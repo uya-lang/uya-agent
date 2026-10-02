@@ -429,11 +429,18 @@ export fn fs_tool_read(f: &const FsCtx, obs: &FsObsTable, args: &const JsonValue
         _ = buf_append_cstr(out, "\": is a directory");
         return;
     }
-    // 读文件（上限 = 选中的行可能达到的字节数上限 + 余量）
+    // 读文件：**流式**取第 [offset, offset+limit) 行那个窗口
+    //   * 全文行数（total）一边读一边数 —— 旧实现只读文件头 cap 字节，然后把这段前缀的
+    //     行数当成全文行数：226 KB / 5756 行的 agent.uya 被报成 3149 行；offset 落在那段
+    //     前缀之外时更是直接 "(End of file)" + 空内容，模型据此以为文件读完了（踩坑 34）；
+    //   * 只缓冲窗口内的行（上限仍是 fs_read_max_bytes + 65536），内存不吃文件大小。
     const cap: usize = fs_read_max_bytes + 65536;
     var data: Buf = buf_new(cap);
     defer { buf_free(&data); }
-    if !fs_read_file_all(abs.ptr as &const byte, &data, cap + 1) {
+    const first: usize = offset - 1;
+    var total: usize = 0;
+    var hit_cap: bool = false;
+    if !fs_read_window(abs.ptr as &const byte, first, limit, cap, &data, &total, &hit_cap) {
         _ = buf_append_cstr(out, "Error: cannot read \"");
         _ = buf_append(out, disp.ptr, disp.len);
         _ = buf_append_cstr(out, "\"");
@@ -443,21 +450,16 @@ export fn fs_tool_read(f: &const FsCtx, obs: &FsObsTable, args: &const JsonValue
     fs_obs_record(obs, abs.ptr as &const byte, abs.len - 1, &st);
 
     const view: &[byte] = data.ptr[0: data.len];
-    const total: usize = fs_count_lines(view);
-    const first: usize = offset - 1;
-    var end: usize = first + limit;
-    if end > total {
-        end = total;
-    }
+    const shown: usize = fs_count_lines(view);      // 窗口里实际能切出几行
     var bytes_used: usize = 0;
-    var capped_bytes: bool = false;
+    var capped_bytes: bool = hit_cap;               // 窗口缓冲撞上限也算「被截断」
     if !fs_env_open(out, &disp, "file") {
         return;
     }
-    var ln: usize = first;
-    while ln < end {
+    var k: usize = 0;                               // 窗口内行号（0 基）
+    while k < shown {
         var line: FsLine = FsLine{ off: 0, len: 0 };
-        if !fs_line_at(view, ln, &line) {
+        if !fs_line_at(view, k, &line) {
             break;
         }
         var take: usize = line.len;
@@ -472,8 +474,8 @@ export fn fs_tool_read(f: &const FsCtx, obs: &FsObsTable, args: &const JsonValue
             capped_bytes = true;
             break;
         }
-        // 行号
-        _ = buf_append_u64(out, (ln + 1) as u64);
+        // 行号：窗口是「从 first 行开始」的，所以绝对行号 = first + k + 1
+        _ = buf_append_u64(out, (first + k + 1) as u64);
         _ = buf_append_cstr(out, ": ");
         _ = buf_append(out, &view.ptr[line.off], take);
         if trunc_line {
@@ -483,11 +485,11 @@ export fn fs_tool_read(f: &const FsCtx, obs: &FsObsTable, args: &const JsonValue
         }
         _ = buf_append_byte(out, 10);
         bytes_used = bytes_used + take;
-        ln = ln + 1;
+        k = k + 1;
     }
-    const shown_end: usize = ln;   // 已输出的最后一行（1 基）
-    if shown_end == 0 {
-        // 一行都没输出（空文件或 offset 越界）
+    const shown_end: usize = first + k;             // 已输出的最后一行（1 基）
+    if k == 0 && !capped_bytes {
+        // 一行都没输出 = offset 越界（total 现在是真值，不再拿前缀行数冒充）
         _ = buf_append_cstr(out, "(End of file - total ");
         _ = buf_append_u64(out, total as u64);
         _ = buf_append_cstr(out, " lines)\n");
@@ -515,6 +517,73 @@ export fn fs_tool_read(f: &const FsCtx, obs: &FsObsTable, args: &const JsonValue
         _ = buf_append_cstr(out, " lines)\n");
     }
     _ = fs_env_close(out);
+}
+
+// 流式读文件，只缓冲第 [first, first+limit) 行这个窗口。
+//
+//   out     窗口字节（换行原样保留，上层用 fs_line_at 按 '\n' 切；CRLF 由它自己剥）
+//   total   文件**真实**总行数：数完整个文件才得出（空文件 = 0；末尾没有 '\n' 的残行也算一行，
+//           与 fs_count_lines 同口径），不受 limit / bytes_cap 影响
+//   hit_cap 缓冲撞到 bytes_cap（上层据此走 "(Output capped…)" 分支；撞上时回滚掉半行，
+//           只留最后一个完整行，免得上层把半行当整行渲染）
+//
+// 为什么要流式（踩坑 34）：旧实现读文件头 cap 字节就停，再把这段**前缀**的行数当成全文行数 ——
+// 226 KB / 5756 行的 agent.uya 被报成 3149 行；offset 落在那段前缀之外时 `fs_line_at` 直接失败，
+// 输出只剩 "(End of file - total 3149 lines)" + 空内容，模型据此以为文件读完了（真实会话踩到）。
+//
+// 代价：每次 read 都会顺序扫完整个文件（真实 total 必须数完），命中 page cache 时是内存带宽级；
+// 真正的大文件（几十 MB 以上）该用 bash / grep，那边本来就不报行数。
+fn fs_read_window(abs_z: &const byte, first: usize, limit: usize, bytes_cap: usize,
+                  out: &Buf, total: &usize, hit_cap: &bool) bool {
+    const fd: i32 = sys_open(abs_z as *const byte, O_RDONLY as i32, 0) catch {
+        return false;
+    };
+    defer { _ = sys_close(fd) catch {}; }
+    buf_reset(out);
+    total[0] = 0;
+    hit_cap[0] = false;
+    var tmp: [byte: 32768] = [0: 32768];
+    var idx: usize = 0;            // 当前行号（0 基；跨 chunk 保持）
+    var ended_nl: bool = true;     // 读到的最后一个字节是不是 '\n'
+    var any: bool = false;         // 读到过字节吗
+    var last_line_end: usize = 0;  // out 里最后一个**完整行**的结束偏移（撞上限时回滚到这）
+    var buffering: bool = true;
+    const win_end: usize = first + limit;
+    while true {
+        const n: isize = sys_read(fd, &tmp[0], 32768) catch { 0 as isize; };
+        if n <= 0 {
+            break;
+        }
+        const m: usize = n as usize;
+        any = true;
+        var k: usize = 0;
+        while k < m {
+            const c: byte = tmp[k];
+            ended_nl = c == 10 as byte;
+            const in_win: bool = idx >= first && idx < win_end;
+            if buffering && in_win {
+                if out.len + 1 <= bytes_cap {
+                    _ = buf_append_byte(out, c);
+                } else {
+                    hit_cap[0] = true;
+                    buffering = false;
+                    buf_truncate(out, last_line_end);
+                }
+            }
+            if c == 10 as byte {
+                if buffering && in_win {
+                    last_line_end = out.len;    // 这一行完整了
+                }
+                idx = idx + 1;
+            }
+            k = k + 1;
+        }
+    }
+    total[0] = idx;
+    if any && !ended_nl {
+        total[0] = total[0] + 1;        // 末尾残行也算一行（与 fs_count_lines 同口径）
+    }
+    return true;
 }
 
 fn fs_read_file_all(abs_z: &const byte, out: &Buf, limit: usize) bool {

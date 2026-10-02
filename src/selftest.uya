@@ -4813,6 +4813,214 @@ fn fs_ws_prepare(ws: &const byte) bool {
 }
 
 // 文件工具轮：断言最终落盘内容（write 覆盖 + edit 替换各一次）
+// ============================================================
+// read-window：read 工具的行窗口（P19）
+//
+// 现场（真实会话踩到，README 踩坑 34）：`read` 只读文件头 cap 字节，再把这段**前缀**的行数
+// 当成全文行数 —— 226 KB / 5756 行的 agent.uya 被报成 3149 行；offset 落在那段前缀之外时
+// `fs_line_at` 直接失败，输出只剩 "(End of file - total 3149 lines)" + 空内容，模型据此
+// 以为文件读完了。这一轮用一个**比 cap 还大**的文件把四件事钉死：真实 total、能读到后半段、
+// 只有真越界才报 EOF、行号是绝对行号。
+// ============================================================
+
+fn read_ws_write(path: &const byte, body: &const Buf) bool {
+    var z: Buf = buf_new(bufx_cstr_len(path) + 1);
+    defer { buf_free(&z); }
+    if !buf_append(&z, path, bufx_cstr_len(path)) {
+        return false;
+    }
+    if !buf_append_byte(&z, 0) {
+        return false;
+    }
+    const flags: i32 = (O_WRONLY | O_CREAT | O_TRUNC) as i32;
+    const fd: i32 = sys_open(&z.ptr[0] as *const byte, flags, 420 as u32) catch {
+        return false;
+    };
+    defer { _ = sys_close(fd) catch {}; }
+    if body.len == 0 {
+        return true;
+    }
+    return write_all_fd(fd, body.ptr as &const byte, body.len);
+}
+
+// 拼 `<ws>/<name>`：**必须补 NUL**（README 坑 2）—— 下面 read_ws_write / sys_open 都按
+// C 字符串取路径，Buf 不带头部 NUL 时它们会读到缓冲区后面的垃圾（文件名会带上乱码尾巴）。
+fn read_ws_path(ws: &const byte, name: &const byte, out: &Buf) void {
+    buf_reset(out);
+    _ = buf_append_cstr(out, ws);
+    _ = buf_append_cstr(out, "/");
+    _ = buf_append_cstr(out, name);
+    _ = buf_append_byte(out, 0);
+    out.len = out.len - 1;      // NUL 留在内存里、不算长度
+}
+
+// 直接调 read 工具：args 现造并走真实 JSON 解析路径（不经过模型/工具分发）
+fn read_call(rel: &const byte, offset: usize, limit: usize, out: &Buf) bool {
+    var args: Buf = buf_new(256);
+    defer { buf_free(&args); }
+    _ = buf_append_cstr(&args, "{\"file_path\":\"");
+    _ = buf_append(&args, rel, bufx_cstr_len(rel));
+    _ = buf_append_cstr(&args, "\"");
+    if offset > 0 {
+        _ = buf_append_cstr(&args, ",\"offset\":");
+        _ = buf_append_u64(&args, offset as u64);
+    }
+    if limit > 0 {
+        _ = buf_append_cstr(&args, ",\"limit\":");
+        _ = buf_append_u64(&args, limit as u64);
+    }
+    _ = buf_append_cstr(&args, "}");
+    var raw: Buf = buf_new(args.len + 1);
+    defer { buf_free(&raw); }
+    if !buf_append(&raw, args.ptr, args.len) || !buf_append_byte(&raw, 0) {
+        return false;
+    }
+    const cap: usize = 65536;
+    const arena_raw: &void = malloc(cap);
+    if (arena_raw as usize) == 0 {
+        return false;
+    }
+    defer { free(arena_raw); }
+    var arena: Arena = Arena{ buffer: null, size: 0, used: 0 };
+    arena_init(&arena, arena_raw as &byte, cap);
+    var root: JsonValue = JsonValue.json_null();
+    buf_reset(out);
+    if !js_parse(&arena, raw.ptr as &byte, raw.len - 1, &root) {
+        return false;
+    }
+    fs_tool_read(&g_fsctx, &g_fsobs, &root, out);
+    return true;
+}
+
+// 断言失败时把工具输出尾部打出来（几百字节，便于定位）
+fn read_dump_tail(tag: &const byte, out: &const Buf) void {
+    var from: usize = 0;
+    if out.len > 400 {
+        from = out.len - 400;
+    }
+    out_err("[");
+    out_err(tag);
+    out_err(" got tail] ");
+    out_err_bytes(&out.ptr[from], out.len - from);
+    out_err("\n");
+}
+
+fn read_window_round(tag: &const byte, ws: &const byte) bool {
+    var ok: bool = true;
+    if !ws_prepare(ws) {
+        ty_fail(tag, "工作目录准备失败", &ok);
+        return false;
+    }
+    var c: Config = cfg_default();
+    // g_fsctx 存的是 workspace 的**指针**：绝不能在这里就 cfg_free（那就是 use-after-free，
+    // 表现是工具报 "file not found"）—— 交到函数结束时再放。
+    defer { cfg_free(&c); }
+    c.workspace = buf_new(strlen(ws) + 8);
+    _ = buf_append_cstr(&c.workspace, ws);
+    c.confine = false;
+    fsctx_init(&c);
+
+    // 大文件：4000 行 × 40 字节 = 160 KB > cap（fs_read_max_bytes + 65536 = 116736）
+    var big: Buf = buf_new(200000);
+    defer { buf_free(&big); }
+    var i: usize = 0;
+    while i < 4000 {
+        _ = buf_append_cstr(&big, "L");
+        var digits: [byte: 5] = [48: 5];
+        var d: usize = 5;
+        var v: usize = i + 1;
+        while d > 0 {
+            d = d - 1;
+            digits[d] = (48 + (v % (10 as usize))) as byte;
+            v = v / (10 as usize);
+        }
+        _ = buf_append(&big, &digits[0], 5);
+        _ = buf_append_cstr(&big, " ");
+        var pad: usize = 0;
+        while pad < 32 {                 // L + 5 位 + 空格 + 32 = 39，加 '\n' 正好 40
+            _ = buf_append_cstr(&big, "x");
+            pad = pad + 1;
+        }
+        _ = buf_append_byte(&big, 10);
+        i = i + 1;
+    }
+    var big_path: Buf = buf_new(256);
+    defer { buf_free(&big_path); }
+    read_ws_path(ws, "big.txt" as &const byte, &big_path);
+    if !read_ws_write(big_path.ptr as &const byte, &big) {
+        ty_fail(tag, "写大文件失败", &ok);
+        return false;
+    }
+    var out: Buf = buf_new(131072);
+    defer { buf_free(&out); }
+
+    // A) 前段窗口：total 必须是**真值 4000**（旧实现会拿前缀行数冒充）
+    if !read_call("big.txt" as &const byte, 0, 1000, &out) {
+        ty_fail(tag, "read(big.txt, limit=1000) 调用失败", &ok);
+    } else {
+        if !contains(&out, "of 4000. Use offset=1001 to continue.") {
+            ty_fail(tag, "total 不是真值（前缀行数被当成了全文行数）", &ok);
+            read_dump_tail(tag, &out);
+        }
+        if !contains(&out, "1000: L01000") {
+            ty_fail(tag, "窗口内容/行号不对（第 1000 行应是 L01000）", &ok);
+            read_dump_tail(tag, &out);
+        }
+    }
+
+    // B) 后段窗口：旧实现在这里假 EOF（前缀之外直接返回空 + End of file）
+    if !read_call("big.txt" as &const byte, 3500, 100, &out) {
+        ty_fail(tag, "read(big.txt, offset=3500) 调用失败", &ok);
+    } else {
+        if !contains(&out, "3500: L03500") {
+            ty_fail(tag, "offset 落在旧前缀之外读不到内容（假 EOF 回归）", &ok);
+            read_dump_tail(tag, &out);
+        }
+        if !contains(&out, "of 4000.") {
+            ty_fail(tag, "后段窗口的 total 不对", &ok);
+        }
+    }
+
+    // C) 真越界才报 EOF，而且 total 必须是真值
+    if !read_call("big.txt" as &const byte, 4001, 0, &out) {
+        ty_fail(tag, "read(big.txt, offset=4001) 调用失败", &ok);
+    } else if !contains(&out, "End of file - total 4000 lines") {
+        ty_fail(tag, "越界时没有报真 total 的 EOF", &ok);
+        read_dump_tail(tag, &out);
+    }
+
+    // D) 撞输出字节上限（1000 行 × 39 B = 39 KB 不撞；2000 行 = 78 KB > 51200 → 撞）
+    if !read_call("big.txt" as &const byte, 0, 2000, &out) {
+        ty_fail(tag, "read(big.txt, limit=2000) 调用失败", &ok);
+    } else if !contains(&out, "Output capped. Showing lines 1-") {
+        ty_fail(tag, "撞到输出上限时没有走 Output capped 分支", &ok);
+        read_dump_tail(tag, &out);
+    }
+
+    // E) 末尾没有换行的残行也算一行（total 口径与 fs_count_lines 一致）
+    var small: Buf = buf_new(64);
+    defer { buf_free(&small); }
+    _ = buf_append_cstr(&small, "a\nb\nc");
+    var tail_path: Buf = buf_new(256);
+    defer { buf_free(&tail_path); }
+    read_ws_path(ws, "tail.txt" as &const byte, &tail_path);
+    if !read_ws_write(tail_path.ptr as &const byte, &small) {
+        ty_fail(tag, "写 tail.txt 失败", &ok);
+    } else if !read_call("tail.txt" as &const byte, 0, 0, &out) {
+        ty_fail(tag, "read(tail.txt) 调用失败", &ok);
+    } else if !contains(&out, "End of file - total 3 lines") {
+        ty_fail(tag, "末尾残行没有算进 total", &ok);
+        read_dump_tail(tag, &out);
+    }
+
+    if ok {
+        out_err("selftest[");
+        out_err(tag);
+        out_err("] ok（真实 total + 后段窗口 + 真 EOF + 输出上限 + 残行）\n");
+    }
+    return ok;
+}
+
 fn fs_round(base: &const Config, tag: &const byte, ws: &const byte) bool {
     mock_mode = 7;
     mock_expect_shell = false;
@@ -9109,6 +9317,8 @@ export fn selftest_main(base: &const Config) i32 {
     const t1: bool = sess_round("session-log");
     const t2: bool = dshcfg_round("dsh-config");
     const t3: bool = fs_round(base, "fs-tools", "build/selftest_ws_fs");
+    // P19：read 的行窗口（真实 total / 后段窗口 / 真 EOF）—— 见踩坑 34
+    const t3b: bool = read_window_round("read-window" as &const byte, "build/selftest_ws_read" as &const byte);
     const t4: bool = jobs_round(base, "bash-jobs", "build/selftest_ws_jobs");
     const t5: bool = prompt_round(base, "prompt-todo-plan", "build/selftest_ws_prompt");
     const t6: bool = round_run(base, "compact-prune", "build/selftest_ws_prune", 11, 0 as i64, "产生大输出");
@@ -9216,7 +9426,7 @@ export fn selftest_main(base: &const Config) i32 {
     const w5: bool = procx_percent_round("procx-percent");
 
     const w6: bool = cpu_live_round("cpu-live");
-    if r1 && r2 && r3 && r4 && r5 && r5b && r6 && r7 && r8 && r9 && s0 && s1 && s2 && s3 && s4 && t0 && t1 && t2 && t3 && t4 && t5 && t6 && t7 && t8 && t9 && t10 && t11 && u0 && u1 && u2 && u3 && v0 && v1 && v2 && v3 && v4 && v5 && v6 && v7 && r1r && r1t && r1s && y0 && y1
+    if r1 && r2 && r3 && r4 && r5 && r5b && r6 && r7 && r8 && r9 && s0 && s1 && s2 && s3 && s4 && t0 && t1 && t2 && t3 && t3b && t4 && t5 && t6 && t7 && t8 && t9 && t10 && t11 && u0 && u1 && u2 && u3 && v0 && v1 && v2 && v3 && v4 && v5 && v6 && v7 && r1r && r1t && r1s && y0 && y1
         && x0 && x1 && x2 && x3 && x4 && x5 && x6 && x7 && x8 && x9 && x10 && x11 && x12 && x13 && x14 && x15 && x16 && w0 && w1 && w2 && w3 && w4 && w5 && w6 && z0 && z1 && z2 {
         out_err("SELFTEST PASS\n");
         return AGENT_OK;
