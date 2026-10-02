@@ -454,6 +454,10 @@ Messages API（`x-api-key` + `anthropic-version: 2023-06-01`，服务端工具 `
   「保留有效尾部工作」。
 * 恢复时会**原样还原** `tool_calls`（用括号配平提取数组文本，不重新序列化，避免 arguments 二次转义），
   因此恢复出来的历史可以直接再序列化成合法请求（自测断言了 `tool_call_id` 与 `tool_calls` 都在）。
+* 反转义用**唯一一份完整实现**（`jsonx.uya::sv_unescape`，支持 `\uXXXX` 与代理对）：
+  日志写入端把 `0x00…0x1f` 写成 `\u00XX`，读回必须还原成**那个字节**，否则一条带 NUL 的
+  工具结果会被静默改成字面量 `u0000`（自测 `session-log` 轮逐字节断言了 NUL/0x01 的往返，
+  见踩坑 27 的后半段）。
 * 入口：`--continue`（当前目录最近一条）、`--resume <id|last>`、`--list-sessions`、`--no-save`；
   REPL 里 `/sessions`、`/resume <id>`、`/new`。
 * 不持久化（恢复时重建）：AGENTS.md 与技能目录、运行时上下文、工具 schema；
@@ -667,6 +671,28 @@ vLLM 等 OpenAI 兼容端点都一样稳。想升级成严格 `tool` 角色消�
     单条超 200 KiB 先剪枝、再头尾截断，绝不因为「太大」拒绝入史。
     回归：`history-long`（40 轮 × 2 调用，逐请求断言配对完整且 80 条结果一条不少）+ `hist-repair`
     （完整组不丢 / 缺应答整组丢）；旧实现在 `history-long` 上必然失败（复现记录在 §6 的验收事实里）。
+27. **请求体里少转义一个控制字节 = 会话报废：端点 400，而且之后每一轮都 400。** 真实事故：
+    一次 bash 调用的输出里带了一个 **NUL**（探测终端属性的小程序写出来的，用
+    `printf 'A\000B'` 就能复现），工具结果原样进了历史；而构请求时用的
+    `std.json.encoder.json_write_str_view` **只转义 `"` `\` `\n` `\r` `\t`**，其余控制字节
+    原样落进 `messages[].content` —— 请求体于是不再是合法 JSON，Go 网关（`encoding/json`）
+    直接回 `Invalid request, invalid character '\x00' in string literal`。更糟的是这条工具结果
+    **永远**留在历史里：之后每次 `/continue` 都带着同一个 NUL，肉眼看就是「这个会话再也推不动」，
+    而错误信息里只有网关的 400，完全指不到 NUL 上。修法与两条不变量：
+    * **转义自己实现，规则对齐 RFC 8259**：`0x00…0x1f` 全部转义（`\b`/`\f`/`\n`/`\r`/`\t`，
+      其余走 `\u00XX`），见 `jsonx.uya::jw_str` / `jw_write_escaped`（`jw_key` 复用同一套）。
+      别再退回标准库那个实现 —— 它省掉的正是「必须转义」的那一半。
+    * **请求体（紧凑 JSON）里不许出现任何裸控制字节**：这是本地就能判的硬不变量。`selftest` 的
+      mock LLM 对**每一个**收到的请求体都扫一遍（判定码 190），另有纯函数轮 `json-escape`
+      逐字节比对转义文本、端到端轮 `ctrl-bytes`（真跑一条输出 NUL 的命令，断言它以 `\u0000`
+      的形式回到请求里）。
+    * **日志写入端一直是对的**（`session.uya::jw_str_into` 把 `0x00…0x1f` 全写成 `\u00XX`），
+      所以出事的会话**在磁盘上看起来完全正常** —— 漏的是「上线」那一步。但顺藤摸瓜还挖出
+      读回那一端的同源 bug：`sess_json_str` 手写的反转义只认 `\n \t \r \" \\`，其余
+      `\X` 一律「去掉反斜杠留字符」，于是 `\u0000` 被还原成字面量 **`u0000`**（NUL 消失、
+      内容多出 4 个字符，而且只在恢复会话时才发生，肉眼几乎不可能发现）。修法：反转义统一走
+      `jsonx.uya::sv_unescape`（唯一一份完整实现，含 `\uXXXX` 与代理对），认不出的转义才退回
+      原文照抄；`session-log` 轮逐字节断言 NUL/0x01 的往返。
 
 ---
 
@@ -786,8 +812,16 @@ write 的 `· +A -D` + diff 正文、**失败的 write 不留假 diff**、窄终
 结果首尾 + `省略` 标记、`--tool-lines 0` 无正文；最后**把 fd 2 接到文件做端到端断言**：
 关闭态抓到 0 字节、打开态抓到的字节与 `view_render_block` 完全一致 |
 | `session-log` | 写 header/事件 → 读回逐行校验（转义层级、`tool_calls` 数组提取、`callId`）；
+**内容里的控制字节（NUL、0x01）必须按字节往返**（写入端写 `\u00XX`，读回不许变成字面量 `u0000`）；
 手工追加半条记录 → 断言丢弃并标记 `dropped_tail`；用日志重建历史 → 断言角色/`tool_call_id`
 且能重新组装成合法请求；索引与按 id / 最近查找 |
+| `json-escape` | 纯函数逐字节断言请求体的字符串转义：`0x00…0x1f` 全部转义（`\b`/`\f`/`\n`/`\r`/`\t`
+与 `\u00XX`）、`"` `\` 转义、输出里不再有裸控制字节、`jw_key` 同规则 + 冒号、空串与中文不被改坏
+（std 的 `json_write_str_view` 只认 5 个短转义，退回它就必然红） |
+| `ctrl-bytes` | 端到端：mock 让 agent 真跑一条**输出含 NUL** 的命令（`printf 'A\000B'`）→
+第二轮断言这条工具结果以 `\u0000` 的形式回到请求里、`tool_call_id` 配对完整；
+再加上「每个请求体都不许有裸控制字节」的全局哨兵（判定码 190）—— 这条就是真机那次
+`invalid character '\x00' in string literal` 的本地等价判据 |
 
 **P1/P2 的验收事实**（2026-10-02）：
 
@@ -820,6 +854,20 @@ write 的 `· +A -D` + diff 正文、**失败的 write 不留假 diff**、窄终
   仍在请求里；② 把日志截在「assistant(tool_calls) 已落盘、tool 结果还没落盘」的形状
   （= 用户当时卡死的状态）：旧二进制丢 58 条（`messages=4`），新实现只丢 1 条悬空 assistant
   （`messages=61`、配对违规 0）—— 也就是 `/continue` 现在能继续。
+* **控制字节转义的验收（2026-10-03，对应踩坑 27）**：先用**本地假网关**（一次性 Python mock，
+  逐请求统计裸控制字节）把故障复现到字节级：mock 让 agent 跑 `printf 'A\000B'`，第 2 次请求体里
+  出现 1 个裸 `\x00`（`"content":"A\x00B\n[exit code: 0]"`）—— 这正是真机
+  `invalid character '\x00' in string literal` 的来源；修后同一条请求里是 `A\u0000B`、裸控制字节 0。
+  再用**真实故障会话**做只读复验（把 `~/.uya-agent/sessions/---home-winger-uya-agent--/` 里那条会话
+  复制到临时 `--agent-home`，同样打到本地假网关，`--no-save`）：① 旧二进制恢复后的请求里，那条带
+  NUL 的工具结果成了字面量 `u0000`（`\u0000` 计数 0）—— NUL 在恢复时被静默吞掉；② 新二进制同一
+  请求里是 `\u0000`（计数 1）、裸控制字节 0，186 条恢复消息一条不少、`tool_call_id` 配对完整。
+  另外是**先写测试再修**：`json-escape` 与 `ctrl-bytes` 两轮在旧 `json_write_str_view` 路径下必然
+  失败（前者报「控制字节转义文本不对」+「字面量里还有裸控制字节」，后者报判定码 193），修后全绿。
+  最后在**真机网关**上收口：用本地 mock 造一条「工具结果里带 NUL」的小会话（`--agent-home` 与
+  `--workspace` 都在临时目录），再用修好的二进制 `--resume` 它并追加一句新任务 —— 真机返回正常
+  回答（不再 400），证明转义后的 `\u0000` 被真网关接受；随后又用 `make e2e TASK="…"` 跑了一轮
+  全新会话，同样正常。
 * 技能与联网搜索都在真机上验证过：让模型「说出本次会话可用的技能名」→ 正确回答
   `agently-mail、h2s-long-context`（来自真实 `~/.dsh/skills`）；让它「用 web_search 搜 uya 语言」→
   `web_search` 工具真的调通了 DeepSeek 的搜索服务并给出总结。
