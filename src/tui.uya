@@ -3205,7 +3205,8 @@ export const TUI_OVK_HELP: u8 = 3;
 export const TUI_OVK_ASK: u8 = 4;      // ask_user_question
 export const TUI_OVK_PLAN: u8 = 5;     // exit_plan_mode 审批
 
-var g_tui_ov_kind: u8 = 0;
+var g_tui_ov_kind: u8 = 0;          // 当前**打开着**的浮层是哪种
+var g_tui_ov_rkind: u8 = 0;         // 最近一次**被选中**的浮层是哪种（收下结果的人要它）
 
 fn tui_ov_ensure() void {
     if !buf_valid(&g_tui_ov_title) { g_tui_ov_title = buf_new(256); }
@@ -3219,8 +3220,14 @@ export fn tui_overlay_open() bool {
     return g_tui_ov != TUI_OV_NONE;
 }
 
+// 收下结果的人（TUI 主循环）拿它判断「选中的是哪张浮层」。
+//
+// 必须回**结果**的 kind，不能回「当前打开着的」那个：`tui_overlay_close()` 会把
+// g_tui_ov_kind 清零，而它在 accept 里是**收尾**调用的 —— 于是主循环读到的永远是 0，
+// 命令面板/会话列表选出来的东西被静默丢掉（`/exit` 从面板里选、`/sessions` 里挑会话
+// 全都「按了没反应」，见 README 踩坑 34）。
 export fn tui_overlay_kind() u8 {
-    return g_tui_ov_kind;
+    return g_tui_ov_rkind;
 }
 
 fn tui_ov_count_items() usize {
@@ -3388,10 +3395,30 @@ fn tui_ov_accept() void {
     if picked {
         _ = buf_append(&g_tui_ov_result, g_tui_ov_items.ptr + off, len);
         g_tui_ov_have = true;
+        g_tui_ov_rkind = g_tui_ov_kind;   // 记住「这是哪张浮层的结果」：close 会把 kind 清零
+        // 命令面板里选中的是「退出」→ **当场**置退出标志：回合运行中主循环不在跑，
+        // 没人会来收这张浮层的结果（`/exit` 得能立刻生效，不能等回合结束，见踩坑 33）
+        if g_tui_ov_kind == TUI_OVK_PALETTE && tui_ov_result_is_exit() {
+            g_tui_quit = true;
+        }
     } else {
         g_tui_ov_cancel = true;
     }
     tui_overlay_close();
+}
+
+// 命令面板的结果里，命令名（第一个空白之前那一段）是不是退出命令
+fn tui_ov_result_is_exit() bool {
+    const p: &const byte = g_tui_ov_result.ptr as &const byte;
+    var n: usize = 0;
+    while n < g_tui_ov_result.len {
+        const c: byte = p[n];
+        if c == 32 as byte || c == 9 as byte || c == 10 as byte {
+            break;
+        }
+        n = n + 1;
+    }
+    return tui_is_exit_command(p, n);
 }
 
 // 浮层按键
@@ -3591,6 +3618,7 @@ var g_tui_have_submit: bool = false;
 var g_tui_interrupt: bool = false;
 var g_tui_quit: bool = false;
 var g_tui_ctrl_c_armed: bool = false;
+var g_tui_ctrl_c_at: u64 = 0;      // 上一次「待确认的 ctrl+c」的时刻（两秒内再按 = 退出）
 var g_tui_req: i32 = TUI_REQ_NONE;
 var g_tui_cmds: Buf = Buf{ ptr: null, len: 0, cap: 0 };
 var g_tui_panel_h: usize = 2;
@@ -3642,11 +3670,123 @@ export fn tui_take_request() i32 {
     return r;
 }
 
+// ============================================================
+// 「现在要不要停」：给**阻塞型**工作（bash 前台 / 后台任务等待 / 子代理等待 /
+// workflow 脚本 / rg）用的一问一答接口。
+//
+// 为什么必须有：这些循环以前只调 tui_poll_tick()（把界面刷活、把键收下来），
+// 但**没有一个人看**收下来的键 —— 于是 `sleep 300` 跑着的时候 esc / ctrl+c /
+// ctrl+d 全都石沉大海，用户只能等工具自己结束，看着就像「退不出」（踩坑 33）。
+// 判定口径与主循环完全一致：QUIT 就是 QUIT，接到的人负责把子进程杀掉并收工。
+// ============================================================
+
+export const TUI_ABORT_NONE: i32 = 0;
+export const TUI_ABORT_TURN: i32 = 1;   // esc / ctrl+c：停掉当前这一步，本回合到此为止
+export const TUI_ABORT_QUIT: i32 = 2;   // ctrl+d / /exit / 运行中二次 ctrl+c：杀子进程并退出
+
+// 滚动模式（--no-tui）下由 tui_abort_check 记下来的意图：那边没有 TUI 的全局标志
+// （ctrl+c 只是 stdin 里的一个字节），但这个意图必须**粘住** —— 杀掉工具子进程之后，
+// 回合还得在下一个 step 边界停下来，否则用户按了 ctrl+c，模型却接着跑下一步。
+var g_block_abort: i32 = TUI_ABORT_NONE;
+
+// 只读状态（不读键、不重绘）：给「已经知道要停」的分支用
+export fn tui_abort_state() i32 {
+    if g_tui_quit || g_block_abort == TUI_ABORT_QUIT {
+        return TUI_ABORT_QUIT;
+    }
+    if g_tui_interrupt || g_block_abort == TUI_ABORT_TURN {
+        return TUI_ABORT_TURN;
+    }
+    return TUI_ABORT_NONE;
+}
+
+// 阻塞循环里调这个：TUI 模式下顺带刷帧 + 读键；滚动模式下也服务一遍键盘
+// （整行进 steer 收件箱、Ctrl-C = 中断），非交互（管道/CI/子代理）模式下是空调用。
+//
+// 自测（headless）下**不**刷帧：headless 的 poll 把「注入的键用完」当成 stdin EOF
+// 并置 quit，刷一下就等于让每个工具循环立刻自杀。
+export fn tui_abort_check() i32 {
+    if tui_active() {
+        if !g_tui_headless {
+            _ = tui_tick(tui_now_ms());
+        }
+        return tui_abort_state();
+    }
+    if tty_is_interactive() {
+        const ev: i32 = llm_pump_input();
+        if ev == TTY_EV_EOF {
+            tui_abort_note_scroll(TUI_ABORT_QUIT);
+        } else if ev == TTY_EV_CTRL_C || ev == TTY_EV_ESC {
+            tui_abort_note_scroll(TUI_ABORT_TURN);
+        }
+    }
+    return tui_abort_state();
+}
+
+// 回合开始时清掉上一轮遗留的中断意图。
+//
+// 不清的后果很重：`g_tui_interrupt` 只有按键会置、**没人复位**，而流式循环一开头
+// 就问「有没有中断意图」—— 于是中断过一次之后，**后面每一个新任务都在第一个字节
+// 就被打断**（屏幕上只有一句「已中断本回合」，看起来像 agent 死了）。
+export fn tui_interrupt_clear() void {
+    g_tui_interrupt = false;
+    g_block_abort = TUI_ABORT_NONE;
+}
+
+// 滚动模式下记下「用户要停」的意图（只升级不降级）。自测直接调它模拟 stdin 上的
+// ctrl+c/ctrl+d —— 真机上这一步由 tui_abort_check 的 tty 分支完成。
+export fn tui_abort_note_scroll(kind: i32) void {
+    if kind == TUI_ABORT_QUIT {
+        g_block_abort = TUI_ABORT_QUIT;
+    } else if kind == TUI_ABORT_TURN && g_block_abort == TUI_ABORT_NONE {
+        g_block_abort = TUI_ABORT_TURN;
+    }
+}
+
+// fork 出来的子代理进程：终端、TUI 帧目标 fd、按键全都是从父进程继承来的，
+// 子进程**一个字节都不许碰** —— 否则子代理（它的流式循环与工具循环都会 tick）
+// 会被父进程的终端抢键：用户在子代理跑着的时候按 esc / ctrl+c / ctrl+d，
+// 键被子进程吃掉，父进程永远收不到（踩坑 33）。
+export fn tui_child_detach() void {
+    g_tui_on = false;
+    g_tui_out_fd = -1;
+    g_tui_headless = false;
+    g_tui_quit = false;
+    g_tui_interrupt = false;
+    tty_sink_on = false;
+}
+
+// 命令面板里那两条「退出」命令（`/exit`、`/quit`）。命令表只有一份，
+// 判定口径也必须只有一份：**提交路径**（打字回车）与**主循环**（面板选中的命令）
+// 都按这个函数认，别处不许再写第二份字面量比较。
+export fn tui_is_exit_command(p: &const byte, n: usize) bool {
+    if n == 5 && bufx_mem_eq(p, "/exit" as &const byte, 5) {
+        return true;
+    }
+    if n == 5 && bufx_mem_eq(p, "/quit" as &const byte, 5) {
+        return true;
+    }
+    return false;
+}
+
 // 提交当前输入（回车）：进历史 + 清空 + 置「有待取走的提交」
+//
+// `/exit` / `/quit` 在**这里**就拦下来（置退出标志、既不进历史也不提交）：
+// 提交路径是「空闲」与「回合运行中」两条路的分叉点 —— 空闲时提交进主循环，
+// 运行中提交进 steer 收件箱（当 user 消息发给模型）。两个地方各拦一次容易漏，
+// 而且真的漏过：TUI 里打 `/exit` 回车以前什么都不发生（退出标志没置），
+// 运行中打还会把 `/exit` 当成任务文本发给模型（见 README 踩坑 33）。
 fn tui_do_submit() void {
     tui_glue_ensure();
     tui_in_ensure();
     if g_tui_in.len == 0 {
+        return;
+    }
+    if tui_is_exit_command(g_tui_in.ptr as &const byte, g_tui_in.len) {
+        g_tui_quit = true;
+        buf_reset(&g_tui_in);
+        g_tui_in_cursor = 0;
+        tui_mark_dirty();
         return;
     }
     buf_reset(&g_tui_submit);
@@ -3665,7 +3805,7 @@ fn tui_open_palette() void {
 }
 
 fn tui_open_help() void {
-    const help: &const byte = "enter 发送 · ctrl+j / alt+enter 换行 · esc 中断 · ctrl+c 中断或退出\npgup/pgdn 滚动 · ctrl+home/end 顶/尾 · tab 计划模式 · ctrl+p 命令面板\nctrl+u 清行 · ctrl+w 删词 · ctrl+k 删到行尾 · ctrl+a/e 行首/行尾 · ctrl+l 重绘\nctrl+d 空行退出 · 运行中的输入会进 steer 收件箱（下一个 step 生效）" as &const byte;
+    const help: &const byte = "enter 发送 · ctrl+j / alt+enter 换行 · esc 中断 · ctrl+c 中断或退出\npgup/pgdn 滚动 · ctrl+home/end 顶/尾 · tab 计划模式 · ctrl+p 命令面板\nctrl+u 清行 · ctrl+w 删词 · ctrl+k 删到行尾 · ctrl+a/e 行首/行尾 · ctrl+l 重绘\nctrl+d 空行退出（运行中也生效）· /exit 退出 · 运行中的输入会进 steer 收件箱（下一个 step 生效）" as &const byte;
     tui_overlay_list(TUI_OVK_HELP, "帮助" as &const byte, 6, help, bufx_cstr_len(help));
 }
 
@@ -3776,6 +3916,18 @@ fn tui_handle_one(ev: i32) void {
     }
     if ev == TUI_K_ESC || ev == TUI_K_CTRL_C {
         if g_tui_run != TUI_RUN_IDLE {
+            // 运行中：esc / ctrl+c 都是「中断本回合」；ctrl+c **两秒内再按一次**就是退出。
+            // 之所以给运行中也留一条退出键：中断意图是在**下一个 step 边界**生效的，
+            // 如果当前这一步是个长命令，光靠 esc 只能等它跑完（踩坑 33）。
+            if ev == TUI_K_CTRL_C {
+                if g_tui_ctrl_c_armed && (tui_now_ms() - g_tui_ctrl_c_at) <= 2000 {
+                    g_tui_quit = true;
+                    return;
+                }
+                g_tui_ctrl_c_armed = true;
+                g_tui_ctrl_c_at = tui_now_ms();
+                tui_add_notice("(再按一次 ctrl+c 直接退出；esc 只中断本回合)" as &const byte, bufx_cstr_len("(再按一次 ctrl+c 直接退出；esc 只中断本回合)" as &const byte));
+            }
             g_tui_interrupt = true;
             tui_mark_dirty();
             return;
@@ -3789,12 +3941,13 @@ fn tui_handle_one(ev: i32) void {
             g_tui_ctrl_c_armed = false;
             return;
         }
-        if g_tui_ctrl_c_armed {
+        if g_tui_ctrl_c_armed && (tui_now_ms() - g_tui_ctrl_c_at) <= 2000 {
             g_tui_quit = true;
             return;
         }
         g_tui_ctrl_c_armed = true;
-        tui_add_notice("(再按一次 ctrl+c 退出；或直接输入任务)" as &const byte, 43);
+        g_tui_ctrl_c_at = tui_now_ms();
+        tui_add_notice("(再按一次 ctrl+c 退出；或直接输入任务)" as &const byte, bufx_cstr_len("(再按一次 ctrl+c 退出；或直接输入任务)" as &const byte));
         return;
     }
     if ev == TUI_K_CTRL_D {
@@ -3824,8 +3977,12 @@ export fn tui_handle_keys() void {
 export fn tui_poll_keys(timeout_ms: i32) usize {
     if g_tui_headless {
         // 自测：按键靠注入；注入的键用完就等价于「stdin 到 EOF」→ 请求退出，
-        // 主循环把这一轮跑完就会收工（否则 headless 下会空转）
-        if g_tui_evn == 0 && !g_tui_have_submit {
+        // 主循环把这一轮跑完就会收工（否则 headless 下会空转）。
+        //
+        // 只在**空闲**时置：回合跑着的时候置 quit 会被流式循环的退出判定看见（
+        // 那正是真终端里 ctrl+d 的语义），headless 的「键用完了」于是会把回合提前掐死 ——
+        // 自测里要结束一个跑着的回合请显式注入 esc/ctrl+c。
+        if g_tui_evn == 0 && !g_tui_have_submit && g_tui_run == TUI_RUN_IDLE {
             g_tui_quit = true;
         }
         return 0;
@@ -3908,12 +4065,15 @@ export fn tui_reset_all() void {
     g_tui_interrupt = false;
     g_tui_quit = false;
     g_tui_ctrl_c_armed = false;
+    g_tui_ctrl_c_at = 0;
     g_tui_req = TUI_REQ_NONE;
+    g_block_abort = TUI_ABORT_NONE;
     g_tui_scroll = 0;
     g_tui_total = 0;
     g_tui_more_above = false;
     g_tui_ov = TUI_OV_NONE;
     g_tui_ov_kind = 0;
+    g_tui_ov_rkind = 0;
     g_tui_ov_have = false;
     g_tui_ov_cancel = false;
     g_tui_ov_n = 0;
@@ -3954,7 +4114,9 @@ export fn tui_begin_session() void {
     g_tui_interrupt = false;
     g_tui_have_submit = false;
     g_tui_ctrl_c_armed = false;
+    g_tui_ctrl_c_at = 0;
     g_tui_req = TUI_REQ_NONE;
+    g_block_abort = TUI_ABORT_NONE;
     g_tui_run = TUI_RUN_IDLE;
     if buf_valid(&g_tui_think) {
         buf_reset(&g_tui_think);      // P18：新会话不许带着上一轮的思考实时行

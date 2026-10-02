@@ -580,8 +580,8 @@ Messages API（`x-api-key` + `anthropic-version: 2023-06-01`，服务端工具 `
   | 键 | 回合运行中 | 空闲（提示符） |
   |---|---|---|
   | 回车 | 文本进 steer 收件箱，**下一个 step 边界**作为普通 user 消息被采纳 | 作为新一轮任务 |
-  | Ctrl-C | 中断本回合：停止读取流、丢弃未派发的 tool_calls、只保留 content 的非空白前缀、历史保留 | 输入非空→清行；空行→提示一次，2 秒内再按→退出 |
-  | Ctrl-D | 忽略 | 空行→退出；非空→删光标处字符 |
+  | Ctrl-C | 中断本回合：停止读取流、丢弃未派发的 tool_calls、只保留 content 的非空白前缀、历史保留；**正在跑的工具子进程当场被杀掉**（P19） | 输入非空→清行；空行→提示一次，2 秒内再按→退出 |
+  | Ctrl-D | **退出**（P19 起；工具跑着也生效，见 §2「退出与中断」） | 空行→退出；非空→删光标处字符 |
   | Esc | 同 Ctrl-C（`ESC[` 前缀识别为方向键序列） | 清行 |
   | ↑/↓ | 历史导航（32 条） | 同左 |
   | Ctrl-U / Ctrl-W / Ctrl-L | 清行 / 删词 / 重绘 | 同左 |
@@ -638,7 +638,7 @@ TTY 交互模式**默认全屏**（`--no-tui` 退回上一节的滚动转录；�
 
   ▌ ↑ Ask anything... "把 hello.uya 的问候语改成 Hello, DSH!"
   ▌ Build   deepseek-chat   deepseek               tab plan   ctrl+p commands
-  ~/uya-agent:main                                          in 8.1k · out 402 · p18-tui
+  ~/uya-agent:main                                          in 8.1k · out 402 · p19-tui
 ```
 
 对话态（`--tui-demo` 打印的就是这三屏的纯文本快照）：
@@ -662,7 +662,7 @@ TTY 交互模式**默认全屏**（`--no-tui` 退回上一节的滚动转录；�
   ⠋ 运行中 Bash(make check) · esc 中断   ← 状态区第 1 行：钉在面板正上方（转录再长也挤不掉）
   ▌ ❯ 顺便把 Makefile 的注释补一下_     ← 输入面板（左边缘强调竖条）
   ▌ Build   deepseek-chat   deepseek               tab plan   ctrl+p commands
-  ~/uya-agent:main                              in 8.1k · out 402 · ctx 21% · p18-tui
+  ~/uya-agent:main                              in 8.1k · out 402 · ctx 21% · p19-tui
 ```
 
 思考阶段多一行实时文本（`--tui-demo` 的第三屏，下面这段转录已经被刻意铺满一屏）：
@@ -677,7 +677,7 @@ TTY 交互模式**默认全屏**（`--no-tui` 退回上一节的滚动转录；�
   ✻ 思考 · …态区预留对不对，再看 view_think_pick 的 latestLine 口径，最后跑一轮 tui-selftest 收尾
   ▌ ↑ Ask anything... "把 hello.uya 的问候语改成 Hello, DSH!"
   ▌ Build   deepseek-chat   deepseek               tab plan   ctrl+p commands
-  ~/uya-agent:main                                    in 8.1k · out 402 · ctx 21% · p18-tui
+  ~/uya-agent:main                                    in 8.1k · out 402 · ctx 21% · p19-tui
 ```
 
 （第 1 行是状态、第 2 行是思考实时文本 —— 它按显示列**从左边**截断，屏幕上留下的是**最新**的那一段。）
@@ -686,12 +686,15 @@ TTY 交互模式**默认全屏**（`--no-tui` 退回上一节的滚动转录；�
   `--color=auto|always|never|16|256` 与 `NO_COLOR`（无色时只留粗体/暗色）；
   `--tui-demo` 打印 home / chat / 运行中 三屏纯文本（诊断 + 文档）。
 * **运行中的状态区（P18）**：见下一小节。
-* **键位**：`enter` 发送 · `ctrl+j` / `alt+enter` 换行 · `esc` 运行中=中断、空闲=清行 ·
-  `ctrl+c` 运行中=中断、空闲=清空/两次退出 · `ctrl+d` 空行退出 · `↑/↓` 单行=历史、
-  多行=上下移光标 · `pgup/pgdn`、`ctrl+home/end` 滚转录 · `tab` 切计划模式（面板显示 `Plan`）·
-  `ctrl+p` 命令面板（输入以 `/` 开头也会自动打开）· `ctrl+u/w/k` 清行/删词/删到行尾 ·
-  `ctrl+a/e`、`←/→`、`home/end`、`backspace/del` 按**字符**编辑 · `ctrl+l` 强制重绘 ·
-  括起粘贴（`ESC[200~`）整段插入不触发提交（> 64 KiB 截断）。
+* **退出与中断（P19）**：见再下一小节 —— 三条退出路径（`ctrl+d` / `/exit` / 运行中二次 `ctrl+c`）
+  在**回合跑着的时候**也必须立即生效。
+* **键位**：`enter` 发送 · `ctrl+j` / `alt+enter` 换行 · `esc` 运行中=中断（当场杀掉正在跑的工具）、
+  空闲=清行 · `ctrl+c` 运行中=中断（2 秒内再按=退出）、空闲=清空/两次退出 ·
+  `ctrl+d` 空行退出（**运行中也生效**）· `/exit`（打字或从命令面板选）退出 ·
+  `↑/↓` 单行=历史、多行=上下移光标 · `pgup/pgdn`、`ctrl+home/end` 滚转录 ·
+  `tab` 切计划模式（面板显示 `Plan`）· `ctrl+p` 命令面板（输入以 `/` 开头也会自动打开）·
+  `ctrl+u/w/k` 清行/删词/删到行尾 · `ctrl+a/e`、`←/→`、`home/end`、`backspace/del` 按**字符**编辑 ·
+  `ctrl+l` 强制重绘 · 括起粘贴（`ESC[200~`）整段插入不触发提交（> 64 KiB 截断）。
 * **浮层**：命令面板、会话列表（选一个 `/resume`）、帮助（`/help`）、`/status` 详情，
   以及 `ask_user_question` / `exit_plan_mode` 的问答弹窗（↑/↓ + enter，esc = 无回答）。
 * **数据流**：TUI 激活后 `tty.uya` 的 `tty_write` 变成一个 **sink** —— 通道 1（助手正文）、
@@ -705,8 +708,10 @@ TTY 交互模式**默认全屏**（`--no-tui` 退回上一节的滚动转录；�
   （只重发变化的行，变化超过 60% 时整屏重画）；正文层永远是纯文本（宽度、换行、擦除都按
   显示列算），工具输出里的控制字节/`ESC[2J` 在 sink 里就被清洗成 `·`/`␛`。
 * **不卡界面**：`llm` 的流式循环、bash/后台任务/子代理/workflow/rg 的阻塞 poll 循环里都插了
-  `tui_poll_tick()`（非 TUI 模式是空调用）—— 工具跑着的时候界面照样刷 spinner、键盘照样收，
-  `esc` 记下中断意图、在**下一个 step 边界**结束回合（滚动模式行为不变）。
+  `tui_poll_tick()`（非 TUI 模式是空调用）—— 工具跑着的时候界面照样刷 spinner、键盘照样收。
+  P19 起这些循环还问一句 **`tui_abort_check()`**（0=继续 / 1=中断 / 2=退出）：
+  接到非 0 就**当场**把自己那个子进程 SIGKILL 掉再收工，而不是「把键收下来却没人看」
+  （以前 `sleep 300` 一跑起来，esc/ctrl+c/ctrl+d 全都石沉大海 —— 见踩坑 33）。
 * **信号配合**：进入 TUI 时 `sigx_arm(私有fd, alt=true)`，被 `SIGTERM/INT/HUP/PIPE` 打断时
   处理器先恢复 termios + 离开备用屏幕再以 `128+sig` 退出；`SIGWINCH` 只置标志（tick 里
   立刻重排，每帧查 TIOCGWINSZ 作兜底）；`read` 的 `EINTR` 一律当「重来」而不是 EOF。
@@ -746,6 +751,62 @@ TTY 交互模式**默认全屏**（`--no-tui` 退回上一节的滚动转录；�
 * **成本**：喂进来只写一个小 Buf + 置脏标记，不碰终端；重绘仍然走既有的逐行 diff（≤ 30 fps）。
 * 关联：`tui_think_live` / `tui_think_clear` / `tui_status_rows` / `tui_put_clipped_tail`（`src/tui.uya`）、
   `view_think_live`（`src/view.uya`），喂入点在 `src/llm.uya` 的两条 reasoning 增量路径上。
+
+#### 退出与中断：任何时刻都退得出去（P19）
+
+**症状**（用户报的「退不出」）：跑着长命令的时候按 `esc` / `ctrl+c` / `ctrl+d` / 打 `/exit`，
+界面**一点反应都没有**，只能等工具自己跑完（`sleep 300` 就是 5 分钟），或者去另一个终端
+`kill`。P19 把这条路上的四个坑一起修了 —— 三个在本进程的输入路径上，一个在**子进程**上。
+
+**① 阻塞循环只收键、不看键。**
+`tui_poll_tick()` 只负责「把键盘收下来 + 刷帧」，而 bash 前台、后台任务等待、子代理等待、
+workflow 脚本、`rg` 这五处循环里**没有一个人看**收下来的意图 —— 于是 `g_tui_interrupt` /
+`g_tui_quit` 置上了也没人理。现在这些循环统一问 **`tui_abort_check()`**：
+
+```
+export const TUI_ABORT_NONE: i32 = 0;   // 继续
+export const TUI_ABORT_TURN: i32 = 1;   // esc / ctrl+c：停掉当前这一步（本回合到此为止）
+export const TUI_ABORT_QUIT: i32 = 2;   // ctrl+d / /exit / 运行中二次 ctrl+c：杀子进程并退出
+```
+
+接到非 0 就 `sys_kill(子进程, SIGKILL)` 并把自己那一步的结果收口（bash 的结果里会多一行
+`[aborted by user]`，子代理是 `[aborted by user] subagent sub-N was interrupted by the user`，
+workflow 是脚本退出码 `137` + `result: [aborted by user]`），**滚动模式（`--no-tui`）也走同一套**
+（非 TUI 时这一函数会服务一遍键盘：整行进 steer 收件箱、Ctrl-C = 中断）。
+
+**② 流式期间的退出意图被吞掉。**
+`llm_stream_style` 的交互循环以前只认 Ctrl-C/Esc 两个事件，`TTY_EV_EOF`（用户在流式期间按了
+`ctrl+d`、或 `/exit`）直接掉在地上 —— 退出了但流还在哗哗地读。现在三个事件一视同仁：立刻
+`LlmInterrupted`，回合收口后主循环看到退出标志自己收工。
+
+**③ `/exit` 与命令面板的选择根本没生效。**
+两条独立的毛病：`tui_do_submit` 提交路径不认识 `/exit`（打字回车会被当成**任务文本**发给模型，
+运行中还会进 steer 收件箱），以及浮层的 kind 在 `tui_overlay_close()` 里被清零 —— 而 close 是
+accept 的**收尾**动作，于是主循环读到的 `tui_overlay_kind()` 永远是 0，**面板里选出来的东西
+（含 `/exit`、`/sessions` 里挑会话）被静默丢掉**（踩坑 34）。现在：`tui_is_exit_command()` 是唯一
+判定口径，提交路径与面板选中路径都走它，退出标志**当场**置上（回合跑着的时候主循环不在，
+只有标志能立刻生效）；kind 另存一份**结果** kind，跨 close 存活。
+
+**④ fork 出来的子代理在抢父进程的键盘。**
+子进程是 `fork` 出来的：`g_tui_on`、帧输出 fd（父进程启动时 `dup(1)` 的那个）、fd 0（终端）
+全是继承来的且**从来没人清**。子代理自己的流式循环与工具循环照样 tick —— 于是它会把帧画到
+用户的屏幕上，还会从 fd 0 **抢键**：用户按 esc/ctrl+c/ctrl+d，键被正在跑的子代理吃掉，
+父进程永远收不到（这就是「派了子代理之后按什么都没反应」）。现在子代理一进 `deleg_child_main`
+就 `tui_child_detach()`：不画帧、不读键、不写转录。
+
+**键位口径**（与空闲态一致，只多一条运行中的二次 ctrl+c）：
+
+| 键 | 回合运行中 | 空闲 |
+|---|---|---|
+| `esc` | 中断本回合（当场杀掉正在跑的工具子进程） | 清行 |
+| `ctrl+c` | 第一次=中断；**2 秒内再按一次=退出** | 输入非空=清行；空行=提示一次，2 秒内再按=退出 |
+| `ctrl+d`（空行） | **退出** | 退出 |
+| `/exit`、`/quit`（打字或面板选） | **退出** | 退出 |
+
+`tui-quit` 轮在真 PTY 里把这三条钉死：工具（`sleep 15`）跑着的时候 `ctrl+d` 必须在 5 秒内退出
+（老代码要等 15 秒）、`esc` 必须让「已中断本回合」在几秒内出现且进程还活着、中断过的会话
+再提交一个任务必须**照常跑完**（中断意图随回合收口作废，不能跨回合残留 —— 残留的话新任务
+会在第一个字节被打断，看着像 agent 死了）。
 
 ### 流式协议要点（P1）
 
@@ -1054,6 +1115,51 @@ vLLM 等 OpenAI 兼容端点都一样稳。想升级成严格 `tool` 角色消�
    `[t_bottom, panel_top)` —— 空闲态因此与之前逐字节一致，而运行态**永远**贴着输入面板。
    回归：`tui-status` 轮的 A 组（铺满转录后状态行必须仍在，且落在 `tui_nrows() - 4` 那一行）。
 
+33. **「把键收下来」不等于「看键」—— 于是一旦有东西在跑，就什么都退出不了。** 用户报的是
+   「退不出」：`sleep` 之类的长命令一跑起来，`esc` / `ctrl+c` / `ctrl+d` / `/exit` 全都没反应，
+   只能等工具自己结束。挖下去是**四个**独立的坑，全都在「这个进程到底谁在看输入」上：
+
+   * **(a) 阻塞循环只 tick 不看标志。** bash 前台（`sh_run_foreground`）、后台任务等待
+     （`job_wait`）、子代理等待（`deleg_tool_subagent` / `deleg_tool_output`）、workflow 脚本
+     （`workflow` 的等待循环）、`rg`（`search`）这五处只调 `tui_poll_tick()`：它把键解析进
+     `g_tui_interrupt` / `g_tui_quit` 就完事了，**没有任何一处读这两个标志** —— 用户在工具跑着
+     的时候按键，等于往一个没人看的盒子里丢纸条。修法是统一接口 `tui_abort_check()`
+     （0/1/2），接到非 0 就当场 SIGKILL 自己的子进程再收工。注意它的 TUI 分支在
+     **headless 自测里不刷帧**：headless 的「注入的键用完 = stdin EOF」会把 quit 打开，
+     刷一下就等于让每个工具循环立刻自杀。
+   * **(b) 流式循环不认 `TTY_EV_EOF`。** `llm_stream_style` 只把 Ctrl-C/Esc 当中断，
+     `TTY_EV_EOF`（运行中按 `ctrl+d`、或 `/exit`）被直接忽略 —— 退出意图置上了，读流的循环
+     却还在跑。三个事件必须一视同仁。
+   * **(c) 退出标志跨回合残留。** `g_tui_interrupt` 只有按键会置、**没人复位**，而流式循环
+     一开头就问「有没有中断意图」——于是**中断过一次之后，后面每一个新任务都在第一个字节
+     被打断**，屏幕上只剩一句「已中断本回合」，看起来像 agent 死了。复位要放在**回合开始前**
+     （主循环里提交任务处）并在 `agent_tui_turn_done()` 再兜一层。回归：`tui-quit` 的 C 段
+     （把两处复位都删掉，这一段立刻红）。
+   * **(d) 子代理在抢父进程的键盘。** 子进程是 `fork` 出来的：`g_tui_on`、帧输出 fd
+     （父进程 `dup(1)` 那个）、fd 0（终端）全是继承的，而 `deleg_child_main` **从来不清**。
+     子代理自己的流式/工具循环照样 tick —— 它会把帧画到用户屏幕上、还会从 fd 0 **抢键**：
+     用户按 esc/ctrl+d，字节被正在跑的子代理吃掉，父进程永远收不到（现象就是「派了子代理
+     之后按什么都没反应」）。子进程一进来就 `tui_child_detach()`：不画帧、不读键、不写转录。
+     这一条是**竞态**（父子都在 poll fd 0），真 PTY 回归里不一定每次都抓到 —— 所以它在
+     `tui-keys` 轮里是**单元断言**（detach 之后 `tui_active()` 必须为 false）。
+
+34. **浮层「收下结果的人」拿不到 kind：命令面板的选择被静默丢掉。** `tui_ov_accept()` 的顺序是
+   「挑中 → 写 `g_tui_ov_result` → `tui_overlay_close()`」，而 `tui_overlay_close()` 顺手把
+   `g_tui_ov_kind` 清零 —— 主循环紧接着问 `tui_overlay_kind()`，读到的**永远是 0**，
+   于是 `if kind == TUI_OVK_PALETTE` / `TUI_OVK_SESSIONS` 两个分支都不成立：
+   面板里选 `/exit`、`/help`、`/sessions` 里挑会话，**全都没反应**（`tui-keys` 轮当时只断言了
+   「结果交出来了」和「选中项文本对不对」，没断言 kind，所以一直没抓到）。修法：结果 kind
+   另存一份（`g_tui_ov_rkind`，只在 accept 时从 `g_tui_ov_kind` 抄一次），`tui_overlay_kind()`
+   返回它。回归：`tui-keys`（kind 断言）+ `tui-exit` 轮（走完整主循环，用 `/help` 把帮助正文
+   写进转录当钉子）。
+
+35. **中文提示语 + 手写的字节长度 = 尾字被砍掉 / 读越 NUL。** `tui_add_notice(p, n)` 是按**字节数**
+   追加的，而所有调用点都写成 `tui_add_notice("…中文…" as &const byte, 43)` 这种人肉计数 ——
+   一个汉字 3 字节，数错是常态：`"(再按一次 ctrl+c 退出；或直接输入任务)"` 实际 52 字节、
+   代码里写的是 **43**（屏幕上尾巴消失，还可能把一个汉字砍成半个）；`"(没有找到会话)"` 实际 20、
+   写的是 **22**（多读 2 字节，读过 NUL 之后的内存）。P19 顺手全改成
+   `bufx_cstr_len("…" as &const byte)`：长度不再是手写的常量。
+
 
 ---
 
@@ -1128,10 +1234,12 @@ agent 循环并逐项断言：
 | `steer` | 回合运行中输入的文本，必须在**下一个 step 的请求**里出现（mock 断言 `STEER-MARKER`） |
 | `interrupt` | 预置 Ctrl-C：回合以 `AGENT_INTERRUPTED` 结束、工具**未派发**、只发生一次请求 |
 | `tui-frame` | 四种尺寸（40×10 / 80×24 / 100×28 / 120×40）下「每行显示列 ≤ cols」「正文层里没有 ESC」；空态整体居中（首行留白 + 块字 logo + 面板 + 脚注 `~/cwd:branch`）、窄终端 logo 退化成单行标题；对话态底对齐 + 面板贴底；工具块/diff/思考/诊断/用户条目都在；跑满一屏后跟随尾部、PgUp/PgDn 夹取、回尾清零 |
-| `tui-keys` | UTF-8 逐字符编辑（退格不砍半个汉字、←/→ 停在字符边界）、**被切开的 `ESC [ D`** 正确组装、Ctrl-J 换行与多行光标移动、回车提交（内容 + 清空 + 进历史）、↑ 取历史、运行中 esc = 中断 / 空闲 esc = 清行、tab 切计划模式（面板显示 Plan）、`/` 自动开命令面板并选中第二项、Ctrl-D 空行退出 |
+| `tui-keys` | UTF-8 逐字符编辑（退格不砍半个汉字、←/→ 停在字符边界）、**被切开的 `ESC [ D`** 正确组装、Ctrl-J 换行与多行光标移动、回车提交（内容 + 清空 + 进历史）、↑ 取历史、运行中 esc = 中断 / 空闲 esc = 清行、tab 切计划模式（面板显示 Plan）、`/` 自动开命令面板并选中第二项、**浮层结果的 kind 跨 close 存活**（踩坑 34）、Ctrl-D（空闲与**运行中**都退出）、运行中 Ctrl-C 一次=中断/两秒内两次=退出、面板里选中 `/exit` 当场置退出标志且**不当作任务提交**、`tui_abort_state()` 三档口径、子进程 `tui_child_detach()` 之后 `tui_active()` 必须为 false |
 | `tui-sink` | TUI 激活后 `tty_write(1/2)` 与 `tty_reason_write` 的字节分别落到 助手/工具/思考 条目；NUL/`ESC[2J`/TAB 被清洗且正文层无 ESC；关掉 sink 后写入回到真实 fd |
 | `tui-turn` | headless 端到端（mock LLM，复用手打路径注入「任务+回车」）：屏幕里出现用户条目、`✓ Write(note.txt)`、`✓ Bash(`、最终答案；回合结束状态回 idle、**状态区整块收掉且思考实时行不留残影**；fd 1 无输出 |
 | `tui-status` | 常驻状态区 + 思考实时行（P18）：**转录铺满视口后状态行必须仍在**（回归主断言，且落在面板上方那一行）、实时行紧跟在状态行下面且只显示 `latestLine`、超宽按列**从左边**截断补 `…`（保住最新的那一端）、`ESC[2J`/NUL/TAB 被清洗且换行只取最后一段、`tui_think_clear`/`TUI_RUN_IDLE` 之后整块收掉（空闲态 0 行）、滚动时钉住不动、窄终端（30 列）按实际可用列画、窄到放不下前缀（20 列）退化成 1 行不硬画、`view_think_live` 默认开（不看 `--show-reasoning`）而 `--quiet` 下一个字节都不写 |
+| `tui-exit` | headless + 完整主循环：命令面板里选中 `/help` 之后帮助正文必须进转录（面板选择被执行 = kind 修好了），主循环正常收工；mock 一次请求都不该被发出去 |
+| `tui-quit` | **真 PTY + 边跑边发键**（「退不出」回归）：A 工具（`sleep 15`）跑着的时候 `ctrl+d` 必须 5 秒内退出（退出码 0 / 离开备用屏幕 / termios 逐位还原）；B 同一窗口按 `esc` → 「已中断本回合」必须几秒内出现（= 工具子进程被当场杀掉，不是等 sleep 跑完）且进程还活着；C 中断过的会话再提交 `task-two` → 必须照常跑完（中断意图不残留，删掉两处复位这一段就红）；D 打 `/exit` 回车 → 退出码 0 |
 | `tui-pty` | **真 PTY**（`/dev/ptmx` + `fork` + `dup2(slave→0/1/2)`）：进备用屏幕（`ESC[?1049h`）、首屏面板/logo、发任务后转录出现 mock 最终答案、`SIGWINCH`（改 winsize + 发信号）后进程仍活着并继续重绘、Ctrl-D 退出码 0、退出后 `TCGETS` 与 fork 前**逐位相同**、离开备用屏幕；不需要 setsid/TIOCSCTTY（fd 0 就是 pts 从设备，Ctrl-C 由程序自己吃字节） |
 | `sig-abi` | `SigxAction` 必须是**宿主 glibc** 布局（152 字节；handler@0 / flags@136 / restorer@144，按字节回读）；恢复序列逐字节（带备用屏幕 26 字节 / 不带 18 字节） |
 | `sig-basic` | 处理器装上以后真的被调用、返回以后进程还活着（P0 的回归闸门：缺 `SA_RESTORER` 的实现在这里直接 139）；`SIGWINCH` 处理器只置标志、取用即清零 |
@@ -1334,6 +1442,19 @@ responses 看 `call_id`）；**chat 与 responses 各一轮**，且顺便断言�
   ② 回合结束时同一屏上 26/27 行变成 `◆ 助手` / `391` —— **状态区整块收掉、转录把行收回**
   （空闲 0 行），没有残影；③ 退出时 `ESC[?2004l ESC[?1049l` 干净收尾（备用屏幕与括起粘贴都关了）。
   **这一屏在 P18 之前是拿不到的**：同样的转录长度下状态行会被挤掉，屏幕上只剩静止的转录 + 面板。
+* **P19 的「退不出」在真机上做了 A/B**（2026-10-03，同一台网关 / 同一个模型 `DeepSeek-V4.1-Flash`，
+  100×30 PTY + 定时注入按键的脚本）。任务都是「用 bash 工具跑 `sleep 120`，description 必须是
+  long-sleep，不要后台运行」，动作在工具跑起来之后：
+
+  | 场景 | 修改前（`main` 那次构建的产物） | 本轮（`p19-tui`） |
+  |---|---|---|
+  | TUI：跑着按 `ctrl+d`（t=20 s） | 45 s 后**仍然活着**（只能等 sleep 跑完） | 键后 **+2.0 s 退出**（rc 0），转录里 `✗ Bash · long-sleep · killed by signal 9` |
+  | TUI：按 `esc`（t=20 s），6 s 后再 `ctrl+d` | 45 s 后仍然活着 | `esc` 后立刻 `✗ … killed by signal 9` + `[interrupted] 已中断本回合（历史保留，可直接继续输入）`；`ctrl+d` **+0.04 s 退出** |
+  | TUI：相隔 0.8 s 按两次 `ctrl+c` | 仍然活着 | 第一次落一行「(再按一次 ctrl+c 直接退出；esc 只中断本回合)」，第二次 **+0.03 s 退出** |
+  | 滚动模式（`--no-tui`）：t=20 s `ctrl+c`、t=30 s `ctrl+d` | 40 s 后仍然活着 | `ctrl+c` → 工具当场被杀 + `[interrupted] …`；`ctrl+d` → `bye` 后退出 |
+
+  （`ctrl+d` 那 2 秒是「请求已经发出去、TCP 还没回」的那一下；`esc` 那条路把 step 边界的中断
+  判定提到发请求之前，所以只剩本地开销。）
 | `http401` | mock 回 401 + 错误体：agent 必须打印状态与错误体并退出 3 |
 | `max-steps` | **显式**给 `max_steps=3`：mock 每轮都给 tool_calls，agent 必须在 3 步后熔断退出 3 |
 | `unlimited-steps` | **默认不限步数**（这轮故意不设 `max_steps`，吃 `cfg_default()` 的 0）：mock 连给 **14 轮** tool_calls（超过旧默认 12）才给最终答案 —— agent 必须一路跑满 14 步、把 14 条 `tool_call_id` 全带回请求，并以 0 退出。默认值一旦改回 12，mock 只会被服务 12 次，这轮立刻失败 |
@@ -1390,8 +1511,15 @@ mock 上逐字段验收。换一台 `openai-responses` 网关可用时，零参�
   长会话请显式给 `--context-window N` 或用 `/compact` 手动压一次。单条消息 200 KiB 会在入史时被
   剪枝/截断（会话日志仍是全文）。
 * **默认不限步数**：模型若陷入工具循环不会自动停 —— 交互模式 Ctrl-C 中断本回合（历史保留），
-  脚本/CI 用 `--max-steps N` 或 `UYA_AGENT_MAX_STEPS=N` 熔断（`make e2e` 也可 `STEPS=N`）。
-  没做「重复调用检测」这类启发式熔断。
+  正在跑的工具子进程**当场被杀掉**（P19，见 §2「退出与中断」），想彻底走人就 `ctrl+d` / `/exit`
+  （运行中也生效）。脚本/CI 用 `--max-steps N` 或 `UYA_AGENT_MAX_STEPS=N` 熔断
+  （`make e2e` 也可 `STEPS=N`）。没做「重复调用检测」这类启发式熔断。
+* 退出时**只有前台那一步的子进程会被杀掉**（bash 前台 / 前台子代理 / workflow 脚本 / `rg`）：
+  `run_in_background` 的后台任务与后台子代理是独立进程，父进程退出后它们变成孤儿继续跑
+  （要停得用 `job_kill` / `interrupt_agent`）。工具循环里的 SIGKILL 打的是**直接子进程**，
+  不带进程组：`bash -c 'a | b'` 这种管道里除 bash 之外的进程可能残留（与超时路径口径一致）。
+* `ask_user_question` / `exit_plan_mode` 的问答浮层里，`ctrl+c`/`esc` 是「取消这次问答」，
+  不是退出程序；要退出先取消（浮层收掉之后 `ctrl+d` 即可）。
 * `read_file` 一次最多 64 KiB；`write_file` 是整文件覆盖，没有 diff/patch 工具。
 * 滚动模式（`--no-tui`）仍然是纯文本字形、不做 markdown 渲染；TUI 模式下有颜色 + 轻量 markdown
   （围栏代码块、行内 code、标题、列表），但不做完整语法高亮/表格/链接重排。
