@@ -41,6 +41,13 @@ tool 结果超 8192 码点自动剪枝，压力超过窗口 80% 时自动压缩�
 `✓ Bash · 打印三行 · exit 0` 这一行（正文退成 `--tool-lines N` 的可选项），
 思考（`--show-reasoning`）压成 DSH 的 **Think 行** —— 运行中在提示符那一行里滚动、
 块结束时落一行 `✻ 思考 · <首行>…`，**全文写进会话日志**（`assistant/reasoning`）。
+**P21 把「权限」补齐成 DSH 的样子**：三级访问模式（`read-only` / `workspace-write` /
+`danger-full-access`，机器名与 DSH 一致）、输入面板上的访问模式 chip 与 `shift+tab` 选择浮层
+（Full access 过风险确认）、`/permission [预设]`、来源链（CLI / `UYA_AGENT_PERMISSION` /
+DSH `permission.defaultPreset`），read-only 下 `write`/`edit` 硬拒、`bash` **逐条人工批准**，
+外加**真的内核沙箱**：confined 模式的 bash 在 **bubblewrap** 的 mount namespace 里跑
+（只读根 + fresh `/dev` + 私有 PID 的 `/proc`，workspace-write 另加临时 `/tmp` 与可写工作区 bind），
+起不来就 fail closed，绝不静默降级。
 **P15 给子代理加了窗口面板**：输入行上方常驻一块带边框的窗口区，每个运行中的子代理 2 行
 （命令行 + 状态行，含**实时秒数**与已收输出行数），最多显示最后 4 个，跑完立刻收掉并在滚动区
 补一行结算通知；边框按显示列逐行补满，自测对每一行断言「列数完全相等」。
@@ -89,6 +96,8 @@ make check        # 词法/语法/类型检查
 make build        # 产出 build/uya-agent
 make selftest     # 离线端到端自测（内置 mock LLM，不需要网络也不需要 key）
 make codegen-audit # 扫构建产物：不许出现「切片描述符 → 字节指针」的强转（终端乱码源头）
+make e2e-permission # 访问模式的四级来源 + 非法值报错（离线）
+make e2e-sandbox    # 沙箱后端探测 / --no-sandbox / 显式 bwrap 路径（离线）
 make probe        # 传输层探针：打真实 https 端点，期望 HTTP 401（不需要 key）
 ```
 
@@ -122,7 +131,7 @@ export UYA_SPLIT_C_DIR=$PWD/build/uyacache      # 多文件 C 缓存别丢在仓
 | `--no-stream` | 关闭流式，回退一次性响应（老端点兼容） |
 | `--api=MODE` | 线协议：`openai-responses`（**默认**）/ `openai-completions`（也接受 `responses` / `chat` / `completions`）。**不写 = 未声明**：先打 `/responses`，只有 404/405/501 才回退 `chat/completions`（每进程一次），见「Responses 接口」一节 |
 | `--reasoning-effort V` | 发 `reasoning.effort`（只有 responses 发；`off`/`none` = 不发），默认取 DSH 的 `agent-default-model.reasoningEffort` |
-| REPL 命令 | `/help` `/continue` `/status` `/compact` `/plan` `/sessions` `/resume <id>` `/new` `/exit` |
+| REPL 命令 | `/help` `/continue` `/status` `/compact` `/plan` `/permission [预设]` `/sessions` `/resume <id>` `/new` `/exit` |
 | `--agent-home DIR` | 会话与索引的根目录（默认 `~/.uya-agent`） |
 | `--continue` | 接着当前目录最近一条会话继续 |
 | `--resume ID` | 恢复指定会话（`ID` 或 `last`） |
@@ -136,6 +145,9 @@ export UYA_SPLIT_C_DIR=$PWD/build/uyacache      # 多文件 C 缓存别丢在仓
 | `--resume-dsh ID` | 导入 DSH 会话并继续（id 前缀 ≥8 字符即可） |
 | `--yaml-dump FILE` | 打印该 YAML 的解析结果（诊断） |
 | `--plan` | 以 plan 模式启动（先出计划、批准后再执行） |
+| `--permission MODE` | **访问模式**（P21）：`read-only` / `workspace-write` / `danger-full-access`（默认）。也收 `--permission=<MODE>`；非法值报错退出。来源优先级 CLI > `UYA_AGENT_PERMISSION` > DSH `permission.defaultPreset`，见「访问模式」一节 |
+| `--no-sandbox` | 关掉 bash 的内核沙箱（bwrap）：confined 模式不再套壳、也不再 fail closed（启动打一行警告） |
+| `--bwrap PATH` | 指定 bwrap 可执行文件（默认探测 `/usr/bin/bwrap`、`/bin/bwrap`、`/usr/local/bin/bwrap`） |
 | `--skill-dir DIR` | 额外的技能根（冒号分隔，可多次） |
 | `--uya-bin PATH` | 跑 workflow 脚本的解释器（默认 `$UYA_BIN` 或 `uya`） |
 | `--no-compact` | 关闭自动上下文压缩 |
@@ -162,7 +174,9 @@ export UYA_SPLIT_C_DIR=$PWD/build/uyacache      # 多文件 C 缓存别丢在仓
 环境变量：`UYA_AGENT_BASE_URL`、`UYA_AGENT_MODEL`、`UYA_AGENT_WORKSPACE`、
 `UYA_AGENT_MAX_STEPS`（步数熔断上限，`0` = 不限，也是默认值；非法值告警后按「不限」处理）、
 `UYA_AGENT_API`（`openai-responses` / `openai-completions`；非法值告警后按「未声明」处理，即仍会先试 responses）、
-`UYA_AGENT_REASONING_EFFORT`（`off`/`none` = 不发），
+`UYA_AGENT_REASONING_EFFORT`（`off`/`none` = 不发）、
+`UYA_AGENT_PERMISSION`（三档访问模式，非法值告警后忽略）、
+`UYA_AGENT_SANDBOX`（`0`/`off` = 等价于 `--no-sandbox`）、`UYA_AGENT_BWRAP`（bwrap 路径），
 以及 key（三选一）：`UYA_AGENT_API_KEY` / `DEEPSEEK_API_KEY` / `OPENAI_API_KEY`。
 
 退出码：`0` 成功 · `1` 用法/配置错 · `2` 传输错（DNS/TCP/TLS/超时）· `3` 模型或协议错
@@ -194,7 +208,8 @@ src/tty.uya       终端层：termios raw 模式、行编辑器（历史/光标/
 src/sigx.uya      信号层（P17）：直接绑宿主 glibc `sigaction`（绕开 uya 0.10 `libc.signal`
                   的 SIGSEGV 缺陷）；终止类信号 → 先恢复终端（termios + 离开备用屏幕）再
                   128+sig 退出；SIGWINCH → 只置标志；`sigx_reset_for_child()` 给 fork 子进程
-src/tui.uya       全屏 TUI（P17）：帧模型（行=段序列，逐行 diff 重绘）、备用屏幕进出、
+src/tui.uya       全屏 TUI（P17/P18）：帧模型（行=段序列，逐行 diff 重绘）、备用屏幕进出、
+                  **访问模式 chip 与底对齐选择浮层、阻塞式确认（tui_confirm_wait）**、
                   转录条目（用户/助手/思考/工具/诊断）、轻量 markdown、输入编辑器（按字符编辑、
                   多行、历史、括起粘贴）、键解码（分片转义序列）、浮层（命令面板/会话/帮助/问答）、
                   sink 通道与清洗、滚动与尾随、帧节流；P18 再加**常驻状态区**（钉在输入面板正
@@ -207,11 +222,13 @@ src/tuiselftest.uya TUI 的自测轮次（tui-frame / tui-keys / tui-sink / tui-
 src/inbox.uya     输入收件箱：steer（运行中输入的文本，step 边界领取）+ keepInbox 语义
 src/yamlcfg.uya   自带 YAML 子集解析器：去注释（块标量/引号感知）、中和 `!!tag`、
                   block/flow 映射与序列、`|`/`>` 块标量、跨行 flow 集合、节点池树 + 导航
-src/fsx.uya       文件工具：路径解析（可选工作区守卫）、(mtime,size) 版本、观察状态表、
+src/fsx.uya       文件工具：路径解析（可选工作区守卫）、**read-only 模式下 write/edit 硬拒**、
+                  (mtime,size) 版本、观察状态表、
                   read（**流式窗口** `fs_read_window`：真 total + 只缓冲选中行 + 行号 + 三种
                   footer + 行长/字节上限）、write（createIfAbsent / replaceIfVersion）、
-                  edit（唯一匹配 / replace_all）
-src/shellx.uya    bash 工具：bash -c、workdir、timeoutMs、run_in_background、stdout/stderr 分开收、
+                  edit（唯一匹配 / replace_all）src/shellx.uya    bash 工具：bash -c、workdir、timeoutMs、run_in_background、stdout/stderr 分开收、
+                  **read-only 逐条人工批准**（TUI 浮层 / 滚动模式 y-N / 无通道则 fail closed）、
+                  **confined 模式下套 bwrap profile 执行**（起不来就拒绝）、
                   结果标记（[exit code: N] / [timed out after Nms] / [killed by signal: N]）、DSH_* 环境注入
 src/jobs.uya      后台任务表：注册/增量输出（保留内存尾部 1 MiB）/状态机（running/completed/killed）、
                   job_list / job_output（wait + timeout_ms）/ job_kill
@@ -220,7 +237,7 @@ src/dshsess.uya   读 DSH 自己的会话：扫 <DSH_HOME>/sessions、解析 hea
                   解压、把 user/message + assistant/message + tool/result 转成我们的历史
 src/dshcfg.uya    读 DSH 设置：$DSH_HOME 解析、settings.yaml 模型路线（agent-default-model →
                   provider 的 baseURL/apiKeyEnv/models[]）、.credentials.yaml、.env 兜底、
-                  permission→confine、uya-agent.tls 命名空间
+                  permission.defaultPreset→访问模式（三级）、uya-agent.tls 命名空间
 src/workflow.uya  workflow：把脚本写成 .ush + 生成同目录的自包含 hooks.uya（钩子客户端）、
                   监听 127.0.0.1 的钩子端口、fork+exec `uya run`、边等服务脚本边处理钩子
 src/deleg.uya     子代理：fork 不 exec（同二进制跑 agent_run）、结果管道 + 增量读取、
@@ -240,7 +257,14 @@ src/instr.uya     AGENTS.md / CLAUDE.md 发现（用户全局 → 项目根 → 
                   预算截断（65536 字节，从最广端丢）、`<system-reminder>` 渲染
 src/todo.uya      todo_write：整表替换、content/去重/状态校验、计数回显
 src/plan.uya      plan 模式状态机 + exit_plan_mode（非 plan 模式报错、`# ` 开头的计划、CLI 审批）
-src/askuser.uya   ask_user_question：交互模式复用行编辑器，非交互读一行，EOF 时回「无回答」
+src/perm.uya      访问模式（P21，对齐 DSH permission-presets）：三级 read-only / workspace-write /
+                  danger-full-access（机器名与 DSH 一致）、显示名与产品名、策略真值表
+                  （confine / allows_write / requires_approval），进程级当前值
+src/sandboxx.uya  内核沙箱（P21，对齐 DSH bash-sandbox 的 Linux bwrap 档）：bwrap 探测（功能探测 +
+                  进程级缓存）、按访问模式拼 profile argv（只读根 + fresh /dev + 私有 PID 的 /proc；
+                  工作区写另加 ephemeral /tmp 与可写 workspace bind）、不可用时的 fail-closed 判定
+src/askuser.uya   ask_user_question：交互模式复用行编辑器，非交互读一行，EOF 时回「无回答」；
+                  P21 加 ask_approve_command（read-only 下 bash 的逐条批准通道）
 src/session.uya   会话日志：路径规范化、id 生成（/dev/urandom→uuid）、header/事件序列化与追加写、
                   索引、读取与崩溃尾部裁剪、按 id/最近查找、括号配平的数组提取
 src/stats.uya     会话统计折叠（P20）：逐行对照 DSH 的 `sessionStats` + `tokenUsage` ——
@@ -268,12 +292,14 @@ src/agent.uya     CLI、环境变量、消息历史、请求组装、主循环�
                   `assistant/reasoning`（思考全文，P16）；P17 再加 `agent_run_tui` /
                   `agent_run_tui_body`（全屏 TUI 主循环，headless 与真终端共用）；
                   P19 再加 `out_diag`（外来字节诊断的**唯一**出口：一行转义预览 + 截断后缀，
-                  全文进会话日志 `diag/dump`，`--debug-dump` 落原始字节）
-src/selftest.uya  --selftest 的 mock LLM（含 SSE 受控切分）+ 75 轮断言 + --probe
+                  全文进会话日志 `diag/dump`，`--debug-dump` 落原始字节）；
+                  P21 再加 `/permission`、`agent_set_access`（切模式 + 推新运行时上下文快照 + 落日志）
+                  与访问模式浮层的结果处理（Full access 过第二道确认）
+src/selftest.uya  --selftest 的 mock LLM（含 SSE 受控切分）+ 80 轮断言 + --probe
                   （P17 又加了源文件里的 4 轮信号 + 5 轮 TUI，P18 再加 1 轮 `tui-status`，
-                  P19 再加 3 轮诊断，P20 再加 9 轮统计/进程 CPU，见 §6）
-```
+                  P19 再加 3 轮诊断，P20 再加 9 轮统计/进程 CPU，P21 再加 7 轮访问模式/沙箱，见 §6）
 
+```
 > 两处已知死代码（P14 未清理，改别的东西时别被它们误导）：`src/tools.uya`（P0 的
 > `read_file`/`write_file`/`run_shell`，早已被 `fsx`/`search`/`shellx` 取代）、
 > `agent.uya` 里的 `dispatch_tool`（`JsonStrView` 版，无调用者）。
@@ -534,7 +560,9 @@ Messages API（`x-api-key` + `anthropic-version: 2023-06-01`，服务端工具 `
 | `grep` | `pattern`(必), `path`(可选), `include`(可选，一个正向 glob) | `rg --json` 逐行解析（不做冒号切分），按文件分组输出 `Line N: 预览`；最多 250 条、每行预览 2000 字节（超出标 ` (line truncated)`）；`include` 拒绝以 `!` 开头或逗号列表；空 → `No matches found` |
 
 * **版本**取 `(mtime, mtime_nsec, size)`；观察状态只在进程内（与 DSH 的已知限制一致：恢复会话后要重新 read）。
-* **路径守卫**默认关闭（对齐 DSH 的 `danger-full-access`）；`--confine` 打开后拒绝绝对路径与 `..`。
+* **路径守卫**默认关闭（内置默认模式就是 DSH 的 `danger-full-access`）：`workspace-write` /
+  `read-only` 下拒绝绝对路径与 `..`。（早期 README 里写的 `--confine` 开关**从来没有实现过**，
+  未知 flag 会直接报错退出；现在请用 `--permission workspace-write`。）
   preset 的 `permission.defaultPreset` 会决定这个默认值（见 P5）。
 * 观察策略现在是硬约束：**没读过的已存在文件不能直接覆盖**，这会让「多轮自测」暴露出
   清理脚本的 bug —— 本轮就靠它抓到了 `ws_prepare` 里少补 NUL 的 `unlink`（见踩坑 30）。
@@ -547,7 +575,8 @@ Messages API（`x-api-key` + `anthropic-version: 2023-06-01`，服务端工具 `
 * 解析出的东西：`base_url`（provider 的 `baseURL`）、`model`、`reasoning_effort`、
   `context_window` / `max_tokens` / `input_image`（模型条目）、`api_key`
   （按 `apiKeyEnv` 走「进程环境 > `.credentials.yaml` > `<cwd>/.env` > `$DSH_HOME/.env`」四层）、
-  以及 `permission.defaultPreset → confine`（`danger-full-access` 不限制，其它预设启用工作区守卫）。
+  以及 `permission.defaultPreset → 访问模式`（P21：三级都认；`read-only` / `workspace-write` /
+  `danger-full-access` 之外的值打一行 warning 后保持内置默认）。
 * **`api:` 真的决定线协议**（不再只是打印）：`openai-responses` → `/responses`，`openai-completions` → 
   `/chat/completions`，声明后**不协商**；认不出来的取值（`anthropic` / `azure-openai-responses` /
   `openai-codex-responses` …）打一条 warning 后按「未声明」处理 —— 也就是仍然先试 `/responses`、
@@ -666,9 +695,8 @@ TTY 交互模式**默认全屏**（`--no-tui` 退回上一节的滚动转录；�
           ▓▓▓▓   ▓▓▓▓  ▓▓  ▓▓        ▓▓  ▓▓  ▓▓▓▓   ▓▓▓▓  ▓▓  ▓▓   ▓▓▓
 
   ▌ ↑ Ask anything... "把 hello.uya 的问候语改成 Hello, DSH!"
-  ▌ Build   deepseek-chat   deepseek               tab plan   ctrl+p commands
-  ~/uya-agent:main                                                                 p20-stats
-```
+  ▌ Build   Full access   deepseek-chat   deepseek  tab plan   ctrl+p commands
+  ~/uya-agent:main                                                                 p20-stats```
 
 对话态（`--tui-demo` 打印的就是这三屏的纯文本快照）：
 
@@ -690,9 +718,8 @@ TTY 交互模式**默认全屏**（`--no-tui` 退回上一节的滚动转录；�
 
   ⠋ 运行中 Bash(make check) · esc 中断   ← 状态区第 1 行：钉在面板正上方（转录再长也挤不掉）
   ▌ ❯ 顺便把 Makefile 的注释补一下_     ← 输入面板（左边缘强调竖条）
-  ▌ Build   deepseek-chat   deepseek               tab plan   ctrl+p commands
-  ~/uya-agent:main · ctx 21% · %cpu 37%    1 轮 · 12 步 | LLM 50.7s · 工具调用 4.1s | 首 token 平均 1.5s | 221 tok/s | 缓存命中 71% | 输入 238K tok · 输出 12K tok
-```
+  ▌ Build   Full access   deepseek-chat   deepseek  tab plan   ctrl+p commands
+  ~/uya-agent:main · ctx 21% · %cpu 37%    1 轮 · 12 步 | LLM 50.7s · 工具调用 4.1s | 首 token 平均 1.5s | 221 tok/s | 缓存命中 71% | 输入 238K tok · 输出 12K tok```
 
 思考阶段多一行实时文本（`--tui-demo` 的第三屏，下面这段转录已经被刻意铺满一屏）：
 
@@ -705,7 +732,7 @@ TTY 交互模式**默认全屏**（`--no-tui` 退回上一节的滚动转录；�
   ⠋ 思考中 · esc 中断
   ✻ 思考 · …态区预留对不对，再看 view_think_pick 的 latestLine 口径，最后跑一轮 tui-selftest 收尾
   ▌ ↑ Ask anything... "把 hello.uya 的问候语改成 Hello, DSH!"
-  ▌ Build   deepseek-chat   deepseek               tab plan   ctrl+p commands
+  ▌ Build   Full access   deepseek-chat   deepseek  tab plan   ctrl+p commands
   ~/uya-agent:main · ctx 21% · %cpu 37%    1 轮 · 12 步 | LLM 50.7s · 工具调用 4.1s | 首 token 平均 1.5s | 221 tok/s | 缓存命中 71% | 输入 238K tok · 输出 12K tok
 ```
 
@@ -717,13 +744,16 @@ TTY 交互模式**默认全屏**（`--no-tui` 退回上一节的滚动转录；�
   160×40，窄终端可以 `--tui-demo 100x30` 看脚注的退化形态）。
 * **运行中的状态区（P18）**：见下一小节。
 * **键位**：`enter` 发送 · `ctrl+j` / `alt+enter` 换行 · `esc` 运行中=中断、空闲=清行 ·
-  `ctrl+c` 运行中=中断、空闲=清空/两次退出 · `ctrl+d` 空行退出 · `↑/↓` 单行=历史、
+  `ctrl+c` 运行中=中断、空闲=清空/两次退出 · `ctrl+d` 空行退出 · **`shift+tab` 访问模式选择浮层** ·
+  `↑/↓` 单行=历史、
   多行=上下移光标 · `pgup/pgdn`、`ctrl+home/end` 滚转录 · `tab` 切计划模式（面板显示 `Plan`）·
   `ctrl+p` 命令面板（输入以 `/` 开头也会自动打开）· `ctrl+u/w/k` 清行/删词/删到行尾 ·
   `ctrl+a/e`、`←/→`、`home/end`、`backspace/del` 按**字符**编辑 · `ctrl+l` 强制重绘 ·
   括起粘贴（`ESC[200~`）整段插入不触发提交（> 64 KiB 截断）。
-* **浮层**：命令面板、会话列表（选一个 `/resume`）、帮助（`/help`）、`/status` 详情，
-  以及 `ask_user_question` / `exit_plan_mode` 的问答弹窗（↑/↓ + enter，esc = 无回答）。
+* **浮层**：命令面板、会话列表（选一个 `/resume`）、帮助（`/help`）、`/status` 详情、
+  **访问模式选择器与 Full access 确认**（P21，底对齐，贴着输入面板往上弹）、
+  **read-only 下 bash 的逐条批准**（P21），以及 `ask_user_question` / `exit_plan_mode` 的
+  问答弹窗（↑/↓ + enter，esc = 无回答）。
 * **数据流**：TUI 激活后 `tty.uya` 的 `tty_write` 变成一个 **sink** —— 通道 1（助手正文）、
   2（工具块/诊断）、3（思考，新增 `tty_reason_write`）全部进转录，**fd 1 一个字节都不写**
   （管道语义干净，`tui-turn` 轮断言 fd 1 捕获 0 字节）；工具卡片不是靠前缀嗅探，而是
@@ -854,7 +884,84 @@ CPU），右边是**整会话统计行** —— 逐字对齐 DSH Web 聊天统�
 * **落地位置**：折叠与格式化在 `src/stats.uya`，进程采样在 `src/procx.uya`，脚注排版在
   `tui.uya`，边界喂养在 `agent.uya` 的 `agent_bound_*`（同一个毫秒值既进日志又进折叠，
   所以「实时」与「回放」对得上）。
+### 访问模式（P21，对齐 DSH permission-presets）
 
+三级，机器名与 DSH 的 preset key **逐字一致**（所以 DSH 设置文件里的
+`permission.defaultPreset` 可以直接喂进来）；显示名按 DSH 的 client 侧规则（kebab → Title Case，
+`danger-full-access` 用产品名 `Full access`）：
+
+| 模式 | 机器名 | 标签 | read/glob/grep | write/edit | bash |
+|---|---|---|---|---|---|
+| 只读 | `read-only` | `Read Only` | 照常（仍受工作区守卫） | **硬拒** | **逐条要用户批准** + 只读沙箱 |
+| 工作区写 | `workspace-write` | `Workspace Write` | 照常 | 允许（工作区守卫） | 自由，但在沙箱里（只写工作区 + 临时 /tmp） |
+| 全权 | `danger-full-access` | `Full access` | 不受限 | 不受限 | 自由，不套沙箱 |
+
+DSH 那边这三档是 `(sandbox, approval)` 两个旋钮的组合（实测表见 `dsh-base/cordis.patch.yml`）；
+本项目没有沙箱拒绝→升级审批那条链，所以 `approval=ask` 落地成 **read-only 下 bash 的逐条人工批准**：
+
+* TUI：弹出底对齐浮层（标题 `Read Only：批准这条 bash 命令？`，条目 `批准并执行` / `拒绝`），
+  **光标默认落在「拒绝」**，且真终端下开浮层前会清掉排队按键 —— 运行期间敲进来的键最多只能
+  「拒绝」，绝不会误批准；`esc` 也是拒绝（不是中断回合）。
+  （headless 自测里注入的键是**立刻派发**的，浮层还没开就已经被输入行吃掉了，所以那条路测不了
+  批准；批准流程由 `tui-approve` 轮用**真 PTY** 覆盖：等浮层画出来再送 `↑`+回车。）
+* 滚动模式（真 TTY，且不是子代理）：打印命令 + `执行？（y = 批准 / n = 拒绝）`。
+* 管道/CI、子代理、浮层画不出来（终端太小）：**fail closed** —— 直接回
+  `bash needs per-command approval in read-only mode, but this session has no answer channel …`，
+  一个字节的命令输出都不给模型。
+
+界面与命令：
+
+* 输入面板信息行有访问模式 chip（只读=绿、工作区写=默认色、全权=警示色），
+  行尾键位提示在**够宽时**会带上 `shift+tab access`（100 列下是 `tab plan   ctrl+p commands`）。
+* `shift+tab`（输入为空时）打开选择浮层：当前项带 `✓`，条目后面跟着一句短说明；
+  `↑/↓` 选、`enter` 切、`esc` 取消；选 **Full access** 不直接生效，会再过一道
+  `确认启用 Full access？`（游标默认停在「取消」，与 DSH 的 RiskConfirmation 同语义）。
+* `/permission`（裸）= 报当前值与可选值（TUI 里直接开浮层；管道/CI 的行式 REPL 也会打印一行）；
+  行式 REPL 现在也认 slash 命令了（以前只认 `exit`，管道里没法查/切模式）；
+  `/permission <preset>` = **直接切**（对齐 DSH 的带参数路径，不过闸门）。
+* 切换的副作用（一处做完）：改 `g_perm` → 同步 `g_fsctx.confine` → 更新 chip →
+  往历史里 **push 一份新的运行时上下文快照**（它自称 supersedes earlier snapshots，模型下一轮就知道）→
+  转录里一行 notice → 会话日志记一条 `permission/mode`。
+
+* 顺手修掉一个**既有缺陷**：`tui_ov_accept()` 会先 `tui_overlay_close()`（把浮层 kind 清 0），
+  而调用方是在 `tui_overlay_take()` **之后**才读 `tui_overlay_kind()` —— 于是命令面板与会话列表
+  的选中结果一直被静默丢弃（`/` 打开面板、选中、回车 = 什么都不发生）。现在 accept 会把 kind 存进
+  `g_tui_ov_done`，没有打开的浮层时 `tui_overlay_kind()` 返回它；`tui-keys` 轮加了一条回归断言。
+
+来源链与今天其它旋钮同构（`--print-config` 逐项打印来源）：
+`--permission <v>` / `--permission=<v>`（cli）> `UYA_AGENT_PERMISSION`（env）>
+DSH `permission.defaultPreset`（dsh-settings）> 内置默认 `danger-full-access`。非法取值直接报错退出；
+DSH 里认不出来的值（例如表示「旋钮不匹配任何预设」的 `custom`）打一行 warning 后保持默认，不猜。
+
+### 沙箱（P21，对齐 DSH bash-sandbox）
+
+**只覆盖 spawn 出去的 shell 代码**（bash 前台/后台任务、子代理里的 bash）；进程内的 write/edit 是
+「工具层栅栏」，不是内核边界 —— 这与 DSH 自己的分界一致（`dsh-fs-sandbox`：策略栅栏不是安全边界，
+内核级隔离归 `ctx.shell`）。也不把 agent 进程自己关起来：那不可逆，会让「运行中放宽模式」失效。
+
+后端只有一档：**bubblewrap**（DSH 在 Linux 也是优先 bwrap、其次 Landlock）。本机实测：
+内核 6.12.65 的 LSM 列表里没有 landlock、`landlock_create_ruleset` 返回 ENOSYS，所以 Landlock 档没写；
+`bubblewrap 0.10.0` 可用，profile 实测与 DSH 文档一致。
+
+| 模式 | profile | 实测效果 |
+|---|---|---|
+| `read-only` | `bwrap --ro-bind / / --dev /dev --proc /proc --unshare-pid --die-with-parent` | 写任何持久路径 → `Read-only file system`；`> /dev/null` **仍然可用**（fresh /dev 里只有它可写） |
+| `workspace-write` | 上述 + `--tmpfs /tmp --bind <workspace> <workspace>` | 工作区内可写、`/tmp` 是临时 tmpfs（跑完就没了）、区外 EROFS |
+| `danger-full-access` | 不套壳 | 今天的行为 |
+
+* **探测 + 缓存**：启动时（或 `--print-config` / `/status` 首次问到时）fork 一次
+  `bwrap … true`，退出码 0 才算可用；结果进程级缓存，`--print-config` 打印
+  `sandbox = bwrap  (source: auto, probe: ok)`。
+* **不可用就 fail closed**：confined 模式下 `bash` 直接回
+  `the file sandbox is unavailable on this host (bwrap: <原因>); bash is refused in <mode> mode …`，
+  绝不静默降级成「不沙箱」（DSH 的 `SANDBOX_UNAVAILABLE` 同款态度）。
+* `--no-sandbox`（或 `UYA_AGENT_SANDBOX=0`）是显式逃生门：confined 模式不再套壳也不再 fail closed，
+  启动时会打一行警告；`--bwrap PATH` / `UYA_AGENT_BWRAP` 可以指定 bwrap 可执行文件
+  （指定了就必须真的可用，不悄悄换别的）。
+* 工作区解析成 `/` 时不加可写 bind（否则整个根都可写，等于没沙箱）。
+* 超时/中断语义不变：杀的还是 fork 出来的那个进程，`[exit code: N]` / `[killed by signal: N]` 口径不动。
+* 没做：workflow 的 `.ush` 脚本（`uya run` 起的不是 bash）、隐藏 `/proc` 之外的更多命名空间、
+  网络/进程级限制（DSH 自己的权限词汇里也只有文件效果）。
 ### 流式协议要点（P1）
 
 * `hc_open()` 只读到 `\r\n\r\n` 就返回，`hc_fill()` 每次读一段网络并推进解码，返回
@@ -1254,7 +1361,12 @@ vLLM 等 OpenAI 兼容端点都一样稳。想升级成严格 `tool` 角色消�
 
 路径守卫（best-effort，**不是安全边界**）：所有 `path` 相对 `--workspace` 解析，拒绝绝对路径、
 `~` 开头、以及含 `..` 段的路径。工具内部任何失败都不抛错，一律写成 `error: ...` 文本回给模型，
-让它自己纠正；`run_shell` 本身当然能执行任意命令，所以别拿它当沙箱用。
+让它自己纠正；bash 在 `danger-full-access` 下本来就能执行任意命令，所以别拿它当沙箱用
+（要沙箱请用 `workspace-write` / `read-only`，见 P21 那两节）。
+
+**P21 起还有两条工具级策略**：`read-only` 模式下 `write` / `edit` 直接回
+`Error: write is refused in read-only mode (the user granted no write access). Do not retry; …`
+（在参数校验之后、动文件之前拦下），`bash` 每条命令先过人工批准闸门。
 
 ---
 
@@ -1329,6 +1441,13 @@ agent 循环并逐项断言：
 | `procx-percent` | `Δticks × 1000 / Δms`：0 / 37 / 100（一个核）/ 250（并行 > 100%）/ 0.5% 向上取整 / `Δms=0` 不可算 / 负增量按 0 / 上限钳 999；`USER_HZ = 100` 常量 |
 | `cpu-live` | fork 一个忙循环 400ms 的子进程（同一个二进制 → comm 相同），父进程睡 450ms 后两次采样：进程数必须涨、综合 `%cpu ≥ 25`、有时间跨度；只建基线的那次必须不给百分比（防除零爆表） |
 | `tui-pty` | **真 PTY**（`/dev/ptmx` + `fork` + `dup2(slave→0/1/2)`）：进备用屏幕（`ESC[?1049h`）、首屏面板/logo、发任务后转录出现 mock 最终答案、`SIGWINCH`（改 winsize + 发信号）后进程仍活着并继续重绘、Ctrl-D 退出码 0、退出后 `TCGETS` 与 fork 前**逐位相同**、离开备用屏幕；不需要 setsid/TIOCSCTTY（fd 0 就是 pts 从设备，Ctrl-C 由程序自己吃字节） |
+| `perm-modes` | 三级访问模式的机器名 ↔ 值 ↔ 显示名（含 DSH 产品名 `Full access`）、`custom`/空串判 -1、策略真值表（`confine` / `allows_write` / `requires_approval`） |
+| `perm-readonly` | mock LLM 一轮 3 个调用：read-only 下 `write` 必须回逐字拒绝串且**文件没落盘**、`bash` 在非交互会话里必须 fail closed（回「无回答渠道」串、命令输出一个字都不给）而 `read` 照常；请求里必须带 read-only 的 file policy 句 |
+| `san-profile` | 三档 profile 的 bwrap argv 逐字断言：read-only = `--ro-bind / / --dev /dev --proc /proc --unshare-pid` 且**没有**可写挂载；workspace-write 多 `--tmpfs /tmp` + `--bind <ws> <ws>`；full access 与 `--no-sandbox` 不套壳；工作区是 `/` 时不加可写 bind；bwrap 不可用时只断言「confined 必须返回 fail closed」 |
+| `san-shell` | 直接 fork 出沙箱命令实测（不经工具闸门）：read-only 里 `> /dev/null` 成功、写 `/tmp` 被拒且文件不出现；workspace-write 里工作区内写入逐字节正确、`../` 区外写入被拒；本机没有 bwrap 时打一行 skip（不假绿） |
+| `san-tool` | 端到端：`--permission workspace-write` 下让模型跑一条**同时**写工作区内与区外的命令 —— 区内文件必须落盘、区外文件必须不存在（工具层没拦它，是内核拦的） |
+| `tui-access` | 访问模式 chip 三种模式的显示、`shift+tab` 只置请求（主循环据此开浮层）、选择器打开（三行齐 + `✓` 只在当前模式那行 + 圆角框 + esc 取消不变更）、↓+enter 选中 Workspace Write 交给处理器（策略全局 + chip + 转录 notice + **恰好一条** runtime-context 注入且不上屏）、运行中切换时 `cfg.access` 必须跟着走（故意把 cfg 设成旧值）、选 Full access 只翻出确认层（游标默认「取消」→ 回车无变化；↑+enter 才切）；末尾一条**回归**：命令面板里选 `/status` 必须真的派发（浮层结果不许被静默丢掉）；每步都查「每行 ≤ cols、正文层无 ESC」 |
+| `tui-approve` | read-only 下 bash 逐条批准，两种形态：① headless（注入的键在浮层打开前就被输入行吃了）= 没人回答 → **fail closed**，转录出现逐字拒绝串、命令 stdout 不出现、且不是「没有回答渠道」那条；② **真 PTY**：等 `Read Only：批准这条 bash 命令？` 画出来再送 `↑`+回车 → 命令真的跑（stdout 进转录与下一封请求）、退出码 0 |
 | `sig-abi` | `SigxAction` 必须是**宿主 glibc** 布局（152 字节；handler@0 / flags@136 / restorer@144，按字节回读）；恢复序列逐字节（带备用屏幕 26 字节 / 不带 18 字节） |
 | `sig-basic` | 处理器装上以后真的被调用、返回以后进程还活着（P0 的回归闸门：缺 `SA_RESTORER` 的实现在这里直接 139）；`SIGWINCH` 处理器只置标志、取用即清零 |
 | `sig-term-restore` | fork 子进程里给自己发 `SIGTERM`：管道上必须收到完整 26 字节恢复序列、退出码必须是 **143**（139 = 处理器路径崩了、7 = 处理器根本没跑） |
@@ -1368,7 +1487,7 @@ edit（多匹配→拒、成功、找不到）/ glob（两条路径）/ grep（�
 第二轮断言全部结果文本，并逐字节校验最终落盘内容（含 edit 后的 `ALPHA one`） |
 | `dsh-config` | 假 `$DSH_HOME`：settings.yaml（block+flow 混排、行尾注释、跨行 flow、`|` 块标量、
 `!!js` 标签）+ `.credentials.yaml` → 断言 provider/model/baseURL/apiKeyEnv/凭据来源四层/
-contextWindow/maxTokens/input image/reasoningEffort/`permission→confine`/`uya-agent.tls` 命名空间；
+contextWindow/maxTokens/input image/reasoningEffort/`permission.defaultPreset`→访问模式/`uya-agent.tls` 命名空间；
 再断言 YAML 预处理（注释去掉、块标量里的 `#` 保留、`!!js` 中和）；最后若存在真实 `~/.dsh` 就顺带校验一次 |
 | `resp-text` | Responses 流式：`created/in_progress` + `output_item.added/done` + `output_text.delta` ×2 + `completed` → content、`input_tokens(100)-cached(40)=60`、out/reasoning、`finish=stop`；`event:` 行必须被忽略 |
 | `resp-tools` | Responses 工具轮：`reasoning_summary_text.delta` ×2 + 两个 `function_call`（`output_item.added` + arguments 交错分片 ×4 + `done`）+ `completed` → `ncalls=2`、`call_id`/`name`/拼好的 `args`、`finish=tool_calls` |
@@ -1627,6 +1746,21 @@ mock 上逐字段验收。换一台 `openai-responses` 网关可用时，零参�
 
 ## 7. 已知限制
 
+* **访问模式/沙箱的边界（P21）**：
+  * 沙箱只覆盖 spawn 出去的 shell 代码（bash 前台/后台、子代理里的 bash）；进程内 write/edit 靠
+    工具层栅栏（路径守卫 + read-only 硬拒），不是内核边界 —— DSH 自己的 `dsh-fs-sandbox` 也是这个分界。
+  * 没有「沙箱拒绝 → 升级审批重试」那条链（DSH 的 `sandbox_permissions` + approval）：本项目
+    read-only 的审批是「允不允许跑这条命令」，不是「允不允许写这个文件」；模型想放宽只能请用户
+    `/permission workspace-write`。
+  * 后端只有 bwrap。Landlock 没实现（本机内核 LSM 里没有它，`landlock_create_ruleset` 返回 ENOSYS）；
+    没有 bwrap 的机器上 confined 模式只能 `--no-sandbox`（显式承担）或退回 `danger-full-access`。
+  * bwrap 的 workspace-write 用 `--tmpfs /tmp`（临时）与整棵工作区可写，做不到「工作区内任意子目录
+    各自细粒度授权」；网络与进程级效果不在权限词汇里（与 DSH 一致）。
+  * 访问模式是**进程级**状态：不进会话日志的恢复语义（`--resume` 按当前进程/设置重新求值运行时上下文），
+    只在切换时记一条 `permission/mode` 审计事件；子代理在 spawn 时刻继承父进程的模式。
+  * 沙箱拒绝提示（`[sandbox] the <mode> file sandbox denied a file effect …`）是**按 stderr 签名**
+    追加的提示（confined + 非零退出 + 命中 `Permission denied` / `Read-only file system`），
+    不改任何强制；DSH 对 bwrap 档也是 signature-only。
 * 上下文管理很朴素：整个历史每轮重新序列化（没有 token 级增量缓存）。历史**条数默认不限制**，
   内存随会话线性增长，唯一的收敛机制是「按 token 压力的自动压缩」——
   所以**没有配置 contextWindow 时（`--no-dsh-config` 或模型条目里没有 `contextWindow`）压缩不会触发**，
