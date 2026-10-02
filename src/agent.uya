@@ -1,0 +1,1030 @@
+// src/agent.uya — 极简 CLI 编程 agent：CLI / 环境变量 / REPL / 主循环 / tools schema
+//
+// 协议（刻意极简）：
+//   * 非流式 POST {base_url}/chat/completions，带 tools（OpenAI function calling）；
+//   * 模型返回 tool_calls 时本地执行工具，把结果拼成**一条 user 消息**回灌，
+//     不回灌 assistant 的 tool_calls 原样 JSON —— 因此完全不需要 tool_call_id 配对，
+//     对 DeepSeek / ollama / vLLM 等 OpenAI 兼容端点都一样稳；
+//   * 没有任何 tool_calls 的回复就是最终答案。
+
+use libc.syscall;
+use libc.unistd;
+use libc.heap;
+use libc.stdlib;
+use libc.fcntl;
+use std.runtime.get_argc;
+use std.runtime.get_argv;
+use std.string.strlen;
+use std.mem.mem.mem_copy;
+use std.mem.mem.mem_set;
+use std.json.value.JsonValue;
+use std.json.value.JsonStrView;
+use std.json.encoder.JsonWriter;
+use std.mem.arena.Arena;
+use std.mem.arena.arena_init;
+use std.mem.arena.arena_alloc;
+use std.mem.arena.arena_reset;
+
+// ============================================================
+// 配置
+// ============================================================
+export struct Config {
+    base_url: Buf,
+    model: Buf,
+    api_key: Buf,
+    workspace: Buf,
+    task: Buf,
+    pin: Buf,
+    verify: i32,
+    max_steps: i32,
+    max_response: usize,
+    max_tool_out: usize,
+    shell_timeout_ms: u32,
+    allow_shell: bool,
+    quiet: bool,
+    tls_debug: bool,
+    timeout_ms: u32,
+}
+
+fn cfg_default() Config {
+    return Config{
+        base_url: buf_empty(),
+        model: buf_empty(),
+        api_key: buf_empty(),
+        workspace: buf_empty(),
+        task: buf_empty(),
+        pin: buf_empty(),
+        verify: HC_VERIFY_CHAIN,
+        max_steps: 12,
+        max_response: 262144,
+        max_tool_out: 65536,
+        shell_timeout_ms: 120000,
+        allow_shell: true,
+        quiet: false,
+        tls_debug: false,
+        timeout_ms: 120000,
+    };
+}
+
+fn cfg_free(c: &Config) void {
+    buf_free(&c.base_url);
+    buf_free(&c.model);
+    buf_free(&c.api_key);
+    buf_free(&c.workspace);
+    buf_free(&c.task);
+    buf_free(&c.pin);
+}
+
+// ============================================================
+// 输出小工具
+// ============================================================
+fn out_err(p: &const byte) void {
+    _ = sys_write(2, p as *const byte, strlen(p)) catch {};
+}
+
+fn out_bytes(p: &const byte, n: usize) void {
+    _ = sys_write(1, p as *const byte, n) catch {};
+}
+
+fn out_err_bytes(p: &const byte, n: usize) void {
+    _ = sys_write(2, p as *const byte, n) catch {};
+}
+
+fn out_err_dec(v: usize) void {
+    var tmp: [byte: 24] = [0: 24];
+    var n: usize = v;
+    var i: usize = 0;
+    if n == 0 {
+        tmp[0] = 48;
+        i = 1;
+    }
+    while n > 0 && i < 24 {
+        const d: i32 = ((n % (10 as usize)) as i32) + 48;
+        tmp[i] = d as byte;
+        n = n / (10 as usize);
+        i = i + 1;
+    }
+    var rev: [byte: 24] = [0: 24];
+    var k: usize = 0;
+    while i > 0 {
+        i = i - 1;
+        rev[k] = tmp[i];
+        k = k + 1;
+    }
+    out_err_bytes(&rev[0], k);
+}
+
+// lib/tls 会把握手过程直接写到 fd 2（https_debug/hs_debug），
+// 对一个 CLI 来说太吵；这里在发请求期间把 stderr 暂时指向 /dev/null，
+// 自己的诊断信息都在静音窗口之外打印。--tls-debug 可关闭静音。
+struct FdGuard {
+    saved: i32,
+    nullfd: i32,
+    active: bool,
+}
+
+fn tls_noise_mute(g: &FdGuard, enabled: bool) void {
+    g.saved = -1;
+    g.nullfd = -1;
+    g.active = false;
+    if !enabled {
+        return;
+    }
+    const saved: i32 = sys_dup(2) catch { -1; };
+    if saved < 0 {
+        return;
+    }
+    var devnull: [byte: 16] = "/dev/null";
+    const nfd: i32 = sys_open(&devnull[0] as *const byte, O_WRONLY as i32, 0) catch {
+        -1;
+    };
+    if nfd < 0 {
+        _ = sys_close(saved) catch {};
+        return;
+    }
+    _ = sys_dup2(nfd, 2) catch {};
+    g.saved = saved;
+    g.nullfd = nfd;
+    g.active = true;
+}
+
+fn tls_noise_unmute(g: &FdGuard) void {
+    if g.active {
+        _ = sys_dup2(g.saved, 2) catch {};
+        g.active = false;
+    }
+    if g.nullfd >= 0 {
+        _ = sys_close(g.nullfd) catch {};
+        g.nullfd = -1;
+    }
+    if g.saved >= 0 {
+        _ = sys_close(g.saved) catch {};
+        g.saved = -1;
+    }
+}
+
+fn cstr_len(p: &byte) usize {
+    return strlen(p);
+}
+
+fn arg_eq(p: &byte, lit: &const byte) bool {
+    const n: usize = cstr_len(p);
+    const m: usize = strlen(lit);
+    if n != m {
+        return false;
+    }
+    var i: usize = 0;
+    while i < n {
+        if p[i] != lit[i] {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn buf_from_cstr(p: &byte) Buf {
+    const n: usize = cstr_len(p);
+    var b: Buf = buf_new(n + 8);
+    if buf_valid(&b) {
+        _ = buf_append(&b, p, n);
+    }
+    return b;
+}
+
+fn env_or(name: &const byte, fallback: &const byte) Buf {
+    const p: &byte = getenv(name);
+    if (p as usize) != 0 {
+        return buf_from_cstr(p);
+    }
+    var b: Buf = buf_new(strlen(fallback) + 8);
+    if buf_valid(&b) {
+        _ = buf_append_cstr(&b, fallback);
+    }
+    return b;
+}
+
+fn env_first(n1: &const byte, n2: &const byte, n3: &const byte) Buf {
+    var b: Buf = env_or(n1, "");
+    if b.len > 0 {
+        return b;
+    }
+    b = env_or(n2, "");
+    if b.len > 0 {
+        return b;
+    }
+    return env_or(n3, "");
+}
+
+// ============================================================
+// 对话历史
+// ============================================================
+const ROLE_SYSTEM: u8 = 0;
+const ROLE_USER: u8 = 1;
+const ROLE_ASSISTANT: u8 = 2;
+const MSG_MAX: usize = 24;
+const MSG_CONTENT_MAX: usize = 200000;
+
+struct Msg {
+    role: u8,
+    ptr: &byte,
+    len: usize,
+}
+
+struct History {
+    items: [Msg: MSG_MAX],
+    len: usize,
+    bytes: usize,
+}
+
+fn hist_init() History {
+    return History{ items: [Msg{ role: 0, ptr: null, len: 0 }: MSG_MAX], len: 0, bytes: 0 };
+}
+
+fn hist_free(h: &History) void {
+    var i: usize = 0;
+    while i < h.len {
+        if (h.items[i].ptr as usize) != 0 {
+            free(h.items[i].ptr as &void);
+        }
+        h.items[i].ptr = null;
+        h.items[i].len = 0;
+        i = i + 1;
+    }
+    h.len = 0;
+    h.bytes = 0;
+}
+
+fn hist_push(h: &History, role: u8, p: &const byte, n: usize) bool {
+    if n == 0 {
+        return false;
+    }
+    if n > MSG_CONTENT_MAX {
+        return false;
+    }
+    const raw: &void = malloc(n + 1);
+    if ((raw as &byte) as usize) == 0 {
+        return false;
+    }
+    const q: &byte = raw as &byte;
+    _ = mem_copy(q, p, n);
+    const q_end: &byte = @ptr_from_usize(@usize_from_ptr(q as &void) + n) as &byte;
+    _ = mem_set(q_end, 0, 1);
+    // 注意：安全证明只接受「局部变量」作为数组下标，直接用字段 h.len 会被拒
+    const idx: usize = h.len;
+    if idx >= MSG_MAX {
+        free(raw);
+        return false;
+    }
+    const slot: &Msg = &h.items[idx];
+    slot.role = role;
+    slot.ptr = q;
+    slot.len = n;
+    h.len = idx + 1;
+    h.bytes = h.bytes + n;
+    return true;
+}
+
+// 丢掉最老的一条非 system 消息（历史太大时的兜底）
+fn hist_drop_oldest(h: &History) bool {
+    if h.len < 3 {
+        return false;
+    }
+    if (h.items[1].ptr as usize) != 0 {
+        free(h.items[1].ptr as &void);
+    }
+    h.bytes = h.bytes - h.items[1].len;
+    var i: usize = 1;
+    while i + 1 < h.len {
+        h.items[i] = h.items[i + 1];
+        i = i + 1;
+    }
+    h.len = h.len - 1;
+    return true;
+}
+
+fn role_cstr(role: u8) &byte {
+    if role == ROLE_SYSTEM {
+        return "system" as &byte;
+    }
+    if role == ROLE_ASSISTANT {
+        return "assistant" as &byte;
+    }
+    return "user" as &byte;
+}
+
+// ============================================================
+// system prompt + tools schema
+// ============================================================
+fn system_prompt() &byte {
+    return "你是一个运行在用户终端里的编程 agent，工作目标是本机上的 Uya 语言项目。\n规则：\n1) 需要看代码就调用 read_file，需要改代码就调用 write_file（整文件覆盖），需要执行命令/编译/跑测试就调用 run_shell。\n2) 一次只做一步：先看、再改、最后用 run_shell 验证。\n3) 路径一律相对工作目录，不要用绝对路径或 ..。\n4) 工具返回以 error: 开头时，读清楚原因再决定下一步，不要重复同样的调用。\n5) 回答用中文，简短；任务完成时给一句话结论，不要复述文件内容。\n\nUya 语言要点（不要写成 C/Rust/Python）：\n- 入口是 `export fn main() i32 { ... return 0; }`；打印用内置的 `@println(\"文本\")`（不是 println/printf/console.log）。\n- 变量必须显式类型：`const x: i32 = 1;` / `var s: &[const byte] = \"abc\";`；没有 let/mut，没有 i++。\n- 编译运行用：`UYA_ROOT=/home/winger/uya-0.10/lib/ /home/winger/uya-0.10/bin/uya build <源文件> -o <输出> && ./<输出>`（UYA_ROOT 不设置会报“无法获取 UYA_ROOT 目录”）。\n- write_file 的 content 就是文件原文：换行写成普通的换行即可，不要二次转义（不要写成 \\n），也不要带引号。\n" as &byte;
+}
+
+fn tools_schema_shell() &byte {
+    return `[{"type":"function","function":{"name":"read_file","description":"读取工作目录下的文本文件，返回内容（最多 64KiB）。","parameters":{"type":"object","properties":{"path":{"type":"string","description":"相对工作目录的文件路径"}},"required":["path"]}}},{"type":"function","function":{"name":"write_file","description":"把 content 完整写入 path（覆盖写）。","parameters":{"type":"object","properties":{"path":{"type":"string","description":"相对工作目录的文件路径"},"content":{"type":"string","description":"完整文件内容"}},"required":["path","content"]}}},{"type":"function","function":{"name":"run_shell","description":"在工作目录下执行 shell 命令，返回 stdout+stderr 与退出码。","parameters":{"type":"object","properties":{"command":{"type":"string","description":"shell 命令"},"timeout_ms":{"type":"integer","description":"超时毫秒，默认 120000"}},"required":["command"]}}}]` as &byte;
+}
+
+fn tools_schema_noshell() &byte {
+    return `[{"type":"function","function":{"name":"read_file","description":"读取工作目录下的文本文件，返回内容（最多 64KiB）。","parameters":{"type":"object","properties":{"path":{"type":"string","description":"相对工作目录的文件路径"}},"required":["path"]}}},{"type":"function","function":{"name":"write_file","description":"把 content 完整写入 path（覆盖写）。","parameters":{"type":"object","properties":{"path":{"type":"string","description":"相对工作目录的文件路径"},"content":{"type":"string","description":"完整文件内容"}},"required":["path","content"]}}}]` as &byte;
+}
+
+// ============================================================
+// 组装请求
+// ============================================================
+fn request_bytes_needed(h: &const History, cfg: &const Config) usize {
+    const overhead: usize = 8192;
+    return h.bytes * 2 + overhead + strlen(tools_schema_shell()) + cfg.model.len * 2;
+}
+
+fn build_request(cfg: &const Config, h: &const History, out: &Buf) bool {
+    var w: JsonWriter = JsonWriter{ buf: null, cap: 0, used: 0, overflow: false };
+    jw_init(&w, out.ptr, out.cap);
+    jw_byte(&w, 123);
+    jw_key(&w, "model");
+    jw_str(&w, cfg.model.ptr, cfg.model.len);
+    jw_byte(&w, 44);
+    jw_key(&w, "messages");
+    jw_byte(&w, 91);
+    var i: usize = 0;
+    while i < h.len {
+        if i > 0 {
+            jw_byte(&w, 44);
+        }
+        jw_byte(&w, 123);
+        jw_key(&w, "role");
+        jw_str_cstr(&w, role_cstr(h.items[i].role));
+        jw_byte(&w, 44);
+        jw_key(&w, "content");
+        jw_str(&w, h.items[i].ptr, h.items[i].len);
+        jw_byte(&w, 125);
+        i = i + 1;
+    }
+    jw_byte(&w, 93);
+    jw_byte(&w, 44);
+    jw_key(&w, "tools");
+    if cfg.allow_shell {
+        jw_cstr(&w, tools_schema_shell());
+    } else {
+        jw_cstr(&w, tools_schema_noshell());
+    }
+    jw_byte(&w, 44);
+    jw_key(&w, "tool_choice");
+    jw_str_cstr(&w, "auto");
+    jw_byte(&w, 44);
+    jw_key(&w, "temperature");
+    jw_i64(&w, 0);
+    jw_byte(&w, 44);
+    jw_key(&w, "stream");
+    jw_bool(&w, false);
+    jw_byte(&w, 125);
+    if jw_overflow(&w) {
+        return false;
+    }
+    out.len = jw_used(&w);
+    return true;
+}
+
+// ============================================================
+// 调用模型
+// ============================================================
+fn build_headers(cfg: &const Config, out: &Buf) bool {
+    if !buf_append_cstr(out, "Content-Type: application/json\r\n") {
+        return false;
+    }
+    if !buf_append_cstr(out, "Accept: application/json\r\n") {
+        return false;
+    }
+    if cfg.api_key.len > 0 {
+        if !buf_append_cstr(out, "Authorization: Bearer ") {
+            return false;
+        }
+        if !buf_append(out, cfg.api_key.ptr, cfg.api_key.len) {
+            return false;
+        }
+        if !buf_append_cstr(out, "\r\n") {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn ends_with_slash(p: &const byte, n: usize) bool {
+    if n == 0 {
+        return false;
+    }
+    return p[n - 1] == '/' as byte;
+}
+
+fn chat_url(cfg: &const Config) Buf {
+    var u: Buf = buf_new(cfg.base_url.len + 24);
+    if buf_valid(&u) {
+        _ = buf_append(&u, cfg.base_url.ptr, cfg.base_url.len);
+        if !ends_with_slash(cfg.base_url.ptr as &const byte, cfg.base_url.len) {
+            _ = buf_append_byte(&u, 47);
+        }
+        _ = buf_append_cstr(&u, "chat/completions");
+    }
+    return u;
+}
+
+fn dump_http_error(status: i32, body: &const Buf) void {
+    out_err("model endpoint returned HTTP ");
+    out_err_dec(status as usize);
+    out_err("\n");
+    var n: usize = body.len;
+    if n > 4096 {
+        n = 4096;
+    }
+    if n > 0 {
+        out_err_bytes(body.ptr, n);
+        out_err("\n");
+    }
+}
+
+// ============================================================
+// 工具分发
+// ============================================================
+fn sv_eq_cstr(b: &const Buf, lit: &const byte) bool {
+    const n: usize = strlen(lit);
+    if b.len != n {
+        return false;
+    }
+    var i: usize = 0;
+    while i < n {
+        if b.ptr[i] != lit[i] {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn dispatch_tool(cfg: &const Config, name: &const JsonStrView, args: &const JsonStrView, arena: &Arena, out: &Buf) void {
+    var name_buf: Buf = buf_empty();
+    defer { buf_free(&name_buf); }
+    if !sv_unescape_to_buf(name, &name_buf) {
+        _ = buf_append_cstr(out, "[tool ?] error: cannot decode tool name\n");
+        return;
+    }
+    _ = buf_append_cstr(out, "[tool ");
+    _ = buf_append(out, name_buf.ptr, name_buf.len);
+    _ = buf_append_cstr(out, "] ");
+    // arguments 本身是一段 JSON 文本，而且 std.json 返回的是**未反转义**的原始视图
+    var args_buf: Buf = buf_empty();
+    defer { buf_free(&args_buf); }
+    var parsed: bool = false;
+    var arg_val: JsonValue = JsonValue.json_null();
+    if sv_unescape_to_buf(args, &args_buf) && args_buf.len > 0 {
+        parsed = js_parse(arena, args_buf.ptr, args_buf.len, &arg_val);
+    }
+    if !parsed {
+        _ = buf_append_cstr(out, "error: tool arguments are not valid JSON (expects an object like {\"path\":\"...\"})\n");
+        return;
+    }
+    if sv_eq_cstr(&name_buf, "read_file") {
+        _ = name_buf;
+        tool_read_file(cfg, &arg_val, out);
+    } else if sv_eq_cstr(&name_buf, "write_file") {
+        tool_write_file(cfg, &arg_val, out);
+    } else if sv_eq_cstr(&name_buf, "run_shell") {
+        tool_run_shell(cfg, &arg_val, out);
+    } else {
+        _ = buf_append_cstr(out, "error: unknown tool");
+    }
+    _ = buf_append_byte(out, 10);
+}
+
+// ============================================================
+// 主循环
+// ============================================================
+export const AGENT_OK: i32 = 0;
+export const AGENT_USAGE: i32 = 1;
+export const AGENT_NET: i32 = 2;
+export const AGENT_PROTO: i32 = 3;
+export const AGENT_TOOL: i32 = 4;
+
+fn response_message(root: &JsonValue, out: &JsonValue) bool {
+    var choices: JsonValue = JsonValue.json_null();
+    if !js_obj_get(root, "choices", 7, &choices) {
+        return false;
+    }
+    if js_arr_len(&choices) == 0 {
+        return false;
+    }
+    var first: JsonValue = JsonValue.json_null();
+    if !js_arr_get(&choices, 0, &first) {
+        return false;
+    }
+    return js_obj_get(&first, "message", 7, out);
+}
+
+fn agent_run(cfg: &const Config) i32 {
+    if cfg.api_key.len == 0 {
+        out_err("error: no API key. set UYA_AGENT_API_KEY / DEEPSEEK_API_KEY / OPENAI_API_KEY\n");
+        return AGENT_USAGE;
+    }
+    var h: History = hist_init();
+    defer { hist_free(&h); }
+    if !hist_push(&h, ROLE_SYSTEM, system_prompt() as &const byte, strlen(system_prompt())) {
+        out_err("error: cannot build history\n");
+        return AGENT_PROTO;
+    }
+    if !hist_push(&h, ROLE_USER, cfg.task.ptr as &const byte, cfg.task.len) {
+        out_err("error: cannot build history\n");
+        return AGENT_PROTO;
+    }
+
+    var url: Buf = chat_url(cfg);
+    defer { buf_free(&url); }
+    if !buf_valid(&url) {
+        out_err("error: out of memory\n");
+        return AGENT_PROTO;
+    }
+    var hdrs: Buf = buf_new(512);
+    defer { buf_free(&hdrs); }
+    if !build_headers(cfg, &hdrs) {
+        out_err("error: out of memory\n");
+        return AGENT_PROTO;
+    }
+
+    const arena_cap: usize = cfg.max_response + 65536;
+    const arena_raw: &void = malloc(arena_cap);
+    if ((arena_raw as &byte) as usize) == 0 {
+        out_err("error: out of memory (arena)\n");
+        return AGENT_PROTO;
+    }
+    defer { free(arena_raw); }
+    var arena: Arena = Arena{ buffer: null, size: 0, used: 0 };
+    arena_init(&arena, arena_raw as &byte, arena_cap);
+
+    var step: i32 = 0;
+    while step < cfg.max_steps {
+        step = step + 1;
+        arena_reset(&arena);
+
+        const need: usize = request_bytes_needed(&h, cfg);
+        var req: Buf = buf_new(need);
+        if !buf_valid(&req) {
+            out_err("error: out of memory (request)\n");
+            return AGENT_PROTO;
+        }
+        if !build_request(cfg, &h, &req) {
+            buf_free(&req);
+            out_err("error: request too large for buffer\n");
+            return AGENT_PROTO;
+        }
+
+        var resp: Resp = resp_empty();
+        var tc: TlsConn = tls_conn_empty();
+        var guard: FdGuard = FdGuard{ saved: -1, nullfd: -1, active: false };
+        tls_noise_mute(&guard, !cfg.tls_debug && !hc_debug);
+        const call_res: !void = http_request(
+            url.ptr[0: url.len],
+            &"POST"[0: 4],
+            hdrs.ptr[0: hdrs.len],
+            req.ptr as &const byte,
+            req.len,
+            cfg.timeout_ms,
+            cfg.max_response,
+            cfg.verify,
+            cfg.pin.ptr[0: cfg.pin.len],
+            &resp,
+            &tc
+        );
+        tls_noise_unmute(&guard);
+        _ = call_res catch {
+            buf_free(&req);
+            out_err("error: 请求失败（网络或 TLS 校验）。\n");
+            if tc.observed_len > 0 {
+                out_err("  本次观测到的 leaf 证书 SHA-256 = ");
+                out_err_bytes(&tc.observed[0], tc.observed_len);
+                out_err("\n");
+                out_err("  链校验在真实站点常失败（见 README 第 5 节）；用这个指纹重试：\n");
+                out_err("  uya-agent --tls-verify=pin --tls-pin <上面的指纹> ...\n");
+            } else {
+                out_err("  检查 base-url / 网络；证书问题可先用 --probe --tls-verify=none 看指纹。\n");
+            }
+            return AGENT_NET;
+        };
+        buf_free(&req);
+
+        if resp.status != 200 {
+            dump_http_error(resp.status, &resp.body);
+            resp_free(&resp);
+            return AGENT_PROTO;
+        }
+
+        // 关键：std.json 的 parse 是**零拷贝**的 —— JsonValue 树（含所有字符串视图）
+        // 都指向输入缓冲区。所以先把响应体复制进 arena 再解析，解析完就能安全释放响应体；
+        // 否则会出现「偶发 use-after-free」：free 之后堆内存一被复用，
+        // choices/message 就查不到，表现为莫名其妙的 "response has no choices[0].message"。
+        const resp_len: usize = resp.body.len;
+        const body_copy: &byte = arena_alloc(&arena, resp_len + 1);
+        if (body_copy as usize) == 0 {
+            out_err("error: out of memory copying response\n");
+            resp_free(&resp);
+            return AGENT_PROTO;
+        }
+        _ = mem_copy(body_copy, resp.body.ptr as &const byte, resp_len);
+        const body_copy_end: &byte = @ptr_from_usize(@usize_from_ptr(body_copy as &void) + resp_len) as &byte;
+        _ = mem_set(body_copy_end, 0, 1);
+        resp_free(&resp);
+
+        var root: JsonValue = JsonValue.json_null();
+        if !js_parse(&arena, body_copy, resp_len, &root) {
+            out_err("error: cannot parse model response as JSON\n");
+            var n: usize = resp_len;
+            if n > 1024 {
+                n = 1024;
+            }
+            out_err_bytes(body_copy as &const byte, n);
+            out_err("\n");
+            return AGENT_PROTO;
+        }
+
+        var msg: JsonValue = JsonValue.json_null();
+        if !response_message(&root, &msg) {
+            // 有些网关会「200 + 体内 error」，或者给出空 choices；把体内 error 与原文打出来
+            var err_obj: JsonValue = JsonValue.json_null();
+            var emsg: JsonStrView = JsonStrView{ ptr: null, len: 0 };
+            if js_obj_get(&root, "error", 5, &err_obj) && js_obj_get_str(&err_obj, "message", 7, &emsg) {
+                var etext: Buf = buf_empty();
+                if sv_unescape_to_buf(&emsg, &etext) {
+                    out_err("model/gateway error: ");
+                    out_err_bytes(etext.ptr, etext.len);
+                    out_err("\n");
+                    buf_free(&etext);
+                }
+            } else {
+                out_err("error: response has no choices[0].message\n");
+            }
+            var nb: usize = resp_len;
+            if nb > 1024 {
+                nb = 1024;
+            }
+            out_err("raw response[0..");
+            out_err_dec(nb);
+            out_err("] = ");
+            out_err_bytes(body_copy as &const byte, nb);
+            out_err("\n");
+            return AGENT_PROTO;
+        }
+
+        var content_sv: JsonStrView = JsonStrView{ ptr: null, len: 0 };
+        var content_buf: Buf = buf_empty();
+        defer { buf_free(&content_buf); }
+        var has_content: bool = false;
+        if js_obj_get_str(&msg, "content", 7, &content_sv) && content_sv.len > 0 {
+            if sv_unescape_to_buf(&content_sv, &content_buf) {
+                has_content = content_buf.len > 0;
+            }
+        }
+
+        var calls: JsonValue = JsonValue.json_null();
+        var has_calls: bool = false;
+        if js_obj_get(&msg, "tool_calls", 10, &calls) {
+            has_calls = js_arr_len(&calls) > 0;
+        }
+
+        if has_calls {
+            var results: Buf = buf_new(16384);
+            if !buf_valid(&results) {
+                out_err("error: out of memory (tool results)\n");
+                return AGENT_PROTO;
+            }
+            _ = buf_append_cstr(&results, "工具执行结果如下，请据此继续；如果你已经能给出最终答案就直接回答：\n");
+            if has_content {
+                _ = buf_append_cstr(&results, "[你上一轮的说明] ");
+                _ = buf_append(&results, content_buf.ptr, content_buf.len);
+                _ = buf_append_byte(&results, 10);
+            }
+            const ncalls: usize = js_arr_len(&calls);
+            var ci: usize = 0;
+            while ci < ncalls {
+                var call: JsonValue = JsonValue.json_null();
+                if js_arr_get(&calls, ci, &call) {
+                    var fname: JsonStrView = JsonStrView{ ptr: null, len: 0 };
+                    var fargs: JsonStrView = JsonStrView{ ptr: null, len: 0 };
+                    var fn_obj: JsonValue = JsonValue.json_null();
+                    if js_obj_get(&call, "function", 8, &fn_obj) && js_obj_get_str(&fn_obj, "name", 4, &fname) {
+                        _ = js_obj_get_str(&fn_obj, "arguments", 9, &fargs);
+                        if !cfg.quiet {
+                            out_err("[step ");
+                            out_err_dec(step as usize);
+                            out_err("] tool: ");
+                            out_err_bytes(fname.ptr, fname.len);
+                            out_err("\n");
+                        }
+                        dispatch_tool(cfg, &fname, &fargs, &arena, &results);
+                    }
+                }
+                ci = ci + 1;
+            }
+            var pushed: bool = hist_push(&h, ROLE_USER, results.ptr as &const byte, results.len);
+            while !pushed {
+                if !hist_drop_oldest(&h) {
+                    break;
+                }
+                out_err("[history] dropped oldest message to stay within limits\n");
+                pushed = hist_push(&h, ROLE_USER, results.ptr as &const byte, results.len);
+            }
+            const results_len: usize = results.len;
+            buf_free(&results);
+            if !pushed {
+                out_err("error: tool results too large for history\n");
+                return AGENT_PROTO;
+            }
+            _ = results_len;
+            continue;
+        }
+
+        if has_content {
+            out_bytes(content_buf.ptr as &const byte, content_buf.len);
+            out_err("\n");
+            return AGENT_OK;
+        }
+        out_err("error: model returned neither content nor tool_calls\n");
+        return AGENT_PROTO;
+    }
+    out_err("error: step limit reached (");
+    out_err_dec(cfg.max_steps as usize);
+    out_err(" steps); use --max-steps to raise it\n");
+    return AGENT_PROTO;
+}
+
+// ============================================================
+// CLI
+// ============================================================
+fn print_usage() void {
+    out_err("uya-agent — 极简 CLI 编程 agent（纯 Uya）\n\n");
+    out_err("用法:\n");
+    out_err("  uya-agent [任务词...]            一次性执行任务\n");
+    out_err("  uya-agent                        REPL：逐行输入任务\n");
+    out_err("  uya-agent --selftest             离线自测（内置 mock LLM，不需要网络与 key）\n");
+    out_err("  uya-agent --probe                传输层探针（打印 HTTP 状态与 leaf 指纹）\n\n");
+    out_err("选项:\n");
+    out_err("  --base-url URL      默认 https://api.deepseek.com/v1\n");
+    out_err("  --model NAME        默认 deepseek-chat\n");
+    out_err("  --workspace DIR     工作目录（工具只在这里面活动），默认当前目录\n");
+    out_err("  --max-steps N       最多几轮工具调用，默认 12\n");
+    out_err("  --max-response N    响应体上限字节，默认 262144\n");
+    out_err("  --timeout-ms N      单次 HTTP 超时，默认 120000\n");
+    out_err("  --no-shell          不提供 run_shell 工具\n");
+    out_err("  --tls-verify=MODE   chain（默认）| pin | none\n");
+    out_err("  --tls-pin HEX       pin 模式下要求的 leaf 证书 SHA-256（小写 hex）\n");
+    out_err("  --quiet             不打印每步工具调用信息\n");
+    out_err("  --tls-debug         保留 lib/tls 的握手调试输出（默认静音）\n");
+    out_err("  --http-debug        打印每轮响应头与体首字节（排查网关怪异响应）\n");
+    out_err("  -h, --help          显示本帮助\n\n");
+    out_err("环境变量:\n");
+    out_err("  UYA_AGENT_BASE_URL / UYA_AGENT_MODEL / UYA_AGENT_WORKSPACE / UYA_AGENT_MAX_STEPS\n");
+    out_err("  UYA_AGENT_API_KEY 或 DEEPSEEK_API_KEY 或 OPENAI_API_KEY\n");
+}
+
+// 从 stdin 取一行：inbuf 保存「上一批读进来但还没消费的剩余字节」，
+// 这样管道/多行粘贴也能一行一个任务（不能假设一次 read 就是一行）。
+fn read_line(inbuf: &Buf, out: &Buf) isize {
+    buf_reset(out);
+    while true {
+        var nl: usize = inbuf.len;
+        var i: usize = 0;
+        while i < inbuf.len {
+            if inbuf.ptr[i] == 10 as byte {
+                nl = i;
+                break;
+            }
+            i = i + 1;
+        }
+        if nl < inbuf.len {
+            var line_len: usize = nl;
+            if line_len > 0 && inbuf.ptr[line_len - 1] == 13 as byte {
+                line_len = line_len - 1;
+            }
+            if !buf_append(out, inbuf.ptr, line_len) {
+                return -1 as isize;
+            }
+            var k: usize = 0;
+            var j: usize = nl + 1;
+            while j < inbuf.len {
+                inbuf.ptr[k] = inbuf.ptr[j];
+                k = k + 1;
+                j = j + 1;
+            }
+            inbuf.len = k;
+            return 1 as isize;
+        }
+        if inbuf.len + 4096 + 1 > inbuf.cap {
+            return -1 as isize;      // 单行过长
+        }
+        const n: isize = sys_read(0, &inbuf.ptr[inbuf.len], inbuf.cap - inbuf.len - 1) catch { -1 as isize; };
+        if n <= 0 {
+            if inbuf.len > 0 {
+                // EOF 前最后一行（没有换行结尾）
+                if !buf_append(out, inbuf.ptr, inbuf.len) {
+                    return -1 as isize;
+                }
+                inbuf.len = 0;
+                return 1 as isize;
+            }
+            return n;
+        }
+        inbuf.len = inbuf.len + (n as usize);
+    }
+}
+
+fn parse_i32_arg(p: &byte, fallback: i32) i32 {
+    const n: usize = cstr_len(p);
+    if n == 0 {
+        return fallback;
+    }
+    var v: i32 = 0;
+    var i: usize = 0;
+    while i < n {
+        const c: byte = p[i];
+        if c < 48 as byte || c > 57 as byte {
+            return fallback;
+        }
+        v = v * 10 + ((c as i32) - 48);
+        i = i + 1;
+    }
+    if v <= 0 {
+        return fallback;
+    }
+    return v;
+}
+
+fn run_once(cfg: &const Config) i32 {
+    if cfg.task.len == 0 {
+        return AGENT_USAGE;
+    }
+    if !cfg.quiet {
+        out_err("[task] ");
+        out_err_bytes(cfg.task.ptr, cfg.task.len);
+        out_err("\n");
+    }
+    return agent_run(cfg);
+}
+
+export fn main() i32 {
+    var cfg: Config = cfg_default();
+    defer { cfg_free(&cfg); }
+    var selftest: bool = false;
+    var probe: bool = false;
+    var task_words: Buf = buf_new(2048);
+    defer { buf_free(&task_words); }
+
+    // 1) 环境变量默认值
+    cfg.base_url = env_or("UYA_AGENT_BASE_URL", "https://api.deepseek.com/v1");
+    cfg.model = env_or("UYA_AGENT_MODEL", "deepseek-chat");
+    cfg.api_key = env_first("UYA_AGENT_API_KEY", "DEEPSEEK_API_KEY", "OPENAI_API_KEY");
+
+    // 2) 工作目录（默认当前目录，可用 UYA_AGENT_WORKSPACE / --workspace 覆盖）
+    var cwd_storage: [byte: 1024] = [0: 1024];
+    const cwd_res: !isize = sys_getcwd(&cwd_storage[0], 1024);
+    const cwd_len: isize = cwd_res catch { 0 as isize; };
+    cfg.workspace = buf_new(1088);
+    if buf_valid(&cfg.workspace) && cwd_len > 0 {
+        _ = buf_append(&cfg.workspace, &cwd_storage[0], cwd_len as usize);
+    }
+    const ws_env: &byte = getenv("UYA_AGENT_WORKSPACE");
+    if (ws_env as usize) != 0 {
+        buf_free(&cfg.workspace);
+        cfg.workspace = buf_from_cstr(ws_env);
+    }
+    const steps_env: &byte = getenv("UYA_AGENT_MAX_STEPS");
+    if (steps_env as usize) != 0 {
+        cfg.max_steps = parse_i32_arg(steps_env, 12);
+    }
+
+    // 3) 命令行
+    var i: i32 = 1;
+    while i < get_argc() {
+        const p: &byte = get_argv(i);
+        if p == null {
+            i = i + 1;
+            continue;
+        }
+        if arg_eq(p, "-h") || arg_eq(p, "--help") {
+            print_usage();
+            return AGENT_OK;
+        } else if arg_eq(p, "--selftest") {
+            selftest = true;
+        } else if arg_eq(p, "--probe") {
+            probe = true;
+        } else if arg_eq(p, "--no-shell") {
+            cfg.allow_shell = false;
+        } else if arg_eq(p, "--quiet") {
+            cfg.quiet = true;
+        } else if arg_eq(p, "--tls-debug") {
+            cfg.tls_debug = true;
+        } else if arg_eq(p, "--http-debug") {
+            hc_debug = true;
+        } else if arg_eq(p, "--base-url") {
+            i = i + 1;
+            if i < get_argc() {
+                buf_free(&cfg.base_url);
+                cfg.base_url = buf_from_cstr(get_argv(i));
+            }
+        } else if arg_eq(p, "--model") {
+            i = i + 1;
+            if i < get_argc() {
+                buf_free(&cfg.model);
+                cfg.model = buf_from_cstr(get_argv(i));
+            }
+        } else if arg_eq(p, "--workspace") {
+            i = i + 1;
+            if i < get_argc() {
+                buf_free(&cfg.workspace);
+                cfg.workspace = buf_from_cstr(get_argv(i));
+            }
+        } else if arg_eq(p, "--max-steps") {
+            i = i + 1;
+            if i < get_argc() {
+                cfg.max_steps = parse_i32_arg(get_argv(i), 12);
+            }
+        } else if arg_eq(p, "--max-response") {
+            i = i + 1;
+            if i < get_argc() {
+                cfg.max_response = parse_i32_arg(get_argv(i), 262144) as usize;
+            }
+        } else if arg_eq(p, "--timeout-ms") {
+            i = i + 1;
+            if i < get_argc() {
+                cfg.timeout_ms = parse_i32_arg(get_argv(i), 120000) as u32;
+            }
+        } else if arg_eq(p, "--tls-verify=chain") {
+            cfg.verify = HC_VERIFY_CHAIN;
+        } else if arg_eq(p, "--tls-verify=pin") {
+            cfg.verify = HC_VERIFY_PIN;
+        } else if arg_eq(p, "--tls-verify=none") {
+            cfg.verify = HC_VERIFY_NONE;
+        } else if arg_eq(p, "--tls-pin") {
+            i = i + 1;
+            if i < get_argc() {
+                buf_free(&cfg.pin);
+                cfg.pin = buf_from_cstr(get_argv(i));
+            }
+        } else if arg_eq(p, "--api-key") {
+            i = i + 1;
+            if i < get_argc() {
+                buf_free(&cfg.api_key);
+                cfg.api_key = buf_from_cstr(get_argv(i));
+            }
+        } else if p[0] == '-' as byte {
+            out_err("error: unknown option: ");
+            out_err_bytes(p, cstr_len(p));
+            out_err("\n");
+            print_usage();
+            return AGENT_USAGE;
+        } else {
+            if task_words.len > 0 {
+                _ = buf_append_byte(&task_words, 32);
+            }
+            _ = buf_append(&task_words, p, cstr_len(p));
+        }
+        i = i + 1;
+    }
+    if cfg.verify == HC_VERIFY_PIN && cfg.pin.len == 0 {
+        out_err("error: --tls-verify=pin requires --tls-pin <sha256 hex>\n");
+        return AGENT_USAGE;
+    }
+    if selftest {
+        return selftest_main(&cfg);
+    }
+    if probe {
+        return probe_main(&cfg);
+    }
+    if task_words.len > 0 {
+        cfg.task = task_words;
+        task_words = buf_empty();
+        return run_once(&cfg);
+    }
+    out_err("uya-agent REPL — 输入任务回车执行；空行/exit/Ctrl-D 退出\n");
+    var inbuf: Buf = buf_new(8192);
+    defer { buf_free(&inbuf); }
+    var line: Buf = buf_new(4096);
+    defer { buf_free(&line); }
+    if !buf_valid(&inbuf) || !buf_valid(&line) {
+        out_err("error: out of memory\n");
+        return AGENT_PROTO;
+    }
+    while true {
+        out_err("> ");
+        const n: isize = read_line(&inbuf, &line);
+        if n <= 0 {
+            out_err("\n");
+            break;
+        }
+        if line.len == 0 {
+            continue;
+        }
+        if line.len == 4 && line.ptr[0] == 101 as byte && line.ptr[1] == 120 as byte && line.ptr[2] == 105 as byte && line.ptr[3] == 116 as byte {
+            break;
+        }
+        buf_free(&cfg.task);
+        cfg.task = buf_new(line.len + 8);
+        _ = buf_append(&cfg.task, line.ptr, line.len);
+        _ = run_once(&cfg);
+    }
+    return AGENT_OK;
+}
