@@ -1,0 +1,818 @@
+// src/fsx.uya — 文件系统工具（P6，对齐 DSH tool-fs + fs-observation-policy）
+//
+// 三个工具：read / write / edit。要点来自 DSH 的实测行为：
+//   * read：按 offset/limit 取窗口，逐行加行号，三种 footer 文案，行长与字节都有上限；
+//   * write：**观察策略** —— 没见过且文件存在 → 只能 createIfAbsent；见过且版本未变 → 覆盖；
+//            版本变了 → FS_STALE_VERSION 并要求重新 read；
+//   * edit：必须**先 read**（任何窗口）且文件未变；old_string 必须唯一（除非 replace_all）。
+//
+// 观察状态记录 (mtime, mtime_nsec, size) 作为「版本」，就够用了；不持久化（与 DSH 的已知限制一致，
+// 恢复会话后需要重新 read 才能 edit）。
+
+use libc.syscall;
+use libc.unistd;
+
+// ---- DSH 默认上限（可通过 preset 旋钮覆盖，见 P13）----
+export var fs_read_limit: usize = 2000;         // readLimit：一次最多返回多少行
+export var fs_read_max_line: usize = 2000;      // 每行最多多少字符
+export var fs_read_max_bytes: usize = 51200;    // 一次 read 选中的行总字节上限
+
+const FS_OBS_MAX: usize = 128;
+const FS_PATH_MAX: usize = 4096;
+
+// ============================================================
+// 路径解析：工作区相对；--confine 时拒绝越界
+// ============================================================
+export struct FsCtx {
+    workspace: &const byte,
+    workspace_len: usize,
+    confine: bool,
+}
+
+// 把工具给的 path 解析成绝对路径写进 out（补 NUL）。
+// 返回 0=ok 1=unsafe 2=oom
+export fn fs_resolve(f: &const FsCtx, rel: &const byte, rel_len: usize, out: &Buf) i32 {
+    buf_reset(out);
+    if rel_len == 0 {
+        return 1;
+    }
+    if rel[0] == 47 as byte {
+        if f.confine {
+            return 1;   // 限制模式下不许绝对路径
+        }
+        if !buf_append(out, rel, rel_len) {
+            return 2;
+        }
+        if !buf_append_byte(out, 0) {
+            return 2;
+        }
+        return 0;
+    }
+    // 逐段处理 ./ 与 ../
+    if !buf_append(out, f.workspace, f.workspace_len) {
+        return 2;
+    }
+    if f.workspace_len > 0 && f.workspace[f.workspace_len - 1] != 47 as byte {
+        if !buf_append_byte(out, 47) {
+            return 2;
+        }
+    }
+    var i: usize = 0;
+    while i < rel_len {
+        const seg_start: usize = i;
+        while i < rel_len && rel[i] != 47 as byte {
+            i = i + 1;
+        }
+        const seg_len: usize = i - seg_start;
+        if seg_len == 2 && rel[seg_start] == 46 as byte && rel[seg_start + 1] == 46 as byte {
+            if f.confine {
+                return 1;   // 限制模式下不许 ..
+            }
+            // 非限制模式：真的往上走一层（把 out 里最后一个 '/' 之后删掉）
+            if out.len > 1 {
+                var k: usize = out.len - 1;
+                while k > 0 && out.ptr[k - 1] != 47 as byte {
+                    k = k - 1;
+                }
+                if k > 0 {
+                    out.len = k;
+                }
+            }
+        } else if seg_len == 1 && rel[seg_start] == 46 as byte {
+            // "./"：忽略
+        } else if seg_len > 0 {
+            if !buf_append(out, &rel[seg_start], seg_len) {
+                return 2;
+            }
+            if !buf_append_byte(out, 47) {
+                return 2;
+            }
+        }
+        i = i + 1;
+    }
+    // 去掉尾部的 '/'（目录路径除外，交给调用方）
+    if out.len > 1 && out.ptr[out.len - 1] == 47 as byte {
+        out.len = out.len - 1;
+    }
+    if !buf_append_byte(out, 0) {
+        return 2;
+    }
+    return 0;
+}
+
+// 面向模型显示的路径：工作区相对（能相对就相对）
+export fn fs_display(f: &const FsCtx, abs: &const byte, abs_len: usize, out: &Buf) bool {
+    buf_reset(out);
+    if abs_len > f.workspace_len + 1 && bufx_mem_eq(abs, f.workspace, f.workspace_len) {
+        if abs[f.workspace_len] == 47 as byte {
+            return buf_append(out, &abs[f.workspace_len + 1], abs_len - f.workspace_len - 1);
+        }
+    }
+    return buf_append(out, abs, abs_len);
+}
+
+// ============================================================
+// 文件状态 / 版本
+// ============================================================
+export struct FsStat {
+    exists: bool,
+    is_dir: bool,
+    size: i64,
+    mtime: i64,
+    mtime_nsec: i64,
+}
+
+export fn fs_stat(abs_z: &const byte, out: &FsStat) bool {
+    out.exists = false;
+    out.is_dir = false;
+    out.size = 0;
+    out.mtime = 0;
+    out.mtime_nsec = 0;
+    var st: Stat = Stat{
+        st_dev: 0,
+        st_ino: 0,
+        st_nlink: 0,
+        st_mode: 0,
+        st_uid: 0,
+        st_gid: 0,
+        _pad0: 0,
+        st_rdev: 0,
+        st_size: 0,
+        st_blksize: 0,
+        st_blocks: 0,
+        st_atime: 0,
+        st_atime_nsec: 0,
+        st_mtime: 0,
+        st_mtime_nsec: 0,
+        st_ctime: 0,
+        st_ctime_nsec: 0,
+        _unused0: 0,
+        _unused1: 0,
+        _unused2: 0,
+    };
+    _ = sys_stat(abs_z as *const byte, &st) catch {
+        return false;
+    };
+    out.exists = true;
+    out.size = st.st_size;
+    out.mtime = st.st_mtime;
+    out.mtime_nsec = st.st_mtime_nsec;
+    // S_IFDIR = 0o40000
+    out.is_dir = ((st.st_mode as i32) & 61440) == 16384;
+    return true;
+}
+
+fn fs_ver_changed(a: &const FsStat, b: &const FsStat) bool {
+    if a.mtime != b.mtime || a.mtime_nsec != b.mtime_nsec || a.size != b.size {
+        return true;
+    }
+    return false;
+}
+
+// ============================================================
+// 观察状态表
+// ============================================================
+const OBS_UNSEEN: u8 = 0;
+const OBS_PRESENT: u8 = 1;
+const OBS_ABSENT: u8 = 2;
+
+struct FsObs {
+    kind: u8,
+    path: Buf,
+    mtime: i64,
+    mtime_nsec: i64,
+    size: i64,
+}
+
+export struct FsObsTable {
+    items: [FsObs: FS_OBS_MAX],
+    n: usize,
+}
+
+fn fs_obs_empty() FsObs {
+    return FsObs{ kind: OBS_UNSEEN, path: buf_empty(), mtime: 0, mtime_nsec: 0, size: 0 };
+}
+
+export fn fs_obs_init(t: &FsObsTable) void {
+    var i: usize = 0;
+    while i < FS_OBS_MAX {
+        t.items[i] = fs_obs_empty();
+        i = i + 1;
+    }
+    t.n = 0;
+}
+
+export fn fs_obs_free(t: &FsObsTable) void {
+    var i: usize = 0;
+    while i < t.n {
+        buf_free(&t.items[i].path);
+        t.items[i] = fs_obs_empty();
+        i = i + 1;
+    }
+    t.n = 0;
+}
+
+fn fs_obs_find(t: &const FsObsTable, abs: &const byte, abs_len: usize) isize {
+    var i: usize = 0;
+    while i < t.n && i < FS_OBS_MAX {
+        const it: &const FsObs = &t.items[i];
+        if it.path.len == abs_len && bufx_mem_eq(it.path.ptr as &const byte, abs, abs_len) {
+            return i as isize;
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+export fn fs_obs_record(t: &FsObsTable, abs: &const byte, abs_len: usize, st: &const FsStat) void {
+    const found: isize = fs_obs_find(t, abs, abs_len);
+    if found >= 0 {
+        const fi: usize = found as usize;
+        if fi >= FS_OBS_MAX {
+            return;
+        }
+        const it: &FsObs = &t.items[fi];
+        if st.exists {
+            it.kind = OBS_PRESENT;
+            it.mtime = st.mtime;
+            it.mtime_nsec = st.mtime_nsec;
+            it.size = st.size;
+        } else {
+            it.kind = OBS_ABSENT;
+        }
+        return;
+    }
+    const idx: usize = t.n;
+    if idx >= FS_OBS_MAX {
+        return;
+    }
+    const it2: &FsObs = &t.items[idx];
+    it2.kind = OBS_ABSENT;
+    if st.exists {
+        it2.kind = OBS_PRESENT;
+    }
+    it2.path = buf_new(abs_len + 8);
+    if buf_valid(&it2.path) {
+        _ = buf_append(&it2.path, abs, abs_len);
+    }
+    it2.mtime = st.mtime;
+    it2.mtime_nsec = st.mtime_nsec;
+    it2.size = st.size;
+    t.n = idx + 1;
+}
+
+// 观察状态：0=unseen 1=present 2=absent
+export fn fs_obs_kind(t: &const FsObsTable, abs: &const byte, abs_len: usize) u8 {
+    const found: isize = fs_obs_find(t, abs, abs_len);
+    if found < 0 {
+        return OBS_UNSEEN;
+    }
+    const fi: usize = found as usize;
+    if fi >= FS_OBS_MAX {
+        return OBS_UNSEEN;
+    }
+    return t.items[fi].kind;
+}
+
+// 观察到的版本是否仍与磁盘一致
+export fn fs_obs_same_version(t: &const FsObsTable, abs: &const byte, abs_len: usize, st: &const FsStat) bool {
+    const found: isize = fs_obs_find(t, abs, abs_len);
+    if found < 0 {
+        return false;
+    }
+    const fi: usize = found as usize;
+    if fi >= FS_OBS_MAX {
+        return false;
+    }
+    const it: &const FsObs = &t.items[fi];
+    if it.kind != OBS_PRESENT || !st.exists {
+        return false;
+    }
+    if it.mtime != st.mtime || it.mtime_nsec != st.mtime_nsec || it.size != st.size {
+        return false;
+    }
+    return true;
+}
+
+// ============================================================
+// 结果信封
+// ============================================================
+fn fs_env_open(out: &Buf, display: &const Buf, kind: &const byte) bool {
+    if !buf_append_cstr(out, "<path>") {
+        return false;
+    }
+    if !buf_append(out, display.ptr, display.len) {
+        return false;
+    }
+    if !buf_append_cstr(out, "</path>\n<type>") {
+        return false;
+    }
+    if !buf_append_cstr(out, kind) {
+        return false;
+    }
+    return buf_append_cstr(out, "</type>\n<content>\n");
+}
+
+fn fs_env_close(out: &Buf) bool {
+    return buf_append_cstr(out, "\n</content>");
+}
+
+fn fs_err(out: &Buf, msg: &const byte) void {
+    _ = buf_append_cstr(out, "Error: ");
+    _ = buf_append_cstr(out, msg);
+}
+
+// ============================================================
+// read
+// ============================================================
+struct FsLine {
+    off: usize,
+    len: usize,
+}
+
+fn fs_count_lines(data: &[byte]) usize {
+    if data.len == 0 {
+        return 0;
+    }
+    var n: usize = 0;
+    var i: usize = 0;
+    while i < data.len {
+        if data.ptr[i] == 10 as byte {
+            n = n + 1;
+        }
+        i = i + 1;
+    }
+    // 最后一行没有换行结尾也算一行
+    if data.len > 0 && data.ptr[data.len - 1] != 10 as byte {
+        n = n + 1;
+    }
+    return n;
+}
+
+// 第 idx 行（0 基）的字节范围
+fn fs_line_at(data: &[byte], idx: usize, out: &FsLine) bool {
+    var cur: usize = 0;
+    var start: usize = 0;
+    var i: usize = 0;
+    while i < data.len {
+        if data.ptr[i] == 10 as byte {
+            if cur == idx {
+                out.off = start;
+                var e: usize = i;
+                if e > start && data.ptr[e - 1] == 13 as byte {
+                    e = e - 1;
+                }
+                out.len = e - start;
+                return true;
+            }
+            cur = cur + 1;
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    if cur == idx {
+        out.off = start;
+        out.len = data.len - start;
+        return true;
+    }
+    return false;
+}
+
+// read 工具。args 已解析成 JSON；结果写进 out。
+export fn fs_tool_read(f: &const FsCtx, obs: &FsObsTable, args: &const JsonValue, out: &Buf) void {
+    var rel: Buf = buf_empty();
+    defer { buf_free(&rel); }
+    if !js_obj_get_str_unescaped(args, "file_path", 9, &rel) || rel.len == 0 {
+        fs_err(out, "file_path must be a non-empty string");
+        return;
+    }
+    var offset: usize = 1;
+    var limit: usize = fs_read_limit;
+    var nv: JsonValue = JsonValue.json_null();
+    var n: i64 = 0;
+    if js_obj_get(args, "offset", 6, &nv) && js_i64_of(&nv, &n) && n >= 1 {
+        offset = n as usize;
+    }
+    if js_obj_get(args, "limit", 5, &nv) && js_i64_of(&nv, &n) && n >= 1 {
+        limit = n as usize;
+        if limit > fs_read_limit {
+            limit = fs_read_limit;
+        }
+    }
+    var abs: Buf = buf_new(FS_PATH_MAX);
+    defer { buf_free(&abs); }
+    const rc: i32 = fs_resolve(f, rel.ptr as &const byte, rel.len, &abs);
+    if rc == 1 {
+        fs_err(out, "unsafe path (absolute paths and \"..\" are rejected in confined mode)");
+        return;
+    }
+    if rc != 0 {
+        fs_err(out, "out of memory");
+        return;
+    }
+    var st: FsStat = FsStat{ exists: false, is_dir: false, size: 0, mtime: 0, mtime_nsec: 0 };
+    _ = fs_stat(abs.ptr as &const byte, &st);
+    var disp: Buf = buf_new(FS_PATH_MAX);
+    defer { buf_free(&disp); }
+    _ = fs_display(f, rel.ptr as &const byte, rel.len, &disp);
+    if !st.exists {
+        fs_obs_record(obs, abs.ptr as &const byte, abs.len - 1, &st);
+        _ = buf_append_cstr(out, "Error: cannot read \"");
+        _ = buf_append(out, disp.ptr, disp.len);
+        _ = buf_append_cstr(out, "\": file not found");
+        return;
+    }
+    if st.is_dir {
+        _ = buf_append_cstr(out, "Error: cannot read \"");
+        _ = buf_append(out, disp.ptr, disp.len);
+        _ = buf_append_cstr(out, "\": is a directory");
+        return;
+    }
+    // 读文件（上限 = 选中的行可能达到的字节数上限 + 余量）
+    const cap: usize = fs_read_max_bytes + 65536;
+    var data: Buf = buf_new(cap);
+    defer { buf_free(&data); }
+    if !fs_read_file_all(abs.ptr as &const byte, &data, cap + 1) {
+        _ = buf_append_cstr(out, "Error: cannot read \"");
+        _ = buf_append(out, disp.ptr, disp.len);
+        _ = buf_append_cstr(out, "\"");
+        return;
+    }
+    // 读到内容 → 记录观察状态（DSH：任何窗口的 read 都算「观察过」）
+    fs_obs_record(obs, abs.ptr as &const byte, abs.len - 1, &st);
+
+    const view: &[byte] = data.ptr[0: data.len];
+    const total: usize = fs_count_lines(view);
+    const first: usize = offset - 1;
+    var end: usize = first + limit;
+    if end > total {
+        end = total;
+    }
+    var bytes_used: usize = 0;
+    var capped_bytes: bool = false;
+    if !fs_env_open(out, &disp, "file") {
+        return;
+    }
+    var ln: usize = first;
+    while ln < end {
+        var line: FsLine = FsLine{ off: 0, len: 0 };
+        if !fs_line_at(view, ln, &line) {
+            break;
+        }
+        var take: usize = line.len;
+        var trunc_line: bool = false;
+        // 行长上限（按字符数，不切断 UTF-8）
+        const cps: usize = bufx_utf8_count(&view.ptr[line.off], take);
+        if cps > fs_read_max_line {
+            take = bufx_utf8_prefix_bytes(&view.ptr[line.off], take, fs_read_max_line);
+            trunc_line = true;
+        }
+        if bytes_used + take + 24 > fs_read_max_bytes {
+            capped_bytes = true;
+            break;
+        }
+        // 行号
+        _ = buf_append_u64(out, (ln + 1) as u64);
+        _ = buf_append_cstr(out, ": ");
+        _ = buf_append(out, &view.ptr[line.off], take);
+        if trunc_line {
+            _ = buf_append_cstr(out, "... (line truncated to ");
+            _ = buf_append_u64(out, fs_read_max_line as u64);
+            _ = buf_append_cstr(out, " chars)");
+        }
+        _ = buf_append_byte(out, 10);
+        bytes_used = bytes_used + take;
+        ln = ln + 1;
+    }
+    const shown_end: usize = ln;   // 已输出的最后一行（1 基）
+    if shown_end == 0 {
+        // 一行都没输出（空文件或 offset 越界）
+        _ = buf_append_cstr(out, "(End of file - total ");
+        _ = buf_append_u64(out, total as u64);
+        _ = buf_append_cstr(out, " lines)\n");
+    } else if capped_bytes {
+        _ = buf_append_cstr(out, "\n(Output capped. Showing lines ");
+        _ = buf_append_u64(out, offset as u64);
+        _ = buf_append_cstr(out, "-");
+        _ = buf_append_u64(out, shown_end as u64);
+        _ = buf_append_cstr(out, ". Use offset=");
+        _ = buf_append_u64(out, (shown_end + 1) as u64);
+        _ = buf_append_cstr(out, " to continue.)\n");
+    } else if shown_end < total {
+        _ = buf_append_cstr(out, "\n(Showing lines ");
+        _ = buf_append_u64(out, offset as u64);
+        _ = buf_append_cstr(out, "-");
+        _ = buf_append_u64(out, shown_end as u64);
+        _ = buf_append_cstr(out, " of ");
+        _ = buf_append_u64(out, total as u64);
+        _ = buf_append_cstr(out, ". Use offset=");
+        _ = buf_append_u64(out, (shown_end + 1) as u64);
+        _ = buf_append_cstr(out, " to continue.)\n");
+    } else {
+        _ = buf_append_cstr(out, "\n(End of file - total ");
+        _ = buf_append_u64(out, total as u64);
+        _ = buf_append_cstr(out, " lines)\n");
+    }
+    _ = fs_env_close(out);
+}
+
+fn fs_read_file_all(abs_z: &const byte, out: &Buf, limit: usize) bool {
+    const fd: i32 = sys_open(abs_z as *const byte, O_RDONLY as i32, 0) catch {
+        return false;
+    };
+    defer { _ = sys_close(fd) catch {}; }
+    buf_reset(out);
+    var tmp: [byte: 32768] = [0: 32768];
+    while true {
+        const n: isize = sys_read(fd, &tmp[0], 32768) catch { 0 as isize; };
+        if n <= 0 {
+            break;
+        }
+        if !buf_append(out, &tmp[0], n as usize) {
+            return false;
+        }
+        if out.len > limit {
+            break;
+        }
+    }
+    return true;
+}
+
+// ============================================================
+// write
+// ============================================================
+fn fs_mkdir_parent(abs_z: &const byte) bool {
+    const n: usize = bufx_cstr_len(abs_z);
+    var i: usize = n;
+    while i > 0 && abs_z[i - 1] != 47 as byte {
+        i = i - 1;
+    }
+    if i == 0 || i == 1 {
+        return false;
+    }
+    var dir: Buf = buf_new(i + 1);
+    defer { buf_free(&dir); }
+    _ = buf_append(&dir, abs_z, i - 1);
+    _ = buf_append_byte(&dir, 0);
+    _ = sys_mkdir(&dir.ptr[0] as *const byte, 493 as u32) catch {};
+    return true;
+}
+
+export fn fs_tool_write(f: &const FsCtx, obs: &FsObsTable, args: &const JsonValue, out: &Buf) void {
+    var rel: Buf = buf_empty();
+    defer { buf_free(&rel); }
+    if !js_obj_get_str_unescaped(args, "file_path", 9, &rel) || rel.len == 0 {
+        fs_err(out, "file_path must be a non-empty string");
+        return;
+    }
+    var content: Buf = buf_empty();
+    defer { buf_free(&content); }
+    if !js_obj_get_str_unescaped(args, "content", 7, &content) {
+        fs_err(out, "missing string argument \"content\"");
+        return;
+    }
+    var abs: Buf = buf_new(FS_PATH_MAX);
+    defer { buf_free(&abs); }
+    const rc: i32 = fs_resolve(f, rel.ptr as &const byte, rel.len, &abs);
+    if rc == 1 {
+        fs_err(out, "unsafe path (absolute paths and \"..\" are rejected in confined mode)");
+        return;
+    }
+    if rc != 0 {
+        fs_err(out, "out of memory");
+        return;
+    }
+    var st: FsStat = FsStat{ exists: false, is_dir: false, size: 0, mtime: 0, mtime_nsec: 0 };
+    _ = fs_stat(abs.ptr as &const byte, &st);
+    var disp: Buf = buf_new(FS_PATH_MAX);
+    defer { buf_free(&disp); }
+    _ = fs_display(f, rel.ptr as &const byte, rel.len, &disp);
+
+    // 观察策略：已存在且版本变了 → 拒绝；已存在但没读过 → 也拒绝（避免静默覆盖）
+    if st.exists {
+        const kind: u8 = fs_obs_kind(obs, abs.ptr as &const byte, abs.len - 1);
+        if kind == OBS_UNSEEN {
+            _ = buf_append_cstr(out, "Error: write requires reading \"");
+            _ = buf_append(out, disp.ptr, disp.len);
+            _ = buf_append_cstr(out, "\" first — read the file, then retry");
+            return;
+        }
+        if !fs_obs_same_version(obs, abs.ptr as &const byte, abs.len - 1, &st) {
+            _ = buf_append_cstr(out, "Error: cannot write \"");
+            _ = buf_append(out, disp.ptr, disp.len);
+            _ = buf_append_cstr(out, "\": file changed since it was read (FS_STALE_VERSION) — re-read the file, then retry");
+            return;
+        }
+    }
+    const flags: i32 = (O_WRONLY | O_CREAT | O_TRUNC) as i32;
+    var fd: i32 = sys_open(abs.ptr as *const byte, flags, 420) catch {
+        -1;
+    };
+    if fd < 0 {
+        if fs_mkdir_parent(abs.ptr as &const byte) {
+            fd = sys_open(abs.ptr as *const byte, flags, 420) catch {
+                -1;
+            };
+        }
+    }
+    if fd < 0 {
+        _ = buf_append_cstr(out, "Error: cannot create \"");
+        _ = buf_append(out, disp.ptr, disp.len);
+        _ = buf_append_cstr(out, "\"");
+        return;
+    }
+    var ok: bool = true;
+    if content.len > 0 {
+        ok = write_all_fd(fd, content.ptr as &const byte, content.len);
+    }
+    _ = sys_close(fd) catch {};
+    if !ok {
+        fs_err(out, "write failed");
+        return;
+    }
+    // 写成功：刷新观察状态（下次覆盖不需要重新 read）
+    var st2: FsStat = FsStat{ exists: false, is_dir: false, size: 0, mtime: 0, mtime_nsec: 0 };
+    _ = fs_stat(abs.ptr as &const byte, &st2);
+    fs_obs_record(obs, abs.ptr as &const byte, abs.len - 1, &st2);
+    if !fs_env_open(out, &disp, "file") {
+        return;
+    }
+    if st.exists {
+        _ = buf_append_cstr(out, "Updated file");
+    } else {
+        _ = buf_append_cstr(out, "Created file");
+    }
+    _ = fs_env_close(out);
+}
+
+// ============================================================
+// edit（字面替换；唯一匹配；需要先 read）
+// ============================================================
+fn fs_count_occurrences(data: &[byte], needle: &[byte]) i32 {
+    if needle.len == 0 || data.len < needle.len {
+        return 0;
+    }
+    var n: i32 = 0;
+    var from: usize = 0;
+    while true {
+        const at: isize = find_sub(data, needle, from);
+        if at < 0 {
+            break;
+        }
+        n = n + 1;
+        from = (at as usize) + needle.len;
+    }
+    return n;
+}
+
+export fn fs_tool_edit(f: &const FsCtx, obs: &FsObsTable, args: &const JsonValue, out: &Buf) void {
+    var rel: Buf = buf_empty();
+    defer { buf_free(&rel); }
+    if !js_obj_get_str_unescaped(args, "file_path", 9, &rel) || rel.len == 0 {
+        fs_err(out, "file_path must be a non-empty string");
+        return;
+    }
+    var old_s: Buf = buf_empty();
+    defer { buf_free(&old_s); }
+    if !js_obj_get_str_unescaped(args, "old_string", 10, &old_s) || old_s.len == 0 {
+        fs_err(out, "old_string must be a non-empty string");
+        return;
+    }
+    var new_s: Buf = buf_empty();
+    defer { buf_free(&new_s); }
+    if !js_obj_get_str_unescaped(args, "new_string", 10, &new_s) {
+        fs_err(out, "missing string argument \"new_string\"");
+        return;
+    }
+    if old_s.len == new_s.len && bufx_mem_eq(old_s.ptr as &const byte, new_s.ptr as &const byte, old_s.len) {
+        fs_err(out, "old_string and new_string must differ");
+        return;
+    }
+    var replace_all: bool = false;
+    var bv: JsonValue = JsonValue.json_null();
+    if js_obj_get(args, "replace_all", 11, &bv) {
+        replace_all = json_bool_of(&bv);
+    }
+    var abs: Buf = buf_new(FS_PATH_MAX);
+    defer { buf_free(&abs); }
+    const rc: i32 = fs_resolve(f, rel.ptr as &const byte, rel.len, &abs);
+    if rc == 1 {
+        fs_err(out, "unsafe path (absolute paths and \"..\" are rejected in confined mode)");
+        return;
+    }
+    if rc != 0 {
+        fs_err(out, "out of memory");
+        return;
+    }
+    var disp: Buf = buf_new(FS_PATH_MAX);
+    defer { buf_free(&disp); }
+    _ = fs_display(f, rel.ptr as &const byte, rel.len, &disp);
+    var st: FsStat = FsStat{ exists: false, is_dir: false, size: 0, mtime: 0, mtime_nsec: 0 };
+    _ = fs_stat(abs.ptr as &const byte, &st);
+    const kind: u8 = fs_obs_kind(obs, abs.ptr as &const byte, abs.len - 1);
+    if !st.exists {
+        if kind == OBS_UNSEEN {
+            _ = buf_append_cstr(out, "Error: edit requires reading \"");
+            _ = buf_append(out, disp.ptr, disp.len);
+            _ = buf_append_cstr(out, "\" first — read the file, then retry");
+            return;
+        }
+        _ = buf_append_cstr(out, "Error: cannot edit \"");
+        _ = buf_append(out, disp.ptr, disp.len);
+        _ = buf_append_cstr(out, "\": file not found");
+        return;
+    }
+    if kind == OBS_UNSEEN {
+        _ = buf_append_cstr(out, "Error: edit requires reading \"");
+        _ = buf_append(out, disp.ptr, disp.len);
+        _ = buf_append_cstr(out, "\" first — read the file, then retry");
+        return;
+    }
+    if !fs_obs_same_version(obs, abs.ptr as &const byte, abs.len - 1, &st) {
+        _ = buf_append_cstr(out, "Error: cannot edit \"");
+        _ = buf_append(out, disp.ptr, disp.len);
+        _ = buf_append_cstr(out, "\": file changed since it was read (FS_STALE_VERSION) — re-read the file, then retry");
+        return;
+    }
+    const cap: usize = 4 * 1024 * 1024;
+    var data: Buf = buf_new(cap);
+    defer { buf_free(&data); }
+    if !fs_read_file_all(abs.ptr as &const byte, &data, cap) {
+        fs_err(out, "cannot read file for edit");
+        return;
+    }
+    const view: &[byte] = data.ptr[0: data.len];
+    const needle: &[byte] = old_s.ptr[0: old_s.len];
+    const hits: i32 = fs_count_occurrences(view, needle);
+    if hits == 0 {
+        fs_err(out, "old_string not found in the file");
+        return;
+    }
+    if hits > 1 && !replace_all {
+        _ = buf_append_cstr(out, "Error: old_string appears ");
+        _ = buf_append_u64(out, hits as u64);
+        _ = buf_append_cstr(out, " times; make it unique or pass replace_all=true");
+        return;
+    }
+    // 生成新内容
+    var outdata: Buf = buf_new(data.len + 4096);
+    defer { buf_free(&outdata); }
+    var from: usize = 0;
+    while true {
+        const at: isize = find_sub(view, needle, from);
+        if at < 0 {
+            _ = buf_append(&outdata, &data.ptr[from], data.len - from);
+            break;
+        }
+        const ai: usize = at as usize;
+        _ = buf_append(&outdata, &data.ptr[from], ai - from);
+        _ = buf_append(&outdata, new_s.ptr as &const byte, new_s.len);
+        from = ai + needle.len;
+        if !replace_all {
+            _ = buf_append(&outdata, &data.ptr[from], data.len - from);
+            break;
+        }
+    }
+    const wflags: i32 = (O_WRONLY | O_CREAT | O_TRUNC) as i32;
+    const wfd: i32 = sys_open(abs.ptr as *const byte, wflags, 420) catch {
+        -1;
+    };
+    if wfd < 0 {
+        fs_err(out, "cannot open file for writing");
+        return;
+    }
+    var wok: bool = true;
+    if outdata.len > 0 {
+        wok = write_all_fd(wfd, outdata.ptr as &const byte, outdata.len);
+    }
+    _ = sys_close(wfd) catch {};
+    if !wok {
+        fs_err(out, "write failed");
+        return;
+    }
+    var st3: FsStat = FsStat{ exists: false, is_dir: false, size: 0, mtime: 0, mtime_nsec: 0 };
+    _ = fs_stat(abs.ptr as &const byte, &st3);
+    fs_obs_record(obs, abs.ptr as &const byte, abs.len - 1, &st3);
+
+    if replace_all {
+        _ = buf_append_cstr(out, "The file ");
+        _ = buf_append(out, disp.ptr, disp.len);
+        _ = buf_append_cstr(out, " has been updated. All occurrences were successfully replaced.");
+    } else {
+        _ = buf_append_cstr(out, "The file ");
+        _ = buf_append(out, disp.ptr, disp.len);
+        _ = buf_append_cstr(out, " has been updated successfully.");
+    }
+}
+
+fn json_bool_of(v: &const JsonValue) bool {
+    const val: JsonValue = v[0];
+    match val {
+        .bool_val(x) => {
+            return x;
+        },
+        else => {
+            return false;
+        },
+    }
+}

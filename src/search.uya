@@ -1,0 +1,425 @@
+// src/search.uya — glob / grep（P6，对齐 DSH tool-fs-search）
+//
+// DSH 的 glob/grep 本身就是 ripgrep 子进程封装，这里保持一致：
+//   glob：`rg --files --glob <pattern> --sort=modified --no-ignore --hidden` + VCS 目录排除，
+//         默认只显示前 100 条（globMaxResults）；
+//   grep：`rg --json` 逐行解析（不做冒号切分），按文件分组输出 `Line N: <preview>`，
+//         最多 250 条（grepMaxMatches），每行预览最多 2000 字节（grepMaxLineBytes）。
+//
+// 与 shell 工具一样：fork + pipe + poll 读子进程输出，墙钟超时 → SIGKILL。
+
+use libc.syscall;
+use libc.unistd;
+use libc.fcntl;
+use libc.signal;
+use std.runtime.saved_envp;
+
+export var search_glob_max: usize = 100;
+export var search_grep_max: usize = 250;
+export var search_line_max: usize = 2000;
+export var search_timeout_ms: u32 = 30000;
+const SEARCH_OUT_MAX: usize = 8 * 1024 * 1024;
+
+// ============================================================
+// 跑一个 rg 子进程；返回退出码，stdout 收进 out
+// ============================================================
+fn rg_run(argv: &(&const byte), cwd: &const byte, out: &Buf) i32 {
+    var fds: [i32: 2] = [0: 2];
+    sys_pipe2(&fds[0], 0) catch {
+        return -1;
+    };
+    const pid64: i64 = sys_fork() catch {
+        _ = sys_close(fds[0]) catch {};
+        _ = sys_close(fds[1]) catch {};
+        return -1;
+    };
+    if pid64 == 0 {
+        // 子进程：stdout → 管道，切到工作目录，exec rg
+        _ = sys_close(fds[0]) catch {};
+        _ = sys_dup2(fds[1], 1) catch {};
+        _ = sys_dup2(fds[1], 2) catch {};
+        _ = sys_close(fds[1]) catch {};
+        _ = sys_chdir(cwd as *const byte) catch {};
+        var rgpath: [byte: 16] = "/usr/bin/rg";
+        _ = sys_execve(&rgpath[0], argv, saved_envp) catch {};
+        // execve 失败：退回 PATH 查找
+        var rg2: [byte: 4] = "rg";
+        _ = sys_execve(&rg2[0], argv, saved_envp) catch {};
+        sys_exit(127);
+    }
+    const pid: i32 = i64_to_i32(pid64);
+    _ = sys_close(fds[1]) catch {};
+    var chunk: [byte: 32768] = [0: 32768];
+    var pfds: [PollFd: 1] = [PollFd{ fd: fds[0], events: POLLIN, revents: 0 }];
+    const started: u64 = ua_now_ms();
+    var done: bool = false;
+    while !done {
+        const pr: i32 = sys_poll(&pfds[0], 1, 100) catch { 0; };
+        if pr > 0 && ((pfds[0].revents & POLLIN) != 0 || (pfds[0].revents & POLLHUP) != 0 || (pfds[0].revents & POLLERR) != 0) {
+            const n: isize = sys_read(fds[0], &chunk[0], 32768) catch { 0 as isize; };
+            if n <= 0 {
+                done = true;
+            } else if out.len < SEARCH_OUT_MAX {
+                _ = buf_append(out, &chunk[0], n as usize);
+            }
+        }
+        if !done && search_timeout_ms > 0 {
+            if (ua_now_ms() - started) >= (search_timeout_ms as u64) {
+                _ = sys_kill(pid as i64, SIGKILL) catch {};
+                done = true;
+            }
+        }
+    }
+    _ = sys_close(fds[0]) catch {};
+    var st: i32 = 0;
+    _ = sys_waitpid(pid, &st, 0) catch {};
+    return (st >> (8 as i32)) & 255;
+}
+
+// 静态 argv 槽位（进程级、单次调用有效）
+const RG_ARGV_MAX: usize = 24;
+var g_rg_argv: [&const byte: RG_ARGV_MAX] = [null as &const byte: RG_ARGV_MAX];
+
+fn rg_argv_reset() void {
+    var i: usize = 0;
+    while i < RG_ARGV_MAX {
+        g_rg_argv[i] = null as &const byte;
+        i = i + 1;
+    }
+}
+
+// ============================================================
+// glob
+// ============================================================
+fn glob_is_dir(f: &const FsCtx, abs: &const Buf, st: &FsStat) bool {
+    _ = f;
+    return st.is_dir;
+}
+
+export fn search_glob(f: &const FsCtx, args: &const JsonValue, out: &Buf) void {
+    var pattern: Buf = buf_empty();
+    defer { buf_free(&pattern); }
+    if !js_obj_get_str_unescaped(args, "pattern", 7, &pattern) || pattern.len == 0 {
+        _ = buf_append_cstr(out, "Error: pattern must be a non-empty string");
+        return;
+    }
+    var rel: Buf = buf_empty();
+    defer { buf_free(&rel); }
+    var have_rel: bool = false;
+    if js_obj_get_str_unescaped(args, "path", 4, &rel) && rel.len > 0 {
+        have_rel = true;
+    }
+    var cwd: Buf = buf_new(FS_PATH_MAX);
+    defer { buf_free(&cwd); }
+    if have_rel {
+        const rc: i32 = fs_resolve(f, rel.ptr as &const byte, rel.len, &cwd);
+        if rc == 1 {
+            _ = buf_append_cstr(out, "Error: unsafe path (absolute paths and \"..\" are rejected in confined mode)");
+            return;
+        }
+        if rc != 0 {
+            _ = buf_append_cstr(out, "Error: out of memory");
+            return;
+        }
+    } else {
+        _ = buf_append(&cwd, f.workspace, f.workspace_len);
+        _ = buf_append_byte(&cwd, 0);
+    }
+
+    var pat_z: Buf = buf_new(pattern.len + 1);
+    defer { buf_free(&pat_z); }
+    _ = buf_append(&pat_z, pattern.ptr, pattern.len);
+    _ = buf_append_byte(&pat_z, 0);
+
+    rg_argv_reset();
+    g_rg_argv[0] = "rg" as &const byte;
+    g_rg_argv[1] = "--files" as &const byte;
+    g_rg_argv[2] = "--no-ignore" as &const byte;
+    g_rg_argv[3] = "--hidden" as &const byte;
+    g_rg_argv[4] = "--sort=modified" as &const byte;
+    g_rg_argv[5] = "--glob" as &const byte;
+    g_rg_argv[6] = pat_z.ptr as &const byte;
+    // VCS 元数据目录排除（与 DSH 的排除表一致）
+    g_rg_argv[7] = "--glob" as &const byte;
+    g_rg_argv[8] = "!.git" as &const byte;
+    g_rg_argv[9] = "--glob" as &const byte;
+    g_rg_argv[10] = "!.svn" as &const byte;
+    g_rg_argv[11] = "--glob" as &const byte;
+    g_rg_argv[12] = "!.hg" as &const byte;
+    g_rg_argv[13] = "--glob" as &const byte;
+    g_rg_argv[14] = "!.bzr" as &const byte;
+    g_rg_argv[15] = "--glob" as &const byte;
+    g_rg_argv[16] = "!.jj" as &const byte;
+    g_rg_argv[17] = "--glob" as &const byte;
+    g_rg_argv[18] = "!.sl" as &const byte;
+    g_rg_argv[19] = "." as &const byte;
+    g_rg_argv[20] = null as &const byte;
+
+    var raw: Buf = buf_new(65536);
+    defer { buf_free(&raw); }
+    const code: i32 = rg_run(&g_rg_argv[0], cwd.ptr as &const byte, &raw);
+    if code < 0 {
+        _ = buf_append_cstr(out, "Error: cannot run rg (SEARCH_FAILED)");
+        return;
+    }
+    if code == 2 {
+        _ = buf_append_cstr(out, "Error: rg rejected the pattern (SEARCH_INVALID_PATTERN)");
+        return;
+    }
+    // 逐行输出（最多 globMaxResults 条）
+    const view: &[byte] = raw.ptr[0: raw.len];
+    var pos: usize = 0;
+    var shown: usize = 0;
+    var total: usize = 0;
+    while pos < view.len {
+        var le: usize = pos;
+        while le < view.len && view.ptr[le] != 10 as byte {
+            le = le + 1;
+        }
+        if le > pos {
+            total = total + 1;
+            if shown < search_glob_max {
+                if shown > 0 {
+                    _ = buf_append_byte(out, 10);
+                }
+                // 去掉 "./" 前缀，保持与 DSH 一样的显示
+                var s: usize = pos;
+                if le - pos > 2 && view.ptr[s] == 46 as byte && view.ptr[s + 1] == 47 as byte {
+                    s = s + 2;
+                }
+                _ = buf_append(out, &view.ptr[s], le - s);
+                shown = shown + 1;
+            }
+        }
+        pos = le + 1;
+    }
+    if total == 0 {
+        _ = buf_append_cstr(out, "No files found");
+        return;
+    }
+    if total > shown {
+        _ = buf_append_cstr(out, "\n… (");
+        _ = buf_append_u64(out, shown as u64);
+        _ = buf_append_cstr(out, " of ");
+        _ = buf_append_u64(out, total as u64);
+        _ = buf_append_cstr(out, " paths shown; narrow the pattern to see more)");
+    }
+    if !glob_is_dir(f, &cwd, &(FsStat{ exists: true, is_dir: true, size: 0, mtime: 0, mtime_nsec: 0 })) {
+        // 只是为了让编译器别报未使用（真实判断在 fs_resolve 里做过）
+        _ = buf_append_byte(out, 0);
+        out.len = out.len - 1;
+    }
+}
+
+// ============================================================
+// grep（rg --json）
+// ============================================================
+fn grep_include_ok(inc: &const Buf) bool {
+    if inc.len == 0 {
+        return false;
+    }
+    if inc.ptr[0] == 33 as byte {
+        return false;   // 以 ! 开头：拒绝
+    }
+    var i: usize = 0;
+    while i < inc.len {
+        if inc.ptr[i] == 44 as byte {
+            return false;   // 逗号列表：拒绝
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+export fn search_grep(f: &const FsCtx, args: &const JsonValue, out: &Buf) void {
+    var pattern: Buf = buf_empty();
+    defer { buf_free(&pattern); }
+    if !js_obj_get_str_unescaped(args, "pattern", 7, &pattern) || pattern.len == 0 {
+        _ = buf_append_cstr(out, "Error: pattern must be a non-empty string");
+        return;
+    }
+    var rel: Buf = buf_empty();
+    defer { buf_free(&rel); }
+    var have_rel: bool = false;
+    if js_obj_get_str_unescaped(args, "path", 4, &rel) && rel.len > 0 {
+        have_rel = true;
+    }
+    var inc: Buf = buf_empty();
+    defer { buf_free(&inc); }
+    var have_inc: bool = false;
+    if js_obj_get_str_unescaped(args, "include", 7, &inc) && inc.len > 0 {
+        if !grep_include_ok(&inc) {
+            _ = buf_append_cstr(out, "Error: include must be ONE positive glob (no leading '!' and no comma list)");
+            return;
+        }
+        have_inc = true;
+    }
+    var target: Buf = buf_new(FS_PATH_MAX);
+    defer { buf_free(&target); }
+    if have_rel {
+        const rc: i32 = fs_resolve(f, rel.ptr as &const byte, rel.len, &target);
+        if rc == 1 {
+            _ = buf_append_cstr(out, "Error: unsafe path (absolute paths and \"..\" are rejected in confined mode)");
+            return;
+        }
+        if rc != 0 {
+            _ = buf_append_cstr(out, "Error: out of memory");
+            return;
+        }
+    } else {
+        _ = buf_append(&target, f.workspace, f.workspace_len);
+        _ = buf_append_byte(&target, 0);
+    }
+    var pat_z: Buf = buf_new(pattern.len + 1);
+    defer { buf_free(&pat_z); }
+    _ = buf_append(&pat_z, pattern.ptr, pattern.len);
+    _ = buf_append_byte(&pat_z, 0);
+    var inc_z: Buf = buf_new(inc.len + 1);
+    defer { buf_free(&inc_z); }
+    if have_inc {
+        _ = buf_append(&inc_z, inc.ptr, inc.len);
+        _ = buf_append_byte(&inc_z, 0);
+    }
+
+    rg_argv_reset();
+    g_rg_argv[0] = "rg" as &const byte;
+    g_rg_argv[1] = "--json" as &const byte;
+    g_rg_argv[2] = "--no-ignore" as &const byte;
+    g_rg_argv[3] = "--hidden" as &const byte;
+    var slot: usize = 4;
+    if have_inc {
+        g_rg_argv[slot] = "--glob" as &const byte;
+        slot = slot + 1;
+        g_rg_argv[slot] = inc_z.ptr as &const byte;
+        slot = slot + 1;
+    }
+    g_rg_argv[slot] = "--glob" as &const byte;
+    slot = slot + 1;
+    g_rg_argv[slot] = "!.git" as &const byte;
+    slot = slot + 1;
+    g_rg_argv[slot] = "--" as &const byte;
+    slot = slot + 1;
+    g_rg_argv[slot] = pat_z.ptr as &const byte;
+    slot = slot + 1;
+    g_rg_argv[slot] = "." as &const byte;
+    slot = slot + 1;
+    g_rg_argv[slot] = null as &const byte;
+
+    var raw: Buf = buf_new(131072);
+    defer { buf_free(&raw); }
+    const code: i32 = rg_run(&g_rg_argv[0], target.ptr as &const byte, &raw);
+    if code < 0 {
+        _ = buf_append_cstr(out, "Error: cannot run rg (SEARCH_FAILED)");
+        return;
+    }
+    if code == 2 {
+        _ = buf_append_cstr(out, "Error: rg rejected the pattern (SEARCH_INVALID_PATTERN)");
+        return;
+    }
+
+    // 逐行解析 rg --json：{"type":"match","data":{"path":{"text":…},"line_number":N,"lines":{"text":…}}}
+    var arena_raw: &void = malloc(262144);
+    defer { free(arena_raw); }
+    if ((arena_raw as &byte) as usize) == 0 {
+        _ = buf_append_cstr(out, "Error: out of memory");
+        return;
+    }
+    var arena: Arena = Arena{ buffer: null, size: 0, used: 0 };
+    arena_init(&arena, arena_raw as &byte, 262144);
+
+    const view: &[byte] = raw.ptr[0: raw.len];
+    var pos: usize = 0;
+    var kept: usize = 0;
+    var seen: usize = 0;
+    var last_path: Buf = buf_new(1024);
+    defer { buf_free(&last_path); }
+    var line_buf: Buf = buf_new(65536);
+    defer { buf_free(&line_buf); }
+    while pos < view.len {
+        var le: usize = pos;
+        while le < view.len && view.ptr[le] != 10 as byte {
+            le = le + 1;
+        }
+        if le > pos {
+            buf_reset(&line_buf);
+            _ = buf_append(&line_buf, &view.ptr[pos], le - pos);
+            arena_reset(&arena);
+            var root: JsonValue = JsonValue.json_null();
+            if js_parse(&arena, line_buf.ptr, line_buf.len, &root) {
+                var tv: JsonValue = JsonValue.json_null();
+                var tsv: JsonStrView = JsonStrView{ ptr: null, len: 0 };
+                if js_obj_get(&root, "type", 4, &tv) && js_str_of(&tv, &tsv) && tsv.len == 5 {
+                    if bufx_mem_eq(tsv.ptr as &const byte, "match", 5) {
+                        var data: JsonValue = JsonValue.json_null();
+                        var pathv: JsonValue = JsonValue.json_null();
+                        var linesv: JsonValue = JsonValue.json_null();
+                        var psv: JsonStrView = JsonStrView{ ptr: null, len: 0 };
+                        var lsv: JsonStrView = JsonStrView{ ptr: null, len: 0 };
+                        var lnum: i64 = 0;
+                        var lnv: JsonValue = JsonValue.json_null();
+                        if js_obj_get(&root, "data", 4, &data) {
+                            seen = seen + 1;
+                            if js_obj_get(&data, "path", 4, &pathv) && js_obj_get_str(&pathv, "text", 4, &psv) {
+                                // 路径：去掉 "./"
+                                var s: usize = 0;
+                                if psv.len > 2 && psv.ptr[0] == 46 as byte && psv.ptr[1] == 47 as byte {
+                                    s = 2;
+                                }
+                                if !(last_path.len == psv.len - s && bufx_mem_eq(last_path.ptr as &const byte, &psv.ptr[s], psv.len - s)) {
+                                    buf_reset(&last_path);
+                                    _ = buf_append(&last_path, &psv.ptr[s], psv.len - s);
+                                    if kept > 0 {
+                                        _ = buf_append_byte(out, 10);
+                                    }
+                                    _ = buf_append(out, last_path.ptr, last_path.len);
+                                    _ = buf_append_cstr(out, ":");
+                                }
+                            }
+                            if js_obj_get(&data, "line_number", 11, &lnv) {
+                                _ = js_i64_of(&lnv, &lnum);
+                            }
+                            var preview: Buf = buf_new(2048);
+                            defer { buf_free(&preview); }
+                            if js_obj_get(&data, "lines", 5, &linesv) && js_obj_get_str(&linesv, "text", 4, &lsv) {
+                                // 去掉行尾换行
+                                var n: usize = lsv.len;
+                                while n > 0 && (lsv.ptr[n - 1] == 10 as byte || lsv.ptr[n - 1] == 13 as byte) {
+                                    n = n - 1;
+                                }
+                                var take: usize = n;
+                                var cut: bool = false;
+                                if take > search_line_max {
+                                    take = bufx_utf8_prefix_bytes(lsv.ptr, n, search_line_max);
+                                    cut = true;
+                                }
+                                _ = buf_append(&preview, lsv.ptr, take);
+                                if kept < search_grep_max {
+                                    _ = buf_append_cstr(out, "\nLine ");
+                                    _ = buf_append_u64(out, lnum as u64);
+                                    _ = buf_append_cstr(out, ": ");
+                                    _ = buf_append(&out[0], preview.ptr, preview.len);
+                                    if cut {
+                                        _ = buf_append_cstr(out, " (line truncated)");
+                                    }
+                                    kept = kept + 1;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        pos = le + 1;
+    }
+    if seen == 0 {
+        _ = buf_append_cstr(out, "No matches found");
+        return;
+    }
+    if seen > kept {
+        _ = buf_append_cstr(out, "\n… (");
+        _ = buf_append_u64(out, kept as u64);
+        _ = buf_append_cstr(out, " of ");
+        _ = buf_append_u64(out, seen as u64);
+        _ = buf_append_cstr(out, " matches shown; narrow the search to see more)");
+    }
+}

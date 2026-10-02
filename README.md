@@ -4,13 +4,15 @@
 多轮 loop 直到给出结论。全部代码 9 个 `.uya` 文件，**不引入任何 C 代码、`@c_import` 或其它语言**，
 只依赖 Uya 语言与随编译器分发的标准库。
 
-**P1–P5 已完成**：LLM 交互是**流式 SSE**（`stream:true` + `stream_options.include_usage`），
+**P1–P6 已完成**：LLM 交互是**流式 SSE**（`stream:true` + `stream_options.include_usage`），
 增量 chunked 解码 + SSE 分帧 + `tool_calls` 按 `index` 分片累积；消息协议是**严格工具协议**
 （`assistant.tool_calls` 原样回灌 + 每条结果一条 `role:"tool"` + `tool_call_id`）；
 交互界面是**真 TTY**（termios raw + 行编辑器），流式期间可打断、可继续输入、可续跑；
 会话**落盘可恢复**（`--continue` / `--resume` / `/sessions`，跨进程实测「记住 4271 → 下一个进程问它 → 答 4271」）；
 **直接读 DSH 的设置文件**：`--print-config` 显示 base_url / model / api_key / contextWindow 全部来自
-`~/.dsh`，实测**零参数启动**（只额外给信任策略）能直接跑通真机网关。`--no-stream` / `--compat-fold` 保留两条回退路径。
+`~/.dsh`，实测**零参数启动**（只额外给信任策略）能直接跑通真机网关；
+**工具改用 DSH 标准模式的原名**（`read`/`write`/`edit`/`glob`/`grep`），并实现了 DSH 的
+文件观察策略（read-before-write / 版本守卫）。`--no-stream` / `--compat-fold` 保留两条回退路径。
 
 ```
 $ DEEPSEEK_API_KEY=sk-xxx ./build/uya-agent "在当前目录创建 hello.uya，编译并运行它"
@@ -108,6 +110,10 @@ src/tty.uya       终端层：termios raw 模式、行编辑器（历史/光标/
 src/inbox.uya     输入收件箱：steer（运行中输入的文本，step 边界领取）+ keepInbox 语义
 src/yamlcfg.uya   自带 YAML 子集解析器：去注释（块标量/引号感知）、中和 `!!tag`、
                   block/flow 映射与序列、`|`/`>` 块标量、跨行 flow 集合、节点池树 + 导航
+src/fsx.uya       文件工具：路径解析（可选工作区守卫）、(mtime,size) 版本、观察状态表、
+                  read（窗口 + 行号 + 三种 footer + 行长/字节上限）、write（createIfAbsent /
+                  replaceIfVersion）、edit（唯一匹配 / replace_all）
+src/search.uya    glob / grep：rg 子进程（--files / --json）、VCS 目录排除、条数与行长上限
 src/dshcfg.uya    读 DSH 设置：$DSH_HOME 解析、settings.yaml 模型路线（agent-default-model →
                   provider 的 baseURL/apiKeyEnv/models[]）、.credentials.yaml、.env 兜底、
                   permission→confine、uya-agent.tls 命名空间
@@ -117,6 +123,22 @@ src/agent.uya     CLI、环境变量、消息历史、请求组装、主循环�
                   交互式 REPL（中断/steer//continue/会话命令）、会话事件记录与恢复
 src/selftest.uya  --selftest 的 mock LLM（含 SSE 受控切分）+ 15 轮断言 + --probe
 ```
+
+### 文件系统工具（P6，对齐 DSH tool-fs + fs-observation-policy）
+
+| 工具 | 参数 | 行为要点 |
+|---|---|---|
+| `read` | `file_path`(必), `offset`(1 基, 默认 1), `limit`(默认 2000, 上限 2000) | 逐行加行号，包在 `<path>/<type>file</type>/<content>` 里；footer 三种：`(End of file - total N lines)` / `(Showing lines a-b of T. Use offset=b+1 to continue.)` / `(Output capped. Showing lines a-b. …)`；行长 > 2000 字符截断并标 `... (line truncated to 2000 chars)`；一次最多 51200 字节 |
+| `write` | `file_path`(必), `content`(必) | **观察策略**：文件存在但**没读过** → 拒绝（`write requires reading "x" first — read the file, then retry`）；读过但**版本变了** → `FS_STALE_VERSION … re-read the file, then retry`；成功回 `Created file` / `Updated file` |
+| `edit` | `file_path`, `old_string`(非空), `new_string`, `replace_all`(默认 false) | 必须**先 read**（任何窗口）；匹配必须唯一（否则报 `appears N times`）；成功回 `The file X has been updated successfully.` / `… All occurrences were successfully replaced.` |
+| `glob` | `pattern`(必), `path`(可选目录) | `rg --files --glob <p> --sort=modified --no-ignore --hidden` + 排除 `.git/.svn/.hg/.bzr/.jj/.sl`；默认显示前 100 条；空 → `No files found` |
+| `grep` | `pattern`(必), `path`(可选), `include`(可选，一个正向 glob) | `rg --json` 逐行解析（不做冒号切分），按文件分组输出 `Line N: 预览`；最多 250 条、每行预览 2000 字节（超出标 ` (line truncated)`）；`include` 拒绝以 `!` 开头或逗号列表；空 → `No matches found` |
+
+* **版本**取 `(mtime, mtime_nsec, size)`；观察状态只在进程内（与 DSH 的已知限制一致：恢复会话后要重新 read）。
+* **路径守卫**默认关闭（对齐 DSH 的 `danger-full-access`）；`--confine` 打开后拒绝绝对路径与 `..`。
+  preset 的 `permission.defaultPreset` 会决定这个默认值（见 P5）。
+* 观察策略现在是硬约束：**没读过的已存在文件不能直接覆盖**，这会让「多轮自测」暴露出
+  清理脚本的 bug —— 本轮就靠它抓到了 `ws_prepare` 里少补 NUL 的 `unlink`（见踩坑 30）。
 
 ### DSH 设置文件兼容（P5）
 
@@ -368,6 +390,9 @@ agent 循环并逐项断言：
 | `interrupt` | 预置 Ctrl-C：回合以 `AGENT_INTERRUPTED` 结束、工具**未派发**、只发生一次请求 |
 | `tty-editor` | termios 布局(60B)/raw 位运算；行编辑（插入/退格/左右/Delete/Home/End/词删除）、
 一次喂入多行拆成多个提交、分片转义序列、裸 ESC 判定、历史上下翻、中断前缀裁剪 |
+| `fs-tools` | 一轮内 10 个文件工具调用：write（未读→拒）/ read（窗口+footer）/ write（读后覆盖）/
+edit（多匹配→拒、成功、找不到）/ glob（两条路径）/ grep（命中两行、无命中）/ glob（无文件）→
+第二轮断言全部结果文本，并逐字节校验最终落盘内容（含 edit 后的 `ALPHA one`） |
 | `dsh-config` | 假 `$DSH_HOME`：settings.yaml（block+flow 混排、行尾注释、跨行 flow、`|` 块标量、
 `!!js` 标签）+ `.credentials.yaml` → 断言 provider/model/baseURL/apiKeyEnv/凭据来源四层/
 contextWindow/maxTokens/input image/reasoningEffort/`permission→confine`/`uya-agent.tls` 命名空间；
@@ -384,6 +409,10 @@ contextWindow/maxTokens/input image/reasoningEffort/`permission→confine`/`uya-
   `"id":"call_…"` 保留、`"tool_call_id"` 条数与调用数一致（shell 2 / no-shell 1 / tools 4）。
 * TTY 交互用**真 pty** 验证（`script -qec`）：进入 raw 模式、banner 干净、一次粘贴
   4 行会分成 4 次提交（任务 → `/help` → `/status` → `/exit`），退出后终端恢复。
+* 文件工具在真机上做了冒烟：让它「创建 demo.txt 写三行，然后用 grep 找 banana 在第几行」，
+  模型按新工具名一路调用 `write → run_shell → grep`，最后回答「banana 出现在第 2 行」，
+  产物 `demo.txt` 内容逐字节符合预期。
+* 自测现在是**幂等**的：连续跑两次都 PASS（以前靠「反正覆盖」掩盖了清理失败）。
 * DSH 配置兼容做了**零参数启动**验收：在空目录里不传 `--base-url/--model/--api-key`，
   `--print-config` 显示 `base_url/model/api_key/context_window/confine` 的来源全是 `dsh-settings`，
   实际提问「2+2 等于几」得到 `4。`（只额外用环境变量给了 TLS pin，因为默认 `chain` 在真机过不去）。
