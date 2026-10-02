@@ -4,7 +4,7 @@
 多轮 loop 直到给出结论。全部代码 9 个 `.uya` 文件，**不引入任何 C 代码、`@c_import` 或其它语言**，
 只依赖 Uya 语言与随编译器分发的标准库。
 
-**P1–P10 已完成**：LLM 交互是**流式 SSE**（`stream:true` + `stream_options.include_usage`），
+**P1–P11 已完成**：LLM 交互是**流式 SSE**（`stream:true` + `stream_options.include_usage`），
 增量 chunked 解码 + SSE 分帧 + `tool_calls` 按 `index` 分片累积；消息协议是**严格工具协议**
 （`assistant.tool_calls` 原样回灌 + 每条结果一条 `role:"tool"` + `tool_call_id`）；
 交互界面是**真 TTY**（termios raw + 行编辑器），流式期间可打断、可继续输入、可续跑；
@@ -19,7 +19,9 @@
 配上 `todo_write` / `exit_plan_mode` / `ask_user_question`；**上下文管理**也齐了：
 tool 结果超 8192 码点自动剪枝，压力超过窗口 80% 时自动压缩成 checkpoint（真机实测触发过）；
 **技能**（发现 → 目录注入 → `skill` 工具）与**联网搜索**（`web_search`，provider 侧搜索）也接上了，
-两者都在真机上跑通过。
+两者都在真机上跑通过；**子代理一族**（`subagent` / `subagent_fork` / `list_agents` / `subagent_output` /
+`send_message` / `interrupt_agent` / `ralph`）与**会话级目标**（`create_goal` / `get_goal` / `update_goal`）
+也完成，真机上派生子代理并把结果收回父进程验证过。
 `--no-stream` / `--compat-fold` 保留两条回退路径。
 
 ```
@@ -135,6 +137,10 @@ src/search.uya    glob / grep：rg 子进程（--files / --json）、VCS 目录�
 src/dshcfg.uya    读 DSH 设置：$DSH_HOME 解析、settings.yaml 模型路线（agent-default-model →
                   provider 的 baseURL/apiKeyEnv/models[]）、.credentials.yaml、.env 兜底、
                   permission→confine、uya-agent.tls 命名空间
+src/deleg.uya     子代理：fork 不 exec（同二进制跑 agent_run）、结果管道 + 增量读取、
+                  父子会话关联（subagent/start 事件）、前台/后台、send_message 续跑、interrupt、ralph
+src/goal.uya      会话级目标：goal.json（id/revision/phase/round/maxRounds/blocker/armed）、
+                  精确 id+revision 校验、blocked 至少连续 3 轮
 src/skill.uya     技能：5 个发现根（项目 .dsh/.agents → --skill-dir → $DSH_HOME/skills →
                   ~/.agents/skills）、SKILL.md front-matter 解析、目录注入模板、skill 工具结果模板
 src/webx.uya      web_search：DeepSeek Anthropic 兼容 Messages API + 服务端 web_search 工具、
@@ -154,6 +160,28 @@ src/agent.uya     CLI、环境变量、消息历史、请求组装、主循环�
                   交互式 REPL（中断/steer//continue/会话命令）、会话事件记录与恢复
 src/selftest.uya  --selftest 的 mock LLM（含 SSE 受控切分）+ 15 轮断言 + --probe
 ```
+
+### 子代理与目标（P11）
+
+* **派生方式：fork 不 exec** —— 子进程是同二进制的一份拷贝，直接跑 `agent_run`，把最终答复写进管道；
+  父进程按后台任务那套语义增量读取。好处是不用把配置序列化成命令行，直接复用已验证的
+  流式/工具/会话/压缩代码。stdout/stderr 在子里重定向到 `/dev/null`（排查时设
+  `UYA_AGENT_DEBUG_SUBAGENT=1` 保留 stderr）。
+* `subagent`（新上下文）/ `subagent_fork`（**继承父会话已完成的轮次**）：`run_in_background` 默认 true；
+  前台调用会等到子代理结束并把它的最终文本作为工具结果返回。
+* `list_agents` / `subagent_output`（增量，`wait=true` 可等）/ `send_message`（给空闲的子代理
+  **续跑同一会话**，表现为新的 `sub-N`）/ `interrupt_agent`（SIGKILL）。
+* 子代理的请求带 `x-uya-subagent: <depth>` 头，便于服务端/日志区分父子；
+  子会话里有 `subagent/start` 事件记录 `parentSession` 与 `delegationDepth`。
+* **只继承「已完成的轮次」**：fork 时父回合可能正在进行（父的 tool 结果还没落盘），
+  所以读进父历史后会先裁掉「不完整的尾部」（悬空 tool 结果 / 没有结果的 assistant(tool_calls)）。
+  这条同时也让**崩溃恢复**出来的历史一定以完整消息结尾（否则网关会以
+  `an assistant message with 'tool_calls' must be followed by tool messages` 拒掉）。
+* `ralph`：fresh-agent 循环，每轮**新会话**、objective 不可变、workspace 当长期记忆；
+  子代理每轮报告以 `RALPH: COMPLETE|BLOCKED|CONTINUE` 结尾，遇到前两者提前收工。
+* **目标工具**：`create_goal`（可从直接的人类请求里推断意图）/ `get_goal` / `update_goal`
+  （`edit|pause|resume|complete|blocked`，要求精确 id+revision，`blocked` 至少要连续 3 轮），
+  状态落 `<agent_home>/goal.json`，跨进程可读。
 
 ### 技能与联网搜索（P10，对齐 DSH skill-filesystem / tool-skill / tool-web）
 
@@ -498,6 +526,10 @@ agent 循环并逐项断言：
 | `interrupt` | 预置 Ctrl-C：回合以 `AGENT_INTERRUPTED` 结束、工具**未派发**、只发生一次请求 |
 | `tty-editor` | termios 布局(60B)/raw 位运算；行编辑（插入/退格/左右/Delete/Home/End/词删除）、
 一次喂入多行拆成多个提交、分片转义序列、裸 ESC 判定、历史上下翻、中断前缀裁剪 |
+| `subagent-goal` | 一轮 9 个调用：`create_goal`/`get_goal`/`update_goal(pause)`、`subagent`（后台）+
+`subagent_output(wait=true)`、`list_agents`、`subagent_fork`（前台）、`ralph(maxRounds=2)` +
+读它的逐轮报告；mock 用 `x-uya-subagent` 头区分父/子请求，第二轮断言目标回显、
+子代理结果回到父、`sub-1 [subagent] idle`、`[round 1]/[round 2]` 都出现在请求里 |
 | `skills-web-search` | 造一个目录型技能（front-matter + 正文）→ 断言目录注入、`skill` 工具结果模板与
 资源指引、未知技能错误串；provider 侧用 mock 的 Anthropic 形状响应，断言 `web_search` 请求带
 服务端搜索工具与鉴权头、query 去重后只出现一次、答案与两条来源都被渲染 |
@@ -528,6 +560,9 @@ contextWindow/maxTokens/input image/reasoningEffort/`permission→confine`/`uya-
   `"id":"call_…"` 保留、`"tool_call_id"` 条数与调用数一致（shell 2 / no-shell 1 / tools 4）。
 * TTY 交互用**真 pty** 验证（`script -qec`）：进入 raw 模式、banner 干净、一次粘贴
   4 行会分成 4 次提交（任务 → `/help` → `/status` → `/exit`），退出后终端恢复。
+* 子代理在真机上验证过：让模型「用 subagent（前台）让子代理写一个 hello.sh 打印 SUBAGENT-OK」→
+  子代理真的创建并自测了脚本，父进程又独立复核了一遍输出；`subagent_fork` 的子代理历史里
+  确实带有父会话已完成轮次的内容（调试输出逐条列过）。
 * 技能与联网搜索都在真机上验证过：让模型「说出本次会话可用的技能名」→ 正确回答
   `agently-mail、h2s-long-context`（来自真实 `~/.dsh/skills`）；让它「用 web_search 搜 uya 语言」→
   `web_search` 工具真的调通了 DeepSeek 的搜索服务并给出总结。

@@ -76,6 +76,12 @@ export struct Config {
     plan: bool,               // --plan：以 plan 模式启动
     dsh_root: Buf,            // --dsh-root：packaged preset 根
     skill_dirs: Buf,          // --skill-dir（冒号分隔，可多次）
+    // P11：派生化
+    is_subagent: bool,        // 这个进程是被派生出来的子代理
+    fork_from: Buf,           // 子代理要继承的父会话 id（subagent_fork）
+    deleg_depth: i32,         // 派生深度（父 + 1）
+    parent_session: Buf,      // 父会话 id
+    deleg_label: Buf,         // 显示用标签（description）
 }
 
 fn cfg_default() Config {
@@ -123,6 +129,11 @@ fn cfg_default() Config {
         plan: false,
         dsh_root: buf_empty(),
         skill_dirs: buf_empty(),
+        is_subagent: false,
+        fork_from: buf_empty(),
+        deleg_depth: 0,
+        parent_session: buf_empty(),
+        deleg_label: buf_empty(),
     };
 }
 
@@ -133,6 +144,9 @@ fn cfg_free(c: &Config) void {
     buf_free(&c.reasoning_effort);
     buf_free(&c.dsh_root);
     buf_free(&c.skill_dirs);
+    buf_free(&c.fork_from);
+    buf_free(&c.parent_session);
+    buf_free(&c.deleg_label);
     buf_free(&c.base_url);
     buf_free(&c.model);
     buf_free(&c.api_key);
@@ -509,9 +523,13 @@ var g_tools_scratch: Buf = Buf{ ptr: null, len: 0, cap: 0 };
 var g_jobs: JobTable = JobTable{ items: [], next_id: 1 };
 // P9：最近一次请求的 prompt_tokens（压力口径）与压缩开关
 var g_last_prompt_tokens: i64 = 0;
+// P11：最后一个「有内容的助手消息」正文（子代理用它回报结果）
+var g_last_answer: Buf = Buf{ ptr: null, len: 0, cap: 0 };
 var g_compact_enabled: bool = true;
 // P10：技能表（首次请求前扫描一次）
 var g_skills: SkillSet = SkillSet{ items: [], n: 0, scanned: false };
+// P11：子代理表
+var g_deleg: DelegTable = DelegTable{ items: [], next_id: 1 };
 
 export fn agent_set_home(home: &const byte) bool {
     buf_free(&g_home);
@@ -595,6 +613,7 @@ fn agent_log_assistant(step: i32, o: &const ChatOut) void {
     _ = buf_append_cstr(&ev, ",\"step\":");
     _ = buf_append_i64(&ev, step as i64);
     _ = buf_append_cstr(&ev, ",\"message\":{\"role\":\"assistant\",\"content\":");
+    agent_note_answer(o.content.ptr as &const byte, o.content.len);
     if o.content.len > 0 {
         if !jw_str_into(&ev, o.content.ptr as &const byte, o.content.len) {
             return;
@@ -807,6 +826,62 @@ fn sess_json_string_dup(view: &[byte], key: &const byte, out: &Buf) bool {
 }
 
 // 打开（或恢复）会话：返回 false 表示只能新建
+// 子代理会话的父子关联（写进会话日志，便于看出派生关系）
+fn agent_log_delegation(cfg: &const Config) void {
+    if !cfg.is_subagent {
+        return;
+    }
+    g_sess.deleg_depth = cfg.deleg_depth;
+    if !g_sess.save {
+        return;
+    }
+    var line: Buf = buf_new(1024);
+    defer { buf_free(&line); }
+    _ = buf_append_cstr(&line, "{\"parentSession\":");
+    _ = jw_str_into(&line, cfg.parent_session.ptr as &const byte, cfg.parent_session.len);
+    _ = buf_append_cstr(&line, ",\"delegationDepth\":");
+    _ = buf_append_i64(&line, cfg.deleg_depth as i64);
+    _ = buf_append_cstr(&line, ",\"label\":");
+    _ = jw_str_into(&line, cfg.deleg_label.ptr as &const byte, cfg.deleg_label.len);
+    _ = buf_append_cstr(&line, "}");
+    _ = buf_append_byte(&line, 0);
+    agent_log_simple("subagent/start", line.ptr as &const byte);
+}
+
+// 只**新建**自己的会话日志（不恢复任何历史）；fork 出来的子代理用它
+fn agent_session_create(cfg: &const Config) bool {
+    var home: Buf = buf_new(1024);
+    defer { buf_free(&home); }
+    if !agent_default_home(cfg, &home) {
+        return false;
+    }
+    var hz: Buf = buf_new(home.len + 1);
+    defer { buf_free(&hz); }
+    _ = buf_append(&hz, home.ptr, home.len);
+    _ = buf_append_byte(&hz, 0);
+    _ = agent_set_home(hz.ptr as &const byte);
+    var cwdz: Buf = buf_new(cfg.workspace.len + 1);
+    defer { buf_free(&cwdz); }
+    _ = buf_append(&cwdz, cfg.workspace.ptr, cfg.workspace.len);
+    _ = buf_append_byte(&cwdz, 0);
+    var modelz: Buf = buf_new(cfg.model.len + 1);
+    defer { buf_free(&modelz); }
+    _ = buf_append(&modelz, cfg.model.ptr, cfg.model.len);
+    _ = buf_append_byte(&modelz, 0);
+    var empty: [byte: 1] = [0];
+    return sess_open(
+        &g_sess,
+        hz.ptr as &const byte,
+        cwdz.ptr as &const byte,
+        modelz.ptr as &const byte,
+        "uya-agent",
+        &empty[0] as &const byte,
+        cfg.save_session,
+        0,
+        true
+    );
+}
+
 export fn agent_session_open(cfg: &const Config, h: &History, resume_path: &const Buf) bool {
     var home: Buf = buf_new(1024);
     defer { buf_free(&home); }
@@ -839,6 +914,12 @@ export fn agent_session_open(cfg: &const Config, h: &History, resume_path: &cons
         var next_seq: i64 = 0;
         const n: i32 = agent_hist_from_log(cfg, h, resume_path, &next_seq);
         if n > 0 {
+            const trimmed: usize = hist_trim_incomplete_tail(h);
+            if trimmed > 0 {
+                out_err("[session] 丢弃了 ");
+                out_err_dec(trimmed);
+                out_err(" 条「未完成一轮」的尾部消息\n");
+            }
             out_err("[session] 已恢复 ");
             out_err_dec(n as usize);
             out_err(" 条消息（id=");
@@ -936,6 +1017,24 @@ fn agent_texts_ensure(cfg: &const Config) void {
 }
 
 // 组装 system prompt（分节 + 空节丢弃 + "\n\n" 连接）
+fn agent_note_answer(text: &const byte, n: usize) void {
+    if n == 0 {
+        return;
+    }
+    if !buf_valid(&g_last_answer) {
+        g_last_answer = buf_new(n + 64);
+    }
+    buf_reset(&g_last_answer);
+    _ = buf_append(&g_last_answer, text, n);
+}
+
+export fn agent_last_answer() &[byte] {
+    if !buf_valid(&g_last_answer) {
+        return &"x"[0: 0];
+    }
+    return g_last_answer.ptr[0: g_last_answer.len];
+}
+
 fn agent_system_prompt(cfg: &const Config, out: &Buf) bool {
     agent_texts_ensure(cfg);
     if !prompt_build_system(cfg, &g_texts, g_plan.active, out) {
@@ -1015,6 +1114,26 @@ const TOOL_ASK_USER: &const byte = `{"type":"function","function":{"name":"ask_u
 const TOOL_SKILL: &const byte = `{"type":"function","function":{"name":"skill","description":"Load the full instructions for an available skill.","parameters":{"type":"object","properties":{"name":{"type":"string","description":"Exact skill name from the available-skills catalog."}},"required":["name"]}}}`;
 
 const TOOL_WEB_SEARCH: &const byte = `{"type":"function","function":{"name":"web_search","description":"Search the web with one or more queries and return an answer plus source URLs.","parameters":{"type":"object","properties":{"queries":{"type":"array","description":"1-4 search queries; duplicates are collapsed.","items":{"type":"string"}}},"required":["queries"]}}}`;
+
+const TOOL_SUBAGENT: &const byte = `{"type":"function","function":{"name":"subagent","description":"Delegate a self-contained task to a subagent (a separate agent that works in its own context) to offload focused, independent work — research, a scoped implementation, an analysis — so it does not consume this conversation's context. The subagent returns its result, not its intermediate steps. Give it a complete, standalone prompt: it does not see this conversation.","parameters":{"type":"object","properties":{"prompt":{"type":"string","description":"The complete, self-contained task for the subagent."},"description":{"type":"string","description":"Short (3-5 word) description of the delegated task, for display."},"run_in_background":{"type":"boolean","description":"Run in the background and return an id immediately. Defaults to true."}},"required":["prompt","description"]}}}`;
+
+const TOOL_SUBAGENT_FORK: &const byte = `{"type":"function","function":{"name":"subagent_fork","description":"Delegate a task to a subagent that inherits this conversation: a child agent seeded with all completed turns so far (it does not see the current in-flight turn). Use this when the subtask builds on this conversation's context — a follow-up analysis, a review, a continuation — without consuming this conversation's context for the work itself.","parameters":{"type":"object","properties":{"prompt":{"type":"string","description":"The task for the subagent. It already sees this conversation's completed turns, so build on them freely and state only what is new."},"description":{"type":"string","description":"Short (3-5 word) description of the delegated task, for display."},"run_in_background":{"type":"boolean","description":"Run in the background and return an id immediately. Defaults to true."}},"required":["prompt","description"]}}}`;
+
+const TOOL_LIST_AGENTS: &const byte = `{"type":"function","function":{"name":"list_agents","description":"List your continuable subagents by durable id and label. Use it to recall which ones you started, not to poll for completion.","parameters":{"type":"object","properties":{}}}}`;
+
+const TOOL_SUBAGENT_OUTPUT: &const byte = `{"type":"function","function":{"name":"subagent_output","description":"Read a background subagent's output. Incremental by default: only new output since the previous read.","parameters":{"type":"object","properties":{"subagent_id":{"type":"string","description":"Id returned when the subagent started."},"wait":{"type":"boolean","description":"Block until the subagent finishes or the timeout expires."}},"required":["subagent_id"]}}}`;
+
+const TOOL_SEND_MESSAGE: &const byte = `{"type":"function","function":{"name":"send_message","description":"Send a message to a subagent by its id, continuing the same conversation. Use it to give it more work; the reply arrives later as a notice.","parameters":{"type":"object","properties":{"subagent_id":{"type":"string","description":"Id of the subagent to continue."},"message":{"type":"string","description":"The message to deliver."}},"required":["subagent_id","message"]}}}`;
+
+const TOOL_INTERRUPT_AGENT: &const byte = `{"type":"function","function":{"name":"interrupt_agent","description":"Request cancellation of a subagent's current turn by its id.","parameters":{"type":"object","properties":{"subagent_id":{"type":"string","description":"Id of the subagent to interrupt."}},"required":["subagent_id"]}}}`;
+
+const TOOL_RALPH: &const byte = `{"type":"function","function":{"name":"ralph","description":"Run a foreground fresh-agent Ralph loop toward one immutable objective. Use only when the direct human explicitly asks for Ralph or fresh-agent iteration. Each round opens a new child with no parent conversation or prior child session; the shared workspace is long-term memory, and only a bounded structured report crosses rounds. The call returns when a worker reports completion or a concrete blocker, or at the round limit.","parameters":{"type":"object","properties":{"objective":{"type":"string","description":"The immutable completion objective for every fresh Ralph round."},"maxRounds":{"type":"number","description":"Optional positive round cap."}},"required":["objective"]}}}`;
+
+const TOOL_CREATE_GOAL: &const byte = `{"type":"function","function":{"name":"create_goal","description":"Create one persisted same-session completion goal when the current direct human request is a long-running objective that should continue across autonomous goal rounds. You may infer that intent without requiring the user to say \u0060create a goal\u0060. Do not use this for trivial single-turn work.","parameters":{"type":"object","properties":{"objective":{"type":"string","description":"The concrete completion objective inferred from the direct human request."},"max_goal_rounds":{"type":"number","description":"Optional positive safe-integer limit on automatic continuation rounds."}},"required":["objective"]}}}`;
+
+const TOOL_GET_GOAL: &const byte = `{"type":"function","function":{"name":"get_goal","description":"Read the current same-session goal, including its exact id/revision, objective, phase, completed continuation rounds, round limit, blocker reason when present, and whether another continuation is armed. Call this before updating a goal.","parameters":{"type":"object","properties":{}}}}`;
+
+const TOOL_UPDATE_GOAL: &const byte = `{"type":"function","function":{"name":"update_goal","description":"Update the exact current goal revision. edit, pause, and resume require a direct top-level human request. During an automatic continuation of the current goal, complete and blocked are also allowed. blocked is rejected before the configured minimum round count; the model remains responsible for judging that the same condition persisted across those rounds and must explain it in blocked_reason.","parameters":{"type":"object","properties":{"goal_id":{"type":"string","description":"Exact id returned by get_goal."},"revision":{"type":"number","description":"Exact positive revision returned by get_goal."},"action":{"type":"string","description":"edit | pause | resume | complete | blocked","enum":["edit","pause","resume","complete","blocked"]},"objective":{"type":"string","description":"Replacement objective; valid only with action edit."},"blocked_reason":{"type":"string","description":"Concrete blocking condition; required only with action blocked."}},"required":["goal_id","revision","action"]}}}`;
 
 const TOOL_RUN_SHELL: &const byte = `{"type":"function","function":{"name":"run_shell","description":"在工作目录下执行 shell 命令，返回 stdout+stderr 与退出码。","parameters":{"type":"object","properties":{"command":{"type":"string","description":"shell 命令"},"timeout_ms":{"type":"integer","description":"超时毫秒，默认 120000"}},"required":["command"]}}}`;
 
@@ -1107,6 +1226,67 @@ fn tools_json(out: &Buf, allow_shell: bool) bool {
     if !buf_append_cstr(out, TOOL_WEB_SEARCH) {
         return false;
     }
+    // P11：派生一族
+    if !buf_append_byte(out, 44) {
+        return false;
+    }
+    if !buf_append_cstr(out, TOOL_SUBAGENT) {
+        return false;
+    }
+    if !buf_append_byte(out, 44) {
+        return false;
+    }
+    if !buf_append_cstr(out, TOOL_SUBAGENT_FORK) {
+        return false;
+    }
+    if !buf_append_byte(out, 44) {
+        return false;
+    }
+    if !buf_append_cstr(out, TOOL_LIST_AGENTS) {
+        return false;
+    }
+    if !buf_append_byte(out, 44) {
+        return false;
+    }
+    if !buf_append_cstr(out, TOOL_SUBAGENT_OUTPUT) {
+        return false;
+    }
+    if !buf_append_byte(out, 44) {
+        return false;
+    }
+    if !buf_append_cstr(out, TOOL_SEND_MESSAGE) {
+        return false;
+    }
+    if !buf_append_byte(out, 44) {
+        return false;
+    }
+    if !buf_append_cstr(out, TOOL_INTERRUPT_AGENT) {
+        return false;
+    }
+    if !buf_append_byte(out, 44) {
+        return false;
+    }
+    if !buf_append_cstr(out, TOOL_RALPH) {
+        return false;
+    }
+    if !buf_append_byte(out, 44) {
+        return false;
+    }
+    if !buf_append_cstr(out, TOOL_CREATE_GOAL) {
+        return false;
+    }
+    if !buf_append_byte(out, 44) {
+        return false;
+    }
+    if !buf_append_cstr(out, TOOL_GET_GOAL) {
+        return false;
+    }
+    if !buf_append_byte(out, 44) {
+        return false;
+    }
+    if !buf_append_cstr(out, TOOL_UPDATE_GOAL) {
+        return false;
+    }
     return buf_append_byte(out, 93);
 }
 
@@ -1122,6 +1302,8 @@ fn fsctx_init(cfg: &const Config) void {
     g_fsctx.confine = cfg.confine;
     fs_obs_init(&g_fsobs);
     jobs_init(&g_jobs);
+    deleg_init(&g_deleg);
+    _ = cfg;
 }
 
 // ============================================================
@@ -1225,6 +1407,17 @@ fn build_chat_request(cfg: &const Config, h: &const History, out: &Buf) bool {
 fn build_headers(cfg: &const Config, out: &Buf) bool {
     if !buf_append_cstr(out, "Content-Type: application/json\r\n") {
         return false;
+    }
+    // 子代理的请求带一个标记头：便于服务端/日志区分父子（自测也用它判断请求来自谁；
+    // 不能靠 prompt 文本判断 —— fork 出来的子代理会继承父的整段历史）
+    if cfg.is_subagent || cfg.deleg_depth > 0 {
+        if !buf_append_cstr(out, "x-uya-subagent: ") {
+            return false;
+        }
+        _ = buf_append_i64(out, cfg.deleg_depth as i64);
+        if !buf_append_cstr(out, "\r\n") {
+            return false;
+        }
     }
     if cfg.stream {
         if !buf_append_cstr(out, "Accept: text/event-stream\r\n") {
@@ -1426,6 +1619,26 @@ fn dispatch_tool_body(cfg: &const Config, name: &const Buf, args_json: &const Bu
         skill_tool(&g_skills, &arg_val, out);
     } else if sv_eq_cstr(name, "web_search") {
         web_tool_search(cfg, &arg_val, out);
+    } else if sv_eq_cstr(name, "subagent") {
+        deleg_tool_subagent(cfg, &g_deleg, &arg_val, out, false);
+    } else if sv_eq_cstr(name, "subagent_fork") {
+        deleg_tool_subagent(cfg, &g_deleg, &arg_val, out, true);
+    } else if sv_eq_cstr(name, "list_agents") {
+        deleg_tool_list(&g_deleg, out);
+    } else if sv_eq_cstr(name, "subagent_output") {
+        deleg_tool_output(&g_deleg, &arg_val, out);
+    } else if sv_eq_cstr(name, "send_message") {
+        deleg_tool_send(cfg, &g_deleg, &arg_val, out);
+    } else if sv_eq_cstr(name, "interrupt_agent") {
+        deleg_tool_interrupt(&g_deleg, &arg_val, out);
+    } else if sv_eq_cstr(name, "ralph") {
+        deleg_tool_ralph(cfg, &g_deleg, &arg_val, out);
+    } else if sv_eq_cstr(name, "create_goal") {
+        goal_tool_create(cfg, &arg_val, out);
+    } else if sv_eq_cstr(name, "get_goal") {
+        goal_tool_get(cfg, out);
+    } else if sv_eq_cstr(name, "update_goal") {
+        goal_tool_update(cfg, &arg_val, out);
     } else {
         _ = buf_append_cstr(out, "error: unknown tool");
     }
@@ -1728,6 +1941,7 @@ fn agent_hist_init(cfg: &const Config, h: &History, first: &const Buf) bool {
         return false;
     }
     agent_inject_context(cfg, h);
+    agent_log_delegation(cfg);
     if first.len > 0 {
         return hist_push(h, ROLE_USER, first.ptr as &const byte, first.len);
     }
@@ -1927,8 +2141,63 @@ fn agent_turn_loop_inner(cfg: &const Config, h: &History) i32 {
 }
 
 // 建/恢复会话历史：先尝试恢复（含 system），否则新建（system + 可选首条 user）
+// 去掉结尾「不完整的一轮」：悬空的 tool 结果，以及没有工具结果跟随的 assistant(tool_calls)。
+// 两种场景都会遇到：
+//   1) fork 出来的子代理在父回合**进行中**读取父历史（父的 tool 结果还没落盘）；
+//   2) 会话日志在崩溃时停在半路。
+// 修完以后回复出来的历史一定以完整的 assistant 结尾，请求不会再被网关以
+// "an assistant message with 'tool_calls' must be followed by tool messages" 拒掉。
+export fn hist_trim_incomplete_tail(h: &History) usize {
+    var dropped: usize = 0;
+    while h.len > 1 {
+        const last: usize = h.len - 1;
+        const r: u8 = msg_at(h, last).role;
+        if r != ROLE_TOOL && r != ROLE_ASSISTANT_CALLS {
+            break;
+        }
+        msg_free_one(msg_at_mut(h, last));
+        h.len = last;
+        dropped = dropped + 1;
+    }
+    return dropped;
+}
+
 fn agent_history_begin(cfg: &const Config, h: &History, first: &const Buf) bool {
     fsctx_init(cfg);
+    // 子代理 fork：先把父会话历史读进来，但会话日志开一个新的（不写父的日志）
+    if cfg.fork_from.len > 0 {
+        var ppath: Buf = buf_empty();
+        defer { buf_free(&ppath); }
+        var pnext: i64 = 0;
+        var wscopy: Buf = buf_new(cfg.workspace.len + 1);
+        defer { buf_free(&wscopy); }
+        _ = buf_append(&wscopy, cfg.workspace.ptr, cfg.workspace.len);
+        _ = buf_append_byte(&wscopy, 0);
+        const found_parent: bool = sess_find(g_home.ptr as &const byte, wscopy.ptr as &const byte, cfg.fork_from.ptr as &const byte, cfg.fork_from.len, &ppath);
+        if (getenv("UYA_AGENT_DEBUG_SUBAGENT") as usize) != 0 {
+            out_err("[fork] parent_session=");
+            out_err_bytes(cfg.fork_from.ptr, cfg.fork_from.len);
+            out_err(" found=");
+            if found_parent {
+                out_err("Y");
+            } else {
+                out_err("N");
+            }
+            out_err("\n");
+        }
+        if found_parent {
+            const n: i32 = agent_hist_from_log(cfg, h, &ppath, &pnext);
+            if (getenv("UYA_AGENT_DEBUG_SUBAGENT") as usize) != 0 {
+                out_err("[fork] restored=");
+                out_err_dec(n as usize);
+                out_err("\n");
+            }
+            if n > 0 {
+                _ = hist_trim_incomplete_tail(h);   // 父回合进行中 → 尾部一定不完整
+            }
+        }
+        // 找不到父历史就退化成普通新会话
+    }
     const opened: bool = agent_session_open(cfg, h, &cfg.resume_id);
     if opened && h.len > 0 {
         // 已从日志恢复（system 在里面）：本轮的任务/首条输入仍要接上去，
@@ -2056,13 +2325,10 @@ export // --dry-run：组装请求并打印（不可打印字节转义成 \xNN�
 fn agent_dry_run(cfg: &const Config) i32 {
     var h: History = hist_init();
     defer { hist_free(&h); }
-    var first: Buf = buf_empty();
-    if !agent_hist_init(cfg, &h, &first) {
+    // 走**真实**的建历史路径（含 --continue/--resume 的恢复），否则 dry-run 看到的不是真请求
+    if !agent_history_begin(cfg, &h, &cfg.task) {
         out_err("error: cannot build history\n");
         return AGENT_PROTO;
-    }
-    if cfg.task.len > 0 {
-        _ = hist_push(&h, ROLE_USER, cfg.task.ptr as &const byte, cfg.task.len);
     }
     var req: Buf = buf_new(262144);
     defer { buf_free(&req); }

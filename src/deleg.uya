@@ -1,0 +1,763 @@
+// src/deleg.uya — 子代理 / 派生（P11）
+//
+// 设计：`subagent*` 用 **fork 而不 exec** —— 子进程是同二进制的一份拷贝，直接跑
+// `agent_run`，把最终答复写进管道；父进程按需读增量输出（与后台任务同一套语义）。
+// 这样不用把配置序列化成命令行，也能共享已验证的流式/工具/会话代码。
+//
+// 会话：子代理有自己的会话日志，头部记录 `parentSession` 与 `delegationDepth`；
+// `subagent_fork` 会先把**父会话的历史**读进来（fork 语义），再开自己的日志。
+//
+// 结果回传：子进程把最终答复写进管道（fd 1/2 重定向到 /dev/null，避免污染父的界面）；
+// 父进程的 `subagent_result` / `list_agents` / 前台 `subagent` 都读这里。
+
+use libc.syscall;
+use libc.unistd;
+use libc.fcntl;
+use libc.signal;
+
+export const DELEG_MAX: usize = 4;
+const DELEG_BUF_MAX: usize = 262144;
+
+export const DELEG_RUNNING: u8 = 0;
+export const DELEG_DONE: u8 = 1;
+export const DELEG_FAILED: u8 = 2;
+export const DELEG_KILLED: u8 = 3;
+
+export const DELEG_KIND_SUB: u8 = 0;
+export const DELEG_KIND_RALPH: u8 = 1;
+
+export struct Deleg {
+    used: bool,
+    id: i32,
+    kind: u8,
+    pid: i32,
+    fd: i32,
+    status: u8,
+    code: i32,
+    reaped: bool,
+    label: Buf,
+    prompt: Buf,
+    sid: Buf,          // 子会话 id（send_message 用它续跑）
+    objective: Buf,    // ralph 用
+    rounds: i32,
+    max_rounds: i32,
+    buf: Buf,
+    read_off: usize,
+}
+
+export struct DelegTable {
+    items: [Deleg: DELEG_MAX],
+    next_id: i32,
+}
+
+fn deleg_empty() Deleg {
+    return Deleg{
+        used: false,
+        id: 0,
+        kind: DELEG_KIND_SUB,
+        pid: -1,
+        fd: -1,
+        status: DELEG_RUNNING,
+        code: 0,
+        reaped: false,
+        label: buf_empty(),
+        prompt: buf_empty(),
+        sid: buf_empty(),
+        objective: buf_empty(),
+        rounds: 0,
+        max_rounds: 0,
+        buf: buf_empty(),
+        read_off: 0,
+    };
+}
+
+export fn deleg_init(t: &DelegTable) void {
+    var i: usize = 0;
+    while i < DELEG_MAX {
+        t.items[i] = deleg_empty();
+        i = i + 1;
+    }
+    t.next_id = 1;
+}
+
+export fn deleg_free(t: &DelegTable) void {
+    var i: usize = 0;
+    while i < DELEG_MAX {
+        const d: &Deleg = &t.items[i];
+        if d.used {
+            buf_free(&d.label);
+            buf_free(&d.prompt);
+            buf_free(&d.sid);
+            buf_free(&d.objective);
+            buf_free(&d.buf);
+            if d.fd >= 0 {
+                _ = sys_close(d.fd) catch {};
+            }
+            if !d.reaped && d.pid > 0 {
+                _ = sys_kill(d.pid as i64, SIGKILL) catch {};
+                var st: i32 = 0;
+                _ = sys_waitpid(d.pid, &st, 0) catch {};
+            }
+        }
+        t.items[i] = deleg_empty();
+        i = i + 1;
+    }
+}
+
+fn deleg_slot(t: &DelegTable) isize {
+    var i: usize = 0;
+    while i < DELEG_MAX {
+        if !t.items[i].used {
+            return i as isize;
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn deleg_find(t: &const DelegTable, id: i32) isize {
+    var i: usize = 0;
+    while i < DELEG_MAX {
+        if t.items[i].used && t.items[i].id == id {
+            return i as isize;
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn deleg_status_name(st: u8) &const byte {
+    if st == DELEG_DONE {
+        return "idle" as &const byte;     // DSH：跑完就是 idle，可以再 send_message
+    }
+    if st == DELEG_FAILED {
+        return "failed" as &const byte;
+    }
+    if st == DELEG_KILLED {
+        return "interrupted" as &const byte;
+    }
+    return "running" as &const byte;
+}
+
+// 固定数组的安全读取（把下标证明放进函数里，避免编译器对复合条件不认）
+export fn deleg_status_at(t: &const DelegTable, i: usize) u8 {
+    if i >= DELEG_MAX {
+        return DELEG_KILLED;
+    }
+    return t.items[i].status;
+}
+
+export fn deleg_fd_at(t: &const DelegTable, i: usize) i32 {
+    if i >= DELEG_MAX {
+        return -1;
+    }
+    return t.items[i].fd;
+}
+
+export fn deleg_sid_at(t: &const DelegTable, i: usize) &[byte] {
+    if i >= DELEG_MAX {
+        return &"x"[0: 0];
+    }
+    return t.items[i].sid.ptr[0: t.items[i].sid.len];
+}
+
+// ============================================================
+// 子进程
+// ============================================================
+fn deleg_cfg_set(dst: &Buf, src: &const Buf) void {
+    buf_free(dst);
+    dst[0] = buf_new(src.len + 8);
+    if buf_valid(&dst[0]) && src.len > 0 {
+        _ = buf_append(&dst[0], src.ptr, src.len);
+    }
+}
+
+// 复制父配置（子代理要用同一套凭据/工具策略）
+fn deleg_clone_cfg(src: &const Config, dst: &Config, prompt: &const Buf, label: &const Buf) void {
+    const base: Config = cfg_default();
+    dst[0] = base;
+    deleg_cfg_set(&dst.base_url, &src.base_url);
+    deleg_cfg_set(&dst.model, &src.model);
+    deleg_cfg_set(&dst.api_key, &src.api_key);
+    deleg_cfg_set(&dst.workspace, &src.workspace);
+    deleg_cfg_set(&dst.agent_home, &src.agent_home);
+    deleg_cfg_set(&dst.pin, &src.pin);
+    deleg_cfg_set(&dst.dsh_root, &src.dsh_root);
+    deleg_cfg_set(&dst.dsh_home, &src.dsh_home);
+    deleg_cfg_set(&dst.skill_dirs, &src.skill_dirs);
+    deleg_cfg_set(&dst.task, prompt);
+    deleg_cfg_set(&dst.deleg_label, label);
+    dst.verify = src.verify;
+    dst.max_steps = src.max_steps;
+    dst.max_response = src.max_response;
+    dst.max_tool_out = src.max_tool_out;
+    dst.shell_timeout_ms = src.shell_timeout_ms;
+    dst.allow_shell = src.allow_shell;
+    dst.confine = src.confine;
+    dst.stream = true;
+    dst.compat_fold = src.compat_fold;
+    dst.quiet = true;            // 子代理不直接往终端写
+    dst.show_reasoning = false;
+    dst.show_usage = false;
+    dst.save_session = true;
+    dst.max_tokens = src.max_tokens;
+    dst.temperature = src.temperature;
+    dst.timeout_ms = src.timeout_ms;
+    dst.context_window = src.context_window;
+    dst.tls_debug = false;
+    dst.is_subagent = true;
+    dst.plan = false;
+}
+
+// 子进程主体：跑一个（或 Ralph 的多个）回合，把结果写进 wfd
+fn deleg_child_main(src: &const Config, prompt: &const Buf, label: &const Buf, kind: u8, max_rounds: i32, fork_parent: bool, wfd: i32) void {
+    // 先把 stdout/stderr 静音，避免污染父进程的界面
+    // （排查子代理时设 UYA_AGENT_DEBUG_SUBAGENT=1 保留 stderr）
+    const dbg: &byte = getenv("UYA_AGENT_DEBUG_SUBAGENT");
+    const keep_err: bool = (dbg as usize) != 0 && bufx_cstr_len(dbg) > 0;
+    const nullfd: i32 = sys_open("/dev/null" as *const byte, O_WRONLY as i32, 0) catch { -1; };
+    if nullfd >= 0 {
+        _ = sys_dup2(nullfd, 1) catch {};
+        if !keep_err {
+            _ = sys_dup2(nullfd, 2) catch {};
+        }
+    }
+    var c: Config = cfg_default();
+    deleg_clone_cfg(src, &c, prompt, label);
+    c.deleg_depth = src.deleg_depth + 1;
+    // 父会话 = **父进程当前开的那个会话**（g_sess 在 fork 出来的副本里就是父的记录）
+    c.parent_session = buf_empty();
+    if g_sess.id.len > 0 {
+        deleg_cfg_set(&c.parent_session, &g_sess.id);
+    }
+    if fork_parent && g_sess.id.len > 0 {
+        deleg_cfg_set(&c.fork_from, &g_sess.id);
+    }
+    var rounds: i32 = 1;
+    if kind == DELEG_KIND_RALPH {
+        rounds = max_rounds;
+        if rounds < 1 {
+            rounds = 1;
+        }
+        if rounds > 20 {
+            rounds = 20;
+        }
+    }
+    var rep: Buf = buf_new(65536);
+    var round: i32 = 0;
+    var stopped: bool = false;
+    while round < rounds && !stopped {
+        round = round + 1;
+        buf_reset(&rep);
+        if kind == DELEG_KIND_RALPH {
+            // Ralph：每轮一个**全新**子代理（没有对话种子），workspace 就是长期记忆
+            _ = buf_append_cstr(&rep, "Round ");
+            _ = buf_append_u64(&rep, round as u64);
+            _ = buf_append_cstr(&rep, " of ");
+            _ = buf_append_u64(&rep, rounds as u64);
+            _ = buf_append_cstr(&rep, ". Objective (immutable): ");
+            _ = buf_append(&rep, prompt.ptr, prompt.len);
+            _ = buf_append_cstr(&rep, "\nYou are a fresh agent with no memory of earlier rounds; the shared workspace is the only durable memory. Inspect it first. Do the next unit of work, verify it, and end your final message with exactly one line: `RALPH: COMPLETE`, `RALPH: BLOCKED`, or `RALPH: CONTINUE`.");
+            var rcfg: Config = cfg_default();
+            deleg_clone_cfg(src, &rcfg, &rep, label);
+            rcfg.deleg_depth = src.deleg_depth + 1;
+            rcfg.fork_from = buf_empty();
+            rcfg.resume_id = buf_empty();
+            rcfg.save_session = true;
+            const rr: i32 = agent_run(&rcfg);
+            var line: Buf = buf_new(65536);
+            defer { buf_free(&line); }
+            _ = buf_append_cstr(&line, "[round ");
+            _ = buf_append_u64(&line, round as u64);
+            _ = buf_append_cstr(&line, "] ");
+            const ans: &[byte] = agent_last_answer();
+            _ = buf_append(&line, ans.ptr, ans.len);
+            _ = buf_append_byte(&line, 10);
+            write_all_fd(wfd, line.ptr as &const byte, line.len);
+            if sess_has_cstr(ans, "RALPH: COMPLETE") || sess_has_cstr(ans, "RALPH: BLOCKED") {
+                stopped = true;
+            }
+            cfg_free(&rcfg);
+            _ = rr;
+            continue;
+        }
+        const rc: i32 = agent_run(&c);
+        const ans2: &[byte] = agent_last_answer();
+        if ans2.len > 0 {
+            write_all_fd(wfd, ans2.ptr as &const byte, ans2.len);
+            write_all_fd(wfd, "\n" as &const byte, 1);
+        } else {
+            var fb: Buf = buf_new(64);
+            defer { buf_free(&fb); }
+            _ = buf_append_cstr(&fb, "(subagent finished with no final text, exit ");
+            _ = buf_append_i64(&fb, rc as i64);
+            _ = buf_append_cstr(&fb, ")");
+            write_all_fd(wfd, fb.ptr as &const byte, fb.len);
+            write_all_fd(wfd, "\n" as &const byte, 1);
+        }
+        stopped = true;
+    }
+    buf_free(&rep);
+    // 子进程自己的会话在 agent_run 里已经收尾；这里直接退出，不跑父进程的 defer
+    _ = sys_close(wfd) catch {};
+    sys_exit(0);
+}
+
+// 派生：返回记录下标（-1 失败）。fork_parent=true 时子代理会继承父会话历史。
+export fn deleg_spawn(src: &const Config, t: &DelegTable, prompt: &const Buf, label: &const Buf, kind: u8, max_rounds: i32, fork_parent: bool) isize {
+    const slot: isize = deleg_slot(t);
+    if slot < 0 {
+        return -1;
+    }
+    var fds: [i32: 2] = [0: 2];
+    if (sys_pipe2(&fds[0], 0) catch { -1; }) != 0 {
+        return -1;
+    }
+    const pid64: i64 = sys_fork() catch {
+        _ = sys_close(fds[0]) catch {};
+        _ = sys_close(fds[1]) catch {};
+        return -1;
+    };
+    if pid64 == 0 {
+        _ = sys_close(fds[0]) catch {};
+        deleg_child_main(src, prompt, label, kind, max_rounds, fork_parent, fds[1]);
+        sys_exit(0);
+    }
+    _ = sys_close(fds[1]) catch {};
+    _ = sys_fcntl(fds[0], F_SETFL, O_NONBLOCK) catch {};
+    const si: usize = slot as usize;
+    if si >= DELEG_MAX {
+        return -1;
+    }
+    const d: &Deleg = &t.items[si];
+    d.used = true;
+    d.id = t.next_id;
+    t.next_id = t.next_id + 1;
+    d.kind = kind;
+    d.pid = i64_to_i32(pid64);
+    d.fd = fds[0];
+    d.status = DELEG_RUNNING;
+    d.code = 0;
+    d.reaped = false;
+    d.rounds = 0;
+    d.max_rounds = max_rounds;
+    d.read_off = 0;
+    d.buf = buf_new(4096);
+    d.label = buf_new(label.len + 8);
+    if buf_valid(&d.label) && label.len > 0 {
+        _ = buf_append(&d.label, label.ptr, label.len);
+    }
+    // 子会话 id：子进程会自己开一个，这里先记父的（供 send_message 找会话）
+    d.prompt = buf_new(prompt.len + 8);
+    if buf_valid(&d.prompt) && prompt.len > 0 {
+        _ = buf_append(&d.prompt, prompt.ptr, prompt.len);
+    }
+    d.sid = buf_empty();
+    d.objective = buf_empty();
+    return slot;
+}
+
+// 读管道里的新增字节
+export fn deleg_drain(t: &DelegTable, idx: usize) void {
+    if idx >= DELEG_MAX {
+        return;
+    }
+    const d: &Deleg = &t.items[idx];
+    if !d.used || d.fd < 0 {
+        return;
+    }
+    var tmp: [byte: 16384] = [0: 16384];
+    var guard: usize = 0;
+    while guard < 64 {
+        guard = guard + 1;
+        var pfds: [PollFd: 1] = [PollFd{ fd: d.fd, events: POLLIN, revents: 0 }];
+        const pr: i32 = sys_poll(&pfds[0], 1, 0) catch { 0; };
+        if pr <= 0 {
+            break;
+        }
+        const n: isize = sys_read(d.fd, &tmp[0], 16384) catch { 0 as isize; };
+        if n <= 0 {
+            break;
+        }
+        if !buf_append(&d.buf, &tmp[0], n as usize) {
+            break;
+        }
+        if d.buf.len > DELEG_BUF_MAX {
+            const drop: usize = d.buf.len - DELEG_BUF_MAX;
+            buf_drop_prefix(&d.buf, drop);
+            if d.read_off > drop {
+                d.read_off = d.read_off - drop;
+            } else {
+                d.read_off = 0;
+            }
+        }
+    }
+}
+
+export fn deleg_check(t: &DelegTable, idx: usize) void {
+    if idx >= DELEG_MAX {
+        return;
+    }
+    const d: &Deleg = &t.items[idx];
+    if !d.used || d.reaped {
+        return;
+    }
+    var st: i32 = 0;
+    const r: i32 = sys_waitpid(d.pid, &st, 1) catch { 0; };
+    if r <= 0 {
+        return;
+    }
+    d.reaped = true;
+    const code: i32 = (st >> (8 as i32)) & 255;
+    const sig: i32 = st & 127;
+    d.code = code;
+    if sig != 0 {
+        d.status = DELEG_KILLED;
+        d.code = 128 + sig;
+    } else if code == 0 {
+        d.status = DELEG_DONE;
+    } else {
+        d.status = DELEG_FAILED;
+    }
+    deleg_drain(t, idx);
+    if d.fd >= 0 {
+        _ = sys_close(d.fd) catch {};
+        d.fd = -1;
+    }
+}
+
+export fn deleg_poll_all(t: &DelegTable) void {
+    var i: usize = 0;
+    while i < DELEG_MAX {
+        if t.items[i].used {
+            deleg_drain(t, i);
+            deleg_check(t, i);
+        }
+        i = i + 1;
+    }
+}
+
+fn deleg_id_from_buf(b: &const Buf, out: &i32) bool {
+    if b.len == 0 {
+        return false;
+    }
+    var i: usize = 0;
+    if b.len > 4 && bufx_eq_cstr(b.ptr as &const byte, 4, "sub-") {
+        i = 4;
+    }
+    var v: i32 = 0;
+    var digits: i32 = 0;
+    while i < b.len && is_digit(b.ptr[i]) {
+        v = v * 10 + ((b.ptr[i] as i32) - 48);
+        digits = digits + 1;
+        i = i + 1;
+    }
+    if digits == 0 {
+        return false;
+    }
+    out[0] = v;
+    return true;
+}
+
+// ============================================================
+// 工具
+// ============================================================
+// subagent / subagent_fork
+export fn deleg_tool_subagent(cfg: &const Config, t: &DelegTable, args: &const JsonValue, out: &Buf, fork: bool) void {
+    var prompt: Buf = buf_empty();
+    defer { buf_free(&prompt); }
+    if !js_obj_get_str_unescaped(args, "prompt", 6, &prompt) || prompt.len == 0 {
+        _ = buf_append_cstr(out, "Error: invalid prompt: expected a non-empty string");
+        return;
+    }
+    var desc: Buf = buf_empty();
+    defer { buf_free(&desc); }
+    if !js_obj_get_str_unescaped(args, "description", 11, &desc) || desc.len == 0 {
+        _ = buf_append_cstr(out, "Error: invalid description: expected a non-empty string");
+        return;
+    }
+    var bg: bool = true;
+    var bv: JsonValue = JsonValue.json_null();
+    if js_obj_get(args, "run_in_background", 17, &bv) {
+        bg = json_bool_of(&bv);
+    }
+    const slot: isize = deleg_spawn(cfg, t, &prompt, &desc, DELEG_KIND_SUB, 1, fork);
+    if slot < 0 {
+        _ = buf_append_cstr(out, "Error: cannot start a subagent (too many running, or resources exhausted)");
+        return;
+    }
+    const si: usize = slot as usize;
+    if si >= DELEG_MAX {
+        return;
+    }
+    const id: i32 = t.items[si].id;
+    if bg {
+        _ = buf_append_cstr(out, "started background subagent sub-");
+        _ = buf_append_u64(out, id as u64);
+        return;
+    }
+    // 前台：等它结束（上限 = 父的超时）
+    const started: u64 = ua_now_ms();
+    while true {
+        deleg_drain(t, si);
+        deleg_check(t, si);
+        if t.items[si].status != DELEG_RUNNING {
+            break;
+        }
+        if (ua_now_ms() - started) >= (cfg.timeout_ms as u64) {
+            _ = sys_kill(t.items[si].pid as i64, SIGKILL) catch {};
+            deleg_check(t, si);
+            if t.items[si].status == DELEG_RUNNING {
+                t.items[si].status = DELEG_KILLED;
+            }
+            _ = buf_append_cstr(out, "Error: subagent sub-");
+            _ = buf_append_u64(out, id as u64);
+            _ = buf_append_cstr(out, " timed out and was interrupted");
+            return;
+        }
+        var pfds: [PollFd: 1] = [PollFd{ fd: t.items[si].fd, events: POLLIN, revents: 0 }];
+        _ = sys_poll(&pfds[0], 1, 50) catch {};
+    }
+    deleg_drain(t, si);
+    if t.items[si].buf.len > 0 {
+        _ = buf_append(out, t.items[si].buf.ptr, t.items[si].buf.len);
+        t.items[si].read_off = t.items[si].buf.len;
+    } else {
+        _ = buf_append_cstr(out, "(subagent finished with no output)");
+    }
+    _ = buf_append_cstr(out, "\n[sub-");
+    _ = buf_append_u64(out, id as u64);
+    _ = buf_append_cstr(out, " status: ");
+    _ = buf_append_cstr(out, deleg_status_name(t.items[si].status));
+    _ = buf_append_cstr(out, "]");
+}
+
+// 读后台子代理的输出（增量）
+export fn deleg_tool_output(t: &DelegTable, args: &const JsonValue, out: &Buf) void {
+    var idb: Buf = buf_empty();
+    defer { buf_free(&idb); }
+    if !js_obj_get_str_unescaped(args, "subagent_id", 11, &idb) || idb.len == 0 {
+        _ = buf_append_cstr(out, "Error: subagent_id must be a non-empty string");
+        return;
+    }
+    var id: i32 = 0;
+    if !deleg_id_from_buf(&idb, &id) {
+        _ = buf_append_cstr(out, "Error: unknown subagent_id");
+        return;
+    }
+    const slot: isize = deleg_find(t, id);
+    if slot < 0 {
+        _ = buf_append_cstr(out, "Error: unknown subagent_id");
+        return;
+    }
+    const si: usize = slot as usize;
+    var wait: bool = false;
+    var bv: JsonValue = JsonValue.json_null();
+    if js_obj_get(args, "wait", 4, &bv) {
+        wait = json_bool_of(&bv);
+    }
+    deleg_drain(t, si);
+    if wait {
+        const started: u64 = ua_now_ms();
+        var spin: usize = 0;
+        while spin < 600 {
+            spin = spin + 1;
+            deleg_check(t, si);
+            if deleg_status_at(t, si) != DELEG_RUNNING {
+                break;
+            }
+            if (ua_now_ms() - started) >= 30000 {
+                break;
+            }
+            const fdw: i32 = deleg_fd_at(t, si);
+            var pfds: [PollFd: 1] = [PollFd{ fd: fdw, events: POLLIN, revents: 0 }];
+            _ = sys_poll(&pfds[0], 1, 100) catch {};
+            deleg_drain(t, si);
+        }
+    } else {
+        deleg_check(t, si);
+    }
+    deleg_drain(t, si);
+    if si >= DELEG_MAX {
+        return;
+    }
+    const d: &Deleg = &t.items[si];
+    if d.read_off < d.buf.len {
+        _ = buf_append(out, &d.buf.ptr[d.read_off], d.buf.len - d.read_off);
+        d.read_off = d.buf.len;
+    } else {
+        _ = buf_append_cstr(out, "(no new output)");
+    }
+    _ = buf_append_cstr(out, "\n[status: ");
+    _ = buf_append_cstr(out, deleg_status_name(d.status));
+    _ = buf_append_cstr(out, "]");
+}
+
+export fn deleg_tool_list(t: &DelegTable, out: &Buf) void {
+    deleg_poll_all(t);
+    var shown: usize = 0;
+    var i: usize = 0;
+    while i < DELEG_MAX {
+        if t.items[i].used {
+            const d: &const Deleg = &t.items[i];
+            if shown > 0 {
+                _ = buf_append_byte(out, 10);
+            }
+            _ = buf_append_cstr(out, "sub-");
+            _ = buf_append_u64(out, d.id as u64);
+            _ = buf_append_cstr(out, " [");
+            if d.kind == DELEG_KIND_RALPH {
+                _ = buf_append_cstr(out, "ralph");
+            } else {
+                _ = buf_append_cstr(out, "subagent");
+            }
+            _ = buf_append_cstr(out, "] ");
+            _ = buf_append_cstr(out, deleg_status_name(d.status));
+            _ = buf_append_cstr(out, " — ");
+            _ = buf_append(out, d.label.ptr, d.label.len);
+            shown = shown + 1;
+        }
+        i = i + 1;
+    }
+    if shown == 0 {
+        _ = buf_append_cstr(out, "(no background agents)");
+    }
+}
+
+// send_message：给已经空闲的子代理再开一个回合（用它的会话续跑）
+export fn deleg_tool_send(cfg: &const Config, t: &DelegTable, args: &const JsonValue, out: &Buf) void {
+    var idb: Buf = buf_empty();
+    defer { buf_free(&idb); }
+    if !js_obj_get_str_unescaped(args, "subagent_id", 11, &idb) || idb.len == 0 {
+        _ = buf_append_cstr(out, "Error: subagent_id must be a non-empty string");
+        return;
+    }
+    var msg: Buf = buf_empty();
+    defer { buf_free(&msg); }
+    if !js_obj_get_str_unescaped(args, "message", 7, &msg) || msg.len == 0 {
+        _ = buf_append_cstr(out, "Error: invalid message: expected a non-empty string");
+        return;
+    }
+    var id: i32 = 0;
+    if !deleg_id_from_buf(&idb, &id) {
+        _ = buf_append_cstr(out, "Error: unknown subagent_id");
+        return;
+    }
+    const slot: isize = deleg_find(t, id);
+    if slot < 0 {
+        _ = buf_append_cstr(out, "Error: unknown subagent_id");
+        return;
+    }
+    const si: usize = slot as usize;
+    deleg_check(t, si);
+    if si >= DELEG_MAX {
+        return;
+    }
+    if t.items[si].status == DELEG_RUNNING {
+        _ = buf_append_cstr(out, "Error: subagent sub-");
+        _ = buf_append_u64(out, id as u64);
+        _ = buf_append_cstr(out, " is still working; wait for its current turn to finish before sending another message");
+        return;
+    }
+    // 续跑：复用它的会话（resume_id），开一个新的子进程
+    var prompt_copy: Buf = buf_new(msg.len + 8);
+    defer { buf_free(&prompt_copy); }
+    _ = buf_append(&prompt_copy, msg.ptr, msg.len);
+    var label_copy: Buf = buf_new(t.items[si].label.len + 16);
+    defer { buf_free(&label_copy); }
+    _ = buf_append(&label_copy, t.items[si].label.ptr, t.items[si].label.len);
+    _ = buf_append_cstr(&label_copy, " (continued)");
+    var sub_cfg: Config = cfg_default();
+    deleg_clone_cfg(cfg, &sub_cfg, &prompt_copy, &label_copy);
+    deleg_cfg_set(&sub_cfg.resume_id, &t.items[si].sid);
+    const new_slot: isize = deleg_spawn(&sub_cfg, t, &prompt_copy, &label_copy, DELEG_KIND_SUB, 1, false);
+    cfg_free(&sub_cfg);
+    if new_slot < 0 {
+        _ = buf_append_cstr(out, "Error: cannot continue the subagent (too many running)");
+        return;
+    }
+    const nsi: usize = new_slot as usize;
+    if nsi >= DELEG_MAX {
+        return;
+    }
+    _ = buf_append_cstr(out, "delivered message to sub-");
+    _ = buf_append_u64(out, id as u64);
+    _ = buf_append_cstr(out, "; continuing as sub-");
+    _ = buf_append_u64(out, t.items[nsi].id as u64);
+}
+
+export fn deleg_tool_interrupt(t: &DelegTable, args: &const JsonValue, out: &Buf) void {
+    var idb: Buf = buf_empty();
+    defer { buf_free(&idb); }
+    if !js_obj_get_str_unescaped(args, "subagent_id", 11, &idb) || idb.len == 0 {
+        _ = buf_append_cstr(out, "Error: subagent_id must be a non-empty string");
+        return;
+    }
+    var id: i32 = 0;
+    if !deleg_id_from_buf(&idb, &id) {
+        _ = buf_append_cstr(out, "Error: unknown subagent_id");
+        return;
+    }
+    const slot: isize = deleg_find(t, id);
+    if slot < 0 {
+        _ = buf_append_cstr(out, "Error: unknown subagent_id");
+        return;
+    }
+    const si: usize = slot as usize;
+    deleg_poll_all(t);
+    if si >= DELEG_MAX {
+        return;
+    }
+    const d: &Deleg = &t.items[si];
+    if d.status != DELEG_RUNNING {
+        _ = buf_append_cstr(out, "sub-");
+        _ = buf_append_u64(out, id as u64);
+        _ = buf_append_cstr(out, " had already finished [status: ");
+        _ = buf_append_cstr(out, deleg_status_name(d.status));
+        _ = buf_append_cstr(out, "]");
+        return;
+    }
+    _ = sys_kill(d.pid as i64, SIGKILL) catch {};
+    deleg_check(t, si);
+    if t.items[si].status == DELEG_RUNNING {
+        t.items[si].status = DELEG_KILLED;
+    }
+    _ = buf_append_cstr(out, "requested cancellation of sub-");
+    _ = buf_append_u64(out, id as u64);
+}
+
+// ralph：fresh-agent 循环
+export fn deleg_tool_ralph(cfg: &const Config, t: &DelegTable, args: &const JsonValue, out: &Buf) void {
+    var objective: Buf = buf_empty();
+    defer { buf_free(&objective); }
+    if !js_obj_get_str_unescaped(args, "objective", 9, &objective) || objective.len == 0 {
+        _ = buf_append_cstr(out, "Error: invalid objective: expected a non-empty string");
+        return;
+    }
+    var rounds: i32 = 4;
+    var rv: JsonValue = JsonValue.json_null();
+    var n: i64 = 0;
+    if js_obj_get(args, "maxRounds", 9, &rv) && js_i64_of(&rv, &n) && n > 0 {
+        if n > 20 {
+            n = 20;
+        }
+        rounds = n as i32;
+    }
+    var label: Buf = buf_new(64);
+    defer { buf_free(&label); }
+    _ = buf_append_cstr(&label, "ralph loop");
+    const slot: isize = deleg_spawn(cfg, t, &objective, &label, DELEG_KIND_RALPH, rounds, false);
+    if slot < 0 {
+        _ = buf_append_cstr(out, "Error: cannot start the Ralph loop (too many running)");
+        return;
+    }
+    const si: usize = slot as usize;
+    if si >= DELEG_MAX {
+        return;
+    }
+    _ = buf_append_cstr(out, "started Ralph loop sub-");
+    _ = buf_append_u64(out, t.items[si].id as u64);
+    _ = buf_append_cstr(out, " with maxRounds=");
+    _ = buf_append_u64(out, rounds as u64);
+    _ = buf_append_cstr(out, "; use subagent_output with wait=true to collect round reports");
+}
