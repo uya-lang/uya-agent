@@ -612,6 +612,9 @@ fn mock_server(lfd: i32) i32 {
     if mock_mode == 14 {
         limit = 2;          // 派生轮：工具轮 → 断言轮（子代理的请求不算轮次）
     }
+    if mock_mode == 16 {
+        limit = 1;          // workflow 轮：假脚本只派 1 个子代理
+    }
     while round < limit {
         // accept 最多等 10 秒：客户端不再发请求时 mock 必须自己退出，
         // 否则「mock 卡在 accept」会变成整个自测卡死（踩过）
@@ -661,6 +664,26 @@ fn mock_server(lfd: i32) i32 {
                 verdict = 30;
             }
             buf_free(&errb);
+            buf_free(&rx);
+            _ = sys_close(cfd) catch {};
+            round = round + 1;
+            continue;
+        }
+        if mock_mode == 16 {
+            var body16: Buf = buf_new(256);
+            if !mock_final_body(&body16, "WF-AGENT-OK") {
+                verdict = 150;
+            }
+            var sent16: bool = false;
+            if is_stream {
+                sent16 = mock_send_sse(cfd, &body16);
+            } else {
+                sent16 = mock_send(cfd, &body16);
+            }
+            if !sent16 {
+                verdict = 151;
+            }
+            buf_free(&body16);
             buf_free(&rx);
             _ = sys_close(cfd) catch {};
             round = round + 1;
@@ -3704,6 +3727,265 @@ fn deleg_round(base: &const Config, tag: &const byte, ws: &const byte) bool {
     return ok;
 }
 
+// ============================================================
+// P12：workflow 轮
+//
+// 两个变体：
+//   A) 脚本用 /bin/sh 写的「假 runner」（说话的就是钩子协议），验证协议本身；
+//   B) 真的用 `uya run` 跑一个 Uya 的 .ush 脚本，验证主路径。
+// 钩子里的 agent_start/agent_wait 会派生子代理 → 由 mock LLM 服务。
+// ============================================================
+fn wf_make_args(out: &Buf, script: &const byte, name: &const byte) bool {
+    buf_reset(out);
+    if !buf_append_cstr(out, "{\"script\":") {
+        return false;
+    }
+    if !jw_str_into(out, script, bufx_cstr_len(script)) {
+        return false;
+    }
+    if !buf_append_cstr(out, ",\"meta\":{\"name\":") {
+        return false;
+    }
+    if !jw_str_into(out, name, bufx_cstr_len(name)) {
+        return false;
+    }
+    return buf_append_cstr(out, ",\"description\":\"两阶段审计\"},\"args\":{\"files\":[\"a.uya\",\"b.uya\"]}}");
+}
+
+fn wf_parse_args(text: &const Buf, out: &JsonValue) bool {
+    var raw: &void = malloc(65536);
+    if ((raw as &byte) as usize) == 0 {
+        return false;
+    }
+    var arena: Arena = Arena{ buffer: null, size: 0, used: 0 };
+    arena_init(&arena, raw as &byte, 65536);
+    if !js_parse(&arena, text.ptr, text.len, out) {
+        return false;
+    }
+    return true;
+}
+
+// 写一个「假 runner」：接受 `run <script>` 的参数形态，直接执行脚本
+fn wf_write_stub_runner(path: &const byte) bool {
+    const body: &const byte = "#!/bin/sh\n# uya-agent workflow 的测试替身：忽略 run 子命令，直接跑脚本\nshift\nexec /bin/sh \"$1\"\n";
+    return write_text_file(path, body);
+}
+
+// A) 假 runner + /bin/sh 脚本（用 /dev/tcp 说钩子协议）
+fn wf_variant_stub(cfg: &const Config, tag: &const byte, out: &Buf) bool {
+    var runner: Buf = buf_new(256);
+    defer { buf_free(&runner); }
+    _ = buf_append_cstr(&runner, "testdata/wf_runner.sh");
+    _ = buf_append_byte(&runner, 0);
+    var okflag: bool = false;
+    if !wf_write_stub_runner(runner.ptr as &const byte) {
+        ty_fail(tag, "写假 runner 失败", &okflag);
+        return false;
+    }
+    var c: Config = cfg_default();
+    c.base_url = buf_new(cfg.base_url.len + 8);
+    _ = buf_append(&c.base_url, cfg.base_url.ptr, cfg.base_url.len);
+    c.model = buf_new(32);
+    _ = buf_append_cstr(&c.model, "selftest-model");
+    c.api_key = buf_new(32);
+    _ = buf_append_cstr(&c.api_key, "selftest-key");
+    c.workspace = buf_new(64);
+    _ = buf_append_cstr(&c.workspace, "build/selftest_wf_ws");
+    c.verify = HC_VERIFY_NONE;
+    c.allow_shell = true;
+    c.stream = true;
+    c.timeout_ms = 30000;
+    c.quiet = true;
+    c.agent_home = buf_new(64);
+    _ = buf_append_cstr(&c.agent_home, "build/selftest_wf_home");
+    c.max_steps = 3;
+    c.quiet = true;
+    c.uya_bin = buf_new(64);
+    _ = buf_append_cstr(&c.uya_bin, "/bin/bash");   // 直接解释器模式：<bin> <script>
+    // 假脚本从磁盘读（内嵌 shell 会被 Uya 字符串转义搞死；testdata/ 里是真实文件）
+    var stub: Buf = buf_new(8192);
+    defer { buf_free(&stub); }
+    if !fs_read_file_all("testdata/wf_stub.sh" as &const byte, &stub, 65536) {
+        ty_fail(tag, "读不到 testdata/wf_stub.sh", &okflag);
+        return false;
+    }
+    if !sess_has_cstr(stub.ptr[0: stub.len], "dev/tcp") {
+        ty_fail(tag, "testdata/wf_stub.sh 内容不对（缺少 dev/tcp）", &okflag);
+        return false;
+    }
+    _ = buf_append_byte(&stub, 0);
+    const script: &const byte = stub.ptr as &const byte;
+    var args: Buf = buf_new(8192);
+    defer { buf_free(&args); }
+    var badflag: bool = false;
+    if !wf_make_args(&args, script, "stub-audit") {
+        ty_fail(tag, "组参失败", &badflag);
+        return false;
+    }
+    var jv: JsonValue = JsonValue.json_null();
+    if !wf_parse_args(&args, &jv) {
+        ty_fail(tag, "参数不是合法 JSON", &badflag);
+        return false;
+    }
+    buf_reset(out);
+    wf_tool_workflow(&c, &jv, out);
+    var ok: bool = true;
+    if !contains(out, "WF-AGENT-OK") {
+        ty_fail(tag, "子代理结果没有回到 workflow 结果里", &ok);
+    }
+    if !contains(out, "phases: phase audit files") && !contains(out, "audit files") {
+        ty_fail(tag, "阶段没有记录", &ok);
+    }
+    if !contains(out, "agents started: 1") {
+        ty_fail(tag, "子代理计数不对", &ok);
+    }
+    if !contains(out, "审计完成：WF-AGENT-OK") {
+        ty_fail(tag, "wf_done 的结果没收到", &ok);
+    }
+    cfg_free(&c);
+    return ok;
+}
+
+// B) 真 `uya run` + Uya 的 .ush 脚本
+fn wf_variant_real(cfg: &const Config, tag: &const byte, out: &Buf) bool {
+    const uya_bin: &byte = getenv("UYA_BIN");
+    var binpath: Buf = buf_new(256);
+    defer { buf_free(&binpath); }
+    if (uya_bin as usize) != 0 && bufx_cstr_len(uya_bin) > 0 {
+        _ = buf_append_cstr(&binpath, uya_bin);
+    } else {
+        _ = buf_append_cstr(&binpath, "/home/winger/uya-0.10/bin/uya");
+    }
+    // 交给系统调用前补 NUL（这个坑第 N 次了）
+    _ = buf_append_byte(&binpath, 0);
+    if !sess_file_exists(binpath.ptr as &const byte) {
+        // 没装 uya 就跳过（离线自测不因此失败）
+        return true;
+    }
+    var c: Config = cfg_default();
+    c.base_url = buf_new(64);
+    _ = buf_append_cstr(&c.base_url, "http://127.0.0.1:1/v1");
+    c.model = buf_new(32);
+    _ = buf_append_cstr(&c.model, "selftest-model");
+    c.api_key = buf_new(32);
+    _ = buf_append_cstr(&c.api_key, "selftest-key");
+    c.workspace = buf_new(64);
+    _ = buf_append_cstr(&c.workspace, "build/selftest_wf_ws");
+    c.verify = HC_VERIFY_NONE;
+    c.allow_shell = false;
+    c.timeout_ms = 60000;
+    c.quiet = true;
+    c.agent_home = buf_new(64);
+    _ = buf_append_cstr(&c.agent_home, "build/selftest_wf_home");
+    c.uya_bin = buf_new(binpath.len + 8);
+    _ = buf_append(&c.uya_bin, binpath.ptr, binpath.len);
+    // 脚本只用 phase/log/done（不派生子代理 → 不需要模型）
+    const script: &const byte = "use hooks;\n\nexport fn main() i32 {\n    wf_phase(\"compile\");\n    wf_log(\"编译完成\");\n    wf_phase(\"verify\");\n    wf_done(\"uya run 变体完成\");\n    return 0;\n}\n";
+    var args: Buf = buf_new(8192);
+    defer { buf_free(&args); }
+    var badflag2: bool = false;
+    if !wf_make_args(&args, script, "real-ush") {
+        ty_fail(tag, "组参失败", &badflag2);
+        return false;
+    }
+    var jv: JsonValue = JsonValue.json_null();
+    if !wf_parse_args(&args, &jv) {
+        ty_fail(tag, "参数不是合法 JSON", &badflag2);
+        return false;
+    }
+    buf_reset(out);
+    wf_tool_workflow(&c, &jv, out);
+    var ok: bool = true;
+    if !contains(out, "uya run 变体完成") {
+        ty_fail(tag, "真 uya run 的 wf_done 结果没收到", &ok);
+    }
+    if !contains(out, "compile") || !contains(out, "verify") {
+        ty_fail(tag, "真 uya run 的阶段没记录", &ok);
+    }
+    if !contains(out, "script exit: 0") {
+        ty_fail(tag, "真 uya run 的脚本退出码不是 0", &ok);
+    }
+    cfg_free(&c);
+    return ok;
+}
+
+fn wf_round(base: &const Config, tag: &const byte, ws: &const byte) bool {
+    mock_mode = 16;
+    mock_expect_shell = false;
+    mock_expect_fold = false;
+    mock_expect_steer = false;
+    if !ws_prepare(ws) {
+        out_err("selftest: cannot prepare workspace\n");
+        return false;
+    }
+    _ = sess_mkdir_p("build/selftest_wf_home");
+    // mock 只服务子代理的请求
+    const lfd: i32 = sys_socket(AF_INET, SOCK_STREAM, IPPROTO_TCP) catch {
+        return false;
+    };
+    var one: i32 = 1;
+    _ = sys_setsockopt(lfd, SOL_SOCKET, SO_REUSEADDR, &one as &void, 4 as u32) catch {};
+    var addr: [byte: 16] = [0: 16];
+    fill_sockaddr_ipv4(127, 0, 0, 1, 0, &addr[0]);
+    _ = sys_bind(lfd, &addr[0] as &void, 16 as u32) catch {
+        _ = sys_close(lfd) catch {};
+        return false;
+    };
+    _ = sys_listen(lfd, 4) catch {
+        _ = sys_close(lfd) catch {};
+        return false;
+    };
+    var got: [byte: 16] = [0: 16];
+    var glen: u32 = 16;
+    _ = sys_getsockname(lfd, &got[0] as &void, &glen) catch {
+        _ = sys_close(lfd) catch {};
+        return false;
+    };
+    const port: u16 = ((got[2] as u16) << (8 as i32)) | (got[3] as u16);
+    const pid64: i64 = sys_fork() catch {
+        _ = sys_close(lfd) catch {};
+        return false;
+    };
+    if pid64 == 0 {
+        const rc0: i32 = mock_server(lfd);
+        sys_exit(rc0);
+    }
+    const pid: i32 = i64_to_i32(pid64);
+    _ = sys_close(lfd) catch {};
+
+    var mcfg: Config = cfg_default();
+    mcfg.base_url = buf_new(64);
+    _ = buf_append_cstr(&mcfg.base_url, "http://127.0.0.1:");
+    _ = buf_append_u64(&mcfg.base_url, port as u64);
+    _ = buf_append_cstr(&mcfg.base_url, "/v1");
+    var out: Buf = buf_new(65536);
+    defer { buf_free(&out); }
+
+    var ok: bool = true;
+    out_err("selftest[");
+    out_err(tag);
+    out_err("] ");
+    if !wf_variant_stub(&mcfg, tag, &out) {
+        ok = false;
+    }
+    if !wf_variant_real(&mcfg, tag, &out) {
+        ok = false;
+    }
+    cfg_free(&mcfg);
+    const mock_rc: i32 = wait_child(pid);
+    if mock_rc != 0 {
+        out_err("FAIL: mock server verdict ");
+        out_err_dec(mock_rc as usize);
+        ok = false;
+    }
+    if ok {
+        out_err("ok");
+    }
+    out_err("\n");
+    _ = base;
+    return ok;
+}
+
 export fn selftest_main(base: &const Config) i32 {
     _ = base;
     out_err("selftest: offline end-to-end (mock LLM on 127.0.0.1, no network, no API key)\n");
@@ -3735,7 +4017,8 @@ export fn selftest_main(base: &const Config) i32 {
     const t7: bool = round_run(base, "compact-auto", "build/selftest_ws_compact", 12, 200 as i64, "触发自动压缩");
     const t8: bool = skill_round(base, "skills-web-search", "build/selftest_ws_skill", "build/selftest_skills");
     const t9: bool = deleg_round(base, "subagent-goal", "build/selftest_ws_deleg");
-    if r1 && r2 && r3 && r4 && r5 && r6 && r7 && r8 && r9 && s0 && s1 && s2 && s3 && s4 && t0 && t1 && t2 && t3 && t4 && t5 && t6 && t7 && t8 && t9 {
+    const u0: bool = wf_round(base, "workflow", "build/selftest_wf_ws");
+    if r1 && r2 && r3 && r4 && r5 && r6 && r7 && r8 && r9 && s0 && s1 && s2 && s3 && s4 && t0 && t1 && t2 && t3 && t4 && t5 && t6 && t7 && t8 && t9 && u0 {
         out_err("SELFTEST PASS\n");
         return AGENT_OK;
     }

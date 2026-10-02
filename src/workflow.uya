@@ -1,0 +1,913 @@
+// src/workflow.uya — workflow（P12）
+//
+// 按用户的要求：workflow 的“脚本”是 **Uya 的 .ush 脚本**（用 `uya run` 执行），
+// 脚本里的钩子**代理回父进程**：`agent()` / `parallel()` / `phase()` / `log()` 这些
+// 都由父进程真实执行（子代理、阶段、日志），脚本只负责编排。
+//
+// 机制：
+//   1) 父进程把脚本写成 <tmp>/uya-wf-<pid>-<n>/main.ush，并生成同目录的 hooks.uya
+//      （钩子客户端，用 libc 的 socket + std.json 说话）；
+//   2) 父进程监听 127.0.0.1:0，把端点写进环境变量 UYA_AGENT_WF_ENDPOINT，
+//      参数（JSON 文本）写进 UYA_AGENT_WF_ARGS；
+//   3) fork + exec `<uya-bin> run main.ush`；父进程在等待脚本的同时**轮询钩子 socket**，
+//      每来一条 `op payload` 就真的去做（agent_start 派生一个子代理、agent_wait 等它、
+//      phase/log 记录、done 收结果），再把 `{"ok":…,"text":…}` 回给脚本。
+//
+// 与 DSH（JS 脚本 + `agent()` 钩子）的差别：脚本语言是 Uya、并发靠
+// agent_start/agent_wait 显式配对（DSH 是 Promise），并且只有一层钩子协议。
+
+use libc.syscall;
+use libc.unistd;
+use libc.fcntl;
+use libc.signal;
+use std.runtime.saved_envp;
+
+const WF_MAX_STEPS: usize = 256;
+
+export struct WorkflowRun {
+    name: Buf,
+    phases: Buf,
+    result: Buf,
+    log: Buf,
+    hooks: usize,
+    agents: usize,
+}
+
+export fn wf_run_empty() WorkflowRun {
+    return WorkflowRun{
+        name: buf_empty(),
+        phases: buf_empty(),
+        result: buf_empty(),
+        log: buf_empty(),
+        hooks: 0,
+        agents: 0,
+    };
+}
+
+export fn wf_run_free(r: &WorkflowRun) void {
+    buf_free(&r.name);
+    buf_free(&r.phases);
+    buf_free(&r.result);
+    buf_free(&r.log);
+}
+
+// ============================================================
+// 钩子客户端模板（生成到脚本同目录的 hooks.uya）
+// ============================================================
+fn wf_write_hooks(path: &const byte) bool {
+    var src: Buf = buf_new(8192);
+    defer { buf_free(&src); }
+    // 客户端的核心：连 127.0.0.1:<port>，发一行 "op payload"，读回一行 JSON
+    const lines: [&const byte: 512] = [
+        "use libc.syscall;\n",
+        "use libc.unistd;\n",
+        "use std.json;\n",
+        "use std.json.value.JsonValue;\n",
+        "use std.json.value.JsonStrView;\n",
+        "use std.json.value.JsonKeyValue;\n",
+        "use std.json.parser.parse;\n",
+        "use std.mem.arena;\n",
+        "\n",
+        "// 自包含：只用 libc + std.json（`uya run` 的脚本环境里没有 uya-agent 自己的 Buf 等工具）\n",
+        "var g_text: [byte: 262144] = [0: 262144];\n",
+        "\n",
+        "fn wf_len(p: &const byte) usize {\n",
+        "    var i: usize = 0;\n",
+        "    while p[i] != 0 as byte {\n",
+        "        i = i + 1;\n",
+        "    }\n",
+        "    return i;\n",
+        "}\n",
+        "\n",
+        "fn wf_int(p: &const byte, out: &i32) bool {\n",
+        "    var i: usize = 0;\n",
+        "    var v: i32 = 0;\n",
+        "    var digits: i32 = 0;\n",
+        "    while p[i] != 0 as byte {\n",
+        "        const c: byte = p[i];\n",
+        "        if c >= 48 as byte && c <= 57 as byte {\n",
+        "            v = v * 10 + ((c as i32) - 48);\n",
+        "            digits = digits + 1;\n",
+        "        }\n",
+        "        i = i + 1;\n",
+        "    }\n",
+        "    if digits == 0 {\n",
+        "        return false;\n",
+        "    }\n",
+        "    out[0] = v;\n",
+        "    return true;\n",
+        "}\n",
+        "\n",
+        "fn wf_port() i32 {\n",
+        "    const ep: &byte = getenv(\"UYA_AGENT_WF_PORT\");\n",
+        "    if (ep as usize) == 0 {\n",
+        "        return 0;\n",
+        "    }\n",
+        "    var v: i32 = 0;\n",
+        "    if !wf_int(ep, &v) {\n",
+        "        return 0;\n",
+        "    }\n",
+        "    return v;\n",
+        "}\n",
+        "\n",
+        "fn wf_connect(port: i32) i32 {\n",
+        "    const fd: i32 = sys_socket(AF_INET, SOCK_STREAM, IPPROTO_TCP) catch {\n",
+        "        -1;\n",
+        "    };\n",
+        "    if fd < 0 {\n",
+        "        return -1;\n",
+        "    }\n",
+        "    var addr: [byte: 16] = [0: 16];\n",
+        "    addr[0] = 2 as byte;\n",
+        "    const hi: byte = (((port >> (8 as i32)) & 255) as! byte) catch { 0 as byte; };\n",
+        "    const lo: byte = ((port & 255) as! byte) catch { 0 as byte; };\n",
+        "    addr[2] = hi;\n",
+        "    addr[3] = lo;\n",
+        "    addr[4] = 127 as byte;\n",
+        "    addr[7] = 1 as byte;\n",
+        "    const rc: i32 = sys_connect(fd, &addr[0] as &void, 16 as u32) catch {\n",
+        "        -1;\n",
+        "    };\n",
+        "    if rc != 0 {\n",
+        "        _ = sys_close(fd) catch {};\n",
+        "        return -1;\n",
+        "    }\n",
+        "    return fd;\n",
+        "}\n",
+        "\n",
+        "fn wf_write_all(fd: i32, p: &const byte, n: usize) bool {\n",
+        "    var off: usize = 0;\n",
+        "    while off < n {\n",
+        "        const w: isize = sys_write(fd, &p[off], n - off) catch { -1 as isize; };\n",
+        "        if w <= 0 {\n",
+        "            return false;\n",
+        "        }\n",
+        "        off = off + (w as usize);\n",
+        "    }\n",
+        "    return true;\n",
+        "}\n",
+        "\n",
+        "// std.json 只给结构体，不给取值 helper，所以自己按 key 找字符串值\n",
+        "fn wf_pick_str(v: &const JsonValue, key: &const byte, klen: usize, out: &byte, cap: usize) bool {\n",
+        "    var val: JsonValue = v[0];\n",
+        "    match val {\n",
+        "        .obj(o) => {\n",
+        "            var i: usize = 0;\n",
+        "            while i < o.len {\n",
+        "                var kv: JsonKeyValue = o.pairs[i];\n",
+        "                if kv.key.len == klen {\n",
+        "                    var same: bool = true;\n",
+        "                    var k: usize = 0;\n",
+        "                    while k < klen {\n",
+        "                        if (kv.key.ptr as &const byte)[k] != key[k] {\n",
+        "                            same = false;\n",
+        "                            break;\n",
+        "                        }\n",
+        "                        k = k + 1;\n",
+        "                    }\n",
+        "                    if same {\n",
+        "                        var inner: JsonValue = kv.value;\n",
+        "                        match inner {\n",
+        "                            .str(svv) => {\n",
+        "                                const sp: &const byte = svv.ptr as &const byte;\n",
+        "                                var t: usize = 0;\n",
+        "                                while t < svv.len && t + 1 < cap {\n",
+        "                                    out[t] = sp[t];\n",
+        "                                    t = t + 1;\n",
+        "                                }\n",
+        "                                out[t] = 0 as byte;\n",
+        "                                return true;\n",
+        "                            },\n",
+        "                            else => {\n",
+        "                                return false;\n",
+        "                            },\n",
+        "                        }\n",
+        "                    }\n",
+        "                }\n",
+        "                i = i + 1;\n",
+        "            }\n",
+        "            return false;\n",
+        "        },\n",
+        "        else => {\n",
+        "            return false;\n",
+        "        },\n",
+        "    }\n",
+        "}\n",
+        "\n",
+        "// 发一条钩子请求：op + ' ' + payload + '\\n'，把响应写进 out；返回 ok\n",
+        "fn wf_call(op: &const byte, payload: &const byte, out: &byte, out_cap: usize) bool {\n",
+        "    out[0] = 0 as byte;\n",
+        "    const port: i32 = wf_port();\n",
+        "    if port <= 0 {\n",
+        "        return false;\n",
+        "    }\n",
+        "    const fd: i32 = wf_connect(port);\n",
+        "    if fd < 0 {\n",
+        "        return false;\n",
+        "    }\n",
+        "    var req: [byte: 8192] = [0: 8192];\n",
+        "    var n: usize = 0;\n",
+        "    var i: usize = 0;\n",
+        "    while op[i] != 0 as byte && n < 8000 {\n",
+        "        req[n] = op[i];\n",
+        "        n = n + 1;\n",
+        "        i = i + 1;\n",
+        "    }\n",
+        "    if n < 8000 {\n",
+        "        req[n] = 32 as byte;\n",
+        "        n = n + 1;\n",
+        "    }\n",
+        "    i = 0;\n",
+        "    while payload[i] != 0 as byte && n < 8100 {\n",
+        "        req[n] = payload[i];\n",
+        "        n = n + 1;\n",
+        "        i = i + 1;\n",
+        "    }\n",
+        "    req[n] = 10 as byte;\n",
+        "    n = n + 1;\n",
+        "    var ok: bool = wf_write_all(fd, &req[0], n);\n",
+        "    var got: usize = 0;\n",
+        "    if ok {\n",
+        "        var tmp: [byte: 2048] = [0: 2048];\n",
+        "        var done: bool = false;\n",
+        "        while !done {\n",
+        "            const r: isize = sys_read(fd, &tmp[0], 2048) catch { 0 as isize; };\n",
+        "            if r <= 0 {\n",
+        "                break;\n",
+        "            }\n",
+        "            var k: usize = 0;\n",
+        "            while k < (r as usize) {\n",
+        "                if tmp[k] == 10 as byte {\n",
+        "                    done = true;\n",
+        "                    break;\n",
+        "                }\n",
+        "                if got + 1 < out_cap {\n",
+        "                    out[got] = tmp[k];\n",
+        "                    got = got + 1;\n",
+        "                }\n",
+        "                k = k + 1;\n",
+        "            }\n",
+        "        }\n",
+        "    }\n",
+        "    _ = sys_close(fd) catch {};\n",
+        "    out[got] = 0 as byte;\n",
+        "    if !ok || got == 0 {\n",
+        "        return false;\n",
+        "    }\n",
+        "    // 解析 {\"ok\":…,\"text\":…}\n",
+        "    var raw: &void = malloc(65536);\n",
+        "    defer { free(raw); }\n",
+        "    if ((raw as &byte) as usize) == 0 {\n",
+        "        return false;\n",
+        "    }\n",
+        "    var arena: Arena = Arena{ buffer: null, size: 0, used: 0 };\n",
+        "    arena_init(&arena, raw as &byte, 65536);\n",
+        "    const pr: !JsonValue = parse(&arena, &out[0], got);\n",
+        "    var parsed: bool = true;\n",
+        "    // catch 块最后表达式类型必须与成功值一致（JsonValue），所以这里返回 json_null()\n",
+        "    const root: JsonValue = pr catch {\n",
+        "        parsed = false;\n",
+        "        JsonValue.json_null();\n",
+        "    };\n",
+        "    if !parsed {\n",
+        "        return false;\n",
+        "    }\n",
+        "    return wf_pick_str(&root, \"text\" as &const byte, 4, out, out_cap);\n",
+        "}\n",
+        "\n",
+        "// JSON 字符串转义（只处理必须的两类，够钩子参数用）\n",
+        "fn wf_esc(dst: &byte, cap: usize, src: &const byte) usize {\n",
+        "    var n: usize = 0;\n",
+        "    var i: usize = 0;\n",
+        "    while src[i] != 0 as byte && n + 2 < cap {\n",
+        "        const c: byte = src[i];\n",
+        "        if c == 34 as byte || c == 92 as byte {\n",
+        "            dst[n] = 92 as byte;\n",
+        "            n = n + 1;\n",
+        "        }\n",
+        "        if c == 10 as byte {\n",
+        "            dst[n] = 92 as byte;\n",
+        "            n = n + 1;\n",
+        "            dst[n] = 110 as byte;\n",
+        "            n = n + 1;\n",
+        "            i = i + 1;\n",
+        "            continue;\n",
+        "        }\n",
+        "        dst[n] = c;\n",
+        "        n = n + 1;\n",
+        "        i = i + 1;\n",
+        "    }\n",
+        "    dst[n] = 0 as byte;\n",
+        "    return n;\n",
+        "}\n",
+        "\n",
+        "// ---- 给脚本用的钩子 ----\n",
+        "export fn wf_args() &const byte {\n",
+        "    const a: &byte = getenv(\"UYA_AGENT_WF_ARGS\");\n",
+        "    if (a as usize) == 0 {\n",
+        "        return \"{}\" as &const byte;\n",
+        "    }\n",
+        "    return a;\n",
+        "}\n",
+        "\n",
+        "export fn wf_phase(title: &const byte) void {\n",
+        "    var resp: [byte: 4096] = [0: 4096];\n",
+        "    _ = wf_call(\"phase\" as &const byte, title, &resp[0], 4096);\n",
+        "}\n",
+        "\n",
+        "export fn wf_log(msg: &const byte) void {\n",
+        "    var resp: [byte: 4096] = [0: 4096];\n",
+        "    _ = wf_call(\"log\" as &const byte, msg, &resp[0], 4096);\n",
+        "}\n",
+        "\n",
+        "export fn wf_agent_start(prompt: &const byte, label: &const byte) i32 {\n",
+        "    var payload: [byte: 16384] = [0: 16384];\n",
+        "    var esc: [byte: 8192] = [0: 8192];\n",
+        "    _ = wf_esc(&esc[0], 8192, prompt);\n",
+        "    var n: usize = 0;\n",
+        "    const head: &const byte = \"{\\\"prompt\\\":\\\"\";\n",
+        "    var i: usize = 0;\n",
+        "    while head[i] != 0 as byte {\n",
+        "        payload[n] = head[i];\n",
+        "        n = n + 1;\n",
+        "        i = i + 1;\n",
+        "    }\n",
+        "    i = 0;\n",
+        "    while esc[i] != 0 as byte {\n",
+        "        payload[n] = esc[i];\n",
+        "        n = n + 1;\n",
+        "        i = i + 1;\n",
+        "    }\n",
+        "    const mid: &const byte = \"\\\",\\\"label\\\":\\\"\";\n",
+        "    i = 0;\n",
+        "    while mid[i] != 0 as byte {\n",
+        "        payload[n] = mid[i];\n",
+        "        n = n + 1;\n",
+        "        i = i + 1;\n",
+        "    }\n",
+        "    _ = wf_esc(&esc[0], 8192, label);\n",
+        "    i = 0;\n",
+        "    while esc[i] != 0 as byte {\n",
+        "        payload[n] = esc[i];\n",
+        "        n = n + 1;\n",
+        "        i = i + 1;\n",
+        "    }\n",
+        "    payload[n] = 34 as byte;\n",
+        "    n = n + 1;\n",
+        "    payload[n] = 125 as byte;\n",
+        "    n = n + 1;\n",
+        "    payload[n] = 0 as byte;\n",
+        "    var resp: [byte: 4096] = [0: 4096];\n",
+        "    if !wf_call(\"agent_start\" as &const byte, &payload[0], &resp[0], 4096) {\n",
+        "        return -1;\n",
+        "    }\n",
+        "    var h: i32 = 0;\n",
+        "    if !wf_int(&resp[0], &h) {\n",
+        "        return -1;\n",
+        "    }\n",
+        "    return h;\n",
+        "}\n",
+        "\n",
+        "export fn wf_agent_wait(handle: i32) &const byte {\n",
+        "    var num: [byte: 16] = [0: 16];\n",
+        "    var n: usize = 0;\n",
+        "    var v: i32 = handle;\n",
+        "    if v == 0 {\n",
+        "        num[0] = 48 as byte;\n",
+        "        n = 1;\n",
+        "    } else {\n",
+        "        var tmp: [byte: 16] = [0: 16];\n",
+        "        var k: usize = 0;\n",
+        "        while v > 0 {\n",
+        "            tmp[k] = (48 + (v % 10)) as! byte catch { 48 as byte; };\n",
+        "            v = v / 10;\n",
+        "            k = k + 1;\n",
+        "        }\n",
+        "        while k > 0 {\n",
+        "            k = k - 1;\n",
+        "            num[n] = tmp[k];\n",
+        "            n = n + 1;\n",
+        "        }\n",
+        "    }\n",
+        "    num[n] = 0 as byte;\n",
+        "    var resp: [byte: 262144] = [0: 262144];\n",
+        "    if !wf_call(\"agent_wait\" as &const byte, &num[0], &resp[0], 262144) {\n",
+        "        return \"(agent_wait failed)\" as &const byte;\n",
+        "    }\n",
+        "    var i: usize = 0;\n",
+        "    while resp[i] != 0 as byte && i < 262143 {\n",
+        "        g_text[i] = resp[i];\n",
+        "        i = i + 1;\n",
+        "    }\n",
+        "    g_text[i] = 0 as byte;\n",
+        "    return &g_text[0] as &const byte;\n",
+        "}\n",
+        "\n",
+        "export fn wf_agent(prompt: &const byte, label: &const byte) &const byte {\n",
+        "    const h: i32 = wf_agent_start(prompt, label);\n",
+        "    if h < 0 {\n",
+        "        return \"(cannot start agent)\" as &const byte;\n",
+        "    }\n",
+        "    return wf_agent_wait(h);\n",
+        "}\n",
+        "\n",
+        "export fn wf_done(result: &const byte) void {\n",
+        "    var resp: [byte: 4096] = [0: 4096];\n",
+        "    _ = wf_call(\"done\" as &const byte, result, &resp[0], 4096);\n",
+        "}\n",
+        "\n",
+        "export fn wf_failed(reason: &const byte) void {\n",
+        "    var resp: [byte: 4096] = [0: 4096];\n",
+        "    _ = wf_call(\"failed\" as &const byte, reason, &resp[0], 4096);\n",
+        "}\n",
+        "\n",
+    ];
+    var i: usize = 0;
+    while i < 512 && (lines[i] as usize) != 0 {
+        if !buf_append_cstr(&src, lines[i]) {
+            return false;
+        }
+        i = i + 1;
+    }
+    if !buf_append_byte(&src, 0) {
+        return false;
+    }
+    return write_text_file_compat(path, src.ptr[0: src.len]);
+}
+
+// uya_bin 是不是「直接解释器」：/bin/bash、/bin/sh、python3 这类（不含 "uya"）
+fn wf_is_direct_interpreter(bin: &[byte]) bool {
+    if bin.len == 0 {
+        return false;
+    }
+    var base: usize = 0;
+    var i: usize = 0;
+    while i < bin.len {
+        if bin.ptr[i] == 47 as byte {
+            base = i + 1;
+        }
+        i = i + 1;
+    }
+    const name: &[byte] = bin[base: bin.len - base];
+    if sess_has_cstr(name, "uya") {
+        return false;
+    }
+    return sess_has_cstr(name, "sh") || sess_has_cstr(name, "bash") || sess_has_cstr(name, "python");
+}
+
+// 只写文件（workflow 自己的小工具，避免依赖 selftest 里的同名函数）
+fn write_text_file_compat(path_z: &const byte, data: &[byte]) bool {
+    const flags: i32 = (O_WRONLY | O_CREAT | O_TRUNC) as i32;
+    const fd: i32 = sys_open(path_z as *const byte, flags, 420) catch {
+        return false;
+    };
+    var ok: bool = true;
+    if data.len > 0 {
+        ok = write_all_fd(fd, data.ptr as &const byte, data.len);
+    }
+    _ = sys_close(fd) catch {};
+    return ok;
+}
+
+// ============================================================
+// 钩子服务 + 脚本执行
+// ============================================================
+fn wf_join(dir: &const Buf, name: &const byte, out: &Buf) bool {
+    buf_reset(out);
+    if !buf_append(&out[0], dir.ptr, dir.len) {
+        return false;
+    }
+    if !buf_append_byte(&out[0], 47) {
+        return false;
+    }
+    return buf_append_cstr(&out[0], name);
+}
+
+// 从 off 开始到末尾的切片（`as &const byte[0: n]` 这种写法解析不了，一律走这里）
+fn wf_slice_from(p: &[byte], off: usize) &[byte] {
+    if off >= p.len {
+        return p[0: 0];
+    }
+    const base: &const byte = @ptr_from_usize(@usize_from_ptr((&p[0]) as &const void) + off) as &const byte;
+    return base[0: p.len - off];
+}
+
+// 处理一条钩子请求；返回 false 表示父进程该收工了
+fn wf_handle_hook(cfg: &const Config, line: &[byte], run: &WorkflowRun, out: &Buf, parent: &const Config) void {
+    // 拆 op 与 payload
+    var sp: usize = 0;
+    while sp < line.len && line.ptr[sp] != 32 as byte {
+        sp = sp + 1;
+    }
+    const op: &[byte] = line[0: sp];
+    const payload: &[byte] = wf_slice_from(line, sp + 1);
+    run.hooks = run.hooks + 1;
+    if bufx_mem_eq(op.ptr, "phase", 5) {
+        if run.phases.len > 0 {
+            _ = buf_append_cstr(&run.phases, " → ");
+        }
+        _ = buf_append(&run.phases, payload.ptr, payload.len);
+        if !cfg.quiet {
+            out_err("[workflow] phase: ");
+            out_err_bytes(payload.ptr, payload.len);
+            out_err("\n");
+        }
+        wf_ok(out, "ok", 2);
+        return;
+    }
+    if bufx_mem_eq(op.ptr, "log", 3) {
+        if run.log.len > 0 {
+            _ = buf_append_byte(&run.log, 10);
+        }
+        _ = buf_append(&run.log, payload.ptr, payload.len);
+        if !cfg.quiet {
+            out_err("[workflow] ");
+            out_err_bytes(payload.ptr, payload.len);
+            out_err("\n");
+        }
+        wf_ok(out, "ok", 2);
+        return;
+    }
+    if bufx_mem_eq(op.ptr, "agent_start", 11) {
+        // payload 是 {"prompt":…,"label":…}
+        var pp: Buf = buf_empty();
+        defer { buf_free(&pp); }
+        var ll: Buf = buf_empty();
+        defer { buf_free(&ll); }
+        if !wf_json_get_str(payload.ptr, payload.len, "prompt", 6, &pp) {
+            wf_ok(out, "invalid agent_start payload", 26);
+            return;
+        }
+        _ = wf_json_get_str(payload.ptr, payload.len, "label", 5, &ll);
+        if ll.len == 0 {
+            _ = buf_append_cstr(&ll, "workflow agent");
+        }
+        const slot: isize = deleg_spawn(parent, &g_deleg, &pp, &ll, DELEG_KIND_SUB, 1, false);
+        if slot < 0 {
+            wf_ok(out, "cannot start a subagent", 23);
+            return;
+        }
+        const si: usize = slot as usize;
+        run.agents = run.agents + 1;
+        var idb: Buf = buf_new(32);
+        defer { buf_free(&idb); }
+        _ = buf_append_i64(&idb, g_deleg.items[si].id as i64);
+        wf_ok(out, idb.ptr as &const byte, idb.len);
+        return;
+    }
+    if bufx_mem_eq(op.ptr, "agent_wait", 10) {
+        var id: i32 = 0;
+        var i: usize = 0;
+        while i < payload.len && is_digit(payload.ptr[i]) {
+            id = id * 10 + ((payload.ptr[i] as i32) - 48);
+            i = i + 1;
+        }
+        const slot: isize = wf_find_deleg(id);
+        if slot < 0 {
+            wf_ok(out, "unknown agent handle", 20);
+            return;
+        }
+        const si: usize = slot as usize;
+        const started: u64 = ua_now_ms();
+        while deleg_status_at(&g_deleg, si) == DELEG_RUNNING {
+            deleg_drain(&g_deleg, si);
+            deleg_check(&g_deleg, si);
+            if (ua_now_ms() - started) >= (parent.timeout_ms as u64) {
+                break;
+            }
+            var pfds: [PollFd: 1] = [PollFd{ fd: deleg_fd_at(&g_deleg, si), events: POLLIN, revents: 0 }];
+            _ = sys_poll(&pfds[0], 1, 50) catch {};
+        }
+        deleg_drain(&g_deleg, si);
+        var txt: Buf = buf_empty();
+        defer { buf_free(&txt); }
+        _ = deleg_take_output(&g_deleg, si, &txt);
+        const v: &[byte] = txt.ptr[0: txt.len];
+        wf_ok_json(out, &v[0], v.len);
+        return;
+    }
+    if bufx_mem_eq(op.ptr, "done", 4) {
+        buf_reset(&run.result);
+        _ = buf_append(&run.result, payload.ptr, payload.len);
+        wf_ok(out, "ok", 2);
+        return;
+    }
+    if bufx_mem_eq(op.ptr, "failed", 6) {
+        buf_reset(&run.result);
+        _ = buf_append_cstr(&run.result, "(failed) ");
+        _ = buf_append(&run.result, payload.ptr, payload.len);
+        wf_ok(out, "ok", 2);
+        return;
+    }
+    wf_ok(out, "unknown op", 10);
+}
+
+fn wf_ok(out: &Buf, text: &const byte, n: usize) void {
+    buf_reset(out);
+    _ = buf_append_cstr(out, "{\"ok\":true,\"text\":");
+    _ = jw_str_into(out, text, n);
+    _ = buf_append_cstr(out, "}\n");
+}
+
+fn wf_ok_json(out: &Buf, text: &const byte, n: usize) void {
+    wf_ok(out, text, n);
+}
+
+fn wf_json_get_str(p: &const byte, n: usize, key: &const byte, key_len: usize, out: &Buf) bool {
+    var raw: &void = malloc(65536);
+    defer { free(raw); }
+    if ((raw as &byte) as usize) == 0 {
+        return false;
+    }
+    var arena: Arena = Arena{ buffer: null, size: 0, used: 0 };
+    arena_init(&arena, raw as &byte, 65536);
+    var root: JsonValue = JsonValue.json_null();
+    if !js_parse(&arena, p, n, &root) {
+        return false;
+    }
+    var sv: JsonStrView = JsonStrView{ ptr: null, len: 0 };
+    if !js_obj_get_str(&root, key, key_len, &sv) {
+        return false;
+    }
+    buf_reset(out);
+    return buf_append(out, sv.ptr as &const byte, sv.len);
+}
+
+fn wf_find_deleg(id: i32) isize {
+    var i: usize = 0;
+    while i < DELEG_MAX {
+        if g_deleg.items[i].used && g_deleg.items[i].id == id {
+            return i as isize;
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+// ============================================================
+// workflow 工具
+// ============================================================
+export fn wf_tool_workflow(cfg: &const Config, args: &const JsonValue, out: &Buf) void {
+    var script: Buf = buf_empty();
+    defer { buf_free(&script); }
+    if !js_obj_get_str_unescaped(args, "script", 6, &script) || script.len == 0 {
+        _ = buf_append_cstr(out, "Error: missing string argument \"script\"");
+        return;
+    }
+    var meta_name: Buf = buf_empty();
+    defer { buf_free(&meta_name); }
+    var meta_raw: Buf = buf_empty();
+    defer { buf_free(&meta_raw); }
+    var mv: JsonValue = JsonValue.json_null();
+    if js_obj_get(args, "meta", 4, &mv) {
+        _ = js_obj_get_str_unescaped(&mv, "name", 4, &meta_name);
+        _ = js_obj_get_str_unescaped(&mv, "description", 11, &meta_raw);
+    }
+    if meta_name.len == 0 {
+        _ = buf_append_cstr(&meta_name, "workflow");
+    }
+    var jargs: Buf = buf_empty();
+    defer { buf_free(&jargs); }
+    if !js_obj_get_str_unescaped(args, "args", 4, &jargs) {
+        _ = buf_append_cstr(&jargs, "{}");
+    }
+
+    // 目录 + 文件
+    var dir: Buf = buf_new(512);
+    defer { buf_free(&dir); }
+    _ = buf_append_cstr(&dir, "/tmp/uya-wf-");
+    _ = buf_append_i64(&dir, ua_now_ms() as i64);
+    _ = buf_append_byte(&dir, 0);
+    _ = sys_mkdir(dir.ptr as *const byte, 493 as u32) catch {
+        _ = buf_append_cstr(out, "Error: cannot create the workflow directory");
+        return;
+    };
+    dir.len = dir.len - 1;   // 去掉 NUL，后面按长度用
+
+    var script_path: Buf = buf_new(600);
+    defer { buf_free(&script_path); }
+    _ = wf_join(&dir, "main.ush", &script_path);
+    _ = buf_append_byte(&script_path, 0);
+    if !write_text_file_compat(script_path.ptr as &const byte, script.ptr[0: script.len]) {
+        _ = buf_append_cstr(out, "Error: cannot write the workflow script");
+        return;
+    }
+    var hooks_path: Buf = buf_new(600);
+    defer { buf_free(&hooks_path); }
+    _ = wf_join(&dir, "hooks.uya", &hooks_path);
+    _ = buf_append_byte(&hooks_path, 0);
+    if !wf_write_hooks(hooks_path.ptr as &const byte) {
+        _ = buf_append_cstr(out, "Error: cannot write the hook module");
+        return;
+    }
+
+    // 监听钩子端口
+    const lfd: i32 = sys_socket(AF_INET, SOCK_STREAM, IPPROTO_TCP) catch {
+        _ = buf_append_cstr(out, "Error: cannot open the hook socket");
+        return;
+    };
+    var one: i32 = 1;
+    _ = sys_setsockopt(lfd, SOL_SOCKET, SO_REUSEADDR, &one as &void, 4 as u32) catch {};
+    var addr: [byte: 16] = [0: 16];
+    addr[0] = 2 as byte;
+    addr[4] = 127 as byte;
+    addr[7] = 1 as byte;
+    _ = sys_bind(lfd, &addr[0] as &void, 16 as u32) catch {
+        _ = sys_close(lfd) catch {};
+        _ = buf_append_cstr(out, "Error: cannot bind the hook socket");
+        return;
+    };
+    _ = sys_listen(lfd, 8) catch {};
+    var got: [byte: 16] = [0: 16];
+    var glen: u32 = 16;
+    _ = sys_getsockname(lfd, &got[0] as &void, &glen) catch {
+        _ = sys_close(lfd) catch {};
+        _ = buf_append_cstr(out, "Error: cannot resolve the hook port");
+        return;
+    };
+    const port: u16 = ((got[2] as u16) << (8 as i32)) | (got[3] as u16);
+
+    // 起脚本进程
+    var run_path_dbg: Buf = buf_new(256);
+    defer { buf_free(&run_path_dbg); }
+    _ = buf_append(&run_path_dbg, cfg.uya_bin.ptr, cfg.uya_bin.len);
+    var portbuf: Buf = buf_new(16);
+    defer { buf_free(&portbuf); }
+    _ = buf_append_i64(&portbuf, port as i64);
+    _ = buf_append_byte(&portbuf, 0);
+    var argsbuf: Buf = buf_new(jargs.len + 1);
+    defer { buf_free(&argsbuf); }
+    _ = buf_append(&argsbuf, jargs.ptr, jargs.len);
+    _ = buf_append_byte(&argsbuf, 0);
+
+    sh_env_prepare_kv("UYA_AGENT_WF_PORT" as &const byte, portbuf.ptr as &const byte, "UYA_AGENT_WF_ARGS" as &const byte, argsbuf.ptr as &const byte);
+    const pid64: i64 = sys_fork() catch {
+        _ = sys_close(lfd) catch {};
+        _ = buf_append_cstr(out, "Error: cannot start the workflow script");
+        return;
+    };
+    if pid64 == 0 {
+        _ = sys_close(lfd) catch {};
+        // 钩子端点与参数通过环境传给脚本（libc 没有 setenv，自己拼 envp）
+        // UYA_ROOT 透传（uya run 需要它）
+        var runner: [byte: 128] = [0: 128];
+        const bin: &const byte = cfg.uya_bin.ptr as &const byte;
+        var i: usize = 0;
+        while i < cfg.uya_bin.len && i < 120 {
+            runner[i] = bin[i];
+            i = i + 1;
+        }
+        runner[i] = 0 as byte;
+        var arg0: [byte: 128] = [0: 128];
+        var j: usize = 0;
+        while j < 32 && runner[j] != 0 as byte && runner[j] != 47 as byte {
+            j = j + 1;
+        }
+        var k: usize = 0;
+        while j < 128 && runner[j] != 0 as byte {
+            arg0[k] = runner[j];
+            j = j + 1;
+            k = k + 1;
+        }
+        if k == 0 {
+            arg0[0] = 117 as byte;
+            arg0[1] = 121 as byte;
+            arg0[2] = 97 as byte;
+            arg0[3] = 0 as byte;
+        }
+        // 直接解释器模式：`--uya-bin` 指向解释器（/bin/bash、python3…）时走 `<bin> <script>`，
+        // 否则走 `uya run <script>`。argv 项的数组长度必须是 strlen+1（否则没有 NUL 结尾）。
+        const direct: bool = wf_is_direct_interpreter(cfg.uya_bin.ptr[0: cfg.uya_bin.len]);
+        var run_arg: [byte: 4] = "run";
+        var argv: [&const byte: 4] = [&arg0[0], &run_arg[0], script_path.ptr as &const byte, null as &const byte];
+        if direct {
+            // 跳过 "run"：argv[1] 就是脚本
+            argv[1] = script_path.ptr as &const byte;
+            argv[2] = null as &const byte;
+        }
+        if !cfg.quiet {
+            out_err("[workflow/child] exec=");
+            out_err_bytes(&runner[0] as &const byte, bufx_cstr_len(&runner[0] as &const byte));
+            out_err(" argv1=");
+            out_err_bytes(&run_arg[0] as &const byte, bufx_cstr_len(&run_arg[0] as &const byte));
+            out_err(" argv2=");
+            out_err_bytes(script_path.ptr as &const byte, script_path.len);
+            out_err("\n");
+        }
+        // execve 失败时（路径不对/没权限）子进程会静默退出 127；父进程会在结果里报退出码
+        _ = sys_execve(&runner[0], &argv[0], sh_env_array()) catch {};
+        if !cfg.quiet {
+            out_err("[workflow/child] execve 失败\n");
+        }
+        sys_exit(127);
+    }
+    const pid: i32 = i64_to_i32(pid64);
+
+    if !cfg.quiet {
+        out_err("[workflow] runner=");
+        out_err_bytes(run_path_dbg.ptr, run_path_dbg.len);
+        out_err(" script=");
+        out_err_bytes(script_path.ptr, script_path.len);
+        out_err("\n");
+    }
+    // 边等脚本、边服务钩子
+    var run: WorkflowRun = wf_run_empty();
+    defer { wf_run_free(&run); }
+    _ = buf_append(&run.name, meta_name.ptr, meta_name.len);
+    run.phases = buf_new(256);
+    run.result = buf_empty();
+    run.log = buf_new(4096);
+    var line: Buf = buf_new(65536);
+    defer { buf_free(&line); }
+    var resp: Buf = buf_new(65536);
+    defer { buf_free(&resp); }
+    var exited: bool = false;
+    var exit_code: i32 = 0;
+    var guard: usize = 0;
+    while !exited && guard < WF_MAX_STEPS * 40 {
+        guard = guard + 1;
+        // 脚本结束了吗？
+        var st: i32 = 0;
+        const r: i32 = sys_waitpid(pid, &st, 1) catch { 0; };
+        if r > 0 {
+            exited = true;
+            exit_code = (st >> (8 as i32)) & 255;
+        }
+        // 有钩子请求就处理
+        var pfds: [PollFd: 1] = [PollFd{ fd: lfd, events: POLLIN, revents: 0 }];
+        const pr: i32 = sys_poll(&pfds[0], 1, 25) catch { 0; };
+        if pr > 0 && (pfds[0].revents & POLLIN) != 0 {
+            var peer: [byte: 16] = [0: 16];
+            var alen: u32 = 16;
+            const cfd: i32 = sys_accept(lfd, &peer[0] as &void, &alen) catch { -1; };
+            if cfd >= 0 {
+                buf_reset(&line);
+                var tmp: [byte: 8192] = [0: 8192];
+                var got_line: bool = false;
+                while !got_line {
+                    const n: isize = sys_read(cfd, &tmp[0], 8192) catch { 0 as isize; };
+                    if n <= 0 {
+                        break;
+                    }
+                    _ = buf_append(&line, &tmp[0], n as usize);
+                    var i: usize = 0;
+                    while i < line.len {
+                        if line.ptr[i] == 10 as byte {
+                            line.len = i;
+                            got_line = true;
+                            break;
+                        }
+                        i = i + 1;
+                    }
+                }
+                if got_line {
+                    wf_handle_hook(cfg, line.ptr[0: line.len], &run, &resp, cfg);
+                    write_all_fd(cfd, resp.ptr as &const byte, resp.len);
+                }
+                _ = sys_close(cfd) catch {};
+            }
+        }
+    }
+    _ = sys_close(lfd) catch {};
+    if !exited {
+        _ = sys_kill(pid as i64, SIGKILL) catch {};
+        var st2: i32 = 0;
+        _ = sys_waitpid(pid, &st2, 0) catch {};
+        exit_code = -1;
+    }
+    // 兜底：把还没收完的子代理收掉
+    deleg_poll_all(&g_deleg);
+
+    // 结果
+    _ = buf_append_cstr(out, "# ");
+    _ = buf_append(out, run.name.ptr, run.name.len);
+    if meta_raw.len > 0 {
+        _ = buf_append_cstr(out, ": ");
+        _ = buf_append(out, meta_raw.ptr, meta_raw.len);
+    }
+    _ = buf_append_cstr(out, "\n");
+    if run.phases.len > 0 {
+        _ = buf_append_cstr(out, "phases: ");
+        _ = buf_append(out, run.phases.ptr, run.phases.len);
+        _ = buf_append_cstr(out, "\n");
+    }
+    _ = buf_append_cstr(out, "hooks handled: ");
+    _ = buf_append_u64(out, run.hooks as u64);
+    _ = buf_append_cstr(out, ", agents started: ");
+    _ = buf_append_u64(out, run.agents as u64);
+    _ = buf_append_cstr(out, ", script exit: ");
+    _ = buf_append_i64(out, exit_code as i64);
+    _ = buf_append_cstr(out, "\n");
+    if run.log.len > 0 {
+        _ = buf_append_cstr(out, "log:\n");
+        _ = buf_append(out, run.log.ptr, run.log.len);
+        _ = buf_append_cstr(out, "\n");
+    }
+    if run.result.len > 0 {
+        _ = buf_append_cstr(out, "result:\n");
+        _ = buf_append(out, run.result.ptr, run.result.len);
+        _ = buf_append_cstr(out, "\n");
+    } else {
+        _ = buf_append_cstr(out, "(the script finished without calling wf_done)\n");
+    }
+}

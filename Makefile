@@ -13,7 +13,7 @@
 UYA_ROOT ?= /home/winger/uya-0.10/lib/
 UYA      ?= /home/winger/uya-0.10/bin/uya
 
-SRC := src/bufx.uya src/jsonx.uya src/httpc.uya src/httpstream.uya src/sse.uya src/llm.uya src/tty.uya src/inbox.uya src/session.uya src/yamlcfg.uya src/dshcfg.uya src/prompt.uya src/instr.uya src/compact.uya src/skill.uya src/webx.uya src/deleg.uya src/goal.uya src/todo.uya src/plan.uya src/askuser.uya src/fsx.uya src/search.uya src/jobs.uya src/shellx.uya src/tools.uya src/agent.uya src/selftest.uya
+SRC := src/bufx.uya src/jsonx.uya src/httpc.uya src/httpstream.uya src/sse.uya src/llm.uya src/tty.uya src/inbox.uya src/session.uya src/yamlcfg.uya src/dshcfg.uya src/prompt.uya src/instr.uya src/compact.uya src/skill.uya src/webx.uya src/deleg.uya src/goal.uya src/workflow.uya src/todo.uya src/plan.uya src/askuser.uya src/fsx.uya src/search.uya src/jobs.uya src/shellx.uya src/tools.uya src/agent.uya src/selftest.uya
 OUT := build/uya-agent
 
 BASE ?= https://api.deepseek.com/v1
@@ -37,7 +37,7 @@ build:
 	$(UYA) build $(SRC) -o $(OUT)
 
 selftest: build
-	$(OUT) --selftest
+	UYA_BIN=$(UYA) $(OUT) --selftest
 
 probe: build
 	$(OUT) --probe --tls-verify=none --base-url $(BASE)

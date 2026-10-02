@@ -4,7 +4,7 @@
 多轮 loop 直到给出结论。全部代码 9 个 `.uya` 文件，**不引入任何 C 代码、`@c_import` 或其它语言**，
 只依赖 Uya 语言与随编译器分发的标准库。
 
-**P1–P11 已完成**：LLM 交互是**流式 SSE**（`stream:true` + `stream_options.include_usage`），
+**P1–P12 已完成**：LLM 交互是**流式 SSE**（`stream:true` + `stream_options.include_usage`），
 增量 chunked 解码 + SSE 分帧 + `tool_calls` 按 `index` 分片累积；消息协议是**严格工具协议**
 （`assistant.tool_calls` 原样回灌 + 每条结果一条 `role:"tool"` + `tool_call_id`）；
 交互界面是**真 TTY**（termios raw + 行编辑器），流式期间可打断、可继续输入、可续跑；
@@ -21,7 +21,8 @@ tool 结果超 8192 码点自动剪枝，压力超过窗口 80% 时自动压缩�
 **技能**（发现 → 目录注入 → `skill` 工具）与**联网搜索**（`web_search`，provider 侧搜索）也接上了，
 两者都在真机上跑通过；**子代理一族**（`subagent` / `subagent_fork` / `list_agents` / `subagent_output` /
 `send_message` / `interrupt_agent` / `ralph`）与**会话级目标**（`create_goal` / `get_goal` / `update_goal`）
-也完成，真机上派生子代理并把结果收回父进程验证过。
+也完成，真机上派生子代理并把结果收回父进程验证过；**workflow** 按既定方案用 **Uya 的 `.ush` 脚本**
+（`uya run` 执行）编排子代理，脚本里的钩子**代理回父进程**执行。
 `--no-stream` / `--compat-fold` 保留两条回退路径。
 
 ```
@@ -87,6 +88,7 @@ export UYA_SPLIT_C_DIR=$PWD/build/uyacache      # 多文件 C 缓存别丢在仓
 | `--yaml-dump FILE` | 打印该 YAML 的解析结果（诊断） |
 | `--plan` | 以 plan 模式启动（先出计划、批准后再执行） |
 | `--skill-dir DIR` | 额外的技能根（冒号分隔，可多次） |
+| `--uya-bin PATH` | 跑 workflow 脚本的解释器（默认 `$UYA_BIN` 或 `uya`） |
 | `--no-compact` | 关闭自动上下文压缩 |
 | `--context-window N` | 压缩判定的窗口（默认取 DSH 模型条目） |
 | `--dsh-root DIR` | packaged preset 根（读 persona / plan 段文案） |
@@ -137,6 +139,8 @@ src/search.uya    glob / grep：rg 子进程（--files / --json）、VCS 目录�
 src/dshcfg.uya    读 DSH 设置：$DSH_HOME 解析、settings.yaml 模型路线（agent-default-model →
                   provider 的 baseURL/apiKeyEnv/models[]）、.credentials.yaml、.env 兜底、
                   permission→confine、uya-agent.tls 命名空间
+src/workflow.uya  workflow：把脚本写成 .ush + 生成同目录的自包含 hooks.uya（钩子客户端）、
+                  监听 127.0.0.1 的钩子端口、fork+exec `uya run`、边等服务脚本边处理钩子
 src/deleg.uya     子代理：fork 不 exec（同二进制跑 agent_run）、结果管道 + 增量读取、
                   父子会话关联（subagent/start 事件）、前台/后台、send_message 续跑、interrupt、ralph
 src/goal.uya      会话级目标：goal.json（id/revision/phase/round/maxRounds/blocker/armed）、
@@ -160,6 +164,24 @@ src/agent.uya     CLI、环境变量、消息历史、请求组装、主循环�
                   交互式 REPL（中断/steer//continue/会话命令）、会话事件记录与恢复
 src/selftest.uya  --selftest 的 mock LLM（含 SSE 受控切分）+ 15 轮断言 + --probe
 ```
+
+### workflow：Uya 脚本 + 钩子代理（P12）
+
+按「用 ush 代理 js」的约定：workflow 的脚本是 **Uya 的 `.ush`**，用 `uya run` 执行；
+`agent()` / `phase()` / `log()` / `done()` 这些钩子**在父进程里真实执行**（脚本只负责编排）。
+
+* 工具参数：`script`（.ush 正文）、`meta`（name/description/phases）、`args`（JSON）。
+* 机制：父进程把脚本写成 `/tmp/uya-wf-<ms>/main.ush`，并在同目录生成**自包含**的
+  `hooks.uya`（只用 libc + std.json，因为 `uya run` 的脚本环境里没有本项目的 `Buf` 等工具）；
+  父进程监听 `127.0.0.1:0`，把端口与 args 通过 env 传给脚本，`fork+exec` `<uya-bin> run main.ush`，
+  然后在等待脚本的同时轮询钩子 socket：每来一条 `op payload` 就真的去做
+  （`agent_start` 派生子代理、`agent_wait` 等它、`phase`/`log` 记录、`done` 收结果），
+  再把 `{"ok":…,"text":…}` 回给脚本。
+* 给脚本用的钩子：`wf_args()` / `wf_phase(t)` / `wf_log(m)` / `wf_agent(prompt,label)` /
+  `wf_agent_start(prompt,label)` + `wf_agent_wait(h)`（并发靠这对显式配对）/ `wf_done(result)` / `wf_failed(reason)`。
+* `--uya-bin PATH` 指定解释器（默认 `$UYA_BIN` 或 `uya`）；把它指向 `/bin/bash` 这类解释器时
+  走 `<bin> <script>` 的直接模式（自测就用它跑一个「说同样协议」的 shell 脚本，无需编译器）。
+* 结果回给模型：名字/描述、阶段链、处理的钩子数、派生的子代理数、脚本退出码、日志与 `wf_done` 的结果。
 
 ### 子代理与目标（P11）
 
@@ -526,6 +548,9 @@ agent 循环并逐项断言：
 | `interrupt` | 预置 Ctrl-C：回合以 `AGENT_INTERRUPTED` 结束、工具**未派发**、只发生一次请求 |
 | `tty-editor` | termios 布局(60B)/raw 位运算；行编辑（插入/退格/左右/Delete/Home/End/词删除）、
 一次喂入多行拆成多个提交、分片转义序列、裸 ESC 判定、历史上下翻、中断前缀裁剪 |
+| `workflow` | 两个变体：① 假 runner（`--uya-bin /bin/bash` + 一个说同样协议的 shell 脚本）验证钩子协议本身
+（阶段/日志/`agent_start`/`agent_wait`/`done` 五个钩子 + 子代理结果回流）；② 真 `uya run` 跑一个 Uya 的
+`.ush` 脚本（生成的自包含 hooks.uya 必须真的编译通过）。 |
 | `subagent-goal` | 一轮 9 个调用：`create_goal`/`get_goal`/`update_goal(pause)`、`subagent`（后台）+
 `subagent_output(wait=true)`、`list_agents`、`subagent_fork`（前台）、`ralph(maxRounds=2)` +
 读它的逐轮报告；mock 用 `x-uya-subagent` 头区分父/子请求，第二轮断言目标回显、
