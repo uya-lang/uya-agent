@@ -755,7 +755,9 @@ TTY 交互模式**默认全屏**（`--no-tui` 退回上一节的滚动转录；�
 * **浮层**：命令面板、会话列表（选一个 `/resume`）、帮助（`/help`）、`/status` 详情、
   **访问模式选择器与 Full access 确认**（P21，底对齐，贴着输入面板往上弹）、
   **read-only 下 bash 的逐条批准**（P21），以及 `ask_user_question` / `exit_plan_mode` 的
-  问答弹窗（↑/↓ + enter，esc = 无回答）。
+  问答弹窗（↑/↓ + enter，esc = 无回答）。`/help` 走的就是这里说的帮助**浮层**（不是滚动
+  模式的纯文本帮助）；`/exit`（同 `/quit`）在面板里选中或直接输入都会退出 ——
+  命令的返回值就是「停」，三种入口（面板 / steer / 普通提交）都尊重它。
 * **数据流**：TUI 激活后 `tty.uya` 的 `tty_write` 变成一个 **sink** —— 通道 1（助手正文）、
   2（工具块/诊断）、3（思考，新增 `tty_reason_write`）全部进转录，**fd 1 一个字节都不写**
   （管道语义干净，`tui-turn` 轮断言 fd 1 捕获 0 字节）；工具卡片不是靠前缀嗅探，而是
@@ -1351,6 +1353,38 @@ vLLM 等 OpenAI 兼容端点都一样稳。想升级成严格 `tool` 角色消�
     + `toolcalls-big` 的 `agent_run returned 3`）—— 那正是修前的现场（见 §6 的验收记录，
     那里还有用**真实故障会话** + `testdata/mock_gateway_bigcall.py` 做的 before/after 对照）。
 
+36. **「当前状态」和「刚才发生了什么」混在一个变量里，结果就会被静默丢掉。**
+    这一条在本仓库**踩过不止一次**：`tui_ov_accept()` 先写结果、再
+    `tui_overlay_close()`，而 close 会把 `g_tui_ov_kind` 归零；调用方却是
+    「先 `tui_overlay_take()`、后读 `tui_overlay_kind()`」—— 读到的永远是 0，
+    命令面板与会话列表的选中项被无声丢弃（`/` 开面板 → 选中 → 回车 = 什么都不发生）。
+    §2 的访问模式一节记了修法（accept 把 kind 存进 `g_tui_ov_done`，浮层关闭时
+    `tui_overlay_kind()` 回退到它），这里只留教训：**清理「当前状态」的代码路径，
+    不能顺手把「刚才发生了什么」也清掉**；两者的生命周期不同，就该是两个变量。
+    同类形状还有「take 之后才问类型」「消失的浮层已经答过一句话」——
+    新增浮层类型时先确认读 kind 的时机。
+
+37. **TUI 主循环把命令的返回值丢掉，`/exit` 就成了摆设。**
+    `agent_repl_command()` / `agent_tui_command()` 的返回值语义是「该停了吗」，
+    滚动模式的 REPL 一直在用（`const stop = …; if stop { run = false }`），
+    但 TUI 那三处调用点全写成 `_ = agent_tui_command(…)` —— 于是 TUI 里
+    **直接输入 `/exit` 回车不退出**，面板里选中 `/exit` 同样不退出。
+    更阴的是它看起来「像在工作」：`ctrl+d`（空行退出）走的是另一条键位路径，
+    所以手动测的时候很容易被 `ctrl+d` 的成功掩盖。修法是把三处调用点都接上返回值。
+    回归：`tui-pty` 轮的退出动作从 `ctrl+d` 换成 **`/exit` + 回车** ——
+    正因为 `ctrl+d` 不经过命令分派，它测不出这个 bug；换掉之后旧实现立刻报
+    「`/exit` 之后子进程没有退出（命令的返回值被丢了？）」，并且连带报出
+    「没有离开备用屏幕 / termios 没有还原」（进程根本没走到收尾）。
+
+38. **浮层标题的「字节数」写死 = 读越界，而且字符数不等于字节数。**
+    `tui_overlay_list(kind, title, tn, …)` 的 `tn` 是**字节数**，实现按它 `memcpy`。
+    三处调用把字节数拍成了字符数/旧值：会话标题写 `44`（实际 38）、状态标题写 `46`
+    （实际 22）、确认标题写 `6`（「请确认」实际 9）。多出来的部分会把 `.rodata` 里
+    紧邻的字面量字节一起复制进标题缓冲 —— 屏幕上就是标题尾巴上挂着别的命令的碎片，
+    而且 `×` 这个形状会先在 client 侧 OOB 崩掉（不是每次都能崩，更毒）。
+    规矩：**能用 `strlen()` / `bufx_cstr_len()` 量就别写死**，这条仓库里已经重复过
+    好几次（`tui_overlay_confirm` 的 `6`、`tui_set_commands` 的字面量长度）。
+
 ---
 
 ## 4. 工具实现要点
@@ -1442,13 +1476,13 @@ agent 循环并逐项断言：
 | `procx-parse` | `/proc/<pid>/stat` 解析：comm 取**第一个 `(` 到最后一个 `)`**（comm 里允许空格与括号）、utime/stime 是 `)` 之后第 12/13 个字段、`|` 后的 cutime/cstime 必须忽略、state 是字母（`S`/`D`）时能跳过；坏行（无括号 / 无右括号 / 缺 stime / utime 非数字）必须失败；`/proc` 目录项名过滤（纯数字才算 pid，`self`/`.`/`..`/11 位不算） |
 | `procx-percent` | `Δticks × 1000 / Δms`：0 / 37 / 100（一个核）/ 250（并行 > 100%）/ 0.5% 向上取整 / `Δms=0` 不可算 / 负增量按 0 / 上限钳 999；`USER_HZ = 100` 常量 |
 | `cpu-live` | fork 一个忙循环 400ms 的子进程（同一个二进制 → comm 相同），父进程睡 450ms 后两次采样：进程数必须涨、综合 `%cpu ≥ 25`、有时间跨度；只建基线的那次必须不给百分比（防除零爆表） |
-| `tui-pty` | **真 PTY**（`/dev/ptmx` + `fork` + `dup2(slave→0/1/2)`）：进备用屏幕（`ESC[?1049h`）、首屏面板/logo、发任务后转录出现 mock 最终答案、`SIGWINCH`（改 winsize + 发信号）后进程仍活着并继续重绘、Ctrl-D 退出码 0、退出后 `TCGETS` 与 fork 前**逐位相同**、离开备用屏幕；不需要 setsid/TIOCSCTTY（fd 0 就是 pts 从设备，Ctrl-C 由程序自己吃字节） |
+| `tui-pty` | **真 PTY**（`/dev/ptmx` + `fork` + `dup2(slave→0/1/2)`）：进备用屏幕（`ESC[?1049h`）、首屏面板/logo、发任务后转录出现 mock 最终答案、`SIGWINCH`（改 winsize + 发信号）后进程仍活着并继续重绘、**`/exit` + 回车**退出码 0（刻意不用 Ctrl-D：它不走命令分派，测不出「命令返回值被丢掉」）、退出后 `TCGETS` 与 fork 前**逐位相同**、离开备用屏幕；不需要 setsid/TIOCSCTTY（fd 0 就是 pts 从设备，Ctrl-C 由程序自己吃字节） |
 | `perm-modes` | 三级访问模式的机器名 ↔ 值 ↔ 显示名（含 DSH 产品名 `Full access`）、`custom`/空串判 -1、策略真值表（`confine` / `allows_write` / `requires_approval`） |
 | `perm-readonly` | mock LLM 一轮 3 个调用：read-only 下 `write` 必须回逐字拒绝串且**文件没落盘**、`bash` 在非交互会话里必须 fail closed（回「无回答渠道」串、命令输出一个字都不给）而 `read` 照常；请求里必须带 read-only 的 file policy 句 |
 | `san-profile` | 三档 profile 的 bwrap argv 逐字断言：read-only = `--ro-bind / / --dev /dev --proc /proc --unshare-pid` 且**没有**可写挂载；workspace-write 多 `--tmpfs /tmp` + `--bind <ws> <ws>`；full access 与 `--no-sandbox` 不套壳；工作区是 `/` 时不加可写 bind；bwrap 不可用时只断言「confined 必须返回 fail closed」 |
 | `san-shell` | 直接 fork 出沙箱命令实测（不经工具闸门）：read-only 里 `> /dev/null` 成功、写 `/tmp` 被拒且文件不出现；workspace-write 里工作区内写入逐字节正确、`../` 区外写入被拒；本机没有 bwrap 时打一行 skip（不假绿） |
 | `san-tool` | 端到端：`--permission workspace-write` 下让模型跑一条**同时**写工作区内与区外的命令 —— 区内文件必须落盘、区外文件必须不存在（工具层没拦它，是内核拦的） |
-| `tui-access` | 访问模式 chip 三种模式的显示、`shift+tab` 只置请求（主循环据此开浮层）、选择器打开（三行齐 + `✓` 只在当前模式那行 + 圆角框 + esc 取消不变更）、↓+enter 选中 Workspace Write 交给处理器（策略全局 + chip + 转录 notice + **恰好一条** runtime-context 注入且不上屏）、运行中切换时 `cfg.access` 必须跟着走（故意把 cfg 设成旧值）、选 Full access 只翻出确认层（游标默认「取消」→ 回车无变化；↑+enter 才切）；末尾一条**回归**：命令面板里选 `/status` 必须真的派发（浮层结果不许被静默丢掉）；每步都查「每行 ≤ cols、正文层无 ESC」 |
+| `tui-access` | 访问模式 chip 三种模式的显示、`shift+tab` 只置请求（主循环据此开浮层）、选择器打开（三行齐 + `✓` 只在当前模式那行 + 圆角框 + esc 取消不变更）、↓+enter 选中 Workspace Write 交给处理器（策略全局 + chip + 转录 notice + **恰好一条** runtime-context 注入且不上屏）、运行中切换时 `cfg.access` 必须跟着走（故意把 cfg 设成旧值）、选 Full access 只翻出确认层（游标默认「取消」→ 回车无变化；↑+enter 才切）；末尾两条**回归**：命令面板里选 `/status` 必须真的派发（浮层结果不许被静默丢掉）、`/help` 必须开**帮助浮层**（不许掉回滚动模式的纯文本帮助）；每步都查「每行 ≤ cols、正文层无 ESC」 |
 | `tui-approve` | read-only 下 bash 逐条批准，两种形态：① headless（注入的键在浮层打开前就被输入行吃了）= 没人回答 → **fail closed**，转录出现逐字拒绝串、命令 stdout 不出现、且不是「没有回答渠道」那条；② **真 PTY**：等 `Read Only：批准这条 bash 命令？` 画出来再送 `↑`+回车 → 命令真的跑（stdout 进转录与下一封请求）、退出码 0 |
 | `sig-abi` | `SigxAction` 必须是**宿主 glibc** 布局（152 字节；handler@0 / flags@136 / restorer@144，按字节回读）；恢复序列逐字节（带备用屏幕 26 字节 / 不带 18 字节） |
 | `sig-basic` | 处理器装上以后真的被调用、返回以后进程还活着（P0 的回归闸门：缺 `SA_RESTORER` 的实现在这里直接 139）；`SIGWINCH` 处理器只置标志、取用即清零 |
