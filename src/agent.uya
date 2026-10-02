@@ -103,6 +103,12 @@ export struct Config {
     deleg_depth: i32,         // 派生深度（父 + 1）
     parent_session: Buf,      // 父会话 id
     deleg_label: Buf,         // 显示用标签（description）
+    // 父进程**预先**为子代理指定的会话 id（NUL 结尾的 C 字符串）。
+    // 为什么要有它：父进程 spawn 之后要拿子会话 id 才能 send_message 续跑，
+    // 但子进程是 fork 出来的、id 由子进程自己生成，父进程无从得知（原实现里
+    // d.sid 永远是空的 → 续跑其实每次都新开一个会话、上下文全丢）。
+    // 由父进程先生成 id、传给子进程用，父子就天然对上了。
+    force_session_id: Buf,
 }
 
 fn cfg_default() Config {
@@ -175,6 +181,7 @@ fn cfg_default() Config {
         deleg_depth: 0,
         parent_session: buf_empty(),
         deleg_label: buf_empty(),
+        force_session_id: buf_empty(),
     };
 }
 
@@ -190,6 +197,7 @@ fn cfg_free(c: &Config) void {
     buf_free(&c.fork_from);
     buf_free(&c.parent_session);
     buf_free(&c.deleg_label);
+    buf_free(&c.force_session_id);
     buf_free(&c.base_url);
     buf_free(&c.model);
     buf_free(&c.api_key);
@@ -306,6 +314,131 @@ fn out_err_dec(v: usize) void {
         k = k + 1;
     }
     out_err_bytes(&rev[0], k);
+}
+
+// ============================================================
+// 诊断出口（**唯一**）
+//
+// 诊断打的是外来字节（网关错误体 / 坏 payload 头部 / 网关错误消息）：既可能夹带控制
+// 字节（含 ESC），也可能正好被按**字节**截断在多字符中间。原样 out_err_bytes 打出去
+// 就是屏幕上那串乱码（半个汉字 + 一屏 JSON），因为 TUI 会把 fd 2 的每一行都渲染成
+// 带 `· ` 前缀的 NOTICE 行（通道 2 → tui_sink_line）。所以：
+//   * 转录（fd 2）只留 DIAG_PREVIEW_MAX 字节的**转义预览** + 「… N bytes total」后缀，
+//     整条只有一行（规则表见 tty.uya::tty_diag_escape_into）；
+//   * 完整原文（同样转义）进会话日志 `diag/dump` —— 会话日志因此永远是合法 UTF-8；
+//   * `--debug-dump <file>` 额外把**原始字节**追加落盘（要二进制现场时才开）。
+// ============================================================
+const DIAG_PREVIEW_MAX: usize = 320;
+const DIAG_LOG_MAX: usize = 65536;
+
+var g_diag_dump: Buf = Buf{ ptr: null, len: 0, cap: 0 };   // --debug-dump 的落盘路径（空 = 不落盘）
+
+export fn agent_set_debug_dump(path: &const byte, n: usize) void {
+    if !buf_valid(&g_diag_dump) {
+        g_diag_dump = buf_new(n + 8);
+    }
+    buf_reset(&g_diag_dump);
+    if n > 0 {
+        _ = buf_append(&g_diag_dump, path, n);
+        // 每次设置路径都清掉旧文件：落盘的是「这一次」的现场（追加式写入会让
+        // 上一次的字节混进来，自测里就会变成「断言被旧文件满足」的假绿）
+        var z: Buf = buf_new(n + 1);
+        defer { buf_free(&z); }
+        if buf_append(&z, path, n) {
+            _ = buf_append_byte(&z, 0);
+            _ = sys_unlink(&z.ptr[0] as *const byte) catch {};
+        }
+    }
+}
+
+export fn agent_debug_dump() &const Buf {
+    return &g_diag_dump;
+}
+
+// 完整原文 → 会话日志（转义后进：日志里永远没有裸控制字节，也没有半个字符）
+fn agent_diag_log(kind: &const byte, p: &const byte, n: usize, used: usize) void {
+    if !g_sess.save {
+        return;
+    }
+    var text: Buf = buf_new(n + 16);
+    defer { buf_free(&text); }
+    _ = tty_diag_escape_into(&text, p, n, DIAG_LOG_MAX);
+    var ev: Buf = buf_new(text.len + 256);
+    defer { buf_free(&ev); }
+    if !sess_begin(&g_sess, "diag/dump", &ev) {
+        return;
+    }
+    const kn: usize = bufx_cstr_len(kind);
+    _ = buf_append_cstr(&ev, "{\"kind\":");
+    _ = jw_str_into(&ev, kind, kn);
+    _ = buf_append_cstr(&ev, ",\"bytes\":");
+    _ = buf_append_i64(&ev, n as i64);
+    _ = buf_append_cstr(&ev, ",\"truncated\":");
+    if used < n {
+        _ = buf_append_cstr(&ev, "true");
+    } else {
+        _ = buf_append_cstr(&ev, "false");
+    }
+    _ = buf_append_cstr(&ev, ",\"text\":");
+    _ = jw_str_into(&ev, text.ptr as &const byte, text.len);
+    _ = buf_append_cstr(&ev, "}");
+    _ = sess_end(&g_sess, &ev);
+}
+
+// 原始字节 → --debug-dump 文件（默认关；开了才写）
+fn agent_diag_file(kind: &const byte, p: &const byte, n: usize) void {
+    if !buf_valid(&g_diag_dump) || g_diag_dump.len == 0 {
+        return;
+    }
+    var path: Buf = buf_new(g_diag_dump.len + 1);
+    defer { buf_free(&path); }
+    _ = buf_append(&path, g_diag_dump.ptr, g_diag_dump.len);
+    _ = buf_append_byte(&path, 0);
+    const flags: i32 = (O_WRONLY | O_CREAT | O_APPEND) as i32;
+    const fd: i32 = sys_open(&path.ptr[0] as *const byte, flags, 420 as u32) catch {
+        return;
+    };
+    defer { _ = sys_close(fd) catch {}; }
+    var head: Buf = buf_new(192);
+    defer { buf_free(&head); }
+    _ = buf_append_cstr(&head, "=== ");
+    _ = buf_append(&head, kind, bufx_cstr_len(kind));
+    _ = buf_append_cstr(&head, " ");
+    _ = buf_append_i64(&head, n as i64);
+    _ = buf_append_cstr(&head, " bytes ===\n");
+    _ = write_all_fd(fd, head.ptr as &const byte, head.len);
+    if n > 0 {
+        _ = write_all_fd(fd, p, n);
+    }
+    if n == 0 || p[n - 1] != 10 as byte {
+        _ = write_all_fd(fd, "\n" as &const byte, 1);
+    }
+}
+
+// 诊断打印入口：一行转义预览 + 截断后缀；全文进日志（+ 可选落盘）
+fn out_diag(kind: &const byte, label: &const byte, p: &const byte, n: usize) void {
+    var prev: Buf = buf_new(DIAG_PREVIEW_MAX + 8);
+    if !buf_valid(&prev) {
+        out_err(label);
+        out_err("(out of memory)\n");
+        return;
+    }
+    defer { buf_free(&prev); }
+    const used: usize = tty_diag_escape_into(&prev, p, n, DIAG_PREVIEW_MAX);
+    out_err(label);
+    if n == 0 {
+        out_err("(0 bytes)");
+    } else {
+        out_err_bytes(prev.ptr as &const byte, prev.len);
+        if used < n {
+            out_err(" … ");
+            out_err_dec(n);
+            out_err(" bytes total");
+        }
+    }
+    out_err("\n");
+    agent_diag_log(kind, p, n, used);
+    agent_diag_file(kind, p, n);
 }
 
 // lib/tls 会把握手过程直接写到 fd 2（https_debug/hs_debug），
@@ -1446,6 +1579,10 @@ fn agent_log_delegation(cfg: &const Config) void {
 
 // 只**新建**自己的会话日志（不恢复任何历史）；fork 出来的子代理用它
 fn agent_session_create(cfg: &const Config) bool {
+    // 必须在 sess_open **之前**把深度交给 SessionLog：header 是在 sess_open 里写的，
+    // 而 agent_log_delegation（原来唯一设置它的地方）在 agent_hist_init 里跑得更晚，
+    // 于是子代理会话 header 的 delegationDepth 一直是 0（靠 header 判断子会话的地方会认错）。
+    g_sess.deleg_depth = cfg.deleg_depth;
     var home: Buf = buf_new(1024);
     defer { buf_free(&home); }
     if !agent_default_home(cfg, &home) {
@@ -1465,13 +1602,23 @@ fn agent_session_create(cfg: &const Config) bool {
     _ = buf_append(&modelz, cfg.model.ptr, cfg.model.len);
     _ = buf_append_byte(&modelz, 0);
     var empty: [byte: 1] = [0];
+    // fork 出来的子代理也用父进程预指定的会话 id（否则父进程拿不到 d.sid，无法续跑）
+    var wantf: Buf = buf_empty();
+    defer { buf_free(&wantf); }
+    if cfg.force_session_id.len > 0 {
+        wantf = buf_new(cfg.force_session_id.len + 1);
+        if buf_valid(&wantf) {
+            _ = buf_append(&wantf, cfg.force_session_id.ptr, cfg.force_session_id.len);
+            _ = buf_append_byte(&wantf, 0);
+        }
+    }
     return sess_open(
         &g_sess,
         hz.ptr as &const byte,
         cwdz.ptr as &const byte,
         modelz.ptr as &const byte,
         "uya-agent",
-        &empty[0] as &const byte,
+        if wantf.len > 0 { wantf.ptr as &const byte } else { &empty[0] as &const byte },
         cfg.save_session,
         0,
         true
@@ -1479,6 +1626,8 @@ fn agent_session_create(cfg: &const Config) bool {
 }
 
 export fn agent_session_open(cfg: &const Config, h: &History, resume_path: &const Buf) bool {
+    // 同 agent_session_create：header 由 sess_open 写，深度必须在它之前落进 g_sess
+    g_sess.deleg_depth = cfg.deleg_depth;
     var home: Buf = buf_new(1024);
     defer { buf_free(&home); }
     if !agent_default_home(cfg, &home) {
@@ -1492,23 +1641,56 @@ export fn agent_session_open(cfg: &const Config, h: &History, resume_path: &cons
 
     var id: Buf = buf_new(64);
     defer { buf_free(&id); }
+    var rpath: Buf = buf_empty();       // 要恢复的会话文件路径（空 = 新建）
+    defer { buf_free(&rpath); }
     var resumed: bool = false;
     if resume_path.len > 0 {
-        // 已解析出路径：从 header 里取 id
-        var r0: SessReader = sess_reader_empty();
-        defer { sess_reader_free(&r0); }
-        var pz: Buf = buf_new(resume_path.len + 1);
-        defer { buf_free(&pz); }
-        _ = buf_append(&pz, resume_path.ptr, resume_path.len);
-        _ = buf_append_byte(&pz, 0);
-        if sess_read_header(pz.ptr as &const byte, &r0) {
-            _ = buf_append(&id, r0.id.ptr, r0.id.len);
-            resumed = true;
+        // 已解析出路径（--resume/--continue 或 fork 的父会话）：从 header 里取 id
+        if buf_append(&rpath, resume_path.ptr, resume_path.len) {
+            var r0: SessReader = sess_reader_empty();
+            defer { sess_reader_free(&r0); }
+            var pz: Buf = buf_new(resume_path.len + 1);
+            defer { buf_free(&pz); }
+            _ = buf_append(&pz, resume_path.ptr, resume_path.len);
+            _ = buf_append_byte(&pz, 0);
+            if sess_read_header(pz.ptr as &const byte, &r0) {
+                _ = buf_append(&id, r0.id.ptr, r0.id.len);
+                resumed = true;
+            }
+        }
+    } else if cfg.force_session_id.len > 0 {
+        // 父进程**预先**给这个子代理指定了会话 id（deleg_spawn 里约定）：
+        //   * 该 id 的日志已存在 → 这是 send_message 续跑，恢复历史继续写同一个日志；
+        //   * 不存在 → 这是首次派生，就用这个 id 新建（父进程因此知道 d.sid）。
+        // 原实现把会话 id 交给子进程随机生成，父进程无从得知 → d.sid 恒空 →
+        // send_message 每次都新开会话，续跑时上下文全丢（实测确认）。
+        var cwdz0: Buf = buf_new(cfg.workspace.len + 1);
+        defer { buf_free(&cwdz0); }
+        _ = buf_append(&cwdz0, cfg.workspace.ptr, cfg.workspace.len);
+        _ = buf_append_byte(&cwdz0, 0);
+        var found: Buf = buf_empty();
+        defer { buf_free(&found); }
+        if sess_find(hz.ptr as &const byte, cwdz0.ptr as &const byte, cfg.force_session_id.ptr as &const byte, cfg.force_session_id.len, &found) {
+            if buf_append(&rpath, found.ptr, found.len) {
+                var r1: SessReader = sess_reader_empty();
+                defer { sess_reader_free(&r1); }
+                var pz1: Buf = buf_new(found.len + 1);
+                defer { buf_free(&pz1); }
+                _ = buf_append(&pz1, found.ptr, found.len);
+                _ = buf_append_byte(&pz1, 0);
+                if sess_read_header(pz1.ptr as &const byte, &r1) {
+                    _ = buf_append(&id, r1.id.ptr, r1.id.len);
+                    resumed = true;
+                }
+            }
+        }
+        if !resumed {
+            _ = buf_append(&id, cfg.force_session_id.ptr, cfg.force_session_id.len);
         }
     }
     if resumed {
         var next_seq: i64 = 0;
-        const n: i32 = agent_hist_from_log(cfg, h, resume_path, &next_seq, true);
+        const n: i32 = agent_hist_from_log(cfg, h, &rpath, &next_seq, true);
         if n > 0 {
             const trimmed: usize = hist_trim_incomplete_tail(h);
             if trimmed > 0 {
@@ -1559,13 +1741,23 @@ export fn agent_session_open(cfg: &const Config, h: &History, resume_path: &cons
     defer { buf_free(&modelz2); }
     _ = buf_append(&modelz2, cfg.model.ptr, cfg.model.len);
     _ = buf_append_byte(&modelz2, 0);
+    // 新建：子代理用父进程预指定的 id（父进程要拿它做 send_message 续跑），其余留空自生成
+    var want2: Buf = buf_empty();
+    defer { buf_free(&want2); }
+    if cfg.force_session_id.len > 0 {
+        want2 = buf_new(cfg.force_session_id.len + 1);
+        if buf_valid(&want2) {
+            _ = buf_append(&want2, cfg.force_session_id.ptr, cfg.force_session_id.len);
+            _ = buf_append_byte(&want2, 0);
+        }
+    }
     return sess_open(
         &g_sess,
         hz.ptr as &const byte,
         cwdz2.ptr as &const byte,
         modelz2.ptr as &const byte,
         "uya-agent",
-        "",
+        if want2.len > 0 { want2.ptr as &const byte } else { "" as &const byte },
         cfg.save_session,
         0 as i64,
         true
@@ -2398,14 +2590,8 @@ fn dump_http_error(status: i32, body: &const Buf) void {
     out_err("model endpoint returned HTTP ");
     out_err_dec(status as usize);
     out_err("\n");
-    var n: usize = body.len;
-    if n > 4096 {
-        n = 4096;
-    }
-    if n > 0 {
-        out_err_bytes(body.ptr, n);
-        out_err("\n");
-    }
+    // 外来字节走唯一诊断出口：转义 + 字符边界截断 + 限长（原文进日志 / --debug-dump）
+    out_diag("http-error-body", "body: ", body.ptr as &const byte, body.len);
 }
 
 // ============================================================
@@ -2472,14 +2658,8 @@ fn dump_stream_error(cfg: &const Config, status: i32, body: &const Buf) void {
     out_err("model endpoint returned HTTP ");
     out_err_dec(status as usize);
     out_err("\n");
-    var n: usize = body.len;
-    if n > 4096 {
-        n = 4096;
-    }
-    if n > 0 {
-        out_err_bytes(body.ptr, n);
-        out_err("\n");
-    }
+    // 同 dump_http_error：流式路径的非 2xx 体也一律走转义预览（原文进日志）
+    out_diag("http-error-body", "body: ", body.ptr as &const byte, body.len);
 }
 
 fn print_usage_line(o: &const ChatOut) void {
@@ -2691,9 +2871,8 @@ fn agent_step_stream(cfg: &const Config, style: u8, url: &const Buf, hdrs: &cons
     }
 
     if err_kind == 1 {
-        out_err("error: malformed SSE payload: ");
-        out_err_bytes(o.err_text.ptr, o.err_text.len);
-        out_err("\n");
+        // 坏 payload 的头部：走唯一诊断出口（不把裸字节刷进转录）
+        out_diag("malformed-sse-payload", "error: malformed SSE payload: ", o.err_text.ptr as &const byte, o.err_text.len);
         return AGENT_PROTO;
     }
     if err_kind == 2 {
@@ -2735,9 +2914,8 @@ fn agent_finish_step(cfg: &const Config, arena: &Arena, h: &History, step: i32, 
         print_usage_line(o);
     }
     if o.finish == LLM_FINISH_ERROR {
-        out_err("model/gateway error: ");
-        out_err_bytes(o.err_text.ptr, o.err_text.len);
-        out_err("\n");
+        // 网关消息同样是外来字节：转义 + 限长（原来是无上限原样打印）
+        out_diag("gateway-error", "model/gateway error: ", o.err_text.ptr as &const byte, o.err_text.len);
         return AGENT_PROTO;
     }
 
@@ -3014,12 +3192,7 @@ fn agent_step_plain(cfg: &const Config, style: u8, url: &const Buf, hdrs: &const
     var root: JsonValue = JsonValue.json_null();
     if !js_parse(arena, body_copy, resp_len, &root) {
         out_err("error: cannot parse model response as JSON\n");
-        var nb0: usize = resp_len;
-        if nb0 > 1024 {
-            nb0 = 1024;
-        }
-        out_err_bytes(body_copy as &const byte, nb0);
-        out_err("\n");
+        out_diag("non-json-body", "body: ", body_copy as &const byte, resp_len);
         return AGENT_PROTO;
     }
 
@@ -3544,24 +3717,13 @@ fn agent_dry_run(cfg: &const Config) i32 {
     out_err(" request_bytes=");
     out_err_dec(req.len);
     out_err("\n");
-    var i: usize = 0;
-    while i < req.len {
-        const c: byte = req.ptr[i];
-        if c == 0 as byte {
-            out_err("\\x00");
-        } else if c == 10 as byte {
-            out_err("\\n");
-        } else if c == 9 as byte {
-            out_err("\\t");
-        } else if c < 32 as byte || c > 126 as byte {
-            const hexd: &[byte] = &"0123456789abcdef"[0: 16];
-            out_err("\\x");
-            out_err_bytes(&hexd[((c as i32) >> 4) as usize], 1);
-            out_err_bytes(&hexd[((c as i32) & 15) as usize], 1);
-        } else {
-            out_err_bytes(&req.ptr[i], 1);
-        }
-        i = i + 1;
+    // 与诊断出口同一套转义（tty.uya::tty_diag_escape_into）：不可打印字节转义成 \xNN，
+    // 便于找 NUL 之类的脏字节。dry-run 要看**整条**请求体，所以 cap 开到最大展开长度。
+    var esc: Buf = buf_new(req.len * 4 + 16);
+    defer { buf_free(&esc); }
+    if buf_valid(&esc) {
+        _ = tty_diag_escape_into(&esc, req.ptr as &const byte, req.len, req.len * 4);
+        out_err_bytes(esc.ptr as &const byte, esc.len);
     }
     out_err("\n");
     return AGENT_OK;
@@ -3853,9 +4015,12 @@ fn print_usage() void {
     out_err("  --no-stream         关闭流式（SSE），回退到一次性响应\n");
     out_err("  --compat-fold       工具结果折叠成一条 user 消息（老端点兼容）\n");
     out_err("  --no-stream-options 不发送 stream_options.include_usage\n");
-    out_err("  --show-reasoning    显示思考行（单行：运行中在提示符那一行滚动，结束时落一行）\n");
+    out_err("  --show-reasoning    显示思考行：滚动模式=运行中在提示符那一行滚动、结束落一行；\n");
+    out_err("                      TUI=额外把思考收进转录条目（TUI 的状态区默认已有实时一行）\n");
     out_err("  --show-usage        每轮打印 token 用量（in/out/cache/reasoning）\n");
     out_err("  --tool-lines N      工具正文：默认 0 = 只留一行；N>0 = 首尾各 N 行（含 diff/todo 清单）\n");
+    out_err("  --debug-dump FILE   诊断原文（网关错误体/坏 payload 等）以**原始字节**追加落盘；\n");
+    out_err("                      默认关：转录里只有转义预览，全文仍进会话日志 diag/dump\n");
     out_err("  --max-tokens N      发送 max_tokens（默认不发送）\n");
     out_err("  --temperature N     发送 temperature 0..N（默认不发送）\n");
     out_err("  --agent-home DIR    会话/索引存放根目录，默认 ~/.uya-agent\n");
@@ -4783,6 +4948,13 @@ fn agent_print_config(cfg: &const Config, dsh: &const DshCfg) void {
     } else {
         out_err("false\n");
     }
+    out_err("debug_dump = ");
+    if buf_valid(&g_diag_dump) && g_diag_dump.len > 0 {
+        out_err_bytes(g_diag_dump.ptr as &const byte, g_diag_dump.len);
+        out_err("  (raw diagnostic bytes appended here)\n");
+    } else {
+        out_err("(off; transcript keeps an escaped preview, session log keeps diag/dump)\n");
+    }
     out_err("confine = ");
     if cfg.confine {
         out_err("true");
@@ -5222,6 +5394,12 @@ export fn main() i32 {
             if i < get_argc() {
                 cfg.tool_lines = parse_i32_nonneg(get_argv(i), 6);
             }
+        } else if arg_eq(p, "--debug-dump") {
+            i = i + 1;
+            if i < get_argc() {
+                const dv: &byte = get_argv(i);
+                agent_set_debug_dump(dv as &const byte, bufx_cstr_len(dv as &const byte));
+            }
         } else if arg_eq(p, "--quiet") {
             cfg.quiet = true;
         } else if arg_eq(p, "--tls-debug") {
@@ -5342,7 +5520,7 @@ export fn main() i32 {
 // 「把它交出来的提交/中断送回回合循环」。数据流见 README「全屏 TUI」一节。
 // ============================================================
 
-const AGENT_VERSION: [byte: 16] = [112, 49, 56, 45, 115, 116, 97, 116, 115, 0, 0, 0, 0, 0, 0, 0];   // "p18-stats"
+const AGENT_VERSION: [byte: 16] = [112, 50, 48, 45, 115, 116, 97, 116, 115, 0, 0, 0, 0, 0, 0, 0];   // "p20-stats"
 const AGENT_VERSION_LEN: usize = 9;
 
 fn agent_parse_color(p: &byte) u8 {
@@ -6071,7 +6249,22 @@ fn agent_tui_demo(cfg: &const Config, cols: usize, rows: usize) i32 {
     tui_sink_bytes(2, "✓ Bash(./hello) · exit 0\n" as &const byte, bufx_cstr_len("✓ Bash(./hello) · exit 0\n" as &const byte));
     tui_sink_bytes(2, "    Hello, DSH!\n" as &const byte, bufx_cstr_len("    Hello, DSH!\n" as &const byte));
     tui_sink_bytes(1, "已改成 Hello, DSH! 并重新编译运行，输出 Hello, DSH!。\n" as &const byte, bufx_cstr_len("已改成 Hello, DSH! 并重新编译运行，输出 Hello, DSH!。\n" as &const byte));
-    tui_set_run(TUI_RUN_TOOL, "Bash(make check)" as &const byte, 15);
+    tui_set_run(TUI_RUN_TOOL, "Bash(make check)" as &const byte,
+        bufx_cstr_len("Bash(make check)" as &const byte));
+    agent_tui_dump(cols, rows);
+    tui_set_run(TUI_RUN_IDLE, "" as &const byte, 0);
+
+    // ③ 运行中（P18）：状态区常驻在面板正上方，第二行是思考实时行。
+    //    下面先堆一大段转录把视口铺满 —— P18 之前这一屏里状态行会被挤掉（一个字节都不显示）。
+    var i: usize = 0;
+    while i < 8 {
+        tui_sink_bytes(1, "为了把视口铺满，这里再补几行转录：状态区必须照样看得见。\n" as &const byte, bufx_cstr_len("为了把视口铺满，这里再补几行转录：状态区必须照样看得见。\n" as &const byte));
+        i = i + 1;
+    }
+    tui_close_stream_entries();
+    tui_set_run(TUI_RUN_THINK, "" as &const byte, 0);
+    tui_think_live("先核对 tui_build_chat 的视口夹取与状态区预留对不对，再看 view_think_pick 的 latestLine 口径，最后跑一轮 tui-selftest 收尾" as &const byte,
+        bufx_cstr_len("先核对 tui_build_chat 的视口夹取与状态区预留对不对，再看 view_think_pick 的 latestLine 口径，最后跑一轮 tui-selftest 收尾" as &const byte));
     agent_tui_dump(cols, rows);
     tui_set_run(TUI_RUN_IDLE, "" as &const byte, 0);
     return AGENT_OK;

@@ -1,13 +1,16 @@
 # uya-agent — 纯 Uya 写的极简 CLI 编程 agent
 
 一个**只用 Uya 源码**实现的命令行编程 agent：给它一句话任务，它自己看文件、改文件、跑命令，
-多轮 loop 直到给出结论。全部代码 34 个 `.uya` 文件，**不引入任何 C 代码、`@c_import` 或其它语言**，
+多轮 loop 直到给出结论。全部代码 38 个 `.uya` 文件，**不引入任何 C 代码、`@c_import` 或其它语言**，
 只依赖 Uya 语言与随编译器分发的标准库。
 
-**P0–P16 全部完成**（P15 这个编号被两条并行线各用过一次：一条是「请求体控制字节全转义 +
+**P0–P20 全部完成**（P15 这个编号被两条并行线各用过一次：一条是「请求体控制字节全转义 +
 默认走 Responses 接口」（落点见 §3 踩坑 27、§2 的 `jsonx.uya`/`session.uya`、§6 的
 `json-escape` / `ctrl-bytes*`）、一条是**子代理窗口面板**（§2 的「子代理窗口面板（并行线的 P15）」，
-踩坑 29）；P16 是**单行转录 + 思考行**）：
+踩坑 29）；P16 是**单行转录 + 思考行**，P17 是**纯 Uya 的全屏 TUI**，
+P18 是**常驻状态区 + 思考实时行**；**P19 是诊断出口**：外来字节（网关错误体 / 坏 payload
+头部）只以「转义 + 字符边界截断 + 限长」的一行预览进转录，全文进会话日志 `diag/dump`、
+原始字节走 `--debug-dump`（踩坑 33））：
 LLM 交互是**流式 SSE**（`stream:true` + `stream_options.include_usage`），
 增量 chunked 解码 + SSE 分帧 + `tool_calls` 按 `index` 分片累积；消息协议是**严格工具协议**
 （`assistant.tool_calls` 原样回灌 + 每条结果一条 `role:"tool"` + `tool_call_id`）；
@@ -40,12 +43,15 @@ tool 结果超 8192 码点自动剪枝，压力超过窗口 80% 时自动压缩�
 **P15 给子代理加了窗口面板**：输入行上方常驻一块带边框的窗口区，每个运行中的子代理 2 行
 （命令行 + 状态行，含**实时秒数**与已收输出行数），最多显示最后 4 个，跑完立刻收掉并在滚动区
 补一行结算通知；边框按显示列逐行补满，自测对每一行断言「列数完全相等」。
-**P17 把交互界面做成全屏 TUI**（对齐 opencode 的观感：块字 logo、贴底输入面板、转录贴面板、
-逐行 diff 重绘、备用屏幕；`--no-tui` 退回滚动转录）。**P18 给脚注加上 DSH 那一行统计**：
-`轮/步 · LLM/工具耗时 · 首 token 平均/tok-s · 缓存命中 · 输入/输出 tok` 全部从**会话日志**折叠
-（`--resume` 后仍逐字节相同），左边再挂上下文占用（`ctx`，DSH `contextPressure` 的口径）与
-**全部 uya-agent 进程**的综合 CPU（`%cpu`，`/proc` + `USER_HZ` 口径）；终端放不下就从尾部丢组，
-明细进 `/status`。
+**P17 是纯 Uya 写的全屏 TUI**（对齐 opencode 的观感），**P18 把运行状态挪进常驻状态区并加了
+思考实时行**：P17 的状态行是「转录的最后一行」，转录一铺满视口就被挤掉 —— 长会话里跑起来
+屏幕上**一个动的字节都没有**，看着像卡住（踩坑 32）。现在状态区钉在输入面板正上方
+（运行中 1–2 行、空闲 0 行）：第 1 行是 spinner + 状态，第 2 行是**思考的实时文本**
+（默认就开、与 `--show-reasoning` 解耦、按显示列从左边截断补 `…`、只留尾部 1 KiB）。
+**P20 给脚注加上 DSH 那一行统计**：`轮/步 · LLM/工具耗时 · 首 token 平均/tok-s · 缓存命中 ·
+输入/输出 tok` 全部从**会话日志**折叠（`--resume` 后仍逐字节相同），左边再挂上下文占用
+（`ctx`，DSH `contextPressure` 的口径）与**全部 uya-agent 进程**的综合 CPU（`%cpu`，
+`/proc` + `USER_HZ` 口径）；终端放不下就从尾部丢组，明细进 `/status`。
 `--no-stream` / `--compat-fold` 保留两条回退路径。
 
 ```
@@ -135,14 +141,15 @@ export UYA_SPLIT_C_DIR=$PWD/build/uyacache      # 多文件 C 缓存别丢在仓
 | `--context-window N` | 压缩判定的窗口（默认取 DSH 模型条目） |
 | `--dsh-root DIR` | packaged preset 根（读 persona / plan 段文案） |
 | `--dry-run` | 只组装请求并打印（不可打印字节转义成 `\xNN`，排查脏字节） |
+| `--debug-dump FILE` | 诊断的**原始字节**（网关错误体 / 坏 payload 头部等）追加落盘（设路径时先清空）；默认关：转录里只有转义预览，全文仍进会话日志 `diag/dump`（见踩坑 33） |
 | `--compat-fold` | 工具结果折叠成一条 user 消息（旧协议） |
 | `--no-stream-options` | 不发送 `stream_options.include_usage` |
-| `--show-reasoning` | 显示思考行（P16：单行 —— 运行中在提示符那一行滚动，结束落一行 `✻ 思考 · …`；全文始终进会话日志） |
+| `--show-reasoning` | 显示思考行（P16 单行口径：滚动模式下运行中在提示符那一行滚动、结束落一行 `✻ 思考 · …`；全文始终进会话日志）。**TUI 下另有一条默认就显示的实时行**（P18，见「全屏 TUI」一节），这个开关在 TUI 里只管「额外把思考收进转录条目」 |
 | `--show-usage` | 每轮打印 token 用量（in/out/cache/reasoning） |
 | `--tool-lines N` | 工具正文：默认 `0` = 只留一行（P16）；`N>0` = 首尾各 N 行（含 diff / todo 清单，即 P14 的正文块） |
-| `--tui` | 全屏 TUI（**TTY 交互模式默认**）；`--no-tui` 退回滚动转录；`UYA_AGENT_TUI=0|1` 同口径 |
+| `--tui` | 全屏 TUI（**TTY 交互模式默认**）；`--no-tui` 退回滚动转录；`UYA_AGENT_TUI=0|1` 同口径。运行中的状态区（spinner + 思考实时行）钉在输入面板正上方，关掉它的方式就是 `--no-tui` / `--quiet` |
 | `--color=MODE` | `auto`（默认）/ `always` / `never` / `16` / `256`；`NO_COLOR` 也认 |
-| `--tui-demo` | 打印 TUI 的 home / chat 两屏纯文本快照后退出（诊断 + 文档） |
+| `--tui-demo` | 打印 TUI 的 home / chat / 运行中 三屏纯文本快照后退出（诊断 + 文档） |
 | `--max-tokens N` | 发送 `max_tokens`（默认不发送） |
 | `--temperature N` | 发送 `temperature`（默认不发送，对齐 DSH） |
 | `--tls-verify=chain\|pin\|none` | TLS 信任策略，默认 `chain`，见第 5 节 |
@@ -180,17 +187,22 @@ src/tty.uya       终端层：termios raw 模式、行编辑器（历史/光标/
                   按显示列截断（`tty_clip_bytes` 截尾 / `tty_clip_tail_bytes` 留尾）、
                   **多行「面板块」**（输入行上方常驻的窗口区：逐行 ESC[2K 擦除 + 相对上移，
                   子代理窗口面板就画在这里）；P17 再加：TUI sink 开关（TUI 激活时所有显示
-                  字节进转录，不再打到终端）与 `tty_reason_write`（思考走独立通道）
+                  字节进转录，不再打到终端）与 `tty_reason_write`（思考走独立通道）；
+                  P19 再加：`tty_diag_escape_into` —— 诊断字节的**唯一**转义实现（转义控制
+                  字节与非法 UTF-8、按字符边界收 cap，见踩坑 33）
 src/sigx.uya      信号层（P17）：直接绑宿主 glibc `sigaction`（绕开 uya 0.10 `libc.signal`
                   的 SIGSEGV 缺陷）；终止类信号 → 先恢复终端（termios + 离开备用屏幕）再
                   128+sig 退出；SIGWINCH → 只置标志；`sigx_reset_for_child()` 给 fork 子进程
 src/tui.uya       全屏 TUI（P17）：帧模型（行=段序列，逐行 diff 重绘）、备用屏幕进出、
                   转录条目（用户/助手/思考/工具/诊断）、轻量 markdown、输入编辑器（按字符编辑、
                   多行、历史、括起粘贴）、键解码（分片转义序列）、浮层（命令面板/会话/帮助/问答）、
-                  sink 通道与清洗、滚动与尾随、帧节流
+                  sink 通道与清洗、滚动与尾随、帧节流；P18 再加**常驻状态区**（钉在输入面板正
+                  上方：spinner 行 + 思考实时行，空闲 0 行）与尾部对齐截断 `tui_put_clipped_tail`；
+                  P19：诊断（NOTICE）条目限长（`TUI_NOTICE_MAX`）、非法/半截 UTF-8 → U+FFFD、
+                  思考尾部按字符边界切
 src/sigselftest.uya 信号层的自测轮次（sig-abi / sig-basic / sig-term-restore / sig-child-reset）
-src/tuiselftest.uya TUI 的自测轮次（tui-frame / tui-keys / tui-sink / tui-turn / tui-pty；
-                  P18 起 tui-frame 还断言脚注统计行在四种宽度下的退化）
+src/tuiselftest.uya TUI 的自测轮次（tui-frame / tui-keys / tui-sink / tui-turn / tui-status / tui-pty；
+                  P20 起 tui-frame 还断言脚注统计行在四种宽度下的退化）
 src/inbox.uya     输入收件箱：steer（运行中输入的文本，step 边界领取）+ keepInbox 语义
 src/yamlcfg.uya   自带 YAML 子集解析器：去注释（块标量/引号感知）、中和 `!!tag`、
                   block/flow 映射与序列、`|`/`>` 块标量、跨行 flow 集合、节点池树 + 导航
@@ -229,14 +241,14 @@ src/plan.uya      plan 模式状态机 + exit_plan_mode（非 plan 模式报错�
 src/askuser.uya   ask_user_question：交互模式复用行编辑器，非交互读一行，EOF 时回「无回答」
 src/session.uya   会话日志：路径规范化、id 生成（/dev/urandom→uuid）、header/事件序列化与追加写、
                   索引、读取与崩溃尾部裁剪、按 id/最近查找、括号配平的数组提取
-src/stats.uya     会话统计折叠（P18）：逐行对照 DSH 的 `sessionStats` + `tokenUsage` ——
+src/stats.uya     会话统计折叠（P20）：逐行对照 DSH 的 `sessionStats` + `tokenUsage` ——
                   step/start→assistant/message 的 llmMs、首个非空正文 delta→消息组装的 ttft 与
                   解码时长/token、tool/call→tool/result 按 callId 配对、step/end 计步
                   （turns 只在该 turn 首次出现时 +1）、未结算调用在 turn/end 丢弃；
                   上下文占用与三段启发式（contextPressure / contextBreakdown 的等价物）；
                   渲染逐字对照 DSH Web 的 `StatsLine`（formatDuration / formatTokens /
                   formatTokensPerSecond / cacheHitPercent，含「有 miss 时不写 100%」的精度阶梯）
-src/procx.uya     进程 CPU 采样（P18）：扫 /proc，取 comm 与本进程相同的**所有**进程的
+src/procx.uya     进程 CPU 采样（P20）：扫 /proc，取 comm 与本进程相同的**所有**进程的
                   utime+stime（不取 cutime/cstime，避免父子双计），USER_HZ = 100、
                   pct = Δticks×1000/Δms（单核口径，可 > 100%），1 秒一次、挂在 TUI 心跳上
 src/diffx.uya     行级 diff（只服务显示）：公共整行前后缀裁剪 → LCS DP（60×60 上限）→
@@ -245,15 +257,19 @@ src/diffx.uya     行级 diff（只服务显示）：公共整行前后缀裁剪
                   正文要 `--tool-lines N`（N>0）才会被 append）
 src/view.uya      显示层：工具→标题/关键参数/后缀三张表、状态字形、按显示列截断、
                   **单行转录**（默认没有正文块：正文要 `--tool-lines N`（N>0）才 append）、
-                  **思考行**（运行中在提示符那一行滚动、块结束落一行 `✻ 思考 · <首行>…`）、
+                  **思考行**（运行中在提示符那一行滚动、块结束落一行 `✻ 思考 · <首行>…`；
+                  P18 再加 `view_think_live`：给 TUI 状态区喂「最新一行」，默认开）、
                   交互模式的「运行中提示符」换入换出、
                   **子代理窗口面板**（2 行/个、最多 4 个、带边框、逐行等宽）
 src/agent.uya     CLI、环境变量、消息历史、请求组装、主循环（流式/非流式）、工具分发、
                   交互式 REPL（中断/steer//continue/会话命令）、会话事件记录与恢复、
                   `assistant/reasoning`（思考全文，P16）；P17 再加 `agent_run_tui` /
-                  `agent_run_tui_body`（全屏 TUI 主循环，headless 与真终端共用）
-src/selftest.uya  --selftest 的 mock LLM（含 SSE 受控切分）+ 33 轮断言 + --probe
-                  （P17 又加了源文件里的 4 轮信号 + 5 轮 TUI，P18 再加 9 轮统计/进程 CPU，见 §6）
+                  `agent_run_tui_body`（全屏 TUI 主循环，headless 与真终端共用）；
+                  P19 再加 `out_diag`（外来字节诊断的**唯一**出口：一行转义预览 + 截断后缀，
+                  全文进会话日志 `diag/dump`，`--debug-dump` 落原始字节）
+src/selftest.uya  --selftest 的 mock LLM（含 SSE 受控切分）+ 75 轮断言 + --probe
+                  （P17 又加了源文件里的 4 轮信号 + 5 轮 TUI，P18 再加 1 轮 `tui-status`，
+                  P19 再加 3 轮诊断，P20 再加 9 轮统计/进程 CPU，见 §6）
 ```
 
 > 两处已知死代码（P14 未清理，改别的东西时别被它们误导）：`src/tools.uya`（P0 的
@@ -305,6 +321,8 @@ TTY/ANSI 代码），所以这里是把**那套内容模型搬到滚动终端**�
   （中断、malformed、网络错误也走同一条收尾路径 —— 不会把提示符停在思考行上）。
   非交互（管道）下没有可改写的一行，所以**不做实时行**，只在块结束时落那一行；
   `--quiet`（含子代理）整层关闭，思考行同样不出现，但日志照记（见下）。
+  **TUI 里另有一条默认就开的实时行**（P18：常驻状态区的第 2 行，同一套 `latestLine` +
+  从左边按列截断补 `…` 的口径，但**不需要** `--show-reasoning`；见「全屏 TUI」一节）。
 * **思考全文进会话日志**：每个 step 追加一条 `assistant/reasoning`
   （`{"turn":N,"step":N,"message":{"role":"assistant","reasoning_content":"…"}}`），
   显示层只留一行、全文在这里活着。独立事件而不是塞进 `assistant/message`：那条要**原样**
@@ -560,7 +578,9 @@ Messages API（`x-api-key` + `anthropic-version: 2023-06-01`，服务端工具 `
   之后每行一个 `{"type":…,"seq":N,"time":N,"data":{…}}`，`seq` 从 0 连续递增，追加-only。
 * 事件词表：`user/message`、`assistant/message`（含 `tool_calls` 原文）、`assistant/reasoning`
   （P16：该 step 的思考全文，显示层只留一行、全文只活在这里；`--resume` 的 reader 不认识它就跳过）、
-  `tool/call`、`tool/result`、`turn/start|end`、`step/start`、`session/title`。**续写已有会话时不重复写 header**，
+  `tool/call`、`tool/result`、`turn/start|end`、`step/start`、`session/title`、
+  `diag/dump`（P19：外来字节诊断的**转义全文**，字段 `kind`/`bytes`/`truncated`/`text`；
+  转录里只有 ≤320 B 的转义预览 —— 见踩坑 33）。**续写已有会话时不重复写 header**，
   `seq` 接着已有最大值往下走（跨进程实测连续）。
 * **崩溃恢复**：最后一行不完整（没有换行结尾）时丢弃它并在 stderr 告警 —— 对应 DSH 的
   「保留有效尾部工作」。
@@ -635,7 +655,7 @@ Messages API（`x-api-key` + `anthropic-version: 2023-06-01`，服务端工具 `
 
 TTY 交互模式**默认全屏**（`--no-tui` 退回上一节的滚动转录；不是 TTY / `--quiet` / 子代理
 自动退回）。做成**无边框、黑底、单强调色**：空态是块字 logo + 居中输入面板，对话态是
-「转录贴面板、面板贴底」，状态不是独立状态栏而是转录里的一行。
+「转录贴面板、面板贴底」，**运行中的状态区（P18）钉在输入面板正上方**（运行中 1–2 行，空闲 0 行）。
 
 ```
          █▓  █▓ █▓  █▓ █▓  █▓        █▓  █▓ █▓  █▓ █▓  █▓ ██▓ █▓ █████▓
@@ -645,10 +665,10 @@ TTY 交互模式**默认全屏**（`--no-tui` 退回上一节的滚动转录；�
 
   ▌ ↑ Ask anything... "把 hello.uya 的问候语改成 Hello, DSH!"
   ▌ Build   deepseek-chat   deepseek               tab plan   ctrl+p commands
-  ~/uya-agent:main                                                                 p18-stats
+  ~/uya-agent:main                                                                 p20-stats
 ```
 
-对话态（`--tui-demo` 打印的就是这两屏的纯文本快照）：
+对话态（`--tui-demo` 打印的就是这三屏的纯文本快照）：
 
 ```
     ▎ 你
@@ -661,16 +681,39 @@ TTY 交互模式**默认全屏**（`--no-tui` 退回上一节的滚动转录；�
   ✓ Read(hello.uya) · 4 lines    ← 工具卡片：✓/✗ 标题行 + 4 空格缩进正文
       -     @println("Hello, Uya!");   ← diff：- 红 / + 绿
       +     @println("Hello, DSH!");
-  ⠹ Bash(make check) · esc 中断      ← 运行中状态是转录最后一行（不是独立状态栏）
-  ▌ ❯ 顺便把 Makefile 的注释补一下_  ← 输入面板（左边缘强调竖条）
+  ✓ Bash(./hello) · exit 0
+      Hello, DSH!
+    ◆ 助手
+  已改成 Hello, DSH! 并重新编译运行，输出 Hello, DSH!。
+
+  ⠋ 运行中 Bash(make check) · esc 中断   ← 状态区第 1 行：钉在面板正上方（转录再长也挤不掉）
+  ▌ ❯ 顺便把 Makefile 的注释补一下_     ← 输入面板（左边缘强调竖条）
   ▌ Build   deepseek-chat   deepseek               tab plan   ctrl+p commands
   ~/uya-agent:main · ctx 21% · %cpu 37%    1 轮 · 12 步 | LLM 50.7s · 工具调用 4.1s | 首 token 平均 1.5s | 221 tok/s | 缓存命中 71% | 输入 238K tok · 输出 12K tok
 ```
 
+思考阶段多一行实时文本（`--tui-demo` 的第三屏，下面这段转录已经被刻意铺满一屏）：
+
+```
+    ◆ 助手
+  已改成 Hello, DSH! 并重新编译运行，输出 Hello, DSH!。
+  为了把视口铺满，这里再补几行转录：状态区必须照样看得见。
+  …（还有 7 行）
+
+  ⠋ 思考中 · esc 中断
+  ✻ 思考 · …态区预留对不对，再看 view_think_pick 的 latestLine 口径，最后跑一轮 tui-selftest 收尾
+  ▌ ↑ Ask anything... "把 hello.uya 的问候语改成 Hello, DSH!"
+  ▌ Build   deepseek-chat   deepseek               tab plan   ctrl+p commands
+  ~/uya-agent:main · ctx 21% · %cpu 37%    1 轮 · 12 步 | LLM 50.7s · 工具调用 4.1s | 首 token 平均 1.5s | 221 tok/s | 缓存命中 71% | 输入 238K tok · 输出 12K tok
+```
+
+（第 1 行是状态、第 2 行是思考实时文本 —— 它按显示列**从左边**截断，屏幕上留下的是**最新**的那一段。）
+
 * **开关**：`--tui`（默认）/ `--no-tui` / `UYA_AGENT_TUI=0|1`；
   `--color=auto|always|never|16|256` 与 `NO_COLOR`（无色时只留粗体/暗色）；
-  `--tui-demo [COLSxROWS]` 打印 home/chat 两屏纯文本（诊断 + 文档；默认画布 160×40，
-  窄终端可以 `--tui-demo 100x30` 看脚注的退化形态）。
+  `--tui-demo [COLSxROWS]` 打印 home / chat / 运行中 三屏纯文本（诊断 + 文档；默认画布
+  160×40，窄终端可以 `--tui-demo 100x30` 看脚注的退化形态）。
+* **运行中的状态区（P18）**：见下一小节。
 * **键位**：`enter` 发送 · `ctrl+j` / `alt+enter` 换行 · `esc` 运行中=中断、空闲=清行 ·
   `ctrl+c` 运行中=中断、空闲=清空/两次退出 · `ctrl+d` 空行退出 · `↑/↓` 单行=历史、
   多行=上下移光标 · `pgup/pgdn`、`ctrl+home/end` 滚转录 · `tab` 切计划模式（面板显示 `Plan`）·
@@ -683,6 +726,8 @@ TTY 交互模式**默认全屏**（`--no-tui` 退回上一节的滚动转录；�
   2（工具块/诊断）、3（思考，新增 `tty_reason_write`）全部进转录，**fd 1 一个字节都不写**
   （管道语义干净，`tui-turn` 轮断言 fd 1 捕获 0 字节）；工具卡片不是靠前缀嗅探，而是
   `view_begin_tool`/`view_end_tool` 走结构化分支、复用纯函数 `view_render_block()` 的产物。
+  P18 起还有一条**不经过 sink** 的路：`view_think_live()`（喂状态区的实时行）——
+  通道 3 仍然只服务「转录里的思考条目」，两者互不影响。
 * **帧与终端**：帧写到启动时 `sys_dup(1)` 的**私有 fd** —— 请求期间 `tls_noise_mute()` 会把
   fd 2 指向 `/dev/null`，走 fd 2 的帧会被吞掉；备用屏幕进出 + 括起粘贴 + 逐行 diff 重绘
   （只重发变化的行，变化超过 60% 时整屏重画）；正文层永远是纯文本（宽度、换行、擦除都按
@@ -696,11 +741,42 @@ TTY 交互模式**默认全屏**（`--no-tui` 退回上一节的滚动转录；�
 * **`--resume`**：历史会回填进转录（最近 200 条），**注入类的 user 消息**（运行时上下文、
   AGENTS.md、技能目录）不进屏幕 —— 它们是我们塞给模型的背景，不是用户说过的话。
 * **记忆上限**：条目 ≤ 512、正文 ≤ 4 MiB、单条 ≤ 256 KiB，超了从最老丢并在顶部留一行标记；
-  思考条目只留尾部 4 KiB（与 P15/P16 的「思考行只显示最新一段」同口径）。
+  思考条目只留尾部 4 KiB；状态区的思考实时行只留尾部 1 KiB（都与 P15/P16 的
+  「思考行只显示最新一段」同口径）。
 * 仍不做：鼠标（滚轮/点击/选择）、图片、可折叠卡片、完整语法高亮（只做轻量 markdown）、
   分屏、主题切换 UI。
 
-### 统计行、上下文占用与 %cpu（P18，对齐 DSH 的统计条 + 占用表 + 自定义的进程 CPU）
+#### 运行中的状态区与思考实时行（P18）
+
+**P17 的状态行是「转录的最后一行」**，于是转录一铺满视口它就被挤掉 —— 判据是
+`r < panel_top`（`tui_build_chat`），而转录绘制循环的上界也是它：长会话里跑起来屏幕上
+**一个动的字节都没有**，看着就像卡住（见 §3 踩坑 32）。P18 把它改成**常驻状态区**：
+
+```
+  ⠋ 思考中 · esc 中断                                             ← 第 1 行：spinner + 状态（一直在）
+  ✻ 思考 · …态区预留对不对，再看 view_think_pick 的 latestLine 口径  ← 第 2 行：思考实时文本
+  ▌ ❯ 输入面板                                                    ← 面板永远在它下面
+```
+
+* **行数**：运行中 1–2 行、**空闲 0 行** —— 空闲态的行数/布局与 P18 之前**逐字节一致**
+  （转录仍然底对齐、贴面板）。视口算术里先把 `status_h` 扣掉再收转录，所以转录再长也挤不掉它。
+* **思考实时行默认开**，且**与 `--show-reasoning` 解耦**：后者只管「转录里的思考条目」与
+  「滚动模式在提示符那一行滚动」；实时行只跟 `--quiet`（显示层整层关）与「TUI 在不在跑」有关。
+  两个都开时：转录里有条目、状态区同样有实时行（不做隐式二选一）。想彻底关掉就用 `--no-tui`。
+* **口径**：喂的是 `view_think_pick(running=true)` 的**最新一行**（`trimEnd` 之后）；
+  按显示列**从左边截断补 `…`**（视口贴右端，屏幕上留最新的那一段），宽字符不砍半个；
+  控制字节/`ESC` 序列/TAB 在进缓冲区之前就清洗成 `·`/`␛`/四空格，换行只取最后一段
+  （这一行必须是单行，否则帧的「一行一段」结构会被冲掉）。
+* **收尾**：正文开始 / 工具调用开始 / 中断 / malformed / 网络错都走
+  `agent_note_reasoning → view_think_end → tui_think_clear()`；回合收口再经
+  `agent_tui_turn_done → tui_set_run(TUI_RUN_IDLE) → tui_think_clear()` 兜一层 ——
+  不会把实时行留在屏幕上，也不会让它跨回合串味。
+* **成本**：喂进来只写一个小 Buf + 置脏标记，不碰终端；重绘仍然走既有的逐行 diff（≤ 30 fps）。
+* 关联：`tui_think_live` / `tui_think_clear` / `tui_status_rows` / `tui_put_clipped_tail`（`src/tui.uya`）、
+  `view_think_live`（`src/view.uya`），喂入点在 `src/llm.uya` 的两条 reasoning 增量路径上。
+
+ours
+### 统计行、上下文占用与 %cpu（P20，对齐 DSH 的统计条 + 占用表 + 自定义的进程 CPU）
 
 脚注那一行分两半：左边是**状态字段**（`ctx` 上下文占用、`%cpu` 全部 uya-agent 进程的综合
 CPU），右边是**整会话统计行** —— 逐字对齐 DSH Web 聊天统计条那一行：
@@ -1071,7 +1147,47 @@ vLLM 等 OpenAI 兼容端点都一样稳。想升级成严格 `tool` 角色消�
       从缓冲区 0 量会得到几百，补 `─` 的循环一次都不进，底框退化成「└─ ┘」。
       另外按列补空格/截断一律用 `tty_cols_between`（显示列），用字节数会把右竖线拉歪。
       自测里对面板**每一行**断言列宽完全相等，这四条任何一条被写回去都会立刻红。
+32. **运行状态行会被「铺满的转录」挤掉 —— 长会话里跑起来屏幕上什么都没有。** P18 做思考实时行时
+   发现：P17 的状态行（`⠹ Bash(make check) · esc 中断`）画在转录的最后，判据是
+   `if g_tui_run != TUI_RUN_IDLE && r < panel_top`，而转录绘制循环的上界**也是** `r < panel_top`
+   —— 于是转录刚好占满视口时 `r == panel_top`，状态行直接不画，剩下的全是补齐的空行；
+   输入面板本身在运行期间完全静态（没有 spinner、没有 esc 提示），**屏幕上就没有一个会动的字节**了。
+   而这个条件在真实终端里几乎总是成立：`make tui-demo` 在 100×28 下对话屏其实只有 **24** 行
+   （真实终端行数），转录正好占满 21 行 —— 也就是说 README 里那张带状态行的截图，
+   在 `--tui-demo` 的真实输出里**从来没出现过**（`grep "make check"` 命中 0）。
+   修法不是「有位置就画」，而是**给状态区预留行数**：`status_h = tui_status_rows()`（运行中 1–2 行、
+   空闲 0 行），先把它从视口里扣掉（`t_bottom = panel_top - status_h`）再收/画转录，状态区画在
+   `[t_bottom, panel_top)` —— 空闲态因此与之前逐字节一致，而运行态**永远**贴着输入面板。
+   回归：`tui-status` 轮的 A 组（铺满转录后状态行必须仍在，且落在 `tui_nrows() - 4` 那一行）。
 
+
+33. **把「外来字节」原样打给 fd 2 = 转录里一屏乱码。** 现场：网关 400 的错误体把整个请求
+    **回显**回来了（里面有模型的 messages、`\n` 转义、组装好的 `tools` 数组），代码走
+    `dump_stream_error` / `dump_http_error` / `err_kind==1` / `LLM_FINISH_ERROR` 这几条路把它
+    **按字节**打到 stderr。而 TUI 的显示模型是「fd 2 的每一行 → 一条 NOTICE 条目，每行画一个
+    `· ` 前缀」——于是屏幕上出现一大块灰底 `· ` 行：**半个汉字 + 一屏 JSON**（用户报的「乱码」）。
+    三条根因叠在一起：
+    * **按字节截断切坏 UTF-8**：`llm_err_head` 收 240 B、`dump_*_error` 收 4096 B、`bad_finish`
+      64 B，中文在边界上被切成半个字符，终端渲染成替换符、列宽也算不对；
+    * **控制字节原样上屏**：错误体里的 CR/LF/ESC 会直接改变终端状态（清屏、挪光标）；
+    * **没有上限**：TUI 单条 NOTICE 的文本上限是 256 KiB（`TUI_ENTRY_MAX`），一条诊断就能把整屏
+      转录冲掉，而「NOTICE 只在内存里」意味着**会话日志里查不到现场**（当时只能靠截图）。
+    修法（入口唯一化 + 有界 + 另有去处）：
+    * `tty.uya::tty_diag_escape_into` 是**唯一**的转义实现：可打印 ASCII 原样、`\n`/`\t` 短转义、
+      其余控制字节 `\xNN`、合法 UTF-8 原样、非法/半截逐字节 `\xNN`，并在**字符边界**上按 cap 收；
+    * `agent.uya::out_diag` 是**唯一**的诊断出口：转义预览（320 B）+ `… N bytes total` 后缀，
+      **整条只有一行**（换行都转义了 → TUI 里最多 3–4 行，而不是一屏）；所有原样打印的调用点
+      全部改走它（`--dry-run` 也复用它，输出口径不变）；
+    * 完整原文（转义后）落会话日志 `diag/dump`（日志因此永远是合法 UTF-8），需要**原始字节**时
+      用 `--debug-dump FILE`（设路径即清空旧文件，避免自测被旧文件「假绿」）；
+    * TUI 侧再加两道：NOTICE 文本上限 `TUI_NOTICE_MAX = 512 B`（超了补一行截断提示），
+      非法/半截 UTF-8 在 `tui_clean_into` 里换成 U+FFFD；`tui_sink_reason` 的尾部保留
+      （4096 B）也改成按字符边界切（原来会把思考条目以半个汉字开头）。
+    回归：`diag-preview`（纯函数：边界/cap/转义/落盘）、`diag-echo-400` 与 `diag-echo-400-ns`
+    （mock 网关回显整个请求，断言转录里只有一行转义预览、没有裸 CR/NUL/ESC、`--debug-dump`
+    与会话日志 `diag/dump` 里有完整原文）、`tui-diag`（4 KiB 块只留 ≤512 B + 截断提示、
+    半截字节变 U+FFFD、思考尾部不切字）。真机对照（本地假网关回显 18 KB 请求）：
+    修前 stderr 297 B / 7 个裸 CR / 9 行，修后 330 B / 0 个裸 CR / 3 行 + `… 18693 bytes total`。
 
 ---
 
@@ -1145,10 +1261,11 @@ agent 循环并逐项断言：
 | `stream-length` | `finish_reason=length` → max-tokens，reasoning 正常累积 |
 | `steer` | 回合运行中输入的文本，必须在**下一个 step 的请求**里出现（mock 断言 `STEER-MARKER`） |
 | `interrupt` | 预置 Ctrl-C：回合以 `AGENT_INTERRUPTED` 结束、工具**未派发**、只发生一次请求 |
-| `tui-frame` | 四种尺寸（40×10 / 80×24 / 100×28 / 120×40）下「每行显示列 ≤ cols」「正文层里没有 ESC」；空态整体居中（首行留白 + 块字 logo + 面板 + 脚注 `~/cwd:branch`）、窄终端 logo 退化成单行标题；对话态底对齐 + 面板贴底；工具块/diff/思考/诊断/用户条目都在；跑满一屏后跟随尾部、PgUp/PgDn 夹取、回尾清零；**P18 脚注**：160 列放下整条统计行、120 列按组丢尾部并补 `…`、40 列统计行整条让位（退回版本号），而 `ctx` / `%cpu` 三种宽度下都必须在 |
+| `tui-frame` | 四种尺寸（40×10 / 80×24 / 100×28 / 120×40）下「每行显示列 ≤ cols」「正文层里没有 ESC」；空态整体居中（首行留白 + 块字 logo + 面板 + 脚注 `~/cwd:branch`）、窄终端 logo 退化成单行标题；对话态底对齐 + 面板贴底；工具块/diff/思考/诊断/用户条目都在；跑满一屏后跟随尾部、PgUp/PgDn 夹取、回尾清零；**P20 脚注**：160 列放下整条统计行、120 列按组丢尾部并补 `…`、40 列统计行整条让位（退回版本号），而 `ctx` / `%cpu` 三种宽度下都必须在 |
 | `tui-keys` | UTF-8 逐字符编辑（退格不砍半个汉字、←/→ 停在字符边界）、**被切开的 `ESC [ D`** 正确组装、Ctrl-J 换行与多行光标移动、回车提交（内容 + 清空 + 进历史）、↑ 取历史、运行中 esc = 中断 / 空闲 esc = 清行、tab 切计划模式（面板显示 Plan）、`/` 自动开命令面板并选中第二项、Ctrl-D 空行退出 |
 | `tui-sink` | TUI 激活后 `tty_write(1/2)` 与 `tty_reason_write` 的字节分别落到 助手/工具/思考 条目；NUL/`ESC[2J`/TAB 被清洗且正文层无 ESC；关掉 sink 后写入回到真实 fd |
-| `tui-turn` | headless 端到端（mock LLM，复用手打路径注入「任务+回车」）：屏幕里出现用户条目、`✓ Write(note.txt)`、`✓ Bash(`、最终答案；回合结束状态回 idle；**P18：脚注里必须出现 `1 轮 · ` 与 `工具调用 `**（真实测量的 llm/工具耗时进了界面）；fd 1 无输出 |
+| `tui-turn` | headless 端到端（mock LLM，复用手打路径注入「任务+回车」）：屏幕里出现用户条目、`✓ Write(note.txt)`、`✓ Bash(`、最终答案；回合结束状态回 idle、**状态区整块收掉且思考实时行不留残影**；**P20：脚注里必须出现 `1 轮 · ` 与 `工具调用 `**（真实测量的 llm/工具耗时进了界面）；fd 1 无输出 |
+| `tui-status` | 常驻状态区 + 思考实时行（P18）：**转录铺满视口后状态行必须仍在**（回归主断言，且落在面板上方那一行）、实时行紧跟在状态行下面且只显示 `latestLine`、超宽按列**从左边**截断补 `…`（保住最新的那一端）、`ESC[2J`/NUL/TAB 被清洗且换行只取最后一段、`tui_think_clear`/`TUI_RUN_IDLE` 之后整块收掉（空闲态 0 行）、滚动时钉住不动、窄终端（30 列）按实际可用列画、窄到放不下前缀（20 列）退化成 1 行不硬画、`view_think_live` 默认开（不看 `--show-reasoning`）而 `--quiet` 下一个字节都不写 |
 | `stats-format` | 纯函数逐字节：duration（`0s`/`0.4s`/`12s`/`50.7s`/`59.9s`/`1m0s`/`2m42s`/`60m0s` + 平均值口径不被整数截断 + 除零保护）、tokens（`999`/`1K`/`12.2K`/`238K`/`517K`/`1000K`/`1M`/`1.2M`/负数按 0）、tok/s（`0.4`/`9.9`/`9.94→9.9`/`221`/`994`/无时长）、缓存命中（无计费输入 → 不显示、`0`/`50`/12.5%→13%（ties 向上）/71%/全命中 `100`/999/1000→`99.9`/99.9579%→`99.96`，全部按 DSH 的取整规则） |
 | `stats-line` | 整行逐字节：demo fixture = DSH 截图那一行（`1 轮 · 12 步 \| LLM 50.7s · 工具调用 4.1s \| 首 token 平均 1.5s · 221 tok/s \| 缓存命中 71% \| 输入 238K tok · 输出 12K tok`）+ 四种判据（只有步数 / 只有 usage / 两步其一被取消 / 只有首 token / 工具+解码同时出现） |
 | `stats-fold` | 同一批边界「实时喂」与「日志逐行回放」的 11 个字段签名必须逐字节相同；再钉边界语义：孤儿 `tool/result` 不计时、未结算调用在 `turn/end` 丢弃、被取消的步只计数不计时、`turn/step` 不匹配时不计时但 token 照记、没上报输出 token 时不记解码、同一 turn 多步只算一轮、重复 callId 取最后一次并只结算一次 |
@@ -1228,6 +1345,7 @@ write 的 `· +A -D`、**默认（`tool_lines=0`）没有正文**（diff / todo 
 最后**把 fd 2 接到文件做端到端断言**：关闭态抓到 0 字节、打开态抓到的字节与 `view_render_block` 完全一致 |
 | `think-row` | 思考行的逐字节断言：运行中取最后一行（`trimEnd` 后）并按列**从左**截断补 `…`、结算取第一非空行按列**从右**截断补 `…`、
 全空白 / 窄到放不下前缀 → 一行都不出、宽字符不砍半个；`view_think_delta/end` 在非交互与 `--quiet` 下一个字节都不写、
+**P18 的 `view_think_live` 在非 TUI（滚动模式）下一个字节都不写**（滚动模式口径不能变）、
 `view_think_end` 幂等；**静音窗口**（`tls_noise_mute` 把 fd 2 指向 `/dev/null`）里显示层必须落到 `err_fd()` 那个还能看见的
 stderr 上（P16 抓到的坑，见 §3 第 27 条）；`assistant/reasoning` 事件的 data JSON 逐字节 |
 | `reasoning-log` | 跑完 `shell` 轮后回读会话日志：必须有一条 `assistant/reasoning`，`reasoning_content` 与 mock 回包**逐字节相同**、
@@ -1257,6 +1375,9 @@ ESC[12C / 逐行 ESC[2K）、真画一帧后屏幕上的块形状与 `cur_row`�
 responses 看 `call_id`）；**chat 与 responses 各一轮**，且顺便断言端点没串（`POST /v1/chat/completions` vs `/v1/responses`）。
 再加上「每个请求体都不许有裸控制字节」的全局哨兵（判定码 240）—— 这条就是真机那次
 `invalid character '\x00' in string literal` 的本地等价判据 |
+| `diag-preview` | 诊断出口的纯函数轮（P19，踩坑 33）：cap 落在多字节字符中间时必须在**字符边界**上停（600 B 中文 + cap 320 → 只吃 318 B，`bufx_utf8_valid` 为真）；半截序列与**孤立续字节**逐字节 `\xNN`；NUL/ESC/CR 走 `\xNN`、TAB 与换行走短转义；合法 U+FFFD 原样留着；`out_diag` 出来的字节序列**只有一个换行**、≤512 B、超长带 `… N bytes total` 后缀；`--debug-dump` 文件里有完整原始字节 |
+| `diag-echo-400` / `diag-echo-400-ns` | 端到端（mock mode 24，流式与非流式各一轮）：mock 网关回 **400 + 把整个请求原样回显**（含请求头的 CRLF 与 `tools` 数组）→ 断言 fd 2 上只有 `model endpoint returned HTTP 400` + 一行转义预览：CR 转义成 `\x0d`、**没有裸 CR/NUL/ESC**、行数 ≤6、总长 ≤1 KiB；同时断言 `--debug-dump` 里有完整原文、会话日志里有 `diag/dump` 事件（`kind`/`bytes`/`truncated`/`text`，文本里同样没有裸控制字节）。这两条就是「转录一屏乱码」的现场回归 |
+| `tui-diag` | 显示层轮（P19）：4 KiB 的 JSON 块从 fd 2 进来 → NOTICE 只留 ≤512 B + 一行截断提示（不修则 40 份重复铺满整屏）；半截汉字在屏幕上变成 **U+FFFD** 且屏幕文本 `bufx_utf8_valid` 为真（终端不会自己渲染半个字）；正文层无 ESC；思考条目尾部截断（4096 B、中文 3 B/字）不切出半个汉字 （这一轮把 `tty_sink_on` 打开做验证，**收尾必须关回去** —— 漏了的话后面每一轮的输出、连最终的 `SELFTEST PASS/FAIL` 都会被吞进转录缓冲区，终端上看起来就是「跑完没有下文」） |
 
 **P1/P2 的验收事实**（2026-10-02）：
 
@@ -1350,6 +1471,15 @@ responses 看 `call_id`）；**chat 与 responses 各一轮**，且顺便断言�
   在 stderr 上一个字节都不写；
   ③ 修掉 §3 第 27 条那个「静音把显示层一起吞了」的坑之前，真机与本地 mock **两边都看不到**
   思考行（`--show-reasoning` 等于没开）—— 这是本轮最有价值的发现。
+* **P18 的常驻状态区 / 思考实时行也真机验收过**（2026-10-03，`autodl-api` /
+  `DeepSeek-V4.1-Flash`，`reasoning_effort = max`，`--tls-verify=none`）：
+  在 100×30 的 PTY 里（`script -q -c "stty cols 100 rows 30; ./build/uya-agent …"`）跑
+  「计算 17×23，只回答数字」，抓到的帧里：
+  ① 提交后 26 行是 `⠙ 思考中 · esc 中断`、27 行是 `✻ 思考 · 391` —— **实时思考文本**（就是模型的
+  reasoning 片段）出现在状态区第 2 行，且 spinner 从 `⠋` 走到了 `⠙`（真的在动）；
+  ② 回合结束时同一屏上 26/27 行变成 `◆ 助手` / `391` —— **状态区整块收掉、转录把行收回**
+  （空闲 0 行），没有残影；③ 退出时 `ESC[?2004l ESC[?1049l` 干净收尾（备用屏幕与括起粘贴都关了）。
+  **这一屏在 P18 之前是拿不到的**：同样的转录长度下状态行会被挤掉，屏幕上只剩静止的转录 + 面板。
 | `http401` | mock 回 401 + 错误体：agent 必须打印状态与错误体并退出 3 |
 | `max-steps` | **显式**给 `max_steps=3`：mock 每轮都给 tool_calls，agent 必须在 3 步后熔断退出 3 |
 | `unlimited-steps` | **默认不限步数**（这轮故意不设 `max_steps`，吃 `cfg_default()` 的 0）：mock 连给 **14 轮** tool_calls（超过旧默认 12）才给最终答案 —— agent 必须一路跑满 14 步、把 14 条 `tool_call_id` 全带回请求，并以 0 退出。默认值一旦改回 12，mock 只会被服务 12 次，这轮立刻失败 |
@@ -1414,7 +1544,7 @@ mock 上逐字段验收。换一台 `openai-responses` 网关可用时，零参�
 * TUI 不做鼠标（滚轮/点击/选择）、图片、可折叠卡片、分屏、主题切换 UI；`--resume` 只回填
   最近 200 条历史（注入类消息不回填），`--resume-dsh` 走同一条回填路径。
 * 终端小于 32×8 时自动退回滚动模式；`cols < 66` 时块字 logo 退化成一行标题。
-* 统计（P18）是**整会话**口径、只认我们自己的会话日志：`--resume-dsh` 导入的 DSH 会话不计入
+* 统计（P20）是**整会话**口径、只认我们自己的会话日志：`--resume-dsh` 导入的 DSH 会话不计入
   （从 0 开始）；输出 token「没上报」与「上报 0」在日志里分不开，所以只有 `> 0` 才进 tok/s；
   非流式（`--no-stream`）没有首 token 边界 → 那一组不显示。上下文的三段明细是
   「4 字符 ≈ 1 token」的启发式，三项加起来不等于总量（DSH 也是这个性质）。
@@ -1424,7 +1554,8 @@ mock 上逐字段验收。换一台 `openai-responses` 网关可用时，零参�
 * `SIGKILL` 之后终端仍可能停在备用屏幕（不可捕获），用 `reset` / `stty sane` 恢复。
 * P16 起滚动模式下每次工具调用只有一行（正文要看就得 `--tool-lines N`，即 DSH 卡片的
   「展开」在终端里是显式开关），思考同理：**非交互（管道）下没有实时行**，只有块结束时落的
-  那一行 —— 想边跑边看思考就用交互模式（TUI 下思考是转录里的一个条目，只留最新一段）。
+  那一行 —— 想边跑边看思考就用交互模式。TUI 下思考有两条路：**状态区的实时行默认就开**
+  （P18，一行、只留最新一段），`--show-reasoning` 再把思考收进转录条目（只留尾部 4 KiB）。
 
 * diff 是行级的、面向显示：中间段两侧超过 60 行就退化为两行汇总（不做 Myers 全量 diff），
   也不高亮词级改动。
