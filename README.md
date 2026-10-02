@@ -88,7 +88,7 @@ export UYA_SPLIT_C_DIR=$PWD/build/uyacache      # 多文件 C 缓存别丢在仓
 | `--dsh-home DIR` | DSH 用户目录（默认 `$DSH_HOME` 或 `~/.dsh`） |
 | `--no-dsh-config` | 完全不读 DSH 设置 |
 | `--strict-dsh-config` | 读不到 DSH 设置就报错退出 |
-| `--print-config` | 打印生效配置、preset 旋钮与来源后退出 |
+| `--print-config` | 打印生效配置、preset 旋钮与来源后退出（含 `tls_verify` / `tls_pin` 及来源） |
 | `--list-dsh-sessions` | 列出 DSH 自己的会话（`<DSH_HOME>/sessions`，含 zstd） |
 | `--resume-dsh ID` | 导入 DSH 会话并继续（id 前缀 ≥8 字符即可） |
 | `--yaml-dump FILE` | 打印该 YAML 的解析结果（诊断） |
@@ -333,14 +333,18 @@ Messages API（`x-api-key` + `anthropic-version: 2023-06-01`，服务端工具 `
   （按 `apiKeyEnv` 走「进程环境 > `.credentials.yaml` > `<cwd>/.env` > `$DSH_HOME/.env`」四层）、
   以及 `permission.defaultPreset → confine`（`danger-full-access` 不限制，其它预设启用工作区守卫）。
 * 优先级：**CLI > `UYA_AGENT_*` 环境变量 > DSH 设置 > 内置默认**，`--print-config` 逐项打印来源
-  （`default` / `dsh-settings` / `env` / `cli`），敏感值打码成 `sk-…abcd`。
-  `--no-dsh-config` 完全关闭，`--strict-dsh-config` 读不到就报错退出。
+  （`default` / `dsh-settings` / `env` / `cli`），敏感值打码成 `sk-…abcd`；
+  `tls_verify` / `tls_pin` 也照样打来源，指纹是公开信息所以完整打印（方便直接和 `openssl` 对比）。
+  `--no-dsh-config` 完全关闭，`--strict-dsh-config` 读不到就报错退出 —— 这三个 flag 决定
+  「去哪儿读设置」，所以必须在加载**之前**预扫一遍，`make e2e-config-flags` 守着这条（见踩坑 25）。
 * TLS 信任策略也可以写进同一个设置文件（DSH 会忽略不认识的节）：
   ```yaml
   uya-agent:
     tls: { verify: pin, pin: <leaf sha256> }   # 或 verify: none
   ```
   这样「零参数启动」才真的可用 —— 默认 `chain` 在真实站点上过不去（见第 5 节）。
+  写完 `--print-config` 会显示 `tls_verify = pin  (source: dsh-settings)`，
+  零参数 `--probe` 即可验证（实测 HTTP 200，指纹与 `openssl s_client` 一致）。
 * `--yaml-dump FILE` 可以打印解析出来的配置树，排查「设置没生效」很有用。
 * 为什么自带 YAML 解析器而不是用 `std.yaml`：见踩坑第 26 条。
 
@@ -531,6 +535,14 @@ vLLM 等 OpenAI 兼容端点都一样稳。想升级成严格 `tool` 角色消�
     该行的起始列再 `ESC[J`（清到屏幕末尾），否则会把同一行前半段刚吐出来的正文擦掉。
     `tty.uya` 为此维护物理列（`out_col`/`out_wrap`）与块首列（`start_col`）；自测断言了
     擦除序列的每个字节。
+25. **「影响加载的 flag」必须预扫，否则会静默失效。** `--dsh-home` / `--no-dsh-config` /
+    `--strict-dsh-config` 的语义是「去哪儿读设置」，但完整 CLI 解析排在 DSH 加载**之后**，
+    于是三个 flag 全都读不到：`--no-dsh-config` 照样读 `~/.dsh`、`--dsh-home X` 照样读
+    `~/.dsh`、`--strict-dsh-config` 也不报错，而 `--print-config` 仍旧显示
+    `source: dsh-settings`，看上去一切正常 —— 加 tls 的来源打印时才撞出来。
+    修法：在主循环之前加一趟只认这三个 flag 的预扫（主循环稍后仍会再解析一次，天然幂等）。
+    这类「flag 是后续步骤的前置条件」的 bug 不会报错，只会让参数悄悄不起作用，
+    所以最好用 `--print-config` 亲眼确认来源、并给它配一条常驻回归（`make e2e-config-flags`）。
 
 ---
 
@@ -675,8 +687,10 @@ contextWindow/maxTokens/input image/reasoningEffort/`permission→confine`/`uya-
   产物 `demo.txt` 内容逐字节符合预期。
 * 自测现在是**幂等**的：连续跑两次都 PASS（以前靠「反正覆盖」掩盖了清理失败）。
 * DSH 配置兼容做了**零参数启动**验收：在空目录里不传 `--base-url/--model/--api-key`，
-  `--print-config` 显示 `base_url/model/api_key/context_window/confine` 的来源全是 `dsh-settings`，
-  实际提问「2+2 等于几」得到 `4。`（只额外用环境变量给了 TLS pin，因为默认 `chain` 在真机过不去）。
+  `--print-config` 显示 `base_url/model/api_key/context_window/confine/tls_verify/tls_pin`
+  的来源全是 `dsh-settings`，实际提问「2+2 等于几」得到 `4。`
+  （TLS pin 也写在 `~/.dsh/settings.yaml` 的 `uya-agent.tls` 节里，连环境变量都不用给；
+  三个「决定去哪儿读设置」的 flag 由 `make e2e-config-flags` 常驻回归）。
 * 会话恢复做了**跨进程 + 真实模型**验收：进程 1 让它「记住 4271」，进程 2 `--continue`
   带恢复的历史问「我刚才让你记住的数字是多少」→ 回答 **4271**；日志里 header 只有一条、
   `seq` 跨两个进程连续 0…9。

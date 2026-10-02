@@ -24,7 +24,7 @@ TASK ?= 创建 hello.uya，编译并运行它
 export UYA_ROOT
 export UYA_SPLIT_C_DIR := $(CURDIR)/build/uyacache
 
-.PHONY: all check build selftest codegen-audit probe e2e clean
+.PHONY: all check build selftest codegen-audit probe e2e e2e-config e2e-config-flags e2e-dsh clean
 
 all: build
 
@@ -49,7 +49,7 @@ codegen-audit: build
 	fi; \
 	echo "codegen-audit: 通过（没有切片描述符强转）"
 
-selftest: build codegen-audit
+selftest: build codegen-audit e2e-config-flags
 	UYA_BIN=$(UYA) $(OUT) --selftest
 
 probe: build
@@ -67,6 +67,24 @@ e2e: build
 # 零参数自检：只用 DSH 设置就能跑（不联网，只打印生效配置与旋钮来源）
 e2e-config: build
 	$(OUT) --print-config
+
+# CLI flag 回归：--dsh-home / --no-dsh-config / --strict-dsh-config 决定「去哪儿读设置」，
+# 必须在下一次加载之前生效（曾经因为完整 CLI 解析排在加载之后而三个 flag 全部静默失效，
+# 见 README 踩坑 25）。离线可跑：--print-config 不联网。
+e2e-config-flags: build
+	@set -e; \
+	out=$$($(OUT) --no-dsh-config --print-config 2>&1); \
+	echo "$$out" | grep -q "base_url = https://api.deepseek.com/v1  (source: default)" \
+		|| { echo "FAIL: --no-dsh-config 没有生效（仍在读 DSH 设置）"; exit 1; }; \
+	out=$$($(OUT) --dsh-home /nonexistent --print-config 2>&1); \
+	echo "$$out" | grep -q "dsh_home = /nonexistent  (loaded: no)" \
+		|| { echo "FAIL: --dsh-home 没有生效"; exit 1; }; \
+	echo "$$out" | grep -q "tls_verify = chain  (source: default)" \
+		|| { echo "FAIL: 读不到 DSH 设置时应回落到内置默认 chain"; exit 1; }; \
+	if $(OUT) --strict-dsh-config --dsh-home /nonexistent --print-config >/dev/null 2>&1; then \
+		echo "FAIL: --strict-dsh-config 读不到设置却没有报错退出"; exit 1; \
+	fi; \
+	echo "e2e-config-flags: 通过（--dsh-home / --no-dsh-config / --strict-dsh-config 都在加载前生效）"
 
 # DSH 自己的会话列表（读 ~/.dsh/sessions，含 zstd）
 e2e-dsh: build
