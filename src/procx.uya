@@ -1,0 +1,310 @@
+// src/procx.uya — 进程 CPU 采样（P18）：机器上**所有** uya-agent 进程的综合 CPU 使用率
+//
+// 口径：
+//   * 范围：`/proc` 下 comm 与本进程相同的**全部**进程 —— 本进程、子代理进程、
+//     其它终端/其它工作区里的实例。不是只看本会话进程树（要改只需换过滤条件）。
+//     自己的 comm 从 `/proc/self/stat` 读出（二进制被改名也照样匹配；comm 上限
+//     15 字符，两侧同样截断，所以逐字节比较成立）。
+//   * 取值：`/proc/<pid>/stat` 的 utime + stime。**不取** cutime/cstime —— 父子
+//     都是我们的进程时，取子进程累计会把同一份 CPU 时间算两遍。
+//   * 单位：这两个字段是 `USER_HZ = 100` 时钟节拍（Linux 对所有架构固定，与内核
+//     HZ 无关），所以 `PROCX_HZ = 100` 是常数而不是 sysconf 读数；`cpu-live` 自测
+//     用「忙循环子进程 + 400ms」把这条钉死。
+//   * 计算：pct = Δticks * 1000 / Δms（1 tick = 10ms CPU）。采样间隔按**墙上时间**
+//     算，所以事件循环被长任务占住、tick 稀疏时数值依然精确。
+//   * 口径是**单核百分比**：多进程/多核并行时可以 > 100%（父 + 2 个子代理最多
+//     约 300%）。显示时钳在 0…999。
+//   * 只在 TUI 活跃时采样（由 tui_tick 这个统一心跳驱动），1 秒一次；第一次采样
+//     只建立基线（不产生数字）。`/proc` 读不到 → 返回不可用，界面直接省略该字段。
+
+use libc.syscall;
+use libc.unistd;
+
+const PROCX_HZ: i64 = 100;            // USER_HZ（见文件头）
+export const PROCX_SAMPLE_MS: u64 = 1000;
+const PROCX_MAX_PROCS: i32 = 4096;    // 防御上限（正常机器几百个）
+const PROCX_STAT_MAX: usize = 2048;   // /proc/<pid>/stat 一行的上限
+
+var g_px_comm: Buf = Buf{ ptr: null, len: 0, cap: 0 };
+var g_px_have_comm: bool = false;
+var g_px_prev_ticks: i64 = 0;
+var g_px_prev_ms: u64 = 0;
+var g_px_have_prev: bool = false;
+var g_px_pct: i32 = -1;
+var g_px_count: i32 = 0;
+var g_px_span_ms: i64 = 0;
+var g_px_failed: bool = false;
+
+// 自测用：清零状态（不影响 comm 缓存）
+export fn procx_reset() void {
+    g_px_prev_ticks = 0;
+    g_px_prev_ms = 0;
+    g_px_have_prev = false;
+    g_px_pct = -1;
+    g_px_count = 0;
+    g_px_span_ms = 0;
+    g_px_failed = false;
+}
+
+export fn procx_cpu_pct() i32 {
+    return g_px_pct;
+}
+
+export fn procx_proc_count() i32 {
+    return g_px_count;
+}
+
+export fn procx_last_span_ms() i64 {
+    return g_px_span_ms;
+}
+
+export fn procx_failed() bool {
+    return g_px_failed;
+}
+
+// ============================================================
+// 纯函数（自测逐字节断言的就是这三个）
+// ============================================================
+
+// 目录项是不是一个 pid（纯数字、非空、不超过 10 位）
+export fn procx_pid_ok(name: &[byte]) bool {
+    if name.len == 0 || name.len > 10 {
+        return false;
+    }
+    var i: usize = 0;
+    while i < name.len {
+        if !is_digit(name.ptr[i]) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+// 解析一行 `/proc/<pid>/stat`：comm = 第一个 '(' 与**最后一个** ')' 之间
+// （comm 里可以有空格和括号，所以不能按空格切），utime/stime = ')' 之后的
+// 第 12、13 个字段（第 3 个字段是 state）。
+export fn procx_parse_stat(line: &[byte], comm: &Buf, ticks: &i64) bool {
+    buf_reset(comm);
+    ticks[0] = 0;
+    const open_at: isize = bufx_find_byte(line, 40, 0);      // '('
+    if open_at < 0 {
+        return false;
+    }
+    // 收尾括号取**最后一个** ')'：comm 里允许出现 ')'（内核不转义），而 ')' 之后的
+    // 字段只有状态字母与数字，不可能再有 ')' —— 取第一个会把 `(uya (agent) x)` 切坏。
+    var close_at: isize = -1;
+    var scan: usize = (open_at as usize) + 1;
+    while scan < line.len {
+        if line.ptr[scan] == 41 as byte {
+            close_at = scan as isize;
+        }
+        scan = scan + 1;
+    }
+    if close_at < 0 {
+        return false;
+    }
+    const cs: usize = (open_at as usize) + 1;
+    const ce: usize = close_at as usize;
+    if !buf_append(comm, &line.ptr[cs], ce - cs) {
+        return false;
+    }
+    var i: usize = ce + 1;
+    var field: i32 = 0;
+    var utime: i64 = -1;
+    var stime: i64 = -1;
+    while i < line.len {
+        // 跳空格
+        while i < line.len && line.ptr[i] == 32 as byte {
+            i = i + 1;
+        }
+        if i >= line.len {
+            break;
+        }
+        field = field + 1;
+        var v: i64 = 0;
+        var digits: i32 = 0;
+        while i < line.len && is_digit(line.ptr[i]) {
+            v = (v * 10) + ((line.ptr[i] as i64) - 48);
+            digits = digits + 1;
+            i = i + 1;
+        }
+        if field == 12 {
+            if digits == 0 {
+                return false;   // utime 必须是数字（缺字段 = 不是我们要的形状）
+            }
+            utime = v;
+        } else if field == 13 {
+            if digits == 0 {
+                return false;
+            }
+            stime = v;
+            break;
+        }
+        // 第 1 个字段是 state（字母 R/S/D…），第 2..11 个是各种计数 —— 一律跳过，
+        // 只要能被空格切出来就行（早期实现在这里要求「数字」，真行会直接解析失败）
+        // 跳过本字段剩下的非空格字节（正常情况下数字后面就是空格）
+        while i < line.len && line.ptr[i] != 32 as byte {
+            i = i + 1;
+        }
+    }
+    if utime < 0 || stime < 0 {
+        return false;
+    }
+    ticks[0] = utime + stime;
+    return true;
+}
+
+// Δticks / Δms → 单核百分比（-1 = 不可算）
+export fn procx_pct_of(dticks: i64, dms: i64) i32 {
+    if dms <= 0 {
+        return -1;
+    }
+    var d: i64 = dticks;
+    if d < 0 {
+        d = 0;
+    }
+    const p: i64 = ((d * 1000) + (dms / 2)) / dms;
+    if p > 999 {
+        return 999;
+    }
+    if p < 0 {
+        return 0;
+    }
+    return p as i32;
+}
+
+// ============================================================
+// 采样
+// ============================================================
+
+fn procx_self_comm() bool {
+    if g_px_have_comm {
+        return true;
+    }
+    if !buf_valid(&g_px_comm) {
+        g_px_comm = buf_new(64);
+        if !buf_valid(&g_px_comm) {
+            return false;
+        }
+    }
+    var line: Buf = buf_new(PROCX_STAT_MAX);
+    defer { buf_free(&line); }
+    if !fs_read_file_all("/proc/self/stat" as &const byte, &line, PROCX_STAT_MAX) {
+        return false;
+    }
+    var ticks: i64 = 0;
+    if !procx_parse_stat(line.ptr[0: line.len], &g_px_comm, &ticks) {
+        return false;
+    }
+    if g_px_comm.len == 0 {
+        return false;
+    }
+    g_px_have_comm = true;
+    return true;
+}
+
+// 扫一遍 /proc，累加 comm 匹配的进程的 utime+stime。返回 false = 枚举失败。
+fn procx_scan(ticks: &i64, count: &i32) bool {
+    ticks[0] = 0;
+    count[0] = 0;
+    if !procx_self_comm() {
+        return false;
+    }
+    const dp: &DIR = opendir("/proc" as &const byte);
+    if dp == null {
+        return false;
+    }
+    defer { _ = closedir(dp); }
+    var path: Buf = buf_new(64);
+    defer { buf_free(&path); }
+    var line: Buf = buf_new(PROCX_STAT_MAX);
+    defer { buf_free(&line); }
+    var comm: Buf = buf_new(64);
+    defer { buf_free(&comm); }
+    while count[0] < PROCX_MAX_PROCS {
+        const de: &Dirent = readdir(dp);
+        if de == null {
+            break;
+        }
+        const nm: &const byte = &de.d_name[0] as &const byte;
+        const ln: usize = bufx_cstr_len(nm);
+        if !procx_pid_ok(nm[0: ln]) {
+            continue;
+        }
+        buf_reset(&path);
+        if !buf_append_cstr(&path, "/proc/") {
+            break;
+        }
+        if !buf_append(&path, nm, ln) {
+            break;
+        }
+        if !buf_append_cstr(&path, "/stat") {
+            break;
+        }
+        if !buf_append_byte(&path, 0) {
+            break;
+        }
+        if !fs_read_file_all(path.ptr as &const byte, &line, PROCX_STAT_MAX) {
+            continue;   // 进程刚消失 / 权限不足：跳过
+        }
+        var t: i64 = 0;
+        if !procx_parse_stat(line.ptr[0: line.len], &comm, &t) {
+            continue;
+        }
+        if comm.len != g_px_comm.len {
+            continue;
+        }
+        if !bufx_mem_eq(comm.ptr as &const byte, g_px_comm.ptr as &const byte, comm.len) {
+            continue;
+        }
+        ticks[0] = ticks[0] + t;
+        count[0] = count[0] + 1;
+    }
+    return true;
+}
+
+// 立刻采一次（自测/诊断入口）。返回值 = 这次扫描是否成功。
+export fn procx_sample_once(now_ms: u64) bool {
+    var ticks: i64 = 0;
+    var count: i32 = 0;
+    const ok: bool = procx_scan(&ticks, &count);
+    if !ok {
+        g_px_failed = true;
+        g_px_pct = -1;
+        g_px_count = 0;
+        g_px_span_ms = 0;
+        g_px_have_prev = false;
+        return false;
+    }
+    g_px_failed = false;
+    g_px_count = count;
+    if g_px_have_prev && now_ms > g_px_prev_ms {
+        const span: i64 = (now_ms - g_px_prev_ms) as i64;
+        g_px_pct = procx_pct_of(ticks - g_px_prev_ticks, span);
+        g_px_span_ms = span;
+    } else {
+        g_px_pct = -1;      // 第一次只建基线（也可能是时钟没走）
+        g_px_span_ms = 0;
+    }
+    g_px_prev_ticks = ticks;
+    g_px_prev_ms = now_ms;
+    g_px_have_prev = true;
+    return true;
+}
+
+// 心跳（由 tui_tick 调）：到点才真扫。
+// now_ms == 0 = 无时钟的画布模式（自测的 headless 帧）→ 不碰 /proc。
+export fn procx_tick(now_ms: u64) void {
+    if now_ms == 0 {
+        return;
+    }
+    if g_px_have_prev && (now_ms - g_px_prev_ms) < PROCX_SAMPLE_MS {
+        return;
+    }
+    _ = procx_sample_once(now_ms);
+}
+
+export fn procx_hz() i64 {
+    return PROCX_HZ;
+}

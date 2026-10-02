@@ -135,8 +135,8 @@ fn cfg_default() Config {
         tui_src: 0,
         tui_headless: false,
         tui_demo: false,
-        tui_cols: 100,
-        tui_rows: 30,
+        tui_cols: 160,     // --tui-demo 默认画布：够放下完整的统计行（约 120 列）
+        tui_rows: 40,
         color_mode: 0,
         save_session: true,
         resume_id: buf_empty(),
@@ -817,11 +817,20 @@ fn role_cstr(role: u8) &byte {
 // 事件词表（data 载荷刻意做成无歧义键，恢复时不必猜）：
 //   user/message      {"role":"user","content":[{"type":"text","text":…}],"source":{…}}
 //   assistant/message {"turn":N,"step":N,"message":{"role":"assistant","content":…,"tool_calls":[…]?},"usage":{…}}
+//   assistant/first-token {"turn":N,"step":N}
 //   tool/call         {"turn":N,"step":N,"callId":…,"name":…,"arguments":…}
 //   tool/result       {"turn":N,"step":N,"callId":…,"content":…}
 //   turn/start|end    {"turn":N}[,"reason":…]
 //   step/start|end    {"turn":N,"step":N}
 //   session/title     {"title":…,"source":{"kind":"fallback"}}
+//
+// P18 起这张表同时是**统计折叠**的输入（stats.uya），于是多出三条硬约束：
+//   * step/start 与 step/end 必须成对写（DSH 是 finally 语义：进过的步都计数，
+//     失败/取消/max-tokens 的步也算）—— 给回合循环加退出分支时别忘了补 step/end；
+//   * `assistant/first-token` 是首个非空正文 delta 的那一刻。事件是流结束后才补写的，
+//     所以时间必须用 sess_begin_at 钉成那一刻，不能用写盘时的 ua_now_ms()；
+//   * tool/call 在**工具真正开始前**写、tool/result 在其后写：两者的 time 差就是
+//     toolMs（早期实现是执行完再背靠背写两条，时间差恒为 0，统计会永远显示 0s）。
 // ============================================================
 var g_sess: SessionLog = SessionLog{
     id: Buf{ ptr: null, len: 0, cap: 0 },
@@ -841,6 +850,8 @@ var g_tools_scratch: Buf = Buf{ ptr: null, len: 0, cap: 0 };
 var g_jobs: JobTable = JobTable{ items: [], next_id: 1 };
 // P9：最近一次请求的 prompt_tokens（压力口径）与压缩开关
 var g_last_prompt_tokens: i64 = 0;
+// P18：上下文占用的增量基准（DSH 的 projectedTokens 锚点）。-1 = 还没有锚点。
+var g_ctx_est_at_sample: i64 = -1;
 // P11：最后一个「有内容的助手消息」正文（子代理用它回报结果）
 var g_last_answer: Buf = Buf{ ptr: null, len: 0, cap: 0 };
 var g_compact_enabled: bool = true;
@@ -923,13 +934,13 @@ fn agent_log_user(text: &const byte, n: usize, steer: bool) void {
     }
 }
 
-fn agent_log_assistant(step: i32, o: &const ChatOut) void {
+fn agent_log_assistant(step: i32, o: &const ChatOut, t: u64) void {
     if !g_sess.save {
         return;
     }
     var ev: Buf = buf_new(o.content.len + 8192);
     defer { buf_free(&ev); }
-    if !sess_begin(&g_sess, "assistant/message", &ev) {
+    if !sess_begin_at(&g_sess, "assistant/message", t, &ev) {
         return;
     }
     _ = buf_append_cstr(&ev, "{\"turn\":");
@@ -960,6 +971,8 @@ fn agent_log_assistant(step: i32, o: &const ChatOut) void {
     _ = buf_append_i64(&ev, o.usage_out);
     _ = buf_append_cstr(&ev, ",\"cacheReadTokens\":");
     _ = buf_append_i64(&ev, o.usage_cache_read);
+    _ = buf_append_cstr(&ev, ",\"cacheWriteTokens\":");
+    _ = buf_append_i64(&ev, o.usage_cache_write);
     _ = buf_append_cstr(&ev, ",\"reasoningTokens\":");
     _ = buf_append_i64(&ev, o.usage_reasoning);
     _ = buf_append_cstr(&ev, "}}");
@@ -1032,13 +1045,15 @@ fn agent_note_reasoning(step: i32, o: &const ChatOut) void {
     agent_log_reasoning(step, o);
 }
 
-fn agent_log_tool(step: i32, call_id: &const Buf, name: &const Buf, args: &const Buf, result: &const Buf) void {
+// tool/call 在工具**真正开始执行前**写（tool/result 在它之后写）：统计折叠用两者的
+// time 差当 toolMs，背靠背写两条的话这个数字恒为 0。
+fn agent_log_tool_call(step: i32, call_id: &const Buf, name: &const Buf, args: &const Buf, t: u64) void {
     if !g_sess.save {
         return;
     }
-    var ev: Buf = buf_new(args.len + result.len + 512);
+    var ev: Buf = buf_new(args.len + 512);
     defer { buf_free(&ev); }
-    if sess_begin(&g_sess, "tool/call", &ev) {
+    if sess_begin_at(&g_sess, "tool/call", t, &ev) {
         _ = buf_append_cstr(&ev, "{\"turn\":");
         _ = buf_append_i64(&ev, g_turn as i64);
         _ = buf_append_cstr(&ev, ",\"step\":");
@@ -1052,8 +1067,15 @@ fn agent_log_tool(step: i32, call_id: &const Buf, name: &const Buf, args: &const
         _ = buf_append_cstr(&ev, "}");
         _ = sess_end(&g_sess, &ev);
     }
-    buf_reset(&ev);
-    if sess_begin(&g_sess, "tool/result", &ev) {
+}
+
+fn agent_log_tool_result(step: i32, call_id: &const Buf, result: &const Buf, t: u64) void {
+    if !g_sess.save {
+        return;
+    }
+    var ev: Buf = buf_new(result.len + 512);
+    defer { buf_free(&ev); }
+    if sess_begin_at(&g_sess, "tool/result", t, &ev) {
         _ = buf_append_cstr(&ev, "{\"turn\":");
         _ = buf_append_i64(&ev, g_turn as i64);
         _ = buf_append_cstr(&ev, ",\"step\":");
@@ -1065,6 +1087,180 @@ fn agent_log_tool(step: i32, call_id: &const Buf, name: &const Buf, args: &const
         _ = buf_append_cstr(&ev, "}");
         _ = sess_end(&g_sess, &ev);
     }
+}
+
+// ============================================================
+// P18：统计边界（记日志 + 喂折叠 + 推给 TUI）
+// ============================================================
+//
+// 每个边界只在这里做一次：同一个毫秒值既进日志（sess_begin_at）又进折叠（st_*），
+// 所以「实时数字」与「resume 回放出来的数字」必须逐位相同（自测 stats-fold 钉这条）。
+// --no-save 时日志不写，折叠照常 —— 界面上的统计与有没有落盘无关。
+
+fn agent_bound_step_start(cfg: &const Config, h: &const History, step: i32) void {
+    const t: u64 = ua_now_ms();
+    if g_sess.save {
+        var ev: Buf = buf_new(96);
+        defer { buf_free(&ev); }
+        if sess_begin_at(&g_sess, "step/start", t, &ev) {
+            _ = buf_append_cstr(&ev, "{\"turn\":");
+            _ = buf_append_i64(&ev, g_turn as i64);
+            _ = buf_append_cstr(&ev, ",\"step\":");
+            _ = buf_append_i64(&ev, step as i64);
+            _ = buf_append_cstr(&ev, "}");
+            _ = sess_end(&g_sess, &ev);
+        }
+    }
+    st_step_start(g_turn as i64, step as i64, t);
+    agent_stats_sync(cfg, h);
+}
+
+fn agent_bound_step_end(cfg: &const Config, h: &const History, step: i32) void {
+    const t: u64 = ua_now_ms();
+    if g_sess.save {
+        var ev: Buf = buf_new(96);
+        defer { buf_free(&ev); }
+        if sess_begin_at(&g_sess, "step/end", t, &ev) {
+            _ = buf_append_cstr(&ev, "{\"turn\":");
+            _ = buf_append_i64(&ev, g_turn as i64);
+            _ = buf_append_cstr(&ev, ",\"step\":");
+            _ = buf_append_i64(&ev, step as i64);
+            _ = buf_append_cstr(&ev, "}");
+            _ = sess_end(&g_sess, &ev);
+        }
+    }
+    st_step_end(g_turn as i64, step as i64);
+    agent_stats_sync(cfg, h);
+}
+
+// ms = ChatOut.first_token_ms（流式路径记的首 token 时刻）
+fn agent_bound_first_token(cfg: &const Config, h: &const History, step: i32, ms: i64) void {
+    if ms <= 0 {
+        return;
+    }
+    const t: u64 = ms as u64;
+    if g_sess.save {
+        var ev: Buf = buf_new(96);
+        defer { buf_free(&ev); }
+        if sess_begin_at(&g_sess, "assistant/first-token", t, &ev) {
+            _ = buf_append_cstr(&ev, "{\"turn\":");
+            _ = buf_append_i64(&ev, g_turn as i64);
+            _ = buf_append_cstr(&ev, ",\"step\":");
+            _ = buf_append_i64(&ev, step as i64);
+            _ = buf_append_cstr(&ev, "}");
+            _ = sess_end(&g_sess, &ev);
+        }
+    }
+    st_first_token(g_turn as i64, step as i64, t);
+}
+
+fn agent_bound_assistant_message(cfg: &const Config, h: &const History, step: i32, o: &const ChatOut) void {
+    const t: u64 = ua_now_ms();
+    agent_log_assistant(step, o, t);
+    st_assistant_message(
+        g_turn as i64,
+        step as i64,
+        t,
+        o.usage_in,
+        o.usage_cache_read,
+        o.usage_cache_write,
+        o.usage_out
+    );
+    // 压力样本就是这次请求的 prompt 规模（DSH 的 pressureTokens）；同时把增量基准
+    // 锚在当下，之后 used = 样本 + (est_now - 锚点)（DSH 的 projectedTokens 口径）
+    var sys_t: i64 = 0;
+    var tools_t: i64 = 0;
+    var msgs_t: i64 = 0;
+    agent_ctx_est(cfg, h, &sys_t, &tools_t, &msgs_t);
+    g_ctx_est_at_sample = sys_t + tools_t + msgs_t;
+    agent_stats_sync(cfg, h);
+}
+
+fn agent_bound_tool_call(cfg: &const Config, h: &const History, step: i32, call_id: &const Buf, name: &const Buf, args: &const Buf) void {
+    const t: u64 = ua_now_ms();
+    agent_log_tool_call(step, call_id, name, args, t);
+    st_tool_call(call_id.ptr as &const byte, call_id.len, t);
+    agent_stats_sync(cfg, h);
+}
+
+fn agent_bound_tool_result(cfg: &const Config, h: &const History, step: i32, call_id: &const Buf, result: &const Buf) void {
+    const t: u64 = ua_now_ms();
+    agent_log_tool_result(step, call_id, result, t);
+    st_tool_result(call_id.ptr as &const byte, call_id.len, t);
+    agent_stats_sync(cfg, h);
+}
+
+// ------------------------------------------------------------
+// P18：上下文占用（DSH contextPressure / contextBreakdown 的等价物）
+// ------------------------------------------------------------
+//
+// 三段启发式：固定「4 字符 ≈ 1 token」（与 agent_pressure_tokens 同口径），
+// 刻意不做 provider 精确 tokenizer —— DSH 的 contextBreakdown 也是这个性质，
+// 所以三项之和**不等于**总量（CJK 会被低估），界面按「近似组成」呈现。
+//
+// g_tools_scratch 是请求组装也在用的共享 scratch。这里的调用点全部落在步边界上，
+// 与 build_*_request 不会嵌套（同一线程顺序执行），所以复用是安全的。
+fn agent_ctx_est(cfg: &const Config, h: &const History, sys_t: &i64, tools_t: &i64, msgs_t: &i64) void {
+    var sys_bytes: i64 = 0;
+    if h.len > 0 {
+        const m0: &const Msg = msg_at(h, 0);
+        if m0.role == ROLE_SYSTEM {
+            sys_bytes = (m0.text_len + m0.extra_len) as i64;
+        }
+    }
+    var tools_bytes: i64 = 0;
+    if tools_json(&g_tools_scratch, cfg.allow_shell, false) {
+        tools_bytes = g_tools_scratch.len as i64;
+    }
+    var msg_bytes: i64 = 0;
+    var i: usize = 1;   // h[0] 是系统提示词，已经算进 sys
+    while i < h.len {
+        const m: &const Msg = msg_at(h, i);
+        msg_bytes = msg_bytes + ((m.text_len + m.extra_len) as i64);
+        i = i + 1;
+    }
+    sys_t[0] = sys_bytes / 4;
+    tools_t[0] = tools_bytes / 4;
+    msgs_t[0] = msg_bytes / 4;
+}
+
+// 展示用的 used（DSH 的 projectedTokens）：返回 -1 = 还不可用（提供方没报过用量）
+fn agent_ctx_used(cfg: &const Config, h: &const History, sys_t: &i64, tools_t: &i64, msgs_t: &i64) i64 {
+    agent_ctx_est(cfg, h, sys_t, tools_t, msgs_t);
+    if !st_have_pressure() {
+        return -1;
+    }
+    const est_now: i64 = sys_t[0] + tools_t[0] + msgs_t[0];
+    if g_ctx_est_at_sample < 0 {
+        // 没有增量基准（--resume 后第一帧：样本来自日志，当时的估算没落盘）：
+        // 锚在当下，先只用样本，等下一次请求再把锚点接上
+        g_ctx_est_at_sample = est_now;
+    }
+    return st_ctx_projected(st_pressure(), g_ctx_est_at_sample, est_now);
+}
+
+fn agent_ctx_sync(cfg: &const Config, h: &const History) void {
+    var sys_t: i64 = 0;
+    var tools_t: i64 = 0;
+    var msgs_t: i64 = 0;
+    const used: i64 = agent_ctx_used(cfg, h, &sys_t, &tools_t, &msgs_t);
+    const pct: i32 = if used < 0 { -1 } else { st_ctx_percent(used, cfg.context_window) };
+    tui_set_ctx(pct);
+}
+
+// 统计行 + 上下文占用一起推给 TUI（没有 TUI 时是空操作：数字只在折叠里，不花冤枉钱）
+fn agent_stats_sync(cfg: &const Config, h: &const History) void {
+    if !tui_active() {
+        return;
+    }
+    var line: Buf = buf_new(512);
+    defer { buf_free(&line); }
+    if st_line(&line) {
+        tui_set_stats(line.ptr as &const byte, line.len);
+    } else {
+        tui_set_stats("" as &const byte, 0);
+    }
+    agent_ctx_sync(cfg, h);
 }
 
 fn agent_log_simple(typ: &const byte, payload: &const byte) void {
@@ -1114,7 +1310,11 @@ fn agent_log_turn_end(reason: &const byte) void {
 }
 
 // 从会话日志恢复消息历史（返回恢复的消息条数；0 表示没有可恢复内容）
-fn agent_hist_from_log(cfg: &const Config, h: &History, path: &const Buf, out_next_seq: &i64) i32 {
+//
+// fold_stats=true 时顺带把**同一遍扫描**的每一行喂进统计折叠 —— 统计因此是全会话
+// 口径，resume 之后与恢复前逐位相同（子代理 fork 父历史时传 false：那份历史的步数
+// 是父会话的，不该算进子会话的统计）。
+fn agent_hist_from_log(cfg: &const Config, h: &History, path: &const Buf, out_next_seq: &i64, fold_stats: bool) i32 {
     var r: SessReader = sess_reader_empty();
     defer { sess_reader_free(&r); }
     var pz: Buf = buf_new(path.len + 1);
@@ -1145,7 +1345,13 @@ fn agent_hist_from_log(cfg: &const Config, h: &History, path: &const Buf, out_ne
     var added: i32 = 0;
     var expect: i64 = 0;
     out_next_seq[0] = 0;
+    if fold_stats {
+        st_reset();
+    }
     while sess_next(&r, &line) {
+        if fold_stats {
+            st_fold_line(&line);
+        }
         const seq: i64 = sess_line_seq(&line);
         if seq >= 0 {
             if seq != expect {
@@ -1302,7 +1508,7 @@ export fn agent_session_open(cfg: &const Config, h: &History, resume_path: &cons
     }
     if resumed {
         var next_seq: i64 = 0;
-        const n: i32 = agent_hist_from_log(cfg, h, resume_path, &next_seq);
+        const n: i32 = agent_hist_from_log(cfg, h, resume_path, &next_seq, true);
         if n > 0 {
             const trimmed: usize = hist_trim_incomplete_tail(h);
             if trimmed > 0 {
@@ -2463,6 +2669,9 @@ fn agent_step_stream(cfg: &const Config, style: u8, url: &const Buf, hdrs: &cons
     // 显示上落一行、日志上记全文，并且把被思考行顶掉的提示符还回去。
     // 正常路径下思考块早就因为「正文开始 / 工具调用开始」结算过了，这里是幂等的兜底。
     agent_note_reasoning(step, &o);
+    // P18：首 token 边界。用 ChatOut 记下的那一刻写事件与折叠（不是现在），
+    // 否则 TTFT 会变成「整段流式时间」。非流式路径没有 delta，这里自然地不打点。
+    agent_bound_first_token(cfg, h, step, o.first_token_ms);
 
     if err_kind == 4 {
         // 对齐 DSH：中断流式时只保留 content/reasoning 的**非空白前缀**，
@@ -2532,7 +2741,7 @@ fn agent_finish_step(cfg: &const Config, arena: &Arena, h: &History, step: i32, 
         return AGENT_PROTO;
     }
 
-    agent_log_assistant(step, o);
+    agent_bound_assistant_message(cfg, h, step, o);
 
     if o.finish == LLM_FINISH_MAX_TOKENS {
         // 对齐 DSH：token 上限截断时**不派发**任何工具调用（参数可能是半截的）
@@ -2562,9 +2771,12 @@ fn agent_finish_step(cfg: &const Config, arena: &Arena, h: &History, step: i32, 
             while ci < o.ncalls {
                 view_begin_tool(arena, &o.calls[ci].name, &o.calls[ci].args);
                 var res_f: Buf = buf_new(4096);
+                // tool/call 在派发**之前**落地，tool/result 在之后：日志上的时间差才是
+                // 真实工具耗时（统计的 toolMs 就吃这个差值）
+                agent_bound_tool_call(cfg, h, step, &o.calls[ci].id, &o.calls[ci].name, &o.calls[ci].args);
                 dispatch_tool_body(cfg, &o.calls[ci].name, &o.calls[ci].args, arena, &res_f);
                 view_end_tool(arena, &o.calls[ci].name, &o.calls[ci].args, &res_f);
-                agent_log_tool(step, &o.calls[ci].id, &o.calls[ci].name, &o.calls[ci].args, &res_f);
+                agent_bound_tool_result(cfg, h, step, &o.calls[ci].id, &res_f);
                 _ = buf_append_cstr(&results, "[tool ");
                 _ = buf_append(&results, o.calls[ci].name.ptr, o.calls[ci].name.len);
                 _ = buf_append_cstr(&results, "] ");
@@ -2624,9 +2836,10 @@ fn agent_finish_step(cfg: &const Config, arena: &Arena, h: &History, step: i32, 
                 hist_truncate_to(h, group_start);
                 return AGENT_PROTO;
             }
+            agent_bound_tool_call(cfg, h, step, &o.calls[ci].id, &o.calls[ci].name, &o.calls[ci].args);
             dispatch_tool_body(cfg, &o.calls[ci].name, &o.calls[ci].args, arena, &res);
             view_end_tool(arena, &o.calls[ci].name, &o.calls[ci].args, &res);
-            agent_log_tool(step, &o.calls[ci].id, &o.calls[ci].name, &o.calls[ci].args, &res);
+            agent_bound_tool_result(cfg, h, step, &o.calls[ci].id, &res);
             if res.len == 0 {
                 // 空结果在线上必须是 "(no output)"（对齐 DSH）
                 _ = buf_append_cstr(&res, "(no output)");
@@ -2723,6 +2936,8 @@ fn agent_turn_loop(cfg: &const Config, h: &History) i32 {
         // 可能是 max-steps 熔断，也可能是协议/工具错
         agent_log_turn_end("error");
     }
+    st_turn_end();
+    agent_stats_sync(cfg, h);
     return rc;
 }
 
@@ -2850,18 +3065,7 @@ fn agent_turn_loop_inner(cfg: &const Config, h: &History) i32 {
         if g_compact_enabled {
             _ = agent_maybe_compact(cfg, h, step, false);
         }
-        if g_sess.save {
-            var sev: Buf = buf_new(96);
-            defer { buf_free(&sev); }
-            if sess_begin(&g_sess, "step/start", &sev) {
-                _ = buf_append_cstr(&sev, "{\"turn\":");
-                _ = buf_append_i64(&sev, g_turn as i64);
-                _ = buf_append_cstr(&sev, ",\"step\":");
-                _ = buf_append_i64(&sev, step as i64);
-                _ = buf_append_cstr(&sev, "}");
-                _ = sess_end(&g_sess, &sev);
-            }
-        }
+        agent_bound_step_start(cfg, h, step);
         if g_interactive {
             // 状态显示走提示符（避免两行光标的复杂度）；子代理面板在提示符上方
             agent_agents_tick();
@@ -2883,12 +3087,14 @@ fn agent_turn_loop_inner(cfg: &const Config, h: &History) i32 {
         var req: Buf = buf_new(need);
         if !buf_valid(&req) {
             out_err("error: out of memory (request)\n");
+            agent_bound_step_end(cfg, h, step);
             return AGENT_PROTO;
         }
         var url: Buf = buf_new(cfg.base_url.len + 24);
         if !buf_valid(&url) {
             buf_free(&req);
             out_err("error: out of memory\n");
+            agent_bound_step_end(cfg, h, step);
             return AGENT_PROTO;
         }
 
@@ -2902,12 +3108,14 @@ fn agent_turn_loop_inner(cfg: &const Config, h: &History) i32 {
                 buf_free(&req);
                 buf_free(&url);
                 out_err("error: out of memory\n");
+                agent_bound_step_end(cfg, h, step);
                 return AGENT_PROTO;
             }
             if !build_model_request(cfg, h, &req, style) {
                 buf_free(&req);
                 buf_free(&url);
                 out_err("error: cannot build request（历史可能过大，试 /compact 或 --context-window）\n");
+                agent_bound_step_end(cfg, h, step);
                 return AGENT_PROTO;
             }
             var status: i32 = 0;
@@ -2926,6 +3134,7 @@ fn agent_turn_loop_inner(cfg: &const Config, h: &History) i32 {
         }
         buf_free(&req);
         buf_free(&url);
+        agent_bound_step_end(cfg, h, step);
         if step_rc == STEP_CONTINUE {
             continue;
         }
@@ -3102,6 +3311,10 @@ export fn hist_trim_incomplete_tail(h: &History) usize {
 
 fn agent_history_begin(cfg: &const Config, h: &History, first: &const Buf) bool {
     fsctx_init(cfg);
+    // 统计是「当前会话」口径：换会话（/new、/resume）先清零，resume 的那一份由
+    // agent_hist_from_log 在扫描日志时重建
+    st_reset();
+    g_ctx_est_at_sample = -1;
     // 导入 DSH 自己的会话（--resume-dsh <id 前缀>）：读它的 jsonl(.zstd) 转成我们的历史，
     // 然后开**我们自己的**会话继续（不写 DSH 的日志）
     if cfg.resume_dsh.len > 0 {
@@ -3165,7 +3378,7 @@ fn agent_history_begin(cfg: &const Config, h: &History, first: &const Buf) bool 
             out_err("\n");
         }
         if found_parent {
-            const n: i32 = agent_hist_from_log(cfg, h, &ppath, &pnext);
+            const n: i32 = agent_hist_from_log(cfg, h, &ppath, &pnext, false);
             if (getenv("UYA_AGENT_DEBUG_SUBAGENT") as usize) != 0 {
                 out_err("[fork] restored=");
                 out_err_dec(n as usize);
@@ -3773,6 +3986,22 @@ fn parse_i32_nonneg(p: &byte, fallback: i32) i32 {
 //   0（也是默认）= 不限步数；正整数 = 熔断上限。
 // 非法值必须告警后再按默认处理 —— 否则 `--max-steps 12x` 这类手误会**静默**变成
 // 「不限步数」，用户以为还有熔断，实际没有。
+// 解析 `COLSxROWS`（--tui-demo 的可选尺寸）。返回 false = 不是这个形状。
+fn parse_size_pair(s: &[byte], cols: &usize, rows: &usize) bool {
+    const at: isize = bufx_find_byte(s, 120, 0);   // 'x'
+    if at <= 0 {
+        return false;
+    }
+    const a: i64 = parse_u64_at(s, 0, at as usize);
+    const b: i64 = parse_u64_at(s, (at as usize) + 1, s.len - (at as usize) - 1);
+    if a < 20 || b < 6 || a > 500 || b > 200 {
+        return false;
+    }
+    cols[0] = a as usize;
+    rows[0] = b as usize;
+    return true;
+}
+
 fn parse_steps_arg(p: &byte, label: &const byte) i32 {
     const n: usize = cstr_len(p);
     var i: usize = 0;
@@ -3889,6 +4118,47 @@ fn agent_repl_help() void {
     tty_puts(&tty_ui, 2, "默认不限步数：回合一直跑到模型给出最终答案；--max-steps N 才有熔断。\n");
 }
 
+// /status 用的占用条宽度（字符格）
+const STATS_BAR_CELLS: i64 = 20;
+
+// /status 的统计 + 上下文 + %cpu 块（TUI 浮层与滚动模式共用）。
+// 注意这里会顺带把增量基准锚一次（agent_ctx_used 的副作用），所以它是「读+顺手校准」。
+fn agent_status_stats_block(cfg: &const Config, h: &const History, out: &Buf) void {
+    _ = buf_append_cstr(out, "--- 统计（整个会话，含 --resume 前的部分）---\n");
+    st_stats_detail(out);
+    var sys_t: i64 = 0;
+    var tools_t: i64 = 0;
+    var msgs_t: i64 = 0;
+    const used: i64 = agent_ctx_used(cfg, h, &sys_t, &tools_t, &msgs_t);
+    _ = buf_append_cstr(out, "--- 上下文（启发式，4 字符 ≈ 1 token）---\n");
+    if used >= 0 {
+        st_ctx_detail(out, used, cfg.context_window, sys_t, tools_t, msgs_t, STATS_BAR_CELLS);
+    } else {
+        _ = buf_append_cstr(out, "上下文已用   还没有可用样本（第一次请求返回后才有）\n");
+    }
+    _ = buf_append_cstr(out, "--- 进程 ---\n%cpu        ");
+    if procx_cpu_pct() >= 0 {
+        _ = buf_append_u64(out, procx_cpu_pct() as u64);
+        _ = buf_append_cstr(out, "%（uya-agent 进程 ");
+        _ = buf_append_u64(out, procx_proc_count() as u64);
+        _ = buf_append_cstr(out, " 个");
+        if procx_last_span_ms() > 0 {
+            _ = buf_append_cstr(out, " · 最近 ");
+            st_fmt_duration(out, procx_last_span_ms());
+            _ = buf_append_cstr(out, " 采样");
+        }
+        _ = buf_append_byte(out, 41);
+    } else if procx_failed() {
+        _ = buf_append_cstr(out, "不可用（读不到 /proc/<pid>/stat）");
+    } else {
+        _ = buf_append_cstr(out, "采样中（全屏 TUI 每 1s 采一次；滚动模式不采样）");
+    }
+    _ = buf_append_byte(out, 10);
+    _ = buf_append_cstr(out, "version    ");
+    _ = buf_append(out, &AGENT_VERSION[0], AGENT_VERSION_LEN);
+    _ = buf_append_byte(out, 10);
+}
+
 fn agent_repl_status(cfg: &const Config, h: &const History) void {
     tty_puts(&tty_ui, 2, "base_url=");
     tty_write(&tty_ui, 2, cfg.base_url.ptr as &const byte, cfg.base_url.len);
@@ -3933,6 +4203,10 @@ fn agent_repl_status(cfg: &const Config, h: &const History) void {
         out_err_dec(g_sess.events);
     }
     tty_puts(&tty_ui, 2, "\n");
+    var blk: Buf = buf_new(4096);
+    defer { buf_free(&blk); }
+    agent_status_stats_block(cfg, h, &blk);
+    tty_write(&tty_ui, 2, blk.ptr as &const byte, blk.len);
 }
 
 // 返回 true = 该退出 REPL
@@ -3972,6 +4246,8 @@ fn agent_repl_command(cfg: &Config, h: &History, line: &const Buf) bool {
         } else {
             tty_puts(&tty_ui, 2, "[compact] 没有可压缩的内容（或摘要请求失败）\n");
         }
+        // 压缩换掉的是历史（表层）→ 上下文占用要立刻跟着降，不必等下一轮请求
+        agent_stats_sync(cfg, h);
         return false;
     }
     if sv_eq_cstr(line, "/plan") {
@@ -3997,6 +4273,7 @@ fn agent_repl_command(cfg: &Config, h: &History, line: &const Buf) bool {
         var none_first: Buf = buf_empty();
         if agent_history_begin(cfg, h, &none_first) {
             tty_puts(&tty_ui, 2, "[session] 已开新会话\n");
+            agent_stats_sync(cfg, h);
         } else {
             tty_puts(&tty_ui, 2, "error: 无法新建会话\n");
         }
@@ -4018,6 +4295,7 @@ fn agent_repl_command(cfg: &Config, h: &History, line: &const Buf) bool {
         var none_first2: Buf = buf_empty();
         if agent_history_begin(cfg, h, &none_first2) {
             tty_puts(&tty_ui, 2, "[session] 已恢复会话\n");
+            agent_stats_sync(cfg, h);
         } else {
             tty_puts(&tty_ui, 2, "error: 无法恢复会话\n");
         }
@@ -4809,6 +5087,13 @@ export fn main() i32 {
             cfg.color_mode = 2;
         } else if arg_eq(p, "--tui-demo") {
             cfg.tui_demo = true;
+            // 可选尺寸：`--tui-demo 100x30`（不给就用 cfg 里的内置画布）
+            if i + 1 < get_argc() {
+                const nx: &byte = get_argv(i + 1);
+                if parse_size_pair(nx[0: cstr_len(nx)], &cfg.tui_cols, &cfg.tui_rows) {
+                    i = i + 1;
+                }
+            }
         } else if arg_eq(p, "--no-shell") {
             cfg.allow_shell = false;
         } else if arg_eq(p, "--no-stream") {
@@ -5036,7 +5321,7 @@ export fn main() i32 {
         return probe_main(&cfg);
     }
     if cfg.tui_demo {
-        return agent_tui_demo(&cfg, 100, 28);
+        return agent_tui_demo(&cfg, cfg.tui_cols, cfg.tui_rows);
     }
     if task_words.len > 0 {
         cfg.task = task_words;
@@ -5057,7 +5342,8 @@ export fn main() i32 {
 // 「把它交出来的提交/中断送回回合循环」。数据流见 README「全屏 TUI」一节。
 // ============================================================
 
-const AGENT_VERSION: [byte: 8] = [112, 49, 55, 45, 116, 117, 105, 0];   // "p17-tui"
+const AGENT_VERSION: [byte: 16] = [112, 49, 56, 45, 115, 116, 97, 116, 115, 0, 0, 0, 0, 0, 0, 0];   // "p18-stats"
+const AGENT_VERSION_LEN: usize = 9;
 
 fn agent_parse_color(p: &byte) u8 {
     // auto / always / never / 16 / 256
@@ -5378,8 +5664,9 @@ fn agent_tui_command(cfg: &Config, h: &History, line: &const Buf) bool {
         } else {
             _ = buf_append_cstr(&items, "no");
         }
-        _ = buf_append_cstr(&items, ")\nversion    p17-tui");
-        tui_overlay_list(TUI_OVK_HELP, "状态（esc 关闭）" as &const byte, 30, items.ptr as &const byte, items.len);
+        _ = buf_append_cstr(&items, ")\n");
+        agent_status_stats_block(cfg, h, &items);
+        tui_overlay_list(TUI_OVK_HELP, "状态（esc 关闭）" as &const byte, 46, items.ptr as &const byte, items.len);
         return false;
     }
     return agent_repl_command(cfg, h, line);
@@ -5471,7 +5758,7 @@ fn agent_tui_start(cfg: &const Config) bool {
     agent_provider_short(cfg, &prov);
     var ver: Buf = buf_empty();
     tui_state_init(cfg.model.ptr as &const byte, cfg.model.len, prov.ptr as &const byte, prov.len,
-        &AGENT_VERSION[0], 7);
+        &AGENT_VERSION[0], AGENT_VERSION_LEN);
     // cwd / HOME / 分支
     var home: Buf = env_or("HOME" as &const byte, "" as &const byte);
     defer { buf_free(&home); }
@@ -5704,12 +5991,47 @@ fn agent_tui_dump(cols: usize, rows: usize) void {
     out_bytes(out.ptr as &const byte, out.len);
 }
 
+// --tui-demo 用的统计 fixture：数字刻意选成 DSH 截图那一行
+// （1 轮 · 12 步 | LLM 50.7s · 工具调用 4.1s | 首 token 平均 1.5s · 221 tok/s |
+//   缓存命中 71% | 输入 238K tok · 输出 12K tok），并且**全部经真实边界喂入**，
+// 所以它同时是折叠的一次端到端演练；自测 `stats-line` 直接复用它。
+fn agent_stats_fixture_demo() void {
+    st_reset();
+    // 步 1..10：只有 llm 时间（没有首 token、不进 ttft/解码），各带 979 个输出 token
+    // —— 这些 token 进「输出 12K」但不进 tok/s（DSH 的 tokenUsage 与 decode 是两个口径）
+    var t: i64 = 0;
+    var i: i64 = 1;
+    while i <= 10 {
+        st_step_start(1, i, t as u64);
+        st_assistant_message(1, i, (t + 3770) as u64, 0, 0, 0, 979);
+        t = t + 3770;
+        i = i + 1;
+    }
+    // 步 11：llm 5.2s（ttft 1.2s / 解码 4.0s）+ 一次工具调用 4.1s
+    st_step_start(1, 11, t as u64);
+    st_first_token(1, 11, (t + 1200) as u64);
+    st_assistant_message(1, 11, (t + 5200) as u64, 0, 0, 0, 1000);
+    st_tool_call("call_demo_1" as &const byte, 11, (t + 5200) as u64);
+    st_tool_result("call_demo_1" as &const byte, 11, (t + 9300) as u64);
+    // 步 12：llm 7.8s（ttft 1.8s / 解码 6.0s），压力样本落在这一步：
+    // 未缓存 69K + 缓存读 169K = 计费输入 238K → 缓存命中 71%
+    const t12: i64 = t + 9300;
+    st_step_start(1, 12, t12 as u64);
+    st_first_token(1, 12, (t12 + 1800) as u64);
+    st_assistant_message(1, 12, (t12 + 7800) as u64, 69000, 169000, 0, 1210);
+    i = 1;
+    while i <= 12 {
+        st_step_end(1, i);
+        i = i + 1;
+    }
+}
+
 fn agent_tui_demo(cfg: &const Config, cols: usize, rows: usize) i32 {
     var prov: Buf = buf_new(32);
     defer { buf_free(&prov); }
     agent_provider_short(cfg, &prov);
     tui_state_init(cfg.model.ptr as &const byte, cfg.model.len, prov.ptr as &const byte, prov.len,
-        &AGENT_VERSION[0], 7);
+        &AGENT_VERSION[0], AGENT_VERSION_LEN);
     var home: Buf = env_or("HOME" as &const byte, "" as &const byte);
     defer { buf_free(&home); }
     tui_set_cwd(cfg.workspace.ptr as &const byte, cfg.workspace.len, home.ptr as &const byte, home.len);
@@ -5720,20 +6042,25 @@ fn agent_tui_demo(cfg: &const Config, cols: usize, rows: usize) i32 {
     tui_set_color(agent_color_on(cfg), agent_color_256(cfg));
     tui_set_commands("" as &const byte, 0);
 
-    // ① 空态（logo + 居中面板）
-    tui_set_usage(0, 0, -1);
+    // ① 空态（logo + 居中面板）：还没有步数 → 右半区退回版本号，左半区只有 cwd
+    tui_set_stats("" as &const byte, 0);
+    tui_set_ctx(-1);
+    tui_set_cpu(-1);
     tui_set_plan(false);
     tui_set_run(TUI_RUN_IDLE, "" as &const byte, 0);
-    tui_build();
-    var out: Buf = buf_new(65536);
-    defer { buf_free(&out); }
-    _ = tui_screen_text(&out);
-    out_bytes(out.ptr as &const byte, out.len);
+    // 空态也用同一个画布（早期实现没设尺寸，空态快照一直是 80×24 的默认值）
+    agent_tui_dump(cols, rows);
 
     // ② 对话态
     tui_add_user("把 hello.uya 的问候语改成 Hello, DSH!" as &const byte,
         bufx_cstr_len("把 hello.uya 的问候语改成 Hello, DSH!" as &const byte));
-    tui_set_usage(8100, 402, 21);
+    agent_stats_fixture_demo();
+    var sline: Buf = buf_new(512);
+    defer { buf_free(&sline); }
+    _ = st_line(&sline);
+    tui_set_stats(sline.ptr as &const byte, sline.len);
+    tui_set_ctx(21);
+    tui_set_cpu(37);
 
     // 再给一份带转录的（模拟真实一轮的形状）
     tui_sink_bytes(1, "我先读一下文件，再改一行，顺手跑一次编译：\n" as &const byte, bufx_cstr_len("我先读一下文件，再改一行，顺手跑一次编译：\n" as &const byte));

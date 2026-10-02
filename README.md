@@ -1,7 +1,7 @@
 # uya-agent — 纯 Uya 写的极简 CLI 编程 agent
 
 一个**只用 Uya 源码**实现的命令行编程 agent：给它一句话任务，它自己看文件、改文件、跑命令，
-多轮 loop 直到给出结论。全部代码 32 个 `.uya` 文件，**不引入任何 C 代码、`@c_import` 或其它语言**，
+多轮 loop 直到给出结论。全部代码 34 个 `.uya` 文件，**不引入任何 C 代码、`@c_import` 或其它语言**，
 只依赖 Uya 语言与随编译器分发的标准库。
 
 **P0–P16 全部完成**（P15 这个编号被两条并行线各用过一次：一条是「请求体控制字节全转义 +
@@ -40,6 +40,12 @@ tool 结果超 8192 码点自动剪枝，压力超过窗口 80% 时自动压缩�
 **P15 给子代理加了窗口面板**：输入行上方常驻一块带边框的窗口区，每个运行中的子代理 2 行
 （命令行 + 状态行，含**实时秒数**与已收输出行数），最多显示最后 4 个，跑完立刻收掉并在滚动区
 补一行结算通知；边框按显示列逐行补满，自测对每一行断言「列数完全相等」。
+**P17 把交互界面做成全屏 TUI**（对齐 opencode 的观感：块字 logo、贴底输入面板、转录贴面板、
+逐行 diff 重绘、备用屏幕；`--no-tui` 退回滚动转录）。**P18 给脚注加上 DSH 那一行统计**：
+`轮/步 · LLM/工具耗时 · 首 token 平均/tok-s · 缓存命中 · 输入/输出 tok` 全部从**会话日志**折叠
+（`--resume` 后仍逐字节相同），左边再挂上下文占用（`ctx`，DSH `contextPressure` 的口径）与
+**全部 uya-agent 进程**的综合 CPU（`%cpu`，`/proc` + `USER_HZ` 口径）；终端放不下就从尾部丢组，
+明细进 `/status`。
 `--no-stream` / `--compat-fold` 保留两条回退路径。
 
 ```
@@ -183,7 +189,8 @@ src/tui.uya       全屏 TUI（P17）：帧模型（行=段序列，逐行 diff 
                   多行、历史、括起粘贴）、键解码（分片转义序列）、浮层（命令面板/会话/帮助/问答）、
                   sink 通道与清洗、滚动与尾随、帧节流
 src/sigselftest.uya 信号层的自测轮次（sig-abi / sig-basic / sig-term-restore / sig-child-reset）
-src/tuiselftest.uya TUI 的自测轮次（tui-frame / tui-keys / tui-sink / tui-turn / tui-pty）
+src/tuiselftest.uya TUI 的自测轮次（tui-frame / tui-keys / tui-sink / tui-turn / tui-pty；
+                  P18 起 tui-frame 还断言脚注统计行在四种宽度下的退化）
 src/inbox.uya     输入收件箱：steer（运行中输入的文本，step 边界领取）+ keepInbox 语义
 src/yamlcfg.uya   自带 YAML 子集解析器：去注释（块标量/引号感知）、中和 `!!tag`、
                   block/flow 映射与序列、`|`/`>` 块标量、跨行 flow 集合、节点池树 + 导航
@@ -222,6 +229,16 @@ src/plan.uya      plan 模式状态机 + exit_plan_mode（非 plan 模式报错�
 src/askuser.uya   ask_user_question：交互模式复用行编辑器，非交互读一行，EOF 时回「无回答」
 src/session.uya   会话日志：路径规范化、id 生成（/dev/urandom→uuid）、header/事件序列化与追加写、
                   索引、读取与崩溃尾部裁剪、按 id/最近查找、括号配平的数组提取
+src/stats.uya     会话统计折叠（P18）：逐行对照 DSH 的 `sessionStats` + `tokenUsage` ——
+                  step/start→assistant/message 的 llmMs、首个非空正文 delta→消息组装的 ttft 与
+                  解码时长/token、tool/call→tool/result 按 callId 配对、step/end 计步
+                  （turns 只在该 turn 首次出现时 +1）、未结算调用在 turn/end 丢弃；
+                  上下文占用与三段启发式（contextPressure / contextBreakdown 的等价物）；
+                  渲染逐字对照 DSH Web 的 `StatsLine`（formatDuration / formatTokens /
+                  formatTokensPerSecond / cacheHitPercent，含「有 miss 时不写 100%」的精度阶梯）
+src/procx.uya     进程 CPU 采样（P18）：扫 /proc，取 comm 与本进程相同的**所有**进程的
+                  utime+stime（不取 cutime/cstime，避免父子双计），USER_HZ = 100、
+                  pct = Δticks×1000/Δms（单核口径，可 > 100%），1 秒一次、挂在 TUI 心跳上
 src/diffx.uya     行级 diff（只服务显示）：公共整行前后缀裁剪 → LCS DP（60×60 上限）→
                   行列截断 + 头截断；全局暂存最近一次变更，view 层 take 走
                   （P16 起正文默认关闭，它只喂 `· +A -D` / `· replaced` 这两个后缀；
@@ -236,7 +253,7 @@ src/agent.uya     CLI、环境变量、消息历史、请求组装、主循环�
                   `assistant/reasoning`（思考全文，P16）；P17 再加 `agent_run_tui` /
                   `agent_run_tui_body`（全屏 TUI 主循环，headless 与真终端共用）
 src/selftest.uya  --selftest 的 mock LLM（含 SSE 受控切分）+ 33 轮断言 + --probe
-                  （P17 又加了源文件里的 4 轮信号 + 5 轮 TUI，见 §6）
+                  （P17 又加了源文件里的 4 轮信号 + 5 轮 TUI，P18 再加 9 轮统计/进程 CPU，见 §6）
 ```
 
 > 两处已知死代码（P14 未清理，改别的东西时别被它们误导）：`src/tools.uya`（P0 的
@@ -628,7 +645,7 @@ TTY 交互模式**默认全屏**（`--no-tui` 退回上一节的滚动转录；�
 
   ▌ ↑ Ask anything... "把 hello.uya 的问候语改成 Hello, DSH!"
   ▌ Build   deepseek-chat   deepseek               tab plan   ctrl+p commands
-  ~/uya-agent:main                                          in 8.1k · out 402 · p17-tui
+  ~/uya-agent:main                                                                 p18-stats
 ```
 
 对话态（`--tui-demo` 打印的就是这两屏的纯文本快照）：
@@ -647,12 +664,13 @@ TTY 交互模式**默认全屏**（`--no-tui` 退回上一节的滚动转录；�
   ⠹ Bash(make check) · esc 中断      ← 运行中状态是转录最后一行（不是独立状态栏）
   ▌ ❯ 顺便把 Makefile 的注释补一下_  ← 输入面板（左边缘强调竖条）
   ▌ Build   deepseek-chat   deepseek               tab plan   ctrl+p commands
-  ~/uya-agent:main                              in 8.1k · out 402 · ctx 21% · p17-tui
+  ~/uya-agent:main · ctx 21% · %cpu 37%    1 轮 · 12 步 | LLM 50.7s · 工具调用 4.1s | 首 token 平均 1.5s | 221 tok/s | 缓存命中 71% | 输入 238K tok · 输出 12K tok
 ```
 
 * **开关**：`--tui`（默认）/ `--no-tui` / `UYA_AGENT_TUI=0|1`；
   `--color=auto|always|never|16|256` 与 `NO_COLOR`（无色时只留粗体/暗色）；
-  `--tui-demo [COLSxROWS]` 打印 home/chat 两屏纯文本（诊断 + 文档）。
+  `--tui-demo [COLSxROWS]` 打印 home/chat 两屏纯文本（诊断 + 文档；默认画布 160×40，
+  窄终端可以 `--tui-demo 100x30` 看脚注的退化形态）。
 * **键位**：`enter` 发送 · `ctrl+j` / `alt+enter` 换行 · `esc` 运行中=中断、空闲=清行 ·
   `ctrl+c` 运行中=中断、空闲=清空/两次退出 · `ctrl+d` 空行退出 · `↑/↓` 单行=历史、
   多行=上下移光标 · `pgup/pgdn`、`ctrl+home/end` 滚转录 · `tab` 切计划模式（面板显示 `Plan`）·
@@ -681,6 +699,83 @@ TTY 交互模式**默认全屏**（`--no-tui` 退回上一节的滚动转录；�
   思考条目只留尾部 4 KiB（与 P15/P16 的「思考行只显示最新一段」同口径）。
 * 仍不做：鼠标（滚轮/点击/选择）、图片、可折叠卡片、完整语法高亮（只做轻量 markdown）、
   分屏、主题切换 UI。
+
+### 统计行、上下文占用与 %cpu（P18，对齐 DSH 的统计条 + 占用表 + 自定义的进程 CPU）
+
+脚注那一行分两半：左边是**状态字段**（`ctx` 上下文占用、`%cpu` 全部 uya-agent 进程的综合
+CPU），右边是**整会话统计行** —— 逐字对齐 DSH Web 聊天统计条那一行：
+
+```
+  ~/uya-agent:main · ctx 21% · %cpu 37%
+      1 轮 · 12 步 | LLM 50.7s · 工具调用 4.1s | 首 token 平均 1.5s | 221 tok/s | 缓存命中 71% | 输入 238K tok · 输出 12K tok
+```
+
+（真实渲染是同一行：状态字段紧跟 cwd，统计行右对齐到终端右边；窄终端见下面的退化规则。）
+
+* **数字是整会话口径**：折叠的输入是**会话日志**（`step/start|end`、`assistant/first-token`、
+  `assistant/message` 的 usage、`tool/call`→`tool/result` 配对、`turn/end`），所以压缩换掉历史
+  也不改变它；`--resume` 时把日志逐行喂进**同一份状态机**，恢复前后的数字与整条统计行
+  **逐字节相同**（`stats-log` 轮钉这条：实时折叠 vs 日志回放）。渲染规则、字段判据、取整方式
+  逐行对照 DSH 的 `dsh-session-stats`（`sessionStats`）与 Web 客户端的 `StatsLine`：
+
+  | 组 | 内容 | 出现条件 |
+  |---|---|---|
+  | 1 | `{turns} 轮 · {steps} 步` | `steps > 0` |
+  | 2 | `LLM {d}` · `工具调用 {d}` | 同上；各自时长 > 0 |
+  | 3 | `首 token 平均 {d}` · `{tps} tok/s` | 同上；`ttftSteps > 0` / `decodeMs > 0` |
+  | 4 | `缓存命中 {p}%` | 计费输入 > 0 |
+  | 5 | `输入 {n} tok · 输出 {n} tok` | 计费输入 > 0 或输出 > 0 |
+
+  组间 ` | `、组内 ` · `；时长 < 60s 一位小数（`50.7s`），否则 `2m42s`；token
+  `999 / 12.2K / 238K / 1.2M`；tok/s ≥ 10 取整；缓存命中是整数百分比、**全命中才是 100**，
+  有 miss 时按 DSH 的最小精度阶梯打 `99.9…x`（不把 99.96% 说成 100%）。合计 `billedInput
+  = 未缓存输入 + 缓存读 + 缓存写`，解码只用「既报了输出 token 又有首 token」的步。
+* **边界语义（都按 DSH）**：`steps` 数的是**进过的步**（失败/取消/max-tokens 都算 —— 回合
+  循环里每个出口都必须补 `step/end`，这是硬约束）；被取消的步**计数但不计时**；`turns` 只在
+  该 turn 首次出现时 +1；`tool/call` 在**派发前**落盘、`tool/result` 在其后（早期实现是执行
+  完再背靠背写两条，时间差恒为 0）；未结算的调用在 `turn/end` 丢弃；TTFT 是 `step/start`
+  → 首个非空正文 delta，用新事件 `assistant/first-token` 记那一刻（事件在流结束后才补写，
+  所以时间用 `sess_begin_at` 钉死，不能用写盘时的 `ua_now_ms()`）；解码是首 token → 消息组装。
+* **偏差（明写）**：输出 token「未上报」与「上报 0」在日志里不可区分，所以只有 `> 0` 才进
+  解码与 tok/s；非流式（`--no-stream`）没有 delta 边界 → 第 3 组自然隐藏（DSH 也只认 chunk）；
+  `--resume-dsh` 导入的 DSH 会话不折叠（那份日志的事件形状不同），统计从 0 开始。
+* **上下文占用**（`ctx N%`）：DSH `contextPressure` 的等价物 —— `used = 最近一次请求的
+  prompt 规模（未缓存 + 缓存读 + 缓存写，来自 `assistant/message` 的 usage；`--resume` 后从
+  日志取）+ 自取样以来表层的启发式增量`，`percent = min(100, round(used / contextWindow × 100))`；
+  **两者缺一就不显示**（还没请求过、或 DSH 设置里没有模型容量）。压缩之后 `used` 立刻跟着
+  表层估算下降，不必等下一轮请求。`/status` 里有 DSH 点击面板的终端等价物：`上下文已用 46%`
+  + `~238K / 517K` + 20 格分段条（`█▓▒` 三段 + `░` 轨道）+ `系统提示词 / 工具 / 对话消息`
+  三行明细 —— 明细是固定的 `4 字符 ≈ 1 token` 启发式（与 `agent_pressure_tokens` 同口径），
+  **三项之和不等于总量**，DSH 也是这么标注的。
+* **%cpu**：机器上**所有** comm 与本进程相同的进程（本进程 + 子代理进程 + 其它终端/工作区里
+  的实例）的**综合** CPU 使用率，单核口径（并行时 > 100%，显示钳 0…999；不按核数归一）。
+  取值是 `/proc/<pid>/stat` 的 `utime + stime`（**不取** cutime/cstime —— 父子同为我们时
+  取子进程累计会把同一份 CPU 时间算两遍），单位 `USER_HZ = 100` 是常数而不是 sysconf 读数
+  （Linux 对所有架构固定，`cpu-live` 轮用忙循环子进程钉死它）；`pct = Δticks × 1000 / Δms`，
+  两次采样之间按**墙上时间**算，所以事件循环被长任务占住也不影响准确度。采样挂在 TUI 的
+  心跳（`tui_tick` → `procx_tick`，所有长循环都经过它）上：**1 秒一次、只在 TUI 活跃时**，
+  第一次只建基线；`/proc` 读不到 → 字段直接省略（`/status` 会说明原因）。滚动模式
+  （`--no-tui`）不采样也不显示。
+* **退化规则**：统计行按 `" | "` 拆组、从**尾部**丢组并补 `…`（等价于 DSH 的整行省略号）；
+  `ctx` / `%cpu` 在左半区**不参与丢组**；cwd 是唯一的弹性字段（先满足状态字段与统计行，
+  不够 8 列就整段丢）；右半区连一组都放不下（< 16 列）时退回版本号。终端没有 hover，
+  所以 DSH 的 tooltip 位置由 `/status` 顶替（那里有完整明细）。各种宽度的实际形态：
+
+（下面是 `--tui-demo` 在六种画布下的真实脚注，cwd 换成了短路径以便阅读）
+
+```
+160 列：~/uya-agent:main · ctx 21% · %cpu 37%   1 轮 · 12 步 | LLM 50.7s · 工具调用 4.1s | 首 token 平均 1.5s | 221 tok/s | 缓存命中 71% | 输入 238K tok · 输出 12K tok
+120 列：~/uya-agent:main · ctx 21% · %cpu 37%   1 轮 · 12 步 | LLM 50.7s · 工具调用 4.1s | 首 token 平均 1.5s · 221 tok/s…
+100 列：~/uya-agent:main · ctx 21% · %cpu 37%   1 轮 · 12 步 | LLM 50.7s · 工具调用 4.1s…
+ 80 列：~/uya-agent:main · ctx 21% · %cpu 37%   1 轮 · 12 步 | LLM 50.7s · 工具调用 4.1s…
+ 60 列：~/uya-agent:main · ctx 21% · %cpu 37%   1 轮 · 12 步…
+ 40 列：~/uya-agent/… · ctx 21% · %cpu 37%      ← 统计行整条让位（右半区不足 16 列），
+                                                  版本号也放不下就只剩状态字段
+```
+
+* **落地位置**：折叠与格式化在 `src/stats.uya`，进程采样在 `src/procx.uya`，脚注排版在
+  `tui.uya`，边界喂养在 `agent.uya` 的 `agent_bound_*`（同一个毫秒值既进日志又进折叠，
+  所以「实时」与「回放」对得上）。
 
 ### 流式协议要点（P1）
 
@@ -1050,10 +1145,19 @@ agent 循环并逐项断言：
 | `stream-length` | `finish_reason=length` → max-tokens，reasoning 正常累积 |
 | `steer` | 回合运行中输入的文本，必须在**下一个 step 的请求**里出现（mock 断言 `STEER-MARKER`） |
 | `interrupt` | 预置 Ctrl-C：回合以 `AGENT_INTERRUPTED` 结束、工具**未派发**、只发生一次请求 |
-| `tui-frame` | 四种尺寸（40×10 / 80×24 / 100×28 / 120×40）下「每行显示列 ≤ cols」「正文层里没有 ESC」；空态整体居中（首行留白 + 块字 logo + 面板 + 脚注 `~/cwd:branch`）、窄终端 logo 退化成单行标题；对话态底对齐 + 面板贴底；工具块/diff/思考/诊断/用户条目都在；跑满一屏后跟随尾部、PgUp/PgDn 夹取、回尾清零 |
+| `tui-frame` | 四种尺寸（40×10 / 80×24 / 100×28 / 120×40）下「每行显示列 ≤ cols」「正文层里没有 ESC」；空态整体居中（首行留白 + 块字 logo + 面板 + 脚注 `~/cwd:branch`）、窄终端 logo 退化成单行标题；对话态底对齐 + 面板贴底；工具块/diff/思考/诊断/用户条目都在；跑满一屏后跟随尾部、PgUp/PgDn 夹取、回尾清零；**P18 脚注**：160 列放下整条统计行、120 列按组丢尾部并补 `…`、40 列统计行整条让位（退回版本号），而 `ctx` / `%cpu` 三种宽度下都必须在 |
 | `tui-keys` | UTF-8 逐字符编辑（退格不砍半个汉字、←/→ 停在字符边界）、**被切开的 `ESC [ D`** 正确组装、Ctrl-J 换行与多行光标移动、回车提交（内容 + 清空 + 进历史）、↑ 取历史、运行中 esc = 中断 / 空闲 esc = 清行、tab 切计划模式（面板显示 Plan）、`/` 自动开命令面板并选中第二项、Ctrl-D 空行退出 |
 | `tui-sink` | TUI 激活后 `tty_write(1/2)` 与 `tty_reason_write` 的字节分别落到 助手/工具/思考 条目；NUL/`ESC[2J`/TAB 被清洗且正文层无 ESC；关掉 sink 后写入回到真实 fd |
-| `tui-turn` | headless 端到端（mock LLM，复用手打路径注入「任务+回车」）：屏幕里出现用户条目、`✓ Write(note.txt)`、`✓ Bash(`、最终答案；回合结束状态回 idle；fd 1 无输出 |
+| `tui-turn` | headless 端到端（mock LLM，复用手打路径注入「任务+回车」）：屏幕里出现用户条目、`✓ Write(note.txt)`、`✓ Bash(`、最终答案；回合结束状态回 idle；**P18：脚注里必须出现 `1 轮 · ` 与 `工具调用 `**（真实测量的 llm/工具耗时进了界面）；fd 1 无输出 |
+| `stats-format` | 纯函数逐字节：duration（`0s`/`0.4s`/`12s`/`50.7s`/`59.9s`/`1m0s`/`2m42s`/`60m0s` + 平均值口径不被整数截断 + 除零保护）、tokens（`999`/`1K`/`12.2K`/`238K`/`517K`/`1000K`/`1M`/`1.2M`/负数按 0）、tok/s（`0.4`/`9.9`/`9.94→9.9`/`221`/`994`/无时长）、缓存命中（无计费输入 → 不显示、`0`/`50`/12.5%→13%（ties 向上）/71%/全命中 `100`/999/1000→`99.9`/99.9579%→`99.96`，全部按 DSH 的取整规则） |
+| `stats-line` | 整行逐字节：demo fixture = DSH 截图那一行（`1 轮 · 12 步 \| LLM 50.7s · 工具调用 4.1s \| 首 token 平均 1.5s · 221 tok/s \| 缓存命中 71% \| 输入 238K tok · 输出 12K tok`）+ 四种判据（只有步数 / 只有 usage / 两步其一被取消 / 只有首 token / 工具+解码同时出现） |
+| `stats-fold` | 同一批边界「实时喂」与「日志逐行回放」的 11 个字段签名必须逐字节相同；再钉边界语义：孤儿 `tool/result` 不计时、未结算调用在 `turn/end` 丢弃、被取消的步只计数不计时、`turn/step` 不匹配时不计时但 token 照记、没上报输出 token 时不记解码、同一 turn 多步只算一轮、重复 callId 取最后一次并只结算一次 |
+| `stats-context` | 占用率（容量未知/分子未知 → 不可用、四舍五入、12.5%→13%、超容量夹 100）、`projectedTokens`（样本 + 增量、钳 0、无锚点时只用样本）、`~已用 / 容量` 与 `未知容量` 写法、`/status` 的上下文块逐字节（含 20 格分段条：三段比例切分、无明细时单段、容量未知时不给百分比与条）、统计明细块（空状态的省缺写法） |
+| `stats-usage` | 端到端一轮（mock 的答案帧带 usage，**只给这一轮开** —— 打开 usage 会让 `prompt_tokens` 从估算变成读数，进而改变自动压缩的触发时机，其它轮保持原样）：回合正常结束 |
+| `stats-log` | 就着 `stats-usage` 那一轮的会话日志：`step/start` 与 `step/end` 必须成对、`tool/result` 不早于 `tool/call`、日志里的步数/首 token 条数/工具时间差之和与实时折叠的数字**逐个相等**；再把整份日志回放一遍（`--resume` 走的就是这条路），统计行与全部字段必须与实时**逐字节相同** |
+| `procx-parse` | `/proc/<pid>/stat` 解析：comm 取**第一个 `(` 到最后一个 `)`**（comm 里允许空格与括号）、utime/stime 是 `)` 之后第 12/13 个字段、`|` 后的 cutime/cstime 必须忽略、state 是字母（`S`/`D`）时能跳过；坏行（无括号 / 无右括号 / 缺 stime / utime 非数字）必须失败；`/proc` 目录项名过滤（纯数字才算 pid，`self`/`.`/`..`/11 位不算） |
+| `procx-percent` | `Δticks × 1000 / Δms`：0 / 37 / 100（一个核）/ 250（并行 > 100%）/ 0.5% 向上取整 / `Δms=0` 不可算 / 负增量按 0 / 上限钳 999；`USER_HZ = 100` 常量 |
+| `cpu-live` | fork 一个忙循环 400ms 的子进程（同一个二进制 → comm 相同），父进程睡 450ms 后两次采样：进程数必须涨、综合 `%cpu ≥ 25`、有时间跨度；只建基线的那次必须不给百分比（防除零爆表） |
 | `tui-pty` | **真 PTY**（`/dev/ptmx` + `fork` + `dup2(slave→0/1/2)`）：进备用屏幕（`ESC[?1049h`）、首屏面板/logo、发任务后转录出现 mock 最终答案、`SIGWINCH`（改 winsize + 发信号）后进程仍活着并继续重绘、Ctrl-D 退出码 0、退出后 `TCGETS` 与 fork 前**逐位相同**、离开备用屏幕；不需要 setsid/TIOCSCTTY（fd 0 就是 pts 从设备，Ctrl-C 由程序自己吃字节） |
 | `sig-abi` | `SigxAction` 必须是**宿主 glibc** 布局（152 字节；handler@0 / flags@136 / restorer@144，按字节回读）；恢复序列逐字节（带备用屏幕 26 字节 / 不带 18 字节） |
 | `sig-basic` | 处理器装上以后真的被调用、返回以后进程还活着（P0 的回归闸门：缺 `SA_RESTORER` 的实现在这里直接 139）；`SIGWINCH` 处理器只置标志、取用即清零 |
@@ -1310,6 +1414,13 @@ mock 上逐字段验收。换一台 `openai-responses` 网关可用时，零参�
 * TUI 不做鼠标（滚轮/点击/选择）、图片、可折叠卡片、分屏、主题切换 UI；`--resume` 只回填
   最近 200 条历史（注入类消息不回填），`--resume-dsh` 走同一条回填路径。
 * 终端小于 32×8 时自动退回滚动模式；`cols < 66` 时块字 logo 退化成一行标题。
+* 统计（P18）是**整会话**口径、只认我们自己的会话日志：`--resume-dsh` 导入的 DSH 会话不计入
+  （从 0 开始）；输出 token「没上报」与「上报 0」在日志里分不开，所以只有 `> 0` 才进 tok/s；
+  非流式（`--no-stream`）没有首 token 边界 → 那一组不显示。上下文的三段明细是
+  「4 字符 ≈ 1 token」的启发式，三项加起来不等于总量（DSH 也是这个性质）。
+* `%cpu` 只在全屏 TUI 里采样（挂在 TUI 心跳上，1 秒一次；滚动模式不采样），统计的是**机器上
+  所有同名进程**（含别的终端/工作区里的实例），不是本会话进程树；单核口径，多进程并行时可以
+  > 100%。`/proc` 不可读时该字段直接省略。
 * `SIGKILL` 之后终端仍可能停在备用屏幕（不可捕获），用 `reset` / `stty sane` 恢复。
 * P16 起滚动模式下每次工具调用只有一行（正文要看就得 `--tool-lines N`，即 DSH 卡片的
   「展开」在终端里是显式开关），思考同理：**非交互（管道）下没有实时行**，只有块结束时落的
