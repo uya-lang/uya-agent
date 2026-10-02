@@ -103,6 +103,12 @@ export struct Config {
     deleg_depth: i32,         // 派生深度（父 + 1）
     parent_session: Buf,      // 父会话 id
     deleg_label: Buf,         // 显示用标签（description）
+    // 父进程**预先**为子代理指定的会话 id（NUL 结尾的 C 字符串）。
+    // 为什么要有它：父进程 spawn 之后要拿子会话 id 才能 send_message 续跑，
+    // 但子进程是 fork 出来的、id 由子进程自己生成，父进程无从得知（原实现里
+    // d.sid 永远是空的 → 续跑其实每次都新开一个会话、上下文全丢）。
+    // 由父进程先生成 id、传给子进程用，父子就天然对上了。
+    force_session_id: Buf,
 }
 
 fn cfg_default() Config {
@@ -175,6 +181,7 @@ fn cfg_default() Config {
         deleg_depth: 0,
         parent_session: buf_empty(),
         deleg_label: buf_empty(),
+        force_session_id: buf_empty(),
     };
 }
 
@@ -190,6 +197,7 @@ fn cfg_free(c: &Config) void {
     buf_free(&c.fork_from);
     buf_free(&c.parent_session);
     buf_free(&c.deleg_label);
+    buf_free(&c.force_session_id);
     buf_free(&c.base_url);
     buf_free(&c.model);
     buf_free(&c.api_key);
@@ -1365,6 +1373,10 @@ fn agent_log_delegation(cfg: &const Config) void {
 
 // 只**新建**自己的会话日志（不恢复任何历史）；fork 出来的子代理用它
 fn agent_session_create(cfg: &const Config) bool {
+    // 必须在 sess_open **之前**把深度交给 SessionLog：header 是在 sess_open 里写的，
+    // 而 agent_log_delegation（原来唯一设置它的地方）在 agent_hist_init 里跑得更晚，
+    // 于是子代理会话 header 的 delegationDepth 一直是 0（靠 header 判断子会话的地方会认错）。
+    g_sess.deleg_depth = cfg.deleg_depth;
     var home: Buf = buf_new(1024);
     defer { buf_free(&home); }
     if !agent_default_home(cfg, &home) {
@@ -1384,13 +1396,23 @@ fn agent_session_create(cfg: &const Config) bool {
     _ = buf_append(&modelz, cfg.model.ptr, cfg.model.len);
     _ = buf_append_byte(&modelz, 0);
     var empty: [byte: 1] = [0];
+    // fork 出来的子代理也用父进程预指定的会话 id（否则父进程拿不到 d.sid，无法续跑）
+    var wantf: Buf = buf_empty();
+    defer { buf_free(&wantf); }
+    if cfg.force_session_id.len > 0 {
+        wantf = buf_new(cfg.force_session_id.len + 1);
+        if buf_valid(&wantf) {
+            _ = buf_append(&wantf, cfg.force_session_id.ptr, cfg.force_session_id.len);
+            _ = buf_append_byte(&wantf, 0);
+        }
+    }
     return sess_open(
         &g_sess,
         hz.ptr as &const byte,
         cwdz.ptr as &const byte,
         modelz.ptr as &const byte,
         "uya-agent",
-        &empty[0] as &const byte,
+        if wantf.len > 0 { wantf.ptr as &const byte } else { &empty[0] as &const byte },
         cfg.save_session,
         0,
         true
@@ -1398,6 +1420,8 @@ fn agent_session_create(cfg: &const Config) bool {
 }
 
 export fn agent_session_open(cfg: &const Config, h: &History, resume_path: &const Buf) bool {
+    // 同 agent_session_create：header 由 sess_open 写，深度必须在它之前落进 g_sess
+    g_sess.deleg_depth = cfg.deleg_depth;
     var home: Buf = buf_new(1024);
     defer { buf_free(&home); }
     if !agent_default_home(cfg, &home) {
@@ -1411,23 +1435,56 @@ export fn agent_session_open(cfg: &const Config, h: &History, resume_path: &cons
 
     var id: Buf = buf_new(64);
     defer { buf_free(&id); }
+    var rpath: Buf = buf_empty();       // 要恢复的会话文件路径（空 = 新建）
+    defer { buf_free(&rpath); }
     var resumed: bool = false;
     if resume_path.len > 0 {
-        // 已解析出路径：从 header 里取 id
-        var r0: SessReader = sess_reader_empty();
-        defer { sess_reader_free(&r0); }
-        var pz: Buf = buf_new(resume_path.len + 1);
-        defer { buf_free(&pz); }
-        _ = buf_append(&pz, resume_path.ptr, resume_path.len);
-        _ = buf_append_byte(&pz, 0);
-        if sess_read_header(pz.ptr as &const byte, &r0) {
-            _ = buf_append(&id, r0.id.ptr, r0.id.len);
-            resumed = true;
+        // 已解析出路径（--resume/--continue 或 fork 的父会话）：从 header 里取 id
+        if buf_append(&rpath, resume_path.ptr, resume_path.len) {
+            var r0: SessReader = sess_reader_empty();
+            defer { sess_reader_free(&r0); }
+            var pz: Buf = buf_new(resume_path.len + 1);
+            defer { buf_free(&pz); }
+            _ = buf_append(&pz, resume_path.ptr, resume_path.len);
+            _ = buf_append_byte(&pz, 0);
+            if sess_read_header(pz.ptr as &const byte, &r0) {
+                _ = buf_append(&id, r0.id.ptr, r0.id.len);
+                resumed = true;
+            }
+        }
+    } else if cfg.force_session_id.len > 0 {
+        // 父进程**预先**给这个子代理指定了会话 id（deleg_spawn 里约定）：
+        //   * 该 id 的日志已存在 → 这是 send_message 续跑，恢复历史继续写同一个日志；
+        //   * 不存在 → 这是首次派生，就用这个 id 新建（父进程因此知道 d.sid）。
+        // 原实现把会话 id 交给子进程随机生成，父进程无从得知 → d.sid 恒空 →
+        // send_message 每次都新开会话，续跑时上下文全丢（实测确认）。
+        var cwdz0: Buf = buf_new(cfg.workspace.len + 1);
+        defer { buf_free(&cwdz0); }
+        _ = buf_append(&cwdz0, cfg.workspace.ptr, cfg.workspace.len);
+        _ = buf_append_byte(&cwdz0, 0);
+        var found: Buf = buf_empty();
+        defer { buf_free(&found); }
+        if sess_find(hz.ptr as &const byte, cwdz0.ptr as &const byte, cfg.force_session_id.ptr as &const byte, cfg.force_session_id.len, &found) {
+            if buf_append(&rpath, found.ptr, found.len) {
+                var r1: SessReader = sess_reader_empty();
+                defer { sess_reader_free(&r1); }
+                var pz1: Buf = buf_new(found.len + 1);
+                defer { buf_free(&pz1); }
+                _ = buf_append(&pz1, found.ptr, found.len);
+                _ = buf_append_byte(&pz1, 0);
+                if sess_read_header(pz1.ptr as &const byte, &r1) {
+                    _ = buf_append(&id, r1.id.ptr, r1.id.len);
+                    resumed = true;
+                }
+            }
+        }
+        if !resumed {
+            _ = buf_append(&id, cfg.force_session_id.ptr, cfg.force_session_id.len);
         }
     }
     if resumed {
         var next_seq: i64 = 0;
-        const n: i32 = agent_hist_from_log(cfg, h, resume_path, &next_seq);
+        const n: i32 = agent_hist_from_log(cfg, h, &rpath, &next_seq);
         if n > 0 {
             const trimmed: usize = hist_trim_incomplete_tail(h);
             if trimmed > 0 {
@@ -1478,13 +1535,23 @@ export fn agent_session_open(cfg: &const Config, h: &History, resume_path: &cons
     defer { buf_free(&modelz2); }
     _ = buf_append(&modelz2, cfg.model.ptr, cfg.model.len);
     _ = buf_append_byte(&modelz2, 0);
+    // 新建：子代理用父进程预指定的 id（父进程要拿它做 send_message 续跑），其余留空自生成
+    var want2: Buf = buf_empty();
+    defer { buf_free(&want2); }
+    if cfg.force_session_id.len > 0 {
+        want2 = buf_new(cfg.force_session_id.len + 1);
+        if buf_valid(&want2) {
+            _ = buf_append(&want2, cfg.force_session_id.ptr, cfg.force_session_id.len);
+            _ = buf_append_byte(&want2, 0);
+        }
+    }
     return sess_open(
         &g_sess,
         hz.ptr as &const byte,
         cwdz2.ptr as &const byte,
         modelz2.ptr as &const byte,
         "uya-agent",
-        "",
+        if want2.len > 0 { want2.ptr as &const byte } else { "" as &const byte },
         cfg.save_session,
         0 as i64,
         true
@@ -3735,7 +3802,8 @@ fn print_usage() void {
     out_err("  --no-stream         关闭流式（SSE），回退到一次性响应\n");
     out_err("  --compat-fold       工具结果折叠成一条 user 消息（老端点兼容）\n");
     out_err("  --no-stream-options 不发送 stream_options.include_usage\n");
-    out_err("  --show-reasoning    显示思考行（单行：运行中在提示符那一行滚动，结束时落一行）\n");
+    out_err("  --show-reasoning    显示思考行：滚动模式=运行中在提示符那一行滚动、结束落一行；\n");
+    out_err("                      TUI=额外把思考收进转录条目（TUI 的状态区默认已有实时一行）\n");
     out_err("  --show-usage        每轮打印 token 用量（in/out/cache/reasoning）\n");
     out_err("  --tool-lines N      工具正文：默认 0 = 只留一行；N>0 = 首尾各 N 行（含 diff/todo 清单）\n");
     out_err("  --debug-dump FILE   诊断原文（网关错误体/坏 payload 等）以**原始字节**追加落盘；\n");
@@ -5167,7 +5235,7 @@ export fn main() i32 {
 // 「把它交出来的提交/中断送回回合循环」。数据流见 README「全屏 TUI」一节。
 // ============================================================
 
-const AGENT_VERSION: [byte: 8] = [112, 49, 55, 45, 116, 117, 105, 0];   // "p17-tui"
+const AGENT_VERSION: [byte: 8] = [112, 49, 56, 45, 116, 117, 105, 0];   // "p18-tui"
 
 fn agent_parse_color(p: &byte) u8 {
     // auto / always / never / 16 / 256
@@ -5488,7 +5556,7 @@ fn agent_tui_command(cfg: &Config, h: &History, line: &const Buf) bool {
         } else {
             _ = buf_append_cstr(&items, "no");
         }
-        _ = buf_append_cstr(&items, ")\nversion    p17-tui");
+        _ = buf_append_cstr(&items, ")\nversion    p18-tui");
         tui_overlay_list(TUI_OVK_HELP, "状态（esc 关闭）" as &const byte, 30, items.ptr as &const byte, items.len);
         return false;
     }
@@ -5854,7 +5922,22 @@ fn agent_tui_demo(cfg: &const Config, cols: usize, rows: usize) i32 {
     tui_sink_bytes(2, "✓ Bash(./hello) · exit 0\n" as &const byte, bufx_cstr_len("✓ Bash(./hello) · exit 0\n" as &const byte));
     tui_sink_bytes(2, "    Hello, DSH!\n" as &const byte, bufx_cstr_len("    Hello, DSH!\n" as &const byte));
     tui_sink_bytes(1, "已改成 Hello, DSH! 并重新编译运行，输出 Hello, DSH!。\n" as &const byte, bufx_cstr_len("已改成 Hello, DSH! 并重新编译运行，输出 Hello, DSH!。\n" as &const byte));
-    tui_set_run(TUI_RUN_TOOL, "Bash(make check)" as &const byte, 15);
+    tui_set_run(TUI_RUN_TOOL, "Bash(make check)" as &const byte,
+        bufx_cstr_len("Bash(make check)" as &const byte));
+    agent_tui_dump(cols, rows);
+    tui_set_run(TUI_RUN_IDLE, "" as &const byte, 0);
+
+    // ③ 运行中（P18）：状态区常驻在面板正上方，第二行是思考实时行。
+    //    下面先堆一大段转录把视口铺满 —— P18 之前这一屏里状态行会被挤掉（一个字节都不显示）。
+    var i: usize = 0;
+    while i < 8 {
+        tui_sink_bytes(1, "为了把视口铺满，这里再补几行转录：状态区必须照样看得见。\n" as &const byte, bufx_cstr_len("为了把视口铺满，这里再补几行转录：状态区必须照样看得见。\n" as &const byte));
+        i = i + 1;
+    }
+    tui_close_stream_entries();
+    tui_set_run(TUI_RUN_THINK, "" as &const byte, 0);
+    tui_think_live("先核对 tui_build_chat 的视口夹取与状态区预留对不对，再看 view_think_pick 的 latestLine 口径，最后跑一轮 tui-selftest 收尾" as &const byte,
+        bufx_cstr_len("先核对 tui_build_chat 的视口夹取与状态区预留对不对，再看 view_think_pick 的 latestLine 口径，最后跑一轮 tui-selftest 收尾" as &const byte));
     agent_tui_dump(cols, rows);
     tui_set_run(TUI_RUN_IDLE, "" as &const byte, 0);
     return AGENT_OK;
