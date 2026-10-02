@@ -1322,6 +1322,33 @@ vLLM 等 OpenAI 兼容端点都一样稳。想升级成严格 `tool` 角色消�
     旧 `of 3080` → 新 `of 5949`；`offset=4000, limit=20`：旧「空内容 + `total 3080 lines`」→
     新 20 行 + `(Showing lines 4000-4019 of 5949. …)`（见 §6 的 P19 验收记录）。
 
+35. **「拍脑袋的固定容量」会把「参数有点大」报成 OOM，而且顺手把证据也抹掉。**
+    症状（真实会话踩到，用户截图就是这一幕）：一步 `bash`（`mkdir -p …/x11c`）成功后，
+    下一步直接
+    `error: out of memory serializing tool_calls`
+    + `[turn] 本回合异常结束（可直接输入继续）`—— 内存一点问题都没有。
+    根因在 `agent_finish_step` 严格协议那一段：assistant 的 `tool_calls` 数组原文要**一次写进
+    一个缓冲**，而那个缓冲是 `buf_new(8192)`（P0 时期随手写的容量），`calls_json_from_chat`
+    写不下就 `jw_overflow` → 调用点把它当成 OOM、`return AGENT_PROTO` 整轮退出。
+    工具参数超过 8 KiB 太容易了：写文件的正文、长 heredoc 的命令行、一次改好几个文件。
+    更糟的是**报错点在入史之前**，而 `agent_log_assistant` 用的是同一个固定容量，于是那一步的
+    `assistant/message` 事件里连 `tool_calls` 都没有（老代码还是**静默** `return`）——
+    事后翻会话日志只看到 `turn/end reason=error`，查不出当时到底调了什么。
+    修法：容量按实际需要算，只有一个出处 ——`jsonx.uya::jw_str_esc_len`（转义后的精确长度，
+    规则与 `jw_write_escaped` 一一对应）+ `agent.uya::calls_json_need`（骨架 + 三段字符串 +
+    元素间逗号 + 256 字节余量），再由 `calls_json_make` 分配并序列化；两个调用点（入史、写日志）
+    都走它，谁都不许再写固定值。真正的上限是历史单条 `extra` 的 `MSG_CONTENT_MAX`（200 KiB），
+    8 KiB 从来不是设计出来的数；「装不下」现在只剩真 OOM 一种可能，而且报错会把**需要多少字节**
+    一起打出来。会话日志那条路失败时也不再静默，会打
+    `[session] assistant 事件的 tool_calls 写不进日志（需要 N 字节…）`。
+    回归轮两条：`toolcalls-cap`（纯函数：`jw_str_esc_len` 与实际写出逐字节相等、预算与实际长度
+    严丝合缝、9 KiB 参数按预算成功而按老的 8192 必然失败、回读 id/name/arguments 逐字节相同）
+    与 `toolcalls-big`（端到端：mock 给一发 arguments ≈ 9.6 KiB 的 `write`，断言参数头尾一字不差
+    地回到请求里、工具结果配对完整、文件内容与正文逐字节相同）。把 `calls_json_make` 改回
+    `buf_new(8192)`，两条轮**同时红**（`error: out of memory serializing tool_calls (9999 bytes)`
+    + `toolcalls-big` 的 `agent_run returned 3`）—— 那正是修前的现场（见 §6 的验收记录，
+    那里还有用**真实故障会话** + `testdata/mock_gateway_bigcall.py` 做的 before/after 对照）。
+
 ---
 
 ## 4. 工具实现要点
@@ -1592,6 +1619,27 @@ responses 看 `call_id`）；**chat 与 responses 各一轮**，且顺便断言�
     新 20 行真内容 + `(Showing lines 4000-4019 of 5949. Use offset=4020 to continue.)`。
   * 离线回归：新增 3 轮（`read-window` / `diag-echo-400`(+`-ns`) / `diag-preview`）与 1 轮显示层
     （`tui-diag`）；`make check / build / codegen-audit / selftest` 全绿（selftest 退出 0）。
+* **tool_calls 容量（踩坑 35）的验收（2026-10-03）**：故障现场来自**真机会话日志**（`~/.uya-agent/sessions/---home-winger-uya-agent--/session-42acda4e…`）：
+  turn 3 的第 2 步 `bash mkdir -p …/x11c` 结果 `(no output) [exit code: 0]` 之后紧接着
+  `turn/end reason=error`，而第 3 步**根本没有 `assistant/message` 记录**（同一处固定容量把日志
+  一起吞了）—— 与用户截图（`✓ Bash · Create x11c directory · exit 0` 下面直接跟
+  `error: out of memory serializing tool_calls`）逐行对上。
+  修法是**先写测试再修**：加 `toolcalls-cap` 与 `toolcalls-big` 两轮，然后在
+  `calls_json_make` 里把容量改回 `buf_new(8192)` 复现修前现场 —— 两轮同时红：
+  `toolcalls-cap` 报「按预算分配仍然写不下（容量没按需要算？）」、
+  入史路径打 `error: out of memory serializing tool_calls (9999 bytes)`、
+  `toolcalls-big` 报 `agent_run returned 3 (expected 0)`、会话日志侧打
+  `[session] assistant 事件的 tool_calls 写不进日志（需要 9999 字节…）`；
+  改回「按 `calls_json_need` 算容量」之后两轮 PASS（该用例的 `tool_calls` 原文 9849 字节，
+  老的固定容量 8192，`make selftest` 退出 0）。
+  再用**真实故障会话**做 before/after 复验（把那条会话复制进临时 `--agent-home`，工作区与
+  会话目录名都按临时路径对齐，假网关 `testdata/mock_gateway_bigcall.py` 第一步就回一发
+  `arguments` ≈ 9.6 KiB 的 `write`，之后把「头尾标记是否一字不差」写进给模型看的最终答案）：
+  旧二进制 exit **3**、stderr 正是用户截图那行 `error: out of memory serializing tool_calls
+  (10001 bytes)`、假网关只看到 **1** 个请求、文件根本没写出来；
+  新二进制 exit **0**、假网关看到 **2** 个请求（第二个请求里 `head=True tail=True`）、
+  回答 `BIGCALL-OK 请求数=2 头=True 尾=True`、落盘文件 9618 字节且头尾标记逐字节正确 ——
+  也就是那条「已恢复 255 条消息」的真实历史现在能继续跑下去了。
 * 技能与联网搜索都在真机上验证过：让模型「说出本次会话可用的技能名」→ 正确回答
   `agently-mail、h2s-long-context`（来自真实 `~/.dsh/skills`）；让它「用 web_search 搜 uya 语言」→
   `web_search` 工具真的调通了 DeepSeek 的搜索服务并给出总结。
@@ -1650,6 +1698,8 @@ responses 看 `call_id`）；**chat 与 responses 各一轮**，且顺便断言�
 | `max-steps` | **显式**给 `max_steps=3`：mock 每轮都给 tool_calls，agent 必须在 3 步后熔断退出 3 |
 | `unlimited-steps` | **默认不限步数**（这轮故意不设 `max_steps`，吃 `cfg_default()` 的 0）：mock 连给 **14 轮** tool_calls（超过旧默认 12）才给最终答案 —— agent 必须一路跑满 14 步、把 14 条 `tool_call_id` 全带回请求，并以 0 退出。默认值一旦改回 12，mock 只会被服务 12 次，这轮立刻失败 |
 | `hist-keep` | 丢老消息的两条保护：`hist_drop_oldest` 必须留住 system 与**任务原文**（下标 1 的 user），且 `assistant(tool_calls)` 与其 tool 结果整组丢；连追加 40 组之后（远超旧 `MSG_MAX=64`）任务原文仍在、历史仍不以悬空 tool 开头（历史条数默认不限制，见 `history-long`） |
+| `toolcalls-cap` | 踩坑 35 的纯函数轮：`jw_str_esc_len` 与实际写出长度**逐字节相等**（含 NUL/引号/控制字节/中文，手工口径 40 字节）；`calls_json_need` 的预算与实际序列化长度严丝合缝（走生产那条路 `calls_json_make`）；两个调用（一个 9 KiB 正文 + 一个塞满转义字节）的参数按预算成功，而按**老的固定 8192** 必然失败；回读后 id/name/arguments 与原文逐字节相同 |
+| `toolcalls-big` | 踩坑 35 的端到端轮（mock mode 25）：mock 发一发 `arguments` ≈ 9.6 KiB 的 `write`，断言 ① 大参数的**头尾标记**都一字不差地回到第二个请求里；② 工具结果（`Created file`）在请求里且配对完整；③ 落盘文件与 9 KiB 正文**逐字节**相同；④ `agent_run` 返回 0 —— 修前这一步直接以 `error: out of memory serializing tool_calls` 中止（返回 3） |
 
 另外几条独立验收：
 
