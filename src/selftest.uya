@@ -302,6 +302,217 @@ fn mock_final_body(out: &Buf, marker: &const byte) bool {
 }
 
 // ============================================================
+// 长历史轮（mock mode 17）：连回 40 轮工具调用，专门压「历史上限」这条线。
+//
+// 每轮 2 个便宜的 bash 调用（echo 一个唯一标记），id 带轮次（call_h<N>_a/b），于是：
+//   * 每个请求都能断言「配对完整」（assistant(tool_calls) 后面必须紧跟应答它的 tool 消息）
+//     —— 这正是端点 400 的判据；
+//   * 最后一轮还能数 `"tool_call_id":"call_h…` 的出现次数，断言 80 条工具结果一条都没被丢掉。
+// 旧实现（MSG_MAX=64）在第 21 步左右就会把历史打满，tool 结果写不进去 → 回合异常结束。
+// ============================================================
+const HISTCAP_ROUNDS: i32 = 40;
+
+fn mock_loop_id(round: i32, tag: &const byte) Buf {
+    var b: Buf = buf_new(32);
+    if !buf_valid(&b) {
+        return b;
+    }
+    _ = buf_append_cstr(&b, "call_h");
+    _ = buf_append_i64(&b, round as i64);
+    _ = buf_append_cstr(&b, "_");
+    _ = buf_append_cstr(&b, tag);
+    return b;
+}
+
+fn mock_loop_args(round: i32, tag: &const byte) Buf {
+    var b: Buf = buf_new(192);
+    if !buf_valid(&b) {
+        return b;
+    }
+    _ = buf_append_cstr(&b, "{\"command\":\"echo HC-R");
+    _ = buf_append_i64(&b, round as i64);
+    _ = buf_append_cstr(&b, "-");
+    _ = buf_append_cstr(&b, tag);
+    _ = buf_append_cstr(&b, "\",\"description\":\"echo loop marker\"}");
+    return b;
+}
+
+fn mock_loop_body(out: &Buf, round: i32) bool {
+    var ia: Buf = mock_loop_id(round, "a");
+    defer { buf_free(&ia); }
+    var ib: Buf = mock_loop_id(round, "b");
+    defer { buf_free(&ib); }
+    var aa: Buf = mock_loop_args(round, "A");
+    defer { buf_free(&aa); }
+    var ab: Buf = mock_loop_args(round, "B");
+    defer { buf_free(&ab); }
+    if !buf_valid(&ia) || !buf_valid(&ib) || !buf_valid(&aa) || !buf_valid(&ab) {
+        return false;
+    }
+    var w: JsonWriter = JsonWriter{ buf: null, cap: 0, used: 0, overflow: false };
+    jw_init(&w, out.ptr, out.cap);
+    jw_byte(&w, 123);
+    jw_key(&w, "id");
+    jw_str_cstr(&w, "chatcmpl-selftest");
+    jw_byte(&w, 44);
+    jw_key(&w, "choices");
+    jw_byte(&w, 91);
+    jw_byte(&w, 123);
+    jw_key(&w, "index");
+    jw_i64(&w, 0);
+    jw_byte(&w, 44);
+    jw_key(&w, "message");
+    jw_byte(&w, 123);
+    jw_key(&w, "role");
+    jw_str_cstr(&w, "assistant");
+    jw_byte(&w, 44);
+    jw_key(&w, "content");
+    jw_null(&w);
+    jw_byte(&w, 44);
+    jw_key(&w, "tool_calls");
+    jw_byte(&w, 91);
+    // 两个同形状的 bash 调用（id/参数各自带轮次）
+    var k: usize = 0;
+    while k < 2 {
+        if k > 0 {
+            jw_byte(&w, 44);
+        }
+        var idb: &const Buf = &ia;
+        var argb: &const Buf = &aa;
+        if k == 1 {
+            idb = &ib;
+            argb = &ab;
+        }
+        jw_byte(&w, 123);
+        jw_key(&w, "id");
+        jw_str(&w, idb.ptr, idb.len);
+        jw_byte(&w, 44);
+        jw_key(&w, "type");
+        jw_str_cstr(&w, "function");
+        jw_byte(&w, 44);
+        jw_key(&w, "function");
+        jw_byte(&w, 123);
+        jw_key(&w, "name");
+        jw_str_cstr(&w, "bash");
+        jw_byte(&w, 44);
+        jw_key(&w, "arguments");
+        jw_str(&w, argb.ptr, argb.len);
+        jw_byte(&w, 125);
+        jw_byte(&w, 125);
+        k = k + 1;
+    }
+    jw_byte(&w, 93);
+    jw_byte(&w, 125);
+    jw_byte(&w, 125);
+    jw_byte(&w, 93);
+    jw_byte(&w, 125);
+    if jw_overflow(&w) {
+        return false;
+    }
+    out.len = jw_used(&w);
+    return true;
+}
+
+// 请求体里的配对校验：每个带 tool_calls 的 assistant 消息后面必须紧跟应答它的 N 条
+// role:"tool"（tool_call_id 与调用 id 一一对上），且不允许出现孤儿 tool 消息。
+// 端点拒掉本项目那次请求的判据就是这条（"insufficient tool messages following tool_calls"）。
+fn mock_field(m: &const JsonValue, key: &const byte, key_len: usize, out: &Buf) bool {
+    out[0] = buf_empty();
+    return js_obj_get_str_unescaped(m, key, key_len, out);
+}
+
+fn mock_field_is(b: &const Buf, lit: &const byte) bool {
+    if b.len == 0 {
+        return false;
+    }
+    return bufx_eq_cstr(b.ptr as &const byte, b.len, lit);
+}
+
+fn mock_field_eq(a: &const Buf, b: &const Buf) bool {
+    if a.len == 0 || a.len != b.len {
+        return false;
+    }
+    return bufx_mem_eq(a.ptr as &const byte, b.ptr as &const byte, a.len);
+}
+
+fn mock_pairing_ok(rx: &const Buf) bool {
+    var arr: Buf = buf_new(1 << 16);
+    defer { buf_free(&arr); }
+    if !buf_valid(&arr) {
+        return false;
+    }
+    const view: &[byte] = rx.ptr[0: rx.len];
+    if !sess_extract_array(view, "messages", &arr) {
+        return false;
+    }
+    const raw: &void = malloc(1 << 20);
+    if ((raw as &byte) as usize) == 0 {
+        return false;
+    }
+    defer { free(raw); }
+    var arena: Arena = Arena{ buffer: null, size: 0, used: 0 };
+    arena_init(&arena, raw as &byte, 1 << 20);
+    var root: JsonValue = JsonValue.json_null();
+    if !js_parse(&arena, arr.ptr, arr.len, &root) {
+        return false;
+    }
+    const total: usize = js_arr_len(&root);
+    var i: usize = 0;
+    while i < total {
+        var m: JsonValue = JsonValue.json_null();
+        if !js_arr_get(&root, i, &m) {
+            return false;
+        }
+        var role: Buf = buf_empty();
+        defer { buf_free(&role); }
+        if !mock_field(&m, "role", 4, &role) {
+            return false;
+        }
+        var tc: JsonValue = JsonValue.json_null();
+        if js_obj_get(&m, "tool_calls", 10, &tc) {
+            const nc: usize = js_arr_len(&tc);
+            if nc == 0 {
+                return false;
+            }
+            var k: usize = 0;
+            while k < nc {
+                if i + 1 + k >= total {
+                    return false;   // 缺 tool 应答
+                }
+                var tm: JsonValue = JsonValue.json_null();
+                var cm: JsonValue = JsonValue.json_null();
+                var trole: Buf = buf_empty();
+                defer { buf_free(&trole); }
+                var tcid: Buf = buf_empty();
+                defer { buf_free(&tcid); }
+                var cid: Buf = buf_empty();
+                defer { buf_free(&cid); }
+                if !js_arr_get(&root, i + 1 + k, &tm) || !js_arr_get(&tc, k, &cm) {
+                    return false;
+                }
+                if !mock_field(&tm, "role", 4, &trole) || !mock_field_is(&trole, "tool") {
+                    return false;
+                }
+                if !mock_field(&tm, "tool_call_id", 12, &tcid) || !mock_field(&cm, "id", 2, &cid) {
+                    return false;
+                }
+                if !mock_field_eq(&tcid, &cid) {
+                    return false;   // 应答的不是这个调用
+                }
+                k = k + 1;
+            }
+            i = i + nc + 1;
+            continue;
+        }
+        if mock_field_is(&role, "tool") {
+            return false;   // 孤儿 tool：它的 assistant 已经被丢掉了
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+// ============================================================
 // mock LLM 服务端（跑在 fork 出的子进程里）
 // ============================================================
 fn count_sub(hay: &const Buf, needle: &const byte) i32 {
@@ -658,6 +869,9 @@ fn mock_server(lfd: i32) i32 {
     if mock_mode == 17 {
         limit = 15;         // 不限步数轮：14 轮工具调用 + 1 轮最终答案
     }
+    if mock_mode == 18 {
+        limit = HISTCAP_ROUNDS + 1;   // 长历史轮：40 轮工具调用 + 1 轮最终答案
+    }
     while round < limit {
         // accept 最多等 10 秒：客户端不再发请求时 mock 必须自己退出，
         // 否则「mock 卡在 accept」会变成整个自测卡死（踩过）
@@ -770,6 +984,41 @@ fn mock_server(lfd: i32) i32 {
                 verdict = 162;
             }
             buf_free(&body17);
+            buf_free(&rx);
+            _ = sys_close(cfd) catch {};
+            round = round + 1;
+            continue;
+        }
+        if mock_mode == 18 {
+            // 长历史轮：前 HISTCAP_ROUNDS 轮各回 2 个 bash 调用，最后一轮给最终答案。
+            // 每个请求都必须配对完整 —— 端点 400 的判据在本地先钉住。
+            if !mock_pairing_ok(&rx) {
+                verdict = 170;
+            }
+            var body18: Buf = buf_new(2048);
+            if round < HISTCAP_ROUNDS {
+                if !mock_loop_body(&body18, round + 1) {
+                    verdict = 171;
+                }
+            } else {
+                // 80 条工具结果必须一条不少地留在请求里（默认不限制历史 = 不丢弃）
+                if count_sub(&rx, "\"tool_call_id\":\"call_h") != 2 * HISTCAP_ROUNDS {
+                    verdict = 174;
+                }
+                if !mock_final_body(&body18, "SELFTEST_HISTCAP_OK") {
+                    verdict = 172;
+                }
+            }
+            var sent18: bool = false;
+            if is_stream {
+                sent18 = mock_send_sse(cfd, &body18);
+            } else {
+                sent18 = mock_send(cfd, &body18);
+            }
+            if !sent18 {
+                verdict = 173;
+            }
+            buf_free(&body18);
             buf_free(&rx);
             _ = sys_close(cfd) catch {};
             round = round + 1;
@@ -2788,23 +3037,162 @@ fn sess_line_has(b: &const Buf, lit: &const byte) bool {
 // ============================================================
 // P5 自测：DSH 设置解析（假 DSH_HOME）+ YAML 预处理
 // ============================================================
-// 历史消息的安全访问（固定数组下标的证明放在函数内部）
+// 历史消息的安全访问（历史是堆数组，边界用 h.len 判）
 fn msg_role_at(h: &const History, i: usize) u8 {
-    if i >= MSG_MAX {
+    if i >= h.len {
         return 255;
     }
-    return h.items[i].role;
+    return msg_at(h, i).role;
 }
 
 fn msg_extra_is(h: &const History, i: usize, lit: &const byte) bool {
-    if i >= MSG_MAX {
+    if i >= h.len {
         return false;
     }
-    const m: &const Msg = &h.items[i];
+    const m: &const Msg = msg_at(h, i);
     if m.extra_len == 0 {
         return false;
     }
     return bufx_eq_cstr(m.extra as &const byte, m.extra_len, lit);
+}
+
+// ============================================================
+// hist-repair 轮：尾部修复（hist_trim_incomplete_tail）必须**只丢不完整的一组**
+//
+// 旧的实现无条件丢掉结尾的 tool / assistant(tool_calls)，于是「恢复会话」这种再正常
+// 不过的操作都会把最后一步白丢掉；反过来，只丢一半的组又会留下悬空 tool_calls，
+// 端点必然 400（本项目真实踩到过）。
+// ============================================================
+const HIST_CALLS_1: &const byte = "[{\"id\":\"c1\",\"type\":\"function\",\"function\":{\"name\":\"bash\",\"arguments\":\"{}\"}}]";
+const HIST_CALLS_2: &const byte = "[{\"id\":\"c1\",\"type\":\"function\",\"function\":{\"name\":\"bash\",\"arguments\":\"{}\"}},{\"id\":\"c2\",\"type\":\"function\",\"function\":{\"name\":\"bash\",\"arguments\":\"{}\"}}]";
+
+fn hist_push_text(h: &History, role: u8, lit: &const byte) bool {
+    return hist_push(h, role, lit, bufx_cstr_len(lit));
+}
+
+fn hist_push_calls(h: &History, calls: &const byte) bool {
+    return hist_push_msg(h, ROLE_ASSISTANT_CALLS, null, 0, calls, bufx_cstr_len(calls));
+}
+
+fn hist_push_tool(h: &History, id: &const byte, lit: &const byte) bool {
+    return hist_push_msg(h, ROLE_TOOL, lit, bufx_cstr_len(lit), id, bufx_cstr_len(id));
+}
+
+fn hist_seed(h: &History) bool {
+    return hist_push_text(h, ROLE_SYSTEM, "SYS") && hist_push_text(h, ROLE_USER, "TASK");
+}
+
+// h.bytes 必须等于各条 text_len+extra_len 之和（裁剪/回滚都要维护它）
+fn hist_bytes_ok(h: &const History) bool {
+    var sum: usize = 0;
+    var i: usize = 0;
+    while i < h.len {
+        const m: &const Msg = msg_at(h, i);
+        sum = sum + m.text_len + m.extra_len;
+        i = i + 1;
+    }
+    return sum == h.bytes;
+}
+
+fn hist_round(tag: &const byte) bool {
+    var ok: bool = true;
+    // 1) 完整的一组（2 个调用 + 2 条应答）：一条都不许丢
+    var h1: History = hist_init();
+    defer { hist_free(&h1); }
+    if !hist_seed(&h1) || !hist_push_calls(&h1, HIST_CALLS_2) || !hist_push_tool(&h1, "c1", "R1") || !hist_push_tool(&h1, "c2", "R2") {
+        ty_fail(tag, "构造历史失败(1)", &ok);
+        return ok;
+    }
+    if !hist_pairing_ok(&h1) {
+        ty_fail(tag, "完整的一组被判成不完整(1)", &ok);
+    }
+    if hist_trim_incomplete_tail(&h1) != 0 || h1.len != 5 {
+        ty_fail(tag, "完整的一组被裁掉了（旧实现对完整组也照丢）", &ok);
+    }
+    if !hist_bytes_ok(&h1) {
+        ty_fail(tag, "h.bytes 记账不对(1)", &ok);
+    }
+
+    // 2) 2 个调用只回了 1 条：整组丢掉
+    var h2: History = hist_init();
+    defer { hist_free(&h2); }
+    if !hist_seed(&h2) || !hist_push_calls(&h2, HIST_CALLS_2) || !hist_push_tool(&h2, "c1", "R1") {
+        ty_fail(tag, "构造历史失败(2)", &ok);
+        return ok;
+    }
+    if hist_pairing_ok(&h2) {
+        ty_fail(tag, "缺应答的历史被判成配对完整(2)", &ok);
+    }
+    if hist_trim_incomplete_tail(&h2) != 2 || h2.len != 2 {
+        ty_fail(tag, "缺应答的一组没有整组丢掉(2)", &ok);
+    }
+    if !hist_pairing_ok(&h2) || !hist_bytes_ok(&h2) {
+        ty_fail(tag, "修复后的历史仍不合法(2)", &ok);
+    }
+
+    // 3) 一个应答都没有（真实故障留下的形状）：丢掉那条 assistant
+    var h3: History = hist_init();
+    defer { hist_free(&h3); }
+    if !hist_seed(&h3) || !hist_push_calls(&h3, HIST_CALLS_1) {
+        ty_fail(tag, "构造历史失败(3)", &ok);
+        return ok;
+    }
+    if hist_trim_incomplete_tail(&h3) != 1 || h3.len != 2 {
+        ty_fail(tag, "零应答的 assistant 没有丢掉(3)", &ok);
+    }
+
+    // 4) tool_call_id 对不上：整组丢掉
+    var h4: History = hist_init();
+    defer { hist_free(&h4); }
+    if !hist_seed(&h4) || !hist_push_calls(&h4, HIST_CALLS_2) || !hist_push_tool(&h4, "c1", "R1") || !hist_push_tool(&h4, "cX", "R2") {
+        ty_fail(tag, "构造历史失败(4)", &ok);
+        return ok;
+    }
+    if hist_pairing_ok(&h4) {
+        ty_fail(tag, "id 对不上的历史被判成配对完整(4)", &ok);
+    }
+    if hist_trim_incomplete_tail(&h4) != 3 || h4.len != 2 {
+        ty_fail(tag, "id 对不上的一组没有整组丢掉(4)", &ok);
+    }
+
+    // 5) 完整的一组后面接了 user：尾部合法，什么都不该动
+    var h5: History = hist_init();
+    defer { hist_free(&h5); }
+    if !hist_seed(&h5) || !hist_push_calls(&h5, HIST_CALLS_1) || !hist_push_tool(&h5, "c1", "R1") || !hist_push_text(&h5, ROLE_USER, "NEXT") {
+        ty_fail(tag, "构造历史失败(5)", &ok);
+        return ok;
+    }
+    if hist_trim_incomplete_tail(&h5) != 0 || h5.len != 5 {
+        ty_fail(tag, "尾部是 user 时不该裁剪(5)", &ok);
+    }
+    if !hist_pairing_ok(&h5) {
+        ty_fail(tag, "完整组 + user 被判成不合法(5)", &ok);
+    }
+
+    // 6) 孤儿 tool（assistant 已经不在）：丢掉
+    var h6: History = hist_init();
+    defer { hist_free(&h6); }
+    if !hist_seed(&h6) || !hist_push_tool(&h6, "c1", "R1") {
+        ty_fail(tag, "构造历史失败(6)", &ok);
+        return ok;
+    }
+    if hist_pairing_ok(&h6) {
+        ty_fail(tag, "孤儿 tool 被判成配对完整(6)", &ok);
+    }
+    if hist_trim_incomplete_tail(&h6) != 1 || h6.len != 2 {
+        ty_fail(tag, "孤儿 tool 没有丢掉(6)", &ok);
+    }
+
+    out_err("selftest[");
+    out_err(tag);
+    out_err("] ");
+    if ok {
+        out_err("ok");
+    } else {
+        out_err("FAIL");
+    }
+    out_err("\n");
+    return ok;
 }
 
 fn write_text_file(path: &const byte, text: &const byte) bool {
@@ -3671,6 +4059,11 @@ fn mock_deleg_body(out: &Buf) bool {
 
 // 通用：起一个 mock server、跑一轮 agent_run、比较退出码/mock 判定
 fn round_run(base: &const Config, tag: &const byte, ws: &const byte, mode: i32, context_window: i64, task: &const byte) bool {
+    return round_run_opts(base, tag, ws, mode, context_window, 4, task);
+}
+
+// 与 round_run 相同，但步数上限可调（长历史轮要跑 40 轮工具调用）
+fn round_run_opts(base: &const Config, tag: &const byte, ws: &const byte, mode: i32, context_window: i64, max_steps: i32, task: &const byte) bool {
     mock_mode = mode;
     mock_expect_shell = true;
     mock_expect_fold = false;
@@ -3728,7 +4121,7 @@ fn round_run(base: &const Config, tag: &const byte, ws: &const byte, mode: i32, 
     c.verify = HC_VERIFY_NONE;
     c.allow_shell = true;
     c.stream = true;
-    c.max_steps = 4;
+    c.max_steps = max_steps;
     c.timeout_ms = 20000;
     c.quiet = true;
     c.context_window = context_window;
@@ -4377,7 +4770,8 @@ fn hist_keep_round(tag: &const byte) bool {
         ty_fail(tag, "首位不是 user 时剩下的角色序列不对", &ok);
     }
 
-    // ---- 3) 塞到 MSG_MAX 之后继续跑：任务原文仍在，且不会以悬空 tool 开头 ----
+    // ---- 3) 连着追加 40 组（远超旧 MSG_MAX=64）之后：任务原文仍在，且不会以悬空 tool 开头 ----
+    // 历史条数现在默认不限制，所以这里断言的是「长度 = 2 + 40 组 × 2 条」而不是 MSG_MAX。
     var h3: History = hist_init();
     defer { hist_free(&h3); }
     _ = hist_push(&h3, ROLE_SYSTEM, "S" as &const byte, 1);
@@ -4403,9 +4797,9 @@ fn hist_keep_round(tag: &const byte) bool {
         k = k + 1;
     }
     if !pa || !pt {
-        ty_fail(tag, "塞满历史后仍然追加失败（丢历史没能腾出位置）", &ok);
-    } else if h3.len != MSG_MAX {
-        ty_fail(tag, "长跑之后历史长度不等于 MSG_MAX", &ok);
+        ty_fail(tag, "长跑之后仍然追加失败（默认不限条数，不该失败）", &ok);
+    } else if h3.len != 2 + 40 * 2 {
+        ty_fail(tag, "长跑之后历史长度不等于 2 + 40 组 × 2 条（历史被打断/被丢？）", &ok);
     } else if msg_role_at(&h3, 0) != ROLE_SYSTEM {
         ty_fail(tag, "长跑之后 system 被丢掉了", &ok);
     } else if msg_role_at(&h3, 1) != ROLE_USER || !hist_text_is(&h3, 1, "TASK-KEEP" as &const byte) {
@@ -4455,6 +4849,18 @@ export fn selftest_main(base: &const Config) i32 {
     const t5: bool = prompt_round(base, "prompt-todo-plan", "build/selftest_ws_prompt");
     const t6: bool = round_run(base, "compact-prune", "build/selftest_ws_prune", 11, 0 as i64, "产生大输出");
     const t7: bool = round_run(base, "compact-auto", "build/selftest_ws_compact", 12, 200 as i64, "触发自动压缩");
+    // 长历史回归：40 轮 × 2 个工具调用（≈124 条消息）必须全程不丢消息、配对完整
+    const t10: bool = round_run_opts(
+        base,
+        "history-long",
+        "build/selftest_ws_histcap",
+        18,
+        0 as i64,
+        HISTCAP_ROUNDS + 5,
+        "长历史：连跑 40 轮工具调用，一条消息都不许丢"
+    );
+    // 尾部修复语义：只丢不完整的一组，完整的一组必须保留
+    const t11: bool = hist_round("hist-repair");
     const t8: bool = skill_round(base, "skills-web-search", "build/selftest_ws_skill", "build/selftest_skills");
     const t9: bool = deleg_round(base, "subagent-goal", "build/selftest_ws_deleg");
     const u0: bool = wf_round(base, "workflow", "build/selftest_wf_ws");
@@ -4469,7 +4875,7 @@ export fn selftest_main(base: &const Config) i32 {
         u3 = false;
     }
     cfg_free(&cdef);
-    if r1 && r2 && r3 && r4 && r5 && r5b && r6 && r7 && r8 && r9 && s0 && s1 && s2 && s3 && s4 && t0 && t1 && t2 && t3 && t4 && t5 && t6 && t7 && t8 && t9 && u0 && u1 && u2 && u3 {
+    if r1 && r2 && r3 && r4 && r5 && r5b && r6 && r7 && r8 && r9 && s0 && s1 && s2 && s3 && s4 && t0 && t1 && t2 && t3 && t4 && t5 && t6 && t7 && t8 && t9 && t10 && t11 && u0 && u1 && u2 && u3 {
         out_err("SELFTEST PASS\n");
         return AGENT_OK;
     }

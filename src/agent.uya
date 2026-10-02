@@ -350,8 +350,13 @@ const ROLE_ASSISTANT: u8 = 2;
 //   ROLE_TOOL             工具结果（extra = tool_call_id）
 const ROLE_ASSISTANT_CALLS: u8 = 3;
 const ROLE_TOOL: u8 = 4;
-const MSG_MAX: usize = 64;
+// 单条消息的存储上限。超过它不是「拒绝入史」（那会让 assistant(tool_calls) 挂空），
+// 而是先按 DSH 剪枝规则缩一次、仍超再头尾截断（见 hist_fit_text）。
 const MSG_CONTENT_MAX: usize = 200000;
+const HIST_MIN_CAP: usize = 8;
+// 硬截断时的头尾预算与标记
+const HIST_TRUNC_TAIL: usize = 16384;
+const HIST_TRUNC_MARK: &const byte = "\n\n[... message truncated to fit history storage ...]\n\n";
 
 // text = content 正文；extra 的含义由 role 决定（tool_calls 数组原文 / tool_call_id）。
 // assistant 展开成「assistant + N 条 tool」消息对，这是 OpenAI 严格协议的要求，
@@ -364,9 +369,13 @@ struct Msg {
     extra_len: usize,
 }
 
+// 对话历史：**默认不限条数**（DSH 的历史同样没有条数上限，靠 token 压力压缩来收敛），
+// 所以这里是按需翻倍增长的堆数组，不再是固定 [Msg: 64]。
+// 注意：增长用 realloc，可能整块搬家 —— 任何 &Msg 都不能跨 hist_push*/hist_reserve 使用。
 struct History {
-    items: [Msg: MSG_MAX],
+    items: &Msg,
     len: usize,
+    cap: usize,
     bytes: usize,
 }
 
@@ -375,22 +384,50 @@ fn msg_zero() Msg {
 }
 
 fn hist_init() History {
-    return History{ items: [msg_zero(): MSG_MAX], len: 0, bytes: 0 };
+    return History{ items: null, len: 0, cap: 0, bytes: 0 };
+}
+
+// 保证还能再放 extra 条消息（容量翻倍；realloc(null, n) 即首次分配）
+fn hist_reserve(h: &History, extra: usize) bool {
+    if h.cap >= h.len + extra {
+        return true;
+    }
+    var ncap: usize = h.cap * 2;
+    if ncap < HIST_MIN_CAP {
+        ncap = HIST_MIN_CAP;
+    }
+    if ncap < h.len + extra {
+        ncap = h.len + extra;
+    }
+    const esz: usize = @size_of(Msg) as usize;
+    const raw: &void = realloc(h.items as &void, ncap * esz);
+    if ((raw as &byte) as usize) == 0 {
+        return false;
+    }
+    h.items = raw as &Msg;
+    h.cap = ncap;
+    return true;
 }
 
 fn hist_free(h: &History) void {
     var i: usize = 0;
     while i < h.len {
-        if (h.items[i].text as usize) != 0 {
-            free(h.items[i].text as &void);
+        const m: &Msg = msg_at_mut(h, i);
+        if (m.text as usize) != 0 {
+            free(m.text as &void);
         }
-        if (h.items[i].extra as usize) != 0 {
-            free(h.items[i].extra as &void);
+        if (m.extra as usize) != 0 {
+            free(m.extra as &void);
         }
-        h.items[i] = msg_zero();
+        m[0] = msg_zero();
         i = i + 1;
     }
+    if (h.items as usize) != 0 {
+        free(h.items as &void);
+    }
+    h.items = null;
     h.len = 0;
+    h.cap = 0;
     h.bytes = 0;
 }
 
@@ -409,18 +446,90 @@ fn hist_dup(p: &const byte, n: usize) &byte {
     return q;
 }
 
-// 追加一条消息；text/extra 允许为空（n == 0 时存 null）
+fn hist_fit_note(before: usize, after: usize) void {
+    out_err("[history] 单条消息过长（");
+    out_err_dec(before);
+    out_err(" 字节），已缩到 ");
+    out_err_dec(after);
+    out_err(" 字节存入历史（会话日志里仍是全文）\n");
+}
+
+// 单条消息「装得下」：<= MSG_CONTENT_MAX 时返回 false（原样入史）；
+// 超上限时把处理后的文本写进 out 并返回 true：
+//   1) 先按 DSH 的剪枝规则缩一次（头 4096 + 标记 + 尾 1024 码点）；
+//   2) 仍超上限（旋钮被调大、或极端字节分布）就按 UTF-8 边界做「头 + 标记 + 尾」硬截断。
+// 保证返回 true 时 out.len <= MSG_CONTENT_MAX —— 于是「单条太大」永远不会变成入史失败。
+fn hist_fit_text(text: &const byte, n: usize, out: &Buf) bool {
+    if n <= MSG_CONTENT_MAX {
+        return false;
+    }
+    var pruned: Buf = buf_empty();
+    defer { buf_free(&pruned); }
+    if cmp_maybe_prune(text, n, &pruned) && pruned.len > 0 && pruned.len <= MSG_CONTENT_MAX {
+        if !buf_append(out, pruned.ptr, pruned.len) {
+            return false;
+        }
+        hist_fit_note(n, out.len);
+        return true;
+    }
+    const mark_len: usize = bufx_cstr_len(HIST_TRUNC_MARK);
+    var tail_budget: usize = HIST_TRUNC_TAIL;
+    var head_budget: usize = MSG_CONTENT_MAX - mark_len - tail_budget;
+    if head_budget >= n {
+        head_budget = n / 2;
+        tail_budget = n - head_budget;
+    }
+    // 头：退到字符起始字节；尾：进到字符起始字节（避免把汉字砍成半个）
+    var head_bytes: usize = head_budget;
+    while head_bytes > 0 && (text[head_bytes] & 192 as byte) == 128 as byte {
+        head_bytes = head_bytes - 1;
+    }
+    var tail_start: usize = n - tail_budget;
+    while tail_start < n && (text[tail_start] & 192 as byte) == 128 as byte {
+        tail_start = tail_start + 1;
+    }
+    if tail_start < head_bytes {
+        tail_start = head_bytes;
+    }
+    buf_reset(out);
+    if !buf_append(out, text, head_bytes) {
+        return false;
+    }
+    if !buf_append_cstr(out, HIST_TRUNC_MARK) {
+        return false;
+    }
+    const tail_ptr: &const byte = @ptr_from_usize(@usize_from_ptr(text as &const void) + tail_start) as &const byte;
+    if !buf_append(out, tail_ptr, n - tail_start) {
+        return false;
+    }
+    hist_fit_note(n, out.len);
+    return true;
+}
+
+// 追加一条消息；text/extra 允许为空（n == 0 时存 null）。
+// 默认不限条数：只有真 OOM（realloc/malloc 失败）才返回 false。调用方必须保证
+// 「assistant(tool_calls) 与它的 tool 结果」不会因此变成半截（见 agent_finish_step 的回滚）。
 fn hist_push_msg(h: &History, role: u8, text: &const byte, text_len: usize, extra: &const byte, extra_len: usize) bool {
-    if text_len > MSG_CONTENT_MAX || extra_len > MSG_CONTENT_MAX {
+    // extra 不做裁剪：它是 tool_calls 数组原文 / tool_call_id，截断后就是非法 JSON
+    // （比「失败 + 回滚」更糟），所以这里仍然按上限拒绝。
+    if extra_len > MSG_CONTENT_MAX {
+        return false;
+    }
+    var fitted: Buf = buf_empty();
+    defer { buf_free(&fitted); }
+    var src: &const byte = text;
+    var n: usize = text_len;
+    if hist_fit_text(text, text_len, &fitted) {
+        src = fitted.ptr as &const byte;
+        n = fitted.len;
+    }
+    if !hist_reserve(h, 1) {
         return false;
     }
     const idx: usize = h.len;
-    if idx >= MSG_MAX {
-        return false;
-    }
     var t: &byte = null;
-    if text_len > 0 {
-        t = hist_dup(text, text_len);
+    if n > 0 {
+        t = hist_dup(src, n);
         if (t as usize) == 0 {
             return false;
         }
@@ -435,14 +544,14 @@ fn hist_push_msg(h: &History, role: u8, text: &const byte, text_len: usize, extr
             return false;
         }
     }
-    const slot: &Msg = &h.items[idx];
+    const slot: &Msg = msg_at_mut(h, idx);
     slot.role = role;
     slot.text = t;
-    slot.text_len = text_len;
+    slot.text_len = n;
     slot.extra = e;
     slot.extra_len = extra_len;
     h.len = idx + 1;
-    h.bytes = h.bytes + text_len + extra_len;
+    h.bytes = h.bytes + n + extra_len;
     return true;
 }
 
@@ -467,27 +576,49 @@ fn msg_free_one(m: &Msg) void {
     m.extra_len = 0;
 }
 
-// 丢掉最老的一条非 system 消息。
+// 截断到 idx 条（释放后面的消息）。用于「本步这一组写不进去就整组回滚」——
+// 保证历史里永远不会留下「assistant(tool_calls) 后面缺 tool 应答」的半截状态。
+export fn hist_truncate_to(h: &History, idx: usize) void {
+    if idx >= h.len {
+        return;
+    }
+    var i: usize = idx;
+    while i < h.len {
+        const m: &Msg = msg_at_mut(h, i);
+        h.bytes = h.bytes - (m.text_len + m.extra_len);
+        msg_free_one(m);
+        i = i + 1;
+    }
+    h.len = idx;
+}
+
+// 丢掉最老的一条（或一整组）非 system 消息，但**只在下标 < floor 的区域里丢**。
+// floor 用来保护「本步刚压入的 assistant(tool_calls) 及其 tool 结果」：
+// 未保护的丢法会把当前这一组自己丢掉，剩下一串孤儿 tool 结果，端点照样 400。
+//
 // **不能拆散 assistant(tool_calls) 与它的 tool 结果**：丢掉带 tool_calls 的
 // assistant 时，紧随其后的 tool 消息必须一起丢，否则请求里会出现「悬空结果」，
-// 端点会直接 400。历史里同样不允许以 tool 消息开头（助手消息已被丢掉的情况）。
+// 端点会直接 400。保留段同样不允许以 tool 消息开头。
 //
-// 默认不限步数之后，一次长跑（严格协议下 ≈31 步就撞上 MSG_MAX）会反复触发「丢最老」，
-// 此时**必须留住下标 1 的 user**（本会话的任务原文）：把它丢掉就等于 agent 跑到一半
-// 忘了自己要干什么。所以下标 1 是 user 时从下标 2 开始丢（system 与任务原文都留下）。
-fn hist_drop_oldest(h: &History) bool {
+// 下标 1 是 user（本会话的任务原文）时从下标 2 开始丢：默认不限条数/不限步数之后，
+// 一次长跑会反复走到这条兜底路径，而把任务原文丢掉就等于 agent 跑到一半忘了自己要干什么
+// （system 与任务原文都留下）。这也是「不限步数」那个改动里的同一条保护。
+fn hist_drop_oldest_below(h: &History, floor: usize) bool {
     var s: usize = 1;
     if h.len > 2 && msg_at(h, 1).role == ROLE_USER {
         s = 2;
     }
-    if h.len <= s + 1 {
+    if floor <= s || h.len <= s + 1 {
         return false;
     }
     var end: usize = s;
     if msg_at(h, s).role == ROLE_ASSISTANT_CALLS {
-        while end + 1 < h.len && msg_at(h, end + 1).role == ROLE_TOOL {
+        while end + 1 < h.len && end + 1 < floor && msg_at(h, end + 1).role == ROLE_TOOL {
             end = end + 1;
         }
+    }
+    if end >= floor {
+        return false;   // 这一组会伸进受保护区域：宁可不丢
     }
     var k: usize = s;
     while k <= end {
@@ -522,15 +653,21 @@ fn hist_drop_oldest(h: &History) bool {
     return true;
 }
 
+fn hist_drop_oldest(h: &History) bool {
+    return hist_drop_oldest_below(h, h.len);
+}
+
 // 固定数组的安全取址：把「下标证明」换成指针运算（编译器对复合条件的证明很挑）
+// 历史是堆数组（不再是固定 [Msg: N]），取址就是普通指针运算；
+// 下标边界由调用方保证（h.len 之内），这里保留这两个辅助是为了调用点写法统一。
 export fn msg_at(h: &const History, i: usize) &const Msg {
-    const base: &const Msg = &h.items[0];
+    const base: &const Msg = h.items;
     const esz: usize = @size_of(Msg) as usize;
     return @ptr_from_usize(@usize_from_ptr(base as &const void) + i * esz) as &const Msg;
 }
 
 export fn msg_at_mut(h: &History, i: usize) &Msg {
-    const base: &Msg = &h.items[0];
+    const base: &Msg = h.items;
     const esz: usize = @size_of(Msg) as usize;
     return @ptr_from_usize(@usize_from_ptr(base as &void) + i * esz) as &Msg;
 }
@@ -1986,7 +2123,9 @@ fn agent_finish_step(cfg: &const Config, arena: &Arena, h: &History, step: i32, 
             }
             buf_free(&results);
             if !pushed_f {
-                out_err("error: tool results too large for history\n");
+                // 折叠路径没有 assistant(tool_calls) 要配对，失败不会留下坏历史；
+                // 超长文本已由 hist_fit_text 缩过，这里只剩真 OOM。
+                out_err("error: 工具结果无法写入历史（内存不足）\n");
                 return AGENT_PROTO;
             }
             return STEP_CONTINUE;
@@ -2008,9 +2147,13 @@ fn agent_finish_step(cfg: &const Config, arena: &Arena, h: &History, step: i32, 
             pushed_a = hist_push_msg(h, ROLE_ASSISTANT_CALLS, o.content.ptr as &const byte, o.content.len, calls_json.ptr as &const byte, calls_json.len);
         }
         if !pushed_a {
-            out_err("error: could not append assistant message to history\n");
+            out_err("error: could not append assistant message to history（内存不足，或 tool_calls 超过单条上限）\n");
             return AGENT_PROTO;
         }
+        // 本步这一组的起点：它就是受保护区域的下界 —— 丢老消息时**不允许**碰到
+        // 这条 assistant(tool_calls) 以及它已经压入的 tool 结果，否则历史会变成
+        // 「悬空 tool_calls」，端点必然 400（历史默认不限条数，所以这条只在内存吃紧时生效）。
+        const group_start: usize = h.len - 1;
 
         var ci: usize = 0;
         while ci < o.ncalls {
@@ -2024,19 +2167,42 @@ fn agent_finish_step(cfg: &const Config, arena: &Arena, h: &History, step: i32, 
             var res: Buf = buf_new(4096);
             if !buf_valid(&res) {
                 out_err("error: out of memory (tool result)\n");
+                hist_truncate_to(h, group_start);
                 return AGENT_PROTO;
             }
             dispatch_tool_body(cfg, &o.calls[ci].name, &o.calls[ci].args, arena, &res);
             agent_log_tool(step, &o.calls[ci].id, &o.calls[ci].name, &o.calls[ci].args, &res);
-            var pushed_t: bool = false;
             if res.len == 0 {
                 // 空结果在线上必须是 "(no output)"（对齐 DSH）
                 _ = buf_append_cstr(&res, "(no output)");
             }
-            pushed_t = hist_push_msg(h, ROLE_TOOL, res.ptr as &const byte, res.len, o.calls[ci].id.ptr as &const byte, o.calls[ci].id.len);
+            // 每条结果都必须进历史：assistant(tool_calls) 与它的 tool 结果是一个原子组，
+            // 半截的话请求会被端点以 "insufficient tool messages following tool_calls" 拒掉，
+            // 而且这条坏历史会一直留在会话里（/continue 永远 400）。
+            //
+            // 本组起点 = h.len - ci - 1（ci 条结果已在本组里；丢老消息只是让两边同比下移）。
+            // 它是 hist_drop_oldest_below 的上界：受保护区域之内一条都不许丢。
+            var pushed_t: bool = hist_push_msg(h, ROLE_TOOL, res.ptr as &const byte, res.len, o.calls[ci].id.ptr as &const byte, o.calls[ci].id.len);
+            while !pushed_t {
+                var floor: usize = 1;
+                if h.len > ci + 1 {
+                    floor = h.len - ci - 1;
+                }
+                if !hist_drop_oldest_below(h, floor) {
+                    break;
+                }
+                out_err("[history] dropped oldest message to stay within limits\n");
+                pushed_t = hist_push_msg(h, ROLE_TOOL, res.ptr as &const byte, res.len, o.calls[ci].id.ptr as &const byte, o.calls[ci].id.len);
+            }
             buf_free(&res);
             if !pushed_t {
-                out_err("error: could not append tool result to history\n");
+                // 回滚整组：宁可不记这一步，也不留下半截（历史必须始终满足配对要求）
+                var floor2: usize = 1;
+                if h.len > ci + 1 {
+                    floor2 = h.len - ci - 1;
+                }
+                hist_truncate_to(h, floor2);
+                out_err("error: out of memory appending tool result; step rolled back\n");
                 return AGENT_PROTO;
             }
             ci = ci + 1;
@@ -2078,6 +2244,20 @@ fn agent_turn_loop(cfg: &const Config, h: &History) i32 {
     g_turn = g_turn + 1;
     agent_log_turn_start();
     const rc: i32 = agent_turn_loop_inner(cfg, h);
+    // 回合结束时历史可能停在「一步只压了一半」的形状上（这一步的 tool 结果没能进历史）。
+    // 修回配对完整 —— 否则下一条 /continue 会被端点以
+    // "insufficient tool messages following tool_calls" 一直 400（用户实际踩到过）。
+    if h.len > 1 {
+        const tail_role: u8 = msg_at(h, h.len - 1).role;
+        if tail_role == ROLE_TOOL || tail_role == ROLE_ASSISTANT_CALLS {
+            const repaired: usize = hist_trim_incomplete_tail(h);
+            if repaired > 0 {
+                out_err("[history] 丢弃了 ");
+                out_err_dec(repaired);
+                out_err(" 条「未完成一轮」的尾部消息\n");
+            }
+        }
+    }
     if rc == AGENT_INTERRUPTED {
         agent_log_turn_end("aborted");
     } else if rc == AGENT_OK {
@@ -2161,7 +2341,7 @@ fn agent_turn_loop_inner(cfg: &const Config, h: &History) i32 {
         }
         if !build_chat_request(cfg, h, &req) {
             buf_free(&req);
-            out_err("error: request too large for buffer\n");
+            out_err("error: request too large for buffer（历史可能过大，试 /compact 或 --context-window）\n");
             return AGENT_PROTO;
         }
 
@@ -2268,23 +2448,159 @@ fn agent_turn_loop_inner(cfg: &const Config, h: &History) i32 {
 }
 
 // 建/恢复会话历史：先尝试恢复（含 system），否则新建（system + 可选首条 user）
-// 去掉结尾「不完整的一轮」：悬空的 tool 结果，以及没有工具结果跟随的 assistant(tool_calls)。
-// 两种场景都会遇到：
+// tool_calls 数组里有几个调用（extra 是本项目自己序列化出来的数组原文）
+fn hist_calls_count(arena: &Arena, extra: &byte, extra_len: usize) usize {
+    if extra_len == 0 {
+        return 0;
+    }
+    arena_reset(arena);
+    var root: JsonValue = JsonValue.json_null();
+    if !js_parse(arena, extra, extra_len, &root) {
+        return 0;
+    }
+    return js_arr_len(&root);
+}
+
+// 下标 g 处的 assistant(tool_calls) 这一组是否**应答完整**：
+// 紧跟其后的 tool 消息条数等于调用条数，且每个 tool_call_id 都能在该组的调用 id 里找到。
+// 完整的一组才是网关接受的形状；不完整的一组必须整组丢掉。
+fn hist_group_ok(arena: &Arena, h: &const History, g: usize) bool {
+    if g >= h.len {
+        return false;
+    }
+    const a: &const Msg = msg_at(h, g);
+    if a.role != ROLE_ASSISTANT_CALLS || a.extra_len == 0 {
+        return false;
+    }
+    arena_reset(arena);
+    var root: JsonValue = JsonValue.json_null();
+    if !js_parse(arena, a.extra, a.extra_len, &root) {
+        return false;   // tool_calls 本身坏了：当作不完整（整组丢）
+    }
+    const nc: usize = js_arr_len(&root);
+    if nc == 0 {
+        return false;
+    }
+    var nt: usize = 0;
+    var i: usize = g + 1;
+    while i < h.len && msg_at(h, i).role == ROLE_TOOL {
+        nt = nt + 1;
+        i = i + 1;
+    }
+    if nt != nc {
+        return false;
+    }
+    var k: usize = 0;
+    while k < nc {
+        var cm: JsonValue = JsonValue.json_null();
+        if !js_arr_get(&root, k, &cm) {
+            return false;
+        }
+        var cid: JsonStrView = JsonStrView{ ptr: null, len: 0 };
+        if !js_obj_get_str(&cm, "id", 2, &cid) || cid.len == 0 {
+            return false;
+        }
+        var hit: bool = false;
+        var t: usize = 0;
+        while t < nt {
+            const tm: &const Msg = msg_at(h, g + 1 + t);
+            if tm.extra_len == cid.len {
+                var same: bool = true;
+                var q: usize = 0;
+                while q < cid.len {
+                    if tm.extra[q] != cid.ptr[q] {
+                        same = false;
+                        break;
+                    }
+                    q = q + 1;
+                }
+                if same {
+                    hit = true;
+                    break;
+                }
+            }
+            t = t + 1;
+        }
+        if !hit {
+            return false;
+        }
+        k = k + 1;
+    }
+    return true;
+}
+
+// 整段历史是否满足严格工具协议的配对要求：每个 assistant(tool_calls) 后面必须紧跟
+// 应答它的 N 条 tool，且不允许出现孤儿 tool 消息。自测/排障用，不进请求热路径。
+export fn hist_pairing_ok(h: &const History) bool {
+    const raw: &void = malloc(1 << 20);
+    if ((raw as &byte) as usize) == 0 {
+        return false;
+    }
+    defer { free(raw); }
+    var arena: Arena = Arena{ buffer: null, size: 0, used: 0 };
+    arena_init(&arena, raw as &byte, 1 << 20);
+    var i: usize = 0;
+    while i < h.len {
+        const r: u8 = msg_at(h, i).role;
+        if r == ROLE_ASSISTANT_CALLS {
+            if !hist_group_ok(&arena, h, i) {
+                return false;
+            }
+            const nc: usize = hist_calls_count(&arena, msg_at(h, i).extra, msg_at(h, i).extra_len);
+            i = i + 1 + nc;
+            continue;
+        }
+        if r == ROLE_TOOL {
+            return false;   // 孤儿 tool：它的 assistant 已经不在了
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+// 去掉结尾「不完整的一轮」：悬空的 tool 结果，以及应答不全（或压根没有应答）的
+// assistant(tool_calls)。三种场景都会遇到：
 //   1) fork 出来的子代理在父回合**进行中**读取父历史（父的 tool 结果还没落盘）；
-//   2) 会话日志在崩溃时停在半路。
-// 修完以后回复出来的历史一定以完整的 assistant 结尾，请求不会再被网关以
+//   2) 会话日志在崩溃时停在半路；
+//   3) 某一组 tool 结果没能写进历史（旧实现里 MSG_MAX 打满就是这样）。
+// **只丢不完整的那一组**：完整的一组必须原样保留（旧实现会把完整的一组也丢掉，
+// 等于每次恢复都白丢一步）。修完以后历史一定满足配对要求，请求不会再被网关以
 // "an assistant message with 'tool_calls' must be followed by tool messages" 拒掉。
 export fn hist_trim_incomplete_tail(h: &History) usize {
+    const raw: &void = malloc(1 << 20);
+    if ((raw as &byte) as usize) == 0 {
+        return 0;   // 内存不足时不做破坏性裁剪
+    }
+    defer { free(raw); }
+    var arena: Arena = Arena{ buffer: null, size: 0, used: 0 };
+    arena_init(&arena, raw as &byte, 1 << 20);
     var dropped: usize = 0;
     while h.len > 1 {
         const last: usize = h.len - 1;
         const r: u8 = msg_at(h, last).role;
-        if r != ROLE_TOOL && r != ROLE_ASSISTANT_CALLS {
-            break;
+        if r == ROLE_ASSISTANT_CALLS {
+            hist_truncate_to(h, last);   // 一个应答都没有：整条丢
+            dropped = dropped + 1;
+            continue;
         }
-        msg_free_one(msg_at_mut(h, last));
-        h.len = last;
-        dropped = dropped + 1;
+        if r != ROLE_TOOL {
+            break;   // 结尾是 user/system/纯文本 assistant：形状本来就是合法的
+        }
+        var start: usize = last;
+        while start > 0 && msg_at(h, start - 1).role == ROLE_TOOL {
+            start = start - 1;
+        }
+        if start == 0 || msg_at(h, start - 1).role != ROLE_ASSISTANT_CALLS {
+            dropped = dropped + (h.len - start);   // 孤儿 tool 结果
+            hist_truncate_to(h, start);
+            continue;
+        }
+        const g: usize = start - 1;
+        if hist_group_ok(&arena, h, g) {
+            break;   // 完整的一组：保留
+        }
+        dropped = dropped + (h.len - g);
+        hist_truncate_to(h, g);
     }
     return dropped;
 }
@@ -2498,10 +2814,15 @@ fn agent_dry_run(cfg: &const Config) i32 {
         out_err("error: cannot build history\n");
         return AGENT_PROTO;
     }
-    var req: Buf = buf_new(262144);
+    // 按真实历史算大小：历史默认不限条数，固定 256 KiB 会让长会话的 dry-run 直接报错
+    var req: Buf = buf_new(request_bytes_needed(&h, cfg));
     defer { buf_free(&req); }
+    if !buf_valid(&req) {
+        out_err("error: out of memory (request buffer)\n");
+        return AGENT_PROTO;
+    }
     if !build_chat_request(cfg, &h, &req) {
-        out_err("error: cannot build request\n");
+        out_err("error: cannot build request（历史可能过大，试 /compact 或 --context-window）\n");
         return AGENT_PROTO;
     }
     out_err("[dry-run] messages=");
@@ -2579,7 +2900,7 @@ fn agent_pressure_tokens(cfg: &const Config, h: &const History) i64 {
     // 估算：请求体大致是历史 + tools + system
     var est: i64 = 0;
     var i: usize = 0;
-    while i < h.len && i < MSG_MAX {
+    while i < h.len {
         const m: &const Msg = msg_at(h, i);
         est = est + ((m.text_len + m.extra_len) as i64) / 4;
         i = i + 1;
@@ -2607,7 +2928,7 @@ fn agent_maybe_compact(cfg: &const Config, h: &History, step: i32, force: bool) 
     var tmp: History = hist_init();
     defer { hist_free(&tmp); }
     var i: usize = 0;
-    while i < h.len && i < MSG_MAX {
+    while i < h.len {
         const m: &const Msg = msg_at(h, i);
         _ = hist_push_msg(&tmp, m.role, m.text as &const byte, m.text_len, m.extra as &const byte, m.extra_len);
         i = i + 1;
@@ -2700,7 +3021,11 @@ fn agent_maybe_compact(cfg: &const Config, h: &History, step: i32, force: bool) 
 
 // 在 idx 处插入一条消息（其余后移）
 fn hist_insert_at(h: &History, idx: usize, role: u8, text: &const byte, text_len: usize, extra: &const byte, extra_len: usize) bool {
-    if h.len >= MSG_MAX || idx > h.len {
+    if idx > h.len {
+        return false;
+    }
+    // 先腾容量再取地址：realloc 可能把整块搬走
+    if !hist_reserve(h, 1) {
         return false;
     }
     var i: usize = h.len;

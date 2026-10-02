@@ -273,6 +273,9 @@ Messages API（`x-api-key` + `anthropic-version: 2023-06-01`，服务端工具 `
   - 替换成 `[system 原文] + [CHECKPOINT_PREAMBLE + <compacted-summary>…</compacted-summary>] + [保留的尾部]`。
 * 触发开关：`--no-compact` 关掉自动压缩，`--context-window N` 覆盖窗口（默认取 DSH 模型条目），
   REPL 里 `/compact` 手动触发一次。
+* **历史条数默认不限制**（`History` 是堆数组，见「严格工具协议要点」）：于是压缩是**唯一**的裁剪机制 ——
+  以前还有一条「超过 64 条丢最老」的兜底，那条兜底正是踩坑 26 的事故来源。单条消息超 200 KiB 会被
+  剪枝/截断到装得下（会话日志仍是全文），不会因为「太大」拒绝入史。
 * 已知偏离：DSH 还有 overflow 兜底重试与 retries 配置，这里只做「一次尝试」。
 
 ### 提示词与上下文状态（P8）
@@ -440,7 +443,17 @@ Messages API（`x-api-key` + `anthropic-version: 2023-06-01`，服务端工具 `
 * assistant 消息连同 `tool_calls` **原样回灌**（`arguments` 用 `jw_raw` 内联，绝不二次转义），
   随后每个调用一条 `role:"tool"` + `tool_call_id`；空结果发 `"(no output)"`。
 * 历史裁剪**不拆散配对**：丢掉带 `tool_calls` 的 assistant 时，紧随其后的 tool 消息一起丢；
-  历史不允许以 tool 消息开头（否则端点会 400）。
+  历史不允许以 tool 消息开头（否则端点会 400）。丢老消息还有两条保护：下标 1 若是 user
+  （本会话的任务原文）则从下标 2 开始丢；**受保护区域之上绝不触碰**（本步刚压入的那一组）。
+* **历史条数默认不限制**：`History` 是堆数组（`hist_reserve` 翻倍 realloc），不再有固定 64 条上限。
+  只有真 OOM 才会 push 失败，而 push 失败时**整组回滚**（`hist_truncate_to`）——
+  绝不留下「`assistant(tool_calls)` 后面缺 tool 应答」的半截历史，否则端点 400 会把会话永久钉死
+  （见踩坑 26）。
+* 单条消息超 200 KiB 不是「入史失败」：先按 DSH 剪枝规则缩一次，仍超就按 UTF-8 边界做
+  「头 + 标记 + 尾」硬截断（`hist_fit_text`），会话日志里保留全文。
+* 尾部修复（`hist_trim_incomplete_tail`）**只丢不完整的一组**：应答不全或零应答的
+  `assistant(tool_calls)` 整组丢掉，**完整的一组原样保留**（旧实现会把结尾的 tool/assistant_calls
+  一路丢空，等于每次恢复都清空历史）；`hist_pairing_ok` 是这套不变量的本地判据。
 * `--compat-fold` 回到旧协议（工具结果折叠成一条 user 消息），`--no-stream` 回到一次性响应；
   两条路径共用同一套收尾逻辑（`agent_finish_step`）。
 
@@ -548,6 +561,25 @@ vLLM 等 OpenAI 兼容端点都一样稳。想升级成严格 `tool` 角色消�
     修法：在主循环之前加一趟只认这三个 flag 的预扫（主循环稍后仍会再解析一次，天然幂等）。
     这类「flag 是后续步骤的前置条件」的 bug 不会报错，只会让参数悄悄不起作用，
     所以最好用 `--print-config` 亲眼确认来源、并给它配一条常驻回归（`make e2e-config-flags`）。
+26. **「某一步只压了一半」的历史是毒药：端点 400，而且会一直 400。** 真实事故：一条很长的会话
+    （恢复日志 + 多轮工具调用）跑到第 10 步时，`hist_push_msg(h, ROLE_TOOL, …)` 因为固定数组
+    `MSG_MAX = 64` 打满而返回 false，代码直接报 `error: could not append tool result to history` 结束回合 ——
+    但**上一条 assistant(tool_calls) 已经在历史里了**。于是之后每次 `/continue` 都被端点以
+    `An assistant message with 'tool_calls' must be followed by tool messages responding to each
+    'tool_call_id'. (insufficient tool messages following tool_calls message)` 拒掉，会话再也推不动。
+    同一次排查还挖出两个同源问题：① 恢复会话时的尾部裁剪**无条件**丢掉结尾的 tool/assistant_calls，
+    而结尾几乎总是「一组完整工具调用」，`while` 一路往后丢，实测把 60 条恢复消息里的 59 条全丢了
+    （等于静默清空上下文）；② 日志重放时 push 失败只 `continue`，历史打满就「留最老、丢最新」。
+    修法与两条不变量：
+    * **追加要么成功、要么回滚**：assistant(tool_calls) 与它的 N 条 tool 结果是一组，
+      写不进去就 `hist_truncate_to` 整组回滚（丢弃计数/失败都打印出来），历史永远满足配对要求；
+      丢老消息时用 `hist_drop_oldest_below(h, floor)` 把「本步这一组」划成受保护区域。
+    * **尾部修复只丢不完整的一组**：应答不全/零应答的 assistant(tool_calls)、孤儿 tool 结果才丢，
+      完整的一组必须原样保留；`hist_pairing_ok(h)` 是这套不变量的本地判据（也是自测的断言）。
+    顺带把根因本身去掉：历史改成**默认不限条数**的堆数组（`hist_reserve` 翻倍 realloc），
+    单条超 200 KiB 先剪枝、再头尾截断，绝不因为「太大」拒绝入史。
+    回归：`history-long`（40 轮 × 2 调用，逐请求断言配对完整且 80 条结果一条不少）+ `hist-repair`
+    （完整组不丢 / 缺应答整组丢）；旧实现在 `history-long` 上必然失败（复现记录在 §6 的验收事实里）。
 
 ---
 
@@ -639,6 +671,13 @@ agent 循环并逐项断言：
 | `compact-prune` | 让 bash 产生 20000 字符输出 → 断言请求里出现剪枝标记、完整中段已消失 |
 | `compact-auto` | 小窗口（200）强制触发：工具轮 → **摘要请求**（断言提示词模板）→ 压缩后的请求里
 必须出现 `automatically generated checkpoint` 与 `<compacted-summary>` |
+| `history-long` | **「历史条数默认不限制」的验收**：mock 连回 40 轮 × 2 个工具调用（≈124 条消息）→
+断言回合正常结束（旧实现在第 64 条处中断，报 `could not append tool result to history`）、**每个请求都配对完整**
+（每个 `tool_calls` 后面紧跟应答它的 `tool` 消息 —— 这正是端点 400 的判据）、且最后一轮请求里 80 条工具结果
+一条不少（数 `"tool_call_id":"call_h…`） |
+| `hist-repair` | 尾部修复语义：完整的一组（2 调用 + 2 应答）**一条不丢**（旧实现会把结尾的 tool/assistant_calls
+一路丢空）；缺应答 / 零应答 / `tool_call_id` 对不上 → 整组丢掉；孤儿 tool → 丢掉；尾部是 user 时不动；
+每步都用 `hist_pairing_ok` 复核，并断言 `h.bytes` 记账仍然准确 |
 | `prompt-todo-plan` | 第一轮断言 system prompt（persona 变量替换、`{{cwd}}`、工具引导段）、运行时上下文
 user 消息、AGENTS.md 注入，以及**请求里没有 NUL 字节**；第二轮断言 todo 计数回显、
 重复 content 被拒、`exit_plan_mode` 在非 plan 模式报错、计划必须以 `# ` 开头 |
@@ -676,6 +715,16 @@ contextWindow/maxTokens/input image/reasoningEffort/`permission→confine`/`uya-
 * 子代理在真机上验证过：让模型「用 subagent（前台）让子代理写一个 hello.sh 打印 SUBAGENT-OK」→
   子代理真的创建并自测了脚本，父进程又独立复核了一遍输出；`subagent_fork` 的子代理历史里
   确实带有父会话已完成轮次的内容（调试输出逐条列过）。
+* **历史容量与尾部修复的验收（2026-10-03）**：`history-long` 先写、在旧实现上跑出真实故障
+  （`[history] dropped oldest message to stay within limits` + `error: could not append tool result
+  to history`，`agent_run` 返回 3），修后同一轮 PASS（41 次请求全部配对完整、80 条工具结果一条不少）。
+  再用**真实故障会话**做只读复验（把 `~/.uya-agent/sessions/**` 里那条会话复制到临时 `--agent-home`，
+  跑 `--resume <id> --dry-run --no-save`，并用同一个配对判据复算请求体）：
+  ① 原样恢复：旧二进制把 60 条恢复消息丢了 59 条（只剩 system + 3 条注入消息），新实现 0 条被丢、
+  `messages=63`、`tool_replies=37`、配对违规 0，第 10 步 `edit` 的结果（`has been updated successfully`）
+  仍在请求里；② 把日志截在「assistant(tool_calls) 已落盘、tool 结果还没落盘」的形状
+  （= 用户当时卡死的状态）：旧二进制丢 58 条（`messages=4`），新实现只丢 1 条悬空 assistant
+  （`messages=61`、配对违规 0）—— 也就是 `/continue` 现在能继续。
 * 技能与联网搜索都在真机上验证过：让模型「说出本次会话可用的技能名」→ 正确回答
   `agently-mail、h2s-long-context`（来自真实 `~/.dsh/skills`）；让它「用 web_search 搜 uya 语言」→
   `web_search` 工具真的调通了 DeepSeek 的搜索服务并给出总结。
@@ -706,7 +755,7 @@ contextWindow/maxTokens/input image/reasoningEffort/`permission→confine`/`uya-
 | `http401` | mock 回 401 + 错误体：agent 必须打印状态与错误体并退出 3 |
 | `max-steps` | **显式**给 `max_steps=3`：mock 每轮都给 tool_calls，agent 必须在 3 步后熔断退出 3 |
 | `unlimited-steps` | **默认不限步数**（这轮故意不设 `max_steps`，吃 `cfg_default()` 的 0）：mock 连给 **14 轮** tool_calls（超过旧默认 12）才给最终答案 —— agent 必须一路跑满 14 步、把 14 条 `tool_call_id` 全带回请求，并以 0 退出。默认值一旦改回 12，mock 只会被服务 12 次，这轮立刻失败 |
-| `hist-keep` | 长跑副作用：`hist_drop_oldest` 必须留住 system 与**任务原文**（下标 1 的 user），且 `assistant(tool_calls)` 与其 tool 结果整组丢；塞满 `MSG_MAX` 后继续追加仍成立 |
+| `hist-keep` | 丢老消息的两条保护：`hist_drop_oldest` 必须留住 system 与**任务原文**（下标 1 的 user），且 `assistant(tool_calls)` 与其 tool 结果整组丢；连追加 40 组之后（远超旧 `MSG_MAX=64`）任务原文仍在、历史仍不以悬空 tool 开头（历史条数默认不限制，见 `history-long`） |
 
 另外几条独立验收：
 
@@ -741,10 +790,11 @@ UYA_AGENT_API_KEY=… ./build/uya-agent \
 
 ## 7. 已知限制
 
-* 上下文管理很朴素：整个历史每轮重新序列化，超过 **64 条消息**（`MSG_MAX`）/单条 200 KiB 时
-  丢最老的对话（`assistant(tool_calls)` 与它的 tool 结果整组丢；**system 与任务原文留住**）；
-  没做 token 计数或智能摘要。严格协议下一轮工具调用占 2 条消息，所以约 31 步之后开始丢老消息
-  —— 不限步数的长跑主要靠「上下文压缩」（`context_window` 来自 DSH 模型条目）来续命。
+* 上下文管理很朴素：整个历史每轮重新序列化（没有 token 级增量缓存）。历史**条数默认不限制**，
+  内存随会话线性增长，唯一的收敛机制是「按 token 压力的自动压缩」——
+  所以**没有配置 contextWindow 时（`--no-dsh-config` 或模型条目里没有 `contextWindow`）压缩不会触发**，
+  长会话请显式给 `--context-window N` 或用 `/compact` 手动压一次。单条消息 200 KiB 会在入史时被
+  剪枝/截断（会话日志仍是全文）。
 * **默认不限步数**：模型若陷入工具循环不会自动停 —— 交互模式 Ctrl-C 中断本回合（历史保留），
   脚本/CI 用 `--max-steps N` 或 `UYA_AGENT_MAX_STEPS=N` 熔断（`make e2e` 也可 `STEPS=N`）。
   没做「重复调用检测」这类启发式熔断。
