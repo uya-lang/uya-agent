@@ -24,11 +24,15 @@ var mock_expect_shell: bool = true;
 //   6 = 中断轮：发若干帧后挂住不发 [DONE]，客户端应被 Ctrl-C 打断
 //  17 = 不限步数轮：默认 max_steps=0（不限）时连给 14 轮工具调用（超过旧默认 12），
 //       第 15 轮才给最终答案 —— agent 必须一路跑完并以 0 退出（默认回到 12 这轮就失败）
+//  23 = 控制字节轮：跑一条 stdout 带 NUL 的命令，断言它转义成 \u0000 之后才上线
+//       （chat 与 responses 各跑一遍，靠 mock_expect_resp 区分端点与响应形状）
 var mock_mode: i32 = 0;
 // --compat-fold 轮：mock 期望看到「折叠成一条 user 消息」的旧协议
 var mock_expect_fold: bool = false;
 // steer 轮：mock 期望在下一轮请求里看到运行中输入的文本
 var mock_expect_steer: bool = false;
+// 控制字节轮：true = 这一轮跑 responses 协议（端点/响应形状都按 responses 来）
+var mock_expect_resp: bool = false;
 
 // 供自测断言用的 lflag 位（与 tty.uya 内部常量一致）
 const TTY_LFLAG_TEST_ISIG: u32 = 0x0001;
@@ -592,6 +596,27 @@ fn contains(hay: &const Buf, needle: &const byte) bool {
     return find_sub(view, needle[0: strlen(needle)], 0) >= 0;
 }
 
+// 请求体（紧凑 JSON，构建时没有任何结构性空白）里出现了裸控制字节（< 0x20）？
+// 返回条数。请求头里有 \r\n，所以从空行之后开始扫。
+// 这条不变量就是 P15 的哨兵：转义漏一个字节（最典型的是工具结果里的 NUL），
+// 真网关就会 400：invalid character '\x00' in string literal。
+fn sel_body_raw_control(rx: &const Buf) usize {
+    const view: &[byte] = rx.ptr[0: rx.len];
+    const at: isize = find_sub(view, &"\r\n\r\n"[0: 4], 0);
+    if at < 0 {
+        return 0;
+    }
+    var i: usize = (at as usize) + 4;
+    var n: usize = 0;
+    while i < rx.len {
+        if rx.ptr[i] < 32 as byte {
+            n = n + 1;
+        }
+        i = i + 1;
+    }
+    return n;
+}
+
 fn mock_read_request(cfd: i32, rx: &Buf) bool {
     var tmp: [byte: 4096] = [0: 4096];
     while true {
@@ -873,6 +898,53 @@ fn mock_toolcall_tools_body(out: &Buf) bool {
     return true;
 }
 
+// 控制字节轮用：一封只含 **一个** bash 调用的 chat 形状响应。cmd 由调用方给
+// （`printf 'A\000B'` 这种：bash 的 printf 认 \000，于是工具结果里就有裸 NUL）。
+fn mock_ctrl_body(out: &Buf, cmd: &const Buf) bool {
+    var args: Buf = buf_new(512);
+    defer { buf_free(&args); }
+    if !mock_args_json(&args, cmd) {
+        return false;
+    }
+    // mock_call 的 args_json 是 C 字符串（内部走 jw_str_cstr），所以补一个 NUL
+    if !buf_append_byte(&args, 0) {
+        return false;
+    }
+    var w: JsonWriter = JsonWriter{ buf: null, cap: 0, used: 0, overflow: false };
+    jw_init(&w, out.ptr, out.cap);
+    jw_byte(&w, 123);
+    jw_key(&w, "id");
+    jw_str_cstr(&w, "chatcmpl-selftest");
+    jw_byte(&w, 44);
+    jw_key(&w, "choices");
+    jw_byte(&w, 91);
+    jw_byte(&w, 123);
+    jw_key(&w, "index");
+    jw_i64(&w, 0);
+    jw_byte(&w, 44);
+    jw_key(&w, "message");
+    jw_byte(&w, 123);
+    jw_key(&w, "role");
+    jw_str_cstr(&w, "assistant");
+    jw_byte(&w, 44);
+    jw_key(&w, "content");
+    jw_null(&w);
+    jw_byte(&w, 44);
+    jw_key(&w, "tool_calls");
+    jw_byte(&w, 91);
+    mock_call(&w, "call_ctrl", "bash", args.ptr as &const byte);
+    jw_byte(&w, 93);
+    jw_byte(&w, 125);
+    jw_byte(&w, 125);
+    jw_byte(&w, 93);
+    jw_byte(&w, 125);
+    if jw_overflow(&w) {
+        return false;
+    }
+    out.len = jw_used(&w);
+    return true;
+}
+
 fn mock_call(w: &JsonWriter, id: &const byte, name: &const byte, args_json: &const byte) void {
     jw_byte(w, 123);
     jw_key(w, "id");
@@ -931,14 +1003,40 @@ fn mock_resp_args(cmd: &Buf, marker: &const byte) bool {
     return buf_append_cstr(cmd, marker);
 }
 
-// Responses 流式：一个 function_call（bash）+ completed
-fn mock_resp_tool_text(out: &Buf, marker: &const byte) bool {
+// 工具调用 arguments 的 JSON 文本：{"command":<cmd>,"description":"…"}
+// （chat 的 arguments 与 responses 的 arguments 分片都是**这层文本**，两条协议共用）
+fn mock_args_json(out: &Buf, cmd: &const Buf) bool {
+    var w: JsonWriter = JsonWriter{ buf: null, cap: 0, used: 0, overflow: false };
+    jw_init(&w, out.ptr, out.cap);
+    jw_byte(&w, 123);
+    jw_key(&w, "command");
+    jw_str(&w, cmd.ptr, cmd.len);
+    jw_byte(&w, 44);
+    jw_key(&w, "description");
+    jw_str_cstr(&w, "selftest command");
+    jw_byte(&w, 125);
+    if jw_overflow(&w) {
+        return false;
+    }
+    out.len = jw_used(&w);
+    return true;
+}
+
+// Responses 流式：一个 function_call（bash）+ completed。cmd 是**完整**的 shell 命令
+// （`echo <marker>` 那种由 mock_resp_tool_text 拼；控制字节轮要的是带 NUL 的命令）。
+//
+// 注意 arguments 分片的形状：Responses API 里 `response.function_call_arguments.delta`
+// 的 `delta` 是**字符串**（内容是 arguments 的 JSON 文本片段），客户端解析器也按字符串取
+// （js_obj_get_str + sv_unescape）。早先这里是按**对象**发的、客户端直接忽略 —— 于是
+// 「工具拿到空 arguments」这件事在自测里溜了过去（mode 19 第二轮那条 marker 断言，正好被
+// 任务文本里的同名 marker 满足，看不出来）。这里按规范发字符串。
+fn mock_resp_tool_cmd(out: &Buf, cmd: &const Buf) bool {
     var payload: Buf = buf_new(1024);
     defer { buf_free(&payload); }
+    var args: Buf = buf_new(512);
+    defer { buf_free(&args); }
     var w: JsonWriter = JsonWriter{ buf: null, cap: 0, used: 0, overflow: false };
-    var cmd: Buf = buf_new(256);
-    defer { buf_free(&cmd); }
-    if !mock_resp_args(&cmd, marker) {
+    if !mock_args_json(&args, cmd) {
         return false;
     }
 
@@ -981,13 +1079,7 @@ fn mock_resp_tool_text(out: &Buf, marker: &const byte) bool {
     jw_i64(&w, 0);
     jw_byte(&w, 44);
     jw_key(&w, "delta");
-    jw_byte(&w, 123);
-    jw_key(&w, "command");
-    jw_str(&w, cmd.ptr, cmd.len);
-    jw_byte(&w, 44);
-    jw_key(&w, "description");
-    jw_str_cstr(&w, "echo a marker");
-    jw_byte(&w, 125);
+    jw_str(&w, args.ptr, args.len);
     jw_byte(&w, 125);
     if !resp_emit(out, &w, &payload) {
         return false;
@@ -1027,6 +1119,16 @@ fn mock_resp_tool_text(out: &Buf, marker: &const byte) bool {
     jw_byte(&w, 125);
     jw_byte(&w, 125);
     return resp_emit(out, &w, &payload);
+}
+
+// Responses 流式：一个 bash function_call，命令是 `echo <marker>`
+fn mock_resp_tool_text(out: &Buf, marker: &const byte) bool {
+    var cmd: Buf = buf_new(256);
+    defer { buf_free(&cmd); }
+    if !mock_resp_args(&cmd, marker) {
+        return false;
+    }
+    return mock_resp_tool_cmd(out, &cmd);
 }
 
 // Responses 流式：一条正文 + completed
@@ -1270,6 +1372,9 @@ fn mock_server(lfd: i32) i32 {
     if mock_mode == 22 {
         limit = 1;          // responses 压缩轮：只断言「压缩之后的那一次请求」
     }
+    if mock_mode == 23 {
+        limit = 2;          // 控制字节轮：工具轮（跑出 NUL）→ 断言轮
+    }
     while round < limit {
         // accept 最多等 10 秒：客户端不再发请求时 mock 必须自己退出，
         // 否则「mock 卡在 accept」会变成整个自测卡死（踩过）
@@ -1292,6 +1397,12 @@ fn mock_server(lfd: i32) i32 {
             buf_free(&rx);
             _ = sys_close(cfd) catch {};
             return 11;
+        }
+        // 全局不变量：任何请求体都不许带裸控制字节（chat 请求、responses 请求、
+        // web_search 的 provider 请求都算）。
+        // 判定码 240 与各 mode 自己的码（含 190…234）不冲突，看到 240 就是「转义漏了字节」。
+        if verdict == 0 && sel_body_raw_control(&rx) != 0 {
+            verdict = 240;
         }
         // P10：web_search 的 provider 请求（Anthropic Messages API）
         if contains(&rx, "POST /messages") || contains(&rx, "/messages HTTP") {
@@ -1514,6 +1625,79 @@ fn mock_server(lfd: i32) i32 {
                 verdict = 162;
             }
             buf_free(&body17);
+            buf_free(&rx);
+            _ = sys_close(cfd) catch {};
+            round = round + 1;
+            continue;
+        }
+        if mock_mode == 23 {
+            // 控制字节轮（P15）：第 1 轮让 agent 跑一条**输出里有 NUL** 的命令，
+            // 第 2 轮断言这条工具结果回到请求里时，NUL 已经被转义成 \u0000。
+            // 为什么必须转义：裸 NUL 进请求体 = 非法 JSON，Go 网关 400
+            // invalid character '\x00' in string literal；而这条结果会一直留在历史里，
+            // 于是「继续」也会一轮接一轮地 400（真机踩过）。
+            // **两条协议都跑**（chat 与 responses 共用 jsonx 的转义，两边的请求体都要合法）：
+            // mock_expect_resp 由这一轮的 runner 设好，这里顺便断言端点没串。
+            var body23: Buf = buf_new(4096);
+            if mock_expect_resp {
+                expect(&rx, "POST /v1/responses", 241, &verdict);
+            } else {
+                expect(&rx, "POST /v1/chat/completions", 242, &verdict);
+            }
+            if round == 0 {
+                // 命令：printf 'A\000B' → stdout 里真的有一个 NUL（bash 的 printf 认 \000）
+                var cmd: Buf = buf_new(64);
+                defer { buf_free(&cmd); }
+                _ = buf_append_cstr(&cmd, "printf 'A\\000B'");
+                var built: bool = false;
+                if mock_expect_resp {
+                    built = mock_resp_tool_cmd(&body23, &cmd);
+                } else {
+                    built = mock_ctrl_body(&body23, &cmd);
+                }
+                if !built {
+                    verdict = 243;
+                }
+            } else {
+                // 回灌用的 id 字段名两条协议不同：chat 是 tool_call_id（只在工具消息里出现 1 次），
+                // responses 是 call_id（function_call 与 function_call_output 各一次 = 2）。
+                // （count_sub 的 needle 走 strlen，所以只能用字面量，不能拿没补 NUL 的 Buf）
+                var id_hits: i32 = 0;
+                var id_want: i32 = 1;
+                if mock_expect_resp {
+                    id_hits = count_sub(&rx, "\"call_id\":\"call_r1\"");
+                    id_want = 2;
+                } else {
+                    id_hits = count_sub(&rx, "\"tool_call_id\":\"call_ctrl\"");
+                }
+                if id_hits != id_want {
+                    verdict = 244;   // 带 NUL 的工具结果必须回到请求里（配对完整）
+                }
+                if count_sub(&rx, "A\\u0000B") != 1 {
+                    verdict = 245;   // 它必须以 \u0000（转义后）出现，不能是裸字节
+                }
+                var built2: bool = false;
+                if mock_expect_resp {
+                    built2 = mock_resp_final_text(&body23, "SELFTEST_CTRL_OK");
+                } else {
+                    built2 = mock_final_body(&body23, "SELFTEST_CTRL_OK");
+                }
+                if !built2 {
+                    verdict = 246;
+                }
+            }
+            var sent23: bool = false;
+            if mock_expect_resp {
+                sent23 = mock_send_resp_sse(cfd, &body23);
+            } else if is_stream {
+                sent23 = mock_send_sse(cfd, &body23);
+            } else {
+                sent23 = mock_send(cfd, &body23);
+            }
+            if !sent23 {
+                verdict = 247;
+            }
+            buf_free(&body23);
             buf_free(&rx);
             _ = sys_close(cfd) catch {};
             round = round + 1;
@@ -3385,7 +3569,16 @@ fn sess_round(tag: &const byte) bool {
         ty_fail(tag, "tool/result 事件开始失败", &ok);
     }
     _ = buf_append_cstr(&ev, "{\"turn\":1,\"step\":1,\"callId\":\"call_s1\",\"content\":");
-    _ = jw_str_into(&ev, "wrote 5 bytes", bufx_cstr_len("wrote 5 bytes"));
+    // P15：控制字节（NUL、0x01）必须**按字节**往返 —— 写入端把它们转义成 \u00XX，
+    // 读回时若只去一个反斜杠，NUL 就变成字面量 `u0000`（内容被悄悄改掉）。
+    var ctrl: Buf = buf_new(16);
+    defer { buf_free(&ctrl); }
+    _ = buf_append_cstr(&ctrl, "A");
+    _ = buf_append_byte(&ctrl, 0);
+    _ = buf_append_cstr(&ctrl, "B");
+    _ = buf_append_byte(&ctrl, 1);
+    _ = buf_append_cstr(&ctrl, "C");
+    _ = jw_str_into(&ev, ctrl.ptr as &const byte, ctrl.len);
     _ = buf_append_cstr(&ev, "}");
     _ = sess_end(&log, &ev);
     buf_reset(&log.title);
@@ -3461,6 +3654,12 @@ fn sess_round(tag: &const byte) bool {
             saw_result = true;
             if !sess_json_str(view, "callId", &text) || !sess_line_has(&text, "call_s1") {
                 ty_fail(tag, "tool/result 的 callId 不对", &ok);
+            }
+            if !sess_json_str(view, "content", &text) || !sv_buf_eq(&text, &ctrl) {
+                ty_fail(tag, "content 里的控制字节没有按字节往返（\\u00XX 被读成字面量？）", &ok);
+                out_err("[sess content] 得到 ");
+                out_err_bytes(text.ptr as &const byte, text.len);
+                out_err("\n");
             }
         }
     }
@@ -3565,6 +3764,14 @@ fn sess_line_has(b: &const Buf, lit: &const byte) bool {
         return false;
     }
     return find_sub(b.ptr[0: b.len], lit[0: n], 0) >= 0;
+}
+
+// 两个 Buf 是否逐字节相同（内容里有 NUL 时不能拿 C 字符串比）
+fn sv_buf_eq(a: &const Buf, b: &const Buf) bool {
+    if a.len != b.len {
+        return false;
+    }
+    return bufx_mem_eq(a.ptr as &const byte, b.ptr as &const byte, a.len);
 }
 
 
@@ -5443,6 +5650,70 @@ fn vw_cap_off(path: &const byte, saved: i32, cfd: i32, out: &Buf) void {
     _ = sys_close(fd) catch {};
 }
 
+// P15：请求体字符串转义的纯函数轮。
+// 不联网、不起服务端 —— 直接把「必须转义的字节全集」喂给 jw_str/jw_key，逐字节比对输出。
+// std.json.encoder.json_write_str_view 只认 " \ \n \r \t，其余控制字节原样上线；
+// 这条测试就是防止再退回那个实现（真机后果见 README 踩坑 27）。
+fn jsonesc_round(tag: &const byte) bool {
+    var ok: bool = true;
+    // 输入：a NUL 0x01 0x1f " \ LF TAB BS FF CR B
+    var raw: [byte: 12] = [97, 0, 1, 31, 34, 92, 10, 9, 8, 12, 13, 66];
+    var out: Buf = buf_new(128);
+    defer { buf_free(&out); }
+    var w: JsonWriter = JsonWriter{ buf: null, cap: 0, used: 0, overflow: false };
+    jw_init(&w, out.ptr, out.cap);
+    jw_str(&w, &raw[0], 12);
+    if jw_overflow(&w) {
+        ty_fail(tag, "转义输出溢出", &ok);
+        return ok;
+    }
+    out.len = jw_used(&w);
+    // 期望：短转义用 \b \f \n \r \t，其余控制字节用 \u00XX（\u0000 就是 NUL）
+    const want: &const byte = "\"a\\u0000\\u0001\\u001f\\\"\\\\\\n\\t\\b\\f\\rB\"";
+    if !ty_buf_is(&out, want) {
+        ty_fail(tag, "控制字节转义文本不对", &ok);
+        out_err("[json-esc] 得到 ");
+        out_err_bytes(out.ptr as &const byte, out.len);
+        out_err("\n");
+    }
+    // 输出（含引号）里不允许再有裸控制字节
+    var i: usize = 0;
+    while i < out.len {
+        if out.ptr[i] < 32 as byte {
+            ty_fail(tag, "转义后的字面量里还有裸控制字节", &ok);
+            break;
+        }
+        i = i + 1;
+    }
+    // key 走同一套转义，再补一个冒号
+    var out2: Buf = buf_new(64);
+    defer { buf_free(&out2); }
+    var w2: JsonWriter = JsonWriter{ buf: null, cap: 0, used: 0, overflow: false };
+    jw_init(&w2, out2.ptr, out2.cap);
+    jw_key(&w2, "k");
+    out2.len = jw_used(&w2);
+    if !ty_buf_is(&out2, "\"k\":") {
+        ty_fail(tag, "jw_key 输出不对", &ok);
+    }
+    // 空串 / 普通 UTF-8 中文不能被改坏
+    var out3: Buf = buf_new(64);
+    defer { buf_free(&out3); }
+    var w3: JsonWriter = JsonWriter{ buf: null, cap: 0, used: 0, overflow: false };
+    jw_init(&w3, out3.ptr, out3.cap);
+    jw_str(&w3, &raw[0], 0);
+    jw_str_cstr(&w3, "中文 ok");
+    out3.len = jw_used(&w3);
+    if !ty_buf_is(&out3, "\"\"\"中文 ok\"") {
+        ty_fail(tag, "空串/中文被改坏了", &ok);
+    }
+    if ok {
+        out_err("selftest[");
+        out_err(tag);
+        out_err("] ok\n");
+    }
+    return ok;
+}
+
 fn diffx_round(tag: &const byte) bool {
     var ok: bool = true;
     var out: Buf = buf_new(16384);
@@ -6706,6 +6977,14 @@ export fn selftest_main(base: &const Config) i32 {
     cfg_free(&cdef);
     const v0: bool = diffx_round("diff-render");
     const v1: bool = view_round("tool-view");
+    // P15：请求体转义（NUL 等控制字节）—— 纯函数轮 + 端到端轮（工具结果里真的带 NUL），
+    // 端到端那条 chat 与 responses 各跑一遍（两条协议的请求体都必须合法）。
+    const v2: bool = jsonesc_round("json-escape");
+    mock_expect_resp = false;
+    const v3: bool = round_run_api(base, "ctrl-bytes", "build/selftest_ws_ctrl", 23, 0 as i64, 4, LLM_STYLE_CHAT, false, "跑一条输出含 NUL 的命令");
+    mock_expect_resp = true;
+    const v4: bool = round_run_api(base, "ctrl-bytes-resp", "build/selftest_ws_ctrl_resp", 23, 0 as i64, 4, LLM_STYLE_RESPONSES, false, "跑一条输出含 NUL 的命令");
+    mock_expect_resp = false;
     // Responses 接口：解析器轮（事件表逐项）+ 非流式 + 请求体 + 协商
     const x0: bool = resp_round(RESP_CASE_TEXT, "resp-text");
     const x1: bool = resp_round(RESP_CASE_TOOLS, "resp-tools");
@@ -6725,7 +7004,7 @@ export fn selftest_main(base: &const Config) i32 {
     const x15: bool = round_run_api(base, "responses-fallback", "build/selftest_ws_resp_fb", 21, 0 as i64, 4, LLM_STYLE_RESPONSES, true, "用 bash 跑 echo RESPONSES-FALLBACK-OK 并只回答这一行");
     // responses 下的自动压缩（摘要请求 + 压缩后的请求都得走 /v1/responses）
     const x16: bool = round_run_api(base, "responses-compact", "build/selftest_ws_resp_ck", 22, 200 as i64, 4, LLM_STYLE_RESPONSES, false, "触发自动压缩");
-    if r1 && r2 && r3 && r4 && r5 && r5b && r6 && r7 && r8 && r9 && s0 && s1 && s2 && s3 && s4 && t0 && t1 && t2 && t3 && t4 && t5 && t6 && t7 && t8 && t9 && t10 && t11 && u0 && u1 && u2 && u3 && v0 && v1
+    if r1 && r2 && r3 && r4 && r5 && r5b && r6 && r7 && r8 && r9 && s0 && s1 && s2 && s3 && s4 && t0 && t1 && t2 && t3 && t4 && t5 && t6 && t7 && t8 && t9 && t10 && t11 && u0 && u1 && u2 && u3 && v0 && v1 && v2 && v3 && v4
         && x0 && x1 && x2 && x3 && x4 && x5 && x6 && x7 && x8 && x9 && x10 && x11 && x12 && x13 && x14 && x15 && x16 {
         out_err("SELFTEST PASS\n");
         return AGENT_OK;
