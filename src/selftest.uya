@@ -22,6 +22,8 @@ var mock_expect_shell: bool = true;
 //   3 = HTTP 401（非 200 必须报错退出，且把错误体打出来）
 //   5 = max-steps 熔断（模型每轮都调工具，agent 必须在 N 步后停下）
 //   6 = 中断轮：发若干帧后挂住不发 [DONE]，客户端应被 Ctrl-C 打断
+//  17 = 不限步数轮：默认 max_steps=0（不限）时连给 14 轮工具调用（超过旧默认 12），
+//       第 15 轮才给最终答案 —— agent 必须一路跑完并以 0 退出（默认回到 12 这轮就失败）
 var mock_mode: i32 = 0;
 // --compat-fold 轮：mock 期望看到「折叠成一条 user 消息」的旧协议
 var mock_expect_fold: bool = false;
@@ -218,6 +220,44 @@ fn mock_toolcall_body(out: &Buf, with_shell: bool) bool {
         jw_byte(&w, 125);
         jw_byte(&w, 125);
     }
+    jw_byte(&w, 93);
+    jw_byte(&w, 125);
+    jw_byte(&w, 125);
+    jw_byte(&w, 93);
+    jw_byte(&w, 125);
+    if jw_overflow(&w) {
+        return false;
+    }
+    out.len = jw_used(&w);
+    return true;
+}
+
+// 不限步数轮用：一封只含**一个** bash 调用的响应（每轮都一样，靠 tool_call_id 计数）。
+// 不碰文件，从而避开 fs 的观察策略（write 需要先 read）：每一步都是干净、等价的。
+fn mock_steps_body(out: &Buf) bool {
+    var w: JsonWriter = JsonWriter{ buf: null, cap: 0, used: 0, overflow: false };
+    jw_init(&w, out.ptr, out.cap);
+    jw_byte(&w, 123);
+    jw_key(&w, "id");
+    jw_str_cstr(&w, "chatcmpl-selftest");
+    jw_byte(&w, 44);
+    jw_key(&w, "choices");
+    jw_byte(&w, 91);
+    jw_byte(&w, 123);
+    jw_key(&w, "index");
+    jw_i64(&w, 0);
+    jw_byte(&w, 44);
+    jw_key(&w, "message");
+    jw_byte(&w, 123);
+    jw_key(&w, "role");
+    jw_str_cstr(&w, "assistant");
+    jw_byte(&w, 44);
+    jw_key(&w, "content");
+    jw_null(&w);
+    jw_byte(&w, 44);
+    jw_key(&w, "tool_calls");
+    jw_byte(&w, 91);
+    mock_call(&w, "call_step", "bash", "{\"command\":\"echo SELFTEST-STEP-OK\",\"description\":\"echo a marker\"}");
     jw_byte(&w, 93);
     jw_byte(&w, 125);
     jw_byte(&w, 125);
@@ -615,6 +655,9 @@ fn mock_server(lfd: i32) i32 {
     if mock_mode == 16 {
         limit = 1;          // workflow 轮：假脚本只派 1 个子代理
     }
+    if mock_mode == 17 {
+        limit = 15;         // 不限步数轮：14 轮工具调用 + 1 轮最终答案
+    }
     while round < limit {
         // accept 最多等 10 秒：客户端不再发请求时 mock 必须自己退出，
         // 否则「mock 卡在 accept」会变成整个自测卡死（踩过）
@@ -684,6 +727,49 @@ fn mock_server(lfd: i32) i32 {
                 verdict = 151;
             }
             buf_free(&body16);
+            buf_free(&rx);
+            _ = sys_close(cfd) catch {};
+            round = round + 1;
+            continue;
+        }
+        if mock_mode == 17 {
+            // 不限步数轮：连给 14 轮 tool_calls（旧默认 12 会在第 12 步熔断），
+            // 第 15 轮才给最终答案。断言口径是「请求里的 tool_call_id 条数 == 已经跑过的步数」，
+            // 所以少跑一步（熔断/丢历史）都会被抓出来。
+            const tool_rounds: i32 = 14;
+            var body17: Buf = buf_new(512);
+            if round < tool_rounds {
+                if round > 0 && sel_count_sub(&rx, "\"tool_call_id\":\"call_step\"") != round as usize {
+                    verdict = 160;
+                }
+                if !mock_steps_body(&body17) {
+                    verdict = 161;
+                }
+            } else {
+                if sel_count_sub(&rx, "\"tool_call_id\":\"call_step\"") != tool_rounds as usize {
+                    verdict = 163;   // 14 步的工具结果必须一条不少地回到请求里
+                }
+                if !contains(&rx, "SELFTEST-STEP-OK") {
+                    verdict = 164;
+                }
+                if verdict == 0 {
+                    if !mock_final_body(&body17, "SELFTEST_UNLIMITED_OK") {
+                        verdict = 165;
+                    }
+                } else if !mock_final_body(&body17, "SELFTEST_FAIL") {
+                    verdict = 165;
+                }
+            }
+            var sent17: bool = false;
+            if is_stream {
+                sent17 = mock_send_sse(cfd, &body17);
+            } else {
+                sent17 = mock_send(cfd, &body17);
+            }
+            if !sent17 {
+                verdict = 162;
+            }
+            buf_free(&body17);
             buf_free(&rx);
             _ = sys_close(cfd) catch {};
             round = round + 1;
@@ -1416,6 +1502,9 @@ fn selftest_round(base: &const Config, tag: &const byte, mode: i32, allow_shell:
     c.compat_fold = fold;
     if mode == 5 {
         c.max_steps = 3;      // 熔断轮：mock 每轮都给 tool_calls，agent 必须在 3 步停下
+    } else if mode == 17 {
+        // 不限步数轮：**故意不设** max_steps —— 吃的就是 cfg_default() 的默认值（0 = 不限）。
+        // 默认值一旦被人改回 12，这轮会因为在第 12 步熔断而失败（mock 只服务了 12 次）。
     } else {
         c.max_steps = 4;
     }
@@ -4231,6 +4320,109 @@ fn knobs_round(tag: &const byte) bool {
     return ok;
 }
 
+// 历史消息的文本比对（下标安全 + 长度先比）
+fn hist_text_is(h: &const History, i: usize, lit: &const byte) bool {
+    const n: usize = bufx_cstr_len(lit);
+    const m: &const Msg = msg_at(h, i);
+    if m.text_len != n {
+        return false;
+    }
+    return bufx_mem_eq(m.text, lit, n);
+}
+
+// 不限步数带来的长跑副作用：历史会反复「丢最老」。这一轮钉住两条不变量：
+//   1) system 与**任务原文**（下标 1 的 user）永远留住 —— 否则跑几十步之后 agent
+//      会把自己的任务丢掉；
+//   2) assistant(tool_calls) 与它的 tool 结果整组丢，历史绝不会以悬空的 tool 开头。
+fn hist_keep_round(tag: &const byte) bool {
+    var ok: bool = true;
+
+    // ---- 1) 小历史：丢的是一条完整的 assistant(tool_calls)+tool 组，任务原文留住 ----
+    var h: History = hist_init();
+    defer { hist_free(&h); }
+    _ = hist_push(&h, ROLE_SYSTEM, "S" as &const byte, 1);
+    _ = hist_push(&h, ROLE_USER, "TASK" as &const byte, 4);
+    _ = hist_push_msg(&h, ROLE_ASSISTANT_CALLS, "c" as &const byte, 1, "[]" as &const byte, 2);
+    _ = hist_push_msg(&h, ROLE_TOOL, "r" as &const byte, 1, "call_1" as &const byte, 6);
+    _ = hist_push(&h, ROLE_USER, "next" as &const byte, 4);
+    if h.len != 5 {
+        ty_fail(tag, "历史没按预期堆起来", &ok);
+    }
+    const dropped: bool = hist_drop_oldest(&h);
+    if !dropped {
+        ty_fail(tag, "hist_drop_oldest 拒绝丢（历史够长却返回 false）", &ok);
+    } else if h.len != 3 {
+        ty_fail(tag, "丢的条数不对（assistant+tool 必须整组丢）", &ok);
+    } else if msg_role_at(&h, 0) != ROLE_SYSTEM {
+        ty_fail(tag, "system 被丢掉了", &ok);
+    } else if msg_role_at(&h, 1) != ROLE_USER || !hist_text_is(&h, 1, "TASK" as &const byte) {
+        ty_fail(tag, "任务原文（下标 1 的 user）被丢掉了", &ok);
+    } else if msg_role_at(&h, 2) != ROLE_USER {
+        ty_fail(tag, "丢掉一组之后剩下的消息不对", &ok);
+    }
+
+    // ---- 2) 首位不是 user（导入的会话/裁剪过的历史）时，退回「从下标 1 丢」的老行为 ----
+    var h2: History = hist_init();
+    defer { hist_free(&h2); }
+    _ = hist_push(&h2, ROLE_SYSTEM, "S" as &const byte, 1);
+    _ = hist_push_msg(&h2, ROLE_ASSISTANT_CALLS, "c" as &const byte, 1, "[]" as &const byte, 2);
+    _ = hist_push_msg(&h2, ROLE_TOOL, "r" as &const byte, 1, "call_1" as &const byte, 6);
+    _ = hist_push(&h2, ROLE_USER, "later" as &const byte, 5);
+    const d2: bool = hist_drop_oldest(&h2);
+    if !d2 {
+        ty_fail(tag, "首位不是 user 时 hist_drop_oldest 拒绝丢", &ok);
+    } else if h2.len != 2 {
+        ty_fail(tag, "首位不是 user 时丢的条数不对", &ok);
+    } else if msg_role_at(&h2, 0) != ROLE_SYSTEM || msg_role_at(&h2, 1) != ROLE_USER {
+        ty_fail(tag, "首位不是 user 时剩下的角色序列不对", &ok);
+    }
+
+    // ---- 3) 塞到 MSG_MAX 之后继续跑：任务原文仍在，且不会以悬空 tool 开头 ----
+    var h3: History = hist_init();
+    defer { hist_free(&h3); }
+    _ = hist_push(&h3, ROLE_SYSTEM, "S" as &const byte, 1);
+    _ = hist_push(&h3, ROLE_USER, "TASK-KEEP" as &const byte, 9);
+    var k: i32 = 0;
+    var pa: bool = true;
+    var pt: bool = true;
+    while k < 40 {
+        pa = hist_push_msg(&h3, ROLE_ASSISTANT_CALLS, "c" as &const byte, 1, "[]" as &const byte, 2);
+        while !pa {
+            if !hist_drop_oldest(&h3) {
+                break;
+            }
+            pa = hist_push_msg(&h3, ROLE_ASSISTANT_CALLS, "c" as &const byte, 1, "[]" as &const byte, 2);
+        }
+        pt = hist_push_msg(&h3, ROLE_TOOL, "r" as &const byte, 1, "call_x" as &const byte, 6);
+        while !pt {
+            if !hist_drop_oldest(&h3) {
+                break;
+            }
+            pt = hist_push_msg(&h3, ROLE_TOOL, "r" as &const byte, 1, "call_x" as &const byte, 6);
+        }
+        k = k + 1;
+    }
+    if !pa || !pt {
+        ty_fail(tag, "塞满历史后仍然追加失败（丢历史没能腾出位置）", &ok);
+    } else if h3.len != MSG_MAX {
+        ty_fail(tag, "长跑之后历史长度不等于 MSG_MAX", &ok);
+    } else if msg_role_at(&h3, 0) != ROLE_SYSTEM {
+        ty_fail(tag, "长跑之后 system 被丢掉了", &ok);
+    } else if msg_role_at(&h3, 1) != ROLE_USER || !hist_text_is(&h3, 1, "TASK-KEEP" as &const byte) {
+        ty_fail(tag, "长跑之后任务原文被丢掉了", &ok);
+    } else if msg_role_at(&h3, 2) == ROLE_TOOL {
+        ty_fail(tag, "长跑之后历史以悬空 tool 消息开头", &ok);
+    }
+
+    if ok {
+        out_err("selftest[");
+        out_err(tag);
+        out_err("] ok");
+    }
+    out_err("\n");
+    return ok;
+}
+
 export fn selftest_main(base: &const Config) i32 {
     _ = base;
     out_err("selftest: offline end-to-end (mock LLM on 127.0.0.1, no network, no API key)\n");
@@ -4239,6 +4431,9 @@ export fn selftest_main(base: &const Config) i32 {
     const r3: bool = selftest_round(base, "tools", 2, true, "build/selftest_ws_tools", true, false, false, false);
     const r4: bool = selftest_round(base, "http401", 3, true, "build/selftest_ws_401", true, false, false, false);
     const r5: bool = selftest_round(base, "max-steps", 5, true, "build/selftest_ws_steps", true, false, false, false);
+    // 默认不限步数：mock 连给 14 轮 tool_calls（超过旧默认 12）才给最终答案，
+    // agent 必须一路跑到最终答案并以 0 退出（这轮不设 max_steps，吃的就是默认值）
+    const r5b: bool = selftest_round(base, "unlimited-steps", 17, true, "build/selftest_ws_unlimited", true, false, false, false);
     // 非流式回归：--no-stream 走旧路径，同一份 mock 数据（JSON 回包）
     const r6: bool = selftest_round(base, "noshell-nostream", 1, false, "build/selftest_ws_nostream", false, false, false, false);
     // 折叠协议回归：--compat-fold
@@ -4264,7 +4459,17 @@ export fn selftest_main(base: &const Config) i32 {
     const t9: bool = deleg_round(base, "subagent-goal", "build/selftest_ws_deleg");
     const u0: bool = wf_round(base, "workflow", "build/selftest_wf_ws");
     const u1: bool = knobs_round("preset-knobs-dshsess");
-    if r1 && r2 && r3 && r4 && r5 && r6 && r7 && r8 && r9 && s0 && s1 && s2 && s3 && s4 && t0 && t1 && t2 && t3 && t4 && t5 && t6 && t7 && t8 && t9 && u0 && u1 {
+    const u2: bool = hist_keep_round("hist-keep");
+    // 步数默认值：0 = 不限步数。这条断言是「默认值」这件事的唯一单点保证 ——
+    // 谁把默认值改回 12，unlimited-steps 轮与这里会同时红。
+    var cdef: Config = cfg_default();
+    var u3: bool = true;
+    if cdef.max_steps != 0 {
+        out_err("selftest[default-max-steps] FAIL: cfg_default().max_steps != 0（默认必须是不限步数）\n");
+        u3 = false;
+    }
+    cfg_free(&cdef);
+    if r1 && r2 && r3 && r4 && r5 && r5b && r6 && r7 && r8 && r9 && s0 && s1 && s2 && s3 && s4 && t0 && t1 && t2 && t3 && t4 && t5 && t6 && t7 && t8 && t9 && u0 && u1 && u2 && u3 {
         out_err("SELFTEST PASS\n");
         return AGENT_OK;
     }

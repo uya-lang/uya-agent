@@ -25,7 +25,7 @@ tool 结果超 8192 码点自动剪枝，压力超过窗口 80% 时自动压缩�
 （`uya run` 执行）编排子代理，脚本里的钩子**代理回父进程**执行。
 最后是收尾：**工具/上下文旋钮由 DSH preset 驱动**（`--print-config` 显示来源与取值）、
 **能直接读 DSH 自己的会话**（`--list-dsh-sessions` / `--resume-dsh`，含 zstd 压缩）、
-`make e2e` 一条命令跑真实网关。
+`make e2e` 一条命令跑真实网关（步数默认不限，`STEPS=N` 可显式熔断）。
 `--no-stream` / `--compat-fold` 保留两条回退路径。
 
 ```
@@ -74,7 +74,7 @@ export UYA_SPLIT_C_DIR=$PWD/build/uyacache      # 多文件 C 缓存别丢在仓
 | `--base-url URL` | 默认 `https://api.deepseek.com/v1`（也支持 `http://127.0.0.1:11434/v1` 这类本地明文端点） |
 | `--model NAME` | 默认 `deepseek-chat` |
 | `--workspace DIR` | 工具的活动目录，默认当前目录 |
-| `--max-steps N` | 最多几轮工具调用，默认 12（熔断，防止模型绕圈） |
+| `--max-steps N` | **熔断上限**：最多几轮工具调用，**默认 0 = 不限** —— 一直跑到模型给出最终答案（对齐 DSH：它没有步数上限） |
 | `--max-response N` | 响应体上限，默认 256 KiB |
 | `--timeout-ms N` | 单次 HTTP 超时，默认 120 s |
 | `--no-shell` | 不提供 `run_shell`（tools schema 里也不会出现） |
@@ -111,10 +111,12 @@ export UYA_SPLIT_C_DIR=$PWD/build/uyacache      # 多文件 C 缓存别丢在仓
 | `--tls-debug` | 保留 `lib/tls` 的握手调试输出（默认静音，见第 3 节第 14 条） |
 | `--http-debug` | 打印每轮响应的头与体首字节（排查网关怪异响应用） |
 
-环境变量：`UYA_AGENT_BASE_URL`、`UYA_AGENT_MODEL`、`UYA_AGENT_WORKSPACE`、`UYA_AGENT_MAX_STEPS`、
+环境变量：`UYA_AGENT_BASE_URL`、`UYA_AGENT_MODEL`、`UYA_AGENT_WORKSPACE`、
+`UYA_AGENT_MAX_STEPS`（步数熔断上限，`0` = 不限，也是默认值；非法值告警后按「不限」处理）、
 以及 key（三选一）：`UYA_AGENT_API_KEY` / `DEEPSEEK_API_KEY` / `OPENAI_API_KEY`。
 
-退出码：`0` 成功 · `1` 用法/配置错 · `2` 传输错（DNS/TCP/TLS/超时）· `3` 模型或协议错 · `4` 工具/工作区错。
+退出码：`0` 成功 · `1` 用法/配置错 · `2` 传输错（DNS/TCP/TLS/超时）· `3` 模型或协议错
+（**只在你显式给了 `--max-steps N` 时**才包含「步数熔断」）· `4` 工具/工作区错。
 
 ---
 
@@ -403,8 +405,11 @@ Messages API（`x-api-key` + `anthropic-version: 2023-06-01`，服务端工具 `
   运行中输入的 slash 命令也按命令处理（用户并不知道回合是否结束）。
 * **中断语义对齐 DSH**：流式期间中断 → assistant 消息只保留非空白前缀且**不含 tool_calls**；
   工具执行期间中断 → 已派发的补 `aborted by user`、未派发的补 `aborted before dispatch`。
-  回合一结束就回到提示符，历史完整，`/continue` 或直接输入都能接着跑；
-  交互模式下 `--max-steps` 只结束回合不杀进程（一次性运行仍返回退出码 3）。
+  回合一结束就回到提示符，历史完整，`/continue` 或直接输入都能接着跑。
+* **步数默认不限**（`--max-steps 0`，也是内置默认）：一个回合只在模型给出**不含 tool_calls 的
+  最终答案**时结束 —— 跑多少步由任务决定，不由 CLI 决定（对齐 DSH：它没有步数上限）。
+  只有显式给了 `--max-steps N` 才有熔断回合：交互模式下熔断只结束回合、不杀进程
+  （一次性运行仍返回退出码 3），提示里会告诉你 `/continue` 可以接着跑。
 * **非 TTY 自动回退**：stdin 不是终端时走行式 REPL（同一份 history 连续对话）。
 * **已知限制（TAB）**：物理列模型把控制字符（含 TAB）按 0 列算，而终端里 TAB 会跳到下一个
   制表位 —— 只有当 TAB 恰好落在「与输入行同一行」的正文里时，才会把输入行起始列算小几格
@@ -699,14 +704,17 @@ contextWindow/maxTokens/input image/reasoningEffort/`permission→confine`/`uya-
   `运行输出：\`Hello, Uya!\`（编译通过，退出码 0）。`，产物 `hello` 是真实 ELF、
   独立运行输出 `Hello, Uya!`；usage 逐轮打印（含 `cache_read=896` 前缀缓存命中）。
 | `http401` | mock 回 401 + 错误体：agent 必须打印状态与错误体并退出 3 |
-| `max-steps` | mock 每轮都给 tool_calls：agent 必须在 `max_steps` 步后熔断退出 3 |
+| `max-steps` | **显式**给 `max_steps=3`：mock 每轮都给 tool_calls，agent 必须在 3 步后熔断退出 3 |
+| `unlimited-steps` | **默认不限步数**（这轮故意不设 `max_steps`，吃 `cfg_default()` 的 0）：mock 连给 **14 轮** tool_calls（超过旧默认 12）才给最终答案 —— agent 必须一路跑满 14 步、把 14 条 `tool_call_id` 全带回请求，并以 0 退出。默认值一旦改回 12，mock 只会被服务 12 次，这轮立刻失败 |
+| `hist-keep` | 长跑副作用：`hist_drop_oldest` 必须留住 system 与**任务原文**（下标 1 的 user），且 `assistant(tool_calls)` 与其 tool 结果整组丢；塞满 `MSG_MAX` 后继续追加仍成立 |
 
-另外三条独立验收：
+另外几条独立验收：
 
 ```bash
 make check                                   # A1 类型检查通过
 make build                                   # A2 产出 build/uya-agent
 make probe BASE=https://api.deepseek.com/v1  # A4 期望 HTTP 401 + leaf 指纹（无需 key）
+make e2e-steps                               # 步数默认值回归：默认不限步数、CLI/env 同口径（离线）
 DEEPSEEK_API_KEY=... ./build/uya-agent --tls-verify=pin <sha256> "创建 hello.uya，编译并运行它"   # A5 真实端到端
 ```
 
@@ -733,8 +741,13 @@ UYA_AGENT_API_KEY=… ./build/uya-agent \
 
 ## 7. 已知限制
 
-* 上下文管理很朴素：整个历史每轮重新序列化，超过 24 条/单条 200 KiB 时丢最老的对话；
-  没做 token 计数或智能摘要。
+* 上下文管理很朴素：整个历史每轮重新序列化，超过 **64 条消息**（`MSG_MAX`）/单条 200 KiB 时
+  丢最老的对话（`assistant(tool_calls)` 与它的 tool 结果整组丢；**system 与任务原文留住**）；
+  没做 token 计数或智能摘要。严格协议下一轮工具调用占 2 条消息，所以约 31 步之后开始丢老消息
+  —— 不限步数的长跑主要靠「上下文压缩」（`context_window` 来自 DSH 模型条目）来续命。
+* **默认不限步数**：模型若陷入工具循环不会自动停 —— 交互模式 Ctrl-C 中断本回合（历史保留），
+  脚本/CI 用 `--max-steps N` 或 `UYA_AGENT_MAX_STEPS=N` 熔断（`make e2e` 也可 `STEPS=N`）。
+  没做「重复调用检测」这类启发式熔断。
 * `read_file` 一次最多 64 KiB；`write_file` 是整文件覆盖，没有 diff/patch 工具。
 * 只做 IPv4（标准库 `dns_client_resolve_first_ipv4`），不做 IPv6、不走代理。
 * 目标平台是 Linux x86-64（代码里的 syscall/常量按这个平台写）。
