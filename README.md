@@ -4,7 +4,7 @@
 多轮 loop 直到给出结论。全部代码 32 个 `.uya` 文件，**不引入任何 C 代码、`@c_import` 或其它语言**，
 只依赖 Uya 语言与随编译器分发的标准库。
 
-**P0–P14 全部完成**：LLM 交互是**流式 SSE**（`stream:true` + `stream_options.include_usage`），
+**P0–P15 全部完成**：LLM 交互是**流式 SSE**（`stream:true` + `stream_options.include_usage`），
 增量 chunked 解码 + SSE 分帧 + `tool_calls` 按 `index` 分片累积；消息协议是**严格工具协议**
 （`assistant.tool_calls` 原样回灌 + 每条结果一条 `role:"tool"` + `tool_call_id`）；
 交互界面是**真 TTY**（termios raw + 行编辑器），流式期间可打断、可继续输入、可续跑；
@@ -29,6 +29,9 @@ tool 结果超 8192 码点自动剪枝，压力超过窗口 80% 时自动压缩�
 **P14 把终端转录改成 DSH 内容块**：每次工具调用一行「状态字形 + 标题(关键参数) + 后缀」，
 正文是结果首尾若干行、`write`/`edit` 的**行级 diff**、`todo_write` 的清单，
 `--quiet` 原样退回旧的最小转录。
+**P15 给子代理加了窗口面板**：输入行上方常驻一块带边框的窗口区，每个运行中的子代理 2 行
+（命令行 + 状态行，含**实时秒数**与已收输出行数），最多显示最后 4 个，跑完立刻收掉并在滚动区
+补一行结算通知；边框按显示列逐行补满，自测对每一行断言「列数完全相等」。
 `--no-stream` / `--compat-fold` 保留两条回退路径。
 
 ```
@@ -171,7 +174,9 @@ src/llm.uya       请求/响应协议（两种）：chat/completions 的流式 d
 src/tools.uya     三个工具：read_file / write_file / run_shell
 src/tty.uya       终端层：termios raw 模式、行编辑器（历史/光标/Delete/词删除，**按 UTF-8
                   字符编辑、按显示列定位**）、渲染协议（擦输入行→写→重画，输入行折行或紧跟
-                  在没换行的正文后面都只擦自己那一块）、提示符即状态显示
+                  在没换行的正文后面都只擦自己那一块）、提示符即状态显示、
+                  **多行「面板块」**（输入行上方常驻的窗口区：逐行 ESC[2K 擦除 + 相对上移，
+                  子代理面板就画在这里）
 src/inbox.uya     输入收件箱：steer（运行中输入的文本，step 边界领取）+ keepInbox 语义
 src/yamlcfg.uya   自带 YAML 子集解析器：去注释（块标量/引号感知）、中和 `!!tag`、
                   block/flow 映射与序列、`|`/`>` 块标量、跨行 flow 集合、节点池树 + 导航
@@ -191,7 +196,8 @@ src/dshcfg.uya    读 DSH 设置：$DSH_HOME 解析、settings.yaml 模型路线
 src/workflow.uya  workflow：把脚本写成 .ush + 生成同目录的自包含 hooks.uya（钩子客户端）、
                   监听 127.0.0.1 的钩子端口、fork+exec `uya run`、边等服务脚本边处理钩子
 src/deleg.uya     子代理：fork 不 exec（同二进制跑 agent_run）、结果管道 + 增量读取、
-                  父子会话关联（subagent/start 事件）、前台/后台、send_message 续跑、interrupt、ralph
+                  父子会话关联（subagent/start 事件）、前台/后台、send_message 续跑、interrupt、ralph、
+                  spawn 时刻记账（面板秒数）+ 终态结算通知（跑完即隐）
 src/goal.uya      会话级目标：goal.json（id/revision/phase/round/maxRounds/blocker/armed）、
                   精确 id+revision 校验、blocked 至少连续 3 轮
 src/skill.uya     技能：5 个发现根（项目 .dsh/.agents → --skill-dir → $DSH_HOME/skills →
@@ -212,7 +218,8 @@ src/session.uya   会话日志：路径规范化、id 生成（/dev/urandom→uu
 src/diffx.uya     行级 diff（只服务显示）：公共整行前后缀裁剪 → LCS DP（60×60 上限）→
                   行列截断 + 头截断；全局暂存最近一次变更，view 层 take 走
 src/view.uya      工具内容块：工具→标题/关键参数/后缀三张表、状态字形、结果首尾若干行、
-                  todo 清单、按显示列截断、交互模式的「运行中提示符」换入换出
+                  todo 清单、按显示列截断、交互模式的「运行中提示符」换入换出、
+                  **子代理窗口面板**（2 行/个、最多 4 个、带边框、逐行等宽）
 src/agent.uya     CLI、环境变量、消息历史、请求组装、主循环（流式/非流式）、工具分发、
                   交互式 REPL（中断/steer//continue/会话命令）、会话事件记录与恢复
 src/selftest.uya  --selftest 的 mock LLM（含 SSE 受控切分）+ 28 轮断言 + --probe
@@ -267,6 +274,48 @@ DSH 的会话视图里每次工具调用是一张卡片：**标题（工具名 +
 * **思考块**：`--show-reasoning` 时每个 step 的思考前面加一行 `✻ 思考`（内容仍原样流式）。
 * 明确不做：ANSI 颜色（`tty_advance_col` 的列算术不认识零宽转义序列，`make codegen-audit`
   对转义写法也有硬约束）、markdown 渲染、可折叠卡片、`--resume` 的转录回放。
+
+### 子代理窗口面板（P15）
+
+工具内容块下面是**输入行上方的常驻窗口区**（「面板块」）：每个**运行中**的子代理占 **2 行**，
+最多显示**最后 4 个**，画在一个共享边框里，输入行永远在它下面：
+
+```
+┌─ agents ───────────────────────────────────────────────────────────────────┐
+│ ● sub-1 [subagent] 审计 deleg 的等待循环与 fork/exec 差异                  │
+│ ● running       3s · 12 · 检查 1030-1120 行的 fork/exec 差异               │
+├─ ──────────────────────────────────────────────────────────────────────────┤
+│ ● sub-2 [ralph] ralph loop                                                 │
+│ ● running      12s · 1 · Round 2 of 4. Objective: 把骨架补齐               │
+└─ ──────────────────────────────────────────────────────────────────────────┘
+[step 4] > 我在这儿接着打字…
+```
+
+* **第 1 行是「命令」**：`● sub-<id> [subagent|ralph] <description>`；**第 2 行是「状态」**：
+  `● running` + 已跑秒数（固定 5 列右对齐）+ `·` + 已收输出行数 + `·` + prompt 首行预览。
+  状态名 10 列左对齐、秒数固定 5 列 —— 位数变化时 `·` 的列号不变（不会左右横跳）。
+* **秒数真的在跳**：`deleg_spawn` 记 `started_ms`，长等待（前台 `subagent` /
+  `subagent_output(wait=true)`）的轮询循环每秒刷一次面板；快照没变时一个字节都不写。
+* **跑完即隐**：面板只收 `status == DELEG_RUNNING` 的窗口；子代理进终态时窗口在**同一次重画**里
+  消失（面板自动缩短），同时在滚动区补一行结算通知
+  `[agents] sub-2 [ralph] ✓ idle 27s — ralph loop`。
+* **边框不错位的四条硬规则**（自测逐行断言）：
+  1. 面板宽 `M = tty_body_width()`（终端宽 − 2），内容行与边框行**都是 M 列**，
+     右竖线恒落在第 M 列；
+  2. 宽度**只按显示列**算（`tty_cols_between`）—— 中文 1 字 3 字节 2 列，按字节数补空格就歪；
+  3. `─` 的数量由「本行实测已用列数」推出来（`view_ag_line_start` 找行首，不能从缓冲区 0 算）；
+  4. 内容超宽逐级收窄（预览 → 输出行数），截断先给 `…` 留 1 列再补齐；
+     状态名/秒数/`·` 是固定前缀，永不截断。
+* **面板块的渲染协议**（`src/tty.uya`）：输入行块 = [窗口行…] + [提示符+输入行]；
+  块底行恒从第 0 列开始，块首行可能不在第 0 列（流式正文没换行时）。
+  擦除 = 上移 `rows-1` 行（**相对量**，扛滚动）→ 右移到块首列 → **逐行 `ESC[2K`**。
+  **不用 `ESC[J`**：它清到屏幕末尾，会连带清掉「紧跟正文的输入行」下面仍然可见的正文文本。
+  输出写入（`tty_out_begin`）也走同一套整块擦除，否则窗口行会残留在屏幕上、越叠越多。
+* **只在干净行上画**：正文停在半行时不画窗口（只画提示符），下一个干净行再出现 —— 绝不擦掉正文。
+* 关联：`view_agents_text` 只认 running、`view_agents_sync` 做快照比对、
+  `deleg_agents_refresh` 是唯一的刷新入口（spawn / 终态 / 等待循环 / step 边界）。
+  刻意不用回调：**uya 0.10 没有函数指针**，只能「上层推、下层画」。
+* `--quiet`（含子代理进程）整层关闭，输出与 P15 之前逐字节一致。
 
 ### preset 旋钮、DSH 会话与 make 目标（P13）
 
@@ -740,6 +789,20 @@ vLLM 等 OpenAI 兼容端点都一样稳。想升级成严格 `tool` 角色消�
     单条超 200 KiB 先剪枝、再头尾截断，绝不因为「太大」拒绝入史。
     回归：`history-long`（40 轮 × 2 调用，逐请求断言配对完整且 80 条结果一条不少）+ `hist-repair`
     （完整组不丢 / 缺应答整组丢）；旧实现在 `history-long` 上必然失败（复现记录在 §6 的验收事实里）。
+27. **多行块（P15 子代理面板）的擦除与定位，四条都是一次踩出来的**：
+    * **别用 `ESC[J` 擦多行块**。它清到屏幕末尾，会连带清掉「输入行紧跟正文」时下面那些
+      **仍然可见**的正文文本（缓冲区里还有，屏幕上看不见了 —— 用户以为输出丢了）。
+      正确做法：上移 `rows-1` 行回块首（**相对量**，扛滚动；绝对屏幕行号在滚动/流式输出之后是脏的）
+      → 右移到块首列 → 逐行 `ESC[2K` 清到块底行为止。
+    * **块变矮时「光标已在目标位置就不发序列」这条捷径会害死人**。窗口关掉后面板从 6 行变 1 行，
+      `erow/trow` 恰好相等 → 提前 return → 新块的尾巴留在屏幕上、`cur_row` 还按旧值记账，
+      下一次擦除就整体错位。修法：面板块在场时禁用这条捷径（`!use_block && !tty_block_on()`）。
+    * **`cur_row` 必须相对块首存**（`tty_build_block_erase` 按 `cur_row+1` 上移），
+      不能存 `tty_end_pos` 算出来的「相对擦除基准点」的行号 —— 两者差一个 `base_row`。
+    * **列数必须从「本行行首」量起**。面板是一行行追加到同一个 `Buf` 里的，
+      从缓冲区 0 量会得到几百，补 `─` 的循环一次都不进，底框退化成「└─ ┘」。
+      另外按列补空格/截断一律用 `tty_cols_between`（显示列），用字节数会把右竖线拉歪。
+      自测里对面板**每一行**断言列宽完全相等，这四条任何一条被写回去都会立刻红。
 
 ---
 
@@ -875,7 +938,15 @@ contextWindow/maxTokens/input image/reasoningEffort/`permission→confine`/`uya-
 参数不是合法 JSON → 无括号无摘要、read 的 `· lines a-b`、todo 的计数与清单（✓/▸/·）、
 write 的 `· +A -D` + diff 正文、**失败的 write 不留假 diff**、窄终端下按列截断补 `…`、
 结果首尾 + `省略` 标记、`--tool-lines 0` 无正文；最后**把 fd 2 接到文件做端到端断言**：
-关闭态抓到 0 字节、打开态抓到的字节与 `view_render_block` 完全一致 |
+关闭态抓到 0 字节、打开态抓到的字节与 `view_render_block` 完全一致。同轮还断言**多行面板块**
+的渲染协议：`tty_block_rows/vis0` 的挂起换行口径、`tty_build_block_erase` 的逐字节（CR / ESC[5A /
+ESC[12C / 逐行 ESC[2K）、真画一帧后屏幕上的块形状与 `cur_row`、以及**块变矮时按老行数擦除**
+（P15 修掉的「光标已在位就提前返回」）|
+| `subagent-panel` | 子代理窗口面板：空表不产出面板；只收 **running**（idle/failed 的窗口立刻消失）；
+标题写「运行中/总数」（`agent 1/4` / `agents 2/4`）；**每一行的显示列数完全相等**且等于
+`tty_body_width()`（含中文标签、超长标题、超长预览的截断情形）；秒数字段固定 5 列
+（`3s` / `1m05s` / `59m+`）且**随已跑时长变化**（1Hz 重画的依据）；`buf` 原语逐字节
+（这里抓过「标题里混进未初始化字节」）；显示层关闭时零输出 |
 | `session-log` | 写 header/事件 → 读回逐行校验（转义层级、`tool_calls` 数组提取、`callId`）；
 手工追加半条记录 → 断言丢弃并标记 `dropped_tail`；用日志重建历史 → 断言角色/`tool_call_id`
 且能重新组装成合法请求；索引与按 id / 最近查找 |

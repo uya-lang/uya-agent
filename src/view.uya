@@ -16,6 +16,8 @@
 // 也不会和正在编辑的输入行打架。
 
 const VIEW_LINE_FALLBACK: usize = 80;
+const VIEW_AG_MAX: usize = 4;          // 只显示最后 4 个子代理窗口
+const VIEW_AG_INNER_MIN: usize = 30;   // 窄终端下内容区的最小列数
 
 // ---- 状态 ----
 var g_view_on: bool = false;
@@ -26,6 +28,9 @@ var g_view_tmp: Buf = Buf{ ptr: null, len: 0, cap: 0 };     // 摘要/正文草�
 var g_view_block: Buf = Buf{ ptr: null, len: 0, cap: 0 };   // 组好的整块（行+正文）
 var g_view_prompt: Buf = Buf{ ptr: null, len: 0, cap: 0 };  // 被顶掉的提示符
 var g_view_swapped: bool = false;
+var g_view_ag: Buf = Buf{ ptr: null, len: 0, cap: 0 };      // 子代理面板快照（与屏幕上的比）
+var g_view_pnl: Buf = Buf{ ptr: null, len: 0, cap: 0 };     // 面板文本草稿（**专用**：不能借 g_view_tmp）
+var g_view_ag_have: bool = false;
 
 // 幂等：REPL 每轮都会调（不能每次 buf_new，否则漏内存）
 export fn view_init(enabled: bool, tool_lines: usize) void {
@@ -44,13 +49,22 @@ export fn view_init(enabled: bool, tool_lines: usize) void {
     if !buf_valid(&g_view_prompt) {
         g_view_prompt = buf_new(1024);
     }
+    if !buf_valid(&g_view_ag) {
+        g_view_ag = buf_new(8192);
+    }
+    if !buf_valid(&g_view_pnl) {
+        g_view_pnl = buf_new(16384);
+    }
     buf_reset(&g_view_row);
     buf_reset(&g_view_body);
     buf_reset(&g_view_tmp);
     buf_reset(&g_view_block);
     buf_reset(&g_view_prompt);
+    buf_reset(&g_view_ag);
+    buf_reset(&g_view_pnl);
+    g_view_ag_have = false;
     g_view_lines = tool_lines;
-    g_view_on = enabled && buf_valid(&g_view_row) && buf_valid(&g_view_body) && buf_valid(&g_view_tmp) && buf_valid(&g_view_block);
+    g_view_on = enabled && buf_valid(&g_view_row) && buf_valid(&g_view_body) && buf_valid(&g_view_tmp) && buf_valid(&g_view_block) && buf_valid(&g_view_ag) && buf_valid(&g_view_pnl);
     g_view_swapped = false;
 }
 
@@ -780,4 +794,412 @@ export fn view_prompt_restore() void {
     if tty_is_interactive() {
         tty_draw_line(&tty_ui, 2);
     }
+}
+
+// ============================================================
+// P15：子代理窗口面板（带边框，画在输入行上方）
+//
+//     ┌─ agents ─────────────────────────────────────────────────────────┐
+//     │ ● sub-1 [subagent] 审计 deleg 的等待循环与 fork/exec 差异        │
+//     │ ● running       3s · 12 · 检查 1030-1120 行的 fork/exec 差异     │
+//     ├─ ────────────────────────────────────────────────────────────────┤
+//     │ ● sub-2 [ralph] ralph loop                                       │
+//     │ ● running      12s · 1 · Round 2 of 4. Objective: 把骨架补齐     │
+//     └─ ────────────────────────────────────────────────────────────────┘
+//     [step 4] > 我在这儿接着打字…
+//
+// 规则（「边框不能错位」全靠它们，自测逐行断言列数）：
+//   1) 面板宽 M = tty_body_width()（终端宽 - 2）；内容行两个竖线之间恒为 M-2 列；
+//   2) 宽度**只按显示列**算（tty_cols_between）—— 中文 1 字 = 3 字节 = 2 列，
+//      按字节数补空格右竖线就会歪；
+//   3) `─` 的数量由「实测已用列数」推出来，不手写、不查表；
+//   4) 状态名 10 列左对齐、秒数 5 列右对齐 —— 位数变化时 `·` 的列号不变；
+//   5) 内容超宽逐级收窄（预览 → 输出行数），截断先给 `…` 留 1 列再补满，
+//      所以宽字符处最多留 1 列空隙，右竖线仍然对齐。
+//
+// 只显示**运行中**的窗口（跑完即隐，收尾信息由 view_agents_note 写进滚动区）。
+// ============================================================
+
+// 状态字形 / 状态名（结算通知与旧工具视图共用，单一来源）
+export fn view_status_glyph(st: u8) &const byte {
+    if st == DELEG_DONE {
+        return "✓" as &const byte;
+    }
+    if st == DELEG_FAILED {
+        return "✗" as &const byte;
+    }
+    if st == DELEG_KILLED {
+        return "■" as &const byte;
+    }
+    return "●" as &const byte;
+}
+
+export fn view_status_name(st: u8) &const byte {
+    return deleg_status_name(st);
+}
+
+fn view_ag_kind(kind: u8) &const byte {
+    if kind == DELEG_KIND_RALPH {
+        return "ralph" as &const byte;
+    }
+    return "subagent" as &const byte;
+}
+
+// 按**列宽**左/右补空格到 n 列。长度**显式传入**（`&const byte` + n），
+// 不要在这里用 `bufx_cstr_len`：传进来的多半是 Buf 的 ptr，没有 NUL 终止符 ——
+// `buf_new` 之后的尾巴是**未初始化内存**，cstr_len 会一路读过界（面板行于是多出一串垃圾字节，
+// 右竖线错位、底框被截断，实测就是这么来的）。
+// 另一个坑：列数必须在**写之前**量好，写在后面会把刚补的空格也数进去。
+fn view_ag_pad(out: &Buf, p: &const byte, n: usize, ln: usize, right: bool) void {
+    var w: usize = 0;
+    if ln > 0 {
+        w = tty_cols_between(p, 0, ln);
+    }
+    if right && w < n {
+        var i: usize = 0;
+        while i < n - w {
+            _ = buf_append_byte(out, 32);
+            i = i + 1;
+        }
+    }
+    if ln > 0 {
+        _ = buf_append(out, p, ln);
+    }
+    if !right && w < n {
+        var i: usize = 0;
+        while i < n - w {
+            _ = buf_append_byte(out, 32);
+            i = i + 1;
+        }
+    }
+}
+
+// 到目前跑了多久：3s / 1m05s / 59m+（超过 1 小时就只报分钟级）
+fn view_ag_secs(out: &Buf, started_ms: u64, now_ms: u64) void {
+    buf_reset(out);
+    if started_ms == 0 || now_ms <= started_ms {
+        _ = buf_append_cstr(out, "0s");
+        return;
+    }
+    var secs: u64 = (now_ms - started_ms) / (1000 as u64);
+    if secs >= (3600 as u64) {
+        const mins: u64 = secs / (60 as u64);
+        if mins > 59 {
+            _ = buf_append_cstr(out, "59m+");
+        } else {
+            _ = buf_append_u64(out, mins);
+            _ = buf_append_cstr(out, "m");
+        }
+        return;
+    }
+    if secs >= (60 as u64) {
+        _ = buf_append_u64(out, secs / (60 as u64));
+        _ = buf_append_cstr(out, "m");
+        const r: u64 = secs % (60 as u64);
+        if r < 10 {
+            _ = buf_append_cstr(out, "0");
+        }
+        _ = buf_append_u64(out, r);
+        _ = buf_append_cstr(out, "s");
+        return;
+    }
+    _ = buf_append_u64(out, secs);
+    _ = buf_append_cstr(out, "s");
+}
+
+// prompt 的第一行、空白折叠成单空格（面板里只要一行预览）
+fn view_ag_preview(out: &Buf, src: &const byte, n: usize) void {
+    buf_reset(out);
+    if n == 0 {
+        return;
+    }
+    // 先按 UTF-8 字符边界砍到 160 字节（**不能**按字节砍，否则会出现半个汉字）
+    var lim: usize = n;
+    if lim > 160 {
+        lim = bufx_utf8_prefix_bytes(src, n, 160);
+    }
+    var i: usize = 0;
+    var sp: bool = false;
+    while i < lim {
+        const c: byte = src[i];
+        if c == 10 as byte || c == 13 as byte {
+            break;                      // 只看第一行
+        }
+        if c == 32 as byte || c == 9 as byte {
+            sp = out.len > 0;
+            i = i + 1;
+            continue;
+        }
+        if sp {
+            _ = buf_append_byte(out, 32);
+            sp = false;
+        }
+        _ = buf_append_byte(out, c);
+        i = i + 1;
+    }
+}
+
+// 边框行：`┌─ 标题 ─…─┐`。`─` 的数量按**实测列数**补齐到 M-1，再写右角。
+// 关键：列数必须从**本行行首**量起（out 里可能已经有很多行了；从 0 量会得到几百，
+// 于是补 '─' 的循环一次都不进，底框就退化成「└─ ┘」——实测踩过）。
+fn view_ag_line_start(out: &const Buf) usize {
+    if out.len == 0 {
+        return 0;
+    }
+    const nl: isize = bufx_find_byte(out.ptr[0: out.len], 10 as byte, 0);
+    if nl < 0 {
+        return 0;
+    }
+    var from: usize = 0;
+    var found: bool = false;
+    while true {
+        const n2: isize = bufx_find_byte(out.ptr[0: out.len], 10 as byte, from);
+        if n2 < 0 {
+            break;
+        }
+        from = (n2 as usize) + 1;
+        found = true;
+    }
+    if !found {
+        return 0;
+    }
+    return from;
+}
+
+fn view_ag_rule(out: &Buf, left: &const byte, right: &const byte, title: &const byte, m: usize) void {
+    const ls: usize = view_ag_line_start(out);
+    _ = buf_append(out, left, bufx_cstr_len(left));
+    _ = buf_append_cstr(out, "─ ");
+    const tn: usize = bufx_cstr_len(title);
+    if tn > 0 {
+        _ = buf_append(out, title, tn);
+        _ = buf_append_byte(out, 32);
+    }
+    const used: usize = tty_cols_between(out.ptr as &const byte, ls, out.len);
+    if used < m - 1 {
+        var k: usize = used;
+        while k < m - 1 {
+            _ = buf_append_cstr(out, "─");
+            k = k + 1;
+        }
+    }
+    _ = buf_append(out, right, bufx_cstr_len(right));
+}
+
+// 内容行：`│ ` + 文本（超宽先收窄）+ 按列补到 inner 列 + `│`
+fn view_ag_row(out: &Buf, text: &const byte, n: usize, m: usize, inner: usize) void {
+    _ = buf_append_cstr(out, "│ ");
+    var t: Buf = buf_empty();
+    defer { buf_free(&t); }
+    if !view_ag_shrink(&t, text, n, inner - 2) {
+        return;                          // 内存不足：宁可不画这一行
+    }
+    if t.len > 0 {
+        _ = buf_append(out, t.ptr, t.len);
+    }
+    // 竖线之间恒为 inner 列：2（"│ "）+ 内容 + 补空格
+    const used: usize = tty_cols_between(t.ptr as &const byte, 0, t.len) + 2;
+    if used < inner + 1 {
+        var k: usize = used;
+        while k < inner + 1 {
+            _ = buf_append_byte(out, 32);
+            k = k + 1;
+        }
+    }
+    _ = buf_append_cstr(out, "│");
+}
+
+// 画一条子代理窗口（两行：命令行 + 状态行）
+fn view_ag_draw_window(out: &Buf, t: &const DelegTable, i: usize, m: usize, inner: usize, now_ms: u64) void {
+    const si: usize = i;
+    if si >= DELEG_MAX {
+        return;
+    }
+    const id: i32 = t.items[si].id;
+    const kind: u8 = t.items[si].kind;
+    const started: u64 = t.items[si].started_ms;
+    var sec: Buf = buf_empty();
+    defer { buf_free(&sec); }
+    view_ag_secs(&sec, started, now_ms);
+    var pv: Buf = buf_empty();
+    defer { buf_free(&pv); }
+    view_ag_preview(&pv, t.items[si].prompt.ptr as &const byte, t.items[si].prompt.len);
+    var head: Buf = buf_empty();
+    defer { buf_free(&head); }
+    var body: Buf = buf_empty();
+    defer { buf_free(&body); }
+    _ = buf_append_cstr(&head, view_status_glyph(DELEG_RUNNING));
+    _ = buf_append_byte(&head, 32);
+    _ = buf_append_cstr(&head, "sub-");
+    _ = buf_append_u64(&head, id as u64);
+    _ = buf_append_cstr(&head, " [");
+    _ = buf_append_cstr(&head, view_ag_kind(kind));
+    _ = buf_append_cstr(&head, "] ");
+    _ = buf_append(&head, t.items[si].label.ptr, t.items[si].label.len);
+    _ = buf_append_cstr(&body, view_status_glyph(DELEG_RUNNING));
+    _ = buf_append_byte(&body, 32);
+    view_ag_pad(&body, "running" as &const byte, 10, 7, false);
+    _ = buf_append_byte(&body, 32);
+    view_ag_pad(&body, sec.ptr as &const byte, 5, sec.len, true);
+    _ = buf_append_cstr(&body, " · ");
+    _ = buf_append_u64(&body, view_count_lines(t.items[si].buf.ptr as &const byte, t.items[si].buf.len) as u64);
+    if pv.len > 0 {
+        _ = buf_append_cstr(&body, " · ");
+        _ = buf_append(&body, pv.ptr, pv.len);
+    }
+    view_ag_row(out, head.ptr as &const byte, head.len, m, inner);
+    _ = buf_append_byte(out, 10);
+    view_ag_row(out, body.ptr as &const byte, body.len, m, inner);
+    _ = buf_append_byte(out, 10);
+}
+
+// 生成整块面板文本（不含输入行）。返回 false = 现在没有要显示的窗口（调用方清空块）。
+// 只收**运行中**的子代理；最多显示最后 VIEW_AG_MAX 个。
+export fn view_agents_text(t: &const DelegTable, out: &Buf) bool {
+    buf_reset(out);
+    var used: usize = 0;
+    var running: usize = 0;
+    var i: usize = 0;
+    while i < DELEG_MAX {
+        if t.items[i].used {
+            used = used + 1;
+            if t.items[i].status == DELEG_RUNNING {
+                running = running + 1;
+            }
+        }
+        i = i + 1;
+    }
+    if running == 0 {
+        return false;
+    }
+    const body_w: usize = view_width();
+    var m: usize = body_w;
+    if m < VIEW_AG_INNER_MIN + 4 {
+        m = VIEW_AG_INNER_MIN + 4;
+    }
+    // 内容行 = "│ " + 内容(截到 inner-2 列) + 补空格到 inner+1 列 + "│" —— 总列宽恒为 m，
+    // 与边框行（也是 m 列）逐列对齐（右边竖线落在第 m 列）。
+    const inner: usize = m - 2;
+    // 标题**直接拼进 out**（不用中间 buf）：既少一次拷贝，也避免中间缓冲被后续写入踩到
+    // （实测出现过标题里混进一个随机字节、右竖线因此错位一列的情况）。
+    {
+        _ = buf_append_cstr(out, "┌");
+        _ = buf_append_cstr(out, "─ ");
+        if running > 1 {
+            _ = buf_append_cstr(out, "agents");
+        } else {
+            _ = buf_append_cstr(out, "agent");
+        }
+        if used > running {
+            _ = buf_append_cstr(out, " ");
+            _ = buf_append_u64(out, running as u64);
+            _ = buf_append_cstr(out, "/");
+            _ = buf_append_u64(out, used as u64);
+        }
+        _ = buf_append_byte(out, 32);
+        const used_cols: usize = tty_cols_between(out.ptr as &const byte, 0, out.len);
+        if used_cols < m - 1 {
+            var k: usize = used_cols;
+            while k < m - 1 {
+                _ = buf_append_cstr(out, "─");
+                k = k + 1;
+            }
+        }
+        _ = buf_append_cstr(out, "┐");
+        _ = buf_append_byte(out, 10);
+    }
+
+    // 只画最后 VIEW_AG_MAX 个运行中的窗口：先数出要跳过几个
+    const now_ms: u64 = ua_now_ms();
+    var skip: usize = 0;
+    if running > VIEW_AG_MAX {
+        skip = running - VIEW_AG_MAX;
+    }
+    var seen: usize = 0;
+    i = 0;
+    while i < DELEG_MAX {
+        const si: usize = i;
+        if si >= DELEG_MAX {
+            break;
+        }
+        if t.items[si].used && t.items[si].status == DELEG_RUNNING {
+            if seen >= skip {
+                view_ag_draw_window(out, t, si, m, inner, now_ms);
+            }
+            seen = seen + 1;
+        }
+        i = i + 1;
+    }
+    view_ag_rule(out, "└" as &const byte, "┘" as &const byte, "" as &const byte, m);
+    _ = buf_append_byte(out, 10);
+    return true;
+}
+
+// 同步面板到 tty 的输入行块：内容变了才推下去并原地重画。返回是否有变化。
+export fn view_agents_sync(t: &const DelegTable) bool {
+    if !g_view_on || !buf_valid(&g_view_ag) || !buf_valid(&g_view_pnl) {
+        return false;
+    }
+    _ = view_agents_text(t, &g_view_pnl);
+    const same: bool = g_view_ag_have && g_view_ag.len == g_view_pnl.len
+        && (g_view_ag.len == 0 || bufx_mem_eq(g_view_ag.ptr as &const byte, g_view_pnl.ptr as &const byte, g_view_ag.len));
+    if same {
+        return false;
+    }
+    buf_reset(&g_view_ag);
+    _ = buf_append(&g_view_ag, g_view_pnl.ptr, g_view_pnl.len);
+    g_view_ag_have = true;
+    if g_view_ag.len == 0 {
+        tty_block_clear();
+    } else {
+        tty_block_begin(g_view_ag.ptr as &const byte, g_view_ag.len);
+    }
+    tty_block_redraw(&tty_ui, 2);
+    return true;
+}
+
+// 某个子代理跑完时的结算通知（窗口已经收掉了，这一行进滚动区）。
+// 内容：[agents] sub-3 [subagent] ✓ idle 27s — 审计 tty 的擦除协议
+export fn view_agents_note(id: i32, kind: u8, status: u8, secs_ms: u64, label: &const byte, label_len: usize) void {
+    var line: Buf = buf_new(1024);
+    defer { buf_free(&line); }
+    _ = buf_append_cstr(&line, "[agents] sub-");
+    _ = buf_append_u64(&line, id as u64);
+    _ = buf_append_cstr(&line, " [");
+    _ = buf_append_cstr(&line, view_ag_kind(kind));
+    _ = buf_append_cstr(&line, "] ");
+    _ = buf_append_cstr(&line, view_status_glyph(status));
+    _ = buf_append_byte(&line, 32);
+    _ = buf_append_cstr(&line, deleg_status_name(status));
+    _ = buf_append_byte(&line, 32);
+    var sec: Buf = buf_empty();
+    defer { buf_free(&sec); }
+    view_ag_secs(&sec, 1, secs_ms + 1);     // 只借用格式化：喂「已过毫秒 + 1」得到稳定文本
+    _ = buf_append(&line, sec.ptr, sec.len);
+    if label_len > 0 {
+        _ = buf_append_cstr(&line, " — ");
+        _ = buf_append(&line, label, label_len);
+    }
+    _ = buf_append_byte(&line, 10);
+    tty_puts(&tty_ui, 2, line.ptr as &const byte);
+}
+
+// 文本超宽逐级收窄（预览 → 尾部），返回是否放得下；放不下时以 `…` 收尾。
+fn view_ag_shrink(out: &Buf, text: &const byte, n: usize, max_cols: usize) bool {
+    buf_reset(out);
+    if n == 0 || max_cols == 0 {
+        return true;
+    }
+    const w: usize = tty_cols_between(text, 0, n);
+    if w <= max_cols {
+        return buf_append(out, text, n);
+    }
+    if max_cols < 2 {
+        return buf_append(out, text, tty_clip_bytes(text, n, max_cols));
+    }
+    const keep: usize = tty_clip_bytes(text, n, max_cols - 1);
+    if !buf_append(out, text, keep) {
+        return false;
+    }
+    return buf_append_cstr(out, "…");
 }
