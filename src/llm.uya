@@ -99,7 +99,7 @@ export struct ChatOut {
     usage_cache_read: i64,
     usage_cache_write: i64,   // responses 的 input_tokens_details.cache_write_tokens（chat 恒 0）
     usage_reasoning: i64,
-    first_token_ms: i64, // P18：首个非空正文 delta 的毫秒时刻（0 = 本次流还没有正文）
+    first_token_ms: i64, // P21：首个非空 delta（正文/思考/工具参数）的毫秒时刻（0 = 本次流还没有任何增量）
     saw_done: bool,
     printed_chars: usize,
     events: usize,
@@ -240,13 +240,21 @@ fn llm_apply_usage(u: &JsonValue, o: &ChatOut) void {
     }
 }
 
-// P18：首 token 打点（**只给流式 delta 路径用**）。
+// P18/P21：首 token 打点（**只给流式 delta 路径用**）。
 //
-// 非流式解析与 responses 的终局回填（output_item.done / 整段 output[]）不打点 ——
-// 那两处拿到的是「整段正文」，打点会把 TTFT 记成整段请求时间。DSH 也是只认首个
-// token delta（`assistant/chunk`），没有 chunk 边界的步不进 TTFT/解码统计。
+// 判据是「本帧里出现了**任意一种**非空增量」——正文、思考（reasoning_content）、
+// 工具调用参数都算，空串 delta / `delta:{}` / usage-only 帧不算。
+//
+// P21 之前只认正文 delta，于是推理模型（先流十几秒思考、正文只在末尾出现）与
+// 工具型回合几乎打不到点：ttft/decode 那一组常常整组不显示；偶尔打到时，分母只覆盖
+// 生成的最后几个百分点、分子却是提供方上报的**全部**输出 token（含思考），
+// 于是 tok/s 爆表（实测 60087 tok / 8990 ms = 6684 tok/s，真值 ~158）。
+// 窗口从「第一个 delta」起算之后，分子分母终于覆盖同一段生成过程。
+//
+// 非流式解析与 responses 的终局回填（output_item.done / 整段 output[]）仍然不打点 ——
+// 那两处拿到的是「整段正文」，打点会把 TTFT 记成整段请求时间（DSH 也只认 chunk 边界）。
 fn llm_note_first_token(o: &ChatOut) void {
-    if o.first_token_ms == 0 && o.content.len > 0 {
+    if o.first_token_ms == 0 {
         o.first_token_ms = ua_now_ms() as i64;
     }
 }
@@ -259,7 +267,9 @@ fn llm_apply_delta(delta: &JsonValue, o: &ChatOut, print_content: bool, print_re
         if !sv_unescape(&sv, &o.content) {
             return error.LlmMalformed;
         }
-        llm_note_first_token(o);
+        if o.content.len > before {
+            llm_note_first_token(o);
+        }
         if print_content && o.content.len > before {
             // P16：正文之前的思考块到此为止（DSH 的 thinking 块在下个块开始时结算），
             // 先把 `✻ 思考 · <首行>…` 那一行落进转录，再写正文。
@@ -275,6 +285,8 @@ fn llm_apply_delta(delta: &JsonValue, o: &ChatOut, print_content: bool, print_re
             return error.LlmMalformed;
         }
         if o.reasoning.len > rbefore {
+            // P21：思考 delta 也算首 token（推理模型的第一个增量几乎总是思考）
+            llm_note_first_token(o);
             // P18：TUI 常驻状态区的思考实时行（默认开，不看 --show-reasoning；--quiet 由显示层兜住）
             view_think_live(o.reasoning.ptr as &const byte, o.reasoning.len);
             if print_reasoning {
@@ -292,6 +304,9 @@ fn llm_apply_delta(delta: &JsonValue, o: &ChatOut, print_content: bool, print_re
             view_think_end(o.reasoning.ptr as &const byte, o.reasoning.len);
         }
         var k: usize = 0;
+        // P21：只有真正带来内容的工具帧才算首 token —— 网关有时会先发一帧只带
+        // `index`/空串的元数据（那不是增量，不能当生成已经开始）
+        var got_payload: bool = false;
         while k < nc {
             var tc: JsonValue = JsonValue.json_null();
             if js_arr_get(&calls, k, &tc) {
@@ -314,6 +329,7 @@ fn llm_apply_delta(delta: &JsonValue, o: &ChatOut, print_content: bool, print_re
                         if !sv_unescape(&idv, &o.calls[si].id) {
                             return error.LlmMalformed;
                         }
+                        got_payload = true;
                     }
                     var fnv: JsonValue = JsonValue.json_null();
                     if js_obj_get(&tc, "function", 8, &fnv) {
@@ -322,6 +338,7 @@ fn llm_apply_delta(delta: &JsonValue, o: &ChatOut, print_content: bool, print_re
                             if !sv_unescape(&nv, &o.calls[si].name) {
                                 return error.LlmMalformed;
                             }
+                            got_payload = true;
                         }
                         var av: JsonStrView = JsonStrView{ ptr: null, len: 0 };
                         if js_obj_get_str(&fnv, "arguments", 9, &av) && av.len > 0 {
@@ -330,11 +347,15 @@ fn llm_apply_delta(delta: &JsonValue, o: &ChatOut, print_content: bool, print_re
                             if !sv_unescape(&av, &o.calls[si].args) {
                                 return error.LlmMalformed;
                             }
+                            got_payload = true;
                         }
                     }
                 }
             }
             k = k + 1;
+        }
+        if got_payload {
+            llm_note_first_token(o);
         }
     }
 }
@@ -542,6 +563,8 @@ fn llm_append_reasoning(o: &ChatOut, sv: &const JsonStrView, print_reasoning: bo
         return error.LlmMalformed;
     }
     if o.reasoning.len > rbefore {
+        // P21：思考 delta 也算首 token（与 chat 路径同口径）
+        llm_note_first_token(o);
         // P18：TUI 常驻状态区的思考实时行（默认开，不看 --show-reasoning；--quiet 由显示层兜住）
         view_think_live(o.reasoning.ptr as &const byte, o.reasoning.len);
         if print_reasoning {
@@ -978,6 +1001,8 @@ fn llm_resp_handle_payload(arena: &Arena, payload: &[byte], o: &ChatOut, print_c
                 if !sv_unescape(&dv, &o.calls[si].args) {
                     return error.LlmMalformed;
                 }
+                // P21：工具参数增量也算首 token（与 chat 路径的 tool_calls 分支同口径）
+                llm_note_first_token(o);
             }
         }
         return true;
