@@ -8,9 +8,10 @@
 默认走 Responses 接口」（落点见 §3 踩坑 27、§2 的 `jsonx.uya`/`session.uya`、§6 的
 `json-escape` / `ctrl-bytes*`）、一条是**子代理窗口面板**（§2 的「子代理窗口面板（并行线的 P15）」，
 踩坑 29）；P16 是**单行转录 + 思考行**，P17 是**纯 Uya 的全屏 TUI**，
-P18 是**常驻状态区 + 思考实时行**；**P19 是诊断出口**：外来字节（网关错误体 / 坏 payload
-头部）只以「转义 + 字符边界截断 + 限长」的一行预览进转录，全文进会话日志 `diag/dump`、
-原始字节走 `--debug-dump`（踩坑 33））：
+P18 是**常驻状态区 + 思考实时行**；**P19 是诊断出口与 read 窗口**：外来字节（网关错误体 /
+坏 payload 头部）只以「转义 + 字符边界截断 + 限长」的一行预览进转录，全文进会话日志
+`diag/dump`、原始字节走 `--debug-dump`（踩坑 33）；`read` 改成**流式窗口**读法，`total` 是
+数完整个文件得到的真值、只有真越界才报 EOF（踩坑 34））：
 LLM 交互是**流式 SSE**（`stream:true` + `stream_options.include_usage`），
 增量 chunked 解码 + SSE 分帧 + `tool_calls` 按 `index` 分片累积；消息协议是**严格工具协议**
 （`assistant.tool_calls` 原样回灌 + 每条结果一条 `role:"tool"` + `tool_call_id`）；
@@ -202,8 +203,9 @@ src/inbox.uya     输入收件箱：steer（运行中输入的文本，step 边�
 src/yamlcfg.uya   自带 YAML 子集解析器：去注释（块标量/引号感知）、中和 `!!tag`、
                   block/flow 映射与序列、`|`/`>` 块标量、跨行 flow 集合、节点池树 + 导航
 src/fsx.uya       文件工具：路径解析（可选工作区守卫）、(mtime,size) 版本、观察状态表、
-                  read（窗口 + 行号 + 三种 footer + 行长/字节上限）、write（createIfAbsent /
-                  replaceIfVersion）、edit（唯一匹配 / replace_all）
+                  read（**流式窗口** `fs_read_window`：真 total + 只缓冲选中行 + 行号 + 三种
+                  footer + 行长/字节上限）、write（createIfAbsent / replaceIfVersion）、
+                  edit（唯一匹配 / replace_all）
 src/shellx.uya    bash 工具：bash -c、workdir、timeoutMs、run_in_background、stdout/stderr 分开收、
                   结果标记（[exit code: N] / [timed out after Nms] / [killed by signal: N]）、DSH_* 环境注入
 src/jobs.uya      后台任务表：注册/增量输出（保留内存尾部 1 MiB）/状态机（running/completed/killed）、
@@ -510,7 +512,7 @@ Messages API（`x-api-key` + `anthropic-version: 2023-06-01`，服务端工具 `
 
 | 工具 | 参数 | 行为要点 |
 |---|---|---|
-| `read` | `file_path`(必), `offset`(1 基, 默认 1), `limit`(默认 2000, 上限 2000) | 逐行加行号，包在 `<path>/<type>file</type>/<content>` 里；footer 三种：`(End of file - total N lines)` / `(Showing lines a-b of T. Use offset=b+1 to continue.)` / `(Output capped. Showing lines a-b. …)`；行长 > 2000 字符截断并标 `... (line truncated to 2000 chars)`；一次最多 51200 字节 |
+| `read` | `file_path`(必), `offset`(1 基, 默认 1), `limit`(默认 2000, 上限 2000) | **流式窗口**读法（P19，踩坑 34）：一边数全文行数（`total` 是真值，不受窗口/上限影响）、一边只缓冲第 `offset … offset+limit-1` 行（缓冲上限 51200+65536 字节），所以 offset 落在文件后半段也读得到；逐行加**绝对**行号，包在 `<path>/<type>file</type>/<content>` 里；footer 三种：`(End of file - total N lines)`（**只有真到末尾才出**）/ `(Showing lines a-b of T. Use offset=b+1 to continue.)` / `(Output capped. Showing lines a-b. …)`；行长 > 2000 字符截断并标 `... (line truncated to 2000 chars)`；一次输出最多 51200 字节 |
 | `write` | `file_path`(必), `content`(必) | **观察策略**：文件存在但**没读过** → 拒绝（`write requires reading "x" first — read the file, then retry`）；读过但**版本变了** → `FS_STALE_VERSION … re-read the file, then retry`；成功回 `Created file` / `Updated file` |
 | `edit` | `file_path`, `old_string`(非空), `new_string`, `replace_all`(默认 false) | 必须**先 read**（任何窗口）；匹配必须唯一（否则报 `appears N times`）；成功回 `The file X has been updated successfully.` / `… All occurrences were successfully replaced.` |
 | `glob` | `pattern`(必), `path`(可选目录) | `rg --files --glob <p> --sort=modified --no-ignore --hidden` + 排除 `.git/.svn/.hg/.bzr/.jj/.sl`；默认显示前 100 条；空 → `No files found` |
@@ -1095,6 +1097,30 @@ vLLM 等 OpenAI 兼容端点都一样稳。想升级成严格 `tool` 角色消�
     半截字节变 U+FFFD、思考尾部不切字）。真机对照（本地假网关回显 18 KB 请求）：
     修前 stderr 297 B / 7 个裸 CR / 9 行，修后 330 B / 0 个裸 CR / 3 行 + `… 18693 bytes total`。
 
+34. **`read` 把「我们自己读到的前缀」当成整个文件 —— 大文件报错行数、offset 越界时假 EOF。**
+    症状（真实会话踩到）：`read src/agent.uya`（当时 226 KB / 5756 行）回
+    `(End of file - total 3149 lines)`，再 `read` 同一个文件 `offset=3272` 得到
+    「空内容 + `End of file - total 3149 lines`」—— 模型据此判定「文件只有 3149 行、已经读完」，
+    后面一连串「为什么第 3272 行读不出来」的排查全是在追这个假信息。
+    根因在 `fs_tool_read`：它先 `fs_read_file_all(fd, &data, cap+1)` 只读文件头 `cap = 51200+65536`
+    字节就停，然后 `total = fs_count_lines(这段前缀)`，窗口再从这个前缀里切 —— 于是
+    ① `total` 是**前缀的行数**（文件越大错得越多）；② `offset` 落在前缀之外时 `fs_line_at` 直接
+    失败，`shown_end == 0` 走进「一行都没输出」分支，打印 `(End of file - total N lines)`，
+    看起来就是文件已经读完（假 EOF）。
+    修法：新增 `fs_read_window`，**流式**读一遍文件 —— 一边数真实行数（`total`，末尾无换行的残行
+    也按 `fs_count_lines` 口径算一行），一边只缓冲第 `offset … offset+limit-1` 行；缓冲撞上
+    `fs_read_max_bytes + 65536` 时**回滚掉半行**（只留最后一个完整行）并置「被截断」，
+    让上层走 `(Output capped …)` 而不是把半行当整行渲染。`fs_tool_read` 相应改成窗口内相对下标
+    （绝对行号 = `offset + k`），footer 四种分支按「真 total / 真越界 / 输出上限」判。
+    回归轮 `read-window`：4000 行 × 40 字节 = 160 KB（> cap）的文件上断言
+    ① `limit=1000` → `(Showing lines 1-1000 of 4000. …)`（旧实现会报前缀行数）；
+    ② `offset=3500` → 真读到 `3500: L03500`（旧实现这里是假 EOF）；
+    ③ `offset=4001` → 才是 `(End of file - total 4000 lines)`；
+    ④ 撞输出上限走 `(Output capped …)`；⑤ 末尾无换行的残行算进 `total`。
+    真机对照（同一个 5949 行 / 230 KB 的 `src/agent.uya`，`offset=3000, limit=20`）：
+    旧 `of 3080` → 新 `of 5949`；`offset=4000, limit=20`：旧「空内容 + `total 3080 lines`」→
+    新 20 行 + `(Showing lines 4000-4019 of 5949. …)`（见 §6 的 P19 验收记录）。
+
 ---
 
 ## 4. 工具实现要点
@@ -1275,6 +1301,7 @@ responses 看 `call_id`）；**chat 与 responses 各一轮**，且顺便断言�
 | `diag-preview` | 诊断出口的纯函数轮（P19，踩坑 33）：cap 落在多字节字符中间时必须在**字符边界**上停（600 B 中文 + cap 320 → 只吃 318 B，`bufx_utf8_valid` 为真）；半截序列与**孤立续字节**逐字节 `\xNN`；NUL/ESC/CR 走 `\xNN`、TAB 与换行走短转义；合法 U+FFFD 原样留着；`out_diag` 出来的字节序列**只有一个换行**、≤512 B、超长带 `… N bytes total` 后缀；`--debug-dump` 文件里有完整原始字节 |
 | `diag-echo-400` / `diag-echo-400-ns` | 端到端（mock mode 24，流式与非流式各一轮）：mock 网关回 **400 + 把整个请求原样回显**（含请求头的 CRLF 与 `tools` 数组）→ 断言 fd 2 上只有 `model endpoint returned HTTP 400` + 一行转义预览：CR 转义成 `\x0d`、**没有裸 CR/NUL/ESC**、行数 ≤6、总长 ≤1 KiB；同时断言 `--debug-dump` 里有完整原文、会话日志里有 `diag/dump` 事件（`kind`/`bytes`/`truncated`/`text`，文本里同样没有裸控制字节）。这两条就是「转录一屏乱码」的现场回归 |
 | `tui-diag` | 显示层轮（P19）：4 KiB 的 JSON 块从 fd 2 进来 → NOTICE 只留 ≤512 B + 一行截断提示（不修则 40 份重复铺满整屏）；半截汉字在屏幕上变成 **U+FFFD** 且屏幕文本 `bufx_utf8_valid` 为真（终端不会自己渲染半个字）；正文层无 ESC；思考条目尾部截断（4096 B、中文 3 B/字）不切出半个汉字 |
+| `read-window` | `read` 的行窗口（P19，踩坑 34）：在 4000 行 × 40 B = 160 KB（> 读缓冲上限 116736）的文件上直接调 read 工具（args 现造、走真实 JSON 解析路径）——断言 `limit=1000` → `(Showing lines 1-1000 of 4000. …)`（**total 是真值**，旧实现报前缀行数）、`offset=3500` → 真读到 `3500: L03500`（旧实现这里是假 EOF）、`offset=4001` → 才是 `(End of file - total 4000 lines)`、`limit=2000` → 走 `(Output capped …)`、末尾无换行的残行算进 `total`（`a\nb\nc` → 3 行） |
 
 **P1/P2 的验收事实**（2026-10-02）：
 
@@ -1323,6 +1350,26 @@ responses 看 `call_id`）；**chat 与 responses 各一轮**，且顺便断言�
   `--workspace` 都在临时目录），再用修好的二进制 `--resume` 它并追加一句新任务 —— 真机返回正常
   回答（不再 400），证明转义后的 `\u0000` 被真网关接受；随后又用 `make e2e TASK="…"` 跑了一轮
   全新会话，同样正常。
+* **P19 的验收记录（2026-10-03，对应踩坑 33/34）**：两件事都用**本地假网关**在真二进制上做过
+  before/after 对照，假网关脚本留在仓里：`testdata/mock_gateway_echo.py`（非 2xx 的错误体里
+  **原样回显**收到的整个请求 —— 就是那次乱码的现场形状）。
+  * **诊断出口（踩坑 33）**：`python3 testdata/mock_gateway_echo.py 0` 起假网关，
+    `uya-agent --no-dsh-config --base-url http://127.0.0.1:$PORT/v1 --api=chat --max-steps 1
+    --debug-dump /tmp/diag.bin "写一个文件"`。用 `git archive 416da94`（P19 之前的提交）
+    单独编了一份旧二进制做对照，同一场景、同一命令：
+    流式 —— 旧 stderr **297 B / 6 行（含 3 个裸 CR）** → 新 **315 B / 3 行 / 裸 CR 0**；
+    非流式（`--no-stream`，走 `dump_http_error` 的 4096 B 出口）—— 旧 **4153 B / 12 行 /
+    9 个裸 CR** → 新 **405 B / 3 行 / 裸 CR 0**，预览尾部是 `… 18814 bytes total`。
+    同时验证「原文另有去处」：会话日志里出现 `diag/dump` 事件
+    （`kind=http-error-body bytes=18814 truncated=true text=18454`，文本是转义后的一行，
+    没有裸控制字节），`--debug-dump /tmp/diag.bin` 落 **18851 B** 原始字节（头行 + 请求体原文）。
+  * **read 窗口（踩坑 34）**：同一个 5949 行 / 230 KB 的 `src/agent.uya`，让假网关发一条
+    `read`（`offset=3000, limit=20`）再发最终答案，从会话日志里读回工具结果：
+    旧 `(Showing lines 3000-3019 of **3080**. …)` → 新 `(… of **5949**. …)`；
+    `offset=4000, limit=20`：旧 `<content>` 空 + `(End of file - total 3080 lines)`（假 EOF）→
+    新 20 行真内容 + `(Showing lines 4000-4019 of 5949. Use offset=4020 to continue.)`。
+  * 离线回归：新增 3 轮（`read-window` / `diag-echo-400`(+`-ns`) / `diag-preview`）与 1 轮显示层
+    （`tui-diag`）；`make check / build / codegen-audit / selftest` 全绿（selftest 退出 0）。
 * 技能与联网搜索都在真机上验证过：让模型「说出本次会话可用的技能名」→ 正确回答
   `agently-mail、h2s-long-context`（来自真实 `~/.dsh/skills`）；让它「用 web_search 搜 uya 语言」→
   `web_search` 工具真的调通了 DeepSeek 的搜索服务并给出总结。
