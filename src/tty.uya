@@ -95,6 +95,7 @@ export struct TtyUi {
     is_tty: bool,
     raw: bool,
     cols: usize,
+    rows: usize,        // 终端高度（TUI 每帧重读；行编辑器不用）
     saved: TtyTermios,
     line: Buf,          // 正在编辑的行
     cursor: usize,
@@ -197,6 +198,22 @@ export fn tty_refresh_cols(ui: &TtyUi) void {
     }
 }
 
+// 同时刷新宽高（TUI 每帧调用；窗口缩放靠这里兜底，SIGWINCH 只是加速）
+export fn tty_refresh_size(ui: &TtyUi) void {
+    if !ui.is_tty {
+        return;
+    }
+    var ws: TtyWinsize = TtyWinsize{ ws_row: 0, ws_col: 0, ws_x: 0, ws_y: 0 };
+    const r: !i32 = sys_ioctl(0, TTY_TIOCGWINSZ, tty_ptr_i64(&ws as &void));
+    const v: i32 = r catch { -1; };
+    if v == 0 && ws.ws_col > 0 {
+        ui.cols = ws.ws_col as usize;
+    }
+    if v == 0 && ws.ws_row > 0 {
+        ui.rows = ws.ws_row as usize;
+    }
+}
+
 export fn tty_free(ui: &TtyUi) void {
     buf_free(&ui.line);
     buf_free(&ui.prompt);
@@ -243,12 +260,13 @@ export fn tty_raw_off(ui: &TtyUi, fd: i32) void {
     _ = sys_write(fd, &TTY_SEQ_CURSOR_SHOW[0], 6) catch {};
 }
 
-// 关于信号：**没有**安装 SIGTERM/SIGHUP 处理器。
-// 实测（uya 0.10.1）`libc.signal.signal` 注册的处理器一旦被调用就 SIGSEGV：写了个
-// 最小复现（handler 里只做 sys_write + sys_exit），`kill -TERM` 之后进程以 139 退出。
-// 与其让「恢复终端」这个贴心功能把进程搞崩，不如不装；退出路径（正常返回、错误返回、
-// Ctrl-D、/exit）都已经恢复 termios。被 SIGKILL/SIGTERM 打断时终端可能停在 raw 模式，
-// 用 `reset` 或 `stty sane` 恢复（README 已记录）。
+// 关于信号：**本模块不装处理器**，信号层在 `src/sigx.uya`（交互入口在进入 raw 模式之前调
+// `sigx_install_terminal` / `sigx_install_winch`，退出时 `sigx_disarm`）。
+// 不用 `libc.signal.signal` 的原因：uya 0.10 的实现走裸 rt_sigaction，`sa_flags = 0`、
+// `sa_restorer = null`，x86-64 上缺 SA_RESTORER + rt_sigreturn 垫片 —— 处理器体一次都
+// 不执行，进程直接 SIGSEGV(139)（本项目实测复现；uya 项目侧已修复，commit fad26acd）。
+// `sigx` 直接绑宿主 glibc 的 `sigaction`，在没修过的工具链上也能工作。
+// 被 SIGKILL 打断仍然无法恢复（不可捕获），用 `reset` / `stty sane` 兜底。
 
 export fn tty_active(ui: &const TtyUi) bool {
     return ui.is_tty && ui.raw;
@@ -859,6 +877,9 @@ fn tty_seq_up(dst: &byte, n: usize) usize {
 }
 
 fn tty_erase_line(ui: &TtyUi, fd: i32) void {
+    if tty_sink_on {
+        return;
+    }
     if !tty_active(ui) {
         return;
     }
@@ -939,6 +960,9 @@ export fn tty_advance_col(ui: &TtyUi, p: &const byte, n: usize) void {
 }
 
 export fn tty_draw_line(ui: &TtyUi, fd: i32) void {
+    if tty_sink_on {
+        return;
+    }
     if !tty_active(ui) {
         return;
     }
@@ -1018,8 +1042,20 @@ export fn tty_puts(ui: &TtyUi, fd: i32, s: &const byte) void {
     tty_write(ui, fd, s, bufx_cstr_len(s));
 }
 
+// P17：TUI 激活时，所有「显示」字节都不再打到终端，而是交给转录层
+//   fd 1 → 助手正文（通道 1）；fd 2 → 工具块/诊断（通道 2）；思考走 tty_reason_write（通道 3）
+export var tty_sink_on: bool = false;
+
 // 所有输出（stdout/stderr）都应该走这里，否则会和输入行互相踩
 export fn tty_write(ui: &TtyUi, fd: i32, p: &const byte, n: usize) void {
+    if tty_sink_on {
+        var chan: i32 = 2;
+        if fd == 1 {
+            chan = 1;
+        }
+        tui_sink_bytes(chan, p, n);
+        return;
+    }
     if !tty_active(ui) {
         _ = sys_write(fd, p as *const byte, n) catch {};
         return;
@@ -1041,6 +1077,7 @@ export var tty_ui: TtyUi = TtyUi{
     is_tty: false,
     raw: false,
     cols: 80,
+    rows: 24,
     saved: TtyTermios{
         c_iflag: 0,
         c_oflag: 0,
@@ -1074,6 +1111,16 @@ export var tty_ui: TtyUi = TtyUi{
 // 给 llm/工具用的薄封装：流式增量也走输入行擦除/重画协议
 export fn tty_stream_write(fd: i32, p: &const byte, n: usize) void {
     tty_write(&tty_ui, fd, p, n);
+}
+
+// 思考（reasoning）走单独通道：滚动模式仍然打到 fd 2（与 P14 的 ✻ 思考 块一致），
+// TUI 模式下进「思考条目」（只留最新一段）
+export fn tty_reason_write(p: &const byte, n: usize) void {
+    if tty_sink_on {
+        tui_sink_bytes(3, p, n);
+        return;
+    }
+    tty_write(&tty_ui, 2, p, n);
 }
 
 export fn tty_is_interactive() bool {

@@ -1,0 +1,3870 @@
+// src/tui.uya — 全屏 TUI（P17）
+//
+// 目标：终端里跑起来的样子对齐 opencode 的 TUI —— **无边框、黑底、单强调色**：
+//   * 空态：居中大块字 logo + 下方输入面板（左边缘一列强调竖条 + 占位行 + 模式/模型行）
+//   * 对话态：转录贴在面板上方（底对齐），面板贴底
+//   * 脚注（最后一行）：左边 `~/cwd:branch`，右边 token 用量 + 版本
+//   * 运行状态不是独立状态栏，而是转录里的一条（`⠹ Bash(make check) · esc 中断`）
+//
+// 三条硬约束（都是被这个项目的历史教育过的）：
+//   1) 所有 SGR 序列都用 `[byte: N]` 数组字面量或逐字节拼，**绝不用 `&"字面量"[a:b]`**
+//      —— 那会生成「切片描述符地址 → char*」的强转，屏幕上就是乱码（README 踩坑 22）。
+//   2) 正文层（g_tui_text / 行文本）里**不允许出现 ESC**：宽度、换行、擦除全部按**显示列**
+//      算（复用 tty_char_cols / tty_clip_bytes），宽度与转义序列混在一起必然算错。
+//   3) 帧写到启动时 `sys_dup(1)` 的私有 fd：`tls_noise_mute()` 在每次请求期间把 fd 2
+//      重定向到 /dev/null，走 fd 2 的帧会被吞掉。
+//
+// 模块级全局（uya 没有闭包，且模块级名字全局合并 → 一律 `tui_*` 前缀）。
+
+use libc.syscall;
+use libc.unistd;
+
+// ============================================================
+// 样式
+// ============================================================
+
+export const TUI_ST_DEFAULT: u8 = 0;
+export const TUI_ST_DIM: u8 = 1;
+export const TUI_ST_BOLD: u8 = 2;
+export const TUI_ST_ACCENT: u8 = 3;
+export const TUI_ST_OK: u8 = 4;
+export const TUI_ST_ERR: u8 = 5;
+export const TUI_ST_WARN: u8 = 6;
+export const TUI_ST_USER: u8 = 7;
+export const TUI_ST_ASSIST: u8 = 8;
+export const TUI_ST_TOOL: u8 = 9;
+export const TUI_ST_ADD: u8 = 10;
+export const TUI_ST_DEL: u8 = 11;
+export const TUI_ST_CODE: u8 = 12;
+export const TUI_ST_INLINE: u8 = 13;
+export const TUI_ST_HINT: u8 = 14;
+export const TUI_ST_FOOTER: u8 = 15;
+export const TUI_ST_SEL: u8 = 16;
+export const TUI_ST_COUNT: usize = 17;
+
+// 每个样式最多 4 个 SGR 参数（-1 = 跳过）；[style * 4 + slot]
+// 16 色一套、256 色一套 —— 由 g_tui_color256 选。
+const TUI_SGR16: [i32: 68] = [
+    -1, -1, -1, -1,          // DEFAULT
+    2, -1, -1, -1,           // DIM
+    1, -1, -1, -1,           // BOLD
+    34, -1, -1, -1,          // ACCENT
+    32, -1, -1, -1,          // OK
+    31, -1, -1, -1,          // ERR
+    33, -1, -1, -1,          // WARN
+    1, 37, -1, -1,           // USER
+    -1, -1, -1, -1,          // ASSIST
+    37, -1, -1, -1,          // TOOL
+    32, -1, -1, -1,          // ADD
+    31, -1, -1, -1,          // DEL
+    2, 37, -1, -1,           // CODE
+    36, -1, -1, -1,          // INLINE
+    2, -1, -1, -1,           // HINT
+    2, -1, -1, -1,           // FOOTER
+    7, 1, -1, -1,            // SEL（反显 + 粗）
+];
+
+const TUI_SGR256: [i32: 68] = [
+    -1, -1, -1, -1,              // DEFAULT
+    2, 38, 5, 245,               // DIM
+    1, -1, -1, -1,               // BOLD
+    38, 5, 33, -1,               // ACCENT
+    38, 5, 42, -1,               // OK
+    38, 5, 203, -1,              // ERR
+    38, 5, 214, -1,              // WARN
+    1, 38, 5, 255,               // USER
+    -1, -1, -1, -1,              // ASSIST
+    38, 5, 250, -1,              // TOOL
+    38, 5, 42, -1,               // ADD
+    38, 5, 203, -1,              // DEL
+    2, 38, 5, 245,               // CODE
+    38, 5, 180, -1,              // INLINE
+    2, -1, -1, -1,               // HINT
+    2, 38, 5, 240,               // FOOTER
+    7, 1, -1, -1,                // SEL（反显 + 粗）
+];
+
+// ESC 序列全部用数组字面量（踩坑 22：`&"字面量"[a:b]` 会生成切片描述符强转 → 乱码）
+const TUI_SEQ_RESET: [byte: 4] = [27, 91, 48, 109];            // ESC[0m
+const TUI_SEQ_EL: [byte: 4] = [27, 91, 50, 75];                // ESC[2K
+const TUI_SEQ_CLEAR: [byte: 7] = [27, 91, 50, 74, 27, 91, 72]; // ESC[2J ESC[H
+const TUI_SEQ_SHOW_CUR: [byte: 6] = [27, 91, 63, 50, 53, 104]; // ESC[?25h
+const TUI_SEQ_HIDE_CUR: [byte: 6] = [27, 91, 63, 50, 53, 108]; // ESC[?25l
+
+// ============================================================
+// 帧模型
+//
+//   一行 = 若干段 (style, len)，段在同一行内首尾相接；
+//   所有行的段按行序拼在 g_tui_segs 里，行表只记本行的段区间。
+//   emit 时把每行编码成「带 SGR 的字节串」，与上一帧逐行比较，只重发变化的行。
+// ============================================================
+
+const TUI_MAX_ROWS: usize = 256;
+const TUI_MAX_SEGS: usize = 8192;
+const TUI_COLS_MIN: usize = 32;
+const TUI_ROWS_MIN: usize = 8;
+const TUI_LOGO_COLS: usize = 66;      // 低于这个宽度不画块字 logo
+
+struct TuiSeg {
+    style: u8,
+    len: usize,
+}
+
+struct TuiRow {
+    seg_start: usize,
+    seg_n: usize,
+    text_off: usize,
+}
+
+// 屏幕（当前帧）
+var g_tui_text: Buf = Buf{ ptr: null, len: 0, cap: 0 };
+var g_tui_segs: [TuiSeg: TUI_MAX_SEGS] = [TuiSeg{ style: 0, len: 0 }: TUI_MAX_SEGS];
+var g_tui_nsegs: usize = 0;
+var g_tui_rowtab: [TuiRow: TUI_MAX_ROWS] = [TuiRow{ seg_start: 0, seg_n: 0, text_off: 0 }: TUI_MAX_ROWS];
+var g_tui_nrows: usize = 0;
+var g_tui_cur_seg: usize = 0;         // 当前行的起始段号
+var g_tui_cur_style: u8 = 255;        // 当前行最后一个段的样式（255 = 还没有段）
+
+// emit（当前帧 / 上一帧的逐行字节串）
+var g_tui_out: Buf = Buf{ ptr: null, len: 0, cap: 0 };
+var g_tui_out_off: [usize: TUI_MAX_ROWS + 1] = [0: TUI_MAX_ROWS + 1];
+var g_tui_prev: Buf = Buf{ ptr: null, len: 0, cap: 0 };
+var g_tui_prev_off: [usize: TUI_MAX_ROWS + 1] = [0: TUI_MAX_ROWS + 1];
+var g_tui_prev_nrows: usize = 0;
+var g_tui_dirty: bool = true;
+
+// 终端
+var g_tui_on: bool = false;           // TUI 是否在跑（帧会打到 out_fd）
+var g_tui_out_fd: i32 = -1;
+var g_tui_cols: usize = 80;
+var g_tui_rows: usize = 24;
+var g_tui_color_on: bool = true;
+var g_tui_color256: bool = true;
+var g_tui_frames: usize = 0;
+var g_tui_headless: bool = false;   // 自测：不碰终端、不读 fd 0，按键由 tui_keys_inject 注入
+
+export fn tui_set_headless(on: bool) void {
+    g_tui_headless = on;
+}
+
+// 自测：让 TUI「逻辑上在跑」但不碰终端（tui_active() 为真 → 显示进转录；flush 因为
+// out_fd < 0 而自动不写）
+export fn tui_headless_enable(on: bool) void {
+    g_tui_headless = on;
+    g_tui_on = on;
+    g_tui_out_fd = -1;
+    tui_invalidate();
+}
+
+export fn tui_headless() bool {
+    return g_tui_headless;
+}
+
+// 注入按键（自测用）：只喂字节，**不**冲刷悬着的 ESC（模拟被切开的转义序列）
+export fn tui_keys_feed(p: &const byte, n: usize) void {
+    tui_key_feed(p, n);
+    tui_handle_keys();
+}
+
+// 注入按键 + 冲刷（一次完整的按键交互）
+export fn tui_keys_inject(p: &const byte, n: usize) void {
+    tui_key_feed(p, n);
+    tui_key_flush_esc();
+    tui_handle_keys();
+}
+
+export fn tui_frame_count() usize {
+    return g_tui_frames;
+}
+
+export fn tui_active() bool {
+    return g_tui_on;
+}
+
+export fn tui_out_fd() i32 {
+    return g_tui_out_fd;
+}
+
+export fn tui_cols() usize {
+    return g_tui_cols;
+}
+
+export fn tui_rows() usize {
+    return g_tui_rows;
+}
+
+// 自测 / --tui-demo 用：直接设定画布尺寸（真实运行时由 TIOCGWINSZ 填）
+export fn tui_set_size(cols: usize, rows: usize) void {
+    if cols > 0 {
+        g_tui_cols = cols;
+    }
+    if rows > 0 {
+        g_tui_rows = rows;
+    }
+    tui_invalidate();
+}
+
+export fn tui_mark_dirty() void {
+    g_tui_dirty = true;
+}
+
+export fn tui_is_dirty() bool {
+    return g_tui_dirty;
+}
+
+export fn tui_set_color(on: bool, color256: bool) void {
+    g_tui_color_on = on;
+    g_tui_color256 = color256;
+}
+
+export struct TuiTimeVal {
+    tv_sec: i64,
+    tv_usec: i64,
+}
+
+// 毫秒时钟：走 libc.syscall 的 sys_gettimeofday（**不用 extern "libc" gettimeofday**，
+// 那会把 libc.time 模块也拉进链接，而 0.10 的 libc.time 与 libc.stdlib 都定义了
+// CLOCKS_PER_SEC，split-C 下会「multiple definition」直接链接失败）
+export fn tui_now_ms() u64 {
+    var tv: TuiTimeVal = TuiTimeVal{ tv_sec: 0, tv_usec: 0 };
+    const r: !i32 = sys_gettimeofday(&tv, null as &void);
+    const rc: i32 = r catch { -1; };
+    if rc != 0 {
+        return 0 as u64;
+    }
+    return ((tv.tv_sec as u64) * (1000 as u64)) + ((tv.tv_usec as u64) / (1000 as u64));
+}
+
+fn tui_bufs_ensure() void {
+    if !buf_valid(&g_tui_text) {
+        g_tui_text = buf_new(65536);
+    }
+    if !buf_valid(&g_tui_out) {
+        g_tui_out = buf_new(131072);
+    }
+    if !buf_valid(&g_tui_prev) {
+        g_tui_prev = buf_new(131072);
+    }
+}
+
+fn tui_bufs_free() void {
+    buf_free(&g_tui_text);
+    buf_free(&g_tui_out);
+    buf_free(&g_tui_prev);
+}
+
+// ============================================================
+// 拼帧基元（都按显示列前进）
+// ============================================================
+
+export fn tui_frame_begin(cols: usize, rows: usize) void {
+    tui_bufs_ensure();
+    buf_reset(&g_tui_text);
+    g_tui_nsegs = 0;
+    g_tui_nrows = 0;
+    g_tui_cur_seg = 0;
+    g_tui_cur_style = 255;
+    if cols > 0 {
+        g_tui_cols = cols;
+    }
+    if rows > 0 {
+        g_tui_rows = rows;
+    }
+}
+
+// 开一行（行内容随后用 tui_put 追加）
+export fn tui_row_new() void {
+    if g_tui_nrows >= TUI_MAX_ROWS {
+        return;
+    }
+    const r: usize = g_tui_nrows;
+    var row: TuiRow = TuiRow{ seg_start: g_tui_nsegs, seg_n: 0, text_off: g_tui_text.len };
+    g_tui_rowtab[r] = row;
+    g_tui_nrows = r + 1;
+    g_tui_cur_seg = g_tui_nsegs;
+    g_tui_cur_style = 255;
+}
+
+export fn tui_put(p: &const byte, n: usize, style: u8) void {
+    if n == 0 || g_tui_nrows == 0 {
+        return;
+    }
+    if !buf_append(&g_tui_text, p, n) {
+        return;
+    }
+    if g_tui_cur_style == style && g_tui_nsegs > g_tui_cur_seg {
+        const last: usize = g_tui_nsegs - 1;
+        if last < TUI_MAX_SEGS {
+            g_tui_segs[last].len = g_tui_segs[last].len + n;
+        }
+    } else if g_tui_nsegs < TUI_MAX_SEGS {
+        g_tui_segs[g_tui_nsegs] = TuiSeg{ style: style, len: n };
+        g_tui_nsegs = g_tui_nsegs + 1;
+        g_tui_cur_style = style;
+    }
+    const r: usize = g_tui_nrows - 1;
+    if r < TUI_MAX_ROWS {
+        g_tui_rowtab[r].seg_n = g_tui_nsegs - g_tui_rowtab[r].seg_start;
+    }
+}
+
+export fn tui_puts(s: &const byte, style: u8) void {
+    tui_put(s, bufx_cstr_len(s), style);
+}
+
+export fn tui_putn(s: &const byte, n: usize, style: u8) void {
+    tui_put(s, n, style);
+}
+
+// 当前行已占多少**显示列**
+export fn tui_row_cols() usize {
+    if g_tui_nrows == 0 {
+        return 0;
+    }
+    const r: usize = g_tui_nrows - 1;
+    if r >= TUI_MAX_ROWS {
+        return 0;
+    }
+    const off: usize = g_tui_rowtab[r].text_off;
+    return tty_cols_between(g_tui_text.ptr as &const byte, off, g_tui_text.len);
+}
+
+// 补空格到第 col 列（col <= 当前列时什么都不做）
+export fn tui_pad_to(col: usize) void {
+    var cur: usize = tui_row_cols();
+    while cur < col {
+        tui_put(" " as &const byte, 1, TUI_ST_DEFAULT);
+        cur = cur + 1;
+    }
+}
+
+// 把当前行补满到宽度 cols（用默认样式填空白）
+export fn tui_fill_row(cols: usize) void {
+    tui_pad_to(cols);
+}
+
+// 画一整行（重复一个字符）
+export fn tui_repeat(ch: byte, n: usize, style: u8) void {
+    var tmp: [byte: 64] = [0: 64];
+    var i: usize = 0;
+    while i < 64 {
+        tmp[i] = ch;
+        i = i + 1;
+    }
+    var left: usize = n;
+    while left > 0 {
+        const take: usize = if left > (64 as usize) { 64 as usize } else { left };
+        tui_put(&tmp[0], take, style);
+        left = left - take;
+    }
+}
+
+// 一段纯文本按显示列截断（超出补 '…'）
+export fn tui_put_clipped(p: &const byte, n: usize, max_cols: usize, style: u8) void {
+    if max_cols == 0 {
+        return;
+    }
+    const keep: usize = tty_clip_bytes(p, n, max_cols);
+    tui_put(p, keep, style);
+    if keep < n {
+        tui_puts("…" as &const byte, style);
+    }
+}
+
+// 取一行文本（含该行起点的字节偏移）
+fn tui_row_text_off(r: usize) usize {
+    if r >= TUI_MAX_ROWS {
+        return 0;
+    }
+    if r >= g_tui_nrows {
+        return 0;
+    }
+    return g_tui_rowtab[r].text_off;
+}
+
+fn tui_row_text_len(r: usize) usize {
+    if r + 1 >= g_tui_nrows {
+        return g_tui_text.len - tui_row_text_off(r);
+    }
+    return tui_row_text_off(r + 1) - tui_row_text_off(r);
+}
+
+fn tui_row_cols_at(r: usize) usize {
+    const off: usize = tui_row_text_off(r);
+    const len: usize = tui_row_text_len(r);
+    return tty_cols_between(g_tui_text.ptr as &const byte, off, off + len);
+}
+
+// ============================================================
+// 屏幕文本快照（自测断言 + --tui-demo 都用它：只要文本，不要转义）
+// ============================================================
+
+export fn tui_screen_text(out: &Buf) void {
+    buf_reset(out);
+    var r: usize = 0;
+    while r < g_tui_nrows {
+        const off: usize = tui_row_text_off(r);
+        const len: usize = tui_row_text_len(r);
+        _ = buf_append(out, g_tui_text.ptr + off, len);
+        _ = buf_append_byte(out, 10);
+        r = r + 1;
+    }
+}
+
+export fn tui_row_is(r: usize, lit: &const byte) bool {
+    if r >= g_tui_nrows {
+        return false;
+    }
+    const off: usize = tui_row_text_off(r);
+    const len: usize = tui_row_text_len(r);
+    const want: usize = bufx_cstr_len(lit);
+    if len != want {
+        return false;
+    }
+    return bufx_mem_eq(g_tui_text.ptr + off, lit, len);
+}
+
+export fn tui_row_has(r: usize, lit: &const byte) bool {
+    if r >= g_tui_nrows {
+        return false;
+    }
+    const off: usize = tui_row_text_off(r);
+    const len: usize = tui_row_text_len(r);
+    const want: usize = bufx_cstr_len(lit);
+    if want == 0 || want > len {
+        return false;
+    }
+    var i: usize = 0;
+    while i + want <= len {
+        if bufx_mem_eq(g_tui_text.ptr + off + i, lit, want) {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+export fn tui_nrows() usize {
+    return g_tui_nrows;
+}
+
+export fn tui_row_cols_n(r: usize) usize {
+    return tui_row_cols_at(r);
+}
+
+// 行文本里有没有 ESC（不变量：正文层永远是纯文本）
+export fn tui_row_blank(r: usize) bool {
+    if r >= g_tui_nrows {
+        return false;
+    }
+    const off: usize = tui_row_text_off(r);
+    const len: usize = tui_row_text_len(r);
+    var i: usize = 0;
+    while i < len {
+        if g_tui_text.ptr[off + i] != 32 as byte {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+export fn tui_rows_have_esc() bool {
+    var i: usize = 0;
+    while i < g_tui_text.len {
+        if g_tui_text.ptr[i] == 27 as byte {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+// ============================================================
+// SGR / 行编码 / 帧输出
+// ============================================================
+
+fn tui_dec_into(dst: &byte, v: i64) usize {
+    var tmp: [byte: 24] = [0: 24];
+    const DIG: [byte: 10] = [48, 49, 50, 51, 52, 53, 54, 55, 56, 57];
+    var n: i64 = v;
+    var i: usize = 0;
+    if n == 0 {
+        tmp[0] = 48;
+        i = 1;
+    }
+    while n > 0 && i < 24 {
+        const q: i64 = n / (10 as i64);
+        const d: i64 = n - (q * (10 as i64));
+        var di: usize = 0;
+        if d > 0 && d < 10 {
+            di = d as usize;
+        }
+        tmp[i] = DIG[di];
+        n = q;
+        i = i + 1;
+    }
+    var k: usize = 0;
+    while i > 0 {
+        i = i - 1;
+        dst[k] = tmp[i];
+        k = k + 1;
+    }
+    return k;
+}
+
+// 把样式编码成 SGR 字节串写进 dst，返回长度（0 = 默认样式，不需要序列）
+fn tui_sgr_into(dst: &byte, style: u8) usize {
+    if !g_tui_color_on {
+        // 无色模式：只保留属性（粗体/暗），颜色全丢
+        if style == TUI_ST_BOLD || style == TUI_ST_USER {
+            dst[0] = 27; dst[1] = 91; dst[2] = 49; dst[3] = 109;
+            return 4;
+        }
+        if style == TUI_ST_DIM || style == TUI_ST_HINT || style == TUI_ST_FOOTER
+            || style == TUI_ST_CODE || style == TUI_ST_TOOL {
+            dst[0] = 27; dst[1] = 91; dst[2] = 50; dst[3] = 109;
+            return 4;
+        }
+        return 0;
+    }
+    const base: usize = (style as usize) * 4;
+    var codes: [i32: 4] = [-1, -1, -1, -1];
+    var i: usize = 0;
+    while i < 4 {
+        const idx: usize = base + i;
+        if idx < 68 {
+            if g_tui_color256 {
+                codes[i] = TUI_SGR256[idx];
+            } else {
+                codes[i] = TUI_SGR16[idx];
+            }
+        }
+        i = i + 1;
+    }
+    if codes[0] < 0 {
+        return 0;
+    }
+    var k: usize = 0;
+    dst[k] = 27; k = k + 1;
+    dst[k] = 91; k = k + 1;
+    var first: bool = true;
+    i = 0;
+    while i < 4 {
+        if codes[i] >= 0 {
+            if !first {
+                dst[k] = 59; k = k + 1;
+            }
+            first = false;
+            k = k + tui_dec_into(&dst[k], codes[i] as i64);
+        }
+        i = i + 1;
+    }
+    dst[k] = 109; k = k + 1;
+    return k;
+}
+
+// 把第 r 行编码成「带 SGR 的字节串」追加到 g_tui_out
+fn tui_encode_row(r: usize) void {
+    if r >= TUI_MAX_ROWS {
+        return;
+    }
+    g_tui_out_off[r] = g_tui_out.len;
+    if r >= g_tui_nrows {
+        return;
+    }
+    const row: TuiRow = g_tui_rowtab[r];
+    var sgr: [byte: 32] = [0: 32];
+    var cur_style: u8 = 255;
+    var i: usize = 0;
+    var off: usize = g_tui_rowtab[r].text_off;
+    while i < row.seg_n {
+        const si: usize = row.seg_start + i;
+        // 证明器只认「正的 if 里做索引」（README 踩坑 6）：写成 if seg 合法 { … }
+        if si < TUI_MAX_SEGS {
+            const seg: TuiSeg = g_tui_segs[si];
+            if seg.style != cur_style {
+                if cur_style != 255 {
+                    // 从有色切到另一个色：先复位再上新色（避免属性叠加）
+                    _ = buf_append(&g_tui_out, &TUI_SEQ_RESET[0], 4);
+                }
+                const n: usize = tui_sgr_into(&sgr[0], seg.style);
+                if n > 0 {
+                    _ = buf_append(&g_tui_out, &sgr[0], n);
+                }
+                cur_style = seg.style;
+            }
+            _ = buf_append(&g_tui_out, g_tui_text.ptr + off, seg.len);
+            off = off + seg.len;
+        }
+        i = i + 1;
+    }
+    if cur_style != 255 && cur_style != TUI_ST_DEFAULT {
+        _ = buf_append(&g_tui_out, &TUI_SEQ_RESET[0], 4);
+    }
+    g_tui_out_off[r + 1] = g_tui_out.len;
+}
+
+fn tui_row_bytes_eq(r: usize) bool {
+    if r >= g_tui_prev_nrows {
+        return false;
+    }
+    if r + 1 > TUI_MAX_ROWS {
+        return false;
+    }
+    const a0: usize = g_tui_out_off[r];
+    const a1: usize = g_tui_out_off[r + 1];
+    const b0: usize = g_tui_prev_off[r];
+    const b1: usize = g_tui_prev_off[r + 1];
+    if (a1 - a0) != (b1 - b0) {
+        return false;
+    }
+    return bufx_mem_eq(g_tui_out.ptr + a0, g_tui_prev.ptr + b0, a1 - a0);
+}
+
+// 移动光标到 (r, c)（1 基，c 是**列**不是字节）
+fn tui_cursor_to(dst: &Buf, r: usize, c: usize) void {
+    var num: [byte: 24] = [0: 24];
+    _ = buf_append_byte(dst, 27);
+    _ = buf_append_byte(dst, 91);
+    const n1: usize = tui_dec_into(&num[0], (r + 1) as i64);
+    _ = buf_append(dst, &num[0], n1);
+    _ = buf_append_byte(dst, 59);
+    const n2: usize = tui_dec_into(&num[0], (c + 1) as i64);
+    _ = buf_append(dst, &num[0], n2);
+    _ = buf_append_byte(dst, 72);   // 'H'
+}
+
+// 光标最终落点（输入框内的插入点，列的**显示列**）
+var g_tui_cursor_row: usize = 0;
+var g_tui_cursor_col: usize = 0;
+var g_tui_cursor_on: bool = true;     // 空态/输入时显示；运行中隐藏
+
+export fn tui_set_cursor(row: usize, col: usize, visible: bool) void {
+    g_tui_cursor_row = row;
+    g_tui_cursor_col = col;
+    g_tui_cursor_on = visible;
+}
+
+// 把整帧编码好并只把**变化的行**写出去
+export fn tui_flush() void {
+    if !g_tui_on || g_tui_out_fd < 0 {
+        return;
+    }
+    tui_bufs_ensure();
+    buf_reset(&g_tui_out);
+    var r: usize = 0;
+    while r < g_tui_nrows {
+        tui_encode_row(r);
+        r = r + 1;
+    }
+    g_tui_out_off[g_tui_nrows] = g_tui_out.len;
+
+    var changed: usize = 0;
+    r = 0;
+    while r < g_tui_nrows {
+        if !tui_row_bytes_eq(r) {
+            changed = changed + 1;
+        }
+        r = r + 1;
+    }
+    const all: usize = g_tui_nrows;
+    const full: bool = (all > 0 && changed * 10 > all * 6) || g_tui_prev_nrows > g_tui_nrows;
+
+    var payload: Buf = buf_new(g_tui_out.len + 4096);
+    if !buf_valid(&payload) {
+        return;
+    }
+    if full {
+        _ = buf_append(&payload, &TUI_SEQ_CLEAR[0], 7);
+    }
+    r = 0;
+    while r < g_tui_nrows {
+        const skip: bool = !full && tui_row_bytes_eq(r);
+        if !skip {
+            tui_cursor_to(&payload, r, 0);
+            _ = buf_append(&payload, &TUI_SEQ_EL[0], 4);
+            _ = buf_append(&payload, g_tui_out.ptr + g_tui_out_off[r], g_tui_out_off[r + 1] - g_tui_out_off[r]);
+        }
+        r = r + 1;
+    }
+    // 多余的老行清掉
+    if g_tui_prev_nrows > g_tui_nrows {
+        r = g_tui_nrows;
+        while r < g_tui_prev_nrows {
+            tui_cursor_to(&payload, r, 0);
+            _ = buf_append(&payload, &TUI_SEQ_EL[0], 4);
+            r = r + 1;
+        }
+    }
+    if g_tui_cursor_on {
+        tui_cursor_to(&payload, g_tui_cursor_row, g_tui_cursor_col);
+        _ = buf_append(&payload, &TUI_SEQ_SHOW_CUR[0], 6);
+    } else {
+        _ = buf_append(&payload, &TUI_SEQ_HIDE_CUR[0], 6);
+    }
+    _ = sys_write(g_tui_out_fd, payload.ptr as *const byte, payload.len) catch {};
+    buf_free(&payload);
+
+    // 本帧成为「上一帧」
+    const tmp: Buf = g_tui_prev;
+    g_tui_prev = g_tui_out;
+    g_tui_out = tmp;
+    var k: usize = 0;
+    while k <= g_tui_nrows {
+        g_tui_prev_off[k] = g_tui_out_off[k];
+        k = k + 1;
+    }
+    g_tui_prev_nrows = g_tui_nrows;
+    g_tui_dirty = false;
+}
+
+// 强制下一帧全量重画（缩放、进入 TUI、外部改了屏幕之后用）
+export fn tui_invalidate() void {
+    g_tui_prev_nrows = 0;
+    g_tui_dirty = true;
+}
+
+// ============================================================
+// 终端（备用屏幕 / 尺寸）
+// ============================================================
+
+const TUI_TIOCGWINSZ: i64 = 0x5413;
+
+export struct TuiWinsize {
+    ws_row: u16,
+    ws_col: u16,
+    ws_x: u16,
+    ws_y: u16,
+}
+
+export fn tui_size_refresh() bool {
+    var ws: TuiWinsize = TuiWinsize{ ws_row: 0, ws_col: 0, ws_x: 0, ws_y: 0 };
+    const r: !i32 = sys_ioctl(0, TUI_TIOCGWINSZ, (@usize_from_ptr(&ws as &void)) as i64);
+    const rc: i32 = r catch { -1; };
+    if rc != 0 || ws.ws_col == 0 {
+        return false;
+    }
+    var rows: usize = ws.ws_row as usize;
+    if rows == 0 {
+        rows = 24;
+    }
+    if rows > TUI_MAX_ROWS {
+        rows = TUI_MAX_ROWS;
+    }
+    const changed: bool = ws.ws_col as usize != g_tui_cols || rows != g_tui_rows;
+    g_tui_cols = ws.ws_col as usize;
+    g_tui_rows = rows;
+    if changed {
+        tui_invalidate();
+    }
+    return true;
+}
+
+// 进备用屏幕 + 开括起粘贴 + 清屏
+export fn tui_term_enter(out_fd: i32) void {
+    var seq: [byte: 32] = [0: 32];
+    var k: usize = 0;
+    // ESC[?1049h
+    seq[0] = 27; seq[1] = 91; seq[2] = 63; seq[3] = 49; seq[4] = 48; seq[5] = 52; seq[6] = 57; seq[7] = 104;
+    k = 8;
+    _ = sys_write(out_fd, &seq[0] as *const byte, k) catch {};
+    var clear: [byte: 8] = [27, 91, 50, 74, 27, 91, 72, 0];   // ESC[2J ESC[H
+    _ = sys_write(out_fd, &clear[0] as *const byte, 7) catch {};
+    var paste: [byte: 8] = [27, 91, 63, 50, 48, 48, 52, 104]; // ESC[?2004h
+    _ = sys_write(out_fd, &paste[0] as *const byte, 8) catch {};
+    g_tui_out_fd = out_fd;
+    g_tui_on = true;
+    tui_invalidate();
+}
+
+// 离开备用屏幕（关闭括起粘贴 → 复位 → 显示光标 → 1049l）
+export fn tui_term_leave(out_fd: i32) void {
+    var seq: [byte: 32] = [0: 32];
+    // ESC[?2004l
+    seq[0] = 27; seq[1] = 91; seq[2] = 63; seq[3] = 50; seq[4] = 48; seq[5] = 48; seq[6] = 52; seq[7] = 108;
+    // ESC[0m
+    seq[8] = 27; seq[9] = 91; seq[10] = 48; seq[11] = 109;
+    // ESC[?25h
+    seq[12] = 27; seq[13] = 91; seq[14] = 63; seq[15] = 50; seq[16] = 53; seq[17] = 104;
+    // ESC[?1049l
+    seq[18] = 27; seq[19] = 91; seq[20] = 63; seq[21] = 49; seq[22] = 48; seq[23] = 52; seq[24] = 57; seq[25] = 108;
+    _ = sys_write(out_fd, &seq[0] as *const byte, 26) catch {};
+    g_tui_on = false;
+}
+
+// 这块屏幕太窄/太矮，TUI 不适合
+export fn tui_fits() bool {
+    return g_tui_cols >= TUI_COLS_MIN && g_tui_rows >= TUI_ROWS_MIN;
+}
+
+// ============================================================
+// 会话状态（面板信息行 / 脚注 / 状态）
+// ============================================================
+
+export const TUI_RUN_IDLE: u8 = 0;
+export const TUI_RUN_THINK: u8 = 1;
+export const TUI_RUN_STREAM: u8 = 2;
+export const TUI_RUN_TOOL: u8 = 3;
+
+var g_tui_model: Buf = Buf{ ptr: null, len: 0, cap: 0 };
+var g_tui_provider: Buf = Buf{ ptr: null, len: 0, cap: 0 };
+var g_tui_cwd: Buf = Buf{ ptr: null, len: 0, cap: 0 };
+var g_tui_branch: Buf = Buf{ ptr: null, len: 0, cap: 0 };
+var g_tui_home: Buf = Buf{ ptr: null, len: 0, cap: 0 };
+var g_tui_version: Buf = Buf{ ptr: null, len: 0, cap: 0 };
+var g_tui_run_label: Buf = Buf{ ptr: null, len: 0, cap: 0 };
+var g_tui_plan: bool = false;
+var g_tui_run: u8 = TUI_RUN_IDLE;
+var g_tui_step: i32 = 0;
+var g_tui_use_in: i64 = 0;
+var g_tui_use_out: i64 = 0;
+var g_tui_ctx_pct: i32 = -1;
+var g_tui_spin: usize = 0;
+
+fn tui_state_ensure() void {
+    if !buf_valid(&g_tui_model) { g_tui_model = buf_empty(); }
+    if !buf_valid(&g_tui_provider) { g_tui_provider = buf_empty(); }
+    if !buf_valid(&g_tui_cwd) { g_tui_cwd = buf_empty(); }
+    if !buf_valid(&g_tui_branch) { g_tui_branch = buf_empty(); }
+    if !buf_valid(&g_tui_home) { g_tui_home = buf_empty(); }
+    if !buf_valid(&g_tui_version) { g_tui_version = buf_empty(); }
+    if !buf_valid(&g_tui_run_label) { g_tui_run_label = buf_empty(); }
+}
+
+var g_tui_state_ready: bool = false;
+
+export fn tui_state_init(model: &const byte, ml: usize, provider: &const byte, pl: usize, version: &const byte, vl: usize) void {
+    tui_state_ensure();
+    buf_reset(&g_tui_model);
+    _ = buf_append(&g_tui_model, model, ml);
+    buf_reset(&g_tui_provider);
+    _ = buf_append(&g_tui_provider, provider, pl);
+    buf_reset(&g_tui_version);
+    _ = buf_append(&g_tui_version, version, vl);
+    g_tui_state_ready = true;
+}
+
+export fn tui_set_cwd(cwd: &const byte, n: usize, home: &const byte, hn: usize) void {
+    tui_state_ensure();
+    buf_reset(&g_tui_cwd);
+    _ = buf_append(&g_tui_cwd, cwd, n);
+    buf_reset(&g_tui_home);
+    _ = buf_append(&g_tui_home, home, hn);
+}
+
+export fn tui_set_branch(b: &const byte, n: usize) void {
+    tui_state_ensure();
+    buf_reset(&g_tui_branch);
+    _ = buf_append(&g_tui_branch, b, n);
+}
+
+export fn tui_set_plan(on: bool) void {
+    g_tui_plan = on;
+    tui_mark_dirty();
+}
+
+export fn tui_plan_on() bool {
+    return g_tui_plan;
+}
+
+export fn tui_set_usage(use_in: i64, use_out: i64, ctx_pct: i32) void {
+    g_tui_use_in = use_in;
+    g_tui_use_out = use_out;
+    g_tui_ctx_pct = ctx_pct;
+}
+
+export fn tui_set_step(step: i32) void {
+    g_tui_step = step;
+    tui_mark_dirty();
+}
+
+// 运行状态：idle / 思考中 / 流式中 / 跑工具（带一行标题）
+export fn tui_set_run(kind: u8, label: &const byte, n: usize) void {
+    tui_state_ensure();
+    g_tui_run = kind;
+    buf_reset(&g_tui_run_label);
+    _ = buf_append(&g_tui_run_label, label, n);
+    tui_mark_dirty();
+}
+
+export fn tui_run_kind() u8 {
+    return g_tui_run;
+}
+
+export fn tui_tick_spinner() void {
+    g_tui_spin = (g_tui_spin + 1) % (10 as usize);
+    if g_tui_run != TUI_RUN_IDLE {
+        tui_mark_dirty();
+    }
+}
+
+// 8 帧的 braille 转轮（比 |/-\ 顺眼，也和 opencode 的等着感一致）
+fn tui_spinner_glyph() &const byte {
+    if g_tui_spin < 2 { return "⠋" as &const byte; }
+    if g_tui_spin < 4 { return "⠙" as &const byte; }
+    if g_tui_spin < 6 { return "⠹" as &const byte; }
+    if g_tui_spin < 8 { return "⠸" as &const byte; }
+    return "⠴" as &const byte;
+}
+
+// ============================================================
+// logo（5 行块字 + 右移一列的阴影）
+// ============================================================
+
+// 每个字形 5 行 × 5 列，bit4 = 最左列
+const TUI_GLYPHS: [u8: 8 * 5] = [
+    0x11, 0x11, 0x11, 0x11, 0x0E,   // u
+    0x11, 0x11, 0x0F, 0x01, 0x0E,   // y
+    0x0E, 0x11, 0x1F, 0x11, 0x11,   // a
+    0x00, 0x00, 0x1F, 0x00, 0x00,   // -
+    0x0F, 0x11, 0x0F, 0x01, 0x0E,   // g
+    0x0E, 0x11, 0x1F, 0x10, 0x0E,   // e
+    0x16, 0x19, 0x11, 0x11, 0x11,   // n
+    0x08, 0x1F, 0x08, 0x09, 0x06,   // t
+];
+
+// "uya-agent" → 字形下标
+const TUI_WORD: [u8: 9] = [0, 1, 2, 3, 2, 4, 5, 6, 7];
+
+const TUI_LOGO_H: usize = 5;
+const TUI_LOGO_W: usize = 61;        // 9 字形 × 7 列 - 2（字形 5 列 + 2 列留白）
+const TUI_LOGO_PAD: usize = 1;       // 阴影多一列
+
+export fn tui_logo_width() usize {
+    return TUI_LOGO_W + TUI_LOGO_PAD;
+}
+
+export fn tui_logo_height() usize {
+    return TUI_LOGO_H;
+}
+
+// 取 (字形序号 gi, 行 ro, 列 co) 那一格是否是亮的
+fn tui_logo_bit(gi: usize, ro: usize, co: usize) bool {
+    if gi >= 9 || ro >= 5 || co >= 5 {
+        return false;
+    }
+    var gidx: usize = 0;
+    if gi < 9 {
+        gidx = TUI_WORD[gi] as usize;
+    }
+    var bits: u8 = 0;
+    const bidx: usize = gidx * 5 + ro;
+    if gidx < 8 && ro < 5 && bidx < 40 {
+        bits = TUI_GLYPHS[bidx];
+    }
+    const shift: i32 = 4 - (co as i32);
+    const v: u8 = (bits >> shift) & 1 as u8;
+    return v == 1 as u8;
+}
+
+// 画一行 logo（5 行里的第 ro 行），列起点由调用方用 tui_pad_to 摆好
+fn tui_logo_row(ro: usize) void {
+    var x: usize = 0;
+    while x < TUI_LOGO_W + TUI_LOGO_PAD {
+        const gi: usize = x / (7 as usize);
+        const co: usize = x % (7 as usize);
+        var bright: bool = false;
+        if co < 5 {
+            bright = tui_logo_bit(gi, ro, co);
+        }
+        var shade: bool = false;
+        if x > 0 {
+            const px: usize = x - 1;
+            const pgi: usize = px / (7 as usize);
+            const pco: usize = px % (7 as usize);
+            if pco < 5 {
+                shade = tui_logo_bit(pgi, ro, pco);
+            }
+        }
+        if bright {
+            if ro == 4 {
+                tui_puts("▓" as &const byte, TUI_ST_DIM);
+            } else {
+                tui_puts("█" as &const byte, TUI_ST_USER);
+            }
+        } else if shade {
+            tui_puts("▓" as &const byte, TUI_ST_DIM);
+        } else {
+            tui_puts(" " as &const byte, TUI_ST_DEFAULT);
+        }
+        x = x + 1;
+    }
+}
+
+// ============================================================
+// 输入面板 / 脚注
+// ============================================================
+
+export fn tui_panel_height(in_lines: usize) usize {
+    var h: usize = in_lines + 1;      // 输入行 + 信息行
+    if h < 2 {
+        h = 2;
+    }
+    if h > 10 {
+        h = 10;
+    }
+    var maxh: usize = 3;
+    if g_tui_rows > 6 {
+        maxh = g_tui_rows - 6;
+    }
+    if maxh < 2 {
+        maxh = 2;
+    }
+    if h > maxh {
+        h = maxh;
+    }
+    return h;
+}
+
+// 面板左边缘的强调竖条
+fn tui_panel_bar(rows: usize) void {
+    var i: usize = 0;
+    while i < rows {
+        tui_row_new();
+        tui_pad_to(2);
+        tui_puts("▌" as &const byte, TUI_ST_ACCENT);
+        tui_fill_row(g_tui_cols);
+        i = i + 1;
+    }
+}
+
+// 把一段文本画到第 col 列起（先补空格到位）
+fn tui_put_at(col: usize, p: &const byte, n: usize, style: u8) void {
+    tui_pad_to(col);
+    tui_put(p, n, style);
+}
+
+fn tui_num_k(v: i64, out: &Buf) void {
+    buf_reset(out);
+    var vv: i64 = v;
+    if vv < 0 {
+        vv = 0;
+    }
+    if vv < 1000 {
+        _ = buf_append_u64(out, vv as u64);
+        return;
+    }
+    const thousands: i64 = vv / 1000;
+    const rest: i64 = vv - (thousands * 1000);
+    _ = buf_append_u64(out, thousands as u64);
+    var frac: Buf = buf_new(8);
+    defer { buf_free(&frac); }
+    _ = buf_append_u64(&frac, rest as u64);
+    var pad: usize = 3 - frac.len;
+    while pad > 0 {
+        _ = buf_append_byte(out, 48);
+        pad = pad - 1;
+    }
+    // 去掉小数末尾的 0（8.100k → 8.1k）
+    var flen: usize = frac.len;
+    while flen > 0 && frac.ptr[flen - 1] == 48 as byte {
+        flen = flen - 1;
+    }
+    if flen > 0 {
+        _ = buf_append_byte(out, 46);
+        _ = buf_append(out, frac.ptr, flen);
+    }
+    _ = buf_append_byte(out, 107);  // 'k'
+}
+
+// 面板：bar_rows 行竖条 + 输入行 + 信息行（信息行落在面板最后一行）
+fn tui_draw_panel(panel_rows: usize, in_text: &const byte, in_len: usize, in_placeholder: bool, show_cursor: bool) void {
+    const width: usize = if g_tui_cols > 5 { g_tui_cols - 5 } else { 1 as usize };
+    const content_col: usize = 4;
+    const in_lines: usize = panel_rows - 1;
+    var li: usize = 0;
+    while li < panel_rows {
+        tui_row_new();
+        tui_pad_to(2);
+        tui_puts("▌" as &const byte, TUI_ST_ACCENT);
+        if li < in_lines {
+            // 输入行：第一行带提示符，其余行缩进对齐
+            tui_pad_to(content_col);
+            if li == 0 {
+                const glyph: &const byte = if in_placeholder { "↑ " as &const byte } else { "❯ " as &const byte };
+                tui_puts(glyph, if in_placeholder { TUI_ST_HINT } else { TUI_ST_ACCENT });
+            } else {
+                tui_pad_to(content_col + 2);
+            }
+            if in_placeholder && li == 0 {
+                const ph: &const byte = "Ask anything... \"把 hello.uya 的问候语改成 Hello, DSH!\"" as &const byte;
+                const room: usize = width - 2;
+                tui_put_clipped(ph, bufx_cstr_len(ph), room, TUI_ST_HINT);
+            } else if li == 0 {
+                const room: usize = width - 2;
+                tui_put_clipped(in_text, in_len, room, TUI_ST_DEFAULT);
+            }
+            tui_fill_row(g_tui_cols);
+        } else {
+            // 信息行：模式 + 模型 + provider，右侧键位提示
+            tui_pad_to(content_col);
+            const mode: &const byte = if g_tui_plan { "Plan" as &const byte } else { "Build" as &const byte };
+            tui_puts(mode, TUI_ST_BOLD);
+            tui_puts("   " as &const byte, TUI_ST_DEFAULT);
+            const w_used: usize = tui_row_cols();
+            const room: usize = if g_tui_cols > w_used + 20 { g_tui_cols - w_used - 3 } else { 0 as usize };
+            var info: Buf = buf_new(256);
+            defer { buf_free(&info); }
+            _ = buf_append(&info, g_tui_model.ptr, g_tui_model.len);
+            if g_tui_provider.len > 0 {
+                _ = buf_append_cstr(&info, "   ");
+                _ = buf_append(&info, g_tui_provider.ptr, g_tui_provider.len);
+            }
+            tui_put_clipped(info.ptr as &const byte, info.len, room, TUI_ST_DIM);
+            // 右对齐的键位提示
+            const hint: &const byte = "tab plan   ctrl+p commands" as &const byte;
+            const hl: usize = bufx_cstr_len(hint);
+            const cur: usize = tui_row_cols();
+            const end: usize = if g_tui_cols > 3 { g_tui_cols - 3 } else { 0 as usize };
+            if end > cur + hl + 2 {
+                tui_pad_to(end - hl);
+                tui_puts(hint, TUI_ST_HINT);
+            }
+            tui_fill_row(g_tui_cols);
+        }
+        li = li + 1;
+    }
+}
+
+// 脚注：左 `~/cwd:branch`，右 `in/out · ctx · 版本`
+fn tui_draw_footer() void {
+    tui_row_new();
+    tui_pad_to(2);
+    const w: usize = if g_tui_cols > 4 { g_tui_cols - 4 } else { 1 as usize };
+    var left: Buf = buf_new(512);
+    defer { buf_free(&left); }
+    // 把 $HOME 前缀缩成 ~
+    var cwd: &const byte = g_tui_cwd.ptr as &const byte;
+    var cwd_len: usize = g_tui_cwd.len;
+    if g_tui_home.len > 0 && cwd_len >= g_tui_home.len
+        && bufx_mem_eq(cwd, g_tui_home.ptr as &const byte, g_tui_home.len) {
+        _ = buf_append_byte(&left, 126);   // '~'
+        _ = buf_append(&left, g_tui_cwd.ptr + g_tui_home.len, g_tui_cwd.len - g_tui_home.len);
+    } else {
+        _ = buf_append(&left, cwd, cwd_len);
+    }
+    if g_tui_branch.len > 0 {
+        _ = buf_append_byte(&left, 58);   // ':'
+        _ = buf_append(&left, g_tui_branch.ptr, g_tui_branch.len);
+    }
+    var right: Buf = buf_new(256);
+    defer { buf_free(&right); }
+    if g_tui_use_in > 0 || g_tui_use_out > 0 {
+        var num: Buf = buf_new(32);
+        defer { buf_free(&num); }
+        _ = buf_append_cstr(&right, "in ");
+        tui_num_k(g_tui_use_in, &num);
+        _ = buf_append(&right, num.ptr, num.len);
+        _ = buf_append_cstr(&right, " · out ");
+        tui_num_k(g_tui_use_out, &num);
+        _ = buf_append(&right, num.ptr, num.len);
+        if g_tui_ctx_pct >= 0 {
+            _ = buf_append_cstr(&right, " · ctx ");
+            _ = buf_append_u64(&right, g_tui_ctx_pct as u64);
+            _ = buf_append_byte(&right, 37);   // '%'
+        }
+        _ = buf_append_cstr(&right, " · ");
+    }
+    _ = buf_append(&right, g_tui_version.ptr, g_tui_version.len);
+    if left.len + right.len + 6 <= w {
+        tui_put_clipped(left.ptr as &const byte, left.len, w - right.len - 2, TUI_ST_FOOTER);
+        tui_pad_to(g_tui_cols - 2 - right.len);
+        tui_put_clipped(right.ptr as &const byte, right.len, right.len, TUI_ST_FOOTER);
+    } else {
+        tui_put_clipped(left.ptr as &const byte, left.len, w, TUI_ST_FOOTER);
+    }
+    tui_fill_row(g_tui_cols);
+}
+
+// ============================================================
+// 转录条目
+// ============================================================
+
+export const TUI_E_USER: u8 = 0;
+export const TUI_E_ASSIST: u8 = 1;
+export const TUI_E_REASON: u8 = 2;
+export const TUI_E_TOOL: u8 = 3;
+export const TUI_E_NOTICE: u8 = 4;
+export const TUI_E_STEER: u8 = 5;
+
+const TUI_MAX_ENTRIES: usize = 512;
+const TUI_ENTRY_MAX: usize = 262144;        // 单条上限 256 KiB
+const TUI_TEXT_MAX: usize = 4194304;        // 转录正文总量上限 4 MiB
+const TUI_REASON_TAIL: usize = 4096;        // 思考条目只留最新一段
+
+struct TuiEntry {
+    kind: u8,
+    text: Buf,
+    wrap: Buf,
+    wrap_width: usize,
+    wrap_lines: usize,
+    wrap_valid: bool,
+    streaming: bool,
+}
+
+var g_tui_entries: [TuiEntry: TUI_MAX_ENTRIES] = [TuiEntry{
+    kind: 0,
+    text: Buf{ ptr: null, len: 0, cap: 0 },
+    wrap: Buf{ ptr: null, len: 0, cap: 0 },
+    wrap_width: 0, wrap_lines: 0, wrap_valid: false, streaming: false
+}: TUI_MAX_ENTRIES];
+var g_tui_nent: usize = 0;          // 已用条目数（环形）
+var g_tui_estart: usize = 0;        // 环形起点
+var g_tui_text_total: usize = 0;    // 正文总量记账
+var g_tui_dropped: usize = 0;       // 被丢掉的老条目数（顶部会写一行）
+
+export fn tui_entries_count() usize {
+    return g_tui_nent;
+}
+
+export fn tui_dropped_count() usize {
+    return g_tui_dropped;
+}
+
+fn tui_entry_slot(i: usize) usize {
+    return (g_tui_estart + i) % TUI_MAX_ENTRIES;
+}
+
+export fn tui_entry_kind(i: usize) u8 {
+    if i >= g_tui_nent {
+        return 255;
+    }
+    const s: usize = tui_entry_slot(i);
+    if s >= TUI_MAX_ENTRIES {
+        return 255;
+    }
+    return g_tui_entries[s].kind;
+}
+
+fn tui_entry_text_of(i: usize) &Buf {
+    const s: usize = tui_entry_slot(i);
+    if s >= TUI_MAX_ENTRIES {
+        return &g_tui_entries[0].text;
+    }
+    return &g_tui_entries[s].text;
+}
+
+fn tui_entry_at(i: usize) &TuiEntry {
+    const s: usize = tui_entry_slot(i);
+    if s >= TUI_MAX_ENTRIES {
+        return &g_tui_entries[0];
+    }
+    return &g_tui_entries[s];
+}
+
+fn tui_entry_init(e: &TuiEntry, kind: u8) void {
+    e.kind = kind;
+    if !buf_valid(&e.text) {
+        e.text = buf_new(4096);
+    }
+    if !buf_valid(&e.wrap) {
+        e.wrap = buf_new(4096);
+    }
+    buf_reset(&e.text);
+    buf_reset(&e.wrap);
+    e.wrap_width = 0;
+    e.wrap_lines = 0;
+    e.wrap_valid = false;
+    e.streaming = false;
+}
+
+// 丢最老的一条（环形前进）
+fn tui_entry_drop_oldest() void {
+    if g_tui_nent == 0 {
+        return;
+    }
+    const s: usize = g_tui_estart;
+    if s < TUI_MAX_ENTRIES {
+        g_tui_text_total = g_tui_text_total - g_tui_entries[s].text.len;
+        buf_free(&g_tui_entries[s].text);
+        buf_free(&g_tui_entries[s].wrap);
+    }
+    g_tui_estart = (g_tui_estart + 1) % TUI_MAX_ENTRIES;
+    g_tui_nent = g_tui_nent - 1;
+    g_tui_dropped = g_tui_dropped + 1;
+}
+
+fn tui_entry_new(kind: u8) i32 {
+    while g_tui_nent >= TUI_MAX_ENTRIES {
+        tui_entry_drop_oldest();
+    }
+    while g_tui_text_total > TUI_TEXT_MAX && g_tui_nent > 0 {
+        tui_entry_drop_oldest();
+    }
+    const s: usize = (g_tui_estart + g_tui_nent) % TUI_MAX_ENTRIES;
+    const e: &TuiEntry = &g_tui_entries[s];
+    tui_entry_init(e, kind);
+    g_tui_nent = g_tui_nent + 1;
+    tui_mark_dirty();
+    return (g_tui_nent - 1) as i32;
+}
+
+fn tui_entry_append(e: &TuiEntry, p: &const byte, n: usize) void {
+    if n == 0 {
+        return;
+    }
+    if e.text.len + n > TUI_ENTRY_MAX {
+        const over: usize = e.text.len + n - TUI_ENTRY_MAX;
+        if over >= e.text.len {
+            buf_reset(&e.text);
+        } else {
+            buf_truncate(&e.text, e.text.len - over);
+        }
+    }
+    if buf_append(&e.text, p, n) {
+        g_tui_text_total = g_tui_text_total + n;
+    }
+    e.wrap_valid = false;
+    tui_mark_dirty();
+}
+
+// 把「未成行的尾巴」拼进来（sink 用）
+var g_tui_pend: Buf = Buf{ ptr: null, len: 0, cap: 0 };
+
+fn tui_pend_ensure() void {
+    if !buf_valid(&g_tui_pend) {
+        g_tui_pend = buf_new(8192);
+    }
+}
+
+// ============================================================
+// 清洗：控制字节 / ESC 序列 / TAB
+//
+// 工具输出里什么都可能有（NUL、彩色转义、`ESC[2J`）。正文层必须是纯文本：
+//   * ESC 起始的 CSI/OSC 序列整段吃掉，只留一个 ␛（告诉人「这里原来有转义」）
+//   * 其余控制字节（0x00-0x1f 除了 \n、0x7f）→ ·
+//   * TAB → 四个空格（正文层里没有 TAB，宽度算得准）
+// ============================================================
+
+export fn tui_clean_into(dst: &Buf, p: &const byte, n: usize) void {
+    var i: usize = 0;
+    while i < n {
+        const c: byte = p[i];
+        if c == 27 as byte {
+            // CSI: ESC [ ... 终结字节 0x40-0x7e；OSC: ESC ] ... BEL/ST
+            var j: usize = i + 1;
+            if j < n && p[j] == 91 as byte {
+                j = j + 1;
+                while j < n {
+                    const d: byte = p[j];
+                    if d >= 0x40 as byte && d <= 0x7e as byte {
+                        j = j + 1;
+                        break;
+                    }
+                    j = j + 1;
+                }
+            } else if j < n && p[j] == 93 as byte {
+                j = j + 1;
+                while j < n {
+                    if p[j] == 7 as byte {
+                        j = j + 1;
+                        break;
+                    }
+                    if p[j] == 27 as byte && j + 1 < n && p[j + 1] == 92 as byte {
+                        j = j + 2;
+                        break;
+                    }
+                    j = j + 1;
+                }
+            } else {
+                j = i + 1;
+            }
+            _ = buf_append(dst, "␛" as &const byte, 3);
+            i = j;
+            continue;
+        }
+        if c == 9 as byte {
+            _ = buf_append(dst, "    " as &const byte, 4);
+            i = i + 1;
+            continue;
+        }
+        if c == 10 as byte {
+            _ = buf_append_byte(dst, 10);
+            i = i + 1;
+            continue;
+        }
+        if c < 0x20 as byte || c == 0x7f as byte {
+            _ = buf_append(dst, "·" as &const byte, 2);
+            i = i + 1;
+            continue;
+        }
+        _ = buf_append_byte(dst, c);
+        i = i + 1;
+    }
+}
+
+// ============================================================
+// 折行（按显示列；续行保留原行缩进）
+// ============================================================
+
+fn tui_wrap_into(dst: &Buf, text: &const byte, n: usize, width: usize) usize {
+    buf_reset(dst);
+    var width_v: usize = width;
+    if width_v < 4 {
+        width_v = 4;
+    }
+    const w: usize = width_v;
+    var lines: usize = 0;
+    var pos: usize = 0;
+    while pos <= n {
+        // 本逻辑行 = [pos, eol)
+        var eol: usize = pos;
+        while eol < n && text[eol] != 10 as byte {
+            eol = eol + 1;
+        }
+        const seg_len: usize = eol - pos;
+        // 缩进（续行沿用）
+        var indent: usize = 0;
+        while indent < seg_len {
+            if text[pos + indent] != 32 as byte {
+                break;
+            }
+            indent = indent + 1;
+        }
+        if indent > w - 4 {
+            indent = w - 4;
+        }
+        if seg_len == 0 {
+            _ = buf_append_byte(dst, 10);
+            lines = lines + 1;
+        } else {
+            var off: usize = 0;
+            var first: bool = true;
+            while off < seg_len {
+                var room: usize = w;
+                if !first {
+                    room = w - indent;
+                }
+                var take: usize = tty_clip_bytes(text + pos + off, seg_len - off, room);
+                if take == 0 {
+                    take = 1;
+                }
+                // 尽量在空格处断行（除非这一段本来就装得下）
+                if off + take < seg_len {
+                    var k: usize = take;
+                    while k > 0 {
+                        if text[pos + off + k - 1] == 32 as byte {
+                            take = k - 1;
+                            break;
+                        }
+                        k = k - 1;
+                    }
+                    if take == 0 {
+                        take = tty_clip_bytes(text + pos + off, seg_len - off, room);
+                        if take == 0 {
+                            take = 1;
+                        }
+                    }
+                }
+                if !first {
+                    var pad: usize = 0;
+                    while pad < indent {
+                        _ = buf_append_byte(dst, 32);
+                        pad = pad + 1;
+                    }
+                }
+                _ = buf_append(dst, text + pos + off, take);
+                _ = buf_append_byte(dst, 10);
+                lines = lines + 1;
+                off = off + take;
+                first = false;
+                while off < seg_len && text[pos + off] == 32 as byte && !first {
+                    // 断行处的空格吃掉（下一行已经有缩进）
+                    if off + 1 < seg_len && text[pos + off + 1] == 32 as byte {
+                        break;
+                    }
+                    break;
+                }
+            }
+        }
+        if eol >= n {
+            break;
+        }
+        pos = eol + 1;
+    }
+    return lines;
+}
+
+// 确保条目折行缓存与当前宽度一致
+fn tui_entry_ensure_wrap(i: usize, width: usize) void {
+    const e: &TuiEntry = tui_entry_at(i);
+    if e.wrap_valid && e.wrap_width == width {
+        return;
+    }
+    if !buf_valid(&e.wrap) {
+        e.wrap = buf_new(4096);
+    }
+    e.wrap_lines = tui_wrap_into(&e.wrap, e.text.ptr as &const byte, e.text.len, width);
+    e.wrap_width = width;
+    e.wrap_valid = true;
+}
+
+// 取条目第 k 行（折行后）的字节区间
+fn tui_entry_line(i: usize, k: usize, off: &usize, len: &usize) bool {
+    const e: &TuiEntry = tui_entry_at(i);
+    if !e.wrap_valid || k >= e.wrap_lines {
+        return false;
+    }
+    var line: usize = 0;
+    var start: usize = 0;
+    var p: usize = 0;
+    while p <= e.wrap.len {
+        if p == e.wrap.len || e.wrap.ptr[p] == 10 as byte {
+            if line == k {
+                off[0] = start;
+                len[0] = p - start;
+                return true;
+            }
+            line = line + 1;
+            start = p + 1;
+        }
+        p = p + 1;
+    }
+    return false;
+}
+
+// ============================================================
+// sink：把 tty_write / tty_reason_write 的字节变成转录条目
+// ============================================================
+
+var g_tui_chan: i32 = 0;          // 当前累积的通道（2 的整行缓冲用）
+var g_tui_linebuf: Buf = Buf{ ptr: null, len: 0, cap: 0 };
+
+fn tui_linebuf_ensure() void {
+    if !buf_valid(&g_tui_linebuf) {
+        g_tui_linebuf = buf_new(8192);
+    }
+}
+
+fn tui_last_kind() u8 {
+    if g_tui_nent == 0 {
+        return 255;
+    }
+    return tui_entry_kind(g_tui_nent - 1);
+}
+
+// 关闭「流式助手」条目：下一段正文会新起一条
+export fn tui_close_stream_entries() void {
+    var i: usize = 0;
+    while i < g_tui_nent {
+        const e: &TuiEntry = tui_entry_at(i);
+        e.streaming = false;
+        i = i + 1;
+    }
+}
+
+// 通道 1（助手正文）：追加到当前流式条目（没有就新建）
+fn tui_sink_assist(p: &const byte, n: usize) void {
+    if n == 0 {
+        return;
+    }
+    var idx: i32 = -1;
+    if g_tui_nent > 0 {
+        const last: usize = g_tui_nent - 1;
+        const e: &TuiEntry = tui_entry_at(last);
+        if e.kind == TUI_E_ASSIST && e.streaming {
+            idx = last as i32;
+        }
+    }
+    if idx < 0 {
+        idx = tui_entry_new(TUI_E_ASSIST);
+        if idx < 0 {
+            return;
+        }
+        const e2: &TuiEntry = tui_entry_at(idx as usize);
+        e2.streaming = true;
+    }
+    const e3: &TuiEntry = tui_entry_at(idx as usize);
+    tui_entry_append(e3, p, n);
+}
+
+// 通道 3（思考）：追加并只保留尾部一段
+fn tui_sink_reason(p: &const byte, n: usize) void {
+    if n == 0 {
+        return;
+    }
+    var idx: i32 = -1;
+    if g_tui_nent > 0 {
+        const last: usize = g_tui_nent - 1;
+        const e: &TuiEntry = tui_entry_at(last);
+        if e.kind == TUI_E_REASON {
+            idx = last as i32;
+        }
+    }
+    if idx < 0 {
+        idx = tui_entry_new(TUI_E_REASON);
+        if idx < 0 {
+            return;
+        }
+    }
+    const e2: &TuiEntry = tui_entry_at(idx as usize);
+    tui_entry_append(e2, p, n);
+    if e2.text.len > TUI_REASON_TAIL {
+        const cut: usize = e2.text.len - TUI_REASON_TAIL;
+        // 从尾部保留：把尾部搬到头部
+        var k: usize = 0;
+        while k < TUI_REASON_TAIL {
+            e2.text.ptr[k] = e2.text.ptr[cut + k];
+            k = k + 1;
+        }
+        buf_truncate(&e2.text, TUI_REASON_TAIL);
+        e2.wrap_valid = false;
+    }
+}
+
+fn tui_line_starts_with(p: &const byte, n: usize, lit: &const byte) bool {
+    const l: usize = bufx_cstr_len(lit);
+    if n < l {
+        return false;
+    }
+    return bufx_mem_eq(p, lit, l);
+}
+
+// 通道 2 的一整行 → 条目（工具块 / 诊断）
+fn tui_sink_line(p: &const byte, n: usize) void {
+    if n == 0 {
+        return;
+    }
+    const is_tool_head: bool = tui_line_starts_with(p, n, "✓ " as &const byte)
+        || tui_line_starts_with(p, n, "✗ " as &const byte)
+        || tui_line_starts_with(p, n, "● " as &const byte);
+    const is_indent: bool = p[0] == 32 as byte;
+    if is_tool_head {
+        const idx: i32 = tui_entry_new(TUI_E_TOOL);
+        if idx < 0 {
+            return;
+        }
+        const e: &TuiEntry = tui_entry_at(idx as usize);
+        tui_entry_append(e, p, n);
+        _ = buf_append_byte(&e.text, 10);
+        g_tui_text_total = g_tui_text_total + 1;
+        return;
+    }
+    const lastk: u8 = tui_last_kind();
+    if is_indent && (lastk == TUI_E_TOOL || lastk == TUI_E_NOTICE) {
+        const e2: &TuiEntry = tui_entry_at(g_tui_nent - 1);
+        tui_entry_append(e2, p, n);
+        _ = buf_append_byte(&e2.text, 10);
+        g_tui_text_total = g_tui_text_total + 1;
+        return;
+    }
+    if (lastk == TUI_E_NOTICE || lastk == TUI_E_TOOL) && !is_indent {
+        // 新的一行诊断：接到上一条 NOTICE 后面（连续若干行），工具块则新起一条
+        if lastk == TUI_E_NOTICE {
+            const e3: &TuiEntry = tui_entry_at(g_tui_nent - 1);
+            tui_entry_append(e3, p, n);
+            _ = buf_append_byte(&e3.text, 10);
+            g_tui_text_total = g_tui_text_total + 1;
+            return;
+        }
+    }
+    const idx4: i32 = tui_entry_new(TUI_E_NOTICE);
+    if idx4 < 0 {
+        return;
+    }
+    const e4: &TuiEntry = tui_entry_at(idx4 as usize);
+    tui_entry_append(e4, p, n);
+    _ = buf_append_byte(&e4.text, 10);
+    g_tui_text_total = g_tui_text_total + 1;
+}
+
+// ---- 外部写入接口（agent / view / askuser 用）----
+
+export fn tui_add_user(p: &const byte, n: usize) void {
+    const idx: i32 = tui_entry_new(TUI_E_USER);
+    if idx < 0 {
+        return;
+    }
+    const e: &TuiEntry = tui_entry_at(idx as usize);
+    tui_entry_append(e, p, n);
+}
+
+export fn tui_add_steer(p: &const byte, n: usize) void {
+    const idx: i32 = tui_entry_new(TUI_E_STEER);
+    if idx < 0 {
+        return;
+    }
+    const e: &TuiEntry = tui_entry_at(idx as usize);
+    tui_entry_append(e, p, n);
+}
+
+export fn tui_add_notice(p: &const byte, n: usize) void {
+    const idx: i32 = tui_entry_new(TUI_E_NOTICE);
+    if idx < 0 {
+        return;
+    }
+    const e: &TuiEntry = tui_entry_at(idx as usize);
+    tui_entry_append(e, p, n);
+    _ = buf_append_byte(&e.text, 10);
+    g_tui_text_total = g_tui_text_total + 1;
+}
+
+// 工具块：view.uya 用现成的纯函数 view_render_block() 生成文本后整块交进来
+export fn tui_add_tool_block(p: &const byte, n: usize) void {
+    const idx: i32 = tui_entry_new(TUI_E_TOOL);
+    if idx < 0 {
+        return;
+    }
+    const e: &TuiEntry = tui_entry_at(idx as usize);
+    tui_entry_append(e, p, n);
+}
+
+// sink 入口（tty.uya 的 tty_write / tty_stream_write / tty_reason_write 调它）
+export fn tui_sink_bytes(chan: i32, p: &const byte, n: usize) void {
+    if n == 0 {
+        return;
+    }
+    tui_pend_ensure();
+    tui_linebuf_ensure();
+    var clean: Buf = buf_new(n + n / 2 + 32);
+    if !buf_valid(&clean) {
+        return;
+    }
+    tui_clean_into(&clean, p, n);
+    if chan == 1 {
+        tui_sink_assist(clean.ptr as &const byte, clean.len);
+        buf_free(&clean);
+        return;
+    }
+    if chan == 3 {
+        tui_sink_reason(clean.ptr as &const byte, clean.len);
+        buf_free(&clean);
+        return;
+    }
+    // 通道 2：按行切开（不完整的尾巴留着）
+    var i: usize = 0;
+    while i < clean.len {
+        const c: byte = clean.ptr[i];
+        if c == 10 as byte {
+            tui_sink_line(g_tui_linebuf.ptr as &const byte, g_tui_linebuf.len);
+            buf_reset(&g_tui_linebuf);
+        } else {
+            _ = buf_append_byte(&g_tui_linebuf, c);
+        }
+        i = i + 1;
+    }
+    buf_free(&clean);
+}
+
+// fork 前/回合结束时把「半行」冲掉（否则下一条工具行会和半行粘在一起）
+export fn tui_sink_flush_partial() void {
+    if buf_valid(&g_tui_linebuf) && g_tui_linebuf.len > 0 {
+        tui_sink_line(g_tui_linebuf.ptr as &const byte, g_tui_linebuf.len);
+        buf_reset(&g_tui_linebuf);
+    }
+}
+
+// ============================================================
+// 行渲染（markdown-lite + 前缀分类）
+// ============================================================
+
+var g_tui_md_code: bool = false;
+
+const TUI_PREFIX_COL: usize = 2;     // 转录左留白（与面板竖条对齐）
+const TUI_BODY_COL: usize = 4;       // 正文列
+
+export fn tui_md_reset() void {
+    g_tui_md_code = false;
+}
+
+// 一行里按反引号切段：`code` → INLINE，其余 base
+fn tui_draw_inline(p: &const byte, n: usize, base: u8, avail: usize) void {
+    var i: usize = 0;
+    var in_code: bool = false;
+    var start: usize = 0;
+    var used: usize = 0;
+    while i <= n {
+        if i == n || p[i] == 96 as byte {
+            const seg_len: usize = i - start;
+            if seg_len > 0 {
+                const style: u8 = if in_code { TUI_ST_INLINE } else { base };
+                const keep: usize = tty_clip_bytes(p + start, seg_len, avail - used);
+                tui_put(p + start, keep, style);
+                used = used + tty_cols_between(p + start, 0, keep);
+                if keep < seg_len {
+                    tui_puts("…" as &const byte, style);
+                    return;
+                }
+            }
+            if i < n {
+                in_code = !in_code;
+            }
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+}
+
+// 助手正文的一行：代码围栏 / 标题 / 列表 / 行内 code
+fn tui_draw_assist_line(p: &const byte, n: usize, avail: usize) void {
+    if tui_line_starts_with(p, n, "```" as &const byte) {
+        g_tui_md_code = !g_tui_md_code;
+        tui_puts("│ " as &const byte, TUI_ST_DIM);
+        tui_put_clipped(p, n, avail - 2, TUI_ST_DIM);
+        return;
+    }
+    if g_tui_md_code {
+        tui_puts("│ " as &const byte, TUI_ST_DIM);
+        tui_put_clipped(p, n, avail - 2, TUI_ST_CODE);
+        return;
+    }
+    if n > 0 && p[0] == 35 as byte {
+        tui_put_clipped(p, n, avail, TUI_ST_BOLD);
+        return;
+    }
+    if n >= 2 && (tui_line_starts_with(p, n, "- " as &const byte) || tui_line_starts_with(p, n, "* " as &const byte)) {
+        tui_puts("· " as &const byte, TUI_ST_ACCENT);
+        tui_draw_inline(p + 2, n - 2, TUI_ST_DEFAULT, avail - 2);
+        return;
+    }
+    var d: usize = 0;
+    while d < n && p[d] >= 48 as byte && p[d] <= 57 as byte {
+        d = d + 1;
+    }
+    if d > 0 && d + 1 < n && p[d] == 46 as byte && p[d + 1] == 32 as byte {
+        tui_put(p, d + 1, TUI_ST_ACCENT);
+        tui_puts(" " as &const byte, TUI_ST_DEFAULT);
+        tui_draw_inline(p + d + 2, n - d - 2, TUI_ST_DEFAULT, avail - d - 3);
+        return;
+    }
+    tui_draw_inline(p, n, TUI_ST_DEFAULT, avail);
+}
+
+// 工具块/诊断行的前缀分类
+fn tui_tool_line_style(p: &const byte, n: usize) u8 {
+    if tui_line_starts_with(p, n, "✓" as &const byte) {
+        return TUI_ST_OK;
+    }
+    if tui_line_starts_with(p, n, "✗" as &const byte) {
+        return TUI_ST_ERR;
+    }
+    if tui_line_starts_with(p, n, "●" as &const byte) {
+        return TUI_ST_ACCENT;
+    }
+    var i: usize = 0;
+    while i < n && p[i] == 32 as byte {
+        i = i + 1;
+    }
+    if i + 1 < n {
+        if p[i] == 45 as byte && p[i + 1] == 32 as byte {
+            return TUI_ST_DEL;
+        }
+        if p[i] == 43 as byte && p[i + 1] == 32 as byte {
+            return TUI_ST_ADD;
+        }
+    }
+    return TUI_ST_TOOL;
+}
+
+fn tui_notice_style(p: &const byte, n: usize) u8 {
+    if tui_line_starts_with(p, n, "error:" as &const byte) {
+        return TUI_ST_ERR;
+    }
+    if tui_line_starts_with(p, n, "warning:" as &const byte) {
+        return TUI_ST_WARN;
+    }
+    if tui_line_starts_with(p, n, "[interrupted]" as &const byte) {
+        return TUI_ST_WARN;
+    }
+    if tui_line_starts_with(p, n, "[steer]" as &const byte) {
+        return TUI_ST_ACCENT;
+    }
+    return TUI_ST_DIM;
+}
+
+fn tui_entry_has_header(kind: u8) bool {
+    return kind == TUI_E_USER || kind == TUI_E_ASSIST || kind == TUI_E_REASON || kind == TUI_E_STEER;
+}
+
+fn tui_entry_rows(i: usize, width: usize) usize {
+    tui_entry_ensure_wrap(i, width);
+    const e: &TuiEntry = tui_entry_at(i);
+    var rows: usize = e.wrap_lines;
+    if tui_entry_has_header(e.kind) {
+        rows = rows + 1;
+    }
+    return rows;
+}
+
+fn tui_draw_header(kind: u8) void {
+    if kind == TUI_E_ASSIST {
+        tui_puts("◆ 助手" as &const byte, TUI_ST_ACCENT);
+        return;
+    }
+    if kind == TUI_E_REASON {
+        tui_puts("✻ 思考" as &const byte, TUI_ST_DIM);
+        return;
+    }
+    tui_puts("▎ 你" as &const byte, TUI_ST_BOLD);
+}
+
+// ============================================================
+// 滚动
+// ============================================================
+
+var g_tui_scroll: usize = 0;        // 从尾部往上滚了多少行
+var g_tui_total: usize = 0;         // 最近一帧算出的总行数
+var g_tui_more_above: bool = false;
+
+export fn tui_scroll_up(lines: usize) void {
+    g_tui_scroll = g_tui_scroll + lines;
+    tui_mark_dirty();
+}
+
+export fn tui_scroll_down(lines: usize) void {
+    if g_tui_scroll > lines {
+        g_tui_scroll = g_tui_scroll - lines;
+    } else {
+        g_tui_scroll = 0;
+    }
+    tui_mark_dirty();
+}
+
+export fn tui_scroll_home() void {
+    g_tui_scroll = 0x7FFFFFFF;
+    tui_mark_dirty();
+}
+
+export fn tui_scroll_end() void {
+    g_tui_scroll = 0;
+    tui_mark_dirty();
+}
+
+export fn tui_scroll_pos() usize {
+    return g_tui_scroll;
+}
+
+// ============================================================
+// 拼整屏
+// ============================================================
+
+var g_tui_in: Buf = Buf{ ptr: null, len: 0, cap: 0 };
+var g_tui_in_cursor: usize = 0;
+var g_tui_panel_top: usize = 0;
+var g_tui_input_top: usize = 0;
+
+fn tui_in_ensure() void {
+    if !buf_valid(&g_tui_in) {
+        g_tui_in = buf_new(65536);
+    }
+}
+
+export fn tui_input_text() &Buf {
+    tui_in_ensure();
+    return &g_tui_in;
+}
+
+export fn tui_input_len() usize {
+    tui_in_ensure();
+    return g_tui_in.len;
+}
+
+export fn tui_input_clear() void {
+    tui_in_ensure();
+    buf_reset(&g_tui_in);
+    g_tui_in_cursor = 0;
+    tui_mark_dirty();
+}
+
+export fn tui_input_set(p: &const byte, n: usize) void {
+    tui_in_ensure();
+    buf_reset(&g_tui_in);
+    _ = buf_append(&g_tui_in, p, n);
+    g_tui_in_cursor = g_tui_in.len;
+    tui_mark_dirty();
+}
+
+export fn tui_input_cursor() usize {
+    return g_tui_in_cursor;
+}
+
+// 输入缓冲里的行数（'\n' 分隔）
+fn tui_input_lines() usize {
+    tui_in_ensure();
+    var lines: usize = 1;
+    var i: usize = 0;
+    while i < g_tui_in.len {
+        if g_tui_in.ptr[i] == 10 as byte {
+            lines = lines + 1;
+        }
+        i = i + 1;
+    }
+    return lines;
+}
+
+// 光标在第几行 / 该行内第几列（显示列）
+fn tui_input_cursor_line_col(line: &usize, col: &usize) void {
+    tui_in_ensure();
+    var l: usize = 0;
+    var start: usize = 0;
+    var i: usize = 0;
+    const cur: usize = if g_tui_in_cursor > g_tui_in.len { g_tui_in.len } else { g_tui_in_cursor };
+    while i < cur {
+        if g_tui_in.ptr[i] == 10 as byte {
+            l = l + 1;
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    line[0] = l;
+    col[0] = tty_cols_between(g_tui_in.ptr as &const byte, start, cur);
+}
+
+// 取输入缓冲第 l 行的区间
+fn tui_input_line_range(l: usize, off: &usize, len: &usize) bool {
+    tui_in_ensure();
+    var line: usize = 0;
+    var start: usize = 0;
+    var p: usize = 0;
+    while p <= g_tui_in.len {
+        if p == g_tui_in.len || g_tui_in.ptr[p] == 10 as byte {
+            if line == l {
+                off[0] = start;
+                len[0] = p - start;
+                return true;
+            }
+            line = line + 1;
+            start = p + 1;
+        }
+        p = p + 1;
+    }
+    return false;
+}
+
+// 空态：logo + 面板整体垂直居中
+fn tui_build_home() void {
+    tui_in_ensure();
+    const in_lines: usize = tui_input_lines();
+    const panel_h: usize = tui_panel_height(in_lines);
+    g_tui_in_lines = in_lines;
+    g_tui_panel_h = panel_h;
+    const logo_h: usize = if g_tui_cols >= TUI_LOGO_COLS { tui_logo_height() } else { 1 as usize };
+    const gap: usize = 2;
+    const block_h: usize = logo_h + gap + panel_h;
+    var top: usize = 0;
+    if g_tui_rows > block_h + 2 {
+        top = (g_tui_rows - 1 - block_h) / 2;
+    }
+    var pad_top: usize = 0;
+    while pad_top < top {
+        tui_row_new();
+        tui_fill_row(g_tui_cols);
+        pad_top = pad_top + 1;
+    }
+    // logo
+    if g_tui_cols >= TUI_LOGO_COLS {
+        const lw: usize = tui_logo_width();
+        var start: usize = 0;
+        if g_tui_cols > lw {
+            start = (g_tui_cols - lw) / 2;
+        }
+        var ro: usize = 0;
+        while ro < TUI_LOGO_H {
+            tui_row_new();
+            tui_pad_to(start);
+            tui_logo_row(ro);
+            tui_fill_row(g_tui_cols);
+            ro = ro + 1;
+        }
+    } else {
+        tui_row_new();
+        tui_pad_to(2);
+        tui_puts("uya agent" as &const byte, TUI_ST_USER);
+        tui_fill_row(g_tui_cols);
+    }
+    var g: usize = 0;
+    while g < gap {
+        tui_row_new();
+        tui_fill_row(g_tui_cols);
+        g = g + 1;
+    }
+    g_tui_panel_top = g_tui_nrows;
+    tui_draw_panel_rows(panel_h, in_lines);
+    // 下面补齐到脚注之前
+    while g_tui_nrows + 1 < g_tui_rows {
+        tui_row_new();
+        tui_fill_row(g_tui_cols);
+    }
+}
+
+// 面板实体（抽出给 home/chat 共用）：in_lines 行输入 + 1 行信息
+fn tui_draw_panel_rows(panel_h: usize, in_lines: usize) void {
+    tui_in_ensure();
+    const width: usize = if g_tui_cols > 5 { g_tui_cols - 5 } else { 1 as usize };
+    const content_col: usize = TUI_BODY_COL;
+    var cur_line: usize = 0;
+    var cur_col: usize = 0;
+    tui_input_cursor_line_col(&cur_line, &cur_col);
+    // 输入行窗口：光标行可见
+    var view: usize = 0;
+    if in_lines > panel_h - 1 {
+        const vis: usize = panel_h - 1;
+        if cur_line >= vis {
+            view = cur_line - vis + 1;
+        }
+    }
+    var li: usize = 0;
+    while li < panel_h {
+        tui_row_new();
+        tui_pad_to(2);
+        tui_puts("▌" as &const byte, TUI_ST_ACCENT);
+        if li < panel_h - 1 {
+            tui_pad_to(content_col);
+            const ln: usize = view + li;
+            if ln == 0 {
+                if g_tui_in.len == 0 {
+                    tui_puts("↑ " as &const byte, TUI_ST_HINT);
+                } else {
+                    tui_puts("❯ " as &const byte, TUI_ST_ACCENT);
+                }
+            } else {
+                tui_pad_to(content_col + 2);
+            }
+            var off: usize = 0;
+            var len: usize = 0;
+            const have: bool = tui_input_line_range(ln, &off, &len);
+            if g_tui_in.len == 0 && li == 0 {
+                const ph2: &const byte = "Ask anything... \"把 hello.uya 的问候语改成 Hello, DSH!\"" as &const byte;
+                tui_put_clipped(ph2, bufx_cstr_len(ph2), width - 2, TUI_ST_HINT);
+            } else if have {
+                tui_put_clipped(g_tui_in.ptr + off, len, width - 2, TUI_ST_DEFAULT);
+            }
+            tui_fill_row(g_tui_cols);
+        } else {
+            tui_pad_to(content_col);
+            if g_tui_plan {
+                tui_puts("Plan" as &const byte, TUI_ST_BOLD);
+            } else {
+                tui_puts("Build" as &const byte, TUI_ST_BOLD);
+            }
+            tui_puts("   " as &const byte, TUI_ST_DEFAULT);
+            const w_used: usize = tui_row_cols();
+            const room: usize = if g_tui_cols > w_used + 20 { g_tui_cols - w_used - 3 } else { 0 as usize };
+            var info: Buf = buf_new(256);
+            defer { buf_free(&info); }
+            _ = buf_append(&info, g_tui_model.ptr, g_tui_model.len);
+            if g_tui_provider.len > 0 {
+                _ = buf_append_cstr(&info, "   ");
+                _ = buf_append(&info, g_tui_provider.ptr, g_tui_provider.len);
+            }
+            tui_put_clipped(info.ptr as &const byte, info.len, room, TUI_ST_DIM);
+            const hint: &const byte = "tab plan   ctrl+p commands" as &const byte;
+            const hl: usize = bufx_cstr_len(hint);
+            const curc: usize = tui_row_cols();
+            const end: usize = if g_tui_cols > 3 { g_tui_cols - 3 } else { 0 as usize };
+            if end > curc + hl + 2 {
+                tui_pad_to(end - hl);
+                tui_puts(hint, TUI_ST_HINT);
+            }
+            tui_fill_row(g_tui_cols);
+        }
+        li = li + 1;
+    }
+}
+
+// 对话态：转录（底对齐）+ 面板贴底
+fn tui_build_chat() void {
+    tui_in_ensure();
+    const in_lines: usize = tui_input_lines();
+    const panel_h: usize = tui_panel_height(in_lines);
+    g_tui_in_lines = in_lines;
+    g_tui_panel_h = panel_h;
+    const footer_h: usize = 1;
+    var panel_top: usize = 0;
+    if g_tui_rows > panel_h + footer_h {
+        panel_top = g_tui_rows - panel_h - footer_h;
+    }
+    g_tui_panel_top = panel_top;
+    const width: usize = if g_tui_cols > 6 { g_tui_cols - 6 } else { 4 as usize };
+    // 1) 从尾部往上收行，直到够一屏 + 滚动量
+    const need: usize = panel_top + g_tui_scroll;
+    var first: usize = g_tui_nent;
+    var total: usize = 0;
+    var more: bool = false;
+    while first > 0 {
+        const rows: usize = tui_entry_rows(first - 1, width);
+        if total >= need && total > 0 {
+            more = true;
+            break;
+        }
+        total = total + rows;
+        first = first - 1;
+    }
+    g_tui_total = total;
+    g_tui_more_above = more || first > 0;
+    // 2) 计算窗口起点
+    var pad_top: usize = 0;
+    var start_line: usize = 0;
+    if total > panel_top {
+        const max_scroll: usize = total - panel_top;
+        var sc: usize = g_tui_scroll;
+        if sc > max_scroll {
+            sc = max_scroll;
+        }
+        start_line = max_scroll - sc;
+        g_tui_scroll = sc;
+    } else {
+        pad_top = panel_top - total;
+        g_tui_scroll = 0;
+    }
+    // 3) 画
+    while pad_top > 0 {
+        tui_row_new();
+        tui_fill_row(g_tui_cols);
+        pad_top = pad_top - 1;
+    }
+    var gl: usize = 0;
+    var r: usize = g_tui_nrows;
+    var i: usize = first;
+    while i < g_tui_nent && r < panel_top {
+        const e: &TuiEntry = tui_entry_at(i);
+        if tui_entry_has_header(e.kind) {
+            if gl >= start_line && r < panel_top {
+                tui_row_new();
+                tui_pad_to(TUI_PREFIX_COL + 2);
+                tui_draw_header(e.kind);
+                tui_fill_row(g_tui_cols);
+                r = r + 1;
+            }
+            gl = gl + 1;
+        }
+        var k: usize = 0;
+        while k < e.wrap_lines && r < panel_top {
+            var off: usize = 0;
+            var len: usize = 0;
+            if tui_entry_line(i, k, &off, &len) {
+                if gl >= start_line {
+                    tui_row_new();
+                    const avail: usize = if g_tui_cols > TUI_BODY_COL + 3 { g_tui_cols - TUI_BODY_COL - 3 } else { 4 as usize };
+                    const p: &const byte = e.wrap.ptr + off;
+                    if e.kind == TUI_E_TOOL {
+                        tui_pad_to(TUI_PREFIX_COL);
+                        tui_put_clipped(p, len, avail + 1, tui_tool_line_style(p, len));
+                    } else if e.kind == TUI_E_NOTICE {
+                        tui_pad_to(TUI_PREFIX_COL);
+                        tui_puts("· " as &const byte, TUI_ST_DIM);
+                        tui_put_clipped(p, len, avail, tui_notice_style(p, len));
+                    } else if e.kind == TUI_E_ASSIST {
+                        tui_pad_to(TUI_BODY_COL - 2);
+                        tui_draw_assist_line(p, len, avail);
+                    } else if e.kind == TUI_E_REASON {
+                        tui_pad_to(TUI_BODY_COL - 2);
+                        tui_put_clipped(p, len, avail, TUI_ST_DIM);
+                    } else {
+                        tui_pad_to(TUI_BODY_COL - 2);
+                        tui_draw_inline(p, len, TUI_ST_USER, avail);
+                    }
+                    tui_fill_row(g_tui_cols);
+                    r = r + 1;
+                }
+                gl = gl + 1;
+            }
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    // 4) 运行中的状态行（跟在转录最后，仍在视口里才画）
+    if g_tui_run != TUI_RUN_IDLE && r < panel_top {
+        tui_row_new();
+        tui_pad_to(TUI_PREFIX_COL);
+        tui_puts(tui_spinner_glyph(), TUI_ST_ACCENT);
+        tui_puts(" " as &const byte, TUI_ST_DEFAULT);
+        var st: Buf = buf_new(256);
+        defer { buf_free(&st); }
+        if g_tui_run == TUI_RUN_THINK {
+            _ = buf_append_cstr(&st, "思考中");
+        } else if g_tui_run == TUI_RUN_STREAM {
+            _ = buf_append_cstr(&st, "输出中");
+        } else if g_tui_run == TUI_RUN_TOOL {
+            _ = buf_append_cstr(&st, "运行中 ");
+            _ = buf_append(&st, g_tui_run_label.ptr, g_tui_run_label.len);
+        } else {
+            _ = buf_append_cstr(&st, "运行中");
+        }
+        _ = buf_append_cstr(&st, " · esc 中断");
+        tui_put_clipped(st.ptr as &const byte, st.len, g_tui_cols - 8, TUI_ST_DIM);
+        tui_fill_row(g_tui_cols);
+        r = r + 1;
+    }
+    // 5) 补齐视口
+    while r < panel_top {
+        tui_row_new();
+        tui_fill_row(g_tui_cols);
+        r = r + 1;
+    }
+    // 6) 滚动指示（视口最右列）
+    if g_tui_more_above || g_tui_scroll > 0 {
+        var rr: usize = 0;
+        while rr < panel_top {
+            const mark: usize = if panel_top > 2 { (1 as usize) + (rr * (panel_top - 3)) / (panel_top - 1) } else { 0 as usize };
+            if rr == mark {
+                if rr < g_tui_nrows {
+                    // 在右侧画一个位置指示（不改行文本，直接补到最后一列）
+                }
+            }
+            rr = rr + 1;
+        }
+    }
+    // 7) 面板
+    g_tui_panel_top = g_tui_nrows;
+    tui_draw_panel_rows(panel_h, in_lines);
+}
+
+// 输入光标落点（面板重画之后调用）
+fn tui_cursor_place() void {
+    var cl: usize = 0;
+    var cc: usize = 0;
+    tui_input_cursor_line_col(&cl, &cc);
+    const panel_h: usize = g_tui_panel_h;
+    const in_lines: usize = g_tui_in_lines;
+    var view: usize = 0;
+    if in_lines > panel_h - 1 {
+        const vis: usize = panel_h - 1;
+        if cl >= vis {
+            view = cl - vis + 1;
+        }
+    }
+    var crow: usize = g_tui_panel_top + (cl - view);
+    if g_tui_panel_top + panel_h > g_tui_rows {
+        crow = g_tui_rows - 1;
+    }
+    const ccol: usize = TUI_BODY_COL + 2 + cc;
+    tui_set_cursor(crow, ccol, g_tui_run == TUI_RUN_IDLE);
+}
+
+// 组装一屏（home / chat），不写终端
+export fn tui_build() void {
+    tui_state_ensure();
+    tui_in_ensure();
+    tui_glue_ensure();
+    tui_md_reset();
+    tui_frame_begin(g_tui_cols, g_tui_rows);
+    if g_tui_nent == 0 {
+        tui_build_home();
+    } else {
+        tui_build_chat();
+    }
+    tui_draw_footer();
+    if g_tui_ov != TUI_OV_NONE {
+        // 浮层画在转录区中间：重画 [top, top+h) 这段，再把面板与脚注补回来
+        tui_draw_overlay();
+        while g_tui_nrows < g_tui_panel_top {
+            tui_row_new();
+            tui_fill_row(g_tui_cols);
+        }
+        tui_draw_panel_rows(g_tui_panel_h, g_tui_in_lines);
+        tui_draw_footer();
+    }
+    tui_cursor_place();
+}
+
+// 组装 + 输出（dirty 才画）
+export fn tui_render() void {
+    if !g_tui_on {
+        return;
+    }
+    if !g_tui_dirty {
+        return;
+    }
+    tui_build();
+    tui_flush();
+    g_tui_frames = g_tui_frames + 1;
+}
+
+// ============================================================
+// 输入编辑器（按 UTF-8 字符编辑、按显示列定位）
+// ============================================================
+
+const TUI_HIST_MAX: usize = 32;
+
+var g_tui_hist: [Buf: TUI_HIST_MAX] = [Buf{ ptr: null, len: 0, cap: 0 }: TUI_HIST_MAX];
+var g_tui_hist_n: usize = 0;
+var g_tui_hist_pos: i32 = -1;
+var g_tui_hist_stash: Buf = Buf{ ptr: null, len: 0, cap: 0 };
+
+fn tui_hist_push(p: &const byte, n: usize) void {
+    if n == 0 {
+        return;
+    }
+    if !buf_valid(&g_tui_hist_stash) {
+        g_tui_hist_stash = buf_new(8192);
+    }
+    var i: usize = TUI_HIST_MAX - 1;
+    while i > 0 {
+        g_tui_hist[i] = g_tui_hist[i - 1];
+        i = i - 1;
+    }
+    if !buf_valid(&g_tui_hist[0]) {
+        g_tui_hist[0] = buf_new(n + 16);
+    } else {
+        buf_reset(&g_tui_hist[0]);
+    }
+    _ = buf_append(&g_tui_hist[0], p, n);
+    if g_tui_hist_n < TUI_HIST_MAX {
+        g_tui_hist_n = g_tui_hist_n + 1;
+    }
+    g_tui_hist_pos = -1;
+}
+
+fn tui_hist_move(up: bool) void {
+    if g_tui_hist_n == 0 {
+        return;
+    }
+    tui_in_ensure();
+    if up {
+        if g_tui_hist_pos < 0 {
+            // 先把当前行存起来
+            buf_reset(&g_tui_hist_stash);
+            _ = buf_append(&g_tui_hist_stash, g_tui_in.ptr, g_tui_in.len);
+        }
+        var np: i32 = g_tui_hist_pos + 1;
+        if np >= g_tui_hist_n as i32 {
+            np = (g_tui_hist_n as i32) - 1;
+        }
+        g_tui_hist_pos = np;
+        const idx: usize = np as usize;
+        if idx < TUI_HIST_MAX {
+            buf_reset(&g_tui_in);
+            _ = buf_append(&g_tui_in, g_tui_hist[idx].ptr, g_tui_hist[idx].len);
+            g_tui_in_cursor = g_tui_in.len;
+        }
+    } else {
+        if g_tui_hist_pos < 0 {
+            return;
+        }
+        const np2: i32 = g_tui_hist_pos - 1;
+        g_tui_hist_pos = np2;
+        buf_reset(&g_tui_in);
+        if np2 < 0 {
+            _ = buf_append(&g_tui_in, g_tui_hist_stash.ptr, g_tui_hist_stash.len);
+        } else {
+            const idx2: usize = np2 as usize;
+            if idx2 < TUI_HIST_MAX {
+                _ = buf_append(&g_tui_in, g_tui_hist[idx2].ptr, g_tui_hist[idx2].len);
+            }
+        }
+        g_tui_in_cursor = g_tui_in.len;
+    }
+    tui_mark_dirty();
+}
+
+fn tui_in_insert(p: &const byte, n: usize) void {
+    tui_in_ensure();
+    if n == 0 || g_tui_in.len + n > 65536 {
+        return;
+    }
+    const cur: usize = if g_tui_in_cursor > g_tui_in.len { g_tui_in.len } else { g_tui_in_cursor };
+    // 在 cur 处插入：先把尾巴挪开
+    const tail: usize = g_tui_in.len - cur;
+    var i: usize = 0;
+    while i < tail {
+        g_tui_in.ptr[g_tui_in.len + n - 1 - i] = g_tui_in.ptr[g_tui_in.len - 1 - i];
+        i = i + 1;
+    }
+    g_tui_in.len = g_tui_in.len + n;
+    i = 0;
+    while i < n {
+        g_tui_in.ptr[cur + i] = p[i];
+        i = i + 1;
+    }
+    g_tui_in_cursor = cur + n;
+    tui_mark_dirty();
+}
+
+fn tui_in_erase(from: usize, to: usize) void {
+    tui_in_ensure();
+    if to > g_tui_in.len || from > to {
+        return;
+    }
+    const tail: usize = g_tui_in.len - to;
+    var i: usize = 0;
+    while i < tail {
+        g_tui_in.ptr[from + i] = g_tui_in.ptr[to + i];
+        i = i + 1;
+    }
+    buf_truncate(&g_tui_in, g_tui_in.len - (to - from));
+    g_tui_in_cursor = from;
+    tui_mark_dirty();
+}
+
+fn tui_in_backspace() void {
+    tui_in_ensure();
+    if g_tui_in_cursor == 0 {
+        return;
+    }
+    const prev: usize = tty_utf8_prev(g_tui_in.ptr as &const byte, g_tui_in_cursor);
+    tui_in_erase(prev, g_tui_in_cursor);
+}
+
+fn tui_in_delete() void {
+    tui_in_ensure();
+    if g_tui_in_cursor >= g_tui_in.len {
+        return;
+    }
+    const next: usize = tty_utf8_next(g_tui_in.ptr as &const byte, g_tui_in_cursor, g_tui_in.len);
+    tui_in_erase(g_tui_in_cursor, next);
+}
+
+fn tui_in_del_word() void {
+    tui_in_ensure();
+    if g_tui_in_cursor == 0 {
+        return;
+    }
+    var i: usize = g_tui_in_cursor;
+    while i > 0 && g_tui_in.ptr[i - 1] == 32 as byte {
+        i = i - 1;
+    }
+    while i > 0 && g_tui_in.ptr[i - 1] != 32 as byte && g_tui_in.ptr[i - 1] != 10 as byte {
+        i = i - 1;
+    }
+    tui_in_erase(i, g_tui_in_cursor);
+}
+
+fn tui_in_left() void {
+    tui_in_ensure();
+    if g_tui_in_cursor > 0 {
+        g_tui_in_cursor = tty_utf8_prev(g_tui_in.ptr as &const byte, g_tui_in_cursor);
+        tui_mark_dirty();
+    }
+}
+
+fn tui_in_right() void {
+    tui_in_ensure();
+    if g_tui_in_cursor < g_tui_in.len {
+        g_tui_in_cursor = tty_utf8_next(g_tui_in.ptr as &const byte, g_tui_in_cursor, g_tui_in.len);
+        tui_mark_dirty();
+    }
+}
+
+// 当前行的起止（用于 Home/End）
+fn tui_in_line_bounds(start: &usize, end: &usize) void {
+    tui_in_ensure();
+    var s: usize = 0;
+    var i: usize = 0;
+    const cur: usize = if g_tui_in_cursor > g_tui_in.len { g_tui_in.len } else { g_tui_in_cursor };
+    while i < cur {
+        if g_tui_in.ptr[i] == 10 as byte {
+            s = i + 1;
+        }
+        i = i + 1;
+    }
+    var e: usize = g_tui_in.len;
+    i = cur;
+    while i < g_tui_in.len {
+        if g_tui_in.ptr[i] == 10 as byte {
+            e = i;
+            break;
+        }
+        i = i + 1;
+    }
+    start[0] = s;
+    end[0] = e;
+}
+
+fn tui_in_home() void {
+    var s: usize = 0;
+    var e: usize = 0;
+    tui_in_line_bounds(&s, &e);
+    g_tui_in_cursor = s;
+    tui_mark_dirty();
+}
+
+fn tui_in_end() void {
+    var s: usize = 0;
+    var e: usize = 0;
+    tui_in_line_bounds(&s, &e);
+    g_tui_in_cursor = e;
+    tui_mark_dirty();
+}
+
+fn tui_in_up() void {
+    tui_in_ensure();
+    // 单行输入 → 历史
+    if tui_input_lines() == 1 {
+        tui_hist_move(true);
+        return;
+    }
+    // 多行 → 上一行同列
+    var s: usize = 0;
+    var e: usize = 0;
+    tui_in_line_bounds(&s, &e);
+    if s == 0 {
+        return;
+    }
+    const want: usize = tty_cols_between(g_tui_in.ptr as &const byte, s, g_tui_in_cursor);
+    // 上一行范围
+    var ps: usize = 0;
+    var pe: usize = s - 1;
+    var i: usize = 0;
+    while i < pe {
+        if g_tui_in.ptr[i] == 10 as byte {
+            ps = i + 1;
+        }
+        i = i + 1;
+    }
+    var col: usize = 0;
+    var j: usize = ps;
+    while j < pe {
+        const w: usize = tty_cols_between(g_tui_in.ptr as &const byte, j, tty_utf8_next(g_tui_in.ptr as &const byte, j, g_tui_in.len));
+        if col + w > want {
+            break;
+        }
+        col = col + w;
+        j = tty_utf8_next(g_tui_in.ptr as &const byte, j, g_tui_in.len);
+    }
+    g_tui_in_cursor = j;
+    tui_mark_dirty();
+}
+
+fn tui_in_down() void {
+    tui_in_ensure();
+    if tui_input_lines() == 1 {
+        tui_hist_move(false);
+        return;
+    }
+    var s: usize = 0;
+    var e: usize = 0;
+    tui_in_line_bounds(&s, &e);
+    if e >= g_tui_in.len {
+        return;
+    }
+    const want: usize = tty_cols_between(g_tui_in.ptr as &const byte, s, g_tui_in_cursor);
+    const ns: usize = e + 1;
+    var ne: usize = g_tui_in.len;
+    var i: usize = ns;
+    while i < g_tui_in.len {
+        if g_tui_in.ptr[i] == 10 as byte {
+            ne = i;
+            break;
+        }
+        i = i + 1;
+    }
+    var col: usize = 0;
+    var j: usize = ns;
+    while j < ne {
+        const nx: usize = tty_utf8_next(g_tui_in.ptr as &const byte, j, g_tui_in.len);
+        const w: usize = tty_cols_between(g_tui_in.ptr as &const byte, j, nx);
+        if col + w > want {
+            break;
+        }
+        col = col + w;
+        j = nx;
+    }
+    g_tui_in_cursor = j;
+    tui_mark_dirty();
+}
+
+fn tui_in_kill_to_end() void {
+    var s: usize = 0;
+    var e: usize = 0;
+    tui_in_line_bounds(&s, &e);
+    tui_in_erase(g_tui_in_cursor, e);
+}
+
+// ============================================================
+// 键解码（把字节流变成按键事件）
+// ============================================================
+
+export const TUI_K_NONE: i32 = 0;
+export const TUI_K_CHAR: i32 = 1;
+export const TUI_K_ENTER: i32 = 2;
+export const TUI_K_NEWLINE: i32 = 3;
+export const TUI_K_BACKSPACE: i32 = 4;
+export const TUI_K_DELETE: i32 = 5;
+export const TUI_K_LEFT: i32 = 6;
+export const TUI_K_RIGHT: i32 = 7;
+export const TUI_K_UP: i32 = 8;
+export const TUI_K_DOWN: i32 = 9;
+export const TUI_K_HOME: i32 = 10;
+export const TUI_K_END: i32 = 11;
+export const TUI_K_PGUP: i32 = 12;
+export const TUI_K_PGDN: i32 = 13;
+export const TUI_K_TAB: i32 = 14;
+export const TUI_K_STAB: i32 = 15;
+export const TUI_K_ESC: i32 = 16;
+export const TUI_K_CTRL_C: i32 = 17;
+export const TUI_K_CTRL_D: i32 = 18;
+export const TUI_K_CTRL_L: i32 = 19;
+export const TUI_K_CTRL_U: i32 = 20;
+export const TUI_K_CTRL_W: i32 = 21;
+export const TUI_K_CTRL_K: i32 = 22;
+export const TUI_K_CTRL_A: i32 = 23;
+export const TUI_K_CTRL_E: i32 = 24;
+export const TUI_K_CTRL_P: i32 = 25;
+
+const TUI_EVQ_MAX: usize = 512;
+
+var g_tui_evq: [i32: TUI_EVQ_MAX] = [0: TUI_EVQ_MAX];
+var g_tui_evn: usize = 0;
+var g_tui_chars: Buf = Buf{ ptr: null, len: 0, cap: 0 };
+var g_tui_chars_r: usize = 0;
+
+var g_tui_esc: i32 = 0;         // 0 无 / 1 ESC / 2 ESC[ / 3 ESC[数字 / 4 ESC] / 5 粘贴中
+var g_tui_esc_num: i32 = 0;
+var g_tui_esc_have: bool = false;
+var g_tui_utf: usize = 0;       // UTF-8 已收到的字节数
+var g_tui_utf_have: usize = 0;
+var g_tui_utf_buf: [byte: 8] = [0: 8];
+
+fn tui_ev_push(ev: i32) void {
+    if g_tui_evn >= TUI_EVQ_MAX {
+        return;
+    }
+    g_tui_evq[g_tui_evn] = ev;
+    g_tui_evn = g_tui_evn + 1;
+}
+
+fn tui_ev_push_char(c: byte) void {
+    if !buf_valid(&g_tui_chars) {
+        g_tui_chars = buf_new(4096);
+    }
+    if g_tui_evn >= TUI_EVQ_MAX {
+        return;
+    }
+    _ = buf_append_byte(&g_tui_chars, c);
+    g_tui_evq[g_tui_evn] = TUI_K_CHAR;
+    g_tui_evn = g_tui_evn + 1;
+}
+
+export fn tui_key_events_pending() usize {
+    return g_tui_evn;
+}
+
+export fn tui_key_next() i32 {
+    if g_tui_evn == 0 {
+        return TUI_K_NONE;
+    }
+    const ev: i32 = g_tui_evq[0];
+    var i: usize = 0;
+    while i + 1 < g_tui_evn {
+        g_tui_evq[i] = g_tui_evq[i + 1];
+        i = i + 1;
+    }
+    g_tui_evn = g_tui_evn - 1;
+    return ev;
+}
+
+// 取一个字符事件的字节（写进 out），返回长度
+export fn tui_key_take_char(out: &Buf) usize {
+    if g_tui_chars_r >= g_tui_chars.len {
+        return 0;
+    }
+    const c: byte = g_tui_chars.ptr[g_tui_chars_r];
+    const l: usize = tty_utf8_len(c);
+    var take: usize = l;
+    if take == 0 {
+        take = 1;
+    }
+    if g_tui_chars_r + take > g_tui_chars.len {
+        take = g_tui_chars.len - g_tui_chars_r;
+    }
+    _ = buf_append(out, g_tui_chars.ptr + g_tui_chars_r, take);
+    g_tui_chars_r = g_tui_chars_r + take;
+    if g_tui_chars_r >= g_tui_chars.len {
+        buf_reset(&g_tui_chars);
+        g_tui_chars_r = 0;
+    }
+    return take;
+}
+
+export fn tui_key_reset() void {
+    g_tui_evn = 0;
+    g_tui_esc = 0;
+    g_tui_esc_num = 0;
+    g_tui_esc_have = false;
+    g_tui_utf = 0;
+    g_tui_utf_have = 0;
+    if buf_valid(&g_tui_chars) {
+        buf_reset(&g_tui_chars);
+    }
+    g_tui_chars_r = 0;
+}
+
+fn tui_esc_final(f: byte) void {
+    // CSI 终结字节
+    if f == 65 as byte {
+        tui_ev_push(TUI_K_UP);
+        return;
+    }
+    if f == 66 as byte {
+        tui_ev_push(TUI_K_DOWN);
+        return;
+    }
+    if f == 67 as byte {
+        tui_ev_push(TUI_K_RIGHT);
+        return;
+    }
+    if f == 68 as byte {
+        tui_ev_push(TUI_K_LEFT);
+        return;
+    }
+    if f == 72 as byte {
+        tui_ev_push(TUI_K_HOME);
+        return;
+    }
+    if f == 70 as byte {
+        tui_ev_push(TUI_K_END);
+        return;
+    }
+    if f == 90 as byte {
+        tui_ev_push(TUI_K_STAB);
+        return;
+    }
+    if f == 126 as byte {
+        // ESC[<n>~
+        if g_tui_esc_num == 1 || g_tui_esc_num == 7 {
+            tui_ev_push(TUI_K_HOME);
+        } else if g_tui_esc_num == 3 {
+            tui_ev_push(TUI_K_DELETE);
+        } else if g_tui_esc_num == 4 || g_tui_esc_num == 8 {
+            tui_ev_push(TUI_K_END);
+        } else if g_tui_esc_num == 5 {
+            tui_ev_push(TUI_K_PGUP);
+        } else if g_tui_esc_num == 6 {
+            tui_ev_push(TUI_K_PGDN);
+        } else if g_tui_esc_num == 200 {
+            g_tui_esc = 5;   // 括起粘贴开始
+            return;
+        } else if g_tui_esc_num == 201 {
+            g_tui_esc = 0;
+            return;
+        }
+    }
+    if f == 77 as byte || f == 109 as byte {
+        // 鼠标（SGR）：整段吃掉
+        g_tui_esc = 0;
+        return;
+    }
+    g_tui_esc = 0;
+}
+
+// 喂入一段字节（fd 0 上读到的原样字节）
+export fn tui_key_feed(p: &const byte, n: usize) void {
+    var i: usize = 0;
+    while i < n {
+        const c: byte = p[i];
+        i = i + 1;
+        // 粘贴中：原样收字符（0x0d 当换行）
+        if g_tui_esc == 5 {
+            if c == 27 as byte {
+                g_tui_esc = 6;   // 可能是 ESC[201~
+                continue;
+            }
+            if c == 13 as byte {
+                tui_ev_push(TUI_K_NEWLINE);
+                continue;
+            }
+            tui_ev_push_char(c);
+            continue;
+        }
+        if g_tui_esc == 6 {
+            // 粘贴里出现 ESC：先当成普通 ESC 字符处理，再看是不是 201~
+            if c == 91 as byte {
+                g_tui_esc = 7;
+                g_tui_esc_num = 0;
+                g_tui_esc_have = false;
+                continue;
+            }
+            tui_ev_push_char(27);
+            g_tui_esc = 5;
+            // 继续按粘贴处理这一字节
+            if c == 13 as byte {
+                tui_ev_push(TUI_K_NEWLINE);
+            } else {
+                tui_ev_push_char(c);
+            }
+            continue;
+        }
+        if g_tui_esc == 7 {
+            // 粘贴里的 ESC[：数字 + ~
+            if c >= 48 as byte && c <= 57 as byte {
+                g_tui_esc_num = g_tui_esc_num * 10 + ((c as i32) - 48);
+                g_tui_esc_have = true;
+                continue;
+            }
+            if c == 126 as byte && g_tui_esc_have && g_tui_esc_num == 201 {
+                g_tui_esc = 0;      // 粘贴结束
+                continue;
+            }
+            tui_ev_push_char(27);
+            tui_ev_push_char(91);
+            g_tui_esc = 5;
+            tui_ev_push_char(c);
+            continue;
+        }
+        if g_tui_esc == 1 {
+            if c == 91 as byte {
+                g_tui_esc = 2;
+                g_tui_esc_num = 0;
+                g_tui_esc_have = false;
+                continue;
+            }
+            if c == 79 as byte {
+                g_tui_esc = 8;      // SS3
+                continue;
+            }
+            if c == 13 as byte {
+                tui_ev_push(TUI_K_NEWLINE);   // Alt-Enter
+                g_tui_esc = 0;
+                continue;
+            }
+            // 裸 ESC（后面跟的是普通字节）
+            tui_ev_push(TUI_K_ESC);
+            g_tui_esc = 0;
+            // 这一字节继续按普通字节处理
+        }
+        if g_tui_esc == 8 {
+            tui_esc_final(c);
+            g_tui_esc = 0;
+            continue;
+        }
+        if g_tui_esc == 2 || g_tui_esc == 3 {
+            if c >= 48 as byte && c <= 57 as byte {
+                g_tui_esc_num = g_tui_esc_num * 10 + ((c as i32) - 48);
+                g_tui_esc_have = true;
+                g_tui_esc = 3;
+                continue;
+            }
+            if c == 59 as byte && g_tui_esc == 2 {
+                // ESC[<n>M 这类鼠标序列（SGR 已在 60 行处理）
+                g_tui_esc = 3;
+                continue;
+            }
+            tui_esc_final(c);
+            g_tui_esc = 0;
+            continue;
+        }
+        // 普通字节
+        if c == 27 as byte {
+            g_tui_esc = 1;
+            continue;
+        }
+        if c == 13 as byte {
+            tui_ev_push(TUI_K_ENTER);
+            continue;
+        }
+        if c == 10 as byte {
+            tui_ev_push(TUI_K_NEWLINE);
+            continue;
+        }
+        if c == 9 as byte {
+            tui_ev_push(TUI_K_TAB);
+            continue;
+        }
+        if c == 127 as byte || c == 8 as byte {
+            tui_ev_push(TUI_K_BACKSPACE);
+            continue;
+        }
+        if c == 3 as byte {
+            tui_ev_push(TUI_K_CTRL_C);
+            continue;
+        }
+        if c == 4 as byte {
+            tui_ev_push(TUI_K_CTRL_D);
+            continue;
+        }
+        if c == 12 as byte {
+            tui_ev_push(TUI_K_CTRL_L);
+            continue;
+        }
+        if c == 21 as byte {
+            tui_ev_push(TUI_K_CTRL_U);
+            continue;
+        }
+        if c == 23 as byte {
+            tui_ev_push(TUI_K_CTRL_W);
+            continue;
+        }
+        if c == 11 as byte {
+            tui_ev_push(TUI_K_CTRL_K);
+            continue;
+        }
+        if c == 1 as byte {
+            tui_ev_push(TUI_K_CTRL_A);
+            continue;
+        }
+        if c == 5 as byte {
+            tui_ev_push(TUI_K_CTRL_E);
+            continue;
+        }
+        if c == 16 as byte {
+            tui_ev_push(TUI_K_CTRL_P);
+            continue;
+        }
+        if c < 32 as byte {
+            continue;   // 其余控制字节丢掉
+        }
+        // UTF-8 多字节组装
+        if g_tui_utf_have == 0 {
+            g_tui_utf = tty_utf8_len(c);
+            if g_tui_utf <= 1 {
+                tui_ev_push_char(c);
+                continue;
+            }
+            g_tui_utf_buf[0] = c;
+            g_tui_utf_have = 1;
+            continue;
+        }
+        g_tui_utf_buf[g_tui_utf_have] = c;
+        g_tui_utf_have = g_tui_utf_have + 1;
+        if g_tui_utf_have >= g_tui_utf {
+            var k: usize = 0;
+            while k < g_tui_utf_have {
+                tui_ev_push_char(g_tui_utf_buf[k]);
+                k = k + 1;
+            }
+            g_tui_utf_have = 0;
+            g_tui_utf = 0;
+        }
+    }
+}
+
+// 一段字节读完后再调用：把悬着的裸 ESC 落实（方向键的 ESC[ 已被状态机吃掉）
+export fn tui_key_flush_esc() void {
+    if g_tui_esc == 1 {
+        tui_ev_push(TUI_K_ESC);
+        g_tui_esc = 0;
+    }
+}
+
+// ============================================================
+// 浮层（命令面板 / 会话选择 / 帮助 / 审批问答）
+// ============================================================
+
+export const TUI_OV_NONE: u8 = 0;
+export const TUI_OV_LIST: u8 = 1;      // 列表型：面板 / 会话 / 帮助
+export const TUI_OV_CONFIRM: u8 = 2;   // 问答型：ask_user_question / plan 审批
+
+var g_tui_ov: u8 = 0;
+var g_tui_ov_title: Buf = Buf{ ptr: null, len: 0, cap: 0 };
+var g_tui_ov_items: Buf = Buf{ ptr: null, len: 0, cap: 0 };
+var g_tui_ov_n: usize = 0;
+var g_tui_ov_sel: usize = 0;
+var g_tui_ov_top: usize = 0;
+var g_tui_ov_filter: Buf = Buf{ ptr: null, len: 0, cap: 0 };
+var g_tui_ov_prompt: Buf = Buf{ ptr: null, len: 0, cap: 0 };
+var g_tui_ov_result: Buf = Buf{ ptr: null, len: 0, cap: 0 };
+var g_tui_ov_have: bool = false;       // 有结果可取
+var g_tui_ov_cancel: bool = false;     // 被 Esc 取消
+
+export const TUI_OVK_PALETTE: u8 = 1;  // 命令面板（输入以 / 开头时也用它）
+export const TUI_OVK_SESSIONS: u8 = 2;
+export const TUI_OVK_HELP: u8 = 3;
+export const TUI_OVK_ASK: u8 = 4;      // ask_user_question
+export const TUI_OVK_PLAN: u8 = 5;     // exit_plan_mode 审批
+
+var g_tui_ov_kind: u8 = 0;
+
+fn tui_ov_ensure() void {
+    if !buf_valid(&g_tui_ov_title) { g_tui_ov_title = buf_new(256); }
+    if !buf_valid(&g_tui_ov_items) { g_tui_ov_items = buf_new(8192); }
+    if !buf_valid(&g_tui_ov_filter) { g_tui_ov_filter = buf_new(256); }
+    if !buf_valid(&g_tui_ov_prompt) { g_tui_ov_prompt = buf_new(8192); }
+    if !buf_valid(&g_tui_ov_result) { g_tui_ov_result = buf_new(4096); }
+}
+
+export fn tui_overlay_open() bool {
+    return g_tui_ov != TUI_OV_NONE;
+}
+
+export fn tui_overlay_kind() u8 {
+    return g_tui_ov_kind;
+}
+
+fn tui_ov_count_items() usize {
+    tui_ov_ensure();
+    var n: usize = 0;
+    if g_tui_ov_items.len == 0 {
+        return 0;
+    }
+    var i: usize = 0;
+    while i < g_tui_ov_items.len {
+        if g_tui_ov_items.ptr[i] == 10 as byte {
+            n = n + 1;
+        }
+        i = i + 1;
+    }
+    if g_tui_ov_items.ptr[g_tui_ov_items.len - 1] != 10 as byte {
+        n = n + 1;
+    }
+    return n;
+}
+
+fn tui_ov_item(i: usize, off: &usize, len: &usize) bool {
+    tui_ov_ensure();
+    var line: usize = 0;
+    var start: usize = 0;
+    var p: usize = 0;
+    while p <= g_tui_ov_items.len {
+        if p == g_tui_ov_items.len || g_tui_ov_items.ptr[p] == 10 as byte {
+            if line == i {
+                off[0] = start;
+                len[0] = p - start;
+                return true;
+            }
+            line = line + 1;
+            start = p + 1;
+        }
+        p = p + 1;
+    }
+    return false;
+}
+
+fn tui_ov_filter_match(p: &const byte, n: usize) bool {
+    if g_tui_ov_filter.len == 0 {
+        return true;
+    }
+    if n < g_tui_ov_filter.len {
+        return false;
+    }
+    // 子串匹配（大小写不敏感 ASCII）
+    var i: usize = 0;
+    while i + g_tui_ov_filter.len <= n {
+        var k: usize = 0;
+        var ok: bool = true;
+        while k < g_tui_ov_filter.len {
+            var a: byte = p[i + k];
+            var b: byte = g_tui_ov_filter.ptr[k];
+            if a >= 65 as byte && a <= 90 as byte {
+                a = (a + 32) as byte;
+            }
+            if b >= 65 as byte && b <= 90 as byte {
+                b = (b + 32) as byte;
+            }
+            if a != b {
+                ok = false;
+                break;
+            }
+            k = k + 1;
+        }
+        if ok {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+// 打开列表型浮层（items 用 '\n' 分隔）
+export fn tui_overlay_list(kind: u8, title: &const byte, tn: usize, items: &const byte, inlen: usize) void {
+    tui_ov_ensure();
+    g_tui_ov = TUI_OV_LIST;
+    g_tui_ov_kind = kind;
+    buf_reset(&g_tui_ov_title);
+    _ = buf_append(&g_tui_ov_title, title, tn);
+    buf_reset(&g_tui_ov_items);
+    _ = buf_append(&g_tui_ov_items, items, inlen);
+    g_tui_ov_n = tui_ov_count_items();
+    g_tui_ov_sel = 0;
+    g_tui_ov_top = 0;
+    buf_reset(&g_tui_ov_filter);
+    g_tui_ov_have = false;
+    g_tui_ov_cancel = false;
+    tui_mark_dirty();
+}
+
+export fn tui_overlay_confirm(kind: u8, prompt: &const byte, pn: usize, items: &const byte, inlen: usize) void {
+    tui_overlay_list(kind, "请确认" as &const byte, 6, items, inlen);
+    g_tui_ov = TUI_OV_CONFIRM;
+    buf_reset(&g_tui_ov_prompt);
+    _ = buf_append(&g_tui_ov_prompt, prompt, pn);
+    tui_mark_dirty();
+}
+
+export fn tui_overlay_close() void {
+    g_tui_ov = TUI_OV_NONE;
+    g_tui_ov_kind = 0;
+    tui_mark_dirty();
+}
+
+// 取浮层结果（选中的原文）；返回 false 表示没有
+export fn tui_overlay_take(out: &Buf) bool {
+    if !g_tui_ov_have {
+        return false;
+    }
+    buf_reset(out);
+    _ = buf_append(out, g_tui_ov_result.ptr, g_tui_ov_result.len);
+    g_tui_ov_have = false;
+    return true;
+}
+
+export fn tui_overlay_cancelled() bool {
+    const c: bool = g_tui_ov_cancel;
+    g_tui_ov_cancel = false;
+    return c;
+}
+
+export fn tui_overlay_set_filter(p: &const byte, n: usize) void {
+    tui_ov_ensure();
+    buf_reset(&g_tui_ov_filter);
+    _ = buf_append(&g_tui_ov_filter, p, n);
+    g_tui_ov_sel = 0;
+    g_tui_ov_top = 0;
+    tui_mark_dirty();
+}
+
+export fn tui_overlay_sel_index() usize {
+    return g_tui_ov_sel;
+}
+
+// 选中项写进结果并关闭
+fn tui_ov_accept() void {
+    tui_ov_ensure();
+    // 找第 sel 个「通过过滤」的项
+    var seen: usize = 0;
+    var i: usize = 0;
+    var picked: bool = false;
+    var off: usize = 0;
+    var len: usize = 0;
+    while i < g_tui_ov_n {
+        var o: usize = 0;
+        var l: usize = 0;
+        if tui_ov_item(i, &o, &l) {
+            if tui_ov_filter_match(g_tui_ov_items.ptr + o, l) {
+                if seen == g_tui_ov_sel {
+                    off = o;
+                    len = l;
+                    picked = true;
+                    break;
+                }
+                seen = seen + 1;
+            }
+        }
+        i = i + 1;
+    }
+    buf_reset(&g_tui_ov_result);
+    if picked {
+        _ = buf_append(&g_tui_ov_result, g_tui_ov_items.ptr + off, len);
+        g_tui_ov_have = true;
+    } else {
+        g_tui_ov_cancel = true;
+    }
+    tui_overlay_close();
+}
+
+// 浮层按键
+fn tui_ov_key(ev: i32) void {
+    if ev == TUI_K_ESC || ev == TUI_K_CTRL_C {
+        g_tui_ov_cancel = true;
+        tui_overlay_close();
+        return;
+    }
+    if ev == TUI_K_ENTER {
+        tui_ov_accept();
+        return;
+    }
+    if ev == TUI_K_UP {
+        if g_tui_ov_sel > 0 {
+            g_tui_ov_sel = g_tui_ov_sel - 1;
+        }
+        tui_mark_dirty();
+        return;
+    }
+    if ev == TUI_K_DOWN {
+        var n: usize = 0;
+        var i: usize = 0;
+        while i < g_tui_ov_n {
+            var o: usize = 0;
+            var l: usize = 0;
+            if tui_ov_item(i, &o, &l) {
+                if tui_ov_filter_match(g_tui_ov_items.ptr + o, l) {
+                    n = n + 1;
+                }
+            }
+            i = i + 1;
+        }
+        if g_tui_ov_sel + 1 < n {
+            g_tui_ov_sel = g_tui_ov_sel + 1;
+        }
+        tui_mark_dirty();
+        return;
+    }
+    if ev == TUI_K_BACKSPACE {
+        if g_tui_ov_filter.len > 0 {
+            const prev: usize = tty_utf8_prev(g_tui_ov_filter.ptr as &const byte, g_tui_ov_filter.len);
+            buf_truncate(&g_tui_ov_filter, prev);
+            g_tui_ov_sel = 0;
+            tui_mark_dirty();
+        }
+        return;
+    }
+    if ev == TUI_K_CHAR {
+        var one: Buf = buf_empty();
+        var tmp: Buf = buf_new(8);
+        defer { buf_free(&tmp); }
+        const n: usize = tui_key_take_char(&tmp);
+        if n > 0 {
+            _ = buf_append(&g_tui_ov_filter, tmp.ptr, n);
+            g_tui_ov_sel = 0;
+            tui_mark_dirty();
+        }
+        _ = one;
+        return;
+    }
+}
+
+// 浮层排版：画在转录区中间的方框里（调用方保证 ov_top 之上/之下的行已经画好）
+fn tui_draw_overlay() void {
+    tui_ov_ensure();
+    const panel_top: usize = g_tui_panel_top;
+    var h: usize = 3 + g_tui_ov_n;
+    if h > 16 {
+        h = 16;
+    }
+    if panel_top < 5 {
+        return;
+    }
+    if h > panel_top - 2 {
+        h = panel_top - 2;
+    }
+    var w: usize = 60;
+    if g_tui_cols < 70 {
+        w = g_tui_cols - 6;
+    }
+    if w < 24 {
+        w = 24;
+    }
+    var left: usize = 2;
+    if g_tui_cols > w + 4 {
+        left = (g_tui_cols - w) / 2;
+    }
+    var top: usize = 1;
+    if panel_top > h + 2 {
+        top = (panel_top - h) / 2;
+    }
+    // 重画 [top, top+h) 这段
+    tui_row_rewind(top);
+    var r: usize = 0;
+    while r < h {
+        tui_row_new();
+        tui_pad_to(left);
+        const inner: usize = w - 2;
+        if r == 0 {
+            // 顶边 + 标题
+            tui_puts("╭─ " as &const byte, TUI_ST_ACCENT);
+            tui_put_clipped(g_tui_ov_title.ptr as &const byte, g_tui_ov_title.len, inner - 4, TUI_ST_BOLD);
+            var used: usize = tui_row_cols() - left;
+            while used + 1 < w {
+                tui_puts("─" as &const byte, TUI_ST_ACCENT);
+                used = used + 1;
+            }
+            tui_puts("╮" as &const byte, TUI_ST_ACCENT);
+        } else if r == h - 1 {
+            tui_puts("╰" as &const byte, TUI_ST_ACCENT);
+            var used2: usize = 1;
+            while used2 + 1 < w {
+                tui_puts("─" as &const byte, TUI_ST_ACCENT);
+                used2 = used2 + 1;
+            }
+            tui_puts("╯" as &const byte, TUI_ST_ACCENT);
+        } else {
+            tui_puts("│ " as &const byte, TUI_ST_ACCENT);
+            const body: usize = inner - 1;
+            // 列表体：按过滤结果逐项列
+            var want: usize = r - 1;
+            if g_tui_ov == TUI_OV_CONFIRM && r == 1 {
+                tui_put_clipped(g_tui_ov_prompt.ptr as &const byte, g_tui_ov_prompt.len, body, TUI_ST_DEFAULT);
+            } else {
+                if g_tui_ov == TUI_OV_CONFIRM {
+                    want = r - 2;
+                }
+                var seen: usize = 0;
+                var i: usize = 0;
+                var done: bool = false;
+                while i < g_tui_ov_n && !done {
+                    var o: usize = 0;
+                    var l: usize = 0;
+                    if tui_ov_item(i, &o, &l) {
+                        if tui_ov_filter_match(g_tui_ov_items.ptr + o, l) {
+                            if seen == want {
+                                const style: u8 = if seen == g_tui_ov_sel { TUI_ST_SEL } else { TUI_ST_DEFAULT };
+                                tui_put_clipped(g_tui_ov_items.ptr + o, l, body, style);
+                                done = true;
+                            }
+                            seen = seen + 1;
+                        }
+                    }
+                    i = i + 1;
+                }
+            }
+            var used3: usize = tui_row_cols() - left;
+            while used3 + 1 < w {
+                tui_puts(" " as &const byte, TUI_ST_DEFAULT);
+                used3 = used3 + 1;
+            }
+            tui_puts("│" as &const byte, TUI_ST_ACCENT);
+        }
+        tui_fill_row(g_tui_cols);
+        r = r + 1;
+    }
+}
+
+// 把 [r, nrows) 的行丢掉（浮层重画前用）
+fn tui_row_rewind(r: usize) void {
+    if r >= g_tui_nrows {
+        return;
+    }
+    const off: usize = tui_rowtab_text_off(r);
+    buf_truncate(&g_tui_text, off);
+    g_tui_nsegs = tui_rowtab_seg_start(r);
+    g_tui_nrows = r;
+    g_tui_cur_seg = g_tui_nsegs;
+    g_tui_cur_style = 255;
+}
+
+fn tui_rowtab_text_off(r: usize) usize {
+    if r >= TUI_MAX_ROWS {
+        return 0;
+    }
+    return g_tui_rowtab[r].text_off;
+}
+
+fn tui_rowtab_seg_start(r: usize) usize {
+    if r >= TUI_MAX_ROWS {
+        return 0;
+    }
+    return g_tui_rowtab[r].seg_start;
+}
+
+// ============================================================
+// 按键 → 行为（提交 / 中断 / 退出 / 滚动 / 浮层）
+// ============================================================
+
+export const TUI_REQ_NONE: i32 = 0;
+export const TUI_REQ_PLAN_ON: i32 = 1;
+export const TUI_REQ_PLAN_OFF: i32 = 2;
+
+var g_tui_submit: Buf = Buf{ ptr: null, len: 0, cap: 0 };
+var g_tui_have_submit: bool = false;
+var g_tui_interrupt: bool = false;
+var g_tui_quit: bool = false;
+var g_tui_ctrl_c_armed: bool = false;
+var g_tui_req: i32 = TUI_REQ_NONE;
+var g_tui_cmds: Buf = Buf{ ptr: null, len: 0, cap: 0 };
+var g_tui_panel_h: usize = 2;
+var g_tui_in_lines: usize = 1;
+
+fn tui_glue_ensure() void {
+    if !buf_valid(&g_tui_submit) { g_tui_submit = buf_new(65536); }
+    if !buf_valid(&g_tui_cmds) { g_tui_cmds = buf_new(4096); }
+}
+
+export fn tui_set_commands(p: &const byte, n: usize) void {
+    tui_glue_ensure();
+    buf_reset(&g_tui_cmds);
+    _ = buf_append(&g_tui_cmds, p, n);
+}
+
+export fn tui_take_submit(out: &Buf) bool {
+    tui_glue_ensure();
+    if !g_tui_have_submit {
+        return false;
+    }
+    buf_reset(out);
+    _ = buf_append(out, g_tui_submit.ptr, g_tui_submit.len);
+    g_tui_have_submit = false;
+    return true;
+}
+
+export fn tui_has_submit() bool {
+    return g_tui_have_submit;
+}
+
+export fn tui_interrupt_take() bool {
+    const v: bool = g_tui_interrupt;
+    g_tui_interrupt = false;
+    return v;
+}
+
+export fn tui_interrupt_pending() bool {
+    return g_tui_interrupt;
+}
+
+export fn tui_quit_wanted() bool {
+    return g_tui_quit;
+}
+
+export fn tui_take_request() i32 {
+    const r: i32 = g_tui_req;
+    g_tui_req = TUI_REQ_NONE;
+    return r;
+}
+
+// 提交当前输入（回车）：进历史 + 清空 + 置「有待取走的提交」
+fn tui_do_submit() void {
+    tui_glue_ensure();
+    tui_in_ensure();
+    if g_tui_in.len == 0 {
+        return;
+    }
+    buf_reset(&g_tui_submit);
+    _ = buf_append(&g_tui_submit, g_tui_in.ptr, g_tui_in.len);
+    g_tui_have_submit = true;
+    tui_hist_push(g_tui_in.ptr as &const byte, g_tui_in.len);
+    buf_reset(&g_tui_in);
+    g_tui_in_cursor = 0;
+    tui_mark_dirty();
+}
+
+// 命令面板：把命令表按 '/' 过滤
+fn tui_open_palette() void {
+    tui_glue_ensure();
+    tui_overlay_list(TUI_OVK_PALETTE, "命令" as &const byte, 6, g_tui_cmds.ptr as &const byte, g_tui_cmds.len);
+}
+
+fn tui_open_help() void {
+    const help: &const byte = "enter 发送 · ctrl+j / alt+enter 换行 · esc 中断 · ctrl+c 中断或退出\npgup/pgdn 滚动 · ctrl+home/end 顶/尾 · tab 计划模式 · ctrl+p 命令面板\nctrl+u 清行 · ctrl+w 删词 · ctrl+k 删到行尾 · ctrl+a/e 行首/行尾 · ctrl+l 重绘\nctrl+d 空行退出 · 运行中的输入会进 steer 收件箱（下一个 step 生效）" as &const byte;
+    tui_overlay_list(TUI_OVK_HELP, "帮助" as &const byte, 6, help, bufx_cstr_len(help));
+}
+
+export fn tui_help_open() void {
+    tui_open_help();
+}
+
+fn tui_handle_one(ev: i32) void {
+    if g_tui_ov != TUI_OV_NONE {
+        tui_ov_key(ev);
+        return;
+    }
+    if ev == TUI_K_CHAR {
+        var tmp: Buf = buf_new(8);
+        defer { buf_free(&tmp); }
+        const n: usize = tui_key_take_char(&tmp);
+        if n > 0 {
+            const first_slash: bool = g_tui_in.len == 0 && tmp.ptr[0] == 47 as byte;
+            tui_in_insert(tmp.ptr as &const byte, n);
+            if first_slash {
+                tui_open_palette();
+            }
+        }
+        return;
+    }
+    if ev == TUI_K_ENTER || ev == TUI_K_NEWLINE {
+        if ev == TUI_K_ENTER {
+            tui_do_submit();
+        } else {
+            tui_in_insert("\n" as &const byte, 1);
+        }
+        return;
+    }
+    if ev == TUI_K_BACKSPACE {
+        tui_in_backspace();
+        return;
+    }
+    if ev == TUI_K_DELETE {
+        tui_in_delete();
+        return;
+    }
+    if ev == TUI_K_LEFT {
+        tui_in_left();
+        return;
+    }
+    if ev == TUI_K_RIGHT {
+        tui_in_right();
+        return;
+    }
+    if ev == TUI_K_UP {
+        tui_in_up();
+        return;
+    }
+    if ev == TUI_K_DOWN {
+        tui_in_down();
+        return;
+    }
+    if ev == TUI_K_HOME || ev == TUI_K_CTRL_A {
+        tui_in_home();
+        return;
+    }
+    if ev == TUI_K_END || ev == TUI_K_CTRL_E {
+        tui_in_end();
+        return;
+    }
+    if ev == TUI_K_PGUP {
+        tui_scroll_up(5);
+        return;
+    }
+    if ev == TUI_K_PGDN {
+        tui_scroll_down(5);
+        return;
+    }
+    if ev == TUI_K_CTRL_U {
+        tui_input_clear();
+        return;
+    }
+    if ev == TUI_K_CTRL_W {
+        tui_in_del_word();
+        return;
+    }
+    if ev == TUI_K_CTRL_K {
+        tui_in_kill_to_end();
+        return;
+    }
+    if ev == TUI_K_CTRL_L {
+        tui_invalidate();
+        return;
+    }
+    if ev == TUI_K_CTRL_P {
+        tui_open_palette();
+        return;
+    }
+    if ev == TUI_K_TAB || ev == TUI_K_STAB {
+        if g_tui_in.len == 0 {
+            // 切计划模式（opencode 里 tab 也是切模式）
+            g_tui_plan = !g_tui_plan;
+            if g_tui_plan {
+                g_tui_req = TUI_REQ_PLAN_ON;
+            } else {
+                g_tui_req = TUI_REQ_PLAN_OFF;
+            }
+            tui_mark_dirty();
+        } else {
+            tui_in_insert("  " as &const byte, 2);
+        }
+        return;
+    }
+    if ev == TUI_K_ESC || ev == TUI_K_CTRL_C {
+        if g_tui_run != TUI_RUN_IDLE {
+            g_tui_interrupt = true;
+            tui_mark_dirty();
+            return;
+        }
+        if ev == TUI_K_ESC {
+            tui_input_clear();
+            return;
+        }
+        if g_tui_in.len > 0 {
+            tui_input_clear();
+            g_tui_ctrl_c_armed = false;
+            return;
+        }
+        if g_tui_ctrl_c_armed {
+            g_tui_quit = true;
+            return;
+        }
+        g_tui_ctrl_c_armed = true;
+        tui_add_notice("(再按一次 ctrl+c 退出；或直接输入任务)" as &const byte, 43);
+        return;
+    }
+    if ev == TUI_K_CTRL_D {
+        if g_tui_in.len == 0 {
+            g_tui_quit = true;
+        } else {
+            tui_in_delete();
+        }
+        return;
+    }
+}
+
+export fn tui_handle_keys() void {
+    while true {
+        const ev: i32 = tui_key_next();
+        if ev == TUI_K_NONE {
+            break;
+        }
+        tui_handle_one(ev);
+    }
+}
+
+// ============================================================
+// 读键盘（fd 0，非阻塞；返回读到的字节数）
+// ============================================================
+
+export fn tui_poll_keys(timeout_ms: i32) usize {
+    if g_tui_headless {
+        // 自测：按键靠注入；注入的键用完就等价于「stdin 到 EOF」→ 请求退出，
+        // 主循环把这一轮跑完就会收工（否则 headless 下会空转）
+        if g_tui_evn == 0 && !g_tui_have_submit {
+            g_tui_quit = true;
+        }
+        return 0;
+    }
+    var pfds: [PollFd: 1] = [PollFd{ fd: 0, events: POLLIN, revents: 0 }];
+    const pr: i32 = sys_poll(&pfds[0], 1, timeout_ms) catch { 0; };
+    if pr <= 0 {
+        return 0;
+    }
+    var tmp: [byte: 512] = [0: 512];
+    const rr: !isize = sys_read(0, &tmp[0], 512);
+    var eid: i32 = 0;
+    const n: isize = rr catch |err| {
+        eid = (@error_id(err) as! i32).value;
+        -1 as isize;
+    };
+    if n <= 0 {
+        // EINTR（SIGWINCH 等）当作「没读到」，绝不当 EOF
+        return 0;
+    }
+    tui_key_feed(&tmp[0], n as usize);
+    // 只有「后面没有更多字节」时才把悬着的裸 ESC 落实 —— 终端/网络可能把
+    // `ESC [ D` 切成几段，早一步落实就会把方向键当成 Esc
+    var more: [PollFd: 1] = [PollFd{ fd: 0, events: POLLIN, revents: 0 }];
+    const pr2: i32 = sys_poll(&more[0], 1, 0) catch { 0; };
+    if pr2 <= 0 {
+        tui_key_flush_esc();
+    }
+    tui_handle_keys();
+    return n as usize;
+}
+
+// 供 llm.uya 的流式循环使用：语义与 tty_next_event 对齐（只关心 Ctrl-C/Esc 中断）
+export const TUI_EV_NONE: i32 = 0;
+export const TUI_EV_SUBMIT: i32 = 1;
+export const TUI_EV_CTRL_C: i32 = 2;
+export const TUI_EV_ESC: i32 = 3;
+export const TUI_EV_EOF: i32 = 4;
+
+export fn tui_pump_input() i32 {
+    _ = tui_poll_keys(0);
+    if tui_has_submit() {
+        return TUI_EV_SUBMIT;
+    }
+    if g_tui_interrupt {
+        return TUI_EV_CTRL_C;
+    }
+    if g_tui_quit {
+        return TUI_EV_EOF;
+    }
+    return TUI_EV_NONE;
+}
+
+// ============================================================
+// 自测：把所有 TUI 状态复位（轮次之间不互相污染）
+// ============================================================
+
+export fn tui_reset_all() void {
+    var i: usize = 0;
+    while i < TUI_MAX_ENTRIES {
+        if buf_valid(&g_tui_entries[i].text) {
+            buf_free(&g_tui_entries[i].text);
+        }
+        if buf_valid(&g_tui_entries[i].wrap) {
+            buf_free(&g_tui_entries[i].wrap);
+        }
+        i = i + 1;
+    }
+    g_tui_nent = 0;
+    g_tui_estart = 0;
+    g_tui_text_total = 0;
+    g_tui_dropped = 0;
+    tui_in_ensure();
+    buf_reset(&g_tui_in);
+    g_tui_in_cursor = 0;
+    tui_glue_ensure();
+    buf_reset(&g_tui_submit);
+    buf_reset(&g_tui_cmds);
+    g_tui_have_submit = false;
+    g_tui_interrupt = false;
+    g_tui_quit = false;
+    g_tui_ctrl_c_armed = false;
+    g_tui_req = TUI_REQ_NONE;
+    g_tui_scroll = 0;
+    g_tui_total = 0;
+    g_tui_more_above = false;
+    g_tui_ov = TUI_OV_NONE;
+    g_tui_ov_kind = 0;
+    g_tui_ov_have = false;
+    g_tui_ov_cancel = false;
+    g_tui_ov_n = 0;
+    g_tui_ov_sel = 0;
+    tui_key_reset();
+    if buf_valid(&g_tui_linebuf) {
+        buf_reset(&g_tui_linebuf);
+    }
+    if buf_valid(&g_tui_pend) {
+        buf_reset(&g_tui_pend);
+    }
+    g_tui_prev_nrows = 0;
+    g_tui_dirty = true;
+    g_tui_run = TUI_RUN_IDLE;
+    g_tui_plan = false;
+    g_tui_frames = 0;
+    g_tui_step = 0;
+    g_tui_use_in = 0;
+    g_tui_use_out = 0;
+    g_tui_ctx_pct = -1;
+}
+
+// ============================================================
+// 启动 / 收尾 / 每帧 tick
+// ============================================================
+
+var g_tui_last_frame_ms: u64 = 0;
+var g_tui_idle_frames: usize = 0;
+
+// 起一个「新 UI 会话」：清掉一次性状态（quit/interrupt/submit/按键队列）。
+// 这些是进程级全局，fork 或同进程复用时会带着上一轮的值 —— 踩过：headless 自测跑完
+// 留下 quit=true，PTY 里的新 UI 一进来就自己退出了。
+export fn tui_begin_session() void {
+    g_tui_quit = false;
+    g_tui_interrupt = false;
+    g_tui_have_submit = false;
+    g_tui_ctrl_c_armed = false;
+    g_tui_req = TUI_REQ_NONE;
+    g_tui_run = TUI_RUN_IDLE;
+    tui_key_reset();
+}
+
+export fn tui_start(out_fd: i32) void {
+    tui_begin_session();
+    tui_bufs_ensure();
+    tui_state_ensure();
+    tui_in_ensure();
+    tui_glue_ensure();
+    tui_term_enter(out_fd);
+    _ = tui_size_refresh();
+}
+
+export fn tui_stop() void {
+    if g_tui_out_fd >= 0 {
+        tui_term_leave(g_tui_out_fd);
+    }
+    g_tui_on = false;
+}
+
+// 工具/后台任务的阻塞循环里调这个（非 TUI 模式是空调用）：界面不会卡住，键也照收
+export fn tui_poll_tick() void {
+    if tui_active() {
+        _ = tui_tick(tui_now_ms());
+    }
+}
+
+// 每帧 tick：尺寸（含 SIGWINCH）→ 键盘 → spinner → 节流重绘
+export fn tui_tick(now_ms: u64) bool {
+    if !g_tui_on {
+        return false;
+    }
+    var need: bool = false;
+    if sigx_winch_take() {
+        tui_invalidate();
+        need = true;
+    }
+    if !g_tui_headless && tui_size_refresh() {
+        need = true;
+    }
+    if tui_poll_keys(0) > 0 {
+        need = true;
+    }
+    if g_tui_run != TUI_RUN_IDLE {
+        tui_tick_spinner();
+        need = true;
+    }
+    if !need && !g_tui_dirty {
+        return false;
+    }
+    // 帧率上限：距上一帧 < 33ms 且不是「空闲转圈」就攒到下一 tick
+    if now_ms > g_tui_last_frame_ms && now_ms - g_tui_last_frame_ms < 33 && g_tui_run != TUI_RUN_IDLE {
+        return false;
+    }
+    if g_tui_run == TUI_RUN_IDLE && g_tui_idle_frames > 6 && now_ms > g_tui_last_frame_ms && now_ms - g_tui_last_frame_ms < 120 {
+        return false;
+    }
+    tui_render();
+    g_tui_last_frame_ms = now_ms;
+    if g_tui_run == TUI_RUN_IDLE {
+        g_tui_idle_frames = g_tui_idle_frames + 1;
+    } else {
+        g_tui_idle_frames = 0;
+    }
+    return true;
+}

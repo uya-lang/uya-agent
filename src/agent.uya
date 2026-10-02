@@ -89,6 +89,14 @@ export struct Config {
     dsh_root: Buf,            // --dsh-root：packaged preset 根
     skill_dirs: Buf,          // --skill-dir（冒号分隔，可多次）
     uya_bin: Buf,             // --uya-bin：跑 workflow 脚本的 uya 可执行文件
+    // P17：全屏 TUI
+    tui: bool,                // --tui / --no-tui（TTY 交互模式默认开）
+    tui_src: u8,              // 0 默认 / 1 env / 2 cli
+    tui_headless: bool,       // 自测用：不碰终端，直接把帧写进给定 fd
+    tui_demo: bool,           // --tui-demo：渲染一帧示例屏就退出（诊断/文档）
+    tui_cols: usize,          // headless 画布宽（自测用）
+    tui_rows: usize,          // headless 画布高（自测用）
+    color_mode: u8,           // 0 auto / 1 always / 2 never / 3 16 色 / 4 256 色
     // P11：派生化
     is_subagent: bool,        // 这个进程是被派生出来的子代理
     fork_from: Buf,           // 子代理要继承的父会话 id（subagent_fork）
@@ -123,6 +131,13 @@ fn cfg_default() Config {
         max_tokens: 0,
         temperature: -1,
         compat_fold: false,
+        tui: true,
+        tui_src: 0,
+        tui_headless: false,
+        tui_demo: false,
+        tui_cols: 100,
+        tui_rows: 30,
+        color_mode: 0,
         save_session: true,
         resume_id: buf_empty(),
         agent_home: buf_empty(),
@@ -3560,6 +3575,9 @@ fn print_usage() void {
     out_err("  --uya-bin PATH      跑 workflow 脚本的 uya（默认 $UYA_BIN 或 uya）\n");
     out_err("  --tls-verify=MODE   chain（默认）| pin | none\n");
     out_err("  --tls-pin HEX       pin 模式下要求的 leaf 证书 SHA-256（小写 hex）\n");
+    out_err("  --tui               全屏 TUI（TTY 交互模式默认）；--no-tui 退回滚动转录\n");
+    out_err("  --color=MODE        auto（默认）| always | never | 16 | 256；NO_COLOR 也认\n");
+    out_err("  --tui-demo          打印 TUI 的 home/chat 两屏纯文本快照后退出\n");
     out_err("  --quiet             不打印工具调用内容块（回退到旧的最小转录）\n");
     out_err("  --tls-debug         保留 lib/tls 的握手调试输出（默认静音）\n");
     out_err("  --http-debug        打印每轮响应头与体首字节（排查网关怪异响应）\n");
@@ -3567,6 +3585,7 @@ fn print_usage() void {
     out_err("环境变量:\n");
     out_err("  UYA_AGENT_BASE_URL / UYA_AGENT_MODEL / UYA_AGENT_WORKSPACE / UYA_AGENT_MAX_STEPS\n");
     out_err("  UYA_AGENT_API（openai-responses | openai-completions）/ UYA_AGENT_REASONING_EFFORT\n");
+    out_err("  UYA_AGENT_TUI=0|1（全屏 TUI 开关）/ NO_COLOR\n");
     out_err("  UYA_AGENT_API_KEY 或 DEEPSEEK_API_KEY 或 OPENAI_API_KEY\n");
 }
 
@@ -3894,7 +3913,17 @@ fn tty_read_line_blocking() i32 {
             continue;
         }
         var tmp: [byte: 256] = [0: 256];
-        const n: isize = sys_read(0, &tmp[0], 256) catch { -1 as isize; };
+        // P1：装了信号处理器以后 read 会被打断（SIGWINCH 等）返回 EINTR —— 那是「重来一次」，
+        // 不是 EOF。把 EINTR 当 EOF 会让一次终端缩放直接把 REPL 关掉。
+        const rr: !isize = sys_read(0, &tmp[0], 256);
+        var eid: i32 = 0;
+        const n: isize = rr catch |err| {
+            eid = (@error_id(err) as! i32).value;
+            -1 as isize;
+        };
+        if n < 0 && eid == 4 {
+            continue;
+        }
         if n <= 0 {
             tty_out_begin(&tty_ui, 2);
             return TTY_EV_EOF;
@@ -3969,8 +3998,16 @@ fn agent_run_interactive(cfg: &Config) i32 {
     if !tty_ui.is_tty {
         return agent_repl_plain(cfg);
     }
+    // P1：装信号处理器。**必须在 tty_raw_on 之前** —— 处理器要拿到原始终端属性才还原得回去。
+    // 装好之后被 SIGTERM/SIGINT/SIGHUP/SIGPIPE 打断，会先把终端还回去再以 128+sig 退出。
+    if !sigx_install_terminal(0) {
+        tty_puts(&tty_ui, 2, "warning: 信号处理器安装失败（被打断时终端可能停在 raw 模式）\n");
+    }
+    _ = sigx_install_winch();
+    sigx_arm(2, false);   // 滚动模式：显示通道是 fd 2，没有备用屏幕
     if !tty_raw_on(&tty_ui, 0) {
         tty_puts(&tty_ui, 2, "warning: 无法进入 raw 模式（termios 设置失败），退回行式 REPL\n");
+        sigx_disarm();
         return agent_repl_plain(cfg);
     }
     g_interactive = true;
@@ -3982,6 +4019,7 @@ fn agent_run_interactive(cfg: &Config) i32 {
     if !agent_history_begin(cfg, &h, &no_first) {
         out_err("error: cannot build history\n");
         tty_raw_off(&tty_ui, 0);
+        sigx_disarm();
         tty_free(&tty_ui);
         return AGENT_PROTO;
     }
@@ -4076,6 +4114,7 @@ fn agent_run_interactive(cfg: &Config) i32 {
     }
 
     tty_raw_off(&tty_ui, 0);
+    sigx_disarm();   // 终端已经还原过了，别让残留的信号再触发一次「恢复终端」
     tty_puts(&tty_ui, 2, "\nbye\n");
     agent_session_close();
     inbox_globals_free();
@@ -4366,6 +4405,40 @@ fn agent_print_config(cfg: &const Config, dsh: &const DshCfg) void {
         out_err_dec(cfg.max_steps as usize);
     }
     out_err("\n");
+    out_err("tui = ");
+    if cfg.tui {
+        out_err("on");
+    } else {
+        out_err("off");
+    }
+    out_err("  (source: ");
+    if cfg.tui_src == 1 {
+        out_err("env");
+    } else if cfg.tui_src == 2 {
+        out_err("cli");
+    } else {
+        out_err("default");
+    }
+    out_err(")\n");
+    out_err("color = ");
+    if cfg.color_mode == 1 {
+        out_err("always");
+    } else if cfg.color_mode == 2 {
+        out_err("never");
+    } else if cfg.color_mode == 3 {
+        out_err("16");
+    } else if cfg.color_mode == 4 {
+        out_err("256");
+    } else {
+        out_err("auto");
+    }
+    out_err("  (source: ");
+    if cfg.color_mode == 0 {
+        out_err("default");
+    } else {
+        out_err("cli");
+    }
+    out_err(")\n");
     out_err("dsh_home = ");
     out_err_bytes(dsh.home.ptr, dsh.home.len);
     out_err("  (loaded: ");
@@ -4453,6 +4526,16 @@ export fn main() i32 {
     if (ws_env as usize) != 0 {
         buf_free(&cfg.workspace);
         cfg.workspace = buf_from_cstr(ws_env);
+    }
+    const tui_env: &byte = getenv("UYA_AGENT_TUI");
+    if (tui_env as usize) != 0 && bufx_cstr_len(tui_env) > 0 {
+        if bufx_eq_cstr(tui_env, bufx_cstr_len(tui_env), "0") {
+            cfg.tui = false;
+            cfg.tui_src = 1;
+        } else {
+            cfg.tui = true;
+            cfg.tui_src = 1;
+        }
     }
     const steps_env: &byte = getenv("UYA_AGENT_MAX_STEPS");
     if (steps_env as usize) != 0 {
@@ -4571,6 +4654,18 @@ export fn main() i32 {
             selftest = true;
         } else if arg_eq(p, "--probe") {
             probe = true;
+        } else if arg_eq(p, "--tui") {
+            cfg.tui = true;
+            cfg.tui_src = 2;
+        } else if arg_eq(p, "--no-tui") {
+            cfg.tui = false;
+            cfg.tui_src = 2;
+        } else if arg_starts_with(p, "--color=") {
+            cfg.color_mode = agent_parse_color(p);
+        } else if arg_eq(p, "--no-color") {
+            cfg.color_mode = 2;
+        } else if arg_eq(p, "--tui-demo") {
+            cfg.tui_demo = true;
         } else if arg_eq(p, "--no-shell") {
             cfg.allow_shell = false;
         } else if arg_eq(p, "--no-stream") {
@@ -4797,10 +4892,722 @@ export fn main() i32 {
     if probe {
         return probe_main(&cfg);
     }
+    if cfg.tui_demo {
+        return agent_tui_demo(&cfg, 100, 28);
+    }
     if task_words.len > 0 {
         cfg.task = task_words;
         task_words = buf_empty();
         return run_once(&cfg);
     }
+    if agent_tui_wanted(&cfg) {
+        // 全屏 TUI：终端不满足条件（不是 TTY / 太小 / dup 失败）时内部自己退回滚动模式
+        return agent_run_tui(&cfg);
+    }
     return agent_run_interactive(&cfg);
+}
+
+// ============================================================
+// P17：全屏 TUI（opencode 风格）
+//
+// 分层：`src/tui.uya` 只管画与按键；这里负责「把 agent 的状态喂给它」和
+// 「把它交出来的提交/中断送回回合循环」。数据流见 README「全屏 TUI」一节。
+// ============================================================
+
+const AGENT_VERSION: [byte: 8] = [112, 49, 55, 45, 116, 117, 105, 0];   // "p17-tui"
+
+fn agent_parse_color(p: &byte) u8 {
+    // auto / always / never / 16 / 256
+    if bufx_cstr_len(p) == 4 && bufx_eq_cstr(p, 4, "auto") {
+        return 0;
+    }
+    if bufx_cstr_len(p) == 6 && bufx_eq_cstr(p, 6, "always") {
+        return 1;
+    }
+    if bufx_cstr_len(p) == 5 && bufx_eq_cstr(p, 5, "never") {
+        return 2;
+    }
+    if bufx_cstr_len(p) == 2 && bufx_eq_cstr(p, 2, "16") {
+        return 3;
+    }
+    if bufx_cstr_len(p) == 3 && bufx_eq_cstr(p, 3, "256") {
+        return 4;
+    }
+    return 0;
+}
+
+fn agent_color_on(cfg: &const Config) bool {
+    if cfg.color_mode == 2 {
+        return false;
+    }
+    if cfg.color_mode == 1 || cfg.color_mode == 3 || cfg.color_mode == 4 {
+        return true;
+    }
+    // auto：NO_COLOR 优先；TERM=dumb 无色
+    if env_present("NO_COLOR" as &const byte) {
+        return false;
+    }
+    const t: &byte = getenv("TERM");
+    if (t as usize) != 0 && bufx_cstr_len(t) == 4 && bufx_eq_cstr(t, 4, "dumb") {
+        return false;
+    }
+    return true;
+}
+
+fn agent_color_256(cfg: &const Config) bool {
+    if cfg.color_mode == 3 {
+        return false;
+    }
+    if cfg.color_mode == 4 {
+        return true;
+    }
+    const ct: &byte = getenv("COLORTERM");
+    if (ct as usize) != 0 && bufx_cstr_len(ct) > 0 {
+        return true;
+    }
+    const t: &byte = getenv("TERM");
+    if (t as usize) != 0 && bufx_cstr_len(t) > 0 {
+        // xterm-256color / screen-256color / tmux-256color …
+        var i: usize = 0;
+        const n: usize = bufx_cstr_len(t);
+        while i + 4 <= n {
+            if bufx_eq_cstr(t + i, 4, "256c") {
+                return true;
+            }
+            i = i + 1;
+        }
+    }
+    return false;
+}
+
+// 从 base_url 猜一个短 provider 名（面板信息行用）：去掉 scheme 与 api. 前缀，取第一个点之前
+fn agent_provider_short(cfg: &const Config, out: &Buf) void {
+    buf_reset(out);
+    var p: &const byte = cfg.base_url.ptr as &const byte;
+    var n: usize = cfg.base_url.len;
+    if n > 8 && bufx_mem_eq(p, "https://" as &const byte, 8) {
+        p = p + 8;
+        n = n - 8;
+    } else if n > 7 && bufx_mem_eq(p, "http://" as &const byte, 7) {
+        p = p + 7;
+        n = n - 7;
+    }
+    var end: usize = 0;
+    while end < n && p[end] != 47 as byte && p[end] != 58 as byte {
+        end = end + 1;
+    }
+    if end >= 4 && bufx_mem_eq(p, "api." as &const byte, 4) {
+        p = p + 4;
+        end = end - 4;
+    }
+    var dot: usize = end;
+    var i: usize = 0;
+    while i < end {
+        if p[i] == 46 as byte {
+            dot = i;
+            break;
+        }
+        i = i + 1;
+    }
+    _ = buf_append(out, p, dot);
+}
+
+// 直读 .git/HEAD 取分支名（**不 fork git**）。worktree 里 .git 是文件，内容是 `gitdir: <path>`。
+fn agent_git_branch(cwd: &const byte, cn: usize, out: &Buf) void {
+    buf_reset(out);
+    var path: Buf = buf_new(cn + 64);
+    defer { buf_free(&path); }
+    _ = buf_append(&path, cwd, cn);
+    _ = buf_append_cstr_z(&path, "/.git");
+    const fd: i32 = sys_open(path.ptr as *const byte, O_RDONLY as i32, 0) catch { -1; };
+    if fd < 0 {
+        return;
+    }
+    var buf: [byte: 512] = [0: 512];
+    const n: isize = sys_read(fd, &buf[0], 511) catch { -1 as isize; };
+    _ = sys_close(fd) catch {};
+    if n <= 0 {
+        return;
+    }
+    const un: usize = n as usize;
+    var gitdir: Buf = buf_new(cn + 128);
+    defer { buf_free(&gitdir); }
+    if un > 8 && bufx_mem_eq(&buf[0], "gitdir: " as &const byte, 8) {
+        // .git 是文件：读里面的目录，再读它的 HEAD
+        var e: usize = 8;
+        while e < un && buf[e] != 10 as byte && buf[e] != 13 as byte {
+            e = e + 1;
+        }
+        if e > 8 {
+            if buf[8] == 47 as byte {
+                _ = buf_append(&gitdir, &buf[8], e - 8);
+            } else {
+                _ = buf_append(&gitdir, cwd, cn);
+                _ = buf_append_cstr(&gitdir, "/");
+                _ = buf_append(&gitdir, &buf[8], e - 8);
+            }
+        }
+        if gitdir.len == 0 {
+            return;
+        }
+        _ = buf_append_cstr_z(&gitdir, "/HEAD");
+        const fd2: i32 = sys_open(gitdir.ptr as *const byte, O_RDONLY as i32, 0) catch { -1; };
+        if fd2 < 0 {
+            return;
+        }
+        var buf2: [byte: 512] = [0: 512];
+        const n2: isize = sys_read(fd2, &buf2[0], 511) catch { -1 as isize; };
+        _ = sys_close(fd2) catch {};
+        if n2 <= 0 {
+            return;
+        }
+        agent_branch_from_head(&buf2[0], n2 as usize, out);
+        return;
+    }
+    agent_branch_from_head(&buf[0], un, out);
+}
+
+fn agent_branch_from_head(p: &const byte, n: usize, out: &Buf) void {
+    buf_reset(out);
+    var e: usize = 0;
+    while e < n && p[e] != 10 as byte && p[e] != 13 as byte {
+        e = e + 1;
+    }
+    if e >= 16 && bufx_mem_eq(p, "ref: refs/heads/" as &const byte, 16) {
+        _ = buf_append(out, p + 16, e - 16);
+        return;
+    }
+    if e >= 4 && bufx_mem_eq(p, "ref:" as &const byte, 4) {
+        // 其它 ref（detached / 远程）：取最后一段
+        var s: usize = 0;
+        var i: usize = 0;
+        while i < e {
+            if p[i] == 47 as byte {
+                s = i + 1;
+            }
+            i = i + 1;
+        }
+        _ = buf_append(out, p + s, e - s);
+        return;
+    }
+    // HEAD 里直接是 40 位 sha（detached）：显示短 sha
+    if e >= 7 {
+        _ = buf_append(out, p, 7);
+    }
+}
+
+fn agent_tui_commands(out: &Buf) void {
+    buf_reset(out);
+    _ = buf_append_cstr(out, "/help      显示帮助浮层\n");
+    _ = buf_append_cstr(out, "/status    当前配置与会话信息\n");
+    _ = buf_append_cstr(out, "/sessions  会话列表（选一个恢复）\n");
+    _ = buf_append_cstr(out, "/new       开一个新会话\n");
+    _ = buf_append_cstr(out, "/compact   手动压缩上下文\n");
+    _ = buf_append_cstr(out, "/plan      切换计划模式\n");
+    _ = buf_append_cstr(out, "/continue  再跑一轮（带着现有历史）\n");
+    _ = buf_append_cstr(out, "/exit      退出\n");
+}
+
+// 会话索引扫描（浮层用）：每行 `<id>\t<lastActiveAt>\t<cwd>`
+// 与 agent_list_sessions 共用同一份索引，但只输出结构化字段，不打印
+fn sess_list_scan(cfg: &const Config, out: &Buf) void {
+    buf_reset(out);
+    var home: Buf = buf_new(1024);
+    defer { buf_free(&home); }
+    if !agent_default_home(cfg, &home) {
+        return;
+    }
+    var hz: Buf = buf_new(home.len + 1);
+    defer { buf_free(&hz); }
+    _ = buf_append(&hz, home.ptr, home.len);
+    _ = buf_append_byte(&hz, 0);
+    var idx: Buf = buf_new(65536);
+    defer { buf_free(&idx); }
+    if !sess_read_index(hz.ptr as *const byte, &idx) {
+        return;
+    }
+    var line: Buf = buf_new(4096);
+    defer { buf_free(&line); }
+    var id: Buf = buf_new(128);
+    defer { buf_free(&id); }
+    var cwdv: Buf = buf_new(1024);
+    defer { buf_free(&cwdv); }
+    var pos: usize = 0;
+    while pos < idx.len {
+        buf_reset(&line);
+        var nl: usize = idx.len;
+        var i: usize = pos;
+        while i < idx.len {
+            if idx.ptr[i] == 10 as byte {
+                nl = i;
+                break;
+            }
+            i = i + 1;
+        }
+        if nl > pos {
+            _ = buf_append(&line, &idx.ptr[pos], nl - pos);
+        }
+        pos = nl + 1;
+        if line.len == 0 {
+            continue;
+        }
+        const view: &[byte] = line.ptr[0: line.len];
+        if !sess_json_str(view, "id", &id) {
+            continue;
+        }
+        _ = sess_json_str(view, "cwd", &cwdv);
+        _ = buf_append(out, id.ptr, id.len);
+        _ = buf_append_byte(out, 9);
+        _ = buf_append(out, cwdv.ptr, cwdv.len);
+        _ = buf_append_byte(out, 10);
+    }
+}
+
+// 会话扫描结果 → 浮层条目（`<id>  <时间>  <消息数>  <cwd>`）
+fn agent_tui_sessions_items(cfg: &const Config, out: &Buf) void {
+    var scan: Buf = buf_new(8192);
+    defer { buf_free(&scan); }
+    sess_list_scan(cfg, &scan);
+    buf_reset(out);
+    var i: usize = 0;
+    while i < scan.len {
+        var e: usize = i;
+        while e < scan.len && scan.ptr[e] != 10 as byte {
+            e = e + 1;
+        }
+        if e > i {
+            // scan 的行格式：`<id>\t<time>\t<msgs>\t<cwd>`；浮层里把 tab 换成空格
+            var k: usize = i;
+            while k < e {
+                const c: byte = scan.ptr[k];
+                if c == 9 as byte {
+                    _ = buf_append_cstr(out, "  ");
+                } else {
+                    _ = buf_append_byte(out, c);
+                }
+                k = k + 1;
+            }
+            _ = buf_append_byte(out, 10);
+        }
+        i = e + 1;
+    }
+}
+
+// 浮层选中的条目 → 取出首段（会话 id / 命令名）
+fn agent_tui_item_head(line: &const Buf, out: &Buf) void {
+    buf_reset(out);
+    var i: usize = 0;
+    while i < line.len {
+        const c: byte = line.ptr[i];
+        if c == 32 as byte || c == 9 as byte {
+            break;
+        }
+        _ = buf_append_byte(out, c);
+        i = i + 1;
+    }
+}
+
+// TUI 模式下的命令处理（复用滚动模式的 agent_repl_command，只把「要浮层的」拦下来）
+fn agent_tui_command(cfg: &Config, h: &History, line: &const Buf) bool {
+    if sv_eq_cstr(line, "/sessions") {
+        var items: Buf = buf_new(8192);
+        defer { buf_free(&items); }
+        agent_tui_sessions_items(cfg, &items);
+        if items.len == 0 {
+            tui_add_notice("(没有找到会话)" as &const byte, 22);
+            return false;
+        }
+        tui_overlay_list(TUI_OVK_SESSIONS, "会话（enter 恢复 · esc 取消）" as &const byte, 44, items.ptr as &const byte, items.len);
+        return false;
+    }
+    if sv_eq_cstr(line, "/status") {
+        var items: Buf = buf_new(2048);
+        defer { buf_free(&items); }
+        _ = buf_append_cstr(&items, "model      ");
+        _ = buf_append(&items, cfg.model.ptr, cfg.model.len);
+        _ = buf_append_cstr(&items, "\nbase_url   ");
+        _ = buf_append(&items, cfg.base_url.ptr, cfg.base_url.len);
+        _ = buf_append_cstr(&items, "\nworkspace  ");
+        _ = buf_append(&items, cfg.workspace.ptr, cfg.workspace.len);
+        _ = buf_append_cstr(&items, "\ntui        on (headless=");
+        if cfg.tui_headless {
+            _ = buf_append_cstr(&items, "yes");
+        } else {
+            _ = buf_append_cstr(&items, "no");
+        }
+        _ = buf_append_cstr(&items, ")\nversion    p17-tui");
+        tui_overlay_list(TUI_OVK_HELP, "状态（esc 关闭）" as &const byte, 30, items.ptr as &const byte, items.len);
+        return false;
+    }
+    return agent_repl_command(cfg, h, line);
+}
+
+// 会话恢复：`/resume <id>`（与滚动模式的命令同一套解析）
+fn agent_tui_resume(cfg: &Config, h: &History, id: &const Buf) void {
+    var line: Buf = buf_new(id.len + 16);
+    defer { buf_free(&line); }
+    _ = buf_append_cstr(&line, "/resume ");
+    _ = buf_append(&line, id.ptr, id.len);
+    _ = agent_repl_command(cfg, h, &line);
+}
+
+// 「回合一结束就回到输入态」：把运行状态与流式条目收口
+fn agent_tui_turn_done() void {
+    tui_close_stream_entries();
+    tui_sink_flush_partial();
+    tui_set_run(TUI_RUN_IDLE, "" as &const byte, 0);
+    tui_set_step(0);
+    tui_mark_dirty();
+}
+
+// 注入类的 user 消息（运行时上下文 / AGENTS.md / 技能目录）不进转录：
+// 它们是我们自己塞给模型的背景，不是「用户说的话」，回填进屏幕只会让人以为用户打过这些字
+fn agent_tui_is_injected(m: &const Msg) bool {
+    if m.text_len < 8 {
+        return false;
+    }
+    const p: &const byte = m.text as &const byte;
+    if bufx_mem_eq(p, "<system-reminder>" as &const byte, 17) {
+        return true;
+    }
+    if bufx_mem_eq(p, "Current runtime context" as &const byte, 23) {
+        return true;
+    }
+    if bufx_mem_eq(p, "Current uya-agent file policy" as &const byte, 30) {
+        return true;
+    }
+    if bufx_mem_eq(p, "# 项目约定" as &const byte, 13) {
+        return true;
+    }
+    return false;
+}
+
+// 把历史回填进转录（--resume / --resume-dsh 之后屏幕不是空的）
+fn agent_tui_seed_history(h: &const History) void {
+    const n: usize = h.len;
+    var start: usize = 0;
+    if n > 200 {
+        start = n - 200;
+        tui_add_notice("… 更早的会话记录已省略" as &const byte, 34);
+    }
+    var i: usize = start;
+    while i < n {
+        const m: &const Msg = msg_at(h, i);
+        if m.role == ROLE_USER {
+            if agent_tui_is_injected(m) {
+                i = i + 1;
+                continue;
+            }
+            tui_add_user(m.text as &const byte, m.text_len);
+        } else if m.role == ROLE_ASSISTANT {
+            if m.text_len > 0 {
+                tui_sink_bytes(1, m.text as &const byte, m.text_len);
+            }
+            tui_close_stream_entries();
+        } else if m.role == ROLE_TOOL {
+            tui_add_tool_block(m.text as &const byte, m.text_len);
+            if m.text_len > 0 && m.text[m.text_len - 1] != 10 as byte {
+                var nl: [byte: 1] = [10];
+                tui_add_tool_block(&nl[0], 0);
+            }
+        }
+        i = i + 1;
+    }
+    tui_sink_flush_partial();
+}
+
+fn agent_tui_start(cfg: &const Config) bool {
+    // 私有输出 fd：请求期间 tls_noise_mute 会把 fd 2 指向 /dev/null，帧不能走 fd 2
+    const ofd: i32 = sys_dup(1) catch { -1; };
+    if ofd < 0 {
+        return false;
+    }
+    var model: Buf = buf_empty();
+    var prov: Buf = buf_new(32);
+    defer { buf_free(&prov); }
+    agent_provider_short(cfg, &prov);
+    var ver: Buf = buf_empty();
+    tui_state_init(cfg.model.ptr as &const byte, cfg.model.len, prov.ptr as &const byte, prov.len,
+        &AGENT_VERSION[0], 7);
+    // cwd / HOME / 分支
+    var home: Buf = env_or("HOME" as &const byte, "" as &const byte);
+    defer { buf_free(&home); }
+    tui_set_cwd(cfg.workspace.ptr as &const byte, cfg.workspace.len, home.ptr as &const byte, home.len);
+    var br: Buf = buf_new(64);
+    defer { buf_free(&br); }
+    agent_git_branch(cfg.workspace.ptr as &const byte, cfg.workspace.len, &br);
+    tui_set_branch(br.ptr as &const byte, br.len);
+    var cmds: Buf = buf_new(1024);
+    defer { buf_free(&cmds); }
+    agent_tui_commands(&cmds);
+    tui_set_commands(cmds.ptr as &const byte, cmds.len);
+    tui_set_color(agent_color_on(cfg), agent_color_256(cfg));
+    tui_set_plan(g_plan.active);
+    _ = model;
+    // 终端
+    if !sigx_install_terminal(0) {
+        tty_puts(&tty_ui, 2, "warning: 信号处理器安装失败（被打断时终端可能停在 raw 模式）\n");
+    }
+    _ = sigx_install_winch();
+    sigx_arm(ofd, true);
+    if !tty_raw_on(&tty_ui, 0) {
+        sigx_disarm();
+        _ = sys_close(ofd) catch {};
+        return false;
+    }
+    tui_start(ofd);
+    tty_sink_on = true;       // 从这一刻起，所有显示字节都进转录
+    tui_set_size(tty_ui.cols, tty_ui.rows);
+    return true;
+}
+
+fn agent_tui_stop(out_fd: i32) void {
+    tty_sink_on = false;
+    tui_stop();
+    tty_raw_off(&tty_ui, 0);
+    sigx_disarm();
+    if out_fd >= 0 {
+        _ = sys_close(out_fd) catch {};
+    }
+}
+
+// TUI 主循环：与 agent_run_interactive 同构（取 steer → 等提交 → 跑回合），
+// 只是输入输出全走 TUI，回合运行期间由 tick 保持界面活着。
+fn agent_run_tui(cfg: &Config) i32 {
+    if cfg.api_key.len == 0 {
+        out_err("error: no API key. set UYA_AGENT_API_KEY / DEEPSEEK_API_KEY / OPENAI_API_KEY\n");
+        return AGENT_USAGE;
+    }
+    // 自测模式：不碰终端（不 raw / 不进备用屏幕 / 不装信号处理器），按键由测试注入
+    if cfg.tui_headless {
+        tui_set_headless(true);
+        tui_set_size(cfg.tui_cols, cfg.tui_rows);
+        return agent_run_tui_body(cfg, -1);
+    }
+    tty_init(&tty_ui, 0);
+    if !tty_ui.is_tty {
+        cfg.tui = false;
+        return agent_run_interactive(cfg);
+    }
+    _ = tty_refresh_size(&tty_ui);
+    const ofd: i32 = sys_dup(1) catch { -1; };
+    if ofd < 0 {
+        cfg.tui = false;
+        return agent_run_interactive(cfg);
+    }
+    _ = sys_close(ofd) catch {};
+    if tty_ui.cols < 32 || tty_ui.rows < 8 {
+        tty_puts(&tty_ui, 2, "warning: 终端太小（<32x8），退回滚动模式\n");
+        cfg.tui = false;
+        return agent_run_interactive(cfg);
+    }
+    if !agent_tui_start(cfg) {
+        cfg.tui = false;
+        return agent_run_interactive(cfg);
+    }
+    return agent_run_tui_body(cfg, tui_out_fd());
+}
+
+// TUI 主循环（headless 与真实终端共用）
+fn agent_run_tui_body(cfg: &Config, tui_fd: i32) i32 {
+    if cfg.tui_headless {
+        tui_headless_enable(true);
+        tty_sink_on = true;
+        tui_mark_dirty();
+        _ = tui_tick(0);
+    }
+    g_interactive = true;
+    inbox_globals_init();
+    tui_key_reset();
+
+    var h: History = hist_init();
+    var rc: i32 = AGENT_OK;
+    var no_first: Buf = buf_empty();
+    if !agent_history_begin(cfg, &h, &no_first) {
+        out_err("error: cannot build history\n");
+        agent_tui_stop(tui_fd);
+        tty_free(&tty_ui);
+        g_interactive = false;
+        return AGENT_PROTO;
+    }
+    agent_tui_seed_history(&h);
+    tui_mark_dirty();
+
+    var line: Buf = buf_new(8192);
+    var sel: Buf = buf_new(4096);
+    var run: bool = true;
+    var ctrl_c_armed: bool = false;
+    _ = ctrl_c_armed;
+    while run {
+        // 0) 空闲等待：有 spinner 时 80ms 转一次，否则 200ms（不忙等）
+        var wait_ms: i32 = 200;
+        if tui_run_kind() != TUI_RUN_IDLE {
+            wait_ms = 80;
+        }
+        if !tui_has_submit() && !g_tui_quit_flag_pending() {
+            _ = tui_poll_keys(wait_ms);
+            _ = tui_tick(tui_now_ms());
+        }
+        // 1) 计划模式切换请求（tab）
+        const req: i32 = tui_take_request();
+        if req == TUI_REQ_PLAN_ON {
+            plan_set(&g_plan, true);
+        } else if req == TUI_REQ_PLAN_OFF {
+            plan_set(&g_plan, false);
+        }
+        // 2) 浮层结果（会话选择）
+        if tui_overlay_take(&sel) {
+            const kind: u8 = tui_overlay_kind();
+            var head: Buf = buf_new(128);
+            defer { buf_free(&head); }
+            agent_tui_item_head(&sel, &head);
+            if kind == TUI_OVK_PALETTE {
+                // 命令面板：把命令名当输入提交
+                buf_reset(&line);
+                _ = buf_append(&line, head.ptr, head.len);
+                if line.len > 0 {
+                    tui_add_notice(line.ptr as &const byte, line.len);
+                    _ = agent_tui_command(cfg, &h, &line);
+                }
+            } else if kind == TUI_OVK_SESSIONS {
+                if head.len > 0 {
+                    agent_tui_resume(cfg, &h, &head);
+                }
+            }
+            continue;
+        }
+        if tui_overlay_cancelled() {
+            continue;
+        }
+        // 3) 运行中输入的文本（steer 收件箱里没被采纳的）→ 当作新任务
+        const steer_got: bool = inbox_pop(&g_steer, &line);
+        if steer_got && line.len > 0 && line.ptr[0] == 47 as byte {
+            _ = agent_tui_command(cfg, &h, &line);
+            continue;
+        }
+        // 4) 等提交
+        if !steer_got {
+            if !tui_take_submit(&line) {
+                if tui_quit_wanted() {
+                    run = false;
+                }
+                continue;
+            }
+        }
+        if line.len == 0 {
+            continue;
+        }
+        if tui_quit_wanted() {
+            run = false;
+            continue;
+        }
+        if line.ptr[0] == 47 as byte {
+            _ = agent_tui_command(cfg, &h, &line);
+            continue;
+        }
+        // 5) 跑一轮
+        var pushed: bool = hist_push(&h, ROLE_USER, line.ptr as &const byte, line.len);
+        while !pushed {
+            if !hist_drop_oldest(&h) {
+                break;
+            }
+            pushed = hist_push(&h, ROLE_USER, line.ptr as &const byte, line.len);
+        }
+        if !pushed {
+            tui_add_notice("error: 无法把任务写入历史" as &const byte, 40);
+            continue;
+        }
+        agent_log_user(line.ptr as &const byte, line.len, false);
+        tui_add_user(line.ptr as &const byte, line.len);
+        tui_set_run(TUI_RUN_THINK, "" as &const byte, 0);
+        tui_tick(tui_now_ms());
+        rc = agent_turn_loop(cfg, &h);
+        agent_tui_turn_done();
+        if rc != AGENT_OK && rc != AGENT_INTERRUPTED {
+            tui_add_notice("[turn] 本回合异常结束（可直接输入继续）" as &const byte, 55);
+        }
+        rc = AGENT_OK;
+    }
+
+    if cfg.tui_headless {
+        tty_sink_on = false;
+        tui_headless_enable(false);
+    } else {
+        agent_tui_stop(tui_fd);
+    }
+    agent_session_close();
+    inbox_globals_free();
+    hist_free(&h);
+    buf_free(&line);
+    buf_free(&sel);
+    if !cfg.tui_headless {
+        tty_free(&tty_ui);
+    }
+    g_interactive = false;
+    return rc;
+}
+
+fn g_tui_quit_flag_pending() bool {
+    return false;
+}
+
+// --tui-demo：把 home / chat 两种屏渲染成**纯文本**打出来（诊断 + README 用）
+fn agent_tui_dump(cols: usize, rows: usize) void {
+    var out: Buf = buf_new(65536);
+    defer { buf_free(&out); }
+    tui_set_size(cols, rows);
+    tui_build();
+    _ = tui_screen_text(&out);
+    out_bytes(out.ptr as &const byte, out.len);
+}
+
+fn agent_tui_demo(cfg: &const Config, cols: usize, rows: usize) i32 {
+    var prov: Buf = buf_new(32);
+    defer { buf_free(&prov); }
+    agent_provider_short(cfg, &prov);
+    tui_state_init(cfg.model.ptr as &const byte, cfg.model.len, prov.ptr as &const byte, prov.len,
+        &AGENT_VERSION[0], 7);
+    var home: Buf = env_or("HOME" as &const byte, "" as &const byte);
+    defer { buf_free(&home); }
+    tui_set_cwd(cfg.workspace.ptr as &const byte, cfg.workspace.len, home.ptr as &const byte, home.len);
+    var br: Buf = buf_new(64);
+    defer { buf_free(&br); }
+    agent_git_branch(cfg.workspace.ptr as &const byte, cfg.workspace.len, &br);
+    tui_set_branch(br.ptr as &const byte, br.len);
+    tui_set_color(agent_color_on(cfg), agent_color_256(cfg));
+    tui_set_commands("" as &const byte, 0);
+
+    // ① 空态（logo + 居中面板）
+    tui_set_usage(0, 0, -1);
+    tui_set_plan(false);
+    tui_set_run(TUI_RUN_IDLE, "" as &const byte, 0);
+    tui_build();
+    var out: Buf = buf_new(65536);
+    defer { buf_free(&out); }
+    _ = tui_screen_text(&out);
+    out_bytes(out.ptr as &const byte, out.len);
+
+    // ② 对话态
+    tui_add_user("把 hello.uya 的问候语改成 Hello, DSH!" as &const byte,
+        bufx_cstr_len("把 hello.uya 的问候语改成 Hello, DSH!" as &const byte));
+    tui_set_usage(8100, 402, 21);
+
+    // 再给一份带转录的（模拟真实一轮的形状）
+    tui_sink_bytes(1, "我先读一下文件，再改一行，顺手跑一次编译：\n" as &const byte, bufx_cstr_len("我先读一下文件，再改一行，顺手跑一次编译：\n" as &const byte));
+    tui_sink_bytes(1, "```\n@println(\"Hello, DSH!\")\n```\n" as &const byte, bufx_cstr_len("```\n@println(\"Hello, DSH!\")\n```\n" as &const byte));
+    tui_sink_bytes(2, "✓ Read(hello.uya) · 4 lines\n" as &const byte, bufx_cstr_len("✓ Read(hello.uya) · 4 lines\n" as &const byte));
+    tui_sink_bytes(2, "    -     @println(\"Hello, Uya!\");\n" as &const byte, bufx_cstr_len("    -     @println(\"Hello, Uya!\");\n" as &const byte));
+    tui_sink_bytes(2, "    +     @println(\"Hello, DSH!\");\n" as &const byte, bufx_cstr_len("    +     @println(\"Hello, DSH!\");\n" as &const byte));
+    tui_sink_bytes(2, "✓ Bash(./hello) · exit 0\n" as &const byte, bufx_cstr_len("✓ Bash(./hello) · exit 0\n" as &const byte));
+    tui_sink_bytes(2, "    Hello, DSH!\n" as &const byte, bufx_cstr_len("    Hello, DSH!\n" as &const byte));
+    tui_sink_bytes(1, "已改成 Hello, DSH! 并重新编译运行，输出 Hello, DSH!。\n" as &const byte, bufx_cstr_len("已改成 Hello, DSH! 并重新编译运行，输出 Hello, DSH!。\n" as &const byte));
+    tui_set_run(TUI_RUN_TOOL, "Bash(make check)" as &const byte, 15);
+    agent_tui_dump(cols, rows);
+    tui_set_run(TUI_RUN_IDLE, "" as &const byte, 0);
+    return AGENT_OK;
+}
+
+// TUI 是否该启用（真正的「终端够不够」判断在 agent_run_tui 里做）
+fn agent_tui_wanted(cfg: &const Config) bool {
+    return cfg.tui && !cfg.quiet && !cfg.is_subagent;
 }

@@ -138,6 +138,9 @@ export UYA_SPLIT_C_DIR=$PWD/build/uyacache      # 多文件 C 缓存别丢在仓
 | `--show-reasoning` | 把 `reasoning_content` 打到 stderr |
 | `--show-usage` | 每轮打印 token 用量（in/out/cache/reasoning） |
 | `--tool-lines N` | 工具结果正文首尾各显示几行，默认 6（`0` = 不显示正文），见 P14 |
+| `--tui` | 全屏 TUI（**TTY 交互模式默认**）；`--no-tui` 退回滚动转录；`UYA_AGENT_TUI=0|1` 同口径 |
+| `--color=MODE` | `auto`（默认）/ `always` / `never` / `16` / `256`；`NO_COLOR` 也认 |
+| `--tui-demo` | 打印 TUI 的 home / chat 两屏纯文本快照后退出（诊断 + 文档） |
 | `--max-tokens N` | 发送 `max_tokens`（默认不发送） |
 | `--temperature N` | 发送 `temperature`（默认不发送，对齐 DSH） |
 | `--tls-verify=chain\|pin\|none` | TLS 信任策略，默认 `chain`，见第 5 节 |
@@ -172,6 +175,14 @@ src/tools.uya     三个工具：read_file / write_file / run_shell
 src/tty.uya       终端层：termios raw 模式、行编辑器（历史/光标/Delete/词删除，**按 UTF-8
                   字符编辑、按显示列定位**）、渲染协议（擦输入行→写→重画，输入行折行或紧跟
                   在没换行的正文后面都只擦自己那一块）、提示符即状态显示
+src/tui.uya       全屏 TUI（P17）：帧模型（行=段序列，逐行 diff 重绘）、备用屏幕进出、
+                  转录条目（用户/助手/思考/工具/诊断）、轻量 markdown、输入编辑器（按字符编辑、
+                  多行、历史、括起粘贴）、键解码（分片转义序列）、浮层（命令面板/会话/帮助/问答）、
+                  sink 通道与清洗、滚动与尾随、帧节流
+src/sigselftest.uya TUI 的自测轮次（frame / keys / sink / turn / pty）
+src/sigx.uya      信号层（P17）：直接绑宿主 glibc `sigaction`（绕开 uya 0.10 `libc.signal`
+                  的 SIGSEGV 缺陷）；终止类信号 → 先恢复终端（termios + 离开备用屏幕）再
+                  128+sig 退出；SIGWINCH → 只置标志；`sigx_reset_for_child()` 给 fork 子进程
 src/inbox.uya     输入收件箱：steer（运行中输入的文本，step 边界领取）+ keepInbox 语义
 src/yamlcfg.uya   自带 YAML 子集解析器：去注释（块标量/引号感知）、中和 `!!tag`、
                   block/flow 映射与序列、`|`/`>` 块标量、跨行 flow 集合、节点池树 + 导航
@@ -215,6 +226,7 @@ src/view.uya      工具内容块：工具→标题/关键参数/后缀三张表
                   todo 清单、按显示列截断、交互模式的「运行中提示符」换入换出
 src/agent.uya     CLI、环境变量、消息历史、请求组装、主循环（流式/非流式）、工具分发、
                   交互式 REPL（中断/steer//continue/会话命令）、会话事件记录与恢复
+src/sigselftest.uya 信号层的自测轮次（sig-abi / sig-basic / sig-term-restore / sig-child-reset）
 src/selftest.uya  --selftest 的 mock LLM（含 SSE 受控切分）+ 28 轮断言 + --probe
 ```
 
@@ -521,10 +533,83 @@ Messages API（`x-api-key` + `anthropic-version: 2023-06-01`，服务端工具 `
   制表位 —— 只有当 TAB 恰好落在「与输入行同一行」的正文里时，才会把输入行起始列算小几格
   （擦除时多擦几个字符）。带 TAB 的正文（代码块）通常每行以换行收尾、列模型随即归零，
   所以没为它维护制表位表。
-* **已知限制**：被 SIGKILL/SIGTERM 打断时终端可能停在 raw 模式，用 `reset` / `stty sane` 恢复。
-  原因是 uya 0.10.1 的 `libc.signal.signal` 注册的处理器一被调用就 SIGSEGV
-  （最小复现：handler 里只做 `sys_write` + `sys_exit`，`kill -TERM` 后进程以 139 退出），
-  所以干脆不装信号处理器 —— 详见踩坑第 21 条。
+* **信号（P17 起）**：装了终止类处理器 —— 被 `SIGTERM` / `SIGINT` / `SIGHUP` / `SIGPIPE`
+  打断时**先把终端还回去**（恢复 termios + 关闭括起粘贴 + 复位属性 + 显示光标）再以
+  `128+sig` 退出；`SIGWINCH` 只置一个标志（TUI 取用后立刻重排，滚动模式靠每帧查宽度兜底）。
+  fork 出来的子进程（bash / rg / 子代理 / workflow / unzstd）都会先
+  `sigx_reset_for_child()` 把处置恢复成默认，免得子进程被杀时去写父进程的终端。
+* **已知限制**：`SIGKILL` 不可捕获（`kill -9` 之后终端可能停在 raw 模式 / 备用屏幕，
+  用 `reset` / `stty sane` 恢复）。uya 0.10 的 `libc.signal.signal` 曾经一调用处理器就 SIGSEGV，
+  本项目因此**不使用它**而是自己绑宿主 `sigaction`（`src/sigx.uya`）；
+  该缺陷已在 uya 项目侧修复（commit `fad26acd`，见踩坑第 28 条）。
+
+### 全屏 TUI（P17，对齐 opencode 的观感）
+
+TTY 交互模式**默认全屏**（`--no-tui` 退回上一节的滚动转录；不是 TTY / `--quiet` / 子代理
+自动退回）。做成**无边框、黑底、单强调色**：空态是块字 logo + 居中输入面板，对话态是
+「转录贴面板、面板贴底」，状态不是独立状态栏而是转录里的一行。
+
+```
+         █▓  █▓ █▓  █▓ █▓  █▓        █▓  █▓ █▓  █▓ █▓  █▓ ██▓ █▓ █████▓
+         █▓  █▓  ████▓ █████▓ █████▓ █████▓  ████▓ █████▓ █▓  █▓  █▓
+         █▓  █▓     █▓ █▓  █▓        █▓  █▓     █▓ █▓     █▓  █▓  █▓ █▓
+          ▓▓▓▓   ▓▓▓▓  ▓▓  ▓▓        ▓▓  ▓▓  ▓▓▓▓   ▓▓▓▓  ▓▓  ▓▓   ▓▓▓
+
+  ▌ ↑ Ask anything... "把 hello.uya 的问候语改成 Hello, DSH!"
+  ▌ Build   deepseek-chat   deepseek               tab plan   ctrl+p commands
+  ~/uya-agent:main                                          in 8.1k · out 402 · p17-tui
+```
+
+对话态（`--tui-demo` 打印的就是这两屏的纯文本快照）：
+
+```
+    ▎ 你
+  把 hello.uya 的问候语改成 Hello, DSH!
+    ◆ 助手
+  我先读一下文件，再改一行，顺手跑一次编译：
+  │ ```                       ← 围栏代码块（DIM + 左竖线），行内 `code` 走 INLINE 色
+  │ @println("Hello, DSH!")
+  │ ```
+  ✓ Read(hello.uya) · 4 lines    ← 工具卡片：✓/✗ 标题行 + 4 空格缩进正文
+      -     @println("Hello, Uya!");   ← diff：- 红 / + 绿
+      +     @println("Hello, DSH!");
+  ⠹ Bash(make check) · esc 中断      ← 运行中状态是转录最后一行（不是独立状态栏）
+  ▌ ❯ 顺便把 Makefile 的注释补一下_  ← 输入面板（左边缘强调竖条）
+  ▌ Build   deepseek-chat   deepseek               tab plan   ctrl+p commands
+  ~/uya-agent:main                              in 8.1k · out 402 · ctx 21% · p17-tui
+```
+
+* **开关**：`--tui`（默认）/ `--no-tui` / `UYA_AGENT_TUI=0|1`；
+  `--color=auto|always|never|16|256` 与 `NO_COLOR`（无色时只留粗体/暗色）；
+  `--tui-demo [COLSxROWS]` 打印 home/chat 两屏纯文本（诊断 + 文档）。
+* **键位**：`enter` 发送 · `ctrl+j` / `alt+enter` 换行 · `esc` 运行中=中断、空闲=清行 ·
+  `ctrl+c` 运行中=中断、空闲=清空/两次退出 · `ctrl+d` 空行退出 · `↑/↓` 单行=历史、
+  多行=上下移光标 · `pgup/pgdn`、`ctrl+home/end` 滚转录 · `tab` 切计划模式（面板显示 `Plan`）·
+  `ctrl+p` 命令面板（输入以 `/` 开头也会自动打开）· `ctrl+u/w/k` 清行/删词/删到行尾 ·
+  `ctrl+a/e`、`←/→`、`home/end`、`backspace/del` 按**字符**编辑 · `ctrl+l` 强制重绘 ·
+  括起粘贴（`ESC[200~`）整段插入不触发提交（> 64 KiB 截断）。
+* **浮层**：命令面板、会话列表（选一个 `/resume`）、帮助（`/help`）、`/status` 详情，
+  以及 `ask_user_question` / `exit_plan_mode` 的问答弹窗（↑/↓ + enter，esc = 无回答）。
+* **数据流**：TUI 激活后 `tty.uya` 的 `tty_write` 变成一个 **sink** —— 通道 1（助手正文）、
+  2（工具块/诊断）、3（思考，新增 `tty_reason_write`）全部进转录，**fd 1 一个字节都不写**
+  （管道语义干净，`tui-turn` 轮断言 fd 1 捕获 0 字节）；工具卡片不是靠前缀嗅探，而是
+  `view_begin_tool`/`view_end_tool` 走结构化分支、复用纯函数 `view_render_block()` 的产物。
+* **帧与终端**：帧写到启动时 `sys_dup(1)` 的**私有 fd** —— 请求期间 `tls_noise_mute()` 会把
+  fd 2 指向 `/dev/null`，走 fd 2 的帧会被吞掉；备用屏幕进出 + 括起粘贴 + 逐行 diff 重绘
+  （只重发变化的行，变化超过 60% 时整屏重画）；正文层永远是纯文本（宽度、换行、擦除都按
+  显示列算），工具输出里的控制字节/`ESC[2J` 在 sink 里就被清洗成 `·`/`␛`。
+* **不卡界面**：`llm` 的流式循环、bash/后台任务/子代理/workflow/rg 的阻塞 poll 循环里都插了
+  `tui_poll_tick()`（非 TUI 模式是空调用）—— 工具跑着的时候界面照样刷 spinner、键盘照样收，
+  `esc` 记下中断意图、在**下一个 step 边界**结束回合（滚动模式行为不变）。
+* **信号配合**：进入 TUI 时 `sigx_arm(私有fd, alt=true)`，被 `SIGTERM/INT/HUP/PIPE` 打断时
+  处理器先恢复 termios + 离开备用屏幕再以 `128+sig` 退出；`SIGWINCH` 只置标志（tick 里
+  立刻重排，每帧查 TIOCGWINSZ 作兜底）；`read` 的 `EINTR` 一律当「重来」而不是 EOF。
+* **`--resume`**：历史会回填进转录（最近 200 条），**注入类的 user 消息**（运行时上下文、
+  AGENTS.md、技能目录）不进屏幕 —— 它们是我们塞给模型的背景，不是用户说过的话。
+* **记忆上限**：条目 ≤ 512、正文 ≤ 4 MiB、单条 ≤ 256 KiB，超了从最老丢并在顶部留一行标记；
+  思考条目只留尾部 4 KiB（与 P15/P16 的「思考行只显示最新一段」同口径）。
+* 仍不做：鼠标（滚轮/点击/选择）、图片、可折叠卡片、完整语法高亮（只做轻量 markdown）、
+  分屏、主题切换 UI。
 
 ### 流式协议要点（P1）
 
@@ -771,6 +856,30 @@ vLLM 等 OpenAI 兼容端点都一样稳。想升级成严格 `tool` 角色消�
       内容多出 4 个字符，而且只在恢复会话时才发生，肉眼几乎不可能发现）。修法：反转义统一走
       `jsonx.uya::sv_unescape`（唯一一份完整实现，含 `\uXXXX` 与代理对），认不出的转义才退回
       原文照抄；`session-log` 轮逐字节断言 NUL/0x01 的往返。
+28. **uya 0.10（以及 1.0 那一支）的 `libc.signal.signal()` 装的处理器一收到信号就 SIGSEGV。**
+   它的实现**不是 glibc 的 `signal`**（`export extern "libc" fn signal(...)` 带函数体，链接时
+   直接盖掉同名符号），内部走裸 `rt_sigaction`，传的是 `sa_flags = 0`、`sa_restorer = null`，
+   而 x86-64 上内核交付信号时要用 `sa_restorer` 里的 `rt_sigreturn` 垫片（glibc/musl 一律置
+   `SA_RESTORER = 0x04000000` 并指向自己的垫片）。旧代码那句注释「sa_restorer 为 null 时不要置
+   SA_RESTORER（与 Linux uapi / glibc 行为一致）」是错的。实测三组对照（最小复现都在
+   `build/sig_*.uya`，不入库）：① `signal()` 装处理器 + `kill -USR1` → 退出码 **139**，
+   **处理器体一次都没执行**（不是「返回时崩」）；② 同一套裸 `rt_sigaction`，只补
+   `SA_RESTORER|SA_RESTART` 并复用宿主 `sigaction` 回读出来的 `sa_restorer` → 处理器正常执行
+   并返回；③ 直接绑宿主 `sigaction` → 同样正常（回读它的动作可见 `SA_RESTORER` 已置、
+   `sa_restorer` 非空）。本项目因此在 `src/sigx.uya` 里**直接声明宿主 `sigaction`**
+   （`SigxAction` 按 glibc 布局：handler@0 + mask128 + flags@136 + restorer@144 = 152 字节，
+   `sig-abi` 轮按字节断言），而不是去修工具链 —— 这样在没修过的 0.10 上也能跑。
+   同一缺陷已在 uya 项目侧修复并提交（`libc.signal: 修复 signal() 装的处理器一收到信号就
+   SIGSEGV`，commit `fad26acd`，回移 0.11 的实现 + 两个回归用例；未修的版本跑那两个用例会
+   `Segmentation fault`、修好后 6/6 通过）。
+29. **装了信号处理器以后，阻塞的 `read` 会被打断返回 `EINTR` —— 那不是 EOF。**
+   `poll`/`select` 不受 `SA_RESTART` 保护（内核语义如此），所以只要装了处理器，
+   交互等待输入时的 `sys_read(0, …)` 就可能返回 `EINTR`（例如用户在流式输出期间缩放终端 →
+   `SIGWINCH`）。原来两处读键盘的循环都写成 `const n = sys_read(...) catch { -1; }; if (n <= 0) { 当作 EOF }`
+   —— 于是**一次窗口缩放就会把 REPL 直接关掉**（`tty_read_line_blocking` 返回 `TTY_EV_EOF`、
+   `ask_read_line` 返回「无回答」）。修法：`catch |err|` 里取 `@error_id(err)`，`== 4`（EINTR）
+   就 `continue` 重来（`agent.uya` 与 `askuser.uya` 各一处）。其它 `poll` 循环里的
+   `catch { 0 }` 天然是「当作超时继续转」，不用改。
 
 ---
 
@@ -844,6 +953,15 @@ agent 循环并逐项断言：
 | `stream-length` | `finish_reason=length` → max-tokens，reasoning 正常累积 |
 | `steer` | 回合运行中输入的文本，必须在**下一个 step 的请求**里出现（mock 断言 `STEER-MARKER`） |
 | `interrupt` | 预置 Ctrl-C：回合以 `AGENT_INTERRUPTED` 结束、工具**未派发**、只发生一次请求 |
+| `tui-frame` | 四种尺寸（40×10 / 80×24 / 100×28 / 120×40）下「每行显示列 ≤ cols」「正文层里没有 ESC」；空态整体居中（首行留白 + 块字 logo + 面板 + 脚注 `~/cwd:branch`）、窄终端 logo 退化成单行标题；对话态底对齐 + 面板贴底；工具块/diff/思考/诊断/用户条目都在；跑满一屏后跟随尾部、PgUp/PgDn 夹取、回尾清零 |
+| `tui-keys` | UTF-8 逐字符编辑（退格不砍半个汉字、←/→ 停在字符边界）、**被切开的 `ESC [ D`** 正确组装、Ctrl-J 换行与多行光标移动、回车提交（内容 + 清空 + 进历史）、↑ 取历史、运行中 esc = 中断 / 空闲 esc = 清行、tab 切计划模式（面板显示 Plan）、`/` 自动开命令面板并选中第二项、Ctrl-D 空行退出 |
+| `tui-sink` | TUI 激活后 `tty_write(1/2)` 与 `tty_reason_write` 的字节分别落到 助手/工具/思考 条目；NUL/`ESC[2J`/TAB 被清洗且正文层无 ESC；关掉 sink 后写入回到真实 fd |
+| `tui-turn` | headless 端到端（mock LLM，复用手打路径注入「任务+回车」）：屏幕里出现用户条目、`✓ Write(note.txt)`、`✓ Bash(`、最终答案；回合结束状态回 idle；fd 1 无输出 |
+| `tui-pty` | **真 PTY**（`/dev/ptmx` + `fork` + `dup2(slave→0/1/2)`）：进备用屏幕（`ESC[?1049h`）、首屏面板/logo、发任务后转录出现 mock 最终答案、`SIGWINCH`（改 winsize + 发信号）后进程仍活着并继续重绘、Ctrl-D 退出码 0、退出后 `TCGETS` 与 fork 前**逐位相同**、离开备用屏幕；不需要 setsid/TIOCSCTTY（fd 0 就是 pts 从设备，Ctrl-C 由程序自己吃字节） |
+| `sig-abi` | `SigxAction` 必须是**宿主 glibc** 布局（152 字节；handler@0 / flags@136 / restorer@144，按字节回读）；恢复序列逐字节（带备用屏幕 26 字节 / 不带 18 字节） |
+| `sig-basic` | 处理器装上以后真的被调用、返回以后进程还活着（P0 的回归闸门：缺 `SA_RESTORER` 的实现在这里直接 139）；`SIGWINCH` 处理器只置标志、取用即清零 |
+| `sig-term-restore` | fork 子进程里给自己发 `SIGTERM`：管道上必须收到完整 26 字节恢复序列、退出码必须是 **143**（139 = 处理器路径崩了、7 = 处理器根本没跑） |
+| `sig-child-reset` | fork 子进程 `sigx_reset_for_child()` 之后被父进程 `SIGTERM`：按**默认处置**死于信号 15，且**一个字节都不写**父进程的输出 fd（否则子代理被杀会擦掉父进程的终端） |
 | `tty-editor` | termios 布局(60B)/raw 位运算；行编辑（插入/退格/左右/Delete/Home/End/词删除）、
 一次喂入多行拆成多个提交、分片转义序列、裸 ESC 判定、历史上下翻、中断前缀裁剪 |
 | `preset-knobs-dshsess` | 假 preset（值故意与默认不同：readLimit 7、prune 111/22/33，
@@ -1061,9 +1179,12 @@ mock 上逐字段验收。换一台 `openai-responses` 网关可用时，零参�
   脚本/CI 用 `--max-steps N` 或 `UYA_AGENT_MAX_STEPS=N` 熔断（`make e2e` 也可 `STEPS=N`）。
   没做「重复调用检测」这类启发式熔断。
 * `read_file` 一次最多 64 KiB；`write_file` 是整文件覆盖，没有 diff/patch 工具。
-* 显示层没有颜色（纯文本字形），DSH 的卡片在终端里是「滚动行 + 缩进正文」，不可折叠；
-  助手正文仍是原样流式打印，**不做 markdown 渲染**；`--resume` / `--resume-dsh` 不回放历史转录
-  （会话日志里已经有 `tool/call` + `tool/result`，将来可以做）。
+* 滚动模式（`--no-tui`）仍然没有颜色、不做 markdown 渲染；TUI 模式下有颜色 + 轻量 markdown
+  （围栏代码块、行内 code、标题、列表），但不做完整语法高亮/表格/链接重排。
+* TUI 不做鼠标（滚轮/点击/选择）、图片、可折叠卡片、分屏、主题切换 UI；`--resume` 只回填
+  最近 200 条历史（注入类消息不回填），`--resume-dsh` 走同一条回填路径。
+* 终端小于 32×8 时自动退回滚动模式；`cols < 66` 时块字 logo 退化成一行标题。
+* `SIGKILL` 之后终端仍可能停在备用屏幕（不可捕获），用 `reset` / `stty sane` 恢复。
 * diff 是行级的、面向显示：中间段两侧超过 60 行就退化为两行汇总（不做 Myers 全量 diff），
   也不高亮词级改动。
 * 只做 IPv4（标准库 `dns_client_resolve_first_ipv4`），不做 IPv6、不走代理。
