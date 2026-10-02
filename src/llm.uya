@@ -1,10 +1,16 @@
-// src/llm.uya — OpenAI 兼容 chat/completions 的**流式**响应解析（P1）
+// src/llm.uya — 两种 OpenAI 系协议的**流式**响应解析（P1 + Responses）
 //
-// 只负责把 SSE 事件流变成一条 assistant 消息 + usage + finish 语义：
-//   * content / reasoning_content 增量可选地即时输出；
-//   * tool_calls 按 wire index 分片累积（首帧带 id/name，后续帧只有 arguments 片段）；
-//   * usage 取 prompt_tokens / completion_tokens / cached_tokens / reasoning_tokens；
-//   * finish_reason 映射成 stop / tool-calls / max-tokens / error，缺 [DONE] 视为流被截断。
+//   * LLM_STYLE_CHAT      → POST {base}/chat/completions（SSE：choices[].delta）
+//   * LLM_STYLE_RESPONSES → POST {base}/responses（SSE：response.* 事件）
+//
+// 两者都只负责把 SSE 事件流变成**同一份** ChatOut（一条 assistant 消息 + usage +
+// finish 语义），所以上层的 agent_finish_step / 历史 / 会话日志完全不必知道协议：
+//   * content / reasoning 增量可选地即时输出；
+//   * 工具调用按 wire index（responses 下是 output_index）分片累积；
+//   * usage：chat 取 prompt_tokens/completion_tokens/cached_tokens/reasoning_tokens；
+//     responses 取 input_tokens/output_tokens/input_tokens_details.cached_tokens/…；
+//   * finish 映射成 stop / tool-calls / max-tokens / error；chat 缺 [DONE]、
+//     responses 缺终局事件（completed/incomplete/failed）都视为流被截断。
 //
 // 关键坑（README 第 3 节第 1、15 条）：
 //   std.json 零拷贝且字符串**未反转义** —— 每个事件 payload 先复制进本模块自己的
@@ -32,6 +38,41 @@ export const LLM_FINISH_STOP: i32 = 1;
 export const LLM_FINISH_TOOL_CALLS: i32 = 2;
 export const LLM_FINISH_MAX_TOKENS: i32 = 3;
 export const LLM_FINISH_ERROR: i32 = 4;
+
+// 线协议（DSH 设置里的 api:，见 README「Responses 接口」一节）
+export const LLM_STYLE_CHAT: u8 = 0;
+export const LLM_STYLE_RESPONSES: u8 = 1;
+
+// 协议名 → style：DSH 的正式取值 + 两个简写；认不出来给 -1（调用方自己决定告警/报错）。
+// 长度必须由调用方给：DSH 设置解析出来的 Buf **不带结尾 NUL**，按 NUL 找长度会读过头。
+export fn llm_style_from_name(name: &const byte, n: usize) i32 {
+    if n == 0 {
+        return -1 as i32;
+    }
+    if bufx_eq_cstr(name, n, "openai-responses") || bufx_eq_cstr(name, n, "responses") {
+        return LLM_STYLE_RESPONSES as i32;
+    }
+    if bufx_eq_cstr(name, n, "openai-completions") || bufx_eq_cstr(name, n, "completions")
+        || bufx_eq_cstr(name, n, "chat") {
+        return LLM_STYLE_CHAT as i32;
+    }
+    return -1 as i32;
+}
+
+export fn llm_style_name(style: u8) &const byte {
+    if style == LLM_STYLE_RESPONSES {
+        return "openai-responses" as &const byte;
+    }
+    return "openai-completions" as &const byte;
+}
+
+// 端点路径（拼在 base_url 之后；base 的尾部斜杠由调用方处理）
+export fn llm_endpoint_path(style: u8) &const byte {
+    if style == LLM_STYLE_RESPONSES {
+        return "responses" as &const byte;
+    }
+    return "chat/completions" as &const byte;
+}
 
 const LLM_MAX_CALLS: usize = 16;
 const LLM_EVENT_ARENA: usize = 262144;
@@ -431,6 +472,660 @@ export fn chat_out_from_nonstream(root: &JsonValue, o: &ChatOut) !void {
     }
 }
 
+// ============================================================
+// Responses API（POST {base_url}/responses）
+//
+// 与 chat 共用同一个 ChatOut，上层（agent_finish_step / 历史 / 日志）完全不必知道协议。
+// 事件表（只处理有语义的，其余一律忽略）：
+//   response.output_item.added/done     → function_call 建槽/补 name/args；message/reasoning 兜底正文
+//   response.output_text.delta          → content（refusal.delta 同）
+//   response.reasoning_*_text.delta     → reasoning（print_reasoning 时打「思考」块）
+//   response.function_call_arguments.*  → 工具参数分片
+//   response.completed / .incomplete    → 终局：usage + status + output[] 回填
+//   response.failed / error             → 错误（err_text 里带上 code: message）
+// 终局事件就是流的终点（协议本身不发 [DONE]）；少数代理仍会发 [DONE]，也当正常收尾。
+// 另有兜底：有些网关把 /v1/responses 的流按 chat 形状回（choices[].delta），交给 chat 解析器。
+// ============================================================
+
+fn sv_eq_lit(sv: &const JsonStrView, lit: &const byte) bool {
+    const n: usize = bufx_cstr_len(lit);
+    if sv.len != n {
+        return false;
+    }
+    return bufx_mem_eq(sv.ptr as &const byte, lit, n);
+}
+
+fn llm_append_content(o: &ChatOut, sv: &const JsonStrView, print_content: bool) !void {
+    if sv.len == 0 {
+        return;
+    }
+    const before: usize = o.content.len;
+    if !sv_unescape(sv, &o.content) {
+        return error.LlmMalformed;
+    }
+    if print_content && o.content.len > before {
+        tty_stream_write(1, &o.content.ptr[before], o.content.len - before);
+        o.printed_chars = o.printed_chars + (o.content.len - before);
+    }
+}
+
+fn llm_append_reasoning(o: &ChatOut, sv: &const JsonStrView, print_reasoning: bool) !void {
+    if sv.len == 0 {
+        return;
+    }
+    const rbefore: usize = o.reasoning.len;
+    if !sv_unescape(sv, &o.reasoning) {
+        return error.LlmMalformed;
+    }
+    if print_reasoning && o.reasoning.len > rbefore {
+        // P14：思考块先给一行标题（与 chat 的 reasoning_content 同形）
+        if !o.rheader {
+            o.rheader = true;
+            const rh: &const byte = "✻ 思考\n";
+            tty_stream_write(2, rh, bufx_cstr_len(rh));
+        }
+        tty_stream_write(2, &o.reasoning.ptr[rbefore], o.reasoning.len - rbefore);
+    }
+}
+
+// Responses 的 usage：input_tokens **含**缓存与缓存写入，两类都要减掉（与 pi-ai 同口径）
+fn llm_resp_usage(u: &JsonValue, o: &ChatOut) void {
+    var v: JsonValue = JsonValue.json_null();
+    var n: i64 = 0;
+    if js_obj_get(u, "input_tokens", 12, &v) && js_i64_of(&v, &n) {
+        var cache: i64 = o.usage_cache_read;
+        var write: i64 = 0;
+        var det: JsonValue = JsonValue.json_null();
+        if js_obj_get(u, "input_tokens_details", 20, &det) {
+            var cv: JsonValue = JsonValue.json_null();
+            var c: i64 = 0;
+            if js_obj_get(&det, "cached_tokens", 13, &cv) && js_i64_of(&cv, &c) {
+                cache = c;
+            }
+            var wv: JsonValue = JsonValue.json_null();
+            var w: i64 = 0;
+            if js_obj_get(&det, "cache_write_tokens", 18, &wv) && js_i64_of(&wv, &w) {
+                write = w;
+            }
+        }
+        o.usage_cache_read = cache;
+        var tin: i64 = n - cache - write;
+        if tin < 0 {
+            tin = 0;
+        }
+        o.usage_in = tin;
+    }
+    if js_obj_get(u, "output_tokens", 13, &v) && js_i64_of(&v, &n) {
+        o.usage_out = n;
+    }
+    var det2: JsonValue = JsonValue.json_null();
+    if js_obj_get(u, "output_tokens_details", 21, &det2) {
+        var rv: JsonValue = JsonValue.json_null();
+        var r: i64 = 0;
+        if js_obj_get(&det2, "reasoning_tokens", 16, &rv) && js_i64_of(&rv, &r) {
+            o.usage_reasoning = r;
+        }
+    }
+}
+
+// status → finish（对齐 pi-ai 的 mapStopReason）
+fn llm_resp_map_status(status: &const JsonStrView, have_status: bool, reason: &const JsonStrView, have_reason: bool, o: &ChatOut) void {
+    o.have_finish = true;
+    if have_status && sv_eq_lit(status, "completed") {
+        o.finish = LLM_FINISH_STOP;
+        return;
+    }
+    if have_status && sv_eq_lit(status, "incomplete") {
+        if have_reason && sv_eq_lit(reason, "max_output_tokens") {
+            o.finish = LLM_FINISH_MAX_TOKENS;
+            return;
+        }
+        o.finish = LLM_FINISH_ERROR;
+        buf_reset(&o.bad_finish);
+        buf_reset(&o.err_text);
+        if have_reason {
+            _ = sv_unescape(reason, &o.bad_finish);
+            _ = buf_append_cstr(&o.err_text, "incomplete: ");
+            _ = sv_unescape(reason, &o.err_text);
+        } else {
+            _ = buf_append_cstr(&o.bad_finish, "incomplete");
+            _ = buf_append_cstr(&o.err_text, "incomplete (no reason given)");
+        }
+        return;
+    }
+    if have_status && (sv_eq_lit(status, "failed") || sv_eq_lit(status, "cancelled")) {
+        o.finish = LLM_FINISH_ERROR;
+        // 没有 error 明细时也要留下可打印的原因（上层打的是 err_text）
+        if o.err_text.len == 0 {
+            buf_reset(&o.err_text);
+            _ = sv_unescape(status, &o.err_text);
+            _ = buf_append_cstr(&o.err_text, " (no error details)");
+        }
+        return;
+    }
+    // in_progress / queued / 缺 status：按正常收尾（防御），有工具调用时下面升级成 tool_calls
+    o.finish = LLM_FINISH_STOP;
+}
+
+fn llm_resp_finalize(o: &ChatOut) void {
+    if o.ncalls > 0 && o.finish == LLM_FINISH_STOP {
+        o.finish = LLM_FINISH_TOOL_CALLS;
+    }
+}
+
+// call_id 只留 '|' 前那段（DSH 的形状是 "call_x|fc_y"；我们只回放 call_id）
+fn llm_trim_pipe(b: &Buf) void {
+    var i: usize = 0;
+    while i < b.len {
+        if b.ptr[i] == 124 as byte {
+            buf_truncate(b, i);
+            return;
+        }
+        i = i + 1;
+    }
+}
+
+fn llm_resp_call_id_buf(item: &JsonValue, out: &Buf) bool {
+    var cid: JsonStrView = JsonStrView{ ptr: null, len: 0 };
+    if !js_obj_get_str(item, "call_id", 7, &cid) || cid.len == 0 {
+        return false;
+    }
+    buf_reset(out);
+    if !sv_unescape(&cid, out) {
+        return false;
+    }
+    llm_trim_pipe(out);
+    return out.len > 0;
+}
+
+fn llm_resp_slot_by_call_id(o: &const ChatOut, cid: &const Buf) isize {
+    var i: usize = 0;
+    while i < o.ncalls {
+        if cid.len > 0 && o.calls[i].id.len == cid.len
+            && bufx_mem_eq(o.calls[i].id.ptr as &const byte, cid.ptr as &const byte, cid.len) {
+            return i as isize;
+        }
+        i = i + 1;
+    }
+    return -1 as isize;
+}
+
+fn llm_resp_item_call_id(item: &JsonValue, o: &ChatOut, si: usize) !void {
+    if si >= LLM_MAX_CALLS {
+        return error.LlmMalformed;
+    }
+    if o.calls[si].id.len > 0 {
+        return;
+    }
+    var cid: Buf = buf_empty();
+    defer { buf_free(&cid); }
+    if !llm_resp_call_id_buf(item, &cid) {
+        return;
+    }
+    if !buf_append(&o.calls[si].id, cid.ptr, cid.len) {
+        return error.HcOutOfMemory;
+    }
+}
+
+fn llm_resp_item_name(item: &JsonValue, o: &ChatOut, si: usize) !void {
+    if si >= LLM_MAX_CALLS {
+        return error.LlmMalformed;
+    }
+    if o.calls[si].name.len > 0 {
+        return;
+    }
+    var nv: JsonStrView = JsonStrView{ ptr: null, len: 0 };
+    if !js_obj_get_str(item, "name", 4, &nv) || nv.len == 0 {
+        return;
+    }
+    if !sv_unescape(&nv, &o.calls[si].name) {
+        return error.LlmMalformed;
+    }
+}
+
+// output_item.done 里给的完整参数（有些网关不发 delta）；已有累积就不覆盖
+fn llm_resp_item_args(item: &JsonValue, o: &ChatOut, si: usize) !void {
+    if si >= LLM_MAX_CALLS {
+        return error.LlmMalformed;
+    }
+    if o.calls[si].args.len > 0 {
+        return;
+    }
+    var av: JsonStrView = JsonStrView{ ptr: null, len: 0 };
+    if !js_obj_get_str(item, "arguments", 9, &av) || av.len == 0 {
+        // custom_tool_call 用的是 input
+        if !js_obj_get_str(item, "input", 5, &av) || av.len == 0 {
+            return;
+        }
+    }
+    if !sv_unescape(&av, &o.calls[si].args) {
+        return error.LlmMalformed;
+    }
+}
+
+// function_call_arguments.done：给的是完整 JSON 文本；累积值是它的前缀就只补差值
+fn llm_resp_args_done(av: &const JsonStrView, o: &ChatOut, si: usize) !void {
+    if si >= LLM_MAX_CALLS {
+        return error.LlmMalformed;
+    }
+    var full: Buf = buf_new(av.len + 8);
+    defer { buf_free(&full); }
+    if !sv_unescape(av, &full) {
+        return error.LlmMalformed;
+    }
+    const have: usize = o.calls[si].args.len;
+    if have == 0 {
+        if !buf_append(&o.calls[si].args, full.ptr, full.len) {
+            return error.HcOutOfMemory;
+        }
+        return;
+    }
+    if full.len <= have {
+        return;
+    }
+    if !bufx_mem_eq(o.calls[si].args.ptr as &const byte, full.ptr as &const byte, have) {
+        return;   // 不一致：保留已累积的，别把算好的参数弄坏
+    }
+    if !buf_append(&o.calls[si].args, &full.ptr[have], full.len - have) {
+        return error.HcOutOfMemory;
+    }
+}
+
+// content[] / summary[] 里所有 text 字段追加进 out
+fn llm_resp_join_parts(arr: &JsonValue, out: &Buf) !bool {
+    const n: usize = js_arr_len(arr);
+    var k: usize = 0;
+    var any: bool = false;
+    while k < n {
+        var part: JsonValue = JsonValue.json_null();
+        if js_arr_get(arr, k, &part) {
+            var tv: JsonStrView = JsonStrView{ ptr: null, len: 0 };
+            if !js_obj_get_str(&part, "text", 4, &tv) {
+                // 拒绝块：{"type":"refusal","refusal":"…"}（pi-ai 也把它当正文）
+                _ = js_obj_get_str(&part, "refusal", 7, &tv);
+            }
+            if tv.len > 0 {
+                if !sv_unescape(&tv, out) {
+                    return error.LlmMalformed;
+                }
+                any = true;
+            }
+        }
+        k = k + 1;
+    }
+    return any;
+}
+
+fn llm_resp_text_from_message(item: &JsonValue, o: &ChatOut, only_if_empty: bool) !void {
+    if only_if_empty && o.content.len > 0 {
+        return;
+    }
+    var parts: JsonValue = JsonValue.json_null();
+    if !js_obj_get(item, "content", 7, &parts) {
+        return;
+    }
+    _ = try llm_resp_join_parts(&parts, &o.content);
+}
+
+fn llm_resp_text_from_reasoning(item: &JsonValue, o: &ChatOut, only_if_empty: bool) !void {
+    if only_if_empty && o.reasoning.len > 0 {
+        return;
+    }
+    var parts: JsonValue = JsonValue.json_null();
+    var any: bool = false;
+    if js_obj_get(item, "summary", 7, &parts) {
+        any = try llm_resp_join_parts(&parts, &o.reasoning);
+    }
+    if !any && js_obj_get(item, "content", 7, &parts) {
+        _ = try llm_resp_join_parts(&parts, &o.reasoning);
+    }
+}
+
+fn llm_resp_output_index(root: &JsonValue, out: &i64) bool {
+    var iv: JsonValue = JsonValue.json_null();
+    if !js_obj_get(root, "output_index", 12, &iv) {
+        return false;
+    }
+    return js_i64_of(&iv, out);
+}
+
+// 终局事件里的 response.output[] 回填（有些网关只发 created + completed，正文/参数只在终局里）
+fn llm_resp_backfill(items: &JsonValue, o: &ChatOut) !void {
+    const n: usize = js_arr_len(items);
+    var k: usize = 0;
+    while k < n {
+        var item: JsonValue = JsonValue.json_null();
+        if js_arr_get(items, k, &item) {
+            var itv: JsonStrView = JsonStrView{ ptr: null, len: 0 };
+            if js_obj_get_str(&item, "type", 4, &itv) {
+                if sv_eq_lit(&itv, "function_call") || sv_eq_lit(&itv, "custom_tool_call") {
+                    var cid: Buf = buf_empty();
+                    defer { buf_free(&cid); }
+                    if llm_resp_call_id_buf(&item, &cid) {
+                        // 先按 call_id 找已有槽位；没有就新建（有些网关只发 created + completed，
+                        // 工具调用只出现在终局的 output[] 里）
+                        var slot: isize = llm_resp_slot_by_call_id(o, &cid);
+                        if slot < 0 {
+                            slot = llm_slot(o, k as i64);
+                        }
+                        if slot >= 0 {
+                            const si: usize = slot as usize;
+                            if si < LLM_MAX_CALLS {
+                                try llm_resp_item_call_id(&item, o, si);
+                                try llm_resp_item_name(&item, o, si);
+                                try llm_resp_item_args(&item, o, si);
+                            }
+                        }
+                    }
+                } else if sv_eq_lit(&itv, "message") {
+                    try llm_resp_text_from_message(&item, o, true);
+                } else if sv_eq_lit(&itv, "reasoning") {
+                    try llm_resp_text_from_reasoning(&item, o, true);
+                }
+            }
+        }
+        k = k + 1;
+    }
+}
+
+// 终局（response.completed / response.incomplete / response.failed 共用）
+fn llm_resp_terminal(resp: &JsonValue, o: &ChatOut) !void {
+    var usage: JsonValue = JsonValue.json_null();
+    if js_obj_get(resp, "usage", 5, &usage) {
+        llm_resp_usage(&usage, o);
+    }
+    var status: JsonStrView = JsonStrView{ ptr: null, len: 0 };
+    const have_status: bool = js_obj_get_str(resp, "status", 6, &status);
+    var reason: JsonStrView = JsonStrView{ ptr: null, len: 0 };
+    var have_reason: bool = false;
+    var det: JsonValue = JsonValue.json_null();
+    if js_obj_get(resp, "incomplete_details", 18, &det) {
+        have_reason = js_obj_get_str(&det, "reason", 6, &reason);
+    }
+    // response.failed 把原因放在 error{code,message}
+    var err_obj: JsonValue = JsonValue.json_null();
+    var emsg: JsonStrView = JsonStrView{ ptr: null, len: 0 };
+    var ecode: JsonStrView = JsonStrView{ ptr: null, len: 0 };
+    var have_err: bool = false;
+    if js_obj_get(resp, "error", 5, &err_obj) {
+        const hm: bool = js_obj_get_str(&err_obj, "message", 7, &emsg);
+        const hc: bool = js_obj_get_str(&err_obj, "code", 4, &ecode);
+        if hm || hc {
+            have_err = true;
+            buf_reset(&o.err_text);
+            if hc {
+                _ = sv_unescape(&ecode, &o.err_text);
+                _ = buf_append_cstr(&o.err_text, ": ");
+            }
+            if hm {
+                _ = sv_unescape(&emsg, &o.err_text);
+            } else {
+                _ = buf_append_cstr(&o.err_text, "(no message)");
+            }
+        }
+    }
+    var out_items: JsonValue = JsonValue.json_null();
+    if js_obj_get(resp, "output", 6, &out_items) {
+        try llm_resp_backfill(&out_items, o);
+    }
+    if have_err {
+        o.have_finish = true;
+        o.finish = LLM_FINISH_ERROR;
+        return;
+    }
+    llm_resp_map_status(&status, have_status, &reason, have_reason, o);
+}
+
+// 处理一个 Responses SSE data payload。返回 false = 收到终局事件，流应当结束。
+fn llm_resp_handle_payload(arena: &Arena, payload: &[byte], o: &ChatOut, print_content: bool, print_reasoning: bool) !bool {
+    o.events = o.events + 1;
+    var ps: usize = 0;
+    while ps < payload.len && (payload.ptr[ps] == 32 as byte || payload.ptr[ps] == 9 as byte) {
+        ps = ps + 1;
+    }
+    const n: usize = payload.len - ps;
+    if n == 0 {
+        return true;
+    }
+    if n == 6 && bufx_eq_cstr(&payload.ptr[ps] as &const byte, 6, "[DONE]") {
+        // 协议本身不发 [DONE]，但少数代理会补一帧：当作正常收尾（缺终局事件才是截断）
+        o.saw_done = true;
+        if !o.have_finish {
+            o.have_finish = true;
+            o.finish = LLM_FINISH_STOP;
+        }
+        llm_resp_finalize(o);
+        return false;
+    }
+    arena_reset(arena);
+    const copy: &byte = arena_alloc(arena, n + 1);
+    if (copy as usize) == 0 {
+        return error.HcOutOfMemory;
+    }
+    _ = mem_copy(copy, &payload.ptr[ps], n);
+    var root: JsonValue = JsonValue.json_null();
+    if !js_parse(arena, copy, n, &root) {
+        llm_err_head(o, &payload.ptr[ps], n);
+        o.finish = LLM_FINISH_ERROR;
+        o.have_finish = true;
+        return error.LlmMalformed;
+    }
+    // 兜底：网关把 responses 的流按 chat 形状回（choices[].delta）→ 交给 chat 解析器
+    var choices: JsonValue = JsonValue.json_null();
+    if js_obj_get(&root, "choices", 7, &choices) {
+        return llm_handle_payload(arena, payload, o, print_content, print_reasoning);
+    }
+    var tv: JsonStrView = JsonStrView{ ptr: null, len: 0 };
+    if !js_obj_get_str(&root, "type", 4, &tv) {
+        return true;   // 没有 type（心跳之类）：忽略
+    }
+    if sv_eq_lit(&tv, "response.output_text.delta") || sv_eq_lit(&tv, "response.refusal.delta") {
+        var dv: JsonStrView = JsonStrView{ ptr: null, len: 0 };
+        if js_obj_get_str(&root, "delta", 5, &dv) {
+            try llm_append_content(o, &dv, print_content);
+        }
+        return true;
+    }
+    if sv_eq_lit(&tv, "response.reasoning_summary_text.delta") || sv_eq_lit(&tv, "response.reasoning_text.delta") {
+        var dv: JsonStrView = JsonStrView{ ptr: null, len: 0 };
+        if js_obj_get_str(&root, "delta", 5, &dv) {
+            try llm_append_reasoning(o, &dv, print_reasoning);
+        }
+        return true;
+    }
+    if sv_eq_lit(&tv, "response.reasoning_summary_part.done") {
+        if o.reasoning.len > 0 {
+            _ = buf_append_cstr(&o.reasoning, "\n\n");
+        }
+        return true;
+    }
+    if sv_eq_lit(&tv, "response.function_call_arguments.delta") {
+        var idx: i64 = -1;
+        var dv: JsonStrView = JsonStrView{ ptr: null, len: 0 };
+        // 没有 output_index 就没法定位（规范里一定有）；靠 output_item.done 兜底
+        if llm_resp_output_index(&root, &idx) && js_obj_get_str(&root, "delta", 5, &dv) && dv.len > 0 {
+            const slot: isize = llm_slot(o, idx);
+            if slot >= 0 {
+                const si: usize = slot as usize;
+                if si >= LLM_MAX_CALLS {
+                    return error.LlmMalformed;
+                }
+                if !sv_unescape(&dv, &o.calls[si].args) {
+                    return error.LlmMalformed;
+                }
+            }
+        }
+        return true;
+    }
+    if sv_eq_lit(&tv, "response.function_call_arguments.done") {
+        var idx: i64 = -1;
+        var av: JsonStrView = JsonStrView{ ptr: null, len: 0 };
+        if llm_resp_output_index(&root, &idx) && js_obj_get_str(&root, "arguments", 9, &av) {
+            const slot: isize = llm_slot(o, idx);
+            if slot >= 0 {
+                const si: usize = slot as usize;
+                if si >= LLM_MAX_CALLS {
+                    return error.LlmMalformed;
+                }
+                try llm_resp_args_done(&av, o, si);
+            }
+        }
+        return true;
+    }
+    if sv_eq_lit(&tv, "response.output_item.added") || sv_eq_lit(&tv, "response.output_item.done") {
+        const done: bool = sv_eq_lit(&tv, "response.output_item.done");
+        var item: JsonValue = JsonValue.json_null();
+        var itv: JsonStrView = JsonStrView{ ptr: null, len: 0 };
+        if js_obj_get(&root, "item", 4, &item) && js_obj_get_str(&item, "type", 4, &itv) {
+            if sv_eq_lit(&itv, "function_call") || sv_eq_lit(&itv, "custom_tool_call") {
+                var slot: isize = -1;
+                var idx: i64 = -1;
+                if llm_resp_output_index(&root, &idx) && idx >= 0 {
+                    slot = llm_slot(o, idx);
+                } else {
+                    var cid: Buf = buf_empty();
+                    defer { buf_free(&cid); }
+                    if llm_resp_call_id_buf(&item, &cid) {
+                        slot = llm_resp_slot_by_call_id(o, &cid);
+                    }
+                }
+                if slot >= 0 {
+                    const si: usize = slot as usize;
+                    if si >= LLM_MAX_CALLS {
+                        return error.LlmMalformed;
+                    }
+                    try llm_resp_item_call_id(&item, o, si);
+                    try llm_resp_item_name(&item, o, si);
+                    if done {
+                        try llm_resp_item_args(&item, o, si);
+                    }
+                }
+            } else if done && sv_eq_lit(&itv, "message") {
+                try llm_resp_text_from_message(&item, o, true);
+            } else if done && sv_eq_lit(&itv, "reasoning") {
+                try llm_resp_text_from_reasoning(&item, o, true);
+            }
+        }
+        return true;
+    }
+    if sv_eq_lit(&tv, "response.completed") || sv_eq_lit(&tv, "response.incomplete") || sv_eq_lit(&tv, "response.failed") {
+        var resp: JsonValue = JsonValue.json_null();
+        if js_obj_get(&root, "response", 8, &resp) {
+            try llm_resp_terminal(&resp, o);
+        } else {
+            o.have_finish = true;
+            o.finish = LLM_FINISH_STOP;
+        }
+        llm_resp_finalize(o);
+        o.saw_done = true;
+        return false;
+    }
+    if sv_eq_lit(&tv, "error") {
+        var emsg: JsonStrView = JsonStrView{ ptr: null, len: 0 };
+        var ecode: JsonStrView = JsonStrView{ ptr: null, len: 0 };
+        buf_reset(&o.err_text);
+        if js_obj_get_str(&root, "code", 4, &ecode) {
+            _ = sv_unescape(&ecode, &o.err_text);
+            _ = buf_append_cstr(&o.err_text, ": ");
+        }
+        if js_obj_get_str(&root, "message", 7, &emsg) {
+            _ = sv_unescape(&emsg, &o.err_text);
+        } else {
+            _ = buf_append_cstr(&o.err_text, "(no message)");
+        }
+        o.have_finish = true;
+        o.finish = LLM_FINISH_ERROR;
+        o.saw_done = true;
+        return false;
+    }
+    // response.created / response.in_progress / output_text.done / content_part.done / …
+    return true;
+}
+
+// 非流式 Responses 响应体 → ChatOut（--no-stream 路径复用同一套收尾逻辑）
+export fn responses_out_from_nonstream(root: &JsonValue, o: &ChatOut) !void {
+    var status: JsonStrView = JsonStrView{ ptr: null, len: 0 };
+    const have_status: bool = js_obj_get_str(root, "status", 6, &status);
+    var out_items: JsonValue = JsonValue.json_null();
+    const have_output: bool = js_obj_get(root, "output", 6, &out_items);
+    var err_obj: JsonValue = JsonValue.json_null();
+    var emsg: JsonStrView = JsonStrView{ ptr: null, len: 0 };
+    var ecode: JsonStrView = JsonStrView{ ptr: null, len: 0 };
+    var have_err: bool = false;
+    if js_obj_get(root, "error", 5, &err_obj) {
+        const hm: bool = js_obj_get_str(&err_obj, "message", 7, &emsg);
+        const hc: bool = js_obj_get_str(&err_obj, "code", 4, &ecode);
+        if hm || hc {
+            have_err = true;
+        }
+    }
+    if !have_status && !have_output {
+        // 连 output/status 都没有：当作坏响应（与 chat 的 "no choices[0].message" 同风格）
+        buf_reset(&o.err_text);
+        if have_err {
+            if !sv_unescape(&emsg, &o.err_text) {
+                return error.LlmMalformed;
+            }
+        } else {
+            _ = buf_append_cstr(&o.err_text, "response has no output[] nor status");
+        }
+        o.finish = LLM_FINISH_ERROR;
+        o.have_finish = true;
+        return;
+    }
+    if have_output {
+        const n: usize = js_arr_len(&out_items);
+        var k: usize = 0;
+        while k < n {
+            var item: JsonValue = JsonValue.json_null();
+            if js_arr_get(&out_items, k, &item) {
+                var itv: JsonStrView = JsonStrView{ ptr: null, len: 0 };
+                if js_obj_get_str(&item, "type", 4, &itv) {
+                    if sv_eq_lit(&itv, "function_call") || sv_eq_lit(&itv, "custom_tool_call") {
+                        const slot: isize = llm_slot(o, k as i64);
+                        if slot >= 0 {
+                            const si: usize = slot as usize;
+                            if si >= LLM_MAX_CALLS {
+                                return error.LlmMalformed;
+                            }
+                            try llm_resp_item_call_id(&item, o, si);
+                            try llm_resp_item_name(&item, o, si);
+                            try llm_resp_item_args(&item, o, si);
+                        }
+                    } else if sv_eq_lit(&itv, "message") {
+                        try llm_resp_text_from_message(&item, o, false);
+                    } else if sv_eq_lit(&itv, "reasoning") {
+                        try llm_resp_text_from_reasoning(&item, o, false);
+                    }
+                }
+            }
+            k = k + 1;
+        }
+    }
+    var usage: JsonValue = JsonValue.json_null();
+    if js_obj_get(root, "usage", 5, &usage) {
+        llm_resp_usage(&usage, o);
+    }
+    if have_err {
+        buf_reset(&o.err_text);
+        if !sv_unescape(&emsg, &o.err_text) {
+            return error.LlmMalformed;
+        }
+        o.have_finish = true;
+        o.finish = LLM_FINISH_ERROR;
+        return;
+    }
+    var reason: JsonStrView = JsonStrView{ ptr: null, len: 0 };
+    var have_reason: bool = false;
+    var det: JsonValue = JsonValue.json_null();
+    if js_obj_get(root, "incomplete_details", 18, &det) {
+        have_reason = js_obj_get_str(&det, "reason", 6, &reason);
+    }
+    llm_resp_map_status(&status, have_status, &reason, have_reason, o);
+    llm_resp_finalize(o);
+    o.saw_done = true;
+}
+
 
 // 流式期间的键盘服务：把完整行投进 steer 收件箱（下一个 step 边界被领取），
 // 把 Ctrl-C/Esc 变成中断信号。返回本次拿到的事件。
@@ -464,9 +1159,13 @@ fn llm_pump_input() i32 {
 
 // 发流式请求并把整条 SSE 流消费完。返回 HTTP 状态码。
 //
-// 错误：网络/TLS 走 Hc* 错误；坏 payload 走 error.LlmMalformed；缺 [DONE] 走
-// error.LlmStreamClosed（对齐 DSH 的 STREAM_CLOSED）。
-export fn llm_stream_chat(
+// style = LLM_STYLE_CHAT / LLM_STYLE_RESPONSES —— 只有「一帧 payload 交给谁解析」不同，
+// 读流、chunked 解码、交互期间的中断服务都是同一套（见本文件头部注释）。
+//
+// 错误：网络/TLS 走 Hc* 错误；坏 payload 走 error.LlmMalformed；chat 缺 [DONE] /
+// responses 缺终局事件走 error.LlmStreamClosed（对齐 DSH 的 STREAM_CLOSED）。
+export fn llm_stream_style(
+    style: u8,
     url: &[byte],
     headers: &[byte],
     body: &const byte,
@@ -523,7 +1222,12 @@ export fn llm_stream_chat(
             if ev <= 0 {
                 break;
             }
-            const cont: bool = try llm_handle_payload(&arena, payload.ptr[0: payload.len], o, print_content, print_reasoning);
+            var cont: bool = false;
+            if style == LLM_STYLE_RESPONSES {
+                cont = try llm_resp_handle_payload(&arena, payload.ptr[0: payload.len], o, print_content, print_reasoning);
+            } else {
+                cont = try llm_handle_payload(&arena, payload.ptr[0: payload.len], o, print_content, print_reasoning);
+            }
             if !cont {
                 done = true;
                 break;
@@ -554,4 +1258,37 @@ export fn llm_stream_chat(
         return error.LlmStreamClosed;
     }
     return st.status;
+}
+
+// chat/completions 的薄包装（自测直接调这个，语义与 P1 完全一致）
+export fn llm_stream_chat(
+    url: &[byte],
+    headers: &[byte],
+    body: &const byte,
+    body_len: usize,
+    timeout_ms: u32,
+    max_body: usize,
+    verify: i32,
+    pin: &[byte],
+    o: &ChatOut,
+    print_content: bool,
+    print_reasoning: bool,
+    interactive: bool
+) !i32 {
+    const r: !i32 = llm_stream_style(
+        LLM_STYLE_CHAT,
+        url,
+        headers,
+        body,
+        body_len,
+        timeout_ms,
+        max_body,
+        verify,
+        pin,
+        o,
+        print_content,
+        print_reasoning,
+        interactive
+    );
+    return r;
 }

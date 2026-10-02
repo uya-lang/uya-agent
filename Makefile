@@ -25,7 +25,7 @@ TASK ?= 创建 hello.uya，编译并运行它
 export UYA_ROOT
 export UYA_SPLIT_C_DIR := $(CURDIR)/build/uyacache
 
-.PHONY: all check build selftest codegen-audit probe e2e e2e-config e2e-config-flags e2e-steps e2e-dsh clean
+.PHONY: all check build selftest codegen-audit probe e2e e2e-config e2e-config-flags e2e-api e2e-steps e2e-dsh clean
 
 all: build
 
@@ -50,7 +50,7 @@ codegen-audit: build
 	fi; \
 	echo "codegen-audit: 通过（没有切片描述符强转）"
 
-selftest: build codegen-audit e2e-config-flags e2e-steps
+selftest: build codegen-audit e2e-config-flags e2e-api e2e-steps
 	UYA_BIN=$(UYA) $(OUT) --selftest
 
 probe: build
@@ -87,6 +87,37 @@ e2e-config-flags: build
 		echo "FAIL: --strict-dsh-config 读不到设置却没有报错退出"; exit 1; \
 	fi; \
 	echo "e2e-config-flags: 通过（--dsh-home / --no-dsh-config / --strict-dsh-config 都在加载前生效）"
+
+# 线协议 flag 回归（离线，--print-config / --dry-run 都不联网）：
+#   * 默认（没有任何声明）= 先 responses + 允许一次性协商回退 chat；
+#   * --api= / UYA_AGENT_API 显式声明后**不协商**（声明即权威）；
+#   * 非法取值必须报错退出（静默按默认跑会让人以为协议生效了）；
+#   * 组装出来的请求体也得跟着协议走（--dry-run 直接看 body）。
+e2e-api: build
+	@set -e; \
+	out=$$($(OUT) --no-dsh-config --print-config 2>&1); \
+	echo "$$out" | grep -q "api = openai-responses  (source: default, negotiable→chat/completions)" \
+		|| { echo "FAIL: 默认协议应当是 responses + 可协商"; exit 1; }; \
+	echo "$$out" | grep -q "endpoint = responses" \
+		|| { echo "FAIL: 默认端点应当是 /responses"; exit 1; }; \
+	out=$$($(OUT) --no-dsh-config --api=chat --print-config 2>&1); \
+	echo "$$out" | grep -q "api = openai-completions  (source: cli)" \
+		|| { echo "FAIL: --api=chat 没生效"; exit 1; }; \
+	if echo "$$out" | grep -q "negotiable"; then echo "FAIL: 显式声明后不该标 negotiable"; exit 1; fi; \
+	out=$$(UYA_AGENT_API=responses $(OUT) --no-dsh-config --print-config 2>&1); \
+	echo "$$out" | grep -q "api = openai-responses  (source: env)" \
+		|| { echo "FAIL: UYA_AGENT_API 没生效"; exit 1; }; \
+	if $(OUT) --api=bogus --print-config >/dev/null 2>&1; then \
+		echo "FAIL: 非法 --api 应当报错退出"; exit 1; \
+	fi; \
+	out=$$($(OUT) --no-dsh-config --dry-run "x" 2>&1); \
+	echo "$$out" | grep -q '\"input\":' \
+		|| { echo "FAIL: 默认应当组装 responses 请求体"; exit 1; }; \
+	if echo "$$out" | grep -q '\"messages\":'; then echo "FAIL: responses 请求体里不该有 messages"; exit 1; fi; \
+	out=$$($(OUT) --no-dsh-config --api=chat --dry-run "x" 2>&1); \
+	echo "$$out" | grep -q '\"messages\":' \
+		|| { echo "FAIL: --api=chat 应当组装 chat 请求体"; exit 1; }; \
+	echo "e2e-api: 通过（默认 responses+一次性协商；--api= / UYA_AGENT_API 显式声明；非法值报错）"
 
 # 步数默认值回归（离线，--print-config 不联网）：默认不限步数（0）；CLI 与环境变量同口径。
 # 默认值从「12 步熔断」改成「不限」是本仓库的显式决策（对齐 DSH：没有步数上限），
