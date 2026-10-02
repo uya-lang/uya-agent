@@ -8,7 +8,9 @@
 默认走 Responses 接口」（落点见 §3 踩坑 27、§2 的 `jsonx.uya`/`session.uya`、§6 的
 `json-escape` / `ctrl-bytes*`）、一条是**子代理窗口面板**（§2 的「子代理窗口面板（并行线的 P15）」，
 踩坑 29）；P16 是**单行转录 + 思考行**，P17 是**纯 Uya 的全屏 TUI**，
-P18 是**常驻状态区 + 思考实时行**）：
+P18 是**常驻状态区 + 思考实时行**；**P19 是诊断出口**：外来字节（网关错误体 / 坏 payload
+头部）只以「转义 + 字符边界截断 + 限长」的一行预览进转录，全文进会话日志 `diag/dump`、
+原始字节走 `--debug-dump`（踩坑 33））：
 LLM 交互是**流式 SSE**（`stream:true` + `stream_options.include_usage`），
 增量 chunked 解码 + SSE 分帧 + `tool_calls` 按 `index` 分片累积；消息协议是**严格工具协议**
 （`assistant.tool_calls` 原样回灌 + 每条结果一条 `role:"tool"` + `tool_call_id`）；
@@ -135,6 +137,7 @@ export UYA_SPLIT_C_DIR=$PWD/build/uyacache      # 多文件 C 缓存别丢在仓
 | `--context-window N` | 压缩判定的窗口（默认取 DSH 模型条目） |
 | `--dsh-root DIR` | packaged preset 根（读 persona / plan 段文案） |
 | `--dry-run` | 只组装请求并打印（不可打印字节转义成 `\xNN`，排查脏字节） |
+| `--debug-dump FILE` | 诊断的**原始字节**（网关错误体 / 坏 payload 头部等）追加落盘（设路径时先清空）；默认关：转录里只有转义预览，全文仍进会话日志 `diag/dump`（见踩坑 33） |
 | `--compat-fold` | 工具结果折叠成一条 user 消息（旧协议） |
 | `--no-stream-options` | 不发送 `stream_options.include_usage` |
 | `--show-reasoning` | 显示思考行（P16 单行口径：滚动模式下运行中在提示符那一行滚动、结束落一行 `✻ 思考 · …`；全文始终进会话日志）。**TUI 下另有一条默认就显示的实时行**（P18，见「全屏 TUI」一节），这个开关在 TUI 里只管「额外把思考收进转录条目」 |
@@ -180,7 +183,9 @@ src/tty.uya       终端层：termios raw 模式、行编辑器（历史/光标/
                   按显示列截断（`tty_clip_bytes` 截尾 / `tty_clip_tail_bytes` 留尾）、
                   **多行「面板块」**（输入行上方常驻的窗口区：逐行 ESC[2K 擦除 + 相对上移，
                   子代理窗口面板就画在这里）；P17 再加：TUI sink 开关（TUI 激活时所有显示
-                  字节进转录，不再打到终端）与 `tty_reason_write`（思考走独立通道）
+                  字节进转录，不再打到终端）与 `tty_reason_write`（思考走独立通道）；
+                  P19 再加：`tty_diag_escape_into` —— 诊断字节的**唯一**转义实现（转义控制
+                  字节与非法 UTF-8、按字符边界收 cap，见踩坑 33）
 src/sigx.uya      信号层（P17）：直接绑宿主 glibc `sigaction`（绕开 uya 0.10 `libc.signal`
                   的 SIGSEGV 缺陷）；终止类信号 → 先恢复终端（termios + 离开备用屏幕）再
                   128+sig 退出；SIGWINCH → 只置标志；`sigx_reset_for_child()` 给 fork 子进程
@@ -188,7 +193,9 @@ src/tui.uya       全屏 TUI（P17）：帧模型（行=段序列，逐行 diff 
                   转录条目（用户/助手/思考/工具/诊断）、轻量 markdown、输入编辑器（按字符编辑、
                   多行、历史、括起粘贴）、键解码（分片转义序列）、浮层（命令面板/会话/帮助/问答）、
                   sink 通道与清洗、滚动与尾随、帧节流；P18 再加**常驻状态区**（钉在输入面板正
-                  上方：spinner 行 + 思考实时行，空闲 0 行）与尾部对齐截断 `tui_put_clipped_tail`
+                  上方：spinner 行 + 思考实时行，空闲 0 行）与尾部对齐截断 `tui_put_clipped_tail`；
+                  P19：诊断（NOTICE）条目限长（`TUI_NOTICE_MAX`）、非法/半截 UTF-8 → U+FFFD、
+                  思考尾部按字符边界切
 src/sigselftest.uya 信号层的自测轮次（sig-abi / sig-basic / sig-term-restore / sig-child-reset）
 src/tuiselftest.uya TUI 的自测轮次（tui-frame / tui-keys / tui-sink / tui-turn / tui-status / tui-pty）
 src/inbox.uya     输入收件箱：steer（运行中输入的文本，step 边界领取）+ keepInbox 语义
@@ -242,9 +249,12 @@ src/view.uya      显示层：工具→标题/关键参数/后缀三张表、状
 src/agent.uya     CLI、环境变量、消息历史、请求组装、主循环（流式/非流式）、工具分发、
                   交互式 REPL（中断/steer//continue/会话命令）、会话事件记录与恢复、
                   `assistant/reasoning`（思考全文，P16）；P17 再加 `agent_run_tui` /
-                  `agent_run_tui_body`（全屏 TUI 主循环，headless 与真终端共用）
-src/selftest.uya  --selftest 的 mock LLM（含 SSE 受控切分）+ 33 轮断言 + --probe
-                  （P17 又加了源文件里的 4 轮信号 + 5 轮 TUI，P18 再加 1 轮 `tui-status`，见 §6）
+                  `agent_run_tui_body`（全屏 TUI 主循环，headless 与真终端共用）；
+                  P19 再加 `out_diag`（外来字节诊断的**唯一**出口：一行转义预览 + 截断后缀，
+                  全文进会话日志 `diag/dump`，`--debug-dump` 落原始字节）
+src/selftest.uya  --selftest 的 mock LLM（含 SSE 受控切分）+ 37 轮断言 + --probe
+                  （P17 又加了源文件里的 4 轮信号 + 5 轮 TUI，P18 再加 1 轮 `tui-status`，
+                  P19 再加 3 轮诊断，见 §6）
 ```
 
 > 两处已知死代码（P14 未清理，改别的东西时别被它们误导）：`src/tools.uya`（P0 的
@@ -553,7 +563,9 @@ Messages API（`x-api-key` + `anthropic-version: 2023-06-01`，服务端工具 `
   之后每行一个 `{"type":…,"seq":N,"time":N,"data":{…}}`，`seq` 从 0 连续递增，追加-only。
 * 事件词表：`user/message`、`assistant/message`（含 `tool_calls` 原文）、`assistant/reasoning`
   （P16：该 step 的思考全文，显示层只留一行、全文只活在这里；`--resume` 的 reader 不认识它就跳过）、
-  `tool/call`、`tool/result`、`turn/start|end`、`step/start`、`session/title`。**续写已有会话时不重复写 header**，
+  `tool/call`、`tool/result`、`turn/start|end`、`step/start`、`session/title`、
+  `diag/dump`（P19：外来字节诊断的**转义全文**，字段 `kind`/`bytes`/`truncated`/`text`；
+  转录里只有 ≤320 B 的转义预览 —— 见踩坑 33）。**续写已有会话时不重复写 header**，
   `seq` 接着已有最大值往下走（跨进程实测连续）。
 * **崩溃恢复**：最后一行不完整（没有换行结尾）时丢弃它并在 stderr 告警 —— 对应 DSH 的
   「保留有效尾部工作」。
@@ -1055,6 +1067,34 @@ vLLM 等 OpenAI 兼容端点都一样稳。想升级成严格 `tool` 角色消�
    回归：`tui-status` 轮的 A 组（铺满转录后状态行必须仍在，且落在 `tui_nrows() - 4` 那一行）。
 
 
+33. **把「外来字节」原样打给 fd 2 = 转录里一屏乱码。** 现场：网关 400 的错误体把整个请求
+    **回显**回来了（里面有模型的 messages、`\n` 转义、组装好的 `tools` 数组），代码走
+    `dump_stream_error` / `dump_http_error` / `err_kind==1` / `LLM_FINISH_ERROR` 这几条路把它
+    **按字节**打到 stderr。而 TUI 的显示模型是「fd 2 的每一行 → 一条 NOTICE 条目，每行画一个
+    `· ` 前缀」——于是屏幕上出现一大块灰底 `· ` 行：**半个汉字 + 一屏 JSON**（用户报的「乱码」）。
+    三条根因叠在一起：
+    * **按字节截断切坏 UTF-8**：`llm_err_head` 收 240 B、`dump_*_error` 收 4096 B、`bad_finish`
+      64 B，中文在边界上被切成半个字符，终端渲染成替换符、列宽也算不对；
+    * **控制字节原样上屏**：错误体里的 CR/LF/ESC 会直接改变终端状态（清屏、挪光标）；
+    * **没有上限**：TUI 单条 NOTICE 的文本上限是 256 KiB（`TUI_ENTRY_MAX`），一条诊断就能把整屏
+      转录冲掉，而「NOTICE 只在内存里」意味着**会话日志里查不到现场**（当时只能靠截图）。
+    修法（入口唯一化 + 有界 + 另有去处）：
+    * `tty.uya::tty_diag_escape_into` 是**唯一**的转义实现：可打印 ASCII 原样、`\n`/`\t` 短转义、
+      其余控制字节 `\xNN`、合法 UTF-8 原样、非法/半截逐字节 `\xNN`，并在**字符边界**上按 cap 收；
+    * `agent.uya::out_diag` 是**唯一**的诊断出口：转义预览（320 B）+ `… N bytes total` 后缀，
+      **整条只有一行**（换行都转义了 → TUI 里最多 3–4 行，而不是一屏）；所有原样打印的调用点
+      全部改走它（`--dry-run` 也复用它，输出口径不变）；
+    * 完整原文（转义后）落会话日志 `diag/dump`（日志因此永远是合法 UTF-8），需要**原始字节**时
+      用 `--debug-dump FILE`（设路径即清空旧文件，避免自测被旧文件「假绿」）；
+    * TUI 侧再加两道：NOTICE 文本上限 `TUI_NOTICE_MAX = 512 B`（超了补一行截断提示），
+      非法/半截 UTF-8 在 `tui_clean_into` 里换成 U+FFFD；`tui_sink_reason` 的尾部保留
+      （4096 B）也改成按字符边界切（原来会把思考条目以半个汉字开头）。
+    回归：`diag-preview`（纯函数：边界/cap/转义/落盘）、`diag-echo-400` 与 `diag-echo-400-ns`
+    （mock 网关回显整个请求，断言转录里只有一行转义预览、没有裸 CR/NUL/ESC、`--debug-dump`
+    与会话日志 `diag/dump` 里有完整原文）、`tui-diag`（4 KiB 块只留 ≤512 B + 截断提示、
+    半截字节变 U+FFFD、思考尾部不切字）。真机对照（本地假网关回显 18 KB 请求）：
+    修前 stderr 297 B / 7 个裸 CR / 9 行，修后 330 B / 0 个裸 CR / 3 行 + `… 18693 bytes total`。
+
 ---
 
 ## 4. 工具实现要点
@@ -1232,6 +1272,9 @@ ESC[12C / 逐行 ESC[2K）、真画一帧后屏幕上的块形状与 `cur_row`�
 responses 看 `call_id`）；**chat 与 responses 各一轮**，且顺便断言端点没串（`POST /v1/chat/completions` vs `/v1/responses`）。
 再加上「每个请求体都不许有裸控制字节」的全局哨兵（判定码 240）—— 这条就是真机那次
 `invalid character '\x00' in string literal` 的本地等价判据 |
+| `diag-preview` | 诊断出口的纯函数轮（P19，踩坑 33）：cap 落在多字节字符中间时必须在**字符边界**上停（600 B 中文 + cap 320 → 只吃 318 B，`bufx_utf8_valid` 为真）；半截序列与**孤立续字节**逐字节 `\xNN`；NUL/ESC/CR 走 `\xNN`、TAB 与换行走短转义；合法 U+FFFD 原样留着；`out_diag` 出来的字节序列**只有一个换行**、≤512 B、超长带 `… N bytes total` 后缀；`--debug-dump` 文件里有完整原始字节 |
+| `diag-echo-400` / `diag-echo-400-ns` | 端到端（mock mode 24，流式与非流式各一轮）：mock 网关回 **400 + 把整个请求原样回显**（含请求头的 CRLF 与 `tools` 数组）→ 断言 fd 2 上只有 `model endpoint returned HTTP 400` + 一行转义预览：CR 转义成 `\x0d`、**没有裸 CR/NUL/ESC**、行数 ≤6、总长 ≤1 KiB；同时断言 `--debug-dump` 里有完整原文、会话日志里有 `diag/dump` 事件（`kind`/`bytes`/`truncated`/`text`，文本里同样没有裸控制字节）。这两条就是「转录一屏乱码」的现场回归 |
+| `tui-diag` | 显示层轮（P19）：4 KiB 的 JSON 块从 fd 2 进来 → NOTICE 只留 ≤512 B + 一行截断提示（不修则 40 份重复铺满整屏）；半截汉字在屏幕上变成 **U+FFFD** 且屏幕文本 `bufx_utf8_valid` 为真（终端不会自己渲染半个字）；正文层无 ESC；思考条目尾部截断（4096 B、中文 3 B/字）不切出半个汉字 |
 
 **P1/P2 的验收事实**（2026-10-02）：
 

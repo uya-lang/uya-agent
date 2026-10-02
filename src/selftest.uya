@@ -817,6 +817,30 @@ fn mock_send_401(cfd: i32, body: &const Buf) bool {
     return true;
 }
 
+// HTTP 400 + **回显整个请求**（复刻中转网关的报错风格：把收到的请求塞进错误体里）。
+// 这是「转录乱码」的现场：错误体里有模型请求的全文（含 tools 数组与 `\n` 转义），
+// 打给 fd 2 时会被 TUI 渲染成一大块带 `· ` 前缀的 NOTICE 行。
+fn mock_send_400_echo(cfd: i32, rx: &const Buf) bool {
+    var body: Buf = buf_new(rx.len + 256);
+    defer { buf_free(&body); }
+    _ = buf_append_cstr(&body, "{\"error\":{\"message\":\"relay echo\"},\"request\":");
+    _ = buf_append(&body, rx.ptr, rx.len);
+    _ = buf_append_cstr(&body, "}");
+    var head: Buf = buf_new(256);
+    defer { buf_free(&head); }
+    _ = buf_append_cstr(&head, "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: ");
+    _ = buf_append_u64(&head, body.len as u64);
+    _ = buf_append_cstr(&head, "\r\n\r\n");
+    https_write_all(cfd, &head.ptr[0] as &const byte, head.len) catch {
+        return false;
+    };
+    const w2: !void = https_write_all(cfd, body.ptr as &const byte, body.len);
+    _ = w2 catch {
+        return false;
+    };
+    return true;
+}
+
 // 期望落盘的字节（真实换行 + 真实引号）
 fn esc_content() &byte {
     return "line1\nline2 \"q\" tail" as &byte;
@@ -1383,6 +1407,9 @@ fn mock_server(lfd: i32) i32 {
     if mock_mode == 23 {
         limit = 2;          // 控制字节轮：工具轮（跑出 NUL）→ 断言轮
     }
+    if mock_mode == 24 {
+        limit = 1;          // 诊断回显轮：只服务一次（agent 拿到 400 就该退出）
+    }
     while round < limit {
         // accept 最多等 10 秒：客户端不再发请求时 mock 必须自己退出，
         // 否则「mock 卡在 accept」会变成整个自测卡死（踩过）
@@ -1570,6 +1597,16 @@ fn mock_server(lfd: i32) i32 {
                 verdict = 30;
             }
             buf_free(&errb);
+            buf_free(&rx);
+            _ = sys_close(cfd) catch {};
+            round = round + 1;
+            continue;
+        }
+        if mock_mode == 24 {
+            // 400 + 把收到的请求原样回显（转录里不许出现这段原文）
+            if !mock_send_400_echo(cfd, &rx) {
+                verdict = 34;
+            }
             buf_free(&rx);
             _ = sys_close(cfd) catch {};
             round = round + 1;
@@ -2397,6 +2434,310 @@ fn file_equals(path: &const byte, expect: &const byte) bool {
     return true;
 }
 
+// ============================================================
+// P19：诊断出口 —— 外来字节不许以原文进转录
+//
+// 缘起：网关错误体是**外来字节**：可能是回显请求体的 JSON（里面就有 tools 数组和
+// `\n` 转义）、可能带 NUL/ESC、也可能正好在多字节字符中间被按字节截断
+// （`llm_err_head` 收 240B、`dump_*_error` 收 4096B）。原样打给 fd 2 时 TUI 会把每一行
+// 渲染成带 `· ` 前缀的 NOTICE 行 —— 屏幕上就是「半个汉字 + 一屏 JSON」。
+// 这一轮钉住四件事：转义、字符边界截断、预览有界、全文另有去处（会话日志/落盘）。
+// ============================================================
+
+fn diag_count_byte(p: &const byte, n: usize, c: byte) usize {
+    var i: usize = 0;
+    var k: usize = 0;
+    while i < n {
+        if p[i] == c {
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    return k;
+}
+
+// 除结尾那个换行外，不许有控制字节（NUL / ESC / CR / TAB 都算）
+fn diag_count_ctrl(p: &const byte, n: usize) usize {
+    var i: usize = 0;
+    var k: usize = 0;
+    while i < n {
+        const c: byte = p[i];
+        const tail_nl: bool = i + 1 == n && c == 10 as byte;
+        if (c < 0x20 as byte || c == 0x7f as byte) && !tail_nl {
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    return k;
+}
+
+// 填 n 个「中」（3 字节 / 字），用来测「按字节截断会不会切半个字」
+fn diag_fill_cjk(out: &Buf, chars: usize) void {
+    const cjk: [byte: 3] = [228, 184, 173];
+    buf_reset(out);
+    var i: usize = 0;
+    while i < chars {
+        _ = buf_append(out, &cjk[0], 3);
+        i = i + 1;
+    }
+}
+
+fn diag_read_file(path: &const byte, out: &Buf) bool {
+    buf_reset(out);
+    const fd: i32 = sys_open(path as *const byte, 0 as i32, 0) catch {
+        return false;
+    };
+    defer { _ = sys_close(fd) catch {}; }
+    var tmp: [byte: 4096] = [0: 4096];
+    while true {
+        const n: isize = sys_read(fd, &tmp[0], 4096) catch { 0 as isize; };
+        if n <= 0 {
+            break;
+        }
+        if !buf_append(out, &tmp[0], n as usize) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// 纯函数轮：转义规则 + 字符边界 + 预览形态
+fn diag_round(tag: &const byte) bool {
+    var ok: bool = true;
+    var src: Buf = buf_new(4096);
+    defer { buf_free(&src); }
+    var out: Buf = buf_new(8192);
+    defer { buf_free(&out); }
+
+    // ---- A) cap 落在多字节字符中间：必须在字符边界上停 ----
+    diag_fill_cjk(&src, 200);                       // 600 字节
+    buf_reset(&out);
+    const used: usize = tty_diag_escape_into(&out, src.ptr as &const byte, src.len, 320);
+    if used != 318 {
+        // 320 = 3*106 + 2：只能吃下 106 个整字（318 字节）
+        ty_fail(tag, "cap 没有停在字符边界上（应吃 318 字节）", &ok);
+    }
+    if out.len != used {
+        ty_fail(tag, "合法 UTF-8 应当原样透传", &ok);
+    }
+    if !bufx_utf8_valid(out.ptr as &const byte, out.len) {
+        ty_fail(tag, "截断后的预览不是合法 UTF-8（半个汉字会直接上屏）", &ok);
+    }
+
+    // ---- B) 半截序列 / 孤立续字节 → 逐字节 \xNN ----
+    var half: [byte: 3] = [229, 143, 65];           // 「中」的前两字节 + 'A'
+    buf_reset(&out);
+    _ = tty_diag_escape_into(&out, &half[0], 3, 64);
+    if !bufx_eq_cstr(out.ptr as &const byte, out.len, "\\xe5\\x8fA") {
+        ty_fail(tag, "半截序列没有转义成 \\xNN", &ok);
+    }
+    var lone: [byte: 2] = [143, 65];                // 孤立续字节
+    buf_reset(&out);
+    _ = tty_diag_escape_into(&out, &lone[0], 2, 64);
+    if !bufx_eq_cstr(out.ptr as &const byte, out.len, "\\x8fA") {
+        ty_fail(tag, "孤立续字节漏过去了（终端会渲染成半个字）", &ok);
+    }
+
+    // ---- C) 控制字节 / 换行的转义（NUL、ESC、CR 走 \xNN；TAB 与换行走短转义）----
+    var ctl: [byte: 10] = [97, 0, 98, 27, 91, 50, 74, 99, 13, 10];
+    buf_reset(&out);
+    _ = tty_diag_escape_into(&out, &ctl[0], 10, 64);
+    if !bufx_eq_cstr(out.ptr as &const byte, out.len, "a\\x00b\\x1b[2Jc\\x0d\\n") {
+        ty_fail(tag, "控制字节转义不对", &ok);
+    }
+    var tab: [byte: 3] = [9, 65, 10];
+    buf_reset(&out);
+    _ = tty_diag_escape_into(&out, &tab[0], 3, 64);
+    if !bufx_eq_cstr(out.ptr as &const byte, out.len, "\\tA\\n") {
+        ty_fail(tag, "TAB / 换行的短转义不对", &ok);
+    }
+
+    // ---- D) 合法 U+FFFD 原样留着（别把合法字符也当坏字节）----
+    var repl: [byte: 3] = [239, 191, 189];
+    buf_reset(&out);
+    _ = tty_diag_escape_into(&out, &repl[0], 3, 64);
+    if out.len != 3 || !bufx_mem_eq(out.ptr as &const byte, &repl[0], 3) {
+        ty_fail(tag, "合法 U+FFFD 被当成坏字节转义了", &ok);
+    }
+
+    // ---- E) out_diag：一行预览 + 截断后缀；--debug-dump 落原始字节 ----
+    var cap_path: [byte: 64] = "build/selftest_diag_stderr.txt";
+    var dump_path: [byte: 64] = "build/selftest_diag_dump.bin";
+    const dump_p: &const byte = &dump_path[0] as &const byte;
+    agent_set_debug_dump(dump_p, bufx_cstr_len(dump_p));
+    var payload: Buf = buf_new(4096);
+    defer { buf_free(&payload); }
+    buf_reset(&payload);
+    _ = buf_append_cstr(&payload, "relay-said:\n");
+    diag_fill_cjk(&payload, 200);
+    var cap: Buf = buf_new(8192);
+    defer { buf_free(&cap); }
+    var cfd: i32 = -1;
+    const saved: i32 = vw_cap_on(&cap_path[0] as &const byte, &cfd);
+    out_diag("unit-kind", "body: ", payload.ptr as &const byte, payload.len);
+    vw_cap_off(&cap_path[0] as &const byte, saved, cfd, &cap);
+    agent_set_debug_dump("" as &const byte, 0);
+    if diag_count_byte(cap.ptr as &const byte, cap.len, 10) != 1 {
+        ty_fail(tag, "out_diag 的预览不是一行（换行没转义 → 转录里会铺成一大块）", &ok);
+    }
+    if diag_count_ctrl(cap.ptr as &const byte, cap.len) != 0 {
+        ty_fail(tag, "out_diag 的预览里有裸控制字节", &ok);
+    }
+    if !contains(&cap, "bytes total") {
+        ty_fail(tag, "out_diag 超长时没有截断后缀", &ok);
+    }
+    if cap.len > 512 {
+        ty_fail(tag, "out_diag 预览太长（>512B）", &ok);
+    }
+    var raw: Buf = buf_new(8192);
+    defer { buf_free(&raw); }
+    if !diag_read_file(dump_p, &raw) || raw.len == 0 {
+        ty_fail(tag, "--debug-dump 没有落盘", &ok);
+    } else {
+        const view: &[byte] = raw.ptr[0: raw.len];
+        if find_sub(view, payload.ptr[0: payload.len], 0) < 0 {
+            ty_fail(tag, "--debug-dump 里没有完整原始字节", &ok);
+        }
+    }
+    if ok {
+        out_err("selftest[");
+        out_err(tag);
+        out_err("] ok\n");
+    }
+    return ok;
+}
+
+// 除换行外的控制字节个数（NUL / CR / ESC / TAB 都算）——诊断预览里一个都不许有
+fn diag_count_ctrl_nonl(p: &const byte, n: usize) usize {
+    var i: usize = 0;
+    var k: usize = 0;
+    while i < n {
+        const c: byte = p[i];
+        if (c < 0x20 as byte || c == 0x7f as byte) && c != 10 as byte {
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    return k;
+}
+
+// 转录侧断言（mode 24）：回显进来的外来字节只许以**转义后的有界预览**出现
+fn diag_capture_check(tag: &const byte, cap: &const Buf, ok: &bool) bool {
+    var good: bool = true;
+    const view: &const byte = cap.ptr as &const byte;
+    if cap.len == 0 {
+        ty_fail(tag, "fd 2 上一个字节都没有（诊断根本没打出来）", ok);
+        return false;
+    }
+    if !contains(cap, "model endpoint returned HTTP 400") {
+        ty_fail(tag, "没有打出 HTTP 400 诊断", ok);
+        good = false;
+    }
+    // 回显体里带请求头的 CRLF：必须被转义成 \x0d\x0a（原来会原样进终端/转录）
+    if !contains(cap, "\\x0d") {
+        ty_fail(tag, "回显体里的 CR 没有转义（预览不是终端安全的一行）", ok);
+        good = false;
+    }
+    if diag_count_ctrl_nonl(view, cap.len) != 0 {
+        ty_fail(tag, "诊断里有裸控制字节（NUL/CR/ESC 会直接进终端）", ok);
+        good = false;
+    }
+    if diag_count_byte(view, cap.len, 10) > 6 {
+        ty_fail(tag, "诊断铺成了很多行（外来字节没被限长/转义成一整行）", ok);
+        good = false;
+    }
+    if cap.len > 1024 {
+        ty_fail(tag, "诊断输出太长（>1 KiB）", ok);
+        good = false;
+    }
+    // --debug-dump：原始字节必须完整落盘（这才是「原文另有去处」）
+    var raw: Buf = buf_new(16384);
+    defer { buf_free(&raw); }
+    if !diag_read_file("build/selftest_diag_dump.bin" as &const byte, &raw) || raw.len == 0 {
+        ty_fail(tag, "--debug-dump 没有落盘", ok);
+        good = false;
+    } else if !contains(&raw, "POST /v1/chat/completions") {
+        ty_fail(tag, "--debug-dump 里没有完整原文（原始字节该留着）", ok);
+        good = false;
+    }
+    return good;
+}
+
+// 会话日志侧断言：转义后的完整原文落在 diag/dump 事件里；日志里没有裸控制字节
+fn diag_log_check(tag: &const byte, home: &const byte, ws: &const byte, ok: &bool) bool {
+    var path: Buf = buf_new(1200);
+    defer { buf_free(&path); }
+    if !sess_find_last(home, ws, &path) {
+        ty_fail(tag, "找不到刚跑完的会话（会话日志没落盘？）", ok);
+        return false;
+    }
+    if !buf_append_byte(&path, 0) {
+        ty_fail(tag, "路径缓冲不够补 NUL", ok);
+        return false;
+    }
+    path.len = path.len - 1;
+    var r: SessReader = sess_reader_empty();
+    defer { sess_reader_free(&r); }
+    if !sess_reader_load(path.ptr as &const byte, &r) {
+        ty_fail(tag, "会话日志读不出来", ok);
+        return false;
+    }
+    var line: Buf = buf_new(65536);
+    defer { buf_free(&line); }
+    var typ: Buf = buf_new(64);
+    defer { buf_free(&typ); }
+    var txt: Buf = buf_new(65536);
+    defer { buf_free(&txt); }
+    var kind: Buf = buf_new(64);
+    defer { buf_free(&kind); }
+    var seen: usize = 0;
+    var has_esc: bool = false;
+    var has_raw: bool = false;
+    var has_ctrl: bool = false;
+    while sess_next(&r, &line) {
+        buf_reset(&typ);
+        if !sess_line_type(&line, &typ) {
+            continue;
+        }
+        if !sv_eq_cstr(&typ, "diag/dump") {
+            continue;
+        }
+        seen = seen + 1;
+        buf_reset(&kind);
+        _ = sess_json_str(line.ptr[0: line.len], "kind", &kind);
+        buf_reset(&txt);
+        if sess_json_str(line.ptr[0: line.len], "text", &txt) {
+            const tv: &const byte = txt.ptr as &const byte;
+            if contains(&txt, "\\x0d") {
+                has_esc = true;
+            }
+            if contains(&txt, "POST /v1/chat/completions") {
+                has_raw = true;
+            }
+            if diag_count_ctrl_nonl(tv, txt.len) != 0 {
+                has_ctrl = true;
+            }
+        }
+    }
+    if seen == 0 {
+        ty_fail(tag, "会话日志里没有 diag/dump 事件（完整原文丢了）", ok);
+        return false;
+    }
+    if !has_esc {
+        ty_fail(tag, "diag/dump 的文本里没有转义痕迹（该是转义后的一行）", ok);
+        return false;
+    }
+    if !has_raw {
+        ty_fail(tag, "diag/dump 里没有完整原文（截断到转录那份了就丢信息）", ok);
+        return false;
+    }
+    if has_ctrl {
+        ty_fail(tag, "diag/dump 的文本里还有裸控制字节（会话日志会被写坏）", ok);
+        return false;
+    }
+    return true;
+}
+
 fn selftest_round(base: &const Config, tag: &const byte, mode: i32, allow_shell: bool, ws: &const byte, stream: bool, fold: bool, steer: bool, interrupt: bool) bool {
     mock_mode = mode;
     mock_expect_shell = allow_shell;
@@ -2497,7 +2838,22 @@ fn selftest_round(base: &const Config, tag: &const byte, mode: i32, allow_shell:
         var ctrl_c: [byte: 1] = [3: 1];
         tty_feed(&tty_ui, &ctrl_c[0], 1);
     }
+    // 诊断轮（24）：把 fd 2 抓进文件，跑完逐字节断言「到底往转录里打了什么」
+    var cap_text: Buf = buf_new(16384);
+    var cfd: i32 = -1;
+    var cap_saved: i32 = -1;
+    if mode == 24 {
+        var cap_path: [byte: 64] = "build/selftest_diag_stderr.txt";
+        cap_saved = vw_cap_on(&cap_path[0] as &const byte, &cfd);
+        agent_set_debug_dump("build/selftest_diag_dump.bin" as &const byte,
+            bufx_cstr_len("build/selftest_diag_dump.bin" as &const byte));
+    }
     const rc: i32 = agent_run(&c);
+    if mode == 24 {
+        var cap_path: [byte: 64] = "build/selftest_diag_stderr.txt";
+        vw_cap_off(&cap_path[0] as &const byte, cap_saved, cfd, &cap_text);
+        agent_set_debug_dump("" as &const byte, 0);
+    }
     g_interactive = false;
     inbox_globals_free();
     cfg_free(&c);
@@ -2526,8 +2882,17 @@ fn selftest_round(base: &const Config, tag: &const byte, mode: i32, allow_shell:
         }
         buf_free(&esc_path);
     }
+    if mode == 24 {
+        // 诊断轮：转录（fd 2）里只许有**一行转义预览**，不许出现回显进来的请求体
+        if !diag_capture_check(tag, &cap_text, &ok) {
+            ok = false;
+        }
+        if !diag_log_check(tag, "build/selftest_agent_home" as &const byte, ws, &ok) {
+            ok = false;
+        }
+    }
     var expect_rc: i32 = AGENT_OK;
-    if mode == 3 || mode == 5 {
+    if mode == 3 || mode == 5 || mode == 24 {
         expect_rc = AGENT_PROTO;
     }
     if interrupt {
@@ -7966,13 +8331,19 @@ export fn selftest_main(base: &const Config) i32 {
     const x15: bool = round_run_api(base, "responses-fallback", "build/selftest_ws_resp_fb", 21, 0 as i64, 4, LLM_STYLE_RESPONSES, true, "用 bash 跑 echo RESPONSES-FALLBACK-OK 并只回答这一行");
     // responses 下的自动压缩（摘要请求 + 压缩后的请求都得走 /v1/responses）
     const x16: bool = round_run_api(base, "responses-compact", "build/selftest_ws_resp_ck", 22, 200 as i64, 4, LLM_STYLE_RESPONSES, false, "触发自动压缩");
+    // P19：诊断出口 —— 外来字节（回显型网关的 400 错误体）不许以原文进转录；
+    // 完整原文（转义后）落会话日志 diag/dump，原始字节走 --debug-dump。
+    const z0: bool = diag_round("diag-preview");
+    const z1: bool = selftest_round(base, "diag-echo-400", 24, true, "build/selftest_ws_diag", true, false, false, false);
+    // 非流式路径走的是另一个出口（dump_http_error，本来会打 4096 B 原文）
+    const z2: bool = selftest_round(base, "diag-echo-400-ns", 24, true, "build/selftest_ws_diag_ns", false, false, false, false);
     // P0/P1：信号层（src/sigx.uya）—— glibc 布局、处理器真的被调用、SIGTERM 先恢复终端、
     // fork 子进程重置处置；轮次实现都在 src/sigselftest.uya 里
     const y0: bool = sigx_selftest_all();
     // P17：全屏 TUI（排版 / 按键 / 显示收口 / headless 端到端 / 真 PTY）
     const y1: bool = tui_selftest_all();
     if r1 && r2 && r3 && r4 && r5 && r5b && r6 && r7 && r8 && r9 && s0 && s1 && s2 && s3 && s4 && t0 && t1 && t2 && t3 && t4 && t5 && t6 && t7 && t8 && t9 && t10 && t11 && u0 && u1 && u2 && u3 && v0 && v1 && v2 && v3 && v4 && v5 && v6 && v7 && r1r && y0 && y1
-        && x0 && x1 && x2 && x3 && x4 && x5 && x6 && x7 && x8 && x9 && x10 && x11 && x12 && x13 && x14 && x15 && x16 {
+        && x0 && x1 && x2 && x3 && x4 && x5 && x6 && x7 && x8 && x9 && x10 && x11 && x12 && x13 && x14 && x15 && x16 && z0 && z1 && z2 {
         out_err("SELFTEST PASS\n");
         return AGENT_OK;
     }

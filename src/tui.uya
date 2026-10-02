@@ -1333,13 +1333,14 @@ struct TuiEntry {
     wrap_lines: usize,
     wrap_valid: bool,
     streaming: bool,
+    notice_full: bool,      // NOTICE 已到上限（不再累积，只留过一行截断提示）
 }
 
 var g_tui_entries: [TuiEntry: TUI_MAX_ENTRIES] = [TuiEntry{
     kind: 0,
     text: Buf{ ptr: null, len: 0, cap: 0 },
     wrap: Buf{ ptr: null, len: 0, cap: 0 },
-    wrap_width: 0, wrap_lines: 0, wrap_valid: false, streaming: false
+    wrap_width: 0, wrap_lines: 0, wrap_valid: false, streaming: false, notice_full: false
 }: TUI_MAX_ENTRIES];
 var g_tui_nent: usize = 0;          // 已用条目数（环形）
 var g_tui_estart: usize = 0;        // 环形起点
@@ -1399,6 +1400,49 @@ fn tui_entry_init(e: &TuiEntry, kind: u8) void {
     e.wrap_lines = 0;
     e.wrap_valid = false;
     e.streaming = false;
+    e.notice_full = false;
+}
+
+// ============================================================
+// NOTICE 条目：诊断（fd 2）的落点，也是「乱码」最容易灌屏的地方
+//
+// 外来字节再大也只占几行：文本到 TUI_NOTICE_MAX 就停，补一行截断提示。
+// 全文在会话日志的 diag/dump 里（agent.uya::agent_diag_log），要看原始字节开
+// --debug-dump。没有这个上限时，一条 4 KiB 的网关错误体就能把整屏转录冲掉。
+// ============================================================
+const TUI_NOTICE_MAX: usize = 512;
+const TUI_NOTICE_CUT: &const byte = "\n…（诊断已截断，全文见会话日志 diag/dump 与 --debug-dump）";
+
+fn tui_notice_append(e: &TuiEntry, p: &const byte, n: usize) void {
+    if e.notice_full || n == 0 {
+        return;
+    }
+    var take: usize = n;
+    var clipped: bool = false;
+    if e.text.len >= TUI_NOTICE_MAX {
+        take = 0;
+        clipped = true;
+    } else if e.text.len + take > TUI_NOTICE_MAX {
+        take = TUI_NOTICE_MAX - e.text.len;
+        clipped = true;
+    }
+    if take > 0 {
+        tui_entry_append(e, p, take);
+    }
+    if clipped {
+        e.notice_full = true;
+        tui_entry_append(e, TUI_NOTICE_CUT, bufx_cstr_len(TUI_NOTICE_CUT));
+    }
+}
+
+// 诊断一行结束后的换行（已到上限的条目不再补，免得把截断提示顶下去）
+fn tui_notice_newline(e: &TuiEntry) void {
+    if e.notice_full {
+        return;
+    }
+    if buf_append_byte(&e.text, 10) {
+        g_tui_text_total = g_tui_text_total + 1;
+    }
 }
 
 // 丢最老的一条（环形前进）
@@ -1461,13 +1505,17 @@ fn tui_pend_ensure() void {
 }
 
 // ============================================================
-// 清洗：控制字节 / ESC 序列 / TAB
+// 清洗：控制字节 / ESC 序列 / TAB / 非法 UTF-8
 //
 // 工具输出里什么都可能有（NUL、彩色转义、`ESC[2J`）。正文层必须是纯文本：
 //   * ESC 起始的 CSI/OSC 序列整段吃掉，只留一个 ␛（告诉人「这里原来有转义」）
 //   * 其余控制字节（0x00-0x1f 除了 \n、0x7f）→ ·
 //   * TAB → 四个空格（正文层里没有 TAB，宽度算得准）
+//   * 非法 / 半截 UTF-8 → U+FFFD（EF BF BD，1 列；见下面 tui_clean_into）
 // ============================================================
+
+// U+FFFD（替换字符）：数组字面量，避免「切片描述符 → char*」强转（踩坑 22）
+const g_tui_repl: [byte: 3] = [239, 191, 189];
 
 export fn tui_clean_into(dst: &Buf, p: &const byte, n: usize) void {
     var i: usize = 0;
@@ -1519,6 +1567,30 @@ export fn tui_clean_into(dst: &Buf, p: &const byte, n: usize) void {
         if c < 0x20 as byte || c == 0x7f as byte {
             _ = buf_append(dst, "·" as &const byte, 2);
             i = i + 1;
+            continue;
+        }
+        if c >= 0x80 as byte {
+            // 非法 / 半截 UTF-8 → U+FFFD（1 列）。不换的话终端自己渲染半个字符，
+            // 而且它的列宽和我们算的不一致（tty_char_cols 按 1 列算）→ 整行错位。
+            // 孤立续字节也要换掉：tty_utf8_decode 对它会返回字节本身而不是 U+FFFD，
+            // 所以先按 tty_utf8_len 判「合法引导字节 + 长度对不对」。
+            const need: usize = tty_utf8_len(c);
+            const step: usize = tty_utf8_next(p, i, n) - i;
+            var good: bool = need > 1 && step == need;
+            if good {
+                const cp: u32 = tty_utf8_decode(p, i, n);
+                if cp == 0xFFFD {
+                    good = step == 3 && c == 239 as byte
+                        && p[i + 1] == 191 as byte && p[i + 2] == 189 as byte;
+                }
+            }
+            if good {
+                _ = buf_append(dst, p + i, step);
+                i = i + step;
+            } else {
+                _ = buf_append(dst, &g_tui_repl[0], 3);
+                i = i + 1;
+            }
             continue;
         }
         _ = buf_append_byte(dst, c);
@@ -1733,14 +1805,19 @@ fn tui_sink_reason(p: &const byte, n: usize) void {
     const e2: &TuiEntry = tui_entry_at(idx as usize);
     tui_entry_append(e2, p, n);
     if e2.text.len > TUI_REASON_TAIL {
-        const cut: usize = e2.text.len - TUI_REASON_TAIL;
+        var cut: usize = e2.text.len - TUI_REASON_TAIL;
+        // 切点必须落在字符边界上：否则思考条目会以**半个汉字**开头
+        // （终端渲染成替换符、列宽也跟着错位 —— 屏幕上就是乱码）
+        while cut < e2.text.len && tty_is_cont(e2.text.ptr[cut]) {
+            cut = cut + 1;
+        }
         // 从尾部保留：把尾部搬到头部
         var k: usize = 0;
-        while k < TUI_REASON_TAIL {
+        while k + cut < e2.text.len {
             e2.text.ptr[k] = e2.text.ptr[cut + k];
             k = k + 1;
         }
-        buf_truncate(&e2.text, TUI_REASON_TAIL);
+        buf_truncate(&e2.text, k);
         e2.wrap_valid = false;
     }
 }
@@ -1776,18 +1853,22 @@ fn tui_sink_line(p: &const byte, n: usize) void {
     const lastk: u8 = tui_last_kind();
     if is_indent && (lastk == TUI_E_TOOL || lastk == TUI_E_NOTICE) {
         const e2: &TuiEntry = tui_entry_at(g_tui_nent - 1);
-        tui_entry_append(e2, p, n);
-        _ = buf_append_byte(&e2.text, 10);
-        g_tui_text_total = g_tui_text_total + 1;
+        if lastk == TUI_E_NOTICE {
+            tui_notice_append(e2, p, n);
+            tui_notice_newline(e2);
+        } else {
+            tui_entry_append(e2, p, n);
+            _ = buf_append_byte(&e2.text, 10);
+            g_tui_text_total = g_tui_text_total + 1;
+        }
         return;
     }
     if (lastk == TUI_E_NOTICE || lastk == TUI_E_TOOL) && !is_indent {
         // 新的一行诊断：接到上一条 NOTICE 后面（连续若干行），工具块则新起一条
         if lastk == TUI_E_NOTICE {
             const e3: &TuiEntry = tui_entry_at(g_tui_nent - 1);
-            tui_entry_append(e3, p, n);
-            _ = buf_append_byte(&e3.text, 10);
-            g_tui_text_total = g_tui_text_total + 1;
+            tui_notice_append(e3, p, n);
+            tui_notice_newline(e3);
             return;
         }
     }
@@ -1796,9 +1877,8 @@ fn tui_sink_line(p: &const byte, n: usize) void {
         return;
     }
     const e4: &TuiEntry = tui_entry_at(idx4 as usize);
-    tui_entry_append(e4, p, n);
-    _ = buf_append_byte(&e4.text, 10);
-    g_tui_text_total = g_tui_text_total + 1;
+    tui_notice_append(e4, p, n);
+    tui_notice_newline(e4);
 }
 
 // ---- 外部写入接口（agent / view / askuser 用）----
@@ -1827,10 +1907,11 @@ export fn tui_add_notice(p: &const byte, n: usize) void {
         return;
     }
     const e: &TuiEntry = tui_entry_at(idx as usize);
-    tui_entry_append(e, p, n);
-    _ = buf_append_byte(&e.text, 10);
-    g_tui_text_total = g_tui_text_total + 1;
+    tui_notice_append(e, p, n);
+    tui_notice_newline(e);
 }
+
+// 工具块：view.uya 用现成的纯函数 view_render_block() 生成文本后整块交进来
 
 // 工具块：view.uya 用现成的纯函数 view_render_block() 生成文本后整块交进来
 export fn tui_add_tool_block(p: &const byte, n: usize) void {

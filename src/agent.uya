@@ -316,6 +316,131 @@ fn out_err_dec(v: usize) void {
     out_err_bytes(&rev[0], k);
 }
 
+// ============================================================
+// 诊断出口（**唯一**）
+//
+// 诊断打的是外来字节（网关错误体 / 坏 payload 头部 / 网关错误消息）：既可能夹带控制
+// 字节（含 ESC），也可能正好被按**字节**截断在多字符中间。原样 out_err_bytes 打出去
+// 就是屏幕上那串乱码（半个汉字 + 一屏 JSON），因为 TUI 会把 fd 2 的每一行都渲染成
+// 带 `· ` 前缀的 NOTICE 行（通道 2 → tui_sink_line）。所以：
+//   * 转录（fd 2）只留 DIAG_PREVIEW_MAX 字节的**转义预览** + 「… N bytes total」后缀，
+//     整条只有一行（规则表见 tty.uya::tty_diag_escape_into）；
+//   * 完整原文（同样转义）进会话日志 `diag/dump` —— 会话日志因此永远是合法 UTF-8；
+//   * `--debug-dump <file>` 额外把**原始字节**追加落盘（要二进制现场时才开）。
+// ============================================================
+const DIAG_PREVIEW_MAX: usize = 320;
+const DIAG_LOG_MAX: usize = 65536;
+
+var g_diag_dump: Buf = Buf{ ptr: null, len: 0, cap: 0 };   // --debug-dump 的落盘路径（空 = 不落盘）
+
+export fn agent_set_debug_dump(path: &const byte, n: usize) void {
+    if !buf_valid(&g_diag_dump) {
+        g_diag_dump = buf_new(n + 8);
+    }
+    buf_reset(&g_diag_dump);
+    if n > 0 {
+        _ = buf_append(&g_diag_dump, path, n);
+        // 每次设置路径都清掉旧文件：落盘的是「这一次」的现场（追加式写入会让
+        // 上一次的字节混进来，自测里就会变成「断言被旧文件满足」的假绿）
+        var z: Buf = buf_new(n + 1);
+        defer { buf_free(&z); }
+        if buf_append(&z, path, n) {
+            _ = buf_append_byte(&z, 0);
+            _ = sys_unlink(&z.ptr[0] as *const byte) catch {};
+        }
+    }
+}
+
+export fn agent_debug_dump() &const Buf {
+    return &g_diag_dump;
+}
+
+// 完整原文 → 会话日志（转义后进：日志里永远没有裸控制字节，也没有半个字符）
+fn agent_diag_log(kind: &const byte, p: &const byte, n: usize, used: usize) void {
+    if !g_sess.save {
+        return;
+    }
+    var text: Buf = buf_new(n + 16);
+    defer { buf_free(&text); }
+    _ = tty_diag_escape_into(&text, p, n, DIAG_LOG_MAX);
+    var ev: Buf = buf_new(text.len + 256);
+    defer { buf_free(&ev); }
+    if !sess_begin(&g_sess, "diag/dump", &ev) {
+        return;
+    }
+    const kn: usize = bufx_cstr_len(kind);
+    _ = buf_append_cstr(&ev, "{\"kind\":");
+    _ = jw_str_into(&ev, kind, kn);
+    _ = buf_append_cstr(&ev, ",\"bytes\":");
+    _ = buf_append_i64(&ev, n as i64);
+    _ = buf_append_cstr(&ev, ",\"truncated\":");
+    if used < n {
+        _ = buf_append_cstr(&ev, "true");
+    } else {
+        _ = buf_append_cstr(&ev, "false");
+    }
+    _ = buf_append_cstr(&ev, ",\"text\":");
+    _ = jw_str_into(&ev, text.ptr as &const byte, text.len);
+    _ = buf_append_cstr(&ev, "}");
+    _ = sess_end(&g_sess, &ev);
+}
+
+// 原始字节 → --debug-dump 文件（默认关；开了才写）
+fn agent_diag_file(kind: &const byte, p: &const byte, n: usize) void {
+    if !buf_valid(&g_diag_dump) || g_diag_dump.len == 0 {
+        return;
+    }
+    var path: Buf = buf_new(g_diag_dump.len + 1);
+    defer { buf_free(&path); }
+    _ = buf_append(&path, g_diag_dump.ptr, g_diag_dump.len);
+    _ = buf_append_byte(&path, 0);
+    const flags: i32 = (O_WRONLY | O_CREAT | O_APPEND) as i32;
+    const fd: i32 = sys_open(&path.ptr[0] as *const byte, flags, 420 as u32) catch {
+        return;
+    };
+    defer { _ = sys_close(fd) catch {}; }
+    var head: Buf = buf_new(192);
+    defer { buf_free(&head); }
+    _ = buf_append_cstr(&head, "=== ");
+    _ = buf_append(&head, kind, bufx_cstr_len(kind));
+    _ = buf_append_cstr(&head, " ");
+    _ = buf_append_i64(&head, n as i64);
+    _ = buf_append_cstr(&head, " bytes ===\n");
+    _ = write_all_fd(fd, head.ptr as &const byte, head.len);
+    if n > 0 {
+        _ = write_all_fd(fd, p, n);
+    }
+    if n == 0 || p[n - 1] != 10 as byte {
+        _ = write_all_fd(fd, "\n" as &const byte, 1);
+    }
+}
+
+// 诊断打印入口：一行转义预览 + 截断后缀；全文进日志（+ 可选落盘）
+fn out_diag(kind: &const byte, label: &const byte, p: &const byte, n: usize) void {
+    var prev: Buf = buf_new(DIAG_PREVIEW_MAX + 8);
+    if !buf_valid(&prev) {
+        out_err(label);
+        out_err("(out of memory)\n");
+        return;
+    }
+    defer { buf_free(&prev); }
+    const used: usize = tty_diag_escape_into(&prev, p, n, DIAG_PREVIEW_MAX);
+    out_err(label);
+    if n == 0 {
+        out_err("(0 bytes)");
+    } else {
+        out_err_bytes(prev.ptr as &const byte, prev.len);
+        if used < n {
+            out_err(" … ");
+            out_err_dec(n);
+            out_err(" bytes total");
+        }
+    }
+    out_err("\n");
+    agent_diag_log(kind, p, n, used);
+    agent_diag_file(kind, p, n);
+}
+
 // lib/tls 会把握手过程直接写到 fd 2（https_debug/hs_debug），
 // 对一个 CLI 来说太吵；这里在发请求期间把 stderr 暂时指向 /dev/null，
 // 自己的诊断信息都在静音窗口之外打印。--tls-debug 可关闭静音。
@@ -2259,14 +2384,8 @@ fn dump_http_error(status: i32, body: &const Buf) void {
     out_err("model endpoint returned HTTP ");
     out_err_dec(status as usize);
     out_err("\n");
-    var n: usize = body.len;
-    if n > 4096 {
-        n = 4096;
-    }
-    if n > 0 {
-        out_err_bytes(body.ptr, n);
-        out_err("\n");
-    }
+    // 外来字节走唯一诊断出口：转义 + 字符边界截断 + 限长（原文进日志 / --debug-dump）
+    out_diag("http-error-body", "body: ", body.ptr as &const byte, body.len);
 }
 
 // ============================================================
@@ -2333,14 +2452,8 @@ fn dump_stream_error(cfg: &const Config, status: i32, body: &const Buf) void {
     out_err("model endpoint returned HTTP ");
     out_err_dec(status as usize);
     out_err("\n");
-    var n: usize = body.len;
-    if n > 4096 {
-        n = 4096;
-    }
-    if n > 0 {
-        out_err_bytes(body.ptr, n);
-        out_err("\n");
-    }
+    // 同 dump_http_error：流式路径的非 2xx 体也一律走转义预览（原文进日志）
+    out_diag("http-error-body", "body: ", body.ptr as &const byte, body.len);
 }
 
 fn print_usage_line(o: &const ChatOut) void {
@@ -2549,9 +2662,8 @@ fn agent_step_stream(cfg: &const Config, style: u8, url: &const Buf, hdrs: &cons
     }
 
     if err_kind == 1 {
-        out_err("error: malformed SSE payload: ");
-        out_err_bytes(o.err_text.ptr, o.err_text.len);
-        out_err("\n");
+        // 坏 payload 的头部：走唯一诊断出口（不把裸字节刷进转录）
+        out_diag("malformed-sse-payload", "error: malformed SSE payload: ", o.err_text.ptr as &const byte, o.err_text.len);
         return AGENT_PROTO;
     }
     if err_kind == 2 {
@@ -2593,9 +2705,8 @@ fn agent_finish_step(cfg: &const Config, arena: &Arena, h: &History, step: i32, 
         print_usage_line(o);
     }
     if o.finish == LLM_FINISH_ERROR {
-        out_err("model/gateway error: ");
-        out_err_bytes(o.err_text.ptr, o.err_text.len);
-        out_err("\n");
+        // 网关消息同样是外来字节：转义 + 限长（原来是无上限原样打印）
+        out_diag("gateway-error", "model/gateway error: ", o.err_text.ptr as &const byte, o.err_text.len);
         return AGENT_PROTO;
     }
 
@@ -2866,12 +2977,7 @@ fn agent_step_plain(cfg: &const Config, style: u8, url: &const Buf, hdrs: &const
     var root: JsonValue = JsonValue.json_null();
     if !js_parse(arena, body_copy, resp_len, &root) {
         out_err("error: cannot parse model response as JSON\n");
-        var nb0: usize = resp_len;
-        if nb0 > 1024 {
-            nb0 = 1024;
-        }
-        out_err_bytes(body_copy as &const byte, nb0);
-        out_err("\n");
+        out_diag("non-json-body", "body: ", body_copy as &const byte, resp_len);
         return AGENT_PROTO;
     }
 
@@ -3398,24 +3504,13 @@ fn agent_dry_run(cfg: &const Config) i32 {
     out_err(" request_bytes=");
     out_err_dec(req.len);
     out_err("\n");
-    var i: usize = 0;
-    while i < req.len {
-        const c: byte = req.ptr[i];
-        if c == 0 as byte {
-            out_err("\\x00");
-        } else if c == 10 as byte {
-            out_err("\\n");
-        } else if c == 9 as byte {
-            out_err("\\t");
-        } else if c < 32 as byte || c > 126 as byte {
-            const hexd: &[byte] = &"0123456789abcdef"[0: 16];
-            out_err("\\x");
-            out_err_bytes(&hexd[((c as i32) >> 4) as usize], 1);
-            out_err_bytes(&hexd[((c as i32) & 15) as usize], 1);
-        } else {
-            out_err_bytes(&req.ptr[i], 1);
-        }
-        i = i + 1;
+    // 与诊断出口同一套转义（tty.uya::tty_diag_escape_into）：不可打印字节转义成 \xNN，
+    // 便于找 NUL 之类的脏字节。dry-run 要看**整条**请求体，所以 cap 开到最大展开长度。
+    var esc: Buf = buf_new(req.len * 4 + 16);
+    defer { buf_free(&esc); }
+    if buf_valid(&esc) {
+        _ = tty_diag_escape_into(&esc, req.ptr as &const byte, req.len, req.len * 4);
+        out_err_bytes(esc.ptr as &const byte, esc.len);
     }
     out_err("\n");
     return AGENT_OK;
@@ -3711,6 +3806,8 @@ fn print_usage() void {
     out_err("                      TUI=额外把思考收进转录条目（TUI 的状态区默认已有实时一行）\n");
     out_err("  --show-usage        每轮打印 token 用量（in/out/cache/reasoning）\n");
     out_err("  --tool-lines N      工具正文：默认 0 = 只留一行；N>0 = 首尾各 N 行（含 diff/todo 清单）\n");
+    out_err("  --debug-dump FILE   诊断原文（网关错误体/坏 payload 等）以**原始字节**追加落盘；\n");
+    out_err("                      默认关：转录里只有转义预览，全文仍进会话日志 diag/dump\n");
     out_err("  --max-tokens N      发送 max_tokens（默认不发送）\n");
     out_err("  --temperature N     发送 temperature 0..N（默认不发送）\n");
     out_err("  --agent-home DIR    会话/索引存放根目录，默认 ~/.uya-agent\n");
@@ -4573,6 +4670,13 @@ fn agent_print_config(cfg: &const Config, dsh: &const DshCfg) void {
     } else {
         out_err("false\n");
     }
+    out_err("debug_dump = ");
+    if buf_valid(&g_diag_dump) && g_diag_dump.len > 0 {
+        out_err_bytes(g_diag_dump.ptr as &const byte, g_diag_dump.len);
+        out_err("  (raw diagnostic bytes appended here)\n");
+    } else {
+        out_err("(off; transcript keeps an escaped preview, session log keeps diag/dump)\n");
+    }
     out_err("confine = ");
     if cfg.confine {
         out_err("true");
@@ -5004,6 +5108,12 @@ export fn main() i32 {
             i = i + 1;
             if i < get_argc() {
                 cfg.tool_lines = parse_i32_nonneg(get_argv(i), 6);
+            }
+        } else if arg_eq(p, "--debug-dump") {
+            i = i + 1;
+            if i < get_argc() {
+                const dv: &byte = get_argv(i);
+                agent_set_debug_dump(dv as &const byte, bufx_cstr_len(dv as &const byte));
             }
         } else if arg_eq(p, "--quiet") {
             cfg.quiet = true;
