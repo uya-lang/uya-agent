@@ -1,0 +1,283 @@
+// src/sigx.uya — 信号层（P0）
+//
+// 为什么不用 `libc.signal.signal`：
+//   uya 0.10 / 1.0 的 signal() 自己走裸 rt_sigaction，传的是 `sa_flags = 0`、
+//   `sa_restorer = null`。x86-64 上内核交付信号时要用 sa_restorer 里的 rt_sigreturn
+//   垫片（glibc/musl 一律置 SA_RESTORER = 0x04000000 并指向自己的垫片），缺了它
+//   处理器体一次都不会执行、进程直接以 SIGSEGV(139) 退出 —— 本项目实测复现过
+//   （见 README 踩坑 20/28）。
+//   该缺陷已在 uya 项目侧修复（uya 仓库 commit fad26acd，lib/libc/signal.uya 与 0.11
+//   的同名实现对齐）。**本项目仍然走自己的路径**：绑定宿主 glibc 的 sigaction，
+//   让宿主负责 SA_RESTORER 与掩码翻译，这样在没修过的工具链上也能工作。
+//
+// 本模块提供三件事（都只依赖 libc.syscall 与 glibc 的 sigaction 符号）：
+//   1) 终止类信号（TERM/INT/HUP/PIPE）→ **先恢复终端再退出**（备用屏幕 + termios）；
+//   2) SIGWINCH → 只置一个标志，主循环取用后立刻重排；
+//   3) fork 出来的子进程用 `sigx_reset_for_child()` 把处置恢复成默认（否则子进程
+//      收到信号会去写父进程的终端）。
+//
+// 处理器里只允许异步信号安全的东西：`sys_write` / `sys_ioctl` / `sys_exit`，
+// 数据全部来自启动时填好的**静态数组**（不分配、不用 Buf、不打印）。
+
+use libc.syscall;
+use libc.unistd;
+
+const SIGX_TCGETS: i64 = 0x5401;
+const SIGX_TCSETS: i64 = 0x5402;
+
+export const SIGX_SIGHUP: i32 = 1;
+export const SIGX_SIGINT: i32 = 2;
+export const SIGX_SIGPIPE: i32 = 13;
+export const SIGX_SIGTERM: i32 = 15;
+export const SIGX_SIGUSR1: i32 = 10;
+export const SIGX_SIGWINCH: i32 = 28;
+
+// glibc 的 struct sigaction（x86-64）：handler(8) + mask(128) + flags(4)+pad(4) + restorer(8)
+// 注意：这是**宿主 glibc** 的布局，不是内核 rt_sigaction 的布局 —— 我们不碰裸系统调用。
+export struct SigxAction {
+    handler: &void,
+    mask: [byte: 128],
+    flags: i32,
+    pad: i32,
+    restorer: &void,
+}
+
+extern "libc" fn sigaction(sig: i32, act: &const SigxAction, old: &SigxAction) i32;
+
+const SIGX_SA_RESTART: i32 = 0x10000000;
+const SIGX_TERMIOS_SIZE: usize = 64;
+const SIGX_SEQ_MAX: usize = 32;
+
+// ---- 处理器要用的静态状态（启动时填好，处理器只读）----
+var g_sigx_armed: bool = false;                 // 是否登记过恢复信息
+var g_sigx_alt: bool = false;                   // 是否在备用屏幕
+var g_sigx_out_fd: i32 = -1;                    // 输出 fd（TUI 的私有 dup）
+var g_sigx_have_termios: bool = false;
+var g_sigx_termios: [byte: SIGX_TERMIOS_SIZE] = [0: SIGX_TERMIOS_SIZE];
+var g_sigx_seq: [byte: SIGX_SEQ_MAX] = [0: SIGX_SEQ_MAX];
+var g_sigx_seq_len: usize = 0;
+
+// ---- 观测用 ----
+var g_sigx_winch: bool = false;
+var g_sigx_term_hits: usize = 0;
+var g_sigx_winch_hits: usize = 0;
+var g_sigx_term_installed: bool = false;
+var g_sigx_winch_installed: bool = false;
+var g_sigx_last_err: i32 = 0;
+
+fn sigx_addr(p: &const void) i64 {
+    return (@usize_from_ptr(p)) as i64;
+}
+
+// ============================================================
+// 安装 / 卸载
+// ============================================================
+
+// 装一个处理器；handler == null 表示恢复默认处置（SIG_DFL）。返回 0 成功。
+export fn sigx_set(sig: i32, handler: &void) i32 {
+    var act: SigxAction = SigxAction{
+        handler: handler,
+        mask: [0: 128],
+        flags: SIGX_SA_RESTART,
+        pad: 0,
+        restorer: null,
+    };
+    const r: i32 = sigaction(sig, &act, null as &SigxAction);
+    if r != 0 {
+        g_sigx_last_err = r;
+    }
+    return r;
+}
+
+// 处理器里只做：恢复 termios → 写「离开备用屏幕」的序列 → 退出（128+sig）
+export fn sigx_on_term(sig: i32) void {
+    g_sigx_term_hits = g_sigx_term_hits + 1;
+    if g_sigx_armed {
+        if g_sigx_have_termios {
+            _ = sys_ioctl(0, SIGX_TCSETS, sigx_addr(&g_sigx_termios[0] as &const void)) catch {};
+        }
+        if g_sigx_out_fd >= 0 && g_sigx_seq_len > 0 {
+            _ = sys_write(g_sigx_out_fd, &g_sigx_seq[0] as *const byte, g_sigx_seq_len) catch {};
+        }
+    }
+    sys_exit(128 + sig);
+}
+
+export fn sigx_on_winch(sig: i32) void {
+    g_sigx_winch_hits = g_sigx_winch_hits + 1;
+    g_sigx_winch = true;
+}
+
+// 保存「原始终端属性」（进入 raw 模式**之前**调用；处理器用它把终端还原回去）
+export fn sigx_capture_termios(fd: i32) bool {
+    var zero: [byte: SIGX_TERMIOS_SIZE] = [0: SIGX_TERMIOS_SIZE];
+    var i: usize = 0;
+    while i < SIGX_TERMIOS_SIZE {
+        g_sigx_termios[i] = zero[i];
+        i = i + 1;
+    }
+    const r: !i32 = sys_ioctl(fd, SIGX_TCGETS, sigx_addr(&g_sigx_termios[0] as &const void));
+    const rc: i32 = r catch { -1; };
+    g_sigx_have_termios = rc == 0;
+    return g_sigx_have_termios;
+}
+
+// 登记「退出时怎么把终端还回去」：输出 fd + 是否在备用屏幕。
+// 序列固定为：关闭括起粘贴 → 复位属性 → 显示光标 →（可选）离开备用屏幕。
+export fn sigx_arm(out_fd: i32, alt: bool) void {
+    g_sigx_out_fd = out_fd;
+    g_sigx_alt = alt;
+    var k: usize = 0;
+    // ESC[?2004l
+    g_sigx_seq[k] = 27; k = k + 1;
+    g_sigx_seq[k] = 91; k = k + 1;
+    g_sigx_seq[k] = 63; k = k + 1;
+    g_sigx_seq[k] = 50; k = k + 1;
+    g_sigx_seq[k] = 48; k = k + 1;
+    g_sigx_seq[k] = 48; k = k + 1;
+    g_sigx_seq[k] = 52; k = k + 1;
+    g_sigx_seq[k] = 108; k = k + 1;
+    // ESC[0m
+    g_sigx_seq[k] = 27; k = k + 1;
+    g_sigx_seq[k] = 91; k = k + 1;
+    g_sigx_seq[k] = 48; k = k + 1;
+    g_sigx_seq[k] = 109; k = k + 1;
+    // ESC[?25h
+    g_sigx_seq[k] = 27; k = k + 1;
+    g_sigx_seq[k] = 91; k = k + 1;
+    g_sigx_seq[k] = 63; k = k + 1;
+    g_sigx_seq[k] = 50; k = k + 1;
+    g_sigx_seq[k] = 53; k = k + 1;
+    g_sigx_seq[k] = 104; k = k + 1;
+    if alt {
+        // ESC[?1049l
+        g_sigx_seq[k] = 27; k = k + 1;
+        g_sigx_seq[k] = 91; k = k + 1;
+        g_sigx_seq[k] = 63; k = k + 1;
+        g_sigx_seq[k] = 49; k = k + 1;
+        g_sigx_seq[k] = 48; k = k + 1;
+        g_sigx_seq[k] = 52; k = k + 1;
+        g_sigx_seq[k] = 57; k = k + 1;
+        g_sigx_seq[k] = 108; k = k + 1;
+    }
+    g_sigx_seq_len = k;
+    g_sigx_armed = true;
+}
+
+// 安装终止类处理器（TERM/INT/HUP/PIPE）。term_fd 用来读原始终端属性（一般传 0）。
+// 返回是否全部装好；失败不致命（只是没有「退出前恢复终端」）。
+export fn sigx_install_terminal(term_fd: i32) bool {
+    _ = sigx_capture_termios(term_fd);
+    var ok: bool = true;
+    if sigx_set(SIGX_SIGTERM, &sigx_on_term as &void) != 0 {
+        ok = false;
+    }
+    if sigx_set(SIGX_SIGINT, &sigx_on_term as &void) != 0 {
+        ok = false;
+    }
+    if sigx_set(SIGX_SIGHUP, &sigx_on_term as &void) != 0 {
+        ok = false;
+    }
+    if sigx_set(SIGX_SIGPIPE, &sigx_on_term as &void) != 0 {
+        ok = false;
+    }
+    g_sigx_term_installed = ok;
+    return ok;
+}
+
+export fn sigx_install_winch() bool {
+    const r: i32 = sigx_set(SIGX_SIGWINCH, &sigx_on_winch as &void);
+    g_sigx_winch_installed = r == 0;
+    return r == 0;
+}
+
+// 退出前把处置恢复成默认：这样 TUI 正常退出之后残留的信号不会再触发「恢复终端」
+export fn sigx_disarm() void {
+    g_sigx_armed = false;
+    _ = sigx_set(SIGX_SIGTERM, null);
+    _ = sigx_set(SIGX_SIGINT, null);
+    _ = sigx_set(SIGX_SIGHUP, null);
+    _ = sigx_set(SIGX_SIGPIPE, null);
+    _ = sigx_set(SIGX_SIGWINCH, null);
+    g_sigx_term_installed = false;
+    g_sigx_winch_installed = false;
+}
+
+// fork 之后、子进程 exec 之前（或 fork 不 exec 的子代理进程里）调用：
+// 信号处置是继承的，子进程若带着我们的处理器，收到 TERM 会去写**父进程的终端**。
+export fn sigx_reset_for_child() void {
+    g_sigx_armed = false;
+    g_sigx_winch = false;
+    _ = sigx_set(SIGX_SIGTERM, null);
+    _ = sigx_set(SIGX_SIGINT, null);
+    _ = sigx_set(SIGX_SIGHUP, null);
+    _ = sigx_set(SIGX_SIGPIPE, null);
+    _ = sigx_set(SIGX_SIGWINCH, null);
+}
+
+// ============================================================
+// 取用 / 观测
+// ============================================================
+
+// SIGWINCH 到了没有（取用即清零）
+export fn sigx_winch_take() bool {
+    if !g_sigx_winch {
+        return false;
+    }
+    g_sigx_winch = false;
+    return true;
+}
+
+export fn sigx_winch_pending() bool {
+    return g_sigx_winch;
+}
+
+export fn sigx_term_hits() usize {
+    return g_sigx_term_hits;
+}
+
+export fn sigx_winch_hits() usize {
+    return g_sigx_winch_hits;
+}
+
+export fn sigx_terminal_installed() bool {
+    return g_sigx_term_installed;
+}
+
+export fn sigx_winch_installed() bool {
+    return g_sigx_winch_installed;
+}
+
+export fn sigx_armed() bool {
+    return g_sigx_armed;
+}
+
+export fn sigx_seq_len() usize {
+    return g_sigx_seq_len;
+}
+
+export fn sigx_seq_at(i: usize) byte {
+    if i >= SIGX_SEQ_MAX {
+        return 0;
+    }
+    return g_sigx_seq[i];
+}
+
+export fn sigx_have_termios() bool {
+    return g_sigx_have_termios;
+}
+
+export fn sigx_termios_at(i: usize) byte {
+    if i >= SIGX_TERMIOS_SIZE {
+        return 0;
+    }
+    return g_sigx_termios[i];
+}
+
+export fn sigx_last_err() i32 {
+    return g_sigx_last_err;
+}
+
+export fn sigx_action_size() usize {
+    return @size_of(SigxAction) as usize;
+}

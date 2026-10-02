@@ -14,7 +14,7 @@
 UYA_ROOT ?= /home/winger/uya-0.10/lib/
 UYA      ?= /home/winger/uya-0.10/bin/uya
 
-SRC := src/bufx.uya src/jsonx.uya src/httpc.uya src/httpstream.uya src/sse.uya src/llm.uya src/tty.uya src/inbox.uya src/session.uya src/yamlcfg.uya src/dshcfg.uya src/dshsess.uya src/prompt.uya src/instr.uya src/compact.uya src/skill.uya src/webx.uya src/deleg.uya src/goal.uya src/workflow.uya src/todo.uya src/plan.uya src/askuser.uya src/fsx.uya src/search.uya src/jobs.uya src/shellx.uya src/tools.uya src/diffx.uya src/view.uya src/agent.uya src/selftest.uya
+SRC := src/bufx.uya src/jsonx.uya src/httpc.uya src/httpstream.uya src/sse.uya src/llm.uya src/tty.uya src/sigx.uya src/inbox.uya src/session.uya src/yamlcfg.uya src/dshcfg.uya src/dshsess.uya src/prompt.uya src/instr.uya src/compact.uya src/skill.uya src/webx.uya src/deleg.uya src/goal.uya src/workflow.uya src/todo.uya src/plan.uya src/askuser.uya src/fsx.uya src/search.uya src/jobs.uya src/shellx.uya src/tools.uya src/diffx.uya src/view.uya src/tui.uya src/agent.uya src/sigselftest.uya src/tuiselftest.uya src/selftest.uya
 OUT := build/uya-agent
 
 BASE ?= https://api.deepseek.com/v1
@@ -25,7 +25,7 @@ TASK ?= 创建 hello.uya，编译并运行它
 export UYA_ROOT
 export UYA_SPLIT_C_DIR := $(CURDIR)/build/uyacache
 
-.PHONY: all check build selftest codegen-audit probe e2e e2e-config e2e-config-flags e2e-api e2e-steps e2e-dsh clean
+.PHONY: all check build selftest codegen-audit probe e2e e2e-config e2e-config-flags e2e-api e2e-steps e2e-dsh tui-demo tui-selftest clean
 
 all: build
 
@@ -149,6 +149,14 @@ e2e-steps: build
 # DSH 自己的会话列表（读 ~/.dsh/sessions，含 zstd）
 e2e-dsh: build
 	$(OUT) --list-dsh-sessions
+
+# TUI：打印 home / chat 两屏纯文本快照（README 引用的就是它，改动排版时先看这个）
+tui-demo: build
+	$(OUT) --no-dsh-config --tui-demo
+
+# TUI 相关自测轮（只跑 frame/keys/sink/turn/pty，改动 TUI 时比整轮 selftest 快得多）
+tui-selftest: build
+	UYA_SELFTEST_TUI_ONLY=1 $(OUT) --selftest
 
 clean:
 	rm -rf build

@@ -1,0 +1,431 @@
+// src/sigselftest.uya — 信号层（src/sigx.uya）的离线自测轮次（P0 / P1）
+//
+// 轮次：
+//   sig-abi            SigxAction 必须是**宿主 glibc** 的布局（152 字节；handler@0、
+//                      flags@136、restorer@144）—— 布局错了就等于把垃圾交给 sigaction
+//   sig-basic          处理器装上以后真的被调用、返回以后进程还活着
+//                      （P0 的回归闸门：缺 SA_RESTORER 的实现在这里直接 139）
+//   sig-term-restore   收到 SIGTERM：先写「关闭括起粘贴 + 复位 + 显示光标 + 离开备用屏幕」
+//                      再退出 143 —— 终端不会烂在备用屏幕/raw 模式
+//   sig-child-reset    fork 子进程重置处置后：SIGTERM 按**默认处置**死掉，且一个字节都不
+//                      往父进程的输出 fd 上写（否则子代理被杀会把父进程的终端擦掉）
+//
+// 全部离线、不联网；需要 fork 的两轮在子进程里做，子进程用 sys_exit 收尾。
+
+use libc.syscall;
+use libc.unistd;
+
+const SIGW_DIG: [byte: 10] = [48, 49, 50, 51, 52, 53, 54, 55, 56, 57];
+
+// SIGTERM 处理器应当写出的 26 字节：ESC[?2004l ESC[0m ESC[?25h ESC[?1049l
+const SIGW_SEQ: [byte: 26] = [
+    27, 91, 63, 50, 48, 48, 52, 108,
+    27, 91, 48, 109,
+    27, 91, 63, 50, 53, 104,
+    27, 91, 63, 49, 48, 52, 57, 108,
+];
+
+// 不带备用屏幕时是 18 字节：ESC[?2004l ESC[0m ESC[?25h
+const SIGW_SEQ_PLAIN: [byte: 18] = [
+    27, 91, 63, 50, 48, 48, 52, 108,
+    27, 91, 48, 109,
+    27, 91, 63, 50, 53, 104,
+];
+
+fn sigw_i32(v: i64) i32 {
+    const r: !i32 = v as! i32;
+    return r catch { -1; };
+}
+
+fn sigw_fail(tag: &const byte, what: &const byte, ok: &bool) void {
+    sigw_puts("selftest[" as &const byte);
+    sigw_puts(tag);
+    sigw_puts("] FAIL: " as &const byte);
+    sigw_puts(what);
+    sigw_puts("\n" as &const byte);
+    ok[0] = false;
+}
+
+fn sigw_num(v: usize) void {
+    var tmp: [byte: 24] = [0: 24];
+    var n: usize = v;
+    var i: usize = 0;
+    if n == 0 {
+        tmp[0] = 48;
+        i = 1;
+    }
+    while n > 0 && i < 24 {
+        const idx: usize = n % (10 as usize);
+        tmp[i] = SIGW_DIG[idx];
+        n = n / (10 as usize);
+        i = i + 1;
+    }
+    var rev: [byte: 24] = [0: 24];
+    var k: usize = 0;
+    while i > 0 {
+        i = i - 1;
+        rev[k] = tmp[i];
+        k = k + 1;
+    }
+    _ = sys_write(2, &rev[0] as *const byte, k) catch {};
+}
+
+fn sigw_puts(p: &const byte) void {
+    _ = sys_write(2, p as *const byte, bufx_cstr_len(p)) catch {};
+}
+
+// 等子进程结束（WNOHANG + 100ms 轮询，最多 ~20s），返回原始 wait 状态
+fn sigw_wait_raw(pid: i32, st: &i32, timeout_ms: i32) bool {
+    var waited: i32 = 0;
+    while waited < timeout_ms {
+        const r: i32 = sys_waitpid(pid, st, 1) catch { 0; };
+        if r > 0 {
+            return true;
+        }
+        var pfds: [PollFd: 1] = [PollFd{ fd: -1, events: 0, revents: 0 }];
+        _ = sys_poll(&pfds[0], 1, 100) catch {};
+        waited = waited + 100;
+    }
+    return false;
+}
+
+// 从管道读到 EOF（最多 1s），返回读到的字节数
+fn sigw_read_all(fd: i32, out: &Buf) usize {
+    var tmp: [byte: 512] = [0: 512];
+    var total: usize = 0;
+    var spins: i32 = 0;
+    while spins < 20 {
+        spins = spins + 1;
+        var pfds: [PollFd: 1] = [PollFd{ fd: fd, events: POLLIN, revents: 0 }];
+        const pr: i32 = sys_poll(&pfds[0], 1, 50) catch { 0; };
+        if pr <= 0 {
+            continue;
+        }
+        const n: isize = sys_read(fd, &tmp[0], 512) catch { -1 as isize; };
+        if n <= 0 {
+            break;
+        }
+        _ = buf_append(out, &tmp[0], n as usize);
+        total = total + (n as usize);
+    }
+    return total;
+}
+
+// ============================================================
+// sig-abi
+// ============================================================
+
+fn sig_abi_round(tag: &const byte) bool {
+    var ok: bool = true;
+
+    const sz: usize = @size_of(SigxAction) as usize;
+    if sz != 152 {
+        sigw_fail(tag, "SigxAction 不是 152 字节（glibc 布局：handler+mask128+flags+restorer）", &ok);
+        sigw_puts("  实际 = " as &const byte);
+        sigw_num(sz);
+        sigw_puts("\n" as &const byte);
+    }
+
+    // 用「按字节回读」验证三个字段的偏移：handler@0、flags@136、restorer@144
+    var act: SigxAction = SigxAction{
+        handler: @ptr_from_usize(0x0102030405060708 as usize) as &void,
+        mask: [0: 128],
+        flags: 0x11223344,
+        pad: 0,
+        restorer: @ptr_from_usize(0x1112131415161718 as usize) as &void,
+    };
+    const base: &byte = @ptr_from_usize(@usize_from_ptr(&act as &void)) as &byte;
+    // handler@0 小端：08 07 06 05 04 03 02 01
+    if base[0] != 8 as byte || base[7] != 1 as byte {
+        sigw_fail(tag, "handler 不在偏移 0（前 8 字节不是给定指针的字节）", &ok);
+    }
+    // flags@136 小端：44 33 22 11
+    if base[136] != 0x44 as byte || base[137] != 0x33 as byte
+        || base[138] != 0x22 as byte || base[139] != 0x11 as byte {
+        sigw_fail(tag, "flags 不在偏移 136", &ok);
+    }
+    // restorer@144 小端：18 17 16 15 14 13 12 11
+    if base[144] != 0x18 as byte || base[151] != 0x11 as byte {
+        sigw_fail(tag, "restorer 不在偏移 144", &ok);
+    }
+
+    // 恢复序列：带备用屏幕 26 字节、不带 18 字节
+    sigx_arm(-1, true);
+    if sigx_seq_len() != 26 {
+        sigw_fail(tag, "sigx_arm(alt=true) 的序列不是 26 字节", &ok);
+    }
+    var k: usize = 0;
+    var seq_ok: bool = true;
+    while k < 26 {
+        if sigx_seq_at(k) != SIGW_SEQ[k] {
+            seq_ok = false;
+        }
+        k = k + 1;
+    }
+    if !seq_ok {
+        sigw_fail(tag, "sigx_arm(alt=true) 的序列字节不对（期望 ESC[?2004l ESC[0m ESC[?25h ESC[?1049l）", &ok);
+    }
+    sigx_arm(-1, false);
+    if sigx_seq_len() != 18 {
+        sigw_fail(tag, "sigx_arm(alt=false) 的序列不是 18 字节", &ok);
+    }
+    k = 0;
+    seq_ok = true;
+    while k < 18 {
+        if sigx_seq_at(k) != SIGW_SEQ_PLAIN[k] {
+            seq_ok = false;
+        }
+        k = k + 1;
+    }
+    if !seq_ok {
+        sigw_fail(tag, "sigx_arm(alt=false) 的序列字节不对", &ok);
+    }
+    sigx_disarm();
+
+    if ok {
+        sigw_puts("selftest[");
+        sigw_puts(tag);
+        sigw_puts("] ok（152 字节布局 + 恢复序列逐字节）\n");
+    }
+    return ok;
+}
+
+// ============================================================
+// sig-basic：处理器真的被调用，而且返回以后进程还活着
+// ============================================================
+
+var g_sigw_hits: usize = 0;
+
+export fn sigw_usr1_handler(sig: i32) void {
+    g_sigw_hits = g_sigw_hits + 1;
+}
+
+fn sig_basic_round(tag: &const byte) bool {
+    var ok: bool = true;
+    g_sigw_hits = 0;
+    if sigx_set(SIGX_SIGUSR1, &sigw_usr1_handler as &void) != 0 {
+        sigw_fail(tag, "sigx_set(SIGUSR1) 失败（宿主 sigaction 不可用？）", &ok);
+        return false;
+    }
+    const me: i64 = sys_getpid() catch { 0 as i64; };
+    _ = sys_kill(me, SIGX_SIGUSR1) catch {};
+    // 能走到这里就说明「处理器返回」这条路是通的（P0 之前这里直接 139）
+    if g_sigw_hits != 1 {
+        sigw_fail(tag, "处理器没有被调用", &ok);
+        sigw_puts("  hits = " as &const byte);
+        sigw_num(g_sigw_hits);
+        sigw_puts("\n" as &const byte);
+    }
+
+    // SIGWINCH：处理器只置标志，取用即清零
+    if !sigx_install_winch() {
+        sigw_fail(tag, "SIGWINCH 处理器安装失败", &ok);
+    } else {
+        _ = sys_kill(me, SIGX_SIGWINCH) catch {};
+        if !sigx_winch_take() {
+            sigw_fail(tag, "SIGWINCH 没有置起标志", &ok);
+        }
+        if sigx_winch_take() {
+            sigw_fail(tag, "SIGWINCH 标志取用后没有清零", &ok);
+        }
+    }
+    sigx_disarm();
+    _ = sigx_set(SIGX_SIGUSR1, null);
+
+    if ok {
+        sigw_puts("selftest[");
+        sigw_puts(tag);
+        sigw_puts("] ok（处理器被调用并正常返回，进程存活）\n");
+    }
+    return ok;
+}
+
+// ============================================================
+// sig-term-restore：SIGTERM → 写恢复序列 → 退出 143
+// ============================================================
+
+fn sig_term_round(tag: &const byte) bool {
+    var ok: bool = true;
+    var fds: [i32: 2] = [0: 2];
+    if (sys_pipe2(&fds[0], 0) catch { -1; }) != 0 {
+        sigw_fail(tag, "pipe2 失败", &ok);
+        return false;
+    }
+    const pid64: i64 = sys_fork() catch {
+        _ = sys_close(fds[0]) catch {};
+        _ = sys_close(fds[1]) catch {};
+        sigw_fail(tag, "fork 失败", &ok);
+        return false;
+    };
+    if pid64 == 0 {
+        // 子进程：装终止类处理器 → 登记恢复信息 → 给自己发 SIGTERM
+        _ = sys_close(fds[0]) catch {};
+        _ = sigx_install_terminal(0);
+        sigx_arm(fds[1], true);
+        const me: i64 = sys_getpid() catch { 0 as i64; };
+        _ = sys_kill(me, SIGX_SIGTERM) catch {};
+        sys_exit(7);   // 处理器没跑才会到这里
+        return false;
+    }
+    _ = sys_close(fds[1]) catch {};
+    const pid: i32 = sigw_i32(pid64);
+
+    var payload: Buf = buf_new(256);
+    defer { buf_free(&payload); }
+    _ = sigw_read_all(fds[0], &payload);
+
+    var st: i32 = 0;
+    const waited: bool = sigw_wait_raw(pid, &st, 20000);
+    _ = sys_close(fds[0]) catch {};
+
+    if !waited {
+        sigw_fail(tag, "子进程没有在 20s 内退出", &ok);
+        _ = sys_kill(pid as i64, SIGKILL) catch {};
+        return false;
+    }
+    const code: i32 = (st >> (8 as i32)) & 255;
+    if code != 143 {
+        sigw_fail(tag, "退出码不是 143（128+SIGTERM）", &ok);
+        sigw_puts("  实际 = " as &const byte);
+        sigw_num(code as usize);
+        sigw_puts("（139 = 处理器路径崩了；7 = 处理器根本没跑）\n" as &const byte);
+    }
+    if payload.len != 26 {
+        sigw_fail(tag, "恢复序列字节数不是 26", &ok);
+        sigw_puts("  实际 = " as &const byte);
+        sigw_num(payload.len);
+        sigw_puts("\n" as &const byte);
+    } else if !bufx_mem_eq(payload.ptr as &const byte, &SIGW_SEQ[0], 26) {
+        sigw_fail(tag, "恢复序列内容不对", &ok);
+    }
+
+    if ok {
+        sigw_puts("selftest[");
+        sigw_puts(tag);
+        sigw_puts("] ok（SIGTERM → 26 字节恢复序列 + 退出 143）\n");
+    }
+    return ok;
+}
+
+// ============================================================
+// sig-child-reset：fork 子进程重置处置后不再写父进程的终端
+// ============================================================
+
+fn sig_child_reset_round(tag: &const byte) bool {
+    var ok: bool = true;
+    var fds: [i32: 2] = [0: 2];
+    if (sys_pipe2(&fds[0], 0) catch { -1; }) != 0 {
+        sigw_fail(tag, "pipe2 失败", &ok);
+        return false;
+    }
+    const pid64: i64 = sys_fork() catch {
+        _ = sys_close(fds[0]) catch {};
+        _ = sys_close(fds[1]) catch {};
+        sigw_fail(tag, "fork 失败", &ok);
+        return false;
+    };
+    if pid64 == 0 {
+        // 子进程：先装上并登记（父进程的处置），再按 fork 约定重置，然后报「就绪」
+        _ = sys_close(fds[0]) catch {};
+        _ = sigx_install_terminal(0);
+        sigx_arm(fds[1], true);
+        sigx_reset_for_child();
+        var ready: [byte: 1] = [82];   // 'R'
+        _ = sys_write(fds[1], &ready[0] as *const byte, 1) catch {};
+        // 等着被父进程 TERM 掉（按默认处置应当直接死）
+        var spins: i32 = 0;
+        while spins < 200 {
+            var pfds: [PollFd: 1] = [PollFd{ fd: -1, events: 0, revents: 0 }];
+            _ = sys_poll(&pfds[0], 1, 50) catch {};
+            spins = spins + 1;
+        }
+        sys_exit(6);   // 没被 TERM 掉才会到这里
+        return false;
+    }
+    _ = sys_close(fds[1]) catch {};
+    const pid: i32 = sigw_i32(pid64);
+
+    // 等就绪字节，再发 SIGTERM
+    var payload: Buf = buf_new(256);
+    defer { buf_free(&payload); }
+    var ready_seen: bool = false;
+    var spins: i32 = 0;
+    while spins < 40 && !ready_seen {
+        spins = spins + 1;
+        var pfds: [PollFd: 1] = [PollFd{ fd: fds[0], events: POLLIN, revents: 0 }];
+        const pr: i32 = sys_poll(&pfds[0], 1, 50) catch { 0; };
+        if pr <= 0 {
+            continue;
+        }
+        var one: [byte: 8] = [0: 8];
+        const n: isize = sys_read(fds[0], &one[0], 8) catch { -1 as isize; };
+        if n <= 0 {
+            continue;
+        }
+        _ = buf_append(&payload, &one[0], n as usize);
+        ready_seen = true;
+    }
+    if !ready_seen {
+        sigw_fail(tag, "没等到子进程的就绪字节", &ok);
+        _ = sys_kill(pid as i64, SIGKILL) catch {};
+        _ = sys_close(fds[0]) catch {};
+        return false;
+    }
+    _ = sys_kill(pid as i64, SIGX_SIGTERM) catch {};
+
+    const extra: usize = sigw_read_all(fds[0], &payload);
+    var st: i32 = 0;
+    const waited: bool = sigw_wait_raw(pid, &st, 20000);
+    _ = sys_close(fds[0]) catch {};
+
+    if !waited {
+        sigw_fail(tag, "子进程没有在 20s 内退出", &ok);
+        _ = sys_kill(pid as i64, SIGKILL) catch {};
+        return false;
+    }
+    const term_sig: i32 = st & 127;
+    if term_sig != SIGX_SIGTERM {
+        sigw_fail(tag, "子进程不是被 SIGTERM 按默认处置杀掉的（处置没重置干净）", &ok);
+        sigw_puts("  状态低 7 位 = " as &const byte);
+        sigw_num(term_sig as usize);
+        sigw_puts("\n" as &const byte);
+    }
+    // 就绪的 'R' = 1 字节；重置成功的话**不该**再有恢复序列
+    if extra != 0 {
+        sigw_fail(tag, "重置处置后的子进程仍然往父进程的输出 fd 写了字节", &ok);
+        sigw_puts("  多出 = " as &const byte);
+        sigw_num(extra);
+        sigw_puts(" 字节\n" as &const byte);
+    }
+    if payload.len > 0 && payload.ptr[0] != 82 as byte {
+        sigw_fail(tag, "就绪字节不是 'R'", &ok);
+    }
+
+    if ok {
+        sigw_puts("selftest[");
+        sigw_puts(tag);
+        sigw_puts("] ok（子进程按默认处置死于 SIGTERM，且不写父进程终端）\n");
+    }
+    return ok;
+}
+
+// ============================================================
+// 对外入口：selftest_main 里一行调用
+// ============================================================
+
+export fn sigx_selftest_all() bool {
+    var ok: bool = true;
+    if !sig_abi_round("sig-abi" as &const byte) {
+        ok = false;
+    }
+    if !sig_basic_round("sig-basic" as &const byte) {
+        ok = false;
+    }
+    if !sig_term_round("sig-term-restore" as &const byte) {
+        ok = false;
+    }
+    if !sig_child_reset_round("sig-child-reset" as &const byte) {
+        ok = false;
+    }
+    return ok;
+}
