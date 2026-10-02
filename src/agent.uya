@@ -92,6 +92,9 @@ export struct Config {
     // P17：全屏 TUI
     tui: bool,                // --tui / --no-tui（TTY 交互模式默认开）
     tui_src: u8,              // 0 默认 / 1 env / 2 cli
+    // P21：终端标题（TTY title）—— 交互模式下把窗口/标签页标题写成当前会话标题
+    title: bool,              // --title / --no-title（交互模式默认开）
+    title_src: u8,            // 0 默认 / 2 env / 3 cli（与 cfg_src_name 同口径）
     tui_headless: bool,       // 自测用：不碰终端，直接把帧写进给定 fd
     tui_demo: bool,           // --tui-demo：渲染一帧示例屏就退出（诊断/文档）
     tui_cols: usize,          // headless 画布宽（自测用）
@@ -139,6 +142,8 @@ fn cfg_default() Config {
         compat_fold: false,
         tui: true,
         tui_src: 0,
+        title: true,
+        title_src: 0,
         tui_headless: false,
         tui_demo: false,
         tui_cols: 160,     // --tui-demo 默认画布：够放下完整的统计行（约 120 列）
@@ -215,6 +220,12 @@ fn cfg_free(c: &Config) void {
 // 一旦 DSH 设置 / 环境变量 / 命令行显式声明了协议，就完全不协商 —— 声明即权威。
 // ============================================================
 export const API_SRC_DEFAULT: u8 = 0;
+
+// P21：终端标题开关的来源码。取值刻意与 `cfg_src_name` 同口径（1=dsh-settings / 2=env / 3=cli），
+// 而不是跟 `tui_src` 那套 1=env / 2=cli —— `--print-config` 打的就是 `cfg_src_name`。
+// 标题没有 DSH 设置这一路，所以只用 0 / 2 / 3。
+const TITLE_SRC_ENV: u8 = 2;
+const TITLE_SRC_CLI: u8 = 3;
 
 var g_api_probe_done: bool = false;
 var g_api_resolved: u8 = LLM_STYLE_RESPONSES;
@@ -1030,41 +1041,154 @@ fn agent_default_home(cfg: &const Config, out: &Buf) bool {
     return buf_append_cstr(out, "/.uya-agent");
 }
 
-fn agent_log_user(text: &const byte, n: usize, steer: bool) void {
-    if !g_sess.save || n == 0 {
+// ============================================================
+// P21：终端标题（TTY title）
+//
+// 「当前会话的标题」只有一份：`g_sess.title`。它的三个写入点 —— 首条用户消息的兜底派生、
+// 会话日志里的 `session/title` 事件（--continue / --resume / /resume）、--resume-dsh
+// 导入的 DSH 标题 —— 全都汇到 `agent_title_apply()`：有标题就上标题，没有就上
+// `uya-agent · <工作目录名>`。清洗与 OSC 2 编码在 src/tty.uya（唯一实现）；
+// 这里只管「标题是什么」与「什么时候同步」。
+// 只有交互模式（TUI / 滚动 REPL）才打开过标题通道，非交互路径 `tty_title_set` 是空操作。
+// ============================================================
+
+var g_title_base: Buf = Buf{ ptr: null, len: 0, cap: 0 };
+var g_title_base_ready: bool = false;
+
+// 压掉尾部 '/' 之后取最后一段（工作目录名）
+fn agent_path_basename_into(out: &Buf, p: &const byte, n: usize) usize {
+    buf_reset(out);
+    var end: usize = n;
+    while end > 0 && p[end - 1] == 47 as byte {
+        end = end - 1;
+    }
+    var start: usize = end;
+    while start > 0 && p[start - 1] != 47 as byte {
+        start = start - 1;
+    }
+    _ = buf_append(out, p + start, end - start);
+    return out.len;
+}
+
+// 还没有标题时的基标题：`uya-agent · <工作目录名>`（目录名取不到就只留 uya-agent）
+fn agent_title_base_into(out: &Buf, ws: &const byte, n: usize) void {
+    buf_reset(out);
+    _ = buf_append_cstr(out, "uya-agent");
+    var base: Buf = buf_new(280);
+    defer { buf_free(&base); }
+    if agent_path_basename_into(&base, ws, n) > 0 {
+        _ = buf_append_cstr(out, " · ");
+        _ = buf_append(out, base.ptr as &const byte, base.len);
+    }
+}
+
+fn agent_title_base_set(cfg: &const Config) void {
+    if !buf_valid(&g_title_base) {
+        g_title_base = buf_new(320);
+    }
+    agent_title_base_into(&g_title_base, cfg.workspace.ptr as &const byte, cfg.workspace.len);
+    g_title_base_ready = true;
+}
+
+// 把「当前会话标题」同步到终端（标题通道没开 / 清洗后为空时，tty 层自己会跳过）
+fn agent_title_apply() void {
+    if g_sess.title.len > 0 {
+        tty_title_set(g_sess.title.ptr as &const byte, g_sess.title.len);
         return;
     }
-    var ev: Buf = buf_new(n + 256);
-    defer { buf_free(&ev); }
-    if !sess_begin(&g_sess, "user/message", &ev) {
+    if g_title_base_ready {
+        tty_title_set(g_title_base.ptr as &const byte, g_title_base.len);
         return;
     }
-    _ = buf_append_cstr(&ev, "{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":");
-    if !jw_str_into(&ev, text, n) {
+    tty_title_set("uya-agent" as &const byte, 10);
+}
+
+// 首条用户消息 → 兜底标题（对齐 DSH：前 5 个词、≤40 B、清洗 + 空白折叠、按码点边界截断）。
+// 清洗后为空就**不**落标题，留给后面真正有内容的输入（DSH 的空输入等后来者）。
+// 只写内存里的 `g_sess.title`（`--no-save` 时同样要派生：终端标题不依赖落盘）；
+// 落 `session/title` 事件由调用方按 `g_sess.save` 决定，且**必须排在 user/message 之后**
+// （DSH 的事件顺序就是这样：title 事件引用它据以生成的 message seq）。
+// 返回 true = 这次真的派生了标题。
+fn agent_title_derive(text: &const byte, n: usize) bool {
+    if g_sess.title.len > 0 || n == 0 {
+        return false;
+    }
+    var t: Buf = buf_new(TTY_TITLE_FALLBACK_BYTES + 16);
+    defer { buf_free(&t); }
+    _ = tty_title_fallback_into(&t, text, n, TTY_TITLE_FALLBACK_WORDS, TTY_TITLE_FALLBACK_BYTES);
+    if t.len == 0 {
+        return false;
+    }
+    buf_reset(&g_sess.title);
+    _ = buf_append(&g_sess.title, t.ptr as &const byte, t.len);
+    return true;
+}
+
+// 落一条标题事件（DSH 也有 session/title）
+fn agent_title_log_event() void {
+    var tev: Buf = buf_new(256);
+    defer { buf_free(&tev); }
+    if sess_begin(&g_sess, "session/title", &tev) {
+        _ = buf_append_cstr(&tev, "{\"title\":");
+        _ = jw_str_into(&tev, g_sess.title.ptr as &const byte, g_sess.title.len);
+        _ = buf_append_cstr(&tev, ",\"source\":{\"kind\":\"fallback\"}}");
+        _ = sess_end(&g_sess, &tev);
+    }
+}
+
+// --resume-dsh：把 DSH 会话的标题接过来当本会话的标题。
+// 事件里的 source.kind 记 `user`：DSH 的三种 kind（fallback / provider / user）中，
+// 「显式给定、且钉住不再自动改写」的那一种就是 user —— 这条标题来自用户显式导入的会话，
+// 不是我们自动推导的，也不该被后面第一条消息改写（`agent_title_derive` 只在标题为空时动手）。
+fn agent_title_adopt_imported(t: &const Buf) void {
+    if t.len == 0 {
         return;
     }
-    if steer {
-        _ = buf_append_cstr(&ev, "}],\"source\":{\"kind\":\"steer\"}}");
-    } else {
-        _ = buf_append_cstr(&ev, "}],\"source\":{\"kind\":\"user\"}}");
+    var clean: Buf = buf_new(TTY_TITLE_MAX_BYTES + 16);
+    defer { buf_free(&clean); }
+    _ = tty_title_clean_into(&clean, t.ptr as &const byte, t.len, TTY_TITLE_MAX_BYTES);
+    if clean.len == 0 {
+        return;
     }
-    _ = sess_end(&g_sess, &ev);
-    if g_sess.title.len == 0 {
-        var t: usize = n;
-        if t > 40 {
-            t = 40;
-        }
-        _ = buf_append(&g_sess.title, text, t);
-        // 顺便落一条标题事件（DSH 也有 session/title）
-        var tev: Buf = buf_new(256);
+    buf_reset(&g_sess.title);
+    _ = buf_append(&g_sess.title, clean.ptr as &const byte, clean.len);
+    if g_sess.save {
+        var tev: Buf = buf_new(320);
         defer { buf_free(&tev); }
         if sess_begin(&g_sess, "session/title", &tev) {
             _ = buf_append_cstr(&tev, "{\"title\":");
             _ = jw_str_into(&tev, g_sess.title.ptr as &const byte, g_sess.title.len);
-            _ = buf_append_cstr(&tev, ",\"source\":{\"kind\":\"fallback\"}}");
+            _ = buf_append_cstr(&tev, ",\"source\":{\"kind\":\"user\"}}");
             _ = sess_end(&g_sess, &tev);
         }
     }
+    agent_title_apply();
+}
+
+fn agent_log_user(text: &const byte, n: usize, steer: bool) void {
+    if n == 0 {
+        return;
+    }
+    const fresh: bool = agent_title_derive(text, n);
+    if g_sess.save {
+        var ev: Buf = buf_new(n + 256);
+        defer { buf_free(&ev); }
+        if sess_begin(&g_sess, "user/message", &ev) {
+            _ = buf_append_cstr(&ev, "{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":");
+            if jw_str_into(&ev, text, n) {
+                if steer {
+                    _ = buf_append_cstr(&ev, "}],\"source\":{\"kind\":\"steer\"}}");
+                } else {
+                    _ = buf_append_cstr(&ev, "}],\"source\":{\"kind\":\"user\"}}");
+                }
+                _ = sess_end(&g_sess, &ev);
+            }
+        }
+        if fresh && g_sess.title.len > 0 {
+            agent_title_log_event();
+        }
+    }
+    agent_title_apply();
 }
 
 fn agent_log_assistant(step: i32, o: &const ChatOut, t: u64) void {
@@ -1692,6 +1816,14 @@ export fn agent_session_open(cfg: &const Config, h: &History, resume_path: &cons
         var next_seq: i64 = 0;
         const n: i32 = agent_hist_from_log(cfg, h, &rpath, &next_seq, true);
         if n > 0 {
+            // P21：`agent_hist_from_log` 顺带把日志里的 `session/title` 恢复进了 `g_sess.title`，
+            // 但下面 `sess_open` 会把 SessionLog 整个重新初始化（`l.title` 重新分配 = 清空）。
+            // 先把标题抄出来，sess_open 之后再放回去 —— 否则 `--continue` 的会话标题每次都丢。
+            var kept_title: Buf = buf_new(g_sess.title.len + 8);
+            defer { buf_free(&kept_title); }
+            if g_sess.title.len > 0 {
+                _ = buf_append(&kept_title, g_sess.title.ptr as &const byte, g_sess.title.len);
+            }
             const trimmed: usize = hist_trim_incomplete_tail(h);
             if trimmed > 0 {
                 out_err("[session] 丢弃了 ");
@@ -1728,6 +1860,11 @@ export fn agent_session_open(cfg: &const Config, h: &History, resume_path: &cons
                 false
             ) {
                 return false;
+            }
+            // P21：把日志里恢复出来的标题放回（sess_open 刚把它清掉）
+            if kept_title.len > 0 {
+                buf_reset(&g_sess.title);
+                _ = buf_append(&g_sess.title, kept_title.ptr as &const byte, kept_title.len);
             }
             return true;
         }
@@ -3509,7 +3646,10 @@ fn agent_history_begin(cfg: &const Config, h: &History, first: &const Buf) bool 
             if si >= DSHS_MAX {
                 return false;
             }
-            const n: usize = dshs_import(cfg, &ss.items[si], h);
+            // P21：DSH 的会话标题在日志的 session/title 事件里，导入时一并取出来
+            var dsh_title: Buf = buf_new(512);
+            defer { buf_free(&dsh_title); }
+            const n: usize = dshs_import(cfg, &ss.items[si], h, &dsh_title);
             out_err("[dsh-session] 从 ");
             out_err_bytes(ss.items[si].id.ptr, ss.items[si].id.len);
             out_err(" 导入了 ");
@@ -3522,6 +3662,8 @@ fn agent_history_begin(cfg: &const Config, h: &History, first: &const Buf) bool 
                 if !agent_session_create(cfg) {
                     return false;
                 }
+                // P21：标题要在 sess_open **之后**落（sess_open 会把 l.title 重置成空）
+                agent_title_adopt_imported(&dsh_title);
                 if first.len > 0 {
                     _ = hist_push(h, ROLE_USER, first.ptr as &const byte, first.len);
                 }
@@ -4043,6 +4185,8 @@ fn print_usage() void {
     out_err("  --tls-verify=MODE   chain（默认）| pin | none\n");
     out_err("  --tls-pin HEX       pin 模式下要求的 leaf 证书 SHA-256（小写 hex）\n");
     out_err("  --tui               全屏 TUI（TTY 交互模式默认）；--no-tui 退回滚动转录\n");
+    out_err("  --title             交互模式下把终端标题写成当前会话标题（默认开）\n");
+    out_err("  --no-title          不改终端标题（UYA_AGENT_TITLE=0 同口径）\n");
     out_err("  --color=MODE        auto（默认）| always | never | 16 | 256；NO_COLOR 也认\n");
     out_err("  --tui-demo          打印 TUI 的 home/chat 两屏纯文本快照后退出\n");
     out_err("  --quiet             不打印工具调用内容块（回退到旧的最小转录）\n");
@@ -4052,7 +4196,7 @@ fn print_usage() void {
     out_err("环境变量:\n");
     out_err("  UYA_AGENT_BASE_URL / UYA_AGENT_MODEL / UYA_AGENT_WORKSPACE / UYA_AGENT_MAX_STEPS\n");
     out_err("  UYA_AGENT_API（openai-responses | openai-completions）/ UYA_AGENT_REASONING_EFFORT\n");
-    out_err("  UYA_AGENT_TUI=0|1（全屏 TUI 开关）/ NO_COLOR\n");
+    out_err("  UYA_AGENT_TUI=0|1（全屏 TUI 开关）/ UYA_AGENT_TITLE=0|1（终端标题开关）/ NO_COLOR\n");
     out_err("  UYA_AGENT_API_KEY 或 DEEPSEEK_API_KEY 或 OPENAI_API_KEY\n");
 }
 
@@ -4439,6 +4583,7 @@ fn agent_repl_command(cfg: &Config, h: &History, line: &const Buf) bool {
         if agent_history_begin(cfg, h, &none_first) {
             tty_puts(&tty_ui, 2, "[session] 已开新会话\n");
             agent_stats_sync(cfg, h);
+            agent_title_apply();   // P21：新会话没有标题 → 回到基标题
         } else {
             tty_puts(&tty_ui, 2, "error: 无法新建会话\n");
         }
@@ -4461,6 +4606,7 @@ fn agent_repl_command(cfg: &Config, h: &History, line: &const Buf) bool {
         if agent_history_begin(cfg, h, &none_first2) {
             tty_puts(&tty_ui, 2, "[session] 已恢复会话\n");
             agent_stats_sync(cfg, h);
+            agent_title_apply();   // P21：换成被恢复会话的标题（日志里的 session/title）
         } else {
             tty_puts(&tty_ui, 2, "error: 无法恢复会话\n");
         }
@@ -4585,13 +4731,16 @@ fn agent_run_interactive(cfg: &Config) i32 {
         tty_puts(&tty_ui, 2, "warning: 信号处理器安装失败（被打断时终端可能停在 raw 模式）\n");
     }
     _ = sigx_install_winch();
-    sigx_arm(2, false);   // 滚动模式：显示通道是 fd 2，没有备用屏幕
+    // 滚动模式：显示通道是 fd 2，没有备用屏幕；P21 的终端标题也要跟着弹栈
+    sigx_arm(2, false, agent_title_enabled(cfg));
     if !tty_raw_on(&tty_ui, 0) {
         tty_puts(&tty_ui, 2, "warning: 无法进入 raw 模式（termios 设置失败），退回行式 REPL\n");
         sigx_disarm();
         return agent_repl_plain(cfg);
     }
     g_interactive = true;
+    // P21：从这一刻起终端标题跟随会话标题（--no-title 时这条通道根本不开）
+    agent_title_begin(cfg, 2);
     tty_set_block_provider(&tty_ui, true);   // P15：输入行上方允许画子代理面板
     inbox_globals_init();
 
@@ -4600,11 +4749,15 @@ fn agent_run_interactive(cfg: &Config) i32 {
     var no_first: Buf = buf_empty();
     if !agent_history_begin(cfg, &h, &no_first) {
         out_err("error: cannot build history\n");
+        tty_title_end();
         tty_raw_off(&tty_ui, 0);
         sigx_disarm();
         tty_free(&tty_ui);
         return AGENT_PROTO;
     }
+    // P21：历史回填完（--continue / --resume 的 session/title 已经进 g_sess.title）再同步一次，
+    // 否则起始标题会一直停在基标题上，直到用户打出第一条消息才换过来
+    agent_title_apply();
     agent_repl_banner(cfg);
 
     var line: Buf = buf_new(8192);
@@ -4699,6 +4852,7 @@ fn agent_run_interactive(cfg: &Config) i32 {
     }
 
     tty_set_block_provider(&tty_ui, false);
+    tty_title_end();   // P21：弹标题栈（终端支持标题栈 = 回到 shell 原来的标题）
     tty_raw_off(&tty_ui, 0);
     sigx_disarm();   // 终端已经还原过了，别让残留的信号再触发一次「恢复终端」
     tty_puts(&tty_ui, 2, "\nbye\n");
@@ -4942,6 +5096,15 @@ fn agent_print_config(cfg: &const Config, dsh: &const DshCfg) void {
     } else {
         out_err("  (display: on)\n");
     }
+    out_err("title = ");
+    if cfg.title {
+        out_err("on");
+    } else {
+        out_err("off");
+    }
+    out_err("  (source: ");
+    out_err(cfg_src_name(cfg.title_src));
+    out_err(")\n");
     out_err("input_image = ");
     if cfg.input_image {
         out_err("true\n");
@@ -5130,6 +5293,16 @@ export fn main() i32 {
             cfg.tui_src = 1;
         }
     }
+    const title_env: &byte = getenv("UYA_AGENT_TITLE");
+    if (title_env as usize) != 0 && bufx_cstr_len(title_env) > 0 {
+        if bufx_eq_cstr(title_env, bufx_cstr_len(title_env), "0") {
+            cfg.title = false;
+            cfg.title_src = TITLE_SRC_ENV;
+        } else {
+            cfg.title = true;
+            cfg.title_src = TITLE_SRC_ENV;
+        }
+    }
     const steps_env: &byte = getenv("UYA_AGENT_MAX_STEPS");
     if (steps_env as usize) != 0 {
         cfg.max_steps = parse_steps_arg(steps_env, "UYA_AGENT_MAX_STEPS" as &const byte);
@@ -5253,6 +5426,12 @@ export fn main() i32 {
         } else if arg_eq(p, "--no-tui") {
             cfg.tui = false;
             cfg.tui_src = 2;
+        } else if arg_eq(p, "--title") {
+            cfg.title = true;
+            cfg.title_src = TITLE_SRC_CLI;
+        } else if arg_eq(p, "--no-title") {
+            cfg.title = false;
+            cfg.title_src = TITLE_SRC_CLI;
         } else if arg_starts_with(p, "--color=") {
             cfg.color_mode = agent_parse_color(p);
         } else if arg_eq(p, "--no-color") {
@@ -5520,7 +5699,7 @@ export fn main() i32 {
 // 「把它交出来的提交/中断送回回合循环」。数据流见 README「全屏 TUI」一节。
 // ============================================================
 
-const AGENT_VERSION: [byte: 16] = [112, 50, 48, 45, 115, 116, 97, 116, 115, 0, 0, 0, 0, 0, 0, 0];   // "p20-stats"
+const AGENT_VERSION: [byte: 16] = [112, 50, 49, 45, 116, 105, 116, 108, 101, 0, 0, 0, 0, 0, 0, 0];   // "p21-title"
 const AGENT_VERSION_LEN: usize = 9;
 
 fn agent_parse_color(p: &byte) u8 {
@@ -5957,13 +6136,15 @@ fn agent_tui_start(cfg: &const Config) bool {
         tty_puts(&tty_ui, 2, "warning: 信号处理器安装失败（被打断时终端可能停在 raw 模式）\n");
     }
     _ = sigx_install_winch();
-    sigx_arm(ofd, true);
+    sigx_arm(ofd, true, agent_title_enabled(cfg));
     if !tty_raw_on(&tty_ui, 0) {
         sigx_disarm();
         _ = sys_close(ofd) catch {};
         return false;
     }
     tui_start(ofd);
+    // P21：备用屏幕起来之后再压标题栈 + 上基标题（顺序：先有界面，再有标题）
+    agent_title_begin(cfg, ofd);
     tty_sink_on = true;       // 从这一刻起，所有显示字节都进转录
     tui_set_size(tty_ui.cols, tty_ui.rows);
     return true;
@@ -5971,12 +6152,36 @@ fn agent_tui_start(cfg: &const Config) bool {
 
 fn agent_tui_stop(out_fd: i32) void {
     tty_sink_on = false;
+    tty_title_end();   // P21：先弹标题栈（写的是 TUI 自己的 fd），再离开备用屏幕
     tui_stop();
     tty_raw_off(&tty_ui, 0);
     sigx_disarm();
     if out_fd >= 0 {
         _ = sys_close(out_fd) catch {};
     }
+}
+
+// P21：交互模式下要不要改终端标题（--title / --no-title / UYA_AGENT_TITLE）。
+// 子代理一律不碰：它们只跑回合循环（stdout/stderr 已经指向 /dev/null，stdin 却继承父进程的
+// TTY），万一将来给它们接了交互界面，也不该去改父进程的终端标题。
+fn agent_title_enabled(cfg: &const Config) bool {
+    return cfg.title && !cfg.is_subagent;
+}
+
+// P21：打开标题通道（压栈 + 上基标题）。`--no-title` 时整条通道都不开 —— 后面所有
+// `agent_title_apply()` 都会因为 `tty_title_active()` 为假而变成空操作。
+//
+// 这里**只**上基标题、不看 `g_sess.title`：这个函数跑在 `agent_history_begin` 之前，
+// 此刻 `g_sess.title` 要么是空的（新进程），要么是 fork 继承来的**上一个会话**的残留
+// （自测里真踩到过：PTY 子进程把上一轮的标题先顶上去，屏幕上就是「任务标题 + 基标题」
+// 两条 OSC）。真正的会话标题由「开完会话之后」的那次 `agent_title_apply()` 上。
+fn agent_title_begin(cfg: &const Config, fd: i32) void {
+    if !agent_title_enabled(cfg) {
+        return;
+    }
+    tty_title_begin(fd);
+    agent_title_base_set(cfg);
+    tty_title_set(g_title_base.ptr as &const byte, g_title_base.len);
 }
 
 // TUI 主循环：与 agent_run_interactive 同构（取 steer → 等提交 → 跑回合），
@@ -6038,6 +6243,8 @@ fn agent_run_tui_body(cfg: &Config, tui_fd: i32) i32 {
         g_interactive = false;
         return AGENT_PROTO;
     }
+    // P21：历史回填完再同步标题（--continue / --resume / --resume-dsh 的标题此刻才在 g_sess.title 里）
+    agent_title_apply();
     agent_tui_seed_history(&h);
     tui_mark_dirty();
 
