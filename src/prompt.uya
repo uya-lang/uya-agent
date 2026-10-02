@@ -1,0 +1,299 @@
+// src/prompt.uya — system prompt 分节装配 + 运行时上下文（P8）
+//
+// 对齐 DSH `renderPrompt`：
+//   * 分节按 order 升序；渲染后为空的节**丢弃**；用 "\n\n" 连接；最终只有一条 system 消息；
+//   * 变量替换 {{model}} / {{cwd}}（只替换完整变量组，替换结果不再二次扫描）；
+//   * persona 文案优先从 DSH preset（agent.cordis.yml 的 persona 行）读，读不到就用
+//     DSH 标准 preset 的内置默认值（逐字一致）；
+//   * plan 策略段只在 plan 模式激活时输出（文案同样优先取 preset 的 plan-mode.section）。
+//
+// 运行时上下文不是 system 的一部分，而是**独立的 user 消息**（DSH 的 joinContextSections）：
+//   "Current runtime context. This snapshot supersedes earlier runtime-context snapshots.\n\n" + 各节
+
+use libc.syscall;
+use libc.unistd;
+
+export const PROMPT_LINE_MAX: usize = 16384;
+
+// ---- DSH 标准 preset 的内置默认（逐字）----
+const DEFAULT_PERSONA: &const byte = "You are a coding agent powered by the {{model}} model. Your working directory is {{cwd}}.";
+
+// ---- 各工具引导段（order 100–106）。read/bash 两条与 DSH 原文一致；其余为等价精简表述 ----
+const SEC_READ: &const byte = "Use the read tool — not shell commands like cat — to inspect text files. Results include line numbers. Use offset and limit to continue reading large files.";
+const SEC_WRITE: &const byte = "Use write to create a file or replace its whole contents. Overwriting an existing file requires reading it first at the same version.";
+const SEC_EDIT: &const byte = "Use edit for targeted literal replacements. old_string must match exactly and uniquely unless replace_all is true.";
+const SEC_GLOB: &const byte = "Use glob to find files by path pattern; without a slash the pattern matches the basename at any depth.";
+const SEC_GREP: &const byte = "Use grep to search file contents with a ripgrep regular expression; results are grouped by file as `Line N: …`.";
+const SEC_BASH: &const byte = "Check the [exit code: N] marker on every bash result; investigate failures before moving on.";
+const SEC_JOBS: &const byte = "Use bash with run_in_background for long-running commands, then job_list / job_output / job_kill to control them.";
+
+export struct PromptTexts {
+    persona: Buf,
+    plan_section: Buf,
+    instr_max_bytes: i64,
+    loaded_from_preset: bool,
+}
+
+export fn prompt_texts_empty() PromptTexts {
+    return PromptTexts{
+        persona: buf_empty(),
+        plan_section: buf_empty(),
+        instr_max_bytes: 65536,
+        loaded_from_preset: false,
+    };
+}
+
+export fn prompt_texts_free(t: &PromptTexts) void {
+    buf_free(&t.persona);
+    buf_free(&t.plan_section);
+}
+
+fn pt_set(dst: &Buf, src: &[byte]) void {
+    buf_reset(dst);
+    if src.len > 0 {
+        _ = buf_append(dst, src.ptr, src.len);
+    }
+}
+
+// C 字符串版本（内置默认文案是 &const byte）
+fn pt_set_cstr(dst: &Buf, src: &const byte) void {
+    buf_reset(dst);
+    const n: usize = bufx_cstr_len(src);
+    if n > 0 {
+        _ = buf_append(dst, src, n);
+    }
+}
+
+// DSH preset 根目录：--dsh-root > $UYA_AGENT_DSH_ROOT > 从 dsh 可执行位置推导 > 常见 npm 全局路径
+fn preset_path(out: &Buf, explicit_root: &const byte, dsh_home: &[byte]) bool {
+    buf_reset(out);
+    var root: Buf = buf_new(1024);
+    defer { buf_free(&root); }
+    if bufx_cstr_len(explicit_root) > 0 {
+        _ = buf_append_cstr(&root, explicit_root);
+    } else {
+        const env: &byte = getenv("UYA_AGENT_DSH_ROOT");
+        if (env as usize) != 0 && bufx_cstr_len(env) > 0 {
+            _ = buf_append_cstr(&root, env);
+        }
+    }
+    if root.len == 0 {
+        // 常见位置（本机是第一个）
+        const home: &byte = getenv("HOME");
+        if (home as usize) == 0 {
+            return false;
+        }
+        var cand: Buf = buf_new(1024);
+        defer { buf_free(&cand); }
+        _ = buf_append_cstr(&cand, home);
+        _ = buf_append_cstr(&cand, "/.npm-global/lib/node_modules/@deepseek-ai/dsh");
+        if sess_file_exists(cand.ptr as &const byte) {
+            _ = buf_append(&root, cand.ptr, cand.len);
+        } else {
+            buf_reset(&cand);
+            _ = buf_append_cstr(&cand, home);
+            _ = buf_append_cstr(&cand, "/.local/lib/node_modules/@deepseek-ai/dsh");
+            if sess_file_exists(cand.ptr as &const byte) {
+                _ = buf_append(&root, cand.ptr, cand.len);
+            }
+        }
+        if root.len == 0 {
+            _ = dsh_home;
+            return false;
+        }
+    }
+    if !buf_append(&out[0], root.ptr, root.len) {
+        return false;
+    }
+    return buf_append_cstr(out, "/config/agent-presets/standard/agent.cordis.yml");
+}
+
+// 从 preset 里读出 persona 文案 / plan 段 / 指令预算
+export fn prompt_load_preset(explicit_root: &const byte, dsh_home: &[byte], out: &PromptTexts) bool {
+    var path: Buf = buf_new(1200);
+    defer { buf_free(&path); }
+    if !preset_path(&path, explicit_root, dsh_home) {
+        return false;
+    }
+    _ = buf_append_byte(&path, 0);
+    if !sess_file_exists(path.ptr as &const byte) {
+        return false;
+    }
+    var tree: YTree = YTree{ nodes: [], n: 0, lines: [], nlines: 0, raw: buf_empty(), cur: 0, err_line: 0 };
+    yt_init(&tree);
+    defer { yt_free(&tree); }
+    if !yt_load_file(path.ptr as &const byte, &tree) {
+        return false;
+    }
+    const root: i32 = yt_root(&tree);
+    if root < 0 {
+        return false;
+    }
+    // 顶层是序列：逐行找 name 匹配的插件
+    const rows: usize = yt_len(&tree, root);
+    var i: usize = 0;
+    var got_persona: bool = false;
+    while i < rows {
+        const row: i32 = yt_at(&tree, root, i);
+        if row >= 0 {
+            const name: &[byte] = yt_get_str(&tree, row, "name");
+            const cfg_node: i32 = yt_get(&tree, row, "config");
+            if cfg_node >= 0 {
+                if name.len == 26 && bufx_mem_eq(name.ptr, "@deepseek-ai/dsh-persona", 26) {
+                    const txt: &[byte] = yt_get_str(&tree, cfg_node, "text");
+                    if txt.len > 0 {
+                        pt_set(&out.persona, txt);
+                        got_persona = true;
+                    }
+                } else if name.len == 23 && bufx_mem_eq(name.ptr, "@deepseek-ai/dsh-plan-mode", 23) {
+                    pt_set(&out.plan_section, yt_get_str(&tree, cfg_node, "section"));
+                } else if name.len == 31 && bufx_mem_eq(name.ptr, "@deepseek-ai/dsh-agent-instructions", 31) {
+                    const mb: i64 = yt_get_i64(&tree, cfg_node, "maxBytes", 65536);
+                    if mb > 0 {
+                        out.instr_max_bytes = mb;
+                    }
+                }
+            }
+        }
+        i = i + 1;
+    }
+    if !got_persona {
+        pt_set_cstr(&out.persona, DEFAULT_PERSONA);
+    }
+    out.loaded_from_preset = true;
+    return true;
+}
+
+export fn prompt_texts_init(explicit_root: &const byte, dsh_home: &[byte], out: &PromptTexts) void {
+    out.persona = buf_new(512);
+    out.plan_section = buf_new(4096);
+    out.instr_max_bytes = 65536;
+    out.loaded_from_preset = false;
+    if !prompt_load_preset(explicit_root, dsh_home, out) {
+        pt_set_cstr(&out.persona, DEFAULT_PERSONA);
+    }
+    if out.persona.len == 0 {
+        pt_set_cstr(&out.persona, DEFAULT_PERSONA);
+    }
+}
+
+// 变量替换：{{name}}，替换结果不再扫描
+fn prompt_subst_vars(text: &[byte], model: &[byte], cwd: &[byte], out: &Buf) void {
+    var i: usize = 0;
+    while i < text.len {
+        if i + 4 <= text.len && text.ptr[i] == 123 as byte && text.ptr[i + 1] == 123 as byte {
+            // 找 "}}"
+            var j: usize = i + 2;
+            var found: bool = false;
+            while j + 1 < text.len {
+                if text.ptr[j] == 125 as byte && text.ptr[j + 1] == 125 as byte {
+                    found = true;
+                    break;
+                }
+                j = j + 1;
+            }
+            if found {
+                const key: &[byte] = text[i + 2: j - (i + 2)];
+                if key.len == 5 && bufx_mem_eq(key.ptr, "model", 5) {
+                    _ = buf_append(out, model.ptr, model.len);
+                    i = j + 2;
+                    continue;
+                }
+                if key.len == 3 && bufx_mem_eq(key.ptr, "cwd", 3) {
+                    _ = buf_append(out, cwd.ptr, cwd.len);
+                    i = j + 2;
+                    continue;
+                }
+            }
+        }
+        _ = buf_append_byte(out, text.ptr[i]);
+        i = i + 1;
+    }
+}
+
+// 注意：persona / plan_section 来自 YAML 解析（Buf，**没有 NUL 结尾**），
+// 所以这里必须用「指针 + 长度」，不能当 C 字符串读（否则会读进堆里的垃圾，
+// 真实网关会直接报 `invalid character '\x00' in string literal`）。
+fn prompt_add_section_n(out: &Buf, text: &const byte, n: usize, model: &[byte], cwd: &[byte], first: &bool) void {
+    if n == 0 {
+        return;
+    }
+    var tmp: Buf = buf_new(n + 512);
+    defer { buf_free(&tmp); }
+    prompt_subst_vars(text[0: n], model, cwd, &tmp);
+    if tmp.len == 0 {
+        return;
+    }
+    if !first[0] {
+        _ = buf_append_cstr(out, "\n\n");
+    }
+    _ = buf_append(out, tmp.ptr, tmp.len);
+    first[0] = false;
+}
+
+// 组装 system prompt（分节 + 空节丢弃 + "\n\n" 连接）
+export fn prompt_build_system(
+    cfg: &const Config,
+    texts: &const PromptTexts,
+    plan_active: bool,
+    out: &Buf
+) bool {
+    buf_reset(out);
+    var first: bool = true;
+    const model: &[byte] = cfg.model.ptr[0: cfg.model.len];
+    const cwd: &[byte] = cfg.workspace.ptr[0: cfg.workspace.len];
+    // order 0：persona
+    prompt_add_section_n(out, texts.persona.ptr as &const byte, texts.persona.len, model, cwd, &first);
+    // order 50：plan 策略（仅在 plan 模式）
+    if plan_active {
+        prompt_add_section_n(out, texts.plan_section.ptr as &const byte, texts.plan_section.len, model, cwd, &first);
+    }
+    // order 100–106：工具引导
+    if !first {
+        _ = buf_append_cstr(out, "\n\n");
+    }
+    _ = buf_append_cstr(out, SEC_READ);
+    _ = buf_append_cstr(out, "\n\n");
+    _ = buf_append_cstr(out, SEC_WRITE);
+    _ = buf_append_cstr(out, "\n\n");
+    _ = buf_append_cstr(out, SEC_EDIT);
+    _ = buf_append_cstr(out, "\n\n");
+    _ = buf_append_cstr(out, SEC_GLOB);
+    _ = buf_append_cstr(out, "\n\n");
+    _ = buf_append_cstr(out, SEC_GREP);
+    if cfg.allow_shell {
+        _ = buf_append_cstr(out, "\n\n");
+        _ = buf_append_cstr(out, SEC_BASH);
+        _ = buf_append_cstr(out, "\n\n");
+        _ = buf_append_cstr(out, SEC_JOBS);
+    }
+    // Uya 语言要点（本项目的 persona 补充，DSH 没有这一节）
+    _ = first;
+    return out.len > 0;
+}
+
+// 运行时上下文（独立的 user 消息）
+export fn prompt_runtime_context(cfg: &const Config, plan_active: bool, out: &Buf) bool {
+    buf_reset(out);
+    var body: Buf = buf_new(2048);
+    defer { buf_free(&body); }
+    var first: bool = true;
+    // context:file-policy
+    if cfg.confine {
+        _ = buf_append_cstr(&body, "Current uya-agent file policy: confined. Absolute paths and \"..\" are rejected; file tools only operate inside the working directory.");
+    } else {
+        _ = buf_append_cstr(&body, "Current uya-agent file policy: full access. The file tools are not confined to the working directory.");
+    }
+    first = false;
+    // context:plan
+    _ = first;
+    if plan_active {
+        _ = buf_append_cstr(&body, "\n\nPlan mode is active.");
+    }
+    if body.len == 0 {
+        _ = buf_append_cstr(out, "Current runtime context: none. Earlier runtime-context snapshots no longer apply.");
+        return true;
+    }
+    _ = buf_append_cstr(out, "Current runtime context. This snapshot supersedes earlier runtime-context snapshots.\n\n");
+    return buf_append(out, body.ptr, body.len);
+}

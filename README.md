@@ -4,7 +4,7 @@
 多轮 loop 直到给出结论。全部代码 9 个 `.uya` 文件，**不引入任何 C 代码、`@c_import` 或其它语言**，
 只依赖 Uya 语言与随编译器分发的标准库。
 
-**P1–P7 已完成**：LLM 交互是**流式 SSE**（`stream:true` + `stream_options.include_usage`），
+**P1–P8 已完成**：LLM 交互是**流式 SSE**（`stream:true` + `stream_options.include_usage`），
 增量 chunked 解码 + SSE 分帧 + `tool_calls` 按 `index` 分片累积；消息协议是**严格工具协议**
 （`assistant.tool_calls` 原样回灌 + 每条结果一条 `role:"tool"` + `tool_call_id`）；
 交互界面是**真 TTY**（termios raw + 行编辑器），流式期间可打断、可继续输入、可续跑；
@@ -14,7 +14,9 @@
 **工具改用 DSH 标准模式的原名**（`read`/`write`/`edit`/`glob`/`grep`/`bash`/`job_*`），
 实现了 DSH 的文件观察策略（read-before-write / 版本守卫）与**后台任务**
 （`bash run_in_background` → `job_list` / `job_output` / `job_kill`），
-子进程会拿到 `DSH_*` 环境。`--no-stream` / `--compat-fold` 保留两条回退路径。
+子进程会拿到 `DSH_*` 环境；system prompt 改为**分节装配**（persona 从 DSH preset 读、
+`{{model}}`/`{{cwd}}` 变量替换、空节丢弃、`\n\n` 连接），并注入 AGENTS.md 与运行时上下文，
+配上 `todo_write` / `exit_plan_mode` / `ask_user_question`。`--no-stream` / `--compat-fold` 保留两条回退路径。
 
 ```
 $ DEEPSEEK_API_KEY=sk-xxx ./build/uya-agent "在当前目录创建 hello.uya，编译并运行它"
@@ -77,6 +79,9 @@ export UYA_SPLIT_C_DIR=$PWD/build/uyacache      # 多文件 C 缓存别丢在仓
 | `--strict-dsh-config` | 读不到 DSH 设置就报错退出 |
 | `--print-config` | 打印生效配置与来源后退出 |
 | `--yaml-dump FILE` | 打印该 YAML 的解析结果（诊断） |
+| `--plan` | 以 plan 模式启动（先出计划、批准后再执行） |
+| `--dsh-root DIR` | packaged preset 根（读 persona / plan 段文案） |
+| `--dry-run` | 只组装请求并打印（不可打印字节转义成 `\xNN`，排查脏字节） |
 | `--compat-fold` | 工具结果折叠成一条 user 消息（旧协议） |
 | `--no-stream-options` | 不发送 `stream_options.include_usage` |
 | `--show-reasoning` | 把 `reasoning_content` 打到 stderr |
@@ -123,12 +128,39 @@ src/search.uya    glob / grep：rg 子进程（--files / --json）、VCS 目录�
 src/dshcfg.uya    读 DSH 设置：$DSH_HOME 解析、settings.yaml 模型路线（agent-default-model →
                   provider 的 baseURL/apiKeyEnv/models[]）、.credentials.yaml、.env 兜底、
                   permission→confine、uya-agent.tls 命名空间
+src/prompt.uya    system prompt 分节装配（order 排序 / 空节丢弃 / `\n\n` 连接 / 变量替换）、
+                  persona 与 plan 段从 DSH preset 读取（读不到用内置默认）、运行时上下文 user 消息
+src/instr.uya     AGENTS.md / CLAUDE.md 发现（用户全局 → 项目根 → cwd，由广到窄）、
+                  预算截断（65536 字节，从最广端丢）、`<system-reminder>` 渲染
+src/todo.uya      todo_write：整表替换、content/去重/状态校验、计数回显
+src/plan.uya      plan 模式状态机 + exit_plan_mode（非 plan 模式报错、`# ` 开头的计划、CLI 审批）
+src/askuser.uya   ask_user_question：交互模式复用行编辑器，非交互读一行，EOF 时回「无回答」
 src/session.uya   会话日志：路径规范化、id 生成（/dev/urandom→uuid）、header/事件序列化与追加写、
                   索引、读取与崩溃尾部裁剪、按 id/最近查找、括号配平的数组提取
 src/agent.uya     CLI、环境变量、消息历史、请求组装、主循环（流式/非流式）、工具分发、
                   交互式 REPL（中断/steer//continue/会话命令）、会话事件记录与恢复
 src/selftest.uya  --selftest 的 mock LLM（含 SSE 受控切分）+ 15 轮断言 + --probe
 ```
+
+### 提示词与上下文状态（P8）
+
+* **system prompt 分节装配**：persona（order 0）→ plan 策略（order 50，仅 plan 模式激活时）→
+  工具引导（100–106）→ 本项目的 Uya 语言要点；空节丢弃、`\n\n` 连接、只有一条 system 消息。
+  persona 文案优先从 `<DSH_ROOT>/config/agent-presets/standard/agent.cordis.yml` 读（`--dsh-root`
+  或 `$UYA_AGENT_DSH_ROOT` 指定根），读不到就用标准 preset 的内置默认值（逐字一致）；
+  `{{model}}` / `{{cwd}}` 做变量替换。
+* **运行时上下文**是一条独立的 user 消息：`Current runtime context. This snapshot supersedes
+  earlier runtime-context snapshots.` + 各节（文件策略、plan 状态）。
+* **AGENTS.md**：用户全局 `$DSH_HOME/AGENTS.md` 最先，然后从项目根（最近的 `.git`）到 cwd 逐级，
+  每个目录按 `AGENTS.md → CLAUDE.md → AGENTS.local.md → CLAUDE.local.md`；整段预算 65536 字节，
+  超预算从最广端丢弃，渲染成 `<system-reminder>…</system-reminder>` 的 user 消息（首次请求前注入）。
+* **todo_write**：整表替换；回显 `Updated todo list: N pending, N in progress, N completed.`；
+  重复 content / 空 content / 非法 status 都会被拒；列表不回注上下文（与 DSH 一致）。
+* **plan 模式**：`exit_plan_mode` 两种模式都注册（工具目录稳定），非 plan 模式调用报
+  `exit_plan_mode is only available in plan mode`，计划必须以 `# ` 开头；批准走 CLI 问答
+  （`y/N`），批准后退出 plan 模式。`--plan` 以 plan 模式启动，REPL 里 `/plan` 切换。
+* **ask_user_question**：交互模式下复用行编辑器（带选项编号），非交互读一行；
+  读到 EOF 时返回 `(no answer channel: the user could not be asked)` 而不是挂死。
 
 ### bash 与后台任务（P7，对齐 DSH tool-bash + tool-jobs）
 
@@ -410,6 +442,9 @@ agent 循环并逐项断言：
 | `interrupt` | 预置 Ctrl-C：回合以 `AGENT_INTERRUPTED` 结束、工具**未派发**、只发生一次请求 |
 | `tty-editor` | termios 布局(60B)/raw 位运算；行编辑（插入/退格/左右/Delete/Home/End/词删除）、
 一次喂入多行拆成多个提交、分片转义序列、裸 ESC 判定、历史上下翻、中断前缀裁剪 |
+| `prompt-todo-plan` | 第一轮断言 system prompt（persona 变量替换、`{{cwd}}`、工具引导段）、运行时上下文
+user 消息、AGENTS.md 注入，以及**请求里没有 NUL 字节**；第二轮断言 todo 计数回显、
+重复 content 被拒、`exit_plan_mode` 在非 plan 模式报错、计划必须以 `# ` 开头 |
 | `bash-jobs` | 一轮 6 个调用：后台短任务 / 后台长任务 / `job_list` / `job_output(wait=true)` 等到
 `BG-DONE` / `job_kill` 取消长任务 / 前台静默命令 → 第二轮断言全部结果文本 |
 | `fs-tools` | 一轮内 10 个文件工具调用：write（未读→拒）/ read（窗口+footer）/ write（读后覆盖）/
@@ -431,6 +466,8 @@ contextWindow/maxTokens/input image/reasoningEffort/`permission→confine`/`uya-
   `"id":"call_…"` 保留、`"tool_call_id"` 条数与调用数一致（shell 2 / no-shell 1 / tools 4）。
 * TTY 交互用**真 pty** 验证（`script -qec`）：进入 raw 模式、banner 干净、一次粘贴
   4 行会分成 4 次提交（任务 → `/help` → `/status` → `/exit`），退出后终端恢复。
+* 提示词装配在真机上验证过（并因此抓出 getcwd 的 NUL bug）：新 prompt 下模型正常使用
+  `glob` 并给出结论；`--dry-run` 现在能看到完整请求体（转义后）且不含 NUL。
 * 后台任务在真机上做了冒烟：让它「用 run_in_background 跑 `sleep 2; echo BG-JOB-DONE`，
   再用 job_output(wait=true) 读输出」→ 模型 `bash` → `job_output` 两轮完成，
   回答「输出内容是 `BG-JOB-DONE`（job-1 正常结束，exit 0）」。

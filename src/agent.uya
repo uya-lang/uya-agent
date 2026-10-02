@@ -71,6 +71,10 @@ export struct Config {
     src_key: u8,
     src_context: u8,
     src_confine: u8,
+    // P8
+    dry_run: bool,            // --dry-run：只组装请求并打印（不联网）
+    plan: bool,               // --plan：以 plan 模式启动
+    dsh_root: Buf,            // --dsh-root：packaged preset 根
 }
 
 fn cfg_default() Config {
@@ -114,6 +118,9 @@ fn cfg_default() Config {
         src_key: 0,
         src_context: 0,
         src_confine: 0,
+        dry_run: false,
+        plan: false,
+        dsh_root: buf_empty(),
     };
 }
 
@@ -122,6 +129,7 @@ fn cfg_free(c: &Config) void {
     buf_free(&c.agent_home);
     buf_free(&c.dsh_home);
     buf_free(&c.reasoning_effort);
+    buf_free(&c.dsh_root);
     buf_free(&c.base_url);
     buf_free(&c.model);
     buf_free(&c.api_key);
@@ -676,7 +684,7 @@ fn agent_log_turn_end(reason: &const byte) void {
 }
 
 // 从会话日志恢复消息历史（返回恢复的消息条数；0 表示没有可恢复内容）
-fn agent_hist_from_log(h: &History, path: &const Buf, out_next_seq: &i64) i32 {
+fn agent_hist_from_log(cfg: &const Config, h: &History, path: &const Buf, out_next_seq: &i64) i32 {
     var r: SessReader = sess_reader_empty();
     defer { sess_reader_free(&r); }
     var pz: Buf = buf_new(path.len + 1);
@@ -686,9 +694,16 @@ fn agent_hist_from_log(h: &History, path: &const Buf, out_next_seq: &i64) i32 {
     if !sess_reader_load(pz.ptr as &const byte, &r) {
         return 0;
     }
-    if !hist_push(h, ROLE_SYSTEM, system_prompt() as &const byte, strlen(system_prompt())) {
+    var sp: Buf = buf_new(32768);
+    defer { buf_free(&sp); }
+    if !agent_system_prompt(cfg, &sp) {
         return 0;
     }
+    if !hist_push(h, ROLE_SYSTEM, sp.ptr as &const byte, sp.len) {
+        return 0;
+    }
+    // 恢复出来的历史**重新注入**运行时上下文与 AGENTS.md（DSH 也是重新求值）
+    agent_inject_context(cfg, h);
     var line: Buf = buf_new(65536);
     defer { buf_free(&line); }
     var typ: Buf = buf_new(64);
@@ -801,7 +816,7 @@ export fn agent_session_open(cfg: &const Config, h: &History, resume_path: &cons
     }
     if resumed {
         var next_seq: i64 = 0;
-        const n: i32 = agent_hist_from_log(h, resume_path, &next_seq);
+        const n: i32 = agent_hist_from_log(cfg, h, resume_path, &next_seq);
         if n > 0 {
             out_err("[session] 已恢复 ");
             out_err_dec(n as usize);
@@ -868,8 +883,73 @@ export fn agent_session_close() void {
 // ============================================================
 // system prompt + tools schema
 // ============================================================
-fn system_prompt() &byte {
-    return "你是一个运行在用户终端里的编程 agent，工作目标是本机上的 Uya 语言项目。\n规则：\n1) 需要看代码就调用 read_file，需要改代码就调用 write_file（整文件覆盖），需要执行命令/编译/跑测试就调用 run_shell。\n2) 一次只做一步：先看、再改、最后用 run_shell 验证。\n3) 路径一律相对工作目录，不要用绝对路径或 ..。\n4) 工具返回以 error: 开头时，读清楚原因再决定下一步，不要重复同样的调用。\n5) 回答用中文，简短；任务完成时给一句话结论，不要复述文件内容。\n\nUya 语言要点（不要写成 C/Rust/Python）：\n- 入口是 `export fn main() i32 { ... return 0; }`；打印用内置的 `@println(\"文本\")`（不是 println/printf/console.log）。\n- 变量必须显式类型：`const x: i32 = 1;` / `var s: &[const byte] = \"abc\";`；没有 let/mut，没有 i++。\n- 编译运行用：`UYA_ROOT=/home/winger/uya-0.10/lib/ /home/winger/uya-0.10/bin/uya build <源文件> -o <输出> && ./<输出>`（UYA_ROOT 不设置会报“无法获取 UYA_ROOT 目录”）。\n- write_file 的 content 就是文件原文：换行写成普通的换行即可，不要二次转义（不要写成 \\n），也不要带引号。\n" as &byte;
+// ============================================================
+// 提示词状态（P8）：persona/plan 段从 DSH preset 读，读不到用内置默认
+// ============================================================
+var g_texts: PromptTexts = PromptTexts{
+    persona: Buf{ ptr: null, len: 0, cap: 0 },
+    plan_section: Buf{ ptr: null, len: 0, cap: 0 },
+    instr_max_bytes: 65536,
+    loaded_from_preset: false,
+};
+var g_plan: PlanState = PlanState{ active: false, pending: 0 };
+var g_todos: TodoState = TodoState{ items: [], n: 0 };
+var g_texts_ready: bool = false;
+
+// 本项目的补充节：Uya 语言要点（DSH 没有，但模型写 Uya 代码时需要）
+fn agent_extra_section() &const byte {
+    return "Uya language notes for files you write here:\n- Entry point is `export fn main() i32 { ... return 0; }`; print with the built-in `@println(\"text\")`.\n- Variables need explicit types: `const x: i32 = 1;` / `var s: &[const byte] = \"abc\";`. There is no `let`/`mut` and no `i++`.\n- Build and run with `UYA_ROOT=<lib> <uya> build <file> -o <out> && ./<out>`.\n- When writing file content, put real newlines in the string you pass to the write tool; do not double-escape them." as &const byte;
+}
+
+fn agent_texts_ensure(cfg: &const Config) void {
+    if g_texts_ready {
+        return;
+    }
+    prompt_texts_init(cfg.dsh_root.ptr as &const byte, agent_dsh_home(), &g_texts);
+    plan_init(&g_plan);
+    todo_init(&g_todos);
+    if cfg.plan {
+        plan_set(&g_plan, true);
+    }
+    g_texts_ready = true;
+}
+
+// 组装 system prompt（分节 + 空节丢弃 + "\n\n" 连接）
+fn agent_system_prompt(cfg: &const Config, out: &Buf) bool {
+    agent_texts_ensure(cfg);
+    if !prompt_build_system(cfg, &g_texts, g_plan.active, out) {
+        return false;
+    }
+    if !buf_append_cstr(out, "\n\n") {
+        return false;
+    }
+    return buf_append_cstr(out, agent_extra_section());
+}
+
+// 首次请求前注入：运行时上下文 + AGENTS.md（都是 user 消息，与 DSH 一致）
+fn agent_inject_context(cfg: &const Config, h: &History) void {
+    if h.len != 1 {
+        return;   // 只在「刚建好 system」时注入一次
+    }
+    var rctx: Buf = buf_new(2048);
+    defer { buf_free(&rctx); }
+    if prompt_runtime_context(cfg, g_plan.active, &rctx) && rctx.len > 0 {
+        _ = hist_push(h, ROLE_USER, rctx.ptr as &const byte, rctx.len);
+    }
+    var set: InstrSet = InstrSet{ items: [], n: 0 };
+    instr_init(&set);
+    defer { instr_free(&set); }
+    var ws: Buf = buf_new(FS_PATH_MAX);
+    defer { buf_free(&ws); }
+    _ = buf_append(&ws, cfg.workspace.ptr, cfg.workspace.len);
+    instr_collect(ws.ptr[0: ws.len], agent_dsh_home(), &set);
+    if set.n > 0 {
+        var msg: Buf = buf_new((g_texts.instr_max_bytes as usize) + 8192);
+        defer { buf_free(&msg); }
+        if instr_render(&set, g_texts.instr_max_bytes, &msg) {
+            _ = hist_push(h, ROLE_USER, msg.ptr as &const byte, msg.len);
+        }
+    }
 }
 
 // ============================================================
@@ -895,6 +975,12 @@ const TOOL_JOB_LIST: &const byte = `{"type":"function","function":{"name":"job_l
 const TOOL_JOB_OUTPUT: &const byte = `{"type":"function","function":{"name":"job_output","description":"Read a background job's output. Incremental by default: only new output since the previous read.","parameters":{"type":"object","properties":{"job_id":{"type":"string","description":"Job id returned when the job started."},"wait":{"type":"boolean","description":"Block until the job finishes or the timeout expires."},"timeout_ms":{"type":"number","description":"Wait budget in milliseconds (default 30000, max 600000)."}},"required":["job_id"]}}}`;
 
 const TOOL_JOB_KILL: &const byte = `{"type":"function","function":{"name":"job_kill","description":"Request cancellation of a background job.","parameters":{"type":"object","properties":{"job_id":{"type":"string","description":"Job id to cancel."},"reason":{"type":"string","description":"Optional short reason."}},"required":["job_id"]}}}`;
+
+const TOOL_TODO: &const byte = `{"type":"function","function":{"name":"todo_write","description":"Record and update a structured task list for the current work. Send the ENTIRE list every call — it REPLACES the previous list (there are no partial updates, no per-item edits). Use it to plan multi-step work and show progress: add one todo per concrete step before you start. Mark every todo being actively worked on \u0060in_progress\u0060 — several at once when work genuinely runs in parallel (e.g. concurrent subagents or background commands), one for sequential work; while work remains, at least one task should be \u0060in_progress\u0060. Mark a todo \u0060completed\u0060 the moment it is done (do not batch completions), and allow no \u0060in_progress\u0060 item only once all work is complete. Skip the list for trivial single-step tasks.","parameters":{"type":"object","properties":{"todos":{"type":"array","description":"The COMPLETE task list, replacing any previous list.","items":{"type":"object","additionalProperties":false,"properties":{"content":{"type":"string","description":"What the task is — a short imperative line."},"status":{"type":"string","enum":["pending","in_progress","completed"],"description":"pending (not started) | in_progress (now) | completed (done)."}},"required":["content","status"]}}},"required":["todos"]}}}`;
+
+const TOOL_EXIT_PLAN: &const byte = `{"type":"function","function":{"name":"exit_plan_mode","description":"Use only in plan mode. Present your plan for the user's review and, on approval, leave plan mode. Send the COMPLETE plan as markdown, starting with a # heading that names it. The user may approve (carry out the plan from your next step) or keep planning — their feedback comes back in the tool result; revise and present again.","parameters":{"type":"object","properties":{"plan":{"type":"string","description":"The complete plan as markdown, starting with a # heading that names it."}},"required":["plan"]}}}`;
+
+const TOOL_ASK_USER: &const byte = `{"type":"function","function":{"name":"ask_user_question","description":"Ask the user a blocking question and return their answer as JSON.","parameters":{"type":"object","properties":{"questions":{"type":"array","description":"One or more questions to ask.","items":{"type":"object","properties":{"id":{"type":"string","description":"Stable id echoed back in the answer."},"question":{"type":"string","description":"The question to show the user."},"header":{"type":"string","description":"Optional short heading."},"options":{"type":"array","description":"Optional choices.","items":{"type":"object","properties":{"label":{"type":"string"},"description":{"type":"string"}},"required":["label"]}},"multi_select":{"type":"boolean","description":"Allow selecting more than one option."}},"required":["id","question"]}}},"required":["questions"]}}}`;
 
 const TOOL_RUN_SHELL: &const byte = `{"type":"function","function":{"name":"run_shell","description":"在工作目录下执行 shell 命令，返回 stdout+stderr 与退出码。","parameters":{"type":"object","properties":{"command":{"type":"string","description":"shell 命令"},"timeout_ms":{"type":"integer","description":"超时毫秒，默认 120000"}},"required":["command"]}}}`;
 
@@ -955,6 +1041,25 @@ fn tools_json(out: &Buf, allow_shell: bool) bool {
         if !buf_append_cstr(out, TOOL_JOB_KILL) {
             return false;
         }
+    }
+    // todo / plan / ask_user 始终可见（DSH：工具目录跨模式稳定）
+    if !buf_append_byte(out, 44) {
+        return false;
+    }
+    if !buf_append_cstr(out, TOOL_TODO) {
+        return false;
+    }
+    if !buf_append_byte(out, 44) {
+        return false;
+    }
+    if !buf_append_cstr(out, TOOL_EXIT_PLAN) {
+        return false;
+    }
+    if !buf_append_byte(out, 44) {
+        return false;
+    }
+    if !buf_append_cstr(out, TOOL_ASK_USER) {
+        return false;
     }
     return buf_append_byte(out, 93);
 }
@@ -1253,6 +1358,12 @@ fn dispatch_tool_body(cfg: &const Config, name: &const Buf, args_json: &const Bu
         jobs_tool_output(&g_jobs, &arg_val, out);
     } else if sv_eq_cstr(name, "job_kill") {
         jobs_tool_kill(&g_jobs, &arg_val, out);
+    } else if sv_eq_cstr(name, "todo_write") {
+        todo_tool_write(&g_todos, &arg_val, out);
+    } else if sv_eq_cstr(name, "exit_plan_mode") {
+        plan_tool_exit(&g_plan, &arg_val, out);
+    } else if sv_eq_cstr(name, "ask_user_question") {
+        ask_tool_question(&arg_val, out);
     } else {
         _ = buf_append_cstr(out, "error: unknown tool");
     }
@@ -1543,10 +1654,16 @@ fn agent_finish_step(cfg: &const Config, arena: &Arena, h: &History, step: i32, 
 }
 
 // 建历史：一条 system + 可选的第一条 user
-fn agent_hist_init(h: &History, first: &const Buf) bool {
-    if !hist_push(h, ROLE_SYSTEM, system_prompt() as &const byte, strlen(system_prompt())) {
+fn agent_hist_init(cfg: &const Config, h: &History, first: &const Buf) bool {
+    var sp: Buf = buf_new(32768);
+    defer { buf_free(&sp); }
+    if !agent_system_prompt(cfg, &sp) {
         return false;
     }
+    if !hist_push(h, ROLE_SYSTEM, sp.ptr as &const byte, sp.len) {
+        return false;
+    }
+    agent_inject_context(cfg, h);
     if first.len > 0 {
         return hist_push(h, ROLE_USER, first.ptr as &const byte, first.len);
     }
@@ -1760,7 +1877,7 @@ fn agent_history_begin(cfg: &const Config, h: &History, first: &const Buf) bool 
         }
         return true;
     }
-    return agent_hist_init(h, first);
+    return agent_hist_init(cfg, h, first);
 }
 
 // 一次性运行（命令行给了任务）
@@ -1867,7 +1984,86 @@ fn agent_resolve_resume(cfg: &Config, want: &const byte) bool {
     return buf_append(&cfg.resume_id, path.ptr, path.len);
 }
 
-export fn agent_run(cfg: &const Config) i32 {
+export // --dry-run：组装请求并打印（不可打印字节转义成 \xNN，便于找 NUL 之类的脏字节）
+fn agent_dry_run(cfg: &const Config) i32 {
+    var h: History = hist_init();
+    defer { hist_free(&h); }
+    var first: Buf = buf_empty();
+    if !agent_hist_init(cfg, &h, &first) {
+        out_err("error: cannot build history\n");
+        return AGENT_PROTO;
+    }
+    if cfg.task.len > 0 {
+        _ = hist_push(&h, ROLE_USER, cfg.task.ptr as &const byte, cfg.task.len);
+    }
+    var req: Buf = buf_new(262144);
+    defer { buf_free(&req); }
+    if !build_chat_request(cfg, &h, &req) {
+        out_err("error: cannot build request\n");
+        return AGENT_PROTO;
+    }
+    out_err("[dry-run] messages=");
+    out_err_dec(h.len);
+    out_err(" request_bytes=");
+    out_err_dec(req.len);
+    out_err("\n");
+    var i: usize = 0;
+    while i < req.len {
+        const c: byte = req.ptr[i];
+        if c == 0 as byte {
+            out_err("\\x00");
+        } else if c == 10 as byte {
+            out_err("\\n");
+        } else if c == 9 as byte {
+            out_err("\\t");
+        } else if c < 32 as byte || c > 126 as byte {
+            const hexd: &[byte] = &"0123456789abcdef"[0: 16];
+            out_err("\\x");
+            out_err_bytes(&hexd[((c as i32) >> 4) as usize], 1);
+            out_err_bytes(&hexd[((c as i32) & 15) as usize], 1);
+        } else {
+            out_err_bytes(&req.ptr[i], 1);
+        }
+        i = i + 1;
+    }
+    out_err("\n");
+    return AGENT_OK;
+}
+
+// 工作目录默认值 = getcwd。注意 sys_getcwd 返回的长度**含结尾 NUL**，
+// 不剥掉的话它会被当作路径的一部分（真实网关会报 invalid character '\x00'）。
+export fn agent_workspace_set_cwd(cfg: &Config) bool {
+    var storage: [byte: 1024] = [0: 1024];
+    const res: !isize = sys_getcwd(&storage[0], 1024);
+    const raw_len: isize = res catch { 0 as isize; };
+    if raw_len <= 0 {
+        return false;
+    }
+    var n: usize = raw_len as usize;
+    if n >= 1024 {
+        n = 1023;
+    }
+    // 用指针走（固定数组下标要给编译器看的证明，指针下标不需要）
+    const base: &byte = &storage[0];
+    while n > 0 {
+        const p: &const byte = @ptr_from_usize(@usize_from_ptr(base as &void) + (n - 1)) as &const byte;
+        if p[0] != 0 as byte {
+            break;
+        }
+        n = n - 1;
+    }
+    if n == 0 {
+        return false;
+    }
+    buf_free(&cfg.workspace);
+    cfg.workspace = buf_new(n + 8);
+    if !buf_valid(&cfg.workspace) {
+        return false;
+    }
+    return buf_append(&cfg.workspace, &storage[0], n);
+}
+
+fn agent_run(cfg: &const Config) i32 {
     if cfg.api_key.len == 0 {
         out_err("error: no API key. set UYA_AGENT_API_KEY / DEEPSEEK_API_KEY / OPENAI_API_KEY\n");
         return AGENT_USAGE;
@@ -1920,6 +2116,8 @@ fn print_usage() void {
     out_err("  --no-dsh-config     完全不读 DSH 设置\n");
     out_err("  --strict-dsh-config 读不到 DSH 设置就报错退出\n");
     out_err("  --print-config      打印生效配置与来源后退出\n");
+    out_err("  --plan              以 plan 模式启动（先出计划再执行）\n");
+    out_err("  --dsh-root DIR      packaged preset 根（读 persona/plan 文案）\n");
     out_err("  --tls-verify=MODE   chain（默认）| pin | none\n");
     out_err("  --tls-pin HEX       pin 模式下要求的 leaf 证书 SHA-256（小写 hex）\n");
     out_err("  --quiet             不打印每步工具调用信息\n");
@@ -2063,6 +2261,7 @@ fn agent_repl_help() void {
     tty_puts(&tty_ui, 2, "  /help      显示本帮助\n");
     tty_puts(&tty_ui, 2, "  /continue  不再输入新内容，带着历史再跑一轮\n");
     tty_puts(&tty_ui, 2, "  /status    打印当前配置与历史条数\n");
+    tty_puts(&tty_ui, 2, "  /plan      切换 plan 模式\n");
     tty_puts(&tty_ui, 2, "  /sessions  列出本机会话\n");
     tty_puts(&tty_ui, 2, "  /resume ID 切换到指定会话（id 或 last）\n");
     tty_puts(&tty_ui, 2, "  /new       开一条新会话（当前会话保留在磁盘上）\n");
@@ -2134,6 +2333,15 @@ fn agent_repl_command(cfg: &Config, h: &History, line: &const Buf) bool {
         const rc: i32 = agent_turn_loop(cfg, h);
         if rc != AGENT_OK && rc != AGENT_INTERRUPTED {
             tty_puts(&tty_ui, 2, "[turn] 本回合异常结束（可直接输入继续）\n");
+        }
+        return false;
+    }
+    if sv_eq_cstr(line, "/plan") {
+        _ = plan_toggle(&g_plan);
+        if g_plan.active {
+            tty_puts(&tty_ui, 2, "Plan mode on. Use /plan to leave.\n");
+        } else {
+            tty_puts(&tty_ui, 2, "Plan mode off.\n");
         }
         return false;
     }
@@ -2619,13 +2827,8 @@ export fn main() i32 {
     cfg.api_key = env_first("UYA_AGENT_API_KEY", "DEEPSEEK_API_KEY", "OPENAI_API_KEY");
 
     // 2) 工作目录（默认当前目录，可用 UYA_AGENT_WORKSPACE / --workspace 覆盖）
-    var cwd_storage: [byte: 1024] = [0: 1024];
-    const cwd_res: !isize = sys_getcwd(&cwd_storage[0], 1024);
-    const cwd_len: isize = cwd_res catch { 0 as isize; };
-    cfg.workspace = buf_new(1088);
-    if buf_valid(&cfg.workspace) && cwd_len > 0 {
-        _ = buf_append(&cfg.workspace, &cwd_storage[0], cwd_len as usize);
-    }
+    cfg.workspace = buf_empty();
+    _ = agent_workspace_set_cwd(&cfg);
     const ws_env: &byte = getenv("UYA_AGENT_WORKSPACE");
     if (ws_env as usize) != 0 {
         buf_free(&cfg.workspace);
@@ -2727,6 +2930,16 @@ export fn main() i32 {
             cfg.strict_dsh_config = true;
         } else if arg_eq(p, "--print-config") {
             cfg.print_config = true;
+        } else if arg_eq(p, "--dry-run") {
+            cfg.dry_run = true;
+        } else if arg_eq(p, "--plan") {
+            cfg.plan = true;
+        } else if arg_eq(p, "--dsh-root") {
+            i = i + 1;
+            if i < get_argc() {
+                buf_free(&cfg.dsh_root);
+                cfg.dsh_root = buf_from_cstr(get_argv(i));
+            }
         } else if arg_eq(p, "--list-sessions") {
             cfg.list_sessions = true;
         } else if arg_eq(p, "--continue") {
@@ -2842,6 +3055,9 @@ export fn main() i32 {
     if cfg.print_config {
         agent_print_config(&cfg, &dsh);
         return AGENT_OK;
+    }
+    if cfg.dry_run {
+        return agent_dry_run(&cfg);
     }
     if cfg.list_sessions {
         return agent_list_sessions(&cfg);
