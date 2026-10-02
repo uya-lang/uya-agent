@@ -18,6 +18,75 @@ use std.runtime.saved_envp;
 const SH_ENV_MAX: usize = 256;
 const SH_POLL_MS: i32 = 50;
 
+// P18：沙箱。0 = 直接 execve /bin/bash（今天的行为）
+//       1 = execve bwrap 的 profile（argv 由 sandboxx 备好）
+// 每次 sh_tool_bash 在 fork 之前决定一次，子进程只照抄。
+var g_sh_exec: u8 = 0;
+const SH_EXEC_PLAIN: u8 = 0;
+const SH_EXEC_SANDBOX: u8 = 1;
+const SH_EXEC_REFUSED: u8 = 2;   // confined + 沙箱不可用 → 调用方必须拒绝
+
+// 内核沙箱的拒绝签名（DSH 对 bwrap 档也是 signature-only：读 stderr 的文本特征）
+fn sh_err_is_sandbox_denied(e: &const Buf) bool {
+    if e.len == 0 {
+        return false;
+    }
+    return sh_has_cstr(e, "Permission denied" as &const byte) || sh_has_cstr(e, "Read-only file system" as &const byte);
+}
+
+fn sh_has_cstr(h: &const Buf, lit: &const byte) bool {
+    const n: usize = bufx_cstr_len(lit);
+    if n == 0 || h.len < n {
+        return false;
+    }
+    var i: usize = 0;
+    while i + n <= h.len {
+        if bufx_mem_eq(h.ptr + i, lit, n) {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+// read-only 下 bash 的失败文案（测试逐字断言）
+const SH_DENIED: &const byte = "Error: the user denied this bash command in read-only mode. Do not retry it or an equivalent; use read/glob/grep, or ask the user to switch with /permission workspace-write.";
+const SH_NO_CHANNEL: &const byte = "Error: bash needs per-command approval in read-only mode, but this session has no answer channel (non-interactive or subagent). Fail closed: ask the user to run it, or switch with /permission workspace-write.";
+
+var g_sh_ws_z: Buf = Buf{ ptr: null, len: 0, cap: 0 };
+
+// 按访问模式与沙箱开关，决定这次 exec 怎么起。返回 false = 必须拒绝执行（错误已写进 out）
+fn sh_prepare_exec(cfg: &const Config, cmd_z: &const byte, out: &Buf) bool {
+    g_sh_exec = SH_EXEC_PLAIN;
+    if !buf_valid(&g_sh_ws_z) {
+        g_sh_ws_z = buf_new(FS_PATH_MAX + 8);
+    }
+    var ws_len: usize = 0;
+    if san_bind_root(cfg.workspace.ptr as &const byte, cfg.workspace.len, &g_sh_ws_z) {
+        ws_len = g_sh_ws_z.len - 1;   // 去掉 NUL
+    } else {
+        _ = buf_reset(&g_sh_ws_z);
+        _ = buf_append_byte(&g_sh_ws_z, 0);
+    }
+    const kind: i32 = san_build_exec(cfg.access, cfg.sandbox, g_sh_ws_z.ptr as &const byte, ws_len, cmd_z);
+    if kind == 1 {
+        g_sh_exec = SH_EXEC_SANDBOX;
+        return true;
+    }
+    if kind == 0 {
+        g_sh_exec = SH_EXEC_PLAIN;
+        return true;
+    }
+    // 2：confined 模式但沙箱起不来 —— fail closed，绝不悄悄不沙箱（对齐 DSH SANDBOX_UNAVAILABLE）
+    _ = buf_append_cstr(out, "Error: the file sandbox is unavailable on this host (bwrap: ");
+    _ = buf_append_cstr(out, san_reason());
+    _ = buf_append_cstr(out, "); bash is refused in ");
+    _ = buf_append_cstr(out, perm_name(cfg.access));
+    _ = buf_append_cstr(out, " mode. Install bubblewrap, or use --no-sandbox / --permission danger-full-access.");
+    g_sh_exec = SH_EXEC_REFUSED;
+    return false;
+}
+
 // 组装子进程环境：继承现有变量（清掉旧的 DSH_*），再补上我们的 DSH_*
 var g_env_ptrs: [&const byte: SH_ENV_MAX] = [null as &const byte: SH_ENV_MAX];
 var g_env_store: Buf = Buf{ ptr: null, len: 0, cap: 0 };
@@ -151,11 +220,16 @@ fn sh_run_foreground(cfg: &const Config, cmd_z: &const byte, workdir_z: &const b
         _ = sys_close(op[1]) catch {};
         _ = sys_close(ep[1]) catch {};
         _ = sys_chdir(workdir_z as *const byte) catch {};
-        var shpath: [byte: 16] = "/bin/bash";
-        var shname: [byte: 5] = "bash";
-        var dashc: [byte: 4] = "-c";
-        var argv: [&const byte: 4] = [&shname[0], &dashc[0], cmd_z, null as &const byte];
-        _ = sys_execve(&shpath[0], &argv[0], &g_env_ptrs[0]) catch {};
+        if g_sh_exec == SH_EXEC_SANDBOX {
+            const bpath: &const byte = san_exec_path();
+            _ = sys_execve(bpath, san_exec_argv(), &g_env_ptrs[0]) catch {};
+        } else {
+            var shpath: [byte: 16] = "/bin/bash";
+            var shname: [byte: 5] = "bash";
+            var dashc: [byte: 4] = "-c";
+            var argv: [&const byte: 4] = [&shname[0], &dashc[0], cmd_z, null as &const byte];
+            _ = sys_execve(&shpath[0], &argv[0], &g_env_ptrs[0]) catch {};
+        }
         sys_exit(127);
     }
     const pid: i32 = i64_to_i32(pid64);
@@ -281,11 +355,16 @@ fn sh_run_background(cfg: &const Config, cmd_z: &const byte, workdir_z: &const b
         _ = sys_dup2(op[1], 2) catch {};
         _ = sys_close(op[1]) catch {};
         _ = sys_chdir(workdir_z as *const byte) catch {};
-        var shpath: [byte: 16] = "/bin/bash";
-        var shname: [byte: 5] = "bash";
-        var dashc: [byte: 4] = "-c";
-        var argv: [&const byte: 4] = [&shname[0], &dashc[0], cmd_z, null as &const byte];
-        _ = sys_execve(&shpath[0], &argv[0], &g_env_ptrs[0]) catch {};
+        if g_sh_exec == SH_EXEC_SANDBOX {
+            const bpath2: &const byte = san_exec_path();
+            _ = sys_execve(bpath2, san_exec_argv(), &g_env_ptrs[0]) catch {};
+        } else {
+            var shpath: [byte: 16] = "/bin/bash";
+            var shname: [byte: 5] = "bash";
+            var dashc: [byte: 4] = "-c";
+            var argv: [&const byte: 4] = [&shname[0], &dashc[0], cmd_z, null as &const byte];
+            _ = sys_execve(&shpath[0], &argv[0], &g_env_ptrs[0]) catch {};
+        }
         sys_exit(127);
     }
     const pid: i32 = i64_to_i32(pid64);
@@ -350,6 +429,21 @@ export fn sh_tool_bash(cfg: &const Config, args: &const JsonValue, out: &Buf) vo
         _ = buf_append_cstr(out, "Error: out of memory");
         return;
     }
+    // P18 闸门 1：read-only 模式下每条命令都要用户批准（对齐 DSH 的 approval=ask）
+    if perm_requires_approval() {
+        const verdict: i32 = ask_approve_command(cfg, cmd.ptr as &const byte, cmd.len);
+        if verdict == 0 {
+            buf_reset(out);
+            _ = buf_append_cstr(out, SH_DENIED);
+            return;
+        }
+        if verdict == 2 {
+            buf_reset(out);
+            _ = buf_append_cstr(out, SH_NO_CHANNEL);
+            return;
+        }
+        buf_reset(out);
+    }
     // 注入 DSH_* 环境
     var sess_id: Buf = buf_empty();
     if g_sess.id.len > 0 {
@@ -360,6 +454,11 @@ export fn sh_tool_bash(cfg: &const Config, args: &const JsonValue, out: &Buf) vo
         sess_path = g_sess.path;
     }
     sh_env_prepare(agent_dsh_home(), sess_id.ptr[0: sess_id.len], sess_path.ptr[0: sess_path.len]);
+
+    // P18 闸门 2：confined 模式必须真的套上沙箱（起不来就拒绝，不静默降级）
+    if !sh_prepare_exec(cfg, &cmd.ptr[0] as &const byte, out) {
+        return;
+    }
 
     if bg {
         const id: i32 = sh_run_background(cfg, &cmd.ptr[0] as &const byte, &wd_z.ptr[0] as &const byte, desc.ptr as &const byte, desc.len);
@@ -414,6 +513,13 @@ export fn sh_tool_bash(cfg: &const Config, args: &const JsonValue, out: &Buf) vo
     }
     if out_s.len >= cfg.max_tool_out || err_s.len >= cfg.max_tool_out {
         _ = buf_append_cstr(out, "[output truncated]\n");
+    }
+    // P18：沙箱拒绝的文件效果 —— confined + 真的套了壳 + 非零退出 + stderr 命中内核签名时补一行提示。
+    // 只是提示（不改强制），措辞也说明了这是内核拒的。
+    if g_sh_exec == SH_EXEC_SANDBOX && code != 0 && sh_err_is_sandbox_denied(&err_s) {
+        _ = buf_append_cstr(out, "[sandbox] the ");
+        _ = buf_append_cstr(out, perm_name(cfg.access));
+        _ = buf_append_cstr(out, " file sandbox denied a file effect of this command (writes outside the allowed roots are rejected by the kernel).\n");
     }
     _ = buf_append_cstr(out, "[exit code: ");
     _ = buf_append_u64(out, code as u64);
