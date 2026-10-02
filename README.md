@@ -69,7 +69,7 @@ DSH `permission.defaultPreset`），read-only 下 `write`/`edit` 硬拒、`bash`
 **P22 让终端标题自动跟着会话标题走**（对齐 DSH 的 session-title 口径）：交互模式起来先压
 标题栈并上基标题 `uya-agent · <工作目录名>`，第一条用户消息之后变成**裸会话标题**
 （前 5 个词 / ≤40 B / 清洗 + 码点边界截断），`--continue`、`/resume`、`--resume-dsh` 都能把
-已有标题接上，退出或收到终止信号时弹栈还给 shell（见踩坑 36）。
+已有标题接上，退出或收到终止信号时弹栈还给 shell（见踩坑 39）。
 
 ```
 $ ./build/uya-agent --show-reasoning "在当前工作目录写 p15-demo.txt，三行 alpha / beta / gamma；然后用 bash 打印它，并告诉我第二行。"
@@ -646,7 +646,7 @@ Messages API（`x-api-key` + `anthropic-version: 2023-06-01`，服务端工具 `
 * `session/title`（P22）就是终端标题的来源：首条用户消息派生一条（`source.kind = "fallback"`，
   对齐 DSH 的前 5 词 / ≤40 B 口径），恢复会话时由日志里**最后一条** title 事件决定标题。
   注意 `sess_open` 会重新初始化整个 `SessionLog`（含 `title`），所以恢复路径必须把回放出来的
-  标题在 `sess_open` 之后再放回去 —— 否则 `--continue` 的标题会静默丢掉（见踩坑 36）。
+  标题在 `sess_open` 之后再放回去 —— 否则 `--continue` 的标题会静默丢掉（见踩坑 39）。
 * 不持久化（恢复时重建）：AGENTS.md 与技能目录、运行时上下文、工具 schema；
   文件观察版本表在恢复后为空（与 DSH 已知限制一致）。
 
@@ -779,7 +779,9 @@ TTY 交互模式**默认全屏**（`--no-tui` 退回上一节的滚动转录；�
 * **浮层**：命令面板、会话列表（选一个 `/resume`）、帮助（`/help`）、`/status` 详情、
   **访问模式选择器与 Full access 确认**（P21，底对齐，贴着输入面板往上弹）、
   **read-only 下 bash 的逐条批准**（P21），以及 `ask_user_question` / `exit_plan_mode` 的
-  问答弹窗（↑/↓ + enter，esc = 无回答）。
+  问答弹窗（↑/↓ + enter，esc = 无回答）。`/help` 走的就是这里说的帮助**浮层**（不是滚动
+  模式的纯文本帮助）；`/exit`（同 `/quit`）在面板里选中或直接输入都会退出 ——
+  命令的返回值就是「停」，三种入口（面板 / steer / 普通提交）都尊重它。
 * **数据流**：TUI 激活后 `tty.uya` 的 `tty_write` 变成一个 **sink** —— 通道 1（助手正文）、
   2（工具块/诊断）、3（思考，新增 `tty_reason_write`）全部进转录，**fd 1 一个字节都不写**
   （管道语义干净，`tui-turn` 轮断言 fd 1 捕获 0 字节）；工具卡片不是靠前缀嗅探，而是
@@ -1410,7 +1412,39 @@ vLLM 等 OpenAI 兼容端点都一样稳。想升级成严格 `tool` 角色消�
     + `toolcalls-big` 的 `agent_run returned 3`）—— 那正是修前的现场（见 §6 的验收记录，
     那里还有用**真实故障会话** + `testdata/mock_gateway_bigcall.py` 做的 before/after 对照）。
 
-36. **终端标题（OSC）是「写出去就收不回来」的一类字节：谁来写、写去哪、写什么，三个都得钉死。**
+36. **「当前状态」和「刚才发生了什么」混在一个变量里，结果就会被静默丢掉。**
+    这一条在本仓库**踩过不止一次**：`tui_ov_accept()` 先写结果、再
+    `tui_overlay_close()`，而 close 会把 `g_tui_ov_kind` 归零；调用方却是
+    「先 `tui_overlay_take()`、后读 `tui_overlay_kind()`」—— 读到的永远是 0，
+    命令面板与会话列表的选中项被无声丢弃（`/` 开面板 → 选中 → 回车 = 什么都不发生）。
+    §2 的访问模式一节记了修法（accept 把 kind 存进 `g_tui_ov_done`，浮层关闭时
+    `tui_overlay_kind()` 回退到它），这里只留教训：**清理「当前状态」的代码路径，
+    不能顺手把「刚才发生了什么」也清掉**；两者的生命周期不同，就该是两个变量。
+    同类形状还有「take 之后才问类型」「消失的浮层已经答过一句话」——
+    新增浮层类型时先确认读 kind 的时机。
+
+37. **TUI 主循环把命令的返回值丢掉，`/exit` 就成了摆设。**
+    `agent_repl_command()` / `agent_tui_command()` 的返回值语义是「该停了吗」，
+    滚动模式的 REPL 一直在用（`const stop = …; if stop { run = false }`），
+    但 TUI 那三处调用点全写成 `_ = agent_tui_command(…)` —— 于是 TUI 里
+    **直接输入 `/exit` 回车不退出**，面板里选中 `/exit` 同样不退出。
+    更阴的是它看起来「像在工作」：`ctrl+d`（空行退出）走的是另一条键位路径，
+    所以手动测的时候很容易被 `ctrl+d` 的成功掩盖。修法是把三处调用点都接上返回值。
+    回归：`tui-pty` 轮的退出动作从 `ctrl+d` 换成 **`/exit` + 回车** ——
+    正因为 `ctrl+d` 不经过命令分派，它测不出这个 bug；换掉之后旧实现立刻报
+    「`/exit` 之后子进程没有退出（命令的返回值被丢了？）」，并且连带报出
+    「没有离开备用屏幕 / termios 没有还原」（进程根本没走到收尾）。
+
+38. **浮层标题的「字节数」写死 = 读越界，而且字符数不等于字节数。**
+    `tui_overlay_list(kind, title, tn, …)` 的 `tn` 是**字节数**，实现按它 `memcpy`。
+    三处调用把字节数拍成了字符数/旧值：会话标题写 `44`（实际 38）、状态标题写 `46`
+    （实际 22）、确认标题写 `6`（「请确认」实际 9）。多出来的部分会把 `.rodata` 里
+    紧邻的字面量字节一起复制进标题缓冲 —— 屏幕上就是标题尾巴上挂着别的命令的碎片，
+    而且 `×` 这个形状会先在 client 侧 OOB 崩掉（不是每次都能崩，更毒）。
+    规矩：**能用 `strlen()` / `bufx_cstr_len()` 量就别写死**，这条仓库里已经重复过
+    好几次（`tui_overlay_confirm` 的 `6`、`tui_set_commands` 的字面量长度）。
+
+39. **终端标题（OSC）是「写出去就收不回来」的一类字节：谁来写、写去哪、写什么，三个都得钉死。**
     P22 把终端标题接上会话标题时，一次踩齐三条：
     * **谁来写（门控）**：OSC 只能写给**真 TTY 的交互界面**。管道里带一个 `ESC]2;…BEL`
       就是坏数据（opencode 有过一次真实事故：ACP 模式把 OSC 0 写进了 stdout，直接把
@@ -1524,13 +1558,13 @@ agent 循环并逐项断言：
 | `procx-parse` | `/proc/<pid>/stat` 解析：comm 取**第一个 `(` 到最后一个 `)`**（comm 里允许空格与括号）、utime/stime 是 `)` 之后第 12/13 个字段、`|` 后的 cutime/cstime 必须忽略、state 是字母（`S`/`D`）时能跳过；坏行（无括号 / 无右括号 / 缺 stime / utime 非数字）必须失败；`/proc` 目录项名过滤（纯数字才算 pid，`self`/`.`/`..`/11 位不算） |
 | `procx-percent` | `Δticks × 1000 / Δms`：0 / 37 / 100（一个核）/ 250（并行 > 100%）/ 0.5% 向上取整 / `Δms=0` 不可算 / 负增量按 0 / 上限钳 999；`USER_HZ = 100` 常量 |
 | `cpu-live` | fork 一个忙循环 400ms 的子进程（同一个二进制 → comm 相同），父进程睡 450ms 后两次采样：进程数必须涨、综合 `%cpu ≥ 25`、有时间跨度；只建基线的那次必须不给百分比（防除零爆表） |
-| `tui-pty` | **真 PTY**（`/dev/ptmx` + `fork` + `dup2(slave→0/1/2)`）：进备用屏幕（`ESC[?1049h`）、首屏面板/logo、发任务后转录出现 mock 最终答案、`SIGWINCH`（改 winsize + 发信号）后进程仍活着并继续重绘、Ctrl-D 退出码 0、退出后 `TCGETS` 与 fork 前**逐位相同**、离开备用屏幕；不需要 setsid/TIOCSCTTY（fd 0 就是 pts 从设备、Ctrl-C 由程序自己吃字节）；**P22 起还断言终端标题**：起始 `ESC[22t` + `ESC]2;uya-agent · selftest_ws_tui_pty BEL`（且首帧捕获里 OSC 2 **只有 1 条** = 标题不是每帧重写的）→ 发任务后 `ESC]2;把 hello-selftest 写进 note.txt BEL`（OSC 2 共 2 条）→ 退出时 `ESC[23t` 且出现在最后一条标题之后 |
+| `tui-pty` | **真 PTY**（`/dev/ptmx` + `fork` + `dup2(slave→0/1/2)`）：进备用屏幕（`ESC[?1049h`）、首屏面板/logo、发任务后转录出现 mock 最终答案、`SIGWINCH`（改 winsize + 发信号）后进程仍活着并继续重绘、**`/exit` + 回车**退出码 0（刻意不用 Ctrl-D：它不走命令分派，测不出「命令返回值被丢掉」）、退出后 `TCGETS` 与 fork 前**逐位相同**、离开备用屏幕；不需要 setsid/TIOCSCTTY（fd 0 就是 pts 从设备、Ctrl-C 由程序自己吃字节）；**P22 起还断言终端标题**：起始 `ESC[22t` + `ESC]2;uya-agent · selftest_ws_tui_pty BEL`（且首帧捕获里 OSC 2 **只有 1 条** = 标题不是每帧重写的）→ 发任务后 `ESC]2;把 hello-selftest 写进 note.txt BEL`（OSC 2 共 2 条）→ 退出时 `ESC[23t` 且出现在最后一条标题之后 |
 | `perm-modes` | 三级访问模式的机器名 ↔ 值 ↔ 显示名（含 DSH 产品名 `Full access`）、`custom`/空串判 -1、策略真值表（`confine` / `allows_write` / `requires_approval`） |
 | `perm-readonly` | mock LLM 一轮 3 个调用：read-only 下 `write` 必须回逐字拒绝串且**文件没落盘**、`bash` 在非交互会话里必须 fail closed（回「无回答渠道」串、命令输出一个字都不给）而 `read` 照常；请求里必须带 read-only 的 file policy 句 |
 | `san-profile` | 三档 profile 的 bwrap argv 逐字断言：read-only = `--ro-bind / / --dev /dev --proc /proc --unshare-pid` 且**没有**可写挂载；workspace-write 多 `--tmpfs /tmp` + `--bind <ws> <ws>`；full access 与 `--no-sandbox` 不套壳；工作区是 `/` 时不加可写 bind；bwrap 不可用时只断言「confined 必须返回 fail closed」 |
 | `san-shell` | 直接 fork 出沙箱命令实测（不经工具闸门）：read-only 里 `> /dev/null` 成功、写 `/tmp` 被拒且文件不出现；workspace-write 里工作区内写入逐字节正确、`../` 区外写入被拒；本机没有 bwrap 时打一行 skip（不假绿） |
 | `san-tool` | 端到端：`--permission workspace-write` 下让模型跑一条**同时**写工作区内与区外的命令 —— 区内文件必须落盘、区外文件必须不存在（工具层没拦它，是内核拦的） |
-| `tui-access` | 访问模式 chip 三种模式的显示、`shift+tab` 只置请求（主循环据此开浮层）、选择器打开（三行齐 + `✓` 只在当前模式那行 + 圆角框 + esc 取消不变更）、↓+enter 选中 Workspace Write 交给处理器（策略全局 + chip + 转录 notice + **恰好一条** runtime-context 注入且不上屏）、运行中切换时 `cfg.access` 必须跟着走（故意把 cfg 设成旧值）、选 Full access 只翻出确认层（游标默认「取消」→ 回车无变化；↑+enter 才切）；末尾一条**回归**：命令面板里选 `/status` 必须真的派发（浮层结果不许被静默丢掉）；每步都查「每行 ≤ cols、正文层无 ESC」 |
+| `tui-access` | 访问模式 chip 三种模式的显示、`shift+tab` 只置请求（主循环据此开浮层）、选择器打开（三行齐 + `✓` 只在当前模式那行 + 圆角框 + esc 取消不变更）、↓+enter 选中 Workspace Write 交给处理器（策略全局 + chip + 转录 notice + **恰好一条** runtime-context 注入且不上屏）、运行中切换时 `cfg.access` 必须跟着走（故意把 cfg 设成旧值）、选 Full access 只翻出确认层（游标默认「取消」→ 回车无变化；↑+enter 才切）；末尾两条**回归**：命令面板里选 `/status` 必须真的派发（浮层结果不许被静默丢掉）、`/help` 必须开**帮助浮层**（不许掉回滚动模式的纯文本帮助）；每步都查「每行 ≤ cols、正文层无 ESC」 |
 | `tui-approve` | read-only 下 bash 逐条批准，两种形态：① headless（注入的键在浮层打开前就被输入行吃了）= 没人回答 → **fail closed**，转录出现逐字拒绝串、命令 stdout 不出现、且不是「没有回答渠道」那条；② **真 PTY**：等 `Read Only：批准这条 bash 命令？` 画出来再送 `↑`+回车 → 命令真的跑（stdout 进转录与下一封请求）、退出码 0 |
 | `sig-abi` | `SigxAction` 必须是**宿主 glibc** 布局（152 字节；handler@0 / flags@136 / restorer@144，按字节回读）；恢复序列逐字节四种形状（P22 起）：带备用屏幕 26 字节 / 不带 18 字节 / 带备用屏幕+弹标题栈 31 字节（`ESC[23t` 排在离开备用屏幕**之前**）/ 不带备用屏幕+弹标题栈 23 字节 |
 | `sig-basic` | 处理器装上以后真的被调用、返回以后进程还活着（P0 的回归闸门：缺 `SA_RESTORER` 的实现在这里直接 139）；`SIGWINCH` 处理器只置标志、取用即清零 |
@@ -1635,7 +1669,7 @@ responses 看 `call_id`）；**chat 与 responses 各一轮**，且顺便断言�
 | `diag-echo-400` / `diag-echo-400-ns` | 端到端（mock mode 24，流式与非流式各一轮）：mock 网关回 **400 + 把整个请求原样回显**（含请求头的 CRLF 与 `tools` 数组）→ 断言 fd 2 上只有 `model endpoint returned HTTP 400` + 一行转义预览：CR 转义成 `\x0d`、**没有裸 CR/NUL/ESC**、行数 ≤6、总长 ≤1 KiB；同时断言 `--debug-dump` 里有完整原文、会话日志里有 `diag/dump` 事件（`kind`/`bytes`/`truncated`/`text`，文本里同样没有裸控制字节）。这两条就是「转录一屏乱码」的现场回归 |
 | `tui-diag` | 显示层轮（P19）：4 KiB 的 JSON 块从 fd 2 进来 → NOTICE 只留 ≤512 B + 一行截断提示（不修则 40 份重复铺满整屏）；半截汉字在屏幕上变成 **U+FFFD** 且屏幕文本 `bufx_utf8_valid` 为真（终端不会自己渲染半个字）；正文层无 ESC；思考条目尾部截断（4096 B、中文 3 B/字）不切出半个汉字 （这一轮把 `tty_sink_on` 打开做验证，**收尾必须关回去** —— 漏了的话后面每一轮的输出、连最终的 `SELFTEST PASS/FAIL` 都会被吞进转录缓冲区，终端上看起来就是「跑完没有下文」） |
 | `read-window` | `read` 的行窗口（P19，踩坑 34）：在 4000 行 × 40 B = 160 KB（> 读缓冲上限 116736）的文件上直接调 read 工具（args 现造、走真实 JSON 解析路径）——断言 `limit=1000` → `(Showing lines 1-1000 of 4000. …)`（**total 是真值**，旧实现报前缀行数）、`offset=3500` → 真读到 `3500: L03500`（旧实现这里是假 EOF）、`offset=4001` → 才是 `(End of file - total 4000 lines)`、`limit=2000` → 走 `(Output capped …)`、末尾无换行的残行算进 `total`（`a\nb\nc` → 3 行） |
-| `title-format` | 终端标题的纯函数轮（P22，踩坑 36）：清洗 —— OSC（BEL 收尾 / ST 收尾 / **未终结吃到尾**）、CSI（含 `1;38;5;196m` 这种最长参数形态）、两字节与带中间字节的 ESC 序列**整段消失**，末尾孤立 ESC 也吃掉；C0 与 DEL 丢掉、TAB/LF/CR/VT/FF 与 NBSP/全角空格折叠成**一个**空格并去首尾（全空白 → 空串）；零宽与方向控制符（U+200B/U+202E/U+FEFF/U+2060）丢掉；半截汉字与坏引导字节丢掉且结果 `bufx_utf8_valid` 为真；**40 B 上限切在码点边界**（14 个汉字 42 B → 只留 13 个 = 39 B）。兜底派生 —— 前 5 个词、词没切完就被 40 B 截断（`把 tty-title 写进 note.txt 然后回答 ok` → `把 tty-title 写进 note.txt 然后回`）、单个超长词按字节截断、首条消息里混进 `ESC]2;hacked BEL` 不落地、全空白不产生标题。基标题 —— `/tmp/p22-ws/` → `uya-agent · p22-ws`、`/` 与空路径 → `uya-agent`。上屏编码（管道抓字节、逐字节比对）—— `ESC[22t` 压栈 → `ESC]2;<标题>BEL` → **同标题不重复写** → 空标题不写 → 关通道后一个字节不写 → `ESC[23t` 弹栈；80 B 上限同样切在码点边界（26 个汉字 = 78 B） |
+| `title-format` | 终端标题的纯函数轮（P22，踩坑 39）：清洗 —— OSC（BEL 收尾 / ST 收尾 / **未终结吃到尾**）、CSI（含 `1;38;5;196m` 这种最长参数形态）、两字节与带中间字节的 ESC 序列**整段消失**，末尾孤立 ESC 也吃掉；C0 与 DEL 丢掉、TAB/LF/CR/VT/FF 与 NBSP/全角空格折叠成**一个**空格并去首尾（全空白 → 空串）；零宽与方向控制符（U+200B/U+202E/U+FEFF/U+2060）丢掉；半截汉字与坏引导字节丢掉且结果 `bufx_utf8_valid` 为真；**40 B 上限切在码点边界**（14 个汉字 42 B → 只留 13 个 = 39 B）。兜底派生 —— 前 5 个词、词没切完就被 40 B 截断（`把 tty-title 写进 note.txt 然后回答 ok` → `把 tty-title 写进 note.txt 然后回`）、单个超长词按字节截断、首条消息里混进 `ESC]2;hacked BEL` 不落地、全空白不产生标题。基标题 —— `/tmp/p22-ws/` → `uya-agent · p22-ws`、`/` 与空路径 → `uya-agent`。上屏编码（管道抓字节、逐字节比对）—— `ESC[22t` 压栈 → `ESC]2;<标题>BEL` → **同标题不重复写** → 空标题不写 → 关通道后一个字节不写 → `ESC[23t` 弹栈；80 B 上限同样切在码点边界（26 个汉字 = 78 B） |
 | `tty-title-pty` | 滚动模式（`--no-tui`）的真 PTY 轮（P22）：`tui-pty` 覆盖的是「备用屏幕 + 私有 dup fd」那条接线，这条覆盖 `fd 2 + 没有备用屏幕 + sigx_arm(2,false,true)` 那条 —— 压栈 + 基标题 `uya-agent · selftest_ws_tty_title`、打一行任务后标题变成该行前 5 个词（≤40 B）、跑完这一轮（mock 最终答案出现）、Ctrl-D 退出码 0、退出时弹栈且**弹栈在最后一条标题之后**、全程不进备用屏幕 |
 
 **P1/P2 的验收事实**（2026-10-02）：
@@ -1727,7 +1761,7 @@ responses 看 `call_id`）；**chat 与 responses 各一轮**，且顺便断言�
   回答 `BIGCALL-OK 请求数=2 头=True 尾=True`、落盘文件 9618 字节且头尾标记逐字节正确 ——
   也就是那条「已恢复 255 条消息」的真实历史现在能继续跑下去了。
 
-* **P22 的验收记录（2026-10-03，对应踩坑 36）**：在真 PTY 里跑**真二进制**逐场景抓字节
+* **P22 的验收记录（2026-10-03，对应踩坑 39）**：在真 PTY 里跑**真二进制**逐场景抓字节
   （同一个 `/tmp` 小脚本：fork + `openpty` + 把 slave 挂到 0/1/2，往主设备打字、把主设备
   读到的字节按 `ESC]2;…BEL` 摘出来；网关指向 `http://127.0.0.1:1/v1` = 必然连不上，
   所以这一轮只验标题通道、不依赖真模型）：
