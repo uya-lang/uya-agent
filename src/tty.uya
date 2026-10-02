@@ -40,6 +40,17 @@ const TTY_CC_VMIN: usize = 6;
 const TTY_LINE_MAX: usize = 8192;
 const TTY_HIST_MAX: usize = 32;
 const TTY_EVQ_MAX: usize = 16;
+const TTY_BLOCK_TEXT_MAX: usize = 8192;    // 面板块快照上限（子代理窗口等）
+
+// 面板块（P15）：输入行块 = [窗口行…] + [提示符+输入行]。快照（窗口行文本）由上层用
+// tty_block_begin 推到这里 —— tty 层不认识 deleg/view，只负责「多行块的擦除与重画」。
+// 上层在**任何可能变化的地方**调它的刷新入口（agent_agents_tick），它会：
+//   生成快照 → 内容变了就 tty_block_begin → tty_block_redraw（原地重画）。
+//
+// 为什么不在这里挂回调：uya 0.10 **没有函数指针**（`export type f = fn() bool` 直接语法报错，
+// 标准库里 `libc/stdlib.uya` / `lib/tflm` 都留了「函数指针暂不支持」的注释），
+// 所以只能「上层推、下层画」。
+
 
 // ---- 转义序列：必须用数组字面量 ----
 // uya 0.10 的坑：`&"\r\x1b[2K"[0: 5]` 求值出来是**切片描述符**（{ptr,len} 结构体）的地址，
@@ -48,6 +59,7 @@ const TTY_EVQ_MAX: usize = 16;
 // ASLR 变（实测 `\xb9x\xe0gi` 这种）。数组字面量取址才是真正的字节指针。
 // `make codegen-audit` 会扫构建产物里的这种形状，防止再写回去。
 const TTY_SEQ_CURSOR_SHOW: [byte: 6] = [27, 91, 63, 50, 53, 104];   // "\x1b[?25h"
+const TTY_SEQ_CRLF: [byte: 2] = [13, 10];                            // "\r\n"（面板块每行收尾）
 
 // ---- 事件 ----
 export const TTY_EV_NONE: i32 = 0;
@@ -116,6 +128,11 @@ export struct TtyUi {
     start_col: usize,       // 输入行块的起始列（流式输出没换行时它不是 0）
     out_col: usize,         // 光标当前的物理列（追踪所有 tty_write 的输出）
     out_wrap: bool,         // 上一行正好写满：下一个字节会落到下一行第 0 列
+    // ---- 面板块（P15，见文件头的说明）----
+    block: Buf,             // 窗口行快照（上层用 tty_block_begin 推下来）
+    block_enabled: bool,    // 上层有没有窗口要显示（tty_set_block_provider）
+    block_on: bool,         // 屏幕上画出来的块里**是否含窗口行**（擦除按它选协议）
+    input_on_screen: bool,  // 「提示符+输入」在屏幕上但输入为空（此时块要复用它当底行）
 }
 
 fn tty_ptr_i64(p: &void) i64 {
@@ -159,6 +176,7 @@ export fn tty_init(ui: &TtyUi, fd: i32) void {
     ui.saved = tty_termios_zero();
     ui.line = buf_new(TTY_LINE_MAX);
     ui.prompt = buf_new(64);
+    ui.block = buf_new(TTY_BLOCK_TEXT_MAX);
     ui.stash = buf_new(TTY_LINE_MAX);
     ui.pend = buf_new(TTY_LINE_MAX);
     ui.cursor = 0;
@@ -172,6 +190,10 @@ export fn tty_init(ui: &TtyUi, fd: i32) void {
     ui.start_col = 0;
     ui.out_col = 0;
     ui.out_wrap = false;
+    ui.block_enabled = false;
+    ui.block_on = false;
+    ui.input_on_screen = false;
+    buf_reset(&ui.block);
     var i: usize = 0;
     while i < TTY_HIST_MAX {
         ui.hist[i] = buf_empty();
@@ -200,6 +222,7 @@ export fn tty_refresh_cols(ui: &TtyUi) void {
 export fn tty_free(ui: &TtyUi) void {
     buf_free(&ui.line);
     buf_free(&ui.prompt);
+    buf_free(&ui.block);
     buf_free(&ui.stash);
     buf_free(&ui.pend);
     var i: usize = 0;
@@ -263,6 +286,193 @@ export fn tty_set_prompt(ui: &TtyUi, text: &const byte) void {
     }
     // 注意：**不能**在这里清 line_on_screen —— 屏幕上那一行还在（只是提示符要改），
     // 清了就等于「没有东西要擦」，下次重画会把旧提示符/new prompt 叠在一起。
+}
+
+// ============================================================
+// 面板块（P15）：输入行块上方的多行窗口（子代理面板等）
+//
+// 块形状（示例：1 行标题 + 2 行内容 + 1 行底框）：
+//
+//     ┌──────┐      ← 窗口行 0
+//     │ ● …  │      ← 窗口行 1
+//     └──────┘      ← 窗口行 2
+//     [step 4] > 打字…   ← 输入行（块的最后一行，**恒在第 0 列**）
+//
+// 不变量（擦除算术全靠它）：
+//   * 块底行 = 提示符+输入行，恒从第 0 列开始（窗口行写完之后才写它，前面有 "\r\n" 归零）；
+//   * 块首行可能不在第 0 列（流式正文没换行时紧跟在正文后面），列号记在 start_col；
+//   * 擦除 = 上移 (rows-1) 行回到块首行（**相对量**，不受终端滚动/绝对行号影响）→
+//     右移到 start_col → 逐行 `ESC[2K` 清到块底行为止。
+//     逐行清而**不用 `ESC[J`**：后者清到屏幕末尾，会连带清掉「紧跟正文的输入行」下面
+//     那些仍然可见的正文文本（缓冲区里还有，屏幕上看不见 = 用户以为丢了输出）。
+// ============================================================
+
+// 注册/清除面板块（P15）。clear=true 时清空快照（上层没有任何窗口要显示）。
+// 幂等：REPL 每轮都会调。
+export fn tty_set_block_provider(ui: &TtyUi, on: bool) void {
+    ui.block_enabled = on;
+    if !on {
+        ui.block_on = false;
+    }
+}
+
+export fn tty_block_on() bool {
+    return tty_ui.block_on;
+}
+
+// 提示符+输入行所在的块内相对行（= 全部窗口行占的行数）：写完全部窗口行之后光标已在
+// 最后一行的第 0 列，所以提示符+输入就从那一行开始算。
+// 不变量：tty_block_vis0(...) == tty_block_rows(...) - 1（自测里断言）。
+//
+// 实现刻意写成「行数 - 1」而不是再走一遍类似的循环：两个函数的列算术必须**逐字一致**，
+// 各写一遍迟早会分叉（第一版就是这样：同样的循环，一个累加得到 2、另一个得到 0）。
+export fn tty_block_vis0(b: &[byte], cols: usize, col0: usize) usize {
+    const rows: usize = tty_block_rows(b, cols, col0);
+    if rows == 0 {
+        return 0;
+    }
+    return rows - 1;
+}
+// 块占几个物理行：逐行按显示列算（一行写满整行宽时占 1 行 —— DECAWM 挂起换行，
+// 口径与 tty_end_row_col / tty_rows_of 一致，踩坑 23）。
+export fn tty_block_rows(b: &[byte], cols: usize, col0: usize) usize {
+    const n: usize = b.len;
+    if n == 0 {
+        return 0;
+    }
+    if cols == 0 {
+        return 1;
+    }
+    var c: usize = col0;
+    var rows: usize = 0;
+    var i: usize = 0;
+    while i < n {
+        const nl: isize = bufx_find_byte(b, 10 as byte, i);
+        var stop: usize = n;
+        var last: bool = true;
+        if nl >= 0 {
+            stop = nl as usize;
+            last = false;
+        }
+        var w: usize = tty_cols_between(b.ptr as &const byte, i, stop);
+        if w == 0 {
+            w = 1;          // 空行也占一行
+        }
+        const t: usize = c + w;
+        var r: usize = t / cols;
+        if r == 0 {
+            r = 1;          // 挂起换行：正好写满整行仍停在**本行**最后一列
+        }
+        rows = rows + r;
+        c = t % cols;
+        if last {
+            i = n;
+        } else {
+            i = stop + 1;
+            c = 0;
+        }
+    }
+    return rows;
+}
+
+// total 列文本在 cols 列终端里占几行（挂起换行口径：正好写满整行算 1 行）
+fn tty_block_line_rows(total: usize, cols: usize) usize {
+    if cols == 0 {
+        return 1;
+    }
+    const r: usize = total / cols;
+    if r == 0 {
+        return 1;
+    }
+    return r;
+}
+
+// 从 (base_row, base_col) 起算 total 列之后，光标的绝对行列。
+// 老函数 tty_end_row_col 就是 base 为 (0,0) 的特例 —— 面板块擦除之后必须从「已知的块首行」
+// 这个基准点重新算，否则「光标已在目标位置就不发序列」那条捷径会在**块变矮**时提前返回，
+// 把新块的尾巴留在屏幕上、并把 cur_row 记错（下一次擦除就错位）。
+export fn tty_end_pos(total: usize, cols: usize, base_row: usize, base_col: usize, row: &usize, col: &usize) void {
+    if cols == 0 {
+        row[0] = base_row;
+        col[0] = base_col;
+        return;
+    }
+    const t: usize = base_col + total;
+    const r: usize = t / cols;
+    const c: usize = t % cols;
+    if c == 0 && t > 0 {
+        row[0] = base_row + r - 1;      // 挂起换行：仍停在本行最后一列
+        col[0] = cols - 1;
+        return;
+    }
+    row[0] = base_row + r;
+    col[0] = c;
+}
+
+// 面板块的擦除序列：先回到块首行 → 右移到块首列 → 逐行清到底。
+// 返回写入的字节数；out_col 回传擦除后的光标绝对列（块首行第 col0 列）。
+// 自测逐字节断言这里 —— 错一个字节屏幕上就是残影或错位。
+export fn tty_build_block_erase(dst: &byte, rows: usize, col0: usize, out_col: &usize) usize {
+    var r: usize = rows;
+    if r == 0 {
+        r = 1;              // rows==0 不合法：退化成单行，绝不写 ESC[0A
+    }
+    var k: usize = 0;
+    if r > 1 {
+        dst[k] = 27; k = k + 1;          // ESC [ <r-1> A
+        dst[k] = 91; k = k + 1;
+        k = k + tty_put_dec(&dst[k], r - 1, 3);
+        dst[k] = 65; k = k + 1;
+    }
+    dst[k] = 13; k = k + 1;              // '\r' 回第 0 列
+    if col0 > 0 {
+        dst[k] = 27; k = k + 1;          // ESC [ <col0> C（col0=0 时不能写，CSI 参数 0 是默认值）
+        dst[k] = 91; k = k + 1;
+        k = k + tty_put_dec(&dst[k], col0, 3);
+        dst[k] = 67; k = k + 1;
+    }
+    var i: usize = 0;
+    while i < r {
+        dst[k] = 27; k = k + 1;          // ESC [ 2 K
+        dst[k] = 91; k = k + 1;
+        dst[k] = 50; k = k + 1;
+        dst[k] = 75; k = k + 1;
+        dst[k] = 13; k = k + 1;          // '\r'
+        i = i + 1;
+    }
+    out_col[0] = col0;
+    return k;
+}
+
+// 快照变了就立刻重画一次（面板原地更新）。屏幕上没有输入行时什么都不做 ——
+// 下一次正常重画自然会带上新快照（tty_draw_line 直接读 ui.block）。
+export fn tty_block_redraw(ui: &TtyUi, fd: i32) void {
+    if !ui.block_on || !ui.line_on_screen {
+        return;
+    }
+    tty_draw_line(ui, fd);
+}
+
+// 上层把新快照推下来（内容变了才调）。注意**不要**在这里动 block_on：
+// 屏幕上那一块还是旧样子，擦除要按旧行数来，等 tty_draw_line 时再一起换。
+export fn tty_block_set(ui: &TtyUi, text: &const byte, n: usize) void {
+    buf_reset(&ui.block);
+    if n > 0 && n <= TTY_BLOCK_TEXT_MAX {
+        _ = buf_append(&ui.block, text, n);
+    }
+}
+
+// 便利wrapper：正常路径只有 tty_ui 一个界面
+export fn tty_block_begin(text: &const byte, n: usize) void {
+    tty_block_set(&tty_ui, text, n);
+}
+
+export fn tty_block_clear() void {
+    tty_block_set(&tty_ui, null as &const byte, 0);
+}
+
+export fn tty_block_len() usize {
+    return tty_ui.block.len;
 }
 
 // ============================================================
@@ -830,19 +1040,9 @@ export fn tty_rows_of(total: usize, cols: usize) usize {
 // 写满 total 列之后光标实际停在哪一行哪一列。
 // DECAWM：字符正好落在最后一列时光标仍留在本行（挂着待换行），不会立刻跳下一行 ——
 // 这个口径必须和 tty_rows_of 一致，否则上移量会差一行、擦除越擦越乱。
+// 实现落在 tty_end_pos 上（基准点 = 块首）—— 面板块擦除之后要从块首这个已知点重算。
 export fn tty_end_row_col(total: usize, cols: usize, row: &usize, col: &usize) void {
-    if cols == 0 {
-        row[0] = 0;
-        col[0] = 0;
-        return;
-    }
-    if total > 0 && total % cols == 0 {
-        row[0] = (total / cols) - 1;
-        col[0] = cols - 1;
-        return;
-    }
-    row[0] = total / cols;
-    col[0] = total % cols;
+    tty_end_pos(total, cols, 0, 0, row, col);
 }
 
 // 把 n 的十进制写进 dst（最多 max_digits 位，max_digits <= 6）；返回写入字节数
@@ -970,12 +1170,73 @@ export fn tty_draw_line(ui: &TtyUi, fd: i32) void {
     if cols == 0 {
         cols = 80;
     }
-    // 先把上一次画的（可能折成好几行）擦干净。擦除只清输入行自己占的格子。
-    tty_erase_line(ui, fd);
 
-    // 块首物理列：上一行正好写满时（out_wrap）下一个字节落到下一行第 0 列
+    // ---- 面板块：只在「干净行」上画 ----
+    // 不干净（模型正文停在半行）时不画窗口行、只画提示符：擦除算术要按整块来算，
+    // 半行状态下块首列/行数都不确定，硬画就会把正文擦掉或留下错位的竖线。
+    // input_on_screen：屏幕上只留着「空提示符 + 空输入行」，此时复用它当块底行，
+    // 不必先换行、也不会多出一行。
+    const blk_len: usize = ui.block.len;
     const col0: usize = if ui.out_wrap { 0 as usize } else { ui.out_col };
-    ui.start_col = col0;
+    // 「干净行」：光标在第 0 列（或上一行正好写满、下一个字节落到第 0 列）。
+    // 只有这时候才把窗口行画出来 —— 块首行不在第 0 列时，块的列算术与擦除都会变得
+    // 难以自洽（首行会跟正文挤在同一行上，实测会把面板第一行截成半截）。
+    const stable: bool = ui.out_col == 0 && !ui.out_wrap;
+    const use_block: bool = ui.block_enabled
+        && blk_len > 0
+        && (ui.prompt.len + ui.line.len) > 0
+        && (stable || ui.input_on_screen);
+
+    // 块首物理列（擦除用旧值、重画用新值）：上一行正好写满时（out_wrap）下一字节落到下一行第 0 列
+    const old_col0: usize = if ui.out_wrap { 0 as usize } else { ui.out_col };
+    const new_col0: usize = if use_block { 0 as usize } else { old_col0 };
+
+    // 先把上一次画的（可能折成好几行）擦干净。擦除只清输入行块自己占的格子。
+    var cur_row: usize = ui.cur_row;
+    if ui.block_on {
+        // 多行面板块：上移 (rows-1) 行回块首行（相对量，扛滚动）→ 右移到块首列 → 逐行清到底。
+        var eb: [byte: 512] = [0: 512];
+        const ec: usize = tty_build_block_erase(&eb[0], ui.cur_row + 1, ui.start_col, &ui.out_col);
+        if ec > 0 {
+            _ = sys_write(fd, &eb[0], ec) catch {};
+        }
+        ui.line_on_screen = false;
+        ui.cur_row = 0;
+        ui.start_col = ui.out_col;
+        ui.out_wrap = false;
+        ui.input_on_screen = false;
+        cur_row = 0;
+    } else {
+        tty_erase_line(ui, fd);
+    }
+    ui.start_col = new_col0;
+
+    // ---- 写：窗口行（每行自带 "\r\n"，保证块底行从第 0 列开始）----
+    if use_block {
+        const blk: &[byte] = ui.block.ptr[0: blk_len];
+        var i: usize = 0;
+        while i < blk_len {
+            const nl: isize = bufx_find_byte(blk, 10 as byte, i);
+            var stop: usize = blk_len;
+            var last: bool = true;
+            if nl >= 0 {
+                stop = nl as usize;
+                last = false;
+            }
+            const ln: usize = stop - i;
+            if ln > 0 {
+                _ = sys_write(fd, ui.block.ptr + i, ln) catch {};
+            }
+            _ = sys_write(fd, &TTY_SEQ_CRLF[0], 2) catch {};
+            if last {
+                i = blk_len;
+            } else {
+                i = stop + 1;
+            }
+        }
+        ui.out_col = 0;
+        ui.out_wrap = false;
+    }
 
     var total: usize = 0;    // 块首起算的总显示列数
     if ui.prompt.len > 0 {
@@ -988,25 +1249,54 @@ export fn tty_draw_line(ui: &TtyUi, fd: i32) void {
         total = total + tty_cols_between(ui.line.ptr as &const byte, 0, ui.line.len);
     }
     ui.line_on_screen = true;
+    // 屏幕上现在只有「提示符 + 空输入行」（或整块都没有）：此时块可以复用它当底行
+    const empty_ctx: bool = (ui.out_col == 0 && !ui.out_wrap) || !ui.input_on_screen;
+    ui.input_on_screen = ui.line.len == 0 && empty_ctx;
+    // 记下「屏幕上这一块里到底有没有窗口行」——下一次擦除按它选协议（漏掉这一句，
+    // 面板就只擦掉输入行、窗口行留在屏幕上，下次重画再叠一层）。
+    ui.block_on = use_block;
 
     // 画完后的物理位置（写满一行的挂起换行口径与 tty_end_row_col 一致）
     var erow: usize = 0;
     var ecol: usize = 0;
-    tty_end_row_col(col0 + total, cols, &erow, &ecol);
+    tty_end_row_col(new_col0 + total, cols, &erow, &ecol);
     ui.out_col = ecol;
-    const xcols: usize = col0 + total;
+    const xcols: usize = new_col0 + total;
     ui.out_wrap = xcols > 0 && (xcols % cols) == 0;
 
     // 光标该在哪：块首列 + 提示符 + 光标前文本的列数。这里必须和 tty_end_row_col 用
     // **同一口径**算行列：写满整行时光标物理上停在最后一列（挂着待换行），不能算成
     // 「下一行第 0 列」，否则擦除时会多上移一行、把上一行输出（banner 之类）擦掉。
-    const ttotal: usize = col0 + pcols + tty_cols_between(ui.line.ptr as &const byte, 0, ui.cursor);
+    //
+    // 基准点（base_row/base_col）取「刚刚擦除后光标的位置」：
+    //   * 走了面板块擦除 → 光标在屏幕上的块首行、第 ui.start_col 列（start_col 当绝对列用）；
+    //   * 否则 → 光标就在块首位置，基准 (0, 0)。
+    // 用基准点重算**绝对**行列（而不是沿用 erow/ecol），块变矮时才不会因为
+    // 「光标看起来已经在目标位置」而提前返回、把新块的尾巴留在屏幕上（P15 修）。
+    var base_row: usize = 0;
+    var base_col: usize = 0;
+    if tty_block_on() {
+        base_row = cur_row;
+        base_col = ui.start_col;
+    }
+    const ttotal: usize = new_col0 + pcols + tty_cols_between(ui.line.ptr as &const byte, 0, ui.cursor);
     var trow: usize = 0;
     var tcol: usize = 0;
-    tty_end_row_col(ttotal, cols, &trow, &tcol);
-    ui.cur_row = trow;
-    if erow == trow && ecol == tcol {
-        // 光标已经在目标位置（最常见：光标就在行尾）—— 一个字节都不用发
+    tty_end_pos(ttotal, cols, base_row, base_col, &trow, &tcol);
+    if use_block {
+        // 面板块路径：cur_row 是**块首起算**的行号（tty_build_block_erase 按 cur_row+1 上移）。
+        // 这里不能用 tty_end_pos 出来的 trow —— 那是相对「擦除后光标位置」的，差一个
+        // base_row，下一次擦除就会少上移 base_row 行（屏幕残影/错位就是这么来的）。
+        const pend_cols: usize = if ui.out_wrap { 0 as usize } else { ui.out_col };
+        ui.cur_row = tty_block_vis0(ui.block.ptr[0: blk_len], cols, new_col0) + ((pend_cols + pcols) / cols);
+    } else {
+        ui.cur_row = trow;
+    }
+    if erow == trow && ecol == tcol && !use_block && !tty_block_on() {
+        // 光标已经在目标位置（最常见：光标就在行尾）—— 一个字节都不用发。
+        // 面板块在场时**不走**这条捷径：块的擦除/重画是逐行做的，"位置相同"并不能保证
+        // 屏幕上那一块就是这一帧要的形状（少发一次光标定位就可能在下一帧错位），
+        // 而块本身最多几十行，这点开销换的是「每帧字节可预期」。
         return;
     }
     var seq: [byte: 16] = [0: 16];
@@ -1025,8 +1315,27 @@ export fn tty_draw_line(ui: &TtyUi, fd: i32) void {
     _ = sys_write(fd, &seq[0], k) catch {};
 }
 
-// 流式输出期间：擦掉输入行 → 写内容 → 重画
+// 流式输出期间：擦掉输入行块 → 写内容 → 重画。
+// 面板块在场时必须整块擦（多行）：只擦输入行会把上面的窗口行留在屏幕上，
+// 后面每次重画都在这些残留行上叠一层（实测就是满屏重复的「┌─ agents ──」）。
 export fn tty_out_begin(ui: &TtyUi, fd: i32) void {
+    if !tty_active(ui) {
+        return;
+    }
+    if ui.block_on && ui.line_on_screen {
+        var eb: [byte: 512] = [0: 512];
+        const ec: usize = tty_build_block_erase(&eb[0], ui.cur_row + 1, ui.start_col, &ui.out_col);
+        if ec > 0 {
+            _ = sys_write(fd, &eb[0], ec) catch {};
+        }
+        ui.line_on_screen = false;
+        ui.block_on = false;
+        ui.cur_row = 0;
+        ui.start_col = ui.out_col;
+        ui.out_wrap = false;
+        ui.input_on_screen = false;
+        return;
+    }
     tty_erase_line(ui, fd);
 }
 
@@ -1050,6 +1359,8 @@ export fn tty_write(ui: &TtyUi, fd: i32, p: &const byte, n: usize) void {
     // 屏幕上没有输入行时不必擦/重画（否则 banner、工具输出都会带上无用的控制序列）
     const was_on: bool = ui.line_on_screen;
     tty_out_begin(ui, fd);
+    // 开始写正文：屏幕上那块输入行已经被擦掉了（若本来就没画，则它压根不在屏幕上）
+    ui.input_on_screen = false;
     _ = sys_write(fd, p as *const byte, n) catch {};
     tty_advance_col(ui, p, n);
     if was_on {
@@ -1092,6 +1403,10 @@ export var tty_ui: TtyUi = TtyUi{
     start_col: 0,
     out_col: 0,
     out_wrap: false,
+    block: Buf{ ptr: null, len: 0, cap: 0 },
+    block_enabled: false,
+    block_on: false,
+    input_on_screen: false,
 };
 
 // 给 llm/工具用的薄封装：流式增量也走输入行擦除/重画协议
