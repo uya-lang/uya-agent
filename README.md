@@ -4,7 +4,11 @@
 多轮 loop 直到给出结论。全部代码 32 个 `.uya` 文件，**不引入任何 C 代码、`@c_import` 或其它语言**，
 只依赖 Uya 语言与随编译器分发的标准库。
 
-**P0–P14 全部完成**：LLM 交互是**流式 SSE**（`stream:true` + `stream_options.include_usage`），
+**P0–P16 全部完成**（P15 这个编号被两条并行线各用过一次：一条是「请求体控制字节全转义 +
+默认走 Responses 接口」（落点见 §3 踩坑 27、§2 的 `jsonx.uya`/`session.uya`、§6 的
+`json-escape` / `ctrl-bytes*`）、一条是**子代理窗口面板**（§2 的「子代理窗口面板（并行线的 P15）」，
+踩坑 29）；P16 是**单行转录 + 思考行**）：
+LLM 交互是**流式 SSE**（`stream:true` + `stream_options.include_usage`），
 增量 chunked 解码 + SSE 分帧 + `tool_calls` 按 `index` 分片累积；消息协议是**严格工具协议**
 （`assistant.tool_calls` 原样回灌 + 每条结果一条 `role:"tool"` + `tool_call_id`）；
 交互界面是**真 TTY**（termios raw + 行编辑器），流式期间可打断、可继续输入、可续跑；
@@ -29,45 +33,37 @@ tool 结果超 8192 码点自动剪枝，压力超过窗口 80% 时自动压缩�
 **P14 把终端转录改成 DSH 内容块**：每次工具调用一行「状态字形 + 标题(关键参数) + 后缀」，
 正文是结果首尾若干行、`write`/`edit` 的**行级 diff**、`todo_write` 的清单，
 `--quiet` 原样退回旧的最小转录。
+**P16 把转录压成单行**（对齐 DSH 会话视图里「折叠状态」的样子）：工具只留
+`✓ Bash · 打印三行 · exit 0` 这一行（正文退成 `--tool-lines N` 的可选项），
+思考（`--show-reasoning`）压成 DSH 的 **Think 行** —— 运行中在提示符那一行里滚动、
+块结束时落一行 `✻ 思考 · <首行>…`，**全文写进会话日志**（`assistant/reasoning`）。
+**P15 给子代理加了窗口面板**：输入行上方常驻一块带边框的窗口区，每个运行中的子代理 2 行
+（命令行 + 状态行，含**实时秒数**与已收输出行数），最多显示最后 4 个，跑完立刻收掉并在滚动区
+补一行结算通知；边框按显示列逐行补满，自测对每一行断言「列数完全相等」。
 `--no-stream` / `--compat-fold` 保留两条回退路径。
 
 ```
-$ ./build/uya-agent "在当前目录创建 hello.uya，编译并运行它，然后把问候语改成 Hello, DSH!"
-[task] 在当前目录创建 hello.uya，编译并运行它，然后把问候语改成 Hello, DSH!
+$ ./build/uya-agent --show-reasoning "在当前工作目录写 p15-demo.txt，三行 alpha / beta / gamma；然后用 bash 打印它，并告诉我第二行。"
+[task] 在当前工作目录写 p15-demo.txt，三行 alpha / beta / gamma；然后用 bash 打印它，并告诉我第二行。
 
-✓ Write(hello.uya) · +4 -0
-    + export fn main() i32 {
-    +     @println("Hello, Uya!");
-    +     return 0;
-    + }
+✻ 思考 · The user wants me to write a file p15-demo.txt with three lines alph…    # Think 行：折叠就是一行
+✗ Write · build/p15_ws/p15-demo.txt · 1 lines                                     # 每次工具调用一行（失败是 ✗）
+✻ 思考 · The write failed with an error. Let me try with the absolute path or…
+✓ Bash · Check working directory and contents · exit 0                            # bash 摘要 = description
+✻ 思考 · The write tool failed. Maybe it needs absolute path? Let's try absol…
+✓ Write · /home/winger/…/build/p15_ws/p15-demo.txt · +3 -0
+✻ 思考 · Now print it with bash and get the second line.
+✓ Bash · Print file and second line · exit 0
 
-✓ Bash(UYA_ROOT=… uya build hello.uya -o hello && ./hello) · exit 0
-    make: 进入目录"…/.uyacache"
-    cc -c -std=c99 -O0 -fno-builtin -I. hello_part1.c -o hello_part1.o
-    … (省略 6 行)
-    编译完成：hello
-    Hello, Uya!
-    [exit code: 0]
-
-✓ Read(hello.uya) · 4 lines
-    1: export fn main() i32 {
-    2:     @println("Hello, Uya!");
-    3:     return 0;
-    4: }
-
-✓ Edit(hello.uya) · replaced
-      export fn main() i32 {
-    -     @println("Hello, Uya!");
-    +     @println("Hello, DSH!");
-          return 0;
-      }
-
-✓ Bash(./hello) · exit 0
-    Hello, DSH!
-    [exit code: 0]
-
-已改成 Hello, DSH! 并重新编译运行，输出 Hello, DSH!。
+第二行是 `beta`。
 ```
+
+（这是真机转录的节选：`--show-reasoning`、`autodl-api` 网关 / `DeepSeek-V4.1-Flash`，
+交互模式里那几行 `✻ 思考` 会先在提示符那一行里滚动、块结束才落成上面这样一行；非交互跑法
+（管道）没有实时行，只有结算的那一行。中间那次 `✗` 是模型自己把路径写错了，显示层照实记下。）
+
+（`--tool-lines 6` 会把 P14 的正文块开回来：write/edit 的 diff、结果首尾各 6 行、todo 清单。
+DSH 的卡片在终端里不可折叠，P16 的取舍是**默认折叠成一行**，要看细节就显式开。）
 
 ---
 
@@ -135,9 +131,9 @@ export UYA_SPLIT_C_DIR=$PWD/build/uyacache      # 多文件 C 缓存别丢在仓
 | `--dry-run` | 只组装请求并打印（不可打印字节转义成 `\xNN`，排查脏字节） |
 | `--compat-fold` | 工具结果折叠成一条 user 消息（旧协议） |
 | `--no-stream-options` | 不发送 `stream_options.include_usage` |
-| `--show-reasoning` | 把 `reasoning_content` 打到 stderr |
+| `--show-reasoning` | 显示思考行（P16：单行 —— 运行中在提示符那一行滚动，结束落一行 `✻ 思考 · …`；全文始终进会话日志） |
 | `--show-usage` | 每轮打印 token 用量（in/out/cache/reasoning） |
-| `--tool-lines N` | 工具结果正文首尾各显示几行，默认 6（`0` = 不显示正文），见 P14 |
+| `--tool-lines N` | 工具正文：默认 `0` = 只留一行（P16）；`N>0` = 首尾各 N 行（含 diff / todo 清单，即 P14 的正文块） |
 | `--tui` | 全屏 TUI（**TTY 交互模式默认**）；`--no-tui` 退回滚动转录；`UYA_AGENT_TUI=0|1` 同口径 |
 | `--color=MODE` | `auto`（默认）/ `always` / `never` / `16` / `256`；`NO_COLOR` 也认 |
 | `--tui-demo` | 打印 TUI 的 home / chat 两屏纯文本快照后退出（诊断 + 文档） |
@@ -174,15 +170,20 @@ src/llm.uya       请求/响应协议（两种）：chat/completions 的流式 d
 src/tools.uya     三个工具：read_file / write_file / run_shell
 src/tty.uya       终端层：termios raw 模式、行编辑器（历史/光标/Delete/词删除，**按 UTF-8
                   字符编辑、按显示列定位**）、渲染协议（擦输入行→写→重画，输入行折行或紧跟
-                  在没换行的正文后面都只擦自己那一块）、提示符即状态显示
+                  在没换行的正文后面都只擦自己那一块）、提示符即状态显示、
+                  按显示列截断（`tty_clip_bytes` 截尾 / `tty_clip_tail_bytes` 留尾）、
+                  **多行「面板块」**（输入行上方常驻的窗口区：逐行 ESC[2K 擦除 + 相对上移，
+                  子代理窗口面板就画在这里）；P17 再加：TUI sink 开关（TUI 激活时所有显示
+                  字节进转录，不再打到终端）与 `tty_reason_write`（思考走独立通道）
+src/sigx.uya      信号层（P17）：直接绑宿主 glibc `sigaction`（绕开 uya 0.10 `libc.signal`
+                  的 SIGSEGV 缺陷）；终止类信号 → 先恢复终端（termios + 离开备用屏幕）再
+                  128+sig 退出；SIGWINCH → 只置标志；`sigx_reset_for_child()` 给 fork 子进程
 src/tui.uya       全屏 TUI（P17）：帧模型（行=段序列，逐行 diff 重绘）、备用屏幕进出、
                   转录条目（用户/助手/思考/工具/诊断）、轻量 markdown、输入编辑器（按字符编辑、
                   多行、历史、括起粘贴）、键解码（分片转义序列）、浮层（命令面板/会话/帮助/问答）、
                   sink 通道与清洗、滚动与尾随、帧节流
-src/sigselftest.uya TUI 的自测轮次（frame / keys / sink / turn / pty）
-src/sigx.uya      信号层（P17）：直接绑宿主 glibc `sigaction`（绕开 uya 0.10 `libc.signal`
-                  的 SIGSEGV 缺陷）；终止类信号 → 先恢复终端（termios + 离开备用屏幕）再
-                  128+sig 退出；SIGWINCH → 只置标志；`sigx_reset_for_child()` 给 fork 子进程
+src/sigselftest.uya 信号层的自测轮次（sig-abi / sig-basic / sig-term-restore / sig-child-reset）
+src/tuiselftest.uya TUI 的自测轮次（tui-frame / tui-keys / tui-sink / tui-turn / tui-pty）
 src/inbox.uya     输入收件箱：steer（运行中输入的文本，step 边界领取）+ keepInbox 语义
 src/yamlcfg.uya   自带 YAML 子集解析器：去注释（块标量/引号感知）、中和 `!!tag`、
                   block/flow 映射与序列、`|`/`>` 块标量、跨行 flow 集合、节点池树 + 导航
@@ -202,7 +203,8 @@ src/dshcfg.uya    读 DSH 设置：$DSH_HOME 解析、settings.yaml 模型路线
 src/workflow.uya  workflow：把脚本写成 .ush + 生成同目录的自包含 hooks.uya（钩子客户端）、
                   监听 127.0.0.1 的钩子端口、fork+exec `uya run`、边等服务脚本边处理钩子
 src/deleg.uya     子代理：fork 不 exec（同二进制跑 agent_run）、结果管道 + 增量读取、
-                  父子会话关联（subagent/start 事件）、前台/后台、send_message 续跑、interrupt、ralph
+                  父子会话关联（subagent/start 事件）、前台/后台、send_message 续跑、interrupt、ralph、
+                  spawn 时刻记账（面板秒数）+ 终态结算通知（跑完即隐）
 src/goal.uya      会话级目标：goal.json（id/revision/phase/round/maxRounds/blocker/armed）、
                   精确 id+revision 校验、blocked 至少连续 3 轮
 src/skill.uya     技能：5 个发现根（项目 .dsh/.agents → --skill-dir → $DSH_HOME/skills →
@@ -222,63 +224,131 @@ src/session.uya   会话日志：路径规范化、id 生成（/dev/urandom→uu
                   索引、读取与崩溃尾部裁剪、按 id/最近查找、括号配平的数组提取
 src/diffx.uya     行级 diff（只服务显示）：公共整行前后缀裁剪 → LCS DP（60×60 上限）→
                   行列截断 + 头截断；全局暂存最近一次变更，view 层 take 走
-src/view.uya      工具内容块：工具→标题/关键参数/后缀三张表、状态字形、结果首尾若干行、
-                  todo 清单、按显示列截断、交互模式的「运行中提示符」换入换出
+                  （P16 起正文默认关闭，它只喂 `· +A -D` / `· replaced` 这两个后缀；
+                  正文要 `--tool-lines N`（N>0）才会被 append）
+src/view.uya      显示层：工具→标题/关键参数/后缀三张表、状态字形、按显示列截断、
+                  **单行转录**（默认没有正文块：正文要 `--tool-lines N`（N>0）才 append）、
+                  **思考行**（运行中在提示符那一行滚动、块结束落一行 `✻ 思考 · <首行>…`）、
+                  交互模式的「运行中提示符」换入换出、
+                  **子代理窗口面板**（2 行/个、最多 4 个、带边框、逐行等宽）
 src/agent.uya     CLI、环境变量、消息历史、请求组装、主循环（流式/非流式）、工具分发、
-                  交互式 REPL（中断/steer//continue/会话命令）、会话事件记录与恢复
-src/sigselftest.uya 信号层的自测轮次（sig-abi / sig-basic / sig-term-restore / sig-child-reset）
-src/selftest.uya  --selftest 的 mock LLM（含 SSE 受控切分）+ 28 轮断言 + --probe
+                  交互式 REPL（中断/steer//continue/会话命令）、会话事件记录与恢复、
+                  `assistant/reasoning`（思考全文，P16）；P17 再加 `agent_run_tui` /
+                  `agent_run_tui_body`（全屏 TUI 主循环，headless 与真终端共用）
+src/selftest.uya  --selftest 的 mock LLM（含 SSE 受控切分）+ 33 轮断言 + --probe
+                  （P17 又加了源文件里的 4 轮信号 + 5 轮 TUI，见 §6）
 ```
 
 > 两处已知死代码（P14 未清理，改别的东西时别被它们误导）：`src/tools.uya`（P0 的
 > `read_file`/`write_file`/`run_shell`，早已被 `fsx`/`search`/`shellx` 取代）、
 > `agent.uya` 里的 `dispatch_tool`（`JsonStrView` 版，无调用者）。
 
-### 显示内容（P14，对齐 DSH 工具视图）
+### 显示内容（P14 的内容模型 + P16 的单行转录）
 
 DSH 的会话视图里每次工具调用是一张卡片：**标题（工具名 + 关键参数）+ 状态 + 分类正文**
-（readBody / diffBody / terminalBody / webBody / todo 行）。DSH 自己没有终端渲染器
-（197 个包里没有任何 TTY/ANSI 代码），所以这里是把**那套内容模型搬到滚动终端**：
+（readBody / diffBody / terminalBody / webBody / todo 行），思考（thinking）则是另一行
+**Think**：折叠时一行、展开才看全文。DSH 自己没有终端渲染器（197 个包里没有任何
+TTY/ANSI 代码），所以这里是把**那套内容模型搬到滚动终端**；P14 搬的是「行 + 正文块」，
+**P16 把转录压成一行**（工具只留描述、思考在一行里滚动），正文退成可选项：
 
 ```
-✓ Edit(src/a.uya) · replaced          # 状态字形 + 标题(关键参数) + 后缀
-      export fn main() i32 {          # 上下文（未改动的行）
-    -     @println("Hello, Uya!");    # 删
-    +     @println("Hello, DSH!");    # 增
-          return 0;
-      }
+✻ 思考 · 先读 hello.uya，再改那一行 println…      # DSH 的 Think 行：折叠状态就是一行
+✓ Read · hello.uya · 4 lines                      # <字形> <Title> · <摘要> <后缀>
+✻ 思考 · 改完重新编译运行确认…
+✓ Edit · hello.uya · replaced
+✓ Bash · 编译并运行 hello.uya · exit 0
 ```
 
-* **行**：`<字形> <Title>(<摘要>)<后缀>`。字形 `✓` 成功 / `✗` 失败 / `●` 运行中（只在交互提示符里）；
-  标题按工具映射（`Read` / `Write` / `Edit` / `Glob` / `Grep` / `Bash` / `Todo` / `Ask` /
-  `WebSearch` / `Subagent` / `Workflow` …）；摘要取关键参数（`command` / `file_path` / `pattern` /
-  `description` / `queries`）；后缀是元信息：`· exit 1`、`· timed out`、`· killed by signal 9`、
+* **工具行**：`<字形> <Title> · <摘要><后缀>`。字形 `✓` 成功 / `✗` 失败 / `●` 运行中
+  （只在交互提示符里）；标题按工具映射（`Read` / `Write` / `Edit` / `Glob` / `Grep` / `Bash` /
+  `Todo` / `Ask` / `WebSearch` / `Subagent` / `Workflow` …）；摘要取关键参数，`bash` 优先取
+  `description`（**对齐 DSH 的 `SUMMARY_KEYS.bash = ["description","command"]`**，缺了才退回
+  命令行）；后缀是元信息：`· exit 1`、`· timed out`、`· killed by signal 9`、
   `· background job-2`、`· +4 -0`、`· replaced`、`· 3 items (1 done)`、`· lines 100-149`，
   兜底是 `· N lines`（结果文本行数）。失败判定：结果以 `Error: `（工具模块统一前缀）或
   `error: `（派发层的「参数不是合法 JSON」）开头，或 bash 尾部是 `[exit code: N≠0]` /
   `[timed out …]` / `[killed by signal: N]`。
-* **正文**：4 空格缩进；默认首尾各 6 行、中间 `… (省略 N 行)`（`--tool-lines N` 改预算，
-  `0` = 只留行不留正文）。`write` / `edit` 用 **diff** 取代首尾（见下），`todo_write` 用清单
-  （`✓` 已完成 / `▸` 进行中 / `·` 待办）。
+* **正文默认关闭**：`tool_lines = 0`（默认）时**只出行**，diff / 结果首尾 / todo 清单一律不打；
+  `--tool-lines N`（N>0）把正文开回来：4 空格缩进、首尾各 N 行、中间 `… (省略 N 行)`，
+  `write` / `edit` 用 **diff** 取代首尾，`todo_write` 用清单（`✓` 已完成 / `▸` 进行中 / `·` 待办）。
 * **diff**（`src/diffx.uya`）：采集点在 fsx —— `edit` 用读写之间已有的两份内容（零额外 I/O），
   `write` 在 `O_TRUNC` **之前**读一份旧内容（只在显示打开时读，上限 2 MiB）。
   算法：公共**整行**前后缀裁掉（O(n) 扫描，不建行表）→ 中间段两侧各 ≤ 60 行时用 LCS DP
   （61×61 字节表）出最小编辑脚本 → 更大就只给两行精确汇总（`- (N 行旧内容)` / `+ (N 行新内容)`，
   反正显示也只看前 20 行）→ 输出按显示列截断、按行头截断（`max(4×tool_lines, 20)` 行）。
-  **失败的 write/edit 不留假 diff**（正文回落到错误文本）。
+  **失败的 write/edit 不留假 diff**（正文回落到错误文本）。P16 起正文默认不显示，但这套采集
+  仍然跑 —— 行后缀 `· +4 -0` / `· replaced` 就是它算出来的（不想付这次旧文件读取的代价，
+  可以把 `diffx_init` 的开关改成 `&& cfg_tool_lines(cfg) > 0`）。
+* **思考行**（`--show-reasoning`，P16）：和 DSH 的 `ReasoningRow` 同口径 ——
+  **运行中取 `latestLine`**（`trimEnd()` 之后的最后一行，视口贴右端 → 终端里就是从左边按列
+  截断、前面补 `…`），**结算取 `firstLine`**（这里多一条兜底：第一行全空白就顺延到第一非空行）。
+  交互模式下运行中的那一行就是**提示符**（`✻ 思考 · …最新内容 > `，节流 80 ms 重画一次，
+  复用 P14 的提示符换入换出机制）；块结束时把提示符还回去，再把 `✻ 思考 · <首行>…` 落进滚动区。
+  块结束的判据是 DSH 的块语义：下一条 `content` / `tool_calls` 增量开始，或整段流结束
+  （中断、malformed、网络错误也走同一条收尾路径 —— 不会把提示符停在思考行上）。
+  非交互（管道）下没有可改写的一行，所以**不做实时行**，只在块结束时落那一行；
+  `--quiet`（含子代理）整层关闭，思考行同样不出现，但日志照记（见下）。
+* **思考全文进会话日志**：每个 step 追加一条 `assistant/reasoning`
+  （`{"turn":N,"step":N,"message":{"role":"assistant","reasoning_content":"…"}}`），
+  显示层只留一行、全文在这里活着。独立事件而不是塞进 `assistant/message`：那条要**原样**
+  回灌给端点（P4 的严格工具协议），DSH 自己也是分开记的；`--continue` / `--resume` 的
+  reader 按已知类型分支，不认识这个类型就跳过，历史里不会多出东西。
 * **宽度**：全部按**显示列**算（`tty_body_width()` 跟着终端宽度收在 [40,200]，CJK 汉字 2 列），
-  截断在 UTF-8 字符边界上回退并补 `…`；非法字节按 1 列宽，保证指针一定前进。
+  截断在 UTF-8 字符边界上回退并补 `…`（`tty_clip_bytes` 截尾、`tty_clip_tail_bytes` 留尾）；
+  非法字节按 1 列宽，保证指针一定前进。
 * **通道与开关**：内容块一律走 fd 2（正文与模型输出仍走 fd 1，管道语义不变）；
-  会话日志不受影响（仍只记 `tool/call` + `tool/result`）。`--quiet`（含子代理，它们本来就
-  `quiet=true`）把整层关掉 —— 输出与 P13 之前的**最小转录逐字节一致**，且 `write` 连旧内容都不读；
-  自测里有一条「关闭态下 fd 2 捕获到 0 字节」的断言守着它。
-* **交互模式**：工具运行期间把**提示符**换成运行中的那一行（`● Bash(npm test) > `），
-  工具返回后先恢复原提示符、再把「成品行 + 正文」写进滚动区。这样不用原地改写已输出的一行，
+  会话日志不受影响（`tool/call` + `tool/result` + `assistant/message` + `assistant/reasoning`）。
+  `--quiet`（含子代理，它们本来就 `quiet=true`）把整层关掉 —— 输出与 P13 之前的**最小转录
+  逐字节一致**；自测里有「关闭态下 fd 2 捕获到 0 字节」的断言守着它。
+* **交互模式**：工具运行期间把**提示符**换成运行中的那一行（`● Bash · 跑测试 > `），
+  工具返回后先恢复原提示符、再把成品行写进滚动区。这样不用原地改写已输出的一行，
   也不会和正在编辑的输入行打架（复用 P3 的擦除/重画协议）。
   `ask_user_question` / `exit_plan_mode` 会自己提问，跳过这次提示符替换。
-* **思考块**：`--show-reasoning` 时每个 step 的思考前面加一行 `✻ 思考`（内容仍原样流式）。
 * 明确不做：ANSI 颜色（`tty_advance_col` 的列算术不认识零宽转义序列，`make codegen-audit`
-  对转义写法也有硬约束）、markdown 渲染、可折叠卡片、`--resume` 的转录回放。
+  对转义写法也有硬约束）、markdown 渲染、可折叠卡片（P16 的取舍正好相反：**默认折叠成一行**，
+  要展开就 `--tool-lines N`）、非交互下的实时思考行、`--resume` 的转录回放。
+
+### 子代理窗口面板（并行线的 P15）
+
+工具内容块下面是**输入行上方的常驻窗口区**（「面板块」）：每个**运行中**的子代理占 **2 行**，
+最多显示**最后 4 个**，画在一个共享边框里，输入行永远在它下面：
+
+```
+┌─ agents ───────────────────────────────────────────────────────────────────┐
+│ ● sub-1 [subagent] 审计 deleg 的等待循环与 fork/exec 差异                  │
+│ ● running       3s · 12 · 检查 1030-1120 行的 fork/exec 差异               │
+├─ ──────────────────────────────────────────────────────────────────────────┤
+│ ● sub-2 [ralph] ralph loop                                                 │
+│ ● running      12s · 1 · Round 2 of 4. Objective: 把骨架补齐               │
+└─ ──────────────────────────────────────────────────────────────────────────┘
+[step 4] > 我在这儿接着打字…
+```
+
+* **第 1 行是「命令」**：`● sub-<id> [subagent|ralph] <description>`；**第 2 行是「状态」**：
+  `● running` + 已跑秒数（固定 5 列右对齐）+ `·` + 已收输出行数 + `·` + prompt 首行预览。
+  状态名 10 列左对齐、秒数固定 5 列 —— 位数变化时 `·` 的列号不变（不会左右横跳）。
+* **秒数真的在跳**：`deleg_spawn` 记 `started_ms`，长等待（前台 `subagent` /
+  `subagent_output(wait=true)`）的轮询循环每秒刷一次面板；快照没变时一个字节都不写。
+* **跑完即隐**：面板只收 `status == DELEG_RUNNING` 的窗口；子代理进终态时窗口在**同一次重画**里
+  消失（面板自动缩短），同时在滚动区补一行结算通知
+  `[agents] sub-2 [ralph] ✓ idle 27s — ralph loop`。
+* **边框不错位的四条硬规则**（自测逐行断言）：
+  1. 面板宽 `M = tty_body_width()`（终端宽 − 2），内容行与边框行**都是 M 列**，
+     右竖线恒落在第 M 列；
+  2. 宽度**只按显示列**算（`tty_cols_between`）—— 中文 1 字 3 字节 2 列，按字节数补空格就歪；
+  3. `─` 的数量由「本行实测已用列数」推出来（`view_ag_line_start` 找行首，不能从缓冲区 0 算）；
+  4. 内容超宽逐级收窄（预览 → 输出行数），截断先给 `…` 留 1 列再补齐；
+     状态名/秒数/`·` 是固定前缀，永不截断。
+* **面板块的渲染协议**（`src/tty.uya`）：输入行块 = [窗口行…] + [提示符+输入行]；
+  块底行恒从第 0 列开始，块首行可能不在第 0 列（流式正文没换行时）。
+  擦除 = 上移 `rows-1` 行（**相对量**，扛滚动）→ 右移到块首列 → **逐行 `ESC[2K`**。
+  **不用 `ESC[J`**：它清到屏幕末尾，会连带清掉「紧跟正文的输入行」下面仍然可见的正文文本。
+  输出写入（`tty_out_begin`）也走同一套整块擦除，否则窗口行会残留在屏幕上、越叠越多。
+* **只在干净行上画**：正文停在半行时不画窗口（只画提示符），下一个干净行再出现 —— 绝不擦掉正文。
+* 关联：`view_agents_text` 只认 running、`view_agents_sync` 做快照比对、
+  `deleg_agents_refresh` 是唯一的刷新入口（spawn / 终态 / 等待循环 / step 边界）。
+  刻意不用回调：**uya 0.10 没有函数指针**，只能「上层推、下层画」。
+* `--quiet`（含子代理进程）整层关闭，输出与 P15 之前逐字节一致。
 
 ### preset 旋钮、DSH 会话与 make 目标（P13）
 
@@ -293,7 +363,7 @@ DSH 的会话视图里每次工具调用是一张卡片：**标题（工具名 +
   `user/message` + `assistant/message` + `tool/result` 转成我们的历史并**开自己的会话**继续
   （不写 DSH 的日志）。压缩的 `.jsonl.zstd` 走 `/usr/bin/unzstd` 解压。
   消息数只统计已读入的部分（zstd 前缀），所以列表里写作 `msgs≈`。
-* `make` 目标：`check` / `build` / `selftest`（离线 28 轮）/ `probe` / `e2e TASK=… [PIN=…]`（真实网关）/
+* `make` 目标：`check` / `build` / `selftest`（离线 33 轮）/ `probe` / `e2e TASK=… [PIN=…]`（真实网关）/
   `e2e-config`（零参数打印生效配置）/ `e2e-dsh`（列 DSH 会话）。
 
 ### workflow：Uya 脚本 + 钩子代理（P12）
@@ -471,8 +541,9 @@ Messages API（`x-api-key` + `anthropic-version: 2023-06-01`，服务端工具 `
   `<agent-home>` = `--agent-home` > `$UYA_AGENT_HOME` > `$HOME/.uya-agent`。
 * 首行 header（`type/version/id/createdAt/cwd/delegationDepth/agentPreset/model/provider`），
   之后每行一个 `{"type":…,"seq":N,"time":N,"data":{…}}`，`seq` 从 0 连续递增，追加-only。
-* 事件词表：`user/message`、`assistant/message`（含 `tool_calls` 原文）、`tool/call`、`tool/result`、
-  `turn/start|end`、`step/start`、`session/title`。**续写已有会话时不重复写 header**，
+* 事件词表：`user/message`、`assistant/message`（含 `tool_calls` 原文）、`assistant/reasoning`
+  （P16：该 step 的思考全文，显示层只留一行、全文只活在这里；`--resume` 的 reader 不认识它就跳过）、
+  `tool/call`、`tool/result`、`turn/start|end`、`step/start`、`session/title`。**续写已有会话时不重复写 header**，
   `seq` 接着已有最大值往下走（跨进程实测连续）。
 * **崩溃恢复**：最后一行不完整（没有换行结尾）时丢弃它并在 stderr 告警 —— 对应 DSH 的
   「保留有效尾部工作」。
@@ -870,8 +941,8 @@ vLLM 等 OpenAI 兼容端点都一样稳。想升级成严格 `tool` 角色消�
    （`SigxAction` 按 glibc 布局：handler@0 + mask128 + flags@136 + restorer@144 = 152 字节，
    `sig-abi` 轮按字节断言），而不是去修工具链 —— 这样在没修过的 0.10 上也能跑。
    同一缺陷已在 uya 项目侧修复并提交（`libc.signal: 修复 signal() 装的处理器一收到信号就
-   SIGSEGV`，commit `fad26acd`，回移 0.11 的实现 + 两个回归用例；未修的版本跑那两个用例会
-   `Segmentation fault`、修好后 6/6 通过）。
+   SIGSEGV`，commit `fad26acd`，回移 0.11 的实现 + 两个回归用例；未修的版本跑那两个用例会 `Segmentation fault`、修好后 6/6 通过）。
+
 29. **装了信号处理器以后，阻塞的 `read` 会被打断返回 `EINTR` —— 那不是 EOF。**
    `poll`/`select` 不受 `SA_RESTART` 保护（内核语义如此），所以只要装了处理器，
    交互等待输入时的 `sys_read(0, …)` 就可能返回 `EINTR`（例如用户在流式输出期间缩放终端 →
@@ -880,6 +951,32 @@ vLLM 等 OpenAI 兼容端点都一样稳。想升级成严格 `tool` 角色消�
    `ask_read_line` 返回「无回答」）。修法：`catch |err|` 里取 `@error_id(err)`，`== 4`（EINTR）
    就 `continue` 重来（`agent.uya` 与 `askuser.uya` 各一处）。其它 `poll` 循环里的
    `catch { 0 }` 天然是「当作超时继续转」，不用改。
+
+30. **第 21 条那个「把 fd 2 指向 /dev/null」会把显示层一起静音掉。** P16 做思考行时发现
+    `--show-reasoning` **从来没有生效过**：P14 那行「✻ 思考」是在 `llm_apply_delta` 里写的，
+    而那一刻正在 `tls_noise_mute` 的窗口内（整个请求期间 fd 2 → `/dev/null`），字节全进了黑洞；
+    只有加 `--tls-debug` / `--http-debug`（静音被关掉）时才看得见 —— 这就是「本地 mock 复现不出来、
+    真机也复现不出来」的原因（两边都没开 debug 时都静音）。修法不是缩短静音窗口（TLS 噪声确实只在
+    握手期，但谁也说不准记录层什么时候再吐一句），而是**让显示层写那个「还看得见」的 fd**：
+    `tls_noise_mute` 顺手把 `dup(2)` 拿到的原件记进 `g_err_fd`，`unmute` 时换回 2，
+    view 层一律 `err_fd()`（工具行、思考行的实时行、提示符重画）而不是字面量 `2`。
+    回归：`think-row` 轮里直接在静音窗口内渲染一次，断言字节落在被捕获的那个 stderr 上；
+    真机验收（`script -q -c` 跑 REPL）能看到 `✻ 思考 · …` 的滚动行与结算行。
+31. **多行块（子代理窗口面板）的擦除与定位，四条都是一次踩出来的**：
+    * **别用 `ESC[J` 擦多行块**。它清到屏幕末尾，会连带清掉「输入行紧跟正文」时下面那些
+      **仍然可见**的正文文本（缓冲区里还有，屏幕上看不见了 —— 用户以为输出丢了）。
+      正确做法：上移 `rows-1` 行回块首（**相对量**，扛滚动；绝对屏幕行号在滚动/流式输出之后是脏的）
+      → 右移到块首列 → 逐行 `ESC[2K` 清到块底行为止。
+    * **块变矮时「光标已在目标位置就不发序列」这条捷径会害死人**。窗口关掉后面板从 6 行变 1 行，
+      `erow/trow` 恰好相等 → 提前 return → 新块的尾巴留在屏幕上、`cur_row` 还按旧值记账，
+      下一次擦除就整体错位。修法：面板块在场时禁用这条捷径（`!use_block && !tty_block_on()`）。
+    * **`cur_row` 必须相对块首存**（`tty_build_block_erase` 按 `cur_row+1` 上移），
+      不能存 `tty_end_pos` 算出来的「相对擦除基准点」的行号 —— 两者差一个 `base_row`。
+    * **列数必须从「本行行首」量起**。面板是一行行追加到同一个 `Buf` 里的，
+      从缓冲区 0 量会得到几百，补 `─` 的循环一次都不进，底框退化成「└─ ┘」。
+      另外按列补空格/截断一律用 `tty_cols_between`（显示列），用字节数会把右竖线拉歪。
+      自测里对面板**每一行**断言列宽完全相等，这四条任何一条被写回去都会立刻红。
+
 
 ---
 
@@ -1020,11 +1117,30 @@ contextWindow/maxTokens/input image/reasoningEffort/`permission→confine`/`uya-
 | `diff-render` | 纯函数逐字节断言 diff：新旧一样 → 空（且**不输出上下文**）、只差结尾换行 → 空、
 中间一行改动 → 前后各 2 行上下文 + `-`/`+`、新文件 → 全 `+`、两侧 >60 行 → 只给精确汇总、
 60 行编辑脚本 → 头截断成 24 行 + `… (省略 36 行)`、增删计数、按显示列截断（汉字 2 列） |
+| `tool-view` | 工具行的逐字节断言（P16 单行口径）：bash `description` 优先 / 缺了退回 `command`、exit 0/exit 1 的字形与 `· exit N`、
+`Error: ` → `✗`、参数不是合法 JSON → 无摘要、read 的 `· lines a-b`、todo 的 `· 3 items (1 done)`、
+write 的 `· +A -D`、**默认（`tool_lines=0`）没有正文**（diff / todo 清单 / 首尾行都不许出现）、
+`--tool-lines 6` 时 diff 正文 / 失败不留假 diff / todo 清单原样回来、窄终端下按列截断补 `…`；
+最后**把 fd 2 接到文件做端到端断言**：关闭态抓到 0 字节、打开态抓到的字节与 `view_render_block` 完全一致 |
+| `think-row` | 思考行的逐字节断言：运行中取最后一行（`trimEnd` 后）并按列**从左**截断补 `…`、结算取第一非空行按列**从右**截断补 `…`、
+全空白 / 窄到放不下前缀 → 一行都不出、宽字符不砍半个；`view_think_delta/end` 在非交互与 `--quiet` 下一个字节都不写、
+`view_think_end` 幂等；**静音窗口**（`tls_noise_mute` 把 fd 2 指向 `/dev/null`）里显示层必须落到 `err_fd()` 那个还能看见的
+stderr 上（P16 抓到的坑，见 §3 第 27 条）；`assistant/reasoning` 事件的 data JSON 逐字节 |
+| `reasoning-log` | 跑完 `shell` 轮后回读会话日志：必须有一条 `assistant/reasoning`，`reasoning_content` 与 mock 回包**逐字节相同**、
+`turn`/`step` 都在 —— 守着「显示层只留一行，但全文不许丢」 |
 | `tool-view` | 工具内容块的逐字节断言：bash exit 0/exit 1 的字形与 `· exit N`、`Error: ` → `✗`、
 参数不是合法 JSON → 无括号无摘要、read 的 `· lines a-b`、todo 的计数与清单（✓/▸/·）、
 write 的 `· +A -D` + diff 正文、**失败的 write 不留假 diff**、窄终端下按列截断补 `…`、
 结果首尾 + `省略` 标记、`--tool-lines 0` 无正文；最后**把 fd 2 接到文件做端到端断言**：
-关闭态抓到 0 字节、打开态抓到的字节与 `view_render_block` 完全一致 |
+关闭态抓到 0 字节、打开态抓到的字节与 `view_render_block` 完全一致。同轮还断言**多行面板块**
+的渲染协议：`tty_block_rows/vis0` 的挂起换行口径、`tty_build_block_erase` 的逐字节（CR / ESC[5A /
+ESC[12C / 逐行 ESC[2K）、真画一帧后屏幕上的块形状与 `cur_row`、以及**块变矮时按老行数擦除**
+（P15 修掉的「光标已在位就提前返回」）|
+| `subagent-panel` | 子代理窗口面板：空表不产出面板；只收 **running**（idle/failed 的窗口立刻消失）；
+标题写「运行中/总数」（`agent 1/4` / `agents 2/4`）；**每一行的显示列数完全相等**且等于
+`tty_body_width()`（含中文标签、超长标题、超长预览的截断情形）；秒数字段固定 5 列
+（`3s` / `1m05s` / `59m+`）且**随已跑时长变化**（1Hz 重画的依据）；`buf` 原语逐字节
+（这里抓过「标题里混进未初始化字节」）；显示层关闭时零输出 |
 | `session-log` | 写 header/事件 → 读回逐行校验（转义层级、`tool_calls` 数组提取、`callId`）；
 **内容里的控制字节（NUL、0x01）必须按字节往返**（写入端写 `\u00XX`，读回不许变成字面量 `u0000`）；
 手工追加半条记录 → 断言丢弃并标记 `dropped_tail`；用日志重建历史 → 断言角色/`tool_call_id`
@@ -1102,7 +1218,7 @@ responses 看 `call_id`）；**chat 与 responses 各一轮**，且顺便断言�
 * 自测现在是**幂等**的：连续跑两次都 PASS（以前靠「反正覆盖」掩盖了清理失败）。
 * DSH 配置兼容做了**零参数启动**验收：在空目录里不传 `--base-url/--model/--api-key`，
   `--print-config` 显示 `base_url/model/api_key/context_window/confine/tls_verify/tls_pin`
-  （以及 P14 的 `tool_lines` 与显示开关状态）
+  （以及 P16 的 `tool_lines` 与显示开关状态）
   的来源全是 `dsh-settings`，实际提问「2+2 等于几」得到 `4。`
   （TLS pin 也写在 `~/.dsh/settings.yaml` 的 `uya-agent.tls` 节里，连环境变量都不用给；
   三个「决定去哪儿读设置」的 flag 由 `make e2e-config-flags` 常驻回归）。
@@ -1120,6 +1236,16 @@ responses 看 `call_id`）；**chat 与 responses 各一轮**，且顺便断言�
   ② 同一任务加 `--quiet`：stderr 只剩正文流，**没有**任何 `✓/✗` 行（旧的最小转录）；
   ③ 用 `script` 分配 PTY 跑 REPL：工具运行期间提示符变成 `● Bash(echo PTY-CHECK) > `，
   返回后恢复 `[step 1] > `，内容块落进滚动区，全程没有乱码（P3 的擦除/重画协议照旧成立）。
+* **P16 单行转录在真机上验收过**（`autodl-api` / `DeepSeek-V4.1-Flash`，`--tls-verify=none`）：
+  ① PTY 里跑「写三行文件 → bash 打印 → 告诉我第二行」：四次思考各自在提示符那一行滚动
+  （`✻ 思考 · The > ` → `✻ 思考 · …t with bash, and tell them the second line. … > `），
+  每个块结束时落一行 `✻ 思考 · <首行>…`；工具行恒为一行（`✓ Bash · Print file and second line · exit 0`），
+  没有任何正文档；会话日志里 4 条 `assistant/reasoning` 与模型给的思考全文逐字一致；
+  ② 本地假网关（`--http-debug`）对照跑同一形状的流：默认只有行、`--tool-lines 6` 把
+  `one/two/three/[exit code: 0]` 的正文块与 `· exit 0` 一起带回来、`--quiet --show-reasoning`
+  在 stderr 上一个字节都不写；
+  ③ 修掉 §3 第 27 条那个「静音把显示层一起吞了」的坑之前，真机与本地 mock **两边都看不到**
+  思考行（`--show-reasoning` 等于没开）—— 这是本轮最有价值的发现。
 | `http401` | mock 回 401 + 错误体：agent 必须打印状态与错误体并退出 3 |
 | `max-steps` | **显式**给 `max_steps=3`：mock 每轮都给 tool_calls，agent 必须在 3 步后熔断退出 3 |
 | `unlimited-steps` | **默认不限步数**（这轮故意不设 `max_steps`，吃 `cfg_default()` 的 0）：mock 连给 **14 轮** tool_calls（超过旧默认 12）才给最终答案 —— agent 必须一路跑满 14 步、把 14 条 `tool_call_id` 全带回请求，并以 0 退出。默认值一旦改回 12，mock 只会被服务 12 次，这轮立刻失败 |
@@ -1179,12 +1305,16 @@ mock 上逐字段验收。换一台 `openai-responses` 网关可用时，零参�
   脚本/CI 用 `--max-steps N` 或 `UYA_AGENT_MAX_STEPS=N` 熔断（`make e2e` 也可 `STEPS=N`）。
   没做「重复调用检测」这类启发式熔断。
 * `read_file` 一次最多 64 KiB；`write_file` 是整文件覆盖，没有 diff/patch 工具。
-* 滚动模式（`--no-tui`）仍然没有颜色、不做 markdown 渲染；TUI 模式下有颜色 + 轻量 markdown
+* 滚动模式（`--no-tui`）仍然是纯文本字形、不做 markdown 渲染；TUI 模式下有颜色 + 轻量 markdown
   （围栏代码块、行内 code、标题、列表），但不做完整语法高亮/表格/链接重排。
 * TUI 不做鼠标（滚轮/点击/选择）、图片、可折叠卡片、分屏、主题切换 UI；`--resume` 只回填
   最近 200 条历史（注入类消息不回填），`--resume-dsh` 走同一条回填路径。
 * 终端小于 32×8 时自动退回滚动模式；`cols < 66` 时块字 logo 退化成一行标题。
 * `SIGKILL` 之后终端仍可能停在备用屏幕（不可捕获），用 `reset` / `stty sane` 恢复。
+* P16 起滚动模式下每次工具调用只有一行（正文要看就得 `--tool-lines N`，即 DSH 卡片的
+  「展开」在终端里是显式开关），思考同理：**非交互（管道）下没有实时行**，只有块结束时落的
+  那一行 —— 想边跑边看思考就用交互模式（TUI 下思考是转录里的一个条目，只留最新一段）。
+
 * diff 是行级的、面向显示：中间段两侧超过 60 行就退化为两行汇总（不做 Myers 全量 diff），
   也不高亮词级改动。
 * 只做 IPv4（标准库 `dns_client_resolve_first_ipv4`），不做 IPv6、不走代理。
