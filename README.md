@@ -11,7 +11,8 @@
 P18 是**常驻状态区 + 思考实时行**；**P19 是诊断出口与 read 窗口**：外来字节（网关错误体 /
 坏 payload 头部）只以「转义 + 字符边界截断 + 限长」的一行预览进转录，全文进会话日志
 `diag/dump`、原始字节走 `--debug-dump`（踩坑 33）；`read` 改成**流式窗口**读法，`total` 是
-数完整个文件得到的真值、只有真越界才报 EOF（踩坑 34））：
+数完整个文件得到的真值、只有真越界才报 EOF（踩坑 34）；**P20 是脚注统计行 + 上下文占用 +
+%cpu**；**P21 是三级访问模式 + 内核沙箱（bubblewrap）**）：
 LLM 交互是**流式 SSE**（`stream:true` + `stream_options.include_usage`），
 增量 chunked 解码 + SSE 分帧 + `tool_calls` 按 `index` 分片累积；消息协议是**严格工具协议**
 （`assistant.tool_calls` 原样回灌 + 每条结果一条 `role:"tool"` + `tool_call_id`）；
@@ -696,7 +697,8 @@ TTY 交互模式**默认全屏**（`--no-tui` 退回上一节的滚动转录；�
 
   ▌ ↑ Ask anything... "把 hello.uya 的问候语改成 Hello, DSH!"
   ▌ Build   Full access   deepseek-chat   deepseek  tab plan   ctrl+p commands
-  ~/uya-agent:main                                                                 p20-stats```
+  ~/uya-agent:main                                                                 p21-perm
+```
 
 对话态（`--tui-demo` 打印的就是这三屏的纯文本快照）：
 
@@ -1694,6 +1696,22 @@ responses 看 `call_id`）；**chat 与 responses 各一轮**，且顺便断言�
   ② 回合结束时同一屏上 26/27 行变成 `◆ 助手` / `391` —— **状态区整块收掉、转录把行收回**
   （空闲 0 行），没有残影；③ 退出时 `ESC[?2004l ESC[?1049l` 干净收尾（备用屏幕与括起粘贴都关了）。
   **这一屏在 P18 之前是拿不到的**：同样的转录长度下状态行会被挤掉，屏幕上只剩静止的转录 + 面板。
+* **P21 的验收记录（2026-10-03，对应访问模式 + 内核沙箱）**：
+  ① 离线全套：`make check` / `codegen-audit` / `e2e-config-flags` / `e2e-api` / `e2e-steps` /
+  `e2e-permission` / `e2e-sandbox` / `tui-selftest`（9 轮）/ `selftest`（`SELFTEST PASS`）全绿；
+  新增的 5 轮权限/沙箱轮与 2 轮 TUI 轮都在里面（`perm-modes` / `perm-readonly` / `san-profile` /
+  `san-shell` / `san-tool` / `tui-access` / `tui-approve`）。
+  ② **沙箱是真的内核边界，不是纸面约定**：`san-shell` 轮直接 fork 出套壳命令实测 ——
+  read-only 里写持久路径 `Read-only file system`、`> /dev/null` 仍成功；workspace-write 里
+  工作区内写入逐字节正确、`../` 区外写入被拒；`san-tool` 轮再走一遍 bash 工具的真实路径
+  （区内落盘、区外不出现）。
+  ③ **本机环境事实**（选型的依据，写下来免得下次重猜）：内核 `6.12.65` 的 LSM 列表里**没有
+  landlock**、`landlock_create_ruleset` 返回 ENOSYS ⇒ 只做 bwrap 一档；`bubblewrap 0.10.0`
+  非特权 userns 可用，profile 与 DSH 文档一致（只读根 + fresh `/dev` + 私有 PID 的 `/proc`，
+  workspace-write 另加临时 `/tmp` 与可写 workspace bind）。
+  ④ 审批流程用**真 PTY** 验收（`tui-approve` B 段：等 `Read Only：批准这条 bash 命令？` 画出来
+  再送 `↑`+回车 → 命令真的跑、stdout 进转录与下一封请求）；headless 那条路只钉「没人回答 =
+  fail closed」。
 | `http401` | mock 回 401 + 错误体：agent 必须打印状态与错误体并退出 3 |
 | `max-steps` | **显式**给 `max_steps=3`：mock 每轮都给 tool_calls，agent 必须在 3 步后熔断退出 3 |
 | `unlimited-steps` | **默认不限步数**（这轮故意不设 `max_steps`，吃 `cfg_default()` 的 0）：mock 连给 **14 轮** tool_calls（超过旧默认 12）才给最终答案 —— agent 必须一路跑满 14 步、把 14 条 `tool_call_id` 全带回请求，并以 0 退出。默认值一旦改回 12，mock 只会被服务 12 次，这轮立刻失败 |
