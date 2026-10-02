@@ -33,6 +33,10 @@ var mock_expect_fold: bool = false;
 var mock_expect_steer: bool = false;
 // 控制字节轮：true = 这一轮跑 responses 协议（端点/响应形状都按 responses 来）
 var mock_expect_resp: bool = false;
+// P18：答案帧里是否带 usage。默认关闭 —— 打开会让 g_last_prompt_tokens 从「估算」变成
+// 提供方读数，进而改变自动压缩的触发时机（compact-auto / responses-compact / workflow
+// 那几轮都会跟着变）。所以只给 stats-usage 这一轮开。
+var mock_usage_on: bool = false;
 
 // 供自测断言用的 lflag 位（与 tty.uya 内部常量一致）
 const TTY_LFLAG_TEST_ISIG: u32 = 0x0001;
@@ -358,12 +362,40 @@ fn mock_final_body(out: &Buf, marker: &const byte) bool {
     jw_byte(&w, 125);
     jw_byte(&w, 125);
     jw_byte(&w, 93);
+    if mock_usage_on {
+        jw_byte(&w, 44);
+        mock_put_usage(&w);
+    }
     jw_byte(&w, 125);
     if jw_overflow(&w) {
         return false;
     }
     out.len = jw_used(&w);
     return true;
+}
+
+// 和 SSE 解析轮同一组数：prompt 100（含缓存 40）、completion 7、reasoning 3
+fn mock_put_usage(w: &JsonWriter) void {
+    jw_key(w, "usage");
+    jw_byte(w, 123);
+    jw_key(w, "prompt_tokens");
+    jw_i64(w, 100);
+    jw_byte(w, 44);
+    jw_key(w, "completion_tokens");
+    jw_i64(w, 7);
+    jw_byte(w, 44);
+    jw_key(w, "prompt_tokens_details");
+    jw_byte(w, 123);
+    jw_key(w, "cached_tokens");
+    jw_i64(w, 40);
+    jw_byte(w, 125);
+    jw_byte(w, 44);
+    jw_key(w, "completion_tokens_details");
+    jw_byte(w, 123);
+    jw_key(w, "reasoning_tokens");
+    jw_i64(w, 3);
+    jw_byte(w, 125);   // } completion_tokens_details
+    jw_byte(w, 125);   // } usage（root 的 } 由调用方补）
 }
 
 // ============================================================
@@ -4319,7 +4351,8 @@ fn sess_round(tag: &const byte) bool {
     _ = buf_append_cstr(&c_hist.model, "selftest-model");
     c_hist.workspace = buf_new(64);
     _ = buf_append_cstr(&c_hist.workspace, "build/selftest_sess_ws");
-    const restored: i32 = agent_hist_from_log(&c_hist, &h, &path_copy, &next_seq0);
+    // P18：这个调用点不折叠统计（历史恢复而已）；resume 路径传 true
+    const restored: i32 = agent_hist_from_log(&c_hist, &h, &path_copy, &next_seq0, false);
     cfg_free(&c_hist);
     if restored != 3 {
         ty_fail(tag, "恢复的消息条数不对", &ok);
@@ -8213,6 +8246,830 @@ fn reasoning_log_round(tag: &const byte, home: &const byte, ws: &const byte) boo
     return ok;
 }
 
+// ============================================================
+// P18：统计折叠 / 上下文占用 / 进程 CPU
+//
+// 这一组轮次钉住三件事：
+//   1) 渲染逐字对齐 DSH（stats-format / stats-line）；
+//   2) 实时喂养与日志回放（= resume 走的那条路）数字逐位相同（stats-fold / stats-log）；
+//   3) 上下文占用与 %cpu 的口径（stats-context / procx-parse / procx-percent / cpu-live）。
+// ============================================================
+
+fn stx_eq(tag: &const byte, what: &const byte, got: &const Buf, want: &const byte, ok: &bool) void {
+    if !bufx_eq_cstr(got.ptr as &const byte, got.len, want) {
+        out_err("selftest[");
+        out_err(tag);
+        out_err("] FAIL: ");
+        out_err(what);
+        out_err("：期望 \"");
+        out_err(want);
+        out_err("\"，实际 \"");
+        out_err_bytes(got.ptr as &const byte, got.len);
+        out_err("\"\n");
+        ok[0] = false;
+    }
+}
+
+fn stx_buf_eq(tag: &const byte, what: &const byte, got: &const Buf, want: &const Buf, ok: &bool) void {
+    if got.len != want.len
+        || !bufx_mem_eq(got.ptr as &const byte, want.ptr as &const byte, got.len) {
+        out_err("selftest[");
+        out_err(tag);
+        out_err("] FAIL: ");
+        out_err(what);
+        out_err("：期望 \"");
+        out_err_bytes(want.ptr as &const byte, want.len);
+        out_err("\"，实际 \"");
+        out_err_bytes(got.ptr as &const byte, got.len);
+        out_err("\"\n");
+        ok[0] = false;
+    }
+}
+
+fn stx_num_eq(tag: &const byte, what: &const byte, got: i64, want: i64, ok: &bool) void {
+    if got != want {
+        out_err("selftest[");
+        out_err(tag);
+        out_err("] FAIL: ");
+        out_err(what);
+        out_err("：期望 ");
+        out_err_dec(want as usize);
+        out_err("，实际 ");
+        out_err_dec(got as usize);
+        out_err("\n");
+        ok[0] = false;
+    }
+}
+
+fn stx_dur(tag: &const byte, what: &const byte, ms: i64, want: &const byte, ok: &bool) void {
+    var b: Buf = buf_new(64);
+    defer { buf_free(&b); }
+    st_fmt_duration(&b, ms);
+    stx_eq(tag, what, &b, want, ok);
+}
+
+fn stx_tok(tag: &const byte, what: &const byte, n: i64, want: &const byte, ok: &bool) void {
+    var b: Buf = buf_new(64);
+    defer { buf_free(&b); }
+    st_fmt_tokens(&b, n);
+    stx_eq(tag, what, &b, want, ok);
+}
+
+fn stx_tps(tag: &const byte, what: &const byte, tokens: i64, ms: i64, want: &const byte, ok: &bool) void {
+    var b: Buf = buf_new(64);
+    defer { buf_free(&b); }
+    st_fmt_tps(&b, tokens, ms);
+    stx_eq(tag, what, &b, want, ok);
+}
+
+fn stx_hit(tag: &const byte, what: &const byte, read: i64, billed: i64, want: &const byte, ok: &bool) void {
+    var b: Buf = buf_new(64);
+    defer { buf_free(&b); }
+    if !st_fmt_cache_hit(&b, read, billed) {
+        ty_fail(tag, what, ok);
+        return;
+    }
+    stx_eq(tag, what, &b, want, ok);
+}
+
+// 折叠状态的签名：所有字段按固定顺序拼一行 —— 两条喂入路径比这个就够
+fn stx_sig(out: &Buf) void {
+    buf_reset(out);
+    _ = buf_append_i64(out, st_turns());
+    _ = buf_append_byte(out, 44);
+    _ = buf_append_i64(out, st_steps());
+    _ = buf_append_byte(out, 44);
+    _ = buf_append_i64(out, st_llm_ms());
+    _ = buf_append_byte(out, 44);
+    _ = buf_append_i64(out, st_tool_ms());
+    _ = buf_append_byte(out, 44);
+    _ = buf_append_i64(out, st_ttft_ms());
+    _ = buf_append_byte(out, 44);
+    _ = buf_append_i64(out, st_ttft_steps());
+    _ = buf_append_byte(out, 44);
+    _ = buf_append_i64(out, st_decode_ms());
+    _ = buf_append_byte(out, 44);
+    _ = buf_append_i64(out, st_decode_tokens());
+    _ = buf_append_byte(out, 44);
+    _ = buf_append_i64(out, st_billed_input());
+    _ = buf_append_byte(out, 44);
+    _ = buf_append_i64(out, st_out_tokens());
+    _ = buf_append_byte(out, 44);
+    _ = buf_append_i64(out, st_pressure());
+}
+
+// 造一行会话日志（不带换行）
+fn stx_log_line(out: &Buf, seq: i64, ms: i64, typ: &const byte, data: &const byte) void {
+    buf_reset(out);
+    _ = buf_append_cstr(out, "{\"type\":\"");
+    _ = buf_append_cstr(out, typ);
+    _ = buf_append_cstr(out, "\",\"seq\":");
+    _ = buf_append_i64(out, seq);
+    _ = buf_append_cstr(out, ",\"time\":");
+    _ = buf_append_i64(out, ms);
+    _ = buf_append_cstr(out, ",\"data\":");
+    _ = buf_append_cstr(out, data);
+    _ = buf_append_cstr(out, "}");
+}
+
+fn stats_format_round(tag: &const byte) bool {
+    var ok: bool = true;
+    // duration：< 60s 一位小数（整数不带小数点），>= 60s 走 "{m}m{s}s"
+    stx_dur(tag, "0ms", 0, "0s" as &const byte, &ok);
+    stx_dur(tag, "400ms", 400, "0.4s" as &const byte, &ok);
+    stx_dur(tag, "12s 整（不带 .0）", 12000, "12s" as &const byte, &ok);
+    stx_dur(tag, "50700ms", 50700, "50.7s" as &const byte, &ok);
+    stx_dur(tag, "59949ms", 59949, "59.9s" as &const byte, &ok);
+    stx_dur(tag, "60000ms", 60000, "1m0s" as &const byte, &ok);
+    stx_dur(tag, "162000ms", 162000, "2m42s" as &const byte, &ok);
+    stx_dur(tag, "3600000ms", 3600000, "60m0s" as &const byte, &ok);
+    // 平均值口径：DSH 是 formatDuration(ttftMs / ttftSteps)，不能被整数截断
+    var avg: Buf = buf_new(64);
+    defer { buf_free(&avg); }
+    st_fmt_duration_avg(&avg, 3000, 2);
+    stx_eq(tag, "3000ms/2 步", &avg, "1.5s" as &const byte, &ok);
+    buf_reset(&avg);
+    st_fmt_duration_avg(&avg, 100, 3);
+    stx_eq(tag, "100ms/3 步（33.3ms）", &avg, "0s" as &const byte, &ok);
+    buf_reset(&avg);
+    st_fmt_duration_avg(&avg, 0, 0);
+    stx_eq(tag, "除零保护", &avg, "0s" as &const byte, &ok);
+
+    // tokens：< 1000 原样；< 1e6 用 K（>= 100 取整，否则一位小数）；否则 M
+    stx_tok(tag, "999", 999, "999" as &const byte, &ok);
+    stx_tok(tag, "1000", 1000, "1K" as &const byte, &ok);
+    stx_tok(tag, "12200", 12200, "12.2K" as &const byte, &ok);
+    stx_tok(tag, "238000", 238000, "238K" as &const byte, &ok);
+    stx_tok(tag, "517000", 517000, "517K" as &const byte, &ok);
+    stx_tok(tag, "999999", 999999, "1000K" as &const byte, &ok);
+    stx_tok(tag, "1000000", 1000000, "1M" as &const byte, &ok);
+    stx_tok(tag, "1200000", 1200000, "1.2M" as &const byte, &ok);
+    stx_tok(tag, "负数按 0", -5, "0" as &const byte, &ok);
+
+    // tok/s：>= 10 取整，否则一位小数
+    stx_tps(tag, "0.4 tok/s", 4, 10000, "0.4" as &const byte, &ok);
+    stx_tps(tag, "9.9 tok/s", 99, 10000, "9.9" as &const byte, &ok);
+    stx_tps(tag, "9.94 → 9.9", 994000, 100000000, "9.9" as &const byte, &ok);
+    stx_tps(tag, "221 tok/s", 2210, 10000, "221" as &const byte, &ok);
+    stx_tps(tag, "994 tok/s 取整", 994000, 1000000, "994" as &const byte, &ok);
+    stx_tps(tag, "没解码时长 → 0", 100, 0, "0" as &const byte, &ok);
+
+    // 缓存命中：整数百分比（.5 向上）、全命中才是 100、有 miss 时最小精度不写 100
+    var ch: Buf = buf_new(64);
+    defer { buf_free(&ch); }
+    if st_fmt_cache_hit(&ch, 0, 0) {
+        ty_fail(tag, "没有计费输入时不该给出缓存命中率", &ok);
+    }
+    stx_hit(tag, "0%", 0, 1000, "0" as &const byte, &ok);
+    stx_hit(tag, "50%", 500, 1000, "50" as &const byte, &ok);
+    stx_hit(tag, "12.5% → 13%（ties 向上）", 125, 1000, "13" as &const byte, &ok);
+    stx_hit(tag, "71%（截图那组）", 169000, 238000, "71" as &const byte, &ok);
+    stx_hit(tag, "全命中 = 100", 1000, 1000, "100" as &const byte, &ok);
+    // 99.9%：整数会舍成 100，但有 1 个 miss → 打 99.9
+    stx_hit(tag, "999/1000 → 99.9", 999, 1000, "99.9" as &const byte, &ok);
+    // 237900/238000 = 99.9579%：整数会舍成 100 → 走 DSH 的精度阶梯（保守地低于 100）
+    stx_hit(tag, "99.9579% → 99.96（不写 100）", 237900, 238000, "99.96" as &const byte, &ok);
+
+    if ok {
+        out_err("selftest[");
+        out_err(tag);
+        out_err("] ok\n");
+    }
+    return ok;
+}
+
+fn stats_line_round(tag: &const byte) bool {
+    var ok: bool = true;
+    var out: Buf = buf_new(1024);
+    defer { buf_free(&out); }
+
+    // 1) 什么都没有 → 没有统计行（脚注右半区退回版本号）
+    st_reset();
+    if st_line(&out) || out.len != 0 {
+        ty_fail(tag, "没有步数也没有用量时不该有统计行", &ok);
+    }
+
+    // 2) demo fixture = DSH 截图那一行，逐字节
+    agent_stats_fixture_demo();
+    if !st_line(&out) {
+        ty_fail(tag, "fixture 之后应当有统计行", &ok);
+        return false;
+    }
+    stx_eq(
+        tag,
+        "fixture 统计行",
+        &out,
+        "1 轮 · 12 步 | LLM 50.7s · 工具调用 4.1s | 首 token 平均 1.5s · 221 tok/s | 缓存命中 71% | 输入 238K tok · 输出 12K tok" as &const byte,
+        &ok
+    );
+
+    // 3) 只有步数（没有 usage、没有时间）→ 只有计数组
+    st_reset();
+    st_step_end(1, 1);
+    _ = st_line(&out);
+    stx_eq(tag, "只有步数", &out, "1 轮 · 1 步" as &const byte, &ok);
+
+    // 4) 只有 usage（没有步数）→ 只有 token 组（DSH 的第 4/5 组在 steps 判据之外）
+    st_reset();
+    st_assistant_message(0, 0, 0, 100, 900, 0, 50);
+    _ = st_line(&out);
+    stx_eq(tag, "只有 usage", &out, "缓存命中 90% | 输入 1K tok · 输出 50 tok" as &const byte, &ok);
+
+    // 5) 两步：一步组装了消息、一步被取消（没有首 token）→ 没有速度组
+    st_reset();
+    st_step_start(1, 1, 1000);
+    st_assistant_message(1, 1, 3000, 0, 0, 0, 0);
+    st_step_end(1, 1);
+    st_step_end(1, 2);
+    _ = st_line(&out);
+    stx_eq(tag, "两步只有 LLM", &out, "1 轮 · 2 步 | LLM 2s" as &const byte, &ok);
+
+    // 6) 有首 token 但没有 llm 时长（时钟没走）→ 只出速度组
+    st_reset();
+    st_step_start(1, 1, 1000);
+    st_first_token(1, 1, 1500);
+    st_assistant_message(1, 1, 1000, 0, 0, 0, 0);
+    st_step_end(1, 1);
+    _ = st_line(&out);
+    stx_eq(tag, "只有首 token", &out, "1 轮 · 1 步 | 首 token 平均 0.5s" as &const byte, &ok);
+
+    // 7) 有工具时间也有输出 → 工具组与 tok/s 组同时出现
+    st_reset();
+    st_step_start(1, 1, 0);
+    st_first_token(1, 1, 1000);
+    st_tool_call("cc" as &const byte, 2, 2000);
+    st_tool_result("cc" as &const byte, 2, 2500);
+    st_assistant_message(1, 1, 11000, 0, 0, 0, 2000);
+    st_step_end(1, 1);
+    _ = st_line(&out);
+    stx_eq(
+        tag,
+        "工具 + 解码",
+        &out,
+        "1 轮 · 1 步 | LLM 11s · 工具调用 0.5s | 首 token 平均 1s · 200 tok/s | 输入 0 tok · 输出 2K tok" as &const byte,
+        &ok
+    );
+
+    if ok {
+        out_err("selftest[");
+        out_err(tag);
+        out_err("] ok\n");
+    }
+    return ok;
+}
+
+fn stats_fold_round(tag: &const byte) bool {
+    var ok: bool = true;
+    var line: Buf = buf_new(4096);
+    defer { buf_free(&line); }
+    var sig_live: Buf = buf_new(256);
+    defer { buf_free(&sig_live); }
+    var sig_replay: Buf = buf_new(256);
+    defer { buf_free(&sig_replay); }
+
+    // ① 实时喂（agent 在边界上走的就是这几个调用）
+    st_reset();
+    st_step_start(7, 1, 1000);
+    st_first_token(7, 1, 1500);
+    st_assistant_message(7, 1, 5000, 10, 90, 5, 200);
+    st_tool_call("c1" as &const byte, 2, 5000);
+    st_tool_result("c1" as &const byte, 2, 5100);
+    st_step_end(7, 1);
+    st_turn_end();
+    stx_sig(&sig_live);
+
+    // ② 同一批事件的日志回放（resume 走的那条路）
+    st_reset();
+    stx_log_line(&line, 0, 1000, "step/start" as &const byte, "{\"turn\":7,\"step\":1}" as &const byte);
+    st_fold_line(&line);
+    stx_log_line(&line, 1, 1500, "assistant/first-token" as &const byte, "{\"turn\":7,\"step\":1}" as &const byte);
+    st_fold_line(&line);
+    stx_log_line(
+        &line,
+        2,
+        5000,
+        "assistant/message" as &const byte,
+        "{\"turn\":7,\"step\":1,\"message\":{\"role\":\"assistant\",\"content\":\"x\"},\"usage\":{\"inputTokens\":10,\"outputTokens\":200,\"cacheReadTokens\":90,\"cacheWriteTokens\":5,\"reasoningTokens\":0}}" as &const byte
+    );
+    st_fold_line(&line);
+    stx_log_line(&line, 3, 5000, "tool/call" as &const byte, "{\"turn\":7,\"step\":1,\"callId\":\"c1\",\"name\":\"bash\",\"arguments\":\"{}\"}" as &const byte);
+    st_fold_line(&line);
+    stx_log_line(&line, 4, 5100, "tool/result" as &const byte, "{\"turn\":7,\"step\":1,\"callId\":\"c1\",\"content\":\"ok\"}" as &const byte);
+    st_fold_line(&line);
+    stx_log_line(&line, 5, 5200, "step/end" as &const byte, "{\"turn\":7,\"step\":1}" as &const byte);
+    st_fold_line(&line);
+    stx_log_line(&line, 6, 5300, "turn/end" as &const byte, "{\"turn\":7,\"reason\":\"completed\"}" as &const byte);
+    st_fold_line(&line);
+    stx_sig(&sig_replay);
+    stx_buf_eq(tag, "实时 vs 回放的签名", &sig_live, &sig_replay, &ok);
+
+    // 数值本身也钉一遍（签名相等还不够直观）
+    stx_num_eq(tag, "llm 时间", st_llm_ms(), 4000, &ok);
+    stx_num_eq(tag, "工具时间（call→result）", st_tool_ms(), 100, &ok);
+    stx_num_eq(tag, "首 token 延迟", st_ttft_ms(), 500, &ok);
+    stx_num_eq(tag, "首 token 步数", st_ttft_steps(), 1, &ok);
+    stx_num_eq(tag, "解码时长（首 token→组装）", st_decode_ms(), 3500, &ok);
+    stx_num_eq(tag, "解码 token", st_decode_tokens(), 200, &ok);
+    stx_num_eq(tag, "计费输入（10+90+5）", st_billed_input(), 105, &ok);
+    stx_num_eq(tag, "压力样本", st_pressure(), 105, &ok);
+    stx_num_eq(tag, "输出 token", st_out_tokens(), 200, &ok);
+    stx_num_eq(tag, "轮数", st_turns(), 1, &ok);
+    stx_num_eq(tag, "步数", st_steps(), 1, &ok);
+    stx_num_eq(tag, "pending 清空", st_turns(), 1, &ok);
+
+    // ③ 边界语义（全部按 DSH）
+    st_reset();
+    st_tool_result("ghost" as &const byte, 5, 9000);
+    stx_num_eq(tag, "孤儿 tool/result 不计时", st_tool_ms(), 0, &ok);
+    st_tool_call("c9" as &const byte, 2, 1000);
+    st_turn_end();
+    st_tool_result("c9" as &const byte, 2, 3000);
+    stx_num_eq(tag, "未结算调用在 turn/end 被丢弃", st_tool_ms(), 0, &ok);
+
+    st_reset();
+    st_step_start(1, 1, 0);
+    st_first_token(1, 1, 300);
+    st_step_end(1, 1);
+    stx_num_eq(tag, "被取消的步照样计数", st_steps(), 1, &ok);
+    stx_num_eq(tag, "被取消的步不计 llm", st_llm_ms(), 0, &ok);
+    stx_num_eq(tag, "被取消的步不计 ttft 步数", st_ttft_steps(), 0, &ok);
+
+    st_reset();
+    st_step_start(1, 1, 0);
+    st_assistant_message(1, 2, 5000, 10, 0, 0, 7);
+    stx_num_eq(tag, "turn/step 不匹配时不计时", st_llm_ms(), 0, &ok);
+    stx_num_eq(tag, "turn/step 不匹配时 token 照记（tokenUsage 口径）", st_billed_input(), 10, &ok);
+
+    st_reset();
+    st_step_start(1, 1, 0);
+    st_first_token(1, 1, 100);
+    st_assistant_message(1, 1, 1100, 0, 0, 0, 0);
+    st_step_end(1, 1);
+    stx_num_eq(tag, "没上报输出 token 时不记解码", st_decode_ms(), 0, &ok);
+    stx_num_eq(tag, "没上报输出 token 时照样记 ttft 步数", st_ttft_steps(), 1, &ok);
+
+    st_reset();
+    st_step_end(3, 1);
+    st_step_end(3, 2);
+    st_step_end(4, 1);
+    stx_num_eq(tag, "同一 turn 的多个步只算一轮", st_turns(), 2, &ok);
+    stx_num_eq(tag, "步数按 step/end 计", st_steps(), 3, &ok);
+
+    // 重复 callId：后者胜（覆盖时间），只结算一次
+    st_reset();
+    st_tool_call("dup" as &const byte, 3, 1000);
+    st_tool_call("dup" as &const byte, 3, 2000);
+    st_tool_result("dup" as &const byte, 3, 2400);
+    stx_num_eq(tag, "重复 callId 只结算一次且用最后一次时间", st_tool_ms(), 400, &ok);
+
+    if ok {
+        out_err("selftest[");
+        out_err(tag);
+        out_err("] ok\n");
+    }
+    return ok;
+}
+
+fn stats_context_round(tag: &const byte) bool {
+    var ok: bool = true;
+    // 占用率：四舍五入、夹 100、缺一不可（DSH 的 contextOccupancy）
+    stx_num_eq(tag, "容量未知 → -1", st_ctx_percent(1000, 0) as i64, -1, &ok);
+    stx_num_eq(tag, "分子未知 → -1", st_ctx_percent(-1, 1000) as i64, -1, &ok);
+    stx_num_eq(tag, "0%", st_ctx_percent(0, 1000) as i64, 0, &ok);
+    stx_num_eq(tag, "21%", st_ctx_percent(210, 1000) as i64, 21, &ok);
+    stx_num_eq(tag, "12.5% → 13%", st_ctx_percent(125, 1000) as i64, 13, &ok);
+    stx_num_eq(tag, "超出容量夹到 100", st_ctx_percent(5000, 1000) as i64, 100, &ok);
+    stx_num_eq(tag, "46%（238K/517K）", st_ctx_percent(238000, 517000) as i64, 46, &ok);
+
+    // projectedTokens：样本 + 增量（钳 0）；没有增量基准时只用样本
+    stx_num_eq(tag, "没有锚点 → 只用样本", st_ctx_projected(1000, -1, 999999), 1000, &ok);
+    stx_num_eq(tag, "增量 +200", st_ctx_projected(1000, 500, 700), 1200, &ok);
+    stx_num_eq(tag, "增量 -400", st_ctx_projected(1000, 500, 100), 600, &ok);
+    stx_num_eq(tag, "增量过大时钳 0", st_ctx_projected(100, 500, 100), 0, &ok);
+    stx_num_eq(tag, "负数样本钳 0", st_ctx_projected(-5, 0, 0), 0, &ok);
+
+    // 数字文本
+    var b: Buf = buf_new(256);
+    defer { buf_free(&b); }
+    st_fmt_figures(&b, 238000, 517000);
+    stx_eq(tag, "已用/容量", &b, "~238K / 517K" as &const byte, &ok);
+    buf_reset(&b);
+    st_fmt_figures(&b, 29000, 0);
+    stx_eq(tag, "容量未知的写法", &b, "~29K / 未知容量" as &const byte, &ok);
+
+    // /status 的上下文块（含分段条）逐字节
+    var det: Buf = buf_new(512);
+    defer { buf_free(&det); }
+    st_ctx_detail(&det, 238000, 517000, 25000, 25000, 50000, 20);
+    stx_eq(
+        tag,
+        "上下文明细块",
+        &det,
+        "上下文已用    46%\n已用/容量     ~238K / 517K\n占用条        [██▓▓▓▒▒▒▒░░░░░░░░░░░] 46%\n系统提示词    ~25K\n工具          ~25K\n对话消息      ~50K\n" as &const byte,
+        &ok
+    );
+    // 没有明细（三段全 0）→ 单段条（DSH 无 breakdown 时的形状）
+    buf_reset(&det);
+    st_ctx_detail(&det, 500, 1000, 0, 0, 0, 20);
+    stx_eq(
+        tag,
+        "无明细时单段条",
+        &det,
+        "上下文已用    50%\n已用/容量     ~500 / 1K\n占用条        [██████████░░░░░░░░░░] 50%\n系统提示词    ~0\n工具          ~0\n对话消息      ~0\n" as &const byte,
+        &ok
+    );
+    // 容量未知：不给百分比也不给条（DSH 整个圆环不渲染），明细照给
+    buf_reset(&det);
+    st_ctx_detail(&det, 29000, 0, 1000, 2000, 26000, 20);
+    stx_eq(
+        tag,
+        "容量未知的明细块",
+        &det,
+        "上下文已用    容量未知\n已用/容量     ~29K / 未知容量\n系统提示词    ~1K\n工具          ~2K\n对话消息      ~26K\n" as &const byte,
+        &ok
+    );
+
+    // /status 的整块（TUI 浮层与滚动模式共用）—— 三段标题 + 内容 + 版本号
+    var cst: Config = cfg_default();
+    var hst: History = hist_init();
+    _ = hist_push(&hst, ROLE_SYSTEM, "S" as &const byte, 1);
+    buf_reset(&det);
+    agent_status_stats_block(&cst, &hst, &det);
+    if !contains(&det, "--- 统计") || !contains(&det, "轮/步") {
+        ty_fail(tag, "/status 里没有统计块", &ok);
+    }
+    if !contains(&det, "--- 上下文") || !contains(&det, "上下文已用") {
+        ty_fail(tag, "/status 里没有上下文块", &ok);
+    }
+    if !contains(&det, "--- 进程") || !contains(&det, "%cpu") {
+        ty_fail(tag, "/status 里没有 %cpu 块", &ok);
+    }
+    if !contains(&det, "version" as &const byte)
+        || !contains(&det, &AGENT_VERSION[0]) {
+        ty_fail(tag, "/status 里没有版本号", &ok);
+    }
+    hist_free(&hst);
+    cfg_free(&cst);
+
+    // 统计明细块：字段名 + 省缺写法
+    st_reset();
+    buf_reset(&det);
+    st_stats_detail(&det);
+    stx_eq(
+        tag,
+        "统计明细（空状态）",
+        &det,
+        "轮/步         0 轮 · 0 步\nLLM           0s\n工具调用      0s\n首 token 平均 -\n解码          -\n缓存命中      -\n输入/输出     0 tok / 0 tok\n" as &const byte,
+        &ok
+    );
+
+    if ok {
+        out_err("selftest[");
+        out_err(tag);
+        out_err("] ok\n");
+    }
+    return ok;
+}
+
+// 就着刚跑完的一轮：比对「实时折叠」与「日志回放（= resume 走的那条路）」
+fn stats_log_round(tag: &const byte, home: &const byte, ws: &const byte) bool {
+    var ok: bool = true;
+    var live_line: Buf = buf_new(1024);
+    defer { buf_free(&live_line); }
+    var live_sig: Buf = buf_new(256);
+    defer { buf_free(&live_sig); }
+    if !st_line(&live_line) {
+        ty_fail(tag, "跑完一轮之后没有统计行", &ok);
+        return false;
+    }
+    stx_sig(&live_sig);
+    if st_turns() != 1 || st_steps() < 2 {
+        ty_fail(tag, "shell 轮的轮/步数不对（应当 1 轮 ≥ 2 步）", &ok);
+    }
+    if st_llm_ms() <= 0 {
+        ty_fail(tag, "llmMs 没有累计", &ok);
+    }
+    if st_tool_ms() <= 0 {
+        ty_fail(tag, "toolMs 恒为 0（tool/call 没有在派发前落盘？）", &ok);
+    }
+    if st_billed_input() <= 0 || st_out_tokens() <= 0 {
+        ty_fail(tag, "token 账目没有累计", &ok);
+    }
+    if st_ttft_steps() <= 0 {
+        ty_fail(tag, "一条首 token 都没记到（流式路径没打点？）", &ok);
+    }
+    if !st_have_pressure() {
+        ty_fail(tag, "没有压力样本（assistant/message 的 usage 没进折叠？）", &ok);
+    }
+
+    var path: Buf = buf_new(1200);
+    defer { buf_free(&path); }
+    if !sess_find_last(home, ws, &path) {
+        ty_fail(tag, "找不到刚跑完的会话（日志没落盘？）", &ok);
+        return false;
+    }
+    if !buf_append_byte(&path, 0) {
+        ty_fail(tag, "路径缓冲不够补 NUL", &ok);
+        return false;
+    }
+    path.len = path.len - 1;
+
+    // ① 日志侧：事件成对/成组，时间差能支撑统计
+    var r: SessReader = sess_reader_empty();
+    defer { sess_reader_free(&r); }
+    if !sess_reader_load(path.ptr as &const byte, &r) {
+        ty_fail(tag, "会话日志读不出来", &ok);
+        return false;
+    }
+    var line: Buf = buf_new(65536);
+    defer { buf_free(&line); }
+    var typ: Buf = buf_new(64);
+    defer { buf_free(&typ); }
+    var step_starts: i64 = 0;
+    var step_ends: i64 = 0;
+    var first_tokens: i64 = 0;
+    var tool_ms_sum: i64 = 0;
+    var call_seen: usize = 0;
+    var result_seen: usize = 0;
+    var have_open: bool = false;
+    var open_t: i64 = 0;
+    while sess_next(&r, &line) {
+        buf_reset(&typ);
+        if !sess_line_type(&line, &typ) {
+            continue;
+        }
+        const view: &[byte] = line.ptr[0: line.len];
+        const t: i64 = sess_json_i64(view, "time" as &const byte);
+        if sv_eq_cstr(&typ, "step/start") {
+            step_starts = step_starts + 1;
+        } else if sv_eq_cstr(&typ, "step/end") {
+            step_ends = step_ends + 1;
+        } else if sv_eq_cstr(&typ, "assistant/first-token") {
+            first_tokens = first_tokens + 1;
+        } else if sv_eq_cstr(&typ, "tool/call") {
+            call_seen = call_seen + 1;
+            have_open = true;
+            open_t = t;
+        } else if sv_eq_cstr(&typ, "tool/result") {
+            result_seen = result_seen + 1;
+            if !have_open {
+                ty_fail(tag, "tool/result 出现在 tool/call 之前", &ok);
+            } else {
+                if t < open_t {
+                    ty_fail(tag, "tool/result 的时间早于 tool/call", &ok);
+                }
+                tool_ms_sum = tool_ms_sum + (t - open_t);
+                have_open = false;
+            }
+        }
+    }
+    if step_starts != step_ends {
+        ty_fail(tag, "step/start 与 step/end 没有成对（统计的步数会失真）", &ok);
+    }
+    if call_seen == 0 || result_seen != call_seen {
+        ty_fail(tag, "tool/call 与 tool/result 条数不匹配", &ok);
+    }
+    if have_open {
+        ty_fail(tag, "回合结束时还有未结算的 tool/call", &ok);
+    }
+    stx_num_eq(tag, "日志 step/end 条数 vs steps", step_ends, st_steps(), &ok);
+    stx_num_eq(tag, "日志首 token 条数 vs ttftSteps", first_tokens, st_ttft_steps(), &ok);
+    stx_num_eq(tag, "日志里的工具时间差之和 vs toolMs", tool_ms_sum, st_tool_ms(), &ok);
+
+    // ② 回放同一份日志 → 与实时数字逐字节相同
+    st_reset();
+    var r2: SessReader = sess_reader_empty();
+    defer { sess_reader_free(&r2); }
+    if !sess_reader_load(path.ptr as &const byte, &r2) {
+        ty_fail(tag, "回放时日志读不出来", &ok);
+        return false;
+    }
+    while sess_next(&r2, &line) {
+        st_fold_line(&line);
+    }
+    var replay_line: Buf = buf_new(1024);
+    defer { buf_free(&replay_line); }
+    var replay_sig: Buf = buf_new(256);
+    defer { buf_free(&replay_sig); }
+    if !st_line(&replay_line) {
+        ty_fail(tag, "回放之后没有统计行", &ok);
+    }
+    stx_sig(&replay_sig);
+    stx_buf_eq(tag, "恢复前后的统计行", &replay_line, &live_line, &ok);
+    stx_buf_eq(tag, "恢复前后的全部字段", &replay_sig, &live_sig, &ok);
+
+    if ok {
+        out_err("selftest[");
+        out_err(tag);
+        out_err("] ok（实时与回放一致：");
+        out_err_bytes(live_line.ptr as &const byte, live_line.len);
+        out_err("）\n");
+    }
+    return ok;
+}
+
+// 造一行 /proc/<pid>/stat：pid (comm) state + 10 个计数 + utime + stime + 尾巴
+// （内核字段序：state ppid pgrp session tty_nr tpgid flags minflt cminflt majflt
+//   cmajflt utime stime cutime cstime …，所以 utime/stime 是 ')' 之后的第 12/13 个）
+fn stx_stat_line(out: &Buf, pid: i64, comm: &const byte, state: &const byte, utime: i64, stime: i64) void {
+    buf_reset(out);
+    _ = buf_append_i64(out, pid);
+    _ = buf_append_cstr(out, " (" as &const byte);
+    _ = buf_append_cstr(out, comm);
+    _ = buf_append_cstr(out, ") " as &const byte);
+    _ = buf_append_cstr(out, state);
+    _ = buf_append_cstr(out, " 1 2 3 4 5 6 7 8 9 10 " as &const byte);
+    _ = buf_append_i64(out, utime);
+    _ = buf_append_byte(out, 32);
+    _ = buf_append_i64(out, stime);
+    _ = buf_append_cstr(out, " 999 888 0 0 0 0 0 0 0 0" as &const byte);
+}
+
+fn procx_parse_round(tag: &const byte) bool {
+    var ok: bool = true;
+    var comm: Buf = buf_new(64);
+    defer { buf_free(&comm); }
+    var ticks: i64 = 0;
+
+    // ① 真实形状：`)` 之后第 12/13 个字段是 utime/stime，后面跟着的 cutime/cstime 必须忽略
+    var good: Buf = buf_new(256);
+    defer { buf_free(&good); }
+    stx_stat_line(&good, 1234, "uya-agent" as &const byte, "S" as &const byte, 120, 34);
+    if !procx_parse_stat(good.ptr[0: good.len], &comm, &ticks) {
+        ty_fail(tag, "标准 /proc/<pid>/stat 行解析失败", &ok);
+    } else {
+        stx_eq(tag, "comm", &comm, "uya-agent" as &const byte, &ok);
+        stx_num_eq(tag, "utime+stime（不取 cutime/cstime）", ticks, 154, &ok);
+    }
+
+    // ② comm 里带空格与括号：只能按「第一个 ( 到最后一个 )」切
+    var weird: Buf = buf_new(256);
+    defer { buf_free(&weird); }
+    stx_stat_line(&weird, 42, "uya (agent) x" as &const byte, "R" as &const byte, 7, 3);
+    if !procx_parse_stat(weird.ptr[0: weird.len], &comm, &ticks) {
+        ty_fail(tag, "comm 带空格/括号时解析失败", &ok);
+    } else {
+        stx_eq(tag, "comm（带括号）", &comm, "uya (agent) x" as &const byte, &ok);
+        stx_num_eq(tag, "ticks（带括号）", ticks, 10, &ok);
+    }
+
+    // ③ 坏行：没有括号 / 没有右括号 / 字段不够 / utime 不是数字
+    var bad1: Buf = buf_new(64);
+    defer { buf_free(&bad1); }
+    _ = buf_append_cstr(&bad1, "1234 uya-agent S 1 2 3 4 5" as &const byte);
+    if procx_parse_stat(bad1.ptr[0: bad1.len], &comm, &ticks) {
+        ty_fail(tag, "没有括号的行不该解析成功", &ok);
+    }
+    buf_reset(&bad1);
+    _ = buf_append_cstr(&bad1, "1234 (uya-agent S 1 2 3 4 5 6 7 8 9 10 11 120 34" as &const byte);
+    if procx_parse_stat(bad1.ptr[0: bad1.len], &comm, &ticks) {
+        ty_fail(tag, "没有右括号的行不该解析成功", &ok);
+    }
+    buf_reset(&bad1);
+    _ = buf_append_cstr(&bad1, "1234 (uya-agent) S 1 2 3 4 5 6 7 8 9 10 120" as &const byte);
+    if procx_parse_stat(bad1.ptr[0: bad1.len], &comm, &ticks) {
+        ty_fail(tag, "缺 stime 的行不该解析成功", &ok);
+    }
+    buf_reset(&bad1);
+    _ = buf_append_cstr(&bad1, "1234 (uya-agent) S 1 2 3 4 5 6 7 8 9 10 x 34" as &const byte);
+    if procx_parse_stat(bad1.ptr[0: bad1.len], &comm, &ticks) {
+        ty_fail(tag, "utime 不是数字的行不该解析成功", &ok);
+    }
+    // 状态字母（第 1 个字段）不是数字 → 必须跳过而不是报错（踩过的坑）
+    var stated: Buf = buf_new(128);
+    defer { buf_free(&stated); }
+    stx_stat_line(&stated, 7, "uya-agent" as &const byte, "D" as &const byte, 5, 6);
+    if !procx_parse_stat(stated.ptr[0: stated.len], &comm, &ticks) {
+        ty_fail(tag, "state 是字母（D）时不该失败", &ok);
+    } else {
+        stx_num_eq(tag, "state=D 的 ticks", ticks, 11, &ok);
+    }
+
+    // ④ 目录项名过滤
+    var nm: Buf = buf_new(32);
+    defer { buf_free(&nm); }
+    _ = buf_append_cstr(&nm, "1234" as &const byte);
+    if !procx_pid_ok(nm.ptr[0: nm.len]) {
+        ty_fail(tag, "纯数字目录项应当算 pid", &ok);
+    }
+    buf_reset(&nm);
+    _ = buf_append_cstr(&nm, "12a" as &const byte);
+    if procx_pid_ok(nm.ptr[0: nm.len]) {
+        ty_fail(tag, "含字母的目录项不该算 pid", &ok);
+    }
+    buf_reset(&nm);
+    _ = buf_append_cstr(&nm, "self" as &const byte);
+    if procx_pid_ok(nm.ptr[0: nm.len]) {
+        ty_fail(tag, "/proc/self 不该算 pid", &ok);
+    }
+    buf_reset(&nm);
+    _ = buf_append_cstr(&nm, "." as &const byte);
+    if procx_pid_ok(nm.ptr[0: nm.len]) {
+        ty_fail(tag, "/proc/. 不该算 pid", &ok);
+    }
+    buf_reset(&nm);
+    if procx_pid_ok(nm.ptr[0: nm.len]) {
+        ty_fail(tag, "空目录项不该算 pid", &ok);
+    }
+    buf_reset(&nm);
+    _ = buf_append_cstr(&nm, "12345678901" as &const byte);
+    if procx_pid_ok(nm.ptr[0: nm.len]) {
+        ty_fail(tag, "11 位数字不该算 pid", &ok);
+    }
+
+    if ok {
+        out_err("selftest[");
+        out_err(tag);
+        out_err("] ok\n");
+    }
+    return ok;
+}
+
+fn procx_percent_round(tag: &const byte) bool {
+    var ok: bool = true;
+    // 1 tick = 10ms CPU；pct = Δticks * 1000 / Δms（单核百分比）
+    stx_num_eq(tag, "0 tick", procx_pct_of(0, 1000) as i64, 0, &ok);
+    stx_num_eq(tag, "37 tick / 1s", procx_pct_of(37, 1000) as i64, 37, &ok);
+    stx_num_eq(tag, "100 tick / 1s = 一个核", procx_pct_of(100, 1000) as i64, 100, &ok);
+    stx_num_eq(tag, "250 tick / 1s（并行 > 100%）", procx_pct_of(250, 1000) as i64, 250, &ok);
+    stx_num_eq(tag, "0.5% 向上取整", procx_pct_of(1, 2000) as i64, 1, &ok);
+    stx_num_eq(tag, "Δms=0 不可算", procx_pct_of(10, 0) as i64, -1, &ok);
+    stx_num_eq(tag, "负增量按 0", procx_pct_of(-5, 1000) as i64, 0, &ok);
+    stx_num_eq(tag, "上限钳 999", procx_pct_of(1000000, 1000) as i64, 999, &ok);
+    stx_num_eq(tag, "USER_HZ 常量", procx_hz(), 100, &ok);
+    if ok {
+        out_err("selftest[");
+        out_err(tag);
+        out_err("] ok\n");
+    }
+    return ok;
+}
+
+// 端到端：fork 一个忙循环子进程（同一个二进制 → comm 相同），两次采样必须把它算进去
+fn cpu_live_round(tag: &const byte) bool {
+    var ok: bool = true;
+    procx_reset();
+    const t0: u64 = ua_now_ms();
+    if !procx_sample_once(t0) {
+        ty_fail(tag, "读不到 /proc（/proc/self/stat 或 /proc 枚举失败）—— 这条断言要求能扫 /proc", &ok);
+        return false;
+    }
+    const base_count: i32 = procx_proc_count();
+    if base_count < 1 {
+        ty_fail(tag, "一个 uya-agent 进程都没枚举到（至少该有本进程）", &ok);
+    }
+    const pid64: i64 = sys_fork() catch {
+        ty_fail(tag, "fork 失败", &ok);
+        return false;
+    };
+    if pid64 == 0 {
+        const until_ms: u64 = ua_now_ms() + 400;
+        var spin: u64 = 0;
+        while ua_now_ms() < until_ms {
+            spin = spin + 1;
+        }
+        _ = spin;
+        sys_exit(0);
+    }
+    const cpid: i32 = i64_to_i32(pid64);
+    // 父进程睡觉：这 450ms 的 CPU 全记在子进程头上（不睡的话两边都在烧核）
+    deleg_wait_slice(450);
+    const t1: u64 = ua_now_ms();
+    if !procx_sample_once(t1) {
+        ty_fail(tag, "第二次采样失败", &ok);
+    } else {
+        if procx_last_span_ms() <= 0 {
+            ty_fail(tag, "两次采样之间没有时间跨度", &ok);
+        }
+        if procx_proc_count() < base_count + 1 {
+            ty_fail(tag, "枚举没看到忙循环子进程（进程数没涨）", &ok);
+        }
+        if procx_cpu_pct() < 25 {
+            ty_fail(tag, "综合 %cpu 偏低（USER_HZ 口径或 /proc 枚举有问题）", &ok);
+            out_err("[cpu] pct=");
+            out_err_dec(procx_cpu_pct() as usize);
+            out_err(" procs=");
+            out_err_dec(procx_proc_count() as usize);
+            out_err(" span_ms=");
+            out_err_dec(procx_last_span_ms() as usize);
+            out_err("\n");
+        }
+    }
+    _ = wait_child(cpid);
+    // 空跨度（now 没走）时不产生数字：这条防的是「除零 → 爆表」
+    procx_reset();
+    _ = procx_sample_once(5000);
+    if procx_cpu_pct() != -1 {
+        ty_fail(tag, "第一次采样（只建基线）不该产生百分比", &ok);
+    }
+    if ok {
+        out_err("selftest[");
+        out_err(tag);
+        out_err("] ok\n");
+    }
+    return ok;
+}
+
 export fn selftest_main(base: &const Config) i32 {
     _ = base;
     // 调试入口：只跑 TUI 轮（改动 TUI 时不必等整轮 selftest）
@@ -8342,8 +9199,25 @@ export fn selftest_main(base: &const Config) i32 {
     const y0: bool = sigx_selftest_all();
     // P17：全屏 TUI（排版 / 按键 / 显示收口 / headless 端到端 / 真 PTY）
     const y1: bool = tui_selftest_all();
-    if r1 && r2 && r3 && r4 && r5 && r5b && r6 && r7 && r8 && r9 && s0 && s1 && s2 && s3 && s4 && t0 && t1 && t2 && t3 && t4 && t5 && t6 && t7 && t8 && t9 && t10 && t11 && u0 && u1 && u2 && u3 && v0 && v1 && v2 && v3 && v4 && v5 && v6 && v7 && r1r && y0 && y1
-        && x0 && x1 && x2 && x3 && x4 && x5 && x6 && x7 && x8 && x9 && x10 && x11 && x12 && x13 && x14 && x15 && x16 && z0 && z1 && z2 {
+    // P20：统计轮（这一轮的 mock 答案帧带 usage，让 token 账目有端到端覆盖），
+    // 然后比对「实时折叠」与「日志回放」—— 后者就是 resume 走的那条路
+
+    mock_usage_on = true;
+    const r1t: bool = selftest_round(base, "stats-usage", 0, true, "build/selftest_ws_stats", true, false, false, false);
+    mock_usage_on = false;
+    const r1s: bool = stats_log_round("stats-log", "build/selftest_agent_home", "build/selftest_ws_stats");
+    // P20：统计渲染与折叠、上下文占用、进程 CPU
+
+    const w0: bool = stats_format_round("stats-format");
+    const w1: bool = stats_line_round("stats-line");
+    const w2: bool = stats_fold_round("stats-fold");
+    const w3: bool = stats_context_round("stats-context");
+    const w4: bool = procx_parse_round("procx-parse");
+    const w5: bool = procx_percent_round("procx-percent");
+
+    const w6: bool = cpu_live_round("cpu-live");
+    if r1 && r2 && r3 && r4 && r5 && r5b && r6 && r7 && r8 && r9 && s0 && s1 && s2 && s3 && s4 && t0 && t1 && t2 && t3 && t4 && t5 && t6 && t7 && t8 && t9 && t10 && t11 && u0 && u1 && u2 && u3 && v0 && v1 && v2 && v3 && v4 && v5 && v6 && v7 && r1r && r1t && r1s && y0 && y1
+        && x0 && x1 && x2 && x3 && x4 && x5 && x6 && x7 && x8 && x9 && x10 && x11 && x12 && x13 && x14 && x15 && x16 && w0 && w1 && w2 && w3 && w4 && w5 && w6 && z0 && z1 && z2 {
         out_err("SELFTEST PASS\n");
         return AGENT_OK;
     }
