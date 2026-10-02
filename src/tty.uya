@@ -1564,3 +1564,340 @@ export fn tty_reason_write(p: &const byte, n: usize) void {
 export fn tty_is_interactive() bool {
     return tty_active(&tty_ui);
 }
+
+// ============================================================
+// P22：终端标题（TTY title）
+//
+// 交互模式跑起来以后，把**终端窗口/标签页的标题**（xterm 的 OSC 2）写成
+// 「当前会话的标题」。三件事：
+//   1) 进界面时压标题栈（`ESC [ 2 2 t`）、退出或收到终止信号时弹栈（`ESC [ 2 3 t`）
+//      —— 终端支持 xterm 标题栈时，退出后能回到 shell 原来的标题；不支持的终端会
+//      忽略这两条（保留我们最后写的标题，不比「不弹栈」差）。**故意不写空标题**：
+//      把标签页清成空串比留着一个会话标题更糟。
+//   2) 标题串的清洗（`tty_title_clean_into`）—— 这是全仓**唯一**的标题规范化实现：
+//      去 OSC/CSI/ESC 序列、去 C0/C1 控制字节、去零宽与方向控制符、空白折叠 + 去首尾、
+//      按码点边界收字节上限。用户输入与外来会话日志都是不可信字节，一个没清掉的
+//      `ESC` / `BEL` 就能把标题变成「注入面」（甚至吃掉后面屏幕上的字节）。
+//      口径对齐 DSH 的 `@deepseek-ai/dsh-session-title`：cleanTitleText + truncateTitleUtf8，
+//      上限取 DSH preset 的 `maxTitleBytes: 80` / `fallbackMaxWords: 5` / `fallbackMaxBytes: 40`。
+//   3) 去重 + 编码上屏（`tty_title_set`）：同一个标题只写一次；整条序列**一次**
+//      `sys_write` 写完（拆成多次写，进程正好死在中间就会留下一个没终结的 OSC，
+//      终端会把它后面的输出一起吃掉）。
+//
+// 两条容易踩的线（都写进 README 踩坑 39）：
+//   * 必须直接 `sys_write` 到界面自己的 fd，**不能走 `tty_write`** —— TUI 激活后
+//     `tty_sink_on = true`，走 `tty_write` 会把控制序列当成显示字节吞进转录条目；
+//   * 只有真 TTY 的交互界面才允许打开这个通道（`tty_title_begin` 的调用点全部在
+//     「stdin 是 TTY 且拿到输出 fd」之后），管道/一次性运行里一个 OSC 字节都不许有。
+// ============================================================
+
+const TTY_TITLE_MAX_BYTES: usize = 80;        // DSH maxTitleBytes
+const TTY_TITLE_FALLBACK_WORDS: usize = 5;    // DSH fallbackMaxWords
+const TTY_TITLE_FALLBACK_BYTES: usize = 40;   // DSH fallbackMaxBytes
+const TTY_TITLE_SEQ_MAX: usize = TTY_TITLE_MAX_BYTES + 8;   // OSC 2 前缀 + 标题 + BEL
+
+var g_title_fd: i32 = -1;
+var g_title_on: bool = false;
+var g_title_buf: Buf = Buf{ ptr: null, len: 0, cap: 0 };
+var g_title_last: Buf = Buf{ ptr: null, len: 0, cap: 0 };
+
+fn tty_title_ensure() void {
+    if !buf_valid(&g_title_buf) {
+        g_title_buf = buf_new(TTY_TITLE_MAX_BYTES + 16);
+    }
+    if !buf_valid(&g_title_last) {
+        g_title_last = buf_new(TTY_TITLE_MAX_BYTES + 16);
+    }
+}
+
+// ASCII 空白（TAB/LF/VT/FF/CR/空格）：清洗时折叠成一个空格
+fn tty_title_ascii_space(c: byte) bool {
+    return c == 32 as byte || (c >= 9 as byte && c <= 13 as byte);
+}
+
+// 码点层面的空白（对齐 JS 正则 `\s` 的常见范围，DSH 的 cleanTitleText 用的就是 `\s+`）
+fn tty_title_cp_space(cp: u32) bool {
+    if cp == 32 || (cp >= 9 && cp <= 13) {
+        return true;
+    }
+    if cp == 0xA0 || cp == 0x1680 || cp == 0x2028 || cp == 0x2029
+        || cp == 0x202F || cp == 0x205F || cp == 0x3000 {
+        return true;
+    }
+    return cp >= 0x2000 && cp <= 0x200A;
+}
+
+// 不可见但会影响显示的控制符：零宽、方向控制、词连接符等（DSH 的 DIRECTIONAL_CONTROL）
+fn tty_title_cp_invisible(cp: u32) bool {
+    if cp == 0x200B || cp == 0x200E || cp == 0x200F || cp == 0xFEFF {
+        return true;
+    }
+    if cp >= 0x202A && cp <= 0x202E {
+        return true;
+    }
+    if cp >= 0x2060 && cp <= 0x2064 {
+        return true;
+    }
+    return cp >= 0x2066 && cp <= 0x206F;
+}
+
+// i 处是 ESC：返回「整个控制序列之后」的下标。OSC 吃到 BEL / ST（未终结就吃到尾）、
+// CSI 吃到终结字节、其余 ESC 序列吃两字节；末尾孤立的 ESC 也吃掉（否则它会留在标题里）。
+fn tty_title_skip_esc(s: &const byte, i: usize, n: usize) usize {
+    var k: usize = i + 1;
+    if k >= n {
+        return k;
+    }
+    const c: byte = s[k];
+    if c == 93 as byte {
+        // OSC：ESC ] … BEL 或 ESC \（ST）
+        k = k + 1;
+        while k < n {
+            if s[k] == 7 as byte {
+                return k + 1;
+            }
+            if s[k] == 27 as byte {
+                if k + 1 < n && s[k + 1] == 92 as byte {
+                    return k + 2;
+                }
+                return k;        // 又一个 ESC：交给下一轮当新序列处理
+            }
+            k = k + 1;
+        }
+        return n;                // 未终结的 OSC：整段吃掉
+    }
+    if c == 91 as byte {
+        // CSI：ESC [ 参数/中间字节 终结字节（0x40..0x7E）
+        k = k + 1;
+        while k < n {
+            const b: byte = s[k];
+            if b >= 0x40 as byte && b <= 0x7e as byte {
+                return k + 1;
+            }
+            k = k + 1;
+        }
+        return n;
+    }
+    if c >= 0x20 as byte && c <= 0x2f as byte {
+        // 带中间字节的 ESC 序列（ESC ( B 之类）
+        k = k + 1;
+        while k < n {
+            const b: byte = s[k];
+            if b >= 0x30 as byte && b <= 0x7e as byte {
+                return k + 1;
+            }
+            k = k + 1;
+        }
+        return n;
+    }
+    return k + 1;                // 两字节 ESC 序列
+}
+
+// 清洗一段不可信字节 → 一行标题。返回写入 dst 的字节数（可能是 0）。
+//
+// 规则（逐码点）：
+//   * ESC 引导的 OSC/CSI/两字节 ESC 序列：整段丢弃；
+//   * C0/C1 控制字节丢弃（TAB/LF/VT/FF/CR 当空白），DEL 丢弃；
+//   * 空白折叠成一个空格、首尾不留空格（末尾那个「待定空格」只在后面真的还有字符时才写）；
+//   * 零宽 / 方向控制符丢弃；
+//   * 非法或半截 UTF-8 丢弃（**不留半个汉字**：多字节只在完整序列上通过）；
+//   * 输出按 `max_bytes` 收口，切点一定落在码点边界上。
+export fn tty_title_clean_into(dst: &Buf, src: &const byte, n: usize, max_bytes: usize) usize {
+    buf_reset(dst);
+    var pending_space: bool = false;
+    var i: usize = 0;
+    while i < n {
+        const c: byte = src[i];
+        if c == 27 as byte {
+            i = tty_title_skip_esc(src, i, n);
+            continue;
+        }
+        if tty_title_ascii_space(c) {
+            // 空格以及 TAB/LF/VT/FF/CR：都只是一个「待定空格」（折叠 + 去首尾）
+            if dst.len > 0 {
+                pending_space = true;
+            }
+            i = i + 1;
+            continue;
+        }
+        if c < 0x20 as byte || c == 0x7f as byte {
+            // 其余 C0 与 DEL 直接丢（C1 的 0x80..0x9F 单字节形态不是合法 UTF-8 引导字节，
+            // 在下面按「非法序列」丢掉）
+            i = i + 1;
+            continue;
+        }
+        if c < 0x80 as byte {
+            if pending_space {
+                if dst.len + 1 > max_bytes {
+                    break;
+                }
+                _ = buf_append_byte(dst, 32);
+                pending_space = false;
+            }
+            if dst.len + 1 > max_bytes {
+                break;
+            }
+            _ = buf_append_byte(dst, c);
+            i = i + 1;
+            continue;
+        }
+        const need: usize = tty_utf8_len(c);
+        const step: usize = tty_utf8_next(src, i, n) - i;
+        if need <= 1 || step != need {
+            // 坏引导字节 / 半截序列：丢一个字节继续（绝不把半个字符写进标题）
+            i = i + 1;
+            continue;
+        }
+        const cp: u32 = tty_utf8_decode(src, i, n);
+        if tty_title_cp_invisible(cp) {
+            i = i + step;
+            continue;
+        }
+        if tty_title_cp_space(cp) {
+            if dst.len > 0 {
+                pending_space = true;
+            }
+            i = i + step;
+            continue;
+        }
+        if pending_space {
+            if dst.len + 1 > max_bytes {
+                break;
+            }
+            _ = buf_append_byte(dst, 32);
+            pending_space = false;
+        }
+        if dst.len + step > max_bytes {
+            break;
+        }
+        _ = buf_append(dst, src + i, step);
+        i = i + step;
+    }
+    return dst.len;
+}
+
+// 前 max_words 个空白分词之后的下标（清洗过的串上调用）
+fn tty_title_words_end(s: &const byte, n: usize, max_words: usize) usize {
+    if max_words == 0 {
+        return 0;
+    }
+    var words: usize = 0;
+    var i: usize = 0;
+    while i < n {
+        if s[i] == 32 as byte {
+            i = i + 1;
+            continue;
+        }
+        words = words + 1;
+        while i < n && s[i] != 32 as byte {
+            i = i + 1;
+        }
+        if words >= max_words {
+            return i;
+        }
+    }
+    return n;
+}
+
+// 首条用户消息 → 兜底标题。顺序与 DSH 的 `fallbackSessionTitle` 一致：
+// 先清洗全文 → 取前 max_words 个词 → 再按 max_bytes（码点边界）截断。
+// 第一遍的字节上限取 `max_bytes + 1` 就够：最终结果一定是这一遍输出的前缀，
+// 而空白折叠让「待定空格」不占输出字节，所以 40 B 的结论不会被更长的输入改变。
+export fn tty_title_fallback_into(
+    dst: &Buf,
+    src: &const byte,
+    n: usize,
+    max_words: usize,
+    max_bytes: usize
+) usize {
+    buf_reset(dst);
+    if max_bytes == 0 {
+        return 0;
+    }
+    var tmp: Buf = buf_new(max_bytes + 2);
+    defer { buf_free(&tmp); }
+    _ = tty_title_clean_into(&tmp, src, n, max_bytes + 1);
+    const we: usize = tty_title_words_end(tmp.ptr as &const byte, tmp.len, max_words);
+    return tty_title_clean_into(dst, tmp.ptr as &const byte, we, max_bytes);
+}
+
+export fn tty_title_active() bool {
+    return g_title_on && g_title_fd >= 0;
+}
+
+export fn tty_title_on() bool {
+    return g_title_on;
+}
+
+// 打开标题通道：先压标题栈，再记 fd。重复调用是空操作（只压一次栈）。
+export fn tty_title_begin(fd: i32) void {
+    if fd < 0 || g_title_on {
+        return;
+    }
+    tty_title_ensure();
+    var push: [byte: 5] = [27, 91, 50, 50, 116];   // ESC[22t
+    _ = sys_write(fd, &push[0] as *const byte, 5) catch {};
+    g_title_fd = fd;
+    g_title_on = true;
+    buf_reset(&g_title_last);
+}
+
+// 关闭标题通道：弹标题栈（终端支持标题栈时这就是「恢复 shell 原来的标题」）
+export fn tty_title_end() void {
+    if !g_title_on {
+        return;
+    }
+    tty_title_ensure();
+    if g_title_fd >= 0 {
+        var pop: [byte: 5] = [27, 91, 50, 51, 116];   // ESC[23t
+        _ = sys_write(g_title_fd, &pop[0] as *const byte, 5) catch {};
+    }
+    g_title_on = false;
+    g_title_fd = -1;
+    buf_reset(&g_title_last);
+}
+
+// 上屏：清洗 → 与上次相同的直接跳过 → 一次写完 `ESC ] 2 ; <标题> BEL`。
+// 清洗后为空（全控制字节 / 全空白）时**不写**：留着上一个标题，而不是把标签页清空。
+export fn tty_title_set(text: &const byte, n: usize) void {
+    if !tty_title_active() {
+        return;
+    }
+    tty_title_ensure();
+    _ = tty_title_clean_into(&g_title_buf, text, n, TTY_TITLE_MAX_BYTES);
+    if g_title_buf.len == 0 {
+        return;
+    }
+    if g_title_last.len == g_title_buf.len
+        && bufx_mem_eq(g_title_last.ptr as &const byte, g_title_buf.ptr as &const byte, g_title_buf.len) {
+        return;
+    }
+    var seq: [byte: TTY_TITLE_SEQ_MAX] = [0: TTY_TITLE_SEQ_MAX];
+    seq[0] = 27; seq[1] = 93; seq[2] = 50; seq[3] = 59;   // ESC ] 2 ;
+    var k: usize = 4;
+    var i: usize = 0;
+    while i < g_title_buf.len {
+        seq[k] = g_title_buf.ptr[i];
+        k = k + 1;
+        i = i + 1;
+    }
+    seq[k] = 7;   // BEL
+    k = k + 1;
+    _ = sys_write(g_title_fd, &seq[0] as *const byte, k) catch {};
+    buf_reset(&g_title_last);
+    _ = buf_append(&g_title_last, g_title_buf.ptr as &const byte, g_title_buf.len);
+}
+
+// 观测（自测用）：最近一次真正写出去的标题
+export fn tty_title_last_len() usize {
+    tty_title_ensure();
+    return g_title_last.len;
+}
+
+export fn tty_title_last_at(i: usize) byte {
+    tty_title_ensure();
+    if i >= g_title_last.len {
+        return 0;
+    }
+    return g_title_last.ptr[i];
+}
