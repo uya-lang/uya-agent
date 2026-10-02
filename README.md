@@ -4,15 +4,17 @@
 多轮 loop 直到给出结论。全部代码 9 个 `.uya` 文件，**不引入任何 C 代码、`@c_import` 或其它语言**，
 只依赖 Uya 语言与随编译器分发的标准库。
 
-**P1–P6 已完成**：LLM 交互是**流式 SSE**（`stream:true` + `stream_options.include_usage`），
+**P1–P7 已完成**：LLM 交互是**流式 SSE**（`stream:true` + `stream_options.include_usage`），
 增量 chunked 解码 + SSE 分帧 + `tool_calls` 按 `index` 分片累积；消息协议是**严格工具协议**
 （`assistant.tool_calls` 原样回灌 + 每条结果一条 `role:"tool"` + `tool_call_id`）；
 交互界面是**真 TTY**（termios raw + 行编辑器），流式期间可打断、可继续输入、可续跑；
 会话**落盘可恢复**（`--continue` / `--resume` / `/sessions`，跨进程实测「记住 4271 → 下一个进程问它 → 答 4271」）；
 **直接读 DSH 的设置文件**：`--print-config` 显示 base_url / model / api_key / contextWindow 全部来自
 `~/.dsh`，实测**零参数启动**（只额外给信任策略）能直接跑通真机网关；
-**工具改用 DSH 标准模式的原名**（`read`/`write`/`edit`/`glob`/`grep`），并实现了 DSH 的
-文件观察策略（read-before-write / 版本守卫）。`--no-stream` / `--compat-fold` 保留两条回退路径。
+**工具改用 DSH 标准模式的原名**（`read`/`write`/`edit`/`glob`/`grep`/`bash`/`job_*`），
+实现了 DSH 的文件观察策略（read-before-write / 版本守卫）与**后台任务**
+（`bash run_in_background` → `job_list` / `job_output` / `job_kill`），
+子进程会拿到 `DSH_*` 环境。`--no-stream` / `--compat-fold` 保留两条回退路径。
 
 ```
 $ DEEPSEEK_API_KEY=sk-xxx ./build/uya-agent "在当前目录创建 hello.uya，编译并运行它"
@@ -113,6 +115,10 @@ src/yamlcfg.uya   自带 YAML 子集解析器：去注释（块标量/引号感�
 src/fsx.uya       文件工具：路径解析（可选工作区守卫）、(mtime,size) 版本、观察状态表、
                   read（窗口 + 行号 + 三种 footer + 行长/字节上限）、write（createIfAbsent /
                   replaceIfVersion）、edit（唯一匹配 / replace_all）
+src/shellx.uya    bash 工具：bash -c、workdir、timeoutMs、run_in_background、stdout/stderr 分开收、
+                  结果标记（[exit code: N] / [timed out after Nms] / [killed by signal: N]）、DSH_* 环境注入
+src/jobs.uya      后台任务表：注册/增量输出（保留内存尾部 1 MiB）/状态机（running/completed/killed）、
+                  job_list / job_output（wait + timeout_ms）/ job_kill
 src/search.uya    glob / grep：rg 子进程（--files / --json）、VCS 目录排除、条数与行长上限
 src/dshcfg.uya    读 DSH 设置：$DSH_HOME 解析、settings.yaml 模型路线（agent-default-model →
                   provider 的 baseURL/apiKeyEnv/models[]）、.credentials.yaml、.env 兜底、
@@ -123,6 +129,20 @@ src/agent.uya     CLI、环境变量、消息历史、请求组装、主循环�
                   交互式 REPL（中断/steer//continue/会话命令）、会话事件记录与恢复
 src/selftest.uya  --selftest 的 mock LLM（含 SSE 受控切分）+ 15 轮断言 + --probe
 ```
+
+### bash 与后台任务（P7，对齐 DSH tool-bash + tool-jobs）
+
+| 工具 | 参数 | 行为要点 |
+|---|---|---|
+| `bash` | `command`(必), `description`(必), `timeoutMs`, `workdir`, `run_in_background` | `bash -c`；stdout 与 stderr **分开收**，stderr 归到 `[stderr]` 段；尾部标记 `[exit code: N]`、`[timed out after Nms]`、`[killed by signal: N]`、`[output truncated]`；完全无输出 → `(no output)`；后台调用立刻回 `started background job job-N` |
+| `job_list` | — | `<job-id> [bash] <status> — <描述>`；空 → `(no background jobs)` |
+| `job_output` | `job_id`(必), `wait`, `timeout_ms` | **增量**语义（只给上次读之后的新输出）；`wait=true` 最多等 30 s（上限 600 s）；无新输出 → `(no new output)`；尾部 `[status: running\|completed\|killed, exit N]` |
+| `job_kill` | `job_id`(必), `reason` | 运行中 → `requested cancellation of job N`；已结束 → `job N had already finished [status: …]` |
+
+* 超时是**墙钟**的，且一定会 SIGKILL 进程组里的子进程；被信号杀掉时退出码报 `128+信号号`。
+* 每个子进程都会拿到 `DSH_HOME`、`DSH_SHELL=1`、`DSH_SESSION_ID`、`DSH_SESSION_JSONL`
+  （继承来的旧 `DSH_*` 会先清掉），与 DSH 的 shell-env 约定一致。
+* 任务输出保留**内存尾部 1 MiB**，超出打 `[output truncated]`（DSH 会落盘 spill，记为偏离）。
 
 ### 文件系统工具（P6，对齐 DSH tool-fs + fs-observation-policy）
 
@@ -390,6 +410,8 @@ agent 循环并逐项断言：
 | `interrupt` | 预置 Ctrl-C：回合以 `AGENT_INTERRUPTED` 结束、工具**未派发**、只发生一次请求 |
 | `tty-editor` | termios 布局(60B)/raw 位运算；行编辑（插入/退格/左右/Delete/Home/End/词删除）、
 一次喂入多行拆成多个提交、分片转义序列、裸 ESC 判定、历史上下翻、中断前缀裁剪 |
+| `bash-jobs` | 一轮 6 个调用：后台短任务 / 后台长任务 / `job_list` / `job_output(wait=true)` 等到
+`BG-DONE` / `job_kill` 取消长任务 / 前台静默命令 → 第二轮断言全部结果文本 |
 | `fs-tools` | 一轮内 10 个文件工具调用：write（未读→拒）/ read（窗口+footer）/ write（读后覆盖）/
 edit（多匹配→拒、成功、找不到）/ glob（两条路径）/ grep（命中两行、无命中）/ glob（无文件）→
 第二轮断言全部结果文本，并逐字节校验最终落盘内容（含 edit 后的 `ALPHA one`） |
@@ -409,6 +431,9 @@ contextWindow/maxTokens/input image/reasoningEffort/`permission→confine`/`uya-
   `"id":"call_…"` 保留、`"tool_call_id"` 条数与调用数一致（shell 2 / no-shell 1 / tools 4）。
 * TTY 交互用**真 pty** 验证（`script -qec`）：进入 raw 模式、banner 干净、一次粘贴
   4 行会分成 4 次提交（任务 → `/help` → `/status` → `/exit`），退出后终端恢复。
+* 后台任务在真机上做了冒烟：让它「用 run_in_background 跑 `sleep 2; echo BG-JOB-DONE`，
+  再用 job_output(wait=true) 读输出」→ 模型 `bash` → `job_output` 两轮完成，
+  回答「输出内容是 `BG-JOB-DONE`（job-1 正常结束，exit 0）」。
 * 文件工具在真机上做了冒烟：让它「创建 demo.txt 写三行，然后用 grep 找 banana 在第几行」，
   模型按新工具名一路调用 `write → run_shell → grep`，最后回答「banana 出现在第 2 行」，
   产物 `demo.txt` 内容逐字节符合预期。

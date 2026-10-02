@@ -1,0 +1,398 @@
+// src/shellx.uya — bash 工具（P7，对齐 DSH tool-bash）
+//
+// 参数：command(必)、description(必)、timeoutMs、workdir、run_in_background。
+// 行为：
+//   * `bash -c <command>`，workdir 默认工作区（相对路径按工作区解析）；
+//   * 前景：stdout 与 stderr **分开**收（DSH 的结果里有独立的 [stderr] 段），
+//     墙钟超时 → SIGKILL；结果尾部的标记：`[exit code: N]`、`[timed out after Nms]`、
+//     `[killed by signal: N]`、`[output truncated]`；空输出 → `(no output)`；
+//   * 后台：注册成任务并立刻返回 `started background job <id>`；
+//   * 给子进程注入 DSH_* 环境（DSH_HOME / DSH_SHELL=1 / DSH_SESSION_ID / DSH_SESSION_JSONL）。
+
+use libc.syscall;
+use libc.unistd;
+use libc.fcntl;
+use libc.signal;
+use std.runtime.saved_envp;
+
+const SH_ENV_MAX: usize = 256;
+const SH_POLL_MS: i32 = 50;
+
+// 组装子进程环境：继承现有变量（清掉旧的 DSH_*），再补上我们的 DSH_*
+var g_env_ptrs: [&const byte: SH_ENV_MAX] = [null as &const byte: SH_ENV_MAX];
+var g_env_store: Buf = Buf{ ptr: null, len: 0, cap: 0 };
+
+fn env_is_dsh(name: &const byte, n: usize) bool {
+    if n < 4 {
+        return false;
+    }
+    return name[0] == 68 as byte && name[1] == 83 as byte && name[2] == 72 as byte && name[3] == 95 as byte;
+}
+
+fn env_add_kv(name: &const byte, value: &const byte, value_len: usize) void {
+    var slot: usize = 0;
+    while slot < SH_ENV_MAX && (g_env_ptrs[slot] as usize) != 0 {
+        slot = slot + 1;
+    }
+    if slot + 1 >= SH_ENV_MAX {
+        return;
+    }
+    const start: usize = g_env_store.len;
+    _ = buf_append_cstr(&g_env_store, name);
+    _ = buf_append_byte(&g_env_store, 61);   // '='
+    if value_len > 0 {
+        _ = buf_append(&g_env_store, value, value_len);
+    }
+    _ = buf_append_byte(&g_env_store, 0);
+    if !buf_valid(&g_env_store) {
+        return;
+    }
+    g_env_ptrs[slot] = &g_env_store.ptr[start] as &const byte;
+    g_env_ptrs[slot + 1] = null as &const byte;
+}
+
+// 组装一次环境（在 fork 之前调用；子进程 execve 前一直有效）
+fn sh_env_prepare(dsh_home: &[byte], session_id: &[byte], session_jsonl: &[byte]) void {
+    if !buf_valid(&g_env_store) {
+        g_env_store = buf_new(8192);
+    }
+    buf_reset(&g_env_store);
+    var i: usize = 0;
+    while i < SH_ENV_MAX {
+        g_env_ptrs[i] = null as &const byte;
+        i = i + 1;
+    }
+    // 继承：saved_envp 是 &(&const byte)，逐条拷指针（跳过 DSH_*）
+    var k: usize = 0;
+    var slot: usize = 0;
+    while slot + 2 < SH_ENV_MAX {
+        const p: &const byte = saved_envp[k];
+        if (p as usize) == 0 {
+            break;
+        }
+        // 找 '='
+        var eq: usize = 0;
+        while p[eq] != 61 as byte && p[eq] != 0 as byte {
+            eq = eq + 1;
+        }
+        if !env_is_dsh(p, eq) {
+            g_env_ptrs[slot] = p;
+            slot = slot + 1;
+        }
+        k = k + 1;
+    }
+    g_env_ptrs[slot] = null as &const byte;
+    env_add_kv("DSH_SHELL", "1", 1);
+    if dsh_home.len > 0 {
+        env_add_kv("DSH_HOME", dsh_home.ptr, dsh_home.len);
+    }
+    if session_id.len > 0 {
+        env_add_kv("DSH_SESSION_ID", session_id.ptr, session_id.len);
+    }
+    if session_jsonl.len > 0 {
+        env_add_kv("DSH_SESSION_JSONL", session_jsonl.ptr, session_jsonl.len);
+    }
+}
+
+// workdir：默认工作区；给了就按工作区解析（可含子目录）
+fn sh_resolve_workdir(cfg: &const Config, args: &const JsonValue, out: &Buf) bool {
+    buf_reset(out);
+    var wd: Buf = buf_empty();
+    defer { buf_free(&wd); }
+    var have: bool = false;
+    if js_obj_get_str_unescaped(args, "workdir", 7, &wd) && wd.len > 0 {
+        have = true;
+    }
+    if !have {
+        _ = buf_append(out, cfg.workspace.ptr, cfg.workspace.len);
+        return buf_append_byte(out, 0);
+    }
+    const rc: i32 = fs_resolve(&g_fsctx, wd.ptr as &const byte, wd.len, out);
+    return rc == 0;
+}
+
+// 前台执行；把 stdout/stderr 收进两个缓冲
+fn sh_run_foreground(cfg: &const Config, cmd_z: &const byte, workdir_z: &const byte, timeout_ms: u32, out_s: &Buf, err_s: &Buf, timed_out: &bool, killed_by: &i32) i32 {
+    timed_out[0] = false;
+    killed_by[0] = 0;
+    var op: [i32: 2] = [0: 2];
+    var ep: [i32: 2] = [0: 2];
+    if (sys_pipe2(&op[0], 0) catch { -1; }) != 0 {
+        return -1;
+    }
+    if (sys_pipe2(&ep[0], 0) catch { -1; }) != 0 {
+        _ = sys_close(op[0]) catch {};
+        _ = sys_close(op[1]) catch {};
+        return -1;
+    }
+    const pid64: i64 = sys_fork() catch {
+        return -1;
+    };
+    if pid64 == 0 {
+        _ = sys_close(op[0]) catch {};
+        _ = sys_close(ep[0]) catch {};
+        _ = sys_dup2(op[1], 1) catch {};
+        _ = sys_dup2(ep[1], 2) catch {};
+        _ = sys_close(op[1]) catch {};
+        _ = sys_close(ep[1]) catch {};
+        _ = sys_chdir(workdir_z as *const byte) catch {};
+        var shpath: [byte: 16] = "/bin/bash";
+        var shname: [byte: 5] = "bash";
+        var dashc: [byte: 4] = "-c";
+        var argv: [&const byte: 4] = [&shname[0], &dashc[0], cmd_z, null as &const byte];
+        _ = sys_execve(&shpath[0], &argv[0], &g_env_ptrs[0]) catch {};
+        sys_exit(127);
+    }
+    const pid: i32 = i64_to_i32(pid64);
+    _ = sys_close(op[1]) catch {};
+    _ = sys_close(ep[1]) catch {};
+    var pfds: [PollFd: 2] = [
+        PollFd{ fd: op[0], events: POLLIN, revents: 0 },
+        PollFd{ fd: ep[0], events: POLLIN, revents: 0 },
+    ];
+    const started: u64 = ua_now_ms();
+    var chunk: [byte: 8192] = [0: 8192];
+    var done: bool = false;
+    var out_len: usize = 0;
+    var err_len: usize = 0;
+    const cap: usize = cfg.max_tool_out;
+    while !done {
+        pfds[0].revents = 0;
+        pfds[1].revents = 0;
+        const pr: i32 = sys_poll(&pfds[0], 2, SH_POLL_MS) catch { 0; };
+        if pr > 0 {
+            var which: usize = 0;
+            while which < 2 {
+                const rev: i16 = pfds[which].revents;
+                if (rev & POLLIN) != 0 || (rev & POLLHUP) != 0 || (rev & POLLERR) != 0 {
+                    const fd: i32 = pfds[which].fd;
+                    const n: isize = sys_read(fd, &chunk[0], 8192) catch { 0 as isize; };
+                    if n > 0 {
+                        const un: usize = n as usize;
+                        var i: usize = 0;
+                        while i < un {
+                            if which == 0 {
+                                if out_len < cap {
+                                    _ = buf_append_byte(out_s, chunk[i]);
+                                    out_len = out_len + 1;
+                                }
+                            } else {
+                                if err_len < cap {
+                                    _ = buf_append_byte(err_s, chunk[i]);
+                                    err_len = err_len + 1;
+                                }
+                            }
+                            i = i + 1;
+                        }
+                    }
+                }
+                which = which + 1;
+            }
+        }
+        // 超时（墙钟）
+        if timeout_ms > 0 && (ua_now_ms() - started) >= (timeout_ms as u64) {
+            timed_out[0] = true;
+            _ = sys_kill(pid as i64, SIGKILL) catch {};
+            killed_by[0] = SIGKILL;
+            done = true;
+        }
+        var st: i32 = 0;
+        const r: i32 = sys_waitpid(pid, &st, 1) catch { 0; };
+        if r > 0 {
+            done = true;
+            // 收尾再读一次
+            var guard: usize = 0;
+            while guard < 8 {
+                guard = guard + 1;
+                const n2: isize = sys_read(op[0], &chunk[0], 8192) catch { 0 as isize; };
+                if n2 <= 0 {
+                    break;
+                }
+                if out_len < cap {
+                    _ = buf_append(out_s, &chunk[0], n2 as usize);
+                    out_len = out_len + n2 as usize;
+                }
+            }
+            guard = 0;
+            while guard < 8 {
+                guard = guard + 1;
+                const n3: isize = sys_read(ep[0], &chunk[0], 8192) catch { 0 as isize; };
+                if n3 <= 0 {
+                    break;
+                }
+                if err_len < cap {
+                    _ = buf_append(err_s, &chunk[0], n3 as usize);
+                    err_len = err_len + n3 as usize;
+                }
+            }
+            const code: i32 = (st >> (8 as i32)) & 255;
+            const sig: i32 = st & 127;
+            _ = sys_close(op[0]) catch {};
+            _ = sys_close(ep[0]) catch {};
+            if sig != 0 {
+                if killed_by[0] == 0 {
+                    killed_by[0] = sig;
+                }
+                return 128 + sig;
+            }
+            return code;
+        }
+    }
+    _ = sys_close(op[0]) catch {};
+    _ = sys_close(ep[0]) catch {};
+    var st2: i32 = 0;
+    _ = sys_waitpid(pid, &st2, 0) catch {};
+    if killed_by[0] != 0 {
+        return 128 + killed_by[0];
+    }
+    return (st2 >> (8 as i32)) & 255;
+}
+
+// 后台执行：注册成任务，返回 job id（-1 = 失败）
+fn sh_run_background(cfg: &const Config, cmd_z: &const byte, workdir_z: &const byte, label: &const byte, label_len: usize) i32 {
+    var op: [i32: 2] = [0: 2];
+    if (sys_pipe2(&op[0], 0) catch { -1; }) != 0 {
+        return -1;
+    }
+    const pid64: i64 = sys_fork() catch {
+        return -1;
+    };
+    if pid64 == 0 {
+        _ = sys_close(op[0]) catch {};
+        _ = sys_dup2(op[1], 1) catch {};
+        _ = sys_dup2(op[1], 2) catch {};
+        _ = sys_close(op[1]) catch {};
+        _ = sys_chdir(workdir_z as *const byte) catch {};
+        var shpath: [byte: 16] = "/bin/bash";
+        var shname: [byte: 5] = "bash";
+        var dashc: [byte: 4] = "-c";
+        var argv: [&const byte: 4] = [&shname[0], &dashc[0], cmd_z, null as &const byte];
+        _ = sys_execve(&shpath[0], &argv[0], &g_env_ptrs[0]) catch {};
+        sys_exit(127);
+    }
+    const pid: i32 = i64_to_i32(pid64);
+    _ = sys_close(op[1]) catch {};
+    // 读端设成非阻塞，避免 drain 时卡住
+    _ = sys_fcntl(op[0], F_SETFL, O_NONBLOCK) catch {};
+    const id: i32 = job_register(&g_jobs, pid, op[0], label, label_len);
+    if id < 0 {
+        _ = sys_kill(pid as i64, SIGKILL) catch {};
+        _ = sys_close(op[0]) catch {};
+    }
+    _ = cfg;
+    return id;
+}
+
+// ============================================================
+// bash 工具
+// ============================================================
+export fn sh_tool_bash(cfg: &const Config, args: &const JsonValue, out: &Buf) void {
+    if !cfg.allow_shell {
+        _ = buf_append_cstr(out, "Error: background execution is disabled for this bash tool");
+        return;
+    }
+    var cmd: Buf = buf_empty();
+    defer { buf_free(&cmd); }
+    if !js_obj_get_str_unescaped(args, "command", 7, &cmd) || cmd.len == 0 {
+        _ = buf_append_cstr(out, "Error: invalid command: expected a non-empty string");
+        return;
+    }
+    var desc: Buf = buf_empty();
+    defer { buf_free(&desc); }
+    if !js_obj_get_str_unescaped(args, "description", 11, &desc) || desc.len == 0 {
+        _ = buf_append_cstr(out, "Error: invalid description: expected a non-empty string");
+        return;
+    }
+    var timeout_ms: u32 = cfg.shell_timeout_ms;
+    var tv: JsonValue = JsonValue.json_null();
+    var n: i64 = 0;
+    if js_obj_get(args, "timeoutMs", 9, &tv) && js_i64_of(&tv, &n) && n > 0 {
+        if n > 3600000 {
+            n = 3600000;
+        }
+        timeout_ms = n as u32;
+    }
+    var bg: bool = false;
+    var bv: JsonValue = JsonValue.json_null();
+    if js_obj_get(args, "run_in_background", 17, &bv) {
+        bg = json_bool_of(&bv);
+    }
+    var wd_z: Buf = buf_new(FS_PATH_MAX);
+    defer { buf_free(&wd_z); }
+    if !sh_resolve_workdir(cfg, args, &wd_z) {
+        _ = buf_append_cstr(out, "Error: invalid workdir");
+        return;
+    }
+    if !buf_append_byte(&cmd, 0) {
+        _ = buf_append_cstr(out, "Error: out of memory");
+        return;
+    }
+    // 注入 DSH_* 环境
+    var sess_id: Buf = buf_empty();
+    if g_sess.id.len > 0 {
+        sess_id = g_sess.id;
+    }
+    var sess_path: Buf = buf_empty();
+    if g_sess.path.len > 0 {
+        sess_path = g_sess.path;
+    }
+    sh_env_prepare(agent_dsh_home(), sess_id.ptr[0: sess_id.len], sess_path.ptr[0: sess_path.len]);
+
+    if bg {
+        const id: i32 = sh_run_background(cfg, &cmd.ptr[0] as &const byte, &wd_z.ptr[0] as &const byte, desc.ptr as &const byte, desc.len);
+        if id < 0 {
+            _ = buf_append_cstr(out, "Error: cannot start background job");
+            return;
+        }
+        _ = buf_append_cstr(out, "started background job job-");
+        _ = buf_append_u64(out, id as u64);
+        return;
+    }
+
+    var out_s: Buf = buf_new(8192);
+    defer { buf_free(&out_s); }
+    var err_s: Buf = buf_new(4096);
+    defer { buf_free(&err_s); }
+    var timed_out: bool = false;
+    var killed_by: i32 = 0;
+    const code: i32 = sh_run_foreground(cfg, &cmd.ptr[0] as &const byte, &wd_z.ptr[0] as &const byte, timeout_ms, &out_s, &err_s, &timed_out, &killed_by);
+    if code < 0 {
+        _ = buf_append_cstr(out, "Error: cannot spawn bash");
+        return;
+    }
+    var wrote: bool = false;
+    if out_s.len > 0 {
+        _ = buf_append(out, out_s.ptr, out_s.len);
+        wrote = true;
+    }
+    if err_s.len > 0 {
+        if wrote && out_s.ptr[out_s.len - 1] != 10 as byte {
+            _ = buf_append_byte(out, 10);
+        }
+        _ = buf_append_cstr(out, "[stderr]\n");
+        _ = buf_append(out, err_s.ptr, err_s.len);
+        wrote = true;
+    }
+    if !wrote {
+        _ = buf_append_cstr(out, "(no output)");
+    }
+    if out.len > 0 && out.ptr[out.len - 1] != 10 as byte {
+        _ = buf_append_byte(out, 10);
+    }
+    if timed_out {
+        _ = buf_append_cstr(out, "[timed out after ");
+        _ = buf_append_u64(out, timeout_ms as u64);
+        _ = buf_append_cstr(out, "ms]\n");
+    }
+    if killed_by != 0 {
+        _ = buf_append_cstr(out, "[killed by signal: ");
+        _ = buf_append_u64(out, killed_by as u64);
+        _ = buf_append_cstr(out, "]\n");
+    }
+    if out_s.len >= cfg.max_tool_out || err_s.len >= cfg.max_tool_out {
+        _ = buf_append_cstr(out, "[output truncated]\n");
+    }
+    _ = buf_append_cstr(out, "[exit code: ");
+    _ = buf_append_u64(out, code as u64);
+    _ = buf_append_cstr(out, "]");
+}

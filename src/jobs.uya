@@ -1,0 +1,423 @@
+// src/jobs.uya — 后台任务注册表（P7）
+//
+// DSH 的后台任务统一由 job_list / job_output / job_kill 控制，`bash` 的
+// run_in_background=true 会注册一个任务并立刻返回 `started background job <id>`。
+//
+// 这里用最简单的模型：fork + 管道，父进程按需 poll 读增量输出。
+// 输出保留**内存尾部**（JOB_BUF_MAX），超出部分丢弃并在结果里标 `[output truncated]`
+// （DSH 会落盘 spill，本项目记为偏离）。
+//
+// 状态词与 DSH 对齐：running / completed / failed / killed。
+
+use libc.syscall;
+use libc.unistd;
+use libc.fcntl;
+use libc.signal;
+
+export const JOB_MAX: usize = 8;
+const JOB_BUF_MAX: usize = 1048576;   // 每个任务保留的输出上限（尾部）
+const JOB_OUT_READ: usize = 32768;
+
+export const JOB_RUNNING: u8 = 0;
+export const JOB_DONE: u8 = 1;
+export const JOB_KILLED: u8 = 2;
+
+export struct Job {
+    used: bool,
+    id: i32,             // job-1、job-2…
+    kind: u8,            // 0 = bash
+    pid: i32,
+    rfd: i32,            // stdout+stderr 管道读端
+    status: u8,
+    exit_code: i32,
+    truncated: bool,
+    start_ms: u64,
+    label: Buf,
+    buf: Buf,            // 累积输出（尾部）
+    read_off: usize,     // 已经交给模型的位置（增量语义）
+    reaped: bool,        // 已经 waitpid 过
+}
+
+export struct JobTable {
+    items: [Job: JOB_MAX],
+    next_id: i32,
+}
+
+fn job_empty() Job {
+    return Job{
+        used: false,
+        id: 0,
+        kind: 0,
+        pid: -1,
+        rfd: -1,
+        status: JOB_RUNNING,
+        exit_code: 0,
+        truncated: false,
+        start_ms: 0,
+        label: buf_empty(),
+        buf: buf_empty(),
+        read_off: 0,
+        reaped: false,
+    };
+}
+
+export fn jobs_init(t: &JobTable) void {
+    var i: usize = 0;
+    while i < JOB_MAX {
+        t.items[i] = job_empty();
+        i = i + 1;
+    }
+    t.next_id = 1;
+}
+
+export fn jobs_free(t: &JobTable) void {
+    var i: usize = 0;
+    while i < JOB_MAX {
+        if t.items[i].used {
+            buf_free(&t.items[i].label);
+            buf_free(&t.items[i].buf);
+            if t.items[i].rfd >= 0 {
+                _ = sys_close(t.items[i].rfd) catch {};
+            }
+            if !t.items[i].reaped && t.items[i].pid > 0 {
+                _ = sys_kill(t.items[i].pid as i64, SIGKILL) catch {};
+                var st: i32 = 0;
+                _ = sys_waitpid(t.items[i].pid, &st, 0) catch {};
+            }
+        }
+        t.items[i] = job_empty();
+        i = i + 1;
+    }
+}
+
+fn job_slot(t: &JobTable) isize {
+    var i: usize = 0;
+    while i < JOB_MAX {
+        if !t.items[i].used {
+            return i as isize;
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn job_find(t: &const JobTable, id: i32) isize {
+    var i: usize = 0;
+    while i < JOB_MAX {
+        if t.items[i].used && t.items[i].id == id {
+            return i as isize;
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+// 把管道里现有的字节读干净（非阻塞）
+export fn job_drain(t: &JobTable, idx: usize) void {
+    if idx >= JOB_MAX {
+        return;
+    }
+    const j: &Job = &t.items[idx];
+    if !j.used || j.rfd < 0 {
+        return;
+    }
+    var tmp: [byte: JOB_OUT_READ] = [0: JOB_OUT_READ];
+    var guard: usize = 0;
+    while guard < 64 {
+        guard = guard + 1;
+        var pfds: [PollFd: 1] = [PollFd{ fd: j.rfd, events: POLLIN, revents: 0 }];
+        const pr: i32 = sys_poll(&pfds[0], 1, 0) catch { 0; };
+        if pr <= 0 {
+            break;
+        }
+        if (pfds[0].revents & POLLIN) == 0 && (pfds[0].revents & POLLHUP) == 0 && (pfds[0].revents & POLLERR) == 0 {
+            break;
+        }
+        const n: isize = sys_read(j.rfd, &tmp[0], JOB_OUT_READ) catch { 0 as isize; };
+        if n <= 0 {
+            break;
+        }
+        const un: usize = n as usize;
+        if !buf_append(&j.buf, &tmp[0], un) {
+            break;
+        }
+        if j.buf.len > JOB_BUF_MAX {
+            // 只留尾部
+            const drop: usize = j.buf.len - JOB_BUF_MAX;
+            buf_drop_prefix(&j.buf, drop);
+            if j.read_off > drop {
+                j.read_off = j.read_off - drop;
+            } else {
+                j.read_off = 0;
+            }
+            j.truncated = true;
+        }
+    }
+}
+
+// 子进程是否已经结束（不阻塞）；结束时回收并记录退出码
+export fn job_check(t: &JobTable, idx: usize) void {
+    if idx >= JOB_MAX {
+        return;
+    }
+    const j: &Job = &t.items[idx];
+    if !j.used || j.reaped {
+        return;
+    }
+    var st: i32 = 0;
+    const r: i32 = sys_waitpid(j.pid, &st, 1) catch { 0; };   // WNOHANG = 1
+    if r <= 0 {
+        return;
+    }
+    j.reaped = true;
+    const code: i32 = (st >> (8 as i32)) & 255;
+    // 被信号杀掉时低 7 位是信号号
+    const sig: i32 = st & 127;
+    j.exit_code = code;
+    if sig != 0 {
+        j.status = JOB_KILLED;
+        j.exit_code = 128 + sig;
+    } else if code == 0 {
+        j.status = JOB_DONE;
+    } else {
+        j.status = JOB_DONE;
+    }
+    // 收尾：把管道剩余数据读完
+    job_drain(t, idx);
+    if j.rfd >= 0 {
+        _ = sys_close(j.rfd) catch {};
+        j.rfd = -1;
+    }
+}
+
+export fn jobs_poll_all(t: &JobTable) void {
+    var i: usize = 0;
+    while i < JOB_MAX {
+        if t.items[i].used {
+            job_drain(t, i);
+            job_check(t, i);
+        }
+        i = i + 1;
+    }
+}
+
+// 注册一个已经 fork 好的后台进程；返回任务 id（失败返回 -1）
+export fn job_register(t: &JobTable, pid: i32, rfd: i32, label: &const byte, label_len: usize) i32 {
+    const slot: isize = job_slot(t);
+    if slot < 0 {
+        return -1;
+    }
+    const si: usize = slot as usize;
+    if si >= JOB_MAX {
+        return -1;
+    }
+    const j: &Job = &t.items[si];
+    j.used = true;
+    j.id = t.next_id;
+    t.next_id = t.next_id + 1;
+    j.kind = 0;
+    j.pid = pid;
+    j.rfd = rfd;
+    j.status = JOB_RUNNING;
+    j.exit_code = 0;
+    j.truncated = false;
+    j.start_ms = ua_now_ms();
+    j.read_off = 0;
+    j.reaped = false;
+    j.label = buf_new(label_len + 8);
+    if buf_valid(&j.label) && label_len > 0 {
+        _ = buf_append(&j.label, label, label_len);
+    }
+    j.buf = buf_new(4096);
+    return j.id;
+}
+
+fn job_status_name(st: u8) &const byte {
+    if st == JOB_DONE {
+        return "completed" as &const byte;
+    }
+    if st == JOB_KILLED {
+        return "killed" as &const byte;
+    }
+    return "running" as &const byte;
+}
+
+// ============================================================
+// 工具：job_list / job_output / job_kill
+// ============================================================
+export fn jobs_tool_list(t: &JobTable, out: &Buf) void {
+    jobs_poll_all(t);
+    var shown: usize = 0;
+    var i: usize = 0;
+    while i < JOB_MAX {
+        if t.items[i].used {
+            if shown > 0 {
+                _ = buf_append_byte(out, 10);
+            }
+            const j: &const Job = &t.items[i];
+            _ = buf_append_cstr(out, "job-");
+            _ = buf_append_u64(out, j.id as u64);
+            _ = buf_append_cstr(out, " [bash] ");
+            _ = buf_append_cstr(out, job_status_name(j.status));
+            _ = buf_append_cstr(out, " — ");
+            _ = buf_append(out, j.label.ptr, j.label.len);
+            shown = shown + 1;
+        }
+        i = i + 1;
+    }
+    if shown == 0 {
+        _ = buf_append_cstr(out, "(no background jobs)");
+    }
+}
+
+// wait：阻塞等到任务结束或超时（毫秒）
+fn job_wait(t: &JobTable, idx: usize, timeout_ms: i32) void {
+    const started: u64 = ua_now_ms();
+    while true {
+        if idx >= JOB_MAX {
+            return;
+        }
+        const j: &const Job = &t.items[idx];
+        if !j.used {
+            return;
+        }
+        job_check(t, idx);
+        if t.items[idx].status != JOB_RUNNING {
+            return;
+        }
+        if timeout_ms >= 0 && (ua_now_ms() - started) >= (timeout_ms as u64) {
+            return;
+        }
+        var pfds: [PollFd: 1] = [PollFd{ fd: t.items[idx].rfd, events: POLLIN, revents: 0 }];
+        _ = sys_poll(&pfds[0], 1, 50) catch {};
+        job_drain(t, idx);
+    }
+}
+
+export fn jobs_tool_output(t: &JobTable, args: &const JsonValue, out: &Buf) void {
+    var idbuf: Buf = buf_empty();
+    defer { buf_free(&idbuf); }
+    if !js_obj_get_str_unescaped(args, "job_id", 6, &idbuf) || idbuf.len == 0 {
+        _ = buf_append_cstr(out, "Error: job_id must be a non-empty string");
+        return;
+    }
+    const id: i32 = job_parse_id(idbuf.ptr as &const byte, idbuf.len);
+    if id < 0 {
+        _ = buf_append_cstr(out, "Error: unknown job_id");
+        return;
+    }
+    const slot: isize = job_find(t, id);
+    if slot < 0 {
+        _ = buf_append_cstr(out, "Error: unknown job_id");
+        return;
+    }
+    const si: usize = slot as usize;
+    if si >= JOB_MAX {
+        _ = buf_append_cstr(out, "Error: unknown job_id");
+        return;
+    }
+    var wait_ms: i32 = -1;
+    var bv: JsonValue = JsonValue.json_null();
+    if js_obj_get(args, "wait", 4, &bv) && json_bool_of(&bv) {
+        wait_ms = 30000;
+        var tv: JsonValue = JsonValue.json_null();
+        var n: i64 = 0;
+        if js_obj_get(args, "timeout_ms", 10, &tv) && js_i64_of(&tv, &n) && n > 0 {
+            if n > 600000 {
+                n = 600000;
+            }
+            wait_ms = n as i32;
+        }
+    }
+    job_drain(t, si);
+    if wait_ms >= 0 {
+        job_wait(t, si, wait_ms);
+    } else {
+        job_check(t, si);
+    }
+    job_drain(t, si);
+
+    const j: &Job = &t.items[si];
+    if j.read_off < j.buf.len {
+        const take: usize = j.buf.len - j.read_off;
+        _ = buf_append(out, &j.buf.ptr[j.read_off], take);
+        j.read_off = j.buf.len;
+    } else if j.buf.len == 0 {
+        _ = buf_append_cstr(out, "(no new output)");
+    } else {
+        _ = buf_append_cstr(out, "(no new output)");
+    }
+    if j.truncated {
+        _ = buf_append_cstr(out, "\n[output truncated]");
+    }
+    _ = buf_append_cstr(out, "\n[status: ");
+    _ = buf_append_cstr(out, job_status_name(j.status));
+    if j.status != JOB_RUNNING {
+        _ = buf_append_cstr(out, ", exit ");
+        _ = buf_append_u64(out, j.exit_code as u64);
+    }
+    _ = buf_append_cstr(out, "]");
+}
+
+export fn jobs_tool_kill(t: &JobTable, args: &const JsonValue, out: &Buf) void {
+    var idbuf: Buf = buf_empty();
+    defer { buf_free(&idbuf); }
+    if !js_obj_get_str_unescaped(args, "job_id", 6, &idbuf) || idbuf.len == 0 {
+        _ = buf_append_cstr(out, "Error: job_id must be a non-empty string");
+        return;
+    }
+    const id: i32 = job_parse_id(idbuf.ptr as &const byte, idbuf.len);
+    const slot: isize = job_find(t, id);
+    if slot < 0 {
+        _ = buf_append_cstr(out, "Error: unknown job_id");
+        return;
+    }
+    const si: usize = slot as usize;
+    if si >= JOB_MAX {
+        _ = buf_append_cstr(out, "Error: unknown job_id");
+        return;
+    }
+    jobs_poll_all(t);
+    const j: &Job = &t.items[si];
+    if j.status != JOB_RUNNING {
+        _ = buf_append_cstr(out, "job-");
+        _ = buf_append_u64(out, j.id as u64);
+        _ = buf_append_cstr(out, " had already finished [status: ");
+        _ = buf_append_cstr(out, job_status_name(j.status));
+        _ = buf_append_cstr(out, "]");
+        return;
+    }
+    _ = sys_kill(j.pid as i64, SIGKILL) catch {};
+    job_check(t, si);
+    if t.items[si].status == JOB_RUNNING {
+        t.items[si].status = JOB_KILLED;
+    }
+    _ = buf_append_cstr(out, "requested cancellation of job ");
+    _ = buf_append_u64(out, j.id as u64);
+}
+
+// "job-3" / "3" → 3
+fn job_parse_id(p: &const byte, n: usize) i32 {
+    var i: usize = 0;
+    if n > 4 && bufx_eq_cstr(p, 4, "job-") {
+        i = 4;
+    }
+    var v: i32 = 0;
+    var digits: i32 = 0;
+    while i < n && is_digit(p[i]) {
+        v = v * 10 + ((p[i] as i32) - 48);
+        digits = digits + 1;
+        i = i + 1;
+    }
+    if digits == 0 {
+        return -1;
+    }
+    return v;
+}
+
+// 回合结束时调用：把「刚结束但还没通知过」的任务文本汇总给模型
+export fn jobs_take_notices(t: &JobTable, out: &Buf) bool {
+    _ = t;
+    _ = out;
+    return false;   // 通知注入在 P8 的 prompt 层实现
+}
