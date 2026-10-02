@@ -1,0 +1,517 @@
+// src/skill.uya — skills（P10，对齐 DSH skill-filesystem + tool-skill）
+//
+// 发现根（按优先级，靠前的先胜）：
+//   100 <projectRoot>/.dsh/skills      200 <projectRoot>/.agents/skills
+//   300 --skill-dir（可多次）          400 $DSH_HOME/skills（跳过 .system 子目录）
+//   500 $DSH_AGENTS_HOME 或 ~/.agents/skills
+// 布局只有两种，且只扫一层：`<root>/<name>/SKILL.md` 或 `<root>/<name>.md`。
+// front-matter 是 YAML（`---` 包起来），必填 name（kebab-case）与 description；
+// 可选 whenUse / disable-model-invocation。
+//
+// 目录以一条 user 消息注入（模板与 DSH 逐字一致，description 上限 500 字符、XML 转义）；
+// skill 工具的结果模板同样对齐 DSH。
+
+use libc.syscall;
+use libc.unistd;
+
+const SKILL_MAX: usize = 64;
+const SKILL_DESC_MAX: usize = 500;
+const SKILL_BODY_MAX: usize = 262144;
+const SKILL_PATH_MAX: usize = 4096;
+const SKILL_ROOTS_MAX: usize = 12;
+
+export struct Skill {
+    name: Buf,
+    description: Buf,
+    dir: Buf,        // 目录型技能的基础目录（平铺文件为空）
+    path: Buf,       // SKILL.md 的绝对路径
+    model_invocable: bool,
+}
+
+export struct SkillSet {
+    items: [Skill: SKILL_MAX],
+    n: usize,
+    scanned: bool,
+}
+
+fn skill_empty() Skill {
+    return Skill{
+        name: buf_empty(),
+        description: buf_empty(),
+        dir: buf_empty(),
+        path: buf_empty(),
+        model_invocable: true,
+    };
+}
+
+export fn skills_init(s: &SkillSet) void {
+    var i: usize = 0;
+    while i < SKILL_MAX {
+        s.items[i] = skill_empty();
+        i = i + 1;
+    }
+    s.n = 0;
+    s.scanned = false;
+}
+
+export fn skills_free(s: &SkillSet) void {
+    var i: usize = 0;
+    while i < s.n {
+        buf_free(&s.items[i].name);
+        buf_free(&s.items[i].description);
+        buf_free(&s.items[i].dir);
+        buf_free(&s.items[i].path);
+        s.items[i] = skill_empty();
+        i = i + 1;
+    }
+    s.n = 0;
+    s.scanned = false;
+}
+
+fn skill_find(s: &const SkillSet, name: &const byte, name_len: usize) isize {
+    var i: usize = 0;
+    while i < s.n && i < SKILL_MAX {
+        const it: &const Skill = &s.items[i];
+        if it.name.len == name_len && bufx_mem_eq(it.name.ptr as &const byte, name, name_len) {
+            return i as isize;
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn skill_name_ok(name: &[byte]) bool {
+    if name.len == 0 || name.len > 64 {
+        return false;
+    }
+    var i: usize = 0;
+    while i < name.len {
+        const c: byte = name.ptr[i];
+        const is_alpha: bool = (c >= 97 as byte && c <= 122 as byte) || (c >= 48 as byte && c <= 57 as byte);
+        if !is_alpha && c != 45 as byte {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+// front-matter：`---` 之间的 YAML；返回正文起始偏移（跳过 front-matter）
+fn skill_front_matter(text: &const Buf, fm: &Buf, body_off: &usize) bool {
+    buf_reset(fm);
+    body_off[0] = 0;
+    if text.len < 4 {
+        return false;
+    }
+    const v: &[byte] = text.ptr[0: text.len];
+    if !(v.ptr[0] == 45 as byte && v.ptr[1] == 45 as byte && v.ptr[2] == 45 as byte) {
+        return false;
+    }
+    // 找第二行的 "---"
+    var i: usize = 0;
+    // 跳过第一行
+    while i < text.len && v.ptr[i] != 10 as byte {
+        i = i + 1;
+    }
+    if i >= text.len {
+        return false;
+    }
+    i = i + 1;
+    const fm_start: usize = i;
+    var fm_end: usize = 0;
+    var found: bool = false;
+    while i < text.len {
+        if v.ptr[i] == 45 as byte && i + 2 < text.len && v.ptr[i + 1] == 45 as byte && v.ptr[i + 2] == 45 as byte {
+            fm_end = i;
+            found = true;
+            break;
+        }
+        i = i + 1;
+    }
+    if !found {
+        return false;
+    }
+    _ = buf_append(fm, &v.ptr[fm_start], fm_end - fm_start);
+    // 正文从第二行 "---" 之后的第一个换行开始
+    var j: usize = fm_end;
+    while j < text.len && v.ptr[j] != 10 as byte {
+        j = j + 1;
+    }
+    body_off[0] = j + 1;
+    return true;
+}
+
+// 扫描一个技能候选：目录型（<root>/<name>/SKILL.md）或平铺（<root>/<name>.md）
+fn skill_load_one(s: &SkillSet, path_z: &const byte, dir: &[byte], is_dir_bundle: bool) void {
+    var st: FsStat = FsStat{ exists: false, is_dir: false, size: 0, mtime: 0, mtime_nsec: 0 };
+    _ = fs_stat(path_z, &st);
+    if !st.exists || st.is_dir || st.size <= 0 || st.size > (SKILL_BODY_MAX as i64) {
+        return;
+    }
+    var text: Buf = buf_new(16384);
+    defer { buf_free(&text); }
+    if !fs_read_file_all(path_z, &text, SKILL_BODY_MAX) {
+        return;
+    }
+    var fm: Buf = buf_new(4096);
+    defer { buf_free(&fm); }
+    var body_off: usize = 0;
+    if !skill_front_matter(&text, &fm, &body_off) {
+        return;
+    }
+    // 解析 front-matter（复用自带 YAML 解析器）
+    var tree: YTree = YTree{ nodes: [], n: 0, lines: [], nlines: 0, raw: buf_empty(), cur: 0, err_line: 0 };
+    yt_init(&tree);
+    defer { yt_free(&tree); }
+    if !yt_parse_text(&fm, &tree) {
+        return;
+    }
+    const r: i32 = yt_root(&tree);
+    if r < 0 {
+        return;
+    }
+    const nv: &[byte] = yt_get_str(&tree, r, "name");
+    if nv.len == 0 || !skill_name_ok(nv) {
+        return;
+    }
+    // 同名先到先得（靠前的根优先）
+    if skill_find(s, nv.ptr, nv.len) >= 0 {
+        return;
+    }
+    const dv: &[byte] = yt_get_str(&tree, r, "description");
+    const idx: usize = s.n;
+    if idx >= SKILL_MAX {
+        return;
+    }
+    const it: &Skill = &s.items[idx];
+    it.name = buf_new(nv.len + 8);
+    it.description = buf_new(dv.len + 8);
+    it.dir = buf_new(dir.len + 8);
+    it.path = buf_new(bufx_cstr_len(path_z) + 8);
+    if !buf_valid(&it.name) || !buf_valid(&it.description) || !buf_valid(&it.dir) || !buf_valid(&it.path) {
+        return;
+    }
+    _ = buf_append(&it.name, nv.ptr, nv.len);
+    _ = buf_append(&it.description, dv.ptr, dv.len);
+    if is_dir_bundle {
+        _ = buf_append(&it.dir, dir.ptr, dir.len);
+    }
+    _ = buf_append(&it.path, path_z, bufx_cstr_len(path_z));
+    // disable-model-invocation: true 的技能不进目录、也不能被工具调用
+    const dis: &[byte] = yt_get_str(&tree, r, "disable-model-invocation");
+    it.model_invocable = true;
+    if dis.len == 4 && bufx_mem_eq(dis.ptr, "true", 4) {
+        it.model_invocable = false;
+    }
+    s.n = idx + 1;
+}
+
+fn skill_scan_root(s: &SkillSet, root: &[byte]) void {
+    var rz: Buf = buf_new(root.len + 1);
+    defer { buf_free(&rz); }
+    _ = buf_append(&rz, root.ptr, root.len);
+    _ = buf_append_byte(&rz, 0);
+    const dirp: &DIR = opendir(&rz.ptr[0] as *const byte);
+    if dirp == null {
+        return;
+    }
+    defer { _ = closedir(dirp); }
+    while true {
+        const de: &Dirent = readdir(dirp);
+        if de == null {
+            break;
+        }
+        var nm: Buf = buf_new(272);
+        defer { buf_free(&nm); }
+        if !buf_append_cstr(&nm, &de.d_name[0] as &const byte) {
+            continue;
+        }
+        if nm.len == 1 && nm.ptr[0] == 46 as byte {
+            continue;
+        }
+        if nm.len == 2 && nm.ptr[0] == 46 as byte && nm.ptr[1] == 46 as byte {
+            continue;
+        }
+        if nm.len == 7 && bufx_mem_eq(nm.ptr as &const byte, ".system", 7) {
+            continue;
+        }
+        // 目录型：<root>/<name>/SKILL.md
+        var sub: Buf = buf_new(SKILL_PATH_MAX);
+        defer { buf_free(&sub); }
+        _ = buf_append(&sub, root.ptr, root.len);
+        _ = buf_append_byte(&sub, 47);
+        _ = buf_append(&sub, nm.ptr, nm.len);
+        _ = buf_append_cstr_z(&sub, "/SKILL.md");
+        var st: FsStat = FsStat{ exists: false, is_dir: false, size: 0, mtime: 0, mtime_nsec: 0 };
+        _ = fs_stat(sub.ptr as &const byte, &st);
+        if st.exists && !st.is_dir {
+            var d: Buf = buf_new(SKILL_PATH_MAX);
+            defer { buf_free(&d); }
+            _ = buf_append(&d, root.ptr, root.len);
+            _ = buf_append_byte(&d, 47);
+            _ = buf_append(&d, nm.ptr, nm.len);
+            skill_load_one(s, sub.ptr as &const byte, d.ptr[0: d.len], true);
+            continue;
+        }
+        // 平铺型：<root>/<name>.md
+        if nm.len > 3 {
+            const tail: usize = nm.len - 3;
+            if nm.ptr[tail] == 46 as byte && nm.ptr[tail + 1] == 109 as byte && nm.ptr[tail + 2] == 100 as byte {
+                var flat: Buf = buf_new(SKILL_PATH_MAX);
+                defer { buf_free(&flat); }
+                _ = buf_append(&flat, root.ptr, root.len);
+                _ = buf_append_byte(&flat, 47);
+                _ = buf_append(&flat, nm.ptr, nm.len);
+                _ = buf_append_byte(&flat, 0);
+                skill_load_one(s, flat.ptr as &const byte, root[0: 0], false);
+            }
+        }
+    }
+}
+
+// 收集所有根（靠前的优先）
+export fn skills_collect(s: &SkillSet, ws: &[byte], dsh_home: &[byte], extra_dirs: &const Buf) void {
+    var roots: [Buf: SKILL_ROOTS_MAX] = [buf_empty(): SKILL_ROOTS_MAX];
+    var nr: usize = 0;
+    var root: Buf = buf_new(SKILL_PATH_MAX);
+    defer { buf_free(&root); }
+    _ = instr_project_root(ws, &root);
+    // 一律「在数组里原地构造」，避免把局部 Buf move 进数组后又被释放（双重释放）
+    if root.len > 0 && nr < SKILL_ROOTS_MAX {
+        const s0: &Buf = &roots[nr];
+        s0[0] = buf_new(SKILL_PATH_MAX);
+        _ = buf_append(s0, root.ptr, root.len);
+        _ = buf_append_cstr(s0, "/.dsh/skills");
+        nr = nr + 1;
+    }
+    if root.len > 0 && nr < SKILL_ROOTS_MAX {
+        const s1: &Buf = &roots[nr];
+        s1[0] = buf_new(SKILL_PATH_MAX);
+        _ = buf_append(s1, root.ptr, root.len);
+        _ = buf_append_cstr(s1, "/.agents/skills");
+        nr = nr + 1;
+    }
+    // 300：--skill-dir（冒号分隔）
+    if extra_dirs.len > 0 {
+        var i: usize = 0;
+        var start: usize = 0;
+        while i <= extra_dirs.len {
+            if i == extra_dirs.len || extra_dirs.ptr[i] == 58 as byte {
+                if i > start && nr < SKILL_ROOTS_MAX {
+                    const slot: &Buf = &roots[nr];
+                    slot[0] = buf_new(SKILL_PATH_MAX);
+                    _ = buf_append(slot, &extra_dirs.ptr[start], i - start);
+                    nr = nr + 1;
+                }
+                start = i + 1;
+            }
+            i = i + 1;
+        }
+    }
+    // 400：$DSH_HOME/skills
+    if dsh_home.len > 0 && nr < SKILL_ROOTS_MAX {
+        const s4: &Buf = &roots[nr];
+        s4[0] = buf_new(SKILL_PATH_MAX);
+        _ = buf_append(s4, dsh_home.ptr, dsh_home.len);
+        _ = buf_append_cstr(s4, "/skills");
+        nr = nr + 1;
+    }
+    // 500：$DSH_AGENTS_HOME|~/.agents/skills
+    const ah: &byte = getenv("DSH_AGENTS_HOME");
+    if (ah as usize) != 0 && bufx_cstr_len(ah) > 0 && nr < SKILL_ROOTS_MAX {
+        const s5: &Buf = &roots[nr];
+        s5[0] = buf_new(SKILL_PATH_MAX);
+        _ = buf_append_cstr(s5, ah);
+        _ = buf_append_cstr(s5, "/skills");
+        nr = nr + 1;
+    } else {
+        const home: &byte = getenv("HOME");
+        if (home as usize) != 0 && nr < SKILL_ROOTS_MAX {
+            const s6: &Buf = &roots[nr];
+            s6[0] = buf_new(SKILL_PATH_MAX);
+            _ = buf_append_cstr(s6, home);
+            _ = buf_append_cstr(s6, "/.agents/skills");
+            nr = nr + 1;
+        }
+    }
+    var k: usize = 0;
+    while k < nr {
+        skill_scan_root(s, roots[k].ptr[0: roots[k].len]);
+        k = k + 1;
+    }
+    // 释放
+    var z: usize = 0;
+    while z < nr {
+        buf_free(&roots[z]);
+        z = z + 1;
+    }
+    s.scanned = true;
+}
+
+// ============================================================
+// 目录注入（模板逐字对齐 DSH）
+// ============================================================
+fn skill_xml_escape(src: &[byte], out: &Buf) void {
+    var i: usize = 0;
+    while i < src.len {
+        const c: byte = src.ptr[i];
+        if c == 38 as byte {
+            _ = buf_append_cstr(out, "&amp;");
+        } else if c == 60 as byte {
+            _ = buf_append_cstr(out, "&lt;");
+        } else if c == 62 as byte {
+            _ = buf_append_cstr(out, "&gt;");
+        } else {
+            _ = buf_append_byte(out, c);
+        }
+        i = i + 1;
+    }
+}
+
+fn skill_desc_normalized(src: &[byte], out: &Buf) void {
+    buf_reset(out);
+    // 压缩空白 + 截断到 500 字符
+    var last_space: bool = false;
+    var i: usize = 0;
+    var count: usize = 0;
+    while i < src.len && count < SKILL_DESC_MAX {
+        const c: byte = src.ptr[i];
+        const is_ws: bool = c == 32 as byte || c == 9 as byte || c == 10 as byte || c == 13 as byte;
+        if is_ws {
+            if !last_space && out.len > 0 {
+                _ = buf_append_byte(out, 32);
+                last_space = true;
+                count = count + 1;
+            }
+        } else {
+            var step: usize = bufx_utf8_step(src.ptr, src.len, i);
+            if step == 0 {
+                step = 1;
+            }
+            if count + 1 > SKILL_DESC_MAX {
+                break;
+            }
+            var k: usize = 0;
+            while k < step {
+                _ = buf_append_byte(out, src.ptr[i + k]);
+                k = k + 1;
+            }
+            count = count + 1;
+            last_space = false;
+            i = i + step;      // 多字节字符要整块跳过，否则续字节会被重复追加
+            continue;
+        }
+        i = i + 1;
+    }
+}
+
+// 目录消息；没有任何可模型调用的技能时返回 false
+export fn skills_catalog(s: &const SkillSet, out: &Buf) bool {
+    var any: bool = false;
+    var i: usize = 0;
+    while i < s.n && i < SKILL_MAX {
+        const it: &const Skill = &s.items[i];
+        if it.model_invocable {
+            any = true;
+            break;
+        }
+        i = i + 1;
+    }
+    if !any {
+        return false;
+    }
+    buf_reset(out);
+    _ = buf_append_cstr(out, "<system-reminder>\nA skill is a reusable set of task-specific instructions. The following skills are available in this session:\n\n<available_skills>\n");
+    var desc: Buf = buf_new(2048);
+    defer { buf_free(&desc); }
+    var esc: Buf = buf_new(2048);
+    defer { buf_free(&esc); }
+    var k: usize = 0;
+    while k < s.n && k < SKILL_MAX {
+        const it: &const Skill = &s.items[k];
+        if it.model_invocable {
+            skill_desc_normalized(it.description.ptr[0: it.description.len], &desc);
+            buf_reset(&esc);
+            skill_xml_escape(desc.ptr[0: desc.len], &esc);
+            _ = buf_append_cstr(out, "- `");
+            _ = buf_append(out, it.name.ptr, it.name.len);
+            _ = buf_append_cstr(out, "`: ");
+            _ = buf_append(&out[0], esc.ptr, esc.len);
+            _ = buf_append_byte(out, 10);
+        }
+        k = k + 1;
+    }
+    return buf_append_cstr(out, "</available_skills>\n\nIf the user names a skill, or the task clearly matches a skill's description, call the `skill` tool with the exact skill name before taking task actions. Load all applicable skills, then follow their full instructions. This catalog contains summaries only; do not infer or follow a skill's instructions until it has been loaded.\nA user may also invoke a skill directly; its <skill_content> block then appears in this conversation. Follow it, and do not call the `skill` tool again for that skill.\n</system-reminder>");
+}
+
+// ============================================================
+// skill 工具
+// ============================================================
+export fn skill_tool(s: &const SkillSet, args: &const JsonValue, out: &Buf) void {
+    var name: Buf = buf_empty();
+    defer { buf_free(&name); }
+    if !js_obj_get_str_unescaped(args, "name", 4, &name) || name.len == 0 {
+        _ = buf_append_cstr(out, "Error: invalid skill name \"\"");
+        return;
+    }
+    if !skill_name_ok(name.ptr[0: name.len]) {
+        _ = buf_append_cstr(out, "Error: invalid skill name \"");
+        _ = buf_append(out, name.ptr, name.len);
+        _ = buf_append_cstr(out, "\"");
+        return;
+    }
+    const found: isize = skill_find(s, name.ptr as &const byte, name.len);
+    if found < 0 {
+        _ = buf_append_cstr(out, "Error: skill \"");
+        _ = buf_append(out, name.ptr, name.len);
+        _ = buf_append_cstr(out, "\" is unknown or no longer available");
+        return;
+    }
+    const idx: usize = found as usize;
+    if idx >= SKILL_MAX {
+        return;
+    }
+    const it: &const Skill = &s.items[idx];
+    if !it.model_invocable {
+        _ = buf_append_cstr(out, "Error: skill \"");
+        _ = buf_append(out, it.name.ptr, it.name.len);
+        _ = buf_append_cstr(out, "\" is not available for model invocation");
+        return;
+    }
+    // 读正文（去掉 front-matter）
+    var text: Buf = buf_new(16384);
+    defer { buf_free(&text); }
+    var pz: Buf = buf_new(it.path.len + 1);
+    defer { buf_free(&pz); }
+    _ = buf_append(&pz, it.path.ptr, it.path.len);
+    _ = buf_append_byte(&pz, 0);
+    if !fs_read_file_all(pz.ptr as &const byte, &text, SKILL_BODY_MAX) {
+        _ = buf_append_cstr(out, "Error: skill \"");
+        _ = buf_append(out, it.name.ptr, it.name.len);
+        _ = buf_append_cstr(out, "\" is unknown or no longer available");
+        return;
+    }
+    var fm: Buf = buf_new(4096);
+    defer { buf_free(&fm); }
+    var body_off: usize = 0;
+    _ = skill_front_matter(&text, &fm, &body_off);
+    if body_off > text.len {
+        body_off = text.len;
+    }
+    _ = buf_append_cstr(out, "<skill_content name=\"");
+    var esc: Buf = buf_new(256);
+    defer { buf_free(&esc); }
+    skill_xml_escape(it.name.ptr[0: it.name.len], &esc);
+    _ = buf_append(&out[0], esc.ptr, esc.len);
+    _ = buf_append_cstr(out, "\">\n<skill_resources>\n");
+    if it.dir.len > 0 {
+        _ = buf_append_cstr(out, "Base directory for this skill: ");
+        _ = buf_append(&out[0], it.dir.ptr, it.dir.len);
+        _ = buf_append_cstr(out, "\nResolve relative paths mentioned by this skill against the base directory before using them. Load referenced resources only as needed.");
+    } else {
+        _ = buf_append_cstr(out, "Load referenced resources only as needed.");
+    }
+    _ = buf_append_cstr(out, "\n</skill_resources>\n\n<skill_instructions>\n");
+    _ = buf_append(&out[0], &text.ptr[body_off], text.len - body_off);
+    _ = buf_append_cstr(out, "\n</skill_instructions>\n</skill_content>");
+}

@@ -4,7 +4,7 @@
 多轮 loop 直到给出结论。全部代码 9 个 `.uya` 文件，**不引入任何 C 代码、`@c_import` 或其它语言**，
 只依赖 Uya 语言与随编译器分发的标准库。
 
-**P1–P9 已完成**：LLM 交互是**流式 SSE**（`stream:true` + `stream_options.include_usage`），
+**P1–P10 已完成**：LLM 交互是**流式 SSE**（`stream:true` + `stream_options.include_usage`），
 增量 chunked 解码 + SSE 分帧 + `tool_calls` 按 `index` 分片累积；消息协议是**严格工具协议**
 （`assistant.tool_calls` 原样回灌 + 每条结果一条 `role:"tool"` + `tool_call_id`）；
 交互界面是**真 TTY**（termios raw + 行编辑器），流式期间可打断、可继续输入、可续跑；
@@ -17,7 +17,9 @@
 子进程会拿到 `DSH_*` 环境；system prompt 改为**分节装配**（persona 从 DSH preset 读、
 `{{model}}`/`{{cwd}}` 变量替换、空节丢弃、`\n\n` 连接），并注入 AGENTS.md 与运行时上下文，
 配上 `todo_write` / `exit_plan_mode` / `ask_user_question`；**上下文管理**也齐了：
-tool 结果超 8192 码点自动剪枝，压力超过窗口 80% 时自动压缩成 checkpoint（真机实测触发过）。
+tool 结果超 8192 码点自动剪枝，压力超过窗口 80% 时自动压缩成 checkpoint（真机实测触发过）；
+**技能**（发现 → 目录注入 → `skill` 工具）与**联网搜索**（`web_search`，provider 侧搜索）也接上了，
+两者都在真机上跑通过。
 `--no-stream` / `--compat-fold` 保留两条回退路径。
 
 ```
@@ -82,6 +84,7 @@ export UYA_SPLIT_C_DIR=$PWD/build/uyacache      # 多文件 C 缓存别丢在仓
 | `--print-config` | 打印生效配置与来源后退出 |
 | `--yaml-dump FILE` | 打印该 YAML 的解析结果（诊断） |
 | `--plan` | 以 plan 模式启动（先出计划、批准后再执行） |
+| `--skill-dir DIR` | 额外的技能根（冒号分隔，可多次） |
 | `--no-compact` | 关闭自动上下文压缩 |
 | `--context-window N` | 压缩判定的窗口（默认取 DSH 模型条目） |
 | `--dsh-root DIR` | packaged preset 根（读 persona / plan 段文案） |
@@ -132,6 +135,10 @@ src/search.uya    glob / grep：rg 子进程（--files / --json）、VCS 目录�
 src/dshcfg.uya    读 DSH 设置：$DSH_HOME 解析、settings.yaml 模型路线（agent-default-model →
                   provider 的 baseURL/apiKeyEnv/models[]）、.credentials.yaml、.env 兜底、
                   permission→confine、uya-agent.tls 命名空间
+src/skill.uya     技能：5 个发现根（项目 .dsh/.agents → --skill-dir → $DSH_HOME/skills →
+                  ~/.agents/skills）、SKILL.md front-matter 解析、目录注入模板、skill 工具结果模板
+src/webx.uya      web_search：DeepSeek Anthropic 兼容 Messages API + 服务端 web_search 工具、
+                  query 去重、来源解析与渲染、按主机的独立信任策略
 src/compact.uya   上下文管理：tool 结果剪枝（8192/4096/1024 **码点**，只在构请求时生效）、
                   压力判定（prompt_tokens，退化时按字节/4 估）、摘要提示词、checkpoint 替换
 src/prompt.uya    system prompt 分节装配（order 排序 / 空节丢弃 / `\n\n` 连接 / 变量替换）、
@@ -147,6 +154,31 @@ src/agent.uya     CLI、环境变量、消息历史、请求组装、主循环�
                   交互式 REPL（中断/steer//continue/会话命令）、会话事件记录与恢复
 src/selftest.uya  --selftest 的 mock LLM（含 SSE 受控切分）+ 15 轮断言 + --probe
 ```
+
+### 技能与联网搜索（P10，对齐 DSH skill-filesystem / tool-skill / tool-web）
+
+**技能**发现根（靠前优先，只扫一层）：`<项目根>/.dsh/skills` → `<项目根>/.agents/skills` →
+`--skill-dir`（冒号分隔，可多次）→ `$DSH_HOME/skills`（跳过 `.system`）→ `$DSH_AGENTS_HOME|~/.agents/skills`。
+布局只有 `<root>/<name>/SKILL.md` 与 `<root>/<name>.md` 两种；front-matter 必填 `name`（kebab-case）与
+`description`，`disable-model-invocation: true` 的技能既不进目录也不能被工具调用。
+
+* 目录以一条 user 消息注入（模板逐字对齐 DSH）：`<available_skills>` 里逐条 `- \`name\`: 描述`，
+  描述先压空白再截到 500 字符、XML 转义；没有任何可调用技能时**不注入**。
+* `skill` 工具结果：`<skill_content name="…">` + `<skill_resources>`（目录型技能给
+  「Base directory for this skill: …」与相对路径解析指引）+ `<skill_instructions>`（front-matter 之后的正文）。
+* 错误串对齐：`Error: invalid skill name "…"` / `Error: skill "…" is unknown or no longer available` /
+  `Error: skill "…" is not available for model invocation`。
+
+**web_search**：`queries` 必填、1–4 条、**去重保留首次出现**；走 DeepSeek 的 Anthropic 兼容
+Messages API（`x-api-key` + `anthropic-version: 2023-06-01`，服务端工具 `web_search_20250305`），
+从响应里取 text 块的答案与 `citations`、以及 `web_search_tool_result` 的来源（url/title/page_age），
+按 URL 去重、最多 8 条，渲染成「答案 + Sources 列表」。
+* 凭据：`DEEPSEEK_API_KEY`（进程环境 → `$DSH_HOME/.credentials.yaml` 的 `refs`）；缺失时回
+  `WEB_PROVIDER_CREDENTIAL_MISSING` 文案。
+* 可用 `DEEPSEEK_SEARCH_BASE_URL` / `DEEPSEEK_SEARCH_MODEL` 覆盖端点与模型（默认
+  `https://api.deepseek.com/anthropic/v1`、`deepseek-v4-flash`）。
+* **按主机的信任策略**：搜索主机和模型主机通常不是同一个，leaf pin 是按主机的，所以
+  web_search 单独读 `UYA_AGENT_WEB_TLS_VERIFY` / `UYA_AGENT_WEB_TLS_PIN`，缺省继承主配置。
 
 ### 上下文管理（P9，对齐 DSH compaction-basic + tool-result-pruner）
 
@@ -466,6 +498,9 @@ agent 循环并逐项断言：
 | `interrupt` | 预置 Ctrl-C：回合以 `AGENT_INTERRUPTED` 结束、工具**未派发**、只发生一次请求 |
 | `tty-editor` | termios 布局(60B)/raw 位运算；行编辑（插入/退格/左右/Delete/Home/End/词删除）、
 一次喂入多行拆成多个提交、分片转义序列、裸 ESC 判定、历史上下翻、中断前缀裁剪 |
+| `skills-web-search` | 造一个目录型技能（front-matter + 正文）→ 断言目录注入、`skill` 工具结果模板与
+资源指引、未知技能错误串；provider 侧用 mock 的 Anthropic 形状响应，断言 `web_search` 请求带
+服务端搜索工具与鉴权头、query 去重后只出现一次、答案与两条来源都被渲染 |
 | `compact-prune` | 让 bash 产生 20000 字符输出 → 断言请求里出现剪枝标记、完整中段已消失 |
 | `compact-auto` | 小窗口（200）强制触发：工具轮 → **摘要请求**（断言提示词模板）→ 压缩后的请求里
 必须出现 `automatically generated checkpoint` 与 `<compacted-summary>` |
@@ -493,6 +528,9 @@ contextWindow/maxTokens/input image/reasoningEffort/`permission→confine`/`uya-
   `"id":"call_…"` 保留、`"tool_call_id"` 条数与调用数一致（shell 2 / no-shell 1 / tools 4）。
 * TTY 交互用**真 pty** 验证（`script -qec`）：进入 raw 模式、banner 干净、一次粘贴
   4 行会分成 4 次提交（任务 → `/help` → `/status` → `/exit`），退出后终端恢复。
+* 技能与联网搜索都在真机上验证过：让模型「说出本次会话可用的技能名」→ 正确回答
+  `agently-mail、h2s-long-context`（来自真实 `~/.dsh/skills`）；让它「用 web_search 搜 uya 语言」→
+  `web_search` 工具真的调通了 DeepSeek 的搜索服务并给出总结。
 * 自动压缩在真机上实测触发过：`--context-window 700` 下跑一个多步任务，
   日志出现 `[compact] 已压缩较早的 2 条消息（pressure=2381 limit=560）`，
   压缩后模型仍正确完成并给出结论。

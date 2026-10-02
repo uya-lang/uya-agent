@@ -1,0 +1,505 @@
+// src/webx.uya — web_search（P10，对齐 DSH tool-web）
+//
+// DSH 走的是「provider 侧搜索」：调 DeepSeek 的 Anthropic 兼容 Messages API，
+// 带上服务端工具 `web_search_20250305`，从响应里取答案与来源，模型自己不抓网页。
+//
+// 请求形状：
+//   POST <base>/messages
+//   headers: x-api-key、anthropic-version: 2023-06-01、content-type: application/json
+//   body: {"model":…,"max_tokens":…,"messages":[{"role":"user","content":[…]}],
+//          "tools":[{"type":"web_search_20250305","name":"web_search","max_uses":N}]}
+// 响应里我们关心：
+//   content[] 里的 text 块（答案 + citations[].cited_text/url/title）与
+//   web_search_tool_result 块（content[] 为 web_search_result：url/title/page_age）
+//
+// 参数：queries（必填，1–4 条，去重保留首次出现）
+// 错误串与 DSH 对齐：queries must contain at least one query / at most 4 queries /
+//                    each query must be a non-empty string / WEB_PROVIDER_CREDENTIAL_MISSING
+
+export const WEB_MAX_QUERIES: usize = 4;
+export const WEB_MAX_RESULTS: usize = 8;
+const WEB_DEFAULT_BASE: &const byte = "https://api.deepseek.com/anthropic/v1";
+const WEB_DEFAULT_MODEL: &const byte = "deepseek-v4-flash";
+const WEB_MAX_USES: i64 = 5;
+
+export struct WebSource {
+    url: Buf,
+    title: Buf,
+    snippet: Buf,
+    published: Buf,
+}
+
+export struct WebResult {
+    answer: Buf,
+    sources: [WebSource: WEB_MAX_RESULTS],
+    nsources: usize,
+    truncated: bool,
+}
+
+fn web_source_empty() WebSource {
+    return WebSource{ url: buf_empty(), title: buf_empty(), snippet: buf_empty(), published: buf_empty() };
+}
+
+export fn web_result_init(r: &WebResult) void {
+    r.answer = buf_empty();
+    var i: usize = 0;
+    while i < WEB_MAX_RESULTS {
+        r.sources[i] = web_source_empty();
+        i = i + 1;
+    }
+    r.nsources = 0;
+    r.truncated = false;
+}
+
+export fn web_result_free(r: &WebResult) void {
+    buf_free(&r.answer);
+    var i: usize = 0;
+    while i < r.nsources && i < WEB_MAX_RESULTS {
+        buf_free(&r.sources[i].url);
+        buf_free(&r.sources[i].title);
+        buf_free(&r.sources[i].snippet);
+        buf_free(&r.sources[i].published);
+        r.sources[i] = web_source_empty();
+        i = i + 1;
+    }
+    r.nsources = 0;
+}
+
+// 凭据：DEEPSEEK_API_KEY（进程环境 → $DSH_HOME/.credentials.yaml → .env）
+// 覆盖接缝（自测用；也可给将来加 CLI 参数留口子）
+export var web_base_override: Buf = Buf{ ptr: null, len: 0, cap: 0 };
+export var web_key_override: Buf = Buf{ ptr: null, len: 0, cap: 0 };
+
+export fn web_api_key(dsh_home: &[byte], out: &Buf) bool {
+    buf_reset(out);
+    if buf_valid(&web_key_override) && web_key_override.len > 0 {
+        return buf_append(out, web_key_override.ptr, web_key_override.len);
+    }
+    const env: &byte = getenv("DEEPSEEK_API_KEY");
+    if (env as usize) != 0 && bufx_cstr_len(env) > 0 {
+        return buf_append_cstr(out, env);
+    }
+    // .credentials.yaml
+    var cp: Buf = buf_new(1200);
+    defer { buf_free(&cp); }
+    _ = buf_append(&cp, dsh_home.ptr, dsh_home.len);
+    _ = buf_append_cstr_z(&cp, "/.credentials.yaml");
+    var creds: YTree = YTree{ nodes: [], n: 0, lines: [], nlines: 0, raw: buf_empty(), cur: 0, err_line: 0 };
+    yt_init(&creds);
+    defer { yt_free(&creds); }
+    if yt_load_file(cp.ptr as &const byte, &creds) {
+        const r: i32 = yt_root(&creds);
+        const refs: i32 = yt_get(&creds, r, "refs");
+        if refs >= 0 {
+            const v: i32 = yt_get(&creds, refs, "DEEPSEEK_API_KEY");
+            if v >= 0 {
+                const sv: &[byte] = yt_str(&creds, v);
+                if sv.len > 0 {
+                    return buf_append(out, sv.ptr, sv.len);
+                }
+            }
+        }
+    }
+    return false;
+}
+
+fn web_base_url(out: &Buf) bool {
+    buf_reset(out);
+    if buf_valid(&web_base_override) && web_base_override.len > 0 {
+        return buf_append(out, web_base_override.ptr, web_base_override.len);
+    }
+    const env: &byte = getenv("DEEPSEEK_SEARCH_BASE_URL");
+    if (env as usize) != 0 && bufx_cstr_len(env) > 0 {
+        return buf_append_cstr(out, env);
+    }
+    return buf_append_cstr(out, WEB_DEFAULT_BASE);
+}
+
+fn web_model(out: &Buf) bool {
+    buf_reset(out);
+    const env: &byte = getenv("DEEPSEEK_SEARCH_MODEL");
+    if (env as usize) != 0 && bufx_cstr_len(env) > 0 {
+        return buf_append_cstr(out, env);
+    }
+    return buf_append_cstr(out, WEB_DEFAULT_MODEL);
+}
+
+// 组请求体（queries 已去重）
+fn web_build_body(queries: &const Buf, nq: usize, model: &const Buf, out: &Buf) bool {
+    buf_reset(out);
+    if !buf_append_cstr(out, "{\"model\":") {
+        return false;
+    }
+    if !jw_str_into(out, model.ptr as &const byte, model.len) {
+        return false;
+    }
+    if !buf_append_cstr(out, ",\"max_tokens\":4096,\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":") {
+        return false;
+    }
+    // 提示词让模型把每条 query 都用一次搜索
+    var prompt: Buf = buf_new(queries.len + 256);
+    defer { buf_free(&prompt); }
+    _ = buf_append_cstr(&prompt, "Run a web search for each of these queries and answer concisely with sources:\n");
+    var i: usize = 0;
+    var q: Buf = buf_empty();
+    while i < nq {
+        _ = buf_append_cstr(&prompt, "query=");
+        if !qs_item(queries, i, &q) {
+            return false;
+        }
+        _ = buf_append(&prompt, q.ptr, q.len);
+        _ = buf_append_byte(&prompt, 10);
+        i = i + 1;
+    }
+    if !jw_str_into(out, prompt.ptr as &const byte, prompt.len) {
+        return false;
+    }
+    if !buf_append_cstr(out, "}]}],\"tools\":[{\"type\":\"web_search_20250305\",\"name\":\"web_search\",\"max_uses\":") {
+        return false;
+    }
+    _ = buf_append_u64(out, WEB_MAX_USES as u64);
+    return buf_append_cstr(out, "}]}");
+}
+
+// queries 用 '\n' 分隔存放（解析阶段做去重）
+fn qs_item(qs: &const Buf, idx: usize, out: &Buf) bool {
+    buf_reset(out);
+    var cur: usize = 0;
+    var i: usize = 0;
+    var start: usize = 0;
+    while i <= qs.len {
+        if i == qs.len || qs.ptr[i] == 10 as byte {
+            if cur == idx {
+                return buf_append(out, &qs.ptr[start], i - start);
+            }
+            cur = cur + 1;
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+// 解析响应：先按 JSON 找 text / web_search_tool_result
+export fn web_parse_response(body: &const Buf, r: &WebResult) bool {
+    var arena_raw: &void = malloc(1048576);
+    defer { free(arena_raw); }
+    if ((arena_raw as &byte) as usize) == 0 {
+        return false;
+    }
+    var arena: Arena = Arena{ buffer: null, size: 0, used: 0 };
+    arena_init(&arena, arena_raw as &byte, 1048576);
+    var root: JsonValue = JsonValue.json_null();
+    if !js_parse(&arena, body.ptr, body.len, &root) {
+        return false;
+    }
+    var content: JsonValue = JsonValue.json_null();
+    if !js_obj_get(&root, "content", 7, &content) {
+        return false;
+    }
+    const n: usize = js_arr_len(&content);
+    var i: usize = 0;
+    while i < n {
+        var blk: JsonValue = JsonValue.json_null();
+        if js_arr_get(&content, i, &blk) {
+            var tv: JsonStrView = JsonStrView{ ptr: null, len: 0 };
+            if js_obj_get_str(&blk, "type", 4, &tv) {
+                if bufx_eq_cstr(tv.ptr as &const byte, tv.len, "text") {
+                    var sv: JsonStrView = JsonStrView{ ptr: null, len: 0 };
+                    if js_obj_get_str(&blk, "text", 4, &sv) && sv.len > 0 {
+                        if r.answer.len > 0 {
+                            _ = buf_append_byte(&r.answer, 10);
+                        }
+                        _ = buf_append(&r.answer, sv.ptr as &const byte, sv.len);
+                    }
+                    // citations → 来源
+                    var cites: JsonValue = JsonValue.json_null();
+                    if js_obj_get(&blk, "citations", 9, &cites) {
+                        web_take_sources(&cites, r);
+                    }
+                } else if bufx_eq_cstr(tv.ptr as &const byte, tv.len, "web_search_tool_result") {   // 22 个字符，别再手数
+                    var sub: JsonValue = JsonValue.json_null();
+                    if js_obj_get(&blk, "content", 7, &sub) {
+                        web_take_sources(&sub, r);
+                    }
+                }
+            }
+        }
+        i = i + 1;
+    }
+    return r.answer.len > 0 || r.nsources > 0;
+}
+
+fn web_take_sources(arr: &const JsonValue, r: &WebResult) void {
+    const n: usize = js_arr_len(arr);
+    var i: usize = 0;
+    while i < n {
+        var it: JsonValue = JsonValue.json_null();
+        if js_arr_get(arr, i, &it) {
+            var uv: JsonStrView = JsonStrView{ ptr: null, len: 0 };
+            var tv: JsonStrView = JsonStrView{ ptr: null, len: 0 };
+            var sv: JsonStrView = JsonStrView{ ptr: null, len: 0 };
+            var pv: JsonStrView = JsonStrView{ ptr: null, len: 0 };
+            _ = js_obj_get_str(&it, "url", 3, &uv);
+            _ = js_obj_get_str(&it, "title", 5, &tv);
+            _ = js_obj_get_str(&it, "cited_text", 10, &sv);
+            if sv.len == 0 {
+                _ = js_obj_get_str(&it, "snippet", 7, &sv);
+            }
+            _ = js_obj_get_str(&it, "page_age", 8, &pv);
+            if pv.len == 0 {
+                _ = js_obj_get_str(&it, "publishedAt", 11, &pv);
+            }
+            if uv.len == 0 && tv.len == 0 {
+                i = i + 1;
+                continue;
+            }
+            // 去重（同 URL）
+            var dup: bool = false;
+            var k: usize = 0;
+            while k < r.nsources && k < WEB_MAX_RESULTS {
+                const ex: &const WebSource = &r.sources[k];
+                if ex.url.len == uv.len && uv.len > 0 && bufx_mem_eq(ex.url.ptr as &const byte, uv.ptr as &const byte, uv.len) {
+                    dup = true;
+                    break;
+                }
+                k = k + 1;
+            }
+            if !dup && r.nsources < WEB_MAX_RESULTS {
+                const si: usize = r.nsources;
+                const dst: &WebSource = &r.sources[si];
+                dst.url = buf_new(uv.len + 8);
+                dst.title = buf_new(tv.len + 8);
+                dst.snippet = buf_new(sv.len + 8);
+                dst.published = buf_new(pv.len + 8);
+                if buf_valid(&dst.url) {
+                    _ = buf_append(&dst.url, uv.ptr as &const byte, uv.len);
+                }
+                if buf_valid(&dst.title) {
+                    _ = buf_append(&dst.title, tv.ptr as &const byte, tv.len);
+                }
+                if buf_valid(&dst.snippet) {
+                    _ = buf_append(&dst.snippet, sv.ptr as &const byte, sv.len);
+                }
+                if buf_valid(&dst.published) {
+                    _ = buf_append(&dst.published, pv.ptr as &const byte, pv.len);
+                }
+                r.nsources = si + 1;
+            } else if !dup {
+                r.truncated = true;
+            }
+        }
+        i = i + 1;
+    }
+}
+
+// 渲染成给模型看的文本
+export fn web_render(r: &const WebResult, out: &Buf) bool {
+    buf_reset(out);
+    if r.answer.len > 0 {
+        _ = buf_append(out, r.answer.ptr, r.answer.len);
+        _ = buf_append_byte(out, 10);
+    }
+    if r.nsources == 0 {
+        if r.answer.len == 0 {
+            _ = buf_append_cstr(out, "No results found");
+        }
+        return true;
+    }
+    _ = buf_append_cstr(out, "\nSources:\n");
+    var i: usize = 0;
+    while i < r.nsources && i < WEB_MAX_RESULTS {
+        const s: &const WebSource = &r.sources[i];
+        _ = buf_append_u64(out, (i + 1) as u64);
+        _ = buf_append_cstr(out, ". ");
+        if s.title.len > 0 {
+            _ = buf_append(out, s.title.ptr, s.title.len);
+            _ = buf_append_cstr(out, " — ");
+        }
+        _ = buf_append(out, s.url.ptr, s.url.len);
+        if s.published.len > 0 {
+            _ = buf_append_cstr(out, " (");
+            _ = buf_append(out, s.published.ptr, s.published.len);
+            _ = buf_append_cstr(out, ")");
+        }
+        if s.snippet.len > 0 {
+            _ = buf_append_cstr(out, "\n   ");
+            var n: usize = s.snippet.len;
+            if n > 300 {
+                n = bufx_utf8_prefix_bytes(s.snippet.ptr as &const byte, s.snippet.len, 300);
+            }
+            _ = buf_append(out, s.snippet.ptr, n);
+        }
+        _ = buf_append_byte(out, 10);
+        i = i + 1;
+    }
+    if r.truncated {
+        _ = buf_append_cstr(out, "(more results were truncated)\n");
+    }
+    return true;
+}
+
+// ============================================================
+// 工具入口
+// ============================================================
+export fn web_tool_search(cfg: &const Config, args: &const JsonValue, out: &Buf) void {
+    var qarr: JsonValue = JsonValue.json_null();
+    if !js_obj_get(args, "queries", 7, &qarr) || js_arr_len(&qarr) == 0 {
+        _ = buf_append_cstr(out, "Error: queries must contain at least one query");
+        return;
+    }
+    const nq_raw: usize = js_arr_len(&qarr);
+    if nq_raw > WEB_MAX_QUERIES {
+        _ = buf_append_cstr(out, "Error: queries must contain at most 4 queries");
+        return;
+    }
+    // 去重（保留首次出现）
+    var qs: Buf = buf_new(512);
+    defer { buf_free(&qs); }
+    var nq: usize = 0;
+    var i: usize = 0;
+    while i < nq_raw {
+        var it: JsonValue = JsonValue.json_null();
+        if js_arr_get(&qarr, i, &it) {
+            var sv: JsonStrView = JsonStrView{ ptr: null, len: 0 };
+            if !js_obj_get_str(&it, "text", 4, &sv) {
+                // queries 也可能是纯字符串数组
+                var tmp: JsonValue = it;
+                if !js_str_of(&tmp, &sv) {
+                    _ = buf_append_cstr(out, "Error: each query must be a non-empty string");
+                    return;
+                }
+            }
+            if sv.len == 0 {
+                _ = buf_append_cstr(out, "Error: each query must be a non-empty string");
+                return;
+            }
+            // 查重
+            var dup: bool = false;
+            var k: usize = 0;
+            var one: Buf = buf_empty();
+            defer { buf_free(&one); }
+            while k < nq {
+                if qs_item(&qs, k, &one) {
+                    if one.len == sv.len && bufx_mem_eq(one.ptr as &const byte, sv.ptr as &const byte, sv.len) {
+                        dup = true;
+                        break;
+                    }
+                }
+                k = k + 1;
+            }
+            if !dup {
+                if nq > 0 {
+                    _ = buf_append_byte(&qs, 10);
+                }
+                _ = buf_append(&qs, sv.ptr as &const byte, sv.len);
+                nq = nq + 1;
+            }
+        }
+        i = i + 1;
+    }
+    if nq == 0 {
+        _ = buf_append_cstr(out, "Error: queries must contain at least one query");
+        return;
+    }
+    // 凭据
+    var key: Buf = buf_new(256);
+    defer { buf_free(&key); }
+    if !web_api_key(agent_dsh_home(), &key) {
+        _ = buf_append_cstr(out, "Error: web search is unavailable: WEB_PROVIDER_CREDENTIAL_MISSING (set DEEPSEEK_API_KEY)");
+        return;
+    }
+    var base: Buf = buf_new(256);
+    defer { buf_free(&base); }
+    _ = web_base_url(&base);
+    var model: Buf = buf_new(128);
+    defer { buf_free(&model); }
+    _ = web_model(&model);
+    var body: Buf = buf_new(4096);
+    defer { buf_free(&body); }
+    if !web_build_body(&qs, nq, &model, &body) {
+        _ = buf_append_cstr(out, "Error: cannot build web search request");
+        return;
+    }
+    var url: Buf = buf_new(512);
+    defer { buf_free(&url); }
+    _ = buf_append(&url, base.ptr, base.len);
+    _ = buf_append_cstr(&url, "/messages");
+    var hdrs: Buf = buf_new(2048);
+    defer { buf_free(&hdrs); }
+    _ = buf_append_cstr(&hdrs, "content-type: application/json\r\nanthropic-version: 2023-06-01\r\nx-api-key: ");
+    _ = buf_append(&hdrs, key.ptr, key.len);
+    _ = buf_append_cstr(&hdrs, "\r\n");
+
+    // 信任策略：搜索主机与模型主机通常不同（leaf pin 是**按主机**的），
+    // 所以单独给一组覆盖：UYA_AGENT_WEB_TLS_VERIFY / UYA_AGENT_WEB_TLS_PIN
+    var wverify: i32 = cfg.verify;
+    var wpin: Buf = buf_new(128);
+    defer { buf_free(&wpin); }
+    _ = buf_append(&wpin, cfg.pin.ptr, cfg.pin.len);
+    const wv: &byte = getenv("UYA_AGENT_WEB_TLS_VERIFY");
+    if (wv as usize) != 0 {
+        if bufx_eq_cstr(wv, bufx_cstr_len(wv), "none") {
+            wverify = HC_VERIFY_NONE;
+        } else if bufx_eq_cstr(wv, bufx_cstr_len(wv), "pin") {
+            wverify = HC_VERIFY_PIN;
+        } else if bufx_eq_cstr(wv, bufx_cstr_len(wv), "chain") {
+            wverify = HC_VERIFY_CHAIN;
+        }
+    }
+    const wp: &byte = getenv("UYA_AGENT_WEB_TLS_PIN");
+    if (wp as usize) != 0 && bufx_cstr_len(wp) > 0 {
+        buf_reset(&wpin);
+        _ = buf_append_cstr(&wpin, wp);
+    }
+
+    var resp: Resp = resp_empty();
+    defer { resp_free(&resp); }
+    var tc: TlsConn = tls_conn_empty();
+    var guard: FdGuard = FdGuard{ saved: -1, nullfd: -1, active: false };
+    tls_noise_mute(&guard, !cfg.tls_debug && !hc_debug);
+    const call_res: !void = http_request(
+        url.ptr[0: url.len],
+        &"POST"[0: 4],
+        hdrs.ptr[0: hdrs.len],
+        body.ptr as &const byte,
+        body.len,
+        cfg.timeout_ms,
+        cfg.max_response,
+        wverify,
+        wpin.ptr[0: wpin.len],
+        &resp,
+        &tc
+    );
+    tls_noise_unmute(&guard);
+    var req_ok: bool = true;
+    _ = call_res catch {
+        req_ok = false;
+    };
+    if !req_ok {
+        _ = buf_append_cstr(out, "Error: web search request failed (network or TLS)");
+        return;
+    }
+    const st: i32 = resp.status;
+    if st != 200 {
+        _ = buf_append_cstr(out, "Error: web search provider returned HTTP ");
+        _ = buf_append_u64(out, st as u64);
+        if resp.body.len > 0 {
+            _ = buf_append_cstr(out, ": ");
+            var n: usize = resp.body.len;
+            if n > 400 {
+                n = 400;
+            }
+            _ = buf_append(out, resp.body.ptr, n);
+        }
+        return;
+    }
+    var r: WebResult = WebResult{ answer: buf_empty(), sources: [], nsources: 0, truncated: false };
+    web_result_init(&r);
+    defer { web_result_free(&r); }
+    if (!web_parse_response(&resp.body, &r)) {
+        _ = buf_append_cstr(out, "Error: unexpected web search response shape");
+        return;
+    }
+    _ = web_render(&r, out);
+}
