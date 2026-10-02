@@ -4,10 +4,15 @@
 //   * isatty 判定：libc 没导出 isatty，用 `ioctl(0, TCGETS, &termios)` 成功即 TTY；
 //   * raw 模式进出：关 ICANON/ECHO/ISIG/IEXTEN（自己管 Ctrl-C），清 IXON/ICRNL，
 //     VMIN=1/VTIME=0；**保留 OPOST** —— 否则项目里大量 `\n` 输出会变成阶梯状；
-//   * 终端宽度（TIOCGWINSZ）；
+//   * 终端宽度（TIOCGWINSZ，每次重画前重读，窗口缩放后不用重启）；
 //   * 行编辑器：把字节流喂进 tty_feed，事件从 tty_next_event 取；
-//   * 单行渲染协议 ui_out_*：擦掉输入行 → 写输出 → 重画输入行；
+//   * 渲染协议 ui_out_*：擦掉输入行 → 写输出 → 重画输入行；
 //   * 动态提示符（状态显示走提示符，避免两行光标的复杂度）。
+//
+// 两条硬约束（都是踩出来的坑）：
+//   1) **编辑按 UTF-8 字符、定位按显示列**。中文一个字符 3 字节、占 2 列，
+//      按字节退格会把字符砍成半个（屏幕上就是乱码），按字节回退光标会越走越偏。
+//   2) **写转义序列必须用数组字面量取址**，不能用 `&"..."[0: n]`（见下面的常量注释）。
 //
 // 设计约束：Uya **没有捕获闭包**，所以状态放在模块级全局 tty_ui 上，函数直接操作它；
 // 单进程里只可能有一个前台界面，这与 DSH 的「一个 session 一个 driver」一致。
@@ -35,6 +40,14 @@ const TTY_CC_VMIN: usize = 6;
 const TTY_LINE_MAX: usize = 8192;
 const TTY_HIST_MAX: usize = 32;
 const TTY_EVQ_MAX: usize = 16;
+
+// ---- 转义序列：必须用数组字面量 ----
+// uya 0.10 的坑：`&"\r\x1b[2K"[0: 5]` 求值出来是**切片描述符**（{ptr,len} 结构体）的地址，
+// 而 `sys_write` 的形参是 `*const byte`，编译器只补一次 `(const char *)` 强转 —— 于是写进
+// 终端的是描述符里那 8 字节指针的前 5 字节：屏幕上每次重画提示符都跟一串乱码，字节还随
+// ASLR 变（实测 `\xb9x\xe0gi` 这种）。数组字面量取址才是真正的字节指针。
+// `make codegen-audit` 会扫构建产物里的这种形状，防止再写回去。
+const TTY_SEQ_CURSOR_SHOW: [byte: 6] = [27, 91, 63, 50, 53, 104];   // "\x1b[?25h"
 
 // ---- 事件 ----
 export const TTY_EV_NONE: i32 = 0;
@@ -99,6 +112,10 @@ export struct TtyUi {
     stash: Buf,         // 上翻历史时暂存的当前行
     pend: Buf,          // 一次读取里「事件之后」剩下的字节（粘贴/多行输入）
     line_on_screen: bool,
+    cur_row: usize,         // 光标在「输入行块」里的第几行（擦除时上移这么多行）
+    start_col: usize,       // 输入行块的起始列（流式输出没换行时它不是 0）
+    out_col: usize,         // 光标当前的物理列（追踪所有 tty_write 的输出）
+    out_wrap: bool,         // 上一行正好写满：下一个字节会落到下一行第 0 列
 }
 
 fn tty_ptr_i64(p: &void) i64 {
@@ -151,6 +168,10 @@ export fn tty_init(ui: &TtyUi, fd: i32) void {
     ui.hist_len = 0;
     ui.hist_pos = -1;
     ui.line_on_screen = false;
+    ui.cur_row = 0;
+    ui.start_col = 0;
+    ui.out_col = 0;
+    ui.out_wrap = false;
     var i: usize = 0;
     while i < TTY_HIST_MAX {
         ui.hist[i] = buf_empty();
@@ -158,12 +179,21 @@ export fn tty_init(ui: &TtyUi, fd: i32) void {
     }
     _ = buf_append_cstr(&ui.prompt, "> ");
     if ui.is_tty {
-        var ws: TtyWinsize = TtyWinsize{ ws_row: 0, ws_col: 0, ws_x: 0, ws_y: 0 };
-        const r: !i32 = sys_ioctl(fd, TTY_TIOCGWINSZ, tty_ptr_i64(&ws as &void));
-        const v: i32 = r catch { -1; };
-        if v == 0 && ws.ws_col > 0 {
-            ui.cols = ws.ws_col as usize;
-        }
+        tty_refresh_cols(ui);
+    }
+}
+
+// 重读窗口宽度。每次重画前调一次：窗口缩放后（没有 SIGWINCH 处理器）也能自动跟上，
+// 否则折行行数会按旧宽度算，擦除就擦不干净。
+export fn tty_refresh_cols(ui: &TtyUi) void {
+    if !ui.is_tty {
+        return;
+    }
+    var ws: TtyWinsize = TtyWinsize{ ws_row: 0, ws_col: 0, ws_x: 0, ws_y: 0 };
+    const r: !i32 = sys_ioctl(0, TTY_TIOCGWINSZ, tty_ptr_i64(&ws as &void));
+    const v: i32 = r catch { -1; };
+    if v == 0 && ws.ws_col > 0 {
+        ui.cols = ws.ws_col as usize;
     }
 }
 
@@ -210,7 +240,7 @@ export fn tty_raw_off(ui: &TtyUi, fd: i32) void {
     }
     _ = tty_set_attrs(fd, &ui.saved);
     ui.raw = false;
-    _ = sys_write(fd, &"\x1b[?25h"[0: 6], 6) catch {};
+    _ = sys_write(fd, &TTY_SEQ_CURSOR_SHOW[0], 6) catch {};
 }
 
 // 关于信号：**没有**安装 SIGTERM/SIGHUP 处理器。
@@ -231,7 +261,134 @@ export fn tty_set_prompt(ui: &TtyUi, text: &const byte) void {
     if n > 0 {
         _ = buf_append(&ui.prompt, text, n);
     }
-    ui.line_on_screen = false;
+    // 注意：**不能**在这里清 line_on_screen —— 屏幕上那一行还在（只是提示符要改），
+    // 清了就等于「没有东西要擦」，下次重画会把旧提示符/new prompt 叠在一起。
+}
+
+// ============================================================
+// UTF-8 / 显示列宽
+//
+// 终端里「字节数 ≠ 字符数 ≠ 列数」：中文 1 字符 = 3 字节 = 2 列。
+// 编辑操作按**字符**走（否则退格会砍出半个字符 → 屏幕乱码），
+// 光标定位按**列**走（否则中文行的光标会越走越偏）。
+// ============================================================
+
+const TTY_U32_7F: u32 = 0x7F;
+const TTY_U32_80: u32 = 0x80;
+const TTY_U32_C0: u32 = 0xC0;
+const TTY_U32_3F: u32 = 0x3F;
+
+// 续字节（10xxxxxx）
+export fn tty_is_cont(c: byte) bool {
+    return ((c as u32) & TTY_U32_C0) == TTY_U32_80;
+}
+
+// 首字节引导的字符长度（1..4）。非法字节按 1 处理：保证编辑操作永远前进、不会卡死。
+export fn tty_utf8_len(c: byte) usize {
+    const v: u32 = c as u32;
+    if v < 0x80 {
+        return 1;
+    }
+    if v >= 0xC2 && v <= 0xDF {
+        return 2;
+    }
+    if v >= 0xE0 && v <= 0xEF {
+        return 3;
+    }
+    if v >= 0xF0 && v <= 0xF4 {
+        return 4;
+    }
+    return 1;   // 0x80..0xC1 / 0xF5..0xFF：坏字节，当单字节走
+}
+
+// 字节下标 i 处**上一个字符**的起点（i 必须是字符边界；i=0 时返回 0）
+export fn tty_utf8_prev(s: &const byte, i: usize) usize {
+    if i == 0 {
+        return 0;
+    }
+    var k: usize = 1;
+    while k < 4 && k < i && tty_is_cont(s[i - k]) {
+        k = k + 1;
+    }
+    return i - k;
+}
+
+// 字节下标 i 处字符**之后**的下标（截到 n）
+export fn tty_utf8_next(s: &const byte, i: usize, n: usize) usize {
+    if i >= n {
+        return n;
+    }
+    const need: usize = tty_utf8_len(s[i]);
+    var j: usize = i + 1;
+    while j < i + need && j < n && tty_is_cont(s[j]) {
+        j = j + 1;
+    }
+    return j;
+}
+
+// 解码 i 处的字符；坏序列返回 U+FFFD（不返回 0，避免和 NUL 混淆）
+export fn tty_utf8_decode(s: &const byte, i: usize, n: usize) u32 {
+    if i >= n {
+        return 0xFFFD;
+    }
+    const c: u32 = s[i] as u32;
+    const need: usize = tty_utf8_len(s[i]);
+    if need == 1 {
+        return c;
+    }
+    if i + need > n {
+        return 0xFFFD;
+    }
+    var v: u32 = c & (TTY_U32_7F >> (need as i32));
+    var k: usize = 1;
+    while k < need {
+        const b: u32 = s[i + k] as u32;
+        if (b & TTY_U32_C0) != TTY_U32_80 {
+            return 0xFFFD;
+        }
+        v = (v << 6) | (b & TTY_U32_3F);
+        k = k + 1;
+    }
+    return v;
+}
+
+// 一个码点占几列：东亚宽字符 2 列，组合符/零宽 0 列，其余 1 列（终端里常见的范围够用）
+export fn tty_char_cols(cp: u32) usize {
+    if cp == 0 {
+        return 0;
+    }
+    if cp < 0x20 || (cp >= 0x7F && cp < 0xA0) {
+        return 0;
+    }
+    if (cp >= 0x0300 && cp <= 0x036F) || (cp >= 0x200B && cp <= 0x200F) || cp == 0xFEFF {
+        return 0;
+    }
+    if cp >= 0x1100 && cp <= 0x115F { return 2; }        // 韩文字母
+    if cp >= 0x2E80 && cp <= 0x303E { return 2; }        // 部首扩展 / 标点
+    if cp >= 0x3041 && cp <= 0x33FF { return 2; }        // 假名 / 注音 / 兼容
+    if cp >= 0x3400 && cp <= 0x4DBF { return 2; }        // CJK 扩展 A
+    if cp >= 0x4E00 && cp <= 0x9FFF { return 2; }        // CJK 基本区
+    if cp >= 0xA000 && cp <= 0xA4CF { return 2; }        // 彝文
+    if cp >= 0xAC00 && cp <= 0xD7A3 { return 2; }        // 韩文音节
+    if cp >= 0xF900 && cp <= 0xFAFF { return 2; }        // CJK 兼容
+    if cp >= 0xFE30 && cp <= 0xFE6F { return 2; }        // CJK 兼容形式
+    if cp >= 0xFF00 && cp <= 0xFF60 { return 2; }        // 全角
+    if cp >= 0xFFE0 && cp <= 0xFFE6 { return 2; }        // 全角符号
+    if cp >= 0x1F300 && cp <= 0x1F64F { return 2; }      // emoji
+    if cp >= 0x1F900 && cp <= 0x1F9FF { return 2; }
+    if cp >= 0x20000 && cp <= 0x3FFFD { return 2; }      // CJK 扩展 B 及以后
+    return 1;
+}
+
+// s[a..b) 的显示列宽
+export fn tty_cols_between(s: &const byte, a: usize, b: usize) usize {
+    var cols: usize = 0;
+    var i: usize = a;
+    while i < b {
+        cols = cols + tty_char_cols(tty_utf8_decode(s, i, b));
+        i = tty_utf8_next(s, i, b);
+    }
+    return cols;
 }
 
 // ============================================================
@@ -289,29 +446,37 @@ fn tty_line_insert(ui: &TtyUi, c: byte) void {
     ui.cursor = ui.cursor + 1;
 }
 
+// 删掉 line[from..to) 并按删除量修正光标（from/to 都必须是字符边界）
+fn tty_line_erase(ui: &TtyUi, from: usize, to: usize) void {
+    if from >= to || to > ui.line.len {
+        return;
+    }
+    const gap: usize = to - from;
+    var i: usize = from;
+    while i + gap < ui.line.len {
+        ui.line.ptr[i] = ui.line.ptr[i + gap];
+        i = i + 1;
+    }
+    ui.line.len = ui.line.len - gap;
+    ui.cursor = from;
+}
+
+// 退格：删**一个字符**（中文 3 字节一起走，否则屏幕上留半个字符 = 乱码）
 fn tty_line_backspace(ui: &TtyUi) void {
     if ui.cursor == 0 {
         return;
     }
-    var i: usize = ui.cursor - 1;
-    while i + 1 < ui.line.len {
-        ui.line.ptr[i] = ui.line.ptr[i + 1];
-        i = i + 1;
-    }
-    ui.line.len = ui.line.len - 1;
-    ui.cursor = ui.cursor - 1;
+    const from: usize = tty_utf8_prev(ui.line.ptr as &const byte, ui.cursor);
+    tty_line_erase(ui, from, ui.cursor);
 }
 
+// Delete / 非空行 Ctrl-D：删光标处的**一个字符**
 fn tty_line_delete(ui: &TtyUi) void {
     if ui.cursor >= ui.line.len {
         return;
     }
-    var i: usize = ui.cursor;
-    while i + 1 < ui.line.len {
-        ui.line.ptr[i] = ui.line.ptr[i + 1];
-        i = i + 1;
-    }
-    ui.line.len = ui.line.len - 1;
+    const to: usize = tty_utf8_next(ui.line.ptr as &const byte, ui.cursor, ui.line.len);
+    tty_line_erase(ui, ui.cursor, to);
 }
 
 fn tty_line_del_word(ui: &TtyUi) void {
@@ -406,11 +571,12 @@ fn tty_esc_apply(ui: &TtyUi, final: byte) void {
         tty_hist_move(ui, false);        // Down
     } else if f == 67 {
         if ui.cursor < ui.line.len {
-            ui.cursor = ui.cursor + 1;
+            // 右移一个**字符**（中文 3 字节一起跳）
+            ui.cursor = tty_utf8_next(ui.line.ptr as &const byte, ui.cursor, ui.line.len);
         }
     } else if f == 68 {
         if ui.cursor > 0 {
-            ui.cursor = ui.cursor - 1;
+            ui.cursor = tty_utf8_prev(ui.line.ptr as &const byte, ui.cursor);
         }
     } else if f == 72 {
         ui.cursor = 0;                   // Home
@@ -586,7 +752,81 @@ export fn tty_pump(ui: &TtyUi, fd: i32) bool {
 
 // ============================================================
 // 渲染
+//
+// 模型：输入行永远是屏幕上**最后**的一块内容。画一次 = 从「块首行第 start_col 列」
+// 写提示符 + 行内容，然后按显示列把光标挪到 cursor 处。擦一次 = 先上移回块首行、
+// 右移到块首列、再用 `ESC[J` 清到屏幕末尾（块下面没有别的东西，所以 J 不会误伤输出）。
+// 这样即使输入行因为太长折成多行（中文 1 字符 2 列，80 列终端 39 个字就折行），
+// 或者它跟在没换行的流式正文后面（start_col > 0），擦除都只擦输入行自己。
 // ============================================================
+
+// total 列文本在 cols 列终端里占几行。
+// 渲染不再需要它（擦除交给 cur_row + start_col），留着是因为自测要逐条断言这套「挂起换行」
+// 口径 —— 口径错一行，屏幕上就是擦不干净或多擦一行。
+export fn tty_rows_of(total: usize, cols: usize) usize {
+    if cols == 0 || total == 0 {
+        return 1;
+    }
+    if total % cols == 0 {
+        return total / cols;
+    }
+    return (total / cols) + 1;
+}
+
+// 写满 total 列之后光标实际停在哪一行哪一列。
+// DECAWM：字符正好落在最后一列时光标仍留在本行（挂着待换行），不会立刻跳下一行 ——
+// 这个口径必须和 tty_rows_of 一致，否则上移量会差一行、擦除越擦越乱。
+export fn tty_end_row_col(total: usize, cols: usize, row: &usize, col: &usize) void {
+    if cols == 0 {
+        row[0] = 0;
+        col[0] = 0;
+        return;
+    }
+    if total > 0 && total % cols == 0 {
+        row[0] = (total / cols) - 1;
+        col[0] = cols - 1;
+        return;
+    }
+    row[0] = total / cols;
+    col[0] = total % cols;
+}
+
+// 把 n 的十进制写进 dst（最多 max_digits 位，max_digits <= 6）；返回写入字节数
+export fn tty_put_dec(dst: &byte, n: usize, max_digits: usize) usize {
+    var digits: [byte: 6] = [0: 6];
+    var v: usize = n;
+    var d: usize = 0;
+    if v == 0 {
+        digits[0] = 48;
+        d = 1;
+    }
+    while v > 0 && d < max_digits {
+        digits[d] = (((v % (10 as usize)) as i32) + 48) as byte;
+        v = v / (10 as usize);
+        d = d + 1;
+    }
+    var i: usize = 0;
+    while i < d {
+        dst[i] = digits[d - 1 - i];
+        i = i + 1;
+    }
+    return d;
+}
+
+// "\x1b[<n>A"（n>0 才写；n=0 不能写 —— CSI 参数 0 是「默认值」= 上移 1 行）
+fn tty_seq_up(dst: &byte, n: usize) usize {
+    if n == 0 {
+        return 0;
+    }
+    var k: usize = 0;
+    dst[k] = 27; k = k + 1;
+    dst[k] = 91; k = k + 1;
+    k = k + tty_put_dec(&dst[k], n, 3);
+    dst[k] = 65;   // 'A'
+    k = k + 1;
+    return k;
+}
+
 fn tty_erase_line(ui: &TtyUi, fd: i32) void {
     if !tty_active(ui) {
         return;
@@ -594,51 +834,141 @@ fn tty_erase_line(ui: &TtyUi, fd: i32) void {
     if !ui.line_on_screen {
         return;
     }
-    _ = sys_write(fd, &"\r\x1b[2K"[0: 5], 5) catch {};
+    var seq: [byte: 20] = [0: 20];
+    const k: usize = tty_build_erase_seq(&seq[0], ui.cur_row, ui.start_col);
+    _ = sys_write(fd, &seq[0], k) catch {};
+    // 擦完光标停在「块首行第 start_col 列」——下一次重画就从这里开始
     ui.line_on_screen = false;
+    ui.cur_row = 0;
+    ui.out_col = ui.start_col;
+    ui.out_wrap = false;
+}
+
+// 擦除序列：上移 cur_row 行 → `\r` → 右移到 start_col → `ESC[J`（清到屏幕末尾）。
+//
+// 为什么不是 `\r ESC[2K`：流式输出期间输入行是紧跟着正文画的，块首列往往不是 0；
+// 先回第 0 列再整行擦会把**同一行前半段的正文**一起擦掉（模型刚吐出来的字就没了）。
+// 从 start_col 清到屏幕末尾则只擦输入行自己（输入行永远是屏幕上最后的内容）。
+//
+// 单独抽成函数是为了自测能逐字节断言 —— 这套协议错一个字节，屏幕上就是乱码/残影。
+export fn tty_build_erase_seq(dst: &byte, cur_row: usize, start_col: usize) usize {
+    var k: usize = tty_seq_up(dst, cur_row);
+    dst[k] = 13; k = k + 1;              // '\r' 回第 0 列
+    if start_col > 0 {
+        dst[k] = 27; k = k + 1;          // ESC [ <start_col> C
+        dst[k] = 91; k = k + 1;
+        k = k + tty_put_dec(&dst[k], start_col, 3);
+        dst[k] = 67;   // 'C'
+        k = k + 1;
+    }
+    dst[k] = 27; k = k + 1;              // ESC [ J
+    dst[k] = 91; k = k + 1;
+    dst[k] = 74; k = k + 1;
+    return k;
+}
+
+// 追着 tty_write 写出去的字节推进「物理列」。
+// 只关心列与「挂起换行」（一行正好写满时光标停在本行最后一列，下一个字节才换行）。
+//
+// 已知近似：控制字符（含 TAB）按 0 列算，而终端里 TAB 会跳到下一个制表位 —— 只有 TAB
+// 恰好落在「与输入行同一行」的正文里才会把起始列算小几格（擦除时多擦几个字符）。
+// 实测带 TAB 的正文（代码块）每行都换行收尾、列模型随即归零，所以没再维护制表位表。
+export fn tty_advance_col(ui: &TtyUi, p: &const byte, n: usize) void {
+    var cols: usize = ui.cols;
+    if cols == 0 {
+        cols = 80;
+    }
+    var i: usize = 0;
+    while i < n {
+        const c: byte = p[i];
+        if c == 13 as byte || c == 10 as byte {
+            ui.out_col = 0;
+            ui.out_wrap = false;
+            i = i + 1;
+            continue;
+        }
+        const w: usize = tty_char_cols(tty_utf8_decode(p, i, n));
+        const step: usize = tty_utf8_next(p, i, n);
+        if w > 0 {
+            if ui.out_wrap {
+                ui.out_col = 0;
+                ui.out_wrap = false;
+            }
+            if ui.out_col + w > cols {
+                ui.out_col = 0;          // 终端自动折行
+            }
+            ui.out_col = ui.out_col + w;
+            if ui.out_col >= cols {
+                ui.out_col = cols - 1;
+                ui.out_wrap = true;
+            }
+        }
+        i = step;
+    }
 }
 
 export fn tty_draw_line(ui: &TtyUi, fd: i32) void {
     if !tty_active(ui) {
         return;
     }
-    _ = sys_write(fd, &"\r\x1b[2K"[0: 5], 5) catch {};
+    tty_refresh_cols(ui);
+    var cols: usize = ui.cols;
+    if cols == 0 {
+        cols = 80;
+    }
+    // 先把上一次画的（可能折成好几行）擦干净。擦除只清输入行自己占的格子。
+    tty_erase_line(ui, fd);
+
+    // 块首物理列：上一行正好写满时（out_wrap）下一个字节落到下一行第 0 列
+    const col0: usize = if ui.out_wrap { 0 as usize } else { ui.out_col };
+    ui.start_col = col0;
+
+    var total: usize = 0;    // 块首起算的总显示列数
     if ui.prompt.len > 0 {
         _ = sys_write(fd, ui.prompt.ptr as *const byte, ui.prompt.len) catch {};
+        total = total + tty_cols_between(ui.prompt.ptr as &const byte, 0, ui.prompt.len);
     }
+    const pcols: usize = total;
     if ui.line.len > 0 {
         _ = sys_write(fd, ui.line.ptr as *const byte, ui.line.len) catch {};
+        total = total + tty_cols_between(ui.line.ptr as &const byte, 0, ui.line.len);
     }
     ui.line_on_screen = true;
-    // 光标回到 cursor 位置
-    const back: usize = ui.line.len - ui.cursor;
-    if back > 0 && back < 64 {
-        var seq: [byte: 8] = [0: 8];
-        seq[0] = 27;
-        seq[1] = 91;
-        // 十进制
-        var n: usize = back;
-        var digits: [byte: 4] = [0: 4];
-        var d: usize = 0;
-        if n == 0 {
-            digits[0] = 48;
-            d = 1;
-        }
-        while n > 0 && d < 4 {
-            digits[d] = (((n % (10 as usize)) as i32) + 48) as byte;
-            n = n / (10 as usize);
-            d = d + 1;
-        }
-        var k: usize = 2;
-        while d > 0 {
-            d = d - 1;
-            seq[k] = digits[d];
-            k = k + 1;
-        }
-        seq[k] = 68;   // 'D'
-        k = k + 1;
-        _ = sys_write(fd, &seq[0], k) catch {};
+
+    // 画完后的物理位置（写满一行的挂起换行口径与 tty_end_row_col 一致）
+    var erow: usize = 0;
+    var ecol: usize = 0;
+    tty_end_row_col(col0 + total, cols, &erow, &ecol);
+    ui.out_col = ecol;
+    const xcols: usize = col0 + total;
+    ui.out_wrap = xcols > 0 && (xcols % cols) == 0;
+
+    // 光标该在哪：块首列 + 提示符 + 光标前文本的列数。这里必须和 tty_end_row_col 用
+    // **同一口径**算行列：写满整行时光标物理上停在最后一列（挂着待换行），不能算成
+    // 「下一行第 0 列」，否则擦除时会多上移一行、把上一行输出（banner 之类）擦掉。
+    const ttotal: usize = col0 + pcols + tty_cols_between(ui.line.ptr as &const byte, 0, ui.cursor);
+    var trow: usize = 0;
+    var tcol: usize = 0;
+    tty_end_row_col(ttotal, cols, &trow, &tcol);
+    ui.cur_row = trow;
+    if erow == trow && ecol == tcol {
+        // 光标已经在目标位置（最常见：光标就在行尾）—— 一个字节都不用发
+        return;
     }
+    var seq: [byte: 16] = [0: 16];
+    var k: usize = 0;
+    if erow > trow {
+        k = tty_seq_up(&seq[0], erow - trow);
+    }
+    seq[k] = 13; k = k + 1;              // '\r'
+    if tcol > 0 {
+        seq[k] = 27; k = k + 1;          // ESC [ <tcol> C（tcol=0 时不能写，同样是「默认值」坑）
+        seq[k] = 91; k = k + 1;
+        k = k + tty_put_dec(&seq[k], tcol, 3);
+        seq[k] = 67;   // 'C'
+        k = k + 1;
+    }
+    _ = sys_write(fd, &seq[0], k) catch {};
 }
 
 // 流式输出期间：擦掉输入行 → 写内容 → 重画
@@ -667,6 +997,7 @@ export fn tty_write(ui: &TtyUi, fd: i32, p: &const byte, n: usize) void {
     const was_on: bool = ui.line_on_screen;
     tty_out_begin(ui, fd);
     _ = sys_write(fd, p as *const byte, n) catch {};
+    tty_advance_col(ui, p, n);
     if was_on {
         tty_out_end(ui, fd);
     }
@@ -703,6 +1034,10 @@ export var tty_ui: TtyUi = TtyUi{
     stash: Buf{ ptr: null, len: 0, cap: 0 },
     pend: Buf{ ptr: null, len: 0, cap: 0 },
     line_on_screen: false,
+    cur_row: 0,
+    start_col: 0,
+    out_col: 0,
+    out_wrap: false,
 };
 
 // 给 llm/工具用的薄封装：流式增量也走输入行擦除/重画协议

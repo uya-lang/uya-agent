@@ -47,6 +47,7 @@ Hello, Uya!
 make check        # 词法/语法/类型检查
 make build        # 产出 build/uya-agent
 make selftest     # 离线端到端自测（内置 mock LLM，不需要网络也不需要 key）
+make codegen-audit # 扫构建产物：不许出现「切片描述符 → 字节指针」的强转（终端乱码源头）
 make probe        # 传输层探针：打真实 https 端点，期望 HTTP 401（不需要 key）
 ```
 
@@ -128,8 +129,9 @@ src/sse.uya       SSE 分帧：字段行、多行 data、空行 dispatch、注�
 src/llm.uya       请求/响应协议：消息组装、流式 delta 装配（content/reasoning/tool_calls）、
                   usage 合并、finish_reason 映射、非流式响应 → 同一 ChatOut
 src/tools.uya     三个工具：read_file / write_file / run_shell
-src/tty.uya       终端层：termios raw 模式、行编辑器（历史/光标/Delete/词删除）、
-                  单行渲染协议（擦输入行→写→重画）、提示符即状态显示
+src/tty.uya       终端层：termios raw 模式、行编辑器（历史/光标/Delete/词删除，**按 UTF-8
+                  字符编辑、按显示列定位**）、渲染协议（擦输入行→写→重画，输入行折行或紧跟
+                  在没换行的正文后面都只擦自己那一块）、提示符即状态显示
 src/inbox.uya     输入收件箱：steer（运行中输入的文本，step 边界领取）+ keepInbox 语义
 src/yamlcfg.uya   自带 YAML 子集解析器：去注释（块标量/引号感知）、中和 `!!tag`、
                   block/flow 映射与序列、`|`/`>` 块标量、跨行 flow 集合、节点池树 + 导航
@@ -383,6 +385,16 @@ Messages API（`x-api-key` + `anthropic-version: 2023-06-01`，服务端工具 `
 * **事件与行的顺序不变量**（踩过坑）：事件是排队的，而「正在编辑的行」只有一份，
   所以取用顺序必须是 **已排队事件 → pend（一次读取里剩下的字节）→ 读键盘**；
   反过来做会让 `read` 一次拿到的多行（粘贴）粘成一行，并让事件与行内容错位。
+* **中文（UTF-8）编辑**：终端里 1 个汉字 = 3 字节 = **2 列**，所以编辑按**字符**、定位按
+  **列**：退格/Delete/Ctrl-W 一次删一个完整字符（按字节删会把汉字砍成半个 `\xe4\xb8`
+  —— 屏幕上就是乱码），←/→ 一次跨一个字符，光标回退量按显示宽度算（东亚宽字符 2 列、
+  组合符 0 列）。自测里逐个断言了这些原语（`tty_utf8_*` / `tty_char_cols`）与折行口径。
+* **渲染协议**：擦除 = 上移回输入行块首行 → 右移到块首列 → `ESC[J` 清到屏幕末尾；
+  重画 = 写提示符 + 行内容 → 按列把光标挪到 `cursor` 处。两个细节必须守住：
+  ① 输入行**折行**（80 列终端 39 个汉字就折行）时要整块擦掉，不能只擦一行；
+  ② 流式输出没换行时输入行接在正文**后面**（块首列 ≠ 0），擦除只能从块首列开始，
+  否则会把同一行前半段刚吐出来的正文一起擦掉。窗口宽度每次重画前重读（TIOCGWINSZ），
+  缩放后不用重启。
 * **slash 命令**：`/help`、`/continue`（带历史再跑一轮）、`/status`、`/exit`。
   运行中输入的 slash 命令也按命令处理（用户并不知道回合是否结束）。
 * **中断语义对齐 DSH**：流式期间中断 → assistant 消息只保留非空白前缀且**不含 tool_calls**；
@@ -390,6 +402,10 @@ Messages API（`x-api-key` + `anthropic-version: 2023-06-01`，服务端工具 `
   回合一结束就回到提示符，历史完整，`/continue` 或直接输入都能接着跑；
   交互模式下 `--max-steps` 只结束回合不杀进程（一次性运行仍返回退出码 3）。
 * **非 TTY 自动回退**：stdin 不是终端时走行式 REPL（同一份 history 连续对话）。
+* **已知限制（TAB）**：物理列模型把控制字符（含 TAB）按 0 列算，而终端里 TAB 会跳到下一个
+  制表位 —— 只有当 TAB 恰好落在「与输入行同一行」的正文里时，才会把输入行起始列算小几格
+  （擦除时多擦几个字符）。带 TAB 的正文（代码块）通常每行以换行收尾、列模型随即归零，
+  所以没为它维护制表位表。
 * **已知限制**：被 SIGKILL/SIGTERM 打断时终端可能停在 raw 模式，用 `reset` / `stty sane` 恢复。
   原因是 uya 0.10.1 的 `libc.signal.signal` 注册的处理器一被调用就 SIGSEGV
   （最小复现：handler 里只做 `sys_write` + `sys_exit`，`kill -TERM` 后进程以 139 退出），
@@ -497,6 +513,24 @@ vLLM 等 OpenAI 兼容端点都一样稳。想升级成严格 `tool` 角色消�
 21. **`lib/tls` 会把握手全过程写到 fd 2**（`https_debug`/`hs_debug`）：CLI 里得在发请求期间把
     fd 2 临时指向 `/dev/null`（`dup(2)`→`open("/dev/null")`→`dup2`→请求→`dup2` 还原），
     否则用户会看到满屏 `[HS] ... [TLS] ...`；`--tls-debug` 保留原样便于排查。
+22. **第 16 条那个坑的另一种死法：把 `&"字面量"[0:n]` 传给 `*const byte` 会往终端写乱码。**
+    `sys_write(fd, &"\r\x1b[2K"[0: 5], 5)` 生成的 C 是
+    `sys_write(fd, (const char *)(&(struct uya_slice_uint8_t){ .ptr = …, .len = 5 }), 5)` ——
+    即「切片描述符的地址强转成 char*」，于是**写出去的是那 8 字节指针的前 5 字节**。
+    症状：交互模式每次重画提示符都在行首挂一串乱码（还会随 ASLR 变，实测 `\xb9x\xe0gi`），
+    而且因为 `\r\x1b[2K` 根本没发出去，旧行不会被擦掉，屏幕上会一行行叠着
+    `乱码> 乱码> 写一篇…`。修法：用数组字面量取址（`const S: [byte: 5] = [13,27,91,50,75];`
+    → `&S[0]`），或者传 `"…" as *const byte`。`make codegen-audit` 会扫构建产物里的这种
+    形状，把它挡在门外（`make selftest` 会先跑它）。
+23. **终端光标位置要用「挂起换行」口径算，否则擦除会多擦一行。** 一行正好写满 `cols` 列时，
+    光标**仍停在最后一列**（DECAWM 挂着待换行），下一个字节才落到下一行第 0 列。所以
+    「写满 80 列」的行号是 0 而不是 1（`tty_end_row_col` / `tty_rows_of` 两个函数必须同口径，
+    自测里都断言了）。另外 CSI 的参数 0 是「默认值」不是 0：`ESC[0A` 会上移 **1** 行、
+    `ESC[0C` 会右移 1 列，所以参数为 0 时宁可不发这段序列。
+24. **流式输出期间输入行不在第 0 列**：正文没换行时提示符紧跟着正文画，擦除前必须先回到
+    该行的起始列再 `ESC[J`（清到屏幕末尾），否则会把同一行前半段刚吐出来的正文擦掉。
+    `tty.uya` 为此维护物理列（`out_col`/`out_wrap`）与块首列（`start_col`）；自测断言了
+    擦除序列的每个字节。
 
 ---
 
@@ -565,6 +599,7 @@ agent 循环并逐项断言：
 | `stream-basic` | SSE 分帧 + content 累积 + usage 合并（含尾随 usage-only 帧不带明细） |
 | `stream-tools` | `tool_calls` 按 index 交错分片累积（两个调用、arguments 被切成 4 段） |
 | `stream-nodone` | 缺 `[DONE]` → `STREAM_CLOSED`，但已收内容仍在 |
+| `tty-editor` | 行编辑器：事件/历史/粘贴多行/pend；**UTF-8 按字符编辑**（退格、Delete、Ctrl-W 不会砍出半个汉字，←/→ 停在字符边界）；显示列宽（汉字 2 列、组合符 0 列）；折行与「挂起换行」的光标口径；擦除序列逐字节断言（含块首列 ≠ 0 的情形） |
 | `stream-badjson` | 坏 JSON 帧 → `MALFORMED_RESPONSE` + payload 头部，之前的内容保留 |
 | `stream-length` | `finish_reason=length` → max-tokens，reasoning 正常累积 |
 | `steer` | 回合运行中输入的文本，必须在**下一个 step 的请求**里出现（mock 断言 `STEER-MARKER`） |
@@ -611,6 +646,16 @@ contextWindow/maxTokens/input image/reasoningEffort/`permission→confine`/`uya-
   `"id":"call_…"` 保留、`"tool_call_id"` 条数与调用数一致（shell 2 / no-shell 1 / tools 4）。
 * TTY 交互用**真 pty** 验证（`script -qec`）：进入 raw 模式、banner 干净、一次粘贴
   4 行会分成 4 次提交（任务 → `/help` → `/status` → `/exit`），退出后终端恢复。
+* **中文乱码修复的验收（2026-10-03）**：在真 pty 里跑交互模式，把输出的字节回放进一个
+  只实现本项目所用控制序列的极简终端模拟器（**临时写的一次性校验脚本，没入库** —— 仓库里的
+  常驻回归是 `make selftest` 的 `tty-editor` 轮 + `make codegen-audit`），
+  逐屏断言「没有 UTF-8 替换符、banner 不丢行」。
+  修前：提示符前每次挂 5 字节乱码、旧行擦不掉，屏幕上叠成
+  `乱码> 乱码> 写一篇30000字未来科技小说…`（66 个替换符）；修后：0 个替换符，
+  中文退格/左移/Delete/Ctrl-W/折行/`/help` 输出全部正确。
+  另外用**本地假网关**（`text/event-stream`，含「把事件字节切在汉字中间」的分段）
+  把真实回合跑了一遍：流式输出的中文完整、流式期间敲入的 steer 字被正确画在输入行上、
+  回合结束提示符重画干净（修前同一场景下正文末行会被擦掉一段）。
 * 子代理在真机上验证过：让模型「用 subagent（前台）让子代理写一个 hello.sh 打印 SUBAGENT-OK」→
   子代理真的创建并自测了脚本，父进程又独立复核了一遍输出；`subagent_fork` 的子代理历史里
   确实带有父会话已完成轮次的内容（调试输出逐条列过）。

@@ -24,7 +24,7 @@ TASK ?= 创建 hello.uya，编译并运行它
 export UYA_ROOT
 export UYA_SPLIT_C_DIR := $(CURDIR)/build/uyacache
 
-.PHONY: all check build selftest probe e2e clean
+.PHONY: all check build selftest codegen-audit probe e2e clean
 
 all: build
 
@@ -36,7 +36,20 @@ build:
 	@mkdir -p build
 	$(UYA) build $(SRC) -o $(OUT)
 
-selftest: build
+# 代码生成审计：uya 0.10 把 `&"字面量"[a:b]` 传给 `*const byte` 形参时会生成
+# 「切片描述符（{ptr,len} 结构体）地址 → char*」的强转 —— sys_write 于是把描述符里
+# 那 8 字节指针的前几字节写到终端，屏幕上就是乱码（实测提示符前挂 `\xb9x\xe0gi`）。
+# 构建产物里再出现这种形状就直接失败，防止再写回去。
+codegen-audit: build
+	@bad=$$(grep -rn "const char \*)(&(struct uya_slice_uint8_t)" $(CURDIR)/build/uyacache/uya-agent 2>/dev/null || true); \
+	if [ -n "$$bad" ]; then \
+		echo "codegen-audit: 发现「切片描述符强转成字节指针」（输出会乱码）："; \
+		echo "$$bad"; \
+		exit 1; \
+	fi; \
+	echo "codegen-audit: 通过（没有切片描述符强转）"
+
+selftest: build codegen-audit
 	UYA_BIN=$(UYA) $(OUT) --selftest
 
 probe: build
