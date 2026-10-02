@@ -21,7 +21,18 @@ var mock_expect_shell: bool = true;
 //   2 = tools 轮（read_file 成功 / read_file 越权被拒 / run_shell 超时被杀；末轮响应用 chunked）
 //   3 = HTTP 401（非 200 必须报错退出，且把错误体打出来）
 //   5 = max-steps 熔断（模型每轮都调工具，agent 必须在 N 步后停下）
+//   6 = 中断轮：发若干帧后挂住不发 [DONE]，客户端应被 Ctrl-C 打断
 var mock_mode: i32 = 0;
+// --compat-fold 轮：mock 期望看到「折叠成一条 user 消息」的旧协议
+var mock_expect_fold: bool = false;
+// steer 轮：mock 期望在下一轮请求里看到运行中输入的文本
+var mock_expect_steer: bool = false;
+
+// 供自测断言用的 lflag 位（与 tty.uya 内部常量一致）
+const TTY_LFLAG_TEST_ISIG: u32 = 0x0001;
+const TTY_LFLAG_TEST_ICANON: u32 = 0x0002;
+const TTY_LFLAG_TEST_ECHO: u32 = 0x0008;
+const TTY_LFLAG_TEST_IEXTEN: u32 = 0x8000;
 
 // ============================================================
 // 探针
@@ -253,6 +264,25 @@ fn mock_final_body(out: &Buf, marker: &const byte) bool {
 // ============================================================
 // mock LLM 服务端（跑在 fork 出的子进程里）
 // ============================================================
+fn count_sub(hay: &const Buf, needle: &const byte) i32 {
+    const view: &[byte] = hay.ptr[0: hay.len];
+    const pat: &[byte] = needle[0: strlen(needle)];
+    if pat.len == 0 {
+        return 0;
+    }
+    var n: i32 = 0;
+    var from: usize = 0;
+    while true {
+        const at: isize = find_sub(view, pat, from);
+        if at < 0 {
+            break;
+        }
+        n = n + 1;
+        from = (at as usize) + pat.len;
+    }
+    return n;
+}
+
 fn contains(hay: &const Buf, needle: &const byte) bool {
     const view: &[byte] = hay.ptr[0: hay.len];
     return find_sub(view, needle[0: strlen(needle)], 0) >= 0;
@@ -286,6 +316,88 @@ fn mock_read_request(cfd: i32, rx: &Buf) bool {
             }
         }
     }
+}
+
+// 完整响应体 → 一帧 SSE：把 "message" 键换成 "delta"，补齐 [DONE]。
+// 非流式与流式的响应体除了这个键名之外结构一致，所以这层转换足以让同一份
+// mock 数据同时覆盖两条路径（且 arguments 会一次性给全）。
+fn sse_from_body(body: &const Buf, out: &Buf) bool {
+    var i: usize = 0;
+    while i < body.len {
+        if i + 9 <= body.len && bufx_eq_cstr(&body.ptr[i] as &const byte, 9, "\"message\"") {
+            if !buf_append_cstr(out, "\"delta\"") {
+                return false;
+            }
+            i = i + 9;
+            continue;
+        }
+        if !buf_append_byte(out, body.ptr[i]) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+// 与 mock_send_sse 相同，但**不发 [DONE]**（用于中断/截断测试）
+fn mock_send_sse_nodone(cfd: i32, body: &const Buf) bool {
+    var text: Buf = buf_new(8192);
+    defer { buf_free(&text); }
+    if !buf_append_cstr(&text, "data: ") {
+        return false;
+    }
+    if !sse_from_body(body, &text) {
+        return false;
+    }
+    if !buf_append_cstr(&text, "\n\n") {
+        return false;
+    }
+    var head: Buf = buf_new(256);
+    defer { buf_free(&head); }
+    _ = buf_append_cstr(&head, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n");
+    _ = buf_append_u64_hex(&head, text.len);
+    _ = buf_append_cstr(&head, "\r\n");
+    _ = buf_append(&head, text.ptr, text.len);
+    _ = buf_append_cstr(&head, "\r\n");
+    https_write_all(cfd, &head.ptr[0] as &const byte, head.len) catch {
+        return false;
+    };
+    return true;
+}
+
+// 以 SSE（chunked，两段 chunk）回一个完整响应体
+fn mock_send_sse(cfd: i32, body: &const Buf) bool {
+    var text: Buf = buf_new(8192);
+    defer { buf_free(&text); }
+    if !buf_valid(&text) {
+        return false;
+    }
+    if !buf_append_cstr(&text, "data: ") {
+        return false;
+    }
+    if !sse_from_body(body, &text) {
+        return false;
+    }
+    if !buf_append_cstr(&text, "\n\ndata: [DONE]\n\n") {
+        return false;
+    }
+
+    var head: Buf = buf_new(256);
+    defer { buf_free(&head); }
+    _ = buf_append_cstr(&head, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n");
+    const half: usize = text.len / 2;
+    _ = buf_append_u64_hex(&head, half);
+    _ = buf_append_cstr(&head, "\r\n");
+    _ = buf_append(&head, text.ptr, half);
+    _ = buf_append_cstr(&head, "\r\n");
+    _ = buf_append_u64_hex(&head, text.len - half);
+    _ = buf_append_cstr(&head, "\r\n");
+    _ = buf_append(&head, &text.ptr[half], text.len - half);
+    _ = buf_append_cstr(&head, "\r\n0\r\n\r\n");
+    https_write_all(cfd, &head.ptr[0] as &const byte, head.len) catch {
+        return false;
+    };
+    return true;
 }
 
 fn mock_send(cfd: i32, body: &const Buf) bool {
@@ -481,11 +593,15 @@ fn mock_server(lfd: i32) i32 {
     var round: i32 = 0;
     var verdict: i32 = 0;
     var limit: i32 = 2;
+    var is_stream: bool = false;   // 由每轮请求体决定
     if mock_mode == 3 {
         limit = 1;          // 401 轮：只服务一次，agent 拿到 401 就该退出
     }
     if mock_mode == 5 {
         limit = 3;          // 熔断轮：agent 的 max_steps 是 3
+    }
+    if mock_mode == 6 {
+        limit = 1;          // 中断轮：客户端被打断后不会再发请求，只服务一次
     }
     while round < limit {
         var peer: [byte: 16] = [0: 16];
@@ -499,6 +615,7 @@ fn mock_server(lfd: i32) i32 {
             _ = sys_close(cfd) catch {};
             return 11;
         }
+        is_stream = contains(&rx, "\"stream\":true");
         if mock_mode == 3 {
             // 直接回 401 + 错误体
             var errb: Buf = buf_new(256);
@@ -512,13 +629,35 @@ fn mock_server(lfd: i32) i32 {
             round = round + 1;
             continue;
         }
+        if mock_mode == 6 {
+            // 中断轮：发一帧工具调用后挂 300ms（不发 [DONE]），客户端应被 Ctrl-C 打断
+            var sb6: Buf = buf_new(512);
+            _ = buf_append_cstr(&sb6, "{\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"working on it\",\"tool_calls\":[{\"id\":\"call_x1\",\"type\":\"function\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\\\"note.txt\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}");
+            if !mock_send_sse_nodone(cfd, &sb6) {
+                verdict = 33;
+            }
+            var req6: TimeSpec = TimeSpec{ tv_sec: 0, tv_nsec: 300000000 };
+            var rem6: TimeSpec = TimeSpec{ tv_sec: 0, tv_nsec: 0 };
+            _ = sys_nanosleep(&req6, &rem6) catch {};
+            buf_free(&sb6);
+            buf_free(&rx);
+            _ = sys_close(cfd) catch {};
+            round = round + 1;
+            continue;
+        }
         if mock_mode == 5 {
             // 一直给工具调用：agent 必须靠 max_steps 自己停下
             var sb: Buf = buf_new(2048);
             if !mock_toolcall_body(&sb, true) {
                 verdict = 31;
             }
-            if !mock_send(cfd, &sb) {
+            var sent5: bool = false;
+            if is_stream {
+                sent5 = mock_send_sse(cfd, &sb);
+            } else {
+                sent5 = mock_send(cfd, &sb);
+            }
+            if !sent5 {
                 verdict = 32;
             }
             buf_free(&sb);
@@ -546,7 +685,13 @@ fn mock_server(lfd: i32) i32 {
                 _ = sys_close(cfd) catch {};
                 return 13;
             }
-            if !mock_send(cfd, &body) {
+            var sent_a: bool = false;
+            if is_stream {
+                sent_a = mock_send_sse(cfd, &body);
+            } else {
+                sent_a = mock_send(cfd, &body);
+            }
+            if !sent_a {
                 verdict = 14;
             }
             buf_free(&body);
@@ -555,6 +700,45 @@ fn mock_server(lfd: i32) i32 {
             if mock_mode != 2 {
                 if !contains(&rx, "wrote ") || !contains(&rx, "note.txt") {
                     verdict = 15;
+                }
+            }
+            // P3：运行中用户输入（steer）必须在**下一个 step 的请求**里出现
+            if mock_expect_steer && !contains(&rx, "STEER-MARKER") {
+                verdict = 29;
+            }
+            // P2 严格协议断言：assistant 的 tool_calls 原样回灌 + 每个结果都有配对的
+            // tool_call_id（折叠协议下这些都不该出现，见 --compat-fold 轮）
+            if mock_expect_fold {
+                // 折叠协议：必须有折叠头，且不能出现 role:"tool"
+                if !contains(&rx, "工具执行结果如下") || contains(&rx, "\"role\":\"tool\"") {
+                    verdict = 28;
+                }
+            } else if is_stream {
+                if !contains(&rx, "\"role\":\"assistant\"") || !contains(&rx, "\"tool_calls\"") {
+                    verdict = 23;
+                }
+                if !contains(&rx, "\"role\":\"tool\"") || !contains(&rx, "\"tool_call_id\"") {
+                    verdict = 24;
+                }
+                if !contains(&rx, "\"id\":\"call_") {
+                    verdict = 25;   // 调用 id 必须原样出现在历史里
+                }
+                // 配对数：tools 轮有 4 个调用，其它轮 1 个
+                // 每轮 mock 发出的调用数：shell 轮 2 个（write_file+run_shell）、
+                // no-shell 轮 1 个、tools 轮 4 个、熔断轮沿用 2 个
+                var want_ids: i32 = 2;
+                if mock_mode == 1 {
+                    want_ids = 1;
+                } else if mock_mode == 2 {
+                    want_ids = 4;
+                }
+                const got_ids: i32 = count_sub(&rx, "\"tool_call_id\":\"call_");
+                if got_ids != want_ids {
+                    verdict = 27;
+                }
+                // 折叠协议标记不该出现
+                if contains(&rx, "工具执行结果如下") {
+                    verdict = 26;
                 }
             }
             if mock_expect_shell && mock_mode != 2 {
@@ -592,8 +776,10 @@ fn mock_server(lfd: i32) i32 {
                 }
             }
             var sent: bool = false;
-            if mock_mode == 2 {
-                sent = mock_send_chunked(cfd, &body2);   // 顺便覆盖 chunked 解码
+            if is_stream {
+                sent = mock_send_sse(cfd, &body2);       // 流式路径（内部就是 chunked）
+            } else if mock_mode == 2 {
+                sent = mock_send_chunked(cfd, &body2);   // 非流式 + chunked 解码
             } else {
                 sent = mock_send(cfd, &body2);
             }
@@ -651,9 +837,11 @@ fn file_equals(path: &const byte, expect: &const byte) bool {
     return true;
 }
 
-fn selftest_round(base: &const Config, tag: &const byte, mode: i32, allow_shell: bool, ws: &const byte) bool {
+fn selftest_round(base: &const Config, tag: &const byte, mode: i32, allow_shell: bool, ws: &const byte, stream: bool, fold: bool, steer: bool, interrupt: bool) bool {
     mock_mode = mode;
     mock_expect_shell = allow_shell;
+    mock_expect_fold = fold;
+    mock_expect_steer = steer;
     if !ws_prepare(ws) {
         out_err("selftest: cannot prepare workspace\n");
         return false;
@@ -717,6 +905,8 @@ fn selftest_round(base: &const Config, tag: &const byte, mode: i32, allow_shell:
     }
     c.verify = HC_VERIFY_NONE;
     c.allow_shell = allow_shell;
+    c.stream = stream;
+    c.compat_fold = fold;
     if mode == 5 {
         c.max_steps = 3;      // 熔断轮：mock 每轮都给 tool_calls，agent 必须在 3 步停下
     } else {
@@ -724,7 +914,24 @@ fn selftest_round(base: &const Config, tag: &const byte, mode: i32, allow_shell:
     }
     c.timeout_ms = 15000;
     c.quiet = true;
+    // 会话落到 build/ 下，别污染 ~/.uya-agent
+    c.agent_home = buf_new(64);
+    _ = buf_append_cstr(&c.agent_home, "build/selftest_agent_home");
+    // P3：预置「运行中用户输入」（steer）与「预置 Ctrl-C 按键」
+    inbox_globals_init();
+    if steer {
+        _ = inbox_push(&g_steer, "STEER-MARKER 追加要求", strlen("STEER-MARKER 追加要求"));
+    }
+    g_interactive = interrupt;
+    if interrupt {
+        // 把 Ctrl-C 预先塞进行编辑器的按键队列：第一次 pump 就会取到它
+        tty_init(&tty_ui, 0);
+        var ctrl_c: [byte: 1] = [3: 1];
+        tty_feed(&tty_ui, &ctrl_c[0], 1);
+    }
     const rc: i32 = agent_run(&c);
+    g_interactive = false;
+    inbox_globals_free();
     cfg_free(&c);
 
     var st: i32 = 0;
@@ -753,11 +960,13 @@ fn selftest_round(base: &const Config, tag: &const byte, mode: i32, allow_shell:
         }
         buf_free(&esc_path);
     }
-    const expect_rc: i32 = if mode == 3 || mode == 5 {
-        AGENT_PROTO
-    } else {
-        AGENT_OK
-    };
+    var expect_rc: i32 = AGENT_OK;
+    if mode == 3 || mode == 5 {
+        expect_rc = AGENT_PROTO;
+    }
+    if interrupt {
+        expect_rc = AGENT_INTERRUPTED;
+    }
     if rc != expect_rc {
         out_err("FAIL: agent_run returned ");
         out_err_dec(rc as usize);
@@ -786,15 +995,1203 @@ fn selftest_round(base: &const Config, tag: &const byte, mode: i32, allow_shell:
     return ok;
 }
 
+// ============================================================
+// P1 流式解析自测
+//
+// mock 端发 text/event-stream + chunked，并且**按 19 字节切片、每片间隔 2ms** 写出，
+// 保证客户端读到的是半截帧（chunk 长度行、data 行、JSON 字符串都可能被切开），
+// 从而真正验证 httpstream 的增量解码 + sse 的分帧 + llm 的分片累积。
+// 客户端直接调 llm_stream_chat（不经过 agent_run），逐字段断言 ChatOut。
+// ============================================================
+const SSE_CASE_BASIC: i32 = 0;
+const SSE_CASE_TOOLS: i32 = 1;
+const SSE_CASE_NODONE: i32 = 2;
+const SSE_CASE_BADJSON: i32 = 3;
+const SSE_CASE_REASONING_LENGTH: i32 = 4;
+
+// 写出的切片大小与间隔：小到必然把 SSE 帧切碎
+const SSE_SLICE: usize = 19;
+const SSE_GAP_NS: i64 = 2000000;
+
+var sse_case: i32 = 0;
+
+fn sse_eq(p: &const byte, n: usize, lit: &const byte) bool {
+    return bufx_cstr_len(lit) == n && bufx_mem_eq(p, lit, n);
+}
+
+fn sse_buf_eq(b: &const Buf, lit: &const byte) bool {
+    return sse_eq(b.ptr as &const byte, b.len, lit);
+}
+
+// 把 writer 写好的 payload 当作一帧 data 追加到 out
+fn sse_emit(out: &Buf, w: &const JsonWriter, payload: &Buf) bool {
+    if jw_overflow(w) {
+        return false;
+    }
+    payload.len = jw_used(w);
+    if !buf_append_cstr(out, "data: ") {
+        return false;
+    }
+    if !buf_append(out, payload.ptr, payload.len) {
+        return false;
+    }
+    return buf_append_cstr(out, "\n\n");
+}
+
+// {"choices":[{"index":0,"delta":{"content"|"reasoning_content":"<text>"}}]}
+fn sse_delta_text(out: &Buf, payload: &Buf, text: &const byte, reasoning: bool) bool {
+    var w: JsonWriter = JsonWriter{ buf: null, cap: 0, used: 0, overflow: false };
+    jw_init(&w, payload.ptr, payload.cap);
+    jw_byte(&w, 123);
+    jw_key(&w, "choices");
+    jw_byte(&w, 91);
+    jw_byte(&w, 123);
+    jw_key(&w, "index");
+    jw_i64(&w, 0);
+    jw_byte(&w, 44);
+    jw_key(&w, "delta");
+    jw_byte(&w, 123);
+    if reasoning {
+        jw_key(&w, "reasoning_content");
+    } else {
+        jw_key(&w, "content");
+    }
+    jw_str_cstr(&w, text);
+    jw_byte(&w, 125);
+    jw_byte(&w, 125);
+    jw_byte(&w, 93);
+    jw_byte(&w, 125);
+    return sse_emit(out, &w, payload);
+}
+
+// {"choices":[{"index":0,"delta":{"tool_calls":[{"index":N,"id":…,"function":{…}}]}}]}
+fn sse_delta_tool(out: &Buf, payload: &Buf, index: i64, id: &const byte, name: &const byte, args_frag: &const byte) bool {
+    var w: JsonWriter = JsonWriter{ buf: null, cap: 0, used: 0, overflow: false };
+    jw_init(&w, payload.ptr, payload.cap);
+    jw_byte(&w, 123);
+    jw_key(&w, "choices");
+    jw_byte(&w, 91);
+    jw_byte(&w, 123);
+    jw_key(&w, "index");
+    jw_i64(&w, 0);
+    jw_byte(&w, 44);
+    jw_key(&w, "delta");
+    jw_byte(&w, 123);
+    jw_key(&w, "tool_calls");
+    jw_byte(&w, 91);
+    jw_byte(&w, 123);
+    jw_key(&w, "index");
+    jw_i64(&w, index);
+    if bufx_cstr_len(id) > 0 {
+        jw_byte(&w, 44);
+        jw_key(&w, "id");
+        jw_str_cstr(&w, id);
+    }
+    jw_byte(&w, 44);
+    jw_key(&w, "function");
+    jw_byte(&w, 123);
+    if bufx_cstr_len(name) > 0 {
+        jw_key(&w, "name");
+        jw_str_cstr(&w, name);
+        jw_byte(&w, 44);
+    }
+    jw_key(&w, "arguments");
+    jw_str_cstr(&w, args_frag);
+    jw_byte(&w, 125);
+    jw_byte(&w, 125);
+    jw_byte(&w, 93);
+    jw_byte(&w, 125);
+    jw_byte(&w, 125);
+    jw_byte(&w, 93);
+    jw_byte(&w, 125);
+    return sse_emit(out, &w, payload);
+}
+
+// finish 帧：{"choices":[{"index":0,"delta":{},"finish_reason":"<why>"}][,"usage":{…}]}
+fn sse_finish(out: &Buf, payload: &Buf, why: &const byte, with_usage: bool) bool {
+    var w: JsonWriter = JsonWriter{ buf: null, cap: 0, used: 0, overflow: false };
+    jw_init(&w, payload.ptr, payload.cap);
+    jw_byte(&w, 123);
+    jw_key(&w, "choices");
+    jw_byte(&w, 91);
+    jw_byte(&w, 123);
+    jw_key(&w, "index");
+    jw_i64(&w, 0);
+    jw_byte(&w, 44);
+    jw_key(&w, "delta");
+    jw_byte(&w, 123);
+    jw_byte(&w, 125);
+    jw_byte(&w, 44);
+    jw_key(&w, "finish_reason");
+    jw_str_cstr(&w, why);
+    jw_byte(&w, 125);
+    jw_byte(&w, 93);
+    if with_usage {
+        jw_byte(&w, 44);
+        jw_key(&w, "usage");
+        jw_byte(&w, 123);
+        jw_key(&w, "prompt_tokens");
+        jw_i64(&w, 100);
+        jw_byte(&w, 44);
+        jw_key(&w, "completion_tokens");
+        jw_i64(&w, 7);
+        jw_byte(&w, 44);
+        jw_key(&w, "prompt_tokens_details");
+        jw_byte(&w, 123);
+        jw_key(&w, "cached_tokens");
+        jw_i64(&w, 40);
+        jw_byte(&w, 125);
+        jw_byte(&w, 44);
+        jw_key(&w, "completion_tokens_details");
+        jw_byte(&w, 123);
+        jw_key(&w, "reasoning_tokens");
+        jw_i64(&w, 3);
+        jw_byte(&w, 125);
+        jw_byte(&w, 125);
+    }
+    jw_byte(&w, 125);
+    return sse_emit(out, &w, payload);
+}
+
+// usage-only 帧：{"choices":[],"usage":{…}}
+fn sse_usage_only(out: &Buf, payload: &Buf) bool {
+    var w: JsonWriter = JsonWriter{ buf: null, cap: 0, used: 0, overflow: false };
+    jw_init(&w, payload.ptr, payload.cap);
+    jw_byte(&w, 123);
+    jw_key(&w, "choices");
+    jw_byte(&w, 91);
+    jw_byte(&w, 93);
+    jw_byte(&w, 44);
+    jw_key(&w, "usage");
+    jw_byte(&w, 123);
+    jw_key(&w, "prompt_tokens");
+    jw_i64(&w, 100);
+    jw_byte(&w, 44);
+    jw_key(&w, "completion_tokens");
+    jw_i64(&w, 7);
+    jw_byte(&w, 125);
+    jw_byte(&w, 125);
+    return sse_emit(out, &w, payload);
+}
+
+fn sse_raw_frame(out: &Buf, text: &const byte) bool {
+    if !buf_append_cstr(out, "data: ") {
+        return false;
+    }
+    if !buf_append_cstr(out, text) {
+        return false;
+    }
+    return buf_append_cstr(out, "\n\n");
+}
+
+// 生成一整个 SSE 文本（未分块）
+fn sse_mock_text(case_id: i32, out: &Buf, payload: &Buf) bool {
+    if case_id == SSE_CASE_BASIC {
+        if !sse_delta_text(out, payload, "", false) { return false; }
+        if !sse_delta_text(out, payload, "Hello", false) { return false; }
+        if !sse_delta_text(out, payload, ", Uya!", false) { return false; }
+        if !sse_finish(out, payload, "stop", true) { return false; }
+        if !sse_usage_only(out, payload) { return false; }
+        return sse_raw_frame(out, "[DONE]");
+    }
+    if case_id == SSE_CASE_TOOLS {
+        if !sse_delta_text(out, payload, "I will read it", false) { return false; }
+        if !sse_delta_tool(out, payload, 0, "call_a", "read", "") { return false; }
+        if !sse_delta_tool(out, payload, 1, "call_b", "bash", "") { return false; }
+        // arguments 分片：拼起来必须是 {"file_path":"a.txt"}
+        if !sse_delta_tool(out, payload, 0, "", "", "{\"file") { return false; }
+        if !sse_delta_tool(out, payload, 1, "", "", "{\"command\":\"ls") { return false; }
+        if !sse_delta_tool(out, payload, 0, "", "", "_path\":\"a.txt\"}") { return false; }
+        if !sse_delta_tool(out, payload, 1, "", "", "\"}") { return false; }
+        if !sse_finish(out, payload, "tool_calls", false) { return false; }
+        return sse_raw_frame(out, "[DONE]");
+    }
+    if case_id == SSE_CASE_NODONE {
+        if !sse_delta_text(out, payload, "partial", false) { return false; }
+        if !sse_finish(out, payload, "stop", false) { return false; }
+        return true;   // 故意不发 [DONE]
+    }
+    if case_id == SSE_CASE_BADJSON {
+        if !sse_delta_text(out, payload, "before-bad", false) { return false; }
+        if !sse_raw_frame(out, "{\"choices\":[{\"index\":0,") { return false; }
+        return sse_raw_frame(out, "[DONE]");
+    }
+    // SSE_CASE_REASONING_LENGTH
+    if !sse_delta_text(out, payload, "think1", true) { return false; }
+    if !sse_delta_text(out, payload, "think2", true) { return false; }
+    if !sse_delta_text(out, payload, "cut", false) { return false; }
+    return sse_finish(out, payload, "length", false);
+}
+
+// mock 端：一次连接，回 SSE（chunked + 受控切片）
+fn sse_mock_server(lfd: i32) i32 {
+    var peer: [byte: 16] = [0: 16];
+    var alen: u32 = 16;
+    const cfd: i32 = sys_accept(lfd, &peer[0] as &void, &alen) catch {
+        _ = sys_close(lfd) catch {};
+        return 40;
+    };
+    var rx: Buf = buf_new(8192);
+    var verdict: i32 = 0;
+    if !mock_read_request(cfd, &rx) {
+        verdict = 41;
+    } else if !contains(&rx, "\"stream\":true") {
+        verdict = 42;   // 必须是流式请求
+    } else if !contains(&rx, "Accept: text/event-stream") {
+        verdict = 43;
+    }
+    buf_free(&rx);
+
+    var text: Buf = buf_new(16384);
+    var payload: Buf = buf_new(4096);
+    if verdict == 0 {
+        if !sse_mock_text(sse_case, &text, &payload) {
+            verdict = 44;
+        }
+    }
+
+    // SSE 文本 → chunked 分帧（每 37 字节一个 chunk，切点必然落在帧中间）
+    var wire: Buf = buf_new(32768);
+    if verdict == 0 {
+        var off: usize = 0;
+        while off < text.len {
+            var take: usize = text.len - off;
+            if take > 37 {
+                take = 37;
+            }
+            _ = buf_append_u64_hex(&wire, take);
+            _ = buf_append_cstr(&wire, "\r\n");
+            _ = buf_append(&wire, &text.ptr[off], take);
+            _ = buf_append_cstr(&wire, "\r\n");
+            off = off + take;
+        }
+        _ = buf_append_cstr(&wire, "0\r\n\r\n");
+    }
+
+    if verdict == 0 {
+        var head: Buf = buf_new(256);
+        _ = buf_append_cstr(&head, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n");
+        const hw: !void = https_write_all(cfd, &head.ptr[0] as &const byte, head.len);
+        _ = hw catch {
+            verdict = 45;
+        };
+        buf_free(&head);
+    }
+
+    if verdict == 0 {
+        var woff: usize = 0;
+        while woff < wire.len {
+            var take: usize = wire.len - woff;
+            if take > SSE_SLICE {
+                take = SSE_SLICE;
+            }
+            const w: !void = https_write_all(cfd, &wire.ptr[woff] as &const byte, take);
+            _ = w catch {
+                verdict = 46;
+                break;
+            };
+            woff = woff + take;
+            if woff < wire.len {
+                var req: TimeSpec = TimeSpec{ tv_sec: 0, tv_nsec: SSE_GAP_NS };
+                var rem: TimeSpec = TimeSpec{ tv_sec: 0, tv_nsec: 0 };
+                _ = sys_nanosleep(&req, &rem) catch {};
+            }
+        }
+    }
+
+    buf_free(&wire);
+    buf_free(&text);
+    buf_free(&payload);
+    _ = sys_close(cfd) catch {};
+    _ = sys_close(lfd) catch {};
+    return verdict;
+}
+
+// 客户端：调一次 llm_stream_chat。返回 0=成功 1=malformed 2=stream-closed 3=其它错误 4=状态码非 200
+fn sse_call(url: &[byte], hdrs: &[byte], body: &const Buf, o: &ChatOut) i32 {
+    var empty_pin: [byte: 0] = [];
+    const res: !i32 = llm_stream_chat(
+        url,
+        hdrs,
+        body.ptr as &const byte,
+        body.len,
+        15000,
+        262144,
+        HC_VERIFY_NONE,
+        &empty_pin[0: 0],
+        o,
+        false,
+        false,
+        false
+    );
+    const status: i32 = res catch |err| {
+        const eid: i32 = (@error_id(err) as! i32).value;
+        var r: i32 = 3;
+        if eid == @error_id(error.LlmMalformed) {
+            r = 1;
+        } else if eid == @error_id(error.LlmStreamClosed) {
+            r = 2;
+        }
+        r;
+    };
+    if status == 0 || status == 1 || status == 2 {
+        return status;
+    }
+    if status != 200 {
+        return 4;
+    }
+    return 0;
+}
+
+fn sse_round(case_id: i32, tag: &const byte) bool {
+    sse_case = case_id;
+    const lfd: i32 = sys_socket(AF_INET, SOCK_STREAM, IPPROTO_TCP) catch {
+        out_err("selftest: socket() failed\n");
+        return false;
+    };
+    var one: i32 = 1;
+    _ = sys_setsockopt(lfd, SOL_SOCKET, SO_REUSEADDR, &one as &void, 4 as u32) catch {};
+    var addr: [byte: 16] = [0: 16];
+    fill_sockaddr_ipv4(127, 0, 0, 1, 0, &addr[0]);
+    _ = sys_bind(lfd, &addr[0] as &void, 16 as u32) catch {
+        _ = sys_close(lfd) catch {};
+        out_err("selftest: bind() failed\n");
+        return false;
+    };
+    _ = sys_listen(lfd, 4) catch {
+        _ = sys_close(lfd) catch {};
+        out_err("selftest: listen() failed\n");
+        return false;
+    };
+    var got: [byte: 16] = [0: 16];
+    var glen: u32 = 16;
+    _ = sys_getsockname(lfd, &got[0] as &void, &glen) catch {
+        _ = sys_close(lfd) catch {};
+        out_err("selftest: getsockname() failed\n");
+        return false;
+    };
+    const port: u16 = ((got[2] as u16) << (8 as i32)) | (got[3] as u16);
+
+    const pid64: i64 = sys_fork() catch {
+        _ = sys_close(lfd) catch {};
+        out_err("selftest: fork() failed\n");
+        return false;
+    };
+    if pid64 == 0 {
+        const rc: i32 = sse_mock_server(lfd);
+        sys_exit(rc);
+    }
+    const pid: i32 = i64_to_i32(pid64);
+    _ = sys_close(lfd) catch {};
+
+    var url: Buf = buf_new(96);
+    _ = buf_append_cstr(&url, "http://127.0.0.1:");
+    _ = buf_append_u64(&url, port as u64);
+    _ = buf_append_cstr(&url, "/v1/chat/completions");
+    var hdrs: Buf = buf_new(128);
+    _ = buf_append_cstr(&hdrs, "Content-Type: application/json\r\nAccept: text/event-stream\r\n");
+    var body: Buf = buf_new(256);
+    _ = buf_append_cstr(&body, "{\"model\":\"selftest-model\",\"stream\":true,\"messages\":[]}");
+
+    var o: ChatOut = chat_out_new();
+    const call_rc: i32 = sse_call(url.ptr[0: url.len], hdrs.ptr[0: hdrs.len], &body, &o);
+
+    var st: i32 = 0;
+    _ = sys_waitpid(pid, &st, 0) catch {};
+    const mock_rc: i32 = (st >> (8 as i32)) & 255;
+
+    var ok: bool = true;
+    if mock_rc != 0 {
+        out_err("selftest[");
+        out_err(tag);
+        out_err("] FAIL: mock verdict ");
+        out_err_dec(mock_rc as usize);
+        out_err("\n");
+        ok = false;
+    }
+
+    if ok && case_id == SSE_CASE_BASIC {
+        if call_rc != 0 || !o.saw_done || o.finish != LLM_FINISH_STOP {
+            out_err("selftest[");
+            out_err(tag);
+            out_err("] FAIL: call_rc/finish");
+            out_err("\n");
+            ok = false;
+        } else if !sse_buf_eq(&o.content, "Hello, Uya!") {
+            out_err("selftest[");
+            out_err(tag);
+            out_err("] FAIL: content=");
+            out_err_bytes(o.content.ptr as &const byte, o.content.len);
+            out_err("\n");
+            ok = false;
+        } else if o.usage_in != 60 || o.usage_out != 7 || o.usage_cache_read != 40 || o.usage_reasoning != 3 {
+            out_err("selftest[");
+            out_err(tag);
+            out_err("] FAIL: usage");
+            out_err("\n");
+            ok = false;
+        } else if o.ncalls != 0 {
+            out_err("selftest[");
+            out_err(tag);
+            out_err("] FAIL: unexpected tool_calls");
+            out_err("\n");
+            ok = false;
+        }
+    } else if ok && case_id == SSE_CASE_TOOLS {
+        if call_rc != 0 || !o.saw_done || o.finish != LLM_FINISH_TOOL_CALLS {
+            out_err("selftest[");
+            out_err(tag);
+            out_err("] FAIL: call_rc/finish");
+            out_err("\n");
+            ok = false;
+        } else if o.ncalls != 2 {
+            out_err("selftest[");
+            out_err(tag);
+            out_err("] FAIL: ncalls=");
+            out_err_dec(o.ncalls);
+            out_err("\n");
+            ok = false;
+        } else if !sse_buf_eq(&o.calls[0].id, "call_a") || !sse_buf_eq(&o.calls[0].name, "read")
+            || !sse_buf_eq(&o.calls[0].args, "{\"file_path\":\"a.txt\"}") {
+            out_err("selftest[");
+            out_err(tag);
+            out_err("] FAIL: call0=");
+            out_err_bytes(o.calls[0].args.ptr as &const byte, o.calls[0].args.len);
+            out_err("\n");
+            ok = false;
+        } else if !sse_buf_eq(&o.calls[1].id, "call_b") || !sse_buf_eq(&o.calls[1].name, "bash")
+            || !sse_buf_eq(&o.calls[1].args, "{\"command\":\"ls\"}") {
+            out_err("selftest[");
+            out_err(tag);
+            out_err("] FAIL: call1=");
+            out_err_bytes(o.calls[1].args.ptr as &const byte, o.calls[1].args.len);
+            out_err("\n");
+            ok = false;
+        } else if !sse_buf_eq(&o.content, "I will read it") {
+            out_err("selftest[");
+            out_err(tag);
+            out_err("] FAIL: content");
+            out_err("\n");
+            ok = false;
+        }
+    } else if ok && case_id == SSE_CASE_NODONE {
+        if call_rc != 2 {
+            out_err("selftest[");
+            out_err(tag);
+            out_err("] FAIL: expected LlmStreamClosed, got ");
+            out_err_dec(call_rc as usize);
+            out_err("\n");
+            ok = false;
+        } else if !sse_buf_eq(&o.content, "partial") {
+            out_err("selftest[");
+            out_err(tag);
+            out_err("] FAIL: content before truncation");
+            out_err("\n");
+            ok = false;
+        }
+    } else if ok && case_id == SSE_CASE_BADJSON {
+        if call_rc != 1 {
+            out_err("selftest[");
+            out_err(tag);
+            out_err("] FAIL: expected LlmMalformed, got ");
+            out_err_dec(call_rc as usize);
+            out_err("\n");
+            ok = false;
+        } else if o.err_text.len == 0 {
+            out_err("selftest[");
+            out_err(tag);
+            out_err("] FAIL: no err_text");
+            out_err("\n");
+            ok = false;
+        } else if !sse_buf_eq(&o.content, "before-bad") {
+            out_err("selftest[");
+            out_err(tag);
+            out_err("] FAIL: content before bad frame");
+            out_err("\n");
+            ok = false;
+        }
+    } else if ok && case_id == SSE_CASE_REASONING_LENGTH {
+        if call_rc != 2 {
+            // 这一轮故意不发 [DONE]，所以是 stream-closed
+            out_err("selftest[");
+            out_err(tag);
+            out_err("] FAIL: expected LlmStreamClosed, got ");
+            out_err_dec(call_rc as usize);
+            out_err("\n");
+            ok = false;
+        } else if !sse_buf_eq(&o.reasoning, "think1think2") {
+            out_err("selftest[");
+            out_err(tag);
+            out_err("] FAIL: reasoning=");
+            out_err_bytes(o.reasoning.ptr as &const byte, o.reasoning.len);
+            out_err("\n");
+            ok = false;
+        } else if o.finish != LLM_FINISH_MAX_TOKENS {
+            out_err("selftest[");
+            out_err(tag);
+            out_err("] FAIL: finish != max-tokens");
+            out_err("\n");
+            ok = false;
+        }
+    }
+
+    chat_out_free(&o);
+    buf_free(&url);
+    buf_free(&hdrs);
+    buf_free(&body);
+    if ok {
+        out_err("selftest[");
+        out_err(tag);
+        out_err("] ok\n");
+    }
+    return ok;
+}
+
+
+// ============================================================
+// P3 终端层自测（不需要真 TTY：行编辑器是纯字节流逻辑，转义序列可以分片喂）
+// ============================================================
+fn ty_fail(tag: &const byte, what: &const byte, ok: &bool) void {
+    out_err("selftest[");
+    out_err(tag);
+    out_err("] FAIL: ");
+    out_err(what);
+    out_err("\n");
+    ok[0] = false;
+}
+
+fn ty_feed_cstr(ui: &TtyUi, s: &const byte) void {
+    tty_feed(ui, s, bufx_cstr_len(s));
+}
+
+// 喂单个字节：必须用数组取址，&"\x1b"[0:1] 是**切片**不是指针
+fn ty_feed_byte1(ui: &TtyUi, b: byte) void {
+    var one: [byte: 1] = [0: 1];
+    one[0] = b;
+    tty_feed(ui, &one[0], 1);
+}
+
+fn ty_line_is(ui: &const TtyUi, want: &const byte) bool {
+    const n: usize = bufx_cstr_len(want);
+    if ui.line.len != n {
+        return false;
+    }
+    return bufx_mem_eq(ui.line.ptr as &const byte, want, n);
+}
+
+fn ty_line_dump(ui: &const TtyUi) void {
+    out_err("[");
+    out_err_bytes(ui.line.ptr as &const byte, ui.line.len);
+    out_err("]");
+}
+
+fn tty_round(tag: &const byte) bool {
+    var ok: bool = true;
+
+    // ---- ABI：termios / winsize 布局与 raw 位运算 ----
+    const tsz: usize = @size_of(TtyTermios) as usize;
+    if tsz != 60 {
+        ty_fail(tag, "TtyTermios 布局不是 60 字节", &ok);
+    }
+    const wsz: usize = @size_of(TtyWinsize) as usize;
+    if wsz != 8 {
+        ty_fail(tag, "TtyWinsize 布局不是 8 字节", &ok);
+    }
+    const all: u32 = 0xFFFFFFFF;
+    const lc: u32 = tty_raw_lflag_clear(all);
+    if (lc & TTY_LFLAG_TEST_ISIG) != 0 || (lc & TTY_LFLAG_TEST_ICANON) != 0
+        || (lc & TTY_LFLAG_TEST_ECHO) != 0 || (lc & TTY_LFLAG_TEST_IEXTEN) != 0 {
+        ty_fail(tag, "raw 模式没有清掉 lflag 位", &ok);
+    }
+    const keep_bit: u32 = 0x00000010;
+    if (lc & keep_bit) == 0 {
+        ty_fail(tag, "raw 模式误清了无关位", &ok);
+    }
+    const ic: u32 = tty_raw_iflag_clear(all);
+    const icrnl: u32 = 0x00000100;
+    const ixon: u32 = 0x00000400;
+    if (ic & icrnl) != 0 || (ic & ixon) != 0 {
+        ty_fail(tag, "raw 模式没有清掉 iflag 位", &ok);
+    }
+
+    // ---- 行编辑 ----
+    var ui: TtyUi = tty_ui;
+    tty_init(&ui, 0);   // 自测环境下 fd 0 不是 TTY → 只测编辑逻辑，不做渲染
+
+    // 输入 + 回车 → SUBMIT
+    ty_feed_cstr(&ui, "abc");
+    ty_feed_cstr(&ui, "\r");
+    if tty_next_event(&ui) != TTY_EV_SUBMIT {
+        ty_fail(tag, "回车没有产生 SUBMIT", &ok);
+    }
+    if !ty_line_is(&ui, "abc") {
+        ty_fail(tag, "提交的行内容不对", &ok);
+        ty_line_dump(&ui);
+    }
+    tty_line_clear(&ui);
+
+    // 退格
+    ty_feed_cstr(&ui, "abX");
+    ty_feed_cstr(&ui, "\x7f");
+    if !ty_line_is(&ui, "ab") {
+        ty_fail(tag, "退格没删掉最后一个字符", &ok);
+        ty_line_dump(&ui);
+    }
+    tty_line_clear(&ui);
+
+    // 左移 + 插入：ac ← + b → abc
+    ty_feed_cstr(&ui, "ac");
+    ty_feed_cstr(&ui, "\x1b[D");
+    ty_feed_cstr(&ui, "b");
+    if !ty_line_is(&ui, "abc") {
+        ty_fail(tag, "左移插入结果不是 abc", &ok);
+        ty_line_dump(&ui);
+    }
+    tty_line_clear(&ui);
+
+    // Delete 键（ESC [ 3 ~）
+    ty_feed_cstr(&ui, "abc");
+    ty_feed_cstr(&ui, "\x1b[D\x1b[D");   // 光标到 'b' 前
+    ty_feed_cstr(&ui, "\x1b[3~");        // 删 'b'
+    if !ty_line_is(&ui, "ac") {
+        ty_fail(tag, "Delete 键没有删掉光标处字符", &ok);
+        ty_line_dump(&ui);
+    }
+    tty_line_clear(&ui);
+
+    // 转义序列**分片**喂入（状态必须跨调用保持）
+    ty_feed_cstr(&ui, "xy");
+    ty_feed_byte1(&ui, 27);
+    ty_feed_byte1(&ui, 91);
+    ty_feed_byte1(&ui, 68);
+    ty_feed_cstr(&ui, "z");
+    if !ty_line_is(&ui, "xzy") {
+        ty_fail(tag, "分片转义序列状态丢了", &ok);
+        ty_line_dump(&ui);
+    }
+    tty_line_clear(&ui);
+
+    // 裸 ESC → ESC 事件（中断意图）；由 tty_flush_esc 在一次读取结束时判定
+    ty_feed_cstr(&ui, "\x1b");
+    tty_flush_esc(&ui);
+    if tty_next_event(&ui) != TTY_EV_ESC {
+        ty_fail(tag, "裸 ESC 没有产生 ESC 事件", &ok);
+    }
+
+    // Ctrl-C / Ctrl-U / Ctrl-D
+    ty_feed_cstr(&ui, "keep");
+    ty_feed_cstr(&ui, "\x03");
+    if tty_next_event(&ui) != TTY_EV_CTRL_C {
+        ty_fail(tag, "Ctrl-C 没有产生事件", &ok);
+    }
+    if !ty_line_is(&ui, "keep") {
+        ty_fail(tag, "Ctrl-C 不该清掉已输入文本（由调用方决定）", &ok);
+    }
+    ty_feed_cstr(&ui, "\x15");   // Ctrl-U
+    if tty_next_event(&ui) != TTY_EV_CLEARED || ui.line.len != 0 {
+        ty_fail(tag, "Ctrl-U 没有清行", &ok);
+    }
+    ty_feed_cstr(&ui, "\x04");   // 空行 Ctrl-D
+    if tty_next_event(&ui) != TTY_EV_EOF {
+        ty_fail(tag, "空行 Ctrl-D 没有产生 EOF", &ok);
+    }
+    // 非空 Ctrl-D = 删光标处字符（先把光标左移，行尾 Ctrl-D 本就不该删）
+    ty_feed_cstr(&ui, "ab");
+    ty_feed_cstr(&ui, "\x1b[D");
+    ty_feed_cstr(&ui, "\x04");
+    if !ty_line_is(&ui, "a") {
+        ty_fail(tag, "非空 Ctrl-D 应删除光标处字符", &ok);
+        ty_line_dump(&ui);
+    }
+    // 行尾 Ctrl-D 不应改动内容
+    tty_line_clear(&ui);
+    ty_feed_cstr(&ui, "ab");
+    ty_feed_cstr(&ui, "\x04");
+    if !ty_line_is(&ui, "ab") {
+        ty_fail(tag, "行尾 Ctrl-D 不该改动内容", &ok);
+        ty_line_dump(&ui);
+    }
+    tty_line_clear(&ui);
+
+    // Ctrl-W 删词
+    ty_feed_cstr(&ui, "foo bar");
+    ty_feed_cstr(&ui, "\x17");
+    if !ty_line_is(&ui, "foo ") {
+        ty_fail(tag, "Ctrl-W 没有删掉一个词", &ok);
+        ty_line_dump(&ui);
+    }
+    tty_line_clear(&ui);
+
+    // 历史：提交 one → 输入 two → Up 回到 one → Down 回到 two
+    ty_feed_cstr(&ui, "one");
+    ty_feed_cstr(&ui, "\r");
+    _ = tty_next_event(&ui);
+    tty_line_clear(&ui);   // 真实调用方在消费 SUBMIT 后清行
+    ty_feed_cstr(&ui, "two");
+    ty_feed_cstr(&ui, "\x1b[A");
+    if !ty_line_is(&ui, "one") {
+        ty_fail(tag, "上翻历史没有取到上一条", &ok);
+        ty_line_dump(&ui);
+    }
+    ty_feed_cstr(&ui, "\x1b[B");
+    if !ty_line_is(&ui, "two") {
+        ty_fail(tag, "下翻历史没有回到暂存行", &ok);
+        ty_line_dump(&ui);
+    }
+    // 前面已经提交过 "abc" 与 "one" 两次，所以历史里应有 2 条
+    if ui.hist_len != 2 {
+        ty_fail(tag, "历史条数不对", &ok);
+    }
+    tty_free(&ui);
+
+    // 一次喂入多行（粘贴）：必须一行一个 SUBMIT，剩下的一行留在 pend 里等下次处理
+    tty_line_clear(&ui);
+    while tty_next_event(&ui) != TTY_EV_NONE {
+    }
+    ty_feed_cstr(&ui, "a\nb\n");
+    if tty_next_event(&ui) != TTY_EV_SUBMIT {
+        ty_fail(tag, "粘贴多行时第一行没有产生 SUBMIT", &ok);
+    }
+    if !ty_line_is(&ui, "a") {
+        ty_fail(tag, "粘贴多行时第一行内容不对", &ok);
+        ty_line_dump(&ui);
+    }
+    if !tty_has_pending(&ui) {
+        ty_fail(tag, "第二行没有留在 pend 缓冲里", &ok);
+    }
+    tty_line_clear(&ui);
+    var no_more: [byte: 0] = [];
+    tty_feed(&ui, &no_more[0: 0], 0);
+    if tty_next_event(&ui) != TTY_EV_SUBMIT {
+        ty_fail(tag, "pend 里的第二行没有产生 SUBMIT", &ok);
+    }
+    if !ty_line_is(&ui, "b") {
+        ty_fail(tag, "pend 里的第二行内容不对", &ok);
+        ty_line_dump(&ui);
+    }
+    tty_line_clear(&ui);
+
+    // 中断时保留「非空白前缀」的规则（DSH 语义）
+    const trim_in: &const byte = "abc  \n\t " as &const byte;
+    const trimmed: usize = agent_trim_trailing_ws(trim_in, 8);
+    if trimmed != 3 {
+        ty_fail(tag, "尾部空白没有被裁掉", &ok);
+    }
+    const all_ws: &const byte = "  \n" as &const byte;
+    if agent_trim_trailing_ws(all_ws, 3) != 0 {
+        ty_fail(tag, "全空白应裁成 0", &ok);
+    }
+    const none_ws: &const byte = "keep" as &const byte;
+    if agent_trim_trailing_ws(none_ws, 4) != 4 {
+        ty_fail(tag, "无尾部空白不该改动长度", &ok);
+    }
+
+    if ok {
+        out_err("selftest[");
+        out_err(tag);
+        out_err("] ok\n");
+    }
+    return ok;
+}
+
+
+// ============================================================
+// P4 会话自测：写日志 → 逐行校验 → 崩溃尾部裁剪 → 恢复重建历史
+// ============================================================
+fn sess_round(tag: &const byte) bool {
+    var ok: bool = true;
+    var home: Buf = buf_new(512);
+    defer { buf_free(&home); }
+    _ = buf_append_cstr(&home, "build/selftest_sess_home");
+    _ = buf_append_byte(&home, 0);
+    _ = sess_mkdir_p(home.ptr as &const byte);
+    // 清掉旧文件，保证这一轮是干净的
+    var idx: Buf = buf_new(600);
+    defer { buf_free(&idx); }
+    _ = buf_append_cstr(&idx, "build/selftest_sess_home/index.jsonl");
+    _ = buf_append_byte(&idx, 0);
+    _ = sys_unlink(idx.ptr as *const byte) catch {};
+
+    // ---- 1) 写：header + 若干事件 ----
+    var log: SessionLog = sess_log_empty();
+    defer { sess_log_free(&log); }
+    if !sess_open(&log, "build/selftest_sess_home", "build/selftest_sess_ws", "selftest-model", "uya-agent", "", true, 0 as i64, true) {
+        out_err("selftest[");
+        out_err(tag);
+        out_err("] FAIL: sess_open\\n");
+        return false;
+    }
+    if log.id.len < 10 || log.path.len == 0 {
+        ty_fail(tag, "会话 id/路径没生成", &ok);
+    }
+    var ev: Buf = buf_new(4096);
+    defer { buf_free(&ev); }
+    // user/message
+    if !sess_begin(&log, "user/message", &ev) {
+        ty_fail(tag, "sess_begin 失败", &ok);
+    }
+    _ = buf_append_cstr(&ev, "{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":");
+    _ = jw_str_into(&ev, "写一个 hello\n带换行 \"引号\"", bufx_cstr_len("写一个 hello\n带换行 \"引号\""));
+    _ = buf_append_cstr(&ev, "}],\"source\":{\"kind\":\"user\"}}");
+    _ = sess_end(&log, &ev);
+    // assistant/message（带 tool_calls，arguments 里有转义）
+    if !sess_begin(&log, "assistant/message", &ev) {
+        ty_fail(tag, "assistant 事件开始失败", &ok);
+    }
+    _ = buf_append_cstr(&ev, "{\"turn\":1,\"step\":1,\"message\":{\"role\":\"assistant\",\"content\":\"我来写\",\"tool_calls\":[{\"id\":\"call_s1\",\"type\":\"function\",\"function\":{\"name\":\"write_file\",\"arguments\":");
+    _ = jw_str_into(&ev, "{\"path\":\"note.txt\",\"content\":\"hello\"}", bufx_cstr_len("{\"path\":\"note.txt\",\"content\":\"hello\"}"));
+    _ = buf_append_cstr(&ev, "}}]},\"usage\":{\"inputTokens\":7}}");
+    _ = sess_end(&log, &ev);
+    // tool/result
+    if !sess_begin(&log, "tool/result", &ev) {
+        ty_fail(tag, "tool/result 事件开始失败", &ok);
+    }
+    _ = buf_append_cstr(&ev, "{\"turn\":1,\"step\":1,\"callId\":\"call_s1\",\"content\":");
+    _ = jw_str_into(&ev, "wrote 5 bytes", bufx_cstr_len("wrote 5 bytes"));
+    _ = buf_append_cstr(&ev, "}");
+    _ = sess_end(&log, &ev);
+    buf_reset(&log.title);
+    _ = buf_append_cstr(&log.title, "写一个 hello");
+    if log.events != 3 {
+        ty_fail(tag, "事件计数不对", &ok);
+    }
+    var id_copy: Buf = buf_new(64);
+    defer { buf_free(&id_copy); }
+    _ = buf_append(&id_copy, log.id.ptr, log.id.len);
+    var path_copy: Buf = buf_new(1200);
+    defer { buf_free(&path_copy); }
+    _ = buf_append(&path_copy, log.path.ptr, log.path.len);
+    _ = buf_append_byte(&path_copy, 0);
+    sess_close(&log, "build/selftest_sess_home");
+
+    // ---- 2) 读回：header、逐行事件、字段还原 ----
+    var r: SessReader = sess_reader_empty();
+    defer { sess_reader_free(&r); }
+    if !sess_reader_load(path_copy.ptr as &const byte, &r) {
+        ty_fail(tag, "会话文件读不回来", &ok);
+        return ok;
+    }
+    if !r.header_ok || r.id.len == 0 {
+        ty_fail(tag, "header 没解析出来", &ok);
+    }
+    if !bufx_eq_cstr(r.id.ptr as &const byte, r.id.len, id_copy.ptr as &const byte) && r.id.len != id_copy.len {
+        ty_fail(tag, "header id 与写入不一致", &ok);
+    }
+    var line: Buf = buf_new(8192);
+    defer { buf_free(&line); }
+    var typ: Buf = buf_new(64);
+    defer { buf_free(&typ); }
+    var text: Buf = buf_new(8192);
+    defer { buf_free(&text); }
+    var args: Buf = buf_new(8192);
+    defer { buf_free(&args); }
+    var n_lines: i32 = 0;
+    var expect_seq: i64 = 0;
+    var saw_user: bool = false;
+    var saw_calls: bool = false;
+    var saw_result: bool = false;
+    while sess_next(&r, &line) {
+        n_lines = n_lines + 1;
+        const seq: i64 = sess_line_seq(&line);
+        if seq != expect_seq {
+            ty_fail(tag, "seq 不连续", &ok);
+        }
+        expect_seq = seq + 1;
+        if !sess_line_type(&line, &typ) {
+            ty_fail(tag, "事件没有 type", &ok);
+            continue;
+        }
+        const view: &[byte] = line.ptr[0: line.len];
+        if sv_eq_cstr(&typ, "user/message") {
+            saw_user = true;
+            if !sess_json_str(view, "text", &text) || !sess_line_has(&text, "带换行") {
+                ty_fail(tag, "用户文本没有正确落盘/反转义", &ok);
+            }
+        } else if sv_eq_cstr(&typ, "assistant/message") {
+            if !sess_extract_array(view, "tool_calls", &args) {
+                ty_fail(tag, "tool_calls 数组没提取出来", &ok);
+            } else {
+                saw_calls = true;
+                if !sess_line_has(&args, "call_s1") {
+                    ty_fail(tag, "tool_calls 里没有 call_s1", &ok);
+                }
+                if !sess_line_has(&args, "\\\"path\\\"") {
+                    ty_fail(tag, "arguments 的转义层级不对", &ok);
+                }
+            }
+        } else if sv_eq_cstr(&typ, "tool/result") {
+            saw_result = true;
+            if !sess_json_str(view, "callId", &text) || !sess_line_has(&text, "call_s1") {
+                ty_fail(tag, "tool/result 的 callId 不对", &ok);
+            }
+        }
+    }
+    if n_lines != 3 || !saw_user || !saw_calls || !saw_result {
+        ty_fail(tag, "读回的事件条数/种类不对", &ok);
+    }
+    if r.dropped_tail {
+        ty_fail(tag, "正常文件不该被判为截断", &ok);
+    }
+
+    // ---- 3) 崩溃尾部：手动追加半条记录，读的时候必须丢掉它 ----
+    var ap: Buf = buf_new(1300);
+    defer { buf_free(&ap); }
+    _ = buf_append_cstr(&ap, path_copy.ptr as &const byte);
+    _ = buf_append_byte(&ap, 0);
+    const flags: i32 = (O_WRONLY | O_APPEND) as i32;
+    const fd: i32 = sys_open(ap.ptr as *const byte, flags, 420) catch {
+        -1;
+    };
+    if fd >= 0 {
+        const half: &const byte = "{\"type\":\"tool/result\",\"seq\":3,\"time\":1,\"data\":{\"callId\":\"call_x\"" as &const byte;
+        _ = write_all_fd(fd, half, bufx_cstr_len(half));
+        _ = sys_close(fd) catch {};
+    }
+    var r2: SessReader = sess_reader_empty();
+    defer { sess_reader_free(&r2); }
+    if !sess_reader_load(ap.ptr as &const byte, &r2) {
+        ty_fail(tag, "带残缺尾部的文件读不回来", &ok);
+    }
+    var n2: i32 = 0;
+    while sess_next(&r2, &line) {
+        n2 = n2 + 1;
+    }
+    if n2 != 3 {
+        ty_fail(tag, "残缺尾部应被丢弃（应读到 3 条）", &ok);
+    }
+    if !r2.dropped_tail {
+        ty_fail(tag, "没有标记 dropped_tail", &ok);
+    }
+
+    // ---- 4) 恢复：用日志重建消息历史 ----
+    var h: History = hist_init();
+    defer { hist_free(&h); }
+    var next_seq0: i64 = 0;
+    const restored: i32 = agent_hist_from_log(&h, &path_copy, &next_seq0);
+    if restored != 3 {
+        ty_fail(tag, "恢复的消息条数不对", &ok);
+    }
+    // system + user + assistant(带 calls) + tool
+    if h.len != 4 {
+        ty_fail(tag, "恢复后的历史长度不对", &ok);
+    } else if h.items[2].role != ROLE_ASSISTANT_CALLS || h.items[3].role != ROLE_TOOL {
+        ty_fail(tag, "恢复后的角色不对", &ok);
+    } else if h.items[3].extra_len == 0 || !bufx_eq_cstr(h.items[3].extra as &const byte, h.items[3].extra_len, "call_s1") {
+        ty_fail(tag, "恢复后的 tool_call_id 不对", &ok);
+    } else {
+        // 恢复出来的历史必须能原样再序列化成请求
+        var req: Buf = buf_new(65536);
+        defer { buf_free(&req); }
+        var c2: Config = cfg_default();
+        c2.model = buf_new(32);
+        _ = buf_append_cstr(&c2.model, "selftest-model");
+        if !build_chat_request(&c2, &h, &req) {
+            ty_fail(tag, "恢复的历史无法组装请求", &ok);
+        } else if !contains(&req, "\"tool_call_id\":\"call_s1\"") || !contains(&req, "\"tool_calls\"") {
+            ty_fail(tag, "恢复的历史里缺少严格协议字段", &ok);
+        }
+        cfg_free(&c2);
+    }
+
+    // ---- 5) 索引 + 最近会话查找 ----
+    if !sess_find_last("build/selftest_sess_home", "", &line) {
+        ty_fail(tag, "sess_find_last 找不到刚写的会话", &ok);
+    }
+    var fpath: Buf = buf_new(1200);
+    defer { buf_free(&fpath); }
+    if !sess_find("build/selftest_sess_home", "build/selftest_sess_ws", id_copy.ptr as &const byte, id_copy.len, &fpath) {
+        ty_fail(tag, "sess_find 按 id 找不到会话", &ok);
+    }
+
+    if ok {
+        out_err("selftest[");
+        out_err(tag);
+        out_err("] ok\\n");
+    }
+    return ok;
+}
+
+fn sess_line_has(b: &const Buf, lit: &const byte) bool {
+    const n: usize = bufx_cstr_len(lit);
+    if b.len < n {
+        return false;
+    }
+    return find_sub(b.ptr[0: b.len], lit[0: n], 0) >= 0;
+}
+
+
+// ============================================================
+// P5 自测：DSH 设置解析（假 DSH_HOME）+ YAML 预处理
+// ============================================================
+fn write_text_file(path: &const byte, text: &const byte) bool {
+    const flags: i32 = (O_WRONLY | O_CREAT | O_TRUNC) as i32;
+    const fd: i32 = sys_open(path as *const byte, flags, 420) catch {
+        return false;
+    };
+    const n: usize = bufx_cstr_len(text);
+    const ok: bool = write_all_fd(fd, text, n);
+    _ = sys_close(fd) catch {};
+    return ok;
+}
+
+fn dshcfg_round(tag: &const byte) bool {
+    var ok: bool = true;
+    const home: &const byte = "build/selftest_dsh_home";
+    _ = sess_mkdir_p("build/selftest_dsh_home");
+    var spath: Buf = buf_new(256);
+    defer { buf_free(&spath); }
+    _ = buf_append_cstr(&spath, home);
+    _ = buf_append_cstr_z(&spath, "/settings.yaml");
+    const settings: &const byte = "# 顶层注释：这一行必须被去掉\nllm-pi-ai:\n  providers:\n    {\n      fakeprov:\n        {\n          apiKeyEnv: FAKE_API_KEY,\n          api: openai-completions,\n          baseURL: https://fake.example/v1,   # 行尾注释\n          models:\n            [\n              { id: fake-model, contextWindow: 65536, maxTokens: 4096, input: [ text, image ] }\n            ]\n        }\n    }\nagent-presets:\n  default: standard\nagent-default-model:\n  provider: fakeprov\n  model: fake-model\n  reasoningEffort: high\npermission:\n  defaultPreset: workspace-write\nuya-agent:\n  tls: { verify: pin, pin: abc123 }\nplan: |\n  # 块标量里的井号必须保留\n  second line\ndisabled_row: !!js process.platform === 'win32'\n";
+    if !write_text_file(&spath.ptr[0] as &const byte, settings) {
+        ty_fail(tag, "写 settings.yaml 失败", &ok);
+        return false;
+    }
+    var cpath: Buf = buf_new(256);
+    defer { buf_free(&cpath); }
+    _ = buf_append_cstr(&cpath, home);
+    _ = buf_append_cstr_z(&cpath, "/.credentials.yaml");
+    const creds: &const byte = "version: 1\nrefs:\n  FAKE_API_KEY: sk-fake-123456\n";
+    if !write_text_file(&cpath.ptr[0] as &const byte, creds) {
+        ty_fail(tag, "写 .credentials.yaml 失败", &ok);
+    }
+    // 确保环境变量不会抢先（否则测的是 env 而不是当前逻辑）
+
+    var dsh: DshCfg = dsh_cfg_empty();
+    defer { dsh_cfg_free(&dsh); }
+    if !dsh_cfg_load(home, "build/selftest_dsh_ws", &dsh) {
+        ty_fail(tag, "dsh_cfg_load 失败", &ok);
+        return false;
+    }
+    if !ty_buf_is(&dsh.provider, "fakeprov") {
+        ty_fail(tag, "provider 解析错", &ok);
+    }
+    if !ty_buf_is(&dsh.model, "fake-model") {
+        ty_fail(tag, "model 解析错", &ok);
+    }
+    if !ty_buf_is(&dsh.base_url, "https://fake.example/v1") {
+        ty_fail(tag, "baseURL 解析错（行尾注释没被去掉？）", &ok);
+        out_err("[dbg] base_url=");
+        out_err_bytes(dsh.base_url.ptr, dsh.base_url.len);
+        out_err("\n");
+    }
+    if !ty_buf_is(&dsh.api_key_env, "FAKE_API_KEY") {
+        ty_fail(tag, "apiKeyEnv 解析错", &ok);
+    }
+    if !ty_buf_is(&dsh.api_key, "sk-fake-123456") || dsh.key_src != DSHSRC_CREDS {
+        ty_fail(tag, "凭据没有从 .credentials.yaml 取到", &ok);
+    }
+    if dsh.context_window != 65536 {
+        ty_fail(tag, "contextWindow 解析错", &ok);
+    }
+    if dsh.max_tokens != 4096 {
+        ty_fail(tag, "maxTokens 解析错", &ok);
+    }
+    if !dsh.input_image {
+        ty_fail(tag, "input 里的 image 没识别出来", &ok);
+    }
+    if !ty_buf_is(&dsh.reasoning_effort, "high") {
+        ty_fail(tag, "reasoningEffort 解析错", &ok);
+    }
+    if !dsh.confine_set || !dsh.confine {
+        ty_fail(tag, "workspace-write 应当推出 confine=true", &ok);
+    }
+    if !ty_buf_is(&dsh.tls_verify, "pin") || !ty_buf_is(&dsh.tls_pin, "abc123") {
+        ty_fail(tag, "uya-agent.tls 命名空间没读到", &ok);
+    }
+    if !ty_buf_is(&dsh.preset_default, "standard") {
+        ty_fail(tag, "agent-presets.default 解析错", &ok);
+    }
+
+    // YAML 预处理：注释被去掉、块标量里的 # 保留、!!js 被中和成带引号标量
+    var ytree: YTree = YTree{ nodes: [], n: 0, lines: [], nlines: 0, raw: buf_empty(), cur: 0, err_line: 0 };
+    yt_init(&ytree);
+    defer { yt_free(&ytree); }
+    if !yt_load_file(&spath.ptr[0] as &const byte, &ytree) {
+        ty_fail(tag, "yt_load_file 失败", &ok);
+        return ok;
+    }
+    const r: i32 = yt_root(&ytree);
+    const plan: i32 = yt_get(&ytree, r, "plan");
+    const pv: &[byte] = yt_str(&ytree, plan);
+    if pv.len == 0 || !sess_has_cstr(pv, "# 块标量里的井号必须保留") {
+        ty_fail(tag, "块标量里的注释被误删了", &ok);
+    }
+    const dis: i32 = yt_get(&ytree, r, "disabled_row");
+    const dv: &[byte] = yt_str(&ytree, dis);
+    if dv.len == 0 || !sess_has_cstr(dv, "process.platform") {
+        ty_fail(tag, "!!js 标签没有被中和成标量", &ok);
+    }
+    if pv.len > 0 && sess_has_cstr(pv, "# 顶层注释") {
+        ty_fail(tag, "顶层注释没有被去掉", &ok);
+    }
+
+    // 真机 DSH：存在就顺带校验一次（不存在就跳过，保持自测离线）
+    const realhome: &byte = getenv("HOME");
+    if (realhome as usize) != 0 {
+        var rh: Buf = buf_new(1024);
+        defer { buf_free(&rh); }
+        _ = buf_append_cstr(&rh, realhome);
+        _ = buf_append_cstr(&rh, "/.dsh");
+        _ = buf_append_byte(&rh, 0);
+        var rsettings: Buf = buf_new(1200);
+        defer { buf_free(&rsettings); }
+        _ = buf_append_cstr(&rsettings, rh.ptr as &const byte);
+        _ = buf_append_cstr_z(&rsettings, "/settings.yaml");
+        if sess_file_exists(rsettings.ptr as &const byte) {
+            var real: DshCfg = dsh_cfg_empty();
+            defer { dsh_cfg_free(&real); }
+            if dsh_cfg_load(&rh.ptr[0] as &const byte, ".", &real) {
+                if real.provider.len == 0 || real.model.len == 0 {
+                    ty_fail(tag, "真实 ~/.dsh 里没解析出 provider/model", &ok);
+                }
+            } else {
+                ty_fail(tag, "真实 ~/.dsh/settings.yaml 解析失败", &ok);
+            }
+        }
+    }
+
+    if ok {
+        out_err("selftest[");
+        out_err(tag);
+        out_err("] ok\n");
+    }
+    return ok;
+}
+
+fn ty_buf_is(b: &const Buf, lit: &const byte) bool {
+    const n: usize = bufx_cstr_len(lit);
+    if b.len != n {
+        return false;
+    }
+    return bufx_mem_eq(b.ptr as &const byte, lit, n);
+}
+
 export fn selftest_main(base: &const Config) i32 {
     _ = base;
     out_err("selftest: offline end-to-end (mock LLM on 127.0.0.1, no network, no API key)\n");
-    const r1: bool = selftest_round(base, "shell", 0, true, "build/selftest_ws_shell");
-    const r2: bool = selftest_round(base, "no-shell", 1, false, "build/selftest_ws_noshell");
-    const r3: bool = selftest_round(base, "tools", 2, true, "build/selftest_ws_tools");
-    const r4: bool = selftest_round(base, "http401", 3, true, "build/selftest_ws_401");
-    const r5: bool = selftest_round(base, "max-steps", 5, true, "build/selftest_ws_steps");
-    if r1 && r2 && r3 && r4 && r5 {
+    const r1: bool = selftest_round(base, "shell", 0, true, "build/selftest_ws_shell", true, false, false, false);
+    const r2: bool = selftest_round(base, "no-shell", 1, false, "build/selftest_ws_noshell", true, false, false, false);
+    const r3: bool = selftest_round(base, "tools", 2, true, "build/selftest_ws_tools", true, false, false, false);
+    const r4: bool = selftest_round(base, "http401", 3, true, "build/selftest_ws_401", true, false, false, false);
+    const r5: bool = selftest_round(base, "max-steps", 5, true, "build/selftest_ws_steps", true, false, false, false);
+    // 非流式回归：--no-stream 走旧路径，同一份 mock 数据（JSON 回包）
+    const r6: bool = selftest_round(base, "noshell-nostream", 1, false, "build/selftest_ws_nostream", false, false, false, false);
+    // 折叠协议回归：--compat-fold
+    const r7: bool = selftest_round(base, "shell-fold", 0, true, "build/selftest_ws_fold", true, true, false, false);
+    // P3：运行中用户输入（steer）在下一个 step 被采纳
+    const r8: bool = selftest_round(base, "steer", 0, true, "build/selftest_ws_steer", true, false, true, false);
+    // P3：Ctrl-C 中断当前回合（不该派发工具、不该有下一轮请求）
+    const r9: bool = selftest_round(base, "interrupt", 6, true, "build/selftest_ws_intr", true, false, false, true);
+    const s0: bool = sse_round(SSE_CASE_BASIC, "stream-basic");
+    const s1: bool = sse_round(SSE_CASE_TOOLS, "stream-tools");
+    const s2: bool = sse_round(SSE_CASE_NODONE, "stream-nodone");
+    const s3: bool = sse_round(SSE_CASE_BADJSON, "stream-badjson");
+    const s4: bool = sse_round(SSE_CASE_REASONING_LENGTH, "stream-length");
+    const t0: bool = tty_round("tty-editor");
+    const t1: bool = sess_round("session-log");
+    const t2: bool = dshcfg_round("dsh-config");
+    if r1 && r2 && r3 && r4 && r5 && r6 && r7 && r8 && r9 && s0 && s1 && s2 && s3 && s4 && t0 && t1 && t2 {
         out_err("SELFTEST PASS\n");
         return AGENT_OK;
     }

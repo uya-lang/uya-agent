@@ -1,0 +1,1311 @@
+// src/yamlcfg.uya — 读 DSH 的 YAML 配置（P5）
+//
+// 为什么不用 `std.yaml`：实测 uya 0.10.1 里 **std.yaml 与 std.json 不能共存** ——
+// 两个模块的同名私有符号（`MAX_NESTING`、`ParseState`、`parse_true/parse_false/
+// parse_number/parse_string/parse_array/parse_object`…）在 Uya 的**合并命名空间**里撞车，
+// yaml 解析器内部调用会解析到 json 的实现（报「期望 !YamlValue，推断 !JsonValue」，
+// 而且报错位置在标准库文件里）。本项目必须用 std.json（线上协议），所以这里自己实现
+// DSH 配置需要的 YAML 子集。
+//
+// 支持范围（覆盖 settings.yaml 与 agent.cordis.yml 的全部用法）：
+//   * block mapping / block sequence（按缩进）
+//   * `- key: value` 形式：序列项本身是 mapping 的第一行
+//   * flow mapping `{a: b, c: d}` 与 flow sequence `[a, b]`（可跨行）
+//   * 标量：双引号（支持转义）/ 单引号（'' 表示 '）/ 裸标量（原样，含 `://`）
+//   * 块标量 `|`、`|-`、`|+`、`>`、`>-`（字面量/折叠 + chomping）
+//   * 注释（行首或空白之后，块标量与引号内不算）与 `!!tag`（整体改写成带引号标量）
+// 不支持（DSH 配置里没用到）：锚点/别名、多文档、`!!` 以外的复杂标签、tab 缩进。
+//
+// 结果放进扁平的节点池 YTree（Uya 结构体不能自引用），用 child/next 下标遍历。
+
+use libc.syscall;
+use libc.unistd;
+
+export const YK_NULL: u8 = 0;
+export const YK_SCALAR: u8 = 1;
+export const YK_MAP: u8 = 2;
+export const YK_SEQ: u8 = 3;
+
+const YN_MAX: usize = 8192;
+const YL_MAX: usize = 8192;
+
+export struct YNode {
+    kind: u8,
+    key: Buf,     // map 成员的键（seq/scalar 为空）
+    val: Buf,     // 标量文本（已去引号、已折叠）
+    child: i32,   // 第一个子节点下标，-1 表示没有
+    next: i32,    // 兄弟节点下标，-1 表示没有
+}
+
+struct YLine {
+    indent: usize,
+    off: usize,
+    len: usize,
+}
+
+export struct YTree {
+    nodes: [YNode: YN_MAX],
+    n: usize,
+    // 行表（预处理后的非空行）
+    lines: [YLine: YL_MAX],
+    nlines: usize,
+    raw: Buf,        // 预处理后的文本（节点里的 Buf 是拷贝，这个只为诊断保留）
+    cur: usize,      // 解析游标
+    err_line: usize,
+}
+
+fn yn_empty() YNode {
+    return YNode{ kind: YK_NULL, key: buf_empty(), val: buf_empty(), child: -1, next: -1 };
+}
+
+export fn yt_init(t: &YTree) void {
+    var i: usize = 0;
+    while i < YN_MAX {
+        t.nodes[i] = yn_empty();
+        i = i + 1;
+    }
+    t.n = 0;
+    t.nlines = 0;
+    t.raw = buf_empty();
+    t.cur = 0;
+    t.err_line = 0;
+}
+
+export fn yt_free(t: &YTree) void {
+    var i: usize = 0;
+    while i < t.n {
+        buf_free(&t.nodes[i].key);
+        buf_free(&t.nodes[i].val);
+        t.nodes[i] = yn_empty();
+        i = i + 1;
+    }
+    t.n = 0;
+    buf_free(&t.raw);
+}
+
+fn yt_new_node(t: &YTree, kind: u8) i32 {
+    const idx: usize = t.n;
+    if idx >= YN_MAX {
+        return -1;
+    }
+    t.nodes[idx] = yn_empty();
+    t.nodes[idx].kind = kind;
+    t.n = idx + 1;
+    return idx as i32;
+}
+
+// 固定数组的下标必须带**字面量上界**检查，编译器的安全证明才过（README 坑 6）
+fn yn_c(t: &const YTree, i: usize) &const YNode {
+    if i >= YN_MAX {
+        return &t.nodes[0];
+    }
+    return &t.nodes[i];
+}
+
+fn yn_p(t: &YTree, i: usize) &YNode {
+    if i >= YN_MAX {
+        return &t.nodes[0];
+    }
+    return &t.nodes[i];
+}
+
+fn yl_p(t: &YTree, i: usize) &YLine {
+    if i >= YL_MAX {
+        return &t.lines[0];
+    }
+    return &t.lines[i];
+}
+
+fn yl_c(t: &const YTree, i: usize) &const YLine {
+    if i >= YL_MAX {
+        return &t.lines[0];
+    }
+    return &t.lines[i];
+}
+
+fn yt_node(t: &const YTree, idx: i32) &const YNode {
+    const i: usize = idx as usize;
+    return yn_c(t, i);
+}
+
+export fn yt_kind(t: &const YTree, idx: i32) u8 {
+    if idx < 0 {
+        return YK_NULL;
+    }
+    return yt_node(t, idx).kind;
+}
+
+export fn yt_child(t: &const YTree, idx: i32) i32 {
+    if idx < 0 {
+        return -1;
+    }
+    return yt_node(t, idx).child;
+}
+
+export fn yt_next(t: &const YTree, idx: i32) i32 {
+    if idx < 0 {
+        return -1;
+    }
+    return yt_node(t, idx).next;
+}
+
+// 标量文本（非标量返回空）
+export fn yt_str(t: &const YTree, idx: i32) &[byte] {
+    if idx < 0 {
+        return &""[0: 0];
+    }
+    const nd: &const YNode = yt_node(t, idx);
+    if nd.kind != YK_SCALAR {
+        return &""[0: 0];
+    }
+    return nd.val.ptr[0: nd.val.len];
+}
+
+// map 取键（不存在返回 -1）
+export fn yt_get(t: &const YTree, idx: i32, key: &const byte) i32 {
+    if idx < 0 {
+        return -1;
+    }
+    var c: i32 = yt_node(t, idx).child;
+    const kn: usize = bufx_cstr_len(key);
+    while c >= 0 {
+        const nd: &const YNode = yt_node(t, c);
+        if nd.key.len == kn && bufx_mem_eq(nd.key.ptr as &const byte, key, kn) {
+            return c;
+        }
+        c = nd.next;
+    }
+    return -1;
+}
+
+// map 取键的标量值（键不存在/不是标量返回空）
+export fn yt_get_str(t: &const YTree, idx: i32, key: &const byte) &[byte] {
+    const c: i32 = yt_get(t, idx, key);
+    if c < 0 {
+        return &""[0: 0];
+    }
+    return yt_str(t, c);
+}
+
+export fn yt_get_i64(t: &const YTree, idx: i32, key: &const byte, fallback: i64) i64 {
+    const c: i32 = yt_get(t, idx, key);
+    if c < 0 {
+        return fallback;
+    }
+    const s: &[byte] = yt_str(t, c);
+    if s.len == 0 {
+        return fallback;
+    }
+    var v: i64 = 0;
+    var i: usize = 0;
+    var neg: bool = false;
+    if s.ptr[0] == 45 as byte {
+        neg = true;
+        i = 1;
+    }
+    var digits: i32 = 0;
+    while i < s.len && is_digit(s.ptr[i]) {
+        v = v * 10 + ((s.ptr[i] as i64) - 48);
+        digits = digits + 1;
+        i = i + 1;
+    }
+    if digits == 0 {
+        return fallback;
+    }
+    if neg {
+        return 0 - v;
+    }
+    return v;
+}
+
+// seq 长度
+export fn yt_len(t: &const YTree, idx: i32) usize {
+    var c: i32 = yt_child(t, idx);
+    var n: usize = 0;
+    while c >= 0 {
+        n = n + 1;
+        c = yt_next(t, c);
+    }
+    return n;
+}
+
+// seq 第 i 个（越界返回 -1）
+export fn yt_at(t: &const YTree, idx: i32, want: usize) i32 {
+    var c: i32 = yt_child(t, idx);
+    var n: usize = 0;
+    while c >= 0 {
+        if n == want {
+            return c;
+        }
+        n = n + 1;
+        c = yt_next(t, c);
+    }
+    return -1;
+}
+
+fn yt_append_child(t: &YTree, parent: i32, kind: u8, key: &const byte, key_len: usize) i32 {
+    if parent < 0 {
+        return -1;
+    }
+    const child: i32 = yt_new_node(t, kind);
+    if child < 0 {
+        return -1;
+    }
+    const pi: usize = parent as usize;
+    const pn: &YNode = yn_p(t, pi);
+    if pn.child < 0 {
+        pn.child = child;
+    } else {
+        var c: i32 = pn.child;
+        while yt_next(t, c) >= 0 {
+            c = yt_next(t, c);
+        }
+        const ci: usize = c as usize;
+        const cn: &YNode = yn_p(t, ci);
+        cn.next = child;
+    }
+    if key_len > 0 {
+        const ci2: usize = child as usize;
+        const kn: &YNode = yn_p(t, ci2);
+        kn.key = buf_new(key_len + 8);
+        if buf_valid(&kn.key) {
+            _ = buf_append(&kn.key, key, key_len);
+        }
+    }
+    return child;
+}
+
+fn yt_set_scalar(t: &YTree, idx: i32, text: &const byte, n: usize) void {
+    if idx < 0 {
+        return;
+    }
+    const i: usize = idx as usize;
+    const nd: &YNode = yn_p(t, i);
+    buf_reset(&nd.val);
+    if n > 0 {
+        _ = buf_append(&nd.val, text, n);
+    }
+}
+
+// ============================================================
+// 预处理（去注释 / 中和标签）
+// ============================================================
+fn ycfg_space(c: byte) bool {
+    return c == 32 as byte || c == 9 as byte;
+}
+
+export fn ycfg_strip_comments(src: &const Buf, out: &Buf) bool {
+    buf_reset(out);
+    var i: usize = 0;
+    const n: usize = src.len;
+    var in_block: bool = false;
+    var block_indent: usize = 0;
+    while i < n {
+        var le: usize = i;
+        while le < n && src.ptr[le] != 10 as byte {
+            le = le + 1;
+        }
+        const view: &[byte] = src.ptr[0: n];
+        var indent: usize = 0;
+        while i + indent < le && src.ptr[i + indent] == 32 as byte {
+            indent = indent + 1;
+        }
+        var only_space: bool = true;
+        var k: usize = i;
+        while k < le {
+            if !ycfg_space(src.ptr[k]) {
+                only_space = false;
+                break;
+            }
+            k = k + 1;
+        }
+        if in_block && !only_space && indent <= block_indent {
+            in_block = false;
+        }
+        if in_block {
+            if !buf_append(out, &src.ptr[i], le - i) {
+                return false;
+            }
+        } else {
+            // 判断这一行是不是块标量开头（值位置是 | 或 >）
+            var style: u8 = 0;
+            var colon: isize = -1;
+            var j: usize = i;
+            var in_s: bool = false;
+            var in_d: bool = false;
+            while j < le {
+                const c: byte = src.ptr[j];
+                if in_s {
+                    if c == 39 as byte {
+                        in_s = false;
+                    }
+                } else if in_d {
+                    if c == 92 as byte {
+                        j = j + 1;
+                    } else if c == 34 as byte {
+                        in_d = false;
+                    }
+                } else if c == 39 as byte {
+                    in_s = true;
+                } else if c == 34 as byte {
+                    in_d = true;
+                } else if c == 58 as byte {
+                    colon = j as isize;
+                } else if c == 35 as byte {
+                    break;
+                }
+                j = j + 1;
+            }
+            if colon >= 0 {
+                var v: usize = (colon as usize) + 1;
+                while v < le && ycfg_space(src.ptr[v]) {
+                    v = v + 1;
+                }
+                if v < le {
+                    if src.ptr[v] == 124 as byte {
+                        style = 1;   // '|'
+                    } else if src.ptr[v] == 62 as byte {
+                        style = 2;   // '>'
+                    }
+                }
+            }
+            // 逐字符复制，遇到注释起点就截断
+            var m: usize = i;
+            var q_s: bool = false;
+            var q_d: bool = false;
+            var cut: usize = le;
+            while m < le {
+                const c2: byte = src.ptr[m];
+                if q_s {
+                    if c2 == 39 as byte {
+                        q_s = false;
+                    }
+                } else if q_d {
+                    if c2 == 92 as byte {
+                        m = m + 1;
+                    } else if c2 == 34 as byte {
+                        q_d = false;
+                    }
+                } else if c2 == 39 as byte {
+                    q_s = true;
+                } else if c2 == 34 as byte {
+                    q_d = true;
+                } else if c2 == 35 as byte {
+                    if m == i + indent || (m > i && ycfg_space(src.ptr[m - 1])) {
+                        cut = m;
+                        break;
+                    }
+                }
+                m = m + 1;
+            }
+            var ce: usize = cut;
+            while ce > i + indent && ycfg_space(src.ptr[ce - 1]) {
+                ce = ce - 1;
+            }
+            if !buf_append(out, &src.ptr[i], ce - i) {
+                return false;
+            }
+            if style != 0 {
+                in_block = true;
+                block_indent = indent;
+            }
+        }
+        if le < n {
+            if !buf_append_byte(out, 10) {
+                return false;
+            }
+        }
+        i = le + 1;
+    }
+    return true;
+}
+
+// `!!tag rest` → `"rest"`
+export fn ycfg_neutralize_tags(src: &const Buf, out: &Buf) bool {
+    buf_reset(out);
+    var i: usize = 0;
+    const n: usize = src.len;
+    while i < n {
+        var le: usize = i;
+        while le < n && src.ptr[le] != 10 as byte {
+            le = le + 1;
+        }
+        var bang: isize = -1;
+        var in_d: bool = false;
+        var j: usize = i;
+        while j + 1 < le {
+            const c: byte = src.ptr[j];
+            if in_d {
+                if c == 92 as byte {
+                    j = j + 1;
+                } else if c == 34 as byte {
+                    in_d = false;
+                }
+            } else if c == 34 as byte {
+                in_d = true;
+            } else if c == 33 as byte && src.ptr[j + 1] == 33 as byte {
+                bang = j as isize;
+                break;
+            }
+            j = j + 1;
+        }
+        if bang < 0 {
+            if !buf_append(out, &src.ptr[i], le - i) {
+                return false;
+            }
+        } else {
+            const b: usize = bang as usize;
+            if !buf_append(out, &src.ptr[i], b - i) {
+                return false;
+            }
+            var k: usize = b;
+            while k < le && !ycfg_space(src.ptr[k]) {
+                k = k + 1;
+            }
+            while k < le && ycfg_space(src.ptr[k]) {
+                k = k + 1;
+            }
+            var ve: usize = le;
+            while ve > k && ycfg_space(src.ptr[ve - 1]) {
+                ve = ve - 1;
+            }
+            if !buf_append_byte(out, 34) {
+                return false;
+            }
+            var m: usize = k;
+            while m < ve {
+                const c2: byte = src.ptr[m];
+                if c2 == 34 as byte {
+                    if !buf_append_cstr(out, "\\\"") {
+                        return false;
+                    }
+                } else if c2 == 92 as byte {
+                    if !buf_append_cstr(out, "\\\\") {
+                        return false;
+                    }
+                } else if !buf_append_byte(out, c2) {
+                    return false;
+                }
+                m = m + 1;
+            }
+            if !buf_append_byte(out, 34) {
+                return false;
+            }
+        }
+        if le < n {
+            if !buf_append_byte(out, 10) {
+                return false;
+            }
+        }
+        i = le + 1;
+    }
+    return true;
+}
+
+// ============================================================
+// 行表
+// ============================================================
+fn ycfg_build_lines(t: &YTree, text: &const Buf) bool {
+    t.nlines = 0;
+    var i: usize = 0;
+    const n: usize = text.len;
+    while i < n {
+        var le: usize = i;
+        while le < n && text.ptr[le] != 10 as byte {
+            le = le + 1;
+        }
+        var indent: usize = 0;
+        while i + indent < le && text.ptr[i + indent] == 32 as byte {
+            indent = indent + 1;
+        }
+        var content_len: usize = le - (i + indent);
+        while content_len > 0 && ycfg_space(text.ptr[i + indent + content_len - 1]) {
+            content_len = content_len - 1;
+        }
+        if content_len > 0 {
+            const idx: usize = t.nlines;
+            if idx >= YL_MAX {
+                return false;
+            }
+            const ln: &YLine = yl_p(t, idx);
+            ln.indent = indent;
+            ln.off = i + indent;
+            ln.len = content_len;
+            t.nlines = idx + 1;
+        }
+        i = le + 1;
+    }
+    return true;
+}
+
+fn ycfg_line_text(t: &const YTree, li: usize, raw: &const byte) &[byte] {
+    const ln: &const YLine = yl_c(t, li);
+    return raw[ln.off: ln.len];
+}
+
+// ============================================================
+// 标量
+// ============================================================
+fn ycfg_trim(seg: &[byte]) &[byte] {
+    var a: usize = 0;
+    var b: usize = seg.len;
+    while a < b && ycfg_space(seg.ptr[a]) {
+        a = a + 1;
+    }
+    while b > a && ycfg_space(seg.ptr[b - 1]) {
+        b = b - 1;
+    }
+    return seg.ptr[a: b - a];
+}
+
+fn ycfg_scalar_into(t: &YTree, idx: i32, seg: &[byte]) void {
+    const s: &[byte] = ycfg_trim(seg);
+    if s.len == 0 {
+        yt_set_scalar(t, idx, null, 0);
+        return;
+    }
+    const c0: byte = s.ptr[0];
+    if c0 == 34 as byte {
+        // 双引号：解转义
+        var tmp: Buf = buf_new(s.len + 8);
+        defer { buf_free(&tmp); }
+        const inner: &[byte] = s.ptr[1: s.len - 2 + 1];
+        var i: usize = 0;
+        var end: usize = s.len;
+        if end > 0 && s.ptr[end - 1] == 34 as byte && end >= 2 {
+            end = end - 1;
+        }
+        _ = inner;
+        while i < end - 1 {
+            const c: byte = s.ptr[1 + i];
+            if c == 92 as byte && i + 2 <= end - 1 {
+                const e: byte = s.ptr[2 + i];
+                if e == 110 as byte {
+                    _ = buf_append_byte(&tmp, 10);
+                } else if e == 116 as byte {
+                    _ = buf_append_byte(&tmp, 9);
+                } else if e == 114 as byte {
+                    _ = buf_append_byte(&tmp, 13);
+                } else {
+                    _ = buf_append_byte(&tmp, e);
+                }
+                i = i + 2;
+                continue;
+            }
+            _ = buf_append_byte(&tmp, c);
+            i = i + 1;
+        }
+        if tmp.len > 0 {
+            yt_set_scalar(t, idx, tmp.ptr as &const byte, tmp.len);
+        } else {
+            yt_set_scalar(t, idx, null, 0);
+        }
+        return;
+    }
+    if c0 == 39 as byte {
+        var tmp2: Buf = buf_new(s.len + 8);
+        defer { buf_free(&tmp2); }
+        var end2: usize = s.len;
+        if end2 >= 2 && s.ptr[end2 - 1] == 39 as byte {
+            end2 = end2 - 1;
+        }
+        var i2: usize = 1;
+        while i2 < end2 {
+            const c: byte = s.ptr[i2];
+            if c == 39 as byte && i2 + 1 < end2 && s.ptr[i2 + 1] == 39 as byte {
+                _ = buf_append_byte(&tmp2, 39);
+                i2 = i2 + 2;
+                continue;
+            }
+            _ = buf_append_byte(&tmp2, c);
+            i2 = i2 + 1;
+        }
+        yt_set_scalar(t, idx, tmp2.ptr as &const byte, tmp2.len);
+        return;
+    }
+    yt_set_scalar(t, idx, s.ptr, s.len);
+}
+
+// ============================================================
+// flow 解析：{k: v, ...} / [a, b]
+// ============================================================
+fn ycfg_flow_parse(t: &YTree, s: &[byte], pos: &usize) i32 {
+    // 跳过空白
+    var i: usize = pos[0];
+    while i < s.len && ycfg_space(s.ptr[i]) {
+        i = i + 1;
+    }
+    if i >= s.len {
+        pos[0] = i;
+        return -1;
+    }
+    const c: byte = s.ptr[i];
+    if c == 123 as byte {
+        i = i + 1;
+        const node: i32 = yt_new_node(t, YK_MAP);
+        if node < 0 {
+            return -1;
+        }
+        while true {
+            while i < s.len && (ycfg_space(s.ptr[i]) || s.ptr[i] == 44 as byte) {
+                i = i + 1;
+            }
+            if i >= s.len {
+                break;
+            }
+            if s.ptr[i] == 125 as byte {
+                i = i + 1;
+                break;
+            }
+            // key
+            const kstart: usize = i;
+            var kend: usize = i;
+            if s.ptr[i] == 34 as byte || s.ptr[i] == 39 as byte {
+                const q: byte = s.ptr[i];
+                i = i + 1;
+                while i < s.len && s.ptr[i] != q {
+                    i = i + 1;
+                }
+                kend = i;
+                i = i + 1;
+            } else {
+                while i < s.len && s.ptr[i] != 58 as byte && s.ptr[i] != 125 as byte && s.ptr[i] != 44 as byte {
+                    i = i + 1;
+                }
+                kend = i;
+            }
+            while i < s.len && ycfg_space(s.ptr[i]) {
+                i = i + 1;
+            }
+            if i < s.len && s.ptr[i] == 58 as byte {
+                i = i + 1;
+            }
+            const key_seg: &[byte] = ycfg_trim(s.ptr[kstart: kend - kstart]);
+            const child: i32 = yt_append_child(t, node, YK_NULL, key_seg.ptr, key_seg.len);
+            if child < 0 {
+                return node;
+            }
+            // value
+            while i < s.len && ycfg_space(s.ptr[i]) {
+                i = i + 1;
+            }
+            if i < s.len && (s.ptr[i] == 123 as byte || s.ptr[i] == 91 as byte) {
+                const sub: i32 = ycfg_flow_parse(t, s, &i);
+                if sub >= 0 {
+                    const ci: usize = child as usize;
+                    const cn2: &YNode = yn_p(t, ci);
+                    const sn2: &YNode = yn_p(t, sub as usize);
+                    cn2.kind = sn2.kind;
+                    cn2.child = sn2.child;
+                    cn2.val = sn2.val;
+                    sn2.val = buf_empty();
+                    sn2.child = -1;
+                }
+                continue;
+            }
+            var vstart: usize = i;
+            if i < s.len && (s.ptr[i] == 34 as byte || s.ptr[i] == 39 as byte) {
+                const q2: byte = s.ptr[i];
+                i = i + 1;
+                while i < s.len && s.ptr[i] != q2 {
+                    if s.ptr[i] == 92 as byte {
+                        i = i + 1;
+                    }
+                    i = i + 1;
+                }
+                if i < s.len {
+                    i = i + 1;
+                }
+            } else {
+                while i < s.len && s.ptr[i] != 44 as byte && s.ptr[i] != 125 as byte {
+                    i = i + 1;
+                }
+            }
+            var vend: usize = i;
+            while vend > vstart && ycfg_space(s.ptr[vend - 1]) {
+                vend = vend - 1;
+            }
+            const ci2: usize = child as usize;
+            const cn5: &YNode = yn_p(t, ci2);
+            cn5.kind = YK_SCALAR;
+            ycfg_scalar_into(t, child, s.ptr[vstart: vend - vstart]);
+        }
+        pos[0] = i;
+        return node;
+    }
+    if c == 91 as byte {
+        i = i + 1;
+        const node2: i32 = yt_new_node(t, YK_SEQ);
+        if node2 < 0 {
+            return -1;
+        }
+        while true {
+            while i < s.len && (ycfg_space(s.ptr[i]) || s.ptr[i] == 44 as byte) {
+                i = i + 1;
+            }
+            if i >= s.len {
+                break;
+            }
+            if s.ptr[i] == 93 as byte {
+                i = i + 1;
+                break;
+            }
+            if s.ptr[i] == 123 as byte || s.ptr[i] == 91 as byte {
+                const sub2: i32 = ycfg_flow_parse(t, s, &i);
+                if sub2 >= 0 {
+                    // 直接把子节点挂到 seq：复制内容（child 链要跟着搬）
+                    const item: i32 = yt_append_child(t, node2, YK_NULL, null, 0);
+                    if item >= 0 {
+                        const ii: usize = item as usize;
+                        const si: usize = sub2 as usize;
+                        const in2: &YNode = yn_p(t, ii);
+                        const sn3: &YNode = yn_p(t, si);
+                        in2.kind = sn3.kind;
+                        in2.child = sn3.child;
+                        in2.val = sn3.val;
+                        sn3.val = buf_empty();
+                        sn3.child = -1;
+                    }
+                }
+                while i < s.len && ycfg_space(s.ptr[i]) {
+                    i = i + 1;
+                }
+                if i < s.len && s.ptr[i] == 44 as byte {
+                    i = i + 1;
+                }
+                continue;
+            }
+            var astart: usize = i;
+            var quoted: bool = false;
+            if s.ptr[i] == 34 as byte || s.ptr[i] == 39 as byte {
+                const q3: byte = s.ptr[i];
+                quoted = true;
+                i = i + 1;
+                while i < s.len && s.ptr[i] != q3 {
+                    if s.ptr[i] == 92 as byte {
+                        i = i + 1;
+                    }
+                    i = i + 1;
+                }
+                if i < s.len {
+                    i = i + 1;
+                }
+            } else {
+                while i < s.len && s.ptr[i] != 44 as byte && s.ptr[i] != 93 as byte {
+                    i = i + 1;
+                }
+            }
+            var aend: usize = i;
+            while aend > astart && ycfg_space(s.ptr[aend - 1]) {
+                aend = aend - 1;
+            }
+            const item2: i32 = yt_append_child(t, node2, YK_SCALAR, null, 0);
+            if quoted {
+                ycfg_scalar_into(t, item2, s.ptr[astart: aend - astart]);
+            } else {
+                ycfg_scalar_into(t, item2, s.ptr[astart: aend - astart]);
+            }
+        }
+        pos[0] = i;
+        return node2;
+    }
+    // 裸标量
+    const start: usize = i;
+    while i < s.len && s.ptr[i] != 44 as byte && s.ptr[i] != 125 as byte && s.ptr[i] != 93 as byte {
+        i = i + 1;
+    }
+    var end: usize = i;
+    while end > start && ycfg_space(s.ptr[end - 1]) {
+        end = end - 1;
+    }
+    const n3: i32 = yt_new_node(t, YK_SCALAR);
+    ycfg_scalar_into(t, n3, s.ptr[start: end - start]);
+    pos[0] = i;
+    return n3;
+}
+
+// 返回这一行的值部分是不是 flow 集合（'{' 或 '['），并给出它的文本范围
+fn ycfg_find_key_colon(seg: &[byte]) isize {
+    // 找最外层（不在引号/括号内）的 `: ` 或行尾 `:`
+    var i: usize = 0;
+    var in_s: bool = false;
+    var in_d: bool = false;
+    var depth: i32 = 0;
+    while i < seg.len {
+        const c: byte = seg.ptr[i];
+        if in_s {
+            if c == 39 as byte {
+                in_s = false;
+            }
+        } else if in_d {
+            if c == 92 as byte {
+                i = i + 1;
+            } else if c == 34 as byte {
+                in_d = false;
+            }
+        } else if c == 39 as byte {
+            in_s = true;
+        } else if c == 34 as byte {
+            in_d = true;
+        } else if c == 123 as byte || c == 91 as byte {
+            depth = depth + 1;
+        } else if c == 125 as byte || c == 93 as byte {
+            depth = depth - 1;
+        } else if c == 58 as byte && depth == 0 {
+            if i + 1 >= seg.len || ycfg_space(seg.ptr[i + 1]) {
+                return i as isize;
+            }
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+// ============================================================
+// block 解析
+// ============================================================
+fn ycfg_parse_block(t: &YTree, raw: &const byte, indent: usize) i32 {
+    if t.cur >= t.nlines {
+        return -1;
+    }
+    const li: usize = t.cur;
+    const line_indent: usize = yl_c(t, li).indent;
+    if line_indent < indent {
+        return -1;
+    }
+    const text: &[byte] = ycfg_line_text(t, li, raw);
+    if text.len >= 2 && text.ptr[0] == 45 as byte && ycfg_space(text.ptr[1]) {
+        return ycfg_parse_seq(t, raw, line_indent);
+    }
+    if text.len == 1 && text.ptr[0] == 45 as byte {
+        return ycfg_parse_seq(t, raw, line_indent);
+    }
+    return ycfg_parse_map(t, raw, line_indent, -1, null, 0);
+}
+
+fn ycfg_parse_seq(t: &YTree, raw: &const byte, indent: usize) i32 {
+    const node: i32 = yt_new_node(t, YK_SEQ);
+    if node < 0 {
+        return -1;
+    }
+    while t.cur < t.nlines {
+        const li: usize = t.cur;
+        if yl_c(t, li).indent != indent {
+            break;
+        }
+        const text: &[byte] = ycfg_line_text(t, li, raw);
+        if text.len < 1 || text.ptr[0] != 45 as byte {
+            break;
+        }
+        var rest_off: usize = 1;
+        while rest_off < text.len && ycfg_space(text.ptr[rest_off]) {
+            rest_off = rest_off + 1;
+        }
+        const rest: &[byte] = text.ptr[rest_off: text.len - rest_off];
+        if rest.len == 0 {
+            // 值在后面的缩进块里
+            t.cur = t.cur + 1;
+            const sub: i32 = ycfg_parse_block(t, raw, indent + 1);
+            const item0: i32 = yt_append_child(t, node, YK_NULL, null, 0);
+            if sub >= 0 && item0 >= 0 {
+                const ii: usize = item0 as usize;
+                const si: usize = sub as usize;
+                const in3: &YNode = yn_p(t, ii);
+                const sn4: &YNode = yn_p(t, si);
+                in3.kind = sn4.kind;
+                in3.child = sn4.child;
+                in3.val = sn4.val;
+                sn4.val = buf_empty();
+                sn4.child = -1;
+            }
+            continue;
+        }
+        const colon: isize = ycfg_find_key_colon(rest);
+        if colon >= 0 {
+            // 序列项是 mapping，第一行就是 `key: value`
+            const key_seg: &[byte] = ycfg_trim(rest.ptr[0: colon as usize]);
+            var vstart: usize = (colon as usize) + 1;
+            while vstart < rest.len && ycfg_space(rest.ptr[vstart]) {
+                vstart = vstart + 1;
+            }
+            const vseg: &[byte] = rest.ptr[vstart: rest.len - vstart];
+            t.cur = t.cur + 1;
+            const map_node: i32 = ycfg_parse_map(t, raw, indent + 1, -2, key_seg.ptr, key_seg.len);
+            const item: i32 = yt_append_child(t, node, YK_NULL, null, 0);
+            if map_node >= 0 && item >= 0 {
+                const ii: usize = item as usize;
+                const mi: usize = map_node as usize;
+                const in4: &YNode = yn_p(t, ii);
+                const mn: &YNode = yn_p(t, mi);
+                in4.kind = mn.kind;
+                in4.child = mn.child;
+                mn.child = -1;
+            }
+            // 第一行的值放进 map 的第一个子节点
+            if item >= 0 {
+                const first: i32 = yt_child(t, item);
+                if first >= 0 {
+                    ycfg_assign_value(t, raw, first, vseg, indent + 1);
+                }
+            }
+            continue;
+        }
+        // 纯标量项
+        const item2: i32 = yt_append_child(t, node, YK_SCALAR, null, 0);
+        ycfg_scalar_into(t, item2, rest);
+        t.cur = t.cur + 1;
+    }
+    return node;
+}
+
+// flow 扫描器状态：括号深度 + 引号状态（字符串里的括号不算）
+struct FlowScan {
+    depth: i32,
+    in_s: bool,
+    in_d: bool,
+    esc: bool,
+}
+
+fn ycfg_flow_scan(seg: &[byte], st: &FlowScan) void {
+    var i: usize = 0;
+    while i < seg.len {
+        const c: byte = seg.ptr[i];
+        if st.in_d {
+            if st.esc {
+                st.esc = false;
+            } else if c == 92 as byte {
+                st.esc = true;
+            } else if c == 34 as byte {
+                st.in_d = false;
+            }
+        } else if st.in_s {
+            if c == 39 as byte {
+                st.in_s = false;
+            }
+        } else if c == 34 as byte {
+            st.in_d = true;
+        } else if c == 39 as byte {
+            st.in_s = true;
+        } else if c == 123 as byte || c == 91 as byte {
+            st.depth = st.depth + 1;
+        } else if c == 125 as byte || c == 93 as byte {
+            st.depth = st.depth - 1;
+        }
+        i = i + 1;
+    }
+}
+
+// 收齐一个 flow 集合的文本（可能跨多行）：
+//   initial + has_initial=true  → 值从同一行开始（`models: [ ...`）
+//   has_initial=false           → 值从**下一行**开始（DSH settings.yaml 的 `providers:` 换行写 `{`）
+// 返回 true 表示括号配平收齐。
+fn ycfg_take_flow(t: &YTree, raw: &const byte, initial: &[byte], has_initial: bool, out: &Buf) bool {
+    buf_reset(out);
+    var st: FlowScan = FlowScan{ depth: 0, in_s: false, in_d: false, esc: false };
+    if has_initial {
+        _ = buf_append(out, initial.ptr, initial.len);
+        ycfg_flow_scan(initial, &st);
+    } else {
+        if t.cur >= t.nlines {
+            return false;
+        }
+        const lt0: &[byte] = ycfg_line_text(t, t.cur, raw);
+        _ = buf_append(out, lt0.ptr, lt0.len);
+        _ = buf_append_byte(out, 32);
+        ycfg_flow_scan(lt0, &st);
+        t.cur = t.cur + 1;
+    }
+    while st.depth > 0 && t.cur < t.nlines {
+        const lt: &[byte] = ycfg_line_text(t, t.cur, raw);
+        if !buf_append(out, lt.ptr, lt.len) {
+            return false;
+        }
+        if !buf_append_byte(out, 32) {
+            return false;
+        }
+        ycfg_flow_scan(lt, &st);
+        t.cur = t.cur + 1;
+    }
+    return st.depth <= 0;
+}
+
+// 把一个「值区段」挂到节点上：可能是 flow、块标量、标量，或者空（值在后面的缩进块里）
+fn ycfg_assign_value(t: &YTree, raw: &const byte, node: i32, vseg: &[byte], indent: usize) void {
+    if vseg.len == 0 {
+        // 值在后面的缩进块里
+        const save: usize = t.cur;
+        if save < t.nlines && yl_c(t, save).indent > indent {
+            const lt: &[byte] = ycfg_line_text(t, save, raw);
+            if lt.len > 0 && (lt.ptr[0] == 123 as byte || lt.ptr[0] == 91 as byte) {
+                // 值在下一行开始的 flow 集合（DSH settings.yaml 就是这么写的）
+                var acc: Buf = buf_new(4096);
+                defer { buf_free(&acc); }
+                var none: [byte: 0] = [];
+                if ycfg_take_flow(t, raw, &none[0: 0], false, &acc) {
+                    var pos: usize = 0;
+                    const subf: i32 = ycfg_flow_parse(t, acc.ptr[0: acc.len], &pos);
+                    if subf >= 0 {
+                        const ni: usize = node as usize;
+                        const si: usize = subf as usize;
+                        const nn: &YNode = yn_p(t, ni);
+                        const sn: &YNode = yn_p(t, si);
+                        nn.kind = sn.kind;
+                        nn.child = sn.child;
+                        nn.val = sn.val;
+                        sn.val = buf_empty();
+                        sn.child = -1;
+                    }
+                }
+                return;
+            }
+            const sub: i32 = ycfg_parse_block(t, raw, indent + 1);
+            if sub >= 0 {
+                const ni: usize = node as usize;
+                const si: usize = sub as usize;
+                const nn: &YNode = yn_p(t, ni);
+                const sn5: &YNode = yn_p(t, si);
+                nn.kind = sn5.kind;
+                nn.child = sn5.child;
+                nn.val = sn5.val;
+                sn5.val = buf_empty();
+                sn5.child = -1;
+            }
+            return;
+        }
+        return;
+    }
+    const c0: byte = vseg.ptr[0];
+    if c0 == 124 as byte || c0 == 62 as byte {
+        // 块标量
+        const literal: bool = c0 == 124 as byte;
+        var chop: u8 = 0;   // 0=clip 1=strip 2=keep
+        var k: usize = 1;
+        while k < vseg.len && !ycfg_space(vseg.ptr[k]) {
+            if vseg.ptr[k] == 45 as byte {
+                chop = 1;
+            } else if vseg.ptr[k] == 43 as byte {
+                chop = 2;
+            }
+            k = k + 1;
+        }
+        var body: Buf = buf_new(4096);
+        defer { buf_free(&body); }
+        while t.cur < t.nlines && yl_c(t, t.cur).indent > indent {
+            const lt: &[byte] = ycfg_line_text(t, t.cur, raw);
+            if literal {
+                _ = buf_append(&body, lt.ptr, lt.len);
+                _ = buf_append_byte(&body, 10);
+            } else {
+                _ = buf_append(&body, lt.ptr, lt.len);
+                _ = buf_append_byte(&body, 32);
+            }
+            t.cur = t.cur + 1;
+        }
+        var out: Buf = buf_new(body.len + 8);
+        defer { buf_free(&out); }
+        if literal {
+            _ = buf_append(&out, body.ptr, body.len);
+        } else {
+            // 折叠：连续行用空格（上面的循环已经这么做了），行尾空格去掉
+            _ = buf_append(&out, body.ptr, body.len);
+            while out.len > 0 && (out.ptr[out.len - 1] == 32 as byte || out.ptr[out.len - 1] == 10 as byte) {
+                out.len = out.len - 1;
+            }
+            _ = buf_append_byte(&out, 10);
+        }
+        if chop == 1 {
+            while out.len > 0 && out.ptr[out.len - 1] == 10 as byte {
+                out.len = out.len - 1;
+            }
+        }
+        const ni2: usize = node as usize;
+        const nn2: &YNode = yn_p(t, ni2);
+        nn2.kind = YK_SCALAR;
+        buf_reset(&nn2.val);
+        _ = buf_append(&nn2.val, out.ptr, out.len);
+        return;
+    }
+    if c0 == 123 as byte || c0 == 91 as byte {
+        var acc2: Buf = buf_new(4096);
+        defer { buf_free(&acc2); }
+        _ = ycfg_take_flow(t, raw, vseg, true, &acc2);
+        var pos: usize = 0;
+        const sub2: i32 = ycfg_flow_parse(t, acc2.ptr[0: acc2.len], &pos);
+        if sub2 >= 0 {
+            const ni3: usize = node as usize;
+            const si3: usize = sub2 as usize;
+            const nn3: &YNode = yn_p(t, ni3);
+            const sn6: &YNode = yn_p(t, si3);
+            nn3.kind = sn6.kind;
+            nn3.child = sn6.child;
+            nn3.val = sn6.val;
+            sn6.val = buf_empty();
+            sn6.child = -1;
+        }
+        return;
+    }
+    const ni4: usize = node as usize;
+    const nn4: &YNode = yn_p(t, ni4);
+    nn4.kind = YK_SCALAR;
+    ycfg_scalar_into(t, node, vseg);
+}
+
+// prepend_key_len == 0：普通 mapping；== -2 时表示「第一行已经作为 key 处理过」，
+// 需要用 prepend 提供的 key（配合调用方随后赋值）
+fn ycfg_parse_map(t: &YTree, raw: &const byte, indent: usize, prepend_node: i32, prepend_key: &const byte, prepend_key_len: usize) i32 {
+    _ = prepend_node;
+    const node: i32 = yt_new_node(t, YK_MAP);
+    if node < 0 {
+        return -1;
+    }
+    var first_key_handled: bool = false;
+    if prepend_key_len > 0 {
+        _ = yt_append_child(t, node, YK_NULL, prepend_key, prepend_key_len);
+        first_key_handled = true;
+    }
+    while t.cur < t.nlines {
+        const li: usize = t.cur;
+        if yl_c(t, li).indent != indent {
+            if yl_c(t, li).indent < indent {
+                break;
+            }
+            // 缩进更深但没有 key：跳过（容错）
+            t.cur = t.cur + 1;
+            continue;
+        }
+        const text: &[byte] = ycfg_line_text(t, li, raw);
+        if text.len > 0 && text.ptr[0] == 45 as byte {
+            break;
+        }
+        const colon: isize = ycfg_find_key_colon(text);
+        if colon < 0 {
+            // 不是 key: value —— 容错：当成标量跳过
+            t.cur = t.cur + 1;
+            continue;
+        }
+        const key_seg: &[byte] = ycfg_trim(text.ptr[0: colon as usize]);
+        var vstart: usize = (colon as usize) + 1;
+        while vstart < text.len && ycfg_space(text.ptr[vstart]) {
+            vstart = vstart + 1;
+        }
+        const vseg: &[byte] = text.ptr[vstart: text.len - vstart];
+        t.cur = t.cur + 1;
+        if first_key_handled {
+            const child: i32 = yt_append_child(t, node, YK_NULL, key_seg.ptr, key_seg.len);
+            ycfg_assign_value(t, raw, child, vseg, indent);
+        } else {
+            first_key_handled = true;
+            const child2: i32 = yt_append_child(t, node, YK_NULL, key_seg.ptr, key_seg.len);
+            ycfg_assign_value(t, raw, child2, vseg, indent);
+        }
+    }
+    return node;
+}
+
+// ============================================================
+// 入口
+// ============================================================
+export fn yt_parse_text(text: &const Buf, t: &YTree) bool {
+    var no_comments: Buf = buf_new(text.len + 16);
+    defer { buf_free(&no_comments); }
+    if !ycfg_strip_comments(text, &no_comments) {
+        return false;
+    }
+    var clean: Buf = buf_new(no_comments.len + 16);
+    defer { buf_free(&clean); }
+    if !ycfg_neutralize_tags(&no_comments, &clean) {
+        return false;
+    }
+    if !ycfg_build_lines(t, &clean) {
+        return false;
+    }
+    // 保留一份 clean 文本（行表指向它）
+    buf_reset(&t.raw);
+    if !buf_append(&t.raw, clean.ptr, clean.len) {
+        return false;
+    }
+    t.cur = 0;
+    const root: i32 = ycfg_parse_block(t, t.raw.ptr as &const byte, 0);
+    return root >= 0;
+}
+
+export fn yt_root(t: &const YTree) i32 {
+    // 根节点固定是第 0 个（ycfg_parse_block 的第一个分配）
+    if t.n == 0 {
+        return -1;
+    }
+    return 0 as i32;
+}
+
+export fn yt_load_file(path: &const byte, t: &YTree) bool {
+    const fd: i32 = sys_open(path as *const byte, O_RDONLY as i32, 0) catch {
+        return false;
+    };
+    defer { _ = sys_close(fd) catch {}; }
+    var src: Buf = buf_new(4096);
+    defer { buf_free(&src); }
+    var tmp: [byte: 16384] = [0: 16384];
+    while true {
+        const n: isize = sys_read(fd, &tmp[0], 16384) catch { 0 as isize; };
+        if n <= 0 {
+            break;
+        }
+        if !buf_append(&src, &tmp[0], n as usize) {
+            return false;
+        }
+    }
+    if src.len == 0 {
+        return false;
+    }
+    return yt_parse_text(&src, t);
+}
+
+// 诊断：把树打印出来（--yaml-dump）
+fn yt_dump_node(t: &const YTree, idx: i32, depth: i32) void {
+    if idx < 0 || depth > 24 {
+        return;
+    }
+    var c: i32 = idx;
+    while c >= 0 {
+        var k: i32 = 0;
+        while k < depth {
+            out_err("  ");
+            k = k + 1;
+        }
+        const nd: &const YNode = yt_node(t, c);
+        if nd.key.len > 0 {
+            out_err_bytes(nd.key.ptr as &const byte, nd.key.len);
+            out_err(": ");
+        }
+        if nd.kind == YK_MAP {
+            out_err("{}\n");
+            yt_dump_node(t, nd.child, depth + 1);
+        } else if nd.kind == YK_SEQ {
+            out_err("[]\n");
+            yt_dump_node(t, nd.child, depth + 1);
+        } else {
+            const v: &[byte] = nd.val.ptr[0: nd.val.len];
+            var show: usize = v.len;
+            if show > 200 {
+                show = 200;
+            }
+            out_err_bytes(v.ptr as &const byte, show);
+            if v.len > 200 {
+                out_err(" …");
+            }
+            out_err("\n");
+        }
+        c = nd.next;
+    }
+}
+
+export fn yt_dump(path: &const byte, t: &YTree) bool {
+    if !yt_load_file(path, t) {
+        out_err("yaml 解析失败: ");
+        out_err_bytes(path, bufx_cstr_len(path));
+        out_err("\n");
+        return false;
+    }
+    yt_dump_node(t, yt_root(t), 0);
+    return true;
+}

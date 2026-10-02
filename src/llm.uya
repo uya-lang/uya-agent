@@ -1,0 +1,550 @@
+// src/llm.uya — OpenAI 兼容 chat/completions 的**流式**响应解析（P1）
+//
+// 只负责把 SSE 事件流变成一条 assistant 消息 + usage + finish 语义：
+//   * content / reasoning_content 增量可选地即时输出；
+//   * tool_calls 按 wire index 分片累积（首帧带 id/name，后续帧只有 arguments 片段）；
+//   * usage 取 prompt_tokens / completion_tokens / cached_tokens / reasoning_tokens；
+//   * finish_reason 映射成 stop / tool-calls / max-tokens / error，缺 [DONE] 视为流被截断。
+//
+// 关键坑（README 第 3 节第 1、15 条）：
+//   std.json 零拷贝且字符串**未反转义** —— 每个事件 payload 先复制进本模块自己的
+//   arena（逐事件 reset），解析后立刻 sv_unescape 进 ChatOut 的堆缓冲；绝不让
+//   JsonStrView 活过下一次 arena_reset。
+
+use libc.unistd;
+use libc.heap;
+use libc.stdlib;
+use std.mem.mem.mem_copy;
+use std.mem.arena.Arena;
+use std.mem.arena.arena_init;
+use std.mem.arena.arena_alloc;
+use std.mem.arena.arena_reset;
+use std.json.value.JsonValue;
+use std.json.value.JsonStrView;
+
+export error LlmMalformed;
+export error LlmStreamClosed;
+// 用户在流式期间按了 Ctrl-C / Esc（P3）
+export error LlmInterrupted;
+
+export const LLM_FINISH_NONE: i32 = 0;
+export const LLM_FINISH_STOP: i32 = 1;
+export const LLM_FINISH_TOOL_CALLS: i32 = 2;
+export const LLM_FINISH_MAX_TOKENS: i32 = 3;
+export const LLM_FINISH_ERROR: i32 = 4;
+
+const LLM_MAX_CALLS: usize = 16;
+const LLM_EVENT_ARENA: usize = 262144;
+const LLM_ERR_HEAD: usize = 240;
+
+export struct LlmCall {
+    index: i64,     // wire 的 tool_calls[].index
+    id: Buf,        // 首帧给的调用 id（可能为空）
+    name: Buf,      // 函数名（可能分片）
+    args: Buf,      // arguments 的**原始 JSON 文本**（已反转义、已拼接，但未 parse）
+}
+
+export struct ChatOut {
+    content: Buf,
+    reasoning: Buf,
+    calls: [LlmCall: LLM_MAX_CALLS],
+    ncalls: usize,
+    finish: i32,
+    have_finish: bool,
+    bad_finish: Buf,     // 未知 finish_reason 原文（诊断）
+    err_text: Buf,       // 体内 error / 坏 payload 头部（诊断）
+    usage_in: i64,       // 非缓存输入（prompt_tokens - cached）
+    usage_out: i64,
+    usage_cache_read: i64,
+    usage_reasoning: i64,
+    saw_done: bool,
+    printed_chars: usize,
+    events: usize,
+}
+
+// 造一个可用的 ChatOut（内部缓冲已分配；用完调 chat_out_free）
+export fn chat_out_new() ChatOut {
+    var o: ChatOut = ChatOut{
+        content: buf_empty(),
+        reasoning: buf_empty(),
+        calls: [],
+        ncalls: 0,
+        finish: LLM_FINISH_NONE,
+        have_finish: false,
+        bad_finish: buf_empty(),
+        err_text: buf_empty(),
+        usage_in: 0,
+        usage_out: 0,
+        usage_cache_read: 0,
+        usage_reasoning: 0,
+        saw_done: false,
+        printed_chars: 0,
+        events: 0,
+    };
+    o.content = buf_new(8192);
+    o.reasoning = buf_new(4096);
+    o.bad_finish = buf_new(64);
+    o.err_text = buf_new(LLM_ERR_HEAD + 8);
+    var i: usize = 0;
+    while i < LLM_MAX_CALLS {
+        o.calls[i] = LlmCall{ index: -1, id: buf_empty(), name: buf_empty(), args: buf_empty() };
+        i = i + 1;
+    }
+    return o;
+}
+
+export fn chat_out_free(o: &ChatOut) void {
+    buf_free(&o.content);
+    buf_free(&o.reasoning);
+    buf_free(&o.bad_finish);
+    buf_free(&o.err_text);
+    var i: usize = 0;
+    while i < LLM_MAX_CALLS {
+        buf_free(&o.calls[i].id);
+        buf_free(&o.calls[i].name);
+        buf_free(&o.calls[i].args);
+        i = i + 1;
+    }
+    o.ncalls = 0;
+}
+
+// 按 wire index 找槽位；没有就新建。返回 -1 表示槽位用尽。
+fn llm_slot(o: &ChatOut, index: i64) isize {
+    var i: usize = 0;
+    while i < o.ncalls {
+        if o.calls[i].index == index {
+            return i as isize;
+        }
+        i = i + 1;
+    }
+    // 注意：数组下标的安全证明只认「局部变量 + 字面量上界」，所以要先用局部量接住 ncalls
+    const slot: usize = o.ncalls;
+    if slot >= LLM_MAX_CALLS {
+        return -1 as isize;
+    }
+    o.calls[slot].index = index;
+    o.ncalls = slot + 1;
+    return slot as isize;
+}
+
+fn llm_err_head(o: &ChatOut, p: &const byte, n: usize) void {
+    buf_reset(&o.err_text);
+    var take: usize = n;
+    if take > LLM_ERR_HEAD {
+        take = LLM_ERR_HEAD;
+    }
+    if take > 0 {
+        _ = buf_append(&o.err_text, p, take);
+    }
+}
+
+fn llm_apply_finish(fr: &const JsonStrView, o: &ChatOut) void {
+    o.have_finish = true;
+    if fr.len == 4 && bufx_eq_cstr(fr.ptr as &const byte, 4, "stop") {
+        o.finish = LLM_FINISH_STOP;
+        return;
+    }
+    if fr.len == 10 && bufx_eq_cstr(fr.ptr as &const byte, 10, "tool_calls") {
+        o.finish = LLM_FINISH_TOOL_CALLS;
+        return;
+    }
+    if fr.len == 6 && bufx_eq_cstr(fr.ptr as &const byte, 6, "length") {
+        o.finish = LLM_FINISH_MAX_TOKENS;
+        return;
+    }
+    // content_filter / insufficient_system_resource / … 一律当错误
+    o.finish = LLM_FINISH_ERROR;
+    buf_reset(&o.bad_finish);
+    _ = sv_unescape(fr, &o.bad_finish);
+}
+
+fn llm_apply_usage(u: &JsonValue, o: &ChatOut) void {
+    var v: JsonValue = JsonValue.json_null();
+    var n: i64 = 0;
+    if js_obj_get(u, "prompt_tokens", 13, &v) && js_i64_of(&v, &n) {
+        // 缓存读数只在**本帧给了明细**时更新：有些网关尾随的 usage-only 帧只带
+        // prompt_tokens/completion_tokens，无条件覆盖会把已拿到的缓存命中清成 0。
+        var cache: i64 = o.usage_cache_read;
+        var det: JsonValue = JsonValue.json_null();
+        if js_obj_get(u, "prompt_tokens_details", 21, &det) {
+            var cv: JsonValue = JsonValue.json_null();
+            var c: i64 = 0;
+            if js_obj_get(&det, "cached_tokens", 13, &cv) && js_i64_of(&cv, &c) {
+                cache = c;
+            }
+        } else {
+            var hv: JsonValue = JsonValue.json_null();
+            var h: i64 = 0;
+            if js_obj_get(u, "prompt_cache_hit_tokens", 23, &hv) && js_i64_of(&hv, &h) {
+                cache = h;
+            }
+        }
+        o.usage_cache_read = cache;
+        o.usage_in = n - cache;   // DeepSeek 的 prompt_tokens **含**缓存命中
+    }
+    if js_obj_get(u, "completion_tokens", 17, &v) && js_i64_of(&v, &n) {
+        o.usage_out = n;
+    }
+    var det2: JsonValue = JsonValue.json_null();
+    if js_obj_get(u, "completion_tokens_details", 25, &det2) {
+        var rv: JsonValue = JsonValue.json_null();
+        var r: i64 = 0;
+        if js_obj_get(&det2, "reasoning_tokens", 16, &rv) && js_i64_of(&rv, &r) {
+            o.usage_reasoning = r;
+        }
+    }
+}
+
+// delta.content / delta.reasoning_content / delta.tool_calls[] → ChatOut
+fn llm_apply_delta(delta: &JsonValue, o: &ChatOut, print_content: bool, print_reasoning: bool) !void {
+    var sv: JsonStrView = JsonStrView{ ptr: null, len: 0 };
+    if js_obj_get_str(delta, "content", 7, &sv) && sv.len > 0 {
+        const before: usize = o.content.len;
+        if !sv_unescape(&sv, &o.content) {
+            return error.LlmMalformed;
+        }
+        if print_content && o.content.len > before {
+            tty_stream_write(1, &o.content.ptr[before], o.content.len - before);
+            o.printed_chars = o.printed_chars + (o.content.len - before);
+        }
+    }
+    var rsv: JsonStrView = JsonStrView{ ptr: null, len: 0 };
+    if js_obj_get_str(delta, "reasoning_content", 17, &rsv) && rsv.len > 0 {
+        const rbefore: usize = o.reasoning.len;
+        if !sv_unescape(&rsv, &o.reasoning) {
+            return error.LlmMalformed;
+        }
+        if print_reasoning && o.reasoning.len > rbefore {
+            tty_stream_write(2, &o.reasoning.ptr[rbefore], o.reasoning.len - rbefore);
+        }
+    }
+    var calls: JsonValue = JsonValue.json_null();
+    if js_obj_get(delta, "tool_calls", 10, &calls) {
+        const nc: usize = js_arr_len(&calls);
+        var k: usize = 0;
+        while k < nc {
+            var tc: JsonValue = JsonValue.json_null();
+            if js_arr_get(&calls, k, &tc) {
+                var widx: i64 = k as i64;   // 缺 index 时用数组下标兜底（同帧多调用的场景）
+                var idxv: JsonValue = JsonValue.json_null();
+                if js_obj_get(&tc, "index", 5, &idxv) {
+                    var got: i64 = 0;
+                    if js_i64_of(&idxv, &got) {
+                        widx = got;
+                    }
+                }
+                const slot: isize = llm_slot(o, widx);
+                if slot >= 0 {
+                    const si: usize = slot as usize;
+                    if si >= LLM_MAX_CALLS {
+                        return error.LlmMalformed;
+                    }
+                    var idv: JsonStrView = JsonStrView{ ptr: null, len: 0 };
+                    if js_obj_get_str(&tc, "id", 2, &idv) && idv.len > 0 {
+                        if !sv_unescape(&idv, &o.calls[si].id) {
+                            return error.LlmMalformed;
+                        }
+                    }
+                    var fnv: JsonValue = JsonValue.json_null();
+                    if js_obj_get(&tc, "function", 8, &fnv) {
+                        var nv: JsonStrView = JsonStrView{ ptr: null, len: 0 };
+                        if js_obj_get_str(&fnv, "name", 4, &nv) && nv.len > 0 {
+                            if !sv_unescape(&nv, &o.calls[si].name) {
+                                return error.LlmMalformed;
+                            }
+                        }
+                        var av: JsonStrView = JsonStrView{ ptr: null, len: 0 };
+                        if js_obj_get_str(&fnv, "arguments", 9, &av) && av.len > 0 {
+                            // 片段逐个反转义再拼接：服务端每个片段都是合法 JSON 字符串，
+                            // 因此「逐片段解码后拼接」与「整体解码」等价。
+                            if !sv_unescape(&av, &o.calls[si].args) {
+                                return error.LlmMalformed;
+                            }
+                        }
+                    }
+                }
+            }
+            k = k + 1;
+        }
+    }
+}
+
+// 处理一个 SSE data payload。返回 false = 收到 [DONE]，流应当结束。
+fn llm_handle_payload(arena: &Arena, payload: &[byte], o: &ChatOut, print_content: bool, print_reasoning: bool) !bool {
+    o.events = o.events + 1;
+    var ps: usize = 0;
+    while ps < payload.len && (payload.ptr[ps] == 32 as byte || payload.ptr[ps] == 9 as byte) {
+        ps = ps + 1;
+    }
+    const n: usize = payload.len - ps;
+    if n == 0 {
+        return true;
+    }
+    if n == 6 && bufx_eq_cstr(&payload.ptr[ps] as &const byte, 6, "[DONE]") {
+        o.saw_done = true;
+        return false;
+    }
+    arena_reset(arena);
+    const copy: &byte = arena_alloc(arena, n + 1);
+    if (copy as usize) == 0 {
+        return error.HcOutOfMemory;
+    }
+    _ = mem_copy(copy, &payload.ptr[ps], n);
+    var root: JsonValue = JsonValue.json_null();
+    if !js_parse(arena, copy, n, &root) {
+        llm_err_head(o, &payload.ptr[ps], n);
+        o.finish = LLM_FINISH_ERROR;
+        o.have_finish = true;
+        return error.LlmMalformed;
+    }
+
+    var choices: JsonValue = JsonValue.json_null();
+    if js_obj_get(&root, "choices", 7, &choices) {
+        const cn: usize = js_arr_len(&choices);
+        var i: usize = 0;
+        while i < cn {
+            var ch: JsonValue = JsonValue.json_null();
+            if js_arr_get(&choices, i, &ch) {
+                var delta: JsonValue = JsonValue.json_null();
+                if js_obj_get(&ch, "delta", 5, &delta) {
+                    try llm_apply_delta(&delta, o, print_content, print_reasoning);
+                }
+                var fr: JsonStrView = JsonStrView{ ptr: null, len: 0 };
+                if js_obj_get_str(&ch, "finish_reason", 13, &fr) {
+                    llm_apply_finish(&fr, o);
+                }
+            }
+            i = i + 1;
+        }
+    }
+
+    var usage: JsonValue = JsonValue.json_null();
+    if js_obj_get(&root, "usage", 5, &usage) {
+        llm_apply_usage(&usage, o);
+    }
+
+    // 有些网关会「HTTP 200 + 体内 error」
+    var err_obj: JsonValue = JsonValue.json_null();
+    if js_obj_get(&root, "error", 5, &err_obj) {
+        var msg: JsonStrView = JsonStrView{ ptr: null, len: 0 };
+        if js_obj_get_str(&err_obj, "message", 7, &msg) {
+            llm_err_head(o, msg.ptr, msg.len);
+        } else {
+            llm_err_head(o, &payload.ptr[ps], n);
+        }
+        o.finish = LLM_FINISH_ERROR;
+        o.have_finish = true;
+    }
+    return true;
+}
+
+// 非流式响应体 → ChatOut（--no-stream 路径复用同一套收尾逻辑）
+export fn chat_out_from_nonstream(root: &JsonValue, o: &ChatOut) !void {
+    var choices: JsonValue = JsonValue.json_null();
+    if !js_obj_get(root, "choices", 7, &choices) {
+        var err_obj: JsonValue = JsonValue.json_null();
+        var emsg: JsonStrView = JsonStrView{ ptr: null, len: 0 };
+        if js_obj_get(root, "error", 5, &err_obj) && js_obj_get_str(&err_obj, "message", 7, &emsg) {
+            llm_err_head(o, emsg.ptr, emsg.len);
+        }
+        o.finish = LLM_FINISH_ERROR;
+        o.have_finish = true;
+        return;
+    }
+    var first: JsonValue = JsonValue.json_null();
+    if !js_arr_get(&choices, 0, &first) {
+        o.finish = LLM_FINISH_ERROR;
+        o.have_finish = true;
+        return;
+    }
+    var msg: JsonValue = JsonValue.json_null();
+    if !js_obj_get(&first, "message", 7, &msg) {
+        o.finish = LLM_FINISH_ERROR;
+        o.have_finish = true;
+        return;
+    }
+    var sv: JsonStrView = JsonStrView{ ptr: null, len: 0 };
+    if js_obj_get_str(&msg, "content", 7, &sv) && sv.len > 0 {
+        if !sv_unescape(&sv, &o.content) {
+            return error.LlmMalformed;
+        }
+    }
+    if js_obj_get_str(&msg, "reasoning_content", 17, &sv) && sv.len > 0 {
+        if !sv_unescape(&sv, &o.reasoning) {
+            return error.LlmMalformed;
+        }
+    }
+    var calls: JsonValue = JsonValue.json_null();
+    if js_obj_get(&msg, "tool_calls", 10, &calls) {
+        const nc: usize = js_arr_len(&calls);
+        var k: usize = 0;
+        while k < nc {
+            var call: JsonValue = JsonValue.json_null();
+            if js_arr_get(&calls, k, &call) {
+                const slot: isize = llm_slot(o, k as i64);
+                if slot >= 0 {
+                    const si: usize = slot as usize;
+                    if si >= LLM_MAX_CALLS {
+                        return error.LlmMalformed;
+                    }
+                    var idv: JsonStrView = JsonStrView{ ptr: null, len: 0 };
+                    if js_obj_get_str(&call, "id", 2, &idv) && idv.len > 0 {
+                        if !sv_unescape(&idv, &o.calls[si].id) {
+                            return error.LlmMalformed;
+                        }
+                    }
+                    var fnv: JsonValue = JsonValue.json_null();
+                    if js_obj_get(&call, "function", 8, &fnv) {
+                        var nv: JsonStrView = JsonStrView{ ptr: null, len: 0 };
+                        if js_obj_get_str(&fnv, "name", 4, &nv) && nv.len > 0 {
+                            if !sv_unescape(&nv, &o.calls[si].name) {
+                                return error.LlmMalformed;
+                            }
+                        }
+                        var av: JsonStrView = JsonStrView{ ptr: null, len: 0 };
+                        if js_obj_get_str(&fnv, "arguments", 9, &av) && av.len > 0 {
+                            if !sv_unescape(&av, &o.calls[si].args) {
+                                return error.LlmMalformed;
+                            }
+                        }
+                    }
+                }
+            }
+            k = k + 1;
+        }
+    }
+    var fr: JsonStrView = JsonStrView{ ptr: null, len: 0 };
+    if js_obj_get_str(&first, "finish_reason", 13, &fr) {
+        llm_apply_finish(&fr, o);
+    }
+    var usage: JsonValue = JsonValue.json_null();
+    if js_obj_get(root, "usage", 5, &usage) {
+        llm_apply_usage(&usage, o);
+    }
+}
+
+
+// 流式期间的键盘服务：把完整行投进 steer 收件箱（下一个 step 边界被领取），
+// 把 Ctrl-C/Esc 变成中断信号。返回本次拿到的事件。
+fn llm_pump_input() i32 {
+    // 顺序：已排队事件 → pend → 读键盘（与 tty_read_line_blocking 保持一致）
+    var ev: i32 = tty_next_event(&tty_ui);
+    if ev == TTY_EV_NONE && tty_has_pending(&tty_ui) {
+        var none_bytes: [byte: 0] = [];
+        tty_feed(&tty_ui, &none_bytes[0: 0], 0);
+        tty_flush_esc(&tty_ui);
+        ev = tty_next_event(&tty_ui);
+    }
+    if ev == TTY_EV_NONE {
+        _ = tty_pump(&tty_ui, 0);
+        ev = tty_next_event(&tty_ui);
+    }
+    if ev == TTY_EV_SUBMIT {
+        const n: usize = tty_line_len(&tty_ui);
+        if n > 0 {
+            const p: &const byte = tty_ui.line.ptr as &const byte;
+            _ = inbox_push(&g_steer, p, n);
+            tty_puts(&tty_ui, 2, "\n[steer] ");
+            tty_write(&tty_ui, 2, p, n);
+            tty_puts(&tty_ui, 2, "\n");
+        }
+        tty_line_clear(&tty_ui);
+    } else if ev == TTY_EV_CLEARED || ev == TTY_EV_REDRAW {
+        tty_draw_line(&tty_ui, 2);
+    }
+    return ev;
+}
+
+// 发流式请求并把整条 SSE 流消费完。返回 HTTP 状态码。
+//
+// 错误：网络/TLS 走 Hc* 错误；坏 payload 走 error.LlmMalformed；缺 [DONE] 走
+// error.LlmStreamClosed（对齐 DSH 的 STREAM_CLOSED）。
+export fn llm_stream_chat(
+    url: &[byte],
+    headers: &[byte],
+    body: &const byte,
+    body_len: usize,
+    timeout_ms: u32,
+    max_body: usize,
+    verify: i32,
+    pin: &[byte],
+    o: &ChatOut,
+    print_content: bool,
+    print_reasoning: bool,
+    interactive: bool
+) !i32 {
+    const arena_raw: &void = malloc(LLM_EVENT_ARENA);
+    if ((arena_raw as &byte) as usize) == 0 {
+        return error.HcOutOfMemory;
+    }
+    defer { free(arena_raw); }
+    var arena: Arena = Arena{ buffer: null, size: 0, used: 0 };
+    arena_init(&arena, arena_raw as &byte, LLM_EVENT_ARENA);
+
+    var st: HcStream = hc_stream_empty();
+    defer { hc_stream_free(&st); }
+    var tc: TlsConn = tls_conn_empty();
+    try hc_open(url, &"POST"[0: 4], headers, body, body_len, timeout_ms, max_body, verify, pin, &st, &tc);
+
+    if st.status != 200 {
+        // 非 2xx 的体不是 SSE（是 JSON/HTML 错误体）：把前面一段收进 err_text，
+        // 交给上层打印状态码与错误体，别把它当事件流解析。
+        while true {
+            const f0: i32 = try hc_fill(&st);
+            if o.err_text.len < LLM_ERR_HEAD {
+                const want: usize = LLM_ERR_HEAD - o.err_text.len;
+                _ = try hc_body_read(&st, &o.err_text, want);
+            }
+            if f0 == 0 {
+                break;
+            }
+        }
+        return st.status;
+    }
+
+    var sr: SseReader = SseReader{ acc: buf_empty(), have_data: false, events: 0, comments: 0 };
+    sse_init(&sr);
+    defer { sse_free(&sr); }
+    var payload: Buf = buf_new(8192);
+    defer { buf_free(&payload); }
+
+    var done: bool = false;
+    while !done {
+        // 1) 先把手上的完整事件全部处理掉
+        while true {
+            const ev: i32 = try sse_next(&st, &sr, &payload);
+            if ev <= 0 {
+                break;
+            }
+            const cont: bool = try llm_handle_payload(&arena, payload.ptr[0: payload.len], o, print_content, print_reasoning);
+            if !cont {
+                done = true;
+                break;
+            }
+        }
+        if done {
+            break;
+        }
+        // 2) 没有完整事件就再读一段；交互模式下先服务键盘，避免流式期间输入无响应
+        if interactive {
+            const tev: i32 = llm_pump_input();
+            if tev == TTY_EV_CTRL_C || tev == TTY_EV_ESC {
+                return error.LlmInterrupted;
+            }
+            const fw: i32 = try hc_fill_wait(&st, 50);
+            if fw == 0 {
+                break;
+            }
+            continue;
+        }
+        const f: i32 = try hc_fill(&st);
+        if f == 0 {
+            break;
+        }
+    }
+
+    if !o.saw_done && o.finish != LLM_FINISH_ERROR {
+        return error.LlmStreamClosed;
+    }
+    return st.status;
+}

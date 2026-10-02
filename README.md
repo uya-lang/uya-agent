@@ -1,8 +1,16 @@
 # uya-agent — 纯 Uya 写的极简 CLI 编程 agent
 
 一个**只用 Uya 源码**实现的命令行编程 agent：给它一句话任务，它自己看文件、改文件、跑命令，
-多轮 loop 直到给出结论。全部代码 5 个 `.uya` 文件、约 3200 行，**不引入任何 C 代码、`@c_import`
-或其它语言**，只依赖 Uya 语言与随编译器分发的标准库。
+多轮 loop 直到给出结论。全部代码 9 个 `.uya` 文件，**不引入任何 C 代码、`@c_import` 或其它语言**，
+只依赖 Uya 语言与随编译器分发的标准库。
+
+**P1–P5 已完成**：LLM 交互是**流式 SSE**（`stream:true` + `stream_options.include_usage`），
+增量 chunked 解码 + SSE 分帧 + `tool_calls` 按 `index` 分片累积；消息协议是**严格工具协议**
+（`assistant.tool_calls` 原样回灌 + 每条结果一条 `role:"tool"` + `tool_call_id`）；
+交互界面是**真 TTY**（termios raw + 行编辑器），流式期间可打断、可继续输入、可续跑；
+会话**落盘可恢复**（`--continue` / `--resume` / `/sessions`，跨进程实测「记住 4271 → 下一个进程问它 → 答 4271」）；
+**直接读 DSH 的设置文件**：`--print-config` 显示 base_url / model / api_key / contextWindow 全部来自
+`~/.dsh`，实测**零参数启动**（只额外给信任策略）能直接跑通真机网关。`--no-stream` / `--compat-fold` 保留两条回退路径。
 
 ```
 $ DEEPSEEK_API_KEY=sk-xxx ./build/uya-agent "在当前目录创建 hello.uya，编译并运行它"
@@ -53,6 +61,24 @@ export UYA_SPLIT_C_DIR=$PWD/build/uyacache      # 多文件 C 缓存别丢在仓
 | `--max-response N` | 响应体上限，默认 256 KiB |
 | `--timeout-ms N` | 单次 HTTP 超时，默认 120 s |
 | `--no-shell` | 不提供 `run_shell`（tools schema 里也不会出现） |
+| `--no-stream` | 关闭流式，回退一次性响应（老端点兼容） |
+| REPL 命令 | `/help` `/continue` `/status` `/sessions` `/resume <id>` `/new` `/exit` |
+| `--agent-home DIR` | 会话与索引的根目录（默认 `~/.uya-agent`） |
+| `--continue` | 接着当前目录最近一条会话继续 |
+| `--resume ID` | 恢复指定会话（`ID` 或 `last`） |
+| `--list-sessions` | 列出本机会话后退出 |
+| `--no-save` | 不写会话日志 |
+| `--dsh-home DIR` | DSH 用户目录（默认 `$DSH_HOME` 或 `~/.dsh`） |
+| `--no-dsh-config` | 完全不读 DSH 设置 |
+| `--strict-dsh-config` | 读不到 DSH 设置就报错退出 |
+| `--print-config` | 打印生效配置与来源后退出 |
+| `--yaml-dump FILE` | 打印该 YAML 的解析结果（诊断） |
+| `--compat-fold` | 工具结果折叠成一条 user 消息（旧协议） |
+| `--no-stream-options` | 不发送 `stream_options.include_usage` |
+| `--show-reasoning` | 把 `reasoning_content` 打到 stderr |
+| `--show-usage` | 每轮打印 token 用量（in/out/cache/reasoning） |
+| `--max-tokens N` | 发送 `max_tokens`（默认不发送） |
+| `--temperature N` | 发送 `temperature`（默认不发送，对齐 DSH） |
 | `--tls-verify=chain\|pin\|none` | TLS 信任策略，默认 `chain`，见第 5 节 |
 | `--tls-pin HEX` | `pin` 模式要求的 leaf 证书 SHA-256（小写 hex） |
 | `--quiet` | 不打印每步工具调用信息 |
@@ -69,12 +95,126 @@ export UYA_SPLIT_C_DIR=$PWD/build/uyacache      # 多文件 C 缓存别丢在仓
 ## 2. 代码结构
 
 ```
-src/httpc.uya     传输层：Buf、URL 解析、DNS+TCP、TLS 会话、请求构造、响应解析、leaf 指纹
+src/bufx.uya      通用字节层：Buf 生命周期、拼接、十进制/十六进制、UTF-8 码点计数与切片
 src/jsonx.uya     JSON：JsonWriter 组装请求；JsonValue 导航取值；字符串反转义（关键，见下）
+src/httpc.uya     传输层：URL 解析、DNS+TCP、TLS 会话、请求构造、非流式响应解析、leaf 指纹
+src/httpstream.uya 流式传输：请求发出后只读到响应头，body 按需增量解码（chunked 状态机）
+src/sse.uya       SSE 分帧：字段行、多行 data、空行 dispatch、注释、未终结帧不冲刷
+src/llm.uya       请求/响应协议：消息组装、流式 delta 装配（content/reasoning/tool_calls）、
+                  usage 合并、finish_reason 映射、非流式响应 → 同一 ChatOut
 src/tools.uya     三个工具：read_file / write_file / run_shell
-src/agent.uya     CLI、环境变量、对话历史、请求组装、主循环、工具分发、REPL
-src/selftest.uya  --selftest 的内置 mock LLM + --probe
+src/tty.uya       终端层：termios raw 模式、行编辑器（历史/光标/Delete/词删除）、
+                  单行渲染协议（擦输入行→写→重画）、提示符即状态显示
+src/inbox.uya     输入收件箱：steer（运行中输入的文本，step 边界领取）+ keepInbox 语义
+src/yamlcfg.uya   自带 YAML 子集解析器：去注释（块标量/引号感知）、中和 `!!tag`、
+                  block/flow 映射与序列、`|`/`>` 块标量、跨行 flow 集合、节点池树 + 导航
+src/dshcfg.uya    读 DSH 设置：$DSH_HOME 解析、settings.yaml 模型路线（agent-default-model →
+                  provider 的 baseURL/apiKeyEnv/models[]）、.credentials.yaml、.env 兜底、
+                  permission→confine、uya-agent.tls 命名空间
+src/session.uya   会话日志：路径规范化、id 生成（/dev/urandom→uuid）、header/事件序列化与追加写、
+                  索引、读取与崩溃尾部裁剪、按 id/最近查找、括号配平的数组提取
+src/agent.uya     CLI、环境变量、消息历史、请求组装、主循环（流式/非流式）、工具分发、
+                  交互式 REPL（中断/steer//continue/会话命令）、会话事件记录与恢复
+src/selftest.uya  --selftest 的 mock LLM（含 SSE 受控切分）+ 15 轮断言 + --probe
 ```
+
+### DSH 设置文件兼容（P5）
+
+* 读哪些文件：`$DSH_HOME/settings.yaml`（模型路线、preset 选择、权限预设）、
+  `$DSH_HOME/.credentials.yaml`（`refs: {NAME: secret}`）、`<cwd>/.env`、`$DSH_HOME/.env`。
+  `$DSH_HOME` = `--dsh-home` > `$DSH_HOME` > `$HOME/.dsh`。
+* 解析出的东西：`base_url`（provider 的 `baseURL`）、`model`、`reasoning_effort`、
+  `context_window` / `max_tokens` / `input_image`（模型条目）、`api_key`
+  （按 `apiKeyEnv` 走「进程环境 > `.credentials.yaml` > `<cwd>/.env` > `$DSH_HOME/.env`」四层）、
+  以及 `permission.defaultPreset → confine`（`danger-full-access` 不限制，其它预设启用工作区守卫）。
+* 优先级：**CLI > `UYA_AGENT_*` 环境变量 > DSH 设置 > 内置默认**，`--print-config` 逐项打印来源
+  （`default` / `dsh-settings` / `env` / `cli`），敏感值打码成 `sk-…abcd`。
+  `--no-dsh-config` 完全关闭，`--strict-dsh-config` 读不到就报错退出。
+* TLS 信任策略也可以写进同一个设置文件（DSH 会忽略不认识的节）：
+  ```yaml
+  uya-agent:
+    tls: { verify: pin, pin: <leaf sha256> }   # 或 verify: none
+  ```
+  这样「零参数启动」才真的可用 —— 默认 `chain` 在真实站点上过不去（见第 5 节）。
+* `--yaml-dump FILE` 可以打印解析出来的配置树，排查「设置没生效」很有用。
+* 为什么自带 YAML 解析器而不是用 `std.yaml`：见踩坑第 26 条。
+
+### 会话持久化与恢复（P4）
+
+* 布局（沿用 DSH 形状，**不压缩**）：
+  `<agent-home>/sessions/--<normalized-cwd>--/<session-id>/session.jsonl` + `<agent-home>/index.jsonl`。
+  `<agent-home>` = `--agent-home` > `$UYA_AGENT_HOME` > `$HOME/.uya-agent`。
+* 首行 header（`type/version/id/createdAt/cwd/delegationDepth/agentPreset/model/provider`），
+  之后每行一个 `{"type":…,"seq":N,"time":N,"data":{…}}`，`seq` 从 0 连续递增，追加-only。
+* 事件词表：`user/message`、`assistant/message`（含 `tool_calls` 原文）、`tool/call`、`tool/result`、
+  `turn/start|end`、`step/start`、`session/title`。**续写已有会话时不重复写 header**，
+  `seq` 接着已有最大值往下走（跨进程实测连续）。
+* **崩溃恢复**：最后一行不完整（没有换行结尾）时丢弃它并在 stderr 告警 —— 对应 DSH 的
+  「保留有效尾部工作」。
+* 恢复时会**原样还原** `tool_calls`（用括号配平提取数组文本，不重新序列化，避免 arguments 二次转义），
+  因此恢复出来的历史可以直接再序列化成合法请求（自测断言了 `tool_call_id` 与 `tool_calls` 都在）。
+* 入口：`--continue`（当前目录最近一条）、`--resume <id|last>`、`--list-sessions`、`--no-save`；
+  REPL 里 `/sessions`、`/resume <id>`、`/new`。
+* 不持久化（恢复时重建）：AGENTS.md 与技能目录、运行时上下文、工具 schema；
+  文件观察版本表在恢复后为空（与 DSH 已知限制一致）。
+
+### TTY 交互（P3）
+
+* **raw 模式**：`ioctl(0, TCGETS)` 成功即 TTY（libc 没导出 `isatty`）；清
+  `ICANON|ECHO|ISIG|IEXTEN` 与 `IXON|ICRNL`，`VMIN=1/VTIME=0`，**保留 OPOST**
+  （否则项目里大量 `
+` 输出会变阶梯状）。退出（正常返回 / 错误返回 / Ctrl-D / `/exit`）
+  都会恢复 termios。
+* **按键**：
+
+  | 键 | 回合运行中 | 空闲（提示符） |
+  |---|---|---|
+  | 回车 | 文本进 steer 收件箱，**下一个 step 边界**作为普通 user 消息被采纳 | 作为新一轮任务 |
+  | Ctrl-C | 中断本回合：停止读取流、丢弃未派发的 tool_calls、只保留 content 的非空白前缀、历史保留 | 输入非空→清行；空行→提示一次，2 秒内再按→退出 |
+  | Ctrl-D | 忽略 | 空行→退出；非空→删光标处字符 |
+  | Esc | 同 Ctrl-C（`ESC[` 前缀识别为方向键序列） | 清行 |
+  | ↑/↓ | 历史导航（32 条） | 同左 |
+  | Ctrl-U / Ctrl-W / Ctrl-L | 清行 / 删词 / 重绘 | 同左 |
+  | Backspace/Del/←/→/Home/End | 行编辑 | 同左 |
+
+* **事件与行的顺序不变量**（踩过坑）：事件是排队的，而「正在编辑的行」只有一份，
+  所以取用顺序必须是 **已排队事件 → pend（一次读取里剩下的字节）→ 读键盘**；
+  反过来做会让 `read` 一次拿到的多行（粘贴）粘成一行，并让事件与行内容错位。
+* **slash 命令**：`/help`、`/continue`（带历史再跑一轮）、`/status`、`/exit`。
+  运行中输入的 slash 命令也按命令处理（用户并不知道回合是否结束）。
+* **中断语义对齐 DSH**：流式期间中断 → assistant 消息只保留非空白前缀且**不含 tool_calls**；
+  工具执行期间中断 → 已派发的补 `aborted by user`、未派发的补 `aborted before dispatch`。
+  回合一结束就回到提示符，历史完整，`/continue` 或直接输入都能接着跑；
+  交互模式下 `--max-steps` 只结束回合不杀进程（一次性运行仍返回退出码 3）。
+* **非 TTY 自动回退**：stdin 不是终端时走行式 REPL（同一份 history 连续对话）。
+* **已知限制**：被 SIGKILL/SIGTERM 打断时终端可能停在 raw 模式，用 `reset` / `stty sane` 恢复。
+  原因是 uya 0.10.1 的 `libc.signal.signal` 注册的处理器一被调用就 SIGSEGV
+  （最小复现：handler 里只做 `sys_write` + `sys_exit`，`kill -TERM` 后进程以 139 退出），
+  所以干脆不装信号处理器 —— 详见踩坑第 21 条。
+
+### 流式协议要点（P1）
+
+* `hc_open()` 只读到 `\r\n\r\n` 就返回，`hc_fill()` 每次读一段网络并推进解码，返回
+  `1=有新体字节 / 2=读到数据但还没解出体 / 0=结束`；调用方靠它决定继续读还是收工。
+* chunked 解码是**状态机**（SIZE→DATA→CRLF→TRAILER→DONE），chunk 长度行、CRLF、data 行、
+  JSON 字符串都可能被 TCP 切开，自测用「37 字节一个 chunk + 每 19 字节写一次 + 2ms 间隔」
+  把这种切分钉死。
+* `tool_calls` 按 wire `index` 归并：首帧带 `id`/`function.name`，后续帧只有 `arguments` 片段；
+  片段**逐个反转义再拼接**（服务端每个片段都是合法 JSON 字符串，因此与整体解码等价）。
+* `finish_reason=length` 时**丢弃全部 tool_calls**（参数可能是半截的），对齐 DSH。
+* 缺 `[DONE]` 视为流被截断（`STREAM_CLOSED`），坏 JSON 帧报 `MALFORMED_RESPONSE` 并把
+  payload 头部带出来。
+* `usage` 的缓存读数只在**本帧给了明细**时更新：网关尾随的 usage-only 帧常常只带
+  `prompt_tokens`/`completion_tokens`，无条件覆盖会把已拿到的 `cached_tokens` 清成 0。
+
+### 严格工具协议要点（P2）
+
+* assistant 消息连同 `tool_calls` **原样回灌**（`arguments` 用 `jw_raw` 内联，绝不二次转义），
+  随后每个调用一条 `role:"tool"` + `tool_call_id`；空结果发 `"(no output)"`。
+* 历史裁剪**不拆散配对**：丢掉带 `tool_calls` 的 assistant 时，紧随其后的 tool 消息一起丢；
+  历史不允许以 tool 消息开头（否则端点会 400）。
+* `--compat-fold` 回到旧协议（工具结果折叠成一条 user 消息），`--no-stream` 回到一次性响应；
+  两条路径共用同一套收尾逻辑（`agent_finish_step`）。
 
 数据流（一轮）：
 
@@ -136,7 +276,22 @@ vLLM 等 OpenAI 兼容端点都一样稳。想升级成严格 `tool` 角色消�
     很容易误判成“网关抽风”。正确做法：**先把响应体复制进 arena，再 parse，然后才释放响应体**
     （每轮一次 memcpy，代价可忽略）。同一个坑还教育了我：给这个报错加的“打印原始响应”诊断本身
     也在读已释放内存，所以第一版诊断打出来的是乱码 —— 诊断代码同样要守生命周期。
-16. **`lib/tls` 会把握手全过程写到 fd 2**（`https_debug`/`hs_debug`）：CLI 里得在发请求期间把
+16. **`&"text"[0:n]` 是切片不是指针**：把它传给 `&const byte` 形参拿到的是**切片结构体的地址**，
+    不是字符内容。`llm.uya` 里比较 `finish_reason` 时踩过这个坑：编译通过、运行时不相等，
+    表现为「所有 finish_reason 都变成 error」。要传 C 指针就传 `s.ptr`，或者用
+    `bufx_eq_cstr(ptr, len, "stop")` 这种拿字面量当 C 字符串的辅助函数。
+17. **checker 不会抓「对已是指针的参数再取址」**：`fn f(o: &const T)` 里写 `g(&o)` 会得到 `**T`，
+    Uya 类型检查通过、**C 编译阶段**才报 `incompatible pointer type`。移动函数体时要特别小心。
+18. **数组字面量初始化会带上结尾 `0`**：`var m: [byte: 9] = "got-term\n";` 会被拒
+    （"容量不足：至少需要 N>=10"）。字面量初始化要求 `N >= 字符数 + 1`。
+19. **别对已经是指针的参数再取址**（同 17 条，但这次是 `**History`）：把一次性的
+    `agent_run` 拆出 `agent_turn_loop(cfg, h: &History)` 之后，函数体里遗留的
+    `&h` 变成了 `**History` —— checker 通过、C 只给 warning、运行**段错误**。
+    移动/抽取函数体时，务必把「本地变量 → 参数引用」的取址全部清一遍。
+20. **信号处理器在 uya 0.10.1 上不可用**：`libc.signal.signal(SIGTERM, &handler as &void)`
+    注册的处理器一旦被调用就 SIGSEGV（最小复现：handler 只做 `sys_write` + `sys_exit`，
+    `kill -TERM` 后以 139 退出）。想要「被信号杀掉时恢复终端」的功能，目前只能不做。
+21. **`lib/tls` 会把握手全过程写到 fd 2**（`https_debug`/`hs_debug`）：CLI 里得在发请求期间把
     fd 2 临时指向 `/dev/null`（`dup(2)`→`open("/dev/null")`→`dup2`→请求→`dup2` 还原），
     否则用户会看到满屏 `[HS] ... [TLS] ...`；`--tls-debug` 保留原样便于排查。
 
@@ -201,7 +356,44 @@ agent 循环并逐项断言：
 |---|---|
 | `shell` | tools schema 里有 `run_shell`；一轮里返回**两个** tool_calls（`write_file` + `run_shell`）；第二轮请求里必须出现 `wrote … note.txt`、`SELFTEST-SHELL-OK`、`exit=0`；落盘文件逐字节比对 |
 | `no-shell` | `"name":"run_shell"` 不出现在请求里；其余同上 |
-| `tools` | 一封 tool_calls 里塞 4 个调用：`write_file`（**content 带换行与引号**）、`read_file` 读回、`read_file ../escape.txt`（必须被路径守卫拒绝）、`run_shell sleep 5 timeout=300`（必须被 SIGKILL 并回 `(timeout, killed)`）；请求里内容必须只被转义一次；**末轮响应用 chunked 编码**；落盘 `esc.txt` 逐字节校验 |
+| `tools` | 一封 tool_calls 里塞 4 个调用：`write_file`（**content 带换行与引号**）、`read_file` 读回、`read_file ../escape.txt`（必须被路径守卫拒绝）、`run_shell sleep 5 timeout=300`（必须被 SIGKILL 并回 `(timeout, killed)`）；请求里内容必须只被转义一次；落盘 `esc.txt` 逐字节校验 |
+| `noshell-nostream` | `--no-stream` 回归：同一份 mock 数据走非流式路径 |
+| `shell-fold` | `--compat-fold` 回归：请求里必须有折叠头、且不出现 `role:"tool"` |
+| `stream-basic` | SSE 分帧 + content 累积 + usage 合并（含尾随 usage-only 帧不带明细） |
+| `stream-tools` | `tool_calls` 按 index 交错分片累积（两个调用、arguments 被切成 4 段） |
+| `stream-nodone` | 缺 `[DONE]` → `STREAM_CLOSED`，但已收内容仍在 |
+| `stream-badjson` | 坏 JSON 帧 → `MALFORMED_RESPONSE` + payload 头部，之前的内容保留 |
+| `stream-length` | `finish_reason=length` → max-tokens，reasoning 正常累积 |
+| `steer` | 回合运行中输入的文本，必须在**下一个 step 的请求**里出现（mock 断言 `STEER-MARKER`） |
+| `interrupt` | 预置 Ctrl-C：回合以 `AGENT_INTERRUPTED` 结束、工具**未派发**、只发生一次请求 |
+| `tty-editor` | termios 布局(60B)/raw 位运算；行编辑（插入/退格/左右/Delete/Home/End/词删除）、
+一次喂入多行拆成多个提交、分片转义序列、裸 ESC 判定、历史上下翻、中断前缀裁剪 |
+| `dsh-config` | 假 `$DSH_HOME`：settings.yaml（block+flow 混排、行尾注释、跨行 flow、`|` 块标量、
+`!!js` 标签）+ `.credentials.yaml` → 断言 provider/model/baseURL/apiKeyEnv/凭据来源四层/
+contextWindow/maxTokens/input image/reasoningEffort/`permission→confine`/`uya-agent.tls` 命名空间；
+再断言 YAML 预处理（注释去掉、块标量里的 `#` 保留、`!!js` 中和）；最后若存在真实 `~/.dsh` 就顺带校验一次 |
+| `session-log` | 写 header/事件 → 读回逐行校验（转义层级、`tool_calls` 数组提取、`callId`）；
+手工追加半条记录 → 断言丢弃并标记 `dropped_tail`；用日志重建历史 → 断言角色/`tool_call_id`
+且能重新组装成合法请求；索引与按 id / 最近查找 |
+
+**P1/P2 的验收事实**（2026-10-02）：
+
+* 5 轮流式轮 + 6 轮既有轮全部通过；前一阶段的所有断言（tools schema、越权路径、
+  超时 SIGKILL、401、熔断）在流式路径下同样成立。
+* 严格协议在**请求字节**上被断言：`"role":"assistant"` + `"tool_calls"` 原样回灌、
+  `"id":"call_…"` 保留、`"tool_call_id"` 条数与调用数一致（shell 2 / no-shell 1 / tools 4）。
+* TTY 交互用**真 pty** 验证（`script -qec`）：进入 raw 模式、banner 干净、一次粘贴
+  4 行会分成 4 次提交（任务 → `/help` → `/status` → `/exit`），退出后终端恢复。
+* DSH 配置兼容做了**零参数启动**验收：在空目录里不传 `--base-url/--model/--api-key`，
+  `--print-config` 显示 `base_url/model/api_key/context_window/confine` 的来源全是 `dsh-settings`，
+  实际提问「2+2 等于几」得到 `4。`（只额外用环境变量给了 TLS pin，因为默认 `chain` 在真机过不去）。
+* 会话恢复做了**跨进程 + 真实模型**验收：进程 1 让它「记住 4271」，进程 2 `--continue`
+  带恢复的历史问「我刚才让你记住的数字是多少」→ 回答 **4271**；日志里 header 只有一条、
+  `seq` 跨两个进程连续 0…9。
+* 真实网关（autodl，`DeepSeek-V4.1-Flash`，pin 模式）跑「创建 hello.uya → 编译 → 运行 → 结论」：
+  3 步完成（write_file → run_shell → 结论），stdout 流式输出
+  `运行输出：\`Hello, Uya!\`（编译通过，退出码 0）。`，产物 `hello` 是真实 ELF、
+  独立运行输出 `Hello, Uya!`；usage 逐轮打印（含 `cache_read=896` 前缀缓存命中）。
 | `http401` | mock 回 401 + 错误体：agent 必须打印状态与错误体并退出 3 |
 | `max-steps` | mock 每轮都给 tool_calls：agent 必须在 `max_steps` 步后熔断退出 3 |
 
@@ -214,7 +406,7 @@ make probe BASE=https://api.deepseek.com/v1  # A4 期望 HTTP 401 + leaf 指纹�
 DEEPSEEK_API_KEY=... ./build/uya-agent --tls-verify=pin <sha256> "创建 hello.uya，编译并运行它"   # A5 真实端到端
 ```
 
-**目前状态：A1–A6 全部通过。**
+**目前状态：A1–A6 全部通过；P1（流式）/P2（严格协议）已完成并通过离线 + 真实网关验收。**
 
 A5 用真实模型跑通的原话（`autodl-api` 网关，模型 `DeepSeek-V4.1-Flash`）：
 
@@ -237,7 +429,6 @@ UYA_AGENT_API_KEY=… ./build/uya-agent \
 
 ## 7. 已知限制
 
-* 只支持**非流式**（`stream:false`）；没做 SSE 增量输出。
 * 上下文管理很朴素：整个历史每轮重新序列化，超过 24 条/单条 200 KiB 时丢最老的对话；
   没做 token 计数或智能摘要。
 * `read_file` 一次最多 64 KiB；`write_file` 是整文件覆盖，没有 diff/patch 工具。

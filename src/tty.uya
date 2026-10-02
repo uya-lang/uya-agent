@@ -1,0 +1,715 @@
+// src/tty.uya — 终端交互层（P3）
+//
+// 提供：
+//   * isatty 判定：libc 没导出 isatty，用 `ioctl(0, TCGETS, &termios)` 成功即 TTY；
+//   * raw 模式进出：关 ICANON/ECHO/ISIG/IEXTEN（自己管 Ctrl-C），清 IXON/ICRNL，
+//     VMIN=1/VTIME=0；**保留 OPOST** —— 否则项目里大量 `\n` 输出会变成阶梯状；
+//   * 终端宽度（TIOCGWINSZ）；
+//   * 行编辑器：把字节流喂进 tty_feed，事件从 tty_next_event 取；
+//   * 单行渲染协议 ui_out_*：擦掉输入行 → 写输出 → 重画输入行；
+//   * 动态提示符（状态显示走提示符，避免两行光标的复杂度）。
+//
+// 设计约束：Uya **没有捕获闭包**，所以状态放在模块级全局 tty_ui 上，函数直接操作它；
+// 单进程里只可能有一个前台界面，这与 DSH 的「一个 session 一个 driver」一致。
+
+use libc.syscall;
+use libc.unistd;
+use libc.stdlib;
+
+// ---- ioctl / termios 常量（Linux x86-64）----
+const TTY_TCGETS: i64 = 0x5401;
+const TTY_TCSETS: i64 = 0x5402;
+const TTY_TIOCGWINSZ: i64 = 0x5413;
+
+const TTY_IFLAG_ICRNL: u32 = 0x0100;
+const TTY_IFLAG_IXON: u32 = 0x0400;
+const TTY_LFLAG_ISIG: u32 = 0x0001;
+const TTY_LFLAG_ICANON: u32 = 0x0002;
+const TTY_LFLAG_ECHO: u32 = 0x0008;
+const TTY_LFLAG_IEXTEN: u32 = 0x8000;
+const TTY_U32_MAX: u32 = 0xFFFFFFFF;
+
+const TTY_CC_VTIME: usize = 5;
+const TTY_CC_VMIN: usize = 6;
+
+const TTY_LINE_MAX: usize = 8192;
+const TTY_HIST_MAX: usize = 32;
+const TTY_EVQ_MAX: usize = 16;
+
+// ---- 事件 ----
+export const TTY_EV_NONE: i32 = 0;
+export const TTY_EV_SUBMIT: i32 = 1;      // 回车：整行在 tty_line()/tty_line_len() 里
+export const TTY_EV_CTRL_C: i32 = 2;      // Ctrl-C（运行中=中断，空闲=清行/退出）
+export const TTY_EV_ESC: i32 = 3;         // 裸 ESC（等同中断意图）
+export const TTY_EV_EOF: i32 = 4;         // 空行上的 Ctrl-D
+export const TTY_EV_CLEARED: i32 = 5;     // Ctrl-U 清空
+export const TTY_EV_REDRAW: i32 = 6;      // Ctrl-L
+
+export struct TtyTermios {
+    c_iflag: u32,
+    c_oflag: u32,
+    c_cflag: u32,
+    c_lflag: u32,
+    c_line: u8,
+    c_cc: [byte: 32],
+    pad: [byte: 3],
+    c_ispeed: u32,
+    c_ospeed: u32,
+}
+
+export struct TtyWinsize {
+    ws_row: u16,
+    ws_col: u16,
+    ws_x: u16,
+    ws_y: u16,
+}
+
+export fn tty_termios_zero() TtyTermios {
+    return TtyTermios{
+        c_iflag: 0,
+        c_oflag: 0,
+        c_cflag: 0,
+        c_lflag: 0,
+        c_line: 0,
+        c_cc: [0: 32],
+        pad: [0: 3],
+        c_ispeed: 0,
+        c_ospeed: 0,
+    };
+}
+
+export struct TtyUi {
+    is_tty: bool,
+    raw: bool,
+    cols: usize,
+    saved: TtyTermios,
+    line: Buf,          // 正在编辑的行
+    cursor: usize,
+    prompt: Buf,        // 当前提示符（含状态）
+    // 转义序列状态机：0=无 1=ESC 2=ESC[ 3=ESC[<num>
+    esc: i32,
+    esc_arg: i32,
+    // 事件队列
+    evq: [i32: TTY_EVQ_MAX],
+    evn: usize,
+    // 历史
+    hist: [Buf: TTY_HIST_MAX],
+    hist_len: usize,
+    hist_pos: i32,
+    stash: Buf,         // 上翻历史时暂存的当前行
+    pend: Buf,          // 一次读取里「事件之后」剩下的字节（粘贴/多行输入）
+    line_on_screen: bool,
+}
+
+fn tty_ptr_i64(p: &void) i64 {
+    return @usize_from_ptr(p) as i64;
+}
+
+// ============================================================
+// 终端属性
+// ============================================================
+export fn tty_get_attrs(fd: i32, out: &TtyTermios) bool {
+    const r: !i32 = sys_ioctl(fd, TTY_TCGETS, tty_ptr_i64(out as &void));
+    const v: i32 = r catch { -1; };
+    return v == 0;
+}
+
+export fn tty_set_attrs(fd: i32, t: &const TtyTermios) bool {
+    const r: !i32 = sys_ioctl(fd, TTY_TCSETS, tty_ptr_i64(t as &void));
+    const v: i32 = r catch { -1; };
+    return v == 0;
+}
+
+// TCGETS 成功 = 这是一个终端
+export fn tty_probe(fd: i32) bool {
+    var tm: TtyTermios = tty_termios_zero();
+    return tty_get_attrs(fd, &tm);
+}
+
+// raw 模式下应该清掉的 lflag / iflag 位（自测直接断言这两个函数）
+export fn tty_raw_lflag_clear(base: u32) u32 {
+    return base & (TTY_U32_MAX - (TTY_LFLAG_ISIG | TTY_LFLAG_ICANON | TTY_LFLAG_ECHO | TTY_LFLAG_IEXTEN));
+}
+
+export fn tty_raw_iflag_clear(base: u32) u32 {
+    return base & (TTY_U32_MAX - (TTY_IFLAG_ICRNL | TTY_IFLAG_IXON));
+}
+
+export fn tty_init(ui: &TtyUi, fd: i32) void {
+    ui.is_tty = tty_probe(fd);
+    ui.raw = false;
+    ui.cols = 80;
+    ui.saved = tty_termios_zero();
+    ui.line = buf_new(TTY_LINE_MAX);
+    ui.prompt = buf_new(64);
+    ui.stash = buf_new(TTY_LINE_MAX);
+    ui.pend = buf_new(TTY_LINE_MAX);
+    ui.cursor = 0;
+    ui.esc = 0;
+    ui.esc_arg = 0;
+    ui.evn = 0;
+    ui.hist_len = 0;
+    ui.hist_pos = -1;
+    ui.line_on_screen = false;
+    var i: usize = 0;
+    while i < TTY_HIST_MAX {
+        ui.hist[i] = buf_empty();
+        i = i + 1;
+    }
+    _ = buf_append_cstr(&ui.prompt, "> ");
+    if ui.is_tty {
+        var ws: TtyWinsize = TtyWinsize{ ws_row: 0, ws_col: 0, ws_x: 0, ws_y: 0 };
+        const r: !i32 = sys_ioctl(fd, TTY_TIOCGWINSZ, tty_ptr_i64(&ws as &void));
+        const v: i32 = r catch { -1; };
+        if v == 0 && ws.ws_col > 0 {
+            ui.cols = ws.ws_col as usize;
+        }
+    }
+}
+
+export fn tty_free(ui: &TtyUi) void {
+    buf_free(&ui.line);
+    buf_free(&ui.prompt);
+    buf_free(&ui.stash);
+    buf_free(&ui.pend);
+    var i: usize = 0;
+    while i < TTY_HIST_MAX {
+        buf_free(&ui.hist[i]);
+        i = i + 1;
+    }
+    ui.hist_len = 0;
+}
+
+// 进 raw 模式；失败返回 false（调用方退回行式 REPL）
+export fn tty_raw_on(ui: &TtyUi, fd: i32) bool {
+    if ui.raw {
+        return true;
+    }
+    if !ui.is_tty {
+        return false;
+    }
+    if !tty_get_attrs(fd, &ui.saved) {
+        return false;
+    }
+    var t: TtyTermios = ui.saved;
+    t.c_lflag = tty_raw_lflag_clear(t.c_lflag);
+    t.c_iflag = tty_raw_iflag_clear(t.c_iflag);
+    t.c_cc[TTY_CC_VMIN] = 1;
+    t.c_cc[TTY_CC_VTIME] = 0;
+    if !tty_set_attrs(fd, &t) {
+        return false;
+    }
+    ui.raw = true;
+    return true;
+}
+
+// 恢复原始终端属性（正常/错误/信号三条路径都必须调用）
+export fn tty_raw_off(ui: &TtyUi, fd: i32) void {
+    if !ui.raw {
+        return;
+    }
+    _ = tty_set_attrs(fd, &ui.saved);
+    ui.raw = false;
+    _ = sys_write(fd, &"\x1b[?25h"[0: 6], 6) catch {};
+}
+
+// 关于信号：**没有**安装 SIGTERM/SIGHUP 处理器。
+// 实测（uya 0.10.1）`libc.signal.signal` 注册的处理器一旦被调用就 SIGSEGV：写了个
+// 最小复现（handler 里只做 sys_write + sys_exit），`kill -TERM` 之后进程以 139 退出。
+// 与其让「恢复终端」这个贴心功能把进程搞崩，不如不装；退出路径（正常返回、错误返回、
+// Ctrl-D、/exit）都已经恢复 termios。被 SIGKILL/SIGTERM 打断时终端可能停在 raw 模式，
+// 用 `reset` 或 `stty sane` 恢复（README 已记录）。
+
+export fn tty_active(ui: &const TtyUi) bool {
+    return ui.is_tty && ui.raw;
+}
+
+// 设置提示符（含状态显示）。传 C 字符串。
+export fn tty_set_prompt(ui: &TtyUi, text: &const byte) void {
+    buf_reset(&ui.prompt);
+    const n: usize = bufx_cstr_len(text);
+    if n > 0 {
+        _ = buf_append(&ui.prompt, text, n);
+    }
+    ui.line_on_screen = false;
+}
+
+// ============================================================
+// 行编辑器
+// ============================================================
+fn tty_push_ev(ui: &TtyUi, ev: i32) void {
+    const idx: usize = ui.evn;
+    if idx < TTY_EVQ_MAX {
+        ui.evq[idx] = ev;
+        ui.evn = idx + 1;
+    }
+}
+
+export fn tty_next_event(ui: &TtyUi) i32 {
+    if ui.evn == 0 {
+        return TTY_EV_NONE;
+    }
+    const ev: i32 = ui.evq[0];
+    var i: usize = 0;
+    while i + 1 < ui.evn {
+        ui.evq[i] = ui.evq[i + 1];
+        i = i + 1;
+    }
+    ui.evn = ui.evn - 1;
+    return ev;
+}
+
+export fn tty_line(ui: &const TtyUi) &[byte] {
+    return ui.line.ptr[0: ui.line.len];
+}
+
+export fn tty_line_len(ui: &const TtyUi) usize {
+    return ui.line.len;
+}
+
+export fn tty_line_clear(ui: &TtyUi) void {
+    ui.line.len = 0;
+    ui.cursor = 0;
+}
+
+fn tty_line_insert(ui: &TtyUi, c: byte) void {
+    if ui.line.len >= TTY_LINE_MAX {
+        return;
+    }
+    if !buf_reserve(&ui.line, 1) {
+        return;
+    }
+    var i: usize = ui.line.len;
+    while i > ui.cursor {
+        ui.line.ptr[i] = ui.line.ptr[i - 1];
+        i = i - 1;
+    }
+    ui.line.ptr[ui.cursor] = c;
+    ui.line.len = ui.line.len + 1;
+    ui.cursor = ui.cursor + 1;
+}
+
+fn tty_line_backspace(ui: &TtyUi) void {
+    if ui.cursor == 0 {
+        return;
+    }
+    var i: usize = ui.cursor - 1;
+    while i + 1 < ui.line.len {
+        ui.line.ptr[i] = ui.line.ptr[i + 1];
+        i = i + 1;
+    }
+    ui.line.len = ui.line.len - 1;
+    ui.cursor = ui.cursor - 1;
+}
+
+fn tty_line_delete(ui: &TtyUi) void {
+    if ui.cursor >= ui.line.len {
+        return;
+    }
+    var i: usize = ui.cursor;
+    while i + 1 < ui.line.len {
+        ui.line.ptr[i] = ui.line.ptr[i + 1];
+        i = i + 1;
+    }
+    ui.line.len = ui.line.len - 1;
+}
+
+fn tty_line_del_word(ui: &TtyUi) void {
+    while ui.cursor > 0 && ui.line.ptr[ui.cursor - 1] == 32 as byte {
+        tty_line_backspace(ui);
+    }
+    while ui.cursor > 0 && ui.line.ptr[ui.cursor - 1] != 32 as byte {
+        tty_line_backspace(ui);
+    }
+}
+
+// 历史：把当前行存进历史（非空且与最后一条不同）
+fn tty_hist_push(ui: &TtyUi) void {
+    const n: usize = ui.line.len;
+    if n == 0 {
+        return;
+    }
+    if ui.hist_len > 0 && ui.hist_len <= TTY_HIST_MAX {
+        const last_idx: usize = ui.hist_len - 1;
+        if last_idx >= TTY_HIST_MAX {
+            return;
+        }
+        const last: &Buf = &ui.hist[last_idx];
+        if last.len == n && bufx_mem_eq(last.ptr as &const byte, ui.line.ptr as &const byte, n) {
+            return;
+        }
+    }
+    if ui.hist_len >= TTY_HIST_MAX {
+        // 丢最老
+        buf_free(&ui.hist[0]);
+        var i: usize = 0;
+        while i + 1 < ui.hist_len {
+            ui.hist[i] = ui.hist[i + 1];
+            i = i + 1;
+        }
+        ui.hist_len = ui.hist_len - 1;
+    }
+    const slot: usize = ui.hist_len;
+    if slot >= TTY_HIST_MAX {
+        return;
+    }
+    ui.hist[slot] = buf_new(n + 8);
+    if buf_valid(&ui.hist[slot]) {
+        _ = buf_append(&ui.hist[slot], ui.line.ptr, n);
+    }
+    ui.hist_len = slot + 1;
+}
+
+fn tty_hist_move(ui: &TtyUi, up: bool) void {
+    if ui.hist_len == 0 {
+        return;
+    }
+    if up {
+        if ui.hist_pos < 0 {
+            // 首次上翻：暂存当前行
+            buf_reset(&ui.stash);
+            _ = buf_append(&ui.stash, ui.line.ptr, ui.line.len);
+            ui.hist_pos = (ui.hist_len as i32) - 1;
+        } else if ui.hist_pos > 0 {
+            ui.hist_pos = ui.hist_pos - 1;
+        } else {
+            return;
+        }
+    } else {
+        if ui.hist_pos < 0 {
+            return;
+        }
+        if ui.hist_pos + 1 < (ui.hist_len as i32) {
+            ui.hist_pos = ui.hist_pos + 1;
+        } else {
+            ui.hist_pos = -1;
+            ui.line.len = 0;
+            _ = buf_append(&ui.line, ui.stash.ptr, ui.stash.len);
+            ui.cursor = ui.line.len;
+            return;
+        }
+    }
+    const idx: usize = ui.hist_pos as usize;
+    if idx >= TTY_HIST_MAX {
+        return;
+    }
+    ui.line.len = 0;
+    _ = buf_append(&ui.line, ui.hist[idx].ptr, ui.hist[idx].len);
+    ui.cursor = ui.line.len;
+}
+
+fn tty_esc_apply(ui: &TtyUi, final: byte) void {
+    const f: i32 = final as i32;
+    if f == 65 {
+        tty_hist_move(ui, true);         // Up
+    } else if f == 66 {
+        tty_hist_move(ui, false);        // Down
+    } else if f == 67 {
+        if ui.cursor < ui.line.len {
+            ui.cursor = ui.cursor + 1;
+        }
+    } else if f == 68 {
+        if ui.cursor > 0 {
+            ui.cursor = ui.cursor - 1;
+        }
+    } else if f == 72 {
+        ui.cursor = 0;                   // Home
+    } else if f == 70 {
+        ui.cursor = ui.line.len;         // End
+    } else if f == 51 {
+        tty_line_delete(ui);             // ESC[3~
+    } else if f == 49 || f == 55 {
+        ui.cursor = 0;                   // ESC[1~ / ESC[7~
+    } else if f == 52 || f == 56 {
+        ui.cursor = ui.line.len;         // ESC[4~ / ESC[8~
+    }
+}
+
+// 喂入一个字节；事件进队列（调用方用 tty_next_event 取）
+fn tty_feed_byte(ui: &TtyUi, c: byte) void {
+    const v: i32 = c as i32;
+
+    if ui.esc == 1 {
+        if v == 91 || v == 79 {          // '[' / 'O'
+            ui.esc = 2;
+            ui.esc_arg = 0;
+            return;
+        }
+        ui.esc = 0;
+        tty_push_ev(ui, TTY_EV_ESC);
+        return;
+    }
+    if ui.esc == 2 || ui.esc == 3 {
+        if v >= 48 && v <= 57 {
+            ui.esc = 3;
+            ui.esc_arg = ui.esc_arg * 10 + (v - 48);
+            return;
+        }
+        if v == 126 {                    // '~'
+            ui.esc = 0;
+            tty_esc_apply(ui, 51 as byte);
+            return;
+        }
+        ui.esc = 0;
+        tty_esc_apply(ui, c);
+        return;
+    }
+
+    if v == 27 {                          // ESC
+        ui.esc = 1;
+        return;
+    }
+    if v == 13 || v == 10 {               // Enter（raw 模式下来的是 CR）
+        if ui.line.len > 0 {
+            tty_hist_push(ui);
+            ui.hist_pos = -1;
+            tty_push_ev(ui, TTY_EV_SUBMIT);
+        }
+        return;
+    }
+    if v == 3 {                           // Ctrl-C
+        tty_push_ev(ui, TTY_EV_CTRL_C);
+        return;
+    }
+    if v == 4 {                           // Ctrl-D
+        if ui.line.len == 0 {
+            tty_push_ev(ui, TTY_EV_EOF);
+        } else {
+            tty_line_delete(ui);
+        }
+        return;
+    }
+    if v == 21 {                          // Ctrl-U
+        tty_line_clear(ui);
+        tty_push_ev(ui, TTY_EV_CLEARED);
+        return;
+    }
+    if v == 23 {                          // Ctrl-W
+        tty_line_del_word(ui);
+        return;
+    }
+    if v == 12 {                          // Ctrl-L
+        tty_push_ev(ui, TTY_EV_REDRAW);
+        return;
+    }
+    if v == 127 || v == 8 {               // Backspace
+        tty_line_backspace(ui);
+        return;
+    }
+    if v == 9 {                           // Tab：原样插入
+        tty_line_insert(ui, 9 as byte);
+        return;
+    }
+    if v < 32 {                           // 其它控制键：忽略
+        return;
+    }
+    tty_line_insert(ui, c);
+}
+
+// 真正逐字节处理；一旦产生事件就把**剩余的字节**存进 pend。
+// 不这样做的话，一次 read 拿到 "a\nb\n" 时两行会被拼成一行（粘贴/多行粘贴必踩）。
+fn tty_feed_inner(ui: &TtyUi, p: &const byte, n: usize) void {
+    var i: usize = 0;
+    while i < n {
+        const before: usize = ui.evn;
+        tty_feed_byte(ui, p[i]);
+        i = i + 1;
+        if ui.evn > before && i < n {
+            _ = buf_append(&ui.pend, &p[i], n - i);
+            return;
+        }
+    }
+}
+
+export fn tty_feed(ui: &TtyUi, p: &const byte, n: usize) void {
+    // 先把上次剩下的字节处理掉（再出事件就继续留着）
+    if ui.pend.len > 0 {
+        var tmp: Buf = buf_new(ui.pend.len + 8);
+        if buf_valid(&tmp) {
+            _ = buf_append(&tmp, ui.pend.ptr, ui.pend.len);
+            ui.pend.len = 0;
+            tty_feed_inner(ui, tmp.ptr as &const byte, tmp.len);
+            buf_free(&tmp);
+        }
+        if ui.evn > 0 {
+            // 本次调用带来的字节也留到下次，绝不能丢
+            if n > 0 {
+                _ = buf_append(&ui.pend, p, n);
+            }
+            return;
+        }
+    }
+    tty_feed_inner(ui, p, n);
+}
+
+// 还有没喂完的字节？（调用方在等输入前应先把它吃完，否则粘贴的后续行会卡住）
+export fn tty_has_pending(ui: &const TtyUi) bool {
+    return ui.pend.len > 0;
+}
+
+export fn tty_pending_bytes(ui: &const TtyUi) usize {
+    return ui.pend.len;
+}
+
+// 一批输入读完后的转义冲刷：
+// 终端按下 Esc 只发一个 0x1b，而方向键发 0x1b '[' X —— 两者只在「后面还有没有字节」
+// 上不同。所以 Esc 是否「裸按」只有在**一次读取结束**时才能判定；半截序列（esc>=2）
+// 直接丢弃，避免把用户后续的普通按键当成序列参数吞掉。
+export fn tty_flush_esc(ui: &TtyUi) void {
+    if ui.esc == 1 {
+        ui.esc = 0;
+        tty_push_ev(ui, TTY_EV_ESC);
+    } else if ui.esc >= 2 {
+        ui.esc = 0;
+    }
+}
+
+// 有可读输入才读（非阻塞），把字节喂给行编辑器。返回是否有新字节。
+export fn tty_pump(ui: &TtyUi, fd: i32) bool {
+    var pfds: [PollFd: 1] = [PollFd{ fd: fd, events: POLLIN, revents: 0 }];
+    const pr: i32 = sys_poll(&pfds[0], 1, 0) catch { 0; };
+    if pr <= 0 {
+        return false;
+    }
+    if (pfds[0].revents & POLLIN) == 0 && (pfds[0].revents & POLLHUP) == 0 {
+        return false;
+    }
+    var tmp: [byte: 256] = [0: 256];
+    const n: isize = sys_read(fd, &tmp[0], 256) catch { -1 as isize; };
+    if n <= 0 {
+        return false;
+    }
+    tty_feed(ui, &tmp[0], n as usize);
+    tty_flush_esc(ui);
+    return true;
+}
+
+// ============================================================
+// 渲染
+// ============================================================
+fn tty_erase_line(ui: &TtyUi, fd: i32) void {
+    if !tty_active(ui) {
+        return;
+    }
+    if !ui.line_on_screen {
+        return;
+    }
+    _ = sys_write(fd, &"\r\x1b[2K"[0: 5], 5) catch {};
+    ui.line_on_screen = false;
+}
+
+export fn tty_draw_line(ui: &TtyUi, fd: i32) void {
+    if !tty_active(ui) {
+        return;
+    }
+    _ = sys_write(fd, &"\r\x1b[2K"[0: 5], 5) catch {};
+    if ui.prompt.len > 0 {
+        _ = sys_write(fd, ui.prompt.ptr as *const byte, ui.prompt.len) catch {};
+    }
+    if ui.line.len > 0 {
+        _ = sys_write(fd, ui.line.ptr as *const byte, ui.line.len) catch {};
+    }
+    ui.line_on_screen = true;
+    // 光标回到 cursor 位置
+    const back: usize = ui.line.len - ui.cursor;
+    if back > 0 && back < 64 {
+        var seq: [byte: 8] = [0: 8];
+        seq[0] = 27;
+        seq[1] = 91;
+        // 十进制
+        var n: usize = back;
+        var digits: [byte: 4] = [0: 4];
+        var d: usize = 0;
+        if n == 0 {
+            digits[0] = 48;
+            d = 1;
+        }
+        while n > 0 && d < 4 {
+            digits[d] = (((n % (10 as usize)) as i32) + 48) as byte;
+            n = n / (10 as usize);
+            d = d + 1;
+        }
+        var k: usize = 2;
+        while d > 0 {
+            d = d - 1;
+            seq[k] = digits[d];
+            k = k + 1;
+        }
+        seq[k] = 68;   // 'D'
+        k = k + 1;
+        _ = sys_write(fd, &seq[0], k) catch {};
+    }
+}
+
+// 流式输出期间：擦掉输入行 → 写内容 → 重画
+export fn tty_out_begin(ui: &TtyUi, fd: i32) void {
+    tty_erase_line(ui, fd);
+}
+
+export fn tty_out_end(ui: &TtyUi, fd: i32) void {
+    if tty_active(ui) {
+        tty_draw_line(ui, fd);
+    }
+}
+
+// C 字符串版本的写（字面量直接可用；避免 &"x"[0:n] 的切片坑）
+export fn tty_puts(ui: &TtyUi, fd: i32, s: &const byte) void {
+    tty_write(ui, fd, s, bufx_cstr_len(s));
+}
+
+// 所有输出（stdout/stderr）都应该走这里，否则会和输入行互相踩
+export fn tty_write(ui: &TtyUi, fd: i32, p: &const byte, n: usize) void {
+    if !tty_active(ui) {
+        _ = sys_write(fd, p as *const byte, n) catch {};
+        return;
+    }
+    // 屏幕上没有输入行时不必擦/重画（否则 banner、工具输出都会带上无用的控制序列）
+    const was_on: bool = ui.line_on_screen;
+    tty_out_begin(ui, fd);
+    _ = sys_write(fd, p as *const byte, n) catch {};
+    if was_on {
+        tty_out_end(ui, fd);
+    }
+}
+
+// ============================================================
+// 模块级全局：单进程只有一个前台界面
+// ============================================================
+export var tty_ui: TtyUi = TtyUi{
+    is_tty: false,
+    raw: false,
+    cols: 80,
+    saved: TtyTermios{
+        c_iflag: 0,
+        c_oflag: 0,
+        c_cflag: 0,
+        c_lflag: 0,
+        c_line: 0,
+        c_cc: [0: 32],
+        pad: [0: 3],
+        c_ispeed: 0,
+        c_ospeed: 0,
+    },
+    line: Buf{ ptr: null, len: 0, cap: 0 },
+    cursor: 0,
+    prompt: Buf{ ptr: null, len: 0, cap: 0 },
+    esc: 0,
+    esc_arg: 0,
+    evq: [0: TTY_EVQ_MAX],
+    evn: 0,
+    hist: [],
+    hist_len: 0,
+    hist_pos: -1,
+    stash: Buf{ ptr: null, len: 0, cap: 0 },
+    pend: Buf{ ptr: null, len: 0, cap: 0 },
+    line_on_screen: false,
+};
+
+// 给 llm/工具用的薄封装：流式增量也走输入行擦除/重画协议
+export fn tty_stream_write(fd: i32, p: &const byte, n: usize) void {
+    tty_write(&tty_ui, fd, p, n);
+}
+
+export fn tty_is_interactive() bool {
+    return tty_active(&tty_ui);
+}

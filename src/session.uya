@@ -1,0 +1,876 @@
+// src/session.uya — 会话日志：写入 / 读取 / 崩溃尾部裁剪 / 索引（P4）
+//
+// 布局（沿用 DSH 的形状，只是不压缩）：
+//   <agent-home>/sessions/--<normalized-cwd>--/<session-id>/session.jsonl
+//   <agent-home>/index.jsonl        每行一条索引记录，同一个 id 以**最后一条**为准
+//
+// 首行是 header：
+//   {"type":"session","version":0,"id":"session-…","createdAt":N,"cwd":"…",
+//    "delegationDepth":0,"agentPreset":"standard","model":"…","provider":"…"}
+// 之后每行一个事件：
+//   {"type":"<event>","seq":N,"time":N,"data":{…}}
+// `seq` 从 0 连续递增；追加-only；崩溃时最后一行可能不完整 —— 读取时丢弃它。
+//
+// 为什么不用 zstd：纯 Uya 没有 zstd 实现（DSH 默认 `.jsonl.zstd`），所以这里写裸 JSONL；
+// 读 DSH 会话时改走 `unzstd` 子进程（见 dshsess.uya）。
+
+use libc.syscall;
+use libc.unistd;
+use libc.stdlib;
+use libc.heap;
+use std.json.encoder.JsonWriter;
+
+export const SESS_VERSION: i64 = 0;
+const SESS_LINE_MAX: usize = 4194304;   // 单行上限（工具结果可能很大）
+
+// ============================================================
+// 路径工具
+// ============================================================
+// "/home/winger/x" → "--home-winger-x--"
+export fn sess_norm_cwd(cwd: &const byte, n: usize, out: &Buf) bool {
+    buf_reset(out);
+    if !buf_append_cstr(out, "--") {
+        return false;
+    }
+    var i: usize = 0;
+    while i < n {
+        const c: byte = cwd[i];
+        if c == 47 as byte {
+            if !buf_append_byte(out, 45) {
+                return false;
+            }
+        } else {
+            if !buf_append_byte(out, c) {
+                return false;
+            }
+        }
+        i = i + 1;
+    }
+    return buf_append_cstr(out, "--");
+}
+
+// 逐级 mkdir（已存在不算错）
+export fn sess_mkdir_p(path: &const byte) bool {
+    var i: usize = 1;
+    const n: usize = bufx_cstr_len(path);
+    while i <= n {
+        if i == n || path[i] == 47 as byte {
+            var part: Buf = buf_new(i + 2);
+            if !buf_valid(&part) {
+                return false;
+            }
+            _ = buf_append(&part, path, i);
+            _ = buf_append_byte(&part, 0);
+            _ = sys_mkdir(&part.ptr[0] as *const byte, 493 as u32) catch {};
+            buf_free(&part);
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+// <home>/sessions/--cwd--/<id>/session.jsonl
+// id 用「指针 + 长度」而不是 C 字符串：调用方手里的 id 常常是没有 NUL 结尾的 Buf
+export fn sess_session_path(home: &const byte, cwd: &const byte, id: &const byte, id_len: usize, out: &Buf) bool {
+    buf_reset(out);
+    if !buf_append_cstr(out, home) {
+        return false;
+    }
+    if !buf_append_cstr(out, "/sessions/") {
+        return false;
+    }
+    var norm: Buf = buf_new(1024);
+    defer { buf_free(&norm); }
+    if !sess_norm_cwd(cwd, bufx_cstr_len(cwd), &norm) {
+        return false;
+    }
+    if !buf_append(&out[0], norm.ptr, norm.len) {
+        return false;
+    }
+    if !buf_append_byte(out, 47) {
+        return false;
+    }
+    if !buf_append(out, id, id_len) {
+        return false;
+    }
+    return buf_append_cstr(out, "/session.jsonl");
+}
+
+// ============================================================
+// 会话 id：/dev/urandom 16 字节 → session-xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx
+// ============================================================
+export fn sess_new_id(out: &Buf) bool {
+    buf_reset(out);
+    var raw: [byte: 16] = [0: 16];
+    var got: bool = false;
+    var dev: [byte: 16] = "/dev/urandom";
+    const fd: i32 = sys_open(&dev[0] as *const byte, O_RDONLY as i32, 0) catch {
+        -1;
+    };
+    if fd >= 0 {
+        var off: usize = 0;
+        while off < 16 {
+            const n: isize = sys_read(fd, &raw[off], 16 - off) catch { 0 as isize; };
+            if n <= 0 {
+                break;
+            }
+            off = off + (n as usize);
+        }
+        _ = sys_close(fd) catch {};
+        if off == 16 {
+            got = true;
+        }
+    }
+    if !got {
+        // 兜底：时间 + pid 派生
+        const t: u64 = ua_now_ms();
+        var i: usize = 0;
+        while i < 16 {
+            const mix: u64 = (t >> ((i % 8) as i32)) + ((i as u64) * (2654435761 as u64));
+            raw[i] = ((mix >> 3) & 255 as u64) as byte;
+            i = i + 1;
+        }
+    }
+    raw[6] = ((raw[6] as i32 & 15) | 64) as byte;      // version 4
+    raw[8] = ((raw[8] as i32 & 63) | 128) as byte;     // variant
+    var hex: [byte: 32] = [0: 32];
+    _ = hex_of(&raw[0], 16, &hex[0]);
+    if !buf_append_cstr(out, "session-") {
+        return false;
+    }
+    var i: usize = 0;
+    while i < 32 {
+        if i == 8 || i == 12 || i == 16 || i == 20 {
+            if !buf_append_byte(out, 45) {
+                return false;
+            }
+        }
+        if !buf_append_byte(out, hex[i]) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+// ============================================================
+// 写
+// ============================================================
+export struct SessionLog {
+    id: Buf,
+    path: Buf,
+    cwd: Buf,
+    model: Buf,
+    fd: i32,
+    seq: i64,
+    events: usize,
+    save: bool,          // false = --no-save：不落盘（seq 仍推进）
+    title: Buf,
+    turns: i64,
+}
+
+export fn sess_log_empty() SessionLog {
+    return SessionLog{
+        id: buf_empty(),
+        path: buf_empty(),
+        cwd: buf_empty(),
+        model: buf_empty(),
+        fd: -1,
+        seq: 0,
+        events: 0,
+        save: false,
+        title: buf_empty(),
+        turns: 0,
+    };
+}
+
+export fn sess_log_free(l: &SessionLog) void {
+    buf_free(&l.id);
+    buf_free(&l.path);
+    buf_free(&l.cwd);
+    buf_free(&l.model);
+    buf_free(&l.title);
+}
+
+fn sess_write_line(l: &SessionLog, line: &const Buf) bool {
+    if !l.save || l.fd < 0 {
+        return true;
+    }
+    return write_all_fd(l.fd, line.ptr as &const byte, line.len);
+}
+
+// 建目录、写 header、打开追加 fd
+export fn sess_open(
+    l: &SessionLog,
+    home: &const byte,
+    cwd: &const byte,
+    model: &const byte,
+    provider: &const byte,
+    want_id: &const byte,
+    save: bool,
+    start_seq: i64,
+    write_header: bool
+) bool {
+    l.fd = -1;
+    l.seq = start_seq;
+    l.events = 0;
+    l.save = save;
+    l.turns = 0;
+    l.id = buf_new(64);
+    l.path = buf_new(1200);
+    l.cwd = buf_new(bufx_cstr_len(cwd) + 8);
+    l.model = buf_new(bufx_cstr_len(model) + 8);
+    l.title = buf_new(256);
+    if !buf_append_cstr(&l.cwd, cwd) || !buf_append_cstr(&l.model, model) {
+        return false;
+    }
+    if bufx_cstr_len(want_id) > 0 {
+        if !buf_append_cstr(&l.id, want_id) {
+            return false;
+        }
+    } else if !sess_new_id(&l.id) {
+        return false;
+    }
+    if !sess_session_path(home, cwd, l.id.ptr as &const byte, l.id.len, &l.path) {
+        return false;
+    }
+    if !l.save {
+        return true;
+    }
+    // 目录：<home>/sessions/--cwd--/<id>  —— 一次拼完再补 NUL 再逐级 mkdir。
+    // 注意**不要**在中间补 NUL：buf_append_cstr_z 会把 \0 也写进缓冲，
+    // 之后追加的内容就落在 NUL 之后，系统调用只看到前半截（踩过）。
+    var dir: Buf = buf_new(1600);
+    defer { buf_free(&dir); }
+    var norm: Buf = buf_new(1024);
+    defer { buf_free(&norm); }
+    if !sess_norm_cwd(cwd, bufx_cstr_len(cwd), &norm) {
+        l.save = false;
+        return false;
+    }
+    _ = buf_append_cstr(&dir, home);
+    _ = buf_append_cstr(&dir, "/sessions/");
+    _ = buf_append(&dir, norm.ptr, norm.len);
+    _ = buf_append_byte(&dir, 47);
+    _ = buf_append(&dir, l.id.ptr, l.id.len);
+    _ = buf_append_byte(&dir, 0);
+    _ = sess_mkdir_p(dir.ptr as &const byte);
+
+    const flags: i32 = (O_WRONLY | O_CREAT | O_APPEND) as i32;
+    var pz: Buf = buf_new(l.path.len + 1);
+    defer { buf_free(&pz); }
+    _ = buf_append(&pz, l.path.ptr, l.path.len);
+    _ = buf_append_byte(&pz, 0);
+    l.fd = sys_open(&pz.ptr[0] as *const byte, flags, 420) catch {
+        -1;
+    };
+    if l.fd < 0 {
+        l.save = false;
+        return false;
+    }
+    if !write_header {
+        return true;   // 续写已有日志：header 与 seq 都已经在文件里了
+    }
+    // header（只写一次：新会话才写）
+    var line: Buf = buf_new(2048);
+    defer { buf_free(&line); }
+    _ = buf_append_cstr(&line, "{\"type\":\"session\",\"version\":");
+    _ = buf_append_i64(&line, SESS_VERSION);
+    _ = buf_append_cstr(&line, ",\"id\":\"");
+    _ = buf_append(&line, l.id.ptr, l.id.len);
+    _ = buf_append_cstr(&line, "\",\"createdAt\":");
+    _ = buf_append_u64(&line, ua_now_ms());
+    _ = buf_append_cstr(&line, ",\"cwd\":");
+    if !jw_str_into(&line, l.cwd.ptr as &const byte, l.cwd.len) {
+        return false;
+    }
+    _ = buf_append_cstr(&line, ",\"delegationDepth\":0,\"agentPreset\":\"standard\",\"model\":");
+    if !jw_str_into(&line, l.model.ptr as &const byte, l.model.len) {
+        return false;
+    }
+    _ = buf_append_cstr(&line, ",\"provider\":");
+    if !jw_str_into(&line, provider, bufx_cstr_len(provider)) {
+        return false;
+    }
+    _ = buf_append_cstr(&line, "}\n");
+    if !sess_write_line(l, &line) {
+        return false;
+    }
+    return true;
+}
+
+// 把一个 JSON 字符串（已转义内容）追加进 out
+export fn jw_str_into(out: &Buf, p: &const byte, n: usize) bool {
+    if !buf_append_byte(out, 34) {
+        return false;
+    }
+    var i: usize = 0;
+    while i < n {
+        const c: byte = p[i];
+        if c == 34 as byte {
+            if !buf_append_cstr(out, "\\\"") {
+                return false;
+            }
+        } else if c == 92 as byte {
+            if !buf_append_cstr(out, "\\\\") {
+                return false;
+            }
+        } else if c == 10 as byte {
+            if !buf_append_cstr(out, "\\n") {
+                return false;
+            }
+        } else if c == 13 as byte {
+            if !buf_append_cstr(out, "\\r") {
+                return false;
+            }
+        } else if c == 9 as byte {
+            if !buf_append_cstr(out, "\\t") {
+                return false;
+            }
+        } else if c < 32 as byte {
+            if !buf_append_cstr(out, "\\u00") {
+                return false;
+            }
+            const hi: i32 = ((c as i32) >> 4) & 15;
+            const lo: i32 = (c as i32) & 15;
+            const hexd: &[byte] = &"0123456789abcdef"[0: 16];
+            if !buf_append_byte(out, hexd[hi as usize]) {
+                return false;
+            }
+            if !buf_append_byte(out, hexd[lo as usize]) {
+                return false;
+            }
+        } else {
+            if !buf_append_byte(out, c) {
+                return false;
+            }
+        }
+        i = i + 1;
+    }
+    return buf_append_byte(out, 34);
+}
+
+// 从事件行里取出 `"key":[...]` 的**原始数组文本**（括号配平、跳过字符串内部）。
+// 恢复历史时用它把 tool_calls 原样还原（不能重新序列化，否则 arguments 会被二次转义）。
+export fn sess_extract_array(line: &[byte], key: &const byte, out: &Buf) bool {
+    var pat: Buf = buf_new(64);
+    defer { buf_free(&pat); }
+    _ = buf_append_byte(&pat, 34);
+    _ = buf_append_cstr(&pat, key);
+    _ = buf_append_cstr(&pat, "\":[");
+    const at: isize = find_sub(line, pat.ptr[0: pat.len], 0);
+    if at < 0 {
+        return false;
+    }
+    const start: usize = (at as usize) + pat.len - 1;   // 指向 '['
+    var depth: i32 = 0;
+    var i: usize = start;
+    var in_str: bool = false;
+    var esc: bool = false;
+    while i < line.len {
+        const c: byte = line.ptr[i];
+        if in_str {
+            if esc {
+                esc = false;
+            } else if c == 92 as byte {
+                esc = true;
+            } else if c == 34 as byte {
+                in_str = false;
+            }
+        } else if c == 34 as byte {
+            in_str = true;
+        } else if c == 91 as byte {
+            depth = depth + 1;
+        } else if c == 93 as byte {
+            depth = depth - 1;
+            if depth == 0 {
+                buf_reset(out);
+                return buf_append(out, &line.ptr[start], (i - start) + 1);
+            }
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+// 开始一个事件：out 里得到 `{"type":"…","seq":N,"time":N,"data":`
+export fn sess_begin(l: &const SessionLog, typ: &const byte, out: &Buf) bool {
+    buf_reset(out);
+    if !buf_append_cstr(out, "{\"type\":\"") {
+        return false;
+    }
+    if !buf_append_cstr(out, typ) {
+        return false;
+    }
+    if !buf_append_cstr(out, "\",\"seq\":") {
+        return false;
+    }
+    if !buf_append_i64(out, l.seq) {
+        return false;
+    }
+    if !buf_append_cstr(out, ",\"time\":") {
+        return false;
+    }
+    if !buf_append_u64(out, ua_now_ms()) {
+        return false;
+    }
+    return buf_append_cstr(out, ",\"data\":");
+}
+
+// 结束事件并落盘（seq 推进；--no-save 时只推进 seq）
+export fn sess_end(l: &SessionLog, out: &Buf) bool {
+    if !buf_append_cstr(out, "}\n") {
+        return false;
+    }
+    const ok: bool = sess_write_line(l, out);
+    l.seq = l.seq + 1;
+    l.events = l.events + 1;
+    return ok;
+}
+
+// 往索引追加一条（读的时候同 id 取最后一条）
+export fn sess_write_index(home: &const byte, l: &const SessionLog) bool {
+    if !l.save {
+        return true;
+    }
+    var line: Buf = buf_new(1024);
+    defer { buf_free(&line); }
+    _ = buf_append_cstr(&line, "{\"id\":\"");
+    _ = buf_append(&line, l.id.ptr, l.id.len);
+    _ = buf_append_cstr(&line, "\",\"cwd\":");
+    if !jw_str_into(&line, l.cwd.ptr as &const byte, l.cwd.len) {
+        return false;
+    }
+    _ = buf_append_cstr(&line, ",\"lastActiveAt\":");
+    _ = buf_append_u64(&line, ua_now_ms());
+    _ = buf_append_cstr(&line, ",\"title\":");
+    if !jw_str_into(&line, l.title.ptr as &const byte, l.title.len) {
+        return false;
+    }
+    _ = buf_append_cstr(&line, ",\"model\":");
+    if !jw_str_into(&line, l.model.ptr as &const byte, l.model.len) {
+        return false;
+    }
+    _ = buf_append_cstr(&line, ",\"turns\":");
+    _ = buf_append_i64(&line, l.turns);
+    _ = buf_append_cstr(&line, ",\"events\":");
+    _ = buf_append_i64(&line, l.events as i64);
+    _ = buf_append_cstr(&line, ",\"path\":");
+    if !jw_str_into(&line, l.path.ptr as &const byte, l.path.len) {
+        return false;
+    }
+    _ = buf_append_cstr(&line, "}\n");
+
+    var pz: Buf = buf_new(bufx_cstr_len(home) + 32);
+    defer { buf_free(&pz); }
+    _ = buf_append_cstr(&pz, home);
+    _ = buf_append_cstr(&pz, "/index.jsonl");
+    _ = buf_append_byte(&pz, 0);
+    const flags: i32 = (O_WRONLY | O_CREAT | O_APPEND) as i32;
+    const fd: i32 = sys_open(&pz.ptr[0] as *const byte, flags, 420) catch {
+        -1;
+    };
+    if fd < 0 {
+        return false;
+    }
+    const ok: bool = write_all_fd(fd, line.ptr as &const byte, line.len);
+    _ = sys_close(fd) catch {};
+    return ok;
+}
+
+export fn sess_close(l: &SessionLog, home: &const byte) void {
+    if l.fd >= 0 {
+        _ = sys_close(l.fd) catch {};
+        l.fd = -1;
+    }
+    if l.save {
+        _ = sess_write_index(home, l);
+    }
+}
+
+// ============================================================
+// 读
+// ============================================================
+export struct SessReader {
+    data: Buf,
+    pos: usize,
+    seq_expected: i64,
+    header_ok: bool,
+    bad_seq: bool,
+    dropped_tail: bool,
+    n_events: usize,
+    id: Buf,
+    cwd: Buf,
+    model: Buf,
+}
+
+export fn sess_reader_empty() SessReader {
+    return SessReader{
+        data: buf_empty(),
+        pos: 0,
+        seq_expected: 0,
+        header_ok: false,
+        bad_seq: false,
+        dropped_tail: false,
+        n_events: 0,
+        id: buf_empty(),
+        cwd: buf_empty(),
+        model: buf_empty(),
+    };
+}
+
+export fn sess_reader_free(r: &SessReader) void {
+    buf_free(&r.data);
+    buf_free(&r.id);
+    buf_free(&r.cwd);
+    buf_free(&r.model);
+}
+
+// 取 `"key":<数字>` 的值（按实际位数，不能要求固定宽度）
+export fn sess_json_i64(line: &[byte], key: &const byte) i64 {
+    var pat: Buf = buf_new(64);
+    defer { buf_free(&pat); }
+    _ = buf_append_byte(&pat, 34);
+    _ = buf_append_cstr(&pat, key);
+    _ = buf_append_cstr(&pat, "\":");
+    const at: isize = find_sub(line, pat.ptr[0: pat.len], 0);
+    if at < 0 {
+        return -1;
+    }
+    var i: usize = (at as usize) + pat.len;
+    var v: i64 = 0;
+    var digits: i32 = 0;
+    while i < line.len && is_digit(line.ptr[i]) {
+        v = v * 10 + ((line.ptr[i] as i64) - 48);
+        digits = digits + 1;
+        i = i + 1;
+    }
+    if digits == 0 {
+        return -1;
+    }
+    return v;
+}
+
+// hay 里是否含 C 字符串字面量（find_sub 要的是切片，这里算好长度）
+fn sess_has_cstr(hay: &[byte], lit: &const byte) bool {
+    const n: usize = bufx_cstr_len(lit);
+    return find_sub(hay, lit[0: n], 0) >= 0;
+}
+
+// 从 JSON 行里取 "key":"value"（我们自己写的格式，够用且不依赖 std.json 的生命周期）
+fn sess_json_str(line: &[byte], key: &const byte, out: &Buf) bool {
+    var pat: Buf = buf_new(64);
+    defer { buf_free(&pat); }
+    _ = buf_append_byte(&pat, 34);
+    _ = buf_append_cstr(&pat, key);
+    _ = buf_append_cstr(&pat, "\":\"");
+    const at: isize = find_sub(line, pat.ptr[0: pat.len], 0);
+    if at < 0 {
+        return false;
+    }
+    var i: usize = (at as usize) + pat.len;
+    var tmp: Buf = buf_new(256);
+    defer { buf_free(&tmp); }
+    while i < line.len && line.ptr[i] != 34 as byte {
+        var c: byte = line.ptr[i];
+        if c == 92 as byte && i + 1 < line.len {
+            i = i + 1;
+            const e: byte = line.ptr[i];
+            if e == 110 as byte {
+                c = 10;
+            } else if e == 116 as byte {
+                c = 9;
+            } else if e == 114 as byte {
+                c = 13;
+            } else {
+                c = e;
+            }
+        }
+        if !buf_append_byte(&tmp, c) {
+            return false;
+        }
+        i = i + 1;
+    }
+    buf_reset(out);
+    return buf_append(out, tmp.ptr, tmp.len);
+}
+
+// 读**第一行**作为 header（列目录/校验用，不读全文件）
+export fn sess_read_header(path: &const byte, r: &SessReader) bool {
+    const fd: i32 = sys_open(path as *const byte, O_RDONLY as i32, 0) catch {
+        return false;
+    };
+    defer { _ = sys_close(fd) catch {}; }
+    var tmp: [byte: 4096] = [0: 4096];
+    const n: isize = sys_read(fd, &tmp[0], 4096) catch { 0 as isize; };
+    if n <= 0 {
+        return false;
+    }
+    const got: usize = n as usize;
+    const view: &[byte] = &tmp[0: got];
+    const nl: isize = bufx_find_byte(view, 10, 0);
+    if nl <= 0 {
+        return false;
+    }
+    const line: &[byte] = &tmp[0: nl as usize];
+    if !sess_has_cstr(line, "\"type\":\"session\"") {
+        return false;
+    }
+    r.header_ok = true;
+    _ = sess_json_str(line, "id", &r.id);
+    _ = sess_json_str(line, "cwd", &r.cwd);
+    _ = sess_json_str(line, "model", &r.model);
+    return r.header_ok;
+}
+
+// 整个文件读进内存并跳过 header（后续用 sess_next 逐行取事件）
+export fn sess_reader_load(path: &const byte, r: &SessReader) bool {
+    const fd: i32 = sys_open(path as *const byte, O_RDONLY as i32, 0) catch {
+        return false;
+    };
+    defer { _ = sys_close(fd) catch {}; }
+    r.data = buf_new(65536);
+    if !buf_valid(&r.data) {
+        return false;
+    }
+    var tmp: [byte: 16384] = [0: 16384];
+    while true {
+        const n: isize = sys_read(fd, &tmp[0], 16384) catch { 0 as isize; };
+        if n <= 0 {
+            break;
+        }
+        if !buf_append(&r.data, &tmp[0], n as usize) {
+            return false;
+        }
+    }
+    if r.data.len == 0 {
+        return false;
+    }
+    const view: &[byte] = r.data.ptr[0: r.data.len];
+    const nl: isize = bufx_find_byte(view, 10, 0);
+    if nl <= 0 {
+        return false;
+    }
+    const hline: &[byte] = r.data.ptr[0: nl as usize];
+    if !sess_has_cstr(hline, "\"type\":\"session\"") {
+        return false;
+    }
+    r.header_ok = true;
+    _ = sess_json_str(hline, "id", &r.id);
+    _ = sess_json_str(hline, "cwd", &r.cwd);
+    _ = sess_json_str(hline, "model", &r.model);
+    r.pos = (nl as usize) + 1;
+    return true;
+}
+
+// 取下一行事件（整行 JSON 文本）。返回 false = 读完了。
+// 最后一行不完整（没有换行结尾）时置 dropped_tail 并停止 —— 对应 DSH 的
+// 「保留有效尾部工作」：崩在写一半的那条记录丢掉，前面的都算数。
+export fn sess_next(r: &SessReader, out: &Buf) bool {
+    if r.pos >= r.data.len {
+        return false;
+    }
+    const view: &[byte] = r.data.ptr[0: r.data.len];
+    const nl: isize = bufx_find_byte(view, 10, r.pos);
+    buf_reset(out);
+    if nl < 0 {
+        r.dropped_tail = true;
+        return false;
+    }
+    const end: usize = nl as usize;
+    if end > r.pos {
+        if !buf_append(out, &r.data.ptr[r.pos], end - r.pos) {
+            return false;
+        }
+    }
+    r.pos = end + 1;
+    r.n_events = r.n_events + 1;
+    return true;
+}
+
+// 事件行里的 seq（用于连续性校验）
+export fn sess_line_seq(line: &const Buf) i64 {
+    var key: Buf = buf_new(16);
+    defer { buf_free(&key); }
+    _ = buf_append_cstr(&key, "\"seq\":");
+    const view: &[byte] = line.ptr[0: line.len];
+    const at: isize = find_sub(view, key.ptr[0: key.len], 0);
+    if at < 0 {
+        return -1;
+    }
+    var i: usize = (at as usize) + key.len;
+    var v: i64 = 0;
+    var digits: i32 = 0;
+    while i < line.len && is_digit(line.ptr[i]) {
+        v = v * 10 + ((line.ptr[i] as i64) - 48);
+        digits = digits + 1;
+        i = i + 1;
+    }
+    if digits == 0 {
+        return -1;
+    }
+    return v;
+}
+
+// 事件类型
+export fn sess_line_type(line: &const Buf, out: &Buf) bool {
+    return sess_json_str(line.ptr[0: line.len], "type", out);
+}
+
+// ============================================================
+// 定位 / 列表
+// ============================================================
+// 按 id 找会话文件：先看当前 cwd 的目录，再扫所有 --*-- 目录
+export fn sess_find(home: &const byte, cwd: &const byte, id: &const byte, id_len: usize, out: &Buf) bool {
+    var p: Buf = buf_new(1200);
+    if !sess_session_path(home, cwd, id, id_len, &p) {
+        buf_free(&p);
+        return false;
+    }
+    _ = buf_append_byte(&p, 0);
+    if sess_file_exists(p.ptr as &const byte) {
+        buf_reset(out);
+        _ = buf_append(out, p.ptr, p.len - 1);
+        buf_free(&p);
+        return true;
+    }
+    buf_free(&p);
+    // 扫 <home>/sessions/*/<id>/session.jsonl
+    var root: Buf = buf_new(bufx_cstr_len(home) + 32);
+    defer { buf_free(&root); }
+    _ = buf_append_cstr(&root, home);
+    _ = buf_append_cstr(&root, "/sessions");
+    _ = buf_append_byte(&root, 0);
+    const dirp: &DIR = opendir(&root.ptr[0] as *const byte);
+    if dirp == null {
+        return false;
+    }
+    defer { _ = closedir(dirp); }
+    while true {
+        const de: &Dirent = readdir(dirp);
+        if de == null {
+            break;
+        }
+        var name: Buf = buf_new(272);
+        defer { buf_free(&name); }
+        if !buf_append_cstr(&name, &de.d_name[0] as &const byte) {
+            continue;
+        }
+        if name.len < 2 || name.ptr[0] != 45 as byte || name.ptr[1] != 45 as byte {
+            continue;
+        }
+        var cand: Buf = buf_new(1200);
+        _ = buf_append_cstr(&cand, home);
+        _ = buf_append_cstr(&cand, "/sessions/");
+        _ = buf_append(&cand, name.ptr, name.len);
+        _ = buf_append_cstr(&cand, "/");
+        _ = buf_append(&cand, id, id_len);
+        _ = buf_append_cstr(&cand, "/session.jsonl");
+        _ = buf_append_byte(&cand, 0);
+        const ok: bool = sess_file_exists(cand.ptr as &const byte);
+        if ok {
+            buf_reset(out);
+            _ = buf_append(out, cand.ptr, cand.len - 1);
+            buf_free(&cand);
+            return true;
+        }
+        buf_free(&cand);
+    }
+    return false;
+}
+
+export fn sess_file_exists(path: &const byte) bool {
+    const fd: i32 = sys_open(path as *const byte, O_RDONLY as i32, 0) catch {
+        return false;
+    };
+    _ = sys_close(fd) catch {};
+    return true;
+}
+
+// 最近的会话（按索引里的 lastActiveAt）：cwd 为空表示不限
+export fn sess_find_last(home: &const byte, cwd: &const byte, out: &Buf) bool {
+    var idx: Buf = buf_new(65536);
+    defer { buf_free(&idx); }
+    if !sess_read_index(home, &idx) {
+        return false;
+    }
+    var best_id: Buf = buf_new(64);
+    defer { buf_free(&best_id); }
+    var best_path: Buf = buf_new(1200);
+    defer { buf_free(&best_path); }
+    var best_at: i64 = -1;
+    var pos: usize = 0;
+    var line: Buf = buf_new(2048);
+    defer { buf_free(&line); }
+    while pos < idx.len {
+        // 取一行
+        buf_reset(&line);
+        var nl: usize = idx.len;
+        var i: usize = pos;
+        while i < idx.len {
+            if idx.ptr[i] == 10 as byte {
+                nl = i;
+                break;
+            }
+            i = i + 1;
+        }
+        if nl > pos {
+            _ = buf_append(&line, &idx.ptr[pos], nl - pos);
+        }
+        pos = nl + 1;
+        if line.len == 0 {
+            continue;
+        }
+        var id: Buf = buf_new(64);
+        var cwdv: Buf = buf_new(1024);
+        var pth: Buf = buf_new(1200);
+        defer { buf_free(&id); buf_free(&cwdv); buf_free(&pth); }
+        if !sess_json_str(line.ptr[0: line.len], "id", &id) {
+            continue;
+        }
+        _ = sess_json_str(line.ptr[0: line.len], "cwd", &cwdv);
+        if bufx_cstr_len(cwd) > 0 && !bufx_eq_cstr(cwdv.ptr as &const byte, cwdv.len, cwd) {
+            continue;
+        }
+        _ = sess_json_str(line.ptr[0: line.len], "path", &pth);
+        const when: i64 = sess_json_i64(line.ptr[0: line.len], "lastActiveAt");
+        if when > best_at {
+            best_at = when;
+            buf_reset(&best_id);
+            _ = buf_append(&best_id, id.ptr, id.len);
+            buf_reset(&best_path);
+            _ = buf_append(&best_path, pth.ptr, pth.len);
+        }
+    }
+    _ = best_id;
+    if best_path.len == 0 {
+        return false;
+    }
+    buf_reset(out);
+    return buf_append(out, best_path.ptr, best_path.len);
+}
+
+// 读索引文件（不存在返回 false）
+export fn sess_read_index(home: &const byte, out: &Buf) bool {
+    var p: Buf = buf_new(bufx_cstr_len(home) + 32);
+    defer { buf_free(&p); }
+    _ = buf_append_cstr(&p, home);
+    _ = buf_append_cstr(&p, "/index.jsonl");
+    _ = buf_append_byte(&p, 0);
+    const fd: i32 = sys_open(&p.ptr[0] as *const byte, O_RDONLY as i32, 0) catch {
+        return false;
+    };
+    defer { _ = sys_close(fd) catch {}; }
+    buf_reset(out);
+    var tmp: [byte: 8192] = [0: 8192];
+    while true {
+        const n: isize = sys_read(fd, &tmp[0], 8192) catch { 0 as isize; };
+        if n <= 0 {
+            break;
+        }
+        if !buf_append(out, &tmp[0], n as usize) {
+            return false;
+        }
+    }
+    return out.len > 0;
+}

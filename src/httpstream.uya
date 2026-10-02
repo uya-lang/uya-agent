@@ -1,0 +1,487 @@
+// src/httpstream.uya — 流式 HTTP 响应读取（P1）
+//
+// 与 httpc.uya 的 http_request 的区别：
+//   * http_request 把整个响应体读完再解析（非流式路径，--no-stream 用，保持原样）；
+//   * 这里 hc_open 只读到**响应头结束**就返回，body 由 hc_fill 按需增量解码，
+//     于是 SSE 能在字节到达时立刻被解析并打印。
+//
+// 支持三种体编码：chunked（增量状态机）、content-length、读到连接关闭（未知长度）。
+// 复用 httpc.uya 的连接/TLS/请求构造函数（Uya 多文件是合并命名空间，私有 fn 也可见）。
+//
+// hc_fill 返回值语义（调用方靠它决定继续 poll 还是收工）：
+//   1 = 本次新增了可读体字节（st.dec 变长）
+//   2 = 读到网络数据但还没解出体字节（继续 poll/fill）
+//   0 = 体已结束（且无新字节）
+//
+// 生命周期：hc_open 之后 fd/TLS 归流持有，**必须**在调用方 defer hc_stream_free(&st)，
+// 否则连接泄漏。
+
+use libc.syscall;
+use tls.https;
+
+// chunked 状态机状态
+const HC_CK_SIZE: u8 = 0;      // 等 chunk 长度行
+const HC_CK_DATA: u8 = 1;      // chunk 数据
+const HC_CK_CRLF: u8 = 2;      // chunk 后的 CRLF
+const HC_CK_TRAILER: u8 = 3;   // 0 块后的 trailer
+const HC_CK_DONE: u8 = 4;      // 体结束
+
+// chunk 长度行/trailer 行的合理上限（防畸形流把内存吃光）
+const HCS_LINE_MAX: usize = 1024;
+
+export struct HcStream {
+    fd: i32,
+    is_tls: bool,
+    tc: &TlsConn,
+    status: i32,
+    chunked: bool,
+    content_length: i64,     // -1 = 未知（读到 EOF）
+    head: Buf,               // 原始响应头（含结尾空行）
+    head_len: usize,
+    rx: Buf,                 // wire 字节；未消费段从 rx_off 开始
+    rx_off: usize,
+    dec: Buf,                // 解码后的体字节；未消费段从 dec_off 开始
+    dec_off: usize,
+    ck_state: u8,
+    ck_need: usize,
+    delivered: usize,        // 累计解出的体字节数（单调）
+    eof: bool,               // 体已结束
+    net_eof: bool,           // 对端已关连接
+    max_body: usize,
+}
+
+export fn hc_stream_empty() HcStream {
+    return HcStream{
+        fd: -1,
+        is_tls: false,
+        tc: null as &TlsConn,
+        status: 0,
+        chunked: false,
+        content_length: -1,
+        head: buf_empty(),
+        head_len: 0,
+        rx: buf_empty(),
+        rx_off: 0,
+        dec: buf_empty(),
+        dec_off: 0,
+        ck_state: HC_CK_SIZE,
+        ck_need: 0,
+        delivered: 0,
+        eof: false,
+        net_eof: false,
+        max_body: 0,
+    };
+}
+
+export fn hc_stream_free(st: &HcStream) void {
+    if st.fd >= 0 {
+        _ = sys_close(st.fd) catch {};
+        st.fd = -1;
+    }
+    if st.is_tls && (st.tc as usize) != 0 {
+        tls_conn_free(st.tc);
+    }
+    buf_free(&st.head);
+    buf_free(&st.rx);
+    buf_free(&st.dec);
+    st.rx_off = 0;
+    st.dec_off = 0;
+    st.eof = true;
+}
+
+export fn hc_fd(st: &const HcStream) i32 {
+    return st.fd;
+}
+
+export fn hc_status(st: &const HcStream) i32 {
+    return st.status;
+}
+
+// 当前可读的体字节数（未消费）
+export fn hc_avail(st: &const HcStream) usize {
+    return st.dec.len - st.dec_off;
+}
+
+// 体是否已读完（不会再有新字节）
+export fn hc_body_done(st: &const HcStream) bool {
+    if st.chunked {
+        return st.ck_state == HC_CK_DONE;
+    }
+    if st.content_length >= 0 {
+        return st.delivered >= (st.content_length as usize);
+    }
+    return st.net_eof;
+}
+
+// 消费 n 字节（n 会被裁剪到可读范围）
+export fn hc_consume(st: &HcStream, n: usize) void {
+    var k: usize = n;
+    const avail: usize = st.dec.len - st.dec_off;
+    if k > avail {
+        k = avail;
+    }
+    st.dec_off = st.dec_off + k;
+    if st.dec_off >= st.dec.len {
+        st.dec.len = 0;
+        st.dec_off = 0;
+    } else if st.dec_off >= 8192 {
+        buf_drop_prefix(&st.dec, st.dec_off);
+        st.dec_off = 0;
+    }
+}
+
+export fn hc_peek(st: &const HcStream, off: usize) byte {
+    const avail: usize = st.dec.len - st.dec_off;
+    if off >= avail {
+        return 0;
+    }
+    return st.dec.ptr[st.dec_off + off];
+}
+
+// 把可读体字节搬到 out（最多 max 字节），返回搬运量
+export fn hc_body_read(st: &HcStream, out: &Buf, max: usize) !usize {
+    var take: usize = hc_avail(st);
+    if take > max {
+        take = max;
+    }
+    if take == 0 {
+        return 0 as usize;
+    }
+    if !buf_append(out, &st.dec.ptr[st.dec_off], take) {
+        return error.HcOutOfMemory;
+    }
+    hc_consume(st, take);
+    return take;
+}
+
+// rx[rx_off..] 尽量解码进 dec。返回 1 = dec 有增长，0 = 无可解内容。
+fn hc_decode(st: &HcStream) !i32 {
+    var grew: bool = false;
+    var guard: usize = 0;
+    while guard < 8192 {
+        guard = guard + 1;
+
+        if st.chunked {
+            if st.ck_state == HC_CK_DONE {
+                break;
+            }
+
+            if st.ck_state == HC_CK_SIZE {
+                const view: &[byte] = st.rx.ptr[0: st.rx.len];
+                const nl: isize = bufx_find_byte(view, 10, st.rx_off);
+                if nl < 0 {
+                    if st.rx.len - st.rx_off > HCS_LINE_MAX {
+                        return error.HcBadResponse;
+                    }
+                    break;
+                }
+                const line_end: usize = nl as usize;
+                var hlen: usize = line_end - st.rx_off;
+                if hlen > 0 && view.ptr[line_end - 1] == 13 as byte {
+                    hlen = hlen - 1;
+                }
+                // 忽略 chunk 扩展（;name=value）
+                var hex_len: usize = hlen;
+                var k: usize = 0;
+                while k < hlen {
+                    if view.ptr[st.rx_off + k] == 59 as byte {
+                        hex_len = k;
+                        break;
+                    }
+                    k = k + 1;
+                }
+                if hex_len == 0 {
+                    return error.HcBadResponse;
+                }
+                const clen: i64 = parse_hex_at(view, st.rx_off, hex_len);
+                if clen < 0 {
+                    return error.HcBadResponse;
+                }
+                st.rx_off = line_end + 1;
+                if clen == 0 {
+                    st.ck_state = HC_CK_TRAILER;
+                } else {
+                    st.ck_need = clen as usize;
+                    st.ck_state = HC_CK_DATA;
+                }
+                continue;
+            }
+
+            if st.ck_state == HC_CK_DATA {
+                const avail: usize = st.rx.len - st.rx_off;
+                if avail == 0 {
+                    break;
+                }
+                var take: usize = st.ck_need;
+                if take > avail {
+                    take = avail;
+                }
+                if !buf_append(&st.dec, &st.rx.ptr[st.rx_off], take) {
+                    return error.HcOutOfMemory;
+                }
+                st.rx_off = st.rx_off + take;
+                st.ck_need = st.ck_need - take;
+                st.delivered = st.delivered + take;
+                grew = true;
+                if st.dec.len > st.max_body {
+                    return error.HcTooLarge;
+                }
+                if st.ck_need == 0 {
+                    st.ck_state = HC_CK_CRLF;
+                }
+                // 先把手上的数据交出去，别一次吃完整条流
+                break;
+            }
+
+            if st.ck_state == HC_CK_CRLF {
+                const avail: usize = st.rx.len - st.rx_off;
+                if avail == 0 {
+                    break;
+                }
+                const view2: &[byte] = st.rx.ptr[0: st.rx.len];
+                if view2.ptr[st.rx_off] == 13 as byte {
+                    if avail < 2 {
+                        break;
+                    }
+                    if view2.ptr[st.rx_off + 1] != 10 as byte {
+                        return error.HcBadResponse;
+                    }
+                    st.rx_off = st.rx_off + 2;
+                } else if view2.ptr[st.rx_off] == 10 as byte {
+                    st.rx_off = st.rx_off + 1;
+                } else {
+                    return error.HcBadResponse;
+                }
+                st.ck_state = HC_CK_SIZE;
+                continue;
+            }
+
+            // HC_CK_TRAILER：吞掉 trailer，直到空行
+            const view3: &[byte] = st.rx.ptr[0: st.rx.len];
+            const nl3: isize = bufx_find_byte(view3, 10, st.rx_off);
+            if nl3 < 0 {
+                if st.rx.len - st.rx_off > HCS_LINE_MAX {
+                    return error.HcBadResponse;
+                }
+                break;
+            }
+            const t_end: usize = nl3 as usize;
+            var tlen: usize = t_end - st.rx_off;
+            if tlen > 0 && view3.ptr[t_end - 1] == 13 as byte {
+                tlen = tlen - 1;
+            }
+            st.rx_off = t_end + 1;
+            if tlen == 0 {
+                st.ck_state = HC_CK_DONE;
+                break;
+            }
+            continue;
+        }
+
+        // identity：把 rx 剩余搬进 dec（受 content-length / max_body 限制）
+        const avail4: usize = st.rx.len - st.rx_off;
+        var take4: usize = avail4;
+        if st.content_length >= 0 {
+            const total: usize = st.content_length as usize;
+            if st.delivered >= total {
+                take4 = 0;
+            } else if take4 > total - st.delivered {
+                take4 = total - st.delivered;
+            }
+        }
+        if take4 > 0 {
+            if !buf_append(&st.dec, &st.rx.ptr[st.rx_off], take4) {
+                return error.HcOutOfMemory;
+            }
+            st.rx_off = st.rx_off + take4;
+            st.delivered = st.delivered + take4;
+            grew = true;
+            if st.dec.len > st.max_body {
+                return error.HcTooLarge;
+            }
+        }
+        break;
+    }
+    if grew {
+        return 1 as i32;
+    }
+    return 0 as i32;
+}
+
+// 发请求 + 读到响应头结束（body 留在流里）
+export fn hc_open(
+    url: &[byte],
+    method: &[byte],
+    extra_headers: &[byte],
+    body: &const byte,
+    body_len: usize,
+    timeout_ms: u32,
+    max_body: usize,
+    verify: i32,
+    pin: &[byte],
+    st: &HcStream,
+    tls_out: &TlsConn
+) !void {
+    var u: Url = url_empty();
+    try url_parse(url, &u);
+    defer { url_free(&u); }
+
+    const fd: i32 = try tcp_connect(url_host(&u), u.host_len, u.port, timeout_ms);
+    st.fd = fd;
+    st.is_tls = u.tls;
+    st.tc = tls_out;
+    st.max_body = max_body;
+
+    tls_out.fd = fd;
+    var conn: HcConn = HcConn{ fd: fd, is_tls: u.tls, tc: tls_out };
+    if u.tls {
+        try tls_open(tls_out, url_host(&u), u.host_len, verify, pin);
+    }
+
+    var req: Buf = buf_new(4096);
+    defer { buf_free(&req); }
+    if !buf_valid(&req) {
+        return error.HcOutOfMemory;
+    }
+    if !build_request(&u, method, extra_headers, body_len, &req) {
+        return error.HcOutOfMemory;
+    }
+    if !buf_append(&req, body, body_len) {
+        return error.HcOutOfMemory;
+    }
+    try conn_write_all(&conn, &req.ptr[0], req.len);
+
+    st.head = buf_new(512);
+    st.rx = buf_new(HC_READ_CHUNK * 2);
+    st.dec = buf_new(HC_READ_CHUNK);
+    if !buf_valid(&st.head) || !buf_valid(&st.rx) || !buf_valid(&st.dec) {
+        return error.HcOutOfMemory;
+    }
+
+    // 读到响应头结束（"\r\n\r\n"）
+    var tmp: [byte: HC_READ_CHUNK] = [0: HC_READ_CHUNK];
+    var head_end: usize = 0;
+    while true {
+        const view: &[byte] = st.rx.ptr[0: st.rx.len];
+        const he: isize = find_sub(view, &"\r\n\r\n"[0: 4], 0);
+        if he >= 0 {
+            head_end = (he as usize) + 4;
+            break;
+        }
+        if st.rx.len > HC_HEAD_MAX {
+            return error.HcBadResponse;
+        }
+        const n: usize = try conn_read(&conn, &tmp[0], HC_READ_CHUNK);
+        if n == 0 {
+            return error.HcBadResponse;   // 头都没读完就断了
+        }
+        if !buf_append(&st.rx, &tmp[0], n) {
+            return error.HcOutOfMemory;
+        }
+    }
+    st.head_len = head_end;
+    if !buf_append(&st.head, &st.rx.ptr[0], head_end) {
+        return error.HcOutOfMemory;
+    }
+    const head_view: &[byte] = st.head.ptr[0: st.head_len];
+    st.status = parse_status(head_view, head_end);
+    if st.status == 0 {
+        return error.HcBadResponse;
+    }
+
+    var cl_off: usize = 0;
+    var cl_len: usize = 0;
+    var te_off: usize = 0;
+    var te_len: usize = 0;
+    if head_value(head_view, head_end, &"content-length"[0: 14], &cl_off, &cl_len) && cl_len > 0 {
+        const want: i64 = parse_u64_at(head_view, cl_off, cl_len);
+        if want < 0 {
+            return error.HcBadResponse;
+        }
+        st.content_length = want;
+    }
+    if head_value(head_view, head_end, &"transfer-encoding"[0: 17], &te_off, &te_len) && te_len >= 7 {
+        st.chunked = eq_ignore_case(head_view[te_off: te_len], &"chunked"[0: 7]);
+    }
+
+    st.rx_off = head_end;
+    if hc_debug {
+        var hb: usize = head_end;
+        if hb > 400 {
+            hb = 400;
+        }
+        hc_dbg("[hc] head: ", &st.head.ptr[0] as &const byte, hb);
+        hc_dbg_dec("[hc] rx.len=", st.rx.len);
+        hc_dbg_dec("[hc] head_end=", head_end);
+        hc_dbg_dec("[hc] chunked=", st.chunked as usize);
+        var cl_show: usize = 0;
+        if st.content_length > 0 {
+            cl_show = st.content_length as usize;
+        }
+        hc_dbg_dec("[hc] content_length=", cl_show);
+        hc_dbg_dec("[hc] leftover=", st.rx.len - head_end);
+    }
+
+    // 头后面可能已经跟着体字节：立刻解一次
+    const d0: i32 = try hc_decode(st);
+    _ = d0;
+    return;
+}
+
+// 交互模式用：先 poll 等可读（最多 timeout_ms），可读才真正读。
+// 超时返回 2（「暂时没数据」），调用方可以先去处理键盘输入再回来。
+export fn hc_fill_wait(st: &HcStream, timeout_ms: i32) !i32 {
+    var pfds: [PollFd: 1] = [PollFd{ fd: st.fd, events: POLLIN, revents: 0 }];
+    const pr: i32 = sys_poll(&pfds[0], 1, timeout_ms) catch { 0; };
+    if pr <= 0 {
+        return 2 as i32;
+    }
+    return hc_fill(st);
+}
+
+// 读一次网络并推进解码。见文件头的返回值语义。
+export fn hc_fill(st: &HcStream) !i32 {
+    const d0: i32 = try hc_decode(st);
+    if d0 == 1 {
+        return 1 as i32;
+    }
+    if hc_body_done(st) {
+        st.eof = true;
+        return 0 as i32;
+    }
+
+    var tmp: [byte: HC_READ_CHUNK] = [0: HC_READ_CHUNK];
+    var conn: HcConn = HcConn{ fd: st.fd, is_tls: st.is_tls, tc: st.tc };
+    const n: usize = try conn_read(&conn, &tmp[0], HC_READ_CHUNK);
+    if n == 0 {
+        // 对端关连接：先尽量把手里剩下的 rx 解完，再报结束
+        st.net_eof = true;
+        const d1: i32 = try hc_decode(st);
+        if hc_body_done(st) || d1 == 0 {
+            st.eof = true;
+            return 0 as i32;
+        }
+        return 1 as i32;
+    }
+    if !buf_append(&st.rx, &tmp[0], n) {
+        return error.HcOutOfMemory;
+    }
+    if st.rx.len > st.max_body + HC_HEAD_MAX + HC_READ_CHUNK {
+        return error.HcTooLarge;
+    }
+    // 压缩已消费的 wire 前缀
+    if st.rx_off > 0 && st.rx_off >= st.rx.len / 2 {
+        buf_drop_prefix(&st.rx, st.rx_off);
+        st.rx_off = 0;
+    }
+
+    const d2: i32 = try hc_decode(st);
+    if d2 == 1 {
+        return 1 as i32;
+    }
+    if hc_body_done(st) {
+        st.eof = true;
+        return 0 as i32;
+    }
+    return 2 as i32;
+}

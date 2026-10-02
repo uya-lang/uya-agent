@@ -44,6 +44,33 @@ export struct Config {
     quiet: bool,
     tls_debug: bool,
     timeout_ms: u32,
+    // P1：流式
+    stream: bool,             // false = 走旧的非流式路径（--no-stream）
+    stream_options: bool,     // 发 stream_options.include_usage
+    show_reasoning: bool,     // 把 reasoning_content 打到 stderr
+    show_usage: bool,         // 每轮结束打印 token 用量
+    max_tokens: i64,          // 0 = 不发送 max_tokens
+    temperature: i32,         // -1 = 不发送 temperature（对齐 DSH 默认行为）
+    compat_fold: bool,        // true = 工具结果折叠成一条 user 消息（老端点兼容）
+    // P4：会话
+    save_session: bool,       // false = --no-save
+    resume_id: Buf,           // --resume <id> / --continue 解析出的 id（空 = 新会话）
+    agent_home: Buf,          // ~/.uya-agent 之类
+    list_sessions: bool,      // --list-sessions：打印后退出
+    // P5：DSH 设置兼容
+    dsh_home: Buf,            // --dsh-home（缺省 $DSH_HOME 或 ~/.dsh）
+    no_dsh_config: bool,      // --no-dsh-config
+    strict_dsh_config: bool,  // --strict-dsh-config：读不到就报错退出
+    print_config: bool,       // --print-config
+    context_window: i64,      // 来自模型条目（压缩阈值基准）
+    reasoning_effort: Buf,    // 来自 agent-default-model
+    input_image: bool,        // 模型条目 input 含 image
+    confine: bool,            // 路径守卫（permission.defaultPreset 推出）
+    src_base_url: u8,
+    src_model: u8,
+    src_key: u8,
+    src_context: u8,
+    src_confine: u8,
 }
 
 fn cfg_default() Config {
@@ -63,10 +90,38 @@ fn cfg_default() Config {
         quiet: false,
         tls_debug: false,
         timeout_ms: 120000,
+        stream: true,
+        stream_options: true,
+        show_reasoning: false,
+        show_usage: false,
+        max_tokens: 0,
+        temperature: -1,
+        compat_fold: false,
+        save_session: true,
+        resume_id: buf_empty(),
+        agent_home: buf_empty(),
+        list_sessions: false,
+        dsh_home: buf_empty(),
+        no_dsh_config: false,
+        strict_dsh_config: false,
+        print_config: false,
+        context_window: -1,
+        reasoning_effort: buf_empty(),
+        input_image: false,
+        confine: false,
+        src_base_url: 0,
+        src_model: 0,
+        src_key: 0,
+        src_context: 0,
+        src_confine: 0,
     };
 }
 
 fn cfg_free(c: &Config) void {
+    buf_free(&c.resume_id);
+    buf_free(&c.agent_home);
+    buf_free(&c.dsh_home);
+    buf_free(&c.reasoning_effort);
     buf_free(&c.base_url);
     buf_free(&c.model);
     buf_free(&c.api_key);
@@ -78,16 +133,18 @@ fn cfg_free(c: &Config) void {
 // ============================================================
 // 输出小工具
 // ============================================================
+// 所有输出都走 tty 协议：交互模式下先擦掉输入行再写、写完重画，
+// 避免流式输出和用户正在敲的字互相踩；非交互时就是裸 write。
 fn out_err(p: &const byte) void {
-    _ = sys_write(2, p as *const byte, strlen(p)) catch {};
+    tty_stream_write(2, p as &const byte, strlen(p));
 }
 
 fn out_bytes(p: &const byte, n: usize) void {
-    _ = sys_write(1, p as *const byte, n) catch {};
+    tty_stream_write(1, p, n);
 }
 
 fn out_err_bytes(p: &const byte, n: usize) void {
-    _ = sys_write(2, p as *const byte, n) catch {};
+    tty_stream_write(2, p, n);
 }
 
 fn out_err_dec(v: usize) void {
@@ -222,13 +279,23 @@ fn env_first(n1: &const byte, n2: &const byte, n3: &const byte) Buf {
 const ROLE_SYSTEM: u8 = 0;
 const ROLE_USER: u8 = 1;
 const ROLE_ASSISTANT: u8 = 2;
-const MSG_MAX: usize = 24;
+// P2：严格工具协议用到的两种消息
+//   ROLE_ASSISTANT_CALLS  assistant 消息里带 tool_calls（extra = tool_calls 数组原文）
+//   ROLE_TOOL             工具结果（extra = tool_call_id）
+const ROLE_ASSISTANT_CALLS: u8 = 3;
+const ROLE_TOOL: u8 = 4;
+const MSG_MAX: usize = 64;
 const MSG_CONTENT_MAX: usize = 200000;
 
+// text = content 正文；extra 的含义由 role 决定（tool_calls 数组原文 / tool_call_id）。
+// assistant 展开成「assistant + N 条 tool」消息对，这是 OpenAI 严格协议的要求，
+// 也是 DSH 的做法（DSH 会把 assistant 消息连同 tool_calls 原样回灌）。
 struct Msg {
     role: u8,
-    ptr: &byte,
-    len: usize,
+    text: &byte,
+    text_len: usize,
+    extra: &byte,
+    extra_len: usize,
 }
 
 struct History {
@@ -237,69 +304,141 @@ struct History {
     bytes: usize,
 }
 
+fn msg_zero() Msg {
+    return Msg{ role: 0, text: null, text_len: 0, extra: null, extra_len: 0 };
+}
+
 fn hist_init() History {
-    return History{ items: [Msg{ role: 0, ptr: null, len: 0 }: MSG_MAX], len: 0, bytes: 0 };
+    return History{ items: [msg_zero(): MSG_MAX], len: 0, bytes: 0 };
 }
 
 fn hist_free(h: &History) void {
     var i: usize = 0;
     while i < h.len {
-        if (h.items[i].ptr as usize) != 0 {
-            free(h.items[i].ptr as &void);
+        if (h.items[i].text as usize) != 0 {
+            free(h.items[i].text as &void);
         }
-        h.items[i].ptr = null;
-        h.items[i].len = 0;
+        if (h.items[i].extra as usize) != 0 {
+            free(h.items[i].extra as &void);
+        }
+        h.items[i] = msg_zero();
         i = i + 1;
     }
     h.len = 0;
     h.bytes = 0;
 }
 
+// 复制一段字节到堆上（补 NUL，便于调试时当 C 字符串看）
+fn hist_dup(p: &const byte, n: usize) &byte {
+    const raw: &void = malloc(n + 1);
+    if ((raw as &byte) as usize) == 0 {
+        return null;
+    }
+    const q: &byte = raw as &byte;
+    if n > 0 {
+        _ = mem_copy(q, p, n);
+    }
+    const q_end: &byte = @ptr_from_usize(@usize_from_ptr(q as &void) + n) as &byte;
+    _ = mem_set(q_end, 0, 1);
+    return q;
+}
+
+// 追加一条消息；text/extra 允许为空（n == 0 时存 null）
+fn hist_push_msg(h: &History, role: u8, text: &const byte, text_len: usize, extra: &const byte, extra_len: usize) bool {
+    if text_len > MSG_CONTENT_MAX || extra_len > MSG_CONTENT_MAX {
+        return false;
+    }
+    const idx: usize = h.len;
+    if idx >= MSG_MAX {
+        return false;
+    }
+    var t: &byte = null;
+    if text_len > 0 {
+        t = hist_dup(text, text_len);
+        if (t as usize) == 0 {
+            return false;
+        }
+    }
+    var e: &byte = null;
+    if extra_len > 0 {
+        e = hist_dup(extra, extra_len);
+        if (e as usize) == 0 {
+            if (t as usize) != 0 {
+                free(t as &void);
+            }
+            return false;
+        }
+    }
+    const slot: &Msg = &h.items[idx];
+    slot.role = role;
+    slot.text = t;
+    slot.text_len = text_len;
+    slot.extra = e;
+    slot.extra_len = extra_len;
+    h.len = idx + 1;
+    h.bytes = h.bytes + text_len + extra_len;
+    return true;
+}
+
+// 老签名（纯文本消息）
 fn hist_push(h: &History, role: u8, p: &const byte, n: usize) bool {
     if n == 0 {
         return false;
     }
-    if n > MSG_CONTENT_MAX {
-        return false;
-    }
-    const raw: &void = malloc(n + 1);
-    if ((raw as &byte) as usize) == 0 {
-        return false;
-    }
-    const q: &byte = raw as &byte;
-    _ = mem_copy(q, p, n);
-    const q_end: &byte = @ptr_from_usize(@usize_from_ptr(q as &void) + n) as &byte;
-    _ = mem_set(q_end, 0, 1);
-    // 注意：安全证明只接受「局部变量」作为数组下标，直接用字段 h.len 会被拒
-    const idx: usize = h.len;
-    if idx >= MSG_MAX {
-        free(raw);
-        return false;
-    }
-    const slot: &Msg = &h.items[idx];
-    slot.role = role;
-    slot.ptr = q;
-    slot.len = n;
-    h.len = idx + 1;
-    h.bytes = h.bytes + n;
-    return true;
+    return hist_push_msg(h, role, p, n, null, 0);
 }
 
-// 丢掉最老的一条非 system 消息（历史太大时的兜底）
+fn msg_free_one(m: &Msg) void {
+    if (m.text as usize) != 0 {
+        free(m.text as &void);
+    }
+    if (m.extra as usize) != 0 {
+        free(m.extra as &void);
+    }
+    m.text = null;
+    m.extra = null;
+    m.text_len = 0;
+    m.extra_len = 0;
+}
+
+// 丢掉最老的一条非 system 消息。
+// **不能拆散 assistant(tool_calls) 与它的 tool 结果**：丢掉带 tool_calls 的
+// assistant 时，紧随其后的 tool 消息必须一起丢，否则请求里会出现「悬空结果」，
+// 端点会直接 400。历史里同样不允许以 tool 消息开头（助手消息已被丢掉的情况）。
 fn hist_drop_oldest(h: &History) bool {
     if h.len < 3 {
         return false;
     }
-    if (h.items[1].ptr as usize) != 0 {
-        free(h.items[1].ptr as &void);
+    var end: usize = 1;
+    if h.items[1].role == ROLE_ASSISTANT_CALLS {
+        while end + 1 < h.len && h.items[end + 1].role == ROLE_TOOL {
+            end = end + 1;
+        }
     }
-    h.bytes = h.bytes - h.items[1].len;
+    var k: usize = 1;
+    while k <= end {
+        h.bytes = h.bytes - (h.items[k].text_len + h.items[k].extra_len);
+        msg_free_one(&h.items[k]);
+        k = k + 1;
+    }
+    const removed: usize = end;   // 移除下标 1..=end 共 end 条
     var i: usize = 1;
-    while i + 1 < h.len {
-        h.items[i] = h.items[i + 1];
+    while i + removed < h.len {
+        h.items[i] = h.items[i + removed];
         i = i + 1;
     }
-    h.len = h.len - 1;
+    h.len = h.len - removed;
+    // 兜底：不允许以 tool 消息开头
+    while h.len > 1 && h.items[1].role == ROLE_TOOL {
+        h.bytes = h.bytes - (h.items[1].text_len + h.items[1].extra_len);
+        msg_free_one(&h.items[1]);
+        var j: usize = 1;
+        while j + 1 < h.len {
+            h.items[j] = h.items[j + 1];
+            j = j + 1;
+        }
+        h.len = h.len - 1;
+    }
     return true;
 }
 
@@ -307,10 +446,421 @@ fn role_cstr(role: u8) &byte {
     if role == ROLE_SYSTEM {
         return "system" as &byte;
     }
-    if role == ROLE_ASSISTANT {
+    if role == ROLE_ASSISTANT || role == ROLE_ASSISTANT_CALLS {
         return "assistant" as &byte;
     }
+    if role == ROLE_TOOL {
+        return "tool" as &byte;
+    }
     return "user" as &byte;
+}
+
+// ============================================================
+// P4：会话日志
+//
+// 事件词表（data 载荷刻意做成无歧义键，恢复时不必猜）：
+//   user/message      {"role":"user","content":[{"type":"text","text":…}],"source":{…}}
+//   assistant/message {"turn":N,"step":N,"message":{"role":"assistant","content":…,"tool_calls":[…]?},"usage":{…}}
+//   tool/call         {"turn":N,"step":N,"callId":…,"name":…,"arguments":…}
+//   tool/result       {"turn":N,"step":N,"callId":…,"content":…}
+//   turn/start|end    {"turn":N}[,"reason":…]
+//   step/start|end    {"turn":N,"step":N}
+//   session/title     {"title":…,"source":{"kind":"fallback"}}
+// ============================================================
+var g_sess: SessionLog = SessionLog{
+    id: Buf{ ptr: null, len: 0, cap: 0 },
+    path: Buf{ ptr: null, len: 0, cap: 0 },
+    cwd: Buf{ ptr: null, len: 0, cap: 0 },
+    model: Buf{ ptr: null, len: 0, cap: 0 },
+    fd: -1,
+    seq: 0,
+    events: 0,
+    save: false,
+    title: Buf{ ptr: null, len: 0, cap: 0 },
+    turns: 0,
+};
+var g_home: Buf = Buf{ ptr: null, len: 0, cap: 0 };
+var g_turn: i32 = 0;
+
+export fn agent_set_home(home: &const byte) bool {
+    buf_free(&g_home);
+    g_home = buf_new(bufx_cstr_len(home) + 8);
+    // 这个缓冲后面要当 C 字符串用（sess_close 会把它传给索引写入），必须补 NUL
+    return buf_append_cstr_z(&g_home, home);
+}
+
+export fn agent_home() &[byte] {
+    return g_home.ptr[0: g_home.len];
+}
+
+// 默认 agent home：--agent-home > $UYA_AGENT_HOME > $HOME/.uya-agent
+fn agent_default_home(cfg: &const Config, out: &Buf) bool {
+    buf_reset(out);
+    if cfg.agent_home.len > 0 {
+        return buf_append(out, cfg.agent_home.ptr, cfg.agent_home.len);
+    }
+    const env: &byte = getenv("UYA_AGENT_HOME");
+    if (env as usize) != 0 {
+        return buf_append_cstr(out, env);
+    }
+    const home: &byte = getenv("HOME");
+    if (home as usize) == 0 {
+        return false;
+    }
+    if !buf_append_cstr(out, home) {
+        return false;
+    }
+    return buf_append_cstr(out, "/.uya-agent");
+}
+
+fn agent_log_user(text: &const byte, n: usize, steer: bool) void {
+    if !g_sess.save || n == 0 {
+        return;
+    }
+    var ev: Buf = buf_new(n + 256);
+    defer { buf_free(&ev); }
+    if !sess_begin(&g_sess, "user/message", &ev) {
+        return;
+    }
+    _ = buf_append_cstr(&ev, "{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":");
+    if !jw_str_into(&ev, text, n) {
+        return;
+    }
+    if steer {
+        _ = buf_append_cstr(&ev, "}],\"source\":{\"kind\":\"steer\"}}");
+    } else {
+        _ = buf_append_cstr(&ev, "}],\"source\":{\"kind\":\"user\"}}");
+    }
+    _ = sess_end(&g_sess, &ev);
+    if g_sess.title.len == 0 {
+        var t: usize = n;
+        if t > 40 {
+            t = 40;
+        }
+        _ = buf_append(&g_sess.title, text, t);
+        // 顺便落一条标题事件（DSH 也有 session/title）
+        var tev: Buf = buf_new(256);
+        defer { buf_free(&tev); }
+        if sess_begin(&g_sess, "session/title", &tev) {
+            _ = buf_append_cstr(&tev, "{\"title\":");
+            _ = jw_str_into(&tev, g_sess.title.ptr as &const byte, g_sess.title.len);
+            _ = buf_append_cstr(&tev, ",\"source\":{\"kind\":\"fallback\"}}");
+            _ = sess_end(&g_sess, &tev);
+        }
+    }
+}
+
+fn agent_log_assistant(step: i32, o: &const ChatOut) void {
+    if !g_sess.save {
+        return;
+    }
+    var ev: Buf = buf_new(o.content.len + 8192);
+    defer { buf_free(&ev); }
+    if !sess_begin(&g_sess, "assistant/message", &ev) {
+        return;
+    }
+    _ = buf_append_cstr(&ev, "{\"turn\":");
+    _ = buf_append_i64(&ev, g_turn as i64);
+    _ = buf_append_cstr(&ev, ",\"step\":");
+    _ = buf_append_i64(&ev, step as i64);
+    _ = buf_append_cstr(&ev, ",\"message\":{\"role\":\"assistant\",\"content\":");
+    if o.content.len > 0 {
+        if !jw_str_into(&ev, o.content.ptr as &const byte, o.content.len) {
+            return;
+        }
+    } else if !buf_append_cstr(&ev, "\"\"") {
+        return;
+    }
+    if o.ncalls > 0 {
+        var cj: Buf = buf_new(8192);
+        defer { buf_free(&cj); }
+        if !calls_json_from_chat(o, &cj) {
+            return;
+        }
+        _ = buf_append_cstr(&ev, ",\"tool_calls\":");
+        _ = buf_append(&ev, cj.ptr, cj.len);
+    }
+    _ = buf_append_cstr(&ev, "},\"usage\":{\"inputTokens\":");
+    _ = buf_append_i64(&ev, o.usage_in);
+    _ = buf_append_cstr(&ev, ",\"outputTokens\":");
+    _ = buf_append_i64(&ev, o.usage_out);
+    _ = buf_append_cstr(&ev, ",\"cacheReadTokens\":");
+    _ = buf_append_i64(&ev, o.usage_cache_read);
+    _ = buf_append_cstr(&ev, ",\"reasoningTokens\":");
+    _ = buf_append_i64(&ev, o.usage_reasoning);
+    _ = buf_append_cstr(&ev, "}}");
+    _ = sess_end(&g_sess, &ev);
+}
+
+fn agent_log_tool(step: i32, call_id: &const Buf, name: &const Buf, args: &const Buf, result: &const Buf) void {
+    if !g_sess.save {
+        return;
+    }
+    var ev: Buf = buf_new(args.len + result.len + 512);
+    defer { buf_free(&ev); }
+    if sess_begin(&g_sess, "tool/call", &ev) {
+        _ = buf_append_cstr(&ev, "{\"turn\":");
+        _ = buf_append_i64(&ev, g_turn as i64);
+        _ = buf_append_cstr(&ev, ",\"step\":");
+        _ = buf_append_i64(&ev, step as i64);
+        _ = buf_append_cstr(&ev, ",\"callId\":");
+        _ = jw_str_into(&ev, call_id.ptr as &const byte, call_id.len);
+        _ = buf_append_cstr(&ev, ",\"name\":");
+        _ = jw_str_into(&ev, name.ptr as &const byte, name.len);
+        _ = buf_append_cstr(&ev, ",\"arguments\":");
+        _ = jw_str_into(&ev, args.ptr as &const byte, args.len);
+        _ = buf_append_cstr(&ev, "}");
+        _ = sess_end(&g_sess, &ev);
+    }
+    buf_reset(&ev);
+    if sess_begin(&g_sess, "tool/result", &ev) {
+        _ = buf_append_cstr(&ev, "{\"turn\":");
+        _ = buf_append_i64(&ev, g_turn as i64);
+        _ = buf_append_cstr(&ev, ",\"step\":");
+        _ = buf_append_i64(&ev, step as i64);
+        _ = buf_append_cstr(&ev, ",\"callId\":");
+        _ = jw_str_into(&ev, call_id.ptr as &const byte, call_id.len);
+        _ = buf_append_cstr(&ev, ",\"content\":");
+        _ = jw_str_into(&ev, result.ptr as &const byte, result.len);
+        _ = buf_append_cstr(&ev, "}");
+        _ = sess_end(&g_sess, &ev);
+    }
+}
+
+fn agent_log_simple(typ: &const byte, payload: &const byte) void {
+    if !g_sess.save {
+        return;
+    }
+    var ev: Buf = buf_new(256);
+    defer { buf_free(&ev); }
+    if !sess_begin(&g_sess, typ, &ev) {
+        return;
+    }
+    _ = buf_append_cstr(&ev, payload);
+    _ = sess_end(&g_sess, &ev);
+}
+
+fn agent_log_turn_start() void {
+    var ev: Buf = buf_new(64);
+    defer { buf_free(&ev); }
+    if !g_sess.save {
+        return;
+    }
+    if !sess_begin(&g_sess, "turn/start", &ev) {
+        return;
+    }
+    _ = buf_append_cstr(&ev, "{\"turn\":");
+    _ = buf_append_i64(&ev, g_turn as i64);
+    _ = buf_append_cstr(&ev, "}");
+    _ = sess_end(&g_sess, &ev);
+    g_sess.turns = g_turn as i64;
+}
+
+fn agent_log_turn_end(reason: &const byte) void {
+    if !g_sess.save {
+        return;
+    }
+    var ev: Buf = buf_new(128);
+    defer { buf_free(&ev); }
+    if !sess_begin(&g_sess, "turn/end", &ev) {
+        return;
+    }
+    _ = buf_append_cstr(&ev, "{\"turn\":");
+    _ = buf_append_i64(&ev, g_turn as i64);
+    _ = buf_append_cstr(&ev, ",\"reason\":");
+    _ = jw_str_into(&ev, reason, bufx_cstr_len(reason));
+    _ = buf_append_cstr(&ev, "}");
+    _ = sess_end(&g_sess, &ev);
+}
+
+// 从会话日志恢复消息历史（返回恢复的消息条数；0 表示没有可恢复内容）
+fn agent_hist_from_log(h: &History, path: &const Buf, out_next_seq: &i64) i32 {
+    var r: SessReader = sess_reader_empty();
+    defer { sess_reader_free(&r); }
+    var pz: Buf = buf_new(path.len + 1);
+    defer { buf_free(&pz); }
+    _ = buf_append(&pz, path.ptr, path.len);
+    _ = buf_append_byte(&pz, 0);
+    if !sess_reader_load(pz.ptr as &const byte, &r) {
+        return 0;
+    }
+    if !hist_push(h, ROLE_SYSTEM, system_prompt() as &const byte, strlen(system_prompt())) {
+        return 0;
+    }
+    var line: Buf = buf_new(65536);
+    defer { buf_free(&line); }
+    var typ: Buf = buf_new(64);
+    defer { buf_free(&typ); }
+    var text: Buf = buf_new(65536);
+    defer { buf_free(&text); }
+    var extra: Buf = buf_new(65536);
+    defer { buf_free(&extra); }
+    var added: i32 = 0;
+    var expect: i64 = 0;
+    out_next_seq[0] = 0;
+    while sess_next(&r, &line) {
+        const seq: i64 = sess_line_seq(&line);
+        if seq >= 0 {
+            if seq != expect {
+                out_err("[session] 警告：seq 不连续（");
+                out_err_dec(seq as usize);
+                out_err(" != ");
+                out_err_dec(expect as usize);
+                out_err("），日志可能损坏\n");
+            }
+            expect = seq + 1;
+        }
+        if !sess_line_type(&line, &typ) {
+            continue;
+        }
+        const view: &[byte] = line.ptr[0: line.len];
+        if sv_eq_cstr(&typ, "user/message") {
+            if sess_json_str(view, "text", &text) && text.len > 0 {
+                if hist_push(h, ROLE_USER, text.ptr as &const byte, text.len) {
+                    added = added + 1;
+                }
+            }
+        } else if sv_eq_cstr(&typ, "assistant/message") {
+            const has_text: bool = sess_json_str(view, "content", &text);
+            const has_calls: bool = sess_extract_array(view, "tool_calls", &extra);
+            if has_calls && extra.len > 0 {
+                if hist_push_msg(
+                    h,
+                    ROLE_ASSISTANT_CALLS,
+                    text.ptr as &const byte,
+                    if has_text { text.len } else { 0 as usize },
+                    extra.ptr as &const byte,
+                    extra.len
+                ) {
+                    added = added + 1;
+                }
+            } else if has_text && text.len > 0 {
+                if hist_push(h, ROLE_ASSISTANT, text.ptr as &const byte, text.len) {
+                    added = added + 1;
+                }
+            }
+        } else if sv_eq_cstr(&typ, "tool/result") {
+            var cid: Buf = buf_new(128);
+            defer { buf_free(&cid); }
+            if sess_json_str(view, "callId", &cid) && sess_json_str(view, "content", &text) {
+                if hist_push_msg(h, ROLE_TOOL, text.ptr as &const byte, text.len, cid.ptr as &const byte, cid.len) {
+                    added = added + 1;
+                }
+            }
+        } else if sv_eq_cstr(&typ, "session/title") {
+            var ttl: Buf = buf_new(256);
+            defer { buf_free(&ttl); }
+            if sess_json_string_dup(view, "title", &ttl) {
+                buf_reset(&g_sess.title);
+                _ = buf_append(&g_sess.title, ttl.ptr, ttl.len);
+            }
+        }
+    }
+    if r.dropped_tail {
+        out_err("[session] 最后一条记录不完整，已丢弃（崩溃恢复）\n");
+    }
+    out_next_seq[0] = expect;   // 续写时接着这个 seq 往下写
+    return added;
+}
+
+// 取字段并复制到独立缓冲（sess_json_str 内部用临时缓冲，这里要留下副本）
+fn sess_json_string_dup(view: &[byte], key: &const byte, out: &Buf) bool {
+    return sess_json_str(view, key, out);
+}
+
+// 打开（或恢复）会话：返回 false 表示只能新建
+export fn agent_session_open(cfg: &const Config, h: &History, resume_path: &const Buf) bool {
+    var home: Buf = buf_new(1024);
+    defer { buf_free(&home); }
+    if !agent_default_home(cfg, &home) {
+        return false;
+    }
+    var hz: Buf = buf_new(home.len + 1);
+    defer { buf_free(&hz); }
+    _ = buf_append(&hz, home.ptr, home.len);
+    _ = buf_append_byte(&hz, 0);
+    _ = agent_set_home(hz.ptr as &const byte);
+
+    var id: Buf = buf_new(64);
+    defer { buf_free(&id); }
+    var resumed: bool = false;
+    if resume_path.len > 0 {
+        // 已解析出路径：从 header 里取 id
+        var r0: SessReader = sess_reader_empty();
+        defer { sess_reader_free(&r0); }
+        var pz: Buf = buf_new(resume_path.len + 1);
+        defer { buf_free(&pz); }
+        _ = buf_append(&pz, resume_path.ptr, resume_path.len);
+        _ = buf_append_byte(&pz, 0);
+        if sess_read_header(pz.ptr as &const byte, &r0) {
+            _ = buf_append(&id, r0.id.ptr, r0.id.len);
+            resumed = true;
+        }
+    }
+    if resumed {
+        var next_seq: i64 = 0;
+        const n: i32 = agent_hist_from_log(h, resume_path, &next_seq);
+        if n > 0 {
+            out_err("[session] 已恢复 ");
+            out_err_dec(n as usize);
+            out_err(" 条消息（id=");
+            out_err_bytes(id.ptr, id.len);
+            out_err("）\n");
+            // 继续往同一个日志追加
+            var cwdz: Buf = buf_new(cfg.workspace.len + 1);
+            defer { buf_free(&cwdz); }
+            _ = buf_append(&cwdz, cfg.workspace.ptr, cfg.workspace.len);
+            _ = buf_append_byte(&cwdz, 0);
+            var modelz: Buf = buf_new(cfg.model.len + 1);
+            defer { buf_free(&modelz); }
+            _ = buf_append(&modelz, cfg.model.ptr, cfg.model.len);
+            _ = buf_append_byte(&modelz, 0);
+            var idz: Buf = buf_new(id.len + 1);
+            defer { buf_free(&idz); }
+            _ = buf_append(&idz, id.ptr, id.len);
+            _ = buf_append_byte(&idz, 0);
+            if !sess_open(
+                &g_sess,
+                hz.ptr as &const byte,
+                cwdz.ptr as &const byte,
+                modelz.ptr as &const byte,
+                "uya-agent",
+                idz.ptr as &const byte,
+                cfg.save_session,
+                next_seq,
+                false
+            ) {
+                return false;
+            }
+            return true;
+        }
+        out_err("[session] 日志为空或无法解析，改为新建会话\n");
+    }
+    var cwdz2: Buf = buf_new(cfg.workspace.len + 1);
+    defer { buf_free(&cwdz2); }
+    _ = buf_append(&cwdz2, cfg.workspace.ptr, cfg.workspace.len);
+    _ = buf_append_byte(&cwdz2, 0);
+    var modelz2: Buf = buf_new(cfg.model.len + 1);
+    defer { buf_free(&modelz2); }
+    _ = buf_append(&modelz2, cfg.model.ptr, cfg.model.len);
+    _ = buf_append_byte(&modelz2, 0);
+    return sess_open(
+        &g_sess,
+        hz.ptr as &const byte,
+        cwdz2.ptr as &const byte,
+        modelz2.ptr as &const byte,
+        "uya-agent",
+        "",
+        cfg.save_session,
+        0 as i64,
+        true
+    );
+}
+
+export fn agent_session_close() void {
+    if g_sess.path.len > 0 {
+        sess_close(&g_sess, g_home.ptr as &const byte);
+    }
 }
 
 // ============================================================
@@ -336,7 +886,7 @@ fn request_bytes_needed(h: &const History, cfg: &const Config) usize {
     return h.bytes * 2 + overhead + strlen(tools_schema_shell()) + cfg.model.len * 2;
 }
 
-fn build_request(cfg: &const Config, h: &const History, out: &Buf) bool {
+fn build_chat_request(cfg: &const Config, h: &const History, out: &Buf) bool {
     var w: JsonWriter = JsonWriter{ buf: null, cap: 0, used: 0, overflow: false };
     jw_init(&w, out.ptr, out.cap);
     jw_byte(&w, 123);
@@ -355,11 +905,40 @@ fn build_request(cfg: &const Config, h: &const History, out: &Buf) bool {
         jw_str_cstr(&w, role_cstr(h.items[i].role));
         jw_byte(&w, 44);
         jw_key(&w, "content");
-        jw_str(&w, h.items[i].ptr, h.items[i].len);
+        if h.items[i].text_len > 0 {
+            jw_str(&w, h.items[i].text, h.items[i].text_len);
+        } else {
+            // DSH：只有工具调用时 content 是空串（不是 null）
+            jw_str_cstr(&w, "");
+        }
+        if h.items[i].role == ROLE_ASSISTANT_CALLS && h.items[i].extra_len > 0 {
+            jw_byte(&w, 44);
+            jw_key(&w, "tool_calls");
+            // extra 是已经序列化好的 tool_calls 数组原文，直接内联，绝不二次转义
+            jw_raw(&w, h.items[i].extra as &const byte, h.items[i].extra_len);
+        }
+        if h.items[i].role == ROLE_TOOL && h.items[i].extra_len > 0 {
+            jw_byte(&w, 44);
+            jw_key(&w, "tool_call_id");
+            jw_str(&w, h.items[i].extra, h.items[i].extra_len);
+        }
         jw_byte(&w, 125);
         i = i + 1;
     }
     jw_byte(&w, 93);
+    // 字段顺序对齐 DSH：model, messages, stream, stream_options, tools, temperature, max_tokens
+    // （OpenAI 兼容端点上顺序不影响语义，但固定顺序让 KV 缓存前缀稳定、也便于自测断言）
+    jw_byte(&w, 44);
+    jw_key(&w, "stream");
+    jw_bool(&w, cfg.stream);
+    if cfg.stream && cfg.stream_options {
+        jw_byte(&w, 44);
+        jw_key(&w, "stream_options");
+        jw_byte(&w, 123);
+        jw_key(&w, "include_usage");
+        jw_bool(&w, true);
+        jw_byte(&w, 125);
+    }
     jw_byte(&w, 44);
     jw_key(&w, "tools");
     if cfg.allow_shell {
@@ -367,15 +946,16 @@ fn build_request(cfg: &const Config, h: &const History, out: &Buf) bool {
     } else {
         jw_cstr(&w, tools_schema_noshell());
     }
-    jw_byte(&w, 44);
-    jw_key(&w, "tool_choice");
-    jw_str_cstr(&w, "auto");
-    jw_byte(&w, 44);
-    jw_key(&w, "temperature");
-    jw_i64(&w, 0);
-    jw_byte(&w, 44);
-    jw_key(&w, "stream");
-    jw_bool(&w, false);
+    if cfg.temperature >= 0 {
+        jw_byte(&w, 44);
+        jw_key(&w, "temperature");
+        jw_i64(&w, cfg.temperature as i64);
+    }
+    if cfg.max_tokens > 0 {
+        jw_byte(&w, 44);
+        jw_key(&w, "max_tokens");
+        jw_i64(&w, cfg.max_tokens);
+    }
     jw_byte(&w, 125);
     if jw_overflow(&w) {
         return false;
@@ -391,8 +971,14 @@ fn build_headers(cfg: &const Config, out: &Buf) bool {
     if !buf_append_cstr(out, "Content-Type: application/json\r\n") {
         return false;
     }
-    if !buf_append_cstr(out, "Accept: application/json\r\n") {
-        return false;
+    if cfg.stream {
+        if !buf_append_cstr(out, "Accept: text/event-stream\r\n") {
+            return false;
+        }
+    } else {
+        if !buf_append_cstr(out, "Accept: application/json\r\n") {
+            return false;
+        }
     }
     if cfg.api_key.len > 0 {
         if !buf_append_cstr(out, "Authorization: Bearer ") {
@@ -459,6 +1045,7 @@ fn sv_eq_cstr(b: &const Buf, lit: &const byte) bool {
     return true;
 }
 
+// 非流式路径用：JsonStrView → Buf 后复用同一分发
 fn dispatch_tool(cfg: &const Config, name: &const JsonStrView, args: &const JsonStrView, arena: &Arena, out: &Buf) void {
     var name_buf: Buf = buf_empty();
     defer { buf_free(&name_buf); }
@@ -466,32 +1053,15 @@ fn dispatch_tool(cfg: &const Config, name: &const JsonStrView, args: &const Json
         _ = buf_append_cstr(out, "[tool ?] error: cannot decode tool name\n");
         return;
     }
-    _ = buf_append_cstr(out, "[tool ");
-    _ = buf_append(out, name_buf.ptr, name_buf.len);
-    _ = buf_append_cstr(out, "] ");
-    // arguments 本身是一段 JSON 文本，而且 std.json 返回的是**未反转义**的原始视图
     var args_buf: Buf = buf_empty();
     defer { buf_free(&args_buf); }
-    var parsed: bool = false;
-    var arg_val: JsonValue = JsonValue.json_null();
-    if sv_unescape_to_buf(args, &args_buf) && args_buf.len > 0 {
-        parsed = js_parse(arena, args_buf.ptr, args_buf.len, &arg_val);
-    }
-    if !parsed {
-        _ = buf_append_cstr(out, "error: tool arguments are not valid JSON (expects an object like {\"path\":\"...\"})\n");
+    if !sv_unescape_to_buf(args, &args_buf) {
+        _ = buf_append_cstr(out, "[tool ");
+        _ = buf_append(out, name_buf.ptr, name_buf.len);
+        _ = buf_append_cstr(out, "] error: cannot decode tool arguments\n");
         return;
     }
-    if sv_eq_cstr(&name_buf, "read_file") {
-        _ = name_buf;
-        tool_read_file(cfg, &arg_val, out);
-    } else if sv_eq_cstr(&name_buf, "write_file") {
-        tool_write_file(cfg, &arg_val, out);
-    } else if sv_eq_cstr(&name_buf, "run_shell") {
-        tool_run_shell(cfg, &arg_val, out);
-    } else {
-        _ = buf_append_cstr(out, "error: unknown tool");
-    }
-    _ = buf_append_byte(out, 10);
+    dispatch_tool_buf(cfg, &name_buf, &args_buf, arena, out);
 }
 
 // ============================================================
@@ -518,22 +1088,383 @@ fn response_message(root: &JsonValue, out: &JsonValue) bool {
     return js_obj_get(&first, "message", 7, out);
 }
 
-fn agent_run(cfg: &const Config) i32 {
-    if cfg.api_key.len == 0 {
-        out_err("error: no API key. set UYA_AGENT_API_KEY / DEEPSEEK_API_KEY / OPENAI_API_KEY\n");
-        return AGENT_USAGE;
+// ============================================================
+// 流式一步（P1）
+//
+// 返回 STEP_CONTINUE 表示「已执行工具、继续下一步」，其余值是 agent_run 的退出码。
+// content 在流式过程中就直接打印（--quiet 关闭），收尾时不再重复打印。
+// ============================================================
+export const STEP_CONTINUE: i32 = 100;
+// 交互模式：本回合被用户 Ctrl-C 打断（不是错误，回到提示符即可）
+export const AGENT_INTERRUPTED: i32 = 130;
+
+// 交互模式标志（前台界面唯一，用全局避免把参数穿过整条调用链）
+var g_interactive: bool = false;
+
+fn dump_stream_error(cfg: &const Config, status: i32, body: &const Buf) void {
+    _ = cfg;
+    out_err("model endpoint returned HTTP ");
+    out_err_dec(status as usize);
+    out_err("\n");
+    var n: usize = body.len;
+    if n > 4096 {
+        n = 4096;
     }
-    var h: History = hist_init();
-    defer { hist_free(&h); }
-    if !hist_push(&h, ROLE_SYSTEM, system_prompt() as &const byte, strlen(system_prompt())) {
-        out_err("error: cannot build history\n");
+    if n > 0 {
+        out_err_bytes(body.ptr, n);
+        out_err("\n");
+    }
+}
+
+fn print_usage_line(o: &const ChatOut) void {
+    out_err("[usage] in=");
+    out_err_dec(o.usage_in as usize);
+    out_err(" out=");
+    out_err_dec(o.usage_out as usize);
+    out_err(" cache_read=");
+    out_err_dec(o.usage_cache_read as usize);
+    out_err(" reasoning=");
+    out_err_dec(o.usage_reasoning as usize);
+    out_err("\n");
+}
+
+// 工具分发的「正文」版本：只写结果文本，不带 [tool name] 前缀。
+// 严格协议下工具名由 assistant 的 tool_calls + tool_call_id 表达，前缀是冗余。
+fn dispatch_tool_body(cfg: &const Config, name: &const Buf, args_json: &const Buf, arena: &Arena, out: &Buf) void {
+    var parsed: bool = false;
+    var arg_val: JsonValue = JsonValue.json_null();
+    if args_json.len > 0 {
+        parsed = js_parse(arena, args_json.ptr, args_json.len, &arg_val);
+    }
+    if !parsed {
+        _ = buf_append_cstr(out, "error: tool arguments are not valid JSON (expects an object like {\"path\":\"...\"})\n");
+        return;
+    }
+    if sv_eq_cstr(name, "read_file") {
+        tool_read_file(cfg, &arg_val, out);
+    } else if sv_eq_cstr(name, "write_file") {
+        tool_write_file(cfg, &arg_val, out);
+    } else if sv_eq_cstr(name, "run_shell") {
+        tool_run_shell(cfg, &arg_val, out);
+    } else {
+        _ = buf_append_cstr(out, "error: unknown tool");
+    }
+}
+
+// 折叠协议用（--compat-fold / 老端点）：[tool name] + 正文 + 换行
+fn dispatch_tool_buf(cfg: &const Config, name: &const Buf, args_json: &const Buf, arena: &Arena, out: &Buf) void {
+    _ = buf_append_cstr(out, "[tool ");
+    _ = buf_append(out, name.ptr, name.len);
+    _ = buf_append_cstr(out, "] ");
+    dispatch_tool_body(cfg, name, args_json, arena, out);
+    _ = buf_append_byte(out, 10);
+}
+
+// 把一批调用序列化成 assistant 的 tool_calls 数组原文（arguments 只转义一次）
+fn calls_json_from_chat(o: &const ChatOut, out: &Buf) bool {
+    var w: JsonWriter = JsonWriter{ buf: null, cap: 0, used: 0, overflow: false };
+    jw_init(&w, out.ptr, out.cap);
+    jw_byte(&w, 91);
+    var i: usize = 0;
+    while i < o.ncalls {
+        if i > 0 {
+            jw_byte(&w, 44);
+        }
+        jw_byte(&w, 123);
+        jw_key(&w, "id");
+        jw_str(&w, o.calls[i].id.ptr, o.calls[i].id.len);
+        jw_byte(&w, 44);
+        jw_key(&w, "type");
+        jw_str_cstr(&w, "function");
+        jw_byte(&w, 44);
+        jw_key(&w, "function");
+        jw_byte(&w, 123);
+        jw_key(&w, "name");
+        jw_str(&w, o.calls[i].name.ptr, o.calls[i].name.len);
+        jw_byte(&w, 44);
+        jw_key(&w, "arguments");
+        jw_str(&w, o.calls[i].args.ptr, o.calls[i].args.len);
+        jw_byte(&w, 125);
+        jw_byte(&w, 125);
+        i = i + 1;
+    }
+    jw_byte(&w, 93);
+    if jw_overflow(&w) {
+        return false;
+    }
+    out.len = jw_used(&w);
+    return true;
+}
+
+// 去掉尾部空白后的长度（DSH：中断时只保留 content/reasoning 的非空白前缀）
+export fn agent_trim_trailing_ws(p: &const byte, n: usize) usize {
+    var keep: usize = n;
+    while keep > 0 {
+        const c: byte = p[keep - 1];
+        if c == 32 as byte || c == 9 as byte || c == 10 as byte || c == 13 as byte {
+            keep = keep - 1;
+        } else {
+            break;
+        }
+    }
+    return keep;
+}
+
+fn agent_step_stream(cfg: &const Config, url: &const Buf, hdrs: &const Buf, req: &const Buf, arena: &Arena, h: &History, step: i32, interactive: bool) i32 {
+    var o: ChatOut = chat_out_new();
+    defer { chat_out_free(&o); }
+    var tc: TlsConn = tls_conn_empty();
+    var guard: FdGuard = FdGuard{ saved: -1, nullfd: -1, active: false };
+    tls_noise_mute(&guard, !cfg.tls_debug && !hc_debug);
+    const call_res: !i32 = llm_stream_chat(
+        url.ptr[0: url.len],
+        hdrs.ptr[0: hdrs.len],
+        req.ptr as &const byte,
+        req.len,
+        cfg.timeout_ms,
+        cfg.max_response,
+        cfg.verify,
+        cfg.pin.ptr[0: cfg.pin.len],
+        &o,
+        !cfg.quiet,
+        cfg.show_reasoning,
+        interactive
+    );
+    tls_noise_unmute(&guard);
+
+    var err_kind: i32 = 0;   // 0=无错 1=malformed 2=stream-closed 3=其它（传输/TLS） 4=用户中断
+    const status: i32 = call_res catch |err| {
+        const eid: i32 = (@error_id(err) as! i32).value;
+        var r: i32 = 3;
+        if eid == @error_id(error.LlmMalformed) {
+            r = 1;
+        } else if eid == @error_id(error.LlmStreamClosed) {
+            r = 2;
+        } else if eid == @error_id(error.LlmInterrupted) {
+            r = 4;
+        }
+        r;
+    };
+    if err_kind == 0 && (status == 1 || status == 2 || status == 3 || status == 4) {
+        err_kind = status;
+    }
+
+    if err_kind == 4 {
+        // 对齐 DSH：中断流式时只保留 content/reasoning 的**非空白前缀**，
+        // **绝不**保留 tool_calls（参数可能是半截的）。
+        const keep: usize = agent_trim_trailing_ws(o.content.ptr as &const byte, o.content.len);
+        if keep > 0 {
+            var pushed_i: bool = hist_push(h, ROLE_ASSISTANT, o.content.ptr as &const byte, keep);
+            while !pushed_i {
+                if !hist_drop_oldest(h) {
+                    break;
+                }
+                pushed_i = hist_push(h, ROLE_ASSISTANT, o.content.ptr as &const byte, keep);
+            }
+        }
+        tty_puts(&tty_ui, 2, "\n[interrupted] 已中断本回合（历史保留，可直接继续输入）\n");
+        return AGENT_INTERRUPTED;
+    }
+
+    if err_kind == 1 {
+        out_err("error: malformed SSE payload: ");
+        out_err_bytes(o.err_text.ptr, o.err_text.len);
+        out_err("\n");
         return AGENT_PROTO;
     }
-    if !hist_push(&h, ROLE_USER, cfg.task.ptr as &const byte, cfg.task.len) {
-        out_err("error: cannot build history\n");
+    if err_kind == 2 {
+        out_err("error: SSE stream ended without [DONE] (stream closed early)\n");
+        return AGENT_NET;
+    }
+    if err_kind == 3 {
+        out_err("error: 请求失败（网络或 TLS 校验）。\n");
+        if tc.observed_len > 0 {
+            out_err("  本次观测到的 leaf 证书 SHA-256 = ");
+            out_err_bytes(&tc.observed[0], tc.observed_len);
+            out_err("\n");
+            out_err("  链校验在真实站点常失败（见 README 第 5 节）；用这个指纹重试：\n");
+            out_err("  uya-agent --tls-verify=pin --tls-pin <上面的指纹> ...\n");
+        } else {
+            out_err("  检查 base-url / 网络；证书问题可先用 --probe --tls-verify=none 看指纹。\n");
+        }
+        return AGENT_NET;
+    }
+    if status != 200 {
+        dump_stream_error(cfg, status, &o.err_text);
         return AGENT_PROTO;
     }
 
+    return agent_finish_step(cfg, arena, h, step, &o);
+}
+
+
+// 一步收尾（流式/非流式共用）：usage、finish 语义、工具派发、最终回答。
+fn agent_finish_step(cfg: &const Config, arena: &Arena, h: &History, step: i32, o: &const ChatOut) i32 {
+    if cfg.show_usage {
+        print_usage_line(o);
+    }
+    if o.finish == LLM_FINISH_ERROR {
+        out_err("model/gateway error: ");
+        out_err_bytes(o.err_text.ptr, o.err_text.len);
+        out_err("\n");
+        return AGENT_PROTO;
+    }
+
+    agent_log_assistant(step, o);
+
+    if o.finish == LLM_FINISH_MAX_TOKENS {
+        // 对齐 DSH：token 上限截断时**不派发**任何工具调用（参数可能是半截的）
+        out_err("error: model output was truncated at the token limit (max_tokens); tool calls dropped\n");
+        if o.content.len > 0 && o.printed_chars == 0 {
+            out_bytes(o.content.ptr as &const byte, o.content.len);
+            out_err("\n");
+        }
+        return AGENT_PROTO;
+    }
+
+    if o.ncalls > 0 {
+        if cfg.compat_fold {
+            // 折叠协议：工具结果拼成**一条 user 消息**回灌（老端点兼容）
+            var results: Buf = buf_new(16384);
+            if !buf_valid(&results) {
+                out_err("error: out of memory (tool results)\n");
+                return AGENT_PROTO;
+            }
+            _ = buf_append_cstr(&results, "工具执行结果如下，请据此继续；如果你已经能给出最终答案就直接回答：\n");
+            if o.content.len > 0 {
+                _ = buf_append_cstr(&results, "[你上一轮的说明] ");
+                _ = buf_append(&results, o.content.ptr, o.content.len);
+                _ = buf_append_byte(&results, 10);
+            }
+            var ci: usize = 0;
+            while ci < o.ncalls {
+                if !cfg.quiet {
+                    out_err("[step ");
+                    out_err_dec(step as usize);
+                    out_err("] tool: ");
+                    out_err_bytes(o.calls[ci].name.ptr, o.calls[ci].name.len);
+                    out_err("\n");
+                }
+                var res_f: Buf = buf_new(4096);
+                dispatch_tool_body(cfg, &o.calls[ci].name, &o.calls[ci].args, arena, &res_f);
+                agent_log_tool(step, &o.calls[ci].id, &o.calls[ci].name, &o.calls[ci].args, &res_f);
+                _ = buf_append_cstr(&results, "[tool ");
+                _ = buf_append(&results, o.calls[ci].name.ptr, o.calls[ci].name.len);
+                _ = buf_append_cstr(&results, "] ");
+                _ = buf_append(&results, res_f.ptr, res_f.len);
+                _ = buf_append_byte(&results, 10);
+                buf_free(&res_f);
+                ci = ci + 1;
+            }
+            var pushed_f: bool = hist_push(h, ROLE_USER, results.ptr as &const byte, results.len);
+            while !pushed_f {
+                if !hist_drop_oldest(h) {
+                    break;
+                }
+                out_err("[history] dropped oldest message to stay within limits\n");
+                pushed_f = hist_push(h, ROLE_USER, results.ptr as &const byte, results.len);
+            }
+            buf_free(&results);
+            if !pushed_f {
+                out_err("error: tool results too large for history\n");
+                return AGENT_PROTO;
+            }
+            return STEP_CONTINUE;
+        }
+
+        // 严格协议：assistant（含 tool_calls 原样）→ 逐条 role:"tool" 结果
+        var calls_json: Buf = buf_new(8192);
+        defer { buf_free(&calls_json); }
+        if !buf_valid(&calls_json) || !calls_json_from_chat(o, &calls_json) {
+            out_err("error: out of memory serializing tool_calls\n");
+            return AGENT_PROTO;
+        }
+        var pushed_a: bool = hist_push_msg(h, ROLE_ASSISTANT_CALLS, o.content.ptr as &const byte, o.content.len, calls_json.ptr as &const byte, calls_json.len);
+        while !pushed_a {
+            if !hist_drop_oldest(h) {
+                break;
+            }
+            out_err("[history] dropped oldest message to stay within limits\n");
+            pushed_a = hist_push_msg(h, ROLE_ASSISTANT_CALLS, o.content.ptr as &const byte, o.content.len, calls_json.ptr as &const byte, calls_json.len);
+        }
+        if !pushed_a {
+            out_err("error: could not append assistant message to history\n");
+            return AGENT_PROTO;
+        }
+
+        var ci: usize = 0;
+        while ci < o.ncalls {
+            if !cfg.quiet {
+                out_err("[step ");
+                out_err_dec(step as usize);
+                out_err("] tool: ");
+                out_err_bytes(o.calls[ci].name.ptr, o.calls[ci].name.len);
+                out_err("\n");
+            }
+            var res: Buf = buf_new(4096);
+            if !buf_valid(&res) {
+                out_err("error: out of memory (tool result)\n");
+                return AGENT_PROTO;
+            }
+            dispatch_tool_body(cfg, &o.calls[ci].name, &o.calls[ci].args, arena, &res);
+            agent_log_tool(step, &o.calls[ci].id, &o.calls[ci].name, &o.calls[ci].args, &res);
+            var pushed_t: bool = false;
+            if res.len == 0 {
+                // 空结果在线上必须是 "(no output)"（对齐 DSH）
+                _ = buf_append_cstr(&res, "(no output)");
+            }
+            pushed_t = hist_push_msg(h, ROLE_TOOL, res.ptr as &const byte, res.len, o.calls[ci].id.ptr as &const byte, o.calls[ci].id.len);
+            buf_free(&res);
+            if !pushed_t {
+                out_err("error: could not append tool result to history\n");
+                return AGENT_PROTO;
+            }
+            ci = ci + 1;
+        }
+        return STEP_CONTINUE;
+    }
+
+    if o.content.len > 0 {
+        if o.printed_chars == 0 {
+            out_bytes(o.content.ptr as &const byte, o.content.len);
+        }
+        out_err("\n");
+        return AGENT_OK;
+    }
+    out_err("error: model returned neither content nor tool_calls\n");
+    return AGENT_PROTO;
+}
+
+// 建历史：一条 system + 可选的第一条 user
+fn agent_hist_init(h: &History, first: &const Buf) bool {
+    if !hist_push(h, ROLE_SYSTEM, system_prompt() as &const byte, strlen(system_prompt())) {
+        return false;
+    }
+    if first.len > 0 {
+        return hist_push(h, ROLE_USER, first.ptr as &const byte, first.len);
+    }
+    return true;
+}
+
+// 一次 turn 的 step 循环：history 里已经包含 system 与本轮的 user 消息
+fn agent_turn_loop(cfg: &const Config, h: &History) i32 {
+    g_turn = g_turn + 1;
+    agent_log_turn_start();
+    const rc: i32 = agent_turn_loop_inner(cfg, h);
+    if rc == AGENT_INTERRUPTED {
+        agent_log_turn_end("aborted");
+    } else if rc == AGENT_OK {
+        agent_log_turn_end("completed");
+    } else if rc == AGENT_NET {
+        agent_log_turn_end("error");
+    } else {
+        // 可能是 max-steps 熔断，也可能是协议/工具错
+        agent_log_turn_end("error");
+    }
+    return rc;
+}
+
+fn agent_turn_loop_inner(cfg: &const Config, h: &History) i32 {
     var url: Buf = chat_url(cfg);
     defer { buf_free(&url); }
     if !buf_valid(&url) {
@@ -560,18 +1491,55 @@ fn agent_run(cfg: &const Config) i32 {
     var step: i32 = 0;
     while step < cfg.max_steps {
         step = step + 1;
+        // DSH steer 语义：step 边界领取「运行期间用户敲进来的输入」，作为普通 user 消息
+        agent_claim_steer(cfg, h);
+        if g_sess.save {
+            var sev: Buf = buf_new(96);
+            defer { buf_free(&sev); }
+            if sess_begin(&g_sess, "step/start", &sev) {
+                _ = buf_append_cstr(&sev, "{\"turn\":");
+                _ = buf_append_i64(&sev, g_turn as i64);
+                _ = buf_append_cstr(&sev, ",\"step\":");
+                _ = buf_append_i64(&sev, step as i64);
+                _ = buf_append_cstr(&sev, "}");
+                _ = sess_end(&g_sess, &sev);
+            }
+        }
+        if g_interactive {
+            // 状态显示走提示符（避免两行光标的复杂度）
+            var ps: Buf = buf_new(64);
+            if buf_valid(&ps) {
+                _ = buf_append_cstr(&ps, "[step ");
+                _ = buf_append_u64(&ps, step as u64);
+                _ = buf_append_cstr(&ps, "] > ");
+                _ = buf_append_byte(&ps, 0);
+                tty_set_prompt(&tty_ui, ps.ptr as &const byte);
+                buf_free(&ps);
+                tty_draw_line(&tty_ui, 2);
+            }
+        }
         arena_reset(&arena);
 
-        const need: usize = request_bytes_needed(&h, cfg);
+        const need: usize = request_bytes_needed(h, cfg);
         var req: Buf = buf_new(need);
         if !buf_valid(&req) {
             out_err("error: out of memory (request)\n");
             return AGENT_PROTO;
         }
-        if !build_request(cfg, &h, &req) {
+        if !build_chat_request(cfg, h, &req) {
             buf_free(&req);
             out_err("error: request too large for buffer\n");
             return AGENT_PROTO;
+        }
+
+        // P1：流式路径（默认）。--no-stream 时走下面的旧路径。
+        if cfg.stream {
+            const src: i32 = agent_step_stream(cfg, &url, &hdrs, &req, &arena, h, step, g_interactive);
+            buf_free(&req);
+            if src == STEP_CONTINUE {
+                continue;
+            }
+            return src;
         }
 
         var resp: Resp = resp_empty();
@@ -633,123 +1601,181 @@ fn agent_run(cfg: &const Config) i32 {
         var root: JsonValue = JsonValue.json_null();
         if !js_parse(&arena, body_copy, resp_len, &root) {
             out_err("error: cannot parse model response as JSON\n");
-            var n: usize = resp_len;
-            if n > 1024 {
-                n = 1024;
+            var nb0: usize = resp_len;
+            if nb0 > 1024 {
+                nb0 = 1024;
             }
-            out_err_bytes(body_copy as &const byte, n);
+            out_err_bytes(body_copy as &const byte, nb0);
             out_err("\n");
             return AGENT_PROTO;
         }
 
-        var msg: JsonValue = JsonValue.json_null();
-        if !response_message(&root, &msg) {
-            // 有些网关会「200 + 体内 error」，或者给出空 choices；把体内 error 与原文打出来
-            var err_obj: JsonValue = JsonValue.json_null();
-            var emsg: JsonStrView = JsonStrView{ ptr: null, len: 0 };
-            if js_obj_get(&root, "error", 5, &err_obj) && js_obj_get_str(&err_obj, "message", 7, &emsg) {
-                var etext: Buf = buf_empty();
-                if sv_unescape_to_buf(&emsg, &etext) {
-                    out_err("model/gateway error: ");
-                    out_err_bytes(etext.ptr, etext.len);
-                    out_err("\n");
-                    buf_free(&etext);
-                }
-            } else {
-                out_err("error: response has no choices[0].message\n");
-            }
-            var nb: usize = resp_len;
-            if nb > 1024 {
-                nb = 1024;
-            }
-            out_err("raw response[0..");
-            out_err_dec(nb);
-            out_err("] = ");
-            out_err_bytes(body_copy as &const byte, nb);
-            out_err("\n");
+        // 非流式响应 → 与流式相同的 ChatOut 结构，收尾逻辑完全共用
+        var o2: ChatOut = chat_out_new();
+        defer { chat_out_free(&o2); }
+        const fill_res: !void = chat_out_from_nonstream(&root, &o2);
+        _ = fill_res catch {
+            out_err("error: cannot parse model response message\n");
             return AGENT_PROTO;
-        }
-
-        var content_sv: JsonStrView = JsonStrView{ ptr: null, len: 0 };
-        var content_buf: Buf = buf_empty();
-        defer { buf_free(&content_buf); }
-        var has_content: bool = false;
-        if js_obj_get_str(&msg, "content", 7, &content_sv) && content_sv.len > 0 {
-            if sv_unescape_to_buf(&content_sv, &content_buf) {
-                has_content = content_buf.len > 0;
-            }
-        }
-
-        var calls: JsonValue = JsonValue.json_null();
-        var has_calls: bool = false;
-        if js_obj_get(&msg, "tool_calls", 10, &calls) {
-            has_calls = js_arr_len(&calls) > 0;
-        }
-
-        if has_calls {
-            var results: Buf = buf_new(16384);
-            if !buf_valid(&results) {
-                out_err("error: out of memory (tool results)\n");
-                return AGENT_PROTO;
-            }
-            _ = buf_append_cstr(&results, "工具执行结果如下，请据此继续；如果你已经能给出最终答案就直接回答：\n");
-            if has_content {
-                _ = buf_append_cstr(&results, "[你上一轮的说明] ");
-                _ = buf_append(&results, content_buf.ptr, content_buf.len);
-                _ = buf_append_byte(&results, 10);
-            }
-            const ncalls: usize = js_arr_len(&calls);
-            var ci: usize = 0;
-            while ci < ncalls {
-                var call: JsonValue = JsonValue.json_null();
-                if js_arr_get(&calls, ci, &call) {
-                    var fname: JsonStrView = JsonStrView{ ptr: null, len: 0 };
-                    var fargs: JsonStrView = JsonStrView{ ptr: null, len: 0 };
-                    var fn_obj: JsonValue = JsonValue.json_null();
-                    if js_obj_get(&call, "function", 8, &fn_obj) && js_obj_get_str(&fn_obj, "name", 4, &fname) {
-                        _ = js_obj_get_str(&fn_obj, "arguments", 9, &fargs);
-                        if !cfg.quiet {
-                            out_err("[step ");
-                            out_err_dec(step as usize);
-                            out_err("] tool: ");
-                            out_err_bytes(fname.ptr, fname.len);
-                            out_err("\n");
-                        }
-                        dispatch_tool(cfg, &fname, &fargs, &arena, &results);
-                    }
-                }
-                ci = ci + 1;
-            }
-            var pushed: bool = hist_push(&h, ROLE_USER, results.ptr as &const byte, results.len);
-            while !pushed {
-                if !hist_drop_oldest(&h) {
-                    break;
-                }
-                out_err("[history] dropped oldest message to stay within limits\n");
-                pushed = hist_push(&h, ROLE_USER, results.ptr as &const byte, results.len);
-            }
-            const results_len: usize = results.len;
-            buf_free(&results);
-            if !pushed {
-                out_err("error: tool results too large for history\n");
-                return AGENT_PROTO;
-            }
-            _ = results_len;
+        };
+        const rc2: i32 = agent_finish_step(cfg, &arena, h, step, &o2);
+        if rc2 == STEP_CONTINUE {
             continue;
         }
-
-        if has_content {
-            out_bytes(content_buf.ptr as &const byte, content_buf.len);
-            out_err("\n");
-            return AGENT_OK;
-        }
-        out_err("error: model returned neither content nor tool_calls\n");
-        return AGENT_PROTO;
+        return rc2;
     }
     out_err("error: step limit reached (");
     out_err_dec(cfg.max_steps as usize);
-    out_err(" steps); use --max-steps to raise it\n");
+    out_err(" steps); use --max-steps to raise it");
+    if g_interactive {
+        out_err("；输入 /continue 可继续，或直接给新任务");
+    }
+    out_err("\n");
     return AGENT_PROTO;
+}
+
+// 建/恢复会话历史：先尝试恢复（含 system），否则新建（system + 可选首条 user）
+fn agent_history_begin(cfg: &const Config, h: &History, first: &const Buf) bool {
+    const opened: bool = agent_session_open(cfg, h, &cfg.resume_id);
+    if opened && h.len > 0 {
+        // 已从日志恢复（system 在里面）：本轮的任务/首条输入仍要接上去，
+        // 否则恢复运行只会看到上一轮的内容（踩过：模型回答了上一轮的话）。
+        if first.len > 0 {
+            var pushed: bool = hist_push(h, ROLE_USER, first.ptr as &const byte, first.len);
+            while !pushed {
+                if !hist_drop_oldest(h) {
+                    break;
+                }
+                pushed = hist_push(h, ROLE_USER, first.ptr as &const byte, first.len);
+            }
+            return pushed;
+        }
+        return true;
+    }
+    return agent_hist_init(h, first);
+}
+
+// 一次性运行（命令行给了任务）
+// --list-sessions：读索引打印（同 id 取最后一条）
+fn agent_list_sessions(cfg: &const Config) i32 {
+    var home: Buf = buf_new(1024);
+    defer { buf_free(&home); }
+    if !agent_default_home(cfg, &home) {
+        out_err("error: 找不到 agent home（HOME 未设置？）\n");
+        return AGENT_USAGE;
+    }
+    var hz: Buf = buf_new(home.len + 1);
+    defer { buf_free(&hz); }
+    _ = buf_append(&hz, home.ptr, home.len);
+    _ = buf_append_byte(&hz, 0);
+    var idx: Buf = buf_new(65536);
+    defer { buf_free(&idx); }
+    if !sess_read_index(hz.ptr as &const byte, &idx) {
+        out_err("(没有会话记录)\n");
+        return AGENT_OK;
+    }
+    var pos: usize = 0;
+    var line: Buf = buf_new(4096);
+    defer { buf_free(&line); }
+    var id: Buf = buf_new(128);
+    defer { buf_free(&id); }
+    var cwdv: Buf = buf_new(1024);
+    defer { buf_free(&cwdv); }
+    var ttl: Buf = buf_new(256);
+    defer { buf_free(&ttl); }
+    var pth: Buf = buf_new(1200);
+    defer { buf_free(&pth); }
+    var shown: usize = 0;
+    while pos < idx.len {
+        buf_reset(&line);
+        var nl: usize = idx.len;
+        var i: usize = pos;
+        while i < idx.len {
+            if idx.ptr[i] == 10 as byte {
+                nl = i;
+                break;
+            }
+            i = i + 1;
+        }
+        if nl > pos {
+            _ = buf_append(&line, &idx.ptr[pos], nl - pos);
+        }
+        pos = nl + 1;
+        if line.len == 0 {
+            continue;
+        }
+        const view: &[byte] = line.ptr[0: line.len];
+        if !sess_json_str(view, "id", &id) {
+            continue;
+        }
+        _ = sess_json_str(view, "cwd", &cwdv);
+        _ = sess_json_str(view, "title", &ttl);
+        _ = sess_json_str(view, "path", &pth);
+        const when: i64 = sess_json_i64(view, "lastActiveAt");
+        out_err_bytes(id.ptr, id.len);
+        out_err("  ");
+        out_err_dec(when as usize);
+        out_err("  ");
+        out_err_bytes(cwdv.ptr, cwdv.len);
+        out_err("  ");
+        out_err_bytes(ttl.ptr, ttl.len);
+        out_err("\n");
+        shown = shown + 1;
+    }
+    if shown == 0 {
+        out_err("(没有会话记录)\n");
+    }
+    return AGENT_OK;
+}
+
+// 解析 --continue / --resume：把会话文件绝对路径写进 cfg.resume_id
+fn agent_resolve_resume(cfg: &Config, want: &const byte) bool {
+    var home: Buf = buf_new(1024);
+    defer { buf_free(&home); }
+    if !agent_default_home(cfg, &home) {
+        return false;
+    }
+    var hz: Buf = buf_new(home.len + 1);
+    defer { buf_free(&hz); }
+    _ = buf_append(&hz, home.ptr, home.len);
+    _ = buf_append_byte(&hz, 0);
+    var path: Buf = buf_new(1200);
+    defer { buf_free(&path); }
+    var found: bool = false;
+    var cwdz: Buf = buf_new(cfg.workspace.len + 1);
+    defer { buf_free(&cwdz); }
+    _ = buf_append(&cwdz, cfg.workspace.ptr, cfg.workspace.len);
+    _ = buf_append_byte(&cwdz, 0);
+    if bufx_cstr_len(want) == 0 || bufx_eq_cstr(want, bufx_cstr_len(want), "last") {
+        found = sess_find_last(hz.ptr as &const byte, cwdz.ptr as &const byte, &path);
+    } else {
+        found = sess_find(hz.ptr as &const byte, cwdz.ptr as &const byte, want, bufx_cstr_len(want), &path);
+    }
+    if !found {
+        return false;
+    }
+    buf_free(&cfg.resume_id);
+    cfg.resume_id = buf_new(path.len + 8);
+    return buf_append(&cfg.resume_id, path.ptr, path.len);
+}
+
+export fn agent_run(cfg: &const Config) i32 {
+    if cfg.api_key.len == 0 {
+        out_err("error: no API key. set UYA_AGENT_API_KEY / DEEPSEEK_API_KEY / OPENAI_API_KEY\n");
+        return AGENT_USAGE;
+    }
+    var h: History = hist_init();
+    defer { hist_free(&h); }
+    defer { agent_session_close(); }
+    if !agent_history_begin(cfg, &h, &cfg.task) {
+        out_err("error: cannot build history\n");
+        return AGENT_PROTO;
+    }
+    if cfg.task.len > 0 && h.len > 0 {
+        // 新建会话时才记录本轮任务（恢复会话时任务为空）
+        agent_log_user(cfg.task.ptr as &const byte, cfg.task.len, false);
+    }
+    return agent_turn_loop(cfg, &h);
 }
 
 // ============================================================
@@ -770,6 +1796,22 @@ fn print_usage() void {
     out_err("  --max-response N    响应体上限字节，默认 262144\n");
     out_err("  --timeout-ms N      单次 HTTP 超时，默认 120000\n");
     out_err("  --no-shell          不提供 run_shell 工具\n");
+    out_err("  --no-stream         关闭流式（SSE），回退到一次性响应\n");
+    out_err("  --compat-fold       工具结果折叠成一条 user 消息（老端点兼容）\n");
+    out_err("  --no-stream-options 不发送 stream_options.include_usage\n");
+    out_err("  --show-reasoning    把模型的 reasoning_content 打到 stderr\n");
+    out_err("  --show-usage        每轮打印 token 用量（in/out/cache/reasoning）\n");
+    out_err("  --max-tokens N      发送 max_tokens（默认不发送）\n");
+    out_err("  --temperature N     发送 temperature 0..N（默认不发送）\n");
+    out_err("  --agent-home DIR    会话/索引存放根目录，默认 ~/.uya-agent\n");
+    out_err("  --no-save           不写会话日志（只跑不记）\n");
+    out_err("  --continue          接着当前目录下最近一条会话继续\n");
+    out_err("  --resume ID         恢复指定会话（id 或 last）\n");
+    out_err("  --list-sessions     列出本机会话后退出\n");
+    out_err("  --dsh-home DIR      DSH 用户目录（默认 $DSH_HOME 或 ~/.dsh）\n");
+    out_err("  --no-dsh-config     完全不读 DSH 设置\n");
+    out_err("  --strict-dsh-config 读不到 DSH 设置就报错退出\n");
+    out_err("  --print-config      打印生效配置与来源后退出\n");
     out_err("  --tls-verify=MODE   chain（默认）| pin | none\n");
     out_err("  --tls-pin HEX       pin 模式下要求的 leaf 证书 SHA-256（小写 hex）\n");
     out_err("  --quiet             不打印每步工具调用信息\n");
@@ -853,6 +1895,400 @@ fn parse_i32_arg(p: &byte, fallback: i32) i32 {
     return v;
 }
 
+// 允许 0 的非负整数解析（--temperature 0 必须与「未给」区分开）
+fn parse_i32_nonneg(p: &byte, fallback: i32) i32 {
+    const n: usize = cstr_len(p);
+    if n == 0 {
+        return fallback;
+    }
+    var v: i32 = 0;
+    var i: usize = 0;
+    while i < n {
+        const c: byte = p[i];
+        if c < 48 as byte || c > 57 as byte {
+            return fallback;
+        }
+        v = v * 10 + ((c as i32) - 48);
+        i = i + 1;
+    }
+    return v;
+}
+
+
+// ============================================================
+// P3 交互模式：提示符 + 流式 + Ctrl-C 中断 + 运行中输入 + 继续
+// ============================================================
+
+// 领取运行期间用户输入的文本（DSH steer）：每条作为独立的 user 消息
+fn agent_claim_steer(cfg: &const Config, h: &History) void {
+    var line: Buf = buf_new(4096);
+    defer { buf_free(&line); }
+    while inbox_pop(&g_steer, &line) {
+        if line.len == 0 {
+            continue;
+        }
+        var pushed: bool = hist_push(h, ROLE_USER, line.ptr as &const byte, line.len);
+        while !pushed {
+            if !hist_drop_oldest(h) {
+                break;
+            }
+            pushed = hist_push(h, ROLE_USER, line.ptr as &const byte, line.len);
+        }
+        agent_log_user(line.ptr as &const byte, line.len, true);
+        if !cfg.quiet {
+            tty_puts(&tty_ui, 2, "[steer] 已采纳运行中的输入\n");
+        }
+    }
+}
+
+fn agent_repl_banner(cfg: &const Config) void {
+    tty_puts(&tty_ui, 2, "uya-agent 交互模式（纯 Uya）\n");
+    tty_puts(&tty_ui, 2, "  · 直接输入任务回车执行；回合运行中输入的文本会在下一个 step 被采纳\n");
+    tty_puts(&tty_ui, 2, "  · Ctrl-C 中断当前回合（历史保留），Ctrl-D 退出\n");
+    tty_puts(&tty_ui, 2, "  · /help 看命令；model=");
+    tty_write(&tty_ui, 2, cfg.model.ptr as &const byte, cfg.model.len);
+    tty_puts(&tty_ui, 2, "\n");
+}
+
+fn agent_repl_help() void {
+    tty_puts(&tty_ui, 2, "命令：\n");
+    tty_puts(&tty_ui, 2, "  /help      显示本帮助\n");
+    tty_puts(&tty_ui, 2, "  /continue  不再输入新内容，带着历史再跑一轮\n");
+    tty_puts(&tty_ui, 2, "  /status    打印当前配置与历史条数\n");
+    tty_puts(&tty_ui, 2, "  /sessions  列出本机会话\n");
+    tty_puts(&tty_ui, 2, "  /resume ID 切换到指定会话（id 或 last）\n");
+    tty_puts(&tty_ui, 2, "  /new       开一条新会话（当前会话保留在磁盘上）\n");
+    tty_puts(&tty_ui, 2, "  /exit      退出（同 Ctrl-D）\n");
+    tty_puts(&tty_ui, 2, "其余输入一律作为新任务提交；Ctrl-C 中断当前回合。\n");
+}
+
+fn agent_repl_status(cfg: &const Config, h: &const History) void {
+    tty_puts(&tty_ui, 2, "base_url=");
+    tty_write(&tty_ui, 2, cfg.base_url.ptr as &const byte, cfg.base_url.len);
+    tty_puts(&tty_ui, 2, "\nmodel=");
+    tty_write(&tty_ui, 2, cfg.model.ptr as &const byte, cfg.model.len);
+    tty_puts(&tty_ui, 2, "\nworkspace=");
+    tty_write(&tty_ui, 2, cfg.workspace.ptr as &const byte, cfg.workspace.len);
+    tty_puts(&tty_ui, 2, "\nstream=");
+    if cfg.stream {
+        tty_puts(&tty_ui, 2, "on");
+    } else {
+        tty_puts(&tty_ui, 2, "off");
+    }
+    tty_puts(&tty_ui, 2, " shell=");
+    if cfg.allow_shell {
+        tty_puts(&tty_ui, 2, "on");
+    } else {
+        tty_puts(&tty_ui, 2, "off");
+    }
+    tty_puts(&tty_ui, 2, " max_steps=");
+    out_err_dec(cfg.max_steps as usize);
+    tty_puts(&tty_ui, 2, " messages=");
+    out_err_dec(h.len);
+    if g_sess.path.len > 0 {
+        tty_puts(&tty_ui, 2, "\nsession=");
+        tty_write(&tty_ui, 2, g_sess.id.ptr as &const byte, g_sess.id.len);
+        if g_sess.save {
+            tty_puts(&tty_ui, 2, " (logging)");
+        } else {
+            tty_puts(&tty_ui, 2, " (no-save)");
+        }
+        tty_puts(&tty_ui, 2, " events=");
+        out_err_dec(g_sess.events);
+    }
+    tty_puts(&tty_ui, 2, "\n");
+}
+
+// 返回 true = 该退出 REPL
+fn agent_repl_command(cfg: &Config, h: &History, line: &const Buf) bool {
+    if sv_eq_cstr(line, "/exit") || sv_eq_cstr(line, "/quit") {
+        return true;
+    }
+    if sv_eq_cstr(line, "/help") {
+        agent_repl_help();
+        return false;
+    }
+    if sv_eq_cstr(line, "/status") {
+        agent_repl_status(cfg, h);
+        return false;
+    }
+    if sv_eq_cstr(line, "/continue") {
+        var cont: Buf = buf_new(16);
+        defer { buf_free(&cont); }
+        _ = buf_append_cstr(&cont, "继续");
+        var pushed: bool = hist_push(h, ROLE_USER, cont.ptr as &const byte, cont.len);
+        while !pushed {
+            if !hist_drop_oldest(h) {
+                break;
+            }
+            pushed = hist_push(h, ROLE_USER, cont.ptr as &const byte, cont.len);
+        }
+        const rc: i32 = agent_turn_loop(cfg, h);
+        if rc != AGENT_OK && rc != AGENT_INTERRUPTED {
+            tty_puts(&tty_ui, 2, "[turn] 本回合异常结束（可直接输入继续）\n");
+        }
+        return false;
+    }
+    if sv_eq_cstr(line, "/sessions") {
+        _ = agent_list_sessions(cfg);
+        return false;
+    }
+    if sv_eq_cstr(line, "/new") {
+        agent_session_close();
+        hist_free(h);
+        h[0] = hist_init();
+        g_turn = 0;
+        buf_free(&cfg.resume_id);
+        cfg.resume_id = buf_empty();
+        var none_first: Buf = buf_empty();
+        if agent_history_begin(cfg, h, &none_first) {
+            tty_puts(&tty_ui, 2, "[session] 已开新会话\n");
+        } else {
+            tty_puts(&tty_ui, 2, "error: 无法新建会话\n");
+        }
+        return false;
+    }
+    if line.len > 8 && bufx_eq_cstr(line.ptr as &const byte, 8, "/resume ") {
+        var id: Buf = buf_new(line.len + 1);
+        defer { buf_free(&id); }
+        _ = buf_append(&id, &line.ptr[8], line.len - 8);
+        _ = buf_append_byte(&id, 0);
+        if !agent_resolve_resume(cfg, id.ptr as &const byte) {
+            tty_puts(&tty_ui, 2, "error: 找不到该会话（/sessions 看列表）\n");
+            return false;
+        }
+        agent_session_close();
+        hist_free(h);
+        h[0] = hist_init();
+        g_turn = 0;
+        var none_first2: Buf = buf_empty();
+        if agent_history_begin(cfg, h, &none_first2) {
+            tty_puts(&tty_ui, 2, "[session] 已恢复会话\n");
+        } else {
+            tty_puts(&tty_ui, 2, "error: 无法恢复会话\n");
+        }
+        return false;
+    }
+    tty_puts(&tty_ui, 2, "未知命令（/help 看可用命令）；已忽略\n");
+    return false;
+}
+
+// 阻塞读一行（raw 模式）。返回 TTY_EV_SUBMIT / TTY_EV_EOF / TTY_EV_CTRL_C
+fn tty_read_line_blocking() i32 {
+    while true {
+        // 顺序很重要：**先取已排队的事件**（事件对应的行内容此刻才在 line 里），
+        // 队列空了才处理 pend（粘贴的后续行），最后才去读键盘。
+        const ev: i32 = tty_next_event(&tty_ui);
+        if ev != TTY_EV_NONE {
+            if ev == TTY_EV_SUBMIT || ev == TTY_EV_EOF || ev == TTY_EV_CTRL_C {
+                // 提交/退出时把输入行从屏幕上抹掉，正文由调用方回显
+                tty_out_begin(&tty_ui, 2);
+                return ev;
+            }
+            if ev == TTY_EV_CLEARED || ev == TTY_EV_REDRAW {
+                tty_draw_line(&tty_ui, 2);
+            }
+            continue;
+        }
+        if tty_has_pending(&tty_ui) {
+            var none_bytes: [byte: 0] = [];
+            tty_feed(&tty_ui, &none_bytes[0: 0], 0);
+            tty_flush_esc(&tty_ui);
+            continue;
+        }
+        var tmp: [byte: 256] = [0: 256];
+        const n: isize = sys_read(0, &tmp[0], 256) catch { -1 as isize; };
+        if n <= 0 {
+            tty_out_begin(&tty_ui, 2);
+            return TTY_EV_EOF;
+        }
+        tty_feed(&tty_ui, &tmp[0], n as usize);
+        tty_flush_esc(&tty_ui);
+        tty_draw_line(&tty_ui, 2);
+    }
+}
+
+// 行式 REPL（stdin 不是 TTY：管道/重定向）。同一份 history 连续对话。
+fn agent_repl_plain(cfg: &const Config) i32 {
+    var h: History = hist_init();
+    defer { hist_free(&h); }
+    defer { agent_session_close(); }
+    var no_first: Buf = buf_empty();
+    if !agent_history_begin(cfg, &h, &no_first) {
+        out_err("error: cannot build history\n");
+        return AGENT_PROTO;
+    }
+    var inbuf: Buf = buf_new(8192);
+    defer { buf_free(&inbuf); }
+    var line: Buf = buf_new(4096);
+    defer { buf_free(&line); }
+    if !buf_valid(&inbuf) || !buf_valid(&line) {
+        out_err("error: out of memory\n");
+        return AGENT_PROTO;
+    }
+    out_err("uya-agent REPL（stdin 不是终端：行式输入）— 空行/exit/Ctrl-D 退出\n");
+    var rc: i32 = AGENT_OK;
+    while true {
+        out_err("> ");
+        const n: isize = read_line(&inbuf, &line);
+        if n <= 0 {
+            out_err("\n");
+            break;
+        }
+        if line.len == 0 {
+            continue;
+        }
+        if line.len == 4 && line.ptr[0] == 101 as byte && line.ptr[1] == 120 as byte && line.ptr[2] == 105 as byte && line.ptr[3] == 116 as byte {
+            break;
+        }
+        var pushed: bool = hist_push(&h, ROLE_USER, line.ptr as &const byte, line.len);
+        while !pushed {
+            if !hist_drop_oldest(&h) {
+                break;
+            }
+            pushed = hist_push(&h, ROLE_USER, line.ptr as &const byte, line.len);
+        }
+        if !pushed {
+            out_err("error: 无法把任务写入历史\n");
+            continue;
+        }
+        agent_log_user(line.ptr as &const byte, line.len, false);
+        rc = agent_turn_loop(cfg, &h);
+        if rc != AGENT_OK {
+            out_err("[turn] 本回合异常结束（可继续输入）\n");
+            rc = AGENT_OK;
+        }
+    }
+    return rc;
+}
+
+// 交互入口：TTY 走 raw 模式行编辑器，否则退回行式 REPL
+fn agent_run_interactive(cfg: &Config) i32 {
+    if cfg.api_key.len == 0 {
+        out_err("error: no API key. set UYA_AGENT_API_KEY / DEEPSEEK_API_KEY / OPENAI_API_KEY\n");
+        return AGENT_USAGE;
+    }
+    tty_init(&tty_ui, 0);
+    if !tty_ui.is_tty {
+        return agent_repl_plain(cfg);
+    }
+    if !tty_raw_on(&tty_ui, 0) {
+        tty_puts(&tty_ui, 2, "warning: 无法进入 raw 模式（termios 设置失败），退回行式 REPL\n");
+        return agent_repl_plain(cfg);
+    }
+    g_interactive = true;
+    inbox_globals_init();
+
+    var h: History = hist_init();
+    var rc: i32 = AGENT_OK;
+    var no_first: Buf = buf_empty();
+    if !agent_history_begin(cfg, &h, &no_first) {
+        out_err("error: cannot build history\n");
+        tty_raw_off(&tty_ui, 0);
+        tty_free(&tty_ui);
+        return AGENT_PROTO;
+    }
+    agent_repl_banner(cfg);
+
+    var line: Buf = buf_new(8192);
+    var run: bool = true;
+    var ctrl_c_armed: bool = false;
+    while run {
+        // 1) 先取已经排队的输入（回合运行期间敲进来的），否则等提示符输入
+        var have: bool = inbox_pop(&g_steer, &line);
+        if have && line.len > 0 && line.ptr[0] == 47 as byte {
+            // 运行中输入的 slash 命令也按命令走：用户并不知道回合是否已经结束
+            tty_puts(&tty_ui, 2, "> ");
+            tty_write(&tty_ui, 2, line.ptr as &const byte, line.len);
+            tty_puts(&tty_ui, 2, "\n");
+            const stop_c: bool = agent_repl_command(cfg, &h, &line);
+            if stop_c {
+                run = false;
+            }
+            continue;
+        }
+        if !have {
+            tty_line_clear(&tty_ui);
+            tty_set_prompt(&tty_ui, "> ");
+            tty_draw_line(&tty_ui, 2);
+            const ev: i32 = tty_read_line_blocking();
+            if ev == TTY_EV_EOF {
+                run = false;
+                break;
+            }
+            if ev == TTY_EV_CTRL_C {
+                if tty_line_len(&tty_ui) > 0 {
+                    tty_line_clear(&tty_ui);
+                    tty_puts(&tty_ui, 2, "\n");
+                    ctrl_c_armed = false;
+                    continue;
+                }
+                if ctrl_c_armed {
+                    run = false;
+                    break;
+                }
+                ctrl_c_armed = true;
+                tty_puts(&tty_ui, 2, "\n(再按一次 Ctrl-C 退出；或直接输入任务)\n");
+                continue;
+            }
+            ctrl_c_armed = false;
+            const n: usize = tty_line_len(&tty_ui);
+            if n == 0 {
+                continue;
+            }
+            buf_reset(&line);
+            _ = buf_append(&line, tty_ui.line.ptr, n);
+            // 立刻清空编辑器行：回合期间用户再敲的字属于**下一行**（也就是 steer），
+            // 否则会在同一缓冲里和刚提交的内容粘在一起。
+            tty_line_clear(&tty_ui);
+            // 回显到正文
+            tty_puts(&tty_ui, 2, "> ");
+            tty_write(&tty_ui, 2, line.ptr as &const byte, line.len);
+            tty_puts(&tty_ui, 2, "\n");
+            if line.ptr[0] == 47 as byte {
+                const stop: bool = agent_repl_command(cfg, &h, &line);
+                if stop {
+                    run = false;
+                }
+                tty_line_clear(&tty_ui);
+                continue;
+            }
+            have = true;
+        }
+        if !have || line.len == 0 {
+            continue;
+        }
+        // 2) 追加 user 消息，跑一轮
+        var pushed: bool = hist_push(&h, ROLE_USER, line.ptr as &const byte, line.len);
+        while !pushed {
+            if !hist_drop_oldest(&h) {
+                break;
+            }
+            pushed = hist_push(&h, ROLE_USER, line.ptr as &const byte, line.len);
+        }
+        if !pushed {
+            tty_puts(&tty_ui, 2, "error: 无法把任务写入历史\n");
+            continue;
+        }
+        agent_log_user(line.ptr as &const byte, line.len, false);
+        rc = agent_turn_loop(cfg, &h);
+        if rc != AGENT_OK && rc != AGENT_INTERRUPTED {
+            tty_puts(&tty_ui, 2, "[turn] 本回合异常结束（可直接输入继续）\n");
+        }
+        // 3) 回合结束后没被采纳的 steer 留在箱里：下一轮循环顶部会取（keepInbox）
+    }
+
+    tty_raw_off(&tty_ui, 0);
+    tty_puts(&tty_ui, 2, "\nbye\n");
+    agent_session_close();
+    inbox_globals_free();
+    hist_free(&h);
+    buf_free(&line);
+    tty_free(&tty_ui);
+    g_interactive = false;
+    return rc;
+}
+
 fn run_once(cfg: &const Config) i32 {
     if cfg.task.len == 0 {
         return AGENT_USAGE;
@@ -863,6 +2299,202 @@ fn run_once(cfg: &const Config) i32 {
         out_err("\n");
     }
     return agent_run(cfg);
+}
+
+// $DSH_HOME（AGENTS.md / skills 的根），进程级
+var g_dsh_home: Buf = Buf{ ptr: null, len: 0, cap: 0 };
+
+export fn agent_dsh_home() &[byte] {
+    return g_dsh_home.ptr[0: g_dsh_home.len];
+}
+
+fn agent_set_dsh_home(home: &[byte]) bool {
+    buf_free(&g_dsh_home);
+    g_dsh_home = buf_new(home.len + 8);
+    return buf_append(&g_dsh_home, home.ptr, home.len);
+}
+
+fn env_present(name: &const byte) bool {
+    const p: &byte = getenv(name);
+    if (p as usize) == 0 {
+        return false;
+    }
+    return bufx_cstr_len(p) > 0;
+}
+
+fn cfg_set_buf(dst: &Buf, src: &const Buf) bool {
+    buf_free(dst);
+    dst[0] = buf_new(src.len + 8);
+    if !buf_valid(&dst[0]) {
+        return false;
+    }
+    return buf_append(&dst[0], src.ptr, src.len);
+}
+
+// 把 DSH 设置里解析出来的东西填进 Config（在 env 之后、CLI 之前调用）
+fn agent_apply_dsh(cfg: &Config, dsh: &const DshCfg) void {
+    if !dsh.ok {
+        return;
+    }
+    if dsh.base_url.len > 0 && !env_present("UYA_AGENT_BASE_URL") {
+        if cfg_set_buf(&cfg.base_url, &dsh.base_url) {
+            cfg.src_base_url = 1;
+        }
+    }
+    if dsh.model.len > 0 && !env_present("UYA_AGENT_MODEL") {
+        if cfg_set_buf(&cfg.model, &dsh.model) {
+            cfg.src_model = 1;
+        }
+    }
+    if dsh.api_key.len > 0 && cfg.api_key.len == 0 {
+        if cfg_set_buf(&cfg.api_key, &dsh.api_key) {
+            cfg.src_key = 1;
+        }
+    }
+    if dsh.context_window > 0 {
+        cfg.context_window = dsh.context_window;
+        cfg.src_context = 1;
+    }
+    if dsh.max_tokens > 0 && cfg.max_tokens == 0 {
+        cfg.max_tokens = dsh.max_tokens;
+    }
+    if dsh.reasoning_effort.len > 0 {
+        _ = cfg_set_buf(&cfg.reasoning_effort, &dsh.reasoning_effort);
+    }
+    if dsh.input_image {
+        cfg.input_image = true;
+    }
+    if dsh.confine_set {
+        cfg.confine = dsh.confine;
+        cfg.src_confine = 1;
+    }
+    if dsh.home.len > 0 {
+        _ = agent_set_dsh_home(dsh.home.ptr[0: dsh.home.len]);
+    }
+    // 信任策略：环境变量优先
+    if !env_present("UYA_AGENT_TLS_VERIFY") {
+        const v: &[byte] = dsh.tls_verify.ptr[0: dsh.tls_verify.len];
+        if v.len == 4 && bufx_mem_eq(v.ptr, "none", 4) {
+            cfg.verify = HC_VERIFY_NONE;
+        } else if v.len == 3 && bufx_mem_eq(v.ptr, "pin", 3) {
+            cfg.verify = HC_VERIFY_PIN;
+        } else if v.len == 5 && bufx_mem_eq(v.ptr, "chain", 5) {
+            cfg.verify = HC_VERIFY_CHAIN;
+        }
+    }
+    if dsh.tls_pin.len > 0 && cfg.pin.len == 0 {
+        _ = cfg_set_buf(&cfg.pin, &dsh.tls_pin);
+    }
+}
+
+fn cfg_src_name(src: u8) &const byte {
+    if src == 1 {
+        return "dsh-settings" as &const byte;
+    }
+    if src == 2 {
+        return "env" as &const byte;
+    }
+    if src == 3 {
+        return "cli" as &const byte;
+    }
+    return "default" as &const byte;
+}
+
+// 敏感值打码：sk-abcdef… → sk-…cdef
+fn out_masked(key: &const Buf) void {
+    if key.len == 0 {
+        out_err("(none)");
+        return;
+    }
+    if key.len <= 8 {
+        out_err_bytes(key.ptr, key.len);
+        return;
+    }
+    out_err_bytes(key.ptr, 3);
+    out_err("…");
+    out_err_bytes(&key.ptr[key.len - 4], 4);
+}
+
+fn agent_print_config(cfg: &const Config, dsh: &const DshCfg) void {
+    out_err("base_url = ");
+    out_err_bytes(cfg.base_url.ptr, cfg.base_url.len);
+    out_err("  (source: ");
+    out_err(cfg_src_name(cfg.src_base_url));
+    out_err(")\n");
+    out_err("model = ");
+    out_err_bytes(cfg.model.ptr, cfg.model.len);
+    out_err("  (source: ");
+    out_err(cfg_src_name(cfg.src_model));
+    out_err(")\n");
+    out_err("api_key = ");
+    out_masked(&cfg.api_key);
+    out_err("  (source: ");
+    out_err(cfg_src_name(cfg.src_key));
+    out_err(")\n");
+    out_err("context_window = ");
+    out_err_dec(cfg.context_window as usize);
+    out_err("  (source: ");
+    out_err(cfg_src_name(cfg.src_context));
+    out_err(")\n");
+    out_err("max_tokens = ");
+    out_err_dec(cfg.max_tokens as usize);
+    out_err("\n");
+    out_err("reasoning_effort = ");
+    out_err_bytes(cfg.reasoning_effort.ptr, cfg.reasoning_effort.len);
+    out_err("\n");
+    out_err("input_image = ");
+    if cfg.input_image {
+        out_err("true\n");
+    } else {
+        out_err("false\n");
+    }
+    out_err("confine = ");
+    if cfg.confine {
+        out_err("true");
+    } else {
+        out_err("false");
+    }
+    out_err("  (source: ");
+    out_err(cfg_src_name(cfg.src_confine));
+    out_err(")\n");
+    out_err("stream = ");
+    if cfg.stream {
+        out_err("true");
+    } else {
+        out_err("false");
+    }
+    out_err("  compat_fold = ");
+    if cfg.compat_fold {
+        out_err("true");
+    } else {
+        out_err("false");
+    }
+    out_err("  max_steps = ");
+    out_err_dec(cfg.max_steps as usize);
+    out_err("\n");
+    out_err("dsh_home = ");
+    out_err_bytes(dsh.home.ptr, dsh.home.len);
+    out_err("  (loaded: ");
+    if dsh.ok {
+        out_err("yes");
+    } else {
+        out_err("no");
+    }
+    out_err(")  provider = ");
+    out_err_bytes(dsh.provider.ptr, dsh.provider.len);
+    out_err("  api_style = ");
+    out_err_bytes(dsh.api_style.ptr, dsh.api_style.len);
+    out_err("\n");
+    out_err("api_key_env = ");
+    out_err_bytes(dsh.api_key_env.ptr, dsh.api_key_env.len);
+    out_err("  key_source = ");
+    out_err(dsh_key_src_name(dsh.key_src));
+    out_err("  agent_home = ");
+    out_err_bytes(g_home.ptr as &const byte, g_home.len);
+    out_err("\n");
+    out_err("preset = ");
+    out_err_bytes(dsh.preset_default.ptr, dsh.preset_default.len);
+    out_err("\n");
 }
 
 export fn main() i32 {
@@ -896,13 +2528,63 @@ export fn main() i32 {
         cfg.max_steps = parse_i32_arg(steps_env, 12);
     }
 
-    // 3) 命令行
+    const tlsv: &byte = getenv("UYA_AGENT_TLS_VERIFY");
+    if (tlsv as usize) != 0 {
+        if bufx_cstr_len(tlsv) == 4 && bufx_eq_cstr(tlsv, 4, "none") {
+            cfg.verify = HC_VERIFY_NONE;
+        } else if bufx_cstr_len(tlsv) == 3 && bufx_eq_cstr(tlsv, 3, "pin") {
+            cfg.verify = HC_VERIFY_PIN;
+        } else if bufx_cstr_len(tlsv) == 5 && bufx_eq_cstr(tlsv, 5, "chain") {
+            cfg.verify = HC_VERIFY_CHAIN;
+        }
+    }
+    const tlsp: &byte = getenv("UYA_AGENT_TLS_PIN");
+    if (tlsp as usize) != 0 && bufx_cstr_len(tlsp) > 0 {
+        buf_free(&cfg.pin);
+        cfg.pin = buf_from_cstr(tlsp);
+    }
+
+    // 3) DSH 设置（优先级：env 之后、CLI 之前）
+    var dsh: DshCfg = dsh_cfg_empty();
+    defer { dsh_cfg_free(&dsh); }
+    if !cfg.no_dsh_config {
+        var cwdz: Buf = buf_new(cfg.workspace.len + 1);
+        defer { buf_free(&cwdz); }
+        _ = buf_append(&cwdz, cfg.workspace.ptr, cfg.workspace.len);
+        _ = buf_append_byte(&cwdz, 0);
+        const loaded: bool = dsh_cfg_load(cfg.dsh_home.ptr as &const byte, cwdz.ptr as &const byte, &dsh);
+        if !loaded {
+            if cfg.strict_dsh_config {
+                out_err("error: 读不到 DSH 设置（--strict-dsh-config）：");
+                out_err_bytes(cfg.dsh_home.ptr, cfg.dsh_home.len);
+                out_err("\n");
+                return AGENT_USAGE;
+            }
+            dsh.ok = false;
+        } else {
+            agent_apply_dsh(&cfg, &dsh);
+        }
+    }
+
+    // 4) 命令行
     var i: i32 = 1;
     while i < get_argc() {
         const p: &byte = get_argv(i);
         if p == null {
             i = i + 1;
             continue;
+        }
+        if arg_eq(p, "--yaml-dump") {
+            i = i + 1;
+            if i < get_argc() {
+                var t: YTree = YTree{ nodes: [], n: 0, lines: [], nlines: 0, raw: buf_empty(), cur: 0, err_line: 0 };
+                yt_init(&t);
+                const got: bool = yt_dump(get_argv(i), &t);
+                yt_free(&t);
+                return if got { AGENT_OK } else { AGENT_PROTO };
+            }
+            out_err("error: --yaml-dump 需要文件路径\n");
+            return AGENT_USAGE;
         }
         if arg_eq(p, "-h") || arg_eq(p, "--help") {
             print_usage();
@@ -913,6 +2595,67 @@ export fn main() i32 {
             probe = true;
         } else if arg_eq(p, "--no-shell") {
             cfg.allow_shell = false;
+        } else if arg_eq(p, "--no-stream") {
+            cfg.stream = false;
+        } else if arg_eq(p, "--compat-fold") {
+            cfg.compat_fold = true;
+        } else if arg_eq(p, "--agent-home") {
+            i = i + 1;
+            if i < get_argc() {
+                buf_free(&cfg.agent_home);
+                cfg.agent_home = buf_from_cstr(get_argv(i));
+            }
+        } else if arg_eq(p, "--no-save") {
+            cfg.save_session = false;
+        } else if arg_eq(p, "--dsh-home") {
+            i = i + 1;
+            if i < get_argc() {
+                buf_free(&cfg.dsh_home);
+                cfg.dsh_home = buf_from_cstr(get_argv(i));
+            }
+        } else if arg_eq(p, "--no-dsh-config") {
+            cfg.no_dsh_config = true;
+        } else if arg_eq(p, "--strict-dsh-config") {
+            cfg.strict_dsh_config = true;
+        } else if arg_eq(p, "--print-config") {
+            cfg.print_config = true;
+        } else if arg_eq(p, "--list-sessions") {
+            cfg.list_sessions = true;
+        } else if arg_eq(p, "--continue") {
+            // 不带参数：接当前目录下最近一条会话（别吞后面的任务词）
+            if !agent_resolve_resume(&cfg, "last") {
+                out_err("error: 当前目录下没有可继续的会话（用 --list-sessions 看）\n");
+                return AGENT_USAGE;
+            }
+        } else if arg_eq(p, "--resume") {
+            i = i + 1;
+            if i < get_argc() {
+                if !agent_resolve_resume(&cfg, get_argv(i)) {
+                    out_err("error: 找不到会话：");
+                    out_err_bytes(get_argv(i), cstr_len(get_argv(i)));
+                    out_err("\n");
+                    return AGENT_USAGE;
+                }
+            } else {
+                out_err("error: --resume 需要会话 id（或用 --continue 接最近一条）\n");
+                return AGENT_USAGE;
+            }
+        } else if arg_eq(p, "--no-stream-options") {
+            cfg.stream_options = false;
+        } else if arg_eq(p, "--show-reasoning") {
+            cfg.show_reasoning = true;
+        } else if arg_eq(p, "--show-usage") {
+            cfg.show_usage = true;
+        } else if arg_eq(p, "--max-tokens") {
+            i = i + 1;
+            if i < get_argc() {
+                cfg.max_tokens = parse_i32_arg(get_argv(i), 0) as i64;
+            }
+        } else if arg_eq(p, "--temperature") {
+            i = i + 1;
+            if i < get_argc() {
+                cfg.temperature = parse_i32_nonneg(get_argv(i), -1);
+            }
         } else if arg_eq(p, "--quiet") {
             cfg.quiet = true;
         } else if arg_eq(p, "--tls-debug") {
@@ -988,6 +2731,13 @@ export fn main() i32 {
         out_err("error: --tls-verify=pin requires --tls-pin <sha256 hex>\n");
         return AGENT_USAGE;
     }
+    if cfg.print_config {
+        agent_print_config(&cfg, &dsh);
+        return AGENT_OK;
+    }
+    if cfg.list_sessions {
+        return agent_list_sessions(&cfg);
+    }
     if selftest {
         return selftest_main(&cfg);
     }
@@ -999,32 +2749,5 @@ export fn main() i32 {
         task_words = buf_empty();
         return run_once(&cfg);
     }
-    out_err("uya-agent REPL — 输入任务回车执行；空行/exit/Ctrl-D 退出\n");
-    var inbuf: Buf = buf_new(8192);
-    defer { buf_free(&inbuf); }
-    var line: Buf = buf_new(4096);
-    defer { buf_free(&line); }
-    if !buf_valid(&inbuf) || !buf_valid(&line) {
-        out_err("error: out of memory\n");
-        return AGENT_PROTO;
-    }
-    while true {
-        out_err("> ");
-        const n: isize = read_line(&inbuf, &line);
-        if n <= 0 {
-            out_err("\n");
-            break;
-        }
-        if line.len == 0 {
-            continue;
-        }
-        if line.len == 4 && line.ptr[0] == 101 as byte && line.ptr[1] == 120 as byte && line.ptr[2] == 105 as byte && line.ptr[3] == 116 as byte {
-            break;
-        }
-        buf_free(&cfg.task);
-        cfg.task = buf_new(line.len + 8);
-        _ = buf_append(&cfg.task, line.ptr, line.len);
-        _ = run_once(&cfg);
-    }
-    return AGENT_OK;
+    return agent_run_interactive(&cfg);
 }

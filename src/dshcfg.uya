@@ -1,0 +1,390 @@
+// src/dshcfg.uya — 解析 DSH 设置文件，得到「模型路线 / 凭据 / 权限 / 技能根」（P5）
+//
+// 读的文件：
+//   $DSH_HOME/settings.yaml        模型路线（agent-default-model → provider 定义）、preset 选择、权限预设
+//   $DSH_HOME/.credentials.yaml    refs: {NAME: secret}
+//   <cwd>/.env、$DSH_HOME/.env     凭据兜底（DSH 的优先级：进程环境 > .credentials.yaml > cwd/.env > home/.env）
+//
+// 优先级（高→低）：CLI > UYA_AGENT_* 环境变量 > DSH 设置 > 内置默认 —— 这一层只负责「DSH 里有什么」，
+// 与应用顺序由 agent.uya 决定。
+
+use libc.syscall;
+use libc.unistd;
+
+export const DSHSRC_NONE: u8 = 0;
+export const DSHSRC_ENV: u8 = 1;
+export const DSHSRC_CREDS: u8 = 2;
+export const DSHSRC_CWD_ENV: u8 = 3;
+export const DSHSRC_HOME_ENV: u8 = 4;
+
+export struct DshCfg {
+    ok: bool,
+    home: Buf,           // $DSH_HOME（AGENTS.md / skills 的根）
+    provider: Buf,
+    model: Buf,
+    base_url: Buf,
+    reasoning_effort: Buf,
+    api_style: Buf,      // openai-completions / openai-responses / anthropic / …
+    api_key_env: Buf,
+    api_key: Buf,
+    key_src: u8,
+    context_window: i64,
+    max_tokens: i64,
+    input_image: bool,
+    confine: bool,
+    confine_set: bool,
+    preset_default: Buf,
+    // 我们自己的命名空间（DSH 会忽略未知节）：uya-agent.tls.{verify,pin}
+    tls_verify: Buf,
+    tls_pin: Buf,
+}
+
+export fn dsh_cfg_empty() DshCfg {
+    return DshCfg{
+        ok: false,
+        home: buf_empty(),
+        provider: buf_empty(),
+        model: buf_empty(),
+        base_url: buf_empty(),
+        reasoning_effort: buf_empty(),
+        api_style: buf_empty(),
+        api_key_env: buf_empty(),
+        api_key: buf_empty(),
+        key_src: DSHSRC_NONE,
+        context_window: -1,
+        max_tokens: -1,
+        input_image: false,
+        confine: false,
+        confine_set: false,
+        preset_default: buf_empty(),
+        tls_verify: buf_empty(),
+        tls_pin: buf_empty(),
+    };
+}
+
+export fn dsh_cfg_free(c: &DshCfg) void {
+    buf_free(&c.home);
+    buf_free(&c.provider);
+    buf_free(&c.model);
+    buf_free(&c.base_url);
+    buf_free(&c.reasoning_effort);
+    buf_free(&c.api_style);
+    buf_free(&c.api_key_env);
+    buf_free(&c.api_key);
+    buf_free(&c.preset_default);
+    buf_free(&c.tls_verify);
+    buf_free(&c.tls_pin);
+}
+
+fn dsh_set(dst: &Buf, src: &[byte]) bool {
+    buf_reset(dst);
+    if src.len == 0 {
+        return true;
+    }
+    return buf_append(dst, src.ptr, src.len);
+}
+
+// $DSH_HOME：--dsh-home > $DSH_HOME > $HOME/.dsh
+export fn dsh_home_resolve(explicit: &const byte, out: &Buf) bool {
+    buf_reset(out);
+    if bufx_cstr_len(explicit) > 0 {
+        return buf_append_cstr(out, explicit);
+    }
+    const env: &byte = getenv("DSH_HOME");
+    if (env as usize) != 0 && bufx_cstr_len(env) > 0 {
+        return buf_append_cstr(out, env);
+    }
+    const h: &byte = getenv("HOME");
+    if (h as usize) == 0 {
+        return false;
+    }
+    if !buf_append_cstr(out, h) {
+        return false;
+    }
+    return buf_append_cstr(out, "/.dsh");
+}
+
+// 取 `.env` 风格的 KEY=VALUE
+export fn dsh_env_file_get(path: &const byte, key: &const byte, out: &Buf) bool {
+    var text: Buf = buf_new(4096);
+    defer { buf_free(&text); }
+    const fd: i32 = sys_open(path as *const byte, O_RDONLY as i32, 0) catch {
+        return false;
+    };
+    defer { _ = sys_close(fd) catch {}; }
+    var tmp: [byte: 8192] = [0: 8192];
+    while true {
+        const n: isize = sys_read(fd, &tmp[0], 8192) catch { 0 as isize; };
+        if n <= 0 {
+            break;
+        }
+        if !buf_append(&text, &tmp[0], n as usize) {
+            return false;
+        }
+    }
+    if text.len == 0 {
+        return false;
+    }
+    const kn: usize = bufx_cstr_len(key);
+    var pos: usize = 0;
+    while pos < text.len {
+        var le: usize = pos;
+        while le < text.len && text.ptr[le] != 10 as byte {
+            le = le + 1;
+        }
+        var ls: usize = pos;
+        while ls < le && (text.ptr[ls] == 32 as byte || text.ptr[ls] == 9 as byte) {
+            ls = ls + 1;
+        }
+        if ls < le && text.ptr[ls] != 35 as byte {
+            if ls + kn < le && bufx_mem_eq(&text.ptr[ls], key, kn) && text.ptr[ls + kn] == 61 as byte {
+                var vs: usize = ls + kn + 1;
+                var ve: usize = le;
+                // 去掉引号
+                if vs < ve && (text.ptr[vs] == 34 as byte || text.ptr[vs] == 39 as byte) {
+                    const q: byte = text.ptr[vs];
+                    vs = vs + 1;
+                    if ve > vs && text.ptr[ve - 1] == q {
+                        ve = ve - 1;
+                    }
+                }
+                buf_reset(out);
+                return buf_append(out, &text.ptr[vs], ve - vs);
+            }
+        }
+        pos = le + 1;
+    }
+    return false;
+}
+
+// 把 refs.NAME 取出来
+fn dsh_cred_get(creds: &const YTree, name: &const byte, out: &Buf) bool {
+    const root: i32 = yt_root(creds);
+    const refs: i32 = yt_get(creds, root, "refs");
+    if refs < 0 {
+        return false;
+    }
+    const v: i32 = yt_get(creds, refs, name);
+    if v < 0 {
+        return false;
+    }
+    return dsh_set(out, yt_str(creds, v));
+}
+
+// provider 定义里的 models[] 找到 id 匹配的那条
+// 参数：t = 整棵树，prov = provider 节点下标，model = 目标模型 id
+fn dsh_pick_model(t: &const YTree, prov: i32, model: &const byte, out_cw: &i64, out_mt: &i64, out_img: &bool) void {
+    const models: i32 = yt_get(t, prov, "models");
+    if models < 0 {
+        return;
+    }
+    const n: usize = yt_len(t, models);
+    var i: usize = 0;
+    while i < n {
+        const e: i32 = yt_at(t, models, i);
+        if e >= 0 {
+            const id: &[byte] = yt_get_str(t, e, "id");
+            const mn: usize = bufx_cstr_len(model);
+            if id.len == mn && bufx_mem_eq(id.ptr, model, mn) {
+                const cw: i64 = yt_get_i64(t, e, "contextWindow", -1);
+                if cw > 0 {
+                    out_cw[0] = cw;
+                }
+                const mt: i64 = yt_get_i64(t, e, "maxTokens", -1);
+                if mt > 0 {
+                    out_mt[0] = mt;
+                }
+                const inp: i32 = yt_get(t, e, "input");
+                if inp >= 0 {
+                    const nn: usize = yt_len(t, inp);
+                    var k: usize = 0;
+                    while k < nn {
+                        const iv: i32 = yt_at(t, inp, k);
+                        const sv: &[byte] = yt_str(t, iv);
+                        if sv.len == 5 && bufx_mem_eq(sv.ptr, "image", 5) {
+                            out_img[0] = true;
+                        }
+                        k = k + 1;
+                    }
+                }
+                return;
+            }
+        }
+        i = i + 1;
+    }
+}
+
+// 读 settings.yaml + .credentials.yaml + .env，解析出路线与凭据
+export fn dsh_cfg_load(explicit_home: &const byte, cwd: &const byte, out: &DshCfg) bool {
+    var home: Buf = buf_new(1024);
+    defer { buf_free(&home); }
+    if !dsh_home_resolve(explicit_home, &home) {
+        return false;
+    }
+    _ = buf_append_byte(&home, 0);
+    _ = dsh_set(&out.home, home.ptr[0: home.len - 1]);
+
+    var spath: Buf = buf_new(1200);
+    defer { buf_free(&spath); }
+    _ = buf_append_cstr(&spath, &home.ptr[0] as &const byte);
+    _ = buf_append_cstr_z(&spath, "/settings.yaml");
+
+    var tree: YTree = YTree{ nodes: [], n: 0, lines: [], nlines: 0, raw: buf_empty(), cur: 0, err_line: 0 };
+    yt_init(&tree);
+    defer { yt_free(&tree); }
+    if !yt_load_file(&spath.ptr[0] as &const byte, &tree) {
+        return false;
+    }
+    const root: i32 = yt_root(&tree);
+    if root < 0 {
+        return false;
+    }
+
+    // ---- agent-default-model ----
+    const adm: i32 = yt_get(&tree, root, "agent-default-model");
+    if adm >= 0 {
+        _ = dsh_set(&out.provider, yt_get_str(&tree, adm, "provider"));
+        _ = dsh_set(&out.model, yt_get_str(&tree, adm, "model"));
+        _ = dsh_set(&out.reasoning_effort, yt_get_str(&tree, adm, "reasoningEffort"));
+    }
+    // ---- agent-presets.default ----
+    const aps: i32 = yt_get(&tree, root, "agent-presets");
+    if aps >= 0 {
+        _ = dsh_set(&out.preset_default, yt_get_str(&tree, aps, "default"));
+    }
+
+    // ---- provider 定义：llm-pi-ai.providers.<provider> 或 llm-deepseek ----
+    const pname: &[byte] = out.provider.ptr[0: out.provider.len];
+    var prov: i32 = -1;
+    if pname.len > 0 {
+        const pi: i32 = yt_get(&tree, root, "llm-pi-ai");
+        if pi >= 0 {
+            const provs: i32 = yt_get(&tree, pi, "providers");
+            if provs >= 0 {
+                var namez: Buf = buf_new(pname.len + 1);
+                defer { buf_free(&namez); }
+                _ = buf_append(&namez, pname.ptr, pname.len);
+                _ = buf_append_byte(&namez, 0);
+                prov = yt_get(&tree, provs, namez.ptr as &const byte);
+            }
+        }
+    }
+    if prov < 0 {
+        // 退回官方 deepseek 路线
+        const dd: i32 = yt_get(&tree, root, "llm-deepseek");
+        if dd >= 0 {
+            prov = dd;
+            _ = dsh_set(&out.api_style, yt_get_str(&tree, dd, "api"));
+        }
+    }
+    if prov >= 0 {
+        _ = dsh_set(&out.base_url, yt_get_str(&tree, prov, "baseURL"));
+        _ = dsh_set(&out.api_key_env, yt_get_str(&tree, prov, "apiKeyEnv"));
+        const api: &[byte] = yt_get_str(&tree, prov, "api");
+        if api.len > 0 {
+            _ = dsh_set(&out.api_style, api);
+        }
+        var cw: i64 = -1;
+        var mt: i64 = -1;
+        var img: bool = false;
+        var mz: Buf = buf_new(out.model.len + 1);
+        defer { buf_free(&mz); }
+        _ = buf_append(&mz, out.model.ptr, out.model.len);
+        _ = buf_append_byte(&mz, 0);
+        dsh_pick_model(&tree, prov, mz.ptr as &const byte, &cw, &mt, &img);
+        out.context_window = cw;
+        out.max_tokens = mt;
+        out.input_image = img;
+    }
+
+    // ---- 凭据：进程环境 > .credentials.yaml > <cwd>/.env > $DSH_HOME/.env ----
+    const envname: &[byte] = out.api_key_env.ptr[0: out.api_key_env.len];
+    if envname.len > 0 {
+        var namez2: Buf = buf_new(envname.len + 1);
+        defer { buf_free(&namez2); }
+        _ = buf_append(&namez2, envname.ptr, envname.len);
+        _ = buf_append_byte(&namez2, 0);
+        const from_env: &byte = getenv(namez2.ptr as &const byte);
+        if (from_env as usize) != 0 && bufx_cstr_len(from_env) > 0 {
+            _ = dsh_set(&out.api_key, from_env[0: bufx_cstr_len(from_env)]);
+            out.key_src = DSHSRC_ENV;
+        } else {
+            var cpath: Buf = buf_new(1200);
+            defer { buf_free(&cpath); }
+            _ = buf_append_cstr(&cpath, &home.ptr[0] as &const byte);
+            _ = buf_append_cstr_z(&cpath, "/.credentials.yaml");
+            var creds: YTree = YTree{ nodes: [], n: 0, lines: [], nlines: 0, raw: buf_empty(), cur: 0, err_line: 0 };
+            yt_init(&creds);
+            defer { yt_free(&creds); }
+            if yt_load_file(&cpath.ptr[0] as &const byte, &creds) {
+                if dsh_cred_get(&creds, namez2.ptr as &const byte, &out.api_key) {
+                    out.key_src = DSHSRC_CREDS;
+                }
+            }
+            if out.key_src == DSHSRC_NONE {
+                var p1: Buf = buf_new(bufx_cstr_len(cwd) + 16);
+                defer { buf_free(&p1); }
+                _ = buf_append_cstr(&p1, cwd);
+                _ = buf_append_cstr_z(&p1, "/.env");
+                if dsh_env_file_get(&p1.ptr[0] as &const byte, namez2.ptr as &const byte, &out.api_key) {
+                    out.key_src = DSHSRC_CWD_ENV;
+                }
+            }
+            if out.key_src == DSHSRC_NONE {
+                var p2: Buf = buf_new(1200);
+                defer { buf_free(&p2); }
+                _ = buf_append_cstr(&p2, &home.ptr[0] as &const byte);
+                _ = buf_append_cstr_z(&p2, "/.env");
+                if dsh_env_file_get(&p2.ptr[0] as &const byte, namez2.ptr as &const byte, &out.api_key) {
+                    out.key_src = DSHSRC_HOME_ENV;
+                }
+            }
+        }
+    }
+
+    // ---- 我们自己的命名空间：uya-agent.tls.{verify,pin} ----
+    // DSH 会忽略不认识的节，所以把 uya-agent 的信任策略也放在同一个设置文件里，
+    // 这样「零参数启动」才真的可用（chain 在真实站点上过不去，见 README 第 5 节）。
+    const ua: i32 = yt_get(&tree, root, "uya-agent");
+    if ua >= 0 {
+        const tls: i32 = yt_get(&tree, ua, "tls");
+        if tls >= 0 {
+            _ = dsh_set(&out.tls_verify, yt_get_str(&tree, tls, "verify"));
+            _ = dsh_set(&out.tls_pin, yt_get_str(&tree, tls, "pin"));
+        }
+    }
+
+    // ---- 权限预设 → 是否限制在工作区内 ----
+    const perm: i32 = yt_get(&tree, root, "permission");
+    if perm >= 0 {
+        const dp: &[byte] = yt_get_str(&tree, perm, "defaultPreset");
+        if dp.len > 0 {
+            out.confine_set = true;
+            // "danger-full-access" 是 18 个字符（数错一位会让这里永远判 false → confine 反了）
+            var dangerous: bool = false;
+            if dp.len == 18 && bufx_mem_eq(dp.ptr, "danger-full-access", 18) {
+                dangerous = true;
+            }
+            out.confine = !dangerous;
+        }
+    }
+
+    out.ok = true;
+    return true;
+}
+
+export fn dsh_key_src_name(src: u8) &const byte {
+    if src == DSHSRC_ENV {
+        return "env" as &const byte;
+    }
+    if src == DSHSRC_CREDS {
+        return "credentials" as &const byte;
+    }
+    if src == DSHSRC_CWD_ENV {
+        return "cwd/.env" as &const byte;
+    }
+    if src == DSHSRC_HOME_ENV {
+        return "home/.env" as &const byte;
+    }
+    return "none" as &const byte;
+}
