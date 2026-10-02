@@ -4,7 +4,7 @@
 多轮 loop 直到给出结论。全部代码 9 个 `.uya` 文件，**不引入任何 C 代码、`@c_import` 或其它语言**，
 只依赖 Uya 语言与随编译器分发的标准库。
 
-**P1–P8 已完成**：LLM 交互是**流式 SSE**（`stream:true` + `stream_options.include_usage`），
+**P1–P9 已完成**：LLM 交互是**流式 SSE**（`stream:true` + `stream_options.include_usage`），
 增量 chunked 解码 + SSE 分帧 + `tool_calls` 按 `index` 分片累积；消息协议是**严格工具协议**
 （`assistant.tool_calls` 原样回灌 + 每条结果一条 `role:"tool"` + `tool_call_id`）；
 交互界面是**真 TTY**（termios raw + 行编辑器），流式期间可打断、可继续输入、可续跑；
@@ -16,7 +16,9 @@
 （`bash run_in_background` → `job_list` / `job_output` / `job_kill`），
 子进程会拿到 `DSH_*` 环境；system prompt 改为**分节装配**（persona 从 DSH preset 读、
 `{{model}}`/`{{cwd}}` 变量替换、空节丢弃、`\n\n` 连接），并注入 AGENTS.md 与运行时上下文，
-配上 `todo_write` / `exit_plan_mode` / `ask_user_question`。`--no-stream` / `--compat-fold` 保留两条回退路径。
+配上 `todo_write` / `exit_plan_mode` / `ask_user_question`；**上下文管理**也齐了：
+tool 结果超 8192 码点自动剪枝，压力超过窗口 80% 时自动压缩成 checkpoint（真机实测触发过）。
+`--no-stream` / `--compat-fold` 保留两条回退路径。
 
 ```
 $ DEEPSEEK_API_KEY=sk-xxx ./build/uya-agent "在当前目录创建 hello.uya，编译并运行它"
@@ -68,7 +70,7 @@ export UYA_SPLIT_C_DIR=$PWD/build/uyacache      # 多文件 C 缓存别丢在仓
 | `--timeout-ms N` | 单次 HTTP 超时，默认 120 s |
 | `--no-shell` | 不提供 `run_shell`（tools schema 里也不会出现） |
 | `--no-stream` | 关闭流式，回退一次性响应（老端点兼容） |
-| REPL 命令 | `/help` `/continue` `/status` `/sessions` `/resume <id>` `/new` `/exit` |
+| REPL 命令 | `/help` `/continue` `/status` `/compact` `/plan` `/sessions` `/resume <id>` `/new` `/exit` |
 | `--agent-home DIR` | 会话与索引的根目录（默认 `~/.uya-agent`） |
 | `--continue` | 接着当前目录最近一条会话继续 |
 | `--resume ID` | 恢复指定会话（`ID` 或 `last`） |
@@ -80,6 +82,8 @@ export UYA_SPLIT_C_DIR=$PWD/build/uyacache      # 多文件 C 缓存别丢在仓
 | `--print-config` | 打印生效配置与来源后退出 |
 | `--yaml-dump FILE` | 打印该 YAML 的解析结果（诊断） |
 | `--plan` | 以 plan 模式启动（先出计划、批准后再执行） |
+| `--no-compact` | 关闭自动上下文压缩 |
+| `--context-window N` | 压缩判定的窗口（默认取 DSH 模型条目） |
 | `--dsh-root DIR` | packaged preset 根（读 persona / plan 段文案） |
 | `--dry-run` | 只组装请求并打印（不可打印字节转义成 `\xNN`，排查脏字节） |
 | `--compat-fold` | 工具结果折叠成一条 user 消息（旧协议） |
@@ -128,6 +132,8 @@ src/search.uya    glob / grep：rg 子进程（--files / --json）、VCS 目录�
 src/dshcfg.uya    读 DSH 设置：$DSH_HOME 解析、settings.yaml 模型路线（agent-default-model →
                   provider 的 baseURL/apiKeyEnv/models[]）、.credentials.yaml、.env 兜底、
                   permission→confine、uya-agent.tls 命名空间
+src/compact.uya   上下文管理：tool 结果剪枝（8192/4096/1024 **码点**，只在构请求时生效）、
+                  压力判定（prompt_tokens，退化时按字节/4 估）、摘要提示词、checkpoint 替换
 src/prompt.uya    system prompt 分节装配（order 排序 / 空节丢弃 / `\n\n` 连接 / 变量替换）、
                   persona 与 plan 段从 DSH preset 读取（读不到用内置默认）、运行时上下文 user 消息
 src/instr.uya     AGENTS.md / CLAUDE.md 发现（用户全局 → 项目根 → cwd，由广到窄）、
@@ -141,6 +147,24 @@ src/agent.uya     CLI、环境变量、消息历史、请求组装、主循环�
                   交互式 REPL（中断/steer//continue/会话命令）、会话事件记录与恢复
 src/selftest.uya  --selftest 的 mock LLM（含 SSE 受控切分）+ 15 轮断言 + --probe
 ```
+
+### 上下文管理（P9，对齐 DSH compaction-basic + tool-result-pruner）
+
+* **tool 结果剪枝**：文本超过 **8192 码点**时替换成「前 4096 码点 + 标记 + 后 1024 码点」，
+  标记逐字对齐 DSH：`\n\n[... tool result middle pruned ...]\n\n`。
+  剪枝**只在构请求时生效**（历史不动），所以天然幂等；按码点计数，不会切坏 UTF-8。
+* **自动压缩**：每个 step 边界测压（压力 = 最近一次响应的 `prompt_tokens`，拿不到就按字节/4 估），
+  达到 `floor(contextWindow × 0.8)` 就把**较早的一段**压成 checkpoint：
+  - 保留最近约 16% 的原文（至少 2 条），且**不拆散** assistant(tool_calls) 与它的 tool 结果、
+    保留段也不能以孤儿 tool 结果开头；
+  - 摘要走一次独立模型调用，提示词用 DSH 的原文头部与八个小节结构（Primary Request and Intent /
+    Key Technical Concepts / Files and Code / Errors and Fixes / Pending Jobs / Current Work /
+    Next Step / Critical Context）；
+  - 摘要**必须比被遮蔽内容短**，否则放弃（DSH 的硬规则）；
+  - 替换成 `[system 原文] + [CHECKPOINT_PREAMBLE + <compacted-summary>…</compacted-summary>] + [保留的尾部]`。
+* 触发开关：`--no-compact` 关掉自动压缩，`--context-window N` 覆盖窗口（默认取 DSH 模型条目），
+  REPL 里 `/compact` 手动触发一次。
+* 已知偏离：DSH 还有 overflow 兜底重试与 retries 配置，这里只做「一次尝试」。
 
 ### 提示词与上下文状态（P8）
 
@@ -442,6 +466,9 @@ agent 循环并逐项断言：
 | `interrupt` | 预置 Ctrl-C：回合以 `AGENT_INTERRUPTED` 结束、工具**未派发**、只发生一次请求 |
 | `tty-editor` | termios 布局(60B)/raw 位运算；行编辑（插入/退格/左右/Delete/Home/End/词删除）、
 一次喂入多行拆成多个提交、分片转义序列、裸 ESC 判定、历史上下翻、中断前缀裁剪 |
+| `compact-prune` | 让 bash 产生 20000 字符输出 → 断言请求里出现剪枝标记、完整中段已消失 |
+| `compact-auto` | 小窗口（200）强制触发：工具轮 → **摘要请求**（断言提示词模板）→ 压缩后的请求里
+必须出现 `automatically generated checkpoint` 与 `<compacted-summary>` |
 | `prompt-todo-plan` | 第一轮断言 system prompt（persona 变量替换、`{{cwd}}`、工具引导段）、运行时上下文
 user 消息、AGENTS.md 注入，以及**请求里没有 NUL 字节**；第二轮断言 todo 计数回显、
 重复 content 被拒、`exit_plan_mode` 在非 plan 模式报错、计划必须以 `# ` 开头 |
@@ -466,6 +493,9 @@ contextWindow/maxTokens/input image/reasoningEffort/`permission→confine`/`uya-
   `"id":"call_…"` 保留、`"tool_call_id"` 条数与调用数一致（shell 2 / no-shell 1 / tools 4）。
 * TTY 交互用**真 pty** 验证（`script -qec`）：进入 raw 模式、banner 干净、一次粘贴
   4 行会分成 4 次提交（任务 → `/help` → `/status` → `/exit`），退出后终端恢复。
+* 自动压缩在真机上实测触发过：`--context-window 700` 下跑一个多步任务，
+  日志出现 `[compact] 已压缩较早的 2 条消息（pressure=2381 limit=560）`，
+  压缩后模型仍正确完成并给出结论。
 * 提示词装配在真机上验证过（并因此抓出 getcwd 的 NUL bug）：新 prompt 下模型正常使用
   `glob` 并给出结论；`--dry-run` 现在能看到完整请求体（转义后）且不含 NUL。
 * 后台任务在真机上做了冒烟：让它「用 run_in_background 跑 `sleep 2; echo BG-JOB-DONE`，

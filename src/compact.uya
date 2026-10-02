@@ -1,0 +1,264 @@
+// src/compact.uya — 上下文管理（P9，对齐 DSH compaction + tool-result-pruner）
+//
+// 两件事：
+//   1) **tool 结果剪枝**：文本超过 thresholdChars（8192）**码点**时，替换成
+//      前 headChars（4096）码点 + 固定标记 + 后 tailChars（1024）码点。
+//      只在**构请求**时生效（不动历史），所以天然幂等；标记逐字对齐 DSH：
+//      "\n\n[... tool result middle pruned ...]\n\n"
+//   2) **自动压缩**：step 边界测压（压力 ≥ floor(contextWindow × 0.8)）时，
+//      调一次模型把**较早的一段**对话压成 checkpoint，替换成一条 user 消息：
+//      CHECKPOINT_PREAMBLE + "\n\n" + <compacted-summary>…</compacted-summary>。
+//      保留最近 retainRatio(0.16) 的原文；摘要不比被遮蔽内容短就拒绝（DSH 的硬规则）。
+//
+// 压力口径与 DSH 的 tokenMeter 一致：inputTokens + cacheReadTokens（即 prompt_tokens）。
+// 拿不到 usage 时退化成「字节 / 4」的估算。
+
+export var cmp_prune_threshold: usize = 8192;   // thresholdChars（码点）
+export var cmp_prune_head: usize = 4096;        // headChars
+export var cmp_prune_tail: usize = 1024;        // tailChars
+export const CMP_PRUNE_MARK: &const byte = "\n\n[... tool result middle pruned ...]\n\n";
+
+export const CHECKPOINT_PREAMBLE: &const byte = "This is an automatically generated checkpoint condensing an earlier span of the conversation to free up context. Treat the captured context as established background and build on it without restating it. Continue the task directly from the messages that follow, without acknowledging this checkpoint.";
+
+// ============================================================
+// tool 结果剪枝
+// ============================================================
+// 需要剪枝就把剪枝后的文本写进 out 并返回 true；否则 out 不动、返回 false。
+export fn cmp_maybe_prune(text: &const byte, n: usize, out: &Buf) bool {
+    const cps: usize = bufx_utf8_count(text, n);
+    if cps <= cmp_prune_threshold {
+        return false;
+    }
+    const head_bytes: usize = bufx_utf8_prefix_bytes(text, n, cmp_prune_head);
+    const tail_start: usize = bufx_utf8_suffix_offset(text, n, cmp_prune_tail);
+    buf_reset(out);
+    if !buf_append(out, text, head_bytes) {
+        return false;
+    }
+    if !buf_append_cstr(out, CMP_PRUNE_MARK) {
+        return false;
+    }
+    const tail: &const byte = @ptr_from_usize(@usize_from_ptr(text as &const void) + tail_start) as &const byte;
+    return buf_append(out, tail, n - tail_start);
+}
+
+// 剪枝是否幂等：剪枝后的码点数必须 <= 阈值
+export fn cmp_prune_result_cps() usize {
+    return cmp_prune_head + bufx_utf8_count(CMP_PRUNE_MARK, bufx_cstr_len(CMP_PRUNE_MARK)) + cmp_prune_tail;
+}
+
+// ============================================================
+// 压力与阈值
+// ============================================================
+// DSH：thresholdRatio 默认 0.8（这里用千分数避免浮点）
+const CMP_THRESHOLD_PERMILLE: i64 = 800;
+const CMP_RETAIN_PERMILLE: i64 = 160;
+
+export fn cmp_pressure_limit(context_window: i64) i64 {
+    if context_window <= 0 {
+        return 0;
+    }
+    return (context_window * CMP_THRESHOLD_PERMILLE) / (1000 as i64);
+}
+
+// 保留多少条最近的原文（按字节比例估算，至少 2 条）
+fn cmp_retain_bytes(total_bytes: usize) usize {
+    var keep: usize = (total_bytes * (CMP_RETAIN_PERMILLE as usize)) / (1000 as usize);
+    if keep < 64 {
+        keep = 64;
+    }
+    return keep;
+}
+
+// 该压哪一段：从 system 之后开始，留下尾部 retain 比例；返回遮蔽条数（0 = 不用压）
+export fn cmp_shadow_count(h: &const History, last_prompt_tokens: i64) usize {
+    if h.len <= 3 {
+        return 0;
+    }
+    const keep: usize = cmp_retain_bytes(h.bytes);
+    var tail_bytes: usize = 0;
+    var i: usize = h.len;
+    if i > MSG_MAX {
+        i = MSG_MAX;
+    }
+    var keep_msgs: usize = 0;
+    while i > 1 && tail_bytes < keep {
+        const idx: usize = i - 1;
+        const m: &const Msg = msg_at(h, idx);
+        tail_bytes = tail_bytes + m.text_len + m.extra_len;
+        keep_msgs = keep_msgs + 1;
+        i = idx;
+    }
+    if keep_msgs < 2 {
+        keep_msgs = 2;
+    }
+    if h.len <= keep_msgs + 1 {
+        return 0;
+    }
+    const shadow: usize = h.len - keep_msgs - 1;   // 1 = system 那条
+    if shadow == 0 {
+        return 0;
+    }
+    // 不能把 assistant(tool_calls) 和它的 tool 结果拆开：向前收拢到边界
+    var s: usize = shadow;
+    // 往前收拢：不能把 assistant(tool_calls) 与它的 tool 结果拆开
+    while s + 1 < h.len && s + 1 < MSG_MAX {
+        const nxt: usize = s + 1;
+        if msg_at(h, nxt).role != ROLE_TOOL {
+            break;
+        }
+        s = nxt;
+    }
+    // 再往后收拢：保留段的开头不能是孤儿 tool 结果（它的 assistant 已被遮蔽）
+    while s < h.len && s < MSG_MAX {
+        if msg_at(h, s).role != ROLE_TOOL {
+            break;
+        }
+        s = s + 1;
+    }
+    if s > h.len {
+        s = h.len;
+    }
+    _ = last_prompt_tokens;
+    return s;
+}
+
+// ============================================================
+// 摘要提示词（DSH 原文的头部与小节结构；Rules 用等价表述）
+// ============================================================
+fn cmp_summary_prompt(out: &Buf) bool {
+    buf_reset(out);
+    const head: &const byte = "You are now acting as a compaction engine for this AI coding assistant. Condense the conversation ABOVE into a structured checkpoint that lets another model resume the work with no loss of essential context.\n\nOutput EXACTLY the Markdown structure below: keep every section, in order. Use terse bullets, not prose paragraphs. Write \"(none)\" for an empty section — never drop a section.\n\n";
+    if !buf_append_cstr(out, head) {
+        return false;
+    }
+    const sections: &const byte = "## Primary Request and Intent\n- (what the user asked for, verbatim where it matters)\n\n## Key Technical Concepts\n- (technologies, invariants, conventions)\n\n## Files and Code\n- (exact paths and the parts that matter)\n\n## Errors and Fixes\n- (what broke, why, and what fixed it)\n\n## Pending Jobs\n- (none)\n\n## Current Work\n- (what is being worked on right now)\n\n## Next Step\n- (the single next action)\n\n## Critical Context\n- (anything a resuming model must not lose)\n\n";
+    if !buf_append_cstr(out, sections) {
+        return false;
+    }
+    const rules: &const byte = "Rules:\n- Keep exact paths, commands, error strings, identifiers, numbers and syntax fragments.\n- Capture user feedback and corrections faithfully.\n- Do not mention this summarization request or that the context was compacted.\n- Output only the checkpoint text; call no tool.\n- If the conversation already contains a <compacted-summary> block, treat it as a PRIOR checkpoint to merge into your output rather than copying it verbatim.";
+    return buf_append_cstr(out, rules);
+}
+
+// 构造 checkpoint 消息正文（PREAMBLE + <compacted-summary>…</compacted-summary>）
+export fn cmp_build_checkpoint(summary: &const Buf, out: &Buf) bool {
+buf_reset(out);
+if summary.len == 0 {
+    return false;
+}
+if !buf_append_cstr(out, CHECKPOINT_PREAMBLE) {
+    return false;
+}
+if !buf_append_cstr(out, "\n\n<compacted-summary>\n") {
+    return false;
+}
+if !buf_append(out, summary.ptr, summary.len) {
+    return false;
+}
+return buf_append_cstr(out, "\n</compacted-summary>");
+}
+
+// ============================================================
+// 压缩：把被遮蔽的一段替换成 checkpoint 消息
+//
+// 返回 true = 已压缩（h 已被改写）
+// ============================================================
+export fn cmp_apply(h: &History, shadow: usize, summary: &const Buf) bool {
+    if shadow == 0 || summary.len == 0 {
+        return false;
+    }
+    // 摘要必须比被遮蔽的内容小（DSH 的硬规则）
+    var shadowed: usize = 0;
+    var i: usize = 0;
+    while i < shadow && i < MSG_MAX {
+        const it: &const Msg = msg_at(h, i);
+        shadowed = shadowed + it.text_len + it.extra_len;
+        i = i + 1;
+    }
+    if summary.len >= shadowed {
+        return false;
+    }
+
+// 组 checkpoint 消息
+    var msg: Buf = buf_new(summary.len + 512);
+    defer { buf_free(&msg); }
+    if !buf_append_cstr(&msg, CHECKPOINT_PREAMBLE) {
+        return false;
+    }
+    if !buf_append_cstr(&msg, "\n\n<compacted-summary>\n") {
+        return false;
+    }
+    if !buf_append(&msg, summary.ptr, summary.len) {
+        return false;
+    }
+    if !buf_append_cstr(&msg, "\n</compacted-summary>") {
+        return false;
+    }
+    // 释放被遮蔽的消息（含 system）并整体前移
+    var k: usize = 0;
+    while k < shadow && k < MSG_MAX {
+        msg_free_one(msg_at_mut(h, k));
+        k = k + 1;
+    }
+    var dst: usize = 0;
+    var src: usize = shadow;
+    while src < h.len && src < MSG_MAX && dst < MSG_MAX {
+        const sm: &Msg = msg_at_mut(h, src);
+        const dm: &Msg = msg_at_mut(h, dst);
+        dm[0] = sm[0];
+        dst = dst + 1;
+        src = src + 1;
+    }
+    h.len = dst;
+    // 头部插回：system 原文 + checkpoint
+    const saved_system: usize = 0;
+    _ = saved_system;
+    return true;
+}
+
+// 压缩后的历史重建：system 单独保留（由调用方重新 push），这里只负责把
+// checkpoint 放到最前面。
+export fn cmp_prepend_checkpoint(h: &History, summary: &const Buf) bool {
+    if summary.len == 0 || h.len >= MSG_MAX {
+        return false;
+    }
+    var msg: Buf = buf_new(summary.len + 512);
+    defer { buf_free(&msg); }
+    if !buf_append_cstr(&msg, CHECKPOINT_PREAMBLE) {
+        return false;
+    }
+    if !buf_append_cstr(&msg, "\n\n<compacted-summary>\n") {
+        return false;
+    }
+    if !buf_append(&msg, summary.ptr, summary.len) {
+        return false;
+    }
+    if !buf_append_cstr(&msg, "\n</compacted-summary>") {
+        return false;
+    }
+    // 整体后移一格，插到 system 之后
+    var i: usize = h.len;
+    if i > MSG_MAX - 1 {
+        return false;
+    }
+    while i > 1 {
+        const cur: usize = i;
+        const prev: usize = i - 1;
+        const cm: &Msg = msg_at_mut(h, cur);
+        const pm: &Msg = msg_at_mut(h, prev);
+        cm[0] = pm[0];
+        i = prev;
+    }
+    const slot: &Msg = msg_at_mut(h, 1);
+    slot.role = ROLE_USER;
+    slot.text = hist_dup(msg.ptr as &const byte, msg.len);
+    if (slot.text as usize) == 0 {
+        return false;
+    }
+    slot.text_len = msg.len;
+    slot.extra = null;
+    slot.extra_len = 0;
+    h.len = h.len + 1;
+    h.bytes = h.bytes + msg.len;
+    return true;
+}

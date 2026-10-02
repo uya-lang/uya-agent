@@ -450,6 +450,19 @@ fn hist_drop_oldest(h: &History) bool {
     return true;
 }
 
+// 固定数组的安全取址：把「下标证明」换成指针运算（编译器对复合条件的证明很挑）
+export fn msg_at(h: &const History, i: usize) &const Msg {
+    const base: &const Msg = &h.items[0];
+    const esz: usize = @size_of(Msg) as usize;
+    return @ptr_from_usize(@usize_from_ptr(base as &const void) + i * esz) as &const Msg;
+}
+
+export fn msg_at_mut(h: &History, i: usize) &Msg {
+    const base: &Msg = &h.items[0];
+    const esz: usize = @size_of(Msg) as usize;
+    return @ptr_from_usize(@usize_from_ptr(base as &void) + i * esz) as &Msg;
+}
+
 fn role_cstr(role: u8) &byte {
     if role == ROLE_SYSTEM {
         return "system" as &byte;
@@ -491,6 +504,9 @@ var g_home: Buf = Buf{ ptr: null, len: 0, cap: 0 };
 var g_turn: i32 = 0;
 var g_tools_scratch: Buf = Buf{ ptr: null, len: 0, cap: 0 };
 var g_jobs: JobTable = JobTable{ items: [], next_id: 1 };
+// P9：最近一次请求的 prompt_tokens（压力口径）与压缩开关
+var g_last_prompt_tokens: i64 = 0;
+var g_compact_enabled: bool = true;
 
 export fn agent_set_home(home: &const byte) bool {
     buf_free(&g_home);
@@ -1103,25 +1119,34 @@ fn build_chat_request(cfg: &const Config, h: &const History, out: &Buf) bool {
         }
         jw_byte(&w, 123);
         jw_key(&w, "role");
-        jw_str_cstr(&w, role_cstr(h.items[i].role));
+        jw_str_cstr(&w, role_cstr(msg_at(h, i).role));
         jw_byte(&w, 44);
         jw_key(&w, "content");
-        if h.items[i].text_len > 0 {
-            jw_str(&w, h.items[i].text, h.items[i].text_len);
+        const m_txt_len: usize = msg_at(h, i).text_len;
+        if m_txt_len > 0 {
+            const m_txt: &byte = msg_at(h, i).text;
+            // P9：工具结果过大时在**构请求**这一层剪掉中段（历史保持不变，天然幂等）
+            var pruned: Buf = buf_empty();
+            defer { buf_free(&pruned); }
+            if msg_at(h, i).role == ROLE_TOOL && cmp_maybe_prune(m_txt as &const byte, m_txt_len, &pruned) {
+                jw_str(&w, pruned.ptr, pruned.len);
+            } else {
+                jw_str(&w, m_txt, m_txt_len);
+            }
         } else {
             // DSH：只有工具调用时 content 是空串（不是 null）
             jw_str_cstr(&w, "");
         }
-        if h.items[i].role == ROLE_ASSISTANT_CALLS && h.items[i].extra_len > 0 {
+        if msg_at(h, i).role == ROLE_ASSISTANT_CALLS && msg_at(h, i).extra_len > 0 {
             jw_byte(&w, 44);
             jw_key(&w, "tool_calls");
             // extra 是已经序列化好的 tool_calls 数组原文，直接内联，绝不二次转义
-            jw_raw(&w, h.items[i].extra as &const byte, h.items[i].extra_len);
+            jw_raw(&w, msg_at(h, i).extra as &const byte, msg_at(h, i).extra_len);
         }
-        if h.items[i].role == ROLE_TOOL && h.items[i].extra_len > 0 {
+        if msg_at(h, i).role == ROLE_TOOL && msg_at(h, i).extra_len > 0 {
             jw_byte(&w, 44);
             jw_key(&w, "tool_call_id");
-            jw_str(&w, h.items[i].extra, h.items[i].extra_len);
+            jw_str(&w, msg_at(h, i).extra, msg_at(h, i).extra_len);
         }
         jw_byte(&w, 125);
         i = i + 1;
@@ -1518,6 +1543,8 @@ fn agent_step_stream(cfg: &const Config, url: &const Buf, hdrs: &const Buf, req:
 
 // 一步收尾（流式/非流式共用）：usage、finish 语义、工具派发、最终回答。
 fn agent_finish_step(cfg: &const Config, arena: &Arena, h: &History, step: i32, o: &const ChatOut) i32 {
+    // P9：记下这次请求的 prompt_tokens，作为下一次压缩判定的压力口径
+    g_last_prompt_tokens = o.usage_in + o.usage_cache_read;
     if cfg.show_usage {
         print_usage_line(o);
     }
@@ -1717,6 +1744,10 @@ fn agent_turn_loop_inner(cfg: &const Config, h: &History) i32 {
         step = step + 1;
         // DSH steer 语义：step 边界领取「运行期间用户敲进来的输入」，作为普通 user 消息
         agent_claim_steer(cfg, h);
+        // P9：step 边界测压，必要时压缩上下文（DSH 也是在 request derivation 之前做）
+        if g_compact_enabled {
+            _ = agent_maybe_compact(cfg, h, step, false);
+        }
         if g_sess.save {
             var sev: Buf = buf_new(96);
             defer { buf_free(&sev); }
@@ -2063,6 +2094,174 @@ export fn agent_workspace_set_cwd(cfg: &Config) bool {
     return buf_append(&cfg.workspace, &storage[0], n);
 }
 
+// ============================================================
+// P9：自动压缩
+//
+// 压力 = 最近一次响应的 prompt_tokens（DSH tokenMeter 的口径）；没有就按字节/4 估。
+// 超过 floor(contextWindow × 0.8) 时：调一次模型做 checkpoint，然后
+//   system 原文保留 + checkpoint 消息插在其后 + 尾部最近一段原文保留。
+// ============================================================
+fn agent_pressure_tokens(cfg: &const Config, h: &const History) i64 {
+    if g_last_prompt_tokens > 0 {
+        return g_last_prompt_tokens;
+    }
+    // 估算：请求体大致是历史 + tools + system
+    var est: i64 = 0;
+    var i: usize = 0;
+    while i < h.len && i < MSG_MAX {
+        const m: &const Msg = msg_at(h, i);
+        est = est + ((m.text_len + m.extra_len) as i64) / 4;
+        i = i + 1;
+    }
+    _ = cfg;
+    return est;
+}
+
+// force=true 时忽略阈值（/compact 手动触发）
+fn agent_maybe_compact(cfg: &const Config, h: &History, step: i32, force: bool) bool {
+    const cw: i64 = cfg.context_window;
+    if cw <= 0 {
+        return false;
+    }
+    const limit: i64 = cmp_pressure_limit(cw);
+    const pressure: i64 = agent_pressure_tokens(cfg, h);
+    if !force && pressure < limit {
+        return false;
+    }
+    const shadow: usize = cmp_shadow_count(h, pressure);
+    if shadow == 0 {
+        return false;
+    }
+    // 组摘要请求：历史副本 + 摘要提示词（DSH 把提示词作为最后一条 user 消息）
+    var tmp: History = hist_init();
+    defer { hist_free(&tmp); }
+    var i: usize = 0;
+    while i < h.len && i < MSG_MAX {
+        const m: &const Msg = msg_at(h, i);
+        _ = hist_push_msg(&tmp, m.role, m.text as &const byte, m.text_len, m.extra as &const byte, m.extra_len);
+        i = i + 1;
+    }
+    var prompt: Buf = buf_new(8192);
+    defer { buf_free(&prompt); }
+    if !cmp_summary_prompt(&prompt) {
+        return false;
+    }
+    if !hist_push(&tmp, ROLE_USER, prompt.ptr as &const byte, prompt.len) {
+        return false;
+    }
+    var req: Buf = buf_new(request_bytes_needed(&tmp, cfg));
+    defer { buf_free(&req); }
+    if !build_chat_request(cfg, &tmp, &req) {
+        return false;
+    }
+    var url: Buf = chat_url(cfg);
+    defer { buf_free(&url); }
+    var hdrs: Buf = buf_new(512);
+    defer { buf_free(&hdrs); }
+    if !build_headers(cfg, &hdrs) {
+        return false;
+    }
+    var o: ChatOut = chat_out_new();
+    defer { chat_out_free(&o); }
+    var tc: TlsConn = tls_conn_empty();
+    var guard: FdGuard = FdGuard{ saved: -1, nullfd: -1, active: false };
+    tls_noise_mute(&guard, !cfg.tls_debug && !hc_debug);
+    const res: !i32 = llm_stream_chat(
+        url.ptr[0: url.len],
+        hdrs.ptr[0: hdrs.len],
+        req.ptr as &const byte,
+        req.len,
+        cfg.timeout_ms,
+        cfg.max_response,
+        cfg.verify,
+        cfg.pin.ptr[0: cfg.pin.len],
+        &o,
+        false,
+        false,
+        false
+    );
+    tls_noise_unmute(&guard);
+    var status: i32 = 0;
+    status = res catch |err| {
+        _ = err;
+        0;
+    };
+    if status != 200 || o.content.len == 0 {
+        if !cfg.quiet {
+            out_err("[compact] 摘要请求失败，跳过本次压缩\n");
+        }
+        return false;
+    }
+    // 应用：先算被遮蔽内容的字节数（cmp_apply 会用），再改写历史
+    if !cmp_apply(h, shadow, &o.content) {
+        if !cfg.quiet {
+            out_err("[compact] 摘要不比被遮蔽内容短，放弃压缩\n");
+        }
+        return false;
+    }
+    // cmp_apply 从 0 开始遮蔽，把 system 也清掉了：这里补回
+    //   [system 原文] + [checkpoint 消息] + [保留的尾部]
+    var ck: Buf = buf_new(o.content.len + 512);
+    defer { buf_free(&ck); }
+    if cmp_build_checkpoint(&o.content, &ck) {
+        // 先插 checkpoint 到 0，再把 system 插到 0 → 顺序就是 system, checkpoint, …
+        _ = hist_insert_at(h, 0, ROLE_USER, ck.ptr as &const byte, ck.len, null, 0);
+        var sp: Buf = buf_new(32768);
+        defer { buf_free(&sp); }
+        if agent_system_prompt(cfg, &sp) {
+            _ = hist_insert_at(h, 0, ROLE_SYSTEM, sp.ptr as &const byte, sp.len, null, 0);
+        }
+    }
+    if !cfg.quiet {
+        out_err("[compact] 已压缩较早的 ");
+        out_err_dec(shadow);
+        out_err(" 条消息（pressure=");
+        out_err_dec(pressure as usize);
+        out_err(" limit=");
+        out_err_dec(limit as usize);
+        out_err("）\n");
+    }
+    agent_log_simple("compaction/summary", "{\"kind\":\"auto\"}");
+    g_last_prompt_tokens = 0;
+    _ = step;
+    return true;
+}
+
+// 在 idx 处插入一条消息（其余后移）
+fn hist_insert_at(h: &History, idx: usize, role: u8, text: &const byte, text_len: usize, extra: &const byte, extra_len: usize) bool {
+    if h.len >= MSG_MAX || idx > h.len {
+        return false;
+    }
+    var i: usize = h.len;
+    while i > idx {
+        const cur: usize = i;
+        const prev: usize = i - 1;
+        const cm: &Msg = msg_at_mut(h, cur);
+        const pm: &Msg = msg_at_mut(h, prev);
+        cm[0] = pm[0];
+        i = prev;
+    }
+    const slot: &Msg = msg_at_mut(h, idx);
+    slot[0] = Msg{ role: role, text: null, text_len: 0, extra: null, extra_len: 0 };
+    if text_len > 0 {
+        slot.text = hist_dup(text, text_len);
+        if (slot.text as usize) == 0 {
+            return false;
+        }
+    }
+    slot.text_len = text_len;
+    if extra_len > 0 {
+        slot.extra = hist_dup(extra, extra_len);
+        if (slot.extra as usize) == 0 {
+            return false;
+        }
+    }
+    slot.extra_len = extra_len;
+    h.len = h.len + 1;
+    h.bytes = h.bytes + text_len + extra_len;
+    return true;
+}
+
 fn agent_run(cfg: &const Config) i32 {
     if cfg.api_key.len == 0 {
         out_err("error: no API key. set UYA_AGENT_API_KEY / DEEPSEEK_API_KEY / OPENAI_API_KEY\n");
@@ -2117,6 +2316,8 @@ fn print_usage() void {
     out_err("  --strict-dsh-config 读不到 DSH 设置就报错退出\n");
     out_err("  --print-config      打印生效配置与来源后退出\n");
     out_err("  --plan              以 plan 模式启动（先出计划再执行）\n");
+    out_err("  --no-compact        关闭自动上下文压缩\n");
+    out_err("  --context-window N  压缩判定的上下文窗口（默认取 DSH 模型条目）\n");
     out_err("  --dsh-root DIR      packaged preset 根（读 persona/plan 文案）\n");
     out_err("  --tls-verify=MODE   chain（默认）| pin | none\n");
     out_err("  --tls-pin HEX       pin 模式下要求的 leaf 证书 SHA-256（小写 hex）\n");
@@ -2261,6 +2462,7 @@ fn agent_repl_help() void {
     tty_puts(&tty_ui, 2, "  /help      显示本帮助\n");
     tty_puts(&tty_ui, 2, "  /continue  不再输入新内容，带着历史再跑一轮\n");
     tty_puts(&tty_ui, 2, "  /status    打印当前配置与历史条数\n");
+    tty_puts(&tty_ui, 2, "  /compact   立即压缩上下文\n");
     tty_puts(&tty_ui, 2, "  /plan      切换 plan 模式\n");
     tty_puts(&tty_ui, 2, "  /sessions  列出本机会话\n");
     tty_puts(&tty_ui, 2, "  /resume ID 切换到指定会话（id 或 last）\n");
@@ -2333,6 +2535,15 @@ fn agent_repl_command(cfg: &Config, h: &History, line: &const Buf) bool {
         const rc: i32 = agent_turn_loop(cfg, h);
         if rc != AGENT_OK && rc != AGENT_INTERRUPTED {
             tty_puts(&tty_ui, 2, "[turn] 本回合异常结束（可直接输入继续）\n");
+        }
+        return false;
+    }
+    if sv_eq_cstr(line, "/compact") {
+        const did: bool = agent_maybe_compact(cfg, h, 0, true);
+        if did {
+            tty_puts(&tty_ui, 2, "[compact] 完成\n");
+        } else {
+            tty_puts(&tty_ui, 2, "[compact] 没有可压缩的内容（或摘要请求失败）\n");
         }
         return false;
     }
@@ -2930,6 +3141,14 @@ export fn main() i32 {
             cfg.strict_dsh_config = true;
         } else if arg_eq(p, "--print-config") {
             cfg.print_config = true;
+        } else if arg_eq(p, "--no-compact") {
+            g_compact_enabled = false;
+        } else if arg_eq(p, "--context-window") {
+            i = i + 1;
+            if i < get_argc() {
+                cfg.context_window = parse_i32_arg(get_argv(i), 0) as i64;
+                cfg.src_context = 3;
+            }
         } else if arg_eq(p, "--dry-run") {
             cfg.dry_run = true;
         } else if arg_eq(p, "--plan") {
