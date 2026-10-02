@@ -37,6 +37,9 @@ var mock_expect_resp: bool = false;
 // 提供方读数，进而改变自动压缩的触发时机（compact-auto / responses-compact / workflow
 // 那几轮都会跟着变）。所以只给 stats-usage 这一轮开。
 var mock_usage_on: bool = false;
+// P23：SSE 两段 chunk 之间的停顿（纳秒）。默认 0 = 一次写完；tui-cmd 那轮要一个
+// 「回合还活着」的窗口，好让父进程在回合运行中往 PTY 里敲 /status。
+var mock_sse_gap_ns: i64 = 0;
 
 // 供自测断言用的 lflag 位（与 tty.uya 内部常量一致）
 const TTY_LFLAG_TEST_ISIG: u32 = 0x0001;
@@ -814,7 +817,11 @@ fn mock_send_sse_nodone(cfd: i32, body: &const Buf) bool {
     return true;
 }
 
-// 以 SSE（chunked，两段 chunk）回一个完整响应体
+// 以 SSE（chunked，两段 chunk）回一个完整响应体。
+//
+// P21：两段之间**故意停 10ms**（分两次写，不再攒成一个包）—— 否则客户端在同一毫秒里
+// 解析完整个流，「首 token → 消息组装」的解码窗口恒为 0，`st_decode_ms() > 0` 这条
+// 断言就没法确定性地成立（真实网关是渐进流式的，见 README 的偏差段）。
 fn mock_send_sse(cfd: i32, body: &const Buf) bool {
     var text: Buf = buf_new(8192);
     defer { buf_free(&text); }
@@ -834,16 +841,45 @@ fn mock_send_sse(cfd: i32, body: &const Buf) bool {
     var head: Buf = buf_new(256);
     defer { buf_free(&head); }
     _ = buf_append_cstr(&head, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n");
-    const half: usize = text.len / 2;
+    // P23：先停一下再发第一段 —— 父进程就靠这个窗口在「回合还在跑」的时候敲键，
+    // 而且这一段里一个答案字节都没有，所以「浮层比最终答案先出现」是可判定的。
+    // 注意 tv_nsec 必须 < 1e9（直接塞 1.2e9 会 EINVAL，等于没停）。
+    if mock_sse_gap_ns > 0 {
+        const gap: i64 = mock_sse_gap_ns;
+        var ts: TimeSpec = TimeSpec{ tv_sec: gap / (1000000000 as i64),
+            tv_nsec: gap % (1000000000 as i64) };
+        var rem: TimeSpec = TimeSpec{ tv_sec: 0, tv_nsec: 0 };
+        _ = sys_nanosleep(&ts, &rem) catch {};
+    }
+    // 切点放在**第一帧结束处**（`\n\n`）：第一段必须已经带着首个 delta。
+    // 砍在 JSON 中间的话首个 delta 会和 [DONE] 一起到，解码窗口又变成 0（踩过）
+    var half: usize = text.len / 2;
+    const nl: &const byte = "\n\n" as &const byte;
+    const fe: isize = find_sub(text.ptr[0: text.len], nl[0: 2], 0);
+    if fe >= 0 {
+        const cut: usize = (fe as usize) + 2;
+        if cut > 0 && cut < text.len {
+            half = cut;
+        }
+    }
     _ = buf_append_u64_hex(&head, half);
     _ = buf_append_cstr(&head, "\r\n");
     _ = buf_append(&head, text.ptr, half);
     _ = buf_append_cstr(&head, "\r\n");
-    _ = buf_append_u64_hex(&head, text.len - half);
-    _ = buf_append_cstr(&head, "\r\n");
-    _ = buf_append(&head, &text.ptr[half], text.len - half);
-    _ = buf_append_cstr(&head, "\r\n0\r\n\r\n");
     https_write_all(cfd, &head.ptr[0] as &const byte, head.len) catch {
+        return false;
+    };
+    var req: TimeSpec = TimeSpec{ tv_sec: 0, tv_nsec: MOCK_SSE_GAP_NS };
+    var rem: TimeSpec = TimeSpec{ tv_sec: 0, tv_nsec: 0 };
+    _ = sys_nanosleep(&req, &rem) catch {};
+
+    var tail: Buf = buf_new(256);
+    defer { buf_free(&tail); }
+    _ = buf_append_u64_hex(&tail, text.len - half);
+    _ = buf_append_cstr(&tail, "\r\n");
+    _ = buf_append(&tail, &text.ptr[half], text.len - half);
+    _ = buf_append_cstr(&tail, "\r\n0\r\n\r\n");
+    https_write_all(cfd, &tail.ptr[0] as &const byte, tail.len) catch {
         return false;
     };
     return true;
@@ -3258,6 +3294,10 @@ const SSE_CASE_TOOLS: i32 = 1;
 const SSE_CASE_NODONE: i32 = 2;
 const SSE_CASE_BADJSON: i32 = 3;
 const SSE_CASE_REASONING_LENGTH: i32 = 4;
+// P24：首 token 打点的三条边界（见 llm_note_first_token）
+const SSE_CASE_REASONING_ONLY: i32 = 5;   // 只有思考 delta → 必须打点（旧口径不打 → tok/s 永远空）
+const SSE_CASE_CALLONLY: i32 = 6;         // 只有工具参数 → 必须打点
+const SSE_CASE_NODELTA: i32 = 7;          // 空串 delta + usage-only → 不许打点
 
 // 写出的切片大小与间隔：小到必然把 SSE 帧切碎
 const SSE_SLICE: usize = 19;
@@ -3272,6 +3312,9 @@ fn sse_eq(p: &const byte, n: usize, lit: &const byte) bool {
 fn sse_buf_eq(b: &const Buf, lit: &const byte) bool {
     return sse_eq(b.ptr as &const byte, b.len, lit);
 }
+
+// 返回同一个响应体时，两段 chunk 之间的间隔（P21：见 mock_send_sse）
+const MOCK_SSE_GAP_NS: i64 = 10000000;
 
 // 把 writer 写好的 payload 当作一帧 data 追加到 out
 fn sse_emit(out: &Buf, w: &const JsonWriter, payload: &Buf) bool {
@@ -3464,6 +3507,26 @@ fn sse_mock_text(case_id: i32, out: &Buf, payload: &Buf) bool {
     if case_id == SSE_CASE_BADJSON {
         if !sse_delta_text(out, payload, "before-bad", false) { return false; }
         if !sse_raw_frame(out, "{\"choices\":[{\"index\":0,") { return false; }
+        return sse_raw_frame(out, "[DONE]");
+    }
+    // SSE_CASE_REASONING_ONLY（P21）：只有思考增量，没有任何正文
+    if case_id == SSE_CASE_REASONING_ONLY {
+        if !sse_delta_text(out, payload, "think1", true) { return false; }
+        if !sse_delta_text(out, payload, "think2", true) { return false; }
+        if !sse_finish(out, payload, "stop", true) { return false; }
+        return sse_raw_frame(out, "[DONE]");
+    }
+    // SSE_CASE_CALLONLY（P21）：只有工具调用参数，没有正文、没有思考
+    if case_id == SSE_CASE_CALLONLY {
+        if !sse_delta_tool(out, payload, 0, "call_c", "read", "{\"file_path\":\"a.txt\"}") { return false; }
+        if !sse_finish(out, payload, "tool_calls", true) { return false; }
+        return sse_raw_frame(out, "[DONE]");
+    }
+    // SSE_CASE_NODELTA（P21）：空串 delta + usage-only + finish(delta{}) —— 一个增量都没有
+    if case_id == SSE_CASE_NODELTA {
+        if !sse_delta_text(out, payload, "", false) { return false; }
+        if !sse_usage_only(out, payload) { return false; }
+        if !sse_finish(out, payload, "stop", false) { return false; }
         return sse_raw_frame(out, "[DONE]");
     }
     // SSE_CASE_REASONING_LENGTH
@@ -3684,6 +3747,9 @@ fn sse_round(case_id: i32, tag: &const byte) bool {
             out_err("] FAIL: unexpected tool_calls");
             out_err("\n");
             ok = false;
+        } else if o.first_token_ms <= 0 {
+            // P21：开头那帧空串 delta 不算，但随后那帧真正文必须打点
+            ty_fail(tag, "首个非空正文 delta 之后首 token 没打点", &ok);
         }
     } else if ok && case_id == SSE_CASE_TOOLS {
         if call_rc != 0 || !o.saw_done || o.finish != LLM_FINISH_TOOL_CALLS {
@@ -3780,6 +3846,36 @@ fn sse_round(case_id: i32, tag: &const byte) bool {
             out_err("] FAIL: finish != max-tokens");
             out_err("\n");
             ok = false;
+        }
+    } else if ok && case_id == SSE_CASE_REASONING_ONLY {
+        if call_rc != 0 || !o.saw_done {
+            ty_fail(tag, "只有思考 delta 的流没有正常收尾", &ok);
+        } else if o.content.len != 0 {
+            ty_fail(tag, "只有思考 delta 时不该攒出正文", &ok);
+        } else if !sse_buf_eq(&o.reasoning, "think1think2") {
+            ty_fail(tag, "思考增量没拼全", &ok);
+        } else if o.first_token_ms <= 0 {
+            ty_fail(tag, "只有思考 delta 时首 token 没打点（ttft/解码那一组会整组空着）", &ok);
+        }
+    } else if ok && case_id == SSE_CASE_CALLONLY {
+        if call_rc != 0 || !o.saw_done {
+            ty_fail(tag, "只有工具参数的流没有正常收尾", &ok);
+        } else if o.content.len != 0 || o.ncalls != 1 {
+            ty_fail(tag, "只有工具参数时的 content/ncalls 不对", &ok);
+        } else if !sse_buf_eq(&o.calls[0].name, "read") || !sse_buf_eq(&o.calls[0].args, "{\"file_path\":\"a.txt\"}") {
+            ty_fail(tag, "工具调用参数没拼全", &ok);
+        } else if o.first_token_ms <= 0 {
+            ty_fail(tag, "只有工具参数时首 token 没打点（解码窗口只盖住生成尾部 → tok/s 爆表）", &ok);
+        }
+    } else if ok && case_id == SSE_CASE_NODELTA {
+        if call_rc != 0 || !o.saw_done {
+            ty_fail(tag, "没有增量帧的流没有正常收尾", &ok);
+        } else if o.content.len != 0 || o.reasoning.len != 0 || o.ncalls != 0 {
+            ty_fail(tag, "空 delta 不该攒出任何内容", &ok);
+        } else if o.usage_out != 7 {
+            ty_fail(tag, "usage-only 帧的用量没解析出来", &ok);
+        } else if o.first_token_ms != 0 {
+            ty_fail(tag, "空串 delta / usage-only 帧被当成首 token 了（窗口会从 0 起算）", &ok);
         }
     }
 
@@ -7842,6 +7938,9 @@ const RESP_CASE_NOTERMINAL: i32 = 6;
 const RESP_CASE_DONEFRAME: i32 = 7;
 const RESP_CASE_CHATSHAPE: i32 = 8;
 const RESP_CASE_BADJSON: i32 = 9;
+// P24：首 token 打点的两条边界（responses 路径）
+const RESP_CASE_REASONING_ONLY: i32 = 10;   // 只有 reasoning delta → 必须打点
+const RESP_CASE_CALLONLY: i32 = 11;         // 只有 function_call_arguments delta → 必须打点
 
 var resp_case: i32 = 0;
 
@@ -7988,6 +8087,34 @@ fn resp_case_chatshape(out: &Buf) bool {
     return resp_data(out, "[DONE]");
 }
 
+// P21：只有思考增量（没有任何正文、没有工具调用）
+fn resp_case_reasoning_only(out: &Buf) bool {
+    if !resp_data(out, `{"type":"response.output_item.added","output_index":0,"item":{"type":"reasoning","id":"rs_r","summary":[]}}`) {
+        return false;
+    }
+    if !resp_data(out, `{"type":"response.reasoning_summary_text.delta","output_index":0,"delta":"think1"}`) {
+        return false;
+    }
+    if !resp_data(out, `{"type":"response.reasoning_summary_text.delta","output_index":0,"delta":"think2"}`) {
+        return false;
+    }
+    return resp_data(out, `{"type":"response.completed","response":{"id":"resp_r","status":"completed","output":[],"usage":{"input_tokens":20,"output_tokens":6}}}`);
+}
+
+// P21：只有工具调用参数（没有正文、没有思考）
+fn resp_case_callonly(out: &Buf) bool {
+    if !resp_data(out, `{"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","id":"fc_c","call_id":"call_c","name":"read","arguments":""}}`) {
+        return false;
+    }
+    if !resp_data(out, `{"type":"response.function_call_arguments.delta","output_index":0,"item_id":"fc_c","delta":"{\"file_path\":\"c.txt\"}"}`) {
+        return false;
+    }
+    if !resp_data(out, `{"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","id":"fc_c","call_id":"call_c","name":"read","arguments":"{\"file_path\":\"c.txt\"}"}}`) {
+        return false;
+    }
+    return resp_data(out, `{"type":"response.completed","response":{"id":"resp_c","status":"completed","output":[],"usage":{"input_tokens":20,"output_tokens":5}}}`);
+}
+
 fn resp_case_badjson(out: &Buf) bool {
     if !resp_data(out, `{"type":"response.output_text.delta","output_index":0,"delta":"before-bad"}`) {
         return false;
@@ -8022,6 +8149,12 @@ fn resp_mock_text(case_id: i32, out: &Buf) bool {
     }
     if case_id == RESP_CASE_CHATSHAPE {
         return resp_case_chatshape(out);
+    }
+    if case_id == RESP_CASE_REASONING_ONLY {
+        return resp_case_reasoning_only(out);
+    }
+    if case_id == RESP_CASE_CALLONLY {
+        return resp_case_callonly(out);
     }
     return resp_case_badjson(out);
 }
@@ -8281,6 +8414,26 @@ fn resp_round(case_id: i32, tag: &const byte) bool {
             ty_fail(tag, "坏帧之前的内容不该丢", &ok);
         } else if o.err_text.len == 0 {
             ty_fail(tag, "坏帧的 payload 头部应当留在 err_text", &ok);
+        }
+    } else if ok && case_id == RESP_CASE_REASONING_ONLY {
+        if call_rc != 0 || !o.saw_done || o.finish != LLM_FINISH_STOP {
+            ty_fail(tag, "只有 reasoning delta 的流没有正常收尾", &ok);
+        } else if o.content.len != 0 {
+            ty_fail(tag, "只有 reasoning delta 时不该攒出正文", &ok);
+        } else if !sse_buf_eq(&o.reasoning, "think1think2") {
+            ty_fail(tag, "reasoning 增量没拼全", &ok);
+        } else if o.first_token_ms <= 0 {
+            ty_fail(tag, "只有 reasoning delta 时首 token 没打点（ttft/解码那一组会整组空着）", &ok);
+        }
+    } else if ok && case_id == RESP_CASE_CALLONLY {
+        if call_rc != 0 || !o.saw_done || o.finish != LLM_FINISH_TOOL_CALLS {
+            ty_fail(tag, "只有工具参数增量的流没有正常收尾", &ok);
+        } else if o.content.len != 0 || o.ncalls != 1 {
+            ty_fail(tag, "只有工具参数时的 content/ncalls 不对", &ok);
+        } else if !sse_buf_eq(&o.calls[0].args, "{\"file_path\":\"c.txt\"}") {
+            ty_fail(tag, "工具参数增量没拼全", &ok);
+        } else if o.first_token_ms <= 0 {
+            ty_fail(tag, "只有工具参数增量时首 token 没打点（tok/s 会爆表）", &ok);
         }
     }
 
@@ -9270,7 +9423,7 @@ fn perm_modes_round(tag: &const byte) bool {
 // 这一组轮次钉住三件事：
 //   1) 渲染逐字对齐 DSH（stats-format / stats-line）；
 //   2) 实时喂养与日志回放（= resume 走的那条路）数字逐位相同（stats-fold / stats-log）；
-//   3) 上下文占用与 %cpu 的口径（stats-context / procx-parse / procx-percent / cpu-live）。
+//   3) 上下文占用与 cpu/内存 的口径（stats-context / procx-parse / procx-percent / procx-mem / cpu-live）。
 // ============================================================
 
 fn stx_eq(tag: &const byte, what: &const byte, got: &const Buf, want: &const byte, ok: &bool) void {
@@ -9922,8 +10075,11 @@ fn stats_context_round(tag: &const byte) bool {
     if !contains(&det, "--- 上下文") || !contains(&det, "上下文已用") {
         ty_fail(tag, "/status 里没有上下文块", &ok);
     }
-    if !contains(&det, "--- 进程") || !contains(&det, "%cpu") {
-        ty_fail(tag, "/status 里没有 %cpu 块", &ok);
+    if !contains(&det, "--- 进程") || !contains(&det, "cpu         ") {
+        ty_fail(tag, "/status 里没有 cpu 块", &ok);
+    }
+    if !contains(&det, "内存        ") {
+        ty_fail(tag, "/status 里没有内存块", &ok);
     }
     if !contains(&det, "version" as &const byte)
         || !contains(&det, &AGENT_VERSION[0]) {
@@ -9978,6 +10134,10 @@ fn stats_log_round(tag: &const byte, home: &const byte, ws: &const byte) bool {
     }
     if st_ttft_steps() <= 0 {
         ty_fail(tag, "一条首 token 都没记到（流式路径没打点？）", &ok);
+    }
+    // P24：解码窗口必须真的有值（mock 的两段 chunk 之间停了 10ms，所以 > 0 是确定性的）
+    if st_decode_ms() <= 0 || st_decode_tokens() <= 0 {
+        ty_fail(tag, "解码窗口是空的（统计行的 tok/s 会整组不显示）", &ok);
     }
     if !st_have_pressure() {
         ty_fail(tag, "没有压力样本（assistant/message 的 usage 没进折叠？）", &ok);
@@ -10226,12 +10386,95 @@ fn procx_percent_round(tag: &const byte) bool {
     return ok;
 }
 
+// 内存显示的逐字节断言（kb → 期望文本）
+fn procx_mem_fmt_is(tag: &const byte, out: &Buf, kb: i64, want: &const byte, ok: &bool) void {
+    buf_reset(out);
+    if !procx_fmt_mem_kb(out, kb) {
+        ty_fail(tag, "内存显示不该失败", ok);
+        return;
+    }
+    if !sse_buf_eq(out, want) {
+        ty_fail(tag, "内存显示不对", ok);
+        out_err("[mem] ");
+        out_err_bytes(out.ptr as &const byte, out.len);
+        out_err("\n");
+    }
+}
+
+// P24：内存行的解析与显示（纯函数，逐字节）
+fn procx_mem_round(tag: &const byte) bool {
+    var ok: bool = true;
+    var kb: i64 = 0;
+
+    // smaps_rollup 的形状：`[rollup]` 头 + Rss/Pss/Pss_Dirty；
+    // 只认**行首**的标签，所以 `Pss_Dirty:` 不会被当成 `Pss:`
+    var roll: Buf = buf_new(512);
+    defer { buf_free(&roll); }
+    _ = buf_append_cstr(&roll, "556a1cc96000-7fff9c3a0000 ---p 00000000 00:00 0                          [rollup]\nRss:                7900 kB\nPss:                6640 kB\nPss_Dirty:          5196 kB\n");
+    if !procx_find_kb(roll.ptr[0: roll.len], "Pss:" as &const byte, &kb) || kb != 6640 {
+        ty_fail(tag, "smaps_rollup 的 Pss 没解析对（或吃到了 Pss_Dirty）", &ok);
+    }
+    if !procx_find_kb(roll.ptr[0: roll.len], "Rss:" as &const byte, &kb) || kb != 7900 {
+        ty_fail(tag, "smaps_rollup 的 Rss 没解析对", &ok);
+    }
+    // status 的形状：制表符分隔 + 前导空格
+    var stt: Buf = buf_new(256);
+    defer { buf_free(&stt); }
+    _ = buf_append_cstr(&stt, "Name:\tuya-agent\nVmPeak:\t   21428 kB\nVmRSS:\t    7900 kB\n");
+    if !procx_find_kb(stt.ptr[0: stt.len], "VmRSS:" as &const byte, &kb) || kb != 7900 {
+        ty_fail(tag, "status 里的 VmRSS（制表符）没解析对", &ok);
+    }
+    // 非行首 / 标签后没有数字 / 空文本 → false，且 out 归 0（不能留下上一次的值）
+    kb = 12345;
+    if procx_find_kb(stt.ptr[0: stt.len], "mRSS:" as &const byte, &kb) || kb != 0 {
+        ty_fail(tag, "非行首的标签不该匹配", &ok);
+    }
+    var bad: Buf = buf_new(64);
+    defer { buf_free(&bad); }
+    _ = buf_append_cstr(&bad, "Pss:\n");
+    kb = 12345;
+    if procx_find_kb(bad.ptr[0: bad.len], "Pss:" as &const byte, &kb) || kb != 0 {
+        ty_fail(tag, "标签后面没有数字时不该给值", &ok);
+    }
+    kb = 12345;
+    if procx_find_kb(bad.ptr[0: 0], "Pss:" as &const byte, &kb) || kb != 0 {
+        ty_fail(tag, "空文本不该给值", &ok);
+    }
+
+    // 显示：K / M / G（M 取整、G 一位小数）；< 0 = 不可用 → 不写字节
+    var out: Buf = buf_new(64);
+    defer { buf_free(&out); }
+    procx_mem_fmt_is(tag, &out, 0, "0K" as &const byte, &ok);
+    procx_mem_fmt_is(tag, &out, 512, "512K" as &const byte, &ok);
+    procx_mem_fmt_is(tag, &out, 1024, "1M" as &const byte, &ok);
+    procx_mem_fmt_is(tag, &out, 7900, "8M" as &const byte, &ok);
+    procx_mem_fmt_is(tag, &out, 319488, "312M" as &const byte, &ok);
+    procx_mem_fmt_is(tag, &out, 1048576, "1.0G" as &const byte, &ok);
+    procx_mem_fmt_is(tag, &out, 1310720, "1.3G" as &const byte, &ok);
+    procx_mem_fmt_is(tag, &out, 68915200, "65.7G" as &const byte, &ok);
+    buf_reset(&out);
+    if procx_fmt_mem_kb(&out, -1) || out.len != 0 {
+        ty_fail(tag, "-1（不可用）时不该写出任何字节", &ok);
+    }
+    procx_reset();
+    if bufx_cstr_len(procx_mem_kind_name()) != 0 {
+        ty_fail(tag, "还没采样时内存口径名该是空的", &ok);
+    }
+
+    if ok {
+        out_err("selftest[");
+        out_err(tag);
+        out_err("] ok\n");
+    }
+    return ok;
+}
+
 // 端到端：fork 一个忙循环子进程（同一个二进制 → comm 相同），两次采样必须把它算进去
 fn cpu_live_round(tag: &const byte) bool {
     var ok: bool = true;
     procx_reset();
     const t0: u64 = ua_now_ms();
-    if !procx_sample_once(t0) {
+    if !procx_sample_once(t0, false) {
         ty_fail(tag, "读不到 /proc（/proc/self/stat 或 /proc 枚举失败）—— 这条断言要求能扫 /proc", &ok);
         return false;
     }
@@ -10256,7 +10499,7 @@ fn cpu_live_round(tag: &const byte) bool {
     // 父进程睡觉：这 450ms 的 CPU 全记在子进程头上（不睡的话两边都在烧核）
     deleg_wait_slice(450);
     const t1: u64 = ua_now_ms();
-    if !procx_sample_once(t1) {
+    if !procx_sample_once(t1, true) {
         ty_fail(tag, "第二次采样失败", &ok);
     } else {
         if procx_last_span_ms() <= 0 {
@@ -10265,8 +10508,20 @@ fn cpu_live_round(tag: &const byte) bool {
         if procx_proc_count() < base_count + 1 {
             ty_fail(tag, "枚举没看到忙循环子进程（进程数没涨）", &ok);
         }
+        // P24：内存（PSS 合计，读不到 smaps_rollup 就整批退回 VmRSS）
+        if procx_mem_kind() == 0 {
+            ty_fail(tag, "内存口径没探明（smaps_rollup 与 status 都读不到？）", &ok);
+        }
+        if procx_mem_kb() < 1024 {
+            ty_fail(tag, "内存合计偏低（连本进程的 1 MiB 都不到？）", &ok);
+            out_err("[mem] kb=");
+            out_err_dec(procx_mem_kb() as usize);
+            out_err(" kind=");
+            out_err_dec(procx_mem_kind() as usize);
+            out_err("\n");
+        }
         if procx_cpu_pct() < 25 {
-            ty_fail(tag, "综合 %cpu 偏低（USER_HZ 口径或 /proc 枚举有问题）", &ok);
+            ty_fail(tag, "综合 cpu 偏低（USER_HZ 口径或 /proc 枚举有问题）", &ok);
             out_err("[cpu] pct=");
             out_err_dec(procx_cpu_pct() as usize);
             out_err(" procs=");
@@ -10279,7 +10534,7 @@ fn cpu_live_round(tag: &const byte) bool {
     _ = wait_child(cpid);
     // 空跨度（now 没走）时不产生数字：这条防的是「除零 → 爆表」
     procx_reset();
-    _ = procx_sample_once(5000);
+    _ = procx_sample_once(5000, false);
     if procx_cpu_pct() != -1 {
         ty_fail(tag, "第一次采样（只建基线）不该产生百分比", &ok);
     }
@@ -10552,6 +10807,10 @@ export fn selftest_main(base: &const Config) i32 {
     const s2: bool = sse_round(SSE_CASE_NODONE, "stream-nodone");
     const s3: bool = sse_round(SSE_CASE_BADJSON, "stream-badjson");
     const s4: bool = sse_round(SSE_CASE_REASONING_LENGTH, "stream-length");
+    // P24：首 token 打点的三条边界（只有思考 / 只有工具参数 / 没有任何增量）
+    const s5: bool = sse_round(SSE_CASE_REASONING_ONLY, "stream-firsttok-reasoning");
+    const s6: bool = sse_round(SSE_CASE_CALLONLY, "stream-firsttok-call");
+    const s7: bool = sse_round(SSE_CASE_NODELTA, "stream-firsttok-none");
     const t0: bool = tty_round("tty-editor");
     const t1: bool = sess_round("session-log");
     const t2: bool = dshcfg_round("dsh-config");
@@ -10634,6 +10893,9 @@ export fn selftest_main(base: &const Config) i32 {
     const x7: bool = resp_round(RESP_CASE_DONEFRAME, "resp-doneframe");
     const x8: bool = resp_round(RESP_CASE_CHATSHAPE, "resp-chatshape");
     const x9: bool = resp_round(RESP_CASE_BADJSON, "resp-badjson");
+    // P24：首 token 打点在 responses 路径的两条边界
+    const x9a: bool = resp_round(RESP_CASE_REASONING_ONLY, "resp-firsttok-reasoning");
+    const x9b: bool = resp_round(RESP_CASE_CALLONLY, "resp-firsttok-call");
     const x10: bool = resp_nonstream_round("resp-nonstream");
     const x11: bool = resp_build_round("resp-build");
     const x12: bool = api_negotiate_round("api-negotiate");
@@ -10674,12 +10936,14 @@ export fn selftest_main(base: &const Config) i32 {
     const w3: bool = stats_context_round("stats-context");
     const w4: bool = procx_parse_round("procx-parse");
     const w5: bool = procx_percent_round("procx-percent");
+    // P24：内存行的解析与显示（PSS / VmRSS 取数 + K/M/G 显示）
+    const w5b: bool = procx_mem_round("procx-mem");
 
     const w6: bool = cpu_live_round("cpu-live");
     // P22：终端标题（清洗 / 兜底派生 / 基标题 / OSC 2 + 标题栈）
     const w7: bool = title_round("title-format" as &const byte);
-    if r1 && r2 && r3 && r4 && r5 && r5b && r6 && r7 && r8 && r9 && s0 && s1 && s2 && s3 && s4 && t0 && t1 && t2 && t3 && t3b && t4 && t5 && t6 && t7 && t8 && t9 && t10 && t11 && u0 && u1 && u2 && u3 && v0 && v1 && v2 && v3 && v4 && v5 && v6 && v7 && v8 && v9 && r1r && r1t && r1s && y0 && y1
-        && x0 && x1 && x2 && x3 && x4 && x5 && x6 && x7 && x8 && x9 && x10 && x11 && x12 && x13 && x14 && x15 && x16 && w0 && w1 && w2 && w3 && w4 && w5 && w6 && w7 && z0 && z1 && z2 && z3 && z4 && z5 && z6 && z7 {
+    if r1 && r2 && r3 && r4 && r5 && r5b && r6 && r7 && r8 && r9 && s0 && s1 && s2 && s3 && s4 && s5 && s6 && s7 && t0 && t1 && t2 && t3 && t3b && t4 && t5 && t6 && t7 && t8 && t9 && t10 && t11 && u0 && u1 && u2 && u3 && v0 && v1 && v2 && v3 && v4 && v5 && v6 && v7 && v8 && v9 && r1r && r1t && r1s && y0 && y1
+        && x0 && x1 && x2 && x3 && x4 && x5 && x6 && x7 && x8 && x9 && x9a && x9b && x10 && x11 && x12 && x13 && x14 && x15 && x16 && w0 && w1 && w2 && w3 && w4 && w5 && w5b && w6 && w7 && z0 && z1 && z2 && z3 && z4 && z5 && z6 && z7 {
         out_err("SELFTEST PASS\n");
         return AGENT_OK;
     }
