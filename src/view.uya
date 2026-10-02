@@ -1,0 +1,783 @@
+// src/view.uya — 工具调用的显示层（P14：把终端转录做成 DSH 内容块）
+//
+// 每次工具调用输出「一行 + 正文块」：
+//
+//     ✓ Bash(npm test) · exit 1
+//         FAIL src/a.uya
+//         … (省略 12 行)
+//
+//   * 行 = 状态字形 + 标题(关键参数) + 后缀（DSH 工具视图的 title/status/summary 三层）；
+//   * 正文 = write/edit 是 diff（diffx 采集）、todo_write 是清单、其余是结果首尾若干行；
+//   * 通道语义不变：显示一律走 fd 2，正文/模型输出仍走 fd 1；
+//   * `--quiet` 时整层关闭（view_init(false, …)），输出与旧版逐字节一致。
+//
+// 交互模式：工具运行期间把**提示符**换成运行中的那一行（本项目的提示符就是状态显示），
+// 工具返回后再把「成品行 + 正文」写进滚动区。这样不需要原地改写已输出的一行，
+// 也不会和正在编辑的输入行打架。
+
+const VIEW_LINE_FALLBACK: usize = 80;
+
+// ---- 状态 ----
+var g_view_on: bool = false;
+var g_view_lines: usize = 6;
+var g_view_row: Buf = Buf{ ptr: null, len: 0, cap: 0 };     // 组「行」文本
+var g_view_body: Buf = Buf{ ptr: null, len: 0, cap: 0 };    // diff 成品
+var g_view_tmp: Buf = Buf{ ptr: null, len: 0, cap: 0 };     // 摘要/正文草稿
+var g_view_block: Buf = Buf{ ptr: null, len: 0, cap: 0 };   // 组好的整块（行+正文）
+var g_view_prompt: Buf = Buf{ ptr: null, len: 0, cap: 0 };  // 被顶掉的提示符
+var g_view_swapped: bool = false;
+
+// 幂等：REPL 每轮都会调（不能每次 buf_new，否则漏内存）
+export fn view_init(enabled: bool, tool_lines: usize) void {
+    if !buf_valid(&g_view_row) {
+        g_view_row = buf_new(4096);
+    }
+    if !buf_valid(&g_view_body) {
+        g_view_body = buf_new(16384);
+    }
+    if !buf_valid(&g_view_tmp) {
+        g_view_tmp = buf_new(16384);
+    }
+    if !buf_valid(&g_view_block) {
+        g_view_block = buf_new(32768);
+    }
+    if !buf_valid(&g_view_prompt) {
+        g_view_prompt = buf_new(1024);
+    }
+    buf_reset(&g_view_row);
+    buf_reset(&g_view_body);
+    buf_reset(&g_view_tmp);
+    buf_reset(&g_view_block);
+    buf_reset(&g_view_prompt);
+    g_view_lines = tool_lines;
+    g_view_on = enabled && buf_valid(&g_view_row) && buf_valid(&g_view_body) && buf_valid(&g_view_tmp) && buf_valid(&g_view_block);
+    g_view_swapped = false;
+}
+
+export fn view_enabled() bool {
+    return g_view_on;
+}
+
+export fn view_tool_lines() usize {
+    return g_view_lines;
+}
+
+// ============================================================
+// 输出小工具（都走 fd 2 的 tty 协议）
+// ============================================================
+fn view_out(p: &const byte) void {
+    tty_stream_write(2, p, bufx_cstr_len(p));
+}
+
+fn view_out_n(p: &const byte, n: usize) void {
+    if n > 0 {
+        tty_stream_write(2, p, n);
+    }
+}
+
+fn view_at(p: &const byte, off: usize) &const byte {
+    return @ptr_from_usize(@usize_from_ptr(p as &const void) + off) as &const byte;
+}
+
+// 按显示列写出（截断时补 '…'）
+fn view_out_clipped(p: &const byte, n: usize, max_cols: usize) void {
+    const keep: usize = tty_clip_bytes(p, n, max_cols);
+    view_out_n(p, keep);
+    if keep < n {
+        view_out("…");
+    }
+}
+
+fn view_width() usize {
+    const w: usize = tty_body_width();
+    if w == 0 {
+        return VIEW_LINE_FALLBACK;
+    }
+    return w;
+}
+
+// ============================================================
+// 小工具：行扫描 / 名称比较 / 参数取值
+// ============================================================
+fn view_next_line(p: &const byte, limit: usize, from: usize, off: &usize, len: &usize) bool {
+    if from >= limit {
+        return false;
+    }
+    var i: usize = from;
+    while i < limit && p[i] != 10 as byte {
+        i = i + 1;
+    }
+    off[0] = from;
+    len[0] = i - from;
+    return true;
+}
+
+fn view_count_lines(p: &const byte, n: usize) usize {
+    var k: usize = 0;
+    var c: usize = 0;
+    while true {
+        var o: usize = 0;
+        var l: usize = 0;
+        if !view_next_line(p, n, c, &o, &l) {
+            break;
+        }
+        k = k + 1;
+        c = o + l + 1;
+    }
+    return k;
+}
+
+fn view_name_is(name: &const Buf, lit: &const byte) bool {
+    if !buf_valid(name) {
+        return false;
+    }
+    return bufx_eq_cstr(name.ptr as &const byte, name.len, lit);
+}
+
+fn view_find(hay: &const Buf, lit: &const byte) isize {
+    if !buf_valid(hay) {
+        return -1;
+    }
+    const ln: usize = bufx_cstr_len(lit);
+    if ln == 0 || hay.len < ln {
+        return -1;
+    }
+    var i: usize = 0;
+    while i + ln <= hay.len {
+        if bufx_mem_eq(view_at(hay.ptr as &const byte, i), lit, ln) {
+            return i as isize;
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn view_args(arena: &Arena, args_json: &const Buf, val: &JsonValue) bool {
+    if !buf_valid(args_json) || args_json.len == 0 {
+        return false;
+    }
+    return js_parse(arena, args_json.ptr, args_json.len, val);
+}
+
+// 取字符串参数（反转义）到 out（out 会被 reset）；没有该键返回 false
+fn view_arg_str(args: &const JsonValue, key: &const byte, key_len: usize, out: &Buf) bool {
+    buf_reset(out);
+    var sv: JsonStrView = JsonStrView{ ptr: null, len: 0 };
+    if !js_obj_get_str(args, key, key_len, &sv) {
+        return false;
+    }
+    if !sv_unescape(&sv, out) {
+        buf_reset(out);
+        return false;
+    }
+    return out.len > 0;
+}
+
+fn view_arg_i64(args: &const JsonValue, key: &const byte, key_len: usize, out: &i64) bool {
+    var jv: JsonValue = JsonValue.json_null();
+    if !js_obj_get(args, key, key_len, &jv) {
+        return false;
+    }
+    return js_i64_of(&jv, out);
+}
+
+// ============================================================
+// 工具 → 标题（对齐 DSH 工具视图的名字）
+// ============================================================
+fn view_title(out: &Buf, name: &const Buf) void {
+    buf_reset(out);
+    if view_name_is(name, "read") { _ = buf_append_cstr(out, "Read"); return; }
+    if view_name_is(name, "write") { _ = buf_append_cstr(out, "Write"); return; }
+    if view_name_is(name, "edit") { _ = buf_append_cstr(out, "Edit"); return; }
+    if view_name_is(name, "glob") { _ = buf_append_cstr(out, "Glob"); return; }
+    if view_name_is(name, "grep") { _ = buf_append_cstr(out, "Grep"); return; }
+    if view_name_is(name, "bash") { _ = buf_append_cstr(out, "Bash"); return; }
+    if view_name_is(name, "job_list") { _ = buf_append_cstr(out, "Jobs"); return; }
+    if view_name_is(name, "job_output") { _ = buf_append_cstr(out, "JobOutput"); return; }
+    if view_name_is(name, "job_kill") { _ = buf_append_cstr(out, "JobKill"); return; }
+    if view_name_is(name, "todo_write") { _ = buf_append_cstr(out, "Todo"); return; }
+    if view_name_is(name, "exit_plan_mode") { _ = buf_append_cstr(out, "ExitPlan"); return; }
+    if view_name_is(name, "ask_user_question") { _ = buf_append_cstr(out, "Ask"); return; }
+    if view_name_is(name, "skill") { _ = buf_append_cstr(out, "Skill"); return; }
+    if view_name_is(name, "web_search") { _ = buf_append_cstr(out, "WebSearch"); return; }
+    if view_name_is(name, "subagent") { _ = buf_append_cstr(out, "Subagent"); return; }
+    if view_name_is(name, "subagent_fork") { _ = buf_append_cstr(out, "SubagentFork"); return; }
+    if view_name_is(name, "list_agents") { _ = buf_append_cstr(out, "Agents"); return; }
+    if view_name_is(name, "subagent_output") { _ = buf_append_cstr(out, "SubagentOutput"); return; }
+    if view_name_is(name, "send_message") { _ = buf_append_cstr(out, "SendMessage"); return; }
+    if view_name_is(name, "interrupt_agent") { _ = buf_append_cstr(out, "Interrupt"); return; }
+    if view_name_is(name, "ralph") { _ = buf_append_cstr(out, "Ralph"); return; }
+    if view_name_is(name, "create_goal") { _ = buf_append_cstr(out, "GoalCreate"); return; }
+    if view_name_is(name, "get_goal") { _ = buf_append_cstr(out, "Goal"); return; }
+    if view_name_is(name, "update_goal") { _ = buf_append_cstr(out, "GoalUpdate"); return; }
+    if view_name_is(name, "workflow") { _ = buf_append_cstr(out, "Workflow"); return; }
+    _ = buf_append_cstr(out, "Tool");
+}
+
+// 会不会自己提问（这两个工具的提问提示符不能被运行中提示符顶掉）
+fn view_tool_prompts(name: &const Buf) bool {
+    return view_name_is(name, "ask_user_question") || view_name_is(name, "exit_plan_mode");
+}
+
+// 会改文件的工具（正文用 diff）
+fn view_tool_mutates(name: &const Buf) bool {
+    return view_name_is(name, "write") || view_name_is(name, "edit");
+}
+
+// ============================================================
+// 摘要（关键参数）
+// ============================================================
+fn view_summary(out: &Buf, name: &const Buf, args: &const JsonValue, parsed: bool) void {
+    buf_reset(out);
+    if !parsed {
+        return;
+    }
+    if view_name_is(name, "read") || view_name_is(name, "write") || view_name_is(name, "edit") {
+        _ = view_arg_str(args, "file_path", 9, out);
+        return;
+    }
+    if view_name_is(name, "glob") || view_name_is(name, "grep") {
+        if !view_arg_str(args, "pattern", 7, out) {
+            return;
+        }
+        if view_name_is(name, "glob") {
+            var p: Buf = buf_empty();
+            defer { buf_free(&p); }
+            if view_arg_str(args, "path", 4, &p) {
+                _ = buf_append_cstr(out, " in ");
+                _ = buf_append(out, p.ptr, p.len);
+            }
+        } else {
+            var inc: Buf = buf_empty();
+            defer { buf_free(&inc); }
+            if view_arg_str(args, "include", 7, &inc) {
+                _ = buf_append_cstr(out, " include:");
+                _ = buf_append(out, inc.ptr, inc.len);
+            }
+        }
+        return;
+    }
+    if view_name_is(name, "bash") {
+        _ = view_arg_str(args, "command", 7, out);
+        return;
+    }
+    if view_name_is(name, "job_output") || view_name_is(name, "job_kill") {
+        _ = view_arg_str(args, "job_id", 6, out);
+        return;
+    }
+    if view_name_is(name, "subagent_output") || view_name_is(name, "send_message") || view_name_is(name, "interrupt_agent") {
+        _ = view_arg_str(args, "subagent_id", 11, out);
+        return;
+    }
+    if view_name_is(name, "subagent") || view_name_is(name, "subagent_fork") {
+        _ = view_arg_str(args, "description", 11, out);
+        return;
+    }
+    if view_name_is(name, "skill") {
+        _ = view_arg_str(args, "name", 4, out);
+        return;
+    }
+    if view_name_is(name, "ask_user_question") {
+        var qs: JsonValue = JsonValue.json_null();
+        if !js_obj_get(args, "questions", 9, &qs) {
+            return;
+        }
+        var first: JsonValue = JsonValue.json_null();
+        if !js_arr_get(&qs, 0, &first) {
+            return;
+        }
+        if !view_arg_str(&first, "question", 8, out) {
+            _ = view_arg_str(&first, "header", 6, out);
+        }
+        return;
+    }
+    if view_name_is(name, "web_search") {
+        var qs: JsonValue = JsonValue.json_null();
+        if !js_obj_get(args, "queries", 7, &qs) {
+            return;
+        }
+        const n: usize = js_arr_len(&qs);
+        var i: usize = 0;
+        while i < n {
+            var item: JsonValue = JsonValue.json_null();
+            if !js_arr_get(&qs, i, &item) {
+                break;
+            }
+            var sv: JsonStrView = JsonStrView{ ptr: null, len: 0 };
+            if js_str_of(&item, &sv) && sv.len > 0 {
+                if i > 0 {
+                    _ = buf_append_cstr(out, ", ");
+                }
+                _ = sv_unescape(&sv, out);
+            }
+            i = i + 1;
+        }
+        return;
+    }
+    if view_name_is(name, "workflow") {
+        var meta: JsonValue = JsonValue.json_null();
+        if js_obj_get(args, "meta", 4, &meta) {
+            _ = view_arg_str(&meta, "name", 4, out);
+        }
+        return;
+    }
+}
+
+// ============================================================
+// 状态与后缀
+// ============================================================
+export fn view_tool_ok(name: &const Buf, result: &const Buf) bool {
+    if !buf_valid(result) {
+        return true;
+    }
+    if result.len >= 7 && bufx_mem_eq(result.ptr as &const byte, "Error: ", 7) {
+        return false;
+    }
+    // 派发层的「参数不是合法 JSON」是小写前缀（工具模块统一用 "Error: "）；
+    // bash 不按前缀判（它的 stdout 可能就以 error: 开头，状态由退出码标记决定）
+    if !view_name_is(name, "bash") && result.len >= 7 && bufx_mem_eq(result.ptr as &const byte, "error: ", 7) {
+        return false;
+    }
+    if view_name_is(name, "bash") {
+        if view_find(result, "[timed out") >= 0 {
+            return false;
+        }
+        if view_find(result, "[killed by signal: ") >= 0 {
+            return false;
+        }
+        const at: isize = view_find(result, "[exit code: ");
+        if at >= 0 {
+            const start: usize = (at as usize) + 12;
+            var e: usize = start;
+            while e < result.len && result.ptr[e] != 93 as byte {
+                e = e + 1;
+            }
+            const v: i64 = parse_u64_at(result.ptr[0: result.len], start, e - start);
+            if v != 0 {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+// bash 的尾部标记 → 后缀（返回 true 表示已给出）
+fn view_bash_suffix(out: &Buf, result: &const Buf) bool {
+    if !buf_valid(result) || result.len == 0 {
+        return false;
+    }
+    var at: isize = view_find(result, "started background job ");
+    if at >= 0 {
+        const start: usize = (at as usize) + 23;
+        var e: usize = start;
+        while e < result.len && result.ptr[e] != 10 as byte {
+            e = e + 1;
+        }
+        _ = buf_append_cstr(out, " · background ");
+        if e > start {
+            _ = buf_append(out, view_at(result.ptr as &const byte, start), e - start);
+        }
+        return true;
+    }
+    if view_find(result, "[timed out") >= 0 {
+        _ = buf_append_cstr(out, " · timed out");
+        return true;
+    }
+    at = view_find(result, "[killed by signal: ");
+    if at >= 0 {
+        const start: usize = (at as usize) + 19;
+        var e: usize = start;
+        while e < result.len && result.ptr[e] != 93 as byte {
+            e = e + 1;
+        }
+        const sv: i64 = parse_u64_at(result.ptr[0: result.len], start, e - start);
+        _ = buf_append_cstr(out, " · killed by signal");
+        if sv > 0 {
+            _ = buf_append_cstr(out, " ");
+            _ = buf_append_u64(out, sv as u64);
+        }
+        return true;
+    }
+    at = view_find(result, "[exit code: ");
+    if at >= 0 {
+        const start: usize = (at as usize) + 12;
+        var e: usize = start;
+        while e < result.len && result.ptr[e] != 93 as byte {
+            e = e + 1;
+        }
+        const v: i64 = parse_u64_at(result.ptr[0: result.len], start, e - start);
+        if v >= 0 {
+            _ = buf_append_cstr(out, " · exit ");
+            _ = buf_append_u64(out, v as u64);
+            return true;
+        }
+    }
+    return false;
+}
+
+fn view_suffix(out: &Buf, name: &const Buf, args: &const JsonValue, parsed: bool, result: &const Buf, added: usize, removed: usize) void {
+    if view_name_is(name, "bash") {
+        if view_bash_suffix(out, result) {
+            return;
+        }
+    } else if view_name_is(name, "write") {
+        if added > 0 || removed > 0 {
+            _ = buf_append_cstr(out, " · +");
+            _ = buf_append_u64(out, added as u64);
+            _ = buf_append_cstr(out, " -");
+            _ = buf_append_u64(out, removed as u64);
+            return;
+        }
+    } else if view_name_is(name, "edit") {
+        if added > 0 || removed > 0 {
+            _ = buf_append_cstr(out, " · replaced");
+            return;
+        }
+    } else if view_name_is(name, "read") {
+        var off: i64 = 0;
+        var lim: i64 = 0;
+        const has_off: bool = view_arg_i64(args, "offset", 6, &off);
+        const has_lim: bool = view_arg_i64(args, "limit", 5, &lim);
+        if parsed && (has_off || has_lim) {
+            if !has_off {
+                off = 1;
+            }
+            if !has_lim {
+                lim = 2000;
+            }
+            _ = buf_append_cstr(out, " · lines ");
+            _ = buf_append_u64(out, off as u64);
+            _ = buf_append_cstr(out, "-");
+            _ = buf_append_u64(out, (off + lim - 1) as u64);
+            return;
+        }
+    } else if view_name_is(name, "todo_write") {
+        var items: usize = 0;
+        var done: usize = 0;
+        if parsed && view_todo_counts(args, &items, &done) {
+            _ = buf_append_cstr(out, " · ");
+            _ = buf_append_u64(out, items as u64);
+            _ = buf_append_cstr(out, " items (");
+            _ = buf_append_u64(out, done as u64);
+            _ = buf_append_cstr(out, " done)");
+            return;
+        }
+    }
+    // 兜底：结果文本行数
+    if buf_valid(result) && result.len > 0 {
+        const total: usize = view_count_lines(result.ptr as &const byte, result.len);
+        if total > 0 {
+            _ = buf_append_cstr(out, " · ");
+            _ = buf_append_u64(out, total as u64);
+            _ = buf_append_cstr(out, " lines");
+        }
+    }
+}
+
+// ============================================================
+// 正文
+// ============================================================
+// 一行正文：4 空格缩进 + 内容（按列截断）
+fn view_body_line(out: &Buf, p: &const byte, off: usize, len: usize, w: usize) void {
+    _ = buf_append_cstr(out, "    ");
+    var cw: usize = w;
+    if cw > 4 {
+        cw = cw - 4;
+    } else {
+        cw = 8;
+    }
+    const ptr: &const byte = view_at(p, off);
+    const keep: usize = tty_clip_bytes(ptr, len, cw);
+    if keep > 0 {
+        _ = buf_append(out, ptr, keep);
+    }
+    if keep < len {
+        _ = buf_append_cstr(out, "…");
+    }
+    _ = buf_append_byte(out, 10);
+}
+
+// 结果首尾各 lines 行（中间省略），lines=0 时什么都不输出
+export fn view_head_tail(out: &Buf, p: &const byte, n: usize, lines: usize, w: usize) void {
+    buf_reset(out);
+    if lines == 0 || n == 0 {
+        return;
+    }
+    const total: usize = view_count_lines(p, n);
+    if total == 0 {
+        return;
+    }
+    if total <= lines * 2 + 1 {
+        var c0: usize = 0;
+        while true {
+            var o: usize = 0;
+            var l: usize = 0;
+            if !view_next_line(p, n, c0, &o, &l) {
+                break;
+            }
+            view_body_line(out, p, o, l, w);
+            c0 = o + l + 1;
+        }
+        return;
+    }
+    var c: usize = 0;
+    var k: usize = 0;
+    while k < lines {
+        var o: usize = 0;
+        var l: usize = 0;
+        if !view_next_line(p, n, c, &o, &l) {
+            break;
+        }
+        view_body_line(out, p, o, l, w);
+        c = o + l + 1;
+        k = k + 1;
+    }
+    _ = buf_append_cstr(out, "    … (省略 ");
+    _ = buf_append_u64(out, (total - lines * 2) as u64);
+    _ = buf_append_cstr(out, " 行)\n");
+    var skip: usize = 0;
+    c = 0;
+    while skip < total - lines {
+        var o: usize = 0;
+        var l: usize = 0;
+        if !view_next_line(p, n, c, &o, &l) {
+            break;
+        }
+        c = o + l + 1;
+        skip = skip + 1;
+    }
+    while true {
+        var o: usize = 0;
+        var l: usize = 0;
+        if !view_next_line(p, n, c, &o, &l) {
+            break;
+        }
+        view_body_line(out, p, o, l, w);
+        c = o + l + 1;
+    }
+}
+
+// todo_write 的清单：✓ 已完成 / ▸ 进行中 / · 待办
+fn view_todo_counts(args: &const JsonValue, items: &usize, done: &usize) bool {
+    var todos: JsonValue = JsonValue.json_null();
+    if !js_obj_get(args, "todos", 5, &todos) {
+        return false;
+    }
+    const n: usize = js_arr_len(&todos);
+    var i: usize = 0;
+    var d: usize = 0;
+    while i < n {
+        var item: JsonValue = JsonValue.json_null();
+        if !js_arr_get(&todos, i, &item) {
+            break;
+        }
+        var sv: JsonStrView = JsonStrView{ ptr: null, len: 0 };
+        if js_obj_get_str(&item, "status", 6, &sv) && sv.len == 9 && bufx_mem_eq(sv.ptr as &const byte, "completed", 9) {
+            d = d + 1;
+        }
+        i = i + 1;
+    }
+    items[0] = n;
+    done[0] = d;
+    return true;
+}
+
+fn view_todo_body(out: &Buf, args: &const JsonValue, parsed: bool, w: usize) void {
+    buf_reset(out);
+    if !parsed {
+        return;
+    }
+    var todos: JsonValue = JsonValue.json_null();
+    if !js_obj_get(args, "todos", 5, &todos) {
+        return;
+    }
+    const n: usize = js_arr_len(&todos);
+    var i: usize = 0;
+    var shown: usize = 0;
+    while i < n {
+        var item: JsonValue = JsonValue.json_null();
+        if !js_arr_get(&todos, i, &item) {
+            break;
+        }
+        var sv: JsonStrView = JsonStrView{ ptr: null, len: 0 };
+        var st: u8 = 0;   // 0=待办 1=进行中 2=已完成
+        if js_obj_get_str(&item, "status", 6, &sv) {
+            if sv.len == 9 && bufx_mem_eq(sv.ptr as &const byte, "completed", 9) {
+                st = 2;
+            } else if sv.len == 11 && bufx_mem_eq(sv.ptr as &const byte, "in_progress", 11) {
+                st = 1;
+            }
+        }
+        buf_reset(&g_view_tmp);
+        if !view_arg_str(&item, "content", 7, &g_view_tmp) {
+            i = i + 1;
+            continue;
+        }
+        if shown < g_view_lines {
+            _ = buf_append_cstr(out, "    ");
+            if st == 2 {
+                _ = buf_append_cstr(out, "✓");
+            } else if st == 1 {
+                _ = buf_append_cstr(out, "▸");
+            } else {
+                _ = buf_append_cstr(out, "·");
+            }
+            _ = buf_append_byte(out, 32);
+            var cw: usize = w;
+            if cw > 6 {
+                cw = cw - 6;
+            } else {
+                cw = 8;
+            }
+            const keep: usize = tty_clip_bytes(g_view_tmp.ptr as &const byte, g_view_tmp.len, cw);
+            if keep > 0 {
+                _ = buf_append(out, g_view_tmp.ptr, keep);
+            }
+            if keep < g_view_tmp.len {
+                _ = buf_append_cstr(out, "…");
+            }
+            _ = buf_append_byte(out, 10);
+        }
+        shown = shown + 1;
+        i = i + 1;
+    }
+    if shown > g_view_lines {
+        _ = buf_append_cstr(out, "    … (省略 ");
+        _ = buf_append_u64(out, (shown - g_view_lines) as u64);
+        _ = buf_append_cstr(out, " 条)\n");
+    }
+}
+
+// ============================================================
+// 提示符：运行中的那一行（只有交互模式才有意义）
+// ============================================================
+fn view_set_prompt_from(b: &Buf) void {
+    if !buf_append_byte(b, 0) {
+        return;
+    }
+    tty_set_prompt(&tty_ui, b.ptr as &const byte);
+    buf_truncate(b, b.len - 1);
+}
+
+fn view_build_head(out: &Buf, glyph: &const byte, name: &const Buf, args: &const JsonValue, parsed: bool) void {
+    buf_reset(out);
+    _ = buf_append_cstr(out, glyph);
+    _ = buf_append_byte(out, 32);
+    buf_reset(&g_view_tmp);
+    view_title(&g_view_tmp, name);
+    _ = buf_append(out, g_view_tmp.ptr, g_view_tmp.len);
+    buf_reset(&g_view_tmp);
+    view_summary(&g_view_tmp, name, args, parsed);
+    if g_view_tmp.len > 0 {
+        _ = buf_append_byte(out, 40);
+        _ = buf_append(out, g_view_tmp.ptr, g_view_tmp.len);
+        _ = buf_append_byte(out, 41);
+    }
+}
+
+export fn view_begin_tool(arena: &Arena, name: &const Buf, args_json: &const Buf) void {
+    if !g_view_on || g_view_swapped {
+        return;
+    }
+    if !tty_is_interactive() {
+        return;
+    }
+    if view_tool_prompts(name) {
+        return;
+    }
+    buf_reset(&g_view_prompt);
+    if !buf_append(&g_view_prompt, tty_ui.prompt.ptr, tty_ui.prompt.len) {
+        return;
+    }
+    var val: JsonValue = JsonValue.json_null();
+    const parsed: bool = view_args(arena, args_json, &val);
+    view_build_head(&g_view_row, "●", name, &val, parsed);
+    const w: usize = view_width();
+    if g_view_row.len > w {
+        buf_truncate(&g_view_row, tty_clip_bytes(g_view_row.ptr as &const byte, g_view_row.len, w));
+    }
+    _ = buf_append_cstr(&g_view_row, " > ");
+    view_set_prompt_from(&g_view_row);
+    g_view_swapped = true;
+    tty_draw_line(&tty_ui, 2);
+}
+
+// 「行 + 正文」整块渲染进 out（不写终端；自测逐字节断言的就是这个）。
+// 结尾换行、按列截断都在这里做完，view_end_tool 只是把它写到 fd 2。
+export fn view_render_block(out: &Buf, arena: &Arena, name: &const Buf, args_json: &const Buf, result: &const Buf, tool_lines: usize, width: usize) void {
+    buf_reset(out);
+    const save_lines: usize = g_view_lines;
+    g_view_lines = tool_lines;
+    var w: usize = width;
+    if w < 16 {
+        w = 16;
+    }
+    var val: JsonValue = JsonValue.json_null();
+    const parsed: bool = view_args(arena, args_json, &val);
+    var added: usize = 0;
+    var removed: usize = 0;
+    var have_diff: bool = false;
+    buf_reset(&g_view_body);
+    if view_tool_mutates(name) {
+        have_diff = diffx_take(&g_view_body, &added, &removed);
+    } else {
+        diffx_clear();
+    }
+    const ok: bool = view_tool_ok(name, result);
+    if !ok {
+        // 失败时不留「假 diff」（采集发生在写盘之前/之中），正文改用错误文本
+        have_diff = false;
+        buf_reset(&g_view_body);
+        added = 0;
+        removed = 0;
+    }
+
+    // 行
+    if ok {
+        view_build_head(&g_view_row, "✓", name, &val, parsed);
+    } else {
+        view_build_head(&g_view_row, "✗", name, &val, parsed);
+    }
+    view_suffix(&g_view_row, name, &val, parsed, result, added, removed);
+    _ = buf_append_byte(out, 10);
+    const keep: usize = tty_clip_bytes(g_view_row.ptr as &const byte, g_view_row.len, w);
+    _ = buf_append(out, g_view_row.ptr, keep);
+    if keep < g_view_row.len {
+        _ = buf_append_cstr(out, "…");
+    }
+    _ = buf_append_byte(out, 10);
+
+    // 正文
+    if have_diff {
+        _ = buf_append(out, g_view_body.ptr, g_view_body.len);
+    } else if ok && view_name_is(name, "todo_write") {
+        view_todo_body(&g_view_body, &val, parsed, w);
+        _ = buf_append(out, g_view_body.ptr, g_view_body.len);
+    } else {
+        view_head_tail(&g_view_body, result.ptr as &const byte, result.len, tool_lines, w);
+        _ = buf_append(out, g_view_body.ptr, g_view_body.len);
+    }
+    g_view_lines = save_lines;
+}
+
+export fn view_end_tool(arena: &Arena, name: &const Buf, args_json: &const Buf, result: &const Buf) void {
+    view_prompt_restore();
+    if !g_view_on {
+        diffx_clear();
+        return;
+    }
+    view_render_block(&g_view_block, arena, name, args_json, result, g_view_lines, view_width());
+    view_out_n(g_view_block.ptr as &const byte, g_view_block.len);
+}
+
+// 把提示符恢复成 begin 之前那一份（begin 没换过就什么都不做）
+export fn view_prompt_restore() void {
+    if !g_view_swapped {
+        return;
+    }
+    g_view_swapped = false;
+    view_set_prompt_from(&g_view_prompt);
+    if tty_is_interactive() {
+        tty_draw_line(&tty_ui, 2);
+    }
+}

@@ -1,0 +1,482 @@
+// src/diffx.uya — 行级 diff（P14：write / edit 的显示正文）
+//
+// 只服务**显示**，不参与线上协议：把「旧内容 → 新内容」渲染成带 `-` / `+` 标记的行。
+// 采集点在 fsx（write 在 O_TRUNC 之前读旧内容、edit 直接用读写之间已有的一份），
+// 渲染结果暂存在这里；view 层在工具返回后 take 走（take 即清，不会串到下一次调用）。
+//
+// 算法（刻意做小，输入由调用方限制在 2 MiB 内）：
+//   1) 公共**整行**前缀/后缀裁掉：O(n) 扫描，不建行表（文件可能很大）；
+//   2) 中间段两侧各 ≤ 60 行时用 LCS DP（61×61 字节表）做精细 diff；
+//   3) 中间段更大时只给两行汇总（精确行数），不 dump —— 反正显示也只看前 20 行；
+//   4) 每行按显示列截断，最后按行头截断（保留前 max(4*tool_lines, 20) 行）。
+//
+// 「行」的口径与 read 工具一致：`\n` 分隔，**结尾换行不算多出一空行**。
+
+const DIFFX_MID_MAX: usize = 60;      // 中间段每侧最多收集多少行（超过走汇总）
+const DIFFX_MID_LINES: usize = 3721;  // (60+1)*(60+1)：LCS DP 表
+const DIFFX_MAX_BYTES: usize = 2 * 1024 * 1024;
+const DIFFX_CTX_LINES: usize = 2;     // 前后各留几行上下文
+
+const DIFFX_CTX: u8 = 0;
+const DIFFX_MINUS: u8 = 1;
+const DIFFX_PLUS: u8 = 2;
+
+// ============================================================
+// 行扫描原语（全部按字节偏移走，不建行表）
+// ============================================================
+fn diffx_at(p: &const byte, off: usize) &const byte {
+    return @ptr_from_usize(@usize_from_ptr(p as &const void) + off) as &const byte;
+}
+
+// 从 from 取一行到 [off, off+len)（不含行尾换行）；from >= limit 时返回 false
+fn diffx_next_line(p: &const byte, limit: usize, from: usize, off: &usize, len: &usize) bool {
+    if from >= limit {
+        return false;
+    }
+    var i: usize = from;
+    while i < limit && p[i] != 10 as byte {
+        i = i + 1;
+    }
+    off[0] = from;
+    len[0] = i - from;
+    return true;
+}
+
+// 去掉结尾换行后的「内容末尾」
+fn diffx_content_end(p: &const byte, n: usize) usize {
+    if n > 0 && p[n - 1] == 10 as byte {
+        return n - 1;
+    }
+    return n;
+}
+
+// p[0..end) 里最后一行的起点（end 处若是换行则不算行）
+fn diffx_last_line(p: &const byte, end: usize, start: &usize) bool {
+    if end == 0 {
+        return false;
+    }
+    var i: usize = end;
+    while i > 0 && p[i - 1] != 10 as byte {
+        i = i - 1;
+    }
+    start[0] = i;
+    return true;
+}
+
+// [from, to) 里的行数
+fn diffx_count_lines(p: &const byte, from: usize, to: usize) usize {
+    var n: usize = 0;
+    var c: usize = from;
+    while true {
+        var o: usize = 0;
+        var l: usize = 0;
+        if !diffx_next_line(p, to, c, &o, &l) {
+            break;
+        }
+        n = n + 1;
+        c = o + l + 1;
+    }
+    return n;
+}
+
+// ============================================================
+// 渲染
+// ============================================================
+// 写一行：4 空格缩进 + 2 列标记（"- " / "+ " / "  "）+ 内容（按显示列截断）
+fn diffx_emit_line(out: &Buf, mark: u8, p: &const byte, n: usize, w: usize) void {
+    _ = buf_append_cstr(out, "    ");
+    if mark == DIFFX_MINUS {
+        _ = buf_append_byte(out, 45 as byte);
+    } else if mark == DIFFX_PLUS {
+        _ = buf_append_byte(out, 43 as byte);
+    } else {
+        _ = buf_append_byte(out, 32 as byte);
+    }
+    _ = buf_append_byte(out, 32 as byte);
+    var cw: usize = w;
+    if cw > 6 {
+        cw = cw - 6;
+    } else {
+        cw = 8;
+    }
+    const keep: usize = tty_clip_bytes(p, n, cw);
+    if keep > 0 {
+        _ = buf_append(out, p, keep);
+    }
+    if keep < n {
+        _ = buf_append_cstr(out, "…");
+    }
+    _ = buf_append_byte(out, 10);
+}
+
+// 中间段：能精细 diff 就精细，太大就给汇总行
+fn diffx_emit_middle(out: &Buf, op: &const byte, mo: usize, mo_end: usize, np: &const byte, mn: usize, mn_end: usize, w: usize, added: &usize, removed: &usize) void {
+    var ao: [usize: DIFFX_MID_MAX] = [0: DIFFX_MID_MAX];
+    var al: [usize: DIFFX_MID_MAX] = [0: DIFFX_MID_MAX];
+    var bo: [usize: DIFFX_MID_MAX] = [0: DIFFX_MID_MAX];
+    var bl: [usize: DIFFX_MID_MAX] = [0: DIFFX_MID_MAX];
+    var na: usize = 0;
+    var nb: usize = 0;
+    var ca: usize = mo;
+    while na < DIFFX_MID_MAX {
+        var o: usize = 0;
+        var l: usize = 0;
+        if !diffx_next_line(op, mo_end, ca, &o, &l) {
+            break;
+        }
+        ao[na] = o;
+        al[na] = l;
+        na = na + 1;
+        ca = o + l + 1;
+    }
+    var cb: usize = mn;
+    while nb < DIFFX_MID_MAX {
+        var o: usize = 0;
+        var l: usize = 0;
+        if !diffx_next_line(np, mn_end, cb, &o, &l) {
+            break;
+        }
+        bo[nb] = o;
+        bl[nb] = l;
+        nb = nb + 1;
+        cb = o + l + 1;
+    }
+    if na == 0 && nb == 0 {
+        return;
+    }
+    // 还有没收集到的行 → 中间段太大：只给精确汇总数
+    var overflow: bool = false;
+    var o2: usize = 0;
+    var l2: usize = 0;
+    if diffx_next_line(op, mo_end, ca, &o2, &l2) {
+        overflow = true;
+    }
+    if diffx_next_line(np, mn_end, cb, &o2, &l2) {
+        overflow = true;
+    }
+    if overflow {
+        const ra: usize = diffx_count_lines(op, mo, mo_end);
+        const rb: usize = diffx_count_lines(np, mn, mn_end);
+        if ra > 0 {
+            _ = buf_append_cstr(out, "    - (");
+            _ = buf_append_u64(out, ra as u64);
+            _ = buf_append_cstr(out, " 行旧内容)\n");
+            removed[0] = removed[0] + ra;
+        }
+        if rb > 0 {
+            _ = buf_append_cstr(out, "    + (");
+            _ = buf_append_u64(out, rb as u64);
+            _ = buf_append_cstr(out, " 行新内容)\n");
+            added[0] = added[0] + rb;
+        }
+        return;
+    }
+    // LCS 后缀表：t[i][j] = LCS(a[i..], b[j..])
+    const stride: usize = nb + 1;
+    var t: [byte: DIFFX_MID_LINES] = [0: DIFFX_MID_LINES];
+    var i: usize = na;
+    while i > 0 {
+        i = i - 1;
+        var j: usize = nb;
+        while j > 0 {
+            j = j - 1;
+            var v: usize = 0;
+            var same: bool = false;
+            if al[i] == bl[j] {
+                if al[i] == 0 || bufx_mem_eq(diffx_at(op, ao[i]), diffx_at(np, bo[j]), al[i]) {
+                    same = true;
+                }
+            }
+            if same {
+                v = (t[(i + 1) * stride + (j + 1)] as usize) + 1;
+            } else {
+                const x: usize = t[(i + 1) * stride + j] as usize;
+                const y: usize = t[i * stride + (j + 1)] as usize;
+                if x >= y {
+                    v = x;
+                } else {
+                    v = y;
+                }
+            }
+            t[i * stride + j] = v as byte;
+        }
+    }
+    // 顺走一遍输出编辑脚本
+    i = 0;
+    var j: usize = 0;
+    while i < na || j < nb {
+        var same: bool = false;
+        if i < na && j < nb && al[i] == bl[j] {
+            if al[i] == 0 || bufx_mem_eq(diffx_at(op, ao[i]), diffx_at(np, bo[j]), al[i]) {
+                same = true;
+            }
+        }
+        if same {
+            diffx_emit_line(out, DIFFX_CTX, diffx_at(op, ao[i]), al[i], w);
+            i = i + 1;
+            j = j + 1;
+        } else if j >= nb {
+            diffx_emit_line(out, DIFFX_MINUS, diffx_at(op, ao[i]), al[i], w);
+            removed[0] = removed[0] + 1;
+            i = i + 1;
+        } else if i >= na {
+            diffx_emit_line(out, DIFFX_PLUS, diffx_at(np, bo[j]), bl[j], w);
+            added[0] = added[0] + 1;
+            j = j + 1;
+        } else if (t[(i + 1) * stride + j] as usize) >= (t[i * stride + (j + 1)] as usize) {
+            diffx_emit_line(out, DIFFX_MINUS, diffx_at(op, ao[i]), al[i], w);
+            removed[0] = removed[0] + 1;
+            i = i + 1;
+        } else {
+            diffx_emit_line(out, DIFFX_PLUS, diffx_at(np, bo[j]), bl[j], w);
+            added[0] = added[0] + 1;
+            j = j + 1;
+        }
+    }
+}
+
+// 纯渲染：out 里是**带缩进的成品行**（每行以 '\n' 结尾）。旧新完全一样时 out 为空。
+export fn diffx_render_ex(out: &Buf, old: &[byte], new: &[byte], tool_lines: usize, width: usize, added: &usize, removed: &usize) void {
+    buf_reset(out);
+    added[0] = 0;
+    removed[0] = 0;
+    const op: &const byte = old.ptr as &const byte;
+    const np: &const byte = new.ptr as &const byte;
+    const on: usize = old.len;
+    const nn: usize = new.len;
+    if on == 0 && nn == 0 {
+        return;
+    }
+    var w: usize = width;
+    if w < 16 {
+        w = 16;
+    }
+
+    // 1) 公共整行前缀（顺带记住最后两行做上下文：固定两个变量，不用环形数组）
+    var co: usize = 0;
+    var cn: usize = 0;
+    var c1_off: usize = 0;
+    var c1_len: usize = 0;
+    var c1_ok: bool = false;
+    var c2_off: usize = 0;
+    var c2_len: usize = 0;
+    var c2_ok: bool = false;
+    while true {
+        var po: usize = 0;
+        var pl: usize = 0;
+        var pn: usize = 0;
+        var pnl: usize = 0;
+        if !diffx_next_line(op, on, co, &po, &pl) {
+            break;
+        }
+        if !diffx_next_line(np, nn, cn, &pn, &pnl) {
+            break;
+        }
+        if pl != pnl {
+            break;
+        }
+        if pl > 0 && !bufx_mem_eq(diffx_at(op, po), diffx_at(np, pn), pl) {
+            break;
+        }
+        c1_off = c2_off;
+        c1_len = c2_len;
+        c1_ok = c2_ok;
+        c2_off = po;
+        c2_len = pl;
+        c2_ok = true;
+        co = po + pl + 1;
+        cn = pn + pnl + 1;
+    }
+    // 2) 公共整行后缀（不越过前缀区）
+    var mo_end: usize = diffx_content_end(op, on);
+    var mn_end: usize = diffx_content_end(np, nn);
+    var suf: usize = 0;
+    var suf_at_o: usize = mo_end;
+    var oe: usize = mo_end;
+    var ne: usize = mn_end;
+    while true {
+        if oe == 0 || ne == 0 {
+            break;
+        }
+        var os: usize = 0;
+        var ns: usize = 0;
+        if !diffx_last_line(op, oe, &os) {
+            break;
+        }
+        if !diffx_last_line(np, ne, &ns) {
+            break;
+        }
+        if os < co || ns < cn {
+            break;
+        }
+        if (oe - os) != (ne - ns) {
+            break;
+        }
+        if (oe - os) > 0 && !bufx_mem_eq(diffx_at(op, os), diffx_at(np, ns), oe - os) {
+            break;
+        }
+        suf = suf + 1;
+        mo_end = os;
+        mn_end = ns;
+        suf_at_o = os;
+        if os == 0 || ns == 0 {
+            break;
+        }
+        oe = os - 1;
+        ne = ns - 1;
+    }
+
+    // 前缀 + 后缀已经覆盖了全部内容 → 没有变化（也**不该**输出上下文行）
+    if co >= mo_end && cn >= mn_end {
+        return;
+    }
+
+    // 3) 先渲染到临时缓冲，再按行头截断到 out
+    var tmp: Buf = buf_new(8192);
+    defer { buf_free(&tmp); }
+    if !buf_valid(&tmp) {
+        return;
+    }
+    if c1_ok {
+        diffx_emit_line(&tmp, DIFFX_CTX, diffx_at(op, c1_off), c1_len, w);
+    }
+    if c2_ok {
+        diffx_emit_line(&tmp, DIFFX_CTX, diffx_at(op, c2_off), c2_len, w);
+    }
+    var dad: usize = 0;
+    var drem: usize = 0;
+    diffx_emit_middle(&tmp, op, co, mo_end, np, cn, mn_end, w, &dad, &drem);
+    added[0] = dad;
+    removed[0] = drem;
+    var c2: usize = suf_at_o;
+    var k2: usize = 0;
+    while k2 < DIFFX_CTX_LINES && k2 < suf {
+        var so: usize = 0;
+        var sl: usize = 0;
+        if !diffx_next_line(op, on, c2, &so, &sl) {
+            break;
+        }
+        diffx_emit_line(&tmp, DIFFX_CTX, diffx_at(op, so), sl, w);
+        c2 = so + sl + 1;
+        k2 = k2 + 1;
+    }
+
+    // 4) 头截断
+    var total: usize = 0;
+    var cur: usize = 0;
+    while true {
+        var o3: usize = 0;
+        var l3: usize = 0;
+        if !diffx_next_line(tmp.ptr as &const byte, tmp.len, cur, &o3, &l3) {
+            break;
+        }
+        total = total + 1;
+        cur = o3 + l3 + 1;
+    }
+    if total == 0 {
+        return;
+    }
+    var cap: usize = tool_lines * 4;
+    if cap < 20 {
+        cap = 20;
+    }
+    var emitted: usize = 0;
+    var cur2: usize = 0;
+    while emitted < cap {
+        var o4: usize = 0;
+        var l4: usize = 0;
+        if !diffx_next_line(tmp.ptr as &const byte, tmp.len, cur2, &o4, &l4) {
+            break;
+        }
+        _ = buf_append(out, diffx_at(tmp.ptr as &const byte, o4), l4);
+        _ = buf_append_byte(out, 10);
+        cur2 = o4 + l4 + 1;
+        emitted = emitted + 1;
+    }
+    if total > emitted {
+        _ = buf_append_cstr(out, "    … (省略 ");
+        _ = buf_append_u64(out, (total - emitted) as u64);
+        _ = buf_append_cstr(out, " 行)\n");
+    }
+}
+
+// 给自测用的薄封装（丢弃增删计数）
+export fn diffx_render(out: &Buf, old: &[byte], new: &[byte], tool_lines: usize, width: usize) void {
+    var a: usize = 0;
+    var r: usize = 0;
+    diffx_render_ex(out, old, new, tool_lines, width, &a, &r);
+}
+
+// ============================================================
+// 进程级全局：采集 + 暂存（单进程一个前台界面）
+// ============================================================
+var g_diffx_on: bool = false;
+var g_diffx_lines: usize = 6;
+var g_diffx_buf: Buf = Buf{ ptr: null, len: 0, cap: 0 };
+var g_diffx_added: usize = 0;
+var g_diffx_removed: usize = 0;
+
+// 幂等：REPL 每轮都会调（不能每次 buf_new，否则漏内存）
+export fn diffx_init(enabled: bool, tool_lines: usize) void {
+    if !buf_valid(&g_diffx_buf) {
+        g_diffx_buf = buf_new(8192);
+    }
+    buf_reset(&g_diffx_buf);
+    g_diffx_on = enabled && buf_valid(&g_diffx_buf);
+    g_diffx_lines = tool_lines;
+    g_diffx_added = 0;
+    g_diffx_removed = 0;
+}
+
+export fn diffx_enabled() bool {
+    return g_diffx_on;
+}
+
+export fn diffx_clear() void {
+    if buf_valid(&g_diffx_buf) {
+        buf_reset(&g_diffx_buf);
+    }
+    g_diffx_added = 0;
+    g_diffx_removed = 0;
+}
+
+// 采集一次变更（write / edit 成功后调）。关闭态下**什么都不做**（连旧内容都不用读）。
+export fn diffx_note(old: &[byte], new: &[byte]) void {
+    if !g_diffx_on {
+        return;
+    }
+    diffx_clear();
+    if old.len > DIFFX_MAX_BYTES || new.len > DIFFX_MAX_BYTES {
+        _ = buf_append_cstr(&g_diffx_buf, "    (diff skipped: file too large)\n");
+        return;
+    }
+    var a: usize = 0;
+    var r: usize = 0;
+    diffx_render_ex(&g_diffx_buf, old, new, g_diffx_lines, tty_body_width(), &a, &r);
+    g_diffx_added = a;
+    g_diffx_removed = r;
+}
+
+// 采集一次「没算 diff」（例如文件太大没读旧内容）
+export fn diffx_note_skipped(reason: &const byte) void {
+    if !g_diffx_on {
+        return;
+    }
+    diffx_clear();
+    _ = buf_append_cstr(&g_diffx_buf, "    (diff skipped: ");
+    _ = buf_append_cstr(&g_diffx_buf, reason);
+    _ = buf_append_cstr(&g_diffx_buf, ")\n");
+}
+
+// 取走渲染结果（追加到 out 并清空）。返回 false 表示这次没有 diff。
+export fn diffx_take(out: &Buf, added: &usize, removed: &usize) bool {
+    if !buf_valid(&g_diffx_buf) || g_diffx_buf.len == 0 {
+        diffx_clear();
+        return false;
+    }
+    const ok: bool = buf_append(out, g_diffx_buf.ptr, g_diffx_buf.len);
+    added[0] = g_diffx_added;
+    removed[0] = g_diffx_removed;
+    diffx_clear();
+    return ok;
+}

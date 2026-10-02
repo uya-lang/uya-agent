@@ -1,10 +1,10 @@
 # uya-agent — 纯 Uya 写的极简 CLI 编程 agent
 
 一个**只用 Uya 源码**实现的命令行编程 agent：给它一句话任务，它自己看文件、改文件、跑命令，
-多轮 loop 直到给出结论。全部代码 9 个 `.uya` 文件，**不引入任何 C 代码、`@c_import` 或其它语言**，
+多轮 loop 直到给出结论。全部代码 32 个 `.uya` 文件，**不引入任何 C 代码、`@c_import` 或其它语言**，
 只依赖 Uya 语言与随编译器分发的标准库。
 
-**P0–P13 全部完成**：LLM 交互是**流式 SSE**（`stream:true` + `stream_options.include_usage`），
+**P0–P14 全部完成**：LLM 交互是**流式 SSE**（`stream:true` + `stream_options.include_usage`），
 增量 chunked 解码 + SSE 分帧 + `tool_calls` 按 `index` 分片累积；消息协议是**严格工具协议**
 （`assistant.tool_calls` 原样回灌 + 每条结果一条 `role:"tool"` + `tool_call_id`）；
 交互界面是**真 TTY**（termios raw + 行编辑器），流式期间可打断、可继续输入、可续跑；
@@ -26,15 +26,47 @@ tool 结果超 8192 码点自动剪枝，压力超过窗口 80% 时自动压缩�
 最后是收尾：**工具/上下文旋钮由 DSH preset 驱动**（`--print-config` 显示来源与取值）、
 **能直接读 DSH 自己的会话**（`--list-dsh-sessions` / `--resume-dsh`，含 zstd 压缩）、
 `make e2e` 一条命令跑真实网关（步数默认不限，`STEPS=N` 可显式熔断）。
+**P14 把终端转录改成 DSH 内容块**：每次工具调用一行「状态字形 + 标题(关键参数) + 后缀」，
+正文是结果首尾若干行、`write`/`edit` 的**行级 diff**、`todo_write` 的清单，
+`--quiet` 原样退回旧的最小转录。
 `--no-stream` / `--compat-fold` 保留两条回退路径。
 
 ```
-$ DEEPSEEK_API_KEY=sk-xxx ./build/uya-agent "在当前目录创建 hello.uya，编译并运行它"
-[task] 在当前目录创建 hello.uya，编译并运行它
-[step 1] tool: write_file
-[step 2] tool: run_shell
-Hello, Uya!
-已创建并运行 hello.uya，输出为 Hello, Uya!。
+$ ./build/uya-agent "在当前目录创建 hello.uya，编译并运行它，然后把问候语改成 Hello, DSH!"
+[task] 在当前目录创建 hello.uya，编译并运行它，然后把问候语改成 Hello, DSH!
+
+✓ Write(hello.uya) · +4 -0
+    + export fn main() i32 {
+    +     @println("Hello, Uya!");
+    +     return 0;
+    + }
+
+✓ Bash(UYA_ROOT=… uya build hello.uya -o hello && ./hello) · exit 0
+    make: 进入目录"…/.uyacache"
+    cc -c -std=c99 -O0 -fno-builtin -I. hello_part1.c -o hello_part1.o
+    … (省略 6 行)
+    编译完成：hello
+    Hello, Uya!
+    [exit code: 0]
+
+✓ Read(hello.uya) · 4 lines
+    1: export fn main() i32 {
+    2:     @println("Hello, Uya!");
+    3:     return 0;
+    4: }
+
+✓ Edit(hello.uya) · replaced
+      export fn main() i32 {
+    -     @println("Hello, Uya!");
+    +     @println("Hello, DSH!");
+          return 0;
+      }
+
+✓ Bash(./hello) · exit 0
+    Hello, DSH!
+    [exit code: 0]
+
+已改成 Hello, DSH! 并重新编译运行，输出 Hello, DSH!。
 ```
 
 ---
@@ -103,11 +135,12 @@ export UYA_SPLIT_C_DIR=$PWD/build/uyacache      # 多文件 C 缓存别丢在仓
 | `--no-stream-options` | 不发送 `stream_options.include_usage` |
 | `--show-reasoning` | 把 `reasoning_content` 打到 stderr |
 | `--show-usage` | 每轮打印 token 用量（in/out/cache/reasoning） |
+| `--tool-lines N` | 工具结果正文首尾各显示几行，默认 6（`0` = 不显示正文），见 P14 |
 | `--max-tokens N` | 发送 `max_tokens`（默认不发送） |
 | `--temperature N` | 发送 `temperature`（默认不发送，对齐 DSH） |
 | `--tls-verify=chain\|pin\|none` | TLS 信任策略，默认 `chain`，见第 5 节 |
 | `--tls-pin HEX` | `pin` 模式要求的 leaf 证书 SHA-256（小写 hex） |
-| `--quiet` | 不打印每步工具调用信息 |
+| `--quiet` | 关闭工具内容块（回退到旧的最小转录：只有正文流） |
 | `--tls-debug` | 保留 `lib/tls` 的握手调试输出（默认静音，见第 3 节第 14 条） |
 | `--http-debug` | 打印每轮响应的头与体首字节（排查网关怪异响应用） |
 
@@ -171,10 +204,64 @@ src/plan.uya      plan 模式状态机 + exit_plan_mode（非 plan 模式报错�
 src/askuser.uya   ask_user_question：交互模式复用行编辑器，非交互读一行，EOF 时回「无回答」
 src/session.uya   会话日志：路径规范化、id 生成（/dev/urandom→uuid）、header/事件序列化与追加写、
                   索引、读取与崩溃尾部裁剪、按 id/最近查找、括号配平的数组提取
+src/diffx.uya     行级 diff（只服务显示）：公共整行前后缀裁剪 → LCS DP（60×60 上限）→
+                  行列截断 + 头截断；全局暂存最近一次变更，view 层 take 走
+src/view.uya      工具内容块：工具→标题/关键参数/后缀三张表、状态字形、结果首尾若干行、
+                  todo 清单、按显示列截断、交互模式的「运行中提示符」换入换出
 src/agent.uya     CLI、环境变量、消息历史、请求组装、主循环（流式/非流式）、工具分发、
                   交互式 REPL（中断/steer//continue/会话命令）、会话事件记录与恢复
-src/selftest.uya  --selftest 的 mock LLM（含 SSE 受控切分）+ 15 轮断言 + --probe
+src/selftest.uya  --selftest 的 mock LLM（含 SSE 受控切分）+ 28 轮断言 + --probe
 ```
+
+> 两处已知死代码（P14 未清理，改别的东西时别被它们误导）：`src/tools.uya`（P0 的
+> `read_file`/`write_file`/`run_shell`，早已被 `fsx`/`search`/`shellx` 取代）、
+> `agent.uya` 里的 `dispatch_tool`（`JsonStrView` 版，无调用者）。
+
+### 显示内容（P14，对齐 DSH 工具视图）
+
+DSH 的会话视图里每次工具调用是一张卡片：**标题（工具名 + 关键参数）+ 状态 + 分类正文**
+（readBody / diffBody / terminalBody / webBody / todo 行）。DSH 自己没有终端渲染器
+（197 个包里没有任何 TTY/ANSI 代码），所以这里是把**那套内容模型搬到滚动终端**：
+
+```
+✓ Edit(src/a.uya) · replaced          # 状态字形 + 标题(关键参数) + 后缀
+      export fn main() i32 {          # 上下文（未改动的行）
+    -     @println("Hello, Uya!");    # 删
+    +     @println("Hello, DSH!");    # 增
+          return 0;
+      }
+```
+
+* **行**：`<字形> <Title>(<摘要>)<后缀>`。字形 `✓` 成功 / `✗` 失败 / `●` 运行中（只在交互提示符里）；
+  标题按工具映射（`Read` / `Write` / `Edit` / `Glob` / `Grep` / `Bash` / `Todo` / `Ask` /
+  `WebSearch` / `Subagent` / `Workflow` …）；摘要取关键参数（`command` / `file_path` / `pattern` /
+  `description` / `queries`）；后缀是元信息：`· exit 1`、`· timed out`、`· killed by signal 9`、
+  `· background job-2`、`· +4 -0`、`· replaced`、`· 3 items (1 done)`、`· lines 100-149`，
+  兜底是 `· N lines`（结果文本行数）。失败判定：结果以 `Error: `（工具模块统一前缀）或
+  `error: `（派发层的「参数不是合法 JSON」）开头，或 bash 尾部是 `[exit code: N≠0]` /
+  `[timed out …]` / `[killed by signal: N]`。
+* **正文**：4 空格缩进；默认首尾各 6 行、中间 `… (省略 N 行)`（`--tool-lines N` 改预算，
+  `0` = 只留行不留正文）。`write` / `edit` 用 **diff** 取代首尾（见下），`todo_write` 用清单
+  （`✓` 已完成 / `▸` 进行中 / `·` 待办）。
+* **diff**（`src/diffx.uya`）：采集点在 fsx —— `edit` 用读写之间已有的两份内容（零额外 I/O），
+  `write` 在 `O_TRUNC` **之前**读一份旧内容（只在显示打开时读，上限 2 MiB）。
+  算法：公共**整行**前后缀裁掉（O(n) 扫描，不建行表）→ 中间段两侧各 ≤ 60 行时用 LCS DP
+  （61×61 字节表）出最小编辑脚本 → 更大就只给两行精确汇总（`- (N 行旧内容)` / `+ (N 行新内容)`，
+  反正显示也只看前 20 行）→ 输出按显示列截断、按行头截断（`max(4×tool_lines, 20)` 行）。
+  **失败的 write/edit 不留假 diff**（正文回落到错误文本）。
+* **宽度**：全部按**显示列**算（`tty_body_width()` 跟着终端宽度收在 [40,200]，CJK 汉字 2 列），
+  截断在 UTF-8 字符边界上回退并补 `…`；非法字节按 1 列宽，保证指针一定前进。
+* **通道与开关**：内容块一律走 fd 2（正文与模型输出仍走 fd 1，管道语义不变）；
+  会话日志不受影响（仍只记 `tool/call` + `tool/result`）。`--quiet`（含子代理，它们本来就
+  `quiet=true`）把整层关掉 —— 输出与 P13 之前的**最小转录逐字节一致**，且 `write` 连旧内容都不读；
+  自测里有一条「关闭态下 fd 2 捕获到 0 字节」的断言守着它。
+* **交互模式**：工具运行期间把**提示符**换成运行中的那一行（`● Bash(npm test) > `），
+  工具返回后先恢复原提示符、再把「成品行 + 正文」写进滚动区。这样不用原地改写已输出的一行，
+  也不会和正在编辑的输入行打架（复用 P3 的擦除/重画协议）。
+  `ask_user_question` / `exit_plan_mode` 会自己提问，跳过这次提示符替换。
+* **思考块**：`--show-reasoning` 时每个 step 的思考前面加一行 `✻ 思考`（内容仍原样流式）。
+* 明确不做：ANSI 颜色（`tty_advance_col` 的列算术不认识零宽转义序列，`make codegen-audit`
+  对转义写法也有硬约束）、markdown 渲染、可折叠卡片、`--resume` 的转录回放。
 
 ### preset 旋钮、DSH 会话与 make 目标（P13）
 
@@ -189,7 +276,7 @@ src/selftest.uya  --selftest 的 mock LLM（含 SSE 受控切分）+ 15 轮断�
   `user/message` + `assistant/message` + `tool/result` 转成我们的历史并**开自己的会话**继续
   （不写 DSH 的日志）。压缩的 `.jsonl.zstd` 走 `/usr/bin/unzstd` 解压。
   消息数只统计已读入的部分（zstd 前缀），所以列表里写作 `msgs≈`。
-* `make` 目标：`check` / `build` / `selftest`（离线 24 轮）/ `probe` / `e2e TASK=… [PIN=…]`（真实网关）/
+* `make` 目标：`check` / `build` / `selftest`（离线 28 轮）/ `probe` / `e2e TASK=… [PIN=…]`（真实网关）/
   `e2e-config`（零参数打印生效配置）/ `e2e-dsh`（列 DSH 会话）。
 
 ### workflow：Uya 脚本 + 钩子代理（P12）
@@ -690,6 +777,14 @@ edit（多匹配→拒、成功、找不到）/ glob（两条路径）/ grep（�
 `!!js` 标签）+ `.credentials.yaml` → 断言 provider/model/baseURL/apiKeyEnv/凭据来源四层/
 contextWindow/maxTokens/input image/reasoningEffort/`permission→confine`/`uya-agent.tls` 命名空间；
 再断言 YAML 预处理（注释去掉、块标量里的 `#` 保留、`!!js` 中和）；最后若存在真实 `~/.dsh` 就顺带校验一次 |
+| `diff-render` | 纯函数逐字节断言 diff：新旧一样 → 空（且**不输出上下文**）、只差结尾换行 → 空、
+中间一行改动 → 前后各 2 行上下文 + `-`/`+`、新文件 → 全 `+`、两侧 >60 行 → 只给精确汇总、
+60 行编辑脚本 → 头截断成 24 行 + `… (省略 36 行)`、增删计数、按显示列截断（汉字 2 列） |
+| `tool-view` | 工具内容块的逐字节断言：bash exit 0/exit 1 的字形与 `· exit N`、`Error: ` → `✗`、
+参数不是合法 JSON → 无括号无摘要、read 的 `· lines a-b`、todo 的计数与清单（✓/▸/·）、
+write 的 `· +A -D` + diff 正文、**失败的 write 不留假 diff**、窄终端下按列截断补 `…`、
+结果首尾 + `省略` 标记、`--tool-lines 0` 无正文；最后**把 fd 2 接到文件做端到端断言**：
+关闭态抓到 0 字节、打开态抓到的字节与 `view_render_block` 完全一致 |
 | `session-log` | 写 header/事件 → 读回逐行校验（转义层级、`tool_calls` 数组提取、`callId`）；
 手工追加半条记录 → 断言丢弃并标记 `dropped_tail`；用日志重建历史 → 断言角色/`tool_call_id`
 且能重新组装成合法请求；索引与按 id / 最近查找 |
@@ -742,6 +837,7 @@ contextWindow/maxTokens/input image/reasoningEffort/`permission→confine`/`uya-
 * 自测现在是**幂等**的：连续跑两次都 PASS（以前靠「反正覆盖」掩盖了清理失败）。
 * DSH 配置兼容做了**零参数启动**验收：在空目录里不传 `--base-url/--model/--api-key`，
   `--print-config` 显示 `base_url/model/api_key/context_window/confine/tls_verify/tls_pin`
+  （以及 P14 的 `tool_lines` 与显示开关状态）
   的来源全是 `dsh-settings`，实际提问「2+2 等于几」得到 `4。`
   （TLS pin 也写在 `~/.dsh/settings.yaml` 的 `uya-agent.tls` 节里，连环境变量都不用给；
   三个「决定去哪儿读设置」的 flag 由 `make e2e-config-flags` 常驻回归）。
@@ -752,6 +848,13 @@ contextWindow/maxTokens/input image/reasoningEffort/`permission→confine`/`uya-
   3 步完成（write_file → run_shell → 结论），stdout 流式输出
   `运行输出：\`Hello, Uya!\`（编译通过，退出码 0）。`，产物 `hello` 是真实 ELF、
   独立运行输出 `Hello, Uya!`；usage 逐轮打印（含 `cache_read=896` 前缀缓存命中）。
+* P14 显示层在真机上验收过三次（零参数配置 + `--tls-verify=none`）：
+  ① 「创建 → 编译运行 → 改问候语」的完整任务，`write` 块给出 `+4 -0` 与 4 行 `+`、
+  `edit` 块给出 `- @println("Hello, Uya!")` / `+ @println("Hello, DSH!")` 与两侧上下文、
+  bash 块给出 `· exit 0` 与首尾各 6 行 + `… (省略 42 行)`；
+  ② 同一任务加 `--quiet`：stderr 只剩正文流，**没有**任何 `✓/✗` 行（旧的最小转录）；
+  ③ 用 `script` 分配 PTY 跑 REPL：工具运行期间提示符变成 `● Bash(echo PTY-CHECK) > `，
+  返回后恢复 `[step 1] > `，内容块落进滚动区，全程没有乱码（P3 的擦除/重画协议照旧成立）。
 | `http401` | mock 回 401 + 错误体：agent 必须打印状态与错误体并退出 3 |
 | `max-steps` | **显式**给 `max_steps=3`：mock 每轮都给 tool_calls，agent 必须在 3 步后熔断退出 3 |
 | `unlimited-steps` | **默认不限步数**（这轮故意不设 `max_steps`，吃 `cfg_default()` 的 0）：mock 连给 **14 轮** tool_calls（超过旧默认 12）才给最终答案 —— agent 必须一路跑满 14 步、把 14 条 `tool_call_id` 全带回请求，并以 0 退出。默认值一旦改回 12，mock 只会被服务 12 次，这轮立刻失败 |
@@ -799,6 +902,11 @@ UYA_AGENT_API_KEY=… ./build/uya-agent \
   脚本/CI 用 `--max-steps N` 或 `UYA_AGENT_MAX_STEPS=N` 熔断（`make e2e` 也可 `STEPS=N`）。
   没做「重复调用检测」这类启发式熔断。
 * `read_file` 一次最多 64 KiB；`write_file` 是整文件覆盖，没有 diff/patch 工具。
+* 显示层没有颜色（纯文本字形），DSH 的卡片在终端里是「滚动行 + 缩进正文」，不可折叠；
+  助手正文仍是原样流式打印，**不做 markdown 渲染**；`--resume` / `--resume-dsh` 不回放历史转录
+  （会话日志里已经有 `tool/call` + `tool/result`，将来可以做）。
+* diff 是行级的、面向显示：中间段两侧超过 60 行就退化为两行汇总（不做 Myers 全量 diff），
+  也不高亮词级改动。
 * 只做 IPv4（标准库 `dns_client_resolve_first_ipv4`），不做 IPv6、不走代理。
 * 目标平台是 Linux x86-64（代码里的 syscall/常量按这个平台写）。
 * 换到 `uya-0.11`：`tls/https.uya`、`std/json/*`、`x509/verify.uya` 与 0.10 逐字节相同，
