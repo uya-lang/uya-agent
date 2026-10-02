@@ -1,0 +1,799 @@
+// src/stats.uya — 会话统计折叠 + 上下文占用（P18，对齐 DSH sessionStats + tokenUsage + contextPressure）
+//
+// 口径**逐行对照** DSH 的两个投影单元实现（`@deepseek-ai/dsh-session-stats` 的
+// `sessionStatsProjectionDefinition.apply`、`@deepseek-ai/dsh-token-meter` 的
+// `contextPressure`/`contextBreakdown`），渲染逐字对照 Web 客户端的 `StatsLine` 与
+// `ContextMeter`：
+//
+//   step/start              → openStep = {turn, step, t, firstToken=0}
+//   assistant/first-token   → 首个非空 delta 那一刻（本仓新增事件；DSH 记的是首个
+//                             token delta 的 `assistant/chunk`）
+//   assistant/message       → llmMs（step/start→消息组装）、ttftMs/ttftSteps、
+//                             decodeMs/decodeTokens，并关掉 openStep
+//   tool/call → tool/result → 按 callId 配对累加 toolMs（未结算的在 turn/end 丢弃）
+//   step/end                → steps += 1；turns 只在该 turn 首次出现时 +1
+//   turn/end                → 清 pending
+//
+// 两条喂入路径**共享同一份状态机**：实时（agent 在边界上直接调 st_*）与回放
+// （resume 时把会话日志逐行喂 st_fold_line）。两条路径用同一个时间戳（agent 侧
+// 用 sess_begin_at 把事件时间钉成它传给 st_* 的那个毫秒值），所以数字必须逐位相等 ——
+// 自测 `stats-fold` 就是钉这一条的。
+//
+// 数字是**整个会话**口径（分页/压缩都不改变它）：压缩换掉的是历史，不是日志。
+
+// ============================================================
+// 状态
+// ============================================================
+
+const STATS_PENDING_MAX: usize = 8;   // 未结算的 tool/call 上限（同步派发时只会用到 1 个）
+
+struct StatPending {
+    id: Buf,
+    at: i64,
+}
+
+export struct Stats {
+    // 计数与墙钟（毫秒）
+    turns: i64,
+    steps: i64,
+    llm_ms: i64,
+    tool_ms: i64,
+    ttft_ms: i64,
+    ttft_steps: i64,
+    decode_ms: i64,
+    decode_tokens: i64,
+    // token 账目（DSH 的 tokenUsage 投影：互不重叠的输入桶 + 输出）
+    in_uncached: i64,
+    cache_read: i64,
+    cache_write: i64,
+    out_tokens: i64,
+    // 打开中的一步
+    have_open: bool,
+    open_turn: i64,
+    open_step: i64,
+    open_ms: i64,
+    first_token_ms: i64,      // 0 = 本步还没有首 token
+    // 最近计入的 turn（DSH 的 lastTurn：turns 按「不同的 turn」计数）
+    have_last_turn: bool,
+    last_turn: i64,
+    // 最近一次 provider 压力样本（未缓存 + 缓存读 + 缓存写 = DSH 的 pressureTokens），
+    // resume 后靠它立刻算出上下文占用，不必等下一轮请求
+    last_pressure: i64,
+    have_pressure: bool,
+    pending: [StatPending: STATS_PENDING_MAX],
+    npending: usize,
+}
+
+var g_stats: Stats = Stats{
+    turns: 0,
+    steps: 0,
+    llm_ms: 0,
+    tool_ms: 0,
+    ttft_ms: 0,
+    ttft_steps: 0,
+    decode_ms: 0,
+    decode_tokens: 0,
+    in_uncached: 0,
+    cache_read: 0,
+    cache_write: 0,
+    out_tokens: 0,
+    have_open: false,
+    open_turn: 0,
+    open_step: 0,
+    open_ms: 0,
+    first_token_ms: 0,
+    have_last_turn: false,
+    last_turn: 0,
+    last_pressure: 0,
+    have_pressure: false,
+    pending: [],
+    npending: 0,
+};
+
+fn st_clamp0(v: i64) i64 {
+    if v < 0 {
+        return 0;
+    }
+    return v;
+}
+
+// 非负整数的四舍五入除法（JS 的 Math.round(a/b)，b > 0）
+fn st_round_div(a: i64, b: i64) i64 {
+    if b <= 0 {
+        return 0;
+    }
+    var v: i64 = a;
+    if v < 0 {
+        v = 0;
+    }
+    return (v + (b / 2)) / b;
+}
+
+fn st_ceil_div(a: i64, b: i64) i64 {
+    if a <= 0 || b <= 0 {
+        return 0;
+    }
+    return ((a + b) - 1) / b;
+}
+
+export fn st_reset() void {
+    var i: usize = 0;
+    while i < g_stats.npending {
+        buf_free(&g_stats.pending[i].id);
+        g_stats.pending[i].at = 0;
+        i = i + 1;
+    }
+    g_stats.npending = 0;
+    g_stats.turns = 0;
+    g_stats.steps = 0;
+    g_stats.llm_ms = 0;
+    g_stats.tool_ms = 0;
+    g_stats.ttft_ms = 0;
+    g_stats.ttft_steps = 0;
+    g_stats.decode_ms = 0;
+    g_stats.decode_tokens = 0;
+    g_stats.in_uncached = 0;
+    g_stats.cache_read = 0;
+    g_stats.cache_write = 0;
+    g_stats.out_tokens = 0;
+    g_stats.have_open = false;
+    g_stats.open_turn = 0;
+    g_stats.open_step = 0;
+    g_stats.open_ms = 0;
+    g_stats.first_token_ms = 0;
+    g_stats.have_last_turn = false;
+    g_stats.last_turn = 0;
+    g_stats.last_pressure = 0;
+    g_stats.have_pressure = false;
+}
+
+// ============================================================
+// 折叠：边界喂入
+// ============================================================
+
+export fn st_step_start(turn: i64, step: i64, ms: u64) void {
+    g_stats.have_open = true;
+    g_stats.open_turn = turn;
+    g_stats.open_step = step;
+    g_stats.open_ms = ms as i64;
+    g_stats.first_token_ms = 0;
+}
+
+// 首 token 边界：只有匹配当前打开的步、且本步还没记过时才生效（DSH 同）
+export fn st_first_token(turn: i64, step: i64, ms: u64) void {
+    if !g_stats.have_open {
+        return;
+    }
+    if g_stats.open_turn != turn || g_stats.open_step != step {
+        return;
+    }
+    if g_stats.first_token_ms != 0 {
+        return;
+    }
+    g_stats.first_token_ms = ms as i64;
+}
+
+// 一步收尾：llm/ttft/decode 时间 + token 账目
+// out_tokens <= 0 视为「提供方没上报输出 token」→ 不记 decode（见 README 的偏差说明）
+export fn st_assistant_message(turn: i64, step: i64, ms: u64, in_uncached: i64, cache_read: i64, cache_write: i64, out_tokens: i64) void {
+    const iu: i64 = st_clamp0(in_uncached);
+    const cr: i64 = st_clamp0(cache_read);
+    const cw: i64 = st_clamp0(cache_write);
+    const ot: i64 = st_clamp0(out_tokens);
+    g_stats.in_uncached = g_stats.in_uncached + iu;
+    g_stats.cache_read = g_stats.cache_read + cr;
+    g_stats.cache_write = g_stats.cache_write + cw;
+    g_stats.out_tokens = g_stats.out_tokens + ot;
+    g_stats.last_pressure = iu + cr + cw;
+    g_stats.have_pressure = true;
+
+    if !g_stats.have_open {
+        return;
+    }
+    if g_stats.open_turn != turn || g_stats.open_step != step {
+        return;
+    }
+    const t: i64 = ms as i64;
+    g_stats.llm_ms = g_stats.llm_ms + st_clamp0(t - g_stats.open_ms);
+    if g_stats.first_token_ms > 0 {
+        g_stats.ttft_ms = g_stats.ttft_ms + st_clamp0(g_stats.first_token_ms - g_stats.open_ms);
+        g_stats.ttft_steps = g_stats.ttft_steps + 1;
+        if ot > 0 {
+            g_stats.decode_ms = g_stats.decode_ms + st_clamp0(t - g_stats.first_token_ms);
+            g_stats.decode_tokens = g_stats.decode_tokens + ot;
+        }
+    }
+    g_stats.have_open = false;
+}
+
+export fn st_tool_call(call_id: &const byte, cn: usize, ms: u64) void {
+    if cn == 0 {
+        return;
+    }
+    var i: usize = 0;
+    while i < g_stats.npending && i < STATS_PENDING_MAX {
+        if g_stats.pending[i].id.len == cn
+            && bufx_mem_eq(g_stats.pending[i].id.ptr as &const byte, call_id, cn) {
+            g_stats.pending[i].at = ms as i64;   // 同 id 重复：后者胜
+            return;
+        }
+        i = i + 1;
+    }
+    if g_stats.npending >= STATS_PENDING_MAX {
+        // 满了：丢最老的一条（保持有界。日志口径下这只会发生在损坏/交错的日志上）
+        buf_free(&g_stats.pending[0].id);
+        var k: usize = STATS_PENDING_MAX - 1;
+        while k > 0 {
+            g_stats.pending[k - 1] = g_stats.pending[k];
+            k = k - 1;
+        }
+        g_stats.npending = STATS_PENDING_MAX - 1;
+        g_stats.pending[STATS_PENDING_MAX - 1].id = buf_empty();
+        g_stats.pending[STATS_PENDING_MAX - 1].at = 0;
+    }
+    const slot: usize = g_stats.npending;
+    if slot >= STATS_PENDING_MAX {
+        return;
+    }
+    if !buf_valid(&g_stats.pending[slot].id) {
+        g_stats.pending[slot].id = buf_new(cn + 16);
+        if !buf_valid(&g_stats.pending[slot].id) {
+            return;   // OOM：这次调用不计时，但不影响别的边界
+        }
+    }
+    buf_reset(&g_stats.pending[slot].id);
+    _ = buf_append(&g_stats.pending[slot].id, call_id, cn);
+    g_stats.pending[slot].at = ms as i64;
+    g_stats.npending = slot + 1;
+}
+
+export fn st_tool_result(call_id: &const byte, cn: usize, ms: u64) void {
+    var i: usize = 0;
+    while i < g_stats.npending && i < STATS_PENDING_MAX {
+        if g_stats.pending[i].id.len == cn
+            && bufx_mem_eq(g_stats.pending[i].id.ptr as &const byte, call_id, cn) {
+            g_stats.tool_ms = g_stats.tool_ms + st_clamp0((ms as i64) - g_stats.pending[i].at);
+            buf_free(&g_stats.pending[i].id);
+            // 把后面的往前挪一格（逆序循环，两个下标都能被证明在界内）
+            var k: usize = STATS_PENDING_MAX - 1;
+            if g_stats.npending < STATS_PENDING_MAX {
+                k = g_stats.npending - 1;
+            }
+            while k > i {
+                g_stats.pending[k - 1] = g_stats.pending[k];
+                k = k - 1;
+            }
+            if g_stats.npending > 0 {
+                g_stats.npending = g_stats.npending - 1;
+            }
+            const tail: usize = g_stats.npending;
+            if tail < STATS_PENDING_MAX {
+                g_stats.pending[tail].id = buf_empty();
+                g_stats.pending[tail].at = 0;
+            }
+            return;
+        }
+        i = i + 1;
+    }
+    // 没有配对的 tool/call：忽略（DSH 的 folding 也是这样，不凭空造时间）
+}
+
+export fn st_step_end(turn: i64, step: i64) void {
+    _ = step;
+    if !g_stats.have_last_turn || g_stats.last_turn != turn {
+        g_stats.turns = g_stats.turns + 1;
+    }
+    g_stats.have_last_turn = true;
+    g_stats.last_turn = turn;
+    g_stats.steps = g_stats.steps + 1;
+    g_stats.have_open = false;   // 步结束了：未组装的 openStep 不再参与计时
+}
+
+export fn st_turn_end() void {
+    var i: usize = 0;
+    while i < g_stats.npending {
+        buf_free(&g_stats.pending[i].id);
+        g_stats.pending[i].at = 0;
+        i = i + 1;
+    }
+    g_stats.npending = 0;
+}
+
+// ============================================================
+// 回放：把一行会话日志喂进同一份状态机（resume 用）
+// ============================================================
+
+export fn st_fold_line(line: &const Buf) void {
+    if line.len == 0 || (line.ptr as usize) == 0 {
+        return;
+    }
+    var typ: Buf = buf_new(64);
+    defer { buf_free(&typ); }
+    if !sess_line_type(line, &typ) {
+        return;
+    }
+    const view: &[byte] = line.ptr[0: line.len];
+    const ms_i: i64 = sess_json_i64(view, "time" as &const byte);
+    const ms: u64 = if ms_i > 0 { ms_i as u64 } else { 0 as u64 };
+    const turn: i64 = sess_json_i64(view, "turn" as &const byte);
+    const step: i64 = sess_json_i64(view, "step" as &const byte);
+    if bufx_eq_cstr(typ.ptr as &const byte, typ.len, "step/start") {
+        if turn < 0 || step < 0 {
+            return;
+        }
+        st_step_start(turn, step, ms);
+        return;
+    }
+    if bufx_eq_cstr(typ.ptr as &const byte, typ.len, "assistant/first-token") {
+        if turn < 0 || step < 0 {
+            return;
+        }
+        st_first_token(turn, step, ms);
+        return;
+    }
+    if bufx_eq_cstr(typ.ptr as &const byte, typ.len, "assistant/message") {
+        if turn < 0 || step < 0 {
+            return;
+        }
+        st_assistant_message(
+            turn,
+            step,
+            ms,
+            sess_json_i64(view, "inputTokens" as &const byte),
+            sess_json_i64(view, "cacheReadTokens" as &const byte),
+            sess_json_i64(view, "cacheWriteTokens" as &const byte),
+            sess_json_i64(view, "outputTokens" as &const byte)
+        );
+        return;
+    }
+    if bufx_eq_cstr(typ.ptr as &const byte, typ.len, "tool/call") {
+        var cid: Buf = buf_new(128);
+        defer { buf_free(&cid); }
+        if sess_json_str(view, "callId" as &const byte, &cid) {
+            st_tool_call(cid.ptr as &const byte, cid.len, ms);
+        }
+        return;
+    }
+    if bufx_eq_cstr(typ.ptr as &const byte, typ.len, "tool/result") {
+        var cid2: Buf = buf_new(128);
+        defer { buf_free(&cid2); }
+        if sess_json_str(view, "callId" as &const byte, &cid2) {
+            st_tool_result(cid2.ptr as &const byte, cid2.len, ms);
+        }
+        return;
+    }
+    if bufx_eq_cstr(typ.ptr as &const byte, typ.len, "step/end") {
+        st_step_end(turn, step);
+        return;
+    }
+    if bufx_eq_cstr(typ.ptr as &const byte, typ.len, "turn/end") {
+        st_turn_end();
+        return;
+    }
+    // 其它事件（user/message、assistant/reasoning、session/title…）与统计无关
+}
+
+// ============================================================
+// 读数（/status 与自测用）
+// ============================================================
+
+export fn st_turns() i64 { return g_stats.turns; }
+export fn st_steps() i64 { return g_stats.steps; }
+export fn st_llm_ms() i64 { return g_stats.llm_ms; }
+export fn st_tool_ms() i64 { return g_stats.tool_ms; }
+export fn st_ttft_ms() i64 { return g_stats.ttft_ms; }
+export fn st_ttft_steps() i64 { return g_stats.ttft_steps; }
+export fn st_decode_ms() i64 { return g_stats.decode_ms; }
+export fn st_decode_tokens() i64 { return g_stats.decode_tokens; }
+export fn st_billed_input() i64 { return g_stats.in_uncached + g_stats.cache_read + g_stats.cache_write; }
+export fn st_uncached_input() i64 { return g_stats.in_uncached; }
+export fn st_cache_read() i64 { return g_stats.cache_read; }
+export fn st_cache_write() i64 { return g_stats.cache_write; }
+export fn st_out_tokens() i64 { return g_stats.out_tokens; }
+export fn st_pressure() i64 { return g_stats.last_pressure; }
+export fn st_have_pressure() bool { return g_stats.have_pressure; }
+
+// ============================================================
+// 格式化（逐字对照 DSH 客户端的 formatDuration / formatTokens /
+//         formatTokensPerSecond / cacheHitPercent）
+// ============================================================
+
+// 十分之一单位 → "12.3" / "12"（JS 的 String(Math.round(v*10)/10) 就是这么打的：
+// 整数不带小数点）
+fn st_put_tenths(out: &Buf, v10: i64) void {
+    const v: i64 = st_clamp0(v10);
+    _ = buf_append_i64(out, v / 10);
+    const r: i64 = v - (v / 10) * 10;
+    if r != 0 {
+        _ = buf_append_byte(out, 46);                       // '.'
+        _ = buf_append_byte(out, (48 + r) as byte);
+    }
+}
+
+// duration(ms)：< 60s 一位小数 + "s"；否则 "{m}m{s}s"
+// 用 num/den 表达「平均值」：duration(avg) 时 den = 步数，避免先把小数截断
+fn st_put_duration_frac(out: &Buf, num: i64, den: i64) void {
+    if den <= 0 {
+        _ = buf_append_cstr(out, "0s");
+        return;
+    }
+    const n: i64 = st_clamp0(num);
+    if n < 60000 * den {                                    // s < 60
+        st_put_tenths(out, st_round_div(n, den * 100));
+        _ = buf_append_byte(out, 115);                      // 's'
+        return;
+    }
+    const whole: i64 = st_round_div(n, den * 1000);
+    _ = buf_append_i64(out, whole / 60);
+    _ = buf_append_byte(out, 109);                          // 'm'
+    _ = buf_append_i64(out, whole - (whole / 60) * 60);
+    _ = buf_append_byte(out, 115);                          // 's'
+}
+
+export fn st_fmt_duration(out: &Buf, ms: i64) void {
+    st_put_duration_frac(out, ms, 1);
+}
+
+// DSH: formatDuration(stats.ttftMs / stats.ttftSteps)
+export fn st_fmt_duration_avg(out: &Buf, total_ms: i64, n: i64) void {
+    st_put_duration_frac(out, total_ms, n);
+}
+
+// scaled(v)：v >= 100 取整，否则一位小数（v 用十分之一单位表达）
+fn st_put_scaled(out: &Buf, v10: i64) void {
+    if v10 >= 1000 {
+        _ = buf_append_i64(out, st_round_div(v10, 10));
+        return;
+    }
+    st_put_tenths(out, v10);
+}
+
+export fn st_fmt_tokens(out: &Buf, n: i64) void {
+    const v: i64 = st_clamp0(n);
+    if v < 1000 {
+        _ = buf_append_i64(out, v);
+        return;
+    }
+    if v < 1000000 {
+        st_put_scaled(out, st_round_div(v, 100));           // v/1000 的十分之一
+        _ = buf_append_byte(out, 75);                       // 'K'
+        return;
+    }
+    st_put_scaled(out, st_round_div(v, 100000));            // v/1e6 的十分之一
+    _ = buf_append_byte(out, 77);                           // 'M'
+}
+
+// DSH: formatTokensPerSecond(decodeTokens / (decodeMs / 1e3))
+export fn st_fmt_tps(out: &Buf, decode_tokens: i64, decode_ms: i64) void {
+    if decode_ms <= 0 {
+        _ = buf_append_byte(out, 48);
+        return;
+    }
+    const t10: i64 = st_round_div(st_clamp0(decode_tokens) * 10000, decode_ms);
+    if t10 >= 100 {
+        _ = buf_append_i64(out, st_round_div(t10, 10));     // >= 10 tok/s：整数
+        return;
+    }
+    st_put_tenths(out, t10);
+}
+
+// DSH 的 roundedIntegerPercent：read/billed 的整数百分比，恰好 .5 向上
+fn st_cache_int_pct(read: i64, billed: i64) i64 {
+    const dq: i64 = billed / 200;
+    const dr: i64 = billed - dq * 200;
+    var lower: i64 = 0;
+    var upper: i64 = 100;
+    while lower < upper {
+        const candidate: i64 = ((lower + upper) + 1) / 2;
+        const factor: i64 = candidate * 2 - 1;
+        const need: i64 = (factor * dq) + st_ceil_div(factor * dr, 200);
+        if read >= need {
+            lower = candidate;
+        } else {
+            upper = candidate - 1;
+        }
+    }
+    return lower;
+}
+
+// 缓存命中率文本（不带 '%'）。返回 false = 没有计费输入，整组不显示。
+//
+// 除了整数百分比，还照抄了 DSH 的「只在会舍入成 100% 时加小数位」：全命中才是
+// 100，有 miss 时最小精度地打 99.9…x，避免把 99.96% 说成 100%。
+export fn st_fmt_cache_hit(out: &Buf, cache_read: i64, billed: i64) bool {
+    if billed <= 0 {
+        return false;
+    }
+    var read: i64 = st_clamp0(cache_read);
+    if read > billed {
+        read = billed;
+    }
+    const missed: i64 = billed - read;
+    if missed == 0 {
+        _ = buf_append_cstr(out, "100");
+        return true;
+    }
+    const ip: i64 = st_cache_int_pct(read, billed);
+    if ip < 100 {
+        _ = buf_append_i64(out, ip);
+        return true;
+    }
+    var places: i64 = 1;
+    var gap: i64 = missed * 200;
+    const dt: i64 = billed / 10;
+    while gap <= dt {
+        gap = gap * 10;
+        places = places + 1;
+    }
+    const dones: i64 = billed - dt * 10;
+    var loss: i64 = 5;
+    var l: i64 = 1;
+    while l < 5 {
+        const factor: i64 = l * 2 + 1;
+        const threshold: i64 = (factor * dt) + ((factor * dones) / 10);
+        if gap <= threshold {
+            loss = l;
+            break;
+        }
+        l = l + 1;
+    }
+    _ = buf_append_cstr(out, "99.");
+    var k: i64 = 1;
+    while k < places {
+        _ = buf_append_byte(out, 57);                       // '9'
+        k = k + 1;
+    }
+    _ = buf_append_byte(out, (48 + (10 - loss)) as byte);
+    return true;
+}
+
+// ============================================================
+// 统计行（DSH StatsLine：组内 " · "、组间 " | "）
+// ============================================================
+
+fn st_line_sep(out: &Buf) void {
+    if out.len > 0 {
+        _ = buf_append_cstr(out, " | ");
+    }
+}
+
+// 返回值：是否写出了非空统计行（false = 脚注右半区退回版本号）
+export fn st_line(out: &Buf) bool {
+    buf_reset(out);
+    if g_stats.steps > 0 {
+        _ = buf_append_i64(out, g_stats.turns);
+        _ = buf_append_cstr(out, " 轮 · ");
+        _ = buf_append_i64(out, g_stats.steps);
+        _ = buf_append_cstr(out, " 步");
+
+        var dur: Buf = buf_new(128);
+        defer { buf_free(&dur); }
+        if g_stats.llm_ms > 0 {
+            _ = buf_append_cstr(&dur, "LLM ");
+            st_fmt_duration(&dur, g_stats.llm_ms);
+        }
+        if g_stats.tool_ms > 0 {
+            if dur.len > 0 {
+                _ = buf_append_cstr(&dur, " · ");
+            }
+            _ = buf_append_cstr(&dur, "工具调用 ");
+            st_fmt_duration(&dur, g_stats.tool_ms);
+        }
+        if dur.len > 0 {
+            st_line_sep(out);
+            _ = buf_append(out, dur.ptr, dur.len);
+        }
+
+        var spd: Buf = buf_new(128);
+        defer { buf_free(&spd); }
+        if g_stats.ttft_steps > 0 {
+            _ = buf_append_cstr(&spd, "首 token 平均 ");
+            st_fmt_duration_avg(&spd, g_stats.ttft_ms, g_stats.ttft_steps);
+        }
+        if g_stats.decode_ms > 0 {
+            if spd.len > 0 {
+                _ = buf_append_cstr(&spd, " · ");
+            }
+            st_fmt_tps(&spd, g_stats.decode_tokens, g_stats.decode_ms);
+            _ = buf_append_cstr(&spd, " tok/s");
+        }
+        if spd.len > 0 {
+            st_line_sep(out);
+            _ = buf_append(out, spd.ptr, spd.len);
+        }
+    }
+    const billed: i64 = st_billed_input();
+    if billed > 0 || g_stats.out_tokens > 0 {
+        var ch: Buf = buf_new(32);
+        defer { buf_free(&ch); }
+        if st_fmt_cache_hit(&ch, g_stats.cache_read, billed) {
+            st_line_sep(out);
+            _ = buf_append_cstr(out, "缓存命中 ");
+            _ = buf_append(out, ch.ptr, ch.len);
+            _ = buf_append_byte(out, 37);                   // '%'
+        }
+        st_line_sep(out);
+        _ = buf_append_cstr(out, "输入 ");
+        st_fmt_tokens(out, billed);
+        _ = buf_append_cstr(out, " tok · 输出 ");
+        st_fmt_tokens(out, g_stats.out_tokens);
+        _ = buf_append_cstr(out, " tok");
+    }
+    return out.len > 0;
+}
+
+// ============================================================
+// 上下文占用（DSH contextOccupancy / ContextMeter）
+// ============================================================
+
+// 返回 -1 = 分子或容量缺失（DSH 的 contextOccupancy 返回 null → 整枚圆环不渲染）
+export fn st_ctx_percent(used: i64, capacity: i64) i32 {
+    if used < 0 || capacity <= 0 {
+        return -1;
+    }
+    const p: i64 = st_round_div(used * 100, capacity);
+    if p > 100 {
+        return 100;
+    }
+    return p as i32;
+}
+
+// DSH 的 projectedTokens：提供方样本 + 自取样以来表层增量的启发式重估（钳 0）。
+// est_at_sample < 0 = 没有增量基准（resume 首帧）→ 只用样本。
+export fn st_ctx_projected(sample: i64, est_at_sample: i64, est_now: i64) i64 {
+    const s: i64 = st_clamp0(sample);
+    if est_at_sample < 0 {
+        return s;
+    }
+    return st_clamp0(s + (est_now - est_at_sample));
+}
+
+// "~238K / 517K"（容量未知时 "~238K / 未知容量"）
+export fn st_fmt_figures(out: &Buf, used: i64, capacity: i64) void {
+    _ = buf_append_byte(out, 126);                          // '~'
+    st_fmt_tokens(out, used);
+    _ = buf_append_cstr(out, " / ");
+    if capacity <= 0 {
+        _ = buf_append_cstr(out, "未知容量");
+        return;
+    }
+    st_fmt_tokens(out, capacity);
+}
+
+// 20 格占用条：填充 = percent 占比，按三段（系统/工具/消息）比例切成 █▓▒，其余 ░。
+// 三段全 0（或没给明细）时单段 █ —— 对应 DSH 无 breakdown 时的单段条。
+fn st_put_bar(out: &Buf, percent: i64, sys_t: i64, tools_t: i64, msgs_t: i64, cells: i64) void {
+    if cells <= 0 {
+        return;
+    }
+    const p: i64 = if percent < 0 { 0 as i64 } else { percent };
+    var filled: i64 = st_round_div(cells * p, 100);
+    if filled > cells {
+        filled = cells;
+    }
+    const total: i64 = st_clamp0(sys_t) + st_clamp0(tools_t) + st_clamp0(msgs_t);
+    var n1: i64 = filled;
+    var n2: i64 = 0;
+    var n3: i64 = 0;
+    if total > 0 && filled > 0 {
+        const e1: i64 = st_round_div(filled * st_clamp0(sys_t), total);
+        const e2: i64 = st_round_div(filled * (st_clamp0(sys_t) + st_clamp0(tools_t)), total);
+        n1 = e1;
+        n2 = e2 - e1;
+        n3 = filled - e2;
+        if n1 < 0 {
+            n1 = 0;
+        }
+        if n2 < 0 {
+            n2 = 0;
+        }
+        if n3 < 0 {
+            n3 = 0;
+        }
+        while n1 + n2 + n3 > filled {
+            if n3 > 0 {
+                n3 = n3 - 1;
+            } else if (n2 > 0) {
+                n2 = n2 - 1;
+            } else {
+                n1 = n1 - 1;
+            }
+        }
+    }
+    _ = buf_append_byte(out, 91);                           // '['
+    var i: i64 = 0;
+    while i < n1 {
+        _ = buf_append_cstr(out, "█");
+        i = i + 1;
+    }
+    i = 0;
+    while i < n2 {
+        _ = buf_append_cstr(out, "▓");
+        i = i + 1;
+    }
+    i = 0;
+    while i < n3 {
+        _ = buf_append_cstr(out, "▒");
+        i = i + 1;
+    }
+    i = filled;
+    while i < cells {
+        _ = buf_append_cstr(out, "░");
+        i = i + 1;
+    }
+    _ = buf_append_byte(out, 93);                           // ']'
+}
+
+// /status 的上下文块（DSH 点击面板的终端等价物）
+export fn st_ctx_detail(out: &Buf, used: i64, capacity: i64, sys_t: i64, tools_t: i64, msgs_t: i64, cells: i64) void {
+    const pct: i32 = st_ctx_percent(used, capacity);
+    _ = buf_append_cstr(out, "上下文已用    ");
+    if pct < 0 {
+        _ = buf_append_cstr(out, "容量未知\n");
+    } else {
+        _ = buf_append_u64(out, pct as u64);
+        _ = buf_append_cstr(out, "%\n");
+    }
+    _ = buf_append_cstr(out, "已用/容量     ");
+    st_fmt_figures(out, used, capacity);
+    _ = buf_append_byte(out, 10);
+    if pct >= 0 {
+        _ = buf_append_cstr(out, "占用条        ");
+        st_put_bar(out, pct as i64, sys_t, tools_t, msgs_t, cells);
+        _ = buf_append_byte(out, 32);
+        _ = buf_append_u64(out, pct as u64);
+        _ = buf_append_cstr(out, "%\n");
+    }
+    _ = buf_append_cstr(out, "系统提示词    ");
+    _ = buf_append_byte(out, 126);
+    st_fmt_tokens(out, sys_t);
+    _ = buf_append_cstr(out, "\n工具          ");
+    _ = buf_append_byte(out, 126);
+    st_fmt_tokens(out, tools_t);
+    _ = buf_append_cstr(out, "\n对话消息      ");
+    _ = buf_append_byte(out, 126);
+    st_fmt_tokens(out, msgs_t);
+    _ = buf_append_byte(out, 10);
+}
+
+// /status 的统计明细（逐字段，脚注那一行放不下时看这里）
+export fn st_stats_detail(out: &Buf) void {
+    _ = buf_append_cstr(out, "轮/步         ");
+    _ = buf_append_i64(out, g_stats.turns);
+    _ = buf_append_cstr(out, " 轮 · ");
+    _ = buf_append_i64(out, g_stats.steps);
+    _ = buf_append_cstr(out, " 步\nLLM           ");
+    st_fmt_duration(out, g_stats.llm_ms);
+    _ = buf_append_cstr(out, "\n工具调用      ");
+    st_fmt_duration(out, g_stats.tool_ms);
+    _ = buf_append_cstr(out, "\n首 token 平均 ");
+    if g_stats.ttft_steps > 0 {
+        st_fmt_duration_avg(out, g_stats.ttft_ms, g_stats.ttft_steps);
+    } else {
+        _ = buf_append_cstr(out, "-");
+    }
+    _ = buf_append_cstr(out, "\n解码          ");
+    if g_stats.decode_ms > 0 {
+        st_fmt_tps(out, g_stats.decode_tokens, g_stats.decode_ms);
+        _ = buf_append_cstr(out, " tok/s · ");
+        st_fmt_tokens(out, g_stats.decode_tokens);
+        _ = buf_append_cstr(out, " tok / ");
+        st_fmt_duration(out, g_stats.decode_ms);
+    } else {
+        _ = buf_append_cstr(out, "-");
+    }
+    _ = buf_append_cstr(out, "\n缓存命中      ");
+    var ch: Buf = buf_new(32);
+    defer { buf_free(&ch); }
+    if st_fmt_cache_hit(&ch, g_stats.cache_read, st_billed_input()) {
+        _ = buf_append(out, ch.ptr, ch.len);
+        _ = buf_append_cstr(out, "%");
+    } else {
+        _ = buf_append_cstr(out, "-");
+    }
+    _ = buf_append_cstr(out, "\n输入/输出     ");
+    st_fmt_tokens(out, st_billed_input());
+    _ = buf_append_cstr(out, " tok / ");
+    st_fmt_tokens(out, g_stats.out_tokens);
+    _ = buf_append_cstr(out, " tok\n");
+}

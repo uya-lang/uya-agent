@@ -130,6 +130,59 @@ fn deleg_find(t: &const DelegTable, id: i32) isize {
     return -1;
 }
 
+// 释放一个槽位（子代理已进终态、进程已被 waitpid 收掉）：把缓冲还给分配器并把
+// 记录清空，让 deleg_slot 能把它再分给新的子代理。
+fn deleg_release(t: &DelegTable, i: usize) void {
+    if i >= DELEG_MAX {
+        return;
+    }
+    const d: &Deleg = &t.items[i];
+    if !d.used {
+        return;
+    }
+    buf_free(&d.label);
+    buf_free(&d.prompt);
+    buf_free(&d.sid);
+    buf_free(&d.objective);
+    buf_free(&d.buf);
+    if d.fd >= 0 {
+        _ = sys_close(d.fd) catch {};
+    }
+    t.items[i] = deleg_empty();
+}
+
+// 槽位不够时回收。原实现里 `used` 只被置 true、**从不复位**，于是 4 个槽位用满
+// 一次以后，subagent / subagent_fork / ralph / send_message 全部永久失败
+// （报 "too many running"）—— 实测就是这么卡死的。这里只回收**已进终态**的槽位
+// （进程已回收、管道已关闭）；优先回收「输出已被父进程读空」的，否则回收最早开始的，
+// 保证永远可以继续派生。
+fn deleg_reclaim(t: &DelegTable) bool {
+    deleg_poll_all(t);            // 先把僵尸收掉，status 才是终态
+    var best: isize = -1;
+    var best_consumed: bool = false;
+    var best_started: u64 = 0;
+    var i: usize = 0;
+    while i < DELEG_MAX {
+        const d: &const Deleg = &t.items[i];
+        if d.used && d.reaped && d.status != DELEG_RUNNING {
+            const consumed: bool = d.read_off >= d.buf.len;
+            if best < 0
+                || (consumed && !best_consumed)
+                || (consumed == best_consumed && d.started_ms < best_started) {
+                best = i as isize;
+                best_consumed = consumed;
+                best_started = d.started_ms;
+            }
+        }
+        i = i + 1;
+    }
+    if best < 0 {
+        return false;
+    }
+    deleg_release(t, best as usize);
+    return true;
+}
+
 export fn deleg_status_name(st: u8) &const byte {
     if st == DELEG_DONE {
         return "idle" as &const byte;     // DSH：跑完就是 idle，可以再 send_message
@@ -197,7 +250,7 @@ fn deleg_clone_cfg(src: &const Config, dst: &Config, prompt: &const Buf, label: 
     dst.max_tool_out = src.max_tool_out;
     dst.shell_timeout_ms = src.shell_timeout_ms;
     dst.allow_shell = src.allow_shell;
-    dst.access = src.access;         // P18：子代理继承访问模式（bash 沙箱与写策略一致）
+    dst.access = src.access;         // P21：子代理继承访问模式（bash 沙箱与写策略一致）
     dst.sandbox = src.sandbox;
     dst.sandbox_src = src.sandbox_src;
     deleg_cfg_set(&dst.bwrap, &src.bwrap);
@@ -225,7 +278,7 @@ fn deleg_clone_cfg(src: &const Config, dst: &Config, prompt: &const Buf, label: 
 }
 
 // 子进程主体：跑一个（或 Ralph 的多个）回合，把结果写进 wfd
-fn deleg_child_main(src: &const Config, prompt: &const Buf, label: &const Buf, kind: u8, max_rounds: i32, fork_parent: bool, wfd: i32) void {
+fn deleg_child_main(src: &const Config, prompt: &const Buf, label: &const Buf, kind: u8, max_rounds: i32, fork_parent: bool, forced_sid: &const Buf, wfd: i32) void {
     // 先把 stdout/stderr 静音，避免污染父进程的界面
     // （排查子代理时设 UYA_AGENT_DEBUG_SUBAGENT=1 保留 stderr）
     const dbg: &byte = getenv("UYA_AGENT_DEBUG_SUBAGENT");
@@ -240,6 +293,10 @@ fn deleg_child_main(src: &const Config, prompt: &const Buf, label: &const Buf, k
     var c: Config = cfg_default();
     deleg_clone_cfg(src, &c, prompt, label);
     c.deleg_depth = src.deleg_depth + 1;
+    // 用父进程预生成的会话 id 开自己的会话（父子因此对得上，send_message 才能续跑）
+    if forced_sid.len > 0 {
+        deleg_cfg_set(&c.force_session_id, forced_sid);
+    }
     // 父会话 = **父进程当前开的那个会话**（g_sess 在 fork 出来的副本里就是父的记录）
     c.parent_session = buf_empty();
     if g_sess.id.len > 0 {
@@ -320,13 +377,38 @@ fn deleg_child_main(src: &const Config, prompt: &const Buf, label: &const Buf, k
 
 // 派生：返回记录下标（-1 失败）。fork_parent=true 时子代理会继承父会话历史。
 export fn deleg_spawn(src: &const Config, t: &DelegTable, prompt: &const Buf, label: &const Buf, kind: u8, max_rounds: i32, fork_parent: bool) isize {
-    const slot: isize = deleg_slot(t);
+    var slot: isize = deleg_slot(t);
+    if slot < 0 {
+        // 满了：先回收已进终态的旧槽位再试一次（否则 4 个槽位用满后永久卡死）
+        if !deleg_reclaim(t) {
+            return -1;
+        }
+        slot = deleg_slot(t);
+    }
     if slot < 0 {
         return -1;
     }
     var fds: [i32: 2] = [0: 2];
     if (sys_pipe2(&fds[0], 0) catch { -1; }) != 0 {
         return -1;
+    }
+    // 会话 id：**父进程先生成**（fork 后父子共享同一份内存），于是子进程用它开自己的会话、
+    // 父进程把它记进 d.sid —— send_message 续跑才能真的接到同一个会话上。
+    // 原来 d.sid 从没被赋过值（恒空），续跑其实每次都新开会话、上下文全丢。
+    // 续跑（调用方已经用 force_session_id 指明会话）时沿用同一个 id；ralph 每轮新会话，不强制。
+    var forced_sid: Buf = buf_empty();
+    defer { buf_free(&forced_sid); }
+    if src.force_session_id.len > 0 {
+        forced_sid = buf_new(src.force_session_id.len + 8);
+        if buf_valid(&forced_sid) {
+            _ = buf_append(&forced_sid, src.force_session_id.ptr, src.force_session_id.len);
+        }
+    } else if kind != DELEG_KIND_RALPH {
+        forced_sid = buf_new(80);
+        if !sess_new_id(&forced_sid) {
+            buf_free(&forced_sid);
+            forced_sid = buf_empty();
+        }
     }
     const pid64: i64 = sys_fork() catch {
         _ = sys_close(fds[0]) catch {};
@@ -337,7 +419,7 @@ export fn deleg_spawn(src: &const Config, t: &DelegTable, prompt: &const Buf, la
         // P1：信号处置是继承的 —— 子进程必须先恢复默认，否则它收到 TERM 会去写父进程的终端
         sigx_reset_for_child();
         _ = sys_close(fds[0]) catch {};
-        deleg_child_main(src, prompt, label, kind, max_rounds, fork_parent, fds[1]);
+        deleg_child_main(src, prompt, label, kind, max_rounds, fork_parent, &forced_sid, fds[1]);
         sys_exit(0);
     }
     _ = sys_close(fds[1]) catch {};
@@ -372,6 +454,13 @@ export fn deleg_spawn(src: &const Config, t: &DelegTable, prompt: &const Buf, la
         _ = buf_append(&d.prompt, prompt.ptr, prompt.len);
     }
     d.sid = buf_empty();
+    // 子会话 id：父进程刚为它预生成的（ralph 不预生成，保持空 —— 它每轮新会话）
+    if forced_sid.len > 0 {
+        d.sid = buf_new(forced_sid.len + 8);
+        if buf_valid(&d.sid) {
+            _ = buf_append(&d.sid, forced_sid.ptr, forced_sid.len);
+        }
+    }
     d.objective = buf_empty();
     deleg_agents_refresh();     // 新窗口立刻出现在面板上
     return slot;
@@ -750,7 +839,14 @@ export fn deleg_tool_send(cfg: &const Config, t: &DelegTable, args: &const JsonV
         _ = buf_append_cstr(out, " is still working; wait for its current turn to finish before sending another message");
         return;
     }
-    // 续跑：复用它的会话（resume_id），开一个新的子进程
+    // 续跑：**同一个会话**接着跑。会话 id 是 spawn 时父子约定的那个（d.sid），
+    // 这里把它交给 deleg_spawn 重新指定 —— 子进程会用同一个 id 打开已有日志（续写）。
+    if t.items[si].sid.len == 0 {
+        _ = buf_append_cstr(out, "Error: subagent sub-");
+        _ = buf_append_u64(out, id as u64);
+        _ = buf_append_cstr(out, " has no session to continue (ralph rounds are fresh-agent by design)");
+        return;
+    }
     var prompt_copy: Buf = buf_new(msg.len + 8);
     defer { buf_free(&prompt_copy); }
     _ = buf_append(&prompt_copy, msg.ptr, msg.len);
@@ -760,7 +856,7 @@ export fn deleg_tool_send(cfg: &const Config, t: &DelegTable, args: &const JsonV
     _ = buf_append_cstr(&label_copy, " (continued)");
     var sub_cfg: Config = cfg_default();
     deleg_clone_cfg(cfg, &sub_cfg, &prompt_copy, &label_copy);
-    deleg_cfg_set(&sub_cfg.resume_id, &t.items[si].sid);
+    deleg_cfg_set(&sub_cfg.force_session_id, &t.items[si].sid);
     const new_slot: isize = deleg_spawn(&sub_cfg, t, &prompt_copy, &label_copy, DELEG_KIND_SUB, 1, false);
     cfg_free(&sub_cfg);
     if new_slot < 0 {
