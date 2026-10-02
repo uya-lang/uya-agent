@@ -111,6 +111,8 @@ export UYA_SPLIT_C_DIR=$PWD/build/uyacache      # 多文件 C 缓存别丢在仓
 | `--timeout-ms N` | 单次 HTTP 超时，默认 120 s |
 | `--no-shell` | 不提供 `run_shell`（tools schema 里也不会出现） |
 | `--no-stream` | 关闭流式，回退一次性响应（老端点兼容） |
+| `--api=MODE` | 线协议：`openai-responses`（**默认**）/ `openai-completions`（也接受 `responses` / `chat` / `completions`）。**不写 = 未声明**：先打 `/responses`，只有 404/405/501 才回退 `chat/completions`（每进程一次），见「Responses 接口」一节 |
+| `--reasoning-effort V` | 发 `reasoning.effort`（只有 responses 发；`off`/`none` = 不发），默认取 DSH 的 `agent-default-model.reasoningEffort` |
 | REPL 命令 | `/help` `/continue` `/status` `/compact` `/plan` `/sessions` `/resume <id>` `/new` `/exit` |
 | `--agent-home DIR` | 会话与索引的根目录（默认 `~/.uya-agent`） |
 | `--continue` | 接着当前目录最近一条会话继续 |
@@ -146,6 +148,8 @@ export UYA_SPLIT_C_DIR=$PWD/build/uyacache      # 多文件 C 缓存别丢在仓
 
 环境变量：`UYA_AGENT_BASE_URL`、`UYA_AGENT_MODEL`、`UYA_AGENT_WORKSPACE`、
 `UYA_AGENT_MAX_STEPS`（步数熔断上限，`0` = 不限，也是默认值；非法值告警后按「不限」处理）、
+`UYA_AGENT_API`（`openai-responses` / `openai-completions`；非法值告警后按「未声明」处理，即仍会先试 responses）、
+`UYA_AGENT_REASONING_EFFORT`（`off`/`none` = 不发），
 以及 key（三选一）：`UYA_AGENT_API_KEY` / `DEEPSEEK_API_KEY` / `OPENAI_API_KEY`。
 
 退出码：`0` 成功 · `1` 用法/配置错 · `2` 传输错（DNS/TCP/TLS/超时）· `3` 模型或协议错
@@ -161,8 +165,9 @@ src/jsonx.uya     JSON：JsonWriter 组装请求；JsonValue 导航取值；字�
 src/httpc.uya     传输层：URL 解析、DNS+TCP、TLS 会话、请求构造、非流式响应解析、leaf 指纹
 src/httpstream.uya 流式传输：请求发出后只读到响应头，body 按需增量解码（chunked 状态机）
 src/sse.uya       SSE 分帧：字段行、多行 data、空行 dispatch、注释、未终结帧不冲刷
-src/llm.uya       请求/响应协议：消息组装、流式 delta 装配（content/reasoning/tool_calls）、
-                  usage 合并、finish_reason 映射、非流式响应 → 同一 ChatOut
+src/llm.uya       请求/响应协议（两种）：chat/completions 的流式 delta 装配与
+                  /v1/responses 的事件表解析（content/reasoning/function_call/usage/status）、
+                  两者都归一成同一个 ChatOut；非流式响应同样归一
 src/tools.uya     三个工具：read_file / write_file / run_shell
 src/tty.uya       终端层：termios raw 模式、行编辑器（历史/光标/Delete/词删除，**按 UTF-8
                   字符编辑、按显示列定位**）、渲染协议（擦输入行→写→重画，输入行折行或紧跟
@@ -424,6 +429,13 @@ Messages API（`x-api-key` + `anthropic-version: 2023-06-01`，服务端工具 `
   `context_window` / `max_tokens` / `input_image`（模型条目）、`api_key`
   （按 `apiKeyEnv` 走「进程环境 > `.credentials.yaml` > `<cwd>/.env` > `$DSH_HOME/.env`」四层）、
   以及 `permission.defaultPreset → confine`（`danger-full-access` 不限制，其它预设启用工作区守卫）。
+* **`api:` 真的决定线协议**（不再只是打印）：`openai-responses` → `/responses`，`openai-completions` → 
+  `/chat/completions`，声明后**不协商**；认不出来的取值（`anthropic` / `azure-openai-responses` /
+  `openai-codex-responses` …）打一条 warning 后按「未声明」处理 —— 也就是仍然先试 `/responses`、
+  404/405/501 回退 chat。`--api=` / `UYA_AGENT_API` 可以覆盖它（优先级 CLI > env > DSH > 默认）。
+* `compat` 也读：`supportsDeveloperRole`（决定系统提示发 `developer` 还是 `system`）、
+  `supportsStore`（决定发不发 `"store": false`）、`supportsReasoningEffort`（决定发不发 `reasoning.effort`）；
+  provider 级是默认值，**模型条目的同名键覆盖它**（与 DSH 一致）。
 * 优先级：**CLI > `UYA_AGENT_*` 环境变量 > DSH 设置 > 内置默认**，`--print-config` 逐项打印来源
   （`default` / `dsh-settings` / `env` / `cli`），敏感值打码成 `sk-…abcd`；
   `tls_verify` / `tls_pin` 也照样打来源，指纹是公开信息所以完整打印（方便直接和 `openssl` 对比）。
@@ -529,6 +541,72 @@ Messages API（`x-api-key` + `anthropic-version: 2023-06-01`，服务端工具 `
 * `usage` 的缓存读数只在**本帧给了明细**时更新：网关尾随的 usage-only 帧常常只带
   `prompt_tokens`/`completion_tokens`，无条件覆盖会把已拿到的 `cached_tokens` 清成 0。
 
+### Responses 接口（`/v1/responses`）
+
+**默认就支持**：什么都不声明时先按 Responses 发（`POST {base_url}/responses`），
+只有「端点不存在」（HTTP **404/405/501**）才在本进程内回退 `chat/completions` 并**记住**——
+同一步用另一个协议重发一次，之后所有请求（后续 step、压缩摘要、子代理）都不再试探。
+被探测掉的那次只留一行提示（不 dump 响应体）：
+
+```
+[api] /v1/responses 不可用（HTTP 404），本进程改用 chat/completions
+```
+
+`api:` 一旦被**显式声明**（DSH 设置里 provider 的 `api:` / `UYA_AGENT_API` / `--api=`），就完全不协商：
+声明即权威（`--print-config` 会显示 `api = …  (source: dsh-settings|env|cli)`；未声明时显示
+`(source: default, negotiable→chat/completions)`）。反过来，状态码 200/400/401/500 都**不会**换协议 ——
+那些说明协议没选错，硬换只会把错误藏起来。
+
+请求体（字段顺序固定，便于断言与 KV 前缀稳定）：
+
+```
+{ "model": …, "input": [ …items… ], "stream": true, "store": false,
+  "tools": [ …扁平 schema… ], "temperature": …?, "max_output_tokens": …?, "reasoning": {"effort": …}? }
+```
+
+* 历史 → `input` items（**只在拼请求时转换**，内部历史与会话日志格式不变，所以老会话/`--resume`/
+  `--resume-dsh`/子代理 fork 全都继续可用）：
+
+  | 内部消息 | item |
+  |---|---|
+  | system | `{"role":"developer","content":"<整段>"}`（`compat.supportsDeveloperRole=false` 时用 `system`；content 是普通字符串，与 pi-ai 同形） |
+  | user | `{"role":"user","content":[{"type":"input_text","text":…}]}` |
+  | assistant | `{"type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":…}]}` |
+  | assistant(tool_calls) | 上面那条 + 每个调用一条 `{"type":"function_call","call_id":…,"name":…,"arguments":"<JSON 文本>"}` |
+  | tool 结果 | `{"type":"function_call_output","call_id":…,"output":"<文本；空则 (no output)>"}` |
+
+* **`call_id` 只取 `|` 前那段**，item id（`fc_*`）不回放、reasoning item 也不回放（不发
+  `include: ["reasoning.encrypted_content"]`）——与 pi-ai 处理「外来消息」的做法一致，省掉
+  `fc_*`/`rs_*` 的配对校验；`--resume-dsh` 导进来的历史里 id 形如 `call_x|fc_y` 也能正确拆开。
+* 工具 schema 用**扁平**形状（`{"type":"function","name":…,"description":…,"parameters":…}`），
+  由 chat 形状的 26 个常量（其中 25 个进数组）做一次文本变换得到：去掉 31 字节前缀
+  `{"type":"function","function":{` 与末尾一个 `}`。变换后逐条 parse 校验（自测 `resp-build` 轮守着）；
+  常量若被改成别的形状，构请求时会立刻报 `error: tool schema constant is not in the expected chat shape`。
+* `max_tokens` → `max_output_tokens`（下限抬到 16：OpenAI 拒绝更小的值）；`stream_options` 不发；
+  `store: false` 默认发，`compat.supportsStore: false` 时整个字段省略。
+* 流式事件表（只处理有语义的，其余忽略）：
+  `response.output_item.added/done`（`function_call` 建槽/补 name/args）、
+  `response.output_text.delta`（`response.refusal.delta` 同）、
+  `response.reasoning_summary_text.delta` / `response.reasoning_text.delta`（→ 思考块）、
+  `response.function_call_arguments.delta/done`（按 `output_index` 分片累积）、
+  `response.completed` / `response.incomplete` / `response.failed`（终局）、`error`。
+  终局事件里若带 `response.output[]`，还会按 `call_id` / `output_text` **回填空缺**——
+  有些网关只发 `created` + `completed`，正文与参数只在终局里。
+* `response.function_call_arguments.delta` 的 `delta` 是**字符串**（内容是 arguments 的 JSON
+  文本片段，可能被切成多片），不是对象 —— 解析器按字符串取（`js_obj_get_str` + `sv_unescape`）
+  逐片追加。自测的 mock 一开始按对象发，客户端直接忽略，于是「工具拿到空 arguments」在自测里
+  溜了过去（那条 marker 断言正好被任务文本里的同名 marker 满足，抓不出来）；现在按规范发字符串，
+  `ctrl-bytes-resp` 轮（真跑一条命令、断言工具输出回到请求里）把这个形状钉住了。
+* finish 映射：`completed` → stop（有工具调用则 tool-calls）；`incomplete` + `max_output_tokens` → max-tokens
+  （工具调用一律丢弃）；`failed`/`cancelled` 或 `error` → error（`err_text` = `code: message`，不派发工具）。
+* 协议本身**不发 `[DONE]`**：收到终局事件即收尾；缺终局事件按「流被截断」（`STREAM_CLOSED`）处理。
+  少数代理仍会发 `[DONE]`、甚至把 responses 的流按 chat 形状（`choices[].delta`）回 —— 两种都兜住。
+* usage：`input_tokens`（**含**缓存）/ `input_tokens_details.cached_tokens` / `output_tokens` /
+  `output_tokens_details.reasoning_tokens`，映射进与 chat 相同的四个计数器
+  （`usage_in = input - cached - cache_write`）。
+* `--no-stream` 也支持：发 `"stream": false`，解析一次性响应体的 `output[]`（`message` / `reasoning` /
+  `function_call`），同样归一成 ChatOut。
+
 ### 严格工具协议要点（P2）
 
 * assistant 消息连同 `tool_calls` **原样回灌**（`arguments` 用 `jw_raw` 内联，绝不二次转义），
@@ -551,7 +629,7 @@ Messages API（`x-api-key` + `anthropic-version: 2023-06-01`，服务端工具 `
 数据流（一轮）：
 
 ```
-history ──build_request(JsonWriter)──▶ POST {base_url}/chat/completions ──http_request──▶ 响应体
+history ──build_model_request(JsonWriter)──▶ POST {base_url}/{chat/completions|responses} ──http_request──▶ 响应体
    ▲                                                                                      │
    │                                                      std.json.parse → choices[0].message
    │                                                                                      │
@@ -683,9 +761,9 @@ vLLM 等 OpenAI 兼容端点都一样稳。想升级成严格 `tool` 角色消�
       其余走 `\u00XX`），见 `jsonx.uya::jw_str` / `jw_write_escaped`（`jw_key` 复用同一套）。
       别再退回标准库那个实现 —— 它省掉的正是「必须转义」的那一半。
     * **请求体（紧凑 JSON）里不许出现任何裸控制字节**：这是本地就能判的硬不变量。`selftest` 的
-      mock LLM 对**每一个**收到的请求体都扫一遍（判定码 190），另有纯函数轮 `json-escape`
+      mock LLM 对**每一个**收到的请求体都扫一遍（判定码 240），另有纯函数轮 `json-escape`
       逐字节比对转义文本、端到端轮 `ctrl-bytes`（真跑一条输出 NUL 的命令，断言它以 `\u0000`
-      的形式回到请求里）。
+      的形式回到请求里；chat 与 responses **两条协议各跑一遍** —— 两条路径共用这套转义）。
     * **日志写入端一直是对的**（`session.uya::jw_str_into` 把 `0x00…0x1f` 全写成 `\u00XX`），
       所以出事的会话**在磁盘上看起来完全正常** —— 漏的是「上线」那一步。但顺藤摸瓜还挖出
       读回那一端的同源 bug：`sess_json_str` 手写的反转义只认 `\n \t \r \" \\`，其余
@@ -803,6 +881,24 @@ edit（多匹配→拒、成功、找不到）/ glob（两条路径）/ grep（�
 `!!js` 标签）+ `.credentials.yaml` → 断言 provider/model/baseURL/apiKeyEnv/凭据来源四层/
 contextWindow/maxTokens/input image/reasoningEffort/`permission→confine`/`uya-agent.tls` 命名空间；
 再断言 YAML 预处理（注释去掉、块标量里的 `#` 保留、`!!js` 中和）；最后若存在真实 `~/.dsh` 就顺带校验一次 |
+| `resp-text` | Responses 流式：`created/in_progress` + `output_item.added/done` + `output_text.delta` ×2 + `completed` → content、`input_tokens(100)-cached(40)=60`、out/reasoning、`finish=stop`；`event:` 行必须被忽略 |
+| `resp-tools` | Responses 工具轮：`reasoning_summary_text.delta` ×2 + 两个 `function_call`（`output_item.added` + arguments 交错分片 ×4 + `done`）+ `completed` → `ncalls=2`、`call_id`/`name`/拼好的 `args`、`finish=tool_calls` |
+| `resp-args-done` | 只在 `output_item.done` 里给完整 `arguments`（不发 delta）也能补齐 |
+| `resp-terminal-only` | 只发 `created` + `completed`，正文/参数只在终局 `response.output[]` 里 → 必须回填（按 `call_id` 建槽） |
+| `resp-incomplete` | `response.incomplete` + `incomplete_details.reason=max_output_tokens` → `finish=max-tokens` |
+| `resp-failed` | `response.failed`（`error.code/message`）→ `finish=error` + `err_text` 带 `code: message`，且**不是** `STREAM_CLOSED` |
+| `resp-noterminal` | 缺终局事件 = 流被截断（`STREAM_CLOSED`），但已收到的正文保留 |
+| `resp-doneframe` | 代理多补一帧 `[DONE]` → 当正常收尾（协议本身不发 `[DONE]`） |
+| `resp-chatshape` | 网关把 responses 的流按 chat 形状（`choices[].delta`）回 → 兜底解析仍拿到正文 |
+| `resp-badjson` | 半截 JSON 帧 → `MALFORMED_RESPONSE` + payload 头部，之前内容保留 |
+| `resp-nonstream` | `responses_out_from_nonstream`：`output[]` 的 message（含 refusal）/reasoning/function_call（`call_id` 带 `\|` 要拆）+ usage + `status=incomplete` 全字段断言 |
+| `resp-build` | 扁平工具 schema 逐条 parse（顶层 `name`/`parameters`、没有 `function` 键）+ `build_model_request` 的 `input` items / `store` / `max_output_tokens`（8→16）/ `reasoning.effort` / `developer→system` 开关 / `api_url` 拼接（base 带不带斜杠） |
+| `api-negotiate` | 协商状态机：未声明时默认 responses；404/405/501 才可协商、200/400/401/500 不行；协商一次后锁存；显式声明后恒不协商；**DSH 的 `api:` 真的落到 cfg**（`openai-responses`/`openai-completions` → `src_api=1`，不认得的按未声明处理） |
+| `responses` | 端到端（mock mode 19）：整轮 agent 循环走 `/v1/responses`，mock 断言请求是 responses 形状（有 `input`、无 `messages`、`developer`、`store:false`、扁平 tools），第二轮断言 `function_call`/`function_call_output` 配对（无 `tool_call_id`）与工具输出 |
+| `responses-nostream` | 端到端（mock mode 20）：`--no-stream` + responses（`"stream":false` + 一次性 JSON 响应） |
+| `responses-fallback` | 端到端（mock mode 21）：**未声明**协议 → 第一个请求打 `/responses`（mock 回 404）→ 同一步改用 `/chat/completions` 重发，之后每轮都必须是 chat（钉住「只协商一次」） |
+| `responses-compact` | 端到端（mock mode 22）：自动压缩也跟随协议 —— 摘要请求与压缩之后的请求都必须走 `/v1/responses`（有 `input`、无 `messages`），并断言 checkpoint 文案 |
+| `api-flags` | `make e2e-api`：默认 = responses + negotiable；`--api=chat` / `UYA_AGENT_API=responses` 生效且不再协商；非法 `--api=` 报错退出；`--dry-run` 的请求体跟着协议走 |
 | `diff-render` | 纯函数逐字节断言 diff：新旧一样 → 空（且**不输出上下文**）、只差结尾换行 → 空、
 中间一行改动 → 前后各 2 行上下文 + `-`/`+`、新文件 → 全 `+`、两侧 >60 行 → 只给精确汇总、
 60 行编辑脚本 → 头截断成 24 行 + `… (省略 36 行)`、增删计数、按显示列截断（汉字 2 列） |
@@ -818,9 +914,10 @@ write 的 `· +A -D` + diff 正文、**失败的 write 不留假 diff**、窄终
 | `json-escape` | 纯函数逐字节断言请求体的字符串转义：`0x00…0x1f` 全部转义（`\b`/`\f`/`\n`/`\r`/`\t`
 与 `\u00XX`）、`"` `\` 转义、输出里不再有裸控制字节、`jw_key` 同规则 + 冒号、空串与中文不被改坏
 （std 的 `json_write_str_view` 只认 5 个短转义，退回它就必然红） |
-| `ctrl-bytes` | 端到端：mock 让 agent 真跑一条**输出含 NUL** 的命令（`printf 'A\000B'`）→
-第二轮断言这条工具结果以 `\u0000` 的形式回到请求里、`tool_call_id` 配对完整；
-再加上「每个请求体都不许有裸控制字节」的全局哨兵（判定码 190）—— 这条就是真机那次
+| `ctrl-bytes` / `ctrl-bytes-resp` | 端到端（mock mode 23，chat 与 responses 各一轮）：mock 让 agent 真跑一条**输出含 NUL** 的命令（`printf 'A\000B'`）→
+第二轮断言这条工具结果以 `\u0000` 的形式回到请求里、id 配对完整（chat 看 `tool_call_id`，
+responses 看 `call_id`）；**chat 与 responses 各一轮**，且顺便断言端点没串（`POST /v1/chat/completions` vs `/v1/responses`）。
+再加上「每个请求体都不许有裸控制字节」的全局哨兵（判定码 240）—— 这条就是真机那次
 `invalid character '\x00' in string literal` 的本地等价判据 |
 
 **P1/P2 的验收事实**（2026-10-02）：
@@ -863,7 +960,9 @@ write 的 `· +A -D` + diff 正文、**失败的 write 不留假 diff**、窄终
   NUL 的工具结果成了字面量 `u0000`（`\u0000` 计数 0）—— NUL 在恢复时被静默吞掉；② 新二进制同一
   请求里是 `\u0000`（计数 1）、裸控制字节 0，186 条恢复消息一条不少、`tool_call_id` 配对完整。
   另外是**先写测试再修**：`json-escape` 与 `ctrl-bytes` 两轮在旧 `json_write_str_view` 路径下必然
-  失败（前者报「控制字节转义文本不对」+「字面量里还有裸控制字节」，后者报判定码 193），修后全绿。
+  失败（前者报「控制字节转义文本不对」+「字面量里还有裸控制字节」，后者报判定码 245），修后全绿；
+  与「默认走 responses」那条线合流后，控制字节轮在 **chat 与 responses 两条协议**上各跑一遍都通过
+  （合流时还顺手修了 mock 的 responses arguments 分片形状，见「Responses 接口」一节最后一颗星）。
   最后在**真机网关**上收口：用本地 mock 造一条「工具结果里带 NUL」的小会话（`--agent-home` 与
   `--workspace` 都在临时目录），再用修好的二进制 `--resume` 它并追加一句新任务 —— 真机返回正常
   回答（不再 400），证明转义后的 `\u0000` 被真网关接受；随后又用 `make e2e TASK="…"` 跑了一轮
@@ -937,6 +1036,18 @@ UYA_AGENT_API_KEY=… ./build/uya-agent \
 （`api.deepseek.com` 返回 402 `Insufficient Balance`），所以 A5 换用了 harness 自己配置的
 `autodl-api` 网关（同样是 OpenAI 兼容 `chat/completions`）。
 
+**Responses 协议的真机验收（2026-10-03）**：本机 DSH 设置里那几条 `api: openai-responses` 路由当时都
+打不通 —— `tirisen`（`https://gpt.tirisen.hk/v1`）对 `/responses` **任何**请求体（含用 curl 手写的最小
+body）都回 `502 upstream_error`，而它的 `/chat/completions` 回 400
+（`The 'gpt-5.4' model is not supported when using Codex with a ChatGPT account`，即该路由是 Codex 形状）；
+`aigw`（`https://mnl.iotalking.top/aigw/v1`）DNS 解析不了；`sglang-8080` / 本地 Ollama 都没起。
+所以 Responses 这条线的验收**只做到**：① `--print-config` 从真 `~/.dsh` 正确读出
+`api = openai-responses (source: dsh-settings)`；② 真机请求确实打到了 `/v1/responses` 并正常拿到
+HTTP 状态与错误体（没有被网关当成坏请求体拒绝）；③ 协议本身由 §6 的两条端到端轮（`responses` /
+`responses-nostream` / `responses-fallback` / `responses-compact`）在真实 socket + chunked 分片的
+mock 上逐字段验收。换一台 `openai-responses` 网关可用时，零参数再跑一次即可（`--print-config` 先看
+`api = …  (source: dsh-settings)` 与 `endpoint = responses`）。
+
 ---
 
 ## 7. 已知限制
@@ -956,6 +1067,16 @@ UYA_AGENT_API_KEY=… ./build/uya-agent \
 * diff 是行级的、面向显示：中间段两侧超过 60 行就退化为两行汇总（不做 Myers 全量 diff），
   也不高亮词级改动。
 * 只做 IPv4（标准库 `dns_client_resolve_first_ipv4`），不做 IPv6、不走代理。
+* Responses 协议只做 `openai-responses`：`anthropic` / `azure-openai-responses` /
+  `openai-codex-responses` 不支持（前者认证与端点都不同，Azure 还要 `api-version` 与 `api-key` 头，
+  Codex 走 OAuth），设置里写了会告警并退回「未声明」处理。
+* 未声明协议时**首次请求可能多一次 404**（先用 `/responses` 探一次），只留一行 `[api]` 提示。
+  协商结果只存在于进程内，不写设置也不写会话（换进程会重新探一次）。
+* 不做 DSH 的 `reasoningEfforts` 模型级 clamp：`reasoning.effort` 原样透传设置里的值
+  （网关不认就 `--reasoning-effort off` 或 `--api=chat`）。
+* Responses 下不回放 reasoning item（不发 `include: ["reasoning.encrypted_content"]`，
+  也不发 `prompt_cache_key`/`prompt_cache_retention`）；历史按「外来消息」重放，只带文本与工具调用。
+  工具 schema 不带 `strict`，也不做 404 之外的协议自动探测（换个协议请显式 `--api=`）。
 * 目标平台是 Linux x86-64（代码里的 syscall/常量按这个平台写）。
 * 换到 `uya-0.11`：`tls/https.uya`、`std/json/*`、`x509/verify.uya` 与 0.10 逐字节相同，
   但 `libc/syscall.uya`、`std/runtime/runtime.uya`、`tls/ssl/context.uya` 有差异，需要重新验证
