@@ -4,14 +4,15 @@
 多轮 loop 直到给出结论。全部代码 38 个 `.uya` 文件，**不引入任何 C 代码、`@c_import` 或其它语言**，
 只依赖 Uya 语言与随编译器分发的标准库。
 
-**P0–P20 全部完成**（P15 这个编号被两条并行线各用过一次：一条是「请求体控制字节全转义 +
+**P0–P21 全部完成**（P15 这个编号被两条并行线各用过一次：一条是「请求体控制字节全转义 +
 默认走 Responses 接口」（落点见 §3 踩坑 27、§2 的 `jsonx.uya`/`session.uya`、§6 的
 `json-escape` / `ctrl-bytes*`）、一条是**子代理窗口面板**（§2 的「子代理窗口面板（并行线的 P15）」，
 踩坑 29）；P16 是**单行转录 + 思考行**，P17 是**纯 Uya 的全屏 TUI**，
 P18 是**常驻状态区 + 思考实时行**；**P19 是诊断出口与 read 窗口**：外来字节（网关错误体 /
 坏 payload 头部）只以「转义 + 字符边界截断 + 限长」的一行预览进转录，全文进会话日志
 `diag/dump`、原始字节走 `--debug-dump`（踩坑 33）；`read` 改成**流式窗口**读法，`total` 是
-数完整个文件得到的真值、只有真越界才报 EOF（踩坑 34））：
+数完整个文件得到的真值、只有真越界才报 EOF（踩坑 34）；**P20 是脚注统计行 + 上下文占用 +
+%cpu**；**P21 是三级访问模式 + 内核沙箱（bubblewrap）**）：
 LLM 交互是**流式 SSE**（`stream:true` + `stream_options.include_usage`），
 增量 chunked 解码 + SSE 分帧 + `tool_calls` 按 `index` 分片累积；消息协议是**严格工具协议**
 （`assistant.tool_calls` 原样回灌 + 每条结果一条 `role:"tool"` + `tool_call_id`）；
@@ -41,13 +42,6 @@ tool 结果超 8192 码点自动剪枝，压力超过窗口 80% 时自动压缩�
 `✓ Bash · 打印三行 · exit 0` 这一行（正文退成 `--tool-lines N` 的可选项），
 思考（`--show-reasoning`）压成 DSH 的 **Think 行** —— 运行中在提示符那一行里滚动、
 块结束时落一行 `✻ 思考 · <首行>…`，**全文写进会话日志**（`assistant/reasoning`）。
-**P21 把「权限」补齐成 DSH 的样子**：三级访问模式（`read-only` / `workspace-write` /
-`danger-full-access`，机器名与 DSH 一致）、输入面板上的访问模式 chip 与 `shift+tab` 选择浮层
-（Full access 过风险确认）、`/permission [预设]`、来源链（CLI / `UYA_AGENT_PERMISSION` /
-DSH `permission.defaultPreset`），read-only 下 `write`/`edit` 硬拒、`bash` **逐条人工批准**，
-外加**真的内核沙箱**：confined 模式的 bash 在 **bubblewrap** 的 mount namespace 里跑
-（只读根 + fresh `/dev` + 私有 PID 的 `/proc`，workspace-write 另加临时 `/tmp` 与可写工作区 bind），
-起不来就 fail closed，绝不静默降级。
 **P15 给子代理加了窗口面板**：输入行上方常驻一块带边框的窗口区，每个运行中的子代理 2 行
 （命令行 + 状态行，含**实时秒数**与已收输出行数），最多显示最后 4 个，跑完立刻收掉并在滚动区
 补一行结算通知；边框按显示列逐行补满，自测对每一行断言「列数完全相等」。
@@ -61,6 +55,13 @@ DSH `permission.defaultPreset`），read-only 下 `write`/`edit` 硬拒、`bash`
 （`ctx`，DSH `contextPressure` 的口径）与**全部 uya-agent 进程**的综合 CPU（`%cpu`，
 `/proc` + `USER_HZ` 口径）；终端放不下就从尾部丢组，明细进 `/status`。
 `--no-stream` / `--compat-fold` 保留两条回退路径。
+**P21 把「权限」补齐成 DSH 的样子**：三级访问模式（`read-only` / `workspace-write` /
+`danger-full-access`，机器名与 DSH 一致）、输入面板上的访问模式 chip 与 `shift+tab` 选择浮层
+（Full access 过风险确认）、`/permission [预设]`、来源链（CLI / `UYA_AGENT_PERMISSION` /
+DSH `permission.defaultPreset`），read-only 下 `write`/`edit` 硬拒、`bash` **逐条人工批准**，
+外加**真的内核沙箱**：confined 模式的 bash 在 **bubblewrap** 的 mount namespace 里跑
+（只读根 + fresh `/dev` + 私有 PID 的 `/proc`，workspace-write 另加临时 `/tmp` 与可写工作区 bind），
+起不来就 fail closed，绝不静默降级。
 
 ```
 $ ./build/uya-agent --show-reasoning "在当前工作目录写 p15-demo.txt，三行 alpha / beta / gamma；然后用 bash 打印它，并告诉我第二行。"
@@ -696,7 +697,8 @@ TTY 交互模式**默认全屏**（`--no-tui` 退回上一节的滚动转录；�
 
   ▌ ↑ Ask anything... "把 hello.uya 的问候语改成 Hello, DSH!"
   ▌ Build   Full access   deepseek-chat   deepseek  tab plan   ctrl+p commands
-  ~/uya-agent:main                                                                 p20-stats```
+  ~/uya-agent:main                                                                 p21-perm
+```
 
 对话态（`--tui-demo` 打印的就是这三屏的纯文本快照）：
 
@@ -753,14 +755,16 @@ TTY 交互模式**默认全屏**（`--no-tui` 退回上一节的滚动转录；�
 * **浮层**：命令面板、会话列表（选一个 `/resume`）、帮助（`/help`）、`/status` 详情、
   **访问模式选择器与 Full access 确认**（P21，底对齐，贴着输入面板往上弹）、
   **read-only 下 bash 的逐条批准**（P21），以及 `ask_user_question` / `exit_plan_mode` 的
-  问答弹窗（↑/↓ + enter，esc = 无回答）。
+  问答弹窗（↑/↓ + enter，esc = 无回答）。`/help` 走的就是这里说的帮助**浮层**（不是滚动
+  模式的纯文本帮助）；`/exit`（同 `/quit`）在面板里选中或直接输入都会退出 ——
+  命令的返回值就是「停」，三种入口（面板 / steer / 普通提交）都尊重它。
   浮层里 `↑/↓` 选条目、`pgup/pgdn/home/end` 滚内容（P22：内容比框高时标题栏右侧给
   `↑`/`↓` 溢出指示），回车取选中项、esc 取消。换成面板打字时会**过滤**条目；
   回车时一条都没匹配上不再静默 —— 敲进去的文字回到输入行 + 一条
   `没有匹配的命令：…` 的 notice。浮层画在转录区上（打开时转录被它盖住，只有输入面板
   与脚注还在），esc 关掉就回来。
   命令面板是由输入行里的 `/` 触发的，**派发之后那个 `/` 会被一起收走**（P22）——
-  否则下一次敲 `/status` 会拼成 `//status`，被当成未知命令丢掉（见 §3 踩坑 35）。
+  否则下一次敲 `/status` 会拼成 `//status`，被当成未知命令丢掉（见 §3 踩坑 39）。
   回合运行中敲 `/status` / `/help` / `/sessions` 也能用：结果挂在**下一个 step 边界**
   派发（只读命令；`/new`、`/resume`、`/compact` 这些会改/释放历史的仍旧等回合结束 ——
   见 §7）。
@@ -1331,9 +1335,68 @@ vLLM 等 OpenAI 兼容端点都一样稳。想升级成严格 `tool` 角色消�
     真机对照（同一个 5949 行 / 230 KB 的 `src/agent.uya`，`offset=3000, limit=20`）：
     旧 `of 3080` → 新 `of 5949`；`offset=4000, limit=20`：旧「空内容 + `total 3080 lines`」→
     新 20 行 + `(Showing lines 4000-4019 of 5949. …)`（见 §6 的 P19 验收记录）。
+35. **「拍脑袋的固定容量」会把「参数有点大」报成 OOM，而且顺手把证据也抹掉。**
+    症状（真实会话踩到，用户截图就是这一幕）：一步 `bash`（`mkdir -p …/x11c`）成功后，
+    下一步直接
+    `error: out of memory serializing tool_calls`
+    + `[turn] 本回合异常结束（可直接输入继续）`—— 内存一点问题都没有。
+    根因在 `agent_finish_step` 严格协议那一段：assistant 的 `tool_calls` 数组原文要**一次写进
+    一个缓冲**，而那个缓冲是 `buf_new(8192)`（P0 时期随手写的容量），`calls_json_from_chat`
+    写不下就 `jw_overflow` → 调用点把它当成 OOM、`return AGENT_PROTO` 整轮退出。
+    工具参数超过 8 KiB 太容易了：写文件的正文、长 heredoc 的命令行、一次改好几个文件。
+    更糟的是**报错点在入史之前**，而 `agent_log_assistant` 用的是同一个固定容量，于是那一步的
+    `assistant/message` 事件里连 `tool_calls` 都没有（老代码还是**静默** `return`）——
+    事后翻会话日志只看到 `turn/end reason=error`，查不出当时到底调了什么。
+    修法：容量按实际需要算，只有一个出处 ——`jsonx.uya::jw_str_esc_len`（转义后的精确长度，
+    规则与 `jw_write_escaped` 一一对应）+ `agent.uya::calls_json_need`（骨架 + 三段字符串 +
+    元素间逗号 + 256 字节余量），再由 `calls_json_make` 分配并序列化；两个调用点（入史、写日志）
+    都走它，谁都不许再写固定值。真正的上限是历史单条 `extra` 的 `MSG_CONTENT_MAX`（200 KiB），
+    8 KiB 从来不是设计出来的数；「装不下」现在只剩真 OOM 一种可能，而且报错会把**需要多少字节**
+    一起打出来。会话日志那条路失败时也不再静默，会打
+    `[session] assistant 事件的 tool_calls 写不进日志（需要 N 字节…）`。
+    回归轮两条：`toolcalls-cap`（纯函数：`jw_str_esc_len` 与实际写出逐字节相等、预算与实际长度
+    严丝合缝、9 KiB 参数按预算成功而按老的 8192 必然失败、回读 id/name/arguments 逐字节相同）
+    与 `toolcalls-big`（端到端：mock 给一发 arguments ≈ 9.6 KiB 的 `write`，断言参数头尾一字不差
+    地回到请求里、工具结果配对完整、文件内容与正文逐字节相同）。把 `calls_json_make` 改回
+    `buf_new(8192)`，两条轮**同时红**（`error: out of memory serializing tool_calls (9999 bytes)`
+    + `toolcalls-big` 的 `agent_run returned 3`）—— 那正是修前的现场（见 §6 的验收记录，
+    那里还有用**真实故障会话** + `testdata/mock_gateway_bigcall.py` 做的 before/after 对照）。
 
-35. **「`/status` 没反应」是四件事叠在一起**（P22，用户报的就是这个）。四条都能在真 PTY 里
-    逐帧复现，也都各自有独立的根因：
+36. **「当前状态」和「刚才发生了什么」混在一个变量里，结果就会被静默丢掉。**
+    这一条在本仓库**踩过不止一次**：`tui_ov_accept()` 先写结果、再
+    `tui_overlay_close()`，而 close 会把 `g_tui_ov_kind` 归零；调用方却是
+    「先 `tui_overlay_take()`、后读 `tui_overlay_kind()`」—— 读到的永远是 0，
+    命令面板与会话列表的选中项被无声丢弃（`/` 开面板 → 选中 → 回车 = 什么都不发生）。
+    §2 的访问模式一节记了修法（accept 把 kind 存进 `g_tui_ov_done`，浮层关闭时
+    `tui_overlay_kind()` 回退到它），这里只留教训：**清理「当前状态」的代码路径，
+    不能顺手把「刚才发生了什么」也清掉**；两者的生命周期不同，就该是两个变量。
+    同类形状还有「take 之后才问类型」「消失的浮层已经答过一句话」——
+    新增浮层类型时先确认读 kind 的时机。
+
+37. **TUI 主循环把命令的返回值丢掉，`/exit` 就成了摆设。**
+    `agent_repl_command()` / `agent_tui_command()` 的返回值语义是「该停了吗」，
+    滚动模式的 REPL 一直在用（`const stop = …; if stop { run = false }`），
+    但 TUI 那三处调用点全写成 `_ = agent_tui_command(…)` —— 于是 TUI 里
+    **直接输入 `/exit` 回车不退出**，面板里选中 `/exit` 同样不退出。
+    更阴的是它看起来「像在工作」：`ctrl+d`（空行退出）走的是另一条键位路径，
+    所以手动测的时候很容易被 `ctrl+d` 的成功掩盖。修法是把三处调用点都接上返回值。
+    回归：`tui-pty` 轮的退出动作从 `ctrl+d` 换成 **`/exit` + 回车** ——
+    正因为 `ctrl+d` 不经过命令分派，它测不出这个 bug；换掉之后旧实现立刻报
+    「`/exit` 之后子进程没有退出（命令的返回值被丢了？）」，并且连带报出
+    「没有离开备用屏幕 / termios 没有还原」（进程根本没走到收尾）。
+
+38. **浮层标题的「字节数」写死 = 读越界，而且字符数不等于字节数。**
+    `tui_overlay_list(kind, title, tn, …)` 的 `tn` 是**字节数**，实现按它 `memcpy`。
+    三处调用把字节数拍成了字符数/旧值：会话标题写 `44`（实际 38）、状态标题写 `46`
+    （实际 22）、确认标题写 `6`（「请确认」实际 9）。多出来的部分会把 `.rodata` 里
+    紧邻的字面量字节一起复制进标题缓冲 —— 屏幕上就是标题尾巴上挂着别的命令的碎片，
+    而且 `×` 这个形状会先在 client 侧 OOB 崩掉（不是每次都能崩，更毒）。
+    规矩：**能用 `strlen()` / `bufx_cstr_len()` 量就别写死**，这条仓库里已经重复过
+    规矩：**能用 `strlen()` / `bufx_cstr_len()` 量就别写死**，这条仓库里已经重复过
+    好几次（`tui_overlay_confirm` 的 `6`、`tui_set_commands` 的字面量长度）。
+
+39. **「`/status` 没反应」是四件事叠在一起**（P22，用户报的就是这个）。四条都能在真 PTY 里
+    逐帧复现，也都各自有独立的根因（最后一条属于踩坑 38 那一类，这里只说它没覆盖到的几处）：
 
     * **① 面板派发之后输入行里留着触发它的那个 `/`。** 面板是「输入行第一个字符是 `/`」自动
       开的（`first_slash`），之后敲的字进的是**面板过滤器**而不是输入行 —— 于是选中项派发掉
@@ -1341,7 +1404,8 @@ vLLM 等 OpenAI 兼容端点都一样稳。想升级成严格 `tool` 角色消�
       屏幕上只多一行 `· 未知命令（/help 看可用命令）；已忽略`，状态浮层**不再出现**
       （第二次、第四次…… 交替失败，最难查的那一类）。修法：`tui_input_drop_slash_trigger()`
       —— 只在输入**恰好**是 `/` 时清空（`ctrl+p` 带草稿开面板时一个字节都不动），
-      主循环的空闲派发与回合中的 step 边界派发都走同一个收口 `agent_tui_palette_apply()`。
+      主循环的空闲派发与回合中的 step 边界派发都走同一个收口 `agent_tui_palette_apply()`
+      （它同时把「该不该停」的返回值传出去，见踩坑 37）。
     * **② 回车但一条都没匹配上 = 静默。** `tui_ov_accept` 找不到匹配项时只置 `cancel`，用户
       敲进去的那串字（在过滤器里）就此消失，屏幕上什么都不发生 —— 「按了回车没反应」的字面
       现场。修法：把过滤器文字**还回输入行** + 一条 `没有匹配的命令：…` 的 notice。
@@ -1353,22 +1417,19 @@ vLLM 等 OpenAI 兼容端点都一样稳。想升级成严格 `tool` 角色消�
       `/sessions`）当场派发，其余（`/new`、`/resume` 会 `hist_free` 掉回合正在用的历史、
       `/compact` 会改写历史）原样留在队列里给主循环。uya 0.10 没有函数指针（见 §2 P15 的
       「不用回调」），所以派发点只能在 step 边界，不能做到「按键当下」。
-    * **④ 手写的字面量长度写大了 → 越界读进相邻只读常量。** `tui_overlay_list(…, "状态（esc
-      关闭）", **46**, …)`：字面量实际只有 **22** 字节，多出来的 24 字节是它后面的 NUL 对齐
-      与下一个字符串字面量 —— 浮层标题栏于是显示成
-      `状态（esc 关闭）␀␀…<system-remind…`。同一类还有 `/sessions` 标题（44/38）、
-      `(没有找到会话)`（22/20）、`error: 无法把任务写入历史`（40/34）、`请确认`（6/9，被截成
-      `请确`）、`(再按一次 ctrl+c 退出；…)`（43/52）、`bufx_mem_eq(p, "Current uya-agent file
-      policy", 30)`（29）、`"# 项目约定", 13`（14）。修法：这些位置一律改成
-      `bufx_cstr_len("<同一字面量>")`，并在 `tuis_scan_rows` 加一条**全局不变量**「正文层不许
-      出现 NUL 字节」+ 逐字节断言浮层标题 —— 以后再写错数字会当场红。
-    * **⑤ 浮层的窗口是死变量。** `g_tui_ov_top` 只被写、从来没被读过，绘制按 `want = r - 1`
+    * **④ 浮层的窗口是死变量。** `g_tui_ov_top` 只被写、从来没被读过，绘制按 `want = r - 1`
       取前几项：24 行的 `/status` 只画得出 14 行（`上下文占用` 那一段永远看不见），
       `↓` 按多了连高亮都会移出可见窗口。修法：`tui_ov_box_h()` / `tui_ov_body_rows()` /
       `tui_ov_sel_into_window()` 三个函数把「框多高、能放几项、选中项必须在窗口里」变成单一
       事实来源，绘制与按键都问它们；`↑/↓` 选项、`pgup/pgdn/home/end` 滚内容，标题栏在
       内容溢出时给 `↑`/`↓` 指示（不溢出时布局与之前**逐字节相同**，P21 的访问模式选择器
       断言原样通过）。
+    * 手写的字节数在踩坑 38 修掉的三处标题之外还有五处，一并改成量出来的长度：
+      `(没有找到会话)`（22/20）、`error: 无法把任务写入历史`（40/34）、
+      `(再按一次 ctrl+c 退出；或直接输入任务)`（43/52），以及 `agent_tui_is_injected`
+      里两个 `bufx_mem_eq` 的字面量长度（30/29、13/14 —— 前者让注入类的运行时上下文
+      被当成用户发言回填进转录）。自测里另加一条**全局不变量**：正文层不许出现
+      NUL 字节（越界读会先带进来一串 NUL，这类缺陷从此会当场红）。
 
     回归轮 `tui-cmd`：面板派发后 `tui_input_len() == 0`、连敲两次 `/status` 都开浮层、
     标题不含 `<system-remind`、无匹配时文字回输入行 + notice、运行中只读命令在 step 边界
@@ -1467,13 +1528,13 @@ agent 循环并逐项断言：
 | `procx-parse` | `/proc/<pid>/stat` 解析：comm 取**第一个 `(` 到最后一个 `)`**（comm 里允许空格与括号）、utime/stime 是 `)` 之后第 12/13 个字段、`|` 后的 cutime/cstime 必须忽略、state 是字母（`S`/`D`）时能跳过；坏行（无括号 / 无右括号 / 缺 stime / utime 非数字）必须失败；`/proc` 目录项名过滤（纯数字才算 pid，`self`/`.`/`..`/11 位不算） |
 | `procx-percent` | `Δticks × 1000 / Δms`：0 / 37 / 100（一个核）/ 250（并行 > 100%）/ 0.5% 向上取整 / `Δms=0` 不可算 / 负增量按 0 / 上限钳 999；`USER_HZ = 100` 常量 |
 | `cpu-live` | fork 一个忙循环 400ms 的子进程（同一个二进制 → comm 相同），父进程睡 450ms 后两次采样：进程数必须涨、综合 `%cpu ≥ 25`、有时间跨度；只建基线的那次必须不给百分比（防除零爆表） |
-| `tui-pty` | **真 PTY**（`/dev/ptmx` + `fork` + `dup2(slave→0/1/2)`）：进备用屏幕（`ESC[?1049h`）、首屏面板/logo、发任务后转录出现 mock 最终答案、`SIGWINCH`（改 winsize + 发信号）后进程仍活着并继续重绘、Ctrl-D 退出码 0、退出后 `TCGETS` 与 fork 前**逐位相同**、离开备用屏幕；不需要 setsid/TIOCSCTTY（fd 0 就是 pts 从设备，Ctrl-C 由程序自己吃字节） |
+| `tui-pty` | **真 PTY**（`/dev/ptmx` + `fork` + `dup2(slave→0/1/2)`）：进备用屏幕（`ESC[?1049h`）、首屏面板/logo、发任务后转录出现 mock 最终答案、`SIGWINCH`（改 winsize + 发信号）后进程仍活着并继续重绘、**`/exit` + 回车**退出码 0（刻意不用 Ctrl-D：它不走命令分派，测不出「命令返回值被丢掉」）、退出后 `TCGETS` 与 fork 前**逐位相同**、离开备用屏幕；不需要 setsid/TIOCSCTTY（fd 0 就是 pts 从设备，Ctrl-C 由程序自己吃字节） |
 | `perm-modes` | 三级访问模式的机器名 ↔ 值 ↔ 显示名（含 DSH 产品名 `Full access`）、`custom`/空串判 -1、策略真值表（`confine` / `allows_write` / `requires_approval`） |
 | `perm-readonly` | mock LLM 一轮 3 个调用：read-only 下 `write` 必须回逐字拒绝串且**文件没落盘**、`bash` 在非交互会话里必须 fail closed（回「无回答渠道」串、命令输出一个字都不给）而 `read` 照常；请求里必须带 read-only 的 file policy 句 |
 | `san-profile` | 三档 profile 的 bwrap argv 逐字断言：read-only = `--ro-bind / / --dev /dev --proc /proc --unshare-pid` 且**没有**可写挂载；workspace-write 多 `--tmpfs /tmp` + `--bind <ws> <ws>`；full access 与 `--no-sandbox` 不套壳；工作区是 `/` 时不加可写 bind；bwrap 不可用时只断言「confined 必须返回 fail closed」 |
 | `san-shell` | 直接 fork 出沙箱命令实测（不经工具闸门）：read-only 里 `> /dev/null` 成功、写 `/tmp` 被拒且文件不出现；workspace-write 里工作区内写入逐字节正确、`../` 区外写入被拒；本机没有 bwrap 时打一行 skip（不假绿） |
 | `san-tool` | 端到端：`--permission workspace-write` 下让模型跑一条**同时**写工作区内与区外的命令 —— 区内文件必须落盘、区外文件必须不存在（工具层没拦它，是内核拦的） |
-| `tui-access` | 访问模式 chip 三种模式的显示、`shift+tab` 只置请求（主循环据此开浮层）、选择器打开（三行齐 + `✓` 只在当前模式那行 + 圆角框 + esc 取消不变更）、↓+enter 选中 Workspace Write 交给处理器（策略全局 + chip + 转录 notice + **恰好一条** runtime-context 注入且不上屏）、运行中切换时 `cfg.access` 必须跟着走（故意把 cfg 设成旧值）、选 Full access 只翻出确认层（游标默认「取消」→ 回车无变化；↑+enter 才切）；末尾一条**回归**：命令面板里选 `/status` 必须真的派发（浮层结果不许被静默丢掉）；每步都查「每行 ≤ cols、正文层无 ESC」 |
+| `tui-access` | 访问模式 chip 三种模式的显示、`shift+tab` 只置请求（主循环据此开浮层）、选择器打开（三行齐 + `✓` 只在当前模式那行 + 圆角框 + esc 取消不变更）、↓+enter 选中 Workspace Write 交给处理器（策略全局 + chip + 转录 notice + **恰好一条** runtime-context 注入且不上屏）、运行中切换时 `cfg.access` 必须跟着走（故意把 cfg 设成旧值）、选 Full access 只翻出确认层（游标默认「取消」→ 回车无变化；↑+enter 才切）；末尾两条**回归**：命令面板里选 `/status` 必须真的派发（浮层结果不许被静默丢掉）、`/help` 必须开**帮助浮层**（不许掉回滚动模式的纯文本帮助）；每步都查「每行 ≤ cols、正文层无 ESC」 |
 | `tui-approve` | read-only 下 bash 逐条批准，两种形态：① headless（注入的键在浮层打开前就被输入行吃了）= 没人回答 → **fail closed**，转录出现逐字拒绝串、命令 stdout 不出现、且不是「没有回答渠道」那条；② **真 PTY**：等 `Read Only：批准这条 bash 命令？` 画出来再送 `↑`+回车 → 命令真的跑（stdout 进转录与下一封请求）、退出码 0 |
 | `sig-abi` | `SigxAction` 必须是**宿主 glibc** 布局（152 字节；handler@0 / flags@136 / restorer@144，按字节回读）；恢复序列逐字节（带备用屏幕 26 字节 / 不带 18 字节） |
 | `sig-basic` | 处理器装上以后真的被调用、返回以后进程还活着（P0 的回归闸门：缺 `SA_RESTORER` 的实现在这里直接 139）；`SIGWINCH` 处理器只置标志、取用即清零 |
@@ -1646,7 +1707,28 @@ responses 看 `call_id`）；**chat 与 responses 各一轮**，且顺便断言�
     新 20 行真内容 + `(Showing lines 4000-4019 of 5949. Use offset=4020 to continue.)`。
   * 离线回归：新增 3 轮（`read-window` / `diag-echo-400`(+`-ns`) / `diag-preview`）与 1 轮显示层
     （`tui-diag`）；`make check / build / codegen-audit / selftest` 全绿（selftest 退出 0）。
-* **P22 的验收记录（「`/status` 没反应」，对应踩坑 35）**：四条症状都先在**真 PTY**
+* **tool_calls 容量（踩坑 35）的验收（2026-10-03）**：故障现场来自**真机会话日志**（`~/.uya-agent/sessions/---home-winger-uya-agent--/session-42acda4e…`）：
+  turn 3 的第 2 步 `bash mkdir -p …/x11c` 结果 `(no output) [exit code: 0]` 之后紧接着
+  `turn/end reason=error`，而第 3 步**根本没有 `assistant/message` 记录**（同一处固定容量把日志
+  一起吞了）—— 与用户截图（`✓ Bash · Create x11c directory · exit 0` 下面直接跟
+  `error: out of memory serializing tool_calls`）逐行对上。
+  修法是**先写测试再修**：加 `toolcalls-cap` 与 `toolcalls-big` 两轮，然后在
+  `calls_json_make` 里把容量改回 `buf_new(8192)` 复现修前现场 —— 两轮同时红：
+  `toolcalls-cap` 报「按预算分配仍然写不下（容量没按需要算？）」、
+  入史路径打 `error: out of memory serializing tool_calls (9999 bytes)`、
+  `toolcalls-big` 报 `agent_run returned 3 (expected 0)`、会话日志侧打
+  `[session] assistant 事件的 tool_calls 写不进日志（需要 9999 字节…）`；
+  改回「按 `calls_json_need` 算容量」之后两轮 PASS（该用例的 `tool_calls` 原文 9849 字节，
+  老的固定容量 8192，`make selftest` 退出 0）。
+  再用**真实故障会话**做 before/after 复验（把那条会话复制进临时 `--agent-home`，工作区与
+  会话目录名都按临时路径对齐，假网关 `testdata/mock_gateway_bigcall.py` 第一步就回一发
+  `arguments` ≈ 9.6 KiB 的 `write`，之后把「头尾标记是否一字不差」写进给模型看的最终答案）：
+  旧二进制 exit **3**、stderr 正是用户截图那行 `error: out of memory serializing tool_calls
+  (10001 bytes)`、假网关只看到 **1** 个请求、文件根本没写出来；
+  新二进制 exit **0**、假网关看到 **2** 个请求（第二个请求里 `head=True tail=True`）、
+  回答 `BIGCALL-OK 请求数=2 头=True 尾=True`、落盘文件 9618 字节且头尾标记逐字节正确 ——
+  也就是那条「已恢复 255 条消息」的真实历史现在能继续跑下去了。
+* **P22 的验收记录（「`/status` 没反应」，对应踩坑 39）**：四条症状都先在**真 PTY**
   （`pty.fork()` + 屏幕仿真，脚本不进仓）里复现、修完再逐条复验：
   * ① 连敲两次：旧 —— 第一次开浮层（输入行留 `/`），esc 关掉再敲 `/status` 得到
     `· 未知命令（/help 看可用命令）；已忽略`，浮层不再出现；新 —— 两次都开浮层，
@@ -1721,10 +1803,28 @@ responses 看 `call_id`）；**chat 与 responses 各一轮**，且顺便断言�
   ② 回合结束时同一屏上 26/27 行变成 `◆ 助手` / `391` —— **状态区整块收掉、转录把行收回**
   （空闲 0 行），没有残影；③ 退出时 `ESC[?2004l ESC[?1049l` 干净收尾（备用屏幕与括起粘贴都关了）。
   **这一屏在 P18 之前是拿不到的**：同样的转录长度下状态行会被挤掉，屏幕上只剩静止的转录 + 面板。
+* **P21 的验收记录（2026-10-03，对应访问模式 + 内核沙箱）**：
+  ① 离线全套：`make check` / `codegen-audit` / `e2e-config-flags` / `e2e-api` / `e2e-steps` /
+  `e2e-permission` / `e2e-sandbox` / `tui-selftest`（9 轮）/ `selftest`（`SELFTEST PASS`）全绿；
+  新增的 5 轮权限/沙箱轮与 2 轮 TUI 轮都在里面（`perm-modes` / `perm-readonly` / `san-profile` /
+  `san-shell` / `san-tool` / `tui-access` / `tui-approve`）。
+  ② **沙箱是真的内核边界，不是纸面约定**：`san-shell` 轮直接 fork 出套壳命令实测 ——
+  read-only 里写持久路径 `Read-only file system`、`> /dev/null` 仍成功；workspace-write 里
+  工作区内写入逐字节正确、`../` 区外写入被拒；`san-tool` 轮再走一遍 bash 工具的真实路径
+  （区内落盘、区外不出现）。
+  ③ **本机环境事实**（选型的依据，写下来免得下次重猜）：内核 `6.12.65` 的 LSM 列表里**没有
+  landlock**、`landlock_create_ruleset` 返回 ENOSYS ⇒ 只做 bwrap 一档；`bubblewrap 0.10.0`
+  非特权 userns 可用，profile 与 DSH 文档一致（只读根 + fresh `/dev` + 私有 PID 的 `/proc`，
+  workspace-write 另加临时 `/tmp` 与可写 workspace bind）。
+  ④ 审批流程用**真 PTY** 验收（`tui-approve` B 段：等 `Read Only：批准这条 bash 命令？` 画出来
+  再送 `↑`+回车 → 命令真的跑、stdout 进转录与下一封请求）；headless 那条路只钉「没人回答 =
+  fail closed」。
 | `http401` | mock 回 401 + 错误体：agent 必须打印状态与错误体并退出 3 |
 | `max-steps` | **显式**给 `max_steps=3`：mock 每轮都给 tool_calls，agent 必须在 3 步后熔断退出 3 |
 | `unlimited-steps` | **默认不限步数**（这轮故意不设 `max_steps`，吃 `cfg_default()` 的 0）：mock 连给 **14 轮** tool_calls（超过旧默认 12）才给最终答案 —— agent 必须一路跑满 14 步、把 14 条 `tool_call_id` 全带回请求，并以 0 退出。默认值一旦改回 12，mock 只会被服务 12 次，这轮立刻失败 |
 | `hist-keep` | 丢老消息的两条保护：`hist_drop_oldest` 必须留住 system 与**任务原文**（下标 1 的 user），且 `assistant(tool_calls)` 与其 tool 结果整组丢；连追加 40 组之后（远超旧 `MSG_MAX=64`）任务原文仍在、历史仍不以悬空 tool 开头（历史条数默认不限制，见 `history-long`） |
+| `toolcalls-cap` | 踩坑 35 的纯函数轮：`jw_str_esc_len` 与实际写出长度**逐字节相等**（含 NUL/引号/控制字节/中文，手工口径 40 字节）；`calls_json_need` 的预算与实际序列化长度严丝合缝（走生产那条路 `calls_json_make`）；两个调用（一个 9 KiB 正文 + 一个塞满转义字节）的参数按预算成功，而按**老的固定 8192** 必然失败；回读后 id/name/arguments 与原文逐字节相同 |
+| `toolcalls-big` | 踩坑 35 的端到端轮（mock mode 25）：mock 发一发 `arguments` ≈ 9.6 KiB 的 `write`，断言 ① 大参数的**头尾标记**都一字不差地回到第二个请求里；② 工具结果（`Created file`）在请求里且配对完整；③ 落盘文件与 9 KiB 正文**逐字节**相同；④ `agent_run` 返回 0 —— 修前这一步直接以 `error: out of memory serializing tool_calls` 中止（返回 3） |
 
 另外几条独立验收：
 

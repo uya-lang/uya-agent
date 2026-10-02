@@ -1096,9 +1096,15 @@ fn agent_log_assistant(step: i32, o: &const ChatOut, t: u64) void {
         return;
     }
     if o.ncalls > 0 {
-        var cj: Buf = buf_new(8192);
+        // 容量按实际需要算（不再是固定 8192）：见 calls_json_make
+        var cj: Buf = buf_empty();
         defer { buf_free(&cj); }
-        if !calls_json_from_chat(o, &cj) {
+        if !calls_json_make(o, &cj) {
+            // 会话日志是尽力而为：这里不能让整轮崩，但必须留话 —— 否则「这一步的
+            // assistant 事件里没有 tool_calls」事后完全查不出原因（真机踩过）。
+            out_err("[session] assistant 事件的 tool_calls 写不进日志（需要 ");
+            out_err_dec(calls_json_need(o));
+            out_err(" 字节，分配或写入失败）\n");
             return;
         }
         _ = buf_append_cstr(&ev, ",\"tool_calls\":");
@@ -2768,7 +2774,55 @@ fn dispatch_tool_buf(cfg: &const Config, name: &const Buf, args_json: &const Buf
     _ = buf_append_byte(out, 10);
 }
 
-// 把一批调用序列化成 assistant 的 tool_calls 数组原文（arguments 只转义一次）
+// 一个 tool_calls 元素的骨架：X / Y / Z 是三个字符串值的占位符（各占 1 字节），
+// 真实长度由 jw_str_esc_len 给。**必须与 calls_json_from_chat 的写法逐字对应** ——
+// 两边不一致时 calls_json_need 会算少，靠 calls_json_from_chat 的返回值兜底（见调用点）。
+const CALLS_JSON_SKELETON: &const byte = "{\"id\":X,\"type\":\"function\",\"function\":{\"name\":Y,\"arguments\":Z}}";
+// 预算余量：宁可多要几百字节，也不要因为骨架算错而把「参数有点大」误报成 OOM
+const CALLS_JSON_SLACK: usize = 256;
+
+// 序列化一批调用**需要多少字节**（精确值 + 余量）。
+//
+// 为什么要有它：以前这里是拍脑袋的 buf_new(8192)。工具参数一大（write 的正文、
+// 长 heredoc 的命令行、一次改好几个文件）序列化就 jw_overflow，调用点于是把
+// 「参数比 8 KiB 大」报成 "out of memory serializing tool_calls" 并**中止整轮**
+// （turn/end reason=error）。真机踩到：模型写一个 8 KiB 出头的 shim，命令行参数刚
+// 过线，于是「创建目录成功」之后的那一步直接死掉。
+//
+// 真正的上限不是这里：历史里单条 extra（tool_calls 原文）的上限是 MSG_CONTENT_MAX，
+// 8 KiB 只是当年随手写的容量。容量按需要算之后，「装不下」只剩真 OOM 一种可能。
+fn calls_json_need(o: &const ChatOut) usize {
+    const skeleton: usize = bufx_cstr_len(CALLS_JSON_SKELETON) - 3;   // 减掉 X/Y/Z 三个占位符
+    var n: usize = 2;   // [ ]
+    var i: usize = 0;
+    while i < o.ncalls {
+        if i > 0 {
+            n = n + 1;   // 元素之间的逗号
+        }
+        n = n + skeleton;
+        n = n + jw_str_esc_len(o.calls[i].id.ptr as &const byte, o.calls[i].id.len);
+        n = n + jw_str_esc_len(o.calls[i].name.ptr as &const byte, o.calls[i].name.len);
+        n = n + jw_str_esc_len(o.calls[i].args.ptr as &const byte, o.calls[i].args.len);
+        i = i + 1;
+    }
+    return n + CALLS_JSON_SLACK;
+}
+
+// 序列化一批调用的完整动作：**按实际需要分配 + 序列化**。
+//
+// 容量只有这一个出处（calls_json_need）—— 谁都不许再写「拍脑袋的固定容量」
+// （老代码就是 buf_new(8192)，工具参数刚过 8 KiB 就把整轮打成
+// "error: out of memory serializing tool_calls"）。自测的 toolcalls-cap 轮钉的就是它。
+//
+// out 必须是**空 Buf**（本函数内部新建；旧内容不会释放）。返回 false = 装不下
+// （预算都装不下＝只剩真 OOM 一种可能）。无论成功失败，调用方都要 buf_free(out)。
+fn calls_json_make(o: &const ChatOut, out: &Buf) bool {
+    out[0] = buf_new(calls_json_need(o));
+    return calls_json_from_chat(o, out);
+}
+
+// 把一批调用序列化成 assistant 的 tool_calls 数组原文（arguments 只转义一次）。
+// 返回 false = 缓冲装不下 —— 容量请用 calls_json_make 算，别自己给固定值。
 fn calls_json_from_chat(o: &const ChatOut, out: &Buf) bool {
     var w: JsonWriter = JsonWriter{ buf: null, cap: 0, used: 0, overflow: false };
     jw_init(&w, out.ptr, out.cap);
@@ -2997,10 +3051,18 @@ fn agent_finish_step(cfg: &const Config, arena: &Arena, h: &History, step: i32, 
         }
 
         // 严格协议：assistant（含 tool_calls 原样）→ 逐条 role:"tool" 结果
-        var calls_json: Buf = buf_new(8192);
+        //
+        // 容量按**实际需要**算（calls_json_make）：以前是固定 8192，工具参数一大就把
+        // 「参数比 8 KiB 大」误报成 "out of memory serializing tool_calls" 并中止整轮 ——
+        // 而且报错点在入史之前，那一步的 assistant 事件也不会落日志，事后无从查证。
+        const need: usize = calls_json_need(o);
+        var calls_json: Buf = buf_empty();
         defer { buf_free(&calls_json); }
-        if !buf_valid(&calls_json) || !calls_json_from_chat(o, &calls_json) {
-            out_err("error: out of memory serializing tool_calls\n");
+        if !calls_json_make(o, &calls_json) {
+            // 容量是精确算的（还带 CALLS_JSON_SLACK 余量）：走到这里只剩真分配不出来
+            out_err("error: out of memory serializing tool_calls (");
+            out_err_dec(need);
+            out_err(" bytes)\n");
             return AGENT_PROTO;
         }
         var pushed_a: bool = hist_push_msg(h, ROLE_ASSISTANT_CALLS, o.content.ptr as &const byte, o.content.len, calls_json.ptr as &const byte, calls_json.len);
@@ -3012,7 +3074,13 @@ fn agent_finish_step(cfg: &const Config, arena: &Arena, h: &History, step: i32, 
             pushed_a = hist_push_msg(h, ROLE_ASSISTANT_CALLS, o.content.ptr as &const byte, o.content.len, calls_json.ptr as &const byte, calls_json.len);
         }
         if !pushed_a {
-            out_err("error: could not append assistant message to history（内存不足，或 tool_calls 超过单条上限）\n");
+            // extra（tool_calls 原文）不能裁剪（截断就是非法 JSON，端点必 400），
+            // 所以超过单条上限只能整轮退出 —— 把两个数字都报出来，别再让人猜
+            out_err("error: could not append assistant message to history（tool_calls 原文 ");
+            out_err_dec(calls_json.len);
+            out_err(" 字节，单条上限 ");
+            out_err_dec(MSG_CONTENT_MAX);
+            out_err("；或内存不足）\n");
             return AGENT_PROTO;
         }
         // 本步这一组的起点：它就是受保护区域的下界 —— 丢老消息时**不允许**碰到
@@ -5697,8 +5765,8 @@ export fn main() i32 {
 // 「把它交出来的提交/中断送回回合循环」。数据流见 README「全屏 TUI」一节。
 // ============================================================
 
-const AGENT_VERSION: [byte: 16] = [112, 50, 48, 45, 115, 116, 97, 116, 115, 0, 0, 0, 0, 0, 0, 0];   // "p20-stats"
-const AGENT_VERSION_LEN: usize = 9;
+const AGENT_VERSION: [byte: 16] = [112, 50, 49, 45, 112, 101, 114, 109, 0, 0, 0, 0, 0, 0, 0, 0];   // "p21-perm"
+const AGENT_VERSION_LEN: usize = 8;
 
 fn agent_parse_color(p: &byte) u8 {
     // auto / always / never / 16 / 256
@@ -6130,21 +6198,25 @@ fn agent_tui_item_head(line: &const Buf, out: &Buf) void {
 // 把触发用的 `/` 从输入行收走 —— 否则第二次敲 `/status` 会拼成 `//status`，被当成
 // 未知命令丢掉，屏幕上就是「/status 没反应」（用户报的正是这一条）。
 // 主循环（空闲态）与 step 边界（回合运行中）都走这里，回显与派发只有一份。
-fn agent_tui_palette_apply(cfg: &Config, h: &History, sel: &const Buf) void {
+// 返回值与 agent_tui_command 同义：true = 该停（`/exit` 在面板里选中也要真退出，
+// 主循环据此收工 —— 见踩坑 37）。
+fn agent_tui_palette_apply(cfg: &Config, h: &History, sel: &const Buf) bool {
     tui_input_drop_slash_trigger();
     var head: Buf = buf_new(128);
     defer { buf_free(&head); }
     agent_tui_item_head(sel, &head);
     if head.len == 0 {
-        return;
+        return false;
     }
     tui_add_notice(head.ptr as &const byte, head.len);
-    _ = agent_tui_command(cfg, h, &head);
+    return agent_tui_command(cfg, h, &head);
 }
 
 // 回合运行中也能安全当场派发的面板命令：只读、不改写也不释放历史。
 // 其余命令（/new、/resume 会 hist_free、/compact 会改写历史、/continue 会再跑一轮）
 // 必须等回合结束由主循环派发 —— 回合还攥着那份 History。
+// 约定：安全集里只能放**不返回「停」**的命令（step 边界的派发点丢掉返回值：回合的
+// 收工由主循环统一处理），所以 `/exit` 不在这里。
 fn agent_tui_cmd_safe(head: &const Buf) bool {
     if sv_eq_cstr(head, "/status") {
         return true;
@@ -6182,11 +6254,19 @@ fn agent_tui_poll_pending_cmd(cfg: &Config, h: &History) void {
     if !tui_overlay_take(&sel) {
         return;
     }
-    agent_tui_palette_apply(cfg, h, &sel);
+    // 安全集里的命令都不返回「停」，所以这里的返回值可以丢（回合的收工由主循环处理）
+    _ = agent_tui_palette_apply(cfg, h, &sel);
 }
 
 // TUI 模式下的命令处理（复用滚动模式的 agent_repl_command，只把「要浮层的」拦下来）
 fn agent_tui_command(cfg: &Config, h: &History, line: &const Buf) bool {
+    if sv_eq_cstr(line, "/help") {
+        // TUI 里 /help 是帮助**浮层**（与 /status、/sessions 同一套观感）；
+        // README 的「浮层」清单与命令表的注释都这么写，但这里一直缺一个分支 ——
+        // 结果 /help 掉进滚动模式的纯文本帮助，浮层函数 tui_help_open() 没人调。
+        tui_help_open();
+        return false;
+    }
     if sv_eq_cstr(line, "/sessions") {
         var items: Buf = buf_new(8192);
         defer { buf_free(&items); }
@@ -6195,8 +6275,10 @@ fn agent_tui_command(cfg: &Config, h: &History, line: &const Buf) bool {
             tui_add_notice("(没有找到会话)" as &const byte, bufx_cstr_len("(没有找到会话)" as &const byte));
             return false;
         }
-        tui_overlay_list(TUI_OVK_SESSIONS, "会话（enter 恢复 · esc 取消）" as &const byte,
-            bufx_cstr_len("会话（enter 恢复 · esc 取消）" as &const byte), items.ptr as &const byte, items.len);
+        // 标题长度必须用 strlen 量：写死的字节数一旦比字面量长，就会把 .rodata 里
+        // 紧邻的字节当作标题的一部分复制进浮层（× 会先在 client 里 OOB 稳定崩溃）。
+        const sess_title: &const byte = "会话（enter 恢复 · esc 取消）" as &const byte;
+        tui_overlay_list(TUI_OVK_SESSIONS, sess_title, strlen(sess_title), items.ptr as &const byte, items.len);
         return false;
     }
     if sv_eq_cstr(line, "/status") {
@@ -6229,8 +6311,8 @@ fn agent_tui_command(cfg: &Config, h: &History, line: &const Buf) bool {
         }
         _ = buf_append_cstr(&items, ")\n");
         agent_status_stats_block(cfg, h, &items);
-        tui_overlay_list(TUI_OVK_HELP, "状态（esc 关闭）" as &const byte,
-            bufx_cstr_len("状态（esc 关闭）" as &const byte), items.ptr as &const byte, items.len);
+        const status_title: &const byte = "状态（esc 关闭）" as &const byte;
+        tui_overlay_list(TUI_OVK_HELP, status_title, strlen(status_title), items.ptr as &const byte, items.len);
         return false;
     }
     return agent_repl_command(cfg, h, line);
@@ -6461,8 +6543,11 @@ fn agent_run_tui_body(cfg: &Config, tui_fd: i32) i32 {
             agent_tui_item_head(&sel, &head);
             if kind == TUI_OVK_PALETTE {
                 // 命令面板：把命令名当输入提交（顺带收走触发面板的那个 "/"，见
-                // agent_tui_palette_apply 的注释）
-                agent_tui_palette_apply(cfg, &h, &sel);
+                // agent_tui_palette_apply 的注释）。返回 true = 「该停」—— 面板里选中
+                // /exit 也要真的退出，见踩坑 37。
+                if agent_tui_palette_apply(cfg, &h, &sel) {
+                    run = false;
+                }
             } else if kind == TUI_OVK_SESSIONS {
                 if head.len > 0 {
                     agent_tui_resume(cfg, &h, &head);
@@ -6479,7 +6564,9 @@ fn agent_run_tui_body(cfg: &Config, tui_fd: i32) i32 {
         // 3) 运行中输入的文本（steer 收件箱里没被采纳的）→ 当作新任务
         const steer_got: bool = inbox_pop(&g_steer, &line);
         if steer_got && line.len > 0 && line.ptr[0] == 47 as byte {
-            _ = agent_tui_command(cfg, &h, &line);
+            if agent_tui_command(cfg, &h, &line) {
+                run = false;
+            }
             continue;
         }
         // 4) 等提交
@@ -6499,7 +6586,9 @@ fn agent_run_tui_body(cfg: &Config, tui_fd: i32) i32 {
             continue;
         }
         if line.ptr[0] == 47 as byte {
-            _ = agent_tui_command(cfg, &h, &line);
+            if agent_tui_command(cfg, &h, &line) {
+                run = false;
+            }
             continue;
         }
         // 5) 跑一轮

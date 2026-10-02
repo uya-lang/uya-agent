@@ -296,6 +296,86 @@ fn mock_toolcall_body(out: &Buf, with_shell: bool) bool {
     return true;
 }
 
+// 踩坑 35 的端到端轮用：一发**参数超过 8 KiB** 的 write 调用（正文用 cap_test_body，
+// 头尾都有标记）。
+// 老代码在 agent_finish_step 里按固定 8192 序列化 tool_calls，于是这一步以
+// "error: out of memory serializing tool_calls" 中止整轮 —— 真机就是这么死的
+// （模型写 8 KiB 出头的文件/命令行）。这轮就是把那条路走一遍。
+fn mock_bigcall_body(out: &Buf) bool {
+    var content: Buf = buf_new(16384);
+    defer { buf_free(&content); }
+    var inner: Buf = buf_new(16384);
+    defer { buf_free(&inner); }
+    if !buf_valid(&content) || !buf_valid(&inner) {
+        return false;
+    }
+    if !cap_test_body(&content) {
+        return false;
+    }
+    var wi: JsonWriter = JsonWriter{ buf: null, cap: 0, used: 0, overflow: false };
+    jw_init(&wi, inner.ptr, inner.cap);
+    jw_byte(&wi, 123);
+    jw_key(&wi, "file_path");
+    jw_str_cstr(&wi, "note.txt");
+    jw_byte(&wi, 44);
+    jw_key(&wi, "content");
+    jw_str(&wi, content.ptr, content.len);
+    jw_byte(&wi, 125);
+    if jw_overflow(&wi) {
+        return false;
+    }
+    inner.len = jw_used(&wi);
+
+    var w: JsonWriter = JsonWriter{ buf: null, cap: 0, used: 0, overflow: false };
+    jw_init(&w, out.ptr, out.cap);
+    jw_byte(&w, 123);
+    jw_key(&w, "id");
+    jw_str_cstr(&w, "chatcmpl-selftest");
+    jw_byte(&w, 44);
+    jw_key(&w, "choices");
+    jw_byte(&w, 91);
+    jw_byte(&w, 123);
+    jw_key(&w, "index");
+    jw_i64(&w, 0);
+    jw_byte(&w, 44);
+    jw_key(&w, "message");
+    jw_byte(&w, 123);
+    jw_key(&w, "role");
+    jw_str_cstr(&w, "assistant");
+    jw_byte(&w, 44);
+    jw_key(&w, "content");
+    jw_null(&w);
+    jw_byte(&w, 44);
+    jw_key(&w, "tool_calls");
+    jw_byte(&w, 91);
+    jw_byte(&w, 123);
+    jw_key(&w, "id");
+    jw_str_cstr(&w, "call_big");
+    jw_byte(&w, 44);
+    jw_key(&w, "type");
+    jw_str_cstr(&w, "function");
+    jw_byte(&w, 44);
+    jw_key(&w, "function");
+    jw_byte(&w, 123);
+    jw_key(&w, "name");
+    jw_str_cstr(&w, "write");
+    jw_byte(&w, 44);
+    jw_key(&w, "arguments");
+    jw_str(&w, inner.ptr, inner.len);
+    jw_byte(&w, 125);
+    jw_byte(&w, 125);
+    jw_byte(&w, 93);
+    jw_byte(&w, 125);
+    jw_byte(&w, 125);
+    jw_byte(&w, 93);
+    jw_byte(&w, 125);
+    if jw_overflow(&w) {
+        return false;
+    }
+    out.len = jw_used(&w);
+    return true;
+}
+
 // 不限步数轮用：一封只含**一个** bash 调用的响应（每轮都一样，靠 tool_call_id 计数）。
 // 不碰文件，从而避开 fs 的观察策略（write 需要先 read）：每一步都是干净、等价的。
 fn mock_steps_body(out: &Buf) bool {
@@ -1461,6 +1541,9 @@ fn mock_server(lfd: i32) i32 {
     if mock_mode == 24 {
         limit = 1;          // 诊断回显轮：只服务一次（agent 拿到 400 就该退出）
     }
+    if mock_mode == 25 {
+        limit = 2;          // 大参数轮：大参数工具轮 + 断言/最终答案轮
+    }
     while round < limit {
         // accept 最多等 10 秒：客户端不再发请求时 mock 必须自己退出，
         // 否则「mock 卡在 accept」会变成整个自测卡死（踩过）
@@ -1657,6 +1740,62 @@ fn mock_server(lfd: i32) i32 {
             // 400 + 把收到的请求原样回显（转录里不许出现这段原文）
             if !mock_send_400_echo(cfd, &rx) {
                 verdict = 34;
+            }
+            buf_free(&rx);
+            _ = sys_close(cfd) catch {};
+            round = round + 1;
+            continue;
+        }
+        if mock_mode == 25 {
+            // 踩坑 35：第一轮给一个 arguments > 8 KiB 的 write 调用（老的固定容量
+            // 就是在这里把整轮打成 "out of memory serializing tool_calls" 的），
+            // 第二轮断言大参数**一字不差**地回到了请求里、工具结果配对完整。
+            if round == 0 {
+                var sb25: Buf = buf_new(32768);
+                if !mock_bigcall_body(&sb25) {
+                    verdict = 250;
+                }
+                var sent25a: bool = false;
+                if is_stream {
+                    sent25a = mock_send_sse(cfd, &sb25);
+                } else {
+                    sent25a = mock_send(cfd, &sb25);
+                }
+                if !sent25a {
+                    verdict = 251;
+                }
+                buf_free(&sb25);
+            } else {
+                // 头尾标记都在 = arguments 一个字节都没少（截断/漏尾都会在这里露出来）
+                if !contains(&rx, "CAP-HEAD|") || !contains(&rx, "|CAP-TAIL") {
+                    verdict = 252;
+                }
+                // 工具真的派发了，结果也回灌了
+                if !contains(&rx, "Created file") {
+                    verdict = 253;
+                }
+                // assistant(tool_calls) 与它的 tool 结果必须配对完整（否则端点 400）
+                if !mock_pairing_ok(&rx) {
+                    verdict = 254;
+                }
+                var body25b: Buf = buf_new(512);
+                if verdict == 0 {
+                    if !mock_final_body(&body25b, "SELFTEST_BIGCALL_OK") {
+                        verdict = 255;
+                    }
+                } else if !mock_final_body(&body25b, "SELFTEST_FAIL") {
+                    verdict = 255;
+                }
+                var sent25b: bool = false;
+                if is_stream {
+                    sent25b = mock_send_sse(cfd, &body25b);
+                } else {
+                    sent25b = mock_send(cfd, &body25b);
+                }
+                if !sent25b {
+                    verdict = 256;
+                }
+                buf_free(&body25b);
             }
             buf_free(&rx);
             _ = sys_close(cfd) catch {};
@@ -2578,6 +2717,37 @@ fn file_equals(path: &const byte, expect: &const byte) bool {
     return true;
 }
 
+// 逐字节比较「文件」与「一段内存」。
+// file_equals 只读 512 字节，装不下大参数轮那 9 KiB 的正文，所以另开一个。
+fn file_bytes_eq(path: &const byte, want: &const byte, want_len: usize) bool {
+    const fd: i32 = sys_open(path as *const byte, O_RDONLY as i32, 0) catch {
+        return false;
+    };
+    defer { _ = sys_close(fd) catch {}; }
+    var got: Buf = buf_new(want_len + 64);
+    defer { buf_free(&got); }
+    if !buf_valid(&got) {
+        return false;
+    }
+    var chunk: [byte: 4096] = [0: 4096];
+    while true {
+        const n: isize = sys_read(fd, &chunk[0], 4096) catch { 0 as isize; };
+        if n <= 0 {
+            break;
+        }
+        if !buf_append(&got, &chunk[0], n as usize) {
+            return false;
+        }
+        if got.len > want_len {
+            return false;   // 比期望长：不用读完就知道不等
+        }
+    }
+    if got.len != want_len {
+        return false;
+    }
+    return bufx_mem_eq(got.ptr as &const byte, want, want_len);
+}
+
 // ============================================================
 // P19：诊断出口 —— 外来字节不许以原文进转录
 //
@@ -3028,6 +3198,21 @@ fn selftest_round(base: &const Config, tag: &const byte, mode: i32, allow_shell:
             ok = false;
         }
         buf_free(&esc_path);
+    }
+    if mode == 25 && rc == AGENT_OK && mock_rc == 0 {
+        // 踩坑 35：9 KiB 的正文必须**整段**落到文件里 —— 序列化、入史、回灌、派发这条路上
+        // 少一个字节（或者整轮被打成 OOM），这里都会红。
+        var want_big: Buf = buf_new(16384);
+        defer { buf_free(&want_big); }
+        if !cap_test_body(&want_big) {
+            out_err("[大参数正文构造失败] ");
+            ok = false;
+        } else if !file_bytes_eq(&file_path.ptr[0] as &const byte, want_big.ptr as &const byte, want_big.len) {
+            out_err("[note.txt 与 9 KiB 正文不一致（期望 ");
+            out_err_dec(want_big.len);
+            out_err(" 字节）] ");
+            ok = false;
+        }
     }
     if mode == 24 {
         // 诊断轮：转录（fd 2）里只许有**一行转义预览**，不许出现回显进来的请求体
@@ -6682,6 +6867,178 @@ fn jsonesc_round(tag: &const byte) bool {
     return ok;
 }
 
+// ============================================================
+// 踩坑 35：tool_calls 序列化容量（真机踩坑）
+//
+// 症状（用户截图那一幕）：模型给一个「参数比 8 KiB 大」的调用（写文件的正文、长 heredoc
+// 的命令行），这一步直接以
+//     error: out of memory serializing tool_calls
+// 中止整轮 —— 内存一点问题都没有，只是当年把容量写死成 buf_new(8192)
+// （见 agent.uya 的 calls_json_need）。命令行的参数刚过 8 KiB 就中招。
+//
+// 这一轮钉三件事：
+//   1) jw_str_esc_len 与 jw_str 实际写出的字节数**逐字节相等**（转义规则一改就红）；
+//   2) calls_json_need 的预算 = 实际序列化长度 + CALLS_JSON_SLACK（预算不许算少）；
+//   3) 9 KiB 出头的参数：按预算分配成功，按老的固定 8192 装不下 —— 后者就是这个 bug。
+// ============================================================
+const CAP_TEST_CHUNKS: usize = 600;   // 16 × 600 = 9600 字节正文
+
+fn cap_test_body(out: &Buf) bool {
+    if !buf_append_cstr(out, "CAP-HEAD|") {
+        return false;
+    }
+    var i: usize = 0;
+    while i < CAP_TEST_CHUNKS {
+        if !buf_append_cstr(out, "0123456789abcdef") {
+            return false;
+        }
+        i = i + 1;
+    }
+    return buf_append_cstr(out, "|CAP-TAIL");
+}
+
+fn toolcalls_cap_round(tag: &const byte) bool {
+    var ok: bool = true;
+
+    // ---- 1) 转义长度 vs 实际写出 ----
+    // 输入：a NUL 0x01 0x1f " \ LF TAB BS FF CR B 中 !
+    var raw: [byte: 16] = [97, 0, 1, 31, 34, 92, 10, 9, 8, 12, 13, 66, 228, 184, 173, 33];
+    var esc: Buf = buf_new(256);
+    defer { buf_free(&esc); }
+    var w: JsonWriter = JsonWriter{ buf: null, cap: 0, used: 0, overflow: false };
+    jw_init(&w, esc.ptr, esc.cap);
+    jw_str(&w, &raw[0], 16);
+    esc.len = jw_used(&w);
+    // 手工口径：a(1) + 三个六字节 \u00XX(18) + " \ LF TAB BS FF CR(14) + B(1) + 中(3) + !(1)
+    //           + 两侧引号(2) = 40
+    const esc_want: usize = 40;
+    if esc.len != esc_want {
+        ty_fail(tag, "用例失效：jw_str 的实际长度不是 40", &ok);
+    }
+    if jw_str_esc_len(&raw[0] as &const byte, 16) != esc_want {
+        ty_fail(tag, "jw_str_esc_len 与实际写出长度不一致", &ok);
+    }
+    if jw_str_esc_len(&raw[0] as &const byte, 0) != 2 {
+        ty_fail(tag, "空串的转义长度应当是 2（一对引号）", &ok);
+    }
+
+    // ---- 2) 造两个调用：第一个是 9 KiB 出头的 write，第二个专挑转义字节 ----
+    // 两个元素是故意的：calls_json_need 的骨架里「元素之间的逗号」只有多元素才走得到。
+    var o: ChatOut = chat_out_new();
+    defer { chat_out_free(&o); }
+    var body: Buf = buf_new(16384);
+    defer { buf_free(&body); }
+    if !cap_test_body(&body) {
+        ty_fail(tag, "用例内部：正文构造失败", &ok);
+        return ok;
+    }
+    _ = buf_append_cstr(&o.calls[0].id, "call_cap");
+    _ = buf_append_cstr(&o.calls[0].name, "write");
+    _ = buf_append_cstr(&o.calls[0].args, "{\"file_path\":\"note.txt\",\"content\":");
+    if !jw_str_into(&o.calls[0].args, body.ptr as &const byte, body.len) {
+        ty_fail(tag, "用例内部：arguments 构造失败", &ok);
+        return ok;
+    }
+    _ = buf_append_cstr(&o.calls[0].args, "}");
+    // 第二个：id/name 带引号，args 里塞 NUL / LF / TAB / 反斜杠 / 非法 UTF-8 尾巴
+    var tricky: [byte: 13] = [123, 34, 97, 34, 58, 34, 10, 9, 0, 92, 34, 200, 173];
+    _ = buf_append_cstr(&o.calls[1].id, "call_esc\"x");
+    _ = buf_append_cstr(&o.calls[1].name, "bash");
+    _ = buf_append(&o.calls[1].args, &tricky[0], 13);
+    o.ncalls = 2;
+
+    // ---- 3) 预算：必须 > 老的 8192，且与实际序列化长度严丝合缝 ----
+    const need: usize = calls_json_need(&o);
+    if need <= 8192 {
+        ty_fail(tag, "用例失效：预算没有超过老的固定容量 8192", &ok);
+    }
+    // 走**生产那条路**（calls_json_make 内部算容量）：老代码这里是 buf_new(8192)，
+    // 所以这一条就是那个 bug 的回归锚点 —— 谁把容量改回固定值，这一轮立刻红。
+    var cj: Buf = buf_empty();
+    defer { buf_free(&cj); }
+    if !calls_json_make(&o, &cj) {
+        ty_fail(tag, "按预算分配仍然写不下（容量没按需要算？）", &ok);
+    } else {
+        if cj.len + CALLS_JSON_SLACK != need {
+            ty_fail(tag, "序列化长度与预算不符（预算必须精确）", &ok);
+        }
+        if cj.len <= 8192 {
+            ty_fail(tag, "用例失效：序列化结果没超过 8192", &ok);
+        }
+        // 大参数的**头尾**都在：中间被截掉、尾字节被漏写都会在这里露出来
+        if !contains(&cj, "CAP-HEAD|") || !contains(&cj, "|CAP-TAIL") {
+            ty_fail(tag, "序列化结果里找不到大参数的标记", &ok);
+        }
+    }
+    // 老的固定容量：必须装不下 —— 这就是那个 bug 的形状（回归的锚点）
+    var small: Buf = buf_new(8192);
+    defer { buf_free(&small); }
+    if calls_json_from_chat(&o, &small) {
+        ty_fail(tag, "8192 的固定容量居然装下了 9 KiB 参数（用例失效）", &ok);
+    }
+
+    // ---- 4) 回读：两个元素的 id/name/arguments 都必须与原文逐字节相同 ----
+    // （不许二次转义、不许丢字节；只看 3) 真序列化成功的情况 —— 失败时 cj 是空的，
+    //   继续往下跑只会用「不是合法 JSON」盖住真正的病因）
+    if cj.len == 0 {
+        if ok {
+            out_err("selftest[");
+            out_err(tag);
+            out_err("] ok\n");
+        }
+        return ok;
+    }
+    const raw_arena: &void = malloc(1 << 20);
+    if ((raw_arena as &byte) as usize) == 0 {
+        ty_fail(tag, "用例内部：arena 分配失败", &ok);
+        return ok;
+    }
+    var arena: Arena = Arena{ buffer: null, size: 0, used: 0 };
+    arena_init(&arena, raw_arena as &byte, 1 << 20);
+    var root: JsonValue = JsonValue.json_null();
+    if !js_parse(&arena, cj.ptr, cj.len, &root) {
+        ty_fail(tag, "序列化结果不是合法 JSON", &ok);
+    } else if js_arr_len(&root) != o.ncalls {
+        ty_fail(tag, "序列化结果的元素个数不对", &ok);
+    } else {
+        var un: Buf = buf_empty();
+        defer { buf_free(&un); }
+        var k: usize = 0;
+        while k < o.ncalls {
+            var call: JsonValue = JsonValue.json_null();
+            var fnv: JsonValue = JsonValue.json_null();
+            if !js_arr_get(&root, k, &call) {
+                ty_fail(tag, "回读 tool_calls 元素失败", &ok);
+            } else if !js_obj_get(&call, "function", 8, &fnv) {
+                ty_fail(tag, "回读 function 失败", &ok);
+            } else if !js_obj_get_str_unescaped(&call, "id", 2, &un) {
+                ty_fail(tag, "回读 id 失败", &ok);
+            } else if un.len != o.calls[k].id.len || !bufx_mem_eq(un.ptr as &const byte, o.calls[k].id.ptr as &const byte, un.len) {
+                ty_fail(tag, "回读的 id 与原文不一致", &ok);
+            } else if !js_obj_get_str_unescaped(&fnv, "name", 4, &un) {
+                ty_fail(tag, "回读 name 失败", &ok);
+            } else if un.len != o.calls[k].name.len || !bufx_mem_eq(un.ptr as &const byte, o.calls[k].name.ptr as &const byte, un.len) {
+                ty_fail(tag, "回读的 name 与原文不一致", &ok);
+            } else if !js_obj_get_str_unescaped(&fnv, "arguments", 9, &un) {
+                ty_fail(tag, "回读 arguments 失败", &ok);
+            } else if un.len != o.calls[k].args.len || !bufx_mem_eq(un.ptr as &const byte, o.calls[k].args.ptr as &const byte, un.len) {
+                ty_fail(tag, "回读的 arguments 与原文不一致", &ok);
+            }
+            k = k + 1;
+        }
+    }
+    free(raw_arena);
+
+    if ok {
+        out_err("selftest[");
+        out_err(tag);
+        out_err("] ok（tool_calls 原文 ");
+        out_err_dec(cj.len);
+        out_err(" 字节，老的固定容量是 8192）\n");
+    }
+    return ok;
+}
+
 fn diffx_round(tag: &const byte) bool {
     var ok: bool = true;
     var out: Buf = buf_new(16384);
@@ -10052,6 +10409,11 @@ export fn selftest_main(base: &const Config) i32 {
     // P15：请求体转义（NUL 等控制字节）—— 纯函数轮 + 端到端轮（工具结果里真的带 NUL），
     // 端到端那条 chat 与 responses 各跑一遍（两条协议的请求体都必须合法）。
     const v2: bool = jsonesc_round("json-escape");
+    // 踩坑 35：tool_calls 序列化容量（固定 8192 把「参数有点大」误报成 OOM 的那个坑）
+    const v8: bool = toolcalls_cap_round("toolcalls-cap");
+    // 踩坑 35 端到端：mock 给一个 arguments > 8 KiB 的 write 调用 —— 老代码在这一步
+    // 直接以 "error: out of memory serializing tool_calls" 中止整轮（用户截图那一幕）
+    const v9: bool = selftest_round(base, "toolcalls-big", 25, true, "build/selftest_ws_bigcall", true, false, false, false);
     mock_expect_resp = false;
     const v3: bool = round_run_api(base, "ctrl-bytes", "build/selftest_ws_ctrl", 23, 0 as i64, 4, LLM_STYLE_CHAT, false, "跑一条输出含 NUL 的命令");
     mock_expect_resp = true;
@@ -10110,7 +10472,7 @@ export fn selftest_main(base: &const Config) i32 {
     const w5: bool = procx_percent_round("procx-percent");
 
     const w6: bool = cpu_live_round("cpu-live");
-    if r1 && r2 && r3 && r4 && r5 && r5b && r6 && r7 && r8 && r9 && s0 && s1 && s2 && s3 && s4 && t0 && t1 && t2 && t3 && t3b && t4 && t5 && t6 && t7 && t8 && t9 && t10 && t11 && u0 && u1 && u2 && u3 && v0 && v1 && v2 && v3 && v4 && v5 && v6 && v7 && r1r && r1t && r1s && y0 && y1
+    if r1 && r2 && r3 && r4 && r5 && r5b && r6 && r7 && r8 && r9 && s0 && s1 && s2 && s3 && s4 && t0 && t1 && t2 && t3 && t3b && t4 && t5 && t6 && t7 && t8 && t9 && t10 && t11 && u0 && u1 && u2 && u3 && v0 && v1 && v2 && v3 && v4 && v5 && v6 && v7 && v8 && v9 && r1r && r1t && r1s && y0 && y1
         && x0 && x1 && x2 && x3 && x4 && x5 && x6 && x7 && x8 && x9 && x10 && x11 && x12 && x13 && x14 && x15 && x16 && w0 && w1 && w2 && w3 && w4 && w5 && w6 && z0 && z1 && z2 && z3 && z4 && z5 && z6 && z7 {
         out_err("SELFTEST PASS\n");
         return AGENT_OK;
