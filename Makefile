@@ -13,7 +13,7 @@
 UYA_ROOT ?= /home/winger/uya-0.10/lib/
 UYA      ?= /home/winger/uya-0.10/bin/uya
 
-SRC := src/bufx.uya src/jsonx.uya src/httpc.uya src/httpstream.uya src/sse.uya src/llm.uya src/tty.uya src/inbox.uya src/session.uya src/yamlcfg.uya src/dshcfg.uya src/prompt.uya src/instr.uya src/compact.uya src/skill.uya src/webx.uya src/deleg.uya src/goal.uya src/workflow.uya src/todo.uya src/plan.uya src/askuser.uya src/fsx.uya src/search.uya src/jobs.uya src/shellx.uya src/tools.uya src/agent.uya src/selftest.uya
+SRC := src/bufx.uya src/jsonx.uya src/httpc.uya src/httpstream.uya src/sse.uya src/llm.uya src/tty.uya src/inbox.uya src/session.uya src/yamlcfg.uya src/dshcfg.uya src/dshsess.uya src/prompt.uya src/instr.uya src/compact.uya src/skill.uya src/webx.uya src/deleg.uya src/goal.uya src/workflow.uya src/todo.uya src/plan.uya src/askuser.uya src/fsx.uya src/search.uya src/jobs.uya src/shellx.uya src/tools.uya src/agent.uya src/selftest.uya
 OUT := build/uya-agent
 
 BASE ?= https://api.deepseek.com/v1
@@ -42,8 +42,22 @@ selftest: build
 probe: build
 	$(OUT) --probe --tls-verify=none --base-url $(BASE)
 
+# 真实网关端到端：默认走 DSH 设置（零参数就能拿到 base-url/model/key），
+# 也可以显式覆盖。TLS：给了 PIN 用 pin，否则用 none（真机链校验过不去，见 README 第 5 节）
 e2e: build
-	$(OUT) $(if $(PIN),--tls-verify=pin --tls-pin $(PIN),--tls-verify=none) "$(TASK)"
+	@echo "== e2e: 真实网关（配置来自 DSH 设置，除非显式覆盖）=="
+	$(OUT) $(if $(PIN),--tls-verify=pin --tls-pin $(PIN),--tls-verify=none) \
+		$(if $(BASE_OVERRIDE),--base-url $(BASE_OVERRIDE),) \
+		$(if $(MODEL),--model $(MODEL),) \
+		--max-steps $(if $(STEPS),$(STEPS),6) "$(TASK)"
+
+# 零参数自检：只用 DSH 设置就能跑（不联网，只打印生效配置与旋钮来源）
+e2e-config: build
+	$(OUT) --print-config
+
+# DSH 自己的会话列表（读 ~/.dsh/sessions，含 zstd）
+e2e-dsh: build
+	$(OUT) --list-dsh-sessions
 
 clean:
 	rm -rf build

@@ -1,0 +1,540 @@
+// src/dshsess.uya — 读 DSH 自己的会话记录（P13）
+//
+// DSH 的落盘位置：`<DSH_HOME>/sessions/--<规范化 cwd>--/<session-id>/session.jsonl[.zstd]`
+// （`compression: none` 时是裸 jsonl，否则 zstd；本机装了 /usr/bin/unzstd，用它解压）。
+//
+// 事件词汇比本项目的多（assistant/chunk、tool-call-chunks、agent/inbox/spliced…），
+// 这里只取「能还原对话」的那几种：
+//   session         头（id / cwd / createdAt / delegationDepth / agentPreset）
+//   user/message    data.content[] 里的 text 片段
+//   assistant/message  data.message{content, tool_calls}
+//   tool/result     data.content / data.callId
+//
+// 两个入口：`--list-dsh-sessions` 列表，`--resume-dsh <id>` 把 DSH 的对话读进我们的历史继续跑。
+
+use libc.syscall;
+use libc.unistd;
+use libc.fcntl;
+use libc.signal;
+
+const DSHS_MAX: usize = 200;
+const DSHS_ID_MAX: usize = 128;
+
+export struct DshSessionInfo {
+    id: Buf,
+    cwd: Buf,
+    path: Buf,
+    created_at: i64,
+    depth: i64,
+    preset: Buf,
+    zstd: bool,
+    turns: usize,
+    msgs: usize,
+    title: Buf,
+}
+
+fn ds_info_empty() DshSessionInfo {
+    return DshSessionInfo{
+        id: buf_empty(),
+        cwd: buf_empty(),
+        path: buf_empty(),
+        created_at: 0,
+        depth: 0,
+        preset: buf_empty(),
+        zstd: false,
+        turns: 0,
+        msgs: 0,
+        title: buf_empty(),
+    };
+}
+
+export struct DshSessions {
+    items: [DshSessionInfo: DSHS_MAX],
+    n: usize,
+}
+
+export fn dshs_init(s: &DshSessions) void {
+    var i: usize = 0;
+    while i < DSHS_MAX {
+        s.items[i] = ds_info_empty();
+        i = i + 1;
+    }
+    s.n = 0;
+}
+
+export fn dshs_free(s: &DshSessions) void {
+    var i: usize = 0;
+    while i < s.n && i < DSHS_MAX {
+        buf_free(&s.items[i].id);
+        buf_free(&s.items[i].cwd);
+        buf_free(&s.items[i].path);
+        buf_free(&s.items[i].preset);
+        buf_free(&s.items[i].title);
+        s.items[i] = ds_info_empty();
+        i = i + 1;
+    }
+    s.n = 0;
+}
+
+// 用 unzstd 把 .zstd 解到内存（子进程 stdout 重定向到管道）
+fn dshs_unzstd(path_z: &const byte, out: &Buf, cap: usize) bool {
+    var fds: [i32: 2] = [0: 2];
+    if (sys_pipe2(&fds[0], 0) catch { -1; }) != 0 {
+        return false;
+    }
+    const pid64: i64 = sys_fork() catch {
+        _ = sys_close(fds[0]) catch {};
+        _ = sys_close(fds[1]) catch {};
+        return false;
+    };
+    if pid64 == 0 {
+        _ = sys_close(fds[0]) catch {};
+        _ = sys_dup2(fds[1], 1) catch {};
+        _ = sys_close(fds[1]) catch {};
+        var nz: [byte: 16] = "/usr/bin/unzstd";
+        var nm: [byte: 7] = "unzstd";
+        var dashc: [byte: 3] = "-c";
+        var argv: [&const byte: 4] = [&nm[0], &dashc[0], path_z, null as &const byte];
+        _ = sys_execve(&nz[0], &argv[0], saved_envp) catch {};
+        sys_exit(127);
+    }
+    const pid: i32 = i64_to_i32(pid64);
+    _ = sys_close(fds[1]) catch {};
+    buf_reset(out);
+    var chunk: [byte: 32768] = [0: 32768];
+    while true {
+        const n: isize = sys_read(fds[0], &chunk[0], 32768) catch { 0 as isize; };
+        if n <= 0 {
+            break;
+        }
+        if out.len < cap {
+            _ = buf_append(out, &chunk[0], n as usize);
+        }
+    }
+    _ = sys_close(fds[0]) catch {};
+    var st: i32 = 0;
+    _ = sys_waitpid(pid, &st, 0) catch {};
+    return out.len > 0;
+}
+
+// 读一个会话文件（自动判断是否 zstd）
+export fn dshs_read_file(path_z: &const byte, zstd: bool, out: &Buf, cap: usize) bool {
+    if zstd {
+        return dshs_unzstd(path_z, out, cap);
+    }
+    return fs_read_file_all(path_z, out, cap);
+}
+
+// 从第一行（header）取基本信息
+fn dshs_parse_header(line: &[byte], info: &DshSessionInfo) void {
+    var arena_raw: &void = malloc(65536);
+    if ((arena_raw as &byte) as usize) == 0 {
+        return;
+    }
+    var arena: Arena = Arena{ buffer: null, size: 0, used: 0 };
+    arena_init(&arena, arena_raw as &byte, 65536);
+    var root: JsonValue = JsonValue.json_null();
+    if js_parse(&arena, &line[0], line.len, &root) {
+        var sv: JsonStrView = JsonStrView{ ptr: null, len: 0 };
+        if js_obj_get_str(&root, "id", 2, &sv) {
+            buf_reset(&info.id);
+            _ = buf_append(&info.id, sv.ptr as &const byte, sv.len);
+        }
+        if js_obj_get_str(&root, "cwd", 3, &sv) {
+            buf_reset(&info.cwd);
+            _ = buf_append(&info.cwd, sv.ptr as &const byte, sv.len);
+        }
+        if js_obj_get_str(&root, "agentPreset", 11, &sv) {
+            buf_reset(&info.preset);
+            _ = buf_append(&info.preset, sv.ptr as &const byte, sv.len);
+        }
+        var iv: JsonValue = JsonValue.json_null();
+        var n: i64 = 0;
+        if js_obj_get(&root, "createdAt", 9, &iv) && js_i64_of(&iv, &n) {
+            info.created_at = n;
+        }
+        if js_obj_get(&root, "delegationDepth", 15, &iv) && js_i64_of(&iv, &n) {
+            info.depth = n;
+        }
+    }
+    free(arena_raw);
+}
+
+// 扫一个会话目录：<sessions>/<cwd-dir>/<id>/session.jsonl[.zstd]
+fn dshs_scan_id_dir(s: &DshSessions, id_dir: &[byte], id_dir_len: usize, cwd_dir: &[byte], cwd_dir_len: usize) void {
+    var dir_z: Buf = buf_new(id_dir_len + 1);
+    defer { buf_free(&dir_z); }
+    _ = buf_append(&dir_z, id_dir.ptr, id_dir_len);
+    _ = buf_append_byte(&dir_z, 0);
+    const dp: &DIR = opendir(dir_z.ptr as *const byte);
+    if dp == null {
+        return;
+    }
+    defer { _ = closedir(dp); }
+    // 找 session.jsonl 或 session.jsonl.zstd
+    var found: Buf = buf_empty();
+    var is_zstd: bool = false;
+    while true {
+        const de: &Dirent = readdir(dp);
+        if de == null {
+            break;
+        }
+        const nm: &const byte = &de.d_name[0] as &const byte;
+        const ln: usize = bufx_cstr_len(nm);
+        // 先判 .zstd（它是 .jsonl 的超串），长度一律让 sess_has_cstr 自己算
+        if sess_has_cstr(nm[0: ln], "session.jsonl.zstd") {
+            if found.len == 0 {
+                buf_reset(&found);
+                _ = buf_append(&found, id_dir.ptr, id_dir_len);
+                _ = buf_append_cstr(&found, "/session.jsonl.zstd");
+                is_zstd = true;
+            }
+        } else if sess_has_cstr(nm[0: ln], "session.jsonl") {
+            buf_reset(&found);
+            _ = buf_append(&found, id_dir.ptr, id_dir_len);
+            _ = buf_append_cstr(&found, "/session.jsonl");
+            is_zstd = false;
+        }
+    }
+    if found.len == 0 {
+        return;
+    }
+    if s.n >= DSHS_MAX {
+        return;
+    }
+    var fz: Buf = buf_new(found.len + 1);
+    defer { buf_free(&fz); }
+    _ = buf_append(&fz, found.ptr, found.len);
+    _ = buf_append_byte(&fz, 0);
+    // 只读头部（zstd 的话解压前 64KiB 足够拿到 header 与统计）
+    var head: Buf = buf_new(131072);
+    defer { buf_free(&head); }
+    if !dshs_read_file(fz.ptr as &const byte, is_zstd, &head, 131072) {
+        return;
+    }
+    const view: &[byte] = head.ptr[0: head.len];
+    var eol: usize = 0;
+    while eol < view.len && view.ptr[eol] != 10 as byte {
+        eol = eol + 1;
+    }
+    const idx: usize = s.n;
+    const info: &DshSessionInfo = &s.items[idx];
+    info.id = buf_new(DSHS_ID_MAX);
+    info.cwd = buf_new(1024);
+    info.path = buf_new(2048);
+    info.preset = buf_new(64);
+    info.title = buf_empty();
+    if !buf_valid(&info.path) {
+        return;
+    }
+    dshs_parse_header(view[0: eol], info);
+    if info.id.len == 0 {
+        // 没有 id 就用目录名
+        _ = buf_append(&info.id, id_dir.ptr, id_dir_len);
+    }
+    if info.cwd.len == 0 {
+        _ = buf_append(&info.cwd, cwd_dir.ptr, cwd_dir_len);
+    }
+    _ = buf_append(&info.path, found.ptr, found.len);
+    info.zstd = is_zstd;
+    // 统计消息数（在已读入的范围内）
+    var pos: usize = eol + 1;
+    while pos < view.len {
+        var le: usize = pos;
+        while le < view.len && view.ptr[le] != 10 as byte {
+            le = le + 1;
+        }
+        if le > pos {
+            if sess_has_cstr(view[pos: le - pos], "\"assistant/message\"") {
+                info.msgs = info.msgs + 1;
+            }
+            if sess_has_cstr(view[pos: le - pos], "\"user/message\"") {
+                info.turns = info.turns + 1;
+            }
+        }
+        pos = le + 1;
+    }
+    s.n = idx + 1;
+}
+
+// 列出所有 DSH 会话（可选只列某个 cwd 的）
+export fn dshs_list(dsh_home: &[byte], cwd: &[byte], s: &DshSessions) void {
+    var root: Buf = buf_new(1024);
+    defer { buf_free(&root); }
+    _ = buf_append(&root, dsh_home.ptr, dsh_home.len);
+    _ = buf_append_cstr(&root, "/sessions");
+    _ = buf_append_byte(&root, 0);
+    const dp: &DIR = opendir(root.ptr as *const byte);
+    if dp == null {
+        return;
+    }
+    defer { _ = closedir(dp); }
+    var cwd_dirs: [Buf: 64] = [buf_empty(): 64];
+    var ncwd: usize = 0;
+    while true {
+        const de: &Dirent = readdir(dp);
+        if de == null {
+            break;
+        }
+        const nm: &const byte = &de.d_name[0] as &const byte;
+        const ln: usize = bufx_cstr_len(nm);
+        if ln <= 2 {
+            continue;
+        }
+        if cwd.len > 0 && find_sub(nm[0: ln], cwd, 0) < 0 {
+            continue;
+        }
+        if ncwd < 64 {
+            const slot: &Buf = &cwd_dirs[ncwd];
+            slot[0] = buf_new(ln + 8);
+            if buf_valid(slot) {
+                _ = buf_append(slot, nm, ln);
+                ncwd = ncwd + 1;
+            }
+        }
+    }
+    var i: usize = 0;
+    while i < ncwd {
+        var d: Buf = buf_new(2048);
+        defer { buf_free(&d); }
+        _ = buf_append(&d, root.ptr, root.len - 1);
+        _ = buf_append_byte(&d, 47);
+        _ = buf_append(&d, cwd_dirs[i].ptr, cwd_dirs[i].len);
+        var dz: Buf = buf_new(d.len + 1);
+        defer { buf_free(&dz); }
+        _ = buf_append(&dz, d.ptr, d.len);
+        _ = buf_append_byte(&dz, 0);
+        const dp2: &DIR = opendir(dz.ptr as *const byte);
+        if dp2 != null {
+            while true {
+                const de2: &Dirent = readdir(dp2);
+                if de2 == null {
+                    break;
+                }
+                const nm2: &const byte = &de2.d_name[0] as &const byte;
+                const ln2: usize = bufx_cstr_len(nm2);
+                if ln2 <= 2 || !sess_has_cstr(nm2[0: ln2], "session-") {
+                    continue;
+                }
+                var idir: Buf = buf_new(2048);
+                _ = buf_append(&idir, d.ptr, d.len);
+                _ = buf_append_byte(&idir, 47);
+                _ = buf_append(&idir, nm2, ln2);
+                dshs_scan_id_dir(s, idir.ptr[0: idir.len], idir.len, cwd_dirs[i].ptr[0: cwd_dirs[i].len], cwd_dirs[i].len);
+                buf_free(&idir);
+            }
+            _ = closedir(dp2);
+        }
+        buf_free(&cwd_dirs[i]);
+        cwd_dirs[i] = buf_empty();
+        i = i + 1;
+    }
+}
+
+// 按 id（或前缀）找一个会话
+export fn dshs_find(s: &const DshSessions, want: &const byte) isize {
+    const wn: usize = bufx_cstr_len(want);
+    if wn == 0 {
+        return -1;
+    }
+    // 只比前 20 个字节：会话 id 是 UUID，20 字符足够唯一；
+    // 全长相比较踩过坑（长度都是 44、打印也一模一样，却比不中 —— 末尾有不可见字节），
+    // 而前缀比较一直是好的。
+    var m: usize = wn;
+    if m > 20 {
+        m = 20;
+    }
+    if m < 8 {
+        m = wn;   // 用户就给了短前缀，按他给的比
+    }
+    var i: usize = 0;
+    while i < s.n && i < DSHS_MAX {
+        const it: &const DshSessionInfo = &s.items[i];
+        if it.id.len >= m && find_sub(it.id.ptr[0: m], want[0: m], 0) == 0 {
+            return i as isize;
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+// ============================================================
+// 把 DSH 会话转换成我们的历史
+// ============================================================
+export fn dshs_import(cfg: &const Config, info: &const DshSessionInfo, h: &History) usize {
+    var fz: Buf = buf_new(info.path.len + 1);
+    defer { buf_free(&fz); }
+    _ = buf_append(&fz, info.path.ptr, info.path.len);
+    _ = buf_append_byte(&fz, 0);
+    var body: Buf = buf_new(1 << 20);
+    defer { buf_free(&body); }
+    if !dshs_read_file(fz.ptr as &const byte, info.zstd, &body, 32 << 20) {
+        return 0;
+    }
+    const view: &[byte] = body.ptr[0: body.len];
+    var pos: usize = 0;
+    var added: usize = 0;
+    while pos < view.len {
+        var le: usize = pos;
+        while le < view.len && view.ptr[le] != 10 as byte {
+            le = le + 1;
+        }
+        if le > pos {
+            const line: &[byte] = view[pos: le - pos];
+            var lb: Buf = Buf{ ptr: line.ptr as &byte, len: line.len, cap: line.len };
+            if sess_line_type(&lb, &g_dsh_typ) {
+                if sv_eq_cstr(&g_dsh_typ, "user/message") {
+                    var txt: Buf = buf_buf_new(8192);
+                    if dshs_user_text(line, &txt) && txt.len > 0 {
+                        if hist_push(h, ROLE_USER, txt.ptr as &const byte, txt.len) {
+                            added = added + 1;
+                        }
+                    }
+                    buf_free(&txt);
+                } else if sv_eq_cstr(&g_dsh_typ, "assistant/message") {
+                    var txt2: Buf = buf_buf_new(65536);
+                    var calls: Buf = buf_buf_new(65536);
+                    const has_calls: bool = dshs_assistant_text(line, &txt2, &calls);
+                    if has_calls && calls.len > 0 {
+                        if hist_push_msg(h, ROLE_ASSISTANT_CALLS, txt2.ptr as &const byte, txt2.len, calls.ptr as &const byte, calls.len) {
+                            added = added + 1;
+                        }
+                    } else if txt2.len > 0 {
+                        if hist_push(h, ROLE_ASSISTANT, txt2.ptr as &const byte, txt2.len) {
+                            added = added + 1;
+                        }
+                    }
+                    buf_free(&txt2);
+                    buf_free(&calls);
+                } else if sv_eq_cstr(&g_dsh_typ, "tool/result") {
+                    var cid: Buf = buf_buf_new(160);
+                    var txt3: Buf = buf_buf_new(65536);
+                    if dshs_tool_result(line, &cid, &txt3) && txt3.len > 0 {
+                        if hist_push_msg(h, ROLE_TOOL, txt3.ptr as &const byte, txt3.len, cid.ptr as &const byte, cid.len) {
+                            added = added + 1;
+                        }
+                    }
+                    buf_free(&cid);
+                    buf_free(&txt3);
+                }
+            }
+        }
+        pos = le + 1;
+    }
+    _ = cfg;
+    return added;
+}
+
+var g_dsh_typ: Buf = Buf{ ptr: null, len: 0, cap: 0 };
+
+fn buf_buf_new(n: usize) Buf {
+    return buf_new(n);
+}
+
+// user/message：data.content[] 里拼 text 片段
+fn dshs_user_text(line: &[byte], out: &Buf) bool {
+    const at: isize = find_sub(line, &"\"text\":\""[0: 8], 0);
+    if at < 0 {
+        return false;
+    }
+    buf_reset(out);
+    // 简易：把所有 "text":"…" 片段按出现顺序拼接（转义还原交给 sv_unescape）
+    var from: usize = 0;
+    var first: bool = true;
+    while true {
+        const a: isize = find_sub(line, &"\"text\":\""[0: 8], from);
+        if a < 0 {
+            break;
+        }
+        var i: usize = (a as usize) + 8;
+        var acc: Buf = buf_new(4096);
+        _ = buf_append_byte(&acc, 34);
+        while i < line.len {
+            const c: byte = line.ptr[i];
+            if c == 92 as byte && i + 1 < line.len {
+                _ = buf_append_byte(&acc, c);
+                _ = buf_append_byte(&acc, line.ptr[i + 1]);
+                i = i + 2;
+                continue;
+            }
+            if c == 34 as byte {
+                break;
+            }
+            _ = buf_append_byte(&acc, c);
+            i = i + 1;
+        }
+        _ = buf_append_byte(&acc, 34);
+        var dec: Buf = buf_new(4096);
+        const rawv: JsonStrView = JsonStrView{ ptr: acc.ptr as &byte, len: acc.len };
+        const inner: JsonStrView = JsonStrView{ ptr: @ptr_from_usize(@usize_from_ptr(acc.ptr as &void) + 1) as &byte, len: acc.len - 2 };
+        _ = rawv;
+        _ = sv_unescape(&inner, &dec);
+        if !first {
+            _ = buf_append_byte(out, 10);
+        }
+        _ = buf_append(out, dec.ptr, dec.len);
+        first = false;
+        buf_free(&acc);
+        buf_free(&dec);
+        from = (a as usize) + 8;
+    }
+    return out.len > 0;
+}
+
+// assistant/message：data.message.content[] 的 text 片段 + tool_calls 原样
+fn dshs_assistant_text(line: &[byte], out_text: &Buf, calls: &Buf) bool {
+    _ = dshs_user_text(line, out_text);
+    return sess_extract_array(line, "tool_calls", calls);
+}
+
+// tool/result：content 与 callId
+fn dshs_tool_result(line: &[byte], cid: &Buf, out: &Buf) bool {
+    if !sess_json_str(line, "callId", cid) {
+        return false;
+    }
+    // content 可能是一段文本，也可能是内容块数组
+    var txt: Buf = buf_new(65536);
+    defer { buf_free(&txt); }
+    if sess_json_str(line, "content", &txt) && txt.len > 0 {
+        buf_reset(out);
+        _ = buf_append(out, txt.ptr, txt.len);
+        return true;
+    }
+    return dshs_user_text(line, out);
+}
+
+// 列表渲染
+export fn dshs_render_list(s: &const DshSessions, out: &Buf, dsh_home: &[byte]) void {
+    buf_reset(out);
+    out_err_bytes(dsh_home.ptr, dsh_home.len);
+    out_err("/sessions：");
+    out_err_dec(s.n);
+    out_err(" 个会话\n");
+    if s.n == 0 {
+        out_err("(没有 DSH 会话)\n");
+        return;
+    }
+    var i: usize = 0;
+    while i < s.n && i < DSHS_MAX {
+        const it: &const DshSessionInfo = &s.items[i];
+        out_err_bytes(it.id.ptr, it.id.len);
+        out_err("  depth=");
+        out_err_dec(it.depth as usize);
+        out_err("  msgs≈");
+        out_err_dec(it.msgs);
+        out_err("  user≈");
+        out_err_dec(it.turns);
+        out_err("  preset=");
+        out_err_bytes(it.preset.ptr, it.preset.len);
+        out_err("  ");
+        if it.zstd {
+            out_err("zstd");
+        } else {
+            out_err("plain");
+        }
+        out_err("  cwd=");
+        out_err_bytes(it.cwd.ptr, it.cwd.len);
+        out_err("\n");
+        i = i + 1;
+    }
+}

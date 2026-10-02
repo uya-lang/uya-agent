@@ -4,7 +4,7 @@
 多轮 loop 直到给出结论。全部代码 9 个 `.uya` 文件，**不引入任何 C 代码、`@c_import` 或其它语言**，
 只依赖 Uya 语言与随编译器分发的标准库。
 
-**P1–P12 已完成**：LLM 交互是**流式 SSE**（`stream:true` + `stream_options.include_usage`），
+**P0–P13 全部完成**：LLM 交互是**流式 SSE**（`stream:true` + `stream_options.include_usage`），
 增量 chunked 解码 + SSE 分帧 + `tool_calls` 按 `index` 分片累积；消息协议是**严格工具协议**
 （`assistant.tool_calls` 原样回灌 + 每条结果一条 `role:"tool"` + `tool_call_id`）；
 交互界面是**真 TTY**（termios raw + 行编辑器），流式期间可打断、可继续输入、可续跑；
@@ -23,6 +23,9 @@ tool 结果超 8192 码点自动剪枝，压力超过窗口 80% 时自动压缩�
 `send_message` / `interrupt_agent` / `ralph`）与**会话级目标**（`create_goal` / `get_goal` / `update_goal`）
 也完成，真机上派生子代理并把结果收回父进程验证过；**workflow** 按既定方案用 **Uya 的 `.ush` 脚本**
 （`uya run` 执行）编排子代理，脚本里的钩子**代理回父进程**执行。
+最后是收尾：**工具/上下文旋钮由 DSH preset 驱动**（`--print-config` 显示来源与取值）、
+**能直接读 DSH 自己的会话**（`--list-dsh-sessions` / `--resume-dsh`，含 zstd 压缩）、
+`make e2e` 一条命令跑真实网关。
 `--no-stream` / `--compat-fold` 保留两条回退路径。
 
 ```
@@ -84,7 +87,9 @@ export UYA_SPLIT_C_DIR=$PWD/build/uyacache      # 多文件 C 缓存别丢在仓
 | `--dsh-home DIR` | DSH 用户目录（默认 `$DSH_HOME` 或 `~/.dsh`） |
 | `--no-dsh-config` | 完全不读 DSH 设置 |
 | `--strict-dsh-config` | 读不到 DSH 设置就报错退出 |
-| `--print-config` | 打印生效配置与来源后退出 |
+| `--print-config` | 打印生效配置、preset 旋钮与来源后退出 |
+| `--list-dsh-sessions` | 列出 DSH 自己的会话（`<DSH_HOME>/sessions`，含 zstd） |
+| `--resume-dsh ID` | 导入 DSH 会话并继续（id 前缀 ≥8 字符即可） |
 | `--yaml-dump FILE` | 打印该 YAML 的解析结果（诊断） |
 | `--plan` | 以 plan 模式启动（先出计划、批准后再执行） |
 | `--skill-dir DIR` | 额外的技能根（冒号分隔，可多次） |
@@ -136,6 +141,8 @@ src/shellx.uya    bash 工具：bash -c、workdir、timeoutMs、run_in_backgroun
 src/jobs.uya      后台任务表：注册/增量输出（保留内存尾部 1 MiB）/状态机（running/completed/killed）、
                   job_list / job_output（wait + timeout_ms）/ job_kill
 src/search.uya    glob / grep：rg 子进程（--files / --json）、VCS 目录排除、条数与行长上限
+src/dshsess.uya   读 DSH 自己的会话：扫 <DSH_HOME>/sessions、解析 header、zstd 用 /usr/bin/unzstd
+                  解压、把 user/message + assistant/message + tool/result 转成我们的历史
 src/dshcfg.uya    读 DSH 设置：$DSH_HOME 解析、settings.yaml 模型路线（agent-default-model →
                   provider 的 baseURL/apiKeyEnv/models[]）、.credentials.yaml、.env 兜底、
                   permission→confine、uya-agent.tls 命名空间
@@ -164,6 +171,22 @@ src/agent.uya     CLI、环境变量、消息历史、请求组装、主循环�
                   交互式 REPL（中断/steer//continue/会话命令）、会话事件记录与恢复
 src/selftest.uya  --selftest 的 mock LLM（含 SSE 受控切分）+ 15 轮断言 + --probe
 ```
+
+### preset 旋钮、DSH 会话与 make 目标（P13）
+
+* **旋钮由 preset 驱动**：`<DSH_ROOT>/config/agent-presets/standard/agent.cordis.yml` 里的
+  `agent-instructions.maxBytes`、`tool-result-pruner.{thresholdChars,headChars,tailChars}`、
+  `tool-fs.{readLimit,readMaxBytes,readMaxLineLength}`、`tool-fs-search.{globMaxResults,grepMaxMatches,…}`、
+  `tool-bash.timeoutMs`、`compaction-basic.{thresholdRatioPermille,retainRatioPermille}` 会被读出来
+  落成运行时全局（读不到就用 DSH 标准 preset 的默认值）。**group 的 `config` 列表会递归进去**
+  （剪枝旋钮就在里面）。`--print-config` 打印每一项与来源（`preset` / `defaults`）。
+* **读 DSH 自己的会话**：`--list-dsh-sessions` 列出 `<DSH_HOME>/sessions/**`（id、深度、
+  消息数、preset、压缩方式、cwd）；`--resume-dsh <id 前缀>` 把该会话的
+  `user/message` + `assistant/message` + `tool/result` 转成我们的历史并**开自己的会话**继续
+  （不写 DSH 的日志）。压缩的 `.jsonl.zstd` 走 `/usr/bin/unzstd` 解压。
+  消息数只统计已读入的部分（zstd 前缀），所以列表里写作 `msgs≈`。
+* `make` 目标：`check` / `build` / `selftest`（离线 24 轮）/ `probe` / `e2e TASK=… [PIN=…]`（真实网关）/
+  `e2e-config`（零参数打印生效配置）/ `e2e-dsh`（列 DSH 会话）。
 
 ### workflow：Uya 脚本 + 钩子代理（P12）
 
@@ -548,6 +571,9 @@ agent 循环并逐项断言：
 | `interrupt` | 预置 Ctrl-C：回合以 `AGENT_INTERRUPTED` 结束、工具**未派发**、只发生一次请求 |
 | `tty-editor` | termios 布局(60B)/raw 位运算；行编辑（插入/退格/左右/Delete/Home/End/词删除）、
 一次喂入多行拆成多个提交、分片转义序列、裸 ESC 判定、历史上下翻、中断前缀裁剪 |
+| `preset-knobs-dshsess` | 假 preset（值故意与默认不同：readLimit 7、prune 111/22/33，
+且剪枝旋钮放在 group 的 `config` 列表里验证递归）断言旋钮与 persona 折叠标量；
+再造一个假 DSH 会话（裸 jsonl）断言扫描、header 解析、前缀查找、导入后的角色序列与 tool_call_id |
 | `workflow` | 两个变体：① 假 runner（`--uya-bin /bin/bash` + 一个说同样协议的 shell 脚本）验证钩子协议本身
 （阶段/日志/`agent_start`/`agent_wait`/`done` 五个钩子 + 子代理结果回流）；② 真 `uya run` 跑一个 Uya 的
 `.ush` 脚本（生成的自包含 hooks.uya 必须真的编译通过）。 |
