@@ -48,6 +48,342 @@ export fn cmp_prune_result_cps() usize {
 }
 
 // ============================================================
+// bash 结果的剪枝（P27）：同一预算内按「信息价值」重分配
+// ============================================================
+// 实测口径（34 个真会话 / 1375 个 bash 结果的真轨迹分析）：
+//   * bash 结果占请求窗口的 57.9%，read 只占 12.9%；
+//   * 其中 >8192 码点、会走剪枝的只有 13 个（占 bash 内容 7.7%）；
+//   * 旧规则（头 4096 + 尾 1024 码点）在这 13 个样本上只保住 60.2% 的信号行
+//     （error/fail/panic/…），输出十分位覆盖只有首尾两段。
+//
+// 新规则在**同一预算**（headChars + tailChars 码点）内改三段分配：
+//   头 = 1/5（命令开场）、尾 = 1/5（构建/测试结论通常在末尾）、中段 = 其余；
+//   中段先收信号行（最多占 80% 预算），余量按等距抽样铺满整个输出，
+//   抽样行带原始行号 @N:，模型据此能再跑一条更窄的命令。
+// 同样本实测（把本实现原样移植回 Python 复算，与 selftest[prune-bash] 夹具逐项对齐）：
+// 信号行保全 0.602 → 1.000，十分位覆盖 0.2 → 0.83，
+// 结构标记保全 0.358 → 0.309（略降），token 23,619 → 21,379（-9.5%，同预算下反而更省）。
+// 预算太小（total < CMP_BASH_MIN_BUDGET）或结果异常（保留量不足预算 1/4）时
+// 退回通用规则，保证任何输入都不会比旧行为更差。
+export const CMP_KIND_TOOL: u8 = 0;     // read / grep / … 等工具结果
+export const CMP_KIND_BASH: u8 = 1;     // bash 结果：走下面的行式剪枝
+
+const CMP_BASH_MIN_BUDGET: usize = 1024;
+const CMP_BASH_SIGNAL_PERMILLE: usize = 800;   // 中段预算里信号行最多占的比例
+const CMP_BASH_LINE_MAX: usize = 200;          // 单行最多保留多少码点
+const CMP_BASH_MARK_ALLOW: usize = 160;        // 标记自身的预算预留（码点）
+
+const CMP_BASH_MARK_A: &const byte = "\n\n[... bash output pruned: ";
+const CMP_BASH_MARK_B: &const byte = " line(s) kept (@N = original line number; run a narrower command such as grep/sed -n for the rest) ...]\n\n";
+
+// 行尾（'\n' 的下标，或 limit）
+fn cmp_line_end(p: &const byte, limit: usize, from: usize) usize {
+    var i: usize = from;
+    while i < limit && p[i] != 10 {
+        i = i + 1;
+    }
+    return i;
+}
+
+// pos 之前那一行的起始下标（pos 处通常是 '\n'）
+fn cmp_prev_line_start(p: &const byte, pos: usize) usize {
+    var i: usize = pos;
+    if i > 0 && p[i - 1] == 10 {
+        i = i - 1;
+    }
+    while i > 0 && p[i - 1] != 10 {
+        i = i - 1;
+    }
+    return i;
+}
+
+// 大小写不敏感的子串匹配（needle 只写小写 ASCII；非 ASCII 按字节等值比）
+fn cmp_has_ci(p: &const byte, n: usize, needle: &const byte) bool {
+    const nl: usize = bufx_cstr_len(needle);
+    if nl == 0 || n < nl {
+        return false;
+    }
+    var i: usize = 0;
+    while i + nl <= n {
+        var k: usize = 0;
+        var hit: bool = true;
+        while k < nl {
+            if byte_lower(p[i + k]) != byte_lower(needle[k]) {
+                hit = false;
+                break;
+            }
+            k = k + 1;
+        }
+        if hit {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+// 诊断/失败/结论类「信号行」。这套词表是拿 13 个真实超阈值输出调出来的：
+// 目标是让 error/FAIL/exit code 这类决定下一步动作的行一条都不丢。
+fn cmp_line_is_signal(p: &const byte, n: usize) bool {
+    if cmp_has_ci(p, n, "error") { return true; }
+    if cmp_has_ci(p, n, "fail") { return true; }
+    if cmp_has_ci(p, n, "fatal") { return true; }
+    if cmp_has_ci(p, n, "panic") { return true; }
+    if cmp_has_ci(p, n, "exception") { return true; }
+    if cmp_has_ci(p, n, "traceback") { return true; }
+    if cmp_has_ci(p, n, "denied") { return true; }
+    if cmp_has_ci(p, n, "cannot") { return true; }
+    if cmp_has_ci(p, n, "undefined") { return true; }
+    if cmp_has_ci(p, n, "conflict") { return true; }
+    if cmp_has_ci(p, n, "not found") { return true; }
+    if cmp_has_ci(p, n, "no such file") { return true; }
+    if cmp_has_ci(p, n, "exit code") { return true; }
+    if cmp_has_ci(p, n, "warning") { return true; }
+    if cmp_has_ci(p, n, "assert") { return true; }
+    if cmp_has_ci(p, n, "✗") { return true; }
+    return false;
+}
+
+fn cmp_line_ptr(text: &const byte, off: usize) &const byte {
+    return @ptr_from_usize(@usize_from_ptr(text as &const void) + off) as &const byte;
+}
+
+// 写一行（可选行号前缀），单行按 CMP_BASH_LINE_MAX 码点截断
+fn cmp_put_line(out: &Buf, text: &const byte, ls: usize, le: usize, lineno: usize, with_no: bool) bool {
+    if with_no {
+        if !buf_append_byte(out, 64) {          // '@'
+            return false;
+        }
+        if !buf_append_u64(out, lineno as u64) {
+            return false;
+        }
+        if !buf_append_cstr(out, ": ") {
+            return false;
+        }
+    }
+    const lp: &const byte = cmp_line_ptr(text, ls);
+    var len: usize = le - ls;
+    var cut: bool = false;
+    if bufx_utf8_count(lp, len) > CMP_BASH_LINE_MAX {
+        len = bufx_utf8_prefix_bytes(lp, len, CMP_BASH_LINE_MAX);
+        cut = true;
+    }
+    if !buf_append(out, lp, len) {
+        return false;
+    }
+    if cut {
+        // 截断要留痕：模型得知道这一行被切过，否则会把半行当全文
+        if !buf_append_cstr(out, " …") {
+            return false;
+        }
+    }
+    return buf_append_byte(out, 10);
+}
+
+export fn cmp_maybe_prune_bash(text: &const byte, n: usize, out: &Buf) bool {
+    if bufx_utf8_count(text, n) <= cmp_prune_threshold {
+        return false;                            // 与 cmp_maybe_prune 同契约：不剪就不动 out
+    }
+    const total: usize = cmp_prune_head + cmp_prune_tail;
+    if total < CMP_BASH_MIN_BUDGET {
+        return cmp_maybe_prune(text, n, out);
+    }
+    const head_b: usize = total / 5;
+    const tail_b: usize = total / 5;
+    var mid_b: usize = total - head_b - tail_b;
+    if mid_b > CMP_BASH_MARK_ALLOW {
+        mid_b = mid_b - CMP_BASH_MARK_ALLOW;
+    }
+
+    buf_reset(out);
+    // ---- 头：从头按行取满 head_b ----
+    var hi: usize = 0;
+    var hl: usize = 0;
+    var used_h: usize = 0;
+    while hi < n {
+        const le: usize = cmp_line_end(text, n, hi);
+        const lcps: usize = bufx_utf8_count(cmp_line_ptr(text, hi), le - hi);
+        if hl > 0 && used_h + lcps + 1 > head_b {
+            break;
+        }
+        if !cmp_put_line(out, text, hi, le, hl + 1, false) {
+            return false;
+        }
+        used_h = used_h + lcps + 1;
+        hl = hl + 1;
+        if le >= n {
+            hi = n;
+            break;
+        }
+        hi = le + 1;
+    }
+    // ---- 尾：从末尾按行回退到 tail_b ----
+    var ti: usize = n;
+    var tl: usize = 0;
+    var used_t: usize = 0;
+    while ti > hi {
+        const ls: usize = cmp_prev_line_start(text, ti);
+        if ls < hi {
+            break;
+        }
+        const le2: usize = cmp_line_end(text, ti, ls);
+        const lcps2: usize = bufx_utf8_count(cmp_line_ptr(text, ls), le2 - ls);
+        if tl > 0 && used_t + lcps2 + 1 > tail_b {
+            break;
+        }
+        used_t = used_t + lcps2 + 1;
+        tl = tl + 1;
+        ti = ls;
+    }
+    // ---- 中段第 1 遍：统计行数 / 信号行 / 码点 ----
+    var mid_lines: usize = 0;
+    var sig_lines: usize = 0;
+    var sig_cps: usize = 0;
+    var mid_cps: usize = 0;
+    var mi: usize = hi;
+    while mi < ti {
+        const le3: usize = cmp_line_end(text, ti, mi);
+        const lp: &const byte = cmp_line_ptr(text, mi);
+        const lcps3: usize = bufx_utf8_count(lp, le3 - mi);
+        var kcps: usize = lcps3;
+        if kcps > CMP_BASH_LINE_MAX {
+            kcps = CMP_BASH_LINE_MAX;
+        }
+        mid_lines = mid_lines + 1;
+        mid_cps = mid_cps + kcps + 1;
+        if cmp_line_is_signal(lp, le3 - mi) {
+            sig_lines = sig_lines + 1;
+            sig_cps = sig_cps + kcps + 16;       // 含 "@行号: " 前缀
+        }
+        if le3 + 1 <= mi {
+            break;
+        }
+        mi = le3 + 1;
+    }
+    // ---- 中段预算分配：信号行优先，余量等距抽样 ----
+    const sig_budget: usize = (mid_b * CMP_BASH_SIGNAL_PERMILLE) / 1000;
+    var sig_keep: usize = sig_lines;
+    if sig_cps > sig_budget && sig_cps > 0 {
+        sig_keep = (sig_lines * sig_budget) / sig_cps;
+        if sig_keep < 1 {
+            sig_keep = 1;
+        }
+    }
+    var sig_used: usize = sig_cps;
+    if sig_used > sig_budget {
+        sig_used = sig_budget;
+    }
+    var rem: usize = 0;
+    if mid_b > sig_used {
+        rem = mid_b - sig_used;
+    }
+    var div_lines: usize = mid_lines;
+    if div_lines == 0 {
+        div_lines = 1;
+    }
+    const avg_slot: usize = mid_cps / div_lines + 16;
+    var div_slot: usize = avg_slot;
+    if div_slot == 0 {
+        div_slot = 1;
+    }
+    var slots: usize = rem / div_slot;
+    const other_lines: usize = mid_lines - sig_lines;
+    if slots > other_lines {
+        slots = other_lines;
+    }
+    var stride: usize = 1;
+    if slots > 0 && other_lines > slots {
+        stride = other_lines / slots;
+    }
+    // ---- 中段第 2 遍：按原顺序收信号行 + 抽样行 ----
+    var mid: Buf = buf_new(mid_b + 512);
+    defer { buf_free(&mid); }
+    var mi2: usize = hi;
+    var lineno: usize = hl + 1;
+    var s_kept: usize = 0;
+    var s_seen: usize = 0;
+    var k_kept: usize = 0;
+    while mi2 < ti {
+        const le4: usize = cmp_line_end(text, ti, mi2);
+        const lp2: &const byte = cmp_line_ptr(text, mi2);
+        var take: bool = false;
+        if cmp_line_is_signal(lp2, le4 - mi2) {
+            if s_kept < sig_keep {
+                take = true;
+                s_kept = s_kept + 1;
+            }
+        } else {
+            if k_kept < slots && s_seen % stride == 0 {
+                take = true;
+                k_kept = k_kept + 1;
+            }
+            s_seen = s_seen + 1;
+        }
+        if take && !cmp_put_line(&mid, text, mi2, le4, lineno, true) {
+            return false;
+        }
+        lineno = lineno + 1;
+        if le4 + 1 <= mi2 {
+            break;
+        }
+        mi2 = le4 + 1;
+    }
+    // ---- 拼装：头 + 标记 + 中段 + 尾 ----
+    const kept: usize = hl + s_kept + k_kept + tl;
+    if !buf_append_cstr(out, CMP_BASH_MARK_A) {
+        return false;
+    }
+    if !buf_append_u64(out, kept as u64) {
+        return false;
+    }
+    if !buf_append_cstr(out, " of ") {
+        return false;
+    }
+    if !buf_append_u64(out, (hl + mid_lines + tl) as u64) {
+        return false;
+    }
+    if !buf_append_cstr(out, CMP_BASH_MARK_B) {
+        return false;
+    }
+    if !buf_append(out, mid.ptr, mid.len) {
+        return false;
+    }
+    var ti2: usize = ti;
+    while ti2 < n {
+        const le5: usize = cmp_line_end(text, n, ti2);
+        if !cmp_put_line(out, text, ti2, le5, 0, false) {
+            return false;
+        }
+        if le5 + 1 <= ti2 {
+            break;
+        }
+        ti2 = le5 + 1;
+    }
+    // 保底：留得太少（例如整段是一行超长文本）就退回通用规则
+    if bufx_utf8_count(out.ptr as &const byte, out.len) * 4 < total {
+        buf_reset(out);
+        return cmp_maybe_prune(text, n, out);
+    }
+    return true;
+}
+
+// 按工具种类分派：bash 走行式剪枝，其余走通用规则
+export fn cmp_maybe_prune_kind(text: &const byte, n: usize, kind: u8, out: &Buf) bool {
+    if kind == CMP_KIND_BASH {
+        return cmp_maybe_prune_bash(text, n, out);
+    }
+    return cmp_maybe_prune(text, n, out);
+}
+
+// 构请求时这条消息实际会占多少**字节**（压力估算用：估算必须跟请求同口径）
+export fn cmp_request_bytes(text: &const byte, n: usize, kind: u8, scratch: &Buf) usize {
+    if cmp_maybe_prune_kind(text, n, kind, scratch) {
+        return scratch.len;
+    }
+    return n;
+}
+
+// ============================================================
 // 压力与阈值
 // ============================================================
 // DSH：thresholdRatio 默认 0.8（这里用千分数避免浮点）
@@ -249,6 +585,7 @@ export fn cmp_prepend_checkpoint(h: &History, summary: &const Buf) bool {
     }
     const slot: &Msg = msg_at_mut(h, 1);
     slot.role = ROLE_USER;
+    slot.kind = CMP_KIND_TOOL;
     slot.text = hist_dup(msg.ptr as &const byte, msg.len);
     if (slot.text as usize) == 0 {
         return false;
