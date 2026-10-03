@@ -254,7 +254,9 @@ src/sigselftest.uya 信号层的自测轮次（sig-abi / sig-basic / sig-term-re
 src/tuiselftest.uya TUI 的自测轮次（tui-frame / tui-keys / tui-sink / tui-turn / tui-status / tui-pty /
                   tty-title-pty；P20/P24 起 tui-frame 还断言脚注统计行的逐级退化、右对齐
                   （末尾 3 列空白）与 `ctx` / `cpu` / `内存` 三档让位顺序，
-                  P22 起 tui-pty 与 tty-title-pty 还逐字节断言终端标题）
+                  P22 起 tui-pty 与 tty-title-pty 还逐字节断言终端标题；
+                  tui-frame 现在还逐行量**浮层方框**的左右边界列——长行把右边框顶出去那类
+                  缺陷（踩坑 42）只有它会红）
 src/inbox.uya     输入收件箱：steer（运行中输入的文本，step 边界领取）+ keepInbox 语义
 src/yamlcfg.uya   自带 YAML 子集解析器：去注释（块标量/引号感知）、中和 `!!tag`、
                   block/flow 映射与序列、`|`/`>` 块标量、跨行 flow 集合、节点池树 + 导航
@@ -1667,7 +1669,19 @@ vLLM 等 OpenAI 兼容端点都一样稳。想升级成严格 `tool` 角色消�
     非流式与终局回填依旧不打点。窗口与 token 从此覆盖同一段生成过程，`首 token 平均`
     也回到真实的 prefill 量级（~1s 而不是十几秒）。回归轮：`stream-firsttok-reasoning` /
     `stream-firsttok-call` / `stream-firsttok-none` 与 responses 侧的两个同名轮。
-42. **uya 0.10 的四个「写下去才发现」的坑（P25 一次性全撞上，都是编译期/运行期各报一次就记住的事）**：
+42. **「被裁时要多补一个 `…`」的裁剪函数，预算里必须先把那一列扣掉 —— 否则方框右边会参差。**
+    `tui_put_clipped(p, n, max_cols, style)` 的语义是「正文最多 `max_cols` 列，**超了再补一个
+    `…`**」，而那个 `…` 不在预算里。浮层正文直接用它，后果是**只有长到需要截断的那一行**
+    比方框宽 1 列：它的右边框 `│` 落在其它行右边一列上 —— 真机截图里就是命令面板的
+    `/permission 切换访问模式（read-only / workspace-write / d…│` 把右边框顶了出去
+    （顶边 / 底边 / 其余九行都在第 80 列，只有它一个在第 81 列），用户看到的就是
+    「弹窗右边没有对齐」。修法是最小改动：新增 `tui_ov_put_clipped()`，先用
+    `tty_clip_bytes` 量一次，确定「这一行会被裁」就把预算减一，保证「正文 + `…`」仍然
+    ≤ 方框内宽。页脚那处早就是这么做的（`show_cwd = cwd_budget - 1`），这一条只是把
+    同一个规矩补齐到浮层。教训：**凡是「超出就补个尾巴」的排版函数，调用点的预算都该按
+    「含尾巴」算**；只测短行（从不触发截断）的用例看不见这类缺陷 ——
+    回归必须拿**真会撑满的那一行**（`/permission`）在多种宽度下逐行量方框的左右边界。
+43. **uya 0.10 的四个「写下去才发现」的坑（P25 一次性全撞上，都是编译期/运行期各报一次就记住的事）**：
     * **全局变量的初始化式必须是常量**：`var g: Goal = Goal{ phase: buf_empty(), … }` 编不过 ——
       `buf_empty()` 是函数调用，生成的 C 是 `{.phase = bufx_buf_empty(), …}`，
       gcc 直接 `error: initializer element is not constant`。全局只能写字面量
@@ -1761,7 +1775,7 @@ agent 循环并逐项断言：
 | `resp-firsttok-reasoning` / `-call` | responses 路径的同口径两条（`response.reasoning_summary_text.delta` / `response.function_call_arguments.delta` 独有） |
 | `steer` | 回合运行中输入的文本，必须在**下一个 step 的请求**里出现（mock 断言 `STEER-MARKER`） |
 | `interrupt` | 预置 Ctrl-C：回合以 `AGENT_INTERRUPTED` 结束、工具**未派发**、只发生一次请求 |
-| `tui-frame` | 八种尺寸（32×8 / 40×12 / 60×20 / 80×24 / 100×28 / 120×40 / 160×30 / 200×30）下「每行显示列 ≤ cols」「正文层里没有 ESC」；空态整体居中（首行留白 + 块字 logo + 面板 + 脚注 `~/cwd:branch`）、窄终端 logo 退化成单行标题；对话态底对齐 + 面板贴底；工具块/diff/思考/诊断/用户条目都在；跑满一屏后跟随尾部、PgUp/PgDn 夹取、回尾清零；**P20/P24 脚注**：200 列放下整条统计行、160 列按组丢尾部并补 `…`、120/100/80 列逐级退化、60 列退回版本号、40 列 cwd 让位（且行首不留孤立的 ` · `）、32 列连 `内存` 也让位；统计行右边缘在 200/160/60 列下必须落在 `cols − 3`（右对齐没被改掉），`ctx` / `cpu` 一直不丢 |
+| `tui-frame` | 八种尺寸（32×8 / 40×12 / 60×20 / 80×24 / 100×28 / 120×40 / 160×30 / 200×30）下「每行显示列 ≤ cols」「正文层里没有 ESC」；空态整体居中（首行留白 + 块字 logo + 面板 + 脚注 `~/cwd:branch`）、窄终端 logo 退化成单行标题；对话态底对齐 + 面板贴底；工具块/diff/思考/诊断/用户条目都在；跑满一屏后跟随尾部、PgUp/PgDn 夹取、回尾清零；**P20/P24 脚注**：200 列放下整条统计行、160 列按组丢尾部并补 `…`、120/100/80 列逐级退化、60 列退回版本号、40 列 cwd 让位（且行首不留孤立的 ` · `）、32 列连 `内存` 也让位；统计行右边缘在 200/160/60 列下必须落在 `cols − 3`（右对齐没被改掉），`ctx` / `cpu` 一直不丢；**浮层方框**（踩坑 42）：5 种宽度 × 3 类浮层（真实命令表 / 帮助 / 确认层）逐行量方框的**左右边界列**必须完全相同、首尾字符必须是边框字形 —— 长到需要截断的那一行（`/permission`）不能再把右边框顶出去 |
 | `tui-keys` | UTF-8 逐字符编辑（退格不砍半个汉字、←/→ 停在字符边界）、**被切开的 `ESC [ D`** 正确组装、Ctrl-J 换行与多行光标移动、回车提交（内容 + 清空 + 进历史）、↑ 取历史、运行中 esc = 中断 / 空闲 esc = 清行、tab 切计划模式（面板显示 Plan）、`/` 自动开命令面板并选中第二项、Ctrl-D 空行退出 |
 | `tui-sink` | TUI 激活后 `tty_write(1/2)` 与 `tty_reason_write` 的字节分别落到 助手/工具/思考 条目；NUL/`ESC[2J`/TAB 被清洗且正文层无 ESC；关掉 sink 后写入回到真实 fd |
 | `tui-turn` | headless 端到端（mock LLM，复用手打路径注入「任务+回车」）：屏幕里出现用户条目、`✓ Write(note.txt)`、`✓ Bash(`、最终答案；回合结束状态回 idle、**状态区整块收掉且思考实时行不留残影**；**P20：脚注里必须出现 `1 轮 · ` 与 `工具调用 `**（真实测量的 llm/工具耗时进了界面）；fd 1 无输出 |
@@ -2069,6 +2083,26 @@ responses 看 `call_id`）；**chat 与 responses 各一轮**，且顺便断言�
      responses 两条）、1 轮内存解析与显示（`procx-mem`）、`cpu-live` 加内存断言、
      `tui-frame` 改成八种宽度（含右对齐「末尾恰好 3 列空白」与 32 列 `内存` 让位）；
      `make check / build / codegen-audit / selftest` 全绿（selftest 退出 0）。
+* **浮层方框右边框（踩坑 42）的验收（2026-10-03）**：用户截图的口径是「命令面板弹窗右边
+  没对齐」。先按**用户那一眼的条件**离线复现：headless 把**真实命令表**（`agent_tui_commands`，
+  9 条命令，`/permission` 那行 69 列）灌进命令面板，在 100 列画布上逐行量「最后一个非空白
+  字符的右边界列」—— 顶边 / 底边 / 其余九行都是第 **80** 列，只有 `/permission` 那行在第
+  **81** 列（`│ /permission 切换访问模式（read-only / workspace-write / d…│`，与截图逐字对上）。
+  然后在**真 PTY 里跑真二进制**同一场景（`openpty` + `TIOCSWINSZ` + 往主设备打 `/`，
+  把读回的字节喂给一个小终端解释器重建屏幕，再按显示列量每行的左右边界）：
+
+  | 画布 | 修前（右边界列集合） | 修后 |
+  |---|---|---|
+  | 70 列 | `{65, 66}` → 右边参差 | `{65}` → 对齐 |
+  | 80 列 | `{70, 71}` → 右边参差 | `{70}` → 对齐 |
+  | 100 列 | `{80, 81}` → 右边参差 | `{80}` → 对齐 |
+  | 120 列 | `{90, 91}` → 右边参差 | `{90}` → 对齐 |
+
+  每次都是**同一行**（`/permission`）差 1 列、其余行与顶边/底边一致 —— 与「只有被截断的那一行
+  多占一列」的根因吻合。回归落在既有轮次 `tui-frame` 里（5 种宽度 × 命令面板 / 帮助 / 确认层
+  三类浮层，每行都要左右边界列相同且首尾是边框字形）；把 `src/tui.uya` 的改动临时还原，
+  该轮立刻在 5 种宽度全部报红并打出修前那屏，`make build / codegen-audit / selftest` 与
+  `UYA_SELFTEST_TUI_ONLY` 全部 PASS。
 * 技能与联网搜索都在真机上验证过：让模型「说出本次会话可用的技能名」→ 正确回答
   `agently-mail、h2s-long-context`（来自真实 `~/.dsh/skills`）；让它「用 web_search 搜 uya 语言」→
   `web_search` 工具真的调通了 DeepSeek 的搜索服务并给出总结。
@@ -2157,7 +2191,7 @@ responses 看 `call_id`）；**chat 与 responses 各一轮**，且顺便断言�
   ⑤ 本轮顺带修掉两个**既有**小问题：`/sessions` 与 `/status` 两处 `tui_overlay_list` 的标题长度
   写死了 44/46（真实字面量是 38/22 字节，多读的那截越界）→ 改成 `bufx_cstr_len`；
   `view_agents_sync` 的快照/推送逻辑抽成 `view_panel_push`（任务块与 agents 面板共用一个写者）。
-  ⑥ 开发过程踩到的 uya 0.10 语言坑记在 §3 第 36 条（全局初始化式不能调函数、循环里的
+  ⑥ 开发过程踩到的 uya 0.10 语言坑记在 §3 第 43 条（全局初始化式不能调函数、循环里的
   `const = if …`、`match` 是保留字、`tui_puts` 按 cstr 量长度）。
 | `http401` | mock 回 401 + 错误体：agent 必须打印状态与错误体并退出 3 |
 | `max-steps` | **显式**给 `max_steps=3`：mock 每轮都给 tool_calls，agent 必须在 3 步后熔断退出 3 |
