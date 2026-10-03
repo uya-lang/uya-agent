@@ -1,22 +1,53 @@
-// src/plan.uya — plan 模式（P8，对齐 DSH plan-mode）
+// src/plan.uya — plan 模式（P8 状态机 + P22 写闸门与审阅浮窗，对齐 DSH plan-mode）
 //
 // 状态：{active, pending}。pending 表示「下一步生效」的切换意图（DSH 的 set() 语义：
 // 运行中挂起、空闲时立即生效；这里简化为立即改 active，因为我们只在 step 边界检查）。
 // exit_plan_mode：两种模式都注册（保持工具目录稳定），非 plan 模式调用报错。
+//
+// P22 两件事：
+//   1) **写闸门**：plan 模式下 write/edit 硬拒（fsx 查 plan_blocks_write()）。DSH 的
+//      plan mode 是纯引导（「需要强制只读规划的部署必须组合独立的沙箱与审批策略」），
+//      这里把那条策略落在写工具上：不然模型压根不调 exit_plan_mode 就直接开工，
+//      审阅浮窗永远不会出现（现场证据见 README 踩坑 36）。bash 不拦 —— 探索要用它，
+//      它归访问模式（P21）管。
+//   2) **审阅浮窗**：TUI 里弹 reader 浮层（正文可滚动 + 三动作），三个裁决与 DSH 的
+//      plan-review 卡一一对应：继续讨论 = Keep planning、解决 = Chat about it、
+//      确认执行 = Approve。滚动模式仍是 P8 的 y/N 问答。
 
 export struct PlanState {
     active: bool,
     pending: i32,   // 0=无 1=准备进入 2=准备退出
 }
 
+// 进程级镜像（工具层闸门用；与 perm.uya 的 g_perm 同款）。
+// fork 出来的子代理会继承它 —— 与子代理本来就会继承 g_plan.active 的提示词一致。
+var g_on: bool = false;
+
+// 审阅裁决（plan_tool_exit 的四条出口）
+export const PLAN_KEEP: i32 = 0;          // 继续讨论：留在 plan 模式，改一版再弹
+export const PLAN_APPROVE: i32 = 1;       // 确认执行：退出 plan 模式，照计划动手
+export const PLAN_NO_CHANNEL: i32 = 2;    // 没有提问渠道（管道/CI、子代理、浮窗画不出来）
+export const PLAN_DISMISS: i32 = 3;       // 解决：关掉浮窗、留在 plan 模式，等用户自己说
+
+// 浮层标题与三个动作（生成与反解共用一份，别写两遍）
+export const PLAN_TITLE: &const byte = "计划待审" as &const byte;
+export const PLAN_ITEM_KEEP: &const byte = "继续讨论" as &const byte;
+export const PLAN_ITEM_DISMISS: &const byte = "解决" as &const byte;
+export const PLAN_ITEM_APPROVE: &const byte = "确认执行" as &const byte;
+export const PLAN_ITEMS: &const byte = "继续讨论\n解决\n确认执行\n" as &const byte;
+
 export fn plan_init(s: &PlanState) void {
     s.active = false;
     s.pending = 0;
+    g_on = false;
+    tui_set_plan(false);   // 输入面板的 Plan chip：唯一变更点顺手同步
 }
 
 export fn plan_set(s: &PlanState, active: bool) void {
     s.active = active;
     s.pending = 0;
+    g_on = active;
+    tui_set_plan(active);
 }
 
 // 返回 true = 状态发生变化
@@ -29,17 +60,73 @@ export fn plan_toggle(s: &PlanState) bool {
     return true;
 }
 
-// 审批：调用前由调用方渲染；返回 1=同意 0=拒绝 2=无法审批
-fn plan_review(plan_text: &const Buf) i32 {
+// plan 模式是否生效（进程级）
+export fn plan_on() bool {
+    return g_on;
+}
+
+// 写工具闸门：plan 模式下 write/edit 硬拒
+export fn plan_blocks_write() bool {
+    return g_on;
+}
+
+// 把计划正文落进转录（记录用：浮窗是临时的，转录里这份留着回看）。
+// 注意**按长度写**：js_obj_get_str_unescaped 给的 Buf 没有 NUL 结尾，用 ask_write()
+// 那种 C 字符串口径会一路读到未初始化的堆尾巴（README 踩坑 37）。
+fn plan_dump(plan: &const Buf) void {
     _ = ask_write("\n=== 计划 ===\n");
-    _ = ask_write(plan_text.ptr as &const byte);
-    _ = ask_write("\n=== 计划结束 ===\n批准这个计划并退出 plan 模式？[y/N] ");
+    tty_stream_write(2, plan.ptr as &const byte, plan.len);
+    _ = ask_write("\n=== 计划结束 ===\n");
+}
+
+// 浮层选中项原文 → 裁决（认不出的项一律当「继续讨论」：绝不误批准）
+export fn plan_verdict_of(pick: &const Buf) i32 {
+    if bufx_eq_cstr(pick.ptr as &const byte, pick.len, PLAN_ITEM_APPROVE) {
+        return PLAN_APPROVE;
+    }
+    if bufx_eq_cstr(pick.ptr as &const byte, pick.len, PLAN_ITEM_DISMISS) {
+        return PLAN_DISMISS;
+    }
+    return PLAN_KEEP;
+}
+
+// 审阅。返回 PLAN_* 之一。
+//   1) TUI 在跑：浮窗（画不出来就 fail closed，绝不等于批准）
+//   2) 子代理 / 管道：没有提问渠道
+//   3) 滚动模式真 TTY：P8 的 y/N 问答
+fn plan_review(cfg: &const Config, plan: &const Buf) i32 {
+    plan_dump(plan);
+    if tui_active() {
+        if !tui_reader_fits() {
+            return PLAN_NO_CHANNEL;
+        }
+        var pick: Buf = buf_new(64);
+        defer { buf_free(&pick); }
+        const rc: i32 = tui_reader_wait(TUI_OVK_PLAN, PLAN_TITLE, bufx_cstr_len(PLAN_TITLE),
+            plan.ptr as &const byte, plan.len,
+            PLAN_ITEMS, bufx_cstr_len(PLAN_ITEMS), 0, &pick);
+        if rc != 1 {
+            // esc / 中断 / headless 没人回答：留在 plan 模式，模型停下等用户说话
+            return PLAN_DISMISS;
+        }
+        return plan_verdict_of(&pick);
+    }
+    if cfg.is_subagent || !tty_is_interactive() {
+        return PLAN_NO_CHANNEL;
+    }
+    _ = ask_write("批准这个计划并退出 plan 模式？[y/N] ");
     const ans: i32 = ask_read_yes_no();
-    return ans;
+    if ans == 1 {
+        return PLAN_APPROVE;
+    }
+    if ans == 0 {
+        return PLAN_KEEP;
+    }
+    return PLAN_NO_CHANNEL;
 }
 
 // exit_plan_mode 工具
-export fn plan_tool_exit(s: &PlanState, args: &const JsonValue, out: &Buf) void {
+export fn plan_tool_exit(cfg: &const Config, s: &PlanState, args: &const JsonValue, out: &Buf) void {
     var plan: Buf = buf_empty();
     defer { buf_free(&plan); }
     if !js_obj_get_str_unescaped(args, "plan", 4, &plan) || plan.len == 0 {
@@ -54,19 +141,23 @@ export fn plan_tool_exit(s: &PlanState, args: &const JsonValue, out: &Buf) void 
         _ = buf_append_cstr(out, "Error: exit_plan_mode is only available in plan mode");
         return;
     }
-    const verdict: i32 = plan_review(&plan);
-    if verdict == 1 {
+    const verdict: i32 = plan_review(cfg, &plan);
+    if verdict == PLAN_APPROVE {
         plan_set(s, false);
         _ = buf_append_cstr(out, "Plan approved — plan mode exited; carry out the plan starting with your next step.");
         return;
     }
-    if verdict == 0 {
+    if verdict == PLAN_KEEP {
         _ = buf_append_cstr(out, "The user chose to keep planning; revise the plan and present it again.");
+        return;
+    }
+    if verdict == PLAN_DISMISS {
+        _ = buf_append_cstr(out, "The user dismissed the plan review to speak instead; stay in plan mode, stop here, and wait for their message.");
         return;
     }
     _ = buf_append_cstr(out, "no user-questions channel is available to review the plan; ask the user to switch the session mode instead");
 }
 
 export fn plan_tool_exit_description() &const byte {
-    return "Use only in plan mode. Present your plan for the user's review and, on approval, leave plan mode. Send the COMPLETE plan as markdown, starting with a # heading that names it." as &const byte;
+    return "Use only in plan mode. Present your plan for the user's review and, on approval, leave plan mode. Send the COMPLETE plan as markdown, starting with a # heading that names it. The user reviews it in a dialog and either approves (carry out the plan from your next step), asks for a revision (keep planning and present it again), or dismisses it to speak instead (stay in plan mode and wait for their message); the decision comes back in the tool result." as &const byte;
 }
