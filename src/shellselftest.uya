@@ -1,0 +1,316 @@
+// src/shellselftest.uya — bash 工具的进程侧自测轮次（P38）
+//
+// 轮次：
+//   bash-detach        命令拿不到终端：stdin 是 /dev/null（不是 TTY、`read` 立刻 EOF），
+//                      而且命令自成会话（pid == pgid == sid）—— 终端信号一个都到不了它
+//   bash-stop-recover  命令把自己 SIGSTOP 掉：工具必须**当场**收口（不等超时、不等用户），
+//                      给出 `[stopped by signal: 19]` 与 `[exit code: 147]`
+//   bash-kill-tree     命令留下两个后台子孙后正常退出：工具必须**立刻**返回（子孙还替我们
+//                      开着管道也不能把工具挂住），`sh_kill_tree(主进程)` 必须把整组收掉
+//
+// 为什么要有这三条（README 踩坑 55）：工具子进程以前继承父进程的 TTY，命令里的 shell 又给
+// 流水线开自己的进程组（相对 TUI 的前台组 = **后台组**），于是命令树里任何一次碰终端
+// （读 → SIGTTIN、`tcsetattr` → SIGTTOU）都会把**整个进程组**停住；而工具侧 `waitpid(WNOHANG)`
+// 看不见「被停住」，状态行就一直「运行中」，只能靠用户 esc 或工具超时收口（线上实测 6 分钟）。
+// 同一类症状还有第二个来源：命令自己退出了、但子孙还替它开着 stdout 管道，收尾那次**阻塞**读
+// 会一直等管道 EOF —— 也是「bash 已经退出、工具还在运行中」。
+//
+// 全部离线、不联网、不落盘（只读 /proc）；子进程一律由轮次自己收干净。
+
+use libc.syscall;
+use libc.unistd;
+
+// ============================================================
+// 小工具（输出/断言沿用 sigselftest 的 sigw_puts / sigw_num / sigw_fail：
+// 它们只是「写 fd 2 + 记失败」，与信号无关，这样两处轮次的输出口径完全一致）
+// ============================================================
+
+// 进程还活着吗？（探活**不能**用 waitpid —— 那会把它收掉，后面就拿不到退出码了）
+fn shs_alive(pid: i32) bool {
+    const r: !i32 = sys_kill(pid as i64, 0);
+    const rc: i32 = r catch { -1; };
+    return rc == 0;
+}
+
+// 从 off 开始找字面量 key，把它**后面紧跟**的十进制数读进 val；after = 数字结束的位置
+fn shs_num_after(h: &const Buf, key: &const byte, off: usize, val: &i64, after: &usize) bool {
+    const n: usize = bufx_cstr_len(key);
+    if n == 0 || h.len < n {
+        return false;
+    }
+    var i: usize = off;
+    while i + n <= h.len {
+        if bufx_mem_eq(h.ptr + i, key, n) {
+            const start: usize = i + n;
+            var j: usize = start;
+            while j < h.len {
+                const c: byte = h.ptr[j];
+                if c < 48 as byte || c > 57 as byte {
+                    break;
+                }
+                j = j + 1;
+            }
+            if j == start {
+                return false;
+            }
+            val[0] = parse_u64_at(h.ptr[0: h.len], start, j - start);
+            after[0] = j;
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+// 跑一条命令（直接走前台执行那一层：测的就是进程侧行为，不经过审批/沙箱/环境那套流程）
+fn shs_run(cfg: &const Config, cmd: &const Buf, timeout_ms: u32, out_s: &Buf, err_s: &Buf, timed_out: &bool, killed_by: &i32, aborted: &bool, stopped_by: &i32) i32 {
+    var wd: Buf = buf_new(FS_PATH_MAX);
+    defer { buf_free(&wd); }
+    _ = buf_append_cstr(&wd, "build");
+    _ = buf_append_byte(&wd, 0);
+    return sh_run_foreground(cfg, cmd.ptr as &const byte, wd.ptr as &const byte, timeout_ms, out_s, err_s, timed_out, killed_by, aborted, stopped_by);
+}
+
+// ============================================================
+// bash-detach：命令没有终端、自成会话
+// ============================================================
+
+fn shs_detach_round(tag: &const byte) bool {
+    var ok: bool = true;
+    var c: Config = cfg_default();
+    defer { cfg_free(&c); }
+
+    var cmd: Buf = buf_new(512);
+    defer { buf_free(&cmd); }
+    // 命令自己把三条事实打出来（谁能看到终端 / `read` 会不会阻塞 / 进程组与会话号）
+    _ = buf_append_cstr(&cmd, "v=no; [ -t 0 ] || v=yes; echo notty=$v\n");
+    _ = buf_append_cstr(&cmd, "read -r _line; echo read_rc=$?\n");
+    _ = buf_append_cstr(&cmd, "ps -o pid=,pgid=,sid= -p $$ | { read a b c; [ $a -eq $b ] && [ $b -eq $c ] && echo selfsession=yes || echo selfsession=no; }\n");
+    _ = buf_append_cstr(&cmd, "if [ -L /proc/self/fd/0 ]; then readlink /proc/self/fd/0; else echo no-proc-fd-link; fi\n");
+    _ = buf_append_byte(&cmd, 0);
+
+    var out_s: Buf = buf_new(4096);
+    defer { buf_free(&out_s); }
+    var err_s: Buf = buf_new(1024);
+    defer { buf_free(&err_s); }
+    var timed_out: bool = false;
+    var killed_by: i32 = 0;
+    var aborted: bool = false;
+    var stopped_by: i32 = 0;
+    const code: i32 = shs_run(&c, &cmd, 15000, &out_s, &err_s, &timed_out, &killed_by, &aborted, &stopped_by);
+
+    if code != 0 {
+        sigw_fail(tag, "命令没跑成（不是 0）", &ok);
+        sigw_puts("  code = " as &const byte);
+        sigw_num(code as usize);
+        sigw_puts("\n" as &const byte);
+    }
+    if !contains(&out_s, "notty=yes" as &const byte) {
+        sigw_fail(tag, "命令的 stdin 还是 TTY（`[ -t 0 ]` 为真）—— 说明 stdin 没被换成 /dev/null", &ok);
+    }
+    if !contains(&out_s, "read_rc=1" as &const byte) {
+        sigw_fail(tag, "`read` 没有立刻 EOF（read_rc 不是 1）—— stdin 不是 /dev/null 时会阻塞在终端上", &ok);
+    }
+    if !contains(&out_s, "selfsession=yes" as &const byte) {
+        sigw_fail(tag, "命令没有自成会话（pid/pgid/sid 不相等）—— setsid 没生效，终端信号还能停住它", &ok);
+    }
+    if !contains(&out_s, "/dev/null" as &const byte) {
+        sigw_fail(tag, "fd 0 没指向 /dev/null", &ok);
+    }
+    if stopped_by != 0 {
+        sigw_fail(tag, "这条命令不该被停住", &ok);
+    }
+    if ok {
+        sigw_puts("selftest[" as &const byte);
+        sigw_puts(tag);
+        sigw_puts("] ok（命令没有终端：stdin=/dev/null + 立刻 EOF + 自成会话（pid==pgid==sid））\n" as &const byte);
+    }
+    return ok;
+}
+
+// ============================================================
+// bash-stop-recover：命令把自己 SIGSTOP 掉 → 工具当场收口并报停止信号
+// ============================================================
+
+fn shs_stop_round(tag: &const byte) bool {
+    var ok: bool = true;
+    var c: Config = cfg_default();
+    defer { cfg_free(&c); }
+
+    var cmd: Buf = buf_new(64);
+    defer { buf_free(&cmd); }
+    _ = buf_append_cstr(&cmd, "kill -STOP $$");
+    _ = buf_append_byte(&cmd, 0);
+
+    var out_s: Buf = buf_new(2048);
+    defer { buf_free(&out_s); }
+    var err_s: Buf = buf_new(512);
+    defer { buf_free(&err_s); }
+    var timed_out: bool = false;
+    var killed_by: i32 = 0;
+    var aborted: bool = false;
+    var stopped_by: i32 = 0;
+    const t0: u64 = ua_now_ms();
+    // 超时给 30s：这条命令自己会停住，工具若还是「等它自己醒」就只能等到超时 —— 那正是要防的
+    const code: i32 = shs_run(&c, &cmd, 30000, &out_s, &err_s, &timed_out, &killed_by, &aborted, &stopped_by);
+    const el: u64 = ua_now_ms() - t0;
+
+    if stopped_by != 19 {
+        sigw_fail(tag, "stopped_by 不是 19（SIGSTOP）—— 工具没认出来「子进程被停住」", &ok);
+        sigw_puts("  实际 = " as &const byte);
+        sigw_num(stopped_by as usize);
+        sigw_puts("\n" as &const byte);
+    }
+    if code != 147 {
+        sigw_fail(tag, "退出码不是 147（128+SIGSTOP）", &ok);
+        sigw_puts("  实际 = " as &const byte);
+        sigw_num(code as usize);
+        sigw_puts("\n" as &const byte);
+    }
+    if el >= 5000 {
+        sigw_fail(tag, "收口不够快（没有被停住就当场收掉）", &ok);
+        sigw_puts("  实际 = " as &const byte);
+        sigw_num(el as usize);
+        sigw_puts("ms\n" as &const byte);
+    }
+    if timed_out {
+        sigw_fail(tag, "是被超时收掉的，不是被「停住」这条路径收掉的", &ok);
+    }
+
+    // 再看用户/模型真正看到的那段文本：走真实的 sh_tool_bash（审批在只读模式下才会拦，
+    // 这里先摆成全权，跑完还原 —— 每个轮次自己负责把全局状态还回去）
+    const saved_perm: u8 = perm_get();
+    perm_set(PERM_FULL_ACCESS);
+    var arena_raw: &void = malloc(65536);
+    if ((arena_raw as &byte) as usize) != 0 {
+        var arena: Arena = Arena{ buffer: null, size: 0, used: 0 };
+        arena_init(&arena, arena_raw as &byte, 65536);
+        var args: JsonValue = JsonValue.json_null();
+        var args_src: Buf = buf_new(192);
+        defer { buf_free(&args_src); }
+        _ = buf_append_cstr(&args_src, "{\"command\":\"kill -STOP $$\",\"description\":\"selftest stop\",\"timeoutMs\":30000}");
+        if js_parse(&arena, args_src.ptr, args_src.len, &args) {
+            var out2: Buf = buf_new(4096);
+            defer { buf_free(&out2); }
+            sh_tool_bash(&c, &args, &out2);
+            if !contains(&out2, "[stopped by signal: 19]" as &const byte) {
+                sigw_fail(tag, "工具结果里没有 `[stopped by signal: 19]` 这一行", &ok);
+            }
+            if !contains(&out2, "[exit code: 147]" as &const byte) {
+                sigw_fail(tag, "工具结果里没有 `[exit code: 147]`", &ok);
+            }
+        } else {
+            sigw_fail(tag, "自测自己拼的 args JSON 解析失败", &ok);
+        }
+        free(arena_raw);
+    } else {
+        sigw_fail(tag, "arena 分配失败", &ok);
+    }
+    perm_set(saved_perm);
+
+    if ok {
+        sigw_puts("selftest[" as &const byte);
+        sigw_puts(tag);
+        sigw_puts("] ok（命令把自己 SIGSTOP：工具当场收口（<5s）+ `[stopped by signal: 19]` + 147）\n" as &const byte);
+    }
+    return ok;
+}
+
+// ============================================================
+// bash-kill-tree：命令留下后台子孙后退出 → 工具立刻返回，且整组收得掉
+// ============================================================
+
+fn shs_kill_tree_round(tag: &const byte) bool {
+    var ok: bool = true;
+    var c: Config = cfg_default();
+    defer { cfg_free(&c); }
+
+    var cmd: Buf = buf_new(256);
+    defer { buf_free(&cmd); }
+    _ = buf_append_cstr(&cmd, "sleep 60 &\nk1=$!\nsleep 60 &\nk2=$!\necho main=$$\necho kid=$k1\necho kid=$k2\n");
+    _ = buf_append_byte(&cmd, 0);
+
+    var out_s: Buf = buf_new(2048);
+    defer { buf_free(&out_s); }
+    var err_s: Buf = buf_new(512);
+    defer { buf_free(&err_s); }
+    var timed_out: bool = false;
+    var killed_by: i32 = 0;
+    var aborted: bool = false;
+    var stopped_by: i32 = 0;
+    const t0: u64 = ua_now_ms();
+    const code: i32 = shs_run(&c, &cmd, 15000, &out_s, &err_s, &timed_out, &killed_by, &aborted, &stopped_by);
+    const el: u64 = ua_now_ms() - t0;
+
+    // ① 命令自己退出了，子孙还开着 stdout 管道 —— 收尾读必须非阻塞，工具要立刻返回
+    if code != 0 {
+        sigw_fail(tag, "命令没跑成（不是 0）", &ok);
+    }
+    if el >= 5000 {
+        sigw_fail(tag, "命令已经退出，工具却还在等（收尾那次读管道阻塞在子孙开着的管道上了）", &ok);
+        sigw_puts("  实际 = " as &const byte);
+        sigw_num(el as usize);
+        sigw_puts("ms\n" as &const byte);
+    }
+
+    // ② 主进程（setsid 之后它也是进程组号 / 会话号）与两个子孙
+    var main_pid: i64 = 0;
+    var at: usize = 0;
+    if !shs_num_after(&out_s, "main=" as &const byte, 0, &main_pid, &at) {
+        sigw_fail(tag, "工具结果里没读到 main=<pid>", &ok);
+        return false;
+    }
+    var kid1: i64 = 0;
+    var kid2: i64 = 0;
+    if !shs_num_after(&out_s, "kid=" as &const byte, 0, &kid1, &at) {
+        sigw_fail(tag, "工具结果里没读到第一个 kid=<pid>", &ok);
+        return false;
+    }
+    if !shs_num_after(&out_s, "kid=" as &const byte, at, &kid2, &at) {
+        sigw_fail(tag, "工具结果里没读到第二个 kid=<pid>", &ok);
+        return false;
+    }
+    const mid: i32 = main_pid as i32;
+    const k1: i32 = kid1 as i32;
+    const k2: i32 = kid2 as i32;
+    if k1 == k2 || !shs_alive(k1) || !shs_alive(k2) {
+        sigw_fail(tag, "两个后台子孙没有都活着（这条轮次就测不到「收子孙」了）", &ok);
+    }
+
+    // ③ 按组收：主进程已经退出，但它开的那个进程组还活着（两个 sleep 在里面）
+    sh_kill_tree(mid);
+    var waits: i32 = 0;
+    while waits < 20 && (shs_alive(k1) || shs_alive(k2)) {
+        var pfds: [PollFd: 1] = [PollFd{ fd: -1, events: 0, revents: 0 }];
+        _ = sys_poll(&pfds[0], 1, 100) catch {};
+        waits = waits + 1;
+    }
+    if shs_alive(k1) || shs_alive(k2) {
+        sigw_fail(tag, "sh_kill_tree 之后还有子孙活着（孤儿没清掉）", &ok);
+    }
+
+    if ok {
+        sigw_puts("selftest[" as &const byte);
+        sigw_puts(tag);
+        sigw_puts("] ok（命令带后台子孙退出：工具立刻返回（管道不阻塞）+ sh_kill_tree 收掉整组）\n" as &const byte);
+    }
+    return ok;
+}
+
+// ============================================================
+// 对外入口：selftest_main 里一行调用
+// ============================================================
+
+export fn shellx_selftest_all() bool {
+    var ok: bool = true;
+    if !shs_detach_round("bash-detach" as &const byte) {
+        ok = false;
+    }
+    if !shs_stop_round("bash-stop-recover" as &const byte) {
+        ok = false;
+    }
+    if !shs_kill_tree_round("bash-kill-tree" as &const byte) {
+        ok = false;
+    }
+    return ok;
+}

@@ -7,6 +7,11 @@
 //     墙钟超时 → SIGKILL；结果尾部的标记：`[exit code: N]`、`[timed out after Nms]`、
 //     `[killed by signal: N]`、`[output truncated]`；空输出 → `(no output)`；
 //   * 后台：注册成任务并立刻返回 `started background job <id>`；
+//   * 命令**没有终端**（P38）：stdin 指向 /dev/null、子进程 setsid 自成会话 —— 命令拿不走用户的
+//     按键，也不会被终端的 job control 信号（SIGTTIN/SIGTTOU/SIGTSTP）停住；万一还是被停住了，
+//     当场把整棵子树收掉并给出 `[stopped by signal: N]`（见 README 踩坑 55）；
+//   * 命令退出就立刻返回：收尾那次读管道是非阻塞的 —— 子孙还替我们开着管道（`sleep 300 &` 之类）
+//     也不会把工具挂住（P38，同一条「别一直显示运行中」的承诺）；
 //   * 给子进程注入 DSH_* 环境（DSH_HOME / DSH_SHELL=1 / DSH_SESSION_ID / DSH_SESSION_JSONL）。
 
 use libc.syscall;
@@ -14,6 +19,9 @@ use libc.unistd;
 use libc.fcntl;
 use libc.signal;
 use std.runtime.saved_envp;
+
+// P38：glibc 的 setsid()（工具链没有 sys_setsid 包装；与 sigx 绑 glibc sigaction 同一个写法/理由）
+extern "libc" fn setsid() i32;
 
 const SH_ENV_MAX: usize = 256;
 const SH_POLL_MS: i32 = 50;
@@ -193,15 +201,63 @@ fn sh_resolve_workdir(cfg: &const Config, args: &const JsonValue, out: &Buf) boo
     return rc == 0;
 }
 
+// ============================================================
+// P38：工具子进程的终端收口 / 进程组收口
+// ============================================================
+
+// 子进程的「没有终端」收口（fork 之后、exec 之前调用一次）。
+//
+// 为什么必须做（README 踩坑 55）：以前只重定向 fd 1/2，fd 0 原样继承 —— 工具命令拿到的
+// stdin 就是 TUI 的终端。命令里的 shell 会把流水线放进自己的进程组，相对 TUI 的前台组就是
+// **后台组**；这时命令树里只要有一个进程碰一下这个终端（读 → SIGTTIN；`tcsetattr` → SIGTTOU），
+// 内核就会把**整个进程组**停住：make / sh / 命令自带的 `timeout` 一起停在 do_signal_stop，
+// 而工具侧 `waitpid(WNOHANG)` 对「被停住」和「还在跑」完全同形 —— 状态行就一直「运行中」，
+// 只能靠用户 esc 或工具超时收口（线上实测 6 分钟；同一命令加 `nohup` 就正常，因为 nohup 在
+// stdin 是终端时会把它改成 /dev/null —— 这就是根因的对照实验）。
+//
+// 两件事，各自独立有用：
+//   1) stdin = /dev/null：命令不可能再读走用户的按键，也不会因为 `isatty(0)` 为真走进交互分支
+//      （对齐 DSH 的 `stdio.stdin = "ignore"`）；
+//   2) setsid()：命令离开父进程的会话，**没有控制终端** → 终端信号（SIGTTIN/SIGTTOU/SIGTSTP，
+//      以及终端挂断时的 SIGHUP）一个都到不了它；顺带 pgid == pid，收尾时 `kill(-pid)` 能连
+//      子孙一起收掉（见 sh_kill_tree）。
+// 任一步失败都不阻断执行：最坏退化成「只重定向了 stdout/stderr」的旧行为。
+export fn sh_child_detach_stdio() void {
+    var nullpath: [byte: 12] = "/dev/null";
+    const nfd: i32 = sys_open(&nullpath[0], O_RDONLY as i32, 0) catch { -1; };
+    if nfd >= 0 {
+        _ = sys_dup2(nfd, 0) catch {};
+        _ = sys_close(nfd) catch {};
+    }
+    _ = setsid();
+}
+
+// 按**进程组**收口（工具子进程 setsid 之后 pgid == pid，`kill(-pid)` 连子孙一起收）。
+// 先 SIGCONT：被停住的组要先续上（否则收不干净）；组杀之后再补一发单 pid —— setsid 没成功时
+// 组号不存在，那一发是兜底，也是老行为（只杀直接子进程）的保底。
+export fn sh_kill_tree(pid: i32) void {
+    if pid <= 0 {
+        return;
+    }
+    const neg: i64 = 0 - (pid as i64);
+    _ = sys_kill(neg, SIGCONT) catch {};
+    _ = sys_kill(neg, SIGKILL) catch {};
+    _ = sys_kill(pid as i64, SIGKILL) catch {};
+}
+
 // 前台执行；把 stdout/stderr 收进两个缓冲
 //
 // aborted：用户在这条命令跑着的时候按了 esc / ctrl+c / ctrl+d —— 我们**当场**把子进程
 // 杀掉（跟超时同一条路），而不是「等它自己结束再说」。以前这里只调 tui_poll_tick()
 // 把键收下来却没人看，`sleep 300` 一跑起来就真的退不出（见 README 踩坑 44）。
-fn sh_run_foreground(cfg: &const Config, cmd_z: &const byte, workdir_z: &const byte, timeout_ms: u32, out_s: &Buf, err_s: &Buf, timed_out: &bool, killed_by: &i32, aborted: &bool) i32 {
+//
+// P38：`waitpid` 带 WUNTRACED —— 子进程被 job control 停住（WIFSTOPPED）时当场收口，
+// 按 128+停止信号 返回并填 stopped_by（见 README 踩坑 55）。
+fn sh_run_foreground(cfg: &const Config, cmd_z: &const byte, workdir_z: &const byte, timeout_ms: u32, out_s: &Buf, err_s: &Buf, timed_out: &bool, killed_by: &i32, aborted: &bool, stopped_by: &i32) i32 {
     timed_out[0] = false;
     killed_by[0] = 0;
     aborted[0] = false;
+    stopped_by[0] = 0;
     var op: [i32: 2] = [0: 2];
     var ep: [i32: 2] = [0: 2];
     if (sys_pipe2(&op[0], 0) catch { -1; }) != 0 {
@@ -219,6 +275,8 @@ fn sh_run_foreground(cfg: &const Config, cmd_z: &const byte, workdir_z: &const b
         _ = sys_close(op[0]) catch {};
         // P1：信号处置是继承的 —— 子进程必须先恢复默认，否则它收到 TERM 会去写父进程的终端
         sigx_reset_for_child();
+        // P38：命令没有终端（stdin=/dev/null + 自成会话）—— 见 sh_child_detach_stdio 的文件注释
+        sh_child_detach_stdio();
         _ = sys_close(ep[0]) catch {};
         _ = sys_dup2(op[1], 1) catch {};
         _ = sys_dup2(ep[1], 2) catch {};
@@ -256,7 +314,8 @@ fn sh_run_foreground(cfg: &const Config, cmd_z: &const byte, workdir_z: &const b
         // P30：泵点 —— 先查「用户意图优先」（中止就当场杀子进程），再派发运行中敲进来的命令
         const ab: i32 = agent_pump_block();
         if ab != TUI_ABORT_NONE {
-            _ = sys_kill(pid as i64, SIGKILL) catch {};
+            // P38：收整棵子树（只杀直接子进程会把子孙留在进程表里）
+            sh_kill_tree(pid);
             killed_by[0] = SIGKILL;
             aborted[0] = true;
             done = true;
@@ -294,15 +353,31 @@ fn sh_run_foreground(cfg: &const Config, cmd_z: &const byte, workdir_z: &const b
         // 超时（墙钟）
         if timeout_ms > 0 && (ua_now_ms() - started) >= (timeout_ms as u64) {
             timed_out[0] = true;
-            _ = sys_kill(pid as i64, SIGKILL) catch {};
+            // P38：收整棵子树
+            sh_kill_tree(pid);
             killed_by[0] = SIGKILL;
             done = true;
         }
         var st: i32 = 0;
-        const r: i32 = sys_waitpid(pid, &st, 1) catch { 0; };
+        const r: i32 = sys_waitpid(pid, &st, 3) catch { 0; };   // WNOHANG|WUNTRACED
         if r > 0 {
+            // P38：被停住（WIFSTOPPED）。job control（SIGTTIN/SIGTTOU/SIGTSTP/SIGSTOP）会把
+            // **整个进程组**停住 —— 连命令自带的 `timeout` 也一起停，谁都醒不过来。这种子进程
+            // 不能就这么丢下（否则工具一直「运行中」，只有 esc/超时才收口）：当场收整棵子树，
+            // 按 128+停止信号 收口。
+            // 已经决定收工（中止/超时）的那一轮不再看停止态：那种情况下的收尾口径是「被我们杀的」
+            if !done && (st & 127) == 127 {
+                stopped_by[0] = (st >> 8) & 255;
+                sh_kill_tree(pid);
+                break;
+            }
             done = true;
-            // 收尾再读一次
+            // 收尾再读一次。
+            // P38：**必须非阻塞**。命令自己已经退出了，但它的子孙可能还开着这两个管道
+            // （`sleep 300 &`、后台 daemon、`nohup … &`）：阻塞读会一直等管道 EOF，
+            // 于是「bash 已经退出、工具却还在运行中」—— 和「被停住」是同一类症状的另一个来源。
+            _ = sys_fcntl(op[0], F_SETFL, O_NONBLOCK) catch {};
+            _ = sys_fcntl(ep[0], F_SETFL, O_NONBLOCK) catch {};
             var guard: usize = 0;
             while guard < 8 {
                 guard = guard + 1;
@@ -344,6 +419,11 @@ fn sh_run_foreground(cfg: &const Config, cmd_z: &const byte, workdir_z: &const b
     _ = sys_close(ep[0]) catch {};
     var st2: i32 = 0;
     _ = sys_waitpid(pid, &st2, 0) catch {};
+    // P38：被停住过 —— 停止信号优先于「被我们 SIGKILL 掉」这条（sh_kill_tree 的 SIGKILL 是我们
+    // 自己发的，不该盖掉真正的原因；要让模型看到的是「谁把它停住了」）
+    if stopped_by[0] != 0 {
+        return 128 + stopped_by[0];
+    }
     if killed_by[0] != 0 {
         return 128 + killed_by[0];
     }
@@ -363,6 +443,8 @@ fn sh_run_background(cfg: &const Config, cmd_z: &const byte, workdir_z: &const b
         _ = sys_close(op[0]) catch {};
         // P1：信号处置是继承的 —— 子进程必须先恢复默认，否则它收到 TERM 会去写父进程的终端
         sigx_reset_for_child();
+        // P38：后台任务同样不给终端（后台任务更容易被忘在那儿读 stdin / 被终端信号停住）
+        sh_child_detach_stdio();
         _ = sys_dup2(op[1], 1) catch {};
         _ = sys_dup2(op[1], 2) catch {};
         _ = sys_close(op[1]) catch {};
@@ -385,7 +467,8 @@ fn sh_run_background(cfg: &const Config, cmd_z: &const byte, workdir_z: &const b
     _ = sys_fcntl(op[0], F_SETFL, O_NONBLOCK) catch {};
     const id: i32 = job_register(&g_jobs, pid, op[0], label, label_len);
     if id < 0 {
-        _ = sys_kill(pid as i64, SIGKILL) catch {};
+        // P38：整棵子树
+        sh_kill_tree(pid);
         _ = sys_close(op[0]) catch {};
     }
     _ = cfg;
@@ -490,7 +573,8 @@ export fn sh_tool_bash(cfg: &const Config, args: &const JsonValue, out: &Buf) vo
     var timed_out: bool = false;
     var killed_by: i32 = 0;
     var aborted: bool = false;
-    const code: i32 = sh_run_foreground(cfg, &cmd.ptr[0] as &const byte, &wd_z.ptr[0] as &const byte, timeout_ms, &out_s, &err_s, &timed_out, &killed_by, &aborted);
+    var stopped_by: i32 = 0;
+    const code: i32 = sh_run_foreground(cfg, &cmd.ptr[0] as &const byte, &wd_z.ptr[0] as &const byte, timeout_ms, &out_s, &err_s, &timed_out, &killed_by, &aborted, &stopped_by);
     if code < 0 {
         _ = buf_append_cstr(out, "Error: cannot spawn bash");
         return;
@@ -523,7 +607,13 @@ export fn sh_tool_bash(cfg: &const Config, args: &const JsonValue, out: &Buf) vo
         // 给模型的措辞要明确：这不是命令失败，是用户把它叫停了
         _ = buf_append_cstr(out, "[aborted by user]\n");
     }
-    if killed_by != 0 {
+    if stopped_by != 0 {
+        // P38：命令树被 job control 停住了。措辞要让模型知道「这不是命令自己失败，也不是用户叫停」，
+        // 而是「命令碰了它没有的终端」——照原样重试只会再停一次。
+        _ = buf_append_cstr(out, "[stopped by signal: ");
+        _ = buf_append_u64(out, stopped_by as u64);
+        _ = buf_append_cstr(out, "]\n(the command's process tree was stopped by a job-control signal: it tried to use the terminal, which bash commands do not get — stdin is /dev/null and the command runs in its own session. The tree has been killed; do not retry it as-is.)\n");
+    } else if killed_by != 0 {
         _ = buf_append_cstr(out, "[killed by signal: ");
         _ = buf_append_u64(out, killed_by as u64);
         _ = buf_append_cstr(out, "]\n");

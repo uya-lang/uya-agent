@@ -328,7 +328,12 @@ src/tui.uya       全屏 TUI（P17/P18）：帧模型（行=段序列，逐行 d
                   （`p1;p2` 修饰键，`ctrl+home/end`）、按真总量走查的滚动定位
                   （`tui_auto_end_scroll`）、`^` 溢出指示
 src/sigselftest.uya 信号层的自测轮次（sig-abi / sig-basic / sig-term-restore / sig-child-reset；
-                  P32 起恢复序列多一段「关鼠标上报」，四种形态的长度跟着改）
+                  P32 起恢复序列多一段「关鼠标上报」，四种形态的长度跟着改；
+                  P38 起「把终端还回去」这一步先临时忽略 SIGTTOU —— 后台进程组 `tcsetattr`
+                  会被内核发 SIGTTOU 停住整个进程组，见踩坑 55）
+src/shellselftest.uya bash 工具的**进程侧**自测轮次（P38：bash-detach / bash-stop-recover /
+                  bash-kill-tree）—— 命令没有终端（stdin=/dev/null + 自成会话）、被停住就当场
+                  收口、命令退出立刻返回且整组收得掉；全部离线、不落盘
 src/tuiselftest.uya TUI 的自测轮次（tui-frame / tui-keys / tui-sink / tui-turn / tui-status / tui-cmd /
                   tui-plan / tui-exit / tui-quit / tui-tasks / tui-diff / tui-scroll / tui-pty /
                   tty-title-pty；P20/P24 起 tui-frame 还断言脚注统计行的逐级退化、右对齐
@@ -338,7 +343,8 @@ src/tuiselftest.uya TUI 的自测轮次（tui-frame / tui-keys / tui-sink / tui-
                   缺陷（踩坑 42）只有它会红；P26 起加 tui-plan：审阅浮窗排版/滚动/三动作/数字直选 +
                   headless fail closed + 真 PTY 批准与解决；P31 起加 tui-p31：派发之后**同一次
                   调用里**就出一帧（`tui_frame_count()` +1）+ 泵点上下文登记/清掉的口径；
-                  P32 起 tui-scroll 钉「长条目翻看 / ctrl+home·end / SGR 滚轮 / 整屏 PgUp / `^` 指示」）
+                  P32 起 tui-scroll 钉「长条目翻看 / ctrl+home·end / SGR 滚轮 / 整屏 PgUp / `^` 指示」；
+                  P38 起 tui-frame 还钉状态行「已运行时长」的格式（`0s` / `45s` / `1m23s` / `1h00m`））
 src/inbox.uya     输入收件箱：steer（运行中输入的文本，step 边界领取）+ keepInbox 语义
 src/yamlcfg.uya   自带 YAML 子集解析器：去注释（块标量/引号感知）、中和 `!!tag`、
                   block/flow 映射与序列、`|`/`>` 块标量、跨行 flow 集合、节点池树 + 导航
@@ -349,7 +355,10 @@ src/fsx.uya       文件工具：路径解析（可选工作区守卫）、**rea
                   edit（唯一匹配 / replace_all）src/shellx.uya    bash 工具：bash -c、workdir、timeoutMs、run_in_background、stdout/stderr 分开收、
                   **read-only 逐条人工批准**（TUI 浮层 / 滚动模式 y-N / 无通道则 fail closed）、
                   **confined 模式下套 bwrap profile 执行**（起不来就拒绝）、
-                  结果标记（[exit code: N] / [timed out after Nms] / [killed by signal: N]）、DSH_* 环境注入
+                  结果标记（[exit code: N] / [timed out after Nms] / [killed by signal: N] / [stopped by signal: N]）、DSH_* 环境注入；
+                   P38：命令**没有终端**（stdin=/dev/null + `setsid()` 自成会话 —— 对齐 DSH 的
+                   `stdio.stdin = "ignore"`）、中止/超时/被停住都按**进程组**收整棵子树、
+                   命令退出后收尾读管道非阻塞（子孙还替它开着管道也不会挂住工具，见踩坑 55）
 src/jobs.uya      后台任务表：注册/增量输出（保留内存尾部 1 MiB）/状态机（running/completed/killed）、
                   job_list / job_output（wait + timeout_ms）/ job_kill
 src/search.uya    glob / grep：rg 子进程（--files / --json）、VCS 目录排除、条数与行长上限
@@ -697,12 +706,28 @@ Messages API（`x-api-key` + `anthropic-version: 2023-06-01`，服务端工具 `
 
 | 工具 | 参数 | 行为要点 |
 |---|---|---|
-| `bash` | `command`(必), `description`(必), `timeoutMs`, `workdir`, `run_in_background` | `bash -c`；stdout 与 stderr **分开收**，stderr 归到 `[stderr]` 段；尾部标记 `[exit code: N]`、`[timed out after Nms]`、`[killed by signal: N]`、`[output truncated]`；完全无输出 → `(no output)`；后台调用立刻回 `started background job job-N` |
+| `bash` | `command`(必), `description`(必), `timeoutMs`, `workdir`, `run_in_background` | `bash -c`；stdout 与 stderr **分开收**，stderr 归到 `[stderr]` 段；尾部标记 `[exit code: N]`、`[timed out after Nms]`、`[killed by signal: N]`、`[stopped by signal: N]`、`[output truncated]`；完全无输出 → `(no output)`；后台调用立刻回 `started background job job-N` |
 | `job_list` | — | `<job-id> [bash] <status> — <描述>`；空 → `(no background jobs)` |
 | `job_output` | `job_id`(必), `wait`, `timeout_ms` | **增量**语义（只给上次读之后的新输出）；`wait=true` 最多等 30 s（上限 600 s）；无新输出 → `(no new output)`；尾部 `[status: running\|completed\|killed, exit N]` |
 | `job_kill` | `job_id`(必), `reason` | 运行中 → `requested cancellation of job N`；已结束 → `job N had already finished [status: …]` |
 
 * 超时是**墙钟**的，且一定会 SIGKILL 进程组里的子进程；被信号杀掉时退出码报 `128+信号号`。
+* **命令没有终端**（P38）：子进程的 stdin 指向 `/dev/null`，并且 `setsid()` 自成会话 ——
+  命令读不到用户的按键、也不会被终端的 job control 信号（SIGTTIN/SIGTTOU/SIGTSTP）或终端挂断
+  （SIGHUP）波及。`[ -t 0 ]` 为假、`read` 立刻 EOF，所以需要 TTY 的命令（`git` 要凭据、`vi`、
+  `ssh` 要密码）会**当场失败**而不是挂住（对齐 DSH 的 `stdio.stdin = "ignore"`）——
+  要真 PTY 请自己套一层 `script -qec "…" /dev/null`（`script` 会 setsid + TIOCSCTTY，
+  在「命令没有终端」的前提下照样能用，厂内那几条 TUI 轮次就是这么跑的）。
+* **收口一律按进程组**（P38）：中止（esc / ctrl+c / ctrl+d）、墙钟超时、以及「子进程被停住」
+  三种收口都走 `sh_kill_tree`（先 `SIGCONT` 再 `SIGKILL`，`setsid` 之后 `pgid == pid`）——
+  只杀直接子进程会把 `make`/`sh`/工具子孙留在进程表里（真机现场遗留过一整条被停住的流水线）。
+* **子进程被停住 = 当场收口**（P38）：`waitpid` 带 `WUNTRACED`，一旦 `WIFSTOPPED` 就收掉整棵
+  子树、按 `128+停止信号` 返回并打 `[stopped by signal: N]` + 一行说明 —— 以前这种情况工具会
+  一直显示「运行中」，只能靠用户 esc 或工具超时收口（见踩坑 55）。
+* **命令退出就立刻返回**（P38）：收尾那次读管道是**非阻塞**的。命令自己退出了、子孙还替它开着
+  stdout 管道（`sleep 300 &`、daemon）时，阻塞读会一直等管道 EOF —— 那也是「bash 已经退出、
+  工具还在运行中」。子孙不由工具负责（要管就用 `run_in_background` + `job_*`），
+  但中止/超时/被停住这三条路径会把整组收干净。
 * 每个子进程都会拿到 `DSH_HOME`、`DSH_SHELL=1`、`DSH_SESSION_ID`、`DSH_SESSION_JSONL`
   （继承来的旧 `DSH_*` 会先清掉），与 DSH 的 shell-env 约定一致。
 * 任务输出保留**内存尾部 1 MiB**，超出打 `[output truncated]`（DSH 会落盘 spill，记为偏离）。
@@ -899,7 +924,8 @@ TTY 交互模式**默认全屏**（`--no-tui` 退回上一节的滚动转录；�
     ◆ 助手
   已改成 Hello, DSH! 并重新编译运行，输出 Hello, DSH!。
 
-  ⠋ 运行中 Bash(make check) · esc 中断   ← 状态区第 1 行：钉在面板正上方（转录再长也挤不掉）
+  ⠋ 运行中 Bash(make check) · 0s · esc 中断   ← 状态区第 1 行：钉在面板正上方（转录再长也挤不掉）
+                                              （P38 起在标题后面多一段已运行时长：`0s` / `1m23s` / `1h02m`）
   ▌ ❯ 顺便把 Makefile 的注释补一下_     ← 输入面板（左边缘强调竖条）
   ▌ Build   Full access   deepseek-chat   deepseek  tab plan   ctrl+p commands
   ~/uya-agent:main · ctx 21% · cpu 37% · 内存 312M    1 轮 · 12 步 | LLM 50.7s · 工具调用 4.1s | 首 token 平均 1.5s · 221 tok/s | 缓存命中 71%…```
@@ -2407,6 +2433,47 @@ vLLM 等 OpenAI 兼容端点都一样稳。想升级成严格 `tool` 角色消�
     落到最后一项（`tui_overlay_sel_set`），否则「打开就回车」恢复的会是最旧的会话 ——
     这正是「顺序翻转」最容易漏掉的一半：**行序对了，选中项口径没跟着改**（与踩坑 50 同类）。
 
+55. **工具子进程继承了父进程的 TTY —— 命令树被 job control 停住，工具却一直显示「运行中」**（P38，
+    用户报的「这个老是等很久，bash 都已经退出了」）。现场：TUI（p36 工作区）里一条
+    `timeout 1200 make selftest 2>&1 | tail -30` 跑了 6 分 04 秒还没回来，用户 esc 才收口
+    （结果是 `[aborted by user] / [killed by signal: 9] / [exit code: 137]`）。`ps` 一看：
+    ```
+    bash -c 'cd … && timeout 1200 make selftest 2>&1 | tail -30'   S+   pgid=3690484（TUI 的前台组）
+    timeout 1200 make selftest                                      S    pgid=3852873（自己的组）
+    make selftest / sh -c … / build/uya-agent --selftest            T    ← 全被**停住**了
+    ```
+    链条：① `sh_run_foreground` 只重定向 fd 1/2，**fd 0 原样继承** → 命令的 stdin 就是 TUI 的
+    终端；② 命令里的 shell 把流水线放进自己的进程组，相对 TUI 的前台组就是**后台组**；
+    ③ 命令树里只要有一个进程碰一下这个终端 —— 读 → `SIGTTIN`，`tcsetattr` → `SIGTTOU` ——
+    内核就把**整个进程组**停住（POSIX 的 job control 规矩）。这一次是 selftest 的
+    `sig-term-restore` 轮：子进程 `sigx_install_terminal(0)` 从**真 TTY** 读到了 termios，
+    SIGTERM 处理器里 `ioctl(0, TCSETS, …)` 正好落在「后台组改控制终端」这一条上；
+    ④ 于是 make / sh / selftest 连同命令自带的 `timeout 1200` 一起停在 `do_signal_stop`，
+    谁都醒不过来；⑤ 工具侧 `waitpid(WNOHANG)` 对「被停住」和「还在跑」**完全同形**（返回 0），
+    状态行就一直「运行中」，只有用户 esc 或工具的 `timeoutMs` 能收口 —— 而且中止只
+    `kill(pid)`（直接子进程），停住的子孙全变孤儿留在进程表里（厂内其它会话事后靠
+    `pkill -9 -f 'build/uya-agent --selftest'` 清）。
+    **对照实验（同一命令、同一环境，唯一变量是 stdin）**：`nohup make selftest > log &` 直接
+    `SELFTEST PASS` —— nohup 在 stdin 是终端时会把它改成 `/dev/null`，于是 `TCGETS` 失败、
+    处理器跳过那个 ioctl、不再被停。**修法**（四件事，各自独立有用）：子进程 stdin → `/dev/null`
+    且 `setsid()` 自成会话（对齐 DSH 的 `stdio.stdin = "ignore"`）；`waitpid` 带 `WUNTRACED`，
+    被停住就当场收整棵子树 + `[stopped by signal: N]`；中止/超时也按**进程组**收（`kill(-pid)`）；
+    `sigx` 的处理器在动终端之前**临时忽略 SIGTTOU**（POSIX：忽略/阻塞时 `tcsetattr` 照常生效），
+    这样「被打断就把终端还回去再退出」在后台组里也成立。
+    **同一类症状的第二个来源（一起修了）**：命令自己退出了、子孙还替它开着 stdout 管道
+    （`sleep 300 &` 之类）时，收尾那次 `sys_read` 会**阻塞**等管道 EOF —— 那也是「bash 已经退出、
+    工具还在运行中」。收尾读现在先置 `O_NONBLOCK`。
+    **回归轮**：`make shell-selftest`（`bash-detach` / `bash-stop-recover` / `bash-kill-tree`，
+    进整轮 `make selftest`）。真机验收：同一形状的命令在真 TTY 下跑完整 `make selftest`（见 §6）。
+
+56. **别把 make 的「挂起」当成「进程被停住」**（P38 排查时差点带偏）。`make: *** [Makefile:58:
+    selftest] 挂起` 里的「挂起」是 **`Hangup`（SIGHUP）**，不是「Stopped」：GNU make 打的是
+    `strsignal(信号)`，而 `make.mo` 的 zh_CN 目录把 `Hangup` 译成「挂起」、把
+    `Stopped` / `Stopped (tty input)` / `Stopped (tty output)` 译成「已停止 (信号)」/
+    「已停止 (tty 输入)」/「已停止 (tty 输出)」。同一份目录里查一遍就知道该信号到底是什么
+    （`python3 -c "import gettext;t=gettext.translation('make',languages=['zh_CN']);print(t.gettext('Hangup'))"`）——
+    排查「谁把进程停住了」时按这四个词对号入座，别按字面意思猜。
+
 ---
 
 ## 4. 工具实现要点
@@ -3186,10 +3253,42 @@ mock 上逐字段验收。换一台 `openai-responses` 网关可用时，零参�
     `e2e-resume-big` 与 `sess-meta-big` 都立刻失败（前者 139、后者直接崩）——
     两条腿都真的抓得到这个缺陷，不是「恰好绿」。
 
+* **P38 的验收记录（2026-10-03，`p38-tty`，对应踩坑 55/56）**：修的是「工具子进程继承了 TTY →
+  命令树被 job control 停住 → 工具一直显示「运行中」」这条真实的挂起（现象 / 根因 / 对照实验
+  见踩坑 55）。（编号说明：P36「/diff 背景色」与 P37 在另外两条线上，这里按顺序占 P38；
+  踩坑号同理从 55 起。）验收都落在**真 TTY** 上（用 `script -qec … /dev/null` 起一个 pty 当控制终端，
+  这样 selftest 的 sig 轮才真的会去碰控制终端 —— 也就是当初出事的那个条件）。
+  * **真机现场（用户报的）**：TUI 里 `timeout 1200 make selftest 2>&1 | tail -30` 跑了
+    **6 分 04 秒**还没回来，用户 esc 才收口（`[aborted by user] / [killed by signal: 9] /
+    [exit code: 137]`）；`ps` 里 make / sh / selftest 三个进程全是 `T (stopped)`。
+  * **对照实验（同一命令、同一环境，唯一变量是 stdin）**：`nohup make selftest > log &`
+    → `SELFTEST PASS`（nohup 把终端 stdin 换成 /dev/null）。
+  * **修完的同一形状（真 TTY + 真管道）**：
+    `script -qec "timeout 1200 make selftest 2>&1 | tee log | tail -30" /dev/null`
+    → **`SELFTEST PASS`，117 轮全绿，约 3 分钟**；`sig-term-restore`（未修版本就死在这一轮）
+    在输出里是 `ok`，`bash-detach` / `bash-stop-recover` / `bash-kill-tree` 三条也都在其中。
+  * **未修版本的对照实验**（按 P35 的老办法：直接改生成的 `shellx.c` 再 `make -C build/uyacache
+    UYA_OUT=…/build/uya-agent` 重链）：`bash-detach` 红在「命令没有自成会话」；
+    `bash-stop-recover` 五条断言全红 —— `stopped_by=0`、退出码 137、**收口耗时 30002ms**
+    （即「只能等工具超时」）、结果里没有 `[stopped by signal: 19]`；`bash-kill-tree`
+    **直接挂住**（收尾那次阻塞读卡在子孙替它开着的管道上，`timeout 90` 才把它砍掉）。
+    三个轮次都真的抓得到缺陷，不是「恰好绿」。
+  * **并发旁证**：修复期间同一台机器上另一条**未修**的 selftest 仍然停在同一个点上
+    （那条流水线的 `make selftest` / `sh -c …` / `build/uya-agent --selftest` 三个进程全是
+    `T (stopped)`）；修好的这份在同一台机器上跑完 —— 不是「机器变快了」。
+  * **轮次入口**：`make shell-selftest`（快轮，`UYA_SELFTEST_SHELL_ONLY=1`）；整轮
+    `make selftest` 里由 `shellx_selftest_all()` 一并跑（实现都在 `src/shellselftest.uya`）。
+
 ---
 
 ## 7. 已知限制
 
+* **bash 命令没有终端（P38）**：stdin 是 `/dev/null`、子进程自成会话 —— 这是有意的（见踩坑 55），
+  代价是需要交互的命令（`git` 要凭据、`vi`、`ssh` 要密码、`apt` 要确认）会**当场失败**而不是
+  等着用户输入。要真 PTY 就自己套 `script -qec "…" /dev/null`（`script` 会 setsid +
+  TIOCSCTTY，在「命令没有终端」的前提下照样可用）。另外命令**退出就返回**：它留下的后台子孙
+  不由工具负责（要管就用 `run_in_background` + `job_*`），只有中止/超时/被停住这三条路径
+  会把整组收干净。
 * **任务状态（P25）的边界**：
   * 已结束的后台任务/子代理**没有时长**（`Job`/`Deleg` 都只记了开始时刻，没有结束时间戳；
     要显示就得改它们的状态机）；运行中的才有秒数。
