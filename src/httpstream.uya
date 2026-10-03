@@ -29,6 +29,9 @@ const HC_CK_DONE: u8 = 4;      // 体结束
 // chunk 长度行/trailer 行的合理上限（防畸形流把内存吃光）
 const HCS_LINE_MAX: usize = 1024;
 
+// P31：等响应头那段「没数据就泵一次」的 poll 粒度（与 httpc 的读到 EOF 循环同口径）
+const HC_PUMP_POLL_MS: i32 = 50;
+
 export struct HcStream {
     fd: i32,
     is_tls: bool,
@@ -326,6 +329,13 @@ export fn hc_open(
     try url_parse(url, &u);
     defer { url_free(&u); }
 
+    // P31：下面这段（DNS → TCP → TLS 握手 → 写请求体）是**插不进泵点**的：解析与握手都在
+    // 工具链的调用内部。至少在踏进去之前服务一次键盘与命令 —— 用户在「上一步刚收尾」时
+    // 敲的只读命令（/status 之类）就不会白等这一整段。
+    if tui_active() {
+        agent_pump_light();
+    }
+
     const fd: i32 = try tcp_connect(url_host(&u), u.host_len, u.port, timeout_ms);
     st.fd = fd;
     st.is_tls = u.tls;
@@ -359,8 +369,17 @@ export fn hc_open(
     }
 
     // 读到响应头结束（"\r\n\r\n"）
+    //
+    // P31：这一段以前是**纯阻塞** conn_read —— 头没到之前一个泵点都没有，于是「请求刚发
+    // 出去、模型还没吐第一个字」那整段（网关 prefill / 慢链路）里，用户敲的 /status、
+    // esc、ctrl+c 全都石沉大海：真终端实测 4879 ms 才出浮层，上限还是 timeout_ms（默认
+    // 120 s）。现在与 httpc 的读到 EOF 循环、以及本文件 hc_fill_wait 同一套做法：
+    // poll(≤50 ms) → 没数据就泵一次 → 回来继续等。超时按**墙上时间**判（与 SO_RCVTIMEO
+    // 同口径，只是更严：原来每帧各有一次 timeout，慢滴流可以无限拖）。
+    // 非 TUI（子代理 / 一次性运行 / 管道 / --probe）走原样的阻塞读，行为不变。
     var tmp: [byte: HC_READ_CHUNK] = [0: HC_READ_CHUNK];
     var head_end: usize = 0;
+    const t0: u64 = ua_now_ms();
     while true {
         const view: &[byte] = st.rx.ptr[0: st.rx.len];
         const he: isize = find_sub(view, &"\r\n\r\n"[0: 4], 0);
@@ -370,6 +389,17 @@ export fn hc_open(
         }
         if st.rx.len > HC_HEAD_MAX {
             return error.HcBadResponse;
+        }
+        if tui_active() {
+            var pfds: [PollFd: 1] = [PollFd{ fd: st.fd, events: POLLIN, revents: 0 }];
+            const pr: i32 = sys_poll(&pfds[0], 1, HC_PUMP_POLL_MS) catch { 0; };
+            if pr <= 0 {
+                agent_pump_light();   // 读键 + 派发运行中敲进来的命令 + 当场刷帧
+                if timeout_ms > 0 && (ua_now_ms() - t0) >= (timeout_ms as u64) {
+                    return error.HcTimeout;
+                }
+                continue;
+            }
         }
         const n: usize = try conn_read(&conn, &tmp[0], HC_READ_CHUNK);
         if n == 0 {

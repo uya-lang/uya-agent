@@ -302,12 +302,17 @@ e2e-dsh: build
 #        （旧实现要等这一步走完 —— 3s 的单步流实测 2245ms，用户看到的就是卡死）
 #     2) 回合运行中敲 /new：立刻回执 + 中断当前回合（随后由主循环开新会话）
 #     3) esc 中断一回合之后再发一条任务：必须正常跑完（曾经被粘住的中断标志秒断）
+#   P31 起再加四条「请求在飞」的验收（判据与数字见 README §6 的 P31 验收记录）：
+#     4) 响应头还没回来时敲 /status：≤800ms（旧实现要等头到 —— 3s 的头实测 2280ms）
+#     5) 空闲敲 /status：≤150ms（旧实现 242ms = 等下一次 200ms 轮询）
+#     6) bash 跑着时敲 /status：≤200ms（且回合仍在跑）
+#     7) 压缩的摘要请求在飞时敲 /status：≤300ms（且必须证明压缩真发过请求）
 #   PTY_DUMP=1 会把子进程屏幕打出来；单跑一个场景：
 #     python3 testdata/pty_drive.py --port <假网关端口> --workspace /tmp/ws status-single-step
 p30-check: build
 	@python3 testdata/pty_drive.py --suite
 
-# P31：/sessions 列表（离线，行式 REPL 走真二进制）：三列 = 标题 / 工作区 / session id，
+# P32：/sessions 列表（离线，行式 REPL 走真二进制）：三列 = 标题 / 工作区 / session id，
 # 按 lastActiveAt 倒序、同 id 只留最后一条。TUI 浮层那条腿（宽箱体 / 逐行宽度不变量 /
 # 选中项取完整 id）在 selftest 的 tui-sessions 轮里断言。
 e2e-sessions: build
@@ -344,7 +349,7 @@ tui-demo: build
 tui-selftest: build
 	UYA_SELFTEST_TUI_ONLY=1 $(OUT) --selftest
 
-# P31：/sessions 列表的自测轮（纯函数排版 + TUI 浮层），改会话列表时比整轮 selftest 快
+# P32：/sessions 列表的自测轮（纯函数排版 + TUI 浮层），改会话列表时比整轮 selftest 快
 sess-selftest: build
 	UYA_SELFTEST_SESS_ONLY=1 $(OUT) --selftest
 
