@@ -38,6 +38,7 @@ export struct Deleg {
     label: Buf,
     prompt: Buf,
     sid: Buf,          // 子会话 id（send_message 用它续跑）
+    watch_base: Buf,   // P42：ralph 的会话 id 基名（第 N 轮的 id = <base>-rN）
     objective: Buf,    // ralph 用
     rounds: i32,
     max_rounds: i32,
@@ -65,6 +66,7 @@ fn deleg_empty() Deleg {
         label: buf_empty(),
         prompt: buf_empty(),
         sid: buf_empty(),
+        watch_base: buf_empty(),
         objective: buf_empty(),
         rounds: 0,
         max_rounds: 0,
@@ -92,6 +94,7 @@ export fn deleg_free(t: &DelegTable) void {
             buf_free(&d.label);
             buf_free(&d.prompt);
             buf_free(&d.sid);
+            buf_free(&d.watch_base);
             buf_free(&d.objective);
             buf_free(&d.buf);
             if d.fd >= 0 {
@@ -130,6 +133,17 @@ fn deleg_find(t: &const DelegTable, id: i32) isize {
     return -1;
 }
 
+// P42：按 id 找槽位（`/watch sub-N` 用）。id 是**运行时编号**（sub-1、sub-2…），
+// 不是数组下标 —— 槽位会被回收复用，两者不相等。
+export fn deleg_slot_of(t: &const DelegTable, id: i32, out_slot: &usize) bool {
+    const slot: isize = deleg_find(t, id);
+    if slot < 0 {
+        return false;
+    }
+    out_slot[0] = slot as usize;
+    return true;
+}
+
 // 释放一个槽位（子代理已进终态、进程已被 waitpid 收掉）：把缓冲还给分配器并把
 // 记录清空，让 deleg_slot 能把它再分给新的子代理。
 fn deleg_release(t: &DelegTable, i: usize) void {
@@ -143,6 +157,7 @@ fn deleg_release(t: &DelegTable, i: usize) void {
     buf_free(&d.label);
     buf_free(&d.prompt);
     buf_free(&d.sid);
+    buf_free(&d.watch_base);
     buf_free(&d.objective);
     buf_free(&d.buf);
     if d.fd >= 0 {
@@ -216,6 +231,124 @@ export fn deleg_sid_at(t: &const DelegTable, i: usize) &[byte] {
         return &"x"[0: 0];
     }
     return t.items[i].sid.ptr[0: t.items[i].sid.len];
+}
+
+// ============================================================
+// P42：/watch —— 定位某个子代理**当前正在写**的会话日志
+//
+// 为什么不走管道：子进程的 fd 1/2 指向 /dev/null，管道只承载**终态答复**
+// （P11 的口径），所以运行中从管道看不到任何过程消息。但它把每个事件都实时
+// 落进了自己的会话日志（无 stdio 缓冲），按需读那份日志就有过程可看。
+//
+// 路径解析：
+//   * subagent / subagent_fork → d.sid 就是会话 id，sess_find 直接取；
+//   * ralph → 第 N 轮的 id 是 `<watch_base>-rN`（父子在 spawn 时约定的构造规则），
+//     N 由管道里已收到的 `[round N]` 行推出来（没有则第 1 轮）。
+// 返回 false = 还没有日志（子进程刚 fork、header 还没落盘）——调用方下一拍再试。
+// ============================================================
+// 缓冲区从 at 起是否逐字节等于一段字面量（bufx_mem_eq 要求两个都是 `&const byte`，
+// 而 `buf.ptr[at: len]` 这种切片再 cast 会让 C 代码生成器报 "cannot convert to a pointer type" ——
+// 实测踩过，所以这里按下标逐字节比）
+fn deleg_starts_at(b: &const Buf, at: usize, lit: &const byte, n: usize) bool {
+    if at + n > b.len {
+        return false;
+    }
+    var k: usize = 0;
+    while k < n {
+        if b.ptr[at + k] != lit[k] {
+            return false;
+        }
+        k = k + 1;
+    }
+    return true;
+}
+
+// 从管道已收输出里推出 ralph 当前轮号（取出现过的最大 N；没出现过算 0）
+//
+// 注意 marker 是**一轮跑完之后**才写的（`[round N] <answer>`），所以：
+//   * 还在跑（RUNNING）→ 正在执行的那一轮 = 已见最大轮号 + 1；
+//   * 已进终态       → 最后一轮的日志 = 已见最大轮号（不再有新轮开始）。
+// 弄反了就会去读上一轮的日志（内容停在那儿不动），看起来像「跟随不工作」。
+fn deleg_round_seen(d: &const Deleg) i32 {
+    var best: i32 = 0;
+    var i: usize = 0;
+    while i < d.buf.len {
+        if d.buf.ptr[i] != 91 as byte {          // '['
+            i = i + 1;
+            continue;
+        }
+        if d.buf.len - i < 7 || !deleg_starts_at(&d.buf, i, "[round " as &const byte, 7) {
+            i = i + 1;
+            continue;
+        }
+        var j: usize = i + 7;
+        var v: i32 = 0;
+        var digits: i32 = 0;
+        while j < d.buf.len && is_digit(d.buf.ptr[j]) {
+            v = v * 10 + ((d.buf.ptr[j] as i32) - 48);
+            digits = digits + 1;
+            j = j + 1;
+        }
+        if digits > 0 && v > best {
+            best = v;
+        }
+        i = j;
+    }
+    return best;
+}
+
+// ralph 当前该跟随的轮号（1 起）
+fn deleg_round_current(d: &const Deleg) i32 {
+    var r: i32 = deleg_round_seen(d);
+    if d.status == DELEG_RUNNING {
+        r = r + 1;
+    }
+    if r < 1 {
+        r = 1;
+    }
+    return r;
+}
+
+export fn deleg_watch_path(cfg: &const Config, t: &const DelegTable, idx: usize, out: &Buf) bool {
+    buf_reset(out);
+    if idx >= DELEG_MAX {
+        return false;
+    }
+    if !t.items[idx].used {
+        return false;
+    }
+    const d: &const Deleg = &t.items[idx];
+    var sid: Buf = buf_new(96);
+    defer { buf_free(&sid); }
+    if d.watch_base.len > 0 {
+        _ = buf_append(&sid, d.watch_base.ptr, d.watch_base.len);
+        _ = buf_append_cstr(&sid, "-r");
+        _ = buf_append_u64(&sid, deleg_round_current(d) as u64);
+    } else if d.sid.len > 0 {
+        _ = buf_append(&sid, d.sid.ptr, d.sid.len);
+    } else {
+        return false;
+    }
+    var home: Buf = buf_new(1024);
+    defer { buf_free(&home); }
+    if !agent_default_home(cfg, &home) {
+        return false;
+    }
+    var hz: Buf = buf_new(home.len + 1);
+    defer { buf_free(&hz); }
+    _ = buf_append(&hz, home.ptr, home.len);
+    _ = buf_append_byte(&hz, 0);
+    var cwdz: Buf = buf_new(cfg.workspace.len + 1);
+    defer { buf_free(&cwdz); }
+    _ = buf_append(&cwdz, cfg.workspace.ptr, cfg.workspace.len);
+    _ = buf_append_byte(&cwdz, 0);
+    return sess_find(
+        hz.ptr as &const byte,
+        cwdz.ptr as &const byte,
+        sid.ptr as &const byte,
+        sid.len,
+        out
+    );
 }
 
 // ============================================================
@@ -348,6 +481,17 @@ fn deleg_child_main(src: &const Config, prompt: &const Buf, label: &const Buf, k
             rcfg.fork_from = buf_empty();
             rcfg.resume_id = buf_empty();
             rcfg.save_session = true;
+            // P42：本轮会话 id 由父进程预生成的基名推出来（<base>-rN）——
+            // 父进程因此能直接定位任意一轮的日志做 /watch（不必扫目录猜）。
+            deleg_cfg_set(&rcfg.parent_session, &c.parent_session);
+            if forced_sid.len > 0 {
+                var rid: Buf = buf_new(forced_sid.len + 24);
+                defer { buf_free(&rid); }
+                _ = buf_append(&rid, forced_sid.ptr, forced_sid.len);
+                _ = buf_append_cstr(&rid, "-r");
+                _ = buf_append_u64(&rid, round as u64);
+                deleg_cfg_set(&rcfg.force_session_id, &rid);
+            }
             const rr: i32 = agent_run(&rcfg);
             var line: Buf = buf_new(65536);
             defer { buf_free(&line); }
@@ -421,6 +565,15 @@ export fn deleg_spawn(src: &const Config, t: &DelegTable, prompt: &const Buf, la
             buf_free(&forced_sid);
             forced_sid = buf_empty();
         }
+    } else {
+        // P42：ralph 也由父进程预生成一个**会话 id 基名**，第 N 轮的 id = `<base>-rN`。
+        // 这样父进程不必去猜「哪个日志是它」——想跟随第几轮就直接拼出路径。
+        // （原实现每轮由子进程 sess_new_id 随机生成，父进程完全不知情。）
+        forced_sid = buf_new(80);
+        if !sess_new_id(&forced_sid) {
+            buf_free(&forced_sid);
+            forced_sid = buf_empty();
+        }
     }
     const pid64: i64 = sys_fork() catch {
         _ = sys_close(fds[0]) catch {};
@@ -469,11 +622,22 @@ export fn deleg_spawn(src: &const Config, t: &DelegTable, prompt: &const Buf, la
         _ = buf_append(&d.prompt, prompt.ptr, prompt.len);
     }
     d.sid = buf_empty();
-    // 子会话 id：父进程刚为它预生成的（ralph 不预生成，保持空 —— 它每轮新会话）
+    d.watch_base = buf_empty();
+    // 子会话 id：父进程刚为它预生成的。
+    //   * subagent / subagent_fork → 直接就是它的会话 id（send_message 续跑靠它）；
+    //   * ralph → 这是**基名**，第 N 轮的实际 id 是 `<base>-rN`（见 deleg_child_main）；
+    //     它不能进 d.sid（那会骗过 send_message 的「ralph 没有可续的会话」判断）。
     if forced_sid.len > 0 {
-        d.sid = buf_new(forced_sid.len + 8);
-        if buf_valid(&d.sid) {
-            _ = buf_append(&d.sid, forced_sid.ptr, forced_sid.len);
+        if kind == DELEG_KIND_RALPH {
+            d.watch_base = buf_new(forced_sid.len + 8);
+            if buf_valid(&d.watch_base) {
+                _ = buf_append(&d.watch_base, forced_sid.ptr, forced_sid.len);
+            }
+        } else {
+            d.sid = buf_new(forced_sid.len + 8);
+            if buf_valid(&d.sid) {
+                _ = buf_append(&d.sid, forced_sid.ptr, forced_sid.len);
+            }
         }
     }
     d.objective = buf_empty();
@@ -627,6 +791,11 @@ export fn deleg_poll_all(t: &DelegTable) void {
         }
         i = i + 1;
     }
+}
+
+// P42：把 `sub-N`（或裸数字）解析成运行期编号（/watch 用）
+export fn deleg_id_parse(b: &const Buf, out: &i32) bool {
+    return deleg_id_from_buf(b, out);
 }
 
 fn deleg_id_from_buf(b: &const Buf, out: &i32) bool {
