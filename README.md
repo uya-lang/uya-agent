@@ -4,8 +4,8 @@
 多轮 loop 直到给出结论。46 个 `.uya` 文件，**不引入任何 C 代码、`@c_import` 或其它语言**，
 只依赖 Uya 语言与随编译器分发的标准库。
 
-**P0–P41 全部完成**，主线版本串 `p37-model`。本节之后按能力域分节，各节标题保留对应的阶段号
-（P0…P41）；设计取舍、踩坑记录与逐阶段验收分别见 §3 与 §6，代码地图见 §2。
+**P0–P42 全部完成**，主线版本串 `p37-model`。本节之后按能力域分节，各节标题保留对应的阶段号
+（P0…P42）；设计取舍、踩坑记录与逐阶段验收分别见 §3 与 §6，代码地图见 §2。
 
 真机转录节选（`--show-reasoning`；`✻ 思考` 交互模式下先在提示符那一行滚动、块结束才落成一行，
 非交互（管道）没有实时行，只有结算的那一行）：
@@ -70,7 +70,7 @@ make tui-selftest  # 只跑 TUI 那几轮（改界面时最快）
 make sess-selftest # 只跑 /sessions 与大日志 meta 那几轮
 make codegen-audit # 扫构建产物：不许出现「切片描述符 → 字节指针」的强转（终端乱码源头）
 make probe         # 传输层探针：打真实 https 端点，期望 HTTP 401（不需要 key）
-# 离线 e2e（不需要网络）：e2e-permission / e2e-sandbox / e2e-tasks / e2e-goal / e2e-sessions / e2e-resume-big
+# 离线 e2e（不需要网络）：e2e-permission / e2e-sandbox / e2e-tasks / e2e-goal / e2e-sessions / e2e-resume-big / e2e-watch
 
 ```
 
@@ -214,6 +214,7 @@ src/worktreex.uya  Git worktree P37：wt_provision / finish / discard、写闸�
 src/gitdiff.uya    /diff 数据模型 P28：status --porcelain -z + diff -U100000 HEAD
 src/diffx.uya      行级 diff（只服务显示）：LCS 60×60、截断
 src/tasks.uya      任务状态 P25：四表折叠成折叠行 / 箱体 / `/tasks` 文本
+src/watch.uya      P42 /watch：事件渲染（纯函数）+ 子代理会话日志的增量读
 src/view.uya       显示层：标题/参数/后缀表、单行转录、思考行、agents 面板
 src/agent.uya      CLI、历史、主循环、工具分发、REPL、会话事件
 src/selftest.uya   mock LLM + 126 轮断言 + --probe
@@ -239,6 +240,23 @@ src/selftest.uya   mock LLM + 126 轮断言 + --probe
   可见列数由 `view_ag_msg` 按**显示列**算（200 列终端 → 面板 198 列、内容行 194 列正好顶满）。
 * 只收 `status == DELEG_RUNNING`，跑完即隐并补 `[agents] sub-2 [ralph] ✓ idle 27s — ralph loop`。
 * 擦除用逐行 `ESC[2K`（不用 `ESC[J`）；`deleg_agents_refresh` 是唯一刷新入口。
+
+### `/watch`：跟随子代理的实时过程消息（P42）
+
+* **为什么需要**：子代理进程的 fd 1/2 指向 `/dev/null`，管道只承载**终态答复**（P11 的口径），
+  所以面板上那列「已收输出行数」对普通 `subagent` 恒为 0 —— 运行中从管道看不到任何过程消息。
+* **怎么做**：子代理把每个事件都实时（无 stdio 缓冲）落进了自己的会话日志；`/watch sub-N`
+  **按需**去读那份日志，增量渲染成一行一条的过程消息（TUI 浮层 / 滚动模式追加进转录）。
+* **事件**（`watch_render_event` 纯函数，逐字节可断言）：`[turn 开始|结束]`、`[step N]`、
+  `▸ <工具> <参数首行>`、`  ← <结果首行>`、`✻ 思考 · <首行>`、`⏺ <正文首行>`、`[started · 标签]`；
+  未知类型静默跳过（与 `--resume` 的 reader 同口径）。
+* **路径解析**：`subagent` / `subagent_fork` 用父进程预生成的 `d.sid`；`ralph` 第 N 轮的 id 是
+  父子约定的 `<基名>-rN`（`deleg_spawn` 生成基名、`deleg_child_main` 每轮拼 id），轮号由管道里
+  已收的 `[round N]` 推出（marker 是一轮跑完才写的，所以运行时看的是「已见最大 + 1」）。
+* **按键**：`↑/↓` / `pgup/pgdn` / `home/end` 滚正文；默认**贴尾跟随**，一旦上滚就停跟随，
+  `f` 或 `End` 恢复；`esc`/`q` 关闭。子代理进终态时补一行 `[已结束 · <status> <n>s]` 并停止轮询。
+* **三条纪律**：不看不读（没有 active 的 watch 时一个字节都不读盘）；只读（绝不消费 `d.buf`，
+  `subagent_output` 的增量游标不受影响）；内容没变就不重推。
 
 ### preset 旋钮与 make 目标（P13）
 
@@ -313,7 +331,7 @@ src/selftest.uya   mock LLM + 126 轮断言 + --probe
 
 * TTY 交互默认全屏（`--no-tui` 退回滚动；非 TTY / `--quiet` / 子代理自动退回）；`UYA_AGENT_TUI=0|1`、`--color=auto|always|never|16|256`、`--tui-demo [COLSxROWS]`。
 * 键位：`enter` 发送、`ctrl+j` / `alt+enter` 换行、`esc` 中断、`ctrl+c` 中断（2 秒内再按退出）、`ctrl+d` 退出、`shift+tab` 访问模式、`tab` plan、`ctrl+t` 任务块、`ctrl+p` 面板。
-* 浮层：命令面板 / 会话列表 / 帮助 / `/status` / `/goal` / 访问模式 / bash 批准 / plan 审阅 / 行式问答；`/` 触发面板后连 `/` 一起收走。
+* 浮层：命令面板 / 会话列表 / 帮助 / `/status` / `/goal` / `/watch` 跟随 / 访问模式 / bash 批准 / plan 审阅 / 行式问答；`/` 触发面板后连 `/` 一起收走。
 * 数据流：`tty_write` 变 sink，通道 1/2/3 全进转录、fd 1 不写；帧走 `sys_dup(1)` 私有 fd。
 * 光标（修复，踩坑 66）：**运行中输入行照样显示光标并闪动** —— 运行中插入点仍是活的打字目标（敲进去的文本走 steer 收件箱，`ask_user_question` 更是直接用输入行等回答）；只有「运行中且浮层开着」才隐藏（浮层把键全吃掉，插入点不在输入行上）。口径在 `tui_cursor_place()`：`run == IDLE || !tui_overlay_open()`。
 * 记忆上限：条目 ≤ 512、正文 ≤ 4 MiB、单条 ≤ 256 KiB；思考条目尾部 4 KiB、实时行尾部 1 KiB。
@@ -370,6 +388,14 @@ src/selftest.uya   mock LLM + 126 轮断言 + --probe
 * 层序：转录 → 任务块 → agents 箱体 → 状态区 → 面板；折叠态 1 行，箱体最多 6 行。
 * 状态字形 `✓ 完成 / ▸ 进行中 / · 待办`；后台任务 `● running` / `✓ completed` / `✗ completed` / `■ killed`。
 * 面板块上限 8192 字节，超了静默丢弃；文本生成是纯函数（`now_ms` 显式传参）。
+
+### 跟随子代理的实时消息与 /watch（P42）
+
+* 子代理的过程消息走**会话日志**（事件粒度实时），不走管道（管道只有终态答复）。
+* 入口：`/watch sub-N` 开始/切换跟随、`/watch off` 停、裸 `/watch` 列现役子代理。
+* TUI 里是正文浮层（`TUI_OVK_WATCH`，复用 reader 型的滚动与按键，多一个贴尾跟随开关）；
+  滚动模式 `--no-tui` 把新行**追加进转录**（append-only，等同 `tail -f`）。
+* 刷新挂在 1Hz 心跳、阻塞泵点与 TUI 空闲主循环三处；内容逐字节比，没变就不重画。
 
 ### 运行中的命令不再等 step 边界（P30，版本串 `p30-pump`）
 
@@ -713,6 +739,9 @@ DEEPSEEK_API_KEY=sk-xxx ./build/uya-agent \
 | `think-row` | 运行中从左截断、结算从右截断、`--quiet` 零字节、静音窗口 |
 | `reasoning-log` | 日志 `assistant/reasoning` 与 mock 回包逐字节相同 |
 | `subagent-panel` | 只收 running、每行显示列数 = `tty_body_width()`、秒数固定 5 列；P40 贴尾：纯函数 `view_ag_msg`/`view_ag_preview` + 80/40/200 列三档面板（锚一个不少、最新一段可见、消息开头不在板上、宽面板顶满预算） |
+| `watch-render` | P42 `/watch` 事件渲染纯函数：`[step N]`（step 是数字）、`▸ 工具 参数`、`  ← 结果`、`✻ 思考 · 首行`、`⏺ 正文首行`、只有 tool_calls 的消息不单出一行、`step/end` 与未知类型静默跳过 |
+| `watch-poll` | P42 `/watch` 增量读：分批写文件只取新增、**半行不吐**（补齐后才出现）、没有新字节时一个字节都不重渲染 |
+| `watch-e2e` | `make e2e-watch`：真终端 + 假网关派一个「先思考、再跑 `sleep 8` bash」的子代理，`/watch sub-1` 后 `[step …]` 与 `▸ bash …` 必须**在子代理结束之前**上屏 |
 | `session-log` | 控制字节按字节往返、半条记录 `dropped_tail`、重建历史 |
 | `json-escape` | `0x00…0x1f` 全转义、无裸控制字节、`jw_key` 同规则 |
 | `ctrl-bytes` / `ctrl-bytes-resp` | mock mode 23：`printf 'A\000B'` 以 `\u0000` 回请求；判定码 240 |
@@ -732,7 +761,7 @@ DEEPSEEK_API_KEY=sk-xxx ./build/uya-agent \
 **验证用的 make 目标与快捷入口**
 
 - 总闸门：`make selftest`（离线，含 `p30-check` 与全部轮次，SELFTEST PASS / 退出 0）、`make e2e`（真网关）。
-- 离线配套：`make check`（A1 类型检查）/ `build`（A2 产出 `build/uya-agent`）/ `codegen-audit` / `tui-selftest` / `shell-selftest` / `e2e-config-flags` / `e2e-api` / `e2e-steps` / `e2e-permission` / `e2e-sandbox` / `e2e-tasks` / `e2e-goal` / `e2e-sessions` / `e2e-resume-big` / `e2e-title` / `e2e-model` / `e2e-worktree` / `e2e-diff` / `diff-selftest` / `panel-selftest` / `e2e-ws`。
+- 离线配套：`make check`（A1 类型检查）/ `build`（A2 产出 `build/uya-agent`）/ `codegen-audit` / `tui-selftest` / `shell-selftest` / `e2e-config-flags` / `e2e-api` / `e2e-steps` / `e2e-permission` / `e2e-sandbox` / `e2e-tasks` / `e2e-goal` / `e2e-sessions` / `e2e-resume-big` / `e2e-title` / `e2e-model` / `e2e-worktree` / `e2e-diff` / `e2e-watch` / `diff-selftest` / `panel-selftest` / `e2e-ws`。
 - PTY 场景：`make p30-check`（`testdata/pty_drive.py --suite`，8 个场景；P41 那场 `worktree-menu` 走
   两条入口 —— 命令面板里选中 `/worktree` 与裸 `/worktree` —— 到选择框 → ↓ 到 `finish` → 确认框 →
   回车取消，`PTY_DUMP=1` 会把两张框打出来）；
@@ -764,14 +793,14 @@ DEEPSEEK_API_KEY=sk-xxx ./build/uya-agent \
 - P25：空态零影响逐字节；`--tui-demo` 第 ④a/④b/④c 屏是真机产物。
 - P26：`session-6918e8ef` 里模型在 plan 模式直接开工 = 「只有提示词没闸门」；闸门按现场补，把 `plan_blocks_write()` 改恒 `false` 该轮立刻红。
 - P28：真机 A/B：`ctrl+d` 45 s 仍活 → +2.0 s 退出；`esc` 后 `ctrl+d` +0.04 s；两次 `ctrl+c` +0.03 s。
-- P29/P33/P34/P35/P37/P38/P39/P40/P41：见对应轮次与踩坑 50–66；`make selftest` / `make tui-selftest` 全绿、退出 0。
+- P29/P33/P34/P35/P37/P38/P39/P40/P41/P42：见对应轮次与踩坑 50–66；`make selftest` / `make tui-selftest` 全绿、退出 0。踩坑 67 另记（见下一段）。
 - P40：子代理面板状态行改贴尾 —— 真机那一幕是两条 `send_message` 续跑的子代理收到一两百字节的催促，老口径整行从右边截断，屏幕上只剩 `Your output was still far too verbose: 325 lines / 68 KB…`，最新那半句 `…Do a second pass and cut it to under 25 KB.` 正好被切掉；80 列下实测 `│ ● running      53s · 0 · …KB). Do a second pass and cut it to under 25 KB. │`（78 列）、40 列收成 `…r 25 KB.`（38 列）。照 ①把 `view_ag_msg` 改回贴左重编 → G 段红 5 条；②把 `VIEW_AG_MSG_MAX` 改回 160 重编 → 200 列那条腿红 1 条。
 - P41：`/worktree` 补齐选择框。真 PTY（`worktree-menu`）实测：命令面板里选中 `/worktree`（ctrl+p → 敲名字 → 回车）62–65 ms 上框、裸 `/worktree` + 回车 62 ms，框里七行 + `✓ off`（当前模式关）都在，↓ 一次到 `finish`、回车 52–62 ms 翻出 `确认 finish？`（动作框同时消失）；确认框上再回车（默认游标「取消」）什么都没发生。`tui-worktree` 轮的**真 git** 那半：fixture 仓里 provision 出 worktree → 键盘走到 `finish` → 此刻目录与 `phase` 都还是 `READY`（没确认就动不了）→ 取消后主干上没有那个文件 → 把游标挪到 `finish` 那一行确认才 `merged … / removed worktree …`（目录消失、主干上出现文件、`phase=FINISHED`）。照 ①把 `wt_act_needs_confirm` 改成恒 `false` 重编 → 该轮红 18 条（确认框不再出现，`finish` 当场合并并删掉 worktree）；②把默认游标从 `WT_ACT_STATUS` 改成 0 重编 → 红 14 条（「打开就回车 = status」与后面整条键盘路径全崩）。
 - 踩坑 66（运行中输入行没有光标）：真 PTY 逐字节抓帧 —— 修前运行中敲字 1.0 s 内 `ESC[?25l` **20 次 / `?25h` 0 次**（敲进去的 `abc` 确实进了输入行），修后同一场景 **`?25h` 20 次 / `?25l` 0 次**（每帧「定位 + 显示」，与空闲态同一条序列，所以照常闪动）。对照实验（防假绿）：把 `tui_cursor_place()` 的可见性改回 `run == IDLE` 重编，`tui-caret` 四条断言当场红（三态标志位 3 条 + 字节级 1 条），改回来全绿。`--tui-demo` 输出与修前**同目录逐字节相同**（50019 字节，布局没动；只有 cwd 那一栏会随目录变）。
 - 踩坑 67（`/sessions` 选择框卡）：真 PTY（100 列）逐次量「按一次 ↑ → 下一帧到屏」。修前 842 个会话：打开浮层 1617 ms、底部按 ↑ 1617 ms，而**同一张浮层 HOME 跳到顶上只要 85 ms** —— 慢的是「跨多少项」而不是解析。修后同场景：打开 46 ms、按 ↑ 10 ms。数据侧 `--list-sessions` 12800 行：升序 1475 → 205 ms、降序 192 → 207 ms（修前两种顺序差 7.7×，修后拉平）。等价性：`--list-sessions` 在冻结索引 + 9 份合成夹具上逐字节相同；`--tui-demo` 逐字节相同（50019 字节）。防假绿对照实验：①把 `tui_ov_row_at` / `tui_ov_item` 的取行改回线性扫描重编 —— 逐字节比对与成帧预算**仍然绿**（兜底与查表结果一样），补了「查表 vs 扫描差分 + 取末项 20000 次自校准比值」后当场红（查表腿 vs 扫描腿 = 1 ms : 8166 ms，退回扫描后 ≈1:1）；②把 `sess_idx_before` 的 `lastActiveAt` 次级键写反重编 —— `sess-list-big` 立刻红（与金标准不符）；③行偏移表初版拿「下一行起点减一」当终点，末行多出 1 字节 ⇒ `--tui-demo` 逐字节对照当场红（reader 浮层末行多占一列、右边框被顶出去），改成存「每行的终点」后恢复。
 - 其它：自测幂等（连跑两次都 PASS）；A1–A6 全部通过；技能与 `web_search`、自动压缩、后台任务、文件工具、DSH 零参数启动、跨进程会话恢复（记住 4271）都在真机验收过。
 
-> 分阶段验收记录的详细现场（P1–P41 的 before/after 命令与截图、真机对照实验、被自测当场抓住的自身缺陷）已在此压缩，原始描述保留在 §3 踩坑 33–67 与各版本提交说明中。
+> 分阶段验收记录的详细现场（P1–P42 的 before/after 命令与截图、真机对照实验、被自测当场抓住的自身缺陷）已在此压缩，原始描述保留在 §3 踩坑 33–67 与各版本提交说明中。
 
 ---
 
@@ -789,8 +818,15 @@ DEEPSEEK_API_KEY=sk-xxx ./build/uya-agent \
   `send_message` 时的任务或催促，只取首行、空白折叠、超长贴尾）；子代理的 stdout 按 P11 的口径
   **只在跑完时**才回传管道，所以「它刚刚说了什么」得等终态或 `subagent_output`（面板上那个
   `· N` 是已收输出行数，运行中通常是 0）。贴尾只收窄**显示**，`Deleg.prompt` 本身一个字节不动。
+* **`/watch` 的实时粒度是「事件」，不是 token 级（P42）**：它读的是子代理的会话日志，而
+  `assistant/reasoning` 与 `assistant/message` 都在**步末**才落盘 —— 所以单个长 step 内部
+  （模型正在流式吐字的那几秒到几十秒）日志不增长，屏幕上不会长出新行。那段时间能看到的实时
+  信号是「正在跑哪个工具」（`tool/call` 在工具**执行前**写）以及面板上的秒数。想逐字看流式，
+  只有在前台跑（交互模式）才有。
+  另外：`/watch` 是**进程状态**（`--resume` 不回填）；被跟随的子代理跑完或槽位被回收时跟随自动
+  结束；`ralph` 跟随的是**当前轮**的日志，换轮时插一行 `[轮次切换]` 并从新日志头开始读。
 * **回合运行中的界面命令（P23 → P30 → P31）**：只读命令（`/status`、`/help`、`/tasks`、
-  `/sessions`、`/goal`、`/diff`）在每个泵点当场派发并当场画一帧；`/new`、`/resume` 立刻回执并
+  `/sessions`、`/goal`、`/diff`、裸 `/watch`）在每个泵点当场派发并当场画一帧；`/new`、`/resume` 立刻回执并
   先中断当前回合（历史保留），`/compact` 排 step 边界，`/continue`、`/exit` 与其余命令等回合结束
   （steer 仍是「运行中输入的文本在下一个 step 边界被采纳」）。**插不进泵点的只有两段**：
   DNS 解析（≤5 s）与 TLS 握手（≤`timeout_ms`），都在工具链调用内部。
