@@ -313,6 +313,7 @@ src/selftest.uya   mock LLM + 126 轮断言 + --probe
 * 键位：`enter` 发送、`ctrl+j` / `alt+enter` 换行、`esc` 中断、`ctrl+c` 中断（2 秒内再按退出）、`ctrl+d` 退出、`shift+tab` 访问模式、`tab` plan、`ctrl+t` 任务块、`ctrl+p` 面板。
 * 浮层：命令面板 / 会话列表 / 帮助 / `/status` / `/goal` / 访问模式 / bash 批准 / plan 审阅 / 行式问答；`/` 触发面板后连 `/` 一起收走。
 * 数据流：`tty_write` 变 sink，通道 1/2/3 全进转录、fd 1 不写；帧走 `sys_dup(1)` 私有 fd。
+* 光标（修复，踩坑 66）：**运行中输入行照样显示光标并闪动** —— 运行中插入点仍是活的打字目标（敲进去的文本走 steer 收件箱，`ask_user_question` 更是直接用输入行等回答）；只有「运行中且浮层开着」才隐藏（浮层把键全吃掉，插入点不在输入行上）。口径在 `tui_cursor_place()`：`run == IDLE || !tui_overlay_open()`。
 * 记忆上限：条目 ≤ 512、正文 ≤ 4 MiB、单条 ≤ 256 KiB；思考条目尾部 4 KiB、实时行尾部 1 KiB。
 
 ### 运行中的状态区与思考实时行（P18）
@@ -523,6 +524,7 @@ src/selftest.uya   mock LLM + 126 轮断言 + --probe
 63. **自测「关掉 TUI」要关对开关**：`tui_set_headless(on)` 只置 `g_tui_headless`，而 `tui_active()` 看 `g_tui_on`，只有 `tui_headless_enable(on)` 两个都置；按模式分叉的断言先断言「真在这个模式里」。孪生：headless 轮须自开 `tty_sink_on = true`。
 64. **uya 的 `{ }` 块在生成的 C 里不是作用域**：同一函数里同名局部变量（`win_round` 的 A0 `pb` 与新 G 段 `pb`）在**平铺的 C 函数体**里直接 `redefinition of 'pb'`，而 `make build` 末尾只报「链接失败」（cc 的真错埋在编译日志里、`-o` 那步根本没跑到）——看到「链接失败」先去 `build/uyacache/**/<file>.c` 里找 cc 报错；同一 `.uya` 函数里的局部名当全局取（本轮一律 `p40_` 前缀）。
 65. **浮层开着就会盖住转录 → 「结果落进转录」的断言必须先关浮层**：headless 自测里 `tui_build()` 画的是一整帧，底对齐菜单正好压在转录最新那几行上，`tuis_screen_has("…")` 于是永远看不到刚写进去的 notice（P41 的 `tui-worktree` 轮实测：选 `on` 之后模式真翻了、文本也真写进了 `tui_add_notice`，断言照样红）。孪生：`tui_overlay_kind()` 在 `take` 之后回的是**结果**的 kind，所以「直接造一行 Buf 喂给 handler」之前必须先开一次浮层 —— 否则读到的是上一张浮层的 kind。
+66. **运行中把输入行的光标藏了 → 「能打字却看不见光标」**：`tui_cursor_place()` 按 `g_tui_run == TUI_RUN_IDLE` 决定可见性，于是 `THINK`/`STREAM`/`TOOL` 期间 `tui_flush()` **每帧**补一个 `ESC[?25l`（真 PTY 实测运行中敲字 20×`?25l` / 0×`?25h`），而运行中插入点仍是活的打字目标（steer 收件箱、`ask_user_question` 用输入行等回答）⇒ 屏幕上没有插入点。可见性**只跟浮层走**：`run == IDLE || !tui_overlay_open()`；判定要看字节（冒烟只看标志位会把 `tui_flush` 那段改坏了还判绿）。同族陷阱：光标错误按**状态**而非**焦点**开关。
 
 ---
 
@@ -610,6 +612,7 @@ DEEPSEEK_API_KEY=sk-xxx ./build/uya-agent \
 | `tui-keys` | UTF-8 逐字符编辑、切开的 `ESC [ D`、Ctrl-J、↑历史、tab plan、面板、Ctrl-D/Ctrl-C、`tui_abort_state()` 三档 |
 | `tui-turn` | headless 端到端：用户条目、`✓ Write`/`✓ Bash(`、最终答案、状态区收掉无残影；脚注含 `1 轮 · ` |
 | `tui-status` | 常驻状态区 + 思考实时行：铺满后仍钉住、只显示 `latestLine`、空闲 0 行、窄终端退化 |
+| `tui-caret` | 踩坑 66：运行中（思考/输出/工具）输入行有光标（标志位 + 字节级 1×`?25h`/0×`?25l`）；空闲与「空闲+浮层」两格不变；运行中开浮层仍隐藏（1×`?25l`/0×`?25h`） |
 | `tui-p30` | 泵点当场派发只读命令、`/new` 立刻回执、`/compact` 留 step 边界；真 PTY `/status` ≤800 ms（`mock_mode=40`） |
 | `tui-p31` | 派发后同一次调用帧数 +1、结果留给主循环；真 PTY ≤800/≤150/≤300 ms |
 | `tui-cmd` | 面板 ↔ `/status` 浮层：输入行不留 `/`、标题逐字节、正文层无 NUL、运行中 step 边界派发 |
@@ -753,12 +756,13 @@ DEEPSEEK_API_KEY=sk-xxx ./build/uya-agent \
 - P25：空态零影响逐字节；`--tui-demo` 第 ④a/④b/④c 屏是真机产物。
 - P26：`session-6918e8ef` 里模型在 plan 模式直接开工 = 「只有提示词没闸门」；闸门按现场补，把 `plan_blocks_write()` 改恒 `false` 该轮立刻红。
 - P28：真机 A/B：`ctrl+d` 45 s 仍活 → +2.0 s 退出；`esc` 后 `ctrl+d` +0.04 s；两次 `ctrl+c` +0.03 s。
-- P29/P33/P34/P35/P37/P38/P39/P40/P41：见对应轮次与踩坑 50–65；`make selftest` / `make tui-selftest` 全绿、退出 0。
+- P29/P33/P34/P35/P37/P38/P39/P40/P41：见对应轮次与踩坑 50–66；`make selftest` / `make tui-selftest` 全绿、退出 0。
 - P40：子代理面板状态行改贴尾 —— 真机那一幕是两条 `send_message` 续跑的子代理收到一两百字节的催促，老口径整行从右边截断，屏幕上只剩 `Your output was still far too verbose: 325 lines / 68 KB…`，最新那半句 `…Do a second pass and cut it to under 25 KB.` 正好被切掉；80 列下实测 `│ ● running      53s · 0 · …KB). Do a second pass and cut it to under 25 KB. │`（78 列）、40 列收成 `…r 25 KB.`（38 列）。照 ①把 `view_ag_msg` 改回贴左重编 → G 段红 5 条；②把 `VIEW_AG_MSG_MAX` 改回 160 重编 → 200 列那条腿红 1 条。
 - P41：`/worktree` 补齐选择框。真 PTY（`worktree-menu`）实测：命令面板里选中 `/worktree`（ctrl+p → 敲名字 → 回车）62–65 ms 上框、裸 `/worktree` + 回车 62 ms，框里七行 + `✓ off`（当前模式关）都在，↓ 一次到 `finish`、回车 52–62 ms 翻出 `确认 finish？`（动作框同时消失）；确认框上再回车（默认游标「取消」）什么都没发生。`tui-worktree` 轮的**真 git** 那半：fixture 仓里 provision 出 worktree → 键盘走到 `finish` → 此刻目录与 `phase` 都还是 `READY`（没确认就动不了）→ 取消后主干上没有那个文件 → 把游标挪到 `finish` 那一行确认才 `merged … / removed worktree …`（目录消失、主干上出现文件、`phase=FINISHED`）。照 ①把 `wt_act_needs_confirm` 改成恒 `false` 重编 → 该轮红 18 条（确认框不再出现，`finish` 当场合并并删掉 worktree）；②把默认游标从 `WT_ACT_STATUS` 改成 0 重编 → 红 14 条（「打开就回车 = status」与后面整条键盘路径全崩）。
+- 踩坑 66（运行中输入行没有光标）：真 PTY 逐字节抓帧 —— 修前运行中敲字 1.0 s 内 `ESC[?25l` **20 次 / `?25h` 0 次**（敲进去的 `abc` 确实进了输入行），修后同一场景 **`?25h` 20 次 / `?25l` 0 次**（每帧「定位 + 显示」，与空闲态同一条序列，所以照常闪动）。对照实验（防假绿）：把 `tui_cursor_place()` 的可见性改回 `run == IDLE` 重编，`tui-caret` 四条断言当场红（三态标志位 3 条 + 字节级 1 条），改回来全绿。`--tui-demo` 输出与修前**同目录逐字节相同**（50019 字节，布局没动；只有 cwd 那一栏会随目录变）。
 - 其它：自测幂等（连跑两次都 PASS）；A1–A6 全部通过；技能与 `web_search`、自动压缩、后台任务、文件工具、DSH 零参数启动、跨进程会话恢复（记住 4271）都在真机验收过。
 
-> 分阶段验收记录的详细现场（P1–P41 的 before/after 命令与截图、真机对照实验、被自测当场抓住的自身缺陷）已在此压缩，原始描述保留在 §3 踩坑 33–65 与各版本提交说明中。
+> 分阶段验收记录的详细现场（P1–P41 的 before/after 命令与截图、真机对照实验、被自测当场抓住的自身缺陷）已在此压缩，原始描述保留在 §3 踩坑 33–66 与各版本提交说明中。
 
 ---
 
