@@ -4,15 +4,13 @@
 多轮 loop 直到给出结论。全部代码 38 个 `.uya` 文件，**不引入任何 C 代码、`@c_import` 或其它语言**，
 只依赖 Uya 语言与随编译器分发的标准库。
 
-**P0–P26 全部完成**（**P26 是「退不出」修复**：运行中的 `esc`/`ctrl+c`/`ctrl+d`/`/exit`
-必须**当场**生效，版本串 `p26-quit`，见 §2「退出与中断」与 §3 踩坑 44；P15、P21 这两个编号
-各被两条并行线用过一次，P22/P23/P24 也是
-并行线前后脚合的流：P21 的一条是**三级访问模式 + 内核沙箱**（机器名与 DSH
+**P0–P27 全部完成**（**P27 是「退不出」修复**：运行中的 `esc`/`ctrl+c`/`ctrl+d`/`/exit`
+必须**当场**生效，版本串 `p27-quit`，见 §2「退出与中断」与 §3 踩坑 45；P15、P21 这两个编号各被两条并行线用过一次，P22/P23/P24 也是并行线前后脚合的流：P21 的一条是**三级访问模式 + 内核沙箱**（机器名与 DSH
 permission-presets 一致，见「访问模式」/「沙箱」两节，版本串 `p21-perm`）、另一条是
 **终端标题**（合流时按后到的编号记成 **P22**，版本串 `p22-title`）；P22 之后到的是
 **命令面板与 `/status` 浮层这条链**（合流时记成 **P23**，见 §3 踩坑 40）；再后到的是
 **脚注的 `内存` 字段 + 首 token 打点口径**（合流时记成 **P24**，版本串 `p24-mem`，
-见 §3 踩坑 41）；P15 的一条是「请求体控制字节全转义 +
+见 §3 踩坑 41）；**任务状态 /tasks + 常驻任务块**记成 **P25**（版本串 `p25-tasks`）；本条线（**plan 模式写闸门 + `exit_plan_mode` 审阅浮窗**）按后到的编号记成 **P26**（版本串 `p26-plan`，见「plan 模式：写闸门与审阅浮窗」一节）；P15 的一条是「请求体控制字节全转义 +
 默认走 Responses 接口」（落点见 §3 踩坑 27、§2 的 `jsonx.uya`/`session.uya`、§6 的
 `json-escape` / `ctrl-bytes*`）、一条是**子代理窗口面板**（§2 的「子代理窗口面板（并行线的 P15）」，
 踩坑 29））；
@@ -88,6 +86,12 @@ DSH `permission.defaultPreset`），read-only 下 `write`/`edit` 硬拒、`bash`
 会话目标（`active 3/20 · objective`）；输入行上方常驻一块**任务块**，默认折叠成 1 行
 （`▸ 任务 2/5 40% · 后台 1/3 · 子代理 2/4 · 目标 3/20`），`ctrl+t`（或 `/tasks open|close`）展开成带
 边框的清单箱体；没有任务时一个字节都不画（布局与 P21 之前逐字节相同）。
+**P26 把 plan 模式从「提示词里的软引导」变成真的闸门与审阅**：plan 模式下 `write`/`edit` 硬拒
+（全权模式也一样），模型要动手只能先用 `exit_plan_mode` 交计划；交计划时 TUI 弹出**审阅浮窗**
+（`计划待审 · 第 a 行/共 b 行` + 可滚动的完整计划 + 一行选中项说明 + `继续讨论 / 解决 / 确认执行`
+三个动作），三个动作分别对应「改一版再弹」「关掉浮窗、你直接说话」「退出 plan 模式开始动手」，
+`esc` 等同「解决」，没人回答一律**不批准**。运行中切 plan 模式还会给模型补推一份新的运行时
+上下文快照（不然模型下一轮看到的仍是旧状态）。
 
 ```
 $ ./build/uya-agent --show-reasoning "在当前工作目录写 p15-demo.txt，三行 alpha / beta / gamma；然后用 bash 打印它，并告诉我第二行。"
@@ -172,7 +176,7 @@ export UYA_SPLIT_C_DIR=$PWD/build/uyacache      # 多文件 C 缓存别丢在仓
 | `--list-dsh-sessions` | 列出 DSH 自己的会话（`<DSH_HOME>/sessions`，含 zstd） |
 | `--resume-dsh ID` | 导入 DSH 会话并继续（id 前缀 ≥8 字符即可） |
 | `--yaml-dump FILE` | 打印该 YAML 的解析结果（诊断） |
-| `--plan` | 以 plan 模式启动（先出计划、批准后再执行） |
+| `--plan` | 以 plan 模式启动（先出计划、批准后再执行）；P22 起 plan 模式**真的拦写**，非交互会话（管道/CI）里没有审阅渠道 ⇒ 只产出计划、写工具始终被拒 |
 | `--permission MODE` | **访问模式**（P21）：`read-only` / `workspace-write` / `danger-full-access`（默认）。也收 `--permission=<MODE>`；非法值报错退出。来源优先级 CLI > `UYA_AGENT_PERMISSION` > DSH `permission.defaultPreset`，见「访问模式」一节 |
 | `--no-sandbox` | 关掉 bash 的内核沙箱（bwrap）：confined 模式不再套壳、也不再 fail closed（启动打一行警告） |
 | `--bwrap PATH` | 指定 bwrap 可执行文件（默认探测 `/usr/bin/bwrap`、`/bin/bwrap`、`/usr/local/bin/bwrap`） |
@@ -191,7 +195,7 @@ export UYA_SPLIT_C_DIR=$PWD/build/uyacache      # 多文件 C 缓存别丢在仓
 | `--tui` | 全屏 TUI（**TTY 交互模式默认**）；`--no-tui` 退回滚动转录；`UYA_AGENT_TUI=0|1` 同口径。运行中的状态区（spinner + 思考实时行）钉在输入面板正上方，关掉它的方式就是 `--no-tui` / `--quiet` |
 | `--title` | 交互模式（TUI / 滚动 REPL）下把**终端标题**写成当前会话标题（**默认开**，见「终端标题」一节）；`--no-title` / `UYA_AGENT_TITLE=0` 关掉整件事；一次性运行与非 TTY 路径本来就不写 |
 | `--color=MODE` | `auto`（默认）/ `always` / `never` / `16` / `256`；`NO_COLOR` 也认 |
-| `--tui-demo` | 打印 TUI 的 home / chat / 运行中 三屏纯文本快照后退出（诊断 + 文档） |
+| `--tui-demo` | 打印 TUI 的 home / chat / 运行中 三屏 + 常驻任务块两帧（折叠 / 展开）+ **plan 审阅浮窗**一帧的纯文本快照后退出（诊断 + 文档） |
 | `--max-tokens N` | 发送 `max_tokens`（默认不发送） |
 | `--temperature N` | 发送 `temperature`（默认不发送，对齐 DSH） |
 | `--tls-verify=chain\|pin\|none` | TLS 信任策略，默认 `chain`，见第 5 节 |
@@ -244,6 +248,7 @@ src/sigx.uya      信号层（P17）：直接绑宿主 glibc `sigaction`（绕�
                   离开备用屏幕）再 128+sig 退出；SIGWINCH → 只置标志；`sigx_reset_for_child()` 给 fork 子进程
 src/tui.uya       全屏 TUI（P17/P18）：帧模型（行=段序列，逐行 diff 重绘）、备用屏幕进出、
                   **访问模式 chip 与底对齐选择浮层、阻塞式确认（tui_confirm_wait）**、
+                  **P22 reader 浮层（tui_reader_wait：计划审阅 —— 可滚动正文 + 三动作）**、
                   转录条目（用户/助手/思考/工具/诊断）、轻量 markdown、输入编辑器（按字符编辑、
                   多行、历史、括起粘贴）、键解码（分片转义序列）、浮层（命令面板/会话/帮助/问答）、
                   sink 通道与清洗、滚动与尾随、帧节流；P18 再加**常驻状态区**（钉在输入面板正
@@ -258,11 +263,12 @@ src/tuiselftest.uya TUI 的自测轮次（tui-frame / tui-keys / tui-sink / tui-
                   （末尾 3 列空白）与 `ctx` / `cpu` / `内存` 三档让位顺序，
                   P22 起 tui-pty 与 tty-title-pty 还逐字节断言终端标题；
                   tui-frame 现在还逐行量**浮层方框**的左右边界列——长行把右边框顶出去那类
-                  缺陷（踩坑 42）只有它会红）
+                  缺陷（踩坑 42）只有它会红；P26 起加 tui-plan：审阅浮窗排版/滚动/三动作/数字直选 +
+                  headless fail closed + 真 PTY 批准与解决）
 src/inbox.uya     输入收件箱：steer（运行中输入的文本，step 边界领取）+ keepInbox 语义
 src/yamlcfg.uya   自带 YAML 子集解析器：去注释（块标量/引号感知）、中和 `!!tag`、
                   block/flow 映射与序列、`|`/`>` 块标量、跨行 flow 集合、节点池树 + 导航
-src/fsx.uya       文件工具：路径解析（可选工作区守卫）、**read-only 模式下 write/edit 硬拒**、
+src/fsx.uya       文件工具：路径解析（可选工作区守卫）、**read-only / plan 模式下 write/edit 硬拒**、
                   (mtime,size) 版本、观察状态表、
                   read（**流式窗口** `fs_read_window`：真 total + 只缓冲选中行 + 行号 + 三种
                   footer + 行长/字节上限）、write（createIfAbsent / replaceIfVersion）、
@@ -297,7 +303,8 @@ src/prompt.uya    system prompt 分节装配（order 排序 / 空节丢弃 / `\n
 src/instr.uya     AGENTS.md / CLAUDE.md 发现（用户全局 → 项目根 → cwd，由广到窄）、
                   预算截断（65536 字节，从最广端丢）、`<system-reminder>` 渲染
 src/todo.uya      todo_write：整表替换、content/去重/状态校验、计数回显
-src/plan.uya      plan 模式状态机 + exit_plan_mode（非 plan 模式报错、`# ` 开头的计划、CLI 审批）
+src/plan.uya      plan 模式状态机 + **写闸门**（plan_blocks_write，进程级镜像供工具层查询）+
+                  exit_plan_mode（非 plan 模式报错、`# ` 开头的计划、三裁决审阅：浮窗 / CLI y-N / 无渠道）
 src/perm.uya      访问模式（P21，对齐 DSH permission-presets）：三级 read-only / workspace-write /
                   danger-full-access（机器名与 DSH 一致）、显示名与产品名、策略真值表
                   （confine / allows_write / requires_approval），进程级当前值
@@ -345,8 +352,10 @@ src/agent.uya     CLI、环境变量、消息历史、请求组装、主循环�
                   P19 再加 `out_diag`（外来字节诊断的**唯一**出口：一行转义预览 + 截断后缀，
                   全文进会话日志 `diag/dump`，`--debug-dump` 落原始字节）；
                   P21 再加 `/permission`、`agent_set_access`（切模式 + 推新运行时上下文快照 + 落日志）
-                  与访问模式浮层的结果处理（Full access 过第二道确认）
-src/selftest.uya  --selftest 的 mock LLM（含 SSE 受控切分）+ 80 轮断言 + --probe
+                  与访问模式浮层的结果处理（Full access 过第二道确认）；
+                  P26 再加 `agent_plan_apply` / `agent_plan_force`（plan 模式切换的唯一入口）与
+                  `agent_plan_snapshot_sync`（step 边界补推运行时上下文快照 —— 运行中切模式模型也得知道）
+src/selftest.uya  --selftest 的 mock LLM（含 SSE 受控切分）+ 84 轮断言 + --probe
                   （P17 又加了源文件里的 4 轮信号 + 5 轮 TUI，P18 再加 1 轮 `tui-status`，
                   P19 再加 3 轮诊断，P20 再加 9 轮统计/进程 CPU，P21 再加 7 轮访问模式/沙箱，
                    P22 再加 1 轮 `title-format` + 1 轮 `tty-title-pty`，
@@ -481,7 +490,7 @@ TTY/ANSI 代码），所以这里是把**那套内容模型搬到滚动终端**�
 * `make` 目标：`check` / `build` / `selftest`（离线 33 轮）/ `probe` / `e2e TASK=… [PIN=…]`（真实网关）/
   `e2e-config`（零参数打印生效配置）/ `e2e-dsh`（列 DSH 会话）/ `e2e-title`（终端标题开关四条回归，
   P22）/ `e2e-permission` / `e2e-sandbox`（P21 访问模式与沙箱）/ `tui-selftest`（只跑 TUI 轮）/
-  `tui-demo`（打印 TUI 三屏纯文本快照）。
+  `tui-demo`（打印 TUI 的几屏纯文本快照：home / chat / 运行中 / 常驻任务块 / plan 审阅浮窗）。
 
 ### workflow：Uya 脚本 + 钩子代理（P12）
 
@@ -583,11 +592,16 @@ Messages API（`x-api-key` + `anthropic-version: 2023-06-01`，服务端工具 `
   超预算从最广端丢弃，渲染成 `<system-reminder>…</system-reminder>` 的 user 消息（首次请求前注入）。
 * **todo_write**：整表替换；回显 `Updated todo list: N pending, N in progress, N completed.`；
   重复 content / 空 content / 非法 status 都会被拒；列表不回注上下文（与 DSH 一致）。
-* **plan 模式**：`exit_plan_mode` 两种模式都注册（工具目录稳定），非 plan 模式调用报
-  `exit_plan_mode is only available in plan mode`，计划必须以 `# ` 开头；批准走 CLI 问答
-  （`y/N`），批准后退出 plan 模式。`--plan` 以 plan 模式启动，REPL 里 `/plan` 切换。
+* **plan 模式（P22 起是闸门 + 审阅）**：`exit_plan_mode` 两种模式都注册（工具目录稳定），
+  非 plan 模式调用报 `exit_plan_mode is only available in plan mode`，计划必须以 `# ` 开头；
+  plan 模式下 `write`/`edit` 硬拒（见「plan 模式：写闸门与审阅浮窗」一节），
+  bash 仍按访问模式走。审阅三裁决：TUI 浮窗（`继续讨论` / `解决` / `确认执行`）、
+  滚动模式 `y/N`、无渠道（管道/CI、子代理、浮窗画不出来）→ 回「没有渠道」且**不退模式**。
+  `--plan` 以 plan 模式启动，REPL 里 `/plan` 切换；运行中切换会给模型补推一份新的运行时
+  上下文快照（否则模型下一轮看到的仍是旧状态）。
 * **ask_user_question**：交互模式下复用行编辑器（带选项编号），非交互读一行；
   读到 EOF 时返回 `(no answer channel: the user could not be asked)` 而不是挂死。
+  （仍是行式问答 —— 只有 `exit_plan_mode` 有浮窗，见 §7 已知限制。）
 
 ### bash 与后台任务（P7，对齐 DSH tool-bash + tool-jobs）
 
@@ -755,10 +769,10 @@ TTY 交互模式**默认全屏**（`--no-tui` 退回上一节的滚动转录；�
 
   ▌ ↑ Ask anything... "把 hello.uya 的问候语改成 Hello, DSH!"
   ▌ Build   Full access   deepseek-chat   deepseek  tab plan   ctrl+p commands
-  ~/uya-agent:main                                                                 p25-tasks
+  ~/uya-agent:main                                                                 p26-plan
 ```
 
-对话态（`--tui-demo` 打印的就是这三屏的纯文本快照）：
+对话态（`--tui-demo` 打印的就是这几屏的纯文本快照）：
 
 ```
     ▎ 你
@@ -798,10 +812,43 @@ TTY 交互模式**默认全屏**（`--no-tui` 退回上一节的滚动转录；�
 
 （第 1 行是状态、第 2 行是思考实时文本 —— 它按显示列**从左边**截断，屏幕上留下的是**最新**的那一段。）
 
+plan 审阅浮窗（`--tui-demo` 的**第 ⑤ 屏**，任务块那两帧是 ④a/④b）：模型交出计划时弹在转录区中间 —— 标题栏是
+`计划待审 · 第 a 行/共 b 行`，正文是完整计划（markdown-lite，可滚动），最后两行是
+**选中项说明**与**三个动作**（`▸` 标当前选中；无色模式下 `TUI_ST_SEL` 不产生 SGR，所以
+前缀不能省）：
+
+```
+           ╭─ 计划待审 · 1/18 ──────────────────────────────────────────────────────────╮
+           │ # 把 hello.uya 的问候语改成 Hello, DSH!                                    │
+           │                                                                            │
+           │ ## 第一步：读现状                                                          │
+           │ · 读 hello.uya，确认现在的问候语是 Hello, Uya!                             │
+           │ · 顺手看一眼 Makefile 里有没有别处引用这个字符串                           │
+           │                                                                            │
+           │ ## 第二步：改一行                                                          │
+           │ · 只动那一行字面量，不动缩进与分号                                         │
+           │ · 用 edit 工具替换，避免整文件重写带来的 diff 噪音                         │
+           │                                                                            │
+           │ ## 第三步：验证                                                            │
+           │ · 编译并运行：期望输出 Hello, DSH!                                         │
+           │ · 跑一次 make check，确认没有连带影响                                      │
+           │                                                                            │
+           │ ## 风险与回滚                                                              │
+           │ · 风险只有一处字符串，回滚就是把这一行改回去                               │
+           │ 留在 plan 模式：模型按你的反馈改一版，再弹一次这个浮窗                     │
+           │ ▸ 继续讨论     解决     确认执行                                           │
+           ╰────────────────────────────────────────────────────────────────────────────╯
+
+  ▌ ↑ Ask anything... "把 hello.uya 的问候语改成 Hello, DSH!"
+  ▌ Plan   Full access   deepseek-chat   deepseek   tab plan   shift+tab access   ctrl+p commands   ctrl+t tasks
+  ~/uya-agent:main · ctx 21% · cpu 37% · 内存 312M    1 轮 · 12 步 | LLM 50.7s · 工具调用 4.1s | 首 token 平均 1.5s · 221 tok/s | 缓存命中 71%…
+```
+
 * **开关**：`--tui`（默认）/ `--no-tui` / `UYA_AGENT_TUI=0|1`；
   `--color=auto|always|never|16|256` 与 `NO_COLOR`（无色时只留粗体/暗色）；
-  `--tui-demo [COLSxROWS]` 打印 home / chat / 运行中 三屏纯文本（诊断 + 文档；默认画布
-  160×40，窄终端可以 `--tui-demo 100x30` 看脚注的退化形态）。
+  `--tui-demo [COLSxROWS]` 打印 home / chat / 运行中 三屏 + 常驻任务块两帧（④a 折叠 / ④b 展开）
+  + **⑤ plan 审阅浮窗**一帧的纯文本快照（诊断 + 文档；默认画布 160×40，窄终端可以
+  `--tui-demo 100x30` 看脚注的退化形态）。
 * **运行中的状态区（P18）**：见下一小节。
 * **退出与中断（P26）**：见后面「退出与中断：任何时刻都退得出去（P26）」一节 ——
   三条退出路径（`ctrl+d` / `/exit` / 运行中二次 `ctrl+c`）在**回合跑着的时候**也必须立即生效。
@@ -813,9 +860,12 @@ TTY 交互模式**默认全屏**（`--no-tui` 退回上一节的滚动转录；�
   括起粘贴（`ESC[200~`）整段插入不触发提交（> 64 KiB 截断）。
 * **浮层**：命令面板、会话列表（选一个 `/resume`）、帮助（`/help`）、`/status` 详情、
   **访问模式选择器与 Full access 确认**（P21，底对齐，贴着输入面板往上弹）、
-  **read-only 下 bash 的逐条批准**（P21），以及 `ask_user_question` / `exit_plan_mode` 的
-  问答弹窗（↑/↓ + enter，esc = 无回答）。`/help` 走的就是这里说的帮助**浮层**（不是滚动
-  模式的纯文本帮助）；`/exit`（同 `/quit`）在面板里选中或直接输入都会退出 ——
+  **read-only 下 bash 的逐条批准**（P21：↑/↓ + enter，esc = 无回答）、
+  **plan 审阅浮窗**（P26：reader 型浮层，↑/↓/pgup/pgdn 滚正文、tab/←/→ 切动作、
+  1/2/3 直选、enter 确认、esc = 解决；见「plan 模式：写闸门与审阅浮窗」一节），
+  以及 `ask_user_question` 的**行式**问答（带编号选项 —— 它没有浮层，见 §7）。
+  `/help` 走的就是这里说的帮助**浮层**（不是滚动模式的纯文本帮助）；
+  `/exit`（同 `/quit`）在面板里选中或直接输入都会退出 ——
   命令的返回值就是「停」，三种入口（面板 / steer / 普通提交）都尊重它。
   浮层里 `↑/↓` 选条目、`pgup/pgdn/home/end` 滚内容（P23：内容比框高时标题栏右侧给
   `↑`/`↓` 溢出指示），回车取选中项、esc 取消。换成面板打字时会**过滤**条目；
@@ -1175,11 +1225,72 @@ $ ./build/uya-agent            # 进 TUI
 $ printf '\e]2;x\a'            # 手测终端本身吃不吃 OSC 2（能看到标签页标题变 x 就支持）
 ```
 
-#### 退出与中断：任何时刻都退得出去（P26）
+### plan 模式：写闸门与审阅浮窗（P26）
+
+plan 模式原来只是**提示词里的软引导**：system prompt 里加一段（来自 DSH preset 的 `plan-mode.section`）、
+运行时上下文加一句 `Plan mode is active`，此外什么都没有 —— 模型完全可以不调 `exit_plan_mode`
+就直接开工，审阅浮窗就永远不会出现（真机现场见踩坑 44）。P26 把它补齐成两件事：
+
+**① 写闸门（工具层）**。plan 模式下 `write` / `edit` 直接回：
+
+```
+Error: write is refused in plan mode (no file changes before the user approves the plan). Do not retry; present the complete plan through exit_plan_mode first.
+Error: edit is refused in plan mode (no file changes before the user approves the plan). Do not retry; present the complete plan through exit_plan_mode first.
+```
+
+* 判据是 `plan_blocks_write()`（`plan.uya` 里的进程级镜像，与 `perm.uya` 的 `g_perm` 同款）；
+  检查排在 `read-only` 那道之前 —— 当前最直接的障碍是「计划还没批」，文案也最能指路。
+* **只看写文件**：`read` / `glob` / `grep` / `bash` / `todo_write` 都不拦。bash 归访问模式
+  （P21）管，plan 阶段照样要能跑 `git status`、读测试、看构建。这与 DSH 的立场一致：
+  plan mode 是引导而非沙箱，我们只把「改文件」这一条硬起来。
+* plan 模式是**进程级**状态，fork 出来的子代理会继承它（与它们本来就会继承 `g_plan.active`
+  的提示词段一致）：父进程在 plan 模式下，子代理也写不了文件。
+
+**② 审阅浮窗（reader 型浮层）**。模型调 `exit_plan_mode` 时：
+
+| 动作 | 语义 | 回到模型的工具结果 |
+|---|---|---|
+| `继续讨论`（默认光标） | 不认可：留在 plan 模式，按反馈改一版再弹一次 | `The user chose to keep planning; revise the plan and present it again.` |
+| `解决`（`esc` 同义） | 关掉浮窗、留在 plan 模式，**模型停下等你直接在输入框里说** | `The user dismissed the plan review to speak instead; stay in plan mode, stop here, and wait for their message.` |
+| `确认执行` | 批准：退出 plan 模式，从下一步开始照计划动手 | `Plan approved — plan mode exited; carry out the plan starting with your next step.` |
+| 无渠道 | 管道/CI、子代理、浮窗画不出来 | `no user-questions channel is available to review the plan; ask the user to switch the session mode instead`（**不退模式**） |
+
+这三个动作与 DSH `plan-review` 卡片的 `Keep planning` / `Chat about it` / `Approve` 一一对应
+（裁决用「选中项原文」判定，从不依赖选项顺序）。
+
+* **排版**：转录区中间的圆角方框，标题栏 `计划待审 · 第 a 行/共 b 行`（滚动指示），
+  正文是完整计划（复用转录那套 markdown-lite：围栏代码、`#` 标题加粗、列表、行内 code），
+  倒数第二行是**选中项的一句话说明**（终端里没有 tooltip），最后一行是三个动作。
+  高度取 `min(panel_top-2, 20)`、宽度 78 列（窄终端退到 `cols-6`，下限 24 列），
+  正文按显示列折行（复用 `tui_wrap_into`，宽度是缓存键，`SIGWINCH` 后重折）。
+* **键位**：`↑/↓` 滚正文一行、`pgup/pgdn` 翻页、`home/end` 顶/尾、`tab`/`shift+tab`/`←/→`
+  环选动作、`1/2/3` 直选、`enter` 确认、`esc` 取消（= 「解决」）。
+* **默认光标停在「继续讨论」**，且开浮窗前沿用 P21 的做法 `tui_key_reset()` 丢掉排队按键：
+  运行期间敲进来的键**最多只能让它继续讨论**，绝不会替用户批准（真终端才丢；headless 自测例外）。
+* **fail closed**：浮层画不出来（面板顶行 < 6）或没人回答（headless / 中断）一律**不批准**；
+  后者按「解决」处理 —— 老实说「没人做决定」，而不是假装用户要改一版。
+* **记录不丢**：浮窗打开前先把计划落进转录（`=== 计划 === … === 计划结束 ===`），
+  浮窗是临时的、转录里那份留着回看；正文超过 128 KiB 时浮窗按行截断并留一行指路。
+* **滚动模式**（`--no-tui` 真 TTY）不变：仍是 `批准这个计划并退出 plan 模式？[y/N]`。
+
+**③ 运行中切模式，模型必须知道**。system prompt 与首份运行时上下文都只在会话开始时装配/注入
+一次，所以运行中切 plan 模式（tab / `/plan` / 批准退出）在 P26 之前对模型是**不可见**的。
+现在 `agent.uya` 记一份「模型已经被告知的状态」，每个 step 边界对不上就补推一份新的运行时
+上下文快照（自称 supersedes earlier snapshots）并落一条 `plan/mode` 会话日志 ——
+与 P21 的访问模式切换同一条路子（见 `agent_set_access`）。切模式同时同步输入面板的 `Plan` chip，
+所以 `/plan` 以前那个「chip 不跟着变」的小毛病也一起没了。
+
+**④ 顺手修掉的既有缺陷**：`plan_review()` 原来是
+`ask_write(plan_text.ptr as &const byte)` 打印计划正文，而 `ask_write` 按 **C 字符串**长度算、
+`js_obj_get_str_unescaped()` 给的 Buf **没有 NUL 结尾**（`buf_new` 是裸 `malloc`）——
+真机第一次跑就会一路读到未初始化的堆尾巴。现在改成按长度写（`tty_stream_write(2, p, len)`），
+自测里 `plan-gate` 轮会把这段转录逐字看一眼（与踩坑 43 里 `tui_puts` 那条同款：按长度传）。
+
+#### 退出与中断：任何时刻都退得出去（P27）
 
 **症状**（用户报的「退不出」）：跑着长命令的时候按 `esc` / `ctrl+c` / `ctrl+d` / 打 `/exit`，
 界面**一点反应都没有**，只能等工具自己跑完（`sleep 300` 就是 5 分钟），或者去另一个终端
-`kill`。P26 把这条路上的四个坑一起修了 —— 三个在本进程的输入路径上，一个在**子进程**上。
+`kill`。P27 把这条路上的四个坑一起修了 —— 三个在本进程的输入路径上，一个在**子进程**上。
 
 **① 阻塞循环只收键、不看键。**
 `tui_poll_tick()` 只负责「把键盘收下来 + 刷帧」，而 bash 前台、后台任务等待、子代理等待、
@@ -1202,7 +1313,7 @@ workflow 是脚本退出码 `137` + `result: [aborted by user]`），**滚动模
 `ctrl+d`、或 `/exit`）直接掉在地上 —— 退出了但流还在哗哗地读。现在三个事件一视同仁：立刻
 `LlmInterrupted`，回合收口后主循环看到退出标志自己收工。副作用是自测那边的
 「headless 下注入的键用完」不能再借用 `g_tui_quit`（那会被读流循环当成用户中断），
-于是把它拆成独立的 `g_tui_headless_done`（见踩坑 44(e)）。
+于是把它拆成独立的 `g_tui_headless_done`（见踩坑 45(e)）。
 
 **②′ step 边界先判中断，再决定要不要发请求。**
 中断/退出意图按 DSH 口径在**下一个 step 边界**生效 —— 那就没必要把一个注定被自己掐断的
@@ -1213,7 +1324,7 @@ workflow 是脚本退出码 `137` + `result: [aborted by user]`），**滚动模
 两条独立的毛病：`tui_do_submit` 提交路径不认识 `/exit`（打字回车会被当成**任务文本**发给模型，
 运行中还会进 steer 收件箱），以及浮层的 kind 在 `tui_overlay_close()` 里被清零 —— 而 close 是
 accept 的**收尾**动作，于是主循环读到的 `tui_overlay_kind()` 永远是 0，**面板里选出来的东西
-（含 `/exit`、`/sessions` 里挑会话）被静默丢掉**（踩坑 44）。现在：`tui_is_exit_command()` 是唯一
+（含 `/exit`、`/sessions` 里挑会话）被静默丢掉**（踩坑 45）。现在：`tui_is_exit_command()` 是唯一
 判定口径，提交路径与面板选中路径都走它，退出标志**当场**置上（回合跑着的时候主循环不在，
 只有标志能立刻生效）；kind 另存一份**结果** kind，跨 close 存活。
 
@@ -1759,7 +1870,21 @@ vLLM 等 OpenAI 兼容端点都一样稳。想升级成严格 `tool` 角色消�
       P25 把信息行右侧提示从字面量改成拼出来的 `Buf` 之后，屏幕上就多出一截堆里的旧字节
       （实测是 `\x8c输出 Hello, DSH!。` 粘在 `ctrl+p commands` 后面，`--tui-demo` 的快照里一眼可见）。
       凡是要画 `Buf` 里的字节，一律用 `tui_putn` / `tui_put_clipped`（显式给长度）。
-44. **「把键收下来」不等于「看键」—— 于是一旦有东西在跑，就什么都退出不了。** 用户报的是
+44. **plan 模式只是「提示词里的软引导」时，模型会直接开工 —— 而审阅问答在 TUI 下等于不存在。**
+    现场（会话 `session-6918e8ef`）：plan 模式激活后模型说「然后直接给你写一个可运行的
+    markdown→ANSI 渲染模块并验证」，一个 `exit_plan_mode` 都没调，用户手动中断
+    （`turn/end reason=aborted`）。根因是两条各自独立：
+    ① plan 模式当时**只有**一段 system prompt（来自 DSH preset）+ 一句 `Plan mode is active`，
+    `write`/`edit`/`bash` 上没有任何 plan 相关的闸门 —— `perm_allows_write()` 只看访问模式；
+    ② 就算模型调了 `exit_plan_mode`，审阅走的也是 P8 时代的 CLI 问答（`ask_write` + y/N），
+    而 TUI 里 `tty_raw_on()` 已经开了 raw ⇒ `tty_is_interactive()` 为真 ⇒ 读的是**老 tty 行编辑器**，
+    它跟 TUI 自己的键队列互不相干（streaming 期间键被 `tui_pump_input()` 收进输入行、
+    工具执行时又没人抽帧）：没有浮窗、提示只当 sink 文本落进转录、按键去向不确定。
+    用户看到的就是「计划直接开始执行」。修法：plan 模式加**写闸门**（`plan_blocks_write()`）
+    + `exit_plan_mode` 走 reader 浮层（`tui_reader_wait`），并把 fs/tui 两侧都用自测轮钉死
+    （`plan-gate` / `tui-plan`）。**教训**：只要「提示词说了但工具没拦」，就一定会有人（模型）
+    绕过它；交互通道必须和界面同源 —— 两套按键通道并存时，UI 那一套才是用户以为自己在用的那套。
+45. **「把键收下来」不等于「看键」—— 于是一旦有东西在跑，就什么都退出不了。** 用户报的是
    「退不出」：`sleep` 之类的长命令一跑起来，`esc` / `ctrl+c` / `ctrl+d` / `/exit` 全都没反应，
    只能等工具自己结束。挖下去是**四个**独立的坑，全都在「这个进程到底谁在看输入」上：
 
@@ -1833,6 +1958,10 @@ vLLM 等 OpenAI 兼容端点都一样稳。想升级成严格 `tool` 角色消�
 `~` 开头、以及含 `..` 段的路径。工具内部任何失败都不抛错，一律写成 `error: ...` 文本回给模型，
 让它自己纠正；bash 在 `danger-full-access` 下本来就能执行任意命令，所以别拿它当沙箱用
 （要沙箱请用 `workspace-write` / `read-only`，见 P21 那两节）。
+
+**P22 起有第三条工具级策略**：plan 模式下 `write` / `edit` 直接回
+`Error: write is refused in plan mode (no file changes before the user approves the plan). …`
+（拦在参数校验之后、动文件之前，且排在 read-only 那道之前）—— 见「plan 模式：写闸门与审阅浮窗」。
 
 **P21 起还有两条工具级策略**：`read-only` 模式下 `write` / `edit` 直接回
 `Error: write is refused in read-only mode (the user granted no write access). Do not retry; …`
@@ -1922,6 +2051,9 @@ agent 循环并逐项断言：
 | `san-shell` | 直接 fork 出沙箱命令实测（不经工具闸门）：read-only 里 `> /dev/null` 成功、写 `/tmp` 被拒且文件不出现；workspace-write 里工作区内写入逐字节正确、`../` 区外写入被拒；本机没有 bwrap 时打一行 skip（不假绿） |
 | `san-tool` | 端到端：`--permission workspace-write` 下让模型跑一条**同时**写工作区内与区外的命令 —— 区内文件必须落盘、区外文件必须不存在（工具层没拦它，是内核拦的） |
 | `tui-access` | 访问模式 chip 三种模式的显示、`shift+tab` 只置请求（主循环据此开浮层）、选择器打开（三行齐 + `✓` 只在当前模式那行 + 圆角框 + esc 取消不变更）、↓+enter 选中 Workspace Write 交给处理器（策略全局 + chip + 转录 notice + **恰好一条** runtime-context 注入且不上屏）、运行中切换时 `cfg.access` 必须跟着走（故意把 cfg 设成旧值）、选 Full access 只翻出确认层（游标默认「取消」→ 回车无变化；↑+enter 才切）；末尾两条**回归**：命令面板里选 `/status` 必须真的派发（浮层结果不许被静默丢掉）、`/help` 必须开**帮助浮层**（不许掉回滚动模式的纯文本帮助）；每步都查「每行 ≤ cols、正文层无 ESC」 |
+| `plan-gate` | P26 plan 写闸门：纯函数真值表（`plan_init`/`plan_set`/`plan_toggle` 三处一致 + 三个动作 → 三裁决 + 认不出的选中项必须是「继续讨论」）+ 端到端（**全权模式**下 plan 模式里 `write`/`edit` 逐字被拒且 `plan-gate.txt` **没落盘**、`exit_plan_mode` 在管道里回「没有渠道」且**不退模式**、请求里必须带「写工具被拒」那句运行时上下文） |
+| `tui-plan` | P26 plan 审阅浮窗，四段：① 浮层级 headless（标题 `计划待审 · 1/b`、三动作齐、默认光标在「继续讨论」、正文第一行画出来、尾巴一开始不可见、`↓` 行号 +1、`pgdn` 整页跳、`end` 到底才看见尾巴、`home` 回顶、`3`+回车交回「确认执行」且 kind 不丢、`esc` 取消、`agent_plan_force` 同步 Plan chip、40 列窄终端不超宽不崩、**浮层方框闭合成矩形**（复用 tui-frame 那套量法：左右边界列 + 首尾必须是边框字形 —— 踩坑 42 那类缺陷）、每帧「行 ≤ cols + 正文层无 ESC」）；② headless + agent：注入的键到不了浮层 → 按「解决」处理（转录出现「dismissed the plan review」、**没有** `Plan approved`、`plan_on()` 仍为真、浮层已收掉）；③ **真 PTY**：tab 进 plan 模式 → 浮窗出现 → 三动作齐 → `end` 翻到底看见 `PLAN-TAIL-MARK`（正文真的能滚）→ `3`+回车 → 第二封请求里必须出现 `Plan approved`；④ **真 PTY**：`esc` → 第二封请求里必须是「dismissed the plan review to speak instead」 |
+| `tui-access` | 访问模式 chip 三种模式的显示、`shift+tab` 只置请求（主循环据此开浮层）、选择器打开（三行齐 + `✓` 只在当前模式那行 + 圆角框 + esc 取消不变更）、↓+enter 选中 Workspace Write 交给处理器（策略全局 + chip + 转录 notice + **恰好一条** runtime-context 注入且不上屏）、运行中切换时 `cfg.access` 必须跟着走（故意把 cfg 设成旧值）、选 Full access 只翻出确认层（游标默认「取消」→ 回车无变化；↑+enter 才切）；末尾一条**回归**：命令面板里选 `/status` 必须真的派发（浮层结果不许被静默丢掉）；每步都查「每行 ≤ cols、正文层无 ESC」 |
 | `tui-approve` | read-only 下 bash 逐条批准，两种形态：① headless（注入的键在浮层打开前就被输入行吃了）= 没人回答 → **fail closed**，转录出现逐字拒绝串、命令 stdout 不出现、且不是「没有回答渠道」那条；② **真 PTY**：等 `Read Only：批准这条 bash 命令？` 画出来再送 `↑`+回车 → 命令真的跑（stdout 进转录与下一封请求）、退出码 0 |
 | `sig-abi` | `SigxAction` 必须是**宿主 glibc** 布局（152 字节；handler@0 / flags@136 / restorer@144，按字节回读）；恢复序列逐字节四种形状（P22 起）：带备用屏幕 26 字节 / 不带 18 字节 / 带备用屏幕+弹标题栈 31 字节（`ESC[23t` 排在离开备用屏幕**之前**）/ 不带备用屏幕+弹标题栈 23 字节 |
 | `sig-basic` | 处理器装上以后真的被调用、返回以后进程还活着（P0 的回归闸门：缺 `SA_RESTORER` 的实现在这里直接 139）；`SIGWINCH` 处理器只置标志、取用即清零 |
@@ -2189,7 +2321,8 @@ responses 看 `call_id`）；**chat 与 responses 各一轮**，且顺便断言�
     `mock_sse_gap_ns` 造出「回合还活着」的窗口）；`tuis_scan_rows` 顺手加了一条全局不变量
     「正文层不许出现 NUL 字节」（字面量长度越界这一类缺陷的通用闸门）。
     `make check / build / codegen-audit / selftest` 全绿（selftest 退出 0），
-    `make tui-demo` 三屏与本节引用的快照逐字节相同（浮层不在 demo 里，排版没有旁及）。
+    `make tui-demo` 的这几屏与本节引用的快照逐字节相同（P26 起 demo 多了第 ⑤ 屏 plan 审阅浮层 ——
+    它只画在转录区上；命令面板 / 帮助这些**不**在 demo 里，排版没有旁及）。
 
  * **P24 的验收记录（2026-10-03，对应踩坑 41）**：脚注新增 `内存`（同一次 `/proc` 走查的
    PSS 合计，5 s 一档）、`%cpu` 改名 `cpu`，并修掉首 token 打点那条口径错误。
@@ -2283,7 +2416,7 @@ responses 看 `call_id`）；**chat 与 responses 各一轮**，且顺便断言�
   **这一屏在 P18 之前是拿不到的**：同样的转录长度下状态行会被挤掉，屏幕上只剩静止的转录 + 面板。
 * **P21 的验收记录（2026-10-03，对应访问模式 + 内核沙箱）**：
   ① 离线全套：`make check` / `codegen-audit` / `e2e-config-flags` / `e2e-api` / `e2e-steps` /
-  `e2e-permission` / `e2e-sandbox` / `tui-selftest`（9 轮）/ `selftest`（`SELFTEST PASS`）全绿；
+  `e2e-permission` / `e2e-sandbox` / `tui-selftest`（P22 起 10 轮）/ `selftest`（`SELFTEST PASS`）全绿；
   新增的 5 轮权限/沙箱轮与 2 轮 TUI 轮都在里面（`perm-modes` / `perm-readonly` / `san-profile` /
   `san-shell` / `san-tool` / `tui-access` / `tui-approve`）。
   ② **沙箱是真的内核边界，不是纸面约定**：`san-shell` 轮直接 fork 出套壳命令实测 ——
@@ -2317,7 +2450,22 @@ responses 看 `call_id`）；**chat 与 responses 各一轮**，且顺便断言�
   `view_agents_sync` 的快照/推送逻辑抽成 `view_panel_push`（任务块与 agents 面板共用一个写者）。
   ⑥ 开发过程踩到的 uya 0.10 语言坑记在 §3 第 43 条（全局初始化式不能调函数、循环里的
   `const = if …`、`match` 是保留字、`tui_puts` 按 cstr 量长度）。
-* **P26 的「退不出」在真机上做了 A/B**（2026-10-03，同一台网关 / 同一个模型 `DeepSeek-V4.1-Flash`，
+* **P26 的验收记录（2026-10-03，对应 plan 写闸门 + 审阅浮窗）**：
+  ① 离线全套：`make check` / `codegen-audit` / `e2e-config-flags` / `e2e-api` / `e2e-steps` /
+  `e2e-permission` / `e2e-sandbox` / `tui-selftest`（13 轮）/ `selftest`（`SELFTEST PASS`）全绿；
+  新增两轮都在里面（`plan-gate` / `tui-plan`），另有 `UYA_SELFTEST_PERM_ONLY=1` 这条只跑
+  P21+P26 的快捷入口。
+  ② **闸门不是纸面约定**：`plan-gate` 轮在 `danger-full-access`（全权）下开 plan 模式 ——
+  `write`/`edit` 仍被逐字拒绝、`plan-gate.txt` 不存在；把 `plan_blocks_write()` 改成恒 `false`，
+  这一轮立刻红（文件会落盘）。
+  ③ **浮窗的批准路径用真 PTY 验收**：`tui-plan` C 段等 `计划待审` 画出来 → `end` 翻到底看见
+  计划尾巴的标记（证明正文真的可滚动，不是只画了第一屏）→ `3`+回车 → 第二封请求里出现
+  `Plan approved`；D 段 `esc` → 第二封请求里是「dismissed the plan review to speak instead」，
+  且 headless 段另外钉住「没人回答之后 `plan_on()` 仍为真」（fail closed 不等于批准）。
+  ④ **真机现场 → 机制**：用户会话 `session-6918e8ef` 里模型在 plan 模式下直接开工
+  （`turn/end reason=aborted`）—— 那是「plan 模式只有提示词没有闸门」的第一手证据（踩坑 44），
+  闸门就是按这个现场补的。
+* **P27 的「退不出」在真机上做了 A/B**（2026-10-03，同一台网关 / 同一个模型 `DeepSeek-V4.1-Flash`，
   100×30 PTY + 定时注入按键的脚本）。任务都是「用 bash 工具跑 `sleep 120`，description 必须是
   long-sleep，不要后台运行」，动作在工具跑起来之后：
 
@@ -2436,6 +2584,13 @@ mock 上逐字段验收。换一台 `openai-responses` 网关可用时，零参�
 * `read_file` 一次最多 64 KiB；`write_file` 是整文件覆盖，没有 diff/patch 工具。
 * 滚动模式（`--no-tui`）仍然是纯文本字形、不做 markdown 渲染；TUI 模式下有颜色 + 轻量 markdown
   （围栏代码块、行内 code、标题、列表），但不做完整语法高亮/表格/链接重排。
+* **plan 模式（P22）的边界**：闸门只拦 `write`/`edit` —— plan 模式下 `bash` 照访问模式走，
+  所以「全权重定向写文件」这条路仍然开着（这也是 DSH 的立场：plan mode 是引导，需要更硬
+  的边界就配 `read-only` 沙箱）；fork 出来的子代理会继承 plan 状态（父进程在 plan 模式下，
+  子代理也写不了文件）；**非交互会话**（管道/CI）里没有审阅渠道 ⇒ `--plan` 只会产出计划、
+  写工具始终被拒，要落地请在交互式会话里批准或去掉 `--plan`；`ask_user_question` 仍是行式
+  问答（只有 `exit_plan_mode` 有浮窗）；plan 状态与访问模式一样是**进程级**的，不进会话日志的
+  恢复语义（`--resume` 按启动参数重新求值），但每次切换会落一条 `plan/mode` 日志。
 * TUI 不做鼠标（滚轮/点击/选择）、图片、可折叠卡片、分屏、主题切换 UI；`--resume` 只回填
   最近 200 条历史（注入类消息不回填），`--resume-dsh` 走同一条回填路径。
 * 终端小于 32×8 时自动退回滚动模式；`cols < 66` 时块字 logo 退化成一行标题。
