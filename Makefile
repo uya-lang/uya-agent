@@ -428,7 +428,11 @@ e2e-dsh: build
 #     5) 空闲敲 /status：≤150ms（旧实现 242ms = 等下一次 200ms 轮询）
 #     6) bash 跑着时敲 /status：≤200ms（且回合仍在跑）
 #     7) 压缩的摘要请求在飞时敲 /status：≤300ms（且必须证明压缩真发过请求）
-#   PTY_DUMP=1 会把子进程屏幕打出来；单跑一个场景：
+#   P41 起再加一条「选择框」的验收（真终端里的人机路径，本场不发请求、不建 worktree）：
+#     8) 命令面板里选中 /worktree（ctrl+p → 过滤 → 回车）与裸 /worktree 都要开出动作选择框
+#        （七行 + ✓ 标当前模式）→ ↓ 到 finish → 回车翻出「确认 finish？」→ 再回车
+#        （默认游标是「取消」）什么都不做
+#   PTY_DUMP=1 会把子进程屏幕打出来（P41 那场会多打两张框的屏幕）；单跑一个场景：
 #     python3 testdata/pty_drive.py --port <假网关端口> --workspace /tmp/ws status-single-step
 p30-check: build
 	@python3 testdata/pty_drive.py --suite
