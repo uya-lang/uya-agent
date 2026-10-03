@@ -9120,8 +9120,9 @@ fn resp_build_round(tag: &const byte) bool {
         var root: JsonValue = JsonValue.json_null();
         if !js_parse(&arena, tools.ptr as &byte, tools.len - 1, &root) {
             ty_fail(tag, "扁平 tools 不是合法 JSON", &ok);
-        } else if js_arr_len(&root) != 25 {
-            ty_fail(tag, "扁平 tools 的条数不是 25", &ok);
+        } else if js_arr_len(&root) != 26 {
+            // 25 → 26：P34 加了 workspace（工具目录跨模式稳定，这条数会随新工具走）
+            ty_fail(tag, "扁平 tools 的条数不是 26", &ok);
         } else {
             var k: usize = 0;
             while k < 25 {
@@ -12217,6 +12218,555 @@ fn dp_dump(tag: &const byte) void {
     out_err_bytes(d.ptr as &const byte, d.len);
 }
 
+// ============================================================
+// P34：工作区两轮（ws-resolve / ws-tool）—— 全离线，不联网、不用模型
+//
+//   * ws-resolve：手写一份会话日志（header + 两条 session/workspace），断言「最后一条为准」、
+//     记录的工作区不存在时退回当前工作区（fallback）、显式指定优先；
+//   * ws-tool：走**真实工具入口**（JSON 参数 → 切工作区），断言相对路径规范化、幂等、
+//     失败不改状态，以及「会话日志 + 索引」两条记录都跟上，/diff 文本头里写的是工作区。
+//
+// 两个硬约束：
+//   1) 切换是真的 chdir —— 本轮结束必须把进程 cwd 还原（别的轮次都假定 cwd = 仓库根）；
+//   2) g_fsctx 里存的是**裸指针** —— 指向本地 cfg 的 workspace 缓冲会在本轮结束后悬垂，
+//      所以 ws-tool 收尾用 fsctx_init(base) 把它指回程序级那一份。
+// ============================================================
+const WST_HOME: &const byte = "build/selftest_ws_home" as &const byte;
+const WST_A: &const byte = "build/selftest_ws_p31_a" as &const byte;
+const WST_A_SUB: &const byte = "build/selftest_ws_p31_a/sub" as &const byte;
+const WST_B: &const byte = "build/selftest_ws_p31_b" as &const byte;
+const WST_GONE: &const byte = "build/selftest_ws_p31_gone" as &const byte;
+const WST_ID: &const byte = "session-aaaa1111-2222-3333-4444-555566667777" as &const byte;
+const WST_LOG: &const byte = "build/selftest_ws_home/sessions/--selftest-ws-p31-a--/session-aaaa1111-2222-3333-4444-555566667777/session.jsonl" as &const byte;
+
+// 相对路径 → 绝对路径。base 必须**显式**传：本轮会真的 chdir，
+// 之后再按「当前目录」拼相对路径就会拼到别的目录上去（自测第一版就这么错了）。
+fn wst_abs(base: &const Buf, rel: &const byte, out: &Buf) bool {
+    buf_reset(out);
+    if !buf_append(out, base.ptr as &const byte, base.len) {
+        return false;
+    }
+    if !buf_append_byte(out, 47) {
+        return false;
+    }
+    return buf_append_cstr(out, rel);
+}
+
+// 逐字节比较两个 Buf。
+// **不要**用 bufx_eq_cstr：它按 strlen 量「字面量」的长度，而 Buf 的缓冲没有 NUL 结尾，
+// 于是量出来比实际长、n != m 直接判不等（自测第一版就被这条坑了）。
+fn wst_eq(a: &const Buf, b: &const Buf) bool {
+    if a.len != b.len {
+        return false;
+    }
+    return bufx_mem_eq(a.ptr as &const byte, b.ptr as &const byte, a.len);
+}
+
+// 回到仓库根：本轮会真的 chdir，之后凡是**相对路径**的东西（fixture 仓、git -C）都得先站回来
+fn wst_back(root: &const Buf) void {
+    var rz: Buf = buf_new(root.len + 1);
+    defer { buf_free(&rz); }
+    _ = buf_append(&rz, root.ptr as &const byte, root.len);
+    _ = buf_append_byte(&rz, 0);
+    _ = sys_chdir(&rz.ptr[0] as *const byte) catch {};
+}
+
+fn wst_prepare() bool {
+    _ = sess_mkdir_p(WST_HOME);
+    _ = sess_mkdir_p(WST_A);
+    _ = sess_mkdir_p(WST_A_SUB);
+    _ = sess_mkdir_p(WST_B);
+    var idx: Buf = buf_new(600);
+    defer { buf_free(&idx); }
+    _ = buf_append_cstr(&idx, WST_HOME);
+    _ = buf_append_cstr(&idx, "/index.jsonl");
+    _ = buf_append_byte(&idx, 0);
+    _ = sys_unlink(idx.ptr as *const byte) catch {};
+    return true;
+}
+
+// 手写一份会话日志：header 的 cwd = A，事件里两条 session/workspace（C → B，最后一条为准）。
+// 三个路径按 **Buf** 传：Buf 缓冲没有 NUL 结尾，`bufx_cstr_len` 会一路扫进堆里的别的数据
+// （全量 selftest 里当场扫到了状态行的 `| 缓存命中 …`，见踩坑 49 同一类坑）。
+fn wst_write_log(cwd_a: &const Buf, ws_c: &const Buf, ws_b: &const Buf) bool {
+    var dir: Buf = buf_new(800);
+    defer { buf_free(&dir); }
+    _ = buf_append_cstr(&dir, WST_HOME);
+    _ = buf_append_cstr(&dir, "/sessions/--selftest-ws-p31-a--/session-aaaa1111-2222-3333-4444-555566667777");
+    _ = buf_append_byte(&dir, 0);
+    _ = sess_mkdir_p(dir.ptr as &const byte);
+    var body: Buf = buf_new(4096);
+    defer { buf_free(&body); }
+    _ = buf_append_cstr(&body, "{\"type\":\"session\",\"version\":0,\"id\":\"");
+    _ = buf_append_cstr(&body, WST_ID);
+    _ = buf_append_cstr(&body, "\",\"createdAt\":1790993000000,\"cwd\":");
+    _ = jw_str_into(&body, cwd_a.ptr as &const byte, cwd_a.len);
+    _ = buf_append_cstr(&body, ",\"delegationDepth\":0,\"agentPreset\":\"standard\",\"model\":\"selftest-model\",\"provider\":\"uya-agent\"}\n");
+    _ = buf_append_cstr(&body, "{\"type\":\"user/message\",\"seq\":0,\"time\":1790993000001,\"data\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"记住 5150\"}],\"source\":{\"kind\":\"user\"}}}\n");
+    _ = buf_append_cstr(&body, "{\"type\":\"session/workspace\",\"seq\":1,\"time\":1790993000002,\"data\":{\"workspace\":");
+    _ = jw_str_into(&body, ws_c.ptr as &const byte, ws_c.len);
+    _ = buf_append_cstr(&body, ",\"previous\":");
+    _ = jw_str_into(&body, cwd_a.ptr as &const byte, cwd_a.len);
+    _ = buf_append_cstr(&body, ",\"source\":\"tool\"}}\n");
+    _ = buf_append_cstr(&body, "{\"type\":\"session/workspace\",\"seq\":2,\"time\":1790993000003,\"data\":{\"workspace\":");
+    _ = jw_str_into(&body, ws_b.ptr as &const byte, ws_b.len);
+    _ = buf_append_cstr(&body, ",\"previous\":");
+    _ = jw_str_into(&body, ws_c.ptr as &const byte, ws_c.len);
+    _ = buf_append_cstr(&body, ",\"source\":\"human\"}}\n");
+    var pz: Buf = buf_new(900);
+    defer { buf_free(&pz); }
+    _ = buf_append_cstr(&pz, WST_LOG);
+    _ = buf_append_byte(&pz, 0);
+    return write_text_file(pz.ptr as &const byte, body.ptr as &const byte);
+}
+
+// 索引里某个 id 的**最后一条**记录的 (cwd, path)。home 传**绝对**路径（本轮会 chdir）
+fn wst_index_last(home_abs: &const Buf, id: &const byte, id_len: usize, cwd_out: &Buf, path_out: &Buf) bool {
+    var idx: Buf = buf_new(65536);
+    defer { buf_free(&idx); }
+    var homez: Buf = buf_new(home_abs.len + 1);
+    defer { buf_free(&homez); }
+    _ = buf_append(&homez, home_abs.ptr as &const byte, home_abs.len);
+    _ = buf_append_byte(&homez, 0);
+    if !sess_read_index(homez.ptr as &const byte, &idx) {
+        return false;
+    }
+    var found: bool = false;
+    var pos: usize = 0;
+    var line: Buf = buf_new(4096);
+    defer { buf_free(&line); }
+    while pos < idx.len {
+        buf_reset(&line);
+        var nl: usize = idx.len;
+        var i: usize = pos;
+        while i < idx.len {
+            if idx.ptr[i] == 10 as byte {
+                nl = i;
+                break;
+            }
+            i = i + 1;
+        }
+        if nl > pos {
+            _ = buf_append(&line, &idx.ptr[pos], nl - pos);
+        }
+        pos = nl + 1;
+        var idv: Buf = buf_new(128);
+        var cwdv: Buf = buf_new(1024);
+        var pthv: Buf = buf_new(1600);
+        defer { buf_free(&idv); buf_free(&cwdv); buf_free(&pthv); }
+        if !sess_json_str(line.ptr[0: line.len], "id", &idv) {
+            continue;
+        }
+        // id_len == 0 = 「不挑 id，取最后一条」（本轮只会写自己那一个会话）
+        if id_len > 0 && !bufx_eq_cstr(idv.ptr as &const byte, idv.len, id) {
+            continue;
+        }
+        _ = sess_json_str(line.ptr[0: line.len], "cwd", &cwdv);
+        _ = sess_json_str(line.ptr[0: line.len], "path", &pthv);
+        buf_reset(cwd_out);
+        _ = buf_append(cwd_out, cwdv.ptr as &const byte, cwdv.len);
+        buf_reset(path_out);
+        _ = buf_append(path_out, pthv.ptr as &const byte, pthv.len);
+        found = true;
+    }
+    return found;
+}
+
+// ============================================================
+// ws-resolve：恢复会话时「这个会话在哪」的判定
+// ============================================================
+fn ws_resolve_round(tag: &const byte) bool {
+    var ok: bool = true;
+    var root: Buf = buf_new(1024);
+    defer { buf_free(&root); }
+    if !agent_getcwd_into(&root) {
+        ty_fail(tag, "拿不到仓库根", &ok);
+        return ok;
+    }
+    // 收尾：把进程 cwd 放回去（本轮的切换是真的 chdir）
+    defer {
+        var rz: Buf = buf_new(root.len + 1);
+        defer { buf_free(&rz); }
+        _ = buf_append(&rz, root.ptr as &const byte, root.len);
+        _ = buf_append_byte(&rz, 0);
+        _ = sys_chdir(&rz.ptr[0] as *const byte) catch {};
+    }
+    _ = wst_prepare();
+    var abs_a: Buf = buf_new(1024);
+    defer { buf_free(&abs_a); }
+    var abs_b: Buf = buf_new(1024);
+    defer { buf_free(&abs_b); }
+    var abs_c: Buf = buf_new(1024);
+    defer { buf_free(&abs_c); }
+    var abs_sub: Buf = buf_new(1024);
+    defer { buf_free(&abs_sub); }
+    var abs_gone: Buf = buf_new(1024);
+    defer { buf_free(&abs_gone); }
+    if !wst_abs(&root, WST_A, &abs_a) || !wst_abs(&root, WST_B, &abs_b) ||
+        !wst_abs(&root, WST_A_SUB, &abs_sub) || !wst_abs(&root, WST_GONE, &abs_gone) {
+        ty_fail(tag, "拿不到临时目录的绝对路径", &ok);
+        return ok;
+    }
+    // C 用 A 的子目录（存在，且与 A/B 都不同）
+    _ = buf_append(&abs_c, abs_sub.ptr as &const byte, abs_sub.len);
+    if !wst_write_log(&abs_a, &abs_c, &abs_b) {
+        ty_fail(tag, "写不出测试会话日志", &ok);
+        return ok;
+    }
+
+    // ---- 1) sess_read_meta：id / header 的创建时工作区 / 最后一条 session/workspace ----
+    var meta: SessMeta = sess_meta_empty();
+    defer { sess_meta_free(&meta); }
+    var lpz: Buf = buf_new(900);
+    defer { buf_free(&lpz); }
+    _ = buf_append_cstr(&lpz, WST_LOG);
+    _ = buf_append_byte(&lpz, 0);
+    if !sess_read_meta(lpz.ptr as &const byte, &meta) {
+        ty_fail(tag, "sess_read_meta 读不出自己刚写的日志", &ok);
+        return ok;
+    }
+    if !bufx_eq_cstr(meta.id.ptr as &const byte, meta.id.len, WST_ID) {
+        ty_fail(tag, "meta.id 不对", &ok);
+    }
+    if !wst_eq(&meta.cwd, &abs_a) {
+        ty_fail(tag, "meta.cwd 不是 header 里的创建时工作区", &ok);
+    }
+    if !wst_eq(&meta.workspace, &abs_b) {
+        ty_fail(tag, "meta.workspace 不是**最后一条** session/workspace", &ok);
+    }
+
+    // ---- 2) pick：记录里是 B（存在）→ 切过去，并记下「会话在哪」 ----
+    var cfg: Config = cfg_default();
+    defer { cfg_free(&cfg); }
+    cfg.model = buf_from_cstr("selftest-model");
+    cfg.workspace = buf_empty();
+    _ = agent_workspace_set_cwd(&cfg);
+    if agent_workspace_switch(&cfg, abs_a.ptr as &const byte, abs_a.len) != WS_OK {
+        ty_fail(tag, "切到工作区 A 失败", &ok);
+    }
+    var outw: Buf = buf_new(1024);
+    defer { buf_free(&outw); }
+    var fb: bool = false;
+    agent_session_workspace_pick(&cfg, &meta, &outw, &fb);
+    if fb {
+        ty_fail(tag, "记录的工作区存在时不该报 fallback", &ok);
+    }
+    if !wst_eq(&cfg.workspace, &abs_b) {
+        ty_fail(tag, "恢复会话没有把工作区切到会话记录的那一个（B）", &ok);
+    } else if cfg.ws_src != 1 {
+        ty_fail(tag, "工作区来源不是 session", &ok);
+    }
+    if !wst_eq(&cfg.resume_ws, &abs_b) {
+        ty_fail(tag, "cfg.resume_ws 没有记下「会话在哪」（/status 与 /workspace 要看它）", &ok);
+    }
+
+    // ---- 3) 显式指定优先 ----
+    if agent_workspace_switch(&cfg, abs_a.ptr as &const byte, abs_a.len) != WS_OK {
+        ty_fail(tag, "第二次切到 A 失败", &ok);
+    }
+    cfg.ws_explicit = true;
+    agent_session_workspace_pick(&cfg, &meta, &outw, &fb);
+    if !wst_eq(&cfg.workspace, &abs_a) {
+        ty_fail(tag, "显式指定过工作区时不该被会话记录顶掉", &ok);
+    }
+    cfg.ws_explicit = false;
+
+    // ---- 4) 记录的工作区已经不存在 → 留在当前工作区 + fallback 标记 ----
+    var meta2: SessMeta = sess_meta_empty();
+    defer { sess_meta_free(&meta2); }
+    meta2.id = buf_new(128);
+    _ = buf_append(&meta2.id, WST_ID, bufx_cstr_len(WST_ID));
+    meta2.cwd = buf_new(abs_gone.len + 8);
+    _ = buf_append(&meta2.cwd, abs_gone.ptr as &const byte, abs_gone.len);
+    meta2.workspace = buf_new(abs_gone.len + 8);
+    _ = buf_append(&meta2.workspace, abs_gone.ptr as &const byte, abs_gone.len);
+    meta2.header_ok = true;
+    const r3: i32 = agent_workspace_switch(&cfg, abs_a.ptr as &const byte, abs_a.len);
+    if r3 != WS_OK && r3 != WS_E_SAME {
+        ty_fail(tag, "第三次切到 A 失败", &ok);
+    }
+    fb = false;
+    agent_session_workspace_pick(&cfg, &meta2, &outw, &fb);
+    if !fb {
+        ty_fail(tag, "记录的工作区不存在时没有报 fallback", &ok);
+    }
+    if !wst_eq(&cfg.workspace, &abs_a) {
+        ty_fail(tag, "fallback 时不该离开当前工作区", &ok);
+    }
+
+    // ---- 5) 幂等 + 相对路径规范化 ----
+    const same: i32 = agent_workspace_switch(&cfg, abs_a.ptr as &const byte, abs_a.len);
+    if same != WS_E_SAME {
+        ty_fail(tag, "切到已经在的工作区应当返回 WS_E_SAME", &ok);
+    }
+    // 相对路径按**当前**工作区解析：此刻在 A，`sub` 就是 A/sub
+    const rrel: i32 = agent_workspace_switch(&cfg, "sub" as &const byte, 3);
+    if rrel != WS_OK {
+        ty_fail(tag, "相对路径切不过去", &ok);
+    } else if !wst_eq(&cfg.workspace, &abs_sub) {
+        ty_fail(tag, "相对路径没有落成它该在的绝对路径", &ok);
+        out_err("  cfg.workspace=");
+        out_err_bytes(cfg.workspace.ptr as &const byte, cfg.workspace.len);
+        out_err("\n  want(abs_sub)=");
+        out_err_bytes(abs_sub.ptr as &const byte, abs_sub.len);
+        out_err("\n");
+    }
+    return ok;
+}
+
+// ============================================================
+// ws-tool：workspace 工具（报告 / 切换 / 记录）
+// ============================================================
+fn ws_tool_round(tag: &const byte, base: &const Config) bool {
+    var ok: bool = true;
+    var root: Buf = buf_new(1024);
+    defer { buf_free(&root); }
+    if !agent_getcwd_into(&root) {
+        ty_fail(tag, "拿不到仓库根", &ok);
+        return ok;
+    }
+    defer {
+        var rz: Buf = buf_new(root.len + 1);
+        defer { buf_free(&rz); }
+        _ = buf_append(&rz, root.ptr as &const byte, root.len);
+        _ = buf_append_byte(&rz, 0);
+        _ = sys_chdir(&rz.ptr[0] as *const byte) catch {};
+    }
+    _ = wst_prepare();
+    var abs_a: Buf = buf_new(1024);
+    defer { buf_free(&abs_a); }
+    var abs_b: Buf = buf_new(1024);
+    defer { buf_free(&abs_b); }
+    if !wst_abs(&root, WST_A, &abs_a) || !wst_abs(&root, WST_B, &abs_b) {
+        ty_fail(tag, "拿不到临时目录的绝对路径", &ok);
+        return ok;
+    }
+    var raw: &void = malloc(65536);
+    if ((raw as &byte) as usize) == 0 {
+        ty_fail(tag, "cannot allocate arena", &ok);
+        return ok;
+    }
+    defer { free(raw); }
+    var arena: Arena = Arena{ buffer: null, size: 0, used: 0 };
+    arena_init(&arena, raw as &byte, 65536);
+
+    var cfg: Config = cfg_default();
+    defer { cfg_free(&cfg); }
+    cfg.model = buf_from_cstr("selftest-model");
+    // agent home 必须给**绝对**路径：本轮的切换是真的 chdir，相对路径会被搬到新工作区下面去
+    var abs_home: Buf = buf_new(1024);
+    defer { buf_free(&abs_home); }
+    if !wst_abs(&root, WST_HOME, &abs_home) {
+        ty_fail(tag, "拿不到 agent home 的绝对路径", &ok);
+        return ok;
+    }
+    cfg.agent_home = buf_new(abs_home.len + 8);
+    _ = buf_append(&cfg.agent_home, abs_home.ptr as &const byte, abs_home.len);
+    cfg.save_session = true;
+    cfg.workspace = buf_empty();
+    _ = agent_workspace_set_cwd(&cfg);
+    if agent_workspace_switch(&cfg, abs_a.ptr as &const byte, abs_a.len) != WS_OK {
+        ty_fail(tag, "切到工作区 A 失败", &ok);
+        return ok;
+    }
+    // 会话日志开在 A 名下（记录才有地方落）
+    if !agent_session_create(&cfg) {
+        ty_fail(tag, "agent_session_create 失败", &ok);
+        return ok;
+    }
+    var out: Buf = buf_new(8192);
+    defer { buf_free(&out); }
+
+    // ---- 1) 无参 = 报告当前工作区 ----
+    var none: JsonValue = JsonValue.json_null();
+    if !js_parse(&arena, "{}" as &byte, 2, &none) {
+        ty_fail(tag, "解析空参数失败", &ok);
+    }
+    ws_tool_workspace(&cfg, &none, &out);
+    if !ty_has(&out, abs_a.ptr as &const byte, abs_a.len) {
+        ty_fail(tag, "无参报告里没有当前工作区", &ok);
+        out_err("  报告=");
+        out_err_bytes(out.ptr as &const byte, out.len);
+        out_err("\n");
+    }
+    if !ty_has(&out, "source: default" as &const byte,
+            bufx_cstr_len("source: default" as &const byte)) {
+        ty_fail(tag, "无参报告里没有工作区来源", &ok);
+    }
+
+    // ---- 2) 不存在 / 不是目录：要有话说，且状态一个字节都不变 ----
+    buf_reset(&out);
+    var bad: JsonValue = JsonValue.json_null();
+    var badj: Buf = buf_new(1200);
+    defer { buf_free(&badj); }
+    _ = buf_append_cstr(&badj, "{\"path\":\"");
+    _ = buf_append(&badj, abs_a.ptr as &const byte, abs_a.len);
+    _ = buf_append_cstr(&badj, "/nope\"}");
+    if !js_parse(&arena, badj.ptr as &byte, badj.len, &bad) {
+        ty_fail(tag, "解析「不存在」的参数失败", &ok);
+    }
+    ws_tool_workspace(&cfg, &bad, &out);
+    if !ty_has(&out, "Error: cannot switch the workspace" as &const byte,
+            bufx_cstr_len("Error: cannot switch the workspace" as &const byte)) {
+        ty_fail(tag, "切到不存在的目录没有报错", &ok);
+    }
+    if !wst_eq(&cfg.workspace, &abs_a) {
+        ty_fail(tag, "切失败之后工作区被改掉了", &ok);
+    }
+    buf_reset(&out);
+    var notdir: JsonValue = JsonValue.json_null();
+    var ndj: Buf = buf_new(1200);
+    defer { buf_free(&ndj); }
+    _ = buf_append_cstr(&ndj, "{\"path\":\"");
+    _ = buf_append(&ndj, abs_a.ptr as &const byte, abs_a.len);
+    _ = buf_append_cstr(&ndj, "/f.txt\"}");
+    if !js_parse(&arena, ndj.ptr as &byte, ndj.len, &notdir) {
+        ty_fail(tag, "解析「不是目录」的参数失败", &ok);
+    }
+    // 造一个普通文件：切到文件必须被拒（chdir 会 ENOTDIR）
+    var fp: Buf = buf_new(1200);
+    defer { buf_free(&fp); }
+    _ = buf_append(&fp, abs_a.ptr as &const byte, abs_a.len);
+    _ = buf_append_cstr(&fp, "/f.txt");
+    _ = buf_append_byte(&fp, 0);
+    _ = write_text_file(fp.ptr as &const byte, "not a dir\n" as &const byte);
+    ws_tool_workspace(&cfg, &notdir, &out);
+    if !ty_has(&out, "Error: cannot switch the workspace" as &const byte,
+            bufx_cstr_len("Error: cannot switch the workspace" as &const byte)) {
+        ty_fail(tag, "切到文件（不是目录）没有报错", &ok);
+    }
+
+    // ---- 3) 真切换（相对路径）：状态 + 会话日志 + 索引三处都要跟上 ----
+    buf_reset(&out);
+    var sw: JsonValue = JsonValue.json_null();
+    var swj: Buf = buf_new(1200);
+    defer { buf_free(&swj); }
+    _ = buf_append_cstr(&swj, "{\"path\":\"");
+    _ = buf_append(&swj, abs_b.ptr as &const byte, abs_b.len);
+    _ = buf_append_cstr(&swj, "\"}");
+    if !js_parse(&arena, swj.ptr as &byte, swj.len, &sw) {
+        ty_fail(tag, "解析切换参数失败", &ok);
+    }
+    ws_tool_workspace(&cfg, &sw, &out);
+    if !wst_eq(&cfg.workspace, &abs_b) {
+        ty_fail(tag, "工具没有把工作区切到 B", &ok);
+        out_err("  cfg.workspace=");
+        out_err_bytes(cfg.workspace.ptr as &const byte, cfg.workspace.len);
+        out_err("\n  want(abs_b)=");
+        out_err_bytes(abs_b.ptr as &const byte, abs_b.len);
+        out_err("\n  工具结果=");
+        out_err_bytes(out.ptr as &const byte, out.len);
+        out_err("\n");
+    }
+    if !ty_has(&out, "switched workspace: " as &const byte,
+            bufx_cstr_len("switched workspace: " as &const byte)) {
+        ty_fail(tag, "切换结果里没有 switched workspace", &ok);
+    }
+    if cfg.ws_src != 4 {
+        ty_fail(tag, "运行中切换之后来源不是 runtime", &ok);
+    }
+    // 会话日志（索引里拿到 path 与 id；同 id 最后一条 = 「现在在哪」）
+    var last_cwd: Buf = buf_new(1024);
+    defer { buf_free(&last_cwd); }
+    var last_path: Buf = buf_new(1600);
+    defer { buf_free(&last_path); }
+    var any_id: Buf = buf_empty();
+    defer { buf_free(&any_id); }
+    if !wst_index_last(&abs_home, any_id.ptr as &const byte, 0, &last_cwd, &last_path) {
+        ty_fail(tag, "索引里找不到刚开的会话（记录没落地？）", &ok);
+    } else {
+        if !wst_eq(&last_cwd, &abs_b) {
+            ty_fail(tag, "索引里的当前工作区不是 B（/sessions 的工作区列会显示错的）", &ok);
+            out_err("  索引 cwd=");
+            out_err_bytes(last_cwd.ptr as &const byte, last_cwd.len);
+            out_err("\n");
+        }
+        var mz: Buf = buf_new(last_path.len + 1);
+        defer { buf_free(&mz); }
+        _ = buf_append(&mz, last_path.ptr as &const byte, last_path.len);
+        _ = buf_append_byte(&mz, 0);
+        var meta: SessMeta = sess_meta_empty();
+        defer { sess_meta_free(&meta); }
+        if !sess_read_meta(mz.ptr as &const byte, &meta) {
+            ty_fail(tag, "会话日志读不回来", &ok);
+        } else {
+            if !wst_eq(&meta.workspace, &abs_b) {
+                ty_fail(tag, "日志里最后一条 session/workspace 不是 B", &ok);
+            }
+            if !wst_eq(&meta.cwd, &abs_a) {
+                ty_fail(tag, "header 的创建时工作区被改写了（应当保持 A）", &ok);
+            }
+        }
+    }
+
+    // ---- 4) 幂等：切到已经在那儿的目录 ----
+    buf_reset(&out);
+    ws_tool_workspace(&cfg, &sw, &out);
+    if !ty_has(&out, "already the current workspace" as &const byte,
+            bufx_cstr_len("already the current workspace" as &const byte)) {
+        ty_fail(tag, "重复切到同一个目录没有走幂等分支", &ok);
+    }
+
+    // ---- 5) /diff 的文本头写的是工作区（真 git；没装 git 就跳过这一段）----
+    // fixture 仓与 git -C 都是相对路径：先站回仓库根
+    wst_back(&root);
+    if !gitx_available() {
+        out_err("selftest[");
+        out_err(tag);
+        out_err("] skip（本机 PATH 里没有 git：/diff 头那一段没跑）\n");
+    } else if !dg_fixture_make() {
+        ty_fail(tag, "造 git fixture 仓失败", &ok);
+    } else {
+        var abs_fx: Buf = buf_new(1024);
+        defer { buf_free(&abs_fx); }
+        _ = wst_abs(&root, DG_WS, &abs_fx);
+        if agent_workspace_switch(&cfg, abs_fx.ptr as &const byte, abs_fx.len) != WS_OK {
+            ty_fail(tag, "切到 fixture 仓失败", &ok);
+            out_err("  want=");
+            out_err_bytes(abs_fx.ptr as &const byte, abs_fx.len);
+            out_err("\n");
+        }
+        var txt: Buf = buf_new(8192);
+        defer { buf_free(&txt); }
+        gd_print_text(cfg.workspace.ptr as &const byte, cfg.workspace.len, &txt);
+        if !ty_has(&txt, "[diff] " as &const byte, bufx_cstr_len("[diff] " as &const byte)) {
+            ty_fail(tag, "/diff 文本头没了", &ok);
+        }
+        // 头里写的是**短路径**（$HOME → ~），所以期望值也要按同一条规则拼一遍
+        var want: Buf = buf_new(1024);
+        defer { buf_free(&want); }
+        const hm: &byte = getenv("HOME");
+        var hn: usize = 0;
+        if (hm as usize) != 0 {
+            hn = bufx_cstr_len(hm);
+        }
+        if hn > 1 && abs_fx.len > hn && abs_fx.ptr[hn] == 47 as byte &&
+            bufx_mem_eq(abs_fx.ptr as &const byte, hm, hn) {
+            _ = buf_append_cstr(&want, "~");
+            _ = buf_append(&want, abs_fx.ptr + hn, abs_fx.len - hn);
+        } else {
+            _ = buf_append(&want, abs_fx.ptr as &const byte, abs_fx.len);
+        }
+        if !ty_has(&txt, want.ptr as &const byte, want.len) {
+            ty_fail(tag, "/diff 文本头里没有当前会话的工作区", &ok);
+            out_err("  want=");
+            out_err_bytes(want.ptr as &const byte, want.len);
+            out_err("\n  头=");
+            out_err_bytes(txt.ptr as &const byte, txt.len);
+            out_err("\n");
+        }
+        if !ty_has(&txt, "个文件（HEAD ↔ 工作区）" as &const byte,
+                bufx_cstr_len("个文件（HEAD ↔ 工作区）" as &const byte)) {
+            ty_fail(tag, "/diff 文本头里没有文件数", &ok);
+        }
+    }
+
+    agent_session_close();
+    // g_fsctx 存的是裸指针：指回程序级 cfg，别让它悬在本地 cfg 上
+    fsctx_init(base);
+    return ok;
+}
+
 fn diff_parse_round(tag: &const byte) bool {
     var ok: bool = true;
     gd_reset();
@@ -12790,7 +13340,7 @@ fn diff_git_round(tag: &const byte) bool {
     var out: Buf = buf_new(65536);
     defer { buf_free(&out); }
     gd_print_text(DG_WS, bufx_cstr_len(DG_WS), &out);
-    if !ty_has(&out, "[diff] " as &const byte, 7) {
+    if !ty_has(&out, "[diff] " as &const byte, bufx_cstr_len("[diff] " as &const byte)) {
         ty_fail(tag, "文本回退没有 [diff] 头", &ok);
     }
     if !ty_has(&out, "3 个文件" as &const byte, 7) {
@@ -13127,6 +13677,17 @@ export fn selftest_main(base: &const Config) i32 {
         out_err("SELFTEST TASKS FAIL\n");
         return AGENT_PROTO;
     }
+    // 调试入口：只跑 P34（工作区）两轮
+    if env_present("UYA_SELFTEST_WS_ONLY" as &const byte) {
+        const pw0: bool = ws_resolve_round("ws-resolve" as &const byte);
+        const pw1: bool = ws_tool_round("ws-tool" as &const byte, base);
+        if pw0 && pw1 {
+            out_err("SELFTEST WS PASS\n");
+            return AGENT_OK;
+        }
+        out_err("SELFTEST WS FAIL\n");
+        return AGENT_PROTO;
+    }
     // 调试入口：只跑 P29（/goal 人类命令）轮
     if env_present("UYA_SELFTEST_GOAL_ONLY" as &const byte) {
         const g0: bool = goal_cmd_round("goal-cmd" as &const byte);
@@ -13332,8 +13893,11 @@ export fn selftest_main(base: &const Config) i32 {
     const z9: bool = goal_cmd_round("goal-cmd" as &const byte);
     // P33：/sessions 列表（索引去重 + lastActiveAt 倒序 + 三列排版 + 宽度自适应）
     const wC: bool = sess_list_round("sess-list" as &const byte);
+    // P34：工作区（恢复会话时落位 / workspace 工具 / 会话日志与索引两条记录）
+    const wF: bool = ws_resolve_round("ws-resolve" as &const byte);
+    const wG: bool = ws_tool_round("ws-tool" as &const byte, base);
     if r1 && r2 && r3 && r4 && r5 && r5b && r6 && r7 && r8 && r9 && s0 && s1 && s2 && s3 && s4 && s5 && s6 && s7 && t0 && t1 && t2 && t3 && t3b && t4 && t5 && t6 && t7 && t8 && t9 && t10 && t11 && u0 && u1 && u2 && u3 && v0 && v1 && v2 && v3 && v4 && v5 && v6 && v7 && v8 && v9 && r1r && r1t && r1s && y0 && y1
-        && x0 && x1 && x2 && x3 && x4 && x5 && x6 && x7 && x8 && x9 && x9a && x9b && x10 && x11 && x12 && x13 && x14 && x15 && x16 && w0 && w1 && w2 && w3 && w3b && w3c && w4 && w5 && w5b && w6 && w7 && w8 && w9 && wA && wB && wC && z0 && z1 && z2 && z3 && z4 && z5 && z6 && z7 && z8 && z9 {
+        && x0 && x1 && x2 && x3 && x4 && x5 && x6 && x7 && x8 && x9 && x9a && x9b && x10 && x11 && x12 && x13 && x14 && x15 && x16 && w0 && w1 && w2 && w3 && w3b && w3c && w4 && w5 && w5b && w6 && w7 && w8 && w9 && wA && wB && wC && wF && wG && z0 && z1 && z2 && z3 && z4 && z5 && z6 && z7 && z8 && z9 {
         out_err("SELFTEST PASS\n");
         return AGENT_OK;
     }
