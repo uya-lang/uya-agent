@@ -20,7 +20,7 @@
 UYA_ROOT ?= /home/winger/uya-0.10/lib/
 UYA      ?= /home/winger/uya-0.10/bin/uya
 
-SRC := src/bufx.uya src/jsonx.uya src/httpc.uya src/httpstream.uya src/sse.uya src/llm.uya src/tty.uya src/sigx.uya src/inbox.uya src/session.uya src/stats.uya src/procx.uya src/yamlcfg.uya src/dshcfg.uya src/dshsess.uya src/prompt.uya src/instr.uya src/compact.uya src/skill.uya src/webx.uya src/deleg.uya src/goal.uya src/workflow.uya src/todo.uya src/plan.uya src/perm.uya src/sandboxx.uya src/askuser.uya src/fsx.uya src/search.uya src/jobs.uya src/shellx.uya src/gitx.uya src/gitdiff.uya src/tools.uya src/diffx.uya src/view.uya src/tasks.uya src/tui.uya src/agent.uya src/sigselftest.uya src/tuiselftest.uya src/selftest.uya
+SRC := src/bufx.uya src/jsonx.uya src/httpc.uya src/httpstream.uya src/sse.uya src/llm.uya src/tty.uya src/sigx.uya src/inbox.uya src/session.uya src/stats.uya src/procx.uya src/yamlcfg.uya src/dshcfg.uya src/modelx.uya src/dshsess.uya src/prompt.uya src/instr.uya src/compact.uya src/skill.uya src/webx.uya src/deleg.uya src/goal.uya src/workflow.uya src/todo.uya src/plan.uya src/perm.uya src/sandboxx.uya src/askuser.uya src/fsx.uya src/search.uya src/jobs.uya src/shellx.uya src/gitx.uya src/gitdiff.uya src/worktreex.uya src/tools.uya src/diffx.uya src/view.uya src/tasks.uya src/tui.uya src/agent.uya src/sigselftest.uya src/tuiselftest.uya src/selftest.uya
 OUT := build/uya-agent
 
 BASE ?= https://api.deepseek.com/v1
@@ -31,7 +31,7 @@ TASK ?= 创建 hello.uya，编译并运行它
 export UYA_ROOT
 export UYA_SPLIT_C_DIR := $(CURDIR)/build/uyacache
 
-.PHONY: all check build selftest codegen-audit probe e2e e2e-config e2e-config-flags e2e-title e2e-api e2e-steps e2e-permission e2e-sandbox e2e-tasks e2e-goal e2e-sessions e2e-resume-big e2e-diff e2e-ws e2e-dsh p30-check tui-demo tui-selftest sess-selftest diff-selftest clean
+.PHONY: all check build selftest codegen-audit probe e2e e2e-config e2e-config-flags e2e-title e2e-api e2e-steps e2e-permission e2e-sandbox e2e-tasks e2e-goal e2e-sessions e2e-resume-big e2e-diff e2e-ws e2e-model e2e-worktree e2e-dsh p30-check tui-demo tui-selftest sess-selftest diff-selftest model-selftest clean
 
 all: build
 
@@ -56,7 +56,7 @@ codegen-audit: build
 	fi; \
 	echo "codegen-audit: 通过（没有切片描述符强转）"
 
-selftest: build codegen-audit e2e-config-flags e2e-title e2e-api e2e-steps e2e-permission e2e-sandbox e2e-tasks e2e-goal e2e-sessions e2e-resume-big e2e-diff e2e-ws p30-check
+selftest: build codegen-audit e2e-config-flags e2e-title e2e-api e2e-steps e2e-permission e2e-sandbox e2e-tasks e2e-goal e2e-sessions e2e-resume-big e2e-diff e2e-ws e2e-model e2e-worktree p30-check
 	UYA_BIN=$(UYA) $(OUT) --selftest
 
 probe: build
@@ -190,6 +190,71 @@ e2e-diff: build
 #   ① 恢复会话时工作区跟着**会话记录**走，/diff 打的是那个工作区的改动；
 #   ② 恢复不去动日志的存放位置（不再造出同 id 的空文件、索引 cwd 不被改写）；
 #   ③ 显式 --workspace 优先于会话记录；
+# P37：模型选择 + 推理强度（离线，全程不联网）
+#   ① 目录来自 DSH 设置：--print-config 要报 provider / 档位清单（构造一份假 settings.yaml）；
+#   ② 不认识模型名：只换名字，provider / contextWindow 保持不动（静默清空会让压缩失效）；
+#   ③ 行式 REPL：/model 报告 + 切换、/effort 报告 + 合法档位收、非法档位拒并列出可选；
+#   ④ 不公布档位的模型：--effort 原样透传（不 clamp），/effort 仍能报出当前值。
+e2e-model: build
+	@set -e; \
+	home=build/selftest_p37_e2e; rm -rf $$home; mkdir -p $$home; \
+	printf 'llm-pi-ai:\n  providers:\n    {\n      alpha:\n        {\n          api: openai-responses,\n          baseURL: https://alpha.example/v1,\n          models:\n            [\n              { id: a-plain, contextWindow: 111000 },\n              { id: a-think, contextWindow: 222000, reasoningEfforts: { off: none, low: low, high: high } }\n            ]\n        }\n    }\nagent-default-model:\n  provider: alpha\n  model: a-think\n  reasoningEffort: high\n' > $$home/settings.yaml; \
+	run="$(CURDIR)/$(OUT) --dsh-home $$home --no-tui --quiet --api-key dummy-key"; \
+	out=$$($$run --print-config 2>&1); \
+	echo "$$out" | grep -q "model = a-think  (source: dsh-settings)" || { echo "FAIL: DSH 的默认模型没生效"; echo "$$out"; exit 1; }; \
+	echo "$$out" | grep -q "provider = alpha  (source: dsh-settings)" || { echo "FAIL: provider 没解析出来"; echo "$$out"; exit 1; }; \
+	echo "$$out" | grep -q "model_catalog = 2 model(s)" || { echo "FAIL: 目录条目数不对"; echo "$$out"; exit 1; }; \
+	echo "$$out" | grep -q "^efforts = off, low, high" || { echo "FAIL: 公布的档位清单不对"; echo "$$out"; exit 1; }; \
+	out=$$($$run --model not-in-catalog --print-config 2>&1); \
+	echo "$$out" | grep -q "model = not-in-catalog" || { echo "FAIL: 目录外的模型名没换上去"; exit 1; }; \
+	echo "$$out" | grep -q "provider = alpha" || { echo "FAIL: 目录外的模型不该清掉 provider"; echo "$$out"; exit 1; }; \
+	echo "$$out" | grep -q "context_window = 222000" || { echo "FAIL: 目录外的模型不该清掉 contextWindow"; echo "$$out"; exit 1; }; \
+	out=$$(printf '/model\n/effort\n/effort bogus\n/effort low\n/effort\n/exit\n' | $$run 2>&1); \
+	echo "$$out" | grep -q "model      a-think  ·  provider alpha" || { echo "FAIL: /model 报告不对"; echo "$$out"; exit 1; }; \
+	echo "$$out" | grep -q "^efforts    off, low, high" || { echo "FAIL: /model 报告里没有档位清单"; echo "$$out"; exit 1; }; \
+	echo "$$out" | grep -q "# alpha" || { echo "FAIL: /model 报告没有按提供方分组"; echo "$$out"; exit 1; }; \
+	echo "$$out" | grep -q "不是这个模型公布的档位" || { echo "FAIL: 非法档位没有报错"; echo "$$out"; exit 1; }; \
+	echo "$$out" | grep -q "推理强度已切换" || { echo "FAIL: /effort low 没切过去"; echo "$$out"; exit 1; }; \
+	: "④ 不公布档位的模型：原样透传"; \
+	out=$$($$run --model a-plain --effort xhigh --print-config 2>&1); \
+	echo "$$out" | grep -q "reasoning_effort = xhigh" || { echo "FAIL: 不公布档位时应当原样透传"; echo "$$out"; exit 1; }; \
+	echo "$$out" | grep -q "not a level this model publishes" || { echo "FAIL: 透传的值应当被标出来（不是模型公布的档位）"; echo "$$out"; exit 1; }; \
+	echo "e2e-model: 通过（目录/能力跟随/目录外只换名字/REPL 报告与切换/非法档位拒/透传标注）"
+
+# P37：Git worktree（离线，真 git）：独立工作区执行 → 合并 → 删除
+#   ① --worktree 开会话：建出 worktree + dsh/<slug> 分支，主检出的文件不受影响；
+#   ② 闸门：往共享 checkout 写文件被拒（并指路 worktree 里的同一相对路径）；
+#   ③ finish：提交 → 合并回 base → **删掉 worktree 与分支**，改动出现在主检出上；
+#   ④ --no-worktree / 非仓库：不建（fail soft）。
+e2e-worktree: build
+	@set -e; \
+	if ! command -v git >/dev/null 2>&1; then echo "e2e-worktree: skip（本机没有 git）"; exit 0; fi; \
+	ws=build/selftest_p37_e2e_wt; rm -rf $$ws; mkdir -p $$ws; \
+	( cd $$ws && git init -q . && git config user.email t@t && git config user.name t && \
+	  printf 'base\n' > base.txt && git add -A && git commit -qm init ); \
+	run="$(CURDIR)/$(OUT) --no-dsh-config --no-tui --quiet --api-key dummy-key --worktree --no-save"; \
+	: "① 建 worktree（状态报告里要看得见路径与分支）"; \
+	out=$$(cd $$ws && printf '/worktree status\n/exit\n' | $$run 2>&1); \
+	echo "$$out" | grep -q "worktree: .*\.git/dsh-worktrees/session-" || { echo "FAIL: /worktree status 没报出 worktree 路径"; echo "$$out"; exit 1; }; \
+	echo "$$out" | grep -q "branch:   dsh/session-" || { echo "FAIL: /worktree status 没报出会话分支"; echo "$$out"; exit 1; }; \
+	n=$$(cd $$ws && git worktree list | grep -c "dsh-worktrees"); \
+	[ "$$n" = "1" ] || { echo "FAIL: 会话开始没有建出 worktree（数量=$$n）"; exit 1; }; \
+	b=$$(cd $$ws && git branch --list 'dsh/*' | wc -l); \
+	[ "$$b" = "1" ] || { echo "FAIL: 没有建出 dsh/* 会话分支（数量=$$b）"; exit 1; }; \
+	: "④ 非仓库 / --no-worktree：不建"; \
+	: "   注意：norepo 必须放在 /tmp —— 放在 build/ 下面它会**继承外层仓库**（git 会往上找）"; \
+	nr=/tmp/selftest_p37_e2e_norepo_$$$$; rm -rf $$nr; mkdir -p $$nr; \
+	out=$$(cd $$nr && printf '/worktree status\n/exit\n' | $$run 2>&1); \
+	echo "$$out" | grep -q "not inside a Git repository" || { echo "FAIL: 非仓库目录没有 fail soft"; echo "$$out"; exit 1; }; \
+	(cd $$ws && git worktree list | grep -q "dsh-worktrees") || { echo "FAIL: 非仓库那一次把 $$ws 的 worktree 弄丢了"; exit 1; }; \
+	: "④b --no-worktree 明确关"; \
+	ws2=build/selftest_p37_e2e_wt_off; rm -rf $$ws2; mkdir -p $$ws2; \
+	( cd $$ws2 && git init -q . && git config user.email t@t && git config user.name t && printf 'x\n' > x.txt && git add -A && git commit -qm init ); \
+	out=$$(cd $$ws2 && printf '/worktree status\n/exit\n' | $(CURDIR)/$(OUT) --no-dsh-config --no-tui --quiet --api-key dummy-key --no-worktree --no-save 2>&1); \
+	echo "$$out" | grep -q "worktree mode is off" || { echo "FAIL: --no-worktree 没有关掉"; echo "$$out"; exit 1; }; \
+	( cd $$ws2 && git worktree list | grep -q "dsh-worktrees" ) && { echo "FAIL: --no-worktree 还是建了 worktree"; exit 1; } || true; \
+	echo "e2e-worktree: 通过（建 worktree+分支 / 非仓库 fail soft / --no-worktree 关闭）"
+
 #   ④ 记录的工作区被删（worktree 合并后就删是常态）→ 留在当前工作区 + 留话 + 记一条 fallback。
 # 会话日志用 python3 手写（格式与 sess_open 逐字节一致）：这一轮**不联网、不用模型**。
 # 两个工作区都用**绝对**路径：切换是真的 chdir，相对路径会被带到新工作区下面去。
@@ -432,6 +497,10 @@ tui-demo: build
 # TUI 相关自测轮（只跑 frame/keys/sink/turn/pty，改动 TUI 时比整轮 selftest 快得多）
 tui-selftest: build
 	UYA_SELFTEST_TUI_ONLY=1 $(OUT) --selftest
+
+# P37：模型选择 / 推理强度 / worktree 的自测轮（改这条线时比整轮 selftest 快）
+model-selftest: build
+	UYA_SELFTEST_MODEL_ONLY=1 $(OUT) --selftest
 
 # P33：/sessions 列表的自测轮（纯函数排版 + TUI 浮层），改会话列表时比整轮 selftest 快
 sess-selftest: build

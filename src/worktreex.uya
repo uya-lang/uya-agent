@@ -1,0 +1,971 @@
+// src/worktreex.uya — P37：Git worktree（独立工作区执行 → 合并 → 删除）
+//
+// 逐字对齐 DSH 的 `git-worktree` agent preset（~/.dsh/.agent-presets/git-worktree/worktree.js）：
+//   * 每个**顶层**会话一开就在自己的 worktree（新分支）里干活，干完由 `worktree` 工具的
+//     finish 提交、合并回主干、**删掉 worktree 与分支**（这正是「独立工作区执行 → 合并 → 删除」）；
+//   * 默认值：baseBranch=''（探测 main→master→HEAD）、branchPrefix='dsh/'、
+//     worktreeRoot='.git/dsh-worktrees'、mergeStrategy='merge'、commitOnFinish=true、
+//     guardMainCheckout=true；
+//   * 子代理**共享父的** worktree（不另建），也不许自己 finish/discard；
+//   * 不是 git 仓库 / 找不到 git ⇒ phase=skipped，照常在原工作区干活（fail soft，同 DSH）。
+//
+// 与 DSH 的一处**有意的偏离**：DSH 让模型显式调 `worktree start`；这里在会话开始时
+// **自动建**（对齐 DSH preset 的 `agent/session-start` 钩子），所以「一开会话就在 worktree 里」
+// 是默认行为，不需要模型先想起那个工具。start 动作仍然保留（幂等），供 finish/discard 之后再来一轮。
+//
+// git 调用一律走 gitx.uya（10s 墙钟超时 + 泵点，界面不假死；GIT_OPTIONAL_LOCKS=0 不写 index.lock）。
+
+use libc.syscall;
+use libc.unistd;
+
+// 相对仓库根的 worktree 根目录（DSH 默认：放 .git 下面 —— glob/grep 会剪掉 .git 子树，
+// 于是每个文件不会被搜出两遍；工作区仍是仓库根本身，不需要额外的可写 bind）
+const WT_ROOT: &const byte = ".git/dsh-worktrees" as &const byte;
+const WT_BRANCH_PREFIX: &const byte = "dsh/" as &const byte;
+const WT_SEP: byte = 47;   // '/'
+
+export const WT_SKIP_NONE: u8 = 0;      // 还没试过
+export const WT_SKIP_NO_REPO: u8 = 1;   // 工作区不在 git 仓库里
+export const WT_SKIP_NO_GIT: u8 = 2;    // PATH 里找不到 git
+export const WT_SKIP_SUBAGENT: u8 = 3;  // 子代理共享父的 worktree
+
+export const WT_E_NONE: i32 = 0;
+export const WT_E_SPAWN: i32 = -1;      // fork/pipe 失败
+export const WT_E_TIMEOUT: i32 = -2;    // git 墙钟超时
+export const WT_E_BASE: i32 = -3;       // 会话分支 == 基分支（branchPrefix 配错）
+export const WT_E_ADD: i32 = -4;        // git worktree add 非零
+export const WT_E_MERGE: i32 = -5;      // 合并冲突（已 abort，主干未动）
+
+export struct WtState {
+    phase: u32,          // WT_PHASE_*
+    skip: u8,            // 供 skipped 说明原因
+    repo_root: Buf,
+    worktree_path: Buf,
+    branch: Buf,
+    base: Buf,
+    note: Buf,           // 失败原因（单行、给人看）
+}
+
+export const WT_PHASE_NONE: u32 = 0;
+export const WT_PHASE_READY: u32 = 1;
+export const WT_PHASE_SKIPPED: u32 = 2;
+export const WT_PHASE_FAILED: u32 = 3;
+export const WT_PHASE_FINISHED: u32 = 4;
+export const WT_PHASE_DISCARDED: u32 = 5;
+
+export fn wt_empty() WtState {
+    return WtState{
+        phase: WT_PHASE_NONE,
+        skip: WT_SKIP_NONE,
+        repo_root: buf_empty(),
+        worktree_path: buf_empty(),
+        branch: buf_empty(),
+        base: buf_empty(),
+        note: buf_empty(),
+    };
+}
+
+export fn wt_free(w: &WtState) void {
+    buf_free(&w.repo_root);
+    buf_free(&w.worktree_path);
+    buf_free(&w.branch);
+    buf_free(&w.base);
+    buf_free(&w.note);
+}
+
+// 给缓冲补一个**尾 NUL 但不算进 len**：git 的 argv 是 C 字符串数组，
+// `Buf.ptr` 没有尾 NUL 时 execve 会把后面堆字节也算进参数（实测 `fatal: cannot change to
+// '/tmp/x'` —— 参数多出半截路径）。这几个路径字段建好后一律过一遍这里。
+fn wt_nul(b: &Buf) void {
+    if !buf_valid(b) {
+        return;
+    }
+    _ = buf_append_byte(b, 0);
+    if b.len > 0 {
+        b.len = b.len - 1;
+    }
+}
+
+// ============================================================
+// 状态（进程级；TUI/滚动模式/提示词都读它）
+// ============================================================
+var g_wt: WtState = WtState{
+    phase: WT_PHASE_NONE,
+    skip: WT_SKIP_NONE,
+    repo_root: Buf{ ptr: null, len: 0, cap: 0 },
+    worktree_path: Buf{ ptr: null, len: 0, cap: 0 },
+    branch: Buf{ ptr: null, len: 0, cap: 0 },
+    base: Buf{ ptr: null, len: 0, cap: 0 },
+    note: Buf{ ptr: null, len: 0, cap: 0 },
+};
+var g_wt_on: bool = false;      // 模式开关（--worktree / DSH preset / /worktree on）
+
+export fn wt_set_on(on: bool) void {
+    g_wt_on = on;
+}
+
+export fn wt_on() bool {
+    return g_wt_on;
+}
+
+export fn wt_state() &const WtState {
+    return &g_wt;
+}
+
+export fn wt_phase() u32 {
+    return g_wt.phase;
+}
+
+export fn wt_ready() bool {
+    return g_wt.phase == WT_PHASE_READY;
+}
+
+// 自测用：把状态复位（下一轮重新建）
+export fn wt_reset() void {
+    wt_free(&g_wt);
+    g_wt = WtState{
+        phase: WT_PHASE_NONE,
+        skip: WT_SKIP_NONE,
+        repo_root: buf_empty(),
+        worktree_path: buf_empty(),
+        branch: buf_empty(),
+        base: buf_empty(),
+        note: buf_empty(),
+    };
+}
+
+// ============================================================
+// git 调用小工具（argv 是 NUL 结尾的 C 字符串数组）
+// ============================================================
+var g_wt_out: Buf = Buf{ ptr: null, len: 0, cap: 0 };
+var g_wt_err: Buf = Buf{ ptr: null, len: 0, cap: 0 };
+
+fn wt_bufs_ensure() void {
+    if !buf_valid(&g_wt_out) {
+        g_wt_out = buf_new(65536);
+    }
+    if !buf_valid(&g_wt_err) {
+        g_wt_err = buf_new(8192);
+    }
+}
+
+fn wt_git(argv: &(&const byte), out: &Buf) i32 {
+    wt_bufs_ensure();
+    buf_reset(out);
+    const rc: i32 = gitx_run(null as &const byte, argv, out, &g_wt_err, 32768);
+    if rc == GITX_E_NO_GIT {
+        return WT_E_SPAWN;
+    }
+    if rc == GITX_E_TIMEOUT {
+        return WT_E_TIMEOUT;
+    }
+    if rc < 0 {
+        return WT_E_SPAWN;
+    }
+    return rc;   // 0 = 成功，其余是 git 自己的退出码
+}
+
+// 单行输出（rev-parse 之类）
+fn wt_git_line(argv: &(&const byte), out: &Buf) i32 {
+    const rc: i32 = wt_git(argv, out);
+    if rc == 0 {
+        gitx_trim_nl(out);
+    }
+    return rc;
+}
+
+// ============================================================
+// 探测 / 建
+// ============================================================
+
+// 会话分支的 slug：会话 id 里除 [A-Za-z0-9] 之外全变 '-'，并截到 40 字节。
+// （DSH 的 sessionSlug 就是这个口径：分支名/目录名都要能安全进 git ref。）
+fn wt_slug(id: &const byte, n: usize, out: &Buf) void {
+    buf_reset(out);
+    var i: usize = 0;
+    while i < n && out.len < 40 {
+        const c: byte = id[i];
+        const ok: bool = (c >= 97 as byte && c <= 122 as byte) ||
+            (c >= 65 as byte && c <= 90 as byte) ||
+            (c >= 48 as byte && c <= 57 as byte);
+        if ok {
+            _ = buf_append_byte(out, c);
+        } else {
+            _ = buf_append_byte(out, 45);   // '-'
+        }
+        i = i + 1;
+    }
+    if out.len == 0 {
+        _ = buf_append_cstr(out, "session");
+    }
+}
+
+// 分支是否存在？
+fn wt_branch_exists(repo: &const byte, branch: &const byte) bool {
+    var av: [&const byte: 8] = [null as &const byte: 8];
+    av[0] = "git" as &const byte;
+    av[1] = "-C" as &const byte;
+    av[2] = repo;
+    av[3] = "show-ref" as &const byte;
+    av[4] = "--verify" as &const byte;
+    av[5] = "--quiet" as &const byte;
+    var ref: Buf = buf_new(256);
+    defer { buf_free(&ref); }
+    _ = buf_append_cstr(&ref, "refs/heads/");
+    _ = buf_append(&ref, branch, bufx_cstr_len(branch));
+    _ = buf_append_byte(&ref, 0);
+    av[6] = ref.ptr as &const byte;
+    av[7] = null as &const byte;
+    var o: Buf = buf_new(256);
+    defer { buf_free(&o); }
+    const rc: i32 = wt_git(&av[0], &o);
+    return rc == 0;
+}
+
+// 基分支：默认探测 main → master → 共享 checkout 的 HEAD（DSH 的 detectBase）
+fn wt_detect_base(repo: &const byte, out: &Buf) void {
+    buf_reset(out);
+    if wt_branch_exists(repo, "main" as &const byte) {
+        _ = buf_append_cstr(out, "main");
+        return;
+    }
+    if wt_branch_exists(repo, "master" as &const byte) {
+        _ = buf_append_cstr(out, "master");
+        return;
+    }
+    var av: [&const byte: 8] = [null as &const byte: 8];
+    av[0] = "git" as &const byte;
+    av[1] = "-C" as &const byte;
+    av[2] = repo;
+    av[3] = "rev-parse" as &const byte;
+    av[4] = "--abbrev-ref" as &const byte;
+    av[5] = "HEAD" as &const byte;
+    av[6] = null as &const byte;
+    const rc: i32 = wt_git_line(&av[0], out);
+    if rc != 0 || out.len == 0 {
+        buf_reset(out);
+        _ = buf_append_cstr(out, "HEAD");
+    }
+}
+
+// worktree 是否已注册（git worktree list --porcelain 里有没有这一条）
+fn wt_registered(repo: &const byte, path: &const byte) bool {
+    var av: [&const byte: 8] = [null as &const byte: 8];
+    av[0] = "git" as &const byte;
+    av[1] = "-C" as &const byte;
+    av[2] = repo;
+    av[3] = "worktree" as &const byte;
+    av[4] = "list" as &const byte;
+    av[5] = "--porcelain" as &const byte;
+    av[6] = null as &const byte;
+    var o: Buf = buf_new(8192);
+    defer { buf_free(&o); }
+    if wt_git(&av[0], &o) != 0 {
+        return false;
+    }
+    const want: usize = bufx_cstr_len(path);
+    var pos: usize = 0;
+    while pos + 9 <= o.len {
+        if bufx_mem_eq(o.ptr + pos, "worktree " as &const byte, 9) {
+            const s: usize = pos + 9;
+            var e: usize = s;
+            while e < o.len && o.ptr[e] != 10 as byte && o.ptr[e] != 13 as byte {
+                e = e + 1;
+            }
+            if e - s == want && bufx_mem_eq(o.ptr + s, path, want) {
+                return true;
+            }
+        }
+        // 下一行
+        while pos < o.len && o.ptr[pos] != 10 as byte {
+            pos = pos + 1;
+        }
+        pos = pos + 1;
+    }
+    return false;
+}
+
+// 建这个会话的 worktree + 分支（幂等：已注册就直接认）。返回 WT_E_*（0 = 成功）。
+// session_id 空时用 "session" 兜底（子代理/自测会给确定的值）。
+export fn wt_provision(cfg: &const Config, ws: &const byte, wsn: usize, session_id: &const byte, sidn: usize) i32 {
+    wt_bufs_ensure();
+    if g_wt.phase == WT_PHASE_READY {
+        return WT_E_NONE;
+    }
+    if !g_wt_on {
+        return WT_E_NONE;
+    }
+    // 子代理共享父的 worktree（父已经把工作区切过去了，这里什么都不做）
+    if cfg.is_subagent || cfg.deleg_depth > 0 {
+        g_wt.phase = WT_PHASE_SKIPPED;
+        g_wt.skip = WT_SKIP_SUBAGENT;
+        if !buf_valid(&g_wt.note) {
+            g_wt.note = buf_new(64);
+        }
+        buf_reset(&g_wt.note);
+        _ = buf_append_cstr(&g_wt.note, "subagent shares its parent's worktree");
+        return WT_E_NONE;
+    }
+    var wsc: Buf = buf_new(wsn + 1);
+    defer { buf_free(&wsc); }
+    _ = buf_append(&wsc, ws, wsn);
+    _ = buf_append_byte(&wsc, 0);
+    // 仓库根
+    var av: [&const byte: 8] = [null as &const byte: 8];
+    av[0] = "git" as &const byte;
+    av[1] = "-C" as &const byte;
+    av[2] = wsc.ptr as &const byte;
+    av[3] = "rev-parse" as &const byte;
+    av[4] = "--show-toplevel" as &const byte;
+    av[5] = null as &const byte;
+    g_wt.repo_root = buf_new(1200);
+    const rc: i32 = wt_git_line(&av[0], &g_wt.repo_root);
+    if rc == WT_E_SPAWN || rc == WT_E_TIMEOUT {
+        g_wt.phase = WT_PHASE_FAILED;
+        wt_set_note("git is unavailable or timed out");
+        return rc;
+    }
+    if rc != 0 || g_wt.repo_root.len == 0 {
+        g_wt.phase = WT_PHASE_SKIPPED;
+        g_wt.skip = WT_SKIP_NO_REPO;
+        wt_set_note("the workspace is not inside a Git repository");
+        return WT_E_NONE;
+    }
+    // git 的 argv 是 C 字符串：repo_root 立刻补 NUL（detect_base / branch_exists 马上就用它）
+    wt_nul(&g_wt.repo_root);
+    // slug / 路径 / 分支 / 基分支
+    var slug: Buf = buf_new(64);
+    defer { buf_free(&slug); }
+    wt_slug(session_id, sidn, &slug);
+    g_wt.worktree_path = buf_new(g_wt.repo_root.len + 128);
+    _ = buf_append(&g_wt.worktree_path, g_wt.repo_root.ptr as &const byte, g_wt.repo_root.len);
+    _ = buf_append_byte(&g_wt.worktree_path, WT_SEP);
+    _ = buf_append_cstr(&g_wt.worktree_path, WT_ROOT);
+    _ = buf_append_byte(&g_wt.worktree_path, WT_SEP);
+    _ = buf_append(&g_wt.worktree_path, slug.ptr as &const byte, slug.len);
+    // 路径 NUL 版本（git 参数要 C 字符串）
+    var wtpz: Buf = buf_new(g_wt.worktree_path.len + 1);
+    defer { buf_free(&wtpz); }
+    _ = buf_append(&wtpz, g_wt.worktree_path.ptr as &const byte, g_wt.worktree_path.len);
+    _ = buf_append_byte(&wtpz, 0);
+    g_wt.branch = buf_new(64);
+    _ = buf_append_cstr(&g_wt.branch, WT_BRANCH_PREFIX);
+    _ = buf_append(&g_wt.branch, slug.ptr as &const byte, slug.len);
+    var brz: Buf = buf_new(g_wt.branch.len + 1);
+    defer { buf_free(&brz); }
+    _ = buf_append(&brz, g_wt.branch.ptr as &const byte, g_wt.branch.len);
+    _ = buf_append_byte(&brz, 0);
+    g_wt.base = buf_new(128);
+    wt_detect_base(g_wt.repo_root.ptr as &const byte, &g_wt.base);
+    wt_nul(&g_wt.base);
+    wt_nul(&g_wt.worktree_path);
+    wt_nul(&g_wt.branch);
+    if g_wt.base.len == g_wt.branch.len &&
+        bufx_mem_eq(g_wt.base.ptr as &const byte, g_wt.branch.ptr as &const byte, g_wt.base.len) {
+        g_wt.phase = WT_PHASE_FAILED;
+        wt_set_note("the session branch would equal the base branch; set a different branchPrefix");
+        return WT_E_BASE;
+    }
+    if wt_registered(g_wt.repo_root.ptr as &const byte, g_wt.worktree_path.ptr as &const byte) {
+        g_wt.phase = WT_PHASE_READY;
+        return WT_E_NONE;
+    }
+    // git worktree add [-b <branch>] <path> [<base>]
+    var av2: [&const byte: 10] = [null as &const byte: 10];
+    av2[0] = "git" as &const byte;
+    av2[1] = "-C" as &const byte;
+    av2[2] = g_wt.repo_root.ptr as &const byte;
+    av2[3] = "worktree" as &const byte;
+    av2[4] = "add" as &const byte;
+    var slot: usize = 5;
+    const have_branch: bool = wt_branch_exists(g_wt.repo_root.ptr as &const byte, g_wt.branch.ptr as &const byte);
+    var basez: Buf = buf_new(g_wt.base.len + 1);
+    defer { buf_free(&basez); }
+    _ = buf_append(&basez, g_wt.base.ptr as &const byte, g_wt.base.len);
+    _ = buf_append_byte(&basez, 0);
+    if !have_branch {
+        av2[slot] = "-b" as &const byte; slot = slot + 1;
+        av2[slot] = brz.ptr as &const byte; slot = slot + 1;
+    }
+    av2[slot] = wtpz.ptr as &const byte; slot = slot + 1;
+    if !have_branch {
+        av2[slot] = basez.ptr as &const byte; slot = slot + 1;
+    }
+    av2[slot] = null as &const byte;
+    var o2: Buf = buf_new(8192);
+    defer { buf_free(&o2); }
+    const rc2: i32 = wt_git(&av2[0], &o2);
+    if rc2 != 0 {
+        g_wt.phase = WT_PHASE_FAILED;
+        if rc2 == WT_E_TIMEOUT {
+            wt_set_note("git worktree add timed out");
+        } else {
+            wt_set_note("git worktree add failed");
+        }
+        return WT_E_ADD;
+    }
+    g_wt.phase = WT_PHASE_READY;
+    return WT_E_NONE;
+}
+
+fn wt_set_note(s: &const byte) void {
+    if !buf_valid(&g_wt.note) {
+        g_wt.note = buf_new(256);
+    }
+    buf_reset(&g_wt.note);
+    _ = buf_append_cstr(&g_wt.note, s);
+}
+
+// 提示词那一节（逐字对齐 preset 的 renderSection 骨架；文案按我们自己的观感写）
+export fn wt_section_into(out: &Buf) void {
+    buf_reset(out);
+    if !g_wt_on {
+        return;
+    }
+    if g_wt.phase == WT_PHASE_SKIPPED || g_wt.phase == WT_PHASE_FAILED {
+        _ = buf_append_cstr(out, "# Git worktree discipline\n\nNo session worktree is available: ");
+        _ = buf_append(out, g_wt.note.ptr as &const byte, g_wt.note.len);
+        _ = buf_append_cstr(out, ".\nWork in the session working directory instead, and say so in your final answer.");
+        return;
+    }
+    if g_wt.phase == WT_PHASE_FINISHED || g_wt.phase == WT_PHASE_DISCARDED {
+        _ = buf_append_cstr(out, "# Git worktree discipline\n\nThe branch was already ");
+        if g_wt.phase == WT_PHASE_FINISHED {
+            _ = buf_append_cstr(out, "merged into ");
+        } else {
+            _ = buf_append_cstr(out, "discarded without merging into ");
+        }
+        _ = buf_append(out, g_wt.base.ptr as &const byte, g_wt.base.len);
+        _ = buf_append_cstr(out, ", and the worktree is gone.\nCall `worktree` with action \"start\" to provision a fresh worktree before doing more work.");
+        return;
+    }
+    if g_wt.phase != WT_PHASE_READY {
+        _ = buf_append_cstr(out, "# Git worktree discipline\n\nThis session is a Git-worktree session, but its worktree is not provisioned yet.\nCall `worktree` with action \"start\" before editing anything.");
+        return;
+    }
+    _ = buf_append_cstr(out, "# Git worktree discipline\n\nThis session is a Git-worktree session. The shared checkout is NOT the place to work:\n\n- Repository root (shared checkout): ");
+    _ = buf_append(out, g_wt.repo_root.ptr as &const byte, g_wt.repo_root.len);
+    _ = buf_append_cstr(out, "\n- Your worktree: ");
+    _ = buf_append(out, g_wt.worktree_path.ptr as &const byte, g_wt.worktree_path.len);
+    _ = buf_append_cstr(out, "\n- Your branch: ");
+    _ = buf_append(out, g_wt.branch.ptr as &const byte, g_wt.branch.len);
+    _ = buf_append_cstr(out, " (based on ");
+    _ = buf_append(out, g_wt.base.ptr as &const byte, g_wt.base.len);
+    _ = buf_append_cstr(out, ")\n\nFollow the user's plan entirely inside your worktree, and treat the repository root as read-only:\n\n");
+    _ = buf_append_cstr(out, "- Bash runs with the worktree as its working directory; a command that names the shared checkout to change state is refused by this mode's guard.\n");
+    _ = buf_append_cstr(out, "- read / write / edit / glob / grep resolve against the worktree; writing into the shared checkout is refused.\n");
+    _ = buf_append_cstr(out, "- Never commit, format, or generate files in the shared checkout. It stays on its branch until the merge.\n\n");
+    _ = buf_append_cstr(out, "When the work is complete and verified, call `worktree` with action \"finish\". It commits anything still pending, merges your branch into ");
+    _ = buf_append(out, g_wt.base.ptr as &const byte, g_wt.base.len);
+    _ = buf_append_cstr(out, " in the shared checkout, then removes the worktree and deletes the branch.\n");
+    _ = buf_append_cstr(out, "If the work is abandoned instead, call it with action \"discard\" so the worktree does not linger.\n");
+    _ = buf_append_cstr(out, "Call it with action \"status\" whenever you need the current diff, commit count, or uncommitted paths.");
+}
+
+// ============================================================
+// 写闸门（对齐 preset 的 tools/pre-execute guard）
+// ============================================================
+// 目标在 repo 内、却不在 worktree 内 ⇒ 落在共享 checkout 上 ⇒ 拒绝（返回 true）。
+// `path` 是**绝对路径**（文件工具已经解析过）；两棵子树都按「前缀 + '/'」比，
+// 避免 `/x/ab` 被 `/x/a` 误判成在子树内。
+export fn wt_guard_path_crosses(path: &const byte, pn: usize) bool {
+    if !g_wt_on || g_wt.phase != WT_PHASE_READY {
+        return false;
+    }
+    const repo: usize = g_wt.repo_root.len;
+    const wtree: usize = g_wt.worktree_path.len;
+    const in_repo: bool = pn > repo && bufx_mem_eq(path, g_wt.repo_root.ptr as &const byte, repo) && path[repo] == WT_SEP;
+    if !in_repo {
+        return false;
+    }
+    const in_wt: bool = pn > wtree && bufx_mem_eq(path, g_wt.worktree_path.ptr as &const byte, wtree) && path[wtree] == WT_SEP;
+    return !in_wt;
+}
+
+// 把共享 checkout 内的绝对路径折成「worktree 里的同一相对路径」（给指路文案用）。
+export fn wt_relocated_into(path: &const byte, pn: usize, out: &Buf) void {
+    buf_reset(out);
+    _ = buf_append(out, g_wt.worktree_path.ptr as &const byte, g_wt.worktree_path.len);
+    const repo: usize = g_wt.repo_root.len;
+    if pn > repo {
+        _ = buf_append(out, path + repo, pn - repo);
+    }
+}
+
+// bash 闸门：命令会改共享 checkout 吗？（对齐 preset 的 GIT_MUTATION + 「命令里写了 worktree 就放行」）
+// workdir 是**已经解析成绝对路径**的调用目录。返回 true = 拒绝。
+export fn wt_guard_bash_crosses(workdir: &const byte, wn: usize, cmd: &const byte, cn: usize) bool {
+    if !g_wt_on || g_wt.phase != WT_PHASE_READY {
+        return false;
+    }
+    if cn == 0 {
+        return false;
+    }
+    // 命令里点名了 worktree 就放行（模型自己在把 git 指过去）
+    if wt_contains(cmd, cn, g_wt.worktree_path.ptr as &const byte, g_wt.worktree_path.len) {
+        return false;
+    }
+    const repo: usize = g_wt.repo_root.len;
+    const wtree: usize = g_wt.worktree_path.len;
+    const in_repo: bool = wn >= repo && bufx_mem_eq(workdir, g_wt.repo_root.ptr as &const byte, repo);
+    if !in_repo {
+        return false;
+    }
+    const in_wt: bool = wn >= wtree && bufx_mem_eq(workdir, g_wt.worktree_path.ptr as &const byte, wtree);
+    if in_wt {
+        return false;
+    }
+    return wt_has_git_mutation(cmd, cn);
+}
+
+// 子串查找（cmd 里有没有子串 needle）
+fn wt_contains(hay: &const byte, hn: usize, needle: &const byte, nn: usize) bool {
+    if nn == 0 || hn < nn {
+        return false;
+    }
+    var i: usize = 0;
+    while i + nn <= hn {
+        if bufx_mem_eq(hay + i, needle, nn) {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+// `git <变更子命令>` 的探测：逐个子命令找「词边界 + 子命令名 + 词边界」。
+// 与 preset 的 GIT_MUTATION 同义，但不用正则（我们这边没有正则引擎）。
+fn wt_has_git_mutation(cmd: &const byte, cn: usize) bool {
+    // 先找一个 'g'，再看后面是不是 "it" 且前面是词边界
+    var i: usize = 0;
+    while i + 2 < cn {
+        const c: byte = cmd[i];
+        if c != 103 as byte {   // 'g'
+            i = i + 1;
+            continue;
+        }
+        if !(cmd[i + 1] == 105 as byte && cmd[i + 2] == 116 as byte) {   // "it"
+            i = i + 1;
+            continue;
+        }
+        // 'g' 前面必须是行首或空白 / ; & | ( 
+        if i > 0 {
+            const p: byte = cmd[i - 1];
+            const ok: bool = p == 32 as byte || p == 9 as byte || p == 59 as byte || p == 38 as byte ||
+                p == 124 as byte || p == 40 as byte || p == 10 as byte;
+            if !ok {
+                i = i + 2;
+                continue;
+            }
+        }
+        // "git" 之后必须跟空白（避免匹配到 "github" 之类）
+        var j: usize = i + 3;
+        if j >= cn || !(cmd[j] == 32 as byte || cmd[j] == 9 as byte) {
+            i = i + 3;
+            continue;
+        }
+        // 在 "git" 之后这一行里扫变更子命令
+        while j < cn && cmd[j] != 10 as byte && cmd[j] != 59 as byte && cmd[j] != 38 as byte && cmd[j] != 124 as byte {
+            // 跳过选项（-C <path> 之类会跟一个参数）：只认空格分隔的词，逐词比
+            while j < cn && (cmd[j] == 32 as byte || cmd[j] == 9 as byte) {
+                j = j + 1;
+            }
+            const s: usize = j;
+            while j < cn && cmd[j] != 32 as byte && cmd[j] != 9 as byte && cmd[j] != 10 as byte &&
+                    cmd[j] != 59 as byte && cmd[j] != 38 as byte && cmd[j] != 124 as byte {
+                j = j + 1;
+            }
+            const wl: usize = j - s;
+            if wl > 0 && cmd[s] != 45 as byte {   // 不是选项
+                if wt_is_mutating_subcommand(cmd + s, wl) {
+                    return true;
+                }
+            }
+        }
+        i = i + 3;
+    }
+    return false;
+}
+
+fn wt_is_mutating_subcommand(w: &const byte, n: usize) bool {
+    if bufx_eq_cstr(w, n, "add" as &const byte) { return true; }
+    if bufx_eq_cstr(w, n, "am" as &const byte) { return true; }
+    if bufx_eq_cstr(w, n, "apply" as &const byte) { return true; }
+    if bufx_eq_cstr(w, n, "checkout" as &const byte) { return true; }
+    if bufx_eq_cstr(w, n, "cherry-pick" as &const byte) { return true; }
+    if bufx_eq_cstr(w, n, "clean" as &const byte) { return true; }
+    if bufx_eq_cstr(w, n, "commit" as &const byte) { return true; }
+    if bufx_eq_cstr(w, n, "merge" as &const byte) { return true; }
+    if bufx_eq_cstr(w, n, "mv" as &const byte) { return true; }
+    if bufx_eq_cstr(w, n, "push" as &const byte) { return true; }
+    if bufx_eq_cstr(w, n, "rebase" as &const byte) { return true; }
+    if bufx_eq_cstr(w, n, "reset" as &const byte) { return true; }
+    if bufx_eq_cstr(w, n, "restore" as &const byte) { return true; }
+    if bufx_eq_cstr(w, n, "revert" as &const byte) { return true; }
+    if bufx_eq_cstr(w, n, "rm" as &const byte) { return true; }
+    if bufx_eq_cstr(w, n, "stash" as &const byte) { return true; }
+    if bufx_eq_cstr(w, n, "switch" as &const byte) { return true; }
+    if bufx_eq_cstr(w, n, "tag" as &const byte) { return true; }
+    if bufx_eq_cstr(w, n, "update-index" as &const byte) { return true; }
+    if bufx_eq_cstr(w, n, "worktree" as &const byte) { return true; }
+    return false;
+}
+
+// ============================================================
+// finish / discard（合并 → 删 worktree 与分支）
+// ============================================================
+
+// 提交 worktree 里还没提交的改动（commitOnFinish）
+fn wt_commit_pending(out: &Buf) i32 {
+    var av: [&const byte: 8] = [null as &const byte: 8];
+    av[0] = "git" as &const byte;
+    av[1] = "-C" as &const byte;
+    av[2] = g_wt.worktree_path.ptr as &const byte;
+    av[3] = "status" as &const byte;
+    av[4] = "--porcelain" as &const byte;
+    av[5] = null as &const byte;
+    var st: Buf = buf_new(8192);
+    defer { buf_free(&st); }
+    if wt_git(&av[0], &st) != 0 {
+        _ = buf_append_cstr(out, "error: git status failed in the worktree\n");
+        return 1;
+    }
+    if st.len == 0 {
+        return 0;   // 干净：不用提交
+    }
+    var av2: [&const byte: 8] = [null as &const byte: 8];
+    av2[0] = "git" as &const byte;
+    av2[1] = "-C" as &const byte;
+    av2[2] = g_wt.worktree_path.ptr as &const byte;
+    av2[3] = "add" as &const byte;
+    av2[4] = "-A" as &const byte;
+    av2[5] = null as &const byte;
+    var o: Buf = buf_new(2048);
+    defer { buf_free(&o); }
+    if wt_git(&av2[0], &o) != 0 {
+        _ = buf_append_cstr(out, "error: git add -A failed in the worktree\n");
+        return 1;
+    }
+    return 0;
+}
+
+fn wt_do_commit(msg: &const byte, out: &Buf) i32 {
+    var av: [&const byte: 8] = [null as &const byte: 8];
+    av[0] = "git" as &const byte;
+    av[1] = "-C" as &const byte;
+    av[2] = g_wt.worktree_path.ptr as &const byte;
+    av[3] = "commit" as &const byte;
+    av[4] = "-m" as &const byte;
+    var mz: Buf = buf_new(bufx_cstr_len(msg) + 1);
+    defer { buf_free(&mz); }
+    _ = buf_append_cstr(&mz, msg);
+    _ = buf_append_byte(&mz, 0);
+    av[5] = mz.ptr as &const byte;
+    av[6] = null as &const byte;
+    var o: Buf = buf_new(4096);
+    defer { buf_free(&o); }
+    if wt_git(&av[0], &o) != 0 {
+        _ = buf_append_cstr(out, "error: git commit failed in the worktree:\n");
+        _ = buf_append(out, g_wt_err.ptr as &const byte, g_wt_err.len);
+        return 1;
+    }
+    return 0;
+}
+
+// 把会话分支合进基分支（共享 checkout 里）。冲突时 abort 并返回 WT_E_MERGE。
+fn wt_merge_into_base(msg: &const byte, out: &Buf) i32 {
+    // 先看共享 checkout 在哪个分支，必要时 checkout base
+    var av: [&const byte: 8] = [null as &const byte: 8];
+    av[0] = "git" as &const byte;
+    av[1] = "-C" as &const byte;
+    av[2] = g_wt.repo_root.ptr as &const byte;
+    av[3] = "rev-parse" as &const byte;
+    av[4] = "--abbrev-ref" as &const byte;
+    av[5] = "HEAD" as &const byte;
+    av[6] = null as &const byte;
+    var head: Buf = buf_new(128);
+    defer { buf_free(&head); }
+    if wt_git_line(&av[0], &head) != 0 {
+        _ = buf_append_cstr(out, "error: cannot read the shared checkout's branch\n");
+        return 1;
+    }
+    if !(head.len == g_wt.base.len && bufx_mem_eq(head.ptr as &const byte, g_wt.base.ptr as &const byte, head.len)) {
+        var avc: [&const byte: 8] = [null as &const byte: 8];
+        avc[0] = "git" as &const byte;
+        avc[1] = "-C" as &const byte;
+        avc[2] = g_wt.repo_root.ptr as &const byte;
+        avc[3] = "checkout" as &const byte;
+        avc[4] = g_wt.base.ptr as &const byte;
+        avc[5] = null as &const byte;
+        var oc: Buf = buf_new(4096);
+        defer { buf_free(&oc); }
+        if wt_git(&avc[0], &oc) != 0 {
+            _ = buf_append_cstr(out, "error: the shared checkout is on a different branch and switching failed:\n");
+            _ = buf_append(out, g_wt_err.ptr as &const byte, g_wt_err.len);
+            _ = buf_append_cstr(out, "\nCommit or stash that work, then call finish again.\n");
+            return 1;
+        }
+    }
+    var avm: [&const byte: 10] = [null as &const byte: 10];
+    avm[0] = "git" as &const byte;
+    avm[1] = "-C" as &const byte;
+    avm[2] = g_wt.repo_root.ptr as &const byte;
+    avm[3] = "merge" as &const byte;
+    avm[4] = "--no-ff" as &const byte;
+    avm[5] = "--no-edit" as &const byte;
+    avm[6] = "-m" as &const byte;
+    var mz: Buf = buf_new(bufx_cstr_len(msg) + 1);
+    defer { buf_free(&mz); }
+    _ = buf_append_cstr(&mz, msg);
+    _ = buf_append_byte(&mz, 0);
+    avm[7] = mz.ptr as &const byte;
+    avm[8] = g_wt.branch.ptr as &const byte;
+    avm[9] = null as &const byte;
+    var om: Buf = buf_new(8192);
+    defer { buf_free(&om); }
+    const rc: i32 = wt_git(&avm[0], &om);
+    if rc != 0 {
+        // 冲突：abort，主干保持不动
+        var ava: [&const byte: 8] = [null as &const byte: 8];
+        ava[0] = "git" as &const byte;
+        ava[1] = "-C" as &const byte;
+        ava[2] = g_wt.repo_root.ptr as &const byte;
+        ava[3] = "merge" as &const byte;
+        ava[4] = "--abort" as &const byte;
+        ava[5] = null as &const byte;
+        var oa: Buf = buf_new(2048);
+        defer { buf_free(&oa); }
+        _ = wt_git(&ava[0], &oa);
+        _ = buf_append_cstr(out, "error: merging ");
+        _ = buf_append(out, g_wt.branch.ptr as &const byte, g_wt.branch.len);
+        _ = buf_append_cstr(out, " into ");
+        _ = buf_append(out, g_wt.base.ptr as &const byte, g_wt.base.len);
+        _ = buf_append_cstr(out, " conflicted; the merge was aborted and ");
+        _ = buf_append(out, g_wt.base.ptr as &const byte, g_wt.base.len);
+        _ = buf_append_cstr(out, " is unchanged.\nResolve inside the worktree — merge ");
+        _ = buf_append(out, g_wt.base.ptr as &const byte, g_wt.base.len);
+        _ = buf_append_cstr(out, " into your branch there, fix the conflicts, commit, then call finish again.\n");
+        return WT_E_MERGE;
+    }
+    return 0;
+}
+
+// 删 worktree + 删分支（合并之后）
+fn wt_remove(out: &Buf) void {
+    var av: [&const byte: 8] = [null as &const byte: 8];
+    av[0] = "git" as &const byte;
+    av[1] = "-C" as &const byte;
+    av[2] = g_wt.repo_root.ptr as &const byte;
+    av[3] = "worktree" as &const byte;
+    av[4] = "remove" as &const byte;
+    av[5] = "--force" as &const byte;
+    av[6] = g_wt.worktree_path.ptr as &const byte;
+    av[7] = null as &const byte;
+    var o: Buf = buf_new(4096);
+    defer { buf_free(&o); }
+    if wt_git(&av[0], &o) != 0 {
+        // 目录可能已经被手工删了：prune 一次把注册摘掉
+        var avp: [&const byte: 8] = [null as &const byte: 8];
+        avp[0] = "git" as &const byte;
+        avp[1] = "-C" as &const byte;
+        avp[2] = g_wt.repo_root.ptr as &const byte;
+        avp[3] = "worktree" as &const byte;
+        avp[4] = "prune" as &const byte;
+        avp[5] = null as &const byte;
+        var op: Buf = buf_new(2048);
+        defer { buf_free(&op); }
+        if wt_git(&avp[0], &op) != 0 {
+            _ = buf_append_cstr(out, "note: worktree remove failed (the directory may need manual cleanup)\n");
+        } else {
+            _ = buf_append_cstr(out, "note: the worktree directory was already gone; its registration was pruned\n");
+        }
+    }
+    var avb: [&const byte: 8] = [null as &const byte: 8];
+    avb[0] = "git" as &const byte;
+    avb[1] = "-C" as &const byte;
+    avb[2] = g_wt.repo_root.ptr as &const byte;
+    avb[3] = "branch" as &const byte;
+    avb[4] = "-D" as &const byte;
+    avb[5] = g_wt.branch.ptr as &const byte;
+    avb[6] = null as &const byte;
+    var ob: Buf = buf_new(2048);
+    defer { buf_free(&ob); }
+    if wt_git(&avb[0], &ob) != 0 {
+        _ = buf_append_cstr(out, "note: branch delete failed\n");
+    }
+}
+
+// finish：提交 → 合并 → 删 worktree 与分支。返回 0 = 成功。
+export fn wt_finish(msg: &const byte, keep: bool, out: &Buf) i32 {
+    if g_wt.phase != WT_PHASE_READY {
+        _ = buf_append_cstr(out, "error: no worktree is provisioned for this session\n");
+        return 1;
+    }
+    if wt_commit_pending(out) != 0 {
+        return 1;
+    }
+    var cmsg: Buf = buf_new(256);
+    defer { buf_free(&cmsg); }
+    if bufx_cstr_len(msg) > 0 {
+        _ = buf_append_cstr(&cmsg, msg);
+    } else {
+        _ = buf_append_cstr(&cmsg, "chore: session checkpoint");
+    }
+    // 有未提交改动才需要这一条 commit（wt_commit_pending 已经 add -A）
+    var av: [&const byte: 8] = [null as &const byte: 8];
+    av[0] = "git" as &const byte;
+    av[1] = "-C" as &const byte;
+    av[2] = g_wt.worktree_path.ptr as &const byte;
+    av[3] = "diff" as &const byte;
+    av[4] = "--cached" as &const byte;
+    av[5] = "--quiet" as &const byte;
+    av[6] = null as &const byte;
+    var od: Buf = buf_new(256);
+    defer { buf_free(&od); }
+    if wt_git(&av[0], &od) != 0 {
+        if wt_do_commit(cmsg.ptr as &const byte, out) != 0 {
+            return 1;
+        }
+    }
+    if wt_merge_into_base(cmsg.ptr as &const byte, out) != 0 {
+        return 1;
+    }
+    _ = buf_append_cstr(out, "merged ");
+    _ = buf_append(out, g_wt.branch.ptr as &const byte, g_wt.branch.len);
+    _ = buf_append_cstr(out, " into ");
+    _ = buf_append(out, g_wt.base.ptr as &const byte, g_wt.base.len);
+    _ = buf_append_cstr(out, "\n");
+    if !keep {
+        wt_remove(out);
+        _ = buf_append_cstr(out, "removed worktree ");
+        _ = buf_append(out, g_wt.worktree_path.ptr as &const byte, g_wt.worktree_path.len);
+        _ = buf_append_cstr(out, " and deleted branch ");
+        _ = buf_append(out, g_wt.branch.ptr as &const byte, g_wt.branch.len);
+        _ = buf_append_cstr(out, "\n");
+        g_wt.phase = WT_PHASE_FINISHED;
+    } else {
+        _ = buf_append_cstr(out, "kept worktree ");
+        _ = buf_append(out, g_wt.worktree_path.ptr as &const byte, g_wt.worktree_path.len);
+        _ = buf_append_cstr(out, " (keepWorktree)\n");
+    }
+    return 0;
+}
+
+// discard：不合并，直接删 worktree 与分支
+export fn wt_discard(out: &Buf) i32 {
+    if g_wt.phase != WT_PHASE_READY {
+        _ = buf_append_cstr(out, "error: no worktree is provisioned for this session\n");
+        return 1;
+    }
+    wt_remove(out);
+    _ = buf_append_cstr(out, "discarded worktree ");
+    _ = buf_append(out, g_wt.worktree_path.ptr as &const byte, g_wt.worktree_path.len);
+    _ = buf_append_cstr(out, " and deleted its branch (nothing was merged)\n");
+    g_wt.phase = WT_PHASE_DISCARDED;
+    return 0;
+}
+
+// status：给人看的一屏（分支 / 提交数 / 未提交路径）
+export fn wt_status_into(out: &Buf) void {
+    buf_reset(out);
+    if !g_wt_on {
+        _ = buf_append_cstr(out, "worktree mode is off (--worktree / /worktree on)\n");
+        return;
+    }
+    if g_wt.phase == WT_PHASE_SKIPPED || g_wt.phase == WT_PHASE_FAILED || g_wt.phase == WT_PHASE_NONE {
+        _ = buf_append_cstr(out, "no worktree: ");
+        _ = buf_append(out, g_wt.note.ptr as &const byte, g_wt.note.len);
+        _ = buf_append_byte(out, 10);
+        return;
+    }
+    _ = buf_append_cstr(out, "worktree: ");
+    _ = buf_append(out, g_wt.worktree_path.ptr as &const byte, g_wt.worktree_path.len);
+    _ = buf_append_cstr(out, "\nbranch:   ");
+    _ = buf_append(out, g_wt.branch.ptr as &const byte, g_wt.branch.len);
+    _ = buf_append_cstr(out, "\nbase:     ");
+    _ = buf_append(out, g_wt.base.ptr as &const byte, g_wt.base.len);
+    _ = buf_append_byte(out, 10);
+    if g_wt.phase != WT_PHASE_READY {
+        _ = buf_append_cstr(out, "(the worktree is already gone)\n");
+        return;
+    }
+    // 未提交路径
+    var av: [&const byte: 8] = [null as &const byte: 8];
+    av[0] = "git" as &const byte;
+    av[1] = "-C" as &const byte;
+    av[2] = g_wt.worktree_path.ptr as &const byte;
+    av[3] = "status" as &const byte;
+    av[4] = "--porcelain" as &const byte;
+    av[5] = null as &const byte;
+    var st: Buf = buf_new(8192);
+    defer { buf_free(&st); }
+    if wt_git(&av[0], &st) == 0 {
+        if st.len == 0 {
+            _ = buf_append_cstr(out, "uncommitted: (none)\n");
+        } else {
+            _ = buf_append_cstr(out, "uncommitted:\n");
+            _ = buf_append(out, st.ptr as &const byte, st.len);
+        }
+    }
+}
+
+// 仓库里还留着的会话 worktree（list 动作；分支前缀由我们自己的 branchPrefix 决定）
+export fn wt_list_into(out: &Buf) void {
+    buf_reset(out);
+    var repo: Buf = buf_empty();
+    defer { buf_free(&repo); }
+    if g_wt.repo_root.len > 0 {
+        _ = buf_append(&repo, g_wt.repo_root.ptr as &const byte, g_wt.repo_root.len);
+    }
+    if repo.len == 0 {
+        _ = buf_append_cstr(out, "(no repository is known yet; the worktree mode has not provisioned one)\n");
+        return;
+    }
+    var av: [&const byte: 8] = [null as &const byte: 8];
+    av[0] = "git" as &const byte;
+    av[1] = "-C" as &const byte;
+    av[2] = repo.ptr as &const byte;
+    av[3] = "worktree" as &const byte;
+    av[4] = "list" as &const byte;
+    av[5] = "--porcelain" as &const byte;
+    av[6] = null as &const byte;
+    var o: Buf = buf_new(16384);
+    defer { buf_free(&o); }
+    if wt_git(&av[0], &o) != 0 {
+        _ = buf_append_cstr(out, "(git worktree list failed)\n");
+        return;
+    }
+    const pfx: usize = bufx_cstr_len(WT_BRANCH_PREFIX);
+    var count: usize = 0;
+    var pos: usize = 0;
+    while pos < o.len {
+        var nl: usize = o.len;
+        var i: usize = pos;
+        while i < o.len {
+            if o.ptr[i] == 10 as byte {
+                nl = i;
+                break;
+            }
+            i = i + 1;
+        }
+        // branch refs/heads/dsh/xxx
+        if nl > pos + 21 && bufx_mem_eq(o.ptr + pos, "branch refs/heads/" as &const byte, 18) {
+            const s: usize = pos + 18;
+            if nl - s >= pfx && bufx_mem_eq(o.ptr + s, WT_BRANCH_PREFIX, pfx) {
+                _ = buf_append_cstr(out, "  ");
+                _ = buf_append(out, o.ptr + s, nl - s);
+                _ = buf_append_byte(out, 10);
+                count = count + 1;
+            }
+        }
+        if nl >= o.len {
+            break;
+        }
+        pos = nl + 1;
+    }
+    if count == 0 {
+        _ = buf_append_cstr(out, "(no ");
+        _ = buf_append_cstr(out, WT_BRANCH_PREFIX);
+        _ = buf_append_cstr(out, "* worktrees remain)\n");
+    }
+}

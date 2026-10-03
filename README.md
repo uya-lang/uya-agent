@@ -1,10 +1,21 @@
 # uya-agent — 纯 Uya 写的极简 CLI 编程 agent
 
 一个**只用 Uya 源码**实现的命令行编程 agent：给它一句话任务，它自己看文件、改文件、跑命令，
-多轮 loop 直到给出结论。全部代码 42 个 `.uya` 文件，**不引入任何 C 代码、`@c_import` 或其它语言**，
+多轮 loop 直到给出结论。全部代码 45 个 `.uya` 文件，**不引入任何 C 代码、`@c_import` 或其它语言**，
 只依赖 Uya 语言与随编译器分发的标准库。
 
-**P0–P35 全部完成**（**P35 是「恢复会话段错误」修复 + `/sessions` 列表的最新一条排最后一行**：`sess_read_meta`
+**P0–P37 全部完成**（**P37 是「模型选择 + 推理强度 + Git worktree」**：
+一条线把三件事按 DSH 的口径补齐 —— **模型选择**（新 `src/modelx.uya` 把 `settings.yaml` 里
+`llm-pi-ai.providers.<prov>.models[]` 摊成只读目录，`/model` 浮层按提供方分组、回车即切，
+`--model` / `--provider` 同口径）、**推理强度**（`/effort` **只列该模型自己公布的档位**、
+`--effort` 校验后收、切模型时档位不在新模型公布的集合里就回落到它的默认档并说清楚，
+`reasoningEfforts: false` 的非推理模型**不显示** Effort 行 —— 与 DSH「不发明档位」一致）、
+**独立工作区执行 → 合并 → 删除**（对齐 DSH 的 `git-worktree` preset：会话一开始就在自己的
+worktree + `dsh/<slug>` 分支里干活，共享 checkout 只读；干完调 `worktree` 工具的 `finish`
+提交 → 合并回 base → **删掉 worktree 与分支**，写闸门与 bash 闸门拒绝碰共享 checkout）——
+版本串 `p37-model`，它和并行线的 `p31`–`p35` 撞号、`p36` 已被未合分支认领，按「后到的顺延」
+记成 **P37**，见 §2「模型选择与推理强度（P37）」「Git worktree（P37）」与 §3 踩坑 55–59；
+**P35 是「恢复会话段错误」修复 + `/sessions` 列表的最新一条排最后一行**：`sess_read_meta`
 逐行取行时把切片第二个参数当成「终点」写（`data.ptr[pos: nl]`，而 uya 的 `p[a: b]` 是
 「偏移 + 长度」）—— 每行的 `view.len` 约等于真实行长 + pos，`sess_has_cstr` 于是往后读过本行：
 小日志只是**静默越过本行**做匹配（最后一条 `session/workspace` 会被错过），大日志
@@ -221,7 +232,7 @@ export UYA_SPLIT_C_DIR=$PWD/build/uyacache      # 多文件 C 缓存别丢在仓
 | 选项 | 说明 |
 |---|---|
 | `--base-url URL` | 默认 `https://api.deepseek.com/v1`（也支持 `http://127.0.0.1:11434/v1` 这类本地明文端点） |
-| `--model NAME` | 默认 `deepseek-chat` |
+| `--model NAME` | 默认 `deepseek-chat`。P37：走模型目录收口 —— 命中就把该模型的 provider / contextWindow / maxTokens / input / compat **一起**搬过来（`/model` 同口径），目录里没有就只换名字并告警（能力保持不动） |
 | `--workspace DIR` | 工具的活动目录，默认当前目录 |
 | `--max-steps N` | **熔断上限**：最多几轮工具调用，**默认 0 = 不限** —— 一直跑到模型给出最终答案（对齐 DSH：它没有步数上限） |
 | `--max-response N` | 响应体上限，默认 256 KiB |
@@ -230,7 +241,9 @@ export UYA_SPLIT_C_DIR=$PWD/build/uyacache      # 多文件 C 缓存别丢在仓
 | `--no-stream` | 关闭流式，回退一次性响应（老端点兼容） |
 | `--api=MODE` | 线协议：`openai-responses`（**默认**）/ `openai-completions`（也接受 `responses` / `chat` / `completions`）。**不写 = 未声明**：先打 `/responses`，只有 404/405/501 才回退 `chat/completions`（每进程一次），见「Responses 接口」一节 |
 | `--reasoning-effort V` | 发 `reasoning.effort`（只有 responses 发；`off`/`none` = 不发），默认取 DSH 的 `agent-default-model.reasoningEffort` |
-| REPL 命令 | `/help` `/continue` `/status` `/tasks [open\|close\|toggle]` `/goal [<objective>\|edit <objective>\|pause\|resume\|clear]` `/compact` `/plan` `/permission [预设]` `/sessions` `/resume <id>` `/new` `/exit` |
+| `--provider NAME` | **提供方键**（P37，可省略）：`settings.yaml` 里 `providers.<key>` 的那个 key，配 `--model` 用；省略时由目录反查 |
+| `--effort V` | **推理强度**（P37，`--reasoning-effort` 的别名）：先按当前模型公布的档位校验，不在集合里则拒绝（`--reasoning-effort` 不校验、原样透传） |
+| REPL 命令 | `/help` `/continue` `/status` `/tasks [open\|close\|toggle]` `/goal [<objective>\|edit <objective>\|pause\|resume\|clear]` `/compact` `/plan` `/permission [预设]` `/model [名字]` `/effort [档位]` `/workspace [目录]` `/worktree [on\|off\|start\|status\|finish\|discard\|list]` `/sessions` `/resume <id>` `/new` `/exit` |
 | `--agent-home DIR` | 会话与索引的根目录（默认 `~/.uya-agent`） |
 | `--continue` | 接着当前目录最近一条会话继续 |
 | `--resume ID` | 恢复指定会话（`ID` 或 `last`） |
@@ -247,6 +260,8 @@ export UYA_SPLIT_C_DIR=$PWD/build/uyacache      # 多文件 C 缓存别丢在仓
 | `--permission MODE` | **访问模式**（P21）：`read-only` / `workspace-write` / `danger-full-access`（默认）。也收 `--permission=<MODE>`；非法值报错退出。来源优先级 CLI > `UYA_AGENT_PERMISSION` > DSH `permission.defaultPreset`，见「访问模式」一节 |
 | `--no-sandbox` | 关掉 bash 的内核沙箱（bwrap）：confined 模式不再套壳、也不再 fail closed（启动打一行警告） |
 | `--bwrap PATH` | 指定 bwrap 可执行文件（默认探测 `/usr/bin/bwrap`、`/bin/bwrap`、`/usr/local/bin/bwrap`） |
+| `--worktree` | **独立工作区执行**（P37）：会话开始建 git worktree + `dsh/<slug>` 分支，干完用 `worktree` 工具 `finish` 提交/合并/删除。DSH `agent-presets.default=git-worktree` 会自动开 |
+| `--no-worktree` | 不建 worktree（把 DSH preset 自动开的那一项关掉） |
 | `--skill-dir DIR` | 额外的技能根（冒号分隔，可多次） |
 | `--uya-bin PATH` | 跑 workflow 脚本的解释器（默认 `$UYA_BIN` 或 `uya`） |
 | `--no-compact` | 关闭自动上下文压缩 |
@@ -341,7 +356,16 @@ src/tuiselftest.uya TUI 的自测轮次（tui-frame / tui-keys / tui-sink / tui-
                   P32 起 tui-scroll 钉「长条目翻看 / ctrl+home·end / SGR 滚轮 / 整屏 PgUp / `^` 指示」）
 src/inbox.uya     输入收件箱：steer（运行中输入的文本，step 边界领取）+ keepInbox 语义
 src/yamlcfg.uya   自带 YAML 子集解析器：去注释（块标量/引号感知）、中和 `!!tag`、
-                  block/flow 映射与序列、`|`/`>` 块标量、跨行 flow 集合、节点池树 + 导航
+                  block/flow 映射与序列、`|`/`>` 块标量、跨行 flow 集合、节点池树 + 导航；
+                  P37 加 `yt_key`（取出 map 成员的**键**本身 —— `reasoningEfforts:` 的键名
+                  才是模型公布的推理档位，`yt_get` 是按键取值，取不出键）
+src/modelx.uya    模型目录（P37）：把 `settings.yaml` 的
+                  `llm-pi-ai.providers.<prov>.models[]`（外加 `llm-deepseek.models[]`）
+                  摊成只读清单 McEntry{provider, model, name, contextWindow, maxTokens,
+                  input_image, reasoning, levels[], declared, compat*}；推理档位**只认模型
+                  自己公布的键**（固定七档 off/minimal/low/medium/high/xhigh/max，none==off），
+                  `reasoningEfforts: false` = 非推理模型（一个档位都不公布 ⇒ 界面不显示
+                  Effort 行）；目录空时 `mx_seed_sole` 把当前 model 当唯一条目（离线可用）
 src/fsx.uya       文件工具：路径解析（可选工作区守卫）、**read-only / plan 模式下 write/edit 硬拒**、
                   (mtime,size) 版本、观察状态表、
                   read（**流式窗口** `fs_read_window`：真 total + 只缓冲选中行 + 行号 + 三种
@@ -411,6 +435,14 @@ src/gitx.uya      只读地跑 git（P28）：PATH 解析 git 路径（stdlib �
                   poll 双管道收 stdout/stderr、10s 墙钟超时 SIGKILL、超限**照读不误**（不排空会把
                   子进程卡在写管道上）；环境继承 + 覆盖 GIT_PAGER/GIT_OPTIONAL_LOCKS/LC_ALL，
                   并剔除 GIT_DIR/GIT_WORK_TREE/GIT_INDEX_FILE（防父进程把仓库指到别处）
+src/worktreex.uya Git worktree（P37，对齐 DSH `git-worktree` preset）：`git rev-parse
+                  --show-toplevel` 定仓库根 → `worktree add -b dsh/<slug> .git/dsh-worktrees/<slug>
+                  <base>`（基分支探测 main→master→HEAD）；写闸门（`wt_guard_path_crosses`：
+                  写共享 checkout 被拒并指路 worktree 里的同一相对路径）与 bash 闸门
+                  （`wt_guard_bash_crosses`：共享 checkout 里的 git 变更子命令被拒，只读放行）；
+                  `finish` = add -A + commit → 共享 checkout 切 base → `merge --no-ff` →
+                  `worktree remove --force` + `branch -D`（冲突则 `merge --abort`，主干不动），
+                  `discard` 不合并直接删；不是 git 仓库 ⇒ skipped（fail soft）
 src/gitdiff.uya   /diff 的数据模型（P28）：`status --porcelain -z` 出文件列表（XY + numstat 计数）、
                   `diff -U100000 HEAD`（未跟踪/无 HEAD 走 `--no-index /dev/null`）出整份文件的
                   unified diff，再把删块/增块**配对**成左右两栏的行表（CTX/MIX/DEL/ADD/HDR）、
@@ -1610,6 +1642,94 @@ accept 的**收尾**动作，于是主循环读到的 `tui_overlay_kind()` 永�
 （老代码要等 15 秒）、`esc` 必须让「已中断本回合」在几秒内出现且进程还活着、中断过的会话
 再提交一个任务必须**照常跑完**（中断意图随回合收口作废，不能跨回合残留 —— 残留的话新任务
 会在第一个字节被打断，看着像 agent 死了）。
+### 模型选择与推理强度（P37，对齐 DSH 的 /model + composer 的 Model/Effort 两级菜单）
+
+DSH 的一次模型选择是**一个三元组**：provider + model + reasoning effort（Host 的
+`ModelSelection`）。P37 照抄这个形状，事实源就是 DSH 自己的 `settings.yaml`。
+
+* **目录**（新 `src/modelx.uya`，只读）：把 `llm-pi-ai.providers.<prov>.models[]`
+  （外加官方路线的 `llm-deepseek.models[]`）摊平成 `McEntry{provider, model, name,
+  contextWindow, maxTokens, input_image, reasoning, levels[], declared, compat*}`。
+  复用 `yamlcfg.uya` 的 `YTree`（为此加了一个 `yt_key`：`reasoningEfforts:` 映射的**键名**
+  才是公布的档位，`yt_get` 是「按键取值」，取不出键本身）。
+* **不发明档位**（DSH 的硬规则）：只认模型自己公布的键，固定七个
+  （`off`/`minimal`/`low`/`medium`/`high`/`xhigh`/`max`，`none` == `off`）；
+  `reasoningEfforts: false` = 非推理模型 ⇒ 一个档位都不公布 ⇒ **界面不显示 Effort 行**
+  （显示一个做不到事的控件比不显示更坏）；**没写**这个键（`declared=false`）与写了一串空映射
+  分开对待 —— 都没档位，但报告里措辞不同。
+* **`/model`**：TUI 里是底对齐菜单浮层（按提供方分组、`✓` 标当前、游标默认落在当前那一行），
+  滚动模式是文本清单；`/model <名字>` 直接切。**`/effort`** 同款（只列当前模型公布的档位）；
+  模型不公布档位时 `/effort` **不开浮层**，只给一行说明。
+* **切换收口**（`agent_model_apply`，CLI `--model` / `/model` / 浮层三条路共用）：
+  * 命中目录 ⇒ 把该模型的 `contextWindow` / `maxTokens` / `input` / 三个 compat 开关
+    一起搬过来（与 `agent_apply_dsh` 同一套字段与来源码）；
+  * **目录外**（目录空，或用户敲了目录外的名字）⇒ **只换名字**，provider 与各项能力保持不动，
+    并打一行 warning —— 静默把 `contextWindow` 清成 -1 会让自动压缩直接失效；
+  * 推理强度不在新模型公布的集合里 ⇒ 回落到它的**默认档**（第一个公布的），并把「原值 → 新值」
+    说清楚；模型不公布档位时**不**动用户显式给的值（与 `--reasoning-effort` 的老口径一致：
+    原样透传、不做 clamp）。
+  * `-C` 那种「调用方传进来的 provider 指针就是 `cfg.provider.ptr` 自己」的写法要小心：
+    先 `buf_free` 再读它 = 读已释放的内存（见 §3 踩坑 56）。
+* **落盘与恢复**：每次选择往会话日志追一条 `session/model`
+  （`{"provider":…,"model":…,"reasoningEffort":…,"source":…}`，append-only、最后一条为准），
+  索引里的 `model` 字段也跟着写；`--resume` 按「显式 CLI 优先 → 日志里最后一条」把
+  provider/model/能力/档位一起落位（与 P34 的工作区同一条路子）。`SessMeta` 因此多了
+  `provider` / `model` / `effort` 三个字段（与 `workspace` 共用同一次逐行扫描）。
+* **`--print-config`** 报 `provider`（带来源）、`model_catalog = N model(s)`（是否真读到
+  settings.yaml）与 `efforts = <清单>`（或「该模型没公布档位」）；`/status` 浮层报
+  provider 来源、effort 是否「模型公布」、以及当前模型的可选档位。
+* **子代理**继承父的 provider/model/强度（`deleg_clone_cfg`），否则它会在另一条路线上跑。
+
+```
+$ ./build/uya-agent --print-config
+...
+model = DeepSeek-V4.1-Flash  (source: dsh-settings)
+reasoning_effort = max  (source: dsh-settings)
+provider = autodl-api  (source: dsh-settings)
+model_catalog = 19 model(s)  (loaded from settings.yaml)
+efforts = off, minimal, low, medium, high, xhigh, max
+```
+
+### Git worktree：独立工作区执行 → 合并 → 删除（P37，对齐 DSH `git-worktree` preset）
+
+**是什么**：会话一开始就在自己的 **worktree + 新分支**里干活，共享 checkout 保持只读；
+干完由 `worktree` 工具的 `finish` **提交 → 合并回 base → 删掉 worktree 与分支**。
+默认值逐字对齐 preset 的 `DEFAULTS`：`baseBranch=''`（探测 `main` → `master` → 共享
+checkout 的 HEAD）、`branchPrefix='dsh/'`、`worktreeRoot='.git/dsh-worktrees'`、
+`mergeStrategy='merge'`、`commitOnFinish=true`、`guardMainCheckout=true`。
+
+* **怎么进**：`--worktree` / `--no-worktree`；DSH 的 `agent-presets.default=git-worktree`
+  会**自动开**（对齐 preset 的 `agent/session-start` 钩子 —— 「选了这个 preset 就是会建」），
+  于是零参数启动（真机就是那个配置）默认就在独立工作区里。`/worktree on|off|start|status|
+  finish|discard|list` 是人这一侧的门。
+* **建**：`wt_provision` 先 `git rev-parse --show-toplevel` 定仓库根，再
+  `git worktree add -b dsh/<slug> <repo>/.git/dsh-worktrees/<slug> <base>`；**幂等**
+  （已注册就直接认）。不是 git 仓库 / PATH 里没有 git ⇒ `phase=skipped` + 一行可见说明，
+  照常在原工作区干活（**fail soft**，同 DSH）。
+* **跑在哪**：建好之后走 **`agent_workspace_apply`**（P34 的单一收口）把当前工作区切到
+  worktree —— 于是文件工具、bash 默认 workdir、沙箱可写 bind、`{{cwd}}`、AGENTS.md、脚注、
+  `/diff` **全都自动跟过去**，一行额外代码都不用写。切换发生在**建 system prompt 之前**
+  （那一节要写 worktree 路径与分支）。
+* **写闸门**（对齐 preset 的 `tools/pre-execute` guard）：`write`/`edit` 的目标落在仓库内、
+  却在 worktree 之外 ⇒ 拒，并指路「写到 worktree 里的同一个相对路径」；bash 的 workdir
+  落在共享 checkout 且命令里有 git 变更子命令（`add`/`commit`/`merge`/`checkout`/`rebase`/
+  `reset`/`push`/… ）⇒ 拒，指路 `workdir: <worktree>`；命令里点名了 worktree、或只是
+  只读命令（`git status`）一律放行。**是工具层栅栏，不是内核边界**（与 DSH 同分界）。
+* **finish**：`git add -A` + commit（有未提交改动时）→ 共享 checkout 切到 base →
+  `merge --no-ff` → `worktree remove --force` + `branch -D`。冲突时 `merge --abort`
+  并返回「在 worktree 里 merge base、解完再 finish」的指路（**主干保持不动，绝不半合并**）。
+  `keepWorktree: true` 可以只合并不删（留现场）。`discard` 不合并、直接删。
+  两个动作都落一条 `session/worktree` 日志（删工作区这种不可逆动作值得留痕）。
+* **子代理共享父的 worktree**（不另建），且**不许**自己 `finish`/`discard`（对齐 preset）。
+
+```
+$ cd /tmp/repo && /path/build/uya-agent --worktree "把 hello.uya 的问候语改一下"
+[session] 工作区跟随会话：/tmp/repo/.git/dsh-worktrees/session-2f552cee…
+… 模型在 worktree 里改文件、跑测试 …
+（模型的最后一步）worktree finish → merged dsh/session-2f552cee… into master
+                            → removed worktree …/.git/dsh-worktrees/session-2f552cee… and deleted branch dsh/session-2f552cee…
+```
+
 ### 流式协议要点（P1）
 
 * `hc_open()` 只读到 `\r\n\r\n` 就返回，`hc_fill()` 每次读一段网络并推进解码，返回
@@ -2406,6 +2526,58 @@ vLLM 等 OpenAI 兼容端点都一样稳。想升级成严格 `tool` 角色消�
     只在排版 `sess_rows_render(..., newest_last)` 里倒着取行；浮层那边默认游标必须跟着
     落到最后一项（`tui_overlay_sel_set`），否则「打开就回车」恢复的会是最旧的会话 ——
     这正是「顺序翻转」最容易漏掉的一半：**行序对了，选中项口径没跟着改**（与踩坑 50 同类）。
+55. **「拼在后面的清单」把前面那段前缀一起抹掉了 —— `buf_reset` 写在被复用的追加函数里**（P37）。
+    `mx_levels_into` 第一版开头是 `buf_reset(out)`（「返回该模型的档位清单」听着就是个完整串），
+    但它被大量用在**先写前缀再补清单**的地方：`error: bogus 不是这个模型公布的档位；可选：<清单>`、
+    `efforts    <清单>`、`该模型只公布：（<清单>）`。`/effort bogus` 于是只剩
+    `off, low, high` —— 前缀被 reset 抹了，用户看到的就是「敲了个错档位，回了一行档位表」。
+    修法：函数体**不 reset**，只追加（`out` 是调用方的，清不清由调用方决定）；
+    顺带把「没公布档位就一个字节都不加」写进契约 —— 界面据此整行不画。
+    教训：**「返回一个串」和「往 out 里加一段」是两种接口**，名字与注释得说清是哪一种；
+    `tui_overlay_body_cols` / `perm_names_into` 那批 `_into` 命名本来就是这个约定。
+56. **`buf_free(&cfg.X)` 之后又去读 `provider` 参数 —— 而那个参数就是 `cfg.X.ptr` 自己**（P37）。
+    `agent_model_apply(cfg, provider, pn, model, mn, …)` 的调用方习惯写
+    `agent_model_apply(&cfg, cfg.provider.ptr as &const byte, cfg.provider.len, …)`，
+    函数里「目录外就把 provider 记下来」那一支先 `buf_free(&cfg.provider)` 再
+    `buf_append(&cfg.provider, provider, pn)` —— `provider` 指向的正是刚被 free 的那块内存。
+    实测表现：模型切成了、`provider` 字段变成一段乱字节（`8ZOZU` 之类）。修法：**先拷进
+    临时 Buf 再 free**（`keep`），一次就干净。同类的还有「先 free 再从 cfg 读同一个字段」——
+    凡是「参数可能是 self 的视图」的收口函数都要先拷贝。
+57. **C 字符串参数：`Buf.ptr` 没有尾 NUL**（P37，一次踩三处）。`git` 的 argv 是
+    `char *[]`、`sys_open` / `sess_mkdir_p` 收 `*const byte` —— 它们全按 **NUL 结尾**读。
+    P37 里三处中招：
+    * `worktreex` 的 `repo_root` / `worktree_path` / `branch` / `base`：把 `Buf.ptr` 直接当
+      argv 传，`execve` 把堆里紧邻的字节也算进参数 —— `git` 回
+      `fatal: cannot change to '/tmp/repo/.git/dsh-worktrees/session-…`（多出半截）；
+      修法是加一个 `wt_nul(&buf)`（**追加 NUL 但把 `len` 减回去**），建好路径立刻过一遍。
+    * `agent_models_ensure` 拼 `$DSH_HOME` + `"/settings.yaml"`：没补 NUL 时
+      `mx_load` 读到的路径带一截旧字节，`yt_load_file` 失败 ⇒ **目录只剩 seeded 的那一条**
+      （`model_catalog = 1 model`），而所有 `mx_find` 都落空 ⇒ `/effort` 报「目录里没有当前模型」。
+    * `wt_fixture_make`（自测）把 `&const byte` 当 C 串用 —— `sess_mkdir_p` / `write_text_file`
+      拿到的是**没有 NUL 的缓冲**：小轮子里堆恰好是 0 就「碰巧通过」，整轮里堆脏了必失败。
+    判据很干脆：**凡是要喂给「收 C 字符串」的 API，缓冲末尾必须有 NUL**；`_z` 后缀那几个
+    `buf_append_cstr_z` 只该出现在**最后一段**（它把 NUL 也写进缓冲，后面的追加会掉进 NUL 之后）。
+58. **`&out` 是「Buf 的指针的指针」—— `out` 参数本来就是 `&Buf`**（P37）。`worktreex` 里
+    写 `buf_append(&out, …)` 时生成的 C 是 `buf_append((struct uya_slice_uint8_t*)&out, …)`，
+    运行时把**栈上那个 Buf 描述符**当成缓冲区首地址 ⇒ 立刻 SIGSEGV（`wt_section_into` 一跑
+    就崩在 `bufx_buf_reserve` → `realloc(0x7ffffff…, 187649985771868)`，因为「长度」读的是
+    描述符里的垃圾）。这条本身是低级错误，值得记的是**它怎么混进来的**：一次批量文本替换
+    （把「输出到 out」的 `buf_append(out, X)` 误改成 `buf_append(&X, X.ptr…)` 那一类规整）
+    把 25 处输出追加一起改错了。**批量正则改调用点时，别只看被改的那一处** ——
+    改完必须 `make check` + 跑一条真路径（这里是 `--dry-run` 都过不了）。
+59. **自测要跟「真机 DSH 设置」隔离：进程级模式会漏进 fork 出去的每一轮**（P37）。
+    P37 的 worktree 模式由 `agent-presets.default=git-worktree` 自动开 —— 而真机
+    `~/.dsh/settings.yaml` 里**正好就是它**。于是 `--selftest` 主进程带着 `wt_on=true` 进场，
+    每个 fork 出去跑一轮的子进程都会去建 worktree、把工作区切进 `.git/dsh-worktrees/…`：
+    `tui-pty` / `tty-title-pty` / `tui-diff` 这些**真 PTY** 轮整片红（mock 网关的 base_url 与
+    工作目录全被搬走），而且报的是「标题被重复写了」「真 git 的 status 没走到列表里」这类
+    看着跟 worktree 毫无关系的症状。两处修法：
+    * `selftest_main` 开头 `wt_set_on(false); wt_reset();` —— 自测**从关开始**，
+      worktree 那两轮自己开、结束时关；
+    * fixture 路径改成 **`/tmp` 下 + 带 pid**：整轮 selftest 里前面几轮会**真的 chdir**
+      （工作区那几轮），相对路径到这一轮已经不是仓库根；共享一个目录时「A 建的 worktree
+      还挂在里面、B 来 `git init`」也会互相踩。`make e2e-worktree` 里那条「非仓库」用例同理：
+      它必须放在 `/tmp`，放在 `build/` 下面会**继承外层仓库**（git 会往上找）。
 
 ---
 
@@ -2526,6 +2698,13 @@ agent 循环并逐项断言：
 | `diff-parse` | **unified diff → 行表**（P27，纯函数、不碰 git）：`@@` 头与行号解析；上下文两侧同行号；**2 删 3 增 → 2 个 MIX（左删右增）+ 1 个落单 ADD**（两侧 off/len 与文本逐字节）；纯插入 / 纯删除；多 hunk（两个说明行）；`\ No newline at end of file` 落成说明行；CRLF 的 `\r` 不许带进单元格（否则显示成 `·`）；TAB 原样保留（清洗是渲染层的事）；`Binary files … differ` 只留一行说明；mode-only（无 hunk）→ 0 行 + 说明；非 diff 文本（git 报错）整段落成一行说明（宁可看得见，也不给空面板）；空输入 → 0 行；**配对溢出**（> 4096 行的块）放弃配对但**一行不丢、顺序不乱** |
 | `ws-resolve` | **恢复会话时「这个会话在哪」的判定（P34）**：手写一份会话日志（header 的 `cwd` = A + 两条 `session/workspace`（C → B）），断言 `sess_read_meta` 取到 id / 创建时工作区（A）/ **最后一条**的工作区（B）；`agent_session_workspace_pick` 在「记录存在」时把工作区切到 B 且来源记成 `session`、`cfg.resume_ws` 记下「会话在哪」；`--workspace`/env 显式指定过就不切；记录的工作区不存在时**报 fallback 且留在当前工作区**；切到同一个目录返回 `WS_E_SAME`（幂等）；相对路径按**当前**工作区解析并落成绝对路径。收尾把进程 cwd 还原（切换是真的 `chdir`，别的轮次都假定 cwd = 仓库根） |
 | `sess-meta-big` | **大日志上的 `sess_read_meta`（P35，段错误回归）**：手写一份 ~3 MiB 的会话日志（header + 早的一条 `session/workspace` + 上千条大 payload 填充行 + **最后一条** `session/workspace` + 一条**没有换行**的残行），断言 `sess_read_meta` 取到 header 的 id / 创建时 `cwd`、**最后一条** `session/workspace`（不是 early —— 越界窗口要把后半段的匹配吃到，这条就会红），并断言 `sess_reader_load`+`sess_next` 能逐行走完、末尾残行被标成 `dropped_tail` 丢弃且 reader 的「最后一条 workspace」不是残行里的 `…/TRUNC`。未修版本在这条 fixture 上稳定 `rc=139`（实测 3/3；1 MiB 时越界窗口恰好还落在同一个 mmap 里、侥幸不崩，所以 fixture 有意做到 3 MiB） |
+| `model-catalog` | **模型目录（P37）**：手写一份只有两提供方的 `settings.yaml`，断言分组/条目数、`contextWindow`/`maxTokens`/`input` 解析、**provider 级 compat 继承 + 模型级覆盖**、档位集合逐项（`a-two` 只公布 `off/low/high` ⇒ `minimal`/`medium` 必须判**不可用**）、`reasoningEfforts: false` = **声明过但一个档位都不公布**（清单必须空 —— 不发明档位）、`declared` 与「公布了档位」分开、`none` == `off`、不认识的档位名返回 -1 |
+| `model-apply` | **切换收口（P37）**：命中目录 ⇒ `provider`/`model`/`contextWindow`/`maxTokens`/provider 级 `supportsDeveloperRole` **一起**跟随，且旧档位 `max` 不在新模型公布的集合里 ⇒ 回落成第一个公布的 `off` 且 `effort_set=true`；同一个三元组再切一次返回 **1**（幂等）；**目录外**的模型名返回 0 但 `contextWindow` 与 `provider` **一个字节都没动**（静默清空会让压缩失效）；非推理模型上 `effort_set` 必须是 false（不装成「已校验」），且不去动已有的强度 |
+| `effort-apply` | **强度校验（P37）**：公布的档位收（`high`）、同值幂等返回 1、没公布的档位**拒**（`medium` → 2）且值不变、不认识的档位名拒；**不公布档位的模型**上显式给的 `xhigh` 原样透传（返回 0）但 `effort_set=false`（与 `--reasoning-effort` 的老口径一致：透传不 clamp） |
+| `model-log` | **选择落盘（P37）**：真开一个会话，切到 `beta/b-think` + `xhigh`，关掉日志后用 `sess_read_meta` 回读 —— `provider`/`model`/`reasoningEffort` 三个字段都必须是**最后一条** `session/model` 的值（`--resume` 跟随靠的就是它） |
+| `worktree` | **Git worktree 的建 → 闸门 → finish（P37，真 git）**：在 `/tmp` 下造一个真仓库（pid 唯一，见踩坑 59），`wt_provision` 建出 worktree + `dsh/<slug>` 分支且 `phase=READY`、基分支探测到 `master`/`main`（**不是** `HEAD`）；闸门：共享 checkout 里的文件判越界、worktree 里的同一个文件不判越界、共享 checkout 里的 `git commit` 被拒、`git status` 放行；在 worktree 里写一个文件 → `wt_finish` → 断言 worktree **目录没了**、**主干上真的有那个文件**（合并成功）、`phase=FINISHED`。本机没有 git 时打 `skip`（不假绿） |
+| `worktree-discard` | **discard 与非仓库 fail soft（P37）**：`wt_discard` 之后 worktree 里那个文件**不许**出现在主干上（没合并）、`phase=DISCARDED`；工作区不在任何 git 仓库里时 `wt_provision` 必须判 `SKIPPED` 且**不报错退出**（照常在原工作区干活，同 DSH） |
+| `tui-model` | **`/model` 与 `/effort` 浮层（P37）**：`/model` 开浮层、标题/分组标题（`# alpha` / `# beta`）/全部模型/公布的档位摘要/「（不公布推理档位）」都在屏幕上，`✓` **只**出现在当前模型那一行；条目反解（分组行交回 false、模型行交回名字）；`↓` + 回车落到 `a-two` 并把 `cfg.model`/`contextWindow` 换过去；`/effort` 浮层**只列公布的档位**（屏幕上不许出现 `medium`），选中后落到 `cfg.reasoning_effort` 且 `effort_set=true`；**不公布档位的模型上 `/effort` 不开浮层**、只留一行可见说明；信息行在 `tui_set_effort` 有值时挂 ` · high`、清成空串后一个字节都不多 |
 | `ws-tool` | **workspace 工具与它的记录（P34）**：无参 = 报告当前工作区 + 来源 + 会话 id；不存在的目录 / 文件（不是目录）两种失败都要有话说且**状态一个字节不变**；相对路径真切换 → `cfg.workspace` 落到绝对路径、`ws_src` 变 `runtime`、结果里有 `switched workspace`；**会话日志**里最后一条 `session/workspace` = 新工作区、header 的创建时工作区**没被改写**，**索引**里同 id 最后一条 `cwd` = 新工作区（`/sessions` 的工作区列吃它）；重复切同一个目录走幂等分支；`/diff` 的文本头里写的是**工作区短路径**（`$HOME` → `~`，与 `gd_ws_short_into` 同一条规则，用例自己按同一规则拼期望值）；本机没有 git 时那一段打 `skip`（不假绿） |
 | `diff-git` | **/diff 的真 git 端到端**（P27，离线；fixture 仓用被测的 `gitx_run` 自己建）：`gd_open` 出 3 个文件且带 git 的 XY 码（` M` / `??` / ` D`）与 numstat 计数（`(+1 -1)` / `(new)` / `(+0 -2)`）；改一行的文件左右两栏文本与行号逐字节正确；未跟踪文件整份都是新增（左侧空）；删除的文件整行都在左侧；`↓/↑` 换文件与两端夹取；`gd_refresh` 之后能看到新内容（`r` 键那条路）；滚动/横向滚夹取；`gd_print_text` 的单列回退含 `[diff]` 头、文件数、列表行与两侧内容；非仓库目录 `gd_open < 0` 且文案非空；本机没有 git 时打 `skip`（不假绿） |
 | `tui-approve` | read-only 下 bash 逐条批准，两种形态：① headless（注入的键在浮层打开前就被输入行吃了）= 没人回答 → **fail closed**，转录出现逐字拒绝串、命令 stdout 不出现、且不是「没有回答渠道」那条；② **真 PTY**：等 `Read Only：批准这条 bash 命令？` 画出来再送 `↑`+回车 → 命令真的跑（stdout 进转录与下一封请求）、退出码 0 |
@@ -3186,6 +3365,36 @@ mock 上逐字段验收。换一台 `openai-responses` 网关可用时，零参�
     `e2e-resume-big` 与 `sess-meta-big` 都立刻失败（前者 139、后者直接崩）——
     两条腿都真的抓得到这个缺陷，不是「恰好绿」。
 
+* **P37 的验收记录（2026-10-03，`p37-model`，对应踩坑 55–59）**：
+  * **真机数据只读复验**：拿真机 `~/.dsh/settings.yaml`（5 个 provider / 19 个模型）跑
+    `--print-config`：`provider = autodl-api (source: dsh-settings)`、
+    `model_catalog = 19 model(s) (loaded from settings.yaml)`、
+    `efforts = off, minimal, low, medium, high, xhigh, max`（与设置里那张 `reasoningEfforts`
+    映射逐项一致）；`/model` 的清单按提供方分组列出全部 19 条，其中 `h2s-local` 的
+    `qwen3.8-9b-distill` 报 `effort: low, medium, high`（它自己只公布这三档）、
+    其余没写 `reasoningEfforts` 的报「（未声明推理档位）」—— **没有任何一条被我们编出档位**。
+  * **一条真实的「不发明档位」对照**：`gpt-6-astra`（`aigw`）在设置里没写 `reasoningEfforts`，
+    从默认的 `DeepSeek-V4.1-Flash` 切过去时 `--effort low` 被**原样透传**（`effort_set=false`，
+    `/effort` 报「不是模型公布的档位」），`/model` 报告里它那一行也写明「（未声明推理档位）」。
+  * **一条真实的「切模型跟随能力」**：`--model gpt-6-astra` 之后 `provider` 从 `autodl-api`
+    变成 `aigw`（跨提供方按 model id 反查，见 §2 那条注释），而不是留在旧 provider 下。
+  * **worktree 真机流程**（`/tmp` 下的真仓库，非 `~/.dsh`）：`--worktree` 起一次会话 →
+    `git worktree list` 里出现 `.git/dsh-worktrees/session-<slug>` + 分支 `dsh/session-<slug>`、
+    基分支探测成 `master`（不是 `HEAD`）；模型在 worktree 里写文件时**主检出看不到它**；
+    `finish` 之后主检出上出现那个文件、`worktree list` 只剩主检出、`git branch --list 'dsh/*'`
+    为空 —— 与 DSH preset 的「合并回主干 + 删 worktree + 删分支」逐条对上。
+  * **离线验收**（都进 `make selftest`）：新增 6 轮（`model-catalog` / `model-apply` /
+    `effort-apply` / `model-log` / `worktree` / `worktree-discard`）+ 1 轮 TUI（`tui-model`）；
+    `make e2e-model`（目录 / 能力跟随 / 目录外只换名字 / REPL 报告与切换 / 非法档位拒 / 透传标注）
+    与 `make e2e-worktree`（建 worktree+分支 / 非仓库 fail soft / `--no-worktree` 关闭）两条真二进制用例。
+  * **被自测当场抓住的三处自身缺陷**（都写进踩坑）：`mx_levels_into` 的 `buf_reset` 抹掉前缀
+    （55）、`buf_free` 后读 self 指针（56）、三处 C 字符串没补 NUL（57）——
+    另外两处「批量替换把 25 处输出追加一次改错」（58）与「真机 DSH preset 把关掉的模式漏进
+    fork 的子进程」（59）都是**整轮 selftest** 才暴露的，单跑 `model-selftest` 时全绿。
+  * `make check / build / codegen-audit / selftest` 全绿（含新增的 7 轮）；
+    `make tui-demo` 只差脚注版本串（`p35-sess` → `p37-model`），排版一个字节没碰 ——
+    强度那一段只在 `tui_set_effort` 有值时才挂（默认空串，逐字节等价）。
+
 ---
 
 ## 7. 已知限制
@@ -3201,6 +3410,45 @@ mock 上逐字段验收。换一台 `openai-responses` 网关可用时，零参�
     只有目标在盘上（`goal.json`，启动时重读）。
   * 浮层打开时常驻块被浮层盖住（与 P18 的状态区同现象），关掉浮层即回来；块不做鼠标交互、
     点击折叠、跨会话记忆（`/tasks close` 只影响当前进程）。
+* **模型选择与推理强度（P37）的边界**：
+  * **目录只读本地 `settings.yaml`**：不做 DSH 那种「提供方目录远程拉取」，也不读
+    `modelOverrides`（只认 `models[]` 里的条目）。设置里没写 `contextWindow` 时目录条目就是
+    -1，切过去也不会把压缩窗口「猜」出来 —— 这种路线请显式 `--context-window N`。
+  * **目录外的模型名只换名字**：`--model` / `/model <名字>` 敲了目录里没有的 id 时，
+    provider / contextWindow / maxTokens / compat **一律保持不动**（只打一行 warning）。
+    这是有意的：静默清空 `contextWindow` 会让自动压缩失效，比「名字换了但能力没跟上」更坏。
+  * **不发明档位**：`/effort` 只接受当前模型**公布**的档位；模型没写 `reasoningEfforts`
+    （或写 `false`）时 `/effort` 不开浮层，`--effort` / `--reasoning-effort` 的值**原样透传**
+    （与既有 `--reasoning-effort` 的老口径一致，不做 clamp、不报错）——
+    `/status` 与 `--print-config` 会把这种情况标成「不是模型公布的档位」。
+    目录外的模型同理（`effort_set=false`）。
+  * **切模型不做上下文迁移**：历史原样保留（不重新压缩、不重写 system prompt 里的
+    `{{model}}`）。`{{model}}` 是**建会话时**求值的，所以运行中切模型后 persona 里仍写着旧模型名
+    （DSH 的 persona 也是「下一次组装边界」才换；这里没有那一层重装）。
+  * 模型/强度的选择进会话日志（`session/model`）**不进索引的独立字段**（索引的 `model`
+    只记模型名，没有 effort）；`--resume` 跟随的是日志里**最后一条**。
+  * 子代理继承父的 provider/model/强度，但**不能自己切**（`/model` 只在人这一侧；
+    子代理没有交互界面）。
+* **Git worktree（P37）的边界**：
+  * **是工具层栅栏，不是内核边界**：写闸门只拦 `write` / `edit` 的目标路径与 bash 里
+    **认得出**的 git 变更子命令；`bash -c` 里用变量拼出来的 git 调用（`g=git; $g commit`）
+    认不出来，跟 DSH 的 `GIT_MUTATION` 同一个分界。要更硬就配 `read-only`（写工具硬拒）。
+  * **不含内核沙箱**：worktree 只是「换一个工作区目录」，bash 的 bwrap 档仍是 P21 那套
+    （confined 模式下可写根跟着当前工作区走 —— 因为切工作区走的是 P34 的收口）。
+  * **一个会话一个 worktree**：不支持并行多 worktree / 嵌套 worktree；`finish` 与 `discard`
+    只认**本会话**建的那个（`finish` 之后 phase 变 `FINISHED`，要再来一轮得重新 `worktree start`，
+    P37 的 `start` 动作支持这个）。
+  * **合并策略只有 `merge`（`--no-ff`）**：preset 的另一档 `squash` 没做；冲突时**中止合并**
+    并把主干恢复原状，留给模型/人在 worktree 里解（`git merge <base>` 后重试 `finish`）——
+    不做自动冲突解决。
+  * **不碰共享 checkout 的未提交改动**：`finish` 会先看共享 checkout 在不在 base 分支上，
+    不在就 `checkout base`（有未提交改动时 git 自己会拒绝，我们把它原话转给模型）。
+  * **`--resume` 不重建 worktree**：恢复一个 worktree 会话时按日志里**最后一条**
+    `session/workspace` 落位（通常是那个 worktree 路径）；worktree 已经被 `finish` 删掉时
+    走 P34 的 fallback（留在当前工作区 + 留话）。恢复之后想再要一个独立工作区就 `/worktree start`。
+  * **DSH preset 自动开是一把双刃剑**：真机 `agent-presets.default=git-worktree` 会让
+    **每个**新会话都建 worktree（这正是那个 preset 的语义）——不想要就 `--no-worktree`
+    或 `/worktree off`；`--selftest` 里显式从关开始（踩坑 59）。
 * **工作区（P34）的边界**：
   * 「会话现在在哪」= 日志里最后一条 `session/workspace` 事件（append-only、权威）；header 的 `cwd`
     是**创建时**在哪（元数据，不再改写）；索引里的 `cwd` 是它的「最后已知」缓存（`/sessions` 的
