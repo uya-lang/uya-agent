@@ -882,6 +882,268 @@ export fn sess_find_last(home: &const byte, cwd: &const byte, out: &Buf) bool {
     return buf_append(out, best_path.ptr, best_path.len);
 }
 
+// ============================================================
+// P31：会话列表的数据源 —— 索引去重 + 按 lastActiveAt 倒序
+// ============================================================
+// `/sessions`（浮层）、`--list-sessions`、滚动模式的 `/sessions` 共用这一份：
+//   * 索引是**追加写**的：同一个会话每关一次就多一条记录，所以列表侧必须先按索引
+//     自己的契约「同 id 取最后一条」去重，否则同一个会话会在列表里出现好几份
+//     （真机 index.jsonl 实测：308 行 / 298 个会话，其中一个 id 出现 4 次）。
+//   * 顺序按 `lastActiveAt` **倒序**（最新在最上）；缺这个字段的记录排最后。
+// 输出：每行一条**索引记录原文**（JSON，行尾 '\n'），不做列排版 ——
+// 索引与日志归 session.uya，呈现（三列 / 宽度自适应）归 agent.uya。
+//
+// id 的比较用**原始切片**（不反转义）：我们自己写的 id 一定是 `session-` + hex + 短横线，
+// 不含转义。真遇到带转义的 id，最坏是去重漏一次（退化成「同一个会话列两次」的旧行为），
+// 不会写错数据；排版与 /resume 用的仍是 sess_json_str 反转义出来的那个 id。
+struct SessIdxRow {
+    at: i64,            // lastActiveAt（缺字段 = -1 → 排最后）
+    line_off: usize,    // 该条索引记录在 idx 里的起始偏移
+    line_len: usize,
+    id_off: usize,      // id 的原始字节区间（指向 idx 内部，只用于去重比较）
+    id_len: usize,
+}
+
+fn sess_idx_at(base: &const SessIdxRow, i: usize) &const SessIdxRow {
+    const esz: usize = @size_of(SessIdxRow) as usize;
+    return @ptr_from_usize(@usize_from_ptr(base as &const void) + i * esz) as &const SessIdxRow;
+}
+
+fn sess_idx_at_mut(base: &SessIdxRow, i: usize) &SessIdxRow {
+    const esz: usize = @size_of(SessIdxRow) as usize;
+    return @ptr_from_usize(@usize_from_ptr(base as &void) + i * esz) as &SessIdxRow;
+}
+
+// 记录整体拷贝：**逐字段**写。
+// 不能写成 `const cur: SessIdxRow = sess_idx_at(rows, i)[0];` —— 从指针解引用里
+// 「移动」出一个结构体值会被类型检查拦下（"循环中的变量不能移动"，实测）。
+fn sess_idx_copy(dst: &SessIdxRow, src: &const SessIdxRow) void {
+    dst.at = src.at;
+    dst.line_off = src.line_off;
+    dst.line_len = src.line_len;
+    dst.id_off = src.id_off;
+    dst.id_len = src.id_len;
+}
+
+// 行里 `"id":"…"` 的原始字节区间（相对行首，不含两端引号）。不在行里返回 false。
+// 与 sess_json_str 同一套扫法：反斜杠后面的字符一律跳过（\" 不是收尾引号）。
+fn sess_idx_find_id(line: &[byte], off: &usize, len: &usize) bool {
+    const at: isize = find_sub(line, &"\"id\":\""[0: 6], 0);
+    if at < 0 {
+        return false;
+    }
+    const start: usize = (at as usize) + 6;
+    var i: usize = start;
+    while i < line.len {
+        const c: byte = line.ptr[i];
+        if c == 92 as byte {
+            i = i + 2;
+            continue;
+        }
+        if c == 34 as byte {
+            off[0] = start;
+            len[0] = i - start;
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+// 两个 id 原始切片比较：<0 / 0 / >0（按字节，id 全是小写 hex 与短横线）
+fn sess_idx_id_cmp(idx: &const Buf, a: &const SessIdxRow, b: &const SessIdxRow) i32 {
+    var n: usize = a.id_len;
+    if b.id_len < n {
+        n = b.id_len;
+    }
+    var i: usize = 0;
+    while i < n {
+        const ca: byte = idx.ptr[a.id_off + i];
+        const cb: byte = idx.ptr[b.id_off + i];
+        if ca < cb {
+            return -1;
+        }
+        if ca > cb {
+            return 1;
+        }
+        i = i + 1;
+    }
+    if a.id_len < b.id_len {
+        return -1;
+    }
+    if a.id_len > b.id_len {
+        return 1;
+    }
+    return 0;
+}
+
+// 插入排序：按 (id 升序, 行号升序) —— 排序后同 id 的记录相邻，组内最后一条就是
+// 索引文件里最后写的那一条（= 契约里「生效」的那一条）。
+// rows 的第 n 号槽是**暂存格**（调用方多分配一格），于是整个排序不产生结构体值。
+// 注意：比较的是紧凑记录（不是 JSON 解析），会话量的平方级开销可以忽略。
+fn sess_idx_sort_by_id(idx: &const Buf, rows: &SessIdxRow, n: usize) void {
+    const tmp: &SessIdxRow = sess_idx_at_mut(rows, n);
+    var i: usize = 1;
+    while i < n {
+        sess_idx_copy(tmp, sess_idx_at(rows, i));
+        var j: usize = i;
+        while j > 0 {
+            const prev: &const SessIdxRow = sess_idx_at(rows, j - 1);
+            const c: i32 = sess_idx_id_cmp(idx, prev, tmp);
+            var stop: bool = false;
+            if c < 0 {
+                stop = true;
+            } else if c == 0 && prev.line_off < tmp.line_off {
+                stop = true;
+            }
+            if stop {
+                break;
+            }
+            sess_idx_copy(sess_idx_at_mut(rows, j), prev);
+            j = j - 1;
+        }
+        sess_idx_copy(sess_idx_at_mut(rows, j), tmp);
+        i = i + 1;
+    }
+}
+
+// 插入排序：按 (lastActiveAt 降序, 行号降序) —— 最新在最上；时间戳相同或缺失（-1）时
+// 后写的排在前面，于是「缺时间戳」的那批一起落到列表末尾。
+fn sess_idx_sort_by_at(rows: &SessIdxRow, n: usize) void {
+    const tmp: &SessIdxRow = sess_idx_at_mut(rows, n);
+    var i: usize = 1;
+    while i < n {
+        sess_idx_copy(tmp, sess_idx_at(rows, i));
+        var j: usize = i;
+        while j > 0 {
+            const prev: &const SessIdxRow = sess_idx_at(rows, j - 1);
+            var before: bool = false;
+            if prev.at > tmp.at {
+                before = true;
+            } else if prev.at == tmp.at && prev.line_off > tmp.line_off {
+                before = true;
+            }
+            if before {
+                break;
+            }
+            sess_idx_copy(sess_idx_at_mut(rows, j), prev);
+            j = j - 1;
+        }
+        sess_idx_copy(sess_idx_at_mut(rows, j), tmp);
+        i = i + 1;
+    }
+}
+
+// 索引里的会话列表（去重 + 倒序）。没有索引 / 没有可解析的记录 → false，out 清空。
+export fn sess_index_rows_sorted(home: &const byte, out: &Buf) bool {
+    buf_reset(out);
+    var idx: Buf = buf_new(65536);
+    defer { buf_free(&idx); }
+    if !sess_read_index(home, &idx) {
+        return false;
+    }
+    // 1) 先数一遍非空行 → 一次分配紧凑记录表（不做逐条 realloc）
+    var n: usize = 0;
+    var pos: usize = 0;
+    while pos < idx.len {
+        var e: usize = pos;
+        while e < idx.len && idx.ptr[e] != 10 as byte {
+            e = e + 1;
+        }
+        if e > pos {
+            n = n + 1;
+        }
+        pos = e + 1;
+    }
+    if n == 0 {
+        return false;
+    }
+    const esz: usize = @size_of(SessIdxRow) as usize;
+    const raw: &void = malloc((n + 1) * esz);   // +1：排序用的暂存格（见 sess_idx_sort_*）
+    if ((raw as &byte) as usize) == 0 {
+        return false;
+    }
+    defer { free(raw); }
+    const rows: &SessIdxRow = raw as &SessIdxRow;
+    // 2) 填表：没有 id 的行直接丢掉（索引是外部文件，可能被手改过）
+    //
+    // ⚠ 每一行先**拷进 line** 再解析，不要写 `idx.ptr[lo: ll]`：uya 0.10 的 `p[a: b]`
+    // 是「从 a 起 **b 个字节**」（偏移 + 长度），不是「到 b 为止」—— 传 `[lo: lo+ll]`
+    // 会拿到 `lo+ll` 字节的窗口，越读到后面几行去（实测：D 那条没有 lastActiveAt 的
+    // 记录被解析成了下一行的 9000，倒序于是全错，还顺带 OOB 读）。全仓的 `[0: n]`
+    // 恰好两种语义一样，所以这个坑一直没露头（见 README 踩坑 48）。
+    var line: Buf = buf_new(4096);
+    defer { buf_free(&line); }
+    var m: usize = 0;
+    pos = 0;
+    while pos < idx.len {
+        var e: usize = pos;
+        while e < idx.len && idx.ptr[e] != 10 as byte {
+            e = e + 1;
+        }
+        const lo: usize = pos;
+        const ll: usize = e - pos;
+        pos = e + 1;
+        if ll == 0 {
+            continue;
+        }
+        buf_reset(&line);
+        if !buf_append(&line, idx.ptr + lo, ll) {
+            return false;
+        }
+        const view: &[byte] = line.ptr[0: line.len];
+        var ido: usize = 0;
+        var idl: usize = 0;
+        if !sess_idx_find_id(view, &ido, &idl) {
+            continue;
+        }
+        const r: &SessIdxRow = sess_idx_at_mut(rows, m);
+        r.at = sess_json_i64(view, "lastActiveAt");
+        r.line_off = lo;
+        r.line_len = ll;
+        r.id_off = lo + ido;
+        r.id_len = idl;
+        m = m + 1;
+    }
+    if m == 0 {
+        return false;
+    }
+    // 3) 同 id 归到相邻 → 4) 每个 id 只留组内最后一条（「同 id 取最后一条」）
+    sess_idx_sort_by_id(&idx, rows, m);
+    var keep: usize = 0;
+    var i: usize = 0;
+    while i < m {
+        var j: usize = i + 1;
+        while j < m {
+            if sess_idx_id_cmp(&idx, sess_idx_at(rows, i), sess_idx_at(rows, j)) != 0 {
+                break;
+            }
+            j = j + 1;
+        }
+        const src: &const SessIdxRow = sess_idx_at(rows, j - 1);
+        if keep != j - 1 {
+            sess_idx_copy(sess_idx_at_mut(rows, keep), src);
+        }
+        keep = keep + 1;
+        i = j;
+    }
+    // 5) 最新在最上
+    sess_idx_sort_by_at(rows, keep);
+    // 6) 原样输出索引记录（排版交给调用方）
+    var k: usize = 0;
+    while k < keep {
+        const r: &const SessIdxRow = sess_idx_at(rows, k);
+        if !buf_append(out, idx.ptr + r.line_off, r.line_len) {
+            return false;
+        }
+        if !buf_append_byte(out, 10) {
+            return false;
+        }
+        k = k + 1;
+    }
+    return out.len > 0;
+}
+
 // 读索引文件（不存在返回 false）
 export fn sess_read_index(home: &const byte, out: &Buf) bool {
     var p: Buf = buf_new(bufx_cstr_len(home) + 32);
