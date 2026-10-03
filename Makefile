@@ -6,6 +6,7 @@
 #   make selftest   # 离线端到端自测（内置 mock LLM，无需网络与 key）
 #   make probe      # 传输层探针（默认打 api.deepseek.com，期望 HTTP 401）
 #   make e2e-diff   # /diff：真 git 的改动列表 + 单列文本回退 + 非仓库报错（离线）
+#   make e2e-ws     # 工作区：恢复时跟随会话记录 + 日志不改挂 + 显式优先 + 记录目录被删（离线）
 #   make e2e-tasks  # /tasks：报告头 / 空态串 / open / toggle / 非法参数（离线）
 #   make e2e-goal   # /goal：看状态 / 创建 / 拒绝顶掉 / edit / pause / resume / clear（离线）
 #   make e2e TASK="..." PIN=<leaf sha256> [STEPS=N]   # 真实调用（需要 DEEPSEEK_API_KEY；STEPS 不给就不限步数）
@@ -28,7 +29,7 @@ TASK ?= 创建 hello.uya，编译并运行它
 export UYA_ROOT
 export UYA_SPLIT_C_DIR := $(CURDIR)/build/uyacache
 
-.PHONY: all check build selftest codegen-audit probe e2e e2e-config e2e-config-flags e2e-title e2e-api e2e-steps e2e-permission e2e-sandbox e2e-tasks e2e-goal e2e-diff e2e-dsh p30-check tui-demo tui-selftest diff-selftest clean
+.PHONY: all check build selftest codegen-audit probe e2e e2e-config e2e-config-flags e2e-title e2e-api e2e-steps e2e-permission e2e-sandbox e2e-tasks e2e-goal e2e-diff e2e-ws e2e-dsh p30-check tui-demo tui-selftest diff-selftest clean
 
 all: build
 
@@ -53,7 +54,7 @@ codegen-audit: build
 	fi; \
 	echo "codegen-audit: 通过（没有切片描述符强转）"
 
-selftest: build codegen-audit e2e-config-flags e2e-title e2e-api e2e-steps e2e-permission e2e-sandbox e2e-tasks e2e-goal e2e-diff p30-check
+selftest: build codegen-audit e2e-config-flags e2e-title e2e-api e2e-steps e2e-permission e2e-sandbox e2e-tasks e2e-goal e2e-diff e2e-ws p30-check
 	UYA_BIN=$(UYA) $(OUT) --selftest
 
 probe: build
@@ -182,6 +183,56 @@ e2e-diff: build
 	out=$$(cd /tmp && printf '/diff\n/exit\n' | $(CURDIR)/$(OUT) --no-dsh-config --no-tui --quiet --api-key dummy-key 2>&1 || true); \
 	echo "$$out" | grep -q "not a git repository" || { echo "FAIL: 非仓库目录没有报出「不是 git 仓库」"; echo "$$out"; exit 1; }; \
 	echo "e2e-diff: 通过（真 git 的列表 + 单列文本回退 + 非仓库报错）"
+
+# P31：工作区（离线）—— 真二进制跑四条：
+#   ① 恢复会话时工作区跟着**会话记录**走，/diff 打的是那个工作区的改动；
+#   ② 恢复不去动日志的存放位置（不再造出同 id 的空文件、索引 cwd 不被改写）；
+#   ③ 显式 --workspace 优先于会话记录；
+#   ④ 记录的工作区被删（worktree 合并后就删是常态）→ 留在当前工作区 + 留话 + 记一条 fallback。
+# 会话日志用 python3 手写（格式与 sess_open 逐字节一致）：这一轮**不联网、不用模型**。
+# 两个工作区都用**绝对**路径：切换是真的 chdir，相对路径会被带到新工作区下面去。
+e2e-ws: build
+	@set -e; \
+	root=$$(pwd); ws=$$root/build/selftest_p31_e2e; home=$$ws/home; a=$$ws/a; b=$$ws/b; c=$$ws/c; \
+	sid=session-aaaa1111-2222-3333-4444-555566667777; \
+	rm -rf $$ws; mkdir -p $$a $$b $$c; \
+	( cd $$a && git init -q . && git config user.email t@t && git config user.name t && \
+	  printf 'one\n' > f.txt && git add -A && git commit -qm init && printf 'changed-in-A\n' > f.txt ); \
+	( cd $$b && git init -q . && git config user.email t@t && git config user.name t && \
+	  printf 'two\n' > g.txt && git add -A && git commit -qm init && printf 'changed-in-B\n' > g.txt ); \
+	python3 -c "import json,os,sys;\
+home,a,sid=sys.argv[1],sys.argv[2],sys.argv[3];\
+d=os.path.join(home,'sessions','--'+a.replace('/','-')+'--',sid);\
+os.makedirs(d,exist_ok=True);\
+p=os.path.join(d,'session.jsonl');\
+rows=[{'type':'session','version':0,'id':sid,'createdAt':1790993000000,'cwd':a,'delegationDepth':0,'agentPreset':'standard','model':'deepseek-chat','provider':'uya-agent'},\
+{'type':'user/message','seq':0,'time':1790993000001,'data':{'role':'user','content':[{'type':'text','text':'记住 5150'}],'source':{'kind':'user'}}},\
+{'type':'assistant/message','seq':1,'time':1790993000002,'data':{'turn':1,'step':1,'message':{'role':'assistant','content':[{'type':'text','text':'记住了'}]}}},\
+{'type':'turn/end','seq':2,'time':1790993000003,'data':{'turn':1,'reason':'completed'}}];\
+open(p,'w').write(''.join(json.dumps(r,ensure_ascii=False,separators=(',',':'))+chr(10) for r in rows));\
+open(os.path.join(home,'index.jsonl'),'w').write(json.dumps({'id':sid,'cwd':a,'lastActiveAt':1790993000003,'title':'记住 5150','model':'deepseek-chat','delegationDepth':0,'turns':1,'events':3,'path':p},ensure_ascii=False,separators=(',',':'))+chr(10))" $$home $$a $$sid; \
+	run="$(CURDIR)/$(OUT) --no-dsh-config --no-tui --quiet --api-key dummy-key --agent-home $$home"; \
+	: "① + ② 从 B 恢复 A 的会话"; \
+	out=$$(cd $$b && printf '/workspace\n/diff\n/exit\n' | $$run --resume $$sid 2>&1 || true); \
+	echo "$$out" | grep -q "工作区跟随会话：$$a" || { echo "FAIL: 恢复会话没有把工作区切到会话记录的那一个"; echo "$$out"; exit 1; }; \
+	echo "$$out" | grep -q "workspace: $$a (source: session)" || { echo "FAIL: /workspace 报告的工作区或来源不对"; echo "$$out"; exit 1; }; \
+	echo "$$out" | grep -q "\[diff\] .*selftest_p31_e2e/a " || { echo "FAIL: /diff 的头里不是会话的工作区"; echo "$$out"; exit 1; }; \
+	echo "$$out" | grep -q -- "+changed-in-A" || { echo "FAIL: /diff 打的不是工作区 A 的改动"; echo "$$out"; exit 1; }; \
+	echo "$$out" | grep -q "changed-in-B" && { echo "FAIL: /diff 里混进了当前目录（B）的改动"; echo "$$out"; exit 1; } || true; \
+	n=$$(find $$home/sessions -name session.jsonl | wc -l); \
+	[ "$$n" = "1" ] || { echo "FAIL: 恢复之后日志被改挂（session.jsonl 份数=$$n，应当只有 1 份）"; find $$home/sessions -name session.jsonl; exit 1; }; \
+	tail -1 $$home/index.jsonl | grep -q "\"cwd\":\"$$a\"" || { echo "FAIL: 索引里的工作区不是会话那一个（被当前目录改写了？）"; tail -1 $$home/index.jsonl; exit 1; }; \
+	: "③ 显式 --workspace 优先"; \
+	out=$$(cd $$b && printf '/workspace\n/exit\n' | $$run --workspace $$c --resume $$sid 2>&1 || true); \
+	echo "$$out" | grep -q "工作区按显式指定" || { echo "FAIL: 显式 --workspace 没有优先于会话记录"; echo "$$out"; exit 1; }; \
+	echo "$$out" | grep -q "workspace: $$c (source: cli)" || { echo "FAIL: 显式指定之后报告不对"; echo "$$out"; exit 1; }; \
+	: "④ 记录的工作区被删"; \
+	mv $$a $$a-gone; \
+	out=$$(cd $$b && printf '/exit\n' | $$run --resume $$sid 2>&1 || true); \
+	echo "$$out" | grep -q "会话记录的工作区已不存在" || { echo "FAIL: 记录的工作区被删之后没有留话"; echo "$$out"; exit 1; }; \
+	echo "$$out" | grep -q "留在当前工作区 $$b" || { echo "FAIL: 被删之后没有留在当前工作区"; echo "$$out"; exit 1; }; \
+	grep -q '"source":"fallback"' $$home/sessions/--*--/$$sid/session.jsonl || { echo "FAIL: 日志里没有 fallback 那一条记录"; exit 1; }; \
+	echo "e2e-ws: 通过（跟随会话工作区 + 日志不改挂 + 索引 cwd 正确 + 显式优先 + 记录目录被删的退路）"
 
 
 # 真实网关端到端：默认走 DSH 设置（零参数就能拿到 base-url/model/key），

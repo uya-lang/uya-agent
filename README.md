@@ -4,7 +4,13 @@
 多轮 loop 直到给出结论。全部代码 42 个 `.uya` 文件，**不引入任何 C 代码、`@c_import` 或其它语言**，
 只依赖 Uya 语言与随编译器分发的标准库。
 
-**P0–P29 全部完成**（**P29 是 `/goal` 人类命令**：会话目标的看 / 建 / 改 / 暂停 / 恢复 / 清除，
+**P0–P30 全部完成**（**P31 是「工作区」**：工作区从「启动时定一次」变成**当前会话的状态** ——
+模型能用 `workspace` 工具报告/切换、人能敲 `/workspace [目录]`、每次切换都记进会话日志
+（`session/workspace`）与索引，恢复会话时**跟着会话记录落位**（显式 `--workspace` 优先，
+记录的工作区被删就留在当前目录并留话），`/diff` 的标题与文本头写的就是这个工作区 ——
+版本串 `p31-ws`，见 §2「工作区」与 §3 踩坑 48/49；
+**P30 是「运行中的 `/` 命令不再等 step 边界」**（并行线，版本串 `p30-pump`）；
+**P29 是 `/goal` 人类命令**：会话目标的看 / 建 / 改 / 暂停 / 恢复 / 清除，
 版本串 `p29-goal`，见 §2 的「会话目标与 /goal（P29）」与 §6 的验收记录；
 **P28 是「退不出」修复**：运行中的 `esc`/`ctrl+c`/`ctrl+d`/`/exit`
 必须**当场**生效，版本串 `p28-quit`，见 §2「退出与中断」与 §3 踩坑 46；P15、P21 这两个编号各被两条并行线用过一次，P22/P23/P24/P25/P26 也是
@@ -129,6 +135,33 @@ DSH `permission.defaultPreset`），read-only 下 `write`/`edit` 硬拒、`bash`
 与模型工具 `create_goal` / `get_goal` / `update_goal` 共用同一份状态：工具走 CAS
 （id + revision），人在回路里直接以当前为准。TUI 里结果是**浮层**、滚动模式打转录，
 带参数的那条还会当场重画常驻任务块的目标段（P22 的块与 `/goal` 共用同一条投影）。
+**P31 把「工作区」变成当前会话的状态**：以前它只在启动时定一次（`getcwd` / `--workspace` /
+`$UYA_AGENT_WORKSPACE`），于是「这个会话现在在哪」既没人记、也切不动 —— 恢复一个别的目录
+的会话时，`/diff`、文件工具、bash、沙箱可写根用的还是**启动目录**（用户报的就是这个）。
+现在：
+* **模型能自己切**：新工具 `workspace` —— 无参 = 报告（工作区 / 来源 / 分支 / 会话 id），
+  带 `path` = 切过去（相对路径按当前工作区解析，目录必须存在，幂等）；非全权模式
+  （read-only / workspace-write）下逐次**要用户批准**（与 read-only 的 bash 审批同一条通道，
+  没有回答渠道就 fail closed），全权模式直接切；plan 模式不拦（plan 只拦写）。
+* **会话记录它**：每次切换往日志追加一条 `session/workspace`
+  （`{"workspace":…,"previous":…,"source":"tool|human|resume|fallback"}`，append-only、最后一条为准），
+  并立刻往索引追一条同 id 记录（`/sessions` 的「工作区」列就是它）。header 里的 `cwd` 是
+  **创建时**在哪（元数据，不再改写）—— 想改的只是这条「当前在哪」。
+* **恢复跟着会话走**：`--resume` / `/resume`（含从 `/sessions` 浮层选）时，工作区按
+  「显式 `--workspace`/env → 日志里最后一条 `session/workspace` → header 的创建时 `cwd`」
+  的顺序定，然后**切过去**（必须在建 system prompt 之前定：`{{cwd}}`、AGENTS.md、技能目录
+  都在那之后求值）；记录的工作区已经不存在（worktree 合并后就删是常态）→ 留在当前工作区、
+  留一行可见的话、记一条 `source:"fallback"`。切了工作区会在 step 边界给模型补推一份新的
+  运行时上下文（里面那句 `Current workspace:`）+ 新工作区的 AGENTS.md。
+* **`/diff` 显示的就是它**：浮窗标题与非 TUI 文本头写**工作区短路径**（`$HOME` → `~`），
+  工作区不是仓库根时再带上仓库名（`/diff · ~/…/.git/dsh-worktrees/92101f97fda4 · 3 个文件（HEAD ↔ 工作区）`），
+  窄终端放不下整条短路径就退成末段，文件与 `+A -D` 不会被挤掉；改动列表的范围仍以**仓库根**
+  为准（P22 的口径没变）。
+* **一处收口**：`agent_workspace_apply` 负责改 `cfg.workspace`、`FsCtx`（裸指针）、
+  `chdir`、技能缓存、`/diff` 缓存、脚注/分支/基标题、日志与索引 —— 于是 bash 的沙箱 bind、
+  文件工具守卫、`{{cwd}}`、`/diff` 全都按「现取」跟着走。
+* 启动时 `--agent-home` / `--dsh-home` / `--workspace` 这类路径会**规范化成绝对路径**：
+  运行中切工作区是真的 `chdir`，相对路径被带走的话会话日志会搬到新工作区下面去（自测第一版撞上了）。
 
 
 ```
@@ -182,7 +215,8 @@ export UYA_SPLIT_C_DIR=$PWD/build/uyacache      # 多文件 C 缓存别丢在仓
 
 用法：
 
-常用斜杠命令：`/diff`（git 修改浮窗：左文件列表 + 右双列全文比对）· `/status` · `/goal`（会话目标）·
+常用斜杠命令：`/diff`（git 修改浮窗：左文件列表 + 右双列全文比对）· `/workspace [目录]`
+（看/切当前会话的工作区）· `/status` · `/goal`（会话目标）·
 `/permission` · `/plan` · `/tasks` · `/sessions` · `/compact` · `/help` · `/exit`。
 
 ```bash
@@ -356,9 +390,13 @@ src/sandboxx.uya  内核沙箱（P21，对齐 DSH bash-sandbox 的 Linux bwrap �
                   进程级缓存）、按访问模式拼 profile argv（只读根 + fresh /dev + 私有 PID 的 /proc；
                   工作区写另加 ephemeral /tmp 与可写 workspace bind）、不可用时的 fail-closed 判定
 src/askuser.uya   ask_user_question：交互模式复用行编辑器，非交互读一行，EOF 时回「无回答」；
-                  P21 加 ask_approve_command（read-only 下 bash 的逐条批准通道）
+                  P21 加 ask_approve_command（read-only 下 bash 的逐条批准通道）；
+                  P31 泛化成 ask_approve_action（bash 与「切工作区」共用同一套浮层/真 TTY/fail-closed）
 src/session.uya   会话日志：路径规范化、id 生成（/dev/urandom→uuid）、header/事件序列化与追加写、
-                  索引、读取与崩溃尾部裁剪、按 id/最近查找、括号配平的数组提取
+                  索引、读取与崩溃尾部裁剪、按 id/最近查找、括号配平的数组提取；
+                  P31 加 `sess_read_meta`（header 的创建时 cwd + 最后一条 `session/workspace`
+                  = 这个会话**现在**在哪）与 `sess_open_resume`（续写**原来那份**日志，
+                  不再按当前目录重算路径 —— 见踩坑 48）
 src/stats.uya     会话统计折叠（P20）：逐行对照 DSH 的 `sessionStats` + `tokenUsage` ——
                   step/start→assistant/message 的 llmMs、首个非空正文 delta→消息组装的 ttft 与
                   解码时长/token、tool/call→tool/result 按 callId 配对、step/end 计步
@@ -2140,6 +2178,30 @@ vLLM 等 OpenAI 兼容端点都一样稳。想升级成严格 `tool` 角色消�
       （实测延迟 4.8 s，看着像没修）。要测这个必须让**响应头 + 第一帧先到**、正文再停：
       见 P30 新加的 `mock_send_sse_slow`（`mock_mode = 40`）。
 
+48. **恢复会话时按「当前目录」重算日志路径 —— 会话被劈成两半，索引里的工作区也跟着被改写**（P31，
+    用户报的是「`/diff` 应该显示当前会话的工作区」）。旧实现里 `agent_session_open` 把恢复
+    当成「按 cwd 开日志 + 接着写」，于是从别的目录恢复一个会话时：
+    * `sess_session_path` 按**当前** cwd 拼路径 → 在 `--<当前 cwd>--/<同一个 id>/session.jsonl`
+      造出一个 **0 字节、连 header 都没有**的新文件，事件从此写进空文件，真历史留在原目录；
+    * `sess_write_index` 又把 `l.cwd`（= 当前目录）写进索引 → 同一个 id 两条记录、
+      「会话在哪」被悄悄改掉（`/sessions` 的工作区列跟着撒谎）；
+    * 运行期工作区仍是启动目录 ⇒ `/diff`、文件工具、bash、沙箱 bind 看的都是启动目录，
+      而**会话自己的记录**说的是另一个地方。
+    现场证据（本机真实索引）：`session-cc4b177b…` / `session-ace7596b…` 各有两条记录，
+    `cwd` 分别是 `/tmp/p5ws` 与仓库根，后者指向的文件是 **0 字节**。
+    修法是把「会话在哪」变成会话自己的属性：日志**只往原来那份文件续写**（`sess_open_resume`）、
+    当前工作区由 `session/workspace` 事件记录（最后一条为准）、恢复时按它落位。
+    **顺带记一条测试方法**：`git worktree` 造出来的工作区（`.git` 是文件而不是目录）必须进用例 ——
+    真实工作流就是「一个任务一个 worktree」，`e2e-ws` 因此用两个**真仓库**跑。
+
+49. **`bufx_eq_cstr(p, n, lit)` 的第三个参数必须是「字面量」—— 传 Buf 会静默判不等**（P31 一次踩两处）。
+    它按 `strlen(lit)` 量长度再比 `n == m`；而 `Buf` 的缓冲**没有 NUL 结尾**（`buf_new` 给的是裸字节），
+    `strlen` 会一直扫到碰巧出现的 0，量出来的长度偏大 ⇒ 直接 return false。症状很隐蔽：
+    * 工作区切换的**幂等分支永远走不到**（切到同一个目录会老老实实再切一遍、再记一条事件）；
+    * 「模型已知的工作区」快照每次比都不相等 ⇒ **每个 step 都补推一份运行时上下文**。
+    两处都在自测里当场暴露（`ws-tool` / `tui-ws` 轮），改法：Buf 对 Buf 一律
+    `a.len == b.len && bufx_mem_eq(...)`（自测里也封了个 `wst_eq`）。
+
 ---
 
 ## 4. 工具实现要点
@@ -2149,6 +2211,7 @@ vLLM 等 OpenAI 兼容端点都一样稳。想升级成严格 `tool` 角色消�
 | `read_file` | `sys_open` + `sys_read` 循环读进堆缓冲 | 单次最多 64 KiB，超出附 `[truncated]` |
 | `write_file` | `sys_open(O_WRONLY\|O_CREAT\|O_TRUNC, 0644)`；父目录缺失时 `mkdir` 一层后重试 | 整文件覆盖写 |
 | `run_shell` | `pipe` → `fork` → 子进程 `dup2`+`chdir(workspace)`+`execve("/bin/sh", ["sh","-c",cmd], envp)` → 父进程 `poll` 读 stdout+stderr → 墙钟超时 `SIGKILL` → `waitpid` | 输出上限 64 KiB；默认超时 120 s；`--no-shell` 关闭 |
+| `workspace`（P31） | 无参 = 报告（工作区 / 来源 / 分支 / 会话 id）；带 `path` = `chdir` + `getcwd` 规范化 + 重指 `FsCtx` + 清技能缓存 + `gd_reset` + 记 `session/workspace` 与索引；工具目录跨模式恒定可见 | 目标必须**存在且是目录**（`chdir` 就是校验，失败什么都不改）；非全权下逐次要用户批准（无渠道 fail closed）；不建目录、不解析 `~` |
 
 路径守卫（best-effort，**不是安全边界**）：所有 `path` 相对 `--workspace` 解析，拒绝绝对路径、
 `~` 开头、以及含 `..` 段的路径。工具内部任何失败都不抛错，一律写成 `error: ...` 文本回给模型，
@@ -2251,8 +2314,11 @@ agent 循环并逐项断言：
 | `plan-gate` | P26 plan 写闸门：纯函数真值表（`plan_init`/`plan_set`/`plan_toggle` 三处一致 + 三个动作 → 三裁决 + 认不出的选中项必须是「继续讨论」）+ 端到端（**全权模式**下 plan 模式里 `write`/`edit` 逐字被拒且 `plan-gate.txt` **没落盘**、`exit_plan_mode` 在管道里回「没有渠道」且**不退模式**、请求里必须带「写工具被拒」那句运行时上下文） |
 | `tui-plan` | P26 plan 审阅浮窗，四段：① 浮层级 headless（标题 `计划待审 · 1/b`、三动作齐、默认光标在「继续讨论」、正文第一行画出来、尾巴一开始不可见、`↓` 行号 +1、`pgdn` 整页跳、`end` 到底才看见尾巴、`home` 回顶、`3`+回车交回「确认执行」且 kind 不丢、`esc` 取消、`agent_plan_force` 同步 Plan chip、40 列窄终端不超宽不崩、**浮层方框闭合成矩形**（复用 tui-frame 那套量法：左右边界列 + 首尾必须是边框字形 —— 踩坑 42 那类缺陷）、每帧「行 ≤ cols + 正文层无 ESC」）；② headless + agent：注入的键到不了浮层 → 按「解决」处理（转录出现「dismissed the plan review」、**没有** `Plan approved`、`plan_on()` 仍为真、浮层已收掉）；③ **真 PTY**：tab 进 plan 模式 → 浮窗出现 → 三动作齐 → `end` 翻到底看见 `PLAN-TAIL-MARK`（正文真的能滚）→ `3`+回车 → 第二封请求里必须出现 `Plan approved`；④ **真 PTY**：`esc` → 第二封请求里必须是「dismissed the plan review to speak instead」 |
 | `tui-access` | 访问模式 chip 三种模式的显示、`shift+tab` 只置请求（主循环据此开浮层）、选择器打开（三行齐 + `✓` 只在当前模式那行 + 圆角框 + esc 取消不变更）、↓+enter 选中 Workspace Write 交给处理器（策略全局 + chip + 转录 notice + **恰好一条** runtime-context 注入且不上屏）、运行中切换时 `cfg.access` 必须跟着走（故意把 cfg 设成旧值）、选 Full access 只翻出确认层（游标默认「取消」→ 回车无变化；↑+enter 才切）；末尾一条**回归**：命令面板里选 `/status` 必须真的派发（浮层结果不许被静默丢掉）；每步都查「每行 ≤ cols、正文层无 ESC」 |
-| `tui-diff` | **`/diff` 浮窗（P28）**：假数据注入后逐项断言 —— 圆角框与标题（`/diff · <仓库> · <文件> · +A -D`）、左列表的 `▸` 选中标记与三个文件、右工作区的 `旧 · HEAD` / `新 · 工作区` 两栏列头、**同一行里同时出现旧文本与新文本**（真并排，不是上下拼）、`@@` 说明行跨两栏；**竖线逐行同列**（两栏行 4 根：左右边框 + 列表缝 + 中缝；跨栏说明行 3 根，且落在同样的列上）；`↓` 换文件后 `▸` 跟着走、`→` 之后每栏补 `‹`、`←` 退回 0、`pgdn/pgup` 翻页与夹取、`r` 失败也**不许丢内容**、`esc`/`q` 关闭走「取消」语义；**运行中开浮窗状态区照样在**（浮层重画转录区之后必须把 P18 的状态区补回来，且整帧行数不变）；40×10 判「画不下」→ 不开浮窗（不许看不见还吞键）；agent 层三条「开不了」都要留下可见的话（不是 git 仓库 → git 的原话、空仓库 → `(没有 git 修改)`、终端太小 → 提示，且三条都**不许**开浮窗）；路径里带 ESC/NUL 时列表与标题都要清洗（帧里一个 NUL/ESC 都不许有 —— P27 第一版就把 fixture 标签的 NUL 画进了标题）；TAB/ESC 序列/汉字不破版（`␛` + 合法 UTF-8）；最后**真 PTY** 里敲 `/diff` → 真跑 git → 屏幕上出现列表与两栏 diff → `↓` 重载 → `esc` → `ctrl-d` 退出码 0；**收尾要把画布与任务面板的行预算还原**（`tui_build_chat` 每帧都会 `tasks_set_row_budget`，本轮的 40×10 子段会把预算压到 1~2 行，不还原就会串到后面 `tasks-scroll` 那一轮 —— 测试之间靠全局状态串味的老坑） |
+| `tui-ws` | **工作区切换在界面与历史里都跟上（P31）**：headless 120×30 —— 切换后**脚注 cwd**（短路径，会被列宽预算裁短所以断言末段目录名）与转录里的 `工作区 → <绝对路径>` 通知都出现；`/diff` 浮窗标题在假数据注入工作区后写成 `/diff · <工作区> · <仓库名> · …`（工作区不是仓库根时两个都写），收尾把假数据的工作区清掉（后面 `tui-diff` 轮还要按旧排版断言）；step 边界补推的运行时上下文以 `Current runtime context` 开头、里面有 `Current workspace: <新工作区>`、且**被认成注入消息**（不许回填成假用户条目、不许画到屏幕上）；同一样的工作区不重复推；切到已经在的工作区是幂等的；相对路径切到子目录 |
+| `tui-diff` | **`/diff` 浮窗（P28）**：假数据注入后逐项断言 —— 圆角框与标题（`/diff · <仓库> · <文件> · +A -D`）、左列表的 `▸` 选中标记与三个文件、右工作区的 `旧 · HEAD` / `新 · 工作区` 两栏列头、**同一行里同时出现旧文本与新文本**（真并排，不是上下拼）、`@@` 说明行跨两栏；**竖线逐行同列**（两栏行 4 根：左右边框 + 列表缝 + 中缝；跨栏说明行 3 根，且落在同样的列上）；`↓` 换文件后 `▸` 跟着走、`→` 之后每栏补 `‹`、`←` 退回 0、`pgdn/pgup` 翻页与夹取、`r` 失败也**不许丢内容**、`esc`/`q` 关闭走「取消」语义；**运行中开浮窗状态区照样在**（浮层重画转录区之后必须把 P18 的状态区补回来，且整帧行数不变）；40×10 判「画不下」→ 不开浮窗（不许看不见还吞键）；agent 层三条「开不了」都要留下可见的话（不是 git 仓库 → git 的原话、空仓库 → `(没有 git 修改)`、终端太小 → 提示，且三条都**不许**开浮窗）；路径里带 ESC/NUL 时列表与标题都要清洗（帧里一个 NUL/ESC 都不许有 —— P27 第一版就把 fixture 标签的 NUL 画进了标题）；TAB/ESC 序列/汉字不破版（`␛` + 合法 UTF-8）；最后**真 PTY** 里敲 `/diff` → 真跑 git → 屏幕上出现列表与两栏 diff → `↓` 重载 → `esc` → 再敲 `/workspace <绝对路径>`（带参数的命令与 `/goal pause` 同一条路：面板里匹配不上 → 回车把整行还回输入行 → 再回车派发）→ 屏幕与脚注出现新工作区、转录里留下 `工作区 → …` 通知 → `ctrl-d` 退出码 0；**收尾要把画布与任务面板的行预算还原**（`tui_build_chat` 每帧都会 `tasks_set_row_budget`，本轮的 40×10 子段会把预算压到 1~2 行，不还原就会串到后面 `tasks-scroll` 那一轮 —— 测试之间靠全局状态串味的老坑） |
 | `diff-parse` | **unified diff → 行表**（P27，纯函数、不碰 git）：`@@` 头与行号解析；上下文两侧同行号；**2 删 3 增 → 2 个 MIX（左删右增）+ 1 个落单 ADD**（两侧 off/len 与文本逐字节）；纯插入 / 纯删除；多 hunk（两个说明行）；`\ No newline at end of file` 落成说明行；CRLF 的 `\r` 不许带进单元格（否则显示成 `·`）；TAB 原样保留（清洗是渲染层的事）；`Binary files … differ` 只留一行说明；mode-only（无 hunk）→ 0 行 + 说明；非 diff 文本（git 报错）整段落成一行说明（宁可看得见，也不给空面板）；空输入 → 0 行；**配对溢出**（> 4096 行的块）放弃配对但**一行不丢、顺序不乱** |
+| `ws-resolve` | **恢复会话时「这个会话在哪」的判定（P31）**：手写一份会话日志（header 的 `cwd` = A + 两条 `session/workspace`（C → B）），断言 `sess_read_meta` 取到 id / 创建时工作区（A）/ **最后一条**的工作区（B）；`agent_session_workspace_pick` 在「记录存在」时把工作区切到 B 且来源记成 `session`、`cfg.resume_ws` 记下「会话在哪」；`--workspace`/env 显式指定过就不切；记录的工作区不存在时**报 fallback 且留在当前工作区**；切到同一个目录返回 `WS_E_SAME`（幂等）；相对路径按**当前**工作区解析并落成绝对路径。收尾把进程 cwd 还原（切换是真的 `chdir`，别的轮次都假定 cwd = 仓库根） |
+| `ws-tool` | **workspace 工具与它的记录（P31）**：无参 = 报告当前工作区 + 来源 + 会话 id；不存在的目录 / 文件（不是目录）两种失败都要有话说且**状态一个字节不变**；相对路径真切换 → `cfg.workspace` 落到绝对路径、`ws_src` 变 `runtime`、结果里有 `switched workspace`；**会话日志**里最后一条 `session/workspace` = 新工作区、header 的创建时工作区**没被改写**，**索引**里同 id 最后一条 `cwd` = 新工作区（`/sessions` 的工作区列吃它）；重复切同一个目录走幂等分支；`/diff` 的文本头里写的是**工作区短路径**（`$HOME` → `~`，与 `gd_ws_short_into` 同一条规则，用例自己按同一规则拼期望值）；本机没有 git 时那一段打 `skip`（不假绿） |
 | `diff-git` | **/diff 的真 git 端到端**（P27，离线；fixture 仓用被测的 `gitx_run` 自己建）：`gd_open` 出 3 个文件且带 git 的 XY 码（` M` / `??` / ` D`）与 numstat 计数（`(+1 -1)` / `(new)` / `(+0 -2)`）；改一行的文件左右两栏文本与行号逐字节正确；未跟踪文件整份都是新增（左侧空）；删除的文件整行都在左侧；`↓/↑` 换文件与两端夹取；`gd_refresh` 之后能看到新内容（`r` 键那条路）；滚动/横向滚夹取；`gd_print_text` 的单列回退含 `[diff]` 头、文件数、列表行与两侧内容；非仓库目录 `gd_open < 0` 且文案非空；本机没有 git 时打 `skip`（不假绿） |
 | `tui-approve` | read-only 下 bash 逐条批准，两种形态：① headless（注入的键在浮层打开前就被输入行吃了）= 没人回答 → **fail closed**，转录出现逐字拒绝串、命令 stdout 不出现、且不是「没有回答渠道」那条；② **真 PTY**：等 `Read Only：批准这条 bash 命令？` 画出来再送 `↑`+回车 → 命令真的跑（stdout 进转录与下一封请求）、退出码 0 |
 | `sig-abi` | `SigxAction` 必须是**宿主 glibc** 布局（152 字节；handler@0 / flags@136 / restorer@144，按字节回读）；恢复序列逐字节四种形状（P22 起）：带备用屏幕 26 字节 / 不带 18 字节 / 带备用屏幕+弹标题栈 31 字节（`ESC[23t` 排在离开备用屏幕**之前**）/ 不带备用屏幕+弹标题栈 23 字节 |
@@ -2718,6 +2784,7 @@ responses 看 `call_id`）；**chat 与 responses 各一轮**，且顺便断言�
 make check                                   # A1 类型检查通过
 make build                                   # A2 产出 build/uya-agent
 make e2e-diff                                # /diff：真 git 的列表 + 单列文本回退 + 非仓库报错（离线）
+make e2e-ws                                  # 工作区：恢复时跟随会话记录 + 日志不改挂 + 显式优先 + 记录目录被删（离线）
 make diff-selftest                           # /diff 的两轮（解析 / 真 git）；浮窗排版在 tui-selftest 里
 make probe BASE=https://api.deepseek.com/v1  # A4 期望 HTTP 401 + leaf 指纹（无需 key）
 make e2e-steps                               # 步数默认值回归：默认不限步数、CLI/env 同口径（离线）
@@ -2784,6 +2851,39 @@ mock 上逐字段验收。换一台 `openai-responses` 网关可用时，零参�
     与 `tui-p30` 两处新闸门）；`make tui-demo` 与本节引用的快照一致
     （P30 只动派发时机与几个阻塞循环，排版一个字节没碰，版本串变成 `p30-pump`）。
 
+* **P31 的验收记录（2026-10-03，`p31-ws`，对应踩坑 48/49）**：
+  * **现场证据**（本机真索引，不是构造出来的）：`~/.uya-agent/index.jsonl` 里
+    `session-cc4b177b…` / `session-ace7596b…` 各有两条记录，`cwd` 分别是 `/tmp/p5ws` 与仓库根；
+    后一条指向 `<home>/sessions/---home-winger-uya-agent--/session-<同一个 id>/session.jsonl`，
+    文件 **0 字节**（连 header 都没有）—— 旧实现从仓库根恢复 `/tmp/p5ws` 的会话就是这个后果：
+    会话被劈成两半、索引里的「工作区」也被改写，而 `/diff` 与文件工具仍按启动目录走
+    （用户报的「`/diff` 应该显示当前会话的工作区」）。
+  * **修完的同一场景**（离线，`make e2e-ws` 每次跑一遍）：从工作区 B 恢复工作区 A 的会话 ——
+    stderr `[session] 工作区跟随会话：<A>`、`/workspace` 报告 `workspace: <A> (source: session)`、
+    `/diff` 的头是 `[diff] ~/…/selftest_p31_e2e/a · 1 个文件（HEAD ↔ 工作区）` 且正文是 A 的改动
+    （B 的 `+changed-in-B` 一个字节都不出现）、`find <home>/sessions -name session.jsonl | wc -l` = **1**
+    （不再造同 id 空文件）、索引里同 id 最后一条 `cwd` = A（不再被当前目录改写）。
+  * **显式优先**：`--workspace <C> --resume <id>` → `[session] 工作区按显式指定（会话记录的是 A）`、
+    报告 `workspace: <C> (source: cli)`。
+  * **记录的工作区被删**（worktree 合并后删除是常态）：`[session] 会话记录的工作区已不存在：<B>
+    —— 留在当前工作区 <A>`，日志里多一条 `"source":"fallback"`，索引记成 A。
+  * **离线回归轮**（进 `make selftest`）：`ws-resolve` / `ws-tool`（纯逻辑 + 真工具入口 + 日志与索引
+    两条记录）、`tui-ws`（headless 界面 / 历史快照 / 浮层标题 / 幂等）、`tui-diff` 真 PTY 段多敲一次
+    `/workspace <绝对路径>`（屏幕与脚注出现新工作区、转录留下 `工作区 → …`）。
+  * **顺带修掉的三处**：① 切工作区是真的 `chdir`，启动时 `--agent-home` / `--dsh-home` / `--workspace`
+    先规范化成绝对路径（否则相对的会话 home 会被搬到新工作区下面 —— 自测第一版就撞上了）；
+    ② `bufx_eq_cstr` 拿 Buf 当字面量传的那两处（踩坑 49）；③ 假数据（`gd_fixture_ws`）注入过工作区
+    之后必须能清回来（不然 `tui-diff` 那轮的旧排版断言会被串味）。
+  * **自测自己踩的一个坑（值得记）**：`tui-approve` 的 mock 用 `"no answer channel"` 断言
+    「第二封请求里不许出现 fail-closed 文案」，而请求体里带着**全部工具的描述** ——
+    P31 新加的 `workspace` 工具描述里正好有这几个字，于是**每一封请求都命中**，这一轮直接红。
+    两处一起改：工具描述换成 `there is nobody to ask`，mock 的这条针换成 bash 专属的整句
+    （`bash needs per-command approval in read-only mode`）—— 否定断言的针要够具体，
+    否则任何新工具的描述都可能把它撞响。
+  * `make check / build / codegen-audit / selftest` 全绿（`selftest` 现在多跑 `e2e-ws`，
+    以及 `--selftest` 里的 `ws-resolve` / `ws-tool` / `tui-ws` 三轮 + `tui-diff` 的 PTY 新段）；
+    `make tui-demo` 与本节引用的快照一致（假数据不注入工作区，排版一个字节没碰）。
+
 ---
 
 ## 7. 已知限制
@@ -2799,6 +2899,29 @@ mock 上逐字段验收。换一台 `openai-responses` 网关可用时，零参�
     只有目标在盘上（`goal.json`，启动时重读）。
   * 浮层打开时常驻块被浮层盖住（与 P18 的状态区同现象），关掉浮层即回来；块不做鼠标交互、
     点击折叠、跨会话记忆（`/tasks close` 只影响当前进程）。
+* **工作区（P31）的边界**：
+  * 「会话现在在哪」= 日志里最后一条 `session/workspace` 事件（append-only、权威）；header 的 `cwd`
+    是**创建时**在哪（元数据，不再改写）；索引里的 `cwd` 是它的「最后已知」缓存（`/sessions` 的
+    工作区列吃它，会话崩了也只是缓存旧一点）。
+  * 恢复时的定序：显式 `--workspace` / `$UYA_AGENT_WORKSPACE` > 最后一条 `session/workspace`
+    > header 的创建时 `cwd` > 当前目录；记录的工作区**不存在**时留在当前工作区、留一行话、
+    记一条 `source:"fallback"`（worktree 合并后就删是常态，所以这条必须有）。
+  * `/diff` 的**改动列表范围**仍以**仓库根**为准（P22 口径）：工作区是仓库子目录时会带出仓库里
+    其它目录的改动；标题写的是工作区（与仓库根不同就两个都写，窄终端退成末段）。
+  * 非全权模式下**模型**切工作区要用户逐次批准（切换会把路径守卫与 `workspace-write` 沙箱的
+    可写根一起搬走 = 扩权），没有回答渠道（管道/子代理）就 fail closed；`/workspace <目录>`
+    是人自己敲的，不再弹审批。plan 模式不拦它（plan 只拦写文件）。
+  * TUI 里带参数的 `/workspace <目录>` 与 `/goal pause` 走同一条路：第一个 `/` 会开命令面板，
+    面板里匹配不上 → 回车把整行还回输入行（附一条「没有匹配的命令」）→ **再**回车才派发
+    （P23 的既有行为，本轮没动它）。
+  * 运行中切工作区是**真 `chdir`**：启动时给的 `--agent-home` / `--dsh-home` / `--workspace`
+    会先规范化成绝对路径（相对路径会被带到新工作区下面去 —— 自测第一版就把会话 home 搬走了）。
+  * `--continue` 仍只接**当前工作区**里最近一条会话（DSH 口径）；`--resume-dsh` 是导入，
+    仍是新建会话、记当前工作区（不采用被导入会话的 cwd）。
+  * 子代理在 spawn 时刻继承父进程的工作区；父进程之后切工作区**不影响**已派生的子代理。
+  * 切工作区之后 `skills` 会按新工作区重扫（`skill` 工具因此认得新目录的技能），但
+    **技能目录那条主动消息不补推**（AGENTS.md 与运行时上下文会补推）。
+  * 沙箱 bind 用的是 `chdir` 后的绝对工作区：工作区解析成 `/` 时不加可写 bind（P21 既有口径）。
 * **会话目标（P11 存储 + P29 人类命令）的边界**：
   * `goal.json` 目前只是**会话级记录**：uya-agent **没有自动续跑的驱动器**（`goal_tick` 已实现但
     没有调用点），所以 `armed` 是给 `/tasks`、`/goal` 看的字段，**不会**自己再开一轮；要对齐 DSH 的

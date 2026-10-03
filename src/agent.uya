@@ -33,6 +33,14 @@ export struct Config {
     model: Buf,
     api_key: Buf,
     workspace: Buf,
+    // P31：工作区是「当前会话」的状态 —— 模型能用 workspace 工具切、人能用 /workspace 切、
+    // 恢复会话时按日志里最后一条 session/workspace 落位。
+    //   ws_src：当前值从哪来（0 默认 getcwd / 1 会话记录 / 2 env / 3 cli）
+    //   ws_explicit：cli 或 env **显式**指定过（显式优先于会话记录）
+    //   resume_ws：被恢复会话记录的工作区（空 = 没有记录）
+    ws_src: u8,
+    ws_explicit: bool,
+    resume_ws: Buf,
     task: Buf,
     pin: Buf,
     verify: i32,
@@ -123,6 +131,9 @@ fn cfg_default() Config {
         model: buf_empty(),
         api_key: buf_empty(),
         workspace: buf_empty(),
+        ws_src: 0,
+        ws_explicit: false,
+        resume_ws: buf_empty(),
         task: buf_empty(),
         pin: buf_empty(),
         verify: HC_VERIFY_CHAIN,
@@ -212,6 +223,7 @@ fn cfg_free(c: &Config) void {
     buf_free(&c.model);
     buf_free(&c.api_key);
     buf_free(&c.workspace);
+    buf_free(&c.resume_ws);
     buf_free(&c.task);
     buf_free(&c.pin);
     buf_free(&c.bwrap);
@@ -1784,7 +1796,7 @@ fn agent_session_create(cfg: &const Config) bool {
     );
 }
 
-export fn agent_session_open(cfg: &const Config, h: &History, resume_path: &const Buf) bool {
+export fn agent_session_open(cfg: &Config, h: &History, resume_path: &const Buf) bool {
     // 同 agent_session_create：header 由 sess_open 写，深度必须在它之前落进 g_sess
     g_sess.deleg_depth = cfg.deleg_depth;
     var home: Buf = buf_new(1024);
@@ -1803,18 +1815,25 @@ export fn agent_session_open(cfg: &const Config, h: &History, resume_path: &cons
     var rpath: Buf = buf_empty();       // 要恢复的会话文件路径（空 = 新建）
     defer { buf_free(&rpath); }
     var resumed: bool = false;
+    // P31：会话记录的工作区（日志里最后一条 session/workspace；没有就用 header 的创建时工作区）
+    var sess_ws: Buf = buf_new(1024);
+    defer { buf_free(&sess_ws); }
+    var ws_fallback: bool = false;      // 记录的工作区已不存在 → 留在当前工作区
     if resume_path.len > 0 {
-        // 已解析出路径（--resume/--continue 或 fork 的父会话）：从 header 里取 id
+        // 已解析出路径（--resume/--continue 或 fork 的父会话）：读身份 + 当前工作区
         if buf_append(&rpath, resume_path.ptr, resume_path.len) {
-            var r0: SessReader = sess_reader_empty();
-            defer { sess_reader_free(&r0); }
+            var meta: SessMeta = sess_meta_empty();
+            defer { sess_meta_free(&meta); }
             var pz: Buf = buf_new(resume_path.len + 1);
             defer { buf_free(&pz); }
             _ = buf_append(&pz, resume_path.ptr, resume_path.len);
             _ = buf_append_byte(&pz, 0);
-            if sess_read_header(pz.ptr as &const byte, &r0) {
-                _ = buf_append(&id, r0.id.ptr, r0.id.len);
+            if sess_read_meta(pz.ptr as &const byte, &meta) {
+                _ = buf_append(&id, meta.id.ptr, meta.id.len);
                 resumed = true;
+                // 「这个会话在哪」必须在 agent_hist_from_log **之前**定下来：system prompt 的
+                // {{cwd}}、AGENTS.md、技能目录都在那里面按工作区求值
+                agent_session_workspace_pick(cfg, &meta, &sess_ws, &ws_fallback);
             }
         }
     } else if cfg.force_session_id.len > 0 {
@@ -1870,7 +1889,10 @@ export fn agent_session_open(cfg: &const Config, h: &History, resume_path: &cons
             out_err(" 条消息（id=");
             out_err_bytes(id.ptr, id.len);
             out_err("）\n");
-            // 继续往同一个日志追加
+            // 继续往**同一个**日志追加：路径用会话自己的那份（sess_open 会按当前 cwd 重算，
+            // 那正是「改挂」的入口 —— P31 换成 sess_open_resume，见 README 踩坑 48）。
+            // l.cwd 传当前工作区：它表示「这个会话现在在哪」，索引（/sessions 的工作区列）
+            // 按它写；header 里的创建时工作区不动（那是元数据）。
             var cwdz: Buf = buf_new(cfg.workspace.len + 1);
             defer { buf_free(&cwdz); }
             _ = buf_append(&cwdz, cfg.workspace.ptr, cfg.workspace.len);
@@ -1883,16 +1905,17 @@ export fn agent_session_open(cfg: &const Config, h: &History, resume_path: &cons
             defer { buf_free(&idz); }
             _ = buf_append(&idz, id.ptr, id.len);
             _ = buf_append_byte(&idz, 0);
-            if !sess_open(
+            if !sess_open_resume(
                 &g_sess,
                 hz.ptr as &const byte,
                 cwdz.ptr as &const byte,
+                rpath.ptr as &const byte,
+                rpath.len,
                 modelz.ptr as &const byte,
                 "uya-agent",
                 idz.ptr as &const byte,
                 cfg.save_session,
-                next_seq,
-                false
+                next_seq
             ) {
                 return false;
             }
@@ -1900,6 +1923,11 @@ export fn agent_session_open(cfg: &const Config, h: &History, resume_path: &cons
             if kept_title.len > 0 {
                 buf_reset(&g_sess.title);
                 _ = buf_append(&g_sess.title, kept_title.ptr as &const byte, kept_title.len);
+            }
+            // P31：记录的工作区已经没了（worktree 合并后被删是常态）—— 把「本次实际在哪」
+            // 补记一条，日志与索引因此不会停在一条对不上的记录上
+            if ws_fallback {
+                agent_workspace_log(cfg, "fallback" as &const byte, &sess_ws);
             }
             return true;
         }
@@ -2165,6 +2193,9 @@ const TOOL_JOB_OUTPUT: &const byte = `{"type":"function","function":{"name":"job
 
 const TOOL_JOB_KILL: &const byte = `{"type":"function","function":{"name":"job_kill","description":"Request cancellation of a background job.","parameters":{"type":"object","properties":{"job_id":{"type":"string","description":"Job id to cancel."},"reason":{"type":"string","description":"Optional short reason."}},"required":["job_id"]}}}`;
 
+// P31：工作区（报告 / 切换）。始终可见 —— 与 todo/plan/ask 同一条口径：工具目录跨模式稳定
+const TOOL_WORKSPACE: &const byte = `{"type":"function","function":{"name":"workspace","description":"Report or switch the current session's workspace: the directory that every file, bash and /diff operation resolves against. Call it with no arguments to see where you are; pass path to move there. A switch takes effect immediately for later tool calls, moves the path guard, the bash sandbox root, the terminal footer and /diff with it, and it is recorded in the session log as a session/workspace event, so a resumed session comes back to the same place. Outside full access the user must approve each switch, and it fails closed when there is nobody to ask (non-interactive or subagent).","parameters":{"type":"object","properties":{"path":{"type":"string","description":"Directory to switch to: absolute, or relative to the current workspace. It must exist and be a directory. Omit it to just report the current workspace."}}}}}`;
+
 const TOOL_TODO: &const byte = `{"type":"function","function":{"name":"todo_write","description":"Record and update a structured task list for the current work. Send the ENTIRE list every call — it REPLACES the previous list (there are no partial updates, no per-item edits). Use it to plan multi-step work and show progress: add one todo per concrete step before you start. Mark every todo being actively worked on \u0060in_progress\u0060 — several at once when work genuinely runs in parallel (e.g. concurrent subagents or background commands), one for sequential work; while work remains, at least one task should be \u0060in_progress\u0060. Mark a todo \u0060completed\u0060 the moment it is done (do not batch completions), and allow no \u0060in_progress\u0060 item only once all work is complete. Skip the list for trivial single-step tasks.","parameters":{"type":"object","properties":{"todos":{"type":"array","description":"The COMPLETE task list, replacing any previous list.","items":{"type":"object","additionalProperties":false,"properties":{"content":{"type":"string","description":"What the task is — a short imperative line."},"status":{"type":"string","enum":["pending","in_progress","completed"],"description":"pending (not started) | in_progress (now) | completed (done)."}},"required":["content","status"]}}},"required":["todos"]}}}`;
 
 const TOOL_EXIT_PLAN: &const byte = `{"type":"function","function":{"name":"exit_plan_mode","description":"Use only in plan mode. Present your plan for the user's review and, on approval, leave plan mode. Send the COMPLETE plan as markdown, starting with a # heading that names it. The user reviews it in a dialog and either approves (carry out the plan from your next step), asks for a revision (keep planning and present it again), or dismisses it to speak instead (stay in plan mode and wait for their message); the decision comes back in the tool result.","parameters":{"type":"object","properties":{"plan":{"type":"string","description":"The complete plan as markdown, starting with a # heading that names it."}},"required":["plan"]}}}`;
@@ -2259,6 +2290,10 @@ fn tools_json(out: &Buf, allow_shell: bool, flat: bool) bool {
         }
     }
     // todo / plan / ask_user 始终可见（DSH：工具目录跨模式稳定）
+    // P31：workspace（报告/切换当前会话的工作区）同样始终可见
+    if !tools_put(out, TOOL_WORKSPACE, flat) {
+        return false;
+    }
     if !tools_put(out, TOOL_TODO, flat) {
         return false;
     }
@@ -2840,7 +2875,7 @@ fn sv_eq_cstr(b: &const Buf, lit: &const byte) bool {
 }
 
 // 非流式路径用：JsonStrView → Buf 后复用同一分发
-fn dispatch_tool(cfg: &const Config, name: &const JsonStrView, args: &const JsonStrView, arena: &Arena, out: &Buf) void {
+fn dispatch_tool(cfg: &Config, name: &const JsonStrView, args: &const JsonStrView, arena: &Arena, out: &Buf) void {
     var name_buf: Buf = buf_empty();
     defer { buf_free(&name_buf); }
     if !sv_unescape_to_buf(name, &name_buf) {
@@ -2903,7 +2938,7 @@ fn print_usage_line(o: &const ChatOut) void {
 
 // 工具分发的「正文」版本：只写结果文本，不带 [tool name] 前缀。
 // 严格协议下工具名由 assistant 的 tool_calls + tool_call_id 表达，前缀是冗余。
-fn dispatch_tool_body(cfg: &const Config, name: &const Buf, args_json: &const Buf, arena: &Arena, out: &Buf) void {
+fn dispatch_tool_body(cfg: &Config, name: &const Buf, args_json: &const Buf, arena: &Arena, out: &Buf) void {
     var parsed: bool = false;
     var arg_val: JsonValue = JsonValue.json_null();
     if args_json.len > 0 {
@@ -2933,6 +2968,8 @@ fn dispatch_tool_body(cfg: &const Config, name: &const Buf, args_json: &const Bu
         jobs_tool_kill(&g_jobs, &arg_val, out);
     } else if sv_eq_cstr(name, "todo_write") {
         todo_tool_write(&g_todos, &arg_val, out);
+    } else if sv_eq_cstr(name, "workspace") {
+        ws_tool_workspace(cfg, &arg_val, out);
     } else if sv_eq_cstr(name, "exit_plan_mode") {
         plan_tool_exit(cfg, &g_plan, &arg_val, out);
     } else if sv_eq_cstr(name, "ask_user_question") {
@@ -2977,7 +3014,7 @@ fn dispatch_tool_body(cfg: &const Config, name: &const Buf, args_json: &const Bu
 }
 
 // 折叠协议用（--compat-fold / 老端点）：[tool name] + 正文 + 换行
-fn dispatch_tool_buf(cfg: &const Config, name: &const Buf, args_json: &const Buf, arena: &Arena, out: &Buf) void {
+fn dispatch_tool_buf(cfg: &Config, name: &const Buf, args_json: &const Buf, arena: &Arena, out: &Buf) void {
     _ = buf_append_cstr(out, "[tool ");
     _ = buf_append(out, name.ptr, name.len);
     _ = buf_append_cstr(out, "] ");
@@ -3085,7 +3122,7 @@ export fn agent_trim_trailing_ws(p: &const byte, n: usize) usize {
 
 // 流式一步。style 必须与 req 的组装协议一致（调用方用同一个 style 建 url/req）。
 // out_status 回传本次请求的 HTTP 状态码（0 = 没走到 HTTP）—— 协商回退要用它。
-fn agent_step_stream(cfg: &const Config, style: u8, url: &const Buf, hdrs: &const Buf, req: &const Buf, arena: &Arena, h: &History, step: i32, interactive: bool, out_status: &i32) i32 {
+fn agent_step_stream(cfg: &Config, style: u8, url: &const Buf, hdrs: &const Buf, req: &const Buf, arena: &Arena, h: &History, step: i32, interactive: bool, out_status: &i32) i32 {
     var o: ChatOut = chat_out_new();
     defer { chat_out_free(&o); }
     var tc: TlsConn = tls_conn_empty();
@@ -3187,7 +3224,7 @@ fn agent_step_stream(cfg: &const Config, style: u8, url: &const Buf, hdrs: &cons
 
 
 // 一步收尾（流式/非流式共用）：usage、finish 语义、工具派发、最终回答。
-fn agent_finish_step(cfg: &const Config, arena: &Arena, h: &History, step: i32, o: &const ChatOut) i32 {
+fn agent_finish_step(cfg: &Config, arena: &Arena, h: &History, step: i32, o: &const ChatOut) i32 {
     // P9：记下这次请求的 prompt_tokens，作为下一次压缩判定的压力口径
     g_last_prompt_tokens = o.usage_in + o.usage_cache_read;
     if cfg.show_usage {
@@ -3387,7 +3424,7 @@ fn agent_hist_init(cfg: &const Config, h: &History, first: &const Buf) bool {
 }
 
 // 一次 turn 的 step 循环：history 里已经包含 system 与本轮的 user 消息
-fn agent_turn_loop(cfg: &const Config, h: &History) i32 {
+fn agent_turn_loop(cfg: &Config, h: &History) i32 {
     g_turn = g_turn + 1;
     agent_log_turn_start();
     const rc: i32 = agent_turn_loop_inner(cfg, h);
@@ -3514,7 +3551,7 @@ fn agent_step_plain(cfg: &const Config, style: u8, url: &const Buf, hdrs: &const
     return agent_finish_step(cfg, arena, h, step, &o2);
 }
 
-fn agent_turn_loop_inner(cfg: &const Config, h: &History) i32 {
+fn agent_turn_loop_inner(cfg: &Config, h: &History) i32 {
     // P30：登记「当前回合」——阻塞循环里的统一泵点要用它来派发运行中的命令
     g_pump_cfg = cfg;
     g_pump_hist = h;
@@ -3561,6 +3598,9 @@ fn agent_turn_loop_inner(cfg: &const Config, h: &History) i32 {
         }
         // P26：plan 模式变了就在这一步补推一份新快照（放在压缩之后：别刚推就被折进 checkpoint）
         agent_plan_snapshot_sync(cfg, h);
+        // P31：工作区变了（模型自己调的 workspace 工具 / 人敲的 /workspace）也在这一步补推：
+        // 运行时上下文里那句 Current workspace 与新工作区的 AGENTS.md 都要跟上
+        agent_ws_snapshot_sync(cfg, h);
         agent_bound_step_start(cfg, h, step);
         if g_interactive {
             // 状态显示走提示符（避免两行光标的复杂度）；子代理面板在提示符上方
@@ -3805,7 +3845,7 @@ export fn hist_trim_incomplete_tail(h: &History) usize {
     return dropped;
 }
 
-fn agent_history_begin(cfg: &const Config, h: &History, first: &const Buf) bool {
+fn agent_history_begin(cfg: &Config, h: &History, first: &const Buf) bool {
     fsctx_init(cfg);
     // 统计是「当前会话」口径：换会话（/new、/resume）先清零，resume 的那一份由
     // agent_hist_from_log 在扫描日志时重建
@@ -4015,7 +4055,7 @@ fn agent_resolve_resume(cfg: &Config, want: &const byte) bool {
 }
 
 export // --dry-run：组装请求并打印（不可打印字节转义成 \xNN，便于找 NUL 之类的脏字节）
-fn agent_dry_run(cfg: &const Config) i32 {
+fn agent_dry_run(cfg: &Config) i32 {
     var h: History = hist_init();
     defer { hist_free(&h); }
     // 走**真实**的建历史路径（含 --continue/--resume 的恢复），否则 dry-run 看到的不是真请求
@@ -4057,9 +4097,9 @@ fn agent_dry_run(cfg: &const Config) i32 {
     return AGENT_OK;
 }
 
-// 工作目录默认值 = getcwd。注意 sys_getcwd 返回的长度**含结尾 NUL**，
+// getcwd 到 Buf。注意 sys_getcwd 返回的长度**含结尾 NUL**，
 // 不剥掉的话它会被当作路径的一部分（真实网关会报 invalid character '\x00'）。
-export fn agent_workspace_set_cwd(cfg: &Config) bool {
+fn agent_getcwd_into(out: &Buf) bool {
     var storage: [byte: 1024] = [0: 1024];
     const res: !isize = sys_getcwd(&storage[0], 1024);
     const raw_len: isize = res catch { 0 as isize; };
@@ -4082,12 +4122,535 @@ export fn agent_workspace_set_cwd(cfg: &Config) bool {
     if n == 0 {
         return false;
     }
+    buf_reset(out);
+    return buf_append(out, &storage[0], n);
+}
+
+// 工作目录默认值 = getcwd
+export fn agent_workspace_set_cwd(cfg: &Config) bool {
+    var got: Buf = buf_new(1024);
+    defer { buf_free(&got); }
+    if !agent_getcwd_into(&got) {
+        return false;
+    }
     buf_free(&cfg.workspace);
-    cfg.workspace = buf_new(n + 8);
+    cfg.workspace = buf_new(got.len + 8);
     if !buf_valid(&cfg.workspace) {
         return false;
     }
-    return buf_append(&cfg.workspace, &storage[0], n);
+    return buf_append(&cfg.workspace, got.ptr as &const byte, got.len);
+}
+
+// 启动路径里的相对值 → 启动目录下的绝对路径。
+// 为什么必须固定：运行中切工作区是**真的 chdir**，相对路径会跟着跑到新工作区去 ——
+// 会话日志、技能目录、workflow 脚本这些「一次定下来、之后一直用」的路径不该跟着跑。
+fn agent_start_path_into(base: &const Buf, v: &const Buf, out: &Buf) void {
+    buf_reset(out);
+    if v.len == 0 {
+        return;
+    }
+    if v.ptr[0] == 47 as byte {
+        _ = buf_append(out, v.ptr as &const byte, v.len);
+        return;
+    }
+    _ = buf_append(out, base.ptr as &const byte, base.len);
+    _ = buf_append_byte(out, 47);
+    _ = buf_append(out, v.ptr as &const byte, v.len);
+}
+
+// 启动时把「一次定下来」的目录固定住：agent home / DSH home / uya 可执行文件，
+// 以及工作区本身（工作区还要顺带证明它存在且是目录）。
+fn agent_workspace_canon(cfg: &Config) void {
+    var here: Buf = buf_new(1024);
+    defer { buf_free(&here); }
+    if !agent_getcwd_into(&here) {
+        return;
+    }
+    var tmp: Buf = buf_new(2048);
+    defer { buf_free(&tmp); }
+    agent_start_path_into(&here, &cfg.agent_home, &tmp);
+    if tmp.len > 0 {
+        buf_reset(&cfg.agent_home);
+        _ = buf_append(&cfg.agent_home, tmp.ptr as &const byte, tmp.len);
+    }
+    agent_start_path_into(&here, &cfg.dsh_home, &tmp);
+    if tmp.len > 0 {
+        buf_reset(&cfg.dsh_home);
+        _ = buf_append(&cfg.dsh_home, tmp.ptr as &const byte, tmp.len);
+    }
+    // 只处理带 '/' 的：不带 '/' 的名字按 PATH 找（execve 收名字时按 cwd 找是另一回事，
+    // 那种用法本来就要求 cwd 不变，见 uya 那份 shim 的注释）
+    if bufx_find_byte(cfg.uya_bin.ptr[0: cfg.uya_bin.len], 47, 0) > 0 {
+        agent_start_path_into(&here, &cfg.uya_bin, &tmp);
+        buf_reset(&cfg.uya_bin);
+        _ = buf_append(&cfg.uya_bin, tmp.ptr as &const byte, tmp.len);
+    }
+    if cfg.workspace.len == 0 {
+        return;
+    }
+    if cfg.workspace.ptr[0] == 47 as byte {
+        return;   // 已经是绝对路径
+    }
+    var want: Buf = buf_new(cfg.workspace.len + 8);
+    defer { buf_free(&want); }
+    if !buf_append(&want, cfg.workspace.ptr as &const byte, cfg.workspace.len) {
+        return;
+    }
+    if agent_workspace_switch(cfg, want.ptr as &const byte, want.len) != WS_OK {
+        return;
+    }
+    var hz: Buf = buf_new(here.len + 1);
+    defer { buf_free(&hz); }
+    _ = buf_append(&hz, here.ptr as &const byte, here.len);
+    _ = buf_append_byte(&hz, 0);
+    _ = sys_chdir(&hz.ptr[0] as *const byte) catch {};
+}
+
+// ============================================================
+// P31：工作区 —— 模型能切、人能切、会话记录它、/diff 跟着它
+//
+// 为什么要有这一层：文件工具、bash 默认 workdir、沙箱可写 bind、AGENTS.md/{{cwd}}、
+// 终端标题、脚注、/diff 全都按 `cfg.workspace` 现取。以前它只在启动时定一次，于是
+// 「当前会话在哪」这件事既没人记、也切不动（恢复别的目录的会话时 /diff 看的是启动目录）。
+// 现在切换只有一条路：agent_workspace_apply → agent_workspace_switch（改状态）→
+// agent_workspace_commit（TUI/技能缓存/diff 缓存/日志与索引）。
+//
+// 顺序上的两个硬约束（都踩过）：
+//   1) `sys_chdir` 成功才算提交 —— 沙箱的 san_bind_root 对相对路径读的是 getcwd，
+//      子进程的默认 cwd 也是它，所以进程 cwd 必须跟着工作区走；
+//   2) 重建 `cfg.workspace` 之后必须**立刻**重指 `g_fsctx.workspace`（那是裸指针，
+//      指向旧缓冲就是悬垂）。
+// ============================================================
+
+export const WS_OK: i32 = 0;
+export const WS_E_MISSING: i32 = 1;    // 目标不存在 / 不是目录 / 没有权限
+export const WS_E_FAIL: i32 = 2;       // 内存、getcwd 之类
+export const WS_E_SAME: i32 = 3;       // 已经就是它（幂等，不记录）
+
+// 把当前工作区切到 `path`（相对路径按**当前**工作区解析）。
+// 只改状态，不记录、不通知 —— 记录与通知在 agent_workspace_commit。
+export fn agent_workspace_switch(cfg: &Config, path: &const byte, n: usize) i32 {
+    if n == 0 {
+        return WS_E_MISSING;
+    }
+    var target: Buf = buf_new(n + cfg.workspace.len + 8);
+    defer { buf_free(&target); }
+    if !buf_valid(&target) {
+        return WS_E_FAIL;
+    }
+    if path[0] != 47 as byte {
+        if !buf_append(&target, cfg.workspace.ptr as &const byte, cfg.workspace.len) ||
+            !buf_append_byte(&target, 47) {
+            return WS_E_FAIL;
+        }
+    }
+    if !buf_append(&target, path, n) {
+        return WS_E_FAIL;
+    }
+    // 幂等：同一条路径（字面相同）不动任何状态。
+    // 逐字节比 —— bufx_eq_cstr 的第三个参数要被 strlen 量长度，而 Buf 缓冲没有 NUL 结尾，
+    // 量出来会偏大直接判不等（这条一开始就写错了：幂等分支永远走不到）。
+    if target.len == cfg.workspace.len &&
+        bufx_mem_eq(target.ptr as &const byte, cfg.workspace.ptr as &const byte, target.len) {
+        return WS_E_SAME;
+    }
+    var tz: Buf = buf_new(target.len + 1);
+    defer { buf_free(&tz); }
+    _ = buf_append(&tz, target.ptr as &const byte, target.len);
+    _ = buf_append_byte(&tz, 0);
+    // 目标不可用（不存在 / 不是目录 / 无权限）时 chdir 失败 —— 状态一个字节都没变
+    const rc0: !i32 = sys_chdir(&tz.ptr[0] as *const byte);
+    const chdir_ok: i32 = rc0 catch { -1; };
+    if chdir_ok != 0 {
+        return WS_E_MISSING;
+    }
+    // 规范化（内核解析 symlink / ".."），也是沙箱 bind 与子进程 cwd 要的那份
+    var canon: Buf = buf_new(1024);
+    defer { buf_free(&canon); }
+    if !agent_getcwd_into(&canon) {
+        var back: Buf = buf_new(cfg.workspace.len + 1);
+        defer { buf_free(&back); }
+        _ = buf_append(&back, cfg.workspace.ptr as &const byte, cfg.workspace.len);
+        _ = buf_append_byte(&back, 0);
+        _ = sys_chdir(&back.ptr[0] as *const byte) catch {};
+        return WS_E_FAIL;
+    }
+    var nb: Buf = buf_new(canon.len + 8);
+    if !buf_valid(&nb) || !buf_append(&nb, canon.ptr as &const byte, canon.len) {
+        var back2: Buf = buf_new(cfg.workspace.len + 1);
+        defer { buf_free(&back2); }
+        _ = buf_append(&back2, cfg.workspace.ptr as &const byte, cfg.workspace.len);
+        _ = buf_append_byte(&back2, 0);
+        _ = sys_chdir(&back2.ptr[0] as *const byte) catch {};
+        return WS_E_FAIL;
+    }
+    // 提交：换缓冲 + 立刻重指 FsCtx（裸指针）
+    var old: Buf = cfg.workspace;
+    cfg.workspace = nb;
+    g_fsctx.workspace = cfg.workspace.ptr as &const byte;
+    g_fsctx.workspace_len = cfg.workspace.len;
+    buf_free(&old);
+    return WS_OK;
+}
+
+// 切换之后的副作用收口：TUI、技能缓存、/diff 缓存、会话记录（日志事件 + 索引）
+// record=false：会话日志还没打开（恢复路径，记录由日志自己带着）—— 只做状态与显示
+fn agent_workspace_commit(cfg: &const Config, src: &const byte, previous: &const Buf, announce: bool, record: bool) void {
+    // 技能是「按工作区扫出来的」，换了工作区必须重扫（工具调用时懒加载）
+    g_skills.scanned = false;
+    // 脚注 cwd / 分支 / 基标题（会话已有标题时 agent_title_apply 不会动它）
+    var home: Buf = env_or("HOME" as &const byte, "" as &const byte);
+    defer { buf_free(&home); }
+    tui_set_cwd(cfg.workspace.ptr as &const byte, cfg.workspace.len,
+        home.ptr as &const byte, home.len);
+    var br: Buf = buf_new(64);
+    defer { buf_free(&br); }
+    agent_git_branch(cfg.workspace.ptr as &const byte, cfg.workspace.len, &br);
+    tui_set_branch(br.ptr as &const byte, br.len);
+    agent_title_base_set(cfg);
+    agent_title_apply();
+    // /diff 的缓存是**旧工作区**解析出来的：关掉浮层再作废（开着不关就等于「看不见却吞键」）
+    if tui_overlay_open() && tui_overlay_kind() == TUI_OVK_DIFF {
+        tui_overlay_close();
+        tui_add_notice("工作区变了：/diff 浮窗已关闭（再敲一次看新工作区）" as &const byte,
+            bufx_cstr_len("工作区变了：/diff 浮窗已关闭（再敲一次看新工作区）" as &const byte));
+    }
+    gd_reset();
+    // 记录：日志事件（权威）+ 索引里的「最后已知」
+    if record {
+        agent_workspace_log(cfg, src, previous);
+    }
+    if announce {
+        var note: Buf = buf_new(cfg.workspace.len + 32);
+        defer { buf_free(&note); }
+        _ = buf_append_cstr(&note, "工作区 → ");
+        _ = buf_append(&note, cfg.workspace.ptr as &const byte, cfg.workspace.len);
+        tui_add_notice(note.ptr as &const byte, note.len);
+    }
+}
+
+// 会话日志里的 `session/workspace`（append-only，权威）+ 索引里的当前工作区
+fn agent_workspace_log(cfg: &const Config, src: &const byte, previous: &const Buf) void {
+    if !g_sess.save {
+        return;
+    }
+    var ev: Buf = buf_new(cfg.workspace.len + previous.len + 128);
+    defer { buf_free(&ev); }
+    if sess_begin(&g_sess, "session/workspace", &ev) {
+        _ = buf_append_cstr(&ev, "{\"workspace\":");
+        if jw_str_into(&ev, cfg.workspace.ptr as &const byte, cfg.workspace.len) {
+            _ = buf_append_cstr(&ev, ",\"previous\":");
+            if jw_str_into(&ev, previous.ptr as &const byte, previous.len) {
+                _ = buf_append_cstr(&ev, ",\"source\":");
+                _ = jw_str_into(&ev, src, bufx_cstr_len(src));
+                _ = buf_append_cstr(&ev, "}");
+                _ = sess_end(&g_sess, &ev);
+            }
+        }
+    }
+    // SessionLog.cwd 是「当前工作区」：索引（/sessions 的工作区列）按它写，
+    // header 里的创建时工作区不动（那是元数据）
+    buf_reset(&g_sess.cwd);
+    _ = buf_append(&g_sess.cwd, cfg.workspace.ptr as &const byte, cfg.workspace.len);
+    var home: Buf = buf_new(1024);
+    defer { buf_free(&home); }
+    if agent_default_home(cfg, &home) {
+        var hz: Buf = buf_new(home.len + 1);
+        defer { buf_free(&hz); }
+        _ = buf_append(&hz, home.ptr as &const byte, home.len);
+        _ = buf_append_byte(&hz, 0);
+        _ = sess_write_index(hz.ptr as &const byte, &g_sess);
+    }
+}
+
+// 工具 / /workspace / 恢复三处共用的入口：切换 + 记录 + 通知。
+// 返回 WS_OK（切了）/ WS_E_SAME（本来就在这）/ WS_E_MISSING / WS_E_FAIL。
+export fn agent_workspace_apply(cfg: &Config, path: &const byte, n: usize, src: &const byte, announce: bool) i32 {
+    return agent_workspace_apply_full(cfg, path, n, src, announce, true);
+}
+
+// 恢复路径专用：会话日志这会儿还没打开，记录（session/workspace 事件 + 索引）留给
+// sess_open_resume 之后那次 agent_workspace_log —— 在这里写会静默丢掉（fd 还没开）。
+export fn agent_workspace_apply_pre(cfg: &Config, path: &const byte, n: usize, src: &const byte, announce: bool) i32 {
+    return agent_workspace_apply_full(cfg, path, n, src, announce, false);
+}
+
+fn agent_workspace_apply_full(cfg: &Config, path: &const byte, n: usize, src: &const byte, announce: bool, record: bool) i32 {
+    var previous: Buf = buf_new(cfg.workspace.len + 8);
+    defer { buf_free(&previous); }
+    if !buf_append(&previous, cfg.workspace.ptr as &const byte, cfg.workspace.len) {
+        return WS_E_FAIL;
+    }
+    const rc: i32 = agent_workspace_switch(cfg, path, n);
+    if rc != WS_OK {
+        return rc;
+    }
+    const sn: usize = bufx_cstr_len(src);
+    if bufx_eq_cstr(src, sn, "cli" as &const byte) {
+        cfg.ws_src = 3;
+    } else if bufx_eq_cstr(src, sn, "env" as &const byte) {
+        cfg.ws_src = 2;
+    } else if bufx_eq_cstr(src, sn, "resume" as &const byte) {
+        cfg.ws_src = 1;
+    } else if bufx_eq_cstr(src, sn, "tool" as &const byte) || bufx_eq_cstr(src, sn, "human" as &const byte) {
+        cfg.ws_src = 4;   // 运行中被切过（来源见会话日志的 session/workspace）
+    }
+    agent_workspace_commit(cfg, src, &previous, announce, record);
+    return WS_OK;
+}
+
+// 恢复会话时决定「这个会话现在在哪」，并把运行期工作区切过去（P31）：
+//   * 显式指定过（--workspace / env）→ 不动，只把记录抄给调用方；
+//   * 记录的工作区存在 → 切过去（/diff、文件工具、bash、沙箱、标题、脚注一起跟过去）；
+//   * 记录的工作区已经没了（worktree 合并后就删是常态）→ 留在当前工作区、打一行可见的话，
+//     由调用方在会话日志打开之后补一条 source=fallback 的事件。
+// 切不切都要把「记录在哪」写进 cfg.resume_ws：/workspace 与 /status 要能说出这句话。
+fn agent_session_workspace_pick(cfg: &Config, meta: &const SessMeta, out_ws: &Buf, fallback: &bool) void {
+    fallback[0] = false;
+    buf_reset(out_ws);
+    // 当前工作区以日志里**最后一条** session/workspace 为准（会话搬过家就是它），
+    // 没有那条事件才退回 header 的创建时工作区
+    if meta.workspace.len > 0 {
+        _ = buf_append(out_ws, meta.workspace.ptr as &const byte, meta.workspace.len);
+    } else if meta.cwd.len > 0 {
+        _ = buf_append(out_ws, meta.cwd.ptr as &const byte, meta.cwd.len);
+    }
+    if out_ws.len == 0 {
+        return;
+    }
+    buf_reset(&cfg.resume_ws);
+    _ = buf_append(&cfg.resume_ws, out_ws.ptr as &const byte, out_ws.len);
+    if cfg.ws_explicit {
+        out_err("[session] 工作区按显式指定（会话记录的是 ");
+        out_err_bytes(out_ws.ptr as &const byte, out_ws.len);
+        out_err("）\n");
+        return;
+    }
+    const rc: i32 = agent_workspace_apply_pre(cfg, out_ws.ptr as &const byte, out_ws.len, "resume" as &const byte, true);
+    if rc == WS_OK {
+        out_err("[session] 工作区跟随会话：");
+        out_err_bytes(cfg.workspace.ptr as &const byte, cfg.workspace.len);
+        out_err("\n");
+        return;
+    }
+    if rc == WS_E_SAME {
+        return;
+    }
+    fallback[0] = true;
+    out_err("[session] 会话记录的工作区已不存在：");
+    out_err_bytes(out_ws.ptr as &const byte, out_ws.len);
+    out_err(" —— 留在当前工作区 ");
+    out_err_bytes(cfg.workspace.ptr as &const byte, cfg.workspace.len);
+    out_err("\n");
+}
+
+// 工作区来源（--print-config / /status 用；与 cfg_src_name 同一套口径）
+export fn ws_src_name(src: u8) &const byte {
+    if src == 1 {
+        return "session" as &const byte;
+    }
+    if src == 2 {
+        return "env" as &const byte;
+    }
+    if src == 3 {
+        return "cli" as &const byte;
+    }
+    if src == 4 {
+        return "runtime" as &const byte;
+    }
+    return "default" as &const byte;
+}
+
+// 工作区的短路径（$HOME → ~），给 /diff 标题与通知用
+export fn agent_short_path_into(out: &Buf, p: &const byte, n: usize) void {
+    buf_reset(out);
+    var home: Buf = env_or("HOME" as &const byte, "" as &const byte);
+    defer { buf_free(&home); }
+    if home.len > 1 && n > home.len && bufx_mem_eq(p, home.ptr as &const byte, home.len) &&
+        p[home.len] == 47 as byte {
+        _ = buf_append_cstr(out, "~");
+        _ = buf_append(out, p + home.len, n - home.len);
+        return;
+    }
+    _ = buf_append(out, p, n);
+}
+
+// 「模型已经被告知的工作区」：step 边界对不上就补推一份新快照（与 plan 模式同一条路子）
+var g_ws_snap: Buf = Buf{ ptr: null, len: 0, cap: 0 };
+var g_ws_snap_ready: bool = false;
+
+export fn agent_ws_snapshot_sync(cfg: &const Config, h: &History) void {
+    if !buf_valid(&g_ws_snap) {
+        g_ws_snap = buf_empty();
+    }
+    if !g_ws_snap_ready {
+        buf_reset(&g_ws_snap);
+        _ = buf_append(&g_ws_snap, cfg.workspace.ptr as &const byte, cfg.workspace.len);
+        g_ws_snap_ready = true;
+        return;
+    }
+    if g_ws_snap.len == cfg.workspace.len &&
+        bufx_mem_eq(g_ws_snap.ptr as &const byte, cfg.workspace.ptr as &const byte, g_ws_snap.len) {
+        return;
+    }
+    var rctx: Buf = buf_new(cfg.workspace.len + 1024);
+    defer { buf_free(&rctx); }
+    if prompt_runtime_context(cfg, g_plan.active, &rctx) && rctx.len > 0 {
+        var pushed: bool = hist_push(h, ROLE_USER, rctx.ptr as &const byte, rctx.len);
+        while !pushed {
+            if !hist_drop_oldest(h) {
+                break;
+            }
+            pushed = hist_push(h, ROLE_USER, rctx.ptr as &const byte, rctx.len);
+        }
+    }
+    // 新工作区的 AGENTS.md 也补一份（渲染出来就是 `<system-reminder>`，转录里当注入消息过滤）
+    var set: InstrSet = InstrSet{ items: [], n: 0 };
+    instr_init(&set);
+    defer { instr_free(&set); }
+    var ws: Buf = buf_new(FS_PATH_MAX);
+    defer { buf_free(&ws); }
+    _ = buf_append(&ws, cfg.workspace.ptr as &const byte, cfg.workspace.len);
+    instr_collect(ws.ptr[0: ws.len], agent_dsh_home(), &set);
+    if set.n > 0 {
+        var msg: Buf = buf_new((g_texts.instr_max_bytes as usize) + 8192);
+        defer { buf_free(&msg); }
+        if instr_render(&set, g_texts.instr_max_bytes, &msg) {
+            _ = hist_push(h, ROLE_USER, msg.ptr as &const byte, msg.len);
+        }
+    }
+    buf_reset(&g_ws_snap);
+    _ = buf_append(&g_ws_snap, cfg.workspace.ptr as &const byte, cfg.workspace.len);
+}
+
+// ============================================================
+// P31：workspace 工具（报告 / 切换）+ /workspace 人类命令
+// ============================================================
+const WS_DENIED: &const byte = "Error: the user denied this workspace switch. Do not retry it or an equivalent; the current workspace is still " as &const byte;
+const WS_NO_CHANNEL: &const byte = "Error: switching the workspace needs the user's approval outside full access, but this session has no answer channel (non-interactive or subagent). Fail closed: work inside the current workspace " as &const byte;
+const WS_MISSING: &const byte = "Error: cannot switch the workspace: that path does not exist, is not a directory, or is not readable. Nothing changed; the current workspace is still " as &const byte;
+const WS_FAIL: &const byte = "Error: the workspace switch failed (out of memory or getcwd failed). Nothing changed; the current workspace is still " as &const byte;
+
+// 报告当前工作区（模型无参调用 / 人敲 /workspace / /status 都用它）
+fn ws_report_into(cfg: &const Config, out: &Buf) void {
+    _ = buf_append_cstr(out, "workspace: ");
+    _ = buf_append(out, cfg.workspace.ptr as &const byte, cfg.workspace.len);
+    _ = buf_append_cstr(out, " (source: ");
+    _ = buf_append_cstr(out, ws_src_name(cfg.ws_src));
+    _ = buf_append_cstr(out, ")\n");
+    var br: Buf = buf_new(64);
+    defer { buf_free(&br); }
+    agent_git_branch(cfg.workspace.ptr as &const byte, cfg.workspace.len, &br);
+    if br.len > 0 {
+        _ = buf_append_cstr(out, "git branch: ");
+        _ = buf_append(out, br.ptr as &const byte, br.len);
+        _ = buf_append_byte(out, 10);
+    } else {
+        // 与脚注同一套口径：只有 `.git` 是文件（worktree）时才读得到分支名
+        _ = buf_append_cstr(out, "git branch: (not detected here)\n");
+    }
+    if g_sess.id.len > 0 {
+        _ = buf_append_cstr(out, "session: ");
+        _ = buf_append(out, g_sess.id.ptr as &const byte, g_sess.id.len);
+        _ = buf_append_cstr(out, " (a switch is recorded as a session/workspace event)\n");
+    }
+}
+
+// 失败文案 = 前缀 + 当前工作区 + 换行
+fn ws_fail_into(out: &Buf, prefix: &const byte, cfg: &const Config) void {
+    _ = buf_append_cstr(out, prefix);
+    _ = buf_append(out, cfg.workspace.ptr as &const byte, cfg.workspace.len);
+    _ = buf_append_cstr(out, ".\n");
+}
+
+// workspace 工具：无参（或空 path）= 报告；给了 path = 切换
+export fn ws_tool_workspace(cfg: &Config, args: &const JsonValue, out: &Buf) void {
+    var rel: Buf = buf_empty();
+    defer { buf_free(&rel); }
+    if !js_obj_get_str_unescaped(args, "path", 4, &rel) || rel.len == 0 {
+        ws_report_into(cfg, out);
+        return;
+    }
+    // 非全权（read-only / workspace-write）：切换会把沙箱的可写根、路径守卫一起搬走，
+    // 等于扩权 —— 逐次要用户点头（与 read-only 的 bash 审批同一条通道，无渠道即 fail closed）。
+    // 全权模式没有边界可越，直接切。
+    if perm_confine() {
+        const verdict: i32 = ask_approve_action(cfg, "workspace" as &const byte, rel.ptr as &const byte, rel.len);
+        if verdict == 0 {
+            ws_fail_into(out, WS_DENIED, cfg);
+            return;
+        }
+        if verdict == 2 {
+            ws_fail_into(out, WS_NO_CHANNEL, cfg);
+            return;
+        }
+    }
+    const rc: i32 = agent_workspace_apply(cfg, rel.ptr as &const byte, rel.len, "tool" as &const byte, true);
+    if rc == WS_E_SAME {
+        _ = buf_append_cstr(out, "workspace: ");
+        _ = buf_append(out, cfg.workspace.ptr as &const byte, cfg.workspace.len);
+        _ = buf_append_cstr(out, " (already the current workspace; nothing changed)\n");
+        return;
+    }
+    if rc == WS_E_MISSING {
+        ws_fail_into(out, WS_MISSING, cfg);
+        return;
+    }
+    if rc != WS_OK {
+        ws_fail_into(out, WS_FAIL, cfg);
+        return;
+    }
+    _ = buf_append_cstr(out, "switched workspace: ");
+    _ = buf_append(out, cfg.workspace.ptr as &const byte, cfg.workspace.len);
+    _ = buf_append_byte(out, 10);
+    ws_report_into(cfg, out);
+    _ = buf_append_cstr(out, "This switch is recorded in the session log; file paths and bash now resolve against the new workspace.\n");
+}
+
+// /workspace [dir]：人看 / 人切。人自己敲的就是批准，不再弹审批。
+fn agent_repl_workspace(cfg: &Config, line: &const Buf) void {
+    // 解析：`/workspace` 或 `/workspace <dir>`（dir 里可以有空格，全是字面量路径）
+    var arg: Buf = buf_empty();
+    defer { buf_free(&arg); }
+    var at: usize = 11;              // "/workspace " 之后
+    while at < line.len && line.ptr[at] == 32 as byte {
+        at = at + 1;                 // 多敲几个空格也认
+    }
+    if line.len > at {
+        arg = buf_new(line.len);
+        _ = buf_append(&arg, &line.ptr[at], line.len - at);
+    }
+    if arg.len == 0 {
+        if g_sess.id.len > 0 {
+            var hdr: Buf = buf_new(64 + g_sess.id.len);
+            defer { buf_free(&hdr); }
+            _ = buf_append_cstr(&hdr, "[session] ");
+            _ = buf_append(&hdr, g_sess.id.ptr as &const byte, g_sess.id.len);
+            _ = buf_append_cstr(&hdr, "（工作区以日志里最后一条 session/workspace 为准）\n");
+            tty_puts(&tty_ui, 2, hdr.ptr as &const byte);
+        }
+        var rep: Buf = buf_new(cfg.workspace.len + 512);
+        defer { buf_free(&rep); }
+        ws_report_into(cfg, &rep);
+        tty_write(&tty_ui, 2, rep.ptr as &const byte, rep.len);
+        return;
+    }
+    const rc: i32 = agent_workspace_apply(cfg, arg.ptr as &const byte, arg.len, "human" as &const byte, true);
+    if rc == WS_E_SAME {
+        tty_puts(&tty_ui, 2, "已经在这个工作区里（没有变化）\n");
+        return;
+    }
+    if rc == WS_E_MISSING {
+        tty_puts(&tty_ui, 2, "error: 切不过去：这个路径不存在 / 不是目录（工作区没变）\n");
+        return;
+    }
+    if rc != WS_OK {
+        tty_puts(&tty_ui, 2, "error: 切换失败（内存或 getcwd 出错，工作区没变）\n");
+        return;
+    }
+    tty_puts(&tty_ui, 2, "工作区已切换：");
+    tty_write(&tty_ui, 2, cfg.workspace.ptr as &const byte, cfg.workspace.len);
+    tty_puts(&tty_ui, 2, "\n");
 }
 
 // ============================================================
@@ -4300,7 +4863,7 @@ fn agent_default_dsh_home(cfg: &const Config, out: &Buf) bool {
     return dsh_home_resolve(cfg.dsh_home.ptr as &const byte, out);
 }
 
-fn agent_run(cfg: &const Config) i32 {
+fn agent_run(cfg: &Config) i32 {
     if cfg.api_key.len == 0 {
         out_err("error: no API key. set UYA_AGENT_API_KEY / DEEPSEEK_API_KEY / OPENAI_API_KEY\n");
         return AGENT_USAGE;
@@ -4332,7 +4895,8 @@ fn print_usage() void {
     out_err("选项:\n");
     out_err("  --base-url URL      默认 https://api.deepseek.com/v1\n");
     out_err("  --model NAME        默认 deepseek-chat\n");
-    out_err("  --workspace DIR     工作目录（工具只在这里面活动），默认当前目录\n");
+    out_err("  --workspace DIR     工作目录（工具只在这里面活动），默认当前目录；\n");
+    out_err("                      恢复会话时默认跟随会话记录的工作区，这条显式指定优先\n");
     out_err("  --max-steps N       熔断上限：最多几轮工具调用，默认 0 = 不限（跑到模型给出最终答案）\n");
     out_err("  --max-response N    响应体上限字节，默认 262144\n");
     out_err("  --timeout-ms N      单次 HTTP 超时，默认 120000\n");
@@ -4638,6 +5202,7 @@ fn agent_repl_help() void {
     tty_puts(&tty_ui, 2, "  /plan      切换 plan 模式\n");
     tty_puts(&tty_ui, 2, "  /permission [预设]  查看/切换访问模式（read-only|workspace-write|danger-full-access）\n");
     tty_puts(&tty_ui, 2, "  /diff      查看 git 修改（非 TUI 模式打单列 unified diff）\n");
+    tty_puts(&tty_ui, 2, "  /workspace [目录]  看/切当前会话的工作区（切换会记进会话日志；恢复会话时回到这里）\n");
     tty_puts(&tty_ui, 2, "  /sessions  列出本机会话\n");
     tty_puts(&tty_ui, 2, "  /resume ID 切换到指定会话（id 或 last）\n");
     tty_puts(&tty_ui, 2, "  /new       开一条新会话（当前会话保留在磁盘上）\n");
@@ -4960,6 +5525,11 @@ fn agent_repl_command(cfg: &Config, h: &History, line: &const Buf) bool {
         agent_diff_print(cfg);
         return false;
     }
+    // P31：/workspace [dir] —— 看当前会话的工作区 / 切过去（人自己敲的就是批准）
+    if sv_eq_cstr(line, "/workspace") || (line.len > 11 && bufx_eq_cstr(line.ptr as &const byte, 11, "/workspace ")) {
+        agent_repl_workspace(cfg, line);
+        return false;
+    }
     if sv_eq_cstr(line, "/sessions") {
         _ = agent_list_sessions(cfg);
         return false;
@@ -5054,7 +5624,7 @@ fn tty_read_line_blocking() i32 {
 }
 
 // 行式 REPL（stdin 不是 TTY：管道/重定向）。同一份 history 连续对话。
-fn agent_repl_plain(cfg: &const Config) i32 {
+fn agent_repl_plain(cfg: &Config) i32 {
     var h: History = hist_init();
     defer { hist_free(&h); }
     defer { agent_session_close(); }
@@ -5270,7 +5840,7 @@ fn agent_run_interactive(cfg: &Config) i32 {
     return rc;
 }
 
-fn run_once(cfg: &const Config) i32 {
+fn run_once(cfg: &Config) i32 {
     if cfg.task.len == 0 {
         return AGENT_USAGE;
     }
@@ -5447,6 +6017,44 @@ fn out_masked(key: &const Buf) void {
 fn agent_print_config(cfg: &const Config, dsh: &const DshCfg) void {
     // 先把 preset 文案/旋钮载入（否则这里看到的是静态初始值）
     agent_texts_ensure(cfg);
+    // P31：工作区是「当前会话」的状态（可切、可被恢复覆盖），所以连来源一起打。
+    // 注意 --print-config 在会话打开之前就返回了：这里看到的是**启动时**解析出来的值，
+    // 「会话记录里的工作区」要么在 /status 里看，要么带 --resume 跑一次。
+    out_err("workspace = ");
+    out_err_bytes(cfg.workspace.ptr, cfg.workspace.len);
+    out_err("  (source: ");
+    out_err(ws_src_name(cfg.ws_src));
+    out_err(")\n");
+    if cfg.resume_ws.len > 0 {
+        out_err("session_workspace = ");
+        out_err_bytes(cfg.resume_ws.ptr, cfg.resume_ws.len);
+        out_err("  (recorded in the resumed session's log; the session opens there)\n");
+    } else if cfg.resume_id.len > 0 {
+        // 还没开会话（--print-config 在 agent_session_open 之前返回）：现场读一眼日志，
+        // 把「会落在哪」说出来 —— 正是这条命令最常见的用途（确认 --resume 会切到哪）
+        var meta: SessMeta = sess_meta_empty();
+        defer { sess_meta_free(&meta); }
+        var pz: Buf = buf_new(cfg.resume_id.len + 1);
+        defer { buf_free(&pz); }
+        _ = buf_append(&pz, cfg.resume_id.ptr, cfg.resume_id.len);
+        _ = buf_append_byte(&pz, 0);
+        if sess_read_meta(pz.ptr as &const byte, &meta) {
+            out_err("session_workspace = ");
+            if meta.workspace.len > 0 {
+                out_err_bytes(meta.workspace.ptr, meta.workspace.len);
+            } else {
+                out_err_bytes(meta.cwd.ptr, meta.cwd.len);
+            }
+            out_err("  (recorded in the resumed session's log; ");
+            if cfg.ws_explicit {
+                out_err("--workspace wins, so this run stays in ");
+                out_err_bytes(cfg.workspace.ptr, cfg.workspace.len);
+            } else {
+                out_err("the session opens there");
+            }
+            out_err(")\n");
+        }
+    }
     out_err("base_url = ");
     out_err_bytes(cfg.base_url.ptr, cfg.base_url.len);
     out_err("  (source: ");
@@ -5706,6 +6314,8 @@ export fn main() i32 {
     if (ws_env as usize) != 0 {
         buf_free(&cfg.workspace);
         cfg.workspace = buf_from_cstr(ws_env);
+        cfg.ws_src = 2;
+        cfg.ws_explicit = true;   // P31：显式指定优先于「会话记录里的工作区」
     }
     const tui_env: &byte = getenv("UYA_AGENT_TUI");
     if (tui_env as usize) != 0 && bufx_cstr_len(tui_env) > 0 {
@@ -6092,6 +6702,8 @@ export fn main() i32 {
             if i < get_argc() {
                 buf_free(&cfg.workspace);
                 cfg.workspace = buf_from_cstr(get_argv(i));
+                cfg.ws_src = 3;
+                cfg.ws_explicit = true;   // P31：显式指定优先于「会话记录里的工作区」
             }
         } else if arg_eq(p, "--max-steps") {
             i = i + 1;
@@ -6144,6 +6756,10 @@ export fn main() i32 {
         }
         i = i + 1;
     }
+    // P31：--workspace / $UYA_AGENT_WORKSPACE 给的可能是相对路径 —— 规范化成绝对路径
+    // （沙箱 bind、/diff 的「工作区 vs 仓库根」比较、/status 与脚注都想看到绝对路径）。
+    // 失败（目录不存在之类）就原样留着：开会话时会照旧报出来。
+    agent_workspace_canon(&cfg);
     if cfg.verify == HC_VERIFY_PIN && cfg.pin.len == 0 {
         out_err("error: --tls-verify=pin requires --tls-pin <sha256 hex>\n");
         return AGENT_USAGE;
@@ -6198,8 +6814,8 @@ export fn main() i32 {
 // —— 与 README 顶部同一套记法。
 // ⚠ 手写的长度常量要跟着版本串一起改：P30 这条线在分支上把串改成 8 字节时忘了改它（当时是 9），
 // 末尾那个 NUL 就进了 /status 浮层 —— 自测的「正文层不许出现 NUL」不变量当场抓住。
-const AGENT_VERSION: [byte: 16] = [112, 51, 48, 45, 112, 117, 109, 112, 0, 0, 0, 0, 0, 0, 0, 0];   // "p30-pump"
-const AGENT_VERSION_LEN: usize = 8;
+const AGENT_VERSION: [byte: 16] = [112, 51, 49, 45, 119, 115, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];   // "p31-ws"
+const AGENT_VERSION_LEN: usize = 6;
 fn agent_parse_color(p: &byte) u8 {
     // auto / always / never / 16 / 256
     if bufx_cstr_len(p) == 4 && bufx_eq_cstr(p, 4, "auto") {
@@ -6389,6 +7005,7 @@ export fn agent_tui_commands(out: &Buf) void {
     _ = buf_append_cstr(out, "/goal      会话目标（查看/创建/编辑/暂停/恢复/清除）\n");
     _ = buf_append_cstr(out, "/sessions  会话列表（选一个恢复）\n");
     _ = buf_append_cstr(out, "/diff      查看 git 修改（左文件列表 · 右双列全文比对）\n");
+    _ = buf_append_cstr(out, "/workspace [目录]  看/切当前会话的工作区（切换记进会话日志）\n");
     _ = buf_append_cstr(out, "/new       开一个新会话\n");
     _ = buf_append_cstr(out, "/compact   手动压缩上下文\n");
     _ = buf_append_cstr(out, "/plan      切换计划模式\n");
@@ -6724,6 +7341,12 @@ fn agent_tui_cmd_safe(head: &const Buf) bool {
     if sv_eq_cstr(head, "/diff") {
         return true;
     }
+    // P31：裸 /workspace 只读（看一眼 cfg.workspace 就打转录，不动历史也不切）；
+    // 带参数的 `/workspace <dir>` 会切工作区，走 steer → 主循环那条路，不经过这里
+    // （与 /goal 同一条口径：面板项只会交出裸命令名）。
+    if sv_eq_cstr(head, "/workspace") {
+        return true;
+    }
     if sv_eq_cstr(head, "/help") {
         return true;
     }
@@ -6943,6 +7566,9 @@ fn agent_tui_command(cfg: &Config, h: &History, line: &const Buf) bool {
         _ = buf_append(&items, cfg.base_url.ptr, cfg.base_url.len);
         _ = buf_append_cstr(&items, "\nworkspace  ");
         _ = buf_append(&items, cfg.workspace.ptr, cfg.workspace.len);
+        _ = buf_append_cstr(&items, "  (source: ");
+        _ = buf_append_cstr(&items, ws_src_name(cfg.ws_src));
+        _ = buf_append_cstr(&items, ")\n");
         _ = buf_append_cstr(&items, "\npermission ");
         _ = buf_append_cstr(&items, perm_name(perm_get()));
         _ = buf_append_cstr(&items, " (");
