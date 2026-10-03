@@ -4,7 +4,10 @@
 多轮 loop 直到给出结论。全部代码 42 个 `.uya` 文件，**不引入任何 C 代码、`@c_import` 或其它语言**，
 只依赖 Uya 语言与随编译器分发的标准库。
 
-**P0–P32 全部完成**（**P32 是「工作区里的转录真的能翻看」**：TUI 进入时开鼠标上报
+**P0–P33 全部完成**（**P33 是 `/sessions` 列表这条线**：三列 = 标题 / 工作区 / session id、
+按 `lastActiveAt` 倒序、列宽随终端自适应、同 id 只留最后一条索引记录，版本串 `p33-sess`
+（它和并行线的 `p31-wait` / `p32-scroll` 前后脚撞号，按「后到的顺延」记成 P33），
+见 §2「会话持久化与恢复（P4）」与 §3 踩坑 50/51；**P32 是「工作区里的转录真的能翻看」**：TUI 进入时开鼠标上报
 （`ESC[?1000h/1006h`）把滚轮从「被 xterm.js 伪装的 ↑/↓」救回来、`ctrl+home/end`
 （`ESC[1;5H/F`）的参数解析修对、滚动按**真总量**走查（一个上万行的长条目也能翻到最前面）、
 `pgup/pgdn` 按整屏走、顶部给 `^` 溢出指示 —— 版本串 `p32-scroll`，见 §3 踩坑 49 与 §6 的验收记录；
@@ -23,8 +26,7 @@
 另有并行线的一条用了同一编号，合流时记成 P22 的终端标题）；**P15** 也各被两条并行线用过一次
 （一条是「请求体控制字节全转义 + 默认走 Responses 接口」——见 §3 踩坑 27、§2 的
 `jsonx.uya`/`session.uya`、§6 的 `json-escape` / `ctrl-bytes*`；另一条是**子代理窗口面板**
-——见 §2 的「子代理窗口面板（并行线的 P15）」与踩坑 29））：
-LLM 交互是**流式 SSE**（`stream:true` + `stream_options.include_usage`），
+——见 §2 的「子代理窗口面板（并行线的 P15）」与踩坑 29））：LLM 交互是**流式 SSE**（`stream:true` + `stream_options.include_usage`），
 增量 chunked 解码 + SSE 分帧 + `tool_calls` 按 `index` 分片累积；消息协议是**严格工具协议**
 （`assistant.tool_calls` 原样回灌 + 每条结果一条 `role:"tool"` + `tool_call_id`）；
 交互界面是**真 TTY**（termios raw + 行编辑器），流式期间可打断、可继续输入、可续跑；
@@ -147,6 +149,8 @@ make e2e-permission # 访问模式的四级来源 + 非法值报错（离线）
 make e2e-sandbox    # 沙箱后端探测 / --no-sandbox / 显式 bwrap 路径（离线）
 make e2e-tasks      # /tasks 报告头 / 空态串 / open|toggle|非法参数 / /help（离线）
 make e2e-goal       # /goal 用法 / 创建 / 拒绝顶掉 / edit / pause·resume / clear / /help（离线）
+make e2e-sessions   # /sessions 三列 / 时间倒序 / 同 id 取最后一条 / id 完整（离线）
+make sess-selftest  # 只跑 /sessions 那两轮（纯函数排版 + TUI 浮层），改会话列表时最快
 make probe        # 传输层探针：打真实 https 端点，期望 HTTP 401（不需要 key）
 ```
 
@@ -527,7 +531,8 @@ TTY/ANSI 代码），所以这里是把**那套内容模型搬到滚动终端**�
   消息数只统计已读入的部分（zstd 前缀），所以列表里写作 `msgs≈`。
 * `make` 目标：`check` / `build` / `selftest`（离线 33 轮）/ `probe` / `e2e TASK=… [PIN=…]`（真实网关）/
   `e2e-config`（零参数打印生效配置）/ `e2e-dsh`（列 DSH 会话）/ `e2e-title`（终端标题开关四条回归，
-  P22）/ `e2e-permission` / `e2e-sandbox`（P21 访问模式与沙箱）/ `tui-selftest`（只跑 TUI 轮）/
+  P22）/ `e2e-permission` / `e2e-sandbox`（P21 访问模式与沙箱）/ `e2e-tasks` / `e2e-goal` /
+  `e2e-sessions`（P33 会话列表）/ `tui-selftest`（只跑 TUI 轮）/ `sess-selftest`（只跑 P33 那两轮）/
   `tui-demo`（打印 TUI 的几屏纯文本快照：home / chat / 运行中 / 常驻任务块 / plan 审阅浮窗）。
 
 ### workflow：Uya 脚本 + 钩子代理（P12）
@@ -729,6 +734,21 @@ Messages API（`x-api-key` + `anthropic-version: 2023-06-01`，服务端工具 `
   见踩坑 27 的后半段）。
 * 入口：`--continue`（当前目录最近一条）、`--resume <id|last>`、`--list-sessions`、`--no-save`；
   REPL 里 `/sessions`、`/resume <id>`、`/new`。
+* **会话列表（P33）**：`/sessions`（浮层）、滚动模式的 `/sessions`、`--list-sessions` 打印的是
+  **同一份**三列表 —— **① 标题 ② 工作区 ③ session id**：
+  * 顺序按 `lastActiveAt` **倒序**（最新的在第一行；缺这个字段的记录排最后），回车即恢复最新那条；
+  * 索引是追加写的（每关一次会话追加一条），同一个 id 会有多行 —— 列表按索引自己的契约
+    「同 id 取最后一条」去重，所以同一个会话只出现一次（2026-10-03 真机 `index.jsonl`
+    实测 332 行 / 322 个会话，其中一个 id 出现 4 次；这个文件一直在长，每跑一次会话就多几行）；
+  * 列宽随终端宽度自适应：浮层箱体铺到 `cols-6`，可用列数按
+    「三列 → 两列（丢掉工作区列）→ 只剩 id」退化，每列至少 6 列才画（不足 6 列的那一列不如不画）；
+  * 列宽按**显示列**算（汉字 2 列），标题**保头**补 `…`、工作区**保尾**补 `…`（路径尾部信息量最大），
+    单元格内容先过 `tty_title_clean_into` 清洗（控制字节 / ESC / 半截 UTF-8 都换掉）；
+  * **id 在条目文本里永不裁剪**：选中项的 id 是从条目文本里取的，显示层再窄也只是「看不见」，
+    `/resume` 永远拿到完整 id（滚动模式没有渲染层，打印前用 `sess_rows_clip_into` 按列硬裁并补 `…`
+    —— 半截 id 抄去 `/resume` 一定失败，得让人看出来被裁过）；
+  * 浮层里回车走 `agent_tui_sessions_head`（**取行尾那个 token**，且必须以 `session-` 开头），
+    不是面板那套「取行首第一个词」—— 第一列现在是标题，取错就变成拿标题去 `/resume`（见踩坑 50）。
 * `session/title`（P22）就是终端标题的来源：首条用户消息派生一条（`source.kind = "fallback"`，
   对齐 DSH 的前 5 词 / ≤40 B 口径），恢复会话时由日志里**最后一条** title 事件决定标题。
   注意 `sess_open` 会重新初始化整个 `SessionLog`（含 `title`），所以恢复路径必须把回放出来的
@@ -807,7 +827,7 @@ TTY 交互模式**默认全屏**（`--no-tui` 退回上一节的滚动转录；�
 
   ▌ ↑ Ask anything... "把 hello.uya 的问候语改成 Hello, DSH!"
   ▌ Build   Full access   deepseek-chat   deepseek  tab plan   ctrl+p commands
-  ~/uya-agent:main                                                                 p32-scroll
+  ~/uya-agent:main                                                                 p33-sess
 ```
 
 对话态（`--tui-demo` 打印的就是这几屏的纯文本快照）：
@@ -931,7 +951,8 @@ plan 审阅浮窗（`--tui-demo` 的**第 ⑤ 屏**，任务块那两帧是 ④a
   `ctrl+u/w/k` 清行/删词/删到行尾 ·
   `ctrl+a/e`、`←/→`、`home/end`、`backspace/del` 按**字符**编辑 · `ctrl+l` 强制重绘 ·
   括起粘贴（`ESC[200~`）整段插入不触发提交（> 64 KiB 截断）。
-* **浮层**：命令面板、会话列表（选一个 `/resume`）、帮助（`/help`）、`/status` 详情、
+* **浮层**：命令面板、会话列表（三列 = 标题 / 工作区 / session id，按时间倒序、列宽随终端自适应，
+  回车把选中的会话 `/resume` 回来 —— 见 §2「会话持久化与恢复（P4）」的 P33 那条）、帮助（`/help`）、`/status` 详情、
   **`/goal` 会话目标**（P29：纯查看型，正文就是 `goal_cmd_run` 的输出 —— 状态块或用法）、
   **访问模式选择器与 Full access 确认**（P21，底对齐，贴着输入面板往上弹）、
   **read-only 下 bash 的逐条批准**（P21：↑/↓ + enter，esc = 无回答）、
@@ -2247,6 +2268,36 @@ vLLM 等 OpenAI 兼容端点都一样稳。想升级成严格 `tool` 角色消�
     （那是 80 列终端下的期望），在别的宽度的 tty 里跑必然红。现在那轮自己把
     `tty_ui.cols` 钉成 80，断言也跟着算出来，跟跑测试的终端无关。
 
+50. **第一列换了，选中项的口径就得跟着换 —— 否则 `/resume` 拿着标题去查会话。**（P33）
+    `/sessions` 的条目原来是 `<id>  <cwd>`，选中项用 `agent_tui_item_head`（取行首第一个
+    空白分隔 token）当会话 id —— id 正好在第一列，所以没问题。改成「标题 / 工作区 / session id」
+    三列之后**行首变成了标题**：同一个 `agent_tui_item_head` 取出来的是标题的第一个词，
+    `/resume 修个` 于是找不到会话（而且属于「静默失败」那一类：用户只看到一行
+    `error: 找不到该会话`）。正解是**取行尾那个 token**（`agent_tui_sessions_head`），
+    并要求它必须以 `session-` 开头；认不出来就落一条可见提示（`这一行里没认出会话 id`），
+    绝不猜。连带两条同样重要的：
+    * **id 只能在显示层裁**。条目文本是选中项的唯一来源，所以 `sess_rows_render` 里 id 一律
+      原样写出（三列 / 两列 / 只剩 id 都一样），「画不下」交给显示层
+      （浮层是 `tui_ov_put_clipped`，滚动模式是打印前的 `sess_rows_clip_into`，两者都补 `…`）。
+      反过来（排版时就按列裁 id）会让窄终端上的 `/resume` 时好时坏，且失败得毫无线索。
+    * **索引是追加写的，同一个 id 一定会有多条**。`index.jsonl` 每关一次会话就追加一条，
+      「同一个会话列两次」是默认行为；列表侧必须按索引自己的契约「同 id 取最后一条」去重
+      （真机索引实测 308 行 / 298 个会话，其中一个 id 出现 4 次）。不去重的话
+      「最新的排第一」里会连续出现同一会话的副本，看起来就像列表坏了。
+    验收：`sess-list` 轮（纯函数：去重 / 倒序 / 三档列宽 / 控制字节清洗 / id 完整）、
+    `tui-sessions` 轮（浮层宽箱体 + 方框闭合 + 回车取完整 id + `sess_find` 找得到）、
+    `make e2e-sessions`（真二进制，管道喂 REPL）。
+
+51. **uya 0.10 的 `p[a: b]` 是「从 a 起 b 个字节」，不是「到 b 为止」。**（P33 实测）
+    全仓的切片几乎都写成 `p[0: n]` —— 两种语义在 a=0 时完全一样，所以这个坑一直没露头。
+    P31 要给「索引里第 k 行」做切片解析，写了 `idx.ptr[lo: lo + ll]`，实际拿到的是
+    **从 lo 起 `lo + ll` 个字节**的窗口：越读 `lo` 个字节到后面几行去（行号越大越界越多，
+    最后一行还会越过缓冲区末尾）。现场：一条**没有** `lastActiveAt` 的记录被解析成了后面
+    那行的 9000，于是「按时间倒序」整个错位（`sess-list` 轮 12 条断言一起红）。
+    探针（`p = "0123456789"`，`p[2: 5].len`）实测打印 **5**（= 长度），不是 3。
+    正解：**别用非 0 起点的切片** —— 把那一行先拷进 scratch Buf 再按 `[0: len]` 解析
+    （`session.uya` / `agent.uya` / 自测助手都这么写）；真要「从 a 起 n 个字节」就写
+    `p[a: n]` 并注明第二个数是长度。已有的正确例子是 `httpc.uya` 的 `head[i: name.len]`。
 ---
 
 ## 4. 工具实现要点
@@ -2446,6 +2497,9 @@ contextWindow/maxTokens/input image/reasoningEffort/`permission.defaultPreset`�
 `/tasks open` / `toggle` 的回显、`/tasks bogus` 报 `未知参数 "bogus"`、`/help` 里能查到 `/tasks` |
 | `goal-cmd` | 会话目标人类命令（P29）纯函数轮：空态裸 `/goal` 报「当前没有目标」+ 用法（**返回 0** —— 看状态不会失败）、缺目标时 `pause`/`resume`/`edit` 各自点出是谁缺目标、裸 `edit` 与 `edit` + 纯空白都报「需要替换内容」且**不落盘**、创建后状态块四段（`Status: active` / `Objective: …` / `Rounds: 0/20` / `Activation: armed`）与盘上字段（id/revision/round/phase/objective）逐条对齐、重复创建被拒**且没改盘上 objective**、`edit` 只换 objective（revision 2、phase/armed 不动）、`pause` 关 armed、`resume` 打开、`clear` 删文件且**幂等**（再 clear 报「没得清」）、`pause after verification` 按**字面目标**创建（控制词只在独占整行时才是控制词）、`clearx` 不被当成 `clear`、大写 `CLEAR` 照样命中、`complete` 的目标让位（创建与 `edit` 都换新身份：id +1 / revision 回 1 / 0 轮 / armed）、输出必须以换行收尾 |
 | `goal-e2e` | `make e2e-goal`（离线，管道喂真 REPL + 独立 `UYA_AGENT_HOME`）：空态用法、创建、`Rounds: 0/20`、拒绝顶掉、`Goal updated` + 新 objective、`Status: paused` + `Activation: disarmed`、`Goal resumed`、`Goal cleared.`、重复 clear 幂等、字面目标规则、`/help` 里能查到 `/goal` |
+| `sess-list` | **/sessions 列表（P33）纯函数轮**：索引 fixture 用真写入端（`sess_open`/`sess_close`）之外的手写索引造出「同 id 两条 + 时间戳乱序 + 缺 `lastActiveAt` + 空标题 + 带控制字节（TAB / `\u0001`）的标题」；断言去重后行数 = 唯一 id 数、重复 id 取的是**最后一条**（被取代那条的标题不许出现）、顺序严格按 `lastActiveAt` 降序且缺字段的排最后；再按 8 档可用列数（198/78/60/59/52/51/44/40）逐行断言 —— 行宽 ≤ 可用列数（只有「连 id 都放不下」那一档允许超宽，因为那份 id 必须完整）、标题列与工作区列的可见性随退化阶梯变化（三列 → 两列丢工作区 → 只剩 id）、每行喂 `agent_tui_sessions_head` 都还得出**完整 id**、正文里一个控制字节都没有；最后验滚动模式的 `sess_rows_clip_into`：窄到 21 列时每行 ≤ 21 且补 `…`，而本来放得下的宽度**一个 `…` 都不许加**（'…' 预算算错会把好端端的 id 截掉 —— 实测踩过） |
+| `tui-sessions` | **/sessions 浮层（P33）**：fixture 是三个**真落盘**的会话（`sess_open`/`sess_close`，标题由测试给），`/sessions` 开浮层后断言 kind/标题、100 列下箱体铺开（顶边右边界列 = 97，即宽 `cols-6` + 左边距 3）、方框闭合成矩形（`tui-frame` 那套量法）、三列都可见、**最新那条的标题行在最早那条之上**（`tuis_find_row` 行号比较）；回车 → 选中项里的 id = 最新会话的**完整 id**（不是标题）→ `sess_find` 找得到（`/resume` 走的就是它）；再跑 60 列那一档：工作区列消失、id 列还在，且条目文本里的 id 仍然完整 |
+| `sessions-e2e` | `make e2e-sessions`（离线，管道喂真 REPL + 独立 `--agent-home`）：手写索引里三条记录（旧 / 空标题 / 旧 id 的第二次记录），断言输出里最新会话在最上（`grep -n` 比行号）、被取代的旧记录不出现、同一个 id 只出现 1 次、空标题落到 `(无标题)`、`/w/new-a` 与完整 id 排成「工作区在前、id 在行尾」（正则收尾匹配） |
 | `diff-render` | 纯函数逐字节断言 diff：新旧一样 → 空（且**不输出上下文**）、只差结尾换行 → 空、
 中间一行改动 → 前后各 2 行上下文 + `-`/`+`、新文件 → 全 `+`、两侧 >60 行 → 只给精确汇总、
 60 行编辑脚本 → 头截断成 24 行 + `… (省略 36 行)`、增删计数、按显示列截断（汉字 2 列） |
@@ -2937,6 +2991,26 @@ mock 上逐字段验收。换一台 `openai-responses` 网关可用时，零参�
     `p30-check` 与 `tui-p31`）；`make tui-demo` 与改前**只差脚注版本串**（`p30-pump` → `p31-wait`），
     本节引用的快照已跟着更新 —— 排版一个字节没碰。
 
+* **P33 的验收记录（2026-10-03，`p33-sess`，对应踩坑 50/51）**：
+  * **真机数据只读复验**：把 `~/.uya-agent/index.jsonl` 复制到临时 `--agent-home` 里跑
+    `--list-sessions`（**只读**，一个字节都没动真机索引）—— 索引 **332 行 / 322 个唯一 id**
+    （10 条是同 id 的重复记录），列表打出来正好 **322 行**、每个 id 一次，「最新的在第一行」；
+    同一个索引在 200 / 120 / 80 / 40 列下分别是「三列（宽）→ 三列（窄）→ 两列 → 只剩 id」，
+    每行显示宽度都 ≤ 终端列数（40 列那档 id 被裁成 `session-…1111…` 并补了 `…`）。
+  * 顺带看到的一条**数据事实**：真机索引里 247/332 条记录（当时）的 `title` 是空串 —— 那些是没进过
+    用户消息的会话（探针、`--print-config` 空跑、PTY/自测 fixture 等），列表里显示成 `(无标题)`；
+    有标题的那 85 条（`怎么默认使用dsh配置` / `跑一下 sleep` …）正常显示，长标题按列宽保头裁剪。
+  * 一处**被自测当场抓住**的自身缺陷：`sess_rows_clip_into` 第一版无条件给 `…` 留一列，
+    于是「本来就正好 `body` 列」的三列行也被截了一刀（80 列终端上 id 尾巴被吃掉）——
+    `sess-list` 轮那条「放得下就不许出现 `…`」的断言把它钉住了（现在只在真的超宽时才裁）。
+  * 另一处更值钱的：uya 的 `p[a: b]` 是「偏移 + 长度」（踩坑 51），我第一版按「到 b 为止」写了
+    `idx.ptr[lo: lo + ll]`，于是「没有 `lastActiveAt`」的记录被解析成后面那行的值、倒序整体错位，
+    `sess-list` 轮 12 条断言一起红。修法是**别用非 0 起点切片**：每行先拷进 scratch Buf 再按
+    `[0: len]` 解析（`session.uya` / `agent.uya` / 自测助手三处都改了）。
+  * `make check / build / codegen-audit / e2e-sessions / sess-selftest / tui-selftest（18 轮）/
+    selftest` 全绿；`make tui-demo` 与本节引用的快照一致（版本串变成 `p33-sess`，
+    其余排版一个字节没碰 —— 会话浮层的箱体宽度只对 `TUI_OVK_SESSIONS` 生效，
+    默认档 `want_w = 0` 与旧写法逐字节等价）。
 ---
 
 ## 7. 已知限制
