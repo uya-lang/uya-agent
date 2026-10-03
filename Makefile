@@ -6,6 +6,7 @@
 #   make selftest   # 离线端到端自测（内置 mock LLM，无需网络与 key）
 #   make probe      # 传输层探针（默认打 api.deepseek.com，期望 HTTP 401）
 #   make e2e-diff   # /diff：真 git 的改动列表 + 单列文本回退 + 非仓库报错（离线）
+#   make e2e-tasks  # /tasks：报告头 / 空态串 / open / toggle / 非法参数（离线）
 #   make e2e TASK="..." PIN=<leaf sha256> [STEPS=N]   # 真实调用（需要 DEEPSEEK_API_KEY；STEPS 不给就不限步数）
 #   make e2e-steps  # 步数默认值回归（离线，不联网）
 #   make clean
@@ -15,7 +16,7 @@
 UYA_ROOT ?= /home/winger/uya-0.10/lib/
 UYA      ?= /home/winger/uya-0.10/bin/uya
 
-SRC := src/bufx.uya src/jsonx.uya src/httpc.uya src/httpstream.uya src/sse.uya src/llm.uya src/tty.uya src/sigx.uya src/inbox.uya src/session.uya src/stats.uya src/procx.uya src/yamlcfg.uya src/dshcfg.uya src/dshsess.uya src/prompt.uya src/instr.uya src/compact.uya src/skill.uya src/webx.uya src/deleg.uya src/goal.uya src/workflow.uya src/todo.uya src/plan.uya src/perm.uya src/sandboxx.uya src/askuser.uya src/fsx.uya src/search.uya src/jobs.uya src/shellx.uya src/gitx.uya src/gitdiff.uya src/tools.uya src/diffx.uya src/view.uya src/tui.uya src/agent.uya src/sigselftest.uya src/tuiselftest.uya src/selftest.uya
+SRC := src/bufx.uya src/jsonx.uya src/httpc.uya src/httpstream.uya src/sse.uya src/llm.uya src/tty.uya src/sigx.uya src/inbox.uya src/session.uya src/stats.uya src/procx.uya src/yamlcfg.uya src/dshcfg.uya src/dshsess.uya src/prompt.uya src/instr.uya src/compact.uya src/skill.uya src/webx.uya src/deleg.uya src/goal.uya src/workflow.uya src/todo.uya src/plan.uya src/perm.uya src/sandboxx.uya src/askuser.uya src/fsx.uya src/search.uya src/jobs.uya src/shellx.uya src/gitx.uya src/gitdiff.uya src/tools.uya src/diffx.uya src/view.uya src/tasks.uya src/tui.uya src/agent.uya src/sigselftest.uya src/tuiselftest.uya src/selftest.uya
 OUT := build/uya-agent
 
 BASE ?= https://api.deepseek.com/v1
@@ -26,7 +27,7 @@ TASK ?= 创建 hello.uya，编译并运行它
 export UYA_ROOT
 export UYA_SPLIT_C_DIR := $(CURDIR)/build/uyacache
 
-.PHONY: all check build selftest codegen-audit probe e2e e2e-config e2e-config-flags e2e-title e2e-api e2e-steps e2e-permission e2e-sandbox e2e-diff e2e-dsh tui-demo tui-selftest diff-selftest clean
+.PHONY: all check build selftest codegen-audit probe e2e e2e-config e2e-config-flags e2e-title e2e-api e2e-steps e2e-permission e2e-sandbox e2e-tasks e2e-diff e2e-dsh tui-demo tui-selftest diff-selftest clean
 
 all: build
 
@@ -51,7 +52,7 @@ codegen-audit: build
 	fi; \
 	echo "codegen-audit: 通过（没有切片描述符强转）"
 
-selftest: build codegen-audit e2e-config-flags e2e-title e2e-api e2e-steps e2e-permission e2e-sandbox e2e-diff
+selftest: build codegen-audit e2e-config-flags e2e-title e2e-api e2e-steps e2e-permission e2e-sandbox e2e-tasks e2e-diff
 	UYA_BIN=$(UYA) $(OUT) --selftest
 
 probe: build
@@ -107,7 +108,27 @@ e2e-sandbox: build
 	echo "$$out" | grep -q "sandbox = none" || { echo "FAIL: 指定不存在的 bwrap 应当判不可用"; exit 1; }; \
 	echo "e2e-sandbox: 通过（探测结果可见 / --no-sandbox / 显式 bwrap 路径不可用）"
 
-# P22：/diff（离线）：在临时仓库里跑**真二进制**（滚动模式的单列文本回退）——
+# P22：/tasks 任务状态（离线，不联网）：裸命令出报告、空态串、open/toggle 回显、非法参数报错、
+# /help 里能查到它。常驻块的排版与活体刷新在 selftest 的 tasks-render / tui-tasks 两轮里断言。
+e2e-tasks: build
+	@set -e; \
+	out=$$(printf '/tasks\n/tasks open\n/tasks toggle\n/tasks bogus\n/help\n/exit\n' | \
+		$(OUT) --no-dsh-config --no-tui --api-key dummy-key --quiet 2>&1); \
+	echo "$$out" | grep -qF -- "--- 任务 ---" \
+		|| { echo "FAIL: 裸 /tasks 没有打出报告头"; exit 1; }; \
+	echo "$$out" | grep -qF "（没有任务：todo 清单为空，也没有后台任务 / 子代理 / 目标）" \
+		|| { echo "FAIL: 空态串不对"; exit 1; }; \
+	echo "$$out" | grep -qF "[tasks] 常驻块：展开（ctrl+t 同效）" \
+		|| { echo "FAIL: /tasks open 没有回显展开"; exit 1; }; \
+	echo "$$out" | grep -qF "[tasks] 常驻块：收起" \
+		|| { echo "FAIL: /tasks toggle 没有回显收起"; exit 1; }; \
+	echo "$$out" | grep -qF '未知参数 "bogus"' \
+		|| { echo "FAIL: 非法参数没有报错"; exit 1; }; \
+	echo "$$out" | grep -qF "/tasks     任务状态进度" \
+		|| { echo "FAIL: /help 里没有 /tasks"; exit 1; }; \
+	echo "e2e-tasks: 通过（报告头 / 空态串 / open / toggle / 非法参数 / /help）"
+
+# P26：/diff（离线）：在临时仓库里跑**真二进制**（滚动模式的单列文本回退）——
 # 必须列出改动文件（含未跟踪）、打出旧/新两侧内容；非仓库目录必须报错而不是静默无事发生。
 e2e-diff: build
 	@set -e; \
@@ -129,6 +150,7 @@ e2e-diff: build
 	out=$$(cd /tmp && printf '/diff\n/exit\n' | $(CURDIR)/$(OUT) --no-dsh-config --no-tui --quiet --api-key dummy-key 2>&1 || true); \
 	echo "$$out" | grep -q "not a git repository" || { echo "FAIL: 非仓库目录没有报出「不是 git 仓库」"; echo "$$out"; exit 1; }; \
 	echo "e2e-diff: 通过（真 git 的列表 + 单列文本回退 + 非仓库报错）"
+
 
 # 真实网关端到端：默认走 DSH 设置（零参数就能拿到 base-url/model/key），
 # 也可以显式覆盖。TLS：给了 PIN 用 pin，否则用 none（真机链校验过不去，见 README 第 5 节）
