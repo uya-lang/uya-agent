@@ -129,7 +129,7 @@ e2e-tasks: build
 		|| { echo "FAIL: /help 里没有 /tasks"; exit 1; }; \
 	echo "e2e-tasks: 通过（报告头 / 空态串 / open / toggle / 非法参数 / /help）"
 
-# P28：/goal（离线，行式 REPL 走真二进制）：空态用法 / 创建 / 拒绝顶掉未完成的 goal /
+# P29：/goal（离线，行式 REPL 走真二进制）：空态用法 / 创建 / 拒绝顶掉未完成的 goal /
 # edit 只换目标 / pause·resume 翻 armed / clear 幂等 / 字面目标规则 / /help 里查得到。
 # TUI 那条腿（浮层 + 常驻块目标段刷新）在 selftest 的 tui-tasks 轮里断言。
 e2e-goal: build
