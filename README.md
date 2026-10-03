@@ -4,14 +4,22 @@
 多轮 loop 直到给出结论。全部代码 42 个 `.uya` 文件，**不引入任何 C 代码、`@c_import` 或其它语言**，
 只依赖 Uya 语言与随编译器分发的标准库。
 
-**P0–P34 全部完成**（**P34 是「工作区」**：工作区从「启动时定一次」变成**当前会话的状态** ——
+**P0–P35 全部完成**（**P35 是「恢复会话段错误」修复 + `/sessions` 列表的最新一条排最后一行**：`sess_read_meta`
+逐行取行时把切片第二个参数当成「终点」写（`data.ptr[pos: nl]`，而 uya 的 `p[a: b]` 是
+「偏移 + 长度」）—— 每行的 `view.len` 约等于真实行长 + pos，`sess_has_cstr` 于是往后读过本行：
+小日志只是**静默越过本行**做匹配（最后一条 `session/workspace` 会被错过），大日志
+（data 缓冲经 `realloc` 走 mmap）读到映射尾就 **SIGSEGV**（真机 913690 字节的会话一
+`/resume` 必崩，`rc=139`）；顺手把列表的展示序翻过来，**最新的排最后一行**（紧挨输入行）。
+版本串 `p35-sess`，见 §2「会话持久化与恢复（P4）」与 §3 踩坑 54；
+**P34 是「工作区」**：工作区从「启动时定一次」变成**当前会话的状态** ——
 模型能用 `workspace` 工具报告/切换、人能敲 `/workspace [目录]`、每次切换都记进会话日志
 （`session/workspace`）与索引，恢复会话时**跟着会话记录落位**（显式 `--workspace` 优先，
 记录的工作区被删就留在当前目录并留话），`/diff` 的标题与文本头写的就是这个工作区 ——
 版本串 `p34-ws`，它和并行线的 `p31-wait` / `p32-scroll` / `p33-sess` 撞号，
 按「后到的顺延」记成 **P34**，见 §2「工作区（P34）」与 §3 踩坑 52/53；
 **P33 是 `/sessions` 列表这条线**：三列 = 标题 / 工作区 / session id、
-按 `lastActiveAt` 倒序、列宽随终端自适应、同 id 只留最后一条索引记录，版本串 `p33-sess`
+按 `lastActiveAt` 排序（P35 起展示序是「最新的在最后一行」）、列宽随终端自适应、
+同 id 只留最后一条索引记录，版本串 `p33-sess`
 （它和并行线的 `p31-wait` / `p32-scroll` 前后脚撞号，按「后到的顺延」记成 P33），
 见 §2「会话持久化与恢复（P4）」与 §3 踩坑 50/51；**P32 是「工作区里的转录真的能翻看」**：TUI 进入时开鼠标上报
 （`ESC[?1000h/1006h`）把滚轮从「被 xterm.js 伪装的 ↑/↓」救回来、`ctrl+home/end`
@@ -182,8 +190,9 @@ make e2e-permission # 访问模式的四级来源 + 非法值报错（离线）
 make e2e-sandbox    # 沙箱后端探测 / --no-sandbox / 显式 bwrap 路径（离线）
 make e2e-tasks      # /tasks 报告头 / 空态串 / open|toggle|非法参数 / /help（离线）
 make e2e-goal       # /goal 用法 / 创建 / 拒绝顶掉 / edit / pause·resume / clear / /help（离线）
-make e2e-sessions   # /sessions 三列 / 时间倒序 / 同 id 取最后一条 / id 完整（离线）
-make sess-selftest  # 只跑 /sessions 那两轮（纯函数排版 + TUI 浮层），改会话列表时最快
+make e2e-sessions   # /sessions 三列 / 最新的在最后一行 / 同 id 取最后一条 / id 完整（离线）
+make e2e-resume-big # ~3 MiB 会话日志 --resume 不段错误 + 最后一条 workspace 取到（离线）
+make sess-selftest  # 只跑 /sessions / 大日志 meta 那三轮（纯函数排版 + TUI 浮层），改会话列表时最快
 make probe        # 传输层探针：打真实 https 端点，期望 HTTP 401（不需要 key）
 ```
 
@@ -772,9 +781,13 @@ Messages API（`x-api-key` + `anthropic-version: 2023-06-01`，服务端工具 `
   见踩坑 27 的后半段）。
 * 入口：`--continue`（当前目录最近一条）、`--resume <id|last>`、`--list-sessions`、`--no-save`；
   REPL 里 `/sessions`、`/resume <id>`、`/new`。
-* **会话列表（P33）**：`/sessions`（浮层）、滚动模式的 `/sessions`、`--list-sessions` 打印的是
-  **同一份**三列表 —— **① 标题 ② 工作区 ③ session id**：
-  * 顺序按 `lastActiveAt` **倒序**（最新的在第一行；缺这个字段的记录排最后），回车即恢复最新那条；
+* **会话列表（P33，P35 改了展示序）**：`/sessions`（浮层）、滚动模式的 `/sessions`、
+  `--list-sessions` 打印的是**同一份**三列表 —— **① 标题 ② 工作区 ③ session id**：
+  * 顺序按 `lastActiveAt` 排：**P35 起最新的排在最后一行**（紧挨输入行/提示符，人眼先落在
+    最近用的那个会话上），最旧的回到第一行，缺这个字段的记录排最前面。
+    浮层里**默认游标就落在最后一项（最新那条）**上，所以「打开就回车」恢复的仍是最新的会话
+    （`tui_overlay_sel_set` 把游标钉过去，见踩坑 54）；数据层 `sess_index_rows_sorted` 的契约
+    不变（第 0 行 = 最新），翻转只发生在排版这一步（`sess_rows_render(..., newest_last)`）；
   * 索引是追加写的（每关一次会话追加一条），同一个 id 会有多行 —— 列表按索引自己的契约
     「同 id 取最后一条」去重，所以同一个会话只出现一次（2026-10-03 真机 `index.jsonl`
     实测 332 行 / 322 个会话，其中一个 id 出现 4 次；这个文件一直在长，每跑一次会话就多几行）；
@@ -865,7 +878,7 @@ TTY 交互模式**默认全屏**（`--no-tui` 退回上一节的滚动转录；�
 
   ▌ ↑ Ask anything... "把 hello.uya 的问候语改成 Hello, DSH!"
   ▌ Build   Full access   deepseek-chat   deepseek  tab plan   ctrl+p commands
-  ~/uya-agent:main                                                                 p33-sess
+  ~/uya-agent:main                                                                 p35-sess
 ```
 
 对话态（`--tui-demo` 打印的就是这几屏的纯文本快照）：
@@ -989,8 +1002,9 @@ plan 审阅浮窗（`--tui-demo` 的**第 ⑤ 屏**，任务块那两帧是 ④a
   `ctrl+u/w/k` 清行/删词/删到行尾 ·
   `ctrl+a/e`、`←/→`、`home/end`、`backspace/del` 按**字符**编辑 · `ctrl+l` 强制重绘 ·
   括起粘贴（`ESC[200~`）整段插入不触发提交（> 64 KiB 截断）。
-* **浮层**：命令面板、会话列表（三列 = 标题 / 工作区 / session id，按时间倒序、列宽随终端自适应，
-  回车把选中的会话 `/resume` 回来 —— 见 §2「会话持久化与恢复（P4）」的 P33 那条）、帮助（`/help`）、`/status` 详情、
+* **浮层**：命令面板、会话列表（三列 = 标题 / 工作区 / session id，P35 起**最新的在最后一行**、
+  默认游标就在它上面，列宽随终端自适应，
+  回车把选中的会话 `/resume` 回来 —— 见 §2「会话持久化与恢复（P4）」的 P33/P35 那两条）、帮助（`/help`）、`/status` 详情、
   **`/goal` 会话目标**（P29：纯查看型，正文就是 `goal_cmd_run` 的输出 —— 状态块或用法）、
   **访问模式选择器与 Full access 确认**（P21，底对齐，贴着输入面板往上弹）、
   **read-only 下 bash 的逐条批准**（P21：↑/↓ + enter，esc = 无回答）、
@@ -1168,7 +1182,7 @@ CPU、`内存` 同一批进程的内存合计），右边是**整会话统计行
 120 列：~/uya-a… · ctx 21% · cpu 37% · 内存 312M 1 轮 · 12 步 | LLM 50.7s · 工具调用 4.1s | 首 token 平均 1.5s · 221 tok/s…
 100 列：~/uya-agent:main · ctx 21% · cpu 37% · 内存 312M   1 轮 · 12 步 | LLM 50.7s · 工具调用 4.1s…
  80 列：~/uya-agent:main · ctx 21% · cpu 37% · 内存 312M   1 轮 · 12 步…     ← 内存占 12 列之后，
- 60 列：~/uya-agent:ma… · ctx 21% · cpu 37% · 内存 312M  p32-scroll            统计行在 80 列就只剩
+ 60 列：~/uya-agent:ma… · ctx 21% · cpu 37% · 内存 312M  p35-sess            统计行在 80 列就只剩
  40 列：ctx 21% · cpu 37% · 内存 312M                                       第一组了；版本号那两行是
  32 列：ctx 21% · cpu 37%                                                   右半区整条让位的形态
 ```
@@ -2321,9 +2335,9 @@ vLLM 等 OpenAI 兼容端点都一样稳。想升级成严格 `tool` 角色消�
     * **索引是追加写的，同一个 id 一定会有多条**。`index.jsonl` 每关一次会话就追加一条，
       「同一个会话列两次」是默认行为；列表侧必须按索引自己的契约「同 id 取最后一条」去重
       （真机索引实测 308 行 / 298 个会话，其中一个 id 出现 4 次）。不去重的话
-      「最新的排第一」里会连续出现同一会话的副本，看起来就像列表坏了。
-    验收：`sess-list` 轮（纯函数：去重 / 倒序 / 三档列宽 / 控制字节清洗 / id 完整）、
-    `tui-sessions` 轮（浮层宽箱体 + 方框闭合 + 回车取完整 id + `sess_find` 找得到）、
+      「最新的那一行」里会连续出现同一会话的副本，看起来就像列表坏了。
+    验收：`sess-list` 轮（纯函数：去重 / 展示序 / 三档列宽 / 控制字节清洗 / id 完整）、
+    `tui-sessions` 轮（浮层宽箱体 + 方框闭合 + 默认游标在最新那条 + 回车取完整 id + `sess_find` 找得到）、
     `make e2e-sessions`（真二进制，管道喂 REPL）。
 
 51. **uya 0.10 的 `p[a: b]` 是「从 a 起 b 个字节」，不是「到 b 为止」。**（P33 实测）
@@ -2359,6 +2373,39 @@ vLLM 等 OpenAI 兼容端点都一样稳。想升级成严格 `tool` 角色消�
     * 「模型已知的工作区」快照每次比都不相等 ⇒ **每个 step 都补推一份运行时上下文**。
     两处都在自测里当场暴露（`ws-tool` / `tui-ws` 轮），改法：Buf 对 Buf 一律
     `a.len == b.len && bufx_mem_eq(...)`（自测里也封了个 `wst_eq`）。
+
+54. **`p[a: b]` 第二次咬人：把第二个参数当「终点」写 —— 小日志静默漂移，大日志直接 SIGSEGV**（P35，
+    用户报的「恢复会话段错误」）。`sess_read_meta` 逐行取行时写了
+    ```uya
+    const view: &[byte] = data.ptr[pos: nl];   // 想表达「第 pos 行」
+    ```
+    而 uya 的 `p[a: b]` 是「偏移 + 长度」（踩坑 51）：第二个数是 `nl`（**绝对行尾偏移**），
+    于是每行拿到的 `view.len ≈ 真实行长 + pos`。该 `view` 只用来做一次
+    `sess_has_cstr(view, "\"type\":\"session/workspace\"")` 子串扫描，扫不过就继续往后读：
+    * **小日志**：只是**静默越过本行**去做匹配 —— 不报错、不崩，但「最后一条
+      `session/workspace`」可能被错过（`/sessions` 的工作区列、`ls`-式的当前工作区 URL
+      于是取到漂移的值，或者干脆退回当前目录）；
+    * **大日志**：`data` Buf 的 cap 到 1–2 MiB 时 `realloc` 走 mmap，读到映射尾就 **SIGSEGV**。
+      真机现场：`~/.uya-agent` 里 6 个会话一 `/resume` 必崩（`rc=139`），其中
+      `session-e59e9165…` 913690 字节 —— gdb 崩溃点 `si_addr` 恰好是 `data` 映射的**末尾页**，
+      `find_sub` 收到的 `hay.len=523646`（真实行长远小于它）；valgrind 同一条栈上报
+      `Invalid read of size 1 … 0 bytes after a block of size 1,048,576 alloc'd (bufx_buf_reserve)`。
+    修法：`data.ptr[pos: nl - pos]`（与厂内既有的 `yamlcfg` / `httpc` 那几处正确的
+    「偏移 + 长度」写法一致）。**为什么只有这一处中招**：全仓非 0 起点的切片只有 6 处，
+    另外 5 处本来就写的是「偏移 + 长度」或长度（见踩坑 51 末尾的清单）——
+    这正是这个坑最阴的地方：`[0: n]` 两种语义一样，所以写错也不会当场红。
+    **验收**（两条腿，都能在未修版本上复现）：
+    * `sess-meta-big` 轮（自测，~3 MiB 手写日志）：断言 header 的 id / 创建时 cwd 取到、
+      **最后一条** `session/workspace` 取到（不是 early）、末尾那条没有换行的**残行被丢弃**。
+      未修版本在这条 fixture 上稳定 `rc=139`（实测 3/3）；1 MiB 时越界窗口恰好还能落在
+      同一个 mmap 里、侥幸不崩，所以 fixture 有意做到 3 MiB。
+    * `make e2e-resume-big`（真二进制）：同一份日志 `--resume --dry-run`，退出码必须 0
+      且打得出 `[dry-run]`、工作区是 `…/final`（未修版本这里 139）。
+    **同批的展示序改动**：`--list-sessions` / `/sessions` 改成**最新的排最后一行**
+    （紧挨输入行）。数据层 `sess_index_rows_sorted` 的契约（第 0 行 = 最新）**不动**，
+    只在排版 `sess_rows_render(..., newest_last)` 里倒着取行；浮层那边默认游标必须跟着
+    落到最后一项（`tui_overlay_sel_set`），否则「打开就回车」恢复的会是最旧的会话 ——
+    这正是「顺序翻转」最容易漏掉的一半：**行序对了，选中项口径没跟着改**（与踩坑 50 同类）。
 
 ---
 
@@ -2478,6 +2525,7 @@ agent 循环并逐项断言：
 | `tui-diff` | **`/diff` 浮窗（P28）**：假数据注入后逐项断言 —— 圆角框与标题（`/diff · <仓库> · <文件> · +A -D`）、左列表的 `▸` 选中标记与三个文件、右工作区的 `旧 · HEAD` / `新 · 工作区` 两栏列头、**同一行里同时出现旧文本与新文本**（真并排，不是上下拼）、`@@` 说明行跨两栏；**竖线逐行同列**（两栏行 4 根：左右边框 + 列表缝 + 中缝；跨栏说明行 3 根，且落在同样的列上）；`↓` 换文件后 `▸` 跟着走、`→` 之后每栏补 `‹`、`←` 退回 0、`pgdn/pgup` 翻页与夹取、`r` 失败也**不许丢内容**、`esc`/`q` 关闭走「取消」语义；**运行中开浮窗状态区照样在**（浮层重画转录区之后必须把 P18 的状态区补回来，且整帧行数不变）；40×10 判「画不下」→ 不开浮窗（不许看不见还吞键）；agent 层三条「开不了」都要留下可见的话（不是 git 仓库 → git 的原话、空仓库 → `(没有 git 修改)`、终端太小 → 提示，且三条都**不许**开浮窗）；路径里带 ESC/NUL 时列表与标题都要清洗（帧里一个 NUL/ESC 都不许有 —— P27 第一版就把 fixture 标签的 NUL 画进了标题）；TAB/ESC 序列/汉字不破版（`␛` + 合法 UTF-8）；最后**真 PTY** 里敲 `/diff` → 真跑 git → 屏幕上出现列表与两栏 diff → `↓` 重载 → `esc` → 再敲 `/workspace <绝对路径>`（带参数的命令与 `/goal pause` 同一条路：面板里匹配不上 → 回车把整行还回输入行 → 再回车派发）→ 屏幕与脚注出现新工作区、转录里留下 `工作区 → …` 通知 → `ctrl-d` 退出码 0；**收尾要把画布与任务面板的行预算还原**（`tui_build_chat` 每帧都会 `tasks_set_row_budget`，本轮的 40×10 子段会把预算压到 1~2 行，不还原就会串到后面 `tasks-scroll` 那一轮 —— 测试之间靠全局状态串味的老坑） |
 | `diff-parse` | **unified diff → 行表**（P27，纯函数、不碰 git）：`@@` 头与行号解析；上下文两侧同行号；**2 删 3 增 → 2 个 MIX（左删右增）+ 1 个落单 ADD**（两侧 off/len 与文本逐字节）；纯插入 / 纯删除；多 hunk（两个说明行）；`\ No newline at end of file` 落成说明行；CRLF 的 `\r` 不许带进单元格（否则显示成 `·`）；TAB 原样保留（清洗是渲染层的事）；`Binary files … differ` 只留一行说明；mode-only（无 hunk）→ 0 行 + 说明；非 diff 文本（git 报错）整段落成一行说明（宁可看得见，也不给空面板）；空输入 → 0 行；**配对溢出**（> 4096 行的块）放弃配对但**一行不丢、顺序不乱** |
 | `ws-resolve` | **恢复会话时「这个会话在哪」的判定（P34）**：手写一份会话日志（header 的 `cwd` = A + 两条 `session/workspace`（C → B）），断言 `sess_read_meta` 取到 id / 创建时工作区（A）/ **最后一条**的工作区（B）；`agent_session_workspace_pick` 在「记录存在」时把工作区切到 B 且来源记成 `session`、`cfg.resume_ws` 记下「会话在哪」；`--workspace`/env 显式指定过就不切；记录的工作区不存在时**报 fallback 且留在当前工作区**；切到同一个目录返回 `WS_E_SAME`（幂等）；相对路径按**当前**工作区解析并落成绝对路径。收尾把进程 cwd 还原（切换是真的 `chdir`，别的轮次都假定 cwd = 仓库根） |
+| `sess-meta-big` | **大日志上的 `sess_read_meta`（P35，段错误回归）**：手写一份 ~3 MiB 的会话日志（header + 早的一条 `session/workspace` + 上千条大 payload 填充行 + **最后一条** `session/workspace` + 一条**没有换行**的残行），断言 `sess_read_meta` 取到 header 的 id / 创建时 `cwd`、**最后一条** `session/workspace`（不是 early —— 越界窗口要把后半段的匹配吃到，这条就会红），并断言 `sess_reader_load`+`sess_next` 能逐行走完、末尾残行被标成 `dropped_tail` 丢弃且 reader 的「最后一条 workspace」不是残行里的 `…/TRUNC`。未修版本在这条 fixture 上稳定 `rc=139`（实测 3/3；1 MiB 时越界窗口恰好还落在同一个 mmap 里、侥幸不崩，所以 fixture 有意做到 3 MiB） |
 | `ws-tool` | **workspace 工具与它的记录（P34）**：无参 = 报告当前工作区 + 来源 + 会话 id；不存在的目录 / 文件（不是目录）两种失败都要有话说且**状态一个字节不变**；相对路径真切换 → `cfg.workspace` 落到绝对路径、`ws_src` 变 `runtime`、结果里有 `switched workspace`；**会话日志**里最后一条 `session/workspace` = 新工作区、header 的创建时工作区**没被改写**，**索引**里同 id 最后一条 `cwd` = 新工作区（`/sessions` 的工作区列吃它）；重复切同一个目录走幂等分支；`/diff` 的文本头里写的是**工作区短路径**（`$HOME` → `~`，与 `gd_ws_short_into` 同一条规则，用例自己按同一规则拼期望值）；本机没有 git 时那一段打 `skip`（不假绿） |
 | `diff-git` | **/diff 的真 git 端到端**（P27，离线；fixture 仓用被测的 `gitx_run` 自己建）：`gd_open` 出 3 个文件且带 git 的 XY 码（` M` / `??` / ` D`）与 numstat 计数（`(+1 -1)` / `(new)` / `(+0 -2)`）；改一行的文件左右两栏文本与行号逐字节正确；未跟踪文件整份都是新增（左侧空）；删除的文件整行都在左侧；`↓/↑` 换文件与两端夹取；`gd_refresh` 之后能看到新内容（`r` 键那条路）；滚动/横向滚夹取；`gd_print_text` 的单列回退含 `[diff]` 头、文件数、列表行与两侧内容；非仓库目录 `gd_open < 0` 且文案非空；本机没有 git 时打 `skip`（不假绿） |
 | `tui-approve` | read-only 下 bash 逐条批准，两种形态：① headless（注入的键在浮层打开前就被输入行吃了）= 没人回答 → **fail closed**，转录出现逐字拒绝串、命令 stdout 不出现、且不是「没有回答渠道」那条；② **真 PTY**：等 `Read Only：批准这条 bash 命令？` 画出来再送 `↑`+回车 → 命令真的跑（stdout 进转录与下一封请求）、退出码 0 |
@@ -2563,9 +2611,10 @@ contextWindow/maxTokens/input image/reasoningEffort/`permission.defaultPreset`�
 `/tasks open` / `toggle` 的回显、`/tasks bogus` 报 `未知参数 "bogus"`、`/help` 里能查到 `/tasks` |
 | `goal-cmd` | 会话目标人类命令（P29）纯函数轮：空态裸 `/goal` 报「当前没有目标」+ 用法（**返回 0** —— 看状态不会失败）、缺目标时 `pause`/`resume`/`edit` 各自点出是谁缺目标、裸 `edit` 与 `edit` + 纯空白都报「需要替换内容」且**不落盘**、创建后状态块四段（`Status: active` / `Objective: …` / `Rounds: 0/20` / `Activation: armed`）与盘上字段（id/revision/round/phase/objective）逐条对齐、重复创建被拒**且没改盘上 objective**、`edit` 只换 objective（revision 2、phase/armed 不动）、`pause` 关 armed、`resume` 打开、`clear` 删文件且**幂等**（再 clear 报「没得清」）、`pause after verification` 按**字面目标**创建（控制词只在独占整行时才是控制词）、`clearx` 不被当成 `clear`、大写 `CLEAR` 照样命中、`complete` 的目标让位（创建与 `edit` 都换新身份：id +1 / revision 回 1 / 0 轮 / armed）、输出必须以换行收尾 |
 | `goal-e2e` | `make e2e-goal`（离线，管道喂真 REPL + 独立 `UYA_AGENT_HOME`）：空态用法、创建、`Rounds: 0/20`、拒绝顶掉、`Goal updated` + 新 objective、`Status: paused` + `Activation: disarmed`、`Goal resumed`、`Goal cleared.`、重复 clear 幂等、字面目标规则、`/help` 里能查到 `/goal` |
-| `sess-list` | **/sessions 列表（P33）纯函数轮**：索引 fixture 用真写入端（`sess_open`/`sess_close`）之外的手写索引造出「同 id 两条 + 时间戳乱序 + 缺 `lastActiveAt` + 空标题 + 带控制字节（TAB / `\u0001`）的标题」；断言去重后行数 = 唯一 id 数、重复 id 取的是**最后一条**（被取代那条的标题不许出现）、顺序严格按 `lastActiveAt` 降序且缺字段的排最后；再按 8 档可用列数（198/78/60/59/52/51/44/40）逐行断言 —— 行宽 ≤ 可用列数（只有「连 id 都放不下」那一档允许超宽，因为那份 id 必须完整）、标题列与工作区列的可见性随退化阶梯变化（三列 → 两列丢工作区 → 只剩 id）、每行喂 `agent_tui_sessions_head` 都还得出**完整 id**、正文里一个控制字节都没有；最后验滚动模式的 `sess_rows_clip_into`：窄到 21 列时每行 ≤ 21 且补 `…`，而本来放得下的宽度**一个 `…` 都不许加**（'…' 预算算错会把好端端的 id 截掉 —— 实测踩过） |
-| `tui-sessions` | **/sessions 浮层（P33）**：fixture 是三个**真落盘**的会话（`sess_open`/`sess_close`，标题由测试给），`/sessions` 开浮层后断言 kind/标题、100 列下箱体铺开（顶边右边界列 = 97，即宽 `cols-6` + 左边距 3）、方框闭合成矩形（`tui-frame` 那套量法）、三列都可见、**最新那条的标题行在最早那条之上**（`tuis_find_row` 行号比较）；回车 → 选中项里的 id = 最新会话的**完整 id**（不是标题）→ `sess_find` 找得到（`/resume` 走的就是它）；再跑 60 列那一档：工作区列消失、id 列还在，且条目文本里的 id 仍然完整 |
-| `sessions-e2e` | `make e2e-sessions`（离线，管道喂真 REPL + 独立 `--agent-home`）：手写索引里三条记录（旧 / 空标题 / 旧 id 的第二次记录），断言输出里最新会话在最上（`grep -n` 比行号）、被取代的旧记录不出现、同一个 id 只出现 1 次、空标题落到 `(无标题)`、`/w/new-a` 与完整 id 排成「工作区在前、id 在行尾」（正则收尾匹配） |
+| `sess-list` | **/sessions 列表（P33，展示序 P35）纯函数轮**：索引 fixture 用真写入端（`sess_open`/`sess_close`）之外的手写索引造出「同 id 两条 + 时间戳乱序 + 缺 `lastActiveAt` + 空标题 + 带控制字节（TAB / `\u0001`）的标题」；断言去重后行数 = 唯一 id 数、重复 id 取的是**最后一条**（被取代那条的标题不许出现）、数据层严格按 `lastActiveAt` 降序且缺字段的排最后，**渲染出来的行序是它的镜像**（最新的在最后一行、缺时间戳的在第一行 —— 只比「出现在最后一行」还不够，要把那一行的行尾 token 取出来比 id）；再按 8 档可用列数（198/78/60/59/52/51/44/40）逐行断言 —— 行宽 ≤ 可用列数（只有「连 id 都放不下」那一档允许超宽，因为那份 id 必须完整）、标题列与工作区列的可见性随退化阶梯变化（三列 → 两列丢工作区 → 只剩 id）、每行喂 `agent_tui_sessions_head` 都还得出**完整 id**、正文里一个控制字节都没有；最后验滚动模式的 `sess_rows_clip_into`：窄到 21 列时每行 ≤ 21 且补 `…`，而本来放得下的宽度**一个 `…` 都不许加**（'…' 预算算错会把好端端的 id 截掉 —— 实测踩过） |
+| `tui-sessions` | **/sessions 浮层（P33）**：fixture 是三个**真落盘**的会话（`sess_open`/`sess_close`，标题由测试给），`/sessions` 开浮层后断言 kind/标题、100 列下箱体铺开（顶边右边界列 = 97，即宽 `cols-6` + 左边距 3）、方框闭合成矩形（`tui-frame` 那套量法）、三列都可见、**最新那条的标题行在最早那条之下**（P35：最新的在最后一行，`tuis_find_row` 行号比较）、**默认游标就在最后一项**（`tui_overlay_sel_index() == 2` —— 否则「打开就回车」恢复的是最旧的会话）；回车 → 选中项里的 id = 最新会话的**完整 id**（不是标题）→ `sess_find` 找得到（`/resume` 走的就是它）；再跑 60 列那一档：工作区列消失、id 列还在，且条目文本里的 id 仍然完整 |
+| `sessions-e2e` | `make e2e-sessions`（离线，管道喂真 REPL + 独立 `--agent-home`）：手写索引里三条记录（旧 / 空标题 / 旧 id 的第二次记录），断言输出里最新会话在最上（`grep -n` 比行号）、被取代的旧记录不出现、同一个 id 只出现 1 次、空标题落到 `(无标题)`、`/w/new-a` 与完整 id 排成「工作区在前、id 在行尾」（正则收尾匹配）；**P35**：最新会话在**最后一行**（`grep -n` 比行号反过来）、最后一行的 id 就是 `lastActiveAt` 最大的那条、第一行是最旧那条 |
+| `resume-big-e2e` | `make e2e-resume-big`（离线，真二进制 + `testdata/make_big_session.py`）：造一份 ~3 MiB 的会话日志（末尾带一条没有换行的残行）后 `--resume --dry-run` —— 退出码必须 **0**（未修版本这里稳定 139）、打得出 `[dry-run]`、恢复出来的工作区是日志里**最后一条** `session/workspace` |
 | `diff-render` | 纯函数逐字节断言 diff：新旧一样 → 空（且**不输出上下文**）、只差结尾换行 → 空、
 中间一行改动 → 前后各 2 行上下文 + `-`/`+`、新文件 → 全 `+`、两侧 >60 行 → 只给精确汇总、
 60 行编辑脚本 → 头截断成 24 行 + `… (省略 36 行)`、增删计数、按显示列截断（汉字 2 列） |
@@ -3110,6 +3159,32 @@ mock 上逐字段验收。换一台 `openai-responses` 网关可用时，零参�
   * `make check / build / codegen-audit / selftest` 全绿（`selftest` 现在多跑 `e2e-ws`，
     以及 `--selftest` 里的 `ws-resolve` / `ws-tool` / `tui-ws` 三轮 + `tui-diff` 的 PTY 新段）；
     `make tui-demo` 与本节引用的快照一致（假数据不注入工作区，排版一个字节没碰）。
+
+* **P35 的验收记录（2026-10-03，`p35-sess`，对应踩坑 54）**：
+  * **现场证据**（本机真会话，不是构造出来的）：`~/.uya-agent/sessions/---home-winger-uya-agent--/`
+    下 6 个会话一 `/resume` 必崩（`rc=139`）；逐个复现后 gdb 的栈固定是
+    `bufx_find_sub ← sess_has_cstr ← session_sess_read_meta ← agent_session_open ← /resume`。
+    以 `session-e59e9165…`（913690 字节）为例：崩溃点 `si_addr` 恰好是 `sess_read_meta` 里
+    那份 `data` Buf 映射的**末尾页**，`find_sub` 收到的 `hay.len=523646`（真实行长远小于它）；
+    valgrind 同一条栈上报 `Invalid read of size 1 … 0 bytes after a block of size 1,048,576
+    alloc'd (bufx_buf_reserve)` —— 根因就是踩坑 54 那条 `data.ptr[pos: nl]`。
+  * **为什么以前没露头**：小日志时它只是**静默越过本行**做匹配（不崩、不报错），
+    所以「最后一条 `session/workspace`」可能取到漂移值；只有文件大到 `realloc` 走 mmap 才崩。
+    1 MiB 时越界窗口恰好还能落在同一个 mapping 里、侥幸不崩，3 MiB 稳定崩 ——
+    回归 fixture 因此定在 ~3 MiB。
+  * **修完的同一场景**：那 6 个会话 `--resume --dry-run` 全部 `rc=0`；`make e2e-resume-big`
+    每次跑一遍（未修版本 139，修好 0）。
+  * **展示序翻过来之后**：`--list-sessions` 的 409 行与「独立重算索引（同 id 取最后一条 +
+    `lastActiveAt` 降序）的**逆序**」逐行比对完全一致（最新在最后一行、缺时间戳的在第一行）；
+    真机只读复验用的是复制出来的 home（一个字节都没写回真索引）。
+  * **离线回归轮**（进 `make selftest`）：新增 `sess-meta-big`（~3 MiB 日志 + 残行丢弃）；
+    `sess-list` / `tui-sessions` 的期望按展示序翻转（`sess-list` 比的是镜像、
+    `tui-sessions` 断言「最新的行号更大」+「默认游标 = 最后一项」）；
+    `make e2e-sessions` 的 `n_new < n_old` 反过来并加「最后一行的 id 必须是 `lastActiveAt`
+    最大的那条、第一行是最旧那条」两条断言。
+  * **未修版本的对照实验**：把生成出来的 `session.c` 那一行改回 `.len = (nl)` 重编，
+    `e2e-resume-big` 与 `sess-meta-big` 都立刻失败（前者 139、后者直接崩）——
+    两条腿都真的抓得到这个缺陷，不是「恰好绿」。
 
 ---
 

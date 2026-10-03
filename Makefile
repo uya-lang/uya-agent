@@ -9,6 +9,8 @@
 #   make e2e-ws     # 工作区：恢复时跟随会话记录 + 日志不改挂 + 显式优先 + 记录目录被删（离线）
 #   make e2e-tasks  # /tasks：报告头 / 空态串 / open / toggle / 非法参数（离线）
 #   make e2e-goal   # /goal：看状态 / 创建 / 拒绝顶掉 / edit / pause / resume / clear（离线）
+#   make e2e-sessions  # /sessions 三列 / 最新的在最后一行 / 同 id 取最后一条 / id 完整（离线）
+#   make e2e-resume-big # ~3 MiB 会话日志 --resume 不段错误 + 最后一条 workspace 取到（离线）
 #   make e2e TASK="..." PIN=<leaf sha256> [STEPS=N]   # 真实调用（需要 DEEPSEEK_API_KEY；STEPS 不给就不限步数）
 #   make e2e-steps  # 步数默认值回归（离线，不联网）
 #   make clean
@@ -29,7 +31,7 @@ TASK ?= 创建 hello.uya，编译并运行它
 export UYA_ROOT
 export UYA_SPLIT_C_DIR := $(CURDIR)/build/uyacache
 
-.PHONY: all check build selftest codegen-audit probe e2e e2e-config e2e-config-flags e2e-title e2e-api e2e-steps e2e-permission e2e-sandbox e2e-tasks e2e-goal e2e-sessions e2e-diff e2e-ws e2e-dsh p30-check tui-demo tui-selftest sess-selftest diff-selftest clean
+.PHONY: all check build selftest codegen-audit probe e2e e2e-config e2e-config-flags e2e-title e2e-api e2e-steps e2e-permission e2e-sandbox e2e-tasks e2e-goal e2e-sessions e2e-resume-big e2e-diff e2e-ws e2e-dsh p30-check tui-demo tui-selftest sess-selftest diff-selftest clean
 
 all: build
 
@@ -54,7 +56,7 @@ codegen-audit: build
 	fi; \
 	echo "codegen-audit: 通过（没有切片描述符强转）"
 
-selftest: build codegen-audit e2e-config-flags e2e-title e2e-api e2e-steps e2e-permission e2e-sandbox e2e-tasks e2e-goal e2e-sessions e2e-diff e2e-ws p30-check
+selftest: build codegen-audit e2e-config-flags e2e-title e2e-api e2e-steps e2e-permission e2e-sandbox e2e-tasks e2e-goal e2e-sessions e2e-resume-big e2e-diff e2e-ws p30-check
 	UYA_BIN=$(UYA) $(OUT) --selftest
 
 probe: build
@@ -363,16 +365,18 @@ e2e-dsh: build
 p30-check: build
 	@python3 testdata/pty_drive.py --suite
 
-# P33：/sessions 列表（离线，行式 REPL 走真二进制）：三列 = 标题 / 工作区 / session id，
-# 按 lastActiveAt 倒序、同 id 只留最后一条。TUI 浮层那条腿（宽箱体 / 逐行宽度不变量 /
-# 选中项取完整 id）在 selftest 的 tui-sessions 轮里断言。
+# P33/P35：/sessions 列表（离线，行式 REPL 走真二进制）：三列 = 标题 / 工作区 / session id，
+# 同 id 只留最后一条；**P35 起最新的排最后一行**（`--list-sessions` 与 `/sessions` 同一份）。
+# TUI 浮层那条腿（宽箱体 / 逐行宽度不变量 / 默认游标落在最新那条 / 选中项取完整 id）
+# 在 selftest 的 tui-sessions 轮里断言。
 e2e-sessions: build
 	@set -e; \
 	home=build/selftest_sess_e2e; rm -rf $$home; mkdir -p $$home; \
 	ida=session-aaaa1111-1111-4111-8111-111111111111; \
+	idb=session-cccc3333-3333-4333-8333-333333333333; \
 	{ \
 	  printf '%s\n' "{\"id\":\"$$ida\",\"cwd\":\"/w/old-a\",\"lastActiveAt\":1000,\"title\":\"OLDTITLE-旧会话第一次记录\",\"model\":\"m\",\"delegationDepth\":0,\"turns\":0,\"events\":0,\"path\":\"/x\"}"; \
-	  printf '%s\n' '{"id":"session-cccc3333-3333-4333-8333-333333333333","cwd":"/w/none","lastActiveAt":7000,"title":"","model":"m","delegationDepth":0,"turns":0,"events":0,"path":"/x"}'; \
+	  printf '%s\n' "{\"id\":\"$$idb\",\"cwd\":\"/w/none\",\"lastActiveAt\":7000,\"title\":\"\",\"model\":\"m\",\"delegationDepth\":0,\"turns\":0,\"events\":0,\"path\":\"/x\"}"; \
 	  printf '%s\n' "{\"id\":\"$$ida\",\"cwd\":\"/w/new-a\",\"lastActiveAt\":9000,\"title\":\"NEWTITLE-最新会话第二次记录\",\"model\":\"m\",\"delegationDepth\":0,\"turns\":0,\"events\":0,\"path\":\"/x\"}"; \
 	} > $$home/index.jsonl; \
 	out=$$(printf '/sessions\n/exit\n' | $(OUT) --no-dsh-config --no-tui --quiet --api-key dummy-key --agent-home $$home 2>&1); \
@@ -386,11 +390,40 @@ e2e-sessions: build
 		|| { echo "FAIL: 空标题没有落到占位串上"; echo "$$out"; exit 1; }; \
 	echo "$$out" | grep -qE "/w/new-a +session-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$$" \
 		|| { echo "FAIL: 工作区列与完整 session id 没有排成「工作区在前、id 在行尾」"; echo "$$out"; exit 1; }; \
+	echo "$$out" | grep -q "session-" || { echo "FAIL: 列表里一个会话都没有"; echo "$$out"; exit 1; }; \
 	n_new=$$(echo "$$out" | grep -n "NEWTITLE" | head -1 | cut -d: -f1); \
 	n_old=$$(echo "$$out" | grep -n "(无标题)" | head -1 | cut -d: -f1); \
-	[ -n "$$n_new" ] && [ -n "$$n_old" ] && [ "$$n_new" -lt "$$n_old" ] \
-		|| { echo "FAIL: 不是时间倒序（最新的必须在上面）"; echo "$$out"; exit 1; }; \
-	echo "e2e-sessions: 通过（三列 / 时间倒序 / 同 id 取最后一条 / 空标题占位 / id 完整）"
+	[ -n "$$n_new" ] && [ -n "$$n_old" ] && [ "$$n_new" -gt "$$n_old" ] \
+		|| { echo "FAIL: 最新的没有排在最后一行（P35 的展示序）"; echo "$$out"; exit 1; }; \
+	last_id=$$(echo "$$out" | grep "session-" | tail -1 | sed 's/.*\(session-[0-9a-f-]*\).*/\1/'); \
+	[ "$$last_id" = "$$ida" ] \
+		|| { echo "FAIL: 最后一行不是 lastActiveAt 最大的那条（实际 $$last_id）"; echo "$$out"; exit 1; }; \
+	first_id=$$(echo "$$out" | grep "session-" | head -1 | sed 's/.*\(session-[0-9a-f-]*\).*/\1/'); \
+	[ "$$first_id" = "$$idb" ] \
+		|| { echo "FAIL: 第一行不是最旧的那条（缺 lastActiveAt 的 cccc 应当垫底/在最上）"; echo "$$out"; exit 1; }; \
+	echo "e2e-sessions: 通过（三列 / 最新的在最后一行 / 同 id 取最后一条 / 空标题占位 / id 完整）"
+
+# P35：恢复会话段错误回归（离线，真二进制）：造一份 ~3 MiB 的会话日志，末尾再补一条
+# **没有换行**的残行，然后 --resume --dry-run。未修版本在这里稳定 SIGSEGV（退出码 139），
+# 修好后必须 0 且打得出 [dry-run]（语义侧那条断言在 selftest 的 sess-meta-big 轮里）。
+# 3 MiB 是有意的：1 MiB 时越界窗口恰好还能落在同一个 mmap 里、侥幸不崩（实测），
+# 而 3 MiB 稳定崩 —— 这样这条 e2e 才真的能抓到 139。
+e2e-resume-big: build
+	@set -e; \
+	home=build/selftest_resume_big; rm -rf $$home; mkdir -p $$home; \
+	sid=session-b19b19b1-2222-4333-8444-555566667777; \
+	python3 testdata/make_big_session.py $$home; \
+	set +e; \
+	out=$$($(OUT) --no-dsh-config --no-tui --api-key dummy-key --agent-home $$home --resume $$sid --dry-run 2>&1); \
+	rc=$$?; \
+	set -e; \
+	[ "$$rc" -eq 0 ] \
+		|| { echo "FAIL: 大日志 --resume 退出码 = $$rc（139 = 段错误，见 README 踩坑 54）"; echo "$$out" | tail -5; exit 1; }; \
+	echo "$$out" | grep -q "\[dry-run\]" \
+		|| { echo "FAIL: --dry-run 没打出请求摘要"; echo "$$out" | tail -5; exit 1; }; \
+	echo "$$out" | grep -q "/selftest/meta-big/final" \
+		|| { echo "FAIL: 恢复出来的工作区不是日志里最后一条 session/workspace"; echo "$$out" | tail -5; exit 1; }; \
+	echo "e2e-resume-big: 通过（~3 MiB 日志不崩 / 最后一条 workspace 取到）"
 
 # TUI：打印 home / chat 两屏纯文本快照（README 引用的就是它，改动排版时先看这个）
 tui-demo: build
