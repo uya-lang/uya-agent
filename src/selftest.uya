@@ -26,7 +26,15 @@ var mock_expect_shell: bool = true;
 //       第 15 轮才给最终答案 —— agent 必须一路跑完并以 0 退出（默认回到 12 这轮就失败）
 //  23 = 控制字节轮：跑一条 stdout 带 NUL 的命令，断言它转义成 \u0000 之后才上线
 //       （chat 与 responses 各跑一遍，靠 mock_expect_resp 区分端点与响应形状）
+//  27 = 「退不出」轮（P28）：第 1 轮让 agent 跑一条**长命令**（sleep 15，工具卡片上的
+//       description 就是 mock_args_json 里那个 "selftest command"）；之后的请求按内容分叉 ——
+//       带第二个任务文本（"task-two"）的回 SELFTEST-TUI-QUIT-OK，其余（被中断的那一轮）回
+//       SELFTEST-TUI-QUIT-MID。用来钉「工具跑着的时候 ctrl+d / esc / /exit 都要立刻生效」
+//       以及「中断过的会话下一个任务必须照常跑完」
 var mock_mode: i32 = 0;
+// 轮数覆盖（-1 = 用 mode 自己的默认）：不想让 mock 等满轮数时用，
+// 例如「工具跑着就退出」的轮次只会服务 1 次请求
+var mock_limit: i32 = -1;
 // --compat-fold 轮：mock 期望看到「折叠成一条 user 消息」的旧协议
 var mock_expect_fold: bool = false;
 // steer 轮：mock 期望在下一轮请求里看到运行中输入的文本
@@ -1561,11 +1569,20 @@ fn mock_server(lfd: i32) i32 {
     if mock_mode == 31 {
         limit = 2;          // P21 沙箱轮：工具轮（沙箱里写文件）→ 断言轮
     }
+    if mock_mode == 26 {
+        limit = 2;          // P26 plan 闸门轮：工具轮（write/edit 被拒 + 无审阅渠道）→ 断言轮
+    }
     if mock_mode == 24 {
         limit = 1;          // 诊断回显轮：只服务一次（agent 拿到 400 就该退出）
     }
     if mock_mode == 25 {
         limit = 2;          // 大参数轮：大参数工具轮 + 断言/最终答案轮
+    }
+    if mock_mode == 27 {
+        limit = 3;          // P28 退不出轮：长命令轮 → 被中断的那一轮 → 第二个任务的答案
+    }
+    if mock_limit >= 0 {
+        limit = mock_limit; // 各轮自己覆盖（例如「工具跑着就退出」只服务 1 轮）
     }
     while round < limit {
         // accept 最多等 10 秒：客户端不再发请求时 mock 必须自己退出，
@@ -1961,6 +1978,51 @@ fn mock_server(lfd: i32) i32 {
             round = round + 1;
             continue;
         }
+        if mock_mode == 27 {
+            // 「退不出」轮（P28）：第 1 轮给一条**长命令**（sleep 15），之后按请求内容分叉 ——
+            // 带第二个任务文本（"task-two"）的那一次给 SELFTEST-TUI-QUIT-OK，
+            // 其余（被中断的那一轮）给 SELFTEST-TUI-QUIT-MID：
+            //   ① 工具跑着的时候 ctrl+d → 必须立刻退出（不是等 sleep 跑完）；
+            //   ② esc → 必须**当场**杀掉工具进程，回合在 step 边界收口；
+            //   ③ 中断过的会话再提交一个任务 → 必须照常跑完（中断意图不能跨回合残留）。
+            // 判据按**请求内容**分叉而不是按轮号：中断那一轮到底发不发（发出去再被掐断，
+            // 还是压根不发）是实现细节，屏幕上的 OK 只能来自「带 task-two 的那次请求」。
+            // 中断会让客户端在读流读到一半时掐掉连接，所以这一轮**不看写失败**。
+            expect(&rx, "POST /v1/chat/completions", 250, &verdict);
+            var body24: Buf = buf_new(4096);
+            var got_ok: bool = false;
+            if round == 0 {
+                var cmd: Buf = buf_new(64);
+                defer { buf_free(&cmd); }
+                _ = buf_append_cstr(&cmd, "sleep 15");
+                if !mock_ctrl_body(&body24, &cmd) {
+                    verdict = 251;
+                }
+            } else if contains(&rx, "task-two" as &const byte) {
+                if !mock_final_body(&body24, "SELFTEST-TUI-QUIT-OK") {
+                    verdict = 252;
+                }
+                got_ok = true;
+            } else {
+                if !mock_final_body(&body24, "SELFTEST-TUI-QUIT-MID") {
+                    verdict = 253;
+                }
+            }
+            if is_stream {
+                _ = mock_send_sse(cfd, &body24);
+            } else {
+                _ = mock_send(cfd, &body24);
+            }
+            buf_free(&body24);
+            buf_free(&rx);
+            _ = sys_close(cfd) catch {};
+            round = round + 1;
+            if got_ok {
+                // 第二个任务的答案已经给出：客户端接下来只会 /exit，不等后面的请求了
+                limit = round;
+            }
+            continue;
+        }
         if mock_mode == 18 {
             // 长历史轮：前 HISTCAP_ROUNDS 轮各回 2 个 bash 调用，最后一轮给最终答案。
             // 每个请求都必须配对完整 —— 端点 400 的判据在本地先钉住。
@@ -2146,8 +2208,13 @@ fn mock_server(lfd: i32) i32 {
                 }
                 buf_free(&sb11);
             } else {
-                if !contains(&rx, "[... tool result middle pruned ...]") {
+                if !contains(&rx, "[... bash output pruned: ") {
                     verdict = 78;
+                }
+                // P27：中段的诊断行必须活下来 —— 旧规则（头 4096 + 尾 1024 码点）会把它丢掉，
+                // 这正是「bash 结果按信号行剪枝」要修的失败模式。@N: 前缀也一并断言。
+                if !contains(&rx, "@") || !contains(&rx, "MMMID-ERROR-unique-bash-signal-1") {
+                    verdict = 89;
                 }
                 // 剪枝后不该再出现完整的长输出（尾部片段仍在，所以只查中段特征）
                 if contains(&rx, "abcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghij") {
@@ -2523,6 +2590,56 @@ fn mock_server(lfd: i32) i32 {
                     verdict = 84;
                 }
                 buf_free(&body31);
+            }
+            buf_free(&rx);
+            _ = sys_close(cfd) catch {};
+            round = round + 1;
+            continue;
+        }
+        if mock_mode == 26 {
+            // P26 plan 闸门轮：plan 模式下 write/edit 硬拒、exit_plan_mode 在管道里无渠道
+            if round == 0 {
+                expect(&rx, "Plan mode is active" as &const byte, 121, &verdict);
+                expect(&rx, "refused until the user approves a plan" as &const byte, 122, &verdict);
+                expect(&rx, "\"name\":\"exit_plan_mode\"" as &const byte, 123, &verdict);
+                var sb26: Buf = buf_new(4096);
+                if !mock_plan_body(&sb26) {
+                    verdict = 124;
+                }
+                var sent26: bool = false;
+                if is_stream {
+                    sent26 = mock_send_sse(cfd, &sb26);
+                } else {
+                    sent26 = mock_send(cfd, &sb26);
+                }
+                if !sent26 {
+                    verdict = 130;
+                }
+                buf_free(&sb26);
+            } else {
+                expect(&rx, "write is refused in plan mode" as &const byte, 125, &verdict);
+                expect(&rx, "edit is refused in plan mode" as &const byte, 126, &verdict);
+                expect(&rx, "no user-questions channel is available to review the plan" as &const byte, 127, &verdict);
+                expect_absent(&rx, "Created file" as &const byte, 128, &verdict);
+                expect_absent(&rx, "has been updated" as &const byte, 129, &verdict);
+                var body26: Buf = buf_new(512);
+                if verdict == 0 {
+                    if !mock_final_body(&body26, "SELFTEST_PLAN_GATE_OK") {
+                        verdict = 131;
+                    }
+                } else if !mock_final_body(&body26, "SELFTEST_FAIL") {
+                    verdict = 132;
+                }
+                var sent26b: bool = false;
+                if is_stream {
+                    sent26b = mock_send_sse(cfd, &body26);
+                } else {
+                    sent26b = mock_send(cfd, &body26);
+                }
+                if !sent26b {
+                    verdict = 133;
+                }
+                buf_free(&body26);
             }
             buf_free(&rx);
             _ = sys_close(cfd) catch {};
@@ -5823,7 +5940,7 @@ fn mock_prune_body(out: &Buf) bool {
     jw_byte(&w, 44);
     jw_key(&w, "tool_calls");
     jw_byte(&w, 91);
-    mock_call(&w, "pr_big", "bash", "{\"command\":\"yes abcdefghij | head -c 20000\",\"description\":\"produce a large output\"}");
+    mock_call(&w, "pr_big", "bash", "{\"command\":\"yes abcdefghij | head -c 10000; echo MMMID-ERROR-unique-bash-signal-1; yes abcdefghij | head -c 10000\",\"description\":\"produce a large output with a middle signal line\"}");
     jw_byte(&w, 93);
     jw_byte(&w, 125);
     jw_byte(&w, 44);
@@ -9116,9 +9233,54 @@ fn san_argv_text(out: &Buf) void {
     }
 }
 
-// P21 只读轮的 mock 正文：write（应被拒）+ bash（应 fail closed）+ read（应照常）
-fn mock_perm_body(out: &Buf) bool {
+// P26 plan 闸门轮的 mock 正文：write / edit（都应被闸门拒）+ exit_plan_mode（管道里没有渠道）
+fn mock_plan_body(out: &Buf) bool {
     var w: JsonWriter = JsonWriter{ buf: null, cap: 0, used: 0, overflow: false };
+    jw_init(&w, out.ptr, out.cap);
+    jw_byte(&w, 123);
+    jw_key(&w, "id");
+    jw_str_cstr(&w, "chatcmpl-plangate");
+    jw_byte(&w, 44);
+    jw_key(&w, "choices");
+    jw_byte(&w, 91);
+    jw_byte(&w, 123);
+    jw_key(&w, "index");
+    jw_i64(&w, 0);
+    jw_byte(&w, 44);
+    jw_key(&w, "message");
+    jw_byte(&w, 123);
+    jw_key(&w, "role");
+    jw_str_cstr(&w, "assistant");
+    jw_byte(&w, 44);
+    jw_key(&w, "content");
+    jw_null(&w);
+    jw_byte(&w, 44);
+    jw_key(&w, "tool_calls");
+    jw_byte(&w, 91);
+    mock_call(&w, "pg_1", "write", "{\"file_path\":\"plan-gate.txt\",\"content\":\"PLAN-GATE-WROTE\\n\"}");
+    jw_byte(&w, 44);
+    // edit 也必须被闸门拦下（拦在「先读后写」检查之前：这里根本没读过这个文件）
+    mock_call(&w, "pg_2", "edit", "{\"file_path\":\"plan-gate.txt\",\"old_string\":\"alpha\",\"new_string\":\"beta\"}");
+    jw_byte(&w, 44);
+    // 管道/CI 里没有审阅渠道 → 必须回「没有渠道」，而且**不退出** plan 模式
+    mock_call(&w, "pg_3", "exit_plan_mode", "{\"plan\":\"# 计划标题\\n\\n先做 A，再做 B。\"}");
+    jw_byte(&w, 93);
+    jw_byte(&w, 125);
+    jw_byte(&w, 44);
+    jw_key(&w, "finish_reason");
+    jw_str_cstr(&w, "tool_calls");
+    jw_byte(&w, 125);
+    jw_byte(&w, 93);
+    jw_byte(&w, 125);
+    if jw_overflow(&w) {
+        return false;
+    }
+    out.len = jw_used(&w);
+    return true;
+}
+
+// P21 只读轮的 mock 正文：write（应被拒）+ bash（应 fail closed）+ read（应照常）
+fn mock_perm_body(out: &Buf) bool {    var w: JsonWriter = JsonWriter{ buf: null, cap: 0, used: 0, overflow: false };
     jw_init(&w, out.ptr, out.cap);
     jw_byte(&w, 123);
     jw_key(&w, "id");
@@ -9282,6 +9444,100 @@ fn perm_round_run(base: &const Config, ws: &const byte, mock: i32, access: u8, s
 }
 
 // P21 只读轮：write 被硬拒 + bash fail closed（非交互没有审批通道）+ read 照常
+// ============================================================
+// P26：plan 模式的写闸门（纯函数真值表 + 端到端）
+//
+// 为什么要它：plan 模式原来只是提示词里的软引导 —— 模型可以直接开工，审阅浮窗永远不会
+// 出现（README 踩坑 36）。这一轮把闸门钉死：**全权模式下**（access = danger-full-access）
+// write/edit 也必须被 plan 模式拒掉，且文件不落盘；exit_plan_mode 在管道里没有渠道时
+// 只能回「没有渠道」，绝不是批准。
+// ============================================================
+fn plan_gate_round(base: &const Config, tag: &const byte, ws: &const byte) bool {
+    var ok: bool = true;
+    var s: PlanState = PlanState{ active: false, pending: 0 };
+    plan_init(&s);
+    if plan_on() || plan_blocks_write() {
+        ty_fail(tag, "plan_init 之后闸门应当是关的", &ok);
+    }
+    plan_set(&s, true);
+    if !s.active || !plan_on() || !plan_blocks_write() {
+        ty_fail(tag, "plan_set(true) 之后状态/镜像/闸门三者必须一致", &ok);
+    }
+    _ = plan_toggle(&s);
+    if s.active || plan_on() || plan_blocks_write() {
+        ty_fail(tag, "plan_toggle 没有把状态翻回去（或镜像没跟上）", &ok);
+    }
+    plan_init(&s);
+    // 三个动作 → 三裁决（浮层交回的是「那一行的原文」，认不出来的一律不批准）
+    var pick: Buf = buf_new(64);
+    defer { buf_free(&pick); }
+    var v: i32 = 0;
+    _ = buf_append_cstr(&pick, PLAN_ITEM_APPROVE);
+    v = plan_verdict_of(&pick);
+    if v != PLAN_APPROVE {
+        ty_fail(tag, "「确认执行」没有映射成批准", &ok);
+    }
+    buf_reset(&pick);
+    _ = buf_append_cstr(&pick, PLAN_ITEM_DISMISS);
+    v = plan_verdict_of(&pick);
+    if v != PLAN_DISMISS {
+        ty_fail(tag, "「解决」没有映射成「关掉浮窗、等用户说话」", &ok);
+    }
+    buf_reset(&pick);
+    _ = buf_append_cstr(&pick, PLAN_ITEM_KEEP);
+    v = plan_verdict_of(&pick);
+    if v != PLAN_KEEP {
+        ty_fail(tag, "「继续讨论」没有映射成「留在 plan 模式改计划」", &ok);
+    }
+    buf_reset(&pick);
+    _ = buf_append_cstr(&pick, "看起来不像我们给的任何一个动作");
+    v = plan_verdict_of(&pick);
+    if v != PLAN_KEEP {
+        ty_fail(tag, "认不出的选中项必须是「继续讨论」（绝不能默认批准）", &ok);
+    }
+
+    if !fs_ws_prepare(ws) {
+        out_err("selftest: cannot prepare plan-mode workspace\n");
+        return false;
+    }
+    // 全权模式下开闸门：能被拒就只可能是 plan 模式拦的，不是 read-only
+    agent_plan_force(true);
+    const r: PermRun = perm_round_run(base, ws, 26, PERM_FULL_ACCESS, SAN_OFF,
+        "先出计划再动手" as &const byte, 4);
+    agent_plan_force(false);
+    out_err("selftest[");
+    out_err(tag);
+    out_err("] ");
+    if !r.ok {
+        out_err("FAIL: mock server 没起来\n");
+        return false;
+    }
+    if r.agent_rc != AGENT_OK || r.mock_rc != 0 {
+        out_err("FAIL: agent_run=");
+        out_err_dec(r.agent_rc as usize);
+        out_err(" mock=");
+        out_err_dec(r.mock_rc as usize);
+        ok = false;
+    } else if plan_on() {
+        out_err("FAIL: 一轮跑完 plan 模式还开着（管道里没有渠道，它不该被退出）");
+        ok = false;
+    } else {
+        var p: Buf = buf_new(256);
+        defer { buf_free(&p); }
+        _ = buf_append_cstr(&p, ws);
+        _ = buf_append_cstr_z(&p, "/plan-gate.txt");
+        if san_path_exists(p.ptr as &const byte) {
+            out_err("FAIL: plan 模式下 write 竟然落盘了");
+            ok = false;
+        } else {
+            out_err("ok（plan 模式下 write/edit 被拒且没落盘；exit_plan_mode 无渠道且不退模式）");
+        }
+        _ = sys_unlink(p.ptr as *const byte) catch {};
+    }
+    out_err("\n");
+    return ok;
+}
+
 fn perm_readonly_round(base: &const Config, tag: &const byte, ws: &const byte) bool {
     var ok: bool = true;
     if !fs_ws_prepare(ws) {
@@ -10010,6 +10266,85 @@ fn stats_fold_round(tag: &const byte) bool {
     st_tool_call("dup" as &const byte, 3, 2000);
     st_tool_result("dup" as &const byte, 3, 2400);
     stx_num_eq(tag, "重复 callId 只结算一次且用最后一次时间", st_tool_ms(), 400, &ok);
+
+    if ok {
+        out_err("selftest[");
+        out_err(tag);
+        out_err("] ok\n");
+    }
+    return ok;
+}
+
+// 断言用：bool → i64（stx_num_eq 只收 i64，字面量 if 表达式会退成 i32）
+fn b2i(v: bool) i64 {
+    if v {
+        return 1;
+    }
+    return 0;
+}
+
+// P27：bash 结果的剪枝 —— 同一预算内「头/尾 + 中段信号行优先 + 等距抽样」
+// 真轨迹口径：旧规则信号行（error/fail/…）保全 0.602，新规则 0.994；
+// 这里断言的是机制本身：中段埋的诊断行必须留下、预算不许超、非 bash 仍走老规则。
+fn prune_bash_round(tag: &const byte) bool {
+    var ok: bool = true;
+    var src: Buf = buf_new(24576);
+    defer { buf_free(&src); }
+    var i: usize = 0;
+    while i < 120 {          // 第 1..120 行：填充（每行 70 码点 + 换行）
+        _ = buf_append_cstr(&src, "0123456789012345678901234567890123456789012345678901234567890123456789\n");
+        i = i + 1;
+    }
+    _ = buf_append_cstr(&src, "MMMID ERROR: unique-bash-signal-1\n");   // 第 121 行
+    var k: usize = 0;
+    while k < 79 {           // 第 122..200 行
+        _ = buf_append_cstr(&src, "0123456789012345678901234567890123456789012345678901234567890123456789\n");
+        k = k + 1;
+    }
+    _ = buf_append_cstr(&src, "TAIL-VERDICT-OK\n");                     // 第 201 行
+
+    // 1) 小输入不剪（与 cmp_maybe_prune 同契约：不剪就不动 out）
+    var small: Buf = buf_new(256);
+    defer { buf_free(&small); }
+    var tiny: Buf = buf_new(256);
+    defer { buf_free(&tiny); }
+    _ = buf_append_cstr(&small, "line one\nline two\n");
+    stx_num_eq(tag, "小输出不剪",
+        b2i(cmp_maybe_prune_bash(small.ptr as &const byte, small.len, &tiny)), 0, &ok);
+
+    // 2) 大输入：走 bash 规则，中段的信号行必须带原始行号留下
+    var out: Buf = buf_new(8192);
+    defer { buf_free(&out); }
+    stx_num_eq(tag, "大输出要剪",
+        b2i(cmp_maybe_prune_bash(src.ptr as &const byte, src.len, &out)), 1, &ok);
+    stx_num_eq(tag, "不用通用标记",
+        b2i(contains(&out, "[... tool result middle pruned ...]")), 0, &ok);
+    stx_num_eq(tag, "用 bash 标记",
+        b2i(contains(&out, "[... bash output pruned: ")), 1, &ok);
+    stx_num_eq(tag, "中段信号行保住",
+        b2i(contains(&out, "@121: MMMID ERROR: unique-bash-signal-1")), 1, &ok);
+    stx_num_eq(tag, "尾部结论保住",
+        b2i(contains(&out, "TAIL-VERDICT-OK")), 1, &ok);
+    const kept: i64 = bufx_utf8_count(out.ptr as &const byte, out.len) as i64;
+    stx_num_eq(tag, "预算不超（5120 + 余量）", b2i(kept <= 5600), 1, &ok);
+
+    // 3) 非 bash 工具仍走通用规则（read/grep 的行为一点没变）
+    var gen: Buf = buf_new(8192);
+    defer { buf_free(&gen); }
+    stx_num_eq(tag, "非 bash 走通用规则",
+        b2i(cmp_maybe_prune_kind(src.ptr as &const byte, src.len, CMP_KIND_TOOL, &gen)), 1, &ok);
+    stx_num_eq(tag, "通用规则保留原标记",
+        b2i(contains(&gen, "[... tool result middle pruned ...]")), 1, &ok);
+    stx_num_eq(tag, "通用规则丢掉中段信号行",
+        b2i(contains(&gen, "unique-bash-signal-1")), 0, &ok);
+
+    // 4) 请求字节口径：压力估算用的就是「剪枝后会占多少字节」
+    var scratch: Buf = buf_new(8192);
+    defer { buf_free(&scratch); }
+    const rb: usize = cmp_request_bytes(src.ptr as &const byte, src.len, CMP_KIND_BASH, &scratch);
+    stx_num_eq(tag, "请求字节按剪枝后算", b2i(rb < src.len), 1, &ok);
+    const rb2: usize = cmp_request_bytes(small.ptr as &const byte, small.len, CMP_KIND_BASH, &scratch);
+    stx_num_eq(tag, "不剪时请求字节 = 原文", rb2 as i64, small.len as i64, &ok);
 
     if ok {
         out_err("selftest[");
@@ -10773,8 +11108,1478 @@ fn title_round(tag: &const byte) bool {
     return ok;
 }
 
+// ============================================================
+// P22：任务状态（折叠行 / 箱体 / 报告）—— 纯函数轮
+//
+// 全部用 fixture 表 + 显式 now_ms 调**纯函数**：不 poll、不读盘、不写终端，所以同一份输入
+// 永远得到同一份字节。逐字节断言「进度条口径 / 段落排版 / 边框等宽 / 截断与降级」。
+// ============================================================
+
+fn tsx_at(b: &const Buf, lit: &const byte) isize {
+    const view: &[byte] = b.ptr[0: b.len];
+    return find_sub(view, lit[0: strlen(lit)], 0);
+}
+
+fn tsx_has(tag: &const byte, what: &const byte, b: &const Buf, lit: &const byte, ok: &bool) void {
+    if tsx_at(b, lit) < 0 {
+        out_err("selftest[");
+        out_err(tag);
+        out_err("] FAIL: ");
+        out_err(what);
+        out_err("：输出里没有 \"");
+        out_err(lit);
+        out_err("\"\n");
+        ok[0] = false;
+    }
+}
+
+fn tsx_no(tag: &const byte, what: &const byte, b: &const Buf, lit: &const byte, ok: &bool) void {
+    if tsx_at(b, lit) >= 0 {
+        out_err("selftest[");
+        out_err(tag);
+        out_err("] FAIL: ");
+        out_err(what);
+        out_err("：输出里不该有 \"");
+        out_err(lit);
+        out_err("\"\n");
+        ok[0] = false;
+    }
+}
+
+// 逐行按显示列量宽度：箱体每行必须等宽（P15 的四条硬规则在任务块上同样成立）
+fn tsx_box_widths(tag: &const byte, what: &const byte, b: &const Buf, rows: usize, ok: &bool) void {
+    var n: usize = 0;
+    var want: usize = 0;
+    var i: usize = 0;
+    while i < b.len {
+        var e: usize = i;
+        while e < b.len && b.ptr[e] != 10 as byte {
+            e = e + 1;
+        }
+        const w: usize = tty_cols_between(b.ptr as &const byte, i, e);
+        if n == 0 {
+            want = w;
+        } else if w != want {
+            out_err("selftest[");
+            out_err(tag);
+            out_err("] FAIL: ");
+            out_err(what);
+            out_err("：第 ");
+            out_err_dec(n + 1);
+            out_err(" 行宽度 ");
+            out_err_dec(w);
+            out_err(" != 第一行 ");
+            out_err_dec(want);
+            out_err("\n");
+            ok[0] = false;
+        }
+        n = n + 1;
+        i = e + 1;
+    }
+    if rows > 0 && n != rows {
+        out_err("selftest[");
+        out_err(tag);
+        out_err("] FAIL: ");
+        out_err(what);
+        out_err("：行数 ");
+        out_err_dec(n);
+        out_err(" != 期望 ");
+        out_err_dec(rows);
+        out_err("\n");
+        ok[0] = false;
+    }
+}
+
+fn tsx_todo(t: &TodoState, i: usize, text: &const byte, st: u8) void {
+    if i >= TODO_MAX {
+        return;
+    }
+    t.items[i].content = buf_new(bufx_cstr_len(text) + 8);
+    _ = buf_append_cstr(&t.items[i].content, text);
+    t.items[i].status = st;
+    if t.n < i + 1 {
+        t.n = i + 1;
+    }
+}
+
+fn tsx_job(t: &JobTable, i: usize, id: i32, st: u8, code: i32, secs_ago: u64,
+           label: &const byte, out_text: &const byte, trunc: bool) void {
+    if i >= JOB_MAX {
+        return;
+    }
+    const j: &Job = &t.items[i];
+    const now: u64 = ua_now_ms();
+    const back: u64 = secs_ago * (1000 as u64);
+    j.used = true;
+    j.id = id;
+    j.kind = 0;
+    j.pid = -1;
+    j.rfd = -1;
+    j.status = st;
+    j.exit_code = code;
+    j.truncated = trunc;
+    j.start_ms = if now > back { now - back } else { 1 as u64 };
+    j.read_off = 0;
+    j.reaped = true;      // 不真 fork：只测显示
+    j.label = buf_new(bufx_cstr_len(label) + 8);
+    _ = buf_append_cstr(&j.label, label);
+    j.buf = buf_new(bufx_cstr_len(out_text) + 8);
+    _ = buf_append_cstr(&j.buf, out_text);
+}
+
+fn tsx_agent(t: &DelegTable, i: usize, id: i32, kind: u8, st: u8, secs_ago: u64,
+             label: &const byte, out_lines: usize) void {
+    if i >= DELEG_MAX {
+        return;
+    }
+    const d: &Deleg = &t.items[i];
+    const now: u64 = ua_now_ms();
+    const back: u64 = secs_ago * (1000 as u64);
+    d.used = true;
+    d.id = id;
+    d.kind = kind;
+    d.pid = -1;
+    d.fd = -1;
+    d.status = st;
+    d.code = 0;
+    d.reaped = true;
+    d.read_off = 0;
+    d.rounds = 2;
+    d.max_rounds = 4;
+    d.ended_noted = false;
+    d.started_ms = if now > back { now - back } else { 1 as u64 };
+    d.label = buf_new(bufx_cstr_len(label) + 8);
+    _ = buf_append_cstr(&d.label, label);
+    d.prompt = buf_new(16);
+    d.sid = buf_new(16);
+    d.objective = buf_new(16);
+    d.buf = buf_new(16);
+    var k: usize = 0;
+    while k < out_lines {
+        _ = buf_append_cstr(&d.buf, "line\n");
+        k = k + 1;
+    }
+}
+
+fn tsx_goal(g: &Goal, phase: &const byte, round: i32, max_rounds: i32, objective: &const byte) void {
+    g.active_state = true;
+    g.id = 1;
+    g.revision = 2;
+    g.phase = buf_new(bufx_cstr_len(phase) + 8);
+    _ = buf_append_cstr(&g.phase, phase);
+    g.objective = buf_new(bufx_cstr_len(objective) + 8);
+    _ = buf_append_cstr(&g.objective, objective);
+    g.round = round;
+    g.max_rounds = max_rounds;
+}
+
+fn tasks_render_round(tag: &const byte) bool {
+    var ok: bool = true;
+    const now: u64 = ua_now_ms();
+    var b: Buf = buf_new(8192);
+    defer { buf_free(&b); }
+
+    // ---- A) 进度条与百分比口径（四舍五入 half-up）----
+    tasks_bar(&b, 2, 4, 20);
+    stx_eq(tag, "进度条 2/4", &b, "██████████░░░░░░░░░░" as &const byte, &ok);
+    buf_reset(&b);
+    tasks_bar(&b, 0, 4, 20);
+    stx_eq(tag, "进度条 0/4", &b, "░░░░░░░░░░░░░░░░░░░░" as &const byte, &ok);
+    buf_reset(&b);
+    tasks_bar(&b, 4, 4, 20);
+    stx_eq(tag, "进度条 4/4", &b, "████████████████████" as &const byte, &ok);
+    buf_reset(&b);
+    tasks_bar(&b, 3, 0, 20);
+    stx_eq(tag, "进度条 total=0 不画", &b, "" as &const byte, &ok);
+    buf_reset(&b);
+    tasks_bar(&b, 3, 4, 0);
+    stx_eq(tag, "进度条 cells=0 不画", &b, "" as &const byte, &ok);
+
+    // ---- B) 输出体量 ----
+    buf_reset(&b);
+    tasks_fmt_bytes(&b, 0);
+    stx_eq(tag, "0 字节", &b, "0B" as &const byte, &ok);
+    buf_reset(&b);
+    tasks_fmt_bytes(&b, 120);
+    stx_eq(tag, "120 字节", &b, "120B" as &const byte, &ok);
+    buf_reset(&b);
+    tasks_fmt_bytes(&b, 1023);
+    stx_eq(tag, "1023 字节", &b, "1023B" as &const byte, &ok);
+    buf_reset(&b);
+    tasks_fmt_bytes(&b, 1024);
+    stx_eq(tag, "1024 字节", &b, "1.0K" as &const byte, &ok);
+    buf_reset(&b);
+    tasks_fmt_bytes(&b, 3277);
+    stx_eq(tag, "3.2K", &b, "3.2K" as &const byte, &ok);
+    buf_reset(&b);
+    tasks_fmt_bytes(&b, 10239);
+    stx_eq(tag, "9.9K", &b, "9.9K" as &const byte, &ok);
+    buf_reset(&b);
+    tasks_fmt_bytes(&b, 10240);
+    stx_eq(tag, "10K（整 K 不带小数）", &b, "10K" as &const byte, &ok);
+    buf_reset(&b);
+    tasks_fmt_bytes(&b, 524288);
+    stx_eq(tag, "512K", &b, "512K" as &const byte, &ok);
+    buf_reset(&b);
+    tasks_fmt_bytes(&b, 1048576);
+    stx_eq(tag, "1 MiB", &b, "1.0M" as &const byte, &ok);
+    buf_reset(&b);
+    tasks_fmt_bytes(&b, 3000000);
+    stx_eq(tag, "2.8M", &b, "2.8M" as &const byte, &ok);
+
+    // ---- C) 空状态：折叠行/箱体/报告都要「一个字节都不画」----
+    var t0: TodoState = TodoState{ items: [], n: 0 };
+    todo_init(&t0);
+    defer { todo_free(&t0); }
+    var j0: JobTable = JobTable{ items: [], next_id: 1 };
+    jobs_init(&j0);
+    defer { jobs_free(&j0); }
+    var d0: DelegTable = DelegTable{ items: [], next_id: 1 };
+    deleg_init(&d0);
+    defer { deleg_free(&d0); }
+    var g0: Goal = goal_empty();
+    defer { goal_free(&g0); }
+    buf_reset(&b);
+    tasks_line(&t0, &j0, &d0, &g0, 80, &b);
+    stx_eq(tag, "空态折叠行", &b, "" as &const byte, &ok);
+    buf_reset(&b);
+    tasks_box(&t0, &j0, &d0, &g0, now, 80, TASKS_BLOCK_MAX_ROWS, true, &b);
+    stx_eq(tag, "空态箱体", &b, "" as &const byte, &ok);
+    buf_reset(&b);
+    tasks_report(&t0, &j0, &d0, &g0, now, 80, &b);
+    stx_eq(tag, "空态报告", &b,
+        "（没有任务：todo 清单为空，也没有后台任务 / 子代理 / 目标）\n" as &const byte, &ok);
+
+    // ---- D) 主 fixture：2 完成 / 1 进行中 / 1 待办 + 2 后台任务（1 跑中）+ 1 子代理 + 目标 ----
+    var t: TodoState = TodoState{ items: [], n: 0 };
+    todo_init(&t);
+    defer { todo_free(&t); }
+    tsx_todo(&t, 0, "写 src/tasks.uya（聚合 + 文本 + 快照推送）" as &const byte, TD_COMPLETED);
+    tsx_todo(&t, 1, "接进 TUI 浮层与常驻块" as &const byte, TD_COMPLETED);
+    tsx_todo(&t, 2, "补自测轮与 make 目标" as &const byte, TD_INPROGRESS);
+    tsx_todo(&t, 3, "把 README 第 6 节的验收表补齐" as &const byte, TD_PENDING);
+
+    var j: JobTable = JobTable{ items: [], next_id: 3 };
+    jobs_init(&j);
+    defer { jobs_free(&j); }
+    tsx_job(&j, 0, 1, JOB_RUNNING, 0, 12, "编译内核模块" as &const byte, "cc\nld\nok\n", false);
+    tsx_job(&j, 1, 2, JOB_DONE, 0, 4, "跑一遍单测" as &const byte, "all 128 tests passed\n", false);
+
+    var d: DelegTable = DelegTable{ items: [], next_id: 2 };
+    deleg_init(&d);
+    defer { deleg_free(&d); }
+    tsx_agent(&d, 0, 1, DELEG_KIND_SUB, DELEG_RUNNING, 7, "审计 deleg 的等待循环" as &const byte, 12);
+
+    var g: Goal = goal_empty();
+    defer { goal_free(&g); }
+    tsx_goal(&g, "active" as &const byte, 3, 20, "把 /tasks 的任务状态进度接进 TUI 与滚动模式" as &const byte);
+
+    buf_reset(&b);
+    tasks_line(&t, &j, &d, &g, 200, &b);
+    stx_eq(tag, "折叠行（四段齐）", &b,
+        "▸ 任务 2/4 50% · 后台 1/2 · 子代理 1/1 · 目标 3/20" as &const byte, &ok);
+
+    // 只有后台任务：首字形是 ·（没有进行中、清单为空）
+    buf_reset(&b);
+    tasks_line(&t0, &j, &d0, &g0, 200, &b);
+    stx_eq(tag, "折叠行（只有后台任务）", &b, "▸ 后台 1/2" as &const byte, &ok);
+    // 清单全完成且没有在跑的 → ✓
+    var tc: TodoState = TodoState{ items: [], n: 0 };
+    todo_init(&tc);
+    defer { todo_free(&tc); }
+    tsx_todo(&tc, 0, "甲" as &const byte, TD_COMPLETED);
+    tsx_todo(&tc, 1, "乙" as &const byte, TD_COMPLETED);
+    buf_reset(&b);
+    tasks_line(&tc, &j0, &d0, &g0, 200, &b);
+    stx_eq(tag, "折叠行（全完成 → ✓）", &b, "✓ 任务 2/2 100%" as &const byte, &ok);
+    // 只有目标
+    buf_reset(&b);
+    tasks_line(&t0, &j0, &d0, &g, 200, &b);
+    stx_eq(tag, "折叠行（只有目标）", &b, "· 目标 3/20" as &const byte, &ok);
+    // 目标非 active：只报状态词
+    var gb: Goal = goal_empty();
+    defer { goal_free(&gb); }
+    tsx_goal(&gb, "blocked" as &const byte, 5, 20, "被外部依赖卡住" as &const byte);
+    buf_reset(&b);
+    tasks_line(&t0, &j0, &d0, &gb, 200, &b);
+    stx_eq(tag, "折叠行（目标 blocked）", &b, "· 目标 阻塞" as &const byte, &ok);
+    // 窄终端：从尾部丢段补 `…`，恒 1 行、不超宽
+    buf_reset(&b);
+    tasks_line(&t, &j, &d, &g, 30, &b);
+    tsx_has(tag, "窄终端折叠行", &b, "…" as &const byte, &ok);
+    tsx_has(tag, "窄终端折叠行保头部", &b, "▸ 任务 2/4 50%" as &const byte, &ok);
+    if tty_cols_between(b.ptr as &const byte, 0, b.len) > 31 {
+        ty_fail(tag, "窄终端折叠行还是超宽（丢段没生效）", &ok);
+    }
+    if tsx_at(&b, "\n" as &const byte) >= 0 {
+        ty_fail(tag, "折叠行里出现了换行（恒 1 行的约定破了）", &ok);
+    }
+
+    // ---- E) 箱体：11 行、逐行等宽、段落齐；agents 段不进箱体 ----
+    buf_reset(&b);
+    tasks_box(&t, &j, &d, &g, now, 60, TASKS_BLOCK_MAX_ROWS, true, &b);
+    tsx_box_widths(tag, "主 fixture 箱体", &b, 11, &ok);
+    tsx_has(tag, "箱体标题", &b, "┌─ tasks " as &const byte, &ok);
+    tsx_has(tag, "箱体底框", &b, "└─ " as &const byte, &ok);
+    tsx_has(tag, "清单段", &b, "清单" as &const byte, &ok);
+    tsx_has(tag, "计数", &b, "2/4" as &const byte, &ok);
+    tsx_has(tag, "百分比", &b, "50%" as &const byte, &ok);
+    tsx_has(tag, "进度条进箱体", &b, "██████████░░░░░░░░░░" as &const byte, &ok);
+    tsx_has(tag, "进行中字形", &b, "▸ 补自测轮与 make 目标" as &const byte, &ok);
+    tsx_has(tag, "待办字形", &b, "· 把 README 第 6 节的验收表补齐" as &const byte, &ok);
+    tsx_has(tag, "完成字形", &b, "✓ 接进 TUI 浮层与常驻块" as &const byte, &ok);
+    tsx_has(tag, "后台任务段", &b, "后台任务" as &const byte, &ok);
+    tsx_has(tag, "跑中的 job", &b, "● job-1 [bash] running " as &const byte, &ok);
+    tsx_has(tag, "job 输出体量", &b, "输出 9B" as &const byte, &ok);
+    tsx_has(tag, "完成的 job", &b, "✓ job-2 [bash] completed · exit 0" as &const byte, &ok);
+    tsx_has(tag, "目标段", &b, "目标" as &const byte, &ok);
+    tsx_has(tag, "目标轮次", &b, "▸ active · round 3/20" as &const byte, &ok);
+    tsx_no(tag, "子代理不进常驻箱体（P15 另有窗口）", &b, "子代理" as &const byte, &ok);
+
+    // 折叠态：箱体退化回 1 行
+    buf_reset(&b);
+    tasks_box(&t, &j, &d, &g, now, 60, TASKS_BLOCK_MAX_ROWS, false, &b);
+    stx_eq(tag, "折叠态箱体", &b,
+        "▸ 任务 2/4 50% · 后台 1/2 · 子代理 1/1 · 目标 3/20\n" as &const byte, &ok);
+
+    // 行数预算：max_rows 含上下边框；裁掉就补一行 `… 还有 N 行`
+    buf_reset(&b);
+    tasks_box(&t, &j, &d, &g, now, 60, 5, true, &b);
+    tsx_box_widths(tag, "max_rows=5 的箱体", &b, 5, &ok);
+    tsx_has(tag, "裁掉的行数标记", &b, "… 还有 " as &const byte, &ok);
+
+    // 窄终端：内容按显示列截断，边框照样等宽（宽字符不许砍半个）
+    buf_reset(&b);
+    tasks_box(&t, &j, &d, &g, now, 40, TASKS_BLOCK_MAX_ROWS, true, &b);
+    tsx_box_widths(tag, "40 列箱体", &b, 0, &ok);
+    tsx_has(tag, "40 列下截断补 …", &b, "…" as &const byte, &ok);
+
+    // ---- F) 清单行数上限：cap 之后补一行「还有 N 项」----
+    var t8: TodoState = TodoState{ items: [], n: 0 };
+    todo_init(&t8);
+    defer { todo_free(&t8); }
+    var i8: usize = 0;
+    while i8 < 8 {
+        tsx_todo(&t8, i8, "第 8 项里的某一条" as &const byte, TD_PENDING);
+        i8 = i8 + 1;
+    }
+    buf_reset(&b);
+    tasks_rows(&t8, &j0, &d0, &g0, now, 60, true, 6, &b);
+    tsx_has(tag, "清单行数上限", &b, "… 还有 2 项（/tasks 看全部）" as &const byte, &ok);
+
+    // ---- G) 报告：段落齐 + 清单按「进行中 → 待办 → 完成」分组（组内保持原序）----
+    buf_reset(&b);
+    tasks_report(&t, &j, &d, &g, now, 200, &b);
+    tsx_has(tag, "报告含清单", &b, "清单" as &const byte, &ok);
+    tsx_has(tag, "报告含子代理", &b, "子代理" as &const byte, &ok);
+    tsx_has(tag, "报告含子代理行", &b, "● sub-1 [subagent] running " as &const byte, &ok);
+    tsx_has(tag, "报告含提示行", &b, "ctrl+t 展开/收起常驻块" as &const byte, &ok);
+    const at_ip: isize = tsx_at(&b, "▸ 补自测轮与 make 目标" as &const byte);
+    const at_pd: isize = tsx_at(&b, "· 把 README 第 6 节的验收表补齐" as &const byte);
+    const at_cp: isize = tsx_at(&b, "✓ 写 src/tasks.uya（聚合 + 文本 + 快照推送）" as &const byte);
+    if at_ip < 0 || at_pd < 0 || at_cp < 0 {
+        ty_fail(tag, "报告里少了清单条目", &ok);
+    } else if !(at_ip < at_pd && at_pd < at_cp) {
+        ty_fail(tag, "清单没有按 进行中 → 待办 → 完成 分组（组内原序）", &ok);
+    }
+
+    // ralph 子代理才带 `Round n/m`（subagent 没有这个概念）
+    var dr: DelegTable = DelegTable{ items: [], next_id: 2 };
+    deleg_init(&dr);
+    defer { deleg_free(&dr); }
+    tsx_agent(&dr, 0, 1, DELEG_KIND_RALPH, DELEG_RUNNING, 12, "ralph loop" as &const byte, 1);
+    buf_reset(&b);
+    tasks_report(&t0, &j0, &dr, &g0, now, 200, &b);
+    tsx_has(tag, "报告含 ralph 段", &b, "● sub-1 [ralph] running " as &const byte, &ok);
+    tsx_has(tag, "报告含 ralph 轮次", &b, "Round 2/4" as &const byte, &ok);
+
+    // ---- H) job 的三种终态字形与截断标记 ----
+    var jk: JobTable = JobTable{ items: [], next_id: 4 };
+    jobs_init(&jk);
+    defer { jobs_free(&jk); }
+    tsx_job(&jk, 0, 1, JOB_DONE, 1, 2, "失败的" as &const byte, "boom\n", false);
+    tsx_job(&jk, 1, 2, JOB_KILLED, 137, 3, "被杀的" as &const byte, "partial\n", true);
+    buf_reset(&b);
+    tasks_report(&t0, &jk, &d0, &g0, now, 200, &b);
+    tsx_has(tag, "非零退出 → ✗", &b, "✗ job-1 [bash] completed · exit 1" as &const byte, &ok);
+    tsx_has(tag, "被杀的 → ■", &b, "■ job-2 [bash] killed · exit 137" as &const byte, &ok);
+    tsx_has(tag, "输出被截断有标记", &b, "（已截断）" as &const byte, &ok);
+
+    // ---- I) 纯函数性质：同一份输入两次调用逐字节相同 ----
+    var b1: Buf = buf_new(8192);
+    defer { buf_free(&b1); }
+    var b2: Buf = buf_new(8192);
+    defer { buf_free(&b2); }
+    tasks_report(&t, &j, &d, &g, now, 200, &b1);
+    tasks_report(&t, &j, &d, &g, now, 200, &b2);
+    if b1.len != b2.len || !bufx_mem_eq(b1.ptr as &const byte, b2.ptr as &const byte, b1.len) {
+        ty_fail(tag, "同一份输入的两次报告不一致（函数有隐藏状态？）", &ok);
+    }
+
+    if ok {
+        out_err("selftest[");
+        out_err(tag);
+        out_err("] ok（进度条/字节口径 + 折叠行四段与降级 + 箱体等宽与行数上限 + 报告分组 + job 三态）\n");
+    }
+    return ok;
+}
+
+
+// ============================================================
+// P22：滚动模式（--no-tui）的「活路径」—— 任务块真的被推到 tty 面板块并画到屏幕上
+//
+// TUI 那条路在 tuiselftest 的 tui-tasks 轮里验（帧模型）；这一轮验的是另一半：
+// tasks_panel_sync → view_panel_push → tty_block_* → tty_draw_line 真画一帧。
+// 没有它，「折叠行 + agents 箱体拼成一份块」这件事在滚动模式里就是没人断言过的。
+// ============================================================
+fn tasks_scroll_round(tag: &const byte) bool {
+    var ok: bool = true;
+    tui_headless_enable(false);        // 走「非 TUI」那条分支
+    view_init(true, 0);
+    tasks_init();
+    tasks_expand_set(false);
+    agent_tasks_fixture_demo();
+
+    tty_init(&tty_ui, 0);
+    tty_ui.is_tty = true;
+    tty_ui.raw = true;
+    tty_ui.cols = 100;                 // 面板块宽 = 100 - 2 = 98
+    tty_set_block_provider(&tty_ui, true);
+    tty_set_prompt(&tty_ui, "[step 5] > " as &const byte);
+    tty_line_clear(&tty_ui);
+
+    var blk: Buf = buf_new(8192);
+    defer { buf_free(&blk); }
+
+    // ---- A) 折叠态：1 行折叠行 + agents 箱体，一起推下去 ----
+    if !tasks_panel_sync() {
+        ty_fail(tag, "第一次同步应当把任务块推给 tty", &ok);
+    }
+    if tty_block_len() == 0 {
+        ty_fail(tag, "同步后面板块里应该有内容", &ok);
+    }
+    _ = buf_append(&blk, tty_ui.block.ptr, tty_ui.block.len);
+    if !contains(&blk, "▸ 任务 2/4 50%" as &const byte) {
+        ty_fail(tag, "折叠行没进面板块", &ok);
+    }
+    if !contains(&blk, "· 后台 1/2" as &const byte) {
+        ty_fail(tag, "折叠行少了后台任务段", &ok);
+    }
+    if !contains(&blk, "┌─ agent " as &const byte) {
+        ty_fail(tag, "运行中的子代理窗口没跟着一起推（P15 被挤掉了？）", &ok);
+    }
+    if contains(&blk, "┌─ tasks " as &const byte) {
+        ty_fail(tag, "折叠态不该出现任务箱体", &ok);
+    }
+
+    // ---- B) 真画一帧：提示符上方必须看得见折叠行 ----
+    var path: [byte: 64] = "build/selftest_tasks_scroll.txt";
+    const pp: &const byte = &path[0] as &const byte;
+    var lcfd: i32 = -1;
+    var lcap: Buf = buf_new(16384);
+    defer { buf_free(&lcap); }
+    const lsaved: i32 = vw_cap_on(pp, &lcfd);
+    tty_draw_line(&tty_ui, 2);
+    vw_cap_off(pp, lsaved, lcfd, &lcap);
+    if !contains(&lcap, "▸ 任务 2/4 50%" as &const byte) {
+        ty_fail(tag, "画出来的帧里没有折叠行", &ok);
+    }
+    if !contains(&lcap, "[step 5] > " as &const byte) {
+        ty_fail(tag, "画出来的帧里没有提示符（层序：面板行在提示符上面）", &ok);
+    }
+
+    // ---- C) 展开：块里换成箱体，且每一行都是 98 列（含中文按显示列算）----
+    tasks_expand_set(true);
+    if !tasks_panel_sync() {
+        ty_fail(tag, "展开之后必须重推一次面板块", &ok);
+    }
+    buf_reset(&blk);
+    _ = buf_append(&blk, tty_ui.block.ptr, tty_ui.block.len);
+    if !contains(&blk, "┌─ tasks " as &const byte) {
+        ty_fail(tag, "展开之后面板块里没有任务箱体", &ok);
+    }
+    if !contains(&blk, "│ 清单" as &const byte) {
+        ty_fail(tag, "展开之后箱体里没有清单段", &ok);
+    }
+    if !contains(&blk, "└─ " as &const byte) {
+        ty_fail(tag, "展开之后箱体没有底框", &ok);
+    }
+    tsx_box_widths(tag, "滚动模式面板块", &blk, 0, &ok);
+
+    // ---- D) 再切回去：箱体消失，只剩折叠行 ----
+    tasks_expand_set(false);
+    _ = tasks_panel_sync();
+    buf_reset(&blk);
+    _ = buf_append(&blk, tty_ui.block.ptr, tty_ui.block.len);
+    if contains(&blk, "┌─ tasks " as &const byte) {
+        ty_fail(tag, "收起之后面板块里还留着任务箱体", &ok);
+    }
+
+    // 收尾：块与 fixture 都要清（后面的轮次共用这些全局）
+    tty_set_block_provider(&tty_ui, false);
+    tty_free(&tty_ui);
+    tty_init(&tty_ui, 0);
+    ttk_clear_fixtures();
+
+    if ok {
+        out_err("selftest[");
+        out_err(tag);
+        out_err("] ok（滚动模式：折叠行+agents 一起进面板块 / 真画一帧看得见 / 展开成等宽箱体 / 收起即隐）\n");
+    }
+    return ok;
+}
+
+// 清掉任务块用过的四张表（fixture 装在真实 globals 上，必须还回去）
+fn ttk_clear_fixtures() void {
+    todo_free(&g_todos);
+    todo_init(&g_todos);
+    jobs_free(&g_jobs);
+    jobs_init(&g_jobs);
+    deleg_free(&g_deleg);
+    deleg_init(&g_deleg);
+    tasks_free();
+    tasks_expand_set(false);
+}
+
+// ============================================================
+// P26：/diff 浮窗（git 修改的双列全文比对）
+//
+//   diff-parse 纯函数：unified diff → 行表（上下文 / 配对 / 落单 / 溢出 / CRLF / 二进制 /
+//              mode-only / 非 diff 文本 / 空输入），不碰 git、不碰 TUI
+//   diff-git   端到端：真 git 造 fixture 仓（自己用 gitx_run 建），断言文件列表、
+//              三栏内容、行号、增删计数、切换/夹取、刷新、文本回退、非仓库报错
+// ============================================================
+
+fn dp_eq(b: &const Buf, lit: &const byte) bool {
+    const n: usize = bufx_cstr_len(lit);
+    if b.len != n {
+        return false;
+    }
+    if n == 0 {
+        return true;
+    }
+    return bufx_mem_eq(b.ptr as &const byte, lit, n);
+}
+
+// 取第 i 行第 side 侧的单元格文本
+fn dp_cell(b: &Buf, i: usize, side: u8) void {
+    var len: usize = 0;
+    const p: &const byte = gd_cell(i, side, &len);
+    buf_reset(b);
+    _ = buf_append(b, p, len);
+}
+
+fn dp_kind(i: usize) u8 {
+    var r: GdRow = GdRow{ l_off: 0, l_len: 0, r_off: 0, r_len: 0, l_no: 0, r_no: 0, kind: 255 };
+    if !gd_row_meta(i, &r) {
+        return 255;
+    }
+    return r.kind;
+}
+
+fn dp_nos(i: usize, lno: &usize, rno: &usize) bool {
+    var r: GdRow = GdRow{ l_off: 0, l_len: 0, r_off: 0, r_len: 0, l_no: 0, r_no: 0, kind: 255 };
+    if !gd_row_meta(i, &r) {
+        return false;
+    }
+    lno[0] = r.l_no;
+    rno[0] = r.r_no;
+    return true;
+}
+
+// 深挖失败原因时打出来（只在 FAIL 分支调用）
+fn dp_dump(tag: &const byte) void {
+    var d: Buf = buf_new(65536);
+    defer { buf_free(&d); }
+    gd_dump_rows(&d);
+    out_err("selftest[");
+    out_err(tag);
+    out_err("] 行表：\n");
+    out_err_bytes(d.ptr as &const byte, d.len);
+}
+
+fn diff_parse_round(tag: &const byte) bool {
+    var ok: bool = true;
+    gd_reset();
+    var txt: Buf = buf_new(4096);
+    defer { buf_free(&txt); }
+    var c1: Buf = buf_new(1024);
+    defer { buf_free(&c1); }
+    var c2: Buf = buf_new(1024);
+    defer { buf_free(&c2); }
+    var a: usize = 0;
+    var r: usize = 0;
+    var lno: usize = 0;
+    var rno: usize = 0;
+
+    // ---- 1) 上下文 + 配对（2 删 3 增 → 2 个 MIX + 1 个 ADD）----
+    buf_reset(&txt);
+    _ = buf_append_cstr(&txt, "diff --git a/src/a.uya b/src/a.uya\n");
+    _ = buf_append_cstr(&txt, "index 1111111..2222222 100644\n");
+    _ = buf_append_cstr(&txt, "--- a/src/a.uya\n");
+    _ = buf_append_cstr(&txt, "+++ b/src/a.uya\n");
+    _ = buf_append_cstr(&txt, "@@ -1,5 +1,6 @@\n");
+    _ = buf_append_cstr(&txt, " line1\n");
+    _ = buf_append_cstr(&txt, "-line2\n");
+    _ = buf_append_cstr(&txt, "-old3\n");
+    _ = buf_append_cstr(&txt, "+NEW2\n");
+    _ = buf_append_cstr(&txt, "+NEW3\n");
+    _ = buf_append_cstr(&txt, "+NEW4\n");
+    _ = buf_append_cstr(&txt, " line4\n");
+    _ = buf_append_cstr(&txt, " line5\n");
+    gd_parse_into(&txt, &a, &r);
+    if a != 3 || r != 2 {
+        ty_fail(tag, "增删计数不对（2 删 3 增）", &ok);
+        dp_dump(tag);
+    }
+    if gd_rows() != 7 {
+        ty_fail(tag, "行数不对（1 说明 + 1 上下文 + 2 MIX + 1 ADD + 2 上下文 = 7）", &ok);
+        dp_dump(tag);
+    } else {
+        if dp_kind(0) != GD_K_HDR {
+            ty_fail(tag, "@@ 行不是 HDR", &ok);
+        }
+        if dp_kind(1) != GD_K_CTX || dp_kind(2) != GD_K_MIX || dp_kind(3) != GD_K_MIX {
+            ty_fail(tag, "第 2/3/4 行的类型不是 CTX/MIX/MIX", &ok);
+            dp_dump(tag);
+        }
+        if dp_kind(4) != GD_K_ADD || dp_kind(5) != GD_K_CTX || dp_kind(6) != GD_K_CTX {
+            ty_fail(tag, "第 5/6/7 行的类型不是 ADD/CTX/CTX", &ok);
+            dp_dump(tag);
+        }
+        dp_cell(&c1, 2, 0);
+        dp_cell(&c2, 2, 1);
+        if !dp_eq(&c1, "line2" as &const byte) || !dp_eq(&c2, "NEW2" as &const byte) {
+            ty_fail(tag, "MIX 行的左右文本不是 line2 / NEW2", &ok);
+            dp_dump(tag);
+        }
+        dp_cell(&c1, 4, 0);
+        dp_cell(&c2, 4, 1);
+        if c1.len != 0 || !dp_eq(&c2, "NEW4" as &const byte) {
+            ty_fail(tag, "落单的增行左侧必须为空、右侧是 NEW4", &ok);
+            dp_dump(tag);
+        }
+        // 行号：上下文两侧同值；MIX 各自推进
+        if !dp_nos(1, &lno, &rno) || lno != 1 || rno != 1 {
+            ty_fail(tag, "首行上下文的行号应当是 1/1", &ok);
+        }
+        if !dp_nos(2, &lno, &rno) || lno != 2 || rno != 2 {
+            ty_fail(tag, "第一个 MIX 的行号应当是 2/2", &ok);
+        }
+        if !dp_nos(4, &lno, &rno) || rno != 4 {
+            ty_fail(tag, "落单增行的新侧行号应当是 4", &ok);
+        }
+        if !dp_nos(5, &lno, &rno) || lno != 4 || rno != 5 {
+            ty_fail(tag, "尾随上下文的行号应当是 4/5", &ok);
+        }
+        dp_cell(&c1, 1, 0);
+        if !dp_eq(&c1, "line1" as &const byte) {
+            ty_fail(tag, "上下文单元格不该带前导空格（- / + / 空格是标记列）", &ok);
+        }
+    }
+
+    // ---- 2) 纯插入 / 纯删除 ----
+    buf_reset(&txt);
+    _ = buf_append_cstr(&txt, "@@ -10,2 +10,4 @@\n ctx\n+new1\n+new2\n ctx2\n");
+    gd_parse_into(&txt, &a, &r);
+    if a != 2 || r != 0 || gd_rows() != 5 {
+        ty_fail(tag, "纯插入块：2 增 0 删 5 行", &ok);
+        dp_dump(tag);
+    } else {
+        dp_cell(&c1, 2, 0);
+        dp_cell(&c2, 2, 1);
+        if c1.len != 0 || !dp_eq(&c2, "new1" as &const byte) {
+            ty_fail(tag, "纯插入的增行左侧应当为空", &ok);
+            dp_dump(tag);
+        }
+        if !dp_nos(4, &lno, &rno) || lno != 11 || rno != 13 {
+            ty_fail(tag, "插入之后的上下文行号应当是 11/13", &ok);
+            dp_dump(tag);
+        }
+    }
+    buf_reset(&txt);
+    _ = buf_append_cstr(&txt, "@@ -5,3 +5,1 @@\n keep\n-gone1\n-gone2\n");
+    gd_parse_into(&txt, &a, &r);
+    if a != 0 || r != 2 || gd_rows() != 4 {
+        ty_fail(tag, "纯删除块：0 增 2 删 4 行", &ok);
+        dp_dump(tag);
+    } else {
+        dp_cell(&c1, 2, 0);
+        dp_cell(&c2, 2, 1);
+        if !dp_eq(&c1, "gone1" as &const byte) || c2.len != 0 {
+            ty_fail(tag, "纯删除的删行右侧应当为空", &ok);
+            dp_dump(tag);
+        }
+    }
+
+    // ---- 3) 多个 hunk：两个 @@ 都是说明行 ----
+    buf_reset(&txt);
+    _ = buf_append_cstr(&txt, "@@ -1,1 +1,1 @@\n-a\n+A\n@@ -9,1 +9,1 @@\n-b\n+B\n");
+    gd_parse_into(&txt, &a, &r);
+    if gd_rows() != 4 || a != 2 || r != 2 {
+        ty_fail(tag, "两个 hunk 应当是 2 说明 + 2 MIX", &ok);
+        dp_dump(tag);
+    } else if dp_kind(0) != GD_K_HDR || dp_kind(2) != GD_K_HDR {
+        ty_fail(tag, "第二个 @@ 没有被当成说明行", &ok);
+        dp_dump(tag);
+    }
+
+    // ---- 4) `\ No newline at end of file` ----
+    buf_reset(&txt);
+    _ = buf_append_cstr(&txt, "@@ -1,1 +1,1 @@\n-old\n+new\n\\ No newline at end of file\n");
+    gd_parse_into(&txt, &a, &r);
+    if gd_rows() != 3 || dp_kind(2) != GD_K_HDR {
+        ty_fail(tag, "无换行结尾的标记行没有落成说明行", &ok);
+        dp_dump(tag);
+    } else {
+        dp_cell(&c1, 2, 0);
+        if !dp_eq(&c1, "\\ No newline at end of file" as &const byte) {
+            ty_fail(tag, "说明行的文本不对", &ok);
+            dp_dump(tag);
+        }
+    }
+
+    // ---- 5) CRLF：内容里的 \r 不许带进单元格 ----
+    buf_reset(&txt);
+    _ = buf_append_cstr(&txt, "@@ -1,1 +1,1 @@\r\n ctx\r\n-x\r\n+X\r\n");
+    gd_parse_into(&txt, &a, &r);
+    if gd_rows() != 3 {
+        ty_fail(tag, "CRLF 输入的行数不对", &ok);
+        dp_dump(tag);
+    } else {
+        dp_cell(&c1, 1, 0);
+        if !dp_eq(&c1, "ctx" as &const byte) {
+            ty_fail(tag, "CRLF 的 \\r 没有被去掉（会显示成 ·）", &ok);
+            dp_dump(tag);
+        }
+    }
+
+    // ---- 6) TAB / 控制字节原样保留（清洗是渲染层的事）----
+    buf_reset(&txt);
+    _ = buf_append_cstr(&txt, "@@ -1,1 +1,1 @@\n\tif a {\n-\told\n+\tnew\n");
+    gd_parse_into(&txt, &a, &r);
+    dp_cell(&c1, 1, 0);
+    if c1.len != 7 || c1.ptr[0] != 9 as byte {
+        ty_fail(tag, "TAB 应当原样保留在单元格里（由渲染层做 4 空格展开）", &ok);
+        dp_dump(tag);
+    }
+
+    // ---- 7) 二进制：留一行说明 ----
+    buf_reset(&txt);
+    _ = buf_append_cstr(&txt, "diff --git a/bin.dat b/bin.dat\nnew file mode 100644\nindex 0000000..1234567\n");
+    _ = buf_append_cstr(&txt, "Binary files /dev/null and b/bin.dat differ\n");
+    gd_parse_into(&txt, &a, &r);
+    if gd_rows() != 1 || dp_kind(0) != GD_K_HDR || a != 0 || r != 0 {
+        ty_fail(tag, "二进制文件应当只留一行说明", &ok);
+        dp_dump(tag);
+    } else {
+        dp_cell(&c1, 0, 0);
+        if !ty_has(&c1, "Binary files" as &const byte, 12) {
+            ty_fail(tag, "二进制说明行的文本不对", &ok);
+        }
+    }
+
+    // ---- 8) mode-only：没有 hunk ⇒ 0 行（note 由载入侧给）----
+    buf_reset(&txt);
+    _ = buf_append_cstr(&txt, "diff --git a/m.uya b/m.uya\nold mode 100644\nnew mode 100755\n");
+    gd_parse_into(&txt, &a, &r);
+    if gd_rows() != 0 {
+        ty_fail(tag, "只改权限不该产生行（载入侧会给「仅文件模式变更」）", &ok);
+        dp_dump(tag);
+    }
+
+    // ---- 9) 非 diff 文本（git 的报错）：整段一行说明，不许给空面板 ----
+    buf_reset(&txt);
+    _ = buf_append_cstr(&txt, "fatal: not a git repository (or any of the parent directories): .git\n");
+    gd_parse_into(&txt, &a, &r);
+    if gd_rows() != 1 || dp_kind(0) != GD_K_HDR {
+        ty_fail(tag, "非 diff 文本应当整段落成一行说明", &ok);
+        dp_dump(tag);
+    }
+
+    // ---- 10) 空输入 ----
+    buf_reset(&txt);
+    gd_parse_into(&txt, &a, &r);
+    if gd_rows() != 0 || a != 0 || r != 0 {
+        ty_fail(tag, "空输入应当是 0 行", &ok);
+    }
+
+    // ---- 11) 配对溢出：超过 GD_RUN_MAX 的块放弃配对，但一行不丢、顺序不乱 ----
+    buf_reset(&txt);
+    _ = buf_append_cstr(&txt, "@@ -1,4100 +1,2 @@\n");
+    var i: usize = 0;
+    while i < GD_RUN_MAX + 2 {
+        _ = buf_append_cstr(&txt, "-old");
+        _ = buf_append_u64(&txt, i as u64);
+        _ = buf_append_byte(&txt, 10);
+        i = i + 1;
+    }
+    _ = buf_append_cstr(&txt, "+NEWA\n+NEWB\n");
+    gd_parse_into(&txt, &a, &r);
+    if r != GD_RUN_MAX + 2 || a != 2 {
+        ty_fail(tag, "溢出块的增删计数不对（内容一行都不许丢）", &ok);
+    }
+    if gd_rows() != GD_RUN_MAX + 5 {
+        ty_fail(tag, "溢出块的行数不对（4098 删 + 2 增 + 1 说明）", &ok);
+    } else {
+        dp_cell(&c1, 1, 0);
+        if !dp_eq(&c1, "old0" as &const byte) {
+            ty_fail(tag, "溢出块的第一行不是 old0（顺序乱了）", &ok);
+        }
+        if dp_kind(1) != GD_K_DEL {
+            ty_fail(tag, "溢出块必须放弃配对（不许出现 MIX）", &ok);
+        }
+        dp_cell(&c2, GD_RUN_MAX + 4, 1);
+        if !dp_eq(&c2, "NEWB" as &const byte) {
+            ty_fail(tag, "溢出块末尾的增行内容不对", &ok);
+        }
+    }
+
+    if ok {
+        out_err("selftest[");
+        out_err(tag);
+        out_err("] ok（unified diff → 行表：配对/落单/溢出/CRLF/二进制/mode-only/非 diff 文本）\n");
+    }
+    return ok;
+}
+
+// ============================================================
+// diff-git：真 git 造 fixture 仓（用 gitx_run 自己建，顺带自测执行器）
+// ============================================================
+const DG_WS: &const byte = "build/selftest_diff_ws" as &const byte;
+
+// 绝对/相对路径 + **末尾 NUL**（sys_open 收的是 C 字符串：漏了 NUL 就会把缓冲区后面的
+// 垃圾当路径的一部分 —— README 坑 2 反复踩过，这里连 fixture 文件名都被污染过）
+fn dg_path(rel: &const byte, out: &Buf) void {
+    buf_reset(out);
+    _ = buf_append_cstr(out, DG_WS);
+    _ = buf_append_cstr(out, "/");
+    _ = buf_append_cstr_z(out, rel);
+}
+
+fn dg_run(argv: &(&const byte)) i32 {
+    var o: Buf = buf_new(4096);
+    defer { buf_free(&o); }
+    var e: Buf = buf_new(4096);
+    defer { buf_free(&e); }
+    return gitx_run(null as &const byte, argv, &o, &e, 4096);
+}
+
+fn dg_run2(argv: &(&const byte), errout: &Buf) i32 {
+    var o: Buf = buf_new(4096);
+    defer { buf_free(&o); }
+    return gitx_run(null as &const byte, argv, &o, errout, 4096);
+}
+
+// 造 diff 用的 fixture 仓（幂等：每跑一次都把三种状态重新做出来）
+//   a.uya = 已跟踪 + 改了一行（line2 → CHANGED）
+//   c.uya = 已跟踪 + 删掉
+//   b.uya = 未跟踪 + 新增
+// 幂等很重要：TUI 的 PTY 轮与 diff-git 轮都调它，谁先跑都要拿到同一份状态。
+export fn dg_fixture_make() bool {
+    _ = sess_mkdir_p(DG_WS);
+    var wsz: Buf = buf_new(256);
+    defer { buf_free(&wsz); }
+    _ = buf_append_cstr_z(&wsz, DG_WS);
+    var p: Buf = buf_new(512);
+    defer { buf_free(&p); }
+    var av: [&const byte: 10] = [null as &const byte: 10];
+    av[0] = "git" as &const byte;
+    av[1] = "-C" as &const byte;
+    av[2] = wsz.ptr as &const byte;
+    av[3] = "init" as &const byte;
+    av[4] = "-q" as &const byte;
+    av[5] = null as &const byte;
+    _ = dg_run(&av[0]);
+    dg_path("b.uya" as &const byte, &p);
+    _ = sys_unlink(&p.ptr[0] as *const byte) catch {};
+    dg_path("a.uya" as &const byte, &p);
+    if !write_text_file(&p.ptr[0] as &const byte, "line1\nline2\nline3\n" as &const byte) {
+        return false;
+    }
+    dg_path("c.uya" as &const byte, &p);
+    if !write_text_file(&p.ptr[0] as &const byte, "gone1\ngone2\n" as &const byte) {
+        return false;
+    }
+    var av2: [&const byte: 16] = [null as &const byte: 16];
+    av2[0] = "git" as &const byte;
+    av2[1] = "-C" as &const byte;
+    av2[2] = wsz.ptr as &const byte;
+    av2[3] = "add" as &const byte;
+    av2[4] = "-A" as &const byte;
+    av2[5] = null as &const byte;
+    _ = dg_run(&av2[0]);
+    var av3: [&const byte: 20] = [null as &const byte: 20];
+    av3[0] = "git" as &const byte;
+    av3[1] = "-C" as &const byte;
+    av3[2] = wsz.ptr as &const byte;
+    av3[3] = "-c" as &const byte;
+    av3[4] = "user.email=t@t" as &const byte;
+    av3[5] = "-c" as &const byte;
+    av3[6] = "user.name=t" as &const byte;
+    av3[7] = "commit" as &const byte;
+    av3[8] = "-q" as &const byte;
+    av3[9] = "-m" as &const byte;
+    av3[10] = "fixture" as &const byte;
+    av3[11] = null as &const byte;
+    _ = dg_run(&av3[0]);
+    // 已提交的基线之上制造三种状态
+    dg_path("a.uya" as &const byte, &p);
+    if !write_text_file(&p.ptr[0] as &const byte, "line1\nCHANGED\nline3\n" as &const byte) {
+        return false;
+    }
+    dg_path("b.uya" as &const byte, &p);
+    if !write_text_file(&p.ptr[0] as &const byte, "new1\nnew2\n" as &const byte) {
+        return false;
+    }
+    dg_path("c.uya" as &const byte, &p);
+    _ = sys_unlink(&p.ptr[0] as *const byte) catch {};
+    return true;
+}
+
+// 空仓库（没有任何改动 / 没有任何提交）：测「(没有 git 修改)」那条通知
+export fn dg_fixture_empty() bool {
+    const empty: &const byte = "build/selftest_diff_empty" as &const byte;
+    _ = sess_mkdir_p(empty);
+    var wsz: Buf = buf_new(256);
+    defer { buf_free(&wsz); }
+    _ = buf_append_cstr_z(&wsz, empty);
+    var av: [&const byte: 8] = [null as &const byte: 8];
+    av[0] = "git" as &const byte;
+    av[1] = "-C" as &const byte;
+    av[2] = wsz.ptr as &const byte;
+    av[3] = "init" as &const byte;
+    av[4] = "-q" as &const byte;
+    av[5] = null as &const byte;
+    return dg_run(&av[0]) == 0;
+}
+
+fn diff_git_round(tag: &const byte) bool {
+    var ok: bool = true;
+    gd_reset();
+    if !gitx_available() {
+        out_err("selftest[");
+        out_err(tag);
+        out_err("] skip（本机 PATH 里没有 git）\n");
+        return ok;
+    }
+    var p: Buf = buf_new(512);
+    defer { buf_free(&p); }
+    var b: Buf = buf_new(1024);
+    defer { buf_free(&b); }
+    if !dg_fixture_make() {
+        ty_fail(tag, "造 fixture 仓失败", &ok);
+        return ok;
+    }
+
+    // 2) 打开：3 个文件 + 状态码 + numstat 计数
+    const rc: i32 = gd_open(DG_WS, bufx_cstr_len(DG_WS));
+    if rc != 0 {
+        ty_fail(tag, "gd_open 失败（fixture 仓应当能打开）", &ok);
+        out_err("  err=");
+        out_err_bytes(gd_error().ptr as &const byte, gd_error().len);
+        out_err("\n");
+        return ok;
+    }
+    var ia: i64 = -1;
+    var ib: i64 = -1;
+    var ic: i64 = -1;
+    var list: Buf = buf_new(4096);
+    defer { buf_free(&list); }
+    var i: usize = 0;
+    while i < gd_file_count() {
+        var len: usize = 0;
+        const ft: &const byte = gd_file_text(i, &len);
+        _ = buf_append_cstr(&list, "    ");
+        _ = buf_append(&list, ft, len);
+        _ = buf_append_byte(&list, 10);
+        buf_reset(&b);
+        _ = buf_append(&b, ft, len);
+        if ty_has(&b, "a.uya" as &const byte, 5) { ia = i as i64; }
+        if ty_has(&b, "b.uya" as &const byte, 5) { ib = i as i64; }
+        if ty_has(&b, "c.uya" as &const byte, 5) { ic = i as i64; }
+        i = i + 1;
+    }
+    var len0: usize = 0;
+    const f0: &const byte = gd_file_text(if ia > 0 { ia as usize } else { 0 as usize }, &len0);
+    _ = f0;
+    if gd_file_count() != 3 {
+        ty_fail(tag, "文件数不是 3（a/b/c 三个改动）", &ok);
+        out_err("  列表：\n");
+        out_err_bytes(list.ptr as &const byte, list.len);
+    } else if ia < 0 || ib < 0 || ic < 0 {
+        ty_fail(tag, "列表里找不到 a.uya / b.uya / c.uya 三个文件", &ok);
+        out_err("  列表：\n");
+        out_err_bytes(list.ptr as &const byte, list.len);
+    } else {
+        // 状态码 + numstat 计数（逐行看）
+        var len: usize = 0;
+        const fa: &const byte = gd_file_text(ia as usize, &len);
+        buf_reset(&b);
+        _ = buf_append(&b, fa, len);
+        if !ty_has(&b, "M  a.uya" as &const byte, 7) {
+            ty_fail(tag, "a.uya 那一行的状态码不是「 M」（git status -z 的 XY）", &ok);
+            out_err("  行=");
+            out_err_bytes(b.ptr as &const byte, b.len);
+            out_err("\n");
+        }
+        if !ty_has(&b, "(+1 -1)" as &const byte, 7) {
+            ty_fail(tag, "a.uya 的 numstat 计数不是 (+1 -1)", &ok);
+            out_err("  行=");
+            out_err_bytes(b.ptr as &const byte, b.len);
+            out_err("\n");
+        }
+        const fb: &const byte = gd_file_text(ib as usize, &len);
+        buf_reset(&b);
+        _ = buf_append(&b, fb, len);
+        if !ty_has(&b, "??  b.uya" as &const byte, 7) {
+            ty_fail(tag, "b.uya 那一行的状态码不是「??」", &ok);
+        }
+        if !ty_has(&b, "(new)" as &const byte, 5) {
+            ty_fail(tag, "未跟踪文件应当标 (new)", &ok);
+        }
+        const fc: &const byte = gd_file_text(ic as usize, &len);
+        buf_reset(&b);
+        _ = buf_append(&b, fc, len);
+        if !ty_has(&b, "D  c.uya" as &const byte, 7) {
+            ty_fail(tag, "c.uya 那一行的状态码不是「 D」", &ok);
+        }
+        if !ty_has(&b, "(+0 -2)" as &const byte, 7) {
+            ty_fail(tag, "c.uya 的 numstat 计数不是 (+0 -2)", &ok);
+            out_err("  行=");
+            out_err_bytes(b.ptr as &const byte, b.len);
+            out_err("\n");
+        }
+    }
+
+    // 3) 已跟踪文件：两侧内容 + 行号 + 计数
+    var c1: Buf = buf_new(1024);
+    defer { buf_free(&c1); }
+    var c2: Buf = buf_new(1024);
+    defer { buf_free(&c2); }
+    var lno: usize = 0;
+    var rno: usize = 0;
+    if gd_sel() != 0 {
+        ty_fail(tag, "打开后应当选中第一个文件", &ok);
+    }
+    if !gd_select(ia as usize) {
+        ty_fail(tag, "选不中 a.uya 那一行", &ok);
+    }
+    if gd_rows() != 4 || gd_added() != 1 || gd_removed() != 1 {
+        ty_fail(tag, "a.uya 应当是 4 行（1 说明 + 1 上下文 + 1 MIX + 1 上下文）、+1 -1", &ok);
+        dp_dump(tag);
+    } else {
+        if dp_kind(1) != GD_K_CTX || dp_kind(2) != GD_K_MIX || dp_kind(3) != GD_K_CTX {
+            ty_fail(tag, "a.uya 的行类型不是 CTX/MIX/CTX", &ok);
+            dp_dump(tag);
+        }
+        dp_cell(&c1, 2, 0);
+        dp_cell(&c2, 2, 1);
+        if !dp_eq(&c1, "line2" as &const byte) || !dp_eq(&c2, "CHANGED" as &const byte) {
+            ty_fail(tag, "a.uya 的改动行不是 line2 → CHANGED", &ok);
+            dp_dump(tag);
+        }
+        if !dp_nos(2, &lno, &rno) || lno != 2 || rno != 2 {
+            ty_fail(tag, "a.uya 改动行的行号应当是 2/2", &ok);
+        }
+        dp_cell(&c1, 0, 0);
+        if !ty_has(&c1, "@@ -1,3 +1,3 @@" as &const byte, 15) {
+            ty_fail(tag, "说明行不是 @@ -1,3 +1,3 @@", &ok);
+            dp_dump(tag);
+        }
+    }
+
+    // 4) 未跟踪文件：整份内容都是新增
+    if !gd_select(ib as usize) {
+        ty_fail(tag, "选不中 b.uya 那一行", &ok);
+    }
+    if gd_rows() != 3 || gd_added() != 2 || gd_removed() != 0 {
+        ty_fail(tag, "b.uya（未跟踪）应当是 3 行、+2 -0", &ok);
+        dp_dump(tag);
+    } else {
+        dp_cell(&c1, 1, 0);
+        dp_cell(&c2, 1, 1);
+        if c1.len != 0 || !dp_eq(&c2, "new1" as &const byte) {
+            ty_fail(tag, "未跟踪文件的第一行应当是「左侧空 / 右侧 new1」", &ok);
+            dp_dump(tag);
+        }
+        if !dp_nos(2, &lno, &rno) || rno != 2 {
+            ty_fail(tag, "未跟踪文件的第二行新侧行号应当是 2", &ok);
+        }
+    }
+
+    // 5) 删除的文件：全在左侧
+    _ = gd_select(ic as usize);
+    if gd_rows() != 3 || gd_added() != 0 || gd_removed() != 2 {
+        ty_fail(tag, "c.uya（已删除）应当是 3 行、+0 -2", &ok);
+        dp_dump(tag);
+    } else {
+        dp_cell(&c1, 1, 0);
+        dp_cell(&c2, 1, 1);
+        if !dp_eq(&c1, "gone1" as &const byte) || c2.len != 0 {
+            ty_fail(tag, "已删除文件的第一行应当是「左侧 gone1 / 右侧空」", &ok);
+            dp_dump(tag);
+        }
+    }
+
+    // 6) 夹取 + 刷新（改一下 a.uya 再看）
+    _ = gd_select(ic as usize);
+    _ = gd_move(1);
+    if gd_sel() + 1 != gd_file_count() {
+        ty_fail(tag, "到底之后再 ↓ 应当停在最后一个文件", &ok);
+    }
+    _ = gd_move(-9);
+    if gd_sel() != 0 {
+        ty_fail(tag, "到顶之后再 ↑ 应当停在第一个文件", &ok);
+    }
+    _ = gd_select(ia as usize);
+    dg_path("a.uya" as &const byte, &p);
+    _ = write_text_file(&p.ptr[0] as &const byte, "line1\nCHANGED2\nline3\n" as &const byte);
+    if gd_refresh() != 0 {
+        ty_fail(tag, "gd_refresh 失败", &ok);
+    }
+    if gd_rows() != 4 {
+        ty_fail(tag, "刷新之后行数应当是 4", &ok);
+    } else {
+        dp_cell(&c2, 2, 1);
+        if !dp_eq(&c2, "CHANGED2" as &const byte) {
+            ty_fail(tag, "刷新之后没看到新内容（r 键的重扫路径）", &ok);
+            dp_dump(tag);
+        }
+    }
+
+    // 7) 滚动：内容装不下时夹取（这里用 view=1 模拟一行的视口）
+    gd_set_view(1);
+    gd_scroll_end();
+    if gd_scroll() == 0 {
+        ty_fail(tag, "视口只有 1 行时 gd_scroll_end 应当能滚起来", &ok);
+    }
+    gd_scroll_home();
+    if gd_scroll() != 0 {
+        ty_fail(tag, "gd_scroll_home 没有回到顶部", &ok);
+    }
+    gd_hscroll_by(-1);
+    if gd_hscroll() != 0 {
+        ty_fail(tag, "左滚不该变成负数", &ok);
+    }
+    gd_hscroll_by(1);
+    if gd_hscroll() != GD_HSTEP {
+        ty_fail(tag, "右滚一步应当是 GD_HSTEP 列", &ok);
+    }
+
+    // 8) 文本回退（非 TUI 模式打的单列 unified diff）
+    var out: Buf = buf_new(65536);
+    defer { buf_free(&out); }
+    gd_print_text(DG_WS, bufx_cstr_len(DG_WS), &out);
+    if !ty_has(&out, "[diff] " as &const byte, 7) {
+        ty_fail(tag, "文本回退没有 [diff] 头", &ok);
+    }
+    if !ty_has(&out, "3 个文件" as &const byte, 7) {
+        ty_fail(tag, "文本回退没有报出文件数", &ok);
+    }
+    if !ty_has(&out, "M  a.uya" as &const byte, 7) || !ty_has(&out, "??  b.uya" as &const byte, 7) {
+        ty_fail(tag, "文本回退的列表里没有三个文件", &ok);
+    }
+    if !ty_has(&out, "+CHANGED2" as &const byte, 9) {
+        ty_fail(tag, "文本回退里没有 a.uya 的新内容", &ok);
+    }
+    if !ty_has(&out, "+++ b/b.uya" as &const byte, 11) {
+        ty_fail(tag, "文本回退里没有未跟踪文件的 diff 段", &ok);
+    }
+
+    // 9) 非仓库目录：报错可见（/tmp 不在任何仓库里）
+    gd_reset();
+    const rc2: i32 = gd_open("/tmp" as &const byte, 4);
+    if rc2 >= 0 {
+        ty_fail(tag, "在非仓库目录上 gd_open 竟然成功了", &ok);
+    }
+    if gd_error().len == 0 {
+        ty_fail(tag, "非仓库目录没有给出错误文案", &ok);
+    }
+    gd_reset();
+
+    if ok {
+        out_err("selftest[");
+        out_err(tag);
+        out_err("] ok（真 git：列表/状态码/numstat/三态内容/行号/切换/夹取/刷新/文本回退/非仓库）\n");
+    }
+    return ok;
+}
+
+// ============================================================
+// P29：/goal 人类命令（纯函数轮）—— 语法 / 措辞 / 状态机 / 落盘
+//
+// 逐条对齐 DSH 的 commands/command-goal：控制词只有**独占整行**时才算控制词（否则整行
+// 都是字面目标）、已有未完成的 goal 不许被顶掉、edit 不动 phase、pause/resume 翻 armed、
+// clear 删文件。TUI 那边的浮层与常驻块刷新在 tuiselftest 的 tui-tasks 轮里验。
+// ============================================================
+fn gcr_has(tag: &const byte, what: &const byte, b: &const Buf, lit: &const byte, ok: &bool) void {
+    if !contains(b, lit) {
+        out_err("selftest[");
+        out_err(tag);
+        out_err("] FAIL: ");
+        out_err(what);
+        out_err("：输出里没有 \"");
+        out_err(lit);
+        out_err("\"\n");
+        ok[0] = false;
+    }
+}
+
+fn gcr_no(tag: &const byte, what: &const byte, b: &const Buf, lit: &const byte, ok: &bool) void {
+    if contains(b, lit) {
+        out_err("selftest[");
+        out_err(tag);
+        out_err("] FAIL: ");
+        out_err(what);
+        out_err("：输出里不该有 \"");
+        out_err(lit);
+        out_err("\"\n");
+        ok[0] = false;
+    }
+}
+
+fn gcr_rc(tag: &const byte, what: &const byte, got: i32, want: i32, ok: &bool) void {
+    if got != want {
+        out_err("selftest[");
+        out_err(tag);
+        out_err("] FAIL: ");
+        out_err(what);
+        out_err("：返回码不对（要 ");
+        var b: Buf = buf_new(64);
+        defer { buf_free(&b); }
+        _ = buf_append_i64(&b, want as i64);
+        _ = buf_append_cstr(&b, "，实得 ");
+        _ = buf_append_i64(&b, got as i64);
+        _ = buf_append_cstr(&b, "）\n");
+        _ = buf_append_byte(&b, 0);
+        out_err(b.ptr as &const byte);
+        ok[0] = false;
+    }
+}
+
+// 一条命令：把整行塞进 line 再跑 goal_cmd_run
+fn gcr_run(c: &const Config, line: &Buf, out: &Buf, lit: &const byte) i32 {
+    buf_reset(line);
+    _ = buf_append_cstr(line, lit);
+    return goal_cmd_run(c, line, out);
+}
+
+// 盘上现在是什么（没有目标时返回 false）
+fn gcr_peek(c: &const Config, g: &Goal) bool {
+    goal_free(g);
+    g[0] = goal_empty();
+    return goal_load(c, g);
+}
+
+fn goal_cmd_round(tag: &const byte) bool {
+    var ok: bool = true;
+    const home: &const byte = "build/selftest_goal_home" as &const byte;
+    _ = sess_mkdir_p(home);
+    var c: Config = cfg_default();
+    defer { cfg_free(&c); }
+    c.agent_home = buf_new(64);
+    _ = buf_append_cstr(&c.agent_home, home);
+    _ = goal_clear(&c);                  // 上一轮留下的 goal.json 先清掉（id 才能从 1 开始）
+    var out: Buf = buf_new(4096);
+    defer { buf_free(&out); }
+    var line: Buf = buf_new(512);
+    defer { buf_free(&line); }
+    var g: Goal = goal_empty();
+    defer { goal_free(&g); }
+
+    // ---- A) 没有目标：裸命令报用法（**成功**——看状态本身不会失败）----
+    gcr_rc(tag, "裸 /goal（无目标）应当成功", gcr_run(&c, &line, &out, "/goal" as &const byte), 0, &ok);
+    gcr_has(tag, "无目标时没有报「当前没有目标」", &out, "No goal is currently set." as &const byte, &ok);
+    gcr_has(tag, "无目标时没有给出用法", &out, "Usage: /goal" as &const byte, &ok);
+    gcr_no(tag, "无目标时不该有状态块", &out, "Activation:" as &const byte, &ok);
+    if out.len == 0 || out.ptr[out.len - 1] != 10 as byte {
+        ty_fail(tag, "输出没有以换行收尾（会与下一行提示符粘在一起）", &ok);
+    }
+
+    // ---- B) 没有目标：pause / resume / edit 各自报「需要一个目标」----
+    gcr_rc(tag, "无目标时 pause 应当报错", gcr_run(&c, &line, &out, "/goal pause" as &const byte), 1, &ok);
+    gcr_has(tag, "pause 的报错没点出是 pause 缺目标", &out,
+        "No goal is currently set; /goal pause requires one." as &const byte, &ok);
+    gcr_rc(tag, "无目标时 resume 应当报错", gcr_run(&c, &line, &out, "/goal resume" as &const byte), 1, &ok);
+    gcr_has(tag, "resume 的报错没点出是 resume 缺目标", &out,
+        "No goal is currently set; /goal resume requires one." as &const byte, &ok);
+    gcr_rc(tag, "无目标时 edit 应当报错", gcr_run(&c, &line, &out, "/goal edit 新目标" as &const byte), 1, &ok);
+    gcr_has(tag, "edit 的报错没点出是 edit 缺目标", &out,
+        "No goal is currently set; /goal edit requires one." as &const byte, &ok);
+
+    // ---- C) edit 有控制词、没有替换内容：直接报用法（不是「把 edit 当目标建出来」）----
+    gcr_rc(tag, "裸 edit 应当报错", gcr_run(&c, &line, &out, "/goal edit" as &const byte), 1, &ok);
+    gcr_has(tag, "裸 edit 没报「需要替换内容」", &out,
+        "Goal editing requires a replacement objective." as &const byte, &ok);
+    gcr_rc(tag, "`/goal edit   `（只有空白）同样应当报错",
+        gcr_run(&c, &line, &out, "/goal edit   " as &const byte), 1, &ok);
+    if gcr_peek(&c, &g) {
+        ty_fail(tag, "报错的命令不该在盘上留下目标", &ok);
+    }
+
+    // ---- D) 创建：状态块四段 + 落盘（id 1 / revision 1 / active / armed / 0 轮）----
+    gcr_rc(tag, "创建目标应当成功",
+        gcr_run(&c, &line, &out, "/goal 把测试跑绿" as &const byte), 0, &ok);
+    gcr_has(tag, "创建没有回执", &out, "Goal created" as &const byte, &ok);
+    gcr_has(tag, "创建后 phase 不对", &out, "Status: active" as &const byte, &ok);
+    gcr_has(tag, "创建后 objective 不对", &out, "Objective: 把测试跑绿" as &const byte, &ok);
+    gcr_has(tag, "创建后轮数不对", &out, "Rounds: 0/20" as &const byte, &ok);
+    gcr_has(tag, "创建后激活态不对", &out, "Activation: armed" as &const byte, &ok);
+    gcr_has(tag, "创建后没给出下一步命令", &out,
+        "Commands: /goal edit <objective>, /goal pause, /goal clear" as &const byte, &ok);
+    if !gcr_peek(&c, &g) {
+        ty_fail(tag, "创建之后盘上没有 goal.json", &ok);
+    } else {
+        if g.id != 1 || g.revision != 1 || g.round != 0 || !g.armed {
+            ty_fail(tag, "落盘的 id/revision/round/armed 不对", &ok);
+        }
+        if !bufx_eq_cstr(g.phase.ptr as &const byte, g.phase.len, "active" as &const byte) {
+            ty_fail(tag, "落盘的 phase 不是 active", &ok);
+        }
+        if !bufx_eq_cstr(g.objective.ptr as &const byte, g.objective.len, "把测试跑绿" as &const byte) {
+            ty_fail(tag, "落盘的 objective 与命令里写的不一样", &ok);
+        }
+    }
+
+    // ---- E) 裸 /goal：报当前状态（不是用法）----
+    gcr_rc(tag, "裸 /goal（有目标）应当成功", gcr_run(&c, &line, &out, "/goal" as &const byte), 0, &ok);
+    gcr_has(tag, "有目标时没有打出状态块", &out, "Goal\nStatus: active" as &const byte, &ok);
+    gcr_no(tag, "有目标时不该再报「没有目标」", &out, "No goal is currently set." as &const byte, &ok);
+
+    // ---- F) 已有未完成的目标：不许被顶掉（必须先 edit 或 clear）----
+    gcr_rc(tag, "重复创建应当被拒", gcr_run(&c, &line, &out, "/goal 另一个目标" as &const byte), 1, &ok);
+    gcr_has(tag, "重复创建的报错措辞不对", &out, "A goal is already active." as &const byte, &ok);
+    if gcr_peek(&c, &g) {
+        if !bufx_eq_cstr(g.objective.ptr as &const byte, g.objective.len, "把测试跑绿" as &const byte) {
+            ty_fail(tag, "被拒的创建居然改了盘上的 objective", &ok);
+        }
+    } else {
+        ty_fail(tag, "被拒的创建之后目标没了", &ok);
+    }
+
+    // ---- G) edit：只换 objective，phase/armed/round 不动，revision +1 ----
+    gcr_rc(tag, "edit 应当成功",
+        gcr_run(&c, &line, &out, "/goal edit 改成跑绿全部测试" as &const byte), 0, &ok);
+    gcr_has(tag, "edit 没有回执", &out, "Goal updated" as &const byte, &ok);
+    gcr_has(tag, "edit 没换掉 objective", &out, "Objective: 改成跑绿全部测试" as &const byte, &ok);
+    gcr_has(tag, "edit 之后 phase 不该变", &out, "Status: active" as &const byte, &ok);
+    gcr_has(tag, "edit 之后激活态不该变", &out, "Activation: armed" as &const byte, &ok);
+    if gcr_peek(&c, &g) {
+        if g.revision != 2 {
+            ty_fail(tag, "edit 之后 revision 不是 2", &ok);
+        }
+    }
+
+    // ---- H) pause / resume：phase 与 armed 一起翻 ----
+    gcr_rc(tag, "pause 应当成功", gcr_run(&c, &line, &out, "/goal pause" as &const byte), 0, &ok);
+    gcr_has(tag, "pause 之后 phase 不是 paused", &out, "Status: paused" as &const byte, &ok);
+    gcr_has(tag, "pause 之后 armed 没关掉", &out, "Activation: disarmed" as &const byte, &ok);
+    gcr_has(tag, "paused 时给出的下一步命令不对", &out, "/goal edit <objective>, /goal resume" as &const byte, &ok);
+    gcr_rc(tag, "resume 应当成功", gcr_run(&c, &line, &out, "/goal resume" as &const byte), 0, &ok);
+    gcr_has(tag, "resume 之后 phase 不是 active", &out, "Status: active" as &const byte, &ok);
+    gcr_has(tag, "resume 之后 armed 没打开", &out, "Activation: armed" as &const byte, &ok);
+
+    // ---- I) 控制词只在独占整行时才算控制词：`pause after verification` 是**字面目标** ----
+    gcr_rc(tag, "clear 应当成功", gcr_run(&c, &line, &out, "/goal clear" as &const byte), 0, &ok);
+    gcr_has(tag, "clear 没有回执", &out, "Goal cleared." as &const byte, &ok);
+    if gcr_peek(&c, &g) {
+        ty_fail(tag, "clear 之后盘上还有 goal.json", &ok);
+    }
+    gcr_rc(tag, "clear 之后再 clear 应当成功（幂等）",
+        gcr_run(&c, &line, &out, "/goal clear" as &const byte), 0, &ok);
+    gcr_has(tag, "重复 clear 的措辞不对", &out, "No goal to clear." as &const byte, &ok);
+    gcr_rc(tag, "带后缀的 pause 应当按字面目标创建",
+        gcr_run(&c, &line, &out, "/goal pause after verification" as &const byte), 0, &ok);
+    gcr_has(tag, "`pause after verification` 没有被当成目标", &out,
+        "Objective: pause after verification" as &const byte, &ok);
+    // 控制词做前缀（clearx / edits）：同样是字面目标，不是控制词
+    gcr_rc(tag, "clearx 应当按字面目标被拒（已有目标）",
+        gcr_run(&c, &line, &out, "/goal clearx" as &const byte), 1, &ok);
+    gcr_has(tag, "clearx 被当成了 clear", &out, "A goal is already active." as &const byte, &ok);
+    if gcr_peek(&c, &g) {
+        if !bufx_eq_cstr(g.objective.ptr as &const byte, g.objective.len,
+                "pause after verification" as &const byte) {
+            ty_fail(tag, "clearx 那条命令动过了 objective", &ok);
+        }
+    }
+    // 大小写不敏感（控制词整行时）：CLEAR
+    gcr_rc(tag, "大写 CLEAR 应当照样清掉",
+        gcr_run(&c, &line, &out, "/goal CLEAR" as &const byte), 0, &ok);
+    gcr_has(tag, "大写 CLEAR 没有回执", &out, "Goal cleared." as &const byte, &ok);
+    if gcr_peek(&c, &g) {
+        ty_fail(tag, "大写 CLEAR 之后盘上还有 goal.json", &ok);
+    }
+
+    // ---- J) complete 的 goal：让位给新身份（id +1，revision 回到 1，round 归零）----
+    var cg: Goal = goal_empty();
+    defer { goal_free(&cg); }
+    cg.active_state = true;
+    cg.id = 7;
+    cg.revision = 4;
+    cg.phase = buf_new(16);
+    _ = buf_append_cstr(&cg.phase, "complete");
+    cg.objective = buf_new(32);
+    _ = buf_append_cstr(&cg.objective, "上一件事");
+    cg.round = 3;
+    cg.max_rounds = 20;
+    cg.blocker = buf_empty();
+    cg.armed = false;
+    if !goal_save(&c, &cg) {
+        ty_fail(tag, "装不上 complete 的 fixture（goal_save 失败）", &ok);
+    }
+    gcr_rc(tag, "complete 之后允许新目标",
+        gcr_run(&c, &line, &out, "/goal 下一件事" as &const byte), 0, &ok);
+    gcr_has(tag, "complete 之后的新目标没建出来", &out, "Goal created" as &const byte, &ok);
+    if gcr_peek(&c, &g) {
+        if g.id != 8 || g.revision != 1 || g.round != 0 || !g.armed {
+            ty_fail(tag, "complete 之后的新身份不对（应当是 id 8 / revision 1 / 0 轮 / armed）", &ok);
+        }
+    }
+    // edit 打在 complete 的 goal 上：同样换新身份
+    if gcr_peek(&c, &g) {
+        buf_reset(&g.phase);
+        _ = buf_append_cstr(&g.phase, "complete");
+        g.armed = false;
+        if !goal_save(&c, &g) {
+            ty_fail(tag, "装不上 complete fixture（第二处）", &ok);
+        }
+    }
+    gcr_rc(tag, "edit 打在 complete 的 goal 上应当换新身份",
+        gcr_run(&c, &line, &out, "/goal edit 又一件新事" as &const byte), 0, &ok);
+    gcr_has(tag, "complete 上的 edit 没建出新目标", &out, "Goal created" as &const byte, &ok);
+    if gcr_peek(&c, &g) {
+        if g.id != 9 || g.revision != 1 {
+            ty_fail(tag, "complete 上的 edit 之后不是新身份（id 9 / revision 1）", &ok);
+        }
+        if !bufx_eq_cstr(g.objective.ptr as &const byte, g.objective.len,
+                "又一件新事" as &const byte) {
+            ty_fail(tag, "complete 上的 edit 没换成新的 objective", &ok);
+        }
+    }
+    _ = goal_clear(&c);                  // 收尾：不留 goal.json 给别的轮
+
+    if ok {
+        out_err("selftest[");
+        out_err(tag);
+        out_err("] ok（用法/缺目标/字面目标/创建·编辑·暂停·恢复·清除/complete 换新身份/落盘字段）\n");
+    }
+    return ok;
+}
+
 export fn selftest_main(base: &const Config) i32 {
     _ = base;
+    // 调试入口：只跑 P26（/diff）轮
+    if env_present("UYA_SELFTEST_DIFF_ONLY" as &const byte) {
+        const d0: bool = diff_parse_round("diff-parse" as &const byte);
+        const d1: bool = diff_git_round("diff-git" as &const byte);
+        if d0 && d1 {
+            out_err("SELFTEST DIFF PASS\n");
+            return AGENT_OK;
+        }
+        out_err("SELFTEST DIFF FAIL\n");
+        return AGENT_PROTO;
+    }
     // 调试入口：只跑 TUI 轮（改动 TUI 时不必等整轮 selftest）
     // 调试入口：只跑 P21（访问模式/沙箱）轮
     if env_present("UYA_SELFTEST_PERM_ONLY" as &const byte) {
@@ -10783,11 +12588,34 @@ export fn selftest_main(base: &const Config) i32 {
         const p2: bool = san_shell_round("san-shell" as &const byte);
         const p3: bool = perm_readonly_round(base, "perm-readonly" as &const byte, "build/selftest_ws_perm" as &const byte);
         const p4: bool = san_tool_round(base, "san-tool" as &const byte, "build/selftest_ws_san" as &const byte);
-        if p0 && p1 && p2 && p3 && p4 {
+        const p5: bool = plan_gate_round(base, "plan-gate" as &const byte, "build/selftest_ws_plangate" as &const byte);
+        if p0 && p1 && p2 && p3 && p4 && p5 {
             out_err("SELFTEST PERM PASS\n");
             return AGENT_OK;
         }
         out_err("SELFTEST PERM FAIL\n");
+        return AGENT_PROTO;
+    }
+    // 调试入口：只跑 P25（任务状态）轮
+    if env_present("UYA_SELFTEST_TASKS_ONLY" as &const byte) {
+        const q0: bool = tasks_render_round("tasks-render" as &const byte);
+        const q2: bool = tasks_scroll_round("tasks-scroll" as &const byte);
+        const q1: bool = tui_tasks_round("tui-tasks" as &const byte);
+        if q0 && q1 && q2 {
+            out_err("SELFTEST TASKS PASS\n");
+            return AGENT_OK;
+        }
+        out_err("SELFTEST TASKS FAIL\n");
+        return AGENT_PROTO;
+    }
+    // 调试入口：只跑 P29（/goal 人类命令）轮
+    if env_present("UYA_SELFTEST_GOAL_ONLY" as &const byte) {
+        const g0: bool = goal_cmd_round("goal-cmd" as &const byte);
+        if g0 {
+            out_err("SELFTEST GOAL PASS\n");
+            return AGENT_OK;
+        }
+        out_err("SELFTEST GOAL FAIL\n");
         return AGENT_PROTO;
     }
     if env_present("UYA_SELFTEST_TUI_ONLY" as &const byte) {
@@ -10936,6 +12764,7 @@ export fn selftest_main(base: &const Config) i32 {
     const z5: bool = san_shell_round("san-shell" as &const byte);
     const z6: bool = perm_readonly_round(base, "perm-readonly" as &const byte, "build/selftest_ws_perm" as &const byte);
     const z7: bool = san_tool_round(base, "san-tool" as &const byte, "build/selftest_ws_san" as &const byte);
+    // P26：plan 模式是**写闸门**（不只是提示词里的软引导）：全权模式下 write/edit 也被拒
     // P20：统计轮（这一轮的 mock 答案帧带 usage，让 token 账目有端到端覆盖），
     // 然后比对「实时折叠」与「日志回放」—— 后者就是 resume 走的那条路
 
@@ -10949,6 +12778,8 @@ export fn selftest_main(base: &const Config) i32 {
     const w1: bool = stats_line_round("stats-line");
     const w2: bool = stats_fold_round("stats-fold");
     const w3: bool = stats_context_round("stats-context");
+    // P27：bash 结果的剪枝（信号行优先 + 中段抽样）
+    const w3b: bool = prune_bash_round("prune-bash" as &const byte);
     const w4: bool = procx_parse_round("procx-parse");
     const w5: bool = procx_percent_round("procx-percent");
     // P24：内存行的解析与显示（PSS / VmRSS 取数 + K/M/G 显示）
@@ -10957,8 +12788,18 @@ export fn selftest_main(base: &const Config) i32 {
     const w6: bool = cpu_live_round("cpu-live");
     // P22：终端标题（清洗 / 兜底派生 / 基标题 / OSC 2 + 标题栈）
     const w7: bool = title_round("title-format" as &const byte);
+    // P25：任务状态（折叠行 / 箱体 / /tasks 报告）—— 纯函数轮 + 滚动模式活路径
+    const w8: bool = tasks_render_round("tasks-render" as &const byte);
+    const w9: bool = tasks_scroll_round("tasks-scroll" as &const byte);
+    // P26：/diff（unified diff → 双列行表 + 真 git 的端到端）
+    const wA: bool = diff_parse_round("diff-parse" as &const byte);
+    const wB: bool = diff_git_round("diff-git" as &const byte);
+    // P26：plan 模式是**写闸门**（不只是提示词里的软引导）：全权模式下 write/edit 也被拒
+    const z8: bool = plan_gate_round(base, "plan-gate" as &const byte, "build/selftest_ws_plangate" as &const byte);
+    // P29：/goal 人类命令（语法 / 措辞 / 状态机 / 落盘）—— TUI 浮层那条腿在 tui-tasks 轮里
+    const z9: bool = goal_cmd_round("goal-cmd" as &const byte);
     if r1 && r2 && r3 && r4 && r5 && r5b && r6 && r7 && r8 && r9 && s0 && s1 && s2 && s3 && s4 && s5 && s6 && s7 && t0 && t1 && t2 && t3 && t3b && t4 && t5 && t6 && t7 && t8 && t9 && t10 && t11 && u0 && u1 && u2 && u3 && v0 && v1 && v2 && v3 && v4 && v5 && v6 && v7 && v8 && v9 && r1r && r1t && r1s && y0 && y1
-        && x0 && x1 && x2 && x3 && x4 && x5 && x6 && x7 && x8 && x9 && x9a && x9b && x10 && x11 && x12 && x13 && x14 && x15 && x16 && w0 && w1 && w2 && w3 && w4 && w5 && w5b && w6 && w7 && z0 && z1 && z2 && z3 && z4 && z5 && z6 && z7 {
+        && x0 && x1 && x2 && x3 && x4 && x5 && x6 && x7 && x8 && x9 && x9a && x9b && x10 && x11 && x12 && x13 && x14 && x15 && x16 && w0 && w1 && w2 && w3 && w3b && w4 && w5 && w5b && w6 && w7 && w8 && w9 && wA && wB && z0 && z1 && z2 && z3 && z4 && z5 && z6 && z7 && z8 && z9 {
         out_err("SELFTEST PASS\n");
         return AGENT_OK;
     }

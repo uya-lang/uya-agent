@@ -144,6 +144,11 @@ var g_tui_color_on: bool = true;
 var g_tui_color256: bool = true;
 var g_tui_frames: usize = 0;
 var g_tui_headless: bool = false;   // 自测：不碰终端、不读 fd 0，按键由 tui_keys_inject 注入
+// 自测专用：headless 下「注入的键用完了」= 这一轮脚本演完了。它**不等于**用户按了 ctrl+d：
+//   * 主循环 / 审批浮层的等待（tui_confirm_wait）拿它收工（「没人回答」→ 一律拒绝）；
+//   * 但**不能**当成中断/退出意图（否则每个 headless 回合一开头就被自己的脚本掐死）。
+// 这两个语义以前挤在同一个 g_tui_quit 里，P22 把 headless 的读流中断打开之后就炸了。
+var g_tui_headless_done: bool = false;
 
 export fn tui_set_headless(on: bool) void {
     g_tui_headless = on;
@@ -1021,7 +1026,12 @@ var g_tui_cpu_pct: i32 = -1;
 var g_tui_mem_kb: i64 = -1;
 var g_tui_spin: usize = 0;
 
+// P22：常驻任务块（文本由 tasks.uya 生成；这里只拉取 + 画，重建在 tasks_tick/工具结果之后）
+var g_tui_tasks: Buf = Buf{ ptr: null, len: 0, cap: 0 };
+var g_tui_tasks_n: usize = 0;          // 行数（0 = 不画，布局与 P22 之前逐字节相同）
+
 fn tui_state_ensure() void {
+    if !buf_valid(&g_tui_tasks) { g_tui_tasks = buf_new(16384); }
     if !buf_valid(&g_tui_model) { g_tui_model = buf_empty(); }
     if !buf_valid(&g_tui_provider) { g_tui_provider = buf_empty(); }
     if !buf_valid(&g_tui_cwd) { g_tui_cwd = buf_empty(); }
@@ -1251,6 +1261,33 @@ fn tui_think_avail() usize {
 // 这一帧该不该画思考行（放不下前缀 + 几列文本就宁可不画，与 view_think_line 同口径）
 fn tui_think_row_wanted() bool {
     return tui_think_len() > 0 && tui_think_avail() >= 8;
+}
+
+// P22：从 tasks.uya 拉最新文本（只 memcpy —— 重建在 tasks_tick / 工具结果之后，最密 1Hz）
+fn tui_tasks_refresh() void {
+    tui_state_ensure();
+    tasks_latest(&g_tui_tasks);
+    g_tui_tasks_n = 0;
+    if g_tui_tasks.len == 0 {
+        return;
+    }
+    var c: usize = 0;
+    var i: usize = 0;
+    while i < g_tui_tasks.len {
+        if g_tui_tasks.ptr[i] == 10 as byte {
+            c = c + 1;
+        }
+        i = i + 1;
+    }
+    if g_tui_tasks.ptr[g_tui_tasks.len - 1] != 10 as byte {
+        c = c + 1;
+    }
+    g_tui_tasks_n = c;
+}
+
+// 任务块要几行（0 = 不画）
+export fn tui_tasks_rows_n() usize {
+    return g_tui_tasks_n;
 }
 
 // 状态区要几行：0 = 空闲（布局与 P18 之前完全一致）/ 1 = 只有状态行 / 2 = 加思考实时行
@@ -2621,6 +2658,7 @@ fn tui_input_line_range(l: usize, off: &usize, len: &usize) bool {
 // 空态：logo + 面板整体垂直居中
 fn tui_build_home() void {
     tui_in_ensure();
+    g_tui_tasks_n = 0;          // 空态屏不画任务块（还没有会话内容）
     const in_lines: usize = tui_input_lines();
     const panel_h: usize = tui_panel_height(in_lines);
     g_tui_in_lines = in_lines;
@@ -2736,8 +2774,21 @@ fn tui_draw_panel_rows(panel_h: usize, in_lines: usize) void {
             if g_tui_provider.len > 0 {
                 model_w = model_w + 3 + g_tui_provider.len;
             }
-            const hint: &const byte = tui_info_row_hint(end, chip_at, alen, model_w);
-            const hl: usize = bufx_cstr_len(hint);
+            // P22：有常驻任务块时，右侧提示再挂一段 `ctrl+t tasks`（放得下才挂）
+            var hb: Buf = buf_new(128);
+            defer { buf_free(&hb); }
+            const base_hint: &const byte = tui_info_row_hint(end, chip_at, alen, model_w);
+            const base_len: usize = bufx_cstr_len(base_hint);
+            if base_len > 0 {
+                _ = buf_append(&hb, base_hint, base_len);
+                const extra: &const byte = "   ctrl+t tasks" as &const byte;
+                const extra_len: usize = bufx_cstr_len(extra);
+                if g_tui_tasks_n > 0 && end > base_len + extra_len + 3 {
+                    _ = buf_append(&hb, extra, extra_len);
+                }
+            }
+            const hint: &const byte = hb.ptr as &const byte;
+            const hl: usize = hb.len;
             const hint_at: usize = if hl > 0 && end > hl { end - hl } else { 0 as usize };
             // 芯片之后还要留 3 空格 + 至少 8 列给模型名，否则不画芯片
             if hint_at > chip_at + alen + 11 {
@@ -2759,7 +2810,9 @@ fn tui_draw_panel_rows(panel_h: usize, in_lines: usize) void {
             }
             if hint_at >= tui_row_cols() + 2 {
                 tui_pad_to(hint_at);
-                tui_puts(hint, TUI_ST_HINT);
+                // 必须显式给长度：tui_puts 内部按 cstr 量长度，而 P22 起 hint 是**拼出来的
+                // 缓冲区**（不是字面量），尾部没有 NUL —— 用 tui_puts 会把堆里的旧字节也画上去
+                tui_putn(hint, hl, TUI_ST_HINT);
             }
             tui_fill_row(g_tui_cols);
         }
@@ -2863,18 +2916,33 @@ fn tui_build_chat() void {
     if status_h > panel_top {
         status_h = if panel_top > 0 { 1 as usize } else { 0 as usize };
     }
-    // P25：先把「贴尾 / 跳顶 / 跳底」的意图按真总量折算成 scroll（长条目也能翻到前面）。
-    const area_rows: usize = panel_top - status_h;      // 转录区总行数
-    tui_auto_end_scroll(area_rows);
-    // 转录区 [0, panel_top)。溢出时**第 0 行让给 `^` 指示**（提示「上面还有、ctrl+home 到顶」），
-    // 所以可用的内容行少一行；贴尾（scroll == 0）时一行都不占 —— 布局与 P25 之前逐字节一致。
+    // P22：常驻任务块钉在状态区**之上**（状态区仍紧贴面板 —— P18 的断言不变）。
+    // 先把「最多能给几行」告诉 tasks 层（变了就地重建一次），再拉文本。
+    const above_status: usize = panel_top - status_h;
+    var room: usize = 0;
+    if above_status > 3 {
+        room = above_status - 3;          // 给转录留 3 行
+    }
+    if tasks_set_row_budget(room) {
+        _ = tasks_panel_sync();
+    }
+    tui_tasks_refresh();
+    var tasks_h: usize = g_tui_tasks_n;
+    if tasks_h > room {
+        tasks_h = room;
+    }
+    const t_bottom: usize = panel_top - status_h - tasks_h;   // 转录底（任务块从这里开始）
+    // P30：先把「贴尾 / 跳顶 / 跳底」的意图按真总量折算成 scroll（长条目也能翻到前面）。
+    // 转录区总行数 = 面板之上、扣掉任务块与状态区之后剩下的那些行。
+    tui_auto_end_scroll(t_bottom);
+    // 溢出时**第 0 行让给 `^` 指示**（提示「上面还有、ctrl+home 到顶」），可用内容行少一行；
+    // 贴尾（scroll == 0）时一行都不占 —— 布局与 P30 之前逐字节一致。
     var t_top: usize = 0;
     if g_tui_scroll > 0 {
         t_top = 1;
     }
-    const t_bottom: usize = panel_top - status_h;
     // 1) 从尾部往上收行，直到够一屏 + 滚动量
-    const view_rows: usize = area_rows - t_top;
+    const view_rows: usize = t_bottom - t_top;
     const need: usize = view_rows + g_tui_scroll;
     var first: usize = g_tui_nent;
     var total: usize = 0;
@@ -2887,7 +2955,7 @@ fn tui_build_chat() void {
         first = first - 1;
     }
     g_tui_total = total;
-    // 2) 计算窗口起点（P25：这里不再把 g_tui_scroll 夹到 max_scroll —— 一个条目
+    // 2) 计算窗口起点（P30：这里不再把 g_tui_scroll 夹到 max_scroll —— 一个条目
     //    可能折出上万行，窗口一旦把它整个装进来（上面 total >= need 就停），
     //    max_scroll = total - view_rows 会变成 0，用户就再也翻不到这一条的前面部分。
     //    真的「滚到底/顶」由 tui_auto_end_scroll 按真总量夹。）
@@ -2973,8 +3041,69 @@ fn tui_build_chat() void {
         }
         i = i + 1;
     }
+    // 3.5) 常驻任务块（P22）：钉在状态区之上；超宽按显示列裁剪（不砍半个字符）
+    if tasks_h > 0 {
+        const avail_c: usize = if g_tui_cols > TUI_PREFIX_COL + 2 { g_tui_cols - TUI_PREFIX_COL - 2 } else { 1 as usize };
+        var off: usize = 0;
+        var drawn: usize = 0;
+        // 文本比可用行数还高（缓存还没跟上刚下发的预算）→ 末行换成 `… 还有 N 行`
+        const clipped: bool = g_tui_tasks_n > tasks_h;
+        const want: usize = if clipped && tasks_h > 0 { tasks_h - 1 } else { tasks_h };
+        while off < g_tui_tasks.len && drawn < want {
+            var e: usize = off;
+            while e < g_tui_tasks.len && g_tui_tasks.ptr[e] != 10 as byte {
+                e = e + 1;
+            }
+            tui_row_new();
+            tui_pad_to(TUI_PREFIX_COL);
+            tui_put_clipped(&g_tui_tasks.ptr[off] as &const byte, e - off, avail_c, TUI_ST_DIM);
+            tui_fill_row(g_tui_cols);
+            r = r + 1;
+            drawn = drawn + 1;
+            off = e + 1;
+        }
+        if clipped && tasks_h > 0 {
+            var mtail: Buf = buf_new(64);
+            defer { buf_free(&mtail); }
+            _ = buf_append_cstr(&mtail, "… 还有 ");
+            _ = buf_append_u64(&mtail, (g_tui_tasks_n - want) as u64);
+            _ = buf_append_cstr(&mtail, " 行");
+            tui_row_new();
+            tui_pad_to(TUI_PREFIX_COL);
+            tui_put_clipped(mtail.ptr as &const byte, mtail.len, avail_c, TUI_ST_DIM);
+            tui_fill_row(g_tui_cols);
+            r = r + 1;
+        }
+    }
     // 4) 状态区（P18）：钉在面板正上方 —— 第 1 行状态，第 2 行思考实时文本。
     //    这里的行数在算视口时就已经扣掉（status_h），所以转录再长也不会把它挤掉。
+    r = tui_draw_status_block(status_h, r);
+    // 5) 补齐视口
+    while r < panel_top {
+        tui_row_new();
+        tui_fill_row(g_tui_cols);
+        r = r + 1;
+    }
+    // 6) 滚动溢出指示（P30）：转录区最右列原地覆盖一个**单字节**方向标记 ——
+    //    `^` = 上面还有（第 0 行）、`v` = 下面还有（转录区最后一行）。
+    //    用单字节是刻意的：g_tui_text 是所有行共用的缓冲，多字节字形会挪动后面行的偏移。
+    //    贴尾（scroll == 0）时**一个字节都不画**，布局与 P30 之前逐字节一致。
+    if g_tui_scroll > 0 {
+        tui_row_put_col(0, g_tui_cols - 1, 94 as byte);                    // '^'
+        if start_line > 0 && t_bottom > 0 {
+            tui_row_put_col(t_bottom - 1, g_tui_cols - 1, 118 as byte);    // 'v'
+        }
+    }
+    // 7) 面板
+    g_tui_panel_top = g_tui_nrows;
+    tui_draw_panel_rows(panel_h, in_lines);
+}
+
+// 状态区（P18）的实体：追加 status_h 行（0/1/2），返回新的当前行数。
+// 抽出来是因为「浮层重画转录区」之后必须把它补回来 —— 否则运行中开一次浮层，
+// 钉在面板上方的状态区就被抹掉了（P18 的承诺：转录再长也看得见状态）。
+fn tui_draw_status_block(status_h: usize, r_in: usize) usize {
+    var r: usize = r_in;
     if status_h >= 1 {
         tui_row_new();
         tui_pad_to(TUI_PREFIX_COL);
@@ -3007,25 +3136,7 @@ fn tui_build_chat() void {
         tui_fill_row(g_tui_cols);
         r = r + 1;
     }
-    // 5) 补齐视口（转录区余下的行）
-    while r < panel_top {
-        tui_row_new();
-        tui_fill_row(g_tui_cols);
-        r = r + 1;
-    }
-    // 6) 滚动溢出指示（P25）：转录区最右列原地覆盖一个**单字节**方向标记 ——
-    //    `^` = 上面还有（第 0 行）、`v` = 下面还有（转录区最后一行）。
-    //    用单字节是刻意的：g_tui_text 是所有行共用的缓冲，多字节字形会挪动后面行的偏移。
-    //    贴尾（scroll == 0）时**一个字节都不画**，布局与 P25 之前逐字节一致。
-    if g_tui_scroll > 0 {
-        tui_row_put_col(0, g_tui_cols - 1, 94 as byte);                    // '^'
-        if start_line > 0 && panel_top > 0 {
-            tui_row_put_col(panel_top - 1, g_tui_cols - 1, 118 as byte);   // 'v'
-        }
-    }
-    // 7) 面板
-    g_tui_panel_top = g_tui_nrows;
-    tui_draw_panel_rows(panel_h, in_lines);
+    return r;
 }
 
 // 输入光标落点（面板重画之后调用）
@@ -3064,13 +3175,27 @@ export fn tui_build() void {
     }
     tui_draw_footer();
     if g_tui_ov != TUI_OV_NONE {
-        // 浮层画在转录区中间：重画 [top, top+h) 这段，再把面板与脚注补回来
+        // 浮层画在转录区中间：重画 [top, top+h) 这段，再把状态区/面板/脚注补回来
         tui_draw_overlay();
+        const sh: usize = tui_status_rows();
+        if sh > 0 && g_tui_panel_top > sh {
+            while g_tui_nrows < g_tui_panel_top - sh {
+                tui_row_new();
+                tui_fill_row(g_tui_cols);
+            }
+            _ = tui_draw_status_block(sh, g_tui_nrows);
+        }
         while g_tui_nrows < g_tui_panel_top {
             tui_row_new();
             tui_fill_row(g_tui_cols);
         }
         tui_draw_panel_rows(g_tui_panel_h, g_tui_in_lines);
+        // 空态的面板是居中的：面板与脚注之间还有空白行，不补齐整帧就短一截
+        // （终端上留下的是上一帧的内容）
+        while g_tui_nrows + 1 < g_tui_rows {
+            tui_row_new();
+            tui_fill_row(g_tui_cols);
+        }
         tui_draw_footer();
     }
     tui_cursor_place();
@@ -3409,12 +3534,13 @@ export const TUI_K_CTRL_K: i32 = 22;
 export const TUI_K_CTRL_A: i32 = 23;
 export const TUI_K_CTRL_E: i32 = 24;
 export const TUI_K_CTRL_P: i32 = 25;
-// P25：鼠标滚轮（SGR 编码 `ESC[<64;..M` / `65`）折成滚轮上/下两个事件。
+export const TUI_K_CTRL_T: i32 = 26;    // P22：展开/收起常驻任务块（shift+tab 的邻居）
+// P30：鼠标滚轮（SGR 编码 `ESC[<64;..M` / `65`）折成滚轮上/下两个事件。
 // 只吃滚轮，press/release/motion 一律忽略（拾取选择仍旧只靠终端自己的 shift 路）。
-export const TUI_K_WHEEL_UP: i32 = 26;
-export const TUI_K_WHEEL_DOWN: i32 = 27;
+export const TUI_K_WHEEL_UP: i32 = 27;
+export const TUI_K_WHEEL_DOWN: i32 = 28;
 
-// 一次滚轮滚几行（与 PgUp/PgDn 的 5 行同一口径）
+// 一次滚轮滚几行（与 PgUp/PgDn 的一屏同一口径之外的细粒度）
 const TUI_WHEEL_STEP: usize = 5;
 
 const TUI_EVQ_MAX: usize = 512;
@@ -3856,6 +3982,10 @@ export fn tui_key_feed(p: &const byte, n: usize) void {
             tui_ev_push(TUI_K_CTRL_P);
             continue;
         }
+        if c == 20 as byte {
+            tui_ev_push(TUI_K_CTRL_T);
+            continue;
+        }
         if c < 32 as byte {
             continue;   // 其余控制字节丢掉
         }
@@ -3899,6 +4029,7 @@ export fn tui_key_flush_esc() void {
 export const TUI_OV_NONE: u8 = 0;
 export const TUI_OV_LIST: u8 = 1;      // 列表型：面板 / 会话 / 帮助
 export const TUI_OV_CONFIRM: u8 = 2;   // 问答型：ask_user_question / plan 审批
+export const TUI_OV_DIFF: u8 = 3;      // P27：/diff（左列表 + 右两栏，自带按键与几何）
 
 var g_tui_ov: u8 = 0;
 var g_tui_ov_title: Buf = Buf{ ptr: null, len: 0, cap: 0 };
@@ -3920,13 +4051,35 @@ export const TUI_OVK_PLAN: u8 = 5;     // exit_plan_mode 审批
 export const TUI_OVK_ACCESS: u8 = 6;         // P21：访问模式选择（底对齐菜单）
 export const TUI_OVK_ACCESS_CONFIRM: u8 = 7; // P21：Full access 风险确认
 export const TUI_OVK_APPROVE: u8 = 8;        // P21：read-only 下 bash 逐条批准
+export const TUI_OVK_TASKS: u8 = 9;          // P22：/tasks 任务状态（纯查看，enter 不派发）
+export const TUI_OVK_DIFF: u8 = 10;          // P27：/diff 双列全文比对（浏览型浮层）
+export const TUI_OVK_GOAL: u8 = 11;          // P29：/goal 会话目标状态（纯查看，enter 不派发）
 
 var g_tui_ov_kind: u8 = 0;
 // 交回结果时的 kind：tui_ov_accept() 会先 close（把 g_tui_ov_kind 清 0），
-// 而调用方是「take 之后才读 kind」——不留这一份，结果就会被静默丢掉（palette/sessions 也踩过）
+// 而调用方是「take 之后才读 kind」——不留这一份，结果就会被静默丢掉（palette/sessions 也踩过；
+// P22 又踩了一遍：`/exit` 从面板里选出来同样被丢掉，见 §3 踩坑 44）
 var g_tui_ov_done: u8 = 0;
 // P21：0 = 居中（今天的行为），1 = 贴着输入面板往上弹（菜单型，对齐 DSH 的 Menu side:"top"）
 var g_tui_ov_anchor: u8 = 0;
+
+// ------------------------------------------------------------
+// P26：reader 型浮层（计划审阅）—— 上半是可滚动正文，下半是「一行说明 + 一行动作」。
+// 与列表型共用 items / 结果机制（tui_ov_accept 直接把选中项原文交回调用方），
+// 区别只在排版与按键：↑/↓ 滚正文、tab/←/→ 切动作、数字直选。
+// ------------------------------------------------------------
+var g_tui_ov_reader: bool = false;   // 当前浮层是 reader 型
+var g_tui_ov_body: Buf = Buf{ ptr: null, len: 0, cap: 0 };   // 清洗 + 限长后的正文
+var g_tui_ov_rows: Buf = Buf{ ptr: null, len: 0, cap: 0 };   // 折行结果（一行一条，'\n' 分隔）
+var g_tui_ov_rows_w: usize = 0;      // 折行宽度（缓存键：尺寸变了就重折）
+var g_tui_ov_rows_n: usize = 0;      // 折行后的总行数
+var g_tui_ov_body_top: usize = 0;         // 正文首行（滚动位置）
+var g_tui_ov_body_h: usize = 1;      // 最近一帧画出来的正文可见行数（翻页步长）
+
+const TUI_OV_READER_MAX_H: usize = 20;         // reader 浮层最高多少行（列表型是 16）
+const TUI_OV_READER_W: usize = 78;             // 期望宽度（窄终端再退）
+const TUI_OV_READER_MIN_PANEL_TOP: usize = 6;  // 标题+1 行正文+说明+动作+底边 = 6；更矮就别开
+const TUI_OV_BODY_MAX: usize = 131072;         // 正文上限（超出按行截断并在末尾指路）
 
 fn tui_ov_ensure() void {
     if !buf_valid(&g_tui_ov_title) { g_tui_ov_title = buf_new(256); }
@@ -3934,12 +4087,20 @@ fn tui_ov_ensure() void {
     if !buf_valid(&g_tui_ov_filter) { g_tui_ov_filter = buf_new(256); }
     if !buf_valid(&g_tui_ov_prompt) { g_tui_ov_prompt = buf_new(8192); }
     if !buf_valid(&g_tui_ov_result) { g_tui_ov_result = buf_new(4096); }
+    if !buf_valid(&g_tui_ov_body) { g_tui_ov_body = buf_new(8192); }
+    if !buf_valid(&g_tui_ov_rows) { g_tui_ov_rows = buf_new(8192); }
 }
 
 export fn tui_overlay_open() bool {
     return g_tui_ov != TUI_OV_NONE;
 }
 
+// 收下结果的人（TUI 主循环）拿它判断「选中的是哪张浮层」。
+//
+// 必须回**结果**的 kind，不能回「当前打开着的」那个：`tui_overlay_close()` 会把
+// g_tui_ov_kind 清零，而它在 accept 里是**收尾**调用的 —— 于是主循环读到的永远是 0，
+// 命令面板/会话列表选出来的东西被静默丢掉（`/exit` 从面板里选、`/sessions` 里挑会话
+// 全都「按了没反应」，见 README 踩坑 44）。
 export fn tui_overlay_kind() u8 {
     if g_tui_ov != TUI_OV_NONE {
         return g_tui_ov_kind;
@@ -3967,12 +4128,17 @@ fn tui_ov_count_items() usize {
 }
 
 fn tui_ov_item(i: usize, off: &usize, len: &usize) bool {
+    return tui_ov_line_at(&g_tui_ov_items, i, off, len);
+}
+
+// 取 buf 里第 i 行（'\n' 分隔）的字节区间
+fn tui_ov_line_at(b: &const Buf, i: usize, off: &usize, len: &usize) bool {
     tui_ov_ensure();
     var line: usize = 0;
     var start: usize = 0;
     var p: usize = 0;
-    while p <= g_tui_ov_items.len {
-        if p == g_tui_ov_items.len || g_tui_ov_items.ptr[p] == 10 as byte {
+    while p <= b.len {
+        if p == b.len || b.ptr[p] == 10 as byte {
             if line == i {
                 off[0] = start;
                 len[0] = p - start;
@@ -3984,6 +4150,11 @@ fn tui_ov_item(i: usize, off: &usize, len: &usize) bool {
         p = p + 1;
     }
     return false;
+}
+
+// reader 型浮层的正文行（折行结果那份缓冲）
+fn tui_ov_row_at(i: usize, off: &usize, len: &usize) bool {
+    return tui_ov_line_at(&g_tui_ov_rows, i, off, len);
 }
 
 fn tui_ov_filter_match(p: &const byte, n: usize) bool {
@@ -4076,9 +4247,350 @@ export fn tui_overlay_confirm(kind: u8, prompt: &const byte, pn: usize, items: &
     tui_mark_dirty();
 }
 
+// ============================================================
+// P26：reader 型浮层（计划审阅）
+// ============================================================
+
+// reader 浮层画得出来吗？—— 至少要放得下「标题 + 1 行正文 + 说明 + 动作 + 底边」。
+// 画不出来时审阅必须 fail closed（与 bash 逐条批准同态度），不能「看不见却仍吞键」。
+export fn tui_reader_fits() bool {
+    return tui_overlay_available() && g_tui_panel_top >= TUI_OV_READER_MIN_PANEL_TOP;
+}
+
+// 打开 reader 型浮层：body 是要给用户看的正文（计划原文，可以是任意长度）。
+// 正文先过 tui_clean_into（控制字节清洗，保住「正文层无 ESC」的不变量），再按上限截断。
+export fn tui_overlay_reader(kind: u8, title: &const byte, tn: usize, body: &const byte, bn: usize, items: &const byte, inlen: usize, sel: usize) void {
+    tui_overlay_list(kind, title, tn, items, inlen);
+    tui_ov_ensure();
+    g_tui_ov_reader = true;
+    g_tui_ov_body_top = 0;
+    g_tui_ov_body_h = 1;
+    g_tui_ov_rows_w = 0;
+    g_tui_ov_rows_n = 0;
+    if sel < g_tui_ov_n {
+        g_tui_ov_sel = sel;
+    }
+    buf_reset(&g_tui_ov_body);
+    tui_clean_into(&g_tui_ov_body, body, bn);
+    if g_tui_ov_body.len > TUI_OV_BODY_MAX {
+        // 按行截断（别切出半个 UTF-8 字符），末尾留一行指路：全文始终在转录里
+        var cut: usize = TUI_OV_BODY_MAX;
+        var guard: usize = 0;
+        while cut > 0 && g_tui_ov_body.ptr[cut] != 10 as byte && guard < TUI_OV_BODY_MAX {
+            cut = cut - 1;
+            guard = guard + 1;
+        }
+        if cut == 0 {
+            cut = TUI_OV_BODY_MAX;
+        }
+        buf_truncate(&g_tui_ov_body, cut);
+        _ = buf_append_cstr(&g_tui_ov_body, "\n…（计划过长，剩余部分见转录）\n");
+    }
+    tui_mark_dirty();
+}
+
+// 折行缓存（宽度是键）：正文按显示列折行，一行一条记录
+fn tui_ov_rows_ensure(w: usize) void {
+    tui_ov_ensure();
+    var ww: usize = w;
+    if ww < 4 {
+        ww = 4;
+    }
+    if g_tui_ov_rows_w == ww && g_tui_ov_rows_n > 0 {
+        return;
+    }
+    g_tui_ov_rows_n = tui_wrap_into(&g_tui_ov_rows, g_tui_ov_body.ptr as &const byte, g_tui_ov_body.len, ww);
+    g_tui_ov_rows_w = ww;
+}
+
+fn tui_ov_reader_page() usize {
+    if g_tui_ov_body_h == 0 {
+        return 1;
+    }
+    return g_tui_ov_body_h;
+}
+
+// 滚动的上界：末页也要看得见内容（rows_n <= body_h 时不许滚）
+fn tui_ov_reader_top_max() usize {
+    if g_tui_ov_rows_n <= g_tui_ov_body_h {
+        return 0;
+    }
+    return g_tui_ov_rows_n - g_tui_ov_body_h;
+}
+
+fn tui_ov_reader_up(n: usize) void {
+    if n >= g_tui_ov_body_top {
+        g_tui_ov_body_top = 0;
+    } else {
+        g_tui_ov_body_top = g_tui_ov_body_top - n;
+    }
+    tui_mark_dirty();
+}
+
+fn tui_ov_reader_down(n: usize) void {
+    const hi: usize = tui_ov_reader_top_max();
+    if g_tui_ov_body_top + n > hi {
+        g_tui_ov_body_top = hi;
+    } else {
+        g_tui_ov_body_top = g_tui_ov_body_top + n;
+    }
+    tui_mark_dirty();
+}
+
+// reader 型浮层的按键：↑/↓ 滚正文、pgup/pgdn 翻页、home/end 顶尾、
+// tab/shift+tab/←/→ 环选动作、1..9 直选、enter 确认、esc 取消（在 tui_ov_key 里先处理）。
+fn tui_ov_key_reader(ev: i32) void {
+    if ev == TUI_K_ENTER {
+        tui_ov_accept();
+        return;
+    }
+    if ev == TUI_K_UP {
+        tui_ov_reader_up(1);
+        return;
+    }
+    if ev == TUI_K_DOWN {
+        tui_ov_reader_down(1);
+        return;
+    }
+    if ev == TUI_K_PGUP {
+        tui_ov_reader_up(tui_ov_reader_page());
+        return;
+    }
+    if ev == TUI_K_PGDN {
+        tui_ov_reader_down(tui_ov_reader_page());
+        return;
+    }
+    if ev == TUI_K_HOME {
+        g_tui_ov_body_top = 0;
+        tui_mark_dirty();
+        return;
+    }
+    if ev == TUI_K_END {
+        g_tui_ov_body_top = tui_ov_reader_top_max();
+        tui_mark_dirty();
+        return;
+    }
+    if ev == TUI_K_TAB || ev == TUI_K_STAB || ev == TUI_K_LEFT || ev == TUI_K_RIGHT {
+        if g_tui_ov_n > 0 {
+            if ev == TUI_K_LEFT || ev == TUI_K_STAB {
+                if g_tui_ov_sel == 0 {
+                    g_tui_ov_sel = g_tui_ov_n - 1;
+                } else {
+                    g_tui_ov_sel = g_tui_ov_sel - 1;
+                }
+            } else {
+                g_tui_ov_sel = (g_tui_ov_sel + 1) % g_tui_ov_n;
+            }
+            tui_mark_dirty();
+        }
+        return;
+    }
+    if ev == TUI_K_CHAR {
+        var tmp: Buf = buf_new(8);
+        defer { buf_free(&tmp); }
+        const n: usize = tui_key_take_char(&tmp);
+        if n == 1 && tmp.ptr[0] >= 49 as byte && tmp.ptr[0] <= 57 as byte {
+            const k: usize = (tmp.ptr[0] as usize) - 49;
+            if k < g_tui_ov_n {
+                g_tui_ov_sel = k;
+                tui_mark_dirty();
+            }
+        }
+        return;
+    }
+    // reader 模式不做过滤：其余按键一律忽略
+}
+
+// 选中项的一句话说明（画在动作行上方，随选中项变；终端里没有 tooltip）
+fn tui_ov_reader_gloss() &const byte {
+    if g_tui_ov_sel == 1 {
+        return "关掉浮窗、留在 plan 模式，你现在直接在输入框里说（模型停下等你）" as &const byte;
+    }
+    if g_tui_ov_sel == 2 {
+        return "退出 plan 模式，模型从下一步开始照着这份计划动手" as &const byte;
+    }
+    return "留在 plan 模式：模型按你的反馈改一版，再弹一次这个浮窗" as &const byte;
+}
+
+// 把正文画到 [top, top+h) 的方框里：标题带滚动指示、正文 markdown-lite、末两行是说明 + 动作
+fn tui_draw_overlay_reader() void {
+    tui_ov_ensure();
+    const panel_top: usize = g_tui_panel_top;
+    if panel_top < TUI_OV_READER_MIN_PANEL_TOP {
+        return;
+    }
+    var h: usize = panel_top - 2;
+    if h > TUI_OV_READER_MAX_H {
+        h = TUI_OV_READER_MAX_H;
+    }
+    if h < 6 {
+        h = 6;
+    }
+    var w: usize = TUI_OV_READER_W;
+    if g_tui_cols < w + 6 {
+        w = g_tui_cols - 6;
+    }
+    if w < 24 {
+        w = 24;
+    }
+    if w > g_tui_cols {
+        w = g_tui_cols;
+    }
+    var left: usize = 2;
+    if g_tui_cols > w + 4 {
+        left = (g_tui_cols - w) / 2;
+    }
+    var top: usize = 1;
+    if panel_top > h + 2 {
+        top = (panel_top - h) / 2;
+    }
+    const inner: usize = w - 2;          // 边框之内
+    const body_w: usize = w - 4;         // 正文可用显示列（两侧各留「│ 」与「 │」）
+    const body_h: usize = h - 4;         // 标题 + 说明 + 动作 + 底边
+    g_tui_ov_body_h = body_h;
+    tui_ov_rows_ensure(body_w);
+    const hi: usize = tui_ov_reader_top_max();
+    if g_tui_ov_body_top > hi {
+        g_tui_ov_body_top = hi;
+    }
+
+    // 正文样式：从第 0 行扫到 top，复原代码围栏状态（否则滚到代码块中间会串样式）
+    tui_md_reset();
+    var k: usize = 0;
+    while k < g_tui_ov_body_top {
+        var o: usize = 0;
+        var l: usize = 0;
+        if tui_ov_row_at(k, &o, &l) {
+            if tui_line_starts_with(g_tui_ov_rows.ptr + o, l, "```" as &const byte) {
+                g_tui_md_code = !g_tui_md_code;
+            }
+        }
+        k = k + 1;
+    }
+
+    tui_row_rewind(top);
+    var r: usize = 0;
+    while r < h {
+        tui_row_new();
+        tui_pad_to(left);
+        if r == 0 {
+            // 顶边 + 标题 + 滚动指示（第 a 行 / 共 b 行）
+            tui_puts("╭─ " as &const byte, TUI_ST_ACCENT);
+            tui_ov_put_clipped(g_tui_ov_title.ptr as &const byte, g_tui_ov_title.len, inner - 16, TUI_ST_BOLD);
+            tui_puts(" · " as &const byte, TUI_ST_ACCENT);
+            var num: Buf = buf_new(32);
+            defer { buf_free(&num); }
+            _ = buf_append_u64(&num, (g_tui_ov_body_top + 1) as u64);
+            _ = buf_append_byte(&num, 47);   // '/'
+            _ = buf_append_u64(&num, g_tui_ov_rows_n as u64);
+            _ = buf_append_byte(&num, 32);   // 尾随空格：与右边框的填充线隔开
+            tui_ov_put_clipped(num.ptr as &const byte, num.len, 14, TUI_ST_ACCENT);
+            var used: usize = tui_row_cols() - left;
+            while used + 1 < w {
+                tui_puts("─" as &const byte, TUI_ST_ACCENT);
+                used = used + 1;
+            }
+            tui_puts("╮" as &const byte, TUI_ST_ACCENT);
+        } else if r == h - 1 {
+            tui_puts("╰" as &const byte, TUI_ST_ACCENT);
+            var used2: usize = 1;
+            while used2 + 1 < w {
+                tui_puts("─" as &const byte, TUI_ST_ACCENT);
+                used2 = used2 + 1;
+            }
+            tui_puts("╯" as &const byte, TUI_ST_ACCENT);
+        } else {
+            tui_puts("│ " as &const byte, TUI_ST_ACCENT);
+            if r == h - 3 {
+                // 选中项说明（同样留一列给可能的 '…'）
+                tui_ov_put_clipped(tui_ov_reader_gloss(), bufx_cstr_len(tui_ov_reader_gloss()), body_w, TUI_ST_HINT);
+            } else if r == h - 2 {
+                // 动作行：选中项前置 ▸（无色模式下 TUI_ST_SEL 不产生 SGR，前缀不能省）
+                var i: usize = 0;
+                var avail: usize = body_w;
+                while i < g_tui_ov_n && avail > 2 {
+                    var o: usize = 0;
+                    var l: usize = 0;
+                    if !tui_ov_item(i, &o, &l) {
+                        i = i + 1;
+                        continue;
+                    }
+                    if i > 0 {
+                        tui_puts("   " as &const byte, TUI_ST_DEFAULT);
+                        avail = avail - 3;
+                    }
+                    if i == g_tui_ov_sel {
+                        tui_puts("▸ " as &const byte, TUI_ST_SEL);
+                        avail = avail - 2;
+                    } else {
+                        tui_puts("  " as &const byte, TUI_ST_DEFAULT);
+                        avail = avail - 2;
+                    }
+                    const before: usize = tui_row_cols();
+                    const style: u8 = if i == g_tui_ov_sel { TUI_ST_SEL } else { TUI_ST_DEFAULT };
+                    tui_ov_put_clipped(g_tui_ov_items.ptr + o, l, avail, style);
+                    // 饱和减法：截断补的 '…' 可能让这一项比 avail 多占一列，别让 usize 回绕
+                    const used_item: usize = tui_row_cols() - before;
+                    if used_item >= avail {
+                        avail = 0;
+                    } else {
+                        avail = avail - used_item;
+                    }
+                    i = i + 1;
+                }
+            } else {
+                // 正文：第 (top + 可见序号) 行
+                const idx: usize = g_tui_ov_body_top + (r - 1);
+                var o: usize = 0;
+                var l: usize = 0;
+                if idx < g_tui_ov_rows_n && tui_ov_row_at(idx, &o, &l) {
+                    // 正文走 tui_draw_assist_line（内部对围栏/列表还会再扣 2 列），所以按最紧的
+                    // 那一档判断它会不会被裁；会被裁就先把那一列让给 '…'（踩坑 42 那类）
+                    var bw: usize = body_w;
+                    if body_w > 2 && tty_clip_bytes(g_tui_ov_rows.ptr + o, l, body_w - 2) < l {
+                        bw = body_w - 1;
+                    }
+                    tui_draw_assist_line(g_tui_ov_rows.ptr + o, l, bw);
+                }
+            }
+            // 内容侧已经保证不超过 inner（body_w = w-4，且都留了 '…' 的余量）：
+            // 这里只管补齐到边框位置（补多了边框会右移，实测就是这样发现的）
+            var used3: usize = tui_row_cols() - left;
+            while used3 + 1 < w {
+                tui_puts(" " as &const byte, TUI_ST_DEFAULT);
+                used3 = used3 + 1;
+            }
+            tui_puts("│" as &const byte, TUI_ST_ACCENT);
+        }
+        tui_fill_row(g_tui_cols);
+        r = r + 1;
+    }
+}
+
+// reader 型浮层的阻塞式等待：与 tui_confirm_wait 同一套「边跑边抽帧等按键」，
+// 只是浮层形态不同（正文 + 动作）。返回 1 = 选中某项（原文写进 out），0 = 取消/中断/无键可等。
+export fn tui_reader_wait(kind: u8, title: &const byte, tn: usize, body: &const byte, bn: usize, items: &const byte, inlen: usize, sel: usize, out: &Buf) i32 {
+    if !g_tui_on {
+        return 0;
+    }
+    // 上一轮没取走的 one-shot 结果不能当成本次的决定
+    tui_overlay_close();
+    g_tui_ov_have = false;
+    g_tui_ov_cancel = false;
+    tui_overlay_reader(kind, title, tn, body, bn, items, inlen, sel);
+    // 排队按键先丢掉：运行期间敲进来的键不能替用户「确认执行」
+    // headless 自测是例外 —— 那里「注入的键」就是模拟用户，丢掉就没法测了。
+    if !g_tui_headless {
+        tui_key_reset();
+    }
+    return tui_decide_wait(out);
+}
+
 export fn tui_overlay_close() void {
     g_tui_ov = TUI_OV_NONE;
     g_tui_ov_kind = 0;
+    g_tui_ov_reader = false;
+    g_tui_ov_body_top = 0;
     if !g_tui_ov_have {
         g_tui_ov_done = 0;   // 没有交回结果（被关掉/取消）：这份残留不该再被读到
     }
@@ -4127,6 +4639,550 @@ export fn tui_overlay_sel_index() usize {
 }
 
 // ============================================================
+// P27：/diff 浮窗（左侧文件列表 + 右侧旧/新两栏全文比对）
+//
+// 数据在 gitdiff.uya（gd_*），这里只管几何、按键与绘制：
+//   * 浮窗占满「转录区可用高度」（面板之上、状态区之外），绝不覆盖状态区；
+//   * 放不下（列数/行数不够）就 tui_overlay_diff_fits() = false，调用方不开浮窗
+//     —— 与既有的「浮窗画不出来却仍吞键」是同一类坑，宁可退化成文本回退；
+//   * 单元格文本一律经 tui_clean_into（ESC/TAB/控制字节/半截 UTF-8 都换掉），
+//     宽度按**显示列**算，画完补位到定长，保证竖线逐行对齐。
+// =====================================================
+
+const TUI_DIFF_COLS_MIN: usize = 60;
+const TUI_DIFF_ROWS_MIN: usize = 11;       // 可用行（浮窗高度 = 可用行 - 1，内容行 = 高度 - 4）
+const TUI_DIFF_GUTTER: usize = 6;          // 行号列：5 位 + 1 空格
+const TUI_DIFF_MARK: usize = 2;            // 左列表的 ▸ 标记列
+
+struct TuiDiffGeo {
+    w: usize,
+    left: usize,
+    list_w: usize,
+    sep1: usize,
+    cell1_x: usize,
+    cell_w: usize,
+    sep2: usize,
+    cell2_x: usize,
+    cell_w2: usize,
+    rows: usize,
+}
+
+var g_tui_dg: TuiDiffGeo = TuiDiffGeo{
+    w: 0, left: 0, list_w: 0, sep1: 0, cell1_x: 0, cell_w: 0,
+    sep2: 0, cell2_x: 0, cell_w2: 0, rows: 0
+};
+var g_tui_diff_tmp: Buf = Buf{ ptr: null, len: 0, cap: 0 };
+var g_tui_diff_txt: Buf = Buf{ ptr: null, len: 0, cap: 0 };
+var g_tui_dg_title: Buf = Buf{ ptr: null, len: 0, cap: 0 };
+
+fn tui_diff_ensure() void {
+    if !buf_valid(&g_tui_diff_tmp) { g_tui_diff_tmp = buf_new(8192); }
+    if !buf_valid(&g_tui_diff_txt) { g_tui_diff_txt = buf_new(4096); }
+    if !buf_valid(&g_tui_dg_title) { g_tui_dg_title = buf_new(1024); }
+}
+
+// 浮窗可用高度：面板之上、扣掉运行中的状态区
+fn tui_diff_avail_rows() usize {
+    const st: usize = tui_status_rows();
+    if g_tui_panel_top > st {
+        return g_tui_panel_top - st;
+    }
+    return 0;
+}
+
+export fn tui_overlay_diff_fits() bool {
+    return g_tui_cols >= TUI_DIFF_COLS_MIN && tui_diff_avail_rows() >= TUI_DIFF_ROWS_MIN;
+}
+
+// 内容区行数（自测断言几何用）
+export fn tui_overlay_diff_rows() usize {
+    return g_tui_dg.rows;
+}
+
+export fn tui_overlay_diff_open() void {
+    tui_ov_ensure();
+    tui_diff_ensure();
+    g_tui_ov = TUI_OV_DIFF;
+    g_tui_ov_kind = TUI_OVK_DIFF;
+    g_tui_ov_done = 0;
+    g_tui_ov_have = false;
+    g_tui_ov_cancel = false;
+    g_tui_ov_n = 0;
+    g_tui_ov_sel = 0;
+    g_tui_ov_top = 0;
+    buf_reset(&g_tui_ov_title);
+    buf_reset(&g_tui_ov_items);
+    buf_reset(&g_tui_ov_filter);
+    g_tui_ov_anchor = 0;
+    tui_mark_dirty();
+}
+
+// 左列表的状态码配色（读前两个字节，就是 git status 的 XY）
+fn tui_diff_list_style(p: &const byte, n: usize) u8 {
+    if n < 2 {
+        return TUI_ST_DEFAULT;
+    }
+    const c0: byte = p[0];
+    const c1: byte = p[1];
+    if c0 == 63 as byte && c1 == 63 as byte {
+        return TUI_ST_ADD;      // ??
+    }
+    if c0 == 68 as byte || c1 == 68 as byte {
+        return TUI_ST_DEL;      // D
+    }
+    if c0 == 65 as byte || c1 == 65 as byte {
+        return TUI_ST_ADD;      // A
+    }
+    if c0 == 77 as byte || c1 == 77 as byte {
+        return TUI_ST_WARN;     // M
+    }
+    if c0 == 82 as byte || c1 == 82 as byte {
+        return TUI_ST_WARN;     // R（--no-renames 下理论上看不到）
+    }
+    return TUI_ST_DIM;
+}
+
+// 画一个单元格：清洗 → 按显示列跳过 from_col（横向滚动）→ 截断 → 补位到 x+w
+fn tui_diff_cell(x: usize, w: usize, p: &const byte, n: usize, style: u8, from_col: usize) void {
+    if w == 0 {
+        tui_pad_to(x);
+        return;
+    }
+    tui_pad_to(x);
+    var avail: usize = w;
+    var skip_cols: usize = from_col;
+    if from_col > 0 {
+        tui_puts("‹" as &const byte, TUI_ST_DIM);
+        avail = w - 1;
+        if avail == 0 {
+            return;
+        }
+    }
+    if n == 0 {
+        tui_pad_to(x + w);
+        return;
+    }
+    // 先按显示列切一刀（超长行不动辄几 MB 地清洗），清洗之后再跳 from_col 列
+    const keep: usize = tty_clip_bytes(p, n, skip_cols + avail + 8);
+    buf_reset(&g_tui_diff_tmp);
+    tui_clean_into(&g_tui_diff_tmp, p, keep);
+    var skip: usize = 0;
+    if (skip_cols > 0) {
+        skip = tty_clip_bytes(g_tui_diff_tmp.ptr as &const byte, g_tui_diff_tmp.len, skip_cols);
+    }
+    // 注意 tui_put_clipped 在截断时会**多打一个 '…'**（1 列）：装不下时预算要留出那一列，
+    // 否则这一格的宽度会超出 w，右竖线整体右移（浮窗里的「列对齐」就毁了）
+    const total: usize = g_tui_diff_tmp.len - skip;
+    const fit: usize = tty_clip_bytes(g_tui_diff_tmp.ptr + skip, total, avail);
+    if fit >= total {
+        tui_put(g_tui_diff_tmp.ptr + skip, total, style);
+    } else {
+        tui_put_clipped(g_tui_diff_tmp.ptr + skip, total, avail - 1, style);
+    }
+    tui_pad_to(x + w);
+}
+
+// 清洗 + 按显示列截断（给列表行/标题用：git 的路径与仓库名是外来字节，
+// 里面可能有 ESC/控制字节/NUL —— 直接画进帧就破了「正文层里没有 ESC」这条不变量）
+fn tui_diff_clean_clip(p: &const byte, n: usize, max_cols: usize, style: u8) void {
+    if max_cols == 0 || n == 0 {
+        return;
+    }
+    buf_reset(&g_tui_diff_tmp);
+    tui_clean_into(&g_tui_diff_tmp, p, tty_clip_bytes(p, n, max_cols + 8));
+    const total: usize = g_tui_diff_tmp.len;
+    const fit: usize = tty_clip_bytes(g_tui_diff_tmp.ptr as &const byte, total, max_cols);
+    if fit >= total {
+        tui_put(g_tui_diff_tmp.ptr as &const byte, total, style);
+    } else {
+        tui_put_clipped(g_tui_diff_tmp.ptr as &const byte, total, max_cols - 1, style);
+    }
+}
+
+// 行号列（右对齐 5 列 + 1 空格）；show = false 时留空（那一侧本来就没有内容）
+fn tui_diff_no(x: usize, no: usize, style: u8, show: bool) void {
+    tui_pad_to(x);
+    if !show {
+        tui_pad_to(x + TUI_DIFF_GUTTER);
+        return;
+    }
+    buf_reset(&g_tui_diff_txt);
+    var v: usize = no;
+    var digits: usize = 1;
+    while v >= 10 {
+        v = v / (10 as usize);
+        digits = digits + 1;
+    }
+    var pad: usize = TUI_DIFF_GUTTER - 1;
+    if digits < pad {
+        pad = pad - digits;
+    } else {
+        pad = 0;
+    }
+    var k: usize = 0;
+    while k < pad {
+        _ = buf_append_byte(&g_tui_diff_txt, 32);
+        k = k + 1;
+    }
+    _ = buf_append_u64(&g_tui_diff_txt, no as u64);
+    _ = buf_append_byte(&g_tui_diff_txt, 32);
+    tui_put_clipped(g_tui_diff_txt.ptr as &const byte, g_tui_diff_txt.len, TUI_DIFF_GUTTER, style);
+    tui_pad_to(x + TUI_DIFF_GUTTER);
+}
+
+// 内容行：k = 内容区第几行
+fn tui_diff_paint_row(k: usize, list_top: usize) void {
+    tui_row_new();
+    const left: usize = g_tui_dg.left;
+    // 左：边框 + 文件列表
+    tui_pad_to(left);
+    tui_puts("│" as &const byte, TUI_ST_ACCENT);
+    const li: usize = list_top + k;
+    if li < gd_file_count() {
+        var len: usize = 0;
+        const p: &const byte = gd_file_text(li, &len);
+        const sel: bool = li == gd_sel();
+        var mstyle: u8 = TUI_ST_DEFAULT;
+        if sel {
+            mstyle = TUI_ST_SEL;
+            tui_puts("▸ " as &const byte, TUI_ST_SEL);
+        } else {
+            mstyle = tui_diff_list_style(p, len);
+            tui_puts("  " as &const byte, TUI_ST_DEFAULT);
+        }
+        const room: usize = if (g_tui_dg.list_w > TUI_DIFF_MARK) { g_tui_dg.list_w - TUI_DIFF_MARK } else { 0 as usize };
+        tui_diff_clean_clip(p, len, room, mstyle);
+    }
+    tui_pad_to(g_tui_dg.sep1);
+    tui_puts("│" as &const byte, TUI_ST_ACCENT);
+    // 右：旧/新两栏
+    const di: usize = gd_scroll() + k;
+    const gd_n: usize = gd_rows();
+    if gd_n == 0 {
+        if k == 0 {
+            var len: usize = 0;
+            const note: &const byte = if gd_note().len > 0 { gd_note().ptr as &const byte } else { "(没有可显示的内容)" as &const byte };
+            if gd_note().len > 0 {
+                len = gd_note().len;
+            } else {
+                len = bufx_cstr_len(note);
+            }
+            const span: usize = g_tui_dg.cell_w + 1 + g_tui_dg.cell_w2;
+            tui_diff_cell(g_tui_dg.cell1_x, span, note, len, TUI_ST_DIM, 0);
+        } else {
+            tui_pad_to(g_tui_dg.sep2);
+            tui_puts("│" as &const byte, TUI_ST_ACCENT);
+            tui_pad_to(g_tui_dg.cell2_x + g_tui_dg.cell_w2);
+        }
+    } else if di < gd_n {
+        var meta: GdRow = GdRow{
+            l_off: 0, l_len: 0, r_off: 0, r_len: 0, l_no: 0, r_no: 0, kind: 255
+        };
+        if gd_row_meta(di, &meta) {
+            var ll: usize = 0;
+            var rl: usize = 0;
+            const lp: &const byte = gd_cell(di, 0, &ll);
+            const rp: &const byte = gd_cell(di, 1, &rl);
+            const hc: usize = gd_hscroll();
+            if meta.kind == GD_K_HDR {
+                // 说明行（@@ / 无换行结尾 / 二进制）：跨两栏
+                const span: usize = g_tui_dg.cell_w + 1 + g_tui_dg.cell_w2;
+                tui_diff_cell(g_tui_dg.cell1_x, span, lp, ll, TUI_ST_DIM, hc);
+            } else {
+                const lshow: bool = meta.kind != GD_K_ADD;
+                const rshow: bool = meta.kind != GD_K_DEL;
+                var lstyle: u8 = TUI_ST_DEFAULT;
+                var rstyle: u8 = TUI_ST_DEFAULT;
+                if meta.kind == GD_K_DEL {
+                    lstyle = TUI_ST_DEL;
+                } else if meta.kind == GD_K_ADD {
+                    rstyle = TUI_ST_ADD;
+                } else if meta.kind == GD_K_MIX {
+                    lstyle = TUI_ST_DEL;
+                    rstyle = TUI_ST_ADD;
+                }
+                tui_diff_no(g_tui_dg.cell1_x, meta.l_no, TUI_ST_DIM, lshow);
+                tui_diff_cell(g_tui_dg.cell1_x + TUI_DIFF_GUTTER, g_tui_dg.cell_w - TUI_DIFF_GUTTER, lp, ll, lstyle, hc);
+                tui_pad_to(g_tui_dg.sep2);
+                tui_puts("│" as &const byte, TUI_ST_ACCENT);
+                tui_diff_no(g_tui_dg.cell2_x, meta.r_no, TUI_ST_DIM, rshow);
+                tui_diff_cell(g_tui_dg.cell2_x + TUI_DIFF_GUTTER, g_tui_dg.cell_w2 - TUI_DIFF_GUTTER, rp, rl, rstyle, hc);
+            }
+        }
+    } else {
+        // 内容到底了：只留竖线
+        tui_pad_to(g_tui_dg.sep2);
+        tui_puts("│" as &const byte, TUI_ST_ACCENT);
+        tui_pad_to(g_tui_dg.cell2_x + g_tui_dg.cell_w2);
+    }
+    // 右边框
+    tui_pad_to(g_tui_dg.left + g_tui_dg.w - 1);
+    tui_puts("│" as &const byte, TUI_ST_ACCENT);
+    tui_fill_row(g_tui_cols);
+}
+
+// 顶边框 + 标题
+fn tui_diff_paint_top() void {
+    tui_row_new();
+    tui_pad_to(g_tui_dg.left);
+    tui_puts("╭─ " as &const byte, TUI_ST_ACCENT);
+    buf_reset(&g_tui_diff_txt);
+    _ = buf_append_cstr(&g_tui_diff_txt, "/diff · ");
+    _ = buf_append(&g_tui_diff_txt, gd_repo_label().ptr, gd_repo_label().len);
+    _ = buf_append_cstr(&g_tui_diff_txt, " · ");
+    var len: usize = 0;
+    const p: &const byte = gd_file_text(gd_sel(), &len);
+    // git 的 XY 码是两列（` M` / `M ` / `??`）：标题里把前导空格去掉好看一点
+    // （左列表保留原样 —— 那一列要跟 git 对齐）
+    var poff: usize = 0;
+    if len > 0 && p[0] == 32 as byte {
+        poff = 1;
+        len = len - 1;
+    }
+    _ = buf_append(&g_tui_diff_txt, p + poff, len);
+    _ = buf_append_cstr(&g_tui_diff_txt, " · +");
+    _ = buf_append_u64(&g_tui_diff_txt, gd_added() as u64);
+    _ = buf_append_cstr(&g_tui_diff_txt, " -");
+    _ = buf_append_u64(&g_tui_diff_txt, gd_removed() as u64);
+    _ = buf_append_cstr(&g_tui_diff_txt, " ");
+    const room: usize = if (g_tui_dg.w > 6) { g_tui_dg.w - 6 } else { 0 as usize };
+    // 拼好的标题里可能有外来字节（仓库名/文件名），照样先清洗再截断
+    buf_reset(&g_tui_dg_title);
+    _ = buf_append(&g_tui_dg_title, g_tui_diff_txt.ptr, g_tui_diff_txt.len);
+    tui_diff_clean_clip(g_tui_dg_title.ptr as &const byte, g_tui_dg_title.len, room, TUI_ST_BOLD);
+    tui_pad_to(g_tui_dg.left + g_tui_dg.w - 1);
+    tui_puts("╮" as &const byte, TUI_ST_ACCENT);
+    tui_fill_row(g_tui_cols);
+}
+
+// 列头：文件 (N) / 旧 · HEAD / 新 · 工作区
+fn tui_diff_paint_head() void {
+    tui_row_new();
+    tui_pad_to(g_tui_dg.left);
+    tui_puts("│" as &const byte, TUI_ST_ACCENT);
+    buf_reset(&g_tui_diff_txt);
+    _ = buf_append_cstr(&g_tui_diff_txt, "文件 (");
+    _ = buf_append_u64(&g_tui_diff_txt, gd_file_count() as u64);
+    _ = buf_append_cstr(&g_tui_diff_txt, ")");
+    tui_put_clipped(g_tui_diff_txt.ptr as &const byte, g_tui_diff_txt.len, g_tui_dg.list_w, TUI_ST_DIM);
+    tui_pad_to(g_tui_dg.sep1);
+    tui_puts("│" as &const byte, TUI_ST_ACCENT);
+    const t1: &const byte = "旧 · HEAD" as &const byte;
+    tui_put_clipped(t1, bufx_cstr_len(t1), g_tui_dg.cell_w, TUI_ST_DIM);
+    tui_pad_to(g_tui_dg.sep2);
+    tui_puts("│" as &const byte, TUI_ST_ACCENT);
+    const t2: &const byte = "新 · 工作区" as &const byte;
+    tui_put_clipped(t2, bufx_cstr_len(t2), g_tui_dg.cell_w2, TUI_ST_DIM);
+    tui_pad_to(g_tui_dg.left + g_tui_dg.w - 1);
+    tui_puts("│" as &const byte, TUI_ST_ACCENT);
+    tui_fill_row(g_tui_cols);
+}
+
+// 底部提示行：左键位提示、右「行 a-b/N · +A -D · note」
+fn tui_diff_paint_hint() void {
+    tui_row_new();
+    tui_pad_to(g_tui_dg.left);
+    tui_puts("│" as &const byte, TUI_ST_ACCENT);
+    const hint: &const byte = "↑↓ 文件 · pgup/pgdn 滚动 · ←→ 左右 · r 刷新 · q/esc 关闭" as &const byte;
+    const hn: usize = bufx_cstr_len(hint);
+    buf_reset(&g_tui_diff_txt);
+    const total: usize = gd_rows();
+    if total > 0 {
+        const from: usize = gd_scroll() + 1;
+        var to: usize = gd_scroll() + g_tui_dg.rows;
+        if to > total {
+            to = total;
+        }
+        _ = buf_append_cstr(&g_tui_diff_txt, "行 ");
+        _ = buf_append_u64(&g_tui_diff_txt, from as u64);
+        _ = buf_append_cstr(&g_tui_diff_txt, "-");
+        _ = buf_append_u64(&g_tui_diff_txt, to as u64);
+        _ = buf_append_cstr(&g_tui_diff_txt, "/");
+        _ = buf_append_u64(&g_tui_diff_txt, total as u64);
+    } else {
+        _ = buf_append_cstr(&g_tui_diff_txt, "无内容");
+    }
+    _ = buf_append_cstr(&g_tui_diff_txt, " · +");
+    _ = buf_append_u64(&g_tui_diff_txt, gd_added() as u64);
+    _ = buf_append_cstr(&g_tui_diff_txt, " -");
+    _ = buf_append_u64(&g_tui_diff_txt, gd_removed() as u64);
+    if gd_note().len > 0 {
+        _ = buf_append_cstr(&g_tui_diff_txt, " · ");
+        _ = buf_append(&g_tui_diff_txt, gd_note().ptr, gd_note().len);
+    }
+    const scols: usize = tty_cols_between(g_tui_diff_txt.ptr as &const byte, 0, g_tui_diff_txt.len);
+    const avail: usize = g_tui_dg.w - 4;
+    tui_pad_to(g_tui_dg.left + 2);
+    if avail > scols + 2 {
+        const hroom: usize = avail - scols - 2;
+        if hroom >= 12 {
+            tui_put_clipped(hint, hn, hroom, TUI_ST_DIM);
+        }
+        tui_pad_to(g_tui_dg.left + g_tui_dg.w - 2 - scols);
+        tui_put_clipped(g_tui_diff_txt.ptr as &const byte, g_tui_diff_txt.len, scols, TUI_ST_DIM);
+    } else {
+        // 太窄：保住状态（行号/计数/note），键位提示让位
+        tui_put_clipped(g_tui_diff_txt.ptr as &const byte, g_tui_diff_txt.len, avail, TUI_ST_DIM);
+    }
+    tui_pad_to(g_tui_dg.left + g_tui_dg.w - 1);
+    tui_puts("│" as &const byte, TUI_ST_ACCENT);
+    tui_fill_row(g_tui_cols);
+}
+
+fn tui_diff_paint_bottom() void {
+    tui_row_new();
+    tui_pad_to(g_tui_dg.left);
+    tui_puts("╰" as &const byte, TUI_ST_ACCENT);
+    var used: usize = 1;
+    while used + 1 < g_tui_dg.w {
+        tui_puts("─" as &const byte, TUI_ST_ACCENT);
+        used = used + 1;
+    }
+    tui_puts("╯" as &const byte, TUI_ST_ACCENT);
+    tui_fill_row(g_tui_cols);
+}
+
+fn tui_draw_overlay_diff() void {
+    tui_diff_ensure();
+    const avail: usize = tui_diff_avail_rows();
+    if g_tui_cols < TUI_DIFF_COLS_MIN || avail < TUI_DIFF_ROWS_MIN {
+        return;   // 画不出来就不画（调用方已经在开之前问过 tui_overlay_diff_fits）
+    }
+    var h: usize = avail - 1;
+    if h > TUI_MAX_ROWS - 2 {
+        h = TUI_MAX_ROWS - 2;
+    }
+    var w: usize = g_tui_cols - 4;
+    if w > g_tui_cols - 2 {
+        w = g_tui_cols - 2;
+    }
+    var left: usize = 2;
+    if g_tui_cols > w + 4 {
+        left = (g_tui_cols - w) / 2;
+    }
+    const inner: usize = w - 2;
+    // 左列表占 30%（估算：`M  path  (+3 -1)` 大概这个宽度），窄终端下限 18、宽终端上限 36
+    var list_w: usize = (w * 3) / 10;
+    if list_w < 18 {
+        list_w = 18;
+    }
+    if list_w > 36 {
+        list_w = 36;
+    }
+    if list_w + 6 > inner {
+        list_w = inner - 6;
+    }
+    const work: usize = inner - list_w - 1;   // 右区 = 两栏 + 一条中缝
+    var col_w: usize = (work - 1) / 2;
+    var col_w2: usize = work - 1 - col_w;
+    if col_w < TUI_DIFF_GUTTER + 2 {
+        col_w = TUI_DIFF_GUTTER + 2;
+    }
+    if col_w2 < TUI_DIFF_GUTTER + 2 {
+        col_w2 = TUI_DIFF_GUTTER + 2;
+    }
+    var rows: usize = 0;
+    if h >= 5 {
+        rows = h - 4;
+    }
+    g_tui_dg = TuiDiffGeo{
+        w: w, left: left, list_w: list_w,
+        sep1: left + 1 + list_w,
+        cell1_x: left + 2 + list_w, cell_w: col_w,
+        sep2: left + 2 + list_w + col_w,
+        cell2_x: left + 3 + list_w + col_w, cell_w2: col_w2,
+        rows: rows
+    };
+    gd_set_view(rows);
+    // 左列表跟着选中项滚
+    var list_top: usize = 0;
+    const nf: usize = gd_file_count();
+    if nf > rows && rows > 0 {
+        if gd_sel() + 1 > rows {
+            list_top = gd_sel() + 1 - rows;
+        }
+        if list_top + rows > nf {
+            list_top = nf - rows;
+        }
+    }
+    tui_row_rewind(0);
+    tui_diff_paint_top();
+    tui_diff_paint_head();
+    var k: usize = 0;
+    while k < rows {
+        tui_diff_paint_row(k, list_top);
+        k = k + 1;
+    }
+    tui_diff_paint_hint();
+    tui_diff_paint_bottom();
+}
+
+// 浮层按键：/diff 是「浏览型」的（没有可提交的结果，也不进食 filter）
+fn tui_ov_key_diff(ev: i32) void {
+    if ev == TUI_K_ESC || ev == TUI_K_CTRL_C {
+        g_tui_ov_cancel = true;
+        tui_overlay_close();
+        return;
+    }
+    if ev == TUI_K_UP {
+        _ = gd_move(-1);
+        tui_mark_dirty();
+        return;
+    }
+    if ev == TUI_K_DOWN {
+        _ = gd_move(1);
+        tui_mark_dirty();
+        return;
+    }
+    if ev == TUI_K_PGUP {
+        gd_scroll_by(-1);
+        tui_mark_dirty();
+        return;
+    }
+    if ev == TUI_K_PGDN {
+        gd_scroll_by(1);
+        tui_mark_dirty();
+        return;
+    }
+    if ev == TUI_K_HOME || ev == TUI_K_CTRL_A {
+        gd_scroll_home();
+        tui_mark_dirty();
+        return;
+    }
+    if ev == TUI_K_END || ev == TUI_K_CTRL_E {
+        gd_scroll_end();
+        tui_mark_dirty();
+        return;
+    }
+    if ev == TUI_K_LEFT {
+        gd_hscroll_by(-1);
+        tui_mark_dirty();
+        return;
+    }
+    if ev == TUI_K_RIGHT {
+        gd_hscroll_by(1);
+        tui_mark_dirty();
+        return;
+    }
+    if ev == TUI_K_CHAR {
+        var tmp: Buf = buf_new(8);
+        defer { buf_free(&tmp); }
+        const n: usize = tui_key_take_char(&tmp);
+        if n > 0 {
+            const c: byte = tmp.ptr[0];
+            if c == 113 as byte {          // q：关闭
+                g_tui_ov_cancel = true;
+                tui_overlay_close();
+            } else if c == 114 as byte {   // r：重新扫描（失败保留原内容，原因进 note）
+                _ = gd_refresh();
+                tui_mark_dirty();
+            }
+            return;
+        }
+        return;
+    }
+}
+
 // 浮层窗口（P23）：内容比框高时能滚
 //
 // 老实现里 g_tui_ov_top 只被写、从来没被读过，绘制按 `want = r - 1` 取前几项 ——
@@ -4248,6 +5304,11 @@ fn tui_ov_accept() void {
     if picked {
         _ = buf_append(&g_tui_ov_result, g_tui_ov_items.ptr + off, len);
         g_tui_ov_have = true;
+        // 命令面板里选中的是「退出」→ **当场**置退出标志：回合运行中主循环不在跑，
+        // 没人会来收这张浮层的结果（`/exit` 得能立刻生效，不能等回合结束，见踩坑 44）
+        if g_tui_ov_kind == TUI_OVK_PALETTE && tui_ov_result_is_exit() {
+            g_tui_quit = true;
+        }
     } else {
         // 回车但一条都没匹配上：不能静默（旧实现是「按了回车屏幕一动不动」）。
         // 把用户敲进过滤器的文字还回输入行，再落一条 notice 说明为什么什么都没发生。
@@ -4271,11 +5332,34 @@ fn tui_ov_restore_filter() void {
     tui_add_notice(msg.ptr as &const byte, msg.len);
 }
 
+// 命令面板的结果里，命令名（第一个空白之前那一段）是不是退出命令
+fn tui_ov_result_is_exit() bool {
+    const p: &const byte = g_tui_ov_result.ptr as &const byte;
+    var n: usize = 0;
+    while n < g_tui_ov_result.len {
+        const c: byte = p[n];
+        if c == 32 as byte || c == 9 as byte || c == 10 as byte {
+            break;
+        }
+        n = n + 1;
+    }
+    return tui_is_exit_command(p, n);
+}
+
 // 浮层按键
 fn tui_ov_key(ev: i32) void {
+    if g_tui_ov == TUI_OV_DIFF {
+        tui_ov_key_diff(ev);
+        return;
+    }
     if ev == TUI_K_ESC || ev == TUI_K_CTRL_C {
         g_tui_ov_cancel = true;
         tui_overlay_close();
+        return;
+    }
+    // reader 型（计划审阅）自带一套按键：↑/↓ 滚正文、tab 切动作、数字直选
+    if g_tui_ov_reader {
+        tui_ov_key_reader(ev);
         return;
     }
     if ev == TUI_K_ENTER {
@@ -4340,8 +5424,34 @@ fn tui_ov_key(ev: i32) void {
 }
 
 // 浮层排版：画在转录区中间的方框里（调用方保证 ov_top 之上/之下的行已经画好）
+//
+// 不变量：顶边 / 每一行正文 / 底边都是**同样 w 列**，右边框逐行对齐。
+// 正文那两处不能直接调 tui_put_clipped —— 它被裁时会**额外**补一个 `…`
+// （不算在 max_cols 里），那一行于是比方框宽 1 列、右边框被顶出去
+// （真机：命令面板里 /permission 那一行，见 README 踩坑 42）。
+fn tui_ov_put_clipped(p: &const byte, n: usize, max_cols: usize, style: u8) void {
+    if max_cols == 0 {
+        return;
+    }
+    var budget: usize = max_cols;
+    if max_cols > 1 && tty_clip_bytes(p, n, max_cols) < n {
+        budget = max_cols - 1;   // 给 '…' 留一列
+    }
+    tui_put_clipped(p, n, budget, style);
+}
+
 fn tui_draw_overlay() void {
+    if g_tui_ov == TUI_OV_DIFF {
+        // P27：/diff 占满转录区（几何与按键都在 tui_draw_overlay_diff / tui_ov_key_diff）
+        tui_draw_overlay_diff();
+        return;
+    }
     tui_ov_ensure();
+    // P26：reader 型（计划审阅）另有排版：正文可滚动 + 说明行 + 动作行
+    if g_tui_ov_reader {
+        tui_draw_overlay_reader();
+        return;
+    }
     const panel_top: usize = g_tui_panel_top;
     if panel_top < 5 {
         return;
@@ -4414,7 +5524,7 @@ fn tui_draw_overlay() void {
             // 列表体：窗口里的第 (r - 1) 行（确认型第 1 行是 prompt）
             var want: usize = r - 1;
             if g_tui_ov == TUI_OV_CONFIRM && r == 1 {
-                tui_put_clipped(g_tui_ov_prompt.ptr as &const byte, g_tui_ov_prompt.len, body, TUI_ST_DEFAULT);
+                tui_ov_put_clipped(g_tui_ov_prompt.ptr as &const byte, g_tui_ov_prompt.len, body, TUI_ST_DEFAULT);
             } else {
                 if g_tui_ov == TUI_OV_CONFIRM {
                     want = r - 2;
@@ -4430,7 +5540,7 @@ fn tui_draw_overlay() void {
                         if tui_ov_filter_match(g_tui_ov_items.ptr + o, l) {
                             if seen == fi {
                                 const style: u8 = if seen == g_tui_ov_sel { TUI_ST_SEL } else { TUI_ST_DEFAULT };
-                                tui_put_clipped(g_tui_ov_items.ptr + o, l, body, style);
+                                tui_ov_put_clipped(g_tui_ov_items.ptr + o, l, body, style);
                                 done = true;
                             }
                             seen = seen + 1;
@@ -4451,9 +5561,8 @@ fn tui_draw_overlay() void {
     }
 }
 
-// P21：阻塞式确认（工具内部用）。TUI 激活时开浮层、自己抽帧等按键：
+// 阻塞式确认（工具内部用）。TUI 激活时开浮层、自己抽帧等按键：
 //   返回 1 = 用户接受了某一项（选中的原文写进 out），0 = 取消 / 中断 / 无键可等。
-// 与 tui_poll_tick() 同一套「边跑边抽帧」的做法，区别是这里要等出一个决定。
 export fn tui_confirm_wait(kind: u8, title: &const byte, tn: usize, prompt: &const byte, pn: usize, items: &const byte, inlen: usize, sel: usize, out: &Buf) i32 {
     if !g_tui_on {
         return 0;
@@ -4472,6 +5581,12 @@ export fn tui_confirm_wait(kind: u8, title: &const byte, tn: usize, prompt: &con
     if !g_tui_headless {
         tui_key_reset();
     }
+    return tui_decide_wait(out);
+}
+
+// 阻塞式等待一个决定（confirm 型与 reader 型共用）：边跑边抽帧，直到「选中 / 取消 /
+// 中断 /（headless）没键可等」。调用方负责先把浮层开好。
+fn tui_decide_wait(out: &Buf) i32 {
     while true {
         if !g_tui_on {
             tui_overlay_close();
@@ -4489,7 +5604,7 @@ export fn tui_confirm_wait(kind: u8, title: &const byte, tn: usize, prompt: &con
             return 0;
         }
         _ = tui_tick(tui_now_ms());
-        if g_tui_headless && g_tui_quit {
+        if g_tui_headless && (g_tui_headless_done || g_tui_quit) {
             // headless 下注入的键用完 = 「没人回答」：别死转，但也别把浮层留在屏幕上
             tui_overlay_close();
             return 0;
@@ -4532,12 +5647,14 @@ export const TUI_REQ_NONE: i32 = 0;
 export const TUI_REQ_PLAN_ON: i32 = 1;
 export const TUI_REQ_PLAN_OFF: i32 = 2;
 export const TUI_REQ_ACCESS: i32 = 3;   // P21：打开访问模式选择器（shift+tab）
+export const TUI_REQ_TASKS: i32 = 4;    // P22：展开/收起常驻任务块（ctrl+t）
 
 var g_tui_submit: Buf = Buf{ ptr: null, len: 0, cap: 0 };
 var g_tui_have_submit: bool = false;
 var g_tui_interrupt: bool = false;
 var g_tui_quit: bool = false;
 var g_tui_ctrl_c_armed: bool = false;
+var g_tui_ctrl_c_at: u64 = 0;      // 上一次「待确认的 ctrl+c」的时刻（两秒内再按 = 退出）
 var g_tui_req: i32 = TUI_REQ_NONE;
 var g_tui_cmds: Buf = Buf{ ptr: null, len: 0, cap: 0 };
 var g_tui_panel_h: usize = 2;
@@ -4580,7 +5697,12 @@ export fn tui_interrupt_pending() bool {
 }
 
 export fn tui_quit_wanted() bool {
-    return g_tui_quit;
+    return g_tui_quit || g_tui_headless_done;
+}
+
+// 自测脚本演完了吗（headless 专用；真终端永远 false）
+export fn tui_headless_done() bool {
+    return g_tui_headless_done;
 }
 
 export fn tui_take_request() i32 {
@@ -4589,11 +5711,124 @@ export fn tui_take_request() i32 {
     return r;
 }
 
+// ============================================================
+// P28：「现在要不要停」：给**阻塞型**工作（bash 前台 / 后台任务等待 / 子代理等待 /
+// workflow 脚本 / rg）用的一问一答接口。
+//
+// 为什么必须有：这些循环以前只调 tui_poll_tick()（把界面刷活、把键收下来），
+// 但**没有一个人看**收下来的键 —— 于是 `sleep 300` 跑着的时候 esc / ctrl+c /
+// ctrl+d 全都石沉大海，用户只能等工具自己结束，看着就像「退不出」（踩坑 44）。
+// 判定口径与主循环完全一致：QUIT 就是 QUIT，接到的人负责把子进程杀掉并收工。
+// ============================================================
+
+export const TUI_ABORT_NONE: i32 = 0;
+export const TUI_ABORT_TURN: i32 = 1;   // esc / ctrl+c：停掉当前这一步，本回合到此为止
+export const TUI_ABORT_QUIT: i32 = 2;   // ctrl+d / /exit / 运行中二次 ctrl+c：杀子进程并退出
+
+// 滚动模式（--no-tui）下由 tui_abort_check 记下来的意图：那边没有 TUI 的全局标志
+// （ctrl+c 只是 stdin 里的一个字节），但这个意图必须**粘住** —— 杀掉工具子进程之后，
+// 回合还得在下一个 step 边界停下来，否则用户按了 ctrl+c，模型却接着跑下一步。
+var g_block_abort: i32 = TUI_ABORT_NONE;
+
+// 只读状态（不读键、不重绘）：给「已经知道要停」的分支用
+export fn tui_abort_state() i32 {
+    if g_tui_quit || g_block_abort == TUI_ABORT_QUIT {
+        return TUI_ABORT_QUIT;
+    }
+    if g_tui_interrupt || g_block_abort == TUI_ABORT_TURN {
+        return TUI_ABORT_TURN;
+    }
+    return TUI_ABORT_NONE;
+}
+
+// 阻塞循环里调这个：TUI 模式下顺带刷帧 + 读键；滚动模式下也服务一遍键盘
+// （整行进 steer 收件箱、Ctrl-C = 中断），非交互（管道/CI/子代理）模式下是空调用。
+//
+// 自测（headless）下**不**刷帧：headless 的 poll 把「注入的键用完」当成 stdin EOF
+// 并置 quit，刷一下就等于让每个工具循环立刻自杀。
+export fn tui_abort_check() i32 {
+    if tui_active() {
+        if !g_tui_headless {
+            _ = tui_tick(tui_now_ms());
+        }
+        return tui_abort_state();
+    }
+    if tty_is_interactive() {
+        const ev: i32 = llm_pump_input();
+        if ev == TTY_EV_EOF {
+            tui_abort_note_scroll(TUI_ABORT_QUIT);
+        } else if ev == TTY_EV_CTRL_C || ev == TTY_EV_ESC {
+            tui_abort_note_scroll(TUI_ABORT_TURN);
+        }
+    }
+    return tui_abort_state();
+}
+
+// 回合开始时清掉上一轮遗留的中断意图。
+//
+// 不清的后果很重：`g_tui_interrupt` 只有按键会置、**没人复位**，而流式循环一开头
+// 就问「有没有中断意图」—— 于是中断过一次之后，**后面每一个新任务都在第一个字节
+// 就被打断**（屏幕上只有一句「已中断本回合」，看起来像 agent 死了）。
+export fn tui_interrupt_clear() void {
+    g_tui_interrupt = false;
+    g_block_abort = TUI_ABORT_NONE;
+}
+
+// 滚动模式下记下「用户要停」的意图（只升级不降级）。自测直接调它模拟 stdin 上的
+// ctrl+c/ctrl+d —— 真机上这一步由 tui_abort_check 的 tty 分支完成。
+export fn tui_abort_note_scroll(kind: i32) void {
+    if kind == TUI_ABORT_QUIT {
+        g_block_abort = TUI_ABORT_QUIT;
+    } else if kind == TUI_ABORT_TURN && g_block_abort == TUI_ABORT_NONE {
+        g_block_abort = TUI_ABORT_TURN;
+    }
+}
+
+// fork 出来的子代理进程：终端、TUI 帧目标 fd、按键全都是从父进程继承来的，
+// 子进程**一个字节都不许碰** —— 否则子代理（它的流式循环与工具循环都会 tick）
+// 会被父进程的终端抢键：用户在子代理跑着的时候按 esc / ctrl+c / ctrl+d，
+// 键被子进程吃掉，父进程永远收不到（踩坑 44）。
+export fn tui_child_detach() void {
+    g_tui_on = false;
+    g_tui_out_fd = -1;
+    g_tui_headless = false;
+    g_tui_quit = false;
+    g_tui_headless_done = false;
+    g_tui_interrupt = false;
+    tty_sink_on = false;
+}
+
+// 命令面板里那两条「退出」命令（`/exit`、`/quit`）。命令表只有一份，
+// 判定口径也必须只有一份：**提交路径**（打字回车）与**主循环**（面板选中的命令）
+// 都按这个函数认，别处不许再写第二份字面量比较。
+export fn tui_is_exit_command(p: &const byte, n: usize) bool {
+    if n == 5 && bufx_mem_eq(p, "/exit" as &const byte, 5) {
+        return true;
+    }
+    if n == 5 && bufx_mem_eq(p, "/quit" as &const byte, 5) {
+        return true;
+    }
+    return false;
+}
+
 // 提交当前输入（回车）：进历史 + 清空 + 置「有待取走的提交」
+//
+// `/exit` / `/quit` 在**这里**就拦下来（置退出标志、既不进历史也不提交）：
+// 提交路径是「空闲」与「回合运行中」两条路的分叉点 —— 空闲时提交进主循环，
+// 运行中提交进 steer 收件箱（当 user 消息发给模型）。两个地方各拦一次容易漏，
+// 而且真的漏过：TUI 里打 `/exit` 回车以前什么都不发生（退出标志没置），
+// 运行中打还会把 `/exit` 当成任务文本发给模型（见 README 踩坑 44）。
 fn tui_do_submit() void {
     tui_glue_ensure();
     tui_in_ensure();
     if g_tui_in.len == 0 {
+        return;
+    }
+    if tui_is_exit_command(g_tui_in.ptr as &const byte, g_tui_in.len) {
+        g_tui_quit = true;
+        buf_reset(&g_tui_in);
+        g_tui_in_cursor = 0;
+        tui_mark_dirty();
         return;
     }
     buf_reset(&g_tui_submit);
@@ -4612,7 +5847,7 @@ fn tui_open_palette() void {
 }
 
 fn tui_open_help() void {
-    const help: &const byte = "enter 发送 · ctrl+j / alt+enter 换行 · esc 中断 · ctrl+c 中断或退出\npgup/pgdn 滚动 · ctrl+home/end 顶/尾 · tab 计划模式 · shift+tab 访问模式 · ctrl+p 命令面板\nctrl+u 清行 · ctrl+w 删词 · ctrl+k 删到行尾 · ctrl+a/e 行首/行尾 · ctrl+l 重绘\nctrl+d 空行退出 · 运行中的输入会进 steer 收件箱（下一个 step 生效）" as &const byte;
+    const help: &const byte = "enter 发送 · ctrl+j / alt+enter 换行 · esc 中断（运行中＝中断本回合，当场杀掉正在跑的工具）· ctrl+c 中断或退出\npgup/pgdn 滚动 · ctrl+home/end 顶/尾 · tab 计划模式 · shift+tab 访问模式 · ctrl+p 命令面板\nctrl+u 清行 · ctrl+w 删词 · ctrl+k 删到行尾 · ctrl+a/e 行首/行尾 · ctrl+l 重绘\nctrl+t 任务状态块 展开/收起 · ctrl+d 空行退出（运行中也生效）· /exit 退出 · ctrl+c 运行中两秒内两次＝退出 · 运行中的输入会进 steer 收件箱（下一个 step 生效）\n/diff 看 git 修改（浮窗里：↑↓ 选文件 · pgup/pgdn 滚动 · ←→ 左右 · r 刷新 · esc 关闭）" as &const byte;
     tui_overlay_list(TUI_OVK_HELP, "帮助" as &const byte, 6, help, bufx_cstr_len(help));
 }
 
@@ -4716,6 +5951,12 @@ fn tui_handle_one(ev: i32) void {
         tui_open_palette();
         return;
     }
+    if ev == TUI_K_CTRL_T {
+        // P22：只置请求，别在这里改状态（与 tab/shift+tab 同一套分工）
+        g_tui_req = TUI_REQ_TASKS;
+        tui_mark_dirty();
+        return;
+    }
     if ev == TUI_K_STAB {
         if g_tui_in.len == 0 {
             // P21：shift+tab 打开访问模式选择器（chip 的「可点」等价物；终端没有鼠标）
@@ -4743,6 +5984,18 @@ fn tui_handle_one(ev: i32) void {
     }
     if ev == TUI_K_ESC || ev == TUI_K_CTRL_C {
         if g_tui_run != TUI_RUN_IDLE {
+            // 运行中：esc / ctrl+c 都是「中断本回合」；ctrl+c **两秒内再按一次**就是退出。
+            // 之所以给运行中也留一条退出键：中断意图是在**下一个 step 边界**生效的，
+            // 如果当前这一步是个长命令，光靠 esc 只能等它跑完（踩坑 44）。
+            if ev == TUI_K_CTRL_C {
+                if g_tui_ctrl_c_armed && (tui_now_ms() - g_tui_ctrl_c_at) <= 2000 {
+                    g_tui_quit = true;
+                    return;
+                }
+                g_tui_ctrl_c_armed = true;
+                g_tui_ctrl_c_at = tui_now_ms();
+                tui_add_notice("(再按一次 ctrl+c 直接退出；esc 只中断本回合)" as &const byte, bufx_cstr_len("(再按一次 ctrl+c 直接退出；esc 只中断本回合)" as &const byte));
+            }
             g_tui_interrupt = true;
             tui_mark_dirty();
             return;
@@ -4756,11 +6009,12 @@ fn tui_handle_one(ev: i32) void {
             g_tui_ctrl_c_armed = false;
             return;
         }
-        if g_tui_ctrl_c_armed {
+        if g_tui_ctrl_c_armed && (tui_now_ms() - g_tui_ctrl_c_at) <= 2000 {
             g_tui_quit = true;
             return;
         }
         g_tui_ctrl_c_armed = true;
+        g_tui_ctrl_c_at = tui_now_ms();
         tui_add_notice("(再按一次 ctrl+c 退出；或直接输入任务)" as &const byte,
             bufx_cstr_len("(再按一次 ctrl+c 退出；或直接输入任务)" as &const byte));
         return;
@@ -4791,10 +6045,11 @@ export fn tui_handle_keys() void {
 
 export fn tui_poll_keys(timeout_ms: i32) usize {
     if g_tui_headless {
-        // 自测：按键靠注入；注入的键用完就等价于「stdin 到 EOF」→ 请求退出，
-        // 主循环把这一轮跑完就会收工（否则 headless 下会空转）
+        // 自测：按键靠注入；注入的键用完 = 这一轮脚本演完了（置 harness 标志，**不置**
+        // g_tui_quit）：主循环与审批浮层的等待据此收工，而流式循环/工具循环的退出判定
+        // 看不到它（自测里要结束一个跑着的回合请显式注入 esc/ctrl+c）。
         if g_tui_evn == 0 && !g_tui_have_submit {
-            g_tui_quit = true;
+            g_tui_headless_done = true;
         }
         return 0;
     }
@@ -4875,8 +6130,11 @@ export fn tui_reset_all() void {
     g_tui_have_submit = false;
     g_tui_interrupt = false;
     g_tui_quit = false;
+    g_tui_headless_done = false;
     g_tui_ctrl_c_armed = false;
+    g_tui_ctrl_c_at = 0;
     g_tui_req = TUI_REQ_NONE;
+    g_block_abort = TUI_ABORT_NONE;
     g_tui_scroll = 0;
     g_tui_total = 0;
     g_tui_more_above = false;
@@ -4891,6 +6149,10 @@ export fn tui_reset_all() void {
     g_tui_ov = TUI_OV_NONE;
     g_tui_ov_kind = 0;
     g_tui_ov_done = 0;
+    g_tui_dg = TuiDiffGeo{
+        w: 0, left: 0, list_w: 0, sep1: 0, cell1_x: 0, cell_w: 0,
+        sep2: 0, cell2_x: 0, cell_w2: 0, rows: 0
+    };
     g_tui_ov_have = false;
     g_tui_ov_cancel = false;
     g_tui_ov_n = 0;
@@ -4912,6 +6174,10 @@ export fn tui_reset_all() void {
     g_tui_frames = 0;
     g_tui_step = 0;
     buf_reset(&g_tui_stats);
+    if buf_valid(&g_tui_tasks) {
+        buf_reset(&g_tui_tasks);
+    }
+    g_tui_tasks_n = 0;
     g_tui_ctx_pct = -1;
     g_tui_cpu_pct = procx_cpu_pct();
     g_tui_mem_kb = procx_mem_kb();
@@ -4929,10 +6195,13 @@ var g_tui_idle_frames: usize = 0;
 // 留下 quit=true，PTY 里的新 UI 一进来就自己退出了。
 export fn tui_begin_session() void {
     g_tui_quit = false;
+    g_tui_headless_done = false;
     g_tui_interrupt = false;
     g_tui_have_submit = false;
     g_tui_ctrl_c_armed = false;
+    g_tui_ctrl_c_at = 0;
     g_tui_req = TUI_REQ_NONE;
+    g_block_abort = TUI_ABORT_NONE;
     g_tui_run = TUI_RUN_IDLE;
     if buf_valid(&g_tui_think) {
         buf_reset(&g_tui_think);      // P18：新会话不许带着上一轮的思考实时行
@@ -4984,6 +6253,8 @@ export fn tui_tick(now_ms: u64) bool {
     // 循环与各种阻塞 poll 循环（tui_poll_tick），所以跑工具/等网络时数字照样刷新。
     // P24：内存（PSS 合计）同一路，只是慢一档（procx 内部按 5s 决定要不要算）。
     procx_tick(now_ms);
+    // P22：任务块的 1Hz 心跳（poll job/deleg + 重建文本；内容变了才 mark dirty）
+    tasks_tick(now_ms);
     if g_tui_cpu_pct != procx_cpu_pct() {
         g_tui_cpu_pct = procx_cpu_pct();
         need = true;

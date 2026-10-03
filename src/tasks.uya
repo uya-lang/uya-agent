@@ -1,0 +1,964 @@
+// src/tasks.uya — P22：任务状态聚合（todo 清单 / 后台任务 / 子代理 / 会话目标）+ 常驻任务块
+//
+// 这一层只做两件事：
+//   1) **纯函数**：把四张表折叠成「折叠行 / 展开箱体 / /tasks 报告」。不 poll、不读盘、
+//      不写终端，`now_ms` 也显式传入 —— 自测才能拿 fixture 逐字节断言；
+//   2) **一张面板块快照**：tasks_panel_sync() 重建 → 与上次推送逐字节比 → 变了才往下推
+//      （滚动模式走 P15 的 tty 面板块协议，TUI 只置 dirty，之后从 tasks_latest() 拉最新文本）。
+//
+// 刻意不做的事：
+//   * 不在每帧重建文本（TUI 的 tui_build 只 memcpy 缓存，重建最密 1Hz）；
+//   * 不用行数统计后台任务输出（1 MiB 缓冲逐行扫太贵）—— 用字节数；
+//   * 不给 job/deleg 加结束时间戳（那要改它们的状态机），所以**已结束项不显示时长**。
+//
+// 状态字形有两套值空间，别混：todo 用 TD_*（见 todo.uya），job 用 JOB_*（见 jobs.uya），
+// deleg 用 DELEG_*（view_status_glyph 只认这一套）。
+
+// ---- 常量 ----
+const TASKS_CELLS: usize = 20;            // 进度条格数（与 /status 的占用条同宽）
+const TASKS_TODO_ROWS: usize = 6;         // 常驻箱体里清单最多画几行（/tasks 全量）
+const TASKS_LABEL_COLS: usize = 10;       // 段落标签列宽（清单/后台任务/子代理/目标/提示）
+const TASKS_WIDTH_MIN: usize = 24;        // 再窄也按这个宽度排版，免得边框退化成负数
+export const TASKS_BLOCK_MAX_ROWS: usize = 12;   // 常驻块总行数上限（含上下边框）
+const TASKS_TTY_BYTES_MAX: usize = 8000;  // tty 面板块上限是 8192（tty.uya），留一点余量：
+                                          // 超了 tty_block_set 会**静默丢弃**（块凭空消失）
+const TASKS_TUI_BYTES_MAX: usize = 262144; // TUI 自己画行，不走 tty 面板块，只防手滑
+
+// ---- 进度 ----
+export struct TasksProgress {
+    total: usize,
+    pending: usize,
+    in_progress: usize,
+    completed: usize,
+    pct: i32,          // -1 = 清单为空
+}
+
+// 四舍五入（half-up）的比例：floor(num * scale / den + 0.5)
+fn tasks_scaled(num: usize, den: usize, scale: usize) usize {
+    if den == 0 {
+        return 0;
+    }
+    return (num * scale * 2 + den) / (2 * den);
+}
+
+export fn tasks_progress(t: &const TodoState, out: &TasksProgress) void {
+    out.total = t.n;
+    var np: usize = 0;
+    var ni: usize = 0;
+    var nc: usize = 0;
+    var i: usize = 0;
+    while i < t.n {
+        if t.items[i].status == TD_COMPLETED {
+            nc = nc + 1;
+        } else if t.items[i].status == TD_INPROGRESS {
+            ni = ni + 1;
+        } else {
+            np = np + 1;
+        }
+        i = i + 1;
+    }
+    out.pending = np;
+    out.in_progress = ni;
+    out.completed = nc;
+    if t.n == 0 {
+        out.pct = -1;
+        return;
+    }
+    out.pct = tasks_scaled(nc, t.n, 100) as i32;
+}
+
+// 进度条：`████░░░░…`（total = 0 时一个字节都不写）
+export fn tasks_bar(out: &Buf, done: usize, total: usize, cells: usize) void {
+    if cells == 0 || total == 0 {
+        return;
+    }
+    var filled: usize = tasks_scaled(done, total, cells);
+    if filled > cells {
+        filled = cells;
+    }
+    var i: usize = 0;
+    while i < filled {
+        _ = buf_append_cstr(out, "█");
+        i = i + 1;
+    }
+    while i < cells {
+        _ = buf_append_cstr(out, "░");
+        i = i + 1;
+    }
+}
+
+fn tasks_fmt_one_dec(out: &Buf, scaled: usize, suffix: &const byte) void {
+    _ = buf_append_u64(out, (scaled / 10) as u64);
+    _ = buf_append_byte(out, 46);   // '.'
+    _ = buf_append_u64(out, (scaled % 10) as u64);
+    _ = buf_append_cstr(out, suffix);
+}
+
+// 输出体量：`120B` / `3.2K` / `512K` / `1.0M`（后台任务的输出不数行 —— 那是 1 MiB 级扫描）
+export fn tasks_fmt_bytes(out: &Buf, n: usize) void {
+    if n < 1024 {
+        _ = buf_append_u64(out, n as u64);
+        _ = buf_append_cstr(out, "B");
+        return;
+    }
+    if n < 10240 {
+        tasks_fmt_one_dec(out, (n * 10) / 1024, "K" as &const byte);
+        return;
+    }
+    if n < 1048576 {
+        _ = buf_append_u64(out, (n / 1024) as u64);
+        _ = buf_append_cstr(out, "K");
+        return;
+    }
+    tasks_fmt_one_dec(out, (n * 10) / 1048576, "M" as &const byte);
+}
+
+// ============================================================
+// 行渲染辅助
+// ============================================================
+
+// 本行行首在 out 里的偏移（列数必须从**本行**量起，不能从 0：out 里可能已经有很多行）
+fn tasks_line_start(out: &const Buf) usize {
+    if out.len == 0 {
+        return 0;
+    }
+    var i: usize = out.len;
+    while i > 0 {
+        if out.ptr[i - 1] == 10 as byte {
+            return i;
+        }
+        i = i - 1;
+    }
+    return 0;
+}
+
+// 把当前行补空格到 target 显示列（中文 2 列、3 字节 —— 按字节补就会歪）
+fn tasks_pad_cols(out: &Buf, target: usize) void {
+    const start: usize = tasks_line_start(out);
+    var used: usize = tty_cols_between(out.ptr as &const byte, start, out.len);
+    while used < target {
+        _ = buf_append_byte(out, 32);
+        used = used + 1;
+    }
+}
+
+// 段落标签：`清单` / `后台任务` / … + 补到标签列宽
+fn tasks_label(out: &Buf, lit: &const byte, n: usize) void {
+    _ = buf_append(out, lit, n);
+    tasks_pad_cols(out, TASKS_LABEL_COLS);
+}
+
+// 一行写出去（按显示列裁剪，裁了就补 `…`），末尾换行
+fn tasks_emit(out: &Buf, text: &const byte, n: usize, width: usize) void {
+    if width == 0 || n == 0 {
+        _ = buf_append_byte(out, 10);
+        return;
+    }
+    const w: usize = tty_cols_between(text, 0, n);
+    if w <= width {
+        _ = buf_append(out, text, n);
+    } else {
+        const keep: usize = tty_clip_bytes(text, n, width - 1);
+        _ = buf_append(out, text, keep);
+        _ = buf_append_cstr(out, "…");
+    }
+    _ = buf_append_byte(out, 10);
+}
+
+// 把可能带控制字节/换行的外来文本压成**一行**：先走 tui_clean_into（ESC 序列、非法 UTF-8
+// 都有既有口径），再把换行/回车折成空格。清单项与标签都是模型给的，不压就会把边框撑破。
+fn tasks_flat_into(dst: &Buf, p: &const byte, n: usize) void {
+    buf_reset(dst);
+    var tmp: Buf = buf_new(n + 16);
+    defer { buf_free(&tmp); }
+    tui_clean_into(&tmp, p, n);
+    var i: usize = 0;
+    while i < tmp.len {
+        const c: byte = tmp.ptr[i];
+        if c == 10 as byte || c == 13 as byte {
+            _ = buf_append_byte(dst, 32);
+        } else {
+            _ = buf_append_byte(dst, c);
+        }
+        i = i + 1;
+    }
+}
+
+fn tasks_glyph_todo(st: u8) &const byte {
+    if st == TD_COMPLETED {
+        return "✓" as &const byte;
+    }
+    if (st == TD_INPROGRESS) {
+        return "▸" as &const byte;
+    }
+    return "·" as &const byte;
+}
+
+// job 的字形跟 deleg 不是一套值：JOB_DONE 还要看退出码（0 → ✓，非 0 → ✗）
+fn tasks_glyph_job(j: &const Job) &const byte {
+    if j.status == JOB_KILLED {
+        return "■" as &const byte;
+    }
+    if j.status == JOB_DONE {
+        if j.exit_code == 0 {
+            return "✓" as &const byte;
+        }
+        return "✗" as &const byte;
+    }
+    return "●" as &const byte;
+}
+
+fn tasks_goal_label(g: &const Goal) &const byte {
+    if bufx_eq_cstr(g.phase.ptr as &const byte, g.phase.len, "paused" as &const byte) {
+        return "暂停" as &const byte;
+    }
+    if bufx_eq_cstr(g.phase.ptr as &const byte, g.phase.len, "complete" as &const byte) {
+        return "完成" as &const byte;
+    }
+    if bufx_eq_cstr(g.phase.ptr as &const byte, g.phase.len, "blocked" as &const byte) {
+        return "阻塞" as &const byte;
+    }
+    return "active" as &const byte;
+}
+
+fn tasks_count_running(jobs: &const JobTable) usize {
+    var r: usize = 0;
+    var i: usize = 0;
+    while i < JOB_MAX {
+        if jobs.items[i].used && jobs.items[i].status == JOB_RUNNING {
+            r = r + 1;
+        }
+        i = i + 1;
+    }
+    return r;
+}
+
+fn tasks_count_jobs(jobs: &const JobTable) usize {
+    var r: usize = 0;
+    var i: usize = 0;
+    while i < JOB_MAX {
+        if jobs.items[i].used {
+            r = r + 1;
+        }
+        i = i + 1;
+    }
+    return r;
+}
+
+fn tasks_count_running_agents(t: &const DelegTable) usize {
+    var r: usize = 0;
+    var i: usize = 0;
+    while i < DELEG_MAX {
+        if t.items[i].used && t.items[i].status == DELEG_RUNNING {
+            r = r + 1;
+        }
+        i = i + 1;
+    }
+    return r;
+}
+
+fn tasks_count_agents(t: &const DelegTable) usize {
+    var r: usize = 0;
+    var i: usize = 0;
+    while i < DELEG_MAX {
+        if t.items[i].used {
+            r = r + 1;
+        }
+        i = i + 1;
+    }
+    return r;
+}
+
+// ============================================================
+// 折叠行（常驻块的非展开形态；恒 1 行，超宽从尾部丢段补 `…`）
+// ============================================================
+
+export fn tasks_line(todos: &const TodoState, jobs: &const JobTable, deleg: &const DelegTable,
+                     goal: &const Goal, width: usize, out: &Buf) void {
+    buf_reset(out);
+    const w: usize = if width < TASKS_WIDTH_MIN { TASKS_WIDTH_MIN } else { width };
+
+    var segs: [Buf: 4] = [buf_empty(): 4];
+    var ns: usize = 0;
+    defer {
+        var k: usize = 0;
+        while k < 4 {
+            buf_free(&segs[k]);
+            k = k + 1;
+        }
+    }
+
+    var prog: TasksProgress = TasksProgress{
+        total: 0, pending: 0, in_progress: 0, completed: 0, pct: -1,
+    };
+    tasks_progress(todos, &prog);
+    const running_jobs: usize = tasks_count_running(jobs);
+    const n_jobs: usize = tasks_count_jobs(jobs);
+    const running_agents: usize = tasks_count_running_agents(deleg);
+    const n_agents: usize = tasks_count_agents(deleg);
+
+    if prog.total > 0 {
+        segs[ns] = buf_new(64);
+        _ = buf_append_cstr(&segs[ns], "任务 ");
+        _ = buf_append_u64(&segs[ns], prog.completed as u64);
+        _ = buf_append_cstr(&segs[ns], "/");
+        _ = buf_append_u64(&segs[ns], prog.total as u64);
+        _ = buf_append_byte(&segs[ns], 32);
+        _ = buf_append_i64(&segs[ns], prog.pct as i64);
+        _ = buf_append_cstr(&segs[ns], "%");
+        ns = ns + 1;
+    }
+    if n_jobs > 0 {
+        segs[ns] = buf_new(48);
+        _ = buf_append_cstr(&segs[ns], "后台 ");
+        _ = buf_append_u64(&segs[ns], running_jobs as u64);
+        _ = buf_append_cstr(&segs[ns], "/");
+        _ = buf_append_u64(&segs[ns], n_jobs as u64);
+        ns = ns + 1;
+    }
+    if n_agents > 0 {
+        segs[ns] = buf_new(48);
+        _ = buf_append_cstr(&segs[ns], "子代理 ");
+        _ = buf_append_u64(&segs[ns], running_agents as u64);
+        _ = buf_append_cstr(&segs[ns], "/");
+        _ = buf_append_u64(&segs[ns], n_agents as u64);
+        ns = ns + 1;
+    }
+    if goal.active_state {
+        segs[ns] = buf_new(64);
+        _ = buf_append_cstr(&segs[ns], "目标 ");
+        const lbl: &const byte = tasks_goal_label(goal);
+        if bufx_eq_cstr(lbl, bufx_cstr_len(lbl), "active" as &const byte) {
+            _ = buf_append_i64(&segs[ns], goal.round as i64);
+            _ = buf_append_cstr(&segs[ns], "/");
+            _ = buf_append_i64(&segs[ns], goal.max_rounds as i64);
+        } else {
+            _ = buf_append_cstr(&segs[ns], lbl);
+        }
+        ns = ns + 1;
+    }
+    if ns == 0 {
+        return;                      // 四类都空 → 一个字节都不写（常驻块整块消失）
+    }
+
+    // 首字形：有在跑的 → ▸；清单非空且全完成且没有在跑的 → ✓；其余 → ·
+    var running_now: bool = running_jobs > 0 || running_agents > 0 || prog.in_progress > 0;
+    var lead: &const byte = "·" as &const byte;
+    if running_now {
+        lead = "▸" as &const byte;
+    } else if prog.total > 0 && prog.completed == prog.total {
+        lead = "✓" as &const byte;
+    }
+    _ = buf_append_cstr(out, lead);
+    _ = buf_append_byte(out, 32);
+    var used: usize = 2;
+
+    var first: bool = true;
+    var dropped: bool = false;
+    var i: usize = 0;
+    while i < ns {
+        const seg: &Buf = &segs[i];
+        const sw: usize = tty_cols_between(seg.ptr as &const byte, 0, seg.len);
+        // 别写成 `const add = if first { sw } else { sw + 3 }`：uya 0.10 会为这种
+        // if 表达式生成「给只读临时变量赋值」的 C，直接编译不过（实测踩到）
+        var add: usize = sw;
+        if !first {
+            add = sw + 3;                                     // ` · `
+        }
+        // 后面还要留 1 列给 `…`：宁可少一段，也不让整行超宽
+        if !first && used + add + 1 > w {
+            dropped = true;
+            break;
+        }
+        if !first {
+            _ = buf_append_cstr(out, " · ");
+        }
+        _ = buf_append(out, seg.ptr, seg.len);
+        used = used + add;
+        first = false;
+        i = i + 1;
+    }
+    if dropped {
+        _ = buf_append_cstr(out, "…");
+    }
+}
+
+// ============================================================
+// 展开内容（无边框的段落行；箱体与 /tasks 报告共用）
+// ============================================================
+
+// 清单：优先 in_progress → pending → completed（组内保持清单原序），最多 cap 行
+fn tasks_rows_todos(out: &Buf, todos: &const TodoState, width: usize, cap: usize) void {
+    if todos.n == 0 {
+        return;
+    }
+    var prog: TasksProgress = TasksProgress{
+        total: 0, pending: 0, in_progress: 0, completed: 0, pct: -1,
+    };
+    tasks_progress(todos, &prog);
+    var row: Buf = buf_new(256);
+    defer { buf_free(&row); }
+    tasks_label(&row, "清单" as &const byte, 6);
+    _ = buf_append_u64(&row, prog.completed as u64);
+    _ = buf_append_cstr(&row, "/");
+    _ = buf_append_u64(&row, prog.total as u64);
+    tasks_pad_cols(&row, TASKS_LABEL_COLS + 6);
+    _ = buf_append_i64(&row, prog.pct as i64);
+    _ = buf_append_cstr(&row, "%");
+    tasks_pad_cols(&row, TASKS_LABEL_COLS + 11);   // 百分比列（3 列右对齐）+ 2 列间隔 → 进度条
+    tasks_bar(&row, prog.completed, prog.total, TASKS_CELLS);
+    tasks_emit(out, row.ptr as &const byte, row.len, width);
+
+    var emitted: usize = 0;
+    var pass: u8 = 0;
+    while pass < 3 {
+        var i: usize = 0;
+        while i < todos.n && emitted < cap {
+            const it: &const TodoItem = &todos.items[i];
+            var hit: bool = false;
+            if pass == 0 && it.status == TD_INPROGRESS {
+                hit = true;
+            } else if pass == 1 && it.status == TD_PENDING {
+                hit = true;
+            } else if pass == 2 && it.status == TD_COMPLETED {
+                hit = true;
+            }
+            if hit {
+                var line: Buf = buf_new(it.content.len + 32);
+                defer { buf_free(&line); }
+                _ = buf_append_cstr(&line, "  ");
+                _ = buf_append_cstr(&line, tasks_glyph_todo(it.status));
+                _ = buf_append_byte(&line, 32);
+                var flat: Buf = buf_new(it.content.len + 16);
+                defer { buf_free(&flat); }
+                tasks_flat_into(&flat, it.content.ptr as &const byte, it.content.len);
+                _ = buf_append(&line, flat.ptr, flat.len);
+                tasks_emit(out, line.ptr as &const byte, line.len, width);
+                emitted = emitted + 1;
+            }
+            i = i + 1;
+        }
+        if emitted >= cap {
+            break;
+        }
+        pass = pass + 1;
+    }
+    if todos.n > emitted {
+        var more: Buf = buf_new(128);
+        defer { buf_free(&more); }
+        _ = buf_append_cstr(&more, "  … 还有 ");
+        _ = buf_append_u64(&more, (todos.n - emitted) as u64);
+        _ = buf_append_cstr(&more, " 项（/tasks 看全部）");
+        tasks_emit(out, more.ptr as &const byte, more.len, width);
+    }
+}
+
+fn tasks_rows_jobs(out: &Buf, jobs: &const JobTable, now_ms: u64, width: usize) void {
+    const n: usize = tasks_count_jobs(jobs);
+    if n == 0 {
+        return;
+    }
+    var row: Buf = buf_new(256);
+    defer { buf_free(&row); }
+    tasks_label(&row, "后台任务" as &const byte, 12);
+    _ = buf_append_u64(&row, tasks_count_running(jobs) as u64);
+    _ = buf_append_cstr(&row, " 跑中 / ");
+    _ = buf_append_u64(&row, n as u64);
+    tasks_emit(out, row.ptr as &const byte, row.len, width);
+
+    var i: usize = 0;
+    while i < JOB_MAX {
+        if jobs.items[i].used {
+            const j: &const Job = &jobs.items[i];
+            var line: Buf = buf_new(j.label.len + 128);
+            defer { buf_free(&line); }
+            _ = buf_append_cstr(&line, "  ");
+            _ = buf_append_cstr(&line, tasks_glyph_job(j));
+            _ = buf_append_cstr(&line, " job-");
+            _ = buf_append_u64(&line, j.id as u64);
+            _ = buf_append_cstr(&line, " [bash] ");
+            _ = buf_append_cstr(&line, job_status_name(j.status));
+            if j.status == JOB_RUNNING {
+                var sec: Buf = buf_new(32);
+                defer { buf_free(&sec); }
+                view_ag_secs(&sec, j.start_ms, now_ms);
+                _ = buf_append_byte(&line, 32);
+                _ = buf_append(&line, sec.ptr, sec.len);
+            } else {
+                _ = buf_append_cstr(&line, " · exit ");
+                _ = buf_append_i64(&line, j.exit_code as i64);
+            }
+            _ = buf_append_cstr(&line, " · 输出 ");
+            tasks_fmt_bytes(&line, j.buf.len);
+            if j.truncated {
+                _ = buf_append_cstr(&line, "（已截断）");
+            }
+            var label: Buf = buf_new(j.label.len + 16);
+            defer { buf_free(&label); }
+            tasks_flat_into(&label, j.label.ptr as &const byte, j.label.len);
+            if label.len > 0 {
+                _ = buf_append_cstr(&line, " · ");
+                _ = buf_append(&line, label.ptr, label.len);
+            }
+            tasks_emit(out, line.ptr as &const byte, line.len, width);
+        }
+        i = i + 1;
+    }
+}
+
+fn tasks_rows_agents(out: &Buf, deleg: &const DelegTable, now_ms: u64, width: usize) void {
+    const n: usize = tasks_count_agents(deleg);
+    if n == 0 {
+        return;
+    }
+    var row: Buf = buf_new(256);
+    defer { buf_free(&row); }
+    tasks_label(&row, "子代理" as &const byte, 9);
+    _ = buf_append_u64(&row, tasks_count_running_agents(deleg) as u64);
+    _ = buf_append_cstr(&row, " 跑中 / ");
+    _ = buf_append_u64(&row, n as u64);
+    tasks_emit(out, row.ptr as &const byte, row.len, width);
+
+    var i: usize = 0;
+    while i < DELEG_MAX {
+        if deleg.items[i].used {
+            const d: &const Deleg = &deleg.items[i];
+            var line: Buf = buf_new(d.label.len + 160);
+            defer { buf_free(&line); }
+            _ = buf_append_cstr(&line, "  ");
+            _ = buf_append_cstr(&line, view_status_glyph(d.status));
+            _ = buf_append_cstr(&line, " sub-");
+            _ = buf_append_u64(&line, d.id as u64);
+            _ = buf_append_cstr(&line, " [");
+            _ = buf_append_cstr(&line, view_ag_kind(d.kind));
+            _ = buf_append_cstr(&line, "] ");
+            _ = buf_append_cstr(&line, deleg_status_name(d.status));
+            if d.status == DELEG_RUNNING {
+                var sec: Buf = buf_new(32);
+                defer { buf_free(&sec); }
+                view_ag_secs(&sec, d.started_ms, now_ms);
+                _ = buf_append_byte(&line, 32);
+                _ = buf_append(&line, sec.ptr, sec.len);
+                _ = buf_append_cstr(&line, " · ");
+                _ = buf_append_u64(&line, view_count_lines(d.buf.ptr as &const byte, d.buf.len) as u64);
+                _ = buf_append_cstr(&line, " 行");
+            }
+            if d.kind == DELEG_KIND_RALPH && d.max_rounds > 0 {
+                _ = buf_append_cstr(&line, " · Round ");
+                _ = buf_append_i64(&line, d.rounds as i64);
+                _ = buf_append_cstr(&line, "/");
+                _ = buf_append_i64(&line, d.max_rounds as i64);
+            }
+            var label: Buf = buf_new(d.label.len + 16);
+            defer { buf_free(&label); }
+            tasks_flat_into(&label, d.label.ptr as &const byte, d.label.len);
+            if label.len > 0 {
+                _ = buf_append_cstr(&line, " · ");
+                _ = buf_append(&line, label.ptr, label.len);
+            }
+            tasks_emit(out, line.ptr as &const byte, line.len, width);
+        }
+        i = i + 1;
+    }
+}
+
+fn tasks_rows_goal(out: &Buf, goal: &const Goal, width: usize) void {
+    if !goal.active_state {
+        return;
+    }
+    var line: Buf = buf_new(goal.objective.len + 128);
+    defer { buf_free(&line); }
+    tasks_label(&line, "目标" as &const byte, 6);
+    const lbl: &const byte = tasks_goal_label(goal);
+    if bufx_eq_cstr(lbl, bufx_cstr_len(lbl), "active" as &const byte) {
+        _ = buf_append_cstr(&line, "▸ ");
+    } else if bufx_eq_cstr(lbl, bufx_cstr_len(lbl), "complete" as &const byte) {
+        _ = buf_append_cstr(&line, "✓ ");
+    } else {
+        _ = buf_append_cstr(&line, "■ ");
+    }
+    _ = buf_append_cstr(&line, lbl);
+    _ = buf_append_cstr(&line, " · round ");
+    _ = buf_append_i64(&line, goal.round as i64);
+    _ = buf_append_cstr(&line, "/");
+    _ = buf_append_i64(&line, goal.max_rounds as i64);
+    var obj: Buf = buf_new(goal.objective.len + 16);
+    defer { buf_free(&obj); }
+    tasks_flat_into(&obj, goal.objective.ptr as &const byte, goal.objective.len);
+    if obj.len > 0 {
+        _ = buf_append_cstr(&line, " · ");
+        _ = buf_append(&line, obj.ptr, obj.len);
+    }
+    if goal.blocker.len > 0 {
+        var bl: Buf = buf_new(goal.blocker.len + 16);
+        defer { buf_free(&bl); }
+        tasks_flat_into(&bl, goal.blocker.ptr as &const byte, goal.blocker.len);
+        if bl.len > 0 {
+            _ = buf_append_cstr(&line, " · 阻塞原因：");
+            _ = buf_append(&line, bl.ptr, bl.len);
+        }
+    }
+    tasks_emit(out, line.ptr as &const byte, line.len, width);
+}
+
+// 段落行（include_agents = false 时画「清单 + 后台任务 + 目标」—— 子代理有 P15 自己的箱体）
+export fn tasks_rows(todos: &const TodoState, jobs: &const JobTable, deleg: &const DelegTable,
+                     goal: &const Goal, now_ms: u64, width: usize, include_agents: bool,
+                     todo_cap: usize, out: &Buf) void {
+    buf_reset(out);
+    const w: usize = if width < TASKS_WIDTH_MIN { TASKS_WIDTH_MIN } else { width };
+    tasks_rows_todos(out, todos, w, todo_cap);
+    tasks_rows_jobs(out, jobs, now_ms, w);
+    if include_agents {
+        tasks_rows_agents(out, deleg, now_ms, w);
+    }
+    tasks_rows_goal(out, goal, w);
+}
+
+// ============================================================
+// 常驻块：折叠 1 行 / 展开成带边框的箱体（几何与 P15 子代理箱体同一套 helper）
+// ============================================================
+
+// body 有几行 = 有几个 '\n'（我们自己拼的文本每行都以 '\n' 收尾，不借 view 的那套行口径：
+// 那种口径对「末尾换行」算不算一行有它自己的约定）
+fn tasks_lines_of(p: &const byte, n: usize) usize {
+    var c: usize = 0;
+    var i: usize = 0;
+    while i < n {
+        if p[i] == 10 as byte {
+            c = c + 1;
+        }
+        i = i + 1;
+    }
+    return c;
+}
+
+// body = 上面的段落行；这里按 max_rows（**含上下边框**）裁剪，裁掉就补一行 `… 还有 N 行`
+fn tasks_box_body(out: &Buf, body: &const Buf, m: usize, max_rows: usize) void {
+    const inner: usize = m - 2;
+    const total: usize = tasks_lines_of(body.ptr as &const byte, body.len);
+    var keep: usize = total;
+    if max_rows >= 3 && total > max_rows - 2 {
+        keep = max_rows - 3;             // 再留一行给 `… 还有 N 行`
+    }
+    view_ag_rule(out, "┌" as &const byte, "┐" as &const byte, "tasks" as &const byte, m);
+    _ = buf_append_byte(out, 10);
+    var i: usize = 0;
+    var line: usize = 0;
+    while i < body.len && line < keep {
+        var e: usize = i;
+        while e < body.len && body.ptr[e] != 10 as byte {
+            e = e + 1;
+        }
+        view_ag_row(out, &body.ptr[i], e - i, m, inner);
+        _ = buf_append_byte(out, 10);
+        i = e + 1;
+        line = line + 1;
+    }
+    if keep < total {
+        var more: Buf = buf_new(64);
+        defer { buf_free(&more); }
+        _ = buf_append_cstr(&more, "… 还有 ");
+        _ = buf_append_u64(&more, (total - keep) as u64);
+        _ = buf_append_cstr(&more, " 行");
+        view_ag_row(out, more.ptr as &const byte, more.len, m, inner);
+        _ = buf_append_byte(out, 10);
+    }
+    view_ag_rule(out, "└" as &const byte, "┘" as &const byte, "" as &const byte, m);
+    _ = buf_append_byte(out, 10);
+}
+
+export fn tasks_box(todos: &const TodoState, jobs: &const JobTable, deleg: &const DelegTable,
+                    goal: &const Goal, now_ms: u64, width: usize, max_rows: usize,
+                    expanded: bool, out: &Buf) void {
+    buf_reset(out);
+    const w: usize = if width < TASKS_WIDTH_MIN { TASKS_WIDTH_MIN } else { width };
+    // 折叠态（或空间小到画不出边框）→ 1 行；四类都空 → 空。
+    // 注意**要以 '\n' 收尾**：这一份文本后面还要紧跟 agents 箱体，没有换行就粘在边框上。
+    if !expanded || max_rows < 3 {
+        tasks_line(todos, jobs, deleg, goal, w, out);
+        if out.len > 0 {
+            _ = buf_append_byte(out, 10);
+        }
+        return;
+    }
+    var body: Buf = buf_new(8192);
+    defer { buf_free(&body); }
+    tasks_rows(todos, jobs, deleg, goal, now_ms, w - 4, false, TASKS_TODO_ROWS, &body);
+    if body.len == 0 {
+        return;
+    }
+    tasks_box_body(out, &body, w, max_rows);
+}
+
+// ============================================================
+// /tasks 报告（无边框；TUI 浮层与滚动模式打印共用）
+// ============================================================
+
+export fn tasks_report(todos: &const TodoState, jobs: &const JobTable, deleg: &const DelegTable,
+                       goal: &const Goal, now_ms: u64, width: usize, out: &Buf) void {
+    buf_reset(out);
+    const w: usize = if width < TASKS_WIDTH_MIN { TASKS_WIDTH_MIN } else { width };
+    var rows: Buf = buf_new(8192);
+    defer { buf_free(&rows); }
+    tasks_rows(todos, jobs, deleg, goal, now_ms, w, true, TODO_MAX, &rows);
+    if rows.len == 0 {
+        _ = buf_append_cstr(out, "（没有任务：todo 清单为空，也没有后台任务 / 子代理 / 目标）");
+        _ = buf_append_byte(out, 10);
+        return;
+    }
+    _ = buf_append(out, rows.ptr, rows.len);
+    var hint: Buf = buf_new(256);
+    defer { buf_free(&hint); }
+    tasks_label(&hint, "提示" as &const byte, 6);
+    _ = buf_append_cstr(&hint, "ctrl+t 展开/收起常驻块（TUI），/tasks open|close 同效");
+    tasks_emit(out, hint.ptr as &const byte, hint.len, w);
+}
+
+// ============================================================
+// 全局状态 + 面板块推送（唯一写者：滚动模式写 tty 面板块，TUI 只置 dirty）
+// ============================================================
+
+var g_tasks_open: bool = false;         // 常驻块展开态（进程级，与 plan/access 的模式同性质）
+var g_tasks_rows: usize = 12;           // 上层（TUI）给的可用行数上限（默认 = TASKS_BLOCK_MAX_ROWS）
+var g_tasks_ms: u64 = 0;                // 上次 1Hz 重建时刻
+var g_tasks_w: usize = 0;               // 上次重建用的宽度（变了就立刻重建）
+var g_tasks_ready: bool = false;        // 已经推过一次（空文本也算）
+var g_tasks_txt: Buf = Buf{ ptr: null, len: 0, cap: 0 };     // 最新文本（TUI 从这里拉）
+var g_tasks_pushed: Buf = Buf{ ptr: null, len: 0, cap: 0 };  // 上次推出去的（TUI 用来判 dirty）
+// 注意：全局初始化式在 C 里必须是常量 —— 不能写 buf_empty()（那是函数调用），
+// 只能写成 Buf 字面量；同理不能用别的 const，直接写字面量。
+var g_tasks_goal: Goal = Goal{
+    active_state: false,
+    id: 0,
+    revision: 0,
+    phase: Buf{ ptr: null, len: 0, cap: 0 },
+    objective: Buf{ ptr: null, len: 0, cap: 0 },
+    round: 0,
+    max_rounds: 20,
+    blocker: Buf{ ptr: null, len: 0, cap: 0 },
+    armed: false,
+};
+
+export fn tasks_expanded() bool {
+    return g_tasks_open;
+}
+
+export fn tasks_expand_set(on: bool) void {
+    g_tasks_open = on;
+}
+
+// TUI 每帧告诉这一层「输入区上方最多能给整块面板几行」（终端变矮、转录要留行都会变）。
+// 注意这是**整块**（任务箱体 + agents 箱体）的预算；任务箱体自己的上限是
+// TASKS_BLOCK_MAX_ROWS，两者取小。返回 true = 预算变了，调用方应当立刻重建一次。
+export fn tasks_set_row_budget(n: usize) bool {
+    var v: usize = n;
+    if v < 1 {
+        v = 1;
+    }
+    if v == g_tasks_rows {
+        return false;
+    }
+    g_tasks_rows = v;
+    return true;
+}
+
+export fn tasks_toggle() bool {
+    g_tasks_open = !g_tasks_open;
+    return g_tasks_open;
+}
+
+// 幂等：REPL 每轮都会调（不能每次 buf_new）
+export fn tasks_init() void {
+    if !buf_valid(&g_tasks_txt) {
+        g_tasks_txt = buf_new(16384);
+    }
+    if !buf_valid(&g_tasks_pushed) {
+        g_tasks_pushed = buf_new(16384);
+    }
+}
+
+export fn tasks_free() void {
+    if buf_valid(&g_tasks_txt) {
+        buf_free(&g_tasks_txt);
+    }
+    if buf_valid(&g_tasks_pushed) {
+        buf_free(&g_tasks_pushed);
+    }
+    goal_free(&g_tasks_goal);
+    g_tasks_goal = goal_empty();
+    g_tasks_ready = false;
+}
+
+// 目标在盘上（goal.json），进程里留一份给面板用：启动时、每次 goal 工具之后、/tasks 之前各刷一次。
+// 读不到就是「没有目标」，不是错误。
+export fn tasks_goal_reload(cfg: &const Config) void {
+    const g: &Goal = &g_tasks_goal;
+    goal_free(g);
+    g[0] = goal_empty();
+    _ = goal_load(cfg, g);
+}
+
+// 界面心跳（TUI 1Hz）里调：先把 job/deleg 的状态与增量输出收掉，面板才是新鲜的。
+// 与 step 边界上 jobs_poll_all/deleg_poll_all 的语义完全一致（只 drain + WNOHANG，不 reclaim）。
+export fn tasks_poll() void {
+    jobs_poll_all(&g_jobs);
+    deleg_poll_all(&g_deleg);
+}
+
+fn tasks_cur_width() usize {
+    if tui_active() {
+        const c: usize = tui_cols();
+        if c > 4 {
+            return c - 4;
+        }
+        return 1;
+    }
+    return tty_body_width();
+}
+
+// 任务箱体 + （可选）agents 箱体拼成一份文本；行数与字节两个预算一起判。
+// 放得下返回 true（out 里就是成品）。
+fn tasks_try(width: usize, room: usize, budget: usize, expanded: bool, with_agents: bool,
+             ag: &const Buf, body: &Buf, out: &Buf) bool {
+    var box_rows: usize = room;
+    if box_rows > TASKS_BLOCK_MAX_ROWS {
+        box_rows = TASKS_BLOCK_MAX_ROWS;      // 常驻箱体自己的上限（展开也不无限长）
+    }
+    tasks_box(&g_todos, &g_jobs, &g_deleg, &g_tasks_goal, ua_now_ms(), width, box_rows, expanded, body);
+    buf_reset(out);
+    if body.len > 0 {
+        _ = buf_append(out, body.ptr, body.len);
+    }
+    if with_agents && ag.len > 0 {
+        _ = buf_append(out, ag.ptr, ag.len);
+    }
+    if out.len == 0 {
+        return true;                          // 什么都不用画 = 最省，直接算成功
+    }
+    if out.len > budget {
+        return false;
+    }
+    if tasks_lines_of(out.ptr as &const byte, out.len) > room {
+        return false;
+    }
+    return true;
+}
+
+// 常驻块成品文本：任务箱体 + （有运行中的子代理时）P15 的 agents 箱体。
+//
+// 地方不够就按「展开+agents → 展开 → 折叠+agents → 折叠」逐级退化。两条预算都要守：
+//   * 字节：tty 面板块超 8192 会被 tty_block_set **静默丢弃**（块凭空消失）；
+//   * 行数：上层（TUI）只能用 room 行；硬裁会把箱体底框切掉，看着像坏了。
+export fn tasks_panel_text(width: usize, room: usize, budget: usize, out: &Buf) void {
+    var body: Buf = buf_new(8192);
+    defer { buf_free(&body); }
+    var ag: Buf = buf_new(8192);
+    defer { buf_free(&ag); }
+    const have_ag: bool = view_agents_text(&g_deleg, &ag) && ag.len > 0;
+
+    // 1) 当前形态 + agents   2) 当前形态不带 agents   3) 折叠 + agents   4) 折叠
+    if tasks_try(width, room, budget, g_tasks_open, have_ag, &ag, &body, out) {
+        return;
+    }
+    if tasks_try(width, room, budget, g_tasks_open, false, &ag, &body, out) {
+        return;
+    }
+    if have_ag && tasks_try(width, room, budget, false, true, &ag, &body, out) {
+        return;
+    }
+    _ = tasks_try(width, room, budget, false, false, &ag, &body, out);
+}
+
+export fn tasks_latest(out: &Buf) void {
+    buf_reset(out);
+    if buf_valid(&g_tasks_txt) && g_tasks_txt.len > 0 {
+        _ = buf_append(out, g_tasks_txt.ptr, g_tasks_txt.len);
+    }
+}
+
+// 会话目标的内存投影（goal.json 由 agent.uya 负责 load/save；这里只存给面板看）
+export fn tasks_goal_ref() &Goal {
+    return &g_tasks_goal;
+}
+
+// 报告宽度：TUI 浮层的内部宽度（tui_draw_overlay：默认 60 列，窄终端 cols-6，最少 24），
+// 滚动模式就是正文宽度
+export fn tasks_report_width() usize {
+    if tui_active() {
+        var w: usize = 60;
+        const c: usize = tui_cols();
+        if c < 70 {
+            w = c - 6;
+        }
+        if w < 24 {
+            w = 24;
+        }
+        if w > 4 {
+            return w - 4;
+        }
+        return 20;
+    }
+    return tty_body_width();
+}
+
+// 直接读全局的四张表出报告（/tasks 与自测之外的生产路径用；纯函数入口是 tasks_report）
+export fn tasks_report_globals(width: usize, out: &Buf) void {
+    tasks_report(&g_todos, &g_jobs, &g_deleg, &g_tasks_goal, ua_now_ms(), width, out);
+}
+
+// 重建 + 快照比对 + 推送。返回 true = 内容变了（滚动模式下已经重画，TUI 下已置 dirty）。
+export fn tasks_panel_sync() bool {
+    tasks_init();
+    if !view_enabled() {
+        return false;          // --quiet / 子代理进程：显示层整层关闭
+    }
+    const w: usize = tasks_cur_width();
+    const budget: usize = if tui_active() { TASKS_TUI_BYTES_MAX } else { TASKS_TTY_BYTES_MAX };
+    var txt: Buf = buf_new(16384);
+    defer { buf_free(&txt); }
+    tasks_panel_text(w, g_tasks_rows, budget, &txt);
+
+    const same: bool = g_tasks_ready && g_tasks_pushed.len == txt.len
+        && (txt.len == 0 || bufx_mem_eq(g_tasks_pushed.ptr as &const byte, txt.ptr as &const byte, txt.len));
+    buf_reset(&g_tasks_txt);
+    _ = buf_append(&g_tasks_txt, txt.ptr, txt.len);
+    if same {
+        return false;
+    }
+    buf_reset(&g_tasks_pushed);
+    _ = buf_append(&g_tasks_pushed, txt.ptr, txt.len);
+    g_tasks_ready = true;
+    if tui_active() {
+        tui_mark_dirty();
+        return true;
+    }
+    if txt.len == 0 {
+        tty_block_clear();
+        return true;
+    }
+    _ = view_panel_push(txt.ptr as &const byte, txt.len);
+    return true;
+}
+
+// 界面心跳：1Hz 重建（秒数/状态会变），宽度变了立刻重建
+export fn tasks_tick(now_ms: u64) void {
+    if !view_enabled() {
+        return;
+    }
+    const w: usize = tasks_cur_width();
+    var due: bool = false;
+    if now_ms >= g_tasks_ms && (now_ms - g_tasks_ms) >= (1000 as u64) {
+        due = true;
+    }
+    if w != g_tasks_w {
+        due = true;
+    }
+    if !due {
+        return;
+    }
+    g_tasks_ms = now_ms;
+    g_tasks_w = w;
+    tasks_poll();
+    _ = tasks_panel_sync();
+}
