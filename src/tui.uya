@@ -20,6 +20,7 @@
 
 use libc.syscall;
 use libc.unistd;
+use libc.heap;
 
 // ============================================================
 // 样式
@@ -4182,6 +4183,25 @@ var g_tui_ov_result: Buf = Buf{ ptr: null, len: 0, cap: 0 };
 var g_tui_ov_have: bool = false;       // 有结果可取
 var g_tui_ov_cancel: bool = false;     // 被 Esc 取消
 
+// 踩坑 67：行偏移表 —— 取第 i 行的字节区间。
+//
+// 老实现（`tui_ov_line_at`）为取第 i 行**从缓冲区第 0 字节重新扫一遍**。画一屏列表
+// 要对每个可见行各扫一次（越靠后越贵），于是「画一帧」是 O(可见行数 × n²) 字节步：
+// 真机 842 个会话、底部按一次 ↑ 实测 1.2–1.6 s（顶上只要 85 ms —— 要跨的项少）。
+// 这里把「一行一段」的偏移区间**一次性**建出来（O(n)），之后每次取行是 O(1)。
+//
+// 生命周期与它描述的那份 Buf 严格绑定：缓冲区每次整体重写（overlay_list /
+// diff_open / ov_rows_ensure）之后就地重建；`tui_reset_all()` 里连表一起 free。
+// 计数口径与 tui_ov_count_items() 逐字相同（'\n' 个数 +1，末字节非 '\n' 时才算）。
+struct TuiLineIdx {
+    offs: &usize,      // 第 i 行的**终点**（行尾 '\n' 的下标；末行无 '\n' 时为缓冲区尾）；长度 n
+    n: usize,          // 行数（= 下面 Buf 的逻辑行数）
+    cap: usize,        // offs 的容量（格数）
+}
+
+var g_tui_ov_items_ix: TuiLineIdx = TuiLineIdx{ offs: null as &usize, n: 0, cap: 0 };
+var g_tui_ov_rows_ix: TuiLineIdx = TuiLineIdx{ offs: null as &usize, n: 0, cap: 0 };
+
 export const TUI_OVK_PALETTE: u8 = 1;  // 命令面板（输入以 / 开头时也用它）
 export const TUI_OVK_SESSIONS: u8 = 2;
 export const TUI_OVK_HELP: u8 = 3;
@@ -4308,6 +4328,103 @@ fn tui_ov_count_items() usize {
     return n;
 }
 
+// ============================================================
+// 行偏移表（踩坑 67）：见 TuiLineIdx 上面那段注释
+// ============================================================
+
+// 丢掉表（free 并把三格清零）。与缓冲区重写配套：重写之后必须重建。
+fn tui_lineidx_reset(ix: &TuiLineIdx) void {
+    if (ix.offs as usize) != 0 {
+        free(ix.offs as &void);
+    }
+    ix.offs = null as &usize;
+    ix.n = 0;
+    ix.cap = 0;
+}
+
+// 表里第 i 行的字节区间（i 越界 = false）。表里存的是**每行的终点**（不含行尾 '\n'）：
+//   * offs[i] = 本行的终点（最后一行没有 '\n' 时就是缓冲区尾）；
+//   * 本行的起点 = i == 0 ? 0 : offs[i-1] + 1（跳过上一行那个 '\n'）。
+//
+// ⚠ 这里踩过一次（本轮被 `--tui-demo` 逐字节对照当场抓住）：起初存的是一行的**起点**、
+// 拿「下一行的起点减一」当终点，结果末行长度的算法在「缓冲区以 '\n' 收尾」与
+// 「不以 '\n' 收尾」两种情形下不一致（前者要把末尾那个 '\n' 排除掉，后者不排除），
+// 末行长度算成 1 而不是 0 —— reader 浮层（计划审阅）画到末行就多占一列，右边框被顶出去。
+// 存终点就没有这个歧义：终点就是那个 '\n' 的下标，一个减法完事，O(1)。
+//
+// 与老实现 `tui_ov_line_at()` 逐字节等价：每行不含行尾 '\n'；缓冲区以 '\n' 收尾时
+// 末尾那个空段只落在下标 n 上，而调用方本来就带 `i < 行数` 守卫。
+fn tui_lineidx_at(ix: &const TuiLineIdx, b: &const Buf, i: usize, off: &usize, len: &usize) bool {
+    if (ix.offs as usize) == 0 || i >= ix.n {
+        return false;
+    }
+    const start: usize = if i == 0 { 0 as usize } else { ix.offs[i - 1] + 1 };
+    const end: usize = ix.offs[i];
+    off[0] = start;
+    len[0] = end - start;
+    return true;
+}
+
+// 数出 b 的行数（与 tui_ov_count_items 同一口径）
+fn tui_lineidx_count(b: &const Buf) usize {
+    if b.len == 0 {
+        return 0;
+    }
+    var n: usize = 0;
+    var i: usize = 0;
+    while i < b.len {
+        if b.ptr[i] == 10 as byte {
+            n = n + 1;
+        }
+        i = i + 1;
+    }
+    if b.ptr[b.len - 1] != 10 as byte {
+        n = n + 1;
+    }
+    return n;
+}
+
+// 重建表：一趟数、一趟填（容量不够就 free + 重新 malloc）。
+// 缓冲区重写之后**必须**调它，否则取行会读到上一份内容的偏移。
+//
+// 表里存的是**每行的终点**（不含行尾 '\n'）——终点就是那个 '\n' 的下标，
+// 末行没有 '\n' 时就是缓冲区尾。取行时的起点由「上一行的终点 + 1」还原
+// （见 tui_lineidx_at），于是每行不含行尾换行符，与老实现逐字节一致。
+fn tui_lineidx_build(ix: &TuiLineIdx, b: &const Buf) void {
+    const n: usize = tui_lineidx_count(b);
+    if n > ix.cap {
+        if (ix.offs as usize) != 0 {
+            free(ix.offs as &void);
+        }
+        ix.offs = null as &usize;
+        ix.cap = 0;
+        const raw: &void = malloc((n + 1) * (@size_of(usize) as usize));
+        if ((raw as &byte) as usize) == 0 {
+            ix.n = 0;
+            return;
+        }
+        ix.offs = raw as &usize;
+        ix.cap = n + 1;
+    }
+    ix.n = n;
+    if n == 0 {
+        return;
+    }
+    var k: usize = 0;
+    var i: usize = 0;
+    while i < b.len {
+        if b.ptr[i] == 10 as byte {
+            ix.offs[k] = i;
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    // 末行没有 '\n' 收尾时，它还没记上 —— 终点就是缓冲区尾
+    if k < n {
+        ix.offs[k] = b.len;
+    }
+}
+
 // 一行一段文本里到底有几项（'\n' 分隔；末行没有换行也算一项）。
 // P35：`/sessions` 要把游标放到最后一项，而它手里只有条目缓冲（不是浮层内部状态）——
 // 于是把这条计数规则导出来，免得调用方自己再写一份、两边判据漂移。
@@ -4330,12 +4447,33 @@ export fn tui_ov_line_count(p: &const byte, n: usize) usize {
 }
 
 fn tui_ov_item(i: usize, off: &usize, len: &usize) bool {
-    return tui_ov_line_at(&g_tui_ov_items, i, off, len);
+    // 表没建起来（malloc 失败这类极端情况）：退回线性扫描 —— 结果是**同一个**，
+    // 只是慢。这样「取行」永远不会因为表缺失而静默给空。
+    if g_tui_ov_force_scan || (g_tui_ov_items_ix.offs as usize) == 0 {
+        return tui_ov_line_scan(&g_tui_ov_items, i, off, len);
+    }
+    return tui_lineidx_at(&g_tui_ov_items_ix, &g_tui_ov_items, i, off, len);
 }
 
-// 取 buf 里第 i 行（'\n' 分隔）的字节区间
-fn tui_ov_line_at(b: &const Buf, i: usize, off: &usize, len: &usize) bool {
-    tui_ov_ensure();
+// 自测用：把「取行」强制走线性扫描（= 老实现那条路）。
+//
+// 用途是**防假绿的对照实验**：把这一句打开重编，`tui-sessions-big` 里那条
+// 「取末项 20000 次的自校准比值」必须当场红（查表腿与扫描腿都变成线性扫描 ⇒ ≈1:1）。
+// 自测自己**不**翻这个开关 —— 翻了的话两条腿都是扫描，比值恒为 1，红的是自测而不是被测对象。
+// 平时恒 false；要复验「取行真的 O(1)」时手工打开一次。
+var g_tui_ov_force_scan: bool = false;
+export fn tui_overlay_force_scan(on: bool) void {
+    g_tui_ov_force_scan = on;
+}
+
+// 自测用：走线性扫描那条路取第 i 项（与查表路径做差分对照）
+export fn tui_overlay_lin_span(i: usize, off: &usize, len: &usize) bool {
+    return tui_ov_line_scan(&g_tui_ov_items, i, off, len);
+}
+
+// 取 buf 里第 i 行（'\n' 分隔）的字节区间 —— 线性扫描版。
+// 只作为偏移表缺失时的兜底，正常路径走 tui_lineidx_at（O(1)）。
+fn tui_ov_line_scan(b: &const Buf, i: usize, off: &usize, len: &usize) bool {
     var line: usize = 0;
     var start: usize = 0;
     var p: usize = 0;
@@ -4356,7 +4494,10 @@ fn tui_ov_line_at(b: &const Buf, i: usize, off: &usize, len: &usize) bool {
 
 // reader 型浮层的正文行（折行结果那份缓冲）
 fn tui_ov_row_at(i: usize, off: &usize, len: &usize) bool {
-    return tui_ov_line_at(&g_tui_ov_rows, i, off, len);
+    if (g_tui_ov_rows_ix.offs as usize) == 0 {
+        return tui_ov_line_scan(&g_tui_ov_rows, i, off, len);
+    }
+    return tui_lineidx_at(&g_tui_ov_rows_ix, &g_tui_ov_rows, i, off, len);
 }
 
 fn tui_ov_filter_match(p: &const byte, n: usize) bool {
@@ -4405,6 +4546,7 @@ export fn tui_overlay_list(kind: u8, title: &const byte, tn: usize, items: &cons
     buf_reset(&g_tui_ov_items);
     _ = buf_append(&g_tui_ov_items, items, inlen);
     g_tui_ov_n = tui_ov_count_items();
+    tui_lineidx_build(&g_tui_ov_items_ix, &g_tui_ov_items);   // 踩坑 67：条目缓冲区重写 ⇒ 重建行偏移表
     g_tui_ov_sel = 0;
     g_tui_ov_top = 0;
     buf_reset(&g_tui_ov_filter);
@@ -4514,6 +4656,7 @@ fn tui_ov_rows_ensure(w: usize) void {
     }
     g_tui_ov_rows_n = tui_wrap_into(&g_tui_ov_rows, g_tui_ov_body.ptr as &const byte, g_tui_ov_body.len, ww);
     g_tui_ov_rows_w = ww;
+    tui_lineidx_build(&g_tui_ov_rows_ix, &g_tui_ov_rows);   // 踩坑 67：折行结果重写 ⇒ 重建行偏移表
 }
 
 fn tui_ov_reader_page() usize {
@@ -4851,6 +4994,32 @@ export fn tui_overlay_sel_index() usize {
     return g_tui_ov_sel;
 }
 
+// 自测用（tui-sessions-big，踩坑 67）：条目数与第 i 项的字节区间 / 缓冲区首地址。
+// 这三条把「取行」这条内部路径开到自测里，好逐字节验行偏移表算对了 ——
+// 不开的话自测只能靠屏幕文本间接推断，末行少一列那类错（本轮真踩到过）就抓不住。
+export fn tui_overlay_item_count() usize {
+    return g_tui_ov_n;
+}
+
+export fn tui_overlay_item_span(i: usize, off: &usize, len: &usize) bool {
+    return tui_ov_item(i, off, len);
+}
+
+export fn tui_overlay_item_ptr() &const byte {
+    return g_tui_ov_items.ptr as &const byte;
+}
+
+// 自测用：行偏移表是否**真的**建起来了、而且与当前条目数一致。
+// 为什么需要这一条：取行有一个「表不在就退回线性扫描」的兜底，而兜底给出的结果与查表
+// **完全一样** —— 只验结果的话，表没建 / 建错了都照样绿（本轮实测：把表整个停掉，
+// 逐字节比对与成帧预算仍然是绿的）。把「表建好了没」直接暴露出来，它才自己可判。
+export fn tui_overlay_items_indexed() bool {
+    if (g_tui_ov_items_ix.offs as usize) == 0 {
+        return false;
+    }
+    return g_tui_ov_items_ix.n == g_tui_ov_n;
+}
+
 // P35：把游标放到第 i 项（越界夹回 [0, n-1]），并让它落在窗口里。
 // 会话列表用：条目顺序翻成「最新在最后一行」之后，默认游标必须落在最后一行/项上，
 // 不然回车恢复的就是最旧的那个会话（与 P33 的「回车即恢复最新那条」口径不一致）。
@@ -4950,6 +5119,7 @@ export fn tui_overlay_diff_open() void {
     g_tui_ov_top = 0;
     buf_reset(&g_tui_ov_title);
     buf_reset(&g_tui_ov_items);
+    tui_lineidx_build(&g_tui_ov_items_ix, &g_tui_ov_items);   // 踩坑 67：清空条目 ⇒ 表跟着清
     buf_reset(&g_tui_ov_filter);
     g_tui_ov_anchor = 0;
     tui_mark_dirty();
@@ -5767,7 +5937,13 @@ fn tui_ov_sel_into_window() void {
 }
 
 // 通过过滤的项共有几个
+//
+// 踩坑 67：过滤器为空时**每一项都通过** —— 直接回 g_tui_ov_n，不必逐项取行再比较
+// （取行本身已是 O(1)，但 n 项逐个走一遍仍是 O(n)，而这条路径每次按键都要走）。
 fn tui_ov_filtered_count() usize {
+    if g_tui_ov_filter.len == 0 {
+        return g_tui_ov_n;
+    }
     var n: usize = 0;
     var i: usize = 0;
     while i < g_tui_ov_n {
@@ -5782,6 +5958,34 @@ fn tui_ov_filtered_count() usize {
     }
     return n;
 }
+
+// 第 fi 个「通过过滤」的项（= 过滤器为空时的第 fi 项）。越界返回 false。
+// 踩坑 67：过滤器为空时**不必**从 0 数起 —— 序号就是项号，一次取行即可。
+// 有过滤器时仍旧逐项扫（那是它的语义：跳过不匹配的项）。
+fn tui_ov_nth_filtered(fi: usize, off: &usize, len: &usize) bool {
+    if g_tui_ov_filter.len == 0 {
+        return tui_ov_item(fi, off, len);
+    }
+    var seen: usize = 0;
+    var i: usize = 0;
+    while i < g_tui_ov_n {
+        var o: usize = 0;
+        var l: usize = 0;
+        if tui_ov_item(i, &o, &l) {
+            if tui_ov_filter_match(g_tui_ov_items.ptr + o, l) {
+                if seen == fi {
+                    off[0] = o;
+                    len[0] = l;
+                    return true;
+                }
+                seen = seen + 1;
+            }
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
 
 // 光标移动：按「通过过滤」的序列走，并把窗口跟过去
 fn tui_ov_sel_move(delta: i32) void {
@@ -5807,28 +6011,10 @@ fn tui_ov_sel_move(delta: i32) void {
 // 选中项写进结果并关闭
 fn tui_ov_accept() void {
     tui_ov_ensure();
-    // 找第 sel 个「通过过滤」的项
-    var seen: usize = 0;
-    var i: usize = 0;
-    var picked: bool = false;
+    // 找第 sel 个「通过过滤」的项（踩坑 67：过滤器为空时这一句就是 O(1) 取行）
     var off: usize = 0;
     var len: usize = 0;
-    while i < g_tui_ov_n {
-        var o: usize = 0;
-        var l: usize = 0;
-        if tui_ov_item(i, &o, &l) {
-            if tui_ov_filter_match(g_tui_ov_items.ptr + o, l) {
-                if seen == g_tui_ov_sel {
-                    off = o;
-                    len = l;
-                    picked = true;
-                    break;
-                }
-                seen = seen + 1;
-            }
-        }
-        i = i + 1;
-    }
+    const picked: bool = tui_ov_nth_filtered(g_tui_ov_sel, &off, &len);
     buf_reset(&g_tui_ov_result);
     if picked {
         _ = buf_append(&g_tui_ov_result, g_tui_ov_items.ptr + off, len);
@@ -6053,23 +6239,13 @@ fn tui_draw_overlay() void {
                     want = r - 2;
                 }
                 const fi: usize = g_tui_ov_top + want;      // 「通过过滤」的序号
-                var seen: usize = 0;
-                var i: usize = 0;
-                var done: bool = false;
-                while i < g_tui_ov_n && !done {
-                    var o: usize = 0;
-                    var l: usize = 0;
-                    if tui_ov_item(i, &o, &l) {
-                        if tui_ov_filter_match(g_tui_ov_items.ptr + o, l) {
-                            if seen == fi {
-                                const style: u8 = if seen == g_tui_ov_sel { TUI_ST_SEL } else { TUI_ST_DEFAULT };
-                                tui_ov_put_clipped(g_tui_ov_items.ptr + o, l, body, style);
-                                done = true;
-                            }
-                            seen = seen + 1;
-                        }
-                    }
-                    i = i + 1;
+                // 踩坑 67：取「第 fi 个通过过滤的项」。过滤器为空时是一次 O(1) 取行
+                // （老实现每画一行都从第 0 项数起 —— 842 个会话时底部一次按键 1.2 s）。
+                var o: usize = 0;
+                var l: usize = 0;
+                if tui_ov_nth_filtered(fi, &o, &l) {
+                    const style: u8 = if fi == g_tui_ov_sel { TUI_ST_SEL } else { TUI_ST_DEFAULT };
+                    tui_ov_put_clipped(g_tui_ov_items.ptr + o, l, body, style);
                 }
             }
             var used3: usize = tui_row_cols() - left;
@@ -6724,6 +6900,9 @@ export fn tui_reset_all() void {
     g_tui_ov_cancel = false;
     g_tui_ov_n = 0;
     g_tui_ov_sel = 0;
+    // 踩坑 67：行偏移表是堆上的，复位时连它一起放掉（表与它描述的 Buf 同寿命）
+    tui_lineidx_reset(&g_tui_ov_items_ix);
+    tui_lineidx_reset(&g_tui_ov_rows_ix);
     tui_key_reset();
     g_tui_prev_nrows = 0;
     g_tui_dirty = true;
