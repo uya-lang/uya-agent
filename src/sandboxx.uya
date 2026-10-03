@@ -1,0 +1,356 @@
+// src/sandboxx.uya — 内核沙箱（P21，对齐 DSH bash-sandbox 的 Linux bwrap 档）
+//
+// 设计口径（DSH 实测）：
+//   * DSH 的本地沙箱在 Linux 上「优先 bwrap、其次 Landlock」（dsh-sandbox-local/README.md）；
+//   * bwrap profile = 只读的宿主机根 + fresh /dev + 私有 PID 的 /proc；
+//     workspace-write 再加 ephemeral /tmp 与可写 workspace bind；
+//   * 后端不可用时 DSH 直接 SANDBOX_UNAVAILABLE **fail closed，绝不静默降级成不沙箱**。
+//
+// 本机实测（写进 README）：内核 6.12.65 的 LSM 列表里没有 landlock，
+// landlock_create_ruleset 返回 ENOSYS，所以只做 bwrap 一档；bubblewrap 0.10.0 可用，
+// profile 实测：写持久路径 → EROFS、`> /dev/null` 仍可写、`--tmpfs /tmp` 是临时 tmpfs。
+//
+// 沙箱只作用于 **spawn 出去的 shell 代码**（bash 前台/后台任务、以及子代理里的 bash）；
+// 进程内的 write/edit 工具是「策略栅栏」而不是内核边界 —— 与 DSH 自己的分界一致
+// （dsh-fs-sandbox/README.md：策略栅栏不是安全边界，内核级隔离归 ctx.shell）。
+
+use libc.syscall;
+use libc.unistd;
+use libc.signal;
+
+export const SAN_AUTO: u8 = 0;
+export const SAN_OFF: u8 = 1;
+
+export const SAN_NONE: u8 = 0;
+export const SAN_BWRAP: u8 = 1;
+
+export const SAN_MAX_ARGS: usize = 24;
+
+const SAN_PROBE_TIMEOUT_MS: u64 = 2000;
+const SAN_PROBE_SLICE_MS: i32 = 10;
+const SAN_X_OK: i32 = 1;
+
+var g_san_probed: bool = false;
+var g_san_backend: u8 = SAN_NONE;
+var g_san_reason: Buf = Buf{ ptr: null, len: 0, cap: 0 };
+var g_san_path: Buf = Buf{ ptr: null, len: 0, cap: 0 };      // 探测命中的 bwrap 绝对路径（带 NUL）
+var g_san_override: Buf = Buf{ ptr: null, len: 0, cap: 0 };  // --bwrap / UYA_AGENT_BWRAP（带 NUL）
+var g_san_argv: [&const byte: SAN_MAX_ARGS] = [null as &const byte: SAN_MAX_ARGS];
+
+fn san_ensure() void {
+    if !buf_valid(&g_san_reason) { g_san_reason = buf_new(128); }
+    if !buf_valid(&g_san_path) { g_san_path = buf_new(512); }
+    if !buf_valid(&g_san_override) { g_san_override = buf_new(512); }
+}
+
+fn san_reason_set(lit: &const byte) void {
+    san_ensure();
+    buf_reset(&g_san_reason);
+    // 必须补 NUL：这个缓冲区会被当 C 字符串直接打印（bufx 里专门写了这个坑）
+    _ = buf_append_cstr_z(&g_san_reason, lit);
+}
+
+// --bwrap / UYA_AGENT_BWRAP（带 NUL 存下来，execve 直接用这块内存）
+export fn san_set_bwrap(p: &const byte, n: usize) void {
+    san_ensure();
+    buf_reset(&g_san_override);
+    if n > 0 {
+        _ = buf_append(&g_san_override, p, n);
+        _ = buf_append_byte(&g_san_override, 0);
+    }
+}
+
+export fn san_has_bwrap_override() bool {
+    san_ensure();
+    return g_san_override.len > 1;
+}
+
+export fn san_backend() u8 {
+    return g_san_backend;
+}
+
+export fn san_backend_name() &const byte {
+    if g_san_backend == SAN_BWRAP {
+        return "bwrap" as &const byte;
+    }
+    return "none" as &const byte;
+}
+
+export fn san_reason() &const byte {
+    san_ensure();
+    if g_san_reason.len == 0 {
+        return "not probed" as &const byte;
+    }
+    return g_san_reason.ptr as &const byte;
+}
+
+// 探测选中的 bwrap 路径（带 NUL；未探测时先探一次）
+export fn san_path() &const byte {
+    san_ensure();
+    if g_san_path.len > 1 {
+        return g_san_path.ptr as &const byte;
+    }
+    return g_san_override.ptr as &const byte;
+}
+
+fn san_exists(pz: &const byte) bool {
+    return (sys_access(pz, SAN_X_OK) catch { -1; }) == 0;
+}
+
+// F_OK：存在即可（工作区 bind 的目标必须先存在，否则 bwrap 会直接报错退出）
+fn san_path_present(pz: &const byte) bool {
+    if (pz as usize) == 0 {
+        return false;
+    }
+    return (sys_access(pz, 0) catch { -1; }) == 0;
+}
+
+// 功能探测：真跑一次 `bwrap --ro-bind / / --dev /dev --proc /proc --unshare-pid true`。
+// 只认「退出码 0」；输出丢到 /dev/null，免得污染终端。
+fn san_probe_path(pz: &const byte) i32 {
+    var devnull: [byte: 12] = "/dev/null";
+    var nfd: i32 = -1;
+    const ofd: !i32 = sys_open(&devnull[0], O_WRONLY as i32, 0);
+    nfd = ofd catch { -1; };
+    const pid64: i64 = sys_fork() catch {
+        if nfd >= 0 {
+            _ = sys_close(nfd) catch {};
+        }
+        return -3;
+    };
+    if pid64 == 0 {
+        // P1：信号处置是继承的 —— 子进程先恢复默认，别去写父进程的终端
+        sigx_reset_for_child();
+        if nfd >= 0 {
+            _ = sys_dup2(nfd, 1) catch {};
+            _ = sys_dup2(nfd, 2) catch {};
+        }
+        var argv: [&const byte: 11] = [
+            pz,
+            "--ro-bind" as &const byte,
+            "/" as &const byte,
+            "/" as &const byte,
+            "--dev" as &const byte,
+            "/dev" as &const byte,
+            "--proc" as &const byte,
+            "/proc" as &const byte,
+            "--unshare-pid" as &const byte,
+            "true" as &const byte,
+            null as &const byte,
+        ];
+        var penv: [&const byte: 2] = ["PATH=/usr/bin:/bin" as &const byte, null as &const byte];
+        _ = sys_execve(pz, &argv[0], &penv[0]) catch {};
+        sys_exit(127);
+    }
+    const pid: i32 = i64_to_i32(pid64);
+    const started: u64 = ua_now_ms();
+    var rc: i32 = -2;   // -2 = 超时
+    while true {
+        var st: i32 = 0;
+        const r: i32 = sys_waitpid(pid, &st, 1) catch { 0; };   // WNOHANG = 1
+        if r == pid {
+            rc = (st >> (8 as i32)) & 255;
+            break;
+        }
+        if (ua_now_ms() - started) >= SAN_PROBE_TIMEOUT_MS {
+            _ = sys_kill(pid as i64, SIGKILL) catch {};
+            var st2: i32 = 0;
+            _ = sys_waitpid(pid, &st2, 0) catch {};
+            rc = -2;
+            break;
+        }
+        var ts: TimeSpec = TimeSpec{ tv_sec: 0, tv_nsec: 0 };
+        ts.tv_sec = (SAN_PROBE_SLICE_MS / 1000) as i64;
+        ts.tv_nsec = (((SAN_PROBE_SLICE_MS % 1000) as i64) * (1000000 as i64));
+        var rem: TimeSpec = TimeSpec{ tv_sec: 0, tv_nsec: 0 };
+        _ = sys_nanosleep(&ts, &rem) catch {};
+    }
+    if nfd >= 0 {
+        _ = sys_close(nfd) catch {};
+    }
+    return rc;
+}
+
+// 探测结果（进程级缓存；force=true 重探 —— 自测用）
+export fn san_probe(force: bool) u8 {
+    san_ensure();
+    if g_san_probed && !force {
+        return g_san_backend;
+    }
+    g_san_probed = true;
+    g_san_backend = SAN_NONE;
+    buf_reset(&g_san_path);
+    // 1) 显式指定优先：指定了就必须真的可用（不存在 → 直接判不可用，不悄悄换别的）
+    if g_san_override.len > 1 {
+        const op: &const byte = g_san_override.ptr as &const byte;
+        if !san_exists(op) {
+            san_reason_set("--bwrap path is not executable");
+            return g_san_backend;
+        }
+        _ = buf_append(&g_san_path, g_san_override.ptr, g_san_override.len);
+        const rc1: i32 = san_probe_path(g_san_path.ptr as &const byte);
+        if rc1 == 0 {
+            g_san_backend = SAN_BWRAP;
+            san_reason_set("ok");
+        } else if rc1 == -2 {
+            san_reason_set("probe timed out");
+        } else if rc1 == -3 {
+            san_reason_set("probe fork failed");
+        } else {
+            san_reason_set("probe failed (bwrap exited non-zero)");
+        }
+        return g_san_backend;
+    }
+    // 2) 常规候选
+    var c1: [byte: 16] = "/usr/bin/bwrap";
+    var c2: [byte: 12] = "/bin/bwrap";
+    var c3: [byte: 24] = "/usr/local/bin/bwrap";
+    var cands: [&const byte: 4] = [&c1[0], &c2[0], &c3[0], null as &const byte];
+    var i: usize = 0;
+    while (cands[i] as usize) != 0 {
+        const p: &const byte = cands[i];
+        i = i + 1;
+        if !san_exists(p) {
+            continue;
+        }
+        const rc: i32 = san_probe_path(p);
+        if rc == 0 {
+            buf_reset(&g_san_path);
+            _ = buf_append_cstr_z(&g_san_path, p);   // execve 要的路径必须带 NUL
+            g_san_backend = SAN_BWRAP;
+            san_reason_set("ok");
+            return g_san_backend;
+        }
+        if rc == -2 {
+            san_reason_set("probe timed out");
+        } else if rc == -3 {
+            san_reason_set("probe fork failed");
+        } else {
+            san_reason_set("probe failed (bwrap exited non-zero)");
+        }
+        return g_san_backend;
+    }
+    san_reason_set("bwrap missing");
+    return g_san_backend;
+}
+
+export fn san_available() bool {
+    if !g_san_probed {
+        _ = san_probe(false);
+    }
+    return g_san_backend == SAN_BWRAP;
+}
+
+// 把工作区变成「绝对路径 + NUL」的可写 bind 目标；返回 false = 拿不到绝对路径
+export fn san_bind_root(ws: &const byte, ws_len: usize, out: &Buf) bool {
+    buf_reset(out);
+    if ws_len == 0 {
+        return false;
+    }
+    if ws[0] == 47 as byte {
+        if !buf_append(out, ws, ws_len) {
+            return false;
+        }
+        return buf_append_byte(out, 0);
+    }
+    var cwd: [byte: 1024] = [0: 1024];
+    const got: !isize = sys_getcwd(&cwd[0], 1024);
+    var n: isize = got catch { -1 as isize; };
+    if n <= 1 {
+        return false;
+    }
+    n = n - 1;   // getcwd 的长度含结尾 NUL
+    if n <= 0 || n >= 1024 {
+        return false;
+    }
+    const ul: usize = n as usize;
+    if !buf_append(out, &cwd[0], ul) {
+        return false;
+    }
+    // 固定数组下标要给编译器看的证明，所以用指针走最后一格（agent.uya 的同一套路）
+    const base: &byte = &cwd[0];
+    const lastp: &const byte = @ptr_from_usize(@usize_from_ptr(base as &void) + (ul - 1)) as &const byte;
+    if lastp[0] != 47 as byte {
+        if !buf_append_byte(out, 47) {
+            return false;
+        }
+    }
+    if !buf_append(out, ws, ws_len) {
+        return false;
+    }
+    return buf_append_byte(out, 0);
+}
+
+// 备好要 execve 的 argv（模块级 g_san_argv，调用方紧跟着 execve，中间不做别的）。
+// 返回：0 = 不套壳（full access / --no-sandbox）
+//       1 = 套壳：execve(san_exec_path(), san_exec_argv(), env)
+//       2 = 沙箱不可用（confined 模式下调用方必须拒绝执行）
+export fn san_build_exec(mode: u8, sandbox: u8, ws_abs_z: &const byte, ws_abs_len: usize, cmd_z: &const byte) i32 {
+    if mode == PERM_FULL_ACCESS || sandbox == SAN_OFF {
+        return 0;
+    }
+    if !san_available() {
+        return 2;
+    }
+    var i: usize = 0;
+    g_san_argv[i] = san_path();
+    i = i + 1;
+    g_san_argv[i] = "--ro-bind" as &const byte;
+    i = i + 1;
+    g_san_argv[i] = "/" as &const byte;
+    i = i + 1;
+    g_san_argv[i] = "/" as &const byte;
+    i = i + 1;
+    g_san_argv[i] = "--dev" as &const byte;
+    i = i + 1;
+    g_san_argv[i] = "/dev" as &const byte;
+    i = i + 1;
+    g_san_argv[i] = "--proc" as &const byte;
+    i = i + 1;
+    g_san_argv[i] = "/proc" as &const byte;
+    i = i + 1;
+    g_san_argv[i] = "--unshare-pid" as &const byte;
+    i = i + 1;
+    g_san_argv[i] = "--die-with-parent" as &const byte;
+    i = i + 1;
+    if mode == PERM_WORKSPACE_WRITE {
+        g_san_argv[i] = "--tmpfs" as &const byte;
+        i = i + 1;
+        g_san_argv[i] = "/tmp" as &const byte;
+        i = i + 1;
+        // 工作区根解析成 "/" 时不加可写 bind（否则整个根都可写，等于没沙箱）；
+        // 目标不存在也不加（bind 的源必须存在，否则 bwrap 直接失败、命令根本跑不起来）
+        if ws_abs_len > 1 && san_path_present(ws_abs_z) {
+            g_san_argv[i] = "--bind" as &const byte;
+            i = i + 1;
+            g_san_argv[i] = ws_abs_z;
+            i = i + 1;
+            g_san_argv[i] = ws_abs_z;
+            i = i + 1;
+        }
+    }
+    g_san_argv[i] = "--" as &const byte;
+    i = i + 1;
+    g_san_argv[i] = "/bin/bash" as &const byte;
+    i = i + 1;
+    g_san_argv[i] = "-c" as &const byte;
+    i = i + 1;
+    g_san_argv[i] = cmd_z;
+    i = i + 1;
+    if i + 1 >= SAN_MAX_ARGS {
+        return 2;   // 参数表不够（不该发生；宁可 fail closed）
+    }
+    g_san_argv[i] = null as &const byte;
+    return 1;
+}
+
+export fn san_exec_argv() &(&const byte) {
+    return &g_san_argv[0];
+}
+
+export fn san_exec_path() &const byte {
+    if (g_san_argv[0] as usize) == 0 {
+        return "/bin/bash" as &const byte;
+    }
+    return g_san_argv[0];
+}

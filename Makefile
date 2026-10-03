@@ -14,7 +14,7 @@
 UYA_ROOT ?= /home/winger/uya-0.10/lib/
 UYA      ?= /home/winger/uya-0.10/bin/uya
 
-SRC := src/bufx.uya src/jsonx.uya src/httpc.uya src/httpstream.uya src/sse.uya src/llm.uya src/tty.uya src/sigx.uya src/inbox.uya src/session.uya src/yamlcfg.uya src/dshcfg.uya src/dshsess.uya src/prompt.uya src/instr.uya src/compact.uya src/skill.uya src/webx.uya src/deleg.uya src/goal.uya src/workflow.uya src/todo.uya src/plan.uya src/askuser.uya src/fsx.uya src/search.uya src/jobs.uya src/shellx.uya src/tools.uya src/diffx.uya src/view.uya src/tui.uya src/agent.uya src/sigselftest.uya src/tuiselftest.uya src/selftest.uya
+SRC := src/bufx.uya src/jsonx.uya src/httpc.uya src/httpstream.uya src/sse.uya src/llm.uya src/tty.uya src/sigx.uya src/inbox.uya src/session.uya src/stats.uya src/procx.uya src/yamlcfg.uya src/dshcfg.uya src/dshsess.uya src/prompt.uya src/instr.uya src/compact.uya src/skill.uya src/webx.uya src/deleg.uya src/goal.uya src/workflow.uya src/todo.uya src/plan.uya src/perm.uya src/sandboxx.uya src/askuser.uya src/fsx.uya src/search.uya src/jobs.uya src/shellx.uya src/tools.uya src/diffx.uya src/view.uya src/tui.uya src/agent.uya src/sigselftest.uya src/tuiselftest.uya src/selftest.uya
 OUT := build/uya-agent
 
 BASE ?= https://api.deepseek.com/v1
@@ -25,7 +25,7 @@ TASK ?= 创建 hello.uya，编译并运行它
 export UYA_ROOT
 export UYA_SPLIT_C_DIR := $(CURDIR)/build/uyacache
 
-.PHONY: all check build selftest codegen-audit probe e2e e2e-config e2e-config-flags e2e-api e2e-steps e2e-dsh tui-demo tui-selftest clean
+.PHONY: all check build selftest codegen-audit probe e2e e2e-config e2e-config-flags e2e-api e2e-steps e2e-permission e2e-sandbox e2e-dsh tui-demo tui-selftest clean
 
 all: build
 
@@ -50,11 +50,61 @@ codegen-audit: build
 	fi; \
 	echo "codegen-audit: 通过（没有切片描述符强转）"
 
-selftest: build codegen-audit e2e-config-flags e2e-api e2e-steps
+selftest: build codegen-audit e2e-config-flags e2e-api e2e-steps e2e-permission e2e-sandbox
 	UYA_BIN=$(UYA) $(OUT) --selftest
 
 probe: build
 	$(OUT) --probe --tls-verify=none --base-url $(BASE)
+
+# P21：访问模式的来源链（离线，--print-config 不联网）
+#   默认 = danger-full-access；--permission <v> 与 --permission=<v> 都是 cli；
+#   UYA_AGENT_PERMISSION 是 env；DSH 设置里的 permission.defaultPreset 是 dsh-settings；
+#   非法取值必须报错退出（静默按默认跑会让人以为模式生效了）。
+e2e-permission: build
+	@set -e; \
+	out=$$($(OUT) --no-dsh-config --print-config 2>&1); \
+	echo "$$out" | grep -q "permission = danger-full-access  (source: default)" \
+		|| { echo "FAIL: 默认访问模式应当是 danger-full-access"; exit 1; }; \
+	out=$$($(OUT) --no-dsh-config --permission read-only --print-config 2>&1); \
+	echo "$$out" | grep -q "permission = read-only  (source: cli)" \
+		|| { echo "FAIL: --permission read-only 没生效"; exit 1; }; \
+	out=$$($(OUT) --no-dsh-config --permission=workspace-write --print-config 2>&1); \
+	echo "$$out" | grep -q "permission = workspace-write  (source: cli)" \
+		|| { echo "FAIL: --permission=workspace-write 没生效"; exit 1; }; \
+	out=$$(UYA_AGENT_PERMISSION=workspace-write $(OUT) --no-dsh-config --print-config 2>&1); \
+	echo "$$out" | grep -q "permission = workspace-write  (source: env)" \
+		|| { echo "FAIL: UYA_AGENT_PERMISSION 没生效"; exit 1; }; \
+	rm -rf build/selftest_dsh_perm; mkdir -p build/selftest_dsh_perm; \
+	printf 'permission:\n  defaultPreset: read-only\n' > build/selftest_dsh_perm/settings.yaml; \
+	out=$$($(OUT) --dsh-home build/selftest_dsh_perm --print-config 2>&1); \
+	echo "$$out" | grep -q "permission = read-only  (source: dsh-settings)" \
+		|| { echo "FAIL: DSH 的 permission.defaultPreset 没生效"; exit 1; }; \
+	if $(OUT) --no-dsh-config --permission bogus --print-config >/dev/null 2>&1; then \
+		echo "FAIL: 非法 --permission 应当报错退出"; exit 1; \
+	fi; \
+	out=$$(printf '/permission\n/permission workspace-write\n/permission\n/permission bogus\n/exit\n' | \
+		$(OUT) --no-dsh-config --no-tui --api-key dummy-key --quiet 2>&1); \
+	echo "$$out" | grep -q "当前访问模式：Full access（danger-full-access）" \
+		|| { echo "FAIL: 裸 /permission 没有报出当前模式"; exit 1; }; \
+	echo "$$out" | grep -q "\[permission\] Workspace Write" \
+		|| { echo "FAIL: /permission workspace-write 没有切过去"; exit 1; }; \
+	echo "$$out" | grep -q "当前访问模式：Workspace Write（workspace-write）" \
+		|| { echo "FAIL: 切换之后当前值不对"; exit 1; }; \
+	echo "$$out" | grep -q '未知预设 "bogus"' \
+		|| { echo "FAIL: 非法预设名应当回未知预设"; exit 1; }; \
+	echo "e2e-permission: 通过（四级来源 + 非法值报错 + 行式 REPL /permission 查/切/报错）"
+
+# P21：内核沙箱后端（离线）：探测结果必须可见；--no-sandbox 明确关；指定不存在的 bwrap 判不可用
+e2e-sandbox: build
+	@set -e; \
+	out=$$($(OUT) --no-dsh-config --print-config 2>&1); \
+	echo "$$out" | grep -q "^sandbox = " || { echo "FAIL: 没打印 sandbox 行"; exit 1; }; \
+	out=$$($(OUT) --no-dsh-config --no-sandbox --print-config 2>&1); \
+	echo "$$out" | grep -q "sandbox = off  (source: cli, probe: skipped)" \
+		|| { echo "FAIL: --no-sandbox 没生效"; exit 1; }; \
+	out=$$(UYA_AGENT_BWRAP=/nonexistent $(OUT) --no-dsh-config --print-config 2>&1); \
+	echo "$$out" | grep -q "sandbox = none" || { echo "FAIL: 指定不存在的 bwrap 应当判不可用"; exit 1; }; \
+	echo "e2e-sandbox: 通过（探测结果可见 / --no-sandbox / 显式 bwrap 路径不可用）"
 
 # 真实网关端到端：默认走 DSH 设置（零参数就能拿到 base-url/model/key），
 # 也可以显式覆盖。TLS：给了 PIN 用 pin，否则用 none（真机链校验过不去，见 README 第 5 节）
