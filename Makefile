@@ -25,7 +25,7 @@ TASK ?= 创建 hello.uya，编译并运行它
 export UYA_ROOT
 export UYA_SPLIT_C_DIR := $(CURDIR)/build/uyacache
 
-.PHONY: all check build selftest codegen-audit probe e2e e2e-config e2e-config-flags e2e-api e2e-steps e2e-permission e2e-sandbox e2e-tasks e2e-dsh tui-demo tui-selftest clean
+.PHONY: all check build selftest codegen-audit probe e2e e2e-config e2e-config-flags e2e-title e2e-api e2e-steps e2e-permission e2e-sandbox e2e-tasks e2e-dsh tui-demo tui-selftest clean
 
 all: build
 
@@ -50,7 +50,7 @@ codegen-audit: build
 	fi; \
 	echo "codegen-audit: 通过（没有切片描述符强转）"
 
-selftest: build codegen-audit e2e-config-flags e2e-api e2e-steps e2e-permission e2e-sandbox e2e-tasks
+selftest: build codegen-audit e2e-config-flags e2e-title e2e-api e2e-steps e2e-permission e2e-sandbox e2e-tasks
 	UYA_BIN=$(UYA) $(OUT) --selftest
 
 probe: build
@@ -157,6 +157,24 @@ e2e-config-flags: build
 		echo "FAIL: --strict-dsh-config 读不到设置却没有报错退出"; exit 1; \
 	fi; \
 	echo "e2e-config-flags: 通过（--dsh-home / --no-dsh-config / --strict-dsh-config 都在加载前生效）"
+
+# 终端标题开关（P22）回归：默认开；--no-title / UYA_AGENT_TITLE=0 都要在 --print-config 的
+# 来源列上看得出来（来源码与 cfg_src_name 同口径：default / env / cli），而且 CLI 压过 env。
+e2e-title:
+	@set -e; \
+	out=$$($(OUT) --no-dsh-config --print-config 2>&1); \
+	echo "$$out" | grep -q "title = on  (source: default)" \
+		|| { echo "FAIL: 终端标题默认应当是开"; exit 1; }; \
+	out=$$($(OUT) --no-dsh-config --no-title --print-config 2>&1); \
+	echo "$$out" | grep -q "title = off  (source: cli)" \
+		|| { echo "FAIL: --no-title 没有生效"; exit 1; }; \
+	out=$$(UYA_AGENT_TITLE=0 $(OUT) --no-dsh-config --print-config 2>&1); \
+	echo "$$out" | grep -q "title = off  (source: env)" \
+		|| { echo "FAIL: UYA_AGENT_TITLE 没有生效"; exit 1; }; \
+	out=$$(UYA_AGENT_TITLE=0 $(OUT) --no-dsh-config --title --print-config 2>&1); \
+	echo "$$out" | grep -q "title = on  (source: cli)" \
+		|| { echo "FAIL: --title 应当压过 UYA_AGENT_TITLE=0"; exit 1; }; \
+	echo "e2e-title: 通过（默认开；--no-title / UYA_AGENT_TITLE 同口径；CLI 优先）"
 
 # 线协议 flag 回归（离线，--print-config / --dry-run 都不联网）：
 #   * 默认（没有任何声明）= 先 responses + 允许一次性协商回退 chat；
