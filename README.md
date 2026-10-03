@@ -4,7 +4,9 @@
 多轮 loop 直到给出结论。全部代码 42 个 `.uya` 文件，**不引入任何 C 代码、`@c_import` 或其它语言**，
 只依赖 Uya 语言与随编译器分发的标准库。
 
-**P0–P28 全部完成**（**P28 是「退不出」修复**：运行中的 `esc`/`ctrl+c`/`ctrl+d`/`/exit`
+**P0–P29 全部完成**（**P29 是 `/goal` 人类命令**：会话目标的看 / 建 / 改 / 暂停 / 恢复 / 清除，
+版本串 `p29-goal`，见 §2 的「会话目标与 /goal（P29）」与 §6 的验收记录；
+**P28 是「退不出」修复**：运行中的 `esc`/`ctrl+c`/`ctrl+d`/`/exit`
 必须**当场**生效，版本串 `p28-quit`，见 §2「退出与中断」与 §3 踩坑 46；P15、P21 这两个编号各被两条并行线用过一次，P22/P23/P24/P25/P26 也是
 并行线前后脚合的流：P21 的一条是**三级访问模式 + 内核沙箱**（机器名与 DSHpermission-presets 一致，见「访问模式」/「沙箱」两节，版本串 `p21-perm`）、另一条是
 **终端标题**（合流时按后到的编号记成 **P22**，版本串 `p22-title`）；P22 之后到的是
@@ -35,7 +37,9 @@ P18 是**常驻状态区 + 思考实时行**；**P19 是诊断出口与 read 窗
 不再整组空着，tok/s 从爆表的几千回到真实的 150–290 量级；版本串 `p24-mem`，见踩坑 41）；
 **P25 是任务状态 `/tasks` 与可展开的常驻任务块**（清单 / 后台任务 / 子代理 / 会话目标四类汇成
 一张进度表，版本串 `p25-tasks`，见 §2 的「任务状态与 /tasks（P25）」与 §6 的验收记录））：
-**P26 是 `/diff` 浮窗**（版本串 `p26-diff`，见下）：
+**P26 是 `/diff` 浮窗**（版本串 `p26-diff`，见下）；
+**P29 是 `/goal` 人类命令**（对齐 DSH 的 `/goal`：看 / 建 / 改 / 暂停 / 恢复 / 清除，
+版本串 `p29-goal`，见 §2 的「会话目标与 /goal（P29）」）：
 
 LLM 交互是**流式 SSE**（`stream:true` + `stream_options.include_usage`），
 增量 chunked 解码 + SSE 分帧 + `tool_calls` 按 `index` 分片累积；消息协议是**严格工具协议**
@@ -111,6 +115,15 @@ DSH `permission.defaultPreset`），read-only 下 `write`/`edit` 硬拒、`bash`
 `GIT_OPTIONAL_LOCKS=0` 不写 index.lock、不经 bash、不套沙箱、不走审批），
 解析与配对在 `src/gitdiff.uya`，绘制在 `tui.uya` 的新浮层 `TUI_OV_DIFF`；
 `esc`/`q` 关闭、`pgup/pgdn` 翻页、`←/→` 左右滚、`r` 重扫，非 TUI 模式打单列 unified diff 回退。
+**P29 把「会话目标」交给人类直接管**：`/goal`（语法与措辞逐条对齐 DSH 的
+`commands/command-goal`）—— 裸命令看状态（phase / objective / `Rounds: r/m` / `Activation: armed`,
+没有目标时给用法），`/goal <objective>` 创建、`/goal edit <objective>` 改目标、
+`/goal pause` / `/goal resume` / `/goal clear`；控制词**只有独占整行时**才算控制词
+（`/goal pause after verification` 创建的就是那个字面目标），已有**未完成**的目标不许被顶掉
+（必须先 `edit` 或 `clear`），已完成的让位给新身份（id +1）。落盘仍是 `goal.json`，
+与模型工具 `create_goal` / `get_goal` / `update_goal` 共用同一份状态：工具走 CAS
+（id + revision），人在回路里直接以当前为准。TUI 里结果是**浮层**、滚动模式打转录，
+带参数的那条还会当场重画常驻任务块的目标段（P22 的块与 `/goal` 共用同一条投影）。
 
 
 ```
@@ -150,6 +163,7 @@ make codegen-audit # 扫构建产物：不许出现「切片描述符 → 字节
 make e2e-permission # 访问模式的四级来源 + 非法值报错（离线）
 make e2e-sandbox    # 沙箱后端探测 / --no-sandbox / 显式 bwrap 路径（离线）
 make e2e-tasks      # /tasks 报告头 / 空态串 / open|toggle|非法参数 / /help（离线）
+make e2e-goal       # /goal 用法 / 创建 / 拒绝顶掉 / edit / pause·resume / clear / /help（离线）
 make probe        # 传输层探针：打真实 https 端点，期望 HTTP 401（不需要 key）
 ```
 
@@ -163,8 +177,8 @@ export UYA_SPLIT_C_DIR=$PWD/build/uyacache      # 多文件 C 缓存别丢在仓
 
 用法：
 
-常用斜杠命令：`/diff`（git 修改浮窗：左文件列表 + 右双列全文比对）· `/status` · `/permission` ·
-`/plan` · `/sessions` · `/compact` · `/help` · `/exit`。
+常用斜杠命令：`/diff`（git 修改浮窗：左文件列表 + 右双列全文比对）· `/status` · `/goal`（会话目标）·
+`/permission` · `/plan` · `/tasks` · `/sessions` · `/compact` · `/help` · `/exit`。
 
 ```bash
 ./build/uya-agent "任务..."          # 一次性执行
@@ -186,7 +200,7 @@ export UYA_SPLIT_C_DIR=$PWD/build/uyacache      # 多文件 C 缓存别丢在仓
 | `--no-stream` | 关闭流式，回退一次性响应（老端点兼容） |
 | `--api=MODE` | 线协议：`openai-responses`（**默认**）/ `openai-completions`（也接受 `responses` / `chat` / `completions`）。**不写 = 未声明**：先打 `/responses`，只有 404/405/501 才回退 `chat/completions`（每进程一次），见「Responses 接口」一节 |
 | `--reasoning-effort V` | 发 `reasoning.effort`（只有 responses 发；`off`/`none` = 不发），默认取 DSH 的 `agent-default-model.reasoningEffort` |
-| REPL 命令 | `/help` `/continue` `/status` `/tasks [open\|close\|toggle]` `/compact` `/plan` `/permission [预设]` `/sessions` `/resume <id>` `/new` `/exit` |
+| REPL 命令 | `/help` `/continue` `/status` `/tasks [open\|close\|toggle]` `/goal [<objective>\|edit <objective>\|pause\|resume\|clear]` `/compact` `/plan` `/permission [预设]` `/sessions` `/resume <id>` `/new` `/exit` |
 | `--agent-home DIR` | 会话与索引的根目录（默认 `~/.uya-agent`） |
 | `--continue` | 接着当前目录最近一条会话继续 |
 | `--resume ID` | 恢复指定会话（`ID` 或 `last`） |
@@ -314,7 +328,9 @@ src/deleg.uya     子代理：fork 不 exec（同二进制跑 agent_run）、结
                   父子会话关联（subagent/start 事件）、前台/后台、send_message 续跑、interrupt、ralph、
                   spawn 时刻记账（面板秒数）+ 终态结算通知（跑完即隐）
 src/goal.uya      会话级目标：goal.json（id/revision/phase/round/maxRounds/blocker/armed）、
-                  精确 id+revision 校验、blocked 至少连续 3 轮
+                  精确 id+revision 校验、blocked 至少连续 3 轮；
+                  P29 再加人类命令面 `goal_cmd_run`（/goal 的看/建/改/暂停/恢复/清除，
+                  控制词只在独占整行时不区分大小写、未完成的目标不许被顶掉）与 `goal_clear`
 src/skill.uya     技能：5 个发现根（项目 .dsh/.agents → --skill-dir → $DSH_HOME/skills →
                   ~/.agents/skills）、SKILL.md front-matter 解析、目录注入模板、skill 工具结果模板
 src/webx.uya      web_search：DeepSeek Anthropic 兼容 Messages API + 服务端 web_search 工具、
@@ -390,7 +406,8 @@ src/selftest.uya  --selftest 的 mock LLM（含 SSE 受控切分）+ 84 轮断�
                   （P17 又加了源文件里的 4 轮信号 + 5 轮 TUI，P18 再加 1 轮 `tui-status`，
                   P19 再加 3 轮诊断，P20 再加 9 轮统计/进程 CPU，P21 再加 7 轮访问模式/沙箱，
                    P22 再加 1 轮 `title-format` + 1 轮 `tty-title-pty`，
-                   P25 再加 2 轮任务状态（渲染 + 滚动模式活路径；TUI 侧另有 `tui-tasks`），见 §6）
+                   P25 再加 2 轮任务状态（渲染 + 滚动模式活路径；TUI 侧另有 `tui-tasks`），
+                   P29 再加 1 轮会话目标人类命令（`goal-cmd`），见 §6）
 ```
 > 两处已知死代码（P14 未清理，改别的东西时别被它们误导）：`src/tools.uya`（P0 的
 > `read_file`/`write_file`/`run_shell`，早已被 `fsx`/`search`/`shellx` 取代）、
@@ -800,7 +817,7 @@ TTY 交互模式**默认全屏**（`--no-tui` 退回上一节的滚动转录；�
 
   ▌ ↑ Ask anything... "把 hello.uya 的问候语改成 Hello, DSH!"
   ▌ Build   Full access   deepseek-chat   deepseek  tab plan   ctrl+p commands
-  ~/uya-agent:main                                                                 p27-diff
+  ~/uya-agent:main                                                                 p29-goal
 ```
 
 对话态（`--tui-demo` 打印的就是这几屏的纯文本快照）：
@@ -921,6 +938,7 @@ plan 审阅浮窗（`--tui-demo` 的**第 ⑤ 屏**，任务块那两帧是 ④a
   `ctrl+a/e`、`←/→`、`home/end`、`backspace/del` 按**字符**编辑 · `ctrl+l` 强制重绘 ·
   括起粘贴（`ESC[200~`）整段插入不触发提交（> 64 KiB 截断）。
 * **浮层**：命令面板、会话列表（选一个 `/resume`）、帮助（`/help`）、`/status` 详情、
+  **`/goal` 会话目标**（P29：纯查看型，正文就是 `goal_cmd_run` 的输出 —— 状态块或用法）、
   **访问模式选择器与 Full access 确认**（P21，底对齐，贴着输入面板往上弹）、
   **read-only 下 bash 的逐条批准**（P21：↑/↓ + enter，esc = 无回答）、
   **plan 审阅浮窗**（P26：reader 型浮层，↑/↓/pgup/pgdn 滚正文、tab/←/→ 切动作、
@@ -936,9 +954,10 @@ plan 审阅浮窗（`--tui-demo` 的**第 ⑤ 屏**，任务块那两帧是 ④a
   与脚注还在），esc 关掉就回来。
   命令面板是由输入行里的 `/` 触发的，**派发之后那个 `/` 会被一起收走**（P23）——
   否则下一次敲 `/status` 会拼成 `//status`，被当成未知命令丢掉（见 §3 踩坑 40）。
-  回合运行中敲 `/status` / `/help` / `/sessions` / `/diff` 也能用：结果挂在**下一个 step 边界**
-  派发（只读命令；`/new`、`/resume`、`/compact` 这些会改/释放历史的仍旧等回合结束 ——
-  见 §7）。
+  回合运行中敲 `/status` / `/help` / `/sessions` / `/diff` / `/goal` 也能用：结果挂在**下一个 step 边界**
+  派发（只读命令；命令面板里的 `/goal` 只会交出**裸命令名**，带参数的 `/goal pause` 那种要写盘，
+  所以回合里手敲的走 steer → 主循环那条路。`/new`、`/resume`、`/compact` 这些会改/释放历史的
+  仍旧等回合结束 —— 见 §7）。
 * **`/diff` 浮窗（P28）**：占满转录区可用高度（面板之上、状态区之外；放不下就**不开**
   并给一条提示 —— 画不出来却吞键是老坑），左列表 + 右两栏：
   `↑/↓` 选文件（选中即重载右侧）、`pgup/pgdn` 翻页、`home/end` 顶/尾、`←/→` 左右各滚 8 列
@@ -1261,6 +1280,37 @@ DSH 里认不出来的值（例如表示「旋钮不匹配任何预设」的 `cu
   tty_draw_line`，断言折叠行与 agents 箱体一起进面板块、提示符在它下面、展开后每行 98 列
   （`tty_body_width()` 口径）、收起即隐。
 * `--quiet`（含子代理进程）整层关闭：不生成、不推送（与 P15/P20 同口径）。
+
+### 会话目标与 /goal（P29）
+
+会话目标（`goal.json`）P11 起就有，但之前只能由模型侧的 `create_goal` / `get_goal` /
+`update_goal` 写；**人在终端里没有入口**。P29 补上人类命令面，语法与措辞**逐条对齐 DSH 的
+`@deepseek-ai/dsh-command-goal`（`/goal`）**：
+
+| 输入 | 结果 |
+|---|---|
+| `/goal` | 报当前状态（`Status` / `Objective` / `Rounds: r/m` / `Activation: armed\|disarmed` + 下一步可用命令）；没有目标时给用法 |
+| `/goal <objective>` | 创建（`active` + `armed` + revision 1）；已有**未完成**的目标时**拒绝**，必须先 `edit` 或 `clear` |
+| `/goal edit <objective>` | 改目标：只换 objective（phase / armed / round 都不动，revision +1）；`complete` 的目标换成**新身份** |
+| `/goal pause` / `/goal resume` | 暂停（`paused` + `armed=false`）/ 恢复（`active` + `armed=true`） |
+| `/goal clear` | 清除（删掉 `goal.json`；再 clear 回「没得清」，幂等） |
+
+规则与 DSH 同源，两条最容易踩的写下来：
+
+* **控制词只在独占整行时才算控制词**（大小写不敏感）：`/goal pause after verification` 创建的
+  就是那个**字面目标**，不是「暂停 + 备注」；`clearx` 也不等于 `clear`，而 `/goal CLEAR` 照样命中。
+* **未完成的目标不会被顶掉**：重复 `/goal <objective>` 逐字回 `A goal is already active. Use
+  /goal edit <objective> to change it or /goal clear before replacing it.`（盘上的目标一个字都不改）。
+
+展示两条腿：TUI 里结果是**浮层**（`TUI_OVK_GOAL`，标题 `目标（esc 关闭）`，纯查看 —— 回车只是关掉），
+滚动模式（`--no-tui`）直接打进转录。带参数的那条命令还会**当场重画常驻任务块的目标段**
+（`tasks_goal_reload` + `tasks_panel_sync`）—— 裸 `/goal` 是纯读，不碰面板（与 `/status` 同一条纪律）。
+命令解析与渲染全在 `src/goal.uya` 的 `goal_cmd_run`（`agent.uya` 只决定「打到哪儿」）。
+
+与模型工具的分工：**共用同一份 `goal.json`**，工具走 CAS（id + revision 都要对，挡住过期写入），
+人类命令直接以当前状态为准（人在回路里不存在读过期值这回事）。人类命令**没有** `complete` 动词
+（与 DSH 一致）—— 把目标标成完成是模型工具的事。
+
 ### 终端标题（P22，TTY title）
 
 交互模式跑起来以后，**终端窗口/标签页的标题自动跟着当前会话标题走**（xterm 的 OSC 2）。
@@ -2167,7 +2217,12 @@ agent 循环并逐项断言：
 装上 fixture 后折叠行（1 行）出现在 agents 箱体之上、状态区之下，层序 = 转录 → 任务块 → agents → 状态区；
 `ctrl+t` 只置出 `TUI_REQ_TASKS`（键层不自己改状态），落地后展开成 `┌─ tasks` 箱体（含清单段与计数、
 底框、agents 箱体仍在），再切回收起；活体刷新（job 跑完 → 折叠行的 `后台 r/n` 变）；矮终端（80×12）
-阶梯退化到 5 行且**保住箱体底框**、先丢 agents 箱体、转录仍留 ≥3 行；窄终端（40 列）每行不超列宽 |
+阶梯退化到 5 行且**保住箱体底框**、先丢 agents 箱体、转录仍留 ≥3 行；窄终端（40 列）每行不超列宽；
+P29 起还断言 `/goal` 这条腿：命令面板的**真实清单**（`agent_tui_commands`）里有 `/goal`、
+裸 `/goal` 开出 `TUI_OVK_GOAL` 浮层且标题 `目标（esc 关闭）` 画在帧上、正文是无目标时的用法、
+`/goal <objective>` 的浮层里 `Goal created` 与 `Objective: …` 真的画出来（list 型浮层 take 回来的
+只是选中行，所以正文看**帧**）、`goal.json` 落盘字段（id 1 / revision 1 / armed）与常驻块的
+目标投影（`tasks_goal_ref().active_state`）当场刷新、`/goal clear` 之后投影回到「无目标」|
 | `skills-web-search` | 造一个目录型技能（front-matter + 正文）→ 断言目录注入、`skill` 工具结果模板与
 资源指引、未知技能错误串；provider 侧用 mock 的 Anthropic 形状响应，断言 `web_search` 请求带
 服务端搜索工具与鉴权头、query 去重后只出现一次、答案与两条来源都被渲染 |
@@ -2213,6 +2268,8 @@ contextWindow/maxTokens/input image/reasoningEffort/`permission.defaultPreset`�
 | `api-flags` | `make e2e-api`：默认 = responses + negotiable；`--api=chat` / `UYA_AGENT_API=responses` 生效且不再协商；非法 `--api=` 报错退出；`--dry-run` 的请求体跟着协议走 |
 | `tasks-e2e` | `make e2e-tasks`（离线，管道喂 REPL）：裸 `/tasks` 打出 `--- 任务 ---` 与空态串、
 `/tasks open` / `toggle` 的回显、`/tasks bogus` 报 `未知参数 "bogus"`、`/help` 里能查到 `/tasks` |
+| `goal-cmd` | 会话目标人类命令（P29）纯函数轮：空态裸 `/goal` 报「当前没有目标」+ 用法（**返回 0** —— 看状态不会失败）、缺目标时 `pause`/`resume`/`edit` 各自点出是谁缺目标、裸 `edit` 与 `edit` + 纯空白都报「需要替换内容」且**不落盘**、创建后状态块四段（`Status: active` / `Objective: …` / `Rounds: 0/20` / `Activation: armed`）与盘上字段（id/revision/round/phase/objective）逐条对齐、重复创建被拒**且没改盘上 objective**、`edit` 只换 objective（revision 2、phase/armed 不动）、`pause` 关 armed、`resume` 打开、`clear` 删文件且**幂等**（再 clear 报「没得清」）、`pause after verification` 按**字面目标**创建（控制词只在独占整行时才是控制词）、`clearx` 不被当成 `clear`、大写 `CLEAR` 照样命中、`complete` 的目标让位（创建与 `edit` 都换新身份：id +1 / revision 回 1 / 0 轮 / armed）、输出必须以换行收尾 |
+| `goal-e2e` | `make e2e-goal`（离线，管道喂真 REPL + 独立 `UYA_AGENT_HOME`）：空态用法、创建、`Rounds: 0/20`、拒绝顶掉、`Goal updated` + 新 objective、`Status: paused` + `Activation: disarmed`、`Goal resumed`、`Goal cleared.`、重复 clear 幂等、字面目标规则、`/help` 里能查到 `/goal` |
 | `diff-render` | 纯函数逐字节断言 diff：新旧一样 → 空（且**不输出上下文**）、只差结尾换行 → 空、
 中间一行改动 → 前后各 2 行上下文 + `-`/`+`、新文件 → 全 `+`、两侧 >60 行 → 只给精确汇总、
 60 行编辑脚本 → 头截断成 24 行 + `… (省略 36 行)`、增删计数、按显示列截断（汉字 2 列） |
@@ -2548,6 +2605,26 @@ responses 看 `call_id`）；**chat 与 responses 各一轮**，且顺便断言�
   ④ **真机现场 → 机制**：用户会话 `session-6918e8ef` 里模型在 plan 模式下直接开工
   （`turn/end reason=aborted`）—— 那是「plan 模式只有提示词没有闸门」的第一手证据（踩坑 44），
   闸门就是按这个现场补的。
+* **P29 的验收记录（2026-10-03，对应 `/goal` 人类命令）**：
+  ① 离线全套：`make check` / `codegen-audit` / `e2e-config-flags` / `e2e-api` / `e2e-steps` /
+  `e2e-permission` / `e2e-sandbox` / `e2e-tasks` / `e2e-goal` / `e2e-diff` / `tui-selftest`
+  （含扩写的 `tui-tasks`）/ `selftest`（`SELFTEST PASS`，含新加的 `goal-cmd`）全绿；
+  另有 `UYA_SELFTEST_GOAL_ONLY=1` 这条只跑 P29 的快捷入口。
+  ② **语法是照 DSH 抄的，不是「差不多」**：控制词大小写不敏感但**必须独占整行** —— `goal-cmd`
+  轮断言 `/goal pause after verification` 建出来的是那个**字面目标**、`/goal clearx` 不会被当成
+  `clear`、而 `/goal CLEAR` 照样命中；缺目标时 `pause`/`resume`/`edit` 分别点出是**谁**缺目标
+  （不是一句笼统的「命令无效」）。
+  ③ **目标不许互相顶掉**：已有未完成的 goal 时再 `/goal <objective>` 逐字回
+  `A goal is already active. …`，并断言盘上的 objective **没被动过**；`complete` 的 goal 让位时
+  换的是**新身份**（id +1、revision 回 1、round 归零、armed 打开）。
+  ④ **落盘与显示是同一条链**：`goal-cmd` 轮每条命令之后都用 `goal_load` 回读盘上字段（id /
+  revision / phase / objective / round / armed）；`tui-tasks` 轮断言 TUI 里 `/goal` 开的是
+  `TUI_OVK_GOAL` 浮层（标题 `目标（esc 关闭）`、正文真的画在帧上 —— list 型浮层 take 回来的
+  只是选中行）、`/goal <objective>` 之后常驻任务块的目标投影（`tasks_goal_ref()`）当场刷新、
+  `/goal clear` 之后回到「无目标」。
+  ⑤ **真二进制那条腿**：`make e2e-goal` 用管道喂**真 REPL**（独立 `UYA_AGENT_HOME`，不碰
+  `~/.uya-agent`），把 11 条命令的输出逐条 grep 断言 —— 含 `Rounds: 0/20` 这种「默认值写错就红」
+  的字段。
 * **P28 的「退不出」在真机上做了 A/B**（2026-10-03，同一台网关 / 同一个模型 `DeepSeek-V4.1-Flash`，
   100×30 PTY + 定时注入按键的脚本）。任务都是「用 bash 工具跑 `sleep 120`，description 必须是
   long-sleep，不要后台运行」，动作在工具跑起来之后：
@@ -2626,6 +2703,16 @@ mock 上逐字段验收。换一台 `openai-responses` 网关可用时，零参�
     只有目标在盘上（`goal.json`，启动时重读）。
   * 浮层打开时常驻块被浮层盖住（与 P18 的状态区同现象），关掉浮层即回来；块不做鼠标交互、
     点击折叠、跨会话记忆（`/tasks close` 只影响当前进程）。
+* **会话目标（P11 存储 + P29 人类命令）的边界**：
+  * `goal.json` 目前只是**会话级记录**：uya-agent **没有自动续跑的驱动器**（`goal_tick` 已实现但
+    没有调用点），所以 `armed` 是给 `/tasks`、`/goal` 看的字段，**不会**自己再开一轮；要对齐 DSH 的
+    goal round driver 得另做一条线。
+  * 人类命令没有 `complete` 动词（与 DSH 一致）：把目标标成完成由模型工具
+    `update_goal action=complete` 负责，人的手段是 `edit`（改目标）或 `clear`（清掉）。
+  * `/goal clear` 是**删文件**：没有 tombstone，清掉之后 id 从 1 重新开始（DSH 保留持久历史与
+    tombstone，本仓库没有那层历史）。
+  * 目标按 `agent_home` 落盘（`--agent-home` / `UYA_AGENT_HOME` / `~/.uya-agent`），
+    与「会话」是同一层，所以 `/new` 之后仍是同一个目标（目标不随会话切换，见 P25 那条同源说明）。
 * **回合运行中的界面命令（P23）**：只有**只读**的 `/status`、`/help`、`/sessions` 在
   **step 边界**当场派发（uya 0.10 没有函数指针，TUI 没法回调进 agent，所以做不到「按键
   当下」；一个 step = 一次 LLM 请求 + 它的工具调用，长流式/长工具期间仍要等这一步走完）。
