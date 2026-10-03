@@ -302,6 +302,11 @@ e2e-dsh: build
 #        （旧实现要等这一步走完 —— 3s 的单步流实测 2245ms，用户看到的就是卡死）
 #     2) 回合运行中敲 /new：立刻回执 + 中断当前回合（随后由主循环开新会话）
 #     3) esc 中断一回合之后再发一条任务：必须正常跑完（曾经被粘住的中断标志秒断）
+#   P31 起再加四条「请求在飞」的验收（判据与数字见 README §6 的 P31 验收记录）：
+#     4) 响应头还没回来时敲 /status：≤800ms（旧实现要等头到 —— 3s 的头实测 2280ms）
+#     5) 空闲敲 /status：≤150ms（旧实现 242ms = 等下一次 200ms 轮询）
+#     6) bash 跑着时敲 /status：≤200ms（且回合仍在跑）
+#     7) 压缩的摘要请求在飞时敲 /status：≤300ms（且必须证明压缩真发过请求）
 #   PTY_DUMP=1 会把子进程屏幕打出来；单跑一个场景：
 #     python3 testdata/pty_drive.py --port <假网关端口> --workspace /tmp/ws status-single-step
 p30-check: build
