@@ -31,7 +31,7 @@ TASK ?= 创建 hello.uya，编译并运行它
 export UYA_ROOT
 export UYA_SPLIT_C_DIR := $(CURDIR)/build/uyacache
 
-.PHONY: all check build selftest codegen-audit probe e2e e2e-config e2e-config-flags e2e-title e2e-api e2e-steps e2e-permission e2e-sandbox e2e-tasks e2e-goal e2e-sessions e2e-resume-big e2e-diff e2e-ws e2e-model e2e-worktree e2e-dsh p30-check tui-demo tui-selftest sess-selftest diff-selftest model-selftest clean shell-selftest
+.PHONY: all check build selftest codegen-audit probe e2e e2e-config e2e-config-flags e2e-title e2e-api e2e-steps e2e-permission e2e-sandbox e2e-tasks e2e-goal e2e-sessions e2e-resume-big e2e-diff e2e-ws e2e-model e2e-worktree e2e-dsh p30-check tui-demo tui-selftest sess-selftest diff-selftest model-selftest panel-selftest clean shell-selftest
 
 all: build
 
@@ -516,6 +516,10 @@ diff-selftest: build
 # P38：bash 工具的进程侧自测轮（终端收口 / 停住即收口 / 整组收子孙），改 shellx 时比整轮快
 shell-selftest: build
 	UYA_SELFTEST_SHELL_ONLY=1 $(OUT) --selftest
+
+# P15/P40：子代理窗口面板的自测轮（几何 / 每行等宽 / 消息预览贴尾），改面板排版时比整轮快
+panel-selftest: build
+	UYA_SELFTEST_PANEL_ONLY=1 $(OUT) --selftest
 
 clean:
 	rm -rf build

@@ -4,8 +4,8 @@
 多轮 loop 直到给出结论。46 个 `.uya` 文件，**不引入任何 C 代码、`@c_import` 或其它语言**，
 只依赖 Uya 语言与随编译器分发的标准库。
 
-**P0–P39 全部完成**，主线版本串 `p37-model`。本节之后按能力域分节，各节标题保留对应的阶段号
-（P0…P39）；设计取舍、踩坑记录与逐阶段验收分别见 §3 与 §6，代码地图见 §2。
+**P0–P40 全部完成**，主线版本串 `p37-model`。本节之后按能力域分节，各节标题保留对应的阶段号
+（P0…P40）；设计取舍、踩坑记录与逐阶段验收分别见 §3 与 §6，代码地图见 §2。
 
 真机转录节选（`--show-reasoning`；`✻ 思考` 交互模式下先在提示符那一行滚动、块结束才落成一行，
 非交互（管道）没有实时行，只有结算的那一行）：
@@ -42,7 +42,8 @@ $ ./build/uya-agent --show-reasoning "在当前工作目录写 p15-demo.txt，�
   （`--list-dsh-sessions` / `--resume-dsh`，含 zstd）。
 * **界面**：真 TTY（termios raw + 行编辑器，UTF-8 按字符编辑、按显示列定位）；P17 起是纯 Uya
   写的全屏 TUI（对齐 opencode 观感），P18 的常驻状态区 + 思考实时行、P20/P24 脚注的统计行与
-  `ctx` / `cpu` / `内存`、P25 的任务块、P27/P36 的 `/diff` 浮窗、P22 的终端标题。
+  `ctx` / `cpu` / `内存`、P25 的任务块、P27/P36 的 `/diff` 浮窗、P22 的终端标题；
+  P40 起子代理面板的状态行把最新消息**贴尾**显示（`…` + 最新一段）。
 * **能力**：会话落盘可恢复（`--continue` / `--resume` / `/sessions`）；上下文管理（tool 结果
   超 8192 码点剪枝 + 压力超窗口 80% 自动压缩成 checkpoint）；技能发现 + `skill` 工具；
   `web_search`；子代理一族（`subagent` / `subagent_fork` / `list_agents` / `subagent_output` /
@@ -227,7 +228,11 @@ src/selftest.uya   mock LLM + 84 轮断言 + --probe
 ### 子代理窗口面板（P15）
 
 * 输入行上方常驻面板块：每个运行中子代理 2 行、最多最后 4 个，共享边框。
-* 第 1 行 `● sub-<id> [subagent|ralph] <description>`，第 2 行状态 + 秒数 + 输出行数 + prompt 预览。
+* 第 1 行 `● sub-<id> [subagent|ralph] <description>`（超宽**贴左**、丢尾巴）；第 2 行 = **锚**
+  （`● running` + 秒数固定 5 列 + 已收输出行数，一个字节都不截）+ `·` + prompt 首行预览。
+* **预览贴尾（P40）**：放不下就丢开头、前置 `…`，屏幕上留**最新的一段**（与运行中的 Think 行
+  同口径）—— 这一行要回答「它现在在按哪句话干活」；`VIEW_AG_MSG_MAX = 320 B` 只兜内存，
+  可见列数由 `view_ag_msg` 按**显示列**算（200 列终端 → 面板 198 列、内容行 194 列正好顶满）。
 * 只收 `status == DELEG_RUNNING`，跑完即隐并补 `[agents] sub-2 [ralph] ✓ idle 27s — ralph loop`。
 * 擦除用逐行 `ESC[2K`（不用 `ESC[J`）；`deleg_agents_refresh` 是唯一刷新入口。
 
@@ -514,6 +519,7 @@ src/selftest.uya   mock LLM + 84 轮断言 + --probe
 61. **别把 make 的「挂起」当「进程被停住」**：那是 `Hangup`（SIGHUP）不是 `Stopped`；make.mo 的 zh_CN 把 `Hangup` 译成「挂起」、`Stopped (tty input/output)` 译成「已停止 (tty 输入/输出)」；按这四个词对号入座。
 62. **每样式 SGR 参数槽只有 4 个**：`TUI_SGR256` 装不下 `38;5;N;48;5;M` 六个参数，背景色被静默吃掉；表尺寸 `TUI_ST_COUNT*4`→`*8`、循环 4→8、暂存缓冲 32→64，扩槽不改既有样式编码；与踩坑 2 同族。
 63. **自测「关掉 TUI」要关对开关**：`tui_set_headless(on)` 只置 `g_tui_headless`，而 `tui_active()` 看 `g_tui_on`，只有 `tui_headless_enable(on)` 两个都置；按模式分叉的断言先断言「真在这个模式里」。孪生：headless 轮须自开 `tty_sink_on = true`。
+64. **uya 的 `{ }` 块在生成的 C 里不是作用域**：同一函数里同名局部变量（`win_round` 的 A0 `pb` 与新 G 段 `pb`）在**平铺的 C 函数体**里直接 `redefinition of 'pb'`，而 `make build` 末尾只报「链接失败」（cc 的真错埋在编译日志里、`-o` 那步根本没跑到）——看到「链接失败」先去 `build/uyacache/**/<file>.c` 里找 cc 报错；同一 `.uya` 函数里的局部名当全局取（本轮一律 `p40_` 前缀）。
 
 ---
 
@@ -690,7 +696,7 @@ DEEPSEEK_API_KEY=sk-xxx ./build/uya-agent \
 | `tool-view` | P16 单行：`· exit N`、`· +A -D`、默认无正文、fd 2 端到端；工具内容块 + 多行面板块渲染协议 |
 | `think-row` | 运行中从左截断、结算从右截断、`--quiet` 零字节、静音窗口 |
 | `reasoning-log` | 日志 `assistant/reasoning` 与 mock 回包逐字节相同 |
-| `subagent-panel` | 只收 running、每行显示列数 = `tty_body_width()`、秒数固定 5 列 |
+| `subagent-panel` | 只收 running、每行显示列数 = `tty_body_width()`、秒数固定 5 列；P40 贴尾：纯函数 `view_ag_msg`/`view_ag_preview` + 80/40/200 列三档面板（锚一个不少、最新一段可见、消息开头不在板上、宽面板顶满预算） |
 | `session-log` | 控制字节按字节往返、半条记录 `dropped_tail`、重建历史 |
 | `json-escape` | `0x00…0x1f` 全转义、无裸控制字节、`jw_key` 同规则 |
 | `ctrl-bytes` / `ctrl-bytes-resp` | mock mode 23：`printf 'A\000B'` 以 `\u0000` 回请求；判定码 240 |
@@ -710,9 +716,9 @@ DEEPSEEK_API_KEY=sk-xxx ./build/uya-agent \
 **验证用的 make 目标与快捷入口**
 
 - 总闸门：`make selftest`（离线，含 `p30-check` 与全部轮次，SELFTEST PASS / 退出 0）、`make e2e`（真网关）。
-- 离线配套：`make check`（A1 类型检查）/ `build`（A2 产出 `build/uya-agent`）/ `codegen-audit` / `tui-selftest` / `shell-selftest` / `e2e-config-flags` / `e2e-api` / `e2e-steps` / `e2e-permission` / `e2e-sandbox` / `e2e-tasks` / `e2e-goal` / `e2e-sessions` / `e2e-resume-big` / `e2e-title` / `e2e-model` / `e2e-worktree` / `e2e-diff` / `diff-selftest` / `e2e-ws`。
+- 离线配套：`make check`（A1 类型检查）/ `build`（A2 产出 `build/uya-agent`）/ `codegen-audit` / `tui-selftest` / `shell-selftest` / `e2e-config-flags` / `e2e-api` / `e2e-steps` / `e2e-permission` / `e2e-sandbox` / `e2e-tasks` / `e2e-goal` / `e2e-sessions` / `e2e-resume-big` / `e2e-title` / `e2e-model` / `e2e-worktree` / `e2e-diff` / `diff-selftest` / `panel-selftest` / `e2e-ws`。
 - PTY 场景：`make p30-check`（`testdata/pty_drive.py --suite`，7 个场景）；`make tui-demo` 是排版基准，各阶段只差脚注版本串（`p22-tasks` … `p39-switch`）。
-- 只跑子集的开关：`UYA_SELFTEST_TUI_ONLY`、`UYA_SELFTEST_PERM_ONLY=1`（P21+P26）、`UYA_SELFTEST_GOAL_ONLY=1`（P29）、`UYA_SELFTEST_SHELL_ONLY=1`（P38）。
+- 只跑子集的开关：`UYA_SELFTEST_TUI_ONLY`、`UYA_SELFTEST_PERM_ONLY=1`（P21+P26）、`UYA_SELFTEST_GOAL_ONLY=1`（P29）、`UYA_SELFTEST_SHELL_ONLY=1`（P38）、`UYA_SELFTEST_PANEL_ONLY=1`（P15+P40，`make panel-selftest`）。
 - 探针：`make probe BASE=https://api.deepseek.com/v1` 期望 HTTP 401 + leaf 指纹。
 
 **load-bearing 硬指标**
@@ -739,10 +745,11 @@ DEEPSEEK_API_KEY=sk-xxx ./build/uya-agent \
 - P25：空态零影响逐字节；`--tui-demo` 第 ④a/④b/④c 屏是真机产物。
 - P26：`session-6918e8ef` 里模型在 plan 模式直接开工 = 「只有提示词没闸门」；闸门按现场补，把 `plan_blocks_write()` 改恒 `false` 该轮立刻红。
 - P28：真机 A/B：`ctrl+d` 45 s 仍活 → +2.0 s 退出；`esc` 后 `ctrl+d` +0.04 s；两次 `ctrl+c` +0.03 s。
-- P29/P33/P34/P35/P37/P38/P39：见对应轮次与踩坑 50–63；`make selftest` / `make tui-selftest` 全绿、退出 0。
+- P29/P33/P34/P35/P37/P38/P39/P40：见对应轮次与踩坑 50–64；`make selftest` / `make tui-selftest` 全绿、退出 0。
+- P40：子代理面板状态行改贴尾 —— 真机那一幕是两条 `send_message` 续跑的子代理收到一两百字节的催促，老口径整行从右边截断，屏幕上只剩 `Your output was still far too verbose: 325 lines / 68 KB…`，最新那半句 `…Do a second pass and cut it to under 25 KB.` 正好被切掉；80 列下实测 `│ ● running      53s · 0 · …KB). Do a second pass and cut it to under 25 KB. │`（78 列）、40 列收成 `…r 25 KB.`（38 列）。照 ①把 `view_ag_msg` 改回贴左重编 → G 段红 5 条；②把 `VIEW_AG_MSG_MAX` 改回 160 重编 → 200 列那条腿红 1 条。
 - 其它：自测幂等（连跑两次都 PASS）；A1–A6 全部通过；技能与 `web_search`、自动压缩、后台任务、文件工具、DSH 零参数启动、跨进程会话恢复（记住 4271）都在真机验收过。
 
-> 分阶段验收记录的详细现场（P1–P39 的 before/after 命令与截图、真机对照实验、被自测当场抓住的自身缺陷）已在此压缩，原始描述保留在 §3 踩坑 33–63 与各版本提交说明中。
+> 分阶段验收记录的详细现场（P1–P40 的 before/after 命令与截图、真机对照实验、被自测当场抓住的自身缺陷）已在此压缩，原始描述保留在 §3 踩坑 33–64 与各版本提交说明中。
 
 ---
 
@@ -756,6 +763,10 @@ DEEPSEEK_API_KEY=sk-xxx ./build/uya-agent \
   「只剩新会话」（`/resume` 再把历史回放一遍），但滚动模式（`--no-tui`）不重画 —— 那边的正文是
   终端自己滚出去的。回放复用启动时那一份口径（最近 200 条 + 一条「更早的会话记录已省略」提示，
   注入类消息不回放），所以换会话后的屏幕与 `--resume` 起一个新进程是同一份。
+* **子代理面板里那条「最新消息」是父进程发给它的那句话（P40）**：预览取 `Deleg.prompt`（spawn /
+  `send_message` 时的任务或催促，只取首行、空白折叠、超长贴尾）；子代理的 stdout 按 P11 的口径
+  **只在跑完时**才回传管道，所以「它刚刚说了什么」得等终态或 `subagent_output`（面板上那个
+  `· N` 是已收输出行数，运行中通常是 0）。贴尾只收窄**显示**，`Deleg.prompt` 本身一个字节不动。
 * **回合运行中的界面命令（P23 → P30 → P31）**：只读命令（`/status`、`/help`、`/tasks`、
   `/sessions`、`/goal`、`/diff`）在每个泵点当场派发并当场画一帧；`/new`、`/resume` 立刻回执并
   先中断当前回合（历史保留），`/compact` 排 step 边界，`/continue`、`/exit` 与其余命令等回合结束
