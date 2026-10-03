@@ -1,7 +1,16 @@
-// src/askuser.uya — ask_user_question / 终端问答（P8）
+// src/askuser.uya — ask_user_question / 终端问答（P8，P43 加弹窗）
 //
-// 交互模式下复用 tty 的行编辑器；非交互（stdin 是管道）就读一行；
-// 读到 EOF 时返回「无回答」而不是挂死（DSH 的 dismissed 语义）。
+// 四条通道，按优先级（P43 起 TUI 里是**弹窗**，不再把问题当 notice 落转录、让用户去输入行盲打）：
+//   1) TUI 且浮层放得下 → 提问弹窗（tui_ask_wait：↑/↓ 选、1-9 直选、space 多选、
+//      直接打字 = 自己回答、enter 提交、esc 取消）；
+//   2) TUI 但终端太矮（画不出浮层）→ 回落输入行（ask_tui_line）；
+//   3) 滚动模式真 TTY → ask_write + ask_read_line（P8 的老路）；
+//   4) 管道 / CI / 子代理 → 读一行，读不到就回「没有回答渠道」（DSH 的 dismissed 语义）。
+//
+// 提问**故意不 fail closed**（与 bash 批准 / plan 审阅相反）：审批是「看不见就不许做」，
+// 提问只是「换个地方问」，浮窗放不下时回落到输入行永远比丢掉渠道好。真正的「没人能答」
+// （管道 / 子代理）才回 no answer channel；「人不答」回的是另一句 dismissed 文案 ——
+// 模型要能分开这两件事，才能决定是自己拿主意还是请用户换模式。
 
 use libc.syscall;
 use libc.unistd;
@@ -211,6 +220,68 @@ export fn ask_approve_command(cfg: &const Config, cmd: &const byte, cn: usize) i
     return ask_approve_action(cfg, "bash" as &const byte, cmd, cn);
 }
 
+// 一题的答案 → 一段 answers JSON 项（**四条通道共用这一份拼装**，措辞/转义不许写两遍）。
+// labels 是选中的选项 label（'\n' 分隔，可为空）；custom 是自由回答（可为空）。
+fn ask_emit_answer(out: &Buf, id: &const Buf, labels: &const Buf, custom: &const Buf) void {
+    _ = buf_append_cstr(out, "{\"id\":");
+    _ = jw_str_into(out, id.ptr as &const byte, id.len);
+    _ = buf_append_cstr(out, ",\"selected\":[");
+    var start: usize = 0;
+    var i: usize = 0;
+    var first: bool = true;
+    while i <= labels.len {
+        if i == labels.len || labels.ptr[i] == 10 as byte {
+            if i > start {
+                if !first {
+                    _ = buf_append_cstr(out, ",");
+                }
+                _ = jw_str_into(out, labels.ptr + start, i - start);
+                first = false;
+            }
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    if custom.len > 0 {
+        _ = buf_append_cstr(out, "],\"custom\":");
+        _ = jw_str_into(out, custom.ptr as &const byte, custom.len);
+        _ = buf_append_cstr(out, "}");
+    } else {
+        _ = buf_append_cstr(out, "]}");
+    }
+}
+
+// 选项下标 → label 文本（追加进 labels；带 '\n'）
+fn ask_label_into(labels: &Buf, opts: &const JsonValue, idx: usize) void {
+    var o: JsonValue = JsonValue.json_null();
+    if !js_arr_get(opts, idx, &o) {
+        return;
+    }
+    var label: Buf = buf_empty();
+    defer { buf_free(&label); }
+    if !js_obj_get_str_unescaped(&o, "label", 5, &label) {
+        return;
+    }
+    if label.len == 0 {
+        return;
+    }
+    _ = buf_append(labels, label.ptr, label.len);
+    _ = buf_append_byte(labels, 10);
+}
+
+// 某个 JsonValue 是不是 true（`multi_select`；fsx 的 json_bool_of 是私有的，这份是本模块口径）
+fn ask_json_bool(v: &const JsonValue) bool {
+    const val: JsonValue = v[0];
+    match val {
+        .bool_val(x) => {
+            return x;
+        },
+        else => {
+            return false;
+        },
+    }
+}
+
 // ask_user_question 工具
 export fn ask_tool_question(args: &const JsonValue, out: &Buf) void {
     var qs: JsonValue = JsonValue.json_null();
@@ -233,43 +304,128 @@ export fn ask_tool_question(args: &const JsonValue, out: &Buf) void {
         defer { buf_free(&qtext); }
         _ = js_obj_get_str_unescaped(&q, "id", 2, &id);
         _ = js_obj_get_str_unescaped(&q, "question", 8, &qtext);
-        // 渲染：先把「问题 + 编号选项」拼成一段文本（P30：TUI 那条路要整段落进转录）
+        var header: Buf = buf_empty();
+        defer { buf_free(&header); }
+        _ = js_obj_get_str_unescaped(&q, "header", 6, &header);
+        var multi: bool = false;
+        var mb: JsonValue = JsonValue.json_null();
+        if js_obj_get(&q, "multi_select", 12, &mb) {
+            multi = ask_json_bool(&mb);
+        }
+        if i > 0 {
+            _ = buf_append_cstr(out, ",");
+        }
+        // ---- 选项：items（弹窗用）+ prompt（旧两条通道用；两者同一份编号口径）----
+        var opts: JsonValue = JsonValue.json_null();
+        var nopt: usize = 0;
+        if js_obj_get(&q, "options", 7, &opts) {
+            nopt = js_arr_len(&opts);
+        }
+        var items: Buf = buf_new(4096);
+        defer { buf_free(&items); }
         var prompt: Buf = buf_new(4096);
         defer { buf_free(&prompt); }
         if qtext.len > 0 {
             _ = buf_append(&prompt, qtext.ptr, qtext.len);
             _ = buf_append_byte(&prompt, 10);
         }
-        var opts: JsonValue = JsonValue.json_null();
-        var nopt: usize = 0;
-        if js_obj_get(&q, "options", 7, &opts) {
-            nopt = js_arr_len(&opts);
-            var k: usize = 0;
-            while k < nopt {
-                var o: JsonValue = JsonValue.json_null();
-                if js_arr_get(&opts, k, &o) {
-                    var label: Buf = buf_empty();
-                    defer { buf_free(&label); }
-                    var desc: Buf = buf_empty();
-                    defer { buf_free(&desc); }
-                    _ = js_obj_get_str_unescaped(&o, "label", 5, &label);
-                    _ = js_obj_get_str_unescaped(&o, "description", 11, &desc);
-                    _ = buf_append_cstr(&prompt, "  ");
-                    var numbuf: Buf = buf_new(16);
-                    defer { buf_free(&numbuf); }
-                    _ = buf_append_u64(&numbuf, (k + 1) as u64);
-                    _ = buf_append(&prompt, numbuf.ptr, numbuf.len);
-                    _ = buf_append_cstr(&prompt, ") ");
-                    _ = buf_append(&prompt, label.ptr, label.len);
+        var k: usize = 0;
+        while k < nopt {
+            var o: JsonValue = JsonValue.json_null();
+            if js_arr_get(&opts, k, &o) {
+                var label: Buf = buf_empty();
+                defer { buf_free(&label); }
+                var desc: Buf = buf_empty();
+                defer { buf_free(&desc); }
+                _ = js_obj_get_str_unescaped(&o, "label", 5, &label);
+                _ = js_obj_get_str_unescaped(&o, "description", 11, &desc);
+                if label.len > 0 {
+                    _ = buf_append(&items, label.ptr, label.len);
                     if desc.len > 0 {
-                        _ = buf_append_cstr(&prompt, " — ");
-                        _ = buf_append(&prompt, desc.ptr, desc.len);
+                        _ = buf_append_cstr(&items, " — ");
+                        _ = buf_append(&items, desc.ptr, desc.len);
                     }
-                    _ = buf_append_byte(&prompt, 10);
+                    _ = buf_append_byte(&items, 10);
                 }
-                k = k + 1;
+                _ = buf_append_cstr(&prompt, "  ");
+                var numbuf: Buf = buf_new(16);
+                defer { buf_free(&numbuf); }
+                _ = buf_append_u64(&numbuf, (k + 1) as u64);
+                _ = buf_append(&prompt, numbuf.ptr, numbuf.len);
+                _ = buf_append_cstr(&prompt, ") ");
+                _ = buf_append(&prompt, label.ptr, label.len);
+                if desc.len > 0 {
+                    _ = buf_append_cstr(&prompt, " — ");
+                    _ = buf_append(&prompt, desc.ptr, desc.len);
+                }
+                _ = buf_append_byte(&prompt, 10);
             }
+            k = k + 1;
         }
+
+        // ---- 通道 1：TUI 提问弹窗 ----
+        // 只有它会给「选中的下标」；旧的两条通道只有一行文本，按编号反解。
+        if tui_active() {
+            var hdr: Buf = buf_new(128);
+            defer { buf_free(&hdr); }
+            if header.len > 0 {
+                _ = buf_append(&hdr, header.ptr, header.len);
+            } else {
+                _ = buf_append_cstr(&hdr, "提问");
+            }
+            if n > 1 {
+                _ = buf_append_cstr(&hdr, " · 第 ");
+                var nb: Buf = buf_new(16);
+                defer { buf_free(&nb); }
+                _ = buf_append_u64(&nb, (i + 1) as u64);
+                _ = buf_append(&hdr, nb.ptr, nb.len);
+                _ = buf_append_cstr(&hdr, "/共 ");
+                _ = buf_append_u64(&nb, n as u64);
+                _ = buf_append(&hdr, nb.ptr, nb.len);
+                _ = buf_append_cstr(&hdr, " 问");
+            }
+            const rc: i32 = tui_ask_wait(hdr.ptr as &const byte, hdr.len,
+                qtext.ptr as &const byte, qtext.len,
+                items.ptr as &const byte, items.len, multi, 0);
+            if rc == 1 {
+                // 选中的下标 → label（**按下标回查**，不反解文本）
+                var labels: Buf = buf_new(1024);
+                defer { buf_free(&labels); }
+                const npick: usize = tui_ask_pick_count();
+                var p: usize = 0;
+                while p < npick {
+                    var idx: usize = 0;
+                    if tui_ask_pick_at(p, &idx) {
+                        if idx < nopt {
+                            ask_label_into(&labels, &opts, idx);
+                        }
+                    }
+                    p = p + 1;
+                }
+                var custom: Buf = buf_new(4096);
+                defer { buf_free(&custom); }
+                const cn: usize = tui_ask_custom_text(&custom);
+                // 单选：写了自定义回答就**覆盖** selected（DSH 的单选 custom 是排他的）；
+                // 多选：两者都带（多选草稿的语义）。
+                if cn > 0 && !multi {
+                    buf_reset(&labels);
+                }
+                ask_emit_answer(out, &id, &labels, &custom);
+                i = i + 1;
+                continue;
+            }
+            if rc == 2 {
+                // 取消了这次问答（esc / ctrl+c / 没人回答）：不是「渠道不通」，是「人不答」。
+                // 文案要与 no answer channel 分开，模型才知道该自己拿主意。
+                _ = buf_append_cstr(out, "{\"id\":");
+                _ = jw_str_into(out, id.ptr as &const byte, id.len);
+                _ = buf_append_cstr(out, ",\"selected\":[],\"custom\":\"(the user dismissed the question without answering; decide yourself or proceed)\"}");
+                i = i + 1;
+                continue;
+            }
+            // rc == 0：浮窗画不出来（终端太矮）→ 回落到输入行那条路，不 fail closed
+        }
+
         var line: Buf = buf_new(4096);
         defer { buf_free(&line); }
         var got: i32 = 0;
@@ -281,37 +437,27 @@ export fn ask_tool_question(args: &const JsonValue, out: &Buf) void {
             _ = ask_write("> ");
             got = ask_read_line(&line);
         }
-        if i > 0 {
-            _ = buf_append_cstr(out, ",");
-        }
-        _ = buf_append_cstr(out, "{\"id\":");
-        _ = jw_str_into(out, id.ptr as &const byte, id.len);
-        _ = buf_append_cstr(out, ",\"selected\":[");
         if got == 0 {
             // 没有输入渠道：明确告诉模型「没有回答」
-            _ = buf_append_cstr(out, "],\"custom\":\"(no answer channel: the user could not be asked)\"}");
+            _ = buf_append_cstr(out, "{\"id\":");
+            _ = jw_str_into(out, id.ptr as &const byte, id.len);
+            _ = buf_append_cstr(out, ",\"selected\":[],\"custom\":\"(no answer channel: the user could not be asked)\"}");
             i = i + 1;
             continue;
         }
+        var labels2: Buf = buf_new(1024);
+        defer { buf_free(&labels2); }
+        var custom2: Buf = buf_empty();
+        defer { buf_free(&custom2); }
         if nopt > 0 && line.len == 1 && is_digit(line.ptr[0]) {
             const pick: usize = (line.ptr[0] as usize) - 48;
             if pick >= 1 && pick <= nopt {
-                var o2: JsonValue = JsonValue.json_null();
-                if js_arr_get(&opts, pick - 1, &o2) {
-                    var label2: Buf = buf_empty();
-                    defer { buf_free(&label2); }
-                    _ = js_obj_get_str_unescaped(&o2, "label", 5, &label2);
-                    _ = jw_str_into(out, label2.ptr as &const byte, label2.len);
-                }
+                ask_label_into(&labels2, &opts, pick - 1);
             }
-            _ = buf_append_cstr(out, "]}");
         } else if line.len > 0 {
-            _ = buf_append_cstr(out, "],\"custom\":");
-            _ = jw_str_into(out, line.ptr as &const byte, line.len);
-            _ = buf_append_cstr(out, "}");
-        } else {
-            _ = buf_append_cstr(out, "]}");
+            _ = buf_append(&custom2, line.ptr, line.len);
         }
+        ask_emit_answer(out, &id, &labels2, &custom2);
         i = i + 1;
     }
     _ = buf_append_cstr(out, "]}");

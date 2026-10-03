@@ -4,8 +4,8 @@
 多轮 loop 直到给出结论。46 个 `.uya` 文件，**不引入任何 C 代码、`@c_import` 或其它语言**，
 只依赖 Uya 语言与随编译器分发的标准库。
 
-**P0–P42 全部完成**，主线版本串 `p37-model`。本节之后按能力域分节，各节标题保留对应的阶段号
-（P0…P42）；设计取舍、踩坑记录与逐阶段验收分别见 §3 与 §6，代码地图见 §2。
+**P0–P43 全部完成**，主线版本串 `p43-ask`。本节之后按能力域分节，各节标题保留对应的阶段号
+（P0…P43）；设计取舍、踩坑记录与逐阶段验收分别见 §3 与 §6，代码地图见 §2。
 
 真机转录节选（`--show-reasoning`；`✻ 思考` 交互模式下先在提示符那一行滚动、块结束才落成一行，
 非交互（管道）没有实时行，只有结算的那一行）：
@@ -44,7 +44,8 @@ $ ./build/uya-agent --show-reasoning "在当前工作目录写 p15-demo.txt，�
   写的全屏 TUI（对齐 opencode 观感），P18 的常驻状态区 + 思考实时行、P20/P24 脚注的统计行与
   `ctx` / `cpu` / `内存`、P25 的任务块、P27/P36 的 `/diff` 浮窗、P22 的终端标题；
   P40 起子代理面板的状态行把最新消息**贴尾**显示（`…` + 最新一段）；P41 起 `/worktree` 也是
-  底对齐选择框（七个动作一行一个，`finish`/`discard` 再过一道确认）。
+  底对齐选择框（七个动作一行一个，`finish`/`discard` 再过一道确认）；P43 起 `ask_user_question`
+  是**提问弹窗**（问题 + 编号选项 + 一行自定义回答，方向键/数字/空格/直接打字作答）。
 * **能力**：会话落盘可恢复（`--continue` / `--resume` / `/sessions`）；上下文管理（tool 结果
   超 8192 码点剪枝 + 压力超窗口 80% 自动压缩成 checkpoint）；技能发现 + `skill` 工具；
   `web_search`；子代理一族（`subagent` / `subagent_fork` / `list_agents` / `subagent_output` /
@@ -203,7 +204,7 @@ src/todo.uya       todo_write：整表替换、去重与状态校验
 src/plan.uya       plan 状态机 + 写闸门 plan_blocks_write + exit_plan_mode
 src/perm.uya       访问模式 P21：read-only / workspace-write / danger-full-access
 src/sandboxx.uya   内核沙箱 P21：bwrap 探测与 profile、不可用 fail closed
-src/askuser.uya    ask_user_question / ask_approve_action
+src/askuser.uya    ask_user_question（P43 TUI 弹窗 + 三条回落通道）/ ask_approve_action
 src/session.uya    会话日志：追加写、索引、崩溃裁剪、sess_open_resume
 src/stats.uya      统计折叠 P20：sessionStats / tokenUsage / StatsLine
 src/procx.uya      进程采样 P20/P24：/proc 算 CPU（USER_HZ=100）与 PSS
@@ -329,9 +330,17 @@ src/selftest.uya   mock LLM + 126 轮断言 + --probe
 
 * TTY 交互默认全屏（`--no-tui` 退回滚动；非 TTY / `--quiet` / 子代理自动退回）；`UYA_AGENT_TUI=0|1`、`--color=auto|always|never|16|256`、`--tui-demo [COLSxROWS]`。
 * 键位：`enter` 发送、`ctrl+j` / `alt+enter` 换行、`esc` 中断、`ctrl+c` 中断（2 秒内再按退出）、`ctrl+d` 退出、`shift+tab` 访问模式、`tab` plan、`ctrl+t` 任务块、`ctrl+p` 面板。
-* 浮层：命令面板 / 会话列表 / 帮助 / `/status` / `/goal` / `/watch` 跟随 / 访问模式 / bash 批准 / plan 审阅 / 行式问答；`/` 触发面板后连 `/` 一起收走。
+* 浮层：命令面板 / 会话列表 / 帮助 / `/status` / `/goal` / `/watch` 跟随 / 访问模式 / bash 批准 / plan 审阅 / **提问弹窗（P43）**；`/` 触发面板后连 `/` 一起收走。
+* **提问弹窗（P43，`ask_user_question`）**：模型在执行中问问题时弹一个浮窗（标题 = `header`，
+  多题时带 `第 i/共 n 问`）——问题正文一行、编号选项（`▸ 1) label — description`）、一行
+  `✎ 自定义回答`、一行按键提示。键位：`↑/↓`（`tab`/`shift+tab` 同效）移光标、`1-9` 直选、
+  `space` 多选勾选（`[x]`）、**直接打字 = 自己回答**、`backspace` 退格、`enter` 提交、`esc`/`ctrl+c`
+  取消这次问答（**不顺带中断回合**）。**只有它在 TUI 里**：终端太矮画不出浮窗时回落输入行问答，
+  滚动模式仍是 `> ` 行式问答，管道 / CI / 子代理仍是 `no answer channel`；
+  回答语义对齐 DSH：单选有自定义回答就覆盖选项、多选两者都带、什么都不选直接回车 = 空 `selected`（跳过）、
+  取消回的是 dismissed 文案（与 `no answer channel` 分开，模型才知道是「人不答」还是「渠道不通」）。
 * 数据流：`tty_write` 变 sink，通道 1/2/3 全进转录、fd 1 不写；帧走 `sys_dup(1)` 私有 fd。
-* 光标（修复，踩坑 66）：**运行中输入行照样显示光标并闪动** —— 运行中插入点仍是活的打字目标（敲进去的文本走 steer 收件箱，`ask_user_question` 更是直接用输入行等回答）；只有「运行中且浮层开着」才隐藏（浮层把键全吃掉，插入点不在输入行上）。口径在 `tui_cursor_place()`：`run == IDLE || !tui_overlay_open()`。
+* 光标（修复，踩坑 66）：**运行中输入行照样显示光标并闪动** —— 运行中插入点仍是活的打字目标（敲进去的文本走 steer 收件箱；P43 起 `ask_user_question` 是提问弹窗，浮窗放不下、回落输入行问答时也走这里）；只有「运行中且浮层开着」才隐藏（浮层把键全吃掉，插入点不在输入行上）。口径在 `tui_cursor_place()`：`run == IDLE || !tui_overlay_open()`。
 * 记忆上限：条目 ≤ 512、正文 ≤ 4 MiB、单条 ≤ 256 KiB；思考条目尾部 4 KiB、实时行尾部 1 KiB。
 
 ### 运行中的状态区与思考实时行（P18）
@@ -361,7 +370,7 @@ src/selftest.uya   mock LLM + 126 轮断言 + --probe
 120 列：~/uya-a… · ctx 21% · cpu 37% · 内存 312M 1 轮 · 12 步 | LLM 50.7s · 工具调用 4.1s | 首 token 平均 1.5s | 221 tok/s…
 100 列：~/uya-agent:main · ctx 21% · cpu 37% · 内存 312M   1 轮 · 12 步 | LLM 50.7s · 工具调用 4.1s…
  80 列：~/uya-agent:main · ctx 21% · cpu 37% · 内存 312M   1 轮 · 12 步…     ← 内存占 12 列之后，
- 60 列：~/uya-agent:ma… · ctx 21% · cpu 37% · 内存 312M  p37-model          统计行在 80 列就只剩
+ 60 列：~/uya-agent:ma… · ctx 21% · cpu 37% · 内存 312M  p43-ask            统计行在 80 列就只剩
  40 列：ctx 21% · cpu 37% · 内存 312M                                       第一组了；版本号那两行是
  32 列：ctx 21% · cpu 37%                                                   右半区整条让位的形态
 ```
@@ -550,7 +559,8 @@ src/selftest.uya   mock LLM + 126 轮断言 + --probe
 63. **自测「关掉 TUI」要关对开关**：`tui_set_headless(on)` 只置 `g_tui_headless`，而 `tui_active()` 看 `g_tui_on`，只有 `tui_headless_enable(on)` 两个都置；按模式分叉的断言先断言「真在这个模式里」。孪生：headless 轮须自开 `tty_sink_on = true`。
 64. **uya 的 `{ }` 块在生成的 C 里不是作用域**：同一函数里同名局部变量（`win_round` 的 A0 `pb` 与新 G 段 `pb`）在**平铺的 C 函数体**里直接 `redefinition of 'pb'`，而 `make build` 末尾只报「链接失败」（cc 的真错埋在编译日志里、`-o` 那步根本没跑到）——看到「链接失败」先去 `build/uyacache/**/<file>.c` 里找 cc 报错；同一 `.uya` 函数里的局部名当全局取（本轮一律 `p40_` 前缀）。
 65. **浮层开着就会盖住转录 → 「结果落进转录」的断言必须先关浮层**：headless 自测里 `tui_build()` 画的是一整帧，底对齐菜单正好压在转录最新那几行上，`tuis_screen_has("…")` 于是永远看不到刚写进去的 notice（P41 的 `tui-worktree` 轮实测：选 `on` 之后模式真翻了、文本也真写进了 `tui_add_notice`，断言照样红）。孪生：`tui_overlay_kind()` 在 `take` 之后回的是**结果**的 kind，所以「直接造一行 Buf 喂给 handler」之前必须先开一次浮层 —— 否则读到的是上一张浮层的 kind。
-66. **运行中把输入行的光标藏了 → 「能打字却看不见光标」**：`tui_cursor_place()` 按 `g_tui_run == TUI_RUN_IDLE` 决定可见性，于是 `THINK`/`STREAM`/`TOOL` 期间 `tui_flush()` **每帧**补一个 `ESC[?25l`（真 PTY 实测运行中敲字 20×`?25l` / 0×`?25h`），而运行中插入点仍是活的打字目标（steer 收件箱、`ask_user_question` 用输入行等回答）⇒ 屏幕上没有插入点。可见性**只跟浮层走**：`run == IDLE || !tui_overlay_open()`；判定要看字节（冒烟只看标志位会把 `tui_flush` 那段改坏了还判绿）。同族陷阱：光标错误按**状态**而非**焦点**开关。
+66. **运行中把输入行的光标藏了 → 「能打字却看不见光标」**：`tui_cursor_place()` 按 `g_tui_run == TUI_RUN_IDLE` 决定可见性，于是 `THINK`/`STREAM`/`TOOL` 期间 `tui_flush()` **每帧**补一个 `ESC[?25l`（真 PTY 实测运行中敲字 20×`?25l` / 0×`?25h`），而运行中插入点仍是活的打字目标（steer 收件箱；P43 起 `ask_user_question` 走弹窗，只在回落时才用输入行）⇒ 屏幕上没有插入点。可见性**只跟浮层走**：`run == IDLE || !tui_overlay_open()`；判定要看字节（冒烟只看标志位会把 `tui_flush` 那段改坏了还判绿）。同族陷阱：光标错误按**状态**而非**焦点**开关。
+67. **「工具结果在请求体里」搜的是转义后的字节**：`assert contains(rx, "\"selected\":[\"beta\"]")` 永远搜不到 —— 工具结果作为 `messages[].content` **字符串**嵌在请求体里，引号已经被转义成 `\"`（P43 的 `tui-ask` 轮第一版就是这么假红的，判据必须写 `\\\"selected\\\":[\\\"`）。孪生两条：① `contains` 走 C 字符串口径（`strlen`），拿 `buf_new` 造的 needle **必须补 NUL**（踩坑 57 同款），否则一路读到堆尾巴；② 同一个字符串在两处各写一份字面量必然漂移 —— PTY 用例里父进程打的任务文本与 mock 断言的必须是**同一个常量**（第一版父进程打 "ask me something …"、mock 断言 "pick a name …"，round 0 当场红）。
 
 ---
 
@@ -664,6 +674,7 @@ DEEPSEEK_API_KEY=sk-xxx ./build/uya-agent \
 | `tui-access` | chip 三模式、`shift+tab` 只置请求、选 Full access 出确认层；`/status` 真派发、`/help` 开浮层；结果 kind 跨 close 存活（踩坑 44） |
 | `plan-gate` | P26 plan 写闸门真值表 + 全权模式下 write/edit 被拒且 `plan-gate.txt` 不落盘 |
 | `tui-plan` | 审阅浮窗四段：动作/滚动/`Plan approved`/`esc` dismissed；40 列不超宽 |
+| `tui-ask` | P43 提问弹窗四段：① headless 排版与按键（标题/问题/编号选项/`▸`/`✎`/提示/方框闭合/每行 ≤ cols/无 ESC-NUL；`↓`、`1-9` 直选、打字进自定义、`backspace` 退、单选自定义排他、多选 `[x]` 交回两个下标、0 选项只画自定义行、40 列不越界、`esc` 取消）；② 终端太矮 `tui_ask_wait` 返回 0（回落输入行，不 fail closed）；③ headless+agent 真调 `ask_user_question`：没人答 = dismissed + 空 `selected`，绝不假装有人答、浮层收干净；④ 真 PTY：弹窗把问题原文画上屏（不是输入行那条提示）、`2`+回车后模型收到的工具结果里是第二个选项的 label |
 | `tui-ws` | P34 工作区切换：脚注 cwd、`/diff` 标题、运行时上下文注入不上屏、幂等 |
 | `tui-diff` | `/diff` 浮窗：圆角框/两栏/竖线同列；P36 底色与 `n`/`N` 跳转 |
 | `diff-parse` | diff → 行表：MIX/多 hunk/CRLF/TAB/`Binary files`；P36 `gd_next_change` 环绕 |
@@ -785,13 +796,14 @@ DEEPSEEK_API_KEY=sk-xxx ./build/uya-agent \
 - P25：空态零影响逐字节；`--tui-demo` 第 ④a/④b/④c 屏是真机产物。
 - P26：`session-6918e8ef` 里模型在 plan 模式直接开工 = 「只有提示词没闸门」；闸门按现场补，把 `plan_blocks_write()` 改恒 `false` 该轮立刻红。
 - P28：真机 A/B：`ctrl+d` 45 s 仍活 → +2.0 s 退出；`esc` 后 `ctrl+d` +0.04 s；两次 `ctrl+c` +0.03 s。
-- P29/P33/P34/P35/P37/P38/P39/P40/P41/P42：见对应轮次与踩坑 50–66；`make selftest` / `make tui-selftest` 全绿、退出 0。
+- P29/P33/P34/P35/P37/P38/P39/P40/P41/P42/P43：见对应轮次与踩坑 50–67；`make selftest` / `make tui-selftest` 全绿、退出 0。
 - P40：子代理面板状态行改贴尾 —— 真机那一幕是两条 `send_message` 续跑的子代理收到一两百字节的催促，老口径整行从右边截断，屏幕上只剩 `Your output was still far too verbose: 325 lines / 68 KB…`，最新那半句 `…Do a second pass and cut it to under 25 KB.` 正好被切掉；80 列下实测 `│ ● running      53s · 0 · …KB). Do a second pass and cut it to under 25 KB. │`（78 列）、40 列收成 `…r 25 KB.`（38 列）。照 ①把 `view_ag_msg` 改回贴左重编 → G 段红 5 条；②把 `VIEW_AG_MSG_MAX` 改回 160 重编 → 200 列那条腿红 1 条。
 - P41：`/worktree` 补齐选择框。真 PTY（`worktree-menu`）实测：命令面板里选中 `/worktree`（ctrl+p → 敲名字 → 回车）62–65 ms 上框、裸 `/worktree` + 回车 62 ms，框里七行 + `✓ off`（当前模式关）都在，↓ 一次到 `finish`、回车 52–62 ms 翻出 `确认 finish？`（动作框同时消失）；确认框上再回车（默认游标「取消」）什么都没发生。`tui-worktree` 轮的**真 git** 那半：fixture 仓里 provision 出 worktree → 键盘走到 `finish` → 此刻目录与 `phase` 都还是 `READY`（没确认就动不了）→ 取消后主干上没有那个文件 → 把游标挪到 `finish` 那一行确认才 `merged … / removed worktree …`（目录消失、主干上出现文件、`phase=FINISHED`）。照 ①把 `wt_act_needs_confirm` 改成恒 `false` 重编 → 该轮红 18 条（确认框不再出现，`finish` 当场合并并删掉 worktree）；②把默认游标从 `WT_ACT_STATUS` 改成 0 重编 → 红 14 条（「打开就回车 = status」与后面整条键盘路径全崩）。
 - 踩坑 66（运行中输入行没有光标）：真 PTY 逐字节抓帧 —— 修前运行中敲字 1.0 s 内 `ESC[?25l` **20 次 / `?25h` 0 次**（敲进去的 `abc` 确实进了输入行），修后同一场景 **`?25h` 20 次 / `?25l` 0 次**（每帧「定位 + 显示」，与空闲态同一条序列，所以照常闪动）。对照实验（防假绿）：把 `tui_cursor_place()` 的可见性改回 `run == IDLE` 重编，`tui-caret` 四条断言当场红（三态标志位 3 条 + 字节级 1 条），改回来全绿。`--tui-demo` 输出与修前**同目录逐字节相同**（50019 字节，布局没动；只有 cwd 那一栏会随目录变）。
+- P43：`ask_user_question` 在 TUI 里改成提问弹窗（`tui-ask` 轮四段，见上表）。真 PTY 那半实测：任务打进去后浮窗把问题原文与 `1) alpha` / `2) beta` 画上屏（同屏**没有**输入行那条「（在输入行回答后回车…）」），敲 `2`+回车之后 mock 收到的第二次请求里工具结果是 `{"answers":[{"id":"q1","selected":["beta"]}]}` —— 弹窗交回的是**选项下标**、由 `askuser` 按下标回查 label（不是按行文本反解）。headless 那半（没人回答）结果是 `"selected":[]` + dismissed 文案，且**没有** `no answer channel`（渠道与「人不答」两件事分开了）。踩坑 67 那两条假红（请求体里引号是转义的、needle 必须 NUL 结尾）都是这一轮当场抓出来的。
 - 其它：自测幂等（连跑两次都 PASS）；A1–A6 全部通过；技能与 `web_search`、自动压缩、后台任务、文件工具、DSH 零参数启动、跨进程会话恢复（记住 4271）都在真机验收过。
 
-> 分阶段验收记录的详细现场（P1–P42 的 before/after 命令与截图、真机对照实验、被自测当场抓住的自身缺陷）已在此压缩，原始描述保留在 §3 踩坑 33–67 与各版本提交说明中。
+> 分阶段验收记录的详细现场（P1–P43 的 before/after 命令与截图、真机对照实验、被自测当场抓住的自身缺陷）已在此压缩，原始描述保留在 §3 踩坑 33–67 与各版本提交说明中。
 
 ---
 
@@ -840,6 +852,14 @@ DEEPSEEK_API_KEY=sk-xxx ./build/uya-agent \
 * **`SIGKILL` 之后终端仍可能停在备用屏幕**（不可捕获），用 `reset` / `stty sane` 恢复。
 * `ask_user_question` / `exit_plan_mode` 的问答浮层里 `ctrl+c`/`esc` 是「取消这次问答」而不是退出
   程序；要退出先取消（浮层收掉之后 `ctrl+d`）。
+* **提问弹窗（P43）只有「TUI 且浮窗放得下」这一条路**：终端太矮（`panel_top < 6`）时回落输入行
+  问答 —— 与审批类浮层**故意不同**（审批是「看不见就不许做」的 fail closed，提问是「换个地方问」，
+  回落永远比丢渠道好）；管道 / CI / 子代理仍然只能拿到 `no answer channel`。题目一次只画一题
+  （多题逐题弹、标题带 `第 i/共 n 问`）；问题正文与选项行都是**一行**（超长按显示列截断补 `…`，
+  不做折行/滚动）；一题最多 16 个选项、最多 9 个数字直选键；自定义回答是**单行**（`enter` 提交，
+  没有多行输入）；`space` 只在多选且未进入输入态时是勾选（单选时是普通字符）。回答语义对齐 DSH：
+  单选自定义回答排他、多选 `selected` 与 `custom` 可同时带、跳过 = 空 `selected`、取消 = dismissed
+  文案（与 `no answer channel` 分开）。
 
 **任务状态与目标**
 
@@ -909,7 +929,8 @@ DEEPSEEK_API_KEY=sk-xxx ./build/uya-agent \
 * **plan 模式（P22）**：闸门只拦 `write`/`edit` —— 所以「全权重定向写文件」这条 bash 路仍然开着
   （DSH 的立场也是 plan mode 是引导，要更硬就配 `read-only`）；fork 出来的子代理继承 plan 状态；
   **非交互会话**（管道/CI）没有审阅渠道 ⇒ `--plan` 只会产出计划、写工具始终被拒；
-  `ask_user_question` 仍是行式问答（只有 `exit_plan_mode` 有浮窗）；plan 状态与访问模式一样是
+  `ask_user_question` 在 TUI 里是**提问弹窗**（P43；浮窗画不出来则回落输入行，管道/子代理仍无渠道）；
+  plan 状态与访问模式一样是
   **进程级**的，但每次切换会落一条 `plan/mode` 日志。
 
 **默认行为与进程**
