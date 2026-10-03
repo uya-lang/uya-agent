@@ -4,7 +4,7 @@
 多轮 loop 直到给出结论。全部代码 38 个 `.uya` 文件，**不引入任何 C 代码、`@c_import` 或其它语言**，
 只依赖 Uya 语言与随编译器分发的标准库。
 
-**P0–P24 全部完成**（P15、P21 这两个编号各被两条并行线用过一次，P22/P23/P24 也是
+**P0–P25 全部完成**（P15、P21 这两个编号各被两条并行线用过一次，P22/P23/P24 也是
 并行线前后脚合的流：P21 的一条是**三级访问模式 + 内核沙箱**（机器名与 DSH
 permission-presets 一致，见「访问模式」/「沙箱」两节，版本串 `p21-perm`）、另一条是
 **终端标题**（合流时按后到的编号记成 **P22**，版本串 `p22-title`）；P22 之后到的是
@@ -23,7 +23,9 @@ P18 是**常驻状态区 + 思考实时行**；**P19 是诊断出口与 read 窗
 **P23 是命令面板与浮层这条链**（派发收口 / 无匹配不静默 / 运行中只读命令在 step 边界派发 /
 浮层滚动与溢出指示）；**P24 是脚注的 `内存` 字段（同批进程的 PSS 合计）、`%cpu` 改名 `cpu`，
 以及首 token 打点从「首个正文 delta」放宽成「第一个非空 delta」**（推理/工具型会话里那一组
-不再整组空着，tok/s 从爆表的几千回到真实的 150–290 量级；版本串 `p24-mem`，见踩坑 41））：
+不再整组空着，tok/s 从爆表的几千回到真实的 150–290 量级；版本串 `p24-mem`，见踩坑 41）；
+**P25 是任务状态 `/tasks` 与可展开的常驻任务块**（清单 / 后台任务 / 子代理 / 会话目标四类汇成
+一张进度表，版本串 `p25-tasks`，见 §2 的「任务状态与 /tasks（P25）」与 §6 的验收记录））：
 LLM 交互是**流式 SSE**（`stream:true` + `stream_options.include_usage`），
 增量 chunked 解码 + SSE 分帧 + `tool_calls` 按 `index` 分片累积；消息协议是**严格工具协议**
 （`assistant.tool_calls` 原样回灌 + 每条结果一条 `role:"tool"` + `tool_call_id`）；
@@ -78,6 +80,12 @@ DSH `permission.defaultPreset`），read-only 下 `write`/`edit` 硬拒、`bash`
 标题栈并上基标题 `uya-agent · <工作目录名>`，第一条用户消息之后变成**裸会话标题**
 （前 5 个词 / ≤40 B / 清洗 + 码点边界截断），`--continue`、`/resume`、`--resume-dsh` 都能把
 已有标题接上，退出或收到终止信号时弹栈还给 shell（见踩坑 39）。
+**P25 把「任务状态」摆到台面上**：`/tasks`（TUI 浮层 / 滚动模式打印同一份报告）把四类在跑的东西
+汇总成一张进度表 —— `todo_write` 的清单（`✓/▸/·` + `2/5 40%` + 20 格进度条）、后台任务
+（状态字形 + 已跑秒数 + 输出体量 + 标签）、子代理（秒数 + 输出行数 + ralph 的 `Round n/m`）、
+会话目标（`active 3/20 · objective`）；输入行上方常驻一块**任务块**，默认折叠成 1 行
+（`▸ 任务 2/5 40% · 后台 1/3 · 子代理 2/4 · 目标 3/20`），`ctrl+t`（或 `/tasks open|close`）展开成带
+边框的清单箱体；没有任务时一个字节都不画（布局与 P21 之前逐字节相同）。
 
 ```
 $ ./build/uya-agent --show-reasoning "在当前工作目录写 p15-demo.txt，三行 alpha / beta / gamma；然后用 bash 打印它，并告诉我第二行。"
@@ -115,6 +123,7 @@ make selftest     # 离线端到端自测（内置 mock LLM，不需要网络也
 make codegen-audit # 扫构建产物：不许出现「切片描述符 → 字节指针」的强转（终端乱码源头）
 make e2e-permission # 访问模式的四级来源 + 非法值报错（离线）
 make e2e-sandbox    # 沙箱后端探测 / --no-sandbox / 显式 bwrap 路径（离线）
+make e2e-tasks      # /tasks 报告头 / 空态串 / open|toggle|非法参数 / /help（离线）
 make probe        # 传输层探针：打真实 https 端点，期望 HTTP 401（不需要 key）
 ```
 
@@ -148,7 +157,7 @@ export UYA_SPLIT_C_DIR=$PWD/build/uyacache      # 多文件 C 缓存别丢在仓
 | `--no-stream` | 关闭流式，回退一次性响应（老端点兼容） |
 | `--api=MODE` | 线协议：`openai-responses`（**默认**）/ `openai-completions`（也接受 `responses` / `chat` / `completions`）。**不写 = 未声明**：先打 `/responses`，只有 404/405/501 才回退 `chat/completions`（每进程一次），见「Responses 接口」一节 |
 | `--reasoning-effort V` | 发 `reasoning.effort`（只有 responses 发；`off`/`none` = 不发），默认取 DSH 的 `agent-default-model.reasoningEffort` |
-| REPL 命令 | `/help` `/continue` `/status` `/compact` `/plan` `/permission [预设]` `/sessions` `/resume <id>` `/new` `/exit` |
+| REPL 命令 | `/help` `/continue` `/status` `/tasks [open\|close\|toggle]` `/compact` `/plan` `/permission [预设]` `/sessions` `/resume <id>` `/new` `/exit` |
 | `--agent-home DIR` | 会话与索引的根目录（默认 `~/.uya-agent`） |
 | `--continue` | 接着当前目录最近一条会话继续 |
 | `--resume ID` | 恢复指定会话（`ID` 或 `last`） |
@@ -238,7 +247,9 @@ src/tui.uya       全屏 TUI（P17/P18）：帧模型（行=段序列，逐行 d
                   sink 通道与清洗、滚动与尾随、帧节流；P18 再加**常驻状态区**（钉在输入面板正
                   上方：spinner 行 + 思考实时行，空闲 0 行）与尾部对齐截断 `tui_put_clipped_tail`；
                   P19：诊断（NOTICE）条目限长（`TUI_NOTICE_MAX`）、非法/半截 UTF-8 → U+FFFD、
-                  思考尾部按字符边界切
+                  思考尾部按字符边界切；P25 再加**常驻任务块**（钉在状态区之上：转录 → 任务块 →
+                  agents 箱体 → 状态区 → 面板）、`ctrl+t` 切展开态（键层只置请求、主循环落地）、
+                  信息行在块非空时才挂 `ctrl+t tasks` 提示
 src/sigselftest.uya 信号层的自测轮次（sig-abi / sig-basic / sig-term-restore / sig-child-reset）
 src/tuiselftest.uya TUI 的自测轮次（tui-frame / tui-keys / tui-sink / tui-turn / tui-status / tui-pty /
                   tty-title-pty；P20/P24 起 tui-frame 还断言脚注统计行的逐级退化、右对齐
@@ -311,12 +322,20 @@ src/diffx.uya     行级 diff（只服务显示）：公共整行前后缀裁剪
                   行列截断 + 头截断；全局暂存最近一次变更，view 层 take 走
                   （P16 起正文默认关闭，它只喂 `· +A -D` / `· replaced` 这两个后缀；
                   正文要 `--tool-lines N`（N>0）才会被 append）
+src/tasks.uya     任务状态（P25）：把四张表（todo 清单 / jobs / deleg / goal）折叠成
+                  「折叠行 / 展开箱体 / /tasks 报告」三份文本（**纯函数**：不 poll、不读盘、
+                  不写终端，now_ms 也显式传参 —— 自测可逐字节断言），外加一张面板块快照：
+                  变了才推送（滚动模式走 tty 面板块，TUI 只置 dirty 后从 tasks_latest 拉）；
+                  地方不够按「展开+agents → 展开 → 折叠+agents → 折叠」逐级退化（行数与字节
+                  两条预算：tty 面板块上限 8192 超了会被**静默丢弃** → 块凭空消失）
 src/view.uya      显示层：工具→标题/关键参数/后缀三张表、状态字形、按显示列截断、
                   **单行转录**（默认没有正文块：正文要 `--tool-lines N`（N>0）才 append）、
                   **思考行**（运行中在提示符那一行滚动、块结束落一行 `✻ 思考 · <首行>…`；
                   P18 再加 `view_think_live`：给 TUI 状态区喂「最新一行」，默认开）、
                   交互模式的「运行中提示符」换入换出、
-                  **子代理窗口面板**（2 行/个、最多 4 个、带边框、逐行等宽）
+                  **子代理窗口面板**（2 行/个、最多 4 个、带边框、逐行等宽）；
+                  P25 起推送原语是 `view_panel_push`（谁生成文本谁调用）—— agents 面板与
+                  任务块共用同一块面板块快照，不允许两个写者抢
 src/agent.uya     CLI、环境变量、消息历史、请求组装、主循环（流式/非流式）、工具分发、
                   交互式 REPL（中断/steer//continue/会话命令）、会话事件记录与恢复、
                   `assistant/reasoning`（思考全文，P16）；P17 再加 `agent_run_tui` /
@@ -328,9 +347,8 @@ src/agent.uya     CLI、环境变量、消息历史、请求组装、主循环�
 src/selftest.uya  --selftest 的 mock LLM（含 SSE 受控切分）+ 80 轮断言 + --probe
                   （P17 又加了源文件里的 4 轮信号 + 5 轮 TUI，P18 再加 1 轮 `tui-status`，
                   P19 再加 3 轮诊断，P20 再加 9 轮统计/进程 CPU，P21 再加 7 轮访问模式/沙箱，
-                  P22 再加 1 轮 `title-format` + 1 轮 `tty-title-pty`，
-                  P24 再加 5 轮首 token 边界 + 1 轮内存解析/显示，见 §6）
-```
+                   P22 再加 1 轮 `title-format` + 1 轮 `tty-title-pty`，
+                   P25 再加 2 轮任务状态（渲染 + 滚动模式活路径；TUI 侧另有 `tui-tasks`），见 §6）
 ```
 > 两处已知死代码（P14 未清理，改别的东西时别被它们误导）：`src/tools.uya`（P0 的
 > `read_file`/`write_file`/`run_shell`，早已被 `fsx`/`search`/`shellx` 取代）、
@@ -735,7 +753,7 @@ TTY 交互模式**默认全屏**（`--no-tui` 退回上一节的滚动转录；�
 
   ▌ ↑ Ask anything... "把 hello.uya 的问候语改成 Hello, DSH!"
   ▌ Build   Full access   deepseek-chat   deepseek  tab plan   ctrl+p commands
-  ~/uya-agent:main                                                                 p24-mem
+  ~/uya-agent:main                                                                 p25-tasks
 ```
 
 对话态（`--tui-demo` 打印的就是这三屏的纯文本快照）：
@@ -787,7 +805,7 @@ TTY 交互模式**默认全屏**（`--no-tui` 退回上一节的滚动转录；�
 * **键位**：`enter` 发送 · `ctrl+j` / `alt+enter` 换行 · `esc` 运行中=中断、空闲=清行 ·
   `ctrl+c` 运行中=中断、空闲=清空/两次退出 · `ctrl+d` 空行退出 · **`shift+tab` 访问模式选择浮层** ·
   `↑/↓` 单行=历史、
-  多行=上下移光标 · `pgup/pgdn`、`ctrl+home/end` 滚转录 · `tab` 切计划模式（面板显示 `Plan`）·
+  多行=上下移光标 · `pgup/pgdn`、`ctrl+home/end` 滚转录 · `tab` 切计划模式（面板显示 `Plan`）· **`ctrl+t` 展开/收起常驻任务块** ·
   `ctrl+p` 命令面板（输入以 `/` 开头也会自动打开）· `ctrl+u/w/k` 清行/删词/删到行尾 ·
   `ctrl+a/e`、`←/→`、`home/end`、`backspace/del` 按**字符**编辑 · `ctrl+l` 强制重绘 ·
   括起粘贴（`ESC[200~`）整段插入不触发提交（> 64 KiB 截断）。
@@ -1041,6 +1059,87 @@ DSH 里认不出来的值（例如表示「旋钮不匹配任何预设」的 `cu
 * 没做：workflow 的 `.ush` 脚本（`uya run` 起的不是 bash）、隐藏 `/proc` 之外的更多命名空间、
   网络/进程级限制（DSH 自己的权限词汇里也只有文件效果）。
 
+### 任务状态与 /tasks（P25）
+
+四类在跑的东西汇成一张进度表：**todo 清单**（`todo_write`）、**后台任务**（`jobs.uya`）、
+**子代理**（`deleg.uya`）、**会话目标**（`goal.uya`）。三个入口，一份内容：
+
+* `/tasks` —— TUI 开浮层、滚动模式（`--no-tui`）直接打印（`tasks_report`，两处同一份文本）；
+* `/tasks open|close|toggle`（也接受 `expand`/`collapse`）—— 只切**常驻块**的展开态；
+* `ctrl+t`（TUI）—— 与 `/tasks toggle` 同效（键层只置 `TUI_REQ_TASKS`，主循环落地）。
+
+常驻块钉在输入面板上方、**状态区之上**（层序：转录 → 任务块 → agents 箱体 → 状态区 → 面板）。
+折叠态就 1 行，`--tui-demo` 的第 ④a 屏就是它（真机输出）：
+
+```
+  ▸ 任务 2/4 50% · 后台 1/2 · 子代理 1/1 · 目标 3/20
+```
+
+`ctrl+t` 展开成带边框的箱体（第 ④b 屏；子代理窗口是 P15 那个独立的箱体，跟在后面）：
+
+```
+  ┌─ tasks ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+  │ 清单      2/4   50%  ██████████░░░░░░░░░░                                                                                                                │
+  │   ▸ 补自测轮与 make 目标                                                                                                                                 │
+  │   · 把 README 第 6 节的验收表补齐                                                                                                                        │
+  │   ✓ 写 src/tasks.uya（聚合 + 文本 + 快照推送）                                                                                                           │
+  │   ✓ 接进 TUI 浮层与常驻块                                                                                                                                │
+  │ 后台任务  1 跑中 / 2                                                                                                                                     │
+  │   ● job-1 [bash] running 12s · 输出 33B · 编译内核模块                                                                                                   │
+  │   ✓ job-2 [bash] completed · exit 0 · 输出 21B · 跑一遍单测                                                                                              │
+  │ 目标      ▸ active · round 3/20 · 把 /tasks 的任务状态进度接进 TUI 与滚动模式                                                                            │
+  └─ ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+  ┌─ agent ────────────────────────────────────────────────────────────────────┐
+  │ ● sub-1 [subagent] 审计 deleg 的等待循环                                   │
+  │ ● running       7s · 12 · 把 deleg 的等待循环与 fork/exec 差异看一遍       │
+  └─ ──────────────────────────────────────────────────────────────────────────┘
+```
+
+`/tasks` 的报告把四类都列全（含**已结束**的后台任务/子代理 —— 常驻块只列运行中的）：
+
+```
+--- 任务（/tasks 的内容）---
+清单      2/4   50%  ██████████░░░░░░░░░░
+  ▸ 补自测轮与 make 目标
+  · 把 README 第 6 节的验收表补齐
+  ✓ 写 src/tasks.uya（聚合 + 文本 + 快照推送）
+  ✓ 接进 TUI 浮层与常驻块
+后台任务  1 跑中 / 2
+  ● job-1 [bash] running 12s · 输出 33B · 编译内核模块
+  ✓ job-2 [bash] completed · exit 0 · 输出 21B · 跑一遍单测
+子代理    1 跑中 / 1
+  ● sub-1 [subagent] running 7s · 12 行 · 审计 deleg 的等待循环
+目标      ▸ active · round 3/20 · 把 /tasks 的任务状态进度接进 TUI 与滚动模式
+提示      ctrl+t 展开/收起常驻块（TUI），/tasks open|close 同效
+```
+
+* **口径**（都进自测逐字节断言）：清单 `✓ 完成 / ▸ 进行中 / · 待办`，百分比与进度条按
+  四舍五入（`1/200 → 1%`）；清单默认按**进行中 → 待办 → 完成**分组展示（组内保持清单原序），
+  常驻箱体里最多 6 行、超出补 `… 还有 N 项（/tasks 看全部）`，`/tasks` 全量列出。
+* **后台任务**：`● running`（带已跑时长）、`✓ completed`（带 `exit 0`）、`✗ completed`（非零退出）、
+  `■ killed`（退出码 128+信号）；输出体量用**字节数**（`33B` / `3.2K` / `512K` / `1.0M`），
+  不数行 —— 1 MiB 的缓冲逐行扫在 30fps 下太贵；超上限被截尾时标 `（已截断）`。
+* **子代理**：复用 `view_status_glyph`/`deleg_status_name`（`running` / `idle` / `failed` /
+  `interrupted`），ralph 多一段 `Round n/m`。
+* **目标**：从 `goal.json` 读进内存（启动时、每次 goal 工具之后、`/tasks` 之前各重读一次）；
+  `active` 显示 `round 3/20`，其余显示 `暂停 / 完成 / 阻塞`，`blocked` 还会带上阻塞原因。
+* **刷新模型**：「上层推、下层画」（uya 0.10 没有函数指针）：每个工具结果之后
+  `tasks_poll`（`jobs_poll_all` + `deleg_poll_all`，只 drain + `WNOHANG`，与 step 边界同一套语义）
+  → `tasks_panel_sync`（重建 → 与上次逐字节比 → 变了才推）；TUI 另有 1Hz 心跳
+  （`tui_tick → tasks_tick`，秒数/状态在这里刷新），滚动模式跟 P15 一样按「step 边界 / 等待循环 /
+  工具结果」刷新。**文本生成是纯函数**，TUI 每帧只做一次 memcpy，不在帧里重建。
+* **没任务就什么都没有**：四类全空时 `tasks_line` 一个字节都不写 → 滚动模式清掉面板块、
+  TUI 0 行，布局与 P21 之前**逐字节相同**（`tui-frame` / `tui-status` 那些排版断言因此不受影响）。
+* **地方不够按「展开+agents → 展开 → 折叠+agents → 折叠」退化**：行数与字节两条预算一起守；
+  先丢子代理窗口（它还有 `/tasks` 与结算通知兜着），最后退成 1 行折叠。
+  这么退的另一个原因：tty 面板块有 8192 字节上限，超了 `tty_block_set` 会**静默丢弃** ——
+  「块凭空消失」比少几行糟得多。
+* `/tasks` 也进了 P23 那条链的「回合运行中可当场派发的只读命令」集合（与 `/status` / `/help` /
+  `/sessions` 同列）：回合还在跑时在命令面板里选它就当场开浮层，改历史的命令照旧等回合结束。
+* **滚动模式也真验过**：`tasks-scroll` 轮走 `tasks_panel_sync → view_panel_push → tty_block_* →
+  tty_draw_line`，断言折叠行与 agents 箱体一起进面板块、提示符在它下面、展开后每行 98 列
+  （`tty_body_width()` 口径）、收起即隐。
+* `--quiet`（含子代理进程）整层关闭：不生成、不推送（与 P15/P20 同口径）。
 ### 终端标题（P22，TTY title）
 
 交互模式跑起来以后，**终端窗口/标签页的标题自动跟着当前会话标题走**（xterm 的 OSC 2）。
@@ -1073,7 +1172,6 @@ DSH 里认不出来的值（例如表示「旋钮不匹配任何预设」的 `cu
 $ ./build/uya-agent            # 进 TUI
 $ printf '\e]2;x\a'            # 手测终端本身吃不吃 OSC 2（能看到标签页标题变 x 就支持）
 ```
-
 ### 流式协议要点（P1）
 
 * `hc_open()` 只读到 `\r\n\r\n` 就返回，`hc_fill()` 每次读一段网络并推进解码，返回
@@ -1583,6 +1681,20 @@ vLLM 等 OpenAI 兼容端点都一样稳。想升级成严格 `tool` 角色消�
     同一个规矩补齐到浮层。教训：**凡是「超出就补个尾巴」的排版函数，调用点的预算都该按
     「含尾巴」算**；只测短行（从不触发截断）的用例看不见这类缺陷 ——
     回归必须拿**真会撑满的那一行**（`/permission`）在多种宽度下逐行量方框的左右边界。
+43. **uya 0.10 的四个「写下去才发现」的坑（P25 一次性全撞上，都是编译期/运行期各报一次就记住的事）**：
+    * **全局变量的初始化式必须是常量**：`var g: Goal = Goal{ phase: buf_empty(), … }` 编不过 ——
+      `buf_empty()` 是函数调用，生成的 C 是 `{.phase = bufx_buf_empty(), …}`，
+      gcc 直接 `error: initializer element is not constant`。全局只能写字面量
+      （`Buf{ ptr: null, len: 0, cap: 0 }`，也不能拿别的 `const` 当初始值，同样要写字面量）。
+    * **`const x = if 条件 { a } else { b }` 在循环体里会生成「给只读变量赋值」的 C**：
+      `const size_t __uya_ifexpr_9;` 然后两个分支去写它 → `error: assignment of read-only variable`。
+      同一个写法在函数顶层有时又没事（`tui_draw_footer` 里那句就活着），别去赌 —— 循环里一律
+      `var x = a; if !cond { x = b; }`。
+    * **`match` 是保留字**：`var match: bool = false;` 报 `意外的 token 'match'`（解析阶段，不是类型阶段）。
+    * **`tui_puts` 按 cstr 量长度**：它内部 `bufx_cstr_len`，而 `buf_new` 出来的缓冲区**没有 NUL**。
+      P25 把信息行右侧提示从字面量改成拼出来的 `Buf` 之后，屏幕上就多出一截堆里的旧字节
+      （实测是 `\x8c输出 Hello, DSH!。` 粘在 `ctrl+p commands` 后面，`--tui-demo` 的快照里一眼可见）。
+      凡是要画 `Buf` 里的字节，一律用 `tui_putn` / `tui_put_clipped`（显式给长度）。
 
 ---
 
@@ -1703,6 +1815,20 @@ agent 循环并逐项断言：
 `subagent_output(wait=true)`、`list_agents`、`subagent_fork`（前台）、`ralph(maxRounds=2)` +
 读它的逐轮报告；mock 用 `x-uya-subagent` 头区分父/子请求，第二轮断言目标回显、
 子代理结果回到父、`sub-1 [subagent] idle`、`[round 1]/[round 2]` 都出现在请求里 |
+| `tasks-render` | 任务状态（P25）纯函数轮：进度条（`2/4`=10 格、`0/4`、`4/4`、`total=0`/`cells=0` 不画）、
+百分比四舍五入（`1/3→33%`、`2/3→67%`、`1/200→1%`）、输出体量（`120B`/`1.0K`/`3.2K`/`9.9K`/`10K`/`512K`/`1.0M`/`2.8M`）、
+空态三件套**一个字节都不写**（折叠行/箱体/报告）、折叠行四段逐字节 + 首字形三态（`▸`/`✓`/`·`）+
+窄终端丢段补 `…` 且恒 1 行、箱体 11 行且**逐行等宽**（含中文/宽字符）、`max_rows` 裁剪补 `… 还有 N 行`、
+清单 6 行上限补 `… 还有 N 项`、报告按 进行中→待办→完成 分组（组内原序）、job 三态字形与 `（已截断）`、
+同一份输入两次调用逐字节相同 |
+| `tasks-scroll` | 滚动模式（`--no-tui`）的活路径（P25）：`tasks_panel_sync → view_panel_push → tty_block_*`
+→ `tty_draw_line` 真画一帧 —— 折叠行与 P15 的 agents 箱体**一起**进面板块、提示符在它下面；
+展开后换成任务箱体且**每行 98 列**（中文按显示列）；收起即隐；显示层关闭（`--quiet`）时零输出 |
+| `tui-tasks` | 常驻任务块（P25）：空态 0 行且状态行仍钉在面板正上方（与 P25 之前逐字节相同）、
+装上 fixture 后折叠行（1 行）出现在 agents 箱体之上、状态区之下，层序 = 转录 → 任务块 → agents → 状态区；
+`ctrl+t` 只置出 `TUI_REQ_TASKS`（键层不自己改状态），落地后展开成 `┌─ tasks` 箱体（含清单段与计数、
+底框、agents 箱体仍在），再切回收起；活体刷新（job 跑完 → 折叠行的 `后台 r/n` 变）；矮终端（80×12）
+阶梯退化到 5 行且**保住箱体底框**、先丢 agents 箱体、转录仍留 ≥3 行；窄终端（40 列）每行不超列宽 |
 | `skills-web-search` | 造一个目录型技能（front-matter + 正文）→ 断言目录注入、`skill` 工具结果模板与
 资源指引、未知技能错误串；provider 侧用 mock 的 Anthropic 形状响应，断言 `web_search` 请求带
 服务端搜索工具与鉴权头、query 去重后只出现一次、答案与两条来源都被渲染 |
@@ -1746,6 +1872,8 @@ contextWindow/maxTokens/input image/reasoningEffort/`permission.defaultPreset`�
 | `responses-fallback` | 端到端（mock mode 21）：**未声明**协议 → 第一个请求打 `/responses`（mock 回 404）→ 同一步改用 `/chat/completions` 重发，之后每轮都必须是 chat（钉住「只协商一次」） |
 | `responses-compact` | 端到端（mock mode 22）：自动压缩也跟随协议 —— 摘要请求与压缩之后的请求都必须走 `/v1/responses`（有 `input`、无 `messages`），并断言 checkpoint 文案 |
 | `api-flags` | `make e2e-api`：默认 = responses + negotiable；`--api=chat` / `UYA_AGENT_API=responses` 生效且不再协商；非法 `--api=` 报错退出；`--dry-run` 的请求体跟着协议走 |
+| `tasks-e2e` | `make e2e-tasks`（离线，管道喂 REPL）：裸 `/tasks` 打出 `--- 任务 ---` 与空态串、
+`/tasks open` / `toggle` 的回显、`/tasks bogus` 报 `未知参数 "bogus"`、`/help` 里能查到 `/tasks` |
 | `diff-render` | 纯函数逐字节断言 diff：新旧一样 → 空（且**不输出上下文**）、只差结尾换行 → 空、
 中间一行改动 → 前后各 2 行上下文 + `-`/`+`、新文件 → 全 `+`、两侧 >60 行 → 只给精确汇总、
 60 行编辑脚本 → 头截断成 24 行 + `… (省略 36 行)`、增删计数、按显示列截断（汉字 2 列） |
@@ -2045,6 +2173,26 @@ responses 看 `call_id`）；**chat 与 responses 各一轮**，且顺便断言�
   ④ 审批流程用**真 PTY** 验收（`tui-approve` B 段：等 `Read Only：批准这条 bash 命令？` 画出来
   再送 `↑`+回车 → 命令真的跑、stdout 进转录与下一封请求）；headless 那条路只钉「没人回答 =
   fail closed」。
+* **P25 的验收记录（对应任务状态 / `/tasks` + 常驻任务块）**：
+  ① 离线全套：`make check` / `codegen-audit` / `e2e-config-flags` / `e2e-api` / `e2e-steps` /
+  `e2e-permission` / `e2e-sandbox` / `e2e-tasks` / `selftest`（`SELFTEST PASS`，含新加的
+  `tasks-render` / `tasks-scroll`）/ `tui-selftest`（10 轮，含新加的 `tui-tasks`）全绿。
+  ② **空态零影响是逐字节验的**：`tui-tasks` 先断言「没有任务时块 0 行、状态行仍然落在
+  `tui_nrows() - 4`」，`tasks-render` 再断言折叠行与箱体在四类全空时**长度为 0**（报告给一行
+  人话：`（没有任务：…）`）；`tui-frame` / `tui-status` / `tui-turn` 那些排版断言（四种尺寸、
+  空态居中、对话态底对齐、脚注按宽度退化）逐条照旧通过 —— 任务块为空时 `--tui-demo` 的前三屏
+  与 P21 只差脚注版本串（`p21-perm` → `p22-tasks`）。
+  ③ **README 引用的三段输出都是真机产物**：`--tui-demo` 的第 ④a（折叠 1 行）/④b（展开箱体 +
+  agents 箱体）/④c（`/tasks` 报告）就是上面那三块，`make tui-demo` 一条命令复现；
+  箱体逐行等宽是**断言**过的（宽度含中文按显示列算）。
+  ④ 键位与命令两条路都验：`tui-tasks` 注入 `\x14` 断言键层只置出 `TUI_REQ_TASKS`（不自己改状态）、
+  落地后展开/收起都正确；`e2e-tasks` 用管道喂真 REPL 验 `/tasks`、`/tasks open|toggle`、
+  非法参数报错与 `/help` 收录。
+  ⑤ 本轮顺带修掉两个**既有**小问题：`/sessions` 与 `/status` 两处 `tui_overlay_list` 的标题长度
+  写死了 44/46（真实字面量是 38/22 字节，多读的那截越界）→ 改成 `bufx_cstr_len`；
+  `view_agents_sync` 的快照/推送逻辑抽成 `view_panel_push`（任务块与 agents 面板共用一个写者）。
+  ⑥ 开发过程踩到的 uya 0.10 语言坑记在 §3 第 43 条（全局初始化式不能调函数、循环里的
+  `const = if …`、`match` 是保留字、`tui_puts` 按 cstr 量长度）。
 | `http401` | mock 回 401 + 错误体：agent 必须打印状态与错误体并退出 3 |
 | `max-steps` | **显式**给 `max_steps=3`：mock 每轮都给 tool_calls，agent 必须在 3 步后熔断退出 3 |
 | `unlimited-steps` | **默认不限步数**（这轮故意不设 `max_steps`，吃 `cfg_default()` 的 0）：mock 连给 **14 轮** tool_calls（超过旧默认 12）才给最终答案 —— agent 必须一路跑满 14 步、把 14 条 `tool_call_id` 全带回请求，并以 0 退出。默认值一旦改回 12，mock 只会被服务 12 次，这轮立刻失败 |
@@ -2097,6 +2245,17 @@ mock 上逐字段验收。换一台 `openai-responses` 网关可用时，零参�
 
 ## 7. 已知限制
 
+* **任务状态（P25）的边界**：
+  * 已结束的后台任务/子代理**没有时长**（`Job`/`Deleg` 都只记了开始时刻，没有结束时间戳；
+    要显示就得改它们的状态机）；运行中的才有秒数。
+  * 常驻块**只列运行中**的后台任务/子代理（跑完即隐，与 P15 的窗口同口径）；完整清单（含已结束的）
+    走 `/tasks`。子代理另有自己那块 P15 窗口，所以它不进任务箱体。
+  * 刷新是「推」出来的：每个工具结果、step 边界、`deleg` 的等待循环各推一次，TUI 另有 1Hz 心跳。
+    **滚动模式下单个长 step 期间秒数会停**（与 P15 的面板同一个限制）。
+  * 清单与后台任务/子代理表是**进程状态**（`--resume` 不回填，新进程从空开始）；
+    只有目标在盘上（`goal.json`，启动时重读）。
+  * 浮层打开时常驻块被浮层盖住（与 P18 的状态区同现象），关掉浮层即回来；块不做鼠标交互、
+    点击折叠、跨会话记忆（`/tasks close` 只影响当前进程）。
 * **回合运行中的界面命令（P23）**：只有**只读**的 `/status`、`/help`、`/sessions` 在
   **step 边界**当场派发（uya 0.10 没有函数指针，TUI 没法回调进 agent，所以做不到「按键
   当下」；一个 step = 一次 LLM 请求 + 它的工具调用，长流式/长工具期间仍要等这一步走完）。
