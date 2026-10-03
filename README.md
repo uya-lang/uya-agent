@@ -4,8 +4,8 @@
 多轮 loop 直到给出结论。46 个 `.uya` 文件，**不引入任何 C 代码、`@c_import` 或其它语言**，
 只依赖 Uya 语言与随编译器分发的标准库。
 
-**P0–P40 全部完成**，主线版本串 `p37-model`。本节之后按能力域分节，各节标题保留对应的阶段号
-（P0…P40）；设计取舍、踩坑记录与逐阶段验收分别见 §3 与 §6，代码地图见 §2。
+**P0–P41 全部完成**，主线版本串 `p37-model`。本节之后按能力域分节，各节标题保留对应的阶段号
+（P0…P41）；设计取舍、踩坑记录与逐阶段验收分别见 §3 与 §6，代码地图见 §2。
 
 真机转录节选（`--show-reasoning`；`✻ 思考` 交互模式下先在提示符那一行滚动、块结束才落成一行，
 非交互（管道）没有实时行，只有结算的那一行）：
@@ -43,7 +43,8 @@ $ ./build/uya-agent --show-reasoning "在当前工作目录写 p15-demo.txt，�
 * **界面**：真 TTY（termios raw + 行编辑器，UTF-8 按字符编辑、按显示列定位）；P17 起是纯 Uya
   写的全屏 TUI（对齐 opencode 观感），P18 的常驻状态区 + 思考实时行、P20/P24 脚注的统计行与
   `ctx` / `cpu` / `内存`、P25 的任务块、P27/P36 的 `/diff` 浮窗、P22 的终端标题；
-  P40 起子代理面板的状态行把最新消息**贴尾**显示（`…` + 最新一段）。
+  P40 起子代理面板的状态行把最新消息**贴尾**显示（`…` + 最新一段）；P41 起 `/worktree` 也是
+  底对齐选择框（七个动作一行一个，`finish`/`discard` 再过一道确认）。
 * **能力**：会话落盘可恢复（`--continue` / `--resume` / `/sessions`）；上下文管理（tool 结果
   超 8192 码点剪枝 + 压力超窗口 80% 自动压缩成 checkpoint）；技能发现 + `skill` 工具；
   `web_search`；子代理一族（`subagent` / `subagent_fork` / `list_agents` / `subagent_output` /
@@ -147,7 +148,8 @@ export UYA_SPLIT_C_DIR=$PWD/build/uyacache      # 多文件 C 缓存别丢在仓
 REPL / TUI 内的斜杠命令：
 `/help` `/status` `/tasks [open|close|toggle]` `/goal [<objective>|edit <objective>|pause|resume|clear]`
 `/compact` `/plan` `/permission [预设]` `/model [名字]` `/effort [档位]` `/workspace [目录]`
-`/worktree [on|off|start|status|finish|discard|list]` `/sessions` `/resume <id>` `/new`
+`/worktree [on|off|start|status|finish|discard|list]`（TUI 里裸命令开**动作选择框**，
+打开就回车 = `status`；`finish`/`discard` 选定后再过一道确认）`/sessions` `/resume <id>` `/new`
 `/continue` `/diff` `/exit`。
 
 环境变量：`UYA_AGENT_BASE_URL`、`UYA_AGENT_MODEL`、`UYA_AGENT_WORKSPACE`、
@@ -212,7 +214,7 @@ src/diffx.uya      行级 diff（只服务显示）：LCS 60×60、截断
 src/tasks.uya      任务状态 P25：四表折叠成折叠行 / 箱体 / `/tasks` 文本
 src/view.uya       显示层：标题/参数/后缀表、单行转录、思考行、agents 面板
 src/agent.uya      CLI、历史、主循环、工具分发、REPL、会话事件
-src/selftest.uya   mock LLM + 84 轮断言 + --probe
+src/selftest.uya   mock LLM + 126 轮断言 + --probe
 ```
 
 > 两处已知死代码（P14 起未清理）：`src/tools.uya` 的 `read_file`/`write_file`/`run_shell`、`agent.uya` 的 `dispatch_tool`（无调用者）。
@@ -520,6 +522,7 @@ src/selftest.uya   mock LLM + 84 轮断言 + --probe
 62. **每样式 SGR 参数槽只有 4 个**：`TUI_SGR256` 装不下 `38;5;N;48;5;M` 六个参数，背景色被静默吃掉；表尺寸 `TUI_ST_COUNT*4`→`*8`、循环 4→8、暂存缓冲 32→64，扩槽不改既有样式编码；与踩坑 2 同族。
 63. **自测「关掉 TUI」要关对开关**：`tui_set_headless(on)` 只置 `g_tui_headless`，而 `tui_active()` 看 `g_tui_on`，只有 `tui_headless_enable(on)` 两个都置；按模式分叉的断言先断言「真在这个模式里」。孪生：headless 轮须自开 `tty_sink_on = true`。
 64. **uya 的 `{ }` 块在生成的 C 里不是作用域**：同一函数里同名局部变量（`win_round` 的 A0 `pb` 与新 G 段 `pb`）在**平铺的 C 函数体**里直接 `redefinition of 'pb'`，而 `make build` 末尾只报「链接失败」（cc 的真错埋在编译日志里、`-o` 那步根本没跑到）——看到「链接失败」先去 `build/uyacache/**/<file>.c` 里找 cc 报错；同一 `.uya` 函数里的局部名当全局取（本轮一律 `p40_` 前缀）。
+65. **浮层开着就会盖住转录 → 「结果落进转录」的断言必须先关浮层**：headless 自测里 `tui_build()` 画的是一整帧，底对齐菜单正好压在转录最新那几行上，`tuis_screen_has("…")` 于是永远看不到刚写进去的 notice（P41 的 `tui-worktree` 轮实测：选 `on` 之后模式真翻了、文本也真写进了 `tui_add_notice`，断言照样红）。孪生：`tui_overlay_kind()` 在 `take` 之后回的是**结果**的 kind，所以「直接造一行 Buf 喂给 handler」之前必须先开一次浮层 —— 否则读到的是上一张浮层的 kind。
 
 ---
 
@@ -690,6 +693,8 @@ DEEPSEEK_API_KEY=sk-xxx ./build/uya-agent \
 | `sess-list` | 去重取最后一条、按 `lastActiveAt` 降序、8 档列宽退化、完整 id |
 | `tui-switch` | P39 换会话：清转录 → 回放 → 回执、脚注保留、滚动模式不动 |
 | `tui-sessions` | `/sessions` 浮层：箱体铺开、默认游标在最后一项、完整 id |
+| `tui-model` | P37 `/model`/`/effort` 浮层：按提供方分组、只列公布的档位、反解、非推理模型不开浮层 |
+| `tui-worktree` | P41 `/worktree` 动作选择浮层：标题/七个动作/✓ 标当前模式、反解只认动作行（「取消」不认）、默认游标 = `status`；`finish`/`discard` 选定不生效、先翻确认框（默认游标 = 取消）；**真 git**：确认前 worktree 目录与 phase 一个字节不动、确认后才合并 + 删除 |
 | `sessions-e2e` | `make e2e-sessions`：最新在最后一行、空标题落 `(无标题)` |
 | `resume-big-e2e` | `make e2e-resume-big`：~3 MiB 会话 + 残行，`--resume --dry-run` 退出码 0 |
 | `diff-render` | 纯函数：上下文、`… (省略 36 行)`、按显示列截断 |
@@ -717,7 +722,10 @@ DEEPSEEK_API_KEY=sk-xxx ./build/uya-agent \
 
 - 总闸门：`make selftest`（离线，含 `p30-check` 与全部轮次，SELFTEST PASS / 退出 0）、`make e2e`（真网关）。
 - 离线配套：`make check`（A1 类型检查）/ `build`（A2 产出 `build/uya-agent`）/ `codegen-audit` / `tui-selftest` / `shell-selftest` / `e2e-config-flags` / `e2e-api` / `e2e-steps` / `e2e-permission` / `e2e-sandbox` / `e2e-tasks` / `e2e-goal` / `e2e-sessions` / `e2e-resume-big` / `e2e-title` / `e2e-model` / `e2e-worktree` / `e2e-diff` / `diff-selftest` / `panel-selftest` / `e2e-ws`。
-- PTY 场景：`make p30-check`（`testdata/pty_drive.py --suite`，7 个场景）；`make tui-demo` 是排版基准，各阶段只差脚注版本串（`p22-tasks` … `p39-switch`）。
+- PTY 场景：`make p30-check`（`testdata/pty_drive.py --suite`，8 个场景；P41 那场 `worktree-menu` 走
+  两条入口 —— 命令面板里选中 `/worktree` 与裸 `/worktree` —— 到选择框 → ↓ 到 `finish` → 确认框 →
+  回车取消，`PTY_DUMP=1` 会把两张框打出来）；
+  `make tui-demo` 是排版基准，各阶段只差脚注版本串（`p22-tasks` … `p39-switch`）。
 - 只跑子集的开关：`UYA_SELFTEST_TUI_ONLY`、`UYA_SELFTEST_PERM_ONLY=1`（P21+P26）、`UYA_SELFTEST_GOAL_ONLY=1`（P29）、`UYA_SELFTEST_SHELL_ONLY=1`（P38）、`UYA_SELFTEST_PANEL_ONLY=1`（P15+P40，`make panel-selftest`）。
 - 探针：`make probe BASE=https://api.deepseek.com/v1` 期望 HTTP 401 + leaf 指纹。
 
@@ -745,11 +753,12 @@ DEEPSEEK_API_KEY=sk-xxx ./build/uya-agent \
 - P25：空态零影响逐字节；`--tui-demo` 第 ④a/④b/④c 屏是真机产物。
 - P26：`session-6918e8ef` 里模型在 plan 模式直接开工 = 「只有提示词没闸门」；闸门按现场补，把 `plan_blocks_write()` 改恒 `false` 该轮立刻红。
 - P28：真机 A/B：`ctrl+d` 45 s 仍活 → +2.0 s 退出；`esc` 后 `ctrl+d` +0.04 s；两次 `ctrl+c` +0.03 s。
-- P29/P33/P34/P35/P37/P38/P39/P40：见对应轮次与踩坑 50–64；`make selftest` / `make tui-selftest` 全绿、退出 0。
+- P29/P33/P34/P35/P37/P38/P39/P40/P41：见对应轮次与踩坑 50–65；`make selftest` / `make tui-selftest` 全绿、退出 0。
 - P40：子代理面板状态行改贴尾 —— 真机那一幕是两条 `send_message` 续跑的子代理收到一两百字节的催促，老口径整行从右边截断，屏幕上只剩 `Your output was still far too verbose: 325 lines / 68 KB…`，最新那半句 `…Do a second pass and cut it to under 25 KB.` 正好被切掉；80 列下实测 `│ ● running      53s · 0 · …KB). Do a second pass and cut it to under 25 KB. │`（78 列）、40 列收成 `…r 25 KB.`（38 列）。照 ①把 `view_ag_msg` 改回贴左重编 → G 段红 5 条；②把 `VIEW_AG_MSG_MAX` 改回 160 重编 → 200 列那条腿红 1 条。
+- P41：`/worktree` 补齐选择框。真 PTY（`worktree-menu`）实测：命令面板里选中 `/worktree`（ctrl+p → 敲名字 → 回车）62–65 ms 上框、裸 `/worktree` + 回车 62 ms，框里七行 + `✓ off`（当前模式关）都在，↓ 一次到 `finish`、回车 52–62 ms 翻出 `确认 finish？`（动作框同时消失）；确认框上再回车（默认游标「取消」）什么都没发生。`tui-worktree` 轮的**真 git** 那半：fixture 仓里 provision 出 worktree → 键盘走到 `finish` → 此刻目录与 `phase` 都还是 `READY`（没确认就动不了）→ 取消后主干上没有那个文件 → 把游标挪到 `finish` 那一行确认才 `merged … / removed worktree …`（目录消失、主干上出现文件、`phase=FINISHED`）。照 ①把 `wt_act_needs_confirm` 改成恒 `false` 重编 → 该轮红 18 条（确认框不再出现，`finish` 当场合并并删掉 worktree）；②把默认游标从 `WT_ACT_STATUS` 改成 0 重编 → 红 14 条（「打开就回车 = status」与后面整条键盘路径全崩）。
 - 其它：自测幂等（连跑两次都 PASS）；A1–A6 全部通过；技能与 `web_search`、自动压缩、后台任务、文件工具、DSH 零参数启动、跨进程会话恢复（记住 4271）都在真机验收过。
 
-> 分阶段验收记录的详细现场（P1–P40 的 before/after 命令与截图、真机对照实验、被自测当场抓住的自身缺陷）已在此压缩，原始描述保留在 §3 踩坑 33–64 与各版本提交说明中。
+> 分阶段验收记录的详细现场（P1–P41 的 before/after 命令与截图、真机对照实验、被自测当场抓住的自身缺陷）已在此压缩，原始描述保留在 §3 踩坑 33–65 与各版本提交说明中。
 
 ---
 
@@ -837,6 +846,14 @@ DEEPSEEK_API_KEY=sk-xxx ./build/uya-agent \
   `finish` 删掉就走 P34 的 fallback）；DSH preset 自动开是一把双刃剑 —— 真机
   `agent-presets.default=git-worktree` 会让**每个**新会话都建 worktree，不想要就 `--no-worktree`
   或 `/worktree off`。
+* **`/worktree` 的选择框与二次确认（P41）**：TUI 里裸 `/worktree` 是**底对齐选择框**（与
+  `/permission`、`/model`、`/effort` 同一套观感），七个动作一行一个、`✓` 标当前模式、游标
+  **默认停在 `status`** —— 所以「打开就回车」与 P37 的裸命令逐字节同效（老手感不变）；带参数的
+  `/worktree on|off|…` 仍是文本命令（与 `/model <名字>` 同一口径）。`finish` / `discard` 会**删掉
+  目录与分支**，所以选定不生效、先翻第二道确认框且游标默认停在「取消」（与 Full access 的风险
+  确认同一态度）—— 彩排过：只按回车不会把 worktree 合掉/删掉。动作的执行结果走**滚动模式同一份**
+  文本（`wt_cmd_run`），TUI 里以一条 notice 落进转录，所以两条路的措辞永远一致。这是工具层护栏，
+  不是安全边界：模型自己调 `worktree` 工具走的是同一条 `wt_tool_worktree`，不经过这道确认框。
 
 **访问模式、沙箱与 plan**
 
