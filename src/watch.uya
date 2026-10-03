@@ -1,0 +1,397 @@
+// src/watch.uya — P41：/watch 按需跟随子代理的实时过程消息
+//
+// 为什么要有这一层：子代理进程的 fd 1/2 指向 /dev/null，管道只承载**终态答复**
+// （P11 的口径），所以运行中从管道看不到任何过程消息 —— 面板上那列「已收输出行数」
+// 对普通 subagent 恒为 0。但子代理把每个事件都实时（无 stdio 缓冲）落进了自己的
+// 会话日志，**按需**读那份日志就有过程可看。
+//
+// 三条纪律：
+//   1) **不看不读**：没有 active 的 watch 时，watch_poll 一个字节都不读盘；
+//   2) **只读**：只读子代理的会话日志，绝不消费它的管道（subagent_output 的增量游标
+//      不受影响）；
+//   3) **纯函数渲染**：事件行 → 单行文本是纯函数（watch_render_event），自测才能拿
+//      fixture 逐字节断言；读盘与状态推进在 watch_poll 里。
+//
+// 实时粒度 = **事件**（步边界 / 工具调用前后 / 思考与正文落盘的那一刻），不是 token 级：
+// 单个长 step 内部没有新事件，那段时间屏幕上不会长出新行（面板上的秒数还在跳）。
+
+use libc.syscall;
+use libc.unistd;
+
+// 跟随缓冲区上限：超过就丢前缀（与 DELEG_BUF_MAX 同一量级的口径）
+export const WATCH_BUF_MAX: usize = 262144;
+
+// 单行预览的字节上限（只兜内存；可见列数在渲染时按显示列裁）
+const WATCH_PREVIEW_MAX: usize = 320;
+
+export struct Watch {
+    active: bool,
+    slot: usize,       // 被跟随的子代理在 DelegTable 里的下标
+    id: i32,           // 运行期编号（sub-N），用于回执文案与换人检测
+    path: Buf,         // 会话日志绝对路径
+    off: usize,        // 已读到的字节偏移
+    partial: Buf,      // 读到的**半行**（等下一个 \n 再渲染）
+    rendered: Buf,     // 渲染好的文本（\n 分隔），供浮层/转录取用
+    dropped: usize,    // 从 rendered 头部丢掉的字节数（trim 用；绝对长度 = dropped + rendered.len）
+    polled_ms: u64,    // 上次读盘的时刻（节流用）
+    ended: bool,       // 被跟随的子代理已进终态（补过结束行、停止轮询）
+}
+
+export fn watch_empty() Watch {
+    return Watch{
+        active: false,
+        slot: 0,
+        id: 0,
+        path: buf_empty(),
+        off: 0,
+        partial: buf_empty(),
+        rendered: buf_empty(),
+        dropped: 0,
+        polled_ms: 0,
+        ended: false,
+    };
+}
+
+export fn watch_free(w: &Watch) void {
+    buf_free(&w.path);
+    buf_free(&w.partial);
+    buf_free(&w.rendered);
+    w[0] = watch_empty();
+}
+
+// ============================================================
+// 纯函数：事件行 → 单行文本
+// ============================================================
+// 取"第一个非空行"（日志里的 content / reasoning 可能是多行）+ 折叠内部空白。
+// n 是字节数；找不到可显示的行返回 false。
+fn watch_first_line(text: &const byte, n: usize, out: &Buf) bool {
+    buf_reset(out);
+    var i: usize = 0;
+    while i < n {
+        // 跳过前导空白与换行
+        while i < n && (text[i] == 32 as byte || text[i] == 9 as byte
+            || text[i] == 10 as byte || text[i] == 13 as byte) {
+            i = i + 1;
+        }
+        if i >= n {
+            break;
+        }
+        var sp: bool = false;
+        const start: usize = i;
+        while i < n && text[i] != 10 as byte && text[i] != 13 as byte {
+            const c: byte = text[i];
+            if c == 32 as byte || c == 9 as byte {
+                sp = out.len > 0;
+            } else {
+                if sp {
+                    _ = buf_append_byte(out, 32);
+                    sp = false;
+                }
+                _ = buf_append_byte(out, c);
+                // 预览上限：贴尾保留最新的一段（与面板预览同口径）
+                if out.len > WATCH_PREVIEW_MAX {
+                    var drop: usize = out.len - WATCH_PREVIEW_MAX;
+                    while drop < out.len && tty_is_cont(out.ptr[drop]) {
+                        drop = drop + 1;
+                    }
+                    buf_drop_prefix(out, drop);
+                }
+            }
+            i = i + 1;
+        }
+        if out.len > 0 {
+            return true;
+        }
+        _ = start;
+    }
+    return out.len > 0;
+}
+
+// 从事件行里取 "key":"value"（日志格式已知，够用；转义交给 sess_json_str 的唯一实现）
+fn watch_field(line: &[byte], key: &const byte, out: &Buf) bool {
+    return sess_json_str(line, key, out);
+}
+
+// 事件行 → 一行可读文本。返回 false = 这条事件不显示（未知类型 / 空内容）。
+// out 里可能已经有多行（追加语义）：每次只 append 一条（含末尾换行）。
+export fn watch_render_event(line: &[byte], out: &Buf) bool {
+    var typ: Buf = buf_new(64);
+    defer { buf_free(&typ); }
+    if !sess_json_str(line, "type", &typ) {
+        return false;
+    }
+    var tmp: Buf = buf_new(1024);
+    defer { buf_free(&tmp); }
+    // step 是 JSON **数字**（`"step":1`），不是字符串 —— 用 sess_json_i64 取，
+    // 用 sess_json_str 会取不到（实测得到空串，屏幕上是 `[step ]`）。
+    const step: i64 = sess_json_i64(line, "step");
+
+    if sv_eq_cstr(&typ, "turn/start") || sv_eq_cstr(&typ, "turn/end") {
+        _ = buf_append_cstr(out, if sv_eq_cstr(&typ, "turn/start") {
+            "[turn 开始]\n" as &const byte
+        } else {
+            "[turn 结束]\n" as &const byte
+        });
+        return true;
+    }
+    if sv_eq_cstr(&typ, "step/start") {
+        _ = buf_append_cstr(out, "[step ");
+        _ = buf_append_i64(out, step);
+        _ = buf_append_cstr(out, "]\n");
+        return true;
+    }
+    if sv_eq_cstr(&typ, "step/end") {
+        return false;   // 步结束不必单列一行（下一步的开始就是信号）
+    }
+    if sv_eq_cstr(&typ, "tool/call") {
+        var name: Buf = buf_new(64);
+        defer { buf_free(&name); }
+        var args: Buf = buf_new(1024);
+        defer { buf_free(&args); }
+        _ = watch_field(line, "name", &name);
+        _ = watch_field(line, "arguments", &args);
+        _ = buf_append_cstr(out, "▸ ");
+        _ = buf_append(out, name.ptr, name.len);
+        if watch_first_line(args.ptr as &const byte, args.len, &tmp) {
+            _ = buf_append_byte(out, 32);
+            _ = buf_append(out, tmp.ptr, tmp.len);
+        }
+        _ = buf_append_byte(out, 10);
+        return true;
+    }
+    if sv_eq_cstr(&typ, "tool/result") {
+        var content: Buf = buf_new(1024);
+        defer { buf_free(&content); }
+        _ = watch_field(line, "content", &content);
+        _ = buf_append_cstr(out, "  ← ");
+        if !watch_first_line(content.ptr as &const byte, content.len, &tmp) {
+            _ = buf_append_cstr(out, "(空)");
+        } else {
+            _ = buf_append(out, tmp.ptr, tmp.len);
+        }
+        _ = buf_append_byte(out, 10);
+        return true;
+    }
+    if sv_eq_cstr(&typ, "assistant/reasoning") {
+        var rc: Buf = buf_new(2048);
+        defer { buf_free(&rc); }
+        if !watch_field(line, "reasoning_content", &rc) {
+            return false;
+        }
+        if !watch_first_line(rc.ptr as &const byte, rc.len, &tmp) {
+            return false;
+        }
+        _ = buf_append_cstr(out, "✻ 思考 · ");
+        _ = buf_append(out, tmp.ptr, tmp.len);
+        _ = buf_append_byte(out, 10);
+        return true;
+    }
+    if sv_eq_cstr(&typ, "assistant/message") {
+        var mbody: Buf = buf_new(2048);
+        defer { buf_free(&mbody); }
+        _ = watch_field(line, "content", &mbody);
+        if !watch_first_line(mbody.ptr as &const byte, mbody.len, &tmp) {
+            return false;   // 只有工具调用的助手消息：正文为空，交给 tool/call 那行呈现
+        }
+        _ = buf_append_cstr(out, "⏺ ");
+        _ = buf_append(out, tmp.ptr, tmp.len);
+        _ = buf_append_byte(out, 10);
+        return true;
+    }
+    if sv_eq_cstr(&typ, "subagent/start") {
+        var lb: Buf = buf_new(256);
+        defer { buf_free(&lb); }
+        _ = buf_append_cstr(out, "[started");
+        if watch_field(line, "label", &lb) && lb.len > 0 {
+            _ = buf_append_cstr(out, " · ");
+            _ = buf_append(out, lb.ptr, lb.len);
+        }
+        _ = buf_append_cstr(out, "]\n");
+        return true;
+    }
+    return false;   // 未知类型：静默跳过（--resume 的 reader 也是这个口径）
+}
+
+// ============================================================
+// 增量读：把读者已写进日志、我们还没看过的那一段渲染出来
+// ============================================================
+// 把 full 里未被 partial 消化完的整行逐条渲染进 rendered。
+// 返回渲染进去的新行数。
+// 渲染 w.partial 里 [from, to) 这一段（一条完整事件行）。
+//
+// 为什么要把这一段**拷进一个临时 Buf**：Uya 的 `ptr[a: b]` 切片在生成的 C 里
+// 下界被忽略（实测得到 `.ptr + 0`，于是每条事件都从缓冲区开头解出 `"type":"session"`）。
+// 拷一份最直白，也省得后续再踩同一个坑。
+fn watch_render_slice(w: &Watch, from: usize, to: usize, rendered: &Buf) bool {
+    var one: Buf = buf_new(to - from + 8);
+    defer { buf_free(&one); }
+    if !buf_append(&one, w.partial.ptr + from, to - from) {
+        return false;
+    }
+    return watch_render_event(one.ptr[0: one.len], rendered);
+}
+
+fn watch_consume_lines(w: &Watch) usize {
+    var added: usize = 0;
+    var from: usize = 0;
+    var scanned: usize = 0;
+    while true {
+        const nl: isize = bufx_find_byte(w.partial.ptr[0: w.partial.len], 10 as byte, from);
+        if nl < 0 {
+            break;
+        }
+        const end: usize = nl as usize;
+        scanned = scanned + 1;
+        if watch_render_slice(w, from, end, &w.rendered) {
+            added = added + 1;
+        }
+        from = end + 1;
+    }
+    if from > 0 {
+        buf_drop_prefix(&w.partial, from);
+    }
+    return added;
+}
+
+// 读盘：从 off 起把新增字节读进来，按整行渲染。返回本次新增的字节数。
+// 半行留在 partial 里，等下一次 poll 补齐（避免把写了一半的 JSON 当事件解析）。
+fn watch_read_more(w: &Watch) usize {
+    if w.path.len == 0 {
+        return 0;
+    }
+    var pz: Buf = buf_new(w.path.len + 1);
+    defer { buf_free(&pz); }
+    _ = buf_append(&pz, w.path.ptr, w.path.len);
+    _ = buf_append_byte(&pz, 0);
+    const fd: i32 = sys_open(pz.ptr as *const byte, O_RDONLY as i32, 0) catch {
+        return 0;
+    };
+    defer { _ = sys_close(fd) catch {}; }
+    _ = sys_lseek(fd, w.off as i64, SEEK_SET) catch {
+        return 0;
+    };
+    var tmp: [byte: 16384] = [0: 16384];
+    var got: usize = 0;
+    var guard: usize = 0;
+    while guard < 64 {
+        guard = guard + 1;
+        const n: isize = sys_read(fd, &tmp[0], 16384) catch { 0 as isize; };
+        if n <= 0 {
+            break;
+        }
+        if !buf_append(&w.partial, &tmp[0], n as usize) {
+            break;
+        }
+        got = got + (n as usize);
+    }
+    w.off = w.off + got;
+    return got;
+}
+
+// rendered 超上限就丢前缀（整行丢，不留半行）
+// rendered 超上限就丢前缀（整行丢，不留半行）。
+//
+// 丢前缀会让 rendered 里的**相对**下标失效 —— 调用方（滚动模式要按偏移只写新增的那一段）
+// 于是可能漏写或重写。所以这里把丢掉多少字节记进 w.dropped，对外一律用**绝对长度**
+// （watch_abs_len）：它只增不减，offset 才有意义。
+fn watch_trim(w: &Watch) void {
+    if w.rendered.len <= WATCH_BUF_MAX {
+        return;
+    }
+    var drop: usize = w.rendered.len - WATCH_BUF_MAX;
+    const nl: isize = bufx_find_byte(w.rendered.ptr[0: w.rendered.len], 10 as byte, drop);
+    if (nl as usize) < w.rendered.len {
+        drop = (nl as usize) + 1;
+    }
+    buf_drop_prefix(&w.rendered, drop);
+    w.dropped = w.dropped + drop;
+}
+
+// 到目前为止**累计**渲染出来的字节数（不含被丢掉的：含被丢掉的才是单调递增的绝对长度，
+// 滚动模式的「上次写到哪」用它做偏移）
+export fn watch_abs_len(w: &const Watch) usize {
+    return w.dropped + w.rendered.len;
+}
+
+// 从绝对偏移 from 起，把还没写出去的那一段取出来（渲染缓冲里实际还留着的部分）。
+// 返回空切片 = 没有新内容。被 trim 掉的部分**不再补写**（它已经在屏幕上滚过去了）。
+export fn watch_since(w: &const Watch, from: usize) &[byte] {
+    const abs: usize = watch_abs_len(w);
+    if from >= abs {
+        return &"x"[0: 0];
+    }
+    // 绝对偏移换算成 rendered 内的相对偏移；落在被丢掉的区间里就从 0 起
+    var rel: usize = 0;
+    if from > w.dropped {
+        rel = from - w.dropped;
+    }
+    if rel >= w.rendered.len {
+        return &"x"[0: 0];
+    }
+    return w.rendered.ptr[rel: w.rendered.len];
+}
+
+// 读一次（节流到 min_ms）。返回 true = 有新内容进 rendered。
+export fn watch_poll(w: &Watch, min_ms: u64) bool {
+    if !w.active {
+        return false;
+    }
+    const now: u64 = ua_now_ms();
+    if w.polled_ms > 0 && now > w.polled_ms && (now - w.polled_ms) < min_ms {
+        return false;
+    }
+    w.polled_ms = now;
+    const before: usize = watch_abs_len(w);
+    _ = watch_read_more(w);
+    _ = watch_consume_lines(w);
+    watch_trim(w);
+    return watch_abs_len(w) != before;
+}
+
+// 开始跟随：把路径与编号钉下来，清空缓冲。调用方负责先算好 path。
+export fn watch_begin(w: &Watch, slot: usize, id: i32, path: &const Buf) void {
+    watch_free(w);
+    w.active = true;
+    w.slot = slot;
+    w.id = id;
+    w.off = 0;
+    w.dropped = 0;
+    w.polled_ms = 0;
+    w.ended = false;
+    w.path = buf_new(path.len + 8);
+    if buf_valid(&w.path) {
+        _ = buf_append(&w.path, path.ptr, path.len);
+    }
+    w.partial = buf_new(8192);
+    w.rendered = buf_new(8192);
+}
+
+export fn watch_stop(w: &Watch) void {
+    watch_free(w);
+}
+
+// 重定位到同一子代理的**另一个**日志文件（ralph 换轮）：保留已渲染的文本，只换路径并从 0 读。
+export fn watch_retarget(w: &Watch, path: &const Buf) void {
+    if !w.active {
+        return;
+    }
+    buf_reset(&w.path);
+    _ = buf_append(&w.path, path.ptr, path.len);
+    w.off = 0;
+    buf_reset(&w.partial);
+    w.polled_ms = 0;
+    _ = buf_append_cstr(&w.rendered, "\n[轮次切换]\n");
+}
+
+// 子代理进终态：补一行结束语（只补一次），之后不再读盘。
+export fn watch_mark_ended(w: &Watch, status_name: &const byte, secs: u64) void {
+    if !w.active || w.ended {
+        return;
+    }
+    w.ended = true;
+    _ = buf_append_cstr(&w.rendered, "[已结束 · ");
+    _ = buf_append_cstr(&w.rendered, status_name);
+    _ = buf_append_byte(&w.rendered, 32);
+    _ = buf_append_u64(&w.rendered, secs);
+    _ = buf_append_cstr(&w.rendered, "s]\n");
+}
