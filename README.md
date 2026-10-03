@@ -330,7 +330,7 @@ src/tui.uya       全屏 TUI（P17/P18）：帧模型（行=段序列，逐行 d
 src/sigselftest.uya 信号层的自测轮次（sig-abi / sig-basic / sig-term-restore / sig-child-reset；
                   P32 起恢复序列多一段「关鼠标上报」，四种形态的长度跟着改；
                   P38 起「把终端还回去」这一步先临时忽略 SIGTTOU —— 后台进程组 `tcsetattr`
-                  会被内核发 SIGTTOU 停住整个进程组，见踩坑 55）
+                  会被内核发 SIGTTOU 停住整个进程组，见踩坑 60）
 src/shellselftest.uya bash 工具的**进程侧**自测轮次（P38：bash-detach / bash-stop-recover /
                   bash-kill-tree）—— 命令没有终端（stdin=/dev/null + 自成会话）、被停住就当场
                   收口、命令退出立刻返回且整组收得掉；全部离线、不落盘
@@ -358,7 +358,7 @@ src/fsx.uya       文件工具：路径解析（可选工作区守卫）、**rea
                   结果标记（[exit code: N] / [timed out after Nms] / [killed by signal: N] / [stopped by signal: N]）、DSH_* 环境注入；
                    P38：命令**没有终端**（stdin=/dev/null + `setsid()` 自成会话 —— 对齐 DSH 的
                    `stdio.stdin = "ignore"`）、中止/超时/被停住都按**进程组**收整棵子树、
-                   命令退出后收尾读管道非阻塞（子孙还替它开着管道也不会挂住工具，见踩坑 55）
+                   命令退出后收尾读管道非阻塞（子孙还替它开着管道也不会挂住工具，见踩坑 60）
 src/jobs.uya      后台任务表：注册/增量输出（保留内存尾部 1 MiB）/状态机（running/completed/killed）、
                   job_list / job_output（wait + timeout_ms）/ job_kill
 src/search.uya    glob / grep：rg 子进程（--files / --json）、VCS 目录排除、条数与行长上限
@@ -723,7 +723,7 @@ Messages API（`x-api-key` + `anthropic-version: 2023-06-01`，服务端工具 `
   只杀直接子进程会把 `make`/`sh`/工具子孙留在进程表里（真机现场遗留过一整条被停住的流水线）。
 * **子进程被停住 = 当场收口**（P38）：`waitpid` 带 `WUNTRACED`，一旦 `WIFSTOPPED` 就收掉整棵
   子树、按 `128+停止信号` 返回并打 `[stopped by signal: N]` + 一行说明 —— 以前这种情况工具会
-  一直显示「运行中」，只能靠用户 esc 或工具超时收口（见踩坑 55）。
+  一直显示「运行中」，只能靠用户 esc 或工具超时收口（见踩坑 60）。
 * **命令退出就立刻返回**（P38）：收尾那次读管道是**非阻塞**的。命令自己退出了、子孙还替它开着
   stdout 管道（`sleep 300 &`、daemon）时，阻塞读会一直等管道 EOF —— 那也是「bash 已经退出、
   工具还在运行中」。子孙不由工具负责（要管就用 `run_in_background` + `job_*`），
@@ -2433,7 +2433,7 @@ vLLM 等 OpenAI 兼容端点都一样稳。想升级成严格 `tool` 角色消�
     落到最后一项（`tui_overlay_sel_set`），否则「打开就回车」恢复的会是最旧的会话 ——
     这正是「顺序翻转」最容易漏掉的一半：**行序对了，选中项口径没跟着改**（与踩坑 50 同类）。
 
-55. **工具子进程继承了父进程的 TTY —— 命令树被 job control 停住，工具却一直显示「运行中」**（P38，
+60. **工具子进程继承了父进程的 TTY —— 命令树被 job control 停住，工具却一直显示「运行中」**（P38，
     用户报的「这个老是等很久，bash 都已经退出了」）。现场：TUI（p36 工作区）里一条
     `timeout 1200 make selftest 2>&1 | tail -30` 跑了 6 分 04 秒还没回来，用户 esc 才收口
     （结果是 `[aborted by user] / [killed by signal: 9] / [exit code: 137]`）。`ps` 一看：
@@ -2466,7 +2466,7 @@ vLLM 等 OpenAI 兼容端点都一样稳。想升级成严格 `tool` 角色消�
     **回归轮**：`make shell-selftest`（`bash-detach` / `bash-stop-recover` / `bash-kill-tree`，
     进整轮 `make selftest`）。真机验收：同一形状的命令在真 TTY 下跑完整 `make selftest`（见 §6）。
 
-56. **别把 make 的「挂起」当成「进程被停住」**（P38 排查时差点带偏）。`make: *** [Makefile:58:
+61. **别把 make 的「挂起」当成「进程被停住」**（P38 排查时差点带偏）。`make: *** [Makefile:58:
     selftest] 挂起` 里的「挂起」是 **`Hangup`（SIGHUP）**，不是「Stopped」：GNU make 打的是
     `strsignal(信号)`，而 `make.mo` 的 zh_CN 目录把 `Hangup` 译成「挂起」、把
     `Stopped` / `Stopped (tty input)` / `Stopped (tty output)` 译成「已停止 (信号)」/
@@ -3253,10 +3253,10 @@ mock 上逐字段验收。换一台 `openai-responses` 网关可用时，零参�
     `e2e-resume-big` 与 `sess-meta-big` 都立刻失败（前者 139、后者直接崩）——
     两条腿都真的抓得到这个缺陷，不是「恰好绿」。
 
-* **P38 的验收记录（2026-10-03，`p38-tty`，对应踩坑 55/56）**：修的是「工具子进程继承了 TTY →
+* **P38 的验收记录（2026-10-03，`p38-tty`，对应踩坑 60/61）**：修的是「工具子进程继承了 TTY →
   命令树被 job control 停住 → 工具一直显示「运行中」」这条真实的挂起（现象 / 根因 / 对照实验
-  见踩坑 55）。（编号说明：P36「/diff 背景色」与 P37 在另外两条线上，这里按顺序占 P38；
-  踩坑号同理从 55 起。）验收都落在**真 TTY** 上（用 `script -qec … /dev/null` 起一个 pty 当控制终端，
+  见踩坑 60）。（编号说明：P36「/diff 背景色」、P37「模型选择 + Git worktree」接在 P35 后面，
+  这里占 P38；踩坑号同理从 60 起。）验收都落在**真 TTY** 上（用 `script -qec … /dev/null` 起一个 pty 当控制终端，
   这样 selftest 的 sig 轮才真的会去碰控制终端 —— 也就是当初出事的那个条件）。
   * **真机现场（用户报的）**：TUI 里 `timeout 1200 make selftest 2>&1 | tail -30` 跑了
     **6 分 04 秒**还没回来，用户 esc 才收口（`[aborted by user] / [killed by signal: 9] /
@@ -3283,7 +3283,7 @@ mock 上逐字段验收。换一台 `openai-responses` 网关可用时，零参�
 
 ## 7. 已知限制
 
-* **bash 命令没有终端（P38）**：stdin 是 `/dev/null`、子进程自成会话 —— 这是有意的（见踩坑 55），
+* **bash 命令没有终端（P38）**：stdin 是 `/dev/null`、子进程自成会话 —— 这是有意的（见踩坑 60），
   代价是需要交互的命令（`git` 要凭据、`vi`、`ssh` 要密码、`apt` 要确认）会**当场失败**而不是
   等着用户输入。要真 PTY 就自己套 `script -qec "…" /dev/null`（`script` 会 setsid +
   TIOCSCTTY，在「命令没有终端」的前提下照样可用）。另外命令**退出就返回**：它留下的后台子孙
