@@ -92,6 +92,9 @@ export struct Config {
     // P17：全屏 TUI
     tui: bool,                // --tui / --no-tui（TTY 交互模式默认开）
     tui_src: u8,              // 0 默认 / 1 env / 2 cli
+    // P22：终端标题（TTY title）—— 交互模式下把窗口/标签页标题写成当前会话标题
+    title: bool,              // --title / --no-title（交互模式默认开）
+    title_src: u8,            // 0 默认 / 2 env / 3 cli（与 cfg_src_name 同口径）
     tui_headless: bool,       // 自测用：不碰终端，直接把帧写进给定 fd
     tui_demo: bool,           // --tui-demo：渲染一帧示例屏就退出（诊断/文档）
     tui_cols: usize,          // headless 画布宽（自测用）
@@ -142,6 +145,8 @@ fn cfg_default() Config {
         compat_fold: false,
         tui: true,
         tui_src: 0,
+        title: true,
+        title_src: 0,
         tui_headless: false,
         tui_demo: false,
         tui_cols: 160,     // --tui-demo 默认画布：够放下完整的统计行（约 120 列）
@@ -221,6 +226,12 @@ fn cfg_free(c: &Config) void {
 // 一旦 DSH 设置 / 环境变量 / 命令行显式声明了协议，就完全不协商 —— 声明即权威。
 // ============================================================
 export const API_SRC_DEFAULT: u8 = 0;
+
+// P22：终端标题开关的来源码。取值刻意与 `cfg_src_name` 同口径（1=dsh-settings / 2=env / 3=cli），
+// 而不是跟 `tui_src` 那套 1=env / 2=cli —— `--print-config` 打的就是 `cfg_src_name`。
+// 标题没有 DSH 设置这一路，所以只用 0 / 2 / 3。
+const TITLE_SRC_ENV: u8 = 2;
+const TITLE_SRC_CLI: u8 = 3;
 
 var g_api_probe_done: bool = false;
 var g_api_resolved: u8 = LLM_STYLE_RESPONSES;
@@ -1036,41 +1047,154 @@ fn agent_default_home(cfg: &const Config, out: &Buf) bool {
     return buf_append_cstr(out, "/.uya-agent");
 }
 
-fn agent_log_user(text: &const byte, n: usize, steer: bool) void {
-    if !g_sess.save || n == 0 {
+// ============================================================
+// P22：终端标题（TTY title）
+//
+// 「当前会话的标题」只有一份：`g_sess.title`。它的三个写入点 —— 首条用户消息的兜底派生、
+// 会话日志里的 `session/title` 事件（--continue / --resume / /resume）、--resume-dsh
+// 导入的 DSH 标题 —— 全都汇到 `agent_title_apply()`：有标题就上标题，没有就上
+// `uya-agent · <工作目录名>`。清洗与 OSC 2 编码在 src/tty.uya（唯一实现）；
+// 这里只管「标题是什么」与「什么时候同步」。
+// 只有交互模式（TUI / 滚动 REPL）才打开过标题通道，非交互路径 `tty_title_set` 是空操作。
+// ============================================================
+
+var g_title_base: Buf = Buf{ ptr: null, len: 0, cap: 0 };
+var g_title_base_ready: bool = false;
+
+// 压掉尾部 '/' 之后取最后一段（工作目录名）
+fn agent_path_basename_into(out: &Buf, p: &const byte, n: usize) usize {
+    buf_reset(out);
+    var end: usize = n;
+    while end > 0 && p[end - 1] == 47 as byte {
+        end = end - 1;
+    }
+    var start: usize = end;
+    while start > 0 && p[start - 1] != 47 as byte {
+        start = start - 1;
+    }
+    _ = buf_append(out, p + start, end - start);
+    return out.len;
+}
+
+// 还没有标题时的基标题：`uya-agent · <工作目录名>`（目录名取不到就只留 uya-agent）
+fn agent_title_base_into(out: &Buf, ws: &const byte, n: usize) void {
+    buf_reset(out);
+    _ = buf_append_cstr(out, "uya-agent");
+    var base: Buf = buf_new(280);
+    defer { buf_free(&base); }
+    if agent_path_basename_into(&base, ws, n) > 0 {
+        _ = buf_append_cstr(out, " · ");
+        _ = buf_append(out, base.ptr as &const byte, base.len);
+    }
+}
+
+fn agent_title_base_set(cfg: &const Config) void {
+    if !buf_valid(&g_title_base) {
+        g_title_base = buf_new(320);
+    }
+    agent_title_base_into(&g_title_base, cfg.workspace.ptr as &const byte, cfg.workspace.len);
+    g_title_base_ready = true;
+}
+
+// 把「当前会话标题」同步到终端（标题通道没开 / 清洗后为空时，tty 层自己会跳过）
+fn agent_title_apply() void {
+    if g_sess.title.len > 0 {
+        tty_title_set(g_sess.title.ptr as &const byte, g_sess.title.len);
         return;
     }
-    var ev: Buf = buf_new(n + 256);
-    defer { buf_free(&ev); }
-    if !sess_begin(&g_sess, "user/message", &ev) {
+    if g_title_base_ready {
+        tty_title_set(g_title_base.ptr as &const byte, g_title_base.len);
         return;
     }
-    _ = buf_append_cstr(&ev, "{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":");
-    if !jw_str_into(&ev, text, n) {
+    tty_title_set("uya-agent" as &const byte, 10);
+}
+
+// 首条用户消息 → 兜底标题（对齐 DSH：前 5 个词、≤40 B、清洗 + 空白折叠、按码点边界截断）。
+// 清洗后为空就**不**落标题，留给后面真正有内容的输入（DSH 的空输入等后来者）。
+// 只写内存里的 `g_sess.title`（`--no-save` 时同样要派生：终端标题不依赖落盘）；
+// 落 `session/title` 事件由调用方按 `g_sess.save` 决定，且**必须排在 user/message 之后**
+// （DSH 的事件顺序就是这样：title 事件引用它据以生成的 message seq）。
+// 返回 true = 这次真的派生了标题。
+fn agent_title_derive(text: &const byte, n: usize) bool {
+    if g_sess.title.len > 0 || n == 0 {
+        return false;
+    }
+    var t: Buf = buf_new(TTY_TITLE_FALLBACK_BYTES + 16);
+    defer { buf_free(&t); }
+    _ = tty_title_fallback_into(&t, text, n, TTY_TITLE_FALLBACK_WORDS, TTY_TITLE_FALLBACK_BYTES);
+    if t.len == 0 {
+        return false;
+    }
+    buf_reset(&g_sess.title);
+    _ = buf_append(&g_sess.title, t.ptr as &const byte, t.len);
+    return true;
+}
+
+// 落一条标题事件（DSH 也有 session/title）
+fn agent_title_log_event() void {
+    var tev: Buf = buf_new(256);
+    defer { buf_free(&tev); }
+    if sess_begin(&g_sess, "session/title", &tev) {
+        _ = buf_append_cstr(&tev, "{\"title\":");
+        _ = jw_str_into(&tev, g_sess.title.ptr as &const byte, g_sess.title.len);
+        _ = buf_append_cstr(&tev, ",\"source\":{\"kind\":\"fallback\"}}");
+        _ = sess_end(&g_sess, &tev);
+    }
+}
+
+// --resume-dsh：把 DSH 会话的标题接过来当本会话的标题。
+// 事件里的 source.kind 记 `user`：DSH 的三种 kind（fallback / provider / user）中，
+// 「显式给定、且钉住不再自动改写」的那一种就是 user —— 这条标题来自用户显式导入的会话，
+// 不是我们自动推导的，也不该被后面第一条消息改写（`agent_title_derive` 只在标题为空时动手）。
+fn agent_title_adopt_imported(t: &const Buf) void {
+    if t.len == 0 {
         return;
     }
-    if steer {
-        _ = buf_append_cstr(&ev, "}],\"source\":{\"kind\":\"steer\"}}");
-    } else {
-        _ = buf_append_cstr(&ev, "}],\"source\":{\"kind\":\"user\"}}");
+    var clean: Buf = buf_new(TTY_TITLE_MAX_BYTES + 16);
+    defer { buf_free(&clean); }
+    _ = tty_title_clean_into(&clean, t.ptr as &const byte, t.len, TTY_TITLE_MAX_BYTES);
+    if clean.len == 0 {
+        return;
     }
-    _ = sess_end(&g_sess, &ev);
-    if g_sess.title.len == 0 {
-        var t: usize = n;
-        if t > 40 {
-            t = 40;
-        }
-        _ = buf_append(&g_sess.title, text, t);
-        // 顺便落一条标题事件（DSH 也有 session/title）
-        var tev: Buf = buf_new(256);
+    buf_reset(&g_sess.title);
+    _ = buf_append(&g_sess.title, clean.ptr as &const byte, clean.len);
+    if g_sess.save {
+        var tev: Buf = buf_new(320);
         defer { buf_free(&tev); }
         if sess_begin(&g_sess, "session/title", &tev) {
             _ = buf_append_cstr(&tev, "{\"title\":");
             _ = jw_str_into(&tev, g_sess.title.ptr as &const byte, g_sess.title.len);
-            _ = buf_append_cstr(&tev, ",\"source\":{\"kind\":\"fallback\"}}");
+            _ = buf_append_cstr(&tev, ",\"source\":{\"kind\":\"user\"}}");
             _ = sess_end(&g_sess, &tev);
         }
     }
+    agent_title_apply();
+}
+
+fn agent_log_user(text: &const byte, n: usize, steer: bool) void {
+    if n == 0 {
+        return;
+    }
+    const fresh: bool = agent_title_derive(text, n);
+    if g_sess.save {
+        var ev: Buf = buf_new(n + 256);
+        defer { buf_free(&ev); }
+        if sess_begin(&g_sess, "user/message", &ev) {
+            _ = buf_append_cstr(&ev, "{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":");
+            if jw_str_into(&ev, text, n) {
+                if steer {
+                    _ = buf_append_cstr(&ev, "}],\"source\":{\"kind\":\"steer\"}}");
+                } else {
+                    _ = buf_append_cstr(&ev, "}],\"source\":{\"kind\":\"user\"}}");
+                }
+                _ = sess_end(&g_sess, &ev);
+            }
+        }
+        if fresh && g_sess.title.len > 0 {
+            agent_title_log_event();
+        }
+    }
+    agent_title_apply();
 }
 
 fn agent_log_assistant(step: i32, o: &const ChatOut, t: u64) void {
@@ -1704,6 +1828,14 @@ export fn agent_session_open(cfg: &const Config, h: &History, resume_path: &cons
         var next_seq: i64 = 0;
         const n: i32 = agent_hist_from_log(cfg, h, &rpath, &next_seq, true);
         if n > 0 {
+            // P22：`agent_hist_from_log` 顺带把日志里的 `session/title` 恢复进了 `g_sess.title`，
+            // 但下面 `sess_open` 会把 SessionLog 整个重新初始化（`l.title` 重新分配 = 清空）。
+            // 先把标题抄出来，sess_open 之后再放回去 —— 否则 `--continue` 的会话标题每次都丢。
+            var kept_title: Buf = buf_new(g_sess.title.len + 8);
+            defer { buf_free(&kept_title); }
+            if g_sess.title.len > 0 {
+                _ = buf_append(&kept_title, g_sess.title.ptr as &const byte, g_sess.title.len);
+            }
             const trimmed: usize = hist_trim_incomplete_tail(h);
             if trimmed > 0 {
                 out_err("[session] 丢弃了 ");
@@ -1740,6 +1872,11 @@ export fn agent_session_open(cfg: &const Config, h: &History, resume_path: &cons
                 false
             ) {
                 return false;
+            }
+            // P22：把日志里恢复出来的标题放回（sess_open 刚把它清掉）
+            if kept_title.len > 0 {
+                buf_reset(&g_sess.title);
+                _ = buf_append(&g_sess.title, kept_title.ptr as &const byte, kept_title.len);
             }
             return true;
         }
@@ -2798,6 +2935,11 @@ fn dispatch_tool_body(cfg: &const Config, name: &const Buf, args_json: &const Bu
         wf_tool_workflow(cfg, &arg_val, out);
     } else {
         _ = buf_append_cstr(out, "error: unknown tool");
+        return;
+    }
+    // P22：任务块的目标段吃的是内存投影 —— goal 工具刚写过盘，这里立刻重读一次
+    if sv_eq_cstr(name, "create_goal") || sv_eq_cstr(name, "get_goal") || sv_eq_cstr(name, "update_goal") {
+        agent_goal_reload(cfg);
     }
 }
 
@@ -3059,6 +3201,7 @@ fn agent_finish_step(cfg: &const Config, arena: &Arena, h: &History, step: i32, 
                 agent_bound_tool_call(cfg, h, step, &o.calls[ci].id, &o.calls[ci].name, &o.calls[ci].args);
                 dispatch_tool_body(cfg, &o.calls[ci].name, &o.calls[ci].args, arena, &res_f);
                 view_end_tool(arena, &o.calls[ci].name, &o.calls[ci].args, &res_f);
+                agent_tasks_sync();
                 agent_bound_tool_result(cfg, h, step, &o.calls[ci].id, &res_f);
                 _ = buf_append_cstr(&results, "[tool ");
                 _ = buf_append(&results, o.calls[ci].name.ptr, o.calls[ci].name.len);
@@ -3136,6 +3279,7 @@ fn agent_finish_step(cfg: &const Config, arena: &Arena, h: &History, step: i32, 
             agent_bound_tool_call(cfg, h, step, &o.calls[ci].id, &o.calls[ci].name, &o.calls[ci].args);
             dispatch_tool_body(cfg, &o.calls[ci].name, &o.calls[ci].args, arena, &res);
             view_end_tool(arena, &o.calls[ci].name, &o.calls[ci].args, &res);
+            agent_tasks_sync();
             agent_bound_tool_result(cfg, h, step, &o.calls[ci].id, &res);
             if res.len == 0 {
                 // 空结果在线上必须是 "(no output)"（对齐 DSH）
@@ -3353,11 +3497,14 @@ fn agent_turn_loop_inner(cfg: &const Config, h: &History) i32 {
         step = step + 1;
         // DSH steer 语义：step 边界领取「运行期间用户敲进来的输入」，作为普通 user 消息
         agent_claim_steer(cfg, h);
+        // P23：运行中在命令面板里选中的只读命令（/status 等）也在这一步派发 ——
+        // 以前面板结果只有主循环会取，而主循环整个回合都不跑，屏幕上就是「没反应」。
+        agent_tui_poll_pending_cmd(cfg, h);
         // P9：step 边界测压，必要时压缩上下文（DSH 也是在 request derivation 之前做）
         if g_compact_enabled {
             _ = agent_maybe_compact(cfg, h, step, false);
         }
-        // P22：plan 模式变了就在这一步补推一份新快照（放在压缩之后：别刚推就被折进 checkpoint）
+        // P26：plan 模式变了就在这一步补推一份新快照（放在压缩之后：别刚推就被折进 checkpoint）
         agent_plan_snapshot_sync(cfg, h);
         agent_bound_step_start(cfg, h, step);
         if g_interactive {
@@ -3630,7 +3777,10 @@ fn agent_history_begin(cfg: &const Config, h: &History, first: &const Buf) bool 
             if si >= DSHS_MAX {
                 return false;
             }
-            const n: usize = dshs_import(cfg, &ss.items[si], h);
+            // P22：DSH 的会话标题在日志的 session/title 事件里，导入时一并取出来
+            var dsh_title: Buf = buf_new(512);
+            defer { buf_free(&dsh_title); }
+            const n: usize = dshs_import(cfg, &ss.items[si], h, &dsh_title);
             out_err("[dsh-session] 从 ");
             out_err_bytes(ss.items[si].id.ptr, ss.items[si].id.len);
             out_err(" 导入了 ");
@@ -3643,6 +3793,8 @@ fn agent_history_begin(cfg: &const Config, h: &History, first: &const Buf) bool 
                 if !agent_session_create(cfg) {
                     return false;
                 }
+                // P22：标题要在 sess_open **之后**落（sess_open 会把 l.title 重置成空）
+                agent_title_adopt_imported(&dsh_title);
                 if first.len > 0 {
                     _ = hist_push(h, ROLE_USER, first.ptr as &const byte, first.len);
                 }
@@ -4168,6 +4320,8 @@ fn print_usage() void {
     out_err("  --tls-verify=MODE   chain（默认）| pin | none\n");
     out_err("  --tls-pin HEX       pin 模式下要求的 leaf 证书 SHA-256（小写 hex）\n");
     out_err("  --tui               全屏 TUI（TTY 交互模式默认）；--no-tui 退回滚动转录\n");
+    out_err("  --title             交互模式下把终端标题写成当前会话标题（默认开）\n");
+    out_err("  --no-title          不改终端标题（UYA_AGENT_TITLE=0 同口径）\n");
     out_err("  --color=MODE        auto（默认）| always | never | 16 | 256；NO_COLOR 也认\n");
     out_err("  --tui-demo          打印 TUI 的 home/chat 两屏纯文本快照后退出\n");
     out_err("  --quiet             不打印工具调用内容块（回退到旧的最小转录）\n");
@@ -4179,7 +4333,7 @@ fn print_usage() void {
     out_err("  UYA_AGENT_API（openai-responses | openai-completions）/ UYA_AGENT_REASONING_EFFORT\n");
     out_err("  UYA_AGENT_PERMISSION（read-only | workspace-write | danger-full-access）/ UYA_AGENT_SANDBOX=0\n");
     out_err("  UYA_AGENT_BWRAP（bwrap 路径）\n");
-    out_err("  UYA_AGENT_TUI=0|1（全屏 TUI 开关）/ NO_COLOR\n");
+    out_err("  UYA_AGENT_TUI=0|1（全屏 TUI 开关）/ UYA_AGENT_TITLE=0|1（终端标题开关）/ NO_COLOR\n");
     out_err("  UYA_AGENT_API_KEY 或 DEEPSEEK_API_KEY 或 OPENAI_API_KEY\n");
 }
 
@@ -4314,12 +4468,23 @@ fn parse_steps_arg(p: &byte, label: &const byte) i32 {
 // P3 交互模式：提示符 + 流式 + Ctrl-C 中断 + 运行中输入 + 继续
 // ============================================================
 
-// 领取运行期间用户输入的文本（DSH steer）：每条作为独立的 user 消息
+// 领取运行期间用户输入的文本（DSH steer）：每条作为独立的 user 消息。
+// 例外：行首是 `/` 的**只读命令**（/status、/help、/sessions）按命令派发 ——
+// 与滚动模式在 REPL 循环里那句「运行中输入的 slash 命令也按命令走」同一个口径，
+// 用户并不知道回合是否已经结束。不安全的命令（会 hist_free / 改写历史）仍旧按文本走。
 fn agent_claim_steer(cfg: &const Config, h: &History) void {
     var line: Buf = buf_new(4096);
     defer { buf_free(&line); }
     while inbox_pop(&g_steer, &line) {
         if line.len == 0 {
+            continue;
+        }
+        if line.ptr[0] == 47 as byte && agent_tui_cmd_safe(&line) {
+            if cfg.tui && tui_active() {
+                _ = agent_tui_command(cfg, h, &line);
+            } else {
+                _ = agent_repl_command(cfg, h, &line);
+            }
             continue;
         }
         var pushed: bool = hist_push(h, ROLE_USER, line.ptr as &const byte, line.len);
@@ -4337,16 +4502,28 @@ fn agent_claim_steer(cfg: &const Config, h: &History) void {
 }
 
 // ============================================================
-// P15：子代理窗口面板（输入行上方的 2 行/个、最多 4 个的带边框窗口）
+// P15/P22：输入行上方的面板块（子代理窗口 + 任务状态块）
 //
-// 面板内容的**生成**在 view（`view_agents_text`），多行块的**擦除/重画**在 tty
-// （`tty_block_*`），这里只负责「什么时候刷新」：
+// 面板内容的**生成**在 view（`view_agents_text`）与 tasks（`tasks_panel_text`），
+// 多行块的**擦除/重画**在 tty（`tty_block_*`），这里只负责「什么时候刷新」：
 //   * 起一个子代理、某个子代理跑完 → deleg 自己调 deleg_agents_refresh（立刻生效）；
 //   * 长等待期间（前台 subagent / subagent_output wait）→ deleg 的等待循环每秒刷一次；
-//   * step 边界 → agent_agents_tick（下面）。
+//   * 每个工具结果之后 → agent_tasks_sync（下面）；
+//   * step 边界 → agent_agents_tick（下面）；TUI 另有 1Hz 心跳（tui_tick → tasks_tick）。
 // 刻意不用回调：uya 0.10 没有函数指针，只能「上层推、下层画」。
 // ============================================================
 var g_agents_tick_ms: u64 = 0;
+
+// 工具结果之后立刻刷一次：后台任务/子代理/清单都可能刚变过
+fn agent_tasks_sync() void {
+    tasks_poll();
+    _ = tasks_panel_sync();
+}
+
+// 会话目标：盘上 goal.json 的内存投影（任务块显示用）
+fn agent_goal_reload(cfg: &const Config) void {
+    tasks_goal_reload(cfg);
+}
 
 // 秒数 1Hz 刷新 + 面板内容变化检测（内容没变时 view 侧一个字节都不写）
 export fn agent_agents_tick() void {
@@ -4355,13 +4532,13 @@ export fn agent_agents_tick() void {
         return;
     }
     g_agents_tick_ms = now;
-    _ = view_agents_sync(&g_deleg);
+    agent_tasks_sync();
 }
 
 // 强制刷一次（回合结束 / 退出前兜底；不受 1 秒节流限制）
 export fn agent_agents_tick_force() void {
     g_agents_tick_ms = ua_now_ms();
-    _ = view_agents_sync(&g_deleg);
+    agent_tasks_sync();
 }
 
 // 提示符里的子代理扇出摘要：运行中时把 `● 2 agents` 挂到 [step N] 后面
@@ -4400,6 +4577,7 @@ fn agent_repl_help() void {
     tty_puts(&tty_ui, 2, "  /help      显示本帮助\n");
     tty_puts(&tty_ui, 2, "  /continue  不再输入新内容，带着历史再跑一轮\n");
     tty_puts(&tty_ui, 2, "  /status    打印当前配置与历史条数\n");
+    tty_puts(&tty_ui, 2, "  /tasks     任务状态进度（清单/后台任务/子代理/目标）；/tasks open|close 切常驻块\n");
     tty_puts(&tty_ui, 2, "  /compact   立即压缩上下文\n");
     tty_puts(&tty_ui, 2, "  /plan      切换 plan 模式\n");
     tty_puts(&tty_ui, 2, "  /permission [预设]  查看/切换访问模式（read-only|workspace-write|danger-full-access）\n");
@@ -4414,7 +4592,7 @@ fn agent_repl_help() void {
 // /status 用的占用条宽度（字符格）
 const STATS_BAR_CELLS: i64 = 20;
 
-// /status 的统计 + 上下文 + %cpu 块（TUI 浮层与滚动模式共用）。
+// /status 的统计 + 上下文 + cpu/内存 块（TUI 浮层与滚动模式共用）。
 // 注意这里会顺带把增量基准锚一次（agent_ctx_used 的副作用），所以它是「读+顺手校准」。
 fn agent_status_stats_block(cfg: &const Config, h: &const History, out: &Buf) void {
     _ = buf_append_cstr(out, "--- 统计（整个会话，含 --resume 前的部分）---\n");
@@ -4429,7 +4607,7 @@ fn agent_status_stats_block(cfg: &const Config, h: &const History, out: &Buf) vo
     } else {
         _ = buf_append_cstr(out, "上下文已用   还没有可用样本（第一次请求返回后才有）\n");
     }
-    _ = buf_append_cstr(out, "--- 进程 ---\n%cpu        ");
+    _ = buf_append_cstr(out, "--- 进程 ---\ncpu         ");
     if procx_cpu_pct() >= 0 {
         _ = buf_append_u64(out, procx_cpu_pct() as u64);
         _ = buf_append_cstr(out, "%（uya-agent 进程 ");
@@ -4445,6 +4623,24 @@ fn agent_status_stats_block(cfg: &const Config, h: &const History, out: &Buf) vo
         _ = buf_append_cstr(out, "不可用（读不到 /proc/<pid>/stat）");
     } else {
         _ = buf_append_cstr(out, "采样中（全屏 TUI 每 1s 采一次；滚动模式不采样）");
+    }
+    _ = buf_append_byte(out, 10);
+    // P24：内存合计（与 cpu 同一次走查；口径 PSS / RSS 由 procx 探明）
+    _ = buf_append_cstr(out, "内存        ");
+    var mem: Buf = buf_new(32);
+    defer { buf_free(&mem); }
+    if procx_mem_kb() >= 0 && procx_fmt_mem_kb(&mem, procx_mem_kb()) {
+        const kind: &const byte = procx_mem_kind_name();
+        _ = buf_append(out, mem.ptr, mem.len);
+        _ = buf_append_cstr(out, "（");
+        _ = buf_append(out, kind, bufx_cstr_len(kind));
+        _ = buf_append_cstr(out, " 合计 · uya-agent 进程 ");
+        _ = buf_append_u64(out, procx_proc_count() as u64);
+        _ = buf_append_cstr(out, " 个 · 5s 采样）");
+    } else if procx_failed() {
+        _ = buf_append_cstr(out, "不可用（读不到 /proc/<pid>/smaps_rollup 与 status）");
+    } else {
+        _ = buf_append_cstr(out, "采样中（全屏 TUI 每 5s 采一次；滚动模式不采样）");
     }
     _ = buf_append_byte(out, 10);
     _ = buf_append_cstr(out, "version    ");
@@ -4510,6 +4706,74 @@ fn agent_repl_status(cfg: &const Config, h: &const History) void {
     tty_write(&tty_ui, 2, blk.ptr as &const byte, blk.len);
 }
 
+// ============================================================
+// P22：/tasks —— 任务状态进度（todo 清单 / 后台任务 / 子代理 / 会话目标）
+//
+//   * 裸 /tasks      → TUI 开浮层、滚动模式打印报告（内容同源：tasks_report）
+//   * /tasks open|close|toggle → 只切「常驻块」的展开态
+//   * TUI 里 ctrl+t 与 /tasks toggle 同效
+// ============================================================
+
+// 报告只认「现取」的四张表：先 poll 一次（job/deleg 的状态与增量输出），再把 goal.json 读一遍
+fn agent_tasks_refresh(cfg: &const Config) void {
+    tasks_init();
+    agent_goal_reload(cfg);
+    tasks_poll();
+}
+
+fn agent_tasks_report(cfg: &const Config, out: &Buf) void {
+    agent_tasks_refresh(cfg);
+    tasks_report_globals(tasks_report_width(), out);
+}
+
+// 滚动模式：直接打进转录（与 /status 同一条路）
+fn agent_repl_tasks(cfg: &const Config) void {
+    var txt: Buf = buf_new(16384);
+    defer { buf_free(&txt); }
+    agent_tasks_report(cfg, &txt);
+    tty_puts(&tty_ui, 2, "--- 任务 ---\n");
+    tty_write(&tty_ui, 2, txt.ptr as &const byte, txt.len);
+}
+
+// /tasks <open|close|toggle>：只动常驻块的展开态（TUI 的 ctrl+t 走同一个函数）
+fn agent_tasks_set_cmd(cfg: &const Config, arg: &const byte, alen: usize) void {
+    var nm: Buf = buf_new(32);
+    defer { buf_free(&nm); }
+    var s0: usize = 0;
+    while s0 < alen && (arg[s0] == 32 as byte || arg[s0] == 9 as byte) {
+        s0 = s0 + 1;
+    }
+    var e0: usize = alen;
+    while e0 > s0 && (arg[e0 - 1] == 32 as byte || arg[e0 - 1] == 9 as byte) {
+        e0 = e0 - 1;
+    }
+    _ = buf_append(&nm, @ptr_from_usize(@usize_from_ptr(arg as &const void) + s0) as &const byte, e0 - s0);
+    var on: bool = false;
+    if bufx_eq_cstr(nm.ptr as &const byte, nm.len, "open" as &const byte)
+        || bufx_eq_cstr(nm.ptr as &const byte, nm.len, "expand" as &const byte) {
+        on = true;
+    } else if bufx_eq_cstr(nm.ptr as &const byte, nm.len, "close" as &const byte)
+        || bufx_eq_cstr(nm.ptr as &const byte, nm.len, "collapse" as &const byte) {
+        on = false;
+    } else if bufx_eq_cstr(nm.ptr as &const byte, nm.len, "toggle" as &const byte) {
+        on = !tasks_expanded();
+    } else {
+        tty_puts(&tty_ui, 2, "未知参数 \"");
+        tty_write(&tty_ui, 2, nm.ptr as &const byte, nm.len);
+        tty_puts(&tty_ui, 2, "\"（可选：open / close / toggle）\n");
+        return;
+    }
+    tasks_expand_set(on);
+    agent_tasks_refresh(cfg);
+    _ = tasks_panel_sync();
+    tty_puts(&tty_ui, 2, "[tasks] 常驻块：");
+    if (on) {
+        tty_puts(&tty_ui, 2, "展开（ctrl+t 同效）\n");
+    } else {
+        tty_puts(&tty_ui, 2, "收起\n");
+    }
+}
+
 // 返回 true = 该退出 REPL
 fn agent_repl_command(cfg: &Config, h: &History, line: &const Buf) bool {
     if sv_eq_cstr(line, "/exit") || sv_eq_cstr(line, "/quit") {
@@ -4521,6 +4785,16 @@ fn agent_repl_command(cfg: &Config, h: &History, line: &const Buf) bool {
     }
     if sv_eq_cstr(line, "/status") {
         agent_repl_status(cfg, h);
+        return false;
+    }
+    if sv_eq_cstr(line, "/tasks") {
+        agent_repl_tasks(cfg);
+        return false;
+    }
+    if arg_starts_with(line.ptr as &const byte, "/tasks ") {
+        // 参数从 "/tasks " 之后开始（`&line.ptr[7]` 不是左值，只能走指针算术）
+        const ap: &const byte = @ptr_from_usize(@usize_from_ptr(line.ptr as &const void) + 7) as &const byte;
+        agent_tasks_set_cmd(cfg, ap, line.len - 7);
         return false;
     }
     if sv_eq_cstr(line, "/continue") {
@@ -4596,7 +4870,7 @@ fn agent_repl_command(cfg: &Config, h: &History, line: &const Buf) bool {
         return false;
     }
     if sv_eq_cstr(line, "/plan") {
-        // P22：切模式 = 改状态 + 给模型推一份新快照（顺便同步 TUI 的 Plan chip）
+        // P26：切模式 = 改状态 + 给模型推一份新快照（顺便同步 TUI 的 Plan chip）
         agent_plan_apply(cfg, h, !g_plan.active);
         if g_plan.active {
             tty_puts(&tty_ui, 2, "Plan mode on. Use /plan to leave.\n");
@@ -4620,6 +4894,7 @@ fn agent_repl_command(cfg: &Config, h: &History, line: &const Buf) bool {
         if agent_history_begin(cfg, h, &none_first) {
             tty_puts(&tty_ui, 2, "[session] 已开新会话\n");
             agent_stats_sync(cfg, h);
+            agent_title_apply();   // P22：新会话没有标题 → 回到基标题
         } else {
             tty_puts(&tty_ui, 2, "error: 无法新建会话\n");
         }
@@ -4642,6 +4917,7 @@ fn agent_repl_command(cfg: &Config, h: &History, line: &const Buf) bool {
         if agent_history_begin(cfg, h, &none_first2) {
             tty_puts(&tty_ui, 2, "[session] 已恢复会话\n");
             agent_stats_sync(cfg, h);
+            agent_title_apply();   // P22：换成被恢复会话的标题（日志里的 session/title）
         } else {
             tty_puts(&tty_ui, 2, "error: 无法恢复会话\n");
         }
@@ -4774,13 +5050,16 @@ fn agent_run_interactive(cfg: &Config) i32 {
         tty_puts(&tty_ui, 2, "warning: 信号处理器安装失败（被打断时终端可能停在 raw 模式）\n");
     }
     _ = sigx_install_winch();
-    sigx_arm(2, false);   // 滚动模式：显示通道是 fd 2，没有备用屏幕
+    // 滚动模式：显示通道是 fd 2，没有备用屏幕；P22 的终端标题也要跟着弹栈
+    sigx_arm(2, false, agent_title_enabled(cfg));
     if !tty_raw_on(&tty_ui, 0) {
         tty_puts(&tty_ui, 2, "warning: 无法进入 raw 模式（termios 设置失败），退回行式 REPL\n");
         sigx_disarm();
         return agent_repl_plain(cfg);
     }
     g_interactive = true;
+    // P22：从这一刻起终端标题跟随会话标题（--no-title 时这条通道根本不开）
+    agent_title_begin(cfg, 2);
     tty_set_block_provider(&tty_ui, true);   // P15：输入行上方允许画子代理面板
     inbox_globals_init();
 
@@ -4789,12 +5068,20 @@ fn agent_run_interactive(cfg: &Config) i32 {
     var no_first: Buf = buf_empty();
     if !agent_history_begin(cfg, &h, &no_first) {
         out_err("error: cannot build history\n");
+        tty_title_end();
         tty_raw_off(&tty_ui, 0);
         sigx_disarm();
         tty_free(&tty_ui);
         return AGENT_PROTO;
     }
+    // P22：历史回填完（--continue / --resume 的 session/title 已经进 g_sess.title）再同步一次，
+    // 否则起始标题会一直停在基标题上，直到用户打出第一条消息才换过来
+    agent_title_apply();
     agent_repl_banner(cfg);
+    // P22：任务块（清单/后台任务/子代理/目标）—— 启动先读一次 goal.json，再把面板刷出来
+    tasks_init();
+    agent_goal_reload(cfg);
+    agent_agents_tick_force();
 
     var line: Buf = buf_new(8192);
     var run: bool = true;
@@ -4888,10 +5175,12 @@ fn agent_run_interactive(cfg: &Config) i32 {
     }
 
     tty_set_block_provider(&tty_ui, false);
+    tty_title_end();   // P22：弹标题栈（终端支持标题栈 = 回到 shell 原来的标题）
     tty_raw_off(&tty_ui, 0);
     sigx_disarm();   // 终端已经还原过了，别让残留的信号再触发一次「恢复终端」
     tty_puts(&tty_ui, 2, "\nbye\n");
     agent_session_close();
+    tasks_free();
     inbox_globals_free();
     hist_free(&h);
     buf_free(&line);
@@ -5132,6 +5421,15 @@ fn agent_print_config(cfg: &const Config, dsh: &const DshCfg) void {
     } else {
         out_err("  (display: on)\n");
     }
+    out_err("title = ");
+    if cfg.title {
+        out_err("on");
+    } else {
+        out_err("off");
+    }
+    out_err("  (source: ");
+    out_err(cfg_src_name(cfg.title_src));
+    out_err(")\n");
     out_err("input_image = ");
     if cfg.input_image {
         out_err("true\n");
@@ -5334,6 +5632,16 @@ export fn main() i32 {
             cfg.tui_src = 1;
         }
     }
+    const title_env: &byte = getenv("UYA_AGENT_TITLE");
+    if (title_env as usize) != 0 && bufx_cstr_len(title_env) > 0 {
+        if bufx_eq_cstr(title_env, bufx_cstr_len(title_env), "0") {
+            cfg.title = false;
+            cfg.title_src = TITLE_SRC_ENV;
+        } else {
+            cfg.title = true;
+            cfg.title_src = TITLE_SRC_ENV;
+        }
+    }
     const steps_env: &byte = getenv("UYA_AGENT_MAX_STEPS");
     if (steps_env as usize) != 0 {
         cfg.max_steps = parse_steps_arg(steps_env, "UYA_AGENT_MAX_STEPS" as &const byte);
@@ -5486,6 +5794,12 @@ export fn main() i32 {
         } else if arg_eq(p, "--no-tui") {
             cfg.tui = false;
             cfg.tui_src = 2;
+        } else if arg_eq(p, "--title") {
+            cfg.title = true;
+            cfg.title_src = TITLE_SRC_CLI;
+        } else if arg_eq(p, "--no-title") {
+            cfg.title = false;
+            cfg.title_src = TITLE_SRC_CLI;
         } else if arg_starts_with(p, "--color=") {
             cfg.color_mode = agent_parse_color(p);
         } else if arg_eq(p, "--no-color") {
@@ -5790,7 +6104,11 @@ export fn main() i32 {
 // 「把它交出来的提交/中断送回回合循环」。数据流见 README「全屏 TUI」一节。
 // ============================================================
 
-const AGENT_VERSION: [byte: 16] = [112, 50, 50, 45, 112, 108, 97, 110, 0, 0, 0, 0, 0, 0, 0, 0];   // "p22-plan"
+// P21–P25 这五个编号都已被并行线占用（访问模式三级 + 内核沙箱 = p21-perm；
+// 终端标题 = p22-title；命令面板与 `/status` 浮层 = p23-cmd；脚注内存字段 + 首 token 口径 =
+// p24-mem；任务状态 /tasks + 常驻任务块 = p25-tasks）。本条线（plan 写闸门 + 审阅浮窗）
+// 按后到的编号记成 **P26**，版本串 `p26-plan` —— 与 README 顶部同一套记法。
+const AGENT_VERSION: [byte: 16] = [112, 50, 54, 45, 112, 108, 97, 110, 0, 0, 0, 0, 0, 0, 0, 0];   // "p26-plan"
 const AGENT_VERSION_LEN: usize = 8;
 
 fn agent_parse_color(p: &byte) u8 {
@@ -5977,6 +6295,7 @@ fn agent_tui_commands(out: &Buf) void {
     buf_reset(out);
     _ = buf_append_cstr(out, "/help      显示帮助浮层\n");
     _ = buf_append_cstr(out, "/status    当前配置与会话信息\n");
+    _ = buf_append_cstr(out, "/tasks     任务状态进度（清单/后台任务/子代理/目标）\n");
     _ = buf_append_cstr(out, "/sessions  会话列表（选一个恢复）\n");
     _ = buf_append_cstr(out, "/new       开一个新会话\n");
     _ = buf_append_cstr(out, "/compact   手动压缩上下文\n");
@@ -6073,7 +6392,7 @@ fn agent_tui_sessions_items(cfg: &const Config, out: &Buf) void {
 
 // 浮层选中的条目 → 取出首段（会话 id / 命令名）
 // ============================================================
-// P22：plan 模式的用户侧切换入口（tab / `/plan` 共用）
+// P26：plan 模式的用户侧切换入口（tab / `/plan` 共用）
 // 模型自己走 exit_plan_mode 那条路不进这里（它的工具结果就是模式变化的说明）。
 // 切换后立刻推一份新快照：会话中途切模式，模型必须下一轮就知道
 // （system prompt 与首份运行时上下文都只在会话开始时装配/注入一次）。
@@ -6237,17 +6556,107 @@ fn agent_tui_item_head(line: &const Buf, out: &Buf) void {
     }
 }
 
+// 命令面板的派发收口（P23）。
+//
+// 面板是由输入行里的那个 `/` 触发开的，之后敲的字进的是面板过滤器；所以派发时必须
+// 把触发用的 `/` 从输入行收走 —— 否则第二次敲 `/status` 会拼成 `//status`，被当成
+// 未知命令丢掉，屏幕上就是「/status 没反应」（用户报的正是这一条）。
+// 主循环（空闲态）与 step 边界（回合运行中）都走这里，回显与派发只有一份。
+// 返回值与 agent_tui_command 同义：true = 该停（`/exit` 在面板里选中也要真退出，
+// 主循环据此收工 —— 见踩坑 37）。
+fn agent_tui_palette_apply(cfg: &Config, h: &History, sel: &const Buf) bool {
+    tui_input_drop_slash_trigger();
+    var head: Buf = buf_new(128);
+    defer { buf_free(&head); }
+    agent_tui_item_head(sel, &head);
+    if head.len == 0 {
+        return false;
+    }
+    tui_add_notice(head.ptr as &const byte, head.len);
+    return agent_tui_command(cfg, h, &head);
+}
+
+// 回合运行中也能安全当场派发的面板命令：只读、不改写也不释放历史。
+// 其余命令（/new、/resume 会 hist_free、/compact 会改写历史、/continue 会再跑一轮）
+// 必须等回合结束由主循环派发 —— 回合还攥着那份 History。
+// 约定：安全集里只能放**不返回「停」**的命令（step 边界的派发点丢掉返回值：回合的
+// 收工由主循环统一处理），所以 `/exit` 不在这里。
+fn agent_tui_cmd_safe(head: &const Buf) bool {
+    if sv_eq_cstr(head, "/status") {
+        return true;
+    }
+    // P25：/tasks 是只读视图（poll 一次 job/deleg + 读一眼 goal.json，不动历史），
+    // 也让它在回合运行中当场派发 —— 用户不知道回合跑完了没有
+    if sv_eq_cstr(head, "/tasks") {
+        return true;
+    }
+    if sv_eq_cstr(head, "/help") {
+        return true;
+    }
+    if sv_eq_cstr(head, "/sessions") {
+        return true;
+    }
+    return false;
+}
+
+// 回合运行中：step 边界（agent_turn_loop_inner 里、agent_claim_steer 之后）看一眼
+// 面板刚交回的结果。安全命令当场派发（/status 在回合里就能看），不安全的原样留在
+// 待取队列里给主循环 —— 非 TUI 模式是空操作。
+fn agent_tui_poll_pending_cmd(cfg: &Config, h: &History) void {
+    if !tui_active() {
+        return;
+    }
+    if tui_overlay_kind() != TUI_OVK_PALETTE {
+        return;
+    }
+    var sel: Buf = buf_new(4096);
+    defer { buf_free(&sel); }
+    if !tui_overlay_peek(&sel) {
+        return;
+    }
+    var head: Buf = buf_new(128);
+    defer { buf_free(&head); }
+    agent_tui_item_head(&sel, &head);
+    if !agent_tui_cmd_safe(&head) {
+        return;
+    }
+    if !tui_overlay_take(&sel) {
+        return;
+    }
+    // 安全集里的命令都不返回「停」，所以这里的返回值可以丢（回合的收工由主循环处理）
+    _ = agent_tui_palette_apply(cfg, h, &sel);
+}
+
 // TUI 模式下的命令处理（复用滚动模式的 agent_repl_command，只把「要浮层的」拦下来）
 fn agent_tui_command(cfg: &Config, h: &History, line: &const Buf) bool {
+    if sv_eq_cstr(line, "/help") {
+        // TUI 里 /help 是帮助**浮层**（与 /status、/sessions 同一套观感）；
+        // README 的「浮层」清单与命令表的注释都这么写，但这里一直缺一个分支 ——
+        // 结果 /help 掉进滚动模式的纯文本帮助，浮层函数 tui_help_open() 没人调。
+        tui_help_open();
+        return false;
+    }
     if sv_eq_cstr(line, "/sessions") {
         var items: Buf = buf_new(8192);
         defer { buf_free(&items); }
         agent_tui_sessions_items(cfg, &items);
         if items.len == 0 {
-            tui_add_notice("(没有找到会话)" as &const byte, 22);
+            tui_add_notice("(没有找到会话)" as &const byte, bufx_cstr_len("(没有找到会话)" as &const byte));
             return false;
         }
-        tui_overlay_list(TUI_OVK_SESSIONS, "会话（enter 恢复 · esc 取消）" as &const byte, 44, items.ptr as &const byte, items.len);
+        // 标题长度必须用 strlen 量：写死的字节数一旦比字面量长，就会把 .rodata 里
+        // 紧邻的字节当作标题的一部分复制进浮层（× 会先在 client 里 OOB 稳定崩溃）。
+        const sess_title: &const byte = "会话（enter 恢复 · esc 取消）" as &const byte;
+        tui_overlay_list(TUI_OVK_SESSIONS, sess_title, strlen(sess_title), items.ptr as &const byte, items.len);
+        return false;
+    }
+    if sv_eq_cstr(line, "/tasks") {
+        // P25：任务状态报告（与滚动模式同一份 tasks_report）
+        var txt: Buf = buf_new(16384);
+        defer { buf_free(&txt); }
+        agent_tasks_report(cfg, &txt);
+        const ttitle: &const byte = "任务（esc 关闭）" as &const byte;
+        tui_overlay_list(TUI_OVK_TASKS, ttitle, strlen(ttitle), txt.ptr as &const byte, txt.len);
         return false;
     }
     if sv_eq_cstr(line, "/status") {
@@ -6280,7 +6689,8 @@ fn agent_tui_command(cfg: &Config, h: &History, line: &const Buf) bool {
         }
         _ = buf_append_cstr(&items, ")\n");
         agent_status_stats_block(cfg, h, &items);
-        tui_overlay_list(TUI_OVK_HELP, "状态（esc 关闭）" as &const byte, 46, items.ptr as &const byte, items.len);
+        const status_title: &const byte = "状态（esc 关闭）" as &const byte;
+        tui_overlay_list(TUI_OVK_HELP, status_title, strlen(status_title), items.ptr as &const byte, items.len);
         return false;
     }
     return agent_repl_command(cfg, h, line);
@@ -6317,10 +6727,11 @@ fn agent_tui_is_injected(m: &const Msg) bool {
     if bufx_mem_eq(p, "Current runtime context" as &const byte, 23) {
         return true;
     }
-    if bufx_mem_eq(p, "Current uya-agent file policy" as &const byte, 30) {
+    if bufx_mem_eq(p, "Current uya-agent file policy" as &const byte,
+            bufx_cstr_len("Current uya-agent file policy" as &const byte)) {
         return true;
     }
-    if bufx_mem_eq(p, "# 项目约定" as &const byte, 13) {
+    if bufx_mem_eq(p, "# 项目约定" as &const byte, bufx_cstr_len("# 项目约定" as &const byte)) {
         return true;
     }
     return false;
@@ -6394,13 +6805,15 @@ fn agent_tui_start(cfg: &const Config) bool {
         tty_puts(&tty_ui, 2, "warning: 信号处理器安装失败（被打断时终端可能停在 raw 模式）\n");
     }
     _ = sigx_install_winch();
-    sigx_arm(ofd, true);
+    sigx_arm(ofd, true, agent_title_enabled(cfg));
     if !tty_raw_on(&tty_ui, 0) {
         sigx_disarm();
         _ = sys_close(ofd) catch {};
         return false;
     }
     tui_start(ofd);
+    // P22：备用屏幕起来之后再压标题栈 + 上基标题（顺序：先有界面，再有标题）
+    agent_title_begin(cfg, ofd);
     tty_sink_on = true;       // 从这一刻起，所有显示字节都进转录
     tui_set_size(tty_ui.cols, tty_ui.rows);
     return true;
@@ -6408,12 +6821,36 @@ fn agent_tui_start(cfg: &const Config) bool {
 
 fn agent_tui_stop(out_fd: i32) void {
     tty_sink_on = false;
+    tty_title_end();   // P22：先弹标题栈（写的是 TUI 自己的 fd），再离开备用屏幕
     tui_stop();
     tty_raw_off(&tty_ui, 0);
     sigx_disarm();
     if out_fd >= 0 {
         _ = sys_close(out_fd) catch {};
     }
+}
+
+// P22：交互模式下要不要改终端标题（--title / --no-title / UYA_AGENT_TITLE）。
+// 子代理一律不碰：它们只跑回合循环（stdout/stderr 已经指向 /dev/null，stdin 却继承父进程的
+// TTY），万一将来给它们接了交互界面，也不该去改父进程的终端标题。
+fn agent_title_enabled(cfg: &const Config) bool {
+    return cfg.title && !cfg.is_subagent;
+}
+
+// P22：打开标题通道（压栈 + 上基标题）。`--no-title` 时整条通道都不开 —— 后面所有
+// `agent_title_apply()` 都会因为 `tty_title_active()` 为假而变成空操作。
+//
+// 这里**只**上基标题、不看 `g_sess.title`：这个函数跑在 `agent_history_begin` 之前，
+// 此刻 `g_sess.title` 要么是空的（新进程），要么是 fork 继承来的**上一个会话**的残留
+// （自测里真踩到过：PTY 子进程把上一轮的标题先顶上去，屏幕上就是「任务标题 + 基标题」
+// 两条 OSC）。真正的会话标题由「开完会话之后」的那次 `agent_title_apply()` 上。
+fn agent_title_begin(cfg: &const Config, fd: i32) void {
+    if !agent_title_enabled(cfg) {
+        return;
+    }
+    tty_title_begin(fd);
+    agent_title_base_set(cfg);
+    tty_title_set(g_title_base.ptr as &const byte, g_title_base.len);
 }
 
 // TUI 主循环：与 agent_run_interactive 同构（取 steer → 等提交 → 跑回合），
@@ -6475,7 +6912,13 @@ fn agent_run_tui_body(cfg: &Config, tui_fd: i32) i32 {
         g_interactive = false;
         return AGENT_PROTO;
     }
+    // P22：历史回填完再同步标题（--continue / --resume / --resume-dsh 的标题此刻才在 g_sess.title 里）
+    agent_title_apply();
     agent_tui_seed_history(&h);
+    // P22：常驻任务块 —— 启动先读一次 goal.json，再把面板文本备好（tui_build 只 memcpy）
+    tasks_init();
+    agent_goal_reload(cfg);
+    agent_agents_tick_force();
     tui_mark_dirty();
 
     var line: Buf = buf_new(8192);
@@ -6501,6 +6944,10 @@ fn agent_run_tui_body(cfg: &Config, tui_fd: i32) i32 {
             agent_plan_apply(cfg, &h, false);
         } else if req == TUI_REQ_ACCESS {
             agent_tui_access_open();
+        } else if req == TUI_REQ_TASKS {
+            // P22：ctrl+t 只置请求，真正切展开态与重画在这里（与 plan/access 同一套分工）
+            _ = tasks_toggle();
+            _ = tasks_panel_sync();
         }
         // 2) 浮层结果（会话选择）
         if tui_overlay_take(&sel) {
@@ -6509,12 +6956,11 @@ fn agent_run_tui_body(cfg: &Config, tui_fd: i32) i32 {
             defer { buf_free(&head); }
             agent_tui_item_head(&sel, &head);
             if kind == TUI_OVK_PALETTE {
-                // 命令面板：把命令名当输入提交
-                buf_reset(&line);
-                _ = buf_append(&line, head.ptr, head.len);
-                if line.len > 0 {
-                    tui_add_notice(line.ptr as &const byte, line.len);
-                    _ = agent_tui_command(cfg, &h, &line);
+                // 命令面板：把命令名当输入提交（顺带收走触发面板的那个 "/"，见
+                // agent_tui_palette_apply 的注释）。返回 true = 「该停」—— 面板里选中
+                // /exit 也要真的退出，见踩坑 37。
+                if agent_tui_palette_apply(cfg, &h, &sel) {
+                    run = false;
                 }
             } else if kind == TUI_OVK_SESSIONS {
                 if head.len > 0 {
@@ -6532,7 +6978,9 @@ fn agent_run_tui_body(cfg: &Config, tui_fd: i32) i32 {
         // 3) 运行中输入的文本（steer 收件箱里没被采纳的）→ 当作新任务
         const steer_got: bool = inbox_pop(&g_steer, &line);
         if steer_got && line.len > 0 && line.ptr[0] == 47 as byte {
-            _ = agent_tui_command(cfg, &h, &line);
+            if agent_tui_command(cfg, &h, &line) {
+                run = false;
+            }
             continue;
         }
         // 4) 等提交
@@ -6552,7 +7000,9 @@ fn agent_run_tui_body(cfg: &Config, tui_fd: i32) i32 {
             continue;
         }
         if line.ptr[0] == 47 as byte {
-            _ = agent_tui_command(cfg, &h, &line);
+            if agent_tui_command(cfg, &h, &line) {
+                run = false;
+            }
             continue;
         }
         // 5) 跑一轮
@@ -6564,7 +7014,8 @@ fn agent_run_tui_body(cfg: &Config, tui_fd: i32) i32 {
             pushed = hist_push(&h, ROLE_USER, line.ptr as &const byte, line.len);
         }
         if !pushed {
-            tui_add_notice("error: 无法把任务写入历史" as &const byte, 40);
+            tui_add_notice("error: 无法把任务写入历史" as &const byte,
+                bufx_cstr_len("error: 无法把任务写入历史" as &const byte));
             continue;
         }
         agent_log_user(line.ptr as &const byte, line.len, false);
@@ -6586,6 +7037,7 @@ fn agent_run_tui_body(cfg: &Config, tui_fd: i32) i32 {
         agent_tui_stop(tui_fd);
     }
     agent_session_close();
+    tasks_free();
     inbox_globals_free();
     hist_free(&h);
     buf_free(&line);
@@ -6646,8 +7098,115 @@ fn agent_stats_fixture_demo() void {
     }
 }
 
-// --tui-demo 第四屏用的示例计划（P22）：多节、够长，能看出「正文可滚动」
+// --tui-demo 第 5 屏用的示例计划（P26）：多节、够长，能看出「正文可滚动」
 const DEMO_PLAN: &const byte = "# 把 hello.uya 的问候语改成 Hello, DSH!\n\n## 第一步：读现状\n- 读 hello.uya，确认现在的问候语是 Hello, Uya!\n- 顺手看一眼 Makefile 里有没有别处引用这个字符串\n\n## 第二步：改一行\n- 只动那一行字面量，不动缩进与分号\n- 用 edit 工具替换，避免整文件重写带来的 diff 噪音\n\n## 第三步：验证\n- 编译并运行：期望输出 Hello, DSH!\n- 跑一次 make check，确认没有连带影响\n\n## 风险与回滚\n- 风险只有一处字符串，回滚就是把这一行改回去\n- 不碰 Makefile、不碰 TUI 代码\n" as &const byte;
+// --tui-demo 第 4 屏的 fixture：在**真实 globals** 上装一份「跑了一半」的任务状态。
+// 全部 reaped/pid=-1/fd=-1：面板刷新绝不能真去 waitpid 或读管道（自测同款约定）。
+fn agent_todo_fixture_add(text: &const byte, st: u8) void {
+    const i: usize = g_todos.n;
+    if i >= TODO_MAX {
+        return;
+    }
+    const n: usize = bufx_cstr_len(text);
+    g_todos.items[i].content = buf_new(n + 8);
+    _ = buf_append_cstr(&g_todos.items[i].content, text);
+    g_todos.items[i].status = st;
+    g_todos.n = i + 1;
+}
+
+export fn agent_tasks_fixture_demo() void {
+    // 清单：2 完成 / 1 进行中 / 1 待办
+    todo_free(&g_todos);
+    todo_init(&g_todos);
+    agent_todo_fixture_add("写 src/tasks.uya（聚合 + 文本 + 快照推送）" as &const byte, TD_COMPLETED);
+    agent_todo_fixture_add("接进 TUI 浮层与常驻块" as &const byte, TD_COMPLETED);
+    agent_todo_fixture_add("补自测轮与 make 目标" as &const byte, TD_INPROGRESS);
+    agent_todo_fixture_add("把 README 第 6 节的验收表补齐" as &const byte, TD_PENDING);
+
+    // 后台任务：1 跑中（12s、已收 3 行输出）+ 1 已完成 exit 0
+    jobs_free(&g_jobs);
+    jobs_init(&g_jobs);
+    g_jobs.items[0].used = true;
+    g_jobs.items[0].id = 1;
+    g_jobs.items[0].kind = 0;
+    g_jobs.items[0].pid = -1;
+    g_jobs.items[0].rfd = -1;
+    g_jobs.items[0].status = JOB_RUNNING;
+    g_jobs.items[0].exit_code = 0;
+    g_jobs.items[0].truncated = false;
+    g_jobs.items[0].start_ms = ua_now_ms() - (12 as u64) * (1000 as u64);
+    g_jobs.items[0].read_off = 0;
+    g_jobs.items[0].reaped = true;
+    g_jobs.items[0].label = buf_new(64);
+    _ = buf_append_cstr(&g_jobs.items[0].label, "编译内核模块" as &const byte);
+    g_jobs.items[0].buf = buf_new(64);
+    _ = buf_append_cstr(&g_jobs.items[0].buf, "cc -c kernel.c
+ld -r kernel.o
+ok
+" as &const byte);
+    g_jobs.items[1].used = true;
+    g_jobs.items[1].id = 2;
+    g_jobs.items[1].kind = 0;
+    g_jobs.items[1].pid = -1;
+    g_jobs.items[1].rfd = -1;
+    g_jobs.items[1].status = JOB_DONE;
+    g_jobs.items[1].exit_code = 0;
+    g_jobs.items[1].truncated = false;
+    g_jobs.items[1].start_ms = ua_now_ms() - (4 as u64) * (1000 as u64);
+    g_jobs.items[1].read_off = 0;
+    g_jobs.items[1].reaped = true;
+    g_jobs.items[1].label = buf_new(64);
+    _ = buf_append_cstr(&g_jobs.items[1].label, "跑一遍单测" as &const byte);
+    g_jobs.items[1].buf = buf_new(64);
+    _ = buf_append_cstr(&g_jobs.items[1].buf, "all 128 tests passed
+" as &const byte);
+    g_jobs.next_id = 3;
+
+    // 子代理：1 跑中（7s、12 行输出）
+    deleg_free(&g_deleg);
+    deleg_init(&g_deleg);
+    g_deleg.items[0].used = true;
+    g_deleg.items[0].id = 1;
+    g_deleg.items[0].kind = DELEG_KIND_SUB;
+    g_deleg.items[0].pid = -1;
+    g_deleg.items[0].fd = -1;
+    g_deleg.items[0].status = DELEG_RUNNING;
+    g_deleg.items[0].code = 0;
+    g_deleg.items[0].reaped = true;
+    g_deleg.items[0].read_off = 0;
+    g_deleg.items[0].rounds = 0;
+    g_deleg.items[0].max_rounds = 0;
+    g_deleg.items[0].ended_noted = false;
+    g_deleg.items[0].started_ms = ua_now_ms() - (7 as u64) * (1000 as u64);
+    g_deleg.items[0].label = buf_new(64);
+    _ = buf_append_cstr(&g_deleg.items[0].label, "审计 deleg 的等待循环" as &const byte);
+    g_deleg.items[0].prompt = buf_new(96);
+    _ = buf_append_cstr(&g_deleg.items[0].prompt, "把 deleg 的等待循环与 fork/exec 差异看一遍" as &const byte);
+    g_deleg.items[0].sid = buf_new(16);
+    g_deleg.items[0].objective = buf_new(16);
+    g_deleg.items[0].buf = buf_new(512);
+    var li: usize = 0;
+    while li < 12 {
+        _ = buf_append_cstr(&g_deleg.items[0].buf, "检查 1030-1120 行的 fork/exec 差异
+" as &const byte);
+        li = li + 1;
+    }
+    g_deleg.next_id = 2;
+
+    // 目标：active、round 3/20
+    const g: &Goal = tasks_goal_ref();
+    goal_free(g);
+    g[0] = goal_empty();
+    g.active_state = true;
+    g.id = 1;
+    g.revision = 4;
+    g.round = 3;
+    g.max_rounds = 20;
+    g.phase = buf_new(16);
+    _ = buf_append_cstr(&g.phase, "active" as &const byte);
+    g.objective = buf_new(128);
+    _ = buf_append_cstr(&g.objective, "把 /tasks 的任务状态进度接进 TUI 与滚动模式" as &const byte);
+}
 
 fn agent_tui_demo(cfg: &const Config, cols: usize, rows: usize) i32 {
     var prov: Buf = buf_new(32);
@@ -6669,6 +7228,7 @@ fn agent_tui_demo(cfg: &const Config, cols: usize, rows: usize) i32 {
     tui_set_stats("" as &const byte, 0);
     tui_set_ctx(-1);
     tui_set_cpu(-1);
+    tui_set_mem(-1);
     tui_set_plan(false);
     tui_set_run(TUI_RUN_IDLE, "" as &const byte, 0);
     // 空态也用同一个画布（早期实现没设尺寸，空态快照一直是 80×24 的默认值）
@@ -6684,6 +7244,7 @@ fn agent_tui_demo(cfg: &const Config, cols: usize, rows: usize) i32 {
     tui_set_stats(sline.ptr as &const byte, sline.len);
     tui_set_ctx(21);
     tui_set_cpu(37);
+    tui_set_mem(319488);   // 312M（P24：内存合计，与 README 示例行一致）
 
     // 再给一份带转录的（模拟真实一轮的形状）
     tui_sink_bytes(1, "我先读一下文件，再改一行，顺手跑一次编译：\n" as &const byte, bufx_cstr_len("我先读一下文件，再改一行，顺手跑一次编译：\n" as &const byte));
@@ -6713,8 +7274,30 @@ fn agent_tui_demo(cfg: &const Config, cols: usize, rows: usize) i32 {
     agent_tui_dump(cols, rows);
     tui_set_run(TUI_RUN_IDLE, "" as &const byte, 0);
 
-    // ④ plan 审阅浮窗（P22）：模型交出计划时弹的 reader 浮层 ——
+    // ④ 常驻任务块（P22）：④a 折叠 1 行 / ④b 展开（ctrl+t 之后的样子）
+    tui_close_stream_entries();
+    view_init(true, 0);
+    tui_headless_enable(true);      // tasks_panel_sync 要走 TUI 那条路（拉取 + mark dirty）
+    tasks_init();
+    agent_tasks_fixture_demo();
+    tasks_expand_set(false);
+    _ = tasks_panel_sync();
+    agent_tui_dump(cols, rows);
+    tasks_expand_set(true);
+    _ = tasks_panel_sync();
+    agent_tui_dump(cols, rows);
+    tasks_expand_set(false);
+
+    // ④c /tasks 报告本体（TUI 浮层与滚动模式打印的是同一份文本）
+    var rep: Buf = buf_new(16384);
+    defer { buf_free(&rep); }
+    tasks_report_globals(cols - 12, &rep);
+    out_bytes("\n--- 任务（/tasks 的内容）---\n" as &const byte, bufx_cstr_len("\n--- 任务（/tasks 的内容）---\n" as &const byte));
+    out_bytes(rep.ptr as &const byte, rep.len);
+
+    // ⑤ plan 审阅浮窗（P26）：模型交出计划时弹的 reader 浮层 ——
     //    正文可滚动（标题栏是「第 a 行/共 b 行」）、下面一行说明 + 一行动作。
+    //    （最后一张快照：任务块与它互不影响）
     tui_set_plan(true);
     tui_overlay_reader(TUI_OVK_PLAN, PLAN_TITLE, bufx_cstr_len(PLAN_TITLE),
         DEMO_PLAN, bufx_cstr_len(DEMO_PLAN),

@@ -14,7 +14,7 @@
 UYA_ROOT ?= /home/winger/uya-0.10/lib/
 UYA      ?= /home/winger/uya-0.10/bin/uya
 
-SRC := src/bufx.uya src/jsonx.uya src/httpc.uya src/httpstream.uya src/sse.uya src/llm.uya src/tty.uya src/sigx.uya src/inbox.uya src/session.uya src/stats.uya src/procx.uya src/yamlcfg.uya src/dshcfg.uya src/dshsess.uya src/prompt.uya src/instr.uya src/compact.uya src/skill.uya src/webx.uya src/deleg.uya src/goal.uya src/workflow.uya src/todo.uya src/plan.uya src/perm.uya src/sandboxx.uya src/askuser.uya src/fsx.uya src/search.uya src/jobs.uya src/shellx.uya src/tools.uya src/diffx.uya src/view.uya src/tui.uya src/agent.uya src/sigselftest.uya src/tuiselftest.uya src/selftest.uya
+SRC := src/bufx.uya src/jsonx.uya src/httpc.uya src/httpstream.uya src/sse.uya src/llm.uya src/tty.uya src/sigx.uya src/inbox.uya src/session.uya src/stats.uya src/procx.uya src/yamlcfg.uya src/dshcfg.uya src/dshsess.uya src/prompt.uya src/instr.uya src/compact.uya src/skill.uya src/webx.uya src/deleg.uya src/goal.uya src/workflow.uya src/todo.uya src/plan.uya src/perm.uya src/sandboxx.uya src/askuser.uya src/fsx.uya src/search.uya src/jobs.uya src/shellx.uya src/tools.uya src/diffx.uya src/view.uya src/tasks.uya src/tui.uya src/agent.uya src/sigselftest.uya src/tuiselftest.uya src/selftest.uya
 OUT := build/uya-agent
 
 BASE ?= https://api.deepseek.com/v1
@@ -25,7 +25,7 @@ TASK ?= 创建 hello.uya，编译并运行它
 export UYA_ROOT
 export UYA_SPLIT_C_DIR := $(CURDIR)/build/uyacache
 
-.PHONY: all check build selftest codegen-audit probe e2e e2e-config e2e-config-flags e2e-api e2e-steps e2e-permission e2e-sandbox e2e-dsh tui-demo tui-selftest clean
+.PHONY: all check build selftest codegen-audit probe e2e e2e-config e2e-config-flags e2e-title e2e-api e2e-steps e2e-permission e2e-sandbox e2e-tasks e2e-dsh tui-demo tui-selftest clean
 
 all: build
 
@@ -50,7 +50,7 @@ codegen-audit: build
 	fi; \
 	echo "codegen-audit: 通过（没有切片描述符强转）"
 
-selftest: build codegen-audit e2e-config-flags e2e-api e2e-steps e2e-permission e2e-sandbox
+selftest: build codegen-audit e2e-config-flags e2e-title e2e-api e2e-steps e2e-permission e2e-sandbox e2e-tasks
 	UYA_BIN=$(UYA) $(OUT) --selftest
 
 probe: build
@@ -106,6 +106,26 @@ e2e-sandbox: build
 	echo "$$out" | grep -q "sandbox = none" || { echo "FAIL: 指定不存在的 bwrap 应当判不可用"; exit 1; }; \
 	echo "e2e-sandbox: 通过（探测结果可见 / --no-sandbox / 显式 bwrap 路径不可用）"
 
+# P22：/tasks 任务状态（离线，不联网）：裸命令出报告、空态串、open/toggle 回显、非法参数报错、
+# /help 里能查到它。常驻块的排版与活体刷新在 selftest 的 tasks-render / tui-tasks 两轮里断言。
+e2e-tasks: build
+	@set -e; \
+	out=$$(printf '/tasks\n/tasks open\n/tasks toggle\n/tasks bogus\n/help\n/exit\n' | \
+		$(OUT) --no-dsh-config --no-tui --api-key dummy-key --quiet 2>&1); \
+	echo "$$out" | grep -qF -- "--- 任务 ---" \
+		|| { echo "FAIL: 裸 /tasks 没有打出报告头"; exit 1; }; \
+	echo "$$out" | grep -qF "（没有任务：todo 清单为空，也没有后台任务 / 子代理 / 目标）" \
+		|| { echo "FAIL: 空态串不对"; exit 1; }; \
+	echo "$$out" | grep -qF "[tasks] 常驻块：展开（ctrl+t 同效）" \
+		|| { echo "FAIL: /tasks open 没有回显展开"; exit 1; }; \
+	echo "$$out" | grep -qF "[tasks] 常驻块：收起" \
+		|| { echo "FAIL: /tasks toggle 没有回显收起"; exit 1; }; \
+	echo "$$out" | grep -qF '未知参数 "bogus"' \
+		|| { echo "FAIL: 非法参数没有报错"; exit 1; }; \
+	echo "$$out" | grep -qF "/tasks     任务状态进度" \
+		|| { echo "FAIL: /help 里没有 /tasks"; exit 1; }; \
+	echo "e2e-tasks: 通过（报告头 / 空态串 / open / toggle / 非法参数 / /help）"
+
 # 真实网关端到端：默认走 DSH 设置（零参数就能拿到 base-url/model/key），
 # 也可以显式覆盖。TLS：给了 PIN 用 pin，否则用 none（真机链校验过不去，见 README 第 5 节）
 # 步数默认不限（跑到模型给出最终答案）；要熔断就 make e2e STEPS=N
@@ -137,6 +157,24 @@ e2e-config-flags: build
 		echo "FAIL: --strict-dsh-config 读不到设置却没有报错退出"; exit 1; \
 	fi; \
 	echo "e2e-config-flags: 通过（--dsh-home / --no-dsh-config / --strict-dsh-config 都在加载前生效）"
+
+# 终端标题开关（P22）回归：默认开；--no-title / UYA_AGENT_TITLE=0 都要在 --print-config 的
+# 来源列上看得出来（来源码与 cfg_src_name 同口径：default / env / cli），而且 CLI 压过 env。
+e2e-title:
+	@set -e; \
+	out=$$($(OUT) --no-dsh-config --print-config 2>&1); \
+	echo "$$out" | grep -q "title = on  (source: default)" \
+		|| { echo "FAIL: 终端标题默认应当是开"; exit 1; }; \
+	out=$$($(OUT) --no-dsh-config --no-title --print-config 2>&1); \
+	echo "$$out" | grep -q "title = off  (source: cli)" \
+		|| { echo "FAIL: --no-title 没有生效"; exit 1; }; \
+	out=$$(UYA_AGENT_TITLE=0 $(OUT) --no-dsh-config --print-config 2>&1); \
+	echo "$$out" | grep -q "title = off  (source: env)" \
+		|| { echo "FAIL: UYA_AGENT_TITLE 没有生效"; exit 1; }; \
+	out=$$(UYA_AGENT_TITLE=0 $(OUT) --no-dsh-config --title --print-config 2>&1); \
+	echo "$$out" | grep -q "title = on  (source: cli)" \
+		|| { echo "FAIL: --title 应当压过 UYA_AGENT_TITLE=0"; exit 1; }; \
+	echo "e2e-title: 通过（默认开；--no-title / UYA_AGENT_TITLE 同口径；CLI 优先）"
 
 # 线协议 flag 回归（离线，--print-config / --dry-run 都不联网）：
 #   * 默认（没有任何声明）= 先 responses + 允许一次性协商回退 chat；
