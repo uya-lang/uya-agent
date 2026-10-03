@@ -14,6 +14,8 @@
     new-mid-turn         运行中敲 /new，打印回执与是否中断了当前回合
     interrupt-then-task  esc 中断一个回合，再跑一个任务（验证中断标志没有粘住）
     baseline             （对照）不做任何输入，只看回显的脚注
+    worktree-menu        （P41）命令面板里选中 /worktree 与裸 /worktree 都要开动作选择框；
+                         ↓ 到 finish → 回车翻确认框；确认框上按回车（默认游标是「取消」）什么都不做
 
 只依赖 Python 标准库；解释器把 pty 的输出按「屏幕重建」的方式解析（备用屏幕 + 光标定位）。
 """
@@ -262,6 +264,18 @@ def suite():
           "压缩在飞时 /status 浮层太慢：%s ms（上限 300）" % (lat,), failures)
     all_v = {"status": v1, "new": v2, "interrupt": v3,
              "header_wait": v4, "idle": v5, "bash": v6, "compact": v7}
+    # ---- P41：/worktree 的动作选择框（真终端里的人机路径）----
+    v8 = run_scenario(0, base + "_worktree", "worktree-menu")
+    check(v8.get("palette_menu_seen"), "命令面板里选中 /worktree 没有开出动作选择框", failures)
+    check(v8.get("palette_menu_items"), "命令面板那条路上开出来的框里没有动作行", failures)
+    check(v8.get("menu_seen"), "裸 /worktree 没有开出动作选择框", failures)
+    check(v8.get("items_seen"), "/worktree 选择框里没有列全七个动作", failures)
+    check(v8.get("gloss_seen"), "/worktree 选择框的动作行没有一行说明", failures)
+    check(v8.get("marked_off"), "/worktree 选择框的 ✓ 没有挂在 off 那一行", failures)
+    check(v8.get("confirm_seen"), "选 finish 没有翻出确认框", failures)
+    check(v8.get("menu_closed"), "翻出确认框之后动作选择框还盖着", failures)
+    check(v8.get("cancelled"), "确认框上按回车（默认游标是取消）之后框还在", failures)
+    all_v["worktree"] = v8
     print(json.dumps(all_v, ensure_ascii=False, indent=2))
     if failures:
         print("P30/P31 FAIL:")
@@ -273,6 +287,9 @@ def suite():
           % (v1.get("overlay_latency_ms"), v4.get("overlay_latency_ms"),
              v5.get("overlay_latency_ms"), v6.get("overlay_latency_ms"),
              v7.get("overlay_latency_ms")))
+    print("P41 PASS（/worktree 动作选择框：面板选中 %s ms · 裸命令 %s ms · 确认框 %s ms；"
+          "七个动作与 ✓ 都在，确认框默认游标是取消）"
+          % (v8.get("palette_ms"), v8.get("menu_ms"), v8.get("confirm_ms")))
     return 0
 
 
@@ -372,6 +389,54 @@ def _drive(port, workspace, scenario, extra=None):
             type_keys(fd, "第二个任务\r")
             pump(fd, screen, 4.0)
             verdict["second_turn_ok"] = screen.has("SELFTEST_OK")
+        elif scenario == "worktree-menu":
+            # P41：真终端里的 /worktree 动作选择框 + finish 的二次确认。
+            # 这一场**不建 worktree**（也不发任何请求）：只验「面板选中或裸命令开出选择框、
+            # ↓ 走到 finish、回车翻确认框、确认框的默认游标是取消」这条人机路径。
+            # 真 git 那一半（确认之后才合并/删除）在 selftest 的 tui-worktree 轮里断言。
+            # ① 命令面板里选中 /worktree（用户报的那条路径：ctrl+p → 敲名字过滤 → 回车）
+            type_keys(fd, "\x10")
+            pump(fd, screen, 0.4)
+            type_keys(fd, "worktree")
+            pump(fd, screen, 0.4)
+            tp = time.time()
+            type_keys(fd, "\r")
+            verdict["palette_ms"] = wait_text(fd, screen, ("Git worktree（enter 执行 · esc 取消）",), tp, 1500)
+            verdict["palette_menu_seen"] = verdict["palette_ms"] is not None
+            verdict["palette_menu_items"] = "finish" in screen.text()
+            type_keys(fd, "\x1b")
+            pump(fd, screen, 0.4)
+            # ② 裸命令（同一条分支：agent_tui_command 的 /worktree 那一支）
+            t0 = time.time()
+            type_keys(fd, "/worktree\r")
+            verdict["menu_ms"] = wait_text(fd, screen, ("Git worktree（enter 执行 · esc 取消）",), t0, 1500)
+            verdict["menu_seen"] = verdict["menu_ms"] is not None
+            txt = screen.text()
+            # 每一项要么带 ✓（当前模式那两行之一），要么是两空格开头的普通行 —— 名字都得在
+            verdict["items_seen"] = all((("✓ " + w) in txt) or (("  " + w) in txt) for w in
+                                        ("on", "off", "start", "status", "finish", "discard", "list"))
+            verdict["gloss_seen"] = "合并回基分支" in txt
+            verdict["marked_off"] = "✓ off" in txt
+            if os.environ.get("PTY_DUMP"):
+                print("---- /worktree 动作选择框 ----")
+                print(txt)
+            # ↓ 一次：游标从默认的 status 挪到 finish
+            type_keys(fd, "\x1b[B")
+            pump(fd, screen, 0.3)
+            t1 = time.time()
+            type_keys(fd, "\r")
+            verdict["confirm_ms"] = wait_text(fd, screen, ("确认 finish？",), t1, 1500)
+            verdict["confirm_seen"] = verdict["confirm_ms"] is not None
+            verdict["menu_closed"] = "Git worktree（enter 执行 · esc 取消）" not in screen.text()
+            if os.environ.get("PTY_DUMP"):
+                print("---- finish 的确认框 ----")
+                print(screen.text())
+            # 确认框的默认游标是「取消」：再按一次回车必须什么都不做（框关掉就够）
+            type_keys(fd, "\r")
+            pump(fd, screen, 0.5)
+            verdict["cancelled"] = "确认 finish？" not in screen.text()
+            type_keys(fd, "\x1b")
+            pump(fd, screen, 0.3)
         else:
             type_keys(fd, "随便跑一个任务\r")
             pump(fd, screen, 5.0)
