@@ -28,7 +28,7 @@ TASK ?= 创建 hello.uya，编译并运行它
 export UYA_ROOT
 export UYA_SPLIT_C_DIR := $(CURDIR)/build/uyacache
 
-.PHONY: all check build selftest codegen-audit probe e2e e2e-config e2e-config-flags e2e-title e2e-api e2e-steps e2e-permission e2e-sandbox e2e-tasks e2e-goal e2e-diff e2e-dsh tui-demo tui-selftest diff-selftest clean
+.PHONY: all check build selftest codegen-audit probe e2e e2e-config e2e-config-flags e2e-title e2e-api e2e-steps e2e-permission e2e-sandbox e2e-tasks e2e-goal e2e-diff e2e-dsh p30-check tui-demo tui-selftest diff-selftest clean
 
 all: build
 
@@ -53,7 +53,7 @@ codegen-audit: build
 	fi; \
 	echo "codegen-audit: 通过（没有切片描述符强转）"
 
-selftest: build codegen-audit e2e-config-flags e2e-title e2e-api e2e-steps e2e-permission e2e-sandbox e2e-tasks e2e-goal e2e-diff
+selftest: build codegen-audit e2e-config-flags e2e-title e2e-api e2e-steps e2e-permission e2e-sandbox e2e-tasks e2e-goal e2e-diff p30-check
 	UYA_BIN=$(UYA) $(OUT) --selftest
 
 probe: build
@@ -295,6 +295,22 @@ e2e-steps: build
 # DSH 自己的会话列表（读 ~/.dsh/sessions，含 zstd）
 e2e-dsh: build
 	$(OUT) --list-dsh-sessions
+
+# P30：运行中的命令不再等 step 边界（真终端 + 假网关；离线，不联网）
+#   三条验收（脚本见 testdata/pty_drive.py，假网关见 testdata/mock_gateway_sse.py）：
+#     1) 单步长流式里敲 /status：浮层必须 ≤800ms 出现，且那一刻回合还在跑
+#        （旧实现要等这一步走完 —— 3s 的单步流实测 2245ms，用户看到的就是卡死）
+#     2) 回合运行中敲 /new：立刻回执 + 中断当前回合（随后由主循环开新会话）
+#     3) esc 中断一回合之后再发一条任务：必须正常跑完（曾经被粘住的中断标志秒断）
+#   P31 起再加四条「请求在飞」的验收（判据与数字见 README §6 的 P31 验收记录）：
+#     4) 响应头还没回来时敲 /status：≤800ms（旧实现要等头到 —— 3s 的头实测 2280ms）
+#     5) 空闲敲 /status：≤150ms（旧实现 242ms = 等下一次 200ms 轮询）
+#     6) bash 跑着时敲 /status：≤200ms（且回合仍在跑）
+#     7) 压缩的摘要请求在飞时敲 /status：≤300ms（且必须证明压缩真发过请求）
+#   PTY_DUMP=1 会把子进程屏幕打出来；单跑一个场景：
+#     python3 testdata/pty_drive.py --port <假网关端口> --workspace /tmp/ws status-single-step
+p30-check: build
+	@python3 testdata/pty_drive.py --suite
 
 # TUI：打印 home / chat 两屏纯文本快照（README 引用的就是它，改动排版时先看这个）
 tui-demo: build
