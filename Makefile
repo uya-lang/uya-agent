@@ -29,7 +29,7 @@ TASK ?= 创建 hello.uya，编译并运行它
 export UYA_ROOT
 export UYA_SPLIT_C_DIR := $(CURDIR)/build/uyacache
 
-.PHONY: all check build selftest codegen-audit probe e2e e2e-config e2e-config-flags e2e-title e2e-api e2e-steps e2e-permission e2e-sandbox e2e-tasks e2e-goal e2e-diff e2e-ws e2e-dsh p30-check tui-demo tui-selftest diff-selftest clean
+.PHONY: all check build selftest codegen-audit probe e2e e2e-config e2e-config-flags e2e-title e2e-api e2e-steps e2e-permission e2e-sandbox e2e-tasks e2e-goal e2e-sessions e2e-diff e2e-ws e2e-dsh p30-check tui-demo tui-selftest sess-selftest diff-selftest clean
 
 all: build
 
@@ -54,7 +54,7 @@ codegen-audit: build
 	fi; \
 	echo "codegen-audit: 通过（没有切片描述符强转）"
 
-selftest: build codegen-audit e2e-config-flags e2e-title e2e-api e2e-steps e2e-permission e2e-sandbox e2e-tasks e2e-goal e2e-diff e2e-ws p30-check
+selftest: build codegen-audit e2e-config-flags e2e-title e2e-api e2e-steps e2e-permission e2e-sandbox e2e-tasks e2e-goal e2e-sessions e2e-diff e2e-ws p30-check
 	UYA_BIN=$(UYA) $(OUT) --selftest
 
 probe: build
@@ -184,7 +184,7 @@ e2e-diff: build
 	echo "$$out" | grep -q "not a git repository" || { echo "FAIL: 非仓库目录没有报出「不是 git 仓库」"; echo "$$out"; exit 1; }; \
 	echo "e2e-diff: 通过（真 git 的列表 + 单列文本回退 + 非仓库报错）"
 
-# P31：工作区（离线）—— 真二进制跑四条：
+# P34：工作区（离线）—— 真二进制跑四条：
 #   ① 恢复会话时工作区跟着**会话记录**走，/diff 打的是那个工作区的改动；
 #   ② 恢复不去动日志的存放位置（不再造出同 id 的空文件、索引 cwd 不被改写）；
 #   ③ 显式 --workspace 优先于会话记录；
@@ -353,10 +353,44 @@ e2e-dsh: build
 #        （旧实现要等这一步走完 —— 3s 的单步流实测 2245ms，用户看到的就是卡死）
 #     2) 回合运行中敲 /new：立刻回执 + 中断当前回合（随后由主循环开新会话）
 #     3) esc 中断一回合之后再发一条任务：必须正常跑完（曾经被粘住的中断标志秒断）
+#   P31 起再加四条「请求在飞」的验收（判据与数字见 README §6 的 P31 验收记录）：
+#     4) 响应头还没回来时敲 /status：≤800ms（旧实现要等头到 —— 3s 的头实测 2280ms）
+#     5) 空闲敲 /status：≤150ms（旧实现 242ms = 等下一次 200ms 轮询）
+#     6) bash 跑着时敲 /status：≤200ms（且回合仍在跑）
+#     7) 压缩的摘要请求在飞时敲 /status：≤300ms（且必须证明压缩真发过请求）
 #   PTY_DUMP=1 会把子进程屏幕打出来；单跑一个场景：
 #     python3 testdata/pty_drive.py --port <假网关端口> --workspace /tmp/ws status-single-step
 p30-check: build
 	@python3 testdata/pty_drive.py --suite
+
+# P33：/sessions 列表（离线，行式 REPL 走真二进制）：三列 = 标题 / 工作区 / session id，
+# 按 lastActiveAt 倒序、同 id 只留最后一条。TUI 浮层那条腿（宽箱体 / 逐行宽度不变量 /
+# 选中项取完整 id）在 selftest 的 tui-sessions 轮里断言。
+e2e-sessions: build
+	@set -e; \
+	home=build/selftest_sess_e2e; rm -rf $$home; mkdir -p $$home; \
+	ida=session-aaaa1111-1111-4111-8111-111111111111; \
+	{ \
+	  printf '%s\n' "{\"id\":\"$$ida\",\"cwd\":\"/w/old-a\",\"lastActiveAt\":1000,\"title\":\"OLDTITLE-旧会话第一次记录\",\"model\":\"m\",\"delegationDepth\":0,\"turns\":0,\"events\":0,\"path\":\"/x\"}"; \
+	  printf '%s\n' '{"id":"session-cccc3333-3333-4333-8333-333333333333","cwd":"/w/none","lastActiveAt":7000,"title":"","model":"m","delegationDepth":0,"turns":0,"events":0,"path":"/x"}'; \
+	  printf '%s\n' "{\"id\":\"$$ida\",\"cwd\":\"/w/new-a\",\"lastActiveAt\":9000,\"title\":\"NEWTITLE-最新会话第二次记录\",\"model\":\"m\",\"delegationDepth\":0,\"turns\":0,\"events\":0,\"path\":\"/x\"}"; \
+	} > $$home/index.jsonl; \
+	out=$$(printf '/sessions\n/exit\n' | $(OUT) --no-dsh-config --no-tui --quiet --api-key dummy-key --agent-home $$home 2>&1); \
+	echo "$$out" | grep -qF "NEWTITLE" \
+		|| { echo "FAIL: 列表里没有最新会话的标题（第一列不是标题？）"; echo "$$out"; exit 1; }; \
+	echo "$$out" | grep -qF "OLDTITLE-旧会话第一次记录" \
+		&& { echo "FAIL: 被取代的旧记录还在列表里（同 id 没取最后一条）"; echo "$$out"; exit 1; }; \
+	[ "$$(echo "$$out" | grep -c "$$ida")" -eq 1 ] \
+		|| { echo "FAIL: 同一个 session id 出现次数 != 1（去重没生效）"; echo "$$out"; exit 1; }; \
+	echo "$$out" | grep -qF "(无标题)" \
+		|| { echo "FAIL: 空标题没有落到占位串上"; echo "$$out"; exit 1; }; \
+	echo "$$out" | grep -qE "/w/new-a +session-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$$" \
+		|| { echo "FAIL: 工作区列与完整 session id 没有排成「工作区在前、id 在行尾」"; echo "$$out"; exit 1; }; \
+	n_new=$$(echo "$$out" | grep -n "NEWTITLE" | head -1 | cut -d: -f1); \
+	n_old=$$(echo "$$out" | grep -n "(无标题)" | head -1 | cut -d: -f1); \
+	[ -n "$$n_new" ] && [ -n "$$n_old" ] && [ "$$n_new" -lt "$$n_old" ] \
+		|| { echo "FAIL: 不是时间倒序（最新的必须在上面）"; echo "$$out"; exit 1; }; \
+	echo "e2e-sessions: 通过（三列 / 时间倒序 / 同 id 取最后一条 / 空标题占位 / id 完整）"
 
 # TUI：打印 home / chat 两屏纯文本快照（README 引用的就是它，改动排版时先看这个）
 tui-demo: build
@@ -365,6 +399,10 @@ tui-demo: build
 # TUI 相关自测轮（只跑 frame/keys/sink/turn/pty，改动 TUI 时比整轮 selftest 快得多）
 tui-selftest: build
 	UYA_SELFTEST_TUI_ONLY=1 $(OUT) --selftest
+
+# P33：/sessions 列表的自测轮（纯函数排版 + TUI 浮层），改会话列表时比整轮 selftest 快
+sess-selftest: build
+	UYA_SELFTEST_SESS_ONLY=1 $(OUT) --selftest
 
 # P22：/diff 的自测轮（纯解析 + 真 git 端到端），改 /diff 时比整轮 selftest 快
 diff-selftest: build

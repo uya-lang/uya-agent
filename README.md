@@ -4,55 +4,35 @@
 多轮 loop 直到给出结论。全部代码 42 个 `.uya` 文件，**不引入任何 C 代码、`@c_import` 或其它语言**，
 只依赖 Uya 语言与随编译器分发的标准库。
 
-**P0–P30 全部完成**（**P31 是「工作区」**：工作区从「启动时定一次」变成**当前会话的状态** ——
+**P0–P34 全部完成**（**P34 是「工作区」**：工作区从「启动时定一次」变成**当前会话的状态** ——
 模型能用 `workspace` 工具报告/切换、人能敲 `/workspace [目录]`、每次切换都记进会话日志
 （`session/workspace`）与索引，恢复会话时**跟着会话记录落位**（显式 `--workspace` 优先，
 记录的工作区被删就留在当前目录并留话），`/diff` 的标题与文本头写的就是这个工作区 ——
-版本串 `p31-ws`，见 §2「工作区」与 §3 踩坑 48/49；
-**P30 是「运行中的 `/` 命令不再等 step 边界」**（并行线，版本串 `p30-pump`）；
-**P29 是 `/goal` 人类命令**：会话目标的看 / 建 / 改 / 暂停 / 恢复 / 清除，
-版本串 `p29-goal`，见 §2 的「会话目标与 /goal（P29）」与 §6 的验收记录；
-**P28 是「退不出」修复**：运行中的 `esc`/`ctrl+c`/`ctrl+d`/`/exit`
-必须**当场**生效，版本串 `p28-quit`，见 §2「退出与中断」与 §3 踩坑 46；P15、P21 这两个编号各被两条并行线用过一次，P22/P23/P24/P25/P26 也是
-并行线前后脚合的流：P21 的一条是**三级访问模式 + 内核沙箱**（机器名与 DSHpermission-presets 一致，见「访问模式」/「沙箱」两节，版本串 `p21-perm`）、另一条是
-**终端标题**（合流时按后到的编号记成 **P22**，版本串 `p22-title`）；P22 之后到的是
-**命令面板与 `/status` 浮层这条链**（合流时记成 **P23**，见 §3 踩坑 40）；再后到的是
-**脚注的 `内存` 字段 + 首 token 打点口径**（合流时记成 **P24**，版本串 `p24-mem`，
-见 §3 踩坑 41）；**任务状态 /tasks + 常驻任务块**记成 **P25**（版本串 `p25-tasks`）；本条线（**plan 模式写闸门 + `exit_plan_mode` 审阅浮窗**）按后到的编号记成 **P26**（版本串 `p26-plan`，见「plan 模式：写闸门与审阅浮窗」一节）；P15 的一条是「请求体控制字节全转义 +
-见 §3 踩坑 41）；再后到的是**任务状态 `/tasks` 与常驻任务块**（合流时记成 **P25**，
-版本串 `p25-tasks`）；最后到的 `/diff` 浮窗记成 **P27**（版本串 `p27-diff`）；
-P15 的一条是「请求体控制字节全转义 +
-并行线前后脚合的流：P21 的一条是**三级访问模式 + 内核沙箱**（机器名与 DSH
-permission-presets 一致，见「访问模式」/「沙箱」两节，版本串 `p21-perm`）、另一条是
-**终端标题**（合流时按后到的编号记成 **P22**，版本串 `p22-title`）；P22 之后到的是
-**命令面板与 `/status` 浮层这条链**（合流时记成 **P23**，见 §3 踩坑 40）；再后到的是
-**脚注的 `内存` 字段 + 首 token 打点口径**（合流时记成 **P24**，版本串 `p24-mem`，
-见 §3 踩坑 41）；最后到的 `/diff` 浮窗记成 **P27**（版本串 `p27-diff`）；P15 的一条是「请求体控制字节全转义 +
-默认走 Responses 接口」（落点见 §3 踩坑 27、§2 的 `jsonx.uya`/`session.uya`、§6 的
-`json-escape` / `ctrl-bytes*`）、一条是**子代理窗口面板**（§2 的「子代理窗口面板（并行线的 P15）」，
-踩坑 29））；
-P16 是**单行转录 + 思考行**，P17 是**纯 Uya 的全屏 TUI**，
-P18 是**常驻状态区 + 思考实时行**；**P19 是诊断出口与 read 窗口**：外来字节（网关错误体 /
-坏 payload 头部）只以「转义 + 字符边界截断 + 限长」的一行预览进转录，全文进会话日志
-`diag/dump`、原始字节走 `--debug-dump`（踩坑 33）；`read` 改成**流式窗口**读法，`total` 是
-数完整个文件得到的真值、只有真越界才报 EOF（踩坑 34）；**P20 是脚注统计行 + 上下文占用 +
-%cpu**；**P21 是三级访问模式 + 内核沙箱（bubblewrap）**；**P22 是终端标题跟随会话标题**；
-**P23 是命令面板与浮层这条链**（派发收口 / 无匹配不静默 / 运行中只读命令在 step 边界派发 /
-浮层滚动与溢出指示）；**P24 是脚注的 `内存` 字段（同批进程的 PSS 合计）、`%cpu` 改名 `cpu`，
-以及首 token 打点从「首个正文 delta」放宽成「第一个非空 delta」**（推理/工具型会话里那一组
-不再整组空着，tok/s 从爆表的几千回到真实的 150–290 量级；版本串 `p24-mem`，见踩坑 41）；
-**P25 是任务状态 `/tasks` 与可展开的常驻任务块**（清单 / 后台任务 / 子代理 / 会话目标四类汇成
-一张进度表，版本串 `p25-tasks`，见 §2 的「任务状态与 /tasks（P25）」与 §6 的验收记录））；
-**P26 是 plan 写闸门 + 审查浮窗**（版本串 `p26-plan`）、**P27 是 `/diff` 浮窗**（`p27-diff`）、
-**P28 是「退不出」这条线**（运行中的 esc/ctrl+c/ctrl+d 与 `/exit` 当场生效，`p28-quit`）、
-**P29 是 `/goal` 人类命令**（对齐 DSH 的 `/goal`，版本串 `p29-goal`）；
-**P30 把「运行中的 `/` 命令要等整个 step」这条边界去掉**（版本串 `p30-pump`）：派发点从
-step 边界一处铺到**全部泵点**（流式每 ≤50 ms 一次 + bash/后台任务/子代理/搜索/workflow 的轮询
-循环），只读命令当场开浮层（真终端实测 2245 ms → **103 ms**），有副作用的命令立刻给回执并写清
-落点（`/new`、`/resume` 先中断当前回合，`/compact` 排 step 边界）；**没有走真线程** ——
-试通了但被工具链的分配器否掉，证据与口径见 §3 踩坑 47 与 §2 的「运行中的命令不再等
-step 边界（P30）」。
-LLM 交互是**流式 SSE**（`stream:true` + `stream_options.include_usage`），
+版本串 `p34-ws`，它和并行线的 `p31-wait` / `p32-scroll` / `p33-sess` 撞号，
+按「后到的顺延」记成 **P34**，见 §2「工作区（P34）」与 §3 踩坑 52/53；
+**P33 是 `/sessions` 列表这条线**：三列 = 标题 / 工作区 / session id、
+按 `lastActiveAt` 倒序、列宽随终端自适应、同 id 只留最后一条索引记录，版本串 `p33-sess`
+（它和并行线的 `p31-wait` / `p32-scroll` 前后脚撞号，按「后到的顺延」记成 P33），
+见 §2「会话持久化与恢复（P4）」与 §3 踩坑 50/51；**P32 是「工作区里的转录真的能翻看」**：TUI 进入时开鼠标上报
+（`ESC[?1000h/1006h`）把滚轮从「被 xterm.js 伪装的 ↑/↓」救回来、`ctrl+home/end`
+（`ESC[1;5H/F`）的参数解析修对、滚动按**真总量**走查（一个上万行的长条目也能翻到最前面）、
+`pgup/pgdn` 按整屏走、顶部给 `^` 溢出指示 —— 版本串 `p32-scroll`，见 §3 踩坑 49 与 §6 的验收记录；
+**P31 是「请求在飞的那段也插泵点」**（版本串 `p31-wait`）：等响应头 / 写请求体 / 压缩请求都插泵点，
+命令派发当场出帧，见 §3 踩坑 48；**P30 是「运行中的 `/` 命令不再等 step 边界」**（版本串 `p30-pump`）：
+派发点从 step 边界一处铺到全部泵点，只读命令当场开浮层，有副作用的命令立刻给回执并写清落点，
+见 §3 踩坑 47；**P29 是 `/goal` 人类命令**：会话目标的看 / 建 / 改 / 暂停 / 恢复 / 清除，版本串 `p29-goal`，
+见 §2 的「会话目标与 /goal（P29）」；**P28 是「退不出」修复**：运行中的
+`esc`/`ctrl+c`/`ctrl+d`/`/exit` 必须**当场**生效，版本串 `p28-quit`，见 §2「退出与中断」与
+§3 踩坑 46；**P27 是 `/diff` 浮窗**（版本串 `p27-diff`）；**P26 是 plan 模式写闸门 +
+`exit_plan_mode` 审阅浮窗**（版本串 `p26-plan`）；**P25 是任务状态 `/tasks` 与可展开的常驻
+任务块**（版本串 `p25-tasks`）；**P24 是脚注的 `内存` 字段（同批进程的 PSS 合计）、`%cpu` 改名
+`cpu`，以及首 token 打点从「首个正文 delta」放宽成「第一个非空 delta」**（版本串 `p24-mem`，
+见踩坑 41）；**P23 是命令面板与 `/status` 浮层这条链**（见踩坑 40）；**P22 是终端标题跟随
+会话标题**（版本串 `p22-title`）；**P21 是三级访问模式 + 内核沙箱**（版本串 `p21-perm`，
+另有并行线的一条用了同一编号，合流时记成 P22 的终端标题）；**P15** 也各被两条并行线用过一次
+（一条是「请求体控制字节全转义 + 默认走 Responses 接口」——见 §3 踩坑 27、§2 的
+`jsonx.uya`/`session.uya`、§6 的 `json-escape` / `ctrl-bytes*`；另一条是**子代理窗口面板**
+——见 §2 的「子代理窗口面板（并行线的 P15）」与踩坑 29））：LLM 交互是**流式 SSE**（`stream:true` + `stream_options.include_usage`），
 增量 chunked 解码 + SSE 分帧 + `tool_calls` 按 `index` 分片累积；消息协议是**严格工具协议**
 （`assistant.tool_calls` 原样回灌 + 每条结果一条 `role:"tool"` + `tool_call_id`）；
 交互界面是**真 TTY**（termios raw + 行编辑器），流式期间可打断、可继续输入、可续跑；
@@ -135,7 +115,7 @@ DSH `permission.defaultPreset`），read-only 下 `write`/`edit` 硬拒、`bash`
 与模型工具 `create_goal` / `get_goal` / `update_goal` 共用同一份状态：工具走 CAS
 （id + revision），人在回路里直接以当前为准。TUI 里结果是**浮层**、滚动模式打转录，
 带参数的那条还会当场重画常驻任务块的目标段（P22 的块与 `/goal` 共用同一条投影）。
-**P31 把「工作区」变成当前会话的状态**：以前它只在启动时定一次（`getcwd` / `--workspace` /
+**P34 把「工作区」变成当前会话的状态**：以前它只在启动时定一次（`getcwd` / `--workspace` /
 `$UYA_AGENT_WORKSPACE`），于是「这个会话现在在哪」既没人记、也切不动 —— 恢复一个别的目录
 的会话时，`/diff`、文件工具、bash、沙箱可写根用的还是**启动目录**（用户报的就是这个）。
 现在：
@@ -202,6 +182,8 @@ make e2e-permission # 访问模式的四级来源 + 非法值报错（离线）
 make e2e-sandbox    # 沙箱后端探测 / --no-sandbox / 显式 bwrap 路径（离线）
 make e2e-tasks      # /tasks 报告头 / 空态串 / open|toggle|非法参数 / /help（离线）
 make e2e-goal       # /goal 用法 / 创建 / 拒绝顶掉 / edit / pause·resume / clear / /help（离线）
+make e2e-sessions   # /sessions 三列 / 时间倒序 / 同 id 取最后一条 / id 完整（离线）
+make sess-selftest  # 只跑 /sessions 那两轮（纯函数排版 + TUI 浮层），改会话列表时最快
 make probe        # 传输层探针：打真实 https 端点，期望 HTTP 401（不需要 key）
 ```
 
@@ -332,15 +314,22 @@ src/tui.uya       全屏 TUI（P17/P18）：帧模型（行=段序列，逐行 d
                   P19：诊断（NOTICE）条目限长（`TUI_NOTICE_MAX`）、非法/半截 UTF-8 → U+FFFD、
                   思考尾部按字符边界切；P25 再加**常驻任务块**（钉在状态区之上：转录 → 任务块 →
                   agents 箱体 → 状态区 → 面板）、`ctrl+t` 切展开态（键层只置请求、主循环落地）、
-                  信息行在块非空时才挂 `ctrl+t tasks` 提示
-src/sigselftest.uya 信号层的自测轮次（sig-abi / sig-basic / sig-term-restore / sig-child-reset）
-src/tuiselftest.uya TUI 的自测轮次（tui-frame / tui-keys / tui-sink / tui-turn / tui-status / tui-pty /
+                  信息行在块非空时才挂 `ctrl+t tasks` 提示；P32 再加**真翻看**：鼠标上报
+                  （`ESC[?1000h/1006h`）与 SGR 滚轮（`ESC[<64/65;x;yM`）、CSI 多参数解析
+                  （`p1;p2` 修饰键，`ctrl+home/end`）、按真总量走查的滚动定位
+                  （`tui_auto_end_scroll`）、`^` 溢出指示
+src/sigselftest.uya 信号层的自测轮次（sig-abi / sig-basic / sig-term-restore / sig-child-reset；
+                  P32 起恢复序列多一段「关鼠标上报」，四种形态的长度跟着改）
+src/tuiselftest.uya TUI 的自测轮次（tui-frame / tui-keys / tui-sink / tui-turn / tui-status / tui-cmd /
+                  tui-plan / tui-exit / tui-quit / tui-tasks / tui-diff / tui-scroll / tui-pty /
                   tty-title-pty；P20/P24 起 tui-frame 还断言脚注统计行的逐级退化、右对齐
                   （末尾 3 列空白）与 `ctx` / `cpu` / `内存` 三档让位顺序，
                   P22 起 tui-pty 与 tty-title-pty 还逐字节断言终端标题；
                   tui-frame 现在还逐行量**浮层方框**的左右边界列——长行把右边框顶出去那类
                   缺陷（踩坑 42）只有它会红；P26 起加 tui-plan：审阅浮窗排版/滚动/三动作/数字直选 +
-                  headless fail closed + 真 PTY 批准与解决）
+                  headless fail closed + 真 PTY 批准与解决；P31 起加 tui-p31：派发之后**同一次
+                  调用里**就出一帧（`tui_frame_count()` +1）+ 泵点上下文登记/清掉的口径；
+                  P32 起 tui-scroll 钉「长条目翻看 / ctrl+home·end / SGR 滚轮 / 整屏 PgUp / `^` 指示」）
 src/inbox.uya     输入收件箱：steer（运行中输入的文本，step 边界领取）+ keepInbox 语义
 src/yamlcfg.uya   自带 YAML 子集解析器：去注释（块标量/引号感知）、中和 `!!tag`、
                   block/flow 映射与序列、`|`/`>` 块标量、跨行 flow 集合、节点池树 + 导航
@@ -391,10 +380,10 @@ src/sandboxx.uya  内核沙箱（P21，对齐 DSH bash-sandbox 的 Linux bwrap �
                   工作区写另加 ephemeral /tmp 与可写 workspace bind）、不可用时的 fail-closed 判定
 src/askuser.uya   ask_user_question：交互模式复用行编辑器，非交互读一行，EOF 时回「无回答」；
                   P21 加 ask_approve_command（read-only 下 bash 的逐条批准通道）；
-                  P31 泛化成 ask_approve_action（bash 与「切工作区」共用同一套浮层/真 TTY/fail-closed）
+                  P34 泛化成 ask_approve_action（bash 与「切工作区」共用同一套浮层/真 TTY/fail-closed）
 src/session.uya   会话日志：路径规范化、id 生成（/dev/urandom→uuid）、header/事件序列化与追加写、
                   索引、读取与崩溃尾部裁剪、按 id/最近查找、括号配平的数组提取；
-                  P31 加 `sess_read_meta`（header 的创建时 cwd + 最后一条 `session/workspace`
+                  P34 加 `sess_read_meta`（header 的创建时 cwd + 最后一条 `session/workspace`
                   = 这个会话**现在**在哪）与 `sess_open_resume`（续写**原来那份**日志，
                   不再按当前目录重算路径 —— 见踩坑 48）
 src/stats.uya     会话统计折叠（P20）：逐行对照 DSH 的 `sessionStats` + `tokenUsage` ——
@@ -580,7 +569,8 @@ TTY/ANSI 代码），所以这里是把**那套内容模型搬到滚动终端**�
   消息数只统计已读入的部分（zstd 前缀），所以列表里写作 `msgs≈`。
 * `make` 目标：`check` / `build` / `selftest`（离线 33 轮）/ `probe` / `e2e TASK=… [PIN=…]`（真实网关）/
   `e2e-config`（零参数打印生效配置）/ `e2e-dsh`（列 DSH 会话）/ `e2e-title`（终端标题开关四条回归，
-  P22）/ `e2e-permission` / `e2e-sandbox`（P21 访问模式与沙箱）/ `tui-selftest`（只跑 TUI 轮）/
+  P22）/ `e2e-permission` / `e2e-sandbox`（P21 访问模式与沙箱）/ `e2e-tasks` / `e2e-goal` /
+  `e2e-sessions`（P33 会话列表）/ `tui-selftest`（只跑 TUI 轮）/ `sess-selftest`（只跑 P33 那两轮）/
   `tui-demo`（打印 TUI 的几屏纯文本快照：home / chat / 运行中 / 常驻任务块 / plan 审阅浮窗）。
 
 ### workflow：Uya 脚本 + 钩子代理（P12）
@@ -782,6 +772,21 @@ Messages API（`x-api-key` + `anthropic-version: 2023-06-01`，服务端工具 `
   见踩坑 27 的后半段）。
 * 入口：`--continue`（当前目录最近一条）、`--resume <id|last>`、`--list-sessions`、`--no-save`；
   REPL 里 `/sessions`、`/resume <id>`、`/new`。
+* **会话列表（P33）**：`/sessions`（浮层）、滚动模式的 `/sessions`、`--list-sessions` 打印的是
+  **同一份**三列表 —— **① 标题 ② 工作区 ③ session id**：
+  * 顺序按 `lastActiveAt` **倒序**（最新的在第一行；缺这个字段的记录排最后），回车即恢复最新那条；
+  * 索引是追加写的（每关一次会话追加一条），同一个 id 会有多行 —— 列表按索引自己的契约
+    「同 id 取最后一条」去重，所以同一个会话只出现一次（2026-10-03 真机 `index.jsonl`
+    实测 332 行 / 322 个会话，其中一个 id 出现 4 次；这个文件一直在长，每跑一次会话就多几行）；
+  * 列宽随终端宽度自适应：浮层箱体铺到 `cols-6`，可用列数按
+    「三列 → 两列（丢掉工作区列）→ 只剩 id」退化，每列至少 6 列才画（不足 6 列的那一列不如不画）；
+  * 列宽按**显示列**算（汉字 2 列），标题**保头**补 `…`、工作区**保尾**补 `…`（路径尾部信息量最大），
+    单元格内容先过 `tty_title_clean_into` 清洗（控制字节 / ESC / 半截 UTF-8 都换掉）；
+  * **id 在条目文本里永不裁剪**：选中项的 id 是从条目文本里取的，显示层再窄也只是「看不见」，
+    `/resume` 永远拿到完整 id（滚动模式没有渲染层，打印前用 `sess_rows_clip_into` 按列硬裁并补 `…`
+    —— 半截 id 抄去 `/resume` 一定失败，得让人看出来被裁过）；
+  * 浮层里回车走 `agent_tui_sessions_head`（**取行尾那个 token**，且必须以 `session-` 开头），
+    不是面板那套「取行首第一个词」—— 第一列现在是标题，取错就变成拿标题去 `/resume`（见踩坑 50）。
 * `session/title`（P22）就是终端标题的来源：首条用户消息派生一条（`source.kind = "fallback"`，
   对齐 DSH 的前 5 词 / ≤40 B 口径），恢复会话时由日志里**最后一条** title 事件决定标题。
   注意 `sess_open` 会重新初始化整个 `SessionLog`（含 `title`），所以恢复路径必须把回放出来的
@@ -860,7 +865,7 @@ TTY 交互模式**默认全屏**（`--no-tui` 退回上一节的滚动转录；�
 
   ▌ ↑ Ask anything... "把 hello.uya 的问候语改成 Hello, DSH!"
   ▌ Build   Full access   deepseek-chat   deepseek  tab plan   ctrl+p commands
-  ~/uya-agent:main                                                                 p29-goal
+  ~/uya-agent:main                                                                 p33-sess
 ```
 
 对话态（`--tui-demo` 打印的就是这几屏的纯文本快照）：
@@ -977,10 +982,15 @@ plan 审阅浮窗（`--tui-demo` 的**第 ⑤ 屏**，任务块那两帧是 ④a
 * **键位**：`enter` 发送 · `ctrl+j` / `alt+enter` 换行 · `esc` 运行中=中断（**当场杀掉正在跑的工具子进程**）、空闲=清行 ·
   `ctrl+c` 运行中=中断（两秒内再按=退出）、空闲=清空/两次退出 · `ctrl+d` 空行退出（**运行中也生效**）· `/exit`（打字或面板选）退出 · **`shift+tab` 访问模式选择浮层** ·
   `↑/↓` 单行=历史、
-  多行=上下移光标 · `pgup/pgdn`、`ctrl+home/end` 滚转录 · `tab` 切计划模式（面板显示 `Plan`）· **`ctrl+t` 展开/收起常驻任务块** ·  `ctrl+p` 命令面板（输入以 `/` 开头也会自动打开）· `ctrl+u/w/k` 清行/删词/删到行尾 ·
+  多行=上下移光标 · **滚动（P32）**：`pgup/pgdn` 一屏、`ctrl+home`/`ctrl+end` 到顶/回底、
+  **鼠标滚轮**（一格 5 行）、`ctrl+↑/↓` 与滚轮同口径；单行输入下裸 `↑` 仍然是历史（不抢），
+  多行输入里 `↑/↓` 仍是光标移动 · `tab` 切计划模式（面板显示 `Plan`）·
+  **`ctrl+t` 展开/收起常驻任务块** · `ctrl+p` 命令面板（输入以 `/` 开头也会自动打开）·
+  `ctrl+u/w/k` 清行/删词/删到行尾 ·
   `ctrl+a/e`、`←/→`、`home/end`、`backspace/del` 按**字符**编辑 · `ctrl+l` 强制重绘 ·
   括起粘贴（`ESC[200~`）整段插入不触发提交（> 64 KiB 截断）。
-* **浮层**：命令面板、会话列表（选一个 `/resume`）、帮助（`/help`）、`/status` 详情、
+* **浮层**：命令面板、会话列表（三列 = 标题 / 工作区 / session id，按时间倒序、列宽随终端自适应，
+  回车把选中的会话 `/resume` 回来 —— 见 §2「会话持久化与恢复（P4）」的 P33 那条）、帮助（`/help`）、`/status` 详情、
   **`/goal` 会话目标**（P29：纯查看型，正文就是 `goal_cmd_run` 的输出 —— 状态块或用法）、
   **访问模式选择器与 Full access 确认**（P21，底对齐，贴着输入面板往上弹）、
   **read-only 下 bash 的逐条批准**（P21：↑/↓ + enter，esc = 无回答）、
@@ -998,8 +1008,9 @@ plan 审阅浮窗（`--tui-demo` 的**第 ⑤ 屏**，任务块那两帧是 ④a
   命令面板是由输入行里的 `/` 触发的，**派发之后那个 `/` 会被一起收走**（P23）——
   否则下一次敲 `/status` 会拼成 `//status`，被当成未知命令丢掉（见 §3 踩坑 40）。
   回合运行中敲 `/status` / `/help` / `/tasks` / `/sessions` / `/diff` 也能用：**按键当下**就派发
-  （P30 起派发点在每个泵点，不再等 step 边界）；`/new`、`/resume` 会**先中断当前回合**再执行，
-  `/compact` 排在 step 边界，`/continue`、`/exit` 等回合结束 —— 每条都先给回执，见 §7。
+  （P30 起派发点在每个泵点，不再等 step 边界；P31 起「请求在飞」的那几段——等响应头 / 写请求体 /
+  压缩的摘要请求——也有泵点，且派发之后**当场画一帧**）；`/new`、`/resume` 会**先中断当前回合**
+  再执行，`/compact` 排在 step 边界，`/continue`、`/exit` 等回合结束 —— 每条都先给回执，见 §7。
   命令面板里的 `/goal` 只会交出**裸命令名**，带参数的 `/goal pause` 那种要写盘，所以回合里手敲的
   走 steer → 主循环那条路（`agent_tui_cmd_safe` 放行的也只有裸 `/goal`）；`/diff` 只读，当场派发。
 * **`/diff` 浮窗（P28）**：占满转录区可用高度（面板之上、状态区之外；放不下就**不开**
@@ -1032,8 +1043,13 @@ plan 审阅浮窗（`--tui-demo` 的**第 ⑤ 屏**，任务块那两帧是 ④a
 * **记忆上限**：条目 ≤ 512、正文 ≤ 4 MiB、单条 ≤ 256 KiB，超了从最老丢并在顶部留一行标记；
   思考条目只留尾部 4 KiB；状态区的思考实时行只留尾部 1 KiB（都与 P15/P16 的
   「思考行只显示最新一段」同口径）。
-* 仍不做：鼠标（滚轮/点击/选择）、图片、可折叠卡片、完整语法高亮（只做轻量 markdown）、
-  分屏、主题切换 UI。
+* **翻看长内容（P32，见 §3 踩坑 49）**：转录窗口按**真总量**走查定位，所以一个上万行的
+  长条目（一条长 `read` 结果、一段长正文）也能一路翻到最前面 —— 到顶时转录区第 0 行会挂一个
+  `^`（还有内容在上面；贴尾时一个字节都不画，排版与 P32 之前逐字节一致）。
+  滚轮是**真鼠标事件**：进 TUI 时开 `ESC[?1000h` + `ESC[?1006h`，收 `ESC[<64;x;yM` / `65`；
+  被信号打断或正常退出都会 `1006l`/`1000l` 关回去（不然退出后鼠标事件会灌进 shell）。
+* 仍不做：鼠标**点击/拖选**（滚轮做了，选择仍靠终端的 shift/option）、图片、可折叠卡片、
+  完整语法高亮（只做轻量 markdown）、分屏、主题切换 UI。
 
 #### 运行中的状态区与思考实时行（P18）
 
@@ -1152,7 +1168,7 @@ CPU、`内存` 同一批进程的内存合计），右边是**整会话统计行
 120 列：~/uya-a… · ctx 21% · cpu 37% · 内存 312M 1 轮 · 12 步 | LLM 50.7s · 工具调用 4.1s | 首 token 平均 1.5s · 221 tok/s…
 100 列：~/uya-agent:main · ctx 21% · cpu 37% · 内存 312M   1 轮 · 12 步 | LLM 50.7s · 工具调用 4.1s…
  80 列：~/uya-agent:main · ctx 21% · cpu 37% · 内存 312M   1 轮 · 12 步…     ← 内存占 12 列之后，
- 60 列：~/uya-agent:ma… · ctx 21% · cpu 37% · 内存 312M   p24-mem              统计行在 80 列就只剩
+ 60 列：~/uya-agent:ma… · ctx 21% · cpu 37% · 内存 312M  p32-scroll            统计行在 80 列就只剩
  40 列：ctx 21% · cpu 37% · 内存 312M                                       第一组了；版本号那两行是
  32 列：ctx 21% · cpu 37%                                                   右半区整条让位的形态
 ```
@@ -1356,6 +1372,43 @@ DSH 里认不出来的值（例如表示「旋钮不匹配任何预设」的 `cu
 
 **没有走真线程**（试过、写通了、最后否掉）：见踩坑 47 —— 工具链的堆在两条线程并发 malloc 时
 必崩（8/8），所以界面与回合仍在同一条线程里，泵点是**协作式**的。
+
+### 请求在飞的那段也不再是空白（P31，版本串 `p31-wait`）
+
+**现场**（用户报的）：P30 之后 `/status` **还是**慢。真终端量下来，慢的不是流式那一段（103 ms），
+而是**请求已经发出去、响应头还没回来**的那一段：敲 `/status` 要等头到才动 —— 假网关把头压住
+3 s，浮层就是 **2280 ms** 才出来；压缩的摘要请求同理（**2833 ms**）。根因三条，都是「一个泵点
+都没有」的阻塞段：
+
+* **`hc_open` 读响应头**（`src/httpstream.uya`）：读 `\r\n\r\n` 的循环是纯阻塞 `conn_read`，
+  头没到之前没有 poll、没有泵 —— 空白的上限就是 `timeout_ms`（默认 120 s）。P30 的验收 mock
+  （`mock_send_sse_slow`）刻意让「响应头 + 第一帧先到」，正好绕开了这一段（踩坑 47 里那条
+  「假阴性」记的就是它，其实它是**用户可见的真窗口**）。
+* **写请求体**（`src/httpc.uya` 的 `tls_write_all`）：每 16 KiB 一条 TLS 记录，每条都是阻塞写；
+  大上下文 + 慢上行时同样是秒级空白。
+* **压缩请求**（`agent_maybe_compact`）：`llm_stream_style` 的 `interactive` 写死 `false`，
+  于是摘要请求的**整段流式**都没有泵点；而且主循环发起的命令（空闲时敲 `/compact`）不在回合里，
+  泵点上下文（`g_pump_cfg`/`g_pump_hist`）是空的 —— 就算泵了也不会派发命令。
+
+改动（仍是一条线程，没有引入线程）：
+
+* **`hc_open` 等响应头**：`poll(≤50 ms)` + `agent_pump_light()`，与 `httpc.uya` 的读到 EOF 循环、
+  同文件的 `hc_fill_wait` 同一套做法；超时按**墙上时间** `timeout_ms` 判（与 SO_RCVTIMEO 同口径，
+  只是更严一点：原来每个分片各给一次 timeout）。非 TUI（子代理 / 一次性运行 / 管道 / `--probe`）
+  走原样的阻塞读，行为不变。
+* **进阻塞段之前先泵一次**：DNS 解析与 TLS 握手在工具链调用内部，插不进泵点（`std/net/dns.uya`、
+  `https_client_handshake`），但至少可以在踏进去之前服务一次键盘与命令。
+* **`tls_write_all` 每写一条记录泵一次**：把「刚发请求」的空白缩到一条记录（≤16 KiB）。
+* **压缩请求改成 `interactive = g_interactive`**：键盘与运行中的只读命令照常服务，esc/ctrl+c
+  现在能中断压缩（被中断时打 `[compact] 已中断（历史未改动）`，不再复用「摘要请求失败」那句
+  误导文案）。
+* **主循环跑命令时也登记泵点上下文**（`agent_pump_ctx_begin`/`agent_pump_ctx_end`）：空闲时敲
+  `/compact` 发出去的摘要请求在飞时，`/status` 之类照样当场派发。
+* **派发之后当场出帧**：`agent_tui_poll_pending_cmd` 在派发（或给出回执）之后直接 `tui_render()`；
+  TUI 主循环每圈开头也先 `tui_render()` 再进阻塞等待。以前命令执行完只是标脏，要等下一次
+  `tui_poll_keys(200)`（空闲）或下一个泵点（回合内 ≤50 ms）才上屏 —— 空闲那 242 ms 全在这里。
+
+剩下真正插不进泵点的只有 **DNS 解析**（≤5 s）与 **TLS 握手**（≤`timeout_ms`）两段，见 §7。
 
 ### 会话目标与 /goal（P29）
 
@@ -2177,8 +2230,113 @@ vLLM 等 OpenAI 兼容端点都一样稳。想升级成严格 `tool` 角色消�
       客户端还卡在「等响应头」，根本没进流式循环，用它测「运行中派发」会得到**假阴性**
       （实测延迟 4.8 s，看着像没修）。要测这个必须让**响应头 + 第一帧先到**、正文再停：
       见 P30 新加的 `mock_send_sse_slow`（`mock_mode = 40`）。
+      后话（P31）：那条「假阴性」判错了性质 —— 它不是测试写错，而是**用户可见的真窗口**：
+      「等响应头」这段本来一个泵点都没有，见踩坑 48。
 
-48. **恢复会话时按「当前目录」重算日志路径 —— 会话被劈成两半，索引里的工作区也跟着被改写**（P31，
+48. **「`/status` 还是慢」：慢的不是流式那段，是「请求在飞」的那段**（P31，用户报的）。
+    P30 把派发点铺满泵点之后，用户复测还是慢。真终端（`testdata/pty_drive.py` 的新场景 +
+    假网关新增的 `HEAD_DELAY_MS`）量出来的分布是这样的：
+
+    | 场景 | 改前 | 改后 |
+    |---|---|---|
+    | 回合流式中 | 103 ms | 101 ms |
+    | **请求已发出、响应头未到**（头压住 3 s） | **2280 ms** | **53 ms** |
+    | 空闲 | 242 ms | 62 ms |
+    | bash 跑着 | 103 ms | 102 ms |
+    | **压缩在飞**（`/compact` 的摘要请求） | **2833 ms** | **63 ms** |
+
+    * **根因一（大头）**：`hc_open` 读响应头的循环是纯阻塞 `conn_read`，头到之前**没有 poll、
+      没有泵** —— 敲的 `/status`、esc、ctrl+c 全都没人读，空白的上限是 `timeout_ms`（默认
+      120 s）。修法与 `httpc.uya` 读到 EOF 那条路、`hc_fill_wait` 完全一样：`poll(≤50 ms)` +
+      `agent_pump_light()`，超时改按墙上时间判。
+    * **根因二**：命令执行完只是 `tui_mark_dirty()`，没人当场画帧 —— 空闲要等下一次
+      `tui_poll_keys(200)`（242 ms 全在这里），回合内要等下一个泵点。修法是派发（或给出回执）
+      之后直接 `tui_render()`，主循环每圈开头也先 `tui_render()` 再阻塞。注意**不能**改成调
+      `tui_tick()`：它有空闲 8 fps 的节流（`now - last_frame < 120` 就跳过），刚派发完那一帧
+      正好会被它吞掉。
+    * **根因三**：`agent_maybe_compact` 把 `interactive` 写死 `false` → 摘要请求整段流式都没有
+      泵点；而且主循环跑命令时泵点上下文是空的（`agent_pump_ctx_begin`/`agent_pump_ctx_end` 补上）。
+    * **写测试时的坑**：压缩场景第一版把浮层留着就去查转录里的 `[compact]`，而浮层正好盖住转录
+      → `compact_ran` 恒为 false（判据自己骗自己，看着像「压缩没发请求」）。改成先 esc 关浮层再查。
+      判据必须能**证明这一轮真跑过**，否则「浮层很快出现」可能只是因为压根没发请求。
+
+49. **「工作区里文本不能滚动、翻不了旧日志」—— 三个独立的缺陷叠在一起**（P32，用户报的就是
+    这个）。分开看，第一个是**显示协议**问题，后两个是**滚动算术**问题：
+
+    * **① 滚轮在 DSH 的 web 终端里根本不是滚轮，是 ↑/↓。** DSH 的聊天工作区用 xterm.js
+      渲染 TUI；xterm.js 在**没有主持有鼠标协议**、且备用屏幕没有 scrollback 时，把
+      wheel 事件**转成 `ESC O A` / `ESC O B`（方向键）**并 `cancel` 掉默认滚动
+      （`bindMouse` 里的 `if(!s.wheel){ … if(!this.buffer.hasScrollback){ … triggerDataEvent(ESC+A/B) } }`）。
+      我们的 TUI 恰好把 `↑` 当**输入历史**，于是「滚轮向上」= 翻历史 —— 屏幕上什么都不动，
+      用户看到的正是「不能滚动、翻不了旧日志」。**修法**：进 TUI 时开
+      `ESC[?1000h`（上报按下/滚轮）+ `ESC[?1006h`（SGR 编码），滚轮这才以
+      `ESC[<64;x;yM` / `ESC[<65;x;yM` 的真身到达；`tui_esc_final` 只把 b 在 64..127 且
+      低两位 0/1 的两档折成 `TUI_K_WHEEL_UP/DOWN`，其余（按下/抬起/移动）一律丢弃。
+      退出与**被信号打断**两条路都要关回去（`sigx_arm` 的恢复序列现在以
+      `ESC[?1006l ESC[?1000l` 开头）—— 否则退出后鼠标事件会继续灌进 shell，终端里
+      满屏 `\e[<64;12;5M`。
+    * **② `ESC[1;5H`（ctrl+home）解析错**：老实现只在 `ESC[` 后收**一**格数字，遇到
+      `;` 就把它当终结符收尾 —— 于是 `ESC[1;5H` 只吃掉了 `ESC[1;`，剩下的 `5H` **当普通
+      字符插进了输入行**（屏幕上明晃晃的 `5H`），而且没跳到顶。`ESC[1;5F`、
+      `ESC[5;5~` 同理。**修法**：CSI 参数收成 p1/p2/p3（`tui_csi_push`/`tui_csi_arg`），
+      终结字节再统一分派；修饰键位按 xterm 的口径 `mods = p2 - 1`（shift=1/alt=2/ctrl=4），
+      `ctrl+↑/↓` 与滚轮同口径，`pgup/pgdn` 顺手改成**按整屏走**（老实现写死 5 行，
+      100×30 的窗口里按一下跟没按差不多）。
+    * **③ 长条目把 `max_scroll` 夹成 0。** 转录窗口是从尾部往上收行、`total >= need` 就停；
+      一个条目折出上万行时，窗口为了「够一屏」会把它**整个**装进来，`total` 于是远大于
+      视口，`max_scroll = total - 视口` 一旦被算小（老实现直接在收行结果上夹），
+      「继续往上翻 / 跳到顶」就再也翻不到这一条的前面部分。**修法**：`tui_auto_end_scroll`
+      按**真总量**夹（遍历全部条目量折行，条目内部按「够不够一屏」分块，代价与单条目行数
+      无关）；`pin_top_req` 保证「跳到顶」落在精确的 `max_scroll`（溢出一旦发生，顶部要给
+      `^` 指示留一行，可用行数比上一帧少一 —— 拿上一帧算出来的 max 会差一行，实测就是
+      「总也差最后一行到不了顶」）。
+    * **④ 溢出指示是死代码**：老实现那个 `while rr < panel_top` 循环里连一句 `tui_put` 都
+      没有（只留了句注释），用户完全看不出「上面还有」还是「已经到顶」。**修法**：转录区
+      第 0 行原地覆盖一个单字节 `^`（只改一列、不挪行偏移；多字节字形会因为 `g_tui_text`
+      是所有行共用的缓冲而顶歪后面所有行 —— 这条试过，真的歪）。**贴尾时一个字节都不画**，
+      于是「贴尾 = 与 P32 之前逐字节一致」这条不变量仍然成立。
+
+    回归轮 `tui-scroll`（P32）：2400 行的长条目一路 PgUp 能看到第 1 行、`ctrl+home` 跳到最顶
+    （`tui_start_line() == 0` 且 `^` 消失）、`ctrl+end` 回底、SGR 滚轮上/下真的动、
+    `ESC[<0;..M`（按下）/`<35;..M`（移动）不滚动也不落进输入行、`ESC[?1000h`/`1006h`
+    逐字节在进出序列里、PgUp 至少走一屏、`^` 指示列数仍等于终端列数、贴尾时新内容照旧自动跟随。
+    另外 `sigselftest` 的四种恢复序列长度跟着改（26→42 / 18→34 / 31→47 / 23→39 字节）。
+
+    顺带修掉一个**长期存在的跑不起来**：`subagent-panel` 轮把「面板宽 78 列」写死
+    （那是 80 列终端下的期望），在别的宽度的 tty 里跑必然红。现在那轮自己把
+    `tty_ui.cols` 钉成 80，断言也跟着算出来，跟跑测试的终端无关。
+
+50. **第一列换了，选中项的口径就得跟着换 —— 否则 `/resume` 拿着标题去查会话。**（P33）
+    `/sessions` 的条目原来是 `<id>  <cwd>`，选中项用 `agent_tui_item_head`（取行首第一个
+    空白分隔 token）当会话 id —— id 正好在第一列，所以没问题。改成「标题 / 工作区 / session id」
+    三列之后**行首变成了标题**：同一个 `agent_tui_item_head` 取出来的是标题的第一个词，
+    `/resume 修个` 于是找不到会话（而且属于「静默失败」那一类：用户只看到一行
+    `error: 找不到该会话`）。正解是**取行尾那个 token**（`agent_tui_sessions_head`），
+    并要求它必须以 `session-` 开头；认不出来就落一条可见提示（`这一行里没认出会话 id`），
+    绝不猜。连带两条同样重要的：
+    * **id 只能在显示层裁**。条目文本是选中项的唯一来源，所以 `sess_rows_render` 里 id 一律
+      原样写出（三列 / 两列 / 只剩 id 都一样），「画不下」交给显示层
+      （浮层是 `tui_ov_put_clipped`，滚动模式是打印前的 `sess_rows_clip_into`，两者都补 `…`）。
+      反过来（排版时就按列裁 id）会让窄终端上的 `/resume` 时好时坏，且失败得毫无线索。
+    * **索引是追加写的，同一个 id 一定会有多条**。`index.jsonl` 每关一次会话就追加一条，
+      「同一个会话列两次」是默认行为；列表侧必须按索引自己的契约「同 id 取最后一条」去重
+      （真机索引实测 308 行 / 298 个会话，其中一个 id 出现 4 次）。不去重的话
+      「最新的排第一」里会连续出现同一会话的副本，看起来就像列表坏了。
+    验收：`sess-list` 轮（纯函数：去重 / 倒序 / 三档列宽 / 控制字节清洗 / id 完整）、
+    `tui-sessions` 轮（浮层宽箱体 + 方框闭合 + 回车取完整 id + `sess_find` 找得到）、
+    `make e2e-sessions`（真二进制，管道喂 REPL）。
+
+51. **uya 0.10 的 `p[a: b]` 是「从 a 起 b 个字节」，不是「到 b 为止」。**（P33 实测）
+    全仓的切片几乎都写成 `p[0: n]` —— 两种语义在 a=0 时完全一样，所以这个坑一直没露头。
+    P31 要给「索引里第 k 行」做切片解析，写了 `idx.ptr[lo: lo + ll]`，实际拿到的是
+    **从 lo 起 `lo + ll` 个字节**的窗口：越读 `lo` 个字节到后面几行去（行号越大越界越多，
+    最后一行还会越过缓冲区末尾）。现场：一条**没有** `lastActiveAt` 的记录被解析成了后面
+    那行的 9000，于是「按时间倒序」整个错位（`sess-list` 轮 12 条断言一起红）。
+    探针（`p = "0123456789"`，`p[2: 5].len`）实测打印 **5**（= 长度），不是 3。
+    正解：**别用非 0 起点的切片** —— 把那一行先拷进 scratch Buf 再按 `[0: len]` 解析
+    （`session.uya` / `agent.uya` / 自测助手都这么写）；真要「从 a 起 n 个字节」就写
+    `p[a: n]` 并注明第二个数是长度。已有的正确例子是 `httpc.uya` 的 `head[i: name.len]`。
+52. **恢复会话时按「当前目录」重算日志路径 —— 会话被劈成两半，索引里的工作区也跟着被改写**（P34，
     用户报的是「`/diff` 应该显示当前会话的工作区」）。旧实现里 `agent_session_open` 把恢复
     当成「按 cwd 开日志 + 接着写」，于是从别的目录恢复一个会话时：
     * `sess_session_path` 按**当前** cwd 拼路径 → 在 `--<当前 cwd>--/<同一个 id>/session.jsonl`
@@ -2194,7 +2352,7 @@ vLLM 等 OpenAI 兼容端点都一样稳。想升级成严格 `tool` 角色消�
     **顺带记一条测试方法**：`git worktree` 造出来的工作区（`.git` 是文件而不是目录）必须进用例 ——
     真实工作流就是「一个任务一个 worktree」，`e2e-ws` 因此用两个**真仓库**跑。
 
-49. **`bufx_eq_cstr(p, n, lit)` 的第三个参数必须是「字面量」—— 传 Buf 会静默判不等**（P31 一次踩两处）。
+53. **`bufx_eq_cstr(p, n, lit)` 的第三个参数必须是「字面量」—— 传 Buf 会静默判不等**（P34 一次踩两处）。
     它按 `strlen(lit)` 量长度再比 `n == m`；而 `Buf` 的缓冲**没有 NUL 结尾**（`buf_new` 给的是裸字节），
     `strlen` 会一直扫到碰巧出现的 0，量出来的长度偏大 ⇒ 直接 return false。症状很隐蔽：
     * 工作区切换的**幂等分支永远走不到**（切到同一个目录会老老实实再切一遍、再记一条事件）；
@@ -2211,7 +2369,7 @@ vLLM 等 OpenAI 兼容端点都一样稳。想升级成严格 `tool` 角色消�
 | `read_file` | `sys_open` + `sys_read` 循环读进堆缓冲 | 单次最多 64 KiB，超出附 `[truncated]` |
 | `write_file` | `sys_open(O_WRONLY\|O_CREAT\|O_TRUNC, 0644)`；父目录缺失时 `mkdir` 一层后重试 | 整文件覆盖写 |
 | `run_shell` | `pipe` → `fork` → 子进程 `dup2`+`chdir(workspace)`+`execve("/bin/sh", ["sh","-c",cmd], envp)` → 父进程 `poll` 读 stdout+stderr → 墙钟超时 `SIGKILL` → `waitpid` | 输出上限 64 KiB；默认超时 120 s；`--no-shell` 关闭 |
-| `workspace`（P31） | 无参 = 报告（工作区 / 来源 / 分支 / 会话 id）；带 `path` = `chdir` + `getcwd` 规范化 + 重指 `FsCtx` + 清技能缓存 + `gd_reset` + 记 `session/workspace` 与索引；工具目录跨模式恒定可见 | 目标必须**存在且是目录**（`chdir` 就是校验，失败什么都不改）；非全权下逐次要用户批准（无渠道 fail closed）；不建目录、不解析 `~` |
+| `workspace`（P34） | 无参 = 报告（工作区 / 来源 / 分支 / 会话 id）；带 `path` = `chdir` + `getcwd` 规范化 + 重指 `FsCtx` + 清技能缓存 + `gd_reset` + 记 `session/workspace` 与索引；工具目录跨模式恒定可见 | 目标必须**存在且是目录**（`chdir` 就是校验，失败什么都不改）；非全权下逐次要用户批准（无渠道 fail closed）；不建目录、不解析 `~` |
 
 路径守卫（best-effort，**不是安全边界**）：所有 `path` 相对 `--workspace` 解析，拒绝绝对路径、
 `~` 开头、以及含 `..` 段的路径。工具内部任何失败都不抛错，一律写成 `error: ...` 文本回给模型，
@@ -2291,7 +2449,9 @@ agent 循环并逐项断言：
 | `tui-turn` | headless 端到端（mock LLM，复用手打路径注入「任务+回车」）：屏幕里出现用户条目、`✓ Write(note.txt)`、`✓ Bash(`、最终答案；回合结束状态回 idle、**状态区整块收掉且思考实时行不留残影**；**P20：脚注里必须出现 `1 轮 · ` 与 `工具调用 `**（真实测量的 llm/工具耗时进了界面）；fd 1 无输出 |
 | `tui-status` | 常驻状态区 + 思考实时行（P18）：**转录铺满视口后状态行必须仍在**（回归主断言，且落在面板上方那一行）、实时行紧跟在状态行下面且只显示 `latestLine`、超宽按列**从左边**截断补 `…`（保住最新的那一端）、`ESC[2J`/NUL/TAB 被清洗且换行只取最后一段、`tui_think_clear`/`TUI_RUN_IDLE` 之后整块收掉（空闲态 0 行）、滚动时钉住不动、窄终端（30 列）按实际可用列画、窄到放不下前缀（20 列）退化成 1 行不硬画、`view_think_live` 默认开（不看 `--show-reasoning`）而 `--quiet` 下一个字节都不写 |
 | `tui-p30` | 运行中的峰值延迟（P30）：headless 断言「泵点当场派发只读命令（`/status` 立刻开浮层）/ `/new` 立刻回执 + 置中断标志、结果仍旧留给主循环（不 `hist_free` 到回合正在用的历史）/ `/compact` 泵点**不**落、`agent_tui_step_boundary_cmd` 处才落」；真 PTY 段用 mock 的**单步长流式**（`mock_mode = 40` + `mock_send_sse_slow`：响应头与第一帧立刻发、正文停 2.5 s）断言「敲 `/status` 之后浮层 ≤800 ms 出现，且那一刻正文还没发出来」——旧实现要等这一步走完（≥2.2 s） |
+| `tui-p31` | 请求在飞的每一段都能当场响应（P31，踩坑 48）：headless 断言「泵点派发只读命令之后**同一次调用里**就画出一帧（`tui_frame_count()` +1，旧实现只标脏、要等下一个泵点或下一次 200 ms 轮询）」「不安全命令的回执同样当场出帧，结果仍旧留给主循环」「泵点上下文登记期间才派发、`agent_pump_ctx_end` 之后面板结果不许被吞」；真 PTY 段另有三条延迟上限（等响应头 ≤800 ms、空闲 ≤150 ms、bash 跑着 ≤300 ms）在 `make p30-check` 里 |
 | `tui-cmd` | 命令面板 ↔ `/status` 浮层这条链（P23，踩坑 40）：面板派发之后**输入行里不许留着触发它的 `/`**（`tui_input_len() == 0`），于是第二次敲 `/status` 仍旧开出浮层（旧实现这里是 `//status` → 「未知命令」）；浮层标题逐字节是 `状态（esc 关闭）`、**不含**越界读来的 `<system-remind`（并且全局不变量「正文层无 NUL」在每一步都查）；回车但无匹配时文字回输入行 + `没有匹配的命令：…` notice；回合运行中接受的面板项**不当场派发**、由 `agent_tui_poll_pending_cmd` 在 step 边界派发只读命令（`/status` 开浮层）、不安全命令（`/permission`）原样留在待取队列；浮层滚动（PgDn 后 `上下文已用`/`version` 可见、`↑`/`↓` 指示随窗口变、滚到底顶端不再停在最前面）；外加**真 PTY**：回合还在跑（脚注仍是「1 轮 · 1 步」）时浮层已经画出来，esc 关掉后回合照常跑完、最终答案回到转录 |
+| `tui-scroll` | **P32 的翻看这条链**（踩坑 49）：2400 行的**单个长条目**一路 PgUp 能看到 `LONG-ROW-1`（老实现把 `max_scroll` 夹成 0，翻不到）、`ctrl+home` 跳到最顶（`tui_start_line() == 0` 且 `^` 消失）、`ctrl+end` 回底；`ESC[1;5H` / `ESC[1;5F` 的**尾巴不许漏进输入行**（老实现会插进一个字面量 `5H`），而裸 `ESC[H` 仍旧只是行内 Home；SGR 滚轮 `ESC[<64;..M`/`<65;..M` 真的上/下滚，`ESC[<0;..M`（按下）/`<35;..M`（移动）既不滚动也不进输入行；进出序列里逐字节有 `ESC[?1000h`/`?1006h`/`?1006l`/`?2004l`；PgUp 至少走一屏（不是写死的 5 行）；顶部 `^` 指示存在且该行列数仍等于终端列数（原地覆盖，不挪行偏移）；贴尾时 `^` 消失、新内容照旧自动跟随 |
 | `stats-format` | 纯函数逐字节：duration（`0s`/`0.4s`/`12s`/`50.7s`/`59.9s`/`1m0s`/`2m42s`/`60m0s` + 平均值口径不被整数截断 + 除零保护）、tokens（`999`/`1K`/`12.2K`/`238K`/`517K`/`1000K`/`1M`/`1.2M`/负数按 0）、tok/s（`0.4`/`9.9`/`9.94→9.9`/`221`/`994`/无时长）、缓存命中（无计费输入 → 不显示、`0`/`50`/12.5%→13%（ties 向上）/71%/全命中 `100`/999/1000→`99.9`/99.9579%→`99.96`，全部按 DSH 的取整规则） |
 | `stats-line` | 整行逐字节：demo fixture = DSH 截图那一行（`1 轮 · 12 步 \| LLM 50.7s · 工具调用 4.1s \| 首 token 平均 1.5s · 221 tok/s \| 缓存命中 71% \| 输入 238K tok · 输出 12K tok`）+ 四种判据（只有步数 / 只有 usage / 两步其一被取消 / 只有首 token / 工具+解码同时出现） |
 | `stats-fold` | 同一批边界「实时喂」与「日志逐行回放」的 11 个字段签名必须逐字节相同；再钉边界语义：孤儿 `tool/result` 不计时、未结算调用在 `turn/end` 丢弃、被取消的步只计数不计时、`turn/step` 不匹配时不计时但 token 照记、没上报输出 token 时不记解码、同一 turn 多步只算一轮、重复 callId 取最后一次并只结算一次 |
@@ -2314,11 +2474,11 @@ agent 循环并逐项断言：
 | `plan-gate` | P26 plan 写闸门：纯函数真值表（`plan_init`/`plan_set`/`plan_toggle` 三处一致 + 三个动作 → 三裁决 + 认不出的选中项必须是「继续讨论」）+ 端到端（**全权模式**下 plan 模式里 `write`/`edit` 逐字被拒且 `plan-gate.txt` **没落盘**、`exit_plan_mode` 在管道里回「没有渠道」且**不退模式**、请求里必须带「写工具被拒」那句运行时上下文） |
 | `tui-plan` | P26 plan 审阅浮窗，四段：① 浮层级 headless（标题 `计划待审 · 1/b`、三动作齐、默认光标在「继续讨论」、正文第一行画出来、尾巴一开始不可见、`↓` 行号 +1、`pgdn` 整页跳、`end` 到底才看见尾巴、`home` 回顶、`3`+回车交回「确认执行」且 kind 不丢、`esc` 取消、`agent_plan_force` 同步 Plan chip、40 列窄终端不超宽不崩、**浮层方框闭合成矩形**（复用 tui-frame 那套量法：左右边界列 + 首尾必须是边框字形 —— 踩坑 42 那类缺陷）、每帧「行 ≤ cols + 正文层无 ESC」）；② headless + agent：注入的键到不了浮层 → 按「解决」处理（转录出现「dismissed the plan review」、**没有** `Plan approved`、`plan_on()` 仍为真、浮层已收掉）；③ **真 PTY**：tab 进 plan 模式 → 浮窗出现 → 三动作齐 → `end` 翻到底看见 `PLAN-TAIL-MARK`（正文真的能滚）→ `3`+回车 → 第二封请求里必须出现 `Plan approved`；④ **真 PTY**：`esc` → 第二封请求里必须是「dismissed the plan review to speak instead」 |
 | `tui-access` | 访问模式 chip 三种模式的显示、`shift+tab` 只置请求（主循环据此开浮层）、选择器打开（三行齐 + `✓` 只在当前模式那行 + 圆角框 + esc 取消不变更）、↓+enter 选中 Workspace Write 交给处理器（策略全局 + chip + 转录 notice + **恰好一条** runtime-context 注入且不上屏）、运行中切换时 `cfg.access` 必须跟着走（故意把 cfg 设成旧值）、选 Full access 只翻出确认层（游标默认「取消」→ 回车无变化；↑+enter 才切）；末尾一条**回归**：命令面板里选 `/status` 必须真的派发（浮层结果不许被静默丢掉）；每步都查「每行 ≤ cols、正文层无 ESC」 |
-| `tui-ws` | **工作区切换在界面与历史里都跟上（P31）**：headless 120×30 —— 切换后**脚注 cwd**（短路径，会被列宽预算裁短所以断言末段目录名）与转录里的 `工作区 → <绝对路径>` 通知都出现；`/diff` 浮窗标题在假数据注入工作区后写成 `/diff · <工作区> · <仓库名> · …`（工作区不是仓库根时两个都写），收尾把假数据的工作区清掉（后面 `tui-diff` 轮还要按旧排版断言）；step 边界补推的运行时上下文以 `Current runtime context` 开头、里面有 `Current workspace: <新工作区>`、且**被认成注入消息**（不许回填成假用户条目、不许画到屏幕上）；同一样的工作区不重复推；切到已经在的工作区是幂等的；相对路径切到子目录 |
+| `tui-ws` | **工作区切换在界面与历史里都跟上（P34）**：headless 120×30 —— 切换后**脚注 cwd**（短路径，会被列宽预算裁短所以断言末段目录名）与转录里的 `工作区 → <绝对路径>` 通知都出现；`/diff` 浮窗标题在假数据注入工作区后写成 `/diff · <工作区> · <仓库名> · …`（工作区不是仓库根时两个都写），收尾把假数据的工作区清掉（后面 `tui-diff` 轮还要按旧排版断言）；step 边界补推的运行时上下文以 `Current runtime context` 开头、里面有 `Current workspace: <新工作区>`、且**被认成注入消息**（不许回填成假用户条目、不许画到屏幕上）；同一样的工作区不重复推；切到已经在的工作区是幂等的；相对路径切到子目录 |
 | `tui-diff` | **`/diff` 浮窗（P28）**：假数据注入后逐项断言 —— 圆角框与标题（`/diff · <仓库> · <文件> · +A -D`）、左列表的 `▸` 选中标记与三个文件、右工作区的 `旧 · HEAD` / `新 · 工作区` 两栏列头、**同一行里同时出现旧文本与新文本**（真并排，不是上下拼）、`@@` 说明行跨两栏；**竖线逐行同列**（两栏行 4 根：左右边框 + 列表缝 + 中缝；跨栏说明行 3 根，且落在同样的列上）；`↓` 换文件后 `▸` 跟着走、`→` 之后每栏补 `‹`、`←` 退回 0、`pgdn/pgup` 翻页与夹取、`r` 失败也**不许丢内容**、`esc`/`q` 关闭走「取消」语义；**运行中开浮窗状态区照样在**（浮层重画转录区之后必须把 P18 的状态区补回来，且整帧行数不变）；40×10 判「画不下」→ 不开浮窗（不许看不见还吞键）；agent 层三条「开不了」都要留下可见的话（不是 git 仓库 → git 的原话、空仓库 → `(没有 git 修改)`、终端太小 → 提示，且三条都**不许**开浮窗）；路径里带 ESC/NUL 时列表与标题都要清洗（帧里一个 NUL/ESC 都不许有 —— P27 第一版就把 fixture 标签的 NUL 画进了标题）；TAB/ESC 序列/汉字不破版（`␛` + 合法 UTF-8）；最后**真 PTY** 里敲 `/diff` → 真跑 git → 屏幕上出现列表与两栏 diff → `↓` 重载 → `esc` → 再敲 `/workspace <绝对路径>`（带参数的命令与 `/goal pause` 同一条路：面板里匹配不上 → 回车把整行还回输入行 → 再回车派发）→ 屏幕与脚注出现新工作区、转录里留下 `工作区 → …` 通知 → `ctrl-d` 退出码 0；**收尾要把画布与任务面板的行预算还原**（`tui_build_chat` 每帧都会 `tasks_set_row_budget`，本轮的 40×10 子段会把预算压到 1~2 行，不还原就会串到后面 `tasks-scroll` 那一轮 —— 测试之间靠全局状态串味的老坑） |
 | `diff-parse` | **unified diff → 行表**（P27，纯函数、不碰 git）：`@@` 头与行号解析；上下文两侧同行号；**2 删 3 增 → 2 个 MIX（左删右增）+ 1 个落单 ADD**（两侧 off/len 与文本逐字节）；纯插入 / 纯删除；多 hunk（两个说明行）；`\ No newline at end of file` 落成说明行；CRLF 的 `\r` 不许带进单元格（否则显示成 `·`）；TAB 原样保留（清洗是渲染层的事）；`Binary files … differ` 只留一行说明；mode-only（无 hunk）→ 0 行 + 说明；非 diff 文本（git 报错）整段落成一行说明（宁可看得见，也不给空面板）；空输入 → 0 行；**配对溢出**（> 4096 行的块）放弃配对但**一行不丢、顺序不乱** |
-| `ws-resolve` | **恢复会话时「这个会话在哪」的判定（P31）**：手写一份会话日志（header 的 `cwd` = A + 两条 `session/workspace`（C → B）），断言 `sess_read_meta` 取到 id / 创建时工作区（A）/ **最后一条**的工作区（B）；`agent_session_workspace_pick` 在「记录存在」时把工作区切到 B 且来源记成 `session`、`cfg.resume_ws` 记下「会话在哪」；`--workspace`/env 显式指定过就不切；记录的工作区不存在时**报 fallback 且留在当前工作区**；切到同一个目录返回 `WS_E_SAME`（幂等）；相对路径按**当前**工作区解析并落成绝对路径。收尾把进程 cwd 还原（切换是真的 `chdir`，别的轮次都假定 cwd = 仓库根） |
-| `ws-tool` | **workspace 工具与它的记录（P31）**：无参 = 报告当前工作区 + 来源 + 会话 id；不存在的目录 / 文件（不是目录）两种失败都要有话说且**状态一个字节不变**；相对路径真切换 → `cfg.workspace` 落到绝对路径、`ws_src` 变 `runtime`、结果里有 `switched workspace`；**会话日志**里最后一条 `session/workspace` = 新工作区、header 的创建时工作区**没被改写**，**索引**里同 id 最后一条 `cwd` = 新工作区（`/sessions` 的工作区列吃它）；重复切同一个目录走幂等分支；`/diff` 的文本头里写的是**工作区短路径**（`$HOME` → `~`，与 `gd_ws_short_into` 同一条规则，用例自己按同一规则拼期望值）；本机没有 git 时那一段打 `skip`（不假绿） |
+| `ws-resolve` | **恢复会话时「这个会话在哪」的判定（P34）**：手写一份会话日志（header 的 `cwd` = A + 两条 `session/workspace`（C → B）），断言 `sess_read_meta` 取到 id / 创建时工作区（A）/ **最后一条**的工作区（B）；`agent_session_workspace_pick` 在「记录存在」时把工作区切到 B 且来源记成 `session`、`cfg.resume_ws` 记下「会话在哪」；`--workspace`/env 显式指定过就不切；记录的工作区不存在时**报 fallback 且留在当前工作区**；切到同一个目录返回 `WS_E_SAME`（幂等）；相对路径按**当前**工作区解析并落成绝对路径。收尾把进程 cwd 还原（切换是真的 `chdir`，别的轮次都假定 cwd = 仓库根） |
+| `ws-tool` | **workspace 工具与它的记录（P34）**：无参 = 报告当前工作区 + 来源 + 会话 id；不存在的目录 / 文件（不是目录）两种失败都要有话说且**状态一个字节不变**；相对路径真切换 → `cfg.workspace` 落到绝对路径、`ws_src` 变 `runtime`、结果里有 `switched workspace`；**会话日志**里最后一条 `session/workspace` = 新工作区、header 的创建时工作区**没被改写**，**索引**里同 id 最后一条 `cwd` = 新工作区（`/sessions` 的工作区列吃它）；重复切同一个目录走幂等分支；`/diff` 的文本头里写的是**工作区短路径**（`$HOME` → `~`，与 `gd_ws_short_into` 同一条规则，用例自己按同一规则拼期望值）；本机没有 git 时那一段打 `skip`（不假绿） |
 | `diff-git` | **/diff 的真 git 端到端**（P27，离线；fixture 仓用被测的 `gitx_run` 自己建）：`gd_open` 出 3 个文件且带 git 的 XY 码（` M` / `??` / ` D`）与 numstat 计数（`(+1 -1)` / `(new)` / `(+0 -2)`）；改一行的文件左右两栏文本与行号逐字节正确；未跟踪文件整份都是新增（左侧空）；删除的文件整行都在左侧；`↓/↑` 换文件与两端夹取；`gd_refresh` 之后能看到新内容（`r` 键那条路）；滚动/横向滚夹取；`gd_print_text` 的单列回退含 `[diff]` 头、文件数、列表行与两侧内容；非仓库目录 `gd_open < 0` 且文案非空；本机没有 git 时打 `skip`（不假绿） |
 | `tui-approve` | read-only 下 bash 逐条批准，两种形态：① headless（注入的键在浮层打开前就被输入行吃了）= 没人回答 → **fail closed**，转录出现逐字拒绝串、命令 stdout 不出现、且不是「没有回答渠道」那条；② **真 PTY**：等 `Read Only：批准这条 bash 命令？` 画出来再送 `↑`+回车 → 命令真的跑（stdout 进转录与下一封请求）、退出码 0 |
 | `sig-abi` | `SigxAction` 必须是**宿主 glibc** 布局（152 字节；handler@0 / flags@136 / restorer@144，按字节回读）；恢复序列逐字节四种形状（P22 起）：带备用屏幕 26 字节 / 不带 18 字节 / 带备用屏幕+弹标题栈 31 字节（`ESC[23t` 排在离开备用屏幕**之前**）/ 不带备用屏幕+弹标题栈 23 字节 |
@@ -2403,6 +2563,9 @@ contextWindow/maxTokens/input image/reasoningEffort/`permission.defaultPreset`�
 `/tasks open` / `toggle` 的回显、`/tasks bogus` 报 `未知参数 "bogus"`、`/help` 里能查到 `/tasks` |
 | `goal-cmd` | 会话目标人类命令（P29）纯函数轮：空态裸 `/goal` 报「当前没有目标」+ 用法（**返回 0** —— 看状态不会失败）、缺目标时 `pause`/`resume`/`edit` 各自点出是谁缺目标、裸 `edit` 与 `edit` + 纯空白都报「需要替换内容」且**不落盘**、创建后状态块四段（`Status: active` / `Objective: …` / `Rounds: 0/20` / `Activation: armed`）与盘上字段（id/revision/round/phase/objective）逐条对齐、重复创建被拒**且没改盘上 objective**、`edit` 只换 objective（revision 2、phase/armed 不动）、`pause` 关 armed、`resume` 打开、`clear` 删文件且**幂等**（再 clear 报「没得清」）、`pause after verification` 按**字面目标**创建（控制词只在独占整行时才是控制词）、`clearx` 不被当成 `clear`、大写 `CLEAR` 照样命中、`complete` 的目标让位（创建与 `edit` 都换新身份：id +1 / revision 回 1 / 0 轮 / armed）、输出必须以换行收尾 |
 | `goal-e2e` | `make e2e-goal`（离线，管道喂真 REPL + 独立 `UYA_AGENT_HOME`）：空态用法、创建、`Rounds: 0/20`、拒绝顶掉、`Goal updated` + 新 objective、`Status: paused` + `Activation: disarmed`、`Goal resumed`、`Goal cleared.`、重复 clear 幂等、字面目标规则、`/help` 里能查到 `/goal` |
+| `sess-list` | **/sessions 列表（P33）纯函数轮**：索引 fixture 用真写入端（`sess_open`/`sess_close`）之外的手写索引造出「同 id 两条 + 时间戳乱序 + 缺 `lastActiveAt` + 空标题 + 带控制字节（TAB / `\u0001`）的标题」；断言去重后行数 = 唯一 id 数、重复 id 取的是**最后一条**（被取代那条的标题不许出现）、顺序严格按 `lastActiveAt` 降序且缺字段的排最后；再按 8 档可用列数（198/78/60/59/52/51/44/40）逐行断言 —— 行宽 ≤ 可用列数（只有「连 id 都放不下」那一档允许超宽，因为那份 id 必须完整）、标题列与工作区列的可见性随退化阶梯变化（三列 → 两列丢工作区 → 只剩 id）、每行喂 `agent_tui_sessions_head` 都还得出**完整 id**、正文里一个控制字节都没有；最后验滚动模式的 `sess_rows_clip_into`：窄到 21 列时每行 ≤ 21 且补 `…`，而本来放得下的宽度**一个 `…` 都不许加**（'…' 预算算错会把好端端的 id 截掉 —— 实测踩过） |
+| `tui-sessions` | **/sessions 浮层（P33）**：fixture 是三个**真落盘**的会话（`sess_open`/`sess_close`，标题由测试给），`/sessions` 开浮层后断言 kind/标题、100 列下箱体铺开（顶边右边界列 = 97，即宽 `cols-6` + 左边距 3）、方框闭合成矩形（`tui-frame` 那套量法）、三列都可见、**最新那条的标题行在最早那条之上**（`tuis_find_row` 行号比较）；回车 → 选中项里的 id = 最新会话的**完整 id**（不是标题）→ `sess_find` 找得到（`/resume` 走的就是它）；再跑 60 列那一档：工作区列消失、id 列还在，且条目文本里的 id 仍然完整 |
+| `sessions-e2e` | `make e2e-sessions`（离线，管道喂真 REPL + 独立 `--agent-home`）：手写索引里三条记录（旧 / 空标题 / 旧 id 的第二次记录），断言输出里最新会话在最上（`grep -n` 比行号）、被取代的旧记录不出现、同一个 id 只出现 1 次、空标题落到 `(无标题)`、`/w/new-a` 与完整 id 排成「工作区在前、id 在行尾」（正则收尾匹配） |
 | `diff-render` | 纯函数逐字节断言 diff：新旧一样 → 空（且**不输出上下文**）、只差结尾换行 → 空、
 中间一行改动 → 前后各 2 行上下文 + `-`/`+`、新文件 → 全 `+`、两侧 >60 行 → 只给精确汇总、
 60 行编辑脚本 → 头截断成 24 行 + `… (省略 36 行)`、增删计数、按显示列截断（汉字 2 列） |
@@ -2613,6 +2776,21 @@ responses 看 `call_id`）；**chat 与 responses 各一轮**，且顺便断言�
      responses 两条）、1 轮内存解析与显示（`procx-mem`）、`cpu-live` 加内存断言、
      `tui-frame` 改成八种宽度（含右对齐「末尾恰好 3 列空白」与 32 列 `内存` 让位）；
      `make check / build / codegen-audit / selftest` 全绿（selftest 退出 0）。
+ * **P32 的验收记录（2026-10-03，对应踩坑 49）**：修「工作区里的转录翻不了旧日志」。
+   * **现场复现（真 PTY，先修前再修后）**：假网关一次吐回 60/800/2500 行的正文，用
+     `pty.openpty()` + `TIOCSWINSZ 100×30` 起 `./build/uya-agent --tui`，逐帧抓屏。
+     修前：滚轮（xterm.js 会发的 `ESC O A`）变历史、`ctrl+home`（`ESC[1;5H`）在输入行里
+     留下 `~;5H`，而且**一个 2500 行的长条目怎么按 PgUp 都停在尾部附近**（`max_scroll` 夹死）。
+     修后：滚轮/`PgUp`/`ctrl+home`/`ctrl+end` 都能到位 —— 2500 行的条目 `ctrl+home` 停在
+     `LONG-ROW-1`（转录最顶上就是条目标题 `◆ 助手`），到顶后 `^` 消失，`ctrl+end` 回到底部
+     最后一行，退出与 `SIGTERM` 两条路都把鼠标上报关回去。
+   * **离线全套**：`make check` / `build` / `codegen-audit` / `e2e-config-flags` / `e2e-title` /
+     `e2e-api` / `e2e-steps` / `e2e-permission` / `e2e-sandbox` / `tui-selftest`（10 轮）/
+     `selftest`（`SELFTEST PASS`，退出 0）全绿；新增回归轮 `tui-scroll`，
+     `sig-term-restore` 的四种恢复序列长度改到 42/34/47/39 字节。
+   * **顺带修掉的假红**：`subagent-panel` 原来把「面板 78 列」写死（= 80 列终端下的期望），
+     在 213 列的终端里跑必然失败（本机就是 213）。现在那一轮自己把 `tty_ui.cols` 钉成 80。
+
 * **浮层方框右边框（踩坑 42）的验收（2026-10-03）**：用户截图的口径是「命令面板弹窗右边
   没对齐」。先按**用户那一眼的条件**离线复现：headless 把**真实命令表**（`agent_tui_commands`，
   9 条命令，`/permission` 那行 69 列）灌进命令面板，在 100 列画布上逐行量「最后一个非空白
@@ -2633,6 +2811,7 @@ responses 看 `call_id`）；**chat 与 responses 各一轮**，且顺便断言�
   三类浮层，每行都要左右边界列相同且首尾是边框字形）；把 `src/tui.uya` 的改动临时还原，
   该轮立刻在 5 种宽度全部报红并打出修前那屏，`make build / codegen-audit / selftest` 与
   `UYA_SELFTEST_TUI_ONLY` 全部 PASS。
+
 * 技能与联网搜索都在真机上验证过：让模型「说出本次会话可用的技能名」→ 正确回答
   `agently-mail、h2s-long-context`（来自真实 `~/.dsh/skills`）；让它「用 web_search 搜 uya 语言」→
   `web_search` 工具真的调通了 DeepSeek 的搜索服务并给出总结。
@@ -2851,7 +3030,55 @@ mock 上逐字段验收。换一台 `openai-responses` 网关可用时，零参�
     与 `tui-p30` 两处新闸门）；`make tui-demo` 与本节引用的快照一致
     （P30 只动派发时机与几个阻塞循环，排版一个字节没碰，版本串变成 `p30-pump`）。
 
-* **P31 的验收记录（2026-10-03，`p31-ws`，对应踩坑 48/49）**：
+* **P31 的验收记录（2026-10-03，`p31-wait`，对应踩坑 48）**：现场是用户复测「`/status` 还是慢」。
+  先量分布再动手 —— 用**改前的二进制**（同一个 commit `4f9a241` 编出来的 `build/uya-agent`）跑
+  新加的三个场景，把「哪一段慢」钉死：
+
+  | 场景（真 PTY + 假网关） | 改前 | 改后 |
+  |---|---|---|
+  | `status-single-step`（流式中） | 103 ms | 101 ms |
+  | `status-header-wait`（请求已发出、响应头压住 3 s） | **2280 ms** | **53 ms** |
+  | `status-idle`（空闲） | 242 ms | 62 ms |
+  | `status-during-bash`（`bash sleep 8` 跑着） | 103 ms | 102 ms |
+  | `status-during-compact`（`/compact` 的摘要请求在飞） | **2833 ms** | **63 ms** |
+
+  * 全部由 `make p30-check`（`testdata/pty_drive.py --suite`，现在 7 个场景）打印，改前那份就是
+    「新场景 + 旧二进制」跑出来的红：断言报「等响应头那段太慢 2280 ms」「空闲太慢 242 ms」
+    「压缩在飞太慢 2835 ms」（同一次还报了「压缩请求根本没发出去」—— 那是判据自身的坑，见踩坑 48
+    最后一条）。**先写测试再修**这条在这一次特别值：光看代码只能猜是「流式还是慢」，一量才知道
+    慢的全在「请求在飞」的那三段。
+  * 假网关新增两个可编排开关：`HEAD_DELAY_MS`（读完请求体先停再发**响应头**）与
+    `TOOL_CMD`（第一次请求回一个 bash 工具调用，用来造长 bash 与「有工具结果的历史」——
+    压缩需要 shadow > 0）。既有调用（3 个参数）行为逐字节不变。
+  * 离线回归轮 `tui-p31`（headless，已进 `make selftest`）：断言「派发之后**同一次调用里**帧数 +1」
+    「不安全命令的回执同样当场出帧且结果仍留给主循环」「泵点上下文登记期间才派发、`end` 之后不吞
+    结果」。真 PTY 的四条延迟上限（等响应头 ≤800 ms、空闲 ≤150 ms、bash ≤200 ms、压缩在飞
+    ≤300 ms）在 `p30-check` 里。
+  * `make check / build / codegen-audit / selftest / p30-check` 全绿（`selftest` 退出 0，其中包含
+    `p30-check` 与 `tui-p31`）；`make tui-demo` 与改前**只差脚注版本串**（`p30-pump` → `p31-wait`），
+    本节引用的快照已跟着更新 —— 排版一个字节没碰。
+
+* **P33 的验收记录（2026-10-03，`p33-sess`，对应踩坑 50/51）**：
+  * **真机数据只读复验**：把 `~/.uya-agent/index.jsonl` 复制到临时 `--agent-home` 里跑
+    `--list-sessions`（**只读**，一个字节都没动真机索引）—— 索引 **332 行 / 322 个唯一 id**
+    （10 条是同 id 的重复记录），列表打出来正好 **322 行**、每个 id 一次，「最新的在第一行」；
+    同一个索引在 200 / 120 / 80 / 40 列下分别是「三列（宽）→ 三列（窄）→ 两列 → 只剩 id」，
+    每行显示宽度都 ≤ 终端列数（40 列那档 id 被裁成 `session-…1111…` 并补了 `…`）。
+  * 顺带看到的一条**数据事实**：真机索引里 247/332 条记录（当时）的 `title` 是空串 —— 那些是没进过
+    用户消息的会话（探针、`--print-config` 空跑、PTY/自测 fixture 等），列表里显示成 `(无标题)`；
+    有标题的那 85 条（`怎么默认使用dsh配置` / `跑一下 sleep` …）正常显示，长标题按列宽保头裁剪。
+  * 一处**被自测当场抓住**的自身缺陷：`sess_rows_clip_into` 第一版无条件给 `…` 留一列，
+    于是「本来就正好 `body` 列」的三列行也被截了一刀（80 列终端上 id 尾巴被吃掉）——
+    `sess-list` 轮那条「放得下就不许出现 `…`」的断言把它钉住了（现在只在真的超宽时才裁）。
+  * 另一处更值钱的：uya 的 `p[a: b]` 是「偏移 + 长度」（踩坑 51），我第一版按「到 b 为止」写了
+    `idx.ptr[lo: lo + ll]`，于是「没有 `lastActiveAt`」的记录被解析成后面那行的值、倒序整体错位，
+    `sess-list` 轮 12 条断言一起红。修法是**别用非 0 起点切片**：每行先拷进 scratch Buf 再按
+    `[0: len]` 解析（`session.uya` / `agent.uya` / 自测助手三处都改了）。
+  * `make check / build / codegen-audit / e2e-sessions / sess-selftest / tui-selftest（18 轮）/
+    selftest` 全绿；`make tui-demo` 与本节引用的快照一致（版本串变成 `p33-sess`，
+    其余排版一个字节没碰 —— 会话浮层的箱体宽度只对 `TUI_OVK_SESSIONS` 生效，
+    默认档 `want_w = 0` 与旧写法逐字节等价）。
+* **P34 的验收记录（2026-10-03，`p34-ws`，对应踩坑 52/53）**：
   * **现场证据**（本机真索引，不是构造出来的）：`~/.uya-agent/index.jsonl` 里
     `session-cc4b177b…` / `session-ace7596b…` 各有两条记录，`cwd` 分别是 `/tmp/p5ws` 与仓库根；
     后一条指向 `<home>/sessions/---home-winger-uya-agent--/session-<同一个 id>/session.jsonl`，
@@ -2876,7 +3103,7 @@ mock 上逐字段验收。换一台 `openai-responses` 网关可用时，零参�
     之后必须能清回来（不然 `tui-diff` 那轮的旧排版断言会被串味）。
   * **自测自己踩的一个坑（值得记）**：`tui-approve` 的 mock 用 `"no answer channel"` 断言
     「第二封请求里不许出现 fail-closed 文案」，而请求体里带着**全部工具的描述** ——
-    P31 新加的 `workspace` 工具描述里正好有这几个字，于是**每一封请求都命中**，这一轮直接红。
+    P34 新加的 `workspace` 工具描述里正好有这几个字，于是**每一封请求都命中**，这一轮直接红。
     两处一起改：工具描述换成 `there is nobody to ask`，mock 的这条针换成 bash 专属的整句
     （`bash needs per-command approval in read-only mode`）—— 否定断言的针要够具体，
     否则任何新工具的描述都可能把它撞响。
@@ -2899,7 +3126,7 @@ mock 上逐字段验收。换一台 `openai-responses` 网关可用时，零参�
     只有目标在盘上（`goal.json`，启动时重读）。
   * 浮层打开时常驻块被浮层盖住（与 P18 的状态区同现象），关掉浮层即回来；块不做鼠标交互、
     点击折叠、跨会话记忆（`/tasks close` 只影响当前进程）。
-* **工作区（P31）的边界**：
+* **工作区（P34）的边界**：
   * 「会话现在在哪」= 日志里最后一条 `session/workspace` 事件（append-only、权威）；header 的 `cwd`
     是**创建时**在哪（元数据，不再改写）；索引里的 `cwd` 是它的「最后已知」缓存（`/sessions` 的
     工作区列吃它，会话崩了也只是缓存旧一点）。
@@ -2932,17 +3159,23 @@ mock 上逐字段验收。换一台 `openai-responses` 网关可用时，零参�
     tombstone，本仓库没有那层历史）。
   * 目标按 `agent_home` 落盘（`--agent-home` / `UYA_AGENT_HOME` / `~/.uya-agent`），
     与「会话」是同一层，所以 `/new` 之后仍是同一个目标（目标不随会话切换，见 P25 那条同源说明）。
-* **回合运行中的界面命令（P23 提出、P30 收口）**：只读命令（`/status`、`/help`、`/tasks`、
-  `/sessions`、`/goal`、`/diff`）在**每个泵点**当场派发（流式每 ≤50 ms 一次；bash / 后台任务 /
-  子代理 / 搜索 / workflow 的轮询循环各一次），不再等 step 边界 —— P23 那条「单步长流式仍要等
-  这一步走完」的边界**已经去掉**（真终端实测 2245 ms → 103 ms）。有副作用的命令按口径落地：
-  `/new`、`/resume` 立刻回执并**先中断当前回合**（历史保留），`/compact` 排 step 边界，
+* **回合运行中的界面命令（P23 提出、P30 铺开、P31 收口）**：只读命令（`/status`、`/help`、
+  `/tasks`、`/sessions`、`/goal`、`/diff`）在**每个泵点**当场派发（流式每 ≤50 ms 一次；bash /
+  后台任务 / 子代理 / 搜索 / workflow 的轮询循环各一次；P31 起还包括「等响应头」与「写请求体」
+  这两段以前没有泵点的阻塞路），派发或给出回执之后**当场画一帧**（不再等下一次 tick）。
+  P23 那条「单步长流式仍要等这一步走完」的边界**已经去掉**（真终端实测 2245 ms → 103 ms），
+  P31 又把「请求在飞」那三段补上（等响应头 2280 ms → 53 ms、压缩在飞 2833 ms → 63 ms、
+  空闲 242 ms → 62 ms）。有副作用的命令按口径落地：`/new`、`/resume` 立刻回执并**先中断当前
+  回合**（历史保留），`/compact` 排 step 边界（压缩请求本身现在也服务键盘，esc 可中断它），
   `/continue`、`/exit` 与 steer 之外的其余命令等回合结束（steer 仍是「运行中输入的文本在下一个
-  step 边界被采纳」）。仍然存在的窗口只有**不经过泵点**的那几段：DNS 解析（≤5 s）、
-  TLS 握手（≤`timeout_ms`）、以及 `--no-stream` 的**响应头等待**（`http_request` 的读到 EOF
-  循环已改成 poll + 泵点，但响应头还没到之前没有可 poll 的数据）。另外：**没有走真线程**
-  （工具链分配器不支持两条线程并发 malloc，见踩坑 47），所以这里仍是「协作式」的泵点，
-  不是抢占式 —— 泵点之间最长的一次阻塞就是上面那三段。
+  step 边界被采纳」）。仍然插不进泵点的只有**两段**：**DNS 解析**（≤5 s，工具链的
+  `dns_client_resolve_first_ipv4`）与 **TLS 握手**（≤`timeout_ms`，`https_client_handshake`）——
+  两者都在工具链调用内部，进程内没有可插桩的循环（能做的只是「踏进去之前先泵一次」，P31 补了）。
+  另外：**没有走真线程**（工具链分配器不支持两条线程并发 malloc，见踩坑 47），所以这里仍是
+  「协作式」的泵点，不是抢占式 —— 泵点之间最长的一次阻塞就是上面那两段。
+  两个小口径：(a) 明文 `http://` 的请求体写入没有分片泵（真机是 https，本地 mock 才用明文）；
+  (b) 等响应头那段的超时改按**墙上时间**判 `timeout_ms`（与 SO_RCVTIMEO 同口径，只是比
+  「每个分片各给一次 timeout」更严）。
 * **浮层（P23）**：框高上限仍是 16 行（内容靠 `↑/↓`、`pgup/pgdn`、`home/end` 滚，标题栏的
   `↑`/`↓` 是溢出指示）；浮层画在转录区上，打开时**转录被它盖住**（只有输入面板与脚注还在），
   esc 关掉就回来。终端高度不够（`panel_top < 5`）时浮层画不出来，那一路由
@@ -3006,7 +3239,7 @@ mock 上逐字段验收。换一台 `openai-responses` 网关可用时，零参�
   写工具始终被拒，要落地请在交互式会话里批准或去掉 `--plan`；`ask_user_question` 仍是行式
   问答（只有 `exit_plan_mode` 有浮窗）；plan 状态与访问模式一样是**进程级**的，不进会话日志的
   恢复语义（`--resume` 按启动参数重新求值），但每次切换会落一条 `plan/mode` 日志。
-* TUI 不做鼠标（滚轮/点击/选择）、图片、可折叠卡片、分屏、主题切换 UI；`--resume` 只回填
+* TUI 不做鼠标**点击/拖选/选择**（滚轮做了，见 P32）、图片、可折叠卡片、分屏、主题切换 UI；`--resume` 只回填
   最近 200 条历史（注入类消息不回填），`--resume-dsh` 走同一条回填路径。
 * 终端小于 32×8 时自动退回滚动模式；`cols < 66` 时块字 logo 退化成一行标题。
 * 统计（P20/P24）是**整会话**口径、只认我们自己的会话日志：`--resume-dsh` 导入的 DSH 会话不计入
