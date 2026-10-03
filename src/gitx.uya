@@ -1,0 +1,420 @@
+// src/gitx.uya — 只读地跑 git（P25：/diff 浮窗的数据来源）
+//
+// 为什么要有这个模块：旧一侧的内容在 git 对象里（packfile / zlib / delta），不 fork git
+// 就得自己实现对象读取；而 git 的 unified diff 顺带把二进制判定、mode 变更、
+// `--no-ext-diff` / `--no-textconv` 的边界都处理好了。所以 /diff 的取舍是：
+// **git 负责算 diff，我们只负责显示**。
+//
+// 与 shellx 的分工（别混）：
+//   * shellx 是**模型**发起的 bash：走 read-only 逐条批准闸门，confined 模式套 bwrap 沙箱；
+//   * gitx 是**用户**敲的 /diff 触发的只读查询：不经 bash、不套沙箱、不走审批，
+//     但也不写任何东西 —— GIT_OPTIONAL_LOCKS=0（`status` 不写 index.lock），
+//     全部命令都是 status/diff/rev-parse 这类只读查询。
+//
+// 用法：argv 是 C 字符串数组（`["git","-C",<root>,"--no-pager",…,null]`），
+// 真实可执行文件由 PATH 解析（execve 只吃路径，stdlib 里没有 execvp）。
+// 输出分别进 out/err，超过 out_cap 的字节**继续读并丢弃**（不排空的话 git 写满管道会卡住），
+// 截断与否用 gitx_last_truncated() 查。
+
+use libc.syscall;
+use libc.unistd;
+use libc.fcntl;
+use libc.signal;
+use std.runtime.saved_envp;
+
+const GITX_TIMEOUT_MS: u64 = 10000;   // 单次 git 的墙钟上限（超时 SIGKILL）
+const GITX_POLL_MS: i32 = 50;
+const GITX_ENV_MAX: usize = 512;
+const GITX_ERR_CAP: usize = 4096;     // stderr 抓取上限（只用来给人看一行错误）
+
+export const GITX_E_NO_GIT: i32 = -1;    // PATH 里找不到 git
+export const GITX_E_SPAWN: i32 = -2;     // pipe/fork 失败
+export const GITX_E_TIMEOUT: i32 = -3;   // 墙钟超时 → SIGKILL
+
+var g_gx_git: Buf = Buf{ ptr: null, len: 0, cap: 0 };        // 解析出的 git 路径（含 NUL）
+var g_gx_probed: bool = false;
+var g_gx_trunc: bool = false;
+
+// ============================================================
+// git 可执行文件：扫 PATH（首个可执行的 <dir>/git）
+// ============================================================
+fn gx_eq(p: &const byte, n: usize, lit: &const byte) bool {
+    const ln: usize = bufx_cstr_len(lit);
+    if n != ln {
+        return false;
+    }
+    return bufx_mem_eq(p, lit, ln);
+}
+
+fn gx_path_probe(cand: &Buf) bool {
+    // cand 必须是 NUL 结尾
+    if cand.len == 0 {
+        return false;
+    }
+    const rc: i32 = sys_access(cand.ptr as *const byte, X_OK) catch { -1; };
+    return rc == 0;
+}
+
+fn gx_try_dir(dir: &const byte, dn: usize, out: &Buf) bool {
+    if dn == 0 {
+        return false;
+    }
+    buf_reset(out);
+    _ = buf_append(out, dir, dn);
+    if out.ptr[out.len - 1] != 47 as byte {
+        _ = buf_append_byte(out, 47);
+    }
+    _ = buf_append_cstr(out, "git");
+    _ = buf_append_byte(out, 0);
+    return gx_path_probe(out);
+}
+
+fn gx_resolve() void {
+    if g_gx_probed {
+        return;
+    }
+    g_gx_probed = true;
+    if !buf_valid(&g_gx_git) {
+        g_gx_git = buf_new(GITX_ENV_MAX * 8);
+    }
+    buf_reset(&g_gx_git);
+    var cand: Buf = buf_new(4096);
+    defer { buf_free(&cand); }
+    // 1) PATH：逐段试 <dir>/git
+    var k: usize = 0;
+    var got: bool = false;
+    while !got {
+        const p: &const byte = saved_envp[k];
+        if (p as usize) == 0 {
+            break;
+        }
+        var eq: usize = 0;
+        while p[eq] != 61 as byte && p[eq] != 0 as byte {
+            eq = eq + 1;
+        }
+        if eq == 5 && bufx_mem_eq(p, "PATH=" as &const byte, 5) {
+            var seg: usize = 5;
+            while seg <= eq && !got {
+                var e: usize = seg;
+                while p[e] != 58 as byte && p[e] != 0 as byte {
+                    e = e + 1;
+                }
+                if gx_try_dir(p + seg, e - seg, &cand) {
+                    _ = buf_append(&g_gx_git, cand.ptr, cand.len);
+                    got = true;
+                }
+                seg = e + 1;
+                if p[e] == 0 as byte {
+                    break;
+                }
+            }
+        }
+        k = k + 1;
+    }
+    // 2) 常见位置兜底（PATH 被清空的场景）
+    if !got {
+        var fixed: [&const byte: 5] = [
+            "/usr/bin/git" as &const byte,
+            "/usr/local/bin/git" as &const byte,
+            "/bin/git" as &const byte,
+            "/opt/homebrew/bin/git" as &const byte,
+            null as &const byte,
+        ];
+        var fi: usize = 0;
+        while !got && (fixed[fi] as usize) != 0 {
+            buf_reset(&cand);
+            _ = buf_append_cstr(&cand, fixed[fi]);
+            _ = buf_append_byte(&cand, 0);
+            if gx_path_probe(&cand) {
+                _ = buf_append(&g_gx_git, cand.ptr, cand.len);
+                got = true;
+            }
+            fi = fi + 1;
+        }
+    }
+}
+
+export fn gitx_available() bool {
+    gx_resolve();
+    return g_gx_git.len > 1;
+}
+
+export fn gitx_path() &const byte {
+    gx_resolve();
+    if g_gx_git.len == 0 {
+        return "" as &const byte;
+    }
+    return g_gx_git.ptr as &const byte;
+}
+
+export fn gitx_last_truncated() bool {
+    return g_gx_trunc;
+}
+
+// ============================================================
+// 子进程环境：继承 + 覆盖/剔除几个 git 相关变量
+//
+// glibc 的 getenv 取**第一个**匹配，所以同名继承项必须先剔除再追加，
+// 否则我们追加的 GIT_PAGER/LC_ALL 会被用户环境里的旧值盖掉。
+// GIT_DIR / GIT_WORK_TREE / GIT_INDEX_FILE 直接剔除：父进程（例如 git hook、
+// 或用户在 GIT_DIR 环境里启动）带着它们时，`-C <root>` 会被指到另一个仓库。
+// ============================================================
+var g_gx_env_store: Buf = Buf{ ptr: null, len: 0, cap: 0 };
+var g_gx_env_ptrs: [&const byte: GITX_ENV_MAX] = [null as &const byte: GITX_ENV_MAX];
+
+fn gx_env_skip(name: &const byte, n: usize) bool {
+    if n < 4 {
+        return false;
+    }
+    if gx_eq(name, n, "GIT_DIR" as &const byte) { return true; }
+    if gx_eq(name, n, "GIT_WORK_TREE" as &const byte) { return true; }
+    if gx_eq(name, n, "GIT_INDEX_FILE" as &const byte) { return true; }
+    if gx_eq(name, n, "GIT_OPTIONAL_LOCKS" as &const byte) { return true; }
+    if gx_eq(name, n, "GIT_TERMINAL_PROMPT" as &const byte) { return true; }
+    if gx_eq(name, n, "GIT_PAGER" as &const byte) { return true; }
+    if gx_eq(name, n, "LC_ALL" as &const byte) { return true; }
+    return false;
+}
+
+fn gx_env_add(name: &const byte, value: &const byte) void {
+    var slot: usize = 0;
+    while slot < GITX_ENV_MAX && (g_gx_env_ptrs[slot] as usize) != 0 {
+        slot = slot + 1;
+    }
+    if slot + 1 >= GITX_ENV_MAX {
+        return;
+    }
+    const start: usize = g_gx_env_store.len;
+    _ = buf_append_cstr(&g_gx_env_store, name);
+    _ = buf_append_byte(&g_gx_env_store, 61);   // '='
+    _ = buf_append_cstr(&g_gx_env_store, value);
+    _ = buf_append_byte(&g_gx_env_store, 0);
+    g_gx_env_ptrs[slot] = &g_gx_env_store.ptr[start] as &const byte;
+    g_gx_env_ptrs[slot + 1] = null as &const byte;
+}
+
+fn gx_env_prepare() void {
+    if !buf_valid(&g_gx_env_store) {
+        g_gx_env_store = buf_new(32768);
+    }
+    buf_reset(&g_gx_env_store);
+    var i: usize = 0;
+    while i < GITX_ENV_MAX {
+        g_gx_env_ptrs[i] = null as &const byte;
+        i = i + 1;
+    }
+    var k: usize = 0;
+    var slot: usize = 0;
+    while slot + 8 < GITX_ENV_MAX {
+        const p: &const byte = saved_envp[k];
+        if (p as usize) == 0 {
+            break;
+        }
+        var eq: usize = 0;
+        while p[eq] != 61 as byte && p[eq] != 0 as byte {
+            eq = eq + 1;
+        }
+        if !gx_env_skip(p, eq) {
+            g_gx_env_ptrs[slot] = p;    // 指针沿用（saved_envp 的生命周期 = 进程）
+            slot = slot + 1;
+        }
+        k = k + 1;
+    }
+    g_gx_env_ptrs[slot] = null as &const byte;
+    gx_env_add("GIT_OPTIONAL_LOCKS" as &const byte, "0" as &const byte);
+    gx_env_add("GIT_TERMINAL_PROMPT" as &const byte, "0" as &const byte);
+    gx_env_add("GIT_PAGER" as &const byte, "cat" as &const byte);
+    gx_env_add("LC_ALL" as &const byte, "C" as &const byte);
+}
+
+// ============================================================
+// 时钟（不借 tools.uya 的 ua_now_ms，也不借 tui 的——自己的模块自己算）
+// ============================================================
+struct GxTimeVal {
+    tv_sec: i64,
+    tv_usec: i64,
+}
+
+fn gx_now_ms() u64 {
+    var tv: GxTimeVal = GxTimeVal{ tv_sec: 0, tv_usec: 0 };
+    const r: !i32 = sys_gettimeofday(&tv, null as &void);
+    const rc: i32 = r catch { -1; };
+    if rc != 0 {
+        return 0 as u64;
+    }
+    return ((tv.tv_sec as u64) * (1000 as u64)) + ((tv.tv_usec as u64) / (1000 as u64));
+}
+
+// ============================================================
+// 执行
+// ============================================================
+// 追加但不超过 cap（超限的部分丢掉；调用方必须照读不误，否则子进程会卡在写管道上）
+fn gx_append_capped(dst: &Buf, p: &const byte, n: usize, cap: usize) void {
+    if dst.len >= cap {
+        return;
+    }
+    var take: usize = n;
+    if dst.len + take > cap {
+        take = cap - dst.len;
+    }
+    _ = buf_append(dst, p, take);
+}
+
+// cwd_z：子进程的 chdir 目标（null = 不 chdir，靠 `git -C` 定位仓库）
+// argv：C 字符串数组，argv[0] 只是进程名（真实路径由 PATH 解析结果决定）
+// 返回：git 的退出码（含 1，语义交给调用方）；负数 = 起不来（见 GITX_E_*）
+export fn gitx_run(cwd_z: &const byte, argv: &(&const byte), out: &Buf, err: &Buf, out_cap: usize) i32 {
+    gx_resolve();
+    if g_gx_git.len == 0 {
+        return GITX_E_NO_GIT;
+    }
+    buf_reset(out);
+    buf_reset(err);
+    g_gx_trunc = false;
+    gx_env_prepare();
+
+    var op: [i32: 2] = [0: 2];
+    var ep: [i32: 2] = [0: 2];
+    if (sys_pipe2(&op[0], 0) catch { -1; }) != 0 {
+        return GITX_E_SPAWN;
+    }
+    if (sys_pipe2(&ep[0], 0) catch { -1; }) != 0 {
+        _ = sys_close(op[0]) catch {};
+        _ = sys_close(op[1]) catch {};
+        return GITX_E_SPAWN;
+    }
+    const pid64: i64 = sys_fork() catch {
+        _ = sys_close(op[0]) catch {};
+        _ = sys_close(op[1]) catch {};
+        _ = sys_close(ep[0]) catch {};
+        _ = sys_close(ep[1]) catch {};
+        return GITX_E_SPAWN;
+    };
+    if pid64 == 0 {
+        // 子进程：只做系统调用
+        _ = sys_close(op[0]) catch {};
+        // P1：信号处置是继承的 —— 子进程必须先恢复默认，否则收到 TERM 会去写父进程的终端
+        sigx_reset_for_child();
+        _ = sys_close(ep[0]) catch {};
+        _ = sys_dup2(op[1], 1) catch {};
+        _ = sys_dup2(ep[1], 2) catch {};
+        _ = sys_close(op[1]) catch {};
+        _ = sys_close(ep[1]) catch {};
+        if (cwd_z != null && cwd_z[0] != 0 as byte) {
+            _ = sys_chdir(cwd_z as *const byte) catch {};
+        }
+        _ = sys_execve(g_gx_git.ptr as &const byte, argv, &g_gx_env_ptrs[0]) catch {};
+        sys_exit(127);
+    }
+    const pid: i32 = i64_to_i32(pid64);
+    _ = sys_close(op[1]) catch {};
+    _ = sys_close(ep[1]) catch {};
+    var pfds: [PollFd: 2] = [
+        PollFd{ fd: op[0], events: POLLIN, revents: 0 },
+        PollFd{ fd: ep[0], events: POLLIN, revents: 0 },
+    ];
+    const started: u64 = gx_now_ms();
+    var chunk: [byte: 8192] = [0: 8192];
+    var done: bool = false;
+    var timed: bool = false;
+    var code: i32 = 0;
+    while !done {
+        pfds[0].revents = 0;
+        pfds[1].revents = 0;
+        tui_poll_tick();      // 让 spinner 继续转（跑 git 期间界面不假死）
+        const pr: i32 = sys_poll(&pfds[0], 2, GITX_POLL_MS) catch { 0; };
+        if pr > 0 {
+            var which: usize = 0;
+            while which < 2 {
+                const rev: i16 = pfds[which].revents;
+                if (rev & POLLIN) != 0 || (rev & POLLHUP) != 0 || (rev & POLLERR) != 0 {
+                    const fd: i32 = pfds[which].fd;
+                    const n: isize = sys_read(fd, &chunk[0], 8192) catch { 0 as isize; };
+                    if n > 0 {
+                        const un: usize = n as usize;
+                        if which == 0 {
+                            if out.len + un > out_cap {
+                                g_gx_trunc = true;
+                            }
+                            gx_append_capped(out, &chunk[0], un, out_cap);
+                        } else {
+                            if err.len + un > GITX_ERR_CAP {
+                                g_gx_trunc = true;
+                            }
+                            gx_append_capped(err, &chunk[0], un, GITX_ERR_CAP);
+                        }
+                    }
+                }
+                which = which + 1;
+            }
+        }
+        if (gx_now_ms() - started) >= GITX_TIMEOUT_MS {
+            timed = true;
+            _ = sys_kill(pid as i64, SIGKILL) catch {};
+            done = true;
+        }
+        var st: i32 = 0;
+        const r: i32 = sys_waitpid(pid, &st, 1) catch { 0; };
+        if r > 0 {
+            done = true;
+            const sig: i32 = st & 127;
+            if sig != 0 {
+                code = 128 + sig;
+            } else {
+                code = (st >> (8 as i32)) & 255;
+            }
+        }
+    }
+    // 收尾排空（超限部分照读不误，否则子进程可能还卡在 write 上）
+    var guard: usize = 0;
+    while guard < 64 {
+        guard = guard + 1;
+        const n2: isize = sys_read(op[0], &chunk[0], 8192) catch { 0 as isize; };
+        if n2 <= 0 {
+            break;
+        }
+        if out.len + (n2 as usize) > out_cap {
+            g_gx_trunc = true;
+        }
+        gx_append_capped(out, &chunk[0], n2 as usize, out_cap);
+    }
+    guard = 0;
+    while guard < 16 {
+        guard = guard + 1;
+        const n3: isize = sys_read(ep[0], &chunk[0], 8192) catch { 0 as isize; };
+        if n3 <= 0 {
+            break;
+        }
+        if err.len + (n3 as usize) > GITX_ERR_CAP {
+            g_gx_trunc = true;
+        }
+        gx_append_capped(err, &chunk[0], n3 as usize, GITX_ERR_CAP);
+    }
+    _ = sys_close(op[0]) catch {};
+    _ = sys_close(ep[0]) catch {};
+    var st2: i32 = 0;
+    _ = sys_waitpid(pid, &st2, 0) catch {};
+    if timed {
+        return GITX_E_TIMEOUT;
+    }
+    return code;
+}
+
+// 去掉尾部的 \n / \r（rev-parse 这类单行输出用）
+export fn gitx_trim_nl(b: &Buf) void {
+    while b.len > 0 {
+        const c: byte = b.ptr[b.len - 1];
+        if c == 10 as byte || c == 13 as byte || c == 32 as byte || c == 9 as byte {
+            b.len = b.len - 1;
+        } else {
+            break;
+        }
+    }
+}
+
+// 追加 NUL 后的副本（给 argv 用）
+export fn gitx_cstr(dst: &Buf, p: &const byte, n: usize) void {
+    buf_reset(dst);
+    _ = buf_append(dst, p, n);
+    _ = buf_append_byte(dst, 0);
+}
