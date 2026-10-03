@@ -3352,6 +3352,629 @@ fn tuis_overlay_frames(ok: &bool, tag: &const byte) void {
 // 对外入口：selftest_main 里一行调用
 // ============================================================
 
+// ============================================================
+// tui-plan（P26）：plan 模式写闸门 + exit_plan_mode 审阅浮窗
+//
+// 为什么单独一轮：P8 的审阅是 CLI 的 y/N 问答（ask_write + ask_read_yes_no），TUI 下
+// 既没有浮窗、按键还要跟 TUI 的键队列抢 —— 用户看到的就是「计划直接开始执行」
+// （README 踩坑 36）。这一轮把四件事钉死：
+//   A) 浮层排版与按键（headless，直接开浮层）：正文可滚动、三动作、数字直选、
+//      esc 取消、每行 ≤ cols、正文层无 ESC、窄终端不崩
+//   B) headless + agent：注入的键到不了浮层 → 按「解决」处理（留在 plan 模式），**绝不批准**
+//   C) 真 PTY：先滚动（尾巴标记出现）再选「确认执行」→ 模型拿到 Plan approved
+//   D) 真 PTY：esc → 「解决」→ 模型被告知停下等用户说话，且 plan 模式仍在
+// ============================================================
+
+const TUIS_PL_TITLE: &const byte = "计划待审" as &const byte;
+const TUIS_PL_KEEP: &const byte = "继续讨论" as &const byte;
+const TUIS_PL_DISMISS: &const byte = "解决" as &const byte;
+const TUIS_PL_APPROVE: &const byte = "确认执行" as &const byte;
+const TUIS_PL_KEEP_RESULT: &const byte = "keep planning; revise the plan" as &const byte;
+const TUIS_PL_DISMISS_RESULT: &const byte = "dismissed the plan review to speak instead" as &const byte;
+const TUIS_PL_APPROVED: &const byte = "Plan approved" as &const byte;
+const TUIS_PL_TAIL: &const byte = "PLAN-TAIL-MARK" as &const byte;
+const TUIS_PL_TASK: &const byte = "plan the greeting change (TUIS-PLAN-TASK)" as &const byte;
+
+// 审阅用的计划：短行（不折行）但够多行 —— 100x30 下正文可见 16 行，
+// 尾巴必须靠滚动才看得见，这样 C 段的「滚动」断言才有意义。
+const TUIS_PL_PLAN: &const byte = "# 计划标题\n\n## 第一步：读现状\n- 读 hello.uya\n- 看一眼 Makefile\n\n## 第二步：改一行\n- 只动那一行字面量\n- 用 edit 工具替换\n\n## 第三步：验证\n- 编译并运行\n- 跑一次 make check\n\n## 第四步：补文档\n- README 补一句\n\n## 第五步：收尾\n- 删掉临时文件\n\n## 风险与回滚\n- 只有一处字符串\n- 回滚就是把这一行改回去\n\n## 尾巴\nPLAN-TAIL-MARK\n" as &const byte;
+
+// exit_plan_mode 的 arguments（用 JsonWriter 生成，免得手写两级转义）。
+// 末尾要补 NUL：mock_call 走的是 jw_str_cstr（C 字符串口径），而 buf_new 是裸 malloc ——
+// 不补的话 strlen 会一路读到未初始化的堆尾巴，arguments 变成非法 JSON（README 踩坑 37 同款）。
+fn tuis_pl_args(out: &Buf, plan: &const byte) bool {
+    var w: JsonWriter = JsonWriter{ buf: null, cap: 0, used: 0, overflow: false };
+    jw_init(&w, out.ptr, out.cap);
+    jw_byte(&w, 123);
+    jw_key(&w, "plan");
+    jw_str_cstr(&w, plan);
+    jw_byte(&w, 125);
+    if jw_overflow(&w) {
+        return false;
+    }
+    const used: usize = jw_used(&w);
+    out.len = used;
+    if !buf_append_byte(out, 0) {
+        return false;
+    }
+    out.len = used;   // NUL 只给 C 字符串口径用，不计入长度
+    return true;
+}
+
+// 一封「交计划」的响应体
+fn tuis_pl_toolcall_body(out: &Buf) bool {
+    var w: JsonWriter = JsonWriter{ buf: null, cap: 0, used: 0, overflow: false };
+    jw_init(&w, out.ptr, out.cap);
+    jw_byte(&w, 123);
+    jw_key(&w, "id");
+    jw_str_cstr(&w, "chatcmpl-tui-plan");
+    jw_byte(&w, 44);
+    jw_key(&w, "choices");
+    jw_byte(&w, 91);
+    jw_byte(&w, 123);
+    jw_key(&w, "index");
+    jw_i64(&w, 0);
+    jw_byte(&w, 44);
+    jw_key(&w, "message");
+    jw_byte(&w, 123);
+    jw_key(&w, "role");
+    jw_str_cstr(&w, "assistant");
+    jw_byte(&w, 44);
+    jw_key(&w, "content");
+    jw_null(&w);
+    jw_byte(&w, 44);
+    jw_key(&w, "tool_calls");
+    jw_byte(&w, 91);
+    var args: Buf = buf_new(4096);
+    defer { buf_free(&args); }
+    if !tuis_pl_args(&args, TUIS_PL_PLAN) {
+        return false;
+    }
+    mock_call(&w, "call_pl", "exit_plan_mode", args.ptr as &const byte);
+    jw_byte(&w, 93);
+    jw_byte(&w, 125);
+    jw_byte(&w, 125);
+    jw_byte(&w, 93);
+    jw_byte(&w, 125);
+    if jw_overflow(&w) {
+        return false;
+    }
+    out.len = jw_used(&w);
+    return true;
+}
+
+// true = 预期「解决」（留在 plan 模式），false = 预期「确认执行」
+var tuis_pl_dismiss: bool = false;
+
+// 本轮专用 mock：第 0 轮发 exit_plan_mode，第 1 轮断言工具结果并给最终答案
+fn tuis_pl_mock(lfd: i32) i32 {
+    var round: i32 = 0;
+    var verdict: i32 = 0;
+    while round < 2 {
+        var lpfds: [PollFd: 1] = [PollFd{ fd: lfd, events: POLLIN, revents: 0 }];
+        const lpr: i32 = sys_poll(&lpfds[0], 1, 10000) catch { 0; };
+        if lpr <= 0 || (lpfds[0].revents & POLLIN) == 0 {
+            if verdict == 0 && round < 2 {
+                return 60 + round;   // 请求数不够：也算失败
+            }
+            return verdict;
+        }
+        var peer: [byte: 16] = [0: 16];
+        var alen: u32 = 16;
+        const cfd: i32 = sys_accept(lfd, &peer[0] as &void, &alen) catch { return 10; };
+        var rx: Buf = buf_new(16384);
+        if !mock_read_request(cfd, &rx) {
+            buf_free(&rx);
+            _ = sys_close(cfd) catch {};
+            return 11;
+        }
+        const is_stream: bool = contains(&rx, "\"stream\":true");
+        var body: Buf = buf_new(8192);
+        if round == 0 {
+            if !contains(&rx, "\"name\":\"exit_plan_mode\"") {
+                verdict = 71;   // 计划工具必须在 schema 里
+            }
+            if !contains(&rx, "Plan mode is active") {
+                verdict = 72;   // 运行时上下文必须告诉模型「在 plan 模式里」
+            }
+            if !contains(&rx, "refused until the user approves a plan") {
+                verdict = 73;   // 闸门那句话也得在（模型提前知道写不了文件）
+            }
+            if !contains(&rx, "TUIS-PLAN-TASK") {
+                verdict = 74;   // 任务文本必须真的进了历史
+            }
+            if !tuis_pl_toolcall_body(&body) {
+                verdict = 75;
+            }
+        } else {
+            if !contains(&rx, "PLAN-TAIL-MARK") {
+                verdict = 76;   // 计划全文必须留在历史里（转录/记录不丢）
+            }
+            if tuis_pl_dismiss {
+                if !contains(&rx, TUIS_PL_DISMISS_RESULT) {
+                    verdict = 77;   // 「解决」的语义必须回到模型面前
+                }
+                if contains(&rx, TUIS_PL_APPROVED) {
+                    verdict = 78;   // 没批准就绝不能出现 approved
+                }
+            } else {
+                if !contains(&rx, TUIS_PL_APPROVED) {
+                    verdict = 79;   // 批准了必须告诉模型可以开工
+                }
+                if contains(&rx, TUIS_PL_DISMISS_RESULT) {
+                    verdict = 80;   // 批准了就不该是「停下等用户」
+                }
+            }
+            if !mock_final_body(&body, "TUIS-PLAN-DONE" as &const byte) {
+                verdict = 81;
+            }
+        }
+        var sent: bool = false;
+        if is_stream {
+            sent = mock_send_sse(cfd, &body);
+        } else {
+            sent = mock_send(cfd, &body);
+        }
+        if !sent {
+            verdict = 82;
+        }
+        buf_free(&body);
+        buf_free(&rx);
+        _ = sys_close(cfd) catch {};
+        round = round + 1;
+    }
+    return verdict;
+}
+
+// fork 出 mock（形状与 tuis_ap_start_mock 相同，只换子进程里跑的那个 server）
+fn tuis_pl_start_mock(want_dismiss: bool, mpid: &i32) u16 {
+    tuis_pl_dismiss = want_dismiss;
+    const lfd: i32 = sys_socket(AF_INET, SOCK_STREAM, IPPROTO_TCP) catch { return 0; };
+    var one: i32 = 1;
+    _ = sys_setsockopt(lfd, SOL_SOCKET, SO_REUSEADDR, &one as &void, 4 as u32) catch {};
+    var addr: [byte: 16] = [0: 16];
+    fill_sockaddr_ipv4(127, 0, 0, 1, 0, &addr[0]);
+    if (sys_bind(lfd, &addr[0] as &void, 16 as u32) catch { -1; }) != 0 {
+        _ = sys_close(lfd) catch {};
+        return 0;
+    }
+    _ = sys_listen(lfd, 4) catch {};
+    var got: [byte: 16] = [0: 16];
+    var glen: u32 = 16;
+    _ = sys_getsockname(lfd, &got[0] as &void, &glen) catch {};
+    const port: u16 = ((got[2] as u16) << (8 as i32)) | (got[3] as u16);
+    const pid64: i64 = sys_fork() catch {
+        _ = sys_close(lfd) catch {};
+        return 0;
+    };
+    if pid64 == 0 {
+        const rc0: i32 = tuis_pl_mock(lfd);
+        sys_exit(rc0);
+    }
+    mpid[0] = tuis_i32(pid64);
+    _ = sys_close(lfd) catch {};
+    return port;
+}
+
+// 一份「指向本地 mock」的配置（headless 与 PTY 子进程共用）。
+// plan 模式**不**写进 cfg.plan：那个旗标只在进程第一次装配提示词时读一次，而本进程早被
+// 前面的轮次装配过了；进入 plan 模式统一走用户那条路（tab / agent_plan_apply）。
+fn tuis_pl_cfg(c: &Config, port: u16, ws: &const byte, task: &const byte) void {
+    c.sandbox = SAN_OFF;          // 自测不测沙箱：别让机器上有没有 bwrap 影响结果
+    cfg_pin_api(c, LLM_STYLE_CHAT);
+    c.base_url = buf_new(64);
+    _ = buf_append_cstr(&c.base_url, "http://127.0.0.1:");
+    _ = buf_append_u64(&c.base_url, port as u64);
+    _ = buf_append_cstr(&c.base_url, "/v1");
+    c.model = buf_new(32);
+    _ = buf_append_cstr(&c.model, "selftest-model");
+    c.api_key = buf_new(32);
+    _ = buf_append_cstr(&c.api_key, "selftest-key");
+    c.workspace = buf_new(strlen(ws) + 8);
+    _ = buf_append_cstr(&c.workspace, ws);
+    c.task = buf_new(64);
+    _ = buf_append(&c.task, task, bufx_cstr_len(task));
+    c.verify = HC_VERIFY_NONE;
+    c.allow_shell = true;
+    c.stream = true;
+    c.quiet = false;
+    c.tool_lines = 8;
+    c.max_steps = 4;
+    c.timeout_ms = 15000;
+    c.agent_home = buf_new(64);
+    _ = buf_append_cstr(&c.agent_home, "build/selftest_agent_home");
+}
+
+// ---- A) 浮层排版与按键（headless，直接开浮层）----
+fn tuis_pl_overlay_case(tag: &const byte, ok: &bool) void {
+    var sel: Buf = buf_new(256);
+    defer { buf_free(&sel); }
+    tuis_reset(100, 30);
+    if !tui_reader_fits() {
+        tuis_fail(tag, "100x30 下 reader 浮层必须放得下", ok);
+    }
+    tui_overlay_reader(TUI_OVK_PLAN, TUIS_PL_TITLE, bufx_cstr_len(TUIS_PL_TITLE),
+        TUIS_PL_PLAN, bufx_cstr_len(TUIS_PL_PLAN), PLAN_ITEMS, bufx_cstr_len(PLAN_ITEMS), 0);
+    if !tui_overlay_open() || tui_overlay_kind() != TUI_OVK_PLAN {
+        tuis_fail(tag, "审阅浮层没有打开（或 kind 不是 TUI_OVK_PLAN）", ok);
+        return;
+    }
+    tui_build();
+    tuis_scan_rows(100, ok, tag);
+    if !tuis_screen_has(TUIS_PL_TITLE) {
+        tuis_fail(tag, "浮层标题不对（应当是「计划待审」）", ok);
+    }
+    if !tuis_screen_has("计划待审 · 1/") {
+        tuis_fail(tag, "标题栏没有「第 a 行/共 b 行」的滚动指示", ok);
+    }
+    if !tuis_screen_has(TUIS_PL_KEEP) || !tuis_screen_has(TUIS_PL_DISMISS) || !tuis_screen_has(TUIS_PL_APPROVE) {
+        tuis_fail(tag, "三个动作（继续讨论 / 解决 / 确认执行）没有都在浮层里", ok);
+    }
+    if !tuis_screen_has("▸ 继续讨论") {
+        tuis_fail(tag, "默认光标不在「继续讨论」上（安全默认：回车 ≠ 批准）", ok);
+    }
+    if !tuis_screen_has("plan 模式") {
+        tuis_fail(tag, "动作行上方没有选中项说明", ok);
+    }
+    if tuis_screen_has(TUIS_PL_TAIL) {
+        tuis_fail(tag, "计划尾巴一开始就可见 —— 这一轮的滚动断言就没意义了", ok);
+    }
+    if !tuis_screen_has("│ # 计划标题") {
+        tuis_fail(tag, "正文第一行没有画出来（markdown 标题）", ok);
+    }
+    // 方框逐行对齐（复用 tui-frame 轮那套量法：左右边界列 + 首尾必须是边框字形）
+    tuis_overlay_frame_check(100, ok, tag);
+
+    // ↓ 滚一行：标题栏指示器必须跟着走
+    tui_keys_inject("\x1b[B" as &const byte, 3);
+    tui_build();
+    tuis_scan_rows(100, ok, tag);
+    if !tuis_screen_has("计划待审 · 2/") {
+        tuis_fail(tag, "↓ 之后标题栏的行号没有 +1（正文没滚动）", ok);
+    }
+    // pgdn 翻页：行号必须整页跳（不是 +1），而且一开始看不到的尾巴仍然看不到
+    tui_keys_inject("\x1b[6~" as &const byte, 4);
+    tui_build();
+    tuis_scan_rows(100, ok, tag);
+    if tuis_screen_has("计划待审 · 1/") || tuis_screen_has("计划待审 · 2/") {
+        tuis_fail(tag, "pgdn 之后行号还停在第 1/2 行（没有整页滚动）", ok);
+    }
+    // end 到底：尾巴标记必须出现（窗口高度随终端变，所以用「到底」而不是「翻一页」）
+    tui_keys_inject("\x1b[4~" as &const byte, 4);
+    tui_build();
+    tuis_scan_rows(100, ok, tag);
+    if !tuis_screen_has(TUIS_PL_TAIL) {
+        tuis_fail(tag, "pgdn 之后仍看不到计划尾巴（正文没有真的滚动）", ok);
+    }
+    // home 回顶
+    tui_keys_inject("\x1b[H" as &const byte, 3);
+    tui_build();
+    if !tuis_screen_has("计划待审 · 1/") {
+        tuis_fail(tag, "home 没有回到第一行", ok);
+    }
+
+    // 数字直选 + 回车：交回「确认执行」
+    tui_keys_inject("3" as &const byte, 1);
+    if tui_overlay_sel_index() != 2 {
+        tuis_fail(tag, "按 3 没有把光标移到第三个动作上", ok);
+    }
+    tui_keys_inject("\r" as &const byte, 1);
+    if !tui_overlay_take(&sel) {
+        tuis_fail(tag, "回车没有把选中项交出来", ok);
+    } else if !bufx_eq_cstr(sel.ptr as &const byte, sel.len, TUIS_PL_APPROVE) {
+        tuis_fail(tag, "数字直选 + 回车交回的不是「确认执行」", ok);
+    }
+    if tui_overlay_kind() != TUI_OVK_PLAN {
+        tuis_fail(tag, "take 之后 kind 不是 TUI_OVK_PLAN（结果会被静默丢掉）", ok);
+    }
+    if tui_overlay_open() {
+        tuis_fail(tag, "回车之后浮层还开着", ok);
+    }
+
+    // esc 取消（= 「解决」）
+    tui_overlay_reader(TUI_OVK_PLAN, TUIS_PL_TITLE, bufx_cstr_len(TUIS_PL_TITLE),
+        TUIS_PL_PLAN, bufx_cstr_len(TUIS_PL_PLAN), PLAN_ITEMS, bufx_cstr_len(PLAN_ITEMS), 0);
+    tui_keys_inject("\x1b" as &const byte, 1);
+    if !tui_overlay_cancelled() {
+        tuis_fail(tag, "esc 没有走「取消」", ok);
+    }
+    if tui_overlay_open() {
+        tuis_fail(tag, "esc 之后浮层还开着", ok);
+    }
+
+    // plan 状态 → 面板 chip 的同步（批准/退出都靠它，唯一的变更点）
+    agent_plan_force(true);
+    if !tui_plan_on() {
+        tuis_fail(tag, "进 plan 模式时没有同步输入面板的 Plan chip", ok);
+    }
+    agent_plan_force(false);
+    if tui_plan_on() {
+        tuis_fail(tag, "退出 plan 模式时 chip 没有跟着收掉", ok);
+    }
+
+    // 窄终端：每行仍然 ≤ cols，边框与动作行还在（40 列下「确认执行」会被截断，只看第一项）
+    tuis_reset(40, 14);
+    tui_overlay_reader(TUI_OVK_PLAN, TUIS_PL_TITLE, bufx_cstr_len(TUIS_PL_TITLE),
+        TUIS_PL_PLAN, bufx_cstr_len(TUIS_PL_PLAN), PLAN_ITEMS, bufx_cstr_len(PLAN_ITEMS), 0);
+    tui_build();
+    tuis_scan_rows(40, ok, tag);
+    if !tuis_screen_has(TUIS_PL_TITLE) || !tuis_screen_has("▸ 继续讨论") {
+        tuis_fail(tag, "窄终端下浮层没画出来（标题或动作行缺失）", ok);
+    }
+    // 窄终端一定会触发截断：这一条正是当初抓出「宽 1 列」（= 踩坑 42 那类）的地方
+    tuis_overlay_frame_check(40, ok, tag);
+    
+    if !tuis_screen_has("╭" as &const byte) || !tuis_screen_has("╰" as &const byte) {
+        tuis_fail(tag, "窄终端下浮层没有圆角边框", ok);
+    }
+    tui_overlay_close();
+    tuis_reset(100, 30);
+}
+
+// ---- B) headless + agent：没人回答 → 「解决」（fail closed，绝不批准）----
+fn tuis_pl_headless_case(tag: &const byte, ok: &bool) void {
+    const ws: &const byte = "build/selftest_ws_tui_plan" as &const byte;
+    if !ws_prepare(ws) {
+        tuis_fail(tag, "工作目录准备失败", ok);
+        return;
+    }
+    var mpid: i32 = -1;
+    const port: u16 = tuis_pl_start_mock(true, &mpid);
+    if port == 0 {
+        tuis_fail(tag, "mock LLM 起不来", ok);
+        return;
+    }
+    var c: Config = cfg_default();
+    tuis_pl_cfg(&c, port, ws, TUIS_PL_TASK);
+    c.tui = true;
+    c.tui_headless = true;
+    c.tui_cols = 100;
+    c.tui_rows = 30;
+
+    tui_reset_all();
+    tui_set_headless(true);
+    tui_set_size(100, 30);
+    tui_set_color(false, false);
+    tui_begin_session();
+    tui_sink_flush_partial();
+    // 进 plan 模式走**用户那条路**：tab → TUI_REQ_PLAN_ON → 主循环 plan_set()。
+    // （进程级的 plan 镜像只有主循环那条路会同步：cfg.plan 只在 agent_texts_ensure()
+    //   里读一次，而那个 one-shot 标记在本进程早被前面的轮次置位了。）
+    // 所以这里只注入 tab、**不**把请求取走，留给主循环去消费。
+    tui_keys_inject("\t" as &const byte, 1);
+    if !tui_plan_on() {
+        tuis_fail(tag, "tab 没有切进 plan 模式（chip 没变）", ok);
+        return;
+    }
+    tui_keys_inject(TUIS_PL_TASK, bufx_cstr_len(TUIS_PL_TASK));
+    tui_keys_inject("\r" as &const byte, 1);
+    if !tui_has_submit() {
+        tuis_fail(tag, "注入回车之后没有待取走的提交", ok);
+    }
+
+    const rc: i32 = agent_run_tui(&c);
+    const mock_rc: i32 = wait_child(mpid);
+    if rc != AGENT_OK {
+        tuis_fail(tag, "plan 模式的一轮却以非 0 退出", ok);
+    }
+    if mock_rc != 0 {
+        tuis_fail(tag, "mock LLM 侧报错（第二封请求里的工具结果不对？）", ok);
+        tuis_puts("  mock_rc=");
+        tuis_num(mock_rc as usize);
+        tuis_puts("\n");
+    }
+    // headless 下注入的键用完 = 没人回答：浮层必须收掉，否则它会一直盖着转录
+    if tui_overlay_open() {
+        tuis_fail(tag, "headless 下没人回答之后，审阅浮层还留在屏幕上", ok);
+        tui_overlay_close();
+    }
+    if !plan_on() {
+        tuis_fail(tag, "没人回答之后 plan 模式被退出了（那时不该退出）", ok);
+    }
+    tui_build();
+    tuis_scan_rows(100, ok, tag);
+    if tuis_screen_has(TUIS_PL_APPROVED) {
+        tuis_fail(tag, "转录里出现了「Plan approved」（没人回答却批准了）", ok);
+    }
+    cfg_free(&c);
+    tui_set_headless(false);
+    tui_headless_enable(false);
+    tty_sink_on = false;
+}
+
+// ---- 子进程侧：把 slave 挂到 0/1/2 后跑真 TUI（plan 模式 + 真终端）----
+fn tuis_pl_child(slave_path: &const Buf, port: u16, ws: &const byte) void {
+    const s: i32 = sys_open(slave_path.ptr as *const byte, TUIS_O_RDWR_NOCTTY, 0) catch { -1; };
+    if s < 0 {
+        sys_exit(9);
+    }
+    _ = sys_dup2(s, 0) catch {};
+    _ = sys_dup2(s, 1) catch {};
+    _ = sys_dup2(s, 2) catch {};
+    if s > 2 {
+        _ = sys_close(s) catch {};
+    }
+    var c: Config = cfg_default();
+    tuis_pl_cfg(&c, port, ws, "" as &const byte);   // 任务由父进程从 PTY 打进来
+    c.tui = true;
+    c.tui_headless = false;
+    const rc: i32 = agent_run_tui(&c);
+    sys_exit(rc);
+}
+
+// ---- C/D) 真 PTY：approve（先滚动）与 esc → 解决 ----
+fn tuis_pl_pty_case(tag: &const byte, ok: &bool, approve: bool) void {
+    const ws: &const byte = "build/selftest_ws_tui_plan_pty" as &const byte;
+    if !ws_prepare(ws) {
+        tuis_fail(tag, "工作目录准备失败", ok);
+        return;
+    }
+    var mpid: i32 = -1;
+    const port: u16 = tuis_pl_start_mock(!approve, &mpid);
+    if port == 0 {
+        tuis_fail(tag, "mock LLM 起不来", ok);
+        return;
+    }
+    var slave_path: Buf = buf_new(64);
+    defer { buf_free(&slave_path); }
+    const m: i32 = tuis_open_pty(&slave_path, 100, 30);
+    if m < 0 {
+        tuis_fail(tag, "打不开 /dev/ptmx", ok);
+        _ = sys_kill(mpid as i64, SIGKILL) catch {};
+        return;
+    }
+    tui_reset_all();
+    tui_set_headless(false);
+    tui_headless_enable(false);
+    tty_sink_on = false;
+    const cpid64: i64 = sys_fork() catch {
+        _ = sys_close(m) catch {};
+        tuis_fail(tag, "fork TUI 失败", ok);
+        return;
+    };
+    if cpid64 == 0 {
+        tuis_pl_child(&slave_path, port, ws);
+        sys_exit(3);
+        return;
+    }
+    const cpid: i32 = tuis_i32(cpid64);
+
+    var cap: Buf = buf_new(4194304);
+    defer { buf_free(&cap); }
+    tuis_drain(m, &cap, 40);      // 首帧（子进程进 raw 之后才会画）
+    if !tuis_has(&cap, "Ask anything" as &const byte) {
+        tuis_fail(tag, "首屏没有输入面板占位文案", ok);
+    }
+    // 先进 plan 模式（tab = 切模式）：面板 chip 从 Build 变成 Plan 才算数。
+    // 注意只能搜**裸词** Plan：PTY 里样式是 SGR 序列，`▌` 与 `Plan` 之间夹着 `ESC[0m`。
+    // （帧里没有别的「Plan」：正文计划只有中文与小写 plan / 大写的 PLAN-TAIL-MARK。）
+    tuis_write_master(m, "\t" as &const byte, 1);
+    var plan_chip: bool = false;
+    var kp: i32 = 0;
+    while kp < 80 && !plan_chip {
+        tuis_drain(m, &cap, 1);
+        if tuis_has(&cap, "Plan" as &const byte) {
+            plan_chip = true;
+        }
+        kp = kp + 1;
+    }
+    if !plan_chip {
+        tuis_fail(tag, "tab 之后面板 chip 没有变成 Plan（没进 plan 模式）", ok);
+        tuis_dump_tail(&cap, 1200);
+    }
+    var task: [byte: 64] = "plan the greeting change (TUIS-PLAN-TASK)\r";
+    tuis_write_master(m, &task[0], bufx_cstr_len(&task[0] as &const byte));
+    var seen: bool = false;
+    var k: i32 = 0;
+    while k < 160 && !seen {
+        tuis_drain(m, &cap, 1);
+        if tuis_has(&cap, TUIS_PL_TITLE) {
+            seen = true;
+        }
+        k = k + 1;
+    }
+    if !seen {
+        tuis_fail(tag, "exit_plan_mode 没有弹出审阅浮窗", ok);
+        tuis_dump_tail(&cap, 1500);
+    } else {
+        if !tuis_has(&cap, TUIS_PL_KEEP) || !tuis_has(&cap, TUIS_PL_DISMISS) || !tuis_has(&cap, TUIS_PL_APPROVE) {
+            tuis_fail(tag, "审阅浮层里没有三个动作", ok);
+        }
+        // 标题栏的「第 a 行/共 b 行」在这里不断言：PTY 里标题与数字之间夹着 SGR 序列，
+        // 字节层面不相邻（精确断言在 A 段的 headless 用例里做）。
+        if tuis_has(&cap, TUIS_PL_TAIL) {
+            tuis_fail(tag, "计划尾巴一开始就可见（这一屏本来是放不下的）", ok);
+        }
+        if approve {
+            // end 翻到底 → 尾巴必须出现（证明确实滚动了），再按 3 选中「确认执行」并回车
+            buf_reset(&cap);
+            tuis_write_master(m, "\x1b[4~" as &const byte, 4);
+            var scrolled: bool = false;
+            var k2: i32 = 0;
+            while k2 < 120 && !scrolled {
+                tuis_drain(m, &cap, 1);
+                if tuis_has(&cap, TUIS_PL_TAIL) {
+                    scrolled = true;
+                }
+                k2 = k2 + 1;
+            }
+            if !scrolled {
+                tuis_fail(tag, "end 之后仍看不到计划尾巴（正文不可滚动？）", ok);
+                tuis_dump_tail(&cap, 1200);
+            }
+            tuis_write_master(m, "3\r" as &const byte, 2);
+        } else {
+            // esc = 「解决」：关掉浮窗、留在 plan 模式等用户说话
+            tuis_write_master(m, "\x1b" as &const byte, 1);
+        }
+        var k3: i32 = 0;
+        while k3 < 200 && !tuis_has(&cap, "TUIS-PLAN-DONE" as &const byte) {
+            tuis_drain(m, &cap, 1);
+            k3 = k3 + 1;
+        }
+        if !tuis_has(&cap, "TUIS-PLAN-DONE" as &const byte) {
+            tuis_fail(tag, "审阅之后没有收到 mock 的最终答案", ok);
+            tuis_dump_tail(&cap, 1500);
+        }
+        // 决定之后的效果由 mock 侧断言（工具结果文案），界面 chip 的同步在 A 段用
+        // 状态查询钉死（PTY 帧里 `▌` 与 `Plan` 之间夹着 SGR，字节层面搜不准，
+        // 而转录里本来就有 ExitPlan 这种含 "Plan" 的卡片标题）。
+        var k4: i32 = 0;
+        while k4 < 8 {
+            tuis_drain(m, &cap, 1);
+            k4 = k4 + 1;
+        }
+    }
+    // 退出：先清输入再 Ctrl-D
+    var bs: [byte: 1] = [127];
+    tuis_write_master(m, &bs[0], 1);
+    tuis_drain(m, &cap, 6);
+    var ctrl_d: [byte: 1] = [4];
+    tuis_write_master(m, &ctrl_d[0], 1);
+    tuis_drain(m, &cap, 30);
+    var st: i32 = 0;
+    if !tuis_wait_raw(cpid, &st, 20000) {
+        tuis_fail(tag, "Ctrl-D 之后 TUI 子进程没有退出", ok);
+        _ = sys_kill(cpid as i64, SIGKILL) catch {};
+        _ = tuis_wait_raw(cpid, &st, 2000);
+    } else {
+        const code: i32 = (st >> (8 as i32)) & 255;
+        if code != 0 {
+            tuis_fail(tag, "TUI 退出码不是 0", ok);
+        }
+    }
+    _ = sys_close(m) catch {};
+    const mock_rc: i32 = wait_child(mpid);
+    if mock_rc != 0 {
+        tuis_fail(tag, "mock LLM 侧报错（审阅结果不对？）", ok);
+        tuis_puts("  mock_rc=");
+        tuis_num(mock_rc as usize);
+        tuis_puts("\n");
+    }
+}
+
+fn tui_plan_round(tag: &const byte) bool {
+    var ok: bool = true;
+    // 进程级的 plan 状态是继承的（PTY 子进程 fork 自本进程）：轮次开头先摆平，
+    // 否则上一轮的残留会让子进程一进来就在 plan 模式里、tab 反倒把它关掉。
+    agent_plan_force(false);
+    // A) 浮层：排版 + 滚动 + 直选 + esc + 窄终端
+    tuis_pl_overlay_case(tag, &ok);
+    // B) headless：没人回答 = 「解决」（fail closed）
+    tuis_pl_headless_case(tag, &ok);
+    // 这一轮结束时 plan 模式仍开着（B 段的语义就是「留在 plan 模式」）：恢复成关，
+    // 免得污染后面的轮次与 PTY 子进程。
+    agent_plan_force(false);
+    // C) 真 PTY：滚动 + 「确认执行」→ 模型拿到 Plan approved
+    tuis_pl_pty_case(tag, &ok, true);
+    // D) 真 PTY：esc → 「解决」→ 模型被告知停下等用户说话，plan 模式仍在
+    tuis_pl_pty_case(tag, &ok, false);
+    agent_plan_force(false);
+    if ok {
+        tuis_ok(tag, "plan 审阅：浮窗排版/滚动/三动作/数字直选/esc + headless fail closed + 真 PTY 批准与解决");
+    }
+    return ok;
+}
 
 // ============================================================
 // tui-tasks（P22）：常驻任务块的布局 / ctrl+t 开关 / 活体刷新 / 降级
@@ -3583,6 +4206,9 @@ export fn tui_selftest_all() bool {
         ok = false;
     }
     if !tui_approve_round("tui-approve" as &const byte) {
+        ok = false;
+    }
+    if !tui_plan_round("tui-plan" as &const byte) {
         ok = false;
     }
     if !tui_keys_round("tui-keys" as &const byte) {
