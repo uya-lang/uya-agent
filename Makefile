@@ -312,7 +312,7 @@ e2e-dsh: build
 p30-check: build
 	@python3 testdata/pty_drive.py --suite
 
-# P32：/sessions 列表（离线，行式 REPL 走真二进制）：三列 = 标题 / 工作区 / session id，
+# P33：/sessions 列表（离线，行式 REPL 走真二进制）：三列 = 标题 / 工作区 / session id，
 # 按 lastActiveAt 倒序、同 id 只留最后一条。TUI 浮层那条腿（宽箱体 / 逐行宽度不变量 /
 # 选中项取完整 id）在 selftest 的 tui-sessions 轮里断言。
 e2e-sessions: build
@@ -349,7 +349,7 @@ tui-demo: build
 tui-selftest: build
 	UYA_SELFTEST_TUI_ONLY=1 $(OUT) --selftest
 
-# P32：/sessions 列表的自测轮（纯函数排版 + TUI 浮层），改会话列表时比整轮 selftest 快
+# P33：/sessions 列表的自测轮（纯函数排版 + TUI 浮层），改会话列表时比整轮 selftest 快
 sess-selftest: build
 	UYA_SELFTEST_SESS_ONLY=1 $(OUT) --selftest
 
