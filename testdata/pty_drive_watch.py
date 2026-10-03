@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""PTY 驱动（P41 验收用，不属于产品）：验收 `/watch` 的实时性。
+"""PTY 驱动（P42 验收用，不属于产品）：验收 `/watch` 的实时性。
 
 现场：真终端里的 uya-agent 派出一个子代理 → 子代理先思考、再跑 `sleep N` 的 bash →
 期间敲 `/watch sub-1` → 必须能在**子代理结束之前**看到 `[step …]` / `▸ bash …` 上屏。
