@@ -172,6 +172,22 @@ def wait_overlay(fd, screen, t0, max_ms=3000):
     return None
 
 
+def wait_text(fd, screen, needles, t0, max_ms=1500):
+    """等 needles 里任意一段文字**在屏幕上出现过**；返回毫秒，没等到返回 None。
+
+    P39 起必须这样判，不能「泵 1.5 s 之后再看屏幕」：`/new` 一旦真的执行就会清转录
+    （屏幕上只剩新会话那两行），而回执与 `[interrupted]` 都是**属于上一屏**的东西 ——
+    等清完再看就永远看不到了。判据语义没变：仍然是「≤max_ms 内出现过」。
+    """
+    rounds = int(max_ms / 50)
+    for _ in range(rounds):
+        pump(fd, screen, 0.05)
+        for s in needles:
+            if screen.has(s):
+                return round((time.time() - t0) * 1000)
+    return None
+
+
 def run_scenario(port, workspace, scenario, extra=None, gap_ms=None, steps=None,
                  head_delay_ms=0, tool_cmd=None):
     """起一个假网关 + 一个真终端 TUI 子进程，跑一个场景，返回 verdict 字典。"""
@@ -212,6 +228,9 @@ def suite():
     v2 = run_scenario(0, base + "_new", "new-mid-turn")
     check(v2.get("receipt_seen"), "/new 没有立刻给出回执", failures)
     check(v2.get("interrupted"), "/new 没有中断当前回合", failures)
+    # P39：换会话之后屏幕上只剩新会话（旧屏的回执/中断行都被清掉，新会话的回执在）
+    check(v2.get("switch_cleared"), "/new 换会话之后屏幕没换（旧转录还在，或新会话回执没出现）",
+          failures)
     v3 = run_scenario(0, base + "_intr", "interrupt-then-task")
     check(v3.get("second_turn_ok"), "esc 中断一回合之后，第二个任务没有正常跑完（粘住的中断标志？）",
           failures)
@@ -331,12 +350,20 @@ def _drive(port, workspace, scenario, extra=None):
         elif scenario == "new-mid-turn":
             type_keys(fd, "跑一个长任务\r")
             pump(fd, screen, 1.2)
+            t0 = time.time()
             type_keys(fd, "/new\r")
-            pump(fd, screen, 1.5)
-            verdict["receipt_seen"] = screen.has("已排队") or screen.has("已收到")
-            verdict["interrupted"] = screen.has("interrupted")
-            pump(fd, screen, 4.0)
+            # P30 的判据：回执与中断都必须**立刻**出现（≤1.5 s）。
+            # P39 起这两样都属于「上一屏」：/new 真的执行时转录会被清掉，所以要在
+            # 它们出现的那一刻判（wait_text 边泵边看），不能再等清完再回头看屏幕。
+            verdict["receipt_ms"] = wait_text(fd, screen, ("已收到", "已排队"), t0, 1500)
+            verdict["receipt_seen"] = verdict["receipt_ms"] is not None
+            verdict["interrupt_ms"] = wait_text(fd, screen, ("[interrupted]",), t0, 2500)
+            verdict["interrupted"] = verdict["interrupt_ms"] is not None
+            pump(fd, screen, 3.0)
             verdict["final_ok"] = screen.has("SELFTEST_OK")
+            # P39：换会话之后屏幕上只剩新会话 —— 旧会话的回执/中断行都不该留在转录里，
+            # 而新会话的回执必须在（真 PTY 里的端到端旁证，headless 那条在 tui-switch 轮）
+            verdict["switch_cleared"] = screen.has("已开新会话") and not screen.has("[interrupted]")
         elif scenario == "interrupt-then-task":
             type_keys(fd, "第一个长任务\r")
             pump(fd, screen, 1.0)

@@ -4,7 +4,14 @@
 多轮 loop 直到给出结论。全部代码 45 个 `.uya` 文件，**不引入任何 C 代码、`@c_import` 或其它语言**，
 只依赖 Uya 语言与随编译器分发的标准库。
 
-**P0–P38 全部完成**（**P38 是「bash 工具的命令不再有终端」**：修的是「工具子进程继承了 TTY →
+**P0–P39 全部完成**（**P39 是「换会话时屏幕跟着换」**：`/new`、`/resume <id>`、
+`/sessions` 浮层里回车恢复 —— 这三条换会话的路以前只换历史、不管屏幕，旧会话的正文
+原样留在转录里与新恢复出来的历史堆在同一屏；现在换会话是「**先清转录、再回放**」：
+清的是转录条目与它配套的半行/滚动状态（不动脚注、面板与访问模式 chip），`/resume` 之后
+还会把恢复出来的历史**回放**一遍（与启动时 `--resume` 同一条路），回执排在回放之后；
+滚动模式（没有转录层）一个字节都不动。新自测轮 `tui-switch` 三条腿钉住，见
+§2「会话持久化与恢复（P4）」、§3 踩坑 63 与 §6 的 P39 验收记录；
+**P38 是「bash 工具的命令不再有终端」**：修的是「工具子进程继承了 TTY →
 命令树被 job control 停住，工具却一直显示「运行中」」这条真实的挂起 —— 子进程 stdin 指向
 `/dev/null` 且 `setsid()` 自成会话（对齐 DSH 的 `stdio.stdin = "ignore"`）、被停住就当场收整棵
 子树、中止/超时按**进程组**收、命令退出就立刻返回（收尾读管道非阻塞），见 §2「bash 与后台任务」、
@@ -350,6 +357,8 @@ src/sigx.uya      信号层（P17）：直接绑宿主 glibc `sigaction`（绕�
                   的 SIGSEGV 缺陷）；终止类信号 → 先恢复终端（termios + **弹标题栈** +
                   离开备用屏幕）再 128+sig 退出；SIGWINCH → 只置标志；`sigx_reset_for_child()` 给 fork 子进程
 src/tui.uya       全屏 TUI（P17/P18）：帧模型（行=段序列，逐行 diff 重绘）、备用屏幕进出、
+                  **P39 `tui_transcript_clear()`（运行时换会话：只清转录条目与它配套的半行/
+                  滚动状态，脚注与 chip 一概不动 —— 自测的 `tui_reset_all()` 与它共用这一半）、**
                   **访问模式 chip 与底对齐选择浮层、阻塞式确认（tui_confirm_wait）**、
                   **P22 reader 浮层（tui_reader_wait：计划审阅 —— 可滚动正文 + 三动作）**、
                   转录条目（用户/助手/思考/工具/诊断）、轻量 markdown、输入编辑器（按字符编辑、
@@ -372,7 +381,7 @@ src/shellselftest.uya bash 工具的**进程侧**自测轮次（P38：bash-detac
                   收口、命令退出立刻返回且整组收得掉；全部离线、不落盘
 src/tuiselftest.uya TUI 的自测轮次（tui-frame / tui-keys / tui-sink / tui-turn / tui-status / tui-cmd /
                   tui-plan / tui-exit / tui-quit / tui-tasks / tui-diff / tui-scroll / tui-pty /
-                  tty-title-pty；P20/P24 起 tui-frame 还断言脚注统计行的逐级退化、右对齐
+                  tty-title-pty；P39 起还有 tui-switch（换会话：清转录 + 回放 + 滚动模式不动）；P20/P24 起 tui-frame 还断言脚注统计行的逐级退化、右对齐
                   （末尾 3 列空白）与 `ctx` / `cpu` / `内存` 三档让位顺序，
                   P22 起 tui-pty 与 tty-title-pty 还逐字节断言终端标题；
                   tui-frame 现在还逐行量**浮层方框**的左右边界列——长行把右边框顶出去那类
@@ -859,6 +868,26 @@ Messages API（`x-api-key` + `anthropic-version: 2023-06-01`，服务端工具 `
   见踩坑 27 的后半段）。
 * 入口：`--continue`（当前目录最近一条）、`--resume <id|last>`、`--list-sessions`、`--no-save`；
   REPL 里 `/sessions`、`/resume <id>`、`/new`。
+* **换会话时屏幕跟着换（P39）**：启动时的 `--continue` / `--resume <id|last>` 与运行时那三条
+  （`/new`、`/resume <id>`、`/sessions` 浮层里回车）都会换掉整个历史，但**屏幕不会自己跟着换** ——
+  以前运行中的那三条只换历史，旧会话的正文原样留在转录里，新恢复出来的历史接着往下堆：
+  一屏里两段会话的正文混在一起，用户既看不出「换成功了」，也分不清哪句话是哪条会话说的。
+  现在三条路（`/new`、`/resume <id>`、`/sessions` 浮层里回车选中）统一走
+  `agent_tui_session_switched()`：
+  * **先清**（`tui_transcript_clear()`）：转录条目 + 它的四条记账 + 跟着转录走的半行/粘贴待处理/
+    思考实时行 + 滚动状态（复位到「贴尾」，下一帧钉在真正的底）一起清。**不动**脚注统计
+    （stats/ctx/cpu/内存）、cwd/分支/模型、plan 与访问模式 chip、浮层与按键队列 —— 那些是
+    「会话还在跑」的证据，清掉就是把界面弄残（这正是它不能拿自测的 `tui_reset_all()` 顶替的原因，
+    两者共用同一份条目池实现）；
+  * **再回放**（`/resume` 那条路）：把恢复出来的历史按启动时同一条路铺回转录
+    （`agent_tui_seed_history`：用户行、助手正文、工具块；运行时上下文/AGENTS.md 那类注入消息
+    仍不进转录）—— 所以换完之后屏幕上就是「被恢复的那个会话」，不是一片空白；
+  * **最后打回执**（`[session] 已开新会话` / `[session] 已恢复会话`）：顺序不能反 ——
+    回执照样走 `tty_puts`（TUI 里进转录），先写后清就会把它自己清掉（自测 `tui-switch` 钉了
+    「回执在回放内容**之后**」这条行序）；
+  * **滚动模式不碰**：`tui_active()` 为假时整条路直接返回 —— 那边的正文是终端自己滚出去的，
+    抹掉等于把用户刚看过的内容删了（滚动模式想重看就往上翻：内容本来就在终端自己的回滚缓冲里）。
+  `/new` 的清与回放都发生在 `agent_history_begin()` 成功**之后**（失败时屏幕上什么都不该变）。
 * **会话列表（P33，P35 改了展示序）**：`/sessions`（浮层）、滚动模式的 `/sessions`、
   `--list-sessions` 打印的是**同一份**三列表 —— **① 标题 ② 工作区 ③ session id**：
   * 顺序按 `lastActiveAt` 排：**P35 起最新的排在最后一行**（紧挨输入行/提示符，人眼先落在
@@ -2680,6 +2709,20 @@ vLLM 等 OpenAI 兼容端点都一样稳。想升级成严格 `tool` 角色消�
     自测里专门钉了「ADD 仍是纯前景 `38;5;42`、不带 `48;5;`」）。这类「表够不够宽」的坑
     和踩坑 2（手写长度常量）是同一族：**改表宽要连尺寸常量、循环上界、暂存缓冲一起改**。
 
+63. **自测里「关掉 TUI」要关对那个开关 —— `tui_set_headless` 只动标志，`tui_active()` 看的是
+    `g_tui_on`**（P39 写 `tui-switch` 轮时先骗了自己一次）。这一族有两个开关：
+    `tui_set_headless(on)` 只置 `g_tui_headless`（=「不碰终端」，各轮复位用的就是它），
+    而**「TUI 在不在跑」判的是 `g_tui_on`**（`tui_active()` 直接返回它）—— 只有
+    `tui_headless_enable(on)` 会把两者一起置。于是「测滚动模式」的那一段写成
+    `tui_set_headless(false)` 时，程序其实还留在 TUI 模式里：清转录照常发生，
+    自测报出来的是「**滚动模式下换会话把转录清了**」—— 看着像产品多清了东西，
+    其实是测试搭错了台，而且方向正好相反。判据：**凡是要按模式分叉的断言，先断言
+    「现在真的在这个模式里」**（本轮的 C 段两条断言互为对照：清了 → 红、没清 → 绿）。
+    同一轮里还踩到它的孪生兄弟：真 TUI 里「显示字节进转录」是 `agent_tui_start` 打开的
+    `tty_sink_on`，headless 轮里不自己打开就调 `tty_puts`，字节会走真实 fd 2 而**永远不上屏**
+    —— 报出来是「回执没出现在屏幕上」，同样像是产品没打（`tui-diag` 等轮都显式
+    `tty_sink_on = true`，就是在防这个）。两条都在同一个自测轮里，值得一起记。
+
 ---
 
 ## 4. 工具实现要点
@@ -2892,6 +2935,7 @@ contextWindow/maxTokens/input image/reasoningEffort/`permission.defaultPreset`�
 | `goal-cmd` | 会话目标人类命令（P29）纯函数轮：空态裸 `/goal` 报「当前没有目标」+ 用法（**返回 0** —— 看状态不会失败）、缺目标时 `pause`/`resume`/`edit` 各自点出是谁缺目标、裸 `edit` 与 `edit` + 纯空白都报「需要替换内容」且**不落盘**、创建后状态块四段（`Status: active` / `Objective: …` / `Rounds: 0/20` / `Activation: armed`）与盘上字段（id/revision/round/phase/objective）逐条对齐、重复创建被拒**且没改盘上 objective**、`edit` 只换 objective（revision 2、phase/armed 不动）、`pause` 关 armed、`resume` 打开、`clear` 删文件且**幂等**（再 clear 报「没得清」）、`pause after verification` 按**字面目标**创建（控制词只在独占整行时才是控制词）、`clearx` 不被当成 `clear`、大写 `CLEAR` 照样命中、`complete` 的目标让位（创建与 `edit` 都换新身份：id +1 / revision 回 1 / 0 轮 / armed）、输出必须以换行收尾 |
 | `goal-e2e` | `make e2e-goal`（离线，管道喂真 REPL + 独立 `UYA_AGENT_HOME`）：空态用法、创建、`Rounds: 0/20`、拒绝顶掉、`Goal updated` + 新 objective、`Status: paused` + `Activation: disarmed`、`Goal resumed`、`Goal cleared.`、重复 clear 幂等、字面目标规则、`/help` 里能查到 `/goal` |
 | `sess-list` | **/sessions 列表（P33，展示序 P35）纯函数轮**：索引 fixture 用真写入端（`sess_open`/`sess_close`）之外的手写索引造出「同 id 两条 + 时间戳乱序 + 缺 `lastActiveAt` + 空标题 + 带控制字节（TAB / `\u0001`）的标题」；断言去重后行数 = 唯一 id 数、重复 id 取的是**最后一条**（被取代那条的标题不许出现）、数据层严格按 `lastActiveAt` 降序且缺字段的排最后，**渲染出来的行序是它的镜像**（最新的在最后一行、缺时间戳的在第一行 —— 只比「出现在最后一行」还不够，要把那一行的行尾 token 取出来比 id）；再按 8 档可用列数（198/78/60/59/52/51/44/40）逐行断言 —— 行宽 ≤ 可用列数（只有「连 id 都放不下」那一档允许超宽，因为那份 id 必须完整）、标题列与工作区列的可见性随退化阶梯变化（三列 → 两列丢工作区 → 只剩 id）、每行喂 `agent_tui_sessions_head` 都还得出**完整 id**、正文里一个控制字节都没有；最后验滚动模式的 `sess_rows_clip_into`：窄到 21 列时每行 ≤ 21 且补 `…`，而本来放得下的宽度**一个 `…` 都不许加**（'…' 预算算错会把好端端的 id 截掉 —— 实测踩过） |
+| `tui-switch` | **运行时换会话：屏幕跟着换（P39）**：headless 100×30 —— A) 先把旧会话的正文铺进转录，敲 `/new` 后旧正文**一个字节不剩**、`[session] 已开新会话` 在上，而**脚注/面板（模型、cwd 末段、分支）都还在**（拿 `tui_reset_all()` 顶替就会把脚注一起端掉，这条专门盯这个分界）；B) fixture 是**真落盘**的会话（`sess_open`/`sess_begin`/`sess_end`/`sess_close`，带一条 user 与一条 assistant 事件），敲 `/resume <id>` 后旧正文消失、被恢复会话的**用户话与回答都回放出来**、`[session] 已恢复会话` 的行号**在回放内容之后**（顺序反了＝「先清后写」写成了「先写后清」，回执会把自己清掉）；C) `tui_headless_enable(false)`（`tui_active()` 为假＝滚动模式）下同一套调用**一个字节都不清、也不回放** —— 防假绿的对照实验：把清转录那段临时短路掉重编，A/B 两条腿立刻红（见踩坑 63 与 §6 的 P39 记录） |
 | `tui-sessions` | **/sessions 浮层（P33）**：fixture 是三个**真落盘**的会话（`sess_open`/`sess_close`，标题由测试给），`/sessions` 开浮层后断言 kind/标题、100 列下箱体铺开（顶边右边界列 = 97，即宽 `cols-6` + 左边距 3）、方框闭合成矩形（`tui-frame` 那套量法）、三列都可见、**最新那条的标题行在最早那条之下**（P35：最新的在最后一行，`tuis_find_row` 行号比较）、**默认游标就在最后一项**（`tui_overlay_sel_index() == 2` —— 否则「打开就回车」恢复的是最旧的会话）；回车 → 选中项里的 id = 最新会话的**完整 id**（不是标题）→ `sess_find` 找得到（`/resume` 走的就是它）；再跑 60 列那一档：工作区列消失、id 列还在，且条目文本里的 id 仍然完整 |
 | `sessions-e2e` | `make e2e-sessions`（离线，管道喂真 REPL + 独立 `--agent-home`）：手写索引里三条记录（旧 / 空标题 / 旧 id 的第二次记录），断言输出里最新会话在最上（`grep -n` 比行号）、被取代的旧记录不出现、同一个 id 只出现 1 次、空标题落到 `(无标题)`、`/w/new-a` 与完整 id 排成「工作区在前、id 在行尾」（正则收尾匹配）；**P35**：最新会话在**最后一行**（`grep -n` 比行号反过来）、最后一行的 id 就是 `lastActiveAt` 最大的那条、第一行是最旧那条 |
 | `resume-big-e2e` | `make e2e-resume-big`（离线，真二进制 + `testdata/make_big_session.py`）：造一份 ~3 MiB 的会话日志（末尾带一条没有换行的残行）后 `--resume --dry-run` —— 退出码必须 **0**（未修版本这里稳定 139）、打得出 `[dry-run]`、恢复出来的工作区是日志里**最后一条** `session/workspace` |
@@ -3551,9 +3595,60 @@ mock 上逐字段验收。换一台 `openai-responses` 网关可用时，零参�
     §6 的验收记录接在 P38 之后；**版本串沿用主线的 `p37-model`**（`p36-diffbg` 是这条线自己的
     验收串，与 P38 的 `p38-tty` 同一种记法：只有选定要改的那条线才动 `AGENT_VERSION`）。
 
+* **P39 的验收记录（2026-10-03，`p39-switch`，对应踩坑 63）**：换会话（`/new`、`/resume <id>`、
+  `/sessions` 浮层里回车）之后**屏幕跟着换** —— 先清转录、`/resume` 再回放、最后打回执。
+  这条线的半成品原先躺在 `dsh/p34-replay` 分支上（`tui_transcript_clear()` 写好了、
+  `tui_reset_all()` 也照着它重构成共用一份实现了，但**一个调用点都没有**：
+  函数注释里写着「`/resume` / `/sessions` 浮层选中 / `/new` 之后旧会话的正文还挂在屏幕上」，
+  而这三条路谁都没调它）—— 本次把它接上、补齐自测与文档，编号按「后到的顺延」记成 **P39**。
+  * **三条入口一处收口**：`/new` 与 `/resume <id>` 走的是 REPL 那条命令路（TUI 里
+    `agent_tui_command` 的最后一行就是转发给它），`/sessions` 浮层里回车走
+    `agent_tui_resume` → 同一行 `/resume <id>`，面板里选中 `/new` / `/resume` 也走
+    `agent_tui_palette_apply` → `agent_tui_command`。所以接线只需两处（两个历史重建点
+    成功之后），不必在四个入口各接一次。
+  * **清什么、不清什么**：清转录条目 + 四条记账（`nent`/`estart`/`text_total`/`dropped`，
+    只把入口指针归零会漏 pooled 内存、还会在顶部留一行假的「已丢弃 N 条」）+ 跟着转录走的
+    半行/粘贴待处理/思考实时行 + 滚动状态（复位到贴尾、下一帧钉到真正的底）；
+    **不清**脚注统计、cwd/分支/模型、plan 与访问模式 chip、浮层与按键队列 ——
+    会话还在跑的时候把这些端掉，界面就残了（所以不能用自测的 `tui_reset_all()` 顶替，
+    但两者现在共用同一份条目池实现，逐字节一致）。
+  * **顺序是设计的一部分**：清 → 回放 → 回执。回执本身也是 `tty_puts`（TUI 里进转录），
+    写在清之前就会被自己清掉 —— 自测里那条「回执的行号在回放内容之后」就是钉这个的。
+  * **滚动模式不碰**：`tui_active()` 为假时整条路直接返回（那边的正文是终端自己滚出去的）。
+  * **自测**：新增 `tui-switch` 轮（headless 100×30，三条腿：A `/new`、B `/resume`、
+    C 滚动模式），进 `make tui-selftest` / `make selftest`。
+  * **真 PTY 端到端旁证**（`make p30-check` 的 `new-mid-turn` 场景，真二进制 + 假网关）：
+    运行中敲 `/new` → 回执 **112 ms** 上屏、`[interrupted]` **172 ms** 上屏，
+    随后换会话生效时屏幕上只剩 `已开新会话`（旧屏的 `[interrupted]` 已经不在了）——
+    新断言 `switch_cleared` 就是钉这个的。
+  * **顺带改了那条既有场景的判据**（`testdata/pty_drive.py`）：`new-mid-turn` 原来泵 1.5 s
+    之后再看屏幕找「已收到 / [interrupted]」，P39 之后这两行**属于上一屏**（换会话时被清掉），
+    所以改成新增的 `wait_text()` **边泵边判「≤N ms 内出现过」**（上限不变：回执 1.5 s、
+    中断 2.5 s）—— 判据的语义（「立刻回执 + 立刻中断」）一个字没改，改的只是「什么时候看」，
+    并且把延迟**量出来**了（112 ms / 172 ms）。
+  * **对照实验（防假绿）**：把 `agent_tui_session_switched()` 开头临时改成「直接 return」
+    重编，A/B 两条腿立刻红五条断言（旧正文还在、回放内容不在、回执找不到），
+    C 段照旧绿 —— 这一轮真的抓得住「没接线」，不是恰好绿。
+  * **被自测当场抓住的两处自身缺陷**（都写进踩坑 63）：测试里用 `tui_set_headless(false)`
+    冒充「滚动模式」（它不动 `g_tui_on`，`tui_active()` 还是真 —— 报出来的症状是
+    「滚动模式下把转录清了」，方向正好反了）；以及 headless 轮里忘了 `tty_sink_on = true`
+    （`tty_puts` 的回执走真实 fd 2，永远不上屏，看着像产品没打回执）。
+  * **顺带修的一处夹具坑**：造夹具会话时把 `Buf.ptr`（没有尾 NUL）当 `sess_open()` 的
+    `cwd`（C 字符串）传，路径带上一截堆里的旧字节 ⇒ `sess_open` 直接失败 ——
+    与踩坑 57 同一族，这是第三次踩（`sess_open` 的 cwd、`mx_load` 的路径、`git` 的 argv）。
+  * `make check / build / codegen-audit / tui-selftest / selftest` 全绿；`make tui-demo`
+    的排版与本节引用的快照一致（脚注里的仓库路径与分支本来就随所在 checkout 走，
+    本节快照是在主检出上跑的）—— 换会话不改首屏排版，只多了一条清转录的路径。
+
 ---
 
 ## 7. 已知限制
+
+* **换会话只换「当前会话的」那段屏幕（P39）**：TUI 里 `/new`、`/resume <id>` 会把转录清成
+  「只剩新会话」（`/resume` 还会把恢复出来的历史回放一遍），但**滚动模式（`--no-tui`）不重画**
+  —— 那边的正文是终端自己滚出去的，抹掉等于把用户刚看过的内容删了（要重看就往上翻）。
+  另外回放复用启动时那一份口径（只回放最近 200 条 + 一条「更早的会话记录已省略」提示，
+  注入类消息不回放），所以换会话之后屏幕上的历史与 `--resume` 起一个新进程时**是同一份**。
 
 * **bash 命令没有终端（P38）**：stdin 是 `/dev/null`、子进程自成会话 —— 这是有意的（见踩坑 60），
   代价是需要交互的命令（`git` 要凭据、`vi`、`ssh` 要密码、`apt` 要确认）会**当场失败**而不是
