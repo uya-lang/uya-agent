@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""可编排的假 LLM 网关（P26 验收用，不属于产品）。
+"""可编排的假 LLM 网关（P30 验收用，不属于产品）。
 
-用途：给真终端下的 uya-agent 喂**受控的 SSE**，用来验收 P26 的两件事：
+用途：给真终端下的 uya-agent 喂**受控的 SSE**，用来验收 P30 的两件事：
   1) 单步长流式期间敲 `/status`、`/tasks`、`/help`，浮层必须**当场**出现（不再等 step 边界）；
   2) 回合运行中敲 `/new`：必须立刻出现回执，并且当前回合被中断、随后真的开了新会话。
 
@@ -71,8 +71,8 @@ def handle(conn):
                 return
             conn.sendall(("%x\r\n" % len(payload)).encode() + payload + b"\r\n")
 
-        base = {"id": "chatcmpl-p26", "object": "chat.completion.chunk",
-                "created": 0, "model": "p26-mock"}
+        base = {"id": "chatcmpl-p30", "object": "chat.completion.chunk",
+                "created": 0, "model": "p30-mock"}
         step = 0
         while step < STEPS:
             step += 1

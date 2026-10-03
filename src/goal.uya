@@ -367,3 +367,313 @@ export fn goal_tick(cfg: &const Config) void {
     }
     _ = goal_save(cfg, &g);
 }
+
+// ============================================================
+// /goal：人类命令面（P29，语法与措辞对齐 DSH 的 commands/command-goal）
+// ============================================================
+//
+//   /goal                        看状态；没有 goal 时报用法
+//   /goal <objective>            创建；已有**未完成**的 goal 时拒绝（必须先 edit 或 clear）
+//   /goal edit <objective>       改目标（phase / armed 不动）；complete 的 goal 换新身份
+//   /goal pause | resume         暂停 / 恢复（armed 跟着翻）
+//   /goal clear                  清除（删掉 goal.json）
+//
+// 只有控制词**独占整行**时才不区分大小写，其余任何非空后缀都是字面目标 ——
+// 所以 `/goal pause after verification` 创建的就是那个字面目标，而不是「暂停 + 备注」。
+//
+// 与模型工具的关系：共用同一份 goal.json。工具走 CAS（id + revision 都要对，挡住过期写入），
+// 人类命令直接以「当前」为准 —— 人在回路里不存在读过期值这回事，那份 ref 只是给模型的护栏。
+//
+// clear 是**删文件**：本仓库里「没有 goal.json」与「从未建过目标」本来就是同一个状态
+// （goal_load 返回 false），不留 tombstone；代价是 clear 之后 id 从 1 重新开始。
+
+export const GOAL_USAGE: &const byte =
+    "Usage: /goal [<objective>|clear|edit <objective>|pause|resume]" as &const byte;
+
+// 人类命令的默认轮次上限（与 goal_tool_create 同口径；工具面还能用 max_goal_rounds 覆写）
+const GOAL_CMD_MAX_ROUNDS: i32 = 20;
+
+fn goal_is_space(c: byte) bool {
+    return c == 32 as byte || c == 9 as byte || c == 10 as byte || c == 13 as byte;
+}
+
+// 去掉 [from, n) 的首尾空白，返回绝对下标 [s_out, e_out)（全空白时两者相等）
+fn goal_trim(p: &const byte, from: usize, n: usize, s_out: &usize, e_out: &usize) void {
+    var s: usize = from;
+    while s < n && goal_is_space(p[s]) {
+        s = s + 1;
+    }
+    var e: usize = n;
+    while e > s && goal_is_space(p[e - 1]) {
+        e = e - 1;
+    }
+    s_out[0] = s;
+    e_out[0] = e;
+}
+
+// 整段 [s, e) 是否就是这个控制词（大小写不敏感）。
+// 长度从字面量自己量（bufx_cstr_len）—— 手写长度写大了会读进相邻常量，见 README 踩坑 3。
+fn goal_word_eq(p: &const byte, s: usize, e: usize, lit: &const byte) bool {
+    const ln: usize = bufx_cstr_len(lit);
+    if e - s != ln {
+        return false;
+    }
+    var i: usize = 0;
+    while i < ln {
+        if byte_lower(p[s + i]) != byte_lower(lit[i]) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn goal_phase_is(g: &const Goal, lit: &const byte) bool {
+    const ln: usize = bufx_cstr_len(lit);
+    return g.phase.len == ln && bufx_eq_cstr(g.phase.ptr as &const byte, ln, lit);
+}
+
+// `/goal edit <objective>`：前缀是 "edit" 且**紧跟空白**（大小写不敏感），
+// 命中就把替换目标的 [rs, re)（已去空白）交出去
+fn goal_edit_span(p: &const byte, s: usize, e: usize, rs: &usize, re: &usize) bool {
+    if e < s + 5 {                       // "edit" + 至少一个空白字符
+        return false;
+    }
+    if !goal_word_eq(p, s, s + 4, "edit" as &const byte) {
+        return false;
+    }
+    if !goal_is_space(p[s + 4]) {
+        return false;
+    }
+    goal_trim(p, s + 4, e, rs, re);
+    return true;
+}
+
+// 用 p[s, e) 替换 dst 的内容（buf_append_span 是**追加**语义，所以先 reset）
+fn goal_set_span(dst: &Buf, p: &const byte, s: usize, e: usize) void {
+    buf_reset(dst);
+    if e > s {
+        _ = buf_append_span(dst, p, s, e - s);
+    }
+}
+
+// clear：删掉 goal.json（失败只有一种可能：文件系统不给删）
+export fn goal_clear(cfg: &const Config) bool {
+    var p: Buf = buf_new(1200);
+    defer { buf_free(&p); }
+    if !goal_path(cfg, &p) {
+        return false;
+    }
+    if !buf_append_byte(&p, 0) {         // 系统调用前必须补 NUL，见 README 踩坑 2
+        return false;
+    }
+    _ = sys_unlink(&p.ptr[0] as *const byte) catch {
+        return false;
+    };
+    return true;
+}
+
+// 人类看的正文（与工具面的 goal_render 分开：这里是 DSH 同款的键值对排版）
+fn goal_render_user(g: &const Goal, out: &Buf) void {
+    _ = buf_append_cstr(out, "Status: ");
+    _ = buf_append(out, g.phase.ptr, g.phase.len);
+    if goal_phase_is(g, "blocked" as &const byte) && g.blocker.len > 0 {
+        _ = buf_append_cstr(out, "\nBlocker: ");
+        _ = buf_append(out, g.blocker.ptr, g.blocker.len);
+    }
+    _ = buf_append_cstr(out, "\nObjective: ");
+    _ = buf_append(out, g.objective.ptr, g.objective.len);
+    _ = buf_append_cstr(out, "\nRounds: ");
+    _ = buf_append_u64(out, g.round as u64);
+    _ = buf_append_cstr(out, "/");
+    _ = buf_append_u64(out, g.max_rounds as u64);
+    _ = buf_append_cstr(out, "\nActivation: ");
+    if g.armed {
+        _ = buf_append_cstr(out, "armed");
+    } else {
+        _ = buf_append_cstr(out, "disarmed");
+    }
+    _ = buf_append_cstr(out, "\n\nCommands: ");
+    if goal_phase_is(g, "active" as &const byte) {
+        if g.armed {
+            _ = buf_append_cstr(out, "/goal edit <objective>, /goal pause, /goal clear");
+        } else {
+            _ = buf_append_cstr(out, "/goal edit <objective>, /goal resume, /goal clear");
+        }
+    } else if goal_phase_is(g, "complete" as &const byte) {
+        _ = buf_append_cstr(out, "/goal <objective>, /goal clear");
+    } else {                             // paused / blocked
+        _ = buf_append_cstr(out, "/goal edit <objective>, /goal resume, /goal clear");
+    }
+    _ = buf_append_byte(out, 10);
+}
+
+fn goal_cmd_need_objective(out: &Buf) i32 {
+    _ = buf_append_cstr(out, "Goal editing requires a replacement objective.\n");
+    _ = buf_append_cstr(out, GOAL_USAGE);
+    _ = buf_append_byte(out, 10);
+    return 1;
+}
+
+fn goal_cmd_missing(out: &Buf, verb: &const byte) i32 {
+    _ = buf_append_cstr(out, "No goal is currently set; /goal ");
+    _ = buf_append_cstr(out, verb);
+    _ = buf_append_cstr(out, " requires one.\n");
+    _ = buf_append_cstr(out, GOAL_USAGE);
+    _ = buf_append_byte(out, 10);
+    return 1;
+}
+
+// 裸 /goal：有目标报状态，没有就报用法（两者都是成功 —— 看状态本身不会失败）
+fn goal_cmd_show(cfg: &const Config, out: &Buf) i32 {
+    var g: Goal = goal_empty();
+    defer { goal_free(&g); }
+    if !goal_load(cfg, &g) {
+        _ = buf_append_cstr(out, "No goal is currently set.\n");
+        _ = buf_append_cstr(out, GOAL_USAGE);
+        _ = buf_append_byte(out, 10);
+        return 0;
+    }
+    _ = buf_append_cstr(out, "Goal\n");
+    goal_render_user(&g, out);
+    return 0;
+}
+
+// 创建：已有**未完成**的 goal 时拒绝（DSH 同一条规则：必须先 edit 或 clear）。
+// 已完成的 goal 让位 —— 新的目标换新身份（id +1，revision 回到 1）。
+fn goal_cmd_create(cfg: &const Config, p: &const byte, s: usize, e: usize, out: &Buf) i32 {
+    var cur: Goal = goal_empty();
+    defer { goal_free(&cur); }
+    var id: i32 = 1;
+    if goal_load(cfg, &cur) {
+        if !goal_phase_is(&cur, "complete" as &const byte) {
+            _ = buf_append_cstr(out, "A goal is already ");
+            _ = buf_append(out, cur.phase.ptr, cur.phase.len);
+            _ = buf_append_cstr(out,
+                ". Use /goal edit <objective> to change it or /goal clear before replacing it.\n");
+            return 1;
+        }
+        id = cur.id + 1;
+    }
+    var g: Goal = goal_empty();
+    defer { goal_free(&g); }
+    g.active_state = true;
+    g.id = id;
+    g.revision = 1;
+    g.phase = buf_new(16);
+    _ = buf_append_cstr(&g.phase, "active");
+    g.objective = buf_new(e - s + 8);
+    _ = goal_set_span(&g.objective, p, s, e);
+    g.round = 0;
+    g.max_rounds = GOAL_CMD_MAX_ROUNDS;
+    g.blocker = buf_empty();
+    g.armed = true;
+    if !goal_save(cfg, &g) {
+        _ = buf_append_cstr(out, "Error: cannot persist the goal\n");
+        return 1;
+    }
+    _ = buf_append_cstr(out, "Goal created\n");
+    goal_render_user(&g, out);
+    return 0;
+}
+
+// 改目标：phase / armed / round 都不动，只换 objective 并 +1 revision
+fn goal_cmd_edit(cfg: &const Config, p: &const byte, s: usize, e: usize, out: &Buf) i32 {
+    var g: Goal = goal_empty();
+    defer { goal_free(&g); }
+    if !goal_load(cfg, &g) {
+        return goal_cmd_missing(out, "edit" as &const byte);
+    }
+    if goal_phase_is(&g, "complete" as &const byte) {
+        return goal_cmd_create(cfg, p, s, e, out);   // 已完成：edit 就是换一个新目标
+    }
+    goal_set_span(&g.objective, p, s, e);
+    g.revision = g.revision + 1;
+    if !goal_save(cfg, &g) {
+        _ = buf_append_cstr(out, "Error: cannot persist the goal\n");
+        return 1;
+    }
+    _ = buf_append_cstr(out, "Goal updated\n");
+    goal_render_user(&g, out);
+    return 0;
+}
+
+// pause / resume：phase 与 armed 一起翻（armed=false 才是「不会自动续跑」的那个开关）
+fn goal_cmd_switch(cfg: &const Config, out: &Buf, armed: bool, verb: &const byte,
+        phase: &const byte, title: &const byte) i32 {
+    var g: Goal = goal_empty();
+    defer { goal_free(&g); }
+    if !goal_load(cfg, &g) {
+        return goal_cmd_missing(out, verb);
+    }
+    goal_set_lit(&g.phase, phase, bufx_cstr_len(phase));
+    g.armed = armed;
+    g.revision = g.revision + 1;
+    if !goal_save(cfg, &g) {
+        _ = buf_append_cstr(out, "Error: cannot persist the goal\n");
+        return 1;
+    }
+    _ = buf_append_cstr(out, title);
+    _ = buf_append_byte(out, 10);
+    goal_render_user(&g, out);
+    return 0;
+}
+
+// clear：没有目标时也算成功（幂等），只是回一句「没得清」
+fn goal_cmd_clear(cfg: &const Config, out: &Buf) i32 {
+    var g: Goal = goal_empty();
+    defer { goal_free(&g); }
+    if !goal_load(cfg, &g) {
+        _ = buf_append_cstr(out, "No goal to clear.\n");
+        return 0;
+    }
+    if !goal_clear(cfg) {
+        _ = buf_append_cstr(out, "Error: cannot remove the goal file\n");
+        return 1;
+    }
+    _ = buf_append_cstr(out, "Goal cleared.\n");
+    return 0;
+}
+
+// 执行一条人类 /goal 命令。line 是**整行**（含命令名，如 "/goal edit 把测试跑绿"）。
+// out 会被重置：返回 0 = 成功，1 = 用法或状态错误 —— 两种情况都把可直接展示的正文写进 out，
+// 调用方不需要自己拼字符串（滚动模式打出来，TUI 塞进浮层）。
+export fn goal_cmd_run(cfg: &const Config, line: &const Buf, out: &Buf) i32 {
+    buf_reset(out);
+    const p: &const byte = line.ptr as &const byte;
+    const n: usize = line.len;
+    if n < 5 {                           // 调用方只会把 "/goal…" 送进来，防一手
+        _ = buf_append_cstr(out, GOAL_USAGE);
+        _ = buf_append_byte(out, 10);
+        return 1;
+    }
+    var s: usize = 0;
+    var e: usize = 0;
+    goal_trim(p, 5, n, &s, &e);          // 跳过 "/goal" 这 5 个字节
+    if e == s {                          // 裸 /goal = 看状态
+        return goal_cmd_show(cfg, out);
+    }
+    if goal_word_eq(p, s, e, "clear" as &const byte) {
+        return goal_cmd_clear(cfg, out);
+    }
+    if goal_word_eq(p, s, e, "pause" as &const byte) {
+        return goal_cmd_switch(cfg, out, false, "pause" as &const byte,
+            "paused" as &const byte, "Goal paused" as &const byte);
+    }
+    if goal_word_eq(p, s, e, "resume" as &const byte) {
+        return goal_cmd_switch(cfg, out, true, "resume" as &const byte,
+            "active" as &const byte, "Goal resumed" as &const byte);
+    }
+    if goal_word_eq(p, s, e, "edit" as &const byte) {
+        return goal_cmd_need_objective(out);   // 只有 "edit"、没有替换内容
+    }
+    var rs: usize = 0;
+    var re: usize = 0;
+    if goal_edit_span(p, s, e, &rs, &re) {
+        if re == rs {
+            return goal_cmd_need_objective(out);
+        }
+        return goal_cmd_edit(cfg, p, rs, re, out);
+    }
+    return goal_cmd_create(cfg, p, s, e, out);
+}

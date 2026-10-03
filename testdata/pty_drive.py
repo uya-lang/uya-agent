@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""PTY 驱动（P26 验收用，不属于产品）：把真终端下的 uya-agent 跑起来，按脚本敲键并回读屏幕。
+"""PTY 驱动（P30 验收用，不属于产品）：把真终端下的 uya-agent 跑起来，按脚本敲键并回读屏幕。
 
 用法：
     python3 testdata/pty_drive.py --port PORT --workspace DIR -- [--steps N] [--gap-ms N] 场景名
 
-场景（P26 的现场）：
+场景（P30 的现场）：
     status-single-step   单步长流式运行中敲 /status，打印「浮层出现」与「回合是否已结束」
     new-mid-turn         运行中敲 /new，打印回执与是否中断了当前回合
     interrupt-then-task  esc 中断一个回合，再跑一个任务（验证中断标志没有粘住）
@@ -122,7 +122,7 @@ def spawn(port, workspace, extra):
     env.pop("DEEPSEEK_API_KEY", None)
     env.pop("OPENAI_API_KEY", None)
     argv = [BIN, "--no-dsh-config", "--base-url", "http://127.0.0.1:%d/v1" % port,
-            "--api=chat", "--model", "p26-mock", "--workspace", workspace,
+            "--api=chat", "--model", "p30-mock", "--workspace", workspace,
             "--agent-home", os.path.join(workspace, ".home"), "--tls-verify=none"] + extra
     pid, fd = pty.fork()
     if pid == 0:
@@ -182,9 +182,9 @@ def check(cond, msg, failures):
 
 
 def suite():
-    """P26 的三条验收（退出码非 0 = 有断言没过）。"""
+    """P30 的三条验收（退出码非 0 = 有断言没过）。"""
     failures = []
-    base = os.path.join("build", "p26_suite")
+    base = os.path.join("build", "p30_suite")
     v1 = run_scenario(0, base + "_status", "status-single-step")
     check(v1.get("overlay_seen"), "/status 浮层没出现", failures)
     lat = v1.get("overlay_latency_ms")
@@ -198,11 +198,11 @@ def suite():
           failures)
     print(json.dumps({"status": v1, "new": v2, "interrupt": v3}, ensure_ascii=False, indent=2))
     if failures:
-        print("P26 FAIL:")
+        print("P30 FAIL:")
         for f in failures:
             print("  - " + f)
         return 1
-    print("P26 PASS（overlay %s ms · 回合未结束 · /new 回执+中断 · esc 之后仍能跑）"
+    print("P30 PASS（overlay %s ms · 回合未结束 · /new 回执+中断 · esc 之后仍能跑）"
           % v1.get("overlay_latency_ms"))
     return 0
 
