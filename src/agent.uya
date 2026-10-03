@@ -635,10 +635,13 @@ const HIST_TRUNC_TAIL: usize = 16384;
 const HIST_TRUNC_MARK: &const byte = "\n\n[... message truncated to fit history storage ...]\n\n";
 
 // text = content 正文；extra 的含义由 role 决定（tool_calls 数组原文 / tool_call_id）。
+// kind 只对 ROLE_TOOL 有意义：产它的工具种类（CMP_KIND_BASH / CMP_KIND_TOOL），
+// 构请求时据此选剪枝规则 —— 历史本身不动，剪枝仍然只发生在构请求这一层。
 // assistant 展开成「assistant + N 条 tool」消息对，这是 OpenAI 严格协议的要求，
 // 也是 DSH 的做法（DSH 会把 assistant 消息连同 tool_calls 原样回灌）。
 struct Msg {
     role: u8,
+    kind: u8,
     text: &byte,
     text_len: usize,
     extra: &byte,
@@ -656,7 +659,7 @@ struct History {
 }
 
 fn msg_zero() Msg {
-    return Msg{ role: 0, text: null, text_len: 0, extra: null, extra_len: 0 };
+    return Msg{ role: 0, kind: CMP_KIND_TOOL, text: null, text_len: 0, extra: null, extra_len: 0 };
 }
 
 fn hist_init() History {
@@ -786,6 +789,15 @@ fn hist_fit_text(text: &const byte, n: usize, out: &Buf) bool {
 // 默认不限条数：只有真 OOM（realloc/malloc 失败）才返回 false。调用方必须保证
 // 「assistant(tool_calls) 与它的 tool 结果」不会因此变成半截（见 agent_finish_step 的回滚）。
 fn hist_push_msg(h: &History, role: u8, text: &const byte, text_len: usize, extra: &const byte, extra_len: usize) bool {
+    return hist_push_msg_kind(h, role, CMP_KIND_TOOL, text, text_len, extra, extra_len);
+}
+
+// 工具结果入史：带上产它的工具种类（构请求时选剪枝规则用）
+fn hist_push_tool_kind(h: &History, kind: u8, text: &const byte, text_len: usize, extra: &const byte, extra_len: usize) bool {
+    return hist_push_msg_kind(h, ROLE_TOOL, kind, text, text_len, extra, extra_len);
+}
+
+fn hist_push_msg_kind(h: &History, role: u8, kind: u8, text: &const byte, text_len: usize, extra: &const byte, extra_len: usize) bool {
     // extra 不做裁剪：它是 tool_calls 数组原文 / tool_call_id，截断后就是非法 JSON
     // （比「失败 + 回滚」更糟），所以这里仍然按上限拒绝。
     if extra_len > MSG_CONTENT_MAX {
@@ -822,6 +834,7 @@ fn hist_push_msg(h: &History, role: u8, text: &const byte, text_len: usize, extr
     }
     const slot: &Msg = msg_at_mut(h, idx);
     slot.role = role;
+    slot.kind = kind;
     slot.text = t;
     slot.text_len = n;
     slot.extra = e;
@@ -997,6 +1010,8 @@ var g_sess: SessionLog = SessionLog{
 var g_home: Buf = Buf{ ptr: null, len: 0, cap: 0 };
 var g_turn: i32 = 0;
 var g_tools_scratch: Buf = Buf{ ptr: null, len: 0, cap: 0 };
+// 压力估算的剪枝 scratch：只在 agent_ctx_est 里用（步边界），与 g_tools_scratch 不混用
+var g_ctx_scratch: Buf = Buf{ ptr: null, len: 0, cap: 0 };
 var g_jobs: JobTable = JobTable{ items: [], next_id: 1 };
 // P9：最近一次请求的 prompt_tokens（压力口径）与压缩开关
 var g_last_prompt_tokens: i64 = 0;
@@ -1485,7 +1500,14 @@ fn agent_ctx_est(cfg: &const Config, h: &const History, sys_t: &i64, tools_t: &i
     var i: usize = 1;   // h[0] 是系统提示词，已经算进 sys
     while i < h.len {
         const m: &const Msg = msg_at(h, i);
-        msg_bytes = msg_bytes + ((m.text_len + m.extra_len) as i64);
+        // P27：工具结果按**构请求后**的字节算 —— 请求里带的是剪枝过的文本，
+        // 估算必须同口径，否则投影压力偏高、压缩会提前触发（一次前缀重写是全价）。
+        if m.role == ROLE_TOOL {
+            msg_bytes = msg_bytes + (cmp_request_bytes(m.text as &const byte, m.text_len, m.kind, &g_ctx_scratch) as i64);
+        } else {
+            msg_bytes = msg_bytes + (m.text_len as i64);
+        }
+        msg_bytes = msg_bytes + (m.extra_len as i64);
         i = i + 1;
     }
     sys_t[0] = sys_bytes / 4;
@@ -1665,6 +1687,7 @@ fn agent_hist_from_log(cfg: &const Config, h: &History, path: &const Buf, out_ne
             var cid: Buf = buf_new(128);
             defer { buf_free(&cid); }
             if sess_json_str(view, "callId", &cid) && sess_json_str(view, "content", &text) {
+                // 会话日志不带工具名，回放出来的结果一律按通用规则剪（同 dshsess.uya 的说明）
                 if hist_push_msg(h, ROLE_TOOL, text.ptr as &const byte, text.len, cid.ptr as &const byte, cid.len) {
                     added = added + 1;
                 }
@@ -2348,7 +2371,7 @@ fn build_chat_request(cfg: &const Config, h: &const History, out: &Buf) bool {
             // P9：工具结果过大时在**构请求**这一层剪掉中段（历史保持不变，天然幂等）
             var pruned: Buf = buf_empty();
             defer { buf_free(&pruned); }
-            if msg_at(h, i).role == ROLE_TOOL && cmp_maybe_prune(m_txt as &const byte, m_txt_len, &pruned) {
+            if msg_at(h, i).role == ROLE_TOOL && cmp_maybe_prune_kind(m_txt as &const byte, m_txt_len, msg_at(h, i).kind, &pruned) {
                 jw_str(&w, pruned.ptr, pruned.len);
             } else {
                 jw_str(&w, m_txt, m_txt_len);
@@ -2637,7 +2660,7 @@ fn build_responses_request(cfg: &const Config, h: &const History, out: &Buf) boo
             // P9：与 chat 路径同一条剪枝规则（构请求这一层剪，历史不变）
             var pruned: Buf = buf_empty();
             defer { buf_free(&pruned); }
-            if m_txt_len > 0 && cmp_maybe_prune(m_txt as &const byte, m_txt_len, &pruned) {
+            if m_txt_len > 0 && cmp_maybe_prune_kind(m_txt as &const byte, m_txt_len, msg_at(h, i).kind, &pruned) {
                 jw_str(&w, pruned.ptr, pruned.len);
             } else if m_txt_len > 0 {
                 jw_str(&w, m_txt, m_txt_len);
@@ -3285,13 +3308,18 @@ fn agent_finish_step(cfg: &const Config, arena: &Arena, h: &History, step: i32, 
                 // 空结果在线上必须是 "(no output)"（对齐 DSH）
                 _ = buf_append_cstr(&res, "(no output)");
             }
+            // 结果来自哪个工具，决定构请求时用哪条剪枝规则（P27：bash 走行式剪枝）
+            var rkind: u8 = CMP_KIND_TOOL;
+            if sv_eq_cstr(&o.calls[ci].name, "bash") {
+                rkind = CMP_KIND_BASH;
+            }
             // 每条结果都必须进历史：assistant(tool_calls) 与它的 tool 结果是一个原子组，
             // 半截的话请求会被端点以 "insufficient tool messages following tool_calls" 拒掉，
             // 而且这条坏历史会一直留在会话里（/continue 永远 400）。
             //
             // 本组起点 = h.len - ci - 1（ci 条结果已在本组里；丢老消息只是让两边同比下移）。
             // 它是 hist_drop_oldest_below 的上界：受保护区域之内一条都不许丢。
-            var pushed_t: bool = hist_push_msg(h, ROLE_TOOL, res.ptr as &const byte, res.len, o.calls[ci].id.ptr as &const byte, o.calls[ci].id.len);
+            var pushed_t: bool = hist_push_tool_kind(h, rkind, res.ptr as &const byte, res.len, o.calls[ci].id.ptr as &const byte, o.calls[ci].id.len);
             while !pushed_t {
                 var floor: usize = 1;
                 if h.len > ci + 1 {
@@ -3301,7 +3329,7 @@ fn agent_finish_step(cfg: &const Config, arena: &Arena, h: &History, step: i32, 
                     break;
                 }
                 out_err("[history] dropped oldest message to stay within limits\n");
-                pushed_t = hist_push_msg(h, ROLE_TOOL, res.ptr as &const byte, res.len, o.calls[ci].id.ptr as &const byte, o.calls[ci].id.len);
+                pushed_t = hist_push_tool_kind(h, rkind, res.ptr as &const byte, res.len, o.calls[ci].id.ptr as &const byte, o.calls[ci].id.len);
             }
             buf_free(&res);
             if !pushed_t {
@@ -4087,7 +4115,7 @@ fn agent_maybe_compact(cfg: &const Config, h: &History, step: i32, force: bool) 
     var i: usize = 0;
     while i < h.len {
         const m: &const Msg = msg_at(h, i);
-        _ = hist_push_msg(&tmp, m.role, m.text as &const byte, m.text_len, m.extra as &const byte, m.extra_len);
+        _ = hist_push_msg_kind(&tmp, m.role, m.kind, m.text as &const byte, m.text_len, m.extra as &const byte, m.extra_len);
         i = i + 1;
     }
     var prompt: Buf = buf_new(8192);
@@ -4209,7 +4237,7 @@ fn hist_insert_at(h: &History, idx: usize, role: u8, text: &const byte, text_len
         i = prev;
     }
     const slot: &Msg = msg_at_mut(h, idx);
-    slot[0] = Msg{ role: role, text: null, text_len: 0, extra: null, extra_len: 0 };
+    slot[0] = Msg{ role: role, kind: CMP_KIND_TOOL, text: null, text_len: 0, extra: null, extra_len: 0 };
     if text_len > 0 {
         slot.text = hist_dup(text, text_len);
         if (slot.text as usize) == 0 {
