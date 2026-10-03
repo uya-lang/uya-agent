@@ -16,14 +16,29 @@
 //     约 300%）。显示时钳在 0…999。
 //   * 只在 TUI 活跃时采样（由 tui_tick 这个统一心跳驱动），1 秒一次；第一次采样
 //     只建立基线（不产生数字）。`/proc` 读不到 → 返回不可用，界面直接省略该字段。
+//
+// P24：同一次走查里顺带累加**内存**（`内存 312M`）：
+//   * 范围与 CPU 完全一致（comm 相同的那批进程）；取 `/proc/<pid>/smaps_rollup` 的
+//     `Pss:`（比例分摊 —— 子代理是 fork 出来的，PSS 不会把父子共享的页算两遍，RSS 会）。
+//   * 口径**整批统一**：一旦认准 PSS 就不再改；内核没有 `smaps_rollup`（< 4.14）时
+//     整批退回 `/proc/<pid>/status` 的 `VmRSS:`，不会 PSS/RSS 混着加。
+//   * 节奏 5 秒一次，比 CPU 慢一档：算 PSS 要遍历页表，3GB 进程实测 ~60ms/次，
+//     1 秒一次会把心跳（也就是界面）拖住；uya-agent 这类几十 MB 的进程 ~1ms。
 
 use libc.syscall;
 use libc.unistd;
 
 const PROCX_HZ: i64 = 100;            // USER_HZ（见文件头）
 export const PROCX_SAMPLE_MS: u64 = 1000;
+export const PROCX_MEM_SAMPLE_MS: u64 = 5000;   // 内存比 CPU 慢一档（见文件头）
 const PROCX_MAX_PROCS: i32 = 4096;    // 防御上限（正常机器几百个）
 const PROCX_STAT_MAX: usize = 2048;   // /proc/<pid>/stat 一行的上限
+const PROCX_MEM_MAX: usize = 4096;    // smaps_rollup / status 前几 KB 就够（要的行都在头部）
+
+// 内存口径：0 = 还没探明（先试 PSS），1 = PSS（smaps_rollup），2 = VmRSS（status）
+const PROCX_MEM_NONE: i32 = 0;
+const PROCX_MEM_PSS: i32 = 1;
+const PROCX_MEM_RSS: i32 = 2;
 
 var g_px_comm: Buf = Buf{ ptr: null, len: 0, cap: 0 };
 var g_px_have_comm: bool = false;
@@ -34,6 +49,10 @@ var g_px_pct: i32 = -1;
 var g_px_count: i32 = 0;
 var g_px_span_ms: i64 = 0;
 var g_px_failed: bool = false;
+var g_px_mem_kb: i64 = -1;
+var g_px_mem_kind: i32 = PROCX_MEM_NONE;
+var g_px_prev_mem_ms: u64 = 0;
+var g_px_have_mem_prev: bool = false;
 
 // 自测用：清零状态（不影响 comm 缓存）
 export fn procx_reset() void {
@@ -44,10 +63,35 @@ export fn procx_reset() void {
     g_px_count = 0;
     g_px_span_ms = 0;
     g_px_failed = false;
+    g_px_mem_kb = -1;
+    g_px_mem_kind = PROCX_MEM_NONE;
+    g_px_prev_mem_ms = 0;
+    g_px_have_mem_prev = false;
 }
 
 export fn procx_cpu_pct() i32 {
     return g_px_pct;
+}
+
+// 内存合计（kB）；-1 = 不可用（还没采到 / 读不到 /proc）
+export fn procx_mem_kb() i64 {
+    return g_px_mem_kb;
+}
+
+// 0 = 还没探明，1 = PSS 合计，2 = VmRSS 合计
+export fn procx_mem_kind() i32 {
+    return g_px_mem_kind;
+}
+
+// 口径名字（/status 里写明是哪种合计）
+export fn procx_mem_kind_name() &const byte {
+    if g_px_mem_kind == PROCX_MEM_PSS {
+        return "PSS" as &const byte;
+    }
+    if g_px_mem_kind == PROCX_MEM_RSS {
+        return "RSS" as &const byte;
+    }
+    return "" as &const byte;
 }
 
 export fn procx_proc_count() i32 {
@@ -174,6 +218,72 @@ export fn procx_pct_of(dticks: i64, dms: i64) i32 {
     return p as i32;
 }
 
+// 在 /proc/<pid>/smaps_rollup（`Pss:  1234 kB`）或 /proc/<pid>/status（`VmRSS:\t1234 kB`）
+// 的文本里取一个 `<label> <数字>` 行的数字（kB）。返回 false = 没有这一行 / 形状不对
+// （此时 out_kb = 0）。只认**行首**匹配，所以 `Pss_Dirty:` 不会被当成 `Pss:`。
+export fn procx_find_kb(text: &[byte], label: &const byte, out_kb: &i64) bool {
+    out_kb[0] = 0;
+    const ln: usize = bufx_cstr_len(label);
+    if ln == 0 || ln > text.len {
+        return false;
+    }
+    var i: usize = 0;
+    while i + ln <= text.len {
+        const line_start: bool = i == 0 || text.ptr[i - 1] == 10 as byte;
+        if line_start && bufx_mem_eq(&text.ptr[i] as &const byte, label, ln) {
+            var j: usize = i + ln;
+            // 标签后面是空格/制表符（status 用 \t，smaps_rollup 用若干空格）
+            while j < text.len && (text.ptr[j] == 32 as byte || text.ptr[j] == 9 as byte) {
+                j = j + 1;
+            }
+            var v: i64 = 0;
+            var digits: i32 = 0;
+            while j < text.len && is_digit(text.ptr[j]) {
+                v = (v * 10) + ((text.ptr[j] as i64) - 48);
+                digits = digits + 1;
+                j = j + 1;
+            }
+            if digits == 0 {
+                return false;   // 标签对上了但后面不是数字：不猜
+            }
+            out_kb[0] = v;
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn procx_round_div(v: i64, d: i64) i64 {
+    if d <= 0 {
+        return 0;
+    }
+    return (v + (d / 2)) / d;
+}
+
+// 内存显示（二进制单位）：`512K` / `312M` / `1.2G`。kb < 0（不可用）→ 返回 false，不写字节。
+export fn procx_fmt_mem_kb(out: &Buf, kb: i64) bool {
+    if kb < 0 {
+        return false;
+    }
+    if kb < 1024 {
+        _ = buf_append_i64(out, kb);
+        _ = buf_append_byte(out, 75);                       // 'K'
+        return true;
+    }
+    if kb < 1024 * 1024 {
+        _ = buf_append_i64(out, procx_round_div(kb, 1024));
+        _ = buf_append_byte(out, 77);                       // 'M'
+        return true;
+    }
+    const t10: i64 = procx_round_div(kb, 1024 * 1024 / 10);   // 十分之一 G（四舍五入）
+    _ = buf_append_i64(out, t10 / 10);
+    _ = buf_append_byte(out, 46);                           // '.'
+    _ = buf_append_byte(out, (48 + (t10 % 10)) as byte);
+    _ = buf_append_byte(out, 71);                           // 'G'
+    return true;
+}
+
 // ============================================================
 // 采样
 // ============================================================
@@ -204,10 +314,52 @@ fn procx_self_comm() bool {
     return true;
 }
 
-// 扫一遍 /proc，累加 comm 匹配的进程的 utime+stime。返回 false = 枚举失败。
-fn procx_scan(ticks: &i64, count: &i32) bool {
+// 把 base（`/proc/<pid>`，长度 base_len）拼上 `/<suffix>` 读进来，再按 label 取数
+fn procx_read_label(path: &Buf, base_len: usize, suffix: &const byte, label: &const byte, text: &Buf, kb: &i64) bool {
+    path.len = base_len;
+    if !buf_append_byte(path, 47) {                         // '/'
+        return false;
+    }
+    if !buf_append_cstr(path, suffix) {
+        return false;
+    }
+    if !buf_append_byte(path, 0) {
+        return false;
+    }
+    if !fs_read_file_all(path.ptr as &const byte, text, PROCX_MEM_MAX) {
+        return false;
+    }
+    return procx_find_kb(text.ptr[0: text.len], label, kb);
+}
+
+// 读一个已匹配进程的内存（kB）。kind[0]：0 = 还没探明（先试 PSS），1 = PSS，2 = VmRSS。
+// 口径一旦定下就不再改：认准 PSS 之后某个进程的 smaps_rollup 读不到就跳过它，
+// 不会偷偷换回 RSS 把两种口径混着加。
+fn procx_read_mem(path: &Buf, base_len: usize, kind: &i32, kb: &i64) bool {
+    var text: Buf = buf_new(PROCX_MEM_MAX);
+    defer { buf_free(&text); }
+    if kind[0] != PROCX_MEM_RSS {
+        if procx_read_label(path, base_len, "smaps_rollup" as &const byte, "Pss:" as &const byte, &text, kb) {
+            kind[0] = PROCX_MEM_PSS;
+            return true;
+        }
+        if kind[0] == PROCX_MEM_PSS {
+            return false;
+        }
+    }
+    if procx_read_label(path, base_len, "status" as &const byte, "VmRSS:" as &const byte, &text, kb) {
+        kind[0] = PROCX_MEM_RSS;
+        return true;
+    }
+    return false;
+}
+
+// 扫一遍 /proc，累加 comm 匹配的进程的 utime+stime（with_mem 时顺带累加内存）。
+// 返回 false = 枚举失败。
+fn procx_scan(ticks: &i64, count: &i32, with_mem: bool, mem_kb: &i64, mem_kind: &i32) bool {
     ticks[0] = 0;
     count[0] = 0;
+    mem_kb[0] = -1;
     if !procx_self_comm() {
         return false;
     }
@@ -222,6 +374,8 @@ fn procx_scan(ticks: &i64, count: &i32) bool {
     defer { buf_free(&line); }
     var comm: Buf = buf_new(64);
     defer { buf_free(&comm); }
+    var mem_sum: i64 = 0;
+    var mem_n: i32 = 0;
     while count[0] < PROCX_MAX_PROCS {
         const de: &Dirent = readdir(dp);
         if de == null {
@@ -239,6 +393,7 @@ fn procx_scan(ticks: &i64, count: &i32) bool {
         if !buf_append(&path, nm, ln) {
             break;
         }
+        const base_len: usize = path.len;                   // `/proc/<pid>`（后面拼后缀用）
         if !buf_append_cstr(&path, "/stat") {
             break;
         }
@@ -260,25 +415,48 @@ fn procx_scan(ticks: &i64, count: &i32) bool {
         }
         ticks[0] = ticks[0] + t;
         count[0] = count[0] + 1;
+        if with_mem {
+            var kb: i64 = 0;
+            if procx_read_mem(&path, base_len, mem_kind, &kb) {
+                mem_sum = mem_sum + kb;
+                mem_n = mem_n + 1;
+            }
+        }
+    }
+    if with_mem && mem_n > 0 {
+        mem_kb[0] = mem_sum;
     }
     return true;
 }
 
-// 立刻采一次（自测/诊断入口）。返回值 = 这次扫描是否成功。
-export fn procx_sample_once(now_ms: u64) bool {
+// 立刻采一次（自测/诊断入口）。with_mem = 顺带采内存（慢一档，见文件头）。
+// 返回值 = 这次扫描是否成功。
+export fn procx_sample_once(now_ms: u64, with_mem: bool) bool {
     var ticks: i64 = 0;
     var count: i32 = 0;
-    const ok: bool = procx_scan(&ticks, &count);
+    var mem_kb: i64 = -1;
+    var mem_kind: i32 = g_px_mem_kind;
+    const ok: bool = procx_scan(&ticks, &count, with_mem, &mem_kb, &mem_kind);
     if !ok {
         g_px_failed = true;
         g_px_pct = -1;
         g_px_count = 0;
         g_px_span_ms = 0;
         g_px_have_prev = false;
+        g_px_mem_kb = -1;
+        g_px_have_mem_prev = false;
         return false;
     }
     g_px_failed = false;
     g_px_count = count;
+    if with_mem {
+        g_px_mem_kb = mem_kb;
+        if mem_kind != g_px_mem_kind {
+            g_px_mem_kind = mem_kind;
+        }
+        g_px_prev_mem_ms = now_ms;
+        g_px_have_mem_prev = true;
+    }
     if g_px_have_prev && now_ms > g_px_prev_ms {
         const span: i64 = (now_ms - g_px_prev_ms) as i64;
         g_px_pct = procx_pct_of(ticks - g_px_prev_ticks, span);
@@ -293,16 +471,18 @@ export fn procx_sample_once(now_ms: u64) bool {
     return true;
 }
 
-// 心跳（由 tui_tick 调）：到点才真扫。
+// 心跳（由 tui_tick 调）：CPU 到点（1s）或内存到点（5s）才真扫。
 // now_ms == 0 = 无时钟的画布模式（自测的 headless 帧）→ 不碰 /proc。
 export fn procx_tick(now_ms: u64) void {
     if now_ms == 0 {
         return;
     }
-    if g_px_have_prev && (now_ms - g_px_prev_ms) < PROCX_SAMPLE_MS {
+    const cpu_due: bool = !g_px_have_prev || (now_ms - g_px_prev_ms) >= PROCX_SAMPLE_MS;
+    const mem_due: bool = !g_px_have_mem_prev || (now_ms - g_px_prev_mem_ms) >= PROCX_MEM_SAMPLE_MS;
+    if !cpu_due && !mem_due {
         return;
     }
-    _ = procx_sample_once(now_ms);
+    _ = procx_sample_once(now_ms, mem_due);
 }
 
 export fn procx_hz() i64 {
