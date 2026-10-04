@@ -1,0 +1,799 @@
+// src/imgx.uya — 图片附件（P51）：魔数嗅探 / 尺寸解析 / 预算判定 / 附件存储 / base64
+//
+// 为什么需要这一层：多模态模型要的是**内联 base64**（completions 的 image_url /
+// responses 的 input_image），而我们拿到的是一坨字节 —— 中间要有人回答四个问题：
+//   1) 这是不是图片、是哪种（决定 MIME，也决定要不要拒绝）；
+//   2) 它多大（宽高从**文件头**读，不解码像素）；
+//   3) 装得下吗（字节预算 + 像素预算，超了只能**拒绝**，见下面那条硬约束）；
+//   4) 存哪儿（内容寻址落盘，会话恢复时还要能找回来）。
+//
+// **硬约束（纯 Uya 的现实）**：stdlib 里没有 zlib / deflate，也没有 JPEG 编解码，
+// 所以**没法缩放或重压**图片。DSH 会把超预算的图重新编码到预算内，我们只能
+// 「接受原图」或「明确拒绝」—— 拒绝时说清楚超了多少，让人自己压一下再粘。
+// 这条约束决定了本模块只做**判定**，不做**变换**。
+//
+// 尺寸解析只读文件头：PNG 的 IHDR、JPEG 的 SOFn、GIF 的逻辑屏幕、WebP 的 VP8/VP8L/VP8X。
+// 读不出来的（畸形/截断）一律当「不认识的图片」拒绝，绝不猜一个尺寸往下走。
+//
+// 命名纪律：本模块新增符号一律带 imgx_ 前缀（多文件是合并命名空间，见 README 第 3 节）。
+
+use libc.heap;
+use libc.stdlib;
+use libc.syscall;
+use libc.unistd;
+use std.encoding.base64.encode_base64;
+
+// DSH 附件版本一收的四种格式（见 dsh-attachment 的 ImageMediaType）。
+// 顺序即**嗅探优先级**：同一份字节不会命中两种，但顺序固定便于自测断言。
+export const IMGX_PNG: u8 = 0;
+export const IMGX_JPEG: u8 = 1;
+export const IMGX_GIF: u8 = 2;
+export const IMGX_WEBP: u8 = 3;
+export const IMGX_NONE: u8 = 255;     // 不认识（不是图片 / 畸形）
+
+// 缺省预算（拿不到模型目录时的保守值）。
+// 与 DSH 的两层口径对齐：附件层（收不收）与请求层（发给模型的大小）。
+//   * 字节：DSH 附件缺省 20 MiB、请求缺省 8 MiB —— 我们取请求层那个（更严的），
+//     因为**没有编码器**，收下来也缩不小，超了就是真发不出去；
+//   * 像素：DSH 的 `imagePixelBudget` 缺省 640000（deepseek 目录与我本机
+//     settings.yaml 里的 `imagePixelBudget: 640000` 一致）。
+export const IMGX_DEF_MAX_BYTES: usize = 8 * 1024 * 1024;
+export const IMGX_DEF_MAX_PIXELS: i64 = 640000;
+// 单条消息里最多几张（DSH 缺省 20，这里取 8 —— 界面一次也粘不了那么多）
+export const IMGX_MAX_PER_MSG: usize = 8;
+
+// 拒绝原因（机器可判定的码 + 给用户看的一句话）
+export const IMGX_OK: i32 = 0;
+export const IMGX_E_UNKNOWN: i32 = 1;      // 不是认识的图片格式
+export const IMGX_E_TOO_BIG: i32 = 2;      // 字节超预算
+export const IMGX_E_TOO_MANY_PIXELS: i32 = 3;  // 像素超预算
+export const IMGX_E_TRUNCATED: i32 = 4;    // 头都读不全
+export const IMGX_E_TOO_MANY: i32 = 5;     // 一条消息里图太多
+export const IMGX_E_NO_VISION: i32 = 6;    // 当前模型不吃图
+export const IMGX_E_IO: i32 = 7;           // 读文件失败
+
+export struct ImgInfo {
+    kind: u8,          // IMGX_PNG / ...
+    width: i64,
+    height: i64,
+    bytes: usize,
+}
+
+fn imgx_empty_info() ImgInfo {
+    return ImgInfo{ kind: IMGX_NONE, width: 0, height: 0, bytes: 0 };
+}
+
+// 按字节序读 n 字节整数（n = 1..4）。
+// 只留**两个**函数而不是 be16/be32/le16/le24/le32 五个：编译器的函数表有名额上限
+// （本轮实测 2214 个左右，满了就报「函数表容量不足」），而这种一行的小工具最容易
+// 把名额吃掉。big = true 时按大端（PNG/JPEG），否则小端（GIF/WebP）。
+fn imgx_num(p: &const byte, n: usize, big: bool) i64 {
+    var v: i64 = 0;
+    var i: usize = 0;
+    while i < n && i < 4 {
+        const b: i64 = p[i] as i64;
+        if big {
+            v = (v << 8) | b;
+        } else {
+            v = v | (b << (8 * (i as i32)));
+        }
+        i = i + 1;
+    }
+    return v;
+}
+
+fn imgx_at(p: &const byte, off: usize) &const byte {
+    return @ptr_from_usize(@usize_from_ptr(p as &const void) + off) as &const byte;
+}
+
+// ============================================================
+// 嗅探 + 尺寸（只看文件头，不解码像素）
+// ============================================================
+
+// PNG：`\x89PNG\r\n\x1a\n` + IHDR（宽高各 4 字节大端，跟在 8 字节签名 + 4 字节长度 + 4 字节类型之后）
+fn imgx_png(p: &const byte, n: usize, info: &ImgInfo) bool {
+    if n < 33 {
+        return false;
+    }
+    const sig: [byte: 8] = [137, 80, 78, 71, 13, 10, 26, 10];
+    if !bufx_mem_eq(p, &sig[0], 8) {
+        return false;
+    }
+    // 第 12..16 字节必须是 "IHDR"（否则尺寸字段的位置就不成立）
+    if !bufx_mem_eq(imgx_at(p, 12), "IHDR" as &const byte, 4) {
+        return false;
+    }
+    info[0].kind = IMGX_PNG;
+    info[0].width = imgx_num(imgx_at(p, 16), 4, true);
+    info[0].height = imgx_num(imgx_at(p, 20), 4, true);
+    info[0].bytes = n;
+    return true;
+}
+
+// JPEG：`\xFF\xD8` 起头，然后逐段跳过，找 SOF0/1/2/3/5/6/7/9/10/11/13/14/15（都有宽高）。
+// 必须走段链：EXIF/ICC 段可以很长，尺寸段的位置不固定。
+fn imgx_jpeg(p: &const byte, n: usize, info: &ImgInfo) bool {
+    if n < 4 || p[0] != 0xFF as byte || p[1] != 0xD8 as byte {
+        return false;
+    }
+    var i: usize = 2;
+    while i + 3 < n {
+        if p[i] != 0xFF as byte {
+            i = i + 1;      // 填充字节 / 畸形：往前挪一格再找段头
+            continue;
+        }
+        const marker: byte = p[i + 1];
+        // 段头之后是 2 字节长度（含这 2 字节本身）
+        const seglen: i64 = imgx_num(imgx_at(p, i + 2), 2, true);
+        // SOFn：宽高在段内偏移 +3/+5（段头 2 字节 + 长度 2 字节 + 精度 1 字节）
+        const is_sof: bool = (marker >= 0xC0 as byte && marker <= 0xC3 as byte)
+            || (marker >= 0xC5 as byte && marker <= 0xC7 as byte)
+            || (marker >= 0xC9 as byte && marker <= 0xCB as byte)
+            || (marker >= 0xCD as byte && marker <= 0xCF as byte);
+        if is_sof {
+            if i + 9 > n {
+                return false;
+            }
+            info[0].kind = IMGX_JPEG;
+            info[0].height = imgx_num(imgx_at(p, i + 5), 2, true);
+            info[0].width = imgx_num(imgx_at(p, i + 7), 2, true);
+            info[0].bytes = n;
+            return true;
+        }
+        // SOS(0xDA) 之后是熵编码数据，尺寸段只可能出现在它之前
+        if marker == 0xDA as byte {
+            return false;
+        }
+        if seglen < 2 {
+            return false;   // 畸形长度：再往下走会死循环
+        }
+        i = i + 2 + (seglen as usize);
+    }
+    return false;
+}
+
+// GIF：`GIF87a` / `GIF89a` + 逻辑屏幕宽高各 2 字节**小端**
+fn imgx_gif(p: &const byte, n: usize, info: &ImgInfo) bool {
+    if n < 10 {
+        return false;
+    }
+    if !bufx_mem_eq(p, "GIF87a" as &const byte, 6) && !bufx_mem_eq(p, "GIF89a" as &const byte, 6) {
+        return false;
+    }
+    info[0].kind = IMGX_GIF;
+    info[0].width = imgx_num(imgx_at(p, 6), 2, false);
+    info[0].height = imgx_num(imgx_at(p, 8), 2, false);
+    info[0].bytes = n;
+    return true;
+}
+
+// WebP：`RIFF` + 4 字节长度 + `WEBP` + 一个 chunk。
+//   * `VP8 `（有损）：宽高在 chunk 内偏移 6/8（14 位）；
+//   * `VP8L`（无损）：14 位宽高打包在偏移 1 起的 4 字节里；
+//   * `VP8X`（扩展）：24 位宽高（各减一）在偏移 4/7。
+fn imgx_webp(p: &const byte, n: usize, info: &ImgInfo) bool {
+    if n < 30 {
+        return false;
+    }
+    if !bufx_mem_eq(p, "RIFF" as &const byte, 4) || !bufx_mem_eq(imgx_at(p, 8), "WEBP" as &const byte, 4) {
+        return false;
+    }
+    const fourcc: &const byte = imgx_at(p, 12);
+    if bufx_mem_eq(fourcc, "VP8X" as &const byte, 4) {
+        info[0].kind = IMGX_WEBP;
+        info[0].width = imgx_num(imgx_at(p, 24), 3, false) + 1;
+        info[0].height = imgx_num(imgx_at(p, 27), 3, false) + 1;
+        info[0].bytes = n;
+        return true;
+    }
+    if bufx_mem_eq(fourcc, "VP8L" as &const byte, 4) {
+        if p[20] != 0x2F as byte {
+            return false;   // 无损 chunk 的签名字节
+        }
+        const bits: i64 = imgx_num(imgx_at(p, 21), 4, false);
+        info[0].kind = IMGX_WEBP;
+        info[0].width = (bits & (0x3FFF as i64)) + 1;
+        info[0].height = ((bits >> 14) & (0x3FFF as i64)) + 1;
+        info[0].bytes = n;
+        return true;
+    }
+    if bufx_mem_eq(fourcc, "VP8 " as &const byte, 4) {
+        // 有损：起始码 0x9D 0x01 0x2A 在偏移 23，之后 2 字节各 14 位宽高
+        if p[23] != 0x9D as byte || p[24] != 0x01 as byte || p[25] != 0x2A as byte {
+            return false;
+        }
+        info[0].kind = IMGX_WEBP;
+        info[0].width = imgx_num(imgx_at(p, 26), 2, false) & (0x3FFF as i64);
+        info[0].height = imgx_num(imgx_at(p, 28), 2, false) & (0x3FFF as i64);
+        info[0].bytes = n;
+        return true;
+    }
+    return false;
+}
+
+// 嗅探入口：认识就填 info 并返回 true。
+// 顺序固定（PNG/JPEG/GIF/WebP 的魔数互不重叠，顺序只影响可读性与自测）。
+export fn imgx_sniff(p: &const byte, n: usize, info: &ImgInfo) bool {
+    info[0] = imgx_empty_info();
+    if imgx_png(p, n, info) {
+        return true;
+    }
+    if imgx_jpeg(p, n, info) {
+        return true;
+    }
+    if imgx_gif(p, n, info) {
+        return true;
+    }
+    if imgx_webp(p, n, info) {
+        return true;
+    }
+    info[0] = imgx_empty_info();
+    return false;
+}
+
+// MIME（线上协议要用的那个字符串）
+export fn imgx_mime(kind: u8) &const byte {
+    if kind == IMGX_PNG {
+        return "image/png" as &const byte;
+    }
+    if kind == IMGX_JPEG {
+        return "image/jpeg" as &const byte;
+    }
+    if kind == IMGX_GIF {
+        return "image/gif" as &const byte;
+    }
+    if kind == IMGX_WEBP {
+        return "image/webp" as &const byte;
+    }
+    return "" as &const byte;
+}
+
+// 扩展名（落盘用）
+export fn imgx_ext(kind: u8) &const byte {
+    if kind == IMGX_PNG {
+        return "png" as &const byte;
+    }
+    if kind == IMGX_JPEG {
+        return "jpg" as &const byte;
+    }
+    if kind == IMGX_GIF {
+        return "gif" as &const byte;
+    }
+    if kind == IMGX_WEBP {
+        return "webp" as &const byte;
+    }
+    return "bin" as &const byte;
+}
+
+export fn imgx_kind_of_mime(mime: &const byte, n: usize) u8 {
+    if n == 9 && bufx_mem_eq(mime, "image/png" as &const byte, 9) {
+        return IMGX_PNG;
+    }
+    if n == 10 && bufx_mem_eq(mime, "image/jpeg" as &const byte, 10) {
+        return IMGX_JPEG;
+    }
+    if n == 9 && bufx_mem_eq(mime, "image/gif" as &const byte, 9) {
+        return IMGX_GIF;
+    }
+    if n == 10 && bufx_mem_eq(mime, "image/webp" as &const byte, 10) {
+        return IMGX_WEBP;
+    }
+    return IMGX_NONE;
+}
+
+// ============================================================
+// 预算判定
+// ============================================================
+
+// 判定一张图收不收。max_bytes/max_pixels ≤ 0 用缺省值。
+// 返回 IMGX_OK / IMGX_E_*，并把「超了多少」交给调用方拼文案（out 里放人话）。
+export fn imgx_check(info: &const ImgInfo, max_bytes: usize, max_pixels: i64, out: &Buf) i32 {
+    buf_reset(out);
+    if info.kind == IMGX_NONE {
+        _ = buf_append_cstr(out, "不认识的图片格式（只认 PNG / JPEG / GIF / WebP）");
+        return IMGX_E_UNKNOWN;
+    }
+    var mb: usize = max_bytes;
+    if mb == 0 {
+        mb = IMGX_DEF_MAX_BYTES;
+    }
+    var mp: i64 = max_pixels;
+    if mp <= 0 {
+        mp = IMGX_DEF_MAX_PIXELS;
+    }
+    if info.bytes > mb {
+        _ = buf_append_cstr(out, "图片太大（");
+        _ = buf_append_u64(out, info.bytes as u64);
+        _ = buf_append_cstr(out, " 字节 > 上限 ");
+        _ = buf_append_u64(out, mb as u64);
+        _ = buf_append_cstr(out, "）");
+        return IMGX_E_TOO_BIG;
+    }
+    const px: i64 = info.width * info.height;
+    if px > mp {
+        _ = buf_append_cstr(out, "图片像素太多（");
+        _ = buf_append_u64(out, info.width as u64);
+        _ = buf_append_cstr(out, "×");
+        _ = buf_append_u64(out, info.height as u64);
+        _ = buf_append_cstr(out, " > 上限 ");
+        _ = buf_append_u64(out, mp as u64);
+        _ = buf_append_cstr(out, " 像素）");
+        return IMGX_E_TOO_MANY_PIXELS;
+    }
+    return IMGX_OK;
+}
+
+// ============================================================
+// 落盘：内容寻址 <dir>/<sha256 前 32 hex>.<ext>
+//
+// 为什么内容寻址：同一张图反复粘不该反复占盘；会话日志里存的是 id，恢复时按 id
+// 找回来（图片字节不进 JSONL —— base64 会把日志撑爆，也让每行 JSON 变得极难读）。
+// ============================================================
+
+use tls.crypto.sha256;
+
+// 附件 id：sha256 十六进制（64 字符，与 DSH 的「不透明 id」同精神但不通用）
+export fn imgx_id_of(p: &const byte, n: usize, out: &Buf) void {
+    buf_reset(out);
+    var digest: [byte: 32] = [0: 32];
+    sha256(p, n, &digest[0]);
+    var hex: [byte: 64] = [0: 64];
+    _ = hex_of(&digest[0], 32, &hex[0]);
+    _ = buf_append(out, &hex[0], 64);
+}
+
+// 拼附件路径：<dir>/<id>.<ext>（**不含** NUL；要喂 syscall 的调用方自己补）
+export fn imgx_path_into(dir: &const byte, dl: usize, id: &const Buf, kind: u8, out: &Buf) void {
+    buf_reset(out);
+    _ = buf_append(out, dir, dl);
+    _ = buf_append_byte(out, 47);
+    _ = buf_append(out, id.ptr as &const byte, id.len);
+    _ = buf_append_byte(out, 46);
+    _ = buf_append_cstr(out, imgx_ext(kind));
+}
+
+// 把字节写进磁盘（幂等：已存在且大小相同就跳过）。
+// 返回 IMGX_OK / IMGX_E_IO。
+export fn imgx_store(dir: &const byte, dl: usize, p: &const byte, n: usize, kind: u8, out: &Buf, id_out: &Buf) i32 {
+    // mkdir 走 sess_mkdir_p，它按 C 串扫（`bufx_cstr_len` + sys_mkdir 要 NUL）——
+    // 所以这里自己补一个 NUL 再调，别把「带长度的 dir」直接递进去（那条路只建到
+    // 半截路径就停了，症状是「图片落盘失败」）。
+    var dz: Buf = buf_new(dl + 2);
+    defer { buf_free(&dz); }
+    _ = buf_append(&dz, dir, dl);
+    _ = buf_append_byte(&dz, 0);
+    if !sess_mkdir_p(dz.ptr as &const byte) {
+        return IMGX_E_IO;
+    }
+    imgx_id_of(p, n, id_out);
+    imgx_path_into(dir, dl, id_out, kind, out);
+    // 幂等：同 id 同大小就不重写（内容寻址下内容必然相同）
+    var pz: Buf = buf_new(out.len + 2);
+    defer { buf_free(&pz); }
+    _ = buf_append(&pz, out.ptr as &const byte, out.len);
+    _ = buf_append_byte(&pz, 0);
+    var st: FsStat = FsStat{ exists: false, is_dir: false, size: 0, mtime: 0, mtime_nsec: 0 };
+    if fs_stat(pz.ptr as &const byte, &st) && st.exists && st.size == (n as i64) {
+        return IMGX_OK;
+    }
+    const flags: i32 = (O_WRONLY | O_CREAT | O_TRUNC) as i32;
+    const fd: i32 = sys_open(&pz.ptr[0] as *const byte, flags, 420) catch {
+        return IMGX_E_IO;
+    };
+    defer { _ = sys_close(fd) catch {}; }
+    var written: usize = 0;
+    while written < n {
+        const w: isize = sys_write(fd, imgx_at(p, written) as *const byte, n - written) catch { -1 as isize; };
+        if w <= 0 {
+            return IMGX_E_IO;
+        }
+        written = written + (w as usize);
+    }
+    return IMGX_OK;
+}
+
+// 读回附件全文（会话恢复 / 构请求时用）。返回 null 表示读不到。
+// 读回附件全文。pn 显式给长度 —— 调用方手上的路径常常是「Buf 里的字节」（没有 NUL），
+// 而 sys_open 要 C 串；按 bufx_cstr_len 扫会一路读到缓冲区后面的垃圾（实测症状：
+// 文件明明在磁盘上，读回来却是 false）。这里自己补 NUL。
+export fn imgx_load(path: &const byte, pn: usize, out: &Buf) bool {
+    buf_reset(out);
+    var pz: Buf = buf_new(pn + 2);
+    defer { buf_free(&pz); }
+    _ = buf_append(&pz, path, pn);
+    _ = buf_append_byte(&pz, 0);
+    const fd: i32 = sys_open(&pz.ptr[0] as *const byte, O_RDONLY as i32, 0) catch {
+        return false;
+    };
+    defer { _ = sys_close(fd) catch {}; }
+    var tmp: [byte: 65536] = [0: 65536];
+    while true {
+        const r: isize = sys_read(fd, &tmp[0], 65536) catch { -1 as isize; };
+        if r == 0 {
+            return true;
+        }
+        if r < 0 {
+            return false;
+        }
+        if !buf_append(out, &tmp[0], r as usize) {
+            return false;
+        }
+    }
+}
+
+// ============================================================
+// base64（内联到请求里用）
+// ============================================================
+const IMGX_B64_ALPHABET_READY: bool = true;
+
+// 先算 base64 长度（含 padding），再一次性编码。
+// 编码失败返回 false —— 调用方据此降级成纯文本 + notice。
+export fn imgx_b64(p: &const byte, n: usize, out: &Buf) bool {
+    buf_reset(out);
+    if n == 0 {
+        return true;
+    }
+    const need: usize = ((n + 2) / 3) * 4;
+    if !buf_reserve(out, need) {
+        return false;
+    }
+    const got: !usize = encode_base64(p[0: n], out.ptr[0: out.cap]);
+    const w: usize = got catch {
+        return false;
+    };
+    out.len = w;
+    _ = IMGX_B64_ALPHABET_READY;
+    return true;
+}
+
+// ============================================================
+// 附件表（一条 user 消息上挂的图）
+//
+// 存储形态刻意选「路径 + 元数据」而不是「字节」：历史里几十条消息各带几 MB 字节
+// 会把内存与请求缓冲都顶爆；字节只在**构请求那一刻**从磁盘读一次并立刻 base64。
+// ============================================================
+export struct ImgRef {
+    kind: u8,
+    width: i64,
+    height: i64,
+    bytes: usize,
+    path: Buf,       // 落盘的绝对/相对路径（原样保存，恢复时按它读）
+    name: Buf,       // 展示名（可空）
+}
+
+export struct ImgList {
+    items: [ImgRef: IMGX_MAX_PER_MSG],
+    len: usize,
+}
+
+fn imgx_ref_empty() ImgRef {
+    return ImgRef{
+        kind: IMGX_NONE, width: 0, height: 0, bytes: 0,
+        path: buf_empty(), name: buf_empty(),
+    };
+}
+
+export fn imgx_list_new() ImgList {
+    var l: ImgList = ImgList{ items: [imgx_ref_empty(): IMGX_MAX_PER_MSG], len: 0 };
+    var i: usize = 0;
+    while i < IMGX_MAX_PER_MSG {
+        l.items[i] = imgx_ref_empty();
+        i = i + 1;
+    }
+    return l;
+}
+
+export fn imgx_list_free(l: &ImgList) void {
+    var i: usize = 0;
+    while i < l.len {
+        buf_free(&l.items[i].path);
+        buf_free(&l.items[i].name);
+        i = i + 1;
+    }
+    l.len = 0;
+}
+
+export fn imgx_list_push(l: &ImgList, r: &const ImgRef) bool {
+    if l.len >= IMGX_MAX_PER_MSG {
+        return false;
+    }
+    // 用指针走：固定数组下标要给编译器看的证明（uya 的「数组索引安全证明」不接受
+    // 「l.len < IMGX_MAX_PER_MSG」这种间接推理，见 agent.uya 里同款注释）
+    const base: &ImgRef = &l.items[0];
+    const slot: &ImgRef = @ptr_from_usize(@usize_from_ptr(base as &const void) + l.len * (@size_of(ImgRef) as usize)) as &ImgRef;
+    slot.kind = r.kind;
+    slot.width = r.width;
+    slot.height = r.height;
+    slot.bytes = r.bytes;
+    if !buf_valid(&slot.path) {
+        slot.path = buf_new(r.path.len + 8);
+    }
+    buf_reset(&slot.path);
+    _ = buf_append(&slot.path, r.path.ptr as &const byte, r.path.len);
+    if !buf_valid(&slot.name) {
+        slot.name = buf_new(64);
+    }
+    buf_reset(&slot.name);
+    _ = buf_append(&slot.name, r.name.ptr as &const byte, r.name.len);
+    l.len = l.len + 1;
+    return true;
+}
+
+// 附件 JSON（存进 Msg.extra 与会话日志的那份）：
+// [{"mime":"image/png","path":"…","w":1024,"h":768,"bytes":51200,"name":"shot.png"}]
+// 手写序列化（不用 JsonWriter）：字段少、顺序固定、要能塞进任意 Buf。
+export fn imgx_list_json(l: &const ImgList, out: &Buf) bool {
+    buf_reset(out);
+    if !buf_append_byte(out, 91) {
+        return false;
+    }
+    var i: usize = 0;
+    while i < l.len {
+        const r: &const ImgRef = &l.items[i];
+        if i > 0 && !buf_append_byte(out, 44) {
+            return false;
+        }
+        if !buf_append_cstr(out, "{\"mime\":") {
+            return false;
+        }
+        if !jw_str_into(out, imgx_mime(r.kind), bufx_cstr_len(imgx_mime(r.kind))) {
+            return false;
+        }
+        if !buf_append_cstr(out, ",\"path\":") {
+            return false;
+        }
+        if !jw_str_into(out, r.path.ptr as &const byte, r.path.len) {
+            return false;
+        }
+        if !buf_append_cstr(out, ",\"w\":") {
+            return false;
+        }
+        _ = buf_append_i64(out, r.width);
+        if !buf_append_cstr(out, ",\"h\":") {
+            return false;
+        }
+        _ = buf_append_i64(out, r.height);
+        if !buf_append_cstr(out, ",\"bytes\":") {
+            return false;
+        }
+        _ = buf_append_u64(out, r.bytes as u64);
+        if r.name.len > 0 {
+            if !buf_append_cstr(out, ",\"name\":") {
+                return false;
+            }
+            if !jw_str_into(out, r.name.ptr as &const byte, r.name.len) {
+                return false;
+            }
+        }
+        if !buf_append_byte(out, 125) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return buf_append_byte(out, 93);
+}
+
+// 从附件 JSON 还原（会话日志 / 历史回放用）。
+// 刻意做成「能认多少算多少」：字段缺失就跳过那一项，绝不让一条坏记录把整段历史废掉。
+export fn imgx_list_parse(js: &const byte, n: usize, out: &ImgList) bool {
+    out.len = 0;
+    var i: usize = 0;
+    while i < n {
+        if js[i] != 123 as byte {
+            i = i + 1;
+            continue;
+        }
+        // 找这一项的收尾 '}'（附件对象里没有嵌套对象）
+        var j: usize = i + 1;
+        while j < n && js[j] != 125 as byte {
+            j = j + 1;
+        }
+        if j >= n {
+            return out.len > 0;
+        }
+        const item: &[byte] = js[i: j + 1];
+        var r: ImgRef = imgx_ref_empty();
+        r.path = buf_new(1024);
+        r.name = buf_new(128);
+        if !imgx_obj_get(item, "path", &r.path) || r.path.len == 0 {
+            buf_free(&r.path);
+            buf_free(&r.name);
+            i = j + 1;
+            continue;
+        }
+        var mime: Buf = buf_new(64);
+        defer { buf_free(&mime); }
+        if imgx_obj_get(item, "mime", &mime) {
+            r.kind = imgx_kind_of_mime(mime.ptr as &const byte, mime.len);
+        }
+        _ = imgx_obj_get(item, "name", &r.name);
+        const wv: i64 = imgx_obj_num(item, "w");
+        if wv >= 0 {
+            r.width = wv;
+        }
+        const hv: i64 = imgx_obj_num(item, "h");
+        if hv >= 0 {
+            r.height = hv;
+        }
+        const bv: i64 = imgx_obj_num(item, "bytes");
+        if bv >= 0 {
+            r.bytes = bv as usize;
+        }
+        // kind 认不出来（外来/手改过的日志）就按扩展名再试一次；仍不认则整项丢掉 ——
+        // 认不出类型的图发出去只会得到网关 400。
+        if r.kind == IMGX_NONE {
+            r.kind = imgx_kind_of_path(r.path.ptr as &const byte, r.path.len);
+        }
+        if r.kind == IMGX_NONE || !imgx_list_push(out, &r) {
+            buf_free(&r.path);
+            buf_free(&r.name);
+        } else {
+            // imgx_list_push 复制过了，这里的临时 Buf 归自己释放
+            buf_free(&r.path);
+            buf_free(&r.name);
+        }
+        i = j + 1;
+    }
+    return out.len > 0;
+}
+
+// 按路径后缀认类型（恢复时 mime 字段缺失的兜底）
+fn imgx_kind_of_path(p: &const byte, n: usize) u8 {
+    if n >= 4 && bufx_mem_eq(imgx_at(p, n - 4), ".png" as &const byte, 4) {
+        return IMGX_PNG;
+    }
+    if n >= 4 && (bufx_mem_eq(imgx_at(p, n - 4), ".jpg" as &const byte, 4)
+        || bufx_mem_eq(imgx_at(p, n - 4), ".jpeg" as &const byte, 4)) {
+        return IMGX_JPEG;
+    }
+    if n >= 5 && bufx_mem_eq(imgx_at(p, n - 5), ".jpeg" as &const byte, 5) {
+        return IMGX_JPEG;
+    }
+    if n >= 4 && bufx_mem_eq(imgx_at(p, n - 4), ".gif" as &const byte, 4) {
+        return IMGX_GIF;
+    }
+    if n >= 5 && bufx_mem_eq(imgx_at(p, n - 5), ".webp" as &const byte, 5) {
+        return IMGX_WEBP;
+    }
+    return IMGX_NONE;
+}
+
+// 取 `"key":<数字>`（w / h / bytes 是 JSON 数字，**没有引号** —— 用 imgx_obj_get
+// 那条 `"key":"` 的路径永远匹配不上，症状是往返之后宽高全变 0）。
+// 返回 -1 表示这个键不存在。
+fn imgx_obj_num(obj: &[byte], key: &const byte) i64 {
+    var pat: Buf = buf_new(64);
+    defer { buf_free(&pat); }
+    _ = buf_append_byte(&pat, 34);
+    _ = buf_append_cstr(&pat, key);
+    _ = buf_append_cstr(&pat, "\":");
+    const at: isize = find_sub(obj, pat.ptr[0: pat.len], 0);
+    if at < 0 {
+        return -1;
+    }
+    var start: usize = (at as usize) + pat.len;
+    while start < obj.len && obj[start] == 32 as byte {
+        start = start + 1;
+    }
+    var end: usize = start;
+    while end < obj.len {
+        const c: byte = obj[end];
+        if c == 44 as byte || c == 125 as byte {
+            break;
+        }
+        end = end + 1;
+    }
+    if end <= start {
+        return -1;
+    }
+    return parse_u64_at(obj[start: end], 0, end - start);
+}
+
+// 从一个 JSON 对象片段里取 `"key":"value"` 的**反转义**值（复用 session 那套 sv_unescape）
+fn imgx_obj_get(obj: &[byte], key: &const byte, out: &Buf) bool {
+    var pat: Buf = buf_new(64);
+    defer { buf_free(&pat); }
+    _ = buf_append_byte(&pat, 34);
+    _ = buf_append_cstr(&pat, key);
+    _ = buf_append_cstr(&pat, "\":\"");
+    const at: isize = find_sub(obj, pat.ptr[0: pat.len], 0);
+    if at < 0 {
+        return false;
+    }
+    const start: usize = (at as usize) + pat.len;
+    var i: usize = start;
+    var end: usize = obj.len;
+    while i < obj.len {
+        const c: byte = obj[i];
+        if c == 92 as byte {
+            i = i + 2;
+            continue;
+        }
+        if c == 34 as byte {
+            end = i;
+            break;
+        }
+        i = i + 1;
+    }
+    if end == obj.len {
+        return false;
+    }
+    const sv: JsonStrView = JsonStrView{ ptr: &obj[start], len: end - start };
+    buf_reset(out);
+    if sv_unescape(&sv, out) {
+        return true;
+    }
+    buf_reset(out);
+    return buf_append(out, &obj[start], end - start);
+}
+
+// ============================================================
+// 展示：占位徽标 / 诊断行
+// ============================================================
+
+// 一行占位（TUI 与滚动模式共用）：
+//   ⎿ 图片 image/png 1024×768 · 512.0 KiB
+// 终端**不渲染图片**，这行就是它存在的全部证据 —— 所以宽高与大小必须是真的。
+export fn imgx_label(r: &const ImgRef, out: &Buf) void {
+    buf_reset(out);
+    _ = buf_append_cstr(out, "⎿ 图片 ");
+    // imgx_mime 返回的是 C 串（指针），长度必须用 bufx_cstr_len 求 —— 写 mime.len
+    // 会被当成「在指针上取成员」（本轮实测的编译错误）。
+    const mime: &const byte = imgx_mime(r.kind);
+    const mime_n: usize = bufx_cstr_len(mime);
+    if mime_n == 0 {
+        _ = buf_append_cstr(out, "未知格式");
+    } else {
+        _ = buf_append(out, mime, mime_n);
+    }
+    if r.width > 0 && r.height > 0 {
+        _ = buf_append_byte(out, 32);
+        _ = buf_append_u64(out, r.width as u64);
+        _ = buf_append_cstr(out, "×");
+        _ = buf_append_u64(out, r.height as u64);
+    }
+    if r.bytes > 0 {
+        _ = buf_append_cstr(out, " · ");
+        imgx_fmt_bytes(r.bytes, out);
+    }
+    if r.name.len > 0 {
+        _ = buf_append_cstr(out, " · ");
+        _ = buf_append(out, r.name.ptr as &const byte, r.name.len);
+    }
+}
+
+// 人类可读字节数（与 tasks/stats 的口径一致：KiB/MiB，一位小数）
+export fn imgx_fmt_bytes(n: usize, out: &Buf) void {
+    if n < 1024 {
+        _ = buf_append_u64(out, n as u64);
+        _ = buf_append_cstr(out, " B");
+        return;
+    }
+    if n < 1024 * 1024 {
+        _ = buf_append_u64(out, (n as u64) / 1024);
+        _ = buf_append_cstr(out, ".");
+        _ = buf_append_u64(out, ((n as u64) % (1024 as u64)) * 10 / (1024 as u64));
+        _ = buf_append_cstr(out, " KiB");
+        return;
+    }
+    _ = buf_append_u64(out, (n as u64) / (1024 * 1024));
+    _ = buf_append_cstr(out, ".");
+    _ = buf_append_u64(out, ((n as u64) % ((1024 * 1024) as u64)) * 10 / ((1024 * 1024) as u64));
+    _ = buf_append_cstr(out, " MiB");
+}
+
+// 一条消息上所有图的占位行（多行；空表返回空）
+export fn imgx_labels(l: &const ImgList, out: &Buf) void {
+    buf_reset(out);
+    var i: usize = 0;
+    while i < l.len {
+        var one: Buf = buf_new(256);
+        defer { buf_free(&one); }
+        imgx_label(&l.items[i], &one);
+        _ = buf_append(out, one.ptr as &const byte, one.len);
+        if i + 1 < l.len {
+            _ = buf_append_byte(out, 10);
+        }
+        i = i + 1;
+    }
+}

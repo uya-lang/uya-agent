@@ -21,7 +21,7 @@
 UYA_ROOT ?= /home/winger/uya-0.10/lib/
 UYA      ?= /home/winger/uya-0.10/bin/uya
 
-SRC := src/bufx.uya src/jsonx.uya src/httpc.uya src/httpstream.uya src/sse.uya src/llm.uya src/tty.uya src/sigx.uya src/inbox.uya src/session.uya src/stats.uya src/procx.uya src/yamlcfg.uya src/modelx.uya src/dshcfg.uya src/dshsess.uya src/prompt.uya src/instr.uya src/compact.uya src/skill.uya src/webx.uya src/deleg.uya src/goal.uya src/workflow.uya src/todo.uya src/plan.uya src/perm.uya src/sandboxx.uya src/askuser.uya src/fsx.uya src/search.uya src/jobs.uya src/shellx.uya src/gitx.uya src/gitdiff.uya src/worktreex.uya src/tools.uya src/diffx.uya src/mdview.uya src/view.uya src/tasks.uya src/watch.uya src/tui.uya src/agent.uya src/sigselftest.uya src/shellselftest.uya src/tuiselftest.uya src/selftest.uya
+SRC := src/bufx.uya src/jsonx.uya src/httpc.uya src/httpstream.uya src/sse.uya src/llm.uya src/tty.uya src/sigx.uya src/inbox.uya src/session.uya src/stats.uya src/procx.uya src/yamlcfg.uya src/modelx.uya src/dshcfg.uya src/dshsess.uya src/prompt.uya src/instr.uya src/compact.uya src/skill.uya src/webx.uya src/deleg.uya src/goal.uya src/workflow.uya src/todo.uya src/plan.uya src/perm.uya src/sandboxx.uya src/askuser.uya src/fsx.uya src/search.uya src/jobs.uya src/shellx.uya src/gitx.uya src/gitdiff.uya src/worktreex.uya src/imgx.uya src/clipx.uya src/diffx.uya src/mdview.uya src/view.uya src/tasks.uya src/watch.uya src/tui.uya src/agent.uya src/sigselftest.uya src/shellselftest.uya src/tuiselftest.uya src/selftest.uya
 OUT := build/uya-agent
 
 BASE ?= https://api.deepseek.com/v1
@@ -57,11 +57,11 @@ codegen-audit: build
 	fi; \
 	echo "codegen-audit: 通过（没有切片描述符强转）"
 
-# P50：**函数表容量**（编译器里写死的 FUNCTION_TABLE_SIZE，无开关）。
+# P53：**函数表容量**（编译器里写死的 FUNCTION_TABLE_SIZE，无开关）。
 #   本仓已经贴着上限：main 6756 个声明能编过，**再加 1 个函数**就报「函数表容量不足」——
 #   而且增量编译看不出来（缓存），只有 `rm -rf build` 重编才炸，报错点还落在标准库里。
 #   所以「净增函数」的改动一律先清缓存重编一遍（见 README §3 踩坑 84）。
-#   变量与常量不占这个额度，只有函数占；整理手段见踩坑 84。
+#   变量与常量不占这个额度，只有函数占；整理手段见踩坑 87。
 selftest: build codegen-audit e2e-config-flags e2e-title e2e-title-cmd e2e-title-auto e2e-mouse e2e-api e2e-steps e2e-permission e2e-sandbox e2e-tasks e2e-goal e2e-sessions e2e-resume-big e2e-diff e2e-ws e2e-model e2e-worktree p30-check
 	UYA_BIN=$(UYA) $(OUT) --selftest
 

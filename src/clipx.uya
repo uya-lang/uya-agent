@@ -1,0 +1,819 @@
+// src/clipx.uya — 剪贴板读取（P52）：X11 协议的最小客户端
+//
+// 为什么要手写 X11 协议：本机（deepin-terminal / X11）**没有** xclip / xsel / wl-paste，
+// 而「粘一张截图给多模态模型」是这一轮的核心诉求 —— 没有外部 helper 就得自己说协议。
+//
+// 只做**读**剪贴板这一件事，而且只做同步的一次性读取（不是常驻状态机）：
+//   * `clipx_paste()` 被 ctrl+v / `/paste` 调用一次，最多阻塞 ~2.5 秒；
+//   * 期间用 poll + `tui_poll_tick()` 泵界面（与 gitx 跑 git 同一手法），所以界面不假死、
+//     esc 也进得来；
+//   * 读不到就**明确回一句**（没有 X11 / 没有 owner / 没有认识的格式），绝不静默。
+//
+// 协议范围（刻意最小）：
+//   * 连接：`/tmp/.X11-unix/X<n>`（DISPLAY 的 unix 分支）+ `~/.Xauthority` 的
+//     MIT-MAGIC-COOKIE-1 认证（family 256 = Local）；读不到 cookie 就匿名试一次。
+//   * 请求：InternAtom / CreateWindow（InputOnly，PropertyChangeMask）/
+//     GetSelectionOwner / ConvertSelection / GetProperty / DeleteProperty。
+//   * 数据：`bytes_after` 循环取完；`INCR`（大图必然走这条）按 PropertyNotify 增量收。
+//   * 目标优先级：image/png → image/jpeg → image/gif → image/webp → UTF8_STRING。
+//
+// 边界：只支持 X11 的 unix socket（不做 TCP 转发、不做 Wayland 协议）；Wayland 会话下
+// 走「外部 helper」那条回落（见 agent 侧的 clip 分流）。
+
+use libc.syscall;
+use libc.unistd;
+use libc.stdlib;
+use libc.heap;
+
+// 结果码
+export const CLIPX_NONE: i32 = 0;      // 剪贴板空 / 没有 owner
+export const CLIPX_TEXT: i32 = 1;      // 读到了文本
+export const CLIPX_IMAGE: i32 = 2;     // 读到了图片（mime 见 clipx_kind_out）
+export const CLIPX_NO_X11: i32 = 3;    // 没有 X11 会话（DISPLAY 没设 / 连不上）
+export const CLIPX_ERR: i32 = 4;       // 协议层失败（超时 / 畸形应答）
+export const CLIPX_TOO_BIG: i32 = 5;   // 超过我们的读取上限
+export const CLIPX_OK_UNUSED: i32 = 99;  // 自测用：一个「成功」码（不该有失败文案）
+
+// 单次读取的字节上限：一张 4K 截图 PNG 通常 2–8 MiB，给到 24 MiB 足够；
+// 超过就明确拒绝（不静默截断 —— 半个 PNG 发给模型只会得到一个坏请求）。
+const CLIPX_MAX_BYTES: usize = 24 * 1024 * 1024;
+// 单次整体超时（毫秒）：包含建连 + 认证 + TARGETS + 取数据 + INCR 全过程
+const CLIPX_TIMEOUT_MS: u64 = 2500;
+const CLIPX_POLL_MS: i32 = 20;
+
+// ============================================================
+// 小工具
+// ============================================================
+fn clipx_at(p: &const byte, off: usize) &const byte {
+    return @ptr_from_usize(@usize_from_ptr(p as &const void) + off) as &const byte;
+}
+
+// X11 字节序（我们按小端发、也按小端读；本机 x86_64 与协议一致）
+fn clipx_le16(p: &const byte) i64 {
+    return (p[0] as i64) | ((p[1] as i64) << 8);
+}
+
+fn clipx_le32(p: &const byte) i64 {
+    return (p[0] as i64) | ((p[1] as i64) << 8) | ((p[2] as i64) << 16) | ((p[3] as i64) << 24);
+}
+
+fn clipx_be16(p: &const byte) i64 {
+    return ((p[0] as i64) << 8) | (p[1] as i64);
+}
+
+fn clipx_now_ms() u64 {
+    return ua_now_ms();
+}
+
+
+// 追加小端 u16 / u32（X11 请求体里到处是这两种；bufx 只到 u64 的十进制文本形式，
+// 没有二进制写整数的工具）
+fn clipx_put_u16(b: &Buf, v: u32) bool {
+    if !buf_append_byte(b, (v & 255) as byte) {
+        return false;
+    }
+    return buf_append_byte(b, ((v >> 8) & 255) as byte);
+}
+
+fn clipx_put_u32(b: &Buf, v: u32) bool {
+    var i: u32 = 0;
+    while i < 4 {
+        if !buf_append_byte(b, ((v >> (8 * i)) & 255) as byte) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+// ============================================================
+// DISPLAY → unix socket 路径
+// 认 `:0` / `unix:0` / `host:0`（host 忽略，我们只连本机 unix socket）/ `:0.0`（屏号忽略）
+// 返回 false = DISPLAY 没设或不是我们能处理的形状（调用方给「没有 X11」的文案）
+// ============================================================
+export fn clipx_display_socket(out: &Buf) bool {
+    var disp: Buf = env_or("DISPLAY" as &const byte, "" as &const byte);
+    defer { buf_free(&disp); }
+    if disp.len == 0 {
+        return false;
+    }
+    // 找冒号：冒号后到 '.' 或结尾之间是 display 号（十进制）
+    var i: usize = 0;
+    var colon: usize = disp.len;
+    while i < disp.len {
+        if disp.ptr[i] == 58 as byte {
+            colon = i;
+            break;
+        }
+        i = i + 1;
+    }
+    if colon >= disp.len {
+        return false;
+    }
+    var num: i64 = 0;
+    var have: bool = false;
+    var k: usize = colon + 1;
+    while k < disp.len {
+        const c: byte = disp.ptr[k];
+        if c == 46 as byte {
+            break;      // 屏号（.0）之后不看
+        }
+        if c < 48 as byte || c > 57 as byte {
+            return false;
+        }
+        num = num * 10 + ((c as i64) - 48);
+        have = true;
+        k = k + 1;
+    }
+    if !have || num < 0 || num > 64 {
+        return false;
+    }
+    buf_reset(out);
+    _ = buf_append_cstr(out, "/tmp/.X11-unix/X");
+    _ = buf_append_u64(out, num as u64);
+    _ = buf_append_byte(out, 0);
+    return true;
+}
+
+// 从 ~/.Xauthority 里取本 display 的 MIT-MAGIC-COOKIE-1。
+// 文件格式是一串条目：family(2, 大端) + addr(len+data) + num(len+data) + name(len+data) + data(len+data)，
+// 其中长度都是大端 u16。family 256 = FamilyLocal（本机 unix socket 用的就是它）。
+// 找不到就返回 false（调用方匿名连接 —— 有些环境开了 xhost 本地放行）。
+export fn clipx_auth_cookie(display_num: &const byte, dn: usize, out: &Buf) bool {
+    buf_reset(out);
+    var home: Buf = env_or("HOME" as &const byte, "" as &const byte);
+    defer { buf_free(&home); }
+    if home.len == 0 {
+        return false;
+    }
+    var path: Buf = buf_new(home.len + 32);
+    defer { buf_free(&path); }
+    _ = buf_append(&path, home.ptr as &const byte, home.len);
+    _ = buf_append_cstr(&path, "/.Xauthority");
+    var raw: Buf = buf_new(4096);
+    defer { buf_free(&raw); }
+    if !imgx_load(path.ptr as &const byte, path.len, &raw) || raw.len < 8 {
+        return false;
+    }
+    const p: &const byte = raw.ptr as &const byte;
+    const n: usize = raw.len;
+    var off: usize = 0;
+    while off + 2 <= n {
+        const fam: i64 = clipx_be16(clipx_at(p, off));
+        off = off + 2;
+        // addr
+        if off + 2 > n {
+            return false;
+        }
+        const al: usize = clipx_be16(clipx_at(p, off)) as usize;
+        off = off + 2;
+        if off + al > n {
+            return false;
+        }
+        off = off + al;
+        // num（display 号，字符串形式）
+        if off + 2 > n {
+            return false;
+        }
+        const nl: usize = clipx_be16(clipx_at(p, off)) as usize;
+        off = off + 2;
+        if off + nl > n {
+            return false;
+        }
+        const num_off: usize = off;
+        off = off + nl;
+        // name
+        if off + 2 > n {
+            return false;
+        }
+        const ml: usize = clipx_be16(clipx_at(p, off)) as usize;
+        off = off + 2;
+        if off + ml > n {
+            return false;
+        }
+        const name_off: usize = off;
+        off = off + ml;
+        // data
+        if off + 2 > n {
+            return false;
+        }
+        const dl: usize = clipx_be16(clipx_at(p, off)) as usize;
+        off = off + 2;
+        if off + dl > n {
+            return false;
+        }
+        const data_off: usize = off;
+        off = off + dl;
+        // family 256 = Local，且 display 号一致，且名字是 MIT-MAGIC-COOKIE-1
+        const name_ok: bool = ml == 18
+            && bufx_mem_eq(clipx_at(p, name_off), "MIT-MAGIC-COOKIE-1" as &const byte, 18);
+        const num_ok: bool = nl == dn && bufx_mem_eq(clipx_at(p, num_off), display_num, dn);
+        if fam == 256 && name_ok && num_ok && dl > 0 {
+            return buf_append(out, clipx_at(p, data_off), dl);
+        }
+    }
+    return false;
+}
+
+// ============================================================
+// 连接 + 认证 + setup 握手
+// 成功后返回 fd（非阻塞，带超时），并填出 root 窗口 / 资源 id 基址 / 是否 Picture 探测过。
+// 失败返回 -1（调用方按「没有 X11」或协议错处理）。
+// ============================================================
+struct ClipxConn {
+    fd: i32,
+    root: u32,
+    rid: u32,
+    win: u32,
+    deadline: u64,
+    big_endian: bool,
+}
+
+fn clipx_sockaddr_un(path: &const byte, n: usize, out: &byte) usize {
+    // struct sockaddr_un { u16 sun_family; char sun_path[108]; }
+    out[0] = 1;   // AF_UNIX = 1
+    out[1] = 0;
+    var i: usize = 0;
+    while i < n && i < 107 {
+        out[2 + i] = path[i];
+        i = i + 1;
+    }
+    out[2 + i] = 0;
+    return 2 + i + 1;
+}
+
+// 写满请求（短写重试；socket 是阻塞式的？—— 不，我们靠 SO_SNDTIMEO 兜）
+fn clipx_write_all(fd: i32, p: &const byte, n: usize) bool {
+    var off: usize = 0;
+    while off < n {
+        const w: isize = sys_write(fd, clipx_at(p, off) as *const byte, n - off) catch { -1 as isize; };
+        if w <= 0 {
+            return false;
+        }
+        off = off + (w as usize);
+    }
+    return true;
+}
+
+// 阻塞读满 n 字节（带 poll 超时；超时/断开返回 false）
+fn clipx_read_exact(c: &const ClipxConn, out: &byte, n: usize) bool {
+    var got: usize = 0;
+    while got < n {
+        if clipx_now_ms() > c.deadline {
+            return false;
+        }
+        var pfds: [PollFd: 1] = [PollFd{ fd: c.fd, events: POLLIN, revents: 0 }];
+        const pr: i32 = sys_poll(&pfds[0], 1, CLIPX_POLL_MS) catch { 0; };
+        if pr <= 0 {
+            tui_poll_tick();   // 界面别假死（读剪贴板期间 spinner/按键照常）
+            continue;
+        }
+        const r: isize = sys_read(c.fd, out + got, n - got) catch { -1 as isize; };
+        if r <= 0 {
+            return false;
+        }
+        got = got + (r as usize);
+    }
+    return true;
+}
+
+// 重置这一步的等待预算（见 clipx_convert 的说明）
+fn clipx_arm(c: &ClipxConn) void {
+    c.deadline = clipx_now_ms() + CLIPX_TIMEOUT_MS;
+}
+
+// 发一条请求：opcode + data(1) + length(2, 以 4 字节为单位) + 体；体自动补齐 4 字节
+fn clipx_req(c: &const ClipxConn, opcode: byte, data: byte, body: &const Buf) bool {
+    // 长度字段 = 整条请求的 4 字节单位数，**含这 4 字节头与自己补的 pad**。
+    // 先算 body 的 pad 再加头，不能反过来（反过来会把长度少算一格 —— 实测症状：
+    // 服务端按短长度截断，请求体尾部被当成下一条请求的开头，随后就是一堆 X 错误）。
+    var pad: usize = ((4 as usize) - (body.len % (4 as usize))) % (4 as usize);
+    const units: usize = (4 + body.len + pad) / (4 as usize);
+    var hdr: [byte: 4] = [0: 4];
+    hdr[0] = opcode;
+    hdr[1] = data;
+    hdr[2] = (units & (255 as usize)) as byte;
+    hdr[3] = ((units >> 8) & (255 as usize)) as byte;
+    if !clipx_write_all(c.fd, &hdr[0], 4) {
+        return false;
+    }
+    if body.len > 0 && !clipx_write_all(c.fd, body.ptr as &const byte, body.len) {
+        return false;
+    }
+    var z: [byte: 4] = [0, 0, 0, 0];
+    _ = pad;
+    if pad > 0 && !clipx_write_all(c.fd, &z[0], pad) {
+        return false;
+    }
+    return true;
+}
+
+// 读一条消息到 out（32 字节头 + 附加体）。返回附体长度（-1 = 失败）。
+// 头里 [0] = 0 事件 / 1 应答 / 2.. 其它；错误消息也是 0 起头，所以调用方要自己判。
+fn clipx_read_msg(c: &const ClipxConn, head: &byte, extra: &Buf) i32 {
+    if !clipx_read_exact(c, head, 32) {
+        return -1;
+    }
+    buf_reset(extra);
+    var n: usize = 0;
+    if head[0] == 1 as byte {
+        n = clipx_le32(clipx_at(head, 4)) as usize * 4;
+    }
+    if n > 0 {
+        if n > CLIPX_MAX_BYTES {
+            return -1;
+        }
+        if !buf_reserve(extra, n) {
+            return -1;
+        }
+        if !clipx_read_exact(c, extra.ptr, n) {
+            return -1;
+        }
+        extra.len = n;
+    }
+    return n as i32;
+}
+
+// 发请求并等**应答**（跳过事件）。返回 false = 出错或对端报了 X 错误。
+fn clipx_call(c: &ClipxConn, opcode: byte, data: byte, body: &const Buf, head: &byte, extra: &Buf) bool {
+    var d0: Buf = buf_new(64);
+    defer { buf_free(&d0); }
+    _ = buf_append_cstr(&d0, "req op=");
+    _ = buf_append_u64(&d0, opcode as u64);
+    _ = buf_append_cstr(&d0, " bodylen=");
+    _ = buf_append_u64(&d0, body.len as u64);
+    if !clipx_req(c, opcode, data, body) {
+        return false;
+    }
+    var tries: i32 = 0;
+    while tries < 64 {
+        tries = tries + 1;
+        const rn: i32 = clipx_read_msg(c, head, extra);
+        if rn < 0 {
+            return false;
+        }
+        if head[0] == 1 as byte {
+            // 应答就是成功。**不要**把 head[1] 当成错误码：各应答自己定义这一字节
+            // （GetInputFocus 是 revert-to、GetProperty 是 format…），把它当错误码会
+            // 把正常应答判成失败（实测：GetInputFocus 的 revert-to=1 被读成「错误 1」）。
+            // 真正的失败只有第一条路：首字节 0 = X 错误。
+            return true;
+        }
+        if head[0] == 0 as byte {
+            // X 错误（错误消息也是 0 起头，第 1 字节是错误码）
+            var d: Buf = buf_new(64);
+            defer { buf_free(&d); }
+            _ = buf_append_cstr(&d, "X error code=");
+            _ = buf_append_u64(&d, head[1] as u64);
+            _ = buf_append_cstr(&d, " major=");
+            _ = buf_append_u64(&d, head[10] as u64);
+            return false;
+        }
+        // 其余是**事件**（首字节 ≥ 2，且可能带 SendEvent 位）：与本次请求无关，
+        // 继续等应答。旧实现在这里直接掉到函数底部返回 false —— 于是「有事件先到」
+        // 的请求（CreateWindow 之后紧跟的那条 GetInputFocus 就是）一律被判成失败。
+    }
+    return false;
+}
+
+// InternAtom（only_if_exists = false）
+fn clipx_intern(c: &const ClipxConn, name: &const byte, n: usize) u32 {
+    // InternAtom 的体布局：name_len(2) pad(2) name(pad4)。
+    // `only_if_exists` 走请求头的 **data 字节**（不是体里的第一个字节）——
+    // 放错位置的症状是服务端解出一个乱长度、报 X 错误 16（BadLength）。
+    var body: Buf = buf_new(n + 8);
+    defer { buf_free(&body); }
+    _ = clipx_put_u16(&body, n as u32);
+    _ = clipx_put_u16(&body, 0);
+    _ = buf_append(&body, name, n);
+    var head: [byte: 32] = [0: 32];
+    var extra: Buf = buf_new(64);
+    defer { buf_free(&extra); }
+    if !clipx_call(c, 16, 0, &body, &head[0], &extra) {
+        return 0;
+    }
+    return clipx_le32(clipx_at(&head[0], 8)) as u32;
+}
+
+// ============================================================
+// 建立连接（连 socket + setup 握手）
+// ============================================================
+export fn clipx_connect(c: &ClipxConn) bool {
+    c.fd = -1;
+    c.root = 0;
+    c.rid = 0;
+    c.win = 0;
+    c.big_endian = false;
+    var sockpath: Buf = buf_new(64);
+    defer { buf_free(&sockpath); }
+    if !clipx_display_socket(&sockpath) {
+        return false;
+    }
+    // display 号（socket 名末尾十进制）——认证要按它配对
+    var num: Buf = buf_new(8);
+    defer { buf_free(&num); }
+    var i: usize = sockpath.len - 1;
+    while i > 0 && sockpath.ptr[i - 1] >= 48 as byte && sockpath.ptr[i - 1] <= 57 as byte {
+        i = i - 1;
+    }
+    _ = buf_append(&num, sockpath.ptr + i, (sockpath.len - 1) - i);
+
+    var sa: [byte: 112] = [0: 112];
+    const salen: usize = clipx_sockaddr_un(sockpath.ptr as &const byte, sockpath.len - 1, &sa[0]);
+    const fd: i32 = sys_socket(1, 1, 0) catch { -1; };   // AF_UNIX, SOCK_STREAM
+    if fd < 0 {
+        return false;
+    }
+    c.fd = fd;
+    c.deadline = clipx_now_ms() + CLIPX_TIMEOUT_MS;
+    // 连接（unix socket 上 connect 通常立即完成；失败直接放弃）
+    if (sys_connect(fd, &sa[0] as *void, salen as u32) catch { -1; }) != 0 {
+        _ = sys_close(fd) catch {};
+        c.fd = -1;
+        return false;
+    }
+    // ---- setup 请求：小端 + 11.0 + auth ----
+    var cookie: Buf = buf_new(64);
+    defer { buf_free(&cookie); }
+    const have_cookie: bool = clipx_auth_cookie(num.ptr as &const byte, num.len, &cookie);
+    var req: Buf = buf_new(64);
+    defer { buf_free(&req); }
+    _ = buf_append_byte(&req, 108);   // 'l' = 小端
+    _ = buf_append_byte(&req, 0);
+    _ = buf_append_byte(&req, 11);    // major
+    _ = buf_append_byte(&req, 0);
+    _ = buf_append_byte(&req, 0);
+    _ = buf_append_byte(&req, 0);
+    const an: usize = if have_cookie { 18 as usize } else { 0 as usize };
+    const adn: usize = if have_cookie { cookie.len } else { 0 as usize };
+    _ = buf_append_byte(&req, (an & (255 as usize)) as byte);
+    _ = buf_append_byte(&req, ((an >> 8) & (255 as usize)) as byte);
+    _ = buf_append_byte(&req, (adn & (255 as usize)) as byte);
+    _ = buf_append_byte(&req, ((adn >> 8) & (255 as usize)) as byte);
+    _ = buf_append_byte(&req, 0);
+    _ = buf_append_byte(&req, 0);
+    if an > 0 {
+        _ = buf_append_cstr(&req, "MIT-MAGIC-COOKIE-1");
+        var p1: usize = ((4 as usize) - (an % (4 as usize))) % (4 as usize);
+        while p1 > 0 {
+            _ = buf_append_byte(&req, 0);
+            p1 = p1 - 1;
+        }
+        _ = buf_append(&req, cookie.ptr as &const byte, cookie.len);
+        var p2: usize = ((4 as usize) - (adn % (4 as usize))) % (4 as usize);
+        while p2 > 0 {
+            _ = buf_append_byte(&req, 0);
+            p2 = p2 - 1;
+        }
+    }
+    if !clipx_write_all(fd, req.ptr as &const byte, req.len) {
+        _ = sys_close(fd) catch {};
+        c.fd = -1;
+        return false;
+    }
+    // ---- setup 应答 ----
+    var h8: [byte: 8] = [0: 8];
+    if !clipx_read_exact(c, &h8[0], 8) {
+        _ = sys_close(fd) catch {};
+        c.fd = -1;
+        return false;
+    }
+    if h8[0] != 1 as byte {
+        // 0 = 认证失败/拒绝（没有 cookie 时可能撞上）
+        _ = sys_close(fd) catch {};
+        c.fd = -1;
+        return false;
+    }
+    const extra_units: usize = clipx_le16(clipx_at(&h8[0], 6)) as usize;
+    const rest_len: usize = extra_units * 4;
+    var rest: Buf = buf_new(rest_len + 8);
+    defer { buf_free(&rest); }
+    if !buf_reserve(&rest, rest_len) {
+        _ = sys_close(fd) catch {};
+        c.fd = -1;
+        return false;
+    }
+    if !clipx_read_exact(c, rest.ptr, rest_len) {
+        _ = sys_close(fd) catch {};
+        c.fd = -1;
+        return false;
+    }
+    rest.len = rest_len;
+    const p: &const byte = rest.ptr as &const byte;
+    // 布局：release(4) rid_base(4) rid_mask(4) motion(4) vendor_len(2) max_req(2)
+    //       num_screens(1) num_formats(1) ... vendor(pad4) formats(8 each) screens
+    c.rid = clipx_le32(clipx_at(p, 4)) as u32;
+    const vlen: usize = clipx_le16(clipx_at(p, 16)) as usize;
+    const nfmt: usize = p[21] as usize;
+    const off: usize = 32 + ((vlen + 3) / 4) * 4 + nfmt * 8;
+    if off + 4 > rest_len {
+        _ = sys_close(fd) catch {};
+        c.fd = -1;
+        return false;
+    }
+    c.root = clipx_le32(clipx_at(p, off)) as u32;
+    return true;
+}
+
+export fn clipx_close(c: &ClipxConn) void {
+    if c.fd >= 0 {
+        _ = sys_close(c.fd) catch {};
+        c.fd = -1;
+    }
+}
+
+// ============================================================
+// 选区读取
+// ============================================================
+
+// GetProperty（delete=false 时保留属性；这里一律 delete=true）。
+// 按 bytes_after 循环取完。返回 false = 协议错。
+fn clipx_getprop(c: &ClipxConn, win: u32, prop: u32, out: &Buf, fmt_out: &u32) bool {
+    buf_reset(out);
+    fmt_out[0] = 0;
+    var guard: i32 = 0;
+    while guard < 4096 {
+        guard = guard + 1;
+        clipx_arm(c);
+        // GetProperty 的体布局：window(4) property(4) type(4) long-offset(4) long-length(4)
+        //   —— **没有** delete 字段：`delete` 走请求头的 data 字节。
+        // 我第一版把 delete 塞进了体里，于是服务端把 window 解成了 delete、其余全错位，
+        // 表现是「读回来永远是空」。
+        var body: Buf = buf_new(20);
+        defer { buf_free(&body); }
+        _ = clipx_put_u32(&body, win);
+        _ = clipx_put_u32(&body, prop);
+        _ = clipx_put_u32(&body, 0);        // type = AnyPropertyType
+        _ = clipx_put_u32(&body, 0);        // long-offset
+        _ = clipx_put_u32(&body, 262144);   // long-length（4 字节单位）
+        var head: [byte: 32] = [0: 32];
+        var extra: Buf = buf_new(1024);
+        defer { buf_free(&extra); }
+        if !clipx_call(c, 20, 1, &body, &head[0], &extra) {   // data=1 → delete=true
+            return false;
+        }
+        // **不**去数 n-items / bytes-after：`extra` 里已经装着正好
+        // `reply_length × 4` 字节的属性值（clipx_read_msg 按应答的 length 字段读的），
+        // 那才是权威长度。我第一版按应答里的 n-items × 单位宽度算，而那个字段在实测
+        // 的应答里两个候选偏移（[16] 给 10、[20] 给 0）都对不上 —— 直接信 length 最稳。
+        // format 只用来判断「是不是 INCR 的 4 字节标记」。
+        const fmt: u32 = head[1] as u32;
+        fmt_out[0] = fmt;
+        const take: usize = extra.len;
+        if take == 0 {
+            return true;    // 空属性 = 没有数据（或增量结束）
+        }
+        if out.len + take > CLIPX_MAX_BYTES {
+            return false;
+        }
+        if !buf_append(out, extra.ptr as &const byte, take) {
+            return false;
+        }
+        return true;
+    }
+    return false;
+}
+
+// ConvertSelection + 等 SelectionNotify；返回属性 atom（0 = 对端拒绝）
+fn clipx_convert(c: &ClipxConn, win: u32, sel: u32, target: u32, prop: u32) u32 {
+    // 每一步重新起算超时：`deadline` 是**每一步**的预算，不是整轮的总预算。
+    // 一开始我把它当成「整次读取的总预算」，于是前面几条握手 + 8 次 InternAtom 花掉
+    // 大半之后，ConvertSelection 一进去就已经过期 —— 表现是「永远等不到 SelectionNotify」。
+    clipx_arm(c);
+    var body: Buf = buf_new(24);
+    defer { buf_free(&body); }
+    _ = clipx_put_u32(&body, win);
+    _ = clipx_put_u32(&body, sel);
+    _ = clipx_put_u32(&body, target);
+    _ = clipx_put_u32(&body, prop);
+    _ = clipx_put_u32(&body, 0);   // time
+    if !clipx_req(c, 24, 0, &body) {
+        return 0;
+    }
+    var tries: i32 = 0;
+    while tries < 256 {
+        tries = tries + 1;
+        clipx_arm(c);
+        var head: [byte: 32] = [0: 32];
+        var extra: Buf = buf_new(64);
+        defer { buf_free(&extra); }
+        if clipx_read_msg(c, &head[0], &extra) < 0 {
+            return 0;
+        }
+        // 事件消息的第 0 字节**就是事件类型**（带 SendEvent 位 0x80）。我第一版把它
+        // 当成「0 = 事件」的老写法，于是去读 head[1] —— 那里永远是 0，SelectionNotify
+        // 一辈子匹配不上（实测日志：`ev first=159 type=0`，159 & 0x7f 正是 31）。
+        // 注意本函数只在**应答之外的任何 32 字节消息**上走到这里：应答由 clipx_call 消费。
+        if (head[0] & 127 as byte) == 31 as byte {
+            // SelectionNotify 的字段：requestor[4] selection[8] target[12] **property[16]** time[20]。
+            // 我第一版读的是 [12]（那是 target），于是拿着一个非属性 atom 去 GetProperty，
+            // 永远取不到数据。
+            return clipx_le32(clipx_at(&head[0], 16)) as u32;
+        }
+    }
+    return 0;
+}
+
+// 取一个 target 的完整数据（含 INCR 增量）。
+// incr_atom = INCR 的 atom（用来识别「先给 INCR 属性、再分块」那条路）。
+fn clipx_read_target(c: &ClipxConn, win: u32, sel: u32, target: u32, prop: u32, incr: u32, out: &Buf) bool {
+    const got: u32 = clipx_convert(c, win, sel, target, prop);
+    if got == 0 {
+        return false;
+    }
+    var fmt: u32 = 0;
+    var first: Buf = buf_new(1024);
+    defer { buf_free(&first); }
+    if !clipx_getprop(c, win, prop, &first, &fmt) {
+        return false;
+    }
+    buf_reset(out);
+    // 类型在应答的 [8..12)：等于 INCR 说明要走增量
+    // （clipx_getprop 没回传 type，所以这里用「首块是 4 字节整数」这个 INCR 的特征来判：
+    //   INCR 属性是一个 u32 = 总字节数，格式 32。更稳的是比对 atom，但那要多回传一个值，
+    //   而本项目里 format=32 且长度 4 的选区数据只可能是 INCR——选区数据本身都是 8 位。）
+    if fmt == 32 && first.len == 4 {
+        if !buf_append(out, first.ptr as &const byte, first.len) {
+            return false;
+        }
+        buf_reset(out);
+        var guard: i32 = 0;
+        while guard < 65536 {
+            guard = guard + 1;
+            clipx_arm(c);
+            var head: [byte: 32] = [0: 32];
+            var extra: Buf = buf_new(64);
+            defer { buf_free(&extra); }
+            if clipx_read_msg(c, &head[0], &extra) < 0 {
+                return out.len > 0;
+            }
+            // PropertyNotify（28）：state=0(NewValue) 且 atom 是我们的属性 ⇒ 取一块
+            // PropertyNotify：事件类型同样在 head[0]（抹掉 SendEvent 位）
+            if (head[0] & 127 as byte) == 28 as byte {
+                const atom: u32 = clipx_le32(clipx_at(&head[0], 4)) as u32;
+                if atom != prop || head[8] != 0 as byte {
+                    continue;
+                }
+                var chunk: Buf = buf_new(1024);
+                defer { buf_free(&chunk); }
+                var cf: u32 = 0;
+                if !clipx_getprop(c, win, prop, &chunk, &cf) {
+                    return out.len > 0;
+                }
+                if chunk.len == 0 {
+                    return true;   // 空块 = 结束
+                }
+                if out.len + chunk.len > CLIPX_MAX_BYTES {
+                    return false;
+                }
+                if !buf_append(out, chunk.ptr as &const byte, chunk.len) {
+                    return false;
+                }
+            }
+        }
+        return out.len > 0;
+    }
+    if !buf_append(out, first.ptr as &const byte, first.len) {
+        return false;
+    }
+    return true;
+}
+
+// TARGETS 列表里有没有某个 atom
+fn clipx_targets_has(c: &ClipxConn, win: u32, sel: u32, targets: u32, prop: u32, want: u32) bool {
+    var list: Buf = buf_new(1024);
+    defer { buf_free(&list); }
+    if !clipx_read_target(c, win, sel, targets, prop, 0, &list) {
+        return false;
+    }
+    var i: usize = 0;
+    while i + 4 <= list.len {
+        if (clipx_le32(clipx_at(list.ptr as &const byte, i)) as u32) == want {
+            return true;
+        }
+        i = i + 4;
+    }
+    return false;
+}
+
+// ============================================================
+// 对外入口：读一次剪贴板
+//
+// kind_out 里是图片的 MIME（文本时为空）。返回 CLIPX_*。
+// **不**在这里做预算判定：那是 imgx 的事，调用方按同一套规则拒绝并给文案。
+// ============================================================
+export fn clipx_paste(out: &Buf, mime_out: &Buf) i32 {
+    buf_reset(out);
+    buf_reset(mime_out);
+    var c: ClipxConn = ClipxConn{ fd: -1, root: 0, rid: 0, win: 0, deadline: 0, big_endian: false };
+    if !clipx_connect(&c) {
+        return CLIPX_NO_X11;
+    }
+    defer { clipx_close(&c); }
+
+    // 自己的 InputOnly 窗口当 requestor（ConvertSelection 的 requestor 必须是真窗口，
+    // 用 root 会被对端拒 —— 实测：拿 root 当 requestor 时永远等不到 SelectionNotify）
+    const win: u32 = c.rid + 4096;
+    var cw: Buf = buf_new(32);
+    defer { buf_free(&cw); }
+    _ = clipx_put_u32(&cw, win);
+    _ = clipx_put_u32(&cw, c.root);
+    _ = clipx_put_u16(&cw, 0);      // x
+    _ = clipx_put_u16(&cw, 0);      // y
+    _ = clipx_put_u16(&cw, 1);      // w
+    _ = clipx_put_u16(&cw, 1);      // h
+    _ = clipx_put_u16(&cw, 0);      // border
+    _ = clipx_put_u16(&cw, 2);      // class = InputOnly
+    _ = clipx_put_u32(&cw, 0);      // visual = CopyFromParent
+    _ = clipx_put_u32(&cw, 2048);   // CWEventMask
+    _ = clipx_put_u32(&cw, 64);     // PropertyChangeMask
+    var head: [byte: 32] = [0: 32];
+    var extra: Buf = buf_new(64);
+    defer { buf_free(&extra); }
+    // CreateWindow 是**无应答**请求（X11 里只有带 reply 的请求才回应答）——
+    // 等应答会一直等到超时。发出去即可；真出错的话，下一条有应答的请求会先把
+    // 那条 X 错误收上来（clipx_call 见到 head[0]==0 就返回 false）。
+    if !clipx_req(&c, 1, 0, &cw) {
+        return CLIPX_ERR;
+    }
+    // Sync（GetInputFocus）：CreateWindow 无应答，但它要是被拒了，那条 X 错误会在
+    // **下一条有应答的请求之前**到达。不同步的话，后面每条请求都会读到错位的一条消息。
+    {
+        var none: Buf = buf_empty();
+        if !clipx_call(&c, 43, 0, &none, &head[0], &extra) {
+            return CLIPX_ERR;
+        }
+    }
+
+    const clip: u32 = clipx_intern(&c, "CLIPBOARD" as &const byte, 9);
+    const targets: u32 = clipx_intern(&c, "TARGETS" as &const byte, 7);
+    const utf8: u32 = clipx_intern(&c, "UTF8_STRING" as &const byte, 11);
+    const png: u32 = clipx_intern(&c, "image/png" as &const byte, 9);
+    const jpg: u32 = clipx_intern(&c, "image/jpeg" as &const byte, 10);
+    const gif: u32 = clipx_intern(&c, "image/gif" as &const byte, 9);
+    const webp: u32 = clipx_intern(&c, "image/webp" as &const byte, 10);
+    const incr: u32 = clipx_intern(&c, "INCR" as &const byte, 4);
+    const prop: u32 = clipx_intern(&c, "UYA_CLIP" as &const byte, 8);
+    if clip == 0 || targets == 0 || utf8 == 0 || prop == 0 {
+        return CLIPX_ERR;
+    }
+    // owner
+    var ob: Buf = buf_new(8);
+    defer { buf_free(&ob); }
+    _ = clipx_put_u32(&ob, clip);
+    if !clipx_call(&c, 23, 0, &ob, &head[0], &extra) {
+        return CLIPX_ERR;
+    }
+    const owner: u32 = clipx_le32(clipx_at(&head[0], 8)) as u32;
+    if owner == 0 {
+        return CLIPX_NONE;
+    }
+
+    // 图片优先（多模态场景下截图比它旁边那段文字更有信息量）
+    if png != 0 && clipx_targets_has(&c, win, clip, targets, prop, png) {
+        if clipx_read_target(&c, win, clip, png, prop, incr, out) && out.len > 0 {
+            _ = buf_append_cstr(mime_out, "image/png");
+            return CLIPX_IMAGE;
+        }
+    }
+    if jpg != 0 && clipx_targets_has(&c, win, clip, targets, prop, jpg) {
+        if clipx_read_target(&c, win, clip, jpg, prop, incr, out) && out.len > 0 {
+            _ = buf_append_cstr(mime_out, "image/jpeg");
+            return CLIPX_IMAGE;
+        }
+    }
+    if gif != 0 && clipx_targets_has(&c, win, clip, targets, prop, gif) {
+        if clipx_read_target(&c, win, clip, gif, prop, incr, out) && out.len > 0 {
+            _ = buf_append_cstr(mime_out, "image/gif");
+            return CLIPX_IMAGE;
+        }
+    }
+    if webp != 0 && clipx_targets_has(&c, win, clip, targets, prop, webp) {
+        if clipx_read_target(&c, win, clip, webp, prop, incr, out) && out.len > 0 {
+            _ = buf_append_cstr(mime_out, "image/webp");
+            return CLIPX_IMAGE;
+        }
+    }
+    // 文本
+    if clipx_read_target(&c, win, clip, utf8, prop, incr, out) && out.len > 0 {
+        return CLIPX_TEXT;
+    }
+    return CLIPX_NONE;
+}
+
+// 一句人话（给 notice 用；调用方拼自己的前后缀）
+export fn clipx_reason(code: i32) &const byte {
+    if code == CLIPX_NO_X11 {
+        return "没有可用的 X11 会话（DISPLAY 未设或连不上），也没有 wl-paste/xclip 这类外部工具" as &const byte;
+    }
+    if code == CLIPX_ERR {
+        return "剪贴板协议读取失败（超时或应答畸形）" as &const byte;
+    }
+    if code == CLIPX_TOO_BIG {
+        return "剪贴板内容超过读取上限（24 MiB）" as &const byte;
+    }
+    if code == CLIPX_NONE {
+        return "剪贴板里没有图片也没有文本" as &const byte;
+    }
+    return "" as &const byte;
+}
