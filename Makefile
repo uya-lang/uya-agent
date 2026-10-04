@@ -57,6 +57,11 @@ codegen-audit: build
 	fi; \
 	echo "codegen-audit: 通过（没有切片描述符强转）"
 
+# P53：**函数表容量**（编译器里写死的 FUNCTION_TABLE_SIZE，无开关）。
+#   本仓已经贴着上限：main 6756 个声明能编过，**再加 1 个函数**就报「函数表容量不足」——
+#   而且增量编译看不出来（缓存），只有 `rm -rf build` 重编才炸，报错点还落在标准库里。
+#   所以「净增函数」的改动一律先清缓存重编一遍（见 README §3 踩坑 84）。
+#   变量与常量不占这个额度，只有函数占；整理手段见踩坑 87。
 selftest: build codegen-audit e2e-config-flags e2e-title e2e-title-cmd e2e-title-auto e2e-mouse e2e-api e2e-steps e2e-permission e2e-sandbox e2e-tasks e2e-goal e2e-sessions e2e-resume-big e2e-diff e2e-ws e2e-model e2e-worktree p30-check
 	UYA_BIN=$(UYA) $(OUT) --selftest
 
@@ -561,6 +566,10 @@ e2e-dsh: build
 #     8) 命令面板里选中 /worktree（ctrl+p → 过滤 → 回车）与裸 /worktree 都要开出动作选择框
 #        （七行 + ✓ 标当前模式）→ ↓ 到 finish → 回车翻出「确认 finish？」→ 再回车
 #        （默认游标是「取消」）什么都不做
+#   P53 起再加一条「浮层全屏」的验收（真终端里的 ctrl+f / F11，判据全是屏幕几何）：
+#     9) /status 开出来是居中框（顶边 > 0 行、左边框 > 0 列）→ ctrl+f 顶到屏幕四边
+#        （顶边第 0 行、左右边框正好 0 与 cols-1、标题带 ` · 全屏`）→ **面板与脚注都还在**、
+#        底边压在面板之上 → F11 关回居中（顶边 > 0 行）→ 再 ctrl+f、esc 关掉浮层
 #   PTY_DUMP=1 会把子进程屏幕打出来（P41 那场会多打两张框的屏幕）；单跑一个场景：
 #     python3 testdata/pty_drive.py --port <假网关端口> --workspace /tmp/ws status-single-step
 p30-check: build

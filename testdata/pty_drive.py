@@ -16,6 +16,9 @@
     baseline             （对照）不做任何输入，只看回显的脚注
     worktree-menu        （P41）命令面板里选中 /worktree 与裸 /worktree 都要开动作选择框；
                          ↓ 到 finish → 回车翻确认框；确认框上按回车（默认游标是「取消」）什么都不做
+    overlay-fullscreen   （P53）浮层全屏：非全屏的 /status 是居中框 → ctrl+f 顶到屏幕四边
+                         （顶边第 0 行、左右边框 0 与 cols-1）且不吃面板/脚注 → F11 关回居中
+                         → 再全屏一次、esc 关掉浮层
 
 只依赖 Python 标准库；解释器把 pty 的输出按「屏幕重建」的方式解析（备用屏幕 + 光标定位）。
 """
@@ -123,6 +126,60 @@ class Screen:
 
     def has(self, s):
         return s in self.text()
+
+    # ---- P53：浮层全屏的判据要读**屏幕几何**（边框在哪一行/列），所以要几个小工具 ----
+
+    def first_border_row(self):
+        """第一个 ╭ 所在行（浮层顶边）；没有返回 None。"""
+        for r, row in enumerate(self.buf):
+            if "".join(row).find("╭") >= 0:
+                return r
+        return None
+
+    def last_border_row(self):
+        """最后一个 ╰ 所在行（浮层底边）；没有返回 None。"""
+        for r in range(self.rows - 1, -1, -1):
+            if "".join(self.buf[r]).find("╰") >= 0:
+                return r
+        return None
+
+    def border_cols(self):
+        """浮层的 [左边界列, 右边界列]（取**底边**那一行的 ╰ / ╯）。
+
+        为什么用底边而不是顶边：本解释器把每个码点都按**1 列**算（见 feed 的注释），
+        而顶边那一行里有标题的汉字（真终端占 2 列）⇒ 按码点下标量出来的右边框列会
+        **小于**真实列（实测差 6 列）。底边是纯制表符（╰───╯），没有宽字符，下标即列号。
+        """
+        r = self.last_border_row()
+        if r is None:
+            return None
+        row = "".join(self.buf[r])
+        l = row.find("╰")
+        rr = row.find("╯")
+        if l < 0 or rr < 0:
+            return None
+        return [l, rr]
+
+    def row_text(self, r):
+        if r < 0 or r >= self.rows:
+            return ""
+        return "".join(self.buf[r]).rstrip()
+
+    def footer_alive(self):
+        """脚注（最后一行）还在吗：非空、且不是浮层的边框行。
+
+        不按 `ctx ` 之类字段判 —— 那要跑过一轮请求才采得到样（本轮没跑回合，
+        脚注里只有 cwd 与版本号）。判据的语义是「全屏没把脚注吃掉」。
+        """
+        t = self.row_text(self.rows - 1)
+        return len(t) > 0 and "│" not in t and "╯" not in t
+
+    def panel_row(self):
+        """输入面板那一行（占位文案所在行）；没有返回 None。"""
+        for r, row in enumerate(self.buf):
+            if "Ask anything" in "".join(row):
+                return r
+        return None
 
 
 def spawn(port, workspace, extra):
@@ -276,6 +333,27 @@ def suite():
     check(v8.get("menu_closed"), "翻出确认框之后动作选择框还盖着", failures)
     check(v8.get("cancelled"), "确认框上按回车（默认游标是取消）之后框还在", failures)
     all_v["worktree"] = v8
+    # ---- P53：浮层全屏（真终端里的 ctrl+f / F11）----
+    v9 = run_scenario(0, base + "_fullscreen", "overlay-fullscreen")
+    check(v9.get("plain_seen"), "空虚敲 /status 没有开出浮层", failures)
+    check(v9.get("plain_not_fullscreen"),
+          "非全屏的 /status 不是居中框（顶边在第 0 行或左边框在第 0 列）", failures)
+    check(v9.get("fullscreen_mark"), "ctrl+f 之后标题栏没有 ` · 全屏` 标记", failures)
+    check(v9.get("full_at_row0"), "ctrl+f 之后浮层顶边没有顶格（第 0 行）", failures)
+    check(v9.get("full_spans_width"),
+          "ctrl+f 之后浮层左右边框没有占满整行（应当正好是 0 与 cols-1）: %s" % (v9.get("full_cols"),),
+          failures)
+    check(v9.get("panel_alive"), "全屏把输入面板吃掉了（输入行是常驻的打字目标）", failures)
+    check(v9.get("footer_alive"), "全屏把脚注吃掉了", failures)
+    check(v9.get("bottom_above_panel"),
+          "全屏浮层的底边没有压在面板之上（底边 %s / 面板 %s）"
+          % (v9.get("bottom_row"), v9.get("panel_row")), failures)
+    check(v9.get("f11_off"), "F11 没有把全屏关回居中框（顶边 %s）" % (v9.get("f11_top_row"),),
+          failures)
+    check(v9.get("full_again"), "第二次 ctrl+f 没有重新全屏", failures)
+    check(v9.get("closed"), "全屏态下 esc 没有关掉浮层", failures)
+    check(v9.get("border_gone"), "esc 关掉浮层之后方框还留在屏幕上", failures)
+    all_v["fullscreen"] = v9
     print(json.dumps(all_v, ensure_ascii=False, indent=2))
     if failures:
         print("P30/P31 FAIL:")
@@ -290,6 +368,11 @@ def suite():
     print("P41 PASS（/worktree 动作选择框：面板选中 %s ms · 裸命令 %s ms · 确认框 %s ms；"
           "八个动作与 ✓ 都在，确认框默认游标是取消）"
           % (v8.get("palette_ms"), v8.get("menu_ms"), v8.get("confirm_ms")))
+    print("P53 PASS（浮层全屏：非全屏居中（顶边 %s 行）→ ctrl+f 占满整行（边框列 %s、"
+          "顶边 %s 行、底边压在面板 %s 之上、面板与脚注都在）→ F11 关回居中（顶边 %s 行）→"
+          "esc 关掉浮层）"
+          % (v9.get("plain_top_row"), v9.get("full_cols"), v9.get("full_top_row"),
+             v9.get("panel_row"), v9.get("f11_top_row")))
     return 0
 
 
@@ -389,6 +472,58 @@ def _drive(port, workspace, scenario, extra=None):
             type_keys(fd, "第二个任务\r")
             pump(fd, screen, 4.0)
             verdict["second_turn_ok"] = screen.has("SELFTEST_OK")
+        elif scenario == "overlay-fullscreen":
+            # P53：真终端里的浮层全屏（ctrl+f / F11）。判据全是**屏幕几何事实**：
+            #   ① 非全屏的 /status 是居中框（顶边不在第 0 行、左边框不在第 0 列）；
+            #   ② ctrl+f 之后框顶到屏幕四边（第 0 行是 ╭、左右边框在第 0 / cols-1 列）；
+            #   ③ 全屏**不吃**面板与脚注（占位文案与 cwd 都还在），且底边压在面板之上；
+            #   ④ F11 再按一次回到非全屏（框回到居中）；
+            #   ⑤ 全屏态下 esc 关掉浮层之后浮层消失、转录回来。
+            t0 = time.time()
+            type_keys(fd, "/status\r")
+            verdict["plain_ms"] = wait_overlay(fd, screen, t0, 1500)
+            verdict["plain_seen"] = verdict["plain_ms"] is not None
+            pump(fd, screen, 0.3)
+            pt = screen.first_border_row()
+            pc = screen.border_cols()
+            verdict["plain_top_row"] = pt
+            verdict["plain_cols"] = pc
+            verdict["plain_not_fullscreen"] = (pt or 0) > 0 and bool(pc) and pc[0] > 0
+            # ② ctrl+f 全屏
+            tf = time.time()
+            type_keys(fd, "\x06")
+            pump(fd, screen, 0.5)
+            verdict["full_ms"] = round((time.time() - tf) * 1000)
+            ft = screen.first_border_row()
+            fc = screen.border_cols()
+            verdict["full_top_row"] = ft
+            verdict["full_cols"] = fc
+            verdict["fullscreen_mark"] = screen.has("· 全屏")
+            verdict["full_at_row0"] = ft == 0
+            verdict["full_spans_width"] = fc == [0, screen.cols - 1]
+            # ③ 面板 / 脚注仍在，且底边压在面板之上
+            txt = screen.text()
+            verdict["panel_alive"] = "Ask anything" in txt
+            verdict["footer_alive"] = screen.footer_alive()
+            lb = screen.last_border_row()
+            pr = screen.panel_row()
+            verdict["bottom_row"] = lb
+            verdict["panel_row"] = pr
+            verdict["bottom_above_panel"] = lb is not None and pr is not None and lb < pr
+            # ④ F11 关回来（框回到居中）
+            type_keys(fd, "\x1b[23~")
+            pump(fd, screen, 0.5)
+            f11t = screen.first_border_row()
+            verdict["f11_top_row"] = f11t
+            verdict["f11_off"] = (f11t or 0) > 0
+            # ⑤ 再全屏一次，esc 关掉浮层：浮层消失、转录回来
+            type_keys(fd, "\x06")
+            pump(fd, screen, 0.4)
+            verdict["full_again"] = screen.first_border_row() == 0
+            type_keys(fd, "\x1b")
+            pump(fd, screen, 0.6)
+            verdict["closed"] = not screen.has(OVERLAY_TITLE)
+            verdict["border_gone"] = screen.first_border_row() is None
         elif scenario == "worktree-menu":
             # P41：真终端里的 /worktree 动作选择框 + finish 的二次确认。
             # 这一场**不建 worktree**（也不发任何请求）：只验「面板选中或裸命令开出选择框、

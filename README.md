@@ -4,8 +4,8 @@
 多轮 loop 直到给出结论。50 个 `.uya` 文件，**不引入任何 C 代码、`@c_import` 或其它语言**，
 只依赖 Uya 语言与随编译器分发的标准库。
 
-**P0–P52 全部完成**，主线版本串 `p52-paste`。本节之后按能力域分节，各节标题保留对应的阶段号
-（P0…P52）；设计取舍、踩坑记录与逐阶段验收分别见 §3 与 §6，代码地图见 §2。
+**P0–P53 全部完成**，主线版本串 `p53-full`。本节之后按能力域分节，各节标题保留对应的阶段号
+（P0…P53）；设计取舍、踩坑记录与逐阶段验收分别见 §3 与 §6，代码地图见 §2。
 「TUI 里能拖选复制文本」是修复、**不占阶段号**，记踩坑 72（见 §3）。
 本线（P50–P52）做**剪贴板粘贴**：多行文本修好了（踩坑 83）、图片能挂给多模态模型、
 `ctrl+v` / `/paste` 走纯 Uya 的 X11 客户端读剪贴板。
@@ -54,6 +54,8 @@ $ ./build/uya-agent --show-reasoning "在当前工作目录写 p15-demo.txt，�
   斜体 / 删除线 / `code` / 链接），并顺手修掉旧的 markdown-lite「长行静默丢 1–3 个字符」与
   「滚到代码块中间串样式」两处硬伤（见 §6 的 P47 条）；P48 起会话标题**执行中就能改**
   （`/title`、`set_title` 工具、模型自动起标题，TUI 里裸 `/title` 先用 AI 填个草稿再让人改）；
+  **P50 起浮层能全屏**（`ctrl+f` / `F11` / `/fullscreen [on|off]` —— 占满转录区，长 `/status`、
+  `/tasks`、计划审阅与 `/watch` 一屏看全；面板 / 状态区 / 脚注一行不动）；
   踩坑 68 起浮层条目与 reader 折行正文各挂一张行偏移表（取第 i 行 O(1)，会话索引也换成
   O(n log n) 归并）—— 真机 842 个会话下 `/sessions` 打开 1617 → 46 ms、按一次 ↑ 1617 → 10 ms。
 * **能力**：会话落盘可恢复（`--continue` / `--resume` / `/sessions`）；上下文管理（tool 结果
@@ -151,7 +153,7 @@ export UYA_SPLIT_C_DIR=$PWD/build/uyacache      # 多文件 C 缓存别丢在仓
 | `--title-auto` / `--no-title-auto` | 每个新的人类消息之后让**模型起标题**（**默认开**；每次多发一个小请求）；`UYA_AGENT_TITLE_AUTO=0` 同口径；手敲 `/title` 不受它影响 |
 | `--mouse` / `--no-mouse` | TUI 的**鼠标上报**开关（**默认开**，滚轮要靠它）。`--no-mouse` 让终端重新接管拖选 ⇒ **能选中文字复制**（同时失去滚轮翻转录，改用 `ctrl+↑/↓` 或 `pgup/pgdn`）；`UYA_AGENT_MOUSE=0` 同口径，运行中还有 `F2` 与 `/mouse on\|off`（见踩坑 72） |
 | `--color=MODE` | `auto`（默认）/ `always` / `never` / `16` / `256`；`NO_COLOR` 也认 |
-| `--tui-demo` | 打印 TUI 的 home / chat / 运行中 三屏 + 常驻任务块两帧（折叠 / 展开）+ plan 审阅浮窗一帧的纯文本快照后退出（诊断 + 文档）；②屏的正文是 P47 的 markdown 排版基准（标题 / 强调 / 列表 / 引用 / 带语言标签的代码块 / 表格） |
+| `--tui-demo` | 打印 TUI 的 home / chat / 运行中 三屏 + 常驻任务块两帧（折叠 / 展开）+ plan 审阅浮窗一帧 + `/diff` 一帧 + **浮层全屏一帧（P53）** 的纯文本快照后退出（诊断 + 文档）；②屏的正文是 P47 的 markdown 排版基准（标题 / 强调 / 列表 / 引用 / 带语言标签的代码块 / 表格）；本线之前那六屏 **逐字节相同**（只有脚注版本串那一行随版本号变） |
 | `--max-tokens N` | 发送 `max_tokens`（默认不发送） |
 | `--temperature N` | 发送 `temperature`（默认不发送，对齐 DSH） |
 | `--tls-verify=chain\|pin\|none` | TLS 信任策略，默认 `chain`，见第 5 节 |
@@ -200,12 +202,13 @@ src/clipx.uya      P52 剪贴板（纯 Uya 的 X11 客户端）：DISPLAY/Xautho
 src/tty.uya        终端层：termios raw、行编辑器、面板块、标题栈、诊断转义
 src/sigx.uya       信号层：自绑 sigaction、终止信号先还终端、SIGWINCH 置标志
 src/tui.uya        全屏 TUI：帧 diff、转录、浮层、状态区、任务块、翻看、鼠标上报开关（F2 / /mouse）；
+                   P53 浮层全屏（ctrl+f / F11，几何收在 tui_ov_box_w 一处）；
                    条目折行挂行偏移表（取行 O(1)，长条目成帧见 §6 的 P47 条）
 src/mdview.uya     P47 markdown 渲染（纯函数）：块级分类 + 行内强调 + GFM 表格 + 按显示列折行，
                    一次产出「行文本 + 逐字节样式」两份等长缓冲（样式落在字节上 ⇒ 折行/滚动不丢状态）
 src/sigselftest.uya 信号自测轮：sig-abi / sig-basic / sig-term-restore / sig-child-reset
 src/shellselftest.uya bash 进程侧自测：bash-detach / bash-stop-recover / bash-kill-tree
-src/tuiselftest.uya TUI 自测轮：tui-frame / tui-keys / tui-sink / tui-turn / tui-status / tui-cmd / tui-plan / tui-exit / tui-quit / tui-tasks / tui-diff / tui-scroll / tui-pty / tty-title-pty / tui-switch / tui-mouse / tui-md
+src/tuiselftest.uya TUI 自测轮：tui-frame / tui-keys / tui-sink / tui-turn / tui-status / tui-cmd / tui-plan / tui-exit / tui-quit / tui-tasks / tui-diff / tui-scroll / tui-pty / tty-title-pty / tui-switch / tui-mouse / tui-md / tui-full
 src/inbox.uya      输入收件箱：steer（step 边界领取）+ keepInbox
 src/yamlcfg.uya    自带 YAML 子集解析器（`yt_key` 取 map 键名）
 src/modelx.uya     模型目录 P37：settings.yaml → McEntry，只认公布的档位
@@ -392,10 +395,24 @@ src/selftest.uya   mock LLM + 130 轮断言 + --probe
 ### 全屏 TUI（P17）
 
 * TTY 交互默认全屏（`--no-tui` 退回滚动；非 TTY / `--quiet` / 子代理自动退回）；`UYA_AGENT_TUI=0|1`、`--color=auto|always|never|16|256`、`--tui-demo [COLSxROWS]`。
-* 键位：`enter` 发送、`ctrl+j` / `alt+enter` 换行、`esc` 中断、`ctrl+c` 中断（2 秒内再按退出）、`ctrl+d` 退出、`shift+tab` 访问模式、`tab` plan、`ctrl+t` 任务块、`ctrl+p` 面板、**`F2` 切换鼠标上报**（关掉就能拖选复制文本，见踩坑 72 / `/mouse`）。
+* 键位：`enter` 发送、`ctrl+j` / `alt+enter` 换行、`esc` 中断、`ctrl+c` 中断（2 秒内再按退出）、`ctrl+d` 退出、`shift+tab` 访问模式、`tab` plan、`ctrl+t` 任务块、`ctrl+p` 面板、**`F2` 切换鼠标上报**（关掉就能拖选复制文本，见踩坑 72 / `/mouse`）、**`ctrl+f` / `F11` 浮层全屏**（见下面的 P53）。
   P52 起多一条 **`ctrl+v` 贴剪贴板**（`/paste` 同效）：有图就挂附件、有文本就插进输入行。
-* 浮层：命令面板 / 会话列表 / 帮助 / `/status` / `/goal` / `/watch` 跟随 / **现役子代理清单（P46，选中即跟随）** / 访问模式 / bash 批准 / plan 审阅 / **提问弹窗（P43，框宽自适应 P45 + 踩坑 81）**；`/` 触发面板后连 `/` 一起收走。
-* **提问弹窗（P43，`ask_user_question`）**：模型在执行中问问题时弹一个浮窗（标题 = `header`，
+* 浮层：命令面板 / 会话列表 / 帮助 / `/status` / `/goal` / `/watch` 跟随 / **现役子代理清单（P46，选中即跟随）** / 访问模式 / bash 批准 / plan 审阅 / **提问弹窗（P43，框宽自适应 P45 + 踩坑 81）** / **`/title` 输入框（P48）**；`/` 触发面板后连 `/` 一起收走。
+* **浮层全屏（P53，`ctrl+f` / `F11` / `/fullscreen [on|off]`）**：把浮层从「居中的 60/78 列框」
+  放大到**占满转录区**（宽 = 终端列数、高 = 面板之上的全部行、左上角顶格），标题栏挂一个
+  ` · 全屏` 标记；长 `/status`（24 行、非全屏上限 16 行看不全）、`/tasks`、计划审阅与 `/watch`
+  因此能一屏看全。三条刻意的口径：
+  * **只吃转录区**：输入面板、常驻状态区（P18）、脚注一行都不动 —— 输入行是常驻的打字目标
+    （踩坑 66），状态区是「分不清在跑还是卡住」时唯一要看的那一眼。浮层的底边正好压在面板之上。
+  * **按浮层一次性生效**：开浮层时清回非全屏、`esc` 关掉也不残留（与 `g_tui_ov_want_w` 同一条纪律）；
+    没浮层时按 `ctrl+f` 只落一条指路 notice（凭空开一张浮层是隐形副作用）。
+  * **不碰 fail-closed 判据**：`tui_overlay_available()` / `tui_reader_fits()` / 提问弹窗的
+    「太矮就回落输入行」/ `tui_overlay_diff_fits()` 一个字节没动 —— 全屏只改**画出来多大**，
+    不改**能不能画**（审批必须「看不见就不许做」）。`/diff` 本来就占满转录区，全屏态对它无意义。
+  四种形态都认这个键（列表 / reader / ask / input）：全屏键路由在 `tui_ov_key` 的**所有形态分派之前**
+  —— 放到后面的话 reader/ask/input 会把 `ctrl+f` 当「认不出的键」静默吃掉（对照实验见 §6）。
+  `input` 型（`/title`）全屏后仍是 4 行高：单行输入框拉成一屏只会是留白，全屏给它的是**宽度**。
+  滚动模式（`--no-tui`）没有浮层，`/fullscreen` 只回一行说明。
   多题时带 `第 i/共 n 问`）——问题正文、编号选项（`▸ 1) label — description`）、一行
   `✎ 自定义回答`、一行按键提示。键位：`↑/↓`（`tab`/`shift+tab` 同效）移光标、`1-9` 直选、
   `space` 多选勾选（`[x]`）、**直接打字 = 自己回答**、`backspace` 退格、`enter` 提交、`esc`/`ctrl+c`
@@ -793,6 +810,7 @@ src/selftest.uya   mock LLM + 130 轮断言 + --probe
    提交说明读回来**逐字节**比对；读越界会多出后面的字节，断言当场红。
    与踩坑 57/67 同族（「`buf_new` 造的东西必须补 NUL 才能当 C 串用」），
    但这次踩在**函数间的口径契约**上，而不是自测夹具里。
+
 81. **「文本跑出框外」不是宽度算错，是「帧里的一行内部带着换行」**（修复，不占阶段号）：
    用户报「提问的窗口内容很长时没有自适应，而且现在文本会跑出框外」—— 两条症状、三个根因，
    而且**都不是渲染算错**：
@@ -874,6 +892,63 @@ src/selftest.uya   mock LLM + 130 轮断言 + --probe
   `ConvertSelection` 一进去就已过期）。**验收方式**：拿 GTK（`python3-gi`）当 owner、
   我们的客户端当 requestor，真读一次文本与一张 376 字节的 PNG（120×90），再用抓包网关确认
   它在下一条消息里变成 `data:image/png;base64,…`。
+
+
+86. **「看起来还在」不是判据 —— 浮层画过头盖住面板，面板又被补画的帧盖回来**（P53，对照实验抓到的假绿）：
+   浮层全屏的第一版对照实验是「让全屏顺手把面板也吃掉」（高度从转录区 `panel_top` 换成整个
+   `rows`），预期 `tui-full` 当场红 —— 结果**全绿**。根因在帧组装顺序（`tui_build`）：
+   `tui_draw_overlay()` 先画浮层，**之后**紧接着补状态区、面板与脚注
+   （`while g_tui_nrows < g_tui_panel_top …` + `tui_draw_panel_rows`），所以浮层画过头的那几行
+   会被后画的面板**原地覆盖**；屏幕上「Ask anything」那行字照样在，我那条断言
+   `tuis_screen_has("Ask anything")` 于是照样绿。教训：**判据要读几何事实**（底边行号与
+   `panel_top` 的关系），不能读「那行字看起来还在」—— 后者对「画过头 + 被覆盖」这种组合完全无感。
+   修法：把「底边必须正好在 `panel_top - 1`」放进共用的 `tuis_full_frame_ok`（列表 / reader /
+   ask 三种形态一起管，不各写一份），对照实验 ③ 随即红（底边 29 ≠ 26）。与踩坑 65（浮层盖住
+   转录 ⇒ 「结果落进转录」的断言必须先关浮层）同族，都是**屏幕断言的可见性陷阱**。
+   本轮自测自身另外两处翻车也记在这里，都是老坑的新现场：① 用 `buf_new` + `buf_append_*`
+   拼出「第 N 条命令」再去 `tuis_screen_has` 查 —— 裸 malloc 不保证 NUL，`bufx_cstr_len`
+   读到堆尾巴，数出来「可见条目 = 9」（实际 20+），断言假红（踩坑 57/67/77 同族，改用
+   **固定字面量**）；② 断言 `/fullscreen bogus` 的报错 notice 时没先关浮层 —— 浮层盖着转录，
+   那条 notice 在屏幕上根本看不见（踩坑 65 的现场），改成先 `tui_overlay_close()` 再判。
+   还有一处**状态泄漏**（不是判据问题，但同属「只在完整套件里红」那一族，与踩坑 82 相邻）：
+   `tui-full` 的 F 段为调 `agent_cmd_fullscreen` 打开了 headless TUI，收尾只做了 `tuis_reset`
+   （它**关不掉** `g_tui_on`）⇒ 后一轮 `perm-readonly` 里 `ask_approve_action` 走进
+   `if tui_active() && tui_overlay_available()` 那一支（以为有浮层可弹），不再回
+   `no answer channel`，mock 第 1 轮断言 110 当场红 —— 现场看着像权限轮的缺陷。
+   修法是 `tui_headless_enable(false)`（它同时清 `g_tui_on`）；`tui-switch` 的 C 段早就
+   为同一个坑留过注释，本轮又踩了一次：**「只在完整套件里红」先查上一轮留下的全局状态**。
+
+87. **uya 0.10 的「函数表」是固定容量 —— 加函数会让整个仓编不过，而且本仓已经贴着上限**（P53，本轮最大的坑）：
+   浮层全屏的第一版实现很自然：几何收成四个小函数（`tui_ov_w` / `tui_ov_h` / `tui_ov_left` /
+   `tui_ov_top`）、全屏态三个（get / set / toggle）、命令一个、自测五个 —— 一共 12 个新函数。
+   写完全部自测都是绿的（增量 `make build` 用缓存），直到**清掉 `build/uyacache` 重编**：
+   ```
+   /home/winger/uya-0.10/lib/std/http/uyagin_router.uya: 错误: 函数表容量不足，请增大 FUNCTION_TABLE_SIZE
+   ```
+   报错点在**标准库**里，跟我的代码毫无关系 —— 这是编译器里写死的 `FUNCTION_TABLE_SIZE`
+   （无开关、无环境变量、无文档）。实测边界（`make build`、本仓当前规模）：
+   | | 声明数 | 结果 |
+   |---|---|---|
+   | main 原样 | 6756 | 通过 |
+   | main + **1** 个空函数 | 6757 | **红** |
+   | main + 15 个空函数 | 6771 | 红 |
+   | 本仓去掉 15 个函数 | 6745 | 通过 |
+   也就是说 **main 当时已经没有余量了**：任何一条线只要净增函数就让 `make build` 从干净缓存起
+   必红。变量与常量**不占**这个额度（实测 +40 个 `const` / `+20` 个 `var` 都不红），
+   只有函数占。
+   教训三条：① **增量编译的绿不算绿** —— 这类容量上限只有「删掉缓存重编」才暴露，
+   所以改完必须 `rm -rf build && make build` 走一遍（本轮就是靠这一步才发现的）；
+   ② 报错点可能在**标准库**里（先被编译到的那一批），别顺着报错文件去找原因，
+   要看「声明总数」这个量；③ 整理手段按优先级：**合并语义同族的函数**（get/set/toggle 合成
+   一个带 `want` 参数的）、**就地展开只有一两处调用的转发函数**（`fn f(){ g(); }` 这种）、
+   **顺带删掉仓里现成的零调用死函数**（`tui_repeat` 就是零调用）。
+   本轮的最终形态：几何收成**一个** `tui_ov_box_w(base_w, cap_h, w, h, left, top)`（四个出参），
+   全屏态收成一个 `tui_overlay_full(want)`（`-2` 查询 / `-1` 翻转 / `0` 关 / `>0` 开），
+   `/mouse` 与 `/fullscreen` 合成一个 `agent_cmd_display(line, which)`，自测的两个 helper 合进
+   轮函数 —— 净增函数数压到 **0**（`tui_ov_box_w` 与 `agent_cmd_display` 复用了原有的名字槽位，
+   另删掉 `tui_putn` / `tui_repeat` 两个死转发）。
+
+=======
 ---
 
 ## 4. 工具实现要点
@@ -1072,6 +1147,8 @@ DEEPSEEK_API_KEY=sk-xxx ./build/uya-agent \
 | `watch-e2e` | `make e2e-watch`：真终端 + 假网关派一个「先思考、再跑 `sleep 8` bash」的子代理，`/watch sub-1` 后 `[step …]` 与 `▸ bash …` 必须**在子代理结束之前**上屏 |
 | `watch-pick-parse` | P46 现役清单行 → 编号（纯函数）：`  sub-12 [running] …` 整段取两位数、标签里的 `sub-3` 不抢先、表头的 `sub-N`（N 不是数字）与空态行都不认、认出的编号必须能过 `deleg_id_parse` |
 | `tui-watch-pick` | P46 清单浮层的 kind 是自己的 `TUI_OVK_WATCH_LIST`（借 `/tasks` 的 kind ⇒ 回车的结果被静默丢掉）+ 默认游标落在第一个代理行（喂一份带表头的清单给 `agent_watch_list_first_row`）+ 回车交出选中行原文 + 三条失败路都有回执（表头行、刚跑完的编号、`/watch sub-9`）+ 三种落点码 + 带参数的 `/watch` 在只读集合里 |
+| `tui-full` | P53 浮层全屏四组：**A** 非全屏仍是居中框（不顶格、`≤16` 行上限、第 30 项看不见）→ 全屏框 = 转录区（顶边第 0 行、左右边框 0 与 `cols-1`、标题 ` · 全屏`、行偏移表口径的逐行闭合、底边**正好**在 `panel_top-1`）+ 16 行上限解除（第 20 项可见、第 30 项仍不可见）；**B** `ctrl+f`（`0x06`）与 `F11`（`ESC[23~`）都切换，且**四种形态各认一次**（列表 / reader / ask / input）；**C** 不吃面板 / 状态区 / 脚注；**D** 没浮层时只落 notice、全屏态不跨浮层残留、`esc` 关掉后转录回来，终端太矮时 fail-closed 判据不变；**F** `/fullscreen` 四态（裸报状态 / `on` / `off` / 非法值只报错且状态不动、重复 `off` 幂等） |
+| `overlay-fullscreen` | `make p30-check` 第 9 场（真终端 + 假网关）：屏幕几何判据 —— 非全屏顶边 > 0 行且左边框 > 0 列 → `ctrl+f` 后顶边第 0 行、左右边框正好 `0` 与 `cols-1`、标题带 ` · 全屏`、面板与脚注都还在、底边行 < 面板行 → `F11` 关回居中 → 再全屏、`esc` 关掉后方框消失 |
 | `watch-pick-e2e` | `make e2e-watch-pick`：真终端 + 假网关两条腿 —— ①裸 `/watch` → 清单 → **一次回车**开跟随浮层（`[step …]`/`▸ bash …` 仍在子代理结束之前上屏）；②假网关把父代理的收尾按住 12 s，期间敲 `/watch sub-1` 必须**当场**开浮层（屏幕上还没有 `PARENT-DONE-OK`） |
 | `session-log` | 控制字节按字节往返、半条记录 `dropped_tail`、重建历史 |
 | `json-escape` | `0x00…0x1f` 全转义、无裸控制字节、`jw_key` 同规则 |
@@ -1098,7 +1175,8 @@ DEEPSEEK_API_KEY=sk-xxx ./build/uya-agent \
   回车取消，`PTY_DUMP=1` 会把两张框打出来）；
   `make tui-demo` 是排版基准：P47 之前各阶段只差脚注版本串（`p22-tasks` … `p46-wpick`），
   P47 起正文那一屏按新的 markdown 排版变（标题/强调/列表/引用/带语言标签的代码块/表格），
-  脚注仍是版本串那一处。
+  脚注仍是版本串那一处；P53 新增第 ⑦ 屏（浮层全屏）并把前六屏**逐字节**保持不变
+  （非全屏路径一个字节没动，所以这条本身就是「没有回归」的判据）。
 - 只跑子集的开关：`UYA_SELFTEST_TUI_ONLY`、`UYA_SELFTEST_PERM_ONLY=1`（P21+P26）、`UYA_SELFTEST_GOAL_ONLY=1`（P29）、`UYA_SELFTEST_SHELL_ONLY=1`（P38）、`UYA_SELFTEST_PANEL_ONLY=1`（P15+P40，`make panel-selftest`）。
 - 探针：`make probe BASE=https://api.deepseek.com/v1` 期望 HTTP 401 + leaf 指纹。
 
@@ -1173,6 +1251,35 @@ DEEPSEEK_API_KEY=sk-xxx ./build/uya-agent \
   问题正文只画一行。修法与六条防假绿对照实验见 §3 踩坑 81；`tui-ask` 轮新增 A3 段（长/多行/
   缩窗/脏标题/确认浮层/最矮终端六条腿），真 PTY 那条腿改用**长且多行**的问题（首末行都要上屏）。
   `--tui-demo` 与修前逐字节相同（浮层内的排版，demo 不画浮层），版本串不动（修复轮不占号）。
+- P53：**浮层全屏**（`ctrl+f` / `F11` / `/fullscreen [on|off]`）。先把几何收成**唯一来源**
+  （`tui_ov_box_w`，宽/高/左上角四个值一次算出）—— 修前宽/高/左上角在四份绘制里
+  各写了一遍（列表型 / reader / ask / input），全屏要动就得改四处、漏一处就是右边框参差
+  （踩坑 42 那一族）；非全屏路径**逐字节返回本线之前的结果**，所以 `--tui-demo` 的前六屏
+  与本线之前完全一致（本轮新增第 ⑦ 屏 = 全屏的任务报告，是这一屏的排版基准）。
+  全屏的确切含义：宽 = 终端列数、高 = `panel_top`（转录区）、左上角 = (0,0)，**不吃**面板 /
+  状态区 / 脚注 —— 底边正好压在面板之上（`tui-full` 的 A 段把这条写成了**数值**判据）。
+  验收：`make tui-selftest`（新增 `tui-full` 轮，四组）＋ `make p30-check`（新增第 9 场
+  `overlay-fullscreen`，真终端里的屏幕几何判据：非全屏顶边 5 行 → `ctrl+f` 后顶边 0 行、
+  左右边框 [0, 99]、底边 26 < 面板 27 → `F11` 关回顶边 5 行 → 再全屏、`esc` 关掉后方框消失）。
+  **三条防假绿对照实验**（各自单独回退都会让 `tui-full` 红）：
+  ① 让 `tui_ov_box_w` 恒返回基准宽（= 全屏不做宽度）→ 红 **5** 条（右边框没到最后一列）；
+  ② 把全屏键的路由从「所有形态分派之前」挪到 reader/ask/input 三条 `return` **之后** → 红 **12** 条
+  —— 正是「reader/ask/input 各认一次」那三条腿在报「ctrl+f 没有全屏」，证明那个位置是**承重**的
+  （放到后面就只有列表型能全屏，看着像「按键时灵时不灵」）；
+  ③ 让全屏顺手把面板也吃掉（高度用整个 `rows` 而不是转录区）→ 红 1 条（底边 29 ≠ `panel_top-1` = 26）。
+  ⚠ 实验 ③ 第一版是**假绿**：`tui-full` 的 C 段当时只断言「面板那行文字还在」，而帧组装里
+  面板是在浮层**之后**补画的 —— 框画过头盖住面板，面板又被盖回来，屏幕上照样看得到那行字。
+  补上「底边必须正好在 `panel_top-1`」这条数值判据（放进共用的 `tuis_full_frame_ok`，三种形态
+  一起管）当场红。这条教训与踩坑 65 同族：**判据要读事实，不能读「看起来还在」**（详记 §3 踩坑 83）。
+  另有两条本轮自测自身踩的坑与一处状态泄漏，都记进 §3（踩坑 83）。
+  ⚠ **本轮最大的坑不在功能里，在编译器的容量上**：uya 0.10 的「函数表」是固定容量
+  （`FUNCTION_TABLE_SIZE`，写死、无开关），而本仓**已经贴着上限**（main 6756 声明通过 /
+  +1 个函数就红）—— 第一版实现净增 12 个函数，增量 `make build` 全绿，
+  **清掉 `build/uyacache` 重编**才炸（报错点还在标准库里）。最终把净增函数数压到 **0**
+  （几何/全屏态/命令各自合并，外加删掉两个零调用的死转发）。细节与实测边界表见 §3 踩坑 84 ——
+  结论是**改完必须 `rm -rf build && make build` 走一遍**，增量绿不算绿。
+  编号说明：P49 被并行线 `dsh/session-d7d9b709`（残留 worktree 回收）先占了，按「后到的顺延」
+  记成 **P53**，版本串 `p53-full`。
 - P48：会话标题**执行中就能改**（`/title` / `set_title` 工具 / 模型自动起标题）。
   三条语义钉在同一处（`agent_title_set_kind`）：清洗到 80 B（码点边界）、`kind=user` 钉住、
   落一条 `session/title` + 写 `index.jsonl` 的 title + OSC 2；`/title clear` 落一条**空标题**的
@@ -1287,10 +1394,18 @@ DEEPSEEK_API_KEY=sk-xxx ./build/uya-agent \
 * **浮层（P23）**：框高上限 16 行（`↑/↓`、`pgup/pgdn`、`home/end` 滚，标题栏 `↑`/`↓` 是溢出指示）；
   浮层画在转录区上，打开时转录被它盖住，esc 关掉就回来。终端高度不够（`panel_top < 5`）时浮层
   画不出来，由 `tui_overlay_available()` 的 fail-closed 语义管（审批不会「看不见却仍吞键」）。
+* **浮层全屏（P53）只吃转录区**：`ctrl+f` / `F11` 把浮层放大到「终端列数 × `panel_top`」，
+  上限（列表 16 行 / reader 与 ask 20 行）随之解除，但**面板、状态区、脚注不参与** ——
+  不做「盖住整屏」的真全屏，也不做鼠标拖拽缩放、鼠标点击边框、每个形态各自记住全屏偏好
+  （按浮层一次性生效，与 `g_tui_ov_want_w` 同一条纪律）。全屏只改**画出来多大**，
+  不改「画不画得出来」：终端太矮时该回落（提问弹窗回输入行）与 fail-closed（审批）照旧。
+  `input` 型（`/title` 输入框）全屏后仍是 4 行高（单行输入的语义），全屏给它的是宽度。
+  `/diff` 本来就占满转录区，全屏态对它无意义（开 `/diff` 时该态被清掉）。滚动模式（`--no-tui`）
+  没有浮层，`/fullscreen` 只回一行说明；`/fullscreen` 与快捷键都不进历史、不改会话。
 * **TUI 不做**鼠标点击/拖选/选择（滚轮做了，见 P32）、可折叠卡片、分屏、主题切换 UI。
   **图片**自 P50 起能挂给多模态模型（`/image` / `ctrl+v` / `/paste`），但**终端里不渲染**
   —— 屏幕上只有一行占位（格式 + 宽高 + 大小 + 文件名）；也不支持缩放/重编码（纯 Uya 没有
-  编码器，超预算只能拒绝，见踩坑 82）。
+  编码器，超预算只能拒绝，见踩坑 84）。
   但**「选中文字复制」是终端自己的事**：TUI 默认开着鼠标上报（P25，为了滚轮），而鼠标上报
   一开终端的拖选就被我们吃掉 ⇒ 想拖选复制得按 `F2` / `/mouse off` 关掉（或开着时按住 shift
   拖选）—— 关掉之后滚轮不再翻转录，改用 `ctrl+↑/↓` 或 `pgup/pgdn`（见踩坑 72）。
