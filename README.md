@@ -4,10 +4,10 @@
 多轮 loop 直到给出结论。50 个 `.uya` 文件，**不引入任何 C 代码、`@c_import` 或其它语言**，
 只依赖 Uya 语言与随编译器分发的标准库。
 
-**P0–P51 全部完成**，主线版本串 `p51-paste`。本节之后按能力域分节，各节标题保留对应的阶段号
-（P0…P51）；设计取舍、踩坑记录与逐阶段验收分别见 §3 与 §6，代码地图见 §2。
+**P0–P52 全部完成**，主线版本串 `p52-paste`。本节之后按能力域分节，各节标题保留对应的阶段号
+（P0…P52）；设计取舍、踩坑记录与逐阶段验收分别见 §3 与 §6，代码地图见 §2。
 「TUI 里能拖选复制文本」是修复、**不占阶段号**，记踩坑 72（见 §3）。
-本线（P49–P51）做**剪贴板粘贴**：多行文本修好了（踩坑 81）、图片能挂给多模态模型、
+本线（P50–P52）做**剪贴板粘贴**：多行文本修好了（踩坑 83）、图片能挂给多模态模型、
 `ctrl+v` / `/paste` 走纯 Uya 的 X11 客户端读剪贴板。
 
 真机转录节选（`--show-reasoning`；`✻ 思考` 交互模式下先在提示符那一行滚动、块结束才落成一行，
@@ -47,7 +47,7 @@ $ ./build/uya-agent --show-reasoning "在当前工作目录写 p15-demo.txt，�
   写的全屏 TUI（对齐 opencode 观感），P18 的常驻状态区 + 思考实时行、P20/P24 脚注的统计行与
   `ctx` / `cpu` / `内存`、P25 的任务块、P27/P36 的 `/diff` 浮窗、P22 的终端标题；
   P40 起子代理面板的状态行把最新消息**贴尾**显示（`…` + 最新一段）；P41 起 `/worktree` 也是
-  底对齐选择框（七个动作一行一个，`finish`/`discard` 再过一道确认）；P43 起 `ask_user_question`
+  底对齐选择框（P49 起八个动作一行一个，`finish`/`discard` 再过一道确认）；P43 起 `ask_user_question`
   是**提问弹窗**（问题 + 编号选项 + 一行自定义回答，方向键/数字/空格/直接打字作答；P45 起框宽
   按内容自适应，短问题不再撑满 78 列）；**P47 起 TUI 的正文是真正的 markdown 渲染**（块级：
   标题分级 / 引用 / 三种列表 / 任务清单 / 分隔线 / 围栏代码块带语言标签 / GFM 表格；行内：粗体 /
@@ -61,7 +61,9 @@ $ ./build/uya-agent --show-reasoning "在当前工作目录写 p15-demo.txt，�
   `web_search`；子代理一族（`subagent` / `subagent_fork` / `list_agents` / `subagent_output` /
   `send_message` / `interrupt_agent` / `ralph`）；会话目标（`create_goal` / `get_goal` /
   `update_goal`）；workflow（`.ush` 脚本编排 + 钩子代理回父进程）；三级访问模式 + bwrap 内核沙箱；
-  Git worktree 独立工作区（执行 → 合并 → 删除）。
+  Git worktree 独立工作区（执行 → 合并 → 删除），P49 起连带**残留回收**——会话退出时清掉自己
+  那个「干净 + 零提交 + 没人在用」的 worktree，`/worktree reclaim` 扫全仓的 `dsh/*` 残留
+  （目录还在的 + 目录已没的孤儿分支各收一遍；没验完的活一律留着）。
 * **运行**：`make selftest` 完全离线（内置 mock LLM）；`make e2e` 一条命令跑真实网关
   （步数默认不限，`STEPS=N` 可显式熔断）。
 
@@ -161,8 +163,8 @@ export UYA_SPLIT_C_DIR=$PWD/build/uyacache      # 多文件 C 缓存别丢在仓
 REPL / TUI 内的斜杠命令：
 `/help` `/status` `/tasks [open|close|toggle]` `/goal [<objective>|edit <objective>|pause|resume|clear]`
 `/compact` `/plan` `/permission [预设]` `/model [名字]` `/effort [档位]` `/workspace [目录]`
-`/worktree [on|off|start|status|finish|discard|list]`（TUI 里裸命令开**动作选择框**，
-打开就回车 = `status`；`finish`/`discard` 选定后再过一道确认）`/sessions` `/resume <id>` `/new`
+`/worktree [on|off|start|status|finish|discard|list|reclaim]`（TUI 里裸命令开**动作选择框**，
+打开就回车 = `status`；`finish`/`discard` 选定后再过一道确认，`reclaim` 只清确定的垃圾、不确认）`/sessions` `/resume <id>` `/new`
 `/continue` `/diff` `/exit`。
 
 环境变量：`UYA_AGENT_BASE_URL`、`UYA_AGENT_MODEL`、`UYA_AGENT_WORKSPACE`、
@@ -190,10 +192,10 @@ src/httpc.uya      传输层：URL/DNS/TLS、请求构造、leaf 指纹
 src/httpstream.uya 流式传输：只读响应头，body 增量解码
 src/sse.uya        SSE 分帧：字段行、多行 data、空行 dispatch
 src/llm.uya        两种协议归一成 ChatOut（chat/completions 与 /v1/responses）
-src/imgx.uya       P50 图片附件（纯函数）：魔数嗅探 + 尺寸解析（PNG IHDR / JPEG 段链 /
+src/imgx.uya       P51 图片附件（纯函数）：魔数嗅探 + 尺寸解析（PNG IHDR / JPEG 段链 /
                    GIF / WebP 三变体，只读文件头）+ 预算判定 + 内容寻址落盘 + base64 +
                    附件表（路径 + 元数据，JSON 往返）+ 占位文案
-src/clipx.uya      P51 剪贴板（纯 Uya 的 X11 客户端）：DISPLAY/Xauthority 认证 + setup 握手 +
+src/clipx.uya      P52 剪贴板（纯 Uya 的 X11 客户端）：DISPLAY/Xauthority 认证 + setup 握手 +
                    InternAtom/CreateWindow/ConvertSelection/GetProperty（含 INCR）
 src/tty.uya        终端层：termios raw、行编辑器、面板块、标题栈、诊断转义
 src/sigx.uya       信号层：自绑 sigaction、终止信号先还终端、SIGWINCH 置标志
@@ -225,12 +227,13 @@ src/todo.uya       todo_write：整表替换、去重与状态校验；会话级
 src/plan.uya       plan 状态机 + 写闸门 plan_blocks_write + exit_plan_mode
 src/perm.uya       访问模式 P21：read-only / workspace-write / danger-full-access
 src/sandboxx.uya   内核沙箱 P21：bwrap 探测与 profile、不可用 fail closed
-src/askuser.uya    ask_user_question（P43 TUI 弹窗 + P45 框宽自适应 + 三条回落通道）/ ask_approve_action
+src/askuser.uya    ask_user_question（P43 TUI 弹窗 + P45 框宽自适应 + 踩坑 81 长/多行不溢出 + 三条回落通道）/ ask_approve_action
 src/session.uya    会话日志：追加写、索引、崩溃裁剪、sess_open_resume
 src/stats.uya      统计折叠 P20：sessionStats / tokenUsage / StatsLine
 src/procx.uya      进程采样 P20/P24：/proc 算 CPU（USER_HZ=100）与 PSS
 src/gitx.uya       只读跑 git P28：10s 超时、双管道收取
-src/worktreex.uya  Git worktree P37：wt_provision / finish / discard、写闸门
+src/worktreex.uya  Git worktree P37 / 残留回收 P49：wt_provision / finish / discard /
+                   wt_reclaim_own（退出时）· wt_reclaim_scan（目录 + 孤儿分支两遍）、写闸门
 src/gitdiff.uya    /diff 数据模型 P28：status --porcelain -z + diff -U100000 HEAD
 src/diffx.uya      行级 diff（只服务显示）：LCS 60×60、截断
 src/tasks.uya      任务状态 P25：四表折叠成折叠行 / 箱体 / `/tasks` 文本
@@ -306,9 +309,9 @@ src/selftest.uya   mock LLM + 130 轮断言 + --probe
 * `subagent` / `subagent_fork`（继承父已完成轮次），`run_in_background` 默认 true；配套 `list_agents` / `subagent_output`（增量，`wait=true`）/ `send_message` / `interrupt_agent`（SIGKILL）。
 * `ralph` 每轮新会话，报告以 `RALPH: COMPLETE|BLOCKED|CONTINUE` 结尾；`create_goal` / `get_goal` / `update_goal` 落 `<agent_home>/goal.json`。
 
-### 剪贴板粘贴：多行文本 + 图片（P49–P51）
+### 剪贴板粘贴：多行文本 + 图片（P50–P52）
 
-* **多行文本（P49，修复）**：括起粘贴（bracketed paste）以前**从未生效过** ——
+* **多行文本（P50，修复）**：括起粘贴（bracketed paste）以前**从未生效过** ——
   `tui_esc_final` 在内部把状态置成「粘贴中」之后，两个调用点又各补了一句无条件
   `g_tui_esc = 0`，粘贴态被当场冲掉。症状：粘 3 行会**逐行提交**（只留最后一行）、
   粘贴里的 TAB 变成 plan 模式开关。LF 恰好与裸 LF 等价，所以老自测（喂 LF）一直是绿的。
@@ -317,7 +320,7 @@ src/selftest.uya   mock LLM + 130 轮断言 + --probe
 * **输入上限**：65536 → 200000 字节（对齐 `MSG_CONTENT_MAX`），超限**提示一次**而不是静默丢弃。
 * **输入行显示清洗**：输入缓冲保持逐字节原样，但帧里不许出现 ESC/TAB/NUL
   （粘贴带 TAB 的代码时列宽不再错、光标不再与屏幕错开）。
-* **图片（P50）**：`/image <路径>` 或剪贴板贴图把图挂到下一条消息。请求体里是**内联 base64**
+* **图片（P51）**：`/image <路径>` 或剪贴板贴图把图挂到下一条消息。请求体里是**内联 base64**
   （completions 的 `content` 数组 + `image_url`；responses 的 `input_image`）。
   终端不渲染图片，所以每个附件有一行占位（`⎿ 图片 image/png 1024×768 · 512.0 KiB · shot.png`）。
   附件字节**内容寻址**落在 `<agent_home>/attachments/<sha256>.<ext>`，历史与会话日志里只存
@@ -325,7 +328,7 @@ src/selftest.uya   mock LLM + 130 轮断言 + --probe
 * **预算与拒绝**：字节 / 像素两道预算（缺省 8 MiB / 640000 像素）。**纯 Uya 没有图片编码器**
   （stdlib 里没有 zlib/deflate），所以缩不小 —— 超预算只能**明确拒绝**并说清超了多少，
   让人自己压一下再来。当前模型 `input` 不含 `image` 时也直接拒（收了只会让请求 400）。
-* **剪贴板（P51）**：`ctrl+v`（TUI）与 `/paste`（两种模式）。本机没有 `xclip`/`xsel`/`wl-paste`，
+* **剪贴板（P52）**：`ctrl+v`（TUI）与 `/paste`（两种模式）。本机没有 `xclip`/`xsel`/`wl-paste`，
   所以是一个**纯 Uya 的 X11 客户端**（`src/clipx.uya`）：`DISPLAY` 解析 → `~/.Xauthority` 的
   MIT-MAGIC-COOKIE-1 认证 → setup 握手 → `InternAtom` / `CreateWindow`(InputOnly) /
   `GetSelectionOwner` / `ConvertSelection` / `GetProperty`（含大数据的 `INCR` 增量）。
@@ -390,18 +393,20 @@ src/selftest.uya   mock LLM + 130 轮断言 + --probe
 
 * TTY 交互默认全屏（`--no-tui` 退回滚动；非 TTY / `--quiet` / 子代理自动退回）；`UYA_AGENT_TUI=0|1`、`--color=auto|always|never|16|256`、`--tui-demo [COLSxROWS]`。
 * 键位：`enter` 发送、`ctrl+j` / `alt+enter` 换行、`esc` 中断、`ctrl+c` 中断（2 秒内再按退出）、`ctrl+d` 退出、`shift+tab` 访问模式、`tab` plan、`ctrl+t` 任务块、`ctrl+p` 面板、**`F2` 切换鼠标上报**（关掉就能拖选复制文本，见踩坑 72 / `/mouse`）。
-  P51 起多一条 **`ctrl+v` 贴剪贴板**（`/paste` 同效）：有图就挂附件、有文本就插进输入行。
-* 浮层：命令面板 / 会话列表 / 帮助 / `/status` / `/goal` / `/watch` 跟随 / **现役子代理清单（P46，选中即跟随）** / 访问模式 / bash 批准 / plan 审阅 / **提问弹窗（P43，框宽自适应 P45）**；`/` 触发面板后连 `/` 一起收走。
+  P52 起多一条 **`ctrl+v` 贴剪贴板**（`/paste` 同效）：有图就挂附件、有文本就插进输入行。
+* 浮层：命令面板 / 会话列表 / 帮助 / `/status` / `/goal` / `/watch` 跟随 / **现役子代理清单（P46，选中即跟随）** / 访问模式 / bash 批准 / plan 审阅 / **提问弹窗（P43，框宽自适应 P45 + 踩坑 81）**；`/` 触发面板后连 `/` 一起收走。
 * **提问弹窗（P43，`ask_user_question`）**：模型在执行中问问题时弹一个浮窗（标题 = `header`，
-  多题时带 `第 i/共 n 问`）——问题正文一行、编号选项（`▸ 1) label — description`）、一行
+  多题时带 `第 i/共 n 问`）——问题正文、编号选项（`▸ 1) label — description`）、一行
   `✎ 自定义回答`、一行按键提示。键位：`↑/↓`（`tab`/`shift+tab` 同效）移光标、`1-9` 直选、
   `space` 多选勾选（`[x]`）、**直接打字 = 自己回答**、`backspace` 退格、`enter` 提交、`esc`/`ctrl+c`
-  取消这次问答（**不顺带中断回合**）。**框宽自适应内容（P45）**：按「标题 / 问题 / 编号选项 /
-  自定义行」的显示列宽算出内容宽度，夹在 `[34, min(78, 终端宽 − 6)]` 之间 —— 「选哪个？」+ 两个
-  短选项就是紧凑的 34 列，长问题仍到 78 列上限；提示行与自定义占位**不撑框**，框小了按
-  `full → mid → min` 降级改文案（`esc 取消` 这类关键键不会被截掉），计数宽度按最大情形量、
-  光标移动不抖列宽。**只有它在 TUI 里**：终端太矮画不出浮窗时回落输入行问答，
-  滚动模式仍是 `> ` 行式问答，管道 / CI / 子代理仍是 `no answer channel`；
+  取消这次问答（**不顺带中断回合**）。**框宽自适应内容（P45 + 踩坑 81）**：按「标题 / 问题 /
+  编号选项 / 自定义行」的显示列宽算出内容宽度，夹在 `[34, 终端宽 − 6]` 之间 —— 「选哪个？」+ 两个
+  短选项就是紧凑的 34 列，**长问题在宽终端上跟着终端一起变宽**（旧口径写死 78 列）；
+  问题正文**按框宽折行、多行全画**（放不下才在末行补 `…`，行数不够时先让选项窗口留 1 行）；
+  进帧的文本一律**单行清洗**（`\n` → 空格），所以多行问题 / 脏 `header` 不会把方框撑破；
+  提示行与自定义占位**不撑框**，框小了按 `full → mid → min` 降级改文案（`esc 取消` 这类关键键
+  不会被截掉），计数宽度按最大情形量、光标移动不抖列宽。**只有它在 TUI 里**：终端太矮画不出浮窗时
+  回落输入行问答，滚动模式仍是 `> ` 行式问答，管道 / CI / 子代理仍是 `no answer channel`；
   回答语义对齐 DSH：单选有自定义回答就覆盖选项、多选两者都带、什么都不选直接回车 = 空 `selected`（跳过）、
   取消回的是 dismissed 文案（与 `no answer channel` 分开，模型才知道是「人不答」还是「渠道不通」）。
 * 数据流：`tty_write` 变 sink，通道 1/2/3 全进转录、fd 1 不写；帧走 `sys_dup(1)` 私有 fd。
@@ -556,16 +561,43 @@ src/selftest.uya   mock LLM + 130 轮断言 + --probe
 * 档位只认模型公布的键，固定七档 `off`/`minimal`/`low`/`medium`/`high`/`xhigh`/`max`（`none` == `off`）。
 * `reasoningEfforts: false` = 非推理模型，界面不显示 Effort 行；`/effort` 只列公布的档位；`/model <名字>` 直接切，每次选择追一条 `session/model`。
 
-### Git worktree（P37）
+### Git worktree（P37；残留回收 P49）
 
 * 会话在 worktree + 新分支里干活，共享 checkout 只读；`finish` 合并后删 worktree 与分支。
 * 默认值：`baseBranch=''`（探测 `main` → `master` → HEAD）、`branchPrefix='dsh/'`、`worktreeRoot='.git/dsh-worktrees'`。
-* `--worktree` / `--no-worktree`；`/worktree on|off|start|status|finish|discard|list`。
+* `--worktree` / `--no-worktree`；`/worktree on|off|start|status|finish|discard|list|reclaim`。
 * 建：`git worktree add -b dsh/<slug> <repo>/.git/dsh-worktrees/<slug> <base>`（幂等）；不是 git 仓库 ⇒ `phase=skipped`。
 * 写闸门：write/edit 或 bash 的 git 变更子命令落在共享 checkout 被拒，只读放行。
 * `finish` = `add -A` + commit → base → `merge --no-ff` → `worktree remove --force` + `branch -D`；落 `session/worktree`。
 * `finish` 的 `message` 走**工具参数**（JSON）时，`msg` 是 `Buf`、没有 NUL，而 `wt_finish` 按 C 串读它 ——
   两边都必须补 NUL，否则 merge 的提交说明会黏上堆里的旧字节（踩坑 80，回归轮 `worktree-tool-msg`）。
+* **残留回收（P49）**：worktree 只在**显式** finish / discard 时才删，会话直接退出（`/exit`、`ctrl+d`、
+  管道 EOF、信号）不会替你 finish —— 这是对的（没验完的活不该自动合并），但目录与分支会留下
+  （真机实测：一个月攒下 17 个残留 / 129 MiB，另有 25 个没人认领的 `dsh/*` 分支）。所以：
+  * **退出时**只回收**本会话这个**，且必须同时满足四条 —— ① git 说它干净（`status --porcelain`
+    空，`--ignored` 不算：`build/` 之类产物是常态）② 基分支..它这条分支**零提交** ③ 没有活着的
+    进程把它（或子树）当 cwd ④ 本会话不是子代理（子代理共享父的 worktree，它退出绝不能拆父的）。
+    清掉了落一条 `session/worktree`（`action:"reclaim"`）并打一行话；**留着的**（有改动 / 有提交）
+    什么都不说什么都不动 —— 那是没验完的活，留给 `finish` 或人自己决定。
+  * **`/worktree reclaim`**（工具动作同名词）顺手扫整个仓库的 `dsh/*` 残留，逐条报告
+    `reclaimed` / `kept (原因)`；`kept` 的原因就是上面那几条里没过的。只碰 `dsh/*` 的 ——
+    人手工建的 worktree 一根汗毛都不动；`git worktree lock` 过的当「故意留着」跳过。
+  * **两条路**：先按 `git worktree list` 收目录还在的（`reclaimed … at <path>`），再按
+    `git for-each-ref refs/heads/dsh/` 收**孤儿分支** —— 目录被手工删了、或注册被 prune 过之后，
+    分支就成了一条没有 worktree 的孤儿，`worktree list` 再也列不到它（真机实测：清完 14 个目录
+    之后仓库里还躺着 25 条零提交孤儿分支，每一条都是一次没干活的会话留下的）。孤儿分支只有一条
+    判据：**零提交**（tip 是基分支的祖先）；有提交的一律留着（`git branch -D` 是人的事）。
+    顺序有意为之：先收目录（连分支一起删），剩下的孤儿才轮到第二遍。
+  * **判定与删除都交给 git**，我们不自己 `rm` 目录：`worktree remove`（**不带 `--force`**）在
+    有改动/未跟踪文件时会拒，`branch -d`（**不是 `-D`**）在分支有未合并提交时会拒 —— 判据只是
+    「提前判断能不能删」，真删时就算判据写错了也删不掉有内容的东西（两道闸门叠着）。
+    这一点在自测里被**实测**过：把孤儿分支的「零提交」判据改成恒真，分支照样「还在」（git 拒了），
+    所以那一轮的断言不能只查「分支还在」—— 得查报告里**没有** `kept branch …(git refused)`
+    这一行（出现它就说明判据放行了、只是被 git 兜住）。第一版断言正是漏在这点上。
+  * 那四条判据里 ③ 是防「同一个仓库同时开着好几个会话」：别人那个新会话的 worktree 往往正是
+    「刚建好、还什么都没干」—— 最像垃圾，也最不该动（真机 17 个残留里，这种占多数）。
+  * 没做：不做后台/定时清理（只在退出与显式 `reclaim` 时跑）；不自动 finish（合并仍然只由
+    模型或人显式触发）；不碰非 `dsh/*` 分支与其他仓库。
 
 ### 流式协议要点（P1）
 
@@ -657,7 +689,7 @@ src/selftest.uya   mock LLM + 130 轮断言 + --probe
 54. **`p[a: b]` 第二次咬人（第二参当终点）**：`sess_read_meta` 写 `data.ptr[pos: nl]`，小日志静默越过本行、大日志 realloc 走 mmap 读映射尾 SIGSEGV（`rc=139`）；修 `data.ptr[pos: nl - pos]`；验收 `sess-meta-big`。
 55. **「拼在后面的清单」把前缀抹掉**：`mx_levels_into` 开头 `buf_reset(out)`，`/effort bogus` 只剩档位表；函数体不 reset 只追加（out 是调用方的），「没档位就一个字节都不加」写进契约；「返回串」与「往 out 加一段」是两种接口。
 56. **`buf_free(&cfg.X)` 后又读 `provider` 参数（它就是 `cfg.X.ptr`）**：`agent_model_apply` free 后再 append，于是 provider 字段变乱字节；先拷进临时 Buf 再 free（`keep`）；参数可能是 self 视图的收口函数都要先拷贝。
-57. **C 字符串参数：`Buf.ptr` 没有尾 NUL**：`worktreex` 把 `repo_root`/`branch` 等当 argv，git 报 `fatal: cannot change to '...'` 多出半截，用 `wt_nul(&buf)`；`agent_models_ensure` 拼 `$DSH_HOME+"/settings.yaml"` 没补 NUL 导致建目录失败。
+57. **C 字符串参数：`Buf.ptr` 没有尾 NUL**：`worktreex` 把 `repo_root`/`branch` 等当 argv，git 报 `fatal: cannot change to '...'` 多出半截，用 `wt_nul(&buf)`；`agent_models_ensure` 拼 `$DSH_HOME+"/settings.yaml"` 没补 NUL 导致建目录失败。**P49 又踩了同一个形状两次**：`wt_list_into` 把 `g_wt.repo_root` 抄进一个新 `Buf` 时只抄了内容、没抄那个尾 NUL —— `git -C <ptr> worktree list` 于是报「fatal: cannot change to」并**静默**返回「(git worktree list failed)」，`/worktree list` 一直是坏的（真机上只表现为「列不出东西」）；新写的 `reclaim` 动作抄 `repo_root` 时同样漏了。`buf_new` 不做零初始化（`malloc` 原样），所以这类漏 NUL 一定读到堆里上一轮的脏字节 —— 抄路径进新 `Buf` 之后，**只要它要当 argv/路径用，就必须自己补 NUL**。
 58. **`&out` 是「Buf 的指针的指针」**：`out` 参数本就是 `&Buf`，`buf_append(&out,…)` 把栈上描述符当缓冲区首地址 ⇒ 立刻 SIGSEGV；批量正则替换把 25 处输出追加一起改错 —— 改完必须 `make check` + 跑真路径。
 59. **自测要跟真机 DSH 设置隔离**：`agent-presets.default=git-worktree` 与真机 `~/.dsh/settings.yaml` 相同，`--selftest` 每个 fork 子进程都建 worktree，真 PTY 轮整片红；`selftest_main` 开头 `wt_set_on(false); wt_reset();`。
 60. **工具子进程继承父 TTY → 命令树被 job control 停住但显示「运行中」**：fd 0 原样继承，碰终端收 `SIGTTIN`/`SIGTTOU` 整组停住，而 `waitpid(WNOHANG)` 与还在跑同形；改 stdin→`/dev/null`+`setsid()`、waitpid 带 `WUNTRACED`、收尾读 `O_NONBLOCK`。
@@ -724,7 +756,6 @@ src/selftest.uya   mock LLM + 130 轮断言 + --probe
    修法与踩坑 68 逐字同源：折行后 `tui_lineidx_build()` 建表 O(n)，之后取行 O(1)；
    生命周期与 wrap 严格绑定（`tui_entry_init` / `tui_entry_drop_oldest` / `tui_transcript_clear`
    三处都跟着重置，漏一处就是「取行读到上一份内容的偏移」或堆泄漏）。
-
 79. **「后台请求」必须对输入完全透明 —— 否则用户敲的命令会被拼坏**（P48，本轮被自己的验收抓到）：
    自动起标题要发一个**用户没发起**的侧路请求，第一版把它放在回合收尾同步发，于是踩了两个坑：
    ① 它在流式期间照常读键盘（`llm_pump_input`），用户那几秒里敲的字被半路取走 —— `/` 进了我们的
@@ -762,8 +793,48 @@ src/selftest.uya   mock LLM + 130 轮断言 + --probe
    提交说明读回来**逐字节**比对；读越界会多出后面的字节，断言当场红。
    与踩坑 57/67 同族（「`buf_new` 造的东西必须补 NUL 才能当 C 串用」），
    但这次踩在**函数间的口径契约**上，而不是自测夹具里。
-
-81. **「下一个状态」写在被调用方、清零写在调用方 = 整个状态机从未生效**（P49，本轮修）：
+81. **「文本跑出框外」不是宽度算错，是「帧里的一行内部带着换行」**（修复，不占阶段号）：
+   用户报「提问的窗口内容很长时没有自适应，而且现在文本会跑出框外」—— 两条症状、三个根因，
+   而且**都不是渲染算错**：
+   * **① 换行被原样送进「帧里的一行」**。帧的每一行是 `g_tui_text` 里的一段，行与行之间靠
+     **行号表**（`g_tui_rowtab`）分开，不是靠字节里的 `'\n'`；段内再出现 `'\n'`，终端就当换行 ——
+     那一行被拆成两行画出来，**后一行从第 0 列开始**，方框右边框再也对不齐。实测（三行问题）：
+     第 2、3 行整个落在框外，右边框孤零零留在上面。同族两处：问题正文走 `tui_clean_into`
+     （**故意保留 `\n`**，那是给多行正文用的），标题**根本没清洗**（`header` 里的 `\n` 与 ESC
+     原样进帧 —— ESC 还能改写终端状态，「正文层不许有 ESC」的不变量当场破）。
+   * **② 宽度上限被写死**。P45 的自适应把上限钉在 `TUI_ASK_WANT_W = 78`（= reader 的宽度档），
+     于是宽终端上长问题也只画到 78 列就补 `…` —— 「没有自适应」的观感就来自这里。
+   * **③ 问题正文只画一行**。折行/截断只处理第一行，后面的行根本没有位置。
+   修法三件配套：**进帧的文本一律单行清洗**（新增 `tui_clean_line_into`：`'\n'` → 空格，
+82. **自测夹具的路径没补 NUL —— 只在「完整 selftest」里炸**（P49 加孤儿分支轮时被自己的新断言抓到）：
+    `wt_ws_pid` 只往 `Buf` 里写内容、**不补尾 NUL**，而新写的那段把 `wsz.ptr` 直接当 git 的 `-C`
+    参数（C 串）用 ⇒ git 报 `fatal: cannot change to '/tmp/selftest_p37_wt_2300741111-111111111111ce":
+    "/selftest/meta-big/TRUNCuild/…'` —— 路径后面黏的那截，是**前面某轮留在堆里的字节**
+    （`sess-meta-big` 的 TRUNC 标记 + 另一个会话日志路径）。三个「为什么难查」叠在一起：
+    ① 单独跑 `UYA_SELFTEST_MODEL_ONLY=1` 永远绿（堆布局不同，那片内存恰好是 0）；
+    ② 报错文本本身像「路径不存在」而不像「读越界」；③ 我最初把失败原因猜成「前面轮次留下了同名分支」，
+    还照着这个错判去加预清理（无效）。真正定位靠的是：**先让断言把 git 的 stderr 打出来**
+    （原先 `worktree remove` 的返回值被丢弃，只看到一句「它还被 worktree 占着」，看不出为什么），
+    看到那截堆垃圾才认出这是踩坑 57 的形状。修法：这一轮里另备一份带 NUL 的 `wszz`，凡是把 fixture
+    路径当 argv 的地方都用它。教训：**「只在完整套件里红」优先怀疑堆/全局状态，而不是测试顺序**；
+    夹具里的路径缓冲与生产代码同等要求（补 NUL），别因为「它只是个 /tmp 路径」就省。
+   修法三件配套：**进帧的文本一律单行清洗**（新增 `tui_clean_line_into`：`'\n'` → 空格，
+   其余与 `tui_clean_into` 同一份实现、只多一个 `one_line` 开关；ask 型的标题/问题/选项/
+   自定义回答行 + 共享的标题/prompt 槽位都用它）、**上限改成「终端宽 − 6」**（不再写死 78）、
+   **问题按框宽折行并把能放下的行全画出来**（末行被砍时补 `…`；行数预算按框高算，有选项时
+   给选项窗口留至少 1 行）。附带：多选提示的 full 档（76 列）在旧上限下是**死文案**
+   （`body_w ≤ 74` 永远够不着），放开上限后补上这一档。
+   **判据是字节级的**：新增不变量 `tui_rows_have_lf()`（帧里不许有「行内的 `'\n'`」），
+   进 `tuis_scan_rows` 与「无 ESC / 无 NUL」并列；只断言宽度数值会漏掉 ①（宽度算得对、
+   行仍被拆开）。六条防假绿对照实验（全部实测到红再改回）：
+   ① `tui_clean_line_into` 退回不清洗 → `tui-ask`/`tui-frame` 的「行内换行」「方框不闭合」红 5 条；
+   ② 上限退回写死 78 → 四条宽度断言红；③ 正文退回固定 1 行 → headless 与真 PTY 两条
+   「只画了前几行」红；④ 折行缓存永不失效 → 「缩窗后没重折 / 仍按旧宽度折」红 2 条
+   （**这条是第一版测试的漏洞**：起初只测「长问题折行」，缓存失效只在缩窗时才暴露，补了
+   `tui_set_size` 缩窗那一段才逮住）；⑤ 共享槽位不清洗 → `tui-frame` 的确认浮层那两条红
+   （同样是补测之后才有的覆盖）。
+   `--tui-demo` 与修前**逐字节相同**（50391 B：这是浮层内的排版，demo 不画浮层）。
+83. **「下一个状态」写在被调用方、清零写在调用方 = 整个状态机从未生效**（P50，本轮修）：
   括起粘贴（`ESC[200~` … `ESC[201~`）在 TUI 里**一次都没生效过**：`tui_esc_final(c)` 的
   `a == 200` 分支把 `g_tui_esc` 置成 5（粘贴中）之后 `return`，而两个调用点在它返回后又各写了
   一句无条件 `g_tui_esc = 0` —— 状态当场被冲掉。**症状**：粘 3 行 → CR 被当成回车**逐行提交**
@@ -780,7 +851,7 @@ src/selftest.uya   mock LLM + 130 轮断言 + --probe
   且都发生在**自测代码**里，产品代码是对的。教训与 77 相同：长度要么用 `bufx_cstr_len` 求，
   要么当场核对。
 
-82. **纯 Uya 没有图片编码器 ⇒ 图片只能「接受原图」或「明确拒绝」**（P50）：stdlib 里没有
+84. **纯 Uya 没有图片编码器 ⇒ 图片只能「接受原图」或「明确拒绝」**（P51）：stdlib 里没有
   zlib/deflate，也没有 JPEG 编解码，所以**没法缩放或重压**图片。DSH 会把超预算的图重新编码到
   预算内，我们只能拒绝并说清超了多少（「图片像素太多（4032×3024 > 上限 640000 像素）——
   纯 Uya 没有图片编码器，缩不小，请自己压一下再来」）。这条**不是取舍而是事实**，所以预算
@@ -788,7 +859,7 @@ src/selftest.uya   mock LLM + 130 轮断言 + --probe
   （completions 的 `image_url` 对象 / responses 的 `input_image` + `detail`）要用**抓包**核对，
   不能照抄文档（实测网关两种都收，但形状不同）。
 
-83. **X11 协议：五个「差一格」全都会表现成同一个症状 ——「什么都读不到」**（P51）：手写 X11
+85. **X11 协议：五个「差一格」全都会表现成同一个症状 ——「什么都读不到」**（P52）：手写 X11
   客户端时踩到的坑**彼此独立**，但现象全都是「剪贴板读不到」：
   ① `CreateWindow` 是**无应答**请求，等应答会一直等到超时（要用一条有应答的请求做 sync）；
   ② 请求长度字段是「**含头与自己补的 pad** 的 4 字节单位数」，先算 body 的 pad 再加头会少算一格；
@@ -803,8 +874,6 @@ src/selftest.uya   mock LLM + 130 轮断言 + --probe
   `ConvertSelection` 一进去就已过期）。**验收方式**：拿 GTK（`python3-gi`）当 owner、
   我们的客户端当 requestor，真读一次文本与一张 376 字节的 PNG（120×90），再用抓包网关确认
   它在下一条消息里变成 `data:image/png;base64,…`。
-
-
 ---
 
 ## 4. 工具实现要点
@@ -917,7 +986,7 @@ DEEPSEEK_API_KEY=sk-xxx ./build/uya-agent \
 | `tui-access` | chip 三模式、`shift+tab` 只置请求、选 Full access 出确认层；`/status` 真派发、`/help` 开浮层；结果 kind 跨 close 存活（踩坑 44） |
 | `plan-gate` | P26 plan 写闸门真值表 + 全权模式下 write/edit 被拒且 `plan-gate.txt` 不落盘 |
 | `tui-plan` | 审阅浮窗四段：动作/滚动/`Plan approved`/`esc` dismissed；40 列不超宽 |
-| `tui-ask` | P43/P45 提问弹窗五段：① headless 排版与按键（标题/问题/编号选项/`▸`/`✎`/提示/方框闭合/每行 ≤ cols/无 ESC-NUL；`↓`、`1-9` 直选、打字进自定义、`backspace` 退、单选自定义排他、多选 `[x]` 交回两个下标、0 选项只画自定义行、40 列不越界、`esc` 取消）；② 框宽**自适应内容**（短内容缩到下限 34、长问题到上限 78、光标移动不抖列宽、提示与占位按 full→mid→min 退让且 `esc 取消` 不被截、40/30 列终端仍闭合不越界）；③ 终端太矮 `tui_ask_wait` 返回 0（回落输入行，不 fail closed）；④ headless+agent 真调 `ask_user_question`：没人答 = dismissed + 空 `selected`，绝不假装有人答、浮层收干净；⑤ 真 PTY：弹窗把问题原文画上屏（不是输入行那条提示）、`2`+回车后模型收到的工具结果里是第二个选项的 label |
+| `tui-ask` | P43/P45/踩坑 81 提问弹窗六段：① headless 排版与按键（标题/问题/编号选项/`▸`/`✎`/提示/方框闭合/每行 ≤ cols/无 ESC-NUL/**无行内换行**；`↓`、`1-9` 直选、打字进自定义、`backspace` 退、单选自定义排他、多选 `[x]` 交回两个下标、0 选项只画自定义行、40 列不越界、`esc` 取消）；② 框宽**自适应内容**（短内容缩到下限 34、长问题长到终端上限 −6、光标移动不抖列宽、提示与占位按 full→mid→min 退让且 `esc 取消` 不被截、40/30 列终端仍闭合不越界）；③ **长/多行内容不跑出框外**（超长问题折成多行且末行标记上屏、放不下时末行补 `…`、多行问题的 `\n` 折成空格、脏 `header`/ESC 被清洗、多行自定义回答仍在框内、**缩窗后按新宽度重折且每行仍在预算内**、宽终端上多选提示的 full 档真的会用）；④ 终端太矮 `tui_ask_wait` 返回 0（回落输入行，不 fail closed）；⑤ headless+agent 真调 `ask_user_question`：没人答 = dismissed + 空 `selected`，绝不假装有人答、浮层收干净；⑥ 真 PTY：弹窗把**长且多行**的问题首末行都画上屏（不是输入行那条提示）、`2`+回车后模型收到的工具结果里是第二个选项的 label |
 | `tui-ws` | P34 工作区切换：脚注 cwd、`/diff` 标题、运行时上下文注入不上屏、幂等 |
 | `tui-diff` | `/diff` 浮窗：圆角框/两栏/竖线同列；P36 底色与 `n`/`N` 跳转 |
 | `diff-parse` | diff → 行表：MIX/多 hunk/CRLF/TAB/`Binary files`；P36 `gd_next_change` 环绕 |
@@ -930,6 +999,7 @@ DEEPSEEK_API_KEY=sk-xxx ./build/uya-agent \
 | `worktree` | 真 git：建 worktree + `dsh/<slug>`、闸门、`wt_finish` 合并且目录消失 |
 | `worktree-discard` | `wt_discard` 不合并；非仓库 `wt_provision` 判 `SKIPPED` |
 | `worktree-tool-msg` | 踩坑 80：走**真工具入口**带 `message` 的 finish —— `git log -1 --pretty=%s` 读回来的提交说明**逐字节**等于传入的 marker（`wt_finish` 把 `msg` 当 C 串，JSON 解出来的 Buf 没有 NUL 时会读到堆尾巴） |
+| `worktree-reclaim` | P49 残留回收（真 git，逐条对照）：**干净 + 零提交**的清了（目录与分支都没了）；**有未提交改动**的留、**有未合并提交**的留、**有活进程 cwd 在里面**的留（真 `fork`+`chdir`+`exec sleep` 当占用者，杀掉之后同一份扫描又能清掉它 —— 证明判据 ③ 真在判「活着」而不是碰巧被别的原因挡着）；**孤儿分支**（目录已没、`worktree list` 列不到）零提交的清掉、有提交的留（这一条钉的是判据自己：断言查报告里**没有** `kept branch …(git refused)`，否则会被 git 的第二道闸门兜成假绿 —— 第一版就漏在这儿）；`wt_reclaim_own` 清掉自己的空 worktree 后 `phase=DISCARDED` |
 | `tui-model` | `/model` 与 `/effort` 浮层：分组标题、`✓` 只在当前行、只列公布档位 |
 | `ws-tool` | workspace 工具：失败状态不变、日志/索引写入、`/diff` 头短路径 |
 | `diff-git` | 真 git：XY 码/numstat、未跟踪/删除、`gd_refresh`、P36 跨文件跳转 |
@@ -980,12 +1050,12 @@ DEEPSEEK_API_KEY=sk-xxx ./build/uya-agent \
 | `tui-sessions` | `/sessions` 浮层：箱体铺开、默认游标在最后一项、完整 id |
 | `tui-sessions-big` | 踩坑 68：2000 项 —— 取行查表 vs 线性扫描**差分逐字节相同** + 取末项 20000 次的自校准比值（查表 ≪ 扫描）+ 第 0/中/末项文本正确 + home/end/↑/↓ 与 sel_set 自洽 + 列表与 reader 成帧各 < 1 s + 正文层无 ESC/NUL |
 | `tui-model` | P37 `/model`/`/effort` 浮层：按提供方分组、只列公布的档位、反解、非推理模型不开浮层 |
-| `tui-worktree` | P41 `/worktree` 动作选择浮层：标题/七个动作/✓ 标当前模式、反解只认动作行（「取消」不认）、默认游标 = `status`；`finish`/`discard` 选定不生效、先翻确认框（默认游标 = 取消）；**真 git**：确认前 worktree 目录与 phase 一个字节不动、确认后才合并 + 删除 |
+| `tui-worktree` | P41 `/worktree` 动作选择浮层：标题/八个动作/✓ 标当前模式、反解只认动作行（「取消」不认）、默认游标 = `status`；`finish`/`discard` 选定不生效、先翻确认框（默认游标 = 取消）；**真 git**：确认前 worktree 目录与 phase 一个字节不动、确认后才合并 + 删除 |
 | `tui-mouse` | 踩坑 72 鼠标上报开关（`F2` / `/mouse` / `--no-mouse`）：标志位默认开 + `tui_set_mouse` 幂等；`F2` 两种编码（`ESC O Q` / `ESC[12~`）与 `/mouse on·off·非法`；**字节级**进/关/再开/关着进都与开关一致；帮助浮层里有 `F2` 那一条；**真 PTY** 两个方向（默认开必有 `1000h`、`mouse=false` 必无 `1000h`/`1006h`） |
 | `title-cmd` | P48 `/title` 与 `set_title`：清洗（80 B / 码点边界 / 控制序列全丢后为空 ⇒ 报错且标题**不动**）、钉住语义（`user` 置位后自动起标题不跑、`clear` 解锁）、revision 门控（同一条人类消息只生成一次）、落盘事件逐字节（kind 三档 + clear 的**空标题**事件）、索引同步、`set_title` 工具三支（合法/空串/缺键）、工具目录里有它 |
-| `tui-paste` | P49 括起粘贴九段：进/出粘贴态的字节级判据、CR **不许**提交（踩坑 81 的原始症状）、CRLF 折成一个换行、TAB 是字面内容且**帧里**不出现 TAB、粘贴里的 ANSI 序列逐字节保留、收尾标记被切开也认、断流时悬着的 ESC 不吞、上限对齐 200000 且超限有提示、光标列按显示口径（TAB 四个空格）+ **真 PTY** 粘 3 行只提交一次（按会话日志断言） |
-| `img-sniff` | P50 图片纯函数层：**真 PNG 字节**（zlib 压出来的 64×48）读尺寸、GIF87a/89a 小端、JPEG 段链（长度段在前，尺寸不在固定偏移）、WebP 三变体（VP8X/VP8L/VP8 ）、纯文本与截断 PNG 一律拒绝、字节/像素两道预算、内容寻址 id 稳定、base64（长度与 PNG 签名）、附件 JSON 往返（**数字字段** + 坏记录只跳那一项）、占位文案与 B/KiB/MiB 三档 |
-| `clip-parse` | P51 X11 客户端可测部分：`DISPLAY` 五种形态（`:0`/`unix:7`/`host:1.0`/空/畸形）与三种畸形拒绝、**真 Xauthority 字节流**的两条目配对（family 256 + display 号 + MIT-MAGIC-COOKIE-1；不存在的 display 号**不许**回退到别的条目）、失败码文案非空 |
+| `tui-paste` | P50 括起粘贴九段：进/出粘贴态的字节级判据、CR **不许**提交（踩坑 83 的原始症状）、CRLF 折成一个换行、TAB 是字面内容且**帧里**不出现 TAB、粘贴里的 ANSI 序列逐字节保留、收尾标记被切开也认、断流时悬着的 ESC 不吞、上限对齐 200000 且超限有提示、光标列按显示口径（TAB 四个空格）+ **真 PTY** 粘 3 行只提交一次（按会话日志断言） |
+| `img-sniff` | P51 图片纯函数层：**真 PNG 字节**（zlib 压出来的 64×48）读尺寸、GIF87a/89a 小端、JPEG 段链（长度段在前，尺寸不在固定偏移）、WebP 三变体（VP8X/VP8L/VP8 ）、纯文本与截断 PNG 一律拒绝、字节/像素两道预算、内容寻址 id 稳定、base64（长度与 PNG 签名）、附件 JSON 往返（**数字字段** + 坏记录只跳那一项）、占位文案与 B/KiB/MiB 三档 |
+| `clip-parse` | P52 X11 客户端可测部分：`DISPLAY` 五种形态（`:0`/`unix:7`/`host:1.0`/空/畸形）与三种畸形拒绝、**真 Xauthority 字节流**的两条目配对（family 256 + display 号 + MIT-MAGIC-COOKIE-1；不存在的 display 号**不许**回退到别的条目）、失败码文案非空 |
 | `tui-title-input` | P48 标题输入框：预填 AI 建议可见 + 编辑（打字/backspace/delete/←→/home·end/ctrl+u/中间插入，**按码点**不劈汉字）+ enter 采纳交回编辑后的文本 / esc 取消**不算改名** + 太矮回落 0 + 方框逐行闭合 + 窄框不越界 + 运行中 `/title <t>` 进安全集而裸 `/title` 不进 |
 | `title-cmd-e2e` | `make e2e-title-cmd`：行式真二进制的用法串 / 改名回执 / `/status` 的 title 行 / clear / 空标题报错 / `/help` 可查 / 索引与日志落盘 |
 | `title-auto-e2e` | `make e2e-title-auto`：真 PTY + 假网关 —— 自动起标题**多发一次请求**并落 `kind=provider`；`--no-title-auto` 两样都没有；三来源（default/env/cli）与 CLI 优先 |
@@ -1095,6 +1165,14 @@ DEEPSEEK_API_KEY=sk-xxx ./build/uya-agent \
   红 2 条；③提示行改成永不退让重编 → 红 4 条（含老段的「没有按键提示」）；④不夹 `max_w` 重编 →
   红 8 条（含「有行的显示宽度超过终端列数」）。`--tui-demo` 只在脚注版本串那 1 行变化（`p43-ask` →
   `p45-askw`），`tui-ask` 其余三段（太矮回落 / headless dismissed / 真 PTY label 回模型）不受影响。
+  （**后续修正**：P45 那句「长问题 78 列」在本轮被推翻 —— 上限写死 78 是「长内容没有自适应」
+  的根因，现在上限是「终端宽 − 6」；见踩坑 81 与 `tui-ask` 的 A2/A3 两段。）
+- 踩坑 81（修复，不占阶段号）：**提问弹窗的长内容 / 多行内容不再跑出框外**。用户报两条症状
+  （「内容很长时没有自适应」+「文本会跑出框外」），根因三个且都不是渲染算错：内容里的 `\n` 被
+  原样画进「帧里的一行」（终端拆行 ⇒ 后一行从第 0 列开始、右边框错位）、宽度上限写死 78、
+  问题正文只画一行。修法与六条防假绿对照实验见 §3 踩坑 81；`tui-ask` 轮新增 A3 段（长/多行/
+  缩窗/脏标题/确认浮层/最矮终端六条腿），真 PTY 那条腿改用**长且多行**的问题（首末行都要上屏）。
+  `--tui-demo` 与修前逐字节相同（浮层内的排版，demo 不画浮层），版本串不动（修复轮不占号）。
 - P48：会话标题**执行中就能改**（`/title` / `set_title` 工具 / 模型自动起标题）。
   三条语义钉在同一处（`agent_title_set_kind`）：清洗到 80 B（码点边界）、`kind=user` 钉住、
   落一条 `session/title` + 写 `index.jsonl` 的 title + OSC 2；`/title clear` 落一条**空标题**的
@@ -1249,9 +1327,11 @@ DEEPSEEK_API_KEY=sk-xxx ./build/uya-agent \
 * **提问弹窗（P43，框宽自适应 P45）只有「TUI 且浮窗放得下」这一条路**：终端太矮（`panel_top < 6`）
   时回落输入行问答 —— 与审批类浮层**故意不同**（审批是「看不见就不许做」的 fail closed，提问是
   「换个地方问」，回落永远比丢渠道好）；管道 / CI / 子代理仍然只能拿到 `no answer channel`。
-  题目一次只画一题（多题逐题弹、标题带 `第 i/共 n 问`）；问题正文与选项行都是**一行**（超长按显示列
-  截断补 `…`，不做折行/滚动）；框宽随内容在 `[34, min(78, 终端宽−6)]` 之间伸缩，像 DSH / 微信输入框
-  那样「短内容不留白、长内容不爆框」，但**只量内容**（提示行与占位文案降级改词、不撑框）；
+  题目一次只画一题（多题逐题弹、标题带 `第 i/共 n 问`）；问题正文按框宽**折行**（多行全画，
+  放不下才在末行补 `…`；行数预算不够时先让选项窗口留 1 行），选项行仍是**一行**（超长按显示列
+  截断补 `…`）；框宽随内容在 `[34, 终端宽−6]` 之间伸缩，像 DSH / 微信输入框
+  那样「短内容不留白、长内容不爆框」（踩坑 81 起上限不再写死 78），但**只量内容**
+  （提示行与占位文案降级改词、不撑框）；
   一题最多 16 个选项、最多 9 个数字直选键；自定义回答是**单行**（`enter` 提交，
   没有多行输入）；`space` 只在多选且未进入输入态时是勾选（单选时是普通字符）。回答语义对齐 DSH：
   单选自定义回答排他、多选 `selected` 与 `custom` 可同时带、跳过 = 空 `selected`、取消 = dismissed
@@ -1305,13 +1385,28 @@ DEEPSEEK_API_KEY=sk-xxx ./build/uya-agent \
   `agent-presets.default=git-worktree` 会让**每个**新会话都建 worktree，不想要就 `--no-worktree`
   或 `/worktree off`。
 * **`/worktree` 的选择框与二次确认（P41）**：TUI 里裸 `/worktree` 是**底对齐选择框**（与
-  `/permission`、`/model`、`/effort` 同一套观感），七个动作一行一个、`✓` 标当前模式、游标
+  `/permission`、`/model`、`/effort` 同一套观感），八个动作一行一个、`✓` 标当前模式、游标
   **默认停在 `status`** —— 所以「打开就回车」与 P37 的裸命令逐字节同效（老手感不变）；带参数的
   `/worktree on|off|…` 仍是文本命令（与 `/model <名字>` 同一口径）。`finish` / `discard` 会**删掉
   目录与分支**，所以选定不生效、先翻第二道确认框且游标默认停在「取消」（与 Full access 的风险
-  确认同一态度）—— 彩排过：只按回车不会把 worktree 合掉/删掉。动作的执行结果走**滚动模式同一份**
-  文本（`wt_cmd_run`），TUI 里以一条 notice 落进转录，所以两条路的措辞永远一致。这是工具层护栏，
-  不是安全边界：模型自己调 `worktree` 工具走的是同一条 `wt_tool_worktree`，不经过这道确认框。
+  确认同一态度）—— 彩排过：只按回车不会把 worktree 合掉/删掉。`reclaim`（P49）也删目录，但**不翻
+  确认框**：它只清「干净 + 零提交 + 没人在用」的确定垃圾，判据在 worktreex 里、人敲这个动作就是
+  「顺手扫一下」。动作的执行结果走**滚动模式同一份**文本（`wt_cmd_run`），TUI 里以一条 notice
+  落进转录，所以两条路的措辞永远一致。这是工具层护栏，不是安全边界：模型自己调 `worktree` 工具
+  走的是同一条 `wt_tool_worktree`，不经过这道确认框。
+* **残留回收的边界（P49）**：只在**会话退出**与**显式 `/worktree reclaim`** 两处跑，没有后台
+  定时器；退出时回收的那条路**只碰本会话自己的 worktree**（不会顺手扫全仓 —— 那是显式动作），
+  而且**信号退出（SIGTERM/SIGKILL）不跑**（信号处理器里只能做异步信号安全的事，`git` 不在其内，
+  见 `sigx`）—— 那种残留留给下一次 `reclaim` 或下一次同 slug 会话。判据里的「没人在用」扫的是
+  `/proc/*/cwd`，所以**扫不到别的 PID namespace / 别的机器**：容器里回收只认本 namespace 的进程，
+  跨 namespace 的占用者会被当成「没人用」（这是本机工具的既有分界，不额外做跨 namespace 探测）。
+  `git worktree lock` 的当「故意留着」，跳过不报错；清单里出现但目录已经没了的条目走 `prune`。
+* **孤儿分支回收的边界（P49）**：`/worktree reclaim` 的第二遍只认 `refs/heads/dsh/` 前缀下的
+  分支（人在这个仓库里手工建的分支一根汗毛都不动），判据只有「零提交」一条 —— 所以**分不出**
+  「一次没干活的会话留下的」与「人自己从 dsh/xxx 拉出来、还没提交的分支」，两者都会被删。
+  前缀可以改：`WT_BRANCH_PREFIX` 是 `worktreex.uya` 里的常量，换成你自己的私有前缀（例如
+  `me/`）就不会与人的分支撞名。还不做：孤儿分支的「上次活跃时间」判据（`branch -d` 不看你多久
+  没动它）、跨仓库扫描（一次只扫当前工作区所在的那个仓库）、`reflog` 过期清理。
 
 **访问模式、沙箱与 plan**
 
