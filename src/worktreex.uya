@@ -248,6 +248,137 @@ fn wt_detect_base(repo: &const byte, out: &Buf) void {
     }
 }
 
+// 目录项是不是一个 pid（纯数字、非空、不超过 10 位）—— 与 procx 同一口径，
+// 但这里不 import procx（worktreex 只依赖 gitx / bufx，见文件头）。
+fn wt_pid_ok(name: &const byte, n: usize) bool {
+    if n == 0 || n > 10 {
+        return false;
+    }
+    var i: usize = 0;
+    while i < n {
+        const c: byte = name[i];
+        if c < 48 as byte || c > 57 as byte {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+// 扫 /proc：有活着的进程把 path（或它的子树）当成 cwd 吗？
+//   1 = 有；0 = 没有；-1 = 扫不了（/proc 打不开 / 一个 pid 都没枚举到）
+// skip_pid 是「别算它」（传自己的 pid：调用的这一方正 chdir 在里面，不跳的话永远
+// 只能得到「有人在用」—— 退出时回收自己的 worktree 就是这么个场景）。
+//
+// 为什么非要有这条判据：同一个仓库可以**同时开着好几个会话**，别人那个 worktree
+// 很可能正是「刚建好、还什么都没干」—— 那既是最像垃圾的一种，也是最不该动的一种。
+// 只按「干净 + 零提交」判会把它当垃圾清掉（实测这种残留占多数），所以必须再问一句
+// 「还有人在里面吗」。会话一建好就 chdir 进 worktree（agent_worktree_begin），
+// 所以活着的会话在自己的 worktree 里必然读得到这条 cwd。
+// 顺带也就保护了「用户开个终端 cd 进残留目录看一眼」这件事。
+fn wt_any_cwd_under(path: &const byte, pn: usize, skip_pid: i64) i32 {
+    if pn == 0 {
+        return -1;
+    }
+    const dp: &DIR = opendir("/proc" as &const byte);
+    if dp == null {
+        return -1;
+    }
+    defer { _ = closedir(dp); }
+    var pz: Buf = buf_new(64);
+    defer { buf_free(&pz); }
+    var cw: [byte: 4096] = [0: 4096];
+    var saw_pid: bool = false;
+    while true {
+        const de: &Dirent = readdir(dp);
+        if de == null {
+            break;
+        }
+        const nm: &const byte = &de.d_name[0] as &const byte;
+        const ln: usize = bufx_cstr_len(nm);
+        if !wt_pid_ok(nm, ln) {
+            continue;
+        }
+        saw_pid = true;
+        if skip_pid > 0 {
+            const this_pid: i64 = wt_parse_i64(nm, ln);
+            if this_pid == skip_pid {
+                continue;
+            }
+        }
+        buf_reset(&pz);
+        if !buf_append_cstr(&pz, "/proc/") {
+            break;
+        }
+        if !buf_append(&pz, nm, ln) {
+            break;
+        }
+        if !buf_append_cstr(&pz, "/cwd") {
+            break;
+        }
+        if !buf_append_byte(&pz, 0) {
+            break;
+        }
+        const n: isize = sys_readlink(pz.ptr as *const byte, &cw[0], 4096) catch { -1 as isize; };
+        if n <= 0 {
+            continue;   // 进程刚消失 / 不是我们的：跳过
+        }
+        const cn: usize = n as usize;
+        if cn < pn {
+            continue;
+        }
+        if !bufx_mem_eq(&cw[0] as &const byte, path, pn) {
+            continue;
+        }
+        // 注意：cw 是固定 4096 的栈数组，checker 要求下标有明确上界 ——
+        // 所以 pn 在这里显式收窄（pn > 4096 时 cn >= pn 已不成立，走不到这儿）
+        if cn <= pn {
+            return 1;       // 正好就是它（不是子树：路径相等）
+        }
+        if pn < 4096 && cw[pn] == WT_SEP {
+            return 1;
+        }
+    }
+    if !saw_pid {
+        return -1;
+    }
+    return 0;
+}
+
+// 自己的 pid（拿不到就 0 = 「不跳过任何进程」）
+fn wt_self_pid() i64 {
+    const p: i64 = sys_getpid() catch { 0 as i64; };
+    return p;
+}
+
+// 十进制解析（git 的 --count 输出 / /proc 里的 pid；非数字、空 ⇒ 0）
+fn wt_parse_i64(p: &const byte, n: usize) i64 {
+    var v: i64 = 0;
+    var neg: bool = false;
+    var i: usize = 0;
+    if n > 0 && p[0] == 45 as byte {   // '-'
+        neg = true;
+        i = 1;
+    }
+    var seen: bool = false;
+    while i < n {
+        const c: byte = p[i];
+        if c < 48 as byte || c > 57 as byte {
+            break;
+        }
+        seen = true;
+        v = v * 10 + ((c - 48 as byte) as i64);
+        i = i + 1;
+    }
+    if !seen {
+        return 0;
+    }
+    if neg {
+        return 0 - v;
+    }
+    return v;
+}
+
 // worktree 是否已注册（git worktree list --porcelain 里有没有这一条）
 fn wt_registered(repo: &const byte, path: &const byte) bool {
     var av: [&const byte: 8] = [null as &const byte: 8];
@@ -283,6 +414,35 @@ fn wt_registered(repo: &const byte, path: &const byte) bool {
         pos = pos + 1;
     }
     return false;
+}
+
+// 这个工作区属于哪个仓库？（`git rev-parse --show-toplevel`）返回 0 = 成功。
+// 与 wt_provision 里那段同源，只是不带状态副作用 —— `reclaim` 动作要用它。
+export fn wt_repo_of(ws: &const byte, wsn: usize, out: &Buf) i32 {
+    wt_bufs_ensure();
+    buf_reset(out);
+    var wsc: Buf = buf_new(wsn + 1);
+    defer { buf_free(&wsc); }
+    _ = buf_append(&wsc, ws, wsn);
+    _ = buf_append_byte(&wsc, 0);
+    var av: [&const byte: 8] = [null as &const byte: 8];
+    av[0] = "git" as &const byte;
+    av[1] = "-C" as &const byte;
+    av[2] = wsc.ptr as &const byte;
+    av[3] = "rev-parse" as &const byte;
+    av[4] = "--show-toplevel" as &const byte;
+    av[5] = null as &const byte;
+    const rc: i32 = wt_git_line(&av[0], out);
+    if rc != 0 {
+        buf_reset(out);
+        return rc;
+    }
+    if out.len == 0 {
+        return WT_E_ADD;
+    }
+    // git 的 argv 是 C 字符串：调用方大概率马上把它喂回去，先补 NUL
+    wt_nul(out);
+    return 0;
 }
 
 // 建这个会话的 worktree + 分支（幂等：已注册就直接认）。返回 WT_E_*（0 = 成功）。
@@ -811,6 +971,16 @@ export fn wt_finish(msg: &const byte, keep: bool, out: &Buf) i32 {
     } else {
         _ = buf_append_cstr(&cmsg, "chore: session checkpoint");
     }
+    // cmsg 往下是**当 C 串用的**（wt_do_commit / wt_merge_into_base 里都走
+    // bufx_cstr_len + buf_append_cstr）：这里必须自己补 NUL。
+    // 不补的后果实测过（P48）：调用方从 JSON 解出来的 message 没有 NUL，
+    // `bufx_cstr_len` 会一路读到堆尾巴，merge 的提交说明后面黏上 `.rodata` 里的工具
+    // schema（"function","funct1"type":"function",…）——说明被污染，读多少字节还不确定。
+    // ⚠ 不要指望调用方补：这条契约在**本函数**里收口（下一行的默认分支同样受益）。
+    if !buf_append_byte(&cmsg, 0) {
+        _ = buf_append_cstr(out, "error: out of memory\n");
+        return 1;
+    }
     // 有未提交改动才需要这一条 commit（wt_commit_pending 已经 add -A）
     var av: [&const byte: 8] = [null as &const byte: 8];
     av[0] = "git" as &const byte;
@@ -921,6 +1091,13 @@ export fn wt_list_into(out: &Buf) void {
         _ = buf_append_cstr(out, "(no repository is known yet; the worktree mode has not provisioned one)\n");
         return;
     }
+    // repo.ptr 要当 git 的 argv（C 字符串）用：**必须补尾 NUL**。
+    // g_wt.repo_root 自己带一个（provision 里过过 wt_nul），但上面是一次**内容拷贝**，
+    // 新缓冲的尾巴是 malloc 出来的脏字节 —— 实测 `git -C <root> worktree list` 会
+    // 报「fatal: cannot change to '…'」，于是这条路静默返回 "(git worktree list failed)"
+    // （踩坑 57 的同一个形状：C 字符串参数少了 NUL）。
+    _ = buf_append_byte(&repo, 0);
+    repo.len = repo.len - 1;
     var av: [&const byte: 8] = [null as &const byte: 8];
     av[0] = "git" as &const byte;
     av[1] = "-C" as &const byte;
@@ -968,4 +1145,360 @@ export fn wt_list_into(out: &Buf) void {
         _ = buf_append_cstr(out, WT_BRANCH_PREFIX);
         _ = buf_append_cstr(out, "* worktrees remain)\n");
     }
+}
+
+// ============================================================
+// P49：残留 worktree 的回收（会话结束时自动清 + `reclaim` 动作）
+//
+// 为什么需要这一节：worktree 只在**显式** finish / discard 时才删。会话正常退出
+// （/exit、ctrl+d、ctrl+c 两下、管道里读到 EOF、回合异常结束）不会替你 finish ——
+// 这是对的（没验完的活不该被自动合并），但**目录和分支就留在那儿了**：真机一个月
+// 攒下 17 个残留（129 MiB），而且还剩 25 个没人认领的 dsh/* 分支。
+// 于是加一条**保守**的回收：会话退出时只清「本会话建的那个、且确定是垃圾」的那一个。
+//
+// 什么叫「确定是垃圾」——四条**都必须**成立，缺一不动（宁可留着也不误删）：
+//   1) 本进程自己建的那个 READY worktree，或 stale 扫（动作 `reclaim`）时发现的某个残留；
+//   2) git 说它**完全干净**（`git status --porcelain` 空。--ignored 不算 —— build/
+//      这类产物是常态，真机 17 个里 15 个都带 ignored 文件）；
+//   3) 基分支..它这条分支**零提交**（`rev-list --count base..branch` == 0）；
+//   4) 没有任何活着的进程把它（或它的子树）当 cwd（见 wt_any_cwd_under）。
+//
+// 判定与删除**都交给 git**，我们不自己 rm 目录：`git worktree remove`（**不带 --force**）
+// 在目录里有改动/未跟踪文件时会拒绝，`git branch -d`（**不是 -D**）在分支有未合并提交时
+// 会拒绝 —— 这两道是 git 自己的闸门，比我们的判据更硬（判据只是「提前判断能不能删」，
+// 真删的时候就算判据错了也删不掉有内容的东西）。所以 2/3 两条是**快速路径**，
+// 4 是防「同一个仓库同时开着好几个会话」时把邻居正在用的空 worktree 当垃圾。
+// ============================================================
+
+// 这个 worktree 现在能被回收吗？返回 true = 能。reason 收一句给人看的话。
+// base 是基分支（用于第三判据）；wt_path / branch 是这个残留的路径与分支。
+// skip_pid 传给「谁在用」那条判据（退出时回收自己的那个：得把自己排除掉）。
+fn wt_reclaimable(repo: &const byte, wt_path: &const byte, branch: &const byte, base: &const byte,
+        skip_pid: i64, reason: &Buf) bool {
+    buf_reset(reason);
+    // 判据 4 先做：最便宜、也最能挡住「并发会话正在用」
+    const live: i32 = wt_any_cwd_under(wt_path, bufx_cstr_len(wt_path), skip_pid);
+    if live != 0 {
+        _ = buf_append_cstr(reason, "a live process is still inside it");
+        return false;
+    }
+    // 判据 2：git 说它干净吗（不带 --ignored：build/ 之类的产物不算脏）
+    var av: [&const byte: 8] = [null as &const byte: 8];
+    av[0] = "git" as &const byte;
+    av[1] = "-C" as &const byte;
+    av[2] = wt_path;
+    av[3] = "status" as &const byte;
+    av[4] = "--porcelain" as &const byte;
+    av[5] = null as &const byte;
+    var o: Buf = buf_new(8192);
+    defer { buf_free(&o); }
+    if wt_git(&av[0], &o) != 0 {
+        _ = buf_append_cstr(reason, "git status failed in it");
+        return false;
+    }
+    // 跳过 status 输出里的空行（--porcelain 一般没有，但别把它当成「有内容」）
+    var has_entry: bool = false;
+    var pos: usize = 0;
+    while pos < o.len {
+        var nl: usize = o.len;
+        var i: usize = pos;
+        while i < o.len {
+            if o.ptr[i] == 10 as byte {
+                nl = i;
+                break;
+            }
+            i = i + 1;
+        }
+        var e: usize = nl;
+        while e > pos && (o.ptr[e - 1] == 13 as byte || o.ptr[e - 1] == 32 as byte) {
+            e = e - 1;
+        }
+        if e > pos {
+            has_entry = true;
+            break;
+        }
+        if nl >= o.len {
+            break;
+        }
+        pos = nl + 1;
+    }
+    if has_entry {
+        _ = buf_append_cstr(reason, "it has uncommitted or untracked changes");
+        return false;
+    }
+    // 判据 3：基分支..这条分支有没有提交（有 ⇒ 里面有没合并的活，不动）
+    var avc: [&const byte: 10] = [null as &const byte: 10];
+    avc[0] = "git" as &const byte;
+    avc[1] = "-C" as &const byte;
+    avc[2] = repo;
+    avc[3] = "rev-list" as &const byte;
+    avc[4] = "--count" as &const byte;
+    var range: Buf = buf_new(256);
+    defer { buf_free(&range); }
+    _ = buf_append(&range, base, bufx_cstr_len(base));
+    _ = buf_append_cstr(&range, "..");
+    _ = buf_append(&range, branch, bufx_cstr_len(branch));
+    _ = buf_append_byte(&range, 0);
+    avc[5] = range.ptr as &const byte;
+    avc[6] = null as &const byte;
+    var oc: Buf = buf_new(256);
+    defer { buf_free(&oc); }
+    if wt_git(&avc[0], &oc) != 0 {
+        _ = buf_append_cstr(reason, "cannot count its commits");
+        return false;
+    }
+    gitx_trim_nl(&oc);
+    if wt_parse_i64(oc.ptr as &const byte, oc.len) != 0 {
+        _ = buf_append_cstr(reason, "it has commits that are not merged yet");
+        return false;
+    }
+    return true;
+}
+
+// 回收一个残留：`worktree remove`（不带 --force）+ `branch -d`（不是 -D）。
+// 返回 true = 目录与分支都清掉了。任何一步被 git 拒绝都返回 false 且**不假装成功**。
+fn wt_reclaim_one(repo: &const byte, wt_path: &const byte, branch: &const byte, out: &Buf) bool {
+    var av: [&const byte: 8] = [null as &const byte: 8];
+    av[0] = "git" as &const byte;
+    av[1] = "-C" as &const byte;
+    av[2] = repo;
+    av[3] = "worktree" as &const byte;
+    av[4] = "remove" as &const byte;
+    av[5] = wt_path;
+    av[6] = null as &const byte;
+    var o: Buf = buf_new(8192);
+    defer { buf_free(&o); }
+    if wt_git(&av[0], &o) != 0 {
+        // 目录已经手工删了 ⇒ 把注册 prune 掉再继续删分支
+        if !wt_dir_exists(wt_path) {
+            var avp: [&const byte: 8] = [null as &const byte: 8];
+            avp[0] = "git" as &const byte;
+            avp[1] = "-C" as &const byte;
+            avp[2] = repo;
+            avp[3] = "worktree" as &const byte;
+            avp[4] = "prune" as &const byte;
+            avp[5] = null as &const byte;
+            var op: Buf = buf_new(2048);
+            defer { buf_free(&op); }
+            _ = wt_git(&avp[0], &op);
+        } else {
+            _ = buf_append_cstr(out, "    skipped: git refused to remove it (still has changes?)\n");
+            return false;
+        }
+    }
+    var avb: [&const byte: 8] = [null as &const byte: 8];
+    avb[0] = "git" as &const byte;
+    avb[1] = "-C" as &const byte;
+    avb[2] = repo;
+    avb[3] = "branch" as &const byte;
+    avb[4] = "-d" as &const byte;
+    avb[5] = branch;
+    avb[6] = null as &const byte;
+    var ob: Buf = buf_new(4096);
+    defer { buf_free(&ob); }
+    if wt_git(&avb[0], &ob) != 0 {
+        _ = buf_append_cstr(out, "    note: the directory is gone but its branch was kept (git refused to delete it)\n");
+    }
+    return true;
+}
+
+// 目录在不在（C 字符串路径）
+fn wt_dir_exists(path_z: &const byte) bool {
+    var st: FsStat = FsStat{ exists: false, is_dir: false, size: 0, mtime: 0, mtime_nsec: 0 };
+    if !fs_stat(path_z, &st) {
+        return false;
+    }
+    return st.exists && st.is_dir;
+}
+
+// 扫这个仓库里所有 dsh/* 的残留 worktree，能回收的都回收。
+// 只在这个仓库**已知**（repo 非空）时调用；列表来自 `git worktree list --porcelain`。
+// 返回回收掉的个数；out 收逐条报告。
+export fn wt_reclaim_scan(repo: &const byte, out: &Buf) i32 {
+    buf_reset(out);
+    var av: [&const byte: 8] = [null as &const byte: 8];
+    av[0] = "git" as &const byte;
+    av[1] = "-C" as &const byte;
+    av[2] = repo;
+    av[3] = "worktree" as &const byte;
+    av[4] = "list" as &const byte;
+    av[5] = "--porcelain" as &const byte;
+    av[6] = null as &const byte;
+    var o: Buf = buf_new(16384);
+    defer { buf_free(&o); }
+    if wt_git(&av[0], &o) != 0 {
+        _ = buf_append_cstr(out, "error: git worktree list failed\n");
+        return 0;
+    }
+    // 基分支：探测一次（main → master → HEAD），用于「零提交」判据
+    var base: Buf = buf_new(128);
+    defer { buf_free(&base); }
+    wt_detect_base(repo, &base);
+    var basez: Buf = buf_new(base.len + 1);
+    defer { buf_free(&basez); }
+    _ = buf_append(&basez, base.ptr as &const byte, base.len);
+    _ = buf_append_byte(&basez, 0);
+
+    // 按条目切：一个条目的样子是
+    //   worktree <path>\nHEAD <sha>\nbranch refs/heads/<name>\n[\n]
+    // （主 checkout 排第一，且它是**共享 checkout 本身** —— 永远不碰）
+    var path: Buf = buf_new(1200);
+    defer { buf_free(&path); }
+    var branch: Buf = buf_new(256);
+    defer { buf_free(&branch); }
+    var locked: bool = false;
+    var first: bool = true;
+    var pos: usize = 0;
+    var n_reclaimed: i32 = 0;
+    var n_kept: i32 = 0;
+    while pos < o.len {
+        // 读一行
+        var nl: usize = o.len;
+        var i: usize = pos;
+        while i < o.len {
+            if o.ptr[i] == 10 as byte {
+                nl = i;
+                break;
+            }
+            i = i + 1;
+        }
+        var e: usize = nl;
+        while e > pos && e > pos && o.ptr[e - 1] == 13 as byte {
+            e = e - 1;
+        }
+        const ln: usize = e - pos;
+        if ln == 0 {
+            // 空行 = 一个条目结束 → 结算这一条
+            if path.len > 0 && !first {
+                wt_reclaim_consider(repo, &path, &branch, basez.ptr as &const byte, locked, out,
+                    &n_reclaimed, &n_kept);
+            }
+            buf_reset(&path);
+            buf_reset(&branch);
+            locked = false;
+            first = false;
+            if nl >= o.len {
+                break;
+            }
+            pos = nl + 1;
+            continue;
+        }
+        if ln > 9 && bufx_mem_eq(o.ptr + pos, "worktree " as &const byte, 9) {
+            buf_reset(&path);
+            _ = buf_append(&path, o.ptr + pos + 9, ln - 9);
+        } else if ln > 18 && bufx_mem_eq(o.ptr + pos, "branch refs/heads/" as &const byte, 18) {
+            buf_reset(&branch);
+            _ = buf_append(&branch, o.ptr + pos + 18, ln - 18);
+        } else if ln >= 6 && bufx_mem_eq(o.ptr + pos, "locked" as &const byte, 6) {
+            locked = true;
+        }
+        if nl >= o.len {
+            break;
+        }
+        pos = nl + 1;
+    }
+    // 最后一条（porcelain 结尾可能没有空行）
+    if path.len > 0 && !first {
+        wt_reclaim_consider(repo, &path, &branch, basez.ptr as &const byte, locked, out,
+            &n_reclaimed, &n_kept);
+    }
+    if n_reclaimed == 0 {
+        if n_kept == 0 {
+            _ = buf_append_cstr(out, "nothing to reclaim here\n");
+        } else {
+            _ = buf_append_cstr(out, "nothing to reclaim here (residue kept: ");
+            _ = buf_append_i64(out, n_kept as i64);
+            _ = buf_append_cstr(out, ")\n");
+        }
+    } else {
+        _ = buf_append_cstr(out, "reclaimed ");
+        _ = buf_append_i64(out, n_reclaimed as i64);
+        _ = buf_append_cstr(out, " worktree(s)");
+        if n_kept > 0 {
+            _ = buf_append_cstr(out, ", kept ");
+            _ = buf_append_i64(out, n_kept as i64);
+        }
+        _ = buf_append_byte(out, 10);
+    }
+    return n_reclaimed;
+}
+
+// 结算一个 worktree 条目：只碰 dsh/* 的（别人手工建的 worktree 一根汗毛都不动）
+fn wt_reclaim_consider(repo: &const byte, path: &Buf, branch: &Buf, basez: &const byte, locked: bool,
+        out: &Buf, n_reclaimed: &i32, n_kept: &i32) void {
+    const pfx: usize = bufx_cstr_len(WT_BRANCH_PREFIX);
+    if branch.len < pfx || !bufx_mem_eq(branch.ptr as &const byte, WT_BRANCH_PREFIX, pfx) {
+        return;   // 不是我们的分支（主 checkout 也在这一档）
+    }
+    if locked {
+        _ = buf_append_cstr(out, "  kept ");
+        _ = buf_append(out, branch.ptr as &const byte, branch.len);
+        _ = buf_append_cstr(out, " (locked on purpose)\n");
+        n_kept[0] = n_kept[0] + 1;
+        return;
+    }
+    // 路径要 C 字符串版本（git 的 argv 与 fs_stat 都吃 C 串）
+    var pz: Buf = buf_new(path.len + 1);
+    defer { buf_free(&pz); }
+    _ = buf_append(&pz, path.ptr as &const byte, path.len);
+    _ = buf_append_byte(&pz, 0);
+    var bz: Buf = buf_new(branch.len + 1);
+    defer { buf_free(&bz); }
+    _ = buf_append(&bz, branch.ptr as &const byte, branch.len);
+    _ = buf_append_byte(&bz, 0);
+    var why: Buf = buf_new(256);
+    defer { buf_free(&why); }
+    if !wt_reclaimable(repo, pz.ptr as &const byte, bz.ptr as &const byte, basez, 0, &why) {
+        _ = buf_append_cstr(out, "  kept ");
+        _ = buf_append(out, branch.ptr as &const byte, branch.len);
+        _ = buf_append_cstr(out, " (");
+        _ = buf_append(out, why.ptr as &const byte, why.len);
+        _ = buf_append_cstr(out, ")\n");
+        n_kept[0] = n_kept[0] + 1;
+        return;
+    }
+    _ = buf_append_cstr(out, "  reclaimed ");
+    _ = buf_append(out, branch.ptr as &const byte, branch.len);
+    _ = buf_append_cstr(out, " at ");
+    _ = buf_append(out, path.ptr as &const byte, path.len);
+    _ = buf_append_byte(out, 10);
+    if wt_reclaim_one(repo, pz.ptr as &const byte, bz.ptr as &const byte, out) {
+        n_reclaimed[0] = n_reclaimed[0] + 1;
+    } else {
+        n_kept[0] = n_kept[0] + 1;
+    }
+}
+
+// 会话退出时的回收（**保守**：只清本会话这个，且必须过 wt_reclaimable 四条判据）。
+// 返回 true = 真的清掉了（调用方据此决定要不要写日志 / 报告）。
+// 这是「会话没 finish 就退出」这条路的兜底：干了一半的活（有改动或有提交）一律留着。
+export fn wt_reclaim_own(out: &Buf) bool {
+    buf_reset(out);
+    if g_wt.phase != WT_PHASE_READY {
+        return false;
+    }
+    if g_wt.repo_root.len == 0 || g_wt.worktree_path.len == 0 || g_wt.branch.len == 0 {
+        return false;
+    }
+    var why: Buf = buf_new(256);
+    defer { buf_free(&why); }
+    if !wt_reclaimable(g_wt.repo_root.ptr as &const byte, g_wt.worktree_path.ptr as &const byte,
+            g_wt.branch.ptr as &const byte, g_wt.base.ptr as &const byte, wt_self_pid(), &why) {
+        // 留着是有意的：里面还有活（未提交 / 未合并）或还有人在用
+        _ = buf_append_cstr(out, "worktree kept (");
+        _ = buf_append(out, why.ptr as &const byte, why.len);
+        _ = buf_append_cstr(out, "): ");
+        _ = buf_append(out, g_wt.worktree_path.ptr as &const byte, g_wt.worktree_path.len);
+        _ = buf_append_byte(out, 10);
+        return false;
+    }
+    _ = buf_append_cstr(out, "reclaimed the worktree of this session (nothing was committed or left uncommitted): ");
+    _ = buf_append(out, g_wt.worktree_path.ptr as &const byte, g_wt.worktree_path.len);
+    _ = buf_append_byte(out, 10);
+    if !wt_reclaim_one(g_wt.repo_root.ptr as &const byte, g_wt.worktree_path.ptr as &const byte,
+            g_wt.branch.ptr as &const byte, out) {
+        return false;
+    }
+    g_wt.phase = WT_PHASE_DISCARDED;
+    return true;
 }

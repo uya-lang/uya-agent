@@ -32,7 +32,7 @@ TASK ?= 创建 hello.uya，编译并运行它
 export UYA_ROOT
 export UYA_SPLIT_C_DIR := $(CURDIR)/build/uyacache
 
-.PHONY: all check build selftest codegen-audit probe e2e e2e-config e2e-config-flags e2e-title e2e-mouse e2e-api e2e-steps e2e-permission e2e-sandbox e2e-tasks e2e-goal e2e-sessions e2e-resume-big e2e-diff e2e-ws e2e-model e2e-worktree e2e-watch e2e-watch-pick e2e-dsh p30-check tui-demo tui-selftest sess-selftest diff-selftest model-selftest panel-selftest clean shell-selftest
+.PHONY: all check build selftest codegen-audit probe e2e e2e-config e2e-config-flags e2e-title e2e-title-cmd e2e-title-auto e2e-mouse e2e-api e2e-steps e2e-permission e2e-sandbox e2e-tasks e2e-goal e2e-sessions e2e-resume-big e2e-diff e2e-ws e2e-model e2e-worktree e2e-watch e2e-watch-pick e2e-dsh p30-check tui-demo tui-selftest sess-selftest diff-selftest model-selftest panel-selftest clean shell-selftest
 
 all: build
 
@@ -57,7 +57,7 @@ codegen-audit: build
 	fi; \
 	echo "codegen-audit: 通过（没有切片描述符强转）"
 
-selftest: build codegen-audit e2e-config-flags e2e-title e2e-mouse e2e-api e2e-steps e2e-permission e2e-sandbox e2e-tasks e2e-goal e2e-sessions e2e-resume-big e2e-diff e2e-ws e2e-model e2e-worktree p30-check
+selftest: build codegen-audit e2e-config-flags e2e-title e2e-title-cmd e2e-title-auto e2e-mouse e2e-api e2e-steps e2e-permission e2e-sandbox e2e-tasks e2e-goal e2e-sessions e2e-resume-big e2e-diff e2e-ws e2e-model e2e-worktree p30-check
 	UYA_BIN=$(UYA) $(OUT) --selftest
 
 probe: build
@@ -223,9 +223,11 @@ e2e-model: build
 	echo "e2e-model: 通过（目录/能力跟随/目录外只换名字/REPL 报告与切换/非法档位拒/透传标注）"
 
 # P37：Git worktree（离线，真 git）：独立工作区执行 → 合并 → 删除
-#   ① --worktree 开会话：建出 worktree + dsh/<slug> 分支，主检出的文件不受影响；
-#   ② 闸门：往共享 checkout 写文件被拒（并指路 worktree 里的同一相对路径）；
-#   ③ finish：提交 → 合并回 base → **删掉 worktree 与分支**，改动出现在主检出上；
+#   ① --worktree 开会话：会话里真的有 worktree + dsh/<slug> 分支（状态报告里看得见，
+#      而且 `git status` 在它里面跑得通 —— 光有路径说明不了目录真的存在）；
+#   ② P49 残留回收：**没干活**就退出（/exit）⇒ 目录与分支当场回收，一个都不留；
+#   ③ P49 判据：`/worktree reclaim` 只清「确定的垃圾」—— 干净零提交的清了，
+#      带未提交改动的原样留着（那是别人的半成品，不许替他扔）；
 #   ④ --no-worktree / 非仓库：不建（fail soft）。
 #   数「会话建出来的 worktree」时**不要**用 `git worktree list | grep dsh-worktrees`：从 worktree 会话里
 #   跑这轮时，主检出的路径本身就带 `.git/dsh-worktrees/`（CURDIR 在它下面），会把主检出也算进去、数出 2 个
@@ -237,18 +239,33 @@ e2e-worktree: build
 	( cd $$ws && git init -q . && git config user.email t@t && git config user.name t && \
 	  printf 'base\n' > base.txt && git add -A && git commit -qm init ); \
 	run="$(CURDIR)/$(OUT) --no-dsh-config --no-tui --quiet --api-key dummy-key --worktree --no-save"; \
-	: "① 建 worktree（状态报告里要看得见路径与分支）"; \
+	: "① 会话里真有 worktree（路径 + 分支 + git status 在它里面跑得通）"; \
 	out=$$(cd $$ws && printf '/worktree status\n/exit\n' | $$run 2>&1); \
 	echo "$$out" | grep -q "worktree: .*\.git/dsh-worktrees/session-" || { echo "FAIL: /worktree status 没报出 worktree 路径"; echo "$$out"; exit 1; }; \
 	echo "$$out" | grep -q "branch:   dsh/session-" || { echo "FAIL: /worktree status 没报出会话分支"; echo "$$out"; exit 1; }; \
+	echo "$$out" | grep -q "uncommitted: (none)" || { echo "FAIL: 会话里的 worktree 读不到 git status（目录没真建出来？）"; echo "$$out"; exit 1; }; \
+	: "② P49：空跑的会话退出 ⇒ 残留当场回收（目录与分支都不留）"; \
 	n=$$(cd $$ws && git worktree list | tail -n +2 | wc -l); \
-	[ "$$n" = "1" ] || { echo "FAIL: 会话开始没有建出 worktree（数量=$$n）"; exit 1; }; \
+	[ "$$n" = "0" ] || { echo "FAIL: 空跑的会话退出后还留着 worktree（数量=$$n）—— P49 的退出回收没生效"; exit 1; }; \
 	b=$$(cd $$ws && git branch --list 'dsh/*' | wc -l); \
-	[ "$$b" = "1" ] || { echo "FAIL: 没有建出 dsh/* 会话分支（数量=$$b）"; exit 1; }; \
+	[ "$$b" = "0" ] || { echo "FAIL: 空跑的会话退出后还留着 dsh/* 分支（数量=$$b）"; exit 1; }; \
+	: "③ P49：reclaim 只清确定的垃圾（干净零提交清掉 / 带改动留着）"; \
+	( cd $$ws && git worktree add -b dsh/junk .git/dsh-worktrees/junk master >/dev/null 2>&1 && \
+	  git worktree add -b dsh/half .git/dsh-worktrees/half master >/dev/null 2>&1 && \
+	  printf 'half done\n' > .git/dsh-worktrees/half/half.txt ); \
+	out=$$(cd $$ws && printf '/worktree reclaim\n/exit\n' | $$run 2>&1); \
+	echo "$$out" | grep -q "reclaimed dsh/junk" || { echo "FAIL: 干净零提交的残留没被回收"; echo "$$out"; exit 1; }; \
+	echo "$$out" | grep -q "kept dsh/half" || { echo "FAIL: 带改动的残留没被明确留下（要看到 kept 那一行）"; echo "$$out"; exit 1; }; \
+	[ ! -d $$ws/.git/dsh-worktrees/junk ] || { echo "FAIL: 该清的残留目录还在"; exit 1; }; \
+	[ -f $$ws/.git/dsh-worktrees/half/half.txt ] || { echo "FAIL: 带改动的残留被误删了（那是别人的半成品）"; exit 1; }; \
+	[ "$$(cd $$ws && git branch --list 'dsh/half' | wc -l)" = "1" ] || { echo "FAIL: 带改动的残留分支被误删了"; exit 1; }; \
+	[ "$$(cd $$ws && git worktree list | tail -n +2 | wc -l)" = "1" ] || { echo "FAIL: reclaim 之后应当只剩带改动的那一个"; exit 1; }; \
 	: "④ 非仓库 / --no-worktree：不建"; \
 	: "   注意：norepo 必须放在 /tmp —— 放在 build/ 下面它会**继承外层仓库**（git 会往上找）"; \
+	: "   跑完要删掉：不删的话每跑一次 make e2e-worktree 就在 /tmp 里留一个（实测 2 天攒了 62 个）"; \
 	nr=/tmp/selftest_p37_e2e_norepo_$$$$; rm -rf $$nr; mkdir -p $$nr; \
 	out=$$(cd $$nr && printf '/worktree status\n/exit\n' | $$run 2>&1); \
+	rm -rf $$nr; \
 	echo "$$out" | grep -q "not inside a Git repository" || { echo "FAIL: 非仓库目录没有 fail soft"; echo "$$out"; exit 1; }; \
 	[ "$$(cd $$ws && git worktree list | tail -n +2 | wc -l)" = "1" ] || { echo "FAIL: 非仓库那一次把 $$ws 的 worktree 弄丢了"; exit 1; }; \
 	: "④b --no-worktree 明确关"; \
@@ -257,7 +274,7 @@ e2e-worktree: build
 	out=$$(cd $$ws2 && printf '/worktree status\n/exit\n' | $(CURDIR)/$(OUT) --no-dsh-config --no-tui --quiet --api-key dummy-key --no-worktree --no-save 2>&1); \
 	echo "$$out" | grep -q "worktree mode is off" || { echo "FAIL: --no-worktree 没有关掉"; echo "$$out"; exit 1; }; \
 	[ "$$(cd $$ws2 && git worktree list | tail -n +2 | wc -l)" = "0" ] || { echo "FAIL: --no-worktree 还是建了 worktree"; exit 1; }; \
-	echo "e2e-worktree: 通过（建 worktree+分支 / 非仓库 fail soft / --no-worktree 关闭）"
+	echo "e2e-worktree: 通过（会话里真建 worktree / 退出回收残留 / reclaim 只清确定的垃圾 / 非仓库 fail soft / --no-worktree 关闭）"
 
 #   ④ 记录的工作区被删（worktree 合并后就删是常态）→ 留在当前工作区 + 留话 + 记一条 fallback。
 # 会话日志用 python3 手写（格式与 sess_open 逐字节一致）：这一轮**不联网、不用模型**。
@@ -363,6 +380,85 @@ e2e-title:
 	echo "$$out" | grep -q "title = on  (source: cli)" \
 		|| { echo "FAIL: --title 应当压过 UYA_AGENT_TITLE=0"; exit 1; }; \
 	echo "e2e-title: 通过（默认开；--no-title / UYA_AGENT_TITLE 同口径；CLI 优先）"
+
+# P46：会话标题可在执行过程中修改（离线，行式 REPL 走真二进制）
+#
+# 两件事：
+#   ① 命令语义与措辞：/title 的用法串、改名回执、/status 里的 title 行与开关、/title clear、
+#      清洗后为空要报错且**标题不动**、/help 里查得到；
+#   ② 落盘：日志里一条 kind=user 的 session/title、index.jsonl 的 title 就是新值。
+e2e-title-cmd: build
+	@set -e; \
+	home=build/selftest_title_cmd_e2e; rm -rf $$home; mkdir -p $$home; \
+	run="$(CURDIR)/$(OUT) --no-dsh-config --no-tui --quiet --api-key dummy-key --agent-home $$home"; \
+	out=$$(printf '/title\n/title 把中文文件名修好\n/status\n/title clear\n/status\n/title \033[31m\007\n/status\n/help\n/exit\n' | $$run 2>&1); \
+	echo "$$out" | grep -qF "用法：/title <新标题> · /title clear（清回基标题）· 裸 /title 让模型起一个建议" \
+		|| { echo "FAIL: 裸 /title 没有给出用法"; echo "$$out"; exit 1; }; \
+	echo "$$out" | grep -qF "[title] 会话标题已更新：把中文文件名修好" \
+		|| { echo "FAIL: /title <新标题> 没有生效（措辞也不对）"; echo "$$out"; exit 1; }; \
+	echo "$$out" | grep -qF "title=把中文文件名修好 (pinned" \
+		|| { echo "FAIL: /status 里没有新的会话标题（或没标 pinned）"; echo "$$out"; exit 1; }; \
+	echo "$$out" | grep -qF "[title] 已清回基标题" \
+		|| { echo "FAIL: /title clear 没有生效"; exit 1; }; \
+	echo "$$out" | grep -qF "title=(无标题，终端显示基标题)" \
+		|| { echo "FAIL: clear 之后 /status 还挂着标题"; exit 1; }; \
+	echo "$$out" | grep -qF "这个标题清洗后是空的" \
+		|| { echo "FAIL: 清洗后为空的标题没有报错（静默成功最坏）"; exit 1; }; \
+	echo "$$out" | grep -qF "title_auto=on" \
+		|| { echo "FAIL: /status 里没有自动起标题的开关"; exit 1; }; \
+	echo "$$out" | grep -qF "/title [<新标题>|clear]" \
+		|| { echo "FAIL: /help 里没有 /title"; exit 1; }; \
+	grep -qF '"title":"把中文文件名修好"' $$home/index.jsonl \
+		|| { echo "FAIL: 索引里的标题不是新值（/sessions 的标题列会空着）"; exit 1; }; \
+	grep -qF '"source":{"kind":"user"}' $$home/sessions/*/*/session.jsonl \
+		|| { echo "FAIL: 显式改名落的 kind 不是 user"; exit 1; }; \
+	: "clear 之后索引里的标题要被清空（否则 /sessions 还显示旧标题）"; \
+	tail -1 $$home/index.jsonl | grep -qF '"title":""' \
+		|| { echo "FAIL: clear 之后索引里的标题没清空"; exit 1; }; \
+	echo "e2e-title-cmd: 通过（用法/改名回执/status 行/clear/空标题报错/命令表/索引与日志落盘）"
+
+# P46：自动起标题真的发了一次请求、落了 provider 事件（离线；真 PTY + 假网关）
+#
+# 为什么必须真 PTY：自动起标题**只服务交互界面**（管道/CI 上 tty_title_set 本来就是空操作，
+# 为一个看不见的东西多发请求没有道理）—— 所以行式 REPL 那一路它根本不会跑，
+# 这一条只能拿真终端验。驱动脚本内联在这里（不新增 testdata 脚本）：pty.fork 起真二进制，
+# 打一条任务，等「回合 + 静默期 + 起标题请求」都收场，再 ctrl+d 退出。
+# 判据：日志里出现 kind=provider 的 session/title，且假网关收到了 ≥2 次请求；
+#       --no-title-auto 时两样都没有。
+e2e-title-auto: build
+	@set -e; \
+	ws=build/selftest_title_auto_e2e; rm -rf $$ws; mkdir -p $$ws/home $$ws/home2; \
+	python3 testdata/mock_gateway_sse.py 0 1 200 > $$ws/gw.log 2>$$ws/gw.err & \
+	gw=$$!; \
+	trap "kill $$gw 2>/dev/null || true" EXIT; \
+	sleep 1.2; \
+	port=$$(awk '/^PORT/{print $$2}' $$ws/gw.log); \
+	[ -n "$$port" ] || { echo "FAIL: 假网关没打印端口"; cat $$ws/gw.log; exit 1; }; \
+	UYA_BIN="$(CURDIR)/$(OUT)" PORT="$$port" HOME_A="$$ws/home" HOME_B="$$ws/home2" \
+		python3 testdata/pty_drive_title.py; \
+	: "① 默认（--title-auto）：起标题多发一次请求，并落 provider 事件"; \
+	n=$$(grep -c "REQ #" $$ws/gw.err || true); \
+	[ "$$n" -ge 2 ] || { echo "FAIL: 自动起标题没有多发请求（只看到 $$n 次）"; exit 1; }; \
+	grep -qF '"source":{"kind":"provider"}' $$ws/home/sessions/*/*/session.jsonl \
+		|| { echo "FAIL: 日志里没有 kind=provider 的 session/title"; exit 1; }; \
+	: "② --no-title-auto：只有主请求，且没有 provider 事件"; \
+	if grep -qF '"source":{"kind":"provider"}' $$ws/home2/sessions/*/*/session.jsonl 2>/dev/null; then \
+		echo "FAIL: --no-title-auto 下仍然落了 provider 事件"; exit 1; \
+	fi; \
+	: "③ 三来源都看得出来，CLI 压过 env"; \
+	out=$$($(OUT) --no-dsh-config --print-config 2>&1); \
+	echo "$$out" | grep -q "title_auto = on  (source: default)" \
+		|| { echo "FAIL: 自动起标题默认应当是开"; exit 1; }; \
+	out=$$($(OUT) --no-dsh-config --no-title-auto --print-config 2>&1); \
+	echo "$$out" | grep -q "title_auto = off  (source: cli)" \
+		|| { echo "FAIL: --no-title-auto 没有生效"; exit 1; }; \
+	out=$$(UYA_AGENT_TITLE_AUTO=0 $(OUT) --no-dsh-config --print-config 2>&1); \
+	echo "$$out" | grep -q "title_auto = off  (source: env)" \
+		|| { echo "FAIL: UYA_AGENT_TITLE_AUTO 没有生效"; exit 1; }; \
+	out=$$(UYA_AGENT_TITLE_AUTO=0 $(OUT) --no-dsh-config --title-auto --print-config 2>&1); \
+	echo "$$out" | grep -q "title_auto = on  (source: cli)" \
+		|| { echo "FAIL: --title-auto 应当压过 UYA_AGENT_TITLE_AUTO=0"; exit 1; }; \
+	echo "e2e-title-auto: 通过（自动起标题发请求+落 provider 事件；--no-title-auto 两样都没有；三来源与 CLI 优先）"
 
 # 踩坑 72：鼠标上报开关回归（离线，不联网）。默认开（滚轮要靠它）；--no-mouse / UYA_AGENT_MOUSE=0
 # 都要在 --print-config 的来源列上看得出来（来源码与 cfg_src_name 同口径），而且 CLI 压过 env。
