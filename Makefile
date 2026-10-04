@@ -57,6 +57,11 @@ codegen-audit: build
 	fi; \
 	echo "codegen-audit: 通过（没有切片描述符强转）"
 
+# P50：**函数表容量**（编译器里写死的 FUNCTION_TABLE_SIZE，无开关）。
+#   本仓已经贴着上限：main 6756 个声明能编过，**再加 1 个函数**就报「函数表容量不足」——
+#   而且增量编译看不出来（缓存），只有 `rm -rf build` 重编才炸，报错点还落在标准库里。
+#   所以「净增函数」的改动一律先清缓存重编一遍（见 README §3 踩坑 84）。
+#   变量与常量不占这个额度，只有函数占；整理手段见踩坑 84。
 selftest: build codegen-audit e2e-config-flags e2e-title e2e-title-cmd e2e-title-auto e2e-mouse e2e-api e2e-steps e2e-permission e2e-sandbox e2e-tasks e2e-goal e2e-sessions e2e-resume-big e2e-diff e2e-ws e2e-model e2e-worktree p30-check
 	UYA_BIN=$(UYA) $(OUT) --selftest
 
