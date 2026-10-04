@@ -1,0 +1,1316 @@
+// src/mdview.uya — P46：TUI 的 markdown 渲染（纯函数层）
+//
+// 为什么单独一层：把「markdown → 可见文本 + 逐字节样式」做成**纯函数**，才能拿 fixture
+// 逐字节断言（与 watch.uya / tasks.uya 的纯函数层同一套路）。这一层不碰终端、不碰 tui 的
+// 全局状态，只认 tty 层的显示列原语（tty_char_cols / tty_clip_bytes）。
+//
+// 两个输出缓冲**逐字节等长**（这是整个设计的地基）：
+//   * hours：最终行文本，一行一条 '\n'；**前缀字形已经写进去**（`│ ` / `▏ ` / `· ` /
+//     `1. ` / `─…` / 表格的 `│`、`├`、`┼`……）；
+//   * md   ：与行文本等长的样式数组，每个**可见字节**挂一个 MDV_ST_*。
+//
+// 把样式挂在**可见字节**上（而不是「一行一段」）带来两件事：
+//   1) 折行落在任何位置都天然继承样式 —— 不需要「续行重开强调」那类状态机；
+//   2) 围栏代码块的样式由 md 承载，不再依赖「从第 0 行扫一遍复原 g_md_code」那种全局
+//      状态（旧实现滚到代码块中间就会串样式，见 README P46 条）。
+//
+// 为什么旧的 markdown-lite 会**静默丢字**：折行宽度（`cols - 6`）与绘制预算（`cols - 7`）
+// 各写一份，列表/代码行在绘制侧再扣 2 列 ⇒ 每行稳定丢 1–3 个字符再补 '…'（实测：60/80/100
+// 列下 100 字符的代码行只显示 97 个）。这一层把「前缀 + 内容」放进**同一条折行流**里算，
+// 预算只有一个来源 —— 结构性修法，不是把数字改对。
+//
+// 口径（故意做小的部分都写进 README §7 已知限制）：
+//   * 每个**逻辑行**独立成段，不做 CommonMark 的软换行合并（行数与原样一一对应）；
+//   * 围栏代码块不做语法高亮，只给整块一个颜色 + 语言标签；
+//   * 表格单元格**不折行**（按列裁剪补 '…'）；列被压到下限还放不下 ⇒ 整块退回普通行
+//     （行内强调仍生效，`|` 原样保留，一个字节都不丢）；
+//   * 不接受 setext 标题（`===` 下划线）、引用式链接 `[x][ref]`、脚注、HTML、自动链接。
+
+use libc.heap;
+use libc.stdlib;
+
+// ============================================================
+// 样式词汇（自带一套，不依赖 tui —— 两层互不引用，纯函数才好断言）
+// ============================================================
+export const MDV_ST_TEXT: u8 = 0;
+export const MDV_ST_BOLD: u8 = 1;
+export const MDV_ST_ITALIC: u8 = 2;
+export const MDV_ST_STRIKE: u8 = 3;
+export const MDV_ST_CODE: u8 = 4;         // 围栏代码块正文
+export const MDV_ST_CODE_LANG: u8 = 5;    // 围栏语言标签（`│ uya`）
+export const MDV_ST_INLINE: u8 = 6;       // 行内 `code`
+export const MDV_ST_H1: u8 = 7;
+export const MDV_ST_H2: u8 = 8;
+export const MDV_ST_H3: u8 = 9;           // 3..6 级都归这里
+export const MDV_ST_QUOTE: u8 = 10;
+export const MDV_ST_RULE: u8 = 11;
+export const MDV_ST_BULLET: u8 = 12;      // 无序项字形 `·`
+export const MDV_ST_ORDERED: u8 = 13;     // 有序项序号
+export const MDV_ST_URL: u8 = 14;         // 链接地址（暗色）
+export const MDV_ST_DONE: u8 = 15;        // 任务清单已完成字形 `✓`
+export const MDV_ST_THEAD: u8 = 16;       // 表头单元格内容
+export const MDV_ST_TCELL: u8 = 17;       // 表格正文字段内容
+export const MDV_ST_TSEP: u8 = 18;        // 表格框线 / 单元格留白
+export const MDV_ST_COUNT: usize = 19;
+
+const MDV_MAX_COLS: usize = 8;      // 表格最多几列（超了退回普通行：固定数组装不下）
+const MDV_MAX_LEVEL: usize = 3;     // 列表/引用嵌套层数上限（再深并入上限层）
+const MDV_URL_MAX: usize = 48;      // 链接地址最多显示多少列（超了补 '…'）
+const MDV_INLINE_DEPTH: usize = 3;  // 行内强调的递归深度上限
+const MDV_INDENT: usize = 2;        // 列表每层的缩进列数
+
+// ============================================================
+// 行偏移表（与 tui.uya 的 TuiLineIdx 同一口径：offs[i] = 第 i 行的**终点**）
+// ============================================================
+struct MdvLines {
+    offs: &usize,
+    n: usize,
+    cap: usize,
+}
+
+var g_mdv_lines: MdvLines = MdvLines{ offs: null as &usize, n: 0, cap: 0 };
+var g_mdv_ready: bool = false;
+
+var g_mdv_cur_t: Buf = Buf{ ptr: null, len: 0, cap: 0 };   // 行内扫描：可见文本
+var g_mdv_cur_m: Buf = Buf{ ptr: null, len: 0, cap: 0 };   // 行内扫描：样式
+var g_mdv_pre_t: Buf = Buf{ ptr: null, len: 0, cap: 0 };   // 列表项前缀（文本）
+var g_mdv_pre_m: Buf = Buf{ ptr: null, len: 0, cap: 0 };   // 列表项前缀（样式）
+var g_mdv_ct_t: Buf = Buf{ ptr: null, len: 0, cap: 0 };    // 列表项续行缩进（文本）
+var g_mdv_ct_m: Buf = Buf{ ptr: null, len: 0, cap: 0 };    // 列表项续行缩进（样式）
+var g_mdv_bx_t: Buf = Buf{ ptr: null, len: 0, cap: 0 };    // 纯 ASCII 前缀（矩形/代码框）
+var g_mdv_bx_m: Buf = Buf{ ptr: null, len: 0, cap: 0 };
+
+fn mdv_ensure() void {
+    if g_mdv_ready {
+        return;
+    }
+    // 注：行表（g_mdv_lines）是「容量不够才 malloc」的惰性表，进程退出前不单独释放
+    // （与 tui.uya 的 TuiLineIdx 同寿命：全程持有一份、内容随时可重建）。
+    g_mdv_cur_t = buf_new(4096);
+    g_mdv_cur_m = buf_new(4096);
+    g_mdv_pre_t = buf_new(64);
+    g_mdv_pre_m = buf_new(64);
+    g_mdv_ct_t = buf_new(64);
+    g_mdv_ct_m = buf_new(64);
+    g_mdv_bx_t = buf_new(64);
+    g_mdv_bx_m = buf_new(64);
+    g_mdv_ready = true;
+}
+
+fn mdv_lines_build(p: &const byte, n: usize) void {
+    g_mdv_lines.n = 0;
+    if n == 0 {
+        return;
+    }
+    var cnt: usize = 0;
+    var i: usize = 0;
+    while i < n {
+        if p[i] == 10 as byte {
+            cnt = cnt + 1;
+        }
+        i = i + 1;
+    }
+    if p[n - 1] != 10 as byte {
+        cnt = cnt + 1;
+    }
+    if cnt > g_mdv_lines.cap {
+        if (g_mdv_lines.offs as usize) != 0 {
+            free(g_mdv_lines.offs as &void);
+        }
+        g_mdv_lines.offs = null as &usize;
+        g_mdv_lines.cap = 0;
+        const raw: &void = malloc((cnt + 1) * (@size_of(usize) as usize));
+        if ((raw as &byte) as usize) == 0 {
+            return;
+        }
+        g_mdv_lines.offs = raw as &usize;
+        g_mdv_lines.cap = cnt + 1;
+    }
+    g_mdv_lines.n = cnt;
+    var k: usize = 0;
+    i = 0;
+    while i < n {
+        if p[i] == 10 as byte {
+            if k < g_mdv_lines.cap {
+                g_mdv_lines.offs[k] = i;
+            }
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    if k < cnt && k < g_mdv_lines.cap {
+        g_mdv_lines.offs[k] = n;
+    }
+}
+
+fn mdv_line_at(p: &const byte, i: usize, s: &usize, e: &usize) bool {
+    if i >= g_mdv_lines.n {
+        return false;
+    }
+    var start: usize = 0;
+    if i > 0 {
+        start = g_mdv_lines.offs[i - 1] + 1;
+    }
+    const end: usize = g_mdv_lines.offs[i];
+    if end < start {
+        return false;
+    }
+    s[0] = start;
+    e[0] = end;
+    return true;
+}
+
+// ============================================================
+// 小工具
+// ============================================================
+fn mdv_cols(p: &const byte, n: usize) usize {
+    if n == 0 {
+        return 0;
+    }
+    return tty_cols_between(p, 0, n);
+}
+
+fn mdv_put(t: &Buf, m: &Buf, p: &const byte, n: usize, st: u8) void {
+    if n == 0 {
+        return;
+    }
+    _ = buf_append(t, p, n);
+    var k: usize = 0;
+    while k < n {
+        _ = buf_append_byte(m, st);
+        k = k + 1;
+    }
+}
+
+fn mdv_puts(t: &Buf, m: &Buf, lit: &const byte, st: u8) void {
+    mdv_put(t, m, lit, bufx_cstr_len(lit), st);
+}
+
+fn mdv_nl(t: &Buf, m: &Buf) void {
+    _ = buf_append_byte(t, 10);
+    _ = buf_append_byte(m, MDV_ST_TEXT);   // md 与 text 必须等长
+}
+
+fn mdv_spaces(t: &Buf, m: &Buf, n: usize, st: u8) void {
+    var k: usize = 0;
+    while k < n {
+        _ = buf_append_byte(t, 32);
+        _ = buf_append_byte(m, st);
+        k = k + 1;
+    }
+}
+
+fn mdv_find_lit(p: &const byte, from: usize, n: usize, lit: &const byte, ln: usize) isize {
+    if ln == 0 || from >= n {
+        return -1;
+    }
+    var i: usize = from;
+    while i + ln <= n {
+        if bufx_mem_eq(p + i, lit, ln) {
+            return i as isize;
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn mdv_is_alnum(c: byte) bool {
+    if c >= 48 as byte && c <= 57 as byte {
+        return true;
+    }
+    if c >= 65 as byte && c <= 90 as byte {
+        return true;
+    }
+    if c >= 97 as byte && c <= 122 as byte {
+        return true;
+    }
+    if c >= 128 as byte {
+        return true;   // 非 ASCII 一律当「字」（中文没有下划线强调这回事）
+    }
+    return false;
+}
+
+// ============================================================
+// 行内扫描：markdown 行内标记 → 可见文本 + 样式
+//
+// 一份实现两个消费者：排版时算**可见宽度**（markup 不计宽），绘制时取样式。
+// 递归是刻意的（`**粗体里的 \`code\`**` 才成立），深度限死在 MDV_INLINE_DEPTH。
+// ============================================================
+fn mdv_inline_d(t: &Buf, m: &Buf, p: &const byte, n: usize, base: u8, depth: usize) void {
+    if n == 0 {
+        return;
+    }
+    if depth > MDV_INLINE_DEPTH {
+        mdv_put(t, m, p, n, base);
+        return;
+    }
+    var i: usize = 0;
+    var seg: usize = 0;
+    while i < n {
+        const c: byte = p[i];
+        // ---- 反斜杠转义：下一个字节原样 ----
+        if c == 92 as byte {
+            if i > seg {
+                mdv_put(t, m, p + seg, i - seg, base);
+            }
+            if i + 1 < n {
+                mdv_put(t, m, p + i + 1, 1, base);
+                i = i + 2;
+            } else {
+                mdv_put(t, m, p + i, 1, base);
+                i = i + 1;
+            }
+            seg = i;
+            continue;
+        }
+        // ---- 行内 code：反引号成对，**内部不再解析**（对齐 CommonMark）----
+        if c == 96 as byte && (i + 1 >= n || p[i + 1] != 96 as byte) {
+            var j: usize = i + 1;
+            var close: isize = -1;
+            while j < n {
+                if p[j] == 96 as byte && (j + 1 >= n || p[j + 1] != 96 as byte) {
+                    close = j as isize;
+                    break;
+                }
+                j = j + 1;
+            }
+            if close >= 0 {
+                if i > seg {
+                    mdv_put(t, m, p + seg, i - seg, base);
+                }
+                mdv_put(t, m, p + i + 1, (close as usize) - i - 1, MDV_ST_INLINE);
+                i = (close as usize) + 1;
+                seg = i;
+                continue;
+            }
+        }
+        // ---- 删除线 ~~…~~ ----
+        if c == 126 as byte && i + 1 < n && p[i + 1] == 126 as byte {
+            const close: isize = mdv_find_lit(p, i + 2, n, "~~" as &const byte, 2);
+            if close > 0 {
+                if i > seg {
+                    mdv_put(t, m, p + seg, i - seg, base);
+                }
+                mdv_inline_d(t, m, p + i + 2, (close as usize) - i - 2, MDV_ST_STRIKE, depth + 1);
+                i = (close as usize) + 2;
+                seg = i;
+                continue;
+            }
+        }
+        // ---- 粗体 **…** / __…__ ----
+        if (c == 42 as byte || c == 95 as byte) && i + 1 < n && p[i + 1] == c {
+            const close: isize = mdv_find_lit(p, i + 2, n, p + i, 2);
+            if close > 0 && (close as usize) > i + 2 {
+                if i > seg {
+                    mdv_put(t, m, p + seg, i - seg, base);
+                }
+                mdv_inline_d(t, m, p + i + 2, (close as usize) - i - 2, MDV_ST_BOLD, depth + 1);
+                i = (close as usize) + 2;
+                seg = i;
+                continue;
+            }
+        }
+        // ---- 斜体 *…* / _…_ ----
+        if c == 42 as byte || c == 95 as byte {
+            var ok: bool = (i + 1 < n) && p[i + 1] != 32 as byte && p[i + 1] != c;
+            if ok && c == 95 as byte && i > 0 && mdv_is_alnum(p[i - 1]) {
+                ok = false;   // 下划线要在词边界上，否则 `snake_case_name` 会被吃掉
+            }
+            if ok {
+                var j: usize = i + 1;
+                var close: isize = -1;
+                while j < n {
+                    if p[j] == c && (j + 1 >= n || p[j + 1] != c) && p[j - 1] != 32 as byte {
+                        var good: bool = true;
+                        if c == 95 as byte && j + 1 < n && mdv_is_alnum(p[j + 1]) {
+                            good = false;
+                        }
+                        if good {
+                            close = j as isize;
+                            break;
+                        }
+                    }
+                    j = j + 1;
+                }
+                if close > 0 && (close as usize) > i + 1 {
+                    if i > seg {
+                        mdv_put(t, m, p + seg, i - seg, base);
+                    }
+                    mdv_inline_d(t, m, p + i + 1, (close as usize) - i - 1, MDV_ST_ITALIC, depth + 1);
+                    i = (close as usize) + 1;
+                    seg = i;
+                    continue;
+                }
+            }
+        }
+        // ---- 链接 [文字](url) / 图片 ![alt](url)：文字正常，地址暗色 ----
+        if c == 91 as byte || (c == 33 as byte && i + 1 < n && p[i + 1] == 91 as byte) {
+            var bstart: usize = i;
+            if c == 33 as byte {
+                bstart = i + 1;
+            }
+            const rb: isize = mdv_find_lit(p, bstart + 1, n, "]" as &const byte, 1);
+            if rb > 0 {
+                const rbu: usize = rb as usize;
+                if rbu + 1 < n && p[rbu + 1] == 40 as byte {
+                    const rp: isize = mdv_find_lit(p, rbu + 2, n, ")" as &const byte, 1);
+                    if rp > 0 {
+                        const rpu: usize = rp as usize;
+                        if i > seg {
+                            mdv_put(t, m, p + seg, i - seg, base);
+                        }
+                        mdv_inline_d(t, m, p + bstart + 1, rbu - bstart - 1, base, depth + 1);
+                        const us: usize = rbu + 2;
+                        var un: usize = rpu - us;
+                        if mdv_cols(p + us, un) > MDV_URL_MAX {
+                            const kp: usize = tty_clip_bytes(p + us, un, MDV_URL_MAX - 1);
+                            mdv_puts(t, m, " (", MDV_ST_URL);
+                            mdv_put(t, m, p + us, kp, MDV_ST_URL);
+                            mdv_puts(t, m, "…", MDV_ST_URL);
+                        } else {
+                            mdv_puts(t, m, " (", MDV_ST_URL);
+                            mdv_put(t, m, p + us, un, MDV_ST_URL);
+                        }
+                        mdv_puts(t, m, ")", MDV_ST_URL);
+                        i = rpu + 1;
+                        seg = i;
+                        continue;
+                    }
+                }
+            }
+        }
+        i = i + 1;
+    }
+    if n > seg {
+        mdv_put(t, m, p + seg, n - seg, base);
+    }
+}
+
+fn mdv_inline(t: &Buf, m: &Buf, p: &const byte, n: usize, base: u8) void {
+    buf_reset(t);
+    buf_reset(m);
+    mdv_inline_d(t, m, p, n, base, 0);
+}
+
+// ============================================================
+// 折行：前缀 + 内容在同一条流里算预算
+//
+// 前缀与续行缩进都带**自己的样式数组**（列表项的标记色要落在标记上、缩进保持默认）。
+// 「尽量在空格处断行」与旧实现同口径；区别是前缀也算进预算（旧实现的丢字根因）。
+// ============================================================
+fn mdv_wrap(t: &Buf, m: &Buf, pre: &const byte, premd: &const byte, pn: usize,
+    cont: &const byte, contmd: &const byte, cn: usize,
+    text: &const byte, md: &const byte, tn: usize, budget: usize, rows: &usize) void {
+    const pc: usize = mdv_cols(pre, pn);
+    const cc: usize = mdv_cols(cont, cn);
+    var first: bool = true;
+    var off: usize = 0;
+    var guard: usize = 0;
+    // 空内容也要出一行（否则「空段落」会被下一行吞掉）
+    while off < tn || first {
+        if guard > tn + 8 {
+            break;
+        }
+        guard = guard + 1;
+        // 不用 `if first { pc } else { cc }` 这种 if 表达式：uya 0.10 为它生成的 C
+        // 是个**只读**的 `__uya_ifexpr_N` 临时变量、却在分支里赋值，编译直接报
+        // `assignment of read-only variable`（本轮实测）。写成普通赋值就绕开了。
+        var lead: usize = cc;
+        if first {
+            lead = pc;
+        }
+        var avail: usize = 4;
+        if budget > lead + 1 {
+            avail = budget - lead;
+        }
+        var take: usize = 0;
+        if off < tn {
+            take = tty_clip_bytes(text + off, tn - off, avail);
+            if take == 0 {
+                take = 1;
+            }
+            if off + take < tn {
+                // 尽量在空格处断行（除非这一段本来就装得下）。
+                // 断点前没有非空格的落点时（整段是空格、或第一个字符就是空格）保持原样，
+                // 否则会退化成「一次只吐一个空格」的无限细碎折行。
+                var k: usize = take;
+                while k > 1 {
+                    if text[off + k - 1] == 32 as byte {
+                        take = k - 1;
+                        break;
+                    }
+                    k = k - 1;
+                }
+            }
+        }
+        if first {
+            _ = buf_append(t, pre, pn);
+            _ = buf_append(m, premd, pn);
+        } else {
+            _ = buf_append(t, cont, cn);
+            _ = buf_append(m, contmd, cn);
+        }
+        var k2: usize = 0;
+        while k2 < take {
+            var st: u8 = MDV_ST_TEXT;
+            if off + k2 < tn {
+                st = md[off + k2];
+            }
+            _ = buf_append_byte(m, st);
+            k2 = k2 + 1;
+        }
+        if take > 0 {
+            _ = buf_append(t, text + off, take);
+        }
+        mdv_nl(t, m);
+        rows[0] = rows[0] + 1;
+        if off + take >= tn {
+            break;
+        }
+        off = off + take;
+        if off < tn && text[off] == 32 as byte {
+            off = off + 1;   // 吃掉断点那个空格（续行已有缩进）
+        }
+        first = false;
+    }
+}
+
+// 一趟：区间 → 行内扫描 → 折行
+fn mdv_emit(t: &Buf, m: &Buf, pre: &const byte, premd: &const byte, pn: usize,
+    cont: &const byte, contmd: &const byte, cn: usize,
+    text: &const byte, s: usize, e: usize, base: u8, budget: usize, rows: &usize) void {
+    mdv_inline(&g_mdv_cur_t, &g_mdv_cur_m, text + s, e - s, base);
+    mdv_wrap(t, m, pre, premd, pn, cont, contmd, cn,
+        g_mdv_cur_t.ptr as &const byte, g_mdv_cur_m.ptr as &const byte, g_mdv_cur_t.len, budget, rows);
+}
+
+// 纯 ASCII 前缀（`│ ` / `▏▏` / 缩进空格…）：文本与样式一次填好
+fn mdv_set_ascii(t: &Buf, m: &Buf, reps: usize, lit: &const byte, st: u8) void {
+    buf_reset(t);
+    buf_reset(m);
+    const ln: usize = bufx_cstr_len(lit);
+    var k: usize = 0;
+    while k < reps {
+        _ = buf_append(t, lit, ln);
+        var q: usize = 0;
+        while q < ln {
+            _ = buf_append_byte(m, st);
+            q = q + 1;
+        }
+        k = k + 1;
+    }
+}
+
+// ============================================================
+// 块级识别
+// ============================================================
+fn mdv_indent(p: &const byte, s: usize, e: usize) usize {
+    var i: usize = s;
+    while i < e && p[i] == 32 as byte {
+        i = i + 1;
+    }
+    return i - s;
+}
+
+fn mdv_trim(p: &const byte, s: usize, e: usize, ts: &usize, te: &usize) void {
+    var a: usize = s;
+    var b: usize = e;
+    while a < b && p[a] == 32 as byte {
+        a = a + 1;
+    }
+    while b > a && p[b - 1] == 32 as byte {
+        b = b - 1;
+    }
+    ts[0] = a;
+    te[0] = b;
+}
+
+// 围栏行：≤3 空格缩进 + ≥3 个 ` 或 ~ + 其余是 info string
+fn mdv_fence_parse(p: &const byte, s: usize, e: usize,
+    ch: &byte, len: &usize, is: &usize, ie: &usize) bool {
+    const ind: usize = mdv_indent(p, s, e);
+    if ind > 3 {
+        return false;
+    }
+    const a: usize = s + ind;
+    if a >= e {
+        return false;
+    }
+    const c: byte = p[a];
+    if c != 96 as byte && c != 126 as byte {
+        return false;
+    }
+    var k: usize = a;
+    while k < e && p[k] == c {
+        k = k + 1;
+    }
+    if k - a < 3 {
+        return false;
+    }
+    ch[0] = c;
+    len[0] = k - a;
+    var b: usize = k;
+    while b < e && p[b] == 32 as byte {
+        b = b + 1;
+    }
+    is[0] = b;
+    ie[0] = e;
+    return true;
+}
+
+// 分隔线：≥3 个同一种 `-` / `*` / `_`（允许夹空格）
+fn mdv_rule(p: &const byte, s: usize, e: usize) bool {
+    var i: usize = s;
+    while i < e && p[i] == 32 as byte {
+        i = i + 1;
+    }
+    if i >= e {
+        return false;
+    }
+    const c: byte = p[i];
+    if c != 45 as byte && c != 42 as byte && c != 95 as byte {
+        return false;
+    }
+    var cnt: usize = 0;
+    while i < e {
+        if p[i] == c {
+            cnt = cnt + 1;
+        } else if p[i] != 32 as byte {
+            return false;
+        }
+        i = i + 1;
+    }
+    return cnt >= 3;
+}
+
+// ATX 标题：# 后必须跟空格或行尾（否则 `#include` 会被当标题）
+fn mdv_heading(p: &const byte, s: usize, e: usize, level: &usize, bs: &usize, be: &usize) bool {
+    if mdv_indent(p, s, e) > 3 {
+        return false;
+    }
+    var i: usize = s;
+    var k: usize = 0;
+    while i < e && p[i] == 35 as byte {
+        k = k + 1;
+        i = i + 1;
+    }
+    if k == 0 || k > 6 {
+        return false;
+    }
+    if i < e && p[i] != 32 as byte {
+        return false;
+    }
+    while i < e && p[i] == 32 as byte {
+        i = i + 1;
+    }
+    var b: usize = e;
+    while b > i && p[b - 1] == 32 as byte {
+        b = b - 1;
+    }
+    // 可选的行尾 `#` 串（CommonMark 的 closing sequence）
+    var c: usize = b;
+    while c > i && p[c - 1] == 35 as byte {
+        c = c - 1;
+    }
+    if c < b {
+        if c == i {
+            b = i;
+        } else if p[c - 1] == 32 as byte {
+            b = c - 1;
+        }
+    }
+    level[0] = k;
+    bs[0] = i;
+    be[0] = b;
+    return true;
+}
+
+// 引用：`>` 可重复（嵌套）
+fn mdv_quote(p: &const byte, s: usize, e: usize, depth: &usize, bs: &usize, be: &usize) bool {
+    const ind: usize = mdv_indent(p, s, e);
+    if ind > 3 {
+        return false;
+    }
+    var i: usize = s + ind;
+    var d: usize = 0;
+    while i < e && p[i] == 62 as byte {
+        d = d + 1;
+        i = i + 1;
+        if i < e && p[i] == 32 as byte {
+            i = i + 1;
+        }
+    }
+    if d == 0 {
+        return false;
+    }
+    depth[0] = d;
+    bs[0] = i;
+    be[0] = e;
+    return true;
+}
+
+// 列表项：缩进 + 标记 + 空格。task 输出 0=不是任务 1=未完成 2=已完成
+fn mdv_list(p: &const byte, s: usize, e: usize, level: &usize,
+    ordered: &bool, ns: &usize, nl: &usize, bs: &usize, be: &usize, task: &u8) bool {
+    const ind: usize = mdv_indent(p, s, e);
+    var i: usize = s + ind;
+    if i >= e {
+        return false;
+    }
+    ordered[0] = false;
+    ns[0] = i;
+    nl[0] = 0;
+    task[0] = 0;
+    const c: byte = p[i];
+    if c == 45 as byte || c == 42 as byte || c == 43 as byte {
+        if i + 1 < e && p[i + 1] != 32 as byte {
+            return false;
+        }
+        ns[0] = i;
+        nl[0] = 1;
+        i = i + 1;
+    } else if c >= 48 as byte && c <= 57 as byte {
+        var k: usize = i;
+        while k < e && p[k] >= 48 as byte && p[k] <= 57 as byte {
+            k = k + 1;
+        }
+        if k >= e {
+            return false;
+        }
+        if p[k] != 46 as byte && p[k] != 41 as byte {
+            return false;
+        }
+        if k + 1 < e && p[k + 1] != 32 as byte {
+            return false;
+        }
+        ordered[0] = true;
+        nl[0] = k - i + 1;
+        i = k + 1;
+    } else {
+        return false;
+    }
+    while i < e && p[i] == 32 as byte {
+        i = i + 1;
+    }
+    // 任务清单 `[x]` / `[ ]`
+    if i + 2 < e && p[i] == 91 as byte && p[i + 2] == 93 as byte {
+        const mark: byte = p[i + 1];
+        if mark == 120 as byte || mark == 88 as byte {
+            task[0] = 2;
+        } else if mark == 32 as byte {
+            task[0] = 1;
+        }
+        if task[0] != 0 {
+            i = i + 3;
+            while i < e && p[i] == 32 as byte {
+                i = i + 1;
+            }
+            ordered[0] = false;
+            ns[0] = s + ind;
+            nl[0] = 1;
+        }
+    }
+    var lv: usize = ind / MDV_INDENT;
+    if lv > MDV_MAX_LEVEL {
+        lv = MDV_MAX_LEVEL;
+    }
+    level[0] = lv;
+    bs[0] = i;
+    be[0] = e;
+    return true;
+}
+
+// ============================================================
+// 表格
+// ============================================================
+var g_mdv_w: [usize: MDV_MAX_COLS] = [0: MDV_MAX_COLS];
+var g_mdv_align: [u8: MDV_MAX_COLS] = [0: MDV_MAX_COLS];
+var g_mdv_cs: [usize: MDV_MAX_COLS] = [0: MDV_MAX_COLS];
+var g_mdv_ce: [usize: MDV_MAX_COLS] = [0: MDV_MAX_COLS];
+var g_mdv_nc: usize = 0;
+
+// 切单元格：丢掉「前后导竖线」产生的空壳。返回列数（>MDV_MAX_COLS ⇒ 0）
+fn mdv_split_cells(p: &const byte, s: usize, e: usize) usize {
+    // 数组下标一律走「基址指针 + 下标」：uya 0.10 的数组边界证明对**运行时下标的
+    // 数组访问**拿不出证明（`while i < n && i < MAX` 那种写法它也不认，见 README 踩坑 6
+    // 的同族记录），而 `&arr[0]` 出来的裸指针是它放行的形式。
+    const cs: &usize = &g_mdv_cs[0];
+    const ce: &usize = &g_mdv_ce[0];
+    g_mdv_nc = 0;
+    var ts: usize = 0;
+    var te: usize = 0;
+    mdv_trim(p, s, e, &ts, &te);
+    if te <= ts {
+        return 0;
+    }
+    var i: usize = ts;
+    if p[i] == 124 as byte {
+        i = i + 1;
+    }
+    var cell_s: usize = i;
+    while i < te {
+        if p[i] == 92 as byte && i + 1 < te && p[i + 1] == 124 as byte {
+            i = i + 2;
+            continue;
+        }
+        if p[i] == 124 as byte {
+            if g_mdv_nc >= MDV_MAX_COLS {
+                return 0;
+            }
+            var a: usize = cell_s;
+            var b: usize = i;
+            while a < b && p[a] == 32 as byte {
+                a = a + 1;
+            }
+            while b > a && p[b - 1] == 32 as byte {
+                b = b - 1;
+            }
+            cs[g_mdv_nc] = a;
+            ce[g_mdv_nc] = b;
+            g_mdv_nc = g_mdv_nc + 1;
+            i = i + 1;
+            cell_s = i;
+            continue;
+        }
+        i = i + 1;
+    }
+    if cell_s < te {
+        if g_mdv_nc >= MDV_MAX_COLS {
+            return 0;
+        }
+        var a2: usize = cell_s;
+        var b2: usize = te;
+        while a2 < b2 && p[a2] == 32 as byte {
+            a2 = a2 + 1;
+        }
+        while b2 > a2 && p[b2 - 1] == 32 as byte {
+            b2 = b2 - 1;
+        }
+        cs[g_mdv_nc] = a2;
+        ce[g_mdv_nc] = b2;
+        g_mdv_nc = g_mdv_nc + 1;
+    }
+    // 收尾竖线产生的空壳丢掉
+    if g_mdv_nc > 0 && g_mdv_nc <= MDV_MAX_COLS && p[te - 1] == 124 as byte {
+        const last: usize = g_mdv_nc - 1;
+        if last < MDV_MAX_COLS {
+            if cs[last] == ce[last] {
+                g_mdv_nc = last;
+            }
+        }
+    }
+    return g_mdv_nc;
+}
+
+// 表格块起始判据：本行以 `|` 起（允许 ≤3 空格缩进），**且下一行是合法分隔行**
+fn mdv_table_start(p: &const byte, i: usize, s: &usize, e: &usize, nc: &usize) bool {
+    const cs: &usize = &g_mdv_cs[0];
+    const ce: &usize = &g_mdv_ce[0];
+    const al_arr: &u8 = &g_mdv_align[0];
+    if i + 1 >= g_mdv_lines.n {
+        return false;
+    }
+    var s1: usize = 0;
+    var e1: usize = 0;
+    var s2: usize = 0;
+    var e2: usize = 0;
+    if !mdv_line_at(p, i, &s1, &e1) || !mdv_line_at(p, i + 1, &s2, &e2) {
+        return false;
+    }
+    const ind: usize = mdv_indent(p, s1, e1);
+    if ind > 3 {
+        return false;
+    }
+    if s1 + ind >= e1 || p[s1 + ind] != 124 as byte {
+        return false;
+    }
+    const k: usize = mdv_split_cells(p, s1, e1);
+    if k == 0 {
+        return false;
+    }
+    const k2: usize = mdv_split_cells(p, s2, e2);
+    if k2 != k {
+        return false;
+    }
+    var j: usize = 0;
+    while j < k {
+        var a: usize = cs[j];
+        var b: usize = ce[j];
+        if a >= b {
+            return false;
+        }
+        var al: u8 = 0;
+        if p[a] == 58 as byte {
+            al = 1;
+            a = a + 1;
+        }
+        if b > a && p[b - 1] == 58 as byte {
+            if al == 1 {
+                al = 3;
+            } else {
+                al = 2;
+            }
+            b = b - 1;
+        }
+        if b <= a {
+            return false;
+        }
+        var dashes: usize = 0;
+        var ok: bool = true;
+        var x: usize = a;
+        while x < b {
+            if p[x] == 45 as byte {
+                dashes = dashes + 1;
+            } else if p[x] != 32 as byte {
+                ok = false;
+                break;
+            }
+            x = x + 1;
+        }
+        if !ok || dashes == 0 {
+            return false;
+        }
+        al_arr[j] = al;
+        j = j + 1;
+    }
+    s[0] = s1;
+    e[0] = e1;
+    nc[0] = k;
+    return true;
+}
+
+// 行是否属于表格块（以 `|` 起）
+fn mdv_table_row_start(p: &const byte, i: usize, s: &usize, e: &usize) bool {
+    var s1: usize = 0;
+    var e1: usize = 0;
+    if !mdv_line_at(p, i, &s1, &e1) {
+        return false;
+    }
+    const ind: usize = mdv_indent(p, s1, e1);
+    if ind > 3 {
+        return false;
+    }
+    if s1 + ind >= e1 || p[s1 + ind] != 124 as byte {
+        return false;
+    }
+    s[0] = s1;
+    e[0] = e1;
+    return true;
+}
+
+// 一行的第 j 格（不足则空）写进 j 号槽
+fn mdv_cell_of(p: &const byte, s: usize, e: usize, j: usize) void {
+    if j >= MDV_MAX_COLS {
+        return;
+    }
+    const cs: &usize = &g_mdv_cs[0];
+    const ce: &usize = &g_mdv_ce[0];
+    const k: usize = mdv_split_cells(p, s, e);
+    var a: usize = 0;
+    var b: usize = 0;
+    if j < k {
+        a = cs[j];
+        b = ce[j];
+    }
+    cs[j] = a;
+    ce[j] = b;
+}
+
+// 单元格落格：左/中/右对齐 + 超宽裁剪补 '…'（内容已在 g_mdv_cur_* 里）
+fn mdv_cell_emit(t: &Buf, m: &Buf, w: usize, al: u8, base: u8) void {
+    const n: usize = g_mdv_cur_t.len;
+    var cw: usize = mdv_cols(g_mdv_cur_t.ptr as &const byte, n);
+    var keep: usize = n;
+    var ell: bool = false;
+    if cw > w {
+        if w > 1 {
+            keep = tty_clip_bytes(g_mdv_cur_t.ptr as &const byte, n, w - 1);
+        } else {
+            keep = 0;
+        }
+        ell = true;
+        cw = mdv_cols(g_mdv_cur_t.ptr as &const byte, keep) + 1;
+    }
+    var pad: usize = 0;
+    if w > cw {
+        pad = w - cw;
+    }
+    var left: usize = 0;
+    var right: usize = pad;
+    if al == 1 {
+        left = pad / 2;
+        right = pad - left;
+    } else if al == 2 {
+        left = pad;
+        right = 0;
+    }
+    mdv_spaces(t, m, left, MDV_ST_TSEP);
+    var k: usize = 0;
+    while k < keep {
+        var st: u8 = MDV_ST_TEXT;
+        if k < g_mdv_cur_m.len {
+            st = g_mdv_cur_m.ptr[k];
+        }
+        if st == MDV_ST_TEXT && base != MDV_ST_TEXT {
+            st = base;
+        }
+        _ = buf_append_byte(t, g_mdv_cur_t.ptr[k]);
+        _ = buf_append_byte(m, st);
+        k = k + 1;
+    }
+    if ell {
+        mdv_puts(t, m, "…", MDV_ST_TSEP);
+    }
+    mdv_spaces(t, m, right, MDV_ST_TSEP);
+}
+
+// 表格数据行：`│ c1 │ c2 │`
+fn mdv_table_emit_row(t: &Buf, m: &Buf, p: &const byte, s: usize, e: usize,
+    k: usize, base: u8, rows: &usize) void {
+    const cs: &usize = &g_mdv_cs[0];
+    const ce: &usize = &g_mdv_ce[0];
+    const warr: &usize = &g_mdv_w[0];
+    const al_arr: &u8 = &g_mdv_align[0];
+    mdv_puts(t, m, "│ ", MDV_ST_TSEP);
+    var j: usize = 0;
+    while j < k {
+        mdv_cell_of(p, s, e, j);
+        const c0: usize = cs[j];
+        const c1: usize = ce[j];
+        mdv_inline(&g_mdv_cur_t, &g_mdv_cur_m, p + c0, c1 - c0, MDV_ST_TEXT);
+        var w: usize = 3;
+        var al: u8 = 0;
+        if j < MDV_MAX_COLS {
+            w = warr[j];
+            al = al_arr[j];
+        }
+        mdv_cell_emit(t, m, w, al, base);
+        if j + 1 < k {
+            mdv_puts(t, m, " │ ", MDV_ST_TSEP);
+        } else {
+            mdv_puts(t, m, " │", MDV_ST_TSEP);
+        }
+        j = j + 1;
+    }
+    mdv_nl(t, m);
+    rows[0] = rows[0] + 1;
+}
+
+// 表头下的分隔行：`├───┼───┤`
+fn mdv_table_emit_sep(t: &Buf, m: &Buf, k: usize, rows: &usize) void {
+    const warr: &usize = &g_mdv_w[0];
+    mdv_puts(t, m, "├", MDV_ST_TSEP);
+    var j: usize = 0;
+    while j < k {
+        var w: usize = 3;
+        if j < MDV_MAX_COLS {
+            w = warr[j];
+        }
+        var x: usize = 0;
+        while x < w + 2 {
+            mdv_puts(t, m, "─", MDV_ST_TSEP);
+            x = x + 1;
+        }
+        if j + 1 < k {
+            mdv_puts(t, m, "┼", MDV_ST_TSEP);
+        } else {
+            mdv_puts(t, m, "┤", MDV_ST_TSEP);
+        }
+        j = j + 1;
+    }
+    mdv_nl(t, m);
+    rows[0] = rows[0] + 1;
+}
+
+// 表格一行的可见列宽（把 j 号格扫一遍取最大）
+fn mdv_row_widths(p: &const byte, s: usize, e: usize, k: usize) void {
+    const cs: &usize = &g_mdv_cs[0];
+    const ce: &usize = &g_mdv_ce[0];
+    const warr: &usize = &g_mdv_w[0];
+    var j: usize = 0;
+    while j < k {
+        mdv_cell_of(p, s, e, j);
+        const c0: usize = cs[j];
+        const c1: usize = ce[j];
+        mdv_inline(&g_mdv_cur_t, &g_mdv_cur_m, p + c0, c1 - c0, MDV_ST_TEXT);
+        const cw: usize = mdv_cols(g_mdv_cur_t.ptr as &const byte, g_mdv_cur_t.len);
+        if cw > warr[j] {
+            warr[j] = cw;
+        }
+        j = j + 1;
+    }
+}
+
+// ============================================================
+// 主入口
+// ============================================================
+export fn mdv_layout_into(t: &Buf, m: &Buf, text: &const byte, n: usize, budget: usize) usize {
+    buf_reset(t);
+    buf_reset(m);
+    mdv_ensure();
+    var bw: usize = budget;
+    if bw < 4 {
+        bw = 4;
+    }
+    if n == 0 {
+        mdv_nl(t, m);
+        return 1;
+    }
+    mdv_lines_build(text, n);
+    if g_mdv_lines.n == 0 {
+        mdv_nl(t, m);
+        return 1;
+    }
+    var rows: usize = 0;
+    var fence: bool = false;
+    var fence_ch: byte = 96;
+    var fence_len: usize = 0;
+    var i: usize = 0;
+    while i < g_mdv_lines.n {
+        var s: usize = 0;
+        var e: usize = 0;
+        if !mdv_line_at(text, i, &s, &e) {
+            break;
+        }
+        // ---- 围栏代码块 ----
+        var fch: byte = 0;
+        var flen: usize = 0;
+        var fis: usize = 0;
+        var fie: usize = 0;
+        const is_fence: bool = mdv_fence_parse(text, s, e, &fch, &flen, &fis, &fie);
+        if fence {
+            if is_fence && fch == fence_ch && flen >= fence_len {
+                fence = false;          // 闭合围栏：什么都不画
+                i = i + 1;
+                continue;
+            }
+            mdv_set_ascii(&g_mdv_bx_t, &g_mdv_bx_m, 1, "│ " as &const byte, MDV_ST_TSEP);
+            mdv_emit(t, m, g_mdv_bx_t.ptr as &const byte, g_mdv_bx_m.ptr as &const byte, g_mdv_bx_t.len,
+                "  " as &const byte, g_mdv_bx_m.ptr as &const byte, 2,
+                text, s, e, MDV_ST_CODE, bw, &rows);
+            i = i + 1;
+            continue;
+        }
+        if is_fence {
+            fence = true;
+            fence_ch = fch;
+            fence_len = flen;
+            if fie > fis {
+                mdv_puts(t, m, "│ ", MDV_ST_TSEP);
+                var keep: usize = fie - fis;
+                if mdv_cols(text + fis, keep) > bw - 2 {
+                    keep = tty_clip_bytes(text + fis, keep, bw - 3);
+                }
+                mdv_put(t, m, text + fis, keep, MDV_ST_CODE_LANG);
+                mdv_nl(t, m);
+                rows = rows + 1;
+            }
+            i = i + 1;
+            continue;
+        }
+        // ---- 分隔线 ----
+        if mdv_rule(text, s, e) {
+            var x: usize = 0;
+            while x < bw {
+                mdv_puts(t, m, "─", MDV_ST_RULE);
+                x = x + 1;
+            }
+            mdv_nl(t, m);
+            rows = rows + 1;
+            i = i + 1;
+            continue;
+        }
+        // ---- 标题 ----
+        var lv: usize = 0;
+        var hs: usize = 0;
+        var he: usize = 0;
+        if mdv_heading(text, s, e, &lv, &hs, &he) {
+            var hst: u8 = MDV_ST_H3;
+            if lv == 1 {
+                hst = MDV_ST_H1;
+            } else if lv == 2 {
+                hst = MDV_ST_H2;
+            }
+            mdv_emit(t, m, "" as &const byte, "" as &const byte, 0,
+                "" as &const byte, "" as &const byte, 0, text, hs, he, hst, bw, &rows);
+            i = i + 1;
+            continue;
+        }
+        // ---- 引用 ----
+        var qd: usize = 0;
+        var qs: usize = 0;
+        var qe: usize = 0;
+        if mdv_quote(text, s, e, &qd, &qs, &qe) {
+            var lvq: usize = qd;
+            if lvq > MDV_MAX_LEVEL {
+                lvq = MDV_MAX_LEVEL;
+            }
+            mdv_set_ascii(&g_mdv_pre_t, &g_mdv_pre_m, lvq, "▏ " as &const byte, MDV_ST_QUOTE);
+            mdv_emit(t, m, g_mdv_pre_t.ptr as &const byte, g_mdv_pre_m.ptr as &const byte, g_mdv_pre_t.len,
+                "  " as &const byte, g_mdv_pre_m.ptr as &const byte, lvq * 2,
+                text, qs, qe, MDV_ST_QUOTE, bw, &rows);
+            i = i + 1;
+            continue;
+        }
+        // ---- 表格 ----
+        var tts: usize = 0;
+        var tte: usize = 0;
+        var tnc: usize = 0;
+        if mdv_table_start(text, i, &tts, &tte, &tnc) {
+            if tnc > MDV_MAX_COLS {
+                tnc = MDV_MAX_COLS;
+            }
+            // 1) 正文行范围
+            var endi: usize = i + 2;
+            while endi < g_mdv_lines.n {
+                var rs: usize = 0;
+                var re: usize = 0;
+                if !mdv_table_row_start(text, endi, &rs, &re) {
+                    break;
+                }
+                endi = endi + 1;
+            }
+            // 2) 量列宽（表头 + 正文）
+            const warr: &usize = &g_mdv_w[0];
+            var j: usize = 0;
+            while j < tnc && j < MDV_MAX_COLS {
+                warr[j] = 3;
+                j = j + 1;
+            }
+            mdv_row_widths(text, tts, tte, tnc);
+            var ri: usize = i + 2;
+            while ri < endi {
+                var rs2: usize = 0;
+                var re2: usize = 0;
+                if !mdv_line_at(text, ri, &rs2, &re2) {
+                    break;
+                }
+                mdv_row_widths(text, rs2, re2, tnc);
+                ri = ri + 1;
+            }
+            // 3) 收窄到预算：反复把最宽那列减 1（下限 3）
+            //    每个数组下标都自带 `j < MDV_MAX_COLS` 的显式守卫：tnc 是从 out 参数带回来的，
+            //    编译器对它的边界证明在这些函数调用之后就不成立了（README 踩坑 6 同族）。
+            var need: usize = (3 * tnc) + 1;
+            j = 0;
+            while j < tnc && j < MDV_MAX_COLS {
+                need = need + warr[j];
+                j = j + 1;
+            }
+            var guard: usize = 0;
+            while need > bw && guard < 4096 {
+                // 先找最宽的列（> 下限 3），再把它减 1。
+                // 不用「记住下标再索引」的写法：类型检查器的数组边界证明只认
+                // 循环变量上的 `j < MDV_MAX_COLS` 这种正的守卫（README 踩坑 6）。
+                var maxw: usize = 3;
+                j = 0;
+                while j < tnc && j < MDV_MAX_COLS {
+                    if warr[j] > maxw {
+                        maxw = warr[j];
+                    }
+                    j = j + 1;
+                }
+                if maxw <= 3 {
+                    break;   // 所有列都到下限了，收不下去
+                }
+                var done: bool = false;
+                j = 0;
+                while j < tnc && j < MDV_MAX_COLS {
+                    if !done && warr[j] == maxw {
+                        warr[j] = maxw - 1;
+                        done = true;
+                    }
+                    j = j + 1;
+                }
+                if !done {
+                    break;
+                }
+                need = need - 1;
+                guard = guard + 1;
+            }
+            if need <= bw {
+                mdv_table_emit_row(t, m, text, tts, tte, tnc, MDV_ST_THEAD, &rows);
+                mdv_table_emit_sep(t, m, tnc, &rows);
+                ri = i + 2;
+                while ri < endi {
+                    var rs3: usize = 0;
+                    var re3: usize = 0;
+                    if !mdv_line_at(text, ri, &rs3, &re3) {
+                        break;
+                    }
+                    mdv_table_emit_row(t, m, text, rs3, re3, tnc, MDV_ST_TCELL, &rows);
+                    ri = ri + 1;
+                }
+            } else {
+                // 放不下：整块退回普通行（内容一个字节都不丢）
+                var pi: usize = i;
+                while pi < endi {
+                    var ps: usize = 0;
+                    var pe: usize = 0;
+                    if !mdv_line_at(text, pi, &ps, &pe) {
+                        break;
+                    }
+                    mdv_emit(t, m, "" as &const byte, "" as &const byte, 0,
+                        "" as &const byte, "" as &const byte, 0, text, ps, pe, MDV_ST_TEXT, bw, &rows);
+                    pi = pi + 1;
+                }
+            }
+            i = endi;
+            continue;
+        }
+        // ---- 列表项 ----
+        var llv: usize = 0;
+        var ordered: bool = false;
+        var nms: usize = 0;
+        var nml: usize = 0;
+        var lbs: usize = 0;
+        var lbe: usize = 0;
+        var task: u8 = 0;
+        if mdv_list(text, s, e, &llv, &ordered, &nms, &nml, &lbs, &lbe, &task) {
+            // 前缀 = 缩进（默认色）+ 标记（标记色）；续行缩进 = 等宽空白
+            buf_reset(&g_mdv_pre_t);
+            buf_reset(&g_mdv_pre_m);
+            buf_reset(&g_mdv_ct_t);
+            buf_reset(&g_mdv_ct_m);
+            var lv2: usize = 0;
+            while lv2 < llv {
+                mdv_spaces(&g_mdv_pre_t, &g_mdv_pre_m, MDV_INDENT, MDV_ST_TEXT);
+                mdv_spaces(&g_mdv_ct_t, &g_mdv_ct_m, MDV_INDENT, MDV_ST_TEXT);
+                lv2 = lv2 + 1;
+            }
+            var mst: u8 = MDV_ST_BULLET;
+            var mcols: usize = 2;
+            if ordered {
+                mst = MDV_ST_ORDERED;
+                mdv_put(&g_mdv_pre_t, &g_mdv_pre_m, text + nms, nml, MDV_ST_ORDERED);
+                mdv_spaces(&g_mdv_pre_t, &g_mdv_pre_m, 1, MDV_ST_TEXT);
+                mdv_spaces(&g_mdv_ct_t, &g_mdv_ct_m, nml + 1, MDV_ST_TEXT);
+                mcols = nml + 1;
+            } else if task == 2 {
+                mst = MDV_ST_DONE;
+                mdv_puts(&g_mdv_pre_t, &g_mdv_pre_m, "✓ " as &const byte, MDV_ST_DONE);
+                mdv_spaces(&g_mdv_ct_t, &g_mdv_ct_m, 2, MDV_ST_TEXT);
+            } else {
+                mdv_puts(&g_mdv_pre_t, &g_mdv_pre_m, "· " as &const byte, MDV_ST_BULLET);
+                mdv_spaces(&g_mdv_ct_t, &g_mdv_ct_m, 2, MDV_ST_TEXT);
+            }
+            const pre_len: usize = g_mdv_pre_t.len;
+            const ct_len: usize = g_mdv_ct_t.len;
+            mdv_emit(t, m,
+                g_mdv_pre_t.ptr as &const byte, g_mdv_pre_m.ptr as &const byte, pre_len,
+                g_mdv_ct_t.ptr as &const byte, g_mdv_ct_m.ptr as &const byte, ct_len,
+                text, lbs, lbe, MDV_ST_TEXT, bw, &rows);
+            i = i + 1;
+            continue;
+        }
+        // ---- 普通段落 ----
+        mdv_emit(t, m, "" as &const byte, "" as &const byte, 0,
+            "" as &const byte, "" as &const byte, 0, text, s, e, MDV_ST_TEXT, bw, &rows);
+        i = i + 1;
+    }
+    if rows == 0 {
+        mdv_nl(t, m);
+        rows = 1;
+    }
+    return rows;
+}

@@ -110,7 +110,7 @@ def pump(fd, scr, seconds):
             scr.feed(data)
 
 
-def drive(port, workspace, sleep_secs, extra=None):
+def drive(port, workspace, sleep_secs, mode="direct", extra=None):
     os.makedirs(workspace, exist_ok=True)
     extra = extra or []
     env = dict(os.environ)
@@ -129,7 +129,8 @@ def drive(port, workspace, sleep_secs, extra=None):
     fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", 30, 110, 0, 0))
 
     scr = Screen()
-    verdict = {}
+    verdict = {"mode": mode}
+    cr = b"\r"
     try:
         pump(fd, scr, 1.2)
         verdict["frame_ok"] = "Ask anything" in scr.text()
@@ -141,16 +142,52 @@ def drive(port, workspace, sleep_secs, extra=None):
             if "sub-1 [subagent]" in scr.text():
                 break
         verdict["agent_seen"] = "sub-1 [subagent]" in scr.text()
-        # 敲 /watch sub-1。TUI 输入纪律：以 / 开头先弹命令面板；这条不在表内，
-        # 回车把整行还回输入行（+ notice），**再**回车才真的派发。
-        os.write(fd, "/watch sub-1".encode("utf-8"))
-        pump(fd, scr, 0.5)
-        cr = b"\r"
-        os.write(fd, cr)
-        pump(fd, scr, 0.5)
-        os.write(fd, cr)
-        pump(fd, scr, 0.8)
+
+        if mode == "direct":
+            # P42 那条路：敲 /watch sub-1。TUI 输入纪律：以 / 开头先弹命令面板；这条不在
+            # 表内，回车把整行还回输入行（+ notice），**再**回车才真的派发。
+            os.write(fd, "/watch sub-1".encode("utf-8"))
+            pump(fd, scr, 0.5)
+            os.write(fd, cr)
+            pump(fd, scr, 0.5)
+            os.write(fd, cr)
+            pump(fd, scr, 0.8)
+        elif mode == "pick":
+            # P46：裸 /watch → 面板里选中 /watch → 现役清单浮层。
+            # 游标默认落在**第一个代理行**上（第 0 行是表头），所以**一次回车**就该开始跟随。
+            os.write(fd, "/watch".encode("utf-8"))
+            pump(fd, scr, 0.6)
+            os.write(fd, cr)
+            pump(fd, scr, 0.9)
+            if "跟随子代理（" not in scr.text():
+                os.write(fd, cr)          # 面板那条路要第二次回车时兜一下
+                pump(fd, scr, 0.9)
+            verdict["list_opened"] = "跟随子代理（" in scr.text()
+            verdict["list_hint"] = "回车跟随" in scr.text()
+            verdict["list_row"] = "sub-1 [running]" in scr.text()
+            t_pick = time.time()
+            os.write(fd, cr)
+            pump(fd, scr, 1.2)
+            verdict["pick_secs"] = round(time.time() - t_pick, 1)
+            # 游标要是落在表头上，得到的会是这句 notice（P46 之前的样子）
+            verdict["header_notice"] = "没认出子代理编号" in scr.text()
+        else:  # running
+            # P46：父代理那一轮**还在飞**（假网关把 parent-final 按住）时敲 /watch sub-1。
+            # 面板拦一道（+ 提示「再按一次回车」），第二次回车派发 —— 必须**当场**开浮层，
+            # 而不是等父代理的回合结束。
+            os.write(fd, "/watch sub-1".encode("utf-8"))
+            pump(fd, scr, 0.5)
+            os.write(fd, cr)
+            pump(fd, scr, 0.4)
+            verdict["hint_seen"] = "再按一次回车" in scr.text()
+            t_pick = time.time()
+            os.write(fd, cr)
+            pump(fd, scr, 1.2)
+            verdict["pick_secs"] = round(time.time() - t_pick, 1)
+
         verdict["watch_opened"] = "跟随 sub-1" in scr.text()
+        verdict["parent_done_seen"] = "PARENT-DONE-OK" in scr.text()
+        verdict["frame_after_open"] = scr.text()
 
         # 关键判据：在子代理**还在跑**的时候就出现这些事件
         need = ("[step", "▸ bash")
@@ -195,9 +232,14 @@ def main():
     ap.add_argument("--port", type=int, required=True)
     ap.add_argument("--workspace", required=True)
     ap.add_argument("--sleep", type=int, default=8, help="子代理那条慢命令睡多久")
+    ap.add_argument("--mode", default="direct", choices=("direct", "pick", "running"),
+                    help="direct=P42 的 /watch sub-1；pick=P46 清单里选中即跟随；"
+                         "running=P46 父代理回合还在飞时敲 /watch sub-1")
+    ap.add_argument("--parent-hold", type=int, default=0,
+                    help="running 模式：假网关把父代理收尾按住多少秒（必须 > 开浮层耗时）")
     args = ap.parse_args()
 
-    v = drive(args.port, args.workspace, args.sleep)
+    v = drive(args.port, args.workspace, args.sleep, args.mode)
     failures = []
 
     def check(cond, msg):
@@ -206,7 +248,21 @@ def main():
 
     check(v.get("frame_ok"), "首帧没画出来（'Ask anything' 不在屏上）")
     check(v.get("agent_seen"), "agents 面板上没出现 sub-1（子代理没派出去？）")
-    check(v.get("watch_opened"), "敲 /watch sub-1 之后没看到跟随浮层")
+    if args.mode == "pick":
+        check(v.get("list_opened"), "裸 /watch 没开出「跟随子代理」清单浮层")
+        check(v.get("list_hint"), "清单标题里没写「回车跟随」（用户不知道回车能干什么）")
+        check(v.get("list_row"), "清单里没有 sub-1 那一行")
+        check(not v.get("header_notice"), "回车落在了表头那一行（默认游标没到第一个代理行）")
+        check(v.get("watch_opened"), "清单里选中 sub-1 之后没看到跟随浮层")
+    elif args.mode == "running":
+        check(v.get("hint_seen"), "面板拦下 /watch sub-1 后没有提示「再按一次回车」")
+        check(v.get("watch_opened"), "父代理还在跑时敲 /watch sub-1 没有开出跟随浮层")
+        check(not v.get("parent_done_seen"),
+              "跟随浮层是在父代理回合结束之后才开的（运行中派发那条路没生效）")
+        check((v.get("pick_secs") or 99) < max(1, args.parent_hold - 2),
+              "开浮层耗时不小于假网关按住的时长（父代理可能已经收尾，判据不作数）")
+    else:
+        check(v.get("watch_opened"), "敲 /watch sub-1 之后没看到跟随浮层")
     fs = v.get("first_seen", {})
     # 实时性：这两条都必须在子代理结束之前就出现
     check("[step" in fs, "浮层里没出现 [step …]（事件没被渲染出来？）")
@@ -215,8 +271,11 @@ def main():
     check(v.get("tool_done_seen"), "没看到工具的真实输出（CHILD_TOOL_DONE）")
 
     print("---- 判据 ----")
-    for k in ("frame_ok", "agent_seen", "watch_opened", "ended_seen", "tool_done_seen"):
-        print("%-16s: %s" % (k, v.get(k)))
+    for k in ("mode", "frame_ok", "agent_seen", "list_opened", "list_hint", "header_notice",
+              "hint_seen", "parent_done_seen", "pick_secs", "watch_opened", "ended_seen",
+              "tool_done_seen"):
+        if k in v:
+            print("%-16s: %s" % (k, v.get(k)))
     print("%-16s: %s" % ("first_seen", fs))
     if os.environ.get("PTY_DUMP") or failures:
         print("\n---- 最后一屏 ----")
