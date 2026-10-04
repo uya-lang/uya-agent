@@ -16,7 +16,7 @@
     baseline             （对照）不做任何输入，只看回显的脚注
     worktree-menu        （P41）命令面板里选中 /worktree 与裸 /worktree 都要开动作选择框；
                          ↓ 到 finish → 回车翻确认框；确认框上按回车（默认游标是「取消」）什么都不做
-    overlay-fullscreen   （P49）浮层全屏：非全屏的 /status 是居中框 → ctrl+f 顶到屏幕四边
+    overlay-fullscreen   （P53）浮层全屏：非全屏的 /status 是居中框 → ctrl+f 顶到屏幕四边
                          （顶边第 0 行、左右边框 0 与 cols-1）且不吃面板/脚注 → F11 关回居中
                          → 再全屏一次、esc 关掉浮层
 
@@ -127,7 +127,7 @@ class Screen:
     def has(self, s):
         return s in self.text()
 
-    # ---- P49：浮层全屏的判据要读**屏幕几何**（边框在哪一行/列），所以要几个小工具 ----
+    # ---- P53：浮层全屏的判据要读**屏幕几何**（边框在哪一行/列），所以要几个小工具 ----
 
     def first_border_row(self):
         """第一个 ╭ 所在行（浮层顶边）；没有返回 None。"""
@@ -333,7 +333,7 @@ def suite():
     check(v8.get("menu_closed"), "翻出确认框之后动作选择框还盖着", failures)
     check(v8.get("cancelled"), "确认框上按回车（默认游标是取消）之后框还在", failures)
     all_v["worktree"] = v8
-    # ---- P49：浮层全屏（真终端里的 ctrl+f / F11）----
+    # ---- P53：浮层全屏（真终端里的 ctrl+f / F11）----
     v9 = run_scenario(0, base + "_fullscreen", "overlay-fullscreen")
     check(v9.get("plain_seen"), "空虚敲 /status 没有开出浮层", failures)
     check(v9.get("plain_not_fullscreen"),
@@ -368,7 +368,7 @@ def suite():
     print("P41 PASS（/worktree 动作选择框：面板选中 %s ms · 裸命令 %s ms · 确认框 %s ms；"
           "八个动作与 ✓ 都在，确认框默认游标是取消）"
           % (v8.get("palette_ms"), v8.get("menu_ms"), v8.get("confirm_ms")))
-    print("P49 PASS（浮层全屏：非全屏居中（顶边 %s 行）→ ctrl+f 占满整行（边框列 %s、"
+    print("P53 PASS（浮层全屏：非全屏居中（顶边 %s 行）→ ctrl+f 占满整行（边框列 %s、"
           "顶边 %s 行、底边压在面板 %s 之上、面板与脚注都在）→ F11 关回居中（顶边 %s 行）→"
           "esc 关掉浮层）"
           % (v9.get("plain_top_row"), v9.get("full_cols"), v9.get("full_top_row"),
@@ -473,7 +473,7 @@ def _drive(port, workspace, scenario, extra=None):
             pump(fd, screen, 4.0)
             verdict["second_turn_ok"] = screen.has("SELFTEST_OK")
         elif scenario == "overlay-fullscreen":
-            # P49：真终端里的浮层全屏（ctrl+f / F11）。判据全是**屏幕几何事实**：
+            # P53：真终端里的浮层全屏（ctrl+f / F11）。判据全是**屏幕几何事实**：
             #   ① 非全屏的 /status 是居中框（顶边不在第 0 行、左边框不在第 0 列）；
             #   ② ctrl+f 之后框顶到屏幕四边（第 0 行是 ╭、左右边框在第 0 / cols-1 列）；
             #   ③ 全屏**不吃**面板与脚注（占位文案与 cwd 都还在），且底边压在面板之上；
