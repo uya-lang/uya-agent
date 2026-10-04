@@ -364,7 +364,7 @@ e2e-title:
 		|| { echo "FAIL: --title 应当压过 UYA_AGENT_TITLE=0"; exit 1; }; \
 	echo "e2e-title: 通过（默认开；--no-title / UYA_AGENT_TITLE 同口径；CLI 优先）"
 
-# P44：鼠标上报开关回归（离线，不联网）。默认开（滚轮要靠它）；--no-mouse / UYA_AGENT_MOUSE=0
+# 踩坑 72：鼠标上报开关回归（离线，不联网）。默认开（滚轮要靠它）；--no-mouse / UYA_AGENT_MOUSE=0
 # 都要在 --print-config 的来源列上看得出来（来源码与 cfg_src_name 同口径），而且 CLI 压过 env。
 # 这是「TUI 里不能拖选复制文本」的出口：关掉之后终端重新接管拖选（真 PTY 的字节级验证在
 # selftest 的 tui-mouse 轮里；这里只钉配置来源链）。
