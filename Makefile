@@ -32,7 +32,7 @@ TASK ?= 创建 hello.uya，编译并运行它
 export UYA_ROOT
 export UYA_SPLIT_C_DIR := $(CURDIR)/build/uyacache
 
-.PHONY: all check build selftest codegen-audit probe e2e e2e-config e2e-config-flags e2e-title e2e-api e2e-steps e2e-permission e2e-sandbox e2e-tasks e2e-goal e2e-sessions e2e-resume-big e2e-diff e2e-ws e2e-model e2e-worktree e2e-watch e2e-dsh p30-check tui-demo tui-selftest sess-selftest diff-selftest model-selftest panel-selftest clean shell-selftest
+.PHONY: all check build selftest codegen-audit probe e2e e2e-config e2e-config-flags e2e-title e2e-mouse e2e-api e2e-steps e2e-permission e2e-sandbox e2e-tasks e2e-goal e2e-sessions e2e-resume-big e2e-diff e2e-ws e2e-model e2e-worktree e2e-watch e2e-dsh p30-check tui-demo tui-selftest sess-selftest diff-selftest model-selftest panel-selftest clean shell-selftest
 
 all: build
 
@@ -57,7 +57,7 @@ codegen-audit: build
 	fi; \
 	echo "codegen-audit: 通过（没有切片描述符强转）"
 
-selftest: build codegen-audit e2e-config-flags e2e-title e2e-api e2e-steps e2e-permission e2e-sandbox e2e-tasks e2e-goal e2e-sessions e2e-resume-big e2e-diff e2e-ws e2e-model e2e-worktree p30-check
+selftest: build codegen-audit e2e-config-flags e2e-title e2e-mouse e2e-api e2e-steps e2e-permission e2e-sandbox e2e-tasks e2e-goal e2e-sessions e2e-resume-big e2e-diff e2e-ws e2e-model e2e-worktree p30-check
 	UYA_BIN=$(UYA) $(OUT) --selftest
 
 probe: build
@@ -363,6 +363,30 @@ e2e-title:
 	echo "$$out" | grep -q "title = on  (source: cli)" \
 		|| { echo "FAIL: --title 应当压过 UYA_AGENT_TITLE=0"; exit 1; }; \
 	echo "e2e-title: 通过（默认开；--no-title / UYA_AGENT_TITLE 同口径；CLI 优先）"
+
+# 踩坑 72：鼠标上报开关回归（离线，不联网）。默认开（滚轮要靠它）；--no-mouse / UYA_AGENT_MOUSE=0
+# 都要在 --print-config 的来源列上看得出来（来源码与 cfg_src_name 同口径），而且 CLI 压过 env。
+# 这是「TUI 里不能拖选复制文本」的出口：关掉之后终端重新接管拖选（真 PTY 的字节级验证在
+# selftest 的 tui-mouse 轮里；这里只钉配置来源链）。
+e2e-mouse:
+	@set -e; \
+	out=$$($(OUT) --no-dsh-config --print-config 2>&1); \
+	echo "$$out" | grep -q "mouse = on  (source: default)" \
+		|| { echo "FAIL: 鼠标上报默认应当是开（滚轮依赖它）"; exit 1; }; \
+	out=$$($(OUT) --no-dsh-config --no-mouse --print-config 2>&1); \
+	echo "$$out" | grep -q "mouse = off  (source: cli)" \
+		|| { echo "FAIL: --no-mouse 没有生效"; exit 1; }; \
+	out=$$(UYA_AGENT_MOUSE=0 $(OUT) --no-dsh-config --print-config 2>&1); \
+	echo "$$out" | grep -q "mouse = off  (source: env)" \
+		|| { echo "FAIL: UYA_AGENT_MOUSE 没有生效"; exit 1; }; \
+	out=$$(UYA_AGENT_MOUSE=0 $(OUT) --no-dsh-config --mouse --print-config 2>&1); \
+	echo "$$out" | grep -q "mouse = on  (source: cli)" \
+		|| { echo "FAIL: --mouse 应当压过 UYA_AGENT_MOUSE=0"; exit 1; }; \
+	out=$$(printf '/mouse\n/mouse bogus\n/mouse off\n/exit\n' | \
+		$(OUT) --no-dsh-config --no-tui --api-key dummy-key --quiet 2>&1); \
+	echo "$$out" | grep -q "滚动模式没开鼠标上报" \
+		|| { echo "FAIL: 滚动模式下的 /mouse 应当说明没开鼠标上报"; exit 1; }; \
+	echo "e2e-mouse: 通过（默认开；--no-mouse / UYA_AGENT_MOUSE 同口径；CLI 优先；滚动模式 /mouse 有说明）"
 
 # 线协议 flag 回归（离线，--print-config / --dry-run 都不联网）：
 #   * 默认（没有任何声明）= 先 responses + 允许一次性协商回退 chat；
