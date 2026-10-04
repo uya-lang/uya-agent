@@ -12,6 +12,7 @@
 #   make e2e-sessions  # /sessions 三列 / 最新的在最后一行 / 同 id 取最后一条 / id 完整（离线）
 #   make e2e-resume-big # ~3 MiB 会话日志 --resume 不段错误 + 最后一条 workspace 取到（离线）
 #   make e2e TASK="..." PIN=<leaf sha256> [STEPS=N]   # 真实调用（需要 DEEPSEEK_API_KEY；STEPS 不给就不限步数）
+#   make e2e-watch  # /watch：子代理实时过程消息（真终端 + 假网关，离线）
 #   make e2e-steps  # 步数默认值回归（离线，不联网）
 #   make clean
 #
@@ -20,7 +21,7 @@
 UYA_ROOT ?= /home/winger/uya-0.10/lib/
 UYA      ?= /home/winger/uya-0.10/bin/uya
 
-SRC := src/bufx.uya src/jsonx.uya src/httpc.uya src/httpstream.uya src/sse.uya src/llm.uya src/tty.uya src/sigx.uya src/inbox.uya src/session.uya src/stats.uya src/procx.uya src/yamlcfg.uya src/modelx.uya src/dshcfg.uya src/dshsess.uya src/prompt.uya src/instr.uya src/compact.uya src/skill.uya src/webx.uya src/deleg.uya src/goal.uya src/workflow.uya src/todo.uya src/plan.uya src/perm.uya src/sandboxx.uya src/askuser.uya src/fsx.uya src/search.uya src/jobs.uya src/shellx.uya src/gitx.uya src/gitdiff.uya src/worktreex.uya src/tools.uya src/diffx.uya src/view.uya src/tasks.uya src/tui.uya src/agent.uya src/sigselftest.uya src/shellselftest.uya src/tuiselftest.uya src/selftest.uya
+SRC := src/bufx.uya src/jsonx.uya src/httpc.uya src/httpstream.uya src/sse.uya src/llm.uya src/tty.uya src/sigx.uya src/inbox.uya src/session.uya src/stats.uya src/procx.uya src/yamlcfg.uya src/modelx.uya src/dshcfg.uya src/dshsess.uya src/prompt.uya src/instr.uya src/compact.uya src/skill.uya src/webx.uya src/deleg.uya src/goal.uya src/workflow.uya src/todo.uya src/plan.uya src/perm.uya src/sandboxx.uya src/askuser.uya src/fsx.uya src/search.uya src/jobs.uya src/shellx.uya src/gitx.uya src/gitdiff.uya src/worktreex.uya src/tools.uya src/diffx.uya src/view.uya src/tasks.uya src/watch.uya src/tui.uya src/agent.uya src/sigselftest.uya src/shellselftest.uya src/tuiselftest.uya src/selftest.uya
 OUT := build/uya-agent
 
 BASE ?= https://api.deepseek.com/v1
@@ -31,7 +32,7 @@ TASK ?= 创建 hello.uya，编译并运行它
 export UYA_ROOT
 export UYA_SPLIT_C_DIR := $(CURDIR)/build/uyacache
 
-.PHONY: all check build selftest codegen-audit probe e2e e2e-config e2e-config-flags e2e-title e2e-api e2e-steps e2e-permission e2e-sandbox e2e-tasks e2e-goal e2e-sessions e2e-resume-big e2e-diff e2e-ws e2e-model e2e-worktree e2e-dsh p30-check tui-demo tui-selftest sess-selftest diff-selftest model-selftest panel-selftest clean shell-selftest
+.PHONY: all check build selftest codegen-audit probe e2e e2e-config e2e-config-flags e2e-title e2e-api e2e-steps e2e-permission e2e-sandbox e2e-tasks e2e-goal e2e-sessions e2e-resume-big e2e-diff e2e-ws e2e-model e2e-worktree e2e-watch e2e-dsh p30-check tui-demo tui-selftest sess-selftest diff-selftest model-selftest panel-selftest clean shell-selftest
 
 all: build
 
@@ -445,6 +446,24 @@ e2e-dsh: build
 p30-check: build
 	@python3 testdata/pty_drive.py --suite
 
+# P42：/watch —— 子代理的实时过程消息（真终端 + 假网关；离线，不联网）
+#   判据（脚本见 testdata/pty_drive_watch.py，假网关见 testdata/mock_gateway_watch.py）：
+#     父代理派一个「先思考、再跑 sleep N 的 bash」的子代理；期间敲 /watch sub-1，
+#     `[step …]` 与 `▸ bash …` 必须**在子代理结束之前**就上屏（这才是「实时」）。
+#   对照旧行为：子代理的 fd 1/2 → /dev/null，管道只承载终态答复，所以面板上那列
+#   「已收输出行数」对普通 subagent 恒为 0 —— 运行中从管道看不到任何过程消息。
+e2e-watch: build
+	@set -e; \
+	ws=build/selftest_p41_watch; rm -rf $$ws; mkdir -p $$ws; \
+	python3 testdata/mock_gateway_watch.py 0 8 > $$ws/gw.log 2>&1 & \
+	gw=$$!; \
+	trap "kill $$gw 2>/dev/null || true" EXIT; \
+	sleep 1.2; \
+	port=$$(awk '/^PORT/{print $$2}' $$ws/gw.log); \
+	[ -n "$$port" ] || { echo "FAIL: 假网关没打印端口"; cat $$ws/gw.log; exit 1; }; \
+	UYA_BIN=$(OUT) python3 testdata/pty_drive_watch.py --port $$port --workspace $$ws; \
+	echo "e2e-watch: 通过（/watch 在子代理结束前就读到 [step]/▸ bash）"
+
 # P33/P35：/sessions 列表（离线，行式 REPL 走真二进制）：三列 = 标题 / 工作区 / session id，
 # 同 id 只留最后一条；**P35 起最新的排最后一行**（`--list-sessions` 与 `/sessions` 同一份）。
 # TUI 浮层那条腿（宽箱体 / 逐行宽度不变量 / 默认游标落在最新那条 / 选中项取完整 id）
@@ -517,7 +536,7 @@ tui-selftest: build
 model-selftest: build
 	UYA_SELFTEST_MODEL_ONLY=1 $(OUT) --selftest
 
-# P33：/sessions 列表的自测轮（纯函数排版 + TUI 浮层），改会话列表时比整轮 selftest 快
+# P33：/sessions 列表的自测轮（纯函数排版 + TUI 浮层 + 大索引排序/大列表取行），改会话列表时比整轮 selftest 快
 sess-selftest: build
 	UYA_SELFTEST_SESS_ONLY=1 $(OUT) --selftest
 

@@ -5543,6 +5543,402 @@ fn sess_list_round(tag: &const byte) bool {
     return ok;
 }
 
+// ============================================================
+// sess-list-big（踩坑 68）：大索引上的排序 —— 与参考插入排序逐行等价 + 结果确定
+// ============================================================
+// 现场（用户报的「session 选择框显示后很卡」）：数据层两处 `sess_idx_sort_*` 是**插入排序**
+// （O(n²)）。会话索引是追加写的，lastActiveAt 天然升序 ⇒ 插入排序每次都把新记录一路挪到
+// 最前，正好是最坏情况（实测 12.8 K 行：升序 1.4 s、降序 0.19 s）。改成自底向上归并
+// （O(n log n)）之后两种顺序都是 0.2 s 量级。
+//
+// 这一轮盯两件事：
+//   1) **等价性**：归并的结果与「金标准（就用未修版本的插入排序）」逐行相同 —— 比较键
+//      必须是严格全序，否则同键记录的顺序会漂（`line_off` 是次级键，在一份索引里唯一）；
+//   2) **确定性**：同一份输入排两次，结果逐行相同。
+
+// 金标准：按 (id 升序, 行号升序) 的插入排序（未修版本原文，只给自测当参照）
+fn sessbig_ref_sort_by_id(idx: &const Buf, rows: &SessIdxRow, n: usize) void {
+    const tmp: &SessIdxRow = sess_idx_at_mut(rows, n);
+    var i: usize = 1;
+    while i < n {
+        sess_idx_copy(tmp, sess_idx_at(rows, i));
+        var j: usize = i;
+        while j > 0 {
+            const prev: &const SessIdxRow = sess_idx_at(rows, j - 1);
+            const c: i32 = sess_idx_id_cmp(idx, prev, tmp);
+            var stop: bool = false;
+            if c < 0 {
+                stop = true;
+            } else if c == 0 && prev.line_off < tmp.line_off {
+                stop = true;
+            }
+            if stop {
+                break;
+            }
+            sess_idx_copy(sess_idx_at_mut(rows, j), prev);
+            j = j - 1;
+        }
+        sess_idx_copy(sess_idx_at_mut(rows, j), tmp);
+        i = i + 1;
+    }
+}
+
+// 金标准：按 (lastActiveAt 降序, 行号降序) 的插入排序
+fn sessbig_ref_sort_by_at(rows: &SessIdxRow, n: usize) void {
+    const tmp: &SessIdxRow = sess_idx_at_mut(rows, n);
+    var i: usize = 1;
+    while i < n {
+        sess_idx_copy(tmp, sess_idx_at(rows, i));
+        var j: usize = i;
+        while j > 0 {
+            const prev: &const SessIdxRow = sess_idx_at(rows, j - 1);
+            var before: bool = false;
+            if prev.at > tmp.at {
+                before = true;
+            } else if prev.at == tmp.at && prev.line_off > tmp.line_off {
+                before = true;
+            }
+            if before {
+                break;
+            }
+            sess_idx_copy(sess_idx_at_mut(rows, j), prev);
+            j = j - 1;
+        }
+        sess_idx_copy(sess_idx_at_mut(rows, j), tmp);
+        i = i + 1;
+    }
+}
+
+const SESSBIG_N: usize = 6000;      // 索引记录数（去重后 2000 条会话）
+const SESSBIG_ESZ_MUL: usize = 2;   // 每行记录占的格数（数据 n 格 + 归并目标区 n 格）
+
+// 造一份大索引的**内存镜像**（不落盘）：形状对齐真索引 —— 追加写 ⇒ 时间戳升序；
+// 每 3 条同 id（后一条生效）；每 7 条缺一条 lastActiveAt；每 11 条重复一次时间戳。
+fn sessbig_build_fixture(rows: &Buf) bool {
+    buf_reset(rows);
+    var i: usize = 0;
+    while i < SESSBIG_N {
+        var line: Buf = buf_new(256);
+        defer { buf_free(&line); }
+        _ = buf_append_cstr(&line, "{\"id\":\"session-");
+        const gid: usize = i / 3;
+        var hex: Buf = buf_new(32);
+        defer { buf_free(&hex); }
+        _ = buf_append_u64(&hex, gid as u64);
+        var pad: usize = hex.len;
+        while pad < 8 {
+            _ = buf_append_byte(&line, 48);   // '0'：id 补齐 8 位十六进制
+            pad = pad + 1;
+        }
+        _ = buf_append(&line, hex.ptr, hex.len);
+        _ = buf_append_cstr(&line, "-1111-4111-8111-111111111111\",\"cwd\":\"/w/");
+        _ = buf_append_u64(&line, (i % 5) as u64);
+        _ = buf_append_cstr(&line, "\",\"title\":\"T");
+        _ = buf_append_u64(&line, i as u64);
+        _ = buf_append_cstr(&line, "\"");
+        if (i % (7 as usize)) != (3 as usize) {
+            const at: i64 = (1700000000000 as i64) + ((i / 11) as i64);
+            _ = buf_append_cstr(&line, ",\"lastActiveAt\":");
+            var num: Buf = buf_new(32);
+            defer { buf_free(&num); }
+            _ = buf_append_i64(&num, at);
+            _ = buf_append(&line, num.ptr, num.len);
+        }
+        _ = buf_append_cstr(&line, "}\n");
+        if !buf_append(rows, line.ptr, line.len) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+// 把 rows（每行一条索引记录原文）填进紧凑记录表；返回填了几条。
+// 表必须能放下 2n+2 格（归并排序的目标区），所有字段逐项写。
+fn sessbig_fill_rows(rows: &Buf, tab: &SessIdxRow, cap: usize) usize {
+    var m: usize = 0;
+    var p: usize = 0;
+    while p < rows.len && m < cap {
+        var e: usize = p;
+        while e < rows.len && rows.ptr[e] != 10 as byte {
+            e = e + 1;
+        }
+        const lo: usize = p;
+        const ll: usize = e - p;
+        p = e + 1;
+        if ll == 0 {
+            continue;
+        }
+        var line: Buf = buf_new(4096);
+        defer { buf_free(&line); }
+        _ = buf_append(&line, rows.ptr + lo, ll);
+        const view: &[byte] = line.ptr[0: line.len];
+        var ido: usize = 0;
+        var idl: usize = 0;
+        if !sess_idx_find_id(view, &ido, &idl) {
+            continue;
+        }
+        const r: &SessIdxRow = sess_idx_at_mut(tab, m);
+        r.at = sess_json_i64(view, "lastActiveAt");
+        r.line_off = lo;
+        r.line_len = ll;
+        r.id_off = lo + ido;
+        r.id_len = idl;
+        m = m + 1;
+    }
+    return m;
+}
+
+// 两张表逐行的 line_off 是否相同（不同就返回首个不同的行号，相同返回 -1）
+fn sessbig_first_diff(a: &const SessIdxRow, b: &const SessIdxRow, n: usize) i64 {
+    var i: usize = 0;
+    while i < n {
+        if sess_idx_at(a, i).line_off != sess_idx_at(b, i).line_off {
+            return i as i64;
+        }
+        i = i + 1;
+    }
+    return -1 as i64;
+}
+
+// 表是否按 mode 排好（含次级键）
+fn sessbig_sorted_ok(idx: &const Buf, tab: &const SessIdxRow, n: usize, mode: u8, why: &Buf) bool {
+    var i: usize = 1;
+    while i < n {
+        const prev: &const SessIdxRow = sess_idx_at(tab, i - 1);
+        const cur: &const SessIdxRow = sess_idx_at(tab, i);
+        // 「cur 不该排在 prev 前面」——把 sess_idx_before 反过来问
+        if sess_idx_before(mode, idx, cur, prev) {
+            buf_reset(why);
+            _ = buf_append_cstr(why, "第 ");
+            _ = buf_append_u64(why, i as u64);
+            _ = buf_append_cstr(why, " 行乱序");
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn sess_list_big_round(tag: &const byte) bool {
+    var ok: bool = true;
+    var rows: Buf = buf_new(1 << 20);
+    defer { buf_free(&rows); }
+    if !sessbig_build_fixture(&rows) {
+        ty_fail(tag, "大索引 fixture 造不出来", &ok);
+        return ok;
+    }
+    // fixture 自检：非空行数 == SESSBIG_N
+    var nl: usize = 0;
+    var p: usize = 0;
+    while p < rows.len {
+        var e: usize = p;
+        while e < rows.len && rows.ptr[e] != 10 as byte {
+            e = e + 1;
+        }
+        if e > p {
+            nl = nl + 1;
+        }
+        p = e + 1;
+    }
+    if nl != SESSBIG_N {
+        ty_fail(tag, "fixture 的非空行数与预期不一致", &ok);
+        return ok;
+    }
+
+    // 两张表：A 走生产实现（sess_idx_sort），B 走金标准插入排序。
+    // 按 2n+2 格分配（生产实现要归并目标区；金标准只用末格暂存）。
+    const esz: usize = @size_of(SessIdxRow) as usize;
+    const nalloc: usize = (SESSBIG_N * SESSBIG_ESZ_MUL) + 2;
+    const rawA: &void = malloc(nalloc * esz);
+    const rawB: &void = malloc(nalloc * esz);
+    if ((rawA as &byte) as usize) == 0 || ((rawB as &byte) as usize) == 0 {
+        if ((rawA as &byte) as usize) != 0 {
+            free(rawA);
+        }
+        if ((rawB as &byte) as usize) != 0 {
+            free(rawB);
+        }
+        ty_fail(tag, "排序表分配失败", &ok);
+        return ok;
+    }
+    defer {
+        free(rawA);
+        free(rawB);
+    }
+    const ta: &SessIdxRow = rawA as &SessIdxRow;
+    const tb: &SessIdxRow = rawB as &SessIdxRow;
+    const m: usize = sessbig_fill_rows(&rows, ta, SESSBIG_N);
+    if m != SESSBIG_N {
+        ty_fail(tag, "填表条数与 fixture 不符", &ok);
+        return ok;
+    }
+    // B 表照抄 A（填两遍比 memcpy 一份结构体数组更省事，也不碰移动语义）
+    var ci: usize = 0;
+    while ci < m {
+        sess_idx_copy(sess_idx_at_mut(tb, ci), sess_idx_at(ta, ci));
+        ci = ci + 1;
+    }
+
+    // ---- 1) 第一把键（id 升序）：生产实现 vs 金标准，逐行 line_off 全等 ----
+    sess_idx_sort(&rows, ta, m, SESS_IDX_BY_ID);
+    sessbig_ref_sort_by_id(&rows, tb, m);
+    const d1: i64 = sessbig_first_diff(ta, tb, m);
+    if d1 >= 0 {
+        ty_fail(tag, "按 id 排序的结果与金标准（插入排序）不一致", &ok);
+        out_err("  首个不同的行号 = ");
+        out_err_dec(d1 as usize);
+        out_err("\n");
+    }
+    var why1: Buf = buf_new(96);
+    defer { buf_free(&why1); }
+    if ok && !sessbig_sorted_ok(&rows, ta, m, SESS_IDX_BY_ID, &why1) {
+        ty_fail(tag, "按 id 排序之后不是「id 升序 / 同 id 行号升序」", &ok);
+        out_err("  ");
+        out_err_bytes(why1.ptr as &const byte, why1.len);
+        out_err("\n");
+    }
+
+    // ---- 2) 第二把键（lastActiveAt 降序 / 同行号降序）：同样比对，再验有序 ----
+    // B 表已经被步骤 1 排过；先把它还原成 A 的当前顺序再比第二把键
+    ci = 0;
+    while ci < m {
+        sess_idx_copy(sess_idx_at_mut(tb, ci), sess_idx_at(ta, ci));
+        ci = ci + 1;
+    }
+    sess_idx_sort(&rows, ta, m, SESS_IDX_BY_AT);
+    sessbig_ref_sort_by_at(tb, m);
+    const d2: i64 = sessbig_first_diff(ta, tb, m);
+    if d2 >= 0 {
+        ty_fail(tag, "按 lastActiveAt 排序的结果与金标准（插入排序）不一致", &ok);
+        out_err("  首个不同的行号 = ");
+        out_err_dec(d2 as usize);
+        out_err("\n");
+    }
+    var why2: Buf = buf_new(96);
+    defer { buf_free(&why2); }
+    if ok && !sessbig_sorted_ok(&rows, ta, m, SESS_IDX_BY_AT, &why2) {
+        ty_fail(tag, "按 lastActiveAt 排序之后不是「时间降序 / 同时间戳行号降序」", &ok);
+        out_err("  ");
+        out_err_bytes(why2.ptr as &const byte, why2.len);
+        out_err("\n");
+    }
+
+    // ---- 3) 确定性：把同一份输入排两次，逐行相同 ----
+    const rawC: &void = malloc(nalloc * esz);
+    if ((rawC as &byte) as usize) == 0 {
+        ty_fail(tag, "确定性用的第三张表分配失败", &ok);
+        return ok;
+    }
+    defer { free(rawC); }
+    const tc: &SessIdxRow = rawC as &SessIdxRow;
+    ci = 0;
+    while ci < m {
+        sess_idx_copy(sess_idx_at_mut(tc, ci), sess_idx_at(ta, ci));
+        ci = ci + 1;
+    }
+    sess_idx_sort(&rows, tc, m, SESS_IDX_BY_AT);
+    const d3: i64 = sessbig_first_diff(ta, tc, m);
+    if d3 >= 0 {
+        ty_fail(tag, "同一份输入排两次结果不同（排序不确定）", &ok);
+        out_err("  首个不同的行号 = ");
+        out_err_dec(d3 as usize);
+        out_err("\n");
+    }
+
+    // ---- 4) 端到端：去重 → 三列排版，行数 == 去重后的会话数，行尾 id 完整 ----
+    // 去重口径照抄 sess_index_rows_sorted：先按 id 排，再每组只留最后一条
+    sess_idx_sort(&rows, ta, m, SESS_IDX_BY_ID);
+    var rows_only: Buf = buf_new(1 << 20);
+    defer { buf_free(&rows_only); }
+    var keep: usize = 0;
+    var i: usize = 0;
+    while i < m {
+        var j: usize = i + 1;
+        while j < m {
+            if sess_idx_id_cmp(&rows, sess_idx_at(ta, i), sess_idx_at(ta, j)) != 0 {
+                break;
+            }
+            j = j + 1;
+        }
+        const lastr: &const SessIdxRow = sess_idx_at(ta, j - 1);
+        _ = buf_append(&rows_only, rows.ptr + lastr.line_off, lastr.line_len);
+        _ = buf_append_byte(&rows_only, 10);
+        keep = keep + 1;
+        i = j;
+    }
+    const want_keep: usize = SESSBIG_N / 3;
+    if keep != want_keep {
+        ty_fail(tag, "去重之后的会话数不对", &ok);
+        out_err("  实际 = ");
+        out_err_dec(keep);
+        out_err(" 期望 = ");
+        out_err_dec(want_keep);
+        out_err("\n");
+    }
+    var render: Buf = buf_new(1 << 20);
+    defer { buf_free(&render); }
+    sess_rows_render(&rows_only, 198, &render, true);
+    var rl: usize = 0;
+    p = 0;
+    while p < render.len {
+        if render.ptr[p] == 10 as byte {
+            rl = rl + 1;
+        }
+        p = p + 1;
+    }
+    if rl != want_keep {
+        ty_fail(tag, "大索引渲染出来的行数与会话数不一致", &ok);
+        out_err("  实际 = ");
+        out_err_dec(rl);
+        out_err(" 期望 = ");
+        out_err_dec(want_keep);
+        out_err("\n");
+    }
+    // 抽查首 / 中 / 末三行的行尾 id：必须是完整的 44 字节、且以 session- 开头
+    const probes: [usize: 3] = [0, want_keep / 2, want_keep - 1];
+    var full_id: Buf = buf_new(128);
+    defer { buf_free(&full_id); }
+    var pk: usize = 0;
+    while pk < 3 {
+        const row: usize = probes[pk];
+        if !sesslist_render_row_id(&render, row, &full_id) {
+            ty_fail(tag, "大索引渲染出来的行取不到行尾 id", &ok);
+        } else if full_id.len != 44 {
+            ty_fail(tag, "大索引渲染出来的行尾 id 长度不对（半截 id 会让 /resume 失败）", &ok);
+            out_err("  行 = ");
+            out_err_dec(row);
+            out_err("  len = ");
+            out_err_dec(full_id.len);
+            out_err("\n");
+        } else if !bufx_mem_eq(full_id.ptr as &const byte, "session-" as &const byte, 8) {
+            ty_fail(tag, "大索引渲染出来的行尾 id 不以 session- 开头", &ok);
+        }
+        pk = pk + 1;
+    }
+    // P35 展示序：最新的（时间戳最大）必须在最后一行，最旧的（缺时间戳那批）在第一行
+    var first_id: Buf = buf_new(128);
+    defer { buf_free(&first_id); }
+    if sesslist_render_row_id(&render, 0, &first_id) {
+        // 缺 lastActiveAt 的记录 at = -1，排最后 ⇒ 展示序（最新在最后）里它就该在最上
+        var first_row: Buf = buf_new(1024);
+        defer { buf_free(&first_row); }
+        if sesslist_span(&render, 0, &p, &nl) {
+            _ = buf_append(&first_row, render.ptr + p, nl);
+            if sesslist_has(&first_row, "\"lastActiveAt\"" as &const byte) {
+                ty_fail(tag, "缺 lastActiveAt 的记录没有垫到最上面（展示序反了？）", &ok);
+            }
+        }
+    }
+
+    if ok {
+        out_err("selftest[");
+        out_err(tag);
+        out_err("] ok（6000 行大索引：归并与金标准逐行等价 + 两把键各自有序 + 排序确定 + 去重 2000 条 + 行尾 id 完整）\n");
+    }
+    return ok;
+}
+
 fn dshcfg_round(tag: &const byte) bool {
     var ok: bool = true;
     const home: &const byte = "build/selftest_dsh_home";
@@ -7700,6 +8096,186 @@ fn toolcalls_cap_round(tag: &const byte) bool {
     return ok;
 }
 
+// ============================================================
+// P42：/watch —— 事件渲染 + 增量读（纯函数轮，不碰网络/终端）
+// ============================================================
+// 一条事件行 → 渲染文本（逐字节断言）。行格式就是会话日志的真实格式
+// （`{"type":…,"seq":N,"time":N,"data":{…}}`）。
+fn watch_render_round(tag: &const byte) bool {
+    var ok: bool = true;
+    var out: Buf = buf_new(4096);
+    defer { buf_free(&out); }
+
+    // ---- 1) 步边界：step 是**数字**，必须渲染成 `[step 1]`（不是 `[step ]`）----
+    var e1: Buf = vw_mk("{\"type\":\"step/start\",\"seq\":0,\"time\":1,\"data\":{\"turn\":1,\"step\":1}}");
+    _ = watch_render_event(e1.ptr[0: e1.len], &out);
+    if !ty_buf_is(&out, "[step 1]\n") {
+        ty_fail(tag, "step/start 该渲染成 [step 1]", &ok);
+        out_err("[got] ");
+        out_err_bytes(out.ptr as &const byte, out.len);
+        out_err("\n");
+    }
+    buf_free(&e1);
+
+    // ---- 2) 工具调用：`▸ <name> <args 首行>`；冷门键（description）不抢戏 ----
+    buf_reset(&out);
+    var e2: Buf = vw_mk("{\"type\":\"tool/call\",\"seq\":1,\"time\":2,\"data\":{\"turn\":1,\"step\":1,\"callId\":\"c1\",\"name\":\"bash\",\"arguments\":\"{\\\"command\\\": \\\"ls -la\\\"}\"}}");
+    _ = watch_render_event(e2.ptr[0: e2.len], &out);
+    if !ty_buf_is(&out, "▸ bash {\"command\": \"ls -la\"}\n") {
+        ty_fail(tag, "tool/call 的渲染不对", &ok);
+        out_err("[got] ");
+        out_err_bytes(out.ptr as &const byte, out.len);
+        out_err("\n");
+    }
+    buf_free(&e2);
+
+    // ---- 3) 工具结果：`  ← <首行>` ----
+    buf_reset(&out);
+    var e3: Buf = vw_mk("{\"type\":\"tool/result\",\"seq\":2,\"time\":3,\"data\":{\"turn\":1,\"step\":1,\"callId\":\"c1\",\"content\":\"CHILD_TOOL_DONE\"}}");
+    _ = watch_render_event(e3.ptr[0: e3.len], &out);
+    if !ty_buf_is(&out, "  ← CHILD_TOOL_DONE\n") {
+        ty_fail(tag, "tool/result 的渲染不对", &ok);
+        out_err("[got] ");
+        out_err_bytes(out.ptr as &const byte, out.len);
+        out_err("\n");
+    }
+    buf_free(&e3);
+
+    // ---- 4) 思考：只取首行、内部空白折叠 ----
+    buf_reset(&out);
+    var e4: Buf = vw_mk("{\"type\":\"assistant/reasoning\",\"seq\":3,\"time\":4,\"data\":{\"turn\":1,\"step\":1,\"message\":{\"role\":\"assistant\",\"reasoning_content\":\"先看看  这个文件\\n再看下一行\"}}}");
+    _ = watch_render_event(e4.ptr[0: e4.len], &out);
+    if !ty_buf_is(&out, "✻ 思考 · 先看看 这个文件\n") {
+        ty_fail(tag, "assistant/reasoning 该取首行并折叠空白", &ok);
+        out_err("[got] ");
+        out_err_bytes(out.ptr as &const byte, out.len);
+        out_err("\n");
+    }
+    buf_free(&e4);
+
+    // ---- 5) 助手正文：`⏺ <首行>`；只有 tool_calls 的消息（content 为空）不单独出一行 ----
+    buf_reset(&out);
+    var e5: Buf = vw_mk("{\"type\":\"assistant/message\",\"seq\":4,\"time\":5,\"data\":{\"turn\":1,\"step\":2,\"message\":{\"role\":\"assistant\",\"content\":\"做完了\\n更多细节\"}}}");
+    _ = watch_render_event(e5.ptr[0: e5.len], &out);
+    if !ty_buf_is(&out, "⏺ 做完了\n") {
+        ty_fail(tag, "assistant/message 该取正文首行", &ok);
+        out_err("[got] ");
+        out_err_bytes(out.ptr as &const byte, out.len);
+        out_err("\n");
+    }
+    buf_free(&e5);
+    buf_reset(&out);
+    var e5b: Buf = vw_mk("{\"type\":\"assistant/message\",\"seq\":5,\"time\":6,\"data\":{\"turn\":1,\"step\":1,\"message\":{\"role\":\"assistant\",\"content\":\"\",\"tool_calls\":[{\"id\":\"c1\"}]}}}");
+    if watch_render_event(e5b.ptr[0: e5b.len], &out) || out.len != 0 {
+        ty_fail(tag, "只有 tool_calls 的助手消息不该单独出一行", &ok);
+    }
+    buf_free(&e5b);
+
+    // ---- 6) 无关事件（step/end）不显示；未知类型静默跳过 ----
+    buf_reset(&out);
+    var e6: Buf = vw_mk("{\"type\":\"step/end\",\"seq\":6,\"time\":7,\"data\":{\"turn\":1,\"step\":1}}");
+    if watch_render_event(e6.ptr[0: e6.len], &out) || out.len != 0 {
+        ty_fail(tag, "step/end 不该单独出一行", &ok);
+    }
+    buf_free(&e6);
+    buf_reset(&out);
+    var e7: Buf = vw_mk("{\"type\":\"完全不认识的事件\",\"seq\":7,\"time\":8,\"data\":{}}");
+    if watch_render_event(e7.ptr[0: e7.len], &out) || out.len != 0 {
+        ty_fail(tag, "未知事件类型该静默跳过", &ok);
+    }
+    buf_free(&e7);
+
+    if ok {
+        out_err("selftest[");
+        out_err(tag);
+        out_err("] ok\n");
+    }
+    return ok;
+}
+
+// 增量读：分批写文件 → 只取新增；半行不吐；一条事件刚好一行
+fn watch_poll_round(tag: &const byte, ws: &const byte) bool {
+    var ok: bool = true;
+    // 临时目录（sess_mkdir_p 收 NUL 结尾的 C 串）
+    var dir: Buf = buf_new(1200);
+    defer { buf_free(&dir); }
+    _ = buf_append_cstr(&dir, ws);
+    _ = buf_append_cstr(&dir, "/watch_inc");
+    _ = buf_append_byte(&dir, 0);
+    _ = sess_mkdir_p(dir.ptr as &const byte);
+    var path: Buf = buf_new(1300);
+    defer { buf_free(&path); }
+    _ = buf_append_cstr(&path, ws);
+    _ = buf_append_cstr(&path, "/watch_inc/session.jsonl");
+    // 清空重来（幂等：连跑两次结果一致）
+    var pz: Buf = buf_new(path.len + 1);
+    defer { buf_free(&pz); }
+    _ = buf_append(&pz, path.ptr, path.len);
+    _ = buf_append_byte(&pz, 0);
+    const cfd: i32 = sys_open(pz.ptr as *const byte, (O_WRONLY | O_CREAT | O_TRUNC) as i32, 420) catch {
+        ty_fail(tag, "建不了临时日志", &ok);
+        return ok;
+    };
+    _ = sys_close(cfd) catch {};
+
+    var w: Watch = watch_empty();
+    defer { watch_free(&w); }
+    watch_begin(&w, 0, 1, &path);
+
+    // 第 1 批：两条完整事件
+    _ = watch_append_file(pz.ptr as &const byte,
+        "{\"type\":\"step/start\",\"seq\":0,\"time\":1,\"data\":{\"turn\":1,\"step\":1}}\n{\"type\":\"tool/call\",\"seq\":1,\"time\":2,\"data\":{\"turn\":1,\"step\":1,\"callId\":\"c1\",\"name\":\"bash\",\"arguments\":\"{}\"}}\n" as &const byte);
+    _ = watch_poll(&w, 0);
+    if !ty_buf_is(&w.rendered, "[step 1]\n▸ bash {}\n") {
+        ty_fail(tag, "第一批增量读出来的文本不对", &ok);
+        out_err("[got] ");
+        out_err_bytes(w.rendered.ptr as &const byte, w.rendered.len);
+        out_err("\n");
+    }
+
+    // 第 2 批：**半行**（没有换行）→ 一个字节都不该吐出来
+    _ = watch_append_file(pz.ptr as &const byte,
+        "{\"type\":\"tool/result\",\"seq\":2,\"time\":3,\"data\":{\"turn\":1,\"step\":1,\"call" as &const byte);
+    _ = watch_poll(&w, 0);
+    if !ty_buf_is(&w.rendered, "[step 1]\n▸ bash {}\n") {
+        ty_fail(tag, "半行不该被渲染出来（会解出坏 JSON）", &ok);
+    }
+
+    // 第 3 批：补齐这一行 → 这一条才出现，且**前面两条不会重复**
+    _ = watch_append_file(pz.ptr as &const byte,
+        "Id\":\"c1\",\"content\":\"OK\"}}\n" as &const byte);
+    _ = watch_poll(&w, 0);
+    if !ty_buf_is(&w.rendered, "[step 1]\n▸ bash {}\n  ← OK\n") {
+        ty_fail(tag, "补齐半行之后应当只追加这一条", &ok);
+        out_err("[got] ");
+        out_err_bytes(w.rendered.ptr as &const byte, w.rendered.len);
+        out_err("\n");
+    }
+
+    // 第 4 批：再读一次（没有新字节）→ 内容必须一个字节都不变
+    const before: usize = w.rendered.len;
+    _ = watch_poll(&w, 0);
+    if w.rendered.len != before {
+        ty_fail(tag, "没有新内容时不该重复渲染", &ok);
+    }
+
+    if ok {
+        out_err("selftest[");
+        out_err(tag);
+        out_err("] ok\n");
+    }
+    return ok;
+}
+
+// 往文件追加一段文本（O_APPEND；测试辅助）
+fn watch_append_file(pathz: &const byte, text: &const byte) bool {
+    const fd: i32 = sys_open(pathz, (O_WRONLY | O_CREAT | O_APPEND) as i32, 420) catch {
+        return false;
+    };
+    defer { _ = sys_close(fd) catch {}; }
+    return write_all_fd(fd, text, bufx_cstr_len(text));
+}
+
 fn diffx_round(tag: &const byte) bool {
     var ok: bool = true;
     var out: Buf = buf_new(16384);
@@ -9500,7 +10076,7 @@ fn resp_build_round(tag: &const byte) bool {
         }
     }
 
-    // 3.5) completions 也要发推理强度（P42，踩坑 67）：曾经只有 responses 发，
+    // 3.5) completions 也要发推理强度（P44，踩坑 71）：曾经只有 responses 发，
     //      于是默认的 openai-completions 路由上 --effort / DSH 的 reasoningEffort 被静默丢弃。
     buf_reset(&cfg.reasoning_effort);
     _ = buf_append_cstr(&cfg.reasoning_effort, "max");
@@ -14895,7 +15471,8 @@ export fn selftest_main(base: &const Config) i32 {
         const s0: bool = sess_list_round("sess-list" as &const byte);
         const s1: bool = tui_sessions_round("tui-sessions" as &const byte);
         const s2: bool = sess_meta_big_round("sess-meta-big" as &const byte);
-        if s0 && s1 && s2 {
+        const s3: bool = sess_list_big_round("sess-list-big" as &const byte);
+        if s0 && s1 && s2 && s3 {
             out_err("SELFTEST SESS PASS\n");
             return AGENT_OK;
         }
@@ -15005,6 +15582,9 @@ export fn selftest_main(base: &const Config) i32 {
     const v0: bool = diffx_round("diff-render");
     const v1: bool = view_round("tool-view");
     const v7: bool = win_round("subagent-panel");
+    // P42：/watch —— 事件渲染（纯函数）+ 增量读（分批写文件）
+    const wch0: bool = watch_render_round("watch-render");
+    const wch1: bool = watch_poll_round("watch-poll", "build/selftest_ws_watch");
     const v5: bool = think_round("think-row");
     // P16：工具正文默认关闭（只留一行）—— 和 max_steps 那条一样，是「默认值」的单点保证：
     // 谁把默认值改回 6，view_round 的 A/D/E 与这里会同时红。
@@ -15112,6 +15692,8 @@ export fn selftest_main(base: &const Config) i32 {
     const wG: bool = ws_tool_round("ws-tool" as &const byte, base);
     // P35：大日志上的 sess_read_meta（「恢复会话段错误」回归：切片被当成「到 b 为止」）
     const wH: bool = sess_meta_big_round("sess-meta-big" as &const byte);
+    // 踩坑 68：大索引上的会话排序（归并与金标准逐行等价 + 结果确定）
+    const wI: bool = sess_list_big_round("sess-list-big" as &const byte);
     // P37：模型目录 / 模型·强度切换 / 会话日志跟随
     const m0: bool = model_catalog_round("model-catalog" as &const byte);
     const m1: bool = model_apply_round("model-apply" as &const byte);
@@ -15121,7 +15703,7 @@ export fn selftest_main(base: &const Config) i32 {
     const m4: bool = worktree_round("worktree" as &const byte);
     const m5: bool = worktree_discard_round("worktree-discard" as &const byte);
     if r1 && r2 && r3 && r4 && r5 && r5b && r6 && r7 && r8 && r9 && s0 && s1 && s2 && s3 && s4 && s5 && s6 && s7 && t0 && t1 && t2 && t3 && t3b && t4 && t5 && t6 && t7 && t8 && t9 && t10 && t11 && u0 && u1 && u2 && u3 && v0 && v1 && v2 && v3 && v4 && v5 && v6 && v7 && v8 && v9 && r1r && r1t && r1s && y0 && y1 && y2
-        && x0 && x1 && x2 && x3 && x4 && x5 && x6 && x7 && x8 && x9 && x9a && x9b && x10 && x11 && x12 && x13 && x14 && x15 && x16 && w0 && w1 && w2 && w3 && w3b && w3c && w4 && w5 && w5b && w6 && w7 && w8 && w9 && wA && wB && wC && wF && wG && wH && z0 && z1 && z2 && z3 && z4 && z5 && z6 && z7 && z8 && z9 && m0 && m1 && m2 && m3 && m4 && m5 {
+        && x0 && x1 && x2 && x3 && x4 && x5 && x6 && x7 && x8 && x9 && x9a && x9b && x10 && x11 && x12 && x13 && x14 && x15 && x16 && w0 && w1 && w2 && w3 && w3b && w3c && w4 && w5 && w5b && w6 && w7 && w8 && w9 && wA && wB && wC && wF && wG && wH && wI && z0 && z1 && z2 && z3 && z4 && z5 && z6 && z7 && z8 && z9 && m0 && m1 && m2 && m3 && m4 && m5 {
         out_err("SELFTEST PASS\n");
         return AGENT_OK;
     }

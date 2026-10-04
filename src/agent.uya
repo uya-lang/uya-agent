@@ -1060,6 +1060,15 @@ export fn agent_bash_timeout_knob() u32 {
 var g_skills: SkillSet = SkillSet{ items: [], n: 0, scanned: false };
 // P11：子代理表
 var g_deleg: DelegTable = DelegTable{ items: [], next_id: 1 };
+// P42：/watch 的跟随状态（进程内一份；不落盘 —— 它是「我现在想看谁」，不是会话状态）
+var g_watch: Watch = Watch{
+    active: false, slot: 0, id: 0,
+    path: Buf{ ptr: null, len: 0, cap: 0 },
+    off: 0,
+    partial: Buf{ ptr: null, len: 0, cap: 0 },
+    rendered: Buf{ ptr: null, len: 0, cap: 0 },
+    polled_ms: 0, ended: false,
+};
 
 export fn agent_set_home(home: &const byte) bool {
     buf_free(&g_home);
@@ -2535,7 +2544,7 @@ fn build_chat_request(cfg: &const Config, h: &const History, out: &Buf) bool {
     }
     // 推理强度：completions 走顶层 reasoning_effort（responses 走 reasoning.effort）。
     // 曾经只发 responses，于是 --effort / DSH 的 agent-default-model.reasoningEffort
-    // 在默认的 openai-completions 路由上被静默丢弃（见 README「踩坑」）。
+    // 在默认的 openai-completions 路由上被静默丢弃（见 README 踩坑 71）。
     // 与 responses 同一条门槛：compat.supportsReasoningEffort=false 时不发。
     if cfg.api_reasoning && cfg.reasoning_effort.len > 0
         && !sv_eq_cstr(&cfg.reasoning_effort, "off" as &const byte)
@@ -3929,6 +3938,9 @@ fn agent_history_begin(cfg: &Config, h: &History, first: &const Buf) bool {
     // 统计是「当前会话」口径：换会话（/new、/resume）先清零，resume 的那一份由
     // agent_hist_from_log 在扫描日志时重建
     st_reset();
+    // 清单同理：它只活在这一条会话里（--resume 也不回填，见 README §7）。
+    // 放在这里而不是 /new、/resume 各自的落点：启动、fork、恢复、换会话走的都是这条路。
+    agent_session_scoped_reset();
     g_ctx_est_at_sample = -1;
     // 导入 DSH 自己的会话（--resume-dsh <id 前缀>）：读它的 jsonl(.zstd) 转成我们的历史，
     // 然后开**我们自己的**会话继续（不写 DSH 的日志）
@@ -6421,6 +6433,19 @@ fn agent_tasks_sync() void {
     _ = tasks_panel_sync();
 }
 
+// P25：换会话（`/new` / `/resume` / fork / 启动）时清零的**会话级**状态。
+//
+// todo 清单原来**没人清**：`/new` 只关了旧会话、换掉历史、清了统计（`st_reset`），清单
+// 原封不动，于是新会话的常驻任务块与 `/tasks` 里还挂着上一条会话的「第几步」—— 用户报的
+// 正是这条（「new 指令后任务清单没有清空」）。
+//
+// 这里**只**清 todo：后台任务/子代理的复位是另一回事（`fsctx_init` 里的 `jobs_init` /
+// `deleg_init`，那是「新会话 = 新的进程状态」，不是「清单没地方存」）；会话目标在盘上
+// （`goal.json`）、按设计跨会话（见 README §7）。
+fn agent_session_scoped_reset() void {
+    todo_clear(&g_todos);
+}
+
 // 会话目标：盘上 goal.json 的内存投影（任务块显示用）
 fn agent_goal_reload(cfg: &const Config) void {
     tasks_goal_reload(cfg);
@@ -6434,12 +6459,279 @@ export fn agent_agents_tick() void {
     }
     g_agents_tick_ms = now;
     agent_tasks_sync();
+    _ = agent_watch_tick_if_active();
+}
+
+// P42：watch 的节流入口（1Hz 心跳、泵点、TUI 空闲主循环都走它）——没有 active 时立刻返回，零开销。
+//
+// 为什么要存一份 cfg：空闲的 TUI 主循环里 `g_pump_cfg` 是空的（它只在命令派发期间登记），
+// 而跟随必须在那段时间也继续长（用户就是盯着它等子代理跑完的）。
+export fn agent_watch_tick_if_active() bool {
+    if !g_watch.active {
+        return false;
+    }
+    if !g_watch_cfg_on {
+        return false;
+    }
+    return agent_watch_tick(&g_watch_cfg);
 }
 
 // 强制刷一次（回合结束 / 退出前兜底；不受 1 秒节流限制）
 export fn agent_agents_tick_force() void {
     g_agents_tick_ms = ua_now_ms();
     agent_tasks_sync();
+}
+
+// ============================================================
+// P42：/watch —— 跟随某个子代理的实时过程消息
+//
+// 设计要点：
+//   * **按需**：没有 active 的 watch 时，agent_watch_tick 一个字节都不读盘；
+//   * **只读**：读的是子代理自己那份会话日志，绝不碰它的管道（subagent_output 的
+//     增量游标因此完全不受影响）；
+//   * 内容变了才重推浮层/转录（逐字节比），避免 1Hz 无脑重画。
+// ============================================================
+var g_watch_last_len: usize = 0;
+var g_watch_last_id: i32 = 0;
+// 跟随期间的配置副本（指针 + 有效位）：空闲 TUI 主循环也能继续 poll（见下面注释）
+var g_watch_cfg: &const Config = null as &const Config;
+var g_watch_cfg_on: bool = false;
+
+fn agent_watch_hold_cfg(cfg: &const Config) void {
+    g_watch_cfg = cfg;
+    g_watch_cfg_on = true;
+}
+
+// 关掉跟随（不开浮层的调用点：用户 /watch off / 子代理没了）
+export fn agent_watch_stop() void {
+    watch_stop(&g_watch);
+    g_watch_last_len = 0;
+    g_watch_last_id = 0;
+    g_watch_cfg_on = false;
+    g_watch_cfg = null as &const Config;
+}
+
+export fn agent_watch_active() bool {
+    return g_watch.active;
+}
+
+// 子代理进终态时把它记下来（标题里显示 idle/failed，并补一行结束语）
+fn agent_watch_ended_name(status: u8) &const byte {
+    return deleg_status_name(status);
+}
+
+// 一拍：读增量 → 变了就重推。返回 true = 有变化（调用方可据此决定重画）。
+var g_watch_in_tick: bool = false;
+
+// 一拍：读增量 → 变了就重推。返回 true = 有变化（调用方可据此决定重画）。
+//
+// **重入保护**：本函数会走 deleg_check / deleg_drain 收状态，而那两条内部走泵点
+// （agent_pump_light），泵点里又会回调 agent_watch_tick_if_active —— 不设闸门就是
+// watch_tick → deleg_check → deleg_drain → pump → watch_tick 的无限递归
+// （实测 SIGSEGV，core 里 25 层全是这个环）。
+export fn agent_watch_tick(cfg: &const Config) bool {
+    if !g_watch.active {
+        return false;
+    }
+    if g_watch_in_tick {
+        return false;   // 已经在里面了：这一拍让外层那一次跑完
+    }
+    const wslot: usize = g_watch.slot;
+    if wslot >= DELEG_MAX {
+        agent_watch_stop();
+        return true;
+    }
+    // 槽位被回收/换人了：跟随自动结束（编号对不上就是别人了）
+    if !g_deleg.items[wslot].used || g_deleg.items[wslot].id != g_watch.id {
+        agent_watch_stop();
+        return true;
+    }
+    g_watch_in_tick = true;
+    defer { g_watch_in_tick = false; }
+    var changed: bool = false;
+    if !g_watch.ended {
+        // 收一下这个槽位的状态：跟随期间主循环可能没在 poll（滚动模式空闲、或跟的是
+        // 后台子代理），不主动收的话「已结束」等不到 —— 日志读完、进程也退了，
+        // status 却还停在 RUNNING。重入闸门保证这一段的泵点回调不会再进本函数。
+        deleg_check(&g_deleg, wslot);
+        if g_deleg.items[wslot].status == DELEG_RUNNING {
+            _ = deleg_drain(&g_deleg, wslot);
+        }
+        // ralph 每轮换一份日志：路径变了就重定位（保留已渲染内容，插一行切换提示）
+        var cur: Buf = buf_new(1200);
+        defer { buf_free(&cur); }
+        if deleg_watch_path(cfg, &g_deleg, g_watch.slot, &cur) && cur.len > 0 {
+            if cur.len != g_watch.path.len
+                || !bufx_mem_eq(cur.ptr as &const byte, g_watch.path.ptr as &const byte, cur.len) {
+                watch_retarget(&g_watch, &cur);
+                changed = true;
+            }
+        }
+        if watch_poll(&g_watch, 200) {
+            changed = true;
+        }
+        // 子代理跑完了：补一行结束语，之后不再读盘（日志已经不会再增长）
+        const d: &const Deleg = &g_deleg.items[wslot];
+        if d.status != DELEG_RUNNING {
+            var ms: u64 = 0;
+            if d.started_ms > 0 {
+                const now: u64 = ua_now_ms();
+                if now > d.started_ms {
+                    ms = now - d.started_ms;
+                }
+            }
+            watch_mark_ended(&g_watch, agent_watch_ended_name(d.status), ms / 1000);
+            changed = true;
+        }
+    }
+    if !changed {
+        return false;
+    }
+    agent_watch_present();
+    return true;
+}
+
+// 把当前 rendered 推给界面：TUI 走浮层（保留滚动位置），滚动模式追加到转录。
+fn agent_watch_present() void {
+    const abs: usize = watch_abs_len(&g_watch);
+    if abs == 0 {
+        return;
+    }
+    if abs == g_watch_last_len {
+        return;   // 内容没变
+    }
+    if tui_active() {
+        // 浮层整块重推（滚动位置由 tui_overlay_watch_update 按跟随态恢复）
+        if g_watch.ended {
+            var title: Buf = buf_new(96);
+            defer { buf_free(&title); }
+            _ = buf_append_cstr(&title, "跟随 sub-");
+            _ = buf_append_u64(&title, g_watch.id as u64);
+            _ = buf_append_cstr(&title, " · 已结束");
+            tui_overlay_watch_set_title(title.ptr as &const byte, title.len);
+        }
+        tui_overlay_watch_update(g_watch.rendered.ptr as &const byte, g_watch.rendered.len);
+    } else {
+        // 滚动模式：append-only，只写**新增**的那一段（等同 tail -f）。
+        // 用绝对长度做偏移：watch_trim 丢前缀时相对下标会失效（见 watch_abs_len 的注释）。
+        const seg: &[byte] = watch_since(&g_watch, g_watch_last_len);
+        if seg.len > 0 {
+            tty_write(&tty_ui, 2, seg.ptr, seg.len);
+        }
+    }
+    g_watch_last_len = abs;
+}
+
+// ------------------------------------------------------------
+// /watch 命令：开始/停止/查看跟随
+// ------------------------------------------------------------
+// 把 `sub-N` 解析成槽位并开始跟随。写回执到 out（滚动模式打出）；TUI 里由调用方开浮层。
+// 返回 true = 已开始跟随。
+fn agent_watch_start(cfg: &const Config, idb: &const Buf, out: &Buf) bool {
+    var id: i32 = -1;
+    if !deleg_id_parse(idb, &id) {
+        _ = buf_append_cstr(out, "[watch] 目标要写成 sub-N（如 /watch sub-1）\n");
+        return false;
+    }
+    var slot: usize = 0;
+    if !deleg_slot_of(&g_deleg, id, &slot) {
+        _ = buf_append_cstr(out, "[watch] 没有 sub-");
+        _ = buf_append_u64(out, id as u64);
+        _ = buf_append_cstr(out, " 这个子代理（/tasks 或 list_agents 看现役清单）\n");
+        return false;
+    }
+    // 路径可能还没落盘（刚 fork、header 还没写）：先试一次，失败也先把跟随挂上，
+    // 之后的 tick 会反复重试（子代理一旦写出第一条事件就能读到）。
+    var path: Buf = buf_new(1200);
+    defer { buf_free(&path); }
+    const have_path: bool = deleg_watch_path(cfg, &g_deleg, slot, &path);
+    if !have_path {
+        buf_reset(&path);   // 空路径 = 还没落盘，watch_read_more 会直接返回 0，下一拍重试
+    }
+    watch_begin(&g_watch, slot, id, &path);
+    agent_watch_hold_cfg(cfg);
+    g_watch_last_len = 0;
+    _ = buf_append_cstr(out, "[watch] 跟随 sub-");
+    _ = buf_append_u64(out, id as u64);
+    _ = buf_append_cstr(out, "（");
+    _ = buf_append_cstr(out, deleg_status_name(g_deleg.items[slot].status));
+    _ = buf_append_cstr(out, "）");
+    if !have_path {
+        _ = buf_append_cstr(out, "；日志还没落盘，等第一条事件");
+    }
+    _ = buf_append_cstr(out, "\n");
+    // 立刻读一拍（可能已经有内容），并把浮层开起来
+    _ = agent_watch_tick(cfg);
+    if tui_active() {
+        var title: Buf = buf_new(96);
+        defer { buf_free(&title); }
+        _ = buf_append_cstr(&title, "跟随 sub-");
+        _ = buf_append_u64(&title, id as u64);
+        _ = buf_append_cstr(&title, " · ");
+        _ = buf_append_cstr(&title, deleg_status_name(g_deleg.items[slot].status));
+        tui_overlay_watch_open(
+            title.ptr as &const byte,
+            title.len,
+            g_watch.rendered.ptr as &const byte,
+            g_watch.rendered.len
+        );
+    }
+    return true;
+}
+
+fn agent_watch_list(out: &Buf) void {
+    _ = buf_append_cstr(out, "[watch] 现役子代理（/watch sub-N 跟随，/watch off 停）：\n");
+    var n: usize = 0;
+    var i: usize = 0;
+    while i < DELEG_MAX {
+        if g_deleg.items[i].used {
+            _ = buf_append_cstr(out, "  sub-");
+            _ = buf_append_u64(out, g_deleg.items[i].id as u64);
+            _ = buf_append_cstr(out, " [");
+            _ = buf_append_cstr(out, deleg_status_name(g_deleg.items[i].status));
+            _ = buf_append_cstr(out, "] ");
+            _ = buf_append(out, g_deleg.items[i].label.ptr, g_deleg.items[i].label.len);
+            _ = buf_append_byte(out, 10);
+            n = n + 1;
+        }
+        i = i + 1;
+    }
+    if n == 0 {
+        _ = buf_append_cstr(out, "  （没有正在跑的子代理）\n");
+    }
+}
+
+// 派发 /watch。args 是 "/watch" 之后的原文（含前导空格）。
+// 返回 true = 该命令被处理了。
+fn agent_cmd_watch(cfg: &const Config, args: &const byte, n: usize, out: &Buf) bool {
+    // 掐掉前导空白
+    var s: usize = 0;
+    while s < n && (args[s] == 32 as byte || args[s] == 9 as byte) {
+        s = s + 1;
+    }
+    var e: usize = n;
+    while e > s && (args[e - 1] == 32 as byte || args[e - 1] == 9 as byte) {
+        e = e - 1;
+    }
+    var arg: Buf = buf_new(64);
+    defer { buf_free(&arg); }
+    _ = buf_append(&arg, @ptr_from_usize(@usize_from_ptr(args as &const void) + s) as &const byte, e - s);
+    if arg.len == 0 {
+        agent_watch_list(out);
+        // 返回 false = 「这不是一次开始/停止」：TUI 里据此开清单浮层；滚动模式已经把
+        // 清单写进 out，调用方照打不误（两条路的落点不同，但内容同源）。
+        return false;
+    }
+    if sv_eq_cstr(&arg, "off") || sv_eq_cstr(&arg, "stop") {
+        agent_watch_stop();
+        if tui_overlay_watch_wanted() {
+            tui_overlay_close();
+        }
+        _ = buf_append_cstr(out, "[watch] 已停止跟随\n");
+        return true;
+    }
+    _ = agent_watch_start(cfg, &arg, out);
+    return true;
 }
 
 // 提示符里的子代理扇出摘要：运行中时把 `● 2 agents` 挂到 [step N] 后面
@@ -6479,6 +6771,7 @@ fn agent_repl_help() void {
     tty_puts(&tty_ui, 2, "  /continue  不再输入新内容，带着历史再跑一轮\n");
     tty_puts(&tty_ui, 2, "  /status    打印当前配置与历史条数\n");
     tty_puts(&tty_ui, 2, "  /tasks     任务状态进度（清单/后台任务/子代理/目标）；/tasks open|close 切常驻块\n");
+    tty_puts(&tty_ui, 2, "  /watch     跟随子代理的实时过程消息（/watch sub-N 开始 · /watch off 停；裸 /watch 列现役）\n");
     tty_puts(&tty_ui, 2, "  /goal [<objective>|edit <objective>|pause|resume|clear]  会话目标（看/建/改/暂停/恢复/清除）\n");
     tty_puts(&tty_ui, 2, "  /compact   立即压缩上下文\n");
     tty_puts(&tty_ui, 2, "  /plan      切换 plan 模式\n");
@@ -6719,6 +7012,20 @@ fn agent_repl_command(cfg: &Config, h: &History, line: &const Buf) bool {
         agent_tasks_set_cmd(cfg, ap, line.len - 7);
         return false;
     }
+    // P42：/watch —— 滚动模式下跟随的行**追加进转录**（append-only，等同 tail -f）
+    if sv_eq_cstr(line, "/watch") || arg_starts_with(line.ptr as &const byte, "/watch ") {
+        var wout: Buf = buf_new(4096);
+        defer { buf_free(&wout); }
+        const an: usize = if (line.len > 6) { line.len - 6 } else { 0 as usize };
+        const ap: &const byte = @ptr_from_usize(@usize_from_ptr(line.ptr as &const void) + 6) as &const byte;
+        if !agent_cmd_watch(cfg, ap, an, &wout) {
+            // 裸 /watch（列清单）：回执本身就是清单，直接打出去
+        }
+        if wout.len > 0 {
+            tty_write(&tty_ui, 2, wout.ptr as &const byte, wout.len);
+        }
+        return false;
+    }
     // P29：/goal —— 语法与措辞对齐 DSH 的 /goal（见 src/goal.uya 顶部注释）
     if sv_eq_cstr(line, "/goal") || arg_starts_with(line.ptr as &const byte, "/goal ") {
         agent_repl_goal(cfg, line);
@@ -6851,6 +7158,9 @@ fn agent_repl_command(cfg: &Config, h: &History, line: &const Buf) bool {
             tty_puts(&tty_ui, 2, "[session] 已开新会话\n");
             agent_stats_sync(cfg, h);
             agent_title_apply();   // P22：新会话没有标题 → 回到基标题
+            // 清单在 agent_history_begin 里已经清了（会话级状态）：常驻块是「推」出来的，
+            // 当场重推一次，否则要等到下一个 1Hz 心跳（滚动模式更是要等下一回合）
+            _ = tasks_panel_sync();
         } else {
             tty_puts(&tty_ui, 2, "error: 无法新建会话\n");
         }
@@ -6877,6 +7187,8 @@ fn agent_repl_command(cfg: &Config, h: &History, line: &const Buf) bool {
             tty_puts(&tty_ui, 2, "[session] 已恢复会话\n");
             agent_stats_sync(cfg, h);
             agent_title_apply();   // P22：换成被恢复会话的标题（日志里的 session/title）
+            // 清单是会话级状态（agent_history_begin 里清过，恢复也不回填）→ 常驻块重推
+            _ = tasks_panel_sync();
         } else {
             tty_puts(&tty_ui, 2, "error: 无法恢复会话\n");
         }
@@ -6910,6 +7222,17 @@ fn tty_read_line_blocking() i32 {
             continue;
         }
         var tmp: [byte: 256] = [0: 256];
+        // P42：跟随子代理时别死等键盘 —— 先带超时 poll 一下 fd 0，超时就推一拍 watch。
+        // 不做这一步的话，滚动模式下「看着它跑」的那段时间屏幕是死的（read 会一直阻塞，
+        // 泵点和心跳都轮不到）。
+        if g_watch.active {
+            var pfd: [PollFd: 1] = [PollFd{ fd: 0, events: POLLIN, revents: 0 }];
+            const pr: i32 = sys_poll(&pfd[0], 1, 200) catch { 0; };
+            if pr <= 0 {
+                _ = agent_watch_tick_if_active();
+                continue;
+            }
+        }
         // P1：装了信号处理器以后 read 会被打断（SIGWINCH 等）返回 EINTR —— 那是「重来一次」，
         // 不是 EOF。把 EINTR 当 EOF 会让一次终端缩放直接把 REPL 关掉。
         const rr: !isize = sys_read(0, &tmp[0], 256);
@@ -7192,7 +7515,7 @@ fn cfg_set_buf(dst: &Buf, src: &const Buf) bool {
 
 // --dsh-root 收口：非 '/' 开头的一律在这里补成绝对路径。
 // 这个值要到「第一次构 system prompt」才被读（agent_texts_ensure 幂等，只跑一次），
-// 而那时进程已经不在启动时的 cwd 上了 —— 实测相对路径会静默失效（踩坑 66）。
+// 而那时进程已经不在启动时的 cwd 上了 —— 实测相对路径会静默失效（踩坑 70）。
 fn cfg_set_dsh_root(cfg: &Config, raw: &const byte) void {
     buf_free(&cfg.dsh_root);
     cfg.dsh_root = buf_new(1200);
@@ -8268,8 +8591,13 @@ export fn main() i32 {
 // 它的编号是这条主线早就给它留着的（见上面那条「后到的顺延」的反向用例），所以并进来仍记
 // **P36**；那条线自己的验收串是 `p36-diffbg`，合回主线后**版本串沿用主线的 `p37-model`**
 // （与 P38 的 `p38-tty` 同一种记法：只有选定要动 `AGENT_VERSION` 的那条线才改它）。
-const AGENT_VERSION: [byte: 16] = [112, 51, 55, 45, 109, 111, 100, 101, 108, 0, 0, 0, 0, 0, 0, 0];   // "p37-model"
-const AGENT_VERSION_LEN: usize = 9;
+// P43（本线）：**`ask_user_question` 在 TUI 里改成提问弹窗**（问题 + 编号选项 + 一行自定义回答：
+// ↑/↓ 选、1-9 直选、space 多选、直接打字 = 自己回答、enter 提交、esc 取消）——
+// 不再把问题当 notice 落进转录、让用户去输入行盲打。浮窗画不出来（终端太矮）回落输入行，
+// 管道 / 子代理仍是 no answer channel；回答语义（单选 custom 排他、多选两者都带、跳过 = 空
+// selected、取消 ≠ 渠道不通）对齐 DSH 的 `ask_user_question`。版本串 `p43-ask` —— 与 README 同一套记法。
+const AGENT_VERSION: [byte: 16] = [112, 52, 51, 45, 97, 115, 107, 0, 0, 0, 0, 0, 0, 0, 0, 0];   // "p43-ask"
+const AGENT_VERSION_LEN: usize = 7;
 fn agent_parse_color(p: &byte) u8 {
     // auto / always / never / 16 / 256
     if bufx_cstr_len(p) == 4 && bufx_eq_cstr(p, 4, "auto") {
@@ -8456,6 +8784,7 @@ export fn agent_tui_commands(out: &Buf) void {
     _ = buf_append_cstr(out, "/help      显示帮助浮层\n");
     _ = buf_append_cstr(out, "/status    当前配置与会话信息\n");
     _ = buf_append_cstr(out, "/tasks     任务状态进度（清单/后台任务/子代理/目标）\n");
+    _ = buf_append_cstr(out, "/watch     跟随子代理的实时过程消息（/watch sub-N · /watch off）\n");
     _ = buf_append_cstr(out, "/goal      会话目标（查看/创建/编辑/暂停/恢复/清除）\n");
     _ = buf_append_cstr(out, "/sessions  会话列表（选一个恢复）\n");
     _ = buf_append_cstr(out, "/diff      查看 git 修改（左文件列表 · 右双列全文比对）\n");
@@ -9031,6 +9360,11 @@ fn agent_tui_cmd_safe(head: &const Buf) bool {
     if sv_eq_cstr(head, "/worktree") {
         return true;
     }
+    // P42：裸 /watch 只读（列一眼现役子代理就开浮层，不动历史也不读日志 ——
+    // 真正开始跟随要带 sub-N，那条走 steer → 主循环那条路，不经过这里）。
+    if sv_eq_cstr(head, "/watch") {
+        return true;
+    }
     if sv_eq_cstr(head, "/help") {
         return true;
     }
@@ -9081,6 +9415,8 @@ fn agent_pump_block() i32 {
     if g_pump_cfg != null as &const Config && g_pump_hist != null as &const History {
         agent_tui_poll_pending_cmd(g_pump_cfg, g_pump_hist);
     }
+    // P42：阻塞等待期间也要让 /watch 的跟随继续长（否则等子代理跑完那段时间屏幕是死的）
+    _ = agent_watch_tick_if_active();
     return ab;
 }
 
@@ -9287,6 +9623,20 @@ fn agent_tui_command(cfg: &Config, h: &History, line: &const Buf) bool {
         agent_tasks_report(cfg, &txt);
         const ttitle: &const byte = "任务（esc 关闭）" as &const byte;
         tui_overlay_list(TUI_OVK_TASKS, ttitle, strlen(ttitle), txt.ptr as &const byte, txt.len);
+        return false;
+    }
+    // P42：/watch —— 裸命令开「现役子代理」浮层；sub-N 开跟随浮层；off 停
+    if sv_eq_cstr(line, "/watch") || arg_starts_with(line.ptr as &const byte, "/watch ") {
+        var wout: Buf = buf_new(4096);
+        defer { buf_free(&wout); }
+        const an: usize = if (line.len > 6) { line.len - 6 } else { 0 as usize };
+        const ap: &const byte = @ptr_from_usize(@usize_from_ptr(line.ptr as &const void) + 6) as &const byte;
+        const did: bool = agent_cmd_watch(cfg, ap, an, &wout);
+        if !did {
+            // 裸 /watch：现役清单浮层（enter 不派发，esc 关闭）
+            const wtitle: &const byte = "跟随子代理（/watch sub-N）" as &const byte;
+            tui_overlay_list(TUI_OVK_TASKS, wtitle, strlen(wtitle), wout.ptr as &const byte, wout.len);
+        }
         return false;
     }
     // P29：/goal —— 输出走浮层（滚动模式那条打转录的路由 agent_repl_goal 守着）
@@ -9648,6 +9998,8 @@ fn agent_run_tui_body(cfg: &Config, tui_fd: i32) i32 {
         if !tui_has_submit() && !g_tui_quit_flag_pending() {
             _ = tui_poll_keys(wait_ms);
             _ = tui_tick(tui_now_ms());
+            // P42：空闲时也要让 /watch 的跟随继续长（这一段没有泵点，g_pump_cfg 是空的）
+            _ = agent_watch_tick_if_active();
         }
         // 1) 模式切换请求（tab = plan / shift+tab = 访问模式选择器）
         const req: i32 = tui_take_request();
