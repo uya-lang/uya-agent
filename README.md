@@ -4,9 +4,9 @@
 多轮 loop 直到给出结论。46 个 `.uya` 文件，**不引入任何 C 代码、`@c_import` 或其它语言**，
 只依赖 Uya 语言与随编译器分发的标准库。
 
-**P0–P45 全部完成**，主线版本串 `p45-askw`。本节之后按能力域分节，各节标题保留对应的阶段号
-（P0…P45）；设计取舍、踩坑记录与逐阶段验收分别见 §3 与 §6，代码地图见 §2。
-本轮「TUI 里能拖选复制文本」是修复，**不占阶段号**，记踩坑 72（见 §3）。
+**P0–P46 全部完成**，主线版本串 `p46-title`。本节之后按能力域分节，各节标题保留对应的阶段号
+（P0…P46）；设计取舍、踩坑记录与逐阶段验收分别见 §3 与 §6，代码地图见 §2。
+「TUI 里能拖选复制文本」是修复、**不占阶段号**，记踩坑 72（见 §3）。
 
 真机转录节选（`--show-reasoning`；`✻ 思考` 交互模式下先在提示符那一行滚动、块结束才落成一行，
 非交互（管道）没有实时行，只有结算的那一行）：
@@ -47,7 +47,8 @@ $ ./build/uya-agent --show-reasoning "在当前工作目录写 p15-demo.txt，�
   P40 起子代理面板的状态行把最新消息**贴尾**显示（`…` + 最新一段）；P41 起 `/worktree` 也是
   底对齐选择框（七个动作一行一个，`finish`/`discard` 再过一道确认）；P43 起 `ask_user_question`
   是**提问弹窗**（问题 + 编号选项 + 一行自定义回答，方向键/数字/空格/直接打字作答；P45 起框宽
-  按内容自适应，短问题不再撑满 78 列）；
+  按内容自适应，短问题不再撑满 78 列）；P46 起会话标题**执行中就能改**（`/title`、`set_title`
+  工具、模型自动起标题，TUI 里裸 `/title` 先用 AI 填个草稿再让人改）；
   踩坑 68 起浮层条目与 reader 折行正文各挂一张行偏移表（取第 i 行 O(1)，会话索引也换成
   O(n log n) 归并）—— 真机 842 个会话下 `/sessions` 打开 1617 → 46 ms、按一次 ↑ 1617 → 10 ms。
 * **能力**：会话落盘可恢复（`--continue` / `--resume` / `/sessions`）；上下文管理（tool 结果
@@ -140,6 +141,7 @@ export UYA_SPLIT_C_DIR=$PWD/build/uyacache      # 多文件 C 缓存别丢在仓
 | `--tool-lines N` | 工具正文：默认 `0` = 只留一行（P16）；`N>0` = 首尾各 N 行（含 diff / todo 清单，即 P14 的正文块） |
 | `--tui` | 全屏 TUI（**TTY 交互模式默认**）；`--no-tui` 退回滚动转录；`UYA_AGENT_TUI=0\|1` 同口径 |
 | `--title` / `--no-title` | 交互模式把**终端标题**写成当前会话标题（**默认开**）；`UYA_AGENT_TITLE=0` 同口径；一次性运行与非 TTY 路径本来就不写 |
+| `--title-auto` / `--no-title-auto` | 每个新的人类消息之后让**模型起标题**（**默认开**；每次多发一个小请求）；`UYA_AGENT_TITLE_AUTO=0` 同口径；手敲 `/title` 不受它影响 |
 | `--mouse` / `--no-mouse` | TUI 的**鼠标上报**开关（**默认开**，滚轮要靠它）。`--no-mouse` 让终端重新接管拖选 ⇒ **能选中文字复制**（同时失去滚轮翻转录，改用 `ctrl+↑/↓` 或 `pgup/pgdn`）；`UYA_AGENT_MOUSE=0` 同口径，运行中还有 `F2` 与 `/mouse on\|off`（见踩坑 72） |
 | `--color=MODE` | `auto`（默认）/ `always` / `never` / `16` / `256`；`NO_COLOR` 也认 |
 | `--tui-demo` | 打印 TUI 的 home / chat / 运行中 三屏 + 常驻任务块两帧（折叠 / 展开）+ plan 审阅浮窗一帧的纯文本快照后退出（诊断 + 文档） |
@@ -165,6 +167,7 @@ REPL / TUI 内的斜杠命令：
 `UYA_AGENT_PERMISSION`（三档访问模式，非法值告警后忽略）、
 `UYA_AGENT_SANDBOX`（`0`/`off` = 等价于 `--no-sandbox`）、`UYA_AGENT_BWRAP`（bwrap 路径）、
 `UYA_AGENT_TITLE`（`0` = 不改终端标题，其它非空值 = 开；`--title` / `--no-title` 优先），
+`UYA_AGENT_TITLE_AUTO`（`0` = 不让模型自动起标题，其它非空值 = 开；`--title-auto` / `--no-title-auto` 优先），
 `UYA_AGENT_MOUSE`（`0` = 关鼠标上报、可直接拖选复制文本，其它非空值 = 开；`--mouse` / `--no-mouse` 优先），
 以及 key（三选一）：`UYA_AGENT_API_KEY` / `DEEPSEEK_API_KEY` / `OPENAI_API_KEY`。
 
@@ -443,6 +446,16 @@ src/selftest.uya   mock LLM + 126 轮断言 + --probe
 * 标题源是 `session/title`；兜底取前 5 个词（`fallbackMaxWords`）并按 ≤40 B（`fallbackMaxBytes`）在码点边界截断。
 * 清洗用 `tty_title_clean_into`（丢 OSC/CSI/ESC、C0/C1、零宽与方向控制符、非法 UTF-8）；压栈 `ESC [ 2 2 t`、弹栈 `ESC [ 2 3 t`；开关 `--no-title`。
 
+### 执行过程中改标题（P46）
+
+* 标题的三档来源对齐 DSH：`fallback`（首条消息前 5 词兜底）/ `provider`（模型生成）/ `user`（人写、模型写、导入）。
+* 人：`/title <新标题>` 直接改；`/title clear` 清回基标题并解锁自动起标题；TUI 里**裸 `/title`** 让模型先起一个建议、把建议**预填进输入框**，人改完回车才生效。
+* 模型：`set_title` 工具（空串 = clear），与 `/title` 走同一个落点，语义逐字一致。
+* 自动起标题：每个新的人类消息之后跑一次侧路请求，把标题换成模型给的（`kind=provider`）；`--no-title-auto` / `UYA_AGENT_TITLE_AUTO=0` 关。
+* **`kind=user` 是钉住**：显式写过之后自动起标题不再改写它（`/title clear` 解锁）；钉住状态只看日志里**最后一条** `session/title` 的 kind，所以 `--resume` 之后仍然钉住。
+* 改动同时落三处：日志一条 `session/title`、`index.jsonl` 的 title（`/sessions` 的标题列）、终端 OSC 2。
+* 起标题请求**不读键盘**，而且只在两段静默（arm 窗口 + 键盘窗口各 900 ms）之后才发；用户一动键盘它就中止自己（标题这一轮不更新，下条消息再试）。
+
 ### plan 模式：写闸门与审阅浮窗（P26）
 
 * plan 下 `write` 回 `Error: write is refused in plan mode (no file changes before the user approves the plan).`（`edit` 同款）。
@@ -585,6 +598,23 @@ src/selftest.uya   mock LLM + 126 轮断言 + --probe
 70. **`--dsh-root` 与 `--dsh-home` 同类：决定「去哪儿读文案」，必须在预扫里生效**（P44）：主循环那次完整 CLI 解析排在 DSH 加载之后，而 `agent_texts_ensure()` 是**幂等的一次性**初始化（`g_texts_ready`），一旦在解析之前被叫过，`cfg.dsh_root` 就永远是空的 —— 症状是 flag 静默无效、persona 仍来自默认 preset 树，而环境变量 `UYA_AGENT_DSH_ROOT` 却正常（那条路在 `preset_path()` 里直接读 env）。判据：同时给 env 和 flag 各指一个**文案不同**的 preset 树，看哪个生效。**孪生一条：相对路径也静默失效** —— 这个值要到「第一次构 system prompt」才被读，那时进程已不在启动时的 cwd，所以 `--dsh-root testdata/x` 读不到、`--dsh-root $PWD/testdata/x` 才读到；修法是解析时就补成绝对路径（`cfg_set_dsh_root()`，预扫与主循环共用）。与踩坑 25 同因；回归补在 `e2e-config-flags`。
 71. **completions 不发 `reasoning_effort` = 静默丢弃用户配置**（P44）：`--effort` / `--reasoning-effort` / DSH 的 `agent-default-model.reasoningEffort` 三条路径的值都进了 `cfg.reasoning_effort`、`--print-config` 也照实显示，但 `build_chat_request` 里没有那一段，于是**默认的 openai-completions 路由上模型按网关默认档思考**，用户配的 `max` 没有落到线上，也没有任何提示。同一份设置下 DSH 是发的（实测抓包 `reasoning_effort: "max"`），所以「uya 比 DSH 省」这类对比会掺进一个与 harness 无关的混杂项（实测偏差 41%）。修法：与 responses 同一条门槛（`cfg.api_reasoning`）发顶层 `reasoning_effort`，字段放最后以保住前缀缓存。**注意效果依网关而异**：官方端点同任务 `max` vs `off` 的 reasoning 占输出 51% vs 27%，autodl 网关 12% vs 17%（该网关不认这个字段）——收益主要是「配置不再说谎」，不是省钱。
 72. **「TUI 里不能拖选复制文本」是鼠标上报的代价，不是渲染坏**（本轮修复，不占阶段号）：P25 为了让滚轮不被 xterm.js 伪装成 ↑/↓，**无条件**开了 `ESC[?1000h`+`ESC[?1006h`；而终端只要把鼠标交给我们，**它自己的拖选就没了** —— 左键按下/拖动全变成 `ESC[<b;x;yM` 事件灌过来，TUI 只吃滚轮（`b` 的 bit6）、其余**丢弃**（`tui_mouse_finish()`），于是拖选期间屏幕上什么都不动、PRIMARY 一个字节都不变。真机实测（deepin-terminal / qtermwidget，即用户环境）：同一块屏幕、同一个拖拽轨迹，**鼠标上报开着时拖选后 PRIMARY 仍是旧值（等于没有选中），手动发一条 `?1000l?1006l` 关掉之后立刻拿到 TUI 正文的文本**；再把 `?1000h?1006h` 发回去又选不动 —— 这一对对照就是根因的判据（render 与选区无关，屏幕重画也不会清掉已选区，实测 T+3 s 仍在）。所以这不是「哪一行画错了」，而是**一个必须可逆的开关**：修法是把鼠标上报做成可关的（`g_tui_mouse` + `tui_set_mouse()`，`tui_term_enter` 按开关发序列、运行中切换当场写 `1000h/1006h` 或 `1006l/1000l`），默认仍开（滚轮口径一字节不变），出口给三个：`F2`（`ESC O Q`，也认 `ESC[12~`）、`/mouse on|off`、启动期 `--no-mouse` / `UYA_AGENT_MOUSE=0`。**取舍写清楚**：关掉之后滚轮交给终端（不再翻转录），翻滚录用 `ctrl+↑/↓`（`ESC[1;5A/B` 那条已修好的路）或 `pgup/pgdn`；不想关也可以在开着时**按住 shift 拖选**（多数终端把这个当本地拖选）。防假绿对照实验：①`tui_term_enter` 改成忽略开关、恒发 `1000h` 重编 → `tui-mouse` 的 D4 当场红（`--no-mouse` 会失效）；②删掉 F2 的 SS3 映射 → B 段红；③`tui_set_mouse` 去掉运行中那段写序列 → D2/D3 红；④启动处把 `tui_set_mouse(cfg.mouse)` 写成恒 `true` → 真 PTY 那条腿红（`mouse=false` 的捕获里仍有 `1000h`）。**与既有口径的一致性**：这是「显式开关」而不是「猜终端」——不去探测、不自动关，因为关掉就等于放弃滚轮，必须由人决定。
+
+73. **「后台请求」必须对输入完全透明 —— 否则用户敲的命令会被拼坏**（P46，本轮被自己的验收抓到）：
+   自动起标题要发一个**用户没发起**的侧路请求，第一版把它放在回合收尾同步发，于是踩了两个坑：
+   ① 它在流式期间照常读键盘（`llm_pump_input`），用户那几秒里敲的字被半路取走 —— `/` 进了我们的
+   缓冲、`status` 还留在终端里，两个字节一拼就是 `//status`，屏幕上显示「未知命令」；
+   ② 更隐蔽的是**存量缺陷**被它暴露：命令面板的结果在泵点里若被判为「不安全」（要等 step 边界），
+   `agent_tui_palette_apply` 里那句收走触发用 `/` 的 `tui_input_drop_slash_trigger()` 就一直没跑，
+   输入行里那个孤零零的 `/` 陪着用户的下一条命令一起被提交 —— 同样得到 `//status`。判据是
+   p30-check 的 `status-during-compact`（`/compact` 之后紧接着敲 `/status`，浮层必须 ≤300 ms 出来）：
+   修前稳定红（不只是慢，是整条命令被吞）。修法两处：**①后台请求不读键盘** —— `g_bg_request`
+   让泵点退化成「只刷帧 + watch 跟随」，并且只在**两段静默**（距回合收尾、距最后一次敲键各
+   900 ms，`tui_last_key_ms` 由唯一的键盘入口记）之后才发；发出去之后 `agent_bg_input_pending()`
+   一发现终端缓冲里有待读字节就让这次请求自己中止（标题这一轮不更新，下条消息再试）；
+   **②`/` 的收走从「派发时」提前到「accept 时」**（`tui_ov_accept` 里按 kind 判断），
+   三条派发路径（主循环 / step 边界 / 泵点）就不会再各漏一次。**教训**：
+   「锦上添花的后台任务」在单线程 harness 里就是「一段会占住主循环的时间」，
+   要么它让路给用户，要么它就不许启动 —— 没有第三条路。
 
 ---
 
@@ -762,6 +792,10 @@ DEEPSEEK_API_KEY=sk-xxx ./build/uya-agent \
 | `tui-model` | P37 `/model`/`/effort` 浮层：按提供方分组、只列公布的档位、反解、非推理模型不开浮层 |
 | `tui-worktree` | P41 `/worktree` 动作选择浮层：标题/七个动作/✓ 标当前模式、反解只认动作行（「取消」不认）、默认游标 = `status`；`finish`/`discard` 选定不生效、先翻确认框（默认游标 = 取消）；**真 git**：确认前 worktree 目录与 phase 一个字节不动、确认后才合并 + 删除 |
 | `tui-mouse` | 踩坑 72 鼠标上报开关（`F2` / `/mouse` / `--no-mouse`）：标志位默认开 + `tui_set_mouse` 幂等；`F2` 两种编码（`ESC O Q` / `ESC[12~`）与 `/mouse on·off·非法`；**字节级**进/关/再开/关着进都与开关一致；帮助浮层里有 `F2` 那一条；**真 PTY** 两个方向（默认开必有 `1000h`、`mouse=false` 必无 `1000h`/`1006h`） |
+| `title-cmd` | P46 `/title` 与 `set_title`：清洗（80 B / 码点边界 / 控制序列全丢后为空 ⇒ 报错且标题**不动**）、钉住语义（`user` 置位后自动起标题不跑、`clear` 解锁）、revision 门控（同一条人类消息只生成一次）、落盘事件逐字节（kind 三档 + clear 的**空标题**事件）、索引同步、`set_title` 工具三支（合法/空串/缺键）、工具目录里有它 |
+| `tui-title-input` | P46 标题输入框：预填 AI 建议可见 + 编辑（打字/backspace/delete/←→/home·end/ctrl+u/中间插入，**按码点**不劈汉字）+ enter 采纳交回编辑后的文本 / esc 取消**不算改名** + 太矮回落 0 + 方框逐行闭合 + 窄框不越界 + 运行中 `/title <t>` 进安全集而裸 `/title` 不进 |
+| `title-cmd-e2e` | `make e2e-title-cmd`：行式真二进制的用法串 / 改名回执 / `/status` 的 title 行 / clear / 空标题报错 / `/help` 可查 / 索引与日志落盘 |
+| `title-auto-e2e` | `make e2e-title-auto`：真 PTY + 假网关 —— 自动起标题**多发一次请求**并落 `kind=provider`；`--no-title-auto` 两样都没有；三来源（default/env/cli）与 CLI 优先 |
 | `sessions-e2e` | `make e2e-sessions`：最新在最后一行、空标题落 `(无标题)` |
 | `resume-big-e2e` | `make e2e-resume-big`：~3 MiB 会话 + 残行，`--resume --dry-run` 退出码 0 |
 | `diff-render` | 纯函数：上下文、`… (省略 36 行)`、按显示列截断 |
@@ -862,11 +896,25 @@ DEEPSEEK_API_KEY=sk-xxx ./build/uya-agent \
   红 2 条；③提示行改成永不退让重编 → 红 4 条（含老段的「没有按键提示」）；④不夹 `max_w` 重编 →
   红 8 条（含「有行的显示宽度超过终端列数」）。`--tui-demo` 只在脚注版本串那 1 行变化（`p43-ask` →
   `p45-askw`），`tui-ask` 其余三段（太矮回落 / headless dismissed / 真 PTY label 回模型）不受影响。
+- P46：会话标题**执行中就能改**（`/title` / `set_title` 工具 / 模型自动起标题）。
+  三条语义钉在同一处（`agent_title_set_kind`）：清洗到 80 B（码点边界）、`kind=user` 钉住、
+  落一条 `session/title` + 写 `index.jsonl` 的 title + OSC 2；`/title clear` 落一条**空标题**的
+  user 事件（不落的话 `--resume` 折叠到最后一条旧事件会把标题复活 —— `title-cmd` 轮钉住这条）。
+  验收：`make e2e-title-cmd`（语义/措辞/落盘）+ `make e2e-title-auto`（真 PTY：自动起标题真的
+  多发一次请求并落 `kind=provider`；`--no-title-auto` 两样都没有）+ `title-cmd` 轮（钉住与
+  revision 门控 / `set_title` 工具 / 索引同步）+ `tui-title-input` 轮（输入框排版与编辑 /
+  太矮回落 / 运行中 `/title <t>` 当场生效而裸 `/title` 不当场派发）。
+  **本轮被自己的验收抓到两条真缺陷**（都记在 §3）：① 自动起标题的请求在飞时读键盘，用户那几秒
+  敲的字被半路取走，`/status` 被拼成 `//status` → 「未知命令」（p30-check 的 status-during-compact
+  当场红，304 号判据）；② 命令面板的结果被推迟到 step 边界派发时，触发用的那个 `/` 留在输入行里，
+  用户接着敲的下一条命令同样被顶成 `//`（同一个现场暴露的**存量**缺陷，修法是把 `/` 的收走
+  从「派发时」提前到「accept 时」）。修法见 §3 踩坑 73；`p30-check` / `p30-check` 的
+  status-during-compact 是本轮最有价值的一双判据。
 - 其它：自测幂等（连跑两次都 PASS）；A1–A6 全部通过；技能与 `web_search`、自动压缩、后台任务、文件工具、DSH 零参数启动、跨进程会话恢复（记住 4271）都在真机验收过。
 
 - 踩坑 72（TUI 里能复制文本）：真机（deepin-terminal / qtermwidget，即用户环境）A/B —— 同一块屏幕、同一条拖拽轨迹（`xdotool` 驱动），鼠标上报**开着**时拖选之后 `PRIMARY` 仍是旧值（= 没选中）、TUI 正文一个字符都拿不到；手动发 `?1000l?1006l` 关掉后拖同一段立刻拿到屏幕文本；再发 `?1000h?1006h` 又选不动。屏幕重画不会清掉已选区（选中后等 3 s 仍在），所以与渲染/重绘无关。修法见踩坑 72；`make e2e-mouse` 钉配置来源链（默认 env/cli + CLI 优先 + 滚动模式 `/mouse` 说明），`tui-mouse` 轮钉开关语义、F2 两种编码、字节级四个方向与真 PTY 两个方向。防假绿对照实验四条（`tui_term_enter` 忽略开关 / 删 F2 映射 / `tui_set_mouse` 去掉运行中写序列 / 启动处恒 `true`）都当场红。
 
-> 分阶段验收记录的详细现场（P1–P45 的 before/after 命令与截图、真机对照实验、被自测当场抓住的自身缺陷）已在此压缩，原始描述保留在 §3 踩坑 33–72 与各版本提交说明中。
+> 分阶段验收记录的详细现场（P1–P46 的 before/after 命令与截图、真机对照实验、被自测当场抓住的自身缺陷）已在此压缩，原始描述保留在 §3 踩坑 33–72 与各版本提交说明中。
 
 ---
 
@@ -912,9 +960,17 @@ DEEPSEEK_API_KEY=sk-xxx ./build/uya-agent \
   P16 起滚动模式下每次工具调用只有一行（正文要看就得 `--tool-lines N`），思考同理：
   **非交互（管道）下没有实时行**，只有块结束时落的那一行 —— 想边跑边看就用交互模式。
 * **终端标题（P22）是 best-effort 的礼貌**：不支持 xterm 标题栈（`CSI 22 t` / `CSI 23 t`）的终端会
-  忽略压栈/弹栈，退出后保留我们最后写的会话标题（故意不写空标题）；标题取「首条用户消息的前 5 个词
-  / ≤40 B」，没有 `/title` 改名命令，也不调模型生成标题。导入 DSH 会话时按 `source.kind = "user"`
-  记一条 `session/title`，不是新增事件类型。
+  忽略压栈/弹栈，退出后保留我们最后写的会话标题（故意不写空标题）；初始标题取「首条用户消息的前 5 个词
+  / ≤40 B」。导入 DSH 会话时按 `source.kind = "user"` 记一条 `session/title`，不是新增事件类型。
+* **改标题（P46）的三条硬边界**：
+  * **自动起标题是同步的**（单线程，踩坑 47 起不了第二条线程）：它排在空闲主循环里，只有「距回合收尾
+    与距最后一次敲键都 ≥900 ms」才发，而且**用户一动键盘就中止自己** —— 那一轮标题不更新，下一条
+    人类消息再试。代价是标题偶尔「慢半拍」；要彻底关掉用 `--no-title-auto`。
+  * **非交互（管道/CI）与子代理不跑**自动起标题：标题只服务交互界面，而那两条路径上 `tty_title_set`
+    本来就是空操作 —— 为一个看不见的东西多发请求没有道理。手敲 `/title` 仍然有效（写日志与索引）。
+  * **滚动模式（`--no-tui`）裸 `/title` 只报建议、不改标题**：那边没有输入框浮层，给的是
+    `建议标题：…` + 用法，改不改由人接着敲 `/title <新标题>` 决定。
+  另外 `set_title` 工具与 `/title` 是同一个落点，所以子代理里模型改的是**它自己**会话的标题。
 * **`SIGKILL` 之后终端仍可能停在备用屏幕**（不可捕获），用 `reset` / `stty sane` 恢复。
 * `ask_user_question` / `exit_plan_mode` 的问答浮层里 `ctrl+c`/`esc` 是「取消这次问答」而不是退出
   程序；要退出先取消（浮层收掉之后 `ctrl+d`）。

@@ -3998,7 +3998,33 @@ fn tui_esc_final(f: byte) void {
 }
 
 // 喂入一段字节（fd 0 上读到的原样字节）
+// P46：最后一次「用户真的敲了东西」的时刻（墙上毫秒）。唯一的键盘入口 tui_key_feed
+// 在这里记一笔 —— 自动起标题据此等一小段静默期再发它那个同步请求（见 agent 侧的
+// agent_title_auto_idle_ok）。放在这一层而不是调用方：键盘入口有好几个
+// （主循环 poll、泵点 tui_abort_check、滚动模式的行编辑器），哪一条都是「用户在说话」。
+var g_tui_last_key_ms: u64 = 0;
+
+export fn tui_last_key_ms() u64 {
+    return g_tui_last_key_ms;
+}
+
+// P46：终端缓冲里**已经有**待读的按键吗？（只看一眼，不消费）
+// 后台请求（自动起标题）拿它做「用户要说话了就立刻让路」的判据 ——
+// 它不能读键（读走就串味），但必须能察觉用户动了键盘。
+// 注意：fd 0 可能不是终端（headless / 子代理），那种情况下恒 false。
+export fn tui_input_pending() bool {
+    if g_tui_headless || !g_tui_on {
+        return false;
+    }
+    var pfds: [PollFd: 1] = [PollFd{ fd: 0, events: POLLIN, revents: 0 }];
+    const pr: i32 = sys_poll(&pfds[0], 1, 0) catch { 0; };
+    return pr > 0 && (pfds[0].revents & POLLIN) != 0;
+}
+
 export fn tui_key_feed(p: &const byte, n: usize) void {
+    if n > 0 {
+        g_tui_last_key_ms = tui_now_ms();
+    }
     var i: usize = 0;
     while i < n {
         const c: byte = p[i];
@@ -4268,6 +4294,7 @@ export const TUI_OVK_EFFORT: u8 = 13;        // P37：/effort 推理强度选择
 export const TUI_OVK_WORKTREE: u8 = 14;      // P41：/worktree 动作选择（底对齐菜单）
 export const TUI_OVK_WORKTREE_CONFIRM: u8 = 15; // P42：finish/discard 的不可逆动作确认
 export const TUI_OVK_WATCH: u8 = 16;         // P42：/watch 跟随子代理实时消息（正文浮层，可续推）
+export const TUI_OVK_TITLE: u8 = 17;         // P46：/title 会话标题输入框（单行文本，可预填建议）
 
 var g_tui_ov_kind: u8 = 0;
 // 交回结果时的 kind：tui_ov_accept() 会先 close（把 g_tui_ov_kind 清 0），
@@ -5796,6 +5823,486 @@ fn tui_draw_overlay_ask() void {
     }
 }
 
+// ============================================================
+// P46：input 型浮层（单行文本输入框）
+//
+// 与 ask 型的区别：ask 的是「从选项里挑」，input 的是「自己写一行字」——
+// 没有选项表、没有编号、没有多选，整张框只有一个可编辑的缓冲与一个光标。
+// 第一个用处是 `/title`：先在框里预填模型给的**建议标题**，人改完回车才生效
+// （AI 只填草稿，落不落地由人按的那个回车决定）。
+//
+// 三份状态与 ask 型同分工：
+//   * 对话框状态（编辑缓冲 + 光标）：跟浮层走，close 就清；
+//   * **答案**（g_tui_ov_in_text + g_tui_ov_in_done）：只在**下一次 open** 才清 ——
+//     tui_title_input_wait 返回之后调用方才来读（踩坑 44 那族 one-shot 结果的同一条口径）；
+//   * 几何：绘制那一段自己算（与 ask/reader 同源，同样逐行补齐保证右边框对齐，见踩坑 42）。
+//
+// 画不出来（终端太矮）时 tui_title_input_wait 返回 0，调用方回落成一条 notice ——
+// 与 ask 同一条立场：这是「换个地方说」，不是审批那种「看不见就不许做」。
+// ============================================================
+
+const TUI_IN_WANT_W: usize = 78;           // 期望宽度（与 ask 同档；窄终端再退）
+const TUI_IN_MIN_W: usize = 34;            // 最小框宽（P45 那一套的下限）
+const TUI_IN_HINT_FULL: &const byte = "直接编辑 · enter 采纳 · esc 取消 · ctrl+u 清空" as &const byte;
+const TUI_IN_HINT_MID: &const byte = "enter 采纳 · esc 取消 · ctrl+u 清空" as &const byte;
+const TUI_IN_HINT_MIN: &const byte = "enter 采纳 · esc 取消" as &const byte;
+const TUI_IN_MAX_TEXT: usize = 4096;       // 编辑缓冲上限（标题本来就 ≤80 B，防手滑粘贴）
+
+var g_tui_ov_in: bool = false;                          // 当前浮层是 input 型
+var g_tui_ov_in_buf: Buf = Buf{ ptr: null, len: 0, cap: 0 };   // 正在编辑的文本（对话框状态）
+var g_tui_ov_in_cursor: usize = 0;                      // 光标（字节下标，落在码点边界）
+var g_tui_ov_in_text: Buf = Buf{ ptr: null, len: 0, cap: 0 };  // 已采纳的答案（close 之后才读）
+var g_tui_ov_in_done: bool = false;
+
+fn tui_tin_ensure() void {
+    if !buf_valid(&g_tui_ov_in_buf) { g_tui_ov_in_buf = buf_new(TUI_IN_MAX_TEXT); }
+    if !buf_valid(&g_tui_ov_in_text) { g_tui_ov_in_text = buf_new(TUI_IN_MAX_TEXT); }
+}
+
+// 清对话框状态（close 用；**不动答案**）
+fn tui_tin_states_clear() void {
+    tui_tin_ensure();
+    g_tui_ov_in = false;
+    buf_reset(&g_tui_ov_in_buf);
+    g_tui_ov_in_cursor = 0;
+}
+
+// 清答案（open 时用）
+fn tui_tin_answer_clear() void {
+    tui_tin_ensure();
+    buf_reset(&g_tui_ov_in_text);
+    g_tui_ov_in_done = false;
+}
+
+// 打开输入框浮层（非阻塞；绘制与按键都由这一形态自己管）。
+// text 是**预填内容**（`/title` 用模型给的建议）：它是可编辑的草稿，不是答案。
+export fn tui_overlay_input_open(title: &const byte, tn: usize, text: &const byte, textn: usize) void {
+    tui_ov_ensure();
+    tui_tin_ensure();
+    tui_overlay_close();          // 上一张浮层的残留（含上一条答案）先收干净
+    tui_tin_answer_clear();
+    tui_tin_states_clear();
+    g_tui_ov = TUI_OV_CONFIRM;    // 与 ask 同档：tui_decide_wait 只认 OV_NONE
+    g_tui_ov_kind = TUI_OVK_TITLE;
+    g_tui_ov_done = 0;
+    g_tui_ov_in = true;
+    buf_reset(&g_tui_ov_title);
+    _ = buf_append(&g_tui_ov_title, title, tn);
+    // 预填内容过一遍清洗：建议来自模型（外来字节），控制字符不许进编辑框
+    buf_reset(&g_tui_ov_in_buf);
+    if textn > 0 {
+        var clean: Buf = buf_new(textn + 8);
+        defer { buf_free(&clean); }
+        tui_clean_into(&clean, text, textn);
+        var keep: usize = clean.len;
+        if keep > TUI_IN_MAX_TEXT - 8 {
+            keep = TUI_IN_MAX_TEXT - 8;
+        }
+        _ = buf_append(&g_tui_ov_in_buf, clean.ptr as &const byte, keep);
+    }
+    g_tui_ov_in_cursor = g_tui_ov_in_buf.len;   // 光标默认在尾部：接着往后写最顺手
+    g_tui_ov_anchor = 0;
+    g_tui_ov_have = false;
+    g_tui_ov_cancel = false;
+    tui_mark_dirty();
+}
+
+// 编辑缓冲的编辑操作（全部按字节下标走，但只在**码点边界**上停 —— 免得把汉字劈开）
+fn tui_tin_buf_insert(p: &const byte, n: usize) void {
+    tui_tin_ensure();
+    if n == 0 || g_tui_ov_in_buf.len + n > TUI_IN_MAX_TEXT {
+        return;
+    }
+    // 在光标处插入：先把光标之后的部分搬到临时缓冲，再拼回去
+    var tail: Buf = buf_new(g_tui_ov_in_buf.len + 8);
+    defer { buf_free(&tail); }
+    const cur: usize = g_tui_ov_in_cursor;
+    if cur < g_tui_ov_in_buf.len {
+        _ = buf_append(&tail, g_tui_ov_in_buf.ptr + cur, g_tui_ov_in_buf.len - cur);
+    }
+    g_tui_ov_in_buf.len = cur;
+    _ = buf_append(&g_tui_ov_in_buf, p, n);
+    if tail.len > 0 {
+        _ = buf_append(&g_tui_ov_in_buf, tail.ptr as &const byte, tail.len);
+    }
+    g_tui_ov_in_cursor = cur + n;
+    tui_mark_dirty();
+}
+
+fn tui_tin_backspace() void {
+    tui_tin_ensure();
+    if g_tui_ov_in_cursor == 0 {
+        return;
+    }
+    const prev: usize = tty_utf8_prev(g_tui_ov_in_buf.ptr as &const byte, g_tui_ov_in_cursor);
+    var tail: Buf = buf_new(g_tui_ov_in_buf.len + 8);
+    defer { buf_free(&tail); }
+    const cur: usize = g_tui_ov_in_cursor;
+    if cur < g_tui_ov_in_buf.len {
+        _ = buf_append(&tail, g_tui_ov_in_buf.ptr + cur, g_tui_ov_in_buf.len - cur);
+    }
+    g_tui_ov_in_buf.len = prev;
+    if tail.len > 0 {
+        _ = buf_append(&g_tui_ov_in_buf, tail.ptr as &const byte, tail.len);
+    }
+    g_tui_ov_in_cursor = prev;
+    tui_mark_dirty();
+}
+
+fn tui_tin_delete() void {
+    tui_tin_ensure();
+    if g_tui_ov_in_cursor >= g_tui_ov_in_buf.len {
+        return;
+    }
+    const next: usize = tty_utf8_next(g_tui_ov_in_buf.ptr as &const byte, g_tui_ov_in_cursor, g_tui_ov_in_buf.len);
+    var tail: Buf = buf_new(g_tui_ov_in_buf.len + 8);
+    defer { buf_free(&tail); }
+    if next < g_tui_ov_in_buf.len {
+        _ = buf_append(&tail, g_tui_ov_in_buf.ptr + next, g_tui_ov_in_buf.len - next);
+    }
+    g_tui_ov_in_buf.len = g_tui_ov_in_cursor;
+    if tail.len > 0 {
+        _ = buf_append(&g_tui_ov_in_buf, tail.ptr as &const byte, tail.len);
+    }
+    tui_mark_dirty();
+}
+
+fn tui_tin_left() void {
+    tui_tin_ensure();
+    if g_tui_ov_in_cursor == 0 {
+        return;
+    }
+    g_tui_ov_in_cursor = tty_utf8_prev(g_tui_ov_in_buf.ptr as &const byte, g_tui_ov_in_cursor);
+    tui_mark_dirty();
+}
+
+fn tui_tin_right() void {
+    tui_tin_ensure();
+    if g_tui_ov_in_cursor >= g_tui_ov_in_buf.len {
+        return;
+    }
+    g_tui_ov_in_cursor = tty_utf8_next(g_tui_ov_in_buf.ptr as &const byte, g_tui_ov_in_cursor, g_tui_ov_in_buf.len);
+    tui_mark_dirty();
+}
+
+// 采纳：把编辑缓冲当答案交出去，然后关浮层（与 tui_ask_commit / tui_ov_accept 同一分工）
+fn tui_tin_commit() void {
+    tui_tin_ensure();
+    buf_reset(&g_tui_ov_in_text);
+    _ = buf_append(&g_tui_ov_in_text, g_tui_ov_in_buf.ptr as &const byte, g_tui_ov_in_buf.len);
+    g_tui_ov_in_done = true;
+    g_tui_ov_result.len = 0;   // 结果字节串不用于 input（答案在 g_tui_ov_in_text 里）
+    g_tui_ov_have = true;
+    g_tui_ov_done = g_tui_ov_kind;
+    tui_overlay_close();
+}
+
+// input 型浮层的按键（esc / ctrl+c 已在 tui_ov_key 里先处理）
+fn tui_ov_key_input(ev: i32) void {
+    if ev == TUI_K_ENTER {
+        tui_tin_commit();
+        return;
+    }
+    if ev == TUI_K_BACKSPACE {
+        tui_tin_backspace();
+        return;
+    }
+    if ev == TUI_K_DELETE {
+        tui_tin_delete();
+        return;
+    }
+    if ev == TUI_K_LEFT {
+        tui_tin_left();
+        return;
+    }
+    if ev == TUI_K_RIGHT {
+        tui_tin_right();
+        return;
+    }
+    if ev == TUI_K_HOME || ev == TUI_K_CTRL_A {
+        g_tui_ov_in_cursor = 0;
+        tui_mark_dirty();
+        return;
+    }
+    if ev == TUI_K_END || ev == TUI_K_CTRL_E {
+        tui_tin_ensure();
+        g_tui_ov_in_cursor = g_tui_ov_in_buf.len;
+        tui_mark_dirty();
+        return;
+    }
+    if ev == TUI_K_CTRL_U {
+        tui_tin_ensure();
+        buf_reset(&g_tui_ov_in_buf);
+        g_tui_ov_in_cursor = 0;
+        tui_mark_dirty();
+        return;
+    }
+    if ev == TUI_K_CHAR {
+        var tmp: Buf = buf_new(8);
+        defer { buf_free(&tmp); }
+        const n: usize = tui_key_take_char(&tmp);
+        if n > 0 {
+            tui_tin_buf_insert(tmp.ptr as &const byte, n);
+        }
+        return;
+    }
+}
+
+// ---- 答案读取（采纳之后立即读；下一次 open 会清掉）----
+export fn tui_tin_answered() bool {
+    return g_tui_ov_in_done;
+}
+
+// 已采纳的文本（空 = 采纳了空串）。返回长度。
+export fn tui_tin_text(out: &Buf) usize {
+    tui_tin_ensure();
+    buf_reset(out);
+    if !g_tui_ov_in_done {
+        return 0;
+    }
+    _ = buf_append(out, g_tui_ov_in_text.ptr as &const byte, g_tui_ov_in_text.len);
+    return g_tui_ov_in_text.len;
+}
+
+// 观测（自测用）：当前编辑缓冲 / 光标位置
+export fn tui_tin_draft_len() usize {
+    tui_tin_ensure();
+    return g_tui_ov_in_buf.len;
+}
+
+export fn tui_tin_draft_at(i: usize) byte {
+    tui_tin_ensure();
+    if i >= g_tui_ov_in_buf.len {
+        return 0;
+    }
+    return g_tui_ov_in_buf.ptr[i];
+}
+
+export fn tui_tin_cursor() usize {
+    tui_tin_ensure();
+    return g_tui_ov_in_cursor;
+}
+
+export fn tui_tin_active() bool {
+    return g_tui_ov_in;
+}
+
+// input 框宽：只由「标题 + 编辑内容」定，再夹进 [TUI_IN_MIN_W, min(78, 终端宽 - 6)]。
+// 提示行与边框留白不撑框（框小了就按 full → mid → min 降级改文案）—— 与 P45 的 ask 同一条口径。
+fn tui_tin_content_w() usize {
+    tui_tin_ensure();
+    var best: usize = tty_cols_between(g_tui_ov_title.ptr as &const byte, 0, g_tui_ov_title.len);
+    const bw: usize = tty_cols_between(g_tui_ov_in_buf.ptr as &const byte, 0, g_tui_ov_in_buf.len) + 2;   // 光标位
+    if bw > best {
+        best = bw;
+    }
+    const minw: usize = TUI_IN_MIN_W - 4;   // 内容侧（body_w = w - 4）
+    if best < minw {
+        best = minw;
+    }
+    return best;
+}
+
+fn tui_tin_adaptive_w() usize {
+    var w: usize = tui_tin_content_w() + 4;
+    if w > TUI_IN_WANT_W {
+        w = TUI_IN_WANT_W;
+    }
+    if w + 6 > g_tui_cols {
+        w = g_tui_cols - 6;
+    }
+    if w < TUI_IN_MIN_W {
+        w = TUI_IN_MIN_W;
+    }
+    if w > g_tui_cols {
+        w = g_tui_cols;
+    }
+    return w;
+}
+
+// 自测用：当前内容算出的自适应框宽（纯函数口径）
+export fn tui_tin_adaptive_width() usize {
+    return tui_tin_adaptive_w();
+}
+
+fn tui_tin_hint_text(body_w: usize) &const byte {
+    if tty_cols_between(TUI_IN_HINT_FULL, 0, bufx_cstr_len(TUI_IN_HINT_FULL)) <= body_w {
+        return TUI_IN_HINT_FULL;
+    }
+    if tty_cols_between(TUI_IN_HINT_MID, 0, bufx_cstr_len(TUI_IN_HINT_MID)) <= body_w {
+        return TUI_IN_HINT_MID;
+    }
+    return TUI_IN_HINT_MIN;
+}
+
+// input 型浮层的绘制。几何与 ask 同源（同样 `panel_top - 2` 上限、同样逐行补齐保证
+// 右边框对齐 —— 见踩坑 42），版式是：标题行 / 编辑行 / 提示行 / 底边。
+fn tui_draw_overlay_input() void {
+    tui_ov_ensure();
+    tui_tin_ensure();
+    const panel_top: usize = g_tui_panel_top;
+    if panel_top < TUI_OV_READER_MIN_PANEL_TOP {
+        return;
+    }
+    // 单行输入不需要高框：4 行（标题 / 编辑 / 提示 / 底边）就够
+    var h: usize = 4;
+    if h > panel_top - 1 {
+        h = panel_top - 1;
+    }
+    if h < 4 {
+        return;   // 放不下就别画（调用方那边也已按 MIN_PANEL_TOP 拦过一道）
+    }
+    const w: usize = tui_tin_adaptive_w();
+    var left: usize = 2;
+    if g_tui_cols > w + 4 {
+        left = (g_tui_cols - w) / 2;
+    }
+    var top: usize = 1;
+    if panel_top > h + 2 {
+        top = (panel_top - h) / 2;
+    }
+    const inner: usize = w - 2;
+    const body_w: usize = w - 4;
+    const edit_budget: usize = body_w - 3;   // '▌' / 光标格 + 里侧两列
+
+    // 编辑行要能滚：光标在尾部、内容比预算长时，把可见窗口贴到光标那一侧
+    // （标题本来就 ≤80 B，正常进不来这条分支；手滑粘一大段时才需要它）
+    var vis_from: usize = 0;
+    var vis_cols: usize = tty_cols_between(g_tui_ov_in_buf.ptr as &const byte, 0, g_tui_ov_in_cursor);
+    if vis_cols > edit_budget {
+        // 从光标往左退，找到第一个「能放下从它到光标」的码点边界
+        var cut: usize = g_tui_ov_in_cursor;
+        var acc: usize = 0;
+        while cut > 0 {
+            const prev: usize = tty_utf8_prev(g_tui_ov_in_buf.ptr as &const byte, cut);
+            const cw: usize = tty_cols_between(g_tui_ov_in_buf.ptr as &const byte, prev, cut);
+            if acc + cw > edit_budget {
+                break;
+            }
+            acc = acc + cw;
+            cut = prev;
+        }
+        vis_from = cut;
+    }
+
+    tui_row_rewind(top);
+    var r: usize = 0;
+    while r < h {
+        tui_row_new();
+        tui_pad_to(left);
+        if r == 0 {
+            tui_puts("╭─ " as &const byte, TUI_ST_ACCENT);
+            tui_ov_put_clipped(g_tui_ov_title.ptr as &const byte, g_tui_ov_title.len, inner - 4, TUI_ST_BOLD);
+            var used: usize = tui_row_cols() - left;
+            while used + 1 < w {
+                tui_puts("─" as &const byte, TUI_ST_ACCENT);
+                used = used + 1;
+            }
+            tui_puts("╮" as &const byte, TUI_ST_ACCENT);
+        } else if r == h - 1 {
+            tui_puts("╰" as &const byte, TUI_ST_ACCENT);
+            var used2: usize = 1;
+            while used2 + 1 < w {
+                tui_puts("─" as &const byte, TUI_ST_ACCENT);
+                used2 = used2 + 1;
+            }
+            tui_puts("╯" as &const byte, TUI_ST_ACCENT);
+        } else if r == h - 2 {
+            // 提示行（按键口径只有这一处）
+            tui_puts("│ " as &const byte, TUI_ST_ACCENT);
+            const hint: &const byte = tui_tin_hint_text(body_w);
+            tui_ov_put_clipped(hint, bufx_cstr_len(hint), body_w, TUI_ST_HINT);
+            var used3: usize = tui_row_cols() - left;
+            while used3 + 1 < w {
+                tui_puts(" " as &const byte, TUI_ST_DEFAULT);
+                used3 = used3 + 1;
+            }
+            tui_puts("│" as &const byte, TUI_ST_ACCENT);
+        } else {
+            // 编辑行：`▌ ` + 光标之前 + 光标那一格（反显）+ 光标之后
+            tui_puts("│ " as &const byte, TUI_ST_ACCENT);
+            tui_puts("▌ " as &const byte, TUI_ST_ACCENT);
+            var before: usize = tty_cols_between(g_tui_ov_in_buf.ptr as &const byte, 0, g_tui_ov_in_cursor);
+            if before > edit_budget {
+                before = edit_budget;
+            }
+            const b0: usize = vis_from;
+            const b1: usize = g_tui_ov_in_cursor;
+            if b1 > b0 {
+                tui_put(g_tui_ov_in_buf.ptr + b0, b1 - b0, TUI_ST_DEFAULT);
+            }
+            // 光标那一格：取光标处的一个码点（到尾了就画一个空格，光标仍然看得见）
+            const cur_b: usize = g_tui_ov_in_cursor;
+            if cur_b < g_tui_ov_in_buf.len {
+                const nx: usize = tty_utf8_next(g_tui_ov_in_buf.ptr as &const byte, cur_b, g_tui_ov_in_buf.len);
+                const cw: usize = tty_cols_between(g_tui_ov_in_buf.ptr as &const byte, cur_b, nx);
+                if before + cw <= edit_budget {
+                    tui_put(g_tui_ov_in_buf.ptr + cur_b, nx - cur_b, TUI_ST_SEL);
+                }
+            } else {
+                tui_puts(" " as &const byte, TUI_ST_SEL);
+            }
+            // 光标之后：先把超预算的部分跳过（贴着光标右侧开始显示）
+            var after_from: usize = if cur_b < g_tui_ov_in_buf.len {
+                tty_utf8_next(g_tui_ov_in_buf.ptr as &const byte, cur_b, g_tui_ov_in_buf.len);
+            } else {
+                cur_b;
+            };
+            var used_a: usize = before;
+            if cur_b < g_tui_ov_in_buf.len {
+                used_a = used_a + tty_cols_between(g_tui_ov_in_buf.ptr as &const byte, cur_b, after_from);
+            } else {
+                used_a = used_a + 1;   // 光标空格本身占 1 列
+            }
+            // 预算用尽就把尾巴丢掉（尾部对齐靠边框补齐保证，不额外补 '…'：
+            // 输入框里补 '…' 会被误读成「内容里真的有个省略号」）
+            while after_from < g_tui_ov_in_buf.len && used_a <= edit_budget {
+                const nx2: usize = tty_utf8_next(g_tui_ov_in_buf.ptr as &const byte, after_from, g_tui_ov_in_buf.len);
+                const cw2: usize = tty_cols_between(g_tui_ov_in_buf.ptr as &const byte, after_from, nx2);
+                if used_a + cw2 > edit_budget {
+                    break;
+                }
+                tui_put(g_tui_ov_in_buf.ptr + after_from, nx2 - after_from, TUI_ST_DEFAULT);
+                used_a = used_a + cw2;
+                after_from = nx2;
+            }
+            var used4: usize = tui_row_cols() - left;
+            while used4 + 1 < w {
+                tui_puts(" " as &const byte, TUI_ST_DEFAULT);
+                used4 = used4 + 1;
+            }
+            tui_puts("│" as &const byte, TUI_ST_ACCENT);
+        }
+        tui_fill_row(g_tui_cols);
+        r = r + 1;
+    }
+}
+
+// input 型的阻塞式等待。返回：
+//   1 = 已采纳（读 tui_tin_text）
+//   0 = 取消 / 中断 / 没人回答 / 这里问不了（TUI 没跑或终端太矮）⇒ 调用方回落 notice
+export fn tui_title_input_wait(title: &const byte, tn: usize, prefill: &const byte, pn: usize, out: &Buf) i32 {
+    if !g_tui_on {
+        return 0;
+    }
+    if !tui_overlay_available() || g_tui_panel_top < TUI_OV_READER_MIN_PANEL_TOP {
+        return 0;
+    }
+    tui_overlay_input_open(title, tn, prefill, pn);
+    // 排队按键先丢掉：运行期间敲进来的键不能替用户写标题
+    // （headless 自测是例外 —— 那里「注入的键」就是模拟用户）
+    if !g_tui_headless {
+        tui_key_reset();
+    }
+    const rc: i32 = tui_decide_wait(&g_tui_ov_result);
+    if rc == 1 {
+        buf_reset(out);
+        _ = buf_append(out, g_tui_ov_in_text.ptr as &const byte, g_tui_ov_in_text.len);
+        return 1;
+    }
+    return 0;
+}
+
 // reader 型浮层的阻塞式等待：与 tui_confirm_wait 同一套「边跑边抽帧等按键」，
 // 只是浮层形态不同（正文 + 动作）。返回 1 = 选中某项（原文写进 out），0 = 取消/中断/无键可等。
 export fn tui_reader_wait(kind: u8, title: &const byte, tn: usize, body: &const byte, bn: usize, items: &const byte, inlen: usize, sel: usize, out: &Buf) i32 {
@@ -5827,6 +6334,10 @@ export fn tui_overlay_close() void {
     if g_tui_ov_ask {
         tui_ask_states_clear();
     }
+    // P46：input 型同一条分工（答案在 g_tui_ov_in_text，close 不动）
+    if g_tui_ov_in {
+        tui_tin_states_clear();
+    }
     if !g_tui_ov_have {
         g_tui_ov_done = 0;   // 没有交回结果（被关掉/取消）：这份残留不该再被读到
     }
@@ -5853,6 +6364,13 @@ export fn tui_overlay_peek(out: &Buf) bool {
     buf_reset(out);
     _ = buf_append(out, g_tui_ov_result.ptr, g_tui_ov_result.len);
     return true;
+}
+
+// P46：有没有**还没被取走**的浮层结果。自动起标题要拿它当闸门 ——
+// 面板里选中的命令还没派发时发请求，那一圈的下一次迭代会把结果（连带它要收走的
+// 触发用的 "/"）与用户正在敲的命令搅在一起，实测症状是 `/status` 变成 `//status`。
+export fn tui_overlay_result_pending() bool {
+    return g_tui_ov_have;
 }
 
 export fn tui_overlay_cancelled() bool {
@@ -6904,6 +7422,15 @@ fn tui_ov_accept() void {
         if g_tui_ov_kind == TUI_OVK_PALETTE && tui_ov_result_is_exit() {
             g_tui_quit = true;
         }
+        // P46：把触发面板的那个 "/" **当场**收走，而不是等派发时再收。
+        // 派发点不止一处（主循环 / step 边界 / 泵点），而结果可能被**推迟**到 step 边界
+        // 才派发 —— 那段时间输入行里那个 "/" 还留着，用户接着敲的下一条命令就被它顶成
+        // `//status` → 「未知命令」（p30-check 的 status-during-compact 抓到）。
+        // 面板开着的期间字符都进 g_tui_ov_filter（不是输入行），所以此刻输入行里要么正是
+        // 那个孤零零的 "/"，要么是用户已经往下敲了新内容 —— 后者不该动（那是下一行）。
+        if g_tui_ov_kind == TUI_OVK_PALETTE {
+            tui_input_drop_slash_trigger();
+        }
     } else {
         // 回车但一条都没匹配上：不能静默（旧实现是「按了回车屏幕一动不动」）。
         // 把用户敲进过滤器的文字还回输入行，再落一条 notice 说明为什么什么都没发生。
@@ -6960,6 +7487,11 @@ fn tui_ov_key(ev: i32) void {
     // P43：ask 型（提问弹窗）自带一套按键：↑/↓ 选、1-9 直选、space 勾选、打字=自定义回答
     if g_tui_ov_ask {
         tui_ov_key_ask(ev);
+        return;
+    }
+    // P46：input 型（单行输入框）自带一套按键：编辑一行文本、enter 采纳、esc 取消
+    if g_tui_ov_in {
+        tui_ov_key_input(ev);
         return;
     }
     if ev == TUI_K_ENTER {
@@ -7050,6 +7582,11 @@ fn tui_draw_overlay() void {
     // P43：ask 型（提问弹窗）另有排版：问题 + 编号选项 + 自定义回答行
     if g_tui_ov_ask {
         tui_draw_overlay_ask();
+        return;
+    }
+    // P46：input 型（单行输入框）另有排版：标题 + 编辑行 + 提示行
+    if g_tui_ov_in {
+        tui_draw_overlay_input();
         return;
     }
     // P26：reader 型（计划审阅）另有排版：正文可滚动 + 说明行 + 动作行
@@ -7443,7 +7980,7 @@ fn tui_open_palette() void {
 }
 
 fn tui_open_help() void {
-    const help: &const byte = "enter 发送 · ctrl+j / alt+enter 换行 · esc 中断（运行中＝中断本回合，当场杀掉正在跑的工具）· ctrl+c 中断或退出\npgup/pgdn 滚动 · ctrl+home/end 顶/尾 · tab 计划模式 · shift+tab 访问模式 · ctrl+p 命令面板\nF2 切换鼠标上报（关掉就能拖选复制文本；开着滚轮能翻滚录，也可以按住 shift 拖选）· /mouse [on|off]\nctrl+u 清行 · ctrl+w 删词 · ctrl+k 删到行尾 · ctrl+a/e 行首/行尾 · ctrl+l 重绘\nctrl+t 任务状态块 展开/收起 · ctrl+d 空行退出（运行中也生效）· /exit 退出 · ctrl+c 运行中两秒内两次＝退出 · 运行中的输入会进 steer 收件箱（下一个 step 生效）\n/diff 看 git 修改（浮窗里：↑↓ 选文件 · n/N 跳改动 · pgup/pgdn 滚动 · ←→ 左右 · r 刷新 · esc 关闭）" as &const byte;
+    const help: &const byte = "enter 发送 · ctrl+j / alt+enter 换行 · esc 中断（运行中＝中断本回合，当场杀掉正在跑的工具）· ctrl+c 中断或退出\npgup/pgdn 滚动 · ctrl+home/end 顶/尾 · tab 计划模式 · shift+tab 访问模式 · ctrl+p 命令面板\nF2 切换鼠标上报（关掉就能拖选复制文本；开着滚轮能翻滚录，也可以按住 shift 拖选）· /mouse [on|off]\nctrl+u 清行 · ctrl+w 删词 · ctrl+k 删到行尾 · ctrl+a/e 行首/行尾 · ctrl+l 重绘\nctrl+t 任务状态块 展开/收起 · ctrl+d 空行退出（运行中也生效）· /exit 退出 · ctrl+c 运行中两秒内两次＝退出 · 运行中的输入会进 steer 收件箱（下一个 step 生效）\n/diff 看 git 修改（浮窗里：↑↓ 选文件 · n/N 跳改动 · pgup/pgdn 滚动 · ←→ 左右 · r 刷新 · esc 关闭）\n/title 改会话标题（裸命令让模型起个建议填进输入框：←→ 移动 · ctrl+u 清空 · enter 采纳 · esc 取消）" as &const byte;
     tui_overlay_list(TUI_OVK_HELP, "帮助" as &const byte, 6, help, bufx_cstr_len(help));
 }
 

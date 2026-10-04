@@ -115,6 +115,9 @@ export struct Config {
     // P22：终端标题（TTY title）—— 交互模式下把窗口/标签页标题写成当前会话标题
     title: bool,              // --title / --no-title（交互模式默认开）
     title_src: u8,            // 0 默认 / 2 env / 3 cli（与 cfg_src_name 同口径）
+    // P46：自动起标题（每来一条人类消息、回合收口时让模型给个标题）
+    title_auto: bool,         // --title-auto / --no-title-auto（默认开）
+    title_auto_src: u8,       // 0 默认 / 2 env / 3 cli
     // 踩坑 72：鼠标上报（TUI 里 --mouse / --no-mouse / UYA_AGENT_MOUSE）。
     // 默认开（滚轮要靠它）；关掉之后终端接管拖选 —— 这就是「不能复制文本」的出口。
     mouse: bool,
@@ -174,6 +177,8 @@ fn cfg_default() Config {
         tui_src: 0,
         title: true,
         title_src: 0,
+        title_auto: true,
+        title_auto_src: 0,
         mouse: true,
         mouse_src: 0,
         tui_headless: false,
@@ -1110,16 +1115,74 @@ fn agent_default_home(cfg: &const Config, out: &Buf) bool {
 // ============================================================
 // P22：终端标题（TTY title）
 //
-// 「当前会话的标题」只有一份：`g_sess.title`。它的三个写入点 —— 首条用户消息的兜底派生、
+// 「当前会话的标题」只有一份：`g_sess.title`。它的写入点 —— 首条用户消息的兜底派生、
 // 会话日志里的 `session/title` 事件（--continue / --resume / /resume）、--resume-dsh
-// 导入的 DSH 标题 —— 全都汇到 `agent_title_apply()`：有标题就上标题，没有就上
-// `uya-agent · <工作目录名>`。清洗与 OSC 2 编码在 src/tty.uya（唯一实现）；
-// 这里只管「标题是什么」与「什么时候同步」。
+// 导入的 DSH 标题、P46 的人手 `/title` / 模型 `set_title`、P46 的自动起标题 —— 全都汇到
+// `agent_title_apply()`：有标题就上标题，没有就上 `uya-agent · <工作目录名>`。
+// 清洗与 OSC 2 编码在 src/tty.uya（唯一实现）；这里只管「标题是什么」与「什么时候同步」。
 // 只有交互模式（TUI / 滚动 REPL）才打开过标题通道，非交互路径 `tty_title_set` 是空操作。
+//
+// P46：标题**在执行过程中就能改**，四件事：
+//   1) 人敲 `/title <新标题>` / `/title clear`（TUI 里裸 `/title` 先让模型起一个建议、
+//      填进输入框再让人改）；
+//   2) 模型自己调 `set_title` 工具；
+//   3) 自动起标题：每个新的人类消息之后（回合收口时）跑一次侧路请求，
+//      把 `session/title` 与索引换成模型给的标题（kind = provider）；
+//   4) `clear` 退回基标题并解锁自动起标题。
+//
+// kind 三档沿用 DSH：`fallback`（前 5 词兜底）/ `provider`（模型生成）/ `user`（人写、模型写、
+// 导入 —— **显式钉住**：钉住之后自动起标题不再动手，与 DSH 的 rename 同语义）。
+// 标题会不会被改写，只看**最后一条** `session/title` 事件的 kind 是不是 user；
+// 这个状态跟着日志（g_title_pinned），所以 --resume 之后仍然钉住。
+//
+// ⚠ 自动起标题是**同步**的侧路请求（单线程，踩坑 47：不能起第二条线程并发 malloc），
+// 所以它排在回合收口之后、回到输入态之前 —— 一次人类消息最多一个额外小请求，
+// `--no-title-auto` / UYA_AGENT_TITLE_AUTO=0 可关。
 // ============================================================
 
 var g_title_base: Buf = Buf{ ptr: null, len: 0, cap: 0 };
 var g_title_base_ready: bool = false;
+var g_title_pinned: bool = false;        // 最后一条 title 事件是不是 user（显式钉住）
+var g_title_human_msgs: usize = 0;       // 本会话收到的人类消息条数（自动起标题的 revision）
+var g_title_auto_rev: usize = 0;         // 上一次自动起标题时的人类消息条数（revision 门控）
+var g_title_auto_done: bool = false;     // 本会话已经成功自动起过标题（供 /status 观测）
+var g_title_auto_pending: bool = false;  // 回合收尾挂下的待办（空闲主循环里消费）
+// P46：当前在飞的是「后台请求」（自动起标题）。泵点据此**不读键盘/不派发命令** ——
+// 用户不知道它在飞，它就没有资格取走用户那几秒里敲的任何字节（见 agent_pump_block）。
+var g_bg_request: bool = false;
+
+// llm.uya 的流式循环用：后台请求别读键盘（见 agent_pump_block 的注释）
+export fn agent_bg_request() bool {
+    return g_bg_request;
+}
+
+// 后台请求的「让路」判据：终端缓冲里已经有待读的按键吗？（只看一眼，不消费）
+// TUI 走 tui 侧那一份；滚动模式（--no-tui）的键盘在 fd 0 上，直接 poll 一眼。
+// 非交互（管道/子代理）恒 false —— 那种场合根本没有「用户要说话」这回事。
+export fn agent_bg_input_pending() bool {
+    if tui_active() {
+        return tui_input_pending();
+    }
+    if !tty_is_interactive() {
+        return false;
+    }
+    var pfd: [PollFd: 1] = [PollFd{ fd: 0, events: POLLIN, revents: 0 }];
+    const pr: i32 = sys_poll(&pfd[0], 1, 0) catch { 0; };
+    return pr > 0 && (pfd[0].revents & POLLIN) != 0;
+}
+// P46：自动起标题要等**两段静默**都满足才发：
+//   * 距「回合收尾挂上待办」已经过了 QUIET（arm 窗口）；
+//   * 距「用户最后一次敲键」也过了 QUIET（键盘窗口）。
+//
+// 为什么必须两段：这是个**同步**请求（单线程，踩坑 47 起不了第二条线程），一发出去就是
+// 几百毫秒到几秒。只看键盘窗口不行 —— 回合本身可能就跑了十几秒，回合一结束「键盘早就静了」，
+// 于是它抢在用户下一条命令之前发出去，用户看到的就是「敲完没反应」
+// （p30-check 的 status-during-compact 实测：/compact 与紧随的 /status 都被推迟 844ms）。
+// arm 窗口给用户一个「回合刚结束、我马上要接着敲」的机会：这段里只要他一动键盘，
+// 待办就继续往后等 —— 标题只在他真正闲下来时才更新。
+// 键盘时刻由 tui 侧唯一的键盘入口记（tui_last_key_ms）。
+const TITLE_AUTO_QUIET_MS: u64 = 900;
+var g_title_auto_arm_ms: u64 = 0;
 
 // 压掉尾部 '/' 之后取最后一段（工作目录名）
 fn agent_path_basename_into(out: &Buf, p: &const byte, n: usize) usize {
@@ -1202,11 +1265,95 @@ fn agent_title_log_event() void {
     }
 }
 
+// P46：把「当前标题」重新写进 `/sessions` 用的索引（标题列读的就是它）。
+// 与 agent_workspace_log / agent_model_log 同一套分工：改会话级字段就顺手追一条索引。
+fn agent_title_write_index(cfg: &const Config) void {
+    var home: Buf = buf_new(1024);
+    defer { buf_free(&home); }
+    if !agent_default_home(cfg, &home) {
+        return;
+    }
+    var hz: Buf = buf_new(home.len + 1);
+    defer { buf_free(&hz); }
+    _ = buf_append(&hz, home.ptr, home.len);
+    _ = buf_append_byte(&hz, 0);
+    _ = sess_write_index(hz.ptr as &const byte, &g_sess);
+}
+
+// P46：落一条**带 kind** 的 title 事件（DSH 的三档：fallback / provider / user）。
+// 空标题也要落（clear 用）：不落的话 `--resume` 折叠到最后一条旧事件会把标题复活，
+// 索引与日志就不一致了（自测 title-cmd 钉住这条）。
+fn agent_title_log_kind(kind: &const byte, t: &const byte, n: usize) void {
+    if !g_sess.save {
+        return;
+    }
+    var tev: Buf = buf_new(n + 192);
+    defer { buf_free(&tev); }
+    if sess_begin(&g_sess, "session/title", &tev) {
+        _ = buf_append_cstr(&tev, "{\"title\":");
+        _ = jw_str_into(&tev, t, n);
+        _ = buf_append_cstr(&tev, ",\"source\":{\"kind\":\"");
+        _ = buf_append(&tev, kind, bufx_cstr_len(kind));
+        _ = buf_append_cstr(&tev, "\"}}");
+        _ = sess_end(&g_sess, &tev);
+    }
+}
+
+// P46：显式设置会话标题（人手 `/title <t>` 与模型 `set_title` 共用这一处）。
+//
+// `pin` = 是否钉住（人写与模型写都钉住；自动起标题不钉）。
+// 只写内存 + 一条日志事件 + 索引 + OSC 2，**不动历史** —— 所以回合运行中当场派发是安全的
+// （与 /mouse 同一条口径，见 agent_tui_cmd_safe）。
+//
+// 返回 0 = 成功；1 = 清洗后为空（调用方给话术，标题一个字节都不动）。
+export const TITLE_SET_OK: i32 = 0;
+export const TITLE_SET_EMPTY: i32 = 1;
+
+fn agent_title_set_kind(
+    cfg: &const Config,
+    text: &const byte,
+    n: usize,
+    kind: &const byte,
+    pin: bool
+) i32 {
+    var clean: Buf = buf_new(TTY_TITLE_MAX_BYTES + 16);
+    defer { buf_free(&clean); }
+    _ = tty_title_clean_into(&clean, text, n, TTY_TITLE_MAX_BYTES);
+    // 空标题：显式给的那一条不许静默成功（DSH 的 rename 也是抛 title-invalid），
+    // 但 clear 那条路（下面）要能落空标题 —— 所以判空放在调用方。
+    if pin && clean.len == 0 {
+        return TITLE_SET_EMPTY;
+    }
+    buf_reset(&g_sess.title);
+    _ = buf_append(&g_sess.title, clean.ptr as &const byte, clean.len);
+    g_title_pinned = pin;
+    agent_title_log_kind(kind, clean.ptr as &const byte, clean.len);
+    agent_title_write_index(cfg);
+    agent_title_apply();
+    return TITLE_SET_OK;
+}
+
+// P46：人手 / 模型显式改名（kind = user，钉住）
+fn agent_title_set_user(cfg: &const Config, text: &const byte, n: usize) i32 {
+    return agent_title_set_kind(cfg, text, n, "user" as &const byte, true);
+}
+
+// P46：/title clear —— 退回基标题 + 解锁自动起标题。
+// 落一条**空标题**的 user 事件（见 agent_title_log_kind 的注释），索引跟着写成空。
+// DSH 的 rename 明确不做删除，这一档是本项目加的。
+fn agent_title_clear(cfg: &const Config) void {
+    buf_reset(&g_sess.title);
+    g_title_pinned = false;
+    agent_title_log_kind("user" as &const byte, "" as &const byte, 0);
+    agent_title_write_index(cfg);
+    agent_title_apply();
+}
+
 // --resume-dsh：把 DSH 会话的标题接过来当本会话的标题。
 // 事件里的 source.kind 记 `user`：DSH 的三种 kind（fallback / provider / user）中，
 // 「显式给定、且钉住不再自动改写」的那一种就是 user —— 这条标题来自用户显式导入的会话，
 // 不是我们自动推导的，也不该被后面第一条消息改写（`agent_title_derive` 只在标题为空时动手）。
-fn agent_title_adopt_imported(t: &const Buf) void {
+fn agent_title_adopt_imported(cfg: &const Config, t: &const Buf) void {
     if t.len == 0 {
         return;
     }
@@ -1218,23 +1365,300 @@ fn agent_title_adopt_imported(t: &const Buf) void {
     }
     buf_reset(&g_sess.title);
     _ = buf_append(&g_sess.title, clean.ptr as &const byte, clean.len);
-    if g_sess.save {
-        var tev: Buf = buf_new(320);
-        defer { buf_free(&tev); }
-        if sess_begin(&g_sess, "session/title", &tev) {
-            _ = buf_append_cstr(&tev, "{\"title\":");
-            _ = jw_str_into(&tev, g_sess.title.ptr as &const byte, g_sess.title.len);
-            _ = buf_append_cstr(&tev, ",\"source\":{\"kind\":\"user\"}}");
-            _ = sess_end(&g_sess, &tev);
+    g_title_pinned = true;
+    agent_title_log_kind("user" as &const byte, clean.ptr as &const byte, clean.len);
+    agent_title_write_index(cfg);
+    agent_title_apply();
+}
+
+// ============================================================
+// P46：自动起标题（对齐 DSH 的 provider 一路）
+//
+// 侧路请求，与 agent_maybe_compact 同一套骨架：复制历史 + 追加提示词 → 走生效协议
+// （未声明时同样允许一次协商回退）→ 结果**只**用来改标题，不进主历史、不进统计、不进转录。
+//
+// 三条纪律：
+//   * `print_content=false / print_reasoning=false`：起标题的请求不许在正文里吐字；
+//   * `interactive=g_interactive`：esc/ctrl+c 能中断它（中断 = 不改标题，不是错误）；
+//   * 失败一律静默（返回 false），由调用方决定给不给话术 —— 标题是 UI 特性，
+//     起标题失败绝不能让回合失败或让人以为出错了。
+// ============================================================
+
+// 起标题的提示词：只输出一行标题。口径对齐 DSH 的 fallback（≤40 B）+ maxTitleBytes（80 B）：
+// 让模型给短的，最后仍由 tty_title_clean_into 收口（前 80 B、码点边界）。
+fn agent_title_prompt_into(out: &Buf) bool {
+    buf_reset(out);
+    const head: &const byte = "Write a session title for the conversation above.\n\n";
+    if !buf_append_cstr(out, head) {
+        return false;
+    }
+    if !buf_append_cstr(out, "Rules:\n") {
+        return false;
+    }
+    if !buf_append_cstr(out, "- Reply with the title ONLY: one single line, no quotes, no markdown, no trailing punctuation.\n") {
+        return false;
+    }
+    if !buf_append_cstr(out, "- Write it in the same language as the user's most recent message.\n") {
+        return false;
+    }
+    if !buf_append_cstr(out, "- Name the concrete task or topic (files, subsystems, error strings) rather than the general area.\n") {
+        return false;
+    }
+    if !buf_append_cstr(out, "- Keep it within 40 characters (at most 5 words).\n") {
+        return false;
+    }
+    return buf_append_cstr(out, "- No preamble, no explanation, call no tool.");
+}
+
+// 让模型给一个候选标题（成功 = 建议值写进 out，返回 true）。
+//
+// `serve_input` = 这次请求要不要在流式期间服务键盘（esc 中断、运行中的只读命令）。
+//   * 裸 /title（前台）：true —— 用户可能想 esc 掉它，与别的请求同一条口径；
+//   * 自动起标题（后台）：调用方传 g_interactive（真机上就是 true），但 `g_bg_request`
+//     会让泵点退化成「只刷帧」，所以它仍然一个键都不读（见 agent_pump_block）。
+//     为什么不干脆传 false：false 会让流式循环完全不泵，界面在那几秒里是冻的 ——
+//     而这是个用户没发起的请求，冻住界面比「读键串味」更糟。
+//     `agent_bg_input_pending()` 是它的让路机制：一发现终端缓冲里有待读字节就中止自己。
+fn agent_title_generate(
+    cfg: &const Config,
+    h: &const History,
+    out: &Buf,
+    serve_input: bool
+) bool {
+    buf_reset(out);
+    if cfg.api_key.len == 0 || h.len == 0 {
+        return false;
+    }
+    // 历史副本 + 提示词（DSH 也是把提示词作为最后一条 user 消息，不动真历史）
+    var tmp: History = hist_init();
+    defer { hist_free(&tmp); }
+    var i: usize = 0;
+    while i < h.len {
+        const m: &const Msg = msg_at(h, i);
+        _ = hist_push_msg_kind(&tmp, m.role, m.kind, m.text as &const byte, m.text_len, m.extra as &const byte, m.extra_len);
+        i = i + 1;
+    }
+    var prompt: Buf = buf_new(2048);
+    defer { buf_free(&prompt); }
+    if !agent_title_prompt_into(&prompt) {
+        return false;
+    }
+    if !hist_push(&tmp, ROLE_USER, prompt.ptr as &const byte, prompt.len) {
+        return false;
+    }
+    var req: Buf = buf_new(request_bytes_needed(&tmp, cfg));
+    defer { buf_free(&req); }
+    var url: Buf = buf_new(cfg.base_url.len + 24);
+    defer { buf_free(&url); }
+    var hdrs: Buf = buf_new(512);
+    defer { buf_free(&hdrs); }
+    if !build_headers(cfg, &hdrs) {
+        return false;
+    }
+    var o: ChatOut = chat_out_new();
+    defer { chat_out_free(&o); }
+    var tc: TlsConn = tls_conn_empty();
+
+    var status: i32 = 0;
+    var tried: i32 = 0;
+    var interrupted: bool = false;
+    while true {
+        tried = tried + 1;
+        const style: u8 = api_style_now(cfg);
+        if !api_url_into(cfg, style, &url) || !build_model_request(cfg, &tmp, &req, style) {
+            return false;
+        }
+        var guard: FdGuard = FdGuard{ saved: -1, nullfd: -1, active: false };
+        tls_noise_mute(&guard, !cfg.tls_debug && !hc_debug);
+        const res: !i32 = llm_stream_style(
+            style,
+            url.ptr[0: url.len],
+            hdrs.ptr[0: hdrs.len],
+            req.ptr as &const byte,
+            req.len,
+            cfg.timeout_ms,
+            cfg.max_response,
+            cfg.verify,
+            cfg.pin.ptr[0: cfg.pin.len],
+            &o,
+            false,
+            false,
+            serve_input
+        );
+        tls_noise_unmute(&guard);
+        status = res catch |err| {
+            const eid: i32 = (@error_id(err) as! i32).value;
+            if eid == @error_id(error.LlmInterrupted) {
+                interrupted = true;
+            }
+            0;
+        };
+        if api_negotiate(cfg, style, status) && tried < 2 {
+            buf_reset(&o.content);
+            continue;
+        }
+        api_lock(cfg, style);
+        break;
+    }
+    if interrupted || status != 200 || o.content.len == 0 {
+        return false;
+    }
+    // 模型给的字节不可信：过唯一的标题规范化实现，再按 fallback 的口径压到「5 词 / 40 B」
+    // （模型偶尔会回一整句；DSH 的 provider 结果同样要过 normalizeSessionTitle 才落地）。
+    var fb: Buf = buf_new(TTY_TITLE_FALLBACK_BYTES + 16);
+    defer { buf_free(&fb); }
+    _ = tty_title_fallback_into(
+        &fb,
+        o.content.ptr as &const byte,
+        o.content.len,
+        TTY_TITLE_FALLBACK_WORDS,
+        TTY_TITLE_FALLBACK_BYTES
+    );
+    if fb.len == 0 {
+        return false;
+    }
+    _ = buf_append(out, fb.ptr as &const byte, fb.len);
+    return true;
+}
+
+// 回合收尾时**只是挂个待办**，真正发请求在空闲主循环里（见 agent_title_auto_pending_tick）。
+//
+// 为什么不能直接在这儿发：这一句在回合的同步路径上，请求在飞的那段会**拖长「回合还没结束」
+// 的窗口**，而运行中敲进来的命令走的是 steer 收件箱 —— 那玩意儿只在 step 边界被领取
+// （泵点里的 agent_tui_poll_pending_cmd 只管面板结果）。于是「起标题的请求在飞时敲 /status」
+// 会掉进收件箱干等，屏幕上就是没反应 —— p30-check 的 status-during-compact 当场抓到这条。
+// 挪到空闲循环 + 泵点上下文之后，落点就与 /compact 完全一样（P31 那条纪律）。
+export fn agent_title_auto_schedule(cfg: &const Config) void {
+    if (!agent_title_auto_on(cfg)) {
+        return;
+    }
+    g_title_auto_pending = true;
+    g_title_auto_arm_ms = ua_now_ms();
+}
+
+fn agent_title_auto_on(cfg: &const Config) bool {
+    if !cfg.title || !cfg.title_auto || !g_interactive || cfg.is_subagent {
+        return false;
+    }
+    if g_title_pinned {
+        return false;
+    }
+    if g_title_human_msgs == 0 || g_title_human_msgs == g_title_auto_rev {
+        return false;   // 没有新的人类消息：不重复烧钱（revision 门控）
+    }
+    return true;
+}
+
+// 空闲主循环里消费待办：把标题换成模型给的（kind = provider，**不钉住** —— 下一条人类消息还能再换）。
+// 与 /compact 同一落点（空闲循环里发），但**泵点的口径不同**：/compact 是前台请求，
+// 泵点照常读键盘、照常派发运行中的只读命令；起标题是后台请求，泵点只刷帧（g_bg_request），
+// 一个字节的键都不读，而且一发现用户动键盘就中止自己。
+//
+// ⚠ 只在**真空闲**时才发：起标题是锦上添花，绝不能抢用户的输入。它是个同步请求，
+// 一发出去就是几百毫秒到几秒；那段时间用户敲的字只会落进 steer 收件箱，而收件箱要等
+// step 边界才被领取 —— 于是「起标题时敲 /status」看起来就是没反应（p30-check 的
+// status-during-compact 抓到过，落点还串成了「未知命令」）。有输入就先让给用户，
+// 下一圈空闲了再发。
+fn agent_title_auto_idle_ok() bool {
+    if !g_title_auto_pending {
+        return false;
+    }
+    // 两段静默（理由见 TITLE_AUTO_QUIET_MS 的注释）：arm 窗口 + 键盘窗口。
+    const now: u64 = ua_now_ms();
+    if g_title_auto_arm_ms > 0 && now >= g_title_auto_arm_ms
+        && now - g_title_auto_arm_ms < TITLE_AUTO_QUIET_MS {
+        return false;
+    }
+    const last_key: u64 = tui_last_key_ms();
+    if last_key > 0 && now >= last_key && now - last_key < TITLE_AUTO_QUIET_MS {
+        return false;
+    }
+    if tui_active() {
+        if tui_has_submit() || tui_overlay_open() {
+            return false;
+        }
+        // 有还没派发的浮层结果（面板里刚选中一条命令）也不行：那一圈的下一次迭代会
+        // 去派发它，而它顺手要收走「触发面板的那个 /」—— 与用户正在敲的命令搅在一起
+        // 就是 `//status`（实测症状，见 tui_overlay_result_pending 的注释）。
+        if tui_overlay_result_pending() {
+            return false;
+        }
+        // 输入行里已经有字 = 用户正在打字（可能刚敲了一个 `/` 在等面板）。
+        // 这时候发请求，那半个命令会被后面的泵点/主循环当成整条命令派发 ——
+        // 实测症状是 `/status` 变成 `//status` 然后「未知命令」（p30-check 的
+        // status-during-compact 抓到过）。
+        if tui_input_len() > 0 {
+            return false;
         }
     }
+    return inbox_len(&g_steer) == 0;
+}
+
+export fn agent_title_auto_pending_tick(cfg: &const Config, h: &const History) void {
+    if (!g_title_auto_pending) {
+        return;
+    }
+    // 用户的东西优先：有输入/有浮层就这一圈不发（待办留着，下一圈再看）
+    if !agent_title_auto_idle_ok() {
+        return;
+    }
+    g_title_auto_pending = false;
+    if (!agent_title_auto_on(cfg)) {
+        return;
+    }
+    // 先把 revision 记上：这次不管成没成，都不该为同一条消息再试一次
+    g_title_auto_rev = g_title_human_msgs;
+    // 后台请求：不读键盘、也不派发命令（g_bg_request 让泵点退化成「只刷帧」）
+    g_bg_request = true;
+    var t: Buf = buf_new(TTY_TITLE_FALLBACK_BYTES + 16);
+    defer { buf_free(&t); }
+    const got: bool = agent_title_generate(cfg, h, &t, g_interactive);
+    g_bg_request = false;
+    if !got {
+        return;
+    }
+    buf_reset(&g_sess.title);
+    _ = buf_append(&g_sess.title, t.ptr as &const byte, t.len);
+    g_title_auto_done = true;
+    agent_title_log_kind("provider" as &const byte, t.ptr as &const byte, t.len);
+    agent_title_write_index(cfg);
     agent_title_apply();
+}
+
+// P46：`set_title` 工具。
+//
+// 与 /title 走同一个落点（agent_title_set_user），所以「钉住 / 落 user 事件 / 写索引 /
+// OSC 2」四条语义两条路完全一致 —— 这是本仓的既定纪律：同一件事只有一处实现。
+// 空串 = clear（退回基标题、解锁自动起标题），与 `/title clear` 同语义。
+// 参数缺失（没有 title 键）则报用法，不做任何改动。
+export fn agent_title_tool_set(cfg: &const Config, args: &const JsonValue, out: &Buf) void {
+    var t: Buf = buf_empty();
+    defer { buf_free(&t); }
+    if !js_obj_get_str_unescaped(args, "title", 5, &t) {
+        _ = buf_append_cstr(out, "error: set_title needs a \"title\" string (pass \"\" to clear it)\n");
+        return;
+    }
+    if t.len == 0 {
+        agent_title_clear(cfg);
+        _ = buf_append_cstr(out, "title cleared; the terminal title is back to the default and automatic titling resumes\n");
+        return;
+    }
+    const rc: i32 = agent_title_set_user(cfg, t.ptr as &const byte, t.len);
+    if rc == TITLE_SET_EMPTY {
+        _ = buf_append_cstr(out, "error: title must contain visible characters (control characters and whitespace alone are not a title)\n");
+        return;
+    }
+    _ = buf_append_cstr(out, "title set to \"");
+    _ = buf_append(out, g_sess.title.ptr as &const byte, g_sess.title.len);
+    _ = buf_append_cstr(out, "\" (pinned: automatic titling will not overwrite it; pass \"\" to clear)\n");
 }
 
 fn agent_log_user(text: &const byte, n: usize, steer: bool) void {
     if n == 0 {
         return;
     }
+    // P46：人类消息计数 = 自动起标题的 revision（steer 也算：用户确实又说了话）
+    g_title_human_msgs = g_title_human_msgs + 1;
     const fresh: bool = agent_title_derive(text, n);
     if g_sess.save {
         var ev: Buf = buf_new(n + 256);
@@ -1743,6 +2167,13 @@ fn agent_hist_from_log(cfg: &const Config, h: &History, path: &const Buf, out_ne
             if sess_json_string_dup(view, "title", &ttl) {
                 buf_reset(&g_sess.title);
                 _ = buf_append(&g_sess.title, ttl.ptr, ttl.len);
+                // P46：钉住与否只看**最后一条** title 事件的 kind（latest-wins，与 DSH 的
+                // foldSessionTitle 同口径）。不读它的话 `--resume` 之后钉住状态就丢了，
+                // 自动起标题会把用户手写的标题覆盖掉。
+                var kd: Buf = buf_new(32);
+                defer { buf_free(&kd); }
+                g_title_pinned = sess_json_str(view, "kind", &kd)
+                    && bufx_eq_cstr(kd.ptr as &const byte, kd.len, "user" as &const byte);
             }
         }
     }
@@ -2272,6 +2703,9 @@ const TOOL_WORKSPACE: &const byte = `{"type":"function","function":{"name":"work
 
 const TOOL_WORKTREE: &const byte = `{"type":"function","function":{"name":"worktree","description":"The Git worktree this session works in. This session was started in its own worktree (a separate branch of the same repository), so all of your work lands there and the shared checkout stays untouched. Actions: start (provision a worktree if this session has none), status (the current diff, commit count, and uncommitted paths), finish (commit anything pending, merge your branch into the base branch in the shared checkout, then REMOVE the worktree and delete the branch), discard (remove the worktree and delete its branch without merging), list (leftover session worktrees in this repository). Call finish only when the work is complete and verified; subagents must never call finish or discard on their parent's worktree.","parameters":{"type":"object","properties":{"action":{"type":"string","enum":["start","status","finish","discard","list"],"description":"start (provision) | status (report) | finish (merge to base and clean up) | discard (clean up without merging) | list (leftover worktrees)."},"message":{"type":"string","description":"Commit message for \"finish\" when it has to commit pending changes or create the merge commit. Omit to use a generated one."},"keepWorktree":{"type":"boolean","description":"For \"finish\" only: merge but leave the worktree in place for inspection. Defaults to false — the worktree is removed after a successful merge."}},"required":["action"]}}}`;
 
+// P46：会话标题。它只影响终端窗口/标签页标题与 /sessions 列表的标题列 —— 不改任务、不改历史。
+const TOOL_SET_TITLE: &const byte = `{"type":"function","function":{"name":"set_title","description":"Rename this session: the title becomes the terminal window/tab title (OSC 2) and the title column of the session list. Call it when the session's topic has clearly moved on from the auto-generated title, or once you understand what the task actually is. Set it in the user's language, name the concrete task (files, subsystem, error string) rather than the general area, and keep it short — at most 5 words / 40 bytes. A title you set is pinned: it will not be overwritten by automatic titling, so set it deliberately and not more than once or twice per session. Passing an empty title clears it back to the default (the automatic titling resumes).","parameters":{"type":"object","properties":{"title":{"type":"string","description":"The new session title: one line, at most 5 words / 40 bytes, in the user's language. Pass an empty string to clear it back to the default title."}},"required":["title"]}}}`;
+
 const TOOL_TODO: &const byte = `{"type":"function","function":{"name":"todo_write","description":"Record and update a structured task list for the current work. Send the ENTIRE list every call — it REPLACES the previous list (there are no partial updates, no per-item edits). Use it to plan multi-step work and show progress: add one todo per concrete step before you start. Mark every todo being actively worked on \u0060in_progress\u0060 — several at once when work genuinely runs in parallel (e.g. concurrent subagents or background commands), one for sequential work; while work remains, at least one task should be \u0060in_progress\u0060. Mark a todo \u0060completed\u0060 the moment it is done (do not batch completions), and allow no \u0060in_progress\u0060 item only once all work is complete. Skip the list for trivial single-step tasks.","parameters":{"type":"object","properties":{"todos":{"type":"array","description":"The COMPLETE task list, replacing any previous list.","items":{"type":"object","additionalProperties":false,"properties":{"content":{"type":"string","description":"What the task is — a short imperative line."},"status":{"type":"string","enum":["pending","in_progress","completed"],"description":"pending (not started) | in_progress (now) | completed (done)."}},"required":["content","status"]}}},"required":["todos"]}}}`;
 
 const TOOL_EXIT_PLAN: &const byte = `{"type":"function","function":{"name":"exit_plan_mode","description":"Use only in plan mode. Present your plan for the user's review and, on approval, leave plan mode. Send the COMPLETE plan as markdown, starting with a # heading that names it. The user reviews it in a dialog and either approves (carry out the plan from your next step), asks for a revision (keep planning and present it again), or dismisses it to speak instead (stay in plan mode and wait for their message); the decision comes back in the tool result.","parameters":{"type":"object","properties":{"plan":{"type":"string","description":"The complete plan as markdown, starting with a # heading that names it."}},"required":["plan"]}}}`;
@@ -2371,6 +2805,10 @@ fn tools_json(out: &Buf, allow_shell: bool, flat: bool) bool {
         return false;
     }
     if !tools_put(out, TOOL_WORKTREE, flat) {
+        return false;
+    }
+    // P46：会话标题（模型也能改；它只动标题，不动历史 —— 与 workspace/worktree 同一条口径）
+    if !tools_put(out, TOOL_SET_TITLE, flat) {
         return false;
     }
     if !tools_put(out, TOOL_TODO, flat) {
@@ -3005,6 +3443,12 @@ export const AGENT_INTERRUPTED: i32 = 130;
 // 交互模式标志（前台界面唯一，用全局避免把参数穿过整条调用链）
 var g_interactive: bool = false;
 
+// P46：给自测用的一把钥匙 —— 「交互模式」这个标志决定了自动起标题跑不跑，
+// 而自测（headless）不走真终端入口，否则那条闸门永远测不到。
+export fn agent_set_interactive(v: bool) void {
+    g_interactive = v;
+}
+
 fn dump_stream_error(cfg: &const Config, status: i32, body: &const Buf) void {
     _ = cfg;
     out_err("model endpoint returned HTTP ");
@@ -3062,6 +3506,8 @@ fn dispatch_tool_body(cfg: &Config, name: &const Buf, args_json: &const Buf, are
         ws_tool_workspace(cfg, &arg_val, out);
     } else if sv_eq_cstr(name, "worktree") {
         wt_tool_worktree(cfg, &arg_val, out);
+    } else if sv_eq_cstr(name, "set_title") {
+        agent_title_tool_set(cfg, &arg_val, out);
     } else if sv_eq_cstr(name, "exit_plan_mode") {
         plan_tool_exit(cfg, &g_plan, &arg_val, out);
     } else if sv_eq_cstr(name, "ask_user_question") {
@@ -3551,6 +3997,12 @@ fn agent_turn_loop(cfg: &Config, h: &History) i32 {
     }
     st_turn_end();
     agent_stats_sync(cfg, h);
+    // P46：自动起标题 —— 回合收尾**只挂待办**，真正发请求在空闲主循环里
+    // （理由见 agent_title_auto_schedule：在这里同步发会拖长「回合没结束」的窗口，
+    // 而运行中敲进来的命令要等 step 边界才被领取 —— p30-check 抓到过这条）。
+    if rc == AGENT_OK {
+        agent_title_auto_schedule(cfg);
+    }
     agent_pump_ctx_end(cfg);
     return rc;
 }
@@ -3986,7 +4438,7 @@ fn agent_history_begin(cfg: &Config, h: &History, first: &const Buf) bool {
                     return false;
                 }
                 // P22：标题要在 sess_open **之后**落（sess_open 会把 l.title 重置成空）
-                agent_title_adopt_imported(&dsh_title);
+                agent_title_adopt_imported(cfg, &dsh_title);
                 if first.len > 0 {
                     _ = hist_push(h, ROLE_USER, first.ptr as &const byte, first.len);
                 }
@@ -6241,6 +6693,8 @@ fn print_usage() void {
     out_err("  --tui               全屏 TUI（TTY 交互模式默认）；--no-tui 退回滚动转录\n");
     out_err("  --title             交互模式下把终端标题写成当前会话标题（默认开）\n");
     out_err("  --no-title          不改终端标题（UYA_AGENT_TITLE=0 同口径）\n");
+    out_err("  --no-title-auto     不让模型自动起标题（每来一条人类消息多一次小请求；\n");
+    out_err("                      UYA_AGENT_TITLE_AUTO=0 同口径；/title 手写仍可用）\n");
     out_err("  --no-mouse          关掉 TUI 的鼠标上报（就能直接拖选复制文本；F2 / /mouse 同效）\n");
     out_err("  --color=MODE        auto（默认）| always | never | 16 | 256；NO_COLOR 也认\n");
     out_err("  --tui-demo          打印 TUI 的 home/chat 两屏纯文本快照后退出\n");
@@ -6393,6 +6847,26 @@ fn parse_steps_arg(p: &byte, label: &const byte) i32 {
 // 例外：行首是 `/` 的**只读命令**（/status、/help、/sessions）按命令派发 ——
 // 与滚动模式在 REPL 循环里那句「运行中输入的 slash 命令也按命令走」同一个口径，
 // 用户并不知道回合是否已经结束。不安全的命令（会 hist_free / 改写历史）仍旧按文本走。
+// P46：steer 那一侧的安全判定。比 agent_tui_cmd_safe 多认识一种命令的**带参形态**：
+// `/title <新标题>` / `/title clear` 只写内存 + 一条日志事件 + OSC 2（不动历史、不发请求），
+// 所以回合运行中当场派发是安全的 —— 用户改标题时并不知道回合有没有跑完。
+//
+// 为什么不能直接把 `/title` 塞进 agent_tui_cmd_safe：那个函数只拿得到**命令名**，
+// 而裸 `/title` 要发一个侧路请求 + 开输入框浮层，在泵点里重入 llm_stream_style 是不行的
+// （单线程，见踩坑 47）—— 它必须走「已收到 …：本回合结束后执行」那条路。
+// 这里按**整行**判定，所以能分开这两支。
+fn agent_tui_cmd_safe_steer(line: &const Buf) bool {
+    if arg_starts_with(line.ptr as &const byte, "/title ") {
+        // 带参数的那支：确认不是只有空白（`/title   ` 其实是裸命令，按不安全处理）
+        var at: usize = 6;
+        while at < line.len && (line.ptr[at] == 32 as byte || line.ptr[at] == 9 as byte) {
+            at = at + 1;
+        }
+        return at < line.len;
+    }
+    return agent_tui_cmd_safe(line);
+}
+
 fn agent_claim_steer(cfg: &const Config, h: &History) void {
     var line: Buf = buf_new(4096);
     defer { buf_free(&line); }
@@ -6400,7 +6874,7 @@ fn agent_claim_steer(cfg: &const Config, h: &History) void {
         if line.len == 0 {
             continue;
         }
-        if line.ptr[0] == 47 as byte && agent_tui_cmd_safe(&line) {
+        if line.ptr[0] == 47 as byte && agent_tui_cmd_safe_steer(&line) {
             if cfg.tui && tui_active() {
                 _ = agent_tui_command(cfg, h, &line);
             } else {
@@ -6452,6 +6926,14 @@ fn agent_tasks_sync() void {
 // （`goal.json`）、按设计跨会话（见 README §7）。
 fn agent_session_scoped_reset() void {
     todo_clear(&g_todos);
+    // P46：标题的会话级状态跟着换会话复位。**不清 g_sess.title 本身** ——
+    // 它由 sess_open / agent_hist_from_log 那条路负责（引用数超容量会丢，见踩坑 51）；
+    // 这里只清「自动起标题有没有跑过」与「钉住」这两个进程级标志，
+    // 否则 /new 之后新会话会被上一条会话的 pin 挡住、永远起不了标题。
+    g_title_pinned = false;
+    g_title_human_msgs = 0;
+    g_title_auto_rev = 0;
+    g_title_auto_done = false;
 }
 
 // 会话目标：盘上 goal.json 的内存投影（任务块显示用）
@@ -6790,6 +7272,7 @@ fn agent_repl_help() void {
     tty_puts(&tty_ui, 2, "  /model [名字]      看/切模型（按提供方分组；带名字直接切）\n");
     tty_puts(&tty_ui, 2, "  /effort [档位]     看/切推理强度（只列该模型公布的档位：off/minimal/low/medium/high/xhigh/max）\n");
     tty_puts(&tty_ui, 2, "  /worktree  Git worktree：独立工作区执行 → finish 合并回主干并删掉它（TUI 里裸命令开动作选择框）\n");
+    tty_puts(&tty_ui, 2, "  /title [<新标题>|clear]  看/改会话标题（裸命令让模型起一个建议；clear 清回基标题）\n");
     tty_puts(&tty_ui, 2, "  /sessions  列出本机会话\n");
     tty_puts(&tty_ui, 2, "  /resume ID 切换到指定会话（id 或 last）\n");
     tty_puts(&tty_ui, 2, "  /new       开一条新会话（当前会话保留在磁盘上）\n");
@@ -6872,6 +7355,24 @@ fn agent_repl_status(cfg: &const Config, h: &const History) void {
     }
     tty_puts(&tty_ui, 2, "\nworkspace=");
     tty_write(&tty_ui, 2, cfg.workspace.ptr as &const byte, cfg.workspace.len);
+    // P46：会话标题（终端窗口/标签页上那一行 + /sessions 的标题列）
+    tty_puts(&tty_ui, 2, "\ntitle=");
+    if g_sess.title.len > 0 {
+        tty_write(&tty_ui, 2, g_sess.title.ptr as &const byte, g_sess.title.len);
+        if g_title_pinned {
+            tty_puts(&tty_ui, 2, " (pinned; /title clear 解锁)");
+        } else {
+            tty_puts(&tty_ui, 2, " (auto; 下一条消息可能改写)");
+        }
+    } else {
+        tty_puts(&tty_ui, 2, "(无标题，终端显示基标题)");
+    }
+    tty_puts(&tty_ui, 2, "\ntitle_auto=");
+    if cfg.title_auto {
+        tty_puts(&tty_ui, 2, "on");
+    } else {
+        tty_puts(&tty_ui, 2, "off (--no-title-auto)");
+    }
     tty_puts(&tty_ui, 2, "\napi=");
     tty_puts(&tty_ui, 2, llm_style_name(api_style_now(cfg)));
     if cfg.src_api == API_SRC_DEFAULT {
@@ -6942,6 +7443,72 @@ fn agent_repl_tasks(cfg: &const Config) void {
     agent_tasks_report(cfg, &txt);
     tty_puts(&tty_ui, 2, "--- 任务 ---\n");
     tty_write(&tty_ui, 2, txt.ptr as &const byte, txt.len);
+}
+
+// P46：/title —— 会话标题（看 / 改 / 清 / 让模型起一个）。
+//
+// 三种形状，解析与语义只有这一份（TUI 与滚动模式共用）：
+//   /title <新标题>  显式改名（钉住，落 kind=user，写索引 + OSC 2）
+//   /title clear     退回基标题 + 解锁自动起标题（落一条空标题的 user 事件）
+//   /title           让模型给一个**建议**（不改标题 —— 改不改由调用方决定）
+//
+// 返回码：0 = 已处理（含「建议已放进 out」）；调用方按各自界面把 out 打出去。
+// `suggest` 出参只在裸 /title 时非空（= 模型建议，可能是空 = 没生成出来）。
+//
+// 为什么要把它做成「共用一份」：TUI 要拿建议去填输入框、滚动模式只能打在屏幕上，
+// 但「哪个词是 clear」「空标题算不算合法」「钉不钉住」这些语义必须完全一致 ——
+// 与 /goal 同一条纪律（解析与措辞只在 goal_cmd_run 一处）。
+const TITLE_CMD_USAGE: &const byte = "用法：/title <新标题> · /title clear（清回基标题）· 裸 /title 让模型起一个建议" as &const byte;
+
+fn agent_title_cmd(cfg: &const Config, h: &const History, line: &const Buf, out: &Buf, suggest: &Buf) bool {
+    buf_reset(out);
+    buf_reset(suggest);
+    // 参数从 "/title" 之后开始（跳过多敲的空格）
+    var at: usize = 6;
+    while at < line.len && (line.ptr[at] == 32 as byte || line.ptr[at] == 9 as byte) {
+        at = at + 1;
+    }
+    if at >= line.len {
+        // 裸 /title：让模型起一个建议（**不改标题**）
+        var t: Buf = buf_new(TTY_TITLE_FALLBACK_BYTES + 16);
+        defer { buf_free(&t); }
+        if agent_title_generate(cfg, h, &t, true) {
+            _ = buf_append(suggest, t.ptr as &const byte, t.len);
+            _ = buf_append_cstr(out, "[title] 建议标题：");
+            _ = buf_append(out, t.ptr as &const byte, t.len);
+            _ = buf_append_cstr(out, "\n");
+        } else {
+            _ = buf_append_cstr(out, "[title] 起不出来（没 key / 空历史 / 请求失败或被中断）\n");
+        }
+        if g_sess.title.len > 0 {
+            _ = buf_append_cstr(out, "当前标题：");
+            _ = buf_append(out, g_sess.title.ptr as &const byte, g_sess.title.len);
+            _ = buf_append_cstr(out, "\n");
+        } else {
+            _ = buf_append_cstr(out, "当前标题：(无标题，终端显示基标题)\n");
+        }
+        _ = buf_append_cstr(out, TITLE_CMD_USAGE);
+        _ = buf_append_cstr(out, "\n");
+        return true;
+    }
+    // 整行就是 clear 才当动词（标题里带 clear 的走字面量那条，与 /goal 同一条口径）
+    const arg: &const byte = @ptr_from_usize(@usize_from_ptr(line.ptr as &const void) + at) as &const byte;
+    const an: usize = line.len - at;
+    if bufx_eq_cstr(arg, an, "clear" as &const byte) {
+        agent_title_clear(cfg);
+        _ = buf_append_cstr(out, "[title] 已清回基标题（自动起标题重新生效）\n");
+        return true;
+    }
+    const rc: i32 = agent_title_set_user(cfg, arg, an);
+    if rc == TITLE_SET_EMPTY {
+        // 静默成功是最坏的一种：用户以为改了，屏幕上什么都没有
+        _ = buf_append_cstr(out, "[title] error: 这个标题清洗后是空的（控制字符 / 空白不算标题）；标题未改动\n");
+        return false;
+    }
+    _ = buf_append_cstr(out, "[title] 会话标题已更新：");
+    _ = buf_append(out, g_sess.title.ptr as &const byte, g_sess.title.len);
+    _ = buf_append_cstr(out, "（已钉住：自动起标题不会再改写它；/title clear 可解锁）\n");
+    return true;
 }
 
 // /goal（P29）：滚动模式直接打进转录；TUI 走浮层（见 agent_tui_command）。
@@ -7114,6 +7681,17 @@ fn agent_repl_command(cfg: &Config, h: &History, line: &const Buf) bool {
     // P29：/goal —— 语法与措辞对齐 DSH 的 /goal（见 src/goal.uya 顶部注释）
     if sv_eq_cstr(line, "/goal") || arg_starts_with(line.ptr as &const byte, "/goal ") {
         agent_repl_goal(cfg, line);
+        return false;
+    }
+    // P46：/title —— 滚动模式没有输入框浮层，所以裸 /title 只把模型建议打出来，
+    // **不改标题**（改不改由人接着敲 `/title <新标题>` 决定）
+    if sv_eq_cstr(line, "/title") || arg_starts_with(line.ptr as &const byte, "/title ") {
+        var tout: Buf = buf_new(1024);
+        defer { buf_free(&tout); }
+        var suggest: Buf = buf_new(TTY_TITLE_FALLBACK_BYTES + 16);
+        defer { buf_free(&suggest); }
+        _ = agent_title_cmd(cfg, h, line, &tout, &suggest);
+        tty_write(&tty_ui, 2, tout.ptr as &const byte, tout.len);
         return false;
     }
     if sv_eq_cstr(line, "/continue") {
@@ -7290,6 +7868,28 @@ fn agent_repl_command(cfg: &Config, h: &History, line: &const Buf) bool {
 }
 
 // 阻塞读一行（raw 模式）。返回 TTY_EV_SUBMIT / TTY_EV_EOF / TTY_EV_CTRL_C
+//
+// P46：自动起标题的待办也要在这一层消费 —— 滚动模式下这个 read 会一直阻塞到用户按键，
+// 而「回合收尾挂待办、空闲时发请求」的分工要求有人主动去 poll。它拿不到 cfg/h
+// （那是调用方的局部量），所以走一份进程级登记（与 /watch 的 agent_watch_hold_cfg 同一手法）。
+var g_title_auto_cfg: &const Config = null as &const Config;
+var g_title_auto_hist: &const History = null as &const History;
+
+export fn agent_title_auto_hold(cfg: &const Config, h: &const History) void {
+    g_title_auto_cfg = cfg;
+    g_title_auto_hist = h;
+}
+
+fn agent_title_auto_pending_tick_held() void {
+    if (!g_title_auto_pending) {
+        return;
+    }
+    if g_title_auto_cfg == null as &const Config || g_title_auto_hist == null as &const History {
+        return;
+    }
+    agent_title_auto_pending_tick(g_title_auto_cfg, g_title_auto_hist);
+}
+
 fn tty_read_line_blocking() i32 {
     while true {
         // 顺序很重要：**先取已排队的事件**（事件对应的行内容此刻才在 line 里），
@@ -7316,11 +7916,14 @@ fn tty_read_line_blocking() i32 {
         // P42：跟随子代理时别死等键盘 —— 先带超时 poll 一下 fd 0，超时就推一拍 watch。
         // 不做这一步的话，滚动模式下「看着它跑」的那段时间屏幕是死的（read 会一直阻塞，
         // 泵点和心跳都轮不到）。
-        if g_watch.active {
+        // P46：自动起标题的待办同理 —— 这一轮先 poll 再决定要不要发那个请求，
+        // 否则 read 会一直阻塞到用户按键为止（标题永远起不出来）。
+        if g_watch.active || g_title_auto_pending {
             var pfd: [PollFd: 1] = [PollFd{ fd: 0, events: POLLIN, revents: 0 }];
             const pr: i32 = sys_poll(&pfd[0], 1, 200) catch { 0; };
             if pr <= 0 {
                 _ = agent_watch_tick_if_active();
+                agent_title_auto_pending_tick_held();
                 continue;
             }
         }
@@ -7445,8 +8048,7 @@ fn agent_run_interactive(cfg: &Config) i32 {
         tty_raw_off(&tty_ui, 0);
         sigx_disarm();
         tty_free(&tty_ui);
-        return AGENT_PROTO;
-    }
+        return AGENT_PROTO;    }
     // P22：历史回填完（--continue / --resume 的 session/title 已经进 g_sess.title）再同步一次，
     // 否则起始标题会一直停在基标题上，直到用户打出第一条消息才换过来
     agent_title_apply();
@@ -7455,6 +8057,9 @@ fn agent_run_interactive(cfg: &Config) i32 {
     tasks_init();
     agent_goal_reload(cfg);
     agent_agents_tick_force();
+    // P46：把 cfg/h 登记给 tty_read_line_blocking 那一层（它在阻塞读里要消费
+    // 自动起标题的待办，拿不到这里的局部量）
+    agent_title_auto_hold(cfg, &h);
 
     var line: Buf = buf_new(8192);
     var run: bool = true;
@@ -7916,6 +8521,15 @@ fn agent_print_config(cfg: &const Config, dsh: &const DshCfg) void {
     out_err("  (source: ");
     out_err(cfg_src_name(cfg.title_src));
     out_err(")\n");
+    out_err("title_auto = ");
+    if cfg.title_auto {
+        out_err("on");
+    } else {
+        out_err("off");
+    }
+    out_err("  (source: ");
+    out_err(cfg_src_name(cfg.title_auto_src));
+    out_err(")\n");
     out_err("mouse = ");
     if cfg.mouse {
         out_err("on");
@@ -8143,6 +8757,17 @@ export fn main() i32 {
             cfg.title_src = TITLE_SRC_ENV;
         }
     }
+    // P46：自动起标题（UYA_AGENT_TITLE_AUTO=0/1）—— 与标题/鼠标同一套「0 关、其它当开」
+    const title_auto_env: &byte = getenv("UYA_AGENT_TITLE_AUTO");
+    if (title_auto_env as usize) != 0 && bufx_cstr_len(title_auto_env) > 0 {
+        if bufx_eq_cstr(title_auto_env, bufx_cstr_len(title_auto_env), "0") {
+            cfg.title_auto = false;
+            cfg.title_auto_src = TITLE_SRC_ENV;
+        } else {
+            cfg.title_auto = true;
+            cfg.title_auto_src = TITLE_SRC_ENV;
+        }
+    }
     // 踩坑 72：鼠标上报（UYA_AGENT_MOUSE=0/1）—— 与标题同一套「0 关、其它当开」的口径
     const mouse_env: &byte = getenv("UYA_AGENT_MOUSE");
     if (mouse_env as usize) != 0 && bufx_cstr_len(mouse_env) > 0 {
@@ -8350,6 +8975,12 @@ export fn main() i32 {
         } else if arg_eq(p, "--no-title") {
             cfg.title = false;
             cfg.title_src = TITLE_SRC_CLI;
+        } else if arg_eq(p, "--title-auto") {
+            cfg.title_auto = true;
+            cfg.title_auto_src = TITLE_SRC_CLI;
+        } else if arg_eq(p, "--no-title-auto") {
+            cfg.title_auto = false;
+            cfg.title_auto_src = TITLE_SRC_CLI;
         } else if arg_eq(p, "--mouse") {
             cfg.mouse = true;
             cfg.mouse_src = TITLE_SRC_CLI;
@@ -8718,8 +9349,12 @@ export fn main() i32 {
 // 现在按「标题 / 问题 / 编号选项 / 自定义行」的**显示列宽**算出内容宽度，夹在
 // [TUI_ASK_MIN_W=34, min(78, 终端宽 - 6)] 之间；提示行与自定义占位**不撑框**，框小了就按
 // full → mid → min 降级改文案（绝不吃掉 `esc 取消` 这类关键键）。版本串 `p45-askw`。
-const AGENT_VERSION: [byte: 16] = [112, 52, 53, 45, 97, 115, 107, 119, 0, 0, 0, 0, 0, 0, 0, 0];   // "p45-askw"
-const AGENT_VERSION_LEN: usize = 8;
+// P46（本线）：**会话标题可在执行过程中修改** —— `/title <新标题>` / `/title clear` /
+// 模型自己调 `set_title` / 自动起标题（每个新的人类消息后跑一次侧路请求，把标题换成
+// 模型给的，kind=provider）。标题被显式写过就**钉住**（kind=user），自动起标题不再动它。
+// ⚠ 长度常量必须跟着版本串一起改（P30 那条线在这儿踩过，见上面）：`p46-title` 是 9 字节。
+const AGENT_VERSION: [byte: 16] = [112, 52, 54, 45, 116, 105, 116, 108, 101, 0, 0, 0, 0, 0, 0, 0];   // "p46-title"
+const AGENT_VERSION_LEN: usize = 9;
 fn agent_parse_color(p: &byte) u8 {
     // auto / always / never / 16 / 256
     if bufx_cstr_len(p) == 4 && bufx_eq_cstr(p, 4, "auto") {
@@ -8914,6 +9549,7 @@ export fn agent_tui_commands(out: &Buf) void {
     _ = buf_append_cstr(out, "/model [名字]  看/切模型（按提供方分组；/effort 管推理强度）\n");
     _ = buf_append_cstr(out, "/effort [档位]  看/切推理强度（只列该模型公布的档位）\n");
     _ = buf_append_cstr(out, "/worktree  Git worktree（独立工作区→合并→删除；裸命令开选择框）\n");
+    _ = buf_append_cstr(out, "/title [<新标题>|clear]  看/改会话标题（裸命令让模型起一个建议、填进输入框）\n");
     _ = buf_append_cstr(out, "/new       开一个新会话\n");
     _ = buf_append_cstr(out, "/compact   手动压缩上下文\n");
     _ = buf_append_cstr(out, "/plan      切换计划模式\n");
@@ -9539,6 +10175,15 @@ fn agent_pump_ctx_end(cfg: &const Config) void {
 //   2) 命令派发：运行中在面板里选中 /status 之类**当场生效**（P30）。
 // 返回中止意图给调用方（bash/jobs/deleg/search/workflow 各自决定怎么收场）。
 fn agent_pump_block() i32 {
+    // P46：后台请求（自动起标题）**不读键盘、也不派发命令** —— 用户根本不知道它在飞，
+    // 那几秒里敲的字一个都不该被它取走（连 `/` 被吞掉都不行：剩下的 `status` 会与
+    // 后面那个 `/` 拼成 `//status`，屏幕上就是「未知命令」，p30-check 抓到过）。
+    // 后台请求的泵点只做「别让界面冻住」那一半：刷帧 + watch 跟随。
+    if g_bg_request {
+        _ = tui_tick(tui_now_ms());
+        _ = agent_watch_tick_if_active();
+        return TUI_ABORT_NONE;
+    }
     const ab: i32 = tui_abort_check();
     if g_pump_cfg != null as &const Config && g_pump_hist != null as &const History {
         agent_tui_poll_pending_cmd(g_pump_cfg, g_pump_hist);
@@ -9788,6 +10433,69 @@ fn agent_tui_command(cfg: &Config, h: &History, line: &const Buf) bool {
         }
         return false;
     }
+    // P46：/title —— 带参数的两支（`<新标题>` / `clear`）当场生效；**裸 /title** 先在后台
+    // （同步的侧路请求）让模型起一个建议，再把建议**预填进输入框**让人改 —— AI 只填草稿，
+    // 落不落地由人按的那个回车决定。生成失败/被中断也照常开框（预填当前标题），
+    // 让人自己写：起不出来标题不该把改名这条路一起堵死。
+    if sv_eq_cstr(line, "/title") || arg_starts_with(line.ptr as &const byte, "/title ") {
+        if !sv_eq_cstr(line, "/title") {
+            var tout: Buf = buf_new(1024);
+            defer { buf_free(&tout); }
+            var suggest0: Buf = buf_new(TTY_TITLE_FALLBACK_BYTES + 16);
+            defer { buf_free(&suggest0); }
+            _ = agent_title_cmd(cfg, h, line, &tout, &suggest0);
+            tui_add_notice(tout.ptr as &const byte, tout.len);
+            return false;
+        }
+        var suggest: Buf = buf_new(TTY_TITLE_FALLBACK_BYTES + 16);
+        defer { buf_free(&suggest); }
+        const gen_ok: bool = agent_title_generate(cfg, h, &suggest, true);
+        var prefill: Buf = buf_new(TTY_TITLE_MAX_BYTES + 16);
+        defer { buf_free(&prefill); }
+        if gen_ok {
+            _ = buf_append(&prefill, suggest.ptr as &const byte, suggest.len);
+        } else if g_sess.title.len > 0 {
+            // 起不出来就预填当前标题：框里至少有东西可改，不至于一片空白
+            _ = buf_append(&prefill, g_sess.title.ptr as &const byte, g_sess.title.len);
+        }
+        const ttitle: &const byte = "会话标题（enter 采纳 · esc 取消）" as &const byte;
+        var picked: Buf = buf_new(TTY_TITLE_MAX_BYTES + 16);
+        defer { buf_free(&picked); }
+        const acted: i32 = tui_title_input_wait(
+            ttitle,
+            strlen(ttitle),
+            prefill.ptr as &const byte,
+            prefill.len,
+            &picked
+        );
+        if acted == 0 {
+            // 终端太矮画不出框（或用户 esc 取消）：落到转录里说清楚，别静默
+            if tui_overlay_available() {
+                tui_add_notice("[title] 已取消（标题未改动）" as &const byte,
+                    bufx_cstr_len("[title] 已取消（标题未改动）" as &const byte));
+            } else {
+                var hint: Buf = buf_new(512);
+                defer { buf_free(&hint); }
+                _ = buf_append_cstr(&hint, TITLE_CMD_USAGE);
+                _ = buf_append_cstr(&hint, "\n");
+                tui_add_notice(hint.ptr as &const byte, hint.len);
+            }
+            return false;
+        }
+        const rc: i32 = agent_title_set_user(cfg, picked.ptr as &const byte, picked.len);
+        if rc == TITLE_SET_EMPTY {
+            tui_add_notice("[title] error: 标题是空的（至少留一个可见字符）；标题未改动" as &const byte,
+                bufx_cstr_len("[title] error: 标题是空的（至少留一个可见字符）；标题未改动" as &const byte));
+            return false;
+        }
+        var done: Buf = buf_new(TTY_TITLE_MAX_BYTES + 160);
+        defer { buf_free(&done); }
+        _ = buf_append_cstr(&done, "[title] 会话标题已更新：");
+        _ = buf_append(&done, g_sess.title.ptr as &const byte, g_sess.title.len);
+        _ = buf_append_cstr(&done, "（已钉住；/title clear 可解锁）");
+        tui_add_notice(done.ptr as &const byte, done.len);
+        return false;
+    }
     if sv_eq_cstr(line, "/status") {
         var items: Buf = buf_new(2048);
         defer { buf_free(&items); }
@@ -9832,6 +10540,25 @@ fn agent_tui_command(cfg: &Config, h: &History, line: &const Buf) bool {
         _ = buf_append_cstr(&items, "  (source: ");
         _ = buf_append_cstr(&items, ws_src_name(cfg.ws_src));
         _ = buf_append_cstr(&items, ")\n");
+        // P46：会话标题（裸 /title 让模型起一个建议；这里只报当前值）
+        _ = buf_append_cstr(&items, "\ntitle      ");
+        if g_sess.title.len > 0 {
+            _ = buf_append(&items, g_sess.title.ptr as &const byte, g_sess.title.len);
+            if g_title_pinned {
+                _ = buf_append_cstr(&items, "  (pinned)");
+            } else {
+                _ = buf_append_cstr(&items, "  (auto)");
+            }
+        } else {
+            _ = buf_append_cstr(&items, "(无标题，终端显示基标题)");
+        }
+        _ = buf_append_cstr(&items, "\ntitle_auto ");
+        if cfg.title_auto {
+            _ = buf_append_cstr(&items, "on");
+        } else {
+            _ = buf_append_cstr(&items, "off (--no-title-auto)");
+        }
+        _ = buf_append_byte(&items, 10);
         _ = buf_append_cstr(&items, "\npermission ");
         _ = buf_append_cstr(&items, perm_name(perm_get()));
         _ = buf_append_cstr(&items, " (");
@@ -10133,6 +10860,9 @@ fn agent_run_tui_body(cfg: &Config, tui_fd: i32) i32 {
         if tui_run_kind() != TUI_RUN_IDLE {
             wait_ms = 80;
         }
+        // P46：自动起标题的待办**不在这里**早退式消费 —— 那会把这一圈的按键/浮层处理
+        // 整段跳过去（实测：起标题的圈里敲进来的 /status 被当成「未知命令」）。
+        // 它排在循环体最后（所有输入处理之后），闸门见 agent_title_auto_idle_ok。
         if !tui_has_submit() && !g_tui_quit_flag_pending() {
             _ = tui_poll_keys(wait_ms);
             _ = tui_tick(tui_now_ms());
@@ -10214,6 +10944,13 @@ fn agent_run_tui_body(cfg: &Config, tui_fd: i32) i32 {
         // 4) 等提交
         if !steer_got {
             if !tui_take_submit(&line) {
+                // P46：这是**真空闲**的那一支（没有提交、浮层结果已在第 2 步消费掉、
+                // steer 也在第 3 步领取过）—— 只有走到这里才发自动起标题的侧路请求。
+                // 放在这一支而不是循环开头：早发会把这一圈的浮层/按键处理整段跳过去
+                // （实测：起标题的圈里，上一圈留下的 /compact 结果与用户正敲的 /status
+                //  搅成了 `//status` → 「未知命令」，p30-check 的 status-during-compact 抓到）。
+                agent_title_auto_pending_tick(cfg, &h);
+                tui_render();
                 if tui_quit_wanted() {
                     run = false;
                 }
@@ -10267,7 +11004,6 @@ fn agent_run_tui_body(cfg: &Config, tui_fd: i32) i32 {
         // 走一圈（poll + tick）才能把最后一屏画出来；提前跳出会让屏幕停在「思考中」的
         // 旧帧上（自测里表现为「转录里什么都没有」，README 踩坑 44）。
     }
-
     if cfg.tui_headless {
         tty_sink_on = false;
         tui_headless_enable(false);
