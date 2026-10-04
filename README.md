@@ -532,6 +532,8 @@ src/selftest.uya   mock LLM + 130 轮断言 + --probe
 * 建：`git worktree add -b dsh/<slug> <repo>/.git/dsh-worktrees/<slug> <base>`（幂等）；不是 git 仓库 ⇒ `phase=skipped`。
 * 写闸门：write/edit 或 bash 的 git 变更子命令落在共享 checkout 被拒，只读放行。
 * `finish` = `add -A` + commit → base → `merge --no-ff` → `worktree remove --force` + `branch -D`；落 `session/worktree`。
+* `finish` 的 `message` 走**工具参数**（JSON）时，`msg` 是 `Buf`、没有 NUL，而 `wt_finish` 按 C 串读它 ——
+  两边都必须补 NUL，否则 merge 的提交说明会黏上堆里的旧字节（踩坑 80，回归轮 `worktree-tool-msg`）。
 * **残留回收（P49）**：worktree 只在**显式** finish / discard 时才删，会话直接退出（`/exit`、`ctrl+d`、
   管道 EOF、信号）不会替你 finish —— 这是对的（没验完的活不该自动合并），但目录与分支会留下
   （真机实测：一个月攒下 17 个残留 / 129 MiB，另有 25 个没人认领的 `dsh/*` 分支）。所以：
@@ -726,6 +728,27 @@ src/selftest.uya   mock LLM + 130 轮断言 + --probe
    「锦上添花的后台任务」在单线程 harness 里就是「一段会占住主循环的时间」，
    要么它让路给用户，要么它就不许启动 —— 没有第三条路。
 
+80. **`worktree` 工具的 `finish` 会把提交说明写成「传入的 message + 堆尾巴」**（P48 收尾时发现，**存量缺陷**）：
+   本线做完 P48 调 `worktree finish` 合并回主干时，那条 **merge commit 的说明被污染**了 ——
+   我传的是 `P48：会话标题可在执行过程中修改（…）`，落盘却是
+   `…（…）:"function","funct1"type":"function","function":{"name":"get_goal",…`，
+   后面黏的正是 `.rodata` 里**工具 schema** 的一段。根因是**同一个 `Buf` 的两种口径混用**：
+   `wt_finish(msg)` 把 `msg` 当 C 串（`bufx_cstr_len` / `buf_append_cstr`），而工具那条路
+   的 `msg` 来自 `js_obj_get_str_unescaped` → `sv_unescape_to_buf` → `sv_unescape`，
+   **只写内容、从不补 NUL**（`jsonx.uya` 里那个函数没有一处 `append_byte(…, 0)`）⇒
+   `bufx_cstr_len` 一直读到堆里的第一个 0 为止，读到多少字节完全看堆布局。
+   **为什么一直没红**：`worktree` 轮的既有断言是 `wt_finish("p37 merge" as &const byte, …)`
+   —— 自测直接传**字面量**，字面量天然带 NUL，正好绕过这条契约；而真机走工具入口，
+   message 是 JSON 解出来的，必踩。修法两处**都要**（各自单独回退都会让新轮当场红）：
+   ① `src/worktreex.uya` 的 `wt_finish` 在自己拼完 `cmsg` 后补一个 NUL（**契约在本函数收口**，
+   连带 `wt_do_commit` / `wt_merge_into_base` 两个下游消费者一起安全，默认说明那条分支同样受益）；
+   ② `src/agent.uya` 的 `worktree` 工具在把 `msg` 交给 `wt_finish` 前也补 NUL（调用方不赖账）。
+   回归：新增 `worktree-tool-msg` 轮 —— 走**真工具入口**（`wt_tool_worktree` + JSON
+   arguments，message 由 JSON 解出来）跑一次 finish，再用 `git log -1 --pretty=%s` 把
+   提交说明读回来**逐字节**比对；读越界会多出后面的字节，断言当场红。
+   与踩坑 57/67 同族（「`buf_new` 造的东西必须补 NUL 才能当 C 串用」），
+   但这次踩在**函数间的口径契约**上，而不是自测夹具里。
+
 
 ---
 
@@ -851,6 +874,7 @@ DEEPSEEK_API_KEY=sk-xxx ./build/uya-agent \
 | `model-log` | `session/model` 三字段取最后一条 |
 | `worktree` | 真 git：建 worktree + `dsh/<slug>`、闸门、`wt_finish` 合并且目录消失 |
 | `worktree-discard` | `wt_discard` 不合并；非仓库 `wt_provision` 判 `SKIPPED` |
+| `worktree-tool-msg` | 踩坑 80：走**真工具入口**带 `message` 的 finish —— `git log -1 --pretty=%s` 读回来的提交说明**逐字节**等于传入的 marker（`wt_finish` 把 `msg` 当 C 串，JSON 解出来的 Buf 没有 NUL 时会读到堆尾巴） |
 | `worktree-reclaim` | P49 残留回收的四条判据（真 git，逐条对照）：**干净 + 零提交**的清了（目录与分支都没了）；**有未提交改动**的留、**有未合并提交**的留、**有活进程 cwd 在里面**的留（真 `fork`+`chdir`+`exec sleep` 当占用者，杀掉之后同一份扫描又能清掉它 —— 证明判据 ③ 真在判「活着」而不是碰巧被别的原因挡着）；`wt_reclaim_own` 清掉自己的空 worktree 后 `phase=DISCARDED` |
 | `tui-model` | `/model` 与 `/effort` 浮层：分组标题、`✓` 只在当前行、只列公布档位 |
 | `ws-tool` | workspace 工具：失败状态不变、日志/索引写入、`/diff` 头短路径 |
@@ -1026,8 +1050,13 @@ DEEPSEEK_API_KEY=sk-xxx ./build/uya-agent \
   敲的字被半路取走，`/status` 被拼成 `//status` → 「未知命令」（p30-check 的 status-during-compact
   当场红，304 号判据）；② 命令面板的结果被推迟到 step 边界派发时，触发用的那个 `/` 留在输入行里，
   用户接着敲的下一条命令同样被顶成 `//`（同一个现场暴露的**存量**缺陷，修法是把 `/` 的收走
-  从「派发时」提前到「accept 时」）。修法见 §3 踩坑 73；`p30-check` / `p30-check` 的
+  从「派发时」提前到「accept 时」）。修法见 §3 踩坑 79；`p30-check` 的
   status-during-compact 是本轮最有价值的一条判据。
+  收尾时又逮到一条**存量缺陷**（见踩坑 80）：`worktree` 工具带 `message` 的 `finish` 把
+  merge commit 的说明写成了「传入的 message + 堆尾巴」（`msg` 是 JSON 解出来的 `Buf`、
+  没有 NUL，而 `wt_finish` 按 C 串读它）—— 这次是在**我自己调 `worktree finish` 合并回主干**
+  时被落盘的提交说明直接照出来的，随后补了 `worktree-tool-msg` 轮（真工具入口 + 逐字节比对），
+  两个修法各自单独回退都会让新轮红。
 - P47：**TUI 的 markdown 渲染 + 修「长行静默丢字」**（`tui-md` 轮六段，见上表）。这是本轮
   唯一一处「先量出缺陷再动手」的：动手前先用临时探针（不进仓库）在当前 main 上量到三件事 ——
   * **长行静默丢字符**（根因：折行按 `cols-6`、绘制按 `cols-7`，列表/代码行绘制时再扣 2 列）：
@@ -1088,7 +1117,7 @@ DEEPSEEK_API_KEY=sk-xxx ./build/uya-agent \
 
 - 踩坑 72（TUI 里能复制文本）：真机（deepin-terminal / qtermwidget，即用户环境）A/B —— 同一块屏幕、同一条拖拽轨迹（`xdotool` 驱动），鼠标上报**开着**时拖选之后 `PRIMARY` 仍是旧值（= 没选中）、TUI 正文一个字符都拿不到；手动发 `?1000l?1006l` 关掉后拖同一段立刻拿到屏幕文本；再发 `?1000h?1006h` 又选不动。屏幕重画不会清掉已选区（选中后等 3 s 仍在），所以与渲染/重绘无关。修法见踩坑 72；`make e2e-mouse` 钉配置来源链（默认 env/cli + CLI 优先 + 滚动模式 `/mouse` 说明），`tui-mouse` 轮钉开关语义、F2 两种编码、字节级四个方向与真 PTY 两个方向。防假绿对照实验四条（`tui_term_enter` 忽略开关 / 删 F2 映射 / `tui_set_mouse` 去掉运行中写序列 / 启动处恒 `true`）都当场红。
 
-> 分阶段验收记录的详细现场（P1–P48 的 before/after 命令与截图、真机对照实验、被自测当场抓住的自身缺陷）已在此压缩，原始描述保留在 §3 踩坑 33–79 与各版本提交说明中。
+> 分阶段验收记录的详细现场（P1–P48 的 before/after 命令与截图、真机对照实验、被自测当场抓住的自身缺陷）已在此压缩，原始描述保留在 §3 踩坑 33–80 与各版本提交说明中。
 
 ---
 
