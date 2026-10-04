@@ -32,7 +32,7 @@ TASK ?= 创建 hello.uya，编译并运行它
 export UYA_ROOT
 export UYA_SPLIT_C_DIR := $(CURDIR)/build/uyacache
 
-.PHONY: all check build selftest codegen-audit probe e2e e2e-config e2e-config-flags e2e-title e2e-mouse e2e-api e2e-steps e2e-permission e2e-sandbox e2e-tasks e2e-goal e2e-sessions e2e-resume-big e2e-diff e2e-ws e2e-model e2e-worktree e2e-watch e2e-watch-pick e2e-dsh p30-check tui-demo tui-selftest sess-selftest diff-selftest model-selftest panel-selftest clean shell-selftest
+.PHONY: all check build selftest codegen-audit probe e2e e2e-config e2e-config-flags e2e-title e2e-title-cmd e2e-title-auto e2e-mouse e2e-api e2e-steps e2e-permission e2e-sandbox e2e-tasks e2e-goal e2e-sessions e2e-resume-big e2e-diff e2e-ws e2e-model e2e-worktree e2e-watch e2e-watch-pick e2e-dsh p30-check tui-demo tui-selftest sess-selftest diff-selftest model-selftest panel-selftest clean shell-selftest
 
 all: build
 
@@ -57,7 +57,7 @@ codegen-audit: build
 	fi; \
 	echo "codegen-audit: 通过（没有切片描述符强转）"
 
-selftest: build codegen-audit e2e-config-flags e2e-title e2e-mouse e2e-api e2e-steps e2e-permission e2e-sandbox e2e-tasks e2e-goal e2e-sessions e2e-resume-big e2e-diff e2e-ws e2e-model e2e-worktree p30-check
+selftest: build codegen-audit e2e-config-flags e2e-title e2e-title-cmd e2e-title-auto e2e-mouse e2e-api e2e-steps e2e-permission e2e-sandbox e2e-tasks e2e-goal e2e-sessions e2e-resume-big e2e-diff e2e-ws e2e-model e2e-worktree p30-check
 	UYA_BIN=$(UYA) $(OUT) --selftest
 
 probe: build
@@ -363,6 +363,85 @@ e2e-title:
 	echo "$$out" | grep -q "title = on  (source: cli)" \
 		|| { echo "FAIL: --title 应当压过 UYA_AGENT_TITLE=0"; exit 1; }; \
 	echo "e2e-title: 通过（默认开；--no-title / UYA_AGENT_TITLE 同口径；CLI 优先）"
+
+# P46：会话标题可在执行过程中修改（离线，行式 REPL 走真二进制）
+#
+# 两件事：
+#   ① 命令语义与措辞：/title 的用法串、改名回执、/status 里的 title 行与开关、/title clear、
+#      清洗后为空要报错且**标题不动**、/help 里查得到；
+#   ② 落盘：日志里一条 kind=user 的 session/title、index.jsonl 的 title 就是新值。
+e2e-title-cmd: build
+	@set -e; \
+	home=build/selftest_title_cmd_e2e; rm -rf $$home; mkdir -p $$home; \
+	run="$(CURDIR)/$(OUT) --no-dsh-config --no-tui --quiet --api-key dummy-key --agent-home $$home"; \
+	out=$$(printf '/title\n/title 把中文文件名修好\n/status\n/title clear\n/status\n/title \033[31m\007\n/status\n/help\n/exit\n' | $$run 2>&1); \
+	echo "$$out" | grep -qF "用法：/title <新标题> · /title clear（清回基标题）· 裸 /title 让模型起一个建议" \
+		|| { echo "FAIL: 裸 /title 没有给出用法"; echo "$$out"; exit 1; }; \
+	echo "$$out" | grep -qF "[title] 会话标题已更新：把中文文件名修好" \
+		|| { echo "FAIL: /title <新标题> 没有生效（措辞也不对）"; echo "$$out"; exit 1; }; \
+	echo "$$out" | grep -qF "title=把中文文件名修好 (pinned" \
+		|| { echo "FAIL: /status 里没有新的会话标题（或没标 pinned）"; echo "$$out"; exit 1; }; \
+	echo "$$out" | grep -qF "[title] 已清回基标题" \
+		|| { echo "FAIL: /title clear 没有生效"; exit 1; }; \
+	echo "$$out" | grep -qF "title=(无标题，终端显示基标题)" \
+		|| { echo "FAIL: clear 之后 /status 还挂着标题"; exit 1; }; \
+	echo "$$out" | grep -qF "这个标题清洗后是空的" \
+		|| { echo "FAIL: 清洗后为空的标题没有报错（静默成功最坏）"; exit 1; }; \
+	echo "$$out" | grep -qF "title_auto=on" \
+		|| { echo "FAIL: /status 里没有自动起标题的开关"; exit 1; }; \
+	echo "$$out" | grep -qF "/title [<新标题>|clear]" \
+		|| { echo "FAIL: /help 里没有 /title"; exit 1; }; \
+	grep -qF '"title":"把中文文件名修好"' $$home/index.jsonl \
+		|| { echo "FAIL: 索引里的标题不是新值（/sessions 的标题列会空着）"; exit 1; }; \
+	grep -qF '"source":{"kind":"user"}' $$home/sessions/*/*/session.jsonl \
+		|| { echo "FAIL: 显式改名落的 kind 不是 user"; exit 1; }; \
+	: "clear 之后索引里的标题要被清空（否则 /sessions 还显示旧标题）"; \
+	tail -1 $$home/index.jsonl | grep -qF '"title":""' \
+		|| { echo "FAIL: clear 之后索引里的标题没清空"; exit 1; }; \
+	echo "e2e-title-cmd: 通过（用法/改名回执/status 行/clear/空标题报错/命令表/索引与日志落盘）"
+
+# P46：自动起标题真的发了一次请求、落了 provider 事件（离线；真 PTY + 假网关）
+#
+# 为什么必须真 PTY：自动起标题**只服务交互界面**（管道/CI 上 tty_title_set 本来就是空操作，
+# 为一个看不见的东西多发请求没有道理）—— 所以行式 REPL 那一路它根本不会跑，
+# 这一条只能拿真终端验。驱动脚本内联在这里（不新增 testdata 脚本）：pty.fork 起真二进制，
+# 打一条任务，等「回合 + 静默期 + 起标题请求」都收场，再 ctrl+d 退出。
+# 判据：日志里出现 kind=provider 的 session/title，且假网关收到了 ≥2 次请求；
+#       --no-title-auto 时两样都没有。
+e2e-title-auto: build
+	@set -e; \
+	ws=build/selftest_title_auto_e2e; rm -rf $$ws; mkdir -p $$ws/home $$ws/home2; \
+	python3 testdata/mock_gateway_sse.py 0 1 200 > $$ws/gw.log 2>$$ws/gw.err & \
+	gw=$$!; \
+	trap "kill $$gw 2>/dev/null || true" EXIT; \
+	sleep 1.2; \
+	port=$$(awk '/^PORT/{print $$2}' $$ws/gw.log); \
+	[ -n "$$port" ] || { echo "FAIL: 假网关没打印端口"; cat $$ws/gw.log; exit 1; }; \
+	UYA_BIN="$(CURDIR)/$(OUT)" PORT="$$port" HOME_A="$$ws/home" HOME_B="$$ws/home2" \
+		python3 testdata/pty_drive_title.py; \
+	: "① 默认（--title-auto）：起标题多发一次请求，并落 provider 事件"; \
+	n=$$(grep -c "REQ #" $$ws/gw.err || true); \
+	[ "$$n" -ge 2 ] || { echo "FAIL: 自动起标题没有多发请求（只看到 $$n 次）"; exit 1; }; \
+	grep -qF '"source":{"kind":"provider"}' $$ws/home/sessions/*/*/session.jsonl \
+		|| { echo "FAIL: 日志里没有 kind=provider 的 session/title"; exit 1; }; \
+	: "② --no-title-auto：只有主请求，且没有 provider 事件"; \
+	if grep -qF '"source":{"kind":"provider"}' $$ws/home2/sessions/*/*/session.jsonl 2>/dev/null; then \
+		echo "FAIL: --no-title-auto 下仍然落了 provider 事件"; exit 1; \
+	fi; \
+	: "③ 三来源都看得出来，CLI 压过 env"; \
+	out=$$($(OUT) --no-dsh-config --print-config 2>&1); \
+	echo "$$out" | grep -q "title_auto = on  (source: default)" \
+		|| { echo "FAIL: 自动起标题默认应当是开"; exit 1; }; \
+	out=$$($(OUT) --no-dsh-config --no-title-auto --print-config 2>&1); \
+	echo "$$out" | grep -q "title_auto = off  (source: cli)" \
+		|| { echo "FAIL: --no-title-auto 没有生效"; exit 1; }; \
+	out=$$(UYA_AGENT_TITLE_AUTO=0 $(OUT) --no-dsh-config --print-config 2>&1); \
+	echo "$$out" | grep -q "title_auto = off  (source: env)" \
+		|| { echo "FAIL: UYA_AGENT_TITLE_AUTO 没有生效"; exit 1; }; \
+	out=$$(UYA_AGENT_TITLE_AUTO=0 $(OUT) --no-dsh-config --title-auto --print-config 2>&1); \
+	echo "$$out" | grep -q "title_auto = on  (source: cli)" \
+		|| { echo "FAIL: --title-auto 应当压过 UYA_AGENT_TITLE_AUTO=0"; exit 1; }; \
+	echo "e2e-title-auto: 通过（自动起标题发请求+落 provider 事件；--no-title-auto 两样都没有；三来源与 CLI 优先）"
 
 # 踩坑 72：鼠标上报开关回归（离线，不联网）。默认开（滚轮要靠它）；--no-mouse / UYA_AGENT_MOUSE=0
 # 都要在 --print-config 的来源列上看得出来（来源码与 cfg_src_name 同口径），而且 CLI 压过 env。
