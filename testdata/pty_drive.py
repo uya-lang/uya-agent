@@ -269,7 +269,7 @@ def suite():
     check(v8.get("palette_menu_seen"), "命令面板里选中 /worktree 没有开出动作选择框", failures)
     check(v8.get("palette_menu_items"), "命令面板那条路上开出来的框里没有动作行", failures)
     check(v8.get("menu_seen"), "裸 /worktree 没有开出动作选择框", failures)
-    check(v8.get("items_seen"), "/worktree 选择框里没有列全七个动作", failures)
+    check(v8.get("items_seen"), "/worktree 选择框里没有列全八个动作（P49 起含 reclaim）", failures)
     check(v8.get("gloss_seen"), "/worktree 选择框的动作行没有一行说明", failures)
     check(v8.get("marked_off"), "/worktree 选择框的 ✓ 没有挂在 off 那一行", failures)
     check(v8.get("confirm_seen"), "选 finish 没有翻出确认框", failures)
@@ -288,7 +288,7 @@ def suite():
              v5.get("overlay_latency_ms"), v6.get("overlay_latency_ms"),
              v7.get("overlay_latency_ms")))
     print("P41 PASS（/worktree 动作选择框：面板选中 %s ms · 裸命令 %s ms · 确认框 %s ms；"
-          "七个动作与 ✓ 都在，确认框默认游标是取消）"
+          "八个动作与 ✓ 都在，确认框默认游标是取消）"
           % (v8.get("palette_ms"), v8.get("menu_ms"), v8.get("confirm_ms")))
     return 0
 
@@ -414,7 +414,7 @@ def _drive(port, workspace, scenario, extra=None):
             txt = screen.text()
             # 每一项要么带 ✓（当前模式那两行之一），要么是两空格开头的普通行 —— 名字都得在
             verdict["items_seen"] = all((("✓ " + w) in txt) or (("  " + w) in txt) for w in
-                                        ("on", "off", "start", "status", "finish", "discard", "list"))
+                                        ("on", "off", "start", "status", "finish", "discard", "list", "reclaim"))
             verdict["gloss_seen"] = "合并回基分支" in txt
             verdict["marked_off"] = "✓ off" in txt
             if os.environ.get("PTY_DUMP"):
