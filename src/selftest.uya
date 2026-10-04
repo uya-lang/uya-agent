@@ -11,6 +11,7 @@
 use libc.syscall;
 use libc.unistd;
 use libc.heap;
+use std.runtime.saved_envp;
 use std.json.encoder.JsonWriter;
 
 var mock_expect_shell: bool = true;
@@ -15990,6 +15991,554 @@ fn worktree_discard_round(tag: &const byte) bool {
     return ok;
 }
 
+// ============================================================
+// P49：残留 worktree 的回收（真 git）
+//
+// 这一轮盯的是**判据**：什么该清、什么一个字节都不许动。四组场景：
+//   A) 干净 + 零提交 → 清掉（目录与分支都没了）；
+//   B) 有未提交改动 → **留**（git 的 remove 不带 --force 也会拒，判据只是提前一步）；
+//   C) 有提交（未合并）→ **留**（否则就是「悄悄扔掉别人没合的工作」）；
+//   D) 干净 + 零提交，但有活进程 cwd 在里面 → **留**（并发会话正在用）。
+// 外加：`wt_reclaim_own` 对自己的 worktree 走同一条判据，清掉之后 phase 翻成 DISCARDED。
+// D 用**真子进程**（sh -c 'cd <dir>; sleep'）当「活着的占用者」—— fork 出来的子进程
+// 在 /proc 里的 cwd 是那个目录，正是这条判据要抓的东西。
+// ============================================================
+
+// 造一个「会话残留」：在 repo 里建一个 worktree + 分支（不通过 wt_provision，
+// 免得动全局状态），返回它的路径（无 NUL）
+// 造一个「会话残留」：在 repo 里建一个 worktree + 分支（不通过 wt_provision，
+// 免得动全局状态），返回它的路径（无 NUL）。
+//
+// 分支名 = "dsh/" + slug + "-" + 序号（进程内递增）。为什么要那个序号：这个 fixture 是
+// **同一个进程里所有 worktree 轮共用**的仓库，上一轮留下的 dsh/* 分支会让这一轮的
+// `worktree add -b <同名>` 直接失败（实测：完整 selftest 时 worktree-reclaim 轮红在
+// 「F 准备失败：它还被 worktree 占着」，单独跑却是绿的）。带序号之后名字永不复用，
+// 于是「这一轮建的一定是新的」。返回的名字（不带 dsh/ 前缀）写进 out_slug，供断言用。
+var g_wt_residue_seq: i32 = 0;
+
+fn wt_residue_slug(slug: &const byte, out_slug: &Buf) void {
+    g_wt_residue_seq = g_wt_residue_seq + 1;
+    buf_reset(out_slug);
+    _ = buf_append_cstr(out_slug, slug);
+    _ = buf_append_cstr(out_slug, "-");
+    _ = buf_append_i64(out_slug, g_wt_residue_seq as i64);
+}
+
+// 造一个残留：分支名由调用方给全（断言要按名字查「还在不在」）。
+// 名字一律走 wt_residue_slug（带进程内序号），永不复用。
+fn wt_residue_make_named(repo: &const Buf, slug: &const byte, out_path: &Buf, errout: &Buf) bool {
+    var rz: Buf = buf_new(1024);
+    defer { buf_free(&rz); }
+    _ = buf_append(&rz, repo.ptr as &const byte, repo.len);
+    _ = buf_append_byte(&rz, 0);
+    var br: Buf = buf_new(64);
+    defer { buf_free(&br); }
+    _ = buf_append_cstr(&br, "dsh/");
+    _ = buf_append_cstr(&br, slug);
+    var brz: Buf = buf_new(br.len + 1);
+    defer { buf_free(&brz); }
+    _ = buf_append(&brz, br.ptr as &const byte, br.len);
+    _ = buf_append_byte(&brz, 0);
+    buf_reset(out_path);
+    _ = buf_append(out_path, repo.ptr as &const byte, repo.len);
+    _ = buf_append_cstr(out_path, "/.git/dsh-worktrees/");
+    _ = buf_append_cstr(out_path, slug);
+    var pz: Buf = buf_new(out_path.len + 1);
+    defer { buf_free(&pz); }
+    _ = buf_append(&pz, out_path.ptr as &const byte, out_path.len);
+    _ = buf_append_byte(&pz, 0);
+    var av: [&const byte: 12] = [null as &const byte: 12];
+    av[0] = "git" as &const byte;
+    av[1] = "-C" as &const byte;
+    av[2] = rz.ptr as &const byte;
+    av[3] = "worktree" as &const byte;
+    av[4] = "add" as &const byte;
+    av[5] = "-b" as &const byte;
+    av[6] = brz.ptr as &const byte;
+    av[7] = pz.ptr as &const byte;
+    av[8] = "master" as &const byte;
+    av[9] = null as &const byte;
+    return wt_test_git(&av[0], errout) == 0;
+}
+
+// 这个路径还存在吗？
+fn wt_path_gone(path: &const Buf) bool {
+    var pz: Buf = buf_new(path.len + 1);
+    defer { buf_free(&pz); }
+    _ = buf_append(&pz, path.ptr as &const byte, path.len);
+    _ = buf_append_byte(&pz, 0);
+    var st: FsStat = FsStat{ exists: false, is_dir: false, size: 0, mtime: 0, mtime_nsec: 0 };
+    _ = fs_stat(pz.ptr as &const byte, &st);
+    return !st.exists;
+}
+
+// 这个分支还在吗？
+fn wt_branch_gone(repo: &const Buf, br: &const byte) bool {
+    var rz: Buf = buf_new(repo.len + 1);
+    defer { buf_free(&rz); }
+    _ = buf_append(&rz, repo.ptr as &const byte, repo.len);
+    _ = buf_append_byte(&rz, 0);
+    var bz: Buf = buf_new(64);
+    defer { buf_free(&bz); }
+    _ = buf_append_cstr(&bz, "refs/heads/dsh/");
+    _ = buf_append_cstr(&bz, br);
+    _ = buf_append_byte(&bz, 0);
+    var av: [&const byte: 8] = [null as &const byte: 8];
+    av[0] = "git" as &const byte;
+    av[1] = "-C" as &const byte;
+    av[2] = rz.ptr as &const byte;
+    av[3] = "show-ref" as &const byte;
+    av[4] = "--verify" as &const byte;
+    av[5] = "--quiet" as &const byte;
+    av[6] = bz.ptr as &const byte;
+    av[7] = null as &const byte;
+    var o: Buf = buf_new(256);
+    defer { buf_free(&o); }
+    return wt_test_git(&av[0], &o) != 0;   // 非零 = 找不到这个 ref
+}
+
+fn worktree_reclaim_round(tag: &const byte) bool {
+    var ok: bool = true;
+    if !gitx_available() {
+        out_err("selftest[");
+        out_err(tag);
+        out_err("] skip（本机 PATH 里没有 git）\n");
+        return ok;
+    }
+    var errout: Buf = buf_new(4096);
+    defer { buf_free(&errout); }
+    var wsz: Buf = buf_new(128);
+    defer { buf_free(&wsz); }
+    wt_ws_pid(&wsz);
+    if !wt_fixture_make(&wsz, &errout) {
+        ty_fail(tag, "造 fixture 仓失败", &ok);
+        return ok;
+    }
+    var repo: Buf = buf_new(1200);
+    defer { buf_free(&repo); }
+    var rout: Buf = buf_new(4096);
+    defer { buf_free(&rout); }
+    // wsz 是**没有尾 NUL** 的（wt_ws_pid 只写内容），而它要当 git 的 `-C` 参数用 ——
+    // 直接传 wsz.ptr 会把堆里后面的脏字节一起读进去（踩坑 57 的形状）。实测在完整
+    // selftest 里就炸了：报 `fatal: cannot change to '/tmp/selftest_p37_wt_2300741111-
+    // 111111111111ce":"/selftest/meta-big/TRUNCuild/...'`（后面黏的正是前面轮次留在堆里
+    // 的字节）。所以这里备一份带 NUL 的 wszz，凡是把它当 argv 的地方都用它。
+    var wszz: Buf = buf_new(wsz.len + 1);
+    defer { buf_free(&wszz); }
+    _ = buf_append(&wszz, wsz.ptr as &const byte, wsz.len);
+    _ = buf_append_byte(&wszz, 0);
+    if wt_repo_of(wsz.ptr as &const byte, wsz.len, &repo) != 0 {
+        ty_fail(tag, "wt_repo_of 拿不到仓库根", &ok);
+        return ok;
+    }
+    // fixture 是**同一个进程里所有 worktree 轮共用**的仓库（按 pid 独占，但 worktree /
+    // worktree-discard / worktree-tool-msg / 这一轮都用它），前面那几轮会在里面留下
+    // 自己建过又删掉的注册与分支。这一轮先把 dsh/* 扫一遍再从确定状态开始：
+    //   * 上一轮留下的**零提交**残留会被清掉（清法就用被测的这条 reclaim，顺手也算一次
+    //     「连扫两遍不炸、第二遍没事可做」的旁证）；
+    //   * 有提交的（`dsh/commit*` 之类）清不掉，但这一轮的分支名一律带进程内序号
+    //     （wt_residue_slug），所以不会再撞名 —— 见下面那段注释记的实测。
+    var pre: Buf = buf_new(4096);
+    defer { buf_free(&pre); }
+    _ = wt_reclaim_scan(repo.ptr as &const byte, &pre);
+    _ = wt_reclaim_scan(repo.ptr as &const byte, &pre);
+    // 四条判据的扫描入口：先建出 A/B/C 三个残留，一次 reclaim 之后逐个验
+    var pa: Buf = buf_new(1200);
+    defer { buf_free(&pa); }
+    var pb: Buf = buf_new(1200);
+    defer { buf_free(&pb); }
+    var pc: Buf = buf_new(1200);
+    defer { buf_free(&pc); }
+    var pa_slug: Buf = buf_new(64);
+    defer { buf_free(&pa_slug); }
+    wt_residue_slug("clean0" as &const byte, &pa_slug);
+    if !wt_residue_make_named(&wsz, pa_slug.ptr as &const byte, &pa, &errout) {
+        ty_fail(tag, "造 A（干净零提交）失败", &ok);
+        return ok;
+    }
+    var pb_slug: Buf = buf_new(64);
+    defer { buf_free(&pb_slug); }
+    wt_residue_slug("dirty1" as &const byte, &pb_slug);
+    if !wt_residue_make_named(&wsz, pb_slug.ptr as &const byte, &pb, &errout) {
+        ty_fail(tag, "造 B（有改动）失败", &ok);
+        return ok;
+    }
+    var pc_slug: Buf = buf_new(64);
+    defer { buf_free(&pc_slug); }
+    wt_residue_slug("commit1" as &const byte, &pc_slug);
+    if !wt_residue_make_named(&wsz, pc_slug.ptr as &const byte, &pc, &errout) {
+        ty_fail(tag, "造 C（有提交）失败", &ok);
+        return ok;
+    }
+    // B：写一个未提交文件；C：写一个文件并提交
+    var bf: Buf = buf_new(1400);
+    defer { buf_free(&bf); }
+    _ = buf_append(&bf, pb.ptr as &const byte, pb.len);
+    _ = buf_append_cstr_z(&bf, "/dirty.txt");
+    if !write_text_file(bf.ptr as &const byte, "half done\n" as &const byte) {
+        ty_fail(tag, "往 B 里写文件失败", &ok);
+    }
+    var cf: Buf = buf_new(1400);
+    defer { buf_free(&cf); }
+    _ = buf_append(&cf, pc.ptr as &const byte, pc.len);
+    _ = buf_append_cstr_z(&cf, "/done.txt");
+    if !write_text_file(cf.ptr as &const byte, "committed\n" as &const byte) {
+        ty_fail(tag, "往 C 里写文件失败", &ok);
+    }
+    // C：在它的目录里 add -A 再 commit（-C 要 **worktree 目录**，不是那个文件 ——
+    // 写成 cf 的话 git 会去那个文件里找仓库，报「不是 git 仓库」，判据 3 就测不出来）
+    var pcz: Buf = buf_new(pc.len + 1);
+    defer { buf_free(&pcz); }
+    _ = buf_append(&pcz, pc.ptr as &const byte, pc.len);
+    _ = buf_append_byte(&pcz, 0);
+    var cav: [&const byte: 12] = [null as &const byte: 12];
+    cav[0] = "git" as &const byte;
+    cav[1] = "-C" as &const byte;
+    cav[2] = pcz.ptr as &const byte;
+    cav[3] = "-c" as &const byte;
+    cav[4] = "user.email=t@t" as &const byte;
+    cav[5] = "-c" as &const byte;
+    cav[6] = "user.name=t" as &const byte;
+    cav[7] = "add" as &const byte;
+    cav[8] = "-A" as &const byte;
+    cav[9] = null as &const byte;
+    _ = wt_test_git(&cav[0], &errout);
+    var cav2: [&const byte: 12] = [null as &const byte: 12];
+    cav2[0] = "git" as &const byte;
+    cav2[1] = "-C" as &const byte;
+    cav2[2] = pcz.ptr as &const byte;
+    cav2[3] = "-c" as &const byte;
+    cav2[4] = "user.email=t@t" as &const byte;
+    cav2[5] = "-c" as &const byte;
+    cav2[6] = "user.name=t" as &const byte;
+    cav2[7] = "commit" as &const byte;
+    cav2[8] = "-q" as &const byte;
+    cav2[9] = "-m" as &const byte;
+    cav2[10] = "wip" as &const byte;
+    cav2[11] = null as &const byte;
+    if wt_test_git(&cav2[0], &errout) != 0 {
+        ty_fail(tag, "给 C 提交失败（这一轮的判据 3 就测不出来了）", &ok);
+        out_err("  git=");
+        out_err_bytes(errout.ptr as &const byte, errout.len);
+        out_err("\n");
+    }
+    const n: i32 = wt_reclaim_scan(repo.ptr as &const byte, &rout);
+    if n != 1 {
+        ty_fail(tag, "应当只清掉 1 个（A），实际清了别的数", &ok);
+        out_err("  报告=");
+        out_err_bytes(rout.ptr as &const byte, rout.len);
+        out_err("\n");
+    }
+    // A：目录与分支都得没了
+    if !wt_path_gone(&pa) {
+        ty_fail(tag, "A（干净零提交）的目录应当被清掉", &ok);
+    }
+    if !wt_branch_gone(&wsz, pa_slug.ptr as &const byte) {
+        ty_fail(tag, "A 的分支应当被删掉", &ok);
+    }
+    // B：目录与分支都在（有未提交的活）
+    if wt_path_gone(&pb) {
+        ty_fail(tag, "B（有未提交改动）被误删了 —— 那是别人的半成品", &ok);
+    }
+    if wt_branch_gone(&wsz, pb_slug.ptr as &const byte) {
+        ty_fail(tag, "B 的分支被误删了", &ok);
+    }
+    // C：目录与分支都在（有没合并的提交）
+    if wt_path_gone(&pc) {
+        ty_fail(tag, "C（有未合并的提交）被误删了 —— 那会悄悄扔掉别人没合的工作", &ok);
+    }
+    if wt_branch_gone(&wsz, pc_slug.ptr as &const byte) {
+        ty_fail(tag, "C 的分支被误删了", &ok);
+    }
+
+    // ---- D) 有活进程 cwd 在里面 → 留着（真子进程）----
+    var pd: Buf = buf_new(1200);
+    defer { buf_free(&pd); }
+    var pd_slug: Buf = buf_new(64);
+    defer { buf_free(&pd_slug); }
+    wt_residue_slug("inuse1" as &const byte, &pd_slug);
+    if !wt_residue_make_named(&wsz, pd_slug.ptr as &const byte, &pd, &errout) {
+        ty_fail(tag, "造 D 失败", &ok);
+    } else {
+        // 真子进程：fork 之后 chdir 进那个 worktree 再 exec `sleep 5` ——
+        // 于是 /proc/<pid>/cwd 指向它，正是判据 4 要抓的东西。
+        var pd_z: Buf = buf_new(pd.len + 1);
+        defer { buf_free(&pd_z); }
+        _ = buf_append(&pd_z, pd.ptr as &const byte, pd.len);
+        _ = buf_append_byte(&pd_z, 0);
+        const dpid64: i64 = sys_fork() catch { -1 as i64; };
+        if dpid64 == 0 {
+            _ = sys_chdir(pd_z.ptr as *const byte) catch {};
+            var sav: [&const byte: 4] = [null as &const byte: 4];
+            sav[0] = "sleep" as &const byte;
+            sav[1] = "5" as &const byte;
+            sav[2] = null as &const byte;
+            _ = sys_execve("/bin/sleep" as &const byte, &sav[0], saved_envp) catch {};
+            _ = sys_execve("/usr/bin/sleep" as &const byte, &sav[0], saved_envp) catch {};
+            sys_exit(127);
+        }
+        if dpid64 < 0 {
+            ty_fail(tag, "起不来「占用者」子进程（这条判据就测不出来）", &ok);
+        } else {
+            const dpid: i32 = i64_to_i32(dpid64);
+            // 等它真的 cd 进去（fork/exec 有延迟，不等就是随机绿）
+            var tries: i32 = 0;
+            while tries < 100 {
+                if (sys_kill(dpid as i64, 0) catch { -1; }) != 0 {
+                    break;   // 已经没了（exec 失败之类），下面的断言会照实报
+                }
+                if wt_any_cwd_under(pd.ptr as &const byte, pd.len, 0) == 1 {
+                    break;
+                }
+                tries = tries + 1;
+                var ts: TimeSpec = TimeSpec{ tv_sec: 0, tv_nsec: 20000000 as i64 };
+                var rem: TimeSpec = TimeSpec{ tv_sec: 0, tv_nsec: 0 };
+                _ = sys_nanosleep(&ts, &rem) catch {};
+            }
+            if wt_any_cwd_under(pd.ptr as &const byte, pd.len, 0) != 1 {
+                ty_fail(tag, "占用者没进到 D 里（判据 4 这一条没测到）", &ok);
+            }
+            var rout2: Buf = buf_new(4096);
+            defer { buf_free(&rout2); }
+            const n2: i32 = wt_reclaim_scan(repo.ptr as &const byte, &rout2);
+            if n2 != 0 {
+                ty_fail(tag, "有活进程在里面时不该清掉任何东西", &ok);
+                out_err("  报告=");
+                out_err_bytes(rout2.ptr as &const byte, rout2.len);
+                out_err("\n");
+            }
+            if wt_path_gone(&pd) {
+                ty_fail(tag, "D（有活进程 cwd 在里面）被误删了 —— 那会把正在用的会话拆掉", &ok);
+            }
+            _ = sys_kill(dpid as i64, 9) catch {};
+            var stt: i32 = 0;
+            _ = sys_waitpid(dpid, &stt, 0) catch {};
+            // 死了之后这就变回「确定的垃圾」⇒ 再扫一次应当清掉它（证明判据 4 是真的在判
+            // 「活着」，而不是恰好因为这个目录被别的原因挡着）
+            var tries2: i32 = 0;
+            while tries2 < 100 {
+                if wt_any_cwd_under(pd.ptr as &const byte, pd.len, 0) != 1 {
+                    break;
+                }
+                tries2 = tries2 + 1;
+                var ts2: TimeSpec = TimeSpec{ tv_sec: 0, tv_nsec: 20000000 as i64 };
+                var rem2: TimeSpec = TimeSpec{ tv_sec: 0, tv_nsec: 0 };
+                _ = sys_nanosleep(&ts2, &rem2) catch {};
+            }
+            var rout2b: Buf = buf_new(4096);
+            defer { buf_free(&rout2b); }
+            const n2b: i32 = wt_reclaim_scan(repo.ptr as &const byte, &rout2b);
+            if n2b != 1 {
+                ty_fail(tag, "占用者死了之后 D 应当能被清掉（判据 4 得真在判活着）", &ok);
+                out_err("  报告=");
+                out_err_bytes(rout2b.ptr as &const byte, rout2b.len);
+                out_err("\n");
+            }
+            if !wt_path_gone(&pd) {
+                ty_fail(tag, "占用者死了之后 D 还是没清掉", &ok);
+            }
+        }
+    }
+
+    // ---- F) 孤儿分支：目录已经没了、只剩一条零提交的 dsh/* 分支 ----
+    //
+    // 这才是真机上残留的大头：清完目录之后仓库里还躺着 25 条零提交孤儿分支（实测）。
+    // 造法：建一个残留，再用 `worktree remove` 把目录与注册一起清掉 —— 分支会留下，
+    // 于是就成了「没有 worktree 的孤儿分支」，`git worktree list` 再也列不到它。
+    var pf: Buf = buf_new(1200);
+    defer { buf_free(&pf); }
+    var pf_slug: Buf = buf_new(64);
+    defer { buf_free(&pf_slug); }
+    wt_residue_slug("orphan1" as &const byte, &pf_slug);
+    if !wt_residue_make_named(&wsz, pf_slug.ptr as &const byte, &pf, &errout) {
+        ty_fail(tag, "造 F 失败", &ok);
+    } else {
+        var pz: Buf = buf_new(pf.len + 1);
+        defer { buf_free(&pz); }
+        _ = buf_append(&pz, pf.ptr as &const byte, pf.len);
+        _ = buf_append_byte(&pz, 0);
+        var avr: [&const byte: 8] = [null as &const byte: 8];
+        avr[0] = "git" as &const byte;
+        avr[1] = "-C" as &const byte;
+        avr[2] = wszz.ptr as &const byte;
+        avr[3] = "worktree" as &const byte;
+        avr[4] = "remove" as &const byte;
+        avr[5] = "--force" as &const byte;
+        avr[6] = pz.ptr as &const byte;
+        avr[7] = null as &const byte;
+        var orr: Buf = buf_new(4096);
+        defer { buf_free(&orr); }
+        const rrc: i32 = wt_test_git(&avr[0], &orr);
+        if wt_branch_gone(&wsz, pf_slug.ptr as &const byte) {
+            ty_fail(tag, "F 准备失败：分支没留下来，孤儿分支这一条就测不出来了", &ok);
+        } else {
+            // 先确认它**真的**是个孤儿（list 里已经没有它了）。
+            //
+            // 这一步实测在完整 selftest 里红过：`worktree remove` 的返回值原先被丢弃，
+            // 而它**可能失败**（fixture 是同一个进程里好几个 worktree 轮共用的仓库，
+            // 前面轮次留下的注册会让 remove 报「already registered」之类）—— 于是注册
+            // 还在，这里就判成「还被占着」。所以：① 检查 remove 的返回值；
+            // ② 失败时把 git 的 stderr 打出来（否则只看到一句「不算孤儿」，查不出为什么）。
+            if rrc != 0 {
+                ty_fail(tag, "F 准备失败：git worktree remove 没成功（注册还在）", &ok);
+                out_err("  git=");
+                out_err_bytes(orr.ptr as &const byte, orr.len);
+                out_err("\n");
+            } else if wt_branch_checked_out(repo.ptr as &const byte, pf_slug.ptr as &const byte) {
+                ty_fail(tag, "F 准备失败：它还被 worktree 占着，不算孤儿", &ok);
+            }
+            var r1: Buf = buf_new(4096);
+            defer { buf_free(&r1); }
+            const nb: i32 = wt_reclaim_scan(repo.ptr as &const byte, &r1);
+            if nb < 1 {
+                ty_fail(tag, "零提交的孤儿分支没被回收（扫不到只剩分支的残留）", &ok);
+                out_err("  报告=");
+                out_err_bytes(r1.ptr as &const byte, r1.len);
+                out_err("\n");
+            }
+            if !wt_branch_gone(&wsz, pf_slug.ptr as &const byte) {
+                ty_fail(tag, "零提交的孤儿分支应当被删掉", &ok);
+            }
+        }
+    }
+    // F2) 有提交的孤儿分支**必须留着**（目录没了也不能替他扔没合并的活）
+    var pf2: Buf = buf_new(1200);
+    defer { buf_free(&pf2); }
+    var pf2_slug: Buf = buf_new(64);
+    defer { buf_free(&pf2_slug); }
+    wt_residue_slug("orphan2" as &const byte, &pf2_slug);
+    if !wt_residue_make_named(&wsz, pf2_slug.ptr as &const byte, &pf2, &errout) {
+        ty_fail(tag, "造 F2 失败", &ok);
+    } else {
+        var pz2: Buf = buf_new(pf2.len + 1);
+        defer { buf_free(&pz2); }
+        _ = buf_append(&pz2, pf2.ptr as &const byte, pf2.len);
+        _ = buf_append_byte(&pz2, 0);
+        // 在里面提交一笔（-C 要 worktree 目录）
+        var f2: Buf = buf_new(1400);
+        defer { buf_free(&f2); }
+        _ = buf_append(&f2, pf2.ptr as &const byte, pf2.len);
+        _ = buf_append_cstr_z(&f2, "/wip.txt");
+        _ = write_text_file(f2.ptr as &const byte, "unmerged work\n" as &const byte);
+        var c1: [&const byte: 12] = [null as &const byte: 12];
+        c1[0] = "git" as &const byte;
+        c1[1] = "-C" as &const byte;
+        c1[2] = pz2.ptr as &const byte;
+        c1[3] = "-c" as &const byte;
+        c1[4] = "user.email=t@t" as &const byte;
+        c1[5] = "-c" as &const byte;
+        c1[6] = "user.name=t" as &const byte;
+        c1[7] = "add" as &const byte;
+        c1[8] = "-A" as &const byte;
+        c1[9] = null as &const byte;
+        _ = wt_test_git(&c1[0], &errout);
+        var c2: [&const byte: 12] = [null as &const byte: 12];
+        c2[0] = "git" as &const byte;
+        c2[1] = "-C" as &const byte;
+        c2[2] = pz2.ptr as &const byte;
+        c2[3] = "-c" as &const byte;
+        c2[4] = "user.email=t@t" as &const byte;
+        c2[5] = "-c" as &const byte;
+        c2[6] = "user.name=t" as &const byte;
+        c2[7] = "commit" as &const byte;
+        c2[8] = "-q" as &const byte;
+        c2[9] = "-m" as &const byte;
+        c2[10] = "wip" as &const byte;
+        c2[11] = null as &const byte;
+        if wt_test_git(&c2[0], &errout) != 0 {
+            ty_fail(tag, "F2 准备失败：提交没成", &ok);
+        }
+        // 删掉目录 + 注册 ⇒ 剩一条**有提交**的孤儿分支
+        var avr2: [&const byte: 8] = [null as &const byte: 8];
+        avr2[0] = "git" as &const byte;
+        avr2[1] = "-C" as &const byte;
+        avr2[2] = wszz.ptr as &const byte;
+        avr2[3] = "worktree" as &const byte;
+        avr2[4] = "remove" as &const byte;
+        avr2[5] = "--force" as &const byte;
+        avr2[6] = pz2.ptr as &const byte;
+        avr2[7] = null as &const byte;
+        var orr2: Buf = buf_new(4096);
+        defer { buf_free(&orr2); }
+        const rrc2: i32 = wt_test_git(&avr2[0], &orr2);
+        if rrc2 != 0 {
+            ty_fail(tag, "F2 准备失败：git worktree remove 没成功（注册还在）", &ok);
+            out_err("  git=");
+            out_err_bytes(orr2.ptr as &const byte, orr2.len);
+            out_err("\n");
+        }
+        var r2: Buf = buf_new(4096);
+        defer { buf_free(&r2); }
+        _ = wt_reclaim_scan(repo.ptr as &const byte, &r2);
+        if wt_branch_gone(&wsz, pf2_slug.ptr as &const byte) {
+            ty_fail(tag, "有未合并提交的孤儿分支被误删了 —— 那会悄悄扔掉没合并的活", &ok);
+        }
+        // 上面那条「还在」**单独**不够：git 自己的 `branch -d` 也会拒掉有提交的分支
+        // （第二道闸门），所以判据被旁路掉时分支照样「还在」—— 实测确实漏过一次。
+        // 这里钉的是**判据自己**有没有拦住它：它连试都不该去试删，报告里既不该出现
+        // 「reclaimed branch …」也不该出现「kept branch …(git refused)」—— 后者正说明
+        // 判据放行了、只是被 git 兜住（实测：把零提交判据改成恒真，报告里就会出现
+        // 「kept branch dsh/orphan2 (git refused to delete it)」，而分支照样在）。
+        const mark: &const byte = "kept branch " as &const byte;
+        const nm2: &const byte = pf2_slug.ptr as &const byte;
+        if ty_has(&r2, mark, bufx_cstr_len(mark)) && ty_has(&r2, nm2, bufx_cstr_len(nm2)) {
+            ty_fail(tag, "零提交判据没拦住有提交的孤儿分支（去试删了，只是被 git 兜住）", &ok);
+        }
+    }
+
+    // ---- 收尾：B / C 还在（有内容）、F2 还挂着（有提交的孤儿分支），再扫一次也不该动它们 ----
+    var rout3: Buf = buf_new(4096);
+    defer { buf_free(&rout3); }
+    const n3: i32 = wt_reclaim_scan(repo.ptr as &const byte, &rout3);
+    if n3 != 0 {
+        ty_fail(tag, "这一轮已经没有可清的了，不该再清出东西", &ok);
+        out_err("  报告=");
+        out_err_bytes(rout3.ptr as &const byte, rout3.len);
+        out_err("\n");
+    }
+    if wt_path_gone(&pb) || wt_path_gone(&pc) {
+        ty_fail(tag, "收尾时把有内容的 B/C 清掉了", &ok);
+    }
+    if wt_branch_gone(&wsz, pf2_slug.ptr as &const byte) {
+        ty_fail(tag, "收尾时把有提交的孤儿分支清掉了", &ok);
+    }
+
+    // ---- E) wt_reclaim_own：自己的 worktree 走同一条判据 ----
+    wt_reset();
+    wt_set_on(true);
+    var cfg: Config = cfg_default();
+    defer { cfg_free(&cfg); }
+    cfg.model = buf_from_cstr("m");
+    _ = wt_provision(&cfg, wsz.ptr as &const byte, wsz.len,
+        "session-reclaim-own" as &const byte, 19);
+    if !wt_ready() {
+        ty_fail(tag, "E 准备失败：没能建出自己的 worktree", &ok);
+    } else {
+        var ow: Buf = buf_new(1024);
+        defer { buf_free(&ow); }
+        if !wt_reclaim_own(&ow) {
+            ty_fail(tag, "wt_reclaim_own 没清掉自己的空 worktree", &ok);
+            out_err("  out=");
+            out_err_bytes(ow.ptr as &const byte, ow.len);
+            out_err("\n");
+        }
+        if wt_phase() != WT_PHASE_DISCARDED {
+            ty_fail(tag, "wt_reclaim_own 清掉之后 phase 应当是 DISCARDED", &ok);
+        }
+        const stn: &const WtState = wt_state();
+        if !wt_path_gone(&stn.worktree_path) {
+            ty_fail(tag, "wt_reclaim_own 之后目录还在", &ok);
+        }
+    }
+    wt_set_on(false);
+    if ok {
+        out_err("selftest[");
+        out_err(tag);
+        out_err("] ok（干净零提交才清 / 有改动·有提交·有人用一律留）\n");
+    }
+    return ok;
+}
+
 export fn selftest_main(base: &const Config) i32 {
     _ = base;
     // P37：worktree 模式在自测里必须**从关开始**。真机的 DSH 设置（agent-presets.default=
@@ -16077,7 +16626,9 @@ export fn selftest_main(base: &const Config) i32 {
         const q3: bool = model_log_round("model-log" as &const byte);
         const q4: bool = worktree_round("worktree" as &const byte);
         const q5: bool = worktree_discard_round("worktree-discard" as &const byte);
-        if q0 && q1 && q2 && q3 && q4 && q5 {
+        // P49：残留 worktree 的回收判据
+        const q6: bool = worktree_reclaim_round("worktree-reclaim" as &const byte);
+        if q0 && q1 && q2 && q3 && q4 && q5 && q6 {
             out_err("SELFTEST MODEL PASS\n");
             return AGENT_OK;
         }
@@ -16324,10 +16875,12 @@ export fn selftest_main(base: &const Config) i32 {
     // P37：Git worktree（独立工作区执行 → 合并 → 删除）
     const m4: bool = worktree_round("worktree" as &const byte);
     const m5: bool = worktree_discard_round("worktree-discard" as &const byte);
-    // P48：工具带 message 的 finish（msg 的 C 串口径契约）
+    // P48（另一条线）：工具带 message 的 finish（msg 的 C 串口径契约，踩坑 80）
     const m6: bool = worktree_tool_msg_round("worktree-tool-msg" as &const byte);
+    // P49：残留 worktree 的回收（干净零提交才清；有改动·有提交·有人用一律留）
+    const m7: bool = worktree_reclaim_round("worktree-reclaim" as &const byte);
     if r1 && r2 && r3 && r4 && r5 && r5b && r6 && r7 && r8 && r9 && s0 && s1 && s2 && s3 && s4 && s5 && s6 && s7 && t0 && t1 && t2 && t3 && t3b && t4 && t5 && t6 && t7 && t8 && t9 && t10 && t11 && u0 && u1 && u2 && u3 && v0 && v1 && v2 && v3 && v4 && v5 && v6 && v7 && v8 && v9 && r1r && r1t && r1s && y0 && y1 && y2
-        && x0 && x1 && x2 && x3 && x4 && x5 && x6 && x7 && x8 && x9 && x9a && x9b && x10 && x11 && x12 && x13 && x14 && x15 && x16 && w0 && w1 && w2 && w3 && w3b && w3c && w4 && w5 && w5b && w6 && w7 && w7b && w8 && w9 && wA && wB && wC && wF && wG && wH && wI && wch0 && wch1 && wch2 && z0 && z1 && z2 && z3 && z4 && z5 && z6 && z7 && z8 && z9 && m0 && m1 && m2 && m3 && m4 && m5 && m6 {
+        && x0 && x1 && x2 && x3 && x4 && x5 && x6 && x7 && x8 && x9 && x9a && x9b && x10 && x11 && x12 && x13 && x14 && x15 && x16 && w0 && w1 && w2 && w3 && w3b && w3c && w4 && w5 && w5b && w6 && w7 && w7b && w8 && w9 && wA && wB && wC && wF && wG && wH && wI && wch0 && wch1 && wch2 && z0 && z1 && z2 && z3 && z4 && z5 && z6 && z7 && z8 && z9 && m0 && m1 && m2 && m3 && m4 && m5 && m6 && m7 {
         out_err("SELFTEST PASS\n");
         return AGENT_OK;
     }
