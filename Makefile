@@ -223,9 +223,11 @@ e2e-model: build
 	echo "e2e-model: 通过（目录/能力跟随/目录外只换名字/REPL 报告与切换/非法档位拒/透传标注）"
 
 # P37：Git worktree（离线，真 git）：独立工作区执行 → 合并 → 删除
-#   ① --worktree 开会话：建出 worktree + dsh/<slug> 分支，主检出的文件不受影响；
-#   ② 闸门：往共享 checkout 写文件被拒（并指路 worktree 里的同一相对路径）；
-#   ③ finish：提交 → 合并回 base → **删掉 worktree 与分支**，改动出现在主检出上；
+#   ① --worktree 开会话：会话里真的有 worktree + dsh/<slug> 分支（状态报告里看得见，
+#      而且 `git status` 在它里面跑得通 —— 光有路径说明不了目录真的存在）；
+#   ② P49 残留回收：**没干活**就退出（/exit）⇒ 目录与分支当场回收，一个都不留；
+#   ③ P49 判据：`/worktree reclaim` 只清「确定的垃圾」—— 干净零提交的清了，
+#      带未提交改动的原样留着（那是别人的半成品，不许替他扔）；
 #   ④ --no-worktree / 非仓库：不建（fail soft）。
 #   数「会话建出来的 worktree」时**不要**用 `git worktree list | grep dsh-worktrees`：从 worktree 会话里
 #   跑这轮时，主检出的路径本身就带 `.git/dsh-worktrees/`（CURDIR 在它下面），会把主检出也算进去、数出 2 个
@@ -237,18 +239,33 @@ e2e-worktree: build
 	( cd $$ws && git init -q . && git config user.email t@t && git config user.name t && \
 	  printf 'base\n' > base.txt && git add -A && git commit -qm init ); \
 	run="$(CURDIR)/$(OUT) --no-dsh-config --no-tui --quiet --api-key dummy-key --worktree --no-save"; \
-	: "① 建 worktree（状态报告里要看得见路径与分支）"; \
+	: "① 会话里真有 worktree（路径 + 分支 + git status 在它里面跑得通）"; \
 	out=$$(cd $$ws && printf '/worktree status\n/exit\n' | $$run 2>&1); \
 	echo "$$out" | grep -q "worktree: .*\.git/dsh-worktrees/session-" || { echo "FAIL: /worktree status 没报出 worktree 路径"; echo "$$out"; exit 1; }; \
 	echo "$$out" | grep -q "branch:   dsh/session-" || { echo "FAIL: /worktree status 没报出会话分支"; echo "$$out"; exit 1; }; \
+	echo "$$out" | grep -q "uncommitted: (none)" || { echo "FAIL: 会话里的 worktree 读不到 git status（目录没真建出来？）"; echo "$$out"; exit 1; }; \
+	: "② P49：空跑的会话退出 ⇒ 残留当场回收（目录与分支都不留）"; \
 	n=$$(cd $$ws && git worktree list | tail -n +2 | wc -l); \
-	[ "$$n" = "1" ] || { echo "FAIL: 会话开始没有建出 worktree（数量=$$n）"; exit 1; }; \
+	[ "$$n" = "0" ] || { echo "FAIL: 空跑的会话退出后还留着 worktree（数量=$$n）—— P49 的退出回收没生效"; exit 1; }; \
 	b=$$(cd $$ws && git branch --list 'dsh/*' | wc -l); \
-	[ "$$b" = "1" ] || { echo "FAIL: 没有建出 dsh/* 会话分支（数量=$$b）"; exit 1; }; \
+	[ "$$b" = "0" ] || { echo "FAIL: 空跑的会话退出后还留着 dsh/* 分支（数量=$$b）"; exit 1; }; \
+	: "③ P49：reclaim 只清确定的垃圾（干净零提交清掉 / 带改动留着）"; \
+	( cd $$ws && git worktree add -b dsh/junk .git/dsh-worktrees/junk master >/dev/null 2>&1 && \
+	  git worktree add -b dsh/half .git/dsh-worktrees/half master >/dev/null 2>&1 && \
+	  printf 'half done\n' > .git/dsh-worktrees/half/half.txt ); \
+	out=$$(cd $$ws && printf '/worktree reclaim\n/exit\n' | $$run 2>&1); \
+	echo "$$out" | grep -q "reclaimed dsh/junk" || { echo "FAIL: 干净零提交的残留没被回收"; echo "$$out"; exit 1; }; \
+	echo "$$out" | grep -q "kept dsh/half" || { echo "FAIL: 带改动的残留没被明确留下（要看到 kept 那一行）"; echo "$$out"; exit 1; }; \
+	[ ! -d $$ws/.git/dsh-worktrees/junk ] || { echo "FAIL: 该清的残留目录还在"; exit 1; }; \
+	[ -f $$ws/.git/dsh-worktrees/half/half.txt ] || { echo "FAIL: 带改动的残留被误删了（那是别人的半成品）"; exit 1; }; \
+	[ "$$(cd $$ws && git branch --list 'dsh/half' | wc -l)" = "1" ] || { echo "FAIL: 带改动的残留分支被误删了"; exit 1; }; \
+	[ "$$(cd $$ws && git worktree list | tail -n +2 | wc -l)" = "1" ] || { echo "FAIL: reclaim 之后应当只剩带改动的那一个"; exit 1; }; \
 	: "④ 非仓库 / --no-worktree：不建"; \
 	: "   注意：norepo 必须放在 /tmp —— 放在 build/ 下面它会**继承外层仓库**（git 会往上找）"; \
+	: "   跑完要删掉：不删的话每跑一次 make e2e-worktree 就在 /tmp 里留一个（实测 2 天攒了 62 个）"; \
 	nr=/tmp/selftest_p37_e2e_norepo_$$$$; rm -rf $$nr; mkdir -p $$nr; \
 	out=$$(cd $$nr && printf '/worktree status\n/exit\n' | $$run 2>&1); \
+	rm -rf $$nr; \
 	echo "$$out" | grep -q "not inside a Git repository" || { echo "FAIL: 非仓库目录没有 fail soft"; echo "$$out"; exit 1; }; \
 	[ "$$(cd $$ws && git worktree list | tail -n +2 | wc -l)" = "1" ] || { echo "FAIL: 非仓库那一次把 $$ws 的 worktree 弄丢了"; exit 1; }; \
 	: "④b --no-worktree 明确关"; \
@@ -257,7 +274,7 @@ e2e-worktree: build
 	out=$$(cd $$ws2 && printf '/worktree status\n/exit\n' | $(CURDIR)/$(OUT) --no-dsh-config --no-tui --quiet --api-key dummy-key --no-worktree --no-save 2>&1); \
 	echo "$$out" | grep -q "worktree mode is off" || { echo "FAIL: --no-worktree 没有关掉"; echo "$$out"; exit 1; }; \
 	[ "$$(cd $$ws2 && git worktree list | tail -n +2 | wc -l)" = "0" ] || { echo "FAIL: --no-worktree 还是建了 worktree"; exit 1; }; \
-	echo "e2e-worktree: 通过（建 worktree+分支 / 非仓库 fail soft / --no-worktree 关闭）"
+	echo "e2e-worktree: 通过（会话里真建 worktree / 退出回收残留 / reclaim 只清确定的垃圾 / 非仓库 fail soft / --no-worktree 关闭）"
 
 #   ④ 记录的工作区被删（worktree 合并后就删是常态）→ 留在当前工作区 + 留话 + 记一条 fallback。
 # 会话日志用 python3 手写（格式与 sess_open 逐字节一致）：这一轮**不联网、不用模型**。

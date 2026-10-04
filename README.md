@@ -4,8 +4,8 @@
 多轮 loop 直到给出结论。48 个 `.uya` 文件，**不引入任何 C 代码、`@c_import` 或其它语言**，
 只依赖 Uya 语言与随编译器分发的标准库。
 
-**P0–P48 全部完成**，主线版本串 `p48-title`。本节之后按能力域分节，各节标题保留对应的阶段号
-（P0…P48）；设计取舍、踩坑记录与逐阶段验收分别见 §3 与 §6，代码地图见 §2。
+**P0–P49 全部完成**，主线版本串 `p49-reclaim`。本节之后按能力域分节，各节标题保留对应的阶段号
+（P0…P49）；设计取舍、踩坑记录与逐阶段验收分别见 §3 与 §6，代码地图见 §2。
 「TUI 里能拖选复制文本」是修复、**不占阶段号**，记踩坑 72（见 §3）。
 
 真机转录节选（`--show-reasoning`；`✻ 思考` 交互模式下先在提示符那一行滚动、块结束才落成一行，
@@ -45,7 +45,7 @@ $ ./build/uya-agent --show-reasoning "在当前工作目录写 p15-demo.txt，�
   写的全屏 TUI（对齐 opencode 观感），P18 的常驻状态区 + 思考实时行、P20/P24 脚注的统计行与
   `ctx` / `cpu` / `内存`、P25 的任务块、P27/P36 的 `/diff` 浮窗、P22 的终端标题；
   P40 起子代理面板的状态行把最新消息**贴尾**显示（`…` + 最新一段）；P41 起 `/worktree` 也是
-  底对齐选择框（七个动作一行一个，`finish`/`discard` 再过一道确认）；P43 起 `ask_user_question`
+  底对齐选择框（P49 起八个动作一行一个，`finish`/`discard` 再过一道确认）；P43 起 `ask_user_question`
   是**提问弹窗**（问题 + 编号选项 + 一行自定义回答，方向键/数字/空格/直接打字作答；P45 起框宽
   按内容自适应，短问题不再撑满 78 列）；**P47 起 TUI 的正文是真正的 markdown 渲染**（块级：
   标题分级 / 引用 / 三种列表 / 任务清单 / 分隔线 / 围栏代码块带语言标签 / GFM 表格；行内：粗体 /
@@ -59,7 +59,9 @@ $ ./build/uya-agent --show-reasoning "在当前工作目录写 p15-demo.txt，�
   `web_search`；子代理一族（`subagent` / `subagent_fork` / `list_agents` / `subagent_output` /
   `send_message` / `interrupt_agent` / `ralph`）；会话目标（`create_goal` / `get_goal` /
   `update_goal`）；workflow（`.ush` 脚本编排 + 钩子代理回父进程）；三级访问模式 + bwrap 内核沙箱；
-  Git worktree 独立工作区（执行 → 合并 → 删除）。
+  Git worktree 独立工作区（执行 → 合并 → 删除），P49 起连带**残留回收**——会话退出时清掉自己
+  那个「干净 + 零提交 + 没人在用」的 worktree，`/worktree reclaim` 扫全仓的 `dsh/*` 残留
+  （没验完的活一律留着）。
 * **运行**：`make selftest` 完全离线（内置 mock LLM）；`make e2e` 一条命令跑真实网关
   （步数默认不限，`STEPS=N` 可显式熔断）。
 
@@ -159,8 +161,8 @@ export UYA_SPLIT_C_DIR=$PWD/build/uyacache      # 多文件 C 缓存别丢在仓
 REPL / TUI 内的斜杠命令：
 `/help` `/status` `/tasks [open|close|toggle]` `/goal [<objective>|edit <objective>|pause|resume|clear]`
 `/compact` `/plan` `/permission [预设]` `/model [名字]` `/effort [档位]` `/workspace [目录]`
-`/worktree [on|off|start|status|finish|discard|list]`（TUI 里裸命令开**动作选择框**，
-打开就回车 = `status`；`finish`/`discard` 选定后再过一道确认）`/sessions` `/resume <id>` `/new`
+`/worktree [on|off|start|status|finish|discard|list|reclaim]`（TUI 里裸命令开**动作选择框**，
+打开就回车 = `status`；`finish`/`discard` 选定后再过一道确认，`reclaim` 只清确定的垃圾、不确认）`/sessions` `/resume <id>` `/new`
 `/continue` `/diff` `/exit`。
 
 环境变量：`UYA_AGENT_BASE_URL`、`UYA_AGENT_MODEL`、`UYA_AGENT_WORKSPACE`、
@@ -224,7 +226,8 @@ src/session.uya    会话日志：追加写、索引、崩溃裁剪、sess_open_
 src/stats.uya      统计折叠 P20：sessionStats / tokenUsage / StatsLine
 src/procx.uya      进程采样 P20/P24：/proc 算 CPU（USER_HZ=100）与 PSS
 src/gitx.uya       只读跑 git P28：10s 超时、双管道收取
-src/worktreex.uya  Git worktree P37：wt_provision / finish / discard、写闸门
+src/worktreex.uya  Git worktree P37 / 残留回收 P49：wt_provision / finish / discard /
+                   wt_reclaim_own（退出时）· wt_reclaim_scan（reclaim 动作）、写闸门
 src/gitdiff.uya    /diff 数据模型 P28：status --porcelain -z + diff -U100000 HEAD
 src/diffx.uya      行级 diff（只服务显示）：LCS 60×60、截断
 src/tasks.uya      任务状态 P25：四表折叠成折叠行 / 箱体 / `/tasks` 文本
@@ -521,16 +524,34 @@ src/selftest.uya   mock LLM + 130 轮断言 + --probe
 * 档位只认模型公布的键，固定七档 `off`/`minimal`/`low`/`medium`/`high`/`xhigh`/`max`（`none` == `off`）。
 * `reasoningEfforts: false` = 非推理模型，界面不显示 Effort 行；`/effort` 只列公布的档位；`/model <名字>` 直接切，每次选择追一条 `session/model`。
 
-### Git worktree（P37）
+### Git worktree（P37；残留回收 P49）
 
 * 会话在 worktree + 新分支里干活，共享 checkout 只读；`finish` 合并后删 worktree 与分支。
 * 默认值：`baseBranch=''`（探测 `main` → `master` → HEAD）、`branchPrefix='dsh/'`、`worktreeRoot='.git/dsh-worktrees'`。
-* `--worktree` / `--no-worktree`；`/worktree on|off|start|status|finish|discard|list`。
+* `--worktree` / `--no-worktree`；`/worktree on|off|start|status|finish|discard|list|reclaim`。
 * 建：`git worktree add -b dsh/<slug> <repo>/.git/dsh-worktrees/<slug> <base>`（幂等）；不是 git 仓库 ⇒ `phase=skipped`。
 * 写闸门：write/edit 或 bash 的 git 变更子命令落在共享 checkout 被拒，只读放行。
 * `finish` = `add -A` + commit → base → `merge --no-ff` → `worktree remove --force` + `branch -D`；落 `session/worktree`。
 * `finish` 的 `message` 走**工具参数**（JSON）时，`msg` 是 `Buf`、没有 NUL，而 `wt_finish` 按 C 串读它 ——
   两边都必须补 NUL，否则 merge 的提交说明会黏上堆里的旧字节（踩坑 80，回归轮 `worktree-tool-msg`）。
+* **残留回收（P49）**：worktree 只在**显式** finish / discard 时才删，会话直接退出（`/exit`、`ctrl+d`、
+  管道 EOF、信号）不会替你 finish —— 这是对的（没验完的活不该自动合并），但目录与分支会留下
+  （真机实测：一个月攒下 17 个残留 / 129 MiB，另有 25 个没人认领的 `dsh/*` 分支）。所以：
+  * **退出时**只回收**本会话这个**，且必须同时满足四条 —— ① git 说它干净（`status --porcelain`
+    空，`--ignored` 不算：`build/` 之类产物是常态）② 基分支..它这条分支**零提交** ③ 没有活着的
+    进程把它（或子树）当 cwd ④ 本会话不是子代理（子代理共享父的 worktree，它退出绝不能拆父的）。
+    清掉了落一条 `session/worktree`（`action:"reclaim"`）并打一行话；**留着的**（有改动 / 有提交）
+    什么都不说什么都不动 —— 那是没验完的活，留给 `finish` 或人自己决定。
+  * **`/worktree reclaim`**（工具动作同名词）顺手扫整个仓库的 `dsh/*` 残留，逐条报告
+    `reclaimed` / `kept (原因)`；`kept` 的原因就是上面那几条里没过的。只碰 `dsh/*` 的 ——
+    人手工建的 worktree 一根汗毛都不动；`git worktree lock` 过的当「故意留着」跳过。
+  * **判定与删除都交给 git**，我们不自己 `rm` 目录：`worktree remove`（**不带 `--force`**）在
+    有改动/未跟踪文件时会拒，`branch -d`（**不是 `-D`**）在分支有未合并提交时会拒 —— 判据只是
+    「提前判断能不能删」，真删时就算判据写错了也删不掉有内容的东西（两道闸门叠着）。
+  * 那四条判据里 ③ 是防「同一个仓库同时开着好几个会话」：别人那个新会话的 worktree 往往正是
+    「刚建好、还什么都没干」—— 最像垃圾，也最不该动（真机 17 个残留里，这种占多数）。
+  * 没做：不做后台/定时清理（只在退出与显式 `reclaim` 时跑）；不自动 finish（合并仍然只由
+    模型或人显式触发）；不碰非 `dsh/*` 分支与其他仓库。
 
 ### 流式协议要点（P1）
 
@@ -622,7 +643,7 @@ src/selftest.uya   mock LLM + 130 轮断言 + --probe
 54. **`p[a: b]` 第二次咬人（第二参当终点）**：`sess_read_meta` 写 `data.ptr[pos: nl]`，小日志静默越过本行、大日志 realloc 走 mmap 读映射尾 SIGSEGV（`rc=139`）；修 `data.ptr[pos: nl - pos]`；验收 `sess-meta-big`。
 55. **「拼在后面的清单」把前缀抹掉**：`mx_levels_into` 开头 `buf_reset(out)`，`/effort bogus` 只剩档位表；函数体不 reset 只追加（out 是调用方的），「没档位就一个字节都不加」写进契约；「返回串」与「往 out 加一段」是两种接口。
 56. **`buf_free(&cfg.X)` 后又读 `provider` 参数（它就是 `cfg.X.ptr`）**：`agent_model_apply` free 后再 append，于是 provider 字段变乱字节；先拷进临时 Buf 再 free（`keep`）；参数可能是 self 视图的收口函数都要先拷贝。
-57. **C 字符串参数：`Buf.ptr` 没有尾 NUL**：`worktreex` 把 `repo_root`/`branch` 等当 argv，git 报 `fatal: cannot change to '...'` 多出半截，用 `wt_nul(&buf)`；`agent_models_ensure` 拼 `$DSH_HOME+"/settings.yaml"` 没补 NUL 导致建目录失败。
+57. **C 字符串参数：`Buf.ptr` 没有尾 NUL**：`worktreex` 把 `repo_root`/`branch` 等当 argv，git 报 `fatal: cannot change to '...'` 多出半截，用 `wt_nul(&buf)`；`agent_models_ensure` 拼 `$DSH_HOME+"/settings.yaml"` 没补 NUL 导致建目录失败。**P49 又踩了同一个形状两次**：`wt_list_into` 把 `g_wt.repo_root` 抄进一个新 `Buf` 时只抄了内容、没抄那个尾 NUL —— `git -C <ptr> worktree list` 于是报「fatal: cannot change to」并**静默**返回「(git worktree list failed)」，`/worktree list` 一直是坏的（真机上只表现为「列不出东西」）；新写的 `reclaim` 动作抄 `repo_root` 时同样漏了。`buf_new` 不做零初始化（`malloc` 原样），所以这类漏 NUL 一定读到堆里上一轮的脏字节 —— 抄路径进新 `Buf` 之后，**只要它要当 argv/路径用，就必须自己补 NUL**。
 58. **`&out` 是「Buf 的指针的指针」**：`out` 参数本就是 `&Buf`，`buf_append(&out,…)` 把栈上描述符当缓冲区首地址 ⇒ 立刻 SIGSEGV；批量正则替换把 25 处输出追加一起改错 —— 改完必须 `make check` + 跑真路径。
 59. **自测要跟真机 DSH 设置隔离**：`agent-presets.default=git-worktree` 与真机 `~/.dsh/settings.yaml` 相同，`--selftest` 每个 fork 子进程都建 worktree，真 PTY 轮整片红；`selftest_main` 开头 `wt_set_on(false); wt_reset();`。
 60. **工具子进程继承父 TTY → 命令树被 job control 停住但显示「运行中」**：fd 0 原样继承，碰终端收 `SIGTTIN`/`SIGTTOU` 整组停住，而 `waitpid(WNOHANG)` 与还在跑同形；改 stdin→`/dev/null`+`setsid()`、waitpid 带 `WUNTRACED`、收尾读 `O_NONBLOCK`。
@@ -854,6 +875,7 @@ DEEPSEEK_API_KEY=sk-xxx ./build/uya-agent \
 | `worktree` | 真 git：建 worktree + `dsh/<slug>`、闸门、`wt_finish` 合并且目录消失 |
 | `worktree-discard` | `wt_discard` 不合并；非仓库 `wt_provision` 判 `SKIPPED` |
 | `worktree-tool-msg` | 踩坑 80：走**真工具入口**带 `message` 的 finish —— `git log -1 --pretty=%s` 读回来的提交说明**逐字节**等于传入的 marker（`wt_finish` 把 `msg` 当 C 串，JSON 解出来的 Buf 没有 NUL 时会读到堆尾巴） |
+| `worktree-reclaim` | P49 残留回收的四条判据（真 git，逐条对照）：**干净 + 零提交**的清了（目录与分支都没了）；**有未提交改动**的留、**有未合并提交**的留、**有活进程 cwd 在里面**的留（真 `fork`+`chdir`+`exec sleep` 当占用者，杀掉之后同一份扫描又能清掉它 —— 证明判据 ③ 真在判「活着」而不是碰巧被别的原因挡着）；`wt_reclaim_own` 清掉自己的空 worktree 后 `phase=DISCARDED` |
 | `tui-model` | `/model` 与 `/effort` 浮层：分组标题、`✓` 只在当前行、只列公布档位 |
 | `ws-tool` | workspace 工具：失败状态不变、日志/索引写入、`/diff` 头短路径 |
 | `diff-git` | 真 git：XY 码/numstat、未跟踪/删除、`gd_refresh`、P36 跨文件跳转 |
@@ -904,7 +926,7 @@ DEEPSEEK_API_KEY=sk-xxx ./build/uya-agent \
 | `tui-sessions` | `/sessions` 浮层：箱体铺开、默认游标在最后一项、完整 id |
 | `tui-sessions-big` | 踩坑 68：2000 项 —— 取行查表 vs 线性扫描**差分逐字节相同** + 取末项 20000 次的自校准比值（查表 ≪ 扫描）+ 第 0/中/末项文本正确 + home/end/↑/↓ 与 sel_set 自洽 + 列表与 reader 成帧各 < 1 s + 正文层无 ESC/NUL |
 | `tui-model` | P37 `/model`/`/effort` 浮层：按提供方分组、只列公布的档位、反解、非推理模型不开浮层 |
-| `tui-worktree` | P41 `/worktree` 动作选择浮层：标题/七个动作/✓ 标当前模式、反解只认动作行（「取消」不认）、默认游标 = `status`；`finish`/`discard` 选定不生效、先翻确认框（默认游标 = 取消）；**真 git**：确认前 worktree 目录与 phase 一个字节不动、确认后才合并 + 删除 |
+| `tui-worktree` | P41 `/worktree` 动作选择浮层：标题/八个动作/✓ 标当前模式、反解只认动作行（「取消」不认）、默认游标 = `status`；`finish`/`discard` 选定不生效、先翻确认框（默认游标 = 取消）；**真 git**：确认前 worktree 目录与 phase 一个字节不动、确认后才合并 + 删除 |
 | `tui-mouse` | 踩坑 72 鼠标上报开关（`F2` / `/mouse` / `--no-mouse`）：标志位默认开 + `tui_set_mouse` 幂等；`F2` 两种编码（`ESC O Q` / `ESC[12~`）与 `/mouse on·off·非法`；**字节级**进/关/再开/关着进都与开关一致；帮助浮层里有 `F2` 那一条；**真 PTY** 两个方向（默认开必有 `1000h`、`mouse=false` 必无 `1000h`/`1006h`） |
 | `title-cmd` | P48 `/title` 与 `set_title`：清洗（80 B / 码点边界 / 控制序列全丢后为空 ⇒ 报错且标题**不动**）、钉住语义（`user` 置位后自动起标题不跑、`clear` 解锁）、revision 门控（同一条人类消息只生成一次）、落盘事件逐字节（kind 三档 + clear 的**空标题**事件）、索引同步、`set_title` 工具三支（合法/空串/缺键）、工具目录里有它 |
 | `tui-title-input` | P48 标题输入框：预填 AI 建议可见 + 编辑（打字/backspace/delete/←→/home·end/ctrl+u/中间插入，**按码点**不劈汉字）+ enter 采纳交回编辑后的文本 / esc 取消**不算改名** + 太矮回落 0 + 方框逐行闭合 + 窄框不越界 + 运行中 `/title <t>` 进安全集而裸 `/title` 不进 |
@@ -1223,13 +1245,22 @@ DEEPSEEK_API_KEY=sk-xxx ./build/uya-agent \
   `agent-presets.default=git-worktree` 会让**每个**新会话都建 worktree，不想要就 `--no-worktree`
   或 `/worktree off`。
 * **`/worktree` 的选择框与二次确认（P41）**：TUI 里裸 `/worktree` 是**底对齐选择框**（与
-  `/permission`、`/model`、`/effort` 同一套观感），七个动作一行一个、`✓` 标当前模式、游标
+  `/permission`、`/model`、`/effort` 同一套观感），八个动作一行一个、`✓` 标当前模式、游标
   **默认停在 `status`** —— 所以「打开就回车」与 P37 的裸命令逐字节同效（老手感不变）；带参数的
   `/worktree on|off|…` 仍是文本命令（与 `/model <名字>` 同一口径）。`finish` / `discard` 会**删掉
   目录与分支**，所以选定不生效、先翻第二道确认框且游标默认停在「取消」（与 Full access 的风险
-  确认同一态度）—— 彩排过：只按回车不会把 worktree 合掉/删掉。动作的执行结果走**滚动模式同一份**
-  文本（`wt_cmd_run`），TUI 里以一条 notice 落进转录，所以两条路的措辞永远一致。这是工具层护栏，
-  不是安全边界：模型自己调 `worktree` 工具走的是同一条 `wt_tool_worktree`，不经过这道确认框。
+  确认同一态度）—— 彩排过：只按回车不会把 worktree 合掉/删掉。`reclaim`（P49）也删目录，但**不翻
+  确认框**：它只清「干净 + 零提交 + 没人在用」的确定垃圾，判据在 worktreex 里、人敲这个动作就是
+  「顺手扫一下」。动作的执行结果走**滚动模式同一份**文本（`wt_cmd_run`），TUI 里以一条 notice
+  落进转录，所以两条路的措辞永远一致。这是工具层护栏，不是安全边界：模型自己调 `worktree` 工具
+  走的是同一条 `wt_tool_worktree`，不经过这道确认框。
+* **残留回收的边界（P49）**：只在**会话退出**与**显式 `/worktree reclaim`** 两处跑，没有后台
+  定时器；退出时回收的那条路**只碰本会话自己的 worktree**（不会顺手扫全仓 —— 那是显式动作），
+  而且**信号退出（SIGTERM/SIGKILL）不跑**（信号处理器里只能做异步信号安全的事，`git` 不在其内，
+  见 `sigx`）—— 那种残留留给下一次 `reclaim` 或下一次同 slug 会话。判据里的「没人在用」扫的是
+  `/proc/*/cwd`，所以**扫不到别的 PID namespace / 别的机器**：容器里回收只认本 namespace 的进程，
+  跨 namespace 的占用者会被当成「没人用」（这是本机工具的既有分界，不额外做跨 namespace 探测）。
+  `git worktree lock` 的当「故意留着」，跳过不报错；清单里出现但目录已经没了的条目走 `prune`。
 
 **访问模式、沙箱与 plan**
 
