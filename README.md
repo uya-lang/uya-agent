@@ -6,6 +6,7 @@
 
 **P0–P45 全部完成**，主线版本串 `p45-askw`。本节之后按能力域分节，各节标题保留对应的阶段号
 （P0…P45）；设计取舍、踩坑记录与逐阶段验收分别见 §3 与 §6，代码地图见 §2。
+本轮「TUI 里能拖选复制文本」是修复，**不占阶段号**，记踩坑 72（见 §3）。
 
 真机转录节选（`--show-reasoning`；`✻ 思考` 交互模式下先在提示符那一行滚动、块结束才落成一行，
 非交互（管道）没有实时行，只有结算的那一行）：
@@ -139,6 +140,7 @@ export UYA_SPLIT_C_DIR=$PWD/build/uyacache      # 多文件 C 缓存别丢在仓
 | `--tool-lines N` | 工具正文：默认 `0` = 只留一行（P16）；`N>0` = 首尾各 N 行（含 diff / todo 清单，即 P14 的正文块） |
 | `--tui` | 全屏 TUI（**TTY 交互模式默认**）；`--no-tui` 退回滚动转录；`UYA_AGENT_TUI=0\|1` 同口径 |
 | `--title` / `--no-title` | 交互模式把**终端标题**写成当前会话标题（**默认开**）；`UYA_AGENT_TITLE=0` 同口径；一次性运行与非 TTY 路径本来就不写 |
+| `--mouse` / `--no-mouse` | TUI 的**鼠标上报**开关（**默认开**，滚轮要靠它）。`--no-mouse` 让终端重新接管拖选 ⇒ **能选中文字复制**（同时失去滚轮翻转录，改用 `ctrl+↑/↓` 或 `pgup/pgdn`）；`UYA_AGENT_MOUSE=0` 同口径，运行中还有 `F2` 与 `/mouse on\|off`（见踩坑 72） |
 | `--color=MODE` | `auto`（默认）/ `always` / `never` / `16` / `256`；`NO_COLOR` 也认 |
 | `--tui-demo` | 打印 TUI 的 home / chat / 运行中 三屏 + 常驻任务块两帧（折叠 / 展开）+ plan 审阅浮窗一帧的纯文本快照后退出（诊断 + 文档） |
 | `--max-tokens N` | 发送 `max_tokens`（默认不发送） |
@@ -163,6 +165,7 @@ REPL / TUI 内的斜杠命令：
 `UYA_AGENT_PERMISSION`（三档访问模式，非法值告警后忽略）、
 `UYA_AGENT_SANDBOX`（`0`/`off` = 等价于 `--no-sandbox`）、`UYA_AGENT_BWRAP`（bwrap 路径）、
 `UYA_AGENT_TITLE`（`0` = 不改终端标题，其它非空值 = 开；`--title` / `--no-title` 优先），
+`UYA_AGENT_MOUSE`（`0` = 关鼠标上报、可直接拖选复制文本，其它非空值 = 开；`--mouse` / `--no-mouse` 优先），
 以及 key（三选一）：`UYA_AGENT_API_KEY` / `DEEPSEEK_API_KEY` / `OPENAI_API_KEY`。
 
 退出码：`0` 成功 · `1` 用法/配置错 · `2` 传输错（DNS/TCP/TLS/超时）· `3` 模型或协议错
@@ -182,10 +185,10 @@ src/llm.uya        两种协议归一成 ChatOut（chat/completions 与 /v1/resp
 src/tools.uya      P0 死代码：read_file / write_file / run_shell
 src/tty.uya        终端层：termios raw、行编辑器、面板块、标题栈、诊断转义
 src/sigx.uya       信号层：自绑 sigaction、终止信号先还终端、SIGWINCH 置标志
-src/tui.uya        全屏 TUI：帧 diff、转录、浮层、状态区、任务块、翻看
+src/tui.uya        全屏 TUI：帧 diff、转录、浮层、状态区、任务块、翻看、鼠标上报开关（F2 / /mouse）
 src/sigselftest.uya 信号自测轮：sig-abi / sig-basic / sig-term-restore / sig-child-reset
 src/shellselftest.uya bash 进程侧自测：bash-detach / bash-stop-recover / bash-kill-tree
-src/tuiselftest.uya TUI 自测轮：tui-frame / tui-keys / tui-sink / tui-turn / tui-status / tui-cmd / tui-plan / tui-exit / tui-quit / tui-tasks / tui-diff / tui-scroll / tui-pty / tty-title-pty / tui-switch
+src/tuiselftest.uya TUI 自测轮：tui-frame / tui-keys / tui-sink / tui-turn / tui-status / tui-cmd / tui-plan / tui-exit / tui-quit / tui-tasks / tui-diff / tui-scroll / tui-pty / tty-title-pty / tui-switch / tui-mouse
 src/inbox.uya      输入收件箱：steer（step 边界领取）+ keepInbox
 src/yamlcfg.uya    自带 YAML 子集解析器（`yt_key` 取 map 键名）
 src/modelx.uya     模型目录 P37：settings.yaml → McEntry，只认公布的档位
@@ -333,7 +336,7 @@ src/selftest.uya   mock LLM + 126 轮断言 + --probe
 ### 全屏 TUI（P17）
 
 * TTY 交互默认全屏（`--no-tui` 退回滚动；非 TTY / `--quiet` / 子代理自动退回）；`UYA_AGENT_TUI=0|1`、`--color=auto|always|never|16|256`、`--tui-demo [COLSxROWS]`。
-* 键位：`enter` 发送、`ctrl+j` / `alt+enter` 换行、`esc` 中断、`ctrl+c` 中断（2 秒内再按退出）、`ctrl+d` 退出、`shift+tab` 访问模式、`tab` plan、`ctrl+t` 任务块、`ctrl+p` 面板。
+* 键位：`enter` 发送、`ctrl+j` / `alt+enter` 换行、`esc` 中断、`ctrl+c` 中断（2 秒内再按退出）、`ctrl+d` 退出、`shift+tab` 访问模式、`tab` plan、`ctrl+t` 任务块、`ctrl+p` 面板、**`F2` 切换鼠标上报**（关掉就能拖选复制文本，见踩坑 72 / `/mouse`）。
 * 浮层：命令面板 / 会话列表 / 帮助 / `/status` / `/goal` / `/watch` 跟随 / 访问模式 / bash 批准 / plan 审阅 / **提问弹窗（P43，框宽自适应 P45）**；`/` 触发面板后连 `/` 一起收走。
 * **提问弹窗（P43，`ask_user_question`）**：模型在执行中问问题时弹一个浮窗（标题 = `header`，
   多题时带 `第 i/共 n 问`）——问题正文一行、编号选项（`▸ 1) label — description`）、一行
@@ -581,6 +584,7 @@ src/selftest.uya   mock LLM + 126 轮断言 + --probe
     * 验收（对照实验，两条都做）：`tui-switch` 的 D 段在**真实 globals** 上装夹具（清单 2/4 + 后台 1/2 + 子代理 1/1 + 目标 3/20）→ 敲 `/new` → 钉住「清掉的」（`g_todos.n == 0` 且屏幕上没有「任务 2/4」）与**「不该被清掉的」**（屏幕上仍有「目标 3/20」）两件事；同一条口径再罩一遍 `/resume`。①把 `agent_session_scoped_reset()` 的函数体停掉重编 → 该轮红 4 条（`/new` 与 `/resume` 各两条：`g_todos.n != 0` + 块里还挂着清单）；②只把 `/new` 落点的 `tasks_panel_sync` 去掉重编 → 红 1 条（块里还挂着清单，状态其实已经清了）—— 证明「清状态」与「推显示」两截都真在起作用，不是其中一条在兜底另一条。
 70. **`--dsh-root` 与 `--dsh-home` 同类：决定「去哪儿读文案」，必须在预扫里生效**（P44）：主循环那次完整 CLI 解析排在 DSH 加载之后，而 `agent_texts_ensure()` 是**幂等的一次性**初始化（`g_texts_ready`），一旦在解析之前被叫过，`cfg.dsh_root` 就永远是空的 —— 症状是 flag 静默无效、persona 仍来自默认 preset 树，而环境变量 `UYA_AGENT_DSH_ROOT` 却正常（那条路在 `preset_path()` 里直接读 env）。判据：同时给 env 和 flag 各指一个**文案不同**的 preset 树，看哪个生效。**孪生一条：相对路径也静默失效** —— 这个值要到「第一次构 system prompt」才被读，那时进程已不在启动时的 cwd，所以 `--dsh-root testdata/x` 读不到、`--dsh-root $PWD/testdata/x` 才读到；修法是解析时就补成绝对路径（`cfg_set_dsh_root()`，预扫与主循环共用）。与踩坑 25 同因；回归补在 `e2e-config-flags`。
 71. **completions 不发 `reasoning_effort` = 静默丢弃用户配置**（P44）：`--effort` / `--reasoning-effort` / DSH 的 `agent-default-model.reasoningEffort` 三条路径的值都进了 `cfg.reasoning_effort`、`--print-config` 也照实显示，但 `build_chat_request` 里没有那一段，于是**默认的 openai-completions 路由上模型按网关默认档思考**，用户配的 `max` 没有落到线上，也没有任何提示。同一份设置下 DSH 是发的（实测抓包 `reasoning_effort: "max"`），所以「uya 比 DSH 省」这类对比会掺进一个与 harness 无关的混杂项（实测偏差 41%）。修法：与 responses 同一条门槛（`cfg.api_reasoning`）发顶层 `reasoning_effort`，字段放最后以保住前缀缓存。**注意效果依网关而异**：官方端点同任务 `max` vs `off` 的 reasoning 占输出 51% vs 27%，autodl 网关 12% vs 17%（该网关不认这个字段）——收益主要是「配置不再说谎」，不是省钱。
+72. **「TUI 里不能拖选复制文本」是鼠标上报的代价，不是渲染坏**（本轮修复，不占阶段号）：P25 为了让滚轮不被 xterm.js 伪装成 ↑/↓，**无条件**开了 `ESC[?1000h`+`ESC[?1006h`；而终端只要把鼠标交给我们，**它自己的拖选就没了** —— 左键按下/拖动全变成 `ESC[<b;x;yM` 事件灌过来，TUI 只吃滚轮（`b` 的 bit6）、其余**丢弃**（`tui_mouse_finish()`），于是拖选期间屏幕上什么都不动、PRIMARY 一个字节都不变。真机实测（deepin-terminal / qtermwidget，即用户环境）：同一块屏幕、同一个拖拽轨迹，**鼠标上报开着时拖选后 PRIMARY 仍是旧值（等于没有选中），手动发一条 `?1000l?1006l` 关掉之后立刻拿到 TUI 正文的文本**；再把 `?1000h?1006h` 发回去又选不动 —— 这一对对照就是根因的判据（render 与选区无关，屏幕重画也不会清掉已选区，实测 T+3 s 仍在）。所以这不是「哪一行画错了」，而是**一个必须可逆的开关**：修法是把鼠标上报做成可关的（`g_tui_mouse` + `tui_set_mouse()`，`tui_term_enter` 按开关发序列、运行中切换当场写 `1000h/1006h` 或 `1006l/1000l`），默认仍开（滚轮口径一字节不变），出口给三个：`F2`（`ESC O Q`，也认 `ESC[12~`）、`/mouse on|off`、启动期 `--no-mouse` / `UYA_AGENT_MOUSE=0`。**取舍写清楚**：关掉之后滚轮交给终端（不再翻转录），翻滚录用 `ctrl+↑/↓`（`ESC[1;5A/B` 那条已修好的路）或 `pgup/pgdn`；不想关也可以在开着时**按住 shift 拖选**（多数终端把这个当本地拖选）。防假绿对照实验：①`tui_term_enter` 改成忽略开关、恒发 `1000h` 重编 → `tui-mouse` 的 D4 当场红（`--no-mouse` 会失效）；②删掉 F2 的 SS3 映射 → B 段红；③`tui_set_mouse` 去掉运行中那段写序列 → D2/D3 红；④启动处把 `tui_set_mouse(cfg.mouse)` 写成恒 `true` → 真 PTY 那条腿红（`mouse=false` 的捕获里仍有 `1000h`）。**与既有口径的一致性**：这是「显式开关」而不是「猜终端」——不去探测、不自动关，因为关掉就等于放弃滚轮，必须由人决定。
 
 ---
 
@@ -757,6 +761,7 @@ DEEPSEEK_API_KEY=sk-xxx ./build/uya-agent \
 | `tui-sessions-big` | 踩坑 68：2000 项 —— 取行查表 vs 线性扫描**差分逐字节相同** + 取末项 20000 次的自校准比值（查表 ≪ 扫描）+ 第 0/中/末项文本正确 + home/end/↑/↓ 与 sel_set 自洽 + 列表与 reader 成帧各 < 1 s + 正文层无 ESC/NUL |
 | `tui-model` | P37 `/model`/`/effort` 浮层：按提供方分组、只列公布的档位、反解、非推理模型不开浮层 |
 | `tui-worktree` | P41 `/worktree` 动作选择浮层：标题/七个动作/✓ 标当前模式、反解只认动作行（「取消」不认）、默认游标 = `status`；`finish`/`discard` 选定不生效、先翻确认框（默认游标 = 取消）；**真 git**：确认前 worktree 目录与 phase 一个字节不动、确认后才合并 + 删除 |
+| `tui-mouse` | 踩坑 72 鼠标上报开关（`F2` / `/mouse` / `--no-mouse`）：标志位默认开 + `tui_set_mouse` 幂等；`F2` 两种编码（`ESC O Q` / `ESC[12~`）与 `/mouse on·off·非法`；**字节级**进/关/再开/关着进都与开关一致；帮助浮层里有 `F2` 那一条；**真 PTY** 两个方向（默认开必有 `1000h`、`mouse=false` 必无 `1000h`/`1006h`） |
 | `sessions-e2e` | `make e2e-sessions`：最新在最后一行、空标题落 `(无标题)` |
 | `resume-big-e2e` | `make e2e-resume-big`：~3 MiB 会话 + 残行，`--resume --dry-run` 退出码 0 |
 | `diff-render` | 纯函数：上下文、`… (省略 36 行)`、按显示列截断 |
@@ -859,7 +864,9 @@ DEEPSEEK_API_KEY=sk-xxx ./build/uya-agent \
   `p45-askw`），`tui-ask` 其余三段（太矮回落 / headless dismissed / 真 PTY label 回模型）不受影响。
 - 其它：自测幂等（连跑两次都 PASS）；A1–A6 全部通过；技能与 `web_search`、自动压缩、后台任务、文件工具、DSH 零参数启动、跨进程会话恢复（记住 4271）都在真机验收过。
 
-> 分阶段验收记录的详细现场（P1–P45 的 before/after 命令与截图、真机对照实验、被自测当场抓住的自身缺陷）已在此压缩，原始描述保留在 §3 踩坑 33–71 与各版本提交说明中。
+- 踩坑 72（TUI 里能复制文本）：真机（deepin-terminal / qtermwidget，即用户环境）A/B —— 同一块屏幕、同一条拖拽轨迹（`xdotool` 驱动），鼠标上报**开着**时拖选之后 `PRIMARY` 仍是旧值（= 没选中）、TUI 正文一个字符都拿不到；手动发 `?1000l?1006l` 关掉后拖同一段立刻拿到屏幕文本；再发 `?1000h?1006h` 又选不动。屏幕重画不会清掉已选区（选中后等 3 s 仍在），所以与渲染/重绘无关。修法见踩坑 72；`make e2e-mouse` 钉配置来源链（默认 env/cli + CLI 优先 + 滚动模式 `/mouse` 说明），`tui-mouse` 轮钉开关语义、F2 两种编码、字节级四个方向与真 PTY 两个方向。防假绿对照实验四条（`tui_term_enter` 忽略开关 / 删 F2 映射 / `tui_set_mouse` 去掉运行中写序列 / 启动处恒 `true`）都当场红。
+
+> 分阶段验收记录的详细现场（P1–P45 的 before/after 命令与截图、真机对照实验、被自测当场抓住的自身缺陷）已在此压缩，原始描述保留在 §3 踩坑 33–72 与各版本提交说明中。
 
 ---
 
@@ -894,7 +901,10 @@ DEEPSEEK_API_KEY=sk-xxx ./build/uya-agent \
 * **浮层（P23）**：框高上限 16 行（`↑/↓`、`pgup/pgdn`、`home/end` 滚，标题栏 `↑`/`↓` 是溢出指示）；
   浮层画在转录区上，打开时转录被它盖住，esc 关掉就回来。终端高度不够（`panel_top < 5`）时浮层
   画不出来，由 `tui_overlay_available()` 的 fail-closed 语义管（审批不会「看不见却仍吞键」）。
-* **TUI 不做**鼠标点击/拖选/选择（滚轮做了，见 P32）、图片、可折叠卡片、分屏、主题切换 UI；
+* **TUI 不做**鼠标点击/拖选/选择（滚轮做了，见 P32）、图片、可折叠卡片、分屏、主题切换 UI。
+  但**「选中文字复制」是终端自己的事**：TUI 默认开着鼠标上报（P25，为了滚轮），而鼠标上报
+  一开终端的拖选就被我们吃掉 ⇒ 想拖选复制得按 `F2` / `/mouse off` 关掉（或开着时按住 shift
+  拖选）—— 关掉之后滚轮不再翻转录，改用 `ctrl+↑/↓` 或 `pgup/pgdn`（见踩坑 72）。
   `--resume` 只回填最近 200 条历史（注入类消息不回填），`--resume-dsh` 走同一条回填路径。
   终端小于 32×8 时自动退回滚动模式；`cols < 66` 时块字 logo 退化成一行标题。
 * **滚动模式（`--no-tui`）**是纯文本字形、不做 markdown 渲染；TUI 有颜色 + 轻量 markdown
