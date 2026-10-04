@@ -61,7 +61,7 @@ $ ./build/uya-agent --show-reasoning "在当前工作目录写 p15-demo.txt，�
   `update_goal`）；workflow（`.ush` 脚本编排 + 钩子代理回父进程）；三级访问模式 + bwrap 内核沙箱；
   Git worktree 独立工作区（执行 → 合并 → 删除），P49 起连带**残留回收**——会话退出时清掉自己
   那个「干净 + 零提交 + 没人在用」的 worktree，`/worktree reclaim` 扫全仓的 `dsh/*` 残留
-  （没验完的活一律留着）。
+  （目录还在的 + 目录已没的孤儿分支各收一遍；没验完的活一律留着）。
 * **运行**：`make selftest` 完全离线（内置 mock LLM）；`make e2e` 一条命令跑真实网关
   （步数默认不限，`STEPS=N` 可显式熔断）。
 
@@ -227,7 +227,7 @@ src/stats.uya      统计折叠 P20：sessionStats / tokenUsage / StatsLine
 src/procx.uya      进程采样 P20/P24：/proc 算 CPU（USER_HZ=100）与 PSS
 src/gitx.uya       只读跑 git P28：10s 超时、双管道收取
 src/worktreex.uya  Git worktree P37 / 残留回收 P49：wt_provision / finish / discard /
-                   wt_reclaim_own（退出时）· wt_reclaim_scan（reclaim 动作）、写闸门
+                   wt_reclaim_own（退出时）· wt_reclaim_scan（目录 + 孤儿分支两遍）、写闸门
 src/gitdiff.uya    /diff 数据模型 P28：status --porcelain -z + diff -U100000 HEAD
 src/diffx.uya      行级 diff（只服务显示）：LCS 60×60、截断
 src/tasks.uya      任务状态 P25：四表折叠成折叠行 / 箱体 / `/tasks` 文本
@@ -547,9 +547,18 @@ src/selftest.uya   mock LLM + 130 轮断言 + --probe
   * **`/worktree reclaim`**（工具动作同名词）顺手扫整个仓库的 `dsh/*` 残留，逐条报告
     `reclaimed` / `kept (原因)`；`kept` 的原因就是上面那几条里没过的。只碰 `dsh/*` 的 ——
     人手工建的 worktree 一根汗毛都不动；`git worktree lock` 过的当「故意留着」跳过。
+  * **两条路**：先按 `git worktree list` 收目录还在的（`reclaimed … at <path>`），再按
+    `git for-each-ref refs/heads/dsh/` 收**孤儿分支** —— 目录被手工删了、或注册被 prune 过之后，
+    分支就成了一条没有 worktree 的孤儿，`worktree list` 再也列不到它（真机实测：清完 14 个目录
+    之后仓库里还躺着 25 条零提交孤儿分支，每一条都是一次没干活的会话留下的）。孤儿分支只有一条
+    判据：**零提交**（tip 是基分支的祖先）；有提交的一律留着（`git branch -D` 是人的事）。
+    顺序有意为之：先收目录（连分支一起删），剩下的孤儿才轮到第二遍。
   * **判定与删除都交给 git**，我们不自己 `rm` 目录：`worktree remove`（**不带 `--force`**）在
     有改动/未跟踪文件时会拒，`branch -d`（**不是 `-D`**）在分支有未合并提交时会拒 —— 判据只是
     「提前判断能不能删」，真删时就算判据写错了也删不掉有内容的东西（两道闸门叠着）。
+    这一点在自测里被**实测**过：把孤儿分支的「零提交」判据改成恒真，分支照样「还在」（git 拒了），
+    所以那一轮的断言不能只查「分支还在」—— 得查报告里**没有** `kept branch …(git refused)`
+    这一行（出现它就说明判据放行了、只是被 git 兜住）。第一版断言正是漏在这点上。
   * 那四条判据里 ③ 是防「同一个仓库同时开着好几个会话」：别人那个新会话的 worktree 往往正是
     「刚建好、还什么都没干」—— 最像垃圾，也最不该动（真机 17 个残留里，这种占多数）。
   * 没做：不做后台/定时清理（只在退出与显式 `reclaim` 时跑）；不自动 finish（合并仍然只由
@@ -749,7 +758,6 @@ src/selftest.uya   mock LLM + 130 轮断言 + --probe
    提交说明读回来**逐字节**比对；读越界会多出后面的字节，断言当场红。
    与踩坑 57/67 同族（「`buf_new` 造的东西必须补 NUL 才能当 C 串用」），
    但这次踩在**函数间的口径契约**上，而不是自测夹具里。
-
 81. **「文本跑出框外」不是宽度算错，是「帧里的一行内部带着换行」**（修复，不占阶段号）：
    用户报「提问的窗口内容很长时没有自适应，而且现在文本会跑出框外」—— 两条症状、三个根因，
    而且**都不是渲染算错**：
@@ -762,6 +770,19 @@ src/selftest.uya   mock LLM + 130 轮断言 + --probe
    * **② 宽度上限被写死**。P45 的自适应把上限钉在 `TUI_ASK_WANT_W = 78`（= reader 的宽度档），
      于是宽终端上长问题也只画到 78 列就补 `…` —— 「没有自适应」的观感就来自这里。
    * **③ 问题正文只画一行**。折行/截断只处理第一行，后面的行根本没有位置。
+   修法三件配套：**进帧的文本一律单行清洗**（新增 `tui_clean_line_into`：`'\n'` → 空格，
+82. **自测夹具的路径没补 NUL —— 只在「完整 selftest」里炸**（P49 加孤儿分支轮时被自己的新断言抓到）：
+    `wt_ws_pid` 只往 `Buf` 里写内容、**不补尾 NUL**，而新写的那段把 `wsz.ptr` 直接当 git 的 `-C`
+    参数（C 串）用 ⇒ git 报 `fatal: cannot change to '/tmp/selftest_p37_wt_2300741111-111111111111ce":
+    "/selftest/meta-big/TRUNCuild/…'` —— 路径后面黏的那截，是**前面某轮留在堆里的字节**
+    （`sess-meta-big` 的 TRUNC 标记 + 另一个会话日志路径）。三个「为什么难查」叠在一起：
+    ① 单独跑 `UYA_SELFTEST_MODEL_ONLY=1` 永远绿（堆布局不同，那片内存恰好是 0）；
+    ② 报错文本本身像「路径不存在」而不像「读越界」；③ 我最初把失败原因猜成「前面轮次留下了同名分支」，
+    还照着这个错判去加预清理（无效）。真正定位靠的是：**先让断言把 git 的 stderr 打出来**
+    （原先 `worktree remove` 的返回值被丢弃，只看到一句「它还被 worktree 占着」，看不出为什么），
+    看到那截堆垃圾才认出这是踩坑 57 的形状。修法：这一轮里另备一份带 NUL 的 `wszz`，凡是把 fixture
+    路径当 argv 的地方都用它。教训：**「只在完整套件里红」优先怀疑堆/全局状态，而不是测试顺序**；
+    夹具里的路径缓冲与生产代码同等要求（补 NUL），别因为「它只是个 /tmp 路径」就省。
    修法三件配套：**进帧的文本一律单行清洗**（新增 `tui_clean_line_into`：`'\n'` → 空格，
    其余与 `tui_clean_into` 同一份实现、只多一个 `one_line` 开关；ask 型的标题/问题/选项/
    自定义回答行 + 共享的标题/prompt 槽位都用它）、**上限改成「终端宽 − 6」**（不再写死 78）、
@@ -903,7 +924,7 @@ DEEPSEEK_API_KEY=sk-xxx ./build/uya-agent \
 | `worktree` | 真 git：建 worktree + `dsh/<slug>`、闸门、`wt_finish` 合并且目录消失 |
 | `worktree-discard` | `wt_discard` 不合并；非仓库 `wt_provision` 判 `SKIPPED` |
 | `worktree-tool-msg` | 踩坑 80：走**真工具入口**带 `message` 的 finish —— `git log -1 --pretty=%s` 读回来的提交说明**逐字节**等于传入的 marker（`wt_finish` 把 `msg` 当 C 串，JSON 解出来的 Buf 没有 NUL 时会读到堆尾巴） |
-| `worktree-reclaim` | P49 残留回收的四条判据（真 git，逐条对照）：**干净 + 零提交**的清了（目录与分支都没了）；**有未提交改动**的留、**有未合并提交**的留、**有活进程 cwd 在里面**的留（真 `fork`+`chdir`+`exec sleep` 当占用者，杀掉之后同一份扫描又能清掉它 —— 证明判据 ③ 真在判「活着」而不是碰巧被别的原因挡着）；`wt_reclaim_own` 清掉自己的空 worktree 后 `phase=DISCARDED` |
+| `worktree-reclaim` | P49 残留回收（真 git，逐条对照）：**干净 + 零提交**的清了（目录与分支都没了）；**有未提交改动**的留、**有未合并提交**的留、**有活进程 cwd 在里面**的留（真 `fork`+`chdir`+`exec sleep` 当占用者，杀掉之后同一份扫描又能清掉它 —— 证明判据 ③ 真在判「活着」而不是碰巧被别的原因挡着）；**孤儿分支**（目录已没、`worktree list` 列不到）零提交的清掉、有提交的留（这一条钉的是判据自己：断言查报告里**没有** `kept branch …(git refused)`，否则会被 git 的第二道闸门兜成假绿 —— 第一版就漏在这儿）；`wt_reclaim_own` 清掉自己的空 worktree 后 `phase=DISCARDED` |
 | `tui-model` | `/model` 与 `/effort` 浮层：分组标题、`✓` 只在当前行、只列公布档位 |
 | `ws-tool` | workspace 工具：失败状态不变、日志/索引写入、`/diff` 头短路径 |
 | `diff-git` | 真 git：XY 码/numstat、未跟踪/删除、`gd_refresh`、P36 跨文件跳转 |
@@ -1299,6 +1320,12 @@ DEEPSEEK_API_KEY=sk-xxx ./build/uya-agent \
   `/proc/*/cwd`，所以**扫不到别的 PID namespace / 别的机器**：容器里回收只认本 namespace 的进程，
   跨 namespace 的占用者会被当成「没人用」（这是本机工具的既有分界，不额外做跨 namespace 探测）。
   `git worktree lock` 的当「故意留着」，跳过不报错；清单里出现但目录已经没了的条目走 `prune`。
+* **孤儿分支回收的边界（P49）**：`/worktree reclaim` 的第二遍只认 `refs/heads/dsh/` 前缀下的
+  分支（人在这个仓库里手工建的分支一根汗毛都不动），判据只有「零提交」一条 —— 所以**分不出**
+  「一次没干活的会话留下的」与「人自己从 dsh/xxx 拉出来、还没提交的分支」，两者都会被删。
+  前缀可以改：`WT_BRANCH_PREFIX` 是 `worktreex.uya` 里的常量，换成你自己的私有前缀（例如
+  `me/`）就不会与人的分支撞名。还不做：孤儿分支的「上次活跃时间」判据（`branch -d` 不看你多久
+  没动它）、跨仓库扫描（一次只扫当前工作区所在的那个仓库）、`reflog` 过期清理。
 
 **访问模式、沙箱与 plan**
 
