@@ -354,7 +354,17 @@ src/selftest.uya   mock LLM + 130 轮断言 + --probe
 ### 提示词与上下文状态（P8）
 
 * system prompt 分节 persona(0) → plan 策略(50) → 工具引导(100–106) → **收敛纪律(107)**；persona 可来自 DSH preset。
-* **收敛纪律（P42）**：`SEC_FINISH` 一段，两条 —— ① 读结果里出现 `(End of file - total N lines)` 就说明整份已在上下文里，不要重读；② 项目验收命令（测试/构建/类型检查）跑绿即收工，最多再确认一次，不要自己另写验证脚本。措辞刻意限定在「文件已读全」「有可运行的验收命令」两种**可判定**情形，探索类任务不受约束。实测依据见 §6 的 P42 条（同一批 LSM 任务上，uya 默认在验收全绿之后还会自造额外验证脚本，多走 4–9 步）。
+* **收敛纪律（P42；第三条是本轮修复，不占阶段号）**：`SEC_FINISH` 一段，三条 —— ① 读结果里出现
+  `(End of file - total N lines)` 就说明整份已在上下文里，不要重读；② 项目验收命令
+  （测试/构建/类型检查）跑绿即收工，最多再确认一次，不要自己另写验证脚本；
+  ③ **清单要一起收口**：报「做完了」之前，真正做完的步骤必须都是 `completed`、
+  不许留 `in_progress` —— 陈旧清单算交付物的一部分，不是记账。措辞刻意限定在
+  「文件已读全」「有可运行的验收命令」「自己维护了清单」三种**可判定**情形，
+  探索类任务不受约束。实测依据见 §6 的 P42 条（同一批 LSM 任务上，uya 默认在验收
+  全绿之后还会自造额外验证脚本，多走 4–9 步）；第 ③ 条的动机是实测出来的：
+  `todo_write` 的工具描述（照搬 DSH 原文）说的是**事前**纪律（"mark … the moment
+  it is done"），而「完成」那一刻注意力已经跳到下一个动作上，事后没有任何东西回头看
+  —— DSH 的防线在 repeat-tool-reminder 与 session projection，uya-agent 两样都没有。
 * 运行时上下文是一条 user 消息，开头 `Current runtime context. This snapshot supersedes earlier runtime-context snapshots.`。
 * AGENTS.md：`$DSH_HOME/AGENTS.md` → 项目根到 cwd 逐级，按 `AGENTS.md → CLAUDE.md → AGENTS.local.md`；预算 65536 字节。
 * `todo_write` 回显 `Updated todo list: N pending, N in progress, N completed.`；非 plan 模式调 `exit_plan_mode` 报 `exit_plan_mode is only available in plan mode`。
@@ -947,6 +957,25 @@ src/selftest.uya   mock LLM + 130 轮断言 + --probe
    `/mouse` 与 `/fullscreen` 合成一个 `agent_cmd_display(line, which)`，自测的两个 helper 合进
    轮函数 —— 净增函数数压到 **0**（`tui_ov_box_w` 与 `agent_cmd_display` 复用了原有的名字槽位，
    另删掉 `tui_putn` / `tui_repeat` 两个死转发）。
+
+88. **「保持清单最新」的纪律只写在工具描述里 = 事后没人回头看**（本轮修复，不占阶段号）：
+   用户观察到「经常不更新任务状态」。查下来**不是措辞问题**：uya-agent 的 `todo_write`
+   描述与 DSH 的 `dsh-tool-todo` **逐字相同**（HEAD/PARALLEL/TAIL 三段全一致），
+   而 DSH 自己的 README 明说 *"the discipline of keeping the list current are left to the
+   model via the tool description"* —— 它刻意不写进 system prompt。**真正的差异在防线**：
+   DSH 还有 `dsh-repeat-tool-reminder`（看工具调用重复）与 session projection 兜着，
+   uya-agent **两样都没有**；而 `src/prompt.uya` 原有 8 节（read/write/edit/glob/grep/bash/
+   jobs/finish）**没有一节讲 todo**。
+   **为什么工具描述那句不够**：它说的是**事前**纪律（"mark a todo `completed` the moment it
+   is done"），而「完成」那一刻注意力已经跳到下一个动作上 —— 事后没有任何东西回头看。
+   本线自己就漏了 4 次（P50/P51/P52 各自做完没标、合并完也没标），形状完全一致。
+   **修法（最小、只改字符串、不占函数名额）**：`SEC_FINISH`（order 107，模型**收工前必读**
+   的那一段，已在管「别重读文件」「验收绿了就收工」两件同性质的事）加第三条：
+   报「做完了」之前真正做完的步骤必须都是 `completed`、不许留 `in_progress`，
+   陈旧清单算交付物的一部分。措辞同样**限定在可判定情形**（「自己维护了清单」）。
+   顺带给这一节补了三条断言（verdict 76/77/78）—— 它此前**完全没有自测覆盖**，
+   纯字符串常量被改坏不会有任何编译期信号；对照实验：把第三条改写成
+   "a stale list is fine" 后 `prompt-todo-plan` 当场红（verdict 78），不是假绿。
 
 =======
 ---
