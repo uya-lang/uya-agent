@@ -73,7 +73,7 @@ make tui-selftest  # 只跑 TUI 那几轮（改界面时最快）
 make sess-selftest # 只跑 /sessions 与大日志 meta 那几轮
 make codegen-audit # 扫构建产物：不许出现「切片描述符 → 字节指针」的强转（终端乱码源头）
 make probe         # 传输层探针：打真实 https 端点，期望 HTTP 401（不需要 key）
-# 离线 e2e（不需要网络）：e2e-permission / e2e-sandbox / e2e-tasks / e2e-goal / e2e-sessions / e2e-resume-big / e2e-watch
+# 离线 e2e（不需要网络）：e2e-permission / e2e-sandbox / e2e-tasks / e2e-goal / e2e-sessions / e2e-resume-big / e2e-watch / e2e-watch-pick
 
 ```
 
@@ -219,7 +219,7 @@ src/worktreex.uya  Git worktree P37：wt_provision / finish / discard、写闸�
 src/gitdiff.uya    /diff 数据模型 P28：status --porcelain -z + diff -U100000 HEAD
 src/diffx.uya      行级 diff（只服务显示）：LCS 60×60、截断
 src/tasks.uya      任务状态 P25：四表折叠成折叠行 / 箱体 / `/tasks` 文本
-src/watch.uya      P42 /watch：事件渲染（纯函数）+ 子代理会话日志的增量读
+src/watch.uya      P42 /watch：事件渲染（纯函数）+ 子代理会话日志的增量读；P46 现役清单行 → 编号（纯函数）
 src/view.uya       显示层：标题/参数/后缀表、单行转录、思考行、agents 面板
 src/agent.uya      CLI、历史、主循环、工具分发、REPL、会话事件
 src/selftest.uya   mock LLM + 126 轮断言 + --probe
@@ -262,6 +262,16 @@ src/selftest.uya   mock LLM + 126 轮断言 + --probe
   `f` 或 `End` 恢复；`esc`/`q` 关闭。子代理进终态时补一行 `[已结束 · <status> <n>s]` 并停止轮询。
 * **三条纪律**：不看不读（没有 active 的 watch 时一个字节都不读盘）；只读（绝不消费 `d.buf`，
   `subagent_output` 的增量游标不受影响）；内容没变就不重推。
+* **怎么开始跟随（P46）**：TUI 里裸 `/watch` 开的是**现役子代理清单**（`TUI_OVK_WATCH_LIST`，
+  标题写着手感：`跟随子代理（↑/↓ 选 · 回车跟随 · esc 关闭）`），**游标默认落在第一个代理行**上，
+  所以「打开就回车」= 跟随第一个；也可以 `↑/↓` 选到别的再回车。清单行 → 编号是纯函数
+  `watch_line_id`（表头里的 `sub-N` 因为 N 不是数字而不认，标签里的 `sub-x` 不抢先）。
+  带参数那条 `/watch sub-N` 一字节没变，仍然直接开跟随浮层。
+* **失败要有回执（P46）**：`agent_cmd_watch` 的返回值从 bool 换成落点码
+  （`WATCH_CMD_LIST` / `STARTED` / `STOPPED` / `BAD`）—— 旧口径把「已开始跟随」与「目标无效」
+  挤在同一格里，TUI 那条路分不出来只好把回执整段丢掉，于是 `/watch sub-9`（编号不存在）、
+  `/watch off` 在 TUI 里都是**一片静默**。现在 BAD/STOPPED 都落 notice，选中一个刚跑完的
+  子代理也会明说「没有 sub-N 这个子代理」。
 
 ### preset 旋钮与 make 目标（P13）
 
@@ -337,7 +347,7 @@ src/selftest.uya   mock LLM + 126 轮断言 + --probe
 
 * TTY 交互默认全屏（`--no-tui` 退回滚动；非 TTY / `--quiet` / 子代理自动退回）；`UYA_AGENT_TUI=0|1`、`--color=auto|always|never|16|256`、`--tui-demo [COLSxROWS]`。
 * 键位：`enter` 发送、`ctrl+j` / `alt+enter` 换行、`esc` 中断、`ctrl+c` 中断（2 秒内再按退出）、`ctrl+d` 退出、`shift+tab` 访问模式、`tab` plan、`ctrl+t` 任务块、`ctrl+p` 面板、**`F2` 切换鼠标上报**（关掉就能拖选复制文本，见踩坑 72 / `/mouse`）。
-* 浮层：命令面板 / 会话列表 / 帮助 / `/status` / `/goal` / `/watch` 跟随 / 访问模式 / bash 批准 / plan 审阅 / **提问弹窗（P43，框宽自适应 P45）**；`/` 触发面板后连 `/` 一起收走。
+* 浮层：命令面板 / 会话列表 / 帮助 / `/status` / `/goal` / `/watch` 跟随 / **现役子代理清单（P46，选中即跟随）** / 访问模式 / bash 批准 / plan 审阅 / **提问弹窗（P43，框宽自适应 P45）**；`/` 触发面板后连 `/` 一起收走。
 * **提问弹窗（P43，`ask_user_question`）**：模型在执行中问问题时弹一个浮窗（标题 = `header`，
   多题时带 `第 i/共 n 问`）——问题正文一行、编号选项（`▸ 1) label — description`）、一行
   `✎ 自定义回答`、一行按键提示。键位：`↑/↓`（`tab`/`shift+tab` 同效）移光标、`1-9` 直选、
@@ -414,7 +424,11 @@ src/selftest.uya   mock LLM + 126 轮断言 + --probe
 ### 跟随子代理的实时消息与 /watch（P42）
 
 * 子代理的过程消息走**会话日志**（事件粒度实时），不走管道（管道只有终态答复）。
-* 入口：`/watch sub-N` 开始/切换跟随、`/watch off` 停、裸 `/watch` 列现役子代理。
+* 入口：`/watch sub-N` 开始/切换跟随、`/watch off` 停、裸 `/watch` 列现役子代理
+  （TUI 里那份清单**选中即跟随**：游标默认在第一个代理行，回车就开跟随浮层，P46）。
+* 回合运行中敲 `/watch sub-N` 也**当场**生效：带参数那条同样只读（读子代理日志 + 开浮层，
+  一个字节都不写历史），所以它进了 `agent_tui_cmd_safe`，由泵点上的 `agent_steer_line()`
+  当场派发 —— 否则收件箱要等 step 边界（一个长 bash 里可能几十秒），屏幕上就是「敲了没反应」。
 * TUI 里是正文浮层（`TUI_OVK_WATCH`，复用 reader 型的滚动与按键，多一个贴尾跟随开关）；
   滚动模式 `--no-tui` 把新行**追加进转录**（append-only，等同 `tail -f`）。
 * 刷新挂在 1Hz 心跳、阻塞泵点与 TUI 空闲主循环三处；内容逐字节比，没变就不重画。
@@ -585,6 +599,12 @@ src/selftest.uya   mock LLM + 126 轮断言 + --probe
 70. **`--dsh-root` 与 `--dsh-home` 同类：决定「去哪儿读文案」，必须在预扫里生效**（P44）：主循环那次完整 CLI 解析排在 DSH 加载之后，而 `agent_texts_ensure()` 是**幂等的一次性**初始化（`g_texts_ready`），一旦在解析之前被叫过，`cfg.dsh_root` 就永远是空的 —— 症状是 flag 静默无效、persona 仍来自默认 preset 树，而环境变量 `UYA_AGENT_DSH_ROOT` 却正常（那条路在 `preset_path()` 里直接读 env）。判据：同时给 env 和 flag 各指一个**文案不同**的 preset 树，看哪个生效。**孪生一条：相对路径也静默失效** —— 这个值要到「第一次构 system prompt」才被读，那时进程已不在启动时的 cwd，所以 `--dsh-root testdata/x` 读不到、`--dsh-root $PWD/testdata/x` 才读到；修法是解析时就补成绝对路径（`cfg_set_dsh_root()`，预扫与主循环共用）。与踩坑 25 同因；回归补在 `e2e-config-flags`。
 71. **completions 不发 `reasoning_effort` = 静默丢弃用户配置**（P44）：`--effort` / `--reasoning-effort` / DSH 的 `agent-default-model.reasoningEffort` 三条路径的值都进了 `cfg.reasoning_effort`、`--print-config` 也照实显示，但 `build_chat_request` 里没有那一段，于是**默认的 openai-completions 路由上模型按网关默认档思考**，用户配的 `max` 没有落到线上，也没有任何提示。同一份设置下 DSH 是发的（实测抓包 `reasoning_effort: "max"`），所以「uya 比 DSH 省」这类对比会掺进一个与 harness 无关的混杂项（实测偏差 41%）。修法：与 responses 同一条门槛（`cfg.api_reasoning`）发顶层 `reasoning_effort`，字段放最后以保住前缀缓存。**注意效果依网关而异**：官方端点同任务 `max` vs `off` 的 reasoning 占输出 51% vs 27%，autodl 网关 12% vs 17%（该网关不认这个字段）——收益主要是「配置不再说谎」，不是省钱。
 72. **「TUI 里不能拖选复制文本」是鼠标上报的代价，不是渲染坏**（本轮修复，不占阶段号）：P25 为了让滚轮不被 xterm.js 伪装成 ↑/↓，**无条件**开了 `ESC[?1000h`+`ESC[?1006h`；而终端只要把鼠标交给我们，**它自己的拖选就没了** —— 左键按下/拖动全变成 `ESC[<b;x;yM` 事件灌过来，TUI 只吃滚轮（`b` 的 bit6）、其余**丢弃**（`tui_mouse_finish()`），于是拖选期间屏幕上什么都不动、PRIMARY 一个字节都不变。真机实测（deepin-terminal / qtermwidget，即用户环境）：同一块屏幕、同一个拖拽轨迹，**鼠标上报开着时拖选后 PRIMARY 仍是旧值（等于没有选中），手动发一条 `?1000l?1006l` 关掉之后立刻拿到 TUI 正文的文本**；再把 `?1000h?1006h` 发回去又选不动 —— 这一对对照就是根因的判据（render 与选区无关，屏幕重画也不会清掉已选区，实测 T+3 s 仍在）。所以这不是「哪一行画错了」，而是**一个必须可逆的开关**：修法是把鼠标上报做成可关的（`g_tui_mouse` + `tui_set_mouse()`，`tui_term_enter` 按开关发序列、运行中切换当场写 `1000h/1006h` 或 `1006l/1000l`），默认仍开（滚轮口径一字节不变），出口给三个：`F2`（`ESC O Q`，也认 `ESC[12~`）、`/mouse on|off`、启动期 `--no-mouse` / `UYA_AGENT_MOUSE=0`。**取舍写清楚**：关掉之后滚轮交给终端（不再翻转录），翻滚录用 `ctrl+↑/↓`（`ESC[1;5A/B` 那条已修好的路）或 `pgup/pgdn`；不想关也可以在开着时**按住 shift 拖选**（多数终端把这个当本地拖选）。防假绿对照实验：①`tui_term_enter` 改成忽略开关、恒发 `1000h` 重编 → `tui-mouse` 的 D4 当场红（`--no-mouse` 会失效）；②删掉 F2 的 SS3 映射 → B 段红；③`tui_set_mouse` 去掉运行中那段写序列 → D2/D3 红；④启动处把 `tui_set_mouse(cfg.mouse)` 写成恒 `true` → 真 PTY 那条腿红（`mouse=false` 的捕获里仍有 `1000h`）。**与既有口径的一致性**：这是「显式开关」而不是「猜终端」——不去探测、不自动关，因为关掉就等于放弃滚轮，必须由人决定。
+
+73. **「选中一个代理」与「敲 `/watch sub-1` 没反应」是同一种坑：结果没人接 + 只读命令被当成给模型的文本**（P46）：用户报「输入 /watch 选代理没反应」「/watch sub-1 也没反应」，真机（真 PTY + 假网关 + `build/uya-agent`）复现出**三条各自独立**的静默路 ——
+    ① 裸 `/watch` 的现役清单一直用 `tui_overlay_list(TUI_OVK_TASKS, …)` 开，与 `/tasks` 共用 kind，而那个 kind 在接收端的语义是「纯查看，enter 不派发」：主循环的结果分发只认 PALETTE / SESSIONS / ACCESS(_CONFIRM) / MODEL / EFFORT / WORKTREE(_CONFIRM)，**没有 TASKS 分支**，于是 `tui_overlay_take()` 把选中行取走 → 落到链尾 `continue` → **静默丢弃**。实测：`/watch` → 清单里 `sub-1 [running]` 在屏上 → ↓ 选中它 → 回车 ⇒ 浮层关掉、没有跟随浮层、没有 notice（三个判据 `list_gone=True` / `follow_opened=False` / `notice=False`）。
+    ② `agent_cmd_watch` 只回 bool，「已开始跟随」与「目标无效」挤在同一格 ⇒ TUI 那条路分不出来，只好把回执整段丢掉：`/watch sub-9`（编号不存在）、`/watch off` 在 TUI 里都是**一片静默**（实测 `bad_target_visible=False`）；目标写错时连「用法」提示都看不到。
+    ③ 回合运行中敲 `/watch sub-1`：`agent_tui_cmd_safe()` 在 steer 那条路上拿到的是**整行**、而它按整行相等匹配 ⇒ 不在只读集合里 → 被当成用户文本推进 steer 收件箱（模型收到一句 `/watch sub-1`）；而**就算它进了集合也不够** —— 提交队列只有两个消费者（`llm_pump_input` 在流式开始时、主循环在回合结束时），「等响应头」那一段（`hc_open` 的 poll 泵点）两个都轮不到。实测把网关按住 12 s：第二次回车之后 1.2 / 5 / 10 s 屏幕上都**没有**跟随浮层，直到回合收工才开出来 —— 这正是「趁子代理在跑时想看它」最需要的那一段。
+    修法：①清单换成自己的 kind `TUI_OVK_WATCH_LIST`，主循环**与泵点**两条分支收它的结果（选中行 → 纯函数 `watch_line_id` 取编号 → `agent_watch_start`），游标默认落在**第一个代理行**（第 0 行是表头，不放的话「打开就回车」只会得到一句「没认出编号」）；②返回值换成落点码 `WATCH_CMD_LIST/STARTED/STOPPED/BAD`，BAD 与 STOPPED 在 TUI 里落 notice（滚动模式照旧打回执）；③带参数的 `/watch` 进只读集合，泵点上由 `agent_steer_line()` 当场派发 —— 并为此补了 `tui_peek_submit()` + `agent_pump_submitted_cmd()`：**只读命令**用掉队列里那一行，其余行一个字节都不动（留给流式循环的 `TTY_EV_SUBMIT` 语义）。顺带把两处**测试自身的假绿**也修了：④假网关按「`WATCH_MARK` 在不在请求里」判父子，而助手那条 `tool_calls` 的**参数里会回显提示词**（实测父代理第 2 条请求里 MARK 计数 = 1）⇒ 父代理的收尾请求被误判成子代理收尾，`PARENT_HOLD_SECS` 那个「把父代理按住」的窗口根本没生效，`--mode running` 那条腿连旧代码都能「过」；改成按「父代理那句任务在不在请求里」判（网关日志回到 `REQ #2 kind=parent-final` + `HOLD parent-final 12s`）。⑤P42 的两个 selftest 轮（`watch-render` / `watch-poll`）的返回值 `wch0`/`wch1` **声明了却没进 `SELFTEST PASS` 的聚合条件** —— 渲染改坏整套 selftest 照样绿；现在 `wch0 && wch1 && wch2` 都在条件里（对照：把 `watch_line_id` 改成恒 `true` 重编 → `watch-pick-parse` 红 8 条 + `SELFTEST FAIL`）。
 
 ---
 
@@ -772,6 +792,9 @@ DEEPSEEK_API_KEY=sk-xxx ./build/uya-agent \
 | `watch-render` | P42 `/watch` 事件渲染纯函数：`[step N]`（step 是数字）、`▸ 工具 参数`、`  ← 结果`、`✻ 思考 · 首行`、`⏺ 正文首行`、只有 tool_calls 的消息不单出一行、`step/end` 与未知类型静默跳过 |
 | `watch-poll` | P42 `/watch` 增量读：分批写文件只取新增、**半行不吐**（补齐后才出现）、没有新字节时一个字节都不重渲染 |
 | `watch-e2e` | `make e2e-watch`：真终端 + 假网关派一个「先思考、再跑 `sleep 8` bash」的子代理，`/watch sub-1` 后 `[step …]` 与 `▸ bash …` 必须**在子代理结束之前**上屏 |
+| `watch-pick-parse` | P46 现役清单行 → 编号（纯函数）：`  sub-12 [running] …` 整段取两位数、标签里的 `sub-3` 不抢先、表头的 `sub-N`（N 不是数字）与空态行都不认、认出的编号必须能过 `deleg_id_parse` |
+| `tui-watch-pick` | P46 清单浮层的 kind 是自己的 `TUI_OVK_WATCH_LIST`（借 `/tasks` 的 kind ⇒ 回车的结果被静默丢掉）+ 默认游标落在第一个代理行（喂一份带表头的清单给 `agent_watch_list_first_row`）+ 回车交出选中行原文 + 三条失败路都有回执（表头行、刚跑完的编号、`/watch sub-9`）+ 三种落点码 + 带参数的 `/watch` 在只读集合里 |
+| `watch-pick-e2e` | `make e2e-watch-pick`：真终端 + 假网关两条腿 —— ①裸 `/watch` → 清单 → **一次回车**开跟随浮层（`[step …]`/`▸ bash …` 仍在子代理结束之前上屏）；②假网关把父代理的收尾按住 12 s，期间敲 `/watch sub-1` 必须**当场**开浮层（屏幕上还没有 `PARENT-DONE-OK`） |
 | `session-log` | 控制字节按字节往返、半条记录 `dropped_tail`、重建历史 |
 | `json-escape` | `0x00…0x1f` 全转义、无裸控制字节、`jw_key` 同规则 |
 | `ctrl-bytes` / `ctrl-bytes-resp` | mock mode 23：`printf 'A\000B'` 以 `\u0000` 回请求；判定码 240 |
@@ -791,11 +814,11 @@ DEEPSEEK_API_KEY=sk-xxx ./build/uya-agent \
 **验证用的 make 目标与快捷入口**
 
 - 总闸门：`make selftest`（离线，含 `p30-check` 与全部轮次，SELFTEST PASS / 退出 0）、`make e2e`（真网关）。
-- 离线配套：`make check`（A1 类型检查）/ `build`（A2 产出 `build/uya-agent`）/ `codegen-audit` / `tui-selftest` / `shell-selftest` / `e2e-config-flags` / `e2e-api` / `e2e-steps` / `e2e-permission` / `e2e-sandbox` / `e2e-tasks` / `e2e-goal` / `e2e-sessions` / `e2e-resume-big` / `e2e-title` / `e2e-model` / `e2e-worktree` / `e2e-diff` / `e2e-watch` / `diff-selftest` / `panel-selftest` / `e2e-ws`。
+- 离线配套：`make check`（A1 类型检查）/ `build`（A2 产出 `build/uya-agent`）/ `codegen-audit` / `tui-selftest` / `shell-selftest` / `e2e-config-flags` / `e2e-api` / `e2e-steps` / `e2e-permission` / `e2e-sandbox` / `e2e-tasks` / `e2e-goal` / `e2e-sessions` / `e2e-resume-big` / `e2e-title` / `e2e-model` / `e2e-worktree` / `e2e-diff` / `e2e-watch` / `e2e-watch-pick` / `diff-selftest` / `panel-selftest` / `e2e-ws`。
 - PTY 场景：`make p30-check`（`testdata/pty_drive.py --suite`，8 个场景；P41 那场 `worktree-menu` 走
   两条入口 —— 命令面板里选中 `/worktree` 与裸 `/worktree` —— 到选择框 → ↓ 到 `finish` → 确认框 →
   回车取消，`PTY_DUMP=1` 会把两张框打出来）；
-  `make tui-demo` 是排版基准，各阶段只差脚注版本串（`p22-tasks` … `p45-askw`）。
+  `make tui-demo` 是排版基准，各阶段只差脚注版本串（`p22-tasks` … `p46-wpick`）。
 - 只跑子集的开关：`UYA_SELFTEST_TUI_ONLY`、`UYA_SELFTEST_PERM_ONLY=1`（P21+P26）、`UYA_SELFTEST_GOAL_ONLY=1`（P29）、`UYA_SELFTEST_SHELL_ONLY=1`（P38）、`UYA_SELFTEST_PANEL_ONLY=1`（P15+P40，`make panel-selftest`）。
 - 探针：`make probe BASE=https://api.deepseek.com/v1` 期望 HTTP 401 + leaf 指纹。
 
@@ -862,6 +885,18 @@ DEEPSEEK_API_KEY=sk-xxx ./build/uya-agent \
   红 2 条；③提示行改成永不退让重编 → 红 4 条（含老段的「没有按键提示」）；④不夹 `max_w` 重编 →
   红 8 条（含「有行的显示宽度超过终端列数」）。`--tui-demo` 只在脚注版本串那 1 行变化（`p43-ask` →
   `p45-askw`），`tui-ask` 其余三段（太矮回落 / headless dismissed / 真 PTY label 回模型）不受影响。
+- P46：`/watch` 的**现役清单选中即跟随** + 把三条「敲了没反应」的静默路一起堵掉（清单 kind、落点码、
+  只读命令在泵点当场派发；细节见踩坑 73）。真 PTY + 假网关的两条腿（`make e2e-watch-pick`）实测：
+  ①`pick`：裸 `/watch` → 清单（标题带「回车跟随」、游标已在 `sub-1` 那一行、回车后没有「没认出编号」
+  的 notice）→ **一次回车** 1.2 s 开跟随浮层，`[step …]` / `▸ bash …` 0.3 s 就上屏；
+  ②`running`：假网关把父代理的收尾**按住 12 s**（网关日志 `REQ #2 kind=parent-final` + `HOLD parent-final 12s`），
+  期间敲 `/watch sub-1`（面板拦一道 → 提示「再按一次回车」→ 第二次回车派发）→ **1.2 s** 开跟随浮层，
+  当时屏幕上还没有 `PARENT-DONE-OK`。对照实验（防假绿）：①旧二进制（`git checkout -- src/` 重编）+
+  同一套判据 → `pick` 腿红 6 条（清单标题没提示、选中后没有跟随浮层、连实时事件都看不到）、
+  `running` 腿红 2 条（没有「再按一次回车」提示、回合还没收工就是不开浮层）；②把 `watch_line_id` 改成
+  恒 `true` 重编 → `watch-pick-parse` 红 8 条且 `SELFTEST FAIL`（这条同时证明「watch-* 轮的返回值真的
+  接进了聚合条件」——P42 那两个轮原本**没接**，见踩坑 73 ⑤）；③把假网关的父子判据改回「`WATCH_MARK`
+  在不在请求里」→ `running` 腿变成假绿（旧代码也「过」），因为助手那条 `tool_calls` 的参数里会回显提示词。
 - 其它：自测幂等（连跑两次都 PASS）；A1–A6 全部通过；技能与 `web_search`、自动压缩、后台任务、文件工具、DSH 零参数启动、跨进程会话恢复（记住 4271）都在真机验收过。
 
 - 踩坑 72（TUI 里能复制文本）：真机（deepin-terminal / qtermwidget，即用户环境）A/B —— 同一块屏幕、同一条拖拽轨迹（`xdotool` 驱动），鼠标上报**开着**时拖选之后 `PRIMARY` 仍是旧值（= 没选中）、TUI 正文一个字符都拿不到；手动发 `?1000l?1006l` 关掉后拖同一段立刻拿到屏幕文本；再发 `?1000h?1006h` 又选不动。屏幕重画不会清掉已选区（选中后等 3 s 仍在），所以与渲染/重绘无关。修法见踩坑 72；`make e2e-mouse` 钉配置来源链（默认 env/cli + CLI 优先 + 滚动模式 `/mouse` 说明），`tui-mouse` 轮钉开关语义、F2 两种编码、字节级四个方向与真 PTY 两个方向。防假绿对照实验四条（`tui_term_enter` 忽略开关 / 删 F2 映射 / `tui_set_mouse` 去掉运行中写序列 / 启动处恒 `true`）都当场红。
@@ -891,8 +926,8 @@ DEEPSEEK_API_KEY=sk-xxx ./build/uya-agent \
   只有在前台跑（交互模式）才有。
   另外：`/watch` 是**进程状态**（`--resume` 不回填）；被跟随的子代理跑完或槽位被回收时跟随自动
   结束；`ralph` 跟随的是**当前轮**的日志，换轮时插一行 `[轮次切换]` 并从新日志头开始读。
-* **回合运行中的界面命令（P23 → P30 → P31）**：只读命令（`/status`、`/help`、`/tasks`、
-  `/sessions`、`/goal`、`/diff`、裸 `/watch`）在每个泵点当场派发并当场画一帧；`/new`、`/resume` 立刻回执并
+* **回合运行中的界面命令（P23 → P30 → P31 → P46）**：只读命令（`/status`、`/help`、`/tasks`、
+  `/sessions`、`/goal`、`/diff`、`/watch`（**含** `/watch sub-N`，P46））在每个泵点当场派发并当场画一帧；`/new`、`/resume` 立刻回执并
   先中断当前回合（历史保留），`/compact` 排 step 边界，`/continue`、`/exit` 与其余命令等回合结束
   （steer 仍是「运行中输入的文本在下一个 step 边界被采纳」）。**插不进泵点的只有两段**：
   DNS 解析（≤5 s）与 TLS 握手（≤`timeout_ms`），都在工具链调用内部。

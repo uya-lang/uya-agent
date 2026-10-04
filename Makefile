@@ -32,7 +32,7 @@ TASK ?= 创建 hello.uya，编译并运行它
 export UYA_ROOT
 export UYA_SPLIT_C_DIR := $(CURDIR)/build/uyacache
 
-.PHONY: all check build selftest codegen-audit probe e2e e2e-config e2e-config-flags e2e-title e2e-mouse e2e-api e2e-steps e2e-permission e2e-sandbox e2e-tasks e2e-goal e2e-sessions e2e-resume-big e2e-diff e2e-ws e2e-model e2e-worktree e2e-watch e2e-dsh p30-check tui-demo tui-selftest sess-selftest diff-selftest model-selftest panel-selftest clean shell-selftest
+.PHONY: all check build selftest codegen-audit probe e2e e2e-config e2e-config-flags e2e-title e2e-mouse e2e-api e2e-steps e2e-permission e2e-sandbox e2e-tasks e2e-goal e2e-sessions e2e-resume-big e2e-diff e2e-ws e2e-model e2e-worktree e2e-watch e2e-watch-pick e2e-dsh p30-check tui-demo tui-selftest sess-selftest diff-selftest model-selftest panel-selftest clean shell-selftest
 
 all: build
 
@@ -487,6 +487,31 @@ e2e-watch: build
 	[ -n "$$port" ] || { echo "FAIL: 假网关没打印端口"; cat $$ws/gw.log; exit 1; }; \
 	UYA_BIN=$(OUT) python3 testdata/pty_drive_watch.py --port $$port --workspace $$ws; \
 	echo "e2e-watch: 通过（/watch 在子代理结束前就读到 [step]/▸ bash）"
+
+# P46：/watch 现役清单「选中即跟随」+ 回合运行中当场派发（真终端 + 假网关；离线，不联网）
+#   判据（同一条脚本的两条腿，见 testdata/pty_drive_watch.py）：
+#     pick    ：裸 /watch → 清单浮层（游标默认落在第一个代理行）→ **一次回车**就开跟随浮层，
+#               且 `[step …]` / `▸ bash …` 仍在子代理结束之前上屏；
+#     running ：假网关把父代理的收尾按住 12 s（响应头都不发），这段时间里敲 /watch sub-1
+#               → 必须**当场**开跟随浮层（屏幕上还没有 PARENT-DONE-OK），而不是等回合结束。
+#   对照旧行为：①清单借 /tasks 的 TUI_OVK_TASKS kind ⇒ 回车交出的行没人接、被静默丢掉
+#   （「选中一个代理」= 什么都没发生）；②回合运行中敲的 `/watch sub-1` 在 step 边界那条路上
+#   整行匹配不上安全集，被当成给模型的文本 —— 两条都是「敲了没反应」。
+e2e-watch-pick: build
+	@set -e; \
+	ws=build/selftest_p46_watchpick; rm -rf $$ws; mkdir -p $$ws; \
+	python3 testdata/mock_gateway_watch.py 0 10 0 > $$ws/gw-pick.log 2>&1 & \
+	gw1=$$!; \
+	python3 testdata/mock_gateway_watch.py 0 10 12 > $$ws/gw-run.log 2>&1 & \
+	gw2=$$!; \
+	trap "kill $$gw1 $$gw2 2>/dev/null || true" EXIT; \
+	sleep 1.2; \
+	p1=$$(awk '/^PORT/{print $$2}' $$ws/gw-pick.log); \
+	p2=$$(awk '/^PORT/{print $$2}' $$ws/gw-run.log); \
+	[ -n "$$p1" ] && [ -n "$$p2" ] || { echo "FAIL: 假网关没打印端口"; cat $$ws/gw-*.log; exit 1; }; \
+	UYA_BIN=$(OUT) python3 testdata/pty_drive_watch.py --port $$p1 --workspace $$ws/pick --sleep 10 --mode pick; \
+	UYA_BIN=$(OUT) python3 testdata/pty_drive_watch.py --port $$p2 --workspace $$ws/running --sleep 10 --mode running --parent-hold 12; \
+	echo "e2e-watch-pick: 通过（清单一次回车即跟随 + 回合运行中当场开跟随浮层）"
 
 # P33/P35：/sessions 列表（离线，行式 REPL 走真二进制）：三列 = 标题 / 工作区 / session id，
 # 同 id 只留最后一条；**P35 起最新的排最后一行**（`--list-sessions` 与 `/sessions` 同一份）。
