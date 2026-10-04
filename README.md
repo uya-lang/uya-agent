@@ -1,12 +1,14 @@
 # uya-agent — 纯 Uya 写的极简 CLI 编程 agent
 
 一个**只用 Uya 源码**实现的命令行编程 agent：给它一句话任务，它自己看文件、改文件、跑命令，
-多轮 loop 直到给出结论。48 个 `.uya` 文件，**不引入任何 C 代码、`@c_import` 或其它语言**，
+多轮 loop 直到给出结论。50 个 `.uya` 文件，**不引入任何 C 代码、`@c_import` 或其它语言**，
 只依赖 Uya 语言与随编译器分发的标准库。
 
-**P0–P49 全部完成**，主线版本串 `p49-reclaim`。本节之后按能力域分节，各节标题保留对应的阶段号
-（P0…P49）；设计取舍、踩坑记录与逐阶段验收分别见 §3 与 §6，代码地图见 §2。
+**P0–P52 全部完成**，主线版本串 `p52-paste`。本节之后按能力域分节，各节标题保留对应的阶段号
+（P0…P52）；设计取舍、踩坑记录与逐阶段验收分别见 §3 与 §6，代码地图见 §2。
 「TUI 里能拖选复制文本」是修复、**不占阶段号**，记踩坑 72（见 §3）。
+本线（P50–P52）做**剪贴板粘贴**：多行文本修好了（踩坑 83）、图片能挂给多模态模型、
+`ctrl+v` / `/paste` 走纯 Uya 的 X11 客户端读剪贴板。
 
 真机转录节选（`--show-reasoning`；`✻ 思考` 交互模式下先在提示符那一行滚动、块结束才落成一行，
 非交互（管道）没有实时行，只有结算的那一行）：
@@ -190,7 +192,11 @@ src/httpc.uya      传输层：URL/DNS/TLS、请求构造、leaf 指纹
 src/httpstream.uya 流式传输：只读响应头，body 增量解码
 src/sse.uya        SSE 分帧：字段行、多行 data、空行 dispatch
 src/llm.uya        两种协议归一成 ChatOut（chat/completions 与 /v1/responses）
-src/tools.uya      P0 死代码：read_file / write_file / run_shell
+src/imgx.uya       P51 图片附件（纯函数）：魔数嗅探 + 尺寸解析（PNG IHDR / JPEG 段链 /
+                   GIF / WebP 三变体，只读文件头）+ 预算判定 + 内容寻址落盘 + base64 +
+                   附件表（路径 + 元数据，JSON 往返）+ 占位文案
+src/clipx.uya      P52 剪贴板（纯 Uya 的 X11 客户端）：DISPLAY/Xauthority 认证 + setup 握手 +
+                   InternAtom/CreateWindow/ConvertSelection/GetProperty（含 INCR）
 src/tty.uya        终端层：termios raw、行编辑器、面板块、标题栈、诊断转义
 src/sigx.uya       信号层：自绑 sigaction、终止信号先还终端、SIGWINCH 置标志
 src/tui.uya        全屏 TUI：帧 diff、转录、浮层、状态区、任务块、翻看、鼠标上报开关（F2 / /mouse）；
@@ -303,6 +309,34 @@ src/selftest.uya   mock LLM + 130 轮断言 + --probe
 * `subagent` / `subagent_fork`（继承父已完成轮次），`run_in_background` 默认 true；配套 `list_agents` / `subagent_output`（增量，`wait=true`）/ `send_message` / `interrupt_agent`（SIGKILL）。
 * `ralph` 每轮新会话，报告以 `RALPH: COMPLETE|BLOCKED|CONTINUE` 结尾；`create_goal` / `get_goal` / `update_goal` 落 `<agent_home>/goal.json`。
 
+### 剪贴板粘贴：多行文本 + 图片（P50–P52）
+
+* **多行文本（P50，修复）**：括起粘贴（bracketed paste）以前**从未生效过** ——
+  `tui_esc_final` 在内部把状态置成「粘贴中」之后，两个调用点又各补了一句无条件
+  `g_tui_esc = 0`，粘贴态被当场冲掉。症状：粘 3 行会**逐行提交**（只留最后一行）、
+  粘贴里的 TAB 变成 plan 模式开关。LF 恰好与裸 LF 等价，所以老自测（喂 LF）一直是绿的。
+  现在 CR / LF / CRLF 一律折成一个换行，TAB 与其它控制字节是字面内容，粘贴里的
+  ANSI 序列逐字节保留（旧实现会丢数字：`ESC[31m` → `ESC[m`）。
+* **输入上限**：65536 → 200000 字节（对齐 `MSG_CONTENT_MAX`），超限**提示一次**而不是静默丢弃。
+* **输入行显示清洗**：输入缓冲保持逐字节原样，但帧里不许出现 ESC/TAB/NUL
+  （粘贴带 TAB 的代码时列宽不再错、光标不再与屏幕错开）。
+* **图片（P51）**：`/image <路径>` 或剪贴板贴图把图挂到下一条消息。请求体里是**内联 base64**
+  （completions 的 `content` 数组 + `image_url`；responses 的 `input_image`）。
+  终端不渲染图片，所以每个附件有一行占位（`⎿ 图片 image/png 1024×768 · 512.0 KiB · shot.png`）。
+  附件字节**内容寻址**落在 `<agent_home>/attachments/<sha256>.<ext>`，历史与会话日志里只存
+  路径 + 元数据（`attachments` 数组），`--resume` 能把图一起带回来。
+* **预算与拒绝**：字节 / 像素两道预算（缺省 8 MiB / 640000 像素）。**纯 Uya 没有图片编码器**
+  （stdlib 里没有 zlib/deflate），所以缩不小 —— 超预算只能**明确拒绝**并说清超了多少，
+  让人自己压一下再来。当前模型 `input` 不含 `image` 时也直接拒（收了只会让请求 400）。
+* **剪贴板（P52）**：`ctrl+v`（TUI）与 `/paste`（两种模式）。本机没有 `xclip`/`xsel`/`wl-paste`，
+  所以是一个**纯 Uya 的 X11 客户端**（`src/clipx.uya`）：`DISPLAY` 解析 → `~/.Xauthority` 的
+  MIT-MAGIC-COOKIE-1 认证 → setup 握手 → `InternAtom` / `CreateWindow`(InputOnly) /
+  `GetSelectionOwner` / `ConvertSelection` / `GetProperty`（含大数据的 `INCR` 增量）。
+  目标优先级 `image/png` → `jpeg` → `gif` → `webp` → `UTF8_STRING`；图片走附件管线，
+  文本**插进输入行不提交**（可以接着编辑）。每一步独立超时并泵界面，读不到就明确回一句。
+* **边界（如实写）**：只支持 X11 的 unix socket（不做 TCP 转发、不做 Wayland 原生协议）；
+  终端内不渲染图片；不支持图片缩放/重编码；加图会让该请求的 KV 前缀缓存失效（成本上升）。
+
 ### 技能与联网搜索（P10）
 
 * 技能发现根：`<项目根>/.dsh/skills` → `.agents/skills` → `--skill-dir` → `$DSH_HOME/skills` → `$DSH_AGENTS_HOME|~/.agents/skills`。
@@ -359,6 +393,7 @@ src/selftest.uya   mock LLM + 130 轮断言 + --probe
 
 * TTY 交互默认全屏（`--no-tui` 退回滚动；非 TTY / `--quiet` / 子代理自动退回）；`UYA_AGENT_TUI=0|1`、`--color=auto|always|never|16|256`、`--tui-demo [COLSxROWS]`。
 * 键位：`enter` 发送、`ctrl+j` / `alt+enter` 换行、`esc` 中断、`ctrl+c` 中断（2 秒内再按退出）、`ctrl+d` 退出、`shift+tab` 访问模式、`tab` plan、`ctrl+t` 任务块、`ctrl+p` 面板、**`F2` 切换鼠标上报**（关掉就能拖选复制文本，见踩坑 72 / `/mouse`）。
+  P52 起多一条 **`ctrl+v` 贴剪贴板**（`/paste` 同效）：有图就挂附件、有文本就插进输入行。
 * 浮层：命令面板 / 会话列表 / 帮助 / `/status` / `/goal` / `/watch` 跟随 / **现役子代理清单（P46，选中即跟随）** / 访问模式 / bash 批准 / plan 审阅 / **提问弹窗（P43，框宽自适应 P45 + 踩坑 81）**；`/` 触发面板后连 `/` 一起收走。
 * **提问弹窗（P43，`ask_user_question`）**：模型在执行中问问题时弹一个浮窗（标题 = `header`，
   多题时带 `第 i/共 n 问`）——问题正文、编号选项（`▸ 1) label — description`）、一行
@@ -799,6 +834,46 @@ src/selftest.uya   mock LLM + 130 轮断言 + --probe
    `tui_set_size` 缩窗那一段才逮住）；⑤ 共享槽位不清洗 → `tui-frame` 的确认浮层那两条红
    （同样是补测之后才有的覆盖）。
    `--tui-demo` 与修前**逐字节相同**（50391 B：这是浮层内的排版，demo 不画浮层）。
+83. **「下一个状态」写在被调用方、清零写在调用方 = 整个状态机从未生效**（P50，本轮修）：
+  括起粘贴（`ESC[200~` … `ESC[201~`）在 TUI 里**一次都没生效过**：`tui_esc_final(c)` 的
+  `a == 200` 分支把 `g_tui_esc` 置成 5（粘贴中）之后 `return`，而两个调用点在它返回后又各写了
+  一句无条件 `g_tui_esc = 0` —— 状态当场被冲掉。**症状**：粘 3 行 → CR 被当成回车**逐行提交**
+  （三条 user 消息，屏幕上只留最后一行）；粘贴里的 TAB → 切换 plan 模式。
+  **为什么老自测没抓到**：自测喂的是 **LF**，而不通粘贴态时裸 LF 也走 `TUI_K_NEWLINE` ——
+  两者恰好等价，唯一的差别（CR 提交 / TAB 切模式）一条都没被覆盖。判据是**可判定的**：
+  `ESC[200~` + `A1\rA2` + `ESC[201~`，修前得到一条 `A1`（CR 提交了），修后是一条两行的输入。
+  **修法**：下一个状态由 `tui_esc_final` 自己定（函数开头默认清零，需要停在别的状态的分支
+  自己覆盖），调用点不再补清零。同族的两处一起修了：粘贴收尾标记改成**逐字节前缀匹配**
+  （旧实现复用 CSI 数字累加器，`ESC[31m` 这类 ANSI 序列会被吞掉数字），以及断流时
+  （buffer 正好断在 `ESC` / `ESC[20`）把攒下的字节吐回输入而不是静默吞掉。
+  **本轮又踩了两次「手数字面量长度」**（踩坑 77 同族）：`"session.jsonl"` 写成 12（实际 13）、
+  `"\"type\":\"user/message\""` 写成 23（实际 21）—— 两处都是「断言永远匹配不上」，
+  且都发生在**自测代码**里，产品代码是对的。教训与 77 相同：长度要么用 `bufx_cstr_len` 求，
+  要么当场核对。
+
+84. **纯 Uya 没有图片编码器 ⇒ 图片只能「接受原图」或「明确拒绝」**（P51）：stdlib 里没有
+  zlib/deflate，也没有 JPEG 编解码，所以**没法缩放或重压**图片。DSH 会把超预算的图重新编码到
+  预算内，我们只能拒绝并说清超了多少（「图片像素太多（4032×3024 > 上限 640000 像素）——
+  纯 Uya 没有图片编码器，缩不小，请自己压一下再来」）。这条**不是取舍而是事实**，所以预算
+  判定必须发生在**下载/读取之后、构请求之前**（`imgx_check`），且两个协议的内联形状
+  （completions 的 `image_url` 对象 / responses 的 `input_image` + `detail`）要用**抓包**核对，
+  不能照抄文档（实测网关两种都收，但形状不同）。
+
+85. **X11 协议：五个「差一格」全都会表现成同一个症状 ——「什么都读不到」**（P52）：手写 X11
+  客户端时踩到的坑**彼此独立**，但现象全都是「剪贴板读不到」：
+  ① `CreateWindow` 是**无应答**请求，等应答会一直等到超时（要用一条有应答的请求做 sync）；
+  ② 请求长度字段是「**含头与自己补的 pad** 的 4 字节单位数」，先算 body 的 pad 再加头会少算一格；
+  ③ `InternAtom` 的 `only_if_exists` 走请求头的 **data 字节**，不是体里的第一个字节；
+  ④ `GetProperty` 的 `delete` 同理走 data 字节（体里只有 5 个 u32）；塞进体里会让服务端把
+     window 解成 delete、其余全错位；
+  ⑤ 事件消息的第 0 字节**就是事件类型**，且 requestor 与 owner 不同源时会带上 **SendEvent 位
+     （0x80）**：`SelectionNotify` 读成 159 —— 直接比对 `== 31` 就永远等不到。要 `& 0x7f`。
+  外加两条：`GetProperty` 应答里 `bytes-after` 与 `n-items` 的偏移容易读反（**最后改成直接信
+  应答的 length 字段**：`clipx_read_msg` 已按它读满，那才是权威长度）；以及 `deadline` 是
+  **每一步**的预算而不是整轮总预算（当成总预算的话，前面几条握手花掉大半之后，
+  `ConvertSelection` 一进去就已过期）。**验收方式**：拿 GTK（`python3-gi`）当 owner、
+  我们的客户端当 requestor，真读一次文本与一张 376 字节的 PNG（120×90），再用抓包网关确认
+  它在下一条消息里变成 `data:image/png;base64,…`。
 ---
 
 ## 4. 工具实现要点
@@ -978,6 +1053,9 @@ DEEPSEEK_API_KEY=sk-xxx ./build/uya-agent \
 | `tui-worktree` | P41 `/worktree` 动作选择浮层：标题/八个动作/✓ 标当前模式、反解只认动作行（「取消」不认）、默认游标 = `status`；`finish`/`discard` 选定不生效、先翻确认框（默认游标 = 取消）；**真 git**：确认前 worktree 目录与 phase 一个字节不动、确认后才合并 + 删除 |
 | `tui-mouse` | 踩坑 72 鼠标上报开关（`F2` / `/mouse` / `--no-mouse`）：标志位默认开 + `tui_set_mouse` 幂等；`F2` 两种编码（`ESC O Q` / `ESC[12~`）与 `/mouse on·off·非法`；**字节级**进/关/再开/关着进都与开关一致；帮助浮层里有 `F2` 那一条；**真 PTY** 两个方向（默认开必有 `1000h`、`mouse=false` 必无 `1000h`/`1006h`） |
 | `title-cmd` | P48 `/title` 与 `set_title`：清洗（80 B / 码点边界 / 控制序列全丢后为空 ⇒ 报错且标题**不动**）、钉住语义（`user` 置位后自动起标题不跑、`clear` 解锁）、revision 门控（同一条人类消息只生成一次）、落盘事件逐字节（kind 三档 + clear 的**空标题**事件）、索引同步、`set_title` 工具三支（合法/空串/缺键）、工具目录里有它 |
+| `tui-paste` | P50 括起粘贴九段：进/出粘贴态的字节级判据、CR **不许**提交（踩坑 83 的原始症状）、CRLF 折成一个换行、TAB 是字面内容且**帧里**不出现 TAB、粘贴里的 ANSI 序列逐字节保留、收尾标记被切开也认、断流时悬着的 ESC 不吞、上限对齐 200000 且超限有提示、光标列按显示口径（TAB 四个空格）+ **真 PTY** 粘 3 行只提交一次（按会话日志断言） |
+| `img-sniff` | P51 图片纯函数层：**真 PNG 字节**（zlib 压出来的 64×48）读尺寸、GIF87a/89a 小端、JPEG 段链（长度段在前，尺寸不在固定偏移）、WebP 三变体（VP8X/VP8L/VP8 ）、纯文本与截断 PNG 一律拒绝、字节/像素两道预算、内容寻址 id 稳定、base64（长度与 PNG 签名）、附件 JSON 往返（**数字字段** + 坏记录只跳那一项）、占位文案与 B/KiB/MiB 三档 |
+| `clip-parse` | P52 X11 客户端可测部分：`DISPLAY` 五种形态（`:0`/`unix:7`/`host:1.0`/空/畸形）与三种畸形拒绝、**真 Xauthority 字节流**的两条目配对（family 256 + display 号 + MIT-MAGIC-COOKIE-1；不存在的 display 号**不许**回退到别的条目）、失败码文案非空 |
 | `tui-title-input` | P48 标题输入框：预填 AI 建议可见 + 编辑（打字/backspace/delete/←→/home·end/ctrl+u/中间插入，**按码点**不劈汉字）+ enter 采纳交回编辑后的文本 / esc 取消**不算改名** + 太矮回落 0 + 方框逐行闭合 + 窄框不越界 + 运行中 `/title <t>` 进安全集而裸 `/title` 不进 |
 | `title-cmd-e2e` | `make e2e-title-cmd`：行式真二进制的用法串 / 改名回执 / `/status` 的 title 行 / clear / 空标题报错 / `/help` 可查 / 索引与日志落盘 |
 | `title-auto-e2e` | `make e2e-title-auto`：真 PTY + 假网关 —— 自动起标题**多发一次请求**并落 `kind=provider`；`--no-title-auto` 两样都没有；三来源（default/env/cli）与 CLI 优先 |
@@ -1209,7 +1287,10 @@ DEEPSEEK_API_KEY=sk-xxx ./build/uya-agent \
 * **浮层（P23）**：框高上限 16 行（`↑/↓`、`pgup/pgdn`、`home/end` 滚，标题栏 `↑`/`↓` 是溢出指示）；
   浮层画在转录区上，打开时转录被它盖住，esc 关掉就回来。终端高度不够（`panel_top < 5`）时浮层
   画不出来，由 `tui_overlay_available()` 的 fail-closed 语义管（审批不会「看不见却仍吞键」）。
-* **TUI 不做**鼠标点击/拖选/选择（滚轮做了，见 P32）、图片、可折叠卡片、分屏、主题切换 UI。
+* **TUI 不做**鼠标点击/拖选/选择（滚轮做了，见 P32）、可折叠卡片、分屏、主题切换 UI。
+  **图片**自 P50 起能挂给多模态模型（`/image` / `ctrl+v` / `/paste`），但**终端里不渲染**
+  —— 屏幕上只有一行占位（格式 + 宽高 + 大小 + 文件名）；也不支持缩放/重编码（纯 Uya 没有
+  编码器，超预算只能拒绝，见踩坑 82）。
   但**「选中文字复制」是终端自己的事**：TUI 默认开着鼠标上报（P25，为了滚轮），而鼠标上报
   一开终端的拖选就被我们吃掉 ⇒ 想拖选复制得按 `F2` / `/mouse off` 关掉（或开着时按住 shift
   拖选）—— 关掉之后滚轮不再翻转录，改用 `ctrl+↑/↓` 或 `pgup/pgdn`（见踩坑 72）。
