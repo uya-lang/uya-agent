@@ -4,8 +4,8 @@
 多轮 loop 直到给出结论。46 个 `.uya` 文件，**不引入任何 C 代码、`@c_import` 或其它语言**，
 只依赖 Uya 语言与随编译器分发的标准库。
 
-**P0–P43 全部完成**，主线版本串 `p43-ask`。本节之后按能力域分节，各节标题保留对应的阶段号
-（P0…P43）；设计取舍、踩坑记录与逐阶段验收分别见 §3 与 §6，代码地图见 §2。
+**P0–P44 全部完成**，主线版本串 `p44-cost`。本节之后按能力域分节，各节标题保留对应的阶段号
+（P0…P44）；设计取舍、踩坑记录与逐阶段验收分别见 §3 与 §6，代码地图见 §2。
 
 真机转录节选（`--show-reasoning`；`✻ 思考` 交互模式下先在提示符那一行滚动、块结束才落成一行，
 非交互（管道）没有实时行，只有结算的那一行）：
@@ -106,7 +106,7 @@ export UYA_SPLIT_C_DIR=$PWD/build/uyacache      # 多文件 C 缓存别丢在仓
 | `--no-shell` | 不提供 `run_shell`（tools schema 里也不会出现） |
 | `--no-stream` | 关闭流式，回退一次性响应（老端点兼容） |
 | `--api=MODE` | 线协议：`openai-responses`（**默认**）/ `openai-completions`（也接受 `responses` / `chat` / `completions`）。**不写 = 未声明**：先打 `/responses`，只有 404/405/501 才回退 `chat/completions`（每进程一次），见「流式协议要点」一节 |
-| `--reasoning-effort V` | 发 `reasoning.effort`（只有 responses 发；`off`/`none` = 不发），默认取 DSH 的 `agent-default-model.reasoningEffort` |
+| `--reasoning-effort V` | 推理强度：**completions 发顶层 `reasoning_effort`，responses 发 `reasoning.effort`**（`compat.supportsReasoningEffort=false` 或 `off`/`none` = 不发），默认取 DSH 的 `agent-default-model.reasoningEffort` |
 | `--agent-home DIR` | 会话与索引的根目录（默认 `~/.uya-agent`） |
 | `--continue` | 接着当前目录最近一条会话继续 |
 | `--resume ID` | 恢复指定会话（`ID` 或 `last`） |
@@ -290,7 +290,8 @@ src/selftest.uya   mock LLM + 126 轮断言 + --probe
 
 ### 提示词与上下文状态（P8）
 
-* system prompt 分节 persona(0) → plan 策略(50) → 工具引导(100–106)；persona 可来自 DSH preset。
+* system prompt 分节 persona(0) → plan 策略(50) → 工具引导(100–106) → **收敛纪律(107)**；persona 可来自 DSH preset。
+* **收敛纪律（P42）**：`SEC_FINISH` 一段，两条 —— ① 读结果里出现 `(End of file - total N lines)` 就说明整份已在上下文里，不要重读；② 项目验收命令（测试/构建/类型检查）跑绿即收工，最多再确认一次，不要自己另写验证脚本。措辞刻意限定在「文件已读全」「有可运行的验收命令」两种**可判定**情形，探索类任务不受约束。实测依据见 §6 的 P42 条（同一批 LSM 任务上，uya 默认在验收全绿之后还会自造额外验证脚本，多走 4–9 步）。
 * 运行时上下文是一条 user 消息，开头 `Current runtime context. This snapshot supersedes earlier runtime-context snapshots.`。
 * AGENTS.md：`$DSH_HOME/AGENTS.md` → 项目根到 cwd 逐级，按 `AGENTS.md → CLAUDE.md → AGENTS.local.md`；预算 65536 字节。
 * `todo_write` 回显 `Updated todo list: N pending, N in progress, N completed.`；非 plan 模式调 `exit_plan_mode` 报 `exit_plan_mode is only available in plan mode`。
@@ -573,6 +574,8 @@ src/selftest.uya   mock LLM + 126 轮断言 + --probe
     * 本轮踩到的两个「假绿」陷阱，都写进自测：**(a)** 取行有「表不在就退回线性扫描」的兜底，兜底结果与查表**一模一样** ⇒ 只验文本/成帧预算的话，把表整个停掉照样绿（实测）。所以 `tui-sessions-big` 里补了两条真判据：查表路径 vs 线性扫描路径的**差分对照**（同一 i、逐字节），与「取末项 20000 次」的**自校准比值**（查表腿 vs 扫描腿，修好后 1 ms : 8166 ms；退回扫描则 ≈1:1 当场红）。**(b)** 行偏移表初版存「行的起点」、拿「下一行起点减一」当终点 ⇒ 末行在「缓冲区以 `\n` 收尾 / 不收尾」两种情形下算法不一致，末行长度算成 1 而不是 0，reader 浮层（计划审阅）画到末行多占一列、右边框被顶出去 —— 是 `--tui-demo` **逐字节对照**当场抓住的，所以最终改成存「每行的终点」（一个减法，O(1)，无歧义）。
 69. **`/new` 之后任务清单还挂着上一条会话的（本轮，不占阶段号）**。清单在进程里是一张全局表（`todo.uya` 的 `g_todos`，`todo_write` 整表替换），但**换会话时没人清**：`/new` 只做了 `agent_session_close` + `hist_free` + `hist_init` + 统计 `st_reset`（后者在 `agent_history_begin` 里），清单原封不动 —— 用户看到的是新会话的常驻任务块与 `/tasks` 里还列着上一条会话的「第几步」。根因不是「清单没地方存」，而是**「进程状态」与「会话状态」没分家**：同一批表里，todo 清单只活在这一条会话里，后台任务/子代理是独立进程（P7 起 `/new` 的 `fsctx_init` 已经会 `jobs_init`/`deleg_init` 把它们复位，那是「新进程状态」而不是「清空历史」），会话目标在盘上（`goal.json`，按设计跨会话）。修法：把「清什么」收进一个 `agent_session_scoped_reset()`（只 `todo_clear`），挂在 `agent_history_begin` 里 `st_reset()` 旁边 —— 启动、fork、`--resume`、`/new`、`/resume` 走的都是这条路，一处收口。孪生一条：**清了状态还得推显示** —— 常驻块是「推」出来的（`tasks_panel_sync` 逐字节比快照后往下推），不重推的话清单虽已清空、屏幕上那块要等到下一个 1Hz 心跳才换，滚动模式更是要等下一回合；所以两个换会话的落点各补一次 `tasks_panel_sync`。
     * 验收（对照实验，两条都做）：`tui-switch` 的 D 段在**真实 globals** 上装夹具（清单 2/4 + 后台 1/2 + 子代理 1/1 + 目标 3/20）→ 敲 `/new` → 钉住「清掉的」（`g_todos.n == 0` 且屏幕上没有「任务 2/4」）与**「不该被清掉的」**（屏幕上仍有「目标 3/20」）两件事；同一条口径再罩一遍 `/resume`。①把 `agent_session_scoped_reset()` 的函数体停掉重编 → 该轮红 4 条（`/new` 与 `/resume` 各两条：`g_todos.n != 0` + 块里还挂着清单）；②只把 `/new` 落点的 `tasks_panel_sync` 去掉重编 → 红 1 条（块里还挂着清单，状态其实已经清了）—— 证明「清状态」与「推显示」两截都真在起作用，不是其中一条在兜底另一条。
+70. **`--dsh-root` 与 `--dsh-home` 同类：决定「去哪儿读文案」，必须在预扫里生效**（P44）：主循环那次完整 CLI 解析排在 DSH 加载之后，而 `agent_texts_ensure()` 是**幂等的一次性**初始化（`g_texts_ready`），一旦在解析之前被叫过，`cfg.dsh_root` 就永远是空的 —— 症状是 flag 静默无效、persona 仍来自默认 preset 树，而环境变量 `UYA_AGENT_DSH_ROOT` 却正常（那条路在 `preset_path()` 里直接读 env）。判据：同时给 env 和 flag 各指一个**文案不同**的 preset 树，看哪个生效。**孪生一条：相对路径也静默失效** —— 这个值要到「第一次构 system prompt」才被读，那时进程已不在启动时的 cwd，所以 `--dsh-root testdata/x` 读不到、`--dsh-root $PWD/testdata/x` 才读到；修法是解析时就补成绝对路径（`cfg_set_dsh_root()`，预扫与主循环共用）。与踩坑 25 同因；回归补在 `e2e-config-flags`。
+71. **completions 不发 `reasoning_effort` = 静默丢弃用户配置**（P44）：`--effort` / `--reasoning-effort` / DSH 的 `agent-default-model.reasoningEffort` 三条路径的值都进了 `cfg.reasoning_effort`、`--print-config` 也照实显示，但 `build_chat_request` 里没有那一段，于是**默认的 openai-completions 路由上模型按网关默认档思考**，用户配的 `max` 没有落到线上，也没有任何提示。同一份设置下 DSH 是发的（实测抓包 `reasoning_effort: "max"`），所以「uya 比 DSH 省」这类对比会掺进一个与 harness 无关的混杂项（实测偏差 41%）。修法：与 responses 同一条门槛（`cfg.api_reasoning`）发顶层 `reasoning_effort`，字段放最后以保住前缀缓存。**注意效果依网关而异**：官方端点同任务 `max` vs `off` 的 reasoning 占输出 51% vs 27%，autodl 网关 12% vs 17%（该网关不认这个字段）——收益主要是「配置不再说谎」，不是省钱。
 
 ---
 
@@ -817,6 +820,30 @@ DEEPSEEK_API_KEY=sk-xxx ./build/uya-agent \
 - P43：`ask_user_question` 在 TUI 里改成提问弹窗（`tui-ask` 轮四段，见上表）。真 PTY 那半实测：任务打进去后浮窗把问题原文与 `1) alpha` / `2) beta` 画上屏（同屏**没有**输入行那条「（在输入行回答后回车…）」），敲 `2`+回车之后 mock 收到的第二次请求里工具结果是 `{"answers":[{"id":"q1","selected":["beta"]}]}` —— 弹窗交回的是**选项下标**、由 `askuser` 按下标回查 label（不是按行文本反解）。headless 那半（没人回答）结果是 `"selected":[]` + dismissed 文案，且**没有** `no answer channel`（渠道与「人不答」两件事分开了）。踩坑 67 那两条假红（请求体里引号是转义的、needle 必须 NUL 结尾）都是这一轮当场抓出来的。
 - 踩坑 68（`/sessions` 选择框卡）：真 PTY（100 列）逐次量「按一次 ↑ → 下一帧到屏」。修前 842 个会话：打开浮层 1617 ms、底部按 ↑ 1617 ms，而**同一张浮层 HOME 跳到顶上只要 85 ms** —— 慢的是「跨多少项」而不是解析。修后同场景：打开 46 ms、按 ↑ 10 ms。数据侧 `--list-sessions` 12800 行：升序 1475 → 205 ms、降序 192 → 207 ms（修前两种顺序差 7.7×，修后拉平）。等价性：`--list-sessions` 在冻结索引 + 9 份合成夹具上逐字节相同；`--tui-demo` 逐字节相同（50019 字节）。防假绿对照实验：①把 `tui_ov_item` 的取行改回线性扫描重编 —— 逐字节比对与成帧预算**仍然绿**（兜底与查表结果一样），补了「查表 vs 扫描差分 + 取末项 20000 次自校准比值」后当场红（查表腿 vs 扫描腿 = 1 ms : 8166 ms，退回扫描后 ≈1:1）；②把 `sess_idx_before` 的 `lastActiveAt` 次级键写反重编 —— `sess-list-big` 立刻红（与金标准不符）；③行偏移表初版拿「下一行起点减一」当终点，末行多出 1 字节 ⇒ `--tui-demo` 逐字节对照当场红（reader 浮层末行多占一列、右边框被顶出去），改成存「每行的终点」后恢复。
 - 踩坑 69（`/new` 后任务清单没清空）：`tui-switch` D 段在真实 globals 上装夹具（清单 2/4 + 后台 1/2 + 子代理 1/1 + 目标 3/20）→ `/new`（与 `/resume`）→ 清单清空且屏幕上没有「任务 2/4」、目标仍在。防假绿对照实验：①停掉 `agent_session_scoped_reset()` 的函数体重编 → 该轮红 4 条；②只去掉 `/new` 落点的 `tasks_panel_sync` 重编 → 红 1 条（「清状态」与「推显示」两截各自都被判到）。
+- P44：修掉两处「配置静默失效」+ 加一段收敛纪律（踩坑 70/71）。真机对照实验基于同一个 LSM 编程任务
+  （落盘 KV：WAL 恢复 / SSTable / 压缩 / 范围删除 / CLI，40 个验收 + 12 个隐藏测试），同模型
+  `DeepSeek-V4.1-Flash`、同 `effort=max`、官方端点 responses 协议，逐次抓包与评分：
+
+  | | 步数 | 成本/次 | 评分 |
+  |---|---|---|---|
+  | DSH（对照） | 7.5 | $0.0149 | 52/52 |
+  | uya 改前 | 14.0 | $0.0161 | 52/52 |
+  | uya 改后（①+②） | **10.0** | **$0.0124** | 52/52 |
+
+  改前的问题不在提示词写了什么（两边任务相关的引导段几乎逐字相同；DSH 多出的 5 段全是本次没用到的
+  工具），而在**收工时机**：uya 在第 8 步就把验收跑绿，之后又自造额外验证脚本、多走 4–9 步；
+  DSH 绿后只再确认一次。逐运行口径（首次全绿步数 / 总步数）：改前 8/16、8/15、10/14、7/11；
+  改后 6/12、7/9、7/9。
+  * **① 推理强度**：completions 补发 `reasoning_effort`（真机抓包 `"reasoning_effort":"max"`）。
+    效果**依网关而异**：官方端点同任务 `--effort max` vs `off` 的 reasoning 占输出 51% vs 27%
+    （明显生效）；autodl 网关 12% vs 17%（该网关不认这个字段，发出去也没用）。收益主要是
+    「`--print-config` 不再说谎」，不是省钱。
+  * **② 收敛纪律**：省下的是上面那 4–9 步；`$0.0161 → $0.0124`、`14 → 10` 步、52/52 不变。
+    附带发现：只把 persona 换成带 harness 身份行的版本**没有效果**（15/17 步），可排除「模型认出
+    DSH 身份」这一解释。
+  * **③ `--dsh-root`**：与 `--dsh-home` 同类，必须在预扫里生效；另外相对路径会静默失效（见踩坑 70），
+    所以解析时就补成绝对路径。回归：`make e2e-config-flags` 新增夹具 `testdata/preset-root`
+    （`readLimit=1777`）三向断言（带 flag 生效 / 不带 flag 不生效 / 旋钮来源为 preset）。
 - 其它：自测幂等（连跑两次都 PASS）；A1–A6 全部通过；技能与 `web_search`、自动压缩、后台任务、文件工具、DSH 零参数启动、跨进程会话恢复（记住 4271）都在真机验收过。
 
 > 分阶段验收记录的详细现场（P1–P43 的 before/after 命令与截图、真机对照实验、被自测当场抓住的自身缺陷）已在此压缩，原始描述保留在 §3 踩坑 33–69 与各版本提交说明中。
@@ -1011,6 +1038,9 @@ DEEPSEEK_API_KEY=sk-xxx ./build/uya-agent \
   协商结果只存在于进程内，不写设置也不写会话（换进程会重新探一次）。
 * 不做 DSH 的 `reasoningEfforts` 模型级 clamp：`reasoning.effort` 原样透传设置里的值
   （网关不认就 `--reasoning-effort off` 或 `--api=chat`）。
+* 推理强度**两条协议都发**（P42）：completions 走顶层 `reasoning_effort`（字段排在 `max_tokens`
+  之后，保住前缀缓存），responses 走 `reasoning.effort`；`compat.supportsReasoningEffort=false`
+  或 `off`/`none` 时不发。此前只有 responses 发，默认路由是 completions ⇒ 配置被静默丢弃（踩坑 67）。
 * Responses 下不回放 reasoning item（不发 `include: ["reasoning.encrypted_content"]`，也不发
   `prompt_cache_key` / `prompt_cache_retention`）；历史按「外来消息」重放，只带文本与工具调用。
   工具 schema 不带 `strict`，也不做 404 之外的协议自动探测（换协议请显式 `--api=`）。

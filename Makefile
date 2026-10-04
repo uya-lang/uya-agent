@@ -336,7 +336,15 @@ e2e-config-flags: build
 	if $(OUT) --strict-dsh-config --dsh-home /nonexistent --print-config >/dev/null 2>&1; then \
 		echo "FAIL: --strict-dsh-config 读不到设置却没有报错退出"; exit 1; \
 	fi; \
-	echo "e2e-config-flags: 通过（--dsh-home / --no-dsh-config / --strict-dsh-config 都在加载前生效）"
+	out=$$($(OUT) --dsh-root testdata/preset-root --print-config 2>&1); \
+	echo "$$out" | grep -q "knobs (source: preset)" \
+		|| { echo "FAIL: --dsh-root 没有生效（旋钮仍来自内置默认）"; exit 1; }; \
+	echo "$$out" | grep -q "readLimit=1777" \
+		|| { echo "FAIL: --dsh-root 指到的 preset 树没被读到（夹具 readLimit=1777 没出现）"; exit 1; }; \
+	out=$$($(OUT) --print-config 2>&1); \
+	echo "$$out" | grep -q "readLimit=1777" \
+		&& { echo "FAIL: 没给 --dsh-root 却读到了夹具的值"; exit 1; }; \
+	echo "e2e-config-flags: 通过（--dsh-home / --no-dsh-config / --strict-dsh-config / --dsh-root 都在加载前生效）"
 
 # 终端标题开关（P22）回归：默认开；--no-title / UYA_AGENT_TITLE=0 都要在 --print-config 的
 # 来源列上看得出来（来源码与 cfg_src_name 同口径：default / env / cli），而且 CLI 压过 env。
