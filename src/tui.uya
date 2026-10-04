@@ -1830,6 +1830,23 @@ const TUI_ENTRY_MAX: usize = 262144;        // 单条上限 256 KiB
 const TUI_TEXT_MAX: usize = 4194304;        // 转录正文总量上限 4 MiB
 const TUI_REASON_TAIL: usize = 4096;        // 思考条目只留最新一段
 
+// 踩坑 68：行偏移表 —— 取第 i 行的字节区间。
+//
+// 修前那条路（就是下面保留的 `tui_ov_line_at` 线性扫描兜底）为取第 i 行**从缓冲区
+// 第 0 字节重新扫一遍**。画一屏列表要对每个可见行各扫一次（越靠后越贵），于是
+// 「画一帧」是 O(可见行数 × n²) 字节步：真机 842 个会话、底部按一次 ↑ 实测 1.2–1.6 s
+// （顶上只要 85 ms —— 要跨的项少）。这里把「一行一段」的偏移区间**一次性**建出来
+// （O(n)），之后每次取行是 O(1)。
+//
+// 生命周期与它描述的那份 Buf 严格绑定：缓冲区每次整体重写（overlay_list /
+// diff_open / ov_rows_ensure）之后就地重建；`tui_reset_all()` 里连表一起 free。
+// 计数口径与 tui_ov_count_items() 逐字相同（'\n' 个数 +1，末字节非 '\n' 时才算）。
+struct TuiLineIdx {
+    offs: &usize,      // 第 i 行的**终点**（行尾 '\n' 的下标；末行无 '\n' 时为缓冲区尾）；长度 n
+    n: usize,          // 行数（= 下面 Buf 的逻辑行数）
+    cap: usize,        // offs 的容量（格数）
+}
+
 struct TuiEntry {
     kind: u8,
     text: Buf,
@@ -1838,6 +1855,16 @@ struct TuiEntry {
     // 样式挂在可见字节上，所以折行落在任何位置都继承样式、跨窗口也不丢围栏状态 ——
     // 见 src/mdview.uya 顶部那段说明。
     md: Buf,
+    // 折行文本的**行偏移表**（与 wrap 同寿命，wrap 每次重写后就地重建）。
+    //
+    // 为什么必须有它：`tui_entry_line(i, k)` 以前为取第 k 行**从 wrap 头部重新扫一遍**
+    // （下面保留的线性扫描兜底就是那条老路），而 draw 循环对每个可见行都调它一次 ——
+    // 于是一个 n 行的长条目「画一帧」是 O(n × 可见行) 字节步。实测（本轮）：一份
+    // ~148 KiB / 约 5400 行的助手正文，80×40 下**每帧 2.8–3.5 s**（贴尾也是），乘上
+    // 滚轮/思考行的重绘频率，界面直接卡死。这与踩坑 68 的 `/sessions` 卡顿是同一族
+    // （那边修的是浮层条目与 reader 正文取行），**条目这条路当时漏了**。
+    // 建表是 O(n) 一次，之后每帧取行是 O(1)：同夹具实测 2819 → 3 ms。
+    wrap_ix: TuiLineIdx,
     wrap_width: usize,
     wrap_lines: usize,
     wrap_valid: bool,
@@ -1850,6 +1877,7 @@ var g_tui_entries: [TuiEntry: TUI_MAX_ENTRIES] = [TuiEntry{
     text: Buf{ ptr: null, len: 0, cap: 0 },
     wrap: Buf{ ptr: null, len: 0, cap: 0 },
     md: Buf{ ptr: null, len: 0, cap: 0 },
+    wrap_ix: TuiLineIdx{ offs: null as &usize, n: 0, cap: 0 },
     wrap_width: 0, wrap_lines: 0, wrap_valid: false, streaming: false, notice_full: false
 }: TUI_MAX_ENTRIES];
 var g_tui_nent: usize = 0;          // 已用条目数（环形）
@@ -1913,6 +1941,8 @@ fn tui_entry_init(e: &TuiEntry, kind: u8) void {
         }
         buf_reset(&e.md);
     }
+    // 槽位可能被复用：行偏移表指向上一条内容，必须一起清（不清就是「取行读到旧偏移」）
+    tui_lineidx_reset(&e.wrap_ix);
     e.wrap_width = 0;
     e.wrap_lines = 0;
     e.wrap_valid = false;
@@ -1973,6 +2003,7 @@ fn tui_entry_drop_oldest() void {
         buf_free(&g_tui_entries[s].text);
         buf_free(&g_tui_entries[s].wrap);
         buf_free(&g_tui_entries[s].md);
+        tui_lineidx_reset(&g_tui_entries[s].wrap_ix);
     }
     g_tui_estart = (g_tui_estart + 1) % TUI_MAX_ENTRIES;
     g_tui_nent = g_tui_nent - 1;
@@ -2236,6 +2267,9 @@ fn tui_entry_ensure_wrap(i: usize, width: usize) void {
     } else {
         e.wrap_lines = tui_wrap_into(&e.wrap, e.text.ptr as &const byte, e.text.len, budget);
     }
+    // wrap 内容整体重写了 ⇒ 行偏移表就地重建（表与它描述的 Buf 同寿命）。
+    // 这一步是 O(n) 一次，换来之后每帧取行 O(1)（见 TuiEntry.wrap_ix 那段）。
+    tui_lineidx_build(&e.wrap_ix, &e.wrap);
     e.wrap_width = width;
     e.wrap_valid = true;
 }
@@ -2250,8 +2284,48 @@ fn tui_entry_line_md(i: usize, k: usize, off: &usize, len: &usize, mdoff: &usize
     return true;
 }
 
-// 取条目第 k 行（折行后）的字节区间
+// 取条目第 k 行（折行后）的字节区间。
+//
+// 走条目自己的行偏移表（O(1)）。表没建起来时（malloc 失败这类极端情况）退回线性扫描 ——
+// 结果**一样**，只是慢；这样「取行」不会因为表缺失而静默给空。
 fn tui_entry_line(i: usize, k: usize, off: &usize, len: &usize) bool {
+    const e: &TuiEntry = tui_entry_at(i);
+    if !e.wrap_valid || k >= e.wrap_lines {
+        return false;
+    }
+    if !g_tui_entry_force_scan && (e.wrap_ix.offs as usize) != 0 {
+        return tui_lineidx_at(&e.wrap_ix, &e.wrap, k, off, len);
+    }
+    var line: usize = 0;
+    var start: usize = 0;
+    var p: usize = 0;
+    while p <= e.wrap.len {
+        if p == e.wrap.len || e.wrap.ptr[p] == 10 as byte {
+            if line == k {
+                off[0] = start;
+                len[0] = p - start;
+                return true;
+            }
+            line = line + 1;
+            start = p + 1;
+        }
+        p = p + 1;
+    }
+    return false;
+}
+
+// 自测用：把条目取行强制走线性扫描（= 修前那条路）。
+//
+// 用途是**防假绿的对照实验**（与踩坑 68 的 `tui_overlay_force_scan` 同一套路）：把这一句
+// 打开重编，`tui-md` 的「长条目成帧预算」必须当场红 —— 否则说明那条预算压根没量到取行。
+// 自测自己**不**翻这个开关（翻了就是自己把被测对象改坏），平时恒 false。
+var g_tui_entry_force_scan: bool = false;
+export fn tui_entry_force_scan(on: bool) void {
+    g_tui_entry_force_scan = on;
+}
+
+// 自测用：走线性扫描取条目第 k 行（与查表路径做差分对照 —— 两条路必须逐字节等价）
+export fn tui_entry_line_lin(i: usize, k: usize, off: &usize, len: &usize) bool {
     const e: &TuiEntry = tui_entry_at(i);
     if !e.wrap_valid || k >= e.wrap_lines {
         return false;
@@ -2272,6 +2346,12 @@ fn tui_entry_line(i: usize, k: usize, off: &usize, len: &usize) bool {
         p = p + 1;
     }
     return false;
+}
+
+// 自测用：条目折行后的行数（成帧不变量用）
+export fn tui_entry_wrap_lines(i: usize) usize {
+    const e: &TuiEntry = tui_entry_at(i);
+    return e.wrap_lines;
 }
 
 // ============================================================
@@ -4346,23 +4426,6 @@ var g_tui_ov_prompt: Buf = Buf{ ptr: null, len: 0, cap: 0 };
 var g_tui_ov_result: Buf = Buf{ ptr: null, len: 0, cap: 0 };
 var g_tui_ov_have: bool = false;       // 有结果可取
 var g_tui_ov_cancel: bool = false;     // 被 Esc 取消
-
-// 踩坑 68：行偏移表 —— 取第 i 行的字节区间。
-//
-// 修前那条路（就是下面保留的 `tui_ov_line_at` 线性扫描兜底）为取第 i 行**从缓冲区
-// 第 0 字节重新扫一遍**。画一屏列表要对每个可见行各扫一次（越靠后越贵），于是
-// 「画一帧」是 O(可见行数 × n²) 字节步：真机 842 个会话、底部按一次 ↑ 实测 1.2–1.6 s
-// （顶上只要 85 ms —— 要跨的项少）。这里把「一行一段」的偏移区间**一次性**建出来
-// （O(n)），之后每次取行是 O(1)。
-//
-// 生命周期与它描述的那份 Buf 严格绑定：缓冲区每次整体重写（overlay_list /
-// diff_open / ov_rows_ensure）之后就地重建；`tui_reset_all()` 里连表一起 free。
-// 计数口径与 tui_ov_count_items() 逐字相同（'\n' 个数 +1，末字节非 '\n' 时才算）。
-struct TuiLineIdx {
-    offs: &usize,      // 第 i 行的**终点**（行尾 '\n' 的下标；末行无 '\n' 时为缓冲区尾）；长度 n
-    n: usize,          // 行数（= 下面 Buf 的逻辑行数）
-    cap: usize,        // offs 的容量（格数）
-}
 
 var g_tui_ov_items_ix: TuiLineIdx = TuiLineIdx{ offs: null as &usize, n: 0, cap: 0 };
 var g_tui_ov_rows_ix: TuiLineIdx = TuiLineIdx{ offs: null as &usize, n: 0, cap: 0 };
@@ -7927,6 +7990,7 @@ export fn tui_transcript_clear() void {
         }
         if buf_valid(&g_tui_entries[i].md) {
             buf_free(&g_tui_entries[i].md);
+            tui_lineidx_reset(&g_tui_entries[i].wrap_ix);
         }
         i = i + 1;
     }
