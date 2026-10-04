@@ -4,8 +4,8 @@
 多轮 loop 直到给出结论。46 个 `.uya` 文件，**不引入任何 C 代码、`@c_import` 或其它语言**，
 只依赖 Uya 语言与随编译器分发的标准库。
 
-**P0–P41 全部完成**，主线版本串 `p37-model`。本节之后按能力域分节，各节标题保留对应的阶段号
-（P0…P41）；设计取舍、踩坑记录与逐阶段验收分别见 §3 与 §6，代码地图见 §2。
+**P0–P42 全部完成**，主线版本串 `p37-model`。本节之后按能力域分节，各节标题保留对应的阶段号
+（P0…P42）；设计取舍、踩坑记录与逐阶段验收分别见 §3 与 §6，代码地图见 §2。
 
 真机转录节选（`--show-reasoning`；`✻ 思考` 交互模式下先在提示符那一行滚动、块结束才落成一行，
 非交互（管道）没有实时行，只有结算的那一行）：
@@ -103,7 +103,7 @@ export UYA_SPLIT_C_DIR=$PWD/build/uyacache      # 多文件 C 缓存别丢在仓
 | `--no-shell` | 不提供 `run_shell`（tools schema 里也不会出现） |
 | `--no-stream` | 关闭流式，回退一次性响应（老端点兼容） |
 | `--api=MODE` | 线协议：`openai-responses`（**默认**）/ `openai-completions`（也接受 `responses` / `chat` / `completions`）。**不写 = 未声明**：先打 `/responses`，只有 404/405/501 才回退 `chat/completions`（每进程一次），见「流式协议要点」一节 |
-| `--reasoning-effort V` | 发 `reasoning.effort`（只有 responses 发；`off`/`none` = 不发），默认取 DSH 的 `agent-default-model.reasoningEffort` |
+| `--reasoning-effort V` | 推理强度：**completions 发顶层 `reasoning_effort`，responses 发 `reasoning.effort`**（`compat.supportsReasoningEffort=false` 或 `off`/`none` = 不发），默认取 DSH 的 `agent-default-model.reasoningEffort` |
 | `--agent-home DIR` | 会话与索引的根目录（默认 `~/.uya-agent`） |
 | `--continue` | 接着当前目录最近一条会话继续 |
 | `--resume ID` | 恢复指定会话（`ID` 或 `last`） |
@@ -269,7 +269,8 @@ src/selftest.uya   mock LLM + 126 轮断言 + --probe
 
 ### 提示词与上下文状态（P8）
 
-* system prompt 分节 persona(0) → plan 策略(50) → 工具引导(100–106)；persona 可来自 DSH preset。
+* system prompt 分节 persona(0) → plan 策略(50) → 工具引导(100–106) → **收敛纪律(107)**；persona 可来自 DSH preset。
+* **收敛纪律（P42）**：`SEC_FINISH` 一段，两条 —— ① 读结果里出现 `(End of file - total N lines)` 就说明整份已在上下文里，不要重读；② 项目验收命令（测试/构建/类型检查）跑绿即收工，最多再确认一次，不要自己另写验证脚本。措辞刻意限定在「文件已读全」「有可运行的验收命令」两种**可判定**情形，探索类任务不受约束。实测依据见 §6 的 P42 条（同一批 LSM 任务上，uya 默认在验收全绿之后还会自造额外验证脚本，多走 4–9 步）。
 * 运行时上下文是一条 user 消息，开头 `Current runtime context. This snapshot supersedes earlier runtime-context snapshots.`。
 * AGENTS.md：`$DSH_HOME/AGENTS.md` → 项目根到 cwd 逐级，按 `AGENTS.md → CLAUDE.md → AGENTS.local.md`；预算 65536 字节。
 * `todo_write` 回显 `Updated todo list: N pending, N in progress, N completed.`；非 plan 模式调 `exit_plan_mode` 报 `exit_plan_mode is only available in plan mode`。
@@ -523,6 +524,8 @@ src/selftest.uya   mock LLM + 126 轮断言 + --probe
 63. **自测「关掉 TUI」要关对开关**：`tui_set_headless(on)` 只置 `g_tui_headless`，而 `tui_active()` 看 `g_tui_on`，只有 `tui_headless_enable(on)` 两个都置；按模式分叉的断言先断言「真在这个模式里」。孪生：headless 轮须自开 `tty_sink_on = true`。
 64. **uya 的 `{ }` 块在生成的 C 里不是作用域**：同一函数里同名局部变量（`win_round` 的 A0 `pb` 与新 G 段 `pb`）在**平铺的 C 函数体**里直接 `redefinition of 'pb'`，而 `make build` 末尾只报「链接失败」（cc 的真错埋在编译日志里、`-o` 那步根本没跑到）——看到「链接失败」先去 `build/uyacache/**/<file>.c` 里找 cc 报错；同一 `.uya` 函数里的局部名当全局取（本轮一律 `p40_` 前缀）。
 65. **浮层开着就会盖住转录 → 「结果落进转录」的断言必须先关浮层**：headless 自测里 `tui_build()` 画的是一整帧，底对齐菜单正好压在转录最新那几行上，`tuis_screen_has("…")` 于是永远看不到刚写进去的 notice（P41 的 `tui-worktree` 轮实测：选 `on` 之后模式真翻了、文本也真写进了 `tui_add_notice`，断言照样红）。孪生：`tui_overlay_kind()` 在 `take` 之后回的是**结果**的 kind，所以「直接造一行 Buf 喂给 handler」之前必须先开一次浮层 —— 否则读到的是上一张浮层的 kind。
+66. **`--dsh-root` 与 `--dsh-home` 同类：决定「去哪儿读文案」，必须在预扫里生效**（P42）：主循环那次完整 CLI 解析排在 DSH 加载之后，而 `agent_texts_ensure()` 是**幂等的一次性**初始化（`g_texts_ready`），一旦在解析之前被叫过，`cfg.dsh_root` 就永远是空的 —— 症状是 flag 静默无效、persona 仍来自默认 preset 树，而环境变量 `UYA_AGENT_DSH_ROOT` 却正常（那条路在 `preset_path()` 里直接读 env）。判据：同时给 env 和 flag 各指一个**文案不同**的 preset 树，看哪个生效。与踩坑 25 同因；回归补在 `e2e-config-flags`。
+67. **completions 不发 `reasoning_effort` = 静默丢弃用户配置**（P42）：`--effort` / `--reasoning-effort` / DSH 的 `agent-default-model.reasoningEffort` 三条路径的值都进了 `cfg.reasoning_effort`、`--print-config` 也照实显示，但 `build_chat_request` 里没有那一段，于是**默认的 openai-completions 路由上模型按网关默认档思考**，用户配的 `max` 没有落到线上，也没有任何提示。同一份设置下 DSH 是发的（实测抓包 `reasoning_effort: "max"`），所以「uya 比 DSH 省」这类对比会掺进一个与 harness 无关的混杂项（实测偏差 41%）。修法：与 responses 同一条门槛（`cfg.api_reasoning`）发顶层 `reasoning_effort`，字段放最后以保住前缀缓存。
 
 ---
 
@@ -756,6 +759,31 @@ DEEPSEEK_API_KEY=sk-xxx ./build/uya-agent \
 - P29/P33/P34/P35/P37/P38/P39/P40/P41：见对应轮次与踩坑 50–65；`make selftest` / `make tui-selftest` 全绿、退出 0。
 - P40：子代理面板状态行改贴尾 —— 真机那一幕是两条 `send_message` 续跑的子代理收到一两百字节的催促，老口径整行从右边截断，屏幕上只剩 `Your output was still far too verbose: 325 lines / 68 KB…`，最新那半句 `…Do a second pass and cut it to under 25 KB.` 正好被切掉；80 列下实测 `│ ● running      53s · 0 · …KB). Do a second pass and cut it to under 25 KB. │`（78 列）、40 列收成 `…r 25 KB.`（38 列）。照 ①把 `view_ag_msg` 改回贴左重编 → G 段红 5 条；②把 `VIEW_AG_MSG_MAX` 改回 160 重编 → 200 列那条腿红 1 条。
 - P41：`/worktree` 补齐选择框。真 PTY（`worktree-menu`）实测：命令面板里选中 `/worktree`（ctrl+p → 敲名字 → 回车）62–65 ms 上框、裸 `/worktree` + 回车 62 ms，框里七行 + `✓ off`（当前模式关）都在，↓ 一次到 `finish`、回车 52–62 ms 翻出 `确认 finish？`（动作框同时消失）；确认框上再回车（默认游标「取消」）什么都没发生。`tui-worktree` 轮的**真 git** 那半：fixture 仓里 provision 出 worktree → 键盘走到 `finish` → 此刻目录与 `phase` 都还是 `READY`（没确认就动不了）→ 取消后主干上没有那个文件 → 把游标挪到 `finish` 那一行确认才 `merged … / removed worktree …`（目录消失、主干上出现文件、`phase=FINISHED`）。照 ①把 `wt_act_needs_confirm` 改成恒 `false` 重编 → 该轮红 18 条（确认框不再出现，`finish` 当场合并并删掉 worktree）；②把默认游标从 `WT_ACT_STATUS` 改成 0 重编 → 红 14 条（「打开就回车 = status」与后面整条键盘路径全崩）。
+- P42：修掉两处「配置静默失效」+ 加一段收敛纪律（踩坑 66/67）。真机对照实验基于同一个 LSM 编程任务
+  （落盘 KV：WAL 恢复 / SSTable / 压缩 / 范围删除 / CLI，40 个验收 + 12 个隐藏测试），同模型
+  `DeepSeek-V4.1-Flash`、同 `effort=max`、官方端点 responses 协议，逐次抓包与评分：
+
+  | | 步数 | 成本/次 | 评分 |
+  |---|---|---|---|
+  | DSH（对照） | 7.5 | $0.0149 | 52/52 |
+  | uya 改前 | 14.0 | $0.0161 | 52/52 |
+  | uya 改后（①+②） | **10.0** | **$0.0124** | 52/52 |
+
+  改前的问题不在提示词写了什么（两边任务相关的引导段几乎逐字相同；DSH 多出的 5 段全是本次没用到的
+  工具），而在**收工时机**：uya 在第 8 步就把验收跑绿，之后又自造额外验证脚本、多走 4–9 步；
+  DSH 绿后只再确认一次。逐运行口径（首次全绿步数 / 总步数）：改前 8/16、8/15、10/14、7/11；
+  改后 6/12、7/9、7/9。
+  * **① 推理强度**：completions 补发 `reasoning_effort`（真机抓包 `"reasoning_effort":"max"`）。
+    效果**依网关而异**：官方端点同任务 `--effort max` vs `off` 的 reasoning 占输出 51% vs 27%
+    （明显生效）；autodl 网关 12% vs 17%（该网关不认这个字段，发出去也没用）。收益主要是
+    「`--print-config` 不再说谎」，不是省钱。
+  * **② 收敛纪律**：省下的是上面那 4–9 步；`$0.0161 → $0.0124`、`14 → 10` 步、52/52 不变。
+    附带发现：只把 persona 换成带 harness 身份行的版本**没有效果**（15/17 步），可排除「模型认出
+    DSH 身份」这一解释。
+  * **③ `--dsh-root`**：与 `--dsh-home` 同类，必须在预扫里生效；另外相对路径会静默失效（`agent_texts_ensure`
+    只在第一次构 system prompt 时读它，那时已不在启动 cwd），所以解析时就补成绝对路径。
+    回归：`make e2e-config-flags` 新增夹具 `testdata/preset-root`（`readLimit=1777`）三向断言
+    （带 flag 生效 / 不带 flag 不生效 / 旋钮来源为 preset）。
 - 其它：自测幂等（连跑两次都 PASS）；A1–A6 全部通过；技能与 `web_search`、自动压缩、后台任务、文件工具、DSH 零参数启动、跨进程会话恢复（记住 4271）都在真机验收过。
 
 > 分阶段验收记录的详细现场（P1–P41 的 before/after 命令与截图、真机对照实验、被自测当场抓住的自身缺陷）已在此压缩，原始描述保留在 §3 踩坑 33–65 与各版本提交说明中。
@@ -932,6 +960,9 @@ DEEPSEEK_API_KEY=sk-xxx ./build/uya-agent \
   协商结果只存在于进程内，不写设置也不写会话（换进程会重新探一次）。
 * 不做 DSH 的 `reasoningEfforts` 模型级 clamp：`reasoning.effort` 原样透传设置里的值
   （网关不认就 `--reasoning-effort off` 或 `--api=chat`）。
+* 推理强度**两条协议都发**（P42）：completions 走顶层 `reasoning_effort`（字段排在 `max_tokens`
+  之后，保住前缀缓存），responses 走 `reasoning.effort`；`compat.supportsReasoningEffort=false`
+  或 `off`/`none` 时不发。此前只有 responses 发，默认路由是 completions ⇒ 配置被静默丢弃（踩坑 67）。
 * Responses 下不回放 reasoning item（不发 `include: ["reasoning.encrypted_content"]`，也不发
   `prompt_cache_key` / `prompt_cache_retention`）；历史按「外来消息」重放，只带文本与工具调用。
   工具 schema 不带 `strict`，也不做 404 之外的协议自动探测（换协议请显式 `--api=`）。
