@@ -1,11 +1,11 @@
 # uya-agent — 纯 Uya 写的极简 CLI 编程 agent
 
 一个**只用 Uya 源码**实现的命令行编程 agent：给它一句话任务，它自己看文件、改文件、跑命令，
-多轮 loop 直到给出结论。46 个 `.uya` 文件，**不引入任何 C 代码、`@c_import` 或其它语言**，
+多轮 loop 直到给出结论。48 个 `.uya` 文件，**不引入任何 C 代码、`@c_import` 或其它语言**，
 只依赖 Uya 语言与随编译器分发的标准库。
 
-**P0–P45 全部完成**，主线版本串 `p45-askw`。本节之后按能力域分节，各节标题保留对应的阶段号
-（P0…P45）；设计取舍、踩坑记录与逐阶段验收分别见 §3 与 §6，代码地图见 §2。
+**P0–P47 全部完成**，主线版本串 `p47-md`。本节之后按能力域分节，各节标题保留对应的阶段号
+（P0…P47）；设计取舍、踩坑记录与逐阶段验收分别见 §3 与 §6，代码地图见 §2。
 本轮「TUI 里能拖选复制文本」是修复，**不占阶段号**，记踩坑 72（见 §3）。
 
 真机转录节选（`--show-reasoning`；`✻ 思考` 交互模式下先在提示符那一行滚动、块结束才落成一行，
@@ -47,7 +47,10 @@ $ ./build/uya-agent --show-reasoning "在当前工作目录写 p15-demo.txt，�
   P40 起子代理面板的状态行把最新消息**贴尾**显示（`…` + 最新一段）；P41 起 `/worktree` 也是
   底对齐选择框（七个动作一行一个，`finish`/`discard` 再过一道确认）；P43 起 `ask_user_question`
   是**提问弹窗**（问题 + 编号选项 + 一行自定义回答，方向键/数字/空格/直接打字作答；P45 起框宽
-  按内容自适应，短问题不再撑满 78 列）；
+  按内容自适应，短问题不再撑满 78 列）；**P47 起 TUI 的正文是真正的 markdown 渲染**（块级：
+  标题分级 / 引用 / 三种列表 / 任务清单 / 分隔线 / 围栏代码块带语言标签 / GFM 表格；行内：粗体 /
+  斜体 / 删除线 / `code` / 链接），并顺手修掉旧的 markdown-lite「长行静默丢 1–3 个字符」与
+  「滚到代码块中间串样式」两处硬伤（见 §6 的 P47 条）；
   踩坑 68 起浮层条目与 reader 折行正文各挂一张行偏移表（取第 i 行 O(1)，会话索引也换成
   O(n log n) 归并）—— 真机 842 个会话下 `/sessions` 打开 1617 → 46 ms、按一次 ↑ 1617 → 10 ms。
 * **能力**：会话落盘可恢复（`--continue` / `--resume` / `/sessions`）；上下文管理（tool 结果
@@ -142,7 +145,7 @@ export UYA_SPLIT_C_DIR=$PWD/build/uyacache      # 多文件 C 缓存别丢在仓
 | `--title` / `--no-title` | 交互模式把**终端标题**写成当前会话标题（**默认开**）；`UYA_AGENT_TITLE=0` 同口径；一次性运行与非 TTY 路径本来就不写 |
 | `--mouse` / `--no-mouse` | TUI 的**鼠标上报**开关（**默认开**，滚轮要靠它）。`--no-mouse` 让终端重新接管拖选 ⇒ **能选中文字复制**（同时失去滚轮翻转录，改用 `ctrl+↑/↓` 或 `pgup/pgdn`）；`UYA_AGENT_MOUSE=0` 同口径，运行中还有 `F2` 与 `/mouse on\|off`（见踩坑 72） |
 | `--color=MODE` | `auto`（默认）/ `always` / `never` / `16` / `256`；`NO_COLOR` 也认 |
-| `--tui-demo` | 打印 TUI 的 home / chat / 运行中 三屏 + 常驻任务块两帧（折叠 / 展开）+ plan 审阅浮窗一帧的纯文本快照后退出（诊断 + 文档） |
+| `--tui-demo` | 打印 TUI 的 home / chat / 运行中 三屏 + 常驻任务块两帧（折叠 / 展开）+ plan 审阅浮窗一帧的纯文本快照后退出（诊断 + 文档）；②屏的正文是 P47 的 markdown 排版基准（标题 / 强调 / 列表 / 引用 / 带语言标签的代码块 / 表格） |
 | `--max-tokens N` | 发送 `max_tokens`（默认不发送） |
 | `--temperature N` | 发送 `temperature`（默认不发送，对齐 DSH） |
 | `--tls-verify=chain\|pin\|none` | TLS 信任策略，默认 `chain`，见第 5 节 |
@@ -186,9 +189,11 @@ src/tools.uya      P0 死代码：read_file / write_file / run_shell
 src/tty.uya        终端层：termios raw、行编辑器、面板块、标题栈、诊断转义
 src/sigx.uya       信号层：自绑 sigaction、终止信号先还终端、SIGWINCH 置标志
 src/tui.uya        全屏 TUI：帧 diff、转录、浮层、状态区、任务块、翻看、鼠标上报开关（F2 / /mouse）
+src/mdview.uya     P47 markdown 渲染（纯函数）：块级分类 + 行内强调 + GFM 表格 + 按显示列折行，
+                   一次产出「行文本 + 逐字节样式」两份等长缓冲（样式落在字节上 ⇒ 折行/滚动不丢状态）
 src/sigselftest.uya 信号自测轮：sig-abi / sig-basic / sig-term-restore / sig-child-reset
 src/shellselftest.uya bash 进程侧自测：bash-detach / bash-stop-recover / bash-kill-tree
-src/tuiselftest.uya TUI 自测轮：tui-frame / tui-keys / tui-sink / tui-turn / tui-status / tui-cmd / tui-plan / tui-exit / tui-quit / tui-tasks / tui-diff / tui-scroll / tui-pty / tty-title-pty / tui-switch / tui-mouse
+src/tuiselftest.uya TUI 自测轮：tui-frame / tui-keys / tui-sink / tui-turn / tui-status / tui-cmd / tui-plan / tui-exit / tui-quit / tui-tasks / tui-diff / tui-scroll / tui-pty / tty-title-pty / tui-switch / tui-mouse / tui-md
 src/inbox.uya      输入收件箱：steer（step 边界领取）+ keepInbox
 src/yamlcfg.uya    自带 YAML 子集解析器（`yt_key` 取 map 键名）
 src/modelx.uya     模型目录 P37：settings.yaml → McEntry，只认公布的档位
@@ -222,7 +227,7 @@ src/tasks.uya      任务状态 P25：四表折叠成折叠行 / 箱体 / `/task
 src/watch.uya      P42 /watch：事件渲染（纯函数）+ 子代理会话日志的增量读；P46 现役清单行 → 编号（纯函数）
 src/view.uya       显示层：标题/参数/后缀表、单行转录、思考行、agents 面板
 src/agent.uya      CLI、历史、主循环、工具分发、REPL、会话事件
-src/selftest.uya   mock LLM + 126 轮断言 + --probe
+src/selftest.uya   mock LLM + 130 轮断言 + --probe
 ```
 
 > 两处已知死代码（P14 起未清理）：`src/tools.uya` 的 `read_file`/`write_file`/`run_shell`、`agent.uya` 的 `dispatch_tool`（无调用者）。
@@ -361,8 +366,28 @@ src/selftest.uya   mock LLM + 126 轮断言 + --probe
   回答语义对齐 DSH：单选有自定义回答就覆盖选项、多选两者都带、什么都不选直接回车 = 空 `selected`（跳过）、
   取消回的是 dismissed 文案（与 `no answer channel` 分开，模型才知道是「人不答」还是「渠道不通」）。
 * 数据流：`tty_write` 变 sink，通道 1/2/3 全进转录、fd 1 不写；帧走 `sys_dup(1)` 私有 fd。
+* **正文的 markdown 渲染（P47，`src/mdview.uya`）**：助手正文（转录里与 plan 审阅浮层里**同一份**）
+  按 markdown 渲染 ——
+  * **块级**：ATX 标题 1–6 级（去掉 `#` 号，1 级用专属色、2 级粗、3 级起暗）、`>` 引用（`▏ ` 前缀）、
+    无序 / 有序 / 嵌套列表（每 2 列一层）、任务清单（`- [x]` → `✓ `、`- [ ]` → `· `）、
+    `---` 分隔线（整行 `─`）、围栏代码块（``` 或 `~~~`，语言标签暗色画成 `│ uya`，围栏标记本身不画）、
+    GFM 表格（表头 + `├─┼─┤` 分隔行 + 单元格，支持 `:--:` 对齐）；
+  * **行内**：`**粗体**` / `*斜体*` / `~~删除线~~` / `` `code` `` / `[文字](url)`（文字照常、地址暗色），
+    支持反斜杠转义；`snake_case` 里的下划线**不会**被当成斜体（`_` 只认词边界）；
+  * **样式落在字节上**：一次排版产出「行文本 + 逐字节样式」两份**等长**缓冲，所以折行落在任何
+    位置都继承样式、滚动窗口从代码块中间开始也不串样式（旧实现靠帧级全局 `g_md_code` 复原围栏，
+    滚到中间就串 —— 见 §6 P47 条）；
+  * **预算只有一个来源**：折行与绘制都问 `tui_entry_indent_cols()`。旧实现两边各扣一次
+    （折行 `cols-6`、绘制 `cols-7`，列表/代码行绘制再扣 2），于是长行**每行丢 1–3 个字符**再补 `…`；
+    P47 起把「前缀 + 内容」放进同一条折行流，长行逐字符完整上屏（不再有 `…`）。
+  * **窄终端**：表格列宽按「反复收最宽那列」压到下限 3；8 列及以上在 40 列终端下放不下就
+    **整块退回普通行**（`|` 原样保留，内容一个字节都不丢）。
+  * **/watch 跟随浮层不走 markdown**：那是事件行（`▸ bash {...}`、`✻ 思考 · …`），按 markdown 解析
+    会被 `---` / `|` 误判，按纯文本画。
+  * 用户消息与思考仍只认行内反引号；滚动模式（`--no-tui`）仍不做 markdown。
 * 光标（修复，踩坑 66）：**运行中输入行照样显示光标并闪动** —— 运行中插入点仍是活的打字目标（敲进去的文本走 steer 收件箱；P43 起 `ask_user_question` 是提问弹窗，浮窗放不下、回落输入行问答时也走这里）；只有「运行中且浮层开着」才隐藏（浮层把键全吃掉，插入点不在输入行上）。口径在 `tui_cursor_place()`：`run == IDLE || !tui_overlay_open()`。
 * 记忆上限：条目 ≤ 512、正文 ≤ 4 MiB、单条 ≤ 256 KiB；思考条目尾部 4 KiB、实时行尾部 1 KiB。
+  P47 起助手条目多一份**逐字节样式**缓冲（与折行文本等长，只给助手条目分配）。
 
 ### 运行中的状态区与思考实时行（P18）
 
@@ -391,7 +416,7 @@ src/selftest.uya   mock LLM + 126 轮断言 + --probe
 120 列：~/uya-a… · ctx 21% · cpu 37% · 内存 312M 1 轮 · 12 步 | LLM 50.7s · 工具调用 4.1s | 首 token 平均 1.5s · 221 tok/s…
 100 列：~/uya-agent:main · ctx 21% · cpu 37% · 内存 312M      1 轮 · 12 步 | LLM 50.7s · 工具调用 4.1s…
  80 列：~/uya-agent:main · ctx 21% · cpu 37% · 内存 312M              1 轮 · 12 步…     ← 内存占 12 列之后，
- 60 列：~/uya-agent:m… · ctx 21% · cpu 37% · 内存 312M p45-askw                       统计行在 80 列就只剩
+ 60 列：~/uya-agent:m… · ctx 21% · cpu 37% · 内存 312M p47-md                         统计行在 80 列就只剩
  40 列：ctx 21% · cpu 37% · 内存 312M                                                第一组了；版本号那两行是
  32 列：ctx 21% · cpu 37%                                                           右半区整条让位的形态
 ```
@@ -599,12 +624,41 @@ src/selftest.uya   mock LLM + 126 轮断言 + --probe
 70. **`--dsh-root` 与 `--dsh-home` 同类：决定「去哪儿读文案」，必须在预扫里生效**（P44）：主循环那次完整 CLI 解析排在 DSH 加载之后，而 `agent_texts_ensure()` 是**幂等的一次性**初始化（`g_texts_ready`），一旦在解析之前被叫过，`cfg.dsh_root` 就永远是空的 —— 症状是 flag 静默无效、persona 仍来自默认 preset 树，而环境变量 `UYA_AGENT_DSH_ROOT` 却正常（那条路在 `preset_path()` 里直接读 env）。判据：同时给 env 和 flag 各指一个**文案不同**的 preset 树，看哪个生效。**孪生一条：相对路径也静默失效** —— 这个值要到「第一次构 system prompt」才被读，那时进程已不在启动时的 cwd，所以 `--dsh-root testdata/x` 读不到、`--dsh-root $PWD/testdata/x` 才读到；修法是解析时就补成绝对路径（`cfg_set_dsh_root()`，预扫与主循环共用）。与踩坑 25 同因；回归补在 `e2e-config-flags`。
 71. **completions 不发 `reasoning_effort` = 静默丢弃用户配置**（P44）：`--effort` / `--reasoning-effort` / DSH 的 `agent-default-model.reasoningEffort` 三条路径的值都进了 `cfg.reasoning_effort`、`--print-config` 也照实显示，但 `build_chat_request` 里没有那一段，于是**默认的 openai-completions 路由上模型按网关默认档思考**，用户配的 `max` 没有落到线上，也没有任何提示。同一份设置下 DSH 是发的（实测抓包 `reasoning_effort: "max"`），所以「uya 比 DSH 省」这类对比会掺进一个与 harness 无关的混杂项（实测偏差 41%）。修法：与 responses 同一条门槛（`cfg.api_reasoning`）发顶层 `reasoning_effort`，字段放最后以保住前缀缓存。**注意效果依网关而异**：官方端点同任务 `max` vs `off` 的 reasoning 占输出 51% vs 27%，autodl 网关 12% vs 17%（该网关不认这个字段）——收益主要是「配置不再说谎」，不是省钱。
 72. **「TUI 里不能拖选复制文本」是鼠标上报的代价，不是渲染坏**（本轮修复，不占阶段号）：P25 为了让滚轮不被 xterm.js 伪装成 ↑/↓，**无条件**开了 `ESC[?1000h`+`ESC[?1006h`；而终端只要把鼠标交给我们，**它自己的拖选就没了** —— 左键按下/拖动全变成 `ESC[<b;x;yM` 事件灌过来，TUI 只吃滚轮（`b` 的 bit6）、其余**丢弃**（`tui_mouse_finish()`），于是拖选期间屏幕上什么都不动、PRIMARY 一个字节都不变。真机实测（deepin-terminal / qtermwidget，即用户环境）：同一块屏幕、同一个拖拽轨迹，**鼠标上报开着时拖选后 PRIMARY 仍是旧值（等于没有选中），手动发一条 `?1000l?1006l` 关掉之后立刻拿到 TUI 正文的文本**；再把 `?1000h?1006h` 发回去又选不动 —— 这一对对照就是根因的判据（render 与选区无关，屏幕重画也不会清掉已选区，实测 T+3 s 仍在）。所以这不是「哪一行画错了」，而是**一个必须可逆的开关**：修法是把鼠标上报做成可关的（`g_tui_mouse` + `tui_set_mouse()`，`tui_term_enter` 按开关发序列、运行中切换当场写 `1000h/1006h` 或 `1006l/1000l`），默认仍开（滚轮口径一字节不变），出口给三个：`F2`（`ESC O Q`，也认 `ESC[12~`）、`/mouse on|off`、启动期 `--no-mouse` / `UYA_AGENT_MOUSE=0`。**取舍写清楚**：关掉之后滚轮交给终端（不再翻转录），翻滚录用 `ctrl+↑/↓`（`ESC[1;5A/B` 那条已修好的路）或 `pgup/pgdn`；不想关也可以在开着时**按住 shift 拖选**（多数终端把这个当本地拖选）。防假绿对照实验：①`tui_term_enter` 改成忽略开关、恒发 `1000h` 重编 → `tui-mouse` 的 D4 当场红（`--no-mouse` 会失效）；②删掉 F2 的 SS3 映射 → B 段红；③`tui_set_mouse` 去掉运行中那段写序列 → D2/D3 红；④启动处把 `tui_set_mouse(cfg.mouse)` 写成恒 `true` → 真 PTY 那条腿红（`mouse=false` 的捕获里仍有 `1000h`）。**与既有口径的一致性**：这是「显式开关」而不是「猜终端」——不去探测、不自动关，因为关掉就等于放弃滚轮，必须由人决定。
-
 73. **「选中一个代理」与「敲 `/watch sub-1` 没反应」是同一种坑：结果没人接 + 只读命令被当成给模型的文本**（P46）：用户报「输入 /watch 选代理没反应」「/watch sub-1 也没反应」，真机（真 PTY + 假网关 + `build/uya-agent`）复现出**三条各自独立**的静默路 ——
     ① 裸 `/watch` 的现役清单一直用 `tui_overlay_list(TUI_OVK_TASKS, …)` 开，与 `/tasks` 共用 kind，而那个 kind 在接收端的语义是「纯查看，enter 不派发」：主循环的结果分发只认 PALETTE / SESSIONS / ACCESS(_CONFIRM) / MODEL / EFFORT / WORKTREE(_CONFIRM)，**没有 TASKS 分支**，于是 `tui_overlay_take()` 把选中行取走 → 落到链尾 `continue` → **静默丢弃**。实测：`/watch` → 清单里 `sub-1 [running]` 在屏上 → ↓ 选中它 → 回车 ⇒ 浮层关掉、没有跟随浮层、没有 notice（三个判据 `list_gone=True` / `follow_opened=False` / `notice=False`）。
     ② `agent_cmd_watch` 只回 bool，「已开始跟随」与「目标无效」挤在同一格 ⇒ TUI 那条路分不出来，只好把回执整段丢掉：`/watch sub-9`（编号不存在）、`/watch off` 在 TUI 里都是**一片静默**（实测 `bad_target_visible=False`）；目标写错时连「用法」提示都看不到。
     ③ 回合运行中敲 `/watch sub-1`：`agent_tui_cmd_safe()` 在 steer 那条路上拿到的是**整行**、而它按整行相等匹配 ⇒ 不在只读集合里 → 被当成用户文本推进 steer 收件箱（模型收到一句 `/watch sub-1`）；而**就算它进了集合也不够** —— 提交队列只有两个消费者（`llm_pump_input` 在流式开始时、主循环在回合结束时），「等响应头」那一段（`hc_open` 的 poll 泵点）两个都轮不到。实测把网关按住 12 s：第二次回车之后 1.2 / 5 / 10 s 屏幕上都**没有**跟随浮层，直到回合收工才开出来 —— 这正是「趁子代理在跑时想看它」最需要的那一段。
     修法：①清单换成自己的 kind `TUI_OVK_WATCH_LIST`，主循环**与泵点**两条分支收它的结果（选中行 → 纯函数 `watch_line_id` 取编号 → `agent_watch_start`），游标默认落在**第一个代理行**（第 0 行是表头，不放的话「打开就回车」只会得到一句「没认出编号」）；②返回值换成落点码 `WATCH_CMD_LIST/STARTED/STOPPED/BAD`，BAD 与 STOPPED 在 TUI 里落 notice（滚动模式照旧打回执）；③带参数的 `/watch` 进只读集合，泵点上由 `agent_steer_line()` 当场派发 —— 并为此补了 `tui_peek_submit()` + `agent_pump_submitted_cmd()`：**只读命令**用掉队列里那一行，其余行一个字节都不动（留给流式循环的 `TTY_EV_SUBMIT` 语义）。顺带把两处**测试自身的假绿**也修了：④假网关按「`WATCH_MARK` 在不在请求里」判父子，而助手那条 `tool_calls` 的**参数里会回显提示词**（实测父代理第 2 条请求里 MARK 计数 = 1）⇒ 父代理的收尾请求被误判成子代理收尾，`PARENT_HOLD_SECS` 那个「把父代理按住」的窗口根本没生效，`--mode running` 那条腿连旧代码都能「过」；改成按「父代理那句任务在不在请求里」判（网关日志回到 `REQ #2 kind=parent-final` + `HOLD parent-final 12s`）。⑤P42 的两个 selftest 轮（`watch-render` / `watch-poll`）的返回值 `wch0`/`wch1` **声明了却没进 `SELFTEST PASS` 的聚合条件** —— 渲染改坏整套 selftest 照样绿；现在 `wch0 && wch1 && wch2` 都在条件里（对照：把 `watch_line_id` 改成恒 `true` 重编 → `watch-pick-parse` 红 8 条 + `SELFTEST FAIL`）。
+
+74. **折行与绘制各扣一次列 = 长行静默丢字**（P47）：正文的 markdown-lite 曾经把宽度算在两个地方 ——
+   `tui_wrap_into` 按 `cols - 6` 折，绘制侧 `avail` 按 `cols - TUI_BODY_COL - 3` 给，列表/代码行
+   在 `tui_draw_assist_line` 里再扣 2 列。三个数字谁也对不上谁，结果是**每一行都丢 1–3 个字符、
+   再补一个 `…`**（实测 60/80/100 列下 100 字符的代码行只显示 97 个、60 个汉字只显示 58–59 个）。
+   为什么没人早发现：`…` 看着像「正常的截断」，而丢的又是行**尾**那几个字符 —— 只有拿连续
+   同种字符（`QQQQ…`）做夹具、并**统计屏幕上出现了几个**才量得出来（看文本「像不像」不行）。
+   修法是结构性的一条：预算只由 `tui_entry_indent_cols()` 一处给，折行与绘制都问它，且把
+   「前缀字形 + 内容」放进**同一条折行流**里算；绘制侧不再裁剪（`tui_put_clipped` 只当安全网）。
+   教训：**同一个量在两处各算一次**，迟早会漂；宁可在折行侧算成最终形态、绘制侧照抄。
+   回归落在 `tui-md` 的 C 段（「不丢字」），对照实验见 §6 的 P47 条。
+75. **样式挂在「帧级全局」上，滚到中间就串**（P47）：旧的代码围栏状态是 `g_tui_md_code` —— 一个
+   全局 bool，`tui_build()` 每帧开头复位、浮层则「从第 0 行扫到窗口首行」复原。于是窗口一旦落在
+   代码块**中间**（往上翻、或计划正文很长时），从 0 起算的状态必然是错的：代码行掉样式、闭合围栏
+   被当成「开始」、之后的正文整段被染成代码样式。修法不是「把复原扫描写对」，而是**换掉承载方式**：
+   排版时就把样式**逐字节**落在可见文本上（`mdview` 输出与行文本等长的样式数组），绘制只按字节取色
+   —— 样式随字节走，折行/滚动/浮层从哪儿开始都对，顺带省掉浮层那次 O(窗口首行) 的复原扫描。
+   教训：**需要按窗口位置重算的渲染状态，本身就说明它挂错了地方**。
+76. **`mc` 是 uya 的关键字，当标识符用会报「意外的 token」**（P47）：给任务清单写
+   `const mc: byte = ...` 时解析直接失败（`mc` 是 uya 的宏构造关键字），编译器只报
+   「意外的 token 'mc'」而不说「这是保留字」。同一个坑的邻居：**`&arr[i]` 的边界证明**——
+   循环条件是「运行时值」（如从 out 参数带回来的列数）时证明器认不出来，得写成
+   `while i < n && i < MAX`，或者干脆取 `&arr[0]` 当基址指针（本轮表格的列宽数组就是这么过的）。
+77. **手数字面量长度 = 屏幕上的 NUL 与错位**（P47，自测当场抓到的自身缺陷）：`mdv_put(t, m, "· ", 4, …)`
+   把 3 字节的 `· `（U+00B7 两字节 + 空格）当成 4 字节，于是多复制一个字节 —— 屏幕上就是
+   `· \0项目一`（NUL 被 `tui_rows_have_nul` 抓住，任务块/状态区的 `…` 也一起挪位）。修法是
+   一律走 `mdv_puts`（内部 `bufx_cstr_len`），把「长度」这件事只留一个来源。同族两条：
+   拿 `bufx_cstr_len` 去量 `buf_new` 造出来的**裸 malloc** 缓冲区（不保证 NUL 结尾，会读到堆尾巴，
+   踩坑 57/67 同款），以及**假判据**——「整屏里有 `…`」这条断言会把脚注缩略与任务块
+   「还有 N 行」的 `…` 也算进来，必须**按行、按字面量**定位。
 
 ---
 
@@ -782,6 +836,7 @@ DEEPSEEK_API_KEY=sk-xxx ./build/uya-agent \
 | `tui-model` | P37 `/model`/`/effort` 浮层：按提供方分组、只列公布的档位、反解、非推理模型不开浮层 |
 | `tui-worktree` | P41 `/worktree` 动作选择浮层：标题/七个动作/✓ 标当前模式、反解只认动作行（「取消」不认）、默认游标 = `status`；`finish`/`discard` 选定不生效、先翻确认框（默认游标 = 取消）；**真 git**：确认前 worktree 目录与 phase 一个字节不动、确认后才合并 + 删除 |
 | `tui-mouse` | 踩坑 72 鼠标上报开关（`F2` / `/mouse` / `--no-mouse`）：标志位默认开 + `tui_set_mouse` 幂等；`F2` 两种编码（`ESC O Q` / `ESC[12~`）与 `/mouse on·off·非法`；**字节级**进/关/再开/关着进都与开关一致；帮助浮层里有 `F2` 那一条；**真 PTY** 两个方向（默认开必有 `1000h`、`mouse=false` 必无 `1000h`/`1006h`） |
+| `tui-md` | P47 markdown 渲染六段：① 行内（`**粗**`/`*斜*`/`~~删~~`/`` `code` ``/链接：标记不上屏、样式落在正确的列、`snake_case` 不被误判）；② 块级（标题去 `#` 并按级着色、无序/嵌套/有序列表、任务清单 `✓`·`·`、引用 `▏ `、分隔线、围栏去标记留语言标签且块内 CODE）；③ **长行不丢字**（60/80/100 列下 100 字符代码行 + 100 字符正文 + 60 汉字逐字符完整、且那些行没有 `…`）；④ **滚到代码块中间样式不串**（贴尾与上滚两面，闭合围栏不再被当成开始）；⑤ 表格（表头 BOLD、框线 DIM、各行列宽一致、8 列在 40 列下整块退回普通行且不丢内容）；⑥ plan 审阅浮层共用同一份渲染 + 方框逐行闭合 |
 | `sessions-e2e` | `make e2e-sessions`：最新在最后一行、空标题落 `(无标题)` |
 | `resume-big-e2e` | `make e2e-resume-big`：~3 MiB 会话 + 残行，`--resume --dry-run` 退出码 0 |
 | `diff-render` | 纯函数：上下文、`… (省略 36 行)`、按显示列截断 |
@@ -818,7 +873,9 @@ DEEPSEEK_API_KEY=sk-xxx ./build/uya-agent \
 - PTY 场景：`make p30-check`（`testdata/pty_drive.py --suite`，8 个场景；P41 那场 `worktree-menu` 走
   两条入口 —— 命令面板里选中 `/worktree` 与裸 `/worktree` —— 到选择框 → ↓ 到 `finish` → 确认框 →
   回车取消，`PTY_DUMP=1` 会把两张框打出来）；
-  `make tui-demo` 是排版基准，各阶段只差脚注版本串（`p22-tasks` … `p46-wpick`）。
+  `make tui-demo` 是排版基准：P47 之前各阶段只差脚注版本串（`p22-tasks` … `p46-wpick`），
+  P47 起正文那一屏按新的 markdown 排版变（标题/强调/列表/引用/带语言标签的代码块/表格），
+  脚注仍是版本串那一处。
 - 只跑子集的开关：`UYA_SELFTEST_TUI_ONLY`、`UYA_SELFTEST_PERM_ONLY=1`（P21+P26）、`UYA_SELFTEST_GOAL_ONLY=1`（P29）、`UYA_SELFTEST_SHELL_ONLY=1`（P38）、`UYA_SELFTEST_PANEL_ONLY=1`（P15+P40，`make panel-selftest`）。
 - 探针：`make probe BASE=https://api.deepseek.com/v1` 期望 HTTP 401 + leaf 指纹。
 
@@ -885,6 +942,33 @@ DEEPSEEK_API_KEY=sk-xxx ./build/uya-agent \
   红 2 条；③提示行改成永不退让重编 → 红 4 条（含老段的「没有按键提示」）；④不夹 `max_w` 重编 →
   红 8 条（含「有行的显示宽度超过终端列数」）。`--tui-demo` 只在脚注版本串那 1 行变化（`p43-ask` →
   `p45-askw`），`tui-ask` 其余三段（太矮回落 / headless dismissed / 真 PTY label 回模型）不受影响。
+- P47：**TUI 的 markdown 渲染 + 修「长行静默丢字」**（`tui-md` 轮六段，见上表）。这是本轮
+  唯一一处「先量出缺陷再动手」的：动手前先用临时探针（不进仓库）在当前 main 上量到三件事 ——
+  * **长行静默丢字符**（根因：折行按 `cols-6`、绘制按 `cols-7`，列表/代码行绘制时再扣 2 列）：
+
+    | 画布 | 100 字符代码行 | 100 字符正文 | 60 个汉字 |
+    |---|---|---|---|
+    | 60 列 | 97/100 | 99/100 | 58/60 |
+    | 80 列 | 97/100 | 99/100 | 59/60 |
+    | 100 列 | 97/100 | 99/100 | 59/60 |
+
+    修后同一探针：60/80/100 列下三档全部 `100/100`、`100/100`、`60/60`，且那些行没有 `…`。
+  * **滚到代码块中间串样式**：贴尾时 `code-line-23` 样式 = 默认、闭合围栏被当成「开始」、
+    之后的正文被染成代码样式；修后上滚 12 行，窗口内的代码行仍是代码样式、闭合围栏不再当开始。
+  * **markdown 语法按字面量上屏**：`**粗体**`、`*斜体*`、`~~删除线~~`、`[文字](url)`、`> 引用`、
+    `- [x]`、`---`、`| 列A | 列B |` 表格、```` ```uya ```` 语言标签 —— 修后逐项按上表渲染。
+  防假绿对照实验四条（每条都实测到红，再改回全绿）：
+  ①把绘制侧恢复成旧的「按 `cols-7` 裁剪」重编 → `tui-md` 红 8 条（含「代码块里的 100 个字符
+  没有全部上屏」）；②把 `tui_style_from_mdv()` 恒返回默认样式重编 → 红 **12** 条；
+  ③把样式改由「帧级标记」决定（进过代码块才染色、且标记不随窗口重置）重编 → 红 8 条，其中
+  **「窗口落在代码块中间时代码行掉了样式（旧的帧级围栏状态）」正是本轮要钉的那条**；
+  ④表格无视预算直接渲染重编 → 红 3 条（含「有行的显示宽度超过终端列数」与「40 列下 8 列表格
+  本该退回普通行，却还是画了框线」）。
+  顺带修的：`tui-plan` 的 `│ # 计划标题` 断言改成 `│ 计划标题`（标题已去 `#`）**并**断言没有 `# `；
+  `--tui-demo` ②屏的正文换成真实形态的 markdown（标题/强调/列表/引用/带语言标签的代码块/表格），
+  脚注只差版本串（`p45-askw` → `p47-md`）。三条**自测自身**踩到的坑都记进 §3：字面量长度手数错
+  （`· ` 是 3 字节不是 4）、拿 `bufx_cstr_len` 量裸 malloc 的动态夹具（踩坑 57/67 同款）、
+  以及「整屏有 `…`」这种假判据（`…` 还会来自脚注缩略与任务块的「还有 N 行」）。
 - P46：`/watch` 的**现役清单选中即跟随** + 把三条「敲了没反应」的静默路一起堵掉（清单 kind、落点码、
   只读命令在泵点当场派发；细节见踩坑 73）。真 PTY + 假网关的两条腿（`make e2e-watch-pick`）实测：
   ①`pick`：裸 `/watch` → 清单（标题带「回车跟随」、游标已在 `sub-1` 那一行、回车后没有「没认出编号」
@@ -901,7 +985,7 @@ DEEPSEEK_API_KEY=sk-xxx ./build/uya-agent \
 
 - 踩坑 72（TUI 里能复制文本）：真机（deepin-terminal / qtermwidget，即用户环境）A/B —— 同一块屏幕、同一条拖拽轨迹（`xdotool` 驱动），鼠标上报**开着**时拖选之后 `PRIMARY` 仍是旧值（= 没选中）、TUI 正文一个字符都拿不到；手动发 `?1000l?1006l` 关掉后拖同一段立刻拿到屏幕文本；再发 `?1000h?1006h` 又选不动。屏幕重画不会清掉已选区（选中后等 3 s 仍在），所以与渲染/重绘无关。修法见踩坑 72；`make e2e-mouse` 钉配置来源链（默认 env/cli + CLI 优先 + 滚动模式 `/mouse` 说明），`tui-mouse` 轮钉开关语义、F2 两种编码、字节级四个方向与真 PTY 两个方向。防假绿对照实验四条（`tui_term_enter` 忽略开关 / 删 F2 映射 / `tui_set_mouse` 去掉运行中写序列 / 启动处恒 `true`）都当场红。
 
-> 分阶段验收记录的详细现场（P1–P45 的 before/after 命令与截图、真机对照实验、被自测当场抓住的自身缺陷）已在此压缩，原始描述保留在 §3 踩坑 33–72 与各版本提交说明中。
+> 分阶段验收记录的详细现场（P1–P47 的 before/after 命令与截图、真机对照实验、被自测当场抓住的自身缺陷）已在此压缩，原始描述保留在 §3 踩坑 33–77 与各版本提交说明中。
 
 ---
 
@@ -942,10 +1026,19 @@ DEEPSEEK_API_KEY=sk-xxx ./build/uya-agent \
   拖选）—— 关掉之后滚轮不再翻转录，改用 `ctrl+↑/↓` 或 `pgup/pgdn`（见踩坑 72）。
   `--resume` 只回填最近 200 条历史（注入类消息不回填），`--resume-dsh` 走同一条回填路径。
   终端小于 32×8 时自动退回滚动模式；`cols < 66` 时块字 logo 退化成一行标题。
-* **滚动模式（`--no-tui`）**是纯文本字形、不做 markdown 渲染；TUI 有颜色 + 轻量 markdown
-  （围栏代码块、行内 code、标题、列表），但不做完整语法高亮/表格/链接重排。
+* **滚动模式（`--no-tui`）**是纯文本字形、不做 markdown 渲染；TUI 有颜色 + markdown 渲染
+  （P46：块级标题/引用/列表/任务清单/分隔线/围栏代码块/GFM 表格 + 行内粗体/斜体/删除线/`code`/链接）。
   P16 起滚动模式下每次工具调用只有一行（正文要看就得 `--tool-lines N`），思考同理：
   **非交互（管道）下没有实时行**，只有块结束时落的那一行 —— 想边跑边看就用交互模式。
+* **markdown 渲染的边界（P47）**：不做代码**语法高亮**（围栏只给整块一个颜色 + 语言标签）、
+  引用式链接 `[x][ref]`、脚注、HTML 块、自动链接 `<url>`、setext 标题（`===` 下划线）；
+  换行仍是「一个逻辑行一段」，不做 CommonMark 的软换行合并（行数与原样一一对应，读日志时不丢行）。
+  表格：单元格**不折行**（每格一行；超列宽按显示列裁剪补 `…`），列宽按「反复收最宽那列」压到下限 3，
+  列数 > 8 或收不下时**整块退回普通行**（`|` 原样保留，不丢内容）；单元格里的 `|` 用 `\|` 转义。
+  删除线靠终端的 SGR 9，不支持的终端只当普通文字（内容照常可见）。
+  助手正文与 plan 审阅浮层共用这一份渲染；**`/watch` 跟随浮层不套 markdown**（那是事件行，
+  会被 `---` / `|` 误判）；用户消息与思考仍只认行内反引号。
+  助手条目因此多一份「逐字节样式」缓冲（与折行文本等长），转录总量上限仍是 4 MiB。
 * **终端标题（P22）是 best-effort 的礼貌**：不支持 xterm 标题栈（`CSI 22 t` / `CSI 23 t`）的终端会
   忽略压栈/弹栈，退出后保留我们最后写的会话标题（故意不写空标题）；标题取「首条用户消息的前 5 个词
   / ≤40 B」，没有 `/title` 改名命令，也不调模型生成标题。导入 DSH 会话时按 `source.kind = "user"`
