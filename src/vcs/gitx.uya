@@ -1,4 +1,17 @@
-// src/gitx.uya — 只读地跑 git（P25：/diff 浮窗的数据来源）
+// src/vcs/gitx.uya — 只读地跑 git（P25：/diff 浮窗的数据来源）
+//
+// 本文件：git 子进程的完整生命周期 —— 定位可执行文件（`gx_resolve`）、
+//   环境组装（`gx_env_prepare` / `gx_env_skip` / `gx_env_add`）、双管道收取与超时
+//   （`gitx_run`：两条 `pipe2`、`poll` + 泵点、超 out_cap 继续读并**丢弃**、收尾排空）、
+//   NUL 与换行小工具（`gitx_cstr` / `gitx_trim_nl`）、截断状态查询（`gitx_last_truncated`）。
+// 不变量：① **只读** —— 只用 `status` / `diff` / `rev-parse`，绝不 `add`/`stash`/`commit`；
+//   ② 环境**先剔后加**（`GIT_DIR` 等会污染 `-C <root>`；glibc getenv 取第一个匹配）；
+//   ③ 超 `out_cap` 的字节**继续读并丢弃** —— 不排空的话 git 写满管道会卡住（假死，不是截断）；
+//   ④ 超时 `GITX_TIMEOUT_MS = 10000`，按**进程组**杀（`sh_kill_tree`）；
+//   ⑤ 子进程必须 `sigx_reset_for_child` + `sh_child_detach_stdio`（否则 git 想提示凭据时会去读 TUI 的终端）。
+// 依赖：libc（fcntl / signal / syscall / unistd）、std.runtime.saved_envp；本仓 foundation/bufx、
+//   session/sigx、tools/shellx（`sh_kill_tree` / `sh_child_detach_stdio`）、term/tui/hook（泵点）。
+// 命名：`gx_*`（内部）、`gitx_*`（对外）、`GITX_*`（返回码与上限）。
 //
 // 为什么要有这个模块：旧一侧的内容在 git 对象里（packfile / zlib / delta），不 fork git
 // 就得自己实现对象读取；而 git 的 unified diff 顺带把二进制判定、mode 变更、
@@ -46,6 +59,7 @@ fn gx_eq(p: &const byte, n: usize, lit: &const byte) bool {
     return bufx_mem_eq(p, lit, ln);
 }
 
+// 这个候选路径能不能执行（`access(X_OK)`）。**cand 必须是 NUL 结尾**（走的是 C 串口径）。
 fn gx_path_probe(cand: &Buf) bool {
     // cand 必须是 NUL 结尾
     if cand.len == 0 {
@@ -55,6 +69,8 @@ fn gx_path_probe(cand: &Buf) bool {
     return rc == 0;
 }
 
+// 试一个 PATH 段：拼成 `<dir>/git`（段末已有 `/` 就不重复加）并补 NUL，写进 out。
+// 命中返回 true（out 里就是可执行路径）；空段直接 false。
 fn gx_try_dir(dir: &const byte, dn: usize, out: &Buf) bool {
     if dn == 0 {
         return false;
@@ -69,6 +85,9 @@ fn gx_try_dir(dir: &const byte, dn: usize, out: &Buf) bool {
     return gx_path_probe(out);
 }
 
+// 定位 git 可执行文件，结果落 `g_gx_git`。**幂等且带 memo**（`g_gx_probed`）——
+// 一次进程只扫一遍 PATH。扫不到时 `g_gx_git` 只留一个终止 NUL（`len == 1`），
+// 于是 `gitx_available()` 判它不可用（这个约定就靠 len>1 这一条）。
 fn gx_resolve() void {
     if g_gx_probed {
         return;
@@ -134,11 +153,14 @@ fn gx_resolve() void {
     }
 }
 
+// git 能不能用（并顺手触发一次定位）。不可用时 `gitx_run` 返回 `GITX_E_NO_GIT`。
 export fn gitx_available() bool {
     gx_resolve();
     return g_gx_git.len > 1;
 }
 
+// 上一次 `gitx_run` 的输出是否被 out_cap **截断**过。判据由调用方用
+// （典型是 `gd_load_sel`：截断了就改 `-U3` 重取，见 §12.3）。
 export fn gitx_last_truncated() bool {
     return g_gx_trunc;
 }
@@ -154,6 +176,11 @@ export fn gitx_last_truncated() bool {
 var g_gx_env_store: Buf = Buf{ ptr: null, len: 0, cap: 0 };
 var g_gx_env_ptrs: [&const byte: GITX_ENV_MAX] = [null as &const byte: GITX_ENV_MAX];
 
+// 这些名字要从子进程环境里**剔除**（「先剔后加」的那一步）：
+//   `GIT_DIR` / `GIT_WORK_TREE` / `GIT_INDEX_FILE` —— 父进程带着它们时 `-C <root>` 会被
+//     指到另一个仓库（真机症状：`/diff` 显示的是别的仓）；
+//   `GIT_OPTIONAL_LOCKS` / `GIT_TERMINAL_PROMPT` / `GIT_PAGER` / `LC_ALL` —— 由 gx_env_add 重新给值。
+// **为什么必须先剔**：glibc 的 getenv 取**第一个**匹配项，不剔掉原值就等于没覆盖。
 fn gx_env_skip(name: &const byte, n: usize) bool {
     if n < 4 {
         return false;
@@ -168,6 +195,9 @@ fn gx_env_skip(name: &const byte, n: usize) bool {
     return false;
 }
 
+// 往子进程环境里追加 `NAME=value`：正文拼进 `g_gx_env_store`（NUL 分隔），
+// 指针存进 `g_gx_env_ptrs` 并用 null 封尾（execve 要的 argv/envp 形状）。
+// 槽位不够就**静默放弃这一项**（不是致命错误）。
 fn gx_env_add(name: &const byte, value: &const byte) void {
     var slot: usize = 0;
     while slot < GITX_ENV_MAX && (g_gx_env_ptrs[slot] as usize) != 0 {
@@ -185,6 +215,11 @@ fn gx_env_add(name: &const byte, value: &const byte) void {
     g_gx_env_ptrs[slot + 1] = null as &const byte;
 }
 
+// 组好「只读 git 调用」要用的环境：剔除 `gx_env_skip` 那批，再加
+//   `GIT_OPTIONAL_LOCKS=0`（status 不写 index.lock）、
+//   `GIT_TERMINAL_PROMPT=0`（不许 git 弹凭据提示，那会读走用户的终端）、
+//   `GIT_PAGER=cat` / `LC_ALL=C`（不落 pager、输出可逐字节判）。
+// 结果落两个全局，供 execve 直接用。
 fn gx_env_prepare() void {
     if !buf_valid(&g_gx_env_store) {
         g_gx_env_store = buf_new(32768);
@@ -227,6 +262,9 @@ struct GxTimeVal {
     tv_usec: i64,
 }
 
+// 墙钟毫秒（`sys_gettimeofday`），给超时判定用。
+// 用 syscall 而不是 extern libc `gettimeofday`：后者会拉进 `libc.time`，
+// 与 `libc.stdlib` 双定义 `CLOCKS_PER_SEC`，split-C 下 multiple definition 链接失败。
 fn gx_now_ms() u64 {
     var tv: GxTimeVal = GxTimeVal{ tv_sec: 0, tv_usec: 0 };
     const r: !i32 = sys_gettimeofday(&tv, null as &void);

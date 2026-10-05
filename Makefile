@@ -75,7 +75,7 @@ TASK ?= 创建 hello.uya，编译并运行它
 export UYA_ROOT
 export UYA_SPLIT_C_DIR := $(CURDIR)/build/uyacache
 
-.PHONY: all check print-src build link-audit selftest codegen-audit doc-audit probe e2e e2e-config e2e-exec e2e-accept-nudge e2e-config-flags e2e-title e2e-title-cmd e2e-title-auto e2e-mouse e2e-api e2e-steps e2e-permission e2e-sandbox e2e-tasks e2e-goal e2e-sessions e2e-resume-big e2e-diff e2e-ws e2e-model e2e-worktree e2e-watch e2e-watch-pick e2e-dsh p30-check tui-demo tui-selftest sess-selftest diff-selftest model-selftest panel-selftest clean shell-selftest
+.PHONY: all check print-src build link-audit selftest codegen-audit doc-audit doc-cover probe e2e e2e-config e2e-exec e2e-accept-nudge e2e-config-flags e2e-title e2e-title-cmd e2e-title-auto e2e-mouse e2e-api e2e-steps e2e-permission e2e-sandbox e2e-tasks e2e-goal e2e-sessions e2e-resume-big e2e-diff e2e-ws e2e-model e2e-worktree e2e-watch e2e-watch-pick e2e-dsh p30-check tui-demo tui-selftest sess-selftest diff-selftest model-selftest panel-selftest clean shell-selftest
 
 all: build
 
@@ -131,8 +131,17 @@ codegen-audit: build
 	fi; \
 	echo "codegen-audit: 通过（没有切片描述符强转）"
 
+# 文档覆盖审计（CODING.md §2 / §3 的可执行版本）：文件头必须有「本文件 / 不变量 / 依赖 /
+# 命名」四行、第 1 行的路径必须与文件实际位置一致，且**每个 fn / export fn 的紧邻上方要有
+# `//` 注释**。为什么单开一条：这两件事**没有任何测试看得见** —— 漏一行头注释、少一句函数
+# 注释，build / selftest / link-audit / codegen-audit / doc-audit 全绿（与踩坑 94 同族：
+# 「全绿」只覆盖被断言过的东西）。只读检查，不动文件。
+doc-cover:
+	@python3 testdata/doc_cover.py
+	@echo "doc-cover: 完成"
+
 # 文档审计：仓库里不许留 Git 冲突标记（`<<<<<<<` / `=======` / `>>>>>>>`）。
-# 来历见 README 踩坑 94：一条合并残留的 `=======` 在 README 里从 P53 那次合并（3e62301）
+# 来历见 §16 踩坑 94：一条合并残留的 `=======` 从 P53 那次合并（3e62301）
 # 一直躺到 P56 —— 编译、自测、link-audit 全绿，**没有任何测试看得见它**，所以只能靠这条审计扫。
 # 只扫文本（源码 / 文档 / 脚本 / Makefile），跳过 .git 与构建产物；行首锚定，
 # 所以源码注释里的 `// ============` 这类分隔线不会误报。
@@ -154,9 +163,9 @@ doc-audit:
 #   P54 实测（同一台机器、同一份 uya 0.10）：6792 声明通过，再 +6 个空函数仍通过，+8 个红
 #   —— 也就是表容量在 6796 上下，而本仓当前余量约 4 个函数（各线合并后会变）。
 #   要命的地方在于增量编译看不出来（缓存），只有 `rm -rf build` 重编才炸，报错点还落在标准库里。
-#   所以「净增函数」的改动一律先清缓存重编一遍（见 README §3 踩坑 87）。
+#   所以「净增函数」的改动一律先清缓存重编一遍（见 §16 踩坑 87）。
 #   变量与常量不占这个额度，只有函数占；整理手段见踩坑 87。
-selftest: build codegen-audit doc-audit e2e-exec e2e-accept-nudge e2e-config-flags e2e-title e2e-title-cmd e2e-title-auto e2e-mouse e2e-api e2e-steps e2e-permission e2e-sandbox e2e-tasks e2e-goal e2e-sessions e2e-resume-big e2e-diff e2e-ws e2e-model e2e-worktree p30-check
+selftest: build codegen-audit doc-audit doc-cover e2e-exec e2e-accept-nudge e2e-config-flags e2e-title e2e-title-cmd e2e-title-auto e2e-mouse e2e-api e2e-steps e2e-permission e2e-sandbox e2e-tasks e2e-goal e2e-sessions e2e-resume-big e2e-diff e2e-ws e2e-model e2e-worktree p30-check
 	UYA_BIN=$(UYA) $(OUT) --selftest
 
 probe: build
@@ -423,7 +432,7 @@ open(os.path.join(home,'index.jsonl'),'w').write(json.dumps({'id':sid,'cwd':a,'l
 
 
 # 真实网关端到端：默认走 DSH 设置（零参数就能拿到 base-url/model/key），
-# 也可以显式覆盖。TLS：给了 PIN 用 pin，否则用 none（真机链校验过不去，见 README 第 5 节）
+# 也可以显式覆盖。TLS：给了 PIN 用 pin，否则用 none（真机链校验过不去，见 §18）
 # 步数默认不限（跑到模型给出最终答案）；要熔断就 make e2e STEPS=N
 e2e: build
 	@echo "== e2e: 真实网关（配置来自 DSH 设置，除非显式覆盖）=="
@@ -484,7 +493,7 @@ e2e-exec: build
 	echo "e2e-exec: 通过（默认关；CLI/env 生效；--help 有；降档 → exec-effort；回合开始 → exec-restore；2 回合）"
 # CLI flag 回归：--dsh-home / --no-dsh-config / --strict-dsh-config 决定「去哪儿读设置」，
 # 必须在下一次加载之前生效（曾经因为完整 CLI 解析排在加载之后而三个 flag 全部静默失效，
-# 见 README 踩坑 25）。离线可跑：--print-config 不联网。
+# 见 §16 踩坑 25）。离线可跑：--print-config 不联网。
 e2e-config-flags: build
 	@set -e; \
 	out=$$($(OUT) --no-dsh-config --print-config 2>&1); \
@@ -728,7 +737,7 @@ e2e-dsh: build
 #        （旧实现要等这一步走完 —— 3s 的单步流实测 2245ms，用户看到的就是卡死）
 #     2) 回合运行中敲 /new：立刻回执 + 中断当前回合（随后由主循环开新会话）
 #     3) esc 中断一回合之后再发一条任务：必须正常跑完（曾经被粘住的中断标志秒断）
-#   P31 起再加四条「请求在飞」的验收（判据与数字见 README §6 的 P31 验收记录）：
+#   P31 起再加四条「请求在飞」的验收（判据与数字见 §19 的 P31 验收记录）：
 #     4) 响应头还没回来时敲 /status：≤800ms（旧实现要等头到 —— 3s 的头实测 2280ms）
 #     5) 空闲敲 /status：≤150ms（旧实现 242ms = 等下一次 200ms 轮询）
 #     6) bash 跑着时敲 /status：≤200ms（且回合仍在跑）
@@ -842,14 +851,14 @@ e2e-resume-big: build
 	rc=$$?; \
 	set -e; \
 	[ "$$rc" -eq 0 ] \
-		|| { echo "FAIL: 大日志 --resume 退出码 = $$rc（139 = 段错误，见 README 踩坑 54）"; echo "$$out" | tail -5; exit 1; }; \
+		|| { echo "FAIL: 大日志 --resume 退出码 = $$rc（139 = 段错误，见 §16 踩坑 54）"; echo "$$out" | tail -5; exit 1; }; \
 	echo "$$out" | grep -q "\[dry-run\]" \
 		|| { echo "FAIL: --dry-run 没打出请求摘要"; echo "$$out" | tail -5; exit 1; }; \
 	echo "$$out" | grep -q "/selftest/meta-big/final" \
 		|| { echo "FAIL: 恢复出来的工作区不是日志里最后一条 session/workspace"; echo "$$out" | tail -5; exit 1; }; \
 	echo "e2e-resume-big: 通过（~3 MiB 日志不崩 / 最后一条 workspace 取到）"
 
-# TUI：打印 home / chat 两屏纯文本快照（README 引用的就是它，改动排版时先看这个）
+# TUI：打印 home / chat 两屏纯文本快照（本文引用的就是它，改动排版时先看这个）
 tui-demo: build
 	$(OUT) --no-dsh-config --tui-demo
 

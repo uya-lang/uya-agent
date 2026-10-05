@@ -1,4 +1,28 @@
-// src/shellx.uya — bash 工具（P7，对齐 DSH tool-bash）
+// src/tools/shellx.uya — bash 工具（P7，对齐 DSH tool-bash）
+//
+// 本文件：bash 工具入口 `sh_tool_bash`（前台/后台）、执行前的两道闸门与沙箱决策
+//   （`sh_prepare_exec`）、子进程环境组装（`sh_env_prepare`/`sh_env_prepare_kv`/
+//   `sh_env_array`/`env_add_kv`）、终端与进程组收口（`sh_child_detach_stdio`、
+//   `sh_kill_tree`）、workdir 解析（`sh_resolve_workdir`）以及结果标记渲染。
+// 不变量：① 命令**没有终端**：stdin = /dev/null + `setsid()`（只重定向 fd 1/2 会让命令
+//   拿到 TUI 终端，碰一下就被内核停住整个进程组，`waitpid(WNOHANG)` 对「被停住」与
+//   「还在跑」完全同形，状态行一直「运行中」——线上实测 6 分钟，踩坑 60）；
+//   ② 收尾那一次读管道**必须非阻塞**：子孙可能还替我们开着管道（`sleep 300 &`），
+//   阻塞读会一直等 EOF ⇒「bash 已退出、工具却还在运行中」；③ 超时/中止/被发现停住一律
+//   **按进程组收整棵子树**（先 SIGCONT 再 SIGKILL，再补一发单 pid 兜底），被停住时 STOP
+//   信号优先于「被我们 SIGKILL 掉」（后者是自己发的，不该盖掉真原因）；④ confined 模式下
+//   沙箱起不来**必须拒绝**执行（`SH_EXEC_REFUSED`），绝不静默降级成不沙箱；
+//   ⑤ read-only 下 bash 要逐条人工批准：拒绝回 `SH_DENIED`、没有渠道回 `SH_NO_CHANNEL`
+//   （两者都是测试逐字断言的文案，不许改措辞）；⑥ 给子进程注入的 DSH_* 由本文件负责，
+//   且继承环境时**先剔除已有的 DSH_*** 再注入，避免同名两份。
+// 依赖：libc.syscall/unistd/fcntl/signal、std.runtime.saved_envp（继承环境）、宿主 glibc
+//   的 `setsid`（extern 绑定，工具链没有 sys_setsid 包装）；本仓 session/sigx（子进程复位信号
+//   处置）、tools/sandboxx（bwrap profile argv）、tools/perm（访问模式）、tools/askuser
+//   （read-only 下的逐条批准）、tools/jobs（后台任务注册）、tools/fsx（`FS_PATH_MAX`、
+//   `g_fsctx`、workdir 解析）、vcs/worktreex（bash 侧的 worktree 写闸门）、
+//   agent（泵点、`agent_dsh_home`、`agent_bash_timeout_knob`）。
+// 命名：对外 `sh_*`（`sh_tool_bash`、`sh_env_*`、`sh_child_detach_stdio`、`sh_kill_tree`），
+//   私有同样 `sh_*` 前缀；常量/文案 `SH_*`（`SH_DENIED`、`SH_NO_CHANNEL`、`SH_EXEC_*`）。
 //
 // 参数：command(必)、description(必)、timeoutMs、workdir、run_in_background。
 // 行为：
@@ -9,7 +33,7 @@
 //   * 后台：注册成任务并立刻返回 `started background job <id>`；
 //   * 命令**没有终端**（P38）：stdin 指向 /dev/null、子进程 setsid 自成会话 —— 命令拿不走用户的
 //     按键，也不会被终端的 job control 信号（SIGTTIN/SIGTTOU/SIGTSTP）停住；万一还是被停住了，
-//     当场把整棵子树收掉并给出 `[stopped by signal: N]`（见 README 踩坑 60）；
+//     当场把整棵子树收掉并给出 `[stopped by signal: N]`（见 §16 踩坑 60）；
 //   * 命令退出就立刻返回：收尾那次读管道是非阻塞的 —— 子孙还替我们开着管道（`sleep 300 &` 之类）
 //     也不会把工具挂住（P38，同一条「别一直显示运行中」的承诺）；
 //   * 给子进程注入 DSH_* 环境（DSH_HOME / DSH_SHELL=1 / DSH_SESSION_ID / DSH_SESSION_JSONL）。
@@ -42,6 +66,7 @@ fn sh_err_is_sandbox_denied(e: &const Buf) bool {
     return sh_has_cstr(e, "Permission denied" as &const byte) || sh_has_cstr(e, "Read-only file system" as &const byte);
 }
 
+// h 里是否含 C 字符串字面量（find_sub 要切片，这里自己算长度；纯字节扫描）
 fn sh_has_cstr(h: &const Buf, lit: &const byte) bool {
     const n: usize = bufx_cstr_len(lit);
     if n == 0 || h.len < n {
@@ -99,6 +124,7 @@ fn sh_prepare_exec(cfg: &const Config, cmd_z: &const byte, out: &Buf) bool {
 var g_env_ptrs: [&const byte: SH_ENV_MAX] = [null as &const byte: SH_ENV_MAX];
 var g_env_store: Buf = Buf{ ptr: null, len: 0, cap: 0 };
 
+// 名字是否以 `DSH_` 开头（正好 4 个字节；用于从继承环境里剔除我们自己注入的变量）
 fn env_is_dsh(name: &const byte, n: usize) bool {
     if n < 4 {
         return false;
@@ -106,6 +132,8 @@ fn env_is_dsh(name: &const byte, n: usize) bool {
     return name[0] == 68 as byte && name[1] == 83 as byte && name[2] == 72 as byte && name[3] == 95 as byte;
 }
 
+// 往环境数组末尾追加一条 `NAME=VALUE`（value 可以没有 NUL，用 value_len 给长度）。
+// 指针落进 g_env_store（先扩容再取地址，防止 realloc 后悬空）。槽位不足或 OOM 时静默丢弃。
 fn env_add_kv(name: &const byte, value: &const byte, value_len: usize) void {
     var slot: usize = 0;
     while slot < SH_ENV_MAX && (g_env_ptrs[slot] as usize) != 0 {
@@ -180,6 +208,7 @@ export fn sh_env_prepare_kv(k1: &const byte, v1: &const byte, k2: &const byte, v
     }
 }
 
+// 给子进程用的最终 envp（NUL 结尾的指针数组）；先调 sh_env_prepare* 才有内容
 export fn sh_env_array() &(&const byte) {
     return &g_env_ptrs[0];
 }
@@ -207,7 +236,7 @@ fn sh_resolve_workdir(cfg: &const Config, args: &const JsonValue, out: &Buf) boo
 
 // 子进程的「没有终端」收口（fork 之后、exec 之前调用一次）。
 //
-// 为什么必须做（README 踩坑 60）：以前只重定向 fd 1/2，fd 0 原样继承 —— 工具命令拿到的
+// 为什么必须做（§16 踩坑 60）：以前只重定向 fd 1/2，fd 0 原样继承 —— 工具命令拿到的
 // stdin 就是 TUI 的终端。命令里的 shell 会把流水线放进自己的进程组，相对 TUI 的前台组就是
 // **后台组**；这时命令树里只要有一个进程碰一下这个终端（读 → SIGTTIN；`tcsetattr` → SIGTTOU），
 // 内核就会把**整个进程组**停住：make / sh / 命令自带的 `timeout` 一起停在 do_signal_stop，
@@ -249,10 +278,10 @@ export fn sh_kill_tree(pid: i32) void {
 //
 // aborted：用户在这条命令跑着的时候按了 esc / ctrl+c / ctrl+d —— 我们**当场**把子进程
 // 杀掉（跟超时同一条路），而不是「等它自己结束再说」。以前这里只调 tui_poll_tick()
-// 把键收下来却没人看，`sleep 300` 一跑起来就真的退不出（见 README 踩坑 44）。
+// 把键收下来却没人看，`sleep 300` 一跑起来就真的退不出（见 §16 踩坑 44）。
 //
 // P38：`waitpid` 带 WUNTRACED —— 子进程被 job control 停住（WIFSTOPPED）时当场收口，
-// 按 128+停止信号 返回并填 stopped_by（见 README 踩坑 60）。
+// 按 128+停止信号 返回并填 stopped_by（见 §16 踩坑 60）。
 fn sh_run_foreground(cfg: &const Config, cmd_z: &const byte, workdir_z: &const byte, timeout_ms: u32, out_s: &Buf, err_s: &Buf, timed_out: &bool, killed_by: &i32, aborted: &bool, stopped_by: &i32) i32 {
     timed_out[0] = false;
     killed_by[0] = 0;

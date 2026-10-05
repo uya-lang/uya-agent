@@ -1,4 +1,24 @@
-// src/stats.uya — 会话统计折叠 + 上下文占用（P18，对齐 DSH sessionStats + tokenUsage + contextPressure）
+// src/session/stats.uya — 会话统计折叠 + 上下文占用（P18，对齐 DSH sessionStats + tokenUsage + contextPressure）
+//
+// 本文件：模块级 `g_stats`（`Stats`）与折叠边界 `st_reset`/`st_step_start`/`st_first_token`/
+//   `st_assistant_message`/`st_tool_call`/`st_tool_result`/`st_step_end`/`st_turn_end`、
+//   回放入口 `st_fold_line`、一组读数 getter（`st_turns` … `st_have_pressure`）、
+//   全部格式化（`st_fmt_duration`/`st_fmt_tokens`/`st_fmt_tps`/`st_fmt_cache_hit`/`st_line`）
+//   与上下文占用（`st_ctx_percent`/`st_ctx_projected`/`st_fmt_figures`/`st_ctx_detail`/
+//   `st_stats_detail`）。私有辅助一律 `st_*` 前缀（`st_clamp0`、`st_round_div`、
+//   `st_put_tenths`、`st_put_bar` …）。
+// 不变量：① 实时折叠（agent 在边界上直接调 `st_*`）与回放（resume 时逐行 `st_fold_line`）
+//   **共享同一份状态机**，事件时间由调用方传入且必须**逐位相同**，所以两条路径的数字必须
+//   逐位相等（自测 `stats-fold` 钉这一条）；② 数字是**整个会话**口径，压缩/分页不改变它；
+//   ③ `turns` 按「不同的 turn」计数（`step/end` 只在 turn 变了时 +1），`steps` 每步 +1；
+//   ④ `pending` 有界（`STATS_PENDING_MAX`=8），满了丢**最老**一条；`turn/end` 丢弃所有
+//   未结算的 `tool/call`（不凭空造时间）；⑤ token 四桶互不重叠，`billed = 未缓存 + 缓存读 +
+//   缓存写 = last_pressure`；`out_tokens <= 0` 视为提供方没上报 ⇒ 不记 decode；
+//   ⑥ 时间/比率一律经 `st_clamp0` 钳 0（时钟回退、负增量不许污染累计值）。
+// 依赖：foundation/bufx（Buf、`bufx_mem_eq`、`bufx_eq_cstr`）；本仓 session/session
+//   （`st_fold_line` 用 `sess_line_type`/`sess_json_i64`/`sess_json_str` 解析日志行）。
+// 命名：对外 `st_*`（折叠边界 + 读数 + 格式化），私有同样 `st_` 但非 export；类型 `Stats`
+//   与 `StatPending`，常量 `STATS_PENDING_MAX`。
 //
 // 口径**逐行对照** DSH 的两个投影单元实现（`@deepseek-ai/dsh-session-stats` 的
 // `sessionStatsProjectionDefinition.apply`、`@deepseek-ai/dsh-token-meter` 的
@@ -90,6 +110,7 @@ var g_stats: Stats = Stats{
     npending: 0,
 };
 
+// 负值钳成 0（时钟回退、提供方给负数时不许污染累计量）
 fn st_clamp0(v: i64) i64 {
     if v < 0 {
         return 0;
@@ -109,6 +130,7 @@ fn st_round_div(a: i64, b: i64) i64 {
     return (v + (b / 2)) / b;
 }
 
+// 向上取整除法（b <= 0 或 a <= 0 时回 0）；缓存命中率逼近法里当除数用
 fn st_ceil_div(a: i64, b: i64) i64 {
     if a <= 0 || b <= 0 {
         return 0;
@@ -116,6 +138,7 @@ fn st_ceil_div(a: i64, b: i64) i64 {
     return ((a + b) - 1) / b;
 }
 
+// 全部清零（含释放 pending 里的 Buf）；resume 时先 reset 再逐行 st_fold_line
 export fn st_reset() void {
     var i: usize = 0;
     while i < g_stats.npending {
@@ -151,6 +174,7 @@ export fn st_reset() void {
 // 折叠：边界喂入
 // ============================================================
 
+// 开一步：记下 turn/step 与起点墙钟，清掉本步的首 token 标记。ms 是**调用方给的**事件时间
 export fn st_step_start(turn: i64, step: i64, ms: u64) void {
     g_stats.have_open = true;
     g_stats.open_turn = turn;
@@ -174,7 +198,7 @@ export fn st_first_token(turn: i64, step: i64, ms: u64) void {
 }
 
 // 一步收尾：llm/ttft/decode 时间 + token 账目
-// out_tokens <= 0 视为「提供方没上报输出 token」→ 不记 decode（见 README 的偏差说明）
+// out_tokens <= 0 视为「提供方没上报输出 token」→ 不记 decode（见 §15.4 的偏差说明）
 export fn st_assistant_message(turn: i64, step: i64, ms: u64, in_uncached: i64, cache_read: i64, cache_write: i64, out_tokens: i64) void {
     const iu: i64 = st_clamp0(in_uncached);
     const cr: i64 = st_clamp0(cache_read);
@@ -206,6 +230,8 @@ export fn st_assistant_message(turn: i64, step: i64, ms: u64, in_uncached: i64, 
     g_stats.have_open = false;
 }
 
+// 开一次工具调用计时：按 callId 入 pending（同 id 重复则后者覆盖）。
+// pending 已满时丢**最老**一条；OOM 时这次调用不计时但不影响别的边界；cn == 0 直接忽略。
 export fn st_tool_call(call_id: &const byte, cn: usize, ms: u64) void {
     if cn == 0 {
         return;
@@ -247,6 +273,8 @@ export fn st_tool_call(call_id: &const byte, cn: usize, ms: u64) void {
     g_stats.npending = slot + 1;
 }
 
+// 结算一次工具调用：`toolMs += clamp0(ms - call 时刻)` 并把该 callId 出队（负数增量钳 0）。
+// 找不到配对就走人 —— 不凭空造时间（DSH 的 folding 同）。
 export fn st_tool_result(call_id: &const byte, cn: usize, ms: u64) void {
     var i: usize = 0;
     while i < g_stats.npending && i < STATS_PENDING_MAX {
@@ -278,6 +306,8 @@ export fn st_tool_result(call_id: &const byte, cn: usize, ms: u64) void {
     // 没有配对的 tool/call：忽略（DSH 的 folding 也是这样，不凭空造时间）
 }
 
+// 一步收尾：`steps += 1`；`turns` 只在 turn 变了时 +1（step 参数未用，保留 DSH 的签名形状）。
+// 同时关掉 openStep：未组装的步不再参与计时。
 export fn st_step_end(turn: i64, step: i64) void {
     _ = step;
     if !g_stats.have_last_turn || g_stats.last_turn != turn {
@@ -289,6 +319,7 @@ export fn st_step_end(turn: i64, step: i64) void {
     g_stats.have_open = false;   // 步结束了：未组装的 openStep 不再参与计时
 }
 
+// 一轮结束：丢弃所有未结算的 tool/call（它们永远不会来 result，留着会跨轮串时间）
 export fn st_turn_end() void {
     var i: usize = 0;
     while i < g_stats.npending {
@@ -303,6 +334,9 @@ export fn st_turn_end() void {
 // 回放：把一行会话日志喂进同一份状态机（resume 用）
 // ============================================================
 
+// resume 回放入口：把**一行**会话日志按 type 派发进同一份状态机（step/start、
+// assistant/first-token、assistant/message、tool/call、tool/result、step/end、turn/end）；
+// 其它事件与统计无关，静默跳过。空行/坏行/缺 turn·step 的行一律不动状态。
 export fn st_fold_line(line: &const Buf) void {
     if line.len == 0 || (line.ptr as usize) == 0 {
         return;
@@ -377,17 +411,29 @@ export fn st_fold_line(line: &const Buf) void {
 // 读数（/status 与自测用）
 // ============================================================
 
+// 读数（累计口径）：轮数
 export fn st_turns() i64 { return g_stats.turns; }
+// 步数
 export fn st_steps() i64 { return g_stats.steps; }
+// LLM 墙钟累计（毫秒）
 export fn st_llm_ms() i64 { return g_stats.llm_ms; }
+// 工具调用墙钟累计（毫秒）
 export fn st_tool_ms() i64 { return g_stats.tool_ms; }
+// 首 token 延迟累计（毫秒）
 export fn st_ttft_ms() i64 { return g_stats.ttft_ms; }
+// 计入 TTFT 的步数（求平均时的分母；0 = 还没有样本）
 export fn st_ttft_steps() i64 { return g_stats.ttft_steps; }
+// 解码墙钟累计（毫秒，仅计提供方上报了 outputTokens 的步）
 export fn st_decode_ms() i64 { return g_stats.decode_ms; }
+// 解码输出 token 累计（decode_ms 的分子）
 export fn st_decode_tokens() i64 { return g_stats.decode_tokens; }
+// 计费输入 = 未缓存 + 缓存读 + 缓存写（三个互不重叠的桶；DSH 的 billedInput）
 export fn st_billed_input() i64 { return g_stats.in_uncached + g_stats.cache_read + g_stats.cache_write; }
+// 输出 token 累计
 export fn st_out_tokens() i64 { return g_stats.out_tokens; }
+// 最近一次 provider 压力样本（= DSH 的 pressureTokens，三桶之和）
 export fn st_pressure() i64 { return g_stats.last_pressure; }
+// 有没有压力样本（false 时 st_pressure 的值无意义，界面应省略该字段）
 export fn st_have_pressure() bool { return g_stats.have_pressure; }
 
 // ============================================================
@@ -427,6 +473,7 @@ fn st_put_duration_frac(out: &Buf, num: i64, den: i64) void {
     _ = buf_append_byte(out, 115);                          // 's'
 }
 
+// 一个时长（毫秒）：< 60s 一位小数 + "s"，否则 "{m}m{s}s"（DSH formatDuration）
 export fn st_fmt_duration(out: &Buf, ms: i64) void {
     st_put_duration_frac(out, ms, 1);
 }
@@ -445,6 +492,7 @@ fn st_put_scaled(out: &Buf, v10: i64) void {
     st_put_tenths(out, v10);
 }
 
+// token 数：<1000 原样、<1e6 带 `K`、否则 `M`（>=100 取整否则一位小数，DSH formatTokens）
 export fn st_fmt_tokens(out: &Buf, n: i64) void {
     const v: i64 = st_clamp0(n);
     if v < 1000 {
@@ -548,6 +596,7 @@ export fn st_fmt_cache_hit(out: &Buf, cache_read: i64, billed: i64) bool {
 // 统计行（DSH StatsLine：组内 " · "、组间 " | "）
 // ============================================================
 
+// 组间分隔 " | "（out 为空时不加，避免统计行以分隔符开头）
 fn st_line_sep(out: &Buf) void {
     if out.len > 0 {
         _ = buf_append_cstr(out, " | ");

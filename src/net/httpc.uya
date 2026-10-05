@@ -1,4 +1,17 @@
-// src/httpc.uya — 极简 HTTP/1.1 客户端（明文 + TLS），纯 Uya
+// src/net/httpc.uya — 极简 HTTP/1.1 客户端（明文 + TLS），纯 Uya
+//
+// 本文件：URL 解析（url_parse）、DNS（std.net.dns）、TCP 连接（tcp_connect）、TLS 开壳
+//   （tls_open + 三档信任策略）、请求构造（build_request）、连接读（conn_read）、整段式请求
+//   （http_request，非流式路径）、leaf 指纹解析与比对、TLS 噪声静音（tls_noise_mute）。
+// 不变量：① 信任策略只有三档且**默认 chain**（chain / pin / none，见 §5）；② leaf SHA-256
+//   从 `HandshakeCtx.server_flight_msg` 自己解析，**不依赖 `cert_parse` 的 RSA 前提**；③
+//   `tls_noise_mute` 把 `dup(2)` 存进 `g_err_fd`，显示层必须经 `err_fd()` 写（踩坑 30 同族）；
+//   ④ 明文与 TLS 走同一条上层路径，调用方不需要分支。
+// 依赖：libc（fcntl/heap/stdlib/syscall/unistd）、std.http.types、std.net.dns、std.string.strlen、
+//   lib/tls（tls.common / crypto.sha256 / https / ssl.context / ssl.handshake / ssl.record /
+//   x509.cert.Cert / x509.trust_store / x509.verify）；本仓 foundation/bufx、net/httpstream。
+// 命名：`hc_*`（连接与请求原语）、`url_parse`/`tcp_connect`/`tls_open`/`build_request`/`conn_read`、
+//   `Tls*` 常量、`http_request`。
 //
 // 为什么不用 std.http.http1_async / tls.https：
 //   1) std.http 的请求头构造器固定只发 Host/Connection/Content-Type/Content-Length，
@@ -60,12 +73,14 @@ export var hc_debug: bool = false;
 // 8 字节指针的第一个字节写出去 —— 屏幕上多一个乱码字节（与 tty.uya 里的坑同一个）。
 const HC_NL: [byte: 1] = [10];
 
+// 调试用：把 label 与 n 字节原始数据写到 fd 2，再补一个换行（仅 hc_debug 路径调用）。
 fn hc_dbg(label: &const byte, p: &const byte, n: usize) void {
     _ = sys_write(2, label as *const byte, strlen(label)) catch {};
     _ = sys_write(2, p as *const byte, n) catch {};
     _ = sys_write(2, &HC_NL[0], 1) catch {};
 }
 
+// 调试用：把 label 与十进制数 v 写到 fd 2（手写转换，避免依赖 bufx 的格式化）。
 fn hc_dbg_dec(label: &const byte, v: usize) void {
     const l: usize = strlen(label);
     _ = sys_write(2, label as *const byte, l) catch {};
@@ -110,18 +125,22 @@ export struct Url {
     path_len: usize,
 }
 
+// host 部分的**非 NUL 结尾**指针（长度看 Url.host_len，不要当 C 字符串用）。
 export fn url_host(u: &const Url) &byte {
     return &u.buf.ptr[u.host_off];
 }
 
+// path 部分的**非 NUL 结尾**指针（长度看 Url.path_len；path 为空时指向 '\0'）。
 export fn url_path(u: &const Url) &byte {
     return &u.buf.ptr[u.path_off];
 }
 
+// 一个空 Url（无 tls、空 buf、端口 0），供调用方零初始化后再喂给 url_parse。
 fn url_empty() Url {
     return Url{ tls: false, buf: buf_empty(), host_off: 0, host_len: 0, port: 0, path_off: 0, path_len: 0 };
 }
 
+// 释放 Url 持有的 buf（host/path 指针都指向它，free 后即失效）。
 export fn url_free(u: &Url) void {
     buf_free(&u.buf);
 }
@@ -231,6 +250,8 @@ fn fill_sockaddr_ipv4(a: byte, b: byte, c: byte, d: byte, port: u16, out: &byte)
     out[7] = d;
 }
 
+// 把 "a.b.c.d" 形式的明文 IPv4 解析成 out[0..4]（四段各 0–255）；
+// 段数不是 4、有非数字字符或任一段 > 255 都返回 false。
 fn scan_ipv4(s: &const byte, n: usize, out: &byte) bool {
     var idx: usize = 0;
     var part: i32 = 0;
@@ -264,6 +285,8 @@ fn scan_ipv4(s: &const byte, n: usize, out: &byte) bool {
     return true;
 }
 
+// 设置 socket 超时（SO_RCVTIMEO / SO_SNDTIMEO）：手工按 16 字节 timeval 布局
+// （前 8 字节秒、后 8 字节微秒，小端），因为不能依赖 libc 的 struct timeval 定义。
 fn set_sock_timeout(fd: i32, opt: i32, timeout_ms: u32) void {
     var tv: [byte: 16] = [0: 16];
     const sec: i64 = (timeout_ms as i64) / (1000 as i64);
@@ -283,6 +306,8 @@ fn set_sock_timeout(fd: i32, opt: i32, timeout_ms: u32) void {
     _ = sys_setsockopt(fd, SOL_SOCKET, opt, &tv[0] as &void, 16 as u32) catch {};
 }
 
+// DNS + TCP 一步到位：`localhost` 硬编码 127.0.0.1，能 scan_ipv4 就直连，否则走 std.net.dns
+// 解析第一个 IPv4。timeout_ms > 0 时同时设读写超时。失败统一返回 `HcConnectFailed`。
 export fn tcp_connect(host: &const byte, host_len: usize, port: u16, timeout_ms: u32) !i32 {
     var addr: [byte: 16] = [0: 16];
     var ip: [byte: 4] = [0: 4];
@@ -350,6 +375,7 @@ export struct TlsConn {
     verified: bool,
 }
 
+// 一个空 TlsConn（fd = -1、四个上下文指针为 null、verified = false）。
 export fn tls_conn_empty() TlsConn {
     return TlsConn{
         fd: -1,
@@ -399,6 +425,8 @@ fn tls_capture_leaf(c: &TlsConn) void {
     }
 }
 
+// 由 leaf 证书 DER 算出 SHA-256 的 64 字符小写 hex 指纹，存进 c.observed。
+// 没有 leaf 时 observed_len 置 0（后续 tls_pin_matches 必然失败）。
 fn tls_compute_observed(c: &TlsConn) void {
     c.observed_len = 0;
     if (c.leaf_der as usize) == 0 || c.leaf_der_len == 0 {
@@ -409,6 +437,8 @@ fn tls_compute_observed(c: &TlsConn) void {
     c.observed_len = hex_of(&digest[0], 32, &c.observed[0]);
 }
 
+// 配置的 pin 与实测指纹是否一致：pin 长度必须正好 64（SHA-256 的 hex 长度），
+// 比较时两侧都做 ASCII 小写折叠；长度不符直接 false。
 fn tls_pin_matches(c: &TlsConn, pin: &[byte]) bool {
     if pin.len != 64 || c.observed_len != 64 {
         return false;
@@ -424,6 +454,11 @@ fn tls_pin_matches(c: &TlsConn, pin: &[byte]) bool {
 }
 
 // verify: HC_VERIFY_CHAIN / HC_VERIFY_PIN / HC_VERIFY_NONE
+// 在已连通的 fd（c.fd）上跑 TLS 握手并按 verify 档位判定信任：
+//   HC_VERIFY_CHAIN 走 stdlib 链校验（要求服务端发根证书，真实站点常失败 → `HcTlsUnsupported`）
+//   HC_VERIFY_PIN   比对 leaf SHA-256 指纹（不匹配 `HcPinMismatch`）
+//   HC_VERIFY_NONE  不校验
+// 分配的 4 个上下文一律交给 tls_conn_free 释放；成功时 c.verified 记录是否真的校验过。
 export fn tls_open(c: &TlsConn, host: &const byte, host_len: usize, verify: i32, pin: &[byte]) !void {
     const hs: &HandshakeCtx = malloc(@size_of(HandshakeCtx)) as &HandshakeCtx;
     if (hs as usize) == 0 {
@@ -487,6 +522,7 @@ export fn tls_open(c: &TlsConn, host: &const byte, host_len: usize, verify: i32,
     return;
 }
 
+// 释放 tls_open 分配的 4 个上下文并全部置 null；可安全重复调用（与 fd 无关）。
 export fn tls_conn_free(c: &TlsConn) void {
     if (c.hs as usize) != 0 {
         free(c.hs as &void);
@@ -582,6 +618,8 @@ export struct HcConn {
     tc: &TlsConn,
 }
 
+// 读一次连接（明文或 TLS 都走这里）；返回读到的字节数，**0 表示 EOF（对端已关）**。
+// 超时映射成 `HcTimeout`，其余 IO 错误映射成 `HcIoFailed`。
 fn conn_read(c: &HcConn, out: &byte, cap: usize) !usize {
     if c.is_tls {
         return tls_read_some(c.tc, out, cap);
@@ -599,6 +637,7 @@ fn conn_read(c: &HcConn, out: &byte, cap: usize) !usize {
     return n;
 }
 
+// 循环写满整段（明文或 TLS）；短写由底层继续，超时映射 `HcTimeout`，其余 `HcIoFailed`。
 fn conn_write_all(c: &HcConn, p: &const byte, n: usize) !void {
     if c.is_tls {
         return tls_write_all(c.tc, p, n);
@@ -622,14 +661,19 @@ export struct Resp {
     head_len: usize,
 }
 
+// 一个空响应（status = 0、空 body）；body 由 http_request 分配，用 resp_free 释放。
 fn resp_empty() Resp {
     return Resp{ status: 0, body: buf_empty(), head_len: 0 };
 }
 
+// 释放 Resp.body；可安全重复调用。
 export fn resp_free(r: &Resp) void {
     buf_free(&r.body);
 }
 
+// 拼请求头（追加进 out，不清空）：请求行 + Host（非默认端口才带 :port）+ User-Agent +
+// extra_headers 原样 + Content-Length + `Connection: close`。body 由调用方另行追加。
+// 分配失败返回 false。
 fn build_request(u: &const Url, method: &[byte], extra_headers: &[byte], body_len: usize, out: &Buf) bool {
     if !buf_append_slice(out, method) {
         return false;
@@ -678,6 +722,7 @@ fn build_request(u: &const Url, method: &[byte], extra_headers: &[byte], body_le
     return true;
 }
 
+// 从状态行里取 3 位十进制状态码；格式不对返回 **0**（调用方据此报 `HcBadResponse`）。
 fn parse_status(head: &[byte], head_len: usize) i32 {
     var sp: usize = 0;
     while sp < head_len && head.ptr[sp] != 32 {
@@ -788,6 +833,10 @@ fn decode_chunked_inplace(src: &Buf, from: usize) i64 {
     return -1;
 }
 
+// 整段式 HTTP 请求（**非流式**路径，`--no-stream` 用）：连接 → 写请求 → 发
+// `Connection: close` 一直读到 EOF，再把头/体解析完才返回。体上限 `max_body + HC_HEAD_MAX`，
+// 超出报 `HcTooLarge`；chunked 会就地解码，content-length 不足报 `HcBadResponse`。
+// out 里的 body 是**独立拷贝的 Buf**，调用方负责 resp_free；tls_out 由调用方 tls_conn_free。
 export fn http_request(
     url: &[byte],
     method: &[byte],

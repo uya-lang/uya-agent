@@ -1,4 +1,27 @@
-// src/fsx.uya — 文件系统工具（P6，对齐 DSH tool-fs + fs-observation-policy）
+// src/tools/fsx.uya — 文件系统工具（P6，对齐 DSH tool-fs + fs-observation-policy）
+//
+// 本文件：路径解析与展示（`fs_resolve`/`fs_display`/`fs_stat`）、观察状态表（`FsObsTable` 与
+//   `fs_obs_init`/`fs_obs_record`/`fs_obs_kind`/`fs_obs_same_version`）、结果信封
+//   （`fs_env_open`/`fs_env_close`/`fs_err`/`fs_wt_denied`）、read 的行窗口与行号
+//   （`fs_count_lines`/`fs_line_at`/`fs_count_window`/`fs_read_file_all`）与三个工具入口
+//   `fs_tool_read`/`fs_tool_write`/`fs_tool_edit`；上限常量 `fs_read_limit`/
+//   `fs_read_max_line`/`fs_read_max_bytes` 是 **var**，preset 旋钮可以覆盖。
+// 不变量：① 观察表的**键是解析后的绝对路径**，版本 = `(mtime, mtime_nsec, size)` 三元组；
+//   表是纯内存态（`FS_OBS_MAX`=128 条，满了不再记），**不持久化** —— 恢复会话后必须重新
+//   read 才能 edit；② write：文件已存在且 `OBS_UNSEEN` → 要求先读；已读但版本变了 →
+//   `FS_STALE_VERSION`；文件**不存在**时不要求先读（直接创建）；read 命中（含读到空）
+//   记 `OBS_PRESENT`，读到不存在记 `OBS_ABSENT`，write/edit 成功后刷新记录；
+//   ③ read 必须**流式扫完整个文件**数真实总行数（只读文件头 cap 字节会把 5756 行的
+//   agent.uya 报成 3149 行，模型据此以为读完了，踩坑 34）；④ 行长按**字符数**截断且不
+//   切断 UTF-8，footer 三种文案各有触发条件；⑤ plan 闸门**排在** read-only 之前（当前最
+//   直接的障碍是「计划还没批」，文案也最能指路），⑥ write 的 diff 采集必须在 `O_TRUNC`
+//   **之前**读旧内容；⑦ 失败一律以 `Error: …` 文本返回，不抛错。
+// 依赖：libc.syscall/unistd（open/stat/write/mkdir）、foundation/bufx（Buf、`bufx_mem_eq`）、
+//   foundation/jsonx（工具参数解析）；本仓 tools/perm（`perm_allows_write`）、plan
+//   （`plan_blocks_write`）、vcs/worktreex（`wt_guard_path_crosses`）、diff/diffx
+//   （`diffx_enabled`/`diffx_note_*`，只用于显示层采集）。
+// 命名：对外 `fs_*`（解析 / 观察 / 三个工具入口）+ `FS_*` 常量（拒绝文案与上限），
+//   私有同样 `fs_*` 前缀（非 export），工具入口统一 `fs_tool_*`。
 //
 // 三个工具：read / write / edit。要点来自 DSH 的实测行为：
 //   * read：按 offset/limit 取窗口，逐行加行号，三种 footer 文案，行长与字节都有上限；
@@ -131,6 +154,8 @@ export struct FsStat {
     mtime_nsec: i64,
 }
 
+// 取 `abs_z`（NUL 结尾的绝对路径）的元数据写进 out；**拿不到也算成功布局**
+// （out.exists = false 并返回 false，调用方只认 out 里的字段）。is_dir 靠 S_IFDIR 位判。
 export fn fs_stat(abs_z: &const byte, out: &FsStat) bool {
     out.exists = false;
     out.is_dir = false;
@@ -191,10 +216,12 @@ export struct FsObsTable {
     n: usize,
 }
 
+// 一条「没观察过」的槽位（kind = OBS_UNSEEN，空 Buf）—— 表初始化用
 fn fs_obs_empty() FsObs {
     return FsObs{ kind: OBS_UNSEEN, path: buf_empty(), mtime: 0, mtime_nsec: 0, size: 0 };
 }
 
+// 把表清成 FS_OBS_MAX 条「没观察过」+ n = 0（观察表是纯内存态，进程起一次就够）
 export fn fs_obs_init(t: &FsObsTable) void {
     var i: usize = 0;
     while i < FS_OBS_MAX {
@@ -204,6 +231,7 @@ export fn fs_obs_init(t: &FsObsTable) void {
     t.n = 0;
 }
 
+// 按**解析后的绝对路径**找槽位；返回下标或 -1（键是字节精确比较，不做规范化）
 fn fs_obs_find(t: &const FsObsTable, abs: &const byte, abs_len: usize) isize {
     var i: usize = 0;
     while i < t.n && i < FS_OBS_MAX {
@@ -216,6 +244,8 @@ fn fs_obs_find(t: &const FsObsTable, abs: &const byte, abs_len: usize) isize {
     return -1;
 }
 
+// 记录/刷新一次观察：已有槽位原地更新（present 存版本三元组，absent 只改 kind）；
+// 没有就占用新槽位，表满（FS_OBS_MAX）时**静默丢弃**（只是观察缺失，不是错误）。
 export fn fs_obs_record(t: &FsObsTable, abs: &const byte, abs_len: usize, st: &const FsStat) void {
     const found: isize = fs_obs_find(t, abs, abs_len);
     if found >= 0 {
@@ -289,6 +319,7 @@ export fn fs_obs_same_version(t: &const FsObsTable, abs: &const byte, abs_len: u
 // ============================================================
 // 结果信封
 // ============================================================
+// 读侧 envelope：`<path>…</path>\n<type>…</type>\n<content>\n`（kind 是 "file" / "directory"）
 fn fs_env_open(out: &Buf, display: &const Buf, kind: &const byte) bool {
     if !buf_append_cstr(out, "<path>") {
         return false;
@@ -305,10 +336,12 @@ fn fs_env_open(out: &Buf, display: &const Buf, kind: &const byte) bool {
     return buf_append_cstr(out, "</type>\n<content>\n");
 }
 
+// 关掉 envelope（`\n</content>`）；与 fs_env_open 成对，调了两个的正文要自己夹在中间
 fn fs_env_close(out: &Buf) bool {
     return buf_append_cstr(out, "\n</content>");
 }
 
+// 统一的错误前缀（`Error: ` + msg）；错误一律走文本返回，不抛错、不中断回合
 fn fs_err(out: &Buf, msg: &const byte) void {
     _ = buf_append_cstr(out, "Error: ");
     _ = buf_append_cstr(out, msg);
@@ -341,6 +374,7 @@ struct FsLine {
     len: usize,
 }
 
+// 数 data 里的行数（末尾没有换行结尾的残行也算一行 —— 与读窗口的 total 同口径）
 fn fs_count_lines(data: &[byte]) usize {
     if data.len == 0 {
         return 0;
@@ -604,6 +638,7 @@ fn fs_read_window(abs_z: &const byte, first: usize, limit: usize, bytes_cap: usi
     return true;
 }
 
+// 把整文件读进 out 直到 EOF 或超过 limit（超了即停，out 里可能比文件短）—— edit 用它做替换
 fn fs_read_file_all(abs_z: &const byte, out: &Buf, limit: usize) bool {
     const fd: i32 = sys_open(abs_z as *const byte, O_RDONLY as i32, 0) catch {
         return false;
@@ -629,6 +664,7 @@ fn fs_read_file_all(abs_z: &const byte, out: &Buf, limit: usize) bool {
 // ============================================================
 // write
 // ============================================================
+// 建父目录（只建一级，不逐级 mkdir；已存在不算错）。取不到父路径时返回 false
 fn fs_mkdir_parent(abs_z: &const byte) bool {
     const n: usize = bufx_cstr_len(abs_z);
     var i: usize = n;
@@ -646,6 +682,10 @@ fn fs_mkdir_parent(abs_z: &const byte) bool {
     return true;
 }
 
+// write 工具入口。顺序：参数校验 → plan 闸门 → read-only 闸门 → worktree 写闸门 →
+// 观察策略（已存在则要求「读过且版本未变」，否则 FS_STALE_VERSION / 先 read 提示）→
+// O_TRUNC 前采 diff → 落盘 → 刷新观察记录 → 回 `<path>…` 信封（正文 `Updated file` /
+// `Created file`）。**文件不存在时不要求先读**。所有失败也写进 out，不抛错。
 export fn fs_tool_write(f: &const FsCtx, obs: &FsObsTable, args: &const JsonValue, out: &Buf) void {
     var rel: Buf = buf_empty();
     defer { buf_free(&rel); }
@@ -792,6 +832,12 @@ fn fs_count_occurrences(data: &[byte], needle: &[byte]) i32 {
     return n;
 }
 
+// edit 工具入口。顺序：参数校验（old_string 非空、new_string 存在、两者必须不同）→ plan 闸门 →
+// read-only 闸门 → worktree 写闸门 → 观察策略（不存在 + 没见过 → 先 read 提示；见过 →
+// file not found；存在但没见过 → 先 read 提示；版本变了 → FS_STALE_VERSION）→ 整文件读入
+// （上限 4 MiB）做字面替换 → 刷新观察记录 → 回 `The file X has been updated successfully.`
+// / `…All occurrences were successfully replaced.`。`old_string` 不唯一且没给 `replace_all=true`
+// 时报「appears N times」，绝不猜要替哪一个。
 export fn fs_tool_edit(f: &const FsCtx, obs: &FsObsTable, args: &const JsonValue, out: &Buf) void {
     var rel: Buf = buf_empty();
     defer { buf_free(&rel); }
@@ -949,6 +995,7 @@ export fn fs_tool_edit(f: &const FsCtx, obs: &FsObsTable, args: &const JsonValue
     }
 }
 
+// JSON 值当布尔读：只认 `.bool_val`，其它类型（含缺字段的 json_null）一律 false
 fn json_bool_of(v: &const JsonValue) bool {
     const val: JsonValue = v[0];
     match val {

@@ -1,4 +1,27 @@
-// src/agent.uya — 极简 CLI 编程 agent：CLI / 环境变量 / REPL / 主循环 / tools schema
+// src/agent/agent.uya — 极简 CLI 编程 agent：CLI / 环境变量 / REPL / 主循环 / tools schema
+//
+// 本文件：进程入口 `main` 与配置来源链、对话历史（`Msg`/`History` 与 `hist_*`）、
+//   system prompt 与运行时上下文的装配调用点、请求组装（`build_chat_request` /
+//   `build_responses_request`）、一步的收发与收尾（`agent_step_stream` / `agent_step_plain` /
+//   `agent_finish_step`）、回合与 step 循环（`agent_turn_loop*`）、工具派发
+//   （`dispatch_tool_body`）与 28 条工具 schema、会话事件写入（`agent_bound_*` / `agent_log_*`）、
+//   标题（`agent_title_*`）、工作区（`agent_workspace_apply_full`）、TUI 生命周期
+//   （`agent_tui_start`/`agent_tui_stop`/`agent_tui_demo`）、全部斜杠命令与 `--print-config`。
+// 不变量：① **`--dsh-home` / `--dsh-root` / `--no-dsh-config` / `--strict-dsh-config` 必须
+//   在读设置之前预扫** —— 放到主循环再解析会静默失效（§3.1）；② 配置优先级 **DSH 设置 →
+//   环境变量 → CLI**，每个取值都带来源标签；③ **`main` 必须 `export fn main() i32`**（不能
+//   写 `!i32`：split-C 下会与 entry 冲突，§16 踩坑 8）；④ **任何 `&Msg` 不许跨 `hist_push*` /
+//   `hist_reserve` 使用**（realloc 搬家，§3.6）；⑤ 历史里 `assistant(tool_calls)` + N 条 tool
+//   结果是**原子组**，派发失败要整组回滚（`hist_truncate_to`）；⑥ 退化响应那一步**不留痕**
+//   （不写 `assistant/message`、不进历史、不计统计，§5.4）；⑦ 所有显示输出走 `err_fd()`
+//   （`tls_noise_mute` 会动 fd 2）。
+// 依赖：libc（fcntl / heap / stdlib / syscall / unistd）、std.json、std.mem（arena / mem）、
+//   std.runtime（get_argc / get_argv）、std.string.strlen；本仓的**几乎每一个域** ——
+//   foundation（bufx / jsonx / yamlcfg）、net（httpc / llm / webx）、term（含 tui/）、tools、
+//   session、vcs、diff、media。它是分层图的最上层（§2.2）。
+// 命名：`agent_*`（主流程与命令）、`cfg_*`（配置）、`hist_*`/`msg_*`（历史）、`build_*`（构请求）、
+//   `tools_*`（schema）、`dispatch_*`、`dump_*`/`out_*`（诊断输出）、`parse_*`、
+//   `wt_act_*`（worktree 工具面）、`g_*`（状态全局，见 §3.3 的表）。
 //
 // 协议（刻意极简）：
 //   * 非流式 POST {base_url}/chat/completions，带 tools（OpenAI function calling）；
@@ -101,7 +124,7 @@ export struct Config {
     src_access: u8,           // 访问模式的来源（0 默认 / 1 dsh-settings / 2 env / 3 cli）
     src_verify: u8,           // TLS 信任策略的来源（0 默认 / 1 dsh-settings / 2 env / 3 cli）
     src_pin: u8,              // leaf 指纹的来源
-    // 线协议（README「Responses 接口」）：默认 = responses；未声明时可一次性协商回退 chat
+    // 线协议（§4.8）：默认 = responses；未声明时可一次性协商回退 chat
     api_style: u8,            // LLM_STYLE_CHAT / LLM_STYLE_RESPONSES
     api_dev_role: bool,       // true = 系统提示发 role:"developer"（false = "system"）
     api_store: bool,          // true = responses 请求里发 "store":false
@@ -149,6 +172,9 @@ export struct Config {
     // 由父进程先生成 id、传给子进程用，父子就天然对上了。
     force_session_id: Buf,}
 
+// 配置的**唯一**出厂值（约 100 个字段）。main 的第一件事就是它，
+// 之后按「DSH 设置 → 环境变量 → CLI」逐层覆盖（§3.1）。
+// 改这里的默认值等于改「用户什么都不给时的行为」，所以每一处都要能说出理由。
 fn cfg_default() Config {
     return Config{
         base_url: buf_empty(),
@@ -242,6 +268,8 @@ fn cfg_default() Config {
         force_session_id: buf_empty(),    };
 }
 
+// 释放 Config 里所有的 Buf 字段。**幂等**（buf_free 后清零），
+// 所以重复调用安全 —— CLI 的早退分支都靠 defer 收尾。
 fn cfg_free(c: &Config) void {
     buf_free(&c.resume_id);
     buf_free(&c.agent_home);
@@ -268,7 +296,7 @@ fn cfg_free(c: &Config) void {
 }
 
 // ============================================================
-// 线协议：选择与一次性协商（README「Responses 接口」）
+// 线协议：选择与一次性协商（§4.8）
 //
 // 默认（什么都没声明）= 先按 Responses 发；只有「端点不存在」（404/405/501）才回退
 // chat/completions，并且**每个进程只协商一次**，结果记在下面两个全局里（子代理是
@@ -351,14 +379,19 @@ fn out_err(p: &const byte) void {
     tty_stream_write(2, p as &const byte, strlen(p));
 }
 
+// 往**显示用的 stderr**（`err_fd()`，不是裸 fd 2）原样写 n 字节。
+// 必须走 `err_fd()`：`tls_noise_mute` 会把 fd 2 指到 /dev/null（§16 踩坑 21/30）。
 fn out_bytes(p: &const byte, n: usize) void {
     tty_stream_write(1, p, n);
 }
 
+// 同 `out_bytes`，语义上归入「错误输出」那一族（目前实现一致，分开只是为了让
+// 调用点的意图可读，也便于以后给错误流单独加前缀）。
 fn out_err_bytes(p: &const byte, n: usize) void {
     tty_stream_write(2, p, n);
 }
 
+// 以**十进制**打印一个 usize（不换行）。给 `[step N]`、计数这类拼装行用。
 fn out_err_dec(v: usize) void {
     var tmp: [byte: 24] = [0: 24];
     var n: usize = v;
@@ -400,6 +433,8 @@ const DIAG_LOG_MAX: usize = 65536;
 
 var g_diag_dump: Buf = Buf{ ptr: null, len: 0, cap: 0 };   // --debug-dump 的落盘路径（空 = 不落盘）
 
+// 设 `--debug-dump` 的落盘路径（**原始字节**追加：网关错误体 / 坏 payload 头部）。
+// 长度由调用方给（CLI 解出来的值不一定有 NUL）；空路径 = 关闭。
 export fn agent_set_debug_dump(path: &const byte, n: usize) void {
     if !buf_valid(&g_diag_dump) {
         g_diag_dump = buf_new(n + 8);
@@ -525,6 +560,11 @@ export fn err_fd() i32 {
     return g_err_fd;
 }
 
+// **TLS 噪声静音**：`lib/tls` 把握手全过程写到 fd 2（满屏 `[HS] ...`），
+// 所以发请求期间把 fd 2 重定向到 /dev/null。
+// `g` 记下 `dup(2)` 的原 fd（用于还原），**副作用是显示层也被静音** ——
+// 这正是显示层一律走 `err_fd()` 的原因（§16 踩坑 21/30）。
+// `enabled = false`（或 `--tls-debug`）时什么都不做，一个字节都不改。
 fn tls_noise_mute(g: &FdGuard, enabled: bool) void {
     g.saved = -1;
     g.nullfd = -1;
@@ -551,6 +591,8 @@ fn tls_noise_mute(g: &FdGuard, enabled: bool) void {
     g_err_fd = saved;
 }
 
+// 还原 `tls_noise_mute` 抢走的 fd 2（dup2 往返）并把 `g` 清零。
+// 与 mute 严格配对（同一层 defer），不还原就会把后面所有输出都吞掉。
 fn tls_noise_unmute(g: &FdGuard) void {
     if g.active {
         _ = sys_dup2(g.saved, 2) catch {};
@@ -567,10 +609,14 @@ fn tls_noise_unmute(g: &FdGuard) void {
     }
 }
 
+// C 串长度（扫到 NUL 为止）。**只用于确认是 C 串的输入**（argv / env），
+// 对 `Buf.ptr` 用它就是踩坑（Buf 不带尾 NUL，会读到堆尾巴 —— §16 踩坑 57/67）。
 fn cstr_len(p: &byte) usize {
     return strlen(p);
 }
 
+// CLI 参数严格相等（`p` 是 C 串，`lit` 是字面量）。值**不参与**匹配 ——
+// 要匹配 `--model=x` 这种形式得用别的前缀函数。
 fn arg_eq(p: &byte, lit: &const byte) bool {
     const n: usize = cstr_len(p);
     const m: usize = strlen(lit);
@@ -600,6 +646,8 @@ fn arg_starts_with(p: &byte, lit: &const byte) bool {
     return true;
 }
 
+// C 串 → 新 Buf（拷一份，带长度）。给「CLI/env 里取到的值要留到后面用」的场合。
+// 返回的 Buf 归调用方，必须 `buf_free`。分配失败返回 `buf_empty()`。
 fn buf_from_cstr(p: &byte) Buf {
     const n: usize = cstr_len(p);
     var b: Buf = buf_new(n + 8);
@@ -609,6 +657,8 @@ fn buf_from_cstr(p: &byte) Buf {
     return b;
 }
 
+// 读环境变量 `name`，没有就用 `fallback` 字面量。返回新 Buf（归调用方，要 free）。
+// 这是「环境变量 → 默认值」这一层的统一入口（§3.1 的第 3 步）。
 fn env_or(name: &const byte, fallback: &const byte) Buf {
     const p: &byte = getenv(name);
     if (p as usize) != 0 {
@@ -621,6 +671,8 @@ fn env_or(name: &const byte, fallback: &const byte) Buf {
     return b;
 }
 
+// 按顺序试三个环境变量名，取**第一个非空**的值；都没有返回空 Buf。
+// 用在 API key 的三选一（`UYA_AGENT_API_KEY` / `DEEPSEEK_API_KEY` / `OPENAI_API_KEY`）。
 fn env_first(n1: &const byte, n2: &const byte, n3: &const byte) Buf {
     var b: Buf = env_or(n1, "");
     if b.len > 0 {
@@ -692,10 +744,15 @@ struct History {
     bytes: usize,
 }
 
+// 零值 Msg（role 0、kind 取 CMP_KIND_TOOL、两个指针 null、长度 0）。
+// 固定数组/结构体的初始化式必须是常量，所以全局只能靠它填。
+// 注意 `Msg` 用的是**裸指针 + 长度**而不是 Buf（见 §3.6）。
 fn msg_zero() Msg {
     return Msg{ role: 0, kind: CMP_KIND_TOOL, text: null, text_len: 0, extra: null, extra_len: 0 };
 }
 
+// 空历史（items=null、len/cap/bytes 全 0），随后按需翻倍增长。
+// **不限条数**（对齐 DSH）：条数由上下文压力管，不由历史管（§3.6）。
 fn hist_init() History {
     return History{ items: null, len: 0, cap: 0, bytes: 0 };
 }
@@ -722,6 +779,7 @@ fn hist_reserve(h: &History, extra: usize) bool {
     return true;
 }
 
+// 释放历史里每一条的 text / extra 与 items 本身。幂等。
 fn hist_free(h: &History) void {
     var i: usize = 0;
     while i < h.len {
@@ -759,6 +817,8 @@ fn hist_dup(p: &const byte, n: usize) &byte {
     return q;
 }
 
+// 某条消息因为超 `MSG_CONTENT_MAX` 被裁剪时落一行诊断（before → after 字节数）。
+// 裁剪是**静默**发生的（模型不会被告知），所以至少让它进会话日志/转录可查。
 fn hist_fit_note(before: usize, after: usize) void {
     out_err("[history] 单条消息过长（");
     out_err_dec(before);
@@ -831,6 +891,9 @@ fn hist_push_tool_kind(h: &History, kind: u8, text: &const byte, text_len: usize
     return hist_push_msg_kind(h, ROLE_TOOL, kind, text, text_len, extra, extra_len);
 }
 
+// 往历史尾部压一条消息（`role` / `kind` / 正文 / `extra` 各拷一份）。
+// **会 realloc 搬家** ⇒ 调用之后任何 `&Msg` 都失效（§3.6 的头号不变量）。
+// 单条超 `MSG_CONTENT_MAX` 时先按 DSH 剪枝缩、再头尾截断（`hist_fit_note` 落诊断）。
 fn hist_push_msg_kind(h: &History, role: u8, kind: u8, text: &const byte, text_len: usize, extra: &const byte, extra_len: usize) bool {
     // extra 不做裁剪：它是 tool_calls 数组原文 / tool_call_id，截断后就是非法 JSON
     // （比「失败 + 回滚」更糟），所以这里仍然按上限拒绝。
@@ -886,6 +949,8 @@ fn hist_push(h: &History, role: u8, p: &const byte, n: usize) bool {
     return hist_push_msg(h, role, p, n, null, 0);
 }
 
+// 释放一条消息的两块堆内存（text / extra）并清零长度。
+// 拆出来是为了让 `hist_drop_oldest` 与 `hist_free` 走同一条释放口径。
 fn msg_free_one(m: &Msg) void {
     if (m.text as usize) != 0 {
         free(m.text as &void);
@@ -976,6 +1041,8 @@ fn hist_drop_oldest_below(h: &History, floor: usize) bool {
     return true;
 }
 
+// 丢掉**最老**的那条消息并把后面的整体前移（用于压缩/裁剪后腾空间）。
+// 历史为空返回 false。注意这会 `memmove` 整块 —— 之前取到的 `&Msg` 一律失效。
 fn hist_drop_oldest(h: &History) bool {
     return hist_drop_oldest_below(h, h.len);
 }
@@ -989,12 +1056,16 @@ export fn msg_at(h: &const History, i: usize) &const Msg {
     return @ptr_from_usize(@usize_from_ptr(base as &const void) + i * esz) as &const Msg;
 }
 
+// 取第 i 条消息的**可写**指针（越界返回 null）。
+// 返回的指针指向堆数组内部：**不许跨任何 `hist_push*` / `hist_reserve` / `hist_drop_*` 留存**。
 export fn msg_at_mut(h: &History, i: usize) &Msg {
     const base: &Msg = h.items;
     const esz: usize = @size_of(Msg) as usize;
     return @ptr_from_usize(@usize_from_ptr(base as &void) + i * esz) as &Msg;
 }
 
+// role 码 → OpenAI 协议的字符串（`system` / `user` / `assistant` / `tool`）。
+// 认不出的码当 `user`（防御：宁可发一条 user 也不要发一个协议里不存在的 role）。
 fn role_cstr(role: u8) &byte {
     if role == ROLE_SYSTEM {
         return "system" as &byte;
@@ -1057,6 +1128,7 @@ var g_compact_enabled: bool = true;
 // preset 的 bash 超时旋钮（只在用户没改过默认值时生效）
 var g_bash_timeout_knob: u32 = 0;
 
+// 当前生效的 bash 默认超时（毫秒）。工具层读它当 `timeoutMs` 的缺省值。
 export fn agent_bash_timeout_knob() u32 {
     return g_bash_timeout_knob;
 }
@@ -1074,6 +1146,8 @@ var g_watch: Watch = Watch{
     polled_ms: 0, ended: false,
 };
 
+// 设 agent home（会话/索引/附件/goal 的根）。返回值 = 是否设置成功。
+// 必须在 `agent_session_open` 之前调 —— 会话路径是按它算出来的。
 export fn agent_set_home(home: &const byte) bool {
     buf_free(&g_home);
     g_home = buf_new(bufx_cstr_len(home) + 8);
@@ -1081,6 +1155,7 @@ export fn agent_set_home(home: &const byte) bool {
     return buf_append_cstr_z(&g_home, home);
 }
 
+// 当前 agent home（默认 `~/.uya-agent`）。**返回内部全局的切片**，调用方不许留存。
 export fn agent_home() &[byte] {
     return g_home.ptr[0: g_home.len];
 }
@@ -1204,6 +1279,8 @@ fn agent_title_base_into(out: &Buf, ws: &const byte, n: usize) void {
     }
 }
 
+// 用**首条用户消息**算初始标题（前 5 词 / ≤40 B，对齐 DSH preset），
+// 并记住「用户没手动改过」这件事（手改之后不再被自动值覆盖）。
 fn agent_title_base_set(cfg: &const Config) void {
     if !buf_valid(&g_title_base) {
         g_title_base = buf_new(320);
@@ -1302,6 +1379,8 @@ fn agent_title_log_kind(kind: &const byte, t: &const byte, n: usize) void {
 export const TITLE_SET_OK: i32 = 0;
 export const TITLE_SET_EMPTY: i32 = 1;
 
+// 设标题并标明**来源**（人类 / 模型自动 / 显式命令）。来源决定后续能不能被自动值覆盖：
+// 人类改过的标题，自动起标题不再动它。
 fn agent_title_set_kind(
     cfg: &const Config,
     text: &const byte,
@@ -1529,6 +1608,8 @@ export fn agent_title_auto_schedule(cfg: &const Config) void {
     g_title_auto_arm_ms = ua_now_ms();
 }
 
+// 自动起标题是否**真的**该跑：开关开着 **且** 非交互（管道/CI）不跑 **且** 子代理不跑。
+// 理由：标题只服务交互界面，那两条路径上 `tty_title_set` 本来就是空操作 (§11.7)。
 fn agent_title_auto_on(cfg: &const Config) bool {
     if !cfg.title || !cfg.title_auto || !g_interactive || cfg.is_subagent {
         return false;
@@ -1587,6 +1668,9 @@ fn agent_title_auto_idle_ok() bool {
     return inbox_len(&g_steer) == 0;
 }
 
+// 自动起标题的**发起**（P48）：只有「距回合收尾与距最后一次敲键都 ≥900 ms」才真的发。
+// 它是同步的（单线程，踩坑 47 起不了第二条线程），而且**用户一动键盘就中止自己**。
+// `--no-title-auto` 时整个函数是空操作。
 export fn agent_title_auto_pending_tick(cfg: &const Config, h: &const History) void {
     if (!g_title_auto_pending) {
         return;
@@ -1646,6 +1730,9 @@ export fn agent_title_tool_set(cfg: &const Config, args: &const JsonValue, out: 
     _ = buf_append_cstr(out, "\" (pinned: automatic titling will not overwrite it; pass \"\" to clear)\n");
 }
 
+// 写一条 `user/message` 事件。`steer = true` 时带 `source.kind = "steer"`
+// （运行中敲进来的文本，见 §3.4 的 step 边界领取）。
+// 带图片附件时**多写一个 `attachments` 数组**；为空时一个字节都不多写（老日志形状不变）。
 fn agent_log_user(text: &const byte, n: usize, steer: bool) void {
     var empty_att: Buf = buf_empty();
     var no: bool = false;
@@ -1689,6 +1776,9 @@ fn agent_log_user_att(text: &const byte, n: usize, steer: bool, att: &const Buf,
     agent_title_apply();
 }
 
+// 写一条 `assistant/message` 事件（正文 + 本次 usage）。
+// **退化响应那一步不写**（§5.4）—— 否则「上游正常收尾但什么都没给」在日志里
+// 与「模型真的回了空串」长得一模一样。
 fn agent_log_assistant(step: i32, o: &const ChatOut, t: u64) void {
     if !g_sess.save {
         return;
@@ -1830,6 +1920,8 @@ fn agent_log_tool_call(step: i32, call_id: &const Buf, name: &const Buf, args: &
     }
 }
 
+// 写一条 `tool/result` 事件（工具名、call_id、结果正文）。
+// `call_id` 是严格工具协议回放的锚点 —— 与 `tool/call` 那一条配对（§3.5 的原子组）。
 fn agent_log_tool_result(step: i32, call_id: &const Buf, result: &const Buf, t: u64) void {
     if !g_sess.save {
         return;
@@ -1876,6 +1968,8 @@ fn agent_bound_step_start(cfg: &const Config, h: &const History, step: i32) void
     agent_stats_sync(cfg, h);
 }
 
+// step 收尾记账：写 `step/end` 事件并把本步的统计折进 `Stats`（§3.4 的第 l 步）。
+// 早退路径（分配失败等）也要走到它，否则 `step/start` 与 `step/end` 会不成对。
 fn agent_bound_step_end(cfg: &const Config, h: &const History, step: i32) void {
     const t: u64 = ua_now_ms();
     if g_sess.save {
@@ -1915,6 +2009,8 @@ fn agent_bound_first_token(cfg: &const Config, h: &const History, step: i32, ms:
     st_first_token(g_turn as i64, step as i64, t);
 }
 
+// step 边界记账 + 写 `assistant/message`。步骤见 §3.5 的第 4 步。
+// 与「把 assistant 消息压进历史」是两件事：这里是日志侧，那里是历史侧。
 fn agent_bound_assistant_message(cfg: &const Config, h: &const History, step: i32, o: &const ChatOut) void {
     const t: u64 = ua_now_ms();
     agent_log_assistant(step, o, t);
@@ -1937,6 +2033,8 @@ fn agent_bound_assistant_message(cfg: &const Config, h: &const History, step: i3
     agent_stats_sync(cfg, h);
 }
 
+// 记账 + 写 `tool/call`。**在工具真正执行之前**写 —— 所以 `/watch` 能在长 step 中途
+// 看到「正在跑哪个工具」（§9.1 说的实时粒度就是这条）。
 fn agent_bound_tool_call(cfg: &const Config, h: &const History, step: i32, call_id: &const Buf, name: &const Buf, args: &const Buf) void {
     const t: u64 = ua_now_ms();
     agent_log_tool_call(step, call_id, name, args, t);
@@ -1944,6 +2042,7 @@ fn agent_bound_tool_call(cfg: &const Config, h: &const History, step: i32, call_
     agent_stats_sync(cfg, h);
 }
 
+// 记账 + 写 `tool/result`（工具执行完之后）。与 `agent_bound_tool_call` 严格配对。
 fn agent_bound_tool_result(cfg: &const Config, h: &const History, step: i32, call_id: &const Buf, result: &const Buf) void {
     const t: u64 = ua_now_ms();
     agent_log_tool_result(step, call_id, result, t);
@@ -2007,6 +2106,8 @@ fn agent_ctx_used(cfg: &const Config, h: &const History, sys_t: &i64, tools_t: &
     return st_ctx_projected(st_pressure(), g_ctx_est_at_sample, est_now);
 }
 
+// 让运行时上下文快照与当前 cfg 一致（权限/plan/工作区变了就补推一条新的 user 消息）。
+// 与 `agent_plan_snapshot_sync` / `agent_ws_snapshot_sync` 同一套「比对快照再补推」的形状。
 fn agent_ctx_sync(cfg: &const Config, h: &const History) void {
     var sys_t: i64 = 0;
     var tools_t: i64 = 0;
@@ -2031,6 +2132,8 @@ fn agent_stats_sync(cfg: &const Config, h: &const History) void {
     agent_ctx_sync(cfg, h);
 }
 
+// 写一条**只有 type + data** 的会话事件（无 step 上下文的那些）。
+// 有 step 归属的事件走 `agent_bound_*` 那一族。
 fn agent_log_simple(typ: &const byte, payload: &const byte) void {
     if !g_sess.save {
         return;
@@ -2044,6 +2147,7 @@ fn agent_log_simple(typ: &const byte, payload: &const byte) void {
     _ = sess_end(&g_sess, &ev);
 }
 
+// 回合开始：`g_turn` 加一、写 `turn/start`，并把会话级的 todo 清空（DSH 口径）。
 fn agent_log_turn_start() void {
     var ev: Buf = buf_new(64);
     defer { buf_free(&ev); }
@@ -2060,6 +2164,7 @@ fn agent_log_turn_start() void {
     g_sess.turns = g_turn as i64;
 }
 
+// 回合结束：写 `turn/end`（带一句 reason，便于事后区分「正常收尾」与「中断/超预算」）。
 fn agent_log_turn_end(reason: &const byte) void {
     if !g_sess.save {
         return;
@@ -2278,6 +2383,10 @@ fn agent_session_create(cfg: &const Config) bool {
     );
 }
 
+// 开会话：算路径、写 header、按 `--no-save` 决定要不要真落盘。
+// 新建走 `sess_open`；**恢复走 `sess_open_resume`**（往已经解析出来的那份日志续写、
+// 不按 cwd 重算路径 —— 重算会在同 id 下造一个无 header 的空文件、把会话劈成两半，踩坑 48）。
+// 开之前工作区必须已经定下来（§8.6）。
 export fn agent_session_open(cfg: &Config, h: &History, resume_path: &const Buf) bool {
     // 同 agent_session_create：header 由 sess_open 写，深度必须在它之前落进 g_sess
     g_sess.deleg_depth = cfg.deleg_depth;
@@ -2374,7 +2483,7 @@ export fn agent_session_open(cfg: &Config, h: &History, resume_path: &const Buf)
             out_err_bytes(id.ptr, id.len);
             out_err("）\n");
             // 继续往**同一个**日志追加：路径用会话自己的那份（sess_open 会按当前 cwd 重算，
-            // 那正是「改挂」的入口 —— P34 换成 sess_open_resume，见 README 踩坑 52）。
+            // 那正是「改挂」的入口 —— P34 换成 sess_open_resume，见 §16 踩坑 52）。
             // l.cwd 传当前工作区：它表示「这个会话现在在哪」，索引（/sessions 的工作区列）
             // 按它写；header 里的创建时工作区不动（那是元数据）。
             var cwdz: Buf = buf_new(cfg.workspace.len + 1);
@@ -2448,6 +2557,9 @@ export fn agent_session_open(cfg: &Config, h: &History, resume_path: &const Buf)
     );
 }
 
+// 收尾：**先** `wt_reclaim_own` 回收本会话自己的确定性垃圾（结果要落一条 `session/worktree`
+// 事件，所以必须排在 `sess_close` 之前），再关日志、写索引。
+// **不自动 finish**：没验完的活不该被自动合并（§10.5）。
 export fn agent_session_close() void {
     // P53：会话退出时先回收**本会话这个** worktree（如果它是「确定的垃圾」）。
     // 顺序很重要：必须排在 sess_close **之前** —— 回收结果要落一条会话日志
@@ -2517,6 +2629,7 @@ var g_pending_imgs: ImgList = ImgList{
 };
 var g_pending_ready: bool = false;
 
+// 惰性初始化待发图片表（`g_pending_imgs`）。幂等；`/image`、`ctrl+v`、`/paste` 都先调它。
 fn agent_imgs_ensure() void {
     if !g_pending_ready {
         g_pending_imgs = imgx_list_new();
@@ -2524,6 +2637,8 @@ fn agent_imgs_ensure() void {
     }
 }
 
+// 清空待发图片（**批次语义**：随下一条用户消息发出后清空，对齐 DSH composer 的
+// 「附件跟着这一次提交走」，见 §13.1）。
 fn agent_imgs_clear() void {
     agent_imgs_ensure();
     imgx_list_free(&g_pending_imgs);
@@ -2618,6 +2733,8 @@ fn agent_apply_knobs(cfg: &const Config) void {
     _ = cfg;
 }
 
+// 惰性加载提示词文案与 preset 旋钮（`g_texts` / `g_knobs`，只做一次）。
+// 幂等：`g_texts_ready` 已经置上就立刻返回。
 fn agent_texts_ensure(cfg: &const Config) void {
     if g_texts_ready {
         return;
@@ -2645,6 +2762,8 @@ fn agent_note_answer(text: &const byte, n: usize) void {
     _ = buf_append(&g_last_answer, text, n);
 }
 
+// 取**最终答复**（子代理与 ralph 靠它把结果写回管道）。
+// 返回内部全局的切片，调用方不许留存（下一回合会被覆盖）。
 export fn agent_last_answer() &[byte] {
     if !buf_valid(&g_last_answer) {
         return &"x"[0: 0];
@@ -2679,6 +2798,9 @@ fn agent_cache_burst_note(cfg: &const Config, o: &const ChatOut) void {
     out_err(" 未命中：provider 侧缓存淘汰（会话私有块被清，共享前缀还在）—— 重算一次，不是客户端改动\n");
 }
 
+// 装配 system prompt：分节（order 升序）+ 空节丢弃 + `{{model}}`/`{{cwd}}` 替换（§5.1）。
+// **必须在工作区定下来之后调** —— 这里的 `{{cwd}}`、AGENTS.md 发现、技能目录
+// 全按当前工作目录求值（§3.2）。
 fn agent_system_prompt(cfg: &const Config, out: &Buf) bool {
     agent_texts_ensure(cfg);
     if !prompt_build_system(cfg, &g_texts, g_plan.active, out) {
@@ -2744,6 +2866,8 @@ fn agent_inject_context(cfg: &const Config, h: &History) void {
 // 记一份「模型已经被告知的状态」，step 边界对不上就补推：一处做完，所有切换路径都覆盖。
 var g_plan_snap: bool = false;
 
+// 每个 step 边界比对 `g_plan_snap` 与当前 plan 状态，**变了才**补推一条新的运行时上下文。
+// 顺序上放在压缩之后：别刚推就被折进 checkpoint（§3.4 第 g 步）。
 fn agent_plan_snapshot_sync(cfg: &const Config, h: &History) void {
     if g_plan_snap == g_plan.active {
         return;
@@ -2846,6 +2970,8 @@ const TOOL_RUN_SHELL: &const byte = `{"type":"function","function":{"name":"run_
 // 变换后顶层键正好是 type/name/description/parameters（自测逐个 parse 校验过）。
 const TOOL_FLAT_STRIP: &const byte = `{"type":"function","function":{`;   // 31 字节
 
+// 把一条工具 schema 追加进 out；`flat = true` 时做 Responses 形状的文本变换
+// （`TOOL_FLAT_STRIP` 去前缀 + 去尾大括号）—— **只有一份 schema 真值**，两边不会漂移。
 fn tools_put(out: &Buf, tool: &const byte, flat: bool) bool {
     if out.len > 1 && !buf_append_byte(out, 44) {   // 44 = ','
         return false;
@@ -2864,6 +2990,9 @@ fn tools_put(out: &Buf, tool: &const byte, flat: bool) bool {
     return buf_append_span(out, tool, 31, n - 32);
 }
 
+// 按**固定顺序**拼出全部 28 个工具的 schema 数组（§6.1）。
+// `allow_shell = false` 时 bash/job_* 整组不出现（`--no-shell`）；其余分组**跨模式恒定可见**，
+// 这样前缀缓存不会因为「模式变了」而失效。
 fn tools_json(out: &Buf, allow_shell: bool, flat: bool) bool {
     buf_reset(out);
     if !buf_append_byte(out, 91) {
@@ -2968,6 +3097,8 @@ fn tools_json(out: &Buf, allow_shell: bool, flat: bool) bool {
 var g_fsctx: FsCtx = FsCtx{ workspace: null, workspace_len: 0, confine: false };
 var g_fsobs: FsObsTable = FsObsTable{ items: [], n: 0 };
 
+// 回合前的**统一初始化**（全部幂等）：权限模式 → 沙箱探测（fail closed）、`jobs_init`、
+// `deleg_init`、显示层与 diff 层初始化、文件工具上下文 `g_fsctx`。见 §3.2 的表。
 fn fsctx_init(cfg: &const Config) void {
     g_fsctx.workspace = cfg.workspace.ptr as &const byte;
     g_fsctx.workspace_len = cfg.workspace.len;
@@ -3098,6 +3229,8 @@ fn agent_request_img_extra(h: &const History) usize {
     return total + (total / 3) + 4096;
 }
 
+// 估出这一次请求要多大的缓冲：`h.bytes*2 + 8192 + 8192 + model.len*2 + img_extra`。
+// 多算不亏（够用一次分配），少算就是构请求失败。
 fn request_bytes_needed(h: &const History, cfg: &const Config) usize {
     const overhead: usize = 8192;
     const tools_max: usize = 8192;   // 全部工具 schema 的上界
@@ -3142,6 +3275,8 @@ fn agent_echo_imgs(att: &const Buf, have_att: &const bool) void {
     tty_puts(&tty_ui, 2, "\n");
 }
 
+// 把用户消息连同**待发图片**压进历史，并把 attachments JSON 回传（记日志用）。
+// 有图时该条消息的 content 变成**数组** `[{type:text},{type:image_url,…}]`（§13.1）。
 fn agent_push_user_with_imgs(h: &History, line: &const Buf, att_out: &Buf, have_out: &bool) bool {
     agent_imgs_ensure();
     buf_reset(att_out);
@@ -3170,6 +3305,10 @@ fn agent_push_user_with_imgs(h: &History, line: &const Buf, att_out: &Buf, have_
     return pushed;
 }
 
+// 构 `chat/completions` 请求体。**字段顺序固定**：model / messages / stream /
+// stream_options / tools / temperature / max_tokens / reasoning_effort —— 顺序稳定是为了
+// 保住提供方的 KV 前缀缓存（字段插在中间会让缓存全失效）。
+// tool 结果在**构请求这一层**过 `cmp_maybe_prune_kind`（剪枝不动历史，§5.3.1）。
 fn build_chat_request(cfg: &const Config, h: &const History, out: &Buf) bool {
     var w: JsonWriter = JsonWriter{ buf: null, cap: 0, used: 0, overflow: false };
     jw_init(&w, out.ptr, out.cap);
@@ -3264,7 +3403,7 @@ fn build_chat_request(cfg: &const Config, h: &const History, out: &Buf) bool {
     }
     // 推理强度：completions 走顶层 reasoning_effort（responses 走 reasoning.effort）。
     // 曾经只发 responses，于是 --effort / DSH 的 agent-default-model.reasoningEffort
-    // 在默认的 openai-completions 路由上被静默丢弃（见 README 踩坑 71）。
+    // 在默认的 openai-completions 路由上被静默丢弃（见 §16 踩坑 71）。
     // 与 responses 同一条门槛：compat.supportsReasoningEffort=false 时不发。
     //
     // P56：`off`/`none` 不再「干脆不发字段」。实测（autodl 网关、同一道题各 3 发）：
@@ -3405,6 +3544,8 @@ fn resp_emit_assistant_text(w: &JsonWriter, p: &byte, n: usize) void {
     jw_byte(w, 125);
 }
 
+// 构 `/v1/responses` 请求体：工具 schema 走 flat 形状、推理强度走 `reasoning.effort`、
+// 图片走 `input_image`。与 chat 侧共用同一个历史，只是线上形状不同（§4.5）。
 fn build_responses_request(cfg: &const Config, h: &const History, out: &Buf) bool {
     var w: JsonWriter = JsonWriter{ buf: null, cap: 0, used: 0, overflow: false };
     jw_init(&w, out.ptr, out.cap);
@@ -3640,6 +3781,7 @@ fn build_headers(cfg: &const Config, out: &Buf) bool {
     return true;
 }
 
+// p[0..n] 是不是以 `/` 结尾（拼 URL 路径时决定要不要补一个斜杠）。
 fn ends_with_slash(p: &const byte, n: usize) bool {
     if n == 0 {
         return false;
@@ -3664,6 +3806,8 @@ fn api_url_into(cfg: &const Config, style: u8, u: &Buf) bool {
     return buf_append_cstr(u, llm_endpoint_path(style));
 }
 
+// 打印 HTTP 错误的诊断：状态码 + 错误体（**原始字节**可选落 `--debug-dump`，
+// 转录里只给转义预览）。见 §16 踩坑 33 的来由。
 fn dump_http_error(status: i32, body: &const Buf) void {
     out_err("model endpoint returned HTTP ");
     out_err_dec(status as usize);
@@ -3746,7 +3890,7 @@ export fn agent_set_interactive(v: bool) void {
 //   notes：已经给过几条收工提醒（上限见 GRACE_NOTE_MAX，别刷屏）
 //
 // ⚠ 这两个机制的代码全部内联在既有函数里（step 边界 / dispatch_tool_body），**一个顶层函数都没加**：
-//   本仓「顶层函数 reachable 集合」是编译器里写死的容量，HEAD 的余量是 0（README 踩坑 87），
+//   本仓「顶层函数 reachable 集合」是编译器里写死的容量，HEAD 的余量是 0（§16 踩坑 87），
 //   加两个函数会撑爆表 —— 症状不是一句「容量不足」，而是链接期 undefined reference
 //   指着一堆**你没改过的**函数（实测踩过一次）。
 struct ExecState {
@@ -3772,6 +3916,8 @@ var g_exec: ExecState = ExecState{
 // 一个回合里最多给几条收工提醒（实测：同一条 make build 在一回合里被跑了三遍）
 const GRACE_NOTE_MAX: i32 = 2;
 
+// 流式路径上的错误诊断（与 `dump_http_error` 同一份口径，区别是流式那侧
+// 手上的体只有头部若干字节 —— 见 `LLM_ERR_HEAD`）。
 fn dump_stream_error(cfg: &const Config, status: i32, body: &const Buf) void {
     _ = cfg;
     out_err("model endpoint returned HTTP ");
@@ -3781,6 +3927,8 @@ fn dump_stream_error(cfg: &const Config, status: i32, body: &const Buf) void {
     out_diag("http-error-body", "body: ", body.ptr as &const byte, body.len);
 }
 
+// 打一行 token 用量（`--show-usage`）：in / out / cache / reasoning。
+// `usage_in` 是**非缓存输入**，所以打印时与 cache_read 分开列（§4.5.1）。
 fn print_usage_line(o: &const ChatOut) void {
     out_err("[usage] in=");
     out_err_dec(o.usage_in as usize);
@@ -3876,7 +4024,7 @@ fn dispatch_tool_body(cfg: &Config, name: &const Buf, args_json: &const Buf, are
     //
     // 放在这里的原因有两个：① 两个工具派发点（流式 / 非流式）都必经 dispatch_tool_body，
     // 一处顶两处；② 本仓「顶层函数 reachable 集合」是编译器里写死的容量，HEAD 的余量是 **0**
-    // （README 踩坑 87：净增函数过不了清缓存重编），所以这两个机制都不新增顶层函数。
+    // （§16 踩坑 87：净增函数过不了清缓存重编），所以这两个机制都不新增顶层函数。
     //
     // 干两件事：
     //   * 记「改动」：write / edit，或 bash 里**有一整段**是改动类命令（git / mv / sed / …）；
@@ -4192,7 +4340,7 @@ fn agent_step_stream(cfg: &Config, style: u8, url: &const Buf, hdrs: &const Buf,
             out_err("  本次观测到的 leaf 证书 SHA-256 = ");
             out_err_bytes(&tc.observed[0], tc.observed_len);
             out_err("\n");
-            out_err("  链校验在真实站点常失败（见 README 第 5 节）；用这个指纹重试：\n");
+            out_err("  链校验在真实站点常失败（见 §18）；用这个指纹重试：\n");
             out_err("  uya-agent --tls-verify=pin --tls-pin <上面的指纹> ...\n");
         } else {
             out_err("  检查 base-url / 网络；证书问题可先用 --probe --tls-verify=none 看指纹。\n");
@@ -4669,7 +4817,7 @@ fn agent_step_plain(cfg: &const Config, style: u8, url: &const Buf, hdrs: &const
             out_err("  本次观测到的 leaf 证书 SHA-256 = ");
             out_err_bytes(&tc.observed[0], tc.observed_len);
             out_err("\n");
-            out_err("  链校验在真实站点常失败（见 README 第 5 节）；用这个指纹重试：\n");
+            out_err("  链校验在真实站点常失败（见 §18）；用这个指纹重试：\n");
             out_err("  uya-agent --tls-verify=pin --tls-pin <上面的指纹> ...\n");
         } else {
             out_err("  检查 base-url / 网络；证书问题可先用 --probe --tls-verify=none 看指纹。\n");
@@ -5097,6 +5245,13 @@ export fn hist_trim_incomplete_tail(h: &History) usize {
     return dropped;
 }
 
+// 回合前的历史准备（§3.2 的最后一步）。三条路：
+//   恢复（`--resume` / `--continue`）→ 读元信息定工作区 → `agent_hist_from_log` → 续写；
+//   `--resume-dsh` → 先导入 DSH 会话；
+//   新建 → `agent_hist_init`：`agent_worktree_begin`（可能 chdir）→ 装配 system prompt →
+//     注入运行时上下文 → 记 `subagent/start` → push 首条 user 消息。
+// **这个顺序不能换**：worktree 会 chdir，而 prompt 的 `{{cwd}}`、AGENTS.md、技能根
+// 全按当前工作目录求值（§3.2）。
 fn agent_history_begin(cfg: &Config, h: &History, first: &const Buf) bool {
     fsctx_init(cfg);
     // 统计是「当前会话」口径：换会话（/new、/resume）先清零，resume 的那一份由
@@ -5271,6 +5426,8 @@ fn agent_resolve_resume(cfg: &Config, want: &const byte) bool {
 }
 
 export // --dry-run：组装请求并打印（不可打印字节转义成 \xNN，便于找 NUL 之类的脏字节）
+// `--dry-run`：只组装并打印请求体（不可打印字节转义成 `\xNN`），不发请求。
+// 存在的意义是排查「脏字节」—— 请求体里混进控制字符时，看转义比看十六进制快。
 fn agent_dry_run(cfg: &Config) i32 {
     var h: History = hist_init();
     defer { hist_free(&h); }
@@ -5591,6 +5748,10 @@ export fn agent_workspace_apply_pre(cfg: &Config, path: &const byte, n: usize, s
     return agent_workspace_apply_full(cfg, path, n, src, announce, false);
 }
 
+// 切工作区的**唯一落点**：真 `chdir` + `getcwd` 规范化 + 重指文件工具上下文 + 清技能缓存
+// + `gd_reset` + 记 `session/workspace` 与索引。
+// `src` 是来源标签（cli / env / session / tool / fallback），进日志便于事后归因；
+// 失败时**什么都不改**（`chdir` 本身就是校验：目标必须存在且是目录）。
 fn agent_workspace_apply_full(cfg: &Config, path: &const byte, n: usize, src: &const byte, announce: bool, record: bool) i32 {
     var previous: Buf = buf_new(cfg.workspace.len + 8);
     defer { buf_free(&previous); }
@@ -5681,6 +5842,8 @@ export fn ws_src_name(src: u8) &const byte {
 var g_ws_snap: Buf = Buf{ ptr: null, len: 0, cap: 0 };
 var g_ws_snap_ready: bool = false;
 
+// 每个 step 边界比对 `g_ws_snap` 与当前工作区，变了才补推运行时上下文
+// （里面那句 `Current workspace` 与新工作区的 AGENTS.md 都要跟上）。
 export fn agent_ws_snapshot_sync(cfg: &const Config, h: &History) void {
     if !buf_valid(&g_ws_snap) {
         g_ws_snap = buf_empty();
@@ -5866,6 +6029,8 @@ fn agent_repl_model_text(cfg: &Config, line: &const Buf, effort: bool, out: &Buf
     }
 }
 
+// 滚动模式下的 `/model [名字]` 与 `/effort [档位]` 文本入口（TUI 里是浮层）。
+// `effort = true` 时按档位处理；**只收当前模型公布的档位**，不发明新档（§7 的模型目录口径）。
 fn agent_repl_model(cfg: &Config, line: &const Buf, effort: bool) void {
     var rep: Buf = buf_new(2048);
     defer { buf_free(&rep); }
@@ -5928,6 +6093,9 @@ fn agent_effort_list_into(cfg: &const Config, out: &Buf) void {
     _ = buf_append_byte(out, 10);
 }
 
+// 把当前推理强度与**可选档位表**追加进 out（给 `/effort` 与 `/status` 共用）。
+// ⚠ 契约：**不 reset out**，只追加；「没有档位表就一个字节都不加」是刻意的 ——
+// 早期实现开头 `buf_reset(out)` 把调用方已经拼好的前缀抹掉了（§16 踩坑 55）。
 fn agent_effort_report_into(cfg: &const Config, out: &Buf) void {
     _ = buf_append_cstr(out, "当前推理强度：");
     if cfg.reasoning_effort.len > 0 {
@@ -5945,6 +6113,8 @@ fn agent_effort_report_into(cfg: &const Config, out: &Buf) void {
     agent_effort_list_into(cfg, out);
 }
 
+// 滚动模式下的 `/workspace [目录]`：人自己敲的就是批准，**不再弹审批**（§7.5 的口径）。
+// 实际切换走 `agent_workspace_apply_full`。
 fn agent_repl_workspace(cfg: &Config, line: &const Buf) void {
     // 解析：`/workspace` 或 `/workspace <dir>`（dir 里可以有空格，全是字面量路径）
     var arg: Buf = buf_empty();
@@ -6049,6 +6219,7 @@ export fn agent_models_reset() void {
     g_mc_ready = false;
 }
 
+// 模型目录里有多少条（TUI 的 `/model` 浮层与 `--print-config` 用）。
 export fn agent_models_count() usize {
     return mx_count(&g_mc);
 }
@@ -6915,6 +7086,8 @@ const WT_ACT_STATUS: usize = 3;    // 裸命令打开时的默认游标
 const WT_ACT_FINISH: usize = 4;
 const WT_ACT_DISCARD: usize = 5;
 
+// worktree 动作的**机器名**（第 i 个）：on/off/start/status/finish/discard/list/reclaim。
+// 与 `wt_act_gloss` 配对，两个表**必须一一对应**（浮层生成与反解共用它们）。
 fn wt_act_name(i: usize) &const byte {
     if i == 0 {
         return "on" as &const byte;
@@ -6940,6 +7113,7 @@ fn wt_act_name(i: usize) &const byte {
     return "reclaim" as &const byte;
 }
 
+// worktree 动作的**显示名**。与 `wt_act_name` 同下标对应 —— 改动要两张表一起改。
 fn wt_act_gloss(i: usize) &const byte {
     if i == 0 {
         return "下一个新会话开始时建独立工作区" as &const byte;
@@ -6993,6 +7167,8 @@ fn agent_tui_worktree_line(i: usize, out: &Buf) void {
     _ = buf_append_cstr(out, wt_act_gloss(i));
 }
 
+// 拼 `/worktree` 选择框的条目：八个动作一行一个，`✓` 标当前模式，游标默认停在 `status`
+// —— 所以「打开就回车」与裸 `/worktree` 的文本版逐字节同效（§7 的 worktree 段）。
 fn agent_tui_worktree_items() Buf {
     var out: Buf = buf_new(1024);
     var line: Buf = buf_new(256);
@@ -7044,6 +7220,7 @@ fn wt_act_needs_confirm(act: &const Buf) bool {
         bufx_eq_cstr(act.ptr as &const byte, act.len, "discard" as &const byte);
 }
 
+// 动作名 → 下标（`wt_act_name` 的反解）。认不出返回一个**越界**值，由调用方当非法动作拒掉。
 fn wt_act_index_of(act: &const Buf) usize {
     if bufx_eq_cstr(act.ptr as &const byte, act.len, "finish" as &const byte) {
         return WT_ACT_FINISH;
@@ -7349,6 +7526,8 @@ fn agent_default_dsh_home(cfg: &const Config, out: &Buf) bool {
     return dsh_home_resolve(cfg.dsh_home.ptr as &const byte, out);
 }
 
+// **非交互**回合入口（一次性任务）：查 key → 建历史 → `agent_turn_loop`。
+// `defer` 里 `hist_free` + `agent_session_close`（顺序不能换：会话关闭要用到历史之外的状态）。
 fn agent_run(cfg: &Config) i32 {
     if cfg.api_key.len == 0 {
         out_err("error: no API key. set UYA_AGENT_API_KEY / DEEPSEEK_API_KEY / OPENAI_API_KEY\n");
@@ -7506,6 +7685,8 @@ fn read_line(inbuf: &Buf, out: &Buf) isize {
     }
 }
 
+// 十进制有符号整数参数解析；解析不出（空串/有非数字）返回 fallback。
+// 不做溢出检查 —— CLI 上给了超范围的值，回落到 fallback 比截断更安全。
 fn parse_i32_arg(p: &byte, fallback: i32) i32 {
     const n: usize = cstr_len(p);
     if n == 0 {
@@ -7566,6 +7747,8 @@ fn parse_size_pair(s: &[byte], cols: &usize, rows: &usize) bool {
     return true;
 }
 
+// 解析步数类参数（`--max-steps` / `--grace-steps` 等）。非法值**告警后按「不限」(0)** 处理，
+// 并把标签一起打出来 —— 静默忽略会让人以为上限生效了！
 fn parse_steps_arg(p: &byte, label: &const byte) i32 {
     const n: usize = cstr_len(p);
     var i: usize = 0;
@@ -7610,6 +7793,9 @@ fn agent_tui_cmd_safe_steer(line: &const Buf) bool {
     return agent_tui_cmd_safe(line);
 }
 
+// **step 边界**领取运行期间用户敲进来的文本（DSH 的 steer 语义）：
+// 作为**普通 user 消息**进入下一次请求（不加任何包装文案）；回合在领取前就结束了，
+// 文本留在箱里成为下一轮的 prompt（§3.4 第 c 步）。
 fn agent_claim_steer(cfg: &const Config, h: &History) void {
     var line: Buf = buf_new(4096);
     defer { buf_free(&line); }
@@ -7730,6 +7916,8 @@ var g_watch_last_id: i32 = 0;
 var g_watch_cfg: &const Config = null as &const Config;
 var g_watch_cfg_on: bool = false;
 
+// 把 cfg 的指针存进 `g_watch_cfg`，让**空闲 TUI 主循环**（那一轮没有 cfg 可传）也能
+// 继续推进 /watch 的 1 Hz 轮询（§9.1）。
 fn agent_watch_hold_cfg(cfg: &const Config) void {
     g_watch_cfg = cfg;
     g_watch_cfg_on = true;
@@ -7908,6 +8096,8 @@ fn agent_watch_start(cfg: &const Config, idb: &const Buf, out: &Buf) bool {
     return true;
 }
 
+// 拼 `/watch` 的现役清单（表头 + 每个在跑的子代理一行）。
+// 表头与代理行的分界是「行里有没有数字」（`watch_line_id` 那一族的口径）。
 fn agent_watch_list(out: &Buf) void {
     _ = buf_append_cstr(out, "[watch] 现役子代理（/watch sub-N 跟随，/watch off 停）：\n");
     var n: usize = 0;
@@ -7940,6 +8130,9 @@ const WATCH_CMD_STARTED: i32 = 1;  // 已开始/切换跟随（TUI 里浮层就�
 const WATCH_CMD_STOPPED: i32 = 2;  // 已停止跟随
 const WATCH_CMD_BAD: i32 = 3;      // 目标无效：原因在 out 里，调用方**必须**把它说出来
 
+// `/watch [sub-N]` 命令：无参数给清单（带「回车跟随」提示），带参数当场开跟随浮层。
+// **只读命令** —— 属于「在每个泵点当场派发」那一类（§11.2），所以长 step 中途也能开。
+// 返回落点码，供调用方区分「开了浮层」/「只回了清单」/「没认出编号」。
 fn agent_cmd_watch(cfg: &const Config, args: &const byte, n: usize, out: &Buf) i32 {
     // 掐掉前导空白
     var s: usize = 0;
@@ -8064,6 +8257,7 @@ fn agent_prompt_suffix(out: &Buf) void {
     }
 }
 
+// 滚动模式的启动横幅（工作区 / 模型 / 权限一类的摘要）。
 fn agent_repl_banner(cfg: &const Config) void {
     tty_puts(&tty_ui, 2, "uya-agent 交互模式（纯 Uya）\n");    tty_puts(&tty_ui, 2, "  · 直接输入任务回车执行；回合运行中输入的文本会在下一个 step 被采纳\n");
     tty_puts(&tty_ui, 2, "  · 默认不限步数：一直跑到模型给出最终答案（--max-steps N 可熔断）\n");
@@ -8073,6 +8267,8 @@ fn agent_repl_banner(cfg: &const Config) void {
     tty_puts(&tty_ui, 2, "\n");
 }
 
+// 滚动模式的 `/help`：命令表。**TUI 的命令面板也读同一份文案** ——
+// 两处措辞不一致会让人以为命令不一样（§11.6 的命令清单）。
 fn agent_repl_help() void {
     tty_puts(&tty_ui, 2, "命令：\n");
     tty_puts(&tty_ui, 2, "  /help      显示本帮助\n");
@@ -8161,6 +8357,8 @@ fn agent_status_stats_block(cfg: &const Config, h: &const History, out: &Buf) vo
     _ = buf_append_byte(out, 10);
 }
 
+// 滚动模式的 `/status`：工作区 / 模型 / 权限 / plan / 目标 / 统计 / 上下文占用。
+// 只读、不联网；TUI 里同一份内容走 reader 浮层。
 fn agent_repl_status(cfg: &const Config, h: &const History) void {
     tty_puts(&tty_ui, 2, "base_url=");
     tty_write(&tty_ui, 2, cfg.base_url.ptr as &const byte, cfg.base_url.len);
@@ -8252,6 +8450,8 @@ fn agent_tasks_refresh(cfg: &const Config) void {
     tasks_poll();
 }
 
+// `/tasks` 的完整报告（四张表：todo 清单 / 后台任务 / 子代理 / 会话目标）。
+// 与常驻任务块**共用** `term/tasks` 的纯函数折叠（§9.5）—— 两处口径不会漂移。
 fn agent_tasks_report(cfg: &const Config, out: &Buf) void {
     agent_tasks_refresh(cfg);
     tasks_report_globals(tasks_report_width(), out);
@@ -8281,6 +8481,8 @@ fn agent_repl_tasks(cfg: &const Config) void {
 // 与 /goal 同一条纪律（解析与措辞只在 goal_cmd_run 一处）。
 const TITLE_CMD_USAGE: &const byte = "用法：/title <新标题> · /title clear（清回基标题）· 裸 /title 让模型起一个建议" as &const byte;
 
+// `/title [新标题]`：显式改标题（题、模型自动、显式命令是三个来源）。
+// TUI 里裸 `/title` 先让模型填个草稿再让人改；滚动模式只报建议（没有输入框浮层，§11.7）。
 fn agent_title_cmd(cfg: &const Config, h: &const History, line: &const Buf, out: &Buf, suggest: &Buf) bool {
     buf_reset(out);
     buf_reset(suggest);
@@ -8512,6 +8714,10 @@ fn agent_cmd_display(line: &const Buf, which: i32) void {
     }
 }
 
+// 把一坨图片字节挂成附件（`/image`、`ctrl+v`、`/paste` 三条路都汇到这里）。
+// 顺序：嗅探 → `imgx_check(&info,0,0,&why)`（0 = 用缺省预算）→ 模型不吃图
+// （`!cfg.input_image`）直接拒 → 超 8 张拒 → `imgx_store`（内容寻址落盘）→ push `g_pending_imgs`。
+// 每一步失败都给**明确原因**（超了多少 / 为什么不吃图），不静默丢（§13.1）。
 fn agent_image_attach_bytes(cfg: &const Config, raw: &const Buf, name: &const byte, nl: usize, from_clip: bool, vision: bool) bool {
     if raw.len == 0 {
         return false;
@@ -9030,11 +9236,14 @@ fn agent_repl_command(cfg: &Config, h: &History, line: &const Buf) bool {
 var g_title_auto_cfg: &const Config = null as &const Config;
 var g_title_auto_hist: &const History = null as &const History;
 
+// 登记「有自动起标题的请求在飞」—— 流式期间**一个字节的键都不许读**（§4.7）。
+// 用户那几秒敲的字必须原样留给主循环，否则会被拼成 `//status` 这种怪东西。
 export fn agent_title_auto_hold(cfg: &const Config, h: &const History) void {
     g_title_auto_cfg = cfg;
     g_title_auto_hist = h;
 }
 
+// 上一行登记的请求回来后，用**当时那份 cfg/h** 继续推进自动起标题（`_held` 版）。
 fn agent_title_auto_pending_tick_held() void {
     if (!g_title_auto_pending) {
         return;
@@ -9045,6 +9254,8 @@ fn agent_title_auto_pending_tick_held() void {
     agent_title_auto_pending_tick(g_title_auto_cfg, g_title_auto_hist);
 }
 
+// 非 TUI 的**阻塞**读一行（返回码给调用方区分 提交 / 中断 / EOF）。
+// 与 TUI 的按键路径不同：这里没有每帧 tick，所以是「阻塞等回车」。
 fn tty_read_line_blocking() i32 {
     while true {
         // 顺序很重要：**先取已排队的事件**（事件对应的行内容此刻才在 line 里），
@@ -9319,6 +9530,7 @@ fn agent_run_interactive(cfg: &Config) i32 {
     return rc;
 }
 
+// 一次性任务的入口（有任务词时走这条）：打印 `[task] …` 再 `agent_run`。
 fn run_once(cfg: &Config) i32 {
     if cfg.task.len == 0 {
         return AGENT_USAGE;
@@ -9334,16 +9546,20 @@ fn run_once(cfg: &Config) i32 {
 // $DSH_HOME（AGENTS.md / skills 的根），进程级
 var g_dsh_home: Buf = Buf{ ptr: null, len: 0, cap: 0 };
 
+// 当前 `$DSH_HOME`（默认 `~/.dsh`）。返回内部全局切片，调用方不许留存。
 export fn agent_dsh_home() &[byte] {
     return g_dsh_home.ptr[0: g_dsh_home.len];
 }
 
+// 设 `$DSH_HOME`（`--dsh-home` / `--dsh-root` **预扫**阶段调，必须早于读设置）。
 fn agent_set_dsh_home(home: &[byte]) bool {
     buf_free(&g_dsh_home);
     g_dsh_home = buf_new(home.len + 8);
     return buf_append(&g_dsh_home, home.ptr, home.len);
 }
 
+// 环境变量**存在**即真（不要求非空）。
+// 用在「`0` 关、其它非空值开」这类三态开关上（如 UYA_AGENT_TITLE / _MOUSE）。
 fn env_present(name: &const byte) bool {
     const p: &byte = getenv(name);
     if (p as usize) == 0 {
@@ -9352,6 +9568,8 @@ fn env_present(name: &const byte) bool {
     return bufx_cstr_len(p) > 0;
 }
 
+// 把 src 覆盖写进 dst（覆盖层次链的统一赋值：后一层覆盖前一层）。
+// 分配失败返回 false —— 调用方据此报「out of memory」而不是静默留旧值。
 fn cfg_set_buf(dst: &Buf, src: &const Buf) bool {
     buf_free(dst);
     dst[0] = buf_new(src.len + 8);
@@ -9496,6 +9714,8 @@ fn verify_name(v: i32) &const byte {
     return "chain" as &const byte;
 }
 
+// 配置来源码 → 标签文本：`cli` / `env` / `dsh-settings` / `default`（§3.1）。
+// `--print-config` 每个取值后面那个括号里的词就是它 —— 这是「配置到底生效了没有」的凭据。
 fn cfg_src_name(src: u8) &const byte {
     if src == 1 {
         return "dsh-settings" as &const byte;
@@ -9528,6 +9748,10 @@ fn out_masked(key: &const Buf) void {
     out_err_bytes(&key.ptr[key.len - 4], 4);
 }
 
+// `--print-config`：打印**生效值 + 来源**（含 preset 旋钮、tls_verify/tls_pin、
+// exec_effort/exec_after/grace_steps）。不联网。
+// 这个出口存在的唯一目的就是让配置可证 —— 参见 §3.1 的「最常见的故障不是崩溃，
+// 而是我以为它生效了」。
 fn agent_print_config(cfg: &const Config, dsh: &const DshCfg) void {
     // 先把 preset 文案/旋钮载入（否则这里看到的是静态初始值）
     agent_texts_ensure(cfg);
@@ -9881,6 +10105,12 @@ fn agent_print_config(cfg: &const Config, dsh: &const DshCfg) void {
     out_err("\n");
 }
 
+// 进程入口。完整阶段序列见 §3.2：预扫 4 flag（--dsh-home / --dsh-root / --no-dsh-config /
+// --strict-dsh-config，必须早于读设置）→ 读 DSH 设置 → 环境变量默认 → CLI 解析 →
+// 工作区规范化 → 早退分支（--print-config / --selftest / --probe / --tui-demo …）→
+// 模型目录 → 形态选择（一次性 / 全屏 TUI / 滚动模式兜底）→ 回合准备。
+// **必须 `export fn main() i32`，不能写 `!i32`**：split-C 下 `!i32` 生成的 `main_main`
+// 会与 entry 冲突（§16 踩坑 8）。
 export fn main() i32 {
     var cfg: Config = cfg_default();
     defer { cfg_free(&cfg); }
@@ -10520,7 +10750,7 @@ export fn main() i32 {
 // P17：全屏 TUI（opencode 风格）
 //
 // 分层：`src/tui.uya` 只管画与按键；这里负责「把 agent 的状态喂给它」和
-// 「把它交出来的提交/中断送回回合循环」。数据流见 README「全屏 TUI」一节。
+// 「把它交出来的提交/中断送回回合循环」。数据流见 §11。
 // ============================================================
 
 // P21–P29 这九个编号都已被并行线占用（访问模式三级 + 内核沙箱 = p21-perm；
@@ -10532,14 +10762,14 @@ export fn main() i32 {
 // **工作区翻看**（滚轮 / ctrl+home·end / 长条目真总量走查 / `^` 溢出指示）= p32-scroll）。
 // 本条线（**`/sessions` 列表：三列 = 标题 / 工作区 / session id、按 lastActiveAt 倒序、
 // 列宽随终端自适应**）与 p31-wait / p32-scroll 前后脚撞号，按「后到的顺延」记成 **P33**，
-// 版本串 `p33-sess` —— 与 README 顶部同一套记法。
+// 版本串 `p33-sess` —— 与 README §1.1 同一套记法。
 // P35（本线）：**恢复会话段错误修复**（`sess_read_meta` 把切片第二个参数当「终点」写，
 // 越界读到映射尾 —— 大日志必崩）+ **/sessions 最新的排最后一行**，版本串 `p35-sess`。
 // ⚠ 手写的长度常量要跟着版本串一起改：P30 这条线在分支上把串改成 8 字节时忘了改它（当时是 9），
 // 末尾那个 NUL 就进了 /status 浮层 —— 自测的「正文层不许出现 NUL」不变量当场抓住。
 // P37（本线）：**模型选择 + 推理强度 + Git worktree**（独立工作区执行 → 合并 → 删除）。
 // 编号说明：P36 已被并行线 `dsh/p36-diffbg` 认领（当时未合），按「后到的顺延」记成 **P37**，
-// 版本串 `p37-model` —— 与 README 顶部同一套记法。
+// 版本串 `p37-model` —— 与 README §1.1 同一套记法。
 // P38（本线）：**bash 工具的命令不再有终端**（stdin=/dev/null + `setsid` + 按进程组收子树）。
 // P36（并行线 `dsh/p36-diffbg`，**现已并入**）：**`/diff` 改动部分的背景色高亮 + `n`/`N` 跳转**。
 // 它的编号是这条主线早就给它留着的（见上面那条「后到的顺延」的反向用例），所以并进来仍记
@@ -10549,7 +10779,7 @@ export fn main() i32 {
 // ↑/↓ 选、1-9 直选、space 多选、直接打字 = 自己回答、enter 提交、esc 取消）——
 // 不再把问题当 notice 落进转录、让用户去输入行盲打。浮窗画不出来（终端太矮）回落输入行，
 // 管道 / 子代理仍是 no answer channel；回答语义（单选 custom 排他、多选两者都带、跳过 = 空
-// selected、取消 ≠ 渠道不通）对齐 DSH 的 `ask_user_question`。版本串 `p43-ask` —— 与 README 同一套记法。
+// selected、取消 ≠ 渠道不通）对齐 DSH 的 `ask_user_question`。版本串 `p43-ask` —— 与 README §1.1 同一套记法。
 // P45（本线）：**提问弹窗的框宽自适应内容** —— 以前无论问题多短都撑满 78 列（P43 沿用
 // reader 的宽度档），短问题（「选哪个？」+ 两个短选项）一半是留白、窄终端还会被压到 24 列。
 // 现在按「标题 / 问题 / 编号选项 / 自定义行」的**显示列宽**算出内容宽度，夹在
@@ -10562,7 +10792,7 @@ export fn main() i32 {
 // ③ 问题正文只画一行。修法：`tui_clean_line_into`（单行清洗，'\n' → 空格）覆盖 ask 的
 // 标题/问题/选项/自定义行与共享的标题/prompt 槽位；上限改成「终端宽 - TUI_ASK_EDGE_W」；
 // 问题按框宽折行、多行全画（放不下时末行补 '…'）。判据是新增不变量 `tui_rows_have_lf()`
-// （帧里不许有行内换行）；细节与六条防假绿对照实验见 README §3 踩坑 81。
+// （帧里不许有行内换行）；细节与六条防假绿对照实验见 §16 踩坑 81。
 // P46（并行线，**现已并入**）：**`/watch` 的现役清单选中即跟随** —— 裸 `/watch` 开的清单以前借
 // `/tasks` 的 `TUI_OVK_TASKS` kind（接收端是「纯查看」语义），回车交出来的行没人接、被静默丢掉；
 // 现在换成自己的 `TUI_OVK_WATCH_LIST` + 收结果的两条分支（主循环与泵点；选中行 →
@@ -10578,12 +10808,12 @@ export fn main() i32 {
 // 97 个）；② 样式靠帧级全局 `g_md_code` ⇒ 滚到代码块中间就串样式。新实现把「前缀 + 内容」
 // 放进同一条折行流，并把样式**逐字节**落在可见文本上（src/mdview.uya），于是滚到哪儿都对。
 // 编号说明：P46 被并行线 `dsh/63ce84e4ffa3` 先占了，按「后到的顺延」记成 **P47**，
-// 版本串 `p47-md` —— 与 README 顶部同一套记法。
+// 版本串 `p47-md` —— 与 README §1.1 同一套记法。
 // P48（本线）：**会话标题可在执行过程中修改** —— `/title <新标题>` / `/title clear` /
 // 模型自己调 `set_title` / 自动起标题（每个新的人类消息后跑一次侧路请求，把标题换成
 // 模型给的，kind=provider）。标题被显式写过就**钉住**（kind=user），自动起标题不再动它。
 // 编号说明：P46 被 `dsh/63ce84e4ffa3`（/watch 现役清单）与 markdown 那条线先后占了，
-// 按「后到的顺延」记成 **P48**，版本串 `p48-title` —— 与 README 顶部同一套记法。
+// 按「后到的顺延」记成 **P48**，版本串 `p48-title` —— 与 README §1.1 同一套记法。
 // ⚠ 长度常量必须跟着版本串一起改（P30 那条线在这儿踩过，见上面）：`p48-title` 是 9 字节。
 // P49（并行线，**现已并入**）：**残留 worktree 的回收** —— 会话退出时回收自己那个「确定的垃圾」worktree
 // （干净 + 零提交 + 没人在用），外加 `/worktree reclaim` / 工具动作 `reclaim` 扫全仓的
@@ -10595,7 +10825,7 @@ export fn main() i32 {
 // ⚠ 长度常量必须跟着版本串一起改（P30 那条线在这儿踩过，见上面）：`p52-paste` 是 9 字节。
 // P50–P52（并行线，**现已并入**）：**剪贴板粘贴（多行文本 + 图片）** —— 三件事：
 //   P50 修「括起粘贴从未生效」（`tui_esc_final` 内部置 5 之后被调用点无条件清零，
-//       于是粘多行逐行提交、TAB 变成 plan 开关；见 README 踩坑 83）；
+//       于是粘多行逐行提交、TAB 变成 plan 开关；见 §16 踩坑 83）；
 //   P51 图片附件（`/image` 挂图 → 内联 base64 进请求 → 日志/恢复，src/imgx.uya）；
 //   P52 `ctrl+v` / `/paste` 贴剪贴板（纯 Uya 的 X11 客户端，src/clipx.uya）。
 // 编号说明：P49 被并行线（worktree 残留回收）先占了，按「后到的顺延」记成 P50–P52。
@@ -10609,7 +10839,7 @@ export fn main() i32 {
 // 全屏**不碰** fail-closed 判据（tui_overlay_available / tui_reader_fits / ask 的太矮回落 /
 // tui_overlay_diff_fits）—— 全屏只改「画出来多大」，不改「能不能画」。
 // 编号说明：P50–P52 被并行线（剪贴板粘贴那条）先占了，按「后到的顺延」记成 **P53**；
-// 版本串 `p53-full` —— 与 README 顶部同一套记法。
+// 版本串 `p53-full` —— 与 README §1.1 同一套记法。
 // P54（本线）：**退化响应的证据 + 同一步重发一次**。空回复分支以前只打一句
 // "model returned neither content nor tool_calls"、日志里只剩一条 content="" 的
 // assistant/message —— 事后分不清「上游说 stop」还是「tool_calls 丢了」。现在：
@@ -10620,7 +10850,7 @@ export fn main() i32 {
 //      context-overflow 走的就是这条通道）；重发不动历史，所以请求体逐字节相同；
 //   ③ 退化那一步**不留 assistant/message、不计统计**（没有产出，硬记一条空的 assistant
 //      消息只会让「退化」和「模型真回了空串」在日志里长得一样）。
-// 版本串 `p54-empty` —— 与 README 顶部同一套记法。
+// 版本串 `p54-empty` —— 与 README §1.1 同一套记法。
 // P57（本线）：**命令弹窗的循环选择 + 已输入文本显示**。两件事都是「列表型浮窗」的
 // 基本手感问题，各有一条明确的症状：
 //   ① **循环选择**：`↑` 在第一项再按、`↓` 在最后一项再按，以前都是**没反应**
@@ -10637,9 +10867,11 @@ export fn main() i32 {
 //      口径：`\n` → 空格、ESC → `␛`、控制字节 → `·`、TAB → 四个空格），过滤缓冲本身
 //      一个字节不动（匹配与「无匹配还回输入行」用的都是原始字节）。
 // 编号说明：P55/P56 被并行线先占了，按「后到的顺延」记成 **P57**；
-// 版本串 `p57-pick` —— 与 README 顶部同一套记法。
+// 版本串 `p57-pick` —— 与 README §1.1 同一套记法。
 const AGENT_VERSION: [byte: 16] = [112, 53, 55, 45, 112, 105, 99, 107, 0, 0, 0, 0, 0, 0, 0, 0];   // "p57-pick"
 const AGENT_VERSION_LEN: usize = 8;
+// 解析 `--color=` 的取值：auto / always / never / 16 / 256。
+// 认不出按 `auto`（同时认 `NO_COLOR`）。
 fn agent_parse_color(p: &byte) u8 {
     // auto / always / never / 16 / 256
     if bufx_cstr_len(p) == 4 && bufx_eq_cstr(p, 4, "auto") {
@@ -10660,6 +10892,7 @@ fn agent_parse_color(p: &byte) u8 {
     return 0;
 }
 
+// 该不该上色：`auto` 看是不是 TTY（`always`/`never` 直接决定）。
 fn agent_color_on(cfg: &const Config) bool {
     if cfg.color_mode == 2 {
         return false;
@@ -10678,6 +10911,7 @@ fn agent_color_on(cfg: &const Config) bool {
     return true;
 }
 
+// 能不能用 256 色（`--color=256`，否则 16 色）。
 fn agent_color_256(cfg: &const Config) bool {
     if cfg.color_mode == 3 {
         return false;
@@ -10791,6 +11025,8 @@ fn agent_git_branch(cwd: &const byte, cn: usize, out: &Buf) void {
     agent_branch_from_head(&buf[0], un, out);
 }
 
+// 从 `git rev-parse --abbrev-ref HEAD` 的输出里取分支名写进 out（去掉结尾换行）。
+// 失败/空输出时 out 留空 —— 脚注里就少显示一段，不是错误。
 fn agent_branch_from_head(p: &const byte, n: usize, out: &Buf) void {
     buf_reset(out);
     var e: usize = 0;
@@ -10933,7 +11169,7 @@ fn sess_rows_render(rows: &Buf, body_cols: usize, out: &Buf, newest_last: bool) 
     var id: Buf = buf_new(128);
     defer { buf_free(&id); }
     // ⚠ 每行先拷进 scratch 再解析：uya 的 `p[a: b]` 是「偏移 + 长度」，`p[i: i+ll]`
-    // 会拿到 `i+ll` 字节的窗口（越读到后面几行；见 README 踩坑 51）
+    // 会拿到 `i+ll` 字节的窗口（越读到后面几行；见 §16 踩坑 51）
     var scratch: Buf = buf_new(4096);
     defer { buf_free(&scratch); }
     var i: usize = 0;
@@ -11274,6 +11510,7 @@ export fn agent_tui_access_handle(cfg: &Config, h: &History, sel: &const Buf) bo
     return false;
 }
 
+// 从一条面板/清单条目里取下标的**首段**（面板栏与清单用同一套编号口径）。
 fn agent_tui_item_head(line: &const Buf, out: &Buf) void {
     buf_reset(out);
     var i: usize = 0;
@@ -11290,7 +11527,7 @@ fn agent_tui_item_head(line: &const Buf, out: &Buf) void {
 // P33：会话浮层选中项 → session id。
 // 条目是三列（标题 | 工作区 | session id），**id 永远在行尾**，第一列反而是标题 ——
 // 所以这里不能再用 agent_tui_item_head（它取行首那个词 = 标题），否则 /resume 会拿着
-// 标题去查会话（见 README 踩坑 50）。行尾那个词必须以 `session-` 开头才算数；
+// 标题去查会话（见 §16 踩坑 50）。行尾那个词必须以 `session-` 开头才算数；
 // 认不出来就交回空串，由调用方给一条可见提示 —— 绝不猜。
 fn agent_tui_sessions_head(line: &const Buf, out: &Buf) void {
     buf_reset(out);
@@ -11463,6 +11700,8 @@ fn agent_pump_ctx_begin(cfg: &const Config, h: &const History) void {
     g_pump_hist = h;
 }
 
+// 撤销 `agent_pump_ctx_begin` 登记的泵点上下文（回合结束时调）。
+// 不撤的话下一回合的泵点会拿到**已经 free 的** cfg/h。
 fn agent_pump_ctx_end(cfg: &const Config) void {
     if g_pump_cfg == cfg as &const Config {
         g_pump_cfg = null as &const Config;
@@ -11528,12 +11767,14 @@ fn agent_pump_light() void {
 // 已给过回执的那条命令（同一条只提示一次，别在泵点里刷屏）
 var g_pump_receipt: Buf = Buf{ ptr: null, len: 0, cap: 0 };
 
+// 清掉「泵点回执」（泵点当场派发命令后留给主循环看的那一小段文本）。
 fn agent_pump_receipt_clear() void {
     if buf_valid(&g_pump_receipt) {
         buf_reset(&g_pump_receipt);
     }
 }
 
+// 当前泵点回执是不是以 head 开头（主循环据此避免把同一条命令**再派发一次**）。
 fn agent_pump_receipt_is(head: &const Buf) bool {
     if !buf_valid(&g_pump_receipt) {
         g_pump_receipt = buf_new(256);
@@ -11606,6 +11847,8 @@ fn agent_tui_step_boundary_cmd(cfg: &Config, h: &History) void {
     _ = agent_tui_palette_apply(cfg, h, &sel);
 }
 
+// step 边界派发「运行中在命令面板里选中的只读命令」（§3.4 第 d 步）。
+// 以前面板结果只有主循环会取，而主循环整个回合都不跑 ⇒ 屏幕上就是「没反应」。
 fn agent_tui_poll_pending_cmd(cfg: &Config, h: &History) void {
     if !tui_active() {
         return;
@@ -11699,7 +11942,7 @@ fn agent_tui_command(cfg: &Config, h: &History, line: &const Buf) bool {
     }
     if sv_eq_cstr(line, "/help") {
         // TUI 里 /help 是帮助**浮层**（与 /status、/sessions 同一套观感）；
-        // README 的「浮层」清单与命令表的注释都这么写，但这里一直缺一个分支 ——
+        // §11.6 的浮层清单这么写，但这里一直缺一个分支 ——
         // 结果 /help 掉进滚动模式的纯文本帮助，浮层函数 tui_help_open() 没人调。
         tui_help_open();
         return false;
@@ -12055,6 +12298,9 @@ fn agent_tui_seed_history(h: &const History) void {
     tui_sink_flush_partial();
 }
 
+// 起全屏 TUI：raw 模式 → sigx（终止/winch/arm）→ 私有输出 fd（`dup(1)`）→
+// 进备用屏幕 → `tty_sink_on = true`（**从这一刻起所有显示字节都进转录**）。
+// 任一步失败返回 false，由调用方退回滚动模式（§11.1）。
 fn agent_tui_start(cfg: &const Config) bool {
     // 私有输出 fd：请求期间 tls_noise_mute 会把 fd 2 指向 /dev/null，帧不能走 fd 2
     const ofd: i32 = sys_dup(1) catch { -1; };
@@ -12108,6 +12354,9 @@ fn agent_tui_start(cfg: &const Config) bool {
     return true;
 }
 
+// 收尾，**顺序不能换**：`tty_sink_on = false` → `tty_title_end()` → `tui_stop()`
+// （离开备用屏幕）→ `tty_raw_off()` → `sigx_disarm()`。
+// 先停 sink 再退屏幕：反过来的话退屏过程中的输出会漏进转录。
 fn agent_tui_stop(out_fd: i32) void {
     tty_sink_on = false;
     tty_title_end();   // P22：先弹标题栈（写的是 TUI 自己的 fd），再离开备用屏幕
@@ -12363,7 +12612,7 @@ fn agent_run_tui_body(cfg: &Config, tui_fd: i32) i32 {
         tui_set_run(TUI_RUN_THINK, "" as &const byte, 0);
         // 新任务 = 新回合：把上一轮遗留的中断意图清掉。不清的话流式循环一开头就会
         // 看到它并立刻打断本回合 —— 用户看到的是「中断一次之后，后面每个任务都秒退」
-        // （README 踩坑 44）。
+        // （§16 踩坑 44）。
         tui_interrupt_clear();
         tui_tick(tui_now_ms());
         rc = agent_turn_loop(cfg, &h);
@@ -12374,7 +12623,7 @@ fn agent_run_tui_body(cfg: &Config, tui_fd: i32) i32 {
         rc = AGENT_OK;
         // 注意：这里**不要**再补一句「quit 就直接 run = false」——回合结束后主循环还要
         // 走一圈（poll + tick）才能把最后一屏画出来；提前跳出会让屏幕停在「思考中」的
-        // 旧帧上（自测里表现为「转录里什么都没有」，README 踩坑 44）。
+        // 旧帧上（自测里表现为「转录里什么都没有」，§16 踩坑 44）。
     }
     if cfg.tui_headless {
         tty_sink_on = false;
@@ -12395,11 +12644,13 @@ fn agent_run_tui_body(cfg: &Config, tui_fd: i32) i32 {
     return rc;
 }
 
+// TUI 是否已经置了「该退出了」的标志（`/exit`、ctrl+d、EOF 都置它）。
+// 主循环每圈查一次，所以退出要等到这一圈结束 —— 这也是「任何时刻都退得出去」的实现（§15.2）。
 fn g_tui_quit_flag_pending() bool {
     return false;
 }
 
-// --tui-demo：把 home / chat 两种屏渲染成**纯文本**打出来（诊断 + README 用）
+// --tui-demo：把 home / chat 两种屏渲染成**纯文本**打出来（诊断 + §11 用）
 fn agent_tui_dump(cols: usize, rows: usize) void {
     var out: Buf = buf_new(65536);
     defer { buf_free(&out); }
@@ -12460,6 +12711,8 @@ fn agent_todo_fixture_add(text: &const byte, st: u8) void {
     g_todos.n = i + 1;
 }
 
+// 给 `--tui-demo` 造一套**假**的任务状态（清单 2/4、后台 1/2、子代理 1/1、目标 3/20），
+// 好让 demo 的常驻任务块有东西可画。只被 demo 与自测调用。
 export fn agent_tasks_fixture_demo() void {
     // 清单：2 完成 / 1 进行中 / 1 待办
     todo_free(&g_todos);
@@ -12467,7 +12720,7 @@ export fn agent_tasks_fixture_demo() void {
     agent_todo_fixture_add("写 src/tasks.uya（聚合 + 文本 + 快照推送）" as &const byte, TD_COMPLETED);
     agent_todo_fixture_add("接进 TUI 浮层与常驻块" as &const byte, TD_COMPLETED);
     agent_todo_fixture_add("补自测轮与 make 目标" as &const byte, TD_INPROGRESS);
-    agent_todo_fixture_add("把 README 第 6 节的验收表补齐" as &const byte, TD_PENDING);
+    agent_todo_fixture_add("把 doc-audit 的告警清零" as &const byte, TD_PENDING);
 
     // 后台任务：1 跑中（12s、已收 3 行输出）+ 1 已完成 exit 0
     jobs_free(&g_jobs);
@@ -12554,6 +12807,9 @@ ok
     _ = buf_append_cstr(&g.objective, "把 /tasks 的任务状态进度接进 TUI 与滚动模式" as &const byte);
 }
 
+// `--tui-demo [WxH]`：在给定尺寸上渲染若干屏**纯文本快照**后退出（诊断 + 文档）。
+// 它同时是 markdown 排版与浮层全屏的**自测基准** —— 快照走 `tui_screen_text`，
+// 与画帧**同源**，所以「demo 逐字节不变」才算真没改渲染（§11.3）。
 fn agent_tui_demo(cfg: &const Config, cols: usize, rows: usize) i32 {
     var prov: Buf = buf_new(32);
     defer { buf_free(&prov); }
@@ -12591,7 +12847,7 @@ fn agent_tui_demo(cfg: &const Config, cols: usize, rows: usize) i32 {
     tui_set_stats(sline.ptr as &const byte, sline.len);
     tui_set_ctx(21);
     tui_set_cpu(37);
-    tui_set_mem(319488);   // 312M（P24：内存合计，与 README 示例行一致）
+    tui_set_mem(319488);   // 312M（P24：内存合计口径与 /status 一致）
 
     // 再给一份带转录的（模拟真实一轮的形状）。
     // P46：这里的正文刻意放成「模型真会吐的那种 markdown」—— 标题、**粗体**、`行内码`、
@@ -12656,7 +12912,7 @@ fn agent_tui_demo(cfg: &const Config, cols: usize, rows: usize) i32 {
     tui_overlay_close();
     tui_set_plan(false);
     // ⑥ /diff 浮窗（P27）：左侧文件列表 + 右侧旧/新两栏全文比对。
-    //    数据用 gd_load_fixture 注入 —— demo 不碰 git，输出才可复现（README 引用的就是这一屏）。
+    //    数据用 gd_load_fixture 注入 —— demo 不碰 git，输出才可复现（本文引用的就是这一屏）。
     var dfiles: Buf = buf_new(256);
     defer { buf_free(&dfiles); }
     var ddiff: Buf = buf_new(4096);

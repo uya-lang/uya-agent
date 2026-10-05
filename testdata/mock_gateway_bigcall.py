@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""大参数假网关 —— 只用于验收「tool_calls 容量」（README 踩坑 35）。
+"""大参数假网关 —— 只用于验收「tool_calls 容量」（§16 踩坑 35）。
 
 它让 agent 的第一步就拿到一发**参数超过 8 KiB** 的 `write` 调用：正文是
 `CAP-HEAD|` + 600×16 字节 + `|CAP-TAIL`（≈9.6 KiB），序列化后的 tool_calls 原文 ≈9.9 KiB。

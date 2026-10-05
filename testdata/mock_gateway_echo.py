@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""回显型假网关 —— 只用于验收「诊断出口」（README 踩坑 33 / P19）。
+"""回显型假网关 —— 只用于验收「诊断出口」（§16 踩坑 33 / P19）。
 
 它模拟那类中转网关的报错风格：**非 2xx 的错误体里把收到的整个请求原样回显**。
 uya-agent 的旧实现会把这具身体按字节打给 fd 2，TUI 再把它渲染成一大块带 `· ` 前缀的
@@ -10,7 +10,7 @@ NOTICE 行（屏幕上就是「半个汉字 + 一屏 JSON」= 用户报的乱码
 用法：
     python3 testdata/mock_gateway_echo.py [port]        # port=0 → 随机端口，首行打印 PORT
 
-配 uya-agent 跑（验收记录见 README §6「P19 的诊断出口验收」）：
+配 uya-agent 跑（验收记录见 §19「P19 的诊断出口验收」）：
     python3 testdata/mock_gateway_echo.py 0 > /tmp/gw.log 2>&1 &
     PORT=$(awk '/^PORT/{print $2}' /tmp/gw.log)
     UYA_AGENT_API_KEY=k ./build/uya-agent --no-dsh-config \
