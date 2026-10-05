@@ -75,6 +75,12 @@ export struct Config {
     context_window: i64,      // 来自模型条目（压缩阈值基准）
     reasoning_effort: Buf,    // 来自 agent-default-model
     input_image: bool,        // 模型条目 input 含 image
+    // P55：低思考执行态 —— 前 exec_after 步用 reasoning_effort 把方案想清，之后切到 exec_effort 执行。
+    //   exec_after <= 0 或 exec_effort 为空 = 关闭（默认，行为与改动前逐字节一致）。
+    //   grace_steps：验收类命令首次「改动之后」通过起，还允许再走几步；0 = 只提醒、不设硬上限。
+    exec_effort: Buf,
+    exec_after: i32,
+    grace_steps: i32,
     // P37：模型路线（对齐 DSH 的 session.selectModel：一次选择 = provider + model + reasoning effort）
     //   provider：提供方键（settings.yaml 里的 providers.<key>）；空 = 未知（--no-dsh-config 或目录为空）
     //   provider_set：provider 是不是「已知的」（决定 /model 浮层要不要按提供方分组）
@@ -198,6 +204,9 @@ fn cfg_default() Config {
         context_window: -1,
         reasoning_effort: buf_empty(),
         input_image: false,
+        exec_effort: buf_empty(),
+        exec_after: 0,
+        grace_steps: 0,
         provider: buf_empty(),
         provider_set: false,
         src_provider: 0,
@@ -238,6 +247,7 @@ fn cfg_free(c: &Config) void {
     buf_free(&c.agent_home);
     buf_free(&c.dsh_home);
     buf_free(&c.reasoning_effort);
+    buf_free(&c.exec_effort);
     buf_free(&c.provider);
     buf_free(&c.dsh_root);
     buf_free(&c.skill_dirs);
@@ -3709,6 +3719,42 @@ export fn agent_set_interactive(v: bool) void {
     g_interactive = v;
 }
 
+// ---- P55：执行期两条纪律的运行时状态（全局，避免把参数穿过整条调用链）----
+//   on：本回合已经切到 exec_effort
+//   off：人**运行中**手动改过强度 ⇒ 自动切换让位（人优先）；档位不被模型公布时也置它
+//   base：切换前的档位（本回合结束时还原；空 = 没切过）
+//   step：当前步号（step 边界写；工具的收尾钩子在 dispatch_tool_body 里，那儿拿不到 step）
+//   accept_step：验收类命令最近一次「改动之后」通过的步号（0 = 还没发生）
+//   mod_seq / accept_mod_seq：改动计数，用来判定「这次验收是不是新的」
+//   notes：已经给过几条收工提醒（上限见 GRACE_NOTE_MAX，别刷屏）
+//
+// ⚠ 这两个机制的代码全部内联在既有函数里（step 边界 / dispatch_tool_body），**一个顶层函数都没加**：
+//   本仓「顶层函数 reachable 集合」是编译器里写死的容量，HEAD 的余量是 0（README 踩坑 87），
+//   加两个函数会撑爆表 —— 症状不是一句「容量不足」，而是链接期 undefined reference
+//   指着一堆**你没改过的**函数（实测踩过一次）。
+struct ExecState {
+    on: bool,
+    off: bool,
+    base: Buf,
+    step: i32,
+    accept_step: i32,
+    mod_seq: i64,
+    accept_mod_seq: i64,
+    notes: i32,
+}
+var g_exec: ExecState = ExecState{
+    on: false,
+    off: false,
+    base: Buf{ ptr: null, len: 0, cap: 0 },
+    step: 0,
+    accept_step: 0,
+    mod_seq: 0,
+    accept_mod_seq: 0,
+    notes: 0,
+};
+// 一个回合里最多给几条收工提醒（实测：同一条 make build 在一回合里被跑了三遍）
+const GRACE_NOTE_MAX: i32 = 2;
+
 fn dump_stream_error(cfg: &const Config, status: i32, body: &const Buf) void {
     _ = cfg;
     out_err("model endpoint returned HTTP ");
@@ -3808,6 +3854,134 @@ fn dispatch_tool_body(cfg: &Config, name: &const Buf, args_json: &const Buf, are
     // P22：任务块的目标段吃的是内存投影 —— goal 工具刚写过盘，这里立刻重读一次
     if sv_eq_cstr(name, "create_goal") || sv_eq_cstr(name, "get_goal") || sv_eq_cstr(name, "update_goal") {
         agent_goal_reload(cfg);
+    }
+    // ---- P55：执行期纪律的收尾钩子 ----
+    //
+    // 放在这里的原因有两个：① 两个工具派发点（流式 / 非流式）都必经 dispatch_tool_body，
+    // 一处顶两处；② 本仓「顶层函数 reachable 集合」是编译器里写死的容量，HEAD 的余量是 **0**
+    // （README 踩坑 87：净增函数过不了清缓存重编），所以这两个机制都不新增顶层函数。
+    //
+    // 干两件事：
+    //   * 记「改动」：write / edit，或 bash 里**有一整段**是改动类命令（git / mv / sed / …）；
+    //   * 收工提醒：bash 里**有一整段**是验收类命令（make / pytest / cargo / …）且这一段跑绿时，
+    //     往结果尾部追加一行提醒（一回合最多 GRACE_NOTE_MAX 条），并把步号记进
+    //     g_exec.accept_step（--grace-steps 的锚点）。
+    //
+    // ⚠ 判据是**按段锚定**的，不是「命令文本里出现过 make」—— 第一版就是后者，真机上当场误报两次：
+    //   ① `git mv … && sed -i 's|src/x.uya|…|' Makefile && grep -n "make" …`（搬家命令，50 个文件
+    //      才搬了 1 个就被告知「验收已通过，提交并给出最终答复」）；
+    //   ② 探索期的 `grep …; time make build`（改动还没开始）。
+    //   误报会把模型往「提前收工」上带：那两腿反而更贵（$0.0472 / $0.0531，对照腿 $0.0272）。
+    //   分段对齐 shell 常见写法：`&&`、`;`、`|`、换行、`(` 都算段边界；段首的
+    //   time / sudo / env / nohup / nice / command 前缀先剥掉，再看这一段的第一个 token。
+    if sv_eq_cstr(name, "bash" as &const byte) {
+        var xcmd: Buf = buf_empty();
+        defer { buf_free(&xcmd); }
+        // ⚠ 两个坑都踩过：① 这个 helper 的第一个参数是**已 parse 的** `&JsonValue`（用上面的
+        // arg_val），传裸 args 文本会被隐式强转成指针、函数永远返回 false —— 静默失效，
+        // 日志里连一条痕迹都没有；② 它内部 `out[0] = buf_new(...)` 换掉整个缓冲，
+        // 所以出参必须是**空 Buf**（给 buf_new(256) 过去等于每次泄漏 256 字节）。
+        if js_obj_get_str_unescaped(&arg_val, "command" as &const byte, 7, &xcmd) {
+            // 段首 token 复用一个 64 字节的小 Buf（sv_eq_cstr 收的是 Buf，不是视图；
+            // 超过 64 字节的 token 一律不认 —— 验收命令的名字都不长）
+            var xtok: Buf = buf_new(64);
+            defer { buf_free(&xtok); }
+            var acc_hit: bool = false;
+            var mut_hit: bool = false;
+            var seg_head: bool = true;   // 处在段首（前导空白不算离开段首）
+            var i: usize = 0;
+            while i < xcmd.len {
+                const c: byte = xcmd.ptr[i];
+                if c == 59 as byte || c == 124 as byte || c == 38 as byte
+                    || c == 10 as byte || c == 13 as byte || c == 40 as byte {
+                    seg_head = true;
+                    i = i + 1;
+                    continue;
+                }
+                if c == 32 as byte || c == 9 as byte {
+                    i = i + 1;
+                    continue;
+                }
+                if seg_head {
+                    // 这一段的第一个 token = [i, j)
+                    var j: usize = i;
+                    while j < xcmd.len {
+                        const d: byte = xcmd.ptr[j];
+                        if d == 32 as byte || d == 9 as byte || d == 10 as byte || d == 13 as byte
+                            || d == 59 as byte || d == 124 as byte || d == 38 as byte {
+                            break;
+                        }
+                        j = j + 1;
+                    }
+                    buf_reset(&xtok);
+                    if j - i <= xtok.cap {
+                        _ = buf_append(&xtok, xcmd.ptr + i, j - i);
+                    }
+                    // 前缀剥掉再看下一个 token（`time make build` 这种要认出来）
+                    while sv_eq_cstr(&xtok, "time" as &const byte) || sv_eq_cstr(&xtok, "sudo" as &const byte)
+                        || sv_eq_cstr(&xtok, "nohup" as &const byte) || sv_eq_cstr(&xtok, "nice" as &const byte)
+                        || sv_eq_cstr(&xtok, "command" as &const byte) || sv_eq_cstr(&xtok, "env" as &const byte) {
+                        var k: usize = j;
+                        while k < xcmd.len && (xcmd.ptr[k] == 32 as byte || xcmd.ptr[k] == 9 as byte) {
+                            k = k + 1;
+                        }
+                        var m: usize = k;
+                        while m < xcmd.len {
+                            const d2: byte = xcmd.ptr[m];
+                            if d2 == 32 as byte || d2 == 9 as byte || d2 == 10 as byte || d2 == 13 as byte
+                                || d2 == 59 as byte || d2 == 124 as byte || d2 == 38 as byte {
+                                break;
+                            }
+                            m = m + 1;
+                        }
+                        if m <= k {
+                            break;
+                        }
+                        buf_reset(&xtok);
+                        if m - k <= xtok.cap {
+                            _ = buf_append(&xtok, xcmd.ptr + k, m - k);
+                        }
+                        j = m;
+                    }
+                    if sv_eq_cstr(&xtok, "make" as &const byte) || sv_eq_cstr(&xtok, "pytest" as &const byte)
+                        || sv_eq_cstr(&xtok, "npm" as &const byte) || sv_eq_cstr(&xtok, "yarn" as &const byte)
+                        || sv_eq_cstr(&xtok, "pnpm" as &const byte) || sv_eq_cstr(&xtok, "cargo" as &const byte)
+                        || sv_eq_cstr(&xtok, "go" as &const byte) || sv_eq_cstr(&xtok, "tsc" as &const byte)
+                        || sv_eq_cstr(&xtok, "gradle" as &const byte) || sv_eq_cstr(&xtok, "mvn" as &const byte)
+                        || sv_eq_cstr(&xtok, "cmake" as &const byte) || sv_eq_cstr(&xtok, "ninja" as &const byte)
+                        || sv_eq_cstr(&xtok, "bazel" as &const byte) || sv_eq_cstr(&xtok, "meson" as &const byte)
+                        || sv_eq_cstr(&xtok, "dotnet" as &const byte) || sv_eq_cstr(&xtok, "tox" as &const byte) {
+                        acc_hit = true;
+                    }
+                    if sv_eq_cstr(&xtok, "git" as &const byte) || sv_eq_cstr(&xtok, "mv" as &const byte)
+                        || sv_eq_cstr(&xtok, "cp" as &const byte) || sv_eq_cstr(&xtok, "rm" as &const byte)
+                        || sv_eq_cstr(&xtok, "mkdir" as &const byte) || sv_eq_cstr(&xtok, "touch" as &const byte)
+                        || sv_eq_cstr(&xtok, "sed" as &const byte) || sv_eq_cstr(&xtok, "patch" as &const byte)
+                        || sv_eq_cstr(&xtok, "tee" as &const byte) || sv_eq_cstr(&xtok, "truncate" as &const byte)
+                        || sv_eq_cstr(&xtok, "ln" as &const byte) || sv_eq_cstr(&xtok, "chmod" as &const byte) {
+                        mut_hit = true;
+                    }
+                    seg_head = false;
+                }
+                i = i + 1;
+            }
+            if mut_hit {
+                g_exec.mod_seq = g_exec.mod_seq + 1;
+            }
+            if acc_hit && g_exec.notes < GRACE_NOTE_MAX && g_exec.mod_seq > g_exec.accept_mod_seq
+                && view_find(out, "[exit code: 0]" as &const byte) >= 0 {
+                g_exec.accept_mod_seq = g_exec.mod_seq;
+                g_exec.notes = g_exec.notes + 1;
+                if g_exec.accept_step == 0 {
+                    g_exec.accept_step = g_exec.step;
+                }
+                _ = buf_append_cstr(out, "\n[acceptance] 验收命令已通过（第 ");
+                _ = buf_append_u64(out, g_exec.step as u64);
+                _ = buf_append_cstr(out, " 步）：收工纪律 —— 不要再跑这条验收命令、不要另造一条验收；与本次改动无关的既有失败记一行就走，不要追查、不要另拉基线。提交并给出最终答复。\n");
+            }
+        }
+    } else if sv_eq_cstr(name, "write" as &const byte) || sv_eq_cstr(name, "edit" as &const byte) {
+        g_exec.mod_seq = g_exec.mod_seq + 1;
     }
 }
 
@@ -4533,10 +4707,36 @@ fn agent_step_plain(cfg: &const Config, style: u8, url: &const Buf, hdrs: &const
     return agent_finish_step(cfg, arena, h, step, &o2, req.len, retry_ok);
 }
 
+// ---- P55：执行期两条纪律 ----
+//
+// 实测（同一个「把 50 个源文件拆进子目录」任务，dsh 对比 uya-agent）：
+//   * 输出 token 的 90% 是**思考**，正文只占 2%、工具参数两边几乎一样多；
+//   * uya-agent 的思考量是 dsh 的 4.5 倍，其中一条固定浪费是「方案在推理里被反复重列」
+//     （50 个文件的映射在 step10–17 被重列，`src/` 在一段推理里出现 281 次）；
+//   * 另一条是「验收通过之后还不收工」：make build 在同一回合里跑了三遍。
+// 所以这里加两个可判定的机制（都不改默认行为）：
+//   ① 低思考执行态（--exec-effort V --exec-after N）：前 N 步用配置档位把方案想清，
+//      之后切到 V 执行 —— 对齐实测里"想一次就进入低思考执行"的那种形态。
+//   ② 收工提醒 + 收工预算（--grace-steps N）：验收类 bash 命令在**改动之后**第一次跑绿时，
+//      往结果尾部追加一行提醒；配了 N 就再给 N 步收工，用尽即提前结束本回合。
+
 fn agent_turn_loop_inner(cfg: &Config, h: &History) i32 {
     // P30：登记「当前回合」——阻塞循环里的统一泵点要用它来派发运行中的命令
     // （P31：主循环跑命令时也登记同一份上下文，见 agent_pump_ctx_begin）
     agent_pump_ctx_begin(cfg, h);
+    // P55：回合开始复位执行期纪律的那点状态 ——
+    //   * 上一回合切下去的低档位先还原（配置档位是每个回合的起点，不然一次任务之后就永久降档了）；
+    //   * 本回合的改动计数 / 验收锚点 / 提醒计数清零（收工预算按回合算）。
+    g_exec.mod_seq = 0;
+    g_exec.accept_mod_seq = 0;
+    g_exec.accept_step = 0;
+    g_exec.notes = 0;
+    if g_exec.on {
+        g_exec.on = false;
+        if g_exec.base.len > 0 {
+            _ = agent_effort_apply(cfg, g_exec.base.ptr as &const byte, g_exec.base.len, false, "exec-restore" as &const byte);
+        }
+    }
     var hdrs: Buf = buf_new(512);
     defer { buf_free(&hdrs); }
     if !build_headers(cfg, &hdrs) {
@@ -4559,6 +4759,17 @@ fn agent_turn_loop_inner(cfg: &Config, h: &History) i32 {
     // 显式给了正整数时才是熔断上限（下面循环结束后那条错误）。
     while cfg.max_steps <= 0 || step < cfg.max_steps {
         step = step + 1;
+        // P55：收工预算（--grace-steps N，默认 0 = 只提醒、不设硬上限）。
+        // 锚点是「验收类命令在改动之后第一次跑绿」的那一步：从那一步起只给 N 步收工，
+        // 用尽就提前结束本回合。默认关闭 —— 硬截断会让模型来不及给最终答复。
+        if cfg.grace_steps > 0 && g_exec.accept_step > 0 && step > g_exec.accept_step + cfg.grace_steps {
+            out_err("[grace] 验收已通过（第 ");
+            out_err_dec(g_exec.accept_step as usize);
+            out_err(" 步），收工预算 ");
+            out_err_dec(cfg.grace_steps as usize);
+            out_err(" 步已用尽：本回合提前收工（改动已保留，请查 /diff 或 git log）\n");
+            return AGENT_PROTO;
+        }
         // P28：step 边界先问一句「用户是不是已经要停了」。
         // 中断/退出意图在**下一个 step 边界**生效（DSH 口径）——那就没必要再发一个
         // 注定会被自己掐断的请求出去：用户按下 esc/ctrl+d 之后，要的是**马上**回到输入态，
@@ -4584,6 +4795,39 @@ fn agent_turn_loop_inner(cfg: &Config, h: &History) i32 {
         // 运行时上下文里那句 Current workspace 与新工作区的 AGENTS.md 都要跟上
         agent_ws_snapshot_sync(cfg, h);
         agent_bound_step_start(cfg, h, step);
+        // P55：低思考执行态 —— 前 exec_after 步用配置档位把方案想清，之后切到 exec_effort 执行。
+        // 只在配了 --exec-effort / --exec-after 时生效；逻辑内联在这里（本仓不能再加顶层函数，
+        // 见 ExecState 上面那段注释）。
+        g_exec.step = step;
+        if !g_exec.on && !g_exec.off && cfg.exec_after > 0 && cfg.exec_effort.len > 0 && step > cfg.exec_after {
+            if cfg.reasoning_effort.len > 0 {
+                buf_free(&g_exec.base);
+                g_exec.base = buf_new(cfg.reasoning_effort.len + 8);
+                _ = buf_append(&g_exec.base, cfg.reasoning_effort.ptr as &const byte, cfg.reasoning_effort.len);
+            }
+            const xrc: i32 = agent_effort_apply(cfg, cfg.exec_effort.ptr as &const byte, cfg.exec_effort.len, false, "exec-effort" as &const byte);
+            if xrc == 2 {
+                // 档位不在该模型公布的清单里：不切，并且别每一步白试一次
+                g_exec.off = true;
+                out_err("[exec-effort] 跳过：");
+                out_err_bytes(cfg.exec_effort.ptr, cfg.exec_effort.len);
+                out_err(" 不在当前模型公布的档位里\n");
+            } else {
+                g_exec.on = true;
+                if g_interactive {
+                    var xnote: Buf = buf_new(128);
+                    if buf_valid(&xnote) {
+                        _ = buf_append_cstr(&xnote, "执行期降档 → ");
+                        _ = buf_append(&xnote, cfg.exec_effort.ptr as &const byte, cfg.exec_effort.len);
+                        _ = buf_append_cstr(&xnote, "（前 ");
+                        _ = buf_append_u64(&xnote, cfg.exec_after as u64);
+                        _ = buf_append_cstr(&xnote, " 步用原档位）");
+                        tui_add_notice(xnote.ptr as &const byte, xnote.len);
+                        buf_free(&xnote);
+                    }
+                }
+            }
+        }
         if g_interactive {
             // 状态显示走提示符（避免两行光标的复杂度）；子代理面板在提示符上方
             agent_agents_tick();
@@ -5568,7 +5812,7 @@ fn agent_repl_model_text(cfg: &Config, line: &const Buf, effort: bool, out: &Buf
     agent_models_ensure(cfg);
     if arg.len > 0 {
         if effort {
-            const rc: i32 = agent_effort_apply(cfg, arg.ptr as &const byte, arg.len, false);
+            const rc: i32 = agent_effort_apply(cfg, arg.ptr as &const byte, arg.len, false, "human" as &const byte);
             if rc == 2 {
                 _ = buf_append_cstr(out, "error: ");
                 _ = buf_append(out, arg.ptr as &const byte, arg.len);
@@ -5974,7 +6218,10 @@ export fn agent_model_apply(cfg: &Config, provider: &const byte, pn: usize, mode
 }
 
 // 只换推理强度（模型不动）。返回 0 = 换了，1 = 本来就是它，2 = 参数不对（不在公布的档位里）。
-export fn agent_effort_apply(cfg: &Config, value: &const byte, vn: usize, announce: bool) i32 {
+// P55：src 是「这次改动从哪来」的来源标签（"human" = 人运行中敲的 /model、/effort、TUI 浮层；
+//   "cli" = 命令行 / --effort；"exec-effort" = 执行期自动降档）。它写进日志的 session/model，
+//   另有一条语义：**人运行中手动挑过档位之后，执行期自动降档让位**（人优先）。
+export fn agent_effort_apply(cfg: &Config, value: &const byte, vn: usize, announce: bool, src: &const byte) i32 {
     if vn == 0 {
         return 2;
     }
@@ -6028,7 +6275,11 @@ export fn agent_effort_apply(cfg: &Config, value: &const byte, vn: usize, announ
     } else {
         cfg.src_effort = 4;
     }
-    agent_model_log(cfg, "human" as &const byte);
+    agent_model_log(cfg, src);
+    // P55：来源是人（运行中手动改）⇒ 关掉本会话的执行期自动降档，别跟人抢
+    if sv_eq_cstr(src, "human" as &const byte) {
+        g_exec.off = true;
+    }
     if announce {
         var note: Buf = buf_new(64);
         defer { buf_free(&note); }
@@ -6350,7 +6601,7 @@ export fn agent_tui_model_handle(cfg: &Config, h: &const History, sel: &const Bu
         var v: Buf = buf_new(64);
         defer { buf_free(&v); }
         if agent_effort_item_parse(sel, &v) {
-            _ = agent_effort_apply(cfg, v.ptr as &const byte, v.len, true);
+            _ = agent_effort_apply(cfg, v.ptr as &const byte, v.len, true, "human" as &const byte);
         }
         return true;
     }
@@ -7123,6 +7374,10 @@ fn print_usage() void {
     out_err("                      不写 = 未声明：先打 /responses，404/405/501 自动回退 chat/completions（每进程一次）\n");
     out_err("  --reasoning-effort V  推理强度：completions 发顶层 reasoning_effort，responses 发 reasoning.effort\n");
     out_err("                      （compat.supportsReasoningEffort=false 时不发；off/none = 不发）\n");
+    out_err("  --exec-effort V     低思考执行态：前 --exec-after N 步用 --reasoning-effort 把方案想清，\n");
+    out_err("                      第 N+1 步起切到 V 执行（默认关；人运行中 /effort 改过就不自动切）\n");
+    out_err("  --exec-after N      想清的窗口（步数）；0 = 关闭低思考执行态（默认）\n");
+    out_err("  --grace-steps N     验收类命令在改动之后首次跑绿起，还允许再走 N 步；0 = 只提醒不截断\n");
     out_err("  --no-stream         关闭流式（SSE），回退到一次性响应\n");
     out_err("  --compat-fold       工具结果折叠成一条 user 消息（老端点兼容）\n");
     out_err("  --no-stream-options 不发送 stream_options.include_usage\n");
@@ -7180,6 +7435,7 @@ fn print_usage() void {
     out_err("  UYA_AGENT_TUI=0|1（全屏 TUI 开关）/ UYA_AGENT_TITLE=0|1（终端标题开关）/ NO_COLOR\n");
     out_err("  UYA_AGENT_MOUSE=0|1（TUI 鼠标上报开关；=0 可直接拖选复制文本）\n");
     out_err("  UYA_AGENT_API_KEY 或 DEEPSEEK_API_KEY 或 OPENAI_API_KEY\n");
+    out_err("  UYA_AGENT_EXEC_EFFORT / UYA_AGENT_EXEC_AFTER / UYA_AGENT_GRACE_STEPS（同 --exec-effort 等）\n");
 }
 
 // 从 stdin 取一行：inbuf 保存「上一批读进来但还没消费的剩余字节」，
@@ -9331,6 +9587,20 @@ fn agent_print_config(cfg: &const Config, dsh: &const DshCfg) void {
         out_err("  [not a level this model publishes; passed through]");
     }
     out_err("\n");
+    // P55：低思考执行态 + 收工预算（两个都默认关；关了就不打印第二段）
+    if cfg.exec_effort.len > 0 || cfg.exec_after > 0 || cfg.grace_steps > 0 {
+        out_err("exec_effort = ");
+        if cfg.exec_effort.len > 0 {
+            out_err_bytes(cfg.exec_effort.ptr, cfg.exec_effort.len);
+        } else {
+            out_err("(off)");
+        }
+        out_err("  exec_after = ");
+        out_err_dec(cfg.exec_after as usize);
+        out_err("  grace_steps = ");
+        out_err_dec(cfg.grace_steps as usize);
+        out_err("\n");
+    }
     // P37：提供方 + 该模型公布的推理档位（目录口径：只认模型自己公布的档位）
     out_err("provider = ");
     if cfg.provider.len > 0 {
@@ -9700,6 +9970,20 @@ export fn main() i32 {
         buf_free(&cfg.reasoning_effort);
         cfg.reasoning_effort = buf_from_cstr(eff_env);
         cfg.src_effort = 2;
+    }
+    // P55：低思考执行态（--exec-effort / --exec-after / --grace-steps 的 env 口径）
+    const xeff_env: &byte = getenv("UYA_AGENT_EXEC_EFFORT");
+    if (xeff_env as usize) != 0 && bufx_cstr_len(xeff_env) > 0 {
+        buf_free(&cfg.exec_effort);
+        cfg.exec_effort = buf_from_cstr(xeff_env);
+    }
+    const xafter_env: &byte = getenv("UYA_AGENT_EXEC_AFTER");
+    if (xafter_env as usize) != 0 && bufx_cstr_len(xafter_env) > 0 {
+        cfg.exec_after = parse_i32_arg(xafter_env, 0);
+    }
+    const grace_env: &byte = getenv("UYA_AGENT_GRACE_STEPS");
+    if (grace_env as usize) != 0 && bufx_cstr_len(grace_env) > 0 {
+        cfg.grace_steps = parse_i32_arg(grace_env, 0);
     }
     // P21：访问模式（read-only / workspace-write / danger-full-access，机器名与 DSH 一致）
     const perm_env: &byte = getenv("UYA_AGENT_PERMISSION");
@@ -10086,7 +10370,7 @@ export fn main() i32 {
         } else if arg_eq(p, "--effort") {
             i = i + 1;
             if i < get_argc() {
-                _ = agent_effort_apply(&cfg, get_argv(i), cstr_len(get_argv(i)), false);
+                _ = agent_effort_apply(&cfg, get_argv(i), cstr_len(get_argv(i)), false, "cli" as &const byte);
             }
         } else if arg_eq(p, "--workspace") {
             i = i + 1;
@@ -10110,6 +10394,24 @@ export fn main() i32 {
             i = i + 1;
             if i < get_argc() {
                 cfg.timeout_ms = parse_i32_arg(get_argv(i), 120000) as u32;
+            }
+        } else if arg_eq(p, "--exec-effort") {
+            // P55：执行期档位（配了 --exec-after 才生效）
+            i = i + 1;
+            if i < get_argc() {
+                buf_free(&cfg.exec_effort);
+                cfg.exec_effort = buf_from_cstr(get_argv(i));
+            }
+        } else if arg_eq(p, "--exec-after") {
+            i = i + 1;
+            if i < get_argc() {
+                cfg.exec_after = parse_i32_arg(get_argv(i), 0);
+            }
+        } else if arg_eq(p, "--grace-steps") {
+            // P55：验收通过之后的收工预算（0 = 只提醒、不设硬上限）
+            i = i + 1;
+            if i < get_argc() {
+                cfg.grace_steps = parse_i32_arg(get_argv(i), 0);
             }
         } else if arg_eq(p, "--tls-verify=chain") {
             cfg.verify = HC_VERIFY_CHAIN;

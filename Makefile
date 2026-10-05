@@ -53,7 +53,7 @@ TASK ?= 创建 hello.uya，编译并运行它
 export UYA_ROOT
 export UYA_SPLIT_C_DIR := $(CURDIR)/build/uyacache
 
-.PHONY: all check build link-audit selftest codegen-audit probe e2e e2e-config e2e-config-flags e2e-title e2e-title-cmd e2e-title-auto e2e-mouse e2e-api e2e-steps e2e-permission e2e-sandbox e2e-tasks e2e-goal e2e-sessions e2e-resume-big e2e-diff e2e-ws e2e-model e2e-worktree e2e-watch e2e-watch-pick e2e-dsh p30-check tui-demo tui-selftest sess-selftest diff-selftest model-selftest panel-selftest clean shell-selftest
+.PHONY: all check build link-audit selftest codegen-audit probe e2e e2e-config e2e-exec e2e-accept-nudge e2e-config-flags e2e-title e2e-title-cmd e2e-title-auto e2e-mouse e2e-api e2e-steps e2e-permission e2e-sandbox e2e-tasks e2e-goal e2e-sessions e2e-resume-big e2e-diff e2e-ws e2e-model e2e-worktree e2e-watch e2e-watch-pick e2e-dsh p30-check tui-demo tui-selftest sess-selftest diff-selftest model-selftest panel-selftest clean shell-selftest
 
 all: build
 
@@ -110,7 +110,7 @@ codegen-audit: build
 #   要命的地方在于增量编译看不出来（缓存），只有 `rm -rf build` 重编才炸，报错点还落在标准库里。
 #   所以「净增函数」的改动一律先清缓存重编一遍（见 README §3 踩坑 87）。
 #   变量与常量不占这个额度，只有函数占；整理手段见踩坑 87。
-selftest: build codegen-audit e2e-config-flags e2e-title e2e-title-cmd e2e-title-auto e2e-mouse e2e-api e2e-steps e2e-permission e2e-sandbox e2e-tasks e2e-goal e2e-sessions e2e-resume-big e2e-diff e2e-ws e2e-model e2e-worktree p30-check
+selftest: build codegen-audit e2e-exec e2e-accept-nudge e2e-config-flags e2e-title e2e-title-cmd e2e-title-auto e2e-mouse e2e-api e2e-steps e2e-permission e2e-sandbox e2e-tasks e2e-goal e2e-sessions e2e-resume-big e2e-diff e2e-ws e2e-model e2e-worktree p30-check
 	UYA_BIN=$(UYA) $(OUT) --selftest
 
 probe: build
@@ -390,6 +390,52 @@ e2e: build
 e2e-config: build
 	$(OUT) --print-config
 
+# P55 执行期两条纪律的开关（低思考执行态 + 收工预算）：默认关、CLI/env 都要在 --print-config
+# 上看得见、`--help` 要列出来。三条纪律本身（提醒文案）由 --selftest 的 prompt 钉子守。
+e2e-exec: build
+	@set -e; \
+	out=$$($(OUT) --no-dsh-config --print-config 2>&1); \
+	echo "$$out" | grep -q "exec_effort" \
+		&& { echo "FAIL: 默认没配也打印了 exec 段（两个机制应当默认关）"; exit 1; } || true; \
+	out=$$($(OUT) --no-dsh-config --exec-effort low --exec-after 7 --grace-steps 5 --print-config 2>&1); \
+	echo "$$out" | grep -q "exec_effort = low  exec_after = 7  grace_steps = 5" \
+		|| { echo "FAIL: --exec-effort/--exec-after/--grace-steps 没有生效"; echo "$$out"; exit 1; }; \
+	out=$$(UYA_AGENT_EXEC_EFFORT=medium UYA_AGENT_EXEC_AFTER=3 UYA_AGENT_GRACE_STEPS=2 \
+		$(OUT) --no-dsh-config --print-config 2>&1); \
+	echo "$$out" | grep -q "exec_effort = medium  exec_after = 3  grace_steps = 2" \
+		|| { echo "FAIL: env 口径（UYA_AGENT_EXEC_EFFORT/EXEC_AFTER/GRACE_STEPS）没有生效"; exit 1; }; \
+	out=$$($(OUT) --no-dsh-config --exec-effort low --exec-after 7 --print-config 2>&1); \
+	echo "$$out" | grep -q "grace_steps = 0" \
+		|| { echo "FAIL: 没给 --grace-steps 时应当是 0（只提醒、不设硬上限）"; exit 1; }; \
+	$(OUT) --help 2>&1 | grep -q -- "--exec-effort" \
+		|| { echo "FAIL: --help 里没有 --exec-effort"; exit 1; }; \
+	$(OUT) --help 2>&1 | grep -q -- "--grace-steps" \
+		|| { echo "FAIL: --help 里没有 --grace-steps"; exit 1; }; \
+	echo "e2e-exec: 通过（两个机制默认关；CLI/env 都生效；--help 有；--grace-steps 缺省 0）"; \
+	: "低思考执行态的切换与**回合结束还原**（借假网关跑两个回合）"; \
+	ws=$(CURDIR)/build/e2e_exec_ws; rm -rf $$ws; mkdir -p $$ws; \
+	printf 'build:\n\t@echo EXEC-OK\n' > $$ws/Makefile; \
+	home=$(CURDIR)/build/e2e_exec_home; rm -rf $$home; mkdir -p $$home; \
+	python3 testdata/mock_gateway_accept.py 0 > $(CURDIR)/build/e2e_exec_gw.log 2>&1 & \
+	gw=$$!; \
+	sleep 0.4; \
+	port=$$(awk '/^PORT/{print $$2}' $(CURDIR)/build/e2e_exec_gw.log); \
+	if [ -z "$$port" ]; then echo "FAIL: 假网关没起来"; kill $$gw 2>/dev/null || true; exit 1; fi; \
+	: "第二行延迟喂：早喂会被当成运行中的 steer，就不是新回合了（也就测不到还原）"; \
+	: "基准档位必须配（--effort xhigh）：没配就没东西可还原，exec-restore 本来就不该出现"; \
+	( printf '任务一\n'; sleep 3; printf '任务二\n'; sleep 3; printf '/exit\n' ) | \
+		UYA_AGENT_API_KEY=k $(OUT) --no-dsh-config --no-stream --no-tui --quiet \
+		--base-url "http://127.0.0.1:$$port/v1" --api=chat --model mock-model \
+		--workspace $$ws --agent-home $$home --tls-verify=none \
+		--effort xhigh --exec-effort low --exec-after 1 > $(CURDIR)/build/e2e_exec_out.txt 2>&1 || true; \
+	kill $$gw 2>/dev/null || true; \
+	log=$$(ls $$home/sessions/*/*/session.jsonl 2>/dev/null | head -1); \
+	if [ -z "$$log" ]; then echo "FAIL: 执行期降档那两回合没有落会话日志"; cat $(CURDIR)/build/e2e_exec_out.txt; exit 1; fi; \
+	grep -q '"source":"exec-effort"' $$log || { echo "FAIL: 没有切档记录（source=exec-effort）"; exit 1; }; \
+	grep -q '"source":"exec-restore"' $$log || { echo "FAIL: 第二个回合开始没有把档位还原（source=exec-restore）"; exit 1; }; \
+	turns=$$(grep -c '"type":"turn/start"' $$log || true); \
+	[ "$$turns" = "2" ] || { echo "FAIL: 期望 2 个回合，实际 $$turns（第二行被当成 steer 了？）"; exit 1; }; \
+	echo "e2e-exec: 通过（默认关；CLI/env 生效；--help 有；降档 → exec-effort；回合开始 → exec-restore；2 回合）"
 # CLI flag 回归：--dsh-home / --no-dsh-config / --strict-dsh-config 决定「去哪儿读设置」，
 # 必须在下一次加载之前生效（曾经因为完整 CLI 解析排在加载之后而三个 flag 全部静默失效，
 # 见 README 踩坑 25）。离线可跑：--print-config 不联网。
@@ -415,6 +461,37 @@ e2e-config-flags: build
 	echo "$$out" | grep -q "readLimit=1777" \
 		&& { echo "FAIL: 没给 --dsh-root 却读到了夹具的值"; exit 1; }; \
 	echo "e2e-config-flags: 通过（--dsh-home / --no-dsh-config / --strict-dsh-config / --dsh-root 都在加载前生效）"
+
+# P55 收工提醒（--grace-steps 的锚点也靠它）：验收类命令在**改动之后**跑绿时，工具结果尾部要出现
+# 一行 `[acceptance] …`；三种反例都不该出现 —— 非验收类命令（`ls -la`）、以及**文本里出现过
+# make 但没有哪一段以验收命令开头**（`grep -n "make build" Makefile && echo ok`，第一版误报的形状）、
+# 以及「还没改动就跑验收」（这里由假网关的第一发 touch 之外的单测覆盖）。
+e2e-accept-nudge: build
+	@set -e; \
+	ws=$(CURDIR)/build/e2e_nudge_ws; \
+	rm -rf $$ws; mkdir -p $$ws; \
+	printf 'build:\n\t@echo NUDGE-BUILD-OK\n' > $$ws/Makefile; \
+	for spec in ACCEPT-NUDGE:1 ACCEPT-CONTROL:0 ACCEPT-FALSEPOS:0; do \
+		mode=$${spec%%:*}; want=$${spec##*:}; \
+		home=$(CURDIR)/build/e2e_nudge_home_$$mode; \
+		rm -rf $$home; mkdir -p $$home; \
+		python3 testdata/mock_gateway_accept.py 0 > $(CURDIR)/build/e2e_nudge_gw_$$mode.log 2>&1 & \
+		gw=$$!; \
+		sleep 0.4; \
+		port=$$(awk '/^PORT/{print $$2}' $(CURDIR)/build/e2e_nudge_gw_$$mode.log); \
+		if [ -z "$$port" ]; then echo "FAIL: 假网关没起来"; cat $(CURDIR)/build/e2e_nudge_gw_$$mode.log; kill $$gw 2>/dev/null || true; exit 1; fi; \
+		UYA_AGENT_API_KEY=k $(OUT) --no-dsh-config --no-stream --no-tui --quiet \
+			--base-url "http://127.0.0.1:$$port/v1" --api=chat --model mock-model \
+			--workspace $$ws --agent-home $$home --tls-verify=none \
+			"任务标记 $$mode" > $(CURDIR)/build/e2e_nudge_out_$$mode.txt 2>&1 || true; \
+		kill $$gw 2>/dev/null || true; \
+		log=$$(ls $$home/sessions/*/*/session.jsonl 2>/dev/null | head -1); \
+		if [ -z "$$log" ]; then echo "FAIL: $$mode 没有落会话日志"; cat $(CURDIR)/build/e2e_nudge_out_$$mode.txt; exit 1; fi; \
+		cnt=$$(grep -c "\[acceptance\] 验收命令已通过" $$log || true); \
+		[ "$$cnt" = "$$want" ] || { echo "FAIL: $$mode 期望 $$want 条提醒，实际 $$cnt 条"; exit 1; }; \
+		grep -q "touch nudge_changed.txt" $(CURDIR)/build/e2e_nudge_gw_$$mode.log || { echo "FAIL: $$mode 的假网关没发改动类命令"; exit 1; }; \
+	done; \
+	echo "e2e-accept-nudge: 通过（验收类 → 1 条；ls -la / 文本里含 make 的非验收命令 → 0 条）"
 
 # 终端标题开关（P22）回归：默认开；--no-title / UYA_AGENT_TITLE=0 都要在 --print-config 的
 # 来源列上看得出来（来源码与 cfg_src_name 同口径：default / env / cli），而且 CLI 压过 env。
