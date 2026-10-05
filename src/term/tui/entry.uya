@@ -1,0 +1,973 @@
+// src/term/tui/entry.uya — 全屏 TUI：转录条目 / NOTICE / 清洗 / 折行 / 行渲染 / sink
+//
+// 本文件：转录条目表与长度上限、NOTICE 条目（诊断 fd 2 的落点，也是「乱码」最容易灌屏
+//   的地方）、控制字节与 ESC 序列清洗、按显示列的折行、行渲染（P46：markdown 交给 mdview
+//   纯函数层，这里只做前缀分类），以及写入 sink（`tty_write` / `tty_reason_write` 的字节
+//   怎么变成条目 —— **唯一的条目入口**）。
+// 不变量：清洗之后的行文本仍不得含 ESC / NUL；折行结果按显示列、续行保留原行缩进；
+//   别处不许直接往条目表里塞。
+// 依赖：term/mdview、style、foundation/bufx。
+
+use libc.syscall;
+use libc.unistd;
+use libc.heap;
+
+// ============================================================
+// 转录条目
+// ============================================================
+
+export const TUI_E_USER: u8 = 0;
+export const TUI_E_ASSIST: u8 = 1;
+export const TUI_E_REASON: u8 = 2;
+export const TUI_E_TOOL: u8 = 3;
+export const TUI_E_NOTICE: u8 = 4;
+export const TUI_E_STEER: u8 = 5;
+
+const TUI_MAX_ENTRIES: usize = 512;
+const TUI_ENTRY_MAX: usize = 262144;        // 单条上限 256 KiB
+const TUI_TEXT_MAX: usize = 4194304;        // 转录正文总量上限 4 MiB
+const TUI_REASON_TAIL: usize = 4096;        // 思考条目只留最新一段
+
+// 踩坑 68：行偏移表 —— 取第 i 行的字节区间。
+//
+// 修前那条路（就是下面保留的 `tui_ov_line_at` 线性扫描兜底）为取第 i 行**从缓冲区
+// 第 0 字节重新扫一遍**。画一屏列表要对每个可见行各扫一次（越靠后越贵），于是
+// 「画一帧」是 O(可见行数 × n²) 字节步：真机 842 个会话、底部按一次 ↑ 实测 1.2–1.6 s
+// （顶上只要 85 ms —— 要跨的项少）。这里把「一行一段」的偏移区间**一次性**建出来
+// （O(n)），之后每次取行是 O(1)。
+//
+// 生命周期与它描述的那份 Buf 严格绑定：缓冲区每次整体重写（overlay_list /
+// diff_open / ov_rows_ensure）之后就地重建；`tui_reset_all()` 里连表一起 free。
+// 计数口径与 tui_ov_count_items() 逐字相同（'\n' 个数 +1，末字节非 '\n' 时才算）。
+struct TuiLineIdx {
+    offs: &usize,      // 第 i 行的**终点**（行尾 '\n' 的下标；末行无 '\n' 时为缓冲区尾）；长度 n
+    n: usize,          // 行数（= 下面 Buf 的逻辑行数）
+    cap: usize,        // offs 的容量（格数）
+}
+
+struct TuiEntry {
+    kind: u8,
+    text: Buf,
+    wrap: Buf,
+    // P46：markdown 条目的**逐字节样式**（与 wrap 逐字节等长；非 markdown 条目恒空）。
+    // 样式挂在可见字节上，所以折行落在任何位置都继承样式、跨窗口也不丢围栏状态 ——
+    // 见 src/mdview.uya 顶部那段说明。
+    md: Buf,
+    // 折行文本的**行偏移表**（与 wrap 同寿命，wrap 每次重写后就地重建）。
+    //
+    // 为什么必须有它：`tui_entry_line(i, k)` 以前为取第 k 行**从 wrap 头部重新扫一遍**
+    // （下面保留的线性扫描兜底就是那条老路），而 draw 循环对每个可见行都调它一次 ——
+    // 于是一个 n 行的长条目「画一帧」是 O(n × 可见行) 字节步。实测（本轮）：一份
+    // ~148 KiB / 约 5400 行的助手正文，80×40 下**每帧 2.8–3.5 s**（贴尾也是），乘上
+    // 滚轮/思考行的重绘频率，界面直接卡死。这与踩坑 68 的 `/sessions` 卡顿是同一族
+    // （那边修的是浮层条目与 reader 正文取行），**条目这条路当时漏了**。
+    // 建表是 O(n) 一次，之后每帧取行是 O(1)：同夹具实测 2819 → 3 ms。
+    wrap_ix: TuiLineIdx,
+    wrap_width: usize,
+    wrap_lines: usize,
+    wrap_valid: bool,
+    streaming: bool,
+    notice_full: bool,      // NOTICE 已到上限（不再累积，只留过一行截断提示）
+}
+
+var g_tui_entries: [TuiEntry: TUI_MAX_ENTRIES] = [TuiEntry{
+    kind: 0,
+    text: Buf{ ptr: null, len: 0, cap: 0 },
+    wrap: Buf{ ptr: null, len: 0, cap: 0 },
+    md: Buf{ ptr: null, len: 0, cap: 0 },
+    wrap_ix: TuiLineIdx{ offs: null as &usize, n: 0, cap: 0 },
+    wrap_width: 0, wrap_lines: 0, wrap_valid: false, streaming: false, notice_full: false
+}: TUI_MAX_ENTRIES];
+var g_tui_nent: usize = 0;          // 已用条目数（环形）
+var g_tui_estart: usize = 0;        // 环形起点
+var g_tui_text_total: usize = 0;    // 正文总量记账
+var g_tui_dropped: usize = 0;       // 被丢掉的老条目数（顶部会写一行）
+
+export fn tui_entries_count() usize {
+    return g_tui_nent;
+}
+
+
+fn tui_entry_slot(i: usize) usize {
+    return (g_tui_estart + i) % TUI_MAX_ENTRIES;
+}
+
+export fn tui_entry_kind(i: usize) u8 {
+    if i >= g_tui_nent {
+        return 255;
+    }
+    const s: usize = tui_entry_slot(i);
+    if s >= TUI_MAX_ENTRIES {
+        return 255;
+    }
+    return g_tui_entries[s].kind;
+}
+
+
+fn tui_entry_at(i: usize) &TuiEntry {
+    const s: usize = tui_entry_slot(i);
+    if s >= TUI_MAX_ENTRIES {
+        return &g_tui_entries[0];
+    }
+    return &g_tui_entries[s];
+}
+
+fn tui_entry_init(e: &TuiEntry, kind: u8) void {
+    e.kind = kind;
+    if !buf_valid(&e.text) {
+        e.text = buf_new(4096);
+    }
+    if !buf_valid(&e.wrap) {
+        e.wrap = buf_new(4096);
+    }
+    buf_reset(&e.text);
+    buf_reset(&e.wrap);
+    // 样式缓冲只给 markdown 条目分配（工具输出动辄几百 KiB，不该白付这一份内存）
+    if kind == TUI_E_ASSIST {
+        if !buf_valid(&e.md) {
+            e.md = buf_new(4096);
+        }
+        buf_reset(&e.md);
+    }
+    // 槽位可能被复用：行偏移表指向上一条内容，必须一起清（不清就是「取行读到旧偏移」）
+    tui_lineidx_reset(&e.wrap_ix);
+    e.wrap_width = 0;
+    e.wrap_lines = 0;
+    e.wrap_valid = false;
+    e.streaming = false;
+    e.notice_full = false;
+}
+
+// ============================================================
+// NOTICE 条目：诊断（fd 2）的落点，也是「乱码」最容易灌屏的地方
+//
+// 外来字节再大也只占几行：文本到 TUI_NOTICE_MAX 就停，补一行截断提示。
+// 全文在会话日志的 diag/dump 里（agent.uya::agent_diag_log），要看原始字节开
+// --debug-dump。没有这个上限时，一条 4 KiB 的网关错误体就能把整屏转录冲掉。
+// ============================================================
+const TUI_NOTICE_MAX: usize = 512;
+const TUI_NOTICE_CUT: &const byte = "\n…（诊断已截断，全文见会话日志 diag/dump 与 --debug-dump）";
+
+fn tui_notice_append(e: &TuiEntry, p: &const byte, n: usize) void {
+    if e.notice_full || n == 0 {
+        return;
+    }
+    var take: usize = n;
+    var clipped: bool = false;
+    if e.text.len >= TUI_NOTICE_MAX {
+        take = 0;
+        clipped = true;
+    } else if e.text.len + take > TUI_NOTICE_MAX {
+        take = TUI_NOTICE_MAX - e.text.len;
+        clipped = true;
+    }
+    if take > 0 {
+        tui_entry_append(e, p, take);
+    }
+    if clipped {
+        e.notice_full = true;
+        tui_entry_append(e, TUI_NOTICE_CUT, bufx_cstr_len(TUI_NOTICE_CUT));
+    }
+}
+
+// 诊断一行结束后的换行（已到上限的条目不再补，免得把截断提示顶下去）
+fn tui_notice_newline(e: &TuiEntry) void {
+    if e.notice_full {
+        return;
+    }
+    if buf_append_byte(&e.text, 10) {
+        g_tui_text_total = g_tui_text_total + 1;
+    }
+}
+
+// 丢最老的一条（环形前进）
+fn tui_entry_drop_oldest() void {
+    if g_tui_nent == 0 {
+        return;
+    }
+    const s: usize = g_tui_estart;
+    if s < TUI_MAX_ENTRIES {
+        g_tui_text_total = g_tui_text_total - g_tui_entries[s].text.len;
+        buf_free(&g_tui_entries[s].text);
+        buf_free(&g_tui_entries[s].wrap);
+        buf_free(&g_tui_entries[s].md);
+        tui_lineidx_reset(&g_tui_entries[s].wrap_ix);
+    }
+    g_tui_estart = (g_tui_estart + 1) % TUI_MAX_ENTRIES;
+    g_tui_nent = g_tui_nent - 1;
+    g_tui_dropped = g_tui_dropped + 1;
+}
+
+fn tui_entry_new(kind: u8) i32 {
+    while g_tui_nent >= TUI_MAX_ENTRIES {
+        tui_entry_drop_oldest();
+    }
+    while g_tui_text_total > TUI_TEXT_MAX && g_tui_nent > 0 {
+        tui_entry_drop_oldest();
+    }
+    const s: usize = (g_tui_estart + g_tui_nent) % TUI_MAX_ENTRIES;
+    const e: &TuiEntry = &g_tui_entries[s];
+    tui_entry_init(e, kind);
+    g_tui_nent = g_tui_nent + 1;
+    tui_mark_dirty();
+    return (g_tui_nent - 1) as i32;
+}
+
+fn tui_entry_append(e: &TuiEntry, p: &const byte, n: usize) void {
+    if n == 0 {
+        return;
+    }
+    if e.text.len + n > TUI_ENTRY_MAX {
+        const over: usize = e.text.len + n - TUI_ENTRY_MAX;
+        if over >= e.text.len {
+            buf_reset(&e.text);
+        } else {
+            buf_truncate(&e.text, e.text.len - over);
+        }
+    }
+    if buf_append(&e.text, p, n) {
+        g_tui_text_total = g_tui_text_total + n;
+    }
+    e.wrap_valid = false;
+    tui_mark_dirty();
+}
+
+// 把「未成行的尾巴」拼进来（sink 用）
+var g_tui_pend: Buf = Buf{ ptr: null, len: 0, cap: 0 };
+
+fn tui_pend_ensure() void {
+    if !buf_valid(&g_tui_pend) {
+        g_tui_pend = buf_new(8192);
+    }
+}
+
+// ============================================================
+// 清洗：控制字节 / ESC 序列 / TAB / 非法 UTF-8
+//
+// 工具输出里什么都可能有（NUL、彩色转义、`ESC[2J`）。正文层必须是纯文本：
+//   * ESC 起始的 CSI/OSC 序列整段吃掉，只留一个 ␛（告诉人「这里原来有转义」）
+//   * 其余控制字节（0x00-0x1f 除了 \n、0x7f）→ ·
+//   * TAB → 四个空格（正文层里没有 TAB，宽度算得准）
+//   * 非法 / 半截 UTF-8 → U+FFFD（EF BF BD，1 列；见下面 tui_clean_into）
+// ============================================================
+
+// U+FFFD（替换字符）：数组字面量，避免「切片描述符 → char*」强转（踩坑 22）
+const g_tui_repl: [byte: 3] = [239, 191, 189];
+
+export fn tui_clean_into(dst: &Buf, p: &const byte, n: usize) void {
+    tui_clean_ex_into(dst, p, n, false);
+}
+
+// 单行变体（本轮修复）：与 tui_clean_into 逐字节相同，只多一条 —— '\n' **折成空格**。
+// 用途只有一个：要塞进「帧里的一行」的文本（浮层标题 / 提问正文 / 自定义回答行）。
+// 为什么必须折：帧的每一行是缓冲里的一段，行内再出现 '\n'，终端就把它当换行 —— 那一行
+// 会被拆成两行画出来，方框的右边框再也对不齐，文字直接跑出框外（见 §3 踩坑 81）。
+fn tui_clean_line_into(dst: &Buf, p: &const byte, n: usize) void {
+    tui_clean_ex_into(dst, p, n, true);
+}
+
+fn tui_clean_ex_into(dst: &Buf, p: &const byte, n: usize, one_line: bool) void {
+    var i: usize = 0;
+    while i < n {
+        const c: byte = p[i];
+        if c == 27 as byte {
+            // CSI: ESC [ ... 终结字节 0x40-0x7e；OSC: ESC ] ... BEL/ST
+            var j: usize = i + 1;
+            if j < n && p[j] == 91 as byte {
+                j = j + 1;
+                while j < n {
+                    const d: byte = p[j];
+                    if d >= 0x40 as byte && d <= 0x7e as byte {
+                        j = j + 1;
+                        break;
+                    }
+                    j = j + 1;
+                }
+            } else if j < n && p[j] == 93 as byte {
+                j = j + 1;
+                while j < n {
+                    if p[j] == 7 as byte {
+                        j = j + 1;
+                        break;
+                    }
+                    if p[j] == 27 as byte && j + 1 < n && p[j + 1] == 92 as byte {
+                        j = j + 2;
+                        break;
+                    }
+                    j = j + 1;
+                }
+            } else {
+                j = i + 1;
+            }
+            _ = buf_append(dst, "␛" as &const byte, 3);
+            i = j;
+            continue;
+        }
+        if c == 9 as byte {
+            _ = buf_append(dst, "    " as &const byte, 4);
+            i = i + 1;
+            continue;
+        }
+        if c == 10 as byte {
+            if one_line {
+                _ = buf_append_byte(dst, 32);
+            } else {
+                _ = buf_append_byte(dst, 10);
+            }
+            i = i + 1;
+            continue;
+        }
+        if c < 0x20 as byte || c == 0x7f as byte {
+            _ = buf_append(dst, "·" as &const byte, 2);
+            i = i + 1;
+            continue;
+        }
+        if c >= 0x80 as byte {
+            // 非法 / 半截 UTF-8 → U+FFFD（1 列）。不换的话终端自己渲染半个字符，
+            // 而且它的列宽和我们算的不一致（tty_char_cols 按 1 列算）→ 整行错位。
+            // 孤立续字节也要换掉：tty_utf8_decode 对它会返回字节本身而不是 U+FFFD，
+            // 所以先按 tty_utf8_len 判「合法引导字节 + 长度对不对」。
+            const need: usize = tty_utf8_len(c);
+            const step: usize = tty_utf8_next(p, i, n) - i;
+            var good: bool = need > 1 && step == need;
+            if good {
+                const cp: u32 = tty_utf8_decode(p, i, n);
+                if cp == 0xFFFD {
+                    good = step == 3 && c == 239 as byte
+                        && p[i + 1] == 191 as byte && p[i + 2] == 189 as byte;
+                }
+            }
+            if good {
+                _ = buf_append(dst, p + i, step);
+                i = i + step;
+            } else {
+                _ = buf_append(dst, &g_tui_repl[0], 3);
+                i = i + 1;
+            }
+            continue;
+        }
+        _ = buf_append_byte(dst, c);
+        i = i + 1;
+    }
+}
+
+// ============================================================
+// 折行（按显示列；续行保留原行缩进）
+// ============================================================
+
+fn tui_wrap_into(dst: &Buf, text: &const byte, n: usize, width: usize) usize {
+    buf_reset(dst);
+    var width_v: usize = width;
+    if width_v < 4 {
+        width_v = 4;
+    }
+    const w: usize = width_v;
+    var lines: usize = 0;
+    var pos: usize = 0;
+    while pos <= n {
+        // 本逻辑行 = [pos, eol)
+        var eol: usize = pos;
+        while eol < n && text[eol] != 10 as byte {
+            eol = eol + 1;
+        }
+        const seg_len: usize = eol - pos;
+        // 缩进（续行沿用）
+        var indent: usize = 0;
+        while indent < seg_len {
+            if text[pos + indent] != 32 as byte {
+                break;
+            }
+            indent = indent + 1;
+        }
+        if indent > w - 4 {
+            indent = w - 4;
+        }
+        if seg_len == 0 {
+            _ = buf_append_byte(dst, 10);
+            lines = lines + 1;
+        } else {
+            var off: usize = 0;
+            var first: bool = true;
+            while off < seg_len {
+                var room: usize = w;
+                if !first {
+                    room = w - indent;
+                }
+                var take: usize = tty_clip_bytes(text + pos + off, seg_len - off, room);
+                if take == 0 {
+                    take = 1;
+                }
+                // 尽量在空格处断行（除非这一段本来就装得下）
+                if off + take < seg_len {
+                    var k: usize = take;
+                    while k > 0 {
+                        if text[pos + off + k - 1] == 32 as byte {
+                            take = k - 1;
+                            break;
+                        }
+                        k = k - 1;
+                    }
+                    if take == 0 {
+                        take = tty_clip_bytes(text + pos + off, seg_len - off, room);
+                        if take == 0 {
+                            take = 1;
+                        }
+                    }
+                }
+                if !first {
+                    var pad: usize = 0;
+                    while pad < indent {
+                        _ = buf_append_byte(dst, 32);
+                        pad = pad + 1;
+                    }
+                }
+                _ = buf_append(dst, text + pos + off, take);
+                _ = buf_append_byte(dst, 10);
+                lines = lines + 1;
+                off = off + take;
+                first = false;
+                while off < seg_len && text[pos + off] == 32 as byte && !first {
+                    // 断行处的空格吃掉（下一行已经有缩进）
+                    if off + 1 < seg_len && text[pos + off + 1] == 32 as byte {
+                        break;
+                    }
+                    break;
+                }
+            }
+        }
+        if eol >= n {
+            break;
+        }
+        pos = eol + 1;
+    }
+    return lines;
+}
+
+// 确保条目折行缓存与当前宽度一致。
+//
+// P46：markdown 条目（TUI_E_ASSIST）走 mdview 的「前缀 + 内容同一条流」排版，
+// **同时**产出折行文本与逐字节样式；其余条目仍走便宜的 tui_wrap_into。
+// `width` 是**终端列数**（不是内容预算）—— 扣多少列由 tui_entry_pre_cols() 一处说了算，
+// 折行侧与绘制侧共用同一个函数（旧实现两边各扣一次，于是每行丢 1–3 个字符）。
+fn tui_entry_ensure_wrap(i: usize, width: usize) void {
+    const e: &TuiEntry = tui_entry_at(i);
+    if e.wrap_valid && e.wrap_width == width {
+        return;
+    }
+    if !buf_valid(&e.wrap) {
+        e.wrap = buf_new(4096);
+    }
+    var budget: usize = width;
+    if budget > tui_entry_indent_cols(e.kind) + 1 {
+        budget = width - tui_entry_indent_cols(e.kind) - 1;
+    } else {
+        budget = 4;
+    }
+    if e.kind == TUI_E_ASSIST {
+        if !buf_valid(&e.md) {
+            e.md = buf_new(4096);
+        }
+        e.wrap_lines = mdv_layout_into(&e.wrap, &e.md, e.text.ptr as &const byte, e.text.len, budget);
+    } else {
+        e.wrap_lines = tui_wrap_into(&e.wrap, e.text.ptr as &const byte, e.text.len, budget);
+    }
+    // wrap 内容整体重写了 ⇒ 行偏移表就地重建（表与它描述的 Buf 同寿命）。
+    // 这一步是 O(n) 一次，换来之后每帧取行 O(1)（见 TuiEntry.wrap_ix 那段）。
+    tui_lineidx_build(&e.wrap_ix, &e.wrap);
+    e.wrap_width = width;
+    e.wrap_valid = true;
+}
+
+
+// 取条目第 k 行（折行后）的字节区间。
+//
+// 走条目自己的行偏移表（O(1)）。表没建起来时（malloc 失败这类极端情况）退回线性扫描 ——
+// 结果**一样**，只是慢；这样「取行」不会因为表缺失而静默给空。
+fn tui_entry_line(i: usize, k: usize, off: &usize, len: &usize) bool {
+    const e: &TuiEntry = tui_entry_at(i);
+    if !e.wrap_valid || k >= e.wrap_lines {
+        return false;
+    }
+    if !g_tui_entry_force_scan && (e.wrap_ix.offs as usize) != 0 {
+        return tui_lineidx_at(&e.wrap_ix, &e.wrap, k, off, len);
+    }
+    var line: usize = 0;
+    var start: usize = 0;
+    var p: usize = 0;
+    while p <= e.wrap.len {
+        if p == e.wrap.len || e.wrap.ptr[p] == 10 as byte {
+            if line == k {
+                off[0] = start;
+                len[0] = p - start;
+                return true;
+            }
+            line = line + 1;
+            start = p + 1;
+        }
+        p = p + 1;
+    }
+    return false;
+}
+
+// 自测用：把条目取行强制走线性扫描（= 修前那条路）。
+//
+// 用途是**防假绿的对照实验**（与踩坑 68 的 `tui_overlay_force_scan` 同一套路）：把这一句
+// 打开重编，`tui-md` 的「长条目成帧预算」必须当场红 —— 否则说明那条预算压根没量到取行。
+// 自测自己**不**翻这个开关（翻了就是自己把被测对象改坏），平时恒 false。
+var g_tui_entry_force_scan: bool = false;
+
+// 自测用：走线性扫描取条目第 k 行（与查表路径做差分对照 —— 两条路必须逐字节等价）
+export fn tui_entry_line_lin(i: usize, k: usize, off: &usize, len: &usize) bool {
+    const e: &TuiEntry = tui_entry_at(i);
+    if !e.wrap_valid || k >= e.wrap_lines {
+        return false;
+    }
+    var line: usize = 0;
+    var start: usize = 0;
+    var p: usize = 0;
+    while p <= e.wrap.len {
+        if p == e.wrap.len || e.wrap.ptr[p] == 10 as byte {
+            if line == k {
+                off[0] = start;
+                len[0] = p - start;
+                return true;
+            }
+            line = line + 1;
+            start = p + 1;
+        }
+        p = p + 1;
+    }
+    return false;
+}
+
+// 自测用：条目折行后的行数（成帧不变量用）
+export fn tui_entry_wrap_lines(i: usize) usize {
+    const e: &TuiEntry = tui_entry_at(i);
+    return e.wrap_lines;
+}
+
+// ============================================================
+// 行渲染（P46：markdown 走 mdview 纯函数层 + 前缀分类）
+// ============================================================
+
+const TUI_PREFIX_COL: usize = 2;     // 转录左留白（与面板竖条对齐）
+const TUI_BODY_COL: usize = 4;       // 正文列
+
+// 各类条目在正文之前**自己**要占掉的列数：左留白（+ 有些条目还有前缀字形）。
+// 折行与绘制都问这一个函数 —— 这是 P46 修掉「静默丢字」的关键：旧实现在
+// tui_wrap_into 里扣 `cols - 6`、在绘制侧扣 `cols - BODY_COL - 3`，各算一份，
+// 列表/代码行绘制时还再多扣 2 列，于是长行每行丢 1–3 个字符再补 '…'。
+//
+// 各项 = 左侧留白列（TUI_PREFIX_COL / TUI_BODY_COL-2，两者都是 2）+ 前缀字形列：
+//   TOOL   2           （只有留白，`✓ `/`- `/`+ ` 这些字形在折行文本里）
+//   NOTICE 2 + 2 = 4   （留白 + 绘制侧的 `· `）
+//   ASSIST / REASON / USER / STEER 2
+fn tui_entry_indent_cols(kind: u8) usize {
+    if kind == TUI_E_NOTICE {
+        return TUI_PREFIX_COL + 2;
+    }
+    return TUI_PREFIX_COL;
+}
+
+// mdview 的样式 → tui 的样式（两层各自一套词汇，这里是唯一的翻译点）
+fn tui_style_from_mdv(st: u8) u8 {
+    if st == MDV_ST_BOLD {
+        return TUI_ST_BOLD;
+    }
+    if st == MDV_ST_ITALIC {
+        return TUI_ST_ITALIC;
+    }
+    if st == MDV_ST_STRIKE {
+        return TUI_ST_STRIKE;
+    }
+    if st == MDV_ST_CODE {
+        return TUI_ST_CODE;
+    }
+    if st == MDV_ST_CODE_LANG || st == MDV_ST_H3 || st == MDV_ST_TSEP {
+        return TUI_ST_DIM;
+    }
+    if st == MDV_ST_INLINE {
+        return TUI_ST_INLINE;
+    }
+    if st == MDV_ST_H1 {
+        return TUI_ST_H1;
+    }
+    if st == MDV_ST_H2 {
+        return TUI_ST_BOLD;
+    }
+    if st == MDV_ST_QUOTE {
+        return TUI_ST_TOOL;
+    }
+    if st == MDV_ST_RULE {
+        return TUI_ST_DIM;
+    }
+    if st == MDV_ST_BULLET || st == MDV_ST_ORDERED || st == MDV_ST_DONE {
+        return TUI_ST_ACCENT;
+    }
+    if st == MDV_ST_URL {
+        return TUI_ST_DIM;
+    }
+    if st == MDV_ST_THEAD {
+        return TUI_ST_BOLD;
+    }
+    if st == MDV_ST_TCELL {
+        return TUI_ST_TOOL;
+    }
+    return TUI_ST_DEFAULT;
+}
+
+// 一行里按反引号切段：`code` → INLINE，其余 base（用户消息用；助手正文走 md 样式）
+fn tui_draw_inline(p: &const byte, n: usize, base: u8, avail: usize) void {
+    var i: usize = 0;
+    var in_code: bool = false;
+    var start: usize = 0;
+    var used: usize = 0;
+    while i <= n {
+        if i == n || p[i] == 96 as byte {
+            const seg_len: usize = i - start;
+            if seg_len > 0 {
+                const style: u8 = if in_code { TUI_ST_INLINE } else { base };
+                const keep: usize = tty_clip_bytes(p + start, seg_len, avail - used);
+                tui_put(p + start, keep, style);
+                used = used + tty_cols_between(p + start, 0, keep);
+                if keep < seg_len {
+                    tui_puts("…" as &const byte, style);
+                    return;
+                }
+            }
+            if i < n {
+                in_code = !in_code;
+            }
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+}
+
+// 助手正文的一行：按 mdview 给的**逐字节样式**分段画（相邻同样式合并成一段）。
+//
+// 为什么不再需要 `g_tui_md_code` 那种全局围栏状态：样式已经落在字节上，
+// 折行/滚动/浮层都从这一行自己的字节区间读，窗口从哪儿开始都正确（P46 的
+// 「滚到代码块中间串样式」就是旧的帧级全局状态造成的）。
+fn tui_draw_md_line(p: &const byte, md: &const byte, n: usize) void {
+    var i: usize = 0;
+    while i < n {
+        const st: u8 = tui_style_from_mdv(md[i]);
+        var j: usize = i + 1;
+        while j < n && tui_style_from_mdv(md[j]) == st {
+            j = j + 1;
+        }
+        tui_put(p + i, j - i, st);
+        i = j;
+    }
+}
+
+// 工具块/诊断行的前缀分类
+fn tui_tool_line_style(p: &const byte, n: usize) u8 {
+    if tui_line_starts_with(p, n, "✓" as &const byte) {
+        return TUI_ST_OK;
+    }
+    if tui_line_starts_with(p, n, "✗" as &const byte) {
+        return TUI_ST_ERR;
+    }
+    if tui_line_starts_with(p, n, "●" as &const byte) {
+        return TUI_ST_ACCENT;
+    }
+    var i: usize = 0;
+    while i < n && p[i] == 32 as byte {
+        i = i + 1;
+    }
+    if i + 1 < n {
+        if p[i] == 45 as byte && p[i + 1] == 32 as byte {
+            return TUI_ST_DEL;
+        }
+        if p[i] == 43 as byte && p[i + 1] == 32 as byte {
+            return TUI_ST_ADD;
+        }
+    }
+    return TUI_ST_TOOL;
+}
+
+fn tui_notice_style(p: &const byte, n: usize) u8 {
+    if tui_line_starts_with(p, n, "error:" as &const byte) {
+        return TUI_ST_ERR;
+    }
+    if tui_line_starts_with(p, n, "warning:" as &const byte) {
+        return TUI_ST_WARN;
+    }
+    if tui_line_starts_with(p, n, "[interrupted]" as &const byte) {
+        return TUI_ST_WARN;
+    }
+    if tui_line_starts_with(p, n, "[steer]" as &const byte) {
+        return TUI_ST_ACCENT;
+    }
+    return TUI_ST_DIM;
+}
+
+fn tui_entry_has_header(kind: u8) bool {
+    return kind == TUI_E_USER || kind == TUI_E_ASSIST || kind == TUI_E_REASON || kind == TUI_E_STEER;
+}
+
+fn tui_entry_rows(i: usize, width: usize) usize {
+    tui_entry_ensure_wrap(i, width);
+    const e: &TuiEntry = tui_entry_at(i);
+    var rows: usize = e.wrap_lines;
+    if tui_entry_has_header(e.kind) {
+        rows = rows + 1;
+    }
+    return rows;
+}
+
+fn tui_draw_header(kind: u8) void {
+    if kind == TUI_E_ASSIST {
+        tui_puts("◆ 助手" as &const byte, TUI_ST_ACCENT);
+        return;
+    }
+    if kind == TUI_E_REASON {
+        tui_puts("✻ 思考" as &const byte, TUI_ST_DIM);
+        return;
+    }
+    tui_puts("▎ 你" as &const byte, TUI_ST_BOLD);
+}
+
+
+
+// ============================================================
+// sink：把 tty_write / tty_reason_write 的字节变成转录条目
+// ============================================================
+
+var g_tui_chan: i32 = 0;          // 当前累积的通道（2 的整行缓冲用）
+var g_tui_linebuf: Buf = Buf{ ptr: null, len: 0, cap: 0 };
+
+fn tui_linebuf_ensure() void {
+    if !buf_valid(&g_tui_linebuf) {
+        g_tui_linebuf = buf_new(8192);
+    }
+}
+
+fn tui_last_kind() u8 {
+    if g_tui_nent == 0 {
+        return 255;
+    }
+    return tui_entry_kind(g_tui_nent - 1);
+}
+
+// 关闭「流式助手」条目：下一段正文会新起一条
+export fn tui_close_stream_entries() void {
+    var i: usize = 0;
+    while i < g_tui_nent {
+        const e: &TuiEntry = tui_entry_at(i);
+        e.streaming = false;
+        i = i + 1;
+    }
+}
+
+// 通道 1（助手正文）：追加到当前流式条目（没有就新建）
+fn tui_sink_assist(p: &const byte, n: usize) void {
+    if n == 0 {
+        return;
+    }
+    var idx: i32 = -1;
+    if g_tui_nent > 0 {
+        const last: usize = g_tui_nent - 1;
+        const e: &TuiEntry = tui_entry_at(last);
+        if e.kind == TUI_E_ASSIST && e.streaming {
+            idx = last as i32;
+        }
+    }
+    if idx < 0 {
+        idx = tui_entry_new(TUI_E_ASSIST);
+        if idx < 0 {
+            return;
+        }
+        const e2: &TuiEntry = tui_entry_at(idx as usize);
+        e2.streaming = true;
+    }
+    const e3: &TuiEntry = tui_entry_at(idx as usize);
+    tui_entry_append(e3, p, n);
+}
+
+// 通道 3（思考）：追加并只保留尾部一段
+fn tui_sink_reason(p: &const byte, n: usize) void {
+    if n == 0 {
+        return;
+    }
+    var idx: i32 = -1;
+    if g_tui_nent > 0 {
+        const last: usize = g_tui_nent - 1;
+        const e: &TuiEntry = tui_entry_at(last);
+        if e.kind == TUI_E_REASON {
+            idx = last as i32;
+        }
+    }
+    if idx < 0 {
+        idx = tui_entry_new(TUI_E_REASON);
+        if idx < 0 {
+            return;
+        }
+    }
+    const e2: &TuiEntry = tui_entry_at(idx as usize);
+    tui_entry_append(e2, p, n);
+    if e2.text.len > TUI_REASON_TAIL {
+        var cut: usize = e2.text.len - TUI_REASON_TAIL;
+        // 切点必须落在字符边界上：否则思考条目会以**半个汉字**开头
+        // （终端渲染成替换符、列宽也跟着错位 —— 屏幕上就是乱码）
+        while cut < e2.text.len && tty_is_cont(e2.text.ptr[cut]) {
+            cut = cut + 1;
+        }
+        // 从尾部保留：把尾部搬到头部
+        var k: usize = 0;
+        while k + cut < e2.text.len {
+            e2.text.ptr[k] = e2.text.ptr[cut + k];
+            k = k + 1;
+        }
+        buf_truncate(&e2.text, k);
+        e2.wrap_valid = false;
+    }
+}
+
+fn tui_line_starts_with(p: &const byte, n: usize, lit: &const byte) bool {
+    const l: usize = bufx_cstr_len(lit);
+    if n < l {
+        return false;
+    }
+    return bufx_mem_eq(p, lit, l);
+}
+
+// 通道 2 的一整行 → 条目（工具块 / 诊断）
+fn tui_sink_line(p: &const byte, n: usize) void {
+    if n == 0 {
+        return;
+    }
+    const is_tool_head: bool = tui_line_starts_with(p, n, "✓ " as &const byte)
+        || tui_line_starts_with(p, n, "✗ " as &const byte)
+        || tui_line_starts_with(p, n, "● " as &const byte);
+    const is_indent: bool = p[0] == 32 as byte;
+    if is_tool_head {
+        const idx: i32 = tui_entry_new(TUI_E_TOOL);
+        if idx < 0 {
+            return;
+        }
+        const e: &TuiEntry = tui_entry_at(idx as usize);
+        tui_entry_append(e, p, n);
+        _ = buf_append_byte(&e.text, 10);
+        g_tui_text_total = g_tui_text_total + 1;
+        return;
+    }
+    const lastk: u8 = tui_last_kind();
+    if is_indent && (lastk == TUI_E_TOOL || lastk == TUI_E_NOTICE) {
+        const e2: &TuiEntry = tui_entry_at(g_tui_nent - 1);
+        if lastk == TUI_E_NOTICE {
+            tui_notice_append(e2, p, n);
+            tui_notice_newline(e2);
+        } else {
+            tui_entry_append(e2, p, n);
+            _ = buf_append_byte(&e2.text, 10);
+            g_tui_text_total = g_tui_text_total + 1;
+        }
+        return;
+    }
+    if (lastk == TUI_E_NOTICE || lastk == TUI_E_TOOL) && !is_indent {
+        // 新的一行诊断：接到上一条 NOTICE 后面（连续若干行），工具块则新起一条
+        if lastk == TUI_E_NOTICE {
+            const e3: &TuiEntry = tui_entry_at(g_tui_nent - 1);
+            tui_notice_append(e3, p, n);
+            tui_notice_newline(e3);
+            return;
+        }
+    }
+    const idx4: i32 = tui_entry_new(TUI_E_NOTICE);
+    if idx4 < 0 {
+        return;
+    }
+    const e4: &TuiEntry = tui_entry_at(idx4 as usize);
+    tui_notice_append(e4, p, n);
+    tui_notice_newline(e4);
+}
+
+// ---- 外部写入接口（agent / view / askuser 用）----
+
+export fn tui_add_user(p: &const byte, n: usize) void {
+    const idx: i32 = tui_entry_new(TUI_E_USER);
+    if idx < 0 {
+        return;
+    }
+    const e: &TuiEntry = tui_entry_at(idx as usize);
+    tui_entry_append(e, p, n);
+}
+
+export fn tui_add_steer(p: &const byte, n: usize) void {
+    const idx: i32 = tui_entry_new(TUI_E_STEER);
+    if idx < 0 {
+        return;
+    }
+    const e: &TuiEntry = tui_entry_at(idx as usize);
+    tui_entry_append(e, p, n);
+}
+
+export fn tui_add_notice(p: &const byte, n: usize) void {
+    const idx: i32 = tui_entry_new(TUI_E_NOTICE);
+    if idx < 0 {
+        return;
+    }
+    const e: &TuiEntry = tui_entry_at(idx as usize);
+    tui_notice_append(e, p, n);
+    tui_notice_newline(e);
+}
+
+// 工具块：view.uya 用现成的纯函数 view_render_block() 生成文本后整块交进来
+
+// 工具块：view.uya 用现成的纯函数 view_render_block() 生成文本后整块交进来
+export fn tui_add_tool_block(p: &const byte, n: usize) void {
+    const idx: i32 = tui_entry_new(TUI_E_TOOL);
+    if idx < 0 {
+        return;
+    }
+    const e: &TuiEntry = tui_entry_at(idx as usize);
+    tui_entry_append(e, p, n);
+}
+
+// sink 入口（tty.uya 的 tty_write / tty_stream_write / tty_reason_write 调它）
+export fn tui_sink_bytes(chan: i32, p: &const byte, n: usize) void {
+    if n == 0 {
+        return;
+    }
+    tui_pend_ensure();
+    tui_linebuf_ensure();
+    var clean: Buf = buf_new(n + n / 2 + 32);
+    if !buf_valid(&clean) {
+        return;
+    }
+    tui_clean_into(&clean, p, n);
+    if chan == 1 {
+        tui_sink_assist(clean.ptr as &const byte, clean.len);
+        buf_free(&clean);
+        return;
+    }
+    if chan == 3 {
+        tui_sink_reason(clean.ptr as &const byte, clean.len);
+        buf_free(&clean);
+        return;
+    }
+    // 通道 2：按行切开（不完整的尾巴留着）
+    var i: usize = 0;
+    while i < clean.len {
+        const c: byte = clean.ptr[i];
+        if c == 10 as byte {
+            tui_sink_line(g_tui_linebuf.ptr as &const byte, g_tui_linebuf.len);
+            buf_reset(&g_tui_linebuf);
+        } else {
+            _ = buf_append_byte(&g_tui_linebuf, c);
+        }
+        i = i + 1;
+    }
+    buf_free(&clean);
+}
+
+// fork 前/回合结束时把「半行」冲掉（否则下一条工具行会和半行粘在一起）
+export fn tui_sink_flush_partial() void {
+    if buf_valid(&g_tui_linebuf) && g_tui_linebuf.len > 0 {
+        tui_sink_line(g_tui_linebuf.ptr as &const byte, g_tui_linebuf.len);
+        buf_reset(&g_tui_linebuf);
+    }
+}

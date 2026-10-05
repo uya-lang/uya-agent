@@ -1,0 +1,946 @@
+// src/term/tui/keys.uya — 全屏 TUI：键解码 + 输入编辑器
+//
+// 本文件：把 fd 0 读来的**字节流**变成按键事件（含 CSI 参数解析、鼠标上报开关），以及
+//   按 UTF-8 **字符**编辑、按显示列定位的光标与编辑操作。
+// 不变量：键解码是**纯函数式**的（喂字节 → 出事件，自测靠 tui_keys_inject 注入）；
+//   光标位置一律按显示列、不按字节；非法 UTF-8 不得让编辑器崩。
+// 依赖：term/tty（tty_char_cols）。
+
+use libc.syscall;
+use libc.unistd;
+use libc.heap;
+
+// ============================================================
+// 键解码（把字节流变成按键事件）
+// ============================================================
+
+export const TUI_K_NONE: i32 = 0;
+export const TUI_K_CHAR: i32 = 1;
+export const TUI_K_ENTER: i32 = 2;
+export const TUI_K_NEWLINE: i32 = 3;
+export const TUI_K_BACKSPACE: i32 = 4;
+export const TUI_K_DELETE: i32 = 5;
+export const TUI_K_LEFT: i32 = 6;
+export const TUI_K_RIGHT: i32 = 7;
+export const TUI_K_UP: i32 = 8;
+export const TUI_K_DOWN: i32 = 9;
+export const TUI_K_HOME: i32 = 10;
+export const TUI_K_END: i32 = 11;
+export const TUI_K_PGUP: i32 = 12;
+export const TUI_K_PGDN: i32 = 13;
+export const TUI_K_TAB: i32 = 14;
+export const TUI_K_STAB: i32 = 15;
+export const TUI_K_ESC: i32 = 16;
+export const TUI_K_CTRL_C: i32 = 17;
+export const TUI_K_CTRL_D: i32 = 18;
+export const TUI_K_CTRL_L: i32 = 19;
+export const TUI_K_CTRL_U: i32 = 20;
+export const TUI_K_CTRL_W: i32 = 21;
+export const TUI_K_CTRL_K: i32 = 22;
+export const TUI_K_CTRL_A: i32 = 23;
+export const TUI_K_CTRL_E: i32 = 24;
+export const TUI_K_CTRL_P: i32 = 25;
+export const TUI_K_CTRL_T: i32 = 26;    // P22：展开/收起常驻任务块（shift+tab 的邻居）
+// P52：ctrl+v = 贴剪贴板（22 = SYN）。键语义只有「请求」这一半 —— 真去读剪贴板是
+// agent 侧的事（TUI 不认识 imgx/clipx，也不该认识）。
+export const TUI_K_CTRL_V: i32 = 30;
+// P32：鼠标滚轮（SGR 编码 `ESC[<64;..M` / `65`）折成滚轮上/下两个事件。
+// 只吃滚轮，press/release/motion 一律忽略（拾取选择仍旧只靠终端自己的 shift 路）。
+export const TUI_K_WHEEL_UP: i32 = 27;
+export const TUI_K_WHEEL_DOWN: i32 = 28;
+// 踩坑 72：切换「鼠标上报」（等价于 /mouse 的 toggle 形态）。绑定 F2 —— 传统终端里 F1 常被
+// 桌面环境抢走（deepin-terminal 的 F1 是帮助），F2 相对干净；序列是 `ESC O Q`（SS3）。
+export const TUI_K_MOUSE_TOGGLE: i32 = 29;
+// P53：浮层全屏开关（等价于 /fullscreen 的 toggle 形态）。两条绑定：`ctrl+f`（0x06，
+// 终端一字节，任何终端都送得到）与 `F11`（`ESC[23~`）。F11 是「全屏」的通行直觉，但
+// 很多桌面环境把它抢去当窗口全屏，所以 ctrl+f 才是主绑定、F11 是顺手的备选。
+export const TUI_K_FULLSCREEN: i32 = 30;
+
+// 一次滚轮滚几行（与 PgUp/PgDn 的一屏同一口径之外的细粒度）
+const TUI_WHEEL_STEP: usize = 5;
+
+const TUI_EVQ_MAX: usize = 512;
+
+var g_tui_evq: [i32: TUI_EVQ_MAX] = [0: TUI_EVQ_MAX];
+var g_tui_evn: usize = 0;
+var g_tui_chars: Buf = Buf{ ptr: null, len: 0, cap: 0 };
+var g_tui_chars_r: usize = 0;
+
+var g_tui_esc: i32 = 0;         // 0 无 / 1 ESC / 2 ESC[ / 3 CSI 参数中 / 4 ESC] / 5 粘贴中 / 6 粘贴收尾 / 9 SGR 鼠标
+
+// 括起粘贴（踩坑 83）：`ESC[201~` 的逐字节前缀匹配 + CRLF 折叠。
+// 为什么不用 g_tui_esc_num 那套数字累加：粘贴内容里的 `ESC[31m` 也是「ESC[数字」，
+// 累加器分不清它和 `201~`，一旦不是 201 就已经把数字丢了（旧实现的现象）。
+const g_tui_paste_want: [byte: 6] = [27, 91, 50, 48, 49, 126];   // ESC[201~
+var g_tui_paste_pend: [byte: 6] = [0: 6];
+var g_tui_paste_pendn: usize = 0;
+var g_tui_paste_cr: bool = false;    // 上一个字符是 CR：下一字节若是 LF 就吞掉（CRLF 折叠）
+var g_tui_esc_num: i32 = 0;     // 当前参数值
+var g_tui_esc_have: bool = false;
+var g_tui_p1: i32 = 0;          // CSI 的第一个参数（修饰键要靠它判断）
+var g_tui_p2: i32 = 0;          // 第二个
+var g_tui_p3: i32 = 0;          // 第三个（SGR 鼠标的 x/y）
+var g_tui_np: i32 = 0;          // 已收几个参数
+// P25：SGR 鼠标（`ESC[<b;x;yM`）。b 的 bit6(64) = 滚轮，低两位 0=上 1=下。
+var g_tui_x10_left: i32 = 0;    // 老式 X10 鼠标 `ESC[M` 后面还剩几个字节要吃
+var g_tui_mouse_sgr: bool = false;   // 本次 CSI 是 `<` 起头的 SGR 鼠标
+var g_tui_utf: usize = 0;       // UTF-8 已收到的字节数
+var g_tui_utf_have: usize = 0;
+var g_tui_utf_buf: [byte: 8] = [0: 8];
+
+// 粘贴内容里的一个字节 → 输入事件。
+// CR / LF / CRLF 三种行尾一律折成一个换行：Windows 剪贴板与部分终端给的是 CRLF，
+// 不折叠就会一行变两行（旧实现在 CR 处直接提交，连折叠的机会都没有）。
+fn tui_paste_put(c: byte) void {
+    if c == 13 as byte {
+        tui_ev_push(TUI_K_NEWLINE);
+        g_tui_paste_cr = true;
+        return;
+    }
+    if c == 10 as byte {
+        if g_tui_paste_cr {
+            g_tui_paste_cr = false;    // CRLF：LF 已被那个换行代表
+            return;
+        }
+        tui_ev_push(TUI_K_NEWLINE);
+        return;
+    }
+    g_tui_paste_cr = false;
+    // TAB 与其它控制字节：粘贴里一律**当字面内容**（9 若走键路会切成 plan 模式；
+    // 正文层由 tui_clean_into 负责把 TAB 展开成四个空格）
+    tui_ev_push_char(c);
+}
+
+// ESC[201~ 前缀匹配失败：攒下的那几个字节是粘贴内容的一部分，原样吐回去
+fn tui_paste_pend_flush() void {
+    var k: usize = 0;
+    while k < g_tui_paste_pendn {
+        tui_paste_put(g_tui_paste_pend[k]);
+        k = k + 1;
+    }
+    g_tui_paste_pendn = 0;
+}
+
+fn tui_ev_push(ev: i32) void {
+    if g_tui_evn >= TUI_EVQ_MAX {
+        return;
+    }
+    g_tui_evq[g_tui_evn] = ev;
+    g_tui_evn = g_tui_evn + 1;
+}
+
+fn tui_ev_push_char(c: byte) void {
+    if !buf_valid(&g_tui_chars) {
+        g_tui_chars = buf_new(4096);
+    }
+    if g_tui_evn >= TUI_EVQ_MAX {
+        return;
+    }
+    _ = buf_append_byte(&g_tui_chars, c);
+    g_tui_evq[g_tui_evn] = TUI_K_CHAR;
+    g_tui_evn = g_tui_evn + 1;
+}
+
+
+export fn tui_key_next() i32 {
+    if g_tui_evn == 0 {
+        return TUI_K_NONE;
+    }
+    const ev: i32 = g_tui_evq[0];
+    var i: usize = 0;
+    while i + 1 < g_tui_evn {
+        g_tui_evq[i] = g_tui_evq[i + 1];
+        i = i + 1;
+    }
+    g_tui_evn = g_tui_evn - 1;
+    return ev;
+}
+
+// 取一个字符事件的字节（写进 out），返回长度
+export fn tui_key_take_char(out: &Buf) usize {
+    if g_tui_chars_r >= g_tui_chars.len {
+        return 0;
+    }
+    const c: byte = g_tui_chars.ptr[g_tui_chars_r];
+    const l: usize = tty_utf8_len(c);
+    var take: usize = l;
+    if take == 0 {
+        take = 1;
+    }
+    if g_tui_chars_r + take > g_tui_chars.len {
+        take = g_tui_chars.len - g_tui_chars_r;
+    }
+    _ = buf_append(out, g_tui_chars.ptr + g_tui_chars_r, take);
+    g_tui_chars_r = g_tui_chars_r + take;
+    if g_tui_chars_r >= g_tui_chars.len {
+        buf_reset(&g_tui_chars);
+        g_tui_chars_r = 0;
+    }
+    return take;
+}
+
+export fn tui_key_reset() void {
+    g_tui_evn = 0;
+    g_tui_esc = 0;
+    g_tui_paste_pendn = 0;
+    g_tui_paste_cr = false;
+    g_tui_esc_num = 0;
+    g_tui_esc_have = false;
+    g_tui_p1 = 0;
+    g_tui_p2 = 0;
+    g_tui_p3 = 0;
+    g_tui_np = 0;
+    g_tui_utf = 0;
+    g_tui_utf_have = 0;
+    g_tui_mouse_sgr = false;
+    g_tui_x10_left = 0;
+    if buf_valid(&g_tui_chars) {
+        buf_reset(&g_tui_chars);
+    }
+    g_tui_chars_r = 0;
+}
+
+// CSI 参数收尾：把当前累积的 g_tui_esc_num 落下，然后开新的一格。
+fn tui_csi_push() void {
+    if g_tui_np == 0 {
+        g_tui_p1 = g_tui_esc_num;
+    } else if g_tui_np == 1 {
+        g_tui_p2 = g_tui_esc_num;
+    } else if g_tui_np == 2 {
+        g_tui_p3 = g_tui_esc_num;
+    }
+    g_tui_np = g_tui_np + 1;
+    g_tui_esc_num = 0;
+    g_tui_esc_have = false;
+}
+
+// 参数值（第 idx 个，0 起算；缺省/超出记 0）
+fn tui_csi_arg(idx: i32) i32 {
+    if g_tui_np <= idx {
+        return 0;
+    }
+    if idx == 0 {
+        return g_tui_p1;
+    }
+    if idx == 1 {
+        return g_tui_p2;
+    }
+    if idx == 2 {
+        return g_tui_p3;
+    }
+    return 0;
+}
+
+// SGR 鼠标收尾：`ESC[<b;x;y` + M/m。
+//   * 只认滚轮（b 的 bit6 / 也就是 64..127 那一档且低两位是 0/1）；
+//   * 其它按下/抬起/移动一律吃掉 —— 我们不画自己的选择层，选中由终端的
+//     shift/option 路走（与「不做鼠标选择」口径一致）。
+fn tui_mouse_finish() void {
+    tui_csi_push();   // y 也收进来（不用，但保证状态干净）
+    const b: i32 = tui_csi_arg(0);
+    if b >= 64 && b < 128 {
+        const low: i32 = b - 64;
+        if low == 0 {
+            tui_ev_push(TUI_K_WHEEL_UP);
+        } else if low == 1 {
+            tui_ev_push(TUI_K_WHEEL_DOWN);
+        }
+    }
+}
+
+// 修饰键位：xterm 的 CSI 修饰参数是「1 + 位掩码」（shift=1 / alt=2 / ctrl=4）。
+// 取到这类序列时不能只看第一个字符 —— 老实现把 `ESC[1;5H`（ctrl+home）在第一个 ';'
+// 就收尾，剩下的 `5H` 当普通字符塞进了输入行（屏幕上能看到 `5H` 两个字）。
+fn tui_csi_mod_mask() i32 {
+    if g_tui_np < 2 {
+        return 0;
+    }
+    return (g_tui_p2 - 1) % 8;
+}
+
+fn tui_csi_has_ctrl() bool {
+    return (tui_csi_mod_mask() & 4) != 0;
+}
+
+
+// CSI/SS3 的终结字节。
+//
+// 踩坑 83（本轮修复）：**下一个状态由本函数自己定**，调用点不许再补一句 `g_tui_esc = 0`。
+// 旧实现在两个调用点各写了一次无条件清零，而 `ESC[200~`（括起粘贴开始）是在**本函数内部**
+// 把状态置成 5 的 —— 返回后那一次清零当场把它冲掉，于是整个括起粘贴协议从未生效：
+//   * 粘贴里的 CR 被当成回车提交（粘 3 行 → 提交 3 次，只有最后一行留下）；
+//   * 粘贴里的 TAB 被当成 plan 模式开关（9 是控制字节，不走 esc==5 那条字面路）。
+// LF 之所以「看起来正常」，是因为不通粘贴态时裸 LF 也走 TUI_K_NEWLINE —— 两者恰好等价，
+// 这正是老自测没抓住它的原因（自测喂的是 LF）。
+fn tui_esc_final(f: byte) void {
+    // 参数收尾：终结字节之前最后那一格也要落下
+    tui_csi_push();
+    // 默认收尾即回「无转义」；需要停在别的状态的分支（200~ / 201~ / X10 鼠标）自己覆盖。
+    g_tui_esc = 0;
+    // CSI 终结字节
+    if f == 65 as byte {
+        // ↑：多行输入里滚历史（ctrl+↑ 才是真滚转录）
+        if tui_csi_has_ctrl() {
+            tui_scroll_up(TUI_WHEEL_STEP);
+        } else {
+            tui_ev_push(TUI_K_UP);
+        }
+        return;
+    }
+    if f == 66 as byte {
+        if tui_csi_has_ctrl() {
+            tui_scroll_down(TUI_WHEEL_STEP);
+        } else {
+            tui_ev_push(TUI_K_DOWN);
+        }
+        return;
+    }
+    if f == 67 as byte {
+        tui_ev_push(TUI_K_RIGHT);
+        return;
+    }
+    if f == 68 as byte {
+        tui_ev_push(TUI_K_LEFT);
+        return;
+    }
+    if f == 72 as byte {
+        // ESC[1;5H = ctrl+home → 转录最顶（老实现这里把它当成了普通 home）
+        if tui_csi_has_ctrl() {
+            tui_scroll_home();
+        } else {
+            tui_ev_push(TUI_K_HOME);
+        }
+        return;
+    }
+    if f == 70 as byte {
+        // ESC[1;5F = ctrl+end → 回底
+        if tui_csi_has_ctrl() {
+            tui_scroll_end();
+        } else {
+            tui_ev_push(TUI_K_END);
+        }
+        return;
+    }
+    if f == 90 as byte {
+        tui_ev_push(TUI_K_STAB);
+        return;
+    }
+    if f == 81 as byte {
+        // 踩坑 72：F2（SS3 形态 `ESC O Q`，也认 CSI 形态 `ESC [ Q`）切换鼠标上报。
+        // 这一条是「不能复制文本」的快捷出口：按一下 F2 关掉鼠标上报，终端重新接管拖选。
+        tui_ev_push(TUI_K_MOUSE_TOGGLE);
+        return;
+    }
+    if f == 126 as byte {
+        // ESC[<n>~ （PgUp/PgDn/Home/End/Del/F2/粘贴界标）
+        const a: i32 = tui_csi_arg(0);
+
+        const ctl: bool = g_tui_np >= 2 && ((tui_csi_mod_mask() & 4) != 0);
+        if a == 1 || a == 7 {
+            if ctl {
+                tui_scroll_home();
+            } else {
+                tui_ev_push(TUI_K_HOME);
+            }
+        } else if a == 3 {
+            tui_ev_push(TUI_K_DELETE);
+        } else if a == 4 || a == 8 {
+            if ctl {
+                tui_scroll_end();
+            } else {
+                tui_ev_push(TUI_K_END);
+            }
+        } else if a == 5 {
+            tui_ev_push(TUI_K_PGUP);
+        } else if a == 6 {
+            tui_ev_push(TUI_K_PGDN);
+        } else if a == 12 {
+            tui_ev_push(TUI_K_MOUSE_TOGGLE);   // F2 的 CSI 形态
+        } else if a == 23 {
+            tui_ev_push(TUI_K_FULLSCREEN);     // P53：F11（`ESC[23~`）
+        } else if a == 200 {
+            g_tui_esc = 5;   // 括起粘贴开始
+            g_tui_paste_pendn = 0;
+            g_tui_paste_cr = false;
+            return;
+        } else if a == 201 {
+            g_tui_esc = 0;
+            return;
+        }
+        return;
+    }
+    if f == 77 as byte || f == 109 as byte {
+        // SGR 鼠标（P25）：按第一个参数 b 折成滚轮事件。必须 `ESC[<` 起头 ——
+        // 裸 `ESC[M` 是 X10 鼠标（下面那条），`ESC[2M` 是「删 2 行」（忽略）。
+        if g_tui_mouse_sgr {
+            tui_mouse_finish();
+            return;
+        }
+        if !g_tui_esc_have && g_tui_np == 0 {
+            g_tui_x10_left = 3;
+            g_tui_esc = 10;
+            return;
+        }
+        g_tui_esc = 0;
+        return;
+    }
+    // 落不到任何具名键的 CSI：默认那一次清零（函数开头）已经收尾，这里什么都不用做。
+}
+
+// 喂入一段字节（fd 0 上读到的原样字节）
+// P48：最后一次「用户真的敲了东西」的时刻（墙上毫秒）。唯一的键盘入口 tui_key_feed
+// 在这里记一笔 —— 自动起标题据此等一小段静默期再发它那个同步请求（见 agent 侧的
+// agent_title_auto_idle_ok）。放在这一层而不是调用方：键盘入口有好几个
+// （主循环 poll、泵点 tui_abort_check、滚动模式的行编辑器），哪一条都是「用户在说话」。
+var g_tui_last_key_ms: u64 = 0;
+
+export fn tui_last_key_ms() u64 {
+    return g_tui_last_key_ms;
+}
+
+// P48：终端缓冲里**已经有**待读的按键吗？（只看一眼，不消费）
+// 后台请求（自动起标题）拿它做「用户要说话了就立刻让路」的判据 ——
+// 它不能读键（读走就串味），但必须能察觉用户动了键盘。
+// 注意：fd 0 可能不是终端（headless / 子代理），那种情况下恒 false。
+export fn tui_input_pending() bool {
+    if g_tui_headless || !g_tui_on {
+        return false;
+    }
+    var pfds: [PollFd: 1] = [PollFd{ fd: 0, events: POLLIN, revents: 0 }];
+    const pr: i32 = sys_poll(&pfds[0], 1, 0) catch { 0; };
+    return pr > 0 && (pfds[0].revents & POLLIN) != 0;
+}
+
+export fn tui_key_feed(p: &const byte, n: usize) void {
+    if n > 0 {
+        g_tui_last_key_ms = tui_now_ms();
+    }
+    var i: usize = 0;
+    while i < n {
+        const c: byte = p[i];
+        i = i + 1;
+        // 粘贴中：原样收字符（CR / LF / CRLF 都只算一个换行）
+        if g_tui_esc == 5 {
+            if c == 27 as byte {
+                g_tui_paste_pend[0] = 27;
+                g_tui_paste_pendn = 1;
+                g_tui_esc = 6;   // 可能是 ESC[201~，也可能是粘贴内容里的 ESC
+                continue;
+            }
+            tui_paste_put(c);
+            continue;
+        }
+        if g_tui_esc == 6 {
+            // 只认**逐字节前缀** `ESC[201~`：匹配满就结束粘贴，一旦不是前缀就把攒下的
+            // 字节原样吐回输入。旧实现在这里丢了数字（粘 ANSI 彩色文本 `ESC[31m` 变成
+            // `ESC[m`，见踩坑 83）。
+            if g_tui_paste_pendn < 6 && c == g_tui_paste_want[g_tui_paste_pendn] {
+                g_tui_paste_pend[g_tui_paste_pendn] = c;
+                g_tui_paste_pendn = g_tui_paste_pendn + 1;
+                if g_tui_paste_pendn == 6 {
+                    g_tui_paste_pendn = 0;
+                    g_tui_paste_cr = false;
+                    g_tui_esc = 0;      // 粘贴结束
+                }
+                continue;
+            }
+            tui_paste_pend_flush();
+            g_tui_esc = 5;
+            tui_paste_put(c);
+            continue;
+        }
+        if g_tui_esc == 1 {
+            if c == 91 as byte {
+                g_tui_esc = 2;
+                g_tui_esc_num = 0;
+                g_tui_esc_have = false;
+                g_tui_p1 = 0;
+                g_tui_p2 = 0;
+                g_tui_p3 = 0;
+                g_tui_np = 0;
+                g_tui_mouse_sgr = false;
+                continue;
+            }
+            if c == 79 as byte {
+                g_tui_esc = 8;      // SS3
+                continue;
+            }
+            if c == 13 as byte {
+                tui_ev_push(TUI_K_NEWLINE);   // Alt-Enter
+                g_tui_esc = 0;
+                continue;
+            }
+            // 裸 ESC（后面跟的是普通字节）
+            tui_ev_push(TUI_K_ESC);
+            g_tui_esc = 0;
+            // 这一字节继续按普通字节处理
+        }
+        if g_tui_esc == 8 {
+            // 状态由 tui_esc_final 自己定（踩坑 83：这里不许再补一次清零）
+            tui_esc_final(c);
+            continue;
+        }
+        if g_tui_esc == 2 || g_tui_esc == 3 {
+            // P25：SGR 鼠标头一个字节是 '<'（60），当参数分隔符用（后面的 b;x;y 照收）。
+            if c == 60 as byte && g_tui_esc == 2 {
+                g_tui_mouse_sgr = true;
+                g_tui_esc = 3;
+                continue;
+            }
+            if c >= 48 as byte && c <= 57 as byte {
+                g_tui_esc_num = g_tui_esc_num * 10 + ((c as i32) - 48);
+                g_tui_esc_have = true;
+                g_tui_esc = 3;
+                continue;
+            }
+            if c == 59 as byte {
+                tui_csi_push();
+                g_tui_esc = 3;
+                continue;
+            }
+            tui_esc_final(c);
+            continue;
+        }
+        // 老式 X10 鼠标 `ESC[M` 之后固定三个字节（b+32, x+32, y+32）：整段吃掉
+        if g_tui_esc == 10 {
+            if g_tui_x10_left > 0 {
+                g_tui_x10_left = g_tui_x10_left - 1;
+            }
+            if g_tui_x10_left == 0 {
+                g_tui_esc = 0;
+            }
+            continue;
+        }
+        // 普通字节
+        if c == 27 as byte {
+            g_tui_esc = 1;
+            continue;
+        }
+        if c == 13 as byte {
+            tui_ev_push(TUI_K_ENTER);
+            continue;
+        }
+        if c == 10 as byte {
+            tui_ev_push(TUI_K_NEWLINE);
+            continue;
+        }
+        if c == 9 as byte {
+            tui_ev_push(TUI_K_TAB);
+            continue;
+        }
+        if c == 127 as byte || c == 8 as byte {
+            tui_ev_push(TUI_K_BACKSPACE);
+            continue;
+        }
+        if c == 3 as byte {
+            tui_ev_push(TUI_K_CTRL_C);
+            continue;
+        }
+        if c == 4 as byte {
+            tui_ev_push(TUI_K_CTRL_D);
+            continue;
+        }
+        if c == 12 as byte {
+            tui_ev_push(TUI_K_CTRL_L);
+            continue;
+        }
+        if c == 21 as byte {
+            tui_ev_push(TUI_K_CTRL_U);
+            continue;
+        }
+        if c == 23 as byte {
+            tui_ev_push(TUI_K_CTRL_W);
+            continue;
+        }
+        if c == 11 as byte {
+            tui_ev_push(TUI_K_CTRL_K);
+            continue;
+        }
+        if c == 1 as byte {
+            tui_ev_push(TUI_K_CTRL_A);
+            continue;
+        }
+        if c == 5 as byte {
+            tui_ev_push(TUI_K_CTRL_E);
+            continue;
+        }
+        if c == 16 as byte {
+            tui_ev_push(TUI_K_CTRL_P);
+            continue;
+        }
+        if c == 20 as byte {
+            tui_ev_push(TUI_K_CTRL_T);
+            continue;
+        }
+        if c == 6 as byte {
+            // 浮层全屏开关。0x06 在本线之前落在下面那条 `if c < 32` 里被丢掉，
+            // 所以这里不会与既有绑定冲突（ctrl+v = 0x16 走另一条）。
+            tui_ev_push(TUI_K_FULLSCREEN);
+            continue;
+        }
+        if c == 22 as byte {
+            tui_ev_push(TUI_K_CTRL_V);
+            continue;
+        }
+        if c < 32 as byte {
+            continue;   // 其余控制字节丢掉
+        }
+        // UTF-8 多字节组装
+        if g_tui_utf_have == 0 {
+            g_tui_utf = tty_utf8_len(c);
+            if g_tui_utf <= 1 {
+                tui_ev_push_char(c);
+                continue;
+            }
+            g_tui_utf_buf[0] = c;
+            g_tui_utf_have = 1;
+            continue;
+        }
+        g_tui_utf_buf[g_tui_utf_have] = c;
+        g_tui_utf_have = g_tui_utf_have + 1;
+        if g_tui_utf_have >= g_tui_utf {
+            var k: usize = 0;
+            while k < g_tui_utf_have {
+                tui_ev_push_char(g_tui_utf_buf[k]);
+                k = k + 1;
+            }
+            g_tui_utf_have = 0;
+            g_tui_utf = 0;
+        }
+    }
+}
+
+// 一段字节读完后再调用：把悬着的裸 ESC 落实（方向键的 ESC[ 已被状态机吃掉）
+export fn tui_key_flush_esc() void {
+    if g_tui_esc == 1 {
+        tui_ev_push(TUI_K_ESC);
+        g_tui_esc = 0;
+        return;
+    }
+    // 粘贴收尾中途断流（buffer 正好在 `ESC` / `ESC[20` 处结束）：攒下的字节是粘贴内容，
+    // 吐回输入并退回粘贴态等后续字节。不吐就等于**静默吞掉粘贴末尾的 ESC**。
+    if g_tui_esc == 6 && g_tui_paste_pendn > 0 {
+        tui_paste_pend_flush();
+        g_tui_esc = 5;
+    }
+}
+
+
+
+// ============================================================
+// 输入编辑器（按 UTF-8 字符编辑、按显示列定位）
+// ============================================================
+
+const TUI_HIST_MAX: usize = 32;
+
+var g_tui_hist: [Buf: TUI_HIST_MAX] = [Buf{ ptr: null, len: 0, cap: 0 }: TUI_HIST_MAX];
+var g_tui_hist_n: usize = 0;
+var g_tui_hist_pos: i32 = -1;
+var g_tui_hist_stash: Buf = Buf{ ptr: null, len: 0, cap: 0 };
+
+fn tui_hist_push(p: &const byte, n: usize) void {
+    if n == 0 {
+        return;
+    }
+    if !buf_valid(&g_tui_hist_stash) {
+        g_tui_hist_stash = buf_new(8192);
+    }
+    var i: usize = TUI_HIST_MAX - 1;
+    while i > 0 {
+        g_tui_hist[i] = g_tui_hist[i - 1];
+        i = i - 1;
+    }
+    if !buf_valid(&g_tui_hist[0]) {
+        g_tui_hist[0] = buf_new(n + 16);
+    } else {
+        buf_reset(&g_tui_hist[0]);
+    }
+    _ = buf_append(&g_tui_hist[0], p, n);
+    if g_tui_hist_n < TUI_HIST_MAX {
+        g_tui_hist_n = g_tui_hist_n + 1;
+    }
+    g_tui_hist_pos = -1;
+}
+
+fn tui_hist_move(up: bool) void {
+    if g_tui_hist_n == 0 {
+        return;
+    }
+    tui_in_ensure();
+    if up {
+        if g_tui_hist_pos < 0 {
+            // 先把当前行存起来
+            buf_reset(&g_tui_hist_stash);
+            _ = buf_append(&g_tui_hist_stash, g_tui_in.ptr, g_tui_in.len);
+        }
+        var np: i32 = g_tui_hist_pos + 1;
+        if np >= g_tui_hist_n as i32 {
+            np = (g_tui_hist_n as i32) - 1;
+        }
+        g_tui_hist_pos = np;
+        const idx: usize = np as usize;
+        if idx < TUI_HIST_MAX {
+            buf_reset(&g_tui_in);
+            _ = buf_append(&g_tui_in, g_tui_hist[idx].ptr, g_tui_hist[idx].len);
+            g_tui_in_cursor = g_tui_in.len;
+        }
+    } else {
+        if g_tui_hist_pos < 0 {
+            return;
+        }
+        const np2: i32 = g_tui_hist_pos - 1;
+        g_tui_hist_pos = np2;
+        buf_reset(&g_tui_in);
+        if np2 < 0 {
+            _ = buf_append(&g_tui_in, g_tui_hist_stash.ptr, g_tui_hist_stash.len);
+        } else {
+            const idx2: usize = np2 as usize;
+            if idx2 < TUI_HIST_MAX {
+                _ = buf_append(&g_tui_in, g_tui_hist[idx2].ptr, g_tui_hist[idx2].len);
+            }
+        }
+        g_tui_in_cursor = g_tui_in.len;
+    }
+    tui_mark_dirty();
+}
+
+fn tui_in_insert(p: &const byte, n: usize) void {
+    tui_in_ensure();
+    if n == 0 {
+        return;
+    }
+    var take: usize = n;
+    // 上限与 agent.uya 的 MSG_CONTENT_MAX 对齐（200000）：输入行装得下的东西，
+    // 历史一定装得下，不会出现「屏幕上明明有、发出去被截」。超限只提示一次
+    // （旧实现是静默丢弃，用户粘一大段文本看不出少了什么 —— 见踩坑 83）。
+    if g_tui_in.len + take > TUI_IN_MAX {
+        if !g_tui_in_over {
+            g_tui_in_over = true;
+            var msg: Buf = buf_new(160);
+            defer { buf_free(&msg); }
+            _ = buf_append_cstr(&msg, "(输入已达上限 ");
+            _ = buf_append_u64(&msg, TUI_IN_MAX as u64);
+            _ = buf_append_cstr(&msg, " 字节，后面的内容被丢弃)");
+            tui_add_notice(msg.ptr as &const byte, msg.len);
+        }
+        if g_tui_in.len >= TUI_IN_MAX {
+            return;
+        }
+        take = TUI_IN_MAX - g_tui_in.len;
+        if take > n {
+            take = n;
+        }
+    }
+    if g_tui_in.len + take > g_tui_in.cap {
+        if !buf_reserve(&g_tui_in, take) {
+            return;
+        }
+    }
+    const cur: usize = if g_tui_in_cursor > g_tui_in.len { g_tui_in.len } else { g_tui_in_cursor };
+    // 在 cur 处插入：先把尾巴挪开
+    const tail: usize = g_tui_in.len - cur;
+    var i: usize = 0;
+    while i < tail {
+        g_tui_in.ptr[g_tui_in.len + take - 1 - i] = g_tui_in.ptr[g_tui_in.len - 1 - i];
+        i = i + 1;
+    }
+    g_tui_in.len = g_tui_in.len + take;
+    i = 0;
+    while i < take {
+        g_tui_in.ptr[cur + i] = p[i];
+        i = i + 1;
+    }
+    g_tui_in_cursor = cur + take;
+    tui_mark_dirty();
+}
+
+fn tui_in_erase(from: usize, to: usize) void {
+    tui_in_ensure();
+    if to > g_tui_in.len || from > to {
+        return;
+    }
+    const tail: usize = g_tui_in.len - to;
+    var i: usize = 0;
+    while i < tail {
+        g_tui_in.ptr[from + i] = g_tui_in.ptr[to + i];
+        i = i + 1;
+    }
+    buf_truncate(&g_tui_in, g_tui_in.len - (to - from));
+    g_tui_in_cursor = from;
+    tui_mark_dirty();
+}
+
+fn tui_in_backspace() void {
+    tui_in_ensure();
+    if g_tui_in_cursor == 0 {
+        return;
+    }
+    const prev: usize = tty_utf8_prev(g_tui_in.ptr as &const byte, g_tui_in_cursor);
+    tui_in_erase(prev, g_tui_in_cursor);
+}
+
+fn tui_in_delete() void {
+    tui_in_ensure();
+    if g_tui_in_cursor >= g_tui_in.len {
+        return;
+    }
+    const next: usize = tty_utf8_next(g_tui_in.ptr as &const byte, g_tui_in_cursor, g_tui_in.len);
+    tui_in_erase(g_tui_in_cursor, next);
+}
+
+fn tui_in_del_word() void {
+    tui_in_ensure();
+    if g_tui_in_cursor == 0 {
+        return;
+    }
+    var i: usize = g_tui_in_cursor;
+    while i > 0 && g_tui_in.ptr[i - 1] == 32 as byte {
+        i = i - 1;
+    }
+    while i > 0 && g_tui_in.ptr[i - 1] != 32 as byte && g_tui_in.ptr[i - 1] != 10 as byte {
+        i = i - 1;
+    }
+    tui_in_erase(i, g_tui_in_cursor);
+}
+
+fn tui_in_left() void {
+    tui_in_ensure();
+    if g_tui_in_cursor > 0 {
+        g_tui_in_cursor = tty_utf8_prev(g_tui_in.ptr as &const byte, g_tui_in_cursor);
+        tui_mark_dirty();
+    }
+}
+
+fn tui_in_right() void {
+    tui_in_ensure();
+    if g_tui_in_cursor < g_tui_in.len {
+        g_tui_in_cursor = tty_utf8_next(g_tui_in.ptr as &const byte, g_tui_in_cursor, g_tui_in.len);
+        tui_mark_dirty();
+    }
+}
+
+// 当前行的起止（用于 Home/End）
+fn tui_in_line_bounds(start: &usize, end: &usize) void {
+    tui_in_ensure();
+    var s: usize = 0;
+    var i: usize = 0;
+    const cur: usize = if g_tui_in_cursor > g_tui_in.len { g_tui_in.len } else { g_tui_in_cursor };
+    while i < cur {
+        if g_tui_in.ptr[i] == 10 as byte {
+            s = i + 1;
+        }
+        i = i + 1;
+    }
+    var e: usize = g_tui_in.len;
+    i = cur;
+    while i < g_tui_in.len {
+        if g_tui_in.ptr[i] == 10 as byte {
+            e = i;
+            break;
+        }
+        i = i + 1;
+    }
+    start[0] = s;
+    end[0] = e;
+}
+
+fn tui_in_home() void {
+    var s: usize = 0;
+    var e: usize = 0;
+    tui_in_line_bounds(&s, &e);
+    g_tui_in_cursor = s;
+    tui_mark_dirty();
+}
+
+fn tui_in_end() void {
+    var s: usize = 0;
+    var e: usize = 0;
+    tui_in_line_bounds(&s, &e);
+    g_tui_in_cursor = e;
+    tui_mark_dirty();
+}
+
+fn tui_in_up() void {
+    tui_in_ensure();
+    // 单行输入 → 历史
+    if tui_input_lines() == 1 {
+        tui_hist_move(true);
+        return;
+    }
+    // 多行 → 上一行同列
+    var s: usize = 0;
+    var e: usize = 0;
+    tui_in_line_bounds(&s, &e);
+    if s == 0 {
+        return;
+    }
+    const want: usize = tui_in_cols_of(g_tui_in.ptr + s, g_tui_in_cursor - s);
+    // 上一行范围
+    var ps: usize = 0;
+    var pe: usize = s - 1;
+    var i: usize = 0;
+    while i < pe {
+        if g_tui_in.ptr[i] == 10 as byte {
+            ps = i + 1;
+        }
+        i = i + 1;
+    }
+    var col: usize = 0;
+    var j: usize = ps;
+    while j < pe {
+        var w: usize = 0;
+        const nx: usize = tui_in_step(g_tui_in.ptr as &const byte, j, pe, &w);
+        if col + w > want {
+            break;
+        }
+        col = col + w;
+        j = nx;
+    }
+    g_tui_in_cursor = j;
+    tui_mark_dirty();
+}
+
+fn tui_in_down() void {
+    tui_in_ensure();
+    if tui_input_lines() == 1 {
+        tui_hist_move(false);
+        return;
+    }
+    var s: usize = 0;
+    var e: usize = 0;
+    tui_in_line_bounds(&s, &e);
+    if e >= g_tui_in.len {
+        return;
+    }
+    const want: usize = tui_in_cols_of(g_tui_in.ptr + s, g_tui_in_cursor - s);
+    const ns: usize = e + 1;
+    var ne: usize = g_tui_in.len;
+    var i: usize = ns;
+    while i < g_tui_in.len {
+        if g_tui_in.ptr[i] == 10 as byte {
+            ne = i;
+            break;
+        }
+        i = i + 1;
+    }
+    var col: usize = 0;
+    var j: usize = ns;
+    while j < ne {
+        var w: usize = 0;
+        const nx: usize = tui_in_step(g_tui_in.ptr as &const byte, j, ne, &w);
+        if col + w > want {
+            break;
+        }
+        col = col + w;
+        j = nx;
+    }
+    g_tui_in_cursor = j;
+    tui_mark_dirty();
+}
+
+fn tui_in_kill_to_end() void {
+    var s: usize = 0;
+    var e: usize = 0;
+    tui_in_line_bounds(&s, &e);
+    tui_in_erase(g_tui_in_cursor, e);
+}

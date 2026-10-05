@@ -1,0 +1,905 @@
+// src/term/tui/screen.uya — 全屏 TUI：滚动 + 拼整屏
+//
+// 本文件：转录视口滚动（贴尾跟随 / 上滚停跟随 / 越界夹取），以及把「状态区 + 转录 +
+//   面板 + 脚注」按几何拼成一整屏。
+// 不变量：贴尾态 = scroll 在最大值，一旦上滚就停跟随（`f` 或 End 恢复）；几何只有
+//   一个来源（见 overlay 的 P53 一节），别在别处重算列宽。
+// 依赖：status / panel / entry / scroll / overlay、term/tty。
+
+use libc.syscall;
+use libc.unistd;
+use libc.heap;
+
+// ============================================================
+// 拼整屏
+// ============================================================
+
+var g_tui_in: Buf = Buf{ ptr: null, len: 0, cap: 0 };
+// 输入行上限：与 agent.uya 的 MSG_CONTENT_MAX 同值（那边是单条消息入史上限）。
+// 改一处必须改两处 —— 输入装得下、历史装不下就会出现「发出去了但被截」，所以值上对齐。
+const TUI_IN_MAX: usize = 200000;
+var g_tui_in_over: bool = false;    // 已经就「超上限」提示过一次（别每条字节刷屏）
+var g_tui_in_cursor: usize = 0;
+var g_tui_panel_top: usize = 0;
+var g_tui_input_top: usize = 0;
+
+fn tui_in_ensure() void {
+    if !buf_valid(&g_tui_in) {
+        g_tui_in = buf_new(65536);
+    }
+}
+
+export fn tui_input_text() &Buf {
+    tui_in_ensure();
+    return &g_tui_in;
+}
+
+export fn tui_input_len() usize {
+    tui_in_ensure();
+    return g_tui_in.len;
+}
+
+export fn tui_input_clear() void {
+    tui_in_ensure();
+    buf_reset(&g_tui_in);
+    g_tui_in_cursor = 0;
+    g_tui_in_over = false;
+    tui_mark_dirty();
+}
+
+// 命令面板是由输入行里的那个 `/` 触发开的（`first_slash` 要求插入前输入为空），
+// 之后敲的字进的是**面板过滤器**而不是输入行。所以面板把选中项派发掉之后，输入行里
+// 那个 `/` 必须一起收走 —— 留着它，用户下一次敲 `/status` 就会拼成 `//status`，
+// 被当成未知命令静默丢掉（用户报的「/status 没反应」就是这条路）。
+// 只在输入**恰好**是 `/` 时清：`ctrl+p` 带草稿开面板时一个字节都不能动。
+export fn tui_input_drop_slash_trigger() void {
+    tui_in_ensure();
+    if g_tui_in.len == 1 && g_tui_in.ptr[0] == 47 as byte {
+        tui_input_clear();
+    }
+}
+
+export fn tui_input_set(p: &const byte, n: usize) void {
+    tui_in_ensure();
+    buf_reset(&g_tui_in);
+    _ = buf_append(&g_tui_in, p, n);
+    g_tui_in_cursor = g_tui_in.len;
+    tui_mark_dirty();
+}
+
+
+// 输入缓冲里的行数（'\n' 分隔）
+fn tui_input_lines() usize {
+    tui_in_ensure();
+    var lines: usize = 1;
+    var i: usize = 0;
+    while i < g_tui_in.len {
+        if g_tui_in.ptr[i] == 10 as byte {
+            lines = lines + 1;
+        }
+        i = i + 1;
+    }
+    return lines;
+}
+
+// 光标在第几行 / 该行内第几列（显示列）
+// 输入行的**显示**清洗：输入缓冲里可以有任意外来字节（粘进来的 ANSI 彩色文本、
+// TAB、NUL…），但帧里绝不能出现 ESC/TAB —— 前者会改写终端状态、后者让列宽算错
+// （踩坑 83 附带修：粘贴现在真的把 TAB 当字面内容收进来了，这条不变量就有了牙齿）。
+// 口径与正文层完全一致，直接复用 tui_clean_into。
+// **只用于绘制**：缓冲区本身保持逐字节原样（发给模型的文本不许被改写）。
+fn tui_in_display(p: &const byte, n: usize, out: &Buf) void {
+    buf_reset(out);
+    tui_clean_into(out, p, n);
+}
+
+// 输入缓冲里从第 i 个字节起的「一个显示单元」：返回下一个字节下标，显示列数写入 w。
+// 口径必须与 tui_in_display（= tui_clean_into）**逐条对齐**，否则粘贴带 TAB / ANSI 的
+// 文本之后光标会跟屏幕上的字错开：
+//   * TAB(9) → 四个空格 = 4 列；
+//   * ESC 起头的 CSI/OSC 整段 → 一个 `␛` = 1 列；
+//   * 其余控制字节 → 一个 `·` = 1 列；
+//   * 正常 UTF-8 → 按 tty_char_cols（宽字符 2 列）。
+fn tui_in_step(p: &const byte, i: usize, n: usize, w: &usize) usize {
+    const c: byte = p[i];
+    if c == 9 as byte {
+        w[0] = 4;
+        return i + 1;
+    }
+    if c == 27 as byte {
+        var j: usize = i + 1;
+        if j < n && p[j] == 91 as byte {
+            j = j + 1;
+            while j < n {
+                const d: byte = p[j];
+                j = j + 1;
+                if d >= 0x40 as byte && d <= 0x7e as byte {
+                    break;
+                }
+            }
+        } else if j < n && p[j] == 93 as byte {
+            j = j + 1;
+            while j < n {
+                if p[j] == 7 as byte {
+                    j = j + 1;
+                    break;
+                }
+                if p[j] == 27 as byte && j + 1 < n && p[j + 1] == 92 as byte {
+                    j = j + 2;
+                    break;
+                }
+                j = j + 1;
+            }
+        } else {
+            j = i + 1;
+        }
+        w[0] = 1;
+        return j;
+    }
+    if c < 0x20 as byte || c == 0x7f as byte {
+        w[0] = 1;
+        return i + 1;
+    }
+    const nx: usize = tty_utf8_next(p, i, n);
+    w[0] = tty_char_cols(tty_utf8_decode(p, i, n));
+    return nx;
+}
+
+// 一行（字节区间）的显示列数（与 tui_in_step 同一口径，供光标定位用）
+fn tui_in_cols_of(p: &const byte, n: usize) usize {
+    var cols: usize = 0;
+    var i: usize = 0;
+    while i < n {
+        var w: usize = 0;
+        i = tui_in_step(p, i, n, &w);
+        cols = cols + w;
+    }
+    return cols;
+}
+
+// 光标落在输入缓冲的第几行 / 该行内第几显示列（导出给自测断言用）
+export fn tui_input_cursor_line_col(line: &usize, col: &usize) void {
+    tui_in_ensure();
+    var l: usize = 0;
+    var start: usize = 0;
+    var i: usize = 0;
+    const cur: usize = if g_tui_in_cursor > g_tui_in.len { g_tui_in.len } else { g_tui_in_cursor };
+    while i < cur {
+        if g_tui_in.ptr[i] == 10 as byte {
+            l = l + 1;
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    line[0] = l;
+    // 列按显示口径算（TAB 展开成四空格、ESC 序列折成一个 ␛）—— 用原始字节算的话
+    // 光标会跟屏幕上的字错开，粘贴带 TAB 的代码后尤为明显。
+    col[0] = tui_in_cols_of(g_tui_in.ptr + start, cur - start);
+}
+
+// 取输入缓冲第 l 行的区间
+fn tui_input_line_range(l: usize, off: &usize, len: &usize) bool {
+    tui_in_ensure();
+    var line: usize = 0;
+    var start: usize = 0;
+    var p: usize = 0;
+    while p <= g_tui_in.len {
+        if p == g_tui_in.len || g_tui_in.ptr[p] == 10 as byte {
+            if line == l {
+                off[0] = start;
+                len[0] = p - start;
+                return true;
+            }
+            line = line + 1;
+            start = p + 1;
+        }
+        p = p + 1;
+    }
+    return false;
+}
+
+// 空态：logo + 面板整体垂直居中
+fn tui_build_home() void {
+    tui_in_ensure();
+    g_tui_tasks_n = 0;          // 空态屏不画任务块（还没有会话内容）
+    const in_lines: usize = tui_input_lines();
+    const panel_h: usize = tui_panel_height(in_lines);
+    g_tui_in_lines = in_lines;
+    g_tui_panel_h = panel_h;
+    const logo_h: usize = if g_tui_cols >= TUI_LOGO_COLS { tui_logo_height() } else { 1 as usize };
+    const gap: usize = 2;
+    const block_h: usize = logo_h + gap + panel_h;
+    var top: usize = 0;
+    if g_tui_rows > block_h + 2 {
+        top = (g_tui_rows - 1 - block_h) / 2;
+    }
+    var pad_top: usize = 0;
+    while pad_top < top {
+        tui_row_new();
+        tui_fill_row(g_tui_cols);
+        pad_top = pad_top + 1;
+    }
+    // logo
+    if g_tui_cols >= TUI_LOGO_COLS {
+        const lw: usize = tui_logo_width();
+        var start: usize = 0;
+        if g_tui_cols > lw {
+            start = (g_tui_cols - lw) / 2;
+        }
+        var ro: usize = 0;
+        while ro < TUI_LOGO_H {
+            tui_row_new();
+            tui_pad_to(start);
+            tui_logo_row(ro);
+            tui_fill_row(g_tui_cols);
+            ro = ro + 1;
+        }
+    } else {
+        tui_row_new();
+        tui_pad_to(2);
+        tui_puts("uya agent" as &const byte, TUI_ST_USER);
+        tui_fill_row(g_tui_cols);
+    }
+    var g: usize = 0;
+    while g < gap {
+        tui_row_new();
+        tui_fill_row(g_tui_cols);
+        g = g + 1;
+    }
+    g_tui_panel_top = g_tui_nrows;
+    tui_draw_panel_rows(panel_h, in_lines);
+    // 下面补齐到脚注之前
+    while g_tui_nrows + 1 < g_tui_rows {
+        tui_row_new();
+        tui_fill_row(g_tui_cols);
+    }
+}
+
+// 面板实体（抽出给 home/chat 共用）：in_lines 行输入 + 1 行信息
+fn tui_draw_panel_rows(panel_h: usize, in_lines: usize) void {
+    tui_in_ensure();
+    const width: usize = if g_tui_cols > 5 { g_tui_cols - 5 } else { 1 as usize };
+    const content_col: usize = TUI_BODY_COL;
+    var cur_line: usize = 0;
+    var cur_col: usize = 0;
+    tui_input_cursor_line_col(&cur_line, &cur_col);
+    // 输入行窗口：光标行可见
+    var view: usize = 0;
+    if in_lines > panel_h - 1 {
+        const vis: usize = panel_h - 1;
+        if cur_line >= vis {
+            view = cur_line - vis + 1;
+        }
+    }
+    var li: usize = 0;
+    while li < panel_h {
+        tui_row_new();
+        tui_pad_to(2);
+        tui_puts("▌" as &const byte, TUI_ST_ACCENT);
+        if li < panel_h - 1 {
+            tui_pad_to(content_col);
+            const ln: usize = view + li;
+            if ln == 0 {
+                if g_tui_in.len == 0 {
+                    tui_puts("↑ " as &const byte, TUI_ST_HINT);
+                } else {
+                    tui_puts("❯ " as &const byte, TUI_ST_ACCENT);
+                }
+            } else {
+                tui_pad_to(content_col + 2);
+            }
+            var off: usize = 0;
+            var len: usize = 0;
+            const have: bool = tui_input_line_range(ln, &off, &len);
+            if g_tui_in.len == 0 && li == 0 {
+                const ph2: &const byte = "Ask anything... \"把 hello.uya 的问候语改成 Hello, DSH!\"" as &const byte;
+                tui_put_clipped(ph2, bufx_cstr_len(ph2), width - 2, TUI_ST_HINT);
+            } else if have {
+                // 显示前清洗（踩坑 83）：输入的原始字节保持不动，但帧里不许出现
+                // ESC/TAB/NUL —— 粘进来的彩色文本会改写终端状态、TAB 会让列宽算错。
+                var disp: Buf = buf_new(len + len / 2 + 16);
+                defer { buf_free(&disp); }
+                if buf_valid(&disp) {
+                    tui_in_display(g_tui_in.ptr + off, len, &disp);
+                    tui_put_clipped(disp.ptr as &const byte, disp.len, width - 2, TUI_ST_DEFAULT);
+                }
+            }
+            tui_fill_row(g_tui_cols);
+        } else {
+            // P21 信息行：模式 + 访问模式 chip + 模型/provider，右侧键位提示。
+            // 三段都按列预算退让：芯片塞不下就整块不画（不发明缩写），提示先试长版再退短版，
+            // 三者一律不重叠。
+            tui_pad_to(content_col);
+            if g_tui_plan {
+                tui_puts("Plan" as &const byte, TUI_ST_BOLD);
+            } else {
+                tui_puts("Build" as &const byte, TUI_ST_BOLD);
+            }
+            tui_puts("   " as &const byte, TUI_ST_DEFAULT);
+            const end: usize = if g_tui_cols > 3 { g_tui_cols - 3 } else { 0 as usize };
+            const chip_at: usize = tui_row_cols();
+            const alab: &const byte = perm_label(g_tui_access);
+            const alen: usize = bufx_cstr_len(alab);
+            var model_w: usize = g_tui_model.len;
+            if g_tui_provider.len > 0 {
+                model_w = model_w + 3 + g_tui_provider.len;
+            }
+            // P37：带了推理强度就再挂一段 `· <强度>`（对齐 DSH composer 的「模型名 + 强度」观感）。
+            // effort_len == 0 时一个字节都不变 —— 脚注/信息行的默认排版与 P35 逐字节相同。
+            var eff_tail: Buf = buf_new(32);
+            defer { buf_free(&eff_tail); }
+            if g_tui_effort.len > 0 {
+                _ = buf_append_cstr(&eff_tail, " · ");
+                _ = buf_append(&eff_tail, g_tui_effort.ptr, g_tui_effort.len);
+                model_w = model_w + eff_tail.len;
+            }
+            // P22：有常驻任务块时，右侧提示再挂一段 `ctrl+t tasks`（放得下才挂）
+            var hb: Buf = buf_new(128);
+            defer { buf_free(&hb); }
+            const base_hint: &const byte = tui_info_row_hint(end, chip_at, alen, model_w);
+            const base_len: usize = bufx_cstr_len(base_hint);
+            if base_len > 0 {
+                _ = buf_append(&hb, base_hint, base_len);
+                const extra: &const byte = "   ctrl+t tasks" as &const byte;
+                const extra_len: usize = bufx_cstr_len(extra);
+                if g_tui_tasks_n > 0 && end > base_len + extra_len + 3 {
+                    _ = buf_append(&hb, extra, extra_len);
+                }
+            }
+            const hint: &const byte = hb.ptr as &const byte;
+            const hl: usize = hb.len;
+            const hint_at: usize = if hl > 0 && end > hl { end - hl } else { 0 as usize };
+            // 芯片之后还要留 3 空格 + 至少 8 列给模型名，否则不画芯片
+            if hint_at > chip_at + alen + 11 {
+                tui_puts(alab, tui_access_style(g_tui_access));
+                tui_puts("   " as &const byte, TUI_ST_DEFAULT);
+            }
+            const w_used: usize = tui_row_cols();
+            const room_end: usize = if hint_at > 3 { hint_at - 3 } else { end };
+            const room: usize = if room_end > w_used + 8 { room_end - w_used } else { 0 as usize };
+            var info: Buf = buf_new(256);
+            defer { buf_free(&info); }
+            _ = buf_append(&info, g_tui_model.ptr, g_tui_model.len);
+            if g_tui_provider.len > 0 {
+                _ = buf_append_cstr(&info, "   ");
+                _ = buf_append(&info, g_tui_provider.ptr, g_tui_provider.len);
+            }
+            // P37：强度跟在模型名后面（与 model_w 的预算算法用同一份拼法）
+            if eff_tail.len > 0 {
+                _ = buf_append(&info, eff_tail.ptr, eff_tail.len);
+            }
+            if room > 0 {
+                tui_put_clipped(info.ptr as &const byte, info.len, room, TUI_ST_DIM);
+            }
+            if hint_at >= tui_row_cols() + 2 {
+                tui_pad_to(hint_at);
+                // 必须显式给长度：tui_puts 内部按 cstr 量长度，而 P22 起 hint 是**拼出来的
+                // 缓冲区**（不是字面量），尾部没有 NUL —— 用 tui_puts 会把堆里的旧字节也画上去
+                tui_put(hint, hl, TUI_ST_HINT);
+            }
+            tui_fill_row(g_tui_cols);
+        }
+        li = li + 1;
+    }
+}
+
+// 把「贴尾 / 跳顶 / 跳底 / 继续往上翻」的意图折算成 g_tui_scroll（P25 的滚动补完）。
+//
+// 为什么需要它：转录窗口从尾部往上收行（`total >= need` 就停），need = 视口 + scroll。
+// 一个条目可能折出上万行（一条长工具结果、长正文），窗口把它整个装下的那一刻 total
+// 已经远大于 need，`max_scroll = total - 视口` 于是变成 0 —— 往上翻就再也翻不到
+// 这一条的前面部分（用户报的「翻看不了旧日志」的第二种形态）。
+// 这里按**真总量**夹 scroll，于是「跳顶」「继续往上翻」都能落在真位置。
+//
+// 代价：走到真总量要遍历全部条目（≤512 个），每个条目内部再按「够不够一屏」分块量
+// 折行 —— 与单个条目的行数无关（长条目不会退化成按行线性走查）。
+//
+// area_rows = 转录区的总行数（面板之上的全部行）。溢出时顶部要给 `^` 指示留一行，
+// 所以可用的内容行是 area_rows - 1 —— 这个 -1 必须和 tui_build_chat 里的算法一致，
+// 否则「跳顶」会差一行（实测：内容第一行永远差一行看不到）。
+//
+// 从尾部往上走查到「至少 want_rows 行」时停，返回 (行数, 用掉的条目数)。
+// 只能停在这条链上 —— 于是「数够一屏」永远只走最后几块。
+fn tui_rows_from_tail(want_rows: usize, width: usize, cnt: &usize) usize {
+    var rows: usize = 0;
+    var used: usize = 0;
+    while used < g_tui_nent {
+        const r: usize = tui_entry_rows(g_tui_nent - 1 - used, width);
+        rows = rows + r;
+        used = used + 1;
+        if rows >= want_rows {
+            break;
+        }
+    }
+    cnt[0] = used;
+    return rows;
+}
+
+fn tui_auto_end_scroll(area_rows: usize) void {
+    // P46：宽度参数统一成**终端列数**（扣多少列由 tui_entry_ensure_wrap 一处说了算），
+    // 这里不再自己 `- 6` —— 那正是「折行/绘制各算一份」的来源。
+    const width: usize = g_tui_cols;
+    // 1) 先看「尾端一屏」：总量不超过一屏 → 没有可滚的，直接贴尾（不占指示行）。
+    var used0: usize = 0;
+    const tail_rows: usize = tui_rows_from_tail(area_rows, width, &used0);
+    if used0 >= g_tui_nent && tail_rows <= area_rows {
+        g_tui_scroll = 0;
+        if g_tui_pin_end_req {
+            g_tui_pin_end_req = false;
+        }
+        return;
+    }
+    // 2) 走到真总量。要量到底就只有这条路；块与块之间不保留状态，纯函数式重算。
+    var grand: usize = 0;
+    var i: usize = 0;
+    while i < g_tui_nent {
+        grand = grand + tui_entry_rows(i, width);
+        i = i + 1;
+    }
+    if grand <= area_rows {
+        g_tui_scroll = 0;
+        g_tui_pin_end_req = false;
+        return;
+    }
+    // 3) 溢出：顶部 `^` 占一行，可用内容行 = area_rows - 1
+    const view: usize = area_rows - 1;
+    const max_scroll: usize = grand - view;
+    if g_tui_pin_end_req {
+        // 「跳到底」：本轮落到底，下一帧再钉一次（内容可能还在长）
+        g_tui_scroll = 0;
+        return;
+    }
+    if g_tui_pin_top_req {
+        // 「跳到顶」：精确落在 max_scroll（哨兵值总会被夹到这里）
+        g_tui_pin_top_req = false;
+        g_tui_scroll = max_scroll;
+        return;
+    }
+    if g_tui_scroll > max_scroll {
+        g_tui_scroll = max_scroll;
+    }
+}
+
+// 对话态：转录（底对齐）+ 面板贴底
+fn tui_build_chat() void {
+    tui_in_ensure();
+    const in_lines: usize = tui_input_lines();
+    const panel_h: usize = tui_panel_height(in_lines);
+    g_tui_in_lines = in_lines;
+    g_tui_panel_h = panel_h;
+    const footer_h: usize = 1;
+    var panel_top: usize = 0;
+    if g_tui_rows > panel_h + footer_h {
+        panel_top = g_tui_rows - panel_h - footer_h;
+    }
+    g_tui_panel_top = panel_top;
+    // P46：与 tui_auto_end_scroll 用同一份宽度口径（终端列数，条目各扣各的）
+    const width: usize = g_tui_cols;
+    // P18：状态区**常驻在面板正上方**，先把它的行数从视口里扣掉。
+    // 不这么做的话，转录一铺满，原来那条「转录最后一行」的状态行就被挤掉了（踩坑 32）——
+    // 长会话里跑起来屏幕上什么都不动，看着就像卡住。
+    var status_h: usize = tui_status_rows();
+    if status_h > panel_top {
+        status_h = if panel_top > 0 { 1 as usize } else { 0 as usize };
+    }
+    // P22：常驻任务块钉在状态区**之上**（状态区仍紧贴面板 —— P18 的断言不变）。
+    // 先把「最多能给几行」告诉 tasks 层（变了就地重建一次），再拉文本。
+    const above_status: usize = panel_top - status_h;
+    var room: usize = 0;
+    if above_status > 3 {
+        room = above_status - 3;          // 给转录留 3 行
+    }
+    if tasks_set_row_budget(room) {
+        _ = tasks_panel_sync();
+    }
+    tui_tasks_refresh();
+    var tasks_h: usize = g_tui_tasks_n;
+    if tasks_h > room {
+        tasks_h = room;
+    }
+    const t_bottom: usize = panel_top - status_h - tasks_h;   // 转录底（任务块从这里开始）
+    // P32：先把「贴尾 / 跳顶 / 跳底」的意图按真总量折算成 scroll（长条目也能翻到前面）。
+    // 转录区总行数 = 面板之上、扣掉任务块与状态区之后剩下的那些行。
+    tui_auto_end_scroll(t_bottom);
+    // 溢出时**第 0 行让给 `^` 指示**（提示「上面还有、ctrl+home 到顶」），可用内容行少一行；
+    // 贴尾（scroll == 0）时一行都不占 —— 布局与 P32 之前逐字节一致。
+    var t_top: usize = 0;
+    if g_tui_scroll > 0 {
+        t_top = 1;
+    }
+    // 1) 从尾部往上收行，直到够一屏 + 滚动量
+    const view_rows: usize = t_bottom - t_top;
+    const need: usize = view_rows + g_tui_scroll;
+    var first: usize = g_tui_nent;
+    var total: usize = 0;
+    while first > 0 {
+        const rows: usize = tui_entry_rows(first - 1, width);
+        if total >= need && total > 0 {
+            break;
+        }
+        total = total + rows;
+        first = first - 1;
+    }
+    g_tui_total = total;
+    // 2) 计算窗口起点（P32：这里不再把 g_tui_scroll 夹到 max_scroll —— 一个条目
+    //    可能折出上万行，窗口一旦把它整个装进来（上面 total >= need 就停），
+    //    max_scroll = total - view_rows 会变成 0，用户就再也翻不到这一条的前面部分。
+    //    真的「滚到底/顶」由 tui_auto_end_scroll 按真总量夹。）
+    var pad_top: usize = 0;
+    var start_line: usize = 0;
+    if total > view_rows {
+        const max_scroll: usize = total - view_rows;
+        var sc: usize = g_tui_scroll;
+        if sc > max_scroll {
+            sc = max_scroll;
+        }
+        start_line = max_scroll - sc;
+        g_tui_scroll = sc;
+    } else {
+        pad_top = view_rows - total;
+        g_tui_scroll = 0;
+    }
+    g_tui_visible_rows = if total < view_rows { total } else { view_rows };
+    g_tui_visible_row0 = start_line;
+    g_tui_visible_total = total;
+    // `^` 只在**真的有内容在窗口上面**时才画（start_line > 0）。用 scroll > 0 当判据是错的：
+    // 跳到最顶时 scroll 正好等于 max，那一刻上面已经没有东西了，箭头会撒谎。
+    g_tui_more_above = start_line > 0;
+    g_tui_more_below = g_tui_scroll > 0;
+    // 3) 画。顶部指示行（`↑`）占转录区第 0 行，先补一行留白；内容只画到 t_bottom。
+    if t_top > 0 {
+        tui_row_new();
+        tui_fill_row(g_tui_cols);
+    }
+    while pad_top > 0 {
+        tui_row_new();
+        tui_fill_row(g_tui_cols);
+        pad_top = pad_top - 1;
+    }
+    var gl: usize = 0;
+    var r: usize = g_tui_nrows;
+    var i: usize = first;
+    const draw_bottom: usize = t_bottom;
+    while i < g_tui_nent && r < draw_bottom {
+        const e: &TuiEntry = tui_entry_at(i);
+        if tui_entry_has_header(e.kind) {
+            if gl >= start_line && r < draw_bottom {
+                tui_row_new();
+                tui_pad_to(TUI_PREFIX_COL + 2);
+                tui_draw_header(e.kind);
+                tui_fill_row(g_tui_cols);
+                r = r + 1;
+            }
+            gl = gl + 1;
+        }
+        var k: usize = 0;
+        while k < e.wrap_lines && r < draw_bottom {
+            var off: usize = 0;
+            var len: usize = 0;
+            if tui_entry_line(i, k, &off, &len) {
+                if gl >= start_line {
+                    tui_row_new();
+                    // 预算与折行侧**同一个**函数：绘制只画到折行已经放下的内容，
+                    // 这里不再有「各算一份」的余地（tui_put_clipped 只是安全网）。
+                    const avail: usize = if g_tui_cols > tui_entry_indent_cols(e.kind) + 1 {
+                        g_tui_cols - tui_entry_indent_cols(e.kind) - 1
+                    } else {
+                        4 as usize
+                    };
+                    const p: &const byte = e.wrap.ptr + off;
+                    if e.kind == TUI_E_TOOL {
+                        tui_pad_to(TUI_PREFIX_COL);
+                        tui_put_clipped(p, len, avail, tui_tool_line_style(p, len));
+                    } else if e.kind == TUI_E_NOTICE {
+                        tui_pad_to(TUI_PREFIX_COL);
+                        tui_puts("· " as &const byte, TUI_ST_DIM);
+                        tui_put_clipped(p, len, avail, tui_notice_style(p, len));
+                    } else if e.kind == TUI_E_ASSIST {
+                        tui_pad_to(TUI_BODY_COL - 2);
+                        var mdp: &const byte = p;
+                        if buf_valid(&e.md) && off < e.md.len {
+                            mdp = e.md.ptr + off;
+                        }
+                        tui_draw_md_line(p, mdp, len);
+                    } else if e.kind == TUI_E_REASON {
+                        tui_pad_to(TUI_BODY_COL - 2);
+                        tui_put_clipped(p, len, avail, TUI_ST_DIM);
+                    } else {
+                        tui_pad_to(TUI_BODY_COL - 2);
+                        tui_draw_inline(p, len, TUI_ST_USER, avail);
+                    }
+                    tui_fill_row(g_tui_cols);
+                    r = r + 1;
+                }
+                gl = gl + 1;
+            }
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    // 3.5) 常驻任务块（P22）：钉在状态区之上；超宽按显示列裁剪（不砍半个字符）
+    if tasks_h > 0 {
+        const avail_c: usize = if g_tui_cols > TUI_PREFIX_COL + 2 { g_tui_cols - TUI_PREFIX_COL - 2 } else { 1 as usize };
+        var off: usize = 0;
+        var drawn: usize = 0;
+        // 文本比可用行数还高（缓存还没跟上刚下发的预算）→ 末行换成 `… 还有 N 行`
+        const clipped: bool = g_tui_tasks_n > tasks_h;
+        const want: usize = if clipped && tasks_h > 0 { tasks_h - 1 } else { tasks_h };
+        while off < g_tui_tasks.len && drawn < want {
+            var e: usize = off;
+            while e < g_tui_tasks.len && g_tui_tasks.ptr[e] != 10 as byte {
+                e = e + 1;
+            }
+            tui_row_new();
+            tui_pad_to(TUI_PREFIX_COL);
+            tui_put_clipped(&g_tui_tasks.ptr[off] as &const byte, e - off, avail_c, TUI_ST_DIM);
+            tui_fill_row(g_tui_cols);
+            r = r + 1;
+            drawn = drawn + 1;
+            off = e + 1;
+        }
+        if clipped && tasks_h > 0 {
+            var mtail: Buf = buf_new(64);
+            defer { buf_free(&mtail); }
+            _ = buf_append_cstr(&mtail, "… 还有 ");
+            _ = buf_append_u64(&mtail, (g_tui_tasks_n - want) as u64);
+            _ = buf_append_cstr(&mtail, " 行");
+            tui_row_new();
+            tui_pad_to(TUI_PREFIX_COL);
+            tui_put_clipped(mtail.ptr as &const byte, mtail.len, avail_c, TUI_ST_DIM);
+            tui_fill_row(g_tui_cols);
+            r = r + 1;
+        }
+    }
+    // 4) 状态区（P18）：钉在面板正上方 —— 第 1 行状态，第 2 行思考实时文本。
+    //    这里的行数在算视口时就已经扣掉（status_h），所以转录再长也不会把它挤掉。
+    r = tui_draw_status_block(status_h, r);
+    // 5) 补齐视口
+    while r < panel_top {
+        tui_row_new();
+        tui_fill_row(g_tui_cols);
+        r = r + 1;
+    }
+    // 6) 滚动溢出指示（P32）：转录区最右列原地覆盖一个**单字节**方向标记 ——
+    //    `^` = 上面还有（第 0 行）、`v` = 下面还有（转录区最后一行）。
+    //    用单字节是刻意的：g_tui_text 是所有行共用的缓冲，多字节字形会挪动后面行的偏移。
+    //    贴尾（scroll == 0）时**一个字节都不画**，布局与 P32 之前逐字节一致。
+    if g_tui_scroll > 0 {
+        tui_row_put_col(0, g_tui_cols - 1, 94 as byte);                    // '^'
+        if start_line > 0 && t_bottom > 0 {
+            tui_row_put_col(t_bottom - 1, g_tui_cols - 1, 118 as byte);    // 'v'
+        }
+    }
+    // 7) 面板
+    g_tui_panel_top = g_tui_nrows;
+    tui_draw_panel_rows(panel_h, in_lines);
+}
+
+// P38：已运行时长（`0s` / `12s` / `1m23s` / `1h02m`）—— 状态行专用。
+// 口径：不足 1 秒显示 `0s`（第一次画出来不空着）；分/时补零，位数固定才好扫。
+export fn tui_fmt_elapsed(out: &Buf, ms: u64) void {
+    var secs: u64 = ms / (1000 as u64);
+    if secs < (60 as u64) {
+        _ = buf_append_u64(out, secs);
+        _ = buf_append_cstr(out, "s");
+        return;
+    }
+    const mins: u64 = secs / (60 as u64);
+    if mins < (60 as u64) {
+        _ = buf_append_u64(out, mins);
+        _ = buf_append_cstr(out, "m");
+        secs = secs - (mins * (60 as u64));
+        if secs < (10 as u64) {
+            _ = buf_append_cstr(out, "0");
+        }
+        _ = buf_append_u64(out, secs);
+        _ = buf_append_cstr(out, "s");
+        return;
+    }
+    const hours: u64 = mins / (60 as u64);
+    const rmins: u64 = mins - (hours * (60 as u64));
+    _ = buf_append_u64(out, hours);
+    _ = buf_append_cstr(out, "h");
+    if rmins < (10 as u64) {
+        _ = buf_append_cstr(out, "0");
+    }
+    _ = buf_append_u64(out, rmins);
+    _ = buf_append_cstr(out, "m");
+}
+
+// 状态区（P18）的实体：追加 status_h 行（0/1/2），返回新的当前行数。
+// 抽出来是因为「浮层重画转录区」之后必须把它补回来 —— 否则运行中开一次浮层，
+// 钉在面板上方的状态区就被抹掉了（P18 的承诺：转录再长也看得见状态）。
+fn tui_draw_status_block(status_h: usize, r_in: usize) usize {
+    var r: usize = r_in;
+    if status_h >= 1 {
+        tui_row_new();
+        tui_pad_to(TUI_PREFIX_COL);
+        tui_puts(tui_spinner_glyph(), TUI_ST_ACCENT);
+        tui_puts(" " as &const byte, TUI_ST_DEFAULT);
+        var st: Buf = buf_new(256);
+        defer { buf_free(&st); }
+        if g_tui_run == TUI_RUN_THINK {
+            _ = buf_append_cstr(&st, "思考中");
+        } else if g_tui_run == TUI_RUN_STREAM {
+            _ = buf_append_cstr(&st, "输出中");
+        } else if g_tui_run == TUI_RUN_TOOL {
+            _ = buf_append_cstr(&st, "运行中 ");
+            _ = buf_append(&st, g_tui_run_label.ptr, g_tui_run_label.len);
+            // P38：已运行多久。放在标题之后、`esc 中断` 之前：窄终端先裁掉的是尾部提示，
+            // 而「跑了多久」正是「分不清在跑还是卡住」时要看的那一眼。
+            _ = buf_append_cstr(&st, " · ");
+            const now_ms: u64 = tui_now_ms();
+            tui_fmt_elapsed(&st, if now_ms > g_tui_run_since_ms { now_ms - g_tui_run_since_ms } else { 0 as u64 });
+        } else {
+            _ = buf_append_cstr(&st, "运行中");
+        }
+        _ = buf_append_cstr(&st, " · esc 中断");
+        const st_max: usize = if g_tui_cols > 8 { g_tui_cols - 8 } else { 1 as usize };
+        tui_put_clipped(st.ptr as &const byte, st.len, st_max, TUI_ST_DIM);
+        tui_fill_row(g_tui_cols);
+        r = r + 1;
+    }
+    if status_h >= 2 {
+        const avail: usize = tui_think_avail();
+        tui_row_new();
+        tui_pad_to(TUI_PREFIX_COL);
+        tui_puts(TUI_THINK_PREFIX, TUI_ST_DIM);
+        tui_put_clipped_tail(g_tui_think.ptr as &const byte, g_tui_think.len, avail, TUI_ST_DIM);
+        tui_fill_row(g_tui_cols);
+        r = r + 1;
+    }
+    return r;
+}
+
+// 输入光标落点（面板重画之后调用）
+fn tui_cursor_place() void {
+    var cl: usize = 0;
+    var cc: usize = 0;
+    tui_input_cursor_line_col(&cl, &cc);
+    const panel_h: usize = g_tui_panel_h;
+    const in_lines: usize = g_tui_in_lines;
+    var view: usize = 0;
+    if in_lines > panel_h - 1 {
+        const vis: usize = panel_h - 1;
+        if cl >= vis {
+            view = cl - vis + 1;
+        }
+    }
+    var crow: usize = g_tui_panel_top + (cl - view);
+    if g_tui_panel_top + panel_h > g_tui_rows {
+        crow = g_tui_rows - 1;
+    }
+    const ccol: usize = TUI_BODY_COL + 2 + cc;
+    // 光标可见性口径（修复，记踩坑 66，不占阶段号）：**空闲**或**没有浮层**时显示 —— 只有「运行中且浮层开着」
+    // 才隐藏。为什么不是「空闲才显示」：运行中的输入行照样是打字目标（敲进去的文本走
+    // steer 收件箱在 step 边界被采纳；ask_user_question 这条工具路径更是直接用输入行
+    // 等回车），把它藏起来就是用户报的「执行中输入文本没有光标」。为什么不是恒显示：
+    // 浮层开着时键全被浮层吃掉（tui_handle_one 先路由给 tui_ov_key），插入点不在输入行上，
+    // 这时露出光标只会误导 —— 这一格与修前逐字节相同，没有顺手动别的状态。
+    const caret_on: bool = g_tui_run == TUI_RUN_IDLE || !tui_overlay_open();
+    tui_set_cursor(crow, ccol, caret_on);
+}
+
+// 组装一屏（home / chat），不写终端
+export fn tui_build() void {
+    tui_state_ensure();
+    tui_in_ensure();
+    tui_glue_ensure();
+    tui_frame_begin(g_tui_cols, g_tui_rows);
+    if g_tui_nent == 0 {
+        tui_build_home();
+    } else {
+        tui_build_chat();
+    }
+    tui_draw_footer();
+    if g_tui_ov != TUI_OV_NONE {
+        // 浮层画在转录区中间：重画 [top, top+h) 这段，再把状态区/面板/脚注补回来
+        tui_draw_overlay();
+        const sh: usize = tui_status_rows();
+        if sh > 0 && g_tui_panel_top > sh {
+            while g_tui_nrows < g_tui_panel_top - sh {
+                tui_row_new();
+                tui_fill_row(g_tui_cols);
+            }
+            _ = tui_draw_status_block(sh, g_tui_nrows);
+        }
+        while g_tui_nrows < g_tui_panel_top {
+            tui_row_new();
+            tui_fill_row(g_tui_cols);
+        }
+        tui_draw_panel_rows(g_tui_panel_h, g_tui_in_lines);
+        // 空态的面板是居中的：面板与脚注之间还有空白行，不补齐整帧就短一截
+        // （终端上留下的是上一帧的内容）
+        while g_tui_nrows + 1 < g_tui_rows {
+            tui_row_new();
+            tui_fill_row(g_tui_cols);
+        }
+        tui_draw_footer();
+    }
+    tui_cursor_place();
+}
+
+// 组装 + 输出（dirty 才画）
+export fn tui_render() void {
+    if !g_tui_on {
+        return;
+    }
+    if !g_tui_dirty {
+        return;
+    }
+    tui_build();
+    tui_flush();
+    g_tui_frames = g_tui_frames + 1;
+}
+
+
+
+// ============================================================
+// 滚动
+// ============================================================
+
+var g_tui_scroll: usize = 0;        // 从尾部往上滚了多少行
+var g_tui_total: usize = 0;         // 最近一帧算出的总行数
+var g_tui_more_above: bool = false;
+// 「用户就在看历史」：只有在最底（scroll == 0）时跟不跟尾部才算问题。
+// 见 tui_auto_end_scroll()：追赶尾部时一旦离开最底就停手。
+var g_tui_follow_tail: bool = true;
+var g_tui_pin_end_req: bool = false;   // 用户按「跳到底」→ 下一帧再钉一次底（内容还在长）
+var g_tui_pin_top_req: bool = false;   // 用户按「跳到顶」→ 帧内落到精确的 max_scroll
+var g_tui_more_below: bool = false;    // 当前窗口下面还有（被截断的）新内容
+var g_tui_visible_rows: usize = 0;       // 上一帧转录区实际行数（PgUp/PgDn 步长 + 分块走查用）
+var g_tui_visible_row0: usize = 0;       // 上一帧窗口首行在「总行」坐标里的序号
+var g_tui_visible_total: usize = 0;      // 上一帧的总行数
+
+export fn tui_scroll_up(lines: usize) void {
+    g_tui_scroll = g_tui_scroll + lines;
+    g_tui_follow_tail = false;
+    g_tui_pin_end_req = false;
+    tui_mark_dirty();
+}
+
+export fn tui_scroll_down(lines: usize) void {
+    if g_tui_scroll > lines {
+        g_tui_scroll = g_tui_scroll - lines;
+    } else {
+        g_tui_scroll = 0;
+    }
+    if g_tui_scroll == 0 {
+        g_tui_follow_tail = true;    // 回到最底 = 继续跟尾部
+    }
+    tui_mark_dirty();
+}
+
+export fn tui_scroll_home() void {
+    // 「顶」= 转录最老那一行。这里只给一个远超真总量的哨兵值，由 tui_auto_end_scroll
+    // 在同一帧里夹到精确的 max_scroll（`pin_top_req` 保证「恰好等于 max」也算命中）。
+    // 不要在这里自己算 max：溢出一旦发生，顶部要给 `^` 指示留一行，可用行数比上一帧
+    // 少一 —— 用上一帧的行数算出来的 max 会差一行（实测：总也差最后一行到不了顶）。
+    g_tui_scroll = 0x7FFFFFF0;
+    g_tui_follow_tail = false;
+    g_tui_pin_end_req = false;
+    g_tui_pin_top_req = true;
+    tui_mark_dirty();
+}
+
+export fn tui_scroll_end() void {
+    g_tui_scroll = 0;
+    g_tui_follow_tail = true;
+    g_tui_pin_end_req = true;     // 内容可能还在长：下一帧再钉一次真正的底
+    tui_mark_dirty();
+}
+
+export fn tui_scroll_pos() usize {
+    return g_tui_scroll;
+}
+
+
+// 一「页」滚多少行 = 上一帧转录区实际行数（至少 2）。老实现写死 5 行，
+// 在 100×30 的窗口里 PgUp 只动 5 行 —— 用户按了跟没按差不多。
+fn tui_page_rows() usize {
+    if g_tui_visible_rows >= 2 {
+        return g_tui_visible_rows;
+    }
+    return 2;
+}

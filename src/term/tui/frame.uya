@@ -1,0 +1,572 @@
+// src/term/tui/frame.uya — 全屏 TUI：行编码 / 帧 diff / 终端控制 / 文本快照
+//
+// 本文件：行编码（段 → SGR + 文本）、帧 diff（与 g_tui_prev 比、只重画脏行）、整帧写出、
+//   终端侧（备用屏幕 / 尺寸 / 光标），以及把当前帧转成**纯文本快照**（`--tui-demo` 打文档、
+//   自测逐字节断言都走它 —— 所以它必须与画帧同源，否则断言绿而屏幕错）。
+// 不变量：帧输出走私有 fd；擦除用逐行 `ESC[2K`，不用 `ESC[J]`；快照里绝不出现 ESC / NUL。
+// 依赖：style、term/tty、libc。
+
+use libc.syscall;
+use libc.unistd;
+use libc.heap;
+
+// ============================================================
+// SGR / 行编码 / 帧输出
+// ============================================================
+
+fn tui_dec_into(dst: &byte, v: i64) usize {
+    var tmp: [byte: 24] = [0: 24];
+    const DIG: [byte: 10] = [48, 49, 50, 51, 52, 53, 54, 55, 56, 57];
+    var n: i64 = v;
+    var i: usize = 0;
+    if n == 0 {
+        tmp[0] = 48;
+        i = 1;
+    }
+    while n > 0 && i < 24 {
+        const q: i64 = n / (10 as i64);
+        const d: i64 = n - (q * (10 as i64));
+        var di: usize = 0;
+        if d > 0 && d < 10 {
+            di = d as usize;
+        }
+        tmp[i] = DIG[di];
+        n = q;
+        i = i + 1;
+    }
+    var k: usize = 0;
+    while i > 0 {
+        i = i - 1;
+        dst[k] = tmp[i];
+        k = k + 1;
+    }
+    return k;
+}
+
+// 把样式编码成 SGR 字节串写进 dst，返回长度（0 = 默认样式，不需要序列）
+fn tui_sgr_into(dst: &byte, style: u8) usize {
+    if !g_tui_color_on {
+        // 无色模式：只保留属性（粗体/暗/斜/删除线），颜色全丢
+        if style == TUI_ST_BOLD || style == TUI_ST_USER || style == TUI_ST_H1 {
+            dst[0] = 27; dst[1] = 91; dst[2] = 49; dst[3] = 109;
+            return 4;
+        }
+        if style == TUI_ST_ITALIC {
+            dst[0] = 27; dst[1] = 91; dst[2] = 51; dst[3] = 109;
+            return 4;
+        }
+        if style == TUI_ST_STRIKE {
+            dst[0] = 27; dst[1] = 91; dst[2] = 57; dst[3] = 109;
+            return 4;
+        }
+        if style == TUI_ST_DIM || style == TUI_ST_HINT || style == TUI_ST_FOOTER
+            || style == TUI_ST_CODE || style == TUI_ST_TOOL {
+            dst[0] = 27; dst[1] = 91; dst[2] = 50; dst[3] = 109;
+            return 4;
+        }
+        return 0;
+    }
+    const base: usize = (style as usize) * 8;
+    var codes: [i32: 8] = [-1, -1, -1, -1, -1, -1, -1, -1];
+    var i: usize = 0;
+    while i < 8 {
+        const idx: usize = base + i;
+        if idx < TUI_SGR16_LEN {
+            if g_tui_color256 {
+                codes[i] = TUI_SGR256[idx];
+            } else {
+                codes[i] = TUI_SGR16[idx];
+            }
+        }
+        i = i + 1;
+    }
+    if codes[0] < 0 {
+        return 0;
+    }
+    var k: usize = 0;
+    dst[k] = 27; k = k + 1;
+    dst[k] = 91; k = k + 1;
+    var first: bool = true;
+    i = 0;
+    while i < 8 {
+        if codes[i] >= 0 {
+            if !first {
+                dst[k] = 59; k = k + 1;
+            }
+            first = false;
+            k = k + tui_dec_into(&dst[k], codes[i] as i64);
+        }
+        i = i + 1;
+    }
+    dst[k] = 109; k = k + 1;
+    return k;
+}
+
+// 把第 r 行编码成「带 SGR 的字节串」追加到 g_tui_out
+fn tui_encode_row(r: usize) void {
+    if r >= TUI_MAX_ROWS {
+        return;
+    }
+    g_tui_out_off[r] = g_tui_out.len;
+    if r >= g_tui_nrows {
+        return;
+    }
+    const row: TuiRow = g_tui_rowtab[r];
+    // P36：8 个 SGR 参数 + 分隔符最多约 50 字节（256 色的「前景+背景」是 6 个参数）
+    var sgr: [byte: 64] = [0: 64];
+    var cur_style: u8 = 255;
+    var i: usize = 0;
+    var off: usize = g_tui_rowtab[r].text_off;
+    while i < row.seg_n {
+        const si: usize = row.seg_start + i;
+        // 证明器只认「正的 if 里做索引」（README 踩坑 6）：写成 if seg 合法 { … }
+        if si < TUI_MAX_SEGS {
+            const seg: TuiSeg = g_tui_segs[si];
+            if seg.style != cur_style {
+                if cur_style != 255 {
+                    // 从有色切到另一个色：先复位再上新色（避免属性叠加）
+                    _ = buf_append(&g_tui_out, &TUI_SEQ_RESET[0], 4);
+                }
+                const n: usize = tui_sgr_into(&sgr[0], seg.style);
+                if n > 0 {
+                    _ = buf_append(&g_tui_out, &sgr[0], n);
+                }
+                cur_style = seg.style;
+            }
+            _ = buf_append(&g_tui_out, g_tui_text.ptr + off, seg.len);
+            off = off + seg.len;
+        }
+        i = i + 1;
+    }
+    if cur_style != 255 && cur_style != TUI_ST_DEFAULT {
+        _ = buf_append(&g_tui_out, &TUI_SEQ_RESET[0], 4);
+    }
+    g_tui_out_off[r + 1] = g_tui_out.len;
+}
+
+fn tui_row_bytes_eq(r: usize) bool {
+    if r >= g_tui_prev_nrows {
+        return false;
+    }
+    if r + 1 > TUI_MAX_ROWS {
+        return false;
+    }
+    const a0: usize = g_tui_out_off[r];
+    const a1: usize = g_tui_out_off[r + 1];
+    const b0: usize = g_tui_prev_off[r];
+    const b1: usize = g_tui_prev_off[r + 1];
+    if (a1 - a0) != (b1 - b0) {
+        return false;
+    }
+    return bufx_mem_eq(g_tui_out.ptr + a0, g_tui_prev.ptr + b0, a1 - a0);
+}
+
+// 移动光标到 (r, c)（1 基，c 是**列**不是字节）
+fn tui_cursor_to(dst: &Buf, r: usize, c: usize) void {
+    var num: [byte: 24] = [0: 24];
+    _ = buf_append_byte(dst, 27);
+    _ = buf_append_byte(dst, 91);
+    const n1: usize = tui_dec_into(&num[0], (r + 1) as i64);
+    _ = buf_append(dst, &num[0], n1);
+    _ = buf_append_byte(dst, 59);
+    const n2: usize = tui_dec_into(&num[0], (c + 1) as i64);
+    _ = buf_append(dst, &num[0], n2);
+    _ = buf_append_byte(dst, 72);   // 'H'
+}
+
+// 光标最终落点（输入框内的插入点，列的**显示列**）
+var g_tui_cursor_row: usize = 0;
+var g_tui_cursor_col: usize = 0;
+// 可见性**只跟浮层走**，不跟运行状态走 —— 运行中插入点仍是活的打字目标
+// （运行中敲的字进输入编辑器 / steer 收件箱，ask_user_question 也是用输入行回答），
+// 以前按 `run == IDLE` 隐藏，屏幕上就是「能打字却看不见光标」。口径见 tui_cursor_place()。
+var g_tui_cursor_on: bool = true;
+
+export fn tui_set_cursor(row: usize, col: usize, visible: bool) void {
+    g_tui_cursor_row = row;
+    g_tui_cursor_col = col;
+    g_tui_cursor_on = visible;
+}
+
+// 本帧的光标可见性（自测断言用；`tui_flush` 按它决定发 `?25h` 还是 `?25l`）
+export fn tui_caret_visible() bool {
+    return g_tui_cursor_on;
+}
+
+// 把整帧编码好并只把**变化的行**写出去
+export fn tui_flush() void {
+    if !g_tui_on || g_tui_out_fd < 0 {
+        return;
+    }
+    tui_bufs_ensure();
+    buf_reset(&g_tui_out);
+    var r: usize = 0;
+    while r < g_tui_nrows {
+        tui_encode_row(r);
+        r = r + 1;
+    }
+    g_tui_out_off[g_tui_nrows] = g_tui_out.len;
+
+    var changed: usize = 0;
+    r = 0;
+    while r < g_tui_nrows {
+        if !tui_row_bytes_eq(r) {
+            changed = changed + 1;
+        }
+        r = r + 1;
+    }
+    const all: usize = g_tui_nrows;
+    const full: bool = (all > 0 && changed * 10 > all * 6) || g_tui_prev_nrows > g_tui_nrows;
+
+    var payload: Buf = buf_new(g_tui_out.len + 4096);
+    if !buf_valid(&payload) {
+        return;
+    }
+    if full {
+        _ = buf_append(&payload, &TUI_SEQ_CLEAR[0], 7);
+    }
+    r = 0;
+    while r < g_tui_nrows {
+        const skip: bool = !full && tui_row_bytes_eq(r);
+        if !skip {
+            tui_cursor_to(&payload, r, 0);
+            _ = buf_append(&payload, &TUI_SEQ_EL[0], 4);
+            _ = buf_append(&payload, g_tui_out.ptr + g_tui_out_off[r], g_tui_out_off[r + 1] - g_tui_out_off[r]);
+        }
+        r = r + 1;
+    }
+    // 多余的老行清掉
+    if g_tui_prev_nrows > g_tui_nrows {
+        r = g_tui_nrows;
+        while r < g_tui_prev_nrows {
+            tui_cursor_to(&payload, r, 0);
+            _ = buf_append(&payload, &TUI_SEQ_EL[0], 4);
+            r = r + 1;
+        }
+    }
+    if g_tui_cursor_on {
+        tui_cursor_to(&payload, g_tui_cursor_row, g_tui_cursor_col);
+        _ = buf_append(&payload, &TUI_SEQ_SHOW_CUR[0], 6);
+    } else {
+        _ = buf_append(&payload, &TUI_SEQ_HIDE_CUR[0], 6);
+    }
+    _ = sys_write(g_tui_out_fd, payload.ptr as *const byte, payload.len) catch {};
+    buf_free(&payload);
+
+    // 本帧成为「上一帧」
+    const tmp: Buf = g_tui_prev;
+    g_tui_prev = g_tui_out;
+    g_tui_out = tmp;
+    var k: usize = 0;
+    while k <= g_tui_nrows {
+        g_tui_prev_off[k] = g_tui_out_off[k];
+        k = k + 1;
+    }
+    g_tui_prev_nrows = g_tui_nrows;
+    g_tui_dirty = false;
+}
+
+// 强制下一帧全量重画（缩放、进入 TUI、外部改了屏幕之后用）
+export fn tui_invalidate() void {
+    g_tui_prev_nrows = 0;
+    g_tui_dirty = true;
+}
+
+// ============================================================
+// 终端（备用屏幕 / 尺寸）
+// ============================================================
+
+const TUI_TIOCGWINSZ: i64 = 0x5413;
+
+export struct TuiWinsize {
+    ws_row: u16,
+    ws_col: u16,
+    ws_x: u16,
+    ws_y: u16,
+}
+
+export fn tui_size_refresh() bool {
+    var ws: TuiWinsize = TuiWinsize{ ws_row: 0, ws_col: 0, ws_x: 0, ws_y: 0 };
+    const r: !i32 = sys_ioctl(0, TUI_TIOCGWINSZ, (@usize_from_ptr(&ws as &void)) as i64);
+    const rc: i32 = r catch { -1; };
+    if rc != 0 || ws.ws_col == 0 {
+        return false;
+    }
+    var rows: usize = ws.ws_row as usize;
+    if rows == 0 {
+        rows = 24;
+    }
+    if rows > TUI_MAX_ROWS {
+        rows = TUI_MAX_ROWS;
+    }
+    const changed: bool = ws.ws_col as usize != g_tui_cols || rows != g_tui_rows;
+    g_tui_cols = ws.ws_col as usize;
+    g_tui_rows = rows;
+    if changed {
+        tui_invalidate();
+    }
+    return true;
+}
+
+// 鼠标上报（P25）：`ESC[?1000h` + `ESC[?1006h`（SGR 编码）。
+// 为什么必须开：DSH 的 web 终端是 xterm.js，**没有鼠标协议时它把滚轮转成 ↑/↓**
+// 发给我们（`buffer.hasScrollback == false` 那条路，见 xterm.js `bindMouse`），
+// 于是「滚轮向上」变成了输入历史 `↑` —— 屏幕上什么都不动，就是用户报的
+// 「工作区里文本不能滚动、翻不了旧日志」。开了 1000/1006 之后滚轮才以
+// `ESC[<64;x;yM` 的真身到达（我们只吃 64/65 两档，其余丢弃）。
+const TUI_MOUSE_ON: [byte: 16] = [
+    27, 91, 63, 49, 48, 48, 48, 104,   // ESC[?1000h
+    27, 91, 63, 49, 48, 48, 54, 104,   // ESC[?1006h
+];
+// 关掉鼠标上报（顺序与开启相反）
+const TUI_MOUSE_OFF: [byte: 16] = [
+    27, 91, 63, 49, 48, 48, 54, 108,   // ESC[?1006l
+    27, 91, 63, 49, 48, 48, 48, 108,   // ESC[?1000l
+];
+
+// 按当前开关写一条鼠标上报序列（ON/OFF 都是 16 字节）。out_fd 还没就绪就什么都不写。
+fn tui_mouse_write(on: bool) void {
+    if g_tui_out_fd < 0 {
+        return;
+    }
+    if on {
+        _ = sys_write(g_tui_out_fd, &TUI_MOUSE_ON[0], 16) catch {};
+    } else {
+        _ = sys_write(g_tui_out_fd, &TUI_MOUSE_OFF[0], 16) catch {};
+    }
+}
+
+// 踩坑 72：运行时开/关鼠标上报。关掉之后终端重新接管拖选 —— 用户就能选中 uya-agent
+// TUI 里的文本复制了；代价是滚轮不再以 `ESC[<64/65;..M` 到达（终端会把它转成 ↑/↓）。
+// 幂等：值没变就直接返回（不重复往终端写序列）。
+export fn tui_set_mouse(on: bool) void {
+    if on == g_tui_mouse {
+        return;
+    }
+    g_tui_mouse = on;
+    // 运行中立刻生效；还没进 TUI 就只记状态，tui_term_enter 会按它发序列。
+    if g_tui_on {
+        tui_mouse_write(on);
+    }
+}
+
+export fn tui_mouse_enabled() bool {
+    return g_tui_mouse;
+}
+
+// 进备用屏幕 + 开括起粘贴 +（默认）开鼠标上报 + 清屏
+export fn tui_term_enter(out_fd: i32) void {
+    var seq: [byte: 32] = [0: 32];
+    var k: usize = 0;
+    // ESC[?1049h
+    seq[0] = 27; seq[1] = 91; seq[2] = 63; seq[3] = 49; seq[4] = 48; seq[5] = 52; seq[6] = 57; seq[7] = 104;
+    k = 8;
+    _ = sys_write(out_fd, &seq[0] as *const byte, k) catch {};
+    var clear: [byte: 8] = [27, 91, 50, 74, 27, 91, 72, 0];   // ESC[2J ESC[H
+    _ = sys_write(out_fd, &clear[0] as *const byte, 7) catch {};
+    var paste: [byte: 8] = [27, 91, 63, 50, 48, 48, 52, 104]; // ESC[?2004h
+    _ = sys_write(out_fd, &paste[0] as *const byte, 8) catch {};
+    // 踩坑 72：鼠标上报是可关的（关掉才能用终端自己的拖选复制文本）
+    g_tui_out_fd = out_fd;
+    if g_tui_mouse {
+        tui_mouse_write(true);
+    }
+    g_tui_on = true;
+    tui_invalidate();
+}
+
+// 离开备用屏幕（关鼠标 → 关括起粘贴 → 复位 → 显示光标 → 1049l）
+export fn tui_term_leave(out_fd: i32) void {
+    var seq: [byte: 32] = [0: 32];
+    _ = sys_write(out_fd, &TUI_MOUSE_OFF[0], 16) catch {};
+    // ESC[?2004l
+    seq[0] = 27; seq[1] = 91; seq[2] = 63; seq[3] = 50; seq[4] = 48; seq[5] = 48; seq[6] = 52; seq[7] = 108;
+    // ESC[0m
+    seq[8] = 27; seq[9] = 91; seq[10] = 48; seq[11] = 109;
+    // ESC[?25h
+    seq[12] = 27; seq[13] = 91; seq[14] = 63; seq[15] = 50; seq[16] = 53; seq[17] = 104;
+    // ESC[?1049l
+    seq[18] = 27; seq[19] = 91; seq[20] = 63; seq[21] = 49; seq[22] = 48; seq[23] = 52; seq[24] = 57; seq[25] = 108;
+    _ = sys_write(out_fd, &seq[0] as *const byte, 26) catch {};
+    g_tui_on = false;
+}
+
+
+
+// ============================================================
+// 屏幕文本快照（自测断言 + --tui-demo 都用它：只要文本，不要转义）
+// ============================================================
+
+export fn tui_screen_text(out: &Buf) void {
+    buf_reset(out);
+    var r: usize = 0;
+    while r < g_tui_nrows {
+        const off: usize = tui_row_text_off(r);
+        const len: usize = tui_row_text_len(r);
+        _ = buf_append(out, g_tui_text.ptr + off, len);
+        _ = buf_append_byte(out, 10);
+        r = r + 1;
+    }
+}
+
+
+export fn tui_row_has(r: usize, lit: &const byte) bool {
+    if r >= g_tui_nrows {
+        return false;
+    }
+    const off: usize = tui_row_text_off(r);
+    const len: usize = tui_row_text_len(r);
+    const want: usize = bufx_cstr_len(lit);
+    if want == 0 || want > len {
+        return false;
+    }
+    var i: usize = 0;
+    while i + want <= len {
+        if bufx_mem_eq(g_tui_text.ptr + off + i, lit, want) {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+export fn tui_nrows() usize {
+    return g_tui_nrows;
+}
+
+
+
+// 窗口首行在「总行」坐标里的序号（0 = 已经在最顶）与两个溢出方向 —— 自测断言用
+export fn tui_start_line() usize {
+    return g_tui_visible_row0;
+}
+
+export fn tui_more_above() bool {
+    return g_tui_more_above;
+}
+
+
+// 取一行的文本（自测断言逐行内容用）
+export fn tui_row_text(r: usize, out: &Buf) void {
+    if r >= g_tui_nrows {
+        return;
+    }
+    const off: usize = tui_row_text_off(r);
+    const len: usize = tui_row_text_len(r);
+    _ = buf_append(out, g_tui_text.ptr + off, len);
+}
+
+// 一个 TUI 会话进出终端时写的**全部**终端序列（进入 + 离开）。
+// 自测用它逐字节验证「鼠标上报开/关、括起粘贴开/关、备用屏幕进出」这一组开关。
+// 注意：原地往 out 里追加，不 reset（调用方自己清）。
+export fn tui_term_text(out: &Buf) void {
+    _ = buf_append(out, &TUI_MOUSE_ON[0], 16);
+    _ = buf_append(out, &TUI_MOUSE_OFF[0], 16);
+    // 进：ESC[?1049h + ESC[2J ESC[H + ESC[?2004h
+    var enter: [byte: 24] = [0: 24];
+    var k: usize = 0;
+    enter[k] = 27; k = k + 1;
+    enter[k] = 91; k = k + 1;
+    enter[k] = 63; k = k + 1;
+    enter[k] = 49; k = k + 1;
+    enter[k] = 48; k = k + 1;
+    enter[k] = 52; k = k + 1;
+    enter[k] = 57; k = k + 1;
+    enter[k] = 104; k = k + 1;
+    _ = buf_append(out, &enter[0], k);
+    _ = buf_append(out, &TUI_SEQ_CLEAR[0], 7);
+    var paste_on: [byte: 8] = [27, 91, 63, 50, 48, 48, 52, 104];
+    _ = buf_append(out, &paste_on[0], 8);
+    // 离：ESC[?2004l ESC[0m ESC[?25h ESC[?1049l
+    var leave: [byte: 26] = [0: 26];
+    k = 0;
+    leave[k] = 27; k = k + 1;
+    leave[k] = 91; k = k + 1;
+    leave[k] = 63; k = k + 1;
+    leave[k] = 50; k = k + 1;
+    leave[k] = 48; k = k + 1;
+    leave[k] = 48; k = k + 1;
+    leave[k] = 52; k = k + 1;
+    leave[k] = 108; k = k + 1;
+    leave[k] = 27; k = k + 1;
+    leave[k] = 91; k = k + 1;
+    leave[k] = 48; k = k + 1;
+    leave[k] = 109; k = k + 1;
+    leave[k] = 27; k = k + 1;
+    leave[k] = 91; k = k + 1;
+    leave[k] = 63; k = k + 1;
+    leave[k] = 50; k = k + 1;
+    leave[k] = 53; k = k + 1;
+    leave[k] = 104; k = k + 1;
+    leave[k] = 27; k = k + 1;
+    leave[k] = 91; k = k + 1;
+    leave[k] = 63; k = k + 1;
+    leave[k] = 49; k = k + 1;
+    leave[k] = 48; k = k + 1;
+    leave[k] = 52; k = k + 1;
+    leave[k] = 57; k = k + 1;
+    leave[k] = 108; k = k + 1;
+    _ = buf_append(out, &leave[0], k);
+}
+
+export fn tui_row_cols_n(r: usize) usize {
+    return tui_row_cols_at(r);
+}
+
+// 行文本里有没有 ESC（不变量：正文层永远是纯文本）
+export fn tui_row_blank(r: usize) bool {
+    if r >= g_tui_nrows {
+        return false;
+    }
+    const off: usize = tui_row_text_off(r);
+    const len: usize = tui_row_text_len(r);
+    var i: usize = 0;
+    while i < len {
+        if g_tui_text.ptr[off + i] != 32 as byte {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+export fn tui_rows_have_esc() bool {
+    var i: usize = 0;
+    while i < g_tui_text.len {
+        if g_tui_text.ptr[i] == 27 as byte {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+// 踩坑 81：帧里有没有「行内的 '\n'」。正文层的每一行是 g_tui_text 里的一段，行与行之间由
+// **行号**分开（g_tui_rowtab），不是靠字节里的 '\n' —— 段内再出现 '\n'，终端就把它当换行，
+// 那一行被拆成两行画出来、后一行从第 0 列开始，方框的右边框再也对不齐（用户报的「文本跑出
+// 框外」）。所以这是一条与「无 ESC / 无 NUL」并列的不变量，自测逐帧断言。
+export fn tui_rows_have_lf() bool {
+    var i: usize = 0;
+    while i < g_tui_text.len {
+        if g_tui_text.ptr[i] == 10 as byte {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+// 行文本里有没有 NUL（不变量：正文层没有 NUL）。
+// 手写字面量长度写大了会越界读进相邻的只读常量（先是一串 NUL，再是下一个字符串
+// 字面量 —— /status 浮层标题就曾经把 `<system-reminder>` 挂在标题栏上），所以这条
+// 断言是那一类缺陷的通用闸门。
+export fn tui_rows_have_nul() bool {
+    var i: usize = 0;
+    while i < g_tui_text.len {
+        if g_tui_text.ptr[i] == 0 as byte {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}

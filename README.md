@@ -121,8 +121,9 @@ recipe 的环境，包括 `make selftest`（它内部 fork bash、由 agent 自�
 ```bash
 export UYA_ROOT=/home/winger/uya-0.10/lib/
 export UYA_SPLIT_C_DIR=$PWD/build/uyacache      # 多文件 C 缓存别丢在仓库根目录
+# 文件清单以 Makefile 的 SRC 为准（按域分目录；手抄的清单一定会过期）
 LDFLAGS=-static \
-  /home/winger/uya-0.10/bin/uya build src/agent.uya src/httpc.uya src/jsonx.uya src/tools.uya src/selftest.uya -o build/uya-agent
+  /home/winger/uya-0.10/bin/uya build $(make -s print-src) -o build/uya-agent
 readelf -lW build/uya-agent | grep -c INTERP    # 0 = 真静态
 ```
 
@@ -221,64 +222,99 @@ REPL / TUI 内的斜杠命令：
 
 ## 2. 代码结构
 
+`src/` 按**域**分目录（一个文件一个职责，规范见 [CODING.md](CODING.md)）。
+Uya 是「目录即模块」且**跨目录合并命名空间**，所以搬文件进子目录不需要改代码里的
+`export` / `use`。两个约束（都是实测出来的，见 CODING.md §2）：
+**文件顺序有意义** —— `if c { CONST_A } else { CONST_B }` 要求常量所在文件**排在前面**，
+否则报「期望类型 u8，推断为 void」（本仓把 `style.uya` 排到使用者之后就当场红）；
+**显式输入文件数上限 64** —— 第 65 个开始报「收集模块依赖失败」，报错指不到根因。
+所以 `SRC` 里 `term/tui/` 与 `diff/` 两块是**按依赖序**排的，不是字母序。
+
 ```
-src/bufx.uya       字节层：Buf、拼接、进制、UTF-8 计数与切片
-src/jsonx.uya      JSON：Writer 组装、Value 取值、`sv_unescape` 反转义
-src/httpc.uya      传输层：URL/DNS/TLS、请求构造、leaf 指纹
-src/httpstream.uya 流式传输：只读响应头，body 增量解码
-src/sse.uya        SSE 分帧：字段行、多行 data、空行 dispatch
-src/llm.uya        两种协议归一成 ChatOut（chat/completions 与 /v1/responses）
-src/imgx.uya       P51 图片附件（纯函数）：魔数嗅探 + 尺寸解析（PNG IHDR / JPEG 段链 /
-                   GIF / WebP 三变体，只读文件头）+ 预算判定 + 内容寻址落盘 + base64 +
-                   附件表（路径 + 元数据，JSON 往返）+ 占位文案
-src/clipx.uya      P52 剪贴板（纯 Uya 的 X11 客户端）：DISPLAY/Xauthority 认证 + setup 握手 +
-                   InternAtom/CreateWindow/ConvertSelection/GetProperty（含 INCR）
-src/tty.uya        终端层：termios raw、行编辑器、面板块、标题栈、诊断转义
-src/sigx.uya       信号层：自绑 sigaction、终止信号先还终端、SIGWINCH 置标志
-src/tui.uya        全屏 TUI：帧 diff、转录、浮层、状态区、任务块、翻看、鼠标上报开关（F2 / /mouse）；
-                   P53 浮层全屏（ctrl+f / F11，几何收在 tui_ov_box_w 一处）；
-                   条目折行挂行偏移表（取行 O(1)，长条目成帧见 §6 的 P47 条）
-src/mdview.uya     P47 markdown 渲染（纯函数）：块级分类 + 行内强调 + GFM 表格 + 按显示列折行，
-                   一次产出「行文本 + 逐字节样式」两份等长缓冲（样式落在字节上 ⇒ 折行/滚动不丢状态）
-src/sigselftest.uya 信号自测轮：sig-abi / sig-basic / sig-term-restore / sig-child-reset
-src/shellselftest.uya bash 进程侧自测：bash-detach / bash-stop-recover / bash-kill-tree
-src/tuiselftest.uya TUI 自测轮：tui-frame / tui-keys / tui-sink / tui-turn / tui-status / tui-cmd / tui-plan / tui-exit / tui-quit / tui-tasks / tui-diff / tui-scroll / tui-pty / tty-title-pty / tui-switch / tui-mouse / tui-md / tui-full
-src/inbox.uya      输入收件箱：steer（step 边界领取）+ keepInbox
-src/yamlcfg.uya    自带 YAML 子集解析器（`yt_key` 取 map 键名）
-src/modelx.uya     模型目录 P37：settings.yaml → McEntry，只认公布的档位
-src/fsx.uya        文件工具：路径守卫、版本表、流式窗口 read
-src/shellx.uya     bash 工具：bash -c / workdir / timeoutMs / run_in_background、bwrap、DSH_* 注入
-src/jobs.uya       后台任务表：job_list / job_output / job_kill，尾部 1 MiB
-src/search.uya     glob / grep：rg 子进程、VCS 排除、条数与行长上限
-src/dshsess.uya    读 DSH 会话：扫 <DSH_HOME>/sessions、zstd 走 /usr/bin/unzstd
-src/dshcfg.uya     读 DSH 设置：settings.yaml、.credentials.yaml、.env、permission.defaultPreset
-src/workflow.uya   workflow：.ush 脚本 + 自包含 hooks.uya + 127.0.0.1 钩子端口
-src/deleg.uya      子代理：fork 不 exec、增量读、send_message、ralph
-src/goal.uya       会话目标：goal.json、id+revision 校验、blocked ≥3 轮、goal_cmd_run
-src/skill.uya      技能：5 个发现根、SKILL.md front-matter、注入模板
-src/webx.uya       web_search：Anthropic 兼容 Messages API + web_search 工具
-src/compact.uya    上下文管理：剪枝 8192/4096/1024 码点、压缩、checkpoint
-src/prompt.uya     system prompt 分节装配（order / 空节丢弃 / 变量替换）
-src/instr.uya      AGENTS.md / CLAUDE.md 发现与 65536 字节预算截断
-src/todo.uya       todo_write：整表替换、去重与状态校验；会话级状态（换会话即清空）
-src/plan.uya       plan 状态机 + 写闸门 plan_blocks_write + exit_plan_mode
-src/perm.uya       访问模式 P21：read-only / workspace-write / danger-full-access
-src/sandboxx.uya   内核沙箱 P21：bwrap 探测与 profile、不可用 fail closed
-src/askuser.uya    ask_user_question（P43 TUI 弹窗 + P45 框宽自适应 + 踩坑 81 长/多行不溢出 + 三条回落通道）/ ask_approve_action
-src/session.uya    会话日志：追加写、索引、崩溃裁剪、sess_open_resume
-src/stats.uya      统计折叠 P20：sessionStats / tokenUsage / StatsLine
-src/procx.uya      进程采样 P20/P24：/proc 算 CPU（USER_HZ=100）与 PSS
-src/gitx.uya       只读跑 git P28：10s 超时、双管道收取
-src/worktreex.uya  Git worktree P37 / 残留回收 P49：wt_provision / finish / discard /
-                   wt_reclaim_own（退出时）· wt_reclaim_scan（目录 + 孤儿分支两遍）、写闸门
-src/gitdiff.uya    /diff 数据模型 P28：status --porcelain -z + diff -U100000 HEAD
-src/diffx.uya      行级 diff（只服务显示）：LCS 60×60、截断
-src/tasks.uya      任务状态 P25：四表折叠成折叠行 / 箱体 / `/tasks` 文本
-src/watch.uya      P42 /watch：事件渲染（纯函数）+ 子代理会话日志的增量读；P46 现役清单行 → 编号（纯函数）
-src/view.uya       显示层：标题/参数/后缀表、单行转录、思考行、agents 面板
-src/agent.uya      CLI、历史、主循环、工具分发、REPL、会话事件；P54 退化响应（空回复）的
-                   证据 + 同一步重发一次（`agent_note_degenerate` / `STEP_RETRY`）
-src/selftest.uya   mock LLM + 150 轮断言 + --probe
+# ---- foundation/ ----
+src/foundation/bufx.uya           字节层：Buf、拼接、进制、UTF-8 计数与切片
+src/foundation/jsonx.uya          JSON：Writer 组装、Value 取值、`sv_unescape` 反转义
+src/foundation/yamlcfg.uya        自带 YAML 子集解析器（`yt_key` 取 map 键名）
+
+# ---- net/ ----
+src/net/httpc.uya          传输层：URL/DNS/TLS、请求构造、leaf 指纹
+src/net/httpstream.uya     流式传输：只读响应头，body 增量解码
+src/net/llm.uya            两种协议归一成 ChatOut（chat/completions 与 /v1/responses）
+src/net/sse.uya            SSE 分帧：字段行、多行 data、空行 dispatch
+src/net/webx.uya           web_search：Anthropic 兼容 Messages API + web_search 工具
+
+# ---- term/ ----
+src/term/mdview.uya         P47 markdown 渲染（纯函数）：块级分类 + 行内强调 + GFM 表格 + 按显示列折行，
+src/term/tasks.uya          任务状态 P25：四表折叠成折叠行 / 箱体 / `/tasks` 文本
+src/term/tty.uya            终端层：termios raw、行编辑器、面板块、标题栈、诊断转义
+
+# ---- term/tui/（按依赖序，与 Makefile 的 SRC 一致）----
+src/term/tui/style.uya      TUI 样式/帧模型/拼帧基元（SGR 表、TuiSeg/TuiRow、按显示列前进）
+src/term/tui/keys.uya       键解码（字节流→按键事件）+ 输入编辑器（UTF-8 字符编辑、按显示列定位）
+src/term/tui/frame.uya      SGR 行编码 / 帧 diff（只重画脏行）/ 终端控制 + 屏幕文本快照（--tui-demo 与自测的基准）
+src/term/tui/entry.uya      转录条目 / NOTICE / 控制字节清洗 / 折行 / 行渲染（mdview 前缀分类）+ 写入 sink
+src/term/tui/screen.uya     滚动（贴尾跟随 / 上滚停跟随）+ 拼整屏（状态区+转录+面板+脚注）
+src/term/tui/overlay.uya    浮层几何（P53 唯一来源）+ 行偏移表（踩坑 68：取第 i 行 O(1)）+ 命令面板/会话/帮助 + reader（P26 计划审阅）
+src/term/tui/status.uya     会话状态区（P18 常驻）+ 脚注 + logo + 输入面板
+src/term/tui/ask.uya        ask 型浮层（P43 弹窗 / P45 框宽自适应 / 踩坑 81 长内容不溢出）+ input 型浮层（P48）
+src/term/tui/watch.uya      /watch 跟随子代理的实时过程消息（P42）
+src/term/tui/diff.uya       /diff 浮窗（P27/P28）：左列表 + 右两栏全文比对，n/N 跳改动
+src/term/tui/hook.uya       按键→行为 / 读键盘 / 清转录（P39）/ 自测复位 / 启动·收尾·每帧 tick
+
+src/term/view.uya           打开/刷新/查询/选择滚动/跨改动跳转（n·N）/非 TUI 单列文本回退
+src/term/watch.uya          /watch 跟随子代理的实时过程消息（P42）
+
+# ---- vcs/ ----
+src/vcs/gitx.uya           只读跑 git P28：10s 超时、双管道收取
+src/vcs/worktreex.uya      Git worktree P37 / 残留回收 P49：wt_provision / finish / discard /
+
+# ---- tools/ ----
+src/tools/askuser.uya        ask_user_question（P43 TUI 弹窗 + P45 框宽自适应 + 踩坑 81 长/多行不溢出 + 三条回落通道）/ ask_approve_action
+src/tools/fsx.uya            文件工具：路径守卫、版本表、流式窗口 read
+src/tools/jobs.uya           后台任务表：job_list / job_output / job_kill，尾部 1 MiB
+src/tools/perm.uya           访问模式 P21：read-only / workspace-write / danger-full-access
+src/tools/sandboxx.uya       内核沙箱 P21：bwrap 探测与 profile、不可用 fail closed
+src/tools/search.uya         glob / grep：rg 子进程、VCS 排除、条数与行长上限
+src/tools/shellx.uya         bash 工具：bash -c / workdir / timeoutMs / run_in_background、bwrap、DSH_* 注入
+
+# ---- session/ ----
+src/session/dshcfg.uya         读 DSH 设置：settings.yaml、.credentials.yaml、.env、permission.defaultPreset
+src/session/dshsess.uya        读 DSH 会话：扫 <DSH_HOME>/sessions、zstd 走 /usr/bin/unzstd
+src/session/inbox.uya          输入收件箱：steer（step 边界领取）+ keepInbox
+src/session/modelx.uya         模型目录 P37：settings.yaml → McEntry，只认公布的档位
+src/session/procx.uya          进程采样 P20/P24：/proc 算 CPU（USER_HZ=100）与 PSS
+src/session/session.uya        会话日志：追加写、索引、崩溃裁剪、sess_open_resume
+src/session/sigx.uya           信号层：自绑 sigaction、终止信号先还终端、SIGWINCH 置标志
+src/session/stats.uya          统计折叠 P20：sessionStats / tokenUsage / StatsLine
+
+# ---- agent/ ----
+src/agent/agent.uya          CLI、历史、主循环、工具分发、REPL、会话事件；P54 退化响应（空回复）的
+src/agent/compact.uya        上下文管理：剪枝 8192/4096/1024 码点、压缩、checkpoint
+src/agent/deleg.uya          子代理：fork 不 exec、增量读、send_message、ralph
+src/agent/goal.uya           会话目标：goal.json、id+revision 校验、blocked ≥3 轮、goal_cmd_run
+src/agent/instr.uya          AGENTS.md / CLAUDE.md 发现与 65536 字节预算截断
+src/agent/plan.uya           plan 状态机 + 写闸门 plan_blocks_write + exit_plan_mode
+src/agent/prompt.uya         system prompt 分节装配（order / 空节丢弃 / 变量替换）
+src/agent/skill.uya          技能：5 个发现根、SKILL.md front-matter、注入模板
+src/agent/todo.uya           todo_write：整表替换、去重与状态校验；会话级状态（换会话即清空）
+src/agent/workflow.uya       workflow：.ush 脚本 + 自包含 hooks.uya + 127.0.0.1 钩子端口
+
+# ---- media/ ----
+src/media/clipx.uya          P52 剪贴板（纯 Uya 的 X11 客户端）：DISPLAY/Xauthority 认证 + setup 握手 +
+src/media/imgx.uya           P51 图片附件（纯函数）：魔数嗅探 + 尺寸解析（PNG IHDR / JPEG 段链 /
+
+# ---- selftest/ ----
+src/selftest/selftest.uya       mock LLM + 150 轮断言 + --probe
+src/selftest/shellselftest.uya  bash 进程侧自测：bash-detach / bash-stop-recover / bash-kill-tree
+src/selftest/sigselftest.uya    信号自测轮：sig-abi / sig-basic / sig-term-restore / sig-child-reset
+src/selftest/tuiselftest.uya    TUI 自测轮：tui-frame / tui-keys / tui-sink / tui-turn / tui-status / tui-cmd / tui-plan / tui-exit / tui-quit / tui-tasks / tui-diff / tui-scroll / tui-pty / tty-title-pty / tui-switch / tui-mouse / tui-md / tui-full
+
+# ---- diff/（/diff 显示层，按依赖序）----
+src/diff/model.uya      数据模型（GdRow/GdRun）+ 上限常量 + g_gd_* 状态 + ensure/reset + 小工具 + 文件列表（status+numstat）+ 标题工作区短路径 + 假数据注入
+src/diff/gitcmd.uya     git 子进程（rev-parse / status -z / numstat -z / diff -U），只读
+src/diff/rows.uya       unified diff → 行表：删块/增块配对成 MIX/DEL/ADD/CTX/HDR
+src/diff/view.uya       打开/刷新/查询/选择滚动/跨改动跳转（n·N）/非 TUI 单列文本回退
+src/diff/render.uya     write/edit 的 diff 正文（LCS 60×60）+ 采集与取走（init/note/take/clear）
 ```
 
 > 两处已知死代码（P14 起未清理）：`src/tools.uya` 的 `read_file`/`write_file`/`run_shell`、`agent.uya` 的 `dispatch_tool`（无调用者）。
@@ -288,7 +324,7 @@ src/selftest.uya   mock LLM + 150 轮断言 + --probe
 * 工具行 `<字形> <Title> · <摘要><后缀>`：`✓` 成功 / `✗` 失败 / `●` 运行中。
 * 标题按工具映射（`Read` / `Bash` / `Subagent` / `WebSearch` / `Workflow`…），`bash` 摘要优先取 `description`。
 * 后缀如 `· exit 1`、`· timed out`、`· +4 -0`，兜底 `· N lines`；失败看 `Error: ` 前缀或 `[exit code: N≠0]`。
-* 正文默认关闭，`--tool-lines N`（N>0）才 append；diff 在 `src/diffx.uya`（LCS 上限 60×60）。
+* 正文默认关闭，`--tool-lines N`（N>0）才 append；diff 在 `src/diff/body.uya`（LCS 上限 60×60）。
 * 思考只显示一行（`latestLine` / `firstLine`），全文进 `assistant/reasoning`；宽度按 `tty_body_width()`（40–200 列）。
 
 ### 子代理窗口面板（P15）
@@ -367,7 +403,7 @@ src/selftest.uya   mock LLM + 150 轮断言 + --probe
   （stdlib 里没有 zlib/deflate），所以缩不小 —— 超预算只能**明确拒绝**并说清超了多少，
   让人自己压一下再来。当前模型 `input` 不含 `image` 时也直接拒（收了只会让请求 400）。
 * **剪贴板（P52）**：`ctrl+v`（TUI）与 `/paste`（两种模式）。本机没有 `xclip`/`xsel`/`wl-paste`，
-  所以是一个**纯 Uya 的 X11 客户端**（`src/clipx.uya`）：`DISPLAY` 解析 → `~/.Xauthority` 的
+  所以是一个**纯 Uya 的 X11 客户端**（`src/media/clipx.uya`）：`DISPLAY` 解析 → `~/.Xauthority` 的
   MIT-MAGIC-COOKIE-1 认证 → setup 握手 → `InternAtom` / `CreateWindow`(InputOnly) /
   `GetSelectionOwner` / `ConvertSelection` / `GetProperty`（含大数据的 `INCR` 增量）。
   目标优先级 `image/png` → `jpeg` → `gif` → `webp` → `UTF8_STRING`；图片走附件管线，
@@ -578,7 +614,7 @@ src/selftest.uya   mock LLM + 150 轮断言 + --probe
   回答语义对齐 DSH：单选有自定义回答就覆盖选项、多选两者都带、什么都不选直接回车 = 空 `selected`（跳过）、
   取消回的是 dismissed 文案（与 `no answer channel` 分开，模型才知道是「人不答」还是「渠道不通」）。
 * 数据流：`tty_write` 变 sink，通道 1/2/3 全进转录、fd 1 不写；帧走 `sys_dup(1)` 私有 fd。
-* **正文的 markdown 渲染（P47，`src/mdview.uya`）**：助手正文（转录里与 plan 审阅浮层里**同一份**）
+* **正文的 markdown 渲染（P47，`src/term/mdview.uya`）**：助手正文（转录里与 plan 审阅浮层里**同一份**）
   按 markdown 渲染 ——
   * **块级**：ATX 标题 1–6 级（去掉 `#` 号，1 级用专属色、2 级粗、3 级起暗）、`>` 引用（`▏ ` 前缀）、
     无序 / 有序 / 嵌套列表（每 2 列一层）、任务清单（`- [x]` → `✓ `、`- [ ]` → `· `）、
@@ -618,9 +654,9 @@ src/selftest.uya   mock LLM + 150 轮断言 + --probe
 * `ctx N%` = `min(100, round(used / contextWindow × 100))`，`used` = 最近一次请求的 prompt 规模 + 表层增量；**两者缺一就不显示**。`/status` 里有 `上下文已用 46%` + `~238K / 517K` + 20 格分段条 + 三行明细（`4 字符 ≈ 1 token` 启发式，三项之和 ≠ 总量）。
 * `cpu` 取 `/proc/<pid>/stat` 的 `utime + stime`（**不取** cutime/cstime，否则父子双计），`USER_HZ = 100` 是常数；`pct = Δticks × 1000 / Δms`，单核口径（并行可 > 100%，显示钳 0…999）；1 秒一次、只在 TUI 活跃时。
 * `内存` 取 `smaps_rollup` 的 `Pss:` 之和（子代理 fork 共享页不双计；无 `smaps_rollup` 时**整批**退回 `VmRSS:`），5 秒一次（算 PSS 要遍历页表），显示 `312M` / `1.2G`。
-* 采样与排版：`src/stats.uya` + `src/procx.uya` + `tui.uya` + `agent.uya` 的 `agent_bound_*`（同一毫秒值既进日志又进折叠）。
+* 采样与排版：`src/session/stats.uya` + `src/session/procx.uya` + `tui.uya` + `agent.uya` 的 `agent_bound_*`（同一毫秒值既进日志又进折叠）。
 
-**已知偏差**（`src/stats.uya` 里 `out_tokens <= 0` 那条分支）：输出 token「未上报」与「上报 0」在日志里不可区分，所以只有 `> 0` 才进解码与 tok/s；空串 delta、`delta:{}`、usage-only 帧不算首 token；解码窗口量的是客户端**看到** delta 的区间，网关把短回答攒成一批发时会偏小、数字偏高（会话级数字由长回答主导）；非流式（`--no-stream`）没有 delta 边界 ⇒ 第 3 组自然隐藏；`--resume-dsh` 导入的 DSH 会话事件形状不同，不折叠、统计从 0 开始。
+**已知偏差**（`src/session/stats.uya` 里 `out_tokens <= 0` 那条分支）：输出 token「未上报」与「上报 0」在日志里不可区分，所以只有 `> 0` 才进解码与 tok/s；空串 delta、`delta:{}`、usage-only 帧不算首 token；解码窗口量的是客户端**看到** delta 的区间，网关把短回答攒成一批发时会偏小、数字偏高（会话级数字由长回答主导）；非流式（`--no-stream`）没有 delta 边界 ⇒ 第 3 组自然隐藏；`--resume-dsh` 导入的 DSH 会话事件形状不同，不折叠、统计从 0 开始。
 
 **脚注退化表**（`--tui-demo` 八种画布下的真实脚注，cwd 是短路径 `~/uya-agent:main`）：统计行按 `" | "` 拆组、从**尾部**丢组并补 `…`；`ctx` / `cpu` **不参与丢组**，`内存` 只在放得下时才带，cwd 是唯一弹性字段，右半区 < 16 列时退回版本号。
 
@@ -725,7 +761,7 @@ src/selftest.uya   mock LLM + 150 轮断言 + --probe
 ### 模型选择与推理强度（P37）
 
 * 一次选择是 provider + model + reasoning effort 三元组，事实源是 DSH `settings.yaml`。
-* 目录 `src/modelx.uya` 把 `llm-pi-ai.providers.<prov>.models[]` 与 `llm-deepseek.models[]` 摊平成 `McEntry`。
+* 目录 `src/session/modelx.uya` 把 `llm-pi-ai.providers.<prov>.models[]` 与 `llm-deepseek.models[]` 摊平成 `McEntry`。
 * 档位只认模型公布的键，固定七档 `off`/`minimal`/`low`/`medium`/`high`/`xhigh`/`max`（`none` == `off`）。
 * `reasoningEfforts: false` = 非推理模型，界面不显示 Effort 行；`/effort` 只列公布的档位；`/model <名字>` 直接切，每次选择追一条 `session/model`。
 
@@ -828,7 +864,7 @@ src/selftest.uya   mock LLM + 150 轮断言 + --probe
 25. **「影响加载的 flag」必须预扫**：`--dsh-home`/`--no-dsh-config`/`--strict-dsh-config` 因解析顺序静默失效（`--print-config` 仍显示 `source: dsh-settings`）；主循环前预扫，回归 `make e2e-config-flags`。
 26. **「只压了一半」的历史是毒药**：`MSG_MAX = 64` 打满后 assistant(tool_calls) 已入史，端点永久回 `insufficient tool messages following tool_calls message`；追加要么成功要么整组回滚，尾部修复只丢不完整组（`hist_pairing_ok`）。
 27. **请求体少转义一个控制字节=会话报废**：NUL 被 `json_write_str_view`（只转义 `"` `\` `\n` `\r` `\t`）原样落进 content，网关回 `invalid character '\x00' in string literal`；自实现 RFC 8259 转义（`jw_str`），反转义走 `sv_unescape`。
-28. **`libc.signal.signal()` 处理器一收信号就 SIGSEGV**：裸 `rt_sigaction` 传 `sa_flags=0`/`sa_restorer=null`，缺 `SA_RESTORER = 0x04000000`；`src/sigx.uya` 声明宿主 `sigaction`（152 字节，`sig-abi` 断言）；工具链已修 `fad26acd`。
+28. **`libc.signal.signal()` 处理器一收信号就 SIGSEGV**：裸 `rt_sigaction` 传 `sa_flags=0`/`sa_restorer=null`，缺 `SA_RESTORER = 0x04000000`；`src/session/sigx.uya` 声明宿主 `sigaction`（152 字节，`sig-abi` 断言）；工具链已修 `fad26acd`。
 29. **装信号处理器后阻塞 `read` 返回 `EINTR` 不是 EOF**：一次 `SIGWINCH` 缩放就关掉 REPL；`catch |err|` 取 `@error_id(err)`，`== 4` 就 `continue`（`agent.uya`/`askuser.uya`）。
 30. **第 21 条的 fd 2 静音会把显示层一起静音**：`--show-reasoning` 从未生效（写在 `llm_apply_delta`，处 `tls_noise_mute` 窗口）；`tls_noise_mute` 把 `dup(2)` 记进 `g_err_fd`，view 层用 `err_fd()`。
 31. **多行块（子代理面板）擦除四条**：别用 `ESC[J`（会清可见正文）；块变矮禁「光标已在目标就不发」捷径；`cur_row` 相对块首存；列数从行首量起用 `tty_cols_between`。
@@ -953,9 +989,9 @@ src/selftest.uya   mock LLM + 150 轮断言 + --probe
    **为什么一直没红**：`worktree` 轮的既有断言是 `wt_finish("p37 merge" as &const byte, …)`
    —— 自测直接传**字面量**，字面量天然带 NUL，正好绕过这条契约；而真机走工具入口，
    message 是 JSON 解出来的，必踩。修法两处**都要**（各自单独回退都会让新轮当场红）：
-   ① `src/worktreex.uya` 的 `wt_finish` 在自己拼完 `cmsg` 后补一个 NUL（**契约在本函数收口**，
+   ① `src/vcs/worktreex.uya` 的 `wt_finish` 在自己拼完 `cmsg` 后补一个 NUL（**契约在本函数收口**，
    连带 `wt_do_commit` / `wt_merge_into_base` 两个下游消费者一起安全，默认说明那条分支同样受益）；
-   ② `src/agent.uya` 的 `worktree` 工具在把 `msg` 交给 `wt_finish` 前也补 NUL（调用方不赖账）。
+   ② `src/agent/agent.uya` 的 `worktree` 工具在把 `msg` 交给 `wt_finish` 前也补 NUL（调用方不赖账）。
    回归：新增 `worktree-tool-msg` 轮 —— 走**真工具入口**（`wt_tool_worktree` + JSON
    arguments，message 由 JSON 解出来）跑一次 finish，再用 `git log -1 --pretty=%s` 把
    提交说明读回来**逐字节**比对；读越界会多出后面的字节，断言当场红。
@@ -1115,7 +1151,7 @@ src/selftest.uya   mock LLM + 150 轮断言 + --probe
    而 DSH 自己的 README 明说 *"the discipline of keeping the list current are left to the
    model via the tool description"* —— 它刻意不写进 system prompt。**真正的差异在防线**：
    DSH 还有 `dsh-repeat-tool-reminder`（看工具调用重复）与 session projection 兜着，
-   uya-agent **两样都没有**；而 `src/prompt.uya` 原有 8 节（read/write/edit/glob/grep/bash/
+   uya-agent **两样都没有**；而 `src/agent/prompt.uya` 原有 8 节（read/write/edit/glob/grep/bash/
    jobs/finish）**没有一节讲 todo**。
    **为什么工具描述那句不够**：它说的是**事前**纪律（"mark a todo `completed` the moment it
    is done"），而「完成」那一刻注意力已经跳到下一个动作上 —— 事后没有任何东西回头看。
@@ -1192,7 +1228,7 @@ src/selftest.uya   mock LLM + 150 轮断言 + --probe
    > 机理对得上：fixture 目录按 pid 命名（`/tmp/selftest_p37_wt_<pid>`），而 `gitx` 对
    > 每次 git 调用有 **10 s 墙钟上限**（`GITX_TIMEOUT_MS`，超了 SIGKILL）—— 真机上
    > `git worktree add` 只要 8–9 ms，但同机并发跑着别的会话的 selftest/构建（load ~5–10）
-   > 时偶发超过 10 s 就整轮红。**没有**在这一轮动 `src/selftest.uya` —— 那属于既有 flake，
+   > 时偶发超过 10 s 就整轮红。**没有**在这一轮动 `src/selftest/selftest.uya` —— 那属于既有 flake，
    > 改了就跑题了；如实记在这里备查（`mine #1` 那次红在 `tui-plan` 的
    > 「审阅浮层里没有三个动作」，同样是 `tuis_drain` 有界轮询的时序快慢，不是链接问题）。
 
@@ -1205,9 +1241,9 @@ src/selftest.uya   mock LLM + 150 轮断言 + --probe
    tuiselftest.c:(.text+0x14487): undefined reference to `tuis_ask_opts'
    collect2: error: ld returned 1 exit status
    ```
-   两个符号**都在源码里定义得好好的**（`src/agent.uya:2637`、`src/tuiselftest.uya:5372`），
+   两个符号**都在源码里定义得好好的**（`src/agent/agent.uya:2637`、`src/selftest/tuiselftest.uya:5372`），
    `uya check` 也绿。表满时塞不进去的条目被丢掉，一直等到链接期才暴露 —— 报错点与被丢的东西
-   毫无关系。同一次实验里换一种写法还报过第三种形态：`src/tuiselftest.uya:(5372:1): 错误:
+   毫无关系。同一次实验里换一种写法还报过第三种形态：`src/selftest/tuiselftest.uya:(5372:1): 错误:
    顶层函数 reachable 集合已满`（这一句才像话，但它什么时候出现靠运气）。
    实测边界（同一台机器、同一份 uya 0.10、`make build` 清缓存重编）：
    | 形态 | 声明数 | 净增函数 | 结果 |

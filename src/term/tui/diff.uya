@@ -1,0 +1,1423 @@
+// src/term/tui/diff.uya — 全屏 TUI：/diff 浮窗（P27 / P28）
+//
+// 本文件：左侧文件列表 + 右侧旧/新两栏全文比对，底色标注增删，`n`/`N` 跳改动。
+//   数据来自 vcs/gitx + diff/（本文件只管画）。
+// 不变量：两栏竖线同列、改动行左右边界列相同（自测的逐字节判据）；行表指针每帧现取
+//   （diff 的 GdRow 指向最近一次解析的文本，跨帧缓存会读脏）。
+// 依赖：diff/view（gd_* 访问器）、overlay、entry。
+
+use libc.syscall;
+use libc.unistd;
+use libc.heap;
+
+// ============================================================
+// P27：/diff 浮窗（左侧文件列表 + 右侧旧/新两栏全文比对）
+//
+// 数据在 gitdiff.uya（gd_*），这里只管几何、按键与绘制：
+//   * 浮窗占满「转录区可用高度」（面板之上、状态区之外），绝不覆盖状态区；
+//   * 放不下（列数/行数不够）就 tui_overlay_diff_fits() = false，调用方不开浮窗
+//     —— 与既有的「浮窗画不出来却仍吞键」是同一类坑，宁可退化成文本回退；
+//   * 单元格文本一律经 tui_clean_into（ESC/TAB/控制字节/半截 UTF-8 都换掉），
+//     宽度按**显示列**算，画完补位到定长，保证竖线逐行对齐。
+// =====================================================
+
+const TUI_DIFF_COLS_MIN: usize = 60;
+const TUI_DIFF_ROWS_MIN: usize = 11;       // 可用行（浮窗高度 = 可用行 - 1，内容行 = 高度 - 4）
+const TUI_DIFF_GUTTER: usize = 6;          // 行号列：5 位 + 1 空格
+const TUI_DIFF_MARK: usize = 2;            // 左列表的 ▸ 标记列
+
+struct TuiDiffGeo {
+    w: usize,
+    left: usize,
+    list_w: usize,
+    sep1: usize,
+    cell1_x: usize,
+    cell_w: usize,
+    sep2: usize,
+    cell2_x: usize,
+    cell_w2: usize,
+    rows: usize,
+}
+
+var g_tui_dg: TuiDiffGeo = TuiDiffGeo{
+    w: 0, left: 0, list_w: 0, sep1: 0, cell1_x: 0, cell_w: 0,
+    sep2: 0, cell2_x: 0, cell_w2: 0, rows: 0
+};
+var g_tui_diff_tmp: Buf = Buf{ ptr: null, len: 0, cap: 0 };
+var g_tui_diff_txt: Buf = Buf{ ptr: null, len: 0, cap: 0 };
+var g_tui_dg_title: Buf = Buf{ ptr: null, len: 0, cap: 0 };
+// P36：配对行的「行内高亮」切分（前缀 / 变化段 / 后缀，都指向 g_tui_diff_tmp）
+var g_tui_diff_lp: &const byte = "" as &const byte;
+var g_tui_diff_ln: usize = 0;
+var g_tui_diff_lpre: usize = 0;
+var g_tui_diff_lmid: usize = 0;
+var g_tui_diff_rp: &const byte = "" as &const byte;
+var g_tui_diff_rn: usize = 0;
+var g_tui_diff_rpre: usize = 0;
+var g_tui_diff_rmid: usize = 0;
+
+fn tui_diff_ensure() void {
+    if !buf_valid(&g_tui_diff_tmp) { g_tui_diff_tmp = buf_new(8192); }
+    if !buf_valid(&g_tui_diff_txt) { g_tui_diff_txt = buf_new(4096); }
+    if !buf_valid(&g_tui_dg_title) { g_tui_dg_title = buf_new(1024); }
+}
+
+// 浮窗可用高度：面板之上、扣掉运行中的状态区
+fn tui_diff_avail_rows() usize {
+    const st: usize = tui_status_rows();
+    if g_tui_panel_top > st {
+        return g_tui_panel_top - st;
+    }
+    return 0;
+}
+
+export fn tui_overlay_diff_fits() bool {
+    return g_tui_cols >= TUI_DIFF_COLS_MIN && tui_diff_avail_rows() >= TUI_DIFF_ROWS_MIN;
+}
+
+// 内容区行数（自测断言几何用）
+export fn tui_overlay_diff_rows() usize {
+    return g_tui_dg.rows;
+}
+
+export fn tui_overlay_diff_open() void {
+    tui_ov_ensure();
+    tui_diff_ensure();
+    g_tui_ov = TUI_OV_DIFF;
+    g_tui_ov_kind = TUI_OVK_DIFF;
+    g_tui_ov_done = 0;
+    g_tui_ov_have = false;
+    g_tui_ov_cancel = false;
+    g_tui_ov_n = 0;
+    g_tui_ov_sel = 0;
+    g_tui_ov_top = 0;
+    buf_reset(&g_tui_ov_title);
+    buf_reset(&g_tui_ov_items);
+    tui_lineidx_build(&g_tui_ov_items_ix, &g_tui_ov_items);   // 踩坑 68：清空条目 ⇒ 表跟着清
+    buf_reset(&g_tui_ov_filter);
+    g_tui_ov_anchor = 0;
+    g_tui_ov_full = false;   // P53：/diff 本来就占满转录区，全屏态对它没有意义 —— 清掉免得残留
+    tui_mark_dirty();
+}
+
+// 左列表的状态码配色（读前两个字节，就是 git status 的 XY）
+fn tui_diff_list_style(p: &const byte, n: usize) u8 {
+    if n < 2 {
+        return TUI_ST_DEFAULT;
+    }
+    const c0: byte = p[0];
+    const c1: byte = p[1];
+    if c0 == 63 as byte && c1 == 63 as byte {
+        return TUI_ST_ADD;      // ??
+    }
+    if c0 == 68 as byte || c1 == 68 as byte {
+        return TUI_ST_DEL;      // D
+    }
+    if c0 == 65 as byte || c1 == 65 as byte {
+        return TUI_ST_ADD;      // A
+    }
+    if c0 == 77 as byte || c1 == 77 as byte {
+        return TUI_ST_WARN;     // M
+    }
+    if c0 == 82 as byte || c1 == 82 as byte {
+        return TUI_ST_WARN;     // R（--no-renames 下理论上看不到）
+    }
+    return TUI_ST_DIM;
+}
+
+// 画一个单元格：清洗 → 按显示列跳过 from_col（横向滚动）→ 截断 → 补位到 x+w
+//
+// bg == 255 是「没有底色」（与以前逐字节一致）；否则补白也用底色样式铺满，
+// 整行因此从行号列一直铺到栏尾（P36）。
+fn tui_diff_cell(x: usize, w: usize, p: &const byte, n: usize, style: u8, from_col: usize, bg: u8) void {
+    var pad_style: u8 = TUI_ST_DEFAULT;
+    if bg != 255 {
+        pad_style = bg;
+    }
+    if w == 0 {
+        tui_pad_to(x);
+        return;
+    }
+    tui_pad_to(x);
+    var avail: usize = w;
+    var skip_cols: usize = from_col;
+    if from_col > 0 {
+        tui_puts("‹" as &const byte, TUI_ST_DIM);
+        avail = w - 1;
+        if avail == 0 {
+            return;
+        }
+    }
+    if n == 0 {
+        tui_pad_to(x + w);
+        return;
+    }
+    // 先按显示列切一刀（超长行不动辄几 MB 地清洗），清洗之后再跳 from_col 列
+    const keep: usize = tty_clip_bytes(p, n, skip_cols + avail + 8);
+    buf_reset(&g_tui_diff_tmp);
+    tui_clean_into(&g_tui_diff_tmp, p, keep);
+    var skip: usize = 0;
+    if (skip_cols > 0) {
+        skip = tty_clip_bytes(g_tui_diff_tmp.ptr as &const byte, g_tui_diff_tmp.len, skip_cols);
+    }
+    // 注意 tui_put_clipped 在截断时会**多打一个 '…'**（1 列）：装不下时预算要留出那一列，
+    // 否则这一格的宽度会超出 w，右竖线整体右移（浮窗里的「列对齐」就毁了）
+    const total: usize = g_tui_diff_tmp.len - skip;
+    const fit: usize = tty_clip_bytes(g_tui_diff_tmp.ptr + skip, total, avail);
+    if fit >= total {
+        tui_put(g_tui_diff_tmp.ptr + skip, total, style);
+    } else {
+        tui_put_clipped(g_tui_diff_tmp.ptr + skip, total, avail - 1, style);
+    }
+    tui_pad_to_styled(x + w, pad_style);
+}
+
+// P36：单元格的「行内高亮」版 —— 三段 [前缀)(变化前段](后缀]，变化段换用 hi 样式。
+// 文本已清洗（pre / mid 都是**清洗后**文本的字节偏移，不会是原文），按显示列切。
+fn tui_diff_cell_hl(x: usize, w: usize, p: &const byte, n: usize, base: u8, hi: u8,
+    pre: usize, mid: usize, from_col: usize) void {
+    tui_pad_to(x);
+    if w == 0 || n == 0 || mid == 0 || pre + mid > n {
+        tui_diff_cell(x, w, p, n, base, from_col, base);
+        return;
+    }
+    var avail: usize = w;
+    var skip: usize = 0;
+    if from_col > 0 {
+        tui_puts("‹" as &const byte, TUI_ST_DIM);
+        avail = w - 1;
+        if avail == 0 {
+            return;
+        }
+        skip = from_col;
+    }
+    const post: usize = n - pre - mid;
+    // 三段依次发：[前缀) 底 → [变化段] 高亮 → (后缀] 底；skip/avail 逐段扣减
+    if pre > 0 {
+        tui_diff_seg(p, pre, &skip, &avail, base);
+    }
+    if mid > 0 {
+        tui_diff_seg(p + pre, mid, &skip, &avail, hi);
+    }
+    if post > 0 {
+        tui_diff_seg(p + pre + mid, post, &skip, &avail, base);
+    }
+    tui_pad_to_styled(x + w, base);
+}
+
+fn tui_diff_sub(a: usize, b: usize) usize {
+    if (a > b) {
+        return a - b;
+    }
+    return 0;
+}
+
+// 发一段（先跳 skip 列、再按 avail 列裁剪）；用掉的显示列从 *skip / *avail 里扣掉。
+// 截断时补 '…' 也要占一列 —— 预算按 avail 算，宽度不会超出这一格（列对齐的老坑）。
+fn tui_diff_seg(p: &const byte, n: usize, skip: &usize, avail: &usize, style: u8) void {
+    if n == 0 || avail[0] == 0 {
+        return;
+    }
+    var s: usize = 0;
+    if skip[0] > 0 {
+        s = tty_clip_bytes(p, n, skip[0]);
+    }
+    const left: usize = n - s;
+    if left == 0 {
+        return;
+    }
+    var shown: usize = 0;
+    if tty_clip_bytes(p + s, left, avail[0]) >= left {
+        tui_put(p + s, left, style);
+        shown = tty_cols_between(p + s, 0, left);
+    } else {
+        tui_put_clipped(p + s, left, avail[0] - 1, style);
+        shown = avail[0];
+    }
+    skip[0] = tui_diff_sub(skip[0], shown);
+    avail[0] = tui_diff_sub(avail[0], shown);
+}
+
+// 清洗 + 按显示列截断（给列表行/标题用：git 的路径与仓库名是外来字节，
+// 里面可能有 ESC/控制字节/NUL —— 直接画进帧就破了「正文层里没有 ESC」这条不变量）
+fn tui_diff_clean_clip(p: &const byte, n: usize, max_cols: usize, style: u8) void {
+    if max_cols == 0 || n == 0 {
+        return;
+    }
+    buf_reset(&g_tui_diff_tmp);
+    tui_clean_into(&g_tui_diff_tmp, p, tty_clip_bytes(p, n, max_cols + 8));
+    const total: usize = g_tui_diff_tmp.len;
+    const fit: usize = tty_clip_bytes(g_tui_diff_tmp.ptr as &const byte, total, max_cols);
+    if fit >= total {
+        tui_put(g_tui_diff_tmp.ptr as &const byte, total, style);
+    } else {
+        tui_put_clipped(g_tui_diff_tmp.ptr as &const byte, total, max_cols - 1, style);
+    }
+}
+
+// 行号列（右对齐 5 列 + 1 空格）；show = false 时留空（那一侧本来就没有内容）
+// P36：bg != 255 时，行号槽的留白也用底色铺（否则整行底色会在行号处断开一截）
+fn tui_diff_no(x: usize, no: usize, style: u8, show: bool, bg: u8) void {
+    var pad_style: u8 = TUI_ST_DEFAULT;
+    if bg != 255 {
+        pad_style = bg;
+    }
+    tui_pad_to(x);
+    if !show {
+        tui_pad_to_styled(x + TUI_DIFF_GUTTER, pad_style);
+        return;
+    }
+    buf_reset(&g_tui_diff_txt);
+    var v: usize = no;
+    var digits: usize = 1;
+    while v >= 10 {
+        v = v / (10 as usize);
+        digits = digits + 1;
+    }
+    var pad: usize = TUI_DIFF_GUTTER - 1;
+    if digits < pad {
+        pad = pad - digits;
+    } else {
+        pad = 0;
+    }
+    var k: usize = 0;
+    while k < pad {
+        _ = buf_append_byte(&g_tui_diff_txt, 32);
+        k = k + 1;
+    }
+    _ = buf_append_u64(&g_tui_diff_txt, no as u64);
+    _ = buf_append_byte(&g_tui_diff_txt, 32);
+    // P36：有底色时行号也跟着上色（否则整行底色会在行号槽断开一截）；
+    // 无色 / 上下文行仍旧用原来的暗色
+    var nstyle: u8 = style;
+    if bg != 255 {
+        nstyle = bg;
+    }
+    tui_put_clipped(g_tui_diff_txt.ptr as &const byte, g_tui_diff_txt.len, TUI_DIFF_GUTTER, nstyle);
+    tui_pad_to_styled(x + TUI_DIFF_GUTTER, pad_style);
+}
+
+// P36：配对行（MIX）的行内高亮切分 —— 公共前缀 / 公共后缀之间就是「变了的片段」。
+// 输入是**单元格原文**，这里先清洗进 g_tui_diff_tmp，再在清洗后的字节上切
+// （前缀长度 mid 都是清洗后文本的字节偏移，tui_diff_cell_hl 直接吃）。
+// 对齐 UTF-8 字符边界：逐字节比、结束后再各自回退到字符起点 —— 绝不切半个汉字。
+// 超长行（> TUI_DIFF_HL_MAX）不切，mid 留 0（渲染层退回整行底色）。
+const TUI_DIFF_HL_MAX: usize = 4096;
+
+fn tui_diff_split_mix(lp: &const byte, ll: usize, rp: &const byte, rl: usize) void {
+    g_tui_diff_lp = "" as &const byte;
+    g_tui_diff_ln = 0;
+    g_tui_diff_lpre = 0;
+    g_tui_diff_lmid = 0;
+    g_tui_diff_rp = "" as &const byte;
+    g_tui_diff_rn = 0;
+    g_tui_diff_rpre = 0;
+    g_tui_diff_rmid = 0;
+    if ll > TUI_DIFF_HL_MAX || rl > TUI_DIFF_HL_MAX {
+        return;
+    }
+    tui_diff_ensure();
+    buf_reset(&g_tui_diff_tmp);
+    tui_clean_into(&g_tui_diff_tmp, lp, ll);
+    const lclean: usize = g_tui_diff_tmp.len;
+    _ = buf_append_byte(&g_tui_diff_tmp, 0);   // 分隔符：右文本从 lclean+1 起
+    tui_clean_into(&g_tui_diff_tmp, rp, rl);
+    const rclean: usize = g_tui_diff_tmp.len - lclean - 1;
+    if lclean == 0 || rclean == 0 {
+        return;
+    }
+    const a: &const byte = g_tui_diff_tmp.ptr as &const byte;
+    const b: &const byte = g_tui_diff_tmp.ptr + lclean + 1;
+    // 公共前缀
+    var pre: usize = 0;
+    var mn: usize = rclean;
+    if (lclean < rclean) {
+        mn = lclean;
+    }
+    while pre < mn && a[pre] == b[pre] {
+        pre = pre + 1;
+    }
+    pre = tui_diff_char_start(a, lclean, pre);
+    // 公共后缀（不越过前缀）
+    var suf: usize = 0;
+    while suf < (lclean - pre) && suf < (rclean - pre)
+        && a[lclean - 1 - suf] == b[rclean - 1 - suf] {
+        suf = suf + 1;
+    }
+    // 后缀的起点也要落在字符边界上（公共后缀停在字符中间时让到该字符的起点）——
+    // 否则「变化段」会从一个汉字中间切开，屏幕上就是半个字。
+    suf = lclean - tui_diff_char_start(a, lclean, lclean - suf);
+    // 两侧的中间段（真正的变化片段）必须有内容才算「配得上高亮」
+    const lmid: usize = lclean - pre - suf;
+    const rmid: usize = rclean - pre - suf;
+    if lmid == 0 || rmid == 0 {
+        return;
+    }
+    g_tui_diff_lp = a;
+    g_tui_diff_ln = lclean;
+    g_tui_diff_lpre = pre;
+    g_tui_diff_lmid = lmid;
+    g_tui_diff_rp = b;
+    g_tui_diff_rn = rclean;
+    g_tui_diff_rpre = pre;
+    g_tui_diff_rmid = rmid;
+}
+
+// P36：把「落在字符中间」的字节下标让到**该字符的起点**（UTF-8 续字节 10xxxxxx 往回退）。
+// 行内高亮的切点必须落在字符边界上，否则会把一个汉字切成半个。
+// p 是整行文本，n 是它的长度，i 是想对齐的下标。
+fn tui_diff_char_start(p: &const byte, n: usize, i: usize) usize {
+    if i == 0 {
+        return 0;
+    }
+    var k: usize = i;
+    if k > n {
+        return i;
+    }
+    var step: usize = 0;
+    while step < 4 && k > 0 && ((p[k] & 192 as byte) == 128 as byte) {
+        k = k - 1;
+        step = step + 1;
+    }
+    return k;
+}
+
+// 自测探针：P36 的行内高亮切分（旧行 / 新行 → 前缀 / 变化段 / 变化段长度）。
+// 走的是**渲染用的同一份**状态（不是另写一套规则）：返回的 pre 是公共前缀的字节数，
+// lmid / rmid 是两侧变化段的字节数（0 = 不做行内高亮）。
+export fn tui_diff_hl_split(lp: &const byte, ll: usize, rp: &const byte, rl: usize,
+    pre: &usize, lmid: &usize, rmid: &usize) void {
+    pre[0] = 0;
+    lmid[0] = 0;
+    rmid[0] = 0;
+    tui_diff_split_mix(lp, ll, rp, rl);
+    pre[0] = g_tui_diff_lpre;
+    lmid[0] = g_tui_diff_lmid;
+    rmid[0] = g_tui_diff_rmid;
+}
+
+// 自测探针：第 r 行第 col 显示列的段样式（没有段 / 越界 → 255）
+export fn tui_row_style_at(r: usize, col: usize) u8 {
+    if r >= TUI_MAX_ROWS {
+        return 255;
+    }
+    if r >= g_tui_nrows {
+        return 255;
+    }
+    const row: TuiRow = g_tui_rowtab[r];
+    var off: usize = row.text_off;
+    var c: usize = 0;
+    var i: usize = 0;
+    while i < row.seg_n {
+        const si: usize = row.seg_start + i;
+        // 证明器只认「正的 if 里做索引」（README 踩坑 6）
+        if si < TUI_MAX_SEGS {
+            const seg: TuiSeg = g_tui_segs[si];
+            const seg_cols: usize = tty_cols_between(g_tui_text.ptr as &const byte, off, off + seg.len);
+            if col < c + seg_cols {
+                return seg.style;
+            }
+            c = c + seg_cols;
+            off = off + seg.len;
+        }
+        i = i + 1;
+    }
+    return 255;
+}
+
+// 自测探针：某样式的 SGR 字节串（断言里有 `48;5;` 这类背景编码）
+export fn tui_style_sgr(style: u8, out: &Buf) void {
+    var sgr: [byte: 64] = [0: 64];
+    const n: usize = tui_sgr_into(&sgr[0], style);
+    buf_reset(out);
+    _ = buf_append(out, &sgr[0], n);
+}
+
+// 内容行：k = 内容区第几行
+fn tui_diff_paint_row(k: usize, list_top: usize) void {
+    tui_row_new();
+    const left: usize = g_tui_dg.left;
+    // 左：边框 + 文件列表
+    tui_pad_to(left);
+    tui_puts("│" as &const byte, TUI_ST_ACCENT);
+    const li: usize = list_top + k;
+    if li < gd_file_count() {
+        var len: usize = 0;
+        const p: &const byte = gd_file_text(li, &len);
+        const sel: bool = li == gd_sel();
+        var mstyle: u8 = TUI_ST_DEFAULT;
+        if sel {
+            mstyle = TUI_ST_SEL;
+            tui_puts("▸ " as &const byte, TUI_ST_SEL);
+        } else {
+            mstyle = tui_diff_list_style(p, len);
+            tui_puts("  " as &const byte, TUI_ST_DEFAULT);
+        }
+        const room: usize = if (g_tui_dg.list_w > TUI_DIFF_MARK) { g_tui_dg.list_w - TUI_DIFF_MARK } else { 0 as usize };
+        tui_diff_clean_clip(p, len, room, mstyle);
+    }
+    tui_pad_to(g_tui_dg.sep1);
+    tui_puts("│" as &const byte, TUI_ST_ACCENT);
+    // 右：旧/新两栏
+    const di: usize = gd_scroll() + k;
+    const gd_n: usize = gd_rows();
+    if gd_n == 0 {
+        if k == 0 {
+            var len: usize = 0;
+            const note: &const byte = if gd_note().len > 0 { gd_note().ptr as &const byte } else { "(没有可显示的内容)" as &const byte };
+            if gd_note().len > 0 {
+                len = gd_note().len;
+            } else {
+                len = bufx_cstr_len(note);
+            }
+            const span: usize = g_tui_dg.cell_w + 1 + g_tui_dg.cell_w2;
+            tui_diff_cell(g_tui_dg.cell1_x, span, note, len, TUI_ST_DIM, 0, 255);
+        } else {
+            tui_pad_to(g_tui_dg.sep2);
+            tui_puts("│" as &const byte, TUI_ST_ACCENT);
+            tui_pad_to(g_tui_dg.cell2_x + g_tui_dg.cell_w2);
+        }
+    } else if di < gd_n {
+        var meta: GdRow = GdRow{
+            l_off: 0, l_len: 0, r_off: 0, r_len: 0, l_no: 0, r_no: 0, kind: 255
+        };
+        if gd_row_meta(di, &meta) {
+            var ll: usize = 0;
+            var rl: usize = 0;
+            const lp: &const byte = gd_cell(di, 0, &ll);
+            const rp: &const byte = gd_cell(di, 1, &rl);
+            const hc: usize = gd_hscroll();
+            if meta.kind == GD_K_HDR {
+                // 说明行（@@ / 无换行结尾 / 二进制）：跨两栏
+                const span: usize = g_tui_dg.cell_w + 1 + g_tui_dg.cell_w2;
+                tui_diff_cell(g_tui_dg.cell1_x, span, lp, ll, TUI_ST_DIM, hc, 255);
+            } else {
+                const lshow: bool = meta.kind != GD_K_ADD;
+                const rshow: bool = meta.kind != GD_K_DEL;
+                // P36：改动行整行铺底 —— 删除侧红底、新增侧绿底；配对行（MIX）两侧都铺。
+                // 上下文行不铺（一屏里到处都是底反而看不清「哪几行改了」）。
+                var lbg: u8 = 255;
+                var rbg: u8 = 255;
+                if meta.kind == GD_K_DEL {
+                    lbg = TUI_ST_DEL_BG;
+                } else if meta.kind == GD_K_ADD {
+                    rbg = TUI_ST_ADD_BG;
+                } else if meta.kind == GD_K_MIX {
+                    lbg = TUI_ST_DEL_BG;
+                    rbg = TUI_ST_ADD_BG;
+                }
+                // 配对行：在底色之上，再把**真正变了的字符片段**换成更亮的一档
+                var lstyle: u8 = TUI_ST_DEFAULT;
+                var rstyle: u8 = TUI_ST_DEFAULT;
+                var lhi: u8 = 255;
+                var rhi: u8 = 255;
+                if meta.kind == GD_K_DEL {
+                    lstyle = TUI_ST_DEL;
+                } else if meta.kind == GD_K_ADD {
+                    rstyle = TUI_ST_ADD;
+                } else if meta.kind == GD_K_MIX {
+                    lstyle = TUI_ST_DEL;
+                    rstyle = TUI_ST_ADD;
+                    tui_diff_split_mix(lp, ll, rp, rl);
+                }
+                if meta.kind == GD_K_MIX {
+                    if g_tui_diff_lmid > 0 {
+                        lhi = TUI_ST_DEL_HL;
+                    }
+                    if g_tui_diff_rmid > 0 {
+                        rhi = TUI_ST_ADD_HL;
+                    }
+                }
+                tui_diff_no(g_tui_dg.cell1_x, meta.l_no, TUI_ST_DIM, lshow, lbg);
+                const lw: usize = g_tui_dg.cell_w - TUI_DIFF_GUTTER;
+                const rx: usize = g_tui_dg.cell2_x + TUI_DIFF_GUTTER;
+                const rw: usize = g_tui_dg.cell_w2 - TUI_DIFF_GUTTER;
+                if lhi != 255 {
+                    tui_diff_cell_hl(g_tui_dg.cell1_x + TUI_DIFF_GUTTER, lw,
+                        g_tui_diff_lp, g_tui_diff_ln, lbg, lhi,
+                        g_tui_diff_lpre, g_tui_diff_lmid, hc);
+                } else {
+                    const ls: u8 = if lbg != 255 { lbg } else { lstyle };
+                    tui_diff_cell(g_tui_dg.cell1_x + TUI_DIFF_GUTTER, lw, lp, ll, ls, hc, lbg);
+                }
+                tui_pad_to(g_tui_dg.sep2);
+                tui_puts("│" as &const byte, TUI_ST_ACCENT);
+                tui_diff_no(g_tui_dg.cell2_x, meta.r_no, TUI_ST_DIM, rshow, rbg);
+                if rhi != 255 {
+                    tui_diff_cell_hl(rx, rw, g_tui_diff_rp, g_tui_diff_rn, rbg, rhi,
+                        g_tui_diff_rpre, g_tui_diff_rmid, hc);
+                } else {
+                    const rs: u8 = if rbg != 255 { rbg } else { rstyle };
+                    tui_diff_cell(rx, rw, rp, rl, rs, hc, rbg);
+                }
+            }
+        }
+    } else {
+        // 内容到底了：只留竖线
+        tui_pad_to(g_tui_dg.sep2);
+        tui_puts("│" as &const byte, TUI_ST_ACCENT);
+        tui_pad_to(g_tui_dg.cell2_x + g_tui_dg.cell_w2);
+    }
+    // 右边框
+    tui_pad_to(g_tui_dg.left + g_tui_dg.w - 1);
+    tui_puts("│" as &const byte, TUI_ST_ACCENT);
+    tui_fill_row(g_tui_cols);
+}
+
+// 顶边框 + 标题
+//
+// P34：标题里第一段是**当前会话的工作区**（短路径，$HOME → ~）—— 一个仓库好几个 worktree
+// 时，「这是哪个工作区的 diff」是唯一能分辨的信息。窄终端下放不下整条短路径就退成末段
+// （worktree 目录名 / 仓库名），文件与 `+A -D` 因此不会被挤掉。
+fn tui_diff_paint_top() void {
+    tui_row_new();
+    tui_pad_to(g_tui_dg.left);
+    tui_puts("╭─ " as &const byte, TUI_ST_ACCENT);
+    const room: usize = if (g_tui_dg.w > 6) { g_tui_dg.w - 6 } else { 0 as usize };
+    var wsl: Buf = buf_new(1024);
+    defer { buf_free(&wsl); }
+    gd_ws_label_into(&wsl);
+    buf_reset(&g_tui_diff_txt);
+    _ = buf_append_cstr(&g_tui_diff_txt, "/diff · ");
+    _ = buf_append(&g_tui_diff_txt, wsl.ptr as &const byte, wsl.len);
+    _ = buf_append_cstr(&g_tui_diff_txt, " · ");
+    var len: usize = 0;
+    const p: &const byte = gd_file_text(gd_sel(), &len);
+    // git 的 XY 码是两列（` M` / `M ` / `??`）：标题里把前导空格去掉好看一点
+    // （左列表保留原样 —— 那一列要跟 git 对齐）
+    var poff: usize = 0;
+    if len > 0 && p[0] == 32 as byte {
+        poff = 1;
+        len = len - 1;
+    }
+    _ = buf_append(&g_tui_diff_txt, p + poff, len);
+    _ = buf_append_cstr(&g_tui_diff_txt, " · +");
+    _ = buf_append_u64(&g_tui_diff_txt, gd_added() as u64);
+    _ = buf_append_cstr(&g_tui_diff_txt, " -");
+    _ = buf_append_u64(&g_tui_diff_txt, gd_removed() as u64);
+    _ = buf_append_cstr(&g_tui_diff_txt, " ");
+    // 放不下整条工作区短路径（去掉首段还能装下）时退成末段，重拼一次
+    if room > 0 && tty_clip_bytes(g_tui_diff_txt.ptr as &const byte, g_tui_diff_txt.len, room) < g_tui_diff_txt.len {
+        var tail: Buf = buf_new(1024);
+        defer { buf_free(&tail); }
+        gd_ws_short_tail_into(&tail);
+        if tail.len > 0 && tail.len < wsl.len {
+            buf_reset(&g_tui_diff_txt);
+            _ = buf_append_cstr(&g_tui_diff_txt, "/diff · ");
+            _ = buf_append(&g_tui_diff_txt, tail.ptr as &const byte, tail.len);
+            _ = buf_append_cstr(&g_tui_diff_txt, " · ");
+            _ = buf_append(&g_tui_diff_txt, p + poff, len);
+            _ = buf_append_cstr(&g_tui_diff_txt, " · +");
+            _ = buf_append_u64(&g_tui_diff_txt, gd_added() as u64);
+            _ = buf_append_cstr(&g_tui_diff_txt, " -");
+            _ = buf_append_u64(&g_tui_diff_txt, gd_removed() as u64);
+            _ = buf_append_cstr(&g_tui_diff_txt, " ");
+        }
+    }
+    // 拼好的标题里可能有外来字节（工作区路径/仓库名/文件名），照样先清洗再截断
+    buf_reset(&g_tui_dg_title);
+    _ = buf_append(&g_tui_dg_title, g_tui_diff_txt.ptr, g_tui_diff_txt.len);
+    tui_diff_clean_clip(g_tui_dg_title.ptr as &const byte, g_tui_dg_title.len, room, TUI_ST_BOLD);
+    tui_pad_to(g_tui_dg.left + g_tui_dg.w - 1);
+    tui_puts("╮" as &const byte, TUI_ST_ACCENT);
+    tui_fill_row(g_tui_cols);
+}
+
+// 列头：文件 (N) / 旧 · HEAD / 新 · 工作区
+fn tui_diff_paint_head() void {
+    tui_row_new();
+    tui_pad_to(g_tui_dg.left);
+    tui_puts("│" as &const byte, TUI_ST_ACCENT);
+    buf_reset(&g_tui_diff_txt);
+    _ = buf_append_cstr(&g_tui_diff_txt, "文件 (");
+    _ = buf_append_u64(&g_tui_diff_txt, gd_file_count() as u64);
+    _ = buf_append_cstr(&g_tui_diff_txt, ")");
+    tui_put_clipped(g_tui_diff_txt.ptr as &const byte, g_tui_diff_txt.len, g_tui_dg.list_w, TUI_ST_DIM);
+    tui_pad_to(g_tui_dg.sep1);
+    tui_puts("│" as &const byte, TUI_ST_ACCENT);
+    const t1: &const byte = "旧 · HEAD" as &const byte;
+    tui_put_clipped(t1, bufx_cstr_len(t1), g_tui_dg.cell_w, TUI_ST_DIM);
+    tui_pad_to(g_tui_dg.sep2);
+    tui_puts("│" as &const byte, TUI_ST_ACCENT);
+    const t2: &const byte = "新 · 工作区" as &const byte;
+    tui_put_clipped(t2, bufx_cstr_len(t2), g_tui_dg.cell_w2, TUI_ST_DIM);
+    tui_pad_to(g_tui_dg.left + g_tui_dg.w - 1);
+    tui_puts("│" as &const byte, TUI_ST_ACCENT);
+    tui_fill_row(g_tui_cols);
+}
+
+// 底部提示行：左键位提示、右「行 a-b/N · +A -D · note」
+fn tui_diff_paint_hint() void {
+    tui_row_new();
+    tui_pad_to(g_tui_dg.left);
+    tui_puts("│" as &const byte, TUI_ST_ACCENT);
+    const hint: &const byte = "↑↓ 文件 · n/N 改动 · pgup/pgdn 滚动 · ←→ 左右 · r 刷新 · q/esc 关闭" as &const byte;
+    const hn: usize = bufx_cstr_len(hint);
+    buf_reset(&g_tui_diff_txt);
+    const total: usize = gd_rows();
+    if total > 0 {
+        const from: usize = gd_scroll() + 1;
+        var to: usize = gd_scroll() + g_tui_dg.rows;
+        if to > total {
+            to = total;
+        }
+        _ = buf_append_cstr(&g_tui_diff_txt, "行 ");
+        _ = buf_append_u64(&g_tui_diff_txt, from as u64);
+        _ = buf_append_cstr(&g_tui_diff_txt, "-");
+        _ = buf_append_u64(&g_tui_diff_txt, to as u64);
+        _ = buf_append_cstr(&g_tui_diff_txt, "/");
+        _ = buf_append_u64(&g_tui_diff_txt, total as u64);
+    } else {
+        _ = buf_append_cstr(&g_tui_diff_txt, "无内容");
+    }
+    _ = buf_append_cstr(&g_tui_diff_txt, " · +");
+    _ = buf_append_u64(&g_tui_diff_txt, gd_added() as u64);
+    _ = buf_append_cstr(&g_tui_diff_txt, " -");
+    _ = buf_append_u64(&g_tui_diff_txt, gd_removed() as u64);
+    if gd_note().len > 0 {
+        _ = buf_append_cstr(&g_tui_diff_txt, " · ");
+        _ = buf_append(&g_tui_diff_txt, gd_note().ptr, gd_note().len);
+    }
+    const scols: usize = tty_cols_between(g_tui_diff_txt.ptr as &const byte, 0, g_tui_diff_txt.len);
+    const avail: usize = g_tui_dg.w - 4;
+    tui_pad_to(g_tui_dg.left + 2);
+    if avail > scols + 2 {
+        const hroom: usize = avail - scols - 2;
+        if hroom >= 12 {
+            tui_put_clipped(hint, hn, hroom, TUI_ST_DIM);
+        }
+        tui_pad_to(g_tui_dg.left + g_tui_dg.w - 2 - scols);
+        tui_put_clipped(g_tui_diff_txt.ptr as &const byte, g_tui_diff_txt.len, scols, TUI_ST_DIM);
+    } else {
+        // 太窄：保住状态（行号/计数/note），键位提示让位
+        tui_put_clipped(g_tui_diff_txt.ptr as &const byte, g_tui_diff_txt.len, avail, TUI_ST_DIM);
+    }
+    tui_pad_to(g_tui_dg.left + g_tui_dg.w - 1);
+    tui_puts("│" as &const byte, TUI_ST_ACCENT);
+    tui_fill_row(g_tui_cols);
+}
+
+fn tui_diff_paint_bottom() void {
+    tui_row_new();
+    tui_pad_to(g_tui_dg.left);
+    tui_puts("╰" as &const byte, TUI_ST_ACCENT);
+    var used: usize = 1;
+    while used + 1 < g_tui_dg.w {
+        tui_puts("─" as &const byte, TUI_ST_ACCENT);
+        used = used + 1;
+    }
+    tui_puts("╯" as &const byte, TUI_ST_ACCENT);
+    tui_fill_row(g_tui_cols);
+}
+
+fn tui_draw_overlay_diff() void {
+    tui_diff_ensure();
+    const avail: usize = tui_diff_avail_rows();
+    if g_tui_cols < TUI_DIFF_COLS_MIN || avail < TUI_DIFF_ROWS_MIN {
+        return;   // 画不出来就不画（调用方已经在开之前问过 tui_overlay_diff_fits）
+    }
+    var h: usize = avail - 1;
+    if h > TUI_MAX_ROWS - 2 {
+        h = TUI_MAX_ROWS - 2;
+    }
+    var w: usize = g_tui_cols - 4;
+    if w > g_tui_cols - 2 {
+        w = g_tui_cols - 2;
+    }
+    var left: usize = 2;
+    if g_tui_cols > w + 4 {
+        left = (g_tui_cols - w) / 2;
+    }
+    const inner: usize = w - 2;
+    // 左列表占 30%（估算：`M  path  (+3 -1)` 大概这个宽度），窄终端下限 18、宽终端上限 36
+    var list_w: usize = (w * 3) / 10;
+    if list_w < 18 {
+        list_w = 18;
+    }
+    if list_w > 36 {
+        list_w = 36;
+    }
+    if list_w + 6 > inner {
+        list_w = inner - 6;
+    }
+    const work: usize = inner - list_w - 1;   // 右区 = 两栏 + 一条中缝
+    var col_w: usize = (work - 1) / 2;
+    var col_w2: usize = work - 1 - col_w;
+    if col_w < TUI_DIFF_GUTTER + 2 {
+        col_w = TUI_DIFF_GUTTER + 2;
+    }
+    if col_w2 < TUI_DIFF_GUTTER + 2 {
+        col_w2 = TUI_DIFF_GUTTER + 2;
+    }
+    var rows: usize = 0;
+    if h >= 5 {
+        rows = h - 4;
+    }
+    g_tui_dg = TuiDiffGeo{
+        w: w, left: left, list_w: list_w,
+        sep1: left + 1 + list_w,
+        cell1_x: left + 2 + list_w, cell_w: col_w,
+        sep2: left + 2 + list_w + col_w,
+        cell2_x: left + 3 + list_w + col_w, cell_w2: col_w2,
+        rows: rows
+    };
+    gd_set_view(rows);
+    // 左列表跟着选中项滚
+    var list_top: usize = 0;
+    const nf: usize = gd_file_count();
+    if nf > rows && rows > 0 {
+        if gd_sel() + 1 > rows {
+            list_top = gd_sel() + 1 - rows;
+        }
+        if list_top + rows > nf {
+            list_top = nf - rows;
+        }
+    }
+    tui_row_rewind(0);
+    tui_diff_paint_top();
+    tui_diff_paint_head();
+    var k: usize = 0;
+    while k < rows {
+        tui_diff_paint_row(k, list_top);
+        k = k + 1;
+    }
+    tui_diff_paint_hint();
+    tui_diff_paint_bottom();
+}
+
+// 浮层按键：/diff 是「浏览型」的（没有可提交的结果，也不进食 filter）
+fn tui_ov_key_diff(ev: i32) void {
+    if ev == TUI_K_ESC || ev == TUI_K_CTRL_C {
+        g_tui_ov_cancel = true;
+        tui_overlay_close();
+        return;
+    }
+    if ev == TUI_K_UP {
+        _ = gd_move(-1);
+        tui_mark_dirty();
+        return;
+    }
+    if ev == TUI_K_DOWN {
+        _ = gd_move(1);
+        tui_mark_dirty();
+        return;
+    }
+    if ev == TUI_K_PGUP {
+        gd_scroll_by(-1);
+        tui_mark_dirty();
+        return;
+    }
+    if ev == TUI_K_PGDN {
+        gd_scroll_by(1);
+        tui_mark_dirty();
+        return;
+    }
+    if ev == TUI_K_HOME || ev == TUI_K_CTRL_A {
+        gd_scroll_home();
+        tui_mark_dirty();
+        return;
+    }
+    if ev == TUI_K_END || ev == TUI_K_CTRL_E {
+        gd_scroll_end();
+        tui_mark_dirty();
+        return;
+    }
+    if ev == TUI_K_LEFT {
+        gd_hscroll_by(-1);
+        tui_mark_dirty();
+        return;
+    }
+    if ev == TUI_K_RIGHT {
+        gd_hscroll_by(1);
+        tui_mark_dirty();
+        return;
+    }
+    if ev == TUI_K_CHAR {
+        var tmp: Buf = buf_new(8);
+        defer { buf_free(&tmp); }
+        const n: usize = tui_key_take_char(&tmp);
+        if n > 0 {
+            const c: byte = tmp.ptr[0];
+            if c == 113 as byte {          // q：关闭
+                g_tui_ov_cancel = true;
+                tui_overlay_close();
+            } else if c == 114 as byte {   // r：重新扫描（失败保留原内容，原因进 note）
+                _ = gd_refresh();
+                tui_mark_dirty();
+            } else if c == 110 as byte {   // n：跳到下一个改动（本文件没了就跨文件）
+                _ = gd_next_change(1);
+                tui_mark_dirty();
+            } else if c == 78 as byte {    // N：跳到上一个改动
+                _ = gd_next_change(-1);
+                tui_mark_dirty();
+            }
+            return;
+        }
+        return;
+    }
+}
+
+// 浮层窗口（P23）：内容比框高时能滚
+//
+// 老实现里 g_tui_ov_top 只被写、从来没被读过，绘制按 `want = r - 1` 取前几项 ——
+// 24 行的 /status 只画出 14 行，`上下文占用` 那一段永远看不见，↓ 按多了连高亮都会
+// 移出可见窗口（看着就像「按键没反应」）。这里把窗口做成唯一事实来源：
+// 框高、能放几项、选中项必须在窗口里，都由下面三个函数说，绘制与按键都问它们。
+// ============================================================
+
+// 框高（与 tui_draw_overlay 的算法同一份；panel_top < 5 时浮层画不出来）
+fn tui_ov_box_h() usize {
+    if g_tui_panel_top < 5 {
+        return 0;
+    }
+    // P53：全屏时三条上界全部解除 —— 框高就是转录区高（panel_top）。那三条
+    // （上限 16 / panel_top-2）都是**非全屏的观感**：全屏的意义正是「看全那 24 行的
+    // /status」，留着 16 行上限等于没全屏。
+    if g_tui_ov_full {
+        return g_tui_panel_top;
+    }
+    var h: usize = 3 + g_tui_ov_n;
+    if h > 16 {
+        h = 16;
+    }
+    if h > g_tui_panel_top - 2 {
+        h = g_tui_panel_top - 2;
+    }
+    return h;
+}
+
+// 框里能放几项（上下边框各一行；确认型还要给 prompt 留一行）
+fn tui_ov_body_rows() usize {
+    const h: usize = tui_ov_box_h();
+    if h < 3 {
+        return 0;
+    }
+    var rows: usize = h - 2;
+    if g_tui_ov == TUI_OV_CONFIRM && rows > 0 {
+        rows = rows - 1;
+    }
+    return rows;
+}
+
+// 让选中项待在窗口里（选择在前、夹取在后）
+fn tui_ov_sel_into_window() void {
+    const rows: usize = tui_ov_body_rows();
+    if rows == 0 || g_tui_ov_n == 0 {
+        g_tui_ov_top = 0;
+        return;
+    }
+    if g_tui_ov_sel < g_tui_ov_top {
+        g_tui_ov_top = g_tui_ov_sel;
+    } else if g_tui_ov_sel >= g_tui_ov_top + rows {
+        g_tui_ov_top = g_tui_ov_sel - rows + 1;
+    }
+    const max_top: usize = if g_tui_ov_n > rows { g_tui_ov_n - rows } else { 0 as usize };
+    if g_tui_ov_top > max_top {
+        g_tui_ov_top = max_top;
+    }
+}
+
+// 通过过滤的项共有几个
+//
+// 踩坑 68：过滤器为空时**每一项都通过** —— 直接回 g_tui_ov_n，不必逐项取行再比较
+// （取行本身已是 O(1)，但 n 项逐个走一遍仍是 O(n)，而这条路径每次按键都要走）。
+fn tui_ov_filtered_count() usize {
+    if g_tui_ov_filter.len == 0 {
+        return g_tui_ov_n;
+    }
+    var n: usize = 0;
+    var i: usize = 0;
+    while i < g_tui_ov_n {
+        var o: usize = 0;
+        var l: usize = 0;
+        if tui_ov_item(i, &o, &l) {
+            if tui_ov_filter_match(g_tui_ov_items.ptr + o, l) {
+                n = n + 1;
+            }
+        }
+        i = i + 1;
+    }
+    return n;
+}
+
+// 第 fi 个「通过过滤」的项（= 过滤器为空时的第 fi 项）。越界返回 false。
+// 踩坑 68：过滤器为空时**不必**从 0 数起 —— 序号就是项号，一次取行即可。
+// 有过滤器时仍旧逐项扫（那是它的语义：跳过不匹配的项）。
+fn tui_ov_nth_filtered(fi: usize, off: &usize, len: &usize) bool {
+    if g_tui_ov_filter.len == 0 {
+        return tui_ov_item(fi, off, len);
+    }
+    var seen: usize = 0;
+    var i: usize = 0;
+    while i < g_tui_ov_n {
+        var o: usize = 0;
+        var l: usize = 0;
+        if tui_ov_item(i, &o, &l) {
+            if tui_ov_filter_match(g_tui_ov_items.ptr + o, l) {
+                if seen == fi {
+                    off[0] = o;
+                    len[0] = l;
+                    return true;
+                }
+                seen = seen + 1;
+            }
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+
+// 光标移动：按「通过过滤」的序列走，并把窗口跟过去
+fn tui_ov_sel_move(delta: i32) void {
+    const n: usize = tui_ov_filtered_count();
+    if n == 0 {
+        g_tui_ov_sel = 0;
+        g_tui_ov_top = 0;
+        tui_mark_dirty();
+        return;
+    }
+    var sel: i64 = g_tui_ov_sel as i64 + delta as i64;
+    if sel < 0 {
+        sel = 0;
+    }
+    if sel > (n - 1) as i64 {
+        sel = (n - 1) as i64;
+    }
+    g_tui_ov_sel = sel as usize;
+    tui_ov_sel_into_window();
+    tui_mark_dirty();
+}
+
+// 选中项写进结果并关闭
+fn tui_ov_accept() void {
+    tui_ov_ensure();
+    // 找第 sel 个「通过过滤」的项（踩坑 68：过滤器为空时这一句就是 O(1) 取行）
+    var off: usize = 0;
+    var len: usize = 0;
+    const picked: bool = tui_ov_nth_filtered(g_tui_ov_sel, &off, &len);
+    buf_reset(&g_tui_ov_result);
+    if picked {
+        _ = buf_append(&g_tui_ov_result, g_tui_ov_items.ptr + off, len);
+        g_tui_ov_have = true;
+        // 命令面板里选中的是「退出」→ **当场**置退出标志：回合运行中主循环不在跑，
+        // 没人会来收这张浮层的结果（`/exit` 得能立刻生效，不能等回合结束，见踩坑 44）
+        if g_tui_ov_kind == TUI_OVK_PALETTE && tui_ov_result_is_exit() {
+            g_tui_quit = true;
+        }
+        // P48：把触发面板的那个 "/" **当场**收走，而不是等派发时再收。
+        // 派发点不止一处（主循环 / step 边界 / 泵点），而结果可能被**推迟**到 step 边界
+        // 才派发 —— 那段时间输入行里那个 "/" 还留着，用户接着敲的下一条命令就被它顶成
+        // `//status` → 「未知命令」（p30-check 的 status-during-compact 抓到）。
+        // 面板开着的期间字符都进 g_tui_ov_filter（不是输入行），所以此刻输入行里要么正是
+        // 那个孤零零的 "/"，要么是用户已经往下敲了新内容 —— 后者不该动（那是下一行）。
+        if g_tui_ov_kind == TUI_OVK_PALETTE {
+            tui_input_drop_slash_trigger();
+        }
+    } else {
+        // 回车但一条都没匹配上：不能静默（旧实现是「按了回车屏幕一动不动」）。
+        // 把用户敲进过滤器的文字还回输入行，再落一条 notice 说明为什么什么都没发生。
+        tui_ov_restore_filter();
+        g_tui_ov_cancel = true;
+    }
+    g_tui_ov_done = g_tui_ov_kind;   // close 会清 kind，先留一份给 take 之后的调用方
+    tui_overlay_close();
+}
+
+// 回车无匹配：过滤器里的文字回到输入行 + 一条说明
+fn tui_ov_restore_filter() void {
+    if g_tui_ov_filter.len == 0 {
+        return;
+    }
+    tui_in_insert(g_tui_ov_filter.ptr as &const byte, g_tui_ov_filter.len);
+    var msg: Buf = buf_new(g_tui_ov_filter.len + 96);
+    defer { buf_free(&msg); }
+    _ = buf_append_cstr(&msg, "没有匹配的命令：");
+    _ = buf_append(&msg, g_tui_ov_filter.ptr, g_tui_ov_filter.len);
+    // P46：敲的是「命令 + 参数」（`/watch sub-1`、`/workspace /tmp/x`）时，面板按**子串**
+    // 匹配必然一条都匹配不上 —— 但文字已经回到输入行，再回车就是那条命令。把这一步说出来，
+    // 否则用户看到的就是「没有匹配的命令」+ 什么都没发生（实测就是这条被当成「/watch 没反应」）。
+    if tui_ov_filter_head_is_command() {
+        _ = buf_append_cstr(&msg, "（已放回输入行：再按一次回车即按命令派发）");
+    }
+    tui_add_notice(msg.ptr as &const byte, msg.len);
+}
+
+// 过滤器是不是「命令 + 参数」形态：首词（空白之前）是命令表里某条命令的名字。
+// 判据只看**有没有参数段**与**首词是否命中命令表**，不看参数本身合不合法 —— 这里要回答的
+// 只是「再按一次回车会发生什么」，合法性由命令自己判。
+fn tui_ov_filter_head_is_command() bool {
+    var sp: usize = 0;
+    while sp < g_tui_ov_filter.len {
+        const c: byte = g_tui_ov_filter.ptr[sp];
+        if c == 32 as byte || c == 9 as byte {
+            break;
+        }
+        sp = sp + 1;
+    }
+    if sp == 0 || sp >= g_tui_ov_filter.len {
+        return false;   // 没有参数段：走原来的「没有匹配的命令」口径
+    }
+    var i: usize = 0;
+    while i < g_tui_cmds.len {
+        var e: usize = i;
+        while e < g_tui_cmds.len && g_tui_cmds.ptr[e] != 10 as byte
+            && g_tui_cmds.ptr[e] != 32 as byte && g_tui_cmds.ptr[e] != 9 as byte {
+            e = e + 1;
+        }
+        // 命令表每行以 `/` 开头，比较的是它之后那一段（过滤器里没有 `/`：开面板时被收走了）
+        if e > i + 1 && g_tui_cmds.ptr[i] == 47 as byte && e - i - 1 == sp
+            && bufx_mem_eq(
+                @ptr_from_usize(@usize_from_ptr(g_tui_cmds.ptr as &const void) + i + 1) as &const byte,
+                g_tui_ov_filter.ptr as &const byte, sp) {
+            return true;
+        }
+        while i < g_tui_cmds.len && g_tui_cmds.ptr[i] != 10 as byte {
+            i = i + 1;
+        }
+        if i < g_tui_cmds.len {
+            i = i + 1;   // 跳过换行
+        }
+    }
+    return false;
+}
+
+// 命令面板的结果里，命令名（第一个空白之前那一段）是不是退出命令
+fn tui_ov_result_is_exit() bool {
+    const p: &const byte = g_tui_ov_result.ptr as &const byte;
+    var n: usize = 0;
+    while n < g_tui_ov_result.len {
+        const c: byte = p[n];
+        if c == 32 as byte || c == 9 as byte || c == 10 as byte {
+            break;
+        }
+        n = n + 1;
+    }
+    return tui_is_exit_command(p, n);
+}
+
+// 浮层按键
+fn tui_ov_key(ev: i32) void {
+    // P53：全屏开关必须在**所有形态分派之前** —— 它是「浮层的显示属性」，不是某一种形态
+    // 的按键。放到后面（比如 reader / ask / input 各自那三条 return 之后）的话，那三种
+    // 形态会把 ctrl+f 当成「认不出的键」静默吃掉：只有列表型能全屏，看着就像「按键时灵时不灵」。
+    if ev == TUI_K_FULLSCREEN {
+        // 先算目标态再切（切完 g_tui_ov_full 已经变了，那条 notice 要说的是**新**状态）
+        const on: bool = !g_tui_ov_full;
+        _ = tui_overlay_full(-1);
+        if on {
+            tui_add_notice("(浮层全屏：开 —— 占满转录区；ctrl+f / F11 再按一次关掉)" as &const byte,
+                bufx_cstr_len("(浮层全屏：开 —— 占满转录区；ctrl+f / F11 再按一次关掉)" as &const byte));
+        } else {
+            tui_add_notice("(浮层全屏：关 —— 回到居中框；ctrl+f / F11 切回来)" as &const byte,
+                bufx_cstr_len("(浮层全屏：关 —— 回到居中框；ctrl+f / F11 切回来)" as &const byte));
+        }
+        return;
+    }
+    if g_tui_ov == TUI_OV_DIFF {
+        tui_ov_key_diff(ev);
+        return;
+    }
+    if ev == TUI_K_ESC || ev == TUI_K_CTRL_C {
+        g_tui_ov_cancel = true;
+        tui_overlay_close();
+        return;
+    }
+    // reader 型（计划审阅）自带一套按键：↑/↓ 滚正文、tab 切动作、数字直选
+    if g_tui_ov_reader {
+        tui_ov_key_reader(ev);
+        return;
+    }
+    // P43：ask 型（提问弹窗）自带一套按键：↑/↓ 选、1-9 直选、space 勾选、打字=自定义回答
+    if g_tui_ov_ask {
+        tui_ov_key_ask(ev);
+        return;
+    }
+    // P48：input 型（单行输入框）自带一套按键：编辑一行文本、enter 采纳、esc 取消
+    if g_tui_ov_in {
+        tui_ov_key_input(ev);
+        return;
+    }
+    if ev == TUI_K_ENTER {
+        tui_ov_accept();
+        return;
+    }
+    if ev == TUI_K_UP {
+        tui_ov_sel_move(-1);
+        return;
+    }
+    if ev == TUI_K_DOWN {
+        tui_ov_sel_move(1);
+        return;
+    }
+    // P23：内容比框高时能滚（滚动模式有 pgup/pgdn，浮层以前没有）
+    if ev == TUI_K_PGUP {
+        var step: i32 = tui_ov_body_rows() as i32;
+        if step < 1 {
+            step = 1;
+        }
+        tui_ov_sel_move(0 - step);
+        return;
+    }
+    if ev == TUI_K_PGDN {
+        var step: i32 = tui_ov_body_rows() as i32;
+        if step < 1 {
+            step = 1;
+        }
+        tui_ov_sel_move(step);
+        return;
+    }
+    if ev == TUI_K_HOME {
+        tui_ov_sel_move(0 - (g_tui_ov_n as i32));
+        return;
+    }
+    if ev == TUI_K_END {
+        tui_ov_sel_move(g_tui_ov_n as i32);
+        return;
+    }
+    if ev == TUI_K_BACKSPACE {
+        if g_tui_ov_filter.len > 0 {
+            const prev: usize = tty_utf8_prev(g_tui_ov_filter.ptr as &const byte, g_tui_ov_filter.len);
+            buf_truncate(&g_tui_ov_filter, prev);
+            g_tui_ov_sel = 0;
+            g_tui_ov_top = 0;
+            tui_mark_dirty();
+        }
+        return;
+    }
+    if ev == TUI_K_CHAR {
+        var tmp: Buf = buf_new(8);
+        defer { buf_free(&tmp); }
+        const n: usize = tui_key_take_char(&tmp);
+        if n > 0 {
+            _ = buf_append(&g_tui_ov_filter, tmp.ptr, n);
+            g_tui_ov_sel = 0;
+            g_tui_ov_top = 0;
+            tui_mark_dirty();
+        }
+        return;
+    }
+}
+
+// 浮层排版：画在转录区中间的方框里（调用方保证 ov_top 之上/之下的行已经画好）
+//
+// 不变量：顶边 / 每一行正文 / 底边都是**同样 w 列**，右边框逐行对齐。
+// 正文那两处不能直接调 tui_put_clipped —— 它被裁时会**额外**补一个 `…`
+// （不算在 max_cols 里），那一行于是比方框宽 1 列、右边框被顶出去
+// （真机：命令面板里 /permission 那一行，见 README 踩坑 42）。
+fn tui_ov_put_clipped(p: &const byte, n: usize, max_cols: usize, style: u8) void {
+    if max_cols == 0 {
+        return;
+    }
+    var budget: usize = max_cols;
+    if max_cols > 1 && tty_clip_bytes(p, n, max_cols) < n {
+        budget = max_cols - 1;   // 给 '…' 留一列
+    }
+    tui_put_clipped(p, n, budget, style);
+}
+
+fn tui_draw_overlay() void {
+    if g_tui_ov == TUI_OV_DIFF {
+        // P27：/diff 占满转录区（几何与按键都在 tui_draw_overlay_diff / tui_ov_key_diff）
+        tui_draw_overlay_diff();
+        return;
+    }
+    tui_ov_ensure();
+    // P43：ask 型（提问弹窗）另有排版：问题 + 编号选项 + 自定义回答行
+    if g_tui_ov_ask {
+        tui_draw_overlay_ask();
+        return;
+    }
+    // P48：input 型（单行输入框）另有排版：标题 + 编辑行 + 提示行
+    if g_tui_ov_in {
+        tui_draw_overlay_input();
+        return;
+    }
+    // P26：reader 型（计划审阅）另有排版：正文可滚动 + 说明行 + 动作行
+    if g_tui_ov_reader {
+        tui_draw_overlay_reader();
+        return;
+    }
+    const panel_top: usize = g_tui_panel_top;
+    if panel_top < 5 {
+        return;
+    }
+    // 框高与「能放几项」跟按键侧共用同一份算法（tui_ov_box_h / tui_ov_body_rows），
+    // 否则滚动的窗口与画出来的行会对不上。
+    const h: usize = tui_ov_box_h();
+    const rows: usize = tui_ov_body_rows();
+    if h < 3 || rows == 0 {
+        return;
+    }
+    // 宽度的**基准**由 geo 算（want_w <= 0 = 列表型默认档），全屏才换成终端宽 ——
+    // 两件事分开：谁算基准、要不要全屏。混在一起就会把 want_w=0 当成基准宽（框宽变 0）。
+    var w: usize = 0;
+    var hh: usize = 0;
+    var left: usize = 0;
+    var top: usize = 0;
+    tui_ov_box_w(g_tui_ov_want_w, h, &w, &hh, &left, &top);
+    // P53：上边界只在**非全屏**时才可能是「贴面板」（菜单型的 anchor）；
+    // 全屏一律顶格（几何收口里那一条）。
+    if !g_tui_ov_full && g_tui_ov_anchor == 1 {
+        // 菜单：贴着输入面板往上（panel_top 就是面板首行）
+        if panel_top > h {
+            top = panel_top - h;
+        }
+    }
+    // 窗口是「通过过滤」的序号空间：上面还有 / 下面还有 → 标题栏给 ↑ / ↓ 指示
+    const up_more: bool = g_tui_ov_top > 0;
+    const down_more: bool = g_tui_ov_top + rows < g_tui_ov_n;
+    // 重画 [top, top+h) 这段
+    tui_row_rewind(top);
+    var r: usize = 0;
+    while r < h {
+        tui_row_new();
+        tui_pad_to(left);
+        const inner: usize = w - 2;
+        if r == 0 {
+            // 顶边 + 标题（有溢出指示时给指示留 4 列，别顶破边框；P53 再加全屏标记的宽度）
+            tui_puts("╭─ " as &const byte, TUI_ST_ACCENT);
+            const marks: usize = if up_more || down_more { 4 as usize } else { 0 as usize };
+            const deco: usize = if g_tui_ov_full { TUI_OV_FULL_DECO_COLS } else { 0 as usize };
+            // 标题预算：inner 扣掉 4 列 + 溢出指示 + 全屏标记；饱和减法别回绕
+            var tbud: usize = 0;
+            const tneed: usize = 4 + marks + deco;
+            if inner > tneed {
+                tbud = inner - tneed;
+            }
+            tui_put_clipped(g_tui_ov_title.ptr as &const byte, g_tui_ov_title.len, tbud, TUI_ST_BOLD);
+            if g_tui_ov_full {
+                tui_puts(TUI_OV_FULL_DECO, TUI_ST_DIM);
+            }
+            if up_more {
+                tui_puts(" ↑" as &const byte, TUI_ST_DIM);
+            }
+            if down_more {
+                tui_puts(" ↓" as &const byte, TUI_ST_DIM);
+            }
+            var used: usize = tui_row_cols() - left;
+            while used + 1 < w {
+                tui_puts("─" as &const byte, TUI_ST_ACCENT);
+                used = used + 1;
+            }
+            tui_puts("╮" as &const byte, TUI_ST_ACCENT);
+        } else if r == h - 1 {
+            tui_puts("╰" as &const byte, TUI_ST_ACCENT);
+            var used2: usize = 1;
+            while used2 + 1 < w {
+                tui_puts("─" as &const byte, TUI_ST_ACCENT);
+                used2 = used2 + 1;
+            }
+            tui_puts("╯" as &const byte, TUI_ST_ACCENT);
+        } else {
+            tui_puts("│ " as &const byte, TUI_ST_ACCENT);
+            const body: usize = inner - 1;
+            // 列表体：窗口里的第 (r - 1) 行（确认型第 1 行是 prompt）
+            var want: usize = r - 1;
+            if g_tui_ov == TUI_OV_CONFIRM && r == 1 {
+                tui_ov_put_clipped(g_tui_ov_prompt.ptr as &const byte, g_tui_ov_prompt.len, body, TUI_ST_DEFAULT);
+            } else {
+                if g_tui_ov == TUI_OV_CONFIRM {
+                    want = r - 2;
+                }
+                const fi: usize = g_tui_ov_top + want;      // 「通过过滤」的序号
+                // 踩坑 68：取「第 fi 个通过过滤的项」。过滤器为空时是一次 O(1) 取行
+                // （老实现每画一行都从第 0 项数起 —— 842 个会话时底部一次按键 1.2 s）。
+                var o: usize = 0;
+                var l: usize = 0;
+                if tui_ov_nth_filtered(fi, &o, &l) {
+                    const style: u8 = if fi == g_tui_ov_sel { TUI_ST_SEL } else { TUI_ST_DEFAULT };
+                    tui_ov_put_clipped(g_tui_ov_items.ptr + o, l, body, style);
+                }
+            }
+            var used3: usize = tui_row_cols() - left;
+            while used3 + 1 < w {
+                tui_puts(" " as &const byte, TUI_ST_DEFAULT);
+                used3 = used3 + 1;
+            }
+            tui_puts("│" as &const byte, TUI_ST_ACCENT);
+        }
+        tui_fill_row(g_tui_cols);
+        r = r + 1;
+    }
+}
+
+// 阻塞式确认（工具内部用）。TUI 激活时开浮层、自己抽帧等按键：
+//   返回 1 = 用户接受了某一项（选中的原文写进 out），0 = 取消 / 中断 / 无键可等。
+export fn tui_confirm_wait(kind: u8, title: &const byte, tn: usize, prompt: &const byte, pn: usize, items: &const byte, inlen: usize, sel: usize, out: &Buf) i32 {
+    if !g_tui_on {
+        return 0;
+    }
+    // 上一轮没取走的 one-shot 结果不能当成本次批准
+    tui_overlay_close();
+    g_tui_ov_have = false;
+    g_tui_ov_cancel = false;
+    tui_overlay_menu(kind, title, tn, items, inlen, sel);
+    g_tui_ov = TUI_OV_CONFIRM;
+    buf_reset(&g_tui_ov_prompt);
+    // 踩坑 81：prompt 就是「要批准的那条命令」——read-only 下它常是多行 bash，
+    // 不清洗就会被拆到框外（与 menu_confirm / confirm 同一份口径）
+    tui_clean_line_into(&g_tui_ov_prompt, prompt, pn);
+    tui_mark_dirty();
+    // 排队按键先丢掉：运行期间敲进来的键不能替用户「答应」一条命令。
+    // headless 自测是例外 —— 那里「注入的键」就是模拟用户，丢掉就没法测批准路径了。
+    if !g_tui_headless {
+        tui_key_reset();
+    }
+    return tui_decide_wait(out);
+}
+
+// 阻塞式等待一个决定（confirm 型与 reader 型共用）：边跑边抽帧，直到「选中 / 取消 /
+// 中断 /（headless）没键可等」。调用方负责先把浮层开好。
+fn tui_decide_wait(out: &Buf) i32 {
+    while true {
+        if !g_tui_on {
+            tui_overlay_close();
+            return 0;
+        }
+        _ = tui_poll_keys(50);
+        if tui_overlay_take(out) {
+            return 1;   // accept 路径上浮层已经自己关了
+        }
+        if tui_overlay_cancelled() {
+            return 0;   // esc 路径上同样已经关了
+        }
+        if g_tui_interrupt {
+            tui_overlay_close();
+            return 0;
+        }
+        _ = tui_tick(tui_now_ms());
+        if g_tui_headless && (g_tui_headless_done || g_tui_quit) {
+            // headless 下注入的键用完 = 「没人回答」：别死转，但也别把浮层留在屏幕上
+            tui_overlay_close();
+            return 0;
+        }
+    }
+}
+
+// 把 [r, nrows) 的行丢掉（浮层重画前用）
+fn tui_row_rewind(r: usize) void {
+    if r >= g_tui_nrows {
+        return;
+    }
+    const off: usize = tui_rowtab_text_off(r);
+    buf_truncate(&g_tui_text, off);
+    g_tui_nsegs = tui_rowtab_seg_start(r);
+    g_tui_nrows = r;
+    g_tui_cur_seg = g_tui_nsegs;
+    g_tui_cur_style = 255;
+}
+
+fn tui_rowtab_text_off(r: usize) usize {
+    if r >= TUI_MAX_ROWS {
+        return 0;
+    }
+    return g_tui_rowtab[r].text_off;
+}
+
+fn tui_rowtab_seg_start(r: usize) usize {
+    if r >= TUI_MAX_ROWS {
+        return 0;
+    }
+    return g_tui_rowtab[r].seg_start;
+}

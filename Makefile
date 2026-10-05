@@ -42,7 +42,29 @@ else
 AGENT_LDFLAGS :=
 endif
 
-SRC := src/bufx.uya src/jsonx.uya src/httpc.uya src/httpstream.uya src/sse.uya src/llm.uya src/tty.uya src/sigx.uya src/inbox.uya src/session.uya src/stats.uya src/procx.uya src/yamlcfg.uya src/modelx.uya src/dshcfg.uya src/dshsess.uya src/prompt.uya src/instr.uya src/compact.uya src/skill.uya src/webx.uya src/deleg.uya src/goal.uya src/workflow.uya src/todo.uya src/plan.uya src/perm.uya src/sandboxx.uya src/askuser.uya src/fsx.uya src/search.uya src/jobs.uya src/shellx.uya src/gitx.uya src/gitdiff.uya src/worktreex.uya src/imgx.uya src/clipx.uya src/diffx.uya src/mdview.uya src/view.uya src/tasks.uya src/watch.uya src/tui.uya src/agent.uya src/sigselftest.uya src/shellselftest.uya src/tuiselftest.uya src/selftest.uya
+# 源码按**域**分目录（一个域一个子目录，一文件一职责）—— 见 CODING.md。
+# Uya 的模块是「目录即模块」，且跨目录**合并命名空间**，所以：
+#   ① 搬文件进子目录**不需要**改源代码里的 export / use；
+#   ② 但**文件顺序有意义**：checker 按 SRC 顺序扫，`if c { CONST_A } else { CONST_B }`
+#      这种表达式要求常量所在文件**排在用它之前**，否则报「期望类型 u8，推断为 void」
+#      （实测：把 style.uya 排到 ask/entry/diff 之后，三处当场红）。所以下面
+#      term/tui/ 与 diff/ 两块是按**依赖序**排的，不是字母序 —— 加文件别打乱。
+#   ③ 显式输入文件数的硬上限是 **64**（uya 0.10.1）：第 65 个开始报「收集模块依赖失败」，
+#      报错完全指不到根因。拆分粒度受这个预算约束（v0.10.3 已解除，但它目前编不过
+#      本仓，原因见 CODING.md §6）。加文件前先数：`make -s print-src | wc -w`。
+# 留在 src/ 根的 tools.uya 是 P50 起就不在构建里的已知死代码，故意不列。
+SRC := src/foundation/bufx.uya src/foundation/jsonx.uya src/foundation/yamlcfg.uya \
+       src/net/httpc.uya src/net/httpstream.uya src/net/llm.uya src/net/sse.uya src/net/webx.uya \
+       src/term/mdview.uya src/term/tasks.uya src/term/tty.uya \
+       src/term/tui/style.uya src/term/tui/keys.uya src/term/tui/frame.uya src/term/tui/entry.uya src/term/tui/screen.uya src/term/tui/overlay.uya src/term/tui/status.uya src/term/tui/ask.uya src/term/tui/watch.uya src/term/tui/diff.uya src/term/tui/hook.uya \
+       src/term/view.uya src/term/watch.uya \
+       src/tools/askuser.uya src/tools/fsx.uya src/tools/jobs.uya src/tools/perm.uya src/tools/sandboxx.uya src/tools/search.uya src/tools/shellx.uya \
+       src/session/dshcfg.uya src/session/dshsess.uya src/session/inbox.uya src/session/modelx.uya src/session/procx.uya src/session/session.uya src/session/sigx.uya src/session/stats.uya \
+       src/agent/agent.uya src/agent/compact.uya src/agent/deleg.uya src/agent/goal.uya src/agent/instr.uya src/agent/plan.uya src/agent/prompt.uya src/agent/skill.uya src/agent/todo.uya src/agent/workflow.uya \
+       src/vcs/gitx.uya src/vcs/worktreex.uya \
+       src/media/clipx.uya src/media/imgx.uya \
+       src/selftest/selftest.uya src/selftest/shellselftest.uya src/selftest/sigselftest.uya src/selftest/tuiselftest.uya \
+       src/diff/model.uya src/diff/gitcmd.uya src/diff/rows.uya src/diff/view.uya src/diff/render.uya
 OUT := build/uya-agent
 
 BASE ?= https://api.deepseek.com/v1
@@ -53,9 +75,15 @@ TASK ?= 创建 hello.uya，编译并运行它
 export UYA_ROOT
 export UYA_SPLIT_C_DIR := $(CURDIR)/build/uyacache
 
-.PHONY: all check build link-audit selftest codegen-audit probe e2e e2e-config e2e-exec e2e-accept-nudge e2e-config-flags e2e-title e2e-title-cmd e2e-title-auto e2e-mouse e2e-api e2e-steps e2e-permission e2e-sandbox e2e-tasks e2e-goal e2e-sessions e2e-resume-big e2e-diff e2e-ws e2e-model e2e-worktree e2e-watch e2e-watch-pick e2e-dsh p30-check tui-demo tui-selftest sess-selftest diff-selftest model-selftest panel-selftest clean shell-selftest
+.PHONY: all check print-src build link-audit selftest codegen-audit probe e2e e2e-config e2e-exec e2e-accept-nudge e2e-config-flags e2e-title e2e-title-cmd e2e-title-auto e2e-mouse e2e-api e2e-steps e2e-permission e2e-sandbox e2e-tasks e2e-goal e2e-sessions e2e-resume-big e2e-diff e2e-ws e2e-model e2e-worktree e2e-watch e2e-watch-pick e2e-dsh p30-check tui-demo tui-selftest sess-selftest diff-selftest model-selftest panel-selftest clean shell-selftest
 
 all: build
+
+# 打印源文件清单（一行，空格分隔）。给「不走 make 的手工编译」和脚手架用：
+#   uya build $(make -s print-src) -o build/uya-agent
+# 清单只在这一个地方维护（SRC），别在 README / 脚本里手抄。
+print-src:
+	@echo $(SRC)
 
 check:
 	@mkdir -p build
