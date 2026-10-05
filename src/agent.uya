@@ -3679,8 +3679,26 @@ export const AGENT_TOOL: i32 = 4;
 // content 在流式过程中就直接打印（--quiet 关闭），收尾时不再重复打印。
 // ============================================================
 export const STEP_CONTINUE: i32 = 100;
+
+// P54：**退化响应 → 同一步重发**（step 循环的内部码，不是退出码）。
+//
+// 退化响应 = 上游正常收尾（不是 error、不是 max-tokens），但这一步既没有正文也没有工具调用。
+// 最典型的样子是「思考流了一大段、正文一个字都没有」，也可能反过来：上游嘴上说 tool_calls
+// 而调用在流里没了。这种响应不值得让整个回合失败 —— 同一份历史重发一次通常就有正文
+// （网关抖动 / 上游偶发只回思考）。
+//
+// 对齐 DSH 的 request-error 通道（`compaction-basic` 就是这么接 context-overflow 的）：
+// 重发发生在**同一步**（step 不递增、历史一个字节没动，所以重算出来的请求体逐字节相同），
+// 额度每步一次 —— 由 agent_note_degenerate 扣；扣不动时它给的是 AGENT_PROTO，不是这个码。
+// 于是这个码**只可能被 step 循环消费**（`continue` 重发），绝不会当退出码还回去。
+export const STEP_RETRY: i32 = 101;
+
 // 交互模式：本回合被用户 Ctrl-C 打断（不是错误，回到提示符即可）
 export const AGENT_INTERRUPTED: i32 = 130;
+
+// 每步允许的退化响应重发次数。写成常量是为了让证据里的 maxRetries 与真正执行的次数
+// 只有一个出处 —— 自测的「只重发一次」那条腿钉的就是它。
+const EMPTY_RETRY_MAX: i32 = 1;
 
 // 交互模式标志（前台界面唯一，用全局避免把参数穿过整条调用链）
 var g_interactive: bool = false;
@@ -3902,7 +3920,8 @@ export fn agent_trim_trailing_ws(p: &const byte, n: usize) usize {
 
 // 流式一步。style 必须与 req 的组装协议一致（调用方用同一个 style 建 url/req）。
 // out_status 回传本次请求的 HTTP 状态码（0 = 没走到 HTTP）—— 协商回退要用它。
-fn agent_step_stream(cfg: &Config, style: u8, url: &const Buf, hdrs: &const Buf, req: &const Buf, arena: &Arena, h: &History, step: i32, interactive: bool, out_status: &i32) i32 {
+// retry_ok = 本步剩余的退化响应重发额度（P54；指针一路带到 agent_finish_step 去扣）。
+fn agent_step_stream(cfg: &Config, style: u8, url: &const Buf, hdrs: &const Buf, req: &const Buf, arena: &Arena, h: &History, step: i32, interactive: bool, out_status: &i32, retry_ok: &bool) i32 {
     var o: ChatOut = chat_out_new();
     defer { chat_out_free(&o); }
     var tc: TlsConn = tls_conn_empty();
@@ -3999,12 +4018,178 @@ fn agent_step_stream(cfg: &Config, style: u8, url: &const Buf, hdrs: &const Buf,
     }
     out_status[0] = status;
 
-    return agent_finish_step(cfg, arena, h, step, &o);
+    return agent_finish_step(cfg, arena, h, step, &o, req.len, retry_ok);
 }
 
 
+// P54：**退化响应**的唯一出口 —— 上游正常收尾，但这一步既没有正文也没有工具调用。
+//
+// ① 为什么要把证据一次给全：以前这里只打一句 "model returned neither content nor tool_calls"，
+// 会话日志里则只剩一条 `content=""` 的 assistant/message —— 事后分不清「上游说了 stop」还是
+// 「tool_calls 在流里丢了」，只能靠旁证凑。判据其实都在手上：
+//   * finish / have_finish / bad_finish：上游到底声明了什么（未知 finish_reason 的原文也在）；
+//   * reasoning 字节数：只思考没正文正是退化响应最典型的样子（正文一个字都没上来）；
+//   * usage：输出 token 花在哪儿了（思考里？还是压根没生成？）；
+//   * 本次请求的体量：prompt 字节数（我们真发出去的）+ prompt token 读数（提供方口径）。
+//
+// ② 为什么值得重发：同一请求再发一次通常就有正文。对齐 DSH 的 request-error 通道
+// （`compaction-basic` 接 context-overflow 就是这条）：**同一步**重发，历史一个字节没动，
+// 所以重算出来的请求体逐字节相同；额度每步一次（retry_ok 由 step 循环持有，指针传进来扣）。
+//
+// 返回 true = 已安排重发（调用方把这一步重来，即 STEP_RETRY）；false = 额度用尽，回合按错误收口。
+// 两个分支都**不留 assistant/message、不进历史、不计统计**：这一步没有任何产出，硬记一条空的
+// assistant 消息只会让「退化」和「模型真的回了空串」在日志里长得一模一样。
+fn agent_note_degenerate(step: i32, o: &const ChatOut, prompt_bytes: usize, retry_ok: &bool) bool {
+    const retrying: bool = retry_ok[0];
+    if retrying {
+        retry_ok[0] = false;   // 额度当场扣掉：同一步只可能重发 EMPTY_RETRY_MAX 次
+    }
+    const used: i64 = if retrying { 0 as i64 } else { EMPTY_RETRY_MAX as i64 };
+    // 负数读数只在「网关报的缓存命中 > prompt」时出现，证据里按 0 打（别打成一个天文数字）
+    const u_in: i64 = if o.usage_in > 0 { o.usage_in } else { 0 as i64 };
+    const u_cache_read: i64 = if o.usage_cache_read > 0 { o.usage_cache_read } else { 0 as i64 };
+    const u_cache_write: i64 = if o.usage_cache_write > 0 { o.usage_cache_write } else { 0 as i64 };
+    const u_out: i64 = if o.usage_out > 0 { o.usage_out } else { 0 as i64 };
+    const u_reason: i64 = if o.usage_reasoning > 0 { o.usage_reasoning } else { 0 as i64 };
+    const prompt_tokens: i64 = u_in + u_cache_read;
+    // finish 的机器名（证据与事件共用一份，避免两处各写一张表）
+    var fname: &const byte = "none" as &const byte;
+    if o.finish == LLM_FINISH_STOP {
+        fname = "stop" as &const byte;
+    } else if o.finish == LLM_FINISH_TOOL_CALLS {
+        fname = "tool_calls" as &const byte;
+    } else if o.finish == LLM_FINISH_MAX_TOKENS {
+        fname = "length" as &const byte;
+    } else if o.finish == LLM_FINISH_ERROR {
+        fname = "error" as &const byte;
+    }
+    // 未知 finish_reason 的原文是**外来字节**：转义 + 限长之后才许上屏（踩坑 33 的口径）
+    var bad: Buf = buf_new(128);
+    defer { buf_free(&bad); }
+    if buf_valid(&bad) && o.bad_finish.len > 0 {
+        _ = tty_diag_escape_into(&bad, o.bad_finish.ptr as &const byte, o.bad_finish.len, 64);
+    }
+
+    // 1) 转录一行：先说要干什么，再把证据（字段名固定，grep 得到）挂上
+    if retrying {
+        out_err("[retry] empty response from upstream (no content, no tool_calls) — resending the same request once");
+    } else {
+        out_err("error: model returned neither content nor tool_calls");
+    }
+    out_err(" [step=");
+    out_err_dec(step as usize);
+    out_err(" finish=");
+    out_err(fname);
+    out_err(" have_finish=");
+    if o.have_finish {
+        out_err("1");
+    } else {
+        out_err("0");
+    }
+    out_err(" bad_finish=");
+    if bad.len == 0 {
+        out_err("(none)");
+    } else {
+        out_err_bytes(bad.ptr as &const byte, bad.len);
+    }
+    out_err(" content=");
+    out_err_dec(o.content.len);
+    out_err("B reasoning=");
+    out_err_dec(o.reasoning.len);
+    out_err("B calls=");
+    out_err_dec(o.ncalls);
+    out_err(" usage={in=");
+    out_err_dec(u_in as usize);
+    out_err(" cache_read=");
+    out_err_dec(u_cache_read as usize);
+    out_err(" cache_write=");
+    out_err_dec(u_cache_write as usize);
+    out_err(" out=");
+    out_err_dec(u_out as usize);
+    out_err(" reasoning=");
+    out_err_dec(u_reason as usize);
+    out_err("} prompt=");
+    out_err_dec(prompt_bytes);
+    out_err("B/");
+    out_err_dec(prompt_tokens as usize);
+    out_err("tok retries=");
+    out_err_dec(used as usize);
+    out_err("/");
+    out_err_dec(EMPTY_RETRY_MAX as usize);
+    out_err("]\n");
+
+    // 2) 同一条证据进会话日志：resume / 事后排障看的就是它（形状对齐 DSH 的 llm/retry：
+    //    retry/maxRetries + 一个 failure 对象；retrying=false 表示「这次不重发了」）
+    if g_sess.save {
+        var ev: Buf = buf_new(1024);
+        defer { buf_free(&ev); }
+        if sess_begin(&g_sess, "llm/degenerate", &ev) {
+            _ = buf_append_cstr(&ev, "{\"turn\":");
+            _ = buf_append_i64(&ev, g_turn as i64);
+            _ = buf_append_cstr(&ev, ",\"step\":");
+            _ = buf_append_i64(&ev, step as i64);
+            _ = buf_append_cstr(&ev, ",\"reason\":\"empty-response\",\"retries\":");
+            _ = buf_append_i64(&ev, used);
+            _ = buf_append_cstr(&ev, ",\"maxRetries\":");
+            _ = buf_append_i64(&ev, EMPTY_RETRY_MAX as i64);
+            _ = buf_append_cstr(&ev, ",\"retrying\":");
+            if retrying {
+                _ = buf_append_cstr(&ev, "true");
+            } else {
+                _ = buf_append_cstr(&ev, "false");
+            }
+            _ = buf_append_cstr(&ev, ",\"failure\":{\"finish\":");
+            _ = jw_str_into(&ev, fname, bufx_cstr_len(fname));
+            _ = buf_append_cstr(&ev, ",\"finishCode\":");
+            _ = buf_append_i64(&ev, o.finish as i64);
+            _ = buf_append_cstr(&ev, ",\"haveFinish\":");
+            if o.have_finish {
+                _ = buf_append_cstr(&ev, "true");
+            } else {
+                _ = buf_append_cstr(&ev, "false");
+            }
+            _ = buf_append_cstr(&ev, ",\"badFinish\":");
+            _ = jw_str_into(&ev, bad.ptr as &const byte, bad.len);
+            _ = buf_append_cstr(&ev, ",\"contentBytes\":");
+            _ = buf_append_i64(&ev, o.content.len as i64);
+            _ = buf_append_cstr(&ev, ",\"reasoningBytes\":");
+            _ = buf_append_i64(&ev, o.reasoning.len as i64);
+            _ = buf_append_cstr(&ev, ",\"calls\":");
+            _ = buf_append_i64(&ev, o.ncalls as i64);
+            _ = buf_append_cstr(&ev, ",\"promptBytes\":");
+            _ = buf_append_i64(&ev, prompt_bytes as i64);
+            _ = buf_append_cstr(&ev, ",\"promptTokens\":");
+            _ = buf_append_i64(&ev, prompt_tokens);
+            _ = buf_append_cstr(&ev, ",\"sawDone\":");
+            if o.saw_done {
+                _ = buf_append_cstr(&ev, "true");
+            } else {
+                _ = buf_append_cstr(&ev, "false");
+            }
+            _ = buf_append_cstr(&ev, ",\"events\":");
+            _ = buf_append_i64(&ev, o.events as i64);
+            _ = buf_append_cstr(&ev, ",\"usage\":{\"in\":");
+            _ = buf_append_i64(&ev, u_in);
+            _ = buf_append_cstr(&ev, ",\"cacheRead\":");
+            _ = buf_append_i64(&ev, u_cache_read);
+            _ = buf_append_cstr(&ev, ",\"cacheWrite\":");
+            _ = buf_append_i64(&ev, u_cache_write);
+            _ = buf_append_cstr(&ev, ",\"out\":");
+            _ = buf_append_i64(&ev, u_out);
+            _ = buf_append_cstr(&ev, ",\"reasoning\":");
+            _ = buf_append_i64(&ev, u_reason);
+            _ = buf_append_cstr(&ev, "}}}");
+            _ = sess_end(&g_sess, &ev);
+        }
+    }
+    return retrying;
+}
+
 // 一步收尾（流式/非流式共用）：usage、finish 语义、工具派发、最终回答。
-fn agent_finish_step(cfg: &Config, arena: &Arena, h: &History, step: i32, o: &const ChatOut) i32 {
+// prompt_bytes = 本次请求体（prompt + tools + 外壳）的字节数 —— 退化响应的证据要用它，
+// 而它只有调用方（拼请求的那一层）知道，所以一路带下来。
+// retry_ok = 本步剩余的退化重发额度（指针：step 循环持有，这里扣）。
+fn agent_finish_step(cfg: &Config, arena: &Arena, h: &History, step: i32, o: &const ChatOut, prompt_bytes: usize, retry_ok: &bool) i32 {
     // P9：记下这次请求的 prompt_tokens，作为下一次压缩判定的压力口径
     g_last_prompt_tokens = o.usage_in + o.usage_cache_read;
     if cfg.show_usage {
@@ -4014,6 +4199,15 @@ fn agent_finish_step(cfg: &Config, arena: &Arena, h: &History, step: i32, o: &co
     if o.finish == LLM_FINISH_ERROR {
         // 网关消息同样是外来字节：转义 + 限长（原来是无上限原样打印）
         out_diag("gateway-error", "model/gateway error: ", o.err_text.ptr as &const byte, o.err_text.len);
+        return AGENT_PROTO;
+    }
+
+    // P54：退化响应（正常收尾但既没正文也没工具调用）—— 先取证据、再决定重发。
+    // max-tokens 有自己的诊断分支（那是「截断」不是「退化」），所以先把它排掉。
+    if o.ncalls == 0 && o.content.len == 0 && o.finish != LLM_FINISH_MAX_TOKENS {
+        if agent_note_degenerate(step, o, prompt_bytes, retry_ok) {
+            return STEP_RETRY;
+        }
         return AGENT_PROTO;
     }
 
@@ -4259,7 +4453,7 @@ fn agent_parse_nonstream(style: u8, root: &JsonValue, o: &ChatOut) !void {
 
 // 非流式一步（--no-stream）：与流式共用 agent_finish_step 收尾。
 // style 必须与 req 的组装协议一致；out_status 回传 HTTP 状态码（协商回退要用）。
-fn agent_step_plain(cfg: &const Config, style: u8, url: &const Buf, hdrs: &const Buf, req: &const Buf, arena: &Arena, h: &History, step: i32, out_status: &i32) i32 {
+fn agent_step_plain(cfg: &const Config, style: u8, url: &const Buf, hdrs: &const Buf, req: &const Buf, arena: &Arena, h: &History, step: i32, out_status: &i32, retry_ok: &bool) i32 {
     var resp: Resp = resp_empty();
     var tc: TlsConn = tls_conn_empty();
     var guard: FdGuard = FdGuard{ saved: -1, nullfd: -1, active: false };
@@ -4336,7 +4530,7 @@ fn agent_step_plain(cfg: &const Config, style: u8, url: &const Buf, hdrs: &const
     };
     // P16：非流式没有实时行，思考只在收尾时落一行 + 记全文（与流式同一个收尾口径）
     agent_note_reasoning(step, &o2);
-    return agent_finish_step(cfg, arena, h, step, &o2);
+    return agent_finish_step(cfg, arena, h, step, &o2, req.len, retry_ok);
 }
 
 fn agent_turn_loop_inner(cfg: &Config, h: &History) i32 {
@@ -4424,6 +4618,11 @@ fn agent_turn_loop_inner(cfg: &Config, h: &History) i32 {
 
         // 协议协商：未声明时首个请求先按 responses 发；只有「端点不存在」（404/405/501）
         // 才回退 chat/completions 并在**同一步**用另一个协议重发一次（每进程只协商一次）。
+        //
+        // P54：本步的**退化响应重发额度**（step 循环持有，agent_note_degenerate 扣）。
+        // 与协商回退同一个形状：都在这个内层循环里把同一步重发一次，历史不动 ——
+        // 于是重算出来的 url/req 与上一次逐字节相同（自测「重发的请求体一字不差」钉的就是它）。
+        var retry_ok: bool = EMPTY_RETRY_MAX > 0;
         var step_rc: i32 = AGENT_PROTO;
         var sent: bool = false;
         while !sent {
@@ -4445,14 +4644,18 @@ fn agent_turn_loop_inner(cfg: &Config, h: &History) i32 {
             var status: i32 = 0;
             var rc: i32 = AGENT_PROTO;
             if cfg.stream {
-                rc = agent_step_stream(cfg, style, &url, &hdrs, &req, &arena, h, step, g_interactive, &status);
+                rc = agent_step_stream(cfg, style, &url, &hdrs, &req, &arena, h, step, g_interactive, &status, &retry_ok);
             } else {
-                rc = agent_step_plain(cfg, style, &url, &hdrs, &req, &arena, h, step, &status);
+                rc = agent_step_plain(cfg, style, &url, &hdrs, &req, &arena, h, step, &status, &retry_ok);
             }
             if api_negotiate(cfg, style, status) {
                 continue;   // 换协议重发：下一轮重算 url/req
             }
             api_lock(cfg, style);
+            if rc == STEP_RETRY {
+                // 退化响应：额度已经在 agent_note_degenerate 里扣掉、证据也落了，这里只管重来
+                continue;
+            }
             step_rc = rc;
             sent = true;
         }
@@ -10080,8 +10283,19 @@ export fn main() i32 {
 // tui_overlay_diff_fits）—— 全屏只改「画出来多大」，不改「能不能画」。
 // 编号说明：P50–P52 被并行线（剪贴板粘贴那条）先占了，按「后到的顺延」记成 **P53**；
 // 版本串 `p53-full` —— 与 README 顶部同一套记法。
-const AGENT_VERSION: [byte: 16] = [112, 53, 51, 45, 102, 117, 108, 108, 0, 0, 0, 0, 0, 0, 0, 0];   // "p53-full"
-const AGENT_VERSION_LEN: usize = 8;
+// P54（本线）：**退化响应的证据 + 同一步重发一次**。空回复分支以前只打一句
+// "model returned neither content nor tool_calls"、日志里只剩一条 content="" 的
+// assistant/message —— 事后分不清「上游说 stop」还是「tool_calls 丢了」。现在：
+//   ① 证据一次给全（finish / have_finish / bad_finish 原文、reasoning 字节数、usage、
+//      本次请求体量与 prompt token 读数），并且**两边都留**：转录一行 + `llm/degenerate` 事件；
+//   ② 退化响应（正常收尾但既没正文也没工具调用）**同一步重发一次**，额度每步一次，
+//      形状对齐 DSH 的 `agent/request-error` → `{kind:"retry"}`（compaction-basic 接
+//      context-overflow 走的就是这条通道）；重发不动历史，所以请求体逐字节相同；
+//   ③ 退化那一步**不留 assistant/message、不计统计**（没有产出，硬记一条空的 assistant
+//      消息只会让「退化」和「模型真回了空串」在日志里长得一样）。
+// 版本串 `p54-empty` —— 与 README 顶部同一套记法。
+const AGENT_VERSION: [byte: 16] = [112, 53, 52, 45, 101, 109, 112, 116, 121, 0, 0, 0, 0, 0, 0, 0];   // "p54-empty"
+const AGENT_VERSION_LEN: usize = 9;
 fn agent_parse_color(p: &byte) u8 {
     // auto / always / never / 16 / 256
     if bufx_cstr_len(p) == 4 && bufx_eq_cstr(p, 4, "auto") {
