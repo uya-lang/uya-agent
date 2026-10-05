@@ -523,6 +523,42 @@ src/diff/render.uya     write/edit 的 diff 正文（LCS 60×60）+ 采集与取
 4. **墙钟这一轮不可用**：同一配置两发 249 s vs 626 s（机器 load 42/44，另有会话在跑 selftest），
    时间维度的对照要等机器安静下来重做。
 
+### 推理强度：思考按输出计费，以及 `off` 的真实语义（P56）
+
+**先给结论**（真网关实测：autodl / `DeepSeek-V4.1-Flash`，同一道题、每次 3 发）：
+
+| 发什么 | completion（= 计费输出） | reasoning | 可见正文 |
+|---|---|---|---|
+| 明确发 `"none"` | 214 / 266 / 160 | **0 / 0 / 0** | 186–319 字 |
+| **不发字段**（网关默认档） | 755 / 488 / 870 | 647 / 363 / 735 | 122–161 字 |
+| DSH `off`（它按 `off: none` 映射发 none） | 135 | — | — |
+| DSH `xhigh` | 1078 | — | — |
+
+* **思考算输出、要钱**：网关的 usage 是 `completion_tokens` 里含
+  `completion_tokens_details.reasoning_tokens`（子集，另有 `output_tokens_details.reasoning_tokens`），
+  不是额外一档。本项目口径输出 0.60 USD/1M ⇒ 思考是同一价。实测的旁证：一趟真实跑批里
+  （思考 217,608 字 + 正文 4,527 字 + 工具参数 18,433 字）= 240,568 字 / 74,144 输出 token
+  = 3.24 字/token（中英混排的正常量级；若思考不计入，会变成 0.31 字/token，不成立）。
+* **`off` 以前是「干脆不发这个字段」**：`build_chat_request` / `build_responses_request` 把
+  off/none 当「没有值」跳过，于是用户想要的「关掉」在线上变成了「网关默认档」——输出 token 差 5 倍
+  以上，而 `--print-config` 还照实印着 `reasoning_effort = off`（配置在说谎）。
+* **修法**：按 settings 里该 provider 的 `reasoningEfforts` 映射（`off: none`）把 off/none 翻成
+  线上值 `none` 再发；`--print-config` 跟着印出**线上会发什么**
+  （`[sent as "none" — 明确关掉思考]` / `[not sent: provider/model declares no reasoning support]`），
+  同时删掉那句过期的 `[sent only for responses]`（P44 之后 completions 也发了）。
+* **修前 / 修后**（同一个 agent、同一道题、同一个网关，只换二进制）：
+  | | outputTokens | 思考正文 | 可见正文 |
+  |---|---|---|---|
+  | 修前 `--effort off` | 364 | 326 字 | 252 字 |
+  | 修后 `--effort off` | **164** | **0 字** | 175 字 |
+* **回归**：自测里原来那两条「effort=off 时不该发」翻成「应当发 none」（responses / completions
+  各一条），另补 `none`（值本身即线上值）与「没配档位就一个字段都不发」。
+* **顺带一条实测**：这个网关**认** reasoning_effort（`none`→0、`xhigh`→completion 1078），
+  但**中间档之间没有可分辨的差别**（同题各 3 发的中位 reasoning：minimal 705 / low 371 /
+  high 347 / xhigh 421；同一档三次最大差 7 倍）。想靠「降一档」省钱在这个网关上不可靠，
+  唯一可靠的省钱档是 `none` —— 这直接约束上面 P55 的 `--exec-effort`：它的前提（降一档就少想）
+  在本网关不成立，要用就用 `--exec-effort off`。
+
 **实现位置（净增函数 = 0）**：两段逻辑都内联在既有函数里 —— step 边界那段在
 `agent_turn_loop_inner`，工具收尾那段在 `dispatch_tool_body` 的尾部（流式/非流式两个派发点都
 必经它）。原因是踩坑 91：本仓「顶层函数 reachable 集合」余量是 0，多 2 个函数就让 `make build`
@@ -911,7 +947,7 @@ src/diff/render.uya     write/edit 的 diff 正文（LCS 60×60）+ 采集与取
 69. **`/new` 之后任务清单还挂着上一条会话的（本轮，不占阶段号）**。清单在进程里是一张全局表（`todo.uya` 的 `g_todos`，`todo_write` 整表替换），但**换会话时没人清**：`/new` 只做了 `agent_session_close` + `hist_free` + `hist_init` + 统计 `st_reset`（后者在 `agent_history_begin` 里），清单原封不动 —— 用户看到的是新会话的常驻任务块与 `/tasks` 里还列着上一条会话的「第几步」。根因不是「清单没地方存」，而是**「进程状态」与「会话状态」没分家**：同一批表里，todo 清单只活在这一条会话里，后台任务/子代理是独立进程（P7 起 `/new` 的 `fsctx_init` 已经会 `jobs_init`/`deleg_init` 把它们复位，那是「新进程状态」而不是「清空历史」），会话目标在盘上（`goal.json`，按设计跨会话）。修法：把「清什么」收进一个 `agent_session_scoped_reset()`（只 `todo_clear`），挂在 `agent_history_begin` 里 `st_reset()` 旁边 —— 启动、fork、`--resume`、`/new`、`/resume` 走的都是这条路，一处收口。孪生一条：**清了状态还得推显示** —— 常驻块是「推」出来的（`tasks_panel_sync` 逐字节比快照后往下推），不重推的话清单虽已清空、屏幕上那块要等到下一个 1Hz 心跳才换，滚动模式更是要等下一回合；所以两个换会话的落点各补一次 `tasks_panel_sync`。
     * 验收（对照实验，两条都做）：`tui-switch` 的 D 段在**真实 globals** 上装夹具（清单 2/4 + 后台 1/2 + 子代理 1/1 + 目标 3/20）→ 敲 `/new` → 钉住「清掉的」（`g_todos.n == 0` 且屏幕上没有「任务 2/4」）与**「不该被清掉的」**（屏幕上仍有「目标 3/20」）两件事；同一条口径再罩一遍 `/resume`。①把 `agent_session_scoped_reset()` 的函数体停掉重编 → 该轮红 4 条（`/new` 与 `/resume` 各两条：`g_todos.n != 0` + 块里还挂着清单）；②只把 `/new` 落点的 `tasks_panel_sync` 去掉重编 → 红 1 条（块里还挂着清单，状态其实已经清了）—— 证明「清状态」与「推显示」两截都真在起作用，不是其中一条在兜底另一条。
 70. **`--dsh-root` 与 `--dsh-home` 同类：决定「去哪儿读文案」，必须在预扫里生效**（P44）：主循环那次完整 CLI 解析排在 DSH 加载之后，而 `agent_texts_ensure()` 是**幂等的一次性**初始化（`g_texts_ready`），一旦在解析之前被叫过，`cfg.dsh_root` 就永远是空的 —— 症状是 flag 静默无效、persona 仍来自默认 preset 树，而环境变量 `UYA_AGENT_DSH_ROOT` 却正常（那条路在 `preset_path()` 里直接读 env）。判据：同时给 env 和 flag 各指一个**文案不同**的 preset 树，看哪个生效。**孪生一条：相对路径也静默失效** —— 这个值要到「第一次构 system prompt」才被读，那时进程已不在启动时的 cwd，所以 `--dsh-root testdata/x` 读不到、`--dsh-root $PWD/testdata/x` 才读到；修法是解析时就补成绝对路径（`cfg_set_dsh_root()`，预扫与主循环共用）。与踩坑 25 同因；回归补在 `e2e-config-flags`。
-71. **completions 不发 `reasoning_effort` = 静默丢弃用户配置**（P44）：`--effort` / `--reasoning-effort` / DSH 的 `agent-default-model.reasoningEffort` 三条路径的值都进了 `cfg.reasoning_effort`、`--print-config` 也照实显示，但 `build_chat_request` 里没有那一段，于是**默认的 openai-completions 路由上模型按网关默认档思考**，用户配的 `max` 没有落到线上，也没有任何提示。同一份设置下 DSH 是发的（实测抓包 `reasoning_effort: "max"`），所以「uya 比 DSH 省」这类对比会掺进一个与 harness 无关的混杂项（实测偏差 41%）。修法：与 responses 同一条门槛（`cfg.api_reasoning`）发顶层 `reasoning_effort`，字段放最后以保住前缀缓存。**注意效果依网关而异**：官方端点同任务 `max` vs `off` 的 reasoning 占输出 51% vs 27%，autodl 网关 12% vs 17%（该网关不认这个字段）——收益主要是「配置不再说谎」，不是省钱。
+71. **completions 不发 `reasoning_effort` = 静默丢弃用户配置**（P44）：`--effort` / `--reasoning-effort` / DSH 的 `agent-default-model.reasoningEffort` 三条路径的值都进了 `cfg.reasoning_effort`、`--print-config` 也照实显示，但 `build_chat_request` 里没有那一段，于是**默认的 openai-completions 路由上模型按网关默认档思考**，用户配的 `max` 没有落到线上，也没有任何提示。同一份设置下 DSH 是发的（实测抓包 `reasoning_effort: "max"`），所以「uya 比 DSH 省」这类对比会掺进一个与 harness 无关的混杂项（实测偏差 41%）。修法：与 responses 同一条门槛（`cfg.api_reasoning`）发顶层 `reasoning_effort`，字段放最后以保住前缀缓存。**注意效果依网关而异**：官方端点同任务 `max` vs `off` 的 reasoning 占输出 51% vs 27%，autodl 网关 12% vs 17%（**P56 复测更新**：autodl 是**认**这个字段的 —— 同题 `none`→reasoning 0、`xhigh`→completion 1078，但中档之间差别被采样噪声淹没；另见 P56 段与踩坑 93：当时那句「不认」很可能混进了 `off` 被静默丢弃的效果）——收益主要是「配置不再说谎」，不是省钱。
 72. **「TUI 里不能拖选复制文本」是鼠标上报的代价，不是渲染坏**（本轮修复，不占阶段号）：P25 为了让滚轮不被 xterm.js 伪装成 ↑/↓，**无条件**开了 `ESC[?1000h`+`ESC[?1006h`；而终端只要把鼠标交给我们，**它自己的拖选就没了** —— 左键按下/拖动全变成 `ESC[<b;x;yM` 事件灌过来，TUI 只吃滚轮（`b` 的 bit6）、其余**丢弃**（`tui_mouse_finish()`），于是拖选期间屏幕上什么都不动、PRIMARY 一个字节都不变。真机实测（deepin-terminal / qtermwidget，即用户环境）：同一块屏幕、同一个拖拽轨迹，**鼠标上报开着时拖选后 PRIMARY 仍是旧值（等于没有选中），手动发一条 `?1000l?1006l` 关掉之后立刻拿到 TUI 正文的文本**；再把 `?1000h?1006h` 发回去又选不动 —— 这一对对照就是根因的判据（render 与选区无关，屏幕重画也不会清掉已选区，实测 T+3 s 仍在）。所以这不是「哪一行画错了」，而是**一个必须可逆的开关**：修法是把鼠标上报做成可关的（`g_tui_mouse` + `tui_set_mouse()`，`tui_term_enter` 按开关发序列、运行中切换当场写 `1000h/1006h` 或 `1006l/1000l`），默认仍开（滚轮口径一字节不变），出口给三个：`F2`（`ESC O Q`，也认 `ESC[12~`）、`/mouse on|off`、启动期 `--no-mouse` / `UYA_AGENT_MOUSE=0`。**取舍写清楚**：关掉之后滚轮交给终端（不再翻转录），翻滚录用 `ctrl+↑/↓`（`ESC[1;5A/B` 那条已修好的路）或 `pgup/pgdn`；不想关也可以在开着时**按住 shift 拖选**（多数终端把这个当本地拖选）。防假绿对照实验：①`tui_term_enter` 改成忽略开关、恒发 `1000h` 重编 → `tui-mouse` 的 D4 当场红（`--no-mouse` 会失效）；②删掉 F2 的 SS3 映射 → B 段红；③`tui_set_mouse` 去掉运行中那段写序列 → D2/D3 红；④启动处把 `tui_set_mouse(cfg.mouse)` 写成恒 `true` → 真 PTY 那条腿红（`mouse=false` 的捕获里仍有 `1000h`）。**与既有口径的一致性**：这是「显式开关」而不是「猜终端」——不去探测、不自动关，因为关掉就等于放弃滚轮，必须由人决定。
 73. **「选中一个代理」与「敲 `/watch sub-1` 没反应」是同一种坑：结果没人接 + 只读命令被当成给模型的文本**（P46）：用户报「输入 /watch 选代理没反应」「/watch sub-1 也没反应」，真机（真 PTY + 假网关 + `build/uya-agent`）复现出**三条各自独立**的静默路 ——
     ① 裸 `/watch` 的现役清单一直用 `tui_overlay_list(TUI_OVK_TASKS, …)` 开，与 `/tasks` 共用 kind，而那个 kind 在接收端的语义是「纯查看，enter 不派发」：主循环的结果分发只认 PALETTE / SESSIONS / ACCESS(_CONFIRM) / MODEL / EFFORT / WORKTREE(_CONFIRM)，**没有 TASKS 分支**，于是 `tui_overlay_take()` 把选中行取走 → 落到链尾 `continue` → **静默丢弃**。实测：`/watch` → 清单里 `sub-1 [running]` 在屏上 → ↓ 选中它 → 回车 ⇒ 浮层关掉、没有跟随浮层、没有 notice（三个判据 `list_gone=True` / `follow_opened=False` / `notice=False`）。
@@ -1275,7 +1311,33 @@ src/diff/render.uya     write/edit 的 diff 正文（LCS 60×60）+ 采集与取
 
 
 
-=======
+93. **`off` 写成「不发字段」= 把用户的「关掉」偷换成「你看着办」**（P56，本轮踩到）：
+    `reasoning_effort` 的 off/none 在请求侧被当成「没有值」跳过，而 `mx_read_efforts` 只读
+    `reasoningEfforts` 的**键**（公布哪些档位）、不读**值**（`off: none` 那层映射没用上）。
+    于是同一个 off：DSH 发 `"none"`（实测 outputTokens 135），uya-agent 一个字段都不发 →
+    网关按自己的默认档思考（实测 outputTokens 364，其中思考正文 326 字）；而 `--print-config`
+    忠实地印着 `reasoning_effort = off`，用户**没有任何办法**看出这条配置没落地。
+    判据很简单：同一道题分别打「不发字段」与「发 none」，看 `completion_tokens` 和
+    `reasoning_tokens` —— 差 5 倍以上就是这个坑（不发字段≈755/647，发 none≈214/0）。
+    与踩坑 71 同源（那条是「completions 完全不发」，这条是「该发的时候不发」），
+    教训是同一句：**配置项的语义必须落到线上字节上**，别停在「我们这边的字段值」；
+    这类静默失效一律用「组装请求体 → 断言字节」的自测钉住（本轮翻了两条旧断言、补了两条新的）。
+
+94. **合并残留的冲突标记没有任何测试看得见 —— 它在 README 里躺了一整天**（本轮修掉，不占阶段号）：
+    `README.md` 的「§3 踩坑 → §4 工具实现要点」之间有一行孤立的 `=======`，来自 P53 那次合并
+    （`3e62301`「Merge main（P50–P52 剪贴板粘贴 + 踩坑 81–85）到『浮层全屏』」）—— 该合并的**两个父
+    提交都没有它**（`4800d23` / `66a521c` 各 0 次），是解冲突时留下的。它躺着的这段时间里
+    `make build`、`make selftest`（含 150 轮断言）、`link-audit`、`codegen-audit` 全绿：
+    **没有任何一条测试会去看文档里的冲突标记**。
+    **第一次归因是错的**（我当时说是静态链接那次合并留下的）—— 那次的两个父提交也都没有它，
+    判据是「在哪个提交第一次出现 + 它的父提交有没有」，别靠印象。
+    防复发：新增 `make doc-audit`（行首锚定的 `<<<<<<<` / `=======` / `>>>>>>>` 扫描；只扫文本文件、
+    跳过 `.git` 与 `build`，所以源码里 `// ============` 这类分隔线不误报），已并进 `make selftest`。
+    反例验证：往 README 追加一行 `=======` → 审计立刻红并打印文件:行号（实测 rc=2）。
+    顺带把 7 处 `---` 分隔符的上下空行统一成各 1 个（那一处是 0 空行顶着标记，正是它暴露的）。
+    教训：**「全绿」只覆盖被断言过的东西**。文档这类没有断言的产物必须单独有一条审计，
+    否则它坏多久都没人知道。
+
 ---
 
 ## 4. 工具实现要点

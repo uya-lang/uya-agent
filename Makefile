@@ -75,7 +75,7 @@ TASK ?= 创建 hello.uya，编译并运行它
 export UYA_ROOT
 export UYA_SPLIT_C_DIR := $(CURDIR)/build/uyacache
 
-.PHONY: all check print-src build link-audit selftest codegen-audit probe e2e e2e-config e2e-exec e2e-accept-nudge e2e-config-flags e2e-title e2e-title-cmd e2e-title-auto e2e-mouse e2e-api e2e-steps e2e-permission e2e-sandbox e2e-tasks e2e-goal e2e-sessions e2e-resume-big e2e-diff e2e-ws e2e-model e2e-worktree e2e-watch e2e-watch-pick e2e-dsh p30-check tui-demo tui-selftest sess-selftest diff-selftest model-selftest panel-selftest clean shell-selftest
+.PHONY: all check print-src build link-audit selftest codegen-audit doc-audit probe e2e e2e-config e2e-exec e2e-accept-nudge e2e-config-flags e2e-title e2e-title-cmd e2e-title-auto e2e-mouse e2e-api e2e-steps e2e-permission e2e-sandbox e2e-tasks e2e-goal e2e-sessions e2e-resume-big e2e-diff e2e-ws e2e-model e2e-worktree e2e-watch e2e-watch-pick e2e-dsh p30-check tui-demo tui-selftest sess-selftest diff-selftest model-selftest panel-selftest clean shell-selftest
 
 all: build
 
@@ -131,6 +131,24 @@ codegen-audit: build
 	fi; \
 	echo "codegen-audit: 通过（没有切片描述符强转）"
 
+# 文档审计：仓库里不许留 Git 冲突标记（`<<<<<<<` / `=======` / `>>>>>>>`）。
+# 来历见 README 踩坑 94：一条合并残留的 `=======` 在 README 里从 P53 那次合并（3e62301）
+# 一直躺到 P56 —— 编译、自测、link-audit 全绿，**没有任何测试看得见它**，所以只能靠这条审计扫。
+# 只扫文本（源码 / 文档 / 脚本 / Makefile），跳过 .git 与构建产物；行首锚定，
+# 所以源码注释里的 `// ============` 这类分隔线不会误报。
+doc-audit:
+	@bad=$$(grep -rnE '^(<<<<<<<|=======|>>>>>>>)' \
+		--include='*.uya' --include='*.md' --include='*.py' --include='*.sh' --include='*.yml' \
+		--include='Makefile' --include='Makefile.*' \
+		--exclude-dir=.git --exclude-dir=build --exclude-dir=__pycache__ \
+		$(CURDIR) 2>/dev/null || true); \
+	if [ -n "$$bad" ]; then \
+		echo "doc-audit: 发现冲突标记（合并残留，必须删掉才准提交）："; \
+		echo "$$bad"; \
+		exit 1; \
+	fi; \
+	echo "doc-audit: 通过（没有冲突标记）"
+
 # 函数表容量（编译器里写死的 FUNCTION_TABLE_SIZE，无开关）：**绝对条数**上限，不是「本仓还能加 0 个」。
 #   P53 实测：main 6756 声明通过、**+1 个空函数**就报「函数表容量不足」；
 #   P54 实测（同一台机器、同一份 uya 0.10）：6792 声明通过，再 +6 个空函数仍通过，+8 个红
@@ -138,7 +156,7 @@ codegen-audit: build
 #   要命的地方在于增量编译看不出来（缓存），只有 `rm -rf build` 重编才炸，报错点还落在标准库里。
 #   所以「净增函数」的改动一律先清缓存重编一遍（见 README §3 踩坑 87）。
 #   变量与常量不占这个额度，只有函数占；整理手段见踩坑 87。
-selftest: build codegen-audit e2e-exec e2e-accept-nudge e2e-config-flags e2e-title e2e-title-cmd e2e-title-auto e2e-mouse e2e-api e2e-steps e2e-permission e2e-sandbox e2e-tasks e2e-goal e2e-sessions e2e-resume-big e2e-diff e2e-ws e2e-model e2e-worktree p30-check
+selftest: build codegen-audit doc-audit e2e-exec e2e-accept-nudge e2e-config-flags e2e-title e2e-title-cmd e2e-title-auto e2e-mouse e2e-api e2e-steps e2e-permission e2e-sandbox e2e-tasks e2e-goal e2e-sessions e2e-resume-big e2e-diff e2e-ws e2e-model e2e-worktree p30-check
 	UYA_BIN=$(UYA) $(OUT) --selftest
 
 probe: build
