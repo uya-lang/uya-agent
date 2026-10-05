@@ -32,8 +32,19 @@
 # 0.10 文档里的 `LINK_MODE=static` 对本路径**无效**（实测产物仍是 PIE 动态，那个变量
 # 是编译器自身构建脚本 compile.sh 用的）。
 
-UYA_ROOT ?= /home/winger/uya-0.10/lib/
-UYA      ?= /home/winger/uya-0.10/bin/uya
+# 编译器：用 /home/winger/uya/uya（0.10.3 + 两处「固定表」修复）。
+# 为什么不再用 /home/winger/uya-0.10（0.10.1）：
+#   ① 0.10.1 的**显式输入文件数硬上限是 64**（第 65 个报「收集模块依赖失败: <编译器路径>」，
+#      报错指不到根因）。本仓拆完 17937/12957/11583 三个大文件后有 **89 个构建文件**，
+#      0.10.1 直接编不动；
+#   ② 0.10.1 的 codegen `reachable_function_decls` 只有 4096 槽，超过就**静默丢函数**
+#      （定义与原型都不发射、调用点还在 ⇒ 宿主 C 报 implicit declaration + invalid
+#      initializer）。本仓 3600+ 个函数，正好踩在这条边界上。
+# 这两处都已在 /home/winger/uya/uya 修掉（见那边的提交：「输入文件表改为可增长」与
+# 「reachable 函数表改为按实际条数分配（修 >4096 个可达函数时静默丢函数）」）。
+# 换别的编译器时请先确认这两条都已修，否则 build 会以看不懂的方式失败。
+UYA_ROOT ?= /home/winger/uya/uya/lib/
+UYA      ?= /home/winger/uya/uya/bin/uya
 
 STATIC ?= 1
 ifeq ($(STATIC),1)
@@ -60,10 +71,11 @@ SRC := src/foundation/bufx.uya src/foundation/jsonx.uya src/foundation/yamlcfg.u
        src/term/view.uya src/term/watch.uya \
        src/tools/askuser.uya src/tools/fsx.uya src/tools/jobs.uya src/tools/perm.uya src/tools/sandboxx.uya src/tools/search.uya src/tools/shellx.uya \
        src/session/dshcfg.uya src/session/dshsess.uya src/session/inbox.uya src/session/modelx.uya src/session/procx.uya src/session/session.uya src/session/sigx.uya src/session/stats.uya \
-       src/agent/agent.uya src/agent/compact.uya src/agent/deleg.uya src/agent/goal.uya src/agent/instr.uya src/agent/plan.uya src/agent/prompt.uya src/agent/skill.uya src/agent/todo.uya src/agent/workflow.uya \
+       src/agent/agent.uya src/agent/ag_config.uya src/agent/ag_title_prompt.uya src/agent/ag_tools_schema.uya src/agent/ag_request_stream.uya src/agent/ag_workspace_model.uya src/agent/ag_worktree.uya src/agent/ag_interactive_tasks.uya src/agent/ag_tui_sessions.uya src/agent/ag_plan_pump.uya src/agent/compact.uya src/agent/deleg.uya src/agent/goal.uya src/agent/instr.uya src/agent/plan.uya src/agent/prompt.uya src/agent/skill.uya src/agent/todo.uya src/agent/workflow.uya \
        src/vcs/gitx.uya src/vcs/worktreex.uya \
        src/media/clipx.uya src/media/imgx.uya \
        src/selftest/selftest.uya src/selftest/shellselftest.uya src/selftest/sigselftest.uya src/selftest/tuiselftest.uya \
+       src/selftest/st_core.uya src/selftest/st_mockserver.uya src/selftest/st_diag_sse.uya src/selftest/st_session.uya src/selftest/st_readwin_knobs.uya src/selftest/st_view_watch.uya src/selftest/st_responses.uya src/selftest/st_perm_plan.uya src/selftest/st_stats_title.uya src/selftest/st_ws_biglog.uya src/selftest/st_goal_worktree.uya src/selftest/tuis_core.uya src/selftest/tuis_title_pty.uya src/selftest/tuis_exit_cmd.uya src/selftest/tuis_diff_scroll.uya src/selftest/tuis_title_ask.uya src/selftest/tuis_sessions_big.uya src/selftest/tuis_tail.uya \
        src/diff/model.uya src/diff/gitcmd.uya src/diff/rows.uya src/diff/view.uya src/diff/render.uya
 OUT := build/uya-agent
 

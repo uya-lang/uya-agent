@@ -1,0 +1,1463 @@
+// src/agent/ag_title_prompt.uya — 极简 CLI 编程 agent（agent.uya 的拆分片 2/9）
+//
+// 本文件：P46：自动起标题（对齐 DSH 的 provider 一路）；P18：统计边界（记日志 + 喂折叠 + 推给 TUI）；system prompt + tools schema；提示词状态（P8）：persona/plan 段从 DSH preset 读，读；P51：待发送的图片附件
+// 不变量：① 输出一律走 tty 协议（交互模式先擦输入行、写完重画），不许裸 fprintf；
+//   ② 诊断只走 `err_fd()` 那一个出口；③ 会话事件/标题/工作区都按锚点文件的口径写；
+//   ④ 与锚点 agent.uya 同处合并命名空间，不许加本地 `use`。
+// 依赖：libc/std、foundation（bufx/jsonx/yamlcfg）、net（llm/sse/webx）、term 与 term/tui、
+//   tools、session、vcs、diff、media。
+// 命名：对外符号沿用 `agent_*`；锚点 agent.uya 只留文件头、`Config`、`main`（拆分说明见那里）。
+
+// ============================================================
+// P46：自动起标题（对齐 DSH 的 provider 一路）
+//
+// 侧路请求，与 agent_maybe_compact 同一套骨架：复制历史 + 追加提示词 → 走生效协议
+// （未声明时同样允许一次协商回退）→ 结果**只**用来改标题，不进主历史、不进统计、不进转录。
+//
+// 三条纪律：
+//   * `print_content=false / print_reasoning=false`：起标题的请求不许在正文里吐字；
+//   * `interactive=g_interactive`：esc/ctrl+c 能中断它（中断 = 不改标题，不是错误）；
+//   * 失败一律静默（返回 false），由调用方决定给不给话术 —— 标题是 UI 特性，
+//     起标题失败绝不能让回合失败或让人以为出错了。
+// ============================================================
+
+// 起标题的提示词：只输出一行标题。口径对齐 DSH 的 fallback（≤40 B）+ maxTitleBytes（80 B）：
+// 让模型给短的，最后仍由 tty_title_clean_into 收口（前 80 B、码点边界）。
+fn agent_title_prompt_into(out: &Buf) bool {
+    buf_reset(out);
+    const head: &const byte = "Write a session title for the conversation above.\n\n";
+    if !buf_append_cstr(out, head) {
+        return false;
+    }
+    if !buf_append_cstr(out, "Rules:\n") {
+        return false;
+    }
+    if !buf_append_cstr(out, "- Reply with the title ONLY: one single line, no quotes, no markdown, no trailing punctuation.\n") {
+        return false;
+    }
+    if !buf_append_cstr(out, "- Write it in the same language as the user's most recent message.\n") {
+        return false;
+    }
+    if !buf_append_cstr(out, "- Name the concrete task or topic (files, subsystems, error strings) rather than the general area.\n") {
+        return false;
+    }
+    if !buf_append_cstr(out, "- Keep it within 40 characters (at most 5 words).\n") {
+        return false;
+    }
+    return buf_append_cstr(out, "- No preamble, no explanation, call no tool.");
+}
+
+// 让模型给一个候选标题（成功 = 建议值写进 out，返回 true）。
+//
+// `serve_input` = 这次请求要不要在流式期间服务键盘（esc 中断、运行中的只读命令）。
+//   * 裸 /title（前台）：true —— 用户可能想 esc 掉它，与别的请求同一条口径；
+//   * 自动起标题（后台）：调用方传 g_interactive（真机上就是 true），但 `g_bg_request`
+//     会让泵点退化成「只刷帧」，所以它仍然一个键都不读（见 agent_pump_block）。
+//     为什么不干脆传 false：false 会让流式循环完全不泵，界面在那几秒里是冻的 ——
+//     而这是个用户没发起的请求，冻住界面比「读键串味」更糟。
+//     `agent_bg_input_pending()` 是它的让路机制：一发现终端缓冲里有待读字节就中止自己。
+fn agent_title_generate(
+    cfg: &const Config,
+    h: &const History,
+    out: &Buf,
+    serve_input: bool
+) bool {
+    buf_reset(out);
+    if cfg.api_key.len == 0 || h.len == 0 {
+        return false;
+    }
+    // 历史副本 + 提示词（DSH 也是把提示词作为最后一条 user 消息，不动真历史）
+    var tmp: History = hist_init();
+    defer { hist_free(&tmp); }
+    var i: usize = 0;
+    while i < h.len {
+        const m: &const Msg = msg_at(h, i);
+        _ = hist_push_msg_kind(&tmp, m.role, m.kind, m.text as &const byte, m.text_len, m.extra as &const byte, m.extra_len);
+        i = i + 1;
+    }
+    var prompt: Buf = buf_new(2048);
+    defer { buf_free(&prompt); }
+    if !agent_title_prompt_into(&prompt) {
+        return false;
+    }
+    if !hist_push(&tmp, ROLE_USER, prompt.ptr as &const byte, prompt.len) {
+        return false;
+    }
+    var req: Buf = buf_new(request_bytes_needed(&tmp, cfg));
+    defer { buf_free(&req); }
+    var url: Buf = buf_new(cfg.base_url.len + 24);
+    defer { buf_free(&url); }
+    var hdrs: Buf = buf_new(512);
+    defer { buf_free(&hdrs); }
+    if !build_headers(cfg, &hdrs) {
+        return false;
+    }
+    var o: ChatOut = chat_out_new();
+    defer { chat_out_free(&o); }
+    var tc: TlsConn = tls_conn_empty();
+
+    var status: i32 = 0;
+    var tried: i32 = 0;
+    var interrupted: bool = false;
+    while true {
+        tried = tried + 1;
+        const style: u8 = api_style_now(cfg);
+        if !api_url_into(cfg, style, &url) || !build_model_request(cfg, &tmp, &req, style) {
+            return false;
+        }
+        var guard: FdGuard = FdGuard{ saved: -1, nullfd: -1, active: false };
+        tls_noise_mute(&guard, !cfg.tls_debug && !hc_debug);
+        const res: !i32 = llm_stream_style(
+            style,
+            url.ptr[0: url.len],
+            hdrs.ptr[0: hdrs.len],
+            req.ptr as &const byte,
+            req.len,
+            cfg.timeout_ms,
+            cfg.max_response,
+            cfg.verify,
+            cfg.pin.ptr[0: cfg.pin.len],
+            &o,
+            false,
+            false,
+            serve_input
+        );
+        tls_noise_unmute(&guard);
+        status = res catch |err| {
+            const eid: i32 = (@error_id(err) as! i32).value;
+            if eid == @error_id(error.LlmInterrupted) {
+                interrupted = true;
+            }
+            0;
+        };
+        if api_negotiate(cfg, style, status) && tried < 2 {
+            buf_reset(&o.content);
+            continue;
+        }
+        api_lock(cfg, style);
+        break;
+    }
+    if interrupted || status != 200 || o.content.len == 0 {
+        return false;
+    }
+    // 模型给的字节不可信：过唯一的标题规范化实现，再按 fallback 的口径压到「5 词 / 40 B」
+    // （模型偶尔会回一整句；DSH 的 provider 结果同样要过 normalizeSessionTitle 才落地）。
+    var fb: Buf = buf_new(TTY_TITLE_FALLBACK_BYTES + 16);
+    defer { buf_free(&fb); }
+    _ = tty_title_fallback_into(
+        &fb,
+        o.content.ptr as &const byte,
+        o.content.len,
+        TTY_TITLE_FALLBACK_WORDS,
+        TTY_TITLE_FALLBACK_BYTES
+    );
+    if fb.len == 0 {
+        return false;
+    }
+    _ = buf_append(out, fb.ptr as &const byte, fb.len);
+    return true;
+}
+
+// 回合收尾时**只是挂个待办**，真正发请求在空闲主循环里（见 agent_title_auto_pending_tick）。
+//
+// 为什么不能直接在这儿发：这一句在回合的同步路径上，请求在飞的那段会**拖长「回合还没结束」
+// 的窗口**，而运行中敲进来的命令走的是 steer 收件箱 —— 那玩意儿只在 step 边界被领取
+// （泵点里的 agent_tui_poll_pending_cmd 只管面板结果）。于是「起标题的请求在飞时敲 /status」
+// 会掉进收件箱干等，屏幕上就是没反应 —— p30-check 的 status-during-compact 当场抓到这条。
+// 挪到空闲循环 + 泵点上下文之后，落点就与 /compact 完全一样（P31 那条纪律）。
+export fn agent_title_auto_schedule(cfg: &const Config) void {
+    if (!agent_title_auto_on(cfg)) {
+        return;
+    }
+    g_title_auto_pending = true;
+    g_title_auto_arm_ms = ua_now_ms();
+}
+
+// 自动起标题是否**真的**该跑：开关开着 **且** 非交互（管道/CI）不跑 **且** 子代理不跑。
+// 理由：标题只服务交互界面，那两条路径上 `tty_title_set` 本来就是空操作 (§11.7)。
+fn agent_title_auto_on(cfg: &const Config) bool {
+    if !cfg.title || !cfg.title_auto || !g_interactive || cfg.is_subagent {
+        return false;
+    }
+    if g_title_pinned {
+        return false;
+    }
+    if g_title_human_msgs == 0 || g_title_human_msgs == g_title_auto_rev {
+        return false;   // 没有新的人类消息：不重复烧钱（revision 门控）
+    }
+    return true;
+}
+
+// 空闲主循环里消费待办：把标题换成模型给的（kind = provider，**不钉住** —— 下一条人类消息还能再换）。
+// 与 /compact 同一落点（空闲循环里发），但**泵点的口径不同**：/compact 是前台请求，
+// 泵点照常读键盘、照常派发运行中的只读命令；起标题是后台请求，泵点只刷帧（g_bg_request），
+// 一个字节的键都不读，而且一发现用户动键盘就中止自己。
+//
+// ⚠ 只在**真空闲**时才发：起标题是锦上添花，绝不能抢用户的输入。它是个同步请求，
+// 一发出去就是几百毫秒到几秒；那段时间用户敲的字只会落进 steer 收件箱，而收件箱要等
+// step 边界才被领取 —— 于是「起标题时敲 /status」看起来就是没反应（p30-check 的
+// status-during-compact 抓到过，落点还串成了「未知命令」）。有输入就先让给用户，
+// 下一圈空闲了再发。
+fn agent_title_auto_idle_ok() bool {
+    if !g_title_auto_pending {
+        return false;
+    }
+    // 两段静默（理由见 TITLE_AUTO_QUIET_MS 的注释）：arm 窗口 + 键盘窗口。
+    const now: u64 = ua_now_ms();
+    if g_title_auto_arm_ms > 0 && now >= g_title_auto_arm_ms
+        && now - g_title_auto_arm_ms < TITLE_AUTO_QUIET_MS {
+        return false;
+    }
+    const last_key: u64 = tui_last_key_ms();
+    if last_key > 0 && now >= last_key && now - last_key < TITLE_AUTO_QUIET_MS {
+        return false;
+    }
+    if tui_active() {
+        if tui_has_submit() || tui_overlay_open() {
+            return false;
+        }
+        // 有还没派发的浮层结果（面板里刚选中一条命令）也不行：那一圈的下一次迭代会
+        // 去派发它，而它顺手要收走「触发面板的那个 /」—— 与用户正在敲的命令搅在一起
+        // 就是 `//status`（实测症状，见 tui_overlay_result_pending 的注释）。
+        if tui_overlay_result_pending() {
+            return false;
+        }
+        // 输入行里已经有字 = 用户正在打字（可能刚敲了一个 `/` 在等面板）。
+        // 这时候发请求，那半个命令会被后面的泵点/主循环当成整条命令派发 ——
+        // 实测症状是 `/status` 变成 `//status` 然后「未知命令」（p30-check 的
+        // status-during-compact 抓到过）。
+        if tui_input_len() > 0 {
+            return false;
+        }
+    }
+    return inbox_len(&g_steer) == 0;
+}
+
+// 自动起标题的**发起**（P48）：只有「距回合收尾与距最后一次敲键都 ≥900 ms」才真的发。
+// 它是同步的（单线程，踩坑 47 起不了第二条线程），而且**用户一动键盘就中止自己**。
+// `--no-title-auto` 时整个函数是空操作。
+export fn agent_title_auto_pending_tick(cfg: &const Config, h: &const History) void {
+    if (!g_title_auto_pending) {
+        return;
+    }
+    // 用户的东西优先：有输入/有浮层就这一圈不发（待办留着，下一圈再看）
+    if !agent_title_auto_idle_ok() {
+        return;
+    }
+    g_title_auto_pending = false;
+    if (!agent_title_auto_on(cfg)) {
+        return;
+    }
+    // 先把 revision 记上：这次不管成没成，都不该为同一条消息再试一次
+    g_title_auto_rev = g_title_human_msgs;
+    // 后台请求：不读键盘、也不派发命令（g_bg_request 让泵点退化成「只刷帧」）
+    g_bg_request = true;
+    var t: Buf = buf_new(TTY_TITLE_FALLBACK_BYTES + 16);
+    defer { buf_free(&t); }
+    const got: bool = agent_title_generate(cfg, h, &t, g_interactive);
+    g_bg_request = false;
+    if !got {
+        return;
+    }
+    buf_reset(&g_sess.title);
+    _ = buf_append(&g_sess.title, t.ptr as &const byte, t.len);
+    g_title_auto_done = true;
+    agent_title_log_kind("provider" as &const byte, t.ptr as &const byte, t.len);
+    agent_title_write_index(cfg);
+    agent_title_apply();
+}
+
+// P46：`set_title` 工具。
+//
+// 与 /title 走同一个落点（agent_title_set_user），所以「钉住 / 落 user 事件 / 写索引 /
+// OSC 2」四条语义两条路完全一致 —— 这是本仓的既定纪律：同一件事只有一处实现。
+// 空串 = clear（退回基标题、解锁自动起标题），与 `/title clear` 同语义。
+// 参数缺失（没有 title 键）则报用法，不做任何改动。
+export fn agent_title_tool_set(cfg: &const Config, args: &const JsonValue, out: &Buf) void {
+    var t: Buf = buf_empty();
+    defer { buf_free(&t); }
+    if !js_obj_get_str_unescaped(args, "title", 5, &t) {
+        _ = buf_append_cstr(out, "error: set_title needs a \"title\" string (pass \"\" to clear it)\n");
+        return;
+    }
+    if t.len == 0 {
+        agent_title_clear(cfg);
+        _ = buf_append_cstr(out, "title cleared; the terminal title is back to the default and automatic titling resumes\n");
+        return;
+    }
+    const rc: i32 = agent_title_set_user(cfg, t.ptr as &const byte, t.len);
+    if rc == TITLE_SET_EMPTY {
+        _ = buf_append_cstr(out, "error: title must contain visible characters (control characters and whitespace alone are not a title)\n");
+        return;
+    }
+    _ = buf_append_cstr(out, "title set to \"");
+    _ = buf_append(out, g_sess.title.ptr as &const byte, g_sess.title.len);
+    _ = buf_append_cstr(out, "\" (pinned: automatic titling will not overwrite it; pass \"\" to clear)\n");
+}
+
+// 写一条 `user/message` 事件。`steer = true` 时带 `source.kind = "steer"`
+// （运行中敲进来的文本，见 §3.4 的 step 边界领取）。
+// 带图片附件时**多写一个 `attachments` 数组**；为空时一个字节都不多写（老日志形状不变）。
+fn agent_log_user(text: &const byte, n: usize, steer: bool) void {
+    var empty_att: Buf = buf_empty();
+    var no: bool = false;
+    agent_log_user_att(text, n, steer, &empty_att, &no);
+}
+
+// P51：与 agent_log_user 同一条路，只是**多写一个 attachments 数组**。
+// 为什么图片附件要进日志：`--resume` 之后那些图还得能重发（历史里存的是路径与元数据，
+// 字节在附件目录里按 id 存着）。attachments 为空时**一个字节都不多写** —— 老日志的形状
+// 与即将写入的日志逐字节相同。
+fn agent_log_user_att(text: &const byte, n: usize, steer: bool, att: &const Buf, have_att: &const bool) void {
+    if n == 0 {
+        return;
+    }
+    // P46：人类消息计数 = 自动起标题的 revision（steer 也算：用户确实又说了话）
+    g_title_human_msgs = g_title_human_msgs + 1;
+    const fresh: bool = agent_title_derive(text, n);
+    if g_sess.save {
+        var ev: Buf = buf_new(n + att.len + 256);
+        defer { buf_free(&ev); }
+        if sess_begin(&g_sess, "user/message", &ev) {
+            _ = buf_append_cstr(&ev, "{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":");
+            if jw_str_into(&ev, text, n) {
+                _ = buf_append_cstr(&ev, "}]");
+                if have_att[0] && att.len > 0 {
+                    _ = buf_append_cstr(&ev, ",\"attachments\":");
+                    _ = buf_append(&ev, att.ptr as &const byte, att.len);
+                }
+                if steer {
+                    _ = buf_append_cstr(&ev, ",\"source\":{\"kind\":\"steer\"}}");
+                } else {
+                    _ = buf_append_cstr(&ev, ",\"source\":{\"kind\":\"user\"}}");
+                }
+                _ = sess_end(&g_sess, &ev);
+            }
+        }
+        if fresh && g_sess.title.len > 0 {
+            agent_title_log_event();
+        }
+    }
+    agent_title_apply();
+}
+
+// 写一条 `assistant/message` 事件（正文 + 本次 usage）。
+// **退化响应那一步不写**（§5.4）—— 否则「上游正常收尾但什么都没给」在日志里
+// 与「模型真的回了空串」长得一模一样。
+fn agent_log_assistant(step: i32, o: &const ChatOut, t: u64) void {
+    if !g_sess.save {
+        return;
+    }
+    var ev: Buf = buf_new(o.content.len + 8192);
+    defer { buf_free(&ev); }
+    if !sess_begin_at(&g_sess, "assistant/message", t, &ev) {
+        return;
+    }
+    _ = buf_append_cstr(&ev, "{\"turn\":");
+    _ = buf_append_i64(&ev, g_turn as i64);
+    _ = buf_append_cstr(&ev, ",\"step\":");
+    _ = buf_append_i64(&ev, step as i64);
+    _ = buf_append_cstr(&ev, ",\"message\":{\"role\":\"assistant\",\"content\":");
+    agent_note_answer(o.content.ptr as &const byte, o.content.len);
+    if o.content.len > 0 {
+        if !jw_str_into(&ev, o.content.ptr as &const byte, o.content.len) {
+            return;
+        }
+    } else if !buf_append_cstr(&ev, "\"\"") {
+        return;
+    }
+    if o.ncalls > 0 {
+        // 容量按实际需要算（不再是固定 8192）：见 calls_json_make
+        var cj: Buf = buf_empty();
+        defer { buf_free(&cj); }
+        if !calls_json_make(o, &cj) {
+            // 会话日志是尽力而为：这里不能让整轮崩，但必须留话 —— 否则「这一步的
+            // assistant 事件里没有 tool_calls」事后完全查不出原因（真机踩过）。
+            out_err("[session] assistant 事件的 tool_calls 写不进日志（需要 ");
+            out_err_dec(calls_json_need(o));
+            out_err(" 字节，分配或写入失败）\n");
+            return;
+        }
+        _ = buf_append_cstr(&ev, ",\"tool_calls\":");
+        _ = buf_append(&ev, cj.ptr, cj.len);
+    }
+    _ = buf_append_cstr(&ev, "},\"usage\":{\"inputTokens\":");
+    _ = buf_append_i64(&ev, o.usage_in);
+    _ = buf_append_cstr(&ev, ",\"outputTokens\":");
+    _ = buf_append_i64(&ev, o.usage_out);
+    _ = buf_append_cstr(&ev, ",\"cacheReadTokens\":");
+    _ = buf_append_i64(&ev, o.usage_cache_read);
+    _ = buf_append_cstr(&ev, ",\"cacheWriteTokens\":");
+    _ = buf_append_i64(&ev, o.usage_cache_write);
+    _ = buf_append_cstr(&ev, ",\"reasoningTokens\":");
+    _ = buf_append_i64(&ev, o.usage_reasoning);
+    _ = buf_append_cstr(&ev, "}}");
+    _ = sess_end(&g_sess, &ev);
+}
+
+// P16：思考全空白（只有空白字符）就不值得记/不值得显示
+fn agent_text_blank(p: &const byte, n: usize) bool {
+    var i: usize = 0;
+    while i < n {
+        const c: byte = p[i];
+        if c != 32 as byte && c != 9 as byte && c != 10 as byte && c != 13 as byte {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+// 纯函数：assistant/reasoning 事件的 data 对象（自测逐字节断言的就是它）。
+// 形状跟着 assistant/message 走（message 包一层、字段名用线上协议名 reasoning_content）。
+fn agent_reasoning_event_json(out: &Buf, turn: i32, step: i32, text: &const byte, n: usize) bool {
+    if !buf_append_cstr(out, "{\"turn\":") {
+        return false;
+    }
+    if !buf_append_i64(out, turn as i64) {
+        return false;
+    }
+    if !buf_append_cstr(out, ",\"step\":") {
+        return false;
+    }
+    if !buf_append_i64(out, step as i64) {
+        return false;
+    }
+    if !buf_append_cstr(out, ",\"message\":{\"role\":\"assistant\",\"reasoning_content\":") {
+        return false;
+    }
+    if !jw_str_into(out, text, n) {
+        return false;
+    }
+    return buf_append_cstr(out, "}}");
+}
+
+// P16：思考全文落一条独立事件 —— 显示层只留一行，全文在这里活下来。
+// 独立事件（而不是塞进 assistant/message）有两个理由：message 那条要**原样**回灌给端点
+// （P4 的严格工具协议），而且 DSH 自己也是把 reasoning 与 message 分开记的。
+// reader（agent_hist_from_events）按已知类型分支，不认识这个类型就跳过，所以 --resume 不受影响。
+fn agent_log_reasoning(step: i32, o: &const ChatOut) void {
+    if !g_sess.save || o.reasoning.len == 0 {
+        return;
+    }
+    if agent_text_blank(o.reasoning.ptr as &const byte, o.reasoning.len) {
+        return;
+    }
+    var ev: Buf = buf_new(o.reasoning.len + 512);
+    defer { buf_free(&ev); }
+    if !sess_begin(&g_sess, "assistant/reasoning", &ev) {
+        return;
+    }
+    if !agent_reasoning_event_json(&ev, g_turn, step, o.reasoning.ptr as &const byte, o.reasoning.len) {
+        return;
+    }
+    _ = sess_end(&g_sess, &ev);
+}
+
+// 一步的思考收尾：显示上把那一行落进转录（幂等），日志上把全文记下来。
+// 成功 / 中断 / 报错、流式 / 非流式都走这里 —— 中断时也要先把提示符还回去再打别的。
+fn agent_note_reasoning(step: i32, o: &const ChatOut) void {
+    view_think_end(o.reasoning.ptr as &const byte, o.reasoning.len);
+    agent_log_reasoning(step, o);
+}
+
+// tool/call 在工具**真正开始执行前**写（tool/result 在它之后写）：统计折叠用两者的
+// time 差当 toolMs，背靠背写两条的话这个数字恒为 0。
+fn agent_log_tool_call(step: i32, call_id: &const Buf, name: &const Buf, args: &const Buf, t: u64) void {
+    if !g_sess.save {
+        return;
+    }
+    var ev: Buf = buf_new(args.len + 512);
+    defer { buf_free(&ev); }
+    if sess_begin_at(&g_sess, "tool/call", t, &ev) {
+        _ = buf_append_cstr(&ev, "{\"turn\":");
+        _ = buf_append_i64(&ev, g_turn as i64);
+        _ = buf_append_cstr(&ev, ",\"step\":");
+        _ = buf_append_i64(&ev, step as i64);
+        _ = buf_append_cstr(&ev, ",\"callId\":");
+        _ = jw_str_into(&ev, call_id.ptr as &const byte, call_id.len);
+        _ = buf_append_cstr(&ev, ",\"name\":");
+        _ = jw_str_into(&ev, name.ptr as &const byte, name.len);
+        _ = buf_append_cstr(&ev, ",\"arguments\":");
+        _ = jw_str_into(&ev, args.ptr as &const byte, args.len);
+        _ = buf_append_cstr(&ev, "}");
+        _ = sess_end(&g_sess, &ev);
+    }
+}
+
+// 写一条 `tool/result` 事件（工具名、call_id、结果正文）。
+// `call_id` 是严格工具协议回放的锚点 —— 与 `tool/call` 那一条配对（§3.5 的原子组）。
+fn agent_log_tool_result(step: i32, call_id: &const Buf, result: &const Buf, t: u64) void {
+    if !g_sess.save {
+        return;
+    }
+    var ev: Buf = buf_new(result.len + 512);
+    defer { buf_free(&ev); }
+    if sess_begin_at(&g_sess, "tool/result", t, &ev) {
+        _ = buf_append_cstr(&ev, "{\"turn\":");
+        _ = buf_append_i64(&ev, g_turn as i64);
+        _ = buf_append_cstr(&ev, ",\"step\":");
+        _ = buf_append_i64(&ev, step as i64);
+        _ = buf_append_cstr(&ev, ",\"callId\":");
+        _ = jw_str_into(&ev, call_id.ptr as &const byte, call_id.len);
+        _ = buf_append_cstr(&ev, ",\"content\":");
+        _ = jw_str_into(&ev, result.ptr as &const byte, result.len);
+        _ = buf_append_cstr(&ev, "}");
+        _ = sess_end(&g_sess, &ev);
+    }
+}
+
+// ============================================================
+// P18：统计边界（记日志 + 喂折叠 + 推给 TUI）
+// ============================================================
+//
+// 每个边界只在这里做一次：同一个毫秒值既进日志（sess_begin_at）又进折叠（st_*），
+// 所以「实时数字」与「resume 回放出来的数字」必须逐位相同（自测 stats-fold 钉这条）。
+// --no-save 时日志不写，折叠照常 —— 界面上的统计与有没有落盘无关。
+
+fn agent_bound_step_start(cfg: &const Config, h: &const History, step: i32) void {
+    const t: u64 = ua_now_ms();
+    if g_sess.save {
+        var ev: Buf = buf_new(96);
+        defer { buf_free(&ev); }
+        if sess_begin_at(&g_sess, "step/start", t, &ev) {
+            _ = buf_append_cstr(&ev, "{\"turn\":");
+            _ = buf_append_i64(&ev, g_turn as i64);
+            _ = buf_append_cstr(&ev, ",\"step\":");
+            _ = buf_append_i64(&ev, step as i64);
+            _ = buf_append_cstr(&ev, "}");
+            _ = sess_end(&g_sess, &ev);
+        }
+    }
+    st_step_start(g_turn as i64, step as i64, t);
+    agent_stats_sync(cfg, h);
+}
+
+// step 收尾记账：写 `step/end` 事件并把本步的统计折进 `Stats`（§3.4 的第 l 步）。
+// 早退路径（分配失败等）也要走到它，否则 `step/start` 与 `step/end` 会不成对。
+fn agent_bound_step_end(cfg: &const Config, h: &const History, step: i32) void {
+    const t: u64 = ua_now_ms();
+    if g_sess.save {
+        var ev: Buf = buf_new(96);
+        defer { buf_free(&ev); }
+        if sess_begin_at(&g_sess, "step/end", t, &ev) {
+            _ = buf_append_cstr(&ev, "{\"turn\":");
+            _ = buf_append_i64(&ev, g_turn as i64);
+            _ = buf_append_cstr(&ev, ",\"step\":");
+            _ = buf_append_i64(&ev, step as i64);
+            _ = buf_append_cstr(&ev, "}");
+            _ = sess_end(&g_sess, &ev);
+        }
+    }
+    st_step_end(g_turn as i64, step as i64);
+    agent_stats_sync(cfg, h);
+}
+
+// ms = ChatOut.first_token_ms（流式路径记的首 token 时刻）
+fn agent_bound_first_token(cfg: &const Config, h: &const History, step: i32, ms: i64) void {
+    if ms <= 0 {
+        return;
+    }
+    const t: u64 = ms as u64;
+    if g_sess.save {
+        var ev: Buf = buf_new(96);
+        defer { buf_free(&ev); }
+        if sess_begin_at(&g_sess, "assistant/first-token", t, &ev) {
+            _ = buf_append_cstr(&ev, "{\"turn\":");
+            _ = buf_append_i64(&ev, g_turn as i64);
+            _ = buf_append_cstr(&ev, ",\"step\":");
+            _ = buf_append_i64(&ev, step as i64);
+            _ = buf_append_cstr(&ev, "}");
+            _ = sess_end(&g_sess, &ev);
+        }
+    }
+    st_first_token(g_turn as i64, step as i64, t);
+}
+
+// step 边界记账 + 写 `assistant/message`。步骤见 §3.5 的第 4 步。
+// 与「把 assistant 消息压进历史」是两件事：这里是日志侧，那里是历史侧。
+fn agent_bound_assistant_message(cfg: &const Config, h: &const History, step: i32, o: &const ChatOut) void {
+    const t: u64 = ua_now_ms();
+    agent_log_assistant(step, o, t);
+    st_assistant_message(
+        g_turn as i64,
+        step as i64,
+        t,
+        o.usage_in,
+        o.usage_cache_read,
+        o.usage_cache_write,
+        o.usage_out
+    );
+    // 压力样本就是这次请求的 prompt 规模（DSH 的 pressureTokens）；同时把增量基准
+    // 锚在当下，之后 used = 样本 + (est_now - 锚点)（DSH 的 projectedTokens 口径）
+    var sys_t: i64 = 0;
+    var tools_t: i64 = 0;
+    var msgs_t: i64 = 0;
+    agent_ctx_est(cfg, h, &sys_t, &tools_t, &msgs_t);
+    g_ctx_est_at_sample = sys_t + tools_t + msgs_t;
+    agent_stats_sync(cfg, h);
+}
+
+// 记账 + 写 `tool/call`。**在工具真正执行之前**写 —— 所以 `/watch` 能在长 step 中途
+// 看到「正在跑哪个工具」（§9.1 说的实时粒度就是这条）。
+fn agent_bound_tool_call(cfg: &const Config, h: &const History, step: i32, call_id: &const Buf, name: &const Buf, args: &const Buf) void {
+    const t: u64 = ua_now_ms();
+    agent_log_tool_call(step, call_id, name, args, t);
+    st_tool_call(call_id.ptr as &const byte, call_id.len, t);
+    agent_stats_sync(cfg, h);
+}
+
+// 记账 + 写 `tool/result`（工具执行完之后）。与 `agent_bound_tool_call` 严格配对。
+fn agent_bound_tool_result(cfg: &const Config, h: &const History, step: i32, call_id: &const Buf, result: &const Buf) void {
+    const t: u64 = ua_now_ms();
+    agent_log_tool_result(step, call_id, result, t);
+    st_tool_result(call_id.ptr as &const byte, call_id.len, t);
+    agent_stats_sync(cfg, h);
+}
+
+// ------------------------------------------------------------
+// P18：上下文占用（DSH contextPressure / contextBreakdown 的等价物）
+// ------------------------------------------------------------
+//
+// 三段启发式：固定「4 字符 ≈ 1 token」（与 agent_pressure_tokens 同口径），
+// 刻意不做 provider 精确 tokenizer —— DSH 的 contextBreakdown 也是这个性质，
+// 所以三项之和**不等于**总量（CJK 会被低估），界面按「近似组成」呈现。
+//
+// g_tools_scratch 是请求组装也在用的共享 scratch。这里的调用点全部落在步边界上，
+// 与 build_*_request 不会嵌套（同一线程顺序执行），所以复用是安全的。
+fn agent_ctx_est(cfg: &const Config, h: &const History, sys_t: &i64, tools_t: &i64, msgs_t: &i64) void {
+    var sys_bytes: i64 = 0;
+    if h.len > 0 {
+        const m0: &const Msg = msg_at(h, 0);
+        if m0.role == ROLE_SYSTEM {
+            sys_bytes = (m0.text_len + m0.extra_len) as i64;
+        }
+    }
+    var tools_bytes: i64 = 0;
+    if tools_json(&g_tools_scratch, cfg.allow_shell, false) {
+        tools_bytes = g_tools_scratch.len as i64;
+    }
+    var msg_bytes: i64 = 0;
+    var i: usize = 1;   // h[0] 是系统提示词，已经算进 sys
+    while i < h.len {
+        const m: &const Msg = msg_at(h, i);
+        // P27：工具结果按**构请求后**的字节算 —— 请求里带的是剪枝过的文本，
+        // 估算必须同口径，否则投影压力偏高、压缩会提前触发（一次前缀重写是全价）。
+        if m.role == ROLE_TOOL {
+            msg_bytes = msg_bytes + (cmp_request_bytes(m.text as &const byte, m.text_len, m.kind, &g_ctx_scratch) as i64);
+        } else {
+            msg_bytes = msg_bytes + (m.text_len as i64);
+        }
+        msg_bytes = msg_bytes + (m.extra_len as i64);
+        i = i + 1;
+    }
+    sys_t[0] = sys_bytes / 4;
+    tools_t[0] = tools_bytes / 4;
+    msgs_t[0] = msg_bytes / 4;
+}
+
+// 展示用的 used（DSH 的 projectedTokens）：返回 -1 = 还不可用（提供方没报过用量）
+fn agent_ctx_used(cfg: &const Config, h: &const History, sys_t: &i64, tools_t: &i64, msgs_t: &i64) i64 {
+    agent_ctx_est(cfg, h, sys_t, tools_t, msgs_t);
+    if !st_have_pressure() {
+        return -1;
+    }
+    const est_now: i64 = sys_t[0] + tools_t[0] + msgs_t[0];
+    if g_ctx_est_at_sample < 0 {
+        // 没有增量基准（--resume 后第一帧：样本来自日志，当时的估算没落盘）：
+        // 锚在当下，先只用样本，等下一次请求再把锚点接上
+        g_ctx_est_at_sample = est_now;
+    }
+    return st_ctx_projected(st_pressure(), g_ctx_est_at_sample, est_now);
+}
+
+// 让运行时上下文快照与当前 cfg 一致（权限/plan/工作区变了就补推一条新的 user 消息）。
+// 与 `agent_plan_snapshot_sync` / `agent_ws_snapshot_sync` 同一套「比对快照再补推」的形状。
+fn agent_ctx_sync(cfg: &const Config, h: &const History) void {
+    var sys_t: i64 = 0;
+    var tools_t: i64 = 0;
+    var msgs_t: i64 = 0;
+    const used: i64 = agent_ctx_used(cfg, h, &sys_t, &tools_t, &msgs_t);
+    const pct: i32 = if used < 0 { -1 } else { st_ctx_percent(used, cfg.context_window) };
+    tui_set_ctx(pct);
+}
+
+// 统计行 + 上下文占用一起推给 TUI（没有 TUI 时是空操作：数字只在折叠里，不花冤枉钱）
+fn agent_stats_sync(cfg: &const Config, h: &const History) void {
+    if !tui_active() {
+        return;
+    }
+    var line: Buf = buf_new(512);
+    defer { buf_free(&line); }
+    if st_line(&line) {
+        tui_set_stats(line.ptr as &const byte, line.len);
+    } else {
+        tui_set_stats("" as &const byte, 0);
+    }
+    agent_ctx_sync(cfg, h);
+}
+
+// 写一条**只有 type + data** 的会话事件（无 step 上下文的那些）。
+// 有 step 归属的事件走 `agent_bound_*` 那一族。
+fn agent_log_simple(typ: &const byte, payload: &const byte) void {
+    if !g_sess.save {
+        return;
+    }
+    var ev: Buf = buf_new(256);
+    defer { buf_free(&ev); }
+    if !sess_begin(&g_sess, typ, &ev) {
+        return;
+    }
+    _ = buf_append_cstr(&ev, payload);
+    _ = sess_end(&g_sess, &ev);
+}
+
+// 回合开始：`g_turn` 加一、写 `turn/start`，并把会话级的 todo 清空（DSH 口径）。
+fn agent_log_turn_start() void {
+    var ev: Buf = buf_new(64);
+    defer { buf_free(&ev); }
+    if !g_sess.save {
+        return;
+    }
+    if !sess_begin(&g_sess, "turn/start", &ev) {
+        return;
+    }
+    _ = buf_append_cstr(&ev, "{\"turn\":");
+    _ = buf_append_i64(&ev, g_turn as i64);
+    _ = buf_append_cstr(&ev, "}");
+    _ = sess_end(&g_sess, &ev);
+    g_sess.turns = g_turn as i64;
+}
+
+// 回合结束：写 `turn/end`（带一句 reason，便于事后区分「正常收尾」与「中断/超预算」）。
+fn agent_log_turn_end(reason: &const byte) void {
+    if !g_sess.save {
+        return;
+    }
+    var ev: Buf = buf_new(128);
+    defer { buf_free(&ev); }
+    if !sess_begin(&g_sess, "turn/end", &ev) {
+        return;
+    }
+    _ = buf_append_cstr(&ev, "{\"turn\":");
+    _ = buf_append_i64(&ev, g_turn as i64);
+    _ = buf_append_cstr(&ev, ",\"reason\":");
+    _ = jw_str_into(&ev, reason, bufx_cstr_len(reason));
+    _ = buf_append_cstr(&ev, "}");
+    _ = sess_end(&g_sess, &ev);
+}
+
+// 从会话日志恢复消息历史（返回恢复的消息条数；0 表示没有可恢复内容）
+//
+// fold_stats=true 时顺带把**同一遍扫描**的每一行喂进统计折叠 —— 统计因此是全会话
+// 口径，resume 之后与恢复前逐位相同（子代理 fork 父历史时传 false：那份历史的步数
+// 是父会话的，不该算进子会话的统计）。
+fn agent_hist_from_log(cfg: &const Config, h: &History, path: &const Buf, out_next_seq: &i64, fold_stats: bool) i32 {
+    var r: SessReader = sess_reader_empty();
+    defer { sess_reader_free(&r); }
+    var pz: Buf = buf_new(path.len + 1);
+    defer { buf_free(&pz); }
+    _ = buf_append(&pz, path.ptr, path.len);
+    _ = buf_append_byte(&pz, 0);
+    if !sess_reader_load(pz.ptr as &const byte, &r) {
+        return 0;
+    }
+    var sp: Buf = buf_new(32768);
+    defer { buf_free(&sp); }
+    if !agent_system_prompt(cfg, &sp) {
+        return 0;
+    }
+    if !hist_push(h, ROLE_SYSTEM, sp.ptr as &const byte, sp.len) {
+        return 0;
+    }
+    // 恢复出来的历史**重新注入**运行时上下文与 AGENTS.md（DSH 也是重新求值）
+    agent_inject_context(cfg, h);
+    var line: Buf = buf_new(65536);
+    defer { buf_free(&line); }
+    var typ: Buf = buf_new(64);
+    defer { buf_free(&typ); }
+    var text: Buf = buf_new(65536);
+    defer { buf_free(&text); }
+    var extra: Buf = buf_new(65536);
+    defer { buf_free(&extra); }
+    var added: i32 = 0;
+    var expect: i64 = 0;
+    out_next_seq[0] = 0;
+    if fold_stats {
+        st_reset();
+    }
+    while sess_next(&r, &line) {
+        if fold_stats {
+            st_fold_line(&line);
+        }
+        const seq: i64 = sess_line_seq(&line);
+        if seq >= 0 {
+            if seq != expect {
+                out_err("[session] 警告：seq 不连续（");
+                out_err_dec(seq as usize);
+                out_err(" != ");
+                out_err_dec(expect as usize);
+                out_err("），日志可能损坏\n");
+            }
+            expect = seq + 1;
+        }
+        if !sess_line_type(&line, &typ) {
+            continue;
+        }
+        const view: &[byte] = line.ptr[0: line.len];
+        if sv_eq_cstr(&typ, "user/message") {
+            if sess_json_str(view, "text", &text) && text.len > 0 {
+                // P51：图片附件（`"attachments":[...]`）随消息一起回放 —— 少了它，
+                // --resume 之后那些图就发不出去了（历史里存的是路径 + 元数据）。
+                var att: Buf = buf_empty();
+                defer { buf_free(&att); }
+                const have_att: bool = sess_extract_array(view, "attachments", &att) && att.len > 0;
+                if have_att {
+                    if hist_push_msg(h, ROLE_USER, text.ptr as &const byte, text.len,
+                        att.ptr as &const byte, att.len) {
+                        added = added + 1;
+                    }
+                } else if hist_push(h, ROLE_USER, text.ptr as &const byte, text.len) {
+                    added = added + 1;
+                }
+            }
+        } else if sv_eq_cstr(&typ, "assistant/message") {
+            const has_text: bool = sess_json_str(view, "content", &text);
+            const has_calls: bool = sess_extract_array(view, "tool_calls", &extra);
+            if has_calls && extra.len > 0 {
+                if hist_push_msg(
+                    h,
+                    ROLE_ASSISTANT_CALLS,
+                    text.ptr as &const byte,
+                    if has_text { text.len } else { 0 as usize },
+                    extra.ptr as &const byte,
+                    extra.len
+                ) {
+                    added = added + 1;
+                }
+            } else if has_text && text.len > 0 {
+                if hist_push(h, ROLE_ASSISTANT, text.ptr as &const byte, text.len) {
+                    added = added + 1;
+                }
+            }
+        } else if sv_eq_cstr(&typ, "tool/result") {
+            var cid: Buf = buf_new(128);
+            defer { buf_free(&cid); }
+            if sess_json_str(view, "callId", &cid) && sess_json_str(view, "content", &text) {
+                // 会话日志不带工具名，回放出来的结果一律按通用规则剪（同 dshsess.uya 的说明）
+                if hist_push_msg(h, ROLE_TOOL, text.ptr as &const byte, text.len, cid.ptr as &const byte, cid.len) {
+                    added = added + 1;
+                }
+            }
+        } else if sv_eq_cstr(&typ, "session/title") {
+            var ttl: Buf = buf_new(256);
+            defer { buf_free(&ttl); }
+            if sess_json_string_dup(view, "title", &ttl) {
+                buf_reset(&g_sess.title);
+                _ = buf_append(&g_sess.title, ttl.ptr, ttl.len);
+                // P46：钉住与否只看**最后一条** title 事件的 kind（latest-wins，与 DSH 的
+                // foldSessionTitle 同口径）。不读它的话 `--resume` 之后钉住状态就丢了，
+                // 自动起标题会把用户手写的标题覆盖掉。
+                var kd: Buf = buf_new(32);
+                defer { buf_free(&kd); }
+                g_title_pinned = sess_json_str(view, "kind", &kd)
+                    && bufx_eq_cstr(kd.ptr as &const byte, kd.len, "user" as &const byte);
+            }
+        }
+    }
+    if r.dropped_tail {
+        out_err("[session] 最后一条记录不完整，已丢弃（崩溃恢复）\n");
+    }
+    out_next_seq[0] = expect;   // 续写时接着这个 seq 往下写
+    return added;
+}
+
+// 取字段并复制到独立缓冲（sess_json_str 内部用临时缓冲，这里要留下副本）
+fn sess_json_string_dup(view: &[byte], key: &const byte, out: &Buf) bool {
+    return sess_json_str(view, key, out);
+}
+
+// 打开（或恢复）会话：返回 false 表示只能新建
+// 子代理会话的父子关联（写进会话日志，便于看出派生关系）
+fn agent_log_delegation(cfg: &const Config) void {
+    if !cfg.is_subagent {
+        return;
+    }
+    g_sess.deleg_depth = cfg.deleg_depth;
+    if !g_sess.save {
+        return;
+    }
+    var line: Buf = buf_new(1024);
+    defer { buf_free(&line); }
+    _ = buf_append_cstr(&line, "{\"parentSession\":");
+    _ = jw_str_into(&line, cfg.parent_session.ptr as &const byte, cfg.parent_session.len);
+    _ = buf_append_cstr(&line, ",\"delegationDepth\":");
+    _ = buf_append_i64(&line, cfg.deleg_depth as i64);
+    _ = buf_append_cstr(&line, ",\"label\":");
+    _ = jw_str_into(&line, cfg.deleg_label.ptr as &const byte, cfg.deleg_label.len);
+    _ = buf_append_cstr(&line, "}");
+    _ = buf_append_byte(&line, 0);
+    agent_log_simple("subagent/start", line.ptr as &const byte);
+}
+
+// 只**新建**自己的会话日志（不恢复任何历史）；fork 出来的子代理用它
+fn agent_session_create(cfg: &const Config) bool {
+    // 必须在 sess_open **之前**把深度交给 SessionLog：header 是在 sess_open 里写的，
+    // 而 agent_log_delegation（原来唯一设置它的地方）在 agent_hist_init 里跑得更晚，
+    // 于是子代理会话 header 的 delegationDepth 一直是 0（靠 header 判断子会话的地方会认错）。
+    g_sess.deleg_depth = cfg.deleg_depth;
+    var home: Buf = buf_new(1024);
+    defer { buf_free(&home); }
+    if !agent_default_home(cfg, &home) {
+        return false;
+    }
+    var hz: Buf = buf_new(home.len + 1);
+    defer { buf_free(&hz); }
+    _ = buf_append(&hz, home.ptr, home.len);
+    _ = buf_append_byte(&hz, 0);
+    _ = agent_set_home(hz.ptr as &const byte);
+    var cwdz: Buf = buf_new(cfg.workspace.len + 1);
+    defer { buf_free(&cwdz); }
+    _ = buf_append(&cwdz, cfg.workspace.ptr, cfg.workspace.len);
+    _ = buf_append_byte(&cwdz, 0);
+    var modelz: Buf = buf_new(cfg.model.len + 1);
+    defer { buf_free(&modelz); }
+    _ = buf_append(&modelz, cfg.model.ptr, cfg.model.len);
+    _ = buf_append_byte(&modelz, 0);
+    var empty: [byte: 1] = [0];
+    // fork 出来的子代理也用父进程预指定的会话 id（否则父进程拿不到 d.sid，无法续跑）
+    var wantf: Buf = buf_empty();
+    defer { buf_free(&wantf); }
+    if cfg.force_session_id.len > 0 {
+        wantf = buf_new(cfg.force_session_id.len + 1);
+        if buf_valid(&wantf) {
+            _ = buf_append(&wantf, cfg.force_session_id.ptr, cfg.force_session_id.len);
+            _ = buf_append_byte(&wantf, 0);
+        }
+    }
+    return sess_open(
+        &g_sess,
+        hz.ptr as &const byte,
+        cwdz.ptr as &const byte,
+        modelz.ptr as &const byte,
+        "uya-agent",
+        if wantf.len > 0 { wantf.ptr as &const byte } else { &empty[0] as &const byte },
+        cfg.save_session,
+        0,
+        true
+    );
+}
+
+// 开会话：算路径、写 header、按 `--no-save` 决定要不要真落盘。
+// 新建走 `sess_open`；**恢复走 `sess_open_resume`**（往已经解析出来的那份日志续写、
+// 不按 cwd 重算路径 —— 重算会在同 id 下造一个无 header 的空文件、把会话劈成两半，踩坑 48）。
+// 开之前工作区必须已经定下来（§8.6）。
+export fn agent_session_open(cfg: &Config, h: &History, resume_path: &const Buf) bool {
+    // 同 agent_session_create：header 由 sess_open 写，深度必须在它之前落进 g_sess
+    g_sess.deleg_depth = cfg.deleg_depth;
+    var home: Buf = buf_new(1024);
+    defer { buf_free(&home); }
+    if !agent_default_home(cfg, &home) {
+        return false;
+    }
+    var hz: Buf = buf_new(home.len + 1);
+    defer { buf_free(&hz); }
+    _ = buf_append(&hz, home.ptr, home.len);
+    _ = buf_append_byte(&hz, 0);
+    _ = agent_set_home(hz.ptr as &const byte);
+
+    var id: Buf = buf_new(64);
+    defer { buf_free(&id); }
+    var rpath: Buf = buf_empty();       // 要恢复的会话文件路径（空 = 新建）
+    defer { buf_free(&rpath); }
+    var resumed: bool = false;
+    // P34：会话记录的工作区（日志里最后一条 session/workspace；没有就用 header 的创建时工作区）
+    var sess_ws: Buf = buf_new(1024);
+    defer { buf_free(&sess_ws); }
+    var ws_fallback: bool = false;      // 记录的工作区已不存在 → 留在当前工作区
+    if resume_path.len > 0 {
+        // 已解析出路径（--resume/--continue 或 fork 的父会话）：读身份 + 当前工作区
+        if buf_append(&rpath, resume_path.ptr, resume_path.len) {
+            var meta: SessMeta = sess_meta_empty();
+            defer { sess_meta_free(&meta); }
+            var pz: Buf = buf_new(resume_path.len + 1);
+            defer { buf_free(&pz); }
+            _ = buf_append(&pz, resume_path.ptr, resume_path.len);
+            _ = buf_append_byte(&pz, 0);
+            if sess_read_meta(pz.ptr as &const byte, &meta) {
+                _ = buf_append(&id, meta.id.ptr, meta.id.len);
+                resumed = true;
+                // 「这个会话在哪」必须在 agent_hist_from_log **之前**定下来：system prompt 的
+                // {{cwd}}、AGENTS.md、技能目录都在那里面按工作区求值
+                agent_session_workspace_pick(cfg, &meta, &sess_ws, &ws_fallback);
+                // P37：模型也跟随会话记录（必须在 system prompt 求值之前定：{{model}} 要它）
+                agent_session_model_pick(cfg, &meta);
+            }
+        }
+    } else if cfg.force_session_id.len > 0 {
+        // 父进程**预先**给这个子代理指定了会话 id（deleg_spawn 里约定）：
+        //   * 该 id 的日志已存在 → 这是 send_message 续跑，恢复历史继续写同一个日志；
+        //   * 不存在 → 这是首次派生，就用这个 id 新建（父进程因此知道 d.sid）。
+        // 原实现把会话 id 交给子进程随机生成，父进程无从得知 → d.sid 恒空 →
+        // send_message 每次都新开会话，续跑时上下文全丢（实测确认）。
+        var cwdz0: Buf = buf_new(cfg.workspace.len + 1);
+        defer { buf_free(&cwdz0); }
+        _ = buf_append(&cwdz0, cfg.workspace.ptr, cfg.workspace.len);
+        _ = buf_append_byte(&cwdz0, 0);
+        var found: Buf = buf_empty();
+        defer { buf_free(&found); }
+        if sess_find(hz.ptr as &const byte, cwdz0.ptr as &const byte, cfg.force_session_id.ptr as &const byte, cfg.force_session_id.len, &found) {
+            if buf_append(&rpath, found.ptr, found.len) {
+                var r1: SessReader = sess_reader_empty();
+                defer { sess_reader_free(&r1); }
+                var pz1: Buf = buf_new(found.len + 1);
+                defer { buf_free(&pz1); }
+                _ = buf_append(&pz1, found.ptr, found.len);
+                _ = buf_append_byte(&pz1, 0);
+                if sess_read_header(pz1.ptr as &const byte, &r1) {
+                    _ = buf_append(&id, r1.id.ptr, r1.id.len);
+                    resumed = true;
+                }
+            }
+        }
+        if !resumed {
+            _ = buf_append(&id, cfg.force_session_id.ptr, cfg.force_session_id.len);
+        }
+    }
+    if resumed {
+        var next_seq: i64 = 0;
+        const n: i32 = agent_hist_from_log(cfg, h, &rpath, &next_seq, true);
+        if n > 0 {
+            // P22：`agent_hist_from_log` 顺带把日志里的 `session/title` 恢复进了 `g_sess.title`，
+            // 但下面 `sess_open` 会把 SessionLog 整个重新初始化（`l.title` 重新分配 = 清空）。
+            // 先把标题抄出来，sess_open 之后再放回去 —— 否则 `--continue` 的会话标题每次都丢。
+            var kept_title: Buf = buf_new(g_sess.title.len + 8);
+            defer { buf_free(&kept_title); }
+            if g_sess.title.len > 0 {
+                _ = buf_append(&kept_title, g_sess.title.ptr as &const byte, g_sess.title.len);
+            }
+            const trimmed: usize = hist_trim_incomplete_tail(h);
+            if trimmed > 0 {
+                out_err("[session] 丢弃了 ");
+                out_err_dec(trimmed);
+                out_err(" 条「未完成一轮」的尾部消息\n");
+            }
+            out_err("[session] 已恢复 ");
+            out_err_dec(n as usize);
+            out_err(" 条消息（id=");
+            out_err_bytes(id.ptr, id.len);
+            out_err("）\n");
+            // 继续往**同一个**日志追加：路径用会话自己的那份（sess_open 会按当前 cwd 重算，
+            // 那正是「改挂」的入口 —— P34 换成 sess_open_resume，见 §16 踩坑 52）。
+            // l.cwd 传当前工作区：它表示「这个会话现在在哪」，索引（/sessions 的工作区列）
+            // 按它写；header 里的创建时工作区不动（那是元数据）。
+            var cwdz: Buf = buf_new(cfg.workspace.len + 1);
+            defer { buf_free(&cwdz); }
+            _ = buf_append(&cwdz, cfg.workspace.ptr, cfg.workspace.len);
+            _ = buf_append_byte(&cwdz, 0);
+            var modelz: Buf = buf_new(cfg.model.len + 1);
+            defer { buf_free(&modelz); }
+            _ = buf_append(&modelz, cfg.model.ptr, cfg.model.len);
+            _ = buf_append_byte(&modelz, 0);
+            var idz: Buf = buf_new(id.len + 1);
+            defer { buf_free(&idz); }
+            _ = buf_append(&idz, id.ptr, id.len);
+            _ = buf_append_byte(&idz, 0);
+            if !sess_open_resume(
+                &g_sess,
+                hz.ptr as &const byte,
+                cwdz.ptr as &const byte,
+                rpath.ptr as &const byte,
+                rpath.len,
+                modelz.ptr as &const byte,
+                "uya-agent",
+                idz.ptr as &const byte,
+                cfg.save_session,
+                next_seq
+            ) {
+                return false;
+            }
+            // P22：把日志里恢复出来的标题放回（sess_open 刚把它清掉）
+            if kept_title.len > 0 {
+                buf_reset(&g_sess.title);
+                _ = buf_append(&g_sess.title, kept_title.ptr as &const byte, kept_title.len);
+            }
+            // P34：记录的工作区已经没了（worktree 合并后被删是常态）—— 把「本次实际在哪」
+            // 补记一条，日志与索引因此不会停在一条对不上的记录上
+            if ws_fallback {
+                agent_workspace_log(cfg, "fallback" as &const byte, &sess_ws);
+            }
+            return true;
+        }
+        out_err("[session] 日志为空或无法解析，改为新建会话\n");
+    }
+    var cwdz2: Buf = buf_new(cfg.workspace.len + 1);
+    defer { buf_free(&cwdz2); }
+    _ = buf_append(&cwdz2, cfg.workspace.ptr, cfg.workspace.len);
+    _ = buf_append_byte(&cwdz2, 0);
+    var modelz2: Buf = buf_new(cfg.model.len + 1);
+    defer { buf_free(&modelz2); }
+    _ = buf_append(&modelz2, cfg.model.ptr, cfg.model.len);
+    _ = buf_append_byte(&modelz2, 0);
+    // 新建：子代理用父进程预指定的 id（父进程要拿它做 send_message 续跑），其余留空自生成
+    var want2: Buf = buf_empty();
+    defer { buf_free(&want2); }
+    if cfg.force_session_id.len > 0 {
+        want2 = buf_new(cfg.force_session_id.len + 1);
+        if buf_valid(&want2) {
+            _ = buf_append(&want2, cfg.force_session_id.ptr, cfg.force_session_id.len);
+            _ = buf_append_byte(&want2, 0);
+        }
+    }
+    return sess_open(
+        &g_sess,
+        hz.ptr as &const byte,
+        cwdz2.ptr as &const byte,
+        modelz2.ptr as &const byte,
+        "uya-agent",
+        if want2.len > 0 { want2.ptr as &const byte } else { "" as &const byte },
+        cfg.save_session,
+        0 as i64,
+        true
+    );
+}
+
+// 收尾：**先** `wt_reclaim_own` 回收本会话自己的确定性垃圾（结果要落一条 `session/worktree`
+// 事件，所以必须排在 `sess_close` 之前），再关日志、写索引。
+// **不自动 finish**：没验完的活不该被自动合并（§10.5）。
+export fn agent_session_close() void {
+    // P53：会话退出时先回收**本会话这个** worktree（如果它是「确定的垃圾」）。
+    // 顺序很重要：必须排在 sess_close **之前** —— 回收结果要落一条会话日志
+    // （`session/worktree`，action=reclaim），日志句柄一关就写不进去了。
+    // 为什么不在这里自动 finish：没验完的活不该被自动合并（P37 的老口径没变），
+    // 所以只有「零改动 + 零提交 + 没人在用」的那种才清掉，其余原样留着。
+    // --no-save / 子代理 / 没开这个模式：wt_reclaim_own 自己会判，这里不用管。
+    agent_worktree_reclaim_on_exit();
+    if g_sess.path.len > 0 {
+        sess_close(&g_sess, g_home.ptr as &const byte);
+    }
+}
+
+// 退出时回收自己的 worktree：清掉了就落一条日志 + 说一句话。
+// 只在交互式会话里出声（一次性任务 / 管道里少一句噪声），但**清**是照做的。
+fn agent_worktree_reclaim_on_exit() void {
+    if !wt_on() || !wt_ready() {
+        return;
+    }
+    // 子代理共享父的 worktree：它的退出绝不能把父的工作区拆了
+    if g_sess.deleg_depth > 0 {
+        return;
+    }
+    var out: Buf = buf_new(1024);
+    defer { buf_free(&out); }
+    if !wt_reclaim_own(&out) {
+        return;
+    }
+    agent_worktree_log_cstr("reclaim" as &const byte);
+    if g_interactive {
+        tty_write(&tty_ui, 2, out.ptr as &const byte, out.len);
+    }
+}
+
+// ============================================================
+// system prompt + tools schema
+// ============================================================
+// ============================================================
+// 提示词状态（P8）：persona/plan 段从 DSH preset 读，读不到用内置默认
+// ============================================================
+var g_texts: PromptTexts = PromptTexts{
+    persona: Buf{ ptr: null, len: 0, cap: 0 },
+    plan_section: Buf{ ptr: null, len: 0, cap: 0 },
+    instr_max_bytes: 65536,
+    loaded_from_preset: false,
+};
+var g_plan: PlanState = PlanState{ active: false, pending: 0 };
+
+// ============================================================
+// P51：待发送的图片附件
+//
+// **批次语义**：`/image <path>`（或剪贴板贴图）把图挂进 g_pending_imgs，随**下一条**
+// 用户消息一起发出，然后清空（对齐 DSH composer 的「附件跟着这一次提交走」）。
+// 为什么不直接塞进历史：历史里是「已经发过的消息」，而挂图是一次**部署**动作 ——
+// 用户可以连挂三张再敲回车；挂上之后屏幕上立刻有一行占位，用户看得见挂了什么。
+//
+// 为什么历史里存**路径**而不是字节：一张截图 base64 之后几 MB，几十条消息各带几 MB
+// 会把内存与请求缓冲一起顶爆。字节只在**构请求那一刻**从磁盘读一次并立刻编码
+// （见 build_chat_request / build_responses_request），历史里只留元数据。
+// ============================================================
+var g_pending_imgs: ImgList = ImgList{
+    items: [ImgRef{
+        kind: IMGX_NONE, width: 0, height: 0, bytes: 0,
+        path: Buf{ ptr: null, len: 0, cap: 0 }, name: Buf{ ptr: null, len: 0, cap: 0 }
+    }: IMGX_MAX_PER_MSG],
+    len: 0,
+};
+var g_pending_ready: bool = false;
+
+// 惰性初始化待发图片表（`g_pending_imgs`）。幂等；`/image`、`ctrl+v`、`/paste` 都先调它。
+fn agent_imgs_ensure() void {
+    if !g_pending_ready {
+        g_pending_imgs = imgx_list_new();
+        g_pending_ready = true;
+    }
+}
+
+// 清空待发图片（**批次语义**：随下一条用户消息发出后清空，对齐 DSH composer 的
+// 「附件跟着这一次提交走」，见 §13.1）。
+fn agent_imgs_clear() void {
+    agent_imgs_ensure();
+    imgx_list_free(&g_pending_imgs);
+    g_pending_imgs = imgx_list_new();
+}
+
+// 附件目录：<agent_home>/attachments（内容寻址落这里，见 imgx_store）。
+// 放 agent_home 而不是工作区：切工作区不该让已挂的图失联，而且附件是「这个 agent
+// 自己的东西」，跟着会话记录同一个根更好找。
+//
+// 这里**不能用 g_home**：那个全局只在会话打开时才被 agent_set_home 填上，而 /image
+// 可以在滚动模式的 REPL 里、会话还没开（或已经关）的时候敲 —— 实测那时的 g_home 是
+// 空的，路径退化成 "/attachments"，mkdir 建不出目录、落盘必然失败。cfg.agent_home
+// 是启动时就定下来的，任何时候都有值。
+fn agent_attach_dir(cfg: &const Config, out: &Buf) void {
+    buf_reset(out);
+    if cfg.agent_home.len > 0 {
+        _ = buf_append(out, cfg.agent_home.ptr as &const byte, cfg.agent_home.len);
+    } else {
+        // 兜底：home 没配（cfg 默认空）时用当前目录下的 .uya-agent，至少不写到根上去
+        _ = buf_append_cstr(out, ".uya-agent");
+    }
+    _ = buf_append_cstr(out, "/attachments");
+}
+var g_todos: TodoState = TodoState{ items: [], n: 0 };
+var g_texts_ready: bool = false;
+// P13：preset 旋钮（缺省 = DSH 标准 preset 默认值）
+var g_knobs: PresetKnobs = PresetKnobs{
+    read_limit: 2000,
+    read_max_bytes: 51200,
+    read_max_line: 2000,
+    prune_threshold: 8192,
+    prune_head: 4096,
+    prune_tail: 1024,
+    bash_prune_threshold: 0,      // 0 = 沿用 prune_threshold
+    bash_prune_permille: 0,       // 0 = 沿用 1000‰（headChars + tailChars）
+    glob_max: 100,
+    grep_max: 250,
+    grep_line: 2000,
+    bash_timeout_ms: 120000,
+    instr_max_bytes: 65536,
+    compact_threshold_permille: 800,
+    retain_permille: 160,
+    loaded: false,
+};
+
+// 本项目的补充节：Uya 语言要点（DSH 没有，但模型写 Uya 代码时需要）
+fn agent_extra_section() &const byte {
+    return "Uya language notes for files you write here:\n- Entry point is `export fn main() i32 { ... return 0; }`; print with the built-in `@println(\"text\")`.\n- Variables need explicit types: `const x: i32 = 1;` / `var s: &[const byte] = \"abc\";`. There is no `let`/`mut` and no `i++`.\n- Build and run with `UYA_ROOT=<lib> <uya> build <file> -o <out> && ./<out>`.\n- When writing file content, put real newlines in the string you pass to the write tool; do not double-escape them." as &const byte;
+}
+
+// 把 preset 旋钮落到各模块的全局上（缺省值就是 DSH 标准 preset 的值）
+fn agent_apply_knobs(cfg: &const Config) void {
+    if g_knobs.read_limit > 0 {
+        fs_read_limit = g_knobs.read_limit as usize;
+    }
+    if g_knobs.read_max_bytes > 0 {
+        fs_read_max_bytes = g_knobs.read_max_bytes as usize;
+    }
+    if g_knobs.read_max_line > 0 {
+        fs_read_max_line = g_knobs.read_max_line as usize;
+    }
+    if g_knobs.prune_threshold > 0 {
+        cmp_prune_threshold = g_knobs.prune_threshold as usize;
+    }
+    if g_knobs.prune_head > 0 {
+        cmp_prune_head = g_knobs.prune_head as usize;
+    }
+    if g_knobs.prune_tail > 0 {
+        cmp_prune_tail = g_knobs.prune_tail as usize;
+    }
+    cmp_bash_threshold = 0;
+    if g_knobs.bash_prune_threshold > 0 {
+        cmp_bash_threshold = g_knobs.bash_prune_threshold as usize;
+    }
+    cmp_bash_permille = 0;
+    if g_knobs.bash_prune_permille > 0 {
+        cmp_bash_permille = g_knobs.bash_prune_permille as usize;
+    }
+    if g_knobs.glob_max > 0 {
+        search_glob_max = g_knobs.glob_max as usize;
+    }
+    if g_knobs.grep_max > 0 {
+        search_grep_max = g_knobs.grep_max as usize;
+    }
+    if g_knobs.grep_line > 0 {
+        search_line_max = g_knobs.grep_line as usize;
+    }
+    if g_knobs.bash_timeout_ms > 0 {
+        g_bash_timeout_knob = g_knobs.bash_timeout_ms as u32;
+    }
+    _ = cfg;
+}
+
+// 惰性加载提示词文案与 preset 旋钮（`g_texts` / `g_knobs`，只做一次）。
+// 幂等：`g_texts_ready` 已经置上就立刻返回。
+fn agent_texts_ensure(cfg: &const Config) void {
+    if g_texts_ready {
+        return;
+    }
+    g_knobs = preset_knobs_default();
+    prompt_texts_init(cfg.dsh_root.ptr as &const byte, agent_dsh_home(), &g_texts, &g_knobs);
+    agent_apply_knobs(cfg);
+    plan_init(&g_plan);
+    todo_init(&g_todos);
+    if cfg.plan {
+        plan_set(&g_plan, true);
+    }
+    g_texts_ready = true;
+}
+
+// 组装 system prompt（分节 + 空节丢弃 + "\n\n" 连接）
+fn agent_note_answer(text: &const byte, n: usize) void {
+    if n == 0 {
+        return;
+    }
+    if !buf_valid(&g_last_answer) {
+        g_last_answer = buf_new(n + 64);
+    }
+    buf_reset(&g_last_answer);
+    _ = buf_append(&g_last_answer, text, n);
+}
+
+// 取**最终答复**（子代理与 ralph 靠它把结果写回管道）。
+// 返回内部全局的切片，调用方不许留存（下一回合会被覆盖）。
+export fn agent_last_answer() &[byte] {
+    if !buf_valid(&g_last_answer) {
+        return &"x"[0: 0];
+    }
+    return g_last_answer.ptr[0: g_last_answer.len];
+}
+
+// P28：这一步是不是「provider 侧缓存被淘汰」？是就记一条事件 + 打一行提示。
+// 判据在 compact.uya（cmp_cache_burst）；这里只负责落日志与提示，判错了也不会
+// 影响任何请求内容 —— 纯观测，不参与决策。
+fn agent_cache_burst_note(cfg: &const Config, o: &const ChatOut) void {
+    const prompt: i64 = o.usage_in + o.usage_cache_read;
+    if !cmp_cache_burst(o.usage_in, prompt) {
+        return;
+    }
+    var pl: Buf = buf_new(192);
+    defer { buf_free(&pl); }
+    if !cmp_cache_burst_json(o.usage_in, prompt, o.usage_cache_read, &pl) {
+        return;
+    }
+    if !buf_append_byte(&pl, 0) {
+        return;
+    }
+    agent_log_simple("cache/evicted", pl.ptr as &const byte);
+    if cfg.quiet {
+        return;
+    }
+    out_err("[cache] 本步 prompt ");
+    out_err_dec(prompt as usize);
+    out_err(" 里有 ");
+    out_err_dec(o.usage_in as usize);
+    out_err(" 未命中：provider 侧缓存淘汰（会话私有块被清，共享前缀还在）—— 重算一次，不是客户端改动\n");
+}
+
+// 装配 system prompt：分节（order 升序）+ 空节丢弃 + `{{model}}`/`{{cwd}}` 替换（§5.1）。
+// **必须在工作区定下来之后调** —— 这里的 `{{cwd}}`、AGENTS.md 发现、技能目录
+// 全按当前工作目录求值（§3.2）。
+fn agent_system_prompt(cfg: &const Config, out: &Buf) bool {
+    agent_texts_ensure(cfg);
+    if !prompt_build_system(cfg, &g_texts, g_plan.active, out) {
+        return false;
+    }
+    // P37：worktree 纪律（对齐 DSH preset 的 renderSection）。没开这个模式时是空串，一个字节不变。
+    var wts: Buf = buf_new(2048);
+    defer { buf_free(&wts); }
+    wt_section_into(&wts);
+    if wts.len > 0 {
+        if !buf_append_cstr(out, "\n\n") {
+            return false;
+        }
+        if !buf_append(out, wts.ptr as &const byte, wts.len) {
+            return false;
+        }
+    }
+    if !buf_append_cstr(out, "\n\n") {
+        return false;
+    }
+    return buf_append_cstr(out, agent_extra_section());
+}
+
+// 首次请求前注入：运行时上下文 + AGENTS.md（都是 user 消息，与 DSH 一致）
+fn agent_inject_context(cfg: &const Config, h: &History) void {
+    if h.len != 1 {
+        return;   // 只在「刚建好 system」时注入一次
+    }
+    var rctx: Buf = buf_new(2048);
+    defer { buf_free(&rctx); }
+    if prompt_runtime_context(cfg, g_plan.active, &rctx) && rctx.len > 0 {
+        _ = hist_push(h, ROLE_USER, rctx.ptr as &const byte, rctx.len);
+    }
+    g_plan_snap = g_plan.active;   // 这份快照描述了当时的 plan 状态（见 agent_plan_snapshot_sync）
+    var set: InstrSet = InstrSet{ items: [], n: 0 };
+    instr_init(&set);
+    defer { instr_free(&set); }
+    var ws: Buf = buf_new(FS_PATH_MAX);
+    defer { buf_free(&ws); }
+    _ = buf_append(&ws, cfg.workspace.ptr, cfg.workspace.len);
+    instr_collect(ws.ptr[0: ws.len], agent_dsh_home(), &set);
+    if set.n > 0 {
+        var msg: Buf = buf_new((g_texts.instr_max_bytes as usize) + 8192);
+        defer { buf_free(&msg); }
+        if instr_render(&set, g_texts.instr_max_bytes, &msg) {
+            _ = hist_push(h, ROLE_USER, msg.ptr as &const byte, msg.len);
+        }
+    }
+    // P10：技能目录（没有可模型调用的技能就不注入）
+    if !g_skills.scanned {
+        skills_collect(&g_skills, ws.ptr[0: ws.len], agent_dsh_home(), &cfg.skill_dirs);
+    }
+    var cat: Buf = buf_new(16384);
+    defer { buf_free(&cat); }
+    if skills_catalog(&g_skills, &cat) {
+        _ = hist_push(h, ROLE_USER, cat.ptr as &const byte, cat.len);
+    }
+}
+
+// plan 模式：模型看到的运行时上下文只在会话开始时注入一次，运行中切模式（tab / `/plan` /
+// 批准退出）必须**再推一份新快照**，否则模型下一轮看到的仍是旧状态 —— 那正是「plan 模式
+// 什么都没发生」的另一半原因（访问模式 P21 走的是同一条路子，见 agent_set_access）。
+// 记一份「模型已经被告知的状态」，step 边界对不上就补推：一处做完，所有切换路径都覆盖。
+var g_plan_snap: bool = false;
+
+// 每个 step 边界比对 `g_plan_snap` 与当前 plan 状态，**变了才**补推一条新的运行时上下文。
+// 顺序上放在压缩之后：别刚推就被折进 checkpoint（§3.4 第 g 步）。
+fn agent_plan_snapshot_sync(cfg: &const Config, h: &History) void {
+    if g_plan_snap == g_plan.active {
+        return;
+    }
+    var rctx: Buf = buf_new(2048);
+    defer { buf_free(&rctx); }
+    if prompt_runtime_context(cfg, g_plan.active, &rctx) && rctx.len > 0 {
+        var pushed: bool = hist_push(h, ROLE_USER, rctx.ptr as &const byte, rctx.len);
+        while !pushed {
+            if !hist_drop_oldest(h) {
+                break;
+            }
+            pushed = hist_push(h, ROLE_USER, rctx.ptr as &const byte, rctx.len);
+        }
+    }
+    g_plan_snap = g_plan.active;
+    var pl: Buf = buf_new(64);
+    defer { buf_free(&pl); }
+    _ = buf_append_cstr(&pl, "{\"active\":");
+    if g_plan.active {
+        _ = buf_append_cstr(&pl, "true");
+    } else {
+        _ = buf_append_cstr(&pl, "false");
+    }
+    _ = buf_append_cstr(&pl, "}");
+    _ = buf_append_byte(&pl, 0);   // agent_log_simple 收的是 C 字符串
+    agent_log_simple("plan/mode", pl.ptr as &const byte);
+}

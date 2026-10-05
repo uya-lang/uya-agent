@@ -1,0 +1,1553 @@
+// src/selftest/st_core.uya — 离线自测轮（selftest.uya 的拆分片 1/11）
+//
+// 本文件：探针；mock LLM 的响应体；长历史轮（mock mode 17）：连回 40 轮工具调用，专门压「历史上限」这条线。；mock LLM 服务端（跑在 fork 出的子进程里）
+// 不变量：① mock 与断言必须**确定性**（同一夹具同一 verdict，不依赖真实网络/时钟/环境）；
+//   ② 判定码只用**低 8 位**（子进程 `sys_exit` 会截断，261 显示成 5，见踩坑 89）；
+//   ③ 每轮可单跑（`UYA_SELFTEST_*_ONLY`）且幂等，轮次之间不许残留全局状态；
+//   ④ 轮次自己 fork 的子进程必须由该轮收干净，不许留孤儿。
+// 依赖：libc（syscall/unistd/heap/fcntl/signal）、foundation/bufx、net（LLM 协议与 SSE）、
+//   term 与 term/tui、tools、session、agent、vcs/gitx、diff；`mock_*` 全局与 `cfg_pin_api`
+//   在锚点文件 selftest.uya 里（锚点只留文件头、mock 全局与入口 `selftest_main`）。
+// 命名：对外 `probe_main`（--probe）/`selftest_main`（--selftest）在锚点；
+//   本片私有前缀 `mock_*`、`sse_*`、`ty_*`、`resp_*`、`stx_*`、`tsx_*`、`dp_/dg_/gcr_/mx_/wt_`。
+
+// ============================================================
+// 探针
+// ============================================================
+// 探针用配置里的 model 发一个最小请求：一次同时验证网络 / TLS / 鉴权 / model 名字。
+// 协议按 api_style_now()；未声明时同样允许一次协商回退（探针本来就是诊断工具）。
+fn probe_payload(cfg: &const Config, style: u8, payload: &Buf) bool {
+    var pw: JsonWriter = JsonWriter{ buf: null, cap: 0, used: 0, overflow: false };
+    jw_init(&pw, payload.ptr, payload.cap);
+    jw_byte(&pw, 123);
+    jw_key(&pw, "model");
+    jw_str(&pw, cfg.model.ptr, cfg.model.len);
+    jw_byte(&pw, 44);
+    if style == LLM_STYLE_RESPONSES {
+        jw_key(&pw, "input");
+        jw_byte(&pw, 91);
+        jw_byte(&pw, 123);
+        jw_key(&pw, "role");
+        jw_str_cstr(&pw, "user");
+        jw_byte(&pw, 44);
+        jw_key(&pw, "content");
+        jw_byte(&pw, 91);
+        jw_byte(&pw, 123);
+        jw_key(&pw, "type");
+        jw_str_cstr(&pw, "input_text");
+        jw_byte(&pw, 44);
+        jw_key(&pw, "text");
+        jw_str_cstr(&pw, "ping");
+        jw_byte(&pw, 125);
+        jw_byte(&pw, 93);
+        jw_byte(&pw, 125);
+        jw_byte(&pw, 93);
+        jw_byte(&pw, 44);
+        jw_key(&pw, "max_output_tokens");
+        jw_i64(&pw, 16);
+    } else {
+        jw_key(&pw, "messages");
+        jw_byte(&pw, 91);
+        jw_byte(&pw, 123);
+        jw_key(&pw, "role");
+        jw_str_cstr(&pw, "user");
+        jw_byte(&pw, 44);
+        jw_key(&pw, "content");
+        jw_str_cstr(&pw, "ping");
+        jw_byte(&pw, 125);
+        jw_byte(&pw, 93);
+        jw_byte(&pw, 44);
+        jw_key(&pw, "max_tokens");
+        jw_i64(&pw, 8);
+    }
+    jw_byte(&pw, 125);
+    if jw_overflow(&pw) {
+        return false;
+    }
+    payload.len = jw_used(&pw);
+    return true;
+}
+
+// 探针主流程（--probe 专用）：用配置里的 model 发一个最小请求，一次同时验证网络 / TLS /
+// 鉴权 / model 名字；协议按 api_style_now()，未声明时同样允许一次协商回退。
+// 返回进程退出码（AGENT_OK / AGENT_PROTO）；跑完即退，不改任何会话状态。
+export fn probe_main(cfg: &const Config) i32 {
+    var hdrs: Buf = buf_new(512);
+    defer { buf_free(&hdrs); }
+    if !build_headers(cfg, &hdrs) {
+        out_err("error: out of memory\n");
+        return AGENT_PROTO;
+    }
+    var u: Buf = buf_new(cfg.base_url.len + 24);
+    defer { buf_free(&u); }
+    var payload: Buf = buf_new(512);
+    defer { buf_free(&payload); }
+    if !buf_valid(&payload) {
+        out_err("error: out of memory\n");
+        return AGENT_PROTO;
+    }
+
+    var status: i32 = 0;
+    var attempt: i32 = 0;
+    while true {
+        attempt = attempt + 1;
+        const style: u8 = api_style_now(cfg);
+        if !api_url_into(cfg, style, &u) || !probe_payload(cfg, style, &payload) {
+            out_err("error: probe payload overflow\n");
+            return AGENT_PROTO;
+        }
+        out_err("probe: POST ");
+        out_err_bytes(u.ptr, u.len);
+        out_err("  [api=");
+        out_err(llm_style_name(style));
+        out_err("]\n");
+
+        var r: Resp = resp_empty();
+        var tc: TlsConn = tls_conn_empty();
+        var guard: FdGuard = FdGuard{ saved: -1, nullfd: -1, active: false };
+        tls_noise_mute(&guard, !cfg.tls_debug && !hc_debug);
+        const call_res: !void = http_request(
+            u.ptr[0: u.len],
+            &"POST"[0: 4],
+            hdrs.ptr[0: hdrs.len],
+            payload.ptr as &const byte,
+            payload.len,
+            cfg.timeout_ms,
+            cfg.max_response,
+            cfg.verify,
+            cfg.pin.ptr[0: cfg.pin.len],
+            &r,
+            &tc
+        );
+        tls_noise_unmute(&guard);
+        _ = call_res catch |err| {
+            out_err("probe: request failed, error name = ");
+            const nm: *byte = @error_name(err);
+            _ = sys_write(2, nm as *const byte, strlen(nm as &const byte)) catch {};
+            out_err("\n");
+            if tc.observed_len > 0 {
+                out_err("probe: observed leaf sha256 = ");
+                out_err_bytes(&tc.observed[0], tc.observed_len);
+                out_err("\n");
+            }
+            return AGENT_NET;
+        };
+        status = r.status;
+        out_err("probe: HTTP status = ");
+        out_err_dec(r.status as usize);
+        out_err("\n");
+        if tc.observed_len > 0 {
+            out_err("probe: leaf_sha256 = ");
+            out_err_bytes(&tc.observed[0], tc.observed_len);
+            out_err("\n");
+        } else {
+            out_err("probe: leaf_sha256 = (plain HTTP, no certificate)\n");
+        }
+        var n: usize = r.body.len;
+        if n > 400 {
+            n = 400;
+        }
+        out_err("probe: body[0..");
+        out_err_dec(n);
+        out_err("] =\n");
+        out_err_bytes(r.body.ptr, n);
+        out_err("\n");
+        resp_free(&r);
+        // 未声明协议 + 端点不存在 → 换 chat 再探一次（两次状态都会打印出来）
+        if api_negotiate(cfg, style, status) && attempt < 2 {
+            continue;
+        }
+        api_lock(cfg, style);
+        break;
+    }
+    return AGENT_OK;
+}
+
+// ============================================================
+// mock LLM 的响应体
+// ============================================================
+fn mock_toolcall_body(out: &Buf, with_shell: bool) bool {
+    var inner: Buf = buf_new(256);
+    defer { buf_free(&inner); }
+    if !buf_valid(&inner) {
+        return false;
+    }
+    var wi: JsonWriter = JsonWriter{ buf: null, cap: 0, used: 0, overflow: false };
+    jw_init(&wi, inner.ptr, inner.cap);
+    jw_byte(&wi, 123);
+    jw_key(&wi, "file_path");
+    jw_str_cstr(&wi, "note.txt");
+    jw_byte(&wi, 44);
+    jw_key(&wi, "content");
+    jw_str_cstr(&wi, "hello-selftest");
+    jw_byte(&wi, 125);
+    if jw_overflow(&wi) {
+        return false;
+    }
+    inner.len = jw_used(&wi);
+
+    var w: JsonWriter = JsonWriter{ buf: null, cap: 0, used: 0, overflow: false };
+    jw_init(&w, out.ptr, out.cap);
+    jw_byte(&w, 123);
+    jw_key(&w, "id");
+    jw_str_cstr(&w, "chatcmpl-selftest");
+    jw_byte(&w, 44);
+    jw_key(&w, "choices");
+    jw_byte(&w, 91);
+    jw_byte(&w, 123);
+    jw_key(&w, "index");
+    jw_i64(&w, 0);
+    jw_byte(&w, 44);
+    jw_key(&w, "message");
+    jw_byte(&w, 123);
+    jw_key(&w, "role");
+    jw_str_cstr(&w, "assistant");
+    jw_byte(&w, 44);
+    jw_key(&w, "content");
+    jw_null(&w);
+    jw_byte(&w, 44);
+    jw_key(&w, "tool_calls");
+    jw_byte(&w, 91);
+    jw_byte(&w, 123);
+    jw_key(&w, "id");
+    jw_str_cstr(&w, "call_1");
+    jw_byte(&w, 44);
+    jw_key(&w, "type");
+    jw_str_cstr(&w, "function");
+    jw_byte(&w, 44);
+    jw_key(&w, "function");
+    jw_byte(&w, 123);
+    jw_key(&w, "name");
+    jw_str_cstr(&w, "write");
+    jw_byte(&w, 44);
+    jw_key(&w, "arguments");
+    jw_str(&w, inner.ptr, inner.len);
+    jw_byte(&w, 125);
+    jw_byte(&w, 125);
+    if with_shell {
+        // 同一轮里再来一个 run_shell 调用，覆盖 fork+pipe+exec+退出码 这条路径
+        jw_byte(&w, 44);
+        jw_byte(&w, 123);
+        jw_key(&w, "id");
+        jw_str_cstr(&w, "call_2");
+        jw_byte(&w, 44);
+        jw_key(&w, "type");
+        jw_str_cstr(&w, "function");
+        jw_byte(&w, 44);
+        jw_key(&w, "function");
+        jw_byte(&w, 123);
+        jw_key(&w, "name");
+        jw_str_cstr(&w, "bash");
+        jw_byte(&w, 44);
+        jw_key(&w, "arguments");
+        jw_str_cstr(&w, "{\"command\":\"echo SELFTEST-SHELL-OK; pwd\",\"description\":\"echo a marker and print cwd\"}");
+        jw_byte(&w, 125);
+        jw_byte(&w, 125);
+    }
+    jw_byte(&w, 93);
+    jw_byte(&w, 125);
+    jw_byte(&w, 125);
+    jw_byte(&w, 93);
+    jw_byte(&w, 125);
+    if jw_overflow(&w) {
+        return false;
+    }
+    out.len = jw_used(&w);
+    return true;
+}
+
+// 踩坑 35 的端到端轮用：一发**参数超过 8 KiB** 的 write 调用（正文用 cap_test_body，
+// 头尾都有标记）。
+// 老代码在 agent_finish_step 里按固定 8192 序列化 tool_calls，于是这一步以
+// "error: out of memory serializing tool_calls" 中止整轮 —— 真机就是这么死的
+// （模型写 8 KiB 出头的文件/命令行）。这轮就是把那条路走一遍。
+fn mock_bigcall_body(out: &Buf) bool {
+    var content: Buf = buf_new(16384);
+    defer { buf_free(&content); }
+    var inner: Buf = buf_new(16384);
+    defer { buf_free(&inner); }
+    if !buf_valid(&content) || !buf_valid(&inner) {
+        return false;
+    }
+    if !cap_test_body(&content) {
+        return false;
+    }
+    var wi: JsonWriter = JsonWriter{ buf: null, cap: 0, used: 0, overflow: false };
+    jw_init(&wi, inner.ptr, inner.cap);
+    jw_byte(&wi, 123);
+    jw_key(&wi, "file_path");
+    jw_str_cstr(&wi, "note.txt");
+    jw_byte(&wi, 44);
+    jw_key(&wi, "content");
+    jw_str(&wi, content.ptr, content.len);
+    jw_byte(&wi, 125);
+    if jw_overflow(&wi) {
+        return false;
+    }
+    inner.len = jw_used(&wi);
+
+    var w: JsonWriter = JsonWriter{ buf: null, cap: 0, used: 0, overflow: false };
+    jw_init(&w, out.ptr, out.cap);
+    jw_byte(&w, 123);
+    jw_key(&w, "id");
+    jw_str_cstr(&w, "chatcmpl-selftest");
+    jw_byte(&w, 44);
+    jw_key(&w, "choices");
+    jw_byte(&w, 91);
+    jw_byte(&w, 123);
+    jw_key(&w, "index");
+    jw_i64(&w, 0);
+    jw_byte(&w, 44);
+    jw_key(&w, "message");
+    jw_byte(&w, 123);
+    jw_key(&w, "role");
+    jw_str_cstr(&w, "assistant");
+    jw_byte(&w, 44);
+    jw_key(&w, "content");
+    jw_null(&w);
+    jw_byte(&w, 44);
+    jw_key(&w, "tool_calls");
+    jw_byte(&w, 91);
+    jw_byte(&w, 123);
+    jw_key(&w, "id");
+    jw_str_cstr(&w, "call_big");
+    jw_byte(&w, 44);
+    jw_key(&w, "type");
+    jw_str_cstr(&w, "function");
+    jw_byte(&w, 44);
+    jw_key(&w, "function");
+    jw_byte(&w, 123);
+    jw_key(&w, "name");
+    jw_str_cstr(&w, "write");
+    jw_byte(&w, 44);
+    jw_key(&w, "arguments");
+    jw_str(&w, inner.ptr, inner.len);
+    jw_byte(&w, 125);
+    jw_byte(&w, 125);
+    jw_byte(&w, 93);
+    jw_byte(&w, 125);
+    jw_byte(&w, 125);
+    jw_byte(&w, 93);
+    jw_byte(&w, 125);
+    if jw_overflow(&w) {
+        return false;
+    }
+    out.len = jw_used(&w);
+    return true;
+}
+
+// 不限步数轮用：一封只含**一个** bash 调用的响应（每轮都一样，靠 tool_call_id 计数）。
+// 不碰文件，从而避开 fs 的观察策略（write 需要先 read）：每一步都是干净、等价的。
+fn mock_steps_body(out: &Buf) bool {
+    var w: JsonWriter = JsonWriter{ buf: null, cap: 0, used: 0, overflow: false };
+    jw_init(&w, out.ptr, out.cap);
+    jw_byte(&w, 123);
+    jw_key(&w, "id");
+    jw_str_cstr(&w, "chatcmpl-selftest");
+    jw_byte(&w, 44);
+    jw_key(&w, "choices");
+    jw_byte(&w, 91);
+    jw_byte(&w, 123);
+    jw_key(&w, "index");
+    jw_i64(&w, 0);
+    jw_byte(&w, 44);
+    jw_key(&w, "message");
+    jw_byte(&w, 123);
+    jw_key(&w, "role");
+    jw_str_cstr(&w, "assistant");
+    jw_byte(&w, 44);
+    jw_key(&w, "content");
+    jw_null(&w);
+    jw_byte(&w, 44);
+    jw_key(&w, "tool_calls");
+    jw_byte(&w, 91);
+    mock_call(&w, "call_step", "bash", "{\"command\":\"echo SELFTEST-STEP-OK\",\"description\":\"echo a marker\"}");
+    jw_byte(&w, 93);
+    jw_byte(&w, 125);
+    jw_byte(&w, 125);
+    jw_byte(&w, 93);
+    jw_byte(&w, 125);
+    if jw_overflow(&w) {
+        return false;
+    }
+    out.len = jw_used(&w);
+    return true;
+}
+
+// P16：最终回包里带一段 reasoning_content —— 显示层只留一行，**全文必须落进会话日志**，
+// 所以这段文本同时被 mock（产生）和 reasoning_log_round（在会话里读回来）用。
+// 刻意带换行与中文：既验证「取哪一行」的显示口径，也验证日志里的转义/反转义。
+const MOCK_REASONING: &const byte = "先看 note.txt 里有什么，再决定要不要覆盖\n第二行思考只该出现在日志里，不该出现在终端";
+
+// P54：**退化响应轮**（mode 41/42）里那段「只有思考」的文本 —— 真机上最常见的退化形状就是
+// 思考流了一大段、正文一个字都没上来。父进程断言证据里的 reasoning 字节数时用的就是这个
+// 常量的长度（`bufx_cstr_len`），不手数（踩坑 77/83 那族）。
+const MOCK_DEGEN_THINK: &const byte = "SELFTEST-DEGEN-THINK 只有思考没有正文";
+
+// 造一段 mock 的「最终答案」响应体（chat 形状，正文就是 marker）。
+// 写进已经 buf_new 好的 out（不扩容）；返回 false = 容量不够 / 溢出，调用方必须当轮红。
+fn mock_final_body(out: &Buf, marker: &const byte) bool {
+    var w: JsonWriter = JsonWriter{ buf: null, cap: 0, used: 0, overflow: false };
+    jw_init(&w, out.ptr, out.cap);
+    jw_byte(&w, 123);
+    jw_key(&w, "id");
+    jw_str_cstr(&w, "chatcmpl-selftest");
+    jw_byte(&w, 44);
+    jw_key(&w, "choices");
+    jw_byte(&w, 91);
+    jw_byte(&w, 123);
+    jw_key(&w, "index");
+    jw_i64(&w, 0);
+    jw_byte(&w, 44);
+    jw_key(&w, "message");
+    jw_byte(&w, 123);
+    jw_key(&w, "role");
+    jw_str_cstr(&w, "assistant");
+    jw_byte(&w, 44);
+    jw_key(&w, "reasoning_content");
+    jw_str_cstr(&w, MOCK_REASONING);
+    jw_byte(&w, 44);
+    jw_key(&w, "content");
+    jw_str_cstr(&w, marker);
+    jw_byte(&w, 125);
+    jw_byte(&w, 125);
+    jw_byte(&w, 93);
+    if mock_usage_on {
+        jw_byte(&w, 44);
+        mock_put_usage(&w);
+    }
+    jw_byte(&w, 125);
+    if jw_overflow(&w) {
+        return false;
+    }
+    out.len = jw_used(&w);
+    return true;
+}
+
+// 和 SSE 解析轮同一组数：prompt 100（含缓存 40）、completion 7、reasoning 3
+fn mock_put_usage(w: &JsonWriter) void {
+    jw_key(w, "usage");
+    jw_byte(w, 123);
+    jw_key(w, "prompt_tokens");
+    jw_i64(w, 100);
+    jw_byte(w, 44);
+    jw_key(w, "completion_tokens");
+    jw_i64(w, 7);
+    jw_byte(w, 44);
+    jw_key(w, "prompt_tokens_details");
+    jw_byte(w, 123);
+    jw_key(w, "cached_tokens");
+    jw_i64(w, 40);
+    jw_byte(w, 125);
+    jw_byte(w, 44);
+    jw_key(w, "completion_tokens_details");
+    jw_byte(w, 123);
+    jw_key(w, "reasoning_tokens");
+    jw_i64(w, 3);
+    jw_byte(w, 125);   // } completion_tokens_details
+    jw_byte(w, 125);   // } usage（root 的 } 由调用方补）
+}
+
+// ============================================================
+// 长历史轮（mock mode 17）：连回 40 轮工具调用，专门压「历史上限」这条线。
+//
+// 每轮 2 个便宜的 bash 调用（echo 一个唯一标记），id 带轮次（call_h<N>_a/b），于是：
+//   * 每个请求都能断言「配对完整」（assistant(tool_calls) 后面必须紧跟应答它的 tool 消息）
+//     —— 这正是端点 400 的判据；
+//   * 最后一轮还能数 `"tool_call_id":"call_h…` 的出现次数，断言 80 条工具结果一条都没被丢掉。
+// 旧实现（MSG_MAX=64）在第 21 步左右就会把历史打满，tool 结果写不进去 → 回合异常结束。
+// ============================================================
+const HISTCAP_ROUNDS: i32 = 40;
+
+// 长历史轮（mode 17）里第 round 轮的调用 id：`call_h<round>_<tag>`。
+// 两边用同一套规则生成，mock 才能按 id 断言工具结果有没有被丢。返回的 Buf 归调用方 free。
+fn mock_loop_id(round: i32, tag: &const byte) Buf {
+    var b: Buf = buf_new(32);
+    if !buf_valid(&b) {
+        return b;
+    }
+    _ = buf_append_cstr(&b, "call_h");
+    _ = buf_append_i64(&b, round as i64);
+    _ = buf_append_cstr(&b, "_");
+    _ = buf_append_cstr(&b, tag);
+    return b;
+}
+
+// 长历史轮第 round 轮的调用参数：一条 `echo HC-R<round>-<tag>` 的 bash 调用。
+// 返回的 Buf 归调用方 free；容量不够时返回未初始化的空 Buf（调用方要 buf_valid）。
+fn mock_loop_args(round: i32, tag: &const byte) Buf {
+    var b: Buf = buf_new(192);
+    if !buf_valid(&b) {
+        return b;
+    }
+    _ = buf_append_cstr(&b, "{\"command\":\"echo HC-R");
+    _ = buf_append_i64(&b, round as i64);
+    _ = buf_append_cstr(&b, "-");
+    _ = buf_append_cstr(&b, tag);
+    _ = buf_append_cstr(&b, "\",\"description\":\"echo loop marker\"}");
+    return b;
+}
+
+// 长历史轮（mode 17）每一轮的响应体：**一次给两个**工具调用（id 后缀 a/b，参数后缀 A/B），
+// 逼出「一条 assistant 消息带多个 tool_calls」这条路径。返回 false = 序列化溢出。
+fn mock_loop_body(out: &Buf, round: i32) bool {
+    var ia: Buf = mock_loop_id(round, "a");
+    defer { buf_free(&ia); }
+    var ib: Buf = mock_loop_id(round, "b");
+    defer { buf_free(&ib); }
+    var aa: Buf = mock_loop_args(round, "A");
+    defer { buf_free(&aa); }
+    var ab: Buf = mock_loop_args(round, "B");
+    defer { buf_free(&ab); }
+    if !buf_valid(&ia) || !buf_valid(&ib) || !buf_valid(&aa) || !buf_valid(&ab) {
+        return false;
+    }
+    var w: JsonWriter = JsonWriter{ buf: null, cap: 0, used: 0, overflow: false };
+    jw_init(&w, out.ptr, out.cap);
+    jw_byte(&w, 123);
+    jw_key(&w, "id");
+    jw_str_cstr(&w, "chatcmpl-selftest");
+    jw_byte(&w, 44);
+    jw_key(&w, "choices");
+    jw_byte(&w, 91);
+    jw_byte(&w, 123);
+    jw_key(&w, "index");
+    jw_i64(&w, 0);
+    jw_byte(&w, 44);
+    jw_key(&w, "message");
+    jw_byte(&w, 123);
+    jw_key(&w, "role");
+    jw_str_cstr(&w, "assistant");
+    jw_byte(&w, 44);
+    jw_key(&w, "content");
+    jw_null(&w);
+    jw_byte(&w, 44);
+    jw_key(&w, "tool_calls");
+    jw_byte(&w, 91);
+    // 两个同形状的 bash 调用（id/参数各自带轮次）
+    var k: usize = 0;
+    while k < 2 {
+        if k > 0 {
+            jw_byte(&w, 44);
+        }
+        var idb: &const Buf = &ia;
+        var argb: &const Buf = &aa;
+        if k == 1 {
+            idb = &ib;
+            argb = &ab;
+        }
+        jw_byte(&w, 123);
+        jw_key(&w, "id");
+        jw_str(&w, idb.ptr, idb.len);
+        jw_byte(&w, 44);
+        jw_key(&w, "type");
+        jw_str_cstr(&w, "function");
+        jw_byte(&w, 44);
+        jw_key(&w, "function");
+        jw_byte(&w, 123);
+        jw_key(&w, "name");
+        jw_str_cstr(&w, "bash");
+        jw_byte(&w, 44);
+        jw_key(&w, "arguments");
+        jw_str(&w, argb.ptr, argb.len);
+        jw_byte(&w, 125);
+        jw_byte(&w, 125);
+        k = k + 1;
+    }
+    jw_byte(&w, 93);
+    jw_byte(&w, 125);
+    jw_byte(&w, 125);
+    jw_byte(&w, 93);
+    jw_byte(&w, 125);
+    if jw_overflow(&w) {
+        return false;
+    }
+    out.len = jw_used(&w);
+    return true;
+}
+
+// 请求体里的配对校验：每个带 tool_calls 的 assistant 消息后面必须紧跟应答它的 N 条
+// role:"tool"（tool_call_id 与调用 id 一一对上），且不允许出现孤儿 tool 消息。
+// 端点拒掉本项目那次请求的判据就是这条（"insufficient tool messages following tool_calls"）。
+fn mock_field(m: &const JsonValue, key: &const byte, key_len: usize, out: &Buf) bool {
+    out[0] = buf_empty();
+    return js_obj_get_str_unescaped(m, key, key_len, out);
+}
+
+// b 与 C 字面量 lit 是否逐字节相等（空 Buf 一律 false）。
+// mock 端解析请求字段后的断言辅助。
+fn mock_field_is(b: &const Buf, lit: &const byte) bool {
+    if b.len == 0 {
+        return false;
+    }
+    return bufx_eq_cstr(b.ptr as &const byte, b.len, lit);
+}
+
+// 两个 Buf 是否逐字节相等（任一为空或长度不等即 false）。
+fn mock_field_eq(a: &const Buf, b: &const Buf) bool {
+    if a.len == 0 || a.len != b.len {
+        return false;
+    }
+    return bufx_mem_eq(a.ptr as &const byte, b.ptr as &const byte, a.len);
+}
+
+// mock 端最贵的断言：请求里的 `messages` 数组必须满足「每个 assistant tool_calls 后面
+// 紧跟等量的 tool 结果」（端点 400 的判据就是这条）。解析用的临时内存是 malloc 的，
+// 函数内自己 free；false = 配对错（或在 mid-turn 被切断，见函数内说明）。
+fn mock_pairing_ok(rx: &const Buf) bool {
+    var arr: Buf = buf_new(1 << 16);
+    defer { buf_free(&arr); }
+    if !buf_valid(&arr) {
+        return false;
+    }
+    const view: &[byte] = rx.ptr[0: rx.len];
+    if !sess_extract_array(view, "messages", &arr) {
+        return false;
+    }
+    const raw: &void = malloc(1 << 20);
+    if ((raw as &byte) as usize) == 0 {
+        return false;
+    }
+    defer { free(raw); }
+    var arena: Arena = Arena{ buffer: null, size: 0, used: 0 };
+    arena_init(&arena, raw as &byte, 1 << 20);
+    var root: JsonValue = JsonValue.json_null();
+    if !js_parse(&arena, arr.ptr, arr.len, &root) {
+        return false;
+    }
+    const total: usize = js_arr_len(&root);
+    var i: usize = 0;
+    while i < total {
+        var m: JsonValue = JsonValue.json_null();
+        if !js_arr_get(&root, i, &m) {
+            return false;
+        }
+        var role: Buf = buf_empty();
+        defer { buf_free(&role); }
+        if !mock_field(&m, "role", 4, &role) {
+            return false;
+        }
+        var tc: JsonValue = JsonValue.json_null();
+        if js_obj_get(&m, "tool_calls", 10, &tc) {
+            const nc: usize = js_arr_len(&tc);
+            if nc == 0 {
+                return false;
+            }
+            var k: usize = 0;
+            while k < nc {
+                if i + 1 + k >= total {
+                    return false;   // 缺 tool 应答
+                }
+                var tm: JsonValue = JsonValue.json_null();
+                var cm: JsonValue = JsonValue.json_null();
+                var trole: Buf = buf_empty();
+                defer { buf_free(&trole); }
+                var tcid: Buf = buf_empty();
+                defer { buf_free(&tcid); }
+                var cid: Buf = buf_empty();
+                defer { buf_free(&cid); }
+                if !js_arr_get(&root, i + 1 + k, &tm) || !js_arr_get(&tc, k, &cm) {
+                    return false;
+                }
+                if !mock_field(&tm, "role", 4, &trole) || !mock_field_is(&trole, "tool") {
+                    return false;
+                }
+                if !mock_field(&tm, "tool_call_id", 12, &tcid) || !mock_field(&cm, "id", 2, &cid) {
+                    return false;
+                }
+                if !mock_field_eq(&tcid, &cid) {
+                    return false;   // 应答的不是这个调用
+                }
+                k = k + 1;
+            }
+            i = i + nc + 1;
+            continue;
+        }
+        if mock_field_is(&role, "tool") {
+            return false;   // 孤儿 tool：它的 assistant 已经被丢掉了
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+// ============================================================
+// mock LLM 服务端（跑在 fork 出的子进程里）
+// ============================================================
+fn count_sub(hay: &const Buf, needle: &const byte) i32 {
+    const view: &[byte] = hay.ptr[0: hay.len];
+    const pat: &[byte] = needle[0: strlen(needle)];
+    if pat.len == 0 {
+        return 0;
+    }
+    var n: i32 = 0;
+    var from: usize = 0;
+    while true {
+        const at: isize = find_sub(view, pat, from);
+        if at < 0 {
+            break;
+        }
+        n = n + 1;
+        from = (at as usize) + pat.len;
+    }
+    return n;
+}
+
+// hay 里是否含子串 needle（needle 按 C 串取长度，内部 find_sub）。
+// 空 needle 恒真；本文件多处断言都用它。
+fn contains(hay: &const Buf, needle: &const byte) bool {
+    const view: &[byte] = hay.ptr[0: hay.len];
+    return find_sub(view, needle[0: strlen(needle)], 0) >= 0;
+}
+
+// 请求体（紧凑 JSON，构建时没有任何结构性空白）里出现了裸控制字节（< 0x20）？
+// 返回条数。请求头里有 \r\n，所以从空行之后开始扫。
+// 这条不变量就是 P15 的哨兵：转义漏一个字节（最典型的是工具结果里的 NUL），
+// 真网关就会 400：invalid character '\x00' in string literal。
+fn sel_body_raw_control(rx: &const Buf) usize {
+    const view: &[byte] = rx.ptr[0: rx.len];
+    const at: isize = find_sub(view, &"\r\n\r\n"[0: 4], 0);
+    if at < 0 {
+        return 0;
+    }
+    var i: usize = (at as usize) + 4;
+    var n: usize = 0;
+    while i < rx.len {
+        if rx.ptr[i] < 32 as byte {
+            n = n + 1;
+        }
+        i = i + 1;
+    }
+    return n;
+}
+
+// 从 mock 端的连接读一整个 HTTP 请求（循环读到 `\r\n\r\n` 之后按 Content-Length 补齐 body），
+// 追加进 rx（rx 由调用方 buf_new 并负责 free）。返回 false = 对端提前关闭 / 追加失败 / 请求不完整。
+fn mock_read_request(cfd: i32, rx: &Buf) bool {
+    var tmp: [byte: 4096] = [0: 4096];
+    while true {
+        const n: isize = sys_read(cfd, &tmp[0], 4096) catch { 0 as isize; };
+        if n <= 0 {
+            return false;
+        }
+        if !buf_append(rx, &tmp[0], n as usize) {
+            return false;
+        }
+        const view: &[byte] = rx.ptr[0: rx.len];
+        const he: isize = find_sub(view, &"\r\n\r\n"[0: 4], 0);
+        if he >= 0 {
+            const head_end: usize = (he as usize) + 4;
+            var need: usize = 0;
+            var cl_off: usize = 0;
+            var cl_len: usize = 0;
+            if head_value(view, head_end, &"content-length"[0: 14], &cl_off, &cl_len) && cl_len > 0 {
+                const want: i64 = parse_u64_at(view, cl_off, cl_len);
+                if want > 0 {
+                    need = want as usize;
+                }
+            }
+            if rx.len >= head_end + need {
+                return true;
+            }
+        }
+    }
+}
+
+// 完整响应体 → 一帧 SSE：把 "message" 键换成 "delta"，补齐 [DONE]。
+// 非流式与流式的响应体除了这个键名之外结构一致，所以这层转换足以让同一份
+// mock 数据同时覆盖两条路径（且 arguments 会一次性给全）。
+fn sse_from_body(body: &const Buf, out: &Buf) bool {
+    var i: usize = 0;
+    while i < body.len {
+        if i + 9 <= body.len && bufx_eq_cstr(&body.ptr[i] as &const byte, 9, "\"message\"") {
+            if !buf_append_cstr(out, "\"delta\"") {
+                return false;
+            }
+            i = i + 9;
+            continue;
+        }
+        if !buf_append_byte(out, body.ptr[i]) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+// P30：**单步长流式** —— 与 mock_send_sse 的差别只在停顿的位置。
+//   * mock_send_sse：停顿发生在**响应头之前** → 客户端还卡在「等响应头」上，
+//     根本没进流式循环，泵点自然也不会跑（用它测不出「运行中派发」）；
+//   * 本函数：响应头 + 第一帧（只有 role 的 delta）立刻发出去 → 客户端进到流式循环，
+//     **泵点每 ≤50ms 跑一次**；正文与 [DONE] 等 mock_sse_gap_ns 之后再发。
+// 这样「长单步」的现场才成立，也才能量出「敲键 → 浮层出现」的延迟。
+fn mock_send_sse_slow(cfd: i32, body: &const Buf) bool {
+    var f1: Buf = buf_new(256);
+    defer { buf_free(&f1); }
+    if !buf_append_cstr(&f1, "data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"}}]}\n\n") {
+        return false;
+    }
+    var head: Buf = buf_new(512);
+    defer { buf_free(&head); }
+    _ = buf_append_cstr(&head, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n");
+    _ = buf_append_u64_hex(&head, f1.len);
+    _ = buf_append_cstr(&head, "\r\n");
+    _ = buf_append(&head, f1.ptr, f1.len);
+    _ = buf_append_cstr(&head, "\r\n");
+    https_write_all(cfd, &head.ptr[0] as &const byte, head.len) catch {
+        return false;
+    };
+    if mock_sse_gap_ns > 0 {
+        const gap: i64 = mock_sse_gap_ns;
+        var ts: TimeSpec = TimeSpec{ tv_sec: gap / (1000000000 as i64),
+            tv_nsec: gap % (1000000000 as i64) };
+        var rem: TimeSpec = TimeSpec{ tv_sec: 0, tv_nsec: 0 };
+        _ = sys_nanosleep(&ts, &rem) catch {};
+    }
+    var f2: Buf = buf_new(8192);
+    defer { buf_free(&f2); }
+    if !buf_append_cstr(&f2, "data: ") {
+        return false;
+    }
+    if !sse_from_body(body, &f2) {
+        return false;
+    }
+    if !buf_append_cstr(&f2, "\n\ndata: [DONE]\n\n") {
+        return false;
+    }
+    var tail: Buf = buf_new(8192);
+    defer { buf_free(&tail); }
+    _ = buf_append_u64_hex(&tail, f2.len);
+    _ = buf_append_cstr(&tail, "\r\n");
+    _ = buf_append(&tail, f2.ptr, f2.len);
+    _ = buf_append_cstr(&tail, "\r\n0\r\n\r\n");
+    https_write_all(cfd, &tail.ptr[0] as &const byte, tail.len) catch {
+        return false;
+    };
+    return true;
+}
+
+// 与 mock_send_sse 相同，但**不发 [DONE]**（用于中断/截断测试）
+fn mock_send_sse_nodone(cfd: i32, body: &const Buf) bool {
+    var text: Buf = buf_new(8192);
+    defer { buf_free(&text); }
+    if !buf_append_cstr(&text, "data: ") {
+        return false;
+    }
+    if !sse_from_body(body, &text) {
+        return false;
+    }
+    if !buf_append_cstr(&text, "\n\n") {
+        return false;
+    }
+    var head: Buf = buf_new(256);
+    defer { buf_free(&head); }
+    _ = buf_append_cstr(&head, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n");
+    _ = buf_append_u64_hex(&head, text.len);
+    _ = buf_append_cstr(&head, "\r\n");
+    _ = buf_append(&head, text.ptr, text.len);
+    _ = buf_append_cstr(&head, "\r\n");
+    https_write_all(cfd, &head.ptr[0] as &const byte, head.len) catch {
+        return false;
+    };
+    return true;
+}
+
+// 以 SSE（chunked，两段 chunk）回一个完整响应体。
+//
+// P21：两段之间**故意停 10ms**（分两次写，不再攒成一个包）—— 否则客户端在同一毫秒里
+// 解析完整个流，「首 token → 消息组装」的解码窗口恒为 0，`st_decode_ms() > 0` 这条
+// 断言就没法确定性地成立（真实网关是渐进流式的，见 §15.4 的偏差段）。
+fn mock_send_sse(cfd: i32, body: &const Buf) bool {
+    var text: Buf = buf_new(8192);
+    defer { buf_free(&text); }
+    if !buf_valid(&text) {
+        return false;
+    }
+    if !buf_append_cstr(&text, "data: ") {
+        return false;
+    }
+    if !sse_from_body(body, &text) {
+        return false;
+    }
+    if !buf_append_cstr(&text, "\n\ndata: [DONE]\n\n") {
+        return false;
+    }
+
+    var head: Buf = buf_new(256);
+    defer { buf_free(&head); }
+    _ = buf_append_cstr(&head, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n");
+    // P23：先停一下再发第一段 —— 父进程就靠这个窗口在「回合还在跑」的时候敲键，
+    // 而且这一段里一个答案字节都没有，所以「浮层比最终答案先出现」是可判定的。
+    // 注意 tv_nsec 必须 < 1e9（直接塞 1.2e9 会 EINVAL，等于没停）。
+    if mock_sse_gap_ns > 0 {
+        const gap: i64 = mock_sse_gap_ns;
+        var ts: TimeSpec = TimeSpec{ tv_sec: gap / (1000000000 as i64),
+            tv_nsec: gap % (1000000000 as i64) };
+        var rem: TimeSpec = TimeSpec{ tv_sec: 0, tv_nsec: 0 };
+        _ = sys_nanosleep(&ts, &rem) catch {};
+    }
+    // 切点放在**第一帧结束处**（`\n\n`）：第一段必须已经带着首个 delta。
+    // 砍在 JSON 中间的话首个 delta 会和 [DONE] 一起到，解码窗口又变成 0（踩过）
+    var half: usize = text.len / 2;
+    const nl: &const byte = "\n\n" as &const byte;
+    const fe: isize = find_sub(text.ptr[0: text.len], nl[0: 2], 0);
+    if fe >= 0 {
+        const cut: usize = (fe as usize) + 2;
+        if cut > 0 && cut < text.len {
+            half = cut;
+        }
+    }
+    _ = buf_append_u64_hex(&head, half);
+    _ = buf_append_cstr(&head, "\r\n");
+    _ = buf_append(&head, text.ptr, half);
+    _ = buf_append_cstr(&head, "\r\n");
+    https_write_all(cfd, &head.ptr[0] as &const byte, head.len) catch {
+        return false;
+    };
+    var req: TimeSpec = TimeSpec{ tv_sec: 0, tv_nsec: MOCK_SSE_GAP_NS };
+    var rem: TimeSpec = TimeSpec{ tv_sec: 0, tv_nsec: 0 };
+    _ = sys_nanosleep(&req, &rem) catch {};
+
+    var tail: Buf = buf_new(256);
+    defer { buf_free(&tail); }
+    _ = buf_append_u64_hex(&tail, text.len - half);
+    _ = buf_append_cstr(&tail, "\r\n");
+    _ = buf_append(&tail, &text.ptr[half], text.len - half);
+    _ = buf_append_cstr(&tail, "\r\n0\r\n\r\n");
+    https_write_all(cfd, &tail.ptr[0] as &const byte, tail.len) catch {
+        return false;
+    };
+    return true;
+}
+
+// 给 mock 端连接回一个 JSON 响应：`Connection: close` + 精确 Content-Length。
+// 返回 false = 头部缓冲分配失败或写失败；body 由调用方持有。
+fn mock_send(cfd: i32, body: &const Buf) bool {
+    var head: Buf = buf_new(256);
+    defer { buf_free(&head); }
+    if !buf_valid(&head) {
+        return false;
+    }
+    _ = buf_append_cstr(&head, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: ");
+    _ = buf_append_u64(&head, body.len as u64);
+    _ = buf_append_cstr(&head, "\r\n\r\n");
+    https_write_all(cfd, &head.ptr[0] as &const byte, head.len) catch {
+        return false;
+    };
+    https_write_all(cfd, body.ptr as &const byte, body.len) catch {
+        return false;
+    };
+    return true;
+}
+
+// chunked 响应：顺带覆盖客户端的 chunked 解码路径
+fn mock_send_chunked(cfd: i32, body: &const Buf) bool {
+    var head: Buf = buf_new(256);
+    defer { buf_free(&head); }
+    if !buf_valid(&head) {
+        return false;
+    }
+    _ = buf_append_cstr(&head, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n");
+    const half: usize = body.len / 2;
+    _ = buf_append_u64_hex(&head, half);
+    _ = buf_append_cstr(&head, "\r\n");
+    _ = buf_append(&head, body.ptr, half);
+    _ = buf_append_cstr(&head, "\r\n");
+    _ = buf_append_u64_hex(&head, body.len - half);
+    _ = buf_append_cstr(&head, "\r\n");
+    _ = buf_append(&head, &body.ptr[half], body.len - half);
+    _ = buf_append_cstr(&head, "\r\n0\r\n\r\n");
+    https_write_all(cfd, &head.ptr[0] as &const byte, head.len) catch {
+        return false;
+    };
+    return true;
+}
+
+// 把 v 以小写十六进制追加进 b（0 写 "0"，其余不补前导零，最多 16 位）。
+// 返回 false = b 容量不够。
+fn buf_append_u64_hex(b: &Buf, v: usize) bool {
+    const hexd: &[byte] = &"0123456789abcdef"[0: 16];
+    var tmp: [byte: 16] = [0: 16];
+    var n: usize = v;
+    var i: usize = 0;
+    if n == 0 {
+        return buf_append_byte(b, 48);
+    }
+    while n > 0 && i < 16 {
+        tmp[i] = hexd[n % (16 as usize)];
+        n = n / (16 as usize);
+        i = i + 1;
+    }
+    while i > 0 {
+        i = i - 1;
+        if !buf_append_byte(b, tmp[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// HTTP 401 + 错误体
+fn mock_send_401(cfd: i32, body: &const Buf) bool {
+    var head: Buf = buf_new(256);
+    defer { buf_free(&head); }
+    _ = buf_append_cstr(&head, "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: ");
+    _ = buf_append_u64(&head, body.len as u64);
+    _ = buf_append_cstr(&head, "\r\n\r\n");
+    https_write_all(cfd, &head.ptr[0] as &const byte, head.len) catch {
+        return false;
+    };
+    const w2: !void = https_write_all(cfd, body.ptr as &const byte, body.len);
+    _ = w2 catch {
+        return false;
+    };
+    return true;
+}
+
+// HTTP 400 + **回显整个请求**（复刻中转网关的报错风格：把收到的请求塞进错误体里）。
+// 这是「转录乱码」的现场：错误体里有模型请求的全文（含 tools 数组与 `\n` 转义），
+// 打给 fd 2 时会被 TUI 渲染成一大块带 `· ` 前缀的 NOTICE 行。
+fn mock_send_400_echo(cfd: i32, rx: &const Buf) bool {
+    var body: Buf = buf_new(rx.len + 256);
+    defer { buf_free(&body); }
+    _ = buf_append_cstr(&body, "{\"error\":{\"message\":\"relay echo\"},\"request\":");
+    _ = buf_append(&body, rx.ptr, rx.len);
+    _ = buf_append_cstr(&body, "}");
+    var head: Buf = buf_new(256);
+    defer { buf_free(&head); }
+    _ = buf_append_cstr(&head, "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: ");
+    _ = buf_append_u64(&head, body.len as u64);
+    _ = buf_append_cstr(&head, "\r\n\r\n");
+    https_write_all(cfd, &head.ptr[0] as &const byte, head.len) catch {
+        return false;
+    };
+    const w2: !void = https_write_all(cfd, body.ptr as &const byte, body.len);
+    _ = w2 catch {
+        return false;
+    };
+    return true;
+}
+
+// 期望落盘的字节（真实换行 + 真实引号）
+fn esc_content() &byte {
+    return "line1\nline2 \"q\" tail" as &byte;
+}
+
+// 用 JsonWriter 生成 write_file 的 arguments：
+// 内层 JSON 由 writer 正确转义，再作为一个 JSON 字符串塞进 arguments。
+fn mock_call_escaped(w: &JsonWriter, id: &const byte, name: &const byte, path: &const byte, content: &const byte) void {
+    var inner: Buf = buf_new(256);
+    var wi: JsonWriter = JsonWriter{ buf: null, cap: 0, used: 0, overflow: false };
+    jw_init(&wi, inner.ptr, inner.cap);
+    jw_byte(&wi, 123);
+    jw_key(&wi, "file_path");
+    jw_str_cstr(&wi, path);
+    jw_byte(&wi, 44);
+    jw_key(&wi, "content");
+    jw_str_cstr(&wi, content);
+    jw_byte(&wi, 125);
+    if jw_overflow(&wi) {
+        buf_free(&inner);
+        return;
+    }
+    inner.len = jw_used(&wi);
+    jw_byte(w, 123);
+    jw_key(w, "id");
+    jw_str_cstr(w, id);
+    jw_byte(w, 44);
+    jw_key(w, "type");
+    jw_str_cstr(w, "function");
+    jw_byte(w, 44);
+    jw_key(w, "function");
+    jw_byte(w, 123);
+    jw_key(w, "name");
+    jw_str_cstr(w, name);
+    jw_byte(w, 44);
+    jw_key(w, "arguments");
+    jw_str(w, inner.ptr, inner.len);      // 整段内层 JSON 作为字符串（转义由 writer 负责）
+    jw_byte(w, 125);
+    jw_byte(w, 125);
+    buf_free(&inner);
+}
+
+// 一轮里塞多个工具调用：正常写/读文件 / 越权路径 / 超时被杀
+fn mock_toolcall_tools_body(out: &Buf) bool {
+    var w: JsonWriter = JsonWriter{ buf: null, cap: 0, used: 0, overflow: false };
+    jw_init(&w, out.ptr, out.cap);
+    jw_byte(&w, 123);
+    jw_key(&w, "id");
+    jw_str_cstr(&w, "chatcmpl-tools");
+    jw_byte(&w, 44);
+    jw_key(&w, "choices");
+    jw_byte(&w, 91);
+    jw_byte(&w, 123);
+    jw_key(&w, "index");
+    jw_i64(&w, 0);
+    jw_byte(&w, 44);
+    jw_key(&w, "message");
+    jw_byte(&w, 123);
+    jw_key(&w, "role");
+    jw_str_cstr(&w, "assistant");
+    jw_byte(&w, 44);
+    jw_key(&w, "content");
+    jw_null(&w);
+    jw_byte(&w, 44);
+    jw_key(&w, "tool_calls");
+    jw_byte(&w, 91);
+    // 1) write_file：content 里**带换行和引号**，专门盯住「字段值必须再反转义一次」这个坑
+    mock_call_escaped(&w, "call_w1", "write", "esc.txt", esc_content());
+    jw_byte(&w, 44);
+    // 2) read_file 读回同一文件
+    mock_call(&w, "call_r1", "read", "{\"file_path\":\"esc.txt\"}");
+    jw_byte(&w, 44);
+    // 3) read_file 越权（应被路径守卫拒绝）
+    mock_call(&w, "call_r2", "read", "{\"file_path\":\"../escape.txt\"}");
+    jw_byte(&w, 44);
+    // 4) run_shell 超时（应被 SIGKILL 并回 timeout）
+    mock_call(&w, "call_r3", "bash", "{\"command\":\"sleep 5\",\"description\":\"sleep to test timeout\",\"timeoutMs\":300}");
+    jw_byte(&w, 93);
+    jw_byte(&w, 125);
+    jw_byte(&w, 125);
+    jw_byte(&w, 93);
+    jw_byte(&w, 125);
+    if jw_overflow(&w) {
+        return false;
+    }
+    out.len = jw_used(&w);
+    return true;
+}
+
+// 控制字节轮用：一封只含 **一个** bash 调用的 chat 形状响应。cmd 由调用方给
+// （`printf 'A\000B'` 这种：bash 的 printf 认 \000，于是工具结果里就有裸 NUL）。
+fn mock_ctrl_body(out: &Buf, cmd: &const Buf) bool {
+    var args: Buf = buf_new(512);
+    defer { buf_free(&args); }
+    if !mock_args_json(&args, cmd) {
+        return false;
+    }
+    // mock_call 的 args_json 是 C 字符串（内部走 jw_str_cstr），所以补一个 NUL
+    if !buf_append_byte(&args, 0) {
+        return false;
+    }
+    var w: JsonWriter = JsonWriter{ buf: null, cap: 0, used: 0, overflow: false };
+    jw_init(&w, out.ptr, out.cap);
+    jw_byte(&w, 123);
+    jw_key(&w, "id");
+    jw_str_cstr(&w, "chatcmpl-selftest");
+    jw_byte(&w, 44);
+    jw_key(&w, "choices");
+    jw_byte(&w, 91);
+    jw_byte(&w, 123);
+    jw_key(&w, "index");
+    jw_i64(&w, 0);
+    jw_byte(&w, 44);
+    jw_key(&w, "message");
+    jw_byte(&w, 123);
+    jw_key(&w, "role");
+    jw_str_cstr(&w, "assistant");
+    jw_byte(&w, 44);
+    jw_key(&w, "content");
+    jw_null(&w);
+    jw_byte(&w, 44);
+    jw_key(&w, "tool_calls");
+    jw_byte(&w, 91);
+    mock_call(&w, "call_ctrl", "bash", args.ptr as &const byte);
+    jw_byte(&w, 93);
+    jw_byte(&w, 125);
+    jw_byte(&w, 125);
+    jw_byte(&w, 93);
+    jw_byte(&w, 125);
+    if jw_overflow(&w) {
+        return false;
+    }
+    out.len = jw_used(&w);
+    return true;
+}
+
+// 往 JsonWriter 里写一个 chat 形状的 tool_calls 数组元素（id / type / function{name,arguments}）。
+// void：写溢出记在 w 上，由调用方查 jw_overflow。
+fn mock_call(w: &JsonWriter, id: &const byte, name: &const byte, args_json: &const byte) void {
+    jw_byte(w, 123);
+    jw_key(w, "id");
+    jw_str_cstr(w, id);
+    jw_byte(w, 44);
+    jw_key(w, "type");
+    jw_str_cstr(w, "function");
+    jw_byte(w, 44);
+    jw_key(w, "function");
+    jw_byte(w, 123);
+    jw_key(w, "name");
+    jw_str_cstr(w, name);
+    jw_byte(w, 44);
+    jw_key(w, "arguments");
+    jw_str_cstr(w, args_json);
+    jw_byte(w, 125);
+    jw_byte(w, 125);
+}
+
+// ---- Responses 形状的 mock 数据（mode 19/20/21 用） ----
+
+// 断言「不该出现」的片段
+fn expect_absent(rx: &const Buf, lit: &const byte, code: i32, verdict: &i32) void {
+    if verdict[0] != 0 {
+        return;
+    }
+    if contains(rx, lit) {
+        verdict[0] = code;
+    }
+}
+
+// 把 writer 写好的一帧当 data 追加（按长度，不做 NUL 假设）
+fn resp_data_n(out: &Buf, p: &const byte, n: usize) bool {
+    if !buf_append_cstr(out, "data: ") {
+        return false;
+    }
+    if !buf_append(out, p, n) {
+        return false;
+    }
+    return buf_append_cstr(out, "\n\n");
+}
+
+// 把 w 里已经写好的一帧 JSON 用 `data: ` 前缀 + 空行收尾追加进 out。
+// 返回 false = w 已溢出（帧没写完）或 out 容量不够 —— 后者会让 mock 回一个半帧。
+fn resp_emit(out: &Buf, w: &const JsonWriter, payload: &Buf) bool {
+    if jw_overflow(w) {
+        return false;
+    }
+    payload.len = jw_used(w);
+    return resp_data_n(out, payload.ptr as &const byte, payload.len);
+}
+
+// bash 调用的 arguments 文本：{"command":"echo <marker>","description":"echo a marker"}
+fn mock_resp_args(cmd: &Buf, marker: &const byte) bool {
+    if !buf_append_cstr(cmd, "echo ") {
+        return false;
+    }
+    return buf_append_cstr(cmd, marker);
+}
+
+// 工具调用 arguments 的 JSON 文本：{"command":<cmd>,"description":"…"}
+// （chat 的 arguments 与 responses 的 arguments 分片都是**这层文本**，两条协议共用）
+fn mock_args_json(out: &Buf, cmd: &const Buf) bool {
+    var w: JsonWriter = JsonWriter{ buf: null, cap: 0, used: 0, overflow: false };
+    jw_init(&w, out.ptr, out.cap);
+    jw_byte(&w, 123);
+    jw_key(&w, "command");
+    jw_str(&w, cmd.ptr, cmd.len);
+    jw_byte(&w, 44);
+    jw_key(&w, "description");
+    jw_str_cstr(&w, "selftest command");
+    jw_byte(&w, 125);
+    if jw_overflow(&w) {
+        return false;
+    }
+    out.len = jw_used(&w);
+    return true;
+}
+
+// Responses 流式：一个 function_call（bash）+ completed。cmd 是**完整**的 shell 命令
+// （`echo <marker>` 那种由 mock_resp_tool_text 拼；控制字节轮要的是带 NUL 的命令）。
+//
+// 注意 arguments 分片的形状：Responses API 里 `response.function_call_arguments.delta`
+// 的 `delta` 是**字符串**（内容是 arguments 的 JSON 文本片段），客户端解析器也按字符串取
+// （js_obj_get_str + sv_unescape）。早先这里是按**对象**发的、客户端直接忽略 —— 于是
+// 「工具拿到空 arguments」这件事在自测里溜了过去（mode 19 第二轮那条 marker 断言，正好被
+// 任务文本里的同名 marker 满足，看不出来）。这里按规范发字符串。
+fn mock_resp_tool_cmd(out: &Buf, cmd: &const Buf) bool {
+    var payload: Buf = buf_new(1024);
+    defer { buf_free(&payload); }
+    var args: Buf = buf_new(512);
+    defer { buf_free(&args); }
+    var w: JsonWriter = JsonWriter{ buf: null, cap: 0, used: 0, overflow: false };
+    if !mock_args_json(&args, cmd) {
+        return false;
+    }
+
+    jw_init(&w, payload.ptr, payload.cap);
+    jw_byte(&w, 123);
+    jw_key(&w, "type");
+    jw_str_cstr(&w, "response.output_item.added");
+    jw_byte(&w, 44);
+    jw_key(&w, "output_index");
+    jw_i64(&w, 0);
+    jw_byte(&w, 44);
+    jw_key(&w, "item");
+    jw_byte(&w, 123);
+    jw_key(&w, "type");
+    jw_str_cstr(&w, "function_call");
+    jw_byte(&w, 44);
+    jw_key(&w, "id");
+    jw_str_cstr(&w, "fc_r1");
+    jw_byte(&w, 44);
+    jw_key(&w, "call_id");
+    jw_str_cstr(&w, "call_r1");
+    jw_byte(&w, 44);
+    jw_key(&w, "name");
+    jw_str_cstr(&w, "bash");
+    jw_byte(&w, 44);
+    jw_key(&w, "arguments");
+    jw_str_cstr(&w, "");
+    jw_byte(&w, 125);
+    jw_byte(&w, 125);
+    if !resp_emit(out, &w, &payload) {
+        return false;
+    }
+
+    jw_init(&w, payload.ptr, payload.cap);
+    jw_byte(&w, 123);
+    jw_key(&w, "type");
+    jw_str_cstr(&w, "response.function_call_arguments.delta");
+    jw_byte(&w, 44);
+    jw_key(&w, "output_index");
+    jw_i64(&w, 0);
+    jw_byte(&w, 44);
+    jw_key(&w, "delta");
+    jw_str(&w, args.ptr, args.len);
+    jw_byte(&w, 125);
+    if !resp_emit(out, &w, &payload) {
+        return false;
+    }
+
+    jw_init(&w, payload.ptr, payload.cap);
+    jw_byte(&w, 123);
+    jw_key(&w, "type");
+    jw_str_cstr(&w, "response.completed");
+    jw_byte(&w, 44);
+    jw_key(&w, "response");
+    jw_byte(&w, 123);
+    jw_key(&w, "id");
+    jw_str_cstr(&w, "resp_r1");
+    jw_byte(&w, 44);
+    jw_key(&w, "status");
+    jw_str_cstr(&w, "completed");
+    jw_byte(&w, 44);
+    jw_key(&w, "output");
+    jw_byte(&w, 91);
+    jw_byte(&w, 93);
+    jw_byte(&w, 44);
+    jw_key(&w, "usage");
+    jw_byte(&w, 123);
+    jw_key(&w, "input_tokens");
+    jw_i64(&w, 30);
+    jw_byte(&w, 44);
+    jw_key(&w, "input_tokens_details");
+    jw_byte(&w, 123);
+    jw_key(&w, "cached_tokens");
+    jw_i64(&w, 10);
+    jw_byte(&w, 125);
+    jw_byte(&w, 44);
+    jw_key(&w, "output_tokens");
+    jw_i64(&w, 5);
+    jw_byte(&w, 125);
+    jw_byte(&w, 125);
+    jw_byte(&w, 125);
+    return resp_emit(out, &w, &payload);
+}
+
+// Responses 流式：一个 bash function_call，命令是 `echo <marker>`
+fn mock_resp_tool_text(out: &Buf, marker: &const byte) bool {
+    var cmd: Buf = buf_new(256);
+    defer { buf_free(&cmd); }
+    if !mock_resp_args(&cmd, marker) {
+        return false;
+    }
+    return mock_resp_tool_cmd(out, &cmd);
+}
+
+// Responses 流式：一条正文 + completed
+fn mock_resp_final_text(out: &Buf, answer: &const byte) bool {
+    var payload: Buf = buf_new(512);
+    defer { buf_free(&payload); }
+    var w: JsonWriter = JsonWriter{ buf: null, cap: 0, used: 0, overflow: false };
+
+    jw_init(&w, payload.ptr, payload.cap);
+    jw_byte(&w, 123);
+    jw_key(&w, "type");
+    jw_str_cstr(&w, "response.output_text.delta");
+    jw_byte(&w, 44);
+    jw_key(&w, "output_index");
+    jw_i64(&w, 0);
+    jw_byte(&w, 44);
+    jw_key(&w, "delta");
+    jw_str_cstr(&w, answer);
+    jw_byte(&w, 125);
+    if !resp_emit(out, &w, &payload) {
+        return false;
+    }
+
+    jw_init(&w, payload.ptr, payload.cap);
+    jw_byte(&w, 123);
+    jw_key(&w, "type");
+    jw_str_cstr(&w, "response.completed");
+    jw_byte(&w, 44);
+    jw_key(&w, "response");
+    jw_byte(&w, 123);
+    jw_key(&w, "id");
+    jw_str_cstr(&w, "resp_r2");
+    jw_byte(&w, 44);
+    jw_key(&w, "status");
+    jw_str_cstr(&w, "completed");
+    jw_byte(&w, 44);
+    jw_key(&w, "output");
+    jw_byte(&w, 91);
+    jw_byte(&w, 93);
+    jw_byte(&w, 125);
+    jw_byte(&w, 125);
+    return resp_emit(out, &w, &payload);
+}
+
+// Responses 非流式：一个 function_call
+fn mock_resp_json_tool(out: &Buf, marker: &const byte) bool {
+    var cmd: Buf = buf_new(256);
+    defer { buf_free(&cmd); }
+    if !mock_resp_args(&cmd, marker) {
+        return false;
+    }
+    var args: Buf = buf_new(512);
+    defer { buf_free(&args); }
+    var wa: JsonWriter = JsonWriter{ buf: null, cap: 0, used: 0, overflow: false };
+    jw_init(&wa, args.ptr, args.cap);
+    jw_byte(&wa, 123);
+    jw_key(&wa, "command");
+    jw_str(&wa, cmd.ptr, cmd.len);
+    jw_byte(&wa, 44);
+    jw_key(&wa, "description");
+    jw_str_cstr(&wa, "echo a marker");
+    jw_byte(&wa, 125);
+    args.len = jw_used(&wa);
+
+    var w: JsonWriter = JsonWriter{ buf: null, cap: 0, used: 0, overflow: false };
+    jw_init(&w, out.ptr, out.cap);
+    jw_byte(&w, 123);
+    jw_key(&w, "id");
+    jw_str_cstr(&w, "resp_ns1");
+    jw_byte(&w, 44);
+    jw_key(&w, "status");
+    jw_str_cstr(&w, "completed");
+    jw_byte(&w, 44);
+    jw_key(&w, "output");
+    jw_byte(&w, 91);
+    jw_byte(&w, 123);
+    jw_key(&w, "type");
+    jw_str_cstr(&w, "function_call");
+    jw_byte(&w, 44);
+    jw_key(&w, "id");
+    jw_str_cstr(&w, "fc_ns1");
+    jw_byte(&w, 44);
+    jw_key(&w, "call_id");
+    jw_str_cstr(&w, "call_r1");
+    jw_byte(&w, 44);
+    jw_key(&w, "name");
+    jw_str_cstr(&w, "bash");
+    jw_byte(&w, 44);
+    jw_key(&w, "arguments");
+    jw_str(&w, args.ptr, args.len);
+    jw_byte(&w, 125);
+    jw_byte(&w, 93);
+    jw_byte(&w, 44);
+    jw_key(&w, "usage");
+    jw_byte(&w, 123);
+    jw_key(&w, "input_tokens");
+    jw_i64(&w, 20);
+    jw_byte(&w, 44);
+    jw_key(&w, "output_tokens");
+    jw_i64(&w, 6);
+    jw_byte(&w, 125);
+    jw_byte(&w, 125);
+    if jw_overflow(&w) {
+        return false;
+    }
+    out.len = jw_used(&w);
+    return true;
+}
+
+// Responses 非流式：最终答案
+fn mock_resp_json_final(out: &Buf, answer: &const byte) bool {
+    var w: JsonWriter = JsonWriter{ buf: null, cap: 0, used: 0, overflow: false };
+    jw_init(&w, out.ptr, out.cap);
+    jw_byte(&w, 123);
+    jw_key(&w, "id");
+    jw_str_cstr(&w, "resp_ns2");
+    jw_byte(&w, 44);
+    jw_key(&w, "status");
+    jw_str_cstr(&w, "completed");
+    jw_byte(&w, 44);
+    jw_key(&w, "output");
+    jw_byte(&w, 91);
+    jw_byte(&w, 123);
+    jw_key(&w, "type");
+    jw_str_cstr(&w, "message");
+    jw_byte(&w, 44);
+    jw_key(&w, "role");
+    jw_str_cstr(&w, "assistant");
+    jw_byte(&w, 44);
+    jw_key(&w, "content");
+    jw_byte(&w, 91);
+    jw_byte(&w, 123);
+    jw_key(&w, "type");
+    jw_str_cstr(&w, "output_text");
+    jw_byte(&w, 44);
+    jw_key(&w, "text");
+    jw_str_cstr(&w, answer);
+    jw_byte(&w, 125);
+    jw_byte(&w, 93);
+    jw_byte(&w, 125);
+    jw_byte(&w, 93);
+    jw_byte(&w, 44);
+    jw_key(&w, "usage");
+    jw_byte(&w, 123);
+    jw_key(&w, "input_tokens");
+    jw_i64(&w, 40);
+    jw_byte(&w, 44);
+    jw_key(&w, "output_tokens");
+    jw_i64(&w, 3);
+    jw_byte(&w, 125);
+    jw_byte(&w, 125);
+    if jw_overflow(&w) {
+        return false;
+    }
+    out.len = jw_used(&w);
+    return true;
+}
+
+// SSE 文本 → chunked（两段）响应
+fn mock_send_resp_sse(cfd: i32, text: &const Buf) bool {
+    var head: Buf = buf_new(256);
+    defer { buf_free(&head); }
+    if !buf_valid(&head) {
+        return false;
+    }
+    _ = buf_append_cstr(&head, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n");
+    const half: usize = text.len / 2;
+    _ = buf_append_u64_hex(&head, half);
+    _ = buf_append_cstr(&head, "\r\n");
+    _ = buf_append(&head, text.ptr, half);
+    _ = buf_append_cstr(&head, "\r\n");
+    _ = buf_append_u64_hex(&head, text.len - half);
+    _ = buf_append_cstr(&head, "\r\n");
+    _ = buf_append(&head, &text.ptr[half], text.len - half);
+    _ = buf_append_cstr(&head, "\r\n0\r\n\r\n");
+    https_write_all(cfd, &head.ptr[0] as &const byte, head.len) catch {
+        return false;
+    };
+    return true;
+}
+
+// 404（端点不存在）：协商轮用它触发回退
+fn mock_send_404(cfd: i32, body: &const Buf) bool {
+    var head: Buf = buf_new(256);
+    defer { buf_free(&head); }
+    _ = buf_append_cstr(&head, "HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: ");
+    _ = buf_append_u64(&head, body.len as u64);
+    _ = buf_append_cstr(&head, "\r\n\r\n");
+    https_write_all(cfd, &head.ptr[0] as &const byte, head.len) catch {
+        return false;
+    };
+    const w2: !void = https_write_all(cfd, body.ptr as &const byte, body.len);
+    _ = w2 catch {
+        return false;
+    };
+    return true;
+}
+
+// 返回 0 表示 mock 端所有断言通过
