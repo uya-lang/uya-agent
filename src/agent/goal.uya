@@ -1,22 +1,32 @@
-// src/agent/goal.uya — 会话级目标（P11，对齐 DSH 的 goal 工具）
+// src/agent/goal.uya — 会话级目标（P11，对齐 DSH 的 goal 工具）+ 同会话续跑驱动器
 //
 // 本文件：持久化（`goal_path`/`goal_load`/`goal_save`，手写 JSON）、字段读写小工具
 //   （`goal_set`/`goal_set_n`/`goal_set_lit`/`goal_is_space`/`goal_phase_is`）、
 //   三个工具入口（`goal_tool_get`/`goal_tool_create`/`goal_tool_update`）、
-//   人类命令面（`goal_cmd_run` 与它的几条回执）。
+//   人类命令面（`goal_cmd_run` 与它的几条回执）、**同会话 Goal Round 驱动器**
+//   （`goal_round_admit`：一次调用同时回答「该不该开下一轮」并把这一轮记在账上）。
 // 不变量：① `update_goal` 是 **CAS**：id 与 revision 都必须精确匹配（`goal-3` / `3` 都收），
 //   过期即拒并要求重取 —— 目标**跨进程/跨回合**持久，没有这道校验两个并发分支会静默互相覆盖；
 //   ② `blocked` 需要非空 `blocked_reason` 且 **round < 2 时拒绝**（DSH 规则：同一阻塞条件
 //   至少连续 3 轮）；③ `phase` 只有 active / paused / complete / blocked；
 //   ④ 已有**未完成**目标时 `create` 拒绝顶掉；⑤ `/goal clear` 是**删文件、不留 tombstone**
 //   （清掉后 id 从 1 重新开始）；⑥ 控制词只有**独占整行**时才不区分大小写，其余非空后缀都是
-//   **字面目标**（`/goal pause after verification` 创建的就是那个字面目标）。
+//   **字面目标**（`/goal pause after verification` 创建的就是那个字面目标）；
+//   ⑦ **`round` 只在一次续跑真正开始之后才 +1**（`goal_round_admit` 里落盘），被拒的预留
+//   **不消耗轮号** —— 与 DSH 的 `roundsStarted` 口径一致；⑧ 续跑授权分**盘上**（`Goal.armed`，
+//   `get_goal` 报它）与**进程本地**（`g_goal_armed`）两份，后者**不跨会话**。
 // 依赖：libc（syscall / unistd）；本仓 foundation/bufx、foundation/jsonx、session/session。
 // 命名：`goal_*`、`Goal`、`GOAL_*`。
 //
-// ⚠ **自动续跑未实现**：`phase=active` / `armed` 是模型与面板可见的状态，但仓里没有
-// 把它推进轮次的驱动器（`round` 只在 `goal_load` 从盘上读、`create` 清零）。
-// 「自动续跑」目前是 schema 文案 + 状态字段，不是已实现的循环（见 §15.4）。
+// 续跑驱动器（P58，对齐 DSH 的 `dsh-goal-round-driver`，见 DESIGN §9.5）：
+//   * 只在**活着的会话**进入 idle 时驱动（调用点是主循环那两处，见 `agent_goal_drive`）；
+//   * 只驱动 `phase=active` + 已授权 + 还有余量的目标；complete / paused / blocked 一律不动，
+//     `round >= maxRounds` 是**把盘上的 phase 改成 blocked**（与 DSH 的 `round-limit` 同口径）；
+//   * 每一轮是往**同一个会话**追加一条 user 消息（`<goal_round>` 块）—— 不开新 agent、
+//     也不 fork 历史（Ralph 那种 fresh-agent 循环在 `agent/deleg.uya`）；
+//   * `armed` **不跨进程**：换会话/恢复那条路（`agent_history_begin` 里的会话级复位）把它
+//     清成进程本地的未授权。于是 `--resume` 之后目标还在盘上、自动续跑却停着，要接着跑必须
+//     由人明确授权（`/goal resume` 或 `update_goal action=resume`）—— 与 DSH 的激活边界同一条。
 //
 // 目标存在 agent_home 下的 goal.json 里，跨进程可读；字段：objective / phase /
 // round / maxRounds / blocker / revision / id。update_goal 要求**精确的 id 与 revision**
@@ -36,8 +46,24 @@ export struct Goal {
     round: i32,
     max_rounds: i32,
     blocker: Buf,
-    armed: bool,            // 是否还有自动续跑
+    armed: bool,            // 盘上的续跑意愿（与进程本地的 g_goal_armed 是两件事）
 }
+
+// P58：**进程本地**的续跑授权。`Goal.armed` 是盘上那份（跨进程持久、`get_goal` 报它），
+// 这一位才是驱动器认的开关 —— 为什么不合并成一个字段：goal.json 跨进程持久，而「继续自动
+// 跑」是**这一次会话的授权**；合并的话 `--resume` 会把上一条会话的授权一起继承过来
+// （人不在键盘前，agent 自己接着跑）。DSH 正是用一个进程本地的 activation 位分开这两件事。
+// 版本串与命名纪律（CODING.md §3：常量大写前缀）不适用于它 —— 它是可变状态量，
+// 与 `g_todos` / `g_deleg` 同一族；`export` 是因为 `agent/agent.uya` 要读写它。
+export var g_goal_armed: bool = false;
+
+// 翻这一位的地方就是「谁授权了自动续跑」的完整名单，共四处，都在本文件里（本仓顶层函数
+// 预算为 0，见 CODING.md §6，所以不再包一层 `goal_arm()`）：
+//   * `goal_tool_create` / `goal_cmd_create`：create 就是授权（DSH 的 create 也 armed）；
+//   * `goal_tool_update` / `goal_cmd_switch`：resume → true，pause/complete/blocked → false；
+//   * `goal_cmd_clear`：目标没了，授权一起收掉；
+//   * `goal_round_admit`：轮次用尽或写盘失败 → false。
+// 换会话的复位在 `agent_session_scoped_reset`（`agent/agent.uya`，直接写这一位）。
 
 // 零值 Goal：无 goal（id 0）、phase/objective/blocker 是 `buf_empty`、
 // `max_rounds` 给 20（不是 0 —— 0 会被下游当成「不许跑」）、armed=false。
@@ -291,6 +317,7 @@ export fn goal_tool_create(cfg: &const Config, args: &const JsonValue, out: &Buf
         _ = buf_append_cstr(out, "Error: cannot persist the goal");
         return;
     }
+    g_goal_armed = true;   // P58：create 就是授权（DSH 的 create 也 armed）
     _ = buf_append_cstr(out, "created goal-");
     _ = buf_append_u64(out, g.id as u64);
     _ = buf_append_cstr(out, " (revision 1, phase active, maxGoalRounds ");
@@ -386,6 +413,16 @@ export fn goal_tool_update(cfg: &const Config, args: &const JsonValue, out: &Buf
     if !goal_save(cfg, &g) {
         _ = buf_append_cstr(out, "Error: cannot persist the goal");
         return;
+    }
+    // P58：本地续跑授权跟着动作翻 —— resume 是**人明确授权**的入口；pause / complete /
+    // blocked 都要把授权收掉；edit 不碰（它只换目标正文，与 DSH 的 commitCurrent 保留
+    // cache.activation 同口径）。
+    if bufx_eq_cstr(action.ptr as &const byte, action.len, "resume") {
+        g_goal_armed = true;
+    } else if bufx_eq_cstr(action.ptr as &const byte, action.len, "pause")
+        || bufx_eq_cstr(action.ptr as &const byte, action.len, "complete")
+        || bufx_eq_cstr(action.ptr as &const byte, action.len, "blocked") {
+        g_goal_armed = false;
     }
     _ = buf_append_cstr(out, "updated goal-");
     _ = buf_append_u64(out, g.id as u64);
@@ -607,6 +644,7 @@ fn goal_cmd_create(cfg: &const Config, p: &const byte, s: usize, e: usize, out: 
         _ = buf_append_cstr(out, "Error: cannot persist the goal\n");
         return 1;
     }
+    g_goal_armed = true;   // P58：人刚说了要干这件事 —— 当场授权续跑
     _ = buf_append_cstr(out, "Goal created\n");
     goal_render_user(&g, out);
     return 0;
@@ -648,6 +686,7 @@ fn goal_cmd_switch(cfg: &const Config, out: &Buf, armed: bool, verb: &const byte
         _ = buf_append_cstr(out, "Error: cannot persist the goal\n");
         return 1;
     }
+    g_goal_armed = armed;   // P58：resume 是人授权的唯一入口；pause 要把它收掉
     _ = buf_append_cstr(out, title);
     _ = buf_append_byte(out, 10);
     goal_render_user(&g, out);
@@ -666,6 +705,7 @@ fn goal_cmd_clear(cfg: &const Config, out: &Buf) i32 {
         _ = buf_append_cstr(out, "Error: cannot remove the goal file\n");
         return 1;
     }
+    g_goal_armed = false;   // P58：目标没了，进程本地的续跑授权也一并收掉
     _ = buf_append_cstr(out, "Goal cleared.\n");
     return 0;
 }
@@ -711,4 +751,72 @@ export fn goal_cmd_run(cfg: &const Config, line: &const Buf, out: &Buf) i32 {
         return goal_cmd_edit(cfg, p, rs, re, out);
     }
     return goal_cmd_create(cfg, p, s, e, out);
+}
+
+
+// ============================================================
+// P58：同会话 Goal Round 驱动器（对齐 DSH 的 goal-round-driver）
+// ============================================================
+//
+// 触发点是**主循环的空闲那一支**（`agent_goal_drive`，TUI 与滚动模式各一处调用点），
+// 也就是「agent 已经 idle、没有待提交输入、没有浮层结果」的那一刻 —— 与 DSH 的
+// 「agent.status === 'idle' && 没有竞争 prompt」同一个检查点。
+//
+// 这一个函数同时干两件事（本仓顶层函数预算为 0，见 CODING.md §6，所以合成一个）：
+//   ① 回答「该不该开下一轮」——不能开的每一档都在这里挡住（顺序即优先级）；
+//   ② 能开就把这一轮的正文拼进 out，**并把这一轮记在账上**（round / revision +1 落盘）。
+//      「记账」与「投递」成对放在这里是为了原子性：**只有记上账的轮次才会被投递**。
+//      反过来（先投递后记账）一旦落盘失败就是个没有记录的轮次，下一次驱动又会拿同一个
+//      轮号重发一遍；投递本身失败反而没关系 —— 账已经记了，那一轮确实开了。
+//
+// 不能开的四档（顺序即优先级）：
+//   * 进程本地没授权（换过会话 / 从没 resume 过）→ 不动（DSH：activation !== armed）；
+//   * 没有目标、或 phase 不是 active → 不动（complete / paused / blocked 都是「别再跑了」）；
+//   * 轮次用尽（round >= maxRounds）→ 把**盘上**的 phase 改成 blocked + blocker=round-limit、
+//     armed=false、revision+1，并把本地授权收掉。与 DSH 的 `round-limit` 一致：这不是
+//     「悄悄停下」，而是目标明确的终态（面板与 get_goal 都看得见）；
+//   * 落盘失败 → 一个字节都不给（返回 false，并把授权收掉：写不进去就别再空转）。
+//
+// 正文措辞与 DSH 的 `renderGoalRoundPrompt` 逐句对应（`<goal_round>` 标签也照抄 ——
+// 模型认这个形状）。objective 走 JSON 字符串转义（`jw_str_into`）：目标里带换行或形似标签
+// 的文本只能是**数据**，不许在提示词里变成结构（DSH 的 `JSON.stringify(goal.objective)`
+// 是同一个理由）。
+export fn goal_round_admit(cfg: &const Config, out: &Buf) bool {
+    buf_reset(out);
+    if !g_goal_armed {
+        return false;
+    }
+    var g: Goal = goal_empty();
+    defer { goal_free(&g); }
+    if !goal_load(cfg, &g) || !g.active_state {
+        return false;
+    }
+    if !goal_phase_is(&g, "active" as &const byte) {
+        return false;
+    }
+    if g.max_rounds > 0 && g.round >= g.max_rounds {
+        goal_set_lit(&g.phase, "blocked" as &const byte, 7);
+        goal_set_lit(&g.blocker, "round-limit" as &const byte, 11);
+        g.armed = false;
+        g.revision = g.revision + 1;
+        _ = goal_save(cfg, &g);
+        g_goal_armed = false;
+        return false;
+    }
+    g.round = g.round + 1;
+    g.revision = g.revision + 1;
+    if !goal_save(cfg, &g) {
+        out_err("[goal] 续跑：记不上账（goal.json 写失败），本轮不发\n");
+        g_goal_armed = false;
+        return false;
+    }
+    _ = buf_append_cstr(out, "<goal_round>\nObjective: ");
+    _ = jw_str_into(out, g.objective.ptr as &const byte, g.objective.len);
+    _ = buf_append_cstr(out, "\nRound: ");
+    _ = buf_append_i64(out, g.round as i64);
+    _ = buf_append_cstr(out, "/");
+    _ = buf_append_i64(out, g.max_rounds as i64);
+    _ = buf_append_cstr(out,
+        "\n\nContinue working toward the objective in this same session. Treat the current workspace, tool results, and durable session state as authoritative; inspect them instead of assuming earlier narration is still current. Make concrete progress and verify the result. Before claiming completion, gather evidence that the whole objective is achieved, read the current goal, and mark it complete. If work remains, leave the goal active for the next round. Follow the configured goal-tool policy before reporting a blocker.\n</goal_round>");
+    return out.len > 0;
 }

@@ -4018,7 +4018,7 @@ fn dispatch_tool_body(cfg: &Config, name: &const Buf, args_json: &const Buf, are
     }
     // P22：任务块的目标段吃的是内存投影 —— goal 工具刚写过盘，这里立刻重读一次
     if sv_eq_cstr(name, "create_goal") || sv_eq_cstr(name, "get_goal") || sv_eq_cstr(name, "update_goal") {
-        agent_goal_reload(cfg);
+        tasks_goal_reload(cfg);
     }
     // ---- P55：执行期纪律的收尾钩子 ----
     //
@@ -7855,6 +7855,11 @@ fn agent_tasks_sync() void {
 // （`goal.json`）、按设计跨会话（见 README §7）。
 fn agent_session_scoped_reset() void {
     todo_clear(&g_todos);
+    // P58：续跑的**进程本地授权**不跨会话（DSH 的 goal/session-start 同一条）：目标本体在
+    // 盘上、跨会话照旧（goal.json），但「继续自动跑」这件事要人重新授权。不清的话
+    // `--resume` 会把上一条会话的授权继承过来 —— 人不在键盘前，agent 自己接着跑。
+    // 启动、fork、`--resume`、`/new`、`/resume` 走的都是这条路，一处收口。
+    g_goal_armed = false;
     // P46：标题的会话级状态跟着换会话复位。**不清 g_sess.title 本身** ——
     // 它由 sess_open / agent_hist_from_log 那条路负责（引用数超容量会丢，见踩坑 51）；
     // 这里只清「自动起标题有没有跑过」与「钉住」这两个进程级标志，
@@ -7865,9 +7870,88 @@ fn agent_session_scoped_reset() void {
     g_title_auto_done = false;
 }
 
-// 会话目标：盘上 goal.json 的内存投影（任务块显示用）
-fn agent_goal_reload(cfg: &const Config) void {
+// P58：同会话 Goal Round 驱动器的唯一外部入口（主循环的空闲那一支调它）。
+//
+// 只做一件事：该开下一轮就开**一轮**，返回 true；否则返回 false。所谓「开一轮」是
+//   ① `goal_round_admit` 要正文 —— 它顺带把这一轮记在账上（round/revision +1 落盘），
+//      落盘失败就一个字节都不发（理由见那边的注释：不许出现「跑了没记账」的轮次）；
+//   ② 把正文当**普通 user 消息**投进同一个会话（历史 + 日志 + 转录），再跑 `agent_turn_loop`；
+//   ③ 收口时看盘上还是不是 active+armed、以及这一轮的退出码，该收就把本地授权收掉
+//      （判据内联在下面，省一个顶层函数 —— 本仓函数表余量是 0，见 CODING.md §6）。
+//
+// 为什么**不在这里 while 循环**：轮与轮之间要留给主循环那圈输入处理（用户敲键、浮层结果、
+// 只读命令）。在这里自转会把输入饿死，与 P46 自动起标题踩过的坑同族（"起标题的圈里敲进来的
+// /status 被当成未知命令"）。所以它跑完**一轮**就 return，由主循环下一圈再问一次 —— 那圈本来
+// 就要 poll 键盘，用户总有插话的机会。
+fn agent_goal_drive(cfg: &Config, h: &History) bool {
+    // 只在**有人在键盘前的前台会话**里自动续跑，与自动起标题同一条闸门（`agent_title_auto_on`）：
+    // 管道 / CI 里不跑 —— 那儿没人能叫停它，而每一轮都是**真的**发请求（e2e-goal 那种离线
+    // 脚本里建完目标就走，不该被它拖去打网络）。子代理也不跑（它自己的目标由父进程管）。
+    if !g_interactive || cfg.is_subagent {
+        return false;
+    }
+    // **人的优先权**（两道闸门放在这里，TUI 与滚动模式两个调用点因此不用各写一份）：
+    //   * 已经要退出（ctrl+d / /exit）→ 不许再开新轮，否则「按了退出却先跑了一整轮」。
+    //     **刻意不用 `tui_quit_wanted()`**：那个还含 headless 的「注入键用完」，是自测的收工
+    //     信号而不是人的退出意图（headless 下用它等于自动续跑永不生效，这条路就没法验收）。
+    //   * 键盘上还有待读的字节 → 让行（`agent_bg_input_pending` 在 TUI 下走 tui 侧那一份、
+    //     滚动模式下 poll fd 0）：自动续跑永远不该抢在人的输入前面。
+    if tui_abort_state() == TUI_ABORT_QUIT || agent_bg_input_pending() {
+        return false;
+    }
+    var body: Buf = buf_new(8192);
+    defer { buf_free(&body); }
+    if !goal_round_admit(cfg, &body) || body.len == 0 {
+        return false;
+    }
+    // 与「用户提交一行」同一条路：进历史、进日志、进转录 —— 它是同一会话里的一条 user 消息
+    var pushed: bool = hist_push(h, ROLE_USER, body.ptr as &const byte, body.len);
+    while !pushed {
+        if !hist_drop_oldest(h) {
+            break;
+        }
+        pushed = hist_push(h, ROLE_USER, body.ptr as &const byte, body.len);
+    }
+    if !pushed {
+        out_err("[goal] 续跑：写不进历史，本轮放弃\n");
+        return false;
+    }
+    agent_log_user(body.ptr as &const byte, body.len, false);
+    // 回执走诊断通道（TUI 下它就是转录里的一条 NOTICE，滚动模式直接打终端，`--quiet`
+    // 由 tty/view 那一层关掉）；**不用** tui_add_notice：那个接口在非 TUI 的滚动模式里
+    // 也会开条目，白白堆转录。
+    if !cfg.quiet {
+        out_err("[goal] 自动续跑一轮（/goal pause 可停）\n");
+    }
     tasks_goal_reload(cfg);
+    if cfg.tui && tui_active() {
+        tui_set_run(TUI_RUN_THINK, "" as &const byte, 0);
+    }
+    tui_interrupt_clear();   // 新回合 = 把上一轮遗留的中断意图清掉（与主循环提交任务同一条纪律）
+    const rrc: i32 = agent_turn_loop(cfg, h);
+    if cfg.tui && tui_active() {
+        agent_tui_turn_done();
+    }
+    // 收口。两件事，都要看**跑完之后**的盘上与退出码：
+    //   ① 模型可能在这一轮里把目标标成 complete / blocked / pause —— 盘上不再是
+    //      「active + armed」就把本地授权跟着收掉，下一轮 admit 的第一道闸门就挡住；
+    //   ② 这一轮**异常收场**（网络/协议错误）时也把授权收掉。DSH 的规则是「异常不自动重试，
+    //      等用户明确 resume」—— 不收的话，上游一直 500 就是主循环一圈一圈地重发，
+    //      屏幕上刷满「自动续跑一轮」，用户还看不出它在空转（真正踩过的形状）。
+    //      中断（esc / ctrl+c）不算异常：那是人主动停下当前这一轮，目标该留着。
+    if g_goal_armed {
+        var g: Goal = goal_empty();
+        defer { goal_free(&g); }
+        if rrc != AGENT_OK && rrc != AGENT_INTERRUPTED {
+            out_err("[goal] 这一轮异常收场，已停下自动续跑（修好后 /goal resume 接着跑）\n");
+            g_goal_armed = false;
+        } else if !goal_load(cfg, &g) || !g.active_state || !g.armed
+            || !bufx_eq_cstr(g.phase.ptr as &const byte, g.phase.len, "active" as &const byte) {
+            g_goal_armed = false;
+        }
+    }
+    tasks_goal_reload(cfg);
+    return true;
 }
 
 // 秒数 1Hz 刷新 + 面板内容变化检测（内容没变时 view 侧一个字节都不写）
@@ -8446,7 +8530,7 @@ fn agent_repl_status(cfg: &const Config, h: &const History) void {
 // 报告只认「现取」的四张表：先 poll 一次（job/deleg 的状态与增量输出），再把 goal.json 读一遍
 fn agent_tasks_refresh(cfg: &const Config) void {
     tasks_init();
-    agent_goal_reload(cfg);
+    tasks_goal_reload(cfg);
     tasks_poll();
 }
 
@@ -8544,7 +8628,7 @@ fn agent_repl_goal(cfg: &const Config, line: &const Buf) void {
     // 带参数的调用可能改过 goal.json：常驻任务块的目标段要跟着新值重画
     // （裸 /goal 是纯读，不碰面板 —— 与 /status 同一条纪律）
     if !sv_eq_cstr(line, "/goal") {
-        agent_goal_reload(cfg);
+        tasks_goal_reload(cfg);
         _ = tasks_panel_sync();
     }
 }
@@ -9419,7 +9503,7 @@ fn agent_run_interactive(cfg: &Config) i32 {
     agent_repl_banner(cfg);
     // P22：任务块（清单/后台任务/子代理/目标）—— 启动先读一次 goal.json，再把面板刷出来
     tasks_init();
-    agent_goal_reload(cfg);
+    tasks_goal_reload(cfg);
     agent_agents_tick_force();
     // P46：把 cfg/h 登记给 tty_read_line_blocking 那一层（它在阻塞读里要消费
     // 自动起标题的待办，拿不到这里的局部量）
@@ -9443,6 +9527,13 @@ fn agent_run_interactive(cfg: &Config) i32 {
             continue;
         }
         if !have {
+            // P58：进阻塞读之前先问一次「要不要续跑」。滚动模式这里没有 TUI 那种「fd 0 上还有
+            // 待读字节吗」的探测，所以顺序反过来 —— 先驱动一轮，用户敲的字留给紧接着的
+            // read（驱动那一轮期间敲进来的会进 steer 收件箱，与回合运行中同一条路）。
+            // 驱动过一轮就回顶部（不在这儿等输入），下一圈再问 —— 用户总有插话的机会。
+            if agent_goal_drive(cfg, &h) {
+                continue;
+            }
             tty_line_clear(&tty_ui);
             tty_set_prompt(&tty_ui, "> ");
             tty_draw_line(&tty_ui, 2);
@@ -10867,9 +10958,10 @@ export fn main() i32 {
 //      口径：`\n` → 空格、ESC → `␛`、控制字节 → `·`、TAB → 四个空格），过滤缓冲本身
 //      一个字节不动（匹配与「无匹配还回输入行」用的都是原始字节）。
 // 编号说明：P55/P56 被并行线先占了，按「后到的顺延」记成 **P57**；
-// 版本串 `p57-pick` —— 与 README §1.1 同一套记法。
-const AGENT_VERSION: [byte: 16] = [112, 53, 55, 45, 112, 105, 99, 107, 0, 0, 0, 0, 0, 0, 0, 0];   // "p57-pick"
-const AGENT_VERSION_LEN: usize = 8;
+// P58（goal 续跑驱动器）记在下方 goal 那一段的注释里。
+// 版本串 `p58-drive` —— 与 README §1.1 同一套记法。
+const AGENT_VERSION: [byte: 16] = [112, 53, 56, 45, 100, 114, 105, 118, 101, 0, 0, 0, 0, 0, 0, 0];   // "p58-drive"
+const AGENT_VERSION_LEN: usize = 9;
 // 解析 `--color=` 的取值：auto / always / never / 16 / 256。
 // 认不出按 `auto`（同时认 `NO_COLOR`）。
 fn agent_parse_color(p: &byte) u8 {
@@ -12036,7 +12128,7 @@ fn agent_tui_command(cfg: &Config, h: &History, line: &const Buf) bool {
         tui_overlay_list(TUI_OVK_GOAL, gtitle, strlen(gtitle), gtxt.ptr as &const byte, gtxt.len);
         // 带参数的调用可能改过 goal.json：常驻块的目标段当场重画（裸 /goal 是纯读，不碰面板）
         if !sv_eq_cstr(line, "/goal") {
-            agent_goal_reload(cfg);
+            tasks_goal_reload(cfg);
             _ = tasks_panel_sync();
         }
         return false;
@@ -12234,6 +12326,11 @@ fn agent_tui_is_injected(m: &const Msg) bool {
         return true;
     }
     if bufx_mem_eq(p, "# 项目约定" as &const byte, bufx_cstr_len("# 项目约定" as &const byte)) {
+        return true;
+    }
+    // P58：续跑那一轮的 `<goal_round>` 块也不回放 —— 它是驱动器写给模型的指令，不是人打的字
+    // （回放成 `▎ 你` 会让人以为用户自己敲了那一大段）。
+    if bufx_mem_eq(p, "<goal_round>" as &const byte, 12) {
         return true;
     }
     return false;
@@ -12455,7 +12552,7 @@ fn agent_run_tui_body(cfg: &Config, tui_fd: i32) i32 {
     agent_tui_seed_history(&h);
     // P22：常驻任务块 —— 启动先读一次 goal.json，再把面板文本备好（tui_build 只 memcpy）
     tasks_init();
-    agent_goal_reload(cfg);
+    tasks_goal_reload(cfg);
     agent_agents_tick_force();
     tui_mark_dirty();
 
@@ -12477,7 +12574,7 @@ fn agent_run_tui_body(cfg: &Config, tui_fd: i32) i32 {
         // P46：自动起标题的待办**不在这里**早退式消费 —— 那会把这一圈的按键/浮层处理
         // 整段跳过去（实测：起标题的圈里敲进来的 /status 被当成「未知命令」）。
         // 它排在循环体最后（所有输入处理之后），闸门见 agent_title_auto_idle_ok。
-        if !tui_has_submit() && !g_tui_quit_flag_pending() {
+        if !tui_has_submit() {
             _ = tui_poll_keys(wait_ms);
             _ = tui_tick(tui_now_ms());
             // P42：空闲时也要让 /watch 的跟随继续长（这一段没有泵点，g_pump_cfg 是空的）
@@ -12566,6 +12663,13 @@ fn agent_run_tui_body(cfg: &Config, tui_fd: i32) i32 {
         // 4) 等提交
         if !steer_got {
             if !tui_take_submit(&line) {
+                // P58：同会话 Goal Round 的驱动器也挂在这一支（与 DSH 的 idle 检查点同一个
+                // 位置）。让路判据（要退出 / 键盘上还有待读字节）都在 `agent_goal_drive`
+                // 里面，两个调用点共用一份。驱动过一轮就回顶部再问一次，**别**在同一圈顺手
+                // 把标题请求也发了。
+                if agent_goal_drive(cfg, &h) {
+                    continue;
+                }
                 // P46：这是**真空闲**的那一支（没有提交、浮层结果已在第 2 步消费掉、
                 // steer 也在第 3 步领取过）—— 只有走到这里才发自动起标题的侧路请求。
                 // 放在这一支而不是循环开头：早发会把这一圈的浮层/按键处理整段跳过去
@@ -12642,12 +12746,6 @@ fn agent_run_tui_body(cfg: &Config, tui_fd: i32) i32 {
     }
     g_interactive = false;
     return rc;
-}
-
-// TUI 是否已经置了「该退出了」的标志（`/exit`、ctrl+d、EOF 都置它）。
-// 主循环每圈查一次，所以退出要等到这一圈结束 —— 这也是「任何时刻都退得出去」的实现（§15.2）。
-fn g_tui_quit_flag_pending() bool {
-    return false;
 }
 
 // --tui-demo：把 home / chat 两种屏渲染成**纯文本**打出来（诊断 + §11 用）

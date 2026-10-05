@@ -1453,13 +1453,57 @@ ralph → `<watch_base>-rN`，N 由管道里已收到的 `[round N]` 行推出
 **控制词只有独占整行时才不区分大小写**，其余非空后缀都是**字面目标**
 （例：`/goal pause after verification` 创建的就是那个字面目标）。
 
-**与主循环的交互点**：派发 create/get/update 后立刻 `agent_goal_reload`；启动/TUI 建历史时也
+**与主循环的交互点**：派发 create/get/update 后立刻 `tasks_goal_reload`；启动/TUI 建历史时也
 reload；内存投影放在 `term/tasks.uya`（`tasks_goal_ref`），面板读它。
 
-> **事实性提醒**：`phase = active` / `armed` 是模型与面板可见的状态，但仓库里**没有**自动续跑
-> 驱动器（`g.round` 只在 `goal_load` 从盘上读、create 清零；全仓**没有**把它 +1 的代码，
-> 只有 `--tui-demo` 的假数据）。也就是说「自动续跑」目前是 schema 文案 + 状态字段，
-> **不是已实现的循环**。
+**两个 `armed`**：`Goal.armed` 是**盘上**那份（跨进程持久、`get_goal` 报它），`g_goal_armed`
+是**进程本地**的续跑授权（驱动器认的是它）。分开的理由见 §9.5 —— 合并的话 `--resume` 会把
+上一条会话的授权继承过来。
+
+### 9.5 同会话续跑驱动器（P58，`goal_round_admit`）
+
+`phase=active` + 有授权 = 自动开下一轮。对齐 DSH 的
+`@deepseek-ai/dsh-goal-round-driver`（本机 DSH 安装里的 `node_modules`，README.zh.md）：
+每一轮是**同一个会话**里追加一条 user 消息，不是开新 agent、也不 fork 历史（那是 Ralph 那条线）。
+
+**触发点 = idle 检查点**：`agent_goal_drive` 挂在主循环**真空闲**的那一支（TUI 与滚动模式各一处），
+也就是「没有待提交输入、没有浮层结果、steer 已领取」的那一刻 —— 与 DSH 的
+「`agent.status === 'idle'` 且没有竞争 prompt」同一个位置。
+
+**六条让路/停止判据**（顺序即优先级）：
+
+| # | 判据 | 行为 |
+|---|---|---|
+| 1 | 非交互 / 子代理 | 不驱动（管道与 CI 里没人叫停，而每一轮都真的发请求） |
+| 2 | 进程本地无授权 | 不动（DSH：`activation !== armed`） |
+| 3 | 无目标 / phase 非 active | 不动（complete / paused / blocked 都是「别再跑了」） |
+| 4 | `round >= maxRounds` | 盘上改成 **blocked + blocker=round-limit + armed=false + revision+1**，本地授权收掉（DSH 的 `round-limit`：是终态，不是悄悄停下） |
+| 5 | 记不上账（goal.json 写失败） | 一个字节都不发，授权收掉（不许出现「跑了没记账」的轮次） |
+| 6 | 某一轮异常收场（非 OK / 非中断） | 停下，要人 `/goal resume`（DSH：**异常不自动重试**） |
+
+TUI 那一条另加两道**人的优先权**：`tui_abort_state() != QUIT`（按了退出就不许再开轮；这里
+**刻意不用** `tui_quit_wanted()` —— 那个还含 headless 的「注入键用完」，是自测的收工信号）
+与 `tui_input_pending()`（fd 0 上还有待读的键就让行）。
+
+**`round` 只在真正开轮之后才 +1**（`goal_round_admit` 里与 revision 一起落盘）：记账与投递成对，
+只有记上账的轮次才会被投递。反过来（先投递后记账）一旦落盘失败就是个没有记录的轮次，下一轮
+驱动又会拿同一个轮号重发一遍。
+
+**正文**（模型可见）：`<goal_round>\nObjective: "<JSON 转义的 objective>"\nRound: N/M\n\n…`
+—— 措辞与 DSH 的 `renderGoalRoundPrompt` 逐句对应。objective 走 `jw_str_into`：目标里带引号、
+反斜杠或形似标签的片段只能是**数据**，不许在提示词里变成结构（DSH 的 `JSON.stringify` 同理由）。
+
+**授权不跨进程**：`agent_session_scoped_reset`（启动 / fork / `--resume` / `/new` / `/resume`
+都走的那个收口）把 `g_goal_armed` 清掉，**盘上的 phase / revision 一个字节不动**。要接着自动跑
+必须由人明确授权（`update_goal action=resume` 或 `/goal resume`）—— 与 DSH 的
+「会话 resume / fork 之后 active 目标是 disarmed」同一条。
+
+**为什么把驱动器收在一个函数里**：本仓顶层函数表的余量是 **0**（CODING.md §6 / §16 坑 87），
+所以「该不该开」与「记账 + 拼正文」合成一个 `goal_round_admit`，收口那段内联在 `agent_goal_drive`。
+为此删掉了 3 个零调用的死函数（`js_view_to_buf` / `mock_glob_body` / `dg_run2`）
+与一个恒 `false` 的占位（`g_tui_quit_flag_pending`），并内联了 `agent_goal_reload`
+（纯转发）—— 净增声明数 **≤ 0**（实测 = 基线）。
+
 
 ### 9.4 workflow（`agent/workflow.uya`）
 
@@ -2371,7 +2415,8 @@ responses 用 `{"type":"input_image","detail":"auto","image_url":…}`；
 | **不发 `temperature`（默认）** | 用网关默认值 —— 这也意味着**轨迹是随机的**，A/B 对照要跑 ≥3 发（§5.5.3） |
 | **不落盘 tool 输出 spill** | DSH 会 spill，本项目只留内存尾部（§6.5）—— 长输出任务的后半段会永久丢失 |
 | **观察表不持久化** | 恢复会话后要重新 read 才能 edit（与 DSH 一致） |
-| `goal` 的**自动续跑未实现** | 目前是 schema 文案 + 状态字段（§9.3） |
+| `goal` 的**异常续跑不自动重试** | 某一轮以网络/协议错收场就停下，要人 `/goal resume`（与 DSH 一致，§9.5） |
+| `goal` 的续跑**授权不跨进程** | `/new`、`--resume`、fork 之后目标还在盘上但停着，接着跑要人明确 resume（§9.5） |
 | **路径守卫是 best-effort，不是安全边界** | 要真隔离请用 `workspace-write` / `read-only` |
 
 ### 15.5 平台
@@ -2965,7 +3010,7 @@ DEEPSEEK_API_KEY=sk-xxx ./build/uya-agent \
 | `interrupt` | Ctrl-C：`AGENT_INTERRUPTED`、工具未派发、只一次请求 |
 | `tui-frame` | 八尺寸每行 ≤ cols、正文层无 ESC；脚注按列退化；浮层方框左右边界同列（踩坑 42） |
 | `tui-keys` | UTF-8 逐字符编辑、切开的 `ESC [ D`、Ctrl-J、↑历史、tab plan、面板、Ctrl-D/Ctrl-C、`tui_abort_state()` 三档 |
-| `tui-turn` | headless 端到端：用户条目、`✓ Write`/`✓ Bash(`、最终答案、状态区收掉无残影；脚注含 `1 轮 · ` |
+| `tui-turn` | headless 端到端：用户条目、`✓ Write`/`✓ Bash(`、最终答案、状态区收掉无残影；脚注含 `1 轮 · `；**P58 续跑腿**（换一份 mock 重跑：`create_goal` 之后主循环空闲即自开第二轮 → 续跑轮用记账后的 revision 标 complete → 授权收掉、转录里不出现 `<goal_round>` 用户条目） |
 | `tui-status` | 常驻状态区 + 思考实时行：铺满后仍钉住、只显示 `latestLine`、空闲 0 行、窄终端退化 |
 | `tui-caret` | 踩坑 66：运行中（思考/输出/工具）输入行有光标（标志位 + 字节级 1×`?25h`/0×`?25l`）；空闲与「空闲+浮层」两格不变；运行中开浮层仍隐藏（1×`?25l`/0×`?25h`） |
 | `tui-p30` | 泵点当场派发只读命令、`/new` 立刻回执、`/compact` 留 step 边界；真 PTY `/status` ≤800 ms（`mock_mode=40`） |
@@ -3049,7 +3094,7 @@ DEEPSEEK_API_KEY=sk-xxx ./build/uya-agent \
 | `responses-compact` | mock mode 22：摘要与压缩后请求都走 `/v1/responses` |
 | `api-flags` | `make e2e-api`：默认 responses+negotiable；`--api=chat`/env 生效 |
 | `tasks-e2e` | `make e2e-tasks`：`/tasks`、`open`/`toggle`、非法参数报错 |
-| `goal-cmd` | P29 `/goal` 纯函数：控制词独占整行、状态块四段、`clear` 幂等 |
+| `goal-cmd` | P29 `/goal` 纯函数：控制词独占整行、状态块四段、`clear` 幂等；**P58 续跑判定九腿**（未授权 / 授权即开 / 轮号递增 / complete 停 / 轮次用尽标 blocked+round-limit / resume 重开 / pause 收授权 / **objective 转义与信封完整性** / 无目标不开） |
 | `goal-e2e` | `make e2e-goal`：真 REPL 11 条命令逐条 grep |
 | `sess-list` | 去重取最后一条、按 `lastActiveAt` 降序、8 档列宽退化、完整 id |
 | `sess-list-big` | 踩坑 68：6000 行大索引 —— 归并排序与「金标准（未修的插入排序）」逐行等价、两把键各自有序、排两次结果相同、去重 2000 条、行尾 id 完整（抽查首/中/末） |
@@ -3329,3 +3374,38 @@ DEEPSEEK_API_KEY=sk-xxx ./build/uya-agent \
   ⑥ 重发前往历史里塞一条 `PERTURB` → 两腿红（**verdict 249**：重发的请求体不再逐字节相同）。
   对照实验 ⑥ 还顺手抓到自测自己的一个坑：第一版判定码写成 261…268，`sys_exit` 回来只留低 8 位，
   「264」显示成「8」（见 §16 踩坑 89）。
+
+- P58：**同会话 Goal Round 驱动器**（`goal-round-driver` 对齐，见 §9.5）。本轮填的是 §9.3 那条
+  「**自动续跑未实现**」的白纸黑字 —— 修前 `phase=active` / `armed` 只是模型与面板看得见的状态，
+  `g.round` 全仓**没有一处 +1**（只有 `--tui-demo` 的假数据），也就是说 schema 文案在说谎：
+  模型建了目标、`get_goal` 报 `armed = true`，用户等着它接着干，仓库却什么都不做。
+  真机症状很具体：长目标跑完一轮就停在提示符上，用户要一条一条敲「继续」（`/continue` 那条路
+  还得自己判断该不该再催）。
+  实现对齐 DSH 的三条硬语义：**① 同会话**（每轮是往同一条会话追加一条 `<goal_round>` user 消息，
+  不开新 agent、不 fork 历史 —— 与 `deleg.uya` 的 Ralph 那条「每轮全新 agent」明确分开）；
+  **② idle 检查点**（挂在主循环真空闲那一支，与自动起标题同一处，但排在它**前面**：续跑优先于
+  起标题那个侧路请求）；**③ 授权不跨进程**（换会话/恢复走的 `agent_session_scoped_reset` 把
+  进程本地的 `g_goal_armed` 清掉，盘上的 phase / revision 一个字节不动，接着跑要人明确 resume）。
+  另外三条是自己补的（都是 DSH 有、本仓必须等价的东西）：轮次用尽 ⇒ 盘上标
+  `blocked + round-limit`（终态而非悄悄停下）；**异常不自动重试**（某一轮网络/协议错收场就停，
+  否则上游一直 500 会变成主循环一圈一圈地空转刷屏）；记账与投递成对（`round` 只在落盘成功之后
+  才算一轮，不许出现「跑了没记账」）。
+  **判定与验收**：`goal-cmd` 轮新增 K 段九腿（未授权 / 授权即开 + 正文形状 + 记账 / 轮号递增 /
+  complete 停 / 轮次用尽标 blocked+round-limit+收授权 / resume 重开 / pause 收授权 /
+  **objective 转义与信封完整性** / 无目标不开）；`tui-turn` 轮新增一条**真端到端**腿（换一份
+  mock 脚本：人那一轮 `create_goal` → 主循环空闲后**不注入任何键**，驱动器必须自己开出第二轮 →
+  续跑轮用**记账之后**的 revision 标 complete → 授权收掉、且在**请求里**断言 `<goal_round>`
+  与 `Round: 1/3` 都在、信封没被目标里的伪标签顶破）。
+  **防假绿对照实验**（都先看到红）：① 把 `goal_round_admit` 里的 `jw_str_into` 换成裸
+  `buf_append` → K2 当场红（「objective 没有走 JSON 转义」）；② 把驱动器的 `g_goal_armed`
+  闸门短路（恒 true）→ K1 红；③ 去掉「异常收场收授权」那一段 → 需真机才稳定复现，故只记在
+  §9.5 的判据表里（自测那两腿跑的是一条正常路径，不冒充覆盖）。
+  ⚠ **本轮最大的坑不在功能里，在编译器的容量上**：uya 0.10 的顶层**函数表**余量是 **0**
+  —— 实测「删 1 个 + 加 1 个」绿、「加 1 个」红（报 `undefined reference to <某个有调用的函数>`，
+  报错点还落在**别的文件**上，看起来像链接脚本坏了）。所以净增声明数压到 **≤0**
+  （实测声明数 6826 = 基线，函数净 −1）：收驱动器为单个 `goal_round_admit`、收口内联进
+  `agent_goal_drive`、内联纯转发的 `agent_goal_reload`，并删掉三个零调用死函数
+  （`js_view_to_buf` / `mock_glob_body` / `dg_run2`）与一个恒 `false` 的占位
+  `g_tui_quit_flag_pending` —— 它的调用点是 `!tui_has_submit() && !g_tui_quit_flag_pending()`，
+  恒真那一项去掉即等价。
+  验收：`make build`（干净重编两次，声明数 6826 = 基线）＋ `make selftest` 全绿。
