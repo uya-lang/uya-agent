@@ -2761,21 +2761,30 @@ responses 用 `{"type":"input_image","detail":"auto","image_url":…}`；
    `--probe` 对 `api.deepseek.com` 拿到 HTTP 401 —— DNS 与 TLS 这两条最容易在静态
    glibc 上出事的路径都是通的。
 
-   > **另一件事（不是这条线引入的）**：整轮 selftest 里 `worktree-reclaim` 偶尔红在
-   > fixture **准备**阶段（`造 A/B/C/F/F2 失败`、`收尾时把有提交的孤儿分支清掉了`），
-   > 报的还每次不一样。这条线顺手做了对照，三组证据都指向「与链接方式无关」：
+   > **另一件事（不是这条线引入的，已在后续一轮修掉）**：整轮 selftest 里 `worktree-reclaim`
+   > 偶尔红在 fixture **准备**阶段（`造 A/B/C/F/F2 失败`、`收尾时把有提交的孤儿分支清掉了`），
+   > 报的还每次不一样。当时这条线顺手做了对照，三组证据都指向「与链接方式无关」：
    > ① **A/B 交替**：同一台机器、静态与动态各跑三轮交替进行，静态第 1 轮红、
    > 动态第 2 轮红（签名逐字相同）；② **拿未改动的对照**：从共享检出里取一份
    > `main` 上 07:25 编好的产物（**动态、本线一行都没碰**），与静态产物交替各跑 4 轮
    > —— **对照 2/4 红，静态 1/4 红**，而且对照红的那两次正是同一个 `worktree-reclaim`；
    > ③ **聚焦**：`UYA_SELFTEST_MODEL_ONLY=1`（0.4 s，含这一轮）连跑 30 次、
    > 每次先清 `/tmp/selftest_p37_wt_*`，**0 失败**。
-   > 机理对得上：fixture 目录按 pid 命名（`/tmp/selftest_p37_wt_<pid>`），而 `gitx` 对
-   > 每次 git 调用有 **10 s 墙钟上限**（`GITX_TIMEOUT_MS`，超了 SIGKILL）—— 真机上
-   > `git worktree add` 只要 8–9 ms，但同机并发跑着别的会话的 selftest/构建（load ~5–10）
-   > 时偶发超过 10 s 就整轮红。**没有**在这一轮动 `src/selftest/selftest.uya` —— 那属于既有 flake，
-   > 改了就跑题了；如实记在这里备查（`mine #1` 那次红在 `tui-plan` 的
-   > 「审阅浮层里没有三个动作」，同样是 `tuis_drain` 有界轮询的时序快慢，不是链接问题）。
+   > 当时的猜测是 `gitx` 的 10 s 墙钟上限（`GITX_TIMEOUT_MS`）在高负载下偶发超时。
+   > **后续一轮把它查清了，不是超时 —— 是踩坑 57 的 C 串口径**：那两轮多出来的
+   > fixture 辅助函数（`wt_residue_slug`）返回的 slug 是个**裸 `Buf`（没有尾 NUL）**，
+   > 而它立刻被 `wt_residue_make_named` / `wt_branch_gone` 按 C 串口径消费
+   > （`buf_append_cstr` / `bufx_cstr_len`）。`buf_new` 的 `malloc` 不清零，于是
+   > `bufx_cstr_len` 一路读到堆里的脏字节：实测 `dsh/inuse1-4` 后面黏着
+   > `\x9d\x13@\0\0\0\0` 与半截 fixture 路径，`git worktree add -b <那个名字>` 时好时坏。
+   > 完整 selftest 里前面几十轮已经**真的 chdir / 拼过大路径**，堆是脏的 ⇒ 必红；
+   > 而 `UYA_SELFTEST_MODEL_ONLY=1` 那条路上堆还干净（后面那些字节恰好是 0）⇒ 三十次都不红。
+   > 这正好解释了三组对照为什么都说「与链接方式无关」，也解释了「报得每次不一样」
+   > （黏上的脏字节随前面跑过哪几轮变化）。**修法**：`wt_residue_slug` 补一个尾 NUL
+   > （`len` 仍留**可见长度**），并在 `worktree-reclaim` 轮里钉一条
+   > 「`bufx_cstr_len(slug) == slug.len`」的断言 —— 补错/漏补都当场红，
+   > 不用再等下一次偶发。（`mine #1` 那次红在 `tui-plan` 的「审阅浮层里没有三个动作」，
+   > 同样是 `tuis_drain` 有界轮询的时序快慢，与本条无关。）
 
 91. **函数表容量还有第二、第三种症状：链接期 `undefined reference` 指向你没改过的函数**（P55，本轮踩到）：
    踩坑 87 的结论是「变量与常量不占额度、只有函数占」，写代码时很容易只记住前半句 —— 这轮给执行期
