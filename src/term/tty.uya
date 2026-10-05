@@ -1,4 +1,9 @@
-// src/tty.uya — 终端交互层（P3）
+// src/term/tty.uya — 终端交互层（P3）
+//
+// 本文件：isatty 探测与 raw 模式进出、终端尺寸读取、UTF-8 编解码与显示列宽、行编辑器与事件队列、面板块的擦除/重画协议、诊断字节的安全预览、终端标题（OSC 2）通道。
+// 不变量：编辑按 **UTF-8 字符**、定位按**显示列**（按字节退格会砍出半个汉字，按字节挪光标会越走越偏）；写转义序列必须用数组字面量取址，**不能**用 `&"字面量"[a:b]`（生成的是切片描述符地址，屏幕上就是乱码）；面板块的擦除只能清它自己占的格子（多行块走 tty_build_block_erase 的逐行 `ESC[2K`，不能拿 `ESC[J` 清到屏幕末尾，那会连带擦掉下面仍可见的正文）；raw 属性必须在正常/错误/信号三条路径上都还原。
+// 依赖：libc.syscall / libc.unistd / libc.stdlib、foundation/bufx；信号层在 sigx（本模块**不装处理器**）。
+// 命名：本文件对外符号统一 `tty_` / `TTY_` 前缀。
 //
 // 提供：
 //   * isatty 判定：libc 没导出 isatty，用 `ioctl(0, TCGETS, &termios)` 成功即 TTY；
@@ -89,6 +94,7 @@ export struct TtyWinsize {
     ws_y: u16,
 }
 
+// 全零的 termios（c_cc 32 字节、pad 3 字节都清零），给「先 memset 再填」的调用方当起点。
 export fn tty_termios_zero() TtyTermios {
     return TtyTermios{
         c_iflag: 0,
@@ -136,6 +142,7 @@ export struct TtyUi {
     input_on_screen: bool,  // 「提示符+输入」在屏幕上但输入为空（此时块要复用它当底行）
 }
 
+// 指针转 i64：ioctl 的第三个参数在 syscall 层是整数（老接口口径）。
 fn tty_ptr_i64(p: &void) i64 {
     return @usize_from_ptr(p) as i64;
 }
@@ -149,6 +156,7 @@ export fn tty_get_attrs(fd: i32, out: &TtyTermios) bool {
     return v == 0;
 }
 
+// 写回终端属性（TCSETS）。返回 ioctl 是否成功。
 export fn tty_set_attrs(fd: i32, t: &const TtyTermios) bool {
     const r: !i32 = sys_ioctl(fd, TTY_TCSETS, tty_ptr_i64(t as &void));
     const v: i32 = r catch { -1; };
@@ -166,10 +174,13 @@ export fn tty_raw_lflag_clear(base: u32) u32 {
     return base & (TTY_U32_MAX - (TTY_LFLAG_ISIG | TTY_LFLAG_ICANON | TTY_LFLAG_ECHO | TTY_LFLAG_IEXTEN));
 }
 
+// raw 模式下应该清掉的 iflag 位（ICRNL/IXON）。纯函数，自测直接断言。
 export fn tty_raw_iflag_clear(base: u32) u32 {
     return base & (TTY_U32_MAX - (TTY_IFLAG_ICRNL | TTY_IFLAG_IXON));
 }
 
+// 初始化界面状态：探测 is_tty、分配各缓冲、复位编辑/转义/面板块字段，提示符置 "> "，
+// 是 TTY 时顺手读一次宽度。**不**进 raw 模式（那是 tty_raw_on 的事）。
 export fn tty_init(ui: &TtyUi, fd: i32) void {
     ui.is_tty = tty_probe(fd);
     ui.raw = false;
@@ -236,6 +247,7 @@ export fn tty_refresh_size(ui: &TtyUi) void {
     }
 }
 
+// 释放 line / prompt / block / stash / pend 与全部历史项（要求调用方不再使用 ui）。
 export fn tty_free(ui: &TtyUi) void {
     buf_free(&ui.line);
     buf_free(&ui.prompt);
@@ -291,6 +303,7 @@ export fn tty_raw_off(ui: &TtyUi, fd: i32) void {
 // `sigx` 直接绑宿主 glibc 的 `sigaction`，在没修过的工具链上也能工作。
 // 被 SIGKILL 打断仍然无法恢复（不可捕获），用 `reset` / `stty sane` 兜底。
 
+// 界面是否真的在 raw 模式下接管终端（is_tty && raw）——所有擦/重画的闸门都是它。
 export fn tty_active(ui: &const TtyUi) bool {
     return ui.is_tty && ui.raw;
 }
@@ -334,6 +347,7 @@ export fn tty_set_block_provider(ui: &TtyUi, on: bool) void {
     }
 }
 
+// 屏幕上当前这一块里**是否含窗口行**（擦除按它选单行还是多行协议）。
 export fn tty_block_on() bool {
     return tty_ui.block_on;
 }
@@ -474,10 +488,12 @@ export fn tty_block_begin(text: &const byte, n: usize) void {
     tty_block_set(&tty_ui, text, n);
 }
 
+// 清空面板块快照（= tty_block_set 传空）。
 export fn tty_block_clear() void {
     tty_block_set(&tty_ui, null as &const byte, 0);
 }
 
+// 当前面板块快照的字节数。
 export fn tty_block_len() usize {
     return tty_ui.block.len;
 }
@@ -629,6 +645,7 @@ export fn tty_cols_between(s: &const byte, a: usize, b: usize) usize {
 // ============================================================
 const TTY_DIAG_ESC_MAX: usize = 4;     // 一个源字节最长的展开形式 "\xNN"
 
+// 往 dst 追加一个字节的 `\xNN` 转义（十六进制小写）。
 fn tty_diag_put_hex(dst: &Buf, c: byte) void {
     _ = buf_append_cstr(dst, "\\x");
     const v: usize = c as usize;
@@ -638,6 +655,8 @@ fn tty_diag_put_hex(dst: &Buf, c: byte) void {
     _ = buf_append_byte(dst, (if lo < 10 { 48 + lo } else { 87 + lo }) as byte);
 }
 
+// 诊断字节 → 终端安全预览（规则见上方长注释）。把转义结果追加进 dst，最多写到 cap 字节。
+// 返回**吃进去的源字节数**：used < n 表示被截断，调用方自己补「… <n> bytes total」。
 export fn tty_diag_escape_into(dst: &Buf, p: &const byte, n: usize, cap: usize) usize {
     var i: usize = 0;
     while i < n {
@@ -773,6 +792,7 @@ fn tty_push_ev(ui: &TtyUi, ev: i32) void {
     }
 }
 
+// 取下一个事件并从队列里出队（FIFO）；队列空返回 TTY_EV_NONE(0)。O(队列长度) 搬移。
 export fn tty_next_event(ui: &TtyUi) i32 {
     if ui.evn == 0 {
         return TTY_EV_NONE;
@@ -787,19 +807,24 @@ export fn tty_next_event(ui: &TtyUi) i32 {
     return ev;
 }
 
+// 当前输入行内容（不含提示符）；长度看 tty_line_len。
 export fn tty_line(ui: &const TtyUi) &[byte] {
     return ui.line.ptr[0: ui.line.len];
 }
 
+// 当前输入行的字节数。
 export fn tty_line_len(ui: &const TtyUi) usize {
     return ui.line.len;
 }
 
+// 清空输入行并把光标移回行首（只改 len，缓冲不释放）。
 export fn tty_line_clear(ui: &TtyUi) void {
     ui.line.len = 0;
     ui.cursor = 0;
 }
 
+// 在光标处插入一个**字节** c（把后面整体右移一格），行满 TTY_LINE_MAX 或扩容失败则丢弃。
+// 调用方负责只在 UTF-8 字符边界上插（多字节字符由上层逐字节喂进来）。
 fn tty_line_insert(ui: &TtyUi, c: byte) void {
     if ui.line.len >= TTY_LINE_MAX {
         return;
@@ -850,6 +875,7 @@ fn tty_line_delete(ui: &TtyUi) void {
     tty_line_erase(ui, ui.cursor, to);
 }
 
+// Ctrl-W：先吃掉光标左侧的空格，再吃掉一整段非空格（都是整个**字符**地退）。
 fn tty_line_del_word(ui: &TtyUi) void {
     while ui.cursor > 0 && ui.line.ptr[ui.cursor - 1] == 32 as byte {
         tty_line_backspace(ui);
@@ -896,6 +922,8 @@ fn tty_hist_push(ui: &TtyUi) void {
     ui.hist_len = slot + 1;
 }
 
+// 历史上下翻：首次上翻先把当前行暂存进 stash，翻到底再按下键就把 stash 放回来（hist_pos=-1）。
+// up=true 上翻（更老），up=false 下翻（更新）。
 fn tty_hist_move(ui: &TtyUi, up: bool) void {
     if ui.hist_len == 0 {
         return;
@@ -934,6 +962,8 @@ fn tty_hist_move(ui: &TtyUi, up: bool) void {
     ui.cursor = ui.line.len;
 }
 
+// CSI 终结字节 → 编辑动作：A/B 历史上下、C/D 左右移一个字符、H/F Home/End、
+// ESC[3~ 删字符、1~/7~ Home、4~/8~ End。移动一律走 UTF-8 字符边界。
 fn tty_esc_apply(ui: &TtyUi, final: byte) void {
     const f: i32 = final as i32;
     if f == 65 {
@@ -1058,6 +1088,8 @@ fn tty_feed_inner(ui: &TtyUi, p: &const byte, n: usize) void {
     }
 }
 
+// 喂入一批字节：先把上次剩的 pend 处理掉（若又出事件，本次这批也留到下次，绝不丢），
+// 再交给逐字节状态机。事件进队列，调用方用 tty_next_event 取。
 export fn tty_feed(ui: &TtyUi, p: &const byte, n: usize) void {
     // 先把上次剩下的字节处理掉（再出事件就继续留着）
     if ui.pend.len > 0 {
@@ -1185,6 +1217,8 @@ fn tty_seq_up(dst: &byte, n: usize) usize {
     return k;
 }
 
+// 擦掉上一次画出来的输入行（多行块由 tty_draw_line 走另一条路）。
+// 三个前置：不在 sink 模式、终端 active、且行确实在屏幕上；擦完把光标记账复位到块首列。
 fn tty_erase_line(ui: &TtyUi, fd: i32) void {
     if tty_sink_on {
         return;
@@ -1268,6 +1302,8 @@ export fn tty_advance_col(ui: &TtyUi, p: &const byte, n: usize) void {
     }
 }
 
+// 重画输入行块：先按旧几何擦干净，再写窗口行（每行自带 "\r\n"，保证块底行从第 0 列起），
+// 接着写提示符 + 输入行，最后按光标列发右移序列。tty_sink_on 或非 active 时直接返回。
 export fn tty_draw_line(ui: &TtyUi, fd: i32) void {
     if tty_sink_on {
         return;
@@ -1449,6 +1485,7 @@ export fn tty_out_begin(ui: &TtyUi, fd: i32) void {
     tty_erase_line(ui, fd);
 }
 
+// 写完正文之后重画输入行（tty_out_begin 的收尾动作）；非 active 时什么都不做。
 export fn tty_out_end(ui: &TtyUi, fd: i32) void {
     if tty_active(ui) {
         tty_draw_line(ui, fd);
@@ -1547,6 +1584,7 @@ export fn tty_reason_write(p: &const byte, n: usize) void {
     tty_write(&tty_ui, 2, p, n);
 }
 
+// 当前进程是否跑在「接管了终端」的交互界面里（tty_ui 的 is_tty && raw）。
 export fn tty_is_interactive() bool {
     return tty_active(&tty_ui);
 }
@@ -1587,6 +1625,7 @@ var g_title_on: bool = false;
 var g_title_buf: Buf = Buf{ ptr: null, len: 0, cap: 0 };
 var g_title_last: Buf = Buf{ ptr: null, len: 0, cap: 0 };
 
+// 惰性分配标题用的两个缓冲（g_title_buf / g_title_last），幂等。
 fn tty_title_ensure() void {
     if !buf_valid(&g_title_buf) {
         g_title_buf = buf_new(TTY_TITLE_MAX_BYTES + 16);
@@ -1807,6 +1846,7 @@ export fn tty_title_fallback_into(
     return tty_title_clean_into(dst, tmp.ptr as &const byte, we, max_bytes);
 }
 
+// 标题通道是否已打开（g_title_on && g_title_fd >= 0）。
 export fn tty_title_active() bool {
     return g_title_on && g_title_fd >= 0;
 }
