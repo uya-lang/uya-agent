@@ -1779,7 +1779,14 @@ fn agent_log_user_att(text: &const byte, n: usize, steer: bool, att: &const Buf,
 // 写一条 `assistant/message` 事件（正文 + 本次 usage）。
 // **退化响应那一步不写**（§5.4）—— 否则「上游正常收尾但什么都没给」在日志里
 // 与「模型真的回了空串」长得一模一样。
-fn agent_log_assistant(step: i32, o: &const ChatOut, t: u64) void {
+//
+// keep_calls=false 是给 **max_tokens 截断**那一步用的（§5.4.1）：那一步的 tool_calls
+// **一个都不会被派发**（参数可能是半截的），留在日志里就是「日志说有调用、实际一条结果都没有」
+// 的悬空形状 —— 而且 `--resume` 折日志时会把那半组当「未完成一轮」**整组丢掉**
+// （`hist_trim_incomplete_tail`），连截断前那段正文一起丢。DSH 的 assembler 在 max-tokens 时
+// 同样把 tool-call 块整块滤掉（"Emitted blocks and replay metadata both derive from this
+// result, so they cannot disagree"）—— 日志与实际派发必须一致。
+fn agent_log_assistant(step: i32, o: &const ChatOut, t: u64, keep_calls: bool) void {
     if !g_sess.save {
         return;
     }
@@ -1801,7 +1808,7 @@ fn agent_log_assistant(step: i32, o: &const ChatOut, t: u64) void {
     } else if !buf_append_cstr(&ev, "\"\"") {
         return;
     }
-    if o.ncalls > 0 {
+    if keep_calls && o.ncalls > 0 {
         // 容量按实际需要算（不再是固定 8192）：见 calls_json_make
         var cj: Buf = buf_empty();
         defer { buf_free(&cj); }
@@ -2011,9 +2018,11 @@ fn agent_bound_first_token(cfg: &const Config, h: &const History, step: i32, ms:
 
 // step 边界记账 + 写 `assistant/message`。步骤见 §3.5 的第 4 步。
 // 与「把 assistant 消息压进历史」是两件事：这里是日志侧，那里是历史侧。
-fn agent_bound_assistant_message(cfg: &const Config, h: &const History, step: i32, o: &const ChatOut) void {
+// keep_calls 一路带给 `agent_log_assistant`：截断那一步传 false（那一步的 tool_calls
+// 不会被派发，见 §5.4.1），其余路径传 true。
+fn agent_bound_assistant_message(cfg: &const Config, h: &const History, step: i32, o: &const ChatOut, keep_calls: bool) void {
     const t: u64 = ua_now_ms();
-    agent_log_assistant(step, o, t);
+    agent_log_assistant(step, o, t, keep_calls);
     st_assistant_message(
         g_turn as i64,
         step as i64,
@@ -3843,6 +3852,15 @@ export const AGENT_NET: i32 = 2;
 export const AGENT_PROTO: i32 = 3;
 export const AGENT_TOOL: i32 = 4;
 
+// P59：**输出到达上限（max_tokens）被截断** —— 回合走完了它的步数，但没走到最终答复就收场。
+//
+// 为什么不并进 3（「模型或协议错」）：模型与协议都没问题，只是我们给这一轮的输出预算用完了。
+// 也不当 0（「跑完了」）—— 屏幕上那段正文是半截的，脚本必须看得出来。所以单开一个码。
+// 两条腿都对齐 DSH：它的 UI 打 warn 色的「已达到输出 token 上限」+「发送"继续"可让模型接着
+// 输出」；`dsh-headless` 那条腿把正文照样打到 stdout、退出码按「没跑完」给非 0
+// （`outcome.reason?.kind === "completed" ? 0 : 1`）。这里取它的语义、给它一个自己的码。
+export const AGENT_MAX_TOKENS: i32 = 5;
+
 // ============================================================
 // 流式一步（P1）
 //
@@ -4550,17 +4568,60 @@ fn agent_finish_step(cfg: &Config, arena: &Arena, h: &History, step: i32, o: &co
         return AGENT_PROTO;
     }
 
-    agent_bound_assistant_message(cfg, h, step, o);
-
+    // P59：**max_tokens 截断**（§5.4.1）。三件事，一件都不能少：
+    //
+    // ① **不派发**任何工具调用 —— 参数可能是半截的，派发出去只会得到一条协议错
+    //    （对齐 DSH：它的 assembler 在 max-tokens 时把 tool-call 块整块滤掉）；
+    // ② 日志与历史**只留正文**：日志不留 tool_calls（keep_calls=false，理由见
+    //    `agent_log_assistant`），历史压一条普通 assistant 消息 —— 这与中断那条路
+    //    同一个形状（`agent_trim_trailing_ws` 剪掉断口处的空白再入史）；
+    // ③ 收口是 **warning 而不是 error**：截断不是「模型/协议出错」，是这一轮的输出
+    //    预算用完了。DSH 在这一步打的是 warn 色的「已达到输出 token 上限 / 回答被截断，
+    //    已有输出保留在对话中。发送"继续"可让模型接着输出」—— 本函数照抄它的语义。
+    //
+    // **为什么正文必须进历史**：用户看到「这一轮被截断了」之后的第一个动作就是回一句
+    // 「继续」。历史里没有那段正文的话，模型连自己刚写到哪都不知道，只能从零重来
+    // （真机现场：一整轮的工具调用白跑）。DSH 的提示语里那句「已有输出保留在对话中」
+    // 说的就是这件事。
     if o.finish == LLM_FINISH_MAX_TOKENS {
-        // 对齐 DSH：token 上限截断时**不派发**任何工具调用（参数可能是半截的）
-        out_err("error: model output was truncated at the token limit (max_tokens); tool calls dropped\n");
-        if o.content.len > 0 && o.printed_chars == 0 {
-            out_bytes(o.content.ptr as &const byte, o.content.len);
+        agent_bound_assistant_message(cfg, h, step, o, false);
+        // 断口处的空白先剪掉：半句话尾巴上挂一串空白，下一轮请求里就是噪声
+        const keep_cut: usize = agent_trim_trailing_ws(o.content.ptr as &const byte, o.content.len);
+        if keep_cut > 0 {
+            var pushed_c: bool = hist_push(h, ROLE_ASSISTANT, o.content.ptr as &const byte, keep_cut);
+            while !pushed_c {
+                if !hist_drop_oldest(h) {
+                    break;
+                }
+                out_err("[history] dropped oldest message to stay within limits\n");
+                pushed_c = hist_push(h, ROLE_ASSISTANT, o.content.ptr as &const byte, keep_cut);
+            }
+        }
+        if keep_cut > 0 && o.printed_chars == 0 {
+            out_bytes(o.content.ptr as &const byte, keep_cut);
+        }
+        // 正文和收口那两行之间必须先断开：流式（默认）早就把正文打出去了、**不带收尾换行**，
+        // 少这一下 `warning:` 就会粘在半句话的尾巴上（与最终答复那条路同一个写法）。
+        if keep_cut > 0 {
             out_err("\n");
         }
-        return AGENT_PROTO;
+        // 转录：一句 warning + 一句「下一步怎么做」。--quiet 也照打 —— 它是「这一轮
+        // 没跑完、画面上的东西是半截的」的唯一信号，静音掉等于骗人。
+        out_err("warning: 模型输出到达 token 上限（max_tokens）被截断，本回合到此为止（不是错误）\n");
+        out_err("[max-tokens] ");
+        if o.ncalls > 0 {
+            out_err_dec(o.ncalls as usize);
+            out_err(" 个工具调用已丢弃（参数可能是半截的，派发只会得到协议错）；");
+        }
+        if keep_cut > 0 {
+            out_err("已产出的正文留在对话里 —— 直接发「继续」即可让模型接着做\n");
+        } else {
+            out_err("这一步没有正文可留（输出预算全花在思考上）—— 发「继续」重试，或调低推理强度 / 调高 max_tokens\n");
+        }
+        return AGENT_MAX_TOKENS;
     }
+
+    agent_bound_assistant_message(cfg, h, step, o, true);
 
     if o.ncalls > 0 {
         if cfg.compat_fold {
@@ -4764,6 +4825,10 @@ fn agent_turn_loop(cfg: &Config, h: &History) i32 {
         agent_log_turn_end("aborted");
     } else if rc == AGENT_OK {
         agent_log_turn_end("completed");
+    } else if rc == AGENT_MAX_TOKENS {
+        // P59：对齐 DSH 的 turn/end reason —— 它在这一步记的是 `{kind:"max-tokens"}`：
+        // 「截断」既不是 completed（没走到最终答复）也不是 error（谁都没出错）。
+        agent_log_turn_end("max-tokens");
     } else if rc == AGENT_NET {
         agent_log_turn_end("error");
     } else {
@@ -7939,10 +8004,13 @@ fn agent_goal_drive(cfg: &Config, h: &History) bool {
     //      等用户明确 resume」—— 不收的话，上游一直 500 就是主循环一圈一圈地重发，
     //      屏幕上刷满「自动续跑一轮」，用户还看不出它在空转（真正踩过的形状）。
     //      中断（esc / ctrl+c）不算异常：那是人主动停下当前这一轮，目标该留着。
+    //      P59：**截断也不算异常** —— 目标显然还没做完，而且截断那一轮的正文已经进历史，
+    //      下一轮（新预算）正好接着写。DSH 的 goal 驱动器同样按「token 上限不是这一轮的
+    //      目标结论」处理（它压根不看 turn/end 的 reason），轮次上限兜住空转。
     if g_goal_armed {
         var g: Goal = goal_empty();
         defer { goal_free(&g); }
-        if rrc != AGENT_OK && rrc != AGENT_INTERRUPTED {
+        if rrc != AGENT_OK && rrc != AGENT_INTERRUPTED && rrc != AGENT_MAX_TOKENS {
             out_err("[goal] 这一轮异常收场，已停下自动续跑（修好后 /goal resume 接着跑）\n");
             g_goal_armed = false;
         } else if !goal_load(cfg, &g) || !g.active_state || !g.armed
@@ -9136,7 +9204,7 @@ fn agent_repl_command(cfg: &Config, h: &History, line: &const Buf) bool {
             pushed = hist_push(h, ROLE_USER, cont.ptr as &const byte, cont.len);
         }
         const rc: i32 = agent_turn_loop(cfg, h);
-        if rc != AGENT_OK && rc != AGENT_INTERRUPTED {
+        if rc != AGENT_OK && rc != AGENT_INTERRUPTED && rc != AGENT_MAX_TOKENS {
             tty_puts(&tty_ui, 2, "[turn] 本回合异常结束（可直接输入继续）\n");
         }
         return false;
@@ -9450,7 +9518,9 @@ fn agent_repl_plain(cfg: &Config) i32 {
         }
         agent_log_user_att(line.ptr as &const byte, line.len, false, &att, &have_att);
         rc = agent_turn_loop(cfg, &h);
-        if rc != AGENT_OK {
+        // P59：截断（AGENT_MAX_TOKENS）不算异常 —— 上面已经用 `warning:` + `[max-tokens] …`
+        // 说清「怎么回事 + 发「继续」接着做」，再报一句「异常结束」只会让人以为出事了。
+        if rc != AGENT_OK && rc != AGENT_MAX_TOKENS {
             out_err("[turn] 本回合异常结束（可继续输入）\n");
             rc = AGENT_OK;
         }
@@ -9597,7 +9667,10 @@ fn agent_run_interactive(cfg: &Config) i32 {
         agent_log_user_att(line.ptr as &const byte, line.len, false, &att, &have_att);
         agent_echo_imgs(&att, &have_att);
         rc = agent_turn_loop(cfg, &h);
-        if rc != AGENT_OK && rc != AGENT_INTERRUPTED {
+        // P59：截断（AGENT_MAX_TOKENS）不算「异常结束」—— 那句话上面已经用
+        // `[max-tokens] …` 说清「怎么回事 + 下一步怎么做」了，再说一句「异常」只会让人以为
+        // 出错了（用户报的就是这条错味的现场）。
+        if rc != AGENT_OK && rc != AGENT_INTERRUPTED && rc != AGENT_MAX_TOKENS {
             tty_puts(&tty_ui, 2, "[turn] 本回合异常结束（可直接输入继续）\n");
         }
         // 回合结束：跑完的子代理窗口已经收掉，这里兜底把面板同步一次
@@ -10958,10 +11031,11 @@ export fn main() i32 {
 //      口径：`\n` → 空格、ESC → `␛`、控制字节 → `·`、TAB → 四个空格），过滤缓冲本身
 //      一个字节不动（匹配与「无匹配还回输入行」用的都是原始字节）。
 // 编号说明：P55/P56 被并行线先占了，按「后到的顺延」记成 **P57**；
-// P58（goal 续跑驱动器）记在下方 goal 那一段的注释里。
-// 版本串 `p58-drive` —— 与 README §1.1 同一套记法。
-const AGENT_VERSION: [byte: 16] = [112, 53, 56, 45, 100, 114, 105, 118, 101, 0, 0, 0, 0, 0, 0, 0];   // "p58-drive"
-const AGENT_VERSION_LEN: usize = 9;
+// P58（goal 续跑驱动器）记在下方 goal 那一段的注释里；
+// P59（max_tokens 截断的收口：正文进历史 + warning + 退出码 5）记在 §5.4.1 与 `agent_finish_step` 里。
+// 版本串 `p59-max-tokens` —— 与 README §1.1 同一套记法。
+const AGENT_VERSION: [byte: 16] = [112, 53, 57, 45, 109, 97, 120, 45, 116, 111, 107, 101, 110, 115, 0, 0];   // "p59-max-tokens"
+const AGENT_VERSION_LEN: usize = 14;
 // 解析 `--color=` 的取值：auto / always / never / 16 / 256。
 // 认不出按 `auto`（同时认 `NO_COLOR`）。
 fn agent_parse_color(p: &byte) u8 {
@@ -12721,7 +12795,7 @@ fn agent_run_tui_body(cfg: &Config, tui_fd: i32) i32 {
         tui_tick(tui_now_ms());
         rc = agent_turn_loop(cfg, &h);
         agent_tui_turn_done();
-        if rc != AGENT_OK && rc != AGENT_INTERRUPTED {
+        if rc != AGENT_OK && rc != AGENT_INTERRUPTED && rc != AGENT_MAX_TOKENS {
             tui_add_notice("[turn] 本回合异常结束（可直接输入继续）" as &const byte, bufx_cstr_len("[turn] 本回合异常结束（可直接输入继续）" as &const byte));
         }
         rc = AGENT_OK;

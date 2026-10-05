@@ -4,7 +4,7 @@
 多轮 loop 直到给出结论。**不引入任何 C 代码、`@c_import` 或其它语言**，只依赖 Uya 语言与
 随编译器分发的标准库。
 
-**P0–P58 全部完成**，主线版本串 `p58-drive`。
+**P0–P59 全部完成**，主线版本串 `p59-max-tokens`。
 
 | 文档 | 看什么 |
 |---|---|
@@ -110,7 +110,7 @@ readelf -lW build/uya-agent | grep -c INTERP    # 0 = 真静态
 | `--show-usage` | 每轮打印 token 用量（in/out/cache/reasoning） |
 | `--tool-lines N` | 工具正文：默认 `0` = 只留一行；`N>0` = 首尾各 N 行（含 diff / todo 清单） |
 | `--quiet` | 关闭工具内容块（回退到旧的最小转录：只有正文流） |
-| `--max-tokens N` / `--temperature N` | 发送 `max_tokens` / `temperature`（**默认都不发送**，对齐 DSH） |
+| `--max-tokens N` / `--temperature N` | 发送 `max_tokens` / `temperature`（**默认都不发送**，对齐 DSH）。真被截断时（`finish_reason=length`）**不派发工具调用、正文留在对话里**，直接发「继续」接着做；退出码见 §1.1 的 `5` |
 | `--exec-effort V` / `--exec-after N` | **低思考执行态**：前 N 步用 `--reasoning-effort` 把方案想清，第 N+1 步起切到 V 执行（**默认关**；人运行中 `/effort` 改过就不自动切）。设计取舍与实测方差见 [DESIGN.md §5.5](DESIGN.md) |
 | `--grace-steps N` | **收工预算**：验收类命令在改动之后首次跑绿起，还允许再走 N 步；`0` = 只提醒不截断（**默认**） |
 | `--plan` | 以 plan 模式启动（先出计划、批准后再执行）；plan 模式**真的拦写**，非交互会话（管道/CI）里没有审阅渠道 ⇒ 只产出计划、写工具始终被拒 |
@@ -170,7 +170,10 @@ readelf -lW build/uya-agent | grep -c INTERP    # 0 = 真静态
 以及 key（三选一）：`UYA_AGENT_API_KEY` / `DEEPSEEK_API_KEY` / `OPENAI_API_KEY`。
 
 **退出码**：`0` 成功 · `1` 用法/配置错 · `2` 传输错（DNS/TCP/TLS/超时）· `3` 模型或协议错
-（**只在你显式给了 `--max-steps N` 时**才包含「步数熔断」）· `4` 工具/工作区错。
+（**只在你显式给了 `--max-steps N` 时**才包含「步数熔断」）· `4` 工具/工作区错 ·
+`5` **模型输出到达 token 上限被截断**（`finish_reason=length`）：这一轮没跑到最终答复，
+但**不是错误** —— 截断前的正文已经留在对话里，`--continue` 之后发一句「继续」即可接着做
+（工具调用一律丢弃：参数可能是半截的）。交互形态（REPL / TUI）里不按「异常」处理。
 
 ---
 

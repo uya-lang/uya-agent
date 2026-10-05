@@ -274,7 +274,7 @@ agent_step_stream / agent_step_plain
 | 2 | `LLM_FINISH_ERROR` → `AGENT_PROTO` |
 | 3 | **退化响应判定**（§5.4）：`finish` 不是 error / 不是 max-tokens，而 `content` 与工具调用**都是 0** → `agent_note_degenerate` → 决定 `STEP_RETRY` |
 | 4 | `agent_bound_assistant_message`（写 `assistant/message`；**退化那一步不写**） |
-| 5 | max-tokens 截断 → **丢弃所有 `tool_calls`**（半截参数没法用，留着只会让协议错） |
+| 5 | max-tokens 截断（§5.4.1）→ **丢弃所有 `tool_calls`**（半截参数没法用，留着只会让协议错），日志与历史里也不留；正文进历史、收口打 `warning` 而不是 `error`、退出码 `5` |
 | 6 | 有 `ncalls > 0` → 写历史 + 派发（见下） |
 | 7 | 无 `tool_calls` 且有正文 = 最终答复 → `AGENT_OK`；两者皆无 → `AGENT_PROTO` |
 
@@ -315,12 +315,18 @@ struct History { items: &Msg, len, cap, bytes }                                 
 | 全屏 TUI | `agent_run_tui` → `agent_run_tui_body` | §11；起来后 `tty_sink_on = true` |
 
 退出码（`AGENT_*`）：`0` 成功 · `1` 用法/配置 · `2` 传输（DNS/TCP/TLS/超时）· `3` 模型或协议 ·
-`4` 工具/工作区。内部码：`STEP_CONTINUE = 100`（还有下一步）、`STEP_RETRY = 101`（同一步重发）、
+`4` 工具/工作区 · `5` **输出到达 token 上限被截断**（§5.4.1：回合跑过步数但没跑到最终答复；
+**不是错误** —— 正文与历史都留着，`--continue` 之后发一句「继续」即可接着做）。
+内部码：`STEP_CONTINUE = 100`（还有下一步）、`STEP_RETRY = 101`（同一步重发）、
 `AGENT_INTERRUPTED = 130`。
 
 > **「步数熔断」为什么只在显式给了 `--max-steps N` 时才体现为退出码 3**：默认
 > `--max-steps 0` = **不限**（对齐 DSH：它没有步数上限）。只有调用方**主动**设了上限，
 > 「撞上限」才算一种失败；不然「跑到模型给出最终答案」是**正常**收尾。
+
+> **截断为什么单开一个 5 而不是并进 3**：3 的语义是「模型或协议错」，而截断时模型与协议都
+> 正常，只是这一轮的**输出预算**用完了。脚本据此分辨「接着做」（`5`）与「真出错了」（`3`）；
+> `dsh-headless` 对 `max-tokens` 收尾同样是非 0（`reason.kind === "completed" ? 0 : 1`）。
 
 ---
 
@@ -753,6 +759,47 @@ bash 结果占请求窗口 **57.9%**，read 只占 **12.9%**；其中会走到�
 `error: model returned neither content nor tool_calls` 保持在最前面（文案没变，只是后面挂了证据）。
 
 非流式（`--no-stream`）走**同一条收尾函数**，行为完全一致。
+
+#### 5.4.1 token 上限截断（`finish_reason=length` / `incomplete`+`max_output_tokens`）：正文进历史 + warning 收口
+
+**判据**：`finish == LLM_FINISH_MAX_TOKENS`（两条协议的映射见 §4.5.1 / §4.5.2）。
+
+**修前的症状**（用户报的就是这一行）：转录里一句
+`error: model output was truncated at the token limit (max_tokens); tool calls dropped`
+——① 它长得像「模型/协议出错」，其实谁都没出错，只是**这一轮的输出预算用完了**；
+② 截断前那段正文**没进历史**，用户按提示回一句「继续」，模型连自己刚写到哪都不知道，
+只能从零重来（真机现场：一整轮的工具调用白跑）；③ 日志里那条 `assistant/message`
+**带着 tool_calls** —— 而它们一个都没被派发（悬空），`--resume` 折日志时会把那半组当
+「未完成一轮」整组丢掉（`hist_trim_incomplete_tail`），连正文一起丢。
+
+**对齐 DSH 的三条**（逐条有出处）：
+
+| 件事 | DSH 怎么做 | 本仓 |
+|---|---|---|
+| 工具调用 | `BlockAssembler.assembled()` 在 `finish.kind === 'max-tokens'` 时把 **tool-call 块整块滤掉**（参数可能是半截的，派发会得到协议错） | 一个都不派发，**日志与历史里也都不留**（`keep_calls=false`） |
+| 正文 | 照样进 `assistant/message`（历史就是会话日志折出来的）——UI 的提示语是「回答被截断，**已有输出保留在对话中**。发送"继续"可让模型接着输出」 | 剪掉断口空白（`agent_trim_trailing_ws`）后压一条 `ROLE_ASSISTANT` 进历史 |
+| 收口 | `turn/end` 的 reason 是 `{kind:'max-tokens'}`：不是 `completed`（没走到最终答复），也不是 `error`（谁都没错）；`dsh-headless` 那条腿把正文照打 stdout、退出码按「没跑完」给非 0 | `turn/end` reason = `"max-tokens"`；转录是 `warning:` 一行 + `[max-tokens]` 一行（「丢了什么 + 发「继续」」）；进程退出码 **5** |
+
+**两行文案**（转录里逐字如此，`testdata` 里的 mock 也按这个字面量断言）：
+
+```
+warning: 模型输出到达 token 上限（max_tokens）被截断，本回合到此为止（不是错误）
+[max-tokens] 1 个工具调用已丢弃（参数可能是半截的，派发只会得到协议错）；已产出的正文留在对话里 —— 直接发「继续」即可让模型接着做
+```
+
+`warning:` 前缀同时也是 TUI 的样式选择器（§11 的 `tui_notice_style`：ERR / **WARN** / DIM）。
+
+**为什么不重发**（与 §5.4 的退化响应分得清清楚楚）：请求没变、上限没变，同一发再来一次只会
+再截断一次；能改的是**下一轮**（模型看到自己写到哪，或人把 `max_tokens` 调大）。
+所以这条路径**不碰** `EMPTY_RETRY_MAX` 的额度，也不留 `llm/degenerate` 事件。
+
+**退出码 5 而不是 3**：`3` 的语义是「模型或协议错」，而截断时模型与协议都正常 —— 共用
+`3` 会让脚本分不出「接着做」和「真出错了」。与非交互形态对齐：`dsh-headless` 对
+`max-tokens` 收尾也是非 0（`reason.kind === "completed" ? 0 : 1`）。
+交互形态（REPL / TUI）**不把截断当「本回合异常结束」**：那两行 warning 已经说清「怎么回事 +
+下一步怎么做」，再说一句「异常」只会让人以为出事了。同会话续跑驱动器（§9.5）也照这个口径：
+**截断不收授权** —— 目标显然还没做完，而且截断那一轮的正文已经在历史里，下一轮（新预算）
+正好接着写；轮次上限兜住空转。
 
 ### 5.5 执行期两条纪律（P55）
 
@@ -2921,6 +2968,23 @@ responses 用 `{"type":"input_image","detail":"auto","image_url":…}`；
    ② `tuis_reset` 会 `tui_reset_all`，**把命令表也清掉** —— 循环里不重新 `tui_set_commands` 的话
    条目数是 0，同样表现为「没跑成」。两条都是**判据自己没到位**，与踩坑 86「判据要读事实」同族。
 
+96. **日志说「有 `tool_calls`」、实际一条都没派发 —— 这条谎会在 `--resume` 时把正文一起吃掉**（P59，本轮发现）：
+   截断（`finish_reason=length`）那一支**丢弃所有工具调用**是对的（参数可能是半截的，派发只会得到
+   协议错），但旧实现是**先**写 `assistant/message`（`agent_log_assistant` 只要 `o.ncalls > 0` 就把
+   `tool_calls` 一并写进去）**再**判断截断 —— 于是日志里留下一条「有 `tool_calls`、零 `tool/result`」
+   的悬空记录，两个后果都很难查：
+   ① 事后复盘时，它与「工具真派发过、结果丢了」**长得一模一样**（这正是 §5.4 里那条「日志里只剩一条
+   `content=""` 的 assistant 消息」的同一族问题：日志不足以区分两种现实）；
+   ② 更要命的是 `--resume`：`agent_hist_from_log` 见到 `tool_calls` 就折成 `ROLE_ASSISTANT_CALLS`，
+   紧接着 `agent_session_open` 跑 `hist_trim_incomplete_tail`，而它对「零应答的 assistant」的做法是
+   **整条丢掉**（`hist-repair` 轮第 3 腿钉的就是这条判据）—— 截断前那段正文跟着一起没了，用户看到的
+   是「恢复会话后模型完全不记得上一轮写过什么」。
+   修法是把「记什么」与「派发什么」绑成**同一个事实**：`agent_log_assistant` 收一个 `keep_calls`，
+   截断那一步传 `false`，日志与历史两条腿都只留正文。DSH 的 `BlockAssembler.assembled()` 注释是同一句话：
+   "Emitted blocks and replay metadata both derive from this result, so they cannot disagree"。
+   教训属于「写下的事实必须与实际副作用一致」那一族（与踩坑 92 的「配置必须落到线上字节」同源）：
+   **日志是事后排障的唯一物证 —— 它只要比现实多一句，就会把人带到反方向去。**
+
 ---
 
 ## 17. 工具实现要点
@@ -3134,6 +3198,7 @@ DEEPSEEK_API_KEY=sk-xxx ./build/uya-agent \
 | `diag-echo-400` / `diag-echo-400-ns` | mock mode 24：400 回显 → fd 2 一行转义预览、无裸 CR/NUL/ESC |
 | `empty-retry` | P54（mock mode 41）：第一轮回「finish_reason=stop + 只有思考、没有正文」→ 转录里那一行证据（`finish=stop have_finish=1 bad_finish=(none) content=0B reasoning=45B calls=0 usage={in=60 cache_read=40 cache_write=0 out=7 reasoning=3} prompt=…B/100tok retries=0/1`）+ 日志一条 `llm/degenerate`（字段逐项核对）→ **同一步重发**：第二轮请求与第一轮**逐字节相同**、`step/start` 仍只有一条、唯一那条 `assistant/message` 的正文是 `SELFTEST-RETRY-OK`、回合退出 0 |
 | `empty-retry-giveup` | P54（mock mode 42）：重发也只给空响应 → 只重发**一次**（两条 `llm/degenerate`：`retrying=true/retries=0` → `retrying=false/retries=1`）、退化那一步**一条 `assistant/message` 都没有**、转录里留下带同一条证据的错误行、回合按协议错误退出 3 |
+| `max-tokens-cut` | P59（mock mode 44，**一个进程跑两个回合**）：① `finish_reason=length` + 正文 + 一个 `write trunc.txt` 调用 → 一个工具调用都不派发（`trunc.txt` 不存在、日志零 `tool/call`）、正文剪掉断口空白后进历史、`assistant/message` **不带 tool_calls**、转录是 `warning:` + `[max-tokens] …发「继续」…`（**没有** `error: model output was truncated`）、`turn/end` reason = `max-tokens`、那一回合返回 `5`；② 人打「继续」→ 第二个请求里**带着那段正文**、没有 `"role":"tool"`、没有 `"tool_calls"` → 回合以 0 收尾、`turn/end` reason = `completed` |
 | `tui-diag` | 4 KiB JSON 只留 ≤512 B、半截汉字变 U+FFFD、`tty_sink_on` 收尾关回 |
 | `read-window` | `(Showing lines 1-1000 of 4000. …)`、`offset=3500` 真读到、`limit=2000` |
 | `title-format` | OSC/CSI 清洗、40 B/80 B 上限切码点边界、`ESC[22t`/`ESC[23t` |
@@ -3409,3 +3474,37 @@ DEEPSEEK_API_KEY=sk-xxx ./build/uya-agent \
   `g_tui_quit_flag_pending` —— 它的调用点是 `!tui_has_submit() && !g_tui_quit_flag_pending()`，
   恒真那一项去掉即等价。
   验收：`make build`（干净重编两次，声明数 6826 = 基线）＋ `make selftest` 全绿。
+
+- P59：**`max_tokens` 截断的收口**（§5.4.1）。用户报的就是转录里那一行
+  `error: model output was truncated at the token limit (max_tokens); tool calls dropped`
+  —— 三个毛病叠在一起：① 它被当成「模型/协议错」（其实是这一轮的**输出预算**用完了，谁都没出错）；
+  ② 截断前那段正文**没进历史**，用户照着提示回一句「继续」，模型只能从零重来（真机现场：一整轮的
+  工作白跑）；③ 日志里那条 `assistant/message` 还带着 `tool_calls`（见踩坑 96：`--resume` 会把这半组
+  当「未完成一轮」整组丢掉，连正文一起丢）。
+  修法逐条对齐 DSH：**不派发**任何工具调用（它 `BlockAssembler` 在 max-tokens 时把 tool-call 块整块
+  滤掉；本仓连日志与历史里也不留）、**正文剪掉断口空白后进历史**（DSH 的 UI 提示语就是「已有输出
+  保留在对话中。发送"继续"可让模型接着输出」）、`turn/end` 的 reason 记成 `max-tokens`（不是
+  `completed` 也不是 `error`），转录从 `error:` 改成 `warning:` + `[max-tokens] …发「继续」…`，
+  进程退出码单开一个 **5**（`dsh-headless` 对 max-tokens 同样给非 0：`reason.kind === "completed" ? 0 : 1`）。
+  **不重发**：请求与上限都没变，同一发再来一次只会再截断一次（这与 §5.4 的退化响应是两回事，
+  所以不占 `EMPTY_RETRY_MAX` 的额度，也不留 `llm/degenerate`）。交互形态（REPL / TUI）不再把它
+  说成「本回合异常结束」；同会话续跑驱动器（§9.5）**不收授权** —— 目标没做完，而截断那一轮的正文
+  已经在历史里，下一轮（新预算）正好接着写。
+  **判定与验收**：新增 `max-tokens-cut` 轮（mock mode 44，`UYA_SELFTEST_EMPTY_ONLY=1` 单跑约 0.3 s），
+  它是全仓第一条**在一个进程里跑两个回合**的轮次（截断 → 人打「继续」），判据十项：`trunc.txt`
+  不存在（工具调用一个都没派发）、日志零 `tool/call` / `tool/result`、截断那一步的 `assistant/message`
+  **不带** `tool_calls` 且正文就是 mock 标记、`step/start` 恰好 2 条、转录含 `warning:` 与
+  `[max-tokens] …` 两行且**不含**旧的 `error: model output was truncated`、`turn/end` 的 reason
+  依次是 `max-tokens` → `completed`、`llm/degenerate` 为 0、那一回合返回 **5**、第二回合返回 0，
+  以及**第二个请求里带着截断前那段正文**（历史真的保住了）。
+  **三条防假绿对照实验**（都先看到红再改回来）：① 去掉「正文进历史」那一段 → 红（mock verdict **144**：
+  第二个请求里找不到 `SELFTEST-TRUNC-PARTIAL`）；② 截断那一步改回 `keep_calls=true`（日志留下
+  `tool_calls`）→ 红（「截断那一步的 assistant/message 里带着 tool_calls」）；③ 收口改回旧文案
+  （`error: model output was truncated…`）→ 红（转录里不得出现 `error:` 那一行 / 缺 `warning:` 那两行）。
+  ⚠ **本轮没有净增函数**（uya 0.10 的函数表余量是 0，见踩坑 87/91）：新轮次的证据验收**并进**
+  P54 那个既有函数（`empty_retry_check` → 改名 `stop_shape_check`，一个函数管两种「异常收尾形状」），
+  两回合的驱动与三条端到端判据内联进 `selftest_round` 的 `mode == 44` 分支；`agent.uya` 只加了一个
+  常量（`AGENT_MAX_TOKENS`）与一个函数入参（`keep_calls`）。实测声明数 **6836 → 6841**
+  （+5 = 那一个常量 + selftest 的 4 个标记字面量；常量不占函数额度），函数净增 **0**。
+  验收：`rm -rf build && make build`（干净重编，函数净增 0）＋ `make selftest` 全绿 ＋
+  `UYA_SELFTEST_EMPTY_ONLY=1 ./build/uya-agent --selftest`（三条收尾腿一起）。
