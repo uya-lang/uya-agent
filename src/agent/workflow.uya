@@ -1,4 +1,19 @@
-// src/workflow.uya — workflow（P12）
+// src/agent/workflow.uya — workflow（P12）
+//
+// 本文件：`workflow` 工具的全过程 —— 脚本与 `hooks.uya` 落盘、`127.0.0.1:0` 监听与端口传递、
+//   `fork` + `execve <uya-bin> run main.ush`、钩子循环（`wf_handle_hook`，op 表见文件末尾）、
+//   收尾与结果组装（`WorkflowRun`）、脚本侧 API 的生成。
+// 不变量：① **只有一层钩子协议** —— 脚本每来一行 `op payload`，父进程做完再回一行
+//   `{"ok":true,"text":…}`（不是双向流，也不是 Promise）；② 端口与参数走**环境变量**
+//   （`UYA_AGENT_WF_PORT` / `UYA_AGENT_WF_ARGS`）—— libc 没有 `setenv`，所以自己拼 envp；
+//   ③ `poll(lfd, 25ms)` 每圈都 `agent_pump_block()`，用户叫停能杀脚本进程；
+//   ④ 循环上限 `WF_MAX_STEPS * 40 = 10240` 圈，超限 SIGKILL；⑤ 结束必 `deleg_poll_all` 兜底
+//   （脚本可能留了没 wait 的子代理）；⑥ 没调 `wf_done` 时给
+//   `(the script finished without calling wf_done)`。
+// 依赖：libc（fcntl / signal / syscall / unistd）、std.runtime.saved_envp；本仓 foundation/bufx、
+//   foundation/jsonx、session/session（jw_str_into）、session/sigx、tools/shellx、
+//   agent/deleg（钩子里的 agent_start/agent_wait 真的开子代理）、term/tui/hook（泵点）。
+// 命名：`wf_*`、`WorkflowRun`、`WF_*`。
 //
 // 按用户的要求：workflow 的“脚本”是 **Uya 的 .ush 脚本**（用 `uya run` 执行），
 // 脚本里的钩子**代理回父进程**：`agent()` / `parallel()` / `phase()` / `log()` 这些
@@ -33,6 +48,8 @@ export struct WorkflowRun {
     agents: usize,
 }
 
+// 零值 WorkflowRun（四个 `buf_empty` + 两个计数 0）。固定字段的初始化式必须是常量，
+// 所以全局只能靠它填；也用于收尾后的复位。
 export fn wf_run_empty() WorkflowRun {
     return WorkflowRun{
         name: buf_empty(),
@@ -44,6 +61,7 @@ export fn wf_run_empty() WorkflowRun {
     };
 }
 
+// 释放四个 Buf（name / phases / result / log）。计数是值字段，不需要动。
 export fn wf_run_free(r: &WorkflowRun) void {
     buf_free(&r.name);
     buf_free(&r.phases);
@@ -602,6 +620,8 @@ fn wf_handle_hook(cfg: &const Config, line: &[byte], run: &WorkflowRun, out: &Bu
     wf_ok(out, "unknown op", 10);
 }
 
+// 回一行给脚本侧的钩子客户端：`{"ok":true,"text":<转义后的 text>}\n`。
+// text 走 `jw_str_into` 转义 —— 脚本拿到的是 JSON，裸文本里有引号就会破坏协议。
 fn wf_ok(out: &Buf, text: &const byte, n: usize) void {
     buf_reset(out);
     _ = buf_append_cstr(out, "{\"ok\":true,\"text\":");
@@ -609,10 +629,14 @@ fn wf_ok(out: &Buf, text: &const byte, n: usize) void {
     _ = buf_append_cstr(out, "}\n");
 }
 
+// 与 `wf_ok` 同一个形状。存在的意义是把「文本已经是 JSON」与「需要转义的文本」在
+// 调用点上区分开，避免以后有人往 wf_ok 里塞预转义串而双重转义。
 fn wf_ok_json(out: &Buf, text: &const byte, n: usize) void {
     wf_ok(out, text, n);
 }
 
+// 从 p[0..n] 这段 JSON 文本里取 `key` 的字符串值写进 out（调用方的，先 reset）。
+// 用一块 65536 的固定 arena 解析（钩子 payload 很小）；未命中 / 解析失败返回 false。
 fn wf_json_get_str(p: &const byte, n: usize, key: &const byte, key_len: usize, out: &Buf) bool {
     var raw: &void = malloc(65536);
     defer { free(raw); }
@@ -633,6 +657,8 @@ fn wf_json_get_str(p: &const byte, n: usize, key: &const byte, key_len: usize, o
     return buf_append(out, sv.ptr as &const byte, sv.len);
 }
 
+// 按子代理 id 在槽位表里找人，返回下标；没有返回 **-1**。
+// 只看 `used` 的槽位 —— 已回收的槽位即使 id 残留也不算命中。
 fn wf_find_deleg(id: i32) isize {
     var i: usize = 0;
     while i < DELEG_MAX {

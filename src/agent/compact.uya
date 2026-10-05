@@ -1,4 +1,20 @@
-// src/compact.uya — 上下文管理（P9，对齐 DSH compaction + tool-result-pruner）
+// src/agent/compact.uya — 上下文管理（P9，对齐 DSH compaction + tool-result-pruner）
+//
+// 本文件：件① tool 结果剪枝（通用 `cmp_maybe_prune` + bash 专用行式 `cmp_maybe_prune_bash`
+//   与兜底 `cmp_span_cut`）；件② 自动压缩（`cmp_*` 的 checkpoint 组装、保留量估算
+//   `cmp_retain_bytes`）；另有观测用的小工具（`cmp_cache_burst`、`cmp_pressure_limit`、
+//   `cmp_line_ptr`）。旋钮是一组 `var cmp_*`，preset 可覆盖。
+// 不变量：① 剪枝**只在构请求层生效、不动历史** —— 于是天然幂等、日志里留的是原文、
+//   `--resume` 后重新构请求仍得同一结果；② 剪枝**按码点**计数（对齐 DSH `Array.from(text).length`），
+//   不是字节；③ 剪枝契约统一：需要剪就写 out 返回 true，**不剪就不动 out** 返回 false；
+//   ④ 结果**不许超过触发阈值**（否则下一轮会被再剪一次）也**不许比原文长**；
+//   ⑤ 预算太小或保留量不足预算 1/4 时**退回通用规则**（任何输入都不比旧行为更差）；
+//   ⑥ 压缩压力口径 = `usage_in + usage_cache_read`（= prompt_tokens，与 DSH tokenMeter 一致），
+//   拿不到 usage 时退化成「字节 / 4」估算；触发线 `floor(window × 0.8)`；
+//   ⑦ 压缩的**硬规则**：摘要不比被遮蔽内容短就**拒绝**（否则「压缩」会反而撑大上下文）。
+// 依赖：无 `use` 行；依赖 foundation/bufx（Buf / `bufx_utf8_count` / `bufx_utf8_prefix_bytes` /
+//   `bufx_utf8_suffix_offset`）与 foundation/jsonx。
+// 命名：`cmp_*`、`CMP_*`、`CHECKPOINT_*`。
 //
 // 两件事：
 //   1) **tool 结果剪枝**：文本超过 thresholdChars（8192）**码点**时，替换成
@@ -147,6 +163,7 @@ fn cmp_line_is_signal(p: &const byte, n: usize) bool {
     return false;
 }
 
+// 指针算术：text + off。配套 `bufx_utf8_suffix_offset` 用（它给的是字节偏移）。
 fn cmp_line_ptr(text: &const byte, off: usize) &const byte {
     return @ptr_from_usize(@usize_from_ptr(text as &const void) + off) as &const byte;
 }
@@ -189,6 +206,10 @@ fn cmp_put_line(out: &Buf, text: &const byte, ls: usize, le: usize, lineno: usiz
 //  1024/768 这一档，657 个真实输出里有 600 个被放大，合计多出 60 万码点。）
 const CMP_BASH_SPAN_MARK: &const byte = "\n\n[... bash output truncated to head + tail ...]\n\n";
 
+// bash 剪枝的**兜底路径**：按**码点**头 head_cps + 标记 + 尾 tail_cps 切。
+// 它与行式规则**同一预算**，所以结果永远不会比原文长。为什么不能退回 `cmp_maybe_prune`：
+// 那个按全局 headChars/tailChars 取值，一旦把 bash 触发阈值调到比它们的和小，
+// 剪枝就会把消息**放大**（实测 1024/768 档：657 个真输出里 600 个被放大，多出 60 万码点）。
 fn cmp_span_cut(text: &const byte, n: usize, head_cps: usize, tail_cps: usize, out: &Buf) bool {
     buf_reset(out);
     const hb: usize = bufx_utf8_prefix_bytes(text, n, head_cps);
@@ -202,6 +223,10 @@ fn cmp_span_cut(text: &const byte, n: usize, head_cps: usize, tail_cps: usize, o
     return buf_append(out, cmp_line_ptr(text, ts), n - ts);
 }
 
+// bash 结果的**行式**剪枝（P27）：同一预算内改三段分配（头 1/5、尾 1/5、中段收信号行 +
+// 等距抽样），细节与实测数字见文件头。
+// 契约与 `cmp_maybe_prune` 一致：需要剪就把结果写进 out 并返回 true，否则 **out 不动**返回 false。
+// 预算被夹到「触发阈值 − 标记预留」以内，保证幂等（结果不会再次超阈值）且不反向放大。
 export fn cmp_maybe_prune_bash(text: &const byte, n: usize, out: &Buf) bool {
     var trigger: usize = cmp_prune_threshold;
     if cmp_bash_threshold > 0 {
@@ -467,6 +492,9 @@ export fn cmp_cache_burst_json(miss: i64, prompt: i64, hit: i64, out: &Buf) bool
     return buf_append_byte(out, 125);        // '}'
 }
 
+// 缓存「突发未命中」判定：这次请求的未命中量 miss 相对总 prompt 是否超过
+// CACHE_BURST_RATIO_PERMILLE 千分比（且两个绝对值都过了最小门槛）。
+// 用来解释「上一轮明明命中率很高，这一轮怎么突然贵了」—— 典型原因是历史被改了前缀。
 export fn cmp_cache_burst(miss: i64, prompt: i64) bool {
     if miss < CACHE_BURST_MIN_MISS || prompt < CACHE_BURST_MIN_PROMPT {
         return false;
@@ -481,6 +509,8 @@ export fn cmp_cache_burst(miss: i64, prompt: i64) bool {
 const CMP_THRESHOLD_PERMILLE: i64 = 800;
 const CMP_RETAIN_PERMILLE: i64 = 160;
 
+// 压缩触发线 = `floor(window × 0.8)`（DSH 的 thresholdRatio 0.8，这里用千分数避免浮点）。
+// `window <= 0`（未知）返回 0 = 不触发。
 export fn cmp_pressure_limit(context_window: i64) i64 {
     if context_window <= 0 {
         return 0;

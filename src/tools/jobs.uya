@@ -1,4 +1,24 @@
-// src/jobs.uya — 后台任务注册表（P7）
+// src/tools/jobs.uya — 后台任务注册表（P7）
+//
+// 本文件：后台任务注册表 `JobTable`/`Job`（`JOB_MAX`=8 个槽位）与 `jobs_init`/`jobs_free`、
+//   增量读输出 `job_drain`、收尸 `job_check`、批量轮询 `jobs_poll_all`、注册 `job_register`
+//   （fork 已在调用方完成），以及三个工具入口 `jobs_tool_list`/`jobs_tool_output`/
+//   `jobs_tool_kill`。
+// 不变量：① 输出只保留**内存尾部**（`JOB_BUF_MAX`=1 MiB）：超出丢弃旧字节并在结果里标
+//   `[output truncated]`（DSH 会落盘 spill，本项目记为偏离）；② 状态三态 `JOB_RUNNING`/
+//   `JOB_DONE`/`JOB_KILLED` —— 被信号杀 → `JOB_KILLED` 且 `exit_code = 128 + sig`，
+//   否则一律 `JOB_DONE`（成功/失败靠 exit_code 区分；文件头提到的 `failed` 词其实**未实现**）；
+//   ③ 输出是**增量语义**：`read_off` 记「已经交给模型的位置」，`job_output` 默认只回新字节；
+//   ④ 每个任务一个管道（stdout+stderr 合并），收尾必须**非阻塞**地把它读空；
+//   ⑤ 杀任务按**整棵子树**收（`sh_kill_tree`：先 SIGCONT 再 SIGKILL），`jobs_free` 对还没回收的
+//   任务也要连子树一起收，否则子孙活过本进程；⑥ 表满（8 个）时 `job_register` 返回 -1；
+//   ⑦ `job_id` 接受 `"job-3"` 或 `"3"`；`wait=true` 默认 30000 ms、`timeout_ms` 上限 600000，
+//   用户按中断就立刻收工（后台任务本身不动，要 `job_kill` 才杀）。
+// 依赖：libc.syscall/unistd/fcntl/signal（poll/read/waitpid/kill）、foundation/bufx、
+//   foundation/jsonx；本仓 tools/shellx（`sh_kill_tree`）、agent（泵点 `agent_pump_light`/
+//   `agent_pump_block`）。
+// 命名：对外 `jobs_*` / `job_*`（工具入口与表操作）+ 类型 `Job`/`JobTable` + 常量 `JOB_*`；
+//   私有同样 `job_*` 前缀（非 export）。
 //
 // DSH 的后台任务统一由 job_list / job_output / job_kill 控制，`bash` 的
 // run_in_background=true 会注册一个任务并立刻返回 `started background job <id>`。
@@ -43,6 +63,7 @@ export struct JobTable {
     next_id: i32,
 }
 
+// 一条空槽位（used = false、pid/rfd = -1、空 Buf）；表初始化与槽位回收都用它
 fn job_empty() Job {
     return Job{
         used: false,
@@ -61,6 +82,7 @@ fn job_empty() Job {
     };
 }
 
+// 把表清成 JOB_MAX 条空槽位，id 从 1 开始发（job-1、job-2…）
 export fn jobs_init(t: &JobTable) void {
     var i: usize = 0;
     while i < JOB_MAX {
@@ -70,6 +92,8 @@ export fn jobs_init(t: &JobTable) void {
     t.next_id = 1;
 }
 
+// 进程退出前的清场：释放 label/buf、关读端；**还没回收的任务连整棵子树一起收掉**
+// （`sh_kill_tree` + 阻塞 waitpid），否则任务自己 fork 出来的子孙会活过本进程。
 export fn jobs_free(t: &JobTable) void {
     var i: usize = 0;
     while i < JOB_MAX {
@@ -91,6 +115,7 @@ export fn jobs_free(t: &JobTable) void {
     }
 }
 
+// 找一个空槽位下标；表满返回 -1（JOB_MAX=8，调用方按「注册失败」处理）
 fn job_slot(t: &JobTable) isize {
     var i: usize = 0;
     while i < JOB_MAX {
@@ -102,6 +127,7 @@ fn job_slot(t: &JobTable) isize {
     return -1;
 }
 
+// 按 job id（数字部分）找槽位下标；未命中返回 -1（job_output/job_kill 共用）
 fn job_find(t: &const JobTable, id: i32) isize {
     var i: usize = 0;
     while i < JOB_MAX {
@@ -114,6 +140,8 @@ fn job_find(t: &const JobTable, id: i32) isize {
 }
 
 // 把管道里现有的字节读干净（非阻塞）
+// 把管道里**现有**的字节读干净（非阻塞，最多 64 轮防死循环），追加进 j.buf 的尾部；
+// 超过 JOB_BUF_MAX 就丢最老的部分并置 truncated（模型侧会看到 `[output truncated]`）。
 export fn job_drain(t: &JobTable, idx: usize) void {
     if idx >= JOB_MAX {
         return;
@@ -192,6 +220,7 @@ export fn job_check(t: &JobTable, idx: usize) void {
     }
 }
 
+// 把所有在用的任务各扫一遍（drain 读增量 + check 收尸）；工具入口与泵点都会调
 export fn jobs_poll_all(t: &JobTable) void {
     var i: usize = 0;
     while i < JOB_MAX {
@@ -234,6 +263,8 @@ export fn job_register(t: &JobTable, pid: i32, rfd: i32, label: &const byte, lab
     return j.id;
 }
 
+// 状态词（对齐 DSH 的三态）。注意：本文件只用 running / completed / killed，
+// 文件头提到的 failed 词在代码里**未实现**（失败与成功同为 JOB_DONE，靠 exit_code 区分）。
 fn job_status_name(st: u8) &const byte {
     if st == JOB_DONE {
         return "completed" as &const byte;
@@ -247,6 +278,7 @@ fn job_status_name(st: u8) &const byte {
 // ============================================================
 // 工具：job_list / job_output / job_kill
 // ============================================================
+// job_list 工具：每行 `job-N [bash] <status> — <label>`；一个都没有时回 `(no background jobs)`
 export fn jobs_tool_list(t: &JobTable, out: &Buf) void {
     jobs_poll_all(t);
     var shown: usize = 0;
@@ -304,6 +336,9 @@ fn job_wait(t: &JobTable, idx: usize, timeout_ms: i32) void {
     }
 }
 
+// job_output 工具：默认只回**增量**（上次交出去之后的字节）；`wait=true` 则先阻塞等
+// 任务结束或超时（默认 30000 ms，`timeout_ms` 上限 600000）；无新输出回 `(no new output)`，
+// 尾部补状态行 `[status: …, exit N]`（被信号杀时 exit = 128 + 信号号）。
 export fn jobs_tool_output(t: &JobTable, args: &const JsonValue, out: &Buf) void {
     var idbuf: Buf = buf_empty();
     defer { buf_free(&idbuf); }
@@ -369,6 +404,9 @@ export fn jobs_tool_output(t: &JobTable, args: &const JsonValue, out: &Buf) void
     _ = buf_append_cstr(out, "]");
 }
 
+// job_kill 工具：`job_id` 接受 `"job-3"` 或 `"3"`。先用 jobs_poll_all 确认真实状态：
+// 已经结束的回 `job-N had already finished [status: …]`，还在跑的按**整棵子树**收
+// （`sh_kill_tree`：先 SIGCONT 再 SIGKILL），然后回 `requested cancellation of job N`。
 export fn jobs_tool_kill(t: &JobTable, args: &const JsonValue, out: &Buf) void {
     var idbuf: Buf = buf_empty();
     defer { buf_free(&idbuf); }
@@ -408,6 +446,7 @@ export fn jobs_tool_kill(t: &JobTable, args: &const JsonValue, out: &Buf) void {
 }
 
 // "job-3" / "3" → 3
+// job_output 与 job_kill 共用；非数字前缀时按 0 起解析
 fn job_parse_id(p: &const byte, n: usize) i32 {
     var i: usize = 0;
     if n > 4 && bufx_eq_cstr(p, 4, "job-") {

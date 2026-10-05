@@ -1,4 +1,26 @@
-// src/session.uya — 会话日志：写入 / 读取 / 崩溃尾部裁剪 / 索引（P4）
+// src/session/session.uya — 会话日志：写入 / 读取 / 崩溃尾部裁剪 / 索引（P4）
+//
+// 本文件：写侧 `SessionLog`（id / path / cwd / model / fd / seq / events）与
+//   `sess_open*`/`sess_begin_at`/`sess_end`/`sess_write_index`/`sess_close`；读侧
+//   `SessReader`（整文件读入后逐行取事件）、`SessMeta`（header + 最后一条
+//   session/workspace 与 session/model）、`sess_read_header`/`sess_reader_load`/`sess_next`/
+//   `sess_line_seq`/`sess_line_type`/`sess_find`/`sess_find_last`；索引侧
+//   `SessIdxRow` 与 `sess_index_rows_sorted`（同 id 取最后一条 + lastActiveAt 倒序）；
+//   以及本文件自带的 JSON 转义 / 反转义 / 数组原文抽取（`jw_str_into`、`sess_extract_array`）。
+// 不变量：① `seq` 从 0 连续递增，日志**追加-only**，`time` 字段由调用方给
+//   （`sess_begin_at`），必须与 stats 折叠用的时间**逐位相同**，否则 resume 前后数字不一致；
+//   ② 写日志过程中**绝不许**补 NUL（`buf_append_cstr_z` 会把 `\0` 写进缓冲，
+//   之后追加的内容落在 NUL 之后、系统调用只看得到前半截）；③ 最后一行没有换行结尾 =
+//   崩溃时写了一半 ⇒ `sess_next` 置 `dropped_tail` 并停止，前面的行仍然全部算数；
+//   ④ 索引是追加写，同一个 id **以最后一条为准**（读侧必须先按它去重）；
+//   ⑤ 恢复会话只往**原文件**续写（`sess_open_resume`），不许按当前 cwd 重算路径；
+//   ⑥ uya 的 `p[a: b]` 是「从 a 起 b 个**字节**」不是「到 b 为止」，切片必须写 `[pos: len]`。
+// 依赖：libc.syscall/unistd/stdlib/heap（open/read/write/mkdir/opendir）、
+//   std.json（encoder.JsonWriter、value.JsonStrView）、foundation/jsonx（`sv_unescape`
+//   的唯一一份完整反转义）、foundation/bufx（Buf 与子串/字节查找）。
+// 命名：`sess_*`（会话与索引的全部对外函数）、`session.uya` 私有的 `sess_idx_*` 排序辅助、
+//   类型 `SessionLog` / `SessReader` / `SessMeta` / `SessIdxRow`、常量 `SESS_VERSION`；
+//   `jw_str_into` 是给索引写入用的转义出口，规则必须与 jsonx 的 `jw_str` 保持一致。
 //
 // 布局（沿用 DSH 的形状，只是不压缩）：
 //   <agent-home>/sessions/--<normalized-cwd>--/<session-id>/session.jsonl
@@ -175,6 +197,7 @@ export struct SessionLog {
     deleg_depth: i32,    // >0 = 这是子代理的会话（--continue 不选它）
 }
 
+// 空闲的 SessionLog：fd = -1、save = false，**不建目录不落盘**（先放进 defer 里安全）
 export fn sess_log_empty() SessionLog {
     return SessionLog{
         id: buf_empty(),
@@ -190,6 +213,7 @@ export fn sess_log_empty() SessionLog {
     };
 }
 
+// 释放 id / path / cwd / model / title 五个 Buf；fd 归 sess_close 关
 export fn sess_log_free(l: &SessionLog) void {
     buf_free(&l.id);
     buf_free(&l.path);
@@ -198,6 +222,8 @@ export fn sess_log_free(l: &SessionLog) void {
     buf_free(&l.title);
 }
 
+// 把一行事件落盘（line 里已是完整的 `…}\n`）。`--no-save` 或 fd < 0 时**直接成功返回**
+// 什么也不写 —— seq 的推进交给 sess_end，两者不许互相代劳。
 fn sess_write_line(l: &SessionLog, line: &const Buf) bool {
     if !l.save || l.fd < 0 {
         return true;
@@ -227,6 +253,7 @@ fn sess_mkdir_for(home: &const byte, cwd: &const byte, id: &const byte, id_len: 
 }
 
 // 新建 / 续写（日志路径按 cwd 算）—— 绝大多数调用方走的入口
+// want_id 为空 = 新生成一个 id；save=false 时只维护内存态（seq 照常推进，不进日志）。
 export fn sess_open(
     l: &SessionLog,
     home: &const byte,
@@ -246,7 +273,7 @@ export fn sess_open(
 // 为什么不复用 sess_open：它按 cwd 重算路径，而恢复时「cwd」是会话记录的工作区、
 // 日志却在**找到它的那个目录**里（sess_find 会扫全部 --*-- 目录）。用当前工作区重算
 // 就会在同 id 下造出一个没有 header 的空文件，把会话劈成两半、顺手改掉索引里的
-// 工作区（旧实现实测如此，见 README 踩坑 48）。
+// 工作区（旧实现实测如此，见 §16 踩坑 48）。
 export fn sess_open_resume(
     l: &SessionLog,
     home: &const byte,
@@ -489,6 +516,7 @@ export fn sess_begin_at(l: &const SessionLog, typ: &const byte, time_ms: u64, ou
     return buf_append_cstr(out, ",\"data\":");
 }
 
+// 开始一个事件，时间取**当下**（ua_now_ms()）。统计边界事件一律别用它，见 sess_begin_at。
 export fn sess_begin(l: &const SessionLog, typ: &const byte, out: &Buf) bool {
     return sess_begin_at(l, typ, ua_now_ms(), out);
 }
@@ -556,6 +584,7 @@ export fn sess_write_index(home: &const byte, l: &const SessionLog) bool {
     return ok;
 }
 
+// 关掉 fd 并写一条索引；`--no-save` 时只关 fd、不写索引（save 为 false 的会话不进列表）
 export fn sess_close(l: &SessionLog, home: &const byte) void {
     if l.fd >= 0 {
         _ = sys_close(l.fd) catch {};
@@ -582,6 +611,7 @@ export struct SessReader {
     model: Buf,
 }
 
+// 零值 SessReader：data / id / cwd / model 都是空 Buf，可安全 defer sess_reader_free
 export fn sess_reader_empty() SessReader {
     return SessReader{
         data: buf_empty(),
@@ -597,6 +627,7 @@ export fn sess_reader_empty() SessReader {
     };
 }
 
+// 释放 data / id / cwd / model 四个 Buf（不关任何 fd）
 export fn sess_reader_free(r: &SessReader) void {
     buf_free(&r.data);
     buf_free(&r.id);
@@ -682,6 +713,7 @@ fn sess_json_str(line: &[byte], key: &const byte, out: &Buf) bool {
 }
 
 // 读**第一行**作为 header（列目录/校验用，不读全文件）
+// 4096 字节的读缓冲足够放下 header；只认带 `"type":"session"` 的首行。
 export fn sess_read_header(path: &const byte, r: &SessReader) bool {
     const fd: i32 = sys_open(path as *const byte, O_RDONLY as i32, 0) catch {
         return false;
@@ -729,6 +761,7 @@ export struct SessMeta {
     header_ok: bool,
 }
 
+// 零值 SessMeta：三份 Buf 全空 = 「没有记录」，header_ok = false
 export fn sess_meta_empty() SessMeta {
     return SessMeta{
         id: buf_empty(),
@@ -741,6 +774,7 @@ export fn sess_meta_empty() SessMeta {
     };
 }
 
+// 释放 SessMeta 的全部 Buf（六个）
 export fn sess_meta_free(m: &SessMeta) void {
     buf_free(&m.id);
     buf_free(&m.cwd);
@@ -750,6 +784,10 @@ export fn sess_meta_free(m: &SessMeta) void {
     buf_free(&m.effort);
 }
 
+// 一次读盘拿齐 header(id/cwd) + 最后一条 session/workspace + 最后一条 session/model。
+// 返回 false = header 读不到（文件不存在/不是会话）；返回 true 时 workspace 等字段可能为空
+// （那就是「没有记录」，调用方按空处理）。必须在 hist 重建**之前**调，工作区定了才能求值
+// system prompt、AGENTS.md 与技能目录。切片长度一律写 `nl - pos`（踩坑 51/54，见文件内注释）。
 export fn sess_read_meta(path: &const byte, m: &SessMeta) bool {
     var r: SessReader = sess_reader_empty();
     defer { sess_reader_free(&r); }
@@ -793,12 +831,12 @@ export fn sess_read_meta(path: &const byte, m: &SessMeta) bool {
             }
             i = i + 1;
         }
-        // ⚠ 切片第二个数是**长度**，不是终点（README 踩坑 51/54）：写成 `data.ptr[pos: nl]`
+        // ⚠ 切片第二个数是**长度**，不是终点（§16 踩坑 51/54）：写成 `data.ptr[pos: nl]`
         // 拿到的是「从 pos 起 nl 个字节」≈ 真实行长 + pos，于是每行的 view.len 约等于真实行长的
         // 两倍。这个 view 只喂给 sess_has_cstr 做子串扫描，扫不过就继续往后读 ——
         // 小日志时只是**静默越过本行**做匹配（读到漂移的工作区，不报错），
         // 大日志（data 缓冲经 realloc 走 mmap，cap 1–2 MiB）读到映射尾就 SIGSEGV：
-        // 实测 913690 字节的真机会话一 /resume 必崩（见 README 踩坑 54 的 gdb/valgrind 证据）。
+        // 实测 913690 字节的真机会话一 /resume 必崩（见 §16 踩坑 54 的 gdb/valgrind 证据）。
         const view: &[byte] = data.ptr[pos: nl - pos];
         // 同 id 取最后一条：后面的覆盖前面的
         if sess_has_cstr(view, "\"type\":\"session/workspace\"") {
@@ -974,6 +1012,7 @@ export fn sess_find(home: &const byte, cwd: &const byte, id: &const byte, id_len
     return false;
 }
 
+// 文件能不能打开（只 open + close 探一下，不读内容）；目录也会返回 true
 export fn sess_file_exists(path: &const byte) bool {
     const fd: i32 = sys_open(path as *const byte, O_RDONLY as i32, 0) catch {
         return false;
@@ -1072,11 +1111,13 @@ struct SessIdxRow {
     id_len: usize,
 }
 
+// 第 i 个 SessIdxRow 的只读指针（表是一整块 malloc 出来的连续内存，手算偏移）
 fn sess_idx_at(base: &const SessIdxRow, i: usize) &const SessIdxRow {
     const esz: usize = @size_of(SessIdxRow) as usize;
     return @ptr_from_usize(@usize_from_ptr(base as &const void) + i * esz) as &const SessIdxRow;
 }
 
+// 同上但给可写指针（归并排序写目标区用；表是手算偏移的裸内存，没有借用检查兜底）
 fn sess_idx_at_mut(base: &SessIdxRow, i: usize) &SessIdxRow {
     const esz: usize = @size_of(SessIdxRow) as usize;
     return @ptr_from_usize(@usize_from_ptr(base as &void) + i * esz) as &SessIdxRow;
@@ -1176,7 +1217,7 @@ fn sess_idx_before(mode: u8, idx: &const Buf, a: &const SessIdxRow, b: &const Se
 // 自底向上归并排序：O(n log n)。
 //
 // 老实现是插入排序（O(n²)）：真机索引 1.4 K 行时 `--list-sessions` 已经要 70 ms，
-// 纯数据侧在 12.8 K 行 / 时间戳升序时要 ~1.4 s（实测，见 README 踩坑 68）。会话索引
+// 纯数据侧在 12.8 K 行 / 时间戳升序时要 ~1.4 s（实测，见 §16 踩坑 68）。会话索引
 // 是**追加写**的，时间戳天然升序 ⇒ 插入排序每次都把新记录一路挪到最前，正好是最坏情况。
 //
 // 与插入排序**逐字节等价**：比较键是严格全序（见 sess_idx_before），排序结果唯一。
@@ -1282,7 +1323,7 @@ export fn sess_index_rows_sorted(home: &const byte, out: &Buf) bool {
     // 是「从 a 起 **b 个字节**」（偏移 + 长度），不是「到 b 为止」—— 传 `[lo: lo+ll]`
     // 会拿到 `lo+ll` 字节的窗口，越读到后面几行去（实测：D 那条没有 lastActiveAt 的
     // 记录被解析成了下一行的 9000，倒序于是全错，还顺带 OOB 读）。全仓的 `[0: n]`
-    // 恰好两种语义一样，所以这个坑一直没露头（见 README 踩坑 51）。
+    // 恰好两种语义一样，所以这个坑一直没露头（见 §16 踩坑 51）。
     var line: Buf = buf_new(4096);
     defer { buf_free(&line); }
     var m: usize = 0;

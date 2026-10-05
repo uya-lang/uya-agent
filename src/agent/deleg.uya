@@ -1,4 +1,24 @@
-// src/deleg.uya — 子代理 / 派生（P11）
+// src/agent/deleg.uya — 子代理 / 派生（P11）
+//
+// 本文件：槽位表生命周期（`deleg_empty`/`deleg_init`/`deleg_free`/`deleg_slot`/`deleg_find`/
+//   `deleg_reclaim`）、派生（`deleg_spawn`/`deleg_clone_cfg`/`deleg_child_main`）、
+//   增量读输出（`deleg_take_output`/`deleg_drain`）、终态结算（`deleg_check`/`deleg_settled`/
+//   `deleg_poll_all`/`deleg_status_*`）、`/watch` 路径（`deleg_watch_path`/`deleg_round_current`）、
+//   七个工具入口（`deleg_tool_*`）。
+// 不变量：① **fork 而不 exec** —— 子进程是同二进制的一份拷贝，直接跑 `agent_run`；
+//   ② **管道只承载终态答复**：子进程 fd 1/2 重定向到 `/dev/null`，读端在父进程 `O_NONBLOCK`，
+//   缓冲上限 `DELEG_BUF_MAX`（超出丢**前缀**并同步 `read_off`）—— 过程消息走会话日志（§9.1）；
+//   ③ **会话 id 由父进程在 fork 之前预生成**（`sess_new_id`），父子共享这份内存 —— 原实现
+//   `d.sid` 恒空导致 `send_message` 每次新开会话、上下文全丢；
+//   ④ `deleg_reclaim` 必须**复位 `used`**（原实现只置 true 从不复位 ⇒ 4 槽用满后永久失败）；
+//   ⑤ 子进程一律 `sigx_reset_for_child` + `sh_child_detach_stdio` + `tui_child_detach`；
+//   ⑥ `deleg_wait_slice` 用**裸 nanosleep**，不许写成 poll 一个无效 fd（poll 对 fd<0 立刻返回，
+//   50 ms 等待会变成 50 ms 自旋）；⑦ ralph 每轮是**全新 agent**（`fork_from`/`resume_id` 清空），
+//   只有共享工作区是长期记忆。
+// 依赖：libc（fcntl / signal / syscall / unistd）；本仓 foundation/bufx、foundation/jsonx、
+//   session/session（会话 id 与日志）、session/sigx、tools/shellx（stdio 分离与杀进程组）、
+//   agent/agent（跑 `agent_run`、泵点、`Config`）。
+// 命名：`deleg_*`、`Deleg`/`DelegTable`、`DELEG_*`。
 //
 // 设计：`subagent*` 用 **fork 而不 exec** —— 子进程是同二进制的一份拷贝，直接跑
 // `agent_run`，把最终答复写进管道；父进程按需读增量输出（与后台任务同一套语义）。
@@ -53,6 +73,8 @@ export struct DelegTable {
     next_id: i32,
 }
 
+// 零值 Deleg：**未占用**（used=false）、fd/pid 都 -1、六个 Buf 是 `buf_empty`（不是 buf_new）。
+// 固定数组的初始化式必须是常量，所以全局那一片靠它填；也用于释放后的复位。
 fn deleg_empty() Deleg {
     return Deleg{
         used: false,
@@ -77,6 +99,7 @@ fn deleg_empty() Deleg {
     };
 }
 
+// 复位整张表：逐槽零值、`next_id` 回到 1。幂等（fsctx_init 一族每轮都调）。
 export fn deleg_init(t: &DelegTable) void {
     var i: usize = 0;
     while i < DELEG_MAX {
@@ -86,6 +109,8 @@ export fn deleg_init(t: &DelegTable) void {
     t.next_id = 1;
 }
 
+// 释放**所有**槽位（不只是终态的）：六个 Buf、关管道 fd，并且对没回收过的活进程
+// **SIGKILL + waitpid** —— 否则退出时留下孤儿子代理（它们各自还在跑 agent 循环）。
 export fn deleg_free(t: &DelegTable) void {
     var i: usize = 0;
     while i < DELEG_MAX {
@@ -111,6 +136,7 @@ export fn deleg_free(t: &DelegTable) void {
     }
 }
 
+// 找第一个空槽，返回下标；**满了返回 -1**（调用方要先 `deleg_reclaim`，或报「4 个都占着」）。
 fn deleg_slot(t: &DelegTable) isize {
     var i: usize = 0;
     while i < DELEG_MAX {
@@ -122,6 +148,7 @@ fn deleg_slot(t: &DelegTable) isize {
     return -1;
 }
 
+// 按 id 找人（只看 `used` 的槽），没有返回 **-1**（不是 0 —— 0 是合法下标）。
 fn deleg_find(t: &const DelegTable, id: i32) isize {
     var i: usize = 0;
     while i < DELEG_MAX {
@@ -198,6 +225,9 @@ fn deleg_reclaim(t: &DelegTable) bool {
     return true;
 }
 
+// 状态 → 对用户/模型显示的词，**对齐 DSH**：running / **idle** / failed / interrupted。
+// 注意 `DONE` 映射成 `idle`：DSH 口径是「跑完就是 idle，可以再 send_message」，
+// 所以这里不能写 done —— 那会让模型以为槽位已经废了。
 export fn deleg_status_name(st: u8) &const byte {
     if st == DELEG_DONE {
         return "idle" as &const byte;     // DSH：跑完就是 idle，可以再 send_message
@@ -219,6 +249,8 @@ export fn deleg_status_at(t: &const DelegTable, i: usize) u8 {
     return t.items[i].status;
 }
 
+// 固定数组的安全读取（下标的证明放在函数里，避免编译器对复合条件不认）。
+// 越界返回 **-1**（与「没有 fd」同一个值，调用方本来就按 fd<0 判不可读）。
 export fn deleg_fd_at(t: &const DelegTable, i: usize) i32 {
     if i >= DELEG_MAX {
         return -1;
@@ -302,6 +334,11 @@ fn deleg_round_current(d: &const Deleg) i32 {
     return r;
 }
 
+// 算出某个槽位**当前正在写**的会话日志路径，写进 out。`/watch` 靠它定位要跟随的文件。
+// subagent / fork → 直接用 `d.sid`；**ralph → `<watch_base>-rN`**，N 由管道里已收到的
+// `[round N]` 行推出（`deleg_round_current`：RUNNING 时是已见最大 +1、终态时是已见最大，
+// **弄反会读到上一轮的日志**）。
+// 返回 false 表示「现在没有可跟随的日志」（槽位没用 / 越界 / 路径推不出来）。
 export fn deleg_watch_path(cfg: &const Config, t: &const DelegTable, idx: usize, out: &Buf) bool {
     buf_reset(out);
     if idx >= DELEG_MAX {
@@ -693,6 +730,9 @@ export fn deleg_drain(t: &DelegTable, idx: usize) void {
     }
 }
 
+// 结算一个槽位的终态：`waitpid(WNOHANG)`；`sig != 0` → KILLED（code = 128+sig）、
+// `code == 0` → DONE、否则 FAILED。
+// **只通知一次**（`deleg_settled`）并刷新面板 —— 重复通知会让用户看到两条「跑完了」。
 export fn deleg_check(t: &DelegTable, idx: usize) void {
     if idx >= DELEG_MAX {
         return;
@@ -775,6 +815,7 @@ fn deleg_wait_slice(ms: i32) void {
     _ = sys_nanosleep(&ts, &rem) catch {};
 }
 
+// 遍历所有槽位各调一次 `deleg_check`。阻塞循环里周期性调用它收僵尸。
 export fn deleg_poll_all(t: &DelegTable) void {
     var i: usize = 0;
     while i < DELEG_MAX {
@@ -791,6 +832,7 @@ export fn deleg_id_parse(b: &const Buf, out: &i32) bool {
     return deleg_id_from_buf(b, out);
 }
 
+// 把工具参数里的 `sub-N` 解析成数字 N 写进 out。认不出（不是 sub- 前缀 / 没有数字）返回 false。
 fn deleg_id_from_buf(b: &const Buf, out: &i32) bool {
     if b.len == 0 {
         return false;
@@ -976,6 +1018,8 @@ export fn deleg_tool_output(t: &DelegTable, args: &const JsonValue, out: &Buf) v
     _ = buf_append_cstr(out, "]");
 }
 
+// `list_agents` 工具：逐槽打印 `sub-N [subagent|ralph] <status> — <label>`；
+// 一个都没有时给 `(no background agents)`。
 export fn deleg_tool_list(t: &DelegTable, out: &Buf) void {
     deleg_poll_all(t);
     var shown: usize = 0;
@@ -1008,6 +1052,11 @@ export fn deleg_tool_list(t: &DelegTable, out: &Buf) void {
 }
 
 // send_message：给已经空闲的子代理再开一个回合（用它的会话续跑）
+// `send_message` 工具：**续跑同一个子代理**。
+// 要点：要求槽位**不处于 RUNNING**；实现是**新 spawn 一个槽位**并用同一个
+// `force_session_id` **续写同一份日志**，所以回的是
+// `delivered message to sub-N; continuing as sub-M`。
+// `d.sid` 为空时报 `has no session to continue (ralph rounds are fresh-agent by design)`。
 export fn deleg_tool_send(cfg: &const Config, t: &DelegTable, args: &const JsonValue, out: &Buf) void {
     var idb: Buf = buf_empty();
     defer { buf_free(&idb); }
@@ -1076,6 +1125,8 @@ export fn deleg_tool_send(cfg: &const Config, t: &DelegTable, args: &const JsonV
     _ = buf_append_u64(out, t.items[nsi].id as u64);
 }
 
+// `interrupt_agent` 工具：先 `deleg_poll_all` 收一遍僵尸，再**仅在 RUNNING 时**
+// SIGKILL + 结算。已经终态的槽位回一句「早就结束了」，不做无效动作。
 export fn deleg_tool_interrupt(t: &DelegTable, args: &const JsonValue, out: &Buf) void {
     var idb: Buf = buf_empty();
     defer { buf_free(&idb); }

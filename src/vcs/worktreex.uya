@@ -1,4 +1,20 @@
-// src/worktreex.uya — P37：Git worktree（独立工作区执行 → 合并 → 删除）
+// src/vcs/worktreex.uya — P37：Git worktree（独立工作区执行 → 合并 → 删除）
+//
+// 本文件：状态机（`WtState` 与 `wt_phase`/`wt_ready`）、建（`wt_provision`）、
+//   合并收工（`wt_finish` → `wt_commit_pending`/`wt_do_commit`/`wt_merge_into_base`）、
+//   丢弃（`wt_discard`）、删除（`wt_remove`）、三道写闸门（`wt_guard_path_crosses` /
+//   `wt_guard_bash_crosses` / `wt_has_git_mutation`）、提示词段（`wt_section_into`）、
+//   残留回收（`wt_reclaim_*` 一族）、工具与命令入口（`wt_cmd_run`）。
+// 不变量：① `WT_ROOT = ".git/dsh-worktrees"` —— 放 `.git` 下的理由是 glob/grep 会剪掉 `.git`
+//   子树，于是每个文件不会被搜出两遍；② 分支 `dsh/<slug>`，slug 只留 `[A-Za-z0-9]`、截到
+//   **40 字节**（要能安全进 git ref）；③ **git 的 argv 必须是 NUL 结尾的 C 字符串** ——
+//   路径字段建好后一律过 `wt_nul`；④ 合并失败必 `git merge --abort` 把主干恢复原状，
+//   **不做自动冲突解决**；⑤ 回收「确定垃圾」四条判据**缺一不动**（宁可留着也不误删），
+//   且删除交给 git（`worktree remove` 不带 `--force`、`branch -d` 不带 `-D`）；
+//   ⑥ **不自动 finish**（没验完的活不该被自动合并），会话退出只回收确定的垃圾。
+// 依赖：libc（syscall / unistd）；本仓 foundation/bufx、vcs/gitx（真正跑 git）、
+//   tools/fsx（路径判定）、agent/agent（工作区切换与提示词接缝）。
+// 命名：`wt_*`、`WtState`、`WT_*`（阶段、跳过码、错误码、上限）。
 //
 // 逐字对齐 DSH 的 `git-worktree` agent preset（~/.dsh/.agent-presets/git-worktree/worktree.js）：
 //   * 每个**顶层**会话一开就在自己的 worktree（新分支）里干活，干完由 `worktree` 工具的
@@ -53,6 +69,8 @@ export const WT_PHASE_FAILED: u32 = 3;
 export const WT_PHASE_FINISHED: u32 = 4;
 export const WT_PHASE_DISCARDED: u32 = 5;
 
+// 释放五个 Buf 字段（repo_root / worktree_path / branch / base / note）。
+// phase / skip 是值字段，不动 —— 释放不改状态机。
 export fn wt_free(w: &WtState) void {
     buf_free(&w.repo_root);
     buf_free(&w.worktree_path);
@@ -88,22 +106,31 @@ var g_wt: WtState = WtState{
 };
 var g_wt_on: bool = false;      // 模式开关（--worktree / DSH preset / /worktree on）
 
+// 模式开关（`--worktree` / `--no-worktree` / DSH preset / `/worktree on|off`）。
+// 只改开关：真正建 worktree 在 `wt_provision`（会话开始、出厂 prompt 之前）。
 export fn wt_set_on(on: bool) void {
     g_wt_on = on;
 }
 
+// 当前模式开关。`agent_worktree_begin` 据此决定要不要 provision。
 export fn wt_on() bool {
     return g_wt_on;
 }
 
+// 进程级状态的只读视图（TUI / 滚动模式 / 提示词段都读它）。
+// **返回的是内部全局的地址** —— 调用方不许跨 `wt_reset` / `wt_provision` 留存。
 export fn wt_state() &const WtState {
     return &g_wt;
 }
 
+// 当前阶段（`WT_PHASE_*`）：NONE / READY / SKIPPED / FAILED / FINISHED / DISCARDED。
+// 文件头那段 `wt_section_into` 的四种文案就是按它分派的。
 export fn wt_phase() u32 {
     return g_wt.phase;
 }
 
+// 是否处于 READY（可以在 worktree 里干活、可以 finish/discard）。
+// 写闸门（wt_guard_path_crosses 等）只在 READY 时才需要拦 —— 非 READY 时工作区根本没切过去。
 export fn wt_ready() bool {
     return g_wt.phase == WT_PHASE_READY;
 }
@@ -128,6 +155,7 @@ export fn wt_reset() void {
 var g_wt_out: Buf = Buf{ ptr: null, len: 0, cap: 0 };
 var g_wt_err: Buf = Buf{ ptr: null, len: 0, cap: 0 };
 
+// 惰性分配两个共享输出缓冲（out 65536 / err 8192）。幂等；`wt_git` 每次开头顶一下。
 fn wt_bufs_ensure() void {
     if !buf_valid(&g_wt_out) {
         g_wt_out = buf_new(65536);
@@ -137,6 +165,10 @@ fn wt_bufs_ensure() void {
     }
 }
 
+// 跑一条 git（argv 是 **NUL 结尾的 C 字符串数组**，cwd 交给 `git -C`），输出写进 out。
+// 返回 `WT_E_NONE` 或映射过的错误码：`GITX_E_NO_GIT → WT_E_SPAWN`、
+// `GITX_E_TIMEOUT → WT_E_TIMEOUT`、其它负值也归 SPAWN。**把 transport 的错误码翻译成
+// worktree 自己的错误码**是这层的职责，调用方只看 WT_E_*。
 fn wt_git(argv: &(&const byte), out: &Buf) i32 {
     wt_bufs_ensure();
     buf_reset(out);
@@ -556,6 +588,7 @@ export fn wt_provision(cfg: &const Config, ws: &const byte, wsn: usize, session_
     return WT_E_NONE;
 }
 
+// 换掉「给用户看的一句话说明」（note）。**覆盖**语义：新的换掉旧的，不做追加。
 fn wt_set_note(s: &const byte) void {
     if !buf_valid(&g_wt.note) {
         g_wt.note = buf_new(256);
@@ -735,6 +768,10 @@ fn wt_has_git_mutation(cmd: &const byte, cn: usize) bool {
     return false;
 }
 
+// 这个 git 子命令会不会**改仓库**？表在下面：add/am/apply/checkout/cherry-pick/clean/
+// commit/merge/mv/push/rebase/reset/restore/revert/rm/stash/switch/tag/update-index/worktree。
+// 只用于 bash 那条闸门（`wt_guard_bash_crosses`）：认不出来的一律放行。
+// **这是启发式，不是安全边界** —— `g=git; $g commit` 认不出来，与 DSH 的 GIT_MUTATION 同一分界。
 fn wt_is_mutating_subcommand(w: &const byte, n: usize) bool {
     if bufx_eq_cstr(w, n, "add" as &const byte) { return true; }
     if bufx_eq_cstr(w, n, "am" as &const byte) { return true; }
@@ -797,6 +834,9 @@ fn wt_commit_pending(out: &Buf) i32 {
     return 0;
 }
 
+// `wt_commit_pending` 里的提交动作：`git -C <worktree> commit -m <msg>`。
+// **msg 自己补 NUL**（调用方从 JSON 解出的 message 没有 NUL；不补的话提交说明后面会黏上
+// `.rodata` 里的工具 schema —— P48 实测）。
 fn wt_do_commit(msg: &const byte, out: &Buf) i32 {
     var av: [&const byte: 8] = [null as &const byte: 8];
     av[0] = "git" as &const byte;

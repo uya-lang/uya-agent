@@ -1,9 +1,24 @@
-// src/tuiselftest.uya — 全屏 TUI（P17）的离线自测轮次
+// src/selftest/tuiselftest.uya — 全屏 TUI（P17）的离线自测轮次
+//
+// 本文件：全屏 TUI 的离线自测轮：排版、按键与编辑器、显示收口、端到端回合、常驻状态区、真 PTY
+//   （备用屏幕、termios 逐位还原、SIGWINCH 重排）、滚动模式标题、访问模式 chip 与 Full access
+//   确认、read-only 批准、诊断出口、命令面板与 /status 浮层、长内容滚动、运行中命令的泵点、
+//   /diff 浮窗、ask 提问浮层、计划模式、会话列表与切换、光标、markdown、鼠标、模型切换、
+//   Git worktree，以及字节级屏幕快照与 PTY 断言所需的小工具。
+// 不变量：① 断言走**字节级**屏幕快照 `tui_screen_text`，它必须与画帧**同源** —— 不许另写一份
+//   排版逻辑，否则测试绿而屏幕花；② 每轮开头用**独立夹具** + `tui_reset_all()` + `tui_set_headless`
+//   / `tui_set_size` 复位，轮次之间不许残留全局状态（任务块夹具装在真实 globals 上，不清会让下一
+//   轮排版断言莫名红）；③ 需要真终端的行为一律 fork 到 PTY / 子进程里做，父进程只读回快照，绝不
+//   动自己的 fd 1/fd 2；④ 判定码只用低 8 位（子进程 `sys_exit` 会截断，踩坑 89）。
+// 依赖：libc（syscall/unistd）、foundation/bufx、term/tui 各子段、term/tty、session（会话/统计/
+//   信号）、agent（主循环）、tools、net（mock LLM 端点）；断言工具前缀 `tuis_*`，轮次前缀 `tui_*`。
+// 命名：对外只有 `tui_selftest_all`（selftest_main 里一行调用）；其余私有：`tuis_*`（断言与夹具）、
+//   `tui*_round`（轮次）、`tuim_*`（模型轮夹具）。
 //
 // 轮次：
 //   tui-frame  纯排版：多种尺寸下「每行显示列 ≤ cols」「正文层里没有 ESC」、空态居中、
 //              对话态底对齐、窄终端退化、面板/脚注字段、滚动夹取；浮层方框的左右边界
-//              逐行对齐（长行截断时多补的那个 '…' 不能在预算外 —— 见 README 踩坑 42）
+//              逐行对齐（长行截断时多补的那个 '…' 不能在预算外 —— 见 §16 踩坑 42）
 //   tui-keys   键解码与编辑器：分片喂入（ESC[ 被切开、UTF-8 被切开）、多行编辑、
 //              历史、回车提交、运行中 esc = 中断、tab 切计划模式
 //   tui-sink   显示收口：TUI 激活后 fd 1/fd 2 **一个字节都不写**，正文进了转录；
@@ -23,15 +38,19 @@ use libc.unistd;
 
 const TUIS_DIG: [byte: 10] = [48, 49, 50, 51, 52, 53, 54, 55, 56, 57];
 
+// i64 → i32 的收窄转换；越界（!i32 失败）返回 -1，不 panic（诊断路径不能反过来崩）。
 fn tuis_i32(v: i64) i32 {
     const r: !i32 = v as! i32;
     return r catch { -1; };
 }
 
+// 把 C 串写到 fd 2（长度按 bufx_cstr_len 现算）。
+// 本文件所有断言/诊断都走它；写失败被吞掉。
 fn tuis_puts(p: &const byte) void {
     _ = sys_write(2, p as *const byte, bufx_cstr_len(p)) catch {};
 }
 
+// 把无符号十进制数写 fd 2（至少 1 位，最多 24 位，超出丢弃）。
 fn tuis_num(v: usize) void {
     var tmp: [byte: 24] = [0: 24];
     var n: usize = v;
@@ -56,6 +75,8 @@ fn tuis_num(v: usize) void {
     _ = sys_write(2, &rev[0] as *const byte, k) catch {};
 }
 
+// 断言失败：往 fd 2 打 `selftest[tag] FAIL: what` 并把 *ok 置 false。
+// 每轮共用；调用后通常继续跑完剩余断言（不早退）。
 fn tuis_fail(tag: &const byte, what: &const byte, ok: &bool) void {
     tuis_puts("selftest[");
     tuis_puts(tag);
@@ -65,6 +86,8 @@ fn tuis_fail(tag: &const byte, what: &const byte, ok: &bool) void {
     ok[0] = false;
 }
 
+// 断言通过：往 fd 2 打 `selftest[tag] ok（note）`（note 是一句人话总结）。
+// 只在整轮 ok 时调用一次，不置任何状态。
 fn tuis_ok(tag: &const byte, note: &const byte) void {
     tuis_puts("selftest[");
     tuis_puts(tag);
@@ -87,6 +110,8 @@ fn tuis_tasks_clear() void {
     tasks_expand_set(false);
 }
 
+// TUI 复位：清任务夹具（真实 globals）+ tui_reset_all + headless + 设定尺寸/状态/工作区/
+// 分支/颜色。每轮开头必须调，否则上一轮的残留会让排版断言莫名红。cols/rows 是终端列行数。
 fn tuis_reset(cols: usize, rows: usize) void {
     tuis_tasks_clear();
     tui_reset_all();
@@ -103,6 +128,8 @@ fn tuis_reset(cols: usize, rows: usize) void {
 // tui-frame
 // ============================================================
 
+// 断言当前帧的正文层健康：没有 ESC、没有 NUL（NUL 多半是字面量长度越界读）、
+// 每行显示宽度 <= cols（cols 是本次尺寸），并抽查空态/滚动时的行数。失败逐条报。
 fn tuis_scan_rows(cols: usize, ok: &bool, tag: &const byte) void {
     if tui_rows_have_esc() {
         tuis_fail(tag, "正文层里出现了 ESC（宽度/换行会算错，屏幕会花）", ok);
@@ -198,6 +225,8 @@ fn tuis_footer_tail(width: &usize, spaces: &usize) bool {
     return true;
 }
 
+// tui-frame 轮：纯排版 —— 多种尺寸下每行显示列 <= cols、正文层无 ESC、空态居中、
+// 对话态底对齐、窄终端退化、面板/脚注字段、滚动夹取、浮层边框逐行对齐。返回 false = 本轮红。
 fn tui_frame_round(tag: &const byte) bool {
     var ok: bool = true;
     var out: Buf = buf_new(65536);
@@ -476,7 +505,7 @@ fn tui_frame_round(tag: &const byte) bool {
         tuis_fail(tag, "统计行退化时把 ctx / cpu / 内存 一起丢了", &ok);
     }
 
-    // 80 列：统计行只剩第 1 组（内存那 12 列的代价，README 的宽度表里写明），状态字段仍在
+    // 80 列：统计行只剩第 1 组（内存那 12 列的代价，§11.5 的宽度表里写明），状态字段仍在
     tuis_reset(80, 24);
     tui_set_stats(sline.ptr as &const byte, sline.len);
     tui_set_ctx(21);
@@ -591,7 +620,7 @@ fn tui_frame_round(tag: &const byte) bool {
         tuis_fail(tag, "只有内存字段时的形态不对（不该出现前导分隔符）", &ok);
     }
 
-    // ---- 浮层方框：右边框逐行对齐（命令面板的 /permission 长行踩过，见 README 踩坑 42）----
+    // ---- 浮层方框：右边框逐行对齐（命令面板的 /permission 长行踩过，见 §16 踩坑 42）----
     tuis_overlay_frames(&ok, tag);
 
     if ok {
@@ -604,6 +633,7 @@ fn tui_frame_round(tag: &const byte) bool {
 // tui-keys
 // ============================================================
 
+// 当前编辑行的内容是否恰好等于 C 字面量 lit（长度先比，再逐字节）。
 fn tuis_in_is(lit: &const byte) bool {
     const n: usize = bufx_cstr_len(lit);
     if tui_input_len() != n {
@@ -612,6 +642,8 @@ fn tuis_in_is(lit: &const byte) bool {
     return bufx_mem_eq(tui_input_text().ptr as &const byte, lit, n);
 }
 
+// tui-keys 轮：键解码与编辑器 —— 分片喂入（ESC[ 被切开、UTF-8 被切开）、多行编辑、
+// 历史、回车提交、运行中 esc = 中断、tab 切计划模式。返回 false = 本轮红。
 fn tui_keys_round(tag: &const byte) bool {
     var ok: bool = true;
     tuis_reset(100, 28);
@@ -848,6 +880,8 @@ fn tui_keys_round(tag: &const byte) bool {
 // tui-sink
 // ============================================================
 
+// 把 fd 1/2 dup2 到一根管道（收「打到真实 fd 上的字节」用）。
+// fds[0]=读端、fds[1]=写端；返回 false = pipe2 或 dup2 失败，调用方必须放掉已开的 fd。
 fn tuis_capture_fd_setup(fds: &i32) bool {
     // 用 pipe 收「打到真实 fd 上的字节」：把 fd 1/2 dup2 到管道写端
     var p: [i32: 2] = [0: 2];
@@ -859,6 +893,8 @@ fn tuis_capture_fd_setup(fds: &i32) bool {
     return true;
 }
 
+// tui-sink 轮：显示收口 —— TUI 激活后 fd 1/fd 2 一个字节都不写、正文进转录、
+// 控制字节/ESC 被清洗、思考走独立条目、tui_stop 后写入回到真实 fd。返回 false = 本轮红。
 fn tui_sink_round(tag: &const byte) bool {
     var ok: bool = true;
     tuis_reset(100, 28);
@@ -952,6 +988,7 @@ fn tui_sink_round(tag: &const byte) bool {
 // tui-turn：headless 端到端（mock LLM）
 // ============================================================
 
+// Buf b 里是否含 C 字面量 lit（按出现次数 > 0 判）。
 fn tuis_has(b: &const Buf, lit: &const byte) bool {
     return tuis_count(b, lit) > 0;
 }
@@ -994,6 +1031,8 @@ fn tuis_last_at(b: &const Buf, lit: &const byte) isize {
     return found;
 }
 
+// 当前**屏幕文本**（tui_screen_text，与画帧同源）里是否含 lit。
+// 这是本文件断言的主口径：不看内部状态，只看字节。
 fn tuis_screen_has(lit: &const byte) bool {
     var out: Buf = buf_new(65536);
     defer { buf_free(&out); }
@@ -1001,6 +1040,8 @@ fn tuis_screen_has(lit: &const byte) bool {
     return tuis_has(&out, lit);
 }
 
+// tui-turn 轮：headless + mock LLM 端到端 —— 注入「任务+回车」→ 屏幕出现用户行、工具卡片、
+// 最终答案；回合结束回 idle 且状态区不留残影。返回 false = 本轮红。
 fn tui_turn_round(tag: &const byte) bool {
     var ok: bool = true;
     mock_mode = 0;              // shell 轮：write_file → run_shell → 最终答案
@@ -1159,15 +1200,18 @@ const TUIS_TIOCSWINSZ: i64 = 0x5414;
 const TUIS_TCGETS: i64 = 0x5401;
 const TUIS_O_RDWR_NOCTTY: i32 = 0x102;      // O_RDWR | O_NOCTTY
 
+// 指针 → i64（ioctl 的地址参数要整数）。
 fn tuis_addr(p: &const void) i64 {
     return (@usize_from_ptr(p)) as i64;
 }
 
+// 取 u16 的低字节。
 fn tuis_u16_lo(v: u16) byte {
     const x: u32 = v as u32;
     return (x % 256) as byte;
 }
 
+// 取 u16 的高字节。
 fn tuis_u16_hi(v: u16) byte {
     const x: u32 = v as u32;
     return ((x / 256) % 256) as byte;
@@ -1202,6 +1246,8 @@ fn tuis_open_pty(slave_path: &Buf, cols: u16, rows: u16) i32 {
     return m;
 }
 
+// 对 PTY master fd m 设窗口尺寸（TIOCSWINSZ；cols/rows 按列/行，内部拼 8 字节 winsize）。
+// ioctl 失败被吞掉（尺寸没设上后面会以别的断言暴露）。
 fn tuis_set_winsize(m: i32, cols: u16, rows: u16) void {
     var ws: [byte: 8] = [0: 8];
     ws[0] = tuis_u16_lo(rows);
@@ -1227,6 +1273,7 @@ fn tuis_get_termios(fd: i32, out: &byte) bool {
     return true;
 }
 
+// 两个 termios 备份是否前 60 字节完全相同（结构体大小走 ABI 常量，不猜）。
 fn tuis_termios_equal(a: &byte, b: &byte) bool {
     var i: usize = 0;
     while i < 60 {
@@ -1257,10 +1304,13 @@ fn tuis_drain(m: i32, out: &Buf, rounds: i32) void {
     }
 }
 
+// 往 PTY master 写 n 字节（提示输入/按键）；写失败被吞掉。
 fn tuis_write_master(m: i32, p: &const byte, n: usize) void {
     _ = sys_write(m, p as *const byte, n) catch {};
 }
 
+// 等子进程结束（WNOHANG + 100ms 轮询，最多 timeout_ms 毫秒），原始 wait 状态写进 st。
+// 返回 false = 超时（子进程还活着，调用方要 SIGKILL 并收尸）。
 fn tuis_wait_raw(pid: i32, st: &i32, timeout_ms: i32) bool {
     var waited: i32 = 0;
     while waited < timeout_ms {
@@ -1307,6 +1357,8 @@ fn tuis_dump_tail(cap: &const Buf, limit: usize) void {
     tuis_puts("\n  --- end ---\n" as &const byte);
 }
 
+// 把 PTY 捕获的字节 dump 给 fd 2（最多 limit 字节，非可打印转义），供失败现场排查。
+// 只诊断，不改断言状态。
 fn tuis_dump_cap(cap: &const Buf, limit: usize) void {
     tuis_puts("  --- pty capture (");
     tuis_num(cap.len);
@@ -1445,6 +1497,8 @@ fn tuis_child_run_tui_paste(slave_path: &const Buf, port: u16, ws: &const byte, 
     sys_exit(rc);
 }
 
+// 鼠标轮的**子进程**入口：打开 PTY slave 当 0/1/2，设好配置后跑真 TUI（agent_run_tui），
+// 再以它的返回码 sys_exit。父进程只读回快照；任何失败都以固定的非零码退出。
 fn tuis_child_run_tui_mouse(slave_path: &const Buf, port: u16, ws: &const byte, mouse: bool) void {    const s: i32 = sys_open(slave_path.ptr as *const byte, TUIS_O_RDWR_NOCTTY, 0) catch { -1; };
     if s < 0 {
         sys_exit(9);
@@ -1523,6 +1577,8 @@ fn tuis_child_run_scroll(slave_path: &const Buf, port: u16, ws: &const byte) voi
     sys_exit(rc);
 }
 
+// tui-pty 轮：真 PTY（/dev/ptmx + fork + dup2）—— 进退备用屏幕、termios 逐位还原、
+// SIGWINCH 触发重排。全程在子进程里跑；返回 false = 本轮红（子进程异常也算）。
 fn tui_pty_round(tag: &const byte) bool {
     var ok: bool = true;
     mock_mode = 0;
@@ -1837,6 +1893,8 @@ fn tty_title_pty_round(tag: &const byte) bool {
 // 第 6 步（palette 派发回归）用的命令表：/status 必须真有一行
 const TUIS_ACC_CMDS: &const byte = "/status    当前配置与会话信息\n/help      显示帮助浮层\n" as &const byte;
 
+// tui-access 轮（P21）：访问模式 —— chip 三级文案、shift+tab 选择器、Full access 风险确认、
+// 键选经 tui_overlay_take 落到策略上。返回 false = 本轮红；不网络。
 fn tui_access_round(tag: &const byte) bool {
     var ok: bool = true;
     var sel: Buf = buf_new(4096);
@@ -2216,7 +2274,7 @@ fn tui_access_round(tag: &const byte) bool {
             tuis_fail(tag, "转录里没有命令面板选中的那一行回显", &ok);
         }
         // 6c) /help 必须开**帮助浮层**（不是滚动模式的纯文本帮助）：
-        //     README 的「浮层」清单与命令表注释一直这么写，但这条分支曾经缺失
+        //     §11.6 的浮层清单一直这么写，但这条分支曾经缺失
         tui_reset_all();
         tui_set_headless(true);
         tui_set_size(100, 30);
@@ -2687,6 +2745,8 @@ fn tuis_ap_pty_case(tag: &const byte, ok: &bool) void {
     }
 }
 
+// tui-approve 轮（P21，read-only）：headless 时注入的键到不了审批浮层 → 一律拒绝（fail closed）；
+// 真 PTY 里浮层画出来之后送键 → 批准且命令真跑。返回 false = 本轮红。
 fn tui_approve_round(tag: &const byte) bool {
     var ok: bool = true;
     // A) headless：注入的键到不了审批浮层 → 一律拒绝（fail closed）
@@ -2704,7 +2764,7 @@ fn tui_approve_round(tag: &const byte) bool {
 //
 // 为什么单独一轮：P17 的运行状态行是「转录的最后一行」，转录一铺满视口
 // 就被 `r < panel_top` 挤掉 —— 长会话里跑起来屏幕上**一个动的字节都没有**
-// （README 踩坑 32）。这一轮把 A「铺满也要看得见」和 B「思考实时行」都钉死。
+// （§16 踩坑 32）。这一轮把 A「铺满也要看得见」和 B「思考实时行」都钉死。
 // ============================================================
 
 // 铺满转录：加够行数，保证「转录比视口长」（每行很长，会各占满一行）
@@ -2734,6 +2794,8 @@ fn tuis_find_row(lit: &const byte, row: &usize) bool {
     return false;
 }
 
+// tui-status 轮（P18）：常驻状态区 + 思考实时行 —— 转录铺满视口也看得见状态行、实时行在
+// 状态行下面且只显示最新一行、超宽从左边截断补 '…'、控制字节清洗、清空/idle 收掉。返回 false = 本轮红。
 fn tui_status_round(tag: &const byte) bool {
     var ok: bool = true;
     var row: usize = 0;
@@ -3060,6 +3122,8 @@ fn tuis_wait_for(m: i32, cap: &Buf, lit: &const byte, max_ms: i32) bool {
     return tuis_has(cap, lit);
 }
 
+// tui-quit 轮（P28）：工具跑着的时候 ctrl+d / esc / /exit 都要立刻生效；
+// 中断过的会话下一个任务必须照常跑完。返回 false = 本轮红。
 fn tui_quit_round(tag: &const byte) bool {
     var ok: bool = true;
     const wsdir: &const byte = "build/selftest_ws_tui_quit" as &const byte;
@@ -3265,6 +3329,8 @@ fn tui_quit_round(tag: &const byte) bool {
 // 面板选择一旦没被执行，屏幕上就找不到帮助正文。
 // ============================================================
 
+// tui-exit 轮（P28）：命令面板的选择真的会执行（headless 走完整主循环）。
+// 用 /help 当钉子（选中没被执行屏幕上就找不到帮助正文）；返回 false = 本轮红。
 fn tui_exit_round(tag: &const byte) bool {
     var ok: bool = true;
     const wsdir: &const byte = "build/selftest_ws_tui_exit" as &const byte;
@@ -3409,6 +3475,8 @@ fn tuis_cmd_cfg(c: &Config, ws: &const byte) void {
     c.tui_rows = 30;
 }
 
+// tui-cmd 轮（P23）：命令面板 ↔ /status 浮层这条链 —— 派发到 agent 后浮层内容正确、
+// 回合运行中也能当场出帧。返回 false = 本轮红。
 fn tui_cmd_round(tag: &const byte) bool {
     var ok: bool = true;
     const wsa: &const byte = "build/selftest_ws_tui_cmd" as &const byte;
@@ -3927,6 +3995,8 @@ fn tuis_long_visible(n: usize) bool {
     return tuis_screen_has(pat.ptr as &const byte);
 }
 
+// tui-scroll 轮（P32）：长内容翻看 —— 2400 行条目翻到前面、ctrl+home 到顶、ctrl+end 回底、
+// 滚动时状态行钉住。返回 false = 本轮红。
 fn tui_scroll_round(tag: &const byte) bool {
     var ok: bool = true;
 
@@ -4136,6 +4206,8 @@ fn tui_scroll_round(tag: &const byte) bool {
 
 const TUIS_P30_LAT_MAX_MS: u64 = 800;     // 派发延迟上限（旧实现 ≥2.2s）
 
+// tui-p30 的 headless 腿（P30）：派发命令**不再等 step 边界**，命令一进来就执行；
+// 与 tuis_p30_pty_case 共用 TUIS_P30_LAT_MAX_MS 这个延迟上限。
 fn tuis_p30_headless_case(tag: &const byte, ok: &bool, ws: &const byte) void {
     var c: Config = cfg_default();
     tuis_cmd_cfg(&c, ws);                 // 与 tui-cmd 同一套配置（不发请求）
@@ -4207,6 +4279,8 @@ fn tuis_p30_headless_case(tag: &const byte, ok: &bool, ws: &const byte) void {
     cfg_free(&c);
 }
 
+// tui-p30 的真 PTY 腿（P30）：单步长流式（mock 先停 2.5s）中敲 /status，浮层必须在
+// TUIS_P30_LAT_MAX_MS（800ms）内出现（旧实现要等这一步走完 ≥2.2s）。父子进程分工与 tui-pty 同。
 fn tuis_p30_pty_case(tag: &const byte, ok: &bool) void {
     const ws: &const byte = "build/selftest_ws_tui_p30" as &const byte;
     if !ws_prepare(ws) {
@@ -4317,6 +4391,8 @@ fn tuis_p30_pty_case(tag: &const byte, ok: &bool) void {
     mock_sse_gap_ns = 0;
 }
 
+// tui-p30 轮（P30）：先跑 headless 腿再跑 PTY 腿（后者自己 fork）。
+// 返回 false = 任一条腿红。
 fn tui_p30_round(tag: &const byte) bool {
     var ok: bool = true;
     const ws: &const byte = "build/selftest_ws_tui_p30_headless" as &const byte;
@@ -4346,6 +4422,8 @@ fn tui_p30_round(tag: &const byte) bool {
 // 能断言的判据是「tui_render 真的被调用过一帧」（build + flush 都走过了）。
 // ============================================================
 
+// tui-p31 的 headless 腿（P31）：请求在飞的那段也插泵点，命令派发当场出帧。
+// 判据用 tui_frame_count()（headless 的 flush fd 是 -1，「脏没脏」不成立）。
 fn tuis_p31_headless_case(tag: &const byte, ok: &bool, ws: &const byte) void {
     var c: Config = cfg_default();
     tuis_cmd_cfg(&c, ws);                 // 与 tui-cmd / tui-p30 同一套配置（不发请求）
@@ -4429,6 +4507,8 @@ fn tuis_p31_headless_case(tag: &const byte, ok: &bool, ws: &const byte) void {
     cfg_free(&c);
 }
 
+// tui-p31 轮（P31）：跑 headless 腿（请求在飞时也能派发命令并当场出帧）。
+// 返回 false = 本轮红。
 fn tui_p31_round(tag: &const byte) bool {
     var ok: bool = true;
     const ws: &const byte = "build/selftest_ws_tui_p31" as &const byte;
@@ -4571,6 +4651,8 @@ fn tuis_border_left_ok(p: &const byte) bool {
         || bufx_mem_eq(p, "╰" as &const byte, 3);
 }
 
+// p 指向的 3 字节是否是**右边框**字符（│ / ╮ / ╯）。
+// diff 浮窗的逐行闭合断言用；p 必须至少有 3 字节。
 fn tuis_border_right_ok(p: &const byte) bool {
     return bufx_mem_eq(p, "│" as &const byte, 3)
         || bufx_mem_eq(p, "╮" as &const byte, 3)
@@ -4708,6 +4790,8 @@ fn tuis_overlay_frames(ok: &bool, tag: &const byte) void {
 const TUIS_DIFF_FILES: &const byte = "M  src/tui.uya  (+3 -1)\n??  src/gitdiff.uya  (new)\nM  README.md  (+1 -0)\n" as &const byte;
 const TUIS_DIFF_TEXT: &const byte = "diff --git a/src/tui.uya b/src/tui.uya\nindex 1111111..2222222 100644\n--- a/src/tui.uya\n+++ b/src/tui.uya\n@@ -1,5 +1,5 @@\n fn tui_overlay() {\n-    @println(\"Hello, Uya!\");\n+    @println(\"Hello, DSH!\");\n     tui_draw();\n }\n@@ -20,2 +20,3 @@\n ctx20\n+line add\n" as &const byte;
 
+// 给 /diff 浮窗轮装 fixture：把 TUIS_DIFF_FILES / TUIS_DIFF_TEXT 灌进 gd 层（假仓库）。
+// 不碰真 git；每轮开头调一次。
 fn tuis_fixture_open() void {
     var files: Buf = buf_new(256);
     defer { buf_free(&files); }
@@ -4819,6 +4903,8 @@ fn tuis_dump_screen(tag: &const byte) void {
     out_err("\n");
 }
 
+// 第 row 行里是否存在显示列恰好等于 want 的竖线（│）。
+// 越界行或没有竖线返回 false；列位置按 tty 显示宽度算，不是字节偏移。
 fn tuis_row_has_pipe_at(out: &const Buf, row: usize, want: usize) bool {
     var cols: [usize: 8] = [0: 8];
     const n: usize = tuis_pipe_cols(out, row, &cols[0], 8);
@@ -4991,6 +5077,8 @@ fn tui_diff_pty_case(tag: &const byte, ok: &bool) void {
     _ = sys_close(m) catch {};
 }
 
+// tui-diff 轮（P26/P31）：/diff 浮窗 —— 几何、标题、列头、列表选中标记、三栏内容与行号、
+// 切换/夹取、刷新、文本回退、窄终端不开浮窗。返回 false = 本轮红。
 fn tui_diff_round(tag: &const byte) bool {
     var ok: bool = true;
     // ---- 1) 100×28：几何、标题、列头、列表选中标记 ----
@@ -5860,6 +5948,8 @@ fn tuis_ask_frame_w(out: &usize) bool {
     return true;
 }
 
+// ask 浮窗的自适应宽度用例：短内容缩到下限 34 列（以前无论多短都撑满 78）、长内容封顶、
+// 逐行闭合。ok 被就地更新；不网络。
 fn tuis_ask_adaptive_case(tag: &const byte, ok: &bool) void {
     const short_q: &const byte = "选哪个？" as &const byte;
     const short_items: &const byte = "alpha\nbeta\n" as &const byte;
@@ -6328,6 +6418,8 @@ var tuis_ask_want_set: bool = false;
 // 踩坑 81：把 mock 的问题换成「长且多行」那一版（真 PTY 那条腿用）
 var g_tuis_ask_q_long: bool = false;
 
+// 设「期望回到模型面前的答案」缓冲（真 PTY 的 ask 腿用它比对）：内容为 p[0:n]，
+// 末尾补 NUL（C 串口径）但 len 仍是 n。n 为 0 表示关闭该断言。
 fn tuis_ask_set_want(p: &const byte, n: usize) void {
     if !buf_valid(&tuis_ask_want) {
         tuis_ask_want = buf_new(256);
@@ -6339,6 +6431,9 @@ fn tuis_ask_set_want(p: &const byte, n: usize) void {
     tuis_ask_want_set = n > 0;
 }
 
+// ask 轮的 mock LLM 服务端（跑在 fork 出的子进程里，lfd 是监听 socket）：
+// 服务两轮请求，按 tuis_ask_want 决定第二轮回什么，返回判定码（0 = 正常）。
+// 只在本轮用，不依赖网络。
 fn tuis_ask_mock(lfd: i32) i32 {
     var round: i32 = 0;
     var verdict: i32 = 0;
@@ -6420,6 +6515,8 @@ fn tuis_ask_mock(lfd: i32) i32 {
     return verdict;
 }
 
+// 起一个只服务本轮 ask 测试的 mock：本地 bind 127.0.0.1:0 并 fork 服务子进程。
+// 返回端口（0 = 失败），子进程 pid 写进 mpid；调用方负责 SIGKILL + 收尸。
 fn tuis_ask_start_mock(mpid: &i32) u16 {
     const lfd: i32 = sys_socket(AF_INET, SOCK_STREAM, IPPROTO_TCP) catch { return 0; };
     var one: i32 = 1;
@@ -6468,6 +6565,8 @@ fn tuis_ask_child(slave_path: &const Buf, port: u16, ws: &const byte) void {
     sys_exit(rc);
 }
 
+// ask 浮窗的真 PTY 腿：子进程里跑真 TUI，父进程按提示行送键选中第 2 项，
+// 断言回到模型面前的是 TUIS_ASK_OPT2 的 label。失败报 tuis_fail，不返回码。
 fn tuis_ask_pty_case(tag: &const byte, ok: &bool) void {
     const ws: &const byte = "build/selftest_ws_tui_ask_pty" as &const byte;
     if !ws_prepare(ws) {
@@ -6607,6 +6706,8 @@ fn tuis_ask_pty_case(tag: &const byte, ok: &bool) void {
     g_tuis_ask_q_long = false;
 }
 
+// tui-ask 轮：跑齐 ask 浮窗的六条腿（浮层/自适应/长内容/装不下/headless fail closed/真 PTY）。
+// 返回 false = 任一腿红。
 fn tui_ask_round(tag: &const byte) bool {
     var ok: bool = true;
     tuis_ask_overlay_case(tag, &ok);
@@ -6640,6 +6741,8 @@ fn tui_ask_round(tag: &const byte) bool {
 const TUIS_TI_TITLE: &const byte = "会话标题" as &const byte;
 const TUIS_TI_SUGGEST: &const byte = "修好中文文件名" as &const byte;
 
+// 标题输入框的浮层用例：预填 AI 建议可见、打字/backspace/←→/home·end/ctrl+u/中间插入、
+// enter 采纳（交回编辑后的文本）、方框逐行闭合、窄框不越界。只更新 ok。
 fn tuis_ti_overlay_case(tag: &const byte, ok: &bool) void {
     tuis_reset(100, 30);
     tui_overlay_input_open(TUIS_TI_TITLE, bufx_cstr_len(TUIS_TI_TITLE),
@@ -6749,6 +6852,7 @@ fn tuis_ti_overlay_case(tag: &const byte, ok: &bool) void {
     }
 }
 
+// 标题输入框的取消用例：esc 之后浮层关闭、不算改名（已采纳结果保留）。只更新 ok。
 fn tuis_ti_cancel_case(tag: &const byte, ok: &bool) void {
     tuis_reset(100, 30);
     tui_overlay_input_open(TUIS_TI_TITLE, bufx_cstr_len(TUIS_TI_TITLE),
@@ -6777,6 +6881,8 @@ fn tuis_ti_cancel_case(tag: &const byte, ok: &bool) void {
     tui_overlay_close();
 }
 
+// 标题输入框「终端太矮」的用例：必须返回 0 让调用方回落 notice，绝不能 fail closed。
+// 同时断言没有开浮层、屏幕上不留残影。
 fn tuis_ti_nofit_case(tag: &const byte, ok: &bool) void {
     // 终端太矮：返回 0（调用方回落 notice），绝不能 fail closed
     tuis_reset(100, 5);
@@ -6803,6 +6909,8 @@ fn tuis_ti_nofit_case(tag: &const byte, ok: &bool) void {
     tuis_reset(100, 30);
 }
 
+// 标题框在**回合运行中**的分工用例：带参 `/title <t>` 只写内存 + 日志事件 + OSC 2，
+// 进安全集可当场生效；裸 `/title` 要发侧路请求 + 开浮层，不进安全集。
 fn tuis_ti_inturn_case(tag: &const byte, ok: &bool) void {
     // D) 回合运行中的分工：带参 `/title <t>` 只写内存 + 一条日志事件 + OSC 2（不动历史、
     //    不发请求）⇒ 进安全集，泵点当场生效；裸 `/title` 要发侧路请求 + 开浮层 ⇒
@@ -6843,6 +6951,8 @@ fn tuis_ti_inturn_case(tag: &const byte, ok: &bool) void {
     }
 }
 
+// tui-title 轮：跑齐标题输入框的四条腿（浮层 / esc 取消 / 太矮回落 / 运行中分工）。
+// 返回 false = 任一腿红。
 fn tuis_ti_round(tag: &const byte) bool {
     var ok: bool = true;
     tuis_ti_overlay_case(tag, &ok);
@@ -6864,7 +6974,7 @@ fn tuis_ti_round(tag: &const byte) bool {
 //
 // 为什么单独一轮：P8 的审阅是 CLI 的 y/N 问答（ask_write + ask_read_yes_no），TUI 下
 // 既没有浮窗、按键还要跟 TUI 的键队列抢 —— 用户看到的就是「计划直接开始执行」
-// （README 踩坑 36）。这一轮把四件事钉死：
+// （§16 踩坑 36）。这一轮把四件事钉死：
 //   A) 浮层排版与按键（headless，直接开浮层）：正文可滚动、三动作、数字直选、
 //      esc 取消、每行 ≤ cols、正文层无 ESC、窄终端不崩
 //   B) headless + agent：注入的键到不了浮层 → 按「解决」处理（留在 plan 模式），**绝不批准**
@@ -6888,7 +6998,7 @@ const TUIS_PL_PLAN: &const byte = "# 计划标题\n\n## 第一步：读现状\n-
 
 // exit_plan_mode 的 arguments（用 JsonWriter 生成，免得手写两级转义）。
 // 末尾要补 NUL：mock_call 走的是 jw_str_cstr（C 字符串口径），而 buf_new 是裸 malloc ——
-// 不补的话 strlen 会一路读到未初始化的堆尾巴，arguments 变成非法 JSON（README 踩坑 37 同款）。
+// 不补的话 strlen 会一路读到未初始化的堆尾巴，arguments 变成非法 JSON（§16 踩坑 37 同款）。
 fn tuis_pl_args(out: &Buf, plan: &const byte) bool {
     var w: JsonWriter = JsonWriter{ buf: null, cap: 0, used: 0, overflow: false };
     jw_init(&w, out.ptr, out.cap);
@@ -7464,6 +7574,8 @@ fn tuis_pl_pty_case(tag: &const byte, ok: &bool, approve: bool) void {
     }
 }
 
+// tui-plan 轮（P26）：计划模式浮层（排版/滚动/直选/esc/窄终端）+ headless 下没人回答 =
+// 「解决」（fail closed）+ tab 切换。返回 false = 本轮红；开头先 agent_plan_force(false) 清残留。
 fn tui_plan_round(tag: &const byte) bool {
     var ok: bool = true;
     // 进程级的 plan 状态是继承的（PTY 子进程 fork 自本进程）：轮次开头先摆平，
@@ -7967,6 +8079,8 @@ fn tuis_sess_make(home: &const byte, ws: &const byte, title: &const byte, out_id
     return out_id.len > 0;
 }
 
+// tui-sessions 轮（P33）：/sessions 与 /resume 在 TUI 里这条链 —— 列表渲染、选中即切换、
+// 空列表、坏索引降级。返回 false = 本轮红；夹具 home 每轮重建。
 fn tui_sessions_round(tag: &const byte) bool {
     var ok: bool = true;
     const home: &const byte = "build/selftest_tui_sessions" as &const byte;
@@ -8213,6 +8327,8 @@ fn tuis_sessbig_check_item(i: usize, why: &Buf) bool {
     return true;
 }
 
+// tui-sessions-big 轮（踩坑 68 的 TUI 侧）：大索引（TUIS_SESSBIG_N 条）下列表仍要跟手、
+// 排序确定、选中切换正确。返回 false = 本轮红。
 fn tui_sessions_big_round(tag: &const byte) bool {
     var ok: bool = true;
     var items: Buf = buf_new(1 << 20);
@@ -8485,6 +8601,8 @@ fn tuis_switch_home_ready(home: &const byte) void {
     _ = sys_unlink(ipath.ptr as *const byte) catch {};
 }
 
+// tui-switch 轮：/resume 切换工作区 —— 夹具挂当前工作区（幂等那条分支），
+// 断言切换后的路径、提示与不搬走本进程 cwd。返回 false = 本轮红。
 fn tui_switch_round(tag: &const byte) bool {
     var ok: bool = true;
     // 夹具挂在**当前工作区**（绝对路径）：/resume 会按会话记录的工作区去 chdir，
@@ -8501,7 +8619,7 @@ fn tui_switch_round(tag: &const byte) bool {
     var id_res: Buf = buf_new(64);
     defer { buf_free(&id_res); }
     // `sess_open` 的 cwd 是 **C 字符串**（NUL 结尾）：Buf.ptr 没有尾 NUL，
-    // 直接传会把堆里紧邻的字节也算进路径（README 踩坑 57），这里补一个 NUL 再传。
+    // 直接传会把堆里紧邻的字节也算进路径（§16 踩坑 57），这里补一个 NUL 再传。
     var rootz: Buf = buf_new(root.len + 1);
     defer { buf_free(&rootz); }
     _ = buf_append(&rootz, root.ptr as &const byte, root.len);
@@ -8732,6 +8850,8 @@ fn tuis_caret_frame(rfd: i32, cap: &Buf) void {
     tuis_pipe_drain(rfd, cap);
 }
 
+// tui-caret 轮：运行中（思考/输出/工具三态）输入行**必须有**光标（字节级 ?25h），
+// 空闲与浮层两格维持不变。返回 false = 本轮红。
 fn tui_caret_round(tag: &const byte) bool {
     var ok: bool = true;
     tuis_reset(100, 30);
@@ -8849,6 +8969,8 @@ fn tui_caret_round(tag: &const byte) bool {
     return ok;
 }
 
+// 对外入口（selftest_main 里一行调用）：按顺序跑本轮全部 TUI 轮，任一轮红就置 ok=false，
+// 但**跑完全部**（不早退，方便一次看到所有红）。返回 false = 本轮有红。
 export fn tui_selftest_all() bool {
     var ok: bool = true;
     if !tui_frame_round("tui-frame" as &const byte) {
@@ -8971,6 +9093,9 @@ export fn tui_selftest_all() bool {
 // panel_top-1 那一行（面板之上最后一行）。用**屏幕文本**判，不看内部状态 ——
 // 这样几何与绘制不一致时（右边界没到边、顶边没顶格）当场红。
 
+// 满屏浮窗轮（P31 那一族）：geo=true 只做「浮层占满转录区」的几何断言并返回
+// （六段共用，合进一个函数是为了省函数表名额，见踩坑 87）；geo=false 跑完整的浮层内容断言。
+// 一律用屏幕文本判，不看内部状态。
 fn tui_full_round(tag: &const byte, geo: bool) bool {
     // geo = true：只做「浮层占满转录区」的几何断言并返回（= 原来的 tuis_full_frame_ok，
     // A2/B2/C/D2/D3/E/F 六段共用）。合进同一个函数是为了省**函数表**名额（见踩坑 87）。
@@ -9160,7 +9285,7 @@ fn tui_full_round(tag: &const byte, geo: bool) bool {
     //
     // 判据用**两个固定字面量**而不是「for 1..30 拼字符串再查」：拼出来的名字是 buf_new
     // 造的**裸 malloc** 缓冲区（不保证 NUL 结尾），而 tuis_screen_has 内部按 bufx_cstr_len
-    // 量长度 —— 会读到堆尾巴上去（README 踩坑 57/67/77 那一族，本轮又踩了一次：
+    // 量长度 —— 会读到堆尾巴上去（§16 踩坑 57/67/77 那一族，本轮又踩了一次：
     // 这条断言的第一版就是这么假红的，量出来「可见条目=9」）。
     // 第 20 条在所有可能的全屏高度下都该看得见（16 行上限只能画到前 13 项左右），
     // 而它在非全屏下**必然**看不见（前面已断言过第 30 条看不见，这里再钉一个更近的）。
@@ -9446,7 +9571,7 @@ fn tui_full_round(tag: &const byte, geo: bool) bool {
         tuis_fail(tag, "/fullscreen bogus 把状态改掉了（非法取值应当只报错）", &ok);
     }
     // 判据要读 notice：先收掉浮层 —— 浮层盖着转录时那条 notice 在屏幕上根本看不见
-    // （README 踩坑 65 的现场：底对齐菜单正好压在转录最新那几行上）
+    // （§16 踩坑 65 的现场：底对齐菜单正好压在转录最新那几行上）
     tui_overlay_close();
     tui_build();
     tuis_scan_rows(cols, &ok, tag);
@@ -9538,6 +9663,8 @@ fn tuis_md_row_has_ellipsis(lit: &const byte) bool {
     return false;
 }
 
+// 数当前屏幕文本里 C 字面量 lit 出现的次数（markdown 轮的断言辅助）。
+// 每帧重新取屏幕；lit 为空返回 0。
 fn tuis_md_count_lit(lit: &const byte) usize {
     var out: Buf = buf_new(262144);
     defer { buf_free(&out); }
@@ -9609,7 +9736,7 @@ fn tuis_md_frame(cols: usize, rows: usize, md: &const byte) void {
 }
 
 // ⚠ buf_new 是**裸 malloc**、缓冲区不保证有 NUL 结尾，拿 bufx_cstr_len 去量动态拼出来的
-// 夹具会一路读到堆尾巴（README 踩坑 57/67 同款）。动态夹具一律走这个带长度的入口。
+// 夹具会一路读到堆尾巴（§16 踩坑 57/67 同款）。动态夹具一律走这个带长度的入口。
 fn tuis_md_frame_n(cols: usize, rows: usize, md: &const byte, n: usize) void {
     tuis_reset(cols, rows);
     tui_sink_bytes(1, md, n);
@@ -10103,6 +10230,8 @@ fn tuis_md_bigcase(tag: &const byte, ok: &bool) void {
     }
 }
 
+// tui-markdown 轮：inline / block / 不折行 / fence 状态 / 表格五种形态的渲染与折行。
+// 直接 view_init 建帧不跑 agent；返回 false = 本轮红。
 fn tui_md_round(tag: &const byte) bool {
     var ok: bool = true;
     view_init(true, 0);       // 直接建帧，不跑 agent
@@ -10218,7 +10347,7 @@ fn tui_paste_round(tag: &const byte) bool {
     // `\` + `n` 两个字符，所以是 28 字节（8+2+8+2+8）。函数内 const 才不会把
     // 数组推断成 int32（模块级 const 会，见上面的编译错误）。
     // 「(输入已达上限 」的 UTF-8 字节（数组字面量，避免「切片描述符 → char*」强转，
-    // 见 README 踩坑 22 与 Makefile 的 codegen-audit）
+    // 见 §16 踩坑 22 与 Makefile 的 codegen-audit）
     const over_lit: [byte: 20] = [
         40, 232, 190, 147, 229, 133, 165, 229, 183, 178, 232, 190, 190, 228, 184, 138, 233, 153, 144, 32
     ];
@@ -10307,7 +10436,7 @@ fn tui_paste_round(tag: &const byte) bool {
 
     // ---- F) 粘贴收尾标记被切开也认（真终端会分片）----
     // 注意长度：`"\x1b[20"` 是 **4** 个字节（ESC [ 2 0）—— 手写长度写大一个字节会
-    // 把 NUL 也喂进去（README 踩坑 77 同族）。
+    // 把 NUL 也喂进去（§16 踩坑 77 同族）。
     tuis_reset(100, 30);
     tui_keys_feed(on, 6);
     tui_keys_feed("S1" as &const byte, 2);
@@ -10514,7 +10643,7 @@ fn tui_paste_pty_case(tag: &const byte, ok: &bool) bool {
     // 这一轮对子进程发的是 SIGKILL，索引根本不存在。所以直接按
     // `<home>/sessions/<cwd-dir>/<session-dir>/session.jsonl` 三级目录找。
     //
-    // 两处长度都不许手写（本轮实测两次踩同一个坑，见 README 踩坑 77）：
+    // 两处长度都不许手写（本轮实测两次踩同一个坑，见 §16 踩坑 77）：
     //   * `"type":"user/message"` 是 21 字节（写成 23 就整段匹配不上）；
     //   * 正文在日志里是**转义后**的形式（换行 = `\` + `n` 两个字符，共 28 字节）。
     var found: bool = false;
@@ -10569,6 +10698,8 @@ fn tui_paste_pty_case(tag: &const byte, ok: &bool) bool {
     return good;
 }
 
+// tui-mouse 轮：鼠标上报开关（默认开、set_mouse 翻转、同值幂等）+ 真 PTY 里滚轮/点击事件
+// 被解码。返回 false = 本轮红；PTY 那条腿自己在子进程里跑。
 fn tui_mouse_round(tag: &const byte) bool {
     var ok: bool = true;
 
@@ -10750,6 +10881,7 @@ fn tui_mouse_round(tag: &const byte) bool {
 // 强度浮层只列模型**公布**的档位；不公布档位的模型上 /effort 不开浮层、只给一行说明。
 const TUIM_HOME: &const byte = "build/selftest_p37_tuim_home" as &const byte;
 
+// 把 DSH home 指向模型轮自己的 fixture 目录（TUIM_HOME），让模型目录从它读设置。
 fn tuim_home_set() void {
     var hb: Buf = buf_new(128);
     defer { buf_free(&hb); }
@@ -10757,6 +10889,8 @@ fn tuim_home_set() void {
     _ = agent_set_dsh_home(hb.ptr[0: hb.len]);
 }
 
+// 写模型轮的 settings.yaml fixture（只有我们关心的那几节）。
+// 返回 false = 建目录或写文件失败。
 fn tuim_fixture_write() bool {
     _ = sess_mkdir_p(TUIM_HOME);
     var p: Buf = buf_new(256);
@@ -10767,6 +10901,8 @@ fn tuim_fixture_write() bool {
     return write_text_file(p.ptr as &const byte, body);
 }
 
+// tui-model 轮（P37）：/model 与 /effort 浮层 —— 清单按提供方分组且当前项带 ✓、
+// 回车交回的行能反解出模型名、强度浮层只列**公布**的档位。返回 false = 本轮红。
 fn tui_model_round(tag: &const byte) bool {
     var ok: bool = true;
     if !tuim_fixture_write() {
@@ -10975,6 +11111,7 @@ fn tuis_wt_z(src: &const Buf, suffix: &const byte, out: &Buf) void {
     _ = buf_append_cstr_z(out, suffix);
 }
 
+// path_z（C 串）指向的路径是否存在（经 fs_stat，不跟随符号链接的细节由 fs_stat 定）。
 fn tuis_wt_exists(path_z: &const byte) bool {
     var st: FsStat = FsStat{ exists: false, is_dir: false, size: 0, mtime: 0, mtime_nsec: 0 };
     _ = fs_stat(path_z, &st);
@@ -11115,6 +11252,8 @@ fn tui_watch_pick_round(tag: &const byte) bool {
     return ok;
 }
 
+// tui-worktree 轮（P37）：TUI 里的 worktree 建/切/收 —— 建之前先从关开始（wt_set_on(false)），
+// 断言清单、切换、finish/discard 的分支与错误文案。返回 false = 本轮红。
 fn tui_worktree_round(tag: &const byte) bool {
     var ok: bool = true;
     wt_set_on(false);

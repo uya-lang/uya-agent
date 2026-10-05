@@ -1,4 +1,25 @@
-// src/selftest.uya — 离线自测（内置 mock LLM）+ 传输层探针
+// src/selftest/selftest.uya — 离线自测（内置 mock LLM）+ 传输层探针
+//
+// 本文件：全部离线自测轮的宿主：mock LLM 服务端子进程（HTTP 解析 + 按 `mock_mode` 出响应体 +
+//   请求体内的断言）、单轮驱动 `selftest_round`（fork → 假 DSH_HOME/工作区 → 跑完整 agent 循环
+//   → 收退出码与写盘内容）、探针 `probe_main`，以及各域的自测轮：SSE 流式、终端层、会话日志与
+//   恢复、DSH 设置、图片、剪贴板、/sessions 列表、read 行窗口、workflow、工具调用序列化上限、
+//   diff、子代理窗口、/watch、Responses 接口、访问模式/沙箱、plan 闸门、统计与上下文占用、
+//   进程采样、终端标题、任务状态、/goal、模型目录、Git worktree 与残留回收。
+// 不变量：① mock 与断言必须**确定性** —— 同一夹具必须给出同一 verdict，不许依赖真实网络 / 时钟 /
+//   环境（唯一允许的外来输入是显式设置的 `mock_*` 全局开关）；② 判定码只用**低 8 位**：子进程用
+//   `sys_exit` 收尾，256 起会被截断（261 显示成 5，踩坑 89），所以外部命令/工具的返回码要先折进
+//   0..255 再当 verdict；③ 每轮可单跑（`UYA_SELFTEST_*_ONLY` 环境变量）且幂等 —— 连跑两次必须
+//   都 PASS，轮次之间不许残留全局状态（工作区 / DSH_HOME 每轮重建）；④ 轮次自己 fork 的子进程
+//   必须由该轮收干净，不许留孤儿。
+// 依赖：libc（syscall/unistd/heap/fcntl/signal）、std.json.encoder、foundation/bufx、net（LLM
+//   协议与 SSE）、term 与 term/tui、tools（fs/shell）、session（日志/DSH 配置/统计/信号）、agent
+//   （历史与主循环）、vcs/gitx、diff；另三个自测文件经合并命名空间提供 `sigx_*` / `shellx_*` /
+//   `tui_*` 入口。
+// 命名：对外只有 `probe_main`（--probe）、`selftest_main`（--selftest）与 diff fixture 的
+//   `dg_fixture_make`/`dg_fixture_empty`；私有前缀 `mock_*`（mock LLM）、`sse_*`、`ty_*`（终端层）、
+//   `resp_*`（Responses）、`stx_*`（统计）、`tsx_*`（任务）、`dp_/dg_/gcr_/mx_/wt_`，以及各轮的
+//   `*_round`。
 //
 // --selftest 完全不联网、不需要 API key：
 //   1) 父进程 bind 127.0.0.1:0 拿到端口，fork 出子进程跑 mock LLM；
@@ -120,6 +141,9 @@ fn probe_payload(cfg: &const Config, style: u8, payload: &Buf) bool {
     return true;
 }
 
+// 探针主流程（--probe 专用）：用配置里的 model 发一个最小请求，一次同时验证网络 / TLS /
+// 鉴权 / model 名字；协议按 api_style_now()，未声明时同样允许一次协商回退。
+// 返回进程退出码（AGENT_OK / AGENT_PROTO）；跑完即退，不改任何会话状态。
 export fn probe_main(cfg: &const Config) i32 {
     var hdrs: Buf = buf_new(512);
     defer { buf_free(&hdrs); }
@@ -433,6 +457,8 @@ const MOCK_REASONING: &const byte = "先看 note.txt 里有什么，再决定要
 // 常量的长度（`bufx_cstr_len`），不手数（踩坑 77/83 那族）。
 const MOCK_DEGEN_THINK: &const byte = "SELFTEST-DEGEN-THINK 只有思考没有正文";
 
+// 造一段 mock 的「最终答案」响应体（chat 形状，正文就是 marker）。
+// 写进已经 buf_new 好的 out（不扩容）；返回 false = 容量不够 / 溢出，调用方必须当轮红。
 fn mock_final_body(out: &Buf, marker: &const byte) bool {
     var w: JsonWriter = JsonWriter{ buf: null, cap: 0, used: 0, overflow: false };
     jw_init(&w, out.ptr, out.cap);
@@ -506,6 +532,8 @@ fn mock_put_usage(w: &JsonWriter) void {
 // ============================================================
 const HISTCAP_ROUNDS: i32 = 40;
 
+// 长历史轮（mode 17）里第 round 轮的调用 id：`call_h<round>_<tag>`。
+// 两边用同一套规则生成，mock 才能按 id 断言工具结果有没有被丢。返回的 Buf 归调用方 free。
 fn mock_loop_id(round: i32, tag: &const byte) Buf {
     var b: Buf = buf_new(32);
     if !buf_valid(&b) {
@@ -518,6 +546,8 @@ fn mock_loop_id(round: i32, tag: &const byte) Buf {
     return b;
 }
 
+// 长历史轮第 round 轮的调用参数：一条 `echo HC-R<round>-<tag>` 的 bash 调用。
+// 返回的 Buf 归调用方 free；容量不够时返回未初始化的空 Buf（调用方要 buf_valid）。
 fn mock_loop_args(round: i32, tag: &const byte) Buf {
     var b: Buf = buf_new(192);
     if !buf_valid(&b) {
@@ -531,6 +561,8 @@ fn mock_loop_args(round: i32, tag: &const byte) Buf {
     return b;
 }
 
+// 长历史轮（mode 17）每一轮的响应体：**一次给两个**工具调用（id 后缀 a/b，参数后缀 A/B），
+// 逼出「一条 assistant 消息带多个 tool_calls」这条路径。返回 false = 序列化溢出。
 fn mock_loop_body(out: &Buf, round: i32) bool {
     var ia: Buf = mock_loop_id(round, "a");
     defer { buf_free(&ia); }
@@ -615,6 +647,8 @@ fn mock_field(m: &const JsonValue, key: &const byte, key_len: usize, out: &Buf) 
     return js_obj_get_str_unescaped(m, key, key_len, out);
 }
 
+// b 与 C 字面量 lit 是否逐字节相等（空 Buf 一律 false）。
+// mock 端解析请求字段后的断言辅助。
 fn mock_field_is(b: &const Buf, lit: &const byte) bool {
     if b.len == 0 {
         return false;
@@ -622,6 +656,7 @@ fn mock_field_is(b: &const Buf, lit: &const byte) bool {
     return bufx_eq_cstr(b.ptr as &const byte, b.len, lit);
 }
 
+// 两个 Buf 是否逐字节相等（任一为空或长度不等即 false）。
 fn mock_field_eq(a: &const Buf, b: &const Buf) bool {
     if a.len == 0 || a.len != b.len {
         return false;
@@ -629,6 +664,9 @@ fn mock_field_eq(a: &const Buf, b: &const Buf) bool {
     return bufx_mem_eq(a.ptr as &const byte, b.ptr as &const byte, a.len);
 }
 
+// mock 端最贵的断言：请求里的 `messages` 数组必须满足「每个 assistant tool_calls 后面
+// 紧跟等量的 tool 结果」（端点 400 的判据就是这条）。解析用的临时内存是 malloc 的，
+// 函数内自己 free；false = 配对错（或在 mid-turn 被切断，见函数内说明）。
 fn mock_pairing_ok(rx: &const Buf) bool {
     var arr: Buf = buf_new(1 << 16);
     defer { buf_free(&arr); }
@@ -728,6 +766,8 @@ fn count_sub(hay: &const Buf, needle: &const byte) i32 {
     return n;
 }
 
+// hay 里是否含子串 needle（needle 按 C 串取长度，内部 find_sub）。
+// 空 needle 恒真；本文件多处断言都用它。
 fn contains(hay: &const Buf, needle: &const byte) bool {
     const view: &[byte] = hay.ptr[0: hay.len];
     return find_sub(view, needle[0: strlen(needle)], 0) >= 0;
@@ -754,6 +794,8 @@ fn sel_body_raw_control(rx: &const Buf) usize {
     return n;
 }
 
+// 从 mock 端的连接读一整个 HTTP 请求（循环读到 `\r\n\r\n` 之后按 Content-Length 补齐 body），
+// 追加进 rx（rx 由调用方 buf_new 并负责 free）。返回 false = 对端提前关闭 / 追加失败 / 请求不完整。
 fn mock_read_request(cfd: i32, rx: &Buf) bool {
     var tmp: [byte: 4096] = [0: 4096];
     while true {
@@ -887,7 +929,7 @@ fn mock_send_sse_nodone(cfd: i32, body: &const Buf) bool {
 //
 // P21：两段之间**故意停 10ms**（分两次写，不再攒成一个包）—— 否则客户端在同一毫秒里
 // 解析完整个流，「首 token → 消息组装」的解码窗口恒为 0，`st_decode_ms() > 0` 这条
-// 断言就没法确定性地成立（真实网关是渐进流式的，见 README 的偏差段）。
+// 断言就没法确定性地成立（真实网关是渐进流式的，见 §15.4 的偏差段）。
 fn mock_send_sse(cfd: i32, body: &const Buf) bool {
     var text: Buf = buf_new(8192);
     defer { buf_free(&text); }
@@ -951,6 +993,8 @@ fn mock_send_sse(cfd: i32, body: &const Buf) bool {
     return true;
 }
 
+// 给 mock 端连接回一个 JSON 响应：`Connection: close` + 精确 Content-Length。
+// 返回 false = 头部缓冲分配失败或写失败；body 由调用方持有。
 fn mock_send(cfd: i32, body: &const Buf) bool {
     var head: Buf = buf_new(256);
     defer { buf_free(&head); }
@@ -992,6 +1036,8 @@ fn mock_send_chunked(cfd: i32, body: &const Buf) bool {
     return true;
 }
 
+// 把 v 以小写十六进制追加进 b（0 写 "0"，其余不补前导零，最多 16 位）。
+// 返回 false = b 容量不够。
 fn buf_append_u64_hex(b: &Buf, v: usize) bool {
     const hexd: &[byte] = &"0123456789abcdef"[0: 16];
     var tmp: [byte: 16] = [0: 16];
@@ -1191,6 +1237,8 @@ fn mock_ctrl_body(out: &Buf, cmd: &const Buf) bool {
     return true;
 }
 
+// 往 JsonWriter 里写一个 chat 形状的 tool_calls 数组元素（id / type / function{name,arguments}）。
+// void：写溢出记在 w 上，由调用方查 jw_overflow。
 fn mock_call(w: &JsonWriter, id: &const byte, name: &const byte, args_json: &const byte) void {
     jw_byte(w, 123);
     jw_key(w, "id");
@@ -1233,6 +1281,8 @@ fn resp_data_n(out: &Buf, p: &const byte, n: usize) bool {
     return buf_append_cstr(out, "\n\n");
 }
 
+// 把 w 里已经写好的一帧 JSON 用 `data: ` 前缀 + 空行收尾追加进 out。
+// 返回 false = w 已溢出（帧没写完）或 out 容量不够 —— 后者会让 mock 回一个半帧。
 fn resp_emit(out: &Buf, w: &const JsonWriter, payload: &Buf) bool {
     if jw_overflow(w) {
         return false;
@@ -2994,13 +3044,15 @@ fn ws_prepare(ws: &const byte) bool {
         return false;
     }
     _ = buf_append_cstr(&f, ws);
-    // 必须补 NUL（README 坑 2）：否则 unlink 拿到的是缓冲区后面的垃圾路径，
+    // 必须补 NUL（§16 坑 2）：否则 unlink 拿到的是缓冲区后面的垃圾路径，
     // 清理静默失败 —— 第二轮就会撞上「write 需要先 read」的观察策略。
     _ = buf_append_cstr_z(&f, "/note.txt");
     _ = sys_unlink(&f.ptr[0] as *const byte) catch {};
     return true;
 }
 
+// path 的**前 512 字节**是否恰好等于 expect（多余字节也算不等）。
+// 只读一次、不重试；false = 打不开 / 读失败 / 内容不等。
 fn file_equals(path: &const byte, expect: &const byte) bool {
     const fd: i32 = sys_open(path as *const byte, O_RDONLY as i32, 0) catch {
         return false;
@@ -3067,6 +3119,7 @@ fn file_bytes_eq(path: &const byte, want: &const byte, want_len: usize) bool {
 // 这一轮钉住四件事：转义、字符边界截断、预览有界、全文另有去处（会话日志/落盘）。
 // ============================================================
 
+// 数 p[0:n] 里等于 c 的字节个数（诊断断言用；不做任何转义解释）。
 fn diag_count_byte(p: &const byte, n: usize, c: byte) usize {
     var i: usize = 0;
     var k: usize = 0;
@@ -3105,6 +3158,8 @@ fn diag_fill_cjk(out: &Buf, chars: usize) void {
     }
 }
 
+// 把 path 全文读进 out（先 buf_reset，读失败返回 false 但 out 已经是空的）。
+// 起手就用 O_RDONLY 打开、循环读到 EOF；out 由调用方 free。
 fn diag_read_file(path: &const byte, out: &Buf) bool {
     buf_reset(out);
     const fd: i32 = sys_open(path as *const byte, 0 as i32, 0) catch {
@@ -3406,7 +3461,7 @@ fn empty_retry_check(tag: &const byte, cap: &const Buf, home: &const byte, ws: &
         ty_fail(tag, "找不到刚跑完的会话（会话日志没落盘？）", &pass);
         return false;
     }
-    // sess_reader_load 把路径当 C 串（README 坑 2）：Buf 不带 NUL，自己补一个
+    // sess_reader_load 把路径当 C 串（§16 坑 2）：Buf 不带 NUL，自己补一个
     if !buf_append_byte(&path, 0) {
         ty_fail(tag, "路径缓冲不够补 NUL", &pass);
         return false;
@@ -3507,6 +3562,10 @@ fn empty_retry_check(tag: &const byte, cap: &const Buf, home: &const byte, ws: &
     return pass;
 }
 
+// **端到端单轮驱动**：设好 mock 开关 → 准备假 DSH_HOME/工作区 → fork 出 mock 子进程 →
+// 在父进程里跑完整 agent 循环（build_request → http → 工具执行 → 回灌 → 下一轮），
+// 再按 mode 断言转录、退出码与写出的文件。mode 见文件头的「自测轮次模式」表；
+// stream=false 走非流式出口，fold/steer/interrupt 分别打开对应断言。返回 false = 本轮红（也用于 fork 失败）。
 fn selftest_round(base: &const Config, tag: &const byte, mode: i32, allow_shell: bool, ws: &const byte, stream: bool, fold: bool, steer: bool, interrupt: bool) bool {
     mock_mode = mode;
     mock_expect_shell = allow_shell;
@@ -3749,10 +3808,13 @@ const SSE_GAP_NS: i64 = 2000000;
 
 var sse_case: i32 = 0;
 
+// p[0:n] 与 C 字面量 lit 逐字节相等（长度先按 bufx_cstr_len 比）。
+// SSE 断言的基本单元 —— 比的是解析出来的字节，不是「看起来对」。
 fn sse_eq(p: &const byte, n: usize, lit: &const byte) bool {
     return bufx_cstr_len(lit) == n && bufx_mem_eq(p, lit, n);
 }
 
+// Buf b 与 C 字面量 lit 逐字节相等（sse_eq 的 Buf 版）。
 fn sse_buf_eq(b: &const Buf, lit: &const byte) bool {
     return sse_eq(b.ptr as &const byte, b.len, lit);
 }
@@ -3911,6 +3973,8 @@ fn sse_usage_only(out: &Buf, payload: &Buf) bool {
     return sse_emit(out, &w, payload);
 }
 
+// 造一个原始 SSE 帧：`data: <text>` + 空行（text 原样，不做 JSON 转义）。
+// 返回 false = out 容量不够（会写出半帧）。
 fn sse_raw_frame(out: &Buf, text: &const byte) bool {
     if !buf_append_cstr(out, "data: ") {
         return false;
@@ -4100,6 +4164,9 @@ fn sse_call(url: &[byte], hdrs: &[byte], body: &const Buf, o: &ChatOut) i32 {
     return 0;
 }
 
+// SSE 解析轮：给 case_id 选夹具、起一个只服务这一轮的本地 TCP，把帧**按 19 字节切片**
+// 分片喂进去（模拟真实网络的切分），断言解析出的正文/思考/工具与首 token 打点。
+// sse_case 供服务端线程读；返回 false = 本轮红。
 fn sse_round(case_id: i32, tag: &const byte) bool {
     sse_case = case_id;
     const lfd: i32 = sys_socket(AF_INET, SOCK_STREAM, IPPROTO_TCP) catch {
@@ -4348,6 +4415,8 @@ fn ty_fail(tag: &const byte, what: &const byte, ok: &bool) void {
     ok[0] = false;
 }
 
+// 把 C 串 s 整段喂进行编辑器（tty_feed，长度现算）。
+// 终端层自测的输入口：转义序列可以分片喂，见 ty_feed_byte1。
 fn ty_feed_cstr(ui: &TtyUi, s: &const byte) void {
     tty_feed(ui, s, bufx_cstr_len(s));
 }
@@ -4359,6 +4428,8 @@ fn ty_feed_byte1(ui: &TtyUi, b: byte) void {
     tty_feed(ui, &one[0], 1);
 }
 
+// ui.line 是否恰好等于 want（长度先比，再逐字节）。
+// 失败时用 ty_line_dump 把实际行打出来。
 fn ty_line_is(ui: &const TtyUi, want: &const byte) bool {
     const n: usize = bufx_cstr_len(want);
     if ui.line.len != n {
@@ -4367,6 +4438,7 @@ fn ty_line_is(ui: &const TtyUi, want: &const byte) bool {
     return bufx_mem_eq(ui.line.ptr as &const byte, want, n);
 }
 
+// 把 ui.line 的实际字节按 `[bytes]` 打给 fd 2（断言失败时的现场，写入失败被吞掉）。
 fn ty_line_dump(ui: &const TtyUi) void {
     out_err("[");
     out_err_bytes(ui.line.ptr as &const byte, ui.line.len);
@@ -4385,6 +4457,8 @@ fn ty_panel_rule(out: &Buf, left: &const byte, right: &const byte, m: usize) voi
     _ = buf_append(out, right, bufx_cstr_len(right));
 }
 
+// 往 out 追加一行面板行：`│ <lit>` 后面补空格到显示宽度 m-1，再补右边框。
+// 宽度按 tty_cols_between 算（不是字节数），所以中文/宽字符不会把边框顶歪。
 fn ty_panel_row(out: &Buf, lit: &const byte, m: usize) void {
     _ = buf_append_cstr(out, "│ ");
     _ = buf_append_cstr(out, lit);
@@ -4418,6 +4492,7 @@ fn ty_has(hay: &const Buf, needle: &const byte, n: usize) bool {
     return find_sub(hay.ptr[0: hay.len], needle[0: n], 0) >= 0;
 }
 
+// b 是否以 C 字面量 lit 开头（不足即 false）。
 fn ty_starts(b: &const Buf, lit: &const byte) bool {
     const n: usize = bufx_cstr_len(lit);
     if b.len < n {
@@ -4426,6 +4501,7 @@ fn ty_starts(b: &const Buf, lit: &const byte) bool {
     return bufx_mem_eq(b.ptr as &const byte, lit, n);
 }
 
+// b 的最后 n 个字节是否等于 lit（长度显式给，因为 lit 可能含 NUL）。
 fn ty_ends(b: &const Buf, lit: &const byte, n: usize) bool {
     if b.len < n {
         return false;
@@ -4433,6 +4509,8 @@ fn ty_ends(b: &const Buf, lit: &const byte, n: usize) bool {
     return bufx_mem_eq((b.ptr + (b.len - n)) as &const byte, lit, n);
 }
 
+// P3 终端层自测轮：先钉 ABI（TtyTermios 60 字节 / TtyWinsize 8 字节），再按纯字节流
+// 喂歧义转义序列与多字节 UTF-8 分片、跑行编辑/历史/面板宽度。不需要真 TTY；返回 false = 本轮红。
 fn tty_round(tag: &const byte) bool {
     var ok: bool = true;
 
@@ -5227,6 +5305,7 @@ fn sess_round(tag: &const byte) bool {
     return ok;
 }
 
+// 会话日志缓冲 b 里是否含子串 lit（按 C 串取长度，内部 find_sub）。
 fn sess_line_has(b: &const Buf, lit: &const byte) bool {
     const n: usize = bufx_cstr_len(lit);
     if b.len < n {
@@ -5255,6 +5334,7 @@ fn msg_role_at(h: &const History, i: usize) u8 {
     return msg_at(h, i).role;
 }
 
+// 历史第 i 条消息的 extra 字段（tool_call_id 之类）是否等于 lit；越界 / extra 为空即 false。
 fn msg_extra_is(h: &const History, i: usize, lit: &const byte) bool {
     if i >= h.len {
         return false;
@@ -5276,18 +5356,25 @@ fn msg_extra_is(h: &const History, i: usize, lit: &const byte) bool {
 const HIST_CALLS_1: &const byte = "[{\"id\":\"c1\",\"type\":\"function\",\"function\":{\"name\":\"bash\",\"arguments\":\"{}\"}}]";
 const HIST_CALLS_2: &const byte = "[{\"id\":\"c1\",\"type\":\"function\",\"function\":{\"name\":\"bash\",\"arguments\":\"{}\"}},{\"id\":\"c2\",\"type\":\"function\",\"function\":{\"name\":\"bash\",\"arguments\":\"{}\"}}]";
 
+// 往历史里追加一条文本消息（role + C 串正文）。返回 false = 追加失败或超出历史上限。
+// 自测夹具专用，走的是 hist_push 的正式路径。
 fn hist_push_text(h: &History, role: u8, lit: &const byte) bool {
     return hist_push(h, role, lit, bufx_cstr_len(lit));
 }
 
+// 往历史里追加一条 assistant 的 tool_calls 消息（正文为空，calls 为 JSON 串）。
+// 返回 false = 追加失败；配套的 tool 结果必须紧跟（见 hist_push_tool）。
 fn hist_push_calls(h: &History, calls: &const byte) bool {
     return hist_push_msg(h, ROLE_ASSISTANT_CALLS, null, 0, calls, bufx_cstr_len(calls));
 }
 
+// 往历史里追加一条 tool 结果（tool_call_id = id，正文 = lit）。
+// 返回 false = 追加失败；必须与前面的 tool_calls 配对，否则端点 400。
 fn hist_push_tool(h: &History, id: &const byte, lit: &const byte) bool {
     return hist_push_msg(h, ROLE_TOOL, lit, bufx_cstr_len(lit), id, bufx_cstr_len(id));
 }
 
+// 给历史铺底：一条 SYS + 一条 TASK（role 固定）。返回 false = 任一条追加失败。
 fn hist_seed(h: &History) bool {
     return hist_push_text(h, ROLE_SYSTEM, "SYS") && hist_push_text(h, ROLE_USER, "TASK");
 }
@@ -5328,6 +5415,8 @@ const IMG_PNG_64x48: [byte: 124] = [
 
 
 
+// img-sniff 轮（P50）：用内嵌的 PNG 字节测纯函数——嗅探类型、解析尺寸与字节大小。
+// 夹具是常量数组，不读盘不联网；返回 false = 本轮红。
 fn img_round(tag: &const byte) bool {
     var ok: bool = true;
     // 占位行断言的三个片段。函数内 const 才不会把数组推断成 int32
@@ -5629,6 +5718,8 @@ fn write_raw_file(path_z: &const byte, p: &const byte, n: usize) bool {
     return write_all_fd(fd, p, n);
 }
 
+// clip-parse 轮（P51）：X11 客户端里不依赖真 X 会话的那部分——DISPLAY 解析、畸形拒绝、
+// Xauthority 配对与失败文案。会让环境变量（DISPLAY/HOME）并在结束时还原；返回 false = 本轮红。
 fn clip_round(tag: &const byte) bool {
     var ok: bool = true;
     out_err("selftest[");
@@ -5803,6 +5894,8 @@ fn clip_round(tag: &const byte) bool {
     return ok;
 }
 
+// hist-repair 轮：尾部修复（hist_trim_incomplete_tail）必须**只丢不完整的一组** ——
+// 完整的一组（tool_calls + 等量 tool 结果）一条都不许少，半组要整体丢掉。返回 false = 本轮红。
 fn hist_round(tag: &const byte) bool {
     var ok: bool = true;
     // 1) 完整的一组（2 个调用 + 2 条应答）：一条都不许丢
@@ -5904,6 +5997,8 @@ fn hist_round(tag: &const byte) bool {
     return ok;
 }
 
+// 用 O_WRONLY|O_CREAT|O_TRUNC（mode 0644）把 text 写进 path，写完即关。
+// text 按 C 串取长度；返回 false = 打不开或写不满（关了 fd 再返回，不泄漏）。
 fn write_text_file(path: &const byte, text: &const byte) bool {
     const flags: i32 = (O_WRONLY | O_CREAT | O_TRUNC) as i32;
     const fd: i32 = sys_open(path as *const byte, flags, 420) catch {
@@ -5937,6 +6032,7 @@ fn sesslist_fixture_line(id: &const byte, cwd: &const byte, at: i64, has_at: boo
     _ = buf_append_cstr(out, ",\"model\":\"m\",\"delegationDepth\":0,\"turns\":0,\"events\":0,\"path\":\"/x\"}\n");
 }
 
+// 数 b 里的换行符个数（= 行数，末尾无换行时最后一行也算）。
 fn sesslist_count_lines(b: &Buf) usize {
     var n: usize = 0;
     var i: usize = 0;
@@ -5993,6 +6089,8 @@ fn sesslist_render_row_id(rendered: &Buf, k: usize, out: &Buf) bool {
     return out.len > 0;
 }
 
+// 取 /sessions 列表里第 k 行的 id 写进 out（先按 sesslist_span 定位该行）。
+// 返回 false = 行号越界 / 该行没有 id 字段 / out 容量不够。
 fn sesslist_row_id(b: &Buf, k: usize, out: &Buf) bool {
     var o: usize = 0;
     var l: usize = 0;
@@ -6006,6 +6104,8 @@ fn sesslist_row_id(b: &Buf, k: usize, out: &Buf) bool {
     return sess_json_str(scratch.ptr[0: scratch.len], "id", out);
 }
 
+// 取 /sessions 列表里第 k 行的 lastActiveAt（毫秒时间戳）。
+// 行号越界 / 该行没有该字段返回 -2（不是 0 —— 0 是合法时间戳）；负数即失败。
 fn sesslist_row_at(b: &Buf, k: usize) i64 {
     var o: usize = 0;
     var l: usize = 0;
@@ -6139,6 +6239,8 @@ fn sesslist_check_width(rows: &Buf, exp: &Buf, body: usize, want_title: bool, wa
     return true;
 }
 
+// /sessions 列表轮（P33，纯函数）：造四份假日志，断言索引去重（同 id 取最后一条）、
+// lastActiveAt 倒序、三列排版与宽度退阶梯（工作区列该藏就藏）。返回 false = 本轮红。
 fn sess_list_round(tag: &const byte) bool {
     var ok: bool = true;
     const home: &const byte = "build/selftest_sess_list" as &const byte;
@@ -6476,6 +6578,8 @@ fn sessbig_sorted_ok(idx: &const Buf, tab: &const SessIdxRow, n: usize, mode: u8
     return true;
 }
 
+// sess-list-big 轮（踩坑 68）：6000 行大索引上，归并排序必须与参考插入排序**逐行等价**、
+// 两把键各自有序、结果确定、去重 2000 条、行尾 id 完整。返回 false = 本轮红。
 fn sess_list_big_round(tag: &const byte) bool {
     var ok: bool = true;
     var rows: Buf = buf_new(1 << 20);
@@ -6695,6 +6799,8 @@ fn sess_list_big_round(tag: &const byte) bool {
     return ok;
 }
 
+// DSH 设置解析轮（假 DSH_HOME）：settings.yaml 的预处理（顶层与行尾注释去掉、块标量里的
+// 井号保留）与各段读取（provider / model / permission / tls / !!js 行被忽略）。返回 false = 本轮红。
 fn dshcfg_round(tag: &const byte) bool {
     var ok: bool = true;
     const home: &const byte = "build/selftest_dsh_home";
@@ -6833,6 +6939,7 @@ fn dshcfg_round(tag: &const byte) bool {
     return ok;
 }
 
+// Buf b 是否恰好等于 C 字面量 lit（长度先比，再逐字节）。
 fn ty_buf_is(b: &const Buf, lit: &const byte) bool {
     const n: usize = bufx_cstr_len(lit);
     if b.len != n {
@@ -6922,13 +7029,15 @@ fn fs_ws_prepare(ws: &const byte) bool {
 // ============================================================
 // read-window：read 工具的行窗口（P19）
 //
-// 现场（真实会话踩到，README 踩坑 34）：`read` 只读文件头 cap 字节，再把这段**前缀**的行数
+// 现场（真实会话踩到，§16 踩坑 34）：`read` 只读文件头 cap 字节，再把这段**前缀**的行数
 // 当成全文行数 —— 226 KB / 5756 行的 agent.uya 被报成 3149 行；offset 落在那段前缀之外时
 // `fs_line_at` 直接失败，输出只剩 "(End of file - total 3149 lines)" + 空内容，模型据此
 // 以为文件读完了。这一轮用一个**比 cap 还大**的文件把四件事钉死：真实 total、能读到后半段、
 // 只有真越界才报 EOF、行号是绝对行号。
 // ============================================================
 
+// 把 body 本体写进 path（path 自动补 NUL；用于 read 行窗口轮的 fixture 文件）。
+// 返回 false = 路径缓冲分配失败 / 打不开 / 写不满（关 fd 再返回）。
 fn read_ws_write(path: &const byte, body: &const Buf) bool {
     var z: Buf = buf_new(bufx_cstr_len(path) + 1);
     defer { buf_free(&z); }
@@ -6949,7 +7058,7 @@ fn read_ws_write(path: &const byte, body: &const Buf) bool {
     return write_all_fd(fd, body.ptr as &const byte, body.len);
 }
 
-// 拼 `<ws>/<name>`：**必须补 NUL**（README 坑 2）—— 下面 read_ws_write / sys_open 都按
+// 拼 `<ws>/<name>`：**必须补 NUL**（§16 坑 2）—— 下面 read_ws_write / sys_open 都按
 // C 字符串取路径，Buf 不带头部 NUL 时它们会读到缓冲区后面的垃圾（文件名会带上乱码尾巴）。
 fn read_ws_path(ws: &const byte, name: &const byte, out: &Buf) void {
     buf_reset(out);
@@ -7011,6 +7120,9 @@ fn read_dump_tail(tag: &const byte, out: &const Buf) void {
     out_err("\n");
 }
 
+// read-window 轮（P19）：read 工具的行窗口必须报**真实全文行数**、能读到 cap 之外的后半段、
+// 只有真越界才报 EOF、输出有上限、残行处理正确（旧实现只按文件头 cap 数行，5756 行报成 3149）。
+// 返回 false = 本轮红；工作目录由 ws 给出。
 fn read_window_round(tag: &const byte, ws: &const byte) bool {
     var ok: bool = true;
     if !ws_prepare(ws) {
@@ -7127,6 +7239,8 @@ fn read_window_round(tag: &const byte, ws: &const byte) bool {
     return ok;
 }
 
+// fs 轮（P6，mode 7）：read/write/edit 三个工具端到端 —— 观察策略（先读才能写）、
+// 越权路径被拒、行窗口与 diff 视图。返回 false = 本轮红；工作区由 ws 给出。
 fn fs_round(base: &const Config, tag: &const byte, ws: &const byte) bool {
     mock_mode = 7;
     mock_expect_shell = false;
@@ -8119,6 +8233,8 @@ fn wf_make_args(out: &Buf, script: &const byte, name: &const byte) bool {
     return buf_append_cstr(out, ",\"description\":\"两阶段审计\"},\"args\":{\"files\":[\"a.uya\",\"b.uya\"]}}");
 }
 
+// 解析 workflow 脚本里的 args JSON（一段文本 → JsonValue），用 64 KiB 堆缓冲 + Arena。
+// 返回 false = 分配失败 / 解析失败；解析成功时 out 指向 arena 内的节点，调用方负责 free raw。
 fn wf_parse_args(text: &const Buf, out: &JsonValue) bool {
     var raw: &void = malloc(65536);
     if ((raw as &byte) as usize) == 0 {
@@ -8278,6 +8394,8 @@ fn wf_variant_real(cfg: &const Config, tag: &const byte, out: &Buf) bool {
     return ok;
 }
 
+// workflow 轮（P12，mode 16）：mock 只回一个 workflow 调用，断言参数解析、`uya run` 真跑一遍
+// 脚本、退出码与输出回灌。返回 false = 本轮红；工作区由 ws 给出。
 fn wf_round(base: &const Config, tag: &const byte, ws: &const byte) bool {
     mock_mode = 16;
     mock_expect_shell = false;
@@ -8619,7 +8737,7 @@ fn vw_cap_off(path: &const byte, saved: i32, cfd: i32, out: &Buf) void {
 // P15：请求体字符串转义的纯函数轮。
 // 不联网、不起服务端 —— 直接把「必须转义的字节全集」喂给 jw_str/jw_key，逐字节比对输出。
 // std.json.encoder.json_write_str_view 只认 " \ \n \r \t，其余控制字节原样上线；
-// 这条测试就是防止再退回那个实现（真机后果见 README 踩坑 27）。
+// 这条测试就是防止再退回那个实现（真机后果见 §16 踩坑 27）。
 fn jsonesc_round(tag: &const byte) bool {
     var ok: bool = true;
     // 输入：a NUL 0x01 0x1f " \ LF TAB BS FF CR B
@@ -8696,6 +8814,8 @@ fn jsonesc_round(tag: &const byte) bool {
 // ============================================================
 const CAP_TEST_CHUNKS: usize = 600;   // 16 × 600 = 9600 字节正文
 
+// 造一段 9600 字节的正文（CAP-HEAD| + 600×16 字节 + |CAP-TAIL），钉「工具调用序列化容量」的
+// 正文体量。返回 false = out 容量不够。
 fn cap_test_body(out: &Buf) bool {
     if !buf_append_cstr(out, "CAP-HEAD|") {
         return false;
@@ -8710,6 +8830,9 @@ fn cap_test_body(out: &Buf) bool {
     return buf_append_cstr(out, "|CAP-TAIL");
 }
 
+// tool_calls 序列化容量轮（踩坑 35）：① jw_str_esc_len 与实际写出字节数逐字节相等；
+// ② calls_json_need 的预算 = 实际长度 + CALLS_JSON_SLACK（不许算少）；③ 9 KiB 出头的参数要按
+// 预算分配成功（老的固定 8192 装不下就是线上那个 bug）。返回 false = 本轮红。
 fn toolcalls_cap_round(tag: &const byte) bool {
     var ok: bool = true;
 
@@ -9098,6 +9221,8 @@ fn watch_append_file(pathz: &const byte, text: &const byte) bool {
     return write_all_fd(fd, text, bufx_cstr_len(text));
 }
 
+// 显示层 diff 渲染轮（P14）：工具内容块与 diff 的逐字节断言，off 态用 fd 2 捕获验证「零输出」。
+// 返回 false = 本轮红；不碰 git、不碰 TUI。
 fn diffx_round(tag: &const byte) bool {
     var ok: bool = true;
     var out: Buf = buf_new(16384);
@@ -9384,6 +9509,8 @@ fn win_expected_cols() usize {
     return 78;
 }
 
+// 子代理窗口面板轮（P15）：2 行/个、最多 4 个、边框每行等宽（80 列下总宽 78）。
+// 夹具直接装 DelegTable，不 poll 不写屏；返回 false = 本轮红。
 fn win_round(tag: &const byte) bool {
     var ok: bool = true;
     var txt: Buf = buf_new(8192);
@@ -9836,6 +9963,8 @@ l2
     return ok;
 }
 
+// 工具内容块 / 视图轮（P14）：把一次工具调用的输入输出渲染成块，断言逐字节排版、截断与折叠。
+// 返回 false = 本轮红。
 fn view_round(tag: &const byte) bool {
     var ok: bool = true;
     var out: Buf = buf_new(16384);
@@ -10182,6 +10311,8 @@ fn resp_data(out: &Buf, payload: &const byte) bool {
     return buf_append_cstr(out, "\n\n");
 }
 
+// Responses 接口的「纯文本」流夹具：created → in_progress → output_item.added/done → completed
+// （带 usage 与 cached/reasoning 明细）。返回 false = 某帧追加失败（out 容量不够）。
 fn resp_case_text(out: &Buf) bool {
     if !resp_raw(out, "response.created", `{"type":"response.created","response":{"id":"resp_1","status":"in_progress"}}`) {
         return false;
@@ -10204,6 +10335,8 @@ fn resp_case_text(out: &Buf) bool {
     return resp_raw(out, "response.completed", `{"type":"response.completed","response":{"id":"resp_1","status":"completed","output":[],"usage":{"input_tokens":100,"input_tokens_details":{"cached_tokens":40},"output_tokens":7,"output_tokens_details":{"reasoning_tokens":3},"total_tokens":107}}}`);
 }
 
+// Responses「工具调用」流夹具：reasoning 摘要 delta + 两个 function_call 的 arguments delta，
+// 最后 completed。返回 false = 某帧追加失败。
 fn resp_case_tools(out: &Buf) bool {
     if !resp_data(out, `{"type":"response.output_item.added","output_index":0,"item":{"type":"reasoning","id":"rs_1","summary":[]}}`) {
         return false;
@@ -10245,6 +10378,8 @@ fn resp_case_tools(out: &Buf) bool {
     return resp_data(out, `{"type":"response.completed","response":{"id":"resp_2","status":"completed","output":[],"usage":{"input_tokens":50,"output_tokens":9}}}`);
 }
 
+// Responses 夹具：**故意不发** arguments delta，参数只在 output_item.done 里（有些网关如此）。
+// 断言解析器不会因此丢掉参数；返回 false = 追加失败。
 fn resp_case_args_done(out: &Buf) bool {
     if !resp_data(out, `{"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","id":"fc_9","call_id":"call_9","name":"bash","arguments":""}}`) {
         return false;
@@ -10256,6 +10391,8 @@ fn resp_case_args_done(out: &Buf) bool {
     return resp_data(out, `{"type":"response.completed","response":{"id":"resp_3","status":"completed"}}`);
 }
 
+// Responses 夹具：正文与工具参数**只在终局事件的 response.output[] 里**。
+// 返回 false = 追加失败；用来钉「终局事件也要能捞回内容」。
 fn resp_case_terminal_only(out: &Buf) bool {
     if !resp_data(out, `{"type":"response.created","response":{"id":"resp_4","status":"in_progress"}}`) {
         return false;
@@ -10264,6 +10401,8 @@ fn resp_case_terminal_only(out: &Buf) bool {
     return resp_data(out, `{"type":"response.completed","response":{"id":"resp_4","status":"completed","output":[{"type":"message","id":"msg_4","role":"assistant","status":"completed","content":[{"type":"output_text","text":"from terminal"}]},{"type":"function_call","id":"fc_4","call_id":"call_t","name":"read","arguments":"{\"file_path\":\"t.txt\"}"}],"usage":{"input_tokens":11,"output_tokens":4}}}`);
 }
 
+// Responses 夹具：先流正文，再以 `response.incomplete`（max_output_tokens）收尾。
+// 返回 false = 追加失败；钉「不完整也算收尾、usage 要读到」。
 fn resp_case_incomplete(out: &Buf) bool {
     if !resp_data(out, `{"type":"response.output_text.delta","output_index":0,"delta":"cut"}`) {
         return false;
@@ -10271,6 +10410,8 @@ fn resp_case_incomplete(out: &Buf) bool {
     return resp_data(out, `{"type":"response.incomplete","response":{"id":"resp_5","status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"usage":{"input_tokens":9,"output_tokens":3}}}`);
 }
 
+// Responses 夹具：先流正文，再以 `response.failed`（rate_limit_exceeded）收尾。
+// 返回 false = 追加失败；钉「错误码与错误文案要透出来」。
 fn resp_case_failed(out: &Buf) bool {
     if !resp_data(out, `{"type":"response.output_text.delta","output_index":0,"delta":"half"}`) {
         return false;
@@ -10278,10 +10419,14 @@ fn resp_case_failed(out: &Buf) bool {
     return resp_data(out, `{"type":"response.failed","response":{"id":"resp_6","status":"failed","error":{"code":"rate_limit_exceeded","message":"mock rate limited"}}}`);
 }
 
+// Responses 夹具：只流一帧正文，**没有任何终局事件**（对端直接断）。
+// 返回 false = 追加失败；钉「不许把半截响应当成功」。
 fn resp_case_noterminal(out: &Buf) bool {
     return resp_data(out, `{"type":"response.output_text.delta","output_index":0,"delta":"partial"}`);
 }
 
+// Responses 夹具：正文之后补一帧 `[DONE]`（少数代理会加）。
+// 返回 false = 追加失败；这一帧必须当正常收尾，不是协议错。
 fn resp_case_doneframe(out: &Buf) bool {
     if !resp_data(out, `{"type":"response.output_text.delta","output_index":0,"delta":"with done"}`) {
         return false;
@@ -10289,6 +10434,8 @@ fn resp_case_doneframe(out: &Buf) bool {
     return resp_data(out, "[DONE]");   // 少数代理会补一帧 [DONE]：必须当正常收尾
 }
 
+// Responses 夹具：网关把 /v1/responses 的流按 **chat 形状**回（choices/delta.content）。
+// 返回 false = 追加失败；解析器要能兜住这种形状。
 fn resp_case_chatshape(out: &Buf) bool {
     // 网关把 /v1/responses 的流按 chat 形状回：解析器要能兜住
     if !resp_data(out, `{"choices":[{"index":0,"delta":{"content":"chat-shaped"}}]}`) {
@@ -10325,6 +10472,8 @@ fn resp_case_callonly(out: &Buf) bool {
     return resp_data(out, `{"type":"response.completed","response":{"id":"resp_c","status":"completed","output":[],"usage":{"input_tokens":20,"output_tokens":5}}}`);
 }
 
+// Responses 夹具：正文流到一半，紧接着一帧**坏 JSON**（截断的对象）。
+// 返回 false = 追加失败；钉「坏帧之后的正文仍要保留、且要报解析错」。
 fn resp_case_badjson(out: &Buf) bool {
     if !resp_data(out, `{"type":"response.output_text.delta","output_index":0,"delta":"before-bad"}`) {
         return false;
@@ -10332,6 +10481,8 @@ fn resp_case_badjson(out: &Buf) bool {
     return resp_data(out, `{"type":"response.output_text.delta","output_index":0,`);
 }
 
+// 按 case_id 把该 case 的完整响应流（含 SSE 帧格式）写进 out。
+// 返回 false = 容量不够或未知 case_id（不会写半个 case）。
 fn resp_mock_text(case_id: i32, out: &Buf) bool {
     if case_id == RESP_CASE_TEXT {
         return resp_case_text(out);
@@ -10489,6 +10640,8 @@ fn resp_call(url: &[byte], hdrs: &[byte], body: &const Buf, o: &ChatOut) i32 {
     return 0;
 }
 
+// Responses 解析轮：按 case_id 起一个只服务这一轮的本地 TCP（mock 端点），把响应按
+// **19 字节切片**分片喂进去，然后断言事件表、非流式、请求体形状与 usage。返回 false = 本轮红。
 fn resp_round(case_id: i32, tag: &const byte) bool {
     resp_case = case_id;
     const lfd: i32 = sys_socket(AF_INET, SOCK_STREAM, IPPROTO_TCP) catch {
@@ -11066,6 +11219,8 @@ fn api_negotiate_round(tag: &const byte) bool {
     return ok;
 }
 
+// P18 思考折叠轮：订阅/取消订阅、折叠行口径、思考内容不被当成正文。
+// 返回 false = 本轮红；不联网（夹具直接喂）。
 fn think_round(tag: &const byte) bool {
     var ok: bool = true;
     var out: Buf = buf_new(4096);
@@ -11279,7 +11434,7 @@ fn reasoning_log_round(tag: &const byte, home: &const byte, ws: &const byte) boo
         ty_fail(tag, "找不到刚跑完的会话（日志没落盘？）", &ok);
         return false;
     }
-    // sess_reader_load 把路径当 C 字符串交给 sys_open（README 坑 2）：
+    // sess_reader_load 把路径当 C 字符串交给 sys_open（§16 坑 2）：
     // Buf 不带 NUL，必须自己补一个（长度照旧不带它）。
     if !buf_append_byte(&path, 0) {
         ty_fail(tag, "路径缓冲不够补 NUL", &ok);
@@ -11346,6 +11501,8 @@ fn san_path_exists(path_z: &const byte) bool {
     return (sys_access(path_z, 0) catch { -1; }) == 0;
 }
 
+// 删掉 path（C 串路径）；失败（含文件不存在）静默返回。
+// 权限/沙箱轮的清理辅助。
 fn san_unlink(path_z: &const byte) void {
     _ = sys_unlink(path_z) catch {};
 }
@@ -11583,7 +11740,7 @@ fn perm_round_run(base: &const Config, ws: &const byte, mock: i32, access: u8, s
 // P26：plan 模式的写闸门（纯函数真值表 + 端到端）
 //
 // 为什么要它：plan 模式原来只是提示词里的软引导 —— 模型可以直接开工，审阅浮窗永远不会
-// 出现（README 踩坑 36）。这一轮把闸门钉死：**全权模式下**（access = danger-full-access）
+// 出现（§16 踩坑 36）。这一轮把闸门钉死：**全权模式下**（access = danger-full-access）
 // write/edit 也必须被 plan 模式拒掉，且文件不落盘；exit_plan_mode 在管道里没有渠道时
 // 只能回「没有渠道」，绝不是批准。
 // ============================================================
@@ -11673,6 +11830,8 @@ fn plan_gate_round(base: &const Config, tag: &const byte, ws: &const byte) bool 
     return ok;
 }
 
+// perm-readonly 轮（P21）：read-only 预设下端到端跑一轮，断言 bash 逐条批准、写工具被拒、
+// 沙箱开关两态。返回 false = 本轮红；工作区由 ws 给出。
 fn perm_readonly_round(base: &const Config, tag: &const byte, ws: &const byte) bool {
     var ok: bool = true;
     if !fs_ws_prepare(ws) {
@@ -11768,6 +11927,8 @@ fn san_tool_round(base: &const Config, tag: &const byte, ws: &const byte) bool {
     return ok;
 }
 
+// 访问模式三级策略的纯函数轮（P21）：`perm_from_name` / chip 文案 / 写闸门真值表。
+// 返回 false = 本轮红；不联网、不碰终端。
 fn perm_modes_round(tag: &const byte) bool {
     var ok: bool = true;
     // 机器名 ↔ 模式（机器名必须与 DSH 的 preset key 逐字一致：设置文件直接喂进来）
@@ -11832,6 +11993,7 @@ fn perm_modes_round(tag: &const byte) bool {
 //   3) 上下文占用与 cpu/内存 的口径（stats-context / procx-parse / procx-percent / procx-mem / cpu-live）。
 // ============================================================
 
+// 统计格式化断言：got（Buf）与 C 字面量 want 逐字节比，不等就 FAIL 并把两边都打出来。
 fn stx_eq(tag: &const byte, what: &const byte, got: &const Buf, want: &const byte, ok: &bool) void {
     if !bufx_eq_cstr(got.ptr as &const byte, got.len, want) {
         out_err("selftest[");
@@ -11847,6 +12009,7 @@ fn stx_eq(tag: &const byte, what: &const byte, got: &const Buf, want: &const byt
     }
 }
 
+// 统计格式化断言：两个 Buf 逐字节比（长度先比），不等就 FAIL。
 fn stx_buf_eq(tag: &const byte, what: &const byte, got: &const Buf, want: &const Buf, ok: &bool) void {
     if got.len != want.len
         || !bufx_mem_eq(got.ptr as &const byte, want.ptr as &const byte, got.len) {
@@ -11863,6 +12026,7 @@ fn stx_buf_eq(tag: &const byte, what: &const byte, got: &const Buf, want: &const
     }
 }
 
+// 统计格式化断言：两个 i64 相等（十进制打印两边）。
 fn stx_num_eq(tag: &const byte, what: &const byte, got: i64, want: i64, ok: &bool) void {
     if got != want {
         out_err("selftest[");
@@ -11878,6 +12042,8 @@ fn stx_num_eq(tag: &const byte, what: &const byte, got: i64, want: i64, ok: &boo
     }
 }
 
+// 统计格式化断言：把 ms 经 st_fmt_duration 格式化后与 want 逐字节比。
+// 单位是**毫秒**；< 60s 一位小数、>= 60s 走 {m}m{s}s。
 fn stx_dur(tag: &const byte, what: &const byte, ms: i64, want: &const byte, ok: &bool) void {
     var b: Buf = buf_new(64);
     defer { buf_free(&b); }
@@ -11885,6 +12051,7 @@ fn stx_dur(tag: &const byte, what: &const byte, ms: i64, want: &const byte, ok: 
     stx_eq(tag, what, &b, want, ok);
 }
 
+// 统计格式化断言：把 token 数经 st_fmt_tokens 格式化后与 want 比（千分位等口径）。
 fn stx_tok(tag: &const byte, what: &const byte, n: i64, want: &const byte, ok: &bool) void {
     var b: Buf = buf_new(64);
     defer { buf_free(&b); }
@@ -11892,6 +12059,8 @@ fn stx_tok(tag: &const byte, what: &const byte, n: i64, want: &const byte, ok: &
     stx_eq(tag, what, &b, want, ok);
 }
 
+// 统计格式化断言：把 tokens/ms 经 st_fmt_tps 格式化后与 want 比（tok/s）。
+// ms 为 0 时格式化函数自己处理（不许除零）。
 fn stx_tps(tag: &const byte, what: &const byte, tokens: i64, ms: i64, want: &const byte, ok: &bool) void {
     var b: Buf = buf_new(64);
     defer { buf_free(&b); }
@@ -11899,6 +12068,8 @@ fn stx_tps(tag: &const byte, what: &const byte, tokens: i64, ms: i64, want: &con
     stx_eq(tag, what, &b, want, ok);
 }
 
+// 统计格式化断言：把 read/billed 缓存命中率经 st_fmt_cache_hit 格式化后与 want 比。
+// 格式化失败（如 billed 为 0）直接 FAIL。
 fn stx_hit(tag: &const byte, what: &const byte, read: i64, billed: i64, want: &const byte, ok: &bool) void {
     var b: Buf = buf_new(64);
     defer { buf_free(&b); }
@@ -11949,6 +12120,8 @@ fn stx_log_line(out: &Buf, seq: i64, ms: i64, typ: &const byte, data: &const byt
     _ = buf_append_cstr(out, "}");
 }
 
+// stats-format 轮：逐项比 duration / tokens / tok-s / 缓存命中率的格式化口径
+// （含边界：0、恰好 60s、负数、除零）。返回 false = 本轮红；纯函数，不联网。
 fn stats_format_round(tag: &const byte) bool {
     var ok: bool = true;
     // duration：< 60s 一位小数（整数不带小数点），>= 60s 走 "{m}m{s}s"
@@ -12116,6 +12289,8 @@ fn san_profile_round(tag: &const byte) bool {
     return ok;
 }
 
+// stats-line 轮（P18）：脚注统计行的组合（没有步数/用量时不出行、有步数、有 usage、
+// 缓存命中、压缩后口径）。返回 false = 本轮红；纯函数 + st_reset 隔离。
 fn stats_line_round(tag: &const byte) bool {
     var ok: bool = true;
     var out: Buf = buf_new(1024);
@@ -12298,6 +12473,8 @@ fn san_shell_round(tag: &const byte) bool {
     return ok;
 }
 
+// stats-fold 轮（P18）：统计行的折叠/展开与「活体 vs 回放」两份签名必须一致。
+// 返回 false = 本轮红；纯函数，不写终端。
 fn stats_fold_round(tag: &const byte) bool {
     var ok: bool = true;
     var line: Buf = buf_new(4096);
@@ -12463,6 +12640,8 @@ fn cache_burst_round(tag: &const byte) bool {
     return ok;
 }
 
+// prune-bash 轮：bash 输出的剪枝（头尾保留、中间省略、行数口径）—— 120 行 70 码点正文。
+// 返回 false = 本轮红；纯函数。
 fn prune_bash_round(tag: &const byte) bool {
     var ok: bool = true;
     var src: Buf = buf_new(24576);
@@ -12590,6 +12769,8 @@ fn prune_bash_round(tag: &const byte) bool {
     return ok;
 }
 
+// stats-context 轮：上下文占用率（四舍五入、向上夹 100、容量/分子未知返回 -1）与自动压缩阈值。
+// 返回 false = 本轮红；纯函数。
 fn stats_context_round(tag: &const byte) bool {
     var ok: bool = true;
     // 占用率：四舍五入、夹 100、缺一不可（DSH 的 contextOccupancy）
@@ -12852,6 +13033,8 @@ fn stx_stat_line(out: &Buf, pid: i64, comm: &const byte, state: &const byte, uti
     _ = buf_append_cstr(out, " 999 888 0 0 0 0 0 0 0 0" as &const byte);
 }
 
+// procx-parse 轮：/proc/<pid>/stat 的解析 —— `)` 之后第 12/13 字段是 utime/stime，
+// 但要忽略紧随的 cutime/cstime；comm 里含 `)`/空格也要对。返回 false = 本轮红。
 fn procx_parse_round(tag: &const byte) bool {
     var ok: bool = true;
     var comm: Buf = buf_new(64);
@@ -12952,6 +13135,8 @@ fn procx_parse_round(tag: &const byte) bool {
     return ok;
 }
 
+// procx-percent 轮：CPU 占用率（1 tick = 10ms；pct = Δticks*1000/Δms，可 > 100% 表示多核；
+// Δms=0 不可算返回 -1）。返回 false = 本轮红；纯函数，不读 /proc。
 fn procx_percent_round(tag: &const byte) bool {
     var ok: bool = true;
     // 1 tick = 10ms CPU；pct = Δticks * 1000 / Δms（单核百分比）
@@ -13217,6 +13402,8 @@ fn ttx_fb_eq(
     }
 }
 
+// 终端标题清洗轮（P22）：控制序列（OSC/CSI/ESC）整段丢弃、空标题兜底派生、基标题、上屏编码。
+// 返回 false = 本轮红；纯函数 + 逐字节断言。
 fn title_round(tag: &const byte) bool {
     var ok: bool = true;
 
@@ -13457,6 +13644,8 @@ fn ttc_index_title(idx_path: &const byte, id: &const byte, out: &Buf) bool {
 
 const TTC_WS: &const byte = "build/selftest_ws_title_cmd" as &const byte;
 
+// 给 /title 的端到端轮铺一份配置：沙箱关、非 TUI、安静、禁 bash，工作区/agent_home 指向
+// 本轮的假目录，模型写死 "m" 且不做 TLS 校验（离线）。调用方持有 c。
 fn ttc_cfg(c: &Config) void {
     c[0] = cfg_default();
     c.sandbox = SAN_OFF;
@@ -13474,6 +13663,8 @@ fn ttc_cfg(c: &Config) void {
     c.verify = HC_VERIFY_NONE;
 }
 
+// title-cmd 轮（P46）：/title 人类命令的端到端（设置/取消/回显）与自动起标题两条链。
+// 返回 false = 本轮红；工作区由 TTC_WS 给出。
 fn title_cmd_round(tag: &const byte) bool {
     var ok: bool = true;
     if !ws_prepare(TTC_WS) {
@@ -13765,11 +13956,14 @@ fn title_cmd_round(tag: &const byte) bool {
 // 永远得到同一份字节。逐字节断言「进度条口径 / 段落排版 / 边框等宽 / 截断与降级」。
 // ============================================================
 
+// 在 b 里找 C 字面量 lit 的首次出现，返回偏移（找不到 -1）。
+// 任务状态轮的断言辅助（b 是渲染输出）。
 fn tsx_at(b: &const Buf, lit: &const byte) isize {
     const view: &[byte] = b.ptr[0: b.len];
     return find_sub(view, lit[0: strlen(lit)], 0);
 }
 
+// 断言 b 里**含** lit：不含就 FAIL（报 what），把 ok 置 false。
 fn tsx_has(tag: &const byte, what: &const byte, b: &const Buf, lit: &const byte, ok: &bool) void {
     if tsx_at(b, lit) < 0 {
         out_err("selftest[");
@@ -13783,6 +13977,7 @@ fn tsx_has(tag: &const byte, what: &const byte, b: &const Buf, lit: &const byte,
     }
 }
 
+// 断言 b 里**不含** lit：含了就 FAIL（报 what），把 ok 置 false。
 fn tsx_no(tag: &const byte, what: &const byte, b: &const Buf, lit: &const byte, ok: &bool) void {
     if tsx_at(b, lit) >= 0 {
         out_err("selftest[");
@@ -13840,6 +14035,8 @@ fn tsx_box_widths(tag: &const byte, what: &const byte, b: &const Buf, rows: usiz
     }
 }
 
+// 往 TodoState 的第 i 项装一条任务（text + 状态）；i >= TODO_MAX 直接返回。
+// 分配的是新 Buf（调用方负责 todo_free）；n 取 max(n, i+1)。
 fn tsx_todo(t: &TodoState, i: usize, text: &const byte, st: u8) void {
     if i >= TODO_MAX {
         return;
@@ -13852,6 +14049,8 @@ fn tsx_todo(t: &TodoState, i: usize, text: &const byte, st: u8) void {
     }
 }
 
+// 往 JobTable 的第 i 项装一条作业（id/状态/退出码/多久以前/标签/输出）。
+// secs_ago 是**秒**，内部换算成毫秒时间戳（基于 ua_now_ms）；i >= JOB_MAX 直接返回。
 fn tsx_job(t: &JobTable, i: usize, id: i32, st: u8, code: i32, secs_ago: u64,
            label: &const byte, out_text: &const byte, trunc: bool) void {
     if i >= JOB_MAX {
@@ -13877,6 +14076,8 @@ fn tsx_job(t: &JobTable, i: usize, id: i32, st: u8, code: i32, secs_ago: u64,
     _ = buf_append_cstr(&j.buf, out_text);
 }
 
+// 往 DelegTable 的第 i 项装一个子代理（id/kind/状态/多久以前/标签/输出行数）。
+// secs_ago 是**秒**；out_lines 行 "line" 铺输出；i >= DELEG_MAX 直接返回。
 fn tsx_agent(t: &DelegTable, i: usize, id: i32, kind: u8, st: u8, secs_ago: u64,
              label: &const byte, out_lines: usize) void {
     if i >= DELEG_MAX {
@@ -13911,6 +14112,8 @@ fn tsx_agent(t: &DelegTable, i: usize, id: i32, kind: u8, st: u8, secs_ago: u64,
     }
 }
 
+// 往 Goal 里装一份 fixture（phase / round / max_rounds / objective）。
+// 只写字段不做校验；调用方负责 goal_free。
 fn tsx_goal(g: &Goal, phase: &const byte, round: i32, max_rounds: i32, objective: &const byte) void {
     g.active_state = true;
     g.id = 1;
@@ -13923,6 +14126,8 @@ fn tsx_goal(g: &Goal, phase: &const byte, round: i32, max_rounds: i32, objective
     g.max_rounds = max_rounds;
 }
 
+// 任务状态轮（P22，纯函数）：进度条口径、折叠行、箱体排版、边框等宽、截断与降级。
+// 夹具 + 显式 now_ms，同一输入必须同一字节；返回 false = 本轮红。
 fn tasks_render_round(tag: &const byte) bool {
     var ok: bool = true;
     const now: u64 = ua_now_ms();
@@ -14007,7 +14212,7 @@ fn tasks_render_round(tag: &const byte) bool {
     tsx_todo(&t, 0, "写 src/tasks.uya（聚合 + 文本 + 快照推送）" as &const byte, TD_COMPLETED);
     tsx_todo(&t, 1, "接进 TUI 浮层与常驻块" as &const byte, TD_COMPLETED);
     tsx_todo(&t, 2, "补自测轮与 make 目标" as &const byte, TD_INPROGRESS);
-    tsx_todo(&t, 3, "把 README 第 6 节的验收表补齐" as &const byte, TD_PENDING);
+    tsx_todo(&t, 3, "把 doc-audit 的告警清零" as &const byte, TD_PENDING);
 
     var j: JobTable = JobTable{ items: [], next_id: 3 };
     jobs_init(&j);
@@ -14076,7 +14281,7 @@ fn tasks_render_round(tag: &const byte) bool {
     tsx_has(tag, "百分比", &b, "50%" as &const byte, &ok);
     tsx_has(tag, "进度条进箱体", &b, "██████████░░░░░░░░░░" as &const byte, &ok);
     tsx_has(tag, "进行中字形", &b, "▸ 补自测轮与 make 目标" as &const byte, &ok);
-    tsx_has(tag, "待办字形", &b, "· 把 README 第 6 节的验收表补齐" as &const byte, &ok);
+    tsx_has(tag, "待办字形", &b, "· 把 doc-audit 的告警清零" as &const byte, &ok);
     tsx_has(tag, "完成字形", &b, "✓ 接进 TUI 浮层与常驻块" as &const byte, &ok);
     tsx_has(tag, "后台任务段", &b, "后台任务" as &const byte, &ok);
     tsx_has(tag, "跑中的 job", &b, "● job-1 [bash] running " as &const byte, &ok);
@@ -14125,7 +14330,7 @@ fn tasks_render_round(tag: &const byte) bool {
     tsx_has(tag, "报告含子代理行", &b, "● sub-1 [subagent] running " as &const byte, &ok);
     tsx_has(tag, "报告含提示行", &b, "ctrl+t 展开/收起常驻块" as &const byte, &ok);
     const at_ip: isize = tsx_at(&b, "▸ 补自测轮与 make 目标" as &const byte);
-    const at_pd: isize = tsx_at(&b, "· 把 README 第 6 节的验收表补齐" as &const byte);
+    const at_pd: isize = tsx_at(&b, "· 把 doc-audit 的告警清零" as &const byte);
     const at_cp: isize = tsx_at(&b, "✓ 写 src/tasks.uya（聚合 + 文本 + 快照推送）" as &const byte);
     if at_ip < 0 || at_pd < 0 || at_cp < 0 {
         ty_fail(tag, "报告里少了清单条目", &ok);
@@ -14300,6 +14505,7 @@ fn ttk_clear_fixtures() void {
 //              三栏内容、行号、增删计数、切换/夹取、刷新、文本回退、非仓库报错
 // ============================================================
 
+// b 是否恰好等于 C 字面量 lit（长度先比；两者都空也算相等）。diff 行表的断言辅助。
 fn dp_eq(b: &const Buf, lit: &const byte) bool {
     const n: usize = bufx_cstr_len(lit);
     if b.len != n {
@@ -14319,6 +14525,7 @@ fn dp_cell(b: &Buf, i: usize, side: u8) void {
     _ = buf_append(b, p, len);
 }
 
+// 第 i 行的 kind（上下文/加/删/空）。越界或 gd_row_meta 失败返回 255（不是合法的 kind）。
 fn dp_kind(i: usize) u8 {
     var r: GdRow = GdRow{ l_off: 0, l_len: 0, r_off: 0, r_len: 0, l_no: 0, r_no: 0, kind: 255 };
     if !gd_row_meta(i, &r) {
@@ -14327,6 +14534,8 @@ fn dp_kind(i: usize) u8 {
     return r.kind;
 }
 
+// 取第 i 行的左右行号写进 lno/rno（0 表示该侧没有这一行）。
+// 返回 false = 越界或取不到元数据（此时不动输出参数）。
 fn dp_nos(i: usize, lno: &usize, rno: &usize) bool {
     var r: GdRow = GdRow{ l_off: 0, l_len: 0, r_off: 0, r_len: 0, l_no: 0, r_no: 0, kind: 255 };
     if !gd_row_meta(i, &r) {
@@ -14401,6 +14610,8 @@ fn wst_back(root: &const Buf) void {
     _ = sys_chdir(&rz.ptr[0] as *const byte) catch {};
 }
 
+// 给工作区轮（ws-resolve / ws-tool）铺假目录与 index.jsonl fixture。
+// 返回 false = 建目录/写索引失败，本轮应直接判红。
 fn wst_prepare() bool {
     _ = sess_mkdir_p(WST_HOME);
     _ = sess_mkdir_p(WST_A);
@@ -14652,7 +14863,7 @@ fn ws_resolve_round(tag: &const byte) bool {
 // 于是每行拿到的 view.len ≈ 真实行长 + pos，`sess_has_cstr` 会一直往后读过本行：
 //   * 小日志：只是**静默越过本行**做匹配，最后一条 session/workspace 可能被错过；
 //   * 大日志：data 缓冲（cap 到 1–2 MiB 时经 realloc 走 mmap）读到映射尾就 SIGSEGV ——
-//     真机 913690 字节的会话一 `/resume` 必崩（rc=139），见了 README 踩坑 54 的 gdb/valgrind 证据。
+//     真机 913690 字节的会话一 `/resume` 必崩（rc=139），见了 §16 踩坑 54 的 gdb/valgrind 证据。
 //
 // 这一轮把两个后果**都**钉死：
 //   1) 语义：最后一条 session/workspace（写在文件**后半段**，前缀早就超过那个越界窗口的起点）
@@ -14745,6 +14956,8 @@ fn smb_write_log() bool {
     return write_all_fd(fd, partial.ptr as &const byte, partial.len);
 }
 
+// sess-meta-big 轮（P35）：大日志上 sess_read_meta 不许段错误 —— 事件被按字节截断时
+// 只能返回「读不出」，不能崩。返回 false = 本轮红；日志 fixture 自己写。
 fn sess_meta_big_round(tag: &const byte) bool {
     var ok: bool = true;
     if !smb_write_log() {
@@ -15067,6 +15280,8 @@ fn ws_tool_round(tag: &const byte, base: &const Config) bool {
     return ok;
 }
 
+// diff-parse 轮：unified diff → 行表的纯函数（上下文/配对/落单/溢出/CRLF/二进制/
+// mode-only/非 diff 文本/空输入），不碰 git、不碰 TUI。返回 false = 本轮红。
 fn diff_parse_round(tag: &const byte) bool {
     var ok: bool = true;
     gd_reset();
@@ -15372,7 +15587,7 @@ fn diff_parse_round(tag: &const byte) bool {
 const DG_WS: &const byte = "build/selftest_diff_ws" as &const byte;
 
 // 绝对/相对路径 + **末尾 NUL**（sys_open 收的是 C 字符串：漏了 NUL 就会把缓冲区后面的
-// 垃圾当路径的一部分 —— README 坑 2 反复踩过，这里连 fixture 文件名都被污染过）
+// 垃圾当路径的一部分 —— §16 坑 2 反复踩过，这里连 fixture 文件名都被污染过）
 fn dg_path(rel: &const byte, out: &Buf) void {
     buf_reset(out);
     _ = buf_append_cstr(out, DG_WS);
@@ -15380,6 +15595,8 @@ fn dg_path(rel: &const byte, out: &Buf) void {
     _ = buf_append_cstr_z(out, rel);
 }
 
+// diff-git 轮的 git 执行器：跑 gitx_run，stdout/stderr 各 4 KiB 丢弃。
+// 返回 git 的退出码（0 = 成功）；argv 以 null 结尾。
 fn dg_run(argv: &(&const byte)) i32 {
     var o: Buf = buf_new(4096);
     defer { buf_free(&o); }
@@ -15388,6 +15605,8 @@ fn dg_run(argv: &(&const byte)) i32 {
     return gitx_run(null as &const byte, argv, &o, &e, 4096);
 }
 
+// 同 dg_run，但把 stderr 交给调用方（断言错误文案用）。
+// 返回 git 的退出码；errout 不扩容，超出即截断。
 fn dg_run2(argv: &(&const byte), errout: &Buf) i32 {
     var o: Buf = buf_new(4096);
     defer { buf_free(&o); }
@@ -15477,6 +15696,8 @@ export fn dg_fixture_empty() bool {
     return dg_run(&av[0]) == 0;
 }
 
+// diff-git 轮（P26）：真 git 造 fixture 仓，断言文件列表、三栏内容、行号、增删计数、
+// 切换/夹取、刷新、文本回退、非仓库报错。本机没 git 就 skip（返回 true）；返回 false = 本轮红。
 fn diff_git_round(tag: &const byte) bool {
     var ok: bool = true;
     gd_reset();
@@ -15778,6 +15999,7 @@ fn gcr_has(tag: &const byte, what: &const byte, b: &const Buf, lit: &const byte,
     }
 }
 
+// 断言 b 里**不含** lit（goal 命令轮的输出检查）；命中就 FAIL 并置 ok=false。
 fn gcr_no(tag: &const byte, what: &const byte, b: &const Buf, lit: &const byte, ok: &bool) void {
     if contains(b, lit) {
         out_err("selftest[");
@@ -15791,6 +16013,7 @@ fn gcr_no(tag: &const byte, what: &const byte, b: &const Buf, lit: &const byte, 
     }
 }
 
+// 断言两个返回码相等（goal 命令轮的 rc 检查）；不等就 FAIL 并把两值都打出来。
 fn gcr_rc(tag: &const byte, what: &const byte, got: i32, want: i32, ok: &bool) void {
     if got != want {
         out_err("selftest[");
@@ -15824,6 +16047,8 @@ fn gcr_peek(c: &const Config, g: &Goal) bool {
     return goal_load(c, g);
 }
 
+// goal-cmd 轮（P29，纯函数为主）：/goal 的语法、措辞、状态机与落盘（goal.json）。
+// 返回 false = 本轮红；先用 goal_clear 清上一轮残留。
 fn goal_cmd_round(tag: &const byte) bool {
     var ok: bool = true;
     const home: &const byte = "build/selftest_goal_home" as &const byte;
@@ -16035,12 +16260,14 @@ fn mx_set_home() void {
     _ = agent_set_dsh_home(hb.ptr[0: hb.len]);
 }
 
+// 给模型目录轮写一份只含关心几节的 settings.yaml（真机那份一直在长，不能当断言基准）。
+// 返回 false = 建目录或写文件失败。
 fn mx_fixture_write() bool {
     _ = sess_mkdir_p(MX_HOME);
     var p: Buf = buf_new(256);
     defer { buf_free(&p); }
     // 注意：只有**最后**一段能用 append_cstr_z（它会把 NUL 也写进缓冲，
-    // 后面的追加就落在 NUL 之后 —— README 里反复踩过的那条）
+    // 后面的追加就落在 NUL 之后 —— §16 里反复踩过的那条）
     _ = buf_append_cstr(&p, MX_HOME);
     _ = buf_append_cstr_z(&p, "/settings.yaml");
     const body: &const byte = "llm-pi-ai:\n  providers:\n    {\n      alpha:\n        {\n          api: openai-responses,\n          baseURL: https://alpha.example/v1,\n          apiKeyEnv: ALPHA_KEY,\n          compat: { supportsDeveloperRole: false },\n          models:\n            [\n              { id: a-one, name: A One, contextWindow: 111000, input: [ text, image ] },\n              { id: a-two, contextWindow: 222000, maxTokens: 4096, reasoningEfforts: { off: none, low: low, high: high } }\n            ]\n        },\n      beta:\n        {\n          api: openai-completions,\n          baseURL: https://beta.example/v1,\n          models:\n            [\n              { id: b-plain, reasoningEfforts: false },\n              { id: b-think, reasoningEfforts: { minimal: minimal, high: high, xhigh: xhigh } }\n            ]\n        }\n    }\n" as &const byte;
@@ -16369,6 +16596,8 @@ fn wt_ws_pid(out: &Buf) void {
     _ = buf_append_i64(out, pid);
 }
 
+// worktree 轮的 git 执行器：跑 gitx_run，stdout 丢弃，stderr 交给调用方。
+// 返回 git 的退出码；argv 以 null 结尾，errout 不扩容。
 fn wt_test_git(argv: &(&const byte), errout: &Buf) i32 {
     var o: Buf = buf_new(8192);
     defer { buf_free(&o); }
@@ -16787,6 +17016,8 @@ fn worktree_discard_round(tag: &const byte) bool {
 // 于是「这一轮建的一定是新的」。返回的名字（不带 dsh/ 前缀）写进 out_slug，供断言用。
 var g_wt_residue_seq: i32 = 0;
 
+// 给残留 worktree 轮的 slug 加**进程内单调序号**，避免与上一轮同名（同名会让
+// `worktree add -b <同名>` 直接失败）。结果（不带 dsh/ 前缀）写进 out_slug，每轮调用一次。
 fn wt_residue_slug(slug: &const byte, out_slug: &Buf) void {
     g_wt_residue_seq = g_wt_residue_seq + 1;
     buf_reset(out_slug);
@@ -16868,6 +17099,8 @@ fn wt_branch_gone(repo: &const Buf, br: &const byte) bool {
     return wt_test_git(&av[0], &o) != 0;   // 非零 = 找不到这个 ref
 }
 
+// worktree-reclaim 轮（P49）：残留 worktree 的回收判据 —— 干净零提交才清，
+// 有改动 / 有提交 / 有人用一律留。本机没 git 就 skip（返回 true）；返回 false = 本轮红。
 fn worktree_reclaim_round(tag: &const byte) bool {
     var ok: bool = true;
     if !gitx_available() {
@@ -17310,6 +17543,9 @@ fn worktree_reclaim_round(tag: &const byte) bool {
     return ok;
 }
 
+// --selftest 的总入口（agent.uya 里一行调用）：先关 worktree 模式，再按 `UYA_SELFTEST_*_ONLY`
+// 环境变量分流到单轮调试入口，否则顺序跑全部轮次。
+// 返回 AGENT_OK / AGENT_PROTO；任一硬轮失败即 FAIL（判定码只用低 8 位，见踩坑 89）。
 export fn selftest_main(base: &const Config) i32 {
     _ = base;
     // P37：worktree 模式在自测里必须**从关开始**。真机的 DSH 设置（agent-presets.default=

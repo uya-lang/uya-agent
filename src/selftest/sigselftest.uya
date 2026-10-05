@@ -1,4 +1,17 @@
-// src/sigselftest.uya — 信号层（src/sigx.uya）的离线自测轮次（P0 / P1）
+// src/selftest/sigselftest.uya — 信号层（src/sigx.uya）的离线自测轮次（P0 / P1）
+//
+// 本文件：信号层的四个离线轮：`SigxAction` 的 glibc 布局与恢复序列四种形状（sig-abi）、处理器真被
+//   调用且返回后进程存活（sig-basic）、SIGTERM 先写恢复序列再退出 143（sig-term-restore）、fork
+//   子进程重置处置后不写父进程终端（sig-child-reset），以及它们用的输出/断言小工具。
+// 不变量：① `SigxAction` 必须是**宿主 glibc** 的布局（152 字节；handler@0、flags@136、restorer@144）
+//   —— 布局错了等于把垃圾交给 sigaction，进程可能直接 139；② 恢复序列必须**逐字节**等于期望的
+//   N 字节（含关鼠标上报 ×2 + 关括起粘贴 + 复位 + 显示光标 + 弹标题栈 + 离开备用屏幕的顺序），
+//   顺序错终端会烂在备用屏幕/raw 模式；③ 子进程重置处置后一个字节都不许写父进程的输出 fd；
+//   ④ 判定码只用低 8 位（子进程 `sys_exit` 会截断，踩坑 89）。
+// 依赖：libc.syscall/unistd（fork / waitpid / pipe2 / poll / write / read）、foundation/bufx、本仓
+//   session/sigx（`sigx_arm` / `sigx_seq_len` / `sigx_seq_at` / `sigx_install` 等）。
+// 命名：对外只有 `sigx_selftest_all`（selftest_main 里一行调用）与 SIGUSR1 处理器 `sigw_usr1_handler`；
+//   其余私有：`sig_*_round`（轮次）、`sigw_*`（断言 / 输出 / 序列比对小工具）。
 //
 // 轮次：
 //   sig-abi            SigxAction 必须是**宿主 glibc** 的布局（152 字节；handler@0、
@@ -79,11 +92,15 @@ fn sigw_seq_is(want: &const byte, n: usize) bool {
     return true;
 }
 
+// 把 i64 安全窄化成 i32：越界时返回 -1（不 panic）。
+// 只给 fork/getpid 这类系统调用返回值用；真实值不会撞上 -1。
 fn sigw_i32(v: i64) i32 {
     const r: !i32 = v as! i32;
     return r catch { -1; };
 }
 
+// 断言失败：往 fd 2 打 `selftest[tag] FAIL: what`，并把 *ok 置 false。
+// shellselftest 也复用它，两边输出口径必须一致；写失败被吞掉（诊断不能反过来打断测试）。
 fn sigw_fail(tag: &const byte, what: &const byte, ok: &bool) void {
     sigw_puts("selftest[" as &const byte);
     sigw_puts(tag);
@@ -93,6 +110,8 @@ fn sigw_fail(tag: &const byte, what: &const byte, ok: &bool) void {
     ok[0] = false;
 }
 
+// 把无符号数按十进制写到 fd 2（断言里的「实际 = N」用）。
+// 内部缓冲 24 字节：够 usize 全量；写失败静默。
 fn sigw_num(v: usize) void {
     var tmp: [byte: 24] = [0: 24];
     var n: usize = v;
@@ -117,6 +136,8 @@ fn sigw_num(v: usize) void {
     _ = sys_write(2, &rev[0] as *const byte, k) catch {};
 }
 
+// 把一条 C 串写到 fd 2（长度按 NUL 算，见 bufx_cstr_len）。
+// shellselftest 也复用；写入失败被吞掉。
 fn sigw_puts(p: &const byte) void {
     _ = sys_write(2, p as *const byte, bufx_cstr_len(p)) catch {};
 }
@@ -162,6 +183,9 @@ fn sigw_read_all(fd: i32, out: &Buf) usize {
 // sig-abi
 // ============================================================
 
+// sig-abi 轮：`SigxAction` 必须是**宿主 glibc** 的布局（152 字节；handler@0、flags@136、
+// restorer@144），并逐字节核对恢复序列的四种形状（带/不带备用屏幕 × 带/不带弹标题栈）。
+// 布局错 = 把垃圾交给 sigaction；顺序错 = 终端烂在备用屏幕。返回 false 即本轮红。
 fn sig_abi_round(tag: &const byte) bool {
     var ok: bool = true;
 
@@ -249,10 +273,14 @@ fn sig_abi_round(tag: &const byte) bool {
 
 var g_sigw_hits: usize = 0;
 
+// 测试用 SIGUSR1 处理器：只把命中计数 +1（信号上下文里不做别的事）。
+// sig_basic_round 先清零 g_sigw_hits，发 SIGUSR1 后断言恰好 1 —— 处理器没跑不可能只靠计数分辨。
 export fn sigw_usr1_handler(sig: i32) void {
     g_sigw_hits = g_sigw_hits + 1;
 }
 
+// sig-basic 轮：处理器装上后真的被调用、返回之后进程还活着（P0 的回归闸门：
+// 缺 SA_RESTORER 的实现在这里直接 139）；顺带验 SIGWINCH 只置标志、取用即清零。
 fn sig_basic_round(tag: &const byte) bool {
     var ok: bool = true;
     g_sigw_hits = 0;
@@ -297,6 +325,8 @@ fn sig_basic_round(tag: &const byte) bool {
 // sig-term-restore：SIGTERM → 写恢复序列 → 退出 143
 // ============================================================
 
+// sig-term-restore 轮：fork 子进程装终止处理器 + 登记恢复信息后给自己发 SIGTERM。
+// 父进程断言子进程以 143 退出，且往管道写出的恢复序列**恰好 42 字节**（先恢复终端再退出）。
 fn sig_term_round(tag: &const byte) bool {
     var ok: bool = true;
     var fds: [i32: 2] = [0: 2];
@@ -364,6 +394,8 @@ fn sig_term_round(tag: &const byte) bool {
 // sig-child-reset：fork 子进程重置处置后不再写父进程的终端
 // ============================================================
 
+// sig-child-reset 轮：fork 子进程重置信号处置后，SIGTERM 按**默认处置**死掉，
+// 且一个字节都不许往父进程的输出 fd 上写（否则子代理被杀会把父进程的终端擦掉）。
 fn sig_child_reset_round(tag: &const byte) bool {
     var ok: bool = true;
     var fds: [i32: 2] = [0: 2];
@@ -466,6 +498,8 @@ fn sig_child_reset_round(tag: &const byte) bool {
 // 对外入口：selftest_main 里一行调用
 // ============================================================
 
+// 对外入口：按序跑 sig-abi / sig-basic / sig-term-restore / sig-child-reset 四轮，
+// 任一红即返回 false。selftest_main 里一行调用。
 export fn sigx_selftest_all() bool {
     var ok: bool = true;
     if !sig_abi_round("sig-abi" as &const byte) {
