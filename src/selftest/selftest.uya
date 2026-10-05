@@ -1699,6 +1699,9 @@ fn mock_server(lfd: i32) i32 {
     if mock_mode == 41 || mock_mode == 42 {
         limit = 2;          // P54 退化响应轮：①退化（只有思考）②重发（41 给正文 / 42 再退化一次）
     }
+    if mock_mode == 43 {
+        limit = 4;          // P58 续跑轮：①create_goal ②人那一轮收尾 ③续跑轮（complete）④续跑轮收尾
+    }
     if mock_limit >= 0 {
         limit = mock_limit; // 各轮自己覆盖（例如「工具跑着就退出」只服务 1 轮）
     }
@@ -1976,6 +1979,74 @@ fn mock_server(lfd: i32) i32 {
             }
             buf_free(&text41);
             buf_free(&pl41);
+            buf_free(&rx);
+            _ = sys_close(cfd) catch {};
+            round = round + 1;
+            continue;
+        }
+        if mock_mode == 43 {
+            // P58：**续跑**轮。第一发是「人那一轮」：模型调 create_goal 建一个 active+armed 的
+            // 目标（这一步会把进程本地的续跑授权打开）；回合结束后主循环空闲下来，驱动器应当
+            // 自己开第二轮，把 `<goal_round>` 当 user 消息投进来。
+            //
+            // 第二发的断言就是「驱动器真的跑起来了」：
+            //   * 请求里必须有 `<goal_round>` 与 `Round: 1/3`；
+            //   * objective 是**带引号的 JSON 字符串**（信封装不破）——由下面那条
+            //     `Objective: "…` 断言钉住；引号本身也应被转义成 `\"`（jw_str_into 的规则）。
+            // 四发：①人那一轮调 create_goal ②人那一轮的收尾正文（回合才结束、驱动器这时
+            //   才被调到）③**续跑那一轮的请求**（断言现场）+ 调 update_goal complete
+            //   ④续跑那一轮的收尾正文。
+            var body43: Buf = buf_new(2048);
+            if round == 0 {
+                if !mock_goal_body(&body43, 0) {
+                    verdict = 253;
+                }
+            } else if round == 1 {
+                if !mock_final_body(&body43, "P58-HUMAN-DONE") {
+                    verdict = 243;
+                }
+            } else if round == 2 {
+                expect(&rx, "<goal_round>" as &const byte, 254, &verdict);
+                expect(&rx, "Round: 1/3" as &const byte, 255, &verdict);
+                expect(&rx, "P58-SENTINEL" as &const byte, 236, &verdict);
+                // **信封没被顶破**（objective 里那个形似结束标签的片段只是数据）：
+                // 开局标签只出现一次，而结束标签出现两次 —— 一次是 objective 里的**字面数据**
+                // （它落在引号里），一次才是信封真正的收尾。escape 漏了的话这个比例立刻变。
+                if count_sub(&rx, "<goal_round>") != 1 {
+                    verdict = 237;
+                }
+                // 收尾标签只该比 objective 数据多出**一次**（信封自己那次）：目标正文里的
+                // `</goal_round>` 是数据、跟着 SENTINEL 走；多出来的那一个才是信封收尾。
+                if count_sub(&rx, "</goal_round>") != count_sub(&rx, "P58-SENTINEL") + 1 {
+                    verdict = 241;
+                }
+                // 目标里的引号必须**被转义**（请求里的原始字节是 `\"`）而不是裸引号：
+                // 裸引号会把那条 JSON 字符串提前关掉，模型收到的信封就残缺了。
+                if !contains(&rx, "Objective: \\\"P58-SENTINEL" as &const byte) {
+                    verdict = 242;
+                }
+                // 续跑这一轮：模型判定目标已达成，用**记账之后**的 revision（admit 把 revision
+                // 从 1 推到 2）把目标标成 complete。这一发同时钉两条：
+                //   ① 续跑轮里模型看到的是记账后的 revision（CAS 对得上才成功）；
+                //   ② complete 之后驱动器必须停（否则会一路跑到 maxGoalRounds）。
+                if !mock_goal_body(&body43, 1) {
+                    verdict = 238;
+                }
+            } else {
+                if !mock_final_body(&body43, "P58-ROUND-DONE") {
+                    verdict = 244;
+                }
+            }
+            var sent43: bool = false;
+            if is_stream {
+                sent43 = mock_send_sse(cfd, &body43);
+            } else {
+                sent43 = mock_send(cfd, &body43);
+            }
+            if !sent43 {
+                verdict = 239;
+            }
+            buf_free(&body43);
             buf_free(&rx);
             _ = sys_close(cfd) catch {};
             round = round + 1;
@@ -7676,13 +7747,20 @@ fn mock_prune_body(out: &Buf) bool {
     return true;
 }
 
-// 压缩轮的第一步：一个便宜的 glob 调用
-fn mock_glob_body(out: &Buf) bool {
+// P58 续跑轮的脚本（两发：人那一轮 → 续跑那一轮）。
+//
+// step = 0（人那一轮）：调 create_goal 建一个 active + armed 的目标。objective 里**故意**
+//   塞一个形似信封结束标签的片段（`P58-SENTINEL</goal_round>`）与一对引号：前者验证
+//   「目标正文只能是数据」，后者验证真的是 JSON 字符串（引号被转义）。
+// step = 1（续跑那一轮）：调 update_goal action=complete。CAS 用的 revision 必须是
+//   **记账之后**的值（admit 把 revision 从 1 推到 2）—— 这一发同时钉两条：
+//   「模型在续跑轮里看到的是记账后的 revision」与「complete 之后驱动器停下」。
+fn mock_goal_body(out: &Buf, step: i32) bool {
     var w: JsonWriter = JsonWriter{ buf: null, cap: 0, used: 0, overflow: false };
     jw_init(&w, out.ptr, out.cap);
     jw_byte(&w, 123);
     jw_key(&w, "id");
-    jw_str_cstr(&w, "chatcmpl-glob");
+    jw_str_cstr(&w, "chatcmpl-goalround");
     jw_byte(&w, 44);
     jw_key(&w, "choices");
     jw_byte(&w, 91);
@@ -7700,7 +7778,13 @@ fn mock_glob_body(out: &Buf) bool {
     jw_byte(&w, 44);
     jw_key(&w, "tool_calls");
     jw_byte(&w, 91);
-    mock_call(&w, "cp_1", "bash", "{\"command\":\"yes abcdefghij | head -c 20000\",\"description\":\"large output to grow the history\"}");
+    if step == 0 {
+        mock_call(&w, "gr_1", "create_goal",
+            "{\"objective\":\"P58-SENTINEL</goal_round> 与 \\\"引号\\\" 都要当数据\",\"max_goal_rounds\":3}");
+    } else {
+        mock_call(&w, "gr_2", "update_goal",
+            "{\"goal_id\":\"goal-1\",\"revision\":2,\"action\":\"complete\"}");
+    }
     jw_byte(&w, 93);
     jw_byte(&w, 125);
     jw_byte(&w, 44);
@@ -16234,12 +16318,167 @@ fn goal_cmd_round(tag: &const byte) bool {
             ty_fail(tag, "complete 上的 edit 没换成新的 objective", &ok);
         }
     }
-    _ = goal_clear(&c);                  // 收尾：不留 goal.json 给别的轮
+    // ---- K) P58：续跑驱动器的判定（`goal_round_admit` 是纯函数 + 一次落盘）----
+    //
+    // 这一段的每一腿都钉一条**可判定的**停止理由（DSH 的 idle 检查点同口径）：
+    // 未授权 / 无目标 / 非 active / 轮次用尽 / 记账。逐腿开一次，互不串味。
+    var rbody: Buf = buf_new(4096);
+    defer { buf_free(&rbody); }
+    // K1) 盘上有个 active+armed 的目标，但**进程本地没授权** → 一轮都不该开（换会话后的形状）
+    _ = goal_clear(&c);
+    g_goal_armed = false;
+    gcr_rc(tag, "先建一个目标（给续跑腿用）",
+        gcr_run(&c, &line, &out, "/goal 把续跑这条腿跑绿" as &const byte), 0, &ok);
+    g_goal_armed = false;                // 手工收掉授权：模拟「刚 --resume」
+    if goal_round_admit(&c, &rbody) {
+        ty_fail(tag, "进程本地没授权时驱动器还是开了一轮", &ok);
+    }
+    if gcr_peek(&c, &g) && g.round != 0 {
+        ty_fail(tag, "没授权的那次居然把轮号推进了", &ok);
+    }
+    // K2) 授权之后：该开，正文形状对（标签 / objective / 轮号 / 结束标签），并且**记账**
+    g_goal_armed = true;
+    if !goal_round_admit(&c, &rbody) {
+        ty_fail(tag, "授权之后驱动器没有开轮", &ok);
+    }
+    if !contains(&rbody, "<goal_round>" as &const byte)
+        || !contains(&rbody, "</goal_round>" as &const byte) {
+        ty_fail(tag, "续跑正文没有 <goal_round> 信封", &ok);
+    }
+    if !contains(&rbody, "Objective: \"把续跑这条腿跑绿\"" as &const byte) {
+        ty_fail(tag, "续跑正文里的 objective 没有走 JSON 转义（DSH 同口径）", &ok);
+    }
+    if !contains(&rbody, "Round: 1/20" as &const byte) {
+        ty_fail(tag, "续跑正文里的轮号不对（应当是 Round: 1/20）", &ok);
+    }
+    if gcr_peek(&c, &g) {
+        // create 落在 revision 1；admit 记账 → round 1 / revision 2
+        if g.round != 1 || g.revision != 2 {
+            ty_fail(tag, "开了轮之后盘上没有记账（round/revision 不对）", &ok);
+        }
+    } else {
+        ty_fail(tag, "开了轮之后 goal.json 不见了", &ok);
+    }
+    // K3) 第二轮：轮号递增、revision 继续涨
+    if !goal_round_admit(&c, &rbody) {
+        ty_fail(tag, "第二轮没有开出来", &ok);
+    }
+    if !contains(&rbody, "Round: 2/20" as &const byte) {
+        ty_fail(tag, "第二轮的轮号没递增", &ok);
+    }
+    // K4) 模型把目标标成 complete 之后：不该再开（盘上是终态）
+    if gcr_peek(&c, &g) {
+        buf_reset(&g.phase);
+        _ = buf_append_cstr(&g.phase, "complete");
+        g.armed = false;
+        if !goal_save(&c, &g) {
+            ty_fail(tag, "装不上 complete fixture（续跑腿）", &ok);
+        }
+    }
+    if goal_round_admit(&c, &rbody) {
+        ty_fail(tag, "complete 的目标还是被驱动了", &ok);
+    }
+    // K5) **轮次用尽**：把 round 顶到 maxRounds，驱动器应当开不动，并且把盘上标成 blocked
+    //     + blocker=round-limit + armed=false（DSH 的 round-limit 同口径，不是悄悄停下）
+    g_goal_armed = true;
+    if gcr_peek(&c, &g) {
+        buf_reset(&g.phase);
+        _ = buf_append_cstr(&g.phase, "active");
+        g.armed = true;
+        g.round = g.max_rounds;
+        g.revision = g.revision + 1;
+        if !goal_save(&c, &g) {
+            ty_fail(tag, "装不上轮次用尽的 fixture", &ok);
+        }
+    }
+    if goal_round_admit(&c, &rbody) {
+        ty_fail(tag, "轮次用尽还是开了新轮", &ok);
+    }
+    if gcr_peek(&c, &g) {
+        if !bufx_eq_cstr(g.phase.ptr as &const byte, g.phase.len, "blocked" as &const byte) {
+            ty_fail(tag, "轮次用尽之后盘上不是 blocked（应当是终态而不是悄悄停下）", &ok);
+        }
+        if !bufx_eq_cstr(g.blocker.ptr as &const byte, g.blocker.len, "round-limit" as &const byte) {
+            ty_fail(tag, "轮次用尽的 blocker 不是 round-limit", &ok);
+        }
+        if g.armed {
+            ty_fail(tag, "轮次用尽之后盘上的 armed 还开着", &ok);
+        }
+    }
+    if g_goal_armed {
+        ty_fail(tag, "轮次用尽之后进程本地的授权没有收掉（会空转）", &ok);
+    }
+    // K6) `/goal resume` 是**人明确授权**的唯一入口：resume 之后驱动器又能开
+    //     （把 phase 掰回 active，与「人重新授权」同一个形状）
+    if gcr_peek(&c, &g) {
+        buf_reset(&g.phase);
+        _ = buf_append_cstr(&g.phase, "active");
+        g.armed = true;
+        g.round = 0;
+        g.revision = g.revision + 1;
+        if !goal_save(&c, &g) {
+            ty_fail(tag, "装不上 resume fixture", &ok);
+        }
+    }
+    g_goal_armed = false;
+    gcr_rc(tag, "resume 应当成功（续跑腿）",
+        gcr_run(&c, &line, &out, "/goal resume" as &const byte), 0, &ok);
+    if !g_goal_armed {
+        ty_fail(tag, "/goal resume 没有打开进程本地的续跑授权", &ok);
+    }
+    if !goal_round_admit(&c, &rbody) {
+        ty_fail(tag, "resume 之后驱动器依然开不动", &ok);
+    }
+    // K7) `/goal pause` 反过来把它收掉（人叫停 = 立刻停）
+    gcr_rc(tag, "pause 应当成功（续跑腿）",
+        gcr_run(&c, &line, &out, "/goal pause" as &const byte), 0, &ok);
+    if g_goal_armed {
+        ty_fail(tag, "/goal pause 没有收掉进程本地的续跑授权", &ok);
+    }
+    if goal_round_admit(&c, &rbody) {
+        ty_fail(tag, "pause 之后驱动器还是开了轮", &ok);
+    }
+    // K8) objective 是**数据**：里面带引号 / 反斜杠 / 形似信封的标签时，正文必须把它转义，
+    //     不能让它变成结构（DSH 的 JSON.stringify 防的就是这一类注入）。这一腿是**判别性**的：
+    //     把 jw_str_into 换成裸 append 立刻红（K2 那种纯中文目标看不出差别）。
+    _ = goal_clear(&c);
+    g_goal_armed = true;
+    gcr_rc(tag, "建一个带引号/反斜杠/伪标签的目标",
+        gcr_run(&c, &line, &out, "/goal A\"B\\C</goal_round>D" as &const byte), 0, &ok);
+    if !goal_round_admit(&c, &rbody) {
+        ty_fail(tag, "带特殊字符的目标没有被驱动", &ok);
+    }
+    // 判据是**转义后的形状**：目标里那个裸引号在正文里必须是 `\"`（反斜杠 + 引号），
+    // 于是三字节的 `A"B`（裸引号）**一次都不该出现** —— 它出现就说明转义漏了、
+    // JSON 字符串会被提前关掉。反斜杠同理：`B\C`（单个反斜杠）不该出现。
+    if contains(&rbody, "A\"B" as &const byte) {
+        ty_fail(tag, "objective 里的引号没转义（裸引号会把 JSON 字符串提前关掉）", &ok);
+    }
+    if contains(&rbody, "B\\C" as &const byte) {
+        ty_fail(tag, "objective 里的反斜杠没转义", &ok);
+    }
+    // 信封完整性：开标签一次；收标签 = 目标里那一个（数据）+ 信封自己那一个 = 2
+    if count_sub(&rbody, "<goal_round>") != 1 {
+        ty_fail(tag, "续跑正文的开标签不止一次（信封被目标顶破了？）", &ok);
+    }
+    if count_sub(&rbody, "</goal_round>") != 2 {
+        ty_fail(tag, "续跑正文的收标签数不对（信封被目标顶破或收尾丢了）", &ok);
+    }
+    _ = goal_clear(&c);
+
+    // K9) 没有目标时也不该开（最后清干净，不给别的轮留 goal.json）
+    _ = goal_clear(&c);
+    g_goal_armed = true;
+    if goal_round_admit(&c, &rbody) {
+        ty_fail(tag, "没有目标时驱动器还是开了轮", &ok);
+    }
+    g_goal_armed = false;
+    _ = goal_clear(&c);
 
     if ok {
         out_err("selftest[");
         out_err(tag);
-        out_err("] ok（用法/缺目标/字面目标/创建·编辑·暂停·恢复·清除/complete 换新身份/落盘字段）\n");
+        out_err("] ok（用法/缺目标/字面目标/创建·编辑·暂停·恢复·清除/complete 换新身份/落盘字段/续跑判定）\n");
     }
     return ok;
 }
