@@ -4,11 +4,14 @@
 多轮 loop 直到给出结论。50 个 `.uya` 文件，**不引入任何 C 代码、`@c_import` 或其它语言**，
 只依赖 Uya 语言与随编译器分发的标准库。
 
-**P0–P53 全部完成**，主线版本串 `p53-full`。本节之后按能力域分节，各节标题保留对应的阶段号
-（P0…P53）；设计取舍、踩坑记录与逐阶段验收分别见 §3 与 §6，代码地图见 §2。
+**P0–P54 全部完成**，主线版本串 `p54-empty`。本节之后按能力域分节，各节标题保留对应的阶段号
+（P0…P54）；设计取舍、踩坑记录与逐阶段验收分别见 §3 与 §6，代码地图见 §2。
 「TUI 里能拖选复制文本」是修复、**不占阶段号**，记踩坑 72（见 §3）。
-本线（P50–P52）做**剪贴板粘贴**：多行文本修好了（踩坑 83）、图片能挂给多模态模型、
-`ctrl+v` / `/paste` 走纯 Uya 的 X11 客户端读剪贴板。
+本线（P54）做**退化响应（空回复）**：空回复分支把证据一次打全（`finish` / `have_finish` /
+`bad_finish` 原文、reasoning 字节数、usage、本次请求体量与 prompt token 读数），转录一行 +
+会话日志 `llm/degenerate` 事件两处都留；上游正常收尾但这一步既没正文也没工具调用时
+**同一步重发一次**（形状对齐 DSH 的 `agent/request-error` → `{kind:"retry"}` 通道，
+该重试只发生一次；见 §6 的 P54 段与 §3 踩坑 89）。
 
 真机转录节选（`--show-reasoning`；`✻ 思考` 交互模式下先在提示符那一行滚动、块结束才落成一行，
 非交互（管道）没有实时行，只有结算的那一行）：
@@ -242,8 +245,9 @@ src/diffx.uya      行级 diff（只服务显示）：LCS 60×60、截断
 src/tasks.uya      任务状态 P25：四表折叠成折叠行 / 箱体 / `/tasks` 文本
 src/watch.uya      P42 /watch：事件渲染（纯函数）+ 子代理会话日志的增量读；P46 现役清单行 → 编号（纯函数）
 src/view.uya       显示层：标题/参数/后缀表、单行转录、思考行、agents 面板
-src/agent.uya      CLI、历史、主循环、工具分发、REPL、会话事件
-src/selftest.uya   mock LLM + 130 轮断言 + --probe
+src/agent.uya      CLI、历史、主循环、工具分发、REPL、会话事件；P54 退化响应（空回复）的
+                   证据 + 同一步重发一次（`agent_note_degenerate` / `STEP_RETRY`）
+src/selftest.uya   mock LLM + 150 轮断言 + --probe
 ```
 
 > 两处已知死代码（P14 起未清理）：`src/tools.uya` 的 `read_file`/`write_file`/`run_shell`、`agent.uya` 的 `dispatch_tool`（无调用者）。
@@ -350,6 +354,29 @@ src/selftest.uya   mock LLM + 130 轮断言 + --probe
 
 * tool 结果超 8192 码点 → 前 4096 + `\n\n[... tool result middle pruned ...]\n\n` + 后 1024，只在构请求时生效。
 * 压力取最近一次 `prompt_tokens`（拿不到按字节/4 估），达 `floor(contextWindow × 0.8)` 触发压缩；开关 `--no-compact` / `--context-window N` / `/compact`。
+
+### 退化响应（空回复）：证据 + 同一步重发一次（P54）
+
+* **判据**（`agent_finish_step`）：`finish` 不是 error、不是 max-tokens，而这一步 `content` 与
+  工具调用**都是 0** —— 也就是上游「正常收尾」却什么都没给。最典型的样子是只有思考：正文一个字
+  都没上来（也可能反过来，上游说 `tool_calls` 而调用在流里丢了）。
+* **证据**（转录一行 + 会话日志 `llm/degenerate` 事件，同一个出处）：
+  `finish` / `have_finish` / `bad_finish`（未知 `finish_reason` 的原文，转义后）、`content` 与
+  `reasoning` 字节数、`calls`、`usage{in,cache_read,cache_write,out,reasoning}`、
+  `promptBytes`（本次**请求体**的真实字节数）与 `promptTokens`（提供方读数，`in + cache_read`）、
+  `sawDone` / `events`、以及 `retries` / `maxRetries` / `retrying`。
+  为什么非要有它：以前日志里只剩一条 `content=""` 的 assistant 消息，「上游说 stop」与
+  「tool_calls 丢了」在事后**长得一模一样**（用户就是靠旁证才定的性）。
+* **重发**：额度每步一次（`EMPTY_RETRY_MAX = 1`）。重发**不推进 step、不动历史**，请求由同一份
+  历史重新拼出来 —— 所以重发的请求体与上一次**逐字节相同**（自测按字节比对，不是数请求条数）。
+  形状对齐 DSH 的 `agent/request-error` → `{kind:"retry"}`（`compaction-basic` 接
+  context-overflow 走的就是这条通道）；区别是 DSH 只对 `finish.kind === "error"` 开这个口子，
+  「正常收尾但空」它没有兜 —— 这一条是 uya-agent 自己补的。
+* **退化那一步不留痕**：不写 `assistant/message`、不进历史、不计统计（没有产出）。否则「退化」与
+  「模型真的回了空串」在日志里长得一样，而且 `--resume` 会把一条空 assistant 消息拼回历史。
+  非流式（`--no-stream`）走同一条收尾函数，行为完全一致。
+* 重发仍然空 → 与以前一样按协议错误收口（退出码 3），但**带证据**；转录里那句
+  `error: model returned neither content nor tool_calls` 保持在最前面（文案没变，只是后面挂了证据）。
 
 ### 提示词与上下文状态（P8）
 
@@ -936,7 +963,7 @@ src/selftest.uya   mock LLM + 130 轮断言 + --probe
    /home/winger/uya-0.10/lib/std/http/uyagin_router.uya: 错误: 函数表容量不足，请增大 FUNCTION_TABLE_SIZE
    ```
    报错点在**标准库**里，跟我的代码毫无关系 —— 这是编译器里写死的 `FUNCTION_TABLE_SIZE`
-   （无开关、无环境变量、无文档）。实测边界（`make build`、本仓当前规模）：
+   （无开关、无环境变量、无文档）。实测边界（`make build`、当时的规模）：
    | | 声明数 | 结果 |
    |---|---|---|
    | main 原样 | 6756 | 通过 |
@@ -946,6 +973,16 @@ src/selftest.uya   mock LLM + 130 轮断言 + --probe
    也就是说 **main 当时已经没有余量了**：任何一条线只要净增函数就让 `make build` 从干净缓存起
    必红。变量与常量**不占**这个额度（实测 +40 个 `const` / `+20` 个 `var` 都不红），
    只有函数占。
+   **上限是「绝对条数」而不是「本仓余量为 0」——余量随各线合并而变，要现测**。P54 重测
+   （同一台机器、同一份 uya 0.10、本仓 6789 声明起）：
+   | | 声明数 | 结果 |
+   |---|---|---|
+   | 本仓（改动前） | 6789 | 通过 |
+   | + **6** 个空函数 | 6795 | 通过 |
+   | + 8 个空函数 | 6797 | 红 |
+   即表容量在 **6796** 上下，本仓当时还剩 6 个左右；P54 这条线净增 **2** 个函数
+   （`agent_note_degenerate` + 自测的 `empty_retry_check`）之后是 6792，仍然通过 ——
+   但结论不变：**净增函数的改动一律清缓存重编一遍**，别拿增量编译的绿当绿。
    教训三条：① **增量编译的绿不算绿** —— 这类容量上限只有「删掉缓存重编」才暴露，
    所以改完必须 `rm -rf build && make build` 走一遍（本轮就是靠这一步才发现的）；
    ② 报错点可能在**标准库**里（先被编译到的那一批），别顺着报错文件去找原因，
@@ -976,6 +1013,19 @@ src/selftest.uya   mock LLM + 130 轮断言 + --probe
    顺带给这一节补了三条断言（verdict 76/77/78）—— 它此前**完全没有自测覆盖**，
    纯字符串常量被改坏不会有任何编译期信号；对照实验：把第三条改写成
    "a stale list is fine" 后 `prompt-todo-plan` 当场红（verdict 78），不是假绿。
+
+89. **mock 的判定码经 `sys_exit` 回来只留低 8 位 —— 261 会显示成 5、264 会显示成 8**（P54，本轮踩到）：
+   退化响应那两轮的判定码第一版顺着既有的号段往下写了 261…268。跑那条「重发前动一下历史」的
+   对照实验（§6 的 P54 段实验 ⑥，期望「重发的请求不再是同一个」那条断言红）时，报出来的是
+   `FAIL: mock server verdict 8` —— **8 和 264 差着 256**：mock 是 `fork` 出来的子进程，
+   判定码要经 `sys_exit(rc)` 回到父进程，而退出码只有低 8 位（`264 & 255 = 8`）。
+   这条**不会造成假绿**（非 0 就是失败），但会让报出来的码**张冠李戴**：8 落在「一遍过不了的
+   号段」里，照着去查会一路查到别的断言上（我第一反应就是「mock 没走到我的分支」）。
+   同族的 267 → 11（读请求失败）、268 → 12（另一条真断言）都是会误导的值。
+   **规矩**：mock 的判定码一律 `< 256`，并且先用
+   `grep -o "verdict = [0-9]*" | sort -nu` 与 `,\s*[0-9]+,\s*&verdict` 两处一起核一遍
+   占用情况（只在 `verdict = N` 里找会漏掉 `expect(..., N, &verdict)` 那一半 ——
+   本轮就是这么撞上 241/242 的）。
 
 =======
 ---
@@ -1184,6 +1234,8 @@ DEEPSEEK_API_KEY=sk-xxx ./build/uya-agent \
 | `ctrl-bytes` / `ctrl-bytes-resp` | mock mode 23：`printf 'A\000B'` 以 `\u0000` 回请求；判定码 240 |
 | `diag-preview` | cap 停字符边界、`\xNN`、`out_diag` ≤512 B |
 | `diag-echo-400` / `diag-echo-400-ns` | mock mode 24：400 回显 → fd 2 一行转义预览、无裸 CR/NUL/ESC |
+| `empty-retry` | P54（mock mode 41）：第一轮回「finish_reason=stop + 只有思考、没有正文」→ 转录里那一行证据（`finish=stop have_finish=1 bad_finish=(none) content=0B reasoning=45B calls=0 usage={in=60 cache_read=40 cache_write=0 out=7 reasoning=3} prompt=…B/100tok retries=0/1`）+ 日志一条 `llm/degenerate`（字段逐项核对）→ **同一步重发**：第二轮请求与第一轮**逐字节相同**、`step/start` 仍只有一条、唯一那条 `assistant/message` 的正文是 `SELFTEST-RETRY-OK`、回合退出 0 |
+| `empty-retry-giveup` | P54（mock mode 42）：重发也只给空响应 → 只重发**一次**（两条 `llm/degenerate`：`retrying=true/retries=0` → `retrying=false/retries=1`）、退化那一步**一条 `assistant/message` 都没有**、转录里留下带同一条证据的错误行、回合按协议错误退出 3 |
 | `tui-diag` | 4 KiB JSON 只留 ≤512 B、半截汉字变 U+FFFD、`tty_sink_on` 收尾关回 |
 | `read-window` | `(Showing lines 1-1000 of 4000. …)`、`offset=3500` 真读到、`limit=2000` |
 | `title-format` | OSC/CSI 清洗、40 B/80 B 上限切码点边界、`ESC[22t`/`ESC[23t` |
@@ -1206,7 +1258,7 @@ DEEPSEEK_API_KEY=sk-xxx ./build/uya-agent \
   P47 起正文那一屏按新的 markdown 排版变（标题/强调/列表/引用/带语言标签的代码块/表格），
   脚注仍是版本串那一处；P53 新增第 ⑦ 屏（浮层全屏）并把前六屏**逐字节**保持不变
   （非全屏路径一个字节没动，所以这条本身就是「没有回归」的判据）。
-- 只跑子集的开关：`UYA_SELFTEST_TUI_ONLY`、`UYA_SELFTEST_PERM_ONLY=1`（P21+P26）、`UYA_SELFTEST_GOAL_ONLY=1`（P29）、`UYA_SELFTEST_SHELL_ONLY=1`（P38）、`UYA_SELFTEST_PANEL_ONLY=1`（P15+P40，`make panel-selftest`）。
+- 只跑子集的开关：`UYA_SELFTEST_TUI_ONLY`、`UYA_SELFTEST_PERM_ONLY=1`（P21+P26）、`UYA_SELFTEST_GOAL_ONLY=1`（P29）、`UYA_SELFTEST_SHELL_ONLY=1`（P38）、`UYA_SELFTEST_PANEL_ONLY=1`（P15+P40，`make panel-selftest`）、`UYA_SELFTEST_EMPTY_ONLY=1`（P54，退化响应两轮 —— 跑对照实验时用它，一次约 0.2 s）。
 - 探针：`make probe BASE=https://api.deepseek.com/v1` 期望 HTTP 401 + leaf 指纹。
 
 **load-bearing 硬指标**
@@ -1389,6 +1441,27 @@ DEEPSEEK_API_KEY=sk-xxx ./build/uya-agent \
 - 踩坑 72（TUI 里能复制文本）：真机（deepin-terminal / qtermwidget，即用户环境）A/B —— 同一块屏幕、同一条拖拽轨迹（`xdotool` 驱动），鼠标上报**开着**时拖选之后 `PRIMARY` 仍是旧值（= 没选中）、TUI 正文一个字符都拿不到；手动发 `?1000l?1006l` 关掉后拖同一段立刻拿到屏幕文本；再发 `?1000h?1006h` 又选不动。屏幕重画不会清掉已选区（选中后等 3 s 仍在），所以与渲染/重绘无关。修法见踩坑 72；`make e2e-mouse` 钉配置来源链（默认 env/cli + CLI 优先 + 滚动模式 `/mouse` 说明），`tui-mouse` 轮钉开关语义、F2 两种编码、字节级四个方向与真 PTY 两个方向。防假绿对照实验四条（`tui_term_enter` 忽略开关 / 删 F2 映射 / `tui_set_mouse` 去掉运行中写序列 / 启动处恒 `true`）都当场红。
 
 > 分阶段验收记录的详细现场（P1–P48 的 before/after 命令与截图、真机对照实验、被自测当场抓住的自身缺陷）已在此压缩，原始描述保留在 §3 踩坑 33–80 与各版本提交说明中。
+
+- P54：**退化响应（空回复）的证据 + 同一步重发一次**。真机现场：一轮结束在
+  `error: model returned neither content nor tool_calls`，而会话日志里**只剩一条
+  `content=""` 的 assistant/message** —— 事后分不清「上游说了 stop」还是「tool_calls 在流里丢了」，
+  用户是靠别的旁证凑出来才定的性；而且同一份请求重发一次通常就有正文，这一轮却直接判了回合失败。
+  验收：`empty-retry` + `empty-retry-giveup` 两轮（`UYA_SELFTEST_EMPTY_ONLY=1` 单跑，约 0.2 s），
+  逐项见 §6 表格；修复后的证据长这样（真跑出来的，不是拼的）：
+  ```
+  [retry] empty response from upstream (no content, no tool_calls) — resending the same request once [step=1 finish=stop have_finish=1 bad_finish=(none) content=0B reasoning=45B calls=0 usage={in=60 cache_read=40 cache_write=0 out=7 reasoning=3} prompt=23867B/100tok retries=0/1]
+  ```
+  **六条防假绿对照实验**（每条都先看到红再改回来）：
+  ① 关掉重发（`retrying` 恒 `false`）→ 两腿红（41：`agent_run` 返 3 而不是 0，mock 只服务到第 1 轮；
+  42：`verdict 63` = 只服务了 1/2 轮，转录里也没有 `retries=1/1` 那一段）；
+  ② 只留一句错误、不打印证据也不落事件 → 两腿一共红 14 条（四条转录断言 + 三条日志断言，
+  每个证据字段都有对应的断言）；
+  ③ 退化那一步也写 `assistant/message`（把检查挪到它之后）→ 两腿红（41 期望恰好一条、42 期望一条都没有）；
+  ④ `EMPTY_RETRY_MAX` 改成 2（额度与事实不符）→ 两腿红（`maxRetries` 与 `retries=0/1` 都对不上）；
+  ⑤ 重发时把 step 推进一格 → 42 红（转录 `[step=1` 与事件 `step` 字段）；
+  ⑥ 重发前往历史里塞一条 `PERTURB` → 两腿红（**verdict 249**：重发的请求体不再逐字节相同）。
+  对照实验 ⑥ 还顺手抓到自测自己的一个坑：第一版判定码写成 261…268，`sys_exit` 回来只留低 8 位，
+  「264」显示成「8」（见 §3 踩坑 89）。
 
 ---
 
@@ -1602,6 +1675,13 @@ DEEPSEEK_API_KEY=sk-xxx ./build/uya-agent \
   （含别的终端/工作区里的实例），不是本会话进程树；单核口径，多进程并行时可以 > 100%。
   `内存` 与它同源但慢一档（**5 秒一次**：算 PSS 要遍历页表），值是 **PSS 合计**（内核没有
   `smaps_rollup` 时整批退回 `VmRSS`，`/status` 里写明）。`/proc` 不可读时两个字段都省略。
+* **退化响应只重发一次（P54）**：额度是**每步一次**，而且只针对「上游正常收尾、却既没正文也没
+  工具调用」这一种形状。传输层错误（网络 / TLS / 401 / 坏 payload / 流被截断）、
+  `finish_reason=length` 截断、网关 error **都不走**这条通道 —— 它们各有自己的诊断与退出码，
+  重发也不会变好（401 与坏 payload 重发只是白花一次往返）。重发不加退避也不加抖动（同请求
+  再发一次就够了，多等一会儿没有收益）；额度不跨步累计（下一步重新给一次），也不跨回合。
+  退化那一步**不计统计**（没有产出），所以那一次请求的 token 不进 `/status` 的账 ——
+  要查它只能看 `llm/degenerate` 事件里的 `usage`。
 
 **`/diff`**
 
