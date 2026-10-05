@@ -80,7 +80,8 @@ $ ./build/uya-agent --show-reasoning "在当前工作目录写 p15-demo.txt，�
 
 ```bash
 make check         # 词法/语法/类型检查
-make build         # 产出 build/uya-agent
+make build         # 产出 build/uya-agent（**静态链接**，见下）
+make link-audit    # 核对产物真是静态链接（无 PT_INTERP / 无 NEEDED）
 make selftest      # 离线端到端自测（内置 mock LLM，不需要网络也不需要 key）
 make tui-selftest  # 只跑 TUI 那几轮（改界面时最快）
 make sess-selftest # 只跑 /sessions 与大日志 meta 那几轮
@@ -90,13 +91,43 @@ make probe         # 传输层探针：打真实 https 端点，期望 HTTP 401�
 
 ```
 
-不带 make 的等价命令（关键点：**显式导出 `UYA_ROOT`**，并尽量用编译器的绝对路径）：
+**静态链接（默认开）**：`make build` 产出的 `build/uya-agent` 不依赖 `libc.so.6`、
+没有 `PT_INTERP`（拷到任何同架构 Linux 上都能跑，不需要目标机有对应的 glibc）。
+开关是 Makefile 里的 `STATIC ?= 1`：`make build STATIC=0` 退回动态。
+
+```bash
+file build/uya-agent        # statically linked
+readelf -lW build/uya-agent | grep -c INTERP    # 0
+readelf -dW build/uya-agent | grep -c NEEDED    # 0
+```
+
+实现在 Makefile：`build` 那条命令前缀 `LDFLAGS="$(AGENT_LDFLAGS)"`（默认 `-static`）。
+编译器把它透传给它生成的 `build/uyacache/Makefile` 的链接行
+（`$(CC) $(OBJS) -o $(UYA_OUT) $(LDFLAGS) -lm`）—— 所以链路是
+`Makefile → 环境变量 → 编译器生成的 make → cc`，逐段可核。
+**为什么是行内赋值而不是全局 `export`**：全局 export 会把 `LDFLAGS=-static` 漏进**所有**
+recipe 的环境，包括 `make selftest`（它内部 fork bash、由 agent 自己去 `uya build` 编东西），
+等于悄悄改掉别人的编译行为；行内赋值只作用于编译那一条命令。
+四个坑（详记 §3 踩坑 90）：① **命令行上临时给不算数**（`LDFLAGS=-static make build`
+之后，下一次不带它的 `make build` 会把产物**静默换回动态**，而全程只有绿）；
+② 编译器文档里的 `LINK_MODE=static` 对 `uya build` 这条路径**无效**（实测产物仍是 PIE 动态）；
+③ `?=` 挡不住外部环境里那个**空**的 `LDFLAGS=`（`?=` 对已定义变量不生效），行内赋值才挡得住；
+④ 所以 `make build` 末尾自带 `link-audit` 断言，**build 绿就等于真静态** ——
+它读的是 ELF 结构性 token（`INTERP` / `(NEEDED)`），不是本机化的散文。
+
+不带 make 的等价命令（关键点：**显式导出 `UYA_ROOT`**、**显式给 `LDFLAGS=-static`**，
+并尽量用编译器的绝对路径）：
 
 ```bash
 export UYA_ROOT=/home/winger/uya-0.10/lib/
 export UYA_SPLIT_C_DIR=$PWD/build/uyacache      # 多文件 C 缓存别丢在仓库根目录
-/home/winger/uya-0.10/bin/uya build src/agent.uya src/httpc.uya src/jsonx.uya src/tools.uya src/selftest.uya -o build/uya-agent
+LDFLAGS=-static \
+  /home/winger/uya-0.10/bin/uya build src/agent.uya src/httpc.uya src/jsonx.uya src/tools.uya src/selftest.uya -o build/uya-agent
+readelf -lW build/uya-agent | grep -c INTERP    # 0 = 真静态
 ```
+
+> 手工编（不走 make）时那个 `LDFLAGS` 是**一行有效**的：下一条不带它的 `uya build`
+> 会把产物换回动态，且不会报任何东西。要长期静态就用 `make build`。
 
 用法：
 
@@ -1026,6 +1057,61 @@ src/selftest.uya   mock LLM + 150 轮断言 + --probe
    `grep -o "verdict = [0-9]*" | sort -nu` 与 `,\s*[0-9]+,\s*&verdict` 两处一起核一遍
    占用情况（只在 `verdict = N` 里找会漏掉 `expect(..., N, &verdict)` 那一半 ——
    本轮就是这么撞上 241/242 的）。
+
+90. **静态链接：开关必须落在 Makefile 里，命令行上给的那次不算数**（本轮，不占阶段号）：
+   uya 0.10 的 `uya build` 不自己决定链接方式，而是把环境里的 `LDFLAGS` 透传给它**生成**的
+   `build/uyacache/Makefile`（那条链接行是 `$(CC) $(OBJS) -o $(UYA_OUT) $(LDFLAGS) -lm`）。
+   于是「改出静态链接」看起来只要 `LDFLAGS=-static make build` 就够了 —— 我第一版就是这么
+   验证的，产物确实 `statically linked`、`--probe` 也真跑通了 TLS。**但这个绿是假的**：
+   下一次不带这个变量的 `make build`（或 `make selftest`，它依赖 `build`）会照常重编并把
+   产物**换回动态**，全程零告警 —— 实测就是这么被换回去的（`readelf -d` 又出现 `libc.so.6`）。
+   判据很简单：**验证完静态之后，再跑一次不带 flag 的 `make build`，看产物还是不是静态**；
+   是的话才算数。所以修法是把开关写进 Makefile：`STATIC ?= 1` + `AGENT_LDFLAGS`，
+   由 `build` 那条命令前缀 `LDFLAGS="$(AGENT_LDFLAGS)"` 带进去。
+   **为什么不全局 `export`**：那会把 `LDFLAGS=-static` 漏进**每个** recipe 的环境 ——
+   包括 `make selftest`，而 selftest 内部会 fork bash、由 agent 自己去 `uya build` 编东西，
+   等于悄悄改掉别人的编译行为；行内赋值只作用于编译那一条命令。核对办法：
+   `make -n selftest | grep -c 'LDFLAGS='` 应当是 **1**（就是 `build` 那条命令前缀，
+   selftest 自己那一串里一个都没有）。
+   **孪生两个坑**：① 编译器文档 §C.2 里的 `LINK_MODE=static` **对这条路径无效** ——
+   实测 `LINK_MODE=static uya build …` 产物仍是 PIE 动态（那个变量是编译器自身构建脚本
+   `compile.sh` 用的），照文档做会得到一个「我明明设了」的假象；
+   ② 生成的 Makefile 里是 `LDFLAGS ?=`，而 `?=` 对**已定义（哪怕空串）**的变量不生效 ——
+   所以调用方环境里一个空的 `LDFLAGS=` 就能把静态吃掉。行内赋值（而不是 `?=`/`:=`
+   全局赋值）两个都挡得住：外部怎么设都覆盖不了那一条命令前缀（实测 `LDFLAGS="" make build`
+   产物照样静态）。
+   **验收怎么钉**：`make build` 末尾自带 `link-audit`（`build` 绿 ⇒ 真静态），读的是 ELF
+   结构性 token —— `readelf -lW | grep -c INTERP` 与 `readelf -dW | grep -c "(NEEDED)"`
+   两个都要是 0。**不解析散文**：中文 locale 下 `readelf -d` 会把
+   「There is no dynamic section in this file」整句翻掉，`file` 输出的
+   「statically linked」同样本机化 —— 只认 `INTERP` / `(NEEDED)` 这类类型名，它们不翻
+   （实测 C / zh_CN.UTF-8 / en_US.UTF-8 三个 locale 下行为一致）。
+   这条**不是假绿**：把 `STATIC=0` 编出来的动态产物拿给 `make link-audit STATIC=1` 判，
+   当场红在「产物有 PT_INTERP」并打出那行 INTERP。
+   **顺带确认的事实**（静态 glibc 的常见雷区，本仓都没踩）：生成的 C 里没有任何
+   `getpwnam` / `getaddrinfo` / `dlopen` 调用（NSS 是静态 glibc 最经典的坑：那些函数会
+   `dlopen` 库，静态链接时会告警并在运行时失效），DNS 是 `lib/std/net/dns.uya` 自己
+   收发 UDP 报文实现的；`dlsym` 那一族只出现在 `__APPLE__` 分支里（`extern` 声明在
+   Linux 下不被引用），静态产物里 `nm | grep dlsym` 是 0 条。
+   真机复核：静态产物拷到 `/tmp` 空目录、`env -i` 起得来（`--print-config` 正常），
+   `--probe` 对 `api.deepseek.com` 拿到 HTTP 401 —— DNS 与 TLS 这两条最容易在静态
+   glibc 上出事的路径都是通的。
+
+   > **另一件事（不是这条线引入的）**：整轮 selftest 里 `worktree-reclaim` 偶尔红在
+   > fixture **准备**阶段（`造 A/B/C/F/F2 失败`、`收尾时把有提交的孤儿分支清掉了`），
+   > 报的还每次不一样。这条线顺手做了对照，三组证据都指向「与链接方式无关」：
+   > ① **A/B 交替**：同一台机器、静态与动态各跑三轮交替进行，静态第 1 轮红、
+   > 动态第 2 轮红（签名逐字相同）；② **拿未改动的对照**：从共享检出里取一份
+   > `main` 上 07:25 编好的产物（**动态、本线一行都没碰**），与静态产物交替各跑 4 轮
+   > —— **对照 2/4 红，静态 1/4 红**，而且对照红的那两次正是同一个 `worktree-reclaim`；
+   > ③ **聚焦**：`UYA_SELFTEST_MODEL_ONLY=1`（0.4 s，含这一轮）连跑 30 次、
+   > 每次先清 `/tmp/selftest_p37_wt_*`，**0 失败**。
+   > 机理对得上：fixture 目录按 pid 命名（`/tmp/selftest_p37_wt_<pid>`），而 `gitx` 对
+   > 每次 git 调用有 **10 s 墙钟上限**（`GITX_TIMEOUT_MS`，超了 SIGKILL）—— 真机上
+   > `git worktree add` 只要 8–9 ms，但同机并发跑着别的会话的 selftest/构建（load ~5–10）
+   > 时偶发超过 10 s 就整轮红。**没有**在这一轮动 `src/selftest.uya` —— 那属于既有 flake，
+   > 改了就跑题了；如实记在这里备查（`mine #1` 那次红在 `tui-plan` 的
+   > 「审阅浮层里没有三个动作」，同样是 `tuis_drain` 有界轮询的时序快慢，不是链接问题）。
 
 =======
 ---

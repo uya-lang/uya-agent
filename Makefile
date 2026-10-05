@@ -2,7 +2,8 @@
 #
 # 用法：
 #   make check      # 只做词法/语法/类型检查
-#   make build      # 产出 build/uya-agent
+#   make build      # 产出 build/uya-agent（**静态链接**，见下）
+#   make link-audit # 核对产物真是静态链接（无 PT_INTERP / 无 NEEDED）
 #   make selftest   # 离线端到端自测（内置 mock LLM，无需网络与 key）
 #   make probe      # 传输层探针（默认打 api.deepseek.com，期望 HTTP 401）
 #   make e2e-diff   # /diff：真 git 的改动列表 + 单列文本回退 + 非仓库报错（离线）
@@ -17,9 +18,29 @@
 #   make clean
 #
 # 换编译器（例如 0.11，未实测）：make UYA=/home/winger/uya-0.11/bin/uya UYA_ROOT=/home/winger/uya-0.11/lib/ ...
+#
+# 静态链接：默认开（`STATIC=0` 退回动态）。开关必须落在 Makefile 里，且**只**加在编译
+# 那一条命令上 —— 编译器把环境里的 LDFLAGS 透传给它生成的 build/uyacache/Makefile 的
+# 链接行（`$(CC) $(OBJS) -o $(UYA_OUT) $(LDFLAGS) -lm`），所以链路是
+# Makefile → 环境变量 → 编译器生成的 make → cc。
+# 为什么不 `export`（全局）：那样 LDFLAGS=-static 会漏进**所有** recipe 的环境，包括
+# `make selftest`（它内部会 fork bash、由 agent 自己去 `uya build` 编东西），等于悄悄
+# 改掉别人的编译行为。行内赋值只作用于那一条命令。
+# 为什么不用 `?=`：`?=` 对「已定义（哪怕空串）」的外部变量不生效，调用方环境里的
+# LDFLAGS= 会把静态吃掉；行内赋值永远覆盖。命令行的 `LDFLAGS=-static make build`
+# 同样不算数（下一次不带它就静默换回动态，见踩坑 90）。
+# 0.10 文档里的 `LINK_MODE=static` 对本路径**无效**（实测产物仍是 PIE 动态，那个变量
+# 是编译器自身构建脚本 compile.sh 用的）。
 
 UYA_ROOT ?= /home/winger/uya-0.10/lib/
 UYA      ?= /home/winger/uya-0.10/bin/uya
+
+STATIC ?= 1
+ifeq ($(STATIC),1)
+AGENT_LDFLAGS := -static
+else
+AGENT_LDFLAGS :=
+endif
 
 SRC := src/bufx.uya src/jsonx.uya src/httpc.uya src/httpstream.uya src/sse.uya src/llm.uya src/tty.uya src/sigx.uya src/inbox.uya src/session.uya src/stats.uya src/procx.uya src/yamlcfg.uya src/modelx.uya src/dshcfg.uya src/dshsess.uya src/prompt.uya src/instr.uya src/compact.uya src/skill.uya src/webx.uya src/deleg.uya src/goal.uya src/workflow.uya src/todo.uya src/plan.uya src/perm.uya src/sandboxx.uya src/askuser.uya src/fsx.uya src/search.uya src/jobs.uya src/shellx.uya src/gitx.uya src/gitdiff.uya src/worktreex.uya src/imgx.uya src/clipx.uya src/diffx.uya src/mdview.uya src/view.uya src/tasks.uya src/watch.uya src/tui.uya src/agent.uya src/sigselftest.uya src/shellselftest.uya src/tuiselftest.uya src/selftest.uya
 OUT := build/uya-agent
@@ -32,7 +53,7 @@ TASK ?= 创建 hello.uya，编译并运行它
 export UYA_ROOT
 export UYA_SPLIT_C_DIR := $(CURDIR)/build/uyacache
 
-.PHONY: all check build selftest codegen-audit probe e2e e2e-config e2e-config-flags e2e-title e2e-title-cmd e2e-title-auto e2e-mouse e2e-api e2e-steps e2e-permission e2e-sandbox e2e-tasks e2e-goal e2e-sessions e2e-resume-big e2e-diff e2e-ws e2e-model e2e-worktree e2e-watch e2e-watch-pick e2e-dsh p30-check tui-demo tui-selftest sess-selftest diff-selftest model-selftest panel-selftest clean shell-selftest
+.PHONY: all check build link-audit selftest codegen-audit probe e2e e2e-config e2e-config-flags e2e-title e2e-title-cmd e2e-title-auto e2e-mouse e2e-api e2e-steps e2e-permission e2e-sandbox e2e-tasks e2e-goal e2e-sessions e2e-resume-big e2e-diff e2e-ws e2e-model e2e-worktree e2e-watch e2e-watch-pick e2e-dsh p30-check tui-demo tui-selftest sess-selftest diff-selftest model-selftest panel-selftest clean shell-selftest
 
 all: build
 
@@ -42,7 +63,32 @@ check:
 
 build:
 	@mkdir -p build
-	$(UYA) build $(SRC) -o $(OUT)
+	LDFLAGS="$(AGENT_LDFLAGS)" $(UYA) build $(SRC) -o $(OUT)
+ifeq ($(STATIC),1)
+	@$(MAKE) --no-print-directory link-audit
+endif
+
+# 静态链接审计：产物必须**没有** PT_INTERP、没有 NEEDED 项。两条都走 readelf 的
+# 结构性 token（`INTERP` / `(NEEDED)`），不解析本机化后的散文（中文环境下 readelf
+# 会把「There is no dynamic section」翻掉，但类型名不翻）—— 踩坑 90 的对照实验就
+# 靠它，写错了要能当场红。`file` 那行的「statically linked」同样本机化，不采用。
+# build 末尾会自己调一次（STATIC=1 时），于是 **build 绿就等于真静态**：这条断言
+# 挡的是「LDFLAGS 没传下去」这一路（换了编译器、有人把那条命令前缀挪走、generated
+# Makefile 的链接行变了），那几种情况产物会悄悄退回动态而构建全程无异常。
+link-audit:
+	@if [ "$(STATIC)" != "1" ]; then echo "link-audit: 跳过（STATIC=$(STATIC)，显式要的动态链接）"; exit 0; fi; \
+	if [ ! -f $(OUT) ]; then echo "link-audit: $(OUT) 不存在，先 make build"; exit 1; fi; \
+	interp=$$(readelf -lW $(OUT) 2>/dev/null | grep -c "INTERP" || true); \
+	if [ "$$interp" != "0" ]; then \
+		echo "link-audit: 产物有 PT_INTERP（= 动态链接，STATIC=0？）"; \
+		readelf -lW $(OUT) | grep "INTERP"; exit 1; \
+	fi; \
+	needed=$$(readelf -dW $(OUT) 2>/dev/null | grep -c "(NEEDED)" || true); \
+	if [ "$$needed" != "0" ]; then \
+		echo "link-audit: 产物有 NEEDED 项（= 依赖共享库）"; \
+		readelf -dW $(OUT) | grep "(NEEDED)"; exit 1; \
+	fi; \
+	echo "link-audit: 通过（无 PT_INTERP、无 NEEDED，真静态）"
 
 # 代码生成审计：uya 0.10 把 `&"字面量"[a:b]` 传给 `*const byte` 形参时会生成
 # 「切片描述符（{ptr,len} 结构体）地址 → char*」的强转 —— sys_write 于是把描述符里
