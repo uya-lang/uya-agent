@@ -89,7 +89,7 @@ TASK ?= 创建 hello.uya，编译并运行它
 export UYA_ROOT
 export UYA_SPLIT_C_DIR := $(CURDIR)/build/uyacache
 
-.PHONY: all check print-src build link-audit selftest codegen-audit doc-audit doc-cover probe e2e e2e-config e2e-exec e2e-accept-nudge e2e-config-flags e2e-title e2e-title-cmd e2e-title-auto e2e-mouse e2e-api e2e-steps e2e-permission e2e-sandbox e2e-tasks e2e-goal e2e-sessions e2e-resume-big e2e-diff e2e-ws e2e-model e2e-worktree e2e-watch e2e-watch-pick e2e-dsh p30-check tui-demo tui-selftest sess-selftest diff-selftest model-selftest panel-selftest clean shell-selftest
+.PHONY: all check print-src build link-audit selftest codegen-audit doc-audit doc-cover probe e2e e2e-config e2e-exec e2e-accept-nudge e2e-config-flags e2e-title e2e-title-cmd e2e-title-auto e2e-mouse e2e-api e2e-steps e2e-permission e2e-sandbox e2e-tasks e2e-goal e2e-sessions e2e-resume-big e2e-diff e2e-ws e2e-model e2e-model-route e2e-worktree e2e-watch e2e-watch-pick e2e-dsh p30-check tui-demo tui-selftest sess-selftest diff-selftest model-selftest panel-selftest clean shell-selftest
 
 all: build
 
@@ -182,7 +182,7 @@ doc-audit:
 #   本仓实测：90 文件树上净增 50 个函数 + `rm -rf build && make build` → 通过（静态链接审计通过）。
 #   因此「净增函数按 0 处理」那条纪律作废。这段留下的用处只有一个：**换/降编译器时认得出症状**
 #   （报错点落在标准库、`make check` 全绿、只有清缓存重编才炸）。
-selftest: build codegen-audit doc-audit doc-cover e2e-exec e2e-accept-nudge e2e-config-flags e2e-title e2e-title-cmd e2e-title-auto e2e-mouse e2e-api e2e-steps e2e-permission e2e-sandbox e2e-tasks e2e-goal e2e-sessions e2e-resume-big e2e-diff e2e-ws e2e-model e2e-worktree p30-check
+selftest: build codegen-audit doc-audit doc-cover e2e-exec e2e-accept-nudge e2e-config-flags e2e-title e2e-title-cmd e2e-title-auto e2e-mouse e2e-api e2e-steps e2e-permission e2e-sandbox e2e-tasks e2e-goal e2e-sessions e2e-resume-big e2e-diff e2e-ws e2e-model e2e-model-route e2e-worktree p30-check
 	UYA_BIN=$(UYA) $(OUT) --selftest
 
 probe: build
@@ -346,6 +346,46 @@ e2e-model: build
 	echo "$$out" | grep -q "reasoning_effort = xhigh" || { echo "FAIL: 不公布档位时应当原样透传"; echo "$$out"; exit 1; }; \
 	echo "$$out" | grep -q "not a level this model publishes" || { echo "FAIL: 透传的值应当被标出来（不是模型公布的档位）"; echo "$$out"; exit 1; }; \
 	echo "e2e-model: 通过（目录/能力跟随/目录外只换名字/REPL 报告与切换/非法档位拒/透传标注）"
+
+# P37：**切模型要连端点与凭据一起跟随**（离线，真终端 + 两个假网关，不联网）
+#   用户报的症状是「中途切换不了模型」：切换看起来成功了（信息行/model 报告都变了），
+#   但请求**继续发往旧提供方的端点、还带着旧提供方的密钥** —— 于是表现为「切了没反应 /
+#   401 / 回答还是旧模型的」。根因是 agent_model_apply 只搬 contextWindow 一类的**能力**，
+#   从不重解析 base_url / api_key / api_style（模型目录故意不存 baseURL，见 §16 踩坑 96）。
+#   两条腿（`--mode text` 带参命令 / `--mode overlay` 浮层），判据都是**屏幕 + 网关记账**：
+#     ① 回合被一条慢 bash 撑住时敲 /model <另一提供方的模型> ⇒ **回合结束前**信息行就变了；
+#     ② 之后那条请求打到**新提供方**的网关（旧网关不再收到请求）；
+#     ③ 那条请求带的是**新提供方**的 `Authorization`（旧密钥绝不跨提供方发出）；
+#     ④ 那一轮的答案是新提供方给的（屏幕上 PROV-B-ANSWER）。
+#   对照旧行为：请求继续打到 prov-a（假网关的 stderr 记账里看得见）、带 prov-a 的 key，
+#   于是屏幕上永远只有 PROV-A-ANSWER；带参那条还会被当成**给模型的文本**（`/model b-two`
+#   出现在请求体里）。两个假网关的记账是各自独立的，所以「打到哪」是硬事实不是推断。
+e2e-model-route: build
+	@set -e; \
+	ws=build/selftest_p37_route; rm -rf $$ws; mkdir -p $$ws; \
+	python3 testdata/mock_gateway_route.py 10 > $$ws/gw.log 2>&1 & \
+	gw=$$!; \
+	trap "kill $$gw 2>/dev/null || true" EXIT; \
+	sleep 1.2; \
+	pa=$$(awk '/^PORT-A/{print $$2}' $$ws/gw.log); \
+	pb=$$(awk '/^PORT-B/{print $$2}' $$ws/gw.log); \
+	[ -n "$$pa" ] && [ -n "$$pb" ] || { echo "FAIL: 假网关没打印两个端口"; cat $$ws/gw.log; exit 1; }; \
+	UYA_BIN=$(OUT) python3 testdata/pty_drive_model.py --port-a $$pa --port-b $$pb \
+		--workspace $$ws/overlay --mode overlay --slow 10; \
+	kill -0 $$gw 2>/dev/null || { echo "FAIL: 假网关在第一条腿里就退出了"; cat $$ws/gw.log; exit 1; }; \
+	: "② 网关侧硬事实：prov-a 只该收到第一条（撑回合那条），之后全打 prov-b"; \
+	a_after=$$(grep -c "^GW-PROV-A #" $$ws/gw.log || true); \
+	b_hits=$$(grep -c "^GW-PROV-B #" $$ws/gw.log || true); \
+	[ "$$b_hits" -ge 1 ] || { echo "FAIL: prov-b 的网关一条请求都没收到（切换没换端点）"; cat $$ws/gw.log; exit 1; }; \
+	: "③ 密钥不跨提供方：prov-b 收到的每一条都必须是 B 的 key"; \
+	if grep "^GW-PROV-B #" $$ws/gw.log | grep -qv "auth=Bearer key-of-prov-b"; then \
+		echo "FAIL: prov-b 的网关收到了不是它自己的密钥（切完还带着旧提供方的 key）"; \
+		grep "^GW-PROV-B #" $$ws/gw.log; exit 1; \
+	fi; \
+	if grep "^GW-PROV-B #" $$ws/gw.log | grep -q "key-of-prov-a"; then \
+		echo "FAIL: prov-a 的密钥被发到了 prov-b 的主机（凭据泄露）"; exit 1; \
+	fi; \
+	echo "e2e-model-route: 通过（回合运行中切换当场生效 + 请求改打新提供方 + 换用新提供方的密钥）"
 
 # P37：Git worktree（离线，真 git）：独立工作区执行 → 合并 → 删除
 #   ① --worktree 开会话：会话里真的有 worktree + dsh/<slug> 分支（状态报告里看得见，

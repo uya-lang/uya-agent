@@ -319,7 +319,10 @@ DEEPSEEK_API_KEY=sk-xxx ./build/uya-agent \
   另外：`/watch` 是**进程状态**（`--resume` 不回填）；被跟随的子代理跑完或槽位被回收时跟随自动
   结束；`ralph` 跟随的是**当前轮**的日志，换轮时插一行 `[轮次切换]` 并从新日志头开始读。
 * **回合运行中的界面命令**：只读命令（`/status`、`/help`、`/tasks`、`/sessions`、`/goal`、
-  `/diff`、`/watch`（**含** `/watch sub-N`））在每个泵点当场派发并当场画一帧；`/new`、`/resume`
+  `/diff`、`/watch`（**含** `/watch sub-N`））在每个泵点当场派发并当场画一帧；`/model` 与
+  `/effort`（裸命令开浮层、`/model <名字>` 这类带参形态都算）同样在泵点当场生效 ——
+  它们在浮层里选完/敲完就改状态并落一条 `session/model`，**下一个 step 的请求**已经是新模型；
+  `/title <新标题>` 早已同路。`/new`、`/resume`
   立刻回执并先中断当前回合（历史保留），`/compact` 排 step 边界，`/continue`、`/exit` 与其余命令
   等回合结束（steer 仍是「运行中输入的文本在下一个 step 边界被采纳」）。**插不进泵点的只有两段**：
   DNS 解析（≤5 s）与 TLS 握手（≤`timeout_ms`），都在工具链调用内部。
@@ -395,6 +398,14 @@ DEEPSEEK_API_KEY=sk-xxx ./build/uya-agent \
   **切模型不做上下文迁移**：历史原样保留，`{{model}}` 是建会话时求值的，所以 persona 里仍是旧
   模型名。选择进会话日志（`session/model`）但不进索引独立字段；子代理继承父的
   provider/model/强度，但**不能自己切**。
+* **切模型会连端点与凭据一起跟随**（P37）：目录故意不存 `baseURL`（存了就要把凭据链复制成
+  第二份），所以换提供方时**重新解析**那条路线 —— `base_url` / `apiKeyEnv` 解出来的密钥 /
+  `api` 线协议三样一起换，并**逐 step 重建请求头**（否则 URL 走了、`Authorization` 还是旧
+  提供方的）。三条硬边界：**显式优先**（`--base-url` / `--api-key` / `--api` 或对应的 env 给过
+  的值一律不被覆盖，来源码在 `--print-config` 里印成 `cli`/`env`）；**绝不把旧密钥发给新主机**
+  （新提供方解析不出凭据就清空 key 并告警，而不是沿用上一把）；**没声明 `baseURL` 的提供方**
+  不动端点，只留一行说明（静默清空比「没跟上」更坏）。`--resume` 跟随会话记录的 provider 时
+  走同一条路。见 [DESIGN.md §16 踩坑 96](DESIGN.md)。
 * **推理强度两条协议都发**：completions 走顶层 `reasoning_effort`（字段排在 `max_tokens`
   之后，保住前缀缓存），responses 走 `reasoning.effort`；`compat.supportsReasoningEffort=false`
   或 `off`/`none` 时不发。此前只有 responses 发，默认路由是 completions ⇒ 配置被静默丢弃
