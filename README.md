@@ -180,14 +180,20 @@ readelf -lW build/uya-agent | grep -c INTERP    # 0 = 真静态
 
 ## 2. 工具
 
-模型可调用的 28 个工具（顺序固定，跨模式恒定可见）：
+模型可调用的 29 个工具（顺序固定，跨模式恒定可见）：
 
 | 组 | 工具 |
 |---|---|
 | 文件 | `read` `write` `edit` `glob` `grep` |
 | 执行 | `bash` `job_list` `job_output` `job_kill`（`--no-shell` 时整组不出现） |
 | 会话与交互 | `workspace` `worktree` `set_title` `todo_write` `exit_plan_mode` `ask_user_question` |
-| 技能与搜索 | `skill` `web_search` |
+| 技能与搜索 | `skill` `uya_notes` `web_search` |
+
+`uya_notes`（P63）返回 **Uya 语言速查表**：入口与打印、显式类型（没有 `let`/`mut`/`i++`）、
+只有 `while` 没有 `for`、`!T` 错误处理与 `defer`、定长数组与结构体字面量、build/check 命令。
+它**原来是一节 system 提示词**，每轮请求都要付那 467 B；现在只在模型真要写 / 改 `.uya` / `.ush`
+时按需取 —— 每请求净省 ~224 B（system 少 469 B、工具表多 245 B）。工具是只读、零参数的，
+read-only 与 plan 模式下照常可用。
 | 子代理 | `subagent` `subagent_fork` `list_agents` `subagent_output` `send_message` `interrupt_agent` `ralph` |
 | 目标 | `create_goal` `get_goal` `update_goal` |
 | 编排 | `workflow` |
@@ -371,6 +377,10 @@ DEEPSEEK_API_KEY=sk-xxx ./build/uya-agent \
   最多 9 个数字直选键；自定义回答是**单行**；`space` 只在多选且未进入输入态时是勾选。
   回答语义对齐 DSH：单选自定义回答排他、多选 `selected` 与 `custom` 可同时带、跳过 = 空
   `selected`、取消 = dismissed 文案（与 `no answer channel` 分开）。
+* **提问弹窗的自定义回答行有可见插入点**（P63，修「能打字却看不见光标」）：真终端光标在
+  「运行中 + 浮层开着」时是被藏起来的（那时键全归浮层），而提问弹窗正是在跑工具时打开的 ——
+  所以这一行**自己画一格插入点**（反显，与 `/title` 那个单行输入框同口径）。它在文本之后
+  （自定义回答只在尾部追加/退格），未打字时也画。见 [DESIGN.md §16 踩坑 100](DESIGN.md)。
 * **提问弹窗的长内容不再跑出框外**（踩坑 81）：正文折行、多行全画，放不下才在末行补 `…`。
 
 **任务状态与目标**
