@@ -73,10 +73,11 @@ SRC := src/foundation/bufx.uya src/foundation/jsonx.uya src/foundation/yamlcfg.u
        src/tools/askuser.uya src/tools/fsx.uya src/tools/jobs.uya src/tools/perm.uya src/tools/sandboxx.uya src/tools/search.uya src/tools/shellx.uya \
        src/session/dshcfg.uya src/session/dshsess.uya src/session/inbox.uya src/session/modelx.uya src/session/procx.uya src/session/session.uya src/session/sigx.uya src/session/stats.uya \
        src/agent/agent.uya src/agent/ag_config.uya src/agent/ag_title_prompt.uya src/agent/ag_tools_schema.uya src/agent/ag_request_stream.uya src/agent/ag_workspace_model.uya src/agent/ag_worktree.uya src/agent/ag_interactive_tasks.uya src/agent/ag_tui_sessions.uya src/agent/ag_plan_pump.uya src/agent/compact.uya src/agent/deleg.uya src/agent/goal.uya src/agent/instr.uya src/agent/plan.uya src/agent/prompt.uya src/agent/skill.uya src/agent/todo.uya src/agent/workflow.uya \
+       src/pm/pm_repo.uya src/pm/pm_store.uya \
        src/vcs/gitx.uya src/vcs/worktreex.uya \
        src/media/clipx.uya src/media/imgx.uya \
        src/selftest/selftest.uya src/selftest/shellselftest.uya src/selftest/sigselftest.uya src/selftest/tuiselftest.uya \
-       src/selftest/st_core.uya src/selftest/st_mock_server.uya src/selftest/st_round_driver.uya src/selftest/st_tty_sse.uya src/selftest/st_sessions.uya src/selftest/st_read_window.uya src/selftest/st_view_watch.uya src/selftest/st_responses.uya src/selftest/st_stats_ctx.uya src/selftest/st_title.uya src/selftest/st_tasks_ws.uya src/selftest/st_goal_worktree.uya \
+       src/selftest/st_core.uya src/selftest/st_mock_server.uya src/selftest/st_round_driver.uya src/selftest/st_tty_sse.uya src/selftest/st_sessions.uya src/selftest/st_read_window.uya src/selftest/st_view_watch.uya src/selftest/st_responses.uya src/selftest/st_stats_ctx.uya src/selftest/st_title.uya src/selftest/st_tasks_ws.uya src/selftest/st_goal_worktree.uya src/selftest/st_pm.uya \
        src/selftest/tuis_core.uya src/selftest/tuis_title_pty.uya src/selftest/tuis_exit_cmd.uya src/selftest/tuis_diff_scroll.uya src/selftest/tuis_title_ask.uya src/selftest/tuis_sessions_big.uya src/selftest/tuis_tail.uya \
        src/diff/model.uya src/diff/gitcmd.uya src/diff/rows.uya src/diff/view.uya src/diff/render.uya
 OUT := build/uya-agent
@@ -89,7 +90,7 @@ TASK ?= 创建 hello.uya，编译并运行它
 export UYA_ROOT
 export UYA_SPLIT_C_DIR := $(CURDIR)/build/uyacache
 
-.PHONY: all check print-src build link-audit selftest codegen-audit doc-audit doc-cover probe e2e e2e-config e2e-exec e2e-accept-nudge e2e-config-flags e2e-title e2e-title-cmd e2e-title-auto e2e-mouse e2e-api e2e-steps e2e-permission e2e-sandbox e2e-tasks e2e-goal e2e-sessions e2e-resume-big e2e-diff e2e-ws e2e-model e2e-model-route e2e-worktree e2e-watch e2e-watch-pick e2e-dsh p30-check tui-demo tui-selftest sess-selftest diff-selftest model-selftest panel-selftest clean shell-selftest
+.PHONY: all check print-src build link-audit selftest codegen-audit doc-audit doc-cover probe e2e e2e-config e2e-exec e2e-accept-nudge e2e-config-flags e2e-title e2e-title-cmd e2e-title-auto e2e-mouse e2e-api e2e-steps e2e-permission e2e-sandbox e2e-tasks e2e-goal e2e-sessions e2e-resume-big e2e-diff e2e-ws e2e-model e2e-model-route e2e-worktree e2e-watch e2e-watch-pick e2e-dsh p30-check tui-demo tui-selftest sess-selftest diff-selftest model-selftest panel-selftest clean shell-selftest pm-selftest
 
 all: build
 
@@ -994,6 +995,10 @@ shell-selftest: build
 # P15/P40：子代理窗口面板的自测轮（几何 / 每行等宽 / 消息预览贴尾），改面板排版时比整轮快
 panel-selftest: build
 	UYA_SELFTEST_PANEL_ONLY=1 $(OUT) --selftest
+
+# P63：项目记忆的自测轮（项目身份归一 / 只追加分片 / 并发归并不丢更新），改 pm/ 时比整轮快
+pm-selftest: build
+	UYA_SELFTEST_PM_ONLY=1 $(OUT) --selftest
 
 clean:
 	rm -rf build
