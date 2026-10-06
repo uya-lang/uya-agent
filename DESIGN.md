@@ -3440,6 +3440,22 @@ responses 用 `{"type":"input_image","detail":"auto","image_url":…}`；
     （试过把它抬到 4096/2048，结果是编译器**自己**编不过 ——
     同一个洞在 `src/checker/symbols.uya` 的缓存比较里又露一次）。
 
+107. **自测夹具用相对路径 ⇒ 单跑绿、整轮红**（P70，本轮被 `make selftest` 当场抓住）：
+    MCP 那三条腿单跑（`UYA_SELFTEST_MCP_ONLY=1`）全绿，`make selftest` 整轮里却全红，
+    报的是「夹具 server 写不出来」。根因：夹具落在**相对路径** `build/selftest_mcp/`，
+    而整轮 selftest 里**前面好几轮会真的 chdir**（工作区那几轮、worktree 那几轮），
+    轮到这条线时 cwd 早不是仓库根了。纯函数那条腿（`mcp-name`）仍然绿 ——
+    正好说明红的确实是「夹具落盘」这一步，而不是实现本身。
+
+    这条教训本仓**早就写着**（`st_pm.uya` 的 `pms_root`、`st_goal_worktree.uya` 的
+    `wt_ws_pid` 都注明「用绝对路径，因为前面几轮会 chdir」），我第一版没照办。
+    改法：夹具根改成运行期算出的 `/tmp/selftest_mcp_<pid>`，收尾 `pm_rm_rf` 清掉
+    （与 st_pm 收它的 /tmp 根同一条口径）。
+
+    教训：**改自测时，单跑绿不算绿** —— 与「净增函数要清缓存重编」（踩坑 87）同族：
+    凡是「只在完整流程里才暴露」的环境依赖（cwd、环境变量、上一轮留下的全局状态、
+    构建缓存），都必须用**整轮**验证。本轮 `make selftest` 连跑两次都 PASS 才算数。
+
 ---
 
 ## 17. 工具实现要点
@@ -4365,6 +4381,10 @@ read-only 下钩子**一律不跑**的理由：钩子能改工具参数、能改
 | `mcp-handshake` | server 收到的 `initialize` 原文含 `clientInfo.name=uya-agent`；`notifications/initialized` 在 `tools/list` **之前**；两个工具（一个干净名、一个带点）都登记成归一化名；`inputSchema` 真的透传 |
 | `mcp-call` | server 收到的是 **raw 名**（不是公开名）；结果文本逐字节等于 server 回文；`arguments` 原样到达（没被双重转义） |
 | `mcp-degrade` | 不配 / 起不来 / 崩掉都是 0 工具 + 有诊断；`-32601` 放行；read-only 不跑钩子且工具被拒；**收口后活着的子进程 = 0**（不留孤儿） |
+
+夹具是**现场写盘的纯 sh server**（`/bin/sh` + `sed`，不依赖 python/node），
+落在 `/tmp/selftest_mcp_<pid>` —— **绝对路径**（前面几轮 selftest 会真 chdir，
+相对路径会在别处建目录；见 §16 踩坑 107），收尾清掉。
 
 **三条防假绿对照实验**（都先看到红，再改回来）：
 
