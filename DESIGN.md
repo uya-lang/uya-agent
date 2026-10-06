@@ -1986,6 +1986,14 @@ READY ──wt_finish──▶ FINISHED
 `cwd` 是唯一弹性字段（少于 8 列整段丢）；**内存**是状态字段里唯一会**先**让位的
 （32 列最小画布只剩 `ctx` / `cpu`，**`ctx` / `cpu` 永远不丢**）；没统计时右半区退回版本号。
 
+**`cpu` / `内存` 的范围（P24b）**：**本会话进程树**里 comm 相同的进程 —— 本进程 +
+它的后代（子代理、workflow 子进程）。**不是**机器上所有 uya-agent：那条老口径
+（P18/P24）会把别的终端、别的 worktree 的实例算到用户头上，实测 14 个同名进程合计
+338 MB 对着本会话树的 9 MB，一个空闲 agent 显示「内存 300M」（§16 踩坑 104）。
+判别分两步、缺一不可：先沿**所有**进程的 ppid 做传递闭包定出树（跨 comm 也要穿过去，
+否则 agent → bash → 嵌套 agent 这条链会断），**再**在求和时过滤 comm（工具子进程
+bash / node / python 峰值可达 GB 级，不算进来是刻意的）。
+
 **常驻状态区为什么钉在面板上方而不是留在转录里**：
 转录铺满视口时，那条「转录最后一行」的状态行会被**挤掉** —— 长会话里屏幕上**一个动的字节都没有**
 （踩坑 32）。
@@ -2196,14 +2204,14 @@ web 服务器（递归），而不是跑 TUI。实测症状：子进程 fork 出
 | poll 槽 | 就绪时做什么 |
 |---|---|
 | listen | `srv_accept_nb` 收连接挂进连接表 |
-| 会话 master（读） | `web_pty_ready`：有 `POLLIN` 就 `web_read_pty`（最多 16 KiB → `emu_feed` → 重算图片锚点）；**没有 `POLLIN` 而给了 `POLLHUP`/`POLLERR` 就 `web_pty_eof`**（子进程没了 —— 关 master + 回收僵尸 + `alive=false`；见踩坑 104） |
+| 会话 master（读） | `web_pty_ready`：有 `POLLIN` 就 `web_read_pty`（最多 16 KiB → `emu_feed` → 重算图片锚点）；**没有 `POLLIN` 而给了 `POLLHUP`/`POLLERR` 就 `web_pty_eof`**（子进程没了 —— 关 master + 回收僵尸 + `alive=false`；见踩坑 105） |
 | 会话 master（写） | `web_write_pty`：待发按键字节写进去（非阻塞，写不完留着） |
 | 连接（读） | `web_service_conn`：READ 收请求并分派 / STREAM 只可能是对端关了 |
 | 连接（写） | `web_flush_conn`：chunked 推帧 |
 
 **顺序有讲究**：先读 PTY（产出数据）再推帧（消费数据），这样「按键 → 屏幕更新」只经
 过一圈（50 ms）；反过来会慢一圈。**PTY 读槽内部也有顺序**：先 `POLLIN` 后 `POLLHUP` ——
-子进程退出前写出去的那一帧要读干净（踩坑 104）。
+子进程退出前写出去的那一帧要读干净（踩坑 105）。
 
 **任何一处阻塞都会冻住全部**（同一个进程里还有 LLM 请求与工具循环），所以读/写一律
 非阻塞，等就绪只靠这一次 poll。
@@ -3335,7 +3343,23 @@ responses 用 `{"type":"input_image","detail":"auto","image_url":…}`；
     比 `get_argv(0)` 可靠：后者可能是相对路径或软链，而 execve 时的 cwd 已经变了，
     且 execve 不查 PATH）。
 
-104. **「EOF 只认 `read == 0`」+ 水平触发的 `POLLHUP` = 主循环空转，页面上表现为「打不进字」**（P69，用户报的「web 页面不能输入」）：
+104. **脚注的「内存」用机器级同名口径 ⇒ 把别人的会话算到用户头上**（P24b，用户报的）：
+    用户报「状态栏内存显示 300M，为什么这么大」。查下来不是泄漏也不是算错，是**口径**：
+    `procx_scan` 原先枚举整个 `/proc`，凡是 comm 等于 `uya-agent` 的一律累加，
+    于是**别的终端、别的 worktree、别的 `--web` 服务端**全算进这一条会话的数字里。
+    实测同一台机器上 14 个同名进程 PSS 合计 338 MB，而本会话的进程树只有 9 MB ——
+    一个**空闲**的 agent 显示「内存 300M」。这不是显示 bug：数字与它声称的口径一致，
+    但那个口径对「我这条会话占了多少」这个问题是错的。
+    修法：范围改成「本进程 + 它的后代里 comm 相同的那批」。两个细节值钱：
+    ① **树判别必须沿所有进程的 ppid 走，comm 只在最后求和时过滤** —— 合成一个
+    bool 就会切断 agent → `bash`（工具子进程，comm 不同）→ 嵌套 agent 这条真实存在的
+    链（`bash` 里再跑一个 agent 是 workflow / selftest 的常规形态）；
+    ② **`/proc` 的 readdir 不是拓扑序**，子进程可能排在父进程前面，所以标记要用
+    不动点反复扫（一趟扫会漏链路中段，症状是数字偶尔偏小、复现不了）。
+    判据：`cpu-live` 那条断言从「进程数涨」收紧成**严格相等**（`base + 1`）——
+    写成 `>=` 的话，把全机同名都算进来这个老口径照样绿，而那正是这条 bug 的来源。
+
+105. **「EOF 只认 `read == 0`」+ 水平触发的 `POLLHUP` = 主循环空转，页面上表现为「打不进字」**（P69，用户报的「web 页面不能输入」）：
     现场：用户开着三台 `--web`（8834/8836/8837），每台 **CPU 99.8%**、`/proc/<pid>/io`
     的 `syscr` 各 **20 亿**次而 `syscw` 只有 5～9（纯忙等），每台底下各躺一个
     `<defunct>` 僵尸子进程（退出码 130/143 = 128+sig，是 sigx 那条「128+信号」的路）。
@@ -3528,10 +3552,11 @@ DEEPSEEK_API_KEY=sk-xxx ./build/uya-agent \
 | `stats-context` | 占用率/`projectedTokens`/`~已用 / 容量`/20 格分段条逐字节 |
 | `stats-usage` | 端到端一轮（只给这轮开 usage），回合正常结束 |
 | `stats-log` | `step/start`↔`step/end` 成对、回放与实时逐字节相同 |
-| `procx-parse` | `/proc/<pid>/stat`：comm 取首 `(` 到末 `)`、utime/stime 第 12/13 字段、坏行必须失败 |
+| `procx-parse` | `/proc/<pid>/stat`：comm 取首 `(` 到末 `)`、ppid 第 2 字段、utime/stime 第 12/13 字段、坏行必须失败 |
 | `procx-percent` | `Δticks × 1000 / Δms`：0/37/100/250、`Δms=0` 不可算、钳 999、`USER_HZ=100` |
+| `procx-tree` | P24b 进程树判别（纯函数合成数据）：root/子/孙、**行序打乱**（子先于父）、**跨 comm 桥接**（agent→bash→agent）、20 层链、父不在表里、root 不在表里、自环与 `ppid=0` 不卡死、空表 |
 | `procx-mem` | `Pss:`/`VmRSS:` 解析与显示（`0K`…`65.7G`，`-1` 不写字节） |
-| `cpu-live` | 忙循环子进程：进程数涨、`cpu ≥ 25`、内存 ≥ 1 MiB；只建基线不给百分比 |
+| `cpu-live` | 忙循环子进程：进程数**恰好** +1（严格相等 —— 老的全机口径会让这条红）、`cpu ≥ 25`、内存 ≥ 1 MiB；只建基线不给百分比 |
 | `tui-pty` | 真 PTY：备用屏幕、SIGWINCH、`/exit` 退出码 0、退出后 `TCGETS` 逐位还原；P22 标题 |
 | `tui-exit` | 完整主循环：面板选 `/help` 后正文进转录；不发任何请求 |
 | `tui-quit` | 真 PTY：`sleep 15` 时 ctrl+d 5 秒内退出、esc 当场杀工具、`/exit` 码 0 |
@@ -3633,7 +3658,7 @@ DEEPSEEK_API_KEY=sk-xxx ./build/uya-agent \
 | `web-http` | P60 HTTP 侧纯函数：`srv_query_get` 能从**带路径前缀**的 URL 里取到参数（修过的「永远 missing id」回归）+ `web_addr_parse` 三形态（默认 8787 / 127.0.0.1:PORT / 0.0.0.0:0）三拒绝（别的 IP / 缺端口 / 非数字端口）+ `web_id_is_hex` 拒绝 `../` 与 `/`（路径穿越） |
 | `web-page` | P60 页面：顶栏 `tabs` / `+` 按钮 / 六个端点标识齐全；**整份 HTML 里没有任何外链**（`http://` / `https://` / `src="//"` —— 不引 xterm.js、不走 CDN 的机器判据）；JS 里有方向键映射 |
 | `web-dispatch` | P60 分派语义：非长连接端点（`GET /`、`POST /api/sessions`）必须返回 **false**（= 关连接）。防假绿对照：把 `GET /` 改回 `return web_ep_index(c);` 重编 ⇒ 当场红（这是「一次 `+` 建两条会话」那条真回归的判据） |
-| `web-pty` | P69 会话子进程死后的收口（踩坑 104）：真 fork + 真 PTY 喂主循环真正用的那一支 `web_pty_ready`，断四条 —— ① 退出前那一段输出在网格里（钉「先 `POLLIN` 后 `POLLHUP`」的顺序）② 收口（`alive=false`、`master=-1`、`pid` 清零、子进程不再是 `<defunct>` 僵尸）③ **循环有限圈内结束**（不忙等）④ 重复喂 HUP 幂等。防假绿对照：把 HUP 那一支摘掉重编 ⇒ 当场红五条（`循环圈数=64 master=5`），正是用户那三台实例的状态（`syscr` 20 亿 / CPU 100% / 页面打不进字） |
+| `web-pty` | P69 会话子进程死后的收口（踩坑 105）：真 fork + 真 PTY 喂主循环真正用的那一支 `web_pty_ready`，断四条 —— ① 退出前那一段输出在网格里（钉「先 `POLLIN` 后 `POLLHUP`」的顺序）② 收口（`alive=false`、`master=-1`、`pid` 清零、子进程不再是 `<defunct>` 僵尸）③ **循环有限圈内结束**（不忙等）④ 重复喂 HUP 幂等。防假绿对照：把 HUP 那一支摘掉重编 ⇒ 当场红五条（`循环圈数=64 master=5`），正是用户那三台实例的状态（`syscr` 20 亿 / CPU 100% / 页面打不进字） |
 | `tui-full` | P53 浮层全屏四组：**A** 非全屏仍是居中框（不顶格、`≤16` 行上限、第 30 项看不见）→ 全屏框 = 转录区（顶边第 0 行、左右边框 0 与 `cols-1`、标题 ` · 全屏`、行偏移表口径的逐行闭合、底边**正好**在 `panel_top-1`）+ 16 行上限解除（第 20 项可见、第 30 项仍不可见）；**B** `ctrl+f`（`0x06`）与 `F11`（`ESC[23~`）都切换，且**四种形态各认一次**（列表 / reader / ask / input）；**C** 不吃面板 / 状态区 / 脚注；**D** 没浮层时只落 notice、全屏态不跨浮层残留、`esc` 关掉后转录回来，终端太矮时 fail-closed 判据不变；**F** `/fullscreen` 四态（裸报状态 / `on` / `off` / 非法值只报错且状态不动、重复 `off` 幂等） |
 | `overlay-fullscreen` | `make p30-check` 第 9 场（真终端 + 假网关）：屏幕几何判据 —— 非全屏顶边 > 0 行且左边框 > 0 列 → `ctrl+f` 后顶边第 0 行、左右边框正好 `0` 与 `cols-1`、标题带 ` · 全屏`、面板与脚注都还在、底边行 < 面板行 → `F11` 关回居中 → 再全屏、`esc` 关掉后方框消失 |
 | `watch-pick-e2e` | `make e2e-watch-pick`：真终端 + 假网关两条腿 —— ①裸 `/watch` → 清单 → **一次回车**开跟随浮层（`[step …]`/`▸ bash …` 仍在子代理结束之前上屏）；②假网关把父代理的收尾按住 12 s，期间敲 `/watch sub-1` 必须**当场**开浮层（屏幕上还没有 `PARENT-DONE-OK`） |
