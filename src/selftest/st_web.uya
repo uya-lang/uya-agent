@@ -1,14 +1,16 @@
-// src/selftest/st_web.uya — web 界面（P60）的自测轮：emu / http / page
+// src/selftest/st_web.uya — web 界面（P60）的自测轮：emu / http / page / pty
 //
-// 本文件：三轮离线自测 —— `web-emu`（服务端终端解释器）、`web-http`（HTTP 端点
-//   与页面）、`web-page`（零外链与端点标识）。
+// 本文件：四轮离线自测 —— `web-emu`（服务端终端解释器）、`web-http`（HTTP 端点
+//   与页面）、`web-page`（零外链与端点标识）、`web-pty`（会话子进程死后主循环
+//   必须收口，不能空转）。
 // 不变量：① 判据走**字节级**比较，不比「看起来对不对」——`web-emu` 的核心断言是
 //   「解释器解出的网格文本与 TUI 自己的 `tui_screen_text()` **逐行相同**」，这正是
 //   把解释器放在服务端的全部理由（见 ttyemu.uya 的文件头）；② 全部离线：不连网、
-//   不开子进程 PTY（真 PTY 那部分留给手验与 `web-pty` 的既有覆盖），只喂**真实
-//   捕获的 TUI 帧字节**给解释器；③ 断言失败只置 ok、不早退（一次看到所有红）。
-// 依赖：本仓 foundation/bufx、web/ttyemu、web/webui、term/tui（画一帧给解释器吃）、
-//   selftest 的公共断言工具（`tuis_*`）。
+//   不 exec 任何东西；只有 `web-pty` 那一轮**真 fork + 真 PTY**（它的判据就是
+//   「子进程真的死了之后会怎样」，假不了），其余三轮只喂**真实捕获的 TUI 帧字节**
+//   给解释器；③ 断言失败只置 ok、不早退（一次看到所有红）。
+// 依赖：本仓 foundation/bufx、web/ttyemu、web/webui、web/websrv、web/webpump、
+//   term/tui（画一帧给解释器吃）、selftest 的公共断言工具（`tuis_*`）。
 // 命名：`web_*_round`；内部 `web_t_*`。
 
 // 把一段字节喂给解释器，再把网格导成文本。`out` 先 reset。
@@ -532,4 +534,173 @@ fn web_t_dispatch_expect_false(cfg: &const Config, t: &WebTable, c: &WebConn,
 fn web_t_dispatch(cfg: &const Config, t: &WebTable, c: &WebConn,
     req: &const byte, ok: &bool, tag: &const byte) bool {
     return web_t_dispatch_expect_false(cfg, t, c, req, tag, ok);
+}
+
+// ============================================================
+// web-pty：会话子进程死掉之后，主循环必须**收口**而不是空转
+// ============================================================
+
+// 这一轮的现场（DESIGN §16 踩坑 104）：子进程退出后 PTY master 上的 `read` 返回
+// **EIO**（不是 0），而只认 `n == 0` 的旧判据收不掉它；master 不关 ⇒ 水平触发的
+// `POLLHUP` 每圈都让这个槽「就绪」⇒ 主循环纯忙等（实测 `syscr` 20 亿 / CPU 100%），
+// 页面上则表现为**打字没有任何反应**。
+//
+// 判据全部走主循环真正用的那一支 `web_pty_ready`（不是另写一份等价判断 ——
+// 那样就变成「自测绿、真机红」）。四条：
+//   ① **最后一帧不丢**：子进程退出前写的字节要出现在网格里
+//      （先 `POLLIN` 后 HUP，这条钉住顺序）；
+//   ② **收口**：HUP 之后 `alive == false`、`master == -1`、子进程被回收
+//      （不再是 `<defunct>` 僵尸）；
+//   ③ **不忙等**：循环有限圈内结束（带 bug 的版本 ①②③ 全红，且这里会先撞圈数上限）；
+//   ④ **幂等**：再喂一次 HUP 什么都不变。
+export fn web_pty_round(tag: &const byte) bool {
+    var ok: bool = true;
+    var t: WebTable = web_table_zero();
+    web_table_init(&t);
+    defer { web_table_free(&t); }
+    var slave: Buf = buf_new(64);
+    defer { buf_free(&slave); }
+    const m: i32 = web_t_pty_open(&slave, 100, 30);
+    if m < 0 {
+        tuis_ok(tag, "跳过（打不开 /dev/ptmx）");
+        return true;
+    }
+    // 子进程：写一段可识别字节，然后**退出**（不关 fd 也一样 —— 进程一没，
+    // 从设备就没有持有者了，master 上立刻是 HUP/EIO）
+    const pid64: i64 = sys_fork() catch {
+        srv_close(m);
+        tuis_fail(tag, "fork 失败", &ok);
+        return false;
+    };
+    if pid64 == 0 {
+        const sf: i32 = sys_open(slave.ptr as *const byte, 0x102, 0) catch {
+            -1;
+        };
+        if sf < 0 {
+            sys_exit(9);
+        }
+        var msg: [byte: 16] = "PTYLASTFRAME\r\n";
+        _ = sys_write(sf, &msg[0], 15) catch {};
+        sys_exit(0);
+    }
+    const s: &WebSession = &t.items[0];
+    web_session_zero(s);
+    if !emu_init(&s.emu, 100, 30) {
+        srv_close(m);
+        tuis_fail(tag, "emu_init 失败", &ok);
+        return false;
+    }
+    s.master = m;
+    s.pid = i64_to_i32(pid64);
+    s.alive = true;
+    t.n = 1;
+    const closed_at: usize = web_t_pty_pump(&t, s);
+    // ③ 不忙等：带 bug 时 master 永不关闭 ⇒ 这里必然停在上限
+    if s.master >= 0 {
+        tuis_fail(tag,
+            "子进程死了但 master 没关（poll 会永远就绪 ⇒ 主循环空转、页面打不进字）",
+            &ok);
+        tuis_puts("  循环圈数=");
+        tuis_num(closed_at);
+        tuis_puts(" master=");
+        tuis_num(s.master as usize);
+        tuis_puts("\n");
+    }
+    web_t_pty_assert_closed(tag, s, pid64 as i32, &ok);
+    // ④ 幂等：再喂一次 HUP
+    web_pty_ready(&t, 0, POLLHUP);
+    if s.master >= 0 || s.alive {
+        tuis_fail(tag, "重复喂 HUP 改变了状态（收口不幂等）", &ok);
+    }
+    if ok {
+        tuis_puts("  循环圈数=");
+        tuis_num(closed_at);
+        tuis_puts("（有限 ⇒ 不空转）\n");
+        tuis_ok(tag,
+            "PTY 收口：最后一帧不丢 + HUP 关 master/回收子进程/标 dead + 幂等");
+    }
+    return ok;
+}
+
+// 跑到这条会话收口为止（**上限 64 圈**：带 bug 的版本永远收不掉，上限就是判据
+// ③「不忙等」的机器实现）。返回实际圈数。
+fn web_t_pty_pump(t: &WebTable, s: &WebSession) usize {
+    var rounds: usize = 0;
+    while rounds < 64 && s.master >= 0 {
+        rounds = rounds + 1;
+        var pfds: [PollFd: 1] = [
+            PollFd{ fd: s.master, events: POLLIN, revents: 0 },
+        ];
+        const pr: i32 = sys_poll(&pfds[0], 1, 200) catch { 0; };
+        if pr > 0 && pfds[0].revents != 0 {
+            web_pty_ready(t, 0, pfds[0].revents);
+        }
+    }
+    return rounds;
+}
+
+// 收口之后的四条断言：① 最后一帧不丢 ② `alive == false` ③ `pid` 清零（= 真的
+// waitpid 收到了）④ 子进程不再是僵尸。只置 ok，不早退（与文件头不变量 ③ 同口径）。
+fn web_t_pty_assert_closed(tag: &const byte, s: &const WebSession, pid: i32,
+    ok: &bool) void {
+    // ① 最后一帧不丢（子进程退出前写的字节必须在网格里）
+    var text: Buf = buf_new(8192);
+    defer { buf_free(&text); }
+    emu_text(&s.emu, &text);
+    if !web_t_contains(&text, "PTYLASTFRAME" as &const byte) {
+        tuis_fail(tag, "子进程退出前的最后一段输出丢了（应先 POLLIN 后 POLLHUP）",
+            ok);
+    }
+    // ② 收口
+    if s.alive {
+        tuis_fail(tag, "会话仍标着 alive（页面上这条会话永远「活着」）", ok);
+    }
+    // ③ `pid` 清零。这**本身**就是「真的收到了」的判据（`web_reap_child` 只在
+    // waitpid 收到那个 pid 时才返回 true）—— 留着旧 pid 会在退出收尾时 `kill`
+    // 一个可能已被内核回收复用的 pid，那是**误杀别人**。
+    if s.pid != 0 {
+        tuis_fail(tag, "子进程没被回收（pid 还留着 ⇒ 退出时可能误杀复用的 pid）",
+            ok);
+    }
+    // ④ 不是僵尸：再 wait 一次应该收不到它了（ECHILD）。
+    var st: i32 = 0;
+    const w: i32 = sys_waitpid(pid, &st, 1) catch { -1; };
+    if w == pid {
+        tuis_fail(tag, "子进程还是僵尸（没有 waitpid 回收）", ok);
+    }
+}
+
+// 开一对 pty（与 websrv 的 `web_pty_open` 同一套 ioctl；自测自己开一份，
+// 不去动生产代码里的私有件）。返回 master fd，slave 路径写进 slave_path。
+fn web_t_pty_open(slave_path: &Buf, cols: usize, rows: usize) i32 {
+    var ptmx: [byte: 16] = "/dev/ptmx";
+    const m: i32 = sys_open(&ptmx[0] as *const byte, 0x102, 0) catch { -1; };
+    if m < 0 {
+        return -1;
+    }
+    var zero: i32 = 0;
+    if (sys_ioctl(m, 0x40045431, web_t_addr(&zero as &const void)) catch {
+        -1;
+    }) != 0 {
+        srv_close(m);
+        return -1;
+    }
+    var num: i32 = 0;
+    if (sys_ioctl(m, 0x80045430, web_t_addr(&num as &const void)) catch {
+        -1;
+    }) != 0 {
+        srv_close(m);
+        return -1;
+    }
+    buf_reset(slave_path);
+    _ = buf_append_cstr(slave_path, "/dev/pts/");
+    _ = buf_append_u64(slave_path, num as u64);
+    _ = buf_append_byte(slave_path, 0);     // 尾 NUL：这个路径要直接喂 sys_open
+    web_set_winsize(m, cols, rows);
+    return m;
+}
+
+// 指针 → i64（ioctl 的地址参数要整数）。
+fn web_t_addr(p: &const void) i64 {
+    return (@usize_from_ptr(p)) as i64;
 }

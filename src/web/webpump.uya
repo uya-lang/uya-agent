@@ -1,8 +1,9 @@
 // src/web/webpump.uya — web 界面的主循环：一次 poll 管住所有 fd
 //
 // 本文件：入口（`web_run`）、地址解析（`web_addr_parse`）、主循环与一次泵
-//   （`web_loop` / `web_poll_once`）、以及五条具体动作 —— 收连接
-//   （`web_accept_conn`）、读 PTY 喂解释器（`web_read_pty`）、写 PTY
+//   （`web_loop` / `web_poll_once`）、以及具体动作 —— 收连接
+//   （`web_accept_conn`）、PTY 读槽就绪（`web_pty_ready`：读 `web_read_pty` /
+//   收口 `web_pty_eof` + `web_reap_child`）、写 PTY
 //   （`web_write_pty`）、服务连接（`web_service_conn`）、推帧（`web_push_frame`）。
 // 不变量：① **一次 `poll` 覆盖五类 fd**：listen、每个会话 master 的读、每个
 //   会话 master 的写（有待发输入时）、每个连接的读/写。会话 ≤8、连接 ≤32，定长
@@ -11,8 +12,12 @@
 //   写连接都是**非阻塞**的：写不完就把余量留在缓冲里，下一圈 `POLLOUT` 接着写
 //   （阻塞写会让整个 agent 冻住，而它在同一个进程里）；④ `web_push_frame` 只在
 //   差分非空时发 —— 空帧一个字节都不发（否则 20 帧/秒的空转流量）；⑤ 子进程死了
-//   （PTY 读到 EOF）就把那条会话标 `alive=false` 但**留着标签** —— 屏幕上是最后
-//   一帧，用户还能看见它说了什么（自动删标签会让「刚才那条怎么没了」无从解释）；
+//   就把那条会话标 `alive=false` 但**留着标签** —— 屏幕上是最后一帧，用户还能看见
+//   它说了什么（自动删标签会让「刚才那条怎么没了」无从解释）；判死的依据是
+//   **`poll` 的 `POLLHUP`/`POLLERR`**，不是 `read` 的返回值（子进程死后 master 上
+//   的 `read` 给的是 EIO 而不是 0，只认 0 会收不掉 ⇒ 水平触发的 HUP 让主循环空转、
+//   页面上表现为打不进字 —— §16 踩坑 104）；收口时必须**关 master**（否则它永远
+//   留在 poll 集合里「就绪」）并回收子进程（否则留 `<defunct>` 僵尸）；
 //   ⑥ 退出走 `web_quit_wanted()`（ctrl+c → sigx 置位），收尾时按进程组收所有子进程。
 // 依赖：无 `use` 行（合并命名空间）；本仓 net/httpsrv（`srv_*`）、web/ttyemu
 //   （`emu_*`）、web/websrv（会话表）、web/webhttp（连接与端点）、session/sigx
@@ -240,7 +245,7 @@ fn web_poll_once(cfg: &const Config, t: &WebTable, lfd: i32,
                     web_accept_conn(&conns[0], &used[0], lfd);
                 }
             } else if kind[k] == WEB_PK_PTY_R {
-                web_read_pty(t, idx[k]);
+                web_pty_ready(t, idx[k], rv);
             } else if kind[k] == WEB_PK_PTY_W {
                 web_write_pty(t, idx[k]);
             } else if kind[k] == WEB_PK_CONN {
@@ -280,6 +285,73 @@ fn web_accept_conn(conns: &WebConn, used: &bool, lfd: i32) void {
     srv_close(fd);
 }
 
+// 处理一个就绪的 PTY 读槽。**顺序有讲究**：先读（`POLLIN`）再判死（`POLLHUP`）。
+//
+// 为什么不写成「只处理 POLLIN」：子进程死了之后，PTY master 上的 `poll` 会**永远**
+// 返回 `POLLHUP`/`POLLERR`（水平触发，实测 1 秒 62 万次），而 `read` 返回的是
+// **EIO**（不是 0，见 `web_pty_eof`）。于是这个槽每圈都「就绪」、每圈白读一次 ⇒
+// 主循环变成纯忙等（实测：`syscr` 涨到 20 亿、CPU 100%），而 `master` 永不关闭 ⇒
+// 会话永远 `alive`，页面上**打字没有任何反应**（`POST /api/input` 照旧回 ok，
+// 只是再没有东西把帧推回去）。见 DESIGN §16 踩坑 104。
+//
+// 先判 `POLLIN` 是为了**不丢最后一帧**：子进程退出前写出去的字节会让 poll 同时
+// 给 `POLLIN|POLLHUP`，读空之后才只剩 `POLLHUP`（实测）。
+export fn web_pty_ready(t: &WebTable, i: usize, revents: i16) void {
+    if (revents & POLLIN) != 0 {
+        web_read_pty(t, i);
+        return;
+    }
+    if (revents & POLLHUP) != 0 || (revents & POLLERR) != 0 {
+        web_pty_eof(t, i);
+    }
+}
+
+// 收掉一条**真的结束**了的会话：关 master → 回收子进程 → 标 `alive = false`。
+// 但**留着标签与最后一帧**（理由见文件头不变量 ⑤）。
+//
+// 两个「为什么」：
+// ① 为什么这里才是 EOF 判据：子进程死后 PTY master 上的 `read` 返回 **EIO**
+//    （errno 5），**不是 0**。原来的判据只认 `n == 0`，于是死掉的会话永远收不掉
+//    （实测：三台实例里各躺一个 `<defunct>`，`syscr` 各 20 亿、CPU 100%）。
+//    非阻塞 fd 上的 EAGAIN 仍然不算 EOF —— 那条留在 `web_read_pty` 的 `n < 0`
+//    分支里等这里是（poll 报 HUP 才是真话）。
+// ② 为什么必须**关 master**：PTY 从设备关了之后，master 上的 `POLLHUP` 是水平
+//    触发的（每圈立刻返回），把它留在 poll 集合里就是忙等。
+export fn web_pty_eof(t: &WebTable, i: usize) void {
+    if i >= WEB_MAX_SESSIONS {
+        return;
+    }
+    const s: &WebSession = &t.items[i];
+    if s.master < 0 && !s.alive {
+        return;                     // 幂等：这条已经收过了
+    }
+    if s.master >= 0 {
+        srv_close(s.master);
+        s.master = -1;
+    }
+    if web_reap_child(s) {
+        // **收到之后必须清 pid**：`web_pty_close`（退出收尾）会 `kill(-pid)` 与
+        // `kill(pid)`，而 pid 已经被内核回收、可能被别的进程复用 —— 留着它去 kill
+        // 就等于**误杀别人**。收不到（子进程还活着、只是关了 tty）才留着 pid，
+        // 那种情况 kill 才是唯一能收干净的路。
+        s.pid = 0;
+    }
+    s.alive = false;
+}
+
+// 回收会话的子进程（**非阻塞**：WNOHANG）。返回「这次真的收到了」。
+// 不回收它就一直是 `<defunct>` 僵尸（实测：用户那三台实例各躺一个，父进程已经
+// 空转了 94 分钟）。
+fn web_reap_child(s: &WebSession) bool {
+    if s.pid <= 0 {
+        return false;
+    }
+    var st: i32 = 0;
+    // 第三参 `1` 是 WNOHANG（libc 没导出这个常量；与 sigselftest.uya 的既有写法一致）
+    const w: i32 = sys_waitpid(s.pid, &st, 1) catch { -1; };
+    return w == s.pid;
+}
+
 // 读一条会话的 PTY：一次最多 WEB_READ_CHUNK，读完塞进解释器。
 // 读不到（EOF / 出错）就把这条会话标成 `alive = false` 并关掉读侧 ——
 // 但**留着标签与最后一帧**（理由见文件头不变量 ⑤）。
@@ -304,11 +376,10 @@ fn web_read_pty(t: &WebTable, i: usize) void {
     // n < 0：**不能**当成结束 —— 非阻塞 fd 上 `poll` 说可读之后 `read` 仍可能
     // 返回 EAGAIN（信号打断、或同一圈里被别的读抢走），把它当 EOF 会让会话
     // 「刚开就被判死」（实测：页面上一条会话都没有帧）。所以这里只留着，
-    // 下一圈 poll 会说真话；真死掉的会话由 n == 0 那一支收掉。
+    // 下一圈 poll 会说真话 —— 真死掉的会话由 `web_pty_ready` 的 HUP 分支收掉
+    // （子进程死后 `read` 给的是 EIO，不是 0；见 `web_pty_eof`）。
     if n == 0 {
-        s.alive = false;
-        srv_close(s.master);
-        s.master = -1;
+        web_pty_eof(t, i);
     }
 }
 

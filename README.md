@@ -188,6 +188,10 @@ uya-agent --web 127.0.0.1:9000     # 指定端口（端口写 0 = 内核分配�
   通用终端：在里面跑一个需要滚屏区/字符集切换的全屏程序不会正确显示 —— 但 `uya-agent`
   自己的 TUI 与它的 `bash` 工具不受影响。
 * 图片附件（`/image`）会显示在正文里；**粘贴剪贴板**（`ctrl+v` / `/paste`）请回终端用。
+* 会话子进程（那条 TUI）退出后，标签**留着**、屏幕上是它的最后一帧，但那条会话
+  不会再接受输入 —— 点 `+` 新建一条，或点标签上的 `x` 把它摘掉。判据是服务端已经
+  把 master 关掉、子进程也回收了（P69 修掉的那条「子进程死了之后主循环空转、
+  页面上打不进字」见 DESIGN §16 踩坑 104）。
 
 ---
 
@@ -249,7 +253,7 @@ make selftest              # 全量：清缓存重编 + link-audit + codegen-aud
 make tui-selftest          # 分域快速轮：只跑 TUI
 make sess-selftest         # 只跑 /sessions 与大日志
 make diff-selftest         # 只跑 src/diff/
-make web-selftest          # 只跑 web 界面（服务端终端解释器 / HTTP 侧 / 页面 / 分派语义）
+make web-selftest          # 只跑 web 界面（服务端终端解释器 / HTTP 侧 / 页面 / 分派语义 / PTY 收口）
 make pm-selftest           # 只跑 src/pm/（项目记忆）
 make UYA_SELFTEST_ONLY=x,y # 只跑指定的几轮
 ```
