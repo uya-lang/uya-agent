@@ -2204,13 +2204,14 @@ web 服务器（递归），而不是跑 TUI。实测症状：子进程 fork 出
 | poll 槽 | 就绪时做什么 |
 |---|---|
 | listen | `srv_accept_nb` 收连接挂进连接表 |
-| 会话 master（读） | `web_read_pty`：最多 16 KiB → `emu_feed` → 重算图片锚点 |
+| 会话 master（读） | `web_pty_ready`：有 `POLLIN` 就 `web_read_pty`（最多 16 KiB → `emu_feed` → 重算图片锚点）；**没有 `POLLIN` 而给了 `POLLHUP`/`POLLERR` 就 `web_pty_eof`**（子进程没了 —— 关 master + 回收僵尸 + `alive=false`；见踩坑 105） |
 | 会话 master（写） | `web_write_pty`：待发按键字节写进去（非阻塞，写不完留着） |
 | 连接（读） | `web_service_conn`：READ 收请求并分派 / STREAM 只可能是对端关了 |
 | 连接（写） | `web_flush_conn`：chunked 推帧 |
 
 **顺序有讲究**：先读 PTY（产出数据）再推帧（消费数据），这样「按键 → 屏幕更新」只经
-过一圈（50 ms）；反过来会慢一圈。
+过一圈（50 ms）；反过来会慢一圈。**PTY 读槽内部也有顺序**：先 `POLLIN` 后 `POLLHUP` ——
+子进程退出前写出去的那一帧要读干净（踩坑 105）。
 
 **任何一处阻塞都会冻住全部**（同一个进程里还有 LLM 请求与工具循环），所以读/写一律
 非阻塞，等就绪只靠这一次 poll。
@@ -3358,6 +3359,41 @@ responses 用 `{"type":"input_image","detail":"auto","image_url":…}`；
     判据：`cpu-live` 那条断言从「进程数涨」收紧成**严格相等**（`base + 1`）——
     写成 `>=` 的话，把全机同名都算进来这个老口径照样绿，而那正是这条 bug 的来源。
 
+105. **「EOF 只认 `read == 0`」+ 水平触发的 `POLLHUP` = 主循环空转，页面上表现为「打不进字」**（P69，用户报的「web 页面不能输入」）：
+    现场：用户开着三台 `--web`（8834/8836/8837），每台 **CPU 99.8%**、`/proc/<pid>/io`
+    的 `syscr` 各 **20 亿**次而 `syscw` 只有 5～9（纯忙等），每台底下各躺一个
+    `<defunct>` 僵尸子进程（退出码 130/143 = 128+sig，是 sigx 那条「128+信号」的路）。
+    页面上：`POST /api/input` 照旧回 `{"ok":true}`（我用 CDP 抓过，浏览器**确实**发了
+    `['h','e','l','l','o']` 五个请求），但屏幕一个字都不动 —— 看着连着，就是打不进字。
+    根因是两件各自都成立的事叠在一起：
+    ① **子进程死后 PTY master 上的 `read` 返回 `EIO`（errno 5），不是 0**。而
+    `web_read_pty` 当初只把 `n == 0` 当 EOF，`n < 0` 一律当「EAGAIN，留着下一圈」
+    （那条注释本身是对的：非阻塞 fd 上 poll 说可读之后 read 仍可能 EAGAIN）——
+    于是死掉的会话**永远收不掉**。
+    ② **PTY 从设备关了之后，master 上的 `POLLHUP` 是水平触发的**（实测 1 秒 62 万次
+    `poll` 立刻返回），而 `master` 永不关闭 ⇒ 这个槽每圈都「就绪」⇒ `web_poll_once`
+    空转：`read` 白读一次（EIO）、`web_push_all` 没有变化可推。用户看到的「打不进字」，
+    只是这条忙等链的末端现象（帧的差分源 `emu` 再没被喂过新字节）。
+    修法（`src/web/webpump.uya`）：把「PTY 读槽就绪」抽成 `web_pty_ready(t, i, revents)`：
+    **先判 `POLLIN` 读干净，再判 `POLLHUP`/`POLLERR` 走 `web_pty_eof`**（关 master +
+    `web_reap_child` 回收僵尸 + 清 `pid` + `alive=false`）。顺序不能反 —— 子进程退出前
+    写出去的字节会让 poll 同时给 `POLLIN|POLLHUP`，读空之后才只剩 `POLLHUP`（实测），
+    反了就会丢掉最后一帧。
+    收到之后**必须把 `pid` 清零**：`web_pty_close`（退出收尾）会 `kill(-pid)`/`kill(pid)`，
+    而 pid 已被内核回收、可能被复用 ⇒ 留着它就是**误杀别人**（`web_reap_child` 因此
+    返回「这次真收到了没有」，只有真收到才清）。收不到（子进程还活着、只是关了 tty）
+    才留着 pid —— 那种情况 kill 才是唯一能收干净的路。
+    判据：`web-pty` 轮（`make web-selftest`）真 fork + 真 PTY 走一遍主循环用的那一支，
+    断四条 —— ① 退出前那一段输出在网格里（钉顺序）② 收口（`alive=false`、`master=-1`、
+    `pid` 清零、子进程不再是僵尸）③ **循环有限圈内结束**（不忙等）④ 幂等。
+    防假绿对照：把 HUP 那一支摘掉重编 ⇒ 当场红五条（`循环圈数=64 master=5`），
+    这正是用户那三台实例的状态。
+    同族：`shellx.uya:357` / `gitx.uya:363` / `search.uya:89` / `jobs.uya:163` 本来就是
+    「`POLLIN` 或 `POLLHUP` 或 `POLLERR`」三条一起认的，只有 web 这条漏了 HUP。
+    教训：**「非阻塞读返回负数」有两个完全不同的原因（EAGAIN / 对端没了），
+    只认 `read == 0` 收不到第二种** —— 判死要靠 `poll` 的 `POLLHUP`/`POLLERR`，
+    而不是靠 `read` 的返回值。
+
 ---
 
 ## 17. 工具实现要点
@@ -3622,6 +3658,7 @@ DEEPSEEK_API_KEY=sk-xxx ./build/uya-agent \
 | `web-http` | P60 HTTP 侧纯函数：`srv_query_get` 能从**带路径前缀**的 URL 里取到参数（修过的「永远 missing id」回归）+ `web_addr_parse` 三形态（默认 8787 / 127.0.0.1:PORT / 0.0.0.0:0）三拒绝（别的 IP / 缺端口 / 非数字端口）+ `web_id_is_hex` 拒绝 `../` 与 `/`（路径穿越） |
 | `web-page` | P60 页面：顶栏 `tabs` / `+` 按钮 / 六个端点标识齐全；**整份 HTML 里没有任何外链**（`http://` / `https://` / `src="//"` —— 不引 xterm.js、不走 CDN 的机器判据）；JS 里有方向键映射 |
 | `web-dispatch` | P60 分派语义：非长连接端点（`GET /`、`POST /api/sessions`）必须返回 **false**（= 关连接）。防假绿对照：把 `GET /` 改回 `return web_ep_index(c);` 重编 ⇒ 当场红（这是「一次 `+` 建两条会话」那条真回归的判据） |
+| `web-pty` | P69 会话子进程死后的收口（踩坑 105）：真 fork + 真 PTY 喂主循环真正用的那一支 `web_pty_ready`，断四条 —— ① 退出前那一段输出在网格里（钉「先 `POLLIN` 后 `POLLHUP`」的顺序）② 收口（`alive=false`、`master=-1`、`pid` 清零、子进程不再是 `<defunct>` 僵尸）③ **循环有限圈内结束**（不忙等）④ 重复喂 HUP 幂等。防假绿对照：把 HUP 那一支摘掉重编 ⇒ 当场红五条（`循环圈数=64 master=5`），正是用户那三台实例的状态（`syscr` 20 亿 / CPU 100% / 页面打不进字） |
 | `tui-full` | P53 浮层全屏四组：**A** 非全屏仍是居中框（不顶格、`≤16` 行上限、第 30 项看不见）→ 全屏框 = 转录区（顶边第 0 行、左右边框 0 与 `cols-1`、标题 ` · 全屏`、行偏移表口径的逐行闭合、底边**正好**在 `panel_top-1`）+ 16 行上限解除（第 20 项可见、第 30 项仍不可见）；**B** `ctrl+f`（`0x06`）与 `F11`（`ESC[23~`）都切换，且**四种形态各认一次**（列表 / reader / ask / input）；**C** 不吃面板 / 状态区 / 脚注；**D** 没浮层时只落 notice、全屏态不跨浮层残留、`esc` 关掉后转录回来，终端太矮时 fail-closed 判据不变；**F** `/fullscreen` 四态（裸报状态 / `on` / `off` / 非法值只报错且状态不动、重复 `off` 幂等） |
 | `overlay-fullscreen` | `make p30-check` 第 9 场（真终端 + 假网关）：屏幕几何判据 —— 非全屏顶边 > 0 行且左边框 > 0 列 → `ctrl+f` 后顶边第 0 行、左右边框正好 `0` 与 `cols-1`、标题带 ` · 全屏`、面板与脚注都还在、底边行 < 面板行 → `F11` 关回居中 → 再全屏、`esc` 关掉后方框消失 |
 | `watch-pick-e2e` | `make e2e-watch-pick`：真终端 + 假网关两条腿 —— ①裸 `/watch` → 清单 → **一次回车**开跟随浮层（`[step …]`/`▸ bash …` 仍在子代理结束之前上屏）；②假网关把父代理的收尾按住 12 s，期间敲 `/watch sub-1` 必须**当场**开浮层（屏幕上还没有 `PARENT-DONE-OK`） |
