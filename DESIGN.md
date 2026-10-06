@@ -2920,6 +2920,50 @@ responses 用 `{"type":"input_image","detail":"auto","image_url":…}`；
    于是那条「找一屏只放得下一行的高度」的循环永远搜不到，症状是「这条腿没跑成」而不是「不通过」；
    ② `tuis_reset` 会 `tui_reset_all`，**把命令表也清掉** —— 循环里不重新 `tui_set_commands` 的话
    条目数是 0，同样表现为「没跑成」。两条都是**判据自己没到位**，与踩坑 86「判据要读事实」同族。
+ 96. **「模型切了，请求却没换路线」——一条链路只搬了一半**（P37，本轮修复，用户报的「中途切换不了模型」）：
+    症状是切换**看起来成功**（信息行、`/model` 报告、`session/model` 事件全都变了），但请求
+    **继续发往启动时那条路线**：换了提供方也一样。实测（两个假网关各自记账，见 `make e2e-model-route`）：
+    切到 prov-b 之后，prov-a 的网关**仍然收到全部请求**（`model=a-one`、`Authorization: Bearer
+    <prov-a 的 key>`），prov-b 一个请求都没收到 —— 用户看到的就是「切了没反应 / 401 /
+    回答还是旧模型的」。根因：`agent_model_apply` 只搬**能力**（contextWindow / maxTokens /
+    input / compat，`agent_model_adopt_caps`），从不重解析 `base_url` / `api_key` / `api_style`；
+    而模型目录**故意不存 baseURL**（存了就要把凭据链 `<DSH_HOME>/.credentials.yaml` / `.env` /
+    进程环境复制成第二份）⇒「provider 换了」与「请求打到哪」是两件事，只有重走一遍
+    `dsh_cfg_load` 才能把后者对齐。修法：`dsh_cfg_load` 加 `provider_override` 一支（跳过
+    `agent-default-model`、复用同一份 provider 定义与凭据链解析），收口成 `agent_route_apply`，
+    由 `agent_model_apply`（仅 provider 真变了时）与 `agent_session_model_pick`（`--resume` 跟随）
+    调用。三条附带的边界，每条都是「不这么写就会静默说谎」：
+    * **显式优先**：env / CLI 给过的 base_url / api_key / api_style 一律不动 —— 为此给
+      `--base-url` / `--api-key` 与对应的 env 补了来源码（以前 CLI 给的值被印成 `default`，
+      而且没有依据判「这是人钉住的」）。
+    * **密钥不跨提供方**：新提供方声明了 `apiKeyEnv` 却解析不出凭据 ⇒ **清空** key 并告警。
+      把 A 的密钥发到 B 的主机是一条凭据泄露路径，比 401 更坏。
+    * **没声明 `baseURL`** ⇒ 一个字节不改，只留一行说明（静默清空端点比「没跟上」更坏）。
+    **孪生坑（同一个「只做了一半」的形状）**：请求头 `hdrs` 在 `agent_turn_loop_inner` 里
+    **整回合只建一次**，而 `url` 是每个 step 重算的 ⇒ 路线变了之后 URL 会跟上、**`Authorization`
+    不会**（带着旧提供方的密钥打新端点）。修法是把 `buf_reset(&hdrs)` + `build_headers` 挪到
+    step 循环里、紧挨 `api_url_into`（两者必须描述同一条路线）。
+    **第二个独立故障：运行中敲的 `/model <名字>` 被当成给模型的文本**。安全集
+    `agent_tui_cmd_safe` 只拿得到**命令名**、按整行相等比 `/model`，于是带参那行匹配不上 ⇒
+    被推进 steer 收件箱、在下一个 step 边界又被判不安全 ⇒ 当 user 消息发给模型（实测网关收到的
+    请求体里赫然有 `/model b-two` 这一行）。修法：`agent_steer_line` 改用**整行**版判定
+    `agent_tui_cmd_safe_steer`，并在那里补 `/model <名字>` / `/effort <档位>`（要求参数段非空白，
+    与既有的 `/title <新标题>` 同一支）；两条路（流式泵点 / step 边界）从此共用一份判定。
+    **第三个：浮层选完要等回合结束才生效**。`agent_tui_poll_pending_cmd` 只认
+    `PALETTE`/`WATCH_LIST` 两种 kind，其余一律 `agent_pump_receipt_clear()` 丢掉 ⇒
+    「回合运行中选完模型」要等最后一轮工具跑完（实测回车 t=8.0、生效 t=14.1）。修法是给泵点
+    补 `TUI_OVK_MODEL` / `TUI_OVK_EFFORT` 两支（只改状态 + 落一条 `session/model`，不碰历史、
+    不发请求，与 `/watch` 现役清单同一条分工）。
+    防假绿对照实验：① 新 e2e 在**改动前**的二进制上必须红（实测 `VERDICT: FAIL`、网关记账里
+    prov-a 收到全部请求）；② 把泵点那两支注释掉重编 ⇒ `tui-model` 轮当场红两条
+    （「泵点没有当场收下模型选择」+「结果还挂着」）；③ selftest 的 `model-apply` 轮同时钉
+    「跟随」与「显式钉住不许被覆盖」两个方向。教训与踩坑 71/93 同族：**配置项改了一半时，
+    「看起来生效」与「真的生效」差着一条网络路径**；这类改动必须有一条读**事实**（打到哪个
+    端点、带了哪把密钥）的判据，不能只断言内存里的字段变了。
+    本轮为腾函数表额度**内联掉一个只转发的函数**（`agent_watch_ended_name` → 直接调
+    `deleg_status_name`）：本仓顶层函数表已满，净增一个**可达**函数就编不过，而删掉**零调用**
+    的死函数（`env_or_src`）并不释放额度（它本来就不在 reachable 集合里）——
+    这条正是踩坑 87/91 的续集。
 
 ---
 
@@ -3045,7 +3089,7 @@ DEEPSEEK_API_KEY=sk-xxx ./build/uya-agent \
 | `ws-resolve` | 恢复时工作区判定：显式优先、记录不存在 fallback、`WS_E_SAME` 幂等 |
 | `sess-meta-big` | ~3 MiB 日志 `sess_read_meta` 段错误回归（未修 139）、残行 `dropped_tail` |
 | `model-catalog` | provider 级 compat 继承、档位集合、`reasoningEfforts: false` 不公布、`none`==`off` |
-| `model-apply` | 切换跟随能力、旧档位回落 `off`、幂等返回 1、目录外不动能力 |
+| `model-apply` | 切换跟随能力、旧档位回落 `off`、幂等返回 1、目录外不动能力；**P37 修复**：换提供方时 `base_url` 与 `api_style` **双向**跟随（beta→alpha→beta 都断言）、跟随来的来源码落 `dsh-settings`、**显式 `--base-url`/`--api-key` 不被覆盖**、提供方**没声明 `baseURL`** 时端点一个字节不动、**解析不出凭据**时清空 key（旧密钥绝不跨提供方）（踩坑 96） |
 | `effort-apply` | 公布的收、同值幂等返回 1、未公布拒 2、透传但 `effort_set=false` |
 | `model-log` | `session/model` 三字段取最后一条 |
 | `worktree` | 真 git：建 worktree + `dsh/<slug>`、闸门、`wt_finish` 合并且目录消失 |
@@ -3101,7 +3145,7 @@ DEEPSEEK_API_KEY=sk-xxx ./build/uya-agent \
 | `tui-switch` | P39 换会话：清转录 → 回放 → 回执、脚注保留、滚动模式不动；P25 会话级状态：`/new`、`/resume` 清空 todo 清单（屏幕与 `g_todos.n` 两处），目标不跟着清 |
 | `tui-sessions` | `/sessions` 浮层：箱体铺开、默认游标在最后一项、完整 id |
 | `tui-sessions-big` | 踩坑 68：2000 项 —— 取行查表 vs 线性扫描**差分逐字节相同** + 取末项 20000 次的自校准比值（查表 ≪ 扫描）+ 第 0/中/末项文本正确 + home/end/↑/↓ 与 sel_set 自洽 + 列表与 reader 成帧各 < 1 s + 正文层无 ESC/NUL |
-| `tui-model` | P37 `/model`/`/effort` 浮层：按提供方分组、只列公布的档位、反解、非推理模型不开浮层 |
+| `tui-model` | P37 `/model`/`/effort` 浮层：按提供方分组、只列公布的档位、反解、非推理模型不开浮层；**P37 修复**：回合运行中选完模型 ⇒ **泵点当场收口**（`cfg.model` 立刻变、结果不再挂着、浮层已关） |
 | `tui-worktree` | P41 `/worktree` 动作选择浮层：标题/八个动作/✓ 标当前模式、反解只认动作行（「取消」不认）、默认游标 = `status`；`finish`/`discard` 选定不生效、先翻确认框（默认游标 = 取消）；**真 git**：确认前 worktree 目录与 phase 一个字节不动、确认后才合并 + 删除 |
 | `tui-mouse` | 踩坑 72 鼠标上报开关（`F2` / `/mouse` / `--no-mouse`）：标志位默认开 + `tui_set_mouse` 幂等；`F2` 两种编码（`ESC O Q` / `ESC[12~`）与 `/mouse on·off·非法`；**字节级**进/关/再开/关着进都与开关一致；帮助浮层里有 `F2` 那一条；**真 PTY** 两个方向（默认开必有 `1000h`、`mouse=false` 必无 `1000h`/`1006h`） |
 | `title-cmd` | P48 `/title` 与 `set_title`：清洗（80 B / 码点边界 / 控制序列全丢后为空 ⇒ 报错且标题**不动**）、钉住语义（`user` 置位后自动起标题不跑、`clear` 解锁）、revision 门控（同一条人类消息只生成一次）、落盘事件逐字节（kind 三档 + clear 的**空标题**事件）、索引同步、`set_title` 工具三支（合法/空串/缺键）、工具目录里有它 |
@@ -3127,6 +3171,7 @@ DEEPSEEK_API_KEY=sk-xxx ./build/uya-agent \
 | `tui-full` | P53 浮层全屏四组：**A** 非全屏仍是居中框（不顶格、`≤16` 行上限、第 30 项看不见）→ 全屏框 = 转录区（顶边第 0 行、左右边框 0 与 `cols-1`、标题 ` · 全屏`、行偏移表口径的逐行闭合、底边**正好**在 `panel_top-1`）+ 16 行上限解除（第 20 项可见、第 30 项仍不可见）；**B** `ctrl+f`（`0x06`）与 `F11`（`ESC[23~`）都切换，且**四种形态各认一次**（列表 / reader / ask / input）；**C** 不吃面板 / 状态区 / 脚注；**D** 没浮层时只落 notice、全屏态不跨浮层残留、`esc` 关掉后转录回来，终端太矮时 fail-closed 判据不变；**F** `/fullscreen` 四态（裸报状态 / `on` / `off` / 非法值只报错且状态不动、重复 `off` 幂等） |
 | `overlay-fullscreen` | `make p30-check` 第 9 场（真终端 + 假网关）：屏幕几何判据 —— 非全屏顶边 > 0 行且左边框 > 0 列 → `ctrl+f` 后顶边第 0 行、左右边框正好 `0` 与 `cols-1`、标题带 ` · 全屏`、面板与脚注都还在、底边行 < 面板行 → `F11` 关回居中 → 再全屏、`esc` 关掉后方框消失 |
 | `watch-pick-e2e` | `make e2e-watch-pick`：真终端 + 假网关两条腿 —— ①裸 `/watch` → 清单 → **一次回车**开跟随浮层（`[step …]`/`▸ bash …` 仍在子代理结束之前上屏）；②假网关把父代理的收尾按住 12 s，期间敲 `/watch sub-1` 必须**当场**开浮层（屏幕上还没有 `PARENT-DONE-OK`） |
+| `model-route-e2e` | `make e2e-model-route`：真终端 + **两个**假网关（各自记账模型名与 `Authorization`），两条腿（`--mode text` 带参命令 / `--mode overlay` 浮层）—— 回合被一条慢 bash 撑住时切换模型，断言**回合结束前**信息行就变成新模型/新提供方（实测 102 ms）、之后那条请求打到**新提供方**的网关（旧网关不再收到）、且带的是**新提供方**的密钥（旧密钥不跨提供方），那一轮的答案是新提供方给的。对照改动前：`VERDICT: FAIL` + 网关记账里 prov-a 收到全部请求（踩坑 96） |
 | `session-log` | 控制字节按字节往返、半条记录 `dropped_tail`、重建历史 |
 | `json-escape` | `0x00…0x1f` 全转义、无裸控制字节、`jw_key` 同规则 |
 | `ctrl-bytes` / `ctrl-bytes-resp` | mock mode 23：`printf 'A\000B'` 以 `\u0000` 回请求；判定码 240 |
@@ -3148,7 +3193,7 @@ DEEPSEEK_API_KEY=sk-xxx ./build/uya-agent \
 **验证用的 make 目标与快捷入口**
 
 - 总闸门：`make selftest`（离线，含 `p30-check` 与全部轮次，SELFTEST PASS / 退出 0）、`make e2e`（真网关）。
-- 离线配套：`make check`（A1 类型检查）/ `build`（A2 产出 `build/uya-agent`）/ `codegen-audit` / `tui-selftest` / `shell-selftest` / `e2e-config-flags` / `e2e-api` / `e2e-steps` / `e2e-permission` / `e2e-sandbox` / `e2e-tasks` / `e2e-goal` / `e2e-sessions` / `e2e-resume-big` / `e2e-title` / `e2e-model` / `e2e-worktree` / `e2e-diff` / `e2e-watch` / `e2e-watch-pick` / `diff-selftest` / `panel-selftest` / `e2e-ws`。
+- 离线配套：`make check`（A1 类型检查）/ `build`（A2 产出 `build/uya-agent`）/ `codegen-audit` / `tui-selftest` / `shell-selftest` / `e2e-config-flags` / `e2e-api` / `e2e-steps` / `e2e-permission` / `e2e-sandbox` / `e2e-tasks` / `e2e-goal` / `e2e-sessions` / `e2e-resume-big` / `e2e-title` / `e2e-model` / `e2e-model-route` / `e2e-worktree` / `e2e-diff` / `e2e-watch` / `e2e-watch-pick` / `diff-selftest` / `panel-selftest` / `e2e-ws`。
 - PTY 场景：`make p30-check`（`testdata/pty_drive.py --suite`，8 个场景；P41 那场 `worktree-menu` 走
   两条入口 —— 命令面板里选中 `/worktree` 与裸 `/worktree` —— 到选择框 → ↓ 到 `finish` → 确认框 →
   回车取消，`PTY_DUMP=1` 会把两张框打出来）；
