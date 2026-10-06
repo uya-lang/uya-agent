@@ -1,0 +1,464 @@
+// examples/mcp-plugins/wordcount.ush — 用 Uya 写一个 MCP 插件（P70 示例）
+//
+// 这是给 uya-agent 的**插件**：它以 MCP（Model Context Protocol）说话，
+// 用 `uya run wordcount.ush` 起进程，stdio 就是协议通道。
+//
+// 配置（三种随便挑一种）：
+//   ① 命令行：
+//      uya-agent --mcp-server "wordcount=uya run examples/mcp-plugins/wordcount.ush"
+//   ② `$DSH_HOME/settings.yaml`（与 DSH 同名同形，一份配置两边都能用）：
+//        uya-agent:
+//          mcp:
+//            wordcount:
+//              transport: stdio
+//              command: uya
+//              args: ["run", "examples/mcp-plugins/wordcount.ush"]
+//   ③ `<projectRoot>/.dsh/mcp.json`（生态通用形状）：
+//        {"mcpServers":{"wordcount":{"command":"uya",
+//          "args":["run","examples/mcp-plugins/wordcount.ush"]}}}
+//
+// 验证装上了：`uya-agent --list-plugins`
+// 然后模型就能调 `mcp__wordcount__word_count`。
+//
+// ─────────────────────────────────────────────────────────────
+// `.ush` 的限制（与 agent/workflow.uya 生成 hooks.uya 时完全一样）：
+//   * `uya run` 的脚本环境里**只有 libc + std.json**，本仓自己的 `Buf` / `bufx_*` /
+//     `jw_*` **都不能用** —— 那些是要参与编译整个仓库才有的符号。所以下面全是
+//     手写的字节处理（这正是「一个插件不该被迫依赖宿主」的意思）。
+//   * **没有 GC**：这个进程只跑一段循环、不长期驻留，所以下面按「够用」分配
+//     （固定缓冲 + 一次性 malloc）。
+//   * 整数转字节的 `as!` 必须带 `catch`（`错误联合类型 !T 不能隐式用于普通类型上下文`）。
+// ─────────────────────────────────────────────────────────────
+
+use libc.syscall;
+use libc.unistd;
+use libc.heap;
+
+// 一行请求的上限（MCP 的请求都不大；超了整行丢弃 —— 半个 JSON 解析失败会掩盖真因）
+const LINE_MAX: usize = 65536;
+// 一个工具结果的文本上限
+const TEXT_MAX: usize = 32768;
+
+const TOOL_NAME: &const byte = "word_count";
+const TOOL_DESC: &const byte = "Count words, lines and characters in a text.";
+
+// -------------------- 基础：C 串长度 / 写 --------------------
+
+fn slen(p: &const byte) usize {
+    var i: usize = 0;
+    while p[i] != 0 as byte {
+        i = i + 1;
+    }
+    return i;
+}
+
+// 把 n 字节写进 fd（循环写满；短写要接着写）
+fn write_all(fd: i32, p: &const byte, n: usize) bool {
+    var off: usize = 0;
+    while off < n {
+        const w: isize = sys_write(fd, &p[off], n - off) catch { -1 as isize; };
+        if w <= 0 {
+            return false;
+        }
+        off = off + (w as usize);
+    }
+    return true;
+}
+
+// 把若干字节写进输出缓冲（省一次拼接分配）。
+// ⚠ 收的是 **slice**（`&[byte]`）而不是 `(ptr, len)` 两个参数：`&"literal"[0: n]`
+// 传给 `*const byte` 形参时，uya 0.10 的 codegen 会生成「切片描述符强转成字节指针」，
+// 输出直接乱码（本仓 Makefile 的 `codegen-audit` 专门扫这个形状）。
+// 收 slice 就没有这个形状，调用点也能直接写 `put(out, &"abc"[0: 3])`。
+fn put(out: &Buf, p: &[byte]) bool {
+    const b: &Buf = out;
+    var i: usize = 0;
+    while i < p.len && b.len < b.cap {
+        b.ptr[b.len] = p[i];
+        b.len = b.len + 1;
+        i = i + 1;
+    }
+    return i == p.len;
+}
+
+fn put_cstr(out: &Buf, p: &const byte) bool {
+    return put(out, p[0: slen(p)]);
+}
+
+// -------------------- 一个小输出缓冲 --------------------
+
+struct Buf {
+    ptr: &byte,
+    len: usize,
+    cap: usize,
+}
+
+fn buf_new(cap: usize) Buf {
+    return Buf{ ptr: malloc(cap) as &byte, len: 0, cap: cap };
+}
+
+fn buf_free(b: &Buf) void {
+    free(b.ptr as &void);
+}
+
+// -------------------- 从一行 JSON 里取值（手写；std.json 只给结构体） --------------------
+
+// 找 `"key"`（**带引号**，避免命中值位置上的同名字符串），返回 key 之后的下标（-1 = 没有）
+fn find_key(p: &const byte, n: usize, key: &const byte) isize {
+    const kl: usize = slen(key);
+    var i: usize = 0;
+    while i + kl + 2 <= n {
+        if p[i] != 34 as byte {   // '"'
+            i = i + 1;
+            continue;
+        }
+        // 比较引号里的内容
+        var same: bool = true;
+        var k: usize = 0;
+        while k < kl {
+            if p[i + 1 + k] != key[k] {
+                same = false;
+                break;
+            }
+            k = k + 1;
+        }
+        if !same || p[i + 1 + kl] != 34 as byte {
+            i = i + 1;
+            continue;
+        }
+        // **必须是键**：后面（跳过空白）要紧跟 ':'
+        var j: usize = i + 2 + kl;
+        while j < n && (p[j] == 32 as byte || p[j] == 9 as byte) {
+            j = j + 1;
+        }
+        if j < n && p[j] == 58 as byte {
+            return (j + 1) as isize;
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+// 取出 `"method":"<值>"` 的值，与 want 比（方法分发用）。
+// ⚠ 别用 find_key 直接找 "tools/list" 这类**值**：find_key 找的是键，
+// 而方法名在 `"method":"tools/list"` 里是**值** —— 找键那套（要求后面跟 `:`）永远找不到它。
+fn method_is(p: &const byte, n: usize, want: &const byte) bool {
+    var mv: Buf = buf_new(256);
+    defer { buf_free(&mv); }
+    if !json_str(p, n, "method" as &const byte, &mv) {
+        return false;
+    }
+    const wl: usize = slen(want);
+    if mv.len != wl {
+        return false;
+    }
+    var i: usize = 0;
+    while i < wl {
+        if mv.ptr[i] != want[i] {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+// 取 `"key":"value"` 的字符串值（反转义 `\"` 与 `\\`），写进 out
+fn json_str(p: &const byte, n: usize, key: &const byte, out: &Buf) bool {
+    out.len = 0;
+    const at: isize = find_key(p, n, key);
+    if at < 0 {
+        return false;
+    }
+    var i: usize = at as! usize catch { return false; };
+    while i < n && (p[i] == 32 as byte || p[i] == 9 as byte) {
+        i = i + 1;
+    }
+    if i >= n || p[i] != 34 as byte {
+        return false;
+    }
+    i = i + 1;
+    var esc: bool = false;
+    while i < n {
+        const c: byte = p[i];
+        if esc {
+            esc = false;
+            var one: [byte: 1] = [c];
+            _ = put(out, &one[0: 1]);
+        } else if c == 92 as byte {
+            esc = true;
+        } else if c == 34 as byte {
+            return true;
+        } else {
+            var one: [byte: 1] = [c];
+            _ = put(out, &one[0: 1]);
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+// 取 `"id":<整数>`（MCP 的 id 是整数；取不到返回 -1）
+fn json_id(p: &const byte, n: usize) i64 {
+    const at: isize = find_key(p, n, "id" as &const byte);
+    if at < 0 {
+        return -1;
+    }
+    var i: usize = at as! usize catch { return -1; };
+    while i < n && (p[i] == 32 as byte || p[i] == 9 as byte) {
+        i = i + 1;
+    }
+    var v: i64 = 0;
+    var digits: usize = 0;
+    while i < n {
+        const c: byte = p[i];
+        if c < 48 as byte || c > 57 as byte {
+            break;
+        }
+        v = v * 10 + ((c as i64) - 48);
+        digits = digits + 1;
+        i = i + 1;
+    }
+    if digits == 0 {
+        return -1;
+    }
+    return v;
+}
+
+// -------------------- 写 JSON 数字 / 字符串 --------------------
+
+fn put_i64(out: &Buf, v: i64) bool {
+    if v == 0 {
+        return put(out, &"0"[0: 1]);
+    }
+    var tmp: [byte: 24] = [0: 24];
+    var n: usize = 0;
+    var x: i64 = v;
+    while x > 0 {
+        const d: byte = ((x - (x / 10) * 10) + 48) as! byte catch { 48 as byte; };
+        tmp[n] = d;
+        n = n + 1;
+        x = x / 10;
+    }
+    var i: usize = n;
+    while i > 0 {
+        i = i - 1;
+        var one: [byte: 1] = [tmp[i]];
+        if !put(out, &one[0: 1]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// 把一个字符串按 JSON 规则转义后写出去（带引号）。
+// **必须转义控制字节**：裸 NUL / 换行会让对端的 JSON 解析失败
+// （本仓踩过：bash 结果里一个 NUL 让网关 400，而那条结果永久留在历史里）。
+fn put_json_str(out: &Buf, p: &const byte, n: usize) bool {
+    if !put(out, &"\""[0: 1]) {
+        return false;
+    }
+    var i: usize = 0;
+    while i < n {
+        const c: byte = p[i];
+        if c == 34 as byte {
+            if !put(out, &"\\\""[0: 2]) { return false; }
+        } else if c == 92 as byte {
+            if !put(out, &"\\\\"[0: 2]) { return false; }
+        } else if c == 10 as byte {
+            if !put(out, &"\\n"[0: 2]) { return false; }
+        } else if c == 13 as byte {
+            if !put(out, &"\\r"[0: 2]) { return false; }
+        } else if c == 9 as byte {
+            if !put(out, &"\\t"[0: 2]) { return false; }
+        } else if c < 32 as byte {
+            // 其余控制字节：`\u00XX`
+            const hexd: &const byte = &"0123456789abcdef"[0: 16];
+            const hi: byte = hexd[((c as i32) >> 4) as usize];
+            const lo: byte = hexd[((c as i32) & 15) as usize];
+            var esc: [byte: 6] = [0: 6];
+            esc[0] = 92 as byte;
+            esc[1] = 117 as byte;   // 'u'
+            esc[2] = 48 as byte;
+            esc[3] = 48 as byte;
+            esc[4] = hi;
+            esc[5] = lo;
+            if !put(out, &esc[0: 6]) { return false; }
+        } else {
+            var one: [byte: 1] = [c];
+            if !put(out, &one[0: 1]) { return false; }
+        }
+        i = i + 1;
+    }
+    return put(out, &"\""[0: 1]);
+}
+
+// -------------------- 工具本体 --------------------
+
+// 数一段文本的字数 / 行数 / 字符数。
+// 字数口径：以「空白」分隔的非空段数（连续空白算一个分隔）；
+// 行数：`\n` 的个数（文本不以 `\n` 收尾时最后一行也算一行）。
+fn count_text(t: &const byte, n: usize, words: &usize, lines: &usize, chars: &usize) void {
+    var w: usize = 0;
+    var l: usize = 0;
+    var in_word: bool = false;
+    var i: usize = 0;
+    var last_nl: bool = true;
+    while i < n {
+        const c: byte = t[i];
+        const ws: bool = c == 32 as byte || c == 9 as byte || c == 10 as byte || c == 13 as byte;
+        if ws {
+            in_word = false;
+            if c == 10 as byte {
+                l = l + 1;
+                last_nl = true;
+            }
+        } else {
+            if !in_word {
+                w = w + 1;
+                in_word = true;
+            }
+            last_nl = false;
+        }
+        i = i + 1;
+    }
+    if n > 0 && !last_nl {
+        l = l + 1;   // 末尾那一行没有 `\n` 也要算
+    }
+    words[0] = w;
+    lines[0] = l;
+    chars[0] = n;
+}
+
+// `tools/call` 的 result（content 里一段文本）
+fn emit_result_text(id: i64, text: &const byte, n: usize) void {
+    var out: Buf = buf_new(TEXT_MAX + 512);
+    out.len = 0;
+    _ = put_cstr(&out, "{\"jsonrpc\":\"2.0\",\"id\":" as &const byte);
+    _ = put_i64(&out, id);
+    _ = put_cstr(&out, ",\"result\":{\"content\":[{\"type\":\"text\",\"text\":" as &const byte);
+    _ = put_json_str(&out, text, n);
+    _ = put_cstr(&out, "}],\"isError\":false}}\n" as &const byte);
+    _ = write_all(1, out.ptr as &const byte, out.len);
+    buf_free(&out);
+}
+
+// `tools/call` 的 result（错误：`isError:true` + 一句人话）
+fn emit_result_error(id: i64, msg: &const byte) void {
+    var out: Buf = buf_new(1024);
+    out.len = 0;
+    _ = put_cstr(&out, "{\"jsonrpc\":\"2.0\",\"id\":" as &const byte);
+    _ = put_i64(&out, id);
+    _ = put_cstr(&out, ",\"result\":{\"content\":[{\"type\":\"text\",\"text\":" as &const byte);
+    _ = put_json_str(&out, msg, slen(msg));
+    _ = put_cstr(&out, "}],\"isError\":true}}\n" as &const byte);
+    _ = write_all(1, out.ptr as &const byte, out.len);
+    buf_free(&out);
+}
+
+// -------------------- 主循环：一行请求 → 一行响应 --------------------
+
+// 读一整行（到 `\n` 或 EOF）；返回字节数（0 = EOF）。
+// 注意：stdin 是**管道**，一次 read 可能拿到半行或好几行 —— 所以逐字节读到 `\n` 为止。
+fn read_line(buf: &byte, cap: usize) usize {
+    var i: usize = 0;
+    while i < cap {
+        var c: [byte: 1] = [0: 1];
+        const n: isize = sys_read(0, &c[0], 1) catch { 0 as isize; };
+        if n <= 0 {
+            return i;
+        }
+        if c[0] == 10 as byte {
+            return i;
+        }
+        buf[i] = c[0];
+        i = i + 1;
+    }
+    return i;
+}
+
+export fn main() i32 {
+    var raw: &byte = malloc(LINE_MAX) as &byte;
+    defer { free(raw as &void); }
+    if (raw as usize) == 0 {
+        return 1;
+    }
+    var idbuf: Buf = buf_new(4096);
+    defer { buf_free(&idbuf); }
+    var argbuf: Buf = buf_new(TEXT_MAX);
+    defer { buf_free(&argbuf); }
+    var textbuf: Buf = buf_new(TEXT_MAX);
+    defer { buf_free(&textbuf); }
+
+    while true {
+        const n: usize = read_line(raw, LINE_MAX);
+        if n == 0 {
+            break;   // EOF：客户端关了管道，收工
+        }
+        const line: &const byte = raw as &const byte;
+        const id: i64 = json_id(line, n);
+
+        // `initialize`：回协议版本与能力。**必须先于 tools/list**
+        if method_is(line, n, "initialize" as &const byte) {
+            var out: Buf = buf_new(512);
+            out.len = 0;
+            _ = put_cstr(&out, "{\"jsonrpc\":\"2.0\",\"id\":" as &const byte);
+            _ = put_i64(&out, id);
+            _ = put_cstr(&out, ",\"result\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{\"tools\":{}},\"serverInfo\":{\"name\":\"wordcount\",\"version\":\"1.0\"}}}\n" as &const byte);
+            _ = write_all(1, out.ptr as &const byte, out.len);
+            buf_free(&out);
+            continue;
+        }
+        // `notifications/initialized` 等通知：没有 id、不许回响应 —— 忽略
+        if method_is(line, n, "notifications/initialized" as &const byte) {
+            continue;
+        }
+        // `tools/list`：报我们这一个工具（`inputSchema` 是 JSON Schema）
+        if method_is(line, n, "tools/list" as &const byte) {
+            var out: Buf = buf_new(2048);
+            out.len = 0;
+            _ = put_cstr(&out, "{\"jsonrpc\":\"2.0\",\"id\":" as &const byte);
+            _ = put_i64(&out, id);
+            _ = put_cstr(&out, ",\"result\":{\"tools\":[{\"name\":\"" as &const byte);
+            _ = put_cstr(&out, TOOL_NAME);
+            _ = put_cstr(&out, "\",\"description\":\"" as &const byte);
+            _ = put_cstr(&out, TOOL_DESC);
+            _ = put_cstr(&out, "\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"text\":{\"type\":\"string\",\"description\":\"The text to count\"}},\"required\":[\"text\"]}}]}}\n" as &const byte);
+            _ = write_all(1, out.ptr as &const byte, out.len);
+            buf_free(&out);
+            continue;
+        }
+        // `tools/call`：取 arguments.text，数完回一段文本
+        if method_is(line, n, "tools/call" as &const byte) {
+            if !json_str(line, n, "text" as &const byte, &argbuf) {
+                emit_result_error(id, "missing required argument \"text\"" as &const byte);
+                continue;
+            }
+            var words: usize = 0;
+            var lines: usize = 0;
+            var chars: usize = 0;
+            count_text(argbuf.ptr as &const byte, argbuf.len, &words, &lines, &chars);
+            // 拼一句结果（一个很小的字符串拼接，不用格式化库）
+            textbuf.len = 0;
+            _ = put_cstr(&textbuf, "words=" as &const byte);
+            _ = put_i64(&textbuf, words as i64);
+            _ = put_cstr(&textbuf, " lines=" as &const byte);
+            _ = put_i64(&textbuf, lines as i64);
+            _ = put_cstr(&textbuf, " chars=" as &const byte);
+            _ = put_i64(&textbuf, chars as i64);
+            emit_result_text(id, textbuf.ptr as &const byte, textbuf.len);
+            continue;
+        }
+        // 别的方法（例如宿主试我们的钩子）：回规范要求的 -32601，
+        // 宿主会据此判「这个 server 不认这个钩子」并**放行**。
+        if id >= 0 {
+            var out: Buf = buf_new(256);
+            out.len = 0;
+            _ = put_cstr(&out, "{\"jsonrpc\":\"2.0\",\"id\":" as &const byte);
+            _ = put_i64(&out, id);
+            _ = put_cstr(&out, ",\"error\":{\"code\":-32601,\"message\":\"Method not found\"}}\n" as &const byte);
+            _ = write_all(1, out.ptr as &const byte, out.len);
+            buf_free(&out);
+        }
+    }
+    return 0;
+}

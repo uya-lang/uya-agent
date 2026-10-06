@@ -1,0 +1,1267 @@
+// src/plugin/mcp.uya — MCP 门面：握手 / 工具发现 / 派发 / 公开名 / 钩子（P70）
+//
+// 本文件：会话级的 server 集合（`g_mcp`）与懒装载（`mcp_ensure`/`mcp_reload`）、
+//   握手与工具发现（`mcp_handshake`/`mcp_list_tools`）、请求组装（`mcp_call`）、
+//   工具派发（`mcp_tool_try`）、公开名（`mcp_tool_public_name`）、结果投影
+//   （`mcp_project_result`）、钩子（`mcp_hook_run`）与诊断（`mcp_diag_*`）。
+// 不变量：① **懒装载** —— 第一次真的要用（拼 tools 数组 / 派发一个 `mcp__` 工具）才连；
+//   一个 server 都没配时，`tools_json` 的产物与改动前**逐字节相同**（自测钉这一条）。
+//   ② 公开名 `mcp__<serverName>__<raw>` 逐字对齐 DSH 的 `publicToolName`
+//   （`dsh-mcp-client/lib/index.js:119`）：非法字符（非 `[A-Za-z0-9_-]`）换 `_`，
+//   若发生过替换**或**超 64 字符，则截到 `64-12-1` 再拼 `_` + sha256 前 12 位 hex。
+//   **raw 名只在线上发**，绝不从公开名反推（那是有损的）。
+//   ③ **失败不阻断主流程**：server 崩 / 超时 / 回非法 JSON，一律写成**工具结果文本**
+//   回给模型（与 bash 工具同口径：让模型自己纠正）；钩子出错当作没这个钩子（放行）。
+//   ④ 一个 server 一个常驻子进程（MCP 的标准形态，也是 DSH 的做法）；进程退出前
+//   `mcp_stop_all` 收干净，**不留孤儿**。
+//, ⑤ read-only 模式下 MCP 工具一律拒绝、**钩子一律不跑**（fail closed）——
+//   钩子能改参数/改结果，它就是权限模型的一部分，不能绕过闸门。
+// 依赖：libc.syscall/unistd；本仓 foundation/bufx、foundation/jsonx（`js_parse` 一族 +
+//   `jw_str_into` 转义）、session/session（`jw_str_into`）、tools/perm（`perm_get`）、
+//   tools/askuser（`ask_approve_action` 审批）、tools/sandboxx（`san_build_exec` 沙箱）、
+//   agent/ag_config（`Config`）、agent/instr（`instr_project_root` 项目根）、
+//   plugin/mcpcfg（配置）与 plugin/mcprun（stdio 会话）。
+// 命名：对外 `mcp_*` + `MCP_*`；私有同样 `mcp_` 前缀。
+//
+// 协议（MCP，JSON-RPC 2.0 over stdio，一行一条）：
+//   → initialize {protocolVersion, capabilities:{}, clientInfo:{name,version}}
+//   ← result {protocolVersion, capabilities, serverInfo}
+//   → notifications/initialized
+//   → tools/list [cursor 分页]  ← result {tools:[{name,description,inputSchema}]}
+//   → tools/call {name:<raw>, arguments:{…}}  ← result {content:[…], isError}
+// 模拟 DSH 的进程内插件缝（**本仓扩展方法**，名字 = DSH 的缝名；server 回 -32601
+// 「Method not found」就当作没这个钩子、放行 —— 于是任何标准 MCP server 都能只当工具用）：
+//   tools/pre-execute      → {kind:"allow"} | {kind:"deny",reason}
+//   tools/post-execute     → {kind:"accept",content} | {kind:"block",feedback}
+//   system-prompt/assemble → {kind:"accept",sections:[…]}（**整体替换**，不是链 ——
+// 见 DESIGN §15）
+//   session/created / session/disposed → 通知型，返回值忽略
+
+use libc.syscall;
+use libc.unistd;
+use std.crypto.sha256;
+
+// 结果文本上限（与 bash 工具的 max_tool_out 同量级；MCP 的 content 也是一段文本）
+const MCP_RESULT_MAX: usize = 262144;
+// tools/list 的分页上限（防坏的 nextCursor 死循环）
+const MCP_LIST_PAGES_MAX: usize = 8;
+const MCP_CLIENT_NAME: &const byte = "uya-agent" as &const byte;
+// 与 DSH 的 `SUPPORTED_PROTOCOL_VERSIONS` 对齐；发最老的那个，兼容面最宽
+const MCP_PROTOCOL_VERSION: &const byte = "2024-11-05" as &const byte;
+// 公开名契约（与 DSH 逐字一致：`MAX_PUBLIC_NAME_LENGTH` / `HASH_LENGTH`）
+const MCP_PUBLIC_NAME_MAX: usize = 64;
+const MCP_NAME_HASH_LEN: usize = 12;
+
+// 一个 server 的会话级状态（配置 + 已发现的工具）
+export struct McpTool {
+    server: Buf,     // serverName（派发时用 raw 名回填 wire）
+    raw: Buf,        // MCP 线上工具名
+    public: Buf,     // 模型侧公开名（mcp__<server>__<raw> 归一化后）
+    desc: Buf,       // description（已做 JSON 转义，直接进 schema 片段）
+    schema: Buf,     // inputSchema 的 JSON 原文（对象；直接进 schema 片段）
+}
+
+export struct McpState {
+    set: McpSet,
+    tools: [McpTool: MCP_TOOLS_MAX],
+    n: usize,
+    scanned: bool,       // 配置已发现（切工作区要复位，与 g_skills.scanned 同因）
+    listed: bool,        // tools/list 已经跑过
+    diag: Buf,           // 诊断行（`--list-plugins` / 失败时给用户看）
+}
+
+export const MCP_TOOLS_MAX: usize = 64;
+
+var g_mcp: McpState = McpState{
+    set: McpSet{
+        items: [McpServer{
+            name: Buf{ ptr: null, len: 0, cap: 0 },
+            transport: 0,
+            command: Buf{ ptr: null, len: 0, cap: 0 },
+            args: Buf{ ptr: null, len: 0, cap: 0 },
+            env: Buf{ ptr: null, len: 0, cap: 0 },
+            cwd: Buf{ ptr: null, len: 0, cap: 0 },
+            timeout_ms: 0,
+            url: Buf{ ptr: null, len: 0, cap: 0 },
+            source: 0,
+        }: MCP_MAX_SERVERS],
+        n: 0,
+        unsupported: Buf{ ptr: null, len: 0, cap: 0 },
+        loaded: false,
+    },
+    tools: [McpTool{
+        server: Buf{ ptr: null, len: 0, cap: 0 },
+        raw: Buf{ ptr: null, len: 0, cap: 0 },
+        public: Buf{ ptr: null, len: 0, cap: 0 },
+        desc: Buf{ ptr: null, len: 0, cap: 0 },
+        schema: Buf{ ptr: null, len: 0, cap: 0 },
+    }: MCP_TOOLS_MAX],
+    n: 0,
+    scanned: false,
+    listed: false,
+    diag: Buf{ ptr: null, len: 0, cap: 0 },
+};
+
+// 一条空工具（数组初始化式必须是常量，所以走这个函数）
+fn mcp_tool_empty() McpTool {
+    return McpTool{
+        server: buf_empty(),
+        raw: buf_empty(),
+        public: buf_empty(),
+        desc: buf_empty(),
+        schema: buf_empty(),
+    };
+}
+
+// 记一行诊断（**只在第一次**给 `--list-plugins`/失败路径用；上限 8 KiB 防跑飞）
+fn mcp_diag(line: &const byte, n: usize) void {
+    if !buf_valid(&g_mcp.diag) {
+        g_mcp.diag = buf_new(8192);
+        if !buf_valid(&g_mcp.diag) {
+            return;
+        }
+    }
+    if g_mcp.diag.len > 8192 {
+        return;
+    }
+    if g_mcp.diag.len > 0 {
+        _ = buf_append_byte(&g_mcp.diag, 10);
+    }
+    _ = buf_append(&g_mcp.diag, line, n);
+}
+
+// 诊断正文（`--list-plugins` 打印它）
+export fn mcp_diag_text() &const Buf {
+    return &g_mcp.diag;
+}
+
+// 已发现的工具数 / server 数（状态区与 `--list-plugins`）
+export fn mcp_tool_count() usize {
+    return g_mcp.n;
+}
+
+// 按下标取一条工具；越界返回 **null**（调用方判 null 就停 —— 这样「按 count 循环」
+// 与「按下标取」两处都不会因为下标越界而读到别的 server 的工具）
+export fn mcp_tool_at(i: usize) &const McpTool {
+    if i >= MCP_TOOLS_MAX {
+        return null as &const McpTool;
+    }
+    return &g_mcp.tools[i];
+}
+
+export fn mcp_server_count() usize {
+    return g_mcp.set.n;
+}
+
+export fn mcp_unsupported_text() &const Buf {
+    return &g_mcp.set.unsupported;
+}
+
+// ============================================================
+// 公开名：逐字对齐 DSH 的 publicToolName
+// ============================================================
+//
+// 契约（`dsh-mcp-client/lib/index.js:57-73, 119-125`）：
+//   * 常态就是 `mcp__<serverName>__<rawName>`；
+//   * `[^A-Za-z0-9_-]` 的字符换成 `_`（DeepSeek 的函数名契约）；
+//   * 发生过替换**或**长度 > 64 ⇒ 截到 `64-12-1` 个字符，再拼 `_` + sha256 前 12 位 hex
+//     （hash 的输入是 `<serverName>\0<rawName>`，与本仓一致就能与 DSH 撞出同一个名字）。
+// 为什么公开名要归一化而不是照抄 raw：模型的函数名契约只允许 `[A-Za-z0-9_-]`、
+// 上限 64 字符；MCP 的 raw 名没有这两条限制（`filesystem.read_file` 这种很常见）。
+fn mcp_is_name_char(c: byte) bool {
+    const upper: bool = c >= 65 as byte && c <= 90 as byte;
+    const lower: bool = c >= 97 as byte && c <= 122 as byte;
+    const digit: bool = c >= 48 as byte && c <= 57 as byte;
+    return upper || lower || digit || c == 95 as byte || c == 45 as byte;
+}
+
+// 拼公开名写进 out。`server` / `raw` 是两个已解析的视图。
+export fn mcp_tool_public_name(server: &const byte, sn: usize, raw: &const byte,
+    rn: usize, out: &Buf) void {
+    buf_reset(out);
+    _ = buf_append_cstr(out, "mcp__");
+    _ = buf_append(out, server, sn);
+    _ = buf_append_cstr(out, "__");
+    _ = buf_append(out, raw, rn);
+    // 归一化：非契约字符换 `_`，同时记下「有没有改动」
+    var changed: bool = false;
+    var i: usize = 0;
+    while i < out.len {
+        if !mcp_is_name_char(out.ptr[i]) {
+            out.ptr[i] = 95 as byte;
+            changed = true;
+        }
+        i = i + 1;
+    }
+    if !changed && out.len <= MCP_PUBLIC_NAME_MAX {
+        return;
+    }
+    // 有损：截断 + 12 位 hash 后缀（hash 输入含 '\0' 分隔，与 DSH 同形）
+    var msg: Buf = buf_new(sn + rn + 2);
+    defer { buf_free(&msg); }
+    if buf_valid(&msg) {
+        _ = buf_append(&msg, server, sn);
+        _ = buf_append_byte(&msg, 0);
+        _ = buf_append(&msg, raw, rn);
+    }
+    var dig: [byte: 32] = [0: 32];
+    sha256_digest(msg.ptr[0: msg.len], dig[0: 32]);
+    var hex: [byte: 64] = [0: 64];
+    _ = hex_of(&dig[0], 32, &hex[0]);
+    // 截到 `64-12-1 = 51` 个字符。**必须取 min(out.len, keep)** ——
+    // 长度本来就不到 51 的名字（例如 `mcp__fixture__echo_text` 只有 23 字节）如果硬取
+    // 51，`buf_append` 会读过缓冲尾部，把堆上的垃圾字节当成名字的一部分复制进去。
+    // 现场症状：公开名变成 `mcp__fixture__echo_text\0\0…\0_5a8a434da366`
+    // （前 51 字节里混进了一串 NUL），于是模型侧名字与派发时的查表两边都对不上。
+    // DSH 那边是 JS 的 `String.slice(0, 51)`，短串原样返回 —— 这里要对齐这个语义。
+    const keep: usize = MCP_PUBLIC_NAME_MAX - MCP_NAME_HASH_LEN - 1;
+    const cut: usize = if out.len < keep { out.len } else { keep };
+    var src: Buf = buf_new(out.len + 1);
+    defer { buf_free(&src); }
+    if !buf_valid(&src) {
+        return;
+    }
+    _ = buf_append(&src, out.ptr, out.len);
+    buf_reset(out);
+    _ = buf_append(out, src.ptr, cut);
+    _ = buf_append_byte(out, 95);
+    _ = buf_append(out, &hex[0], MCP_NAME_HASH_LEN);
+}
+
+// 这个工具名是不是我们的（`mcp__` 前缀）—— 派发前的快筛，避免每次工具调用都找表
+export fn mcp_name_is_ours(name: &const Buf) bool {
+    if name.len <= 5 {
+        return false;
+    }
+    return bufx_eq_cstr(name.ptr as &const byte, 5, "mcp__" as &const byte);
+}
+
+// ============================================================
+// 配置装载（懒）
+// ============================================================
+
+// 确保配置已发现。`ws` 是当前工作区（算项目根）；`dsh_home` 是 $DSH_HOME。
+// 幂等：`scanned` 为真就直接返回（切工作区时由 `mcp_reset_scan` 复位）。
+//
+// `cli` 是 `--mcp-server` 的原始行（每行一条 `name=command args…`）。它是**最高优先级**
+// 的来源，所以**先**解析它 —— `mcp_set_push` 是「同名先到先得」，先装的就赢。
+export fn mcp_ensure(ws: &[byte], dsh_home: &[byte], no_mcp: bool,
+    cli: &const Buf) void {
+    if g_mcp.scanned {
+        return;
+    }
+    g_mcp.scanned = true;
+    mcp_set_init(&g_mcp.set);
+    if !buf_valid(&g_mcp.diag) {
+        g_mcp.diag = buf_new(8192);
+    }
+    if no_mcp {
+        return;   // --no-mcp：配置都不读（连诊断也不产生）
+    }
+    mcp_cfg_load_cli(&g_mcp.set, cli);
+    var root: Buf = buf_new(4096);
+    defer { buf_free(&root); }
+    if buf_valid(&root) {
+        _ = instr_project_root(ws, &root);
+    }
+    mcp_cfg_collect(&g_mcp.set, root.ptr[0: root.len], dsh_home);
+    if g_mcp.set.n == 0 {
+        return;
+    }
+    // 握手 + tools/list：**在第一次拼 tools 数组之前**跑完，否则模型看不到工具
+    mcp_list_tools();
+}
+
+// 切工作区时复位（与 `g_skills.scanned = false` 同一处、同一理由：发现根依赖工作区）。
+// 同时也把工具表清掉 —— 工作区变了，server 的 cwd 语义也变了。
+export fn mcp_reset_scan() void {
+    g_mcp.scanned = false;
+    g_mcp.listed = false;
+    var i: usize = 0;
+    while i < MCP_TOOLS_MAX {
+        buf_free(&g_mcp.tools[i].server);
+        buf_free(&g_mcp.tools[i].raw);
+        buf_free(&g_mcp.tools[i].public);
+        buf_free(&g_mcp.tools[i].desc);
+        buf_free(&g_mcp.tools[i].schema);
+        g_mcp.tools[i] = mcp_tool_empty();
+        i = i + 1;
+    }
+    g_mcp.n = 0;
+}
+
+// 显式重载（`mcp` 元工具的 reload；不做服务端推送的 list_changed 热更新，见 DESIGN §15）
+export fn mcp_reload(ws: &[byte], dsh_home: &[byte], no_mcp: bool,
+    cli: &const Buf) void {
+    mcprun_stop_all();
+    mcp_reset_scan();
+    buf_free(&g_mcp.diag);
+    g_mcp.diag = buf_new(8192);
+    mcp_ensure(ws, dsh_home, no_mcp, cli);
+}
+
+// 收掉所有 server（进程退出前调；不留孤儿）
+export fn mcp_stop_all() void {
+    mcprun_stop_all();
+}
+
+// ============================================================
+// 握手与工具发现
+// ============================================================
+
+// 拼一条 JSON-RPC 请求进 out（id + method + params 原文）。
+//
+// ⚠ `params` 是 **(ptr, len) 一对**，不是 C 串：调用点手上的 params 是个 `Buf`
+// （**没有 NUL 结尾**）。早期版本收 `&const byte` 并用 `buf_append_cstr` 追加 ——
+// 那按 NUL 量长度，读越界，把缓冲后面的垃圾拼进请求里。
+// 现场症状：server 收到的 `tools/list` 是 `..."params":{}protoc..fs..C}`，
+// 于是 tools/list 解析失败、一个工具都登记不上（initialize 恰好短，看着正常）。
+fn mcp_req(out: &Buf, id: i64, method: &const byte, params: &const byte,
+    pn: usize) bool {
+    buf_reset(out);
+    if !buf_append_cstr(out, "{\"jsonrpc\":\"2.0\",\"id\":") {
+        return false;
+    }
+    if !buf_append_i64(out, id) {
+        return false;
+    }
+    if !buf_append_cstr(out, ",\"method\":") {
+        return false;
+    }
+    if !jw_str_into(out, method, bufx_cstr_len(method)) {
+        return false;
+    }
+    if pn > 0 {
+        if !buf_append_cstr(out, ",\"params\":") {
+            return false;
+        }
+        if !buf_append(out, params, pn) {
+            return false;
+        }
+    }
+    return buf_append_byte(out, 125);   // '}'
+}
+
+// 从一行 JSON 里取 `result` 子串的 [start, end)；失败返回 false。
+// 只做「找到 result 的值区间」这一件事：MCP 的各个结果体形状各异，
+// 逐个字段解析交给各自的读取函数（`mcp_tools_from_result` / `mcp_project_result`）。
+fn mcp_result_span(line: &[byte], start: &usize, end: &usize) bool {
+    const key: &const byte = "\"result\"" as &const byte;
+    const at: isize = find_sub(line, key[0: 8], 0);
+    if at < 0 {
+        return false;
+    }
+    var i: usize = (at as usize) + 8;
+    i = mcp_skip_ws(&line[0], line.len, i);
+    if i >= line.len || line[i] != 58 as byte {
+        return false;
+    }
+    i = mcp_skip_ws(&line[0], line.len, i + 1);
+    if i >= line.len {
+        return false;
+    }
+    // 对象或数组：找配对的收尾；标量：到行尾或逗号
+    const open: byte = line[i];
+    if open == 123 as byte {
+        const e: usize = mcp_json_obj_end(&line[0], line.len, i);
+        if e <= i {
+            return false;
+        }
+        start[0] = i;
+        end[0] = e + 1;
+        return true;
+    }
+    if open == 91 as byte {
+        var depth: i32 = 0;
+        var j: usize = i;
+        var instr: bool = false;
+        var esc: bool = false;
+        while j < line.len {
+            const c: byte = line[j];
+            if instr {
+                if esc {
+                    esc = false;
+                } else if c == 92 as byte {
+                    esc = true;
+                } else if c == 34 as byte {
+                    instr = false;
+                }
+            } else if c == 34 as byte {
+                instr = true;
+            } else if c == 91 as byte {
+                depth = depth + 1;
+            } else if c == 93 as byte {
+                depth = depth - 1;
+                if depth == 0 {
+                    start[0] = i;
+                    end[0] = j + 1;
+                    return true;
+                }
+            }
+            j = j + 1;
+        }
+        return false;
+    }
+    return false;
+}
+
+// 这一行是不是一条 error 响应（取 `error.message` 写进 out）
+fn mcp_error_message(line: &[byte], out: &Buf) bool {
+    buf_reset(out);
+    const key: &const byte = "\"error\"" as &const byte;
+    const at: isize = find_sub(line, key[0: 7], 0);
+    if at < 0 {
+        return false;
+    }
+    var i: usize = (at as usize) + 7;
+    i = mcp_skip_ws(&line[0], line.len, i);
+    if i >= line.len || line[i] != 58 as byte {
+        return false;
+    }
+    i = mcp_skip_ws(&line[0], line.len, i + 1);
+    if i >= line.len || line[i] != 123 as byte {
+        return false;
+    }
+    const e: usize = mcp_json_obj_end(&line[0], line.len, i);
+    if e <= i {
+        return false;
+    }
+    var frag: Buf = buf_new(e - i + 1);
+    defer { buf_free(&frag); }
+    if !buf_valid(&frag) {
+        return false;
+    }
+    _ = buf_append(&frag, &line[i], e - i + 1);
+    return mcp_json_str(frag.ptr as &const byte, frag.len,
+        "message" as &const byte, out);
+}
+
+// 对一个 server 做握手（initialize + notifications/initialized）。
+// 返回 0 = 成功；否则是 `mcprun_recv` 的返回码。
+fn mcp_handshake(idx: usize, si: usize) i32 {
+    if si >= MCP_MAX_SERVERS {
+        return 2;
+    }
+    const srv: &const McpServer = &g_mcp.set.items[si];
+    var req: Buf = buf_new(1024);
+    defer { buf_free(&req); }
+    var resp: Buf = buf_new(65536);
+    defer { buf_free(&resp); }
+    var d: Buf = buf_new(1024);
+    defer { buf_free(&d); }
+    if !buf_valid(&req) || !buf_valid(&resp) {
+        return 2;
+    }
+    // params 原文：protocolVersion + 空 capabilities + clientInfo
+    var params: Buf = buf_new(512);
+    defer { buf_free(&params); }
+    if buf_valid(&params) {
+        _ = buf_append_cstr(&params, "{\"protocolVersion\":");
+        _ = jw_str_into(&params, MCP_PROTOCOL_VERSION,
+            bufx_cstr_len(MCP_PROTOCOL_VERSION));
+        _ = buf_append_cstr(&params,
+            ",\"capabilities\":{},\"clientInfo\":{\"name\":");
+        _ = jw_str_into(&params, MCP_CLIENT_NAME,
+            bufx_cstr_len(MCP_CLIENT_NAME));
+        _ = buf_append_cstr(&params, ",\"version\":\"0.10\"}}");
+    }
+    const id: i64 = mcprun_next_id(idx);
+    if !mcp_req(&req, id, "initialize" as &const byte,
+        params.ptr as &const byte, params.len) {
+        return 2;
+    }
+    if !mcprun_send(idx, &req) {
+        mcp_diag("initialize: cannot write to server", 35);
+        return 2;
+    }
+    const rc: i32 = mcprun_recv(idx, id, srv.timeout_ms, &resp, &d);
+    if rc != 0 {
+        return rc;
+    }
+    var em: Buf = buf_new(512);
+    defer { buf_free(&em); }
+    if mcp_error_message(resp.ptr[0: resp.len], &em) {
+        mcp_diag("initialize error: ", 18);
+        mcp_diag(em.ptr as &const byte, em.len);
+        return 2;
+    }
+    // `notifications/initialized`（**通知，无 id**；规范要求握手后发一条）
+    var note: Buf = buf_new(128);
+    defer { buf_free(&note); }
+    if buf_valid(&note) {
+        _ = buf_append_cstr(&note,
+            "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}");
+        _ = mcprun_send(idx, &note);
+    }
+    return 0;
+}
+
+// 把 tools/list 结果里的一项解析成 McpTool（server 名 + 归一化公开名）。
+// 注意 `desc` / `schema` 存的是**已经可以直接拼进请求体**的 JSON 片段
+// （desc 走转义后的带引号字符串；schema 是原样对象 ——
+// MCP 保证它是 JSON Schema 对象）。
+fn mcp_tool_from_frag(sname: &const byte, sn: usize, frag: &const byte,
+    fn_: usize, out: &McpTool) bool {
+    var raw: Buf = buf_new(256);
+    defer { buf_free(&raw); }
+    if !mcp_json_str(frag, fn_, "name" as &const byte, &raw) || raw.len == 0 {
+        return false;
+    }
+    // 公开名可能与别的 server 撞（两个 server 报同名工具）—— 撞了就整条丢掉，
+    // 因为公开名是模型侧的唯一标识（DSH 也是「重名 → 整份列表作废」）。
+    var pub: Buf = buf_new(256);
+    defer { buf_free(&pub); }
+    mcp_tool_public_name(sname, sn, raw.ptr as &const byte, raw.len, &pub);
+    var i: usize = 0;
+    while i < g_mcp.n && i < MCP_TOOLS_MAX {
+        if g_mcp.tools[i].public.len == pub.len
+            && bufx_mem_eq(g_mcp.tools[i].public.ptr as &const byte,
+                pub.ptr as &const byte, pub.len) {
+            return false;
+        }
+        i = i + 1;
+    }
+    out.server = buf_new(sn + 8);
+    out.raw = buf_new(raw.len + 8);
+    out.public = buf_new(pub.len + 8);
+    out.desc = buf_new(1024);
+    out.schema = buf_new(fn_ + 8);
+    if !buf_valid(&out.server) || !buf_valid(&out.raw)
+        || !buf_valid(&out.public)
+        || !buf_valid(&out.desc) || !buf_valid(&out.schema) {
+        return false;
+    }
+    _ = buf_append(&out.server, sname, sn);
+    _ = buf_append(&out.raw, raw.ptr, raw.len);
+    _ = buf_append(&out.public, pub.ptr, pub.len);
+    // description：转义成带引号的 JSON 字符串（缺省给空串）
+    var dstr: Buf = buf_new(1024);
+    defer { buf_free(&dstr); }
+    _ = mcp_json_str(frag, fn_, "description" as &const byte, &dstr);
+    _ = jw_str_into(&out.desc, dstr.ptr as &const byte, dstr.len);
+    // inputSchema：原样拷对象的 JSON 文本；缺省给 `{"type":"object"}`（MCP 要求根是 object）
+    const ikey: &const byte = "\"inputSchema\"" as &const byte;
+    const at: isize = find_sub(frag[0: fn_], ikey[0: 13], 0);
+    var got_schema: bool = false;
+    if at >= 0 {
+        var j: usize = mcp_skip_ws(frag, fn_, (at as usize) + 13);
+        if j < fn_ && frag[j] == 58 as byte {
+            j = mcp_skip_ws(frag, fn_, j + 1);
+            if j < fn_ && frag[j] == 123 as byte {
+                const e: usize = mcp_json_obj_end(frag, fn_, j);
+                if e > j {
+                    _ = buf_append(&out.schema, frag + j, e - j + 1);
+                    got_schema = true;
+                }
+            }
+        }
+    }
+    if !got_schema {
+        _ = buf_append_cstr(&out.schema, "{\"type\":\"object\"}");
+    }
+    return true;
+}
+
+// 扫 `{"tools":[…]}` 里每一项，登记进 g_mcp.tools
+fn mcp_tools_from_result(sname: &const byte, sn: usize, res: &const byte,
+    rn: usize) usize {
+    const key: &const byte = "\"tools\"" as &const byte;
+    const at: isize = find_sub(res[0: rn], key[0: 7], 0);
+    if at < 0 {
+        return 0;
+    }
+    var i: usize = mcp_skip_ws(res, rn, (at as usize) + 7);
+    if i >= rn || res[i] != 58 as byte {
+        return 0;
+    }
+    i = mcp_skip_ws(res, rn, i + 1);
+    if i >= rn || res[i] != 91 as byte {
+        return 0;
+    }
+    var added: usize = 0;
+    i = i + 1;
+    while i < rn {
+        i = mcp_skip_ws(res, rn, i);
+        if i >= rn || res[i] == 93 as byte {
+            break;
+        }
+        if res[i] == 44 as byte {
+            i = i + 1;
+            continue;
+        }
+        if res[i] != 123 as byte {
+            break;
+        }
+        const e: usize = mcp_json_obj_end(res, rn, i);
+        if e <= i {
+            break;
+        }
+        if g_mcp.n < MCP_TOOLS_MAX {
+            const t: &McpTool = &g_mcp.tools[g_mcp.n];
+            t[0] = mcp_tool_empty();
+            if mcp_tool_from_frag(sname, sn, res + i, e - i + 1, t) {
+                g_mcp.n = g_mcp.n + 1;
+                added = added + 1;
+            }
+        }
+        i = e + 1;
+    }
+    return added;
+}
+
+// 确保某个 server 的子进程在跑（已在跑就复用）。返回槽位下标；失败返回 **-1**
+// 并把原因写进 `fail`（"out of memory" / "cannot start: …"）。
+//
+// 为什么把这段抽出来：`mcp_list_one` 本来连着「起进程 + 握手 + 分页拉工具」三件事，
+// 加起来 130 多行，超过 AGENTS.md 的 100 行上限。起进程这一段是**自成一件事**
+// （路径/cwd/env 的组装），抽出来两段都读得清楚了。
+fn mcp_spawn_server(si: usize, fail: &Buf) isize {
+    if si >= MCP_MAX_SERVERS {
+        return -1;
+    }
+    const srv: &const McpServer = &g_mcp.set.items[si];
+    const idx: isize = mcprun_find(srv.name.ptr as &const byte, srv.name.len);
+    if idx >= 0 {
+        return idx;
+    }
+    var err: Buf = buf_new(512);
+    defer { buf_free(&err); }
+    var cmd_z: Buf = buf_new(1024);
+    defer { buf_free(&cmd_z); }
+    if !buf_valid(&cmd_z) || !buf_valid(&err) {
+        buf_reset(fail);
+        _ = buf_append_cstr(fail, "out of memory");
+        return -1;
+    }
+    _ = buf_append(&cmd_z, srv.command.ptr, srv.command.len);
+    _ = buf_append_byte(&cmd_z, 0);
+    // cwd：配置给了就用它（相对路径按 agent 当前目录解析）；没给就继承
+    var cwd_z: Buf = buf_new(1024);
+    defer { buf_free(&cwd_z); }
+    var cwd_ptr: &const byte = null as &const byte;
+    if srv.cwd.len > 0 && buf_valid(&cwd_z) {
+        _ = buf_append(&cwd_z, srv.cwd.ptr, srv.cwd.len);
+        _ = buf_append_byte(&cwd_z, 0);
+        cwd_ptr = cwd_z.ptr as &const byte;
+    }
+    const got: isize = mcprun_start(srv.name.ptr as &const byte, srv.name.len,
+        cmd_z.ptr as &const byte, &srv.args, &srv.env, cwd_ptr, &err);
+    if got < 0 {
+        buf_reset(fail);
+        _ = buf_append_cstr(fail, "cannot start: ");
+        _ = buf_append(fail, err.ptr, err.len);
+        return -1;
+    }
+    return got;
+}
+
+// 从一个 server 拉工具列表（含 cursor 分页；上限 MCP_LIST_PAGES_MAX 防死循环）。
+// 返回登记成功的条数；`fail` 填「为什么没有 / 为什么少」。
+fn mcp_list_one(si: usize, fail: &Buf) usize {
+    if si >= MCP_MAX_SERVERS {
+        return 0;
+    }
+    const srv: &const McpServer = &g_mcp.set.items[si];
+    if srv.transport != MCP_TR_STDIO || srv.command.len == 0 {
+        buf_reset(fail);
+        // 行宽豁免：错误文案是**单条不可断的字面量**（Uya 没有相邻字面量拼接）
+        _ = buf_append_cstr(fail, "unsupported transport (only stdio is implemented)");
+        return 0;
+    }
+    // 拉起子进程（已拉起就复用：mcp_list_tools 可能被 reload 再调一次）
+    const started: isize = mcp_spawn_server(si, fail);
+    if started < 0 {
+        return 0;
+    }
+    const p: usize = started as usize;
+    const hrc: i32 = mcp_handshake(p, si);
+    if hrc != 0 {
+        buf_reset(fail);
+        _ = buf_append_cstr(fail, mcp_rc_text(hrc));
+        mcprun_stop(p);
+        return 0;
+    }
+    var total: usize = 0;
+    // `cursor` 必须**先分配好**：`mcp_list_page` 要往里写 nextCursor，
+    // 而 `buf_empty()` 是无效缓冲（`buf_valid` 为假）—— 拿它当循环条件会让整圈都不跑
+    // （现场症状：`--list-plugins` 报 `empty tools/list`，工具一个都登记不上）。
+    var cursor: Buf = buf_new(256);
+    defer { buf_free(&cursor); }
+    var page: usize = 0;
+    while page < MCP_LIST_PAGES_MAX {
+        page = page + 1;
+        const got: usize = mcp_list_page(p, si, &cursor, fail);
+        if got == 0 {
+            break;
+        }
+        total = total + got;
+        if cursor.len == 0 {
+            break;   // 没有下一页
+        }
+    }
+    return total;
+}
+
+// 拉**一页** tools/list 并把工具登记进去；返回这一页登记的条数。
+// `cursor` 进 = 这一页的游标（空 = 第一页），出 = `nextCursor`（空 = 没有下一页）。
+// 空返回 = 出错或没有下一页（原因写进 `fail`）。
+fn mcp_list_page(p: usize, si: usize, cursor: &Buf, fail: &Buf) usize {
+    if si >= MCP_MAX_SERVERS {
+        return 0;
+    }
+    const srv: &const McpServer = &g_mcp.set.items[si];
+    var params: Buf = buf_new(512);
+    defer { buf_free(&params); }
+    if !buf_valid(&params) {
+        return 0;
+    }
+    if cursor.len > 0 {
+        _ = buf_append_cstr(&params, "{\"cursor\":");
+        _ = jw_str_into(&params, cursor.ptr as &const byte, cursor.len);
+        _ = buf_append_byte(&params, 125);
+    } else {
+        _ = buf_append_cstr(&params, "{}");
+    }
+    var req: Buf = buf_new(512);
+    defer { buf_free(&req); }
+    var resp: Buf = buf_new(262144);
+    defer { buf_free(&resp); }
+    var d: Buf = buf_new(512);
+    defer { buf_free(&d); }
+    if !buf_valid(&req) || !buf_valid(&resp) {
+        return 0;
+    }
+    const id: i64 = mcprun_next_id(p);
+    if !mcp_req(&req, id, "tools/list" as &const byte,
+        params.ptr as &const byte, params.len) {
+        return 0;
+    }
+    if !mcprun_send(p, &req) {
+        buf_reset(fail);
+        _ = buf_append_cstr(fail, "server closed the pipe during tools/list");
+        buf_reset(cursor);
+        return 0;
+    }
+    const rc: i32 = mcprun_recv(p, id, srv.timeout_ms, &resp, &d);
+    if rc != 0 {
+        buf_reset(fail);
+        _ = buf_append_cstr(fail, mcp_rc_text(rc));
+        buf_reset(cursor);
+        return 0;
+    }
+    var em: Buf = buf_new(512);
+    defer { buf_free(&em); }
+    if mcp_error_message(resp.ptr[0: resp.len], &em) {
+        buf_reset(fail);
+        _ = buf_append_cstr(fail, "tools/list error: ");
+        _ = buf_append(fail, em.ptr, em.len);
+        buf_reset(cursor);
+        return 0;
+    }
+    var rs: usize = 0;
+    var re: usize = 0;
+    if !mcp_result_span(resp.ptr[0: resp.len], &rs, &re) {
+        buf_reset(fail);
+        _ = buf_append_cstr(fail, "malformed tools/list response (no result)");
+        buf_reset(cursor);
+        return 0;
+    }
+    const got: usize = mcp_tools_from_result(srv.name.ptr as &const byte,
+        srv.name.len, resp.ptr + rs, re - rs);
+    // nextCursor：有就留给下一圈，没有就清空（调用方据此收工）
+    buf_reset(cursor);
+    const ckey: &const byte = "\"nextCursor\"" as &const byte;
+    const cat: isize = find_sub(resp.ptr[0: resp.len], ckey[0: 12], 0);
+    if cat >= 0 {
+        var cj: usize = mcp_skip_ws(resp.ptr as &const byte, resp.len,
+            (cat as usize) + 12);
+        if cj < resp.len && resp.ptr[cj] == 58 as byte {
+            cj = mcp_skip_ws(resp.ptr as &const byte, resp.len, cj + 1);
+            if cj < resp.len && resp.ptr[cj] == 34 as byte {
+                var k: usize = cj + 1;
+                while k < resp.len && resp.ptr[k] != 34 as byte {
+                    _ = buf_append_byte(cursor, resp.ptr[k]);
+                    k = k + 1;
+                }
+            }
+        }
+    }
+    return got;
+}
+
+// `mcprun_recv` 的返回码 → 人话（**唯一**一份文案；工具结果与诊断都用它）
+fn mcp_rc_text(rc: i32) &const byte {
+    if rc == 1 {
+        return "timed out waiting for the MCP server" as &const byte;
+    }
+    if rc == 2 {
+        return "MCP server exited or closed the pipe" as &const byte;
+    }
+    if rc == 3 {
+        return "cancelled" as &const byte;
+    }
+    if rc == 4 {
+        return "MCP server sent an oversized line" as &const byte;
+    }
+    return "MCP protocol error" as &const byte;
+}
+
+// 对所有 server 拉一遍工具列表并写诊断（每个 server 一行结论）。幂等：`listed` 为真就直接返回。
+export fn mcp_list_tools() void {
+    if g_mcp.listed {
+        return;
+    }
+    g_mcp.listed = true;
+    var i: usize = 0;
+    while i < g_mcp.set.n && i < MCP_MAX_SERVERS {
+        const srv: &const McpServer = &g_mcp.set.items[i];
+        var fail: Buf = buf_new(512);
+        defer { buf_free(&fail); }
+        const n: usize = mcp_list_one(i, &fail);
+        var line: Buf = buf_new(512);
+        defer { buf_free(&line); }
+        if buf_valid(&line) {
+            _ = buf_append(&line, srv.name.ptr, srv.name.len);
+            if n > 0 {
+                _ = buf_append_cstr(&line, ": ");
+                _ = buf_append_u64(&line, n as u64);
+                _ = buf_append_cstr(&line, " tool(s)");
+            } else {
+                _ = buf_append_cstr(&line, ": no tools (");
+                if fail.len > 0 {
+                    _ = buf_append(&line, fail.ptr, fail.len);
+                } else {
+                    _ = buf_append_cstr(&line, "empty tools/list");
+                }
+                _ = buf_append_byte(&line, 41);   // ')'
+            }
+            mcp_diag(line.ptr as &const byte, line.len);
+        }
+        i = i + 1;
+    }
+}
+
+// ============================================================
+// 派发：工具结果投影
+// ============================================================
+
+// 把 `tools/call` 的 result 投影成工具结果文本（对齐 DSH 的 Native text projection）：
+//   * `content[]` 里 `type=="text"` 的 `text` 逐段拼接（`\n` 连接）；
+//   * 非 text 段（image / resource / audio）按 `[<type>: <detail>]` 这类**确定性占位行**
+//     落地 —— 本仓终端不渲染图片（DESIGN §15），但「这里有一张图」这个事实必须可见；
+//   * `isError:true` ⇒ 前缀 `Error: `（本仓既有工具口径）。
+// 返回 false = result 里一个可投影的内容段都没有（调用方回一句说明）。
+fn mcp_project_result(res: &const byte, rn: usize, out: &Buf) bool {
+    buf_reset(out);
+    var is_error: bool = false;
+    const ekey: &const byte = "\"isError\"" as &const byte;
+    const eat: isize = find_sub(res[0: rn], ekey[0: 9], 0);
+    if eat >= 0 {
+        var j: usize = mcp_skip_ws(res, rn, (eat as usize) + 9);
+        if j < rn && res[j] == 58 as byte {
+            j = mcp_skip_ws(res, rn, j + 1);
+            if j + 3 < rn && bufx_mem_eq(res + j, "true" as &const byte, 4) {
+                is_error = true;
+            }
+        }
+    }
+    if is_error {
+        _ = buf_append_cstr(out, "Error: ");
+    }
+    // 先看 structuredContent（MCP 2025-06-18 起：有 outputSchema 的工具给结构化结果）
+    const skey: &const byte = "\"structuredContent\"" as &const byte;
+    const sat: isize = find_sub(res[0: rn], skey[0: 19], 0);
+    var any: bool = false;
+    const key: &const byte = "\"content\"" as &const byte;
+    const at: isize = find_sub(res[0: rn], key[0: 9], 0);
+    if at >= 0 {
+        var i: usize = mcp_skip_ws(res, rn, (at as usize) + 9);
+        if i < rn && res[i] == 58 as byte {
+            i = mcp_skip_ws(res, rn, i + 1);
+            if i < rn && res[i] == 91 as byte {
+                i = i + 1;
+                while i < rn {
+                    i = mcp_skip_ws(res, rn, i);
+                    if i >= rn || res[i] == 93 as byte {
+                        break;
+                    }
+                    if res[i] == 44 as byte {
+                        i = i + 1;
+                        continue;
+                    }
+                    if res[i] != 123 as byte {
+                        break;
+                    }
+                    const e: usize = mcp_json_obj_end(res, rn, i);
+                    if e <= i {
+                        break;
+                    }
+                    if mcp_project_block(res + i, e - i + 1, out, any,
+                        is_error) {
+                        any = true;
+                    }
+                    i = e + 1;
+                }
+            }
+        }
+    }
+    // content 为空但给了 structuredContent：把结构化结果原样落成文本
+    // （总比「什么都没有」强 —— 模型至少能看到工具真的返回了东西）
+    if !any && sat >= 0 && out.len < MCP_RESULT_MAX {
+        var j: usize = mcp_skip_ws(res, rn, (sat as usize) + 19);
+        if j < rn && res[j] == 58 as byte {
+            j = mcp_skip_ws(res, rn, j + 1);
+            if j < rn && res[j] == 123 as byte {
+                const e: usize = mcp_json_obj_end(res, rn, j);
+                if e > j {
+                    _ = buf_append(out, res + j, e - j + 1);
+                    any = true;
+                }
+            }
+        }
+    }
+    return any;
+}
+
+// 投影一个内容块。`any` 是「前面已经写过正文」（决定要不要补
+// `\n`）。
+fn mcp_project_block(blk: &const byte, bn: usize, out: &Buf, any: bool,
+    is_error: bool) bool {
+    _ = is_error;
+    if out.len >= MCP_RESULT_MAX {
+        return false;
+    }
+    var ty: Buf = buf_new(64);
+    defer { buf_free(&ty); }
+    if !mcp_json_str(blk, bn, "type" as &const byte, &ty) {
+        return false;
+    }
+    if bufx_eq_cstr(ty.ptr as &const byte, ty.len, "text" as &const byte) {
+        var txt: Buf = buf_new(4096);
+        defer { buf_free(&txt); }
+        if !mcp_json_str(blk, bn, "text" as &const byte, &txt) {
+            return false;
+        }
+        if any {
+            _ = buf_append_byte(out, 10);
+        }
+        _ = buf_append(out, txt.ptr, txt.len);
+        return true;
+    }
+    // 非文本块：确定性占位行（终端不渲染图片/资源，但必须让人看见「这里有个东西」）
+    var detail: Buf = buf_new(256);
+    defer { buf_free(&detail); }
+    if bufx_eq_cstr(ty.ptr as &const byte, ty.len, "image" as &const byte)
+        || bufx_eq_cstr(ty.ptr as &const byte, ty.len, "audio" as &const byte) {
+        _ = mcp_json_str(blk, bn, "mimeType" as &const byte, &detail);
+    } else if bufx_eq_cstr(ty.ptr as &const byte, ty.len,
+        "resource" as &const byte) {
+        // resource 的 uri 在 `resource.uri` 里（嵌一层）
+        const rkey: &const byte = "\"resource\"" as &const byte;
+        const rat: isize = find_sub(blk[0: bn], rkey[0: 10], 0);
+        if rat >= 0 {
+            var j: usize = mcp_skip_ws(blk, bn, (rat as usize) + 10);
+            if j < bn && blk[j] == 58 as byte {
+                j = mcp_skip_ws(blk, bn, j + 1);
+                if j < bn && blk[j] == 123 as byte {
+                    const e2: usize = mcp_json_obj_end(blk, bn, j);
+                    if e2 > j {
+                        _ = mcp_json_str(blk + j, e2 - j + 1,
+                            "uri" as &const byte, &detail);
+                    }
+                }
+            }
+        }
+    } else if bufx_eq_cstr(ty.ptr as &const byte, ty.len,
+        "resource_link" as &const byte) {
+        _ = mcp_json_str(blk, bn, "uri" as &const byte, &detail);
+    }
+    if any {
+        _ = buf_append_byte(out, 10);
+    }
+    _ = buf_append_byte(out, 91);   // '['
+    _ = buf_append(out, ty.ptr, ty.len);
+    if detail.len > 0 {
+        _ = buf_append_cstr(out, ": ");
+        _ = buf_append(out, detail.ptr, detail.len);
+    }
+    _ = buf_append_byte(out, 93);   // ']'
+    return true;
+}
+
+// 按公开名找工具；没有返回 **-1**
+fn mcp_find_public(name: &const Buf) isize {
+    var i: usize = 0;
+    while i < g_mcp.n && i < MCP_TOOLS_MAX {
+        const t: &const McpTool = &g_mcp.tools[i];
+        if t.public.len == name.len
+            && bufx_mem_eq(t.public.ptr as &const byte,
+                name.ptr as &const byte, name.len) {
+            return i as isize;
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+// 按 serverName 找配置下标；没有返回 -1
+fn mcp_find_server(name: &const byte, n: usize) isize {
+    return mcp_set_find(&g_mcp.set, name, n);
+}
+
+// 问用户批不批这一次 MCP 工具调用。返回 **true = 放行**（或本来就不需要批准）；
+// false = 拒绝 / 没有渠道（此时 `out` 里已经写好给模型的错误文本）。
+//
+// 三种回执：1 = 批准 / 0 = 拒绝 / 2 = 没有回答渠道（非交互或子代理）——
+// 后两种都是**拒绝**，且都给模型一句能照做的指路（与 bash 的 read-only 闸门同款）。
+fn mcp_ask_approval(cfg: &const Config, srv: &const McpServer,
+    t: &const McpTool, out: &Buf) bool {
+    if !perm_requires_approval() && !perm_confine() {
+        return true;
+    }
+    var body: Buf = buf_new(512);
+    defer { buf_free(&body); }
+    if buf_valid(&body) {
+        _ = buf_append(&body, srv.name.ptr, srv.name.len);
+        _ = buf_append_cstr(&body, " → ");
+        _ = buf_append(&body, t.raw.ptr, t.raw.len);
+        _ = buf_append_cstr(&body, " (MCP tool call)");
+    }
+    const verdict: i32 = ask_approve_action(cfg, "mcp" as &const byte,
+        body.ptr as &const byte, body.len);
+    if verdict == 0 {
+        _ = buf_append_cstr(out,
+            // 行宽豁免：错误文案是**单条不可断的字面量**（Uya 没有相邻字面量拼接）
+            "Error: the user denied this MCP tool call. Do not retry it or an equivalent; ask the user first.");
+        return false;
+    }
+    if verdict == 2 {
+        _ = buf_append_cstr(out,
+            "Error: this MCP tool call needs approval, but it has no answer channel. Fail closed: ask the user to run it.");
+        return false;
+    }
+    return true;
+}
+
+// 派发一个 `mcp__…` 工具。名字不属于我们返回 **false**（调用方继续走自己的 else 链）。
+//
+// 失败一律写成**工具结果文本**（return true，out 里是 `Error: …`）—— 这是本仓的既有口径
+// （bash 工具同理）：让模型自己看到「MCP server 起不来 / 超时了」并纠正，而不是把整轮打断。
+//
+// `args_json` 是调用者给的**工具参数原文**（`dispatch_tool_body` 手上就有）。它被
+// **原样**下沉成 MCP 的 `arguments`：不要用 `args`（已 parse 的 JsonValue）重新序列化 ——
+// std.json 的 `JsonStrView` 是**未反转义**的原始视图（见 jsonx 的说明），
+// 拿它重新拼 JSON
+// 会把 `\n` 变成 `\\n` 双重转义，
+// server 收到的字符串当场变样。原文下沉既忠实又省一次编码。
+export fn mcp_tool_try(cfg: &const Config, name: &const Buf,
+    args_json: &const Buf, out: &Buf) bool {
+    if !mcp_name_is_ours(name) {
+        return false;
+    }
+    mcp_ensure(cfg.workspace.ptr[0: cfg.workspace.len], agent_dsh_home(),
+        cfg.mcp_off, &cfg.mcp_servers);
+    const ti: isize = mcp_find_public(name);
+    if ti < 0 {
+        _ = buf_append_cstr(out,
+            "Error: unknown MCP tool (the server may have dropped it; run the `mcp` tool with {\"action\":\"list\"} to refresh)");
+        return true;
+    }
+    // P70 权限闸门：read-only 下 MCP 工具一律拒绝（与写工具同等对待 ——
+    // MCP server 能做的事远超只读：它有网络、有文件、有自己的凭据）。
+    // 这里**不给**「问用户」的机会：read-only 的语义就是「不许它动」。
+    if perm_get() == PERM_READ_ONLY {
+        _ = buf_append_cstr(out,
+            "Error: MCP tools are disabled in read-only mode. Switch with /permission workspace-write to allow them.");
+        return true;
+    }
+    const tui: usize = (ti as! usize) catch { return true; };
+    if tui >= MCP_TOOLS_MAX {
+        _ = buf_append_cstr(out, "Error: unknown MCP tool");
+        return true;
+    }
+    const t: &const McpTool = &g_mcp.tools[tui];
+    const si: isize = mcp_find_server(t.server.ptr as &const byte,
+        t.server.len);
+    if si < 0 || si >= (MCP_MAX_SERVERS as isize) {
+        _ = buf_append_cstr(out, "Error: MCP server is no longer configured");
+        return true;
+    }
+    const sidx: usize = si as usize;
+    if sidx >= MCP_MAX_SERVERS {
+        _ = buf_append_cstr(out, "Error: MCP server index out of range");
+        return true;
+    }
+    const srv: &const McpServer = &g_mcp.set.items[sidx];
+    // workspace-write / read-only：每次调用要用户批准（与 bash 逐条批准同一条口径）。
+    // 抽成 `mcp_ask_approval`：它是「问一次人」这一件事，且要处理三种回执。
+    if !mcp_ask_approval(cfg, srv, t, out) {
+        return true;   // 拒绝 / 没有渠道：out 里已经是给模型的错误文本
+    }
+    const idx: isize = mcprun_find(srv.name.ptr as &const byte, srv.name.len);
+    if idx < 0 {
+        _ = buf_append_cstr(out, "Error: MCP server is not running (reload with the `mcp` tool)");
+        return true;
+    }
+    // 组请求 + 发出去 + 收回来 + 投影（抽成 `mcp_call_server`：这一段自成「一轮调用」）
+    mcp_call_server(idx as usize, srv, t, args_json, out);
+    return true;
+}
+
+// 跑一轮 `tools/call`：组 params（raw 名 + 原样下沉的 arguments）→ 发 → 收 → 投影进 out。
+// 失败一律写成给模型的错误文本（返回 void：调用方已经把「认领了」这件事定死了）。
+fn mcp_call_server(idx: usize, srv: &const McpServer, t: &const McpTool,
+    args_json: &const Buf, out: &Buf) void {
+    var params: Buf = buf_new(1024);
+    defer { buf_free(&params); }
+    if !buf_valid(&params) {
+        _ = buf_append_cstr(out, "Error: out of memory");
+        return;
+    }
+    _ = buf_append_cstr(&params, "{\"name\":");
+    _ = jw_str_into(&params, t.raw.ptr as &const byte, t.raw.len);
+    _ = buf_append_cstr(&params, ",\"arguments\":");
+    // arguments 原样下沉（见 mcp_tool_try 的文件头注释：**不许**重新序列化）
+    if args_json.len > 0 {
+        _ = buf_append(&params, args_json.ptr, args_json.len);
+    } else {
+        _ = buf_append_cstr(&params, "{}");
+    }
+    _ = buf_append_byte(&params, 125);
+    var req: Buf = buf_new(1024);
+    defer { buf_free(&req); }
+    var resp: Buf = buf_new(MCP_RESULT_MAX);
+    defer { buf_free(&resp); }
+    var d: Buf = buf_new(1024);
+    defer { buf_free(&d); }
+    if !buf_valid(&req) || !buf_valid(&resp) {
+        _ = buf_append_cstr(out, "Error: out of memory");
+        return;
+    }
+    const id: i64 = mcprun_next_id(idx);
+    if !mcp_req(&req, id, "tools/call" as &const byte,
+        params.ptr as &const byte, params.len) {
+        _ = buf_append_cstr(out, "Error: cannot build the MCP request");
+        return;
+    }
+    if !mcprun_send(idx, &req) {
+        _ = buf_append_cstr(out, "Error: MCP server closed the pipe (it crashed or exited)");
+        return;
+    }
+    const rc: i32 = mcprun_recv(idx, id, srv.timeout_ms, &resp, &d);
+    if rc != 0 {
+        _ = buf_append_cstr(out, "Error: ");
+        _ = buf_append_cstr(out, mcp_rc_text(rc));
+        return;
+    }
+    var em: Buf = buf_new(512);
+    defer { buf_free(&em); }
+    if mcp_error_message(resp.ptr[0: resp.len], &em) {
+        _ = buf_append_cstr(out, "Error: MCP server returned an error: ");
+        _ = buf_append(out, em.ptr, em.len);
+        return;
+    }
+    var rs: usize = 0;
+    var re: usize = 0;
+    if !mcp_result_span(resp.ptr[0: resp.len], &rs, &re) {
+        _ = buf_append_cstr(out, "Error: malformed MCP response (no result object)");
+        return;
+    }
+    if !mcp_project_result(resp.ptr + rs, re - rs, out) {
+        _ = buf_append_cstr(out, "(the MCP tool returned no content)");
+    }
+}
+
+
+// ============================================================
+// 钩子（模拟 DSH 的进程内缝；server 回 -32601 就当作没这个钩子）
+// ============================================================
+
+// 跑一个钩子。返回：
+//   0 = 没有 server 认这个钩子（**放行**；
+// 这是绝大多数情况）
+//   1 = 有 server 回了决策，
+// 原文写进 out（调用方按 DSH 的决策形状解释）
+// 钩子出错（超时/崩/坏 JSON）**一律当放行** ——
+// 钩子是增强，不能变成故障点。
+export fn mcp_hook_run(cfg: &const Config, method: &const byte,
+    params_json: &const Buf, out: &Buf) i32 {
+    buf_reset(out);
+    if cfg.mcp_off {
+        return 0;
+    }
+    // read-only 下钩子一律不跑（它**能改参数/改结果**，
+    // 等于权限模型的一部分）
+    if perm_get() == PERM_READ_ONLY {
+        return 0;
+    }
+    mcp_ensure(cfg.workspace.ptr[0: cfg.workspace.len], agent_dsh_home(),
+        cfg.mcp_off, &cfg.mcp_servers);
+    if g_mcp.set.n == 0 {
+        return 0;
+    }
+    var i: usize = 0;
+    while i < g_mcp.set.n && i < MCP_MAX_SERVERS {
+        const srv: &const McpServer = &g_mcp.set.items[i];
+        i = i + 1;
+        const idx: isize = mcprun_find(srv.name.ptr as &const byte,
+            srv.name.len);
+        if idx < 0 {
+            continue;   // 这个 server 没在跑（没工具被用过）：跳过，不为钩子白起进程
+        }
+        const p: usize = idx as usize;
+        var req: Buf = buf_new(1024);
+        defer { buf_free(&req); }
+        var resp: Buf = buf_new(65536);
+        defer { buf_free(&resp); }
+        var d: Buf = buf_new(256);
+        defer { buf_free(&d); }
+        if !buf_valid(&req) || !buf_valid(&resp) {
+            continue;
+        }
+        const id: i64 = mcprun_next_id(p);
+        if !mcp_req(&req, id, method, params_json.ptr as &const byte,
+            params_json.len) {
+            continue;
+        }
+        if !mcprun_send(p, &req) {
+            continue;   // 管道断了：当放行
+        }
+        const rc: i32 = mcprun_recv(p, id, srv.timeout_ms, &resp, &d);
+        if rc != 0 {
+            continue;   // 超时/崩/取消：当放行（钩子不许让主流程失败）
+        }
+        // `-32601 Method not found` ⇒ 这个 server 不认钩子（标准 MCP server 的常态）
+        var em: Buf = buf_new(256);
+        defer { buf_free(&em); }
+        if mcp_error_message(resp.ptr[0: resp.len], &em) {
+            if bufx_contains(&em, "not found" as &const byte) {
+                continue;
+            }
+            continue;
+        }
+        var rs: usize = 0;
+        var re: usize = 0;
+        if !mcp_result_span(resp.ptr[0: resp.len], &rs, &re) {
+            continue;
+        }
+        _ = buf_append(out, resp.ptr + rs, re - rs);
+        return 1;
+    }
+    return 0;
+}
+
+// 钩子决策里的 `kind`（`allow`/`deny`/`accept`/`block`/…）：取不到返回空。
+// 之所以要一个单独的小函数而不是复用 `mcp_json_str`：决策对象的 `kind`
+// 一定是
+// 顶层短字符串，这里的调用点很多（每个钩子一处），
+// 单独收口便于以后加日志。
+export fn mcp_decision_kind(dec: &const Buf, out: &Buf) void {
+    _ = mcp_json_str(dec.ptr as &const byte, dec.len,
+        "kind" as &const byte, out);
+}
+
+// 决策里的一个字符串字段（`reason` / `content` / `feedback`）
+export fn mcp_decision_str(dec: &const Buf, key: &const byte, out: &Buf) bool {
+    return mcp_json_str(dec.ptr as &const byte, dec.len, key, out);
+}
