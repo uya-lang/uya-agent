@@ -1308,13 +1308,19 @@ plan 审阅的四条裁决：`PLAN_KEEP=0` / `PLAN_APPROVE=1` / `PLAN_NO_CHANNEL
 **行级硬裁只给滚动模式与 `--list-sessions` 用；TUI 里 id 在条目文本里永不裁剪** ——
 因为选中项的 id 就是**从条目文本里取回来的**，裁了就取不到。
 
+**列表只列有标题的会话**：空标题（`"title":""`）与缺 `title` 字段的索引行在**渲染层**
+（`sess_rows_render` 的两趟都套 `sess_cell_has_title`）被整条跳过；数据层
+（`sess_index_rows_sorted`）照旧交出全部记录，所以 `--resume <id>` / `sess_find` /
+`--continue` 仍能回到没起过名字的会话。三个入口（`/sessions` 浮层、`--list-sessions`、
+滚动模式的 `/sessions`）共用这一份；一条有标题的都没有时给 `(没有找到已命名会话)`。
+
 ### 8.6 恢复数据流
 
 | 入口 | 行为 |
 |---|---|
 | `--continue` | `sess_find_last`：读索引，按 `lastActiveAt` 选最大；**`delegationDepth > 0` 的子代理会话不参与**（否则会接到子代理身上）；可按 cwd 过滤 |
 | `--resume <id>` | `sess_find`：先看当前 cwd 目录，再扫所有 `--*--` 目录 |
-| `/sessions` | 浮层，数据层最新在前、**展示层翻成最新在最后一行** |
+| `/sessions` | 浮层，数据层最新在前、**展示层翻成最新在最后一行**；只列**有标题的**会话（空标题整条不见，`--resume <id>` 仍可直达） |
 | `--resume-dsh <前缀>` | 走 `dshsess` 导入（§8.7） |
 
 解析结果写进 `cfg.resume_id`（**绝对路径**）。恢复过程：
@@ -3259,7 +3265,7 @@ DEEPSEEK_API_KEY=sk-xxx ./build/uya-agent \
 | `title-cmd-e2e` | `make e2e-title-cmd`：行式真二进制的用法串 / 改名回执 / `/status` 的 title 行 / clear / 空标题报错 / `/help` 可查 / 索引与日志落盘 |
 | `title-auto-e2e` | `make e2e-title-auto`：真 PTY + 假网关 —— 自动起标题**多发一次请求**并落 `kind=provider`；`--no-title-auto` 两样都没有；三来源（default/env/cli）与 CLI 优先 |
 | `tui-md` | P47 markdown 渲染七段：① 行内（`**粗**`/`*斜*`/`~~删~~`/`` `code` ``/链接：标记不上屏、样式落在正确的列、`snake_case` 不被误判）；② 块级（标题去 `#` 并按级着色、无序/嵌套/有序列表、任务清单 `✓`·`·`、引用 `▏ `、分隔线、围栏去标记留语言标签且块内 CODE）；③ **长行不丢字**（60/80/100 列下 100 字符代码行 + 100 字符正文 + 60 汉字逐字符完整、且那些行没有 `…`）；④ **滚到代码块中间样式不串**（贴尾与上滚两面，闭合围栏不再被当成开始）；⑤ 表格（表头 BOLD、框线 DIM、各行列宽一致、8 列在 40 列下整块退回普通行且不丢内容）；⑥ plan 审阅浮层共用同一份渲染 + 方框逐行闭合；⑦ **长条目取行 O(1)**（查表 vs 线性扫描逐行差分 + 贴尾首帧/缓存帧/上翻 20 屏三条成帧预算） |
-| `sessions-e2e` | `make e2e-sessions`：最新在最后一行、空标题落 `(无标题)` |
+| `sessions-e2e` | `make e2e-sessions`：只列有标题的会话（空标题整条不见）、最新在最后一行、同 id 取最后一条 |
 | `resume-big-e2e` | `make e2e-resume-big`：~3 MiB 会话 + 残行，`--resume --dry-run` 退出码 0 |
 | `diff-render` | 纯函数：上下文、`… (省略 36 行)`、按显示列截断 |
 | `tool-view` | P16 单行：`· exit N`、`· +A -D`、默认无正文、fd 2 端到端；工具内容块 + 多行面板块渲染协议 |

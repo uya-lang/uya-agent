@@ -23,7 +23,8 @@
   （read-before-write / 版本守卫）；system prompt 分节装配；能直接读 DSH 自己的会话（含 zstd）。
 * **界面**：纯 Uya 写的全屏 TUI（常驻状态区 + 思考实时行 + 统计行/`ctx`/`cpu`/`内存` + 任务块 +
   `/diff` 浮窗 + markdown 渲染 + 浮层全屏 + 终端标题）；滚动模式（`--no-tui`）退回纯文本转录。
-* **能力**：会话落盘可恢复（`--continue` / `--resume` / `/sessions`）；上下文管理（剪枝 +
+* **能力**：会话落盘可恢复（`--continue` / `--resume` / `/sessions` —— 列表只列**有标题的**会话，
+  无标题的仍可 `--resume <id>` 直达）；上下文管理（剪枝 +
   自动压缩）；技能发现 + `skill`；`web_search`；子代理一族（含 `ralph` 与 `/watch` 实时跟随）；
   会话目标；workflow（`.ush` 脚本编排）；三级访问模式 + bwrap 内核沙箱；Git worktree
   （执行 → 合并 → 删除，连带残留回收）；图片附件与剪贴板粘贴（纯 Uya 的 X11 客户端）。
@@ -125,7 +126,7 @@ readelf -lW build/uya-agent | grep -c INTERP    # 0 = 真静态
 | `--no-save` | 不写会话日志（只跑不记） |
 | `--continue` | 接着当前目录最近一条会话继续 |
 | `--resume ID` | 恢复指定会话（`ID` 或 `last`） |
-| `--list-sessions` | 列出本机会话后退出 |
+| `--list-sessions` | 列出本机**有标题的**会话后退出（无标题的不进列表；`--resume <id>` 仍可直达） |
 | `--dsh-home DIR` | DSH 用户目录（默认 `$DSH_HOME` 或 `~/.dsh`） |
 | `--no-dsh-config` | 完全不读 DSH 设置 |
 | `--strict-dsh-config` | 读不到 DSH 设置就报错退出 |
