@@ -127,6 +127,9 @@ readelf -lW build/uya-agent | grep -c INTERP    # 0 = 真静态
 | `--bwrap PATH` | 指定 bwrap 可执行文件（默认探测 `/usr/bin/bwrap`、`/bin/bwrap`、`/usr/local/bin/bwrap`） |
 | `--worktree` / `--no-worktree` | **独立工作区执行**：会话开始建 git worktree + `dsh/<slug>` 分支，干完用 `worktree` 工具 `finish` 提交/合并/删除；DSH `agent-presets.default=git-worktree` 会自动开 |
 | `--skill-dir DIR` | 额外的技能根（冒号分隔，可多次） |
+| `--mcp-server SPEC` | 加一个 MCP 插件 server（可多次）。`SPEC = name=command [args…] [K=V…]`，例：`--mcp-server "fs=npx -y @mcp/server-filesystem ."`。见 [§2.1](#21-插件mcp) |
+| `--no-mcp` | 不读不连任何 MCP 插件（`UYA_AGENT_MCP=0` 同口径） |
+| `--list-plugins` | 打印插件与工具的诊断后退出（排查「为什么工具数是 0」的第一个入口） |
 | `--uya-bin PATH` | 跑 workflow 脚本的解释器（默认 `$UYA_BIN` 或 `uya`） |
 | `--no-compact` / `--context-window N` | 关闭自动上下文压缩 / 指定压缩判定的窗口（默认取 DSH 模型条目） |
 | `--no-memory` / `--memory-budget N` | 关掉项目记忆（不读不写不注入）/ 开工包的字节预算（默认 3072） |
@@ -207,6 +210,7 @@ uya-agent --web 127.0.0.1:9000     # 指定端口（端口写 0 = 内核分配�
 `UYA_AGENT_SANDBOX`（`0`/`off` = 等价于 `--no-sandbox`）、`UYA_AGENT_BWRAP`（bwrap 路径）、
 `UYA_AGENT_TITLE` / `UYA_AGENT_TITLE_AUTO`（`0` = 关，其它非空值 = 开；CLI 优先）、
 `UYA_AGENT_MOUSE`（`0` = 关鼠标上报、可直接拖选复制；CLI 优先）、
+`UYA_AGENT_MCP`（`0` = 不读不连 MCP 插件，等价 `--no-mcp`）、
 `UYA_AGENT_WEB_TLS_VERIFY` / `UYA_AGENT_WEB_TLS_PIN`（搜索主机的信任策略，默认继承 cfg）、
 以及 key（三选一）：`UYA_AGENT_API_KEY` / `DEEPSEEK_API_KEY` / `OPENAI_API_KEY`。
 
@@ -237,10 +241,59 @@ read-only 与 plan 模式下照常可用。
 | 子代理 | `subagent` `subagent_fork` `list_agents` `subagent_output` `send_message` `interrupt_agent` `ralph` |
 | 目标 | `create_goal` `get_goal` `update_goal` |
 | 编排 | `workflow` |
+| 插件（P70） | `mcp`（元工具：看/重载插件状态）+ 每个 MCP 插件自己的工具（配了才出现） |
 
 每个工具的参数与结果形状见 [DESIGN.md §6.2](DESIGN.md)；
 实现要点（路径守卫、版本守卫、bash 的进程与标记、glob/grep 的上限）见
 [DESIGN.md §6](DESIGN.md) 与 [§17](DESIGN.md)。
+
+### 2.1 插件（MCP）
+
+**MCP server 就是插件，可以用任意语言写** —— Uya、Python、Node、shell，或者别人发布好的
+现成 server。宿主只认 stdio 上的一问一答 JSON，不关心对面是什么。
+
+为什么选 MCP 而不是自造一套协议：**DSH 自己的进程外插件路径就是 MCP**
+（`@deepseek-ai/dsh-mcp-client`），所以同一份配置、同一个 server，DSH 与本仓都能吃；
+自造一套只会多一层适配，还拿不到生态。协议细节见 [DESIGN.md](DESIGN.md) 的「插件系统」一节。
+
+配置（三种挑一种，都能直接跑）：
+
+```bash
+# ① 命令行：SPEC = name=command [args…] [K=V…]
+uya-agent --mcp-server "fs=npx -y @modelcontextprotocol/server-filesystem ."
+
+# ② $DSH_HOME/settings.yaml（字段与 DSH 逐字相同，一份配置两边都能用）
+#   uya-agent:
+#     mcp:
+#       fs:
+#         transport: stdio
+#         command: npx
+#         args: ["-y", "@modelcontextprotocol/server-filesystem", "."]
+
+# ③ <projectRoot>/.dsh/mcp.json（生态通用 mcpServers 形状）
+#   {"mcpServers":{"fs":{"command":"npx","args":["-y","@modelcontextprotocol/server-filesystem","."]}}}
+```
+
+先看装上了没有（每个 server 一行结论；失败会说明为什么）：
+
+```bash
+uya-agent --list-plugins
+```
+
+三条要知道的口径：
+
+| 事项 | 说明 |
+|---|---|
+| 工具名 | 模型看到的是 `mcp__<serverName>__<原名>`；非法字符换成 `_`，名字太长（或发生过替换）时截到 51 字符再补 `_` + 12 位 sha256。**与 DSH 同一套规则**，所以同一个 server 在两边叫同一个名字 |
+| 权限 | `read-only` 下一律拒绝（且钩子不跑）；`workspace-write` 每次调用问你一次 + bwrap 沙箱；`danger-full-access` 放行。`command` **不做 PATH 查找** |
+| 失败 | server 崩了 / 超时 / 回非法 JSON，都是一句**工具结果文本**（与 `bash` 工具同口径），不会把整轮打断 |
+
+**三种语言的可跑示例**在 [`examples/mcp-plugins/`](examples/mcp-plugins/)：
+`wordcount.ush`（Uya）、`greet.py`（Python）、`echo.sh`（POSIX shell）——
+同一件事的三种实现，可以直接照着写自己的。
+
+`--no-mcp`（或 `UYA_AGENT_MCP=0`）完全不读不连插件；一份 server 都没配时，
+工具表与没这个功能时**逐字节相同**。
 
 ---
 
@@ -256,6 +309,7 @@ make sess-selftest         # 只跑 /sessions 与大日志
 make diff-selftest         # 只跑 src/diff/
 make web-selftest          # 只跑 web 界面（服务端终端解释器 / HTTP 侧 / 页面 / 分派语义 / PTY 收口）
 make pm-selftest           # 只跑 src/pm/（项目记忆）
+make mcp-selftest          # 只跑 src/plugin/（MCP 插件：公开名 / 握手 / 派发 / 降级）
 make UYA_SELFTEST_ONLY=x,y # 只跑指定的几轮
 ```
 

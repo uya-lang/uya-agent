@@ -976,6 +976,7 @@ front-matter = `---` 包起来的 YAML，必填 `name`（kebab-case，`[a-z0-9-]
 | 子代理 | `subagent` `subagent_fork` `list_agents` `subagent_output` `send_message` `interrupt_agent` `ralph` | 总是 |
 | 目标 | `create_goal` `get_goal` `update_goal` | 总是 |
 | 编排 | `workflow` | 总是 |
+| 插件（P70） | `mcp`（元工具）；每个 MCP 插件自己报的工具 | **配了 MCP server 时才出现**（没配时工具表逐字节不变，见 §21） |
 
 schema 文本是 `TOOL_*` 常量（`src/agent/ag_tools_schema.uya`），逐字对齐 DSH v0.1.1-rc.2 的
 standard preset。**唯二例外**是本仓自有的两个：`uya_notes`（P63，速查表）与 `run_shell`
@@ -2691,6 +2692,18 @@ responses 用 `{"type":"input_image","detail":"auto","image_url":…}`；
 | `goal` 的续跑**授权不跨进程** | `/new`、`--resume`、fork 之后目标还在盘上但停着，接着跑要人明确 resume（§9.5） |
 | **路径守卫是 best-effort，不是安全边界** | 要真隔离请用 `workspace-write` / `read-only` |
 
+### 15.4.1 插件（P70）明确不做的事
+
+| 不做 | 理由 |
+|---|---|
+| **进程内 cordis/TS 插件**（`@deepseek-ai/dsh-tool-*` 这类） | 那要求宿主是 Node —— 插件要的是**进程内可调用对象**（`ctx.subprocess` / `ctx.fs`）与同进程状态同步（`sessionProjections.register`），跨进程给不了。如实记为「不追」，`--list-plugins` 会报 `unsupported` 并说明原因 |
+| `streamable-http` transport | 只做 stdio（字段留着、解析照做，只是不实现连接） |
+| MCP 的 `resources` / `sampling` / `roots` | 只做 tools + prompts；本仓没有对应的消费面 |
+| `notifications/tools/list_changed` 热更新 | 用 `mcp` 元工具的 `reload` 手动刷（自动热更新要处理「注册表正在被读时被换掉」） |
+| MCP 的 task / permission 扩展词表 | 与 §7 的三级模式重复，两套权限语义会漂移 |
+| waterfall 的**链式**语义 | 只能单点否决/整体替换（见 §21.2 的表） |
+| 插件市场 / 自动下载安装 | 插件的获取是用户的事；本仓只负责「装好了怎么用」 |
+
 ### 15.5 平台
 
 目标平台是 **Linux x86-64**（代码里的 syscall / 常量按这个平台写）。
@@ -3393,6 +3406,39 @@ responses 用 `{"type":"input_image","detail":"auto","image_url":…}`；
     教训：**「非阻塞读返回负数」有两个完全不同的原因（EAGAIN / 对端没了），
     只认 `read == 0` 收不到第二种** —— 判死要靠 `poll` 的 `POLLHUP`/`POLLERR`，
     而不是靠 `read` 的返回值。
+
+106. **编译器的「固定容量表」又撞了两次 —— 报错点在别的文件里，根因是表满了**（P70）：
+    这一轮加 4 个插件文件（+ 1 个自测文件）时连撞两条容量上限。它们本来就有
+    （§2.3 那张表记的是「已修」的那几条），但**余量在这轮被吃穿**了：
+
+    | 表 | 常量 | 基线用量 | 症状 |
+    |---|---|---|---|
+    | 顶层函数 **call edge** 表 | `MAX_FN_CALL_EDGES = 16384` | **16336**（余 48 条） | 报「顶层函数 call edge 容量已满」，报错点在**标准库**（`std/http/uyagin.uya` 等） |
+    | 顶层变量**类型查找**的降级路径 | `C99_MAX_GLOBAL_VARS = 512`（**缓存**，满了不登记是设计） | 顶层全局 771 → 783 | 报 `'struct uya_slice_int32_t' has no member named 'ptr'`，报错点在**与改动毫无关系**的 `agent/ag_tui_sessions.uya` 的 `sess_cell_has_title` |
+
+    第一条的实测边界（`uya build` + 清缓存）：加 48 条边通过、64 条红。
+    修法：`fn_call_edge_from/to` 改成 `&(&ASTNode)` 指针表 + `fn_call_edge_capacity`，
+    满了按 2 倍扩（`checker_grow_call_edges`）—— 与 `c99_grow_reachable_functions`
+    （提交 `1267dbc6`）逐条对齐；`MAX_FN_CALL_EDGES` 降级为「**初始**容量」。
+
+    第二条更阴：`c99_emit_global_variable` 的注释写着「这张表是缓存，满了降级，
+    按名查找会退回 `program_decls` 线性扫描」—— 但**只有「名字」查找有那条兜底，
+    「类型」查找（`lookup_identifier_type_c_impl`）没有**。于是表满之后
+    `get_identifier_type_c` 返回 `null`、`get_slice_struct_type_c` 落到默认的
+    `uya_slice_int32_t`，而**切字符串字面量不受影响**（走 `AST_STRING` 分支，不查表）
+    —— 全仓只有一处「切一个具名常量」：
+    `find_sub(line, &SESS_TITLE_KEY[0: n], 0)`。改那一行就绿，但那是在应用层绕过编译器，
+    换个地方这么写还会再踩；正确修法是把缺的那条降级补齐（提交 `15899366`）。
+
+    **两条教训**：
+    ① 「报错点与自己无关」现在有两个家族 —— 一是**函数/可达集合**类（§16 踩坑 87），
+    二是**表满之后的类型推断退化**（本轮）。两者的共同判据是：**报错文件里没有你的改动**
+    且 `make check` 与增量编译全绿、只有清缓存重编（或加了文件之后）才炸。
+    ② 修的时候要问「这张表该是缓存还是该是上限」：call edge 表**是**上限（丢边=可达集合
+    静默变小，症状是链接期 undefined reference，比报错难查得多）⇒ 扩容；
+    顶层变量表**是**缓存（满了降级是设计）⇒ 补降级路径，不动 `C99_MAX_GLOBAL_VARS`
+    （试过把它抬到 4096/2048，结果是编译器**自己**编不过 ——
+    同一个洞在 `src/checker/symbols.uya` 的缓存比较里又露一次）。
 
 ---
 
@@ -4179,3 +4225,173 @@ stat 三元组）/ `state`（上次什么结果）。`<repo-key>` = 归一化仓
    「不存在」全标 GONE；**更糟的是 GONE 那条断言也满足，失效轮会假装通过** —— 所以
    `pm_verify` 现在必须收 workspace；
 5. 惯例分区标题写死 "user-confirmed"，而抽出来的只是候选 → 标题变谎话。
+
+---
+
+## 21. 插件系统（P70，`src/plugin/`）
+
+这一节回答：**「插件」在本仓是什么、为什么是 MCP、哪些模拟得了哪些模拟不了、
+失败与权限怎么收口**。
+
+### 21.1 结论先行：DSH 的进程外插件路径**就是 MCP**
+
+装好 DSH（v0.1.1-rc.2，`~/.npm-global/lib/node_modules/@deepseek-ai/dsh`）读一遍就清楚：
+
+| 事实 | 出处（可复核） |
+|---|---|
+| DSH 的插件 = **cordis/npm 包**（`@deepseek-ai/dsh-*`），`type: module`，**进程内** TS 模块 | `dsh-base/package.json`、`dsh-tool-todo/lib/index.js` |
+| 插件靠 `cordis.yml` 的**行**装配，`config:` 是它的参数 | `~/.dsh/.agent-presets/git-worktree/agent.cordis.yml` |
+| 插件往**命名缝**注入：`tools/pre-execute`、`tools/post-execute`、`system-prompt/assemble`、`agent/pre-step`… | `dsh-tools/lib/index.js:3105`、`dsh-system-prompt/lib/index.js:283`、`dsh-agent-loop/lib/index.js:501` |
+| `tools/pre-execute` 的返回值就是决策对象：`{kind:"allow"}` / `{kind:"ask"}` / `{kind:"deny",reason}` | `dsh-tools/lib/index.js:3105-3117` |
+| `tools/post-execute`：`{kind:"accept",content?}` / `{kind:"block",feedback}` | `dsh-tools/lib/index.js:3366-3394` |
+| **DSH 自己的「进程外插件」路径 = MCP**：`@deepseek-ai/dsh-mcp-client`，`transport: stdio \| streamable-http` | `dsh-mcp-client/package.json`、`lib/index.js:738` |
+| MCP 工具公开名 = `mcp__<serverName>__<rawName>`；`serverName` 必须 `^[A-Za-z0-9_-]{1,32}$` | `dsh-mcp-client/lib/index.js:119-125, 724, 740` |
+| MCP 配置字段逐字：`transport`/`serverName`/`command`/`args`/`env`/`cwd`/`toolCallTimeoutMs`（默认 **60000**） | `dsh-mcp-client/lib/index.js:738-747, 722` |
+| stdio 帧 = **一行一条 JSON**（`\n` 分隔，容忍 `\r`）；SDK 1.30.0、协议版本 `2025-11-25` | `@modelcontextprotocol/sdk/dist/esm/shared/stdio.js` |
+
+**所以本仓不造协议，直接实现 MCP stdio 客户端** —— 装好的 MCP server
+（`filesystem`、`github`、`sqlite`…）与本仓、与 DSH 共用同一批。命名也逐字对齐
+（§21.3），同一个 server 在 DSH 与本仓**叫同一个名字**。
+
+### 21.2 能模拟什么、模拟不了什么（**如实记，别假装**）
+
+「DSH 插件能做的事」拆开是「注册一个工具」与「在某个缝上做决策」两类，MCP 对第一类
+一一对应，对第二类能单点决策、**做不出链**：
+
+| DSH 进程内插件做的事 | MCP 能否模拟 | 本仓怎么做 |
+|---|---|---|
+| `ctx.tools.register(defineTool({name,description,parameters,execute}))`（19 个包这么做） | **完全能** | `tools/list` + `tools/call` |
+| `tools/pre-execute` → allow / deny | **能**（单点） | 同名自定义方法（§21.4） |
+| `tools/post-execute` → accept / block | **能**（单点） | 同上 |
+| `system-prompt/assemble` | **能**，但只能**整体替换** | 同上 |
+| `session/created` / `session/disposed` | **能**（通知） | 同上 |
+| `static inject = ["subprocess"]` 这类**宿主服务注入** | **不能** | 插件要的是**进程内可调用对象**，跨进程给不了 |
+| `sessionProjections.register({apply})`（改宿主状态机） | **不能** | 要求同进程状态同步 |
+| `ctx.waterfall` 的**链式 next()** | **不能** | 只能单点否决/替换；多个 server 之间没有链 |
+| `dsh-cordis-host-runner`、`dsh-client-ui-*` | **不能** | 前者在宿主里跑 cordis 插件、后者是 Web UI 组件，都与本仓无关 |
+
+⇒ `--list-plugins` 扫到 `@deepseek-ai/dsh-*` 的**进程内**插件行时，如实报
+`unsupported (in-process cordis plugins cannot run OOP)` 并说明原因 ——
+**不让用户以为「配了就会生效」**。
+
+### 21.3 公开名：逐字复用 DSH 的规则
+
+`mcp_tool_public_name`（`src/plugin/mcp.uya`）与 DSH 的 `publicToolName` 逐条对齐：
+
+1. 常态就是 `mcp__<serverName>__<rawName>`；
+2. `[^A-Za-z0-9_-]` 的字符换成 `_`（模型的函数名契约只允许这个字符集）；
+3. **发生过替换或长度 > 64** ⇒ 截到 `64-12-1 = 51` 个字符，再拼 `_` + sha256
+   （输入 `<serverName>\0<rawName>`）**前 12 位 hex**；
+4. **raw 名只在线上发**（`tools/call` 的 `params.name`），绝不从公开名反推 —— 那是有损的。
+
+`serverName` 必须 `^[A-Za-z0-9_-]{1,32}$`，不合法整条丢掉（不猜、不改名）。
+
+⚠ 第 3 步有个**必须用 `min(原名长, 51)`** 的细节：短名字（如 `mcp__fs__read_file` 只有
+18 字节）硬取 51 会读过缓冲尾部、把堆上的垃圾字节当名字的一部分（现场症状：公开名里
+混进一串 NUL，模型侧名字与派发查表两边都对不上）。DSH 那边是 JS 的
+`String.slice(0, 51)`（短串原样），这里对齐的就是那个语义。
+
+### 21.4 钩子：用 DSH 的缝名，但走本仓的扩展方法
+
+DSH 的缝是**进程内**的，而 MCP 规范里**没有**钩子能力（只有 tools/resources/prompts/
+sampling/notifications）。所以本仓把钩子做成**自定义 MCP 方法，名字沿用 DSH 的缝名**：
+`tools/pre-execute`、`tools/post-execute`、`system-prompt/assemble`、`session/created`。
+
+* server **不认**这个方法 ⇒ 回 `-32601 Method not found` ⇒ 本仓**当作没这个钩子、放行**。
+  于是**任何标准 MCP server 都能只当纯工具插件用**（这是绝大多数情况）；
+* 认得的 server 才跑钩子。**钩子出错（超时/崩/坏 JSON）一律当放行** ——
+  钩子是增强，不能变成故障点；
+* 这一条是本仓扩展，DSH 原生不通过 MCP 暴露钩子。将来 DSH 若把钩子也搬到 MCP，
+  方法名已经对齐（这是刻意留的升级缝）。
+
+### 21.5 配置来源与优先级
+
+高 → 低（**靠前的先胜**，同名不覆盖）：
+
+| 优先级 | 来源 | 形状 |
+|---|---|---|
+| 1 | `--mcp-server SPEC` | `name=command [args…] [K=V…]`（`K=V` 判据：`=` 前是合法环境变量名，所以 `--opt=value` 照旧进 args） |
+| 2 | `$DSH_HOME/settings.yaml` 的 `uya-agent.mcp.<name>` | 字段与 DSH 逐字相同 |
+| 3 | `<projectRoot>/.dsh/mcp.json` + `~/.agents/mcp.json` | 生态通用 `mcpServers` 形状 |
+| 4 | `cordis.yml` 的 `@deepseek-ai/dsh-mcp-client` 行 | `config` 原样映射 |
+
+任何一个来源读不到/解析失败都**不是致命错误**（离线要能跑，与 dshcfg 同一条口径）。
+
+### 21.6 权限：MCP server 是第三方进程
+
+| 模式 | MCP 工具 | 钩子 |
+|---|---|---|
+| `read-only` | **拒绝**（回错误文本指路 `/permission workspace-write`） | **一律不跑** |
+| `workspace-write` | `ask_approve_action` 逐次批准 + `san_build_exec` 同档 bwrap | 跑 |
+| `danger-full-access` | 放行 | 跑 |
+
+read-only 下钩子**一律不跑**的理由：钩子能改工具参数、能改工具结果 ——
+它**就是权限模型的一部分**，read-only 的语义是「不许它动」，不能留一条改参数的旁路。
+
+三条硬口径：
+
+1. **`command` 不做 PATH 查找**（`execve` 只吃路径）。PATH 查找会让「装了哪个插件」
+   变成环境变量的函数；示例与文档里一律写绝对路径。
+2. 子进程**只继承安全白名单**（`HOME LOGNAME PATH SHELL TERM USER`）+ 配置里显式给的
+   `K=V` —— 它是第三方进程，不该看到宿主自己的 `DSH_*` 与凭据类变量。
+3. 子进程必须 `sigx_reset_for_child`（信号处置是继承的，否则它收到 TERM 会写父终端）。
+
+### 21.7 与 bash 工具的两处**关键差异**（容易写错）
+
+1. **stdin/stdout 就是协议通道** ⇒ **不能**像 `bash`/`rg` 那样调
+   `sh_child_detach_stdio()`（它把 stdin 接到 `/dev/null`）。这里 stdin/stdout 接管成
+   管道，**stderr 单独一根管**（转诊断，绝不混进 JSON 流 —— 一个 warning 就能让协议错位）。
+2. **一个 server 一个常驻子进程**（MCP 的标准形态，也是 DSH 的做法），
+   所以省掉每次 fork 的冷启动；代价是要管子进程生命周期 —— 换工作区、
+   `mcp` 元工具 reload、进程退出三处都要收干净（`main` 的 defer 里 `mcp_stop_all`，
+   所有早退路径都经过它）。
+
+### 21.8 失败语义：不阻断主流程
+
+| 情况 | 表现 |
+|---|---|
+| server 起不来 / 崩 / 超时 / 回非法 JSON | 一句**工具结果文本** `Error: …`（模型自己纠正 —— 与 bash 工具同口径） |
+| server 一个工具都没报 | 诊断里一行 `name: no tools (<原因>)` |
+| 不认的钩子（`-32601`） | **放行**（标准 MCP server 的常态，不是错误） |
+| 一个 server 都没配 | 工具表**逐字节不变**（自测 + 对照实验钉这条） |
+
+### 21.9 自测（`make mcp-selftest` / `UYA_SELFTEST_MCP_ONLY=1`）
+
+四条腿，判据全是**事实**（server 自己把收到的请求落盘成 marker，断言读那个文件）：
+
+| 腿 | 判据 |
+|---|---|
+| `mcp-name` | 公开名规则：干净名原样、非法字符换 `_` 且带 12 位 hex 后缀、超长截断、`serverName` 正则 |
+| `mcp-handshake` | server 收到的 `initialize` 原文含 `clientInfo.name=uya-agent`；`notifications/initialized` 在 `tools/list` **之前**；两个工具（一个干净名、一个带点）都登记成归一化名；`inputSchema` 真的透传 |
+| `mcp-call` | server 收到的是 **raw 名**（不是公开名）；结果文本逐字节等于 server 回文；`arguments` 原样到达（没被双重转义） |
+| `mcp-degrade` | 不配 / 起不来 / 崩掉都是 0 工具 + 有诊断；`-32601` 放行；read-only 不跑钩子且工具被拒；**收口后活着的子进程 = 0**（不留孤儿） |
+
+**三条防假绿对照实验**（都先看到红，再改回来）：
+
+| 实验 | 改动 | 结果 |
+|---|---|---|
+| ① | 线上发**公开名**而不是 raw 名 | `mcp-call` 红 2 条（正是「server 没收到 raw 名」与「上线出现了公开名」） |
+| ② | 去掉公开名的「截断 + hash」那一步 | `mcp-name` 红（「超长名字没有截到 64」） |
+| ③ | 无条件注入 `mcp` 元工具（没配插件也注入） | 无插件时的工具表从 19540 B 变 **19996 B**，第一处差异正好落在 `"mcp"` 那条 |
+
+实验③用的是**逐字节对照**（本轮改动的核心不变量：没装插件 = 零影响），
+所以它比「看起来还在」类断言强一档 —— 这一条与 §16 踩坑 83 的教训同族。
+
+### 21.10 示例与 `.ush` 的三个坑
+
+`examples/mcp-plugins/` 下是**同一件事的三种语言实现**：`wordcount.ush`（Uya）、
+`greet.py`（Python）、`echo.sh`（POSIX shell）。写 `.ush` 插件时踩到三条（都已记在文件头）：
+
+1. **`uya run` 的脚本环境只有 `libc` + `std.json`** —— 本仓的 `Buf` / `bufx_*` / `jw_*`
+   都用不了（那些要参与编译整个仓库才有符号）。所以示例里全是手写的字节处理。
+2. 整数转字节的 `as!` **必须带 `catch`**（`错误联合类型 !T 不能隐式用于普通类型上下文`）。
+3. `&"literal"[0: n]` 传给 `*const byte` 形参 ⇒ codegen 生成「切片描述符强转成字节指针」，
+   输出直接乱码（`Makefile` 的 `codegen-audit` 扫的就是这个形状）。
+   收 `&[byte]` 形参就没这个问题 —— 示例的 `put` 就是这么写的。
+
+另外：`uya` 要用**绝对路径**（`command` 不做 PATH 查找，PATH 里的 `uya` 可能是别的版本 ——
+实测过一次「工具数是 0」，根因就是 PATH 里那个旧的 `uya` 不接受 `UYA_ROOT`）。
+
+实现这一条时还顺带修了编译器两处**固定容量表**（详见 §16 与那两个提交）：
+call edge 表（`MAX_FN_CALL_EDGES`）与顶层变量类型查找的降级路径 ——
+不加插件文件时碰不到，加了就编不过，而报错点落在**与改动毫无关系**的文件里。
