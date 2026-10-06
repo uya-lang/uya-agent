@@ -1,0 +1,470 @@
+// src/pm/pm_ingest.uya — 项目记忆的摄取：确定性抽取（P64）
+//
+// 本文件：`PmIngest`（一次会话的摄取上下文）、`pm_ingest_init`/`pm_ingest_free`、
+//   `pm_ingest_tool`（从一条工具结果抽事实）、`pm_ingest_user`（从用户原话抽**候选**惯例）、
+//   一组纯文本小工具（`pm_ing_norm_cmd`/`pm_ing_find_exit`/`pm_ing_extract_path`/
+//   `pm_ing_lines_total`/`pm_ing_signal_line`）。
+// 不变量：① **确定性抽取，绝不调 LLM** —— 让模型自己抽「主张」等于把自证换个位置；
+//   同一份工具结果必须永远抽出同一条事实（时间戳由调用方给，不读时钟）。
+//   ② 事实的 `value` 只放**指针与概要**（路径、行数、退出码、首条错误行），**绝不放文件
+//   正文** —— 实测 19.2% 被读过的文件之后会被改动；注入正文就等于注入过期货。
+//   ③ **可判定的才记**：`read` 只记「读到过 + 行数 + stat 三元组」，`bash` 只记退出码；
+//   认不出形状就**什么都不记**（宁可少记，不可记错）。
+//   ④ 每条事实都带出处（`src` = 工具名）与 stat 锚点，供注入侧做失效校验；
+//   锚点全 0 表示「这条不可校验」（不是「校验通过」）。
+// 依赖：libc（syscall / unistd）；本仓 foundation/bufx、foundation/jsonx、tools/fsx
+//   （`fs_stat`）、pm/pm_store（`PmFact`/`pm_store_append`）。
+// 命名：`pm_ing_*`（本文件内部工具）、`pm_ingest_*`（对外入口）、`PmIngest`、`PM_ING_*`。
+
+use libc.syscall;
+use libc.unistd;
+use std.mem.arena.Arena;
+
+export const PM_ING_CMD_MAX: usize = 512;    // 命令键上限
+export const PM_ING_ERR_MAX: usize = 200;    // 错误行摘要上限
+const PM_ING_SIG_MAX: usize = 256;           // 找信号行时单行扫描上限
+
+// 一次会话的摄取上下文。`dir` 与 `sid` 决定写哪个分片；`ws` 用来把 read 的相对路径
+// 解析成绝对路径（stat 要绝对路径）。
+export struct PmIngest {
+    dir: Buf,
+    sid: Buf,
+    ws: Buf,
+    n_facts: i32,      // 本次会话累计写入的事实条数（诊断用）
+    enabled: bool,     // false = 完全不摄取（`--no-memory`）
+}
+
+// 零值：三个空 Buf + 关闭。全局数组初始化式必须是常量，所以逐个填。
+fn pm_ing_empty() PmIngest {
+    return PmIngest{ dir: buf_empty(), sid: buf_empty(), ws: buf_empty(), n_facts: 0, enabled: false };
+}
+
+// 初始化（先 free 旧值，可重复调用）。任一参数为空就保持 `enabled = false` ——
+// 「没有记忆目录」与「关掉记忆」对调用方是同一件事：什么都不做。
+export fn pm_ingest_init(ing: &PmIngest, dir: &const byte, dir_len: usize,
+                         sid: &const byte, sid_len: usize, ws: &const byte, ws_len: usize) bool {
+    pm_ingest_free(ing);
+    ing.enabled = false;
+    if dir_len == 0 || sid_len == 0 || ws_len == 0 {
+        return false;
+    }
+    if !buf_append(&ing.dir, dir, dir_len) {
+        return false;
+    }
+    if !buf_append(&ing.sid, sid, sid_len) {
+        return false;
+    }
+    if !buf_append(&ing.ws, ws, ws_len) {
+        return false;
+    }
+    ing.enabled = true;
+    return true;
+}
+
+// 释放三个 Buf 并归零。幂等。
+export fn pm_ingest_free(ing: &PmIngest) void {
+    buf_free(&ing.dir);
+    buf_free(&ing.sid);
+    buf_free(&ing.ws);
+    ing.n_facts = 0;
+    ing.enabled = false;
+}
+
+// ============================================================
+// 纯文本小工具
+// ============================================================
+// 空白折叠：把连续的空格 / tab / 换行压成一个空格，并去掉首尾。
+// 为什么需要：同一条命令在不同会话里缩进 / 换行不一样（多行 heredoc、复制粘贴），
+// 不归一就会变成两条事实 —— 而它们本来就该是「同一条命令」。
+export fn pm_ing_norm_cmd(src: &const byte, n: usize, out: &Buf) void {
+    buf_reset(out);
+    var i: usize = 0;
+    var pending_space: bool = false;
+    var wrote: bool = false;
+    while i < n {
+        const c: byte = src[i];
+        const is_ws: bool = c == 32 as byte || c == 9 as byte || c == 10 as byte || c == 13 as byte;
+        if is_ws {
+            if wrote {
+                pending_space = true;
+            }
+        } else {
+            if pending_space && out.len < PM_ING_CMD_MAX {
+                _ = buf_append_byte(out, 32);
+            }
+            pending_space = false;
+            if out.len >= PM_ING_CMD_MAX {
+                break;
+            }
+            _ = buf_append_byte(out, c);
+            wrote = true;
+        }
+        i = i + 1;
+    }
+}
+
+// 在 hay 里找 `[exit code: N]` 并解析 N 写进 out（isize，避免 i64/i32 的摩擦）。
+// 找不到返回 false —— 调用方据此**什么都不记**（比如沙箱拒绝、工具报错都没有这个标记）。
+export fn pm_ing_find_exit(hay: &const byte, n: usize, out: &isize) bool {
+    const view: &[byte] = hay[0: n];
+    // 从后往前找：结果尾部才是最终标记（stdout 里也可能恰好有同样的字面量）
+    var at: isize = -1;
+    var from: usize = 0;
+    while from < n {
+        const hit: isize = find_sub(view, &"[exit code: "[0: 12], from);
+        if hit < 0 {
+            break;
+        }
+        at = hit;
+        from = (hit as usize) + 12;
+    }
+    if at < 0 {
+        return false;
+    }
+    var i: usize = (at as usize) + 12;
+    var v: isize = 0;
+    var digits: usize = 0;
+    while i < n && digits < 6 {
+        const c: byte = hay[i];
+        if c < 48 as byte || c > 57 as byte {
+            break;
+        }
+        v = v * 10 + ((c - 48 as byte) as isize);
+        digits = digits + 1;
+        i = i + 1;
+    }
+    if digits == 0 {
+        return false;
+    }
+    // 必须紧跟着 `]`，否则不是我们要的那个标记
+    if i >= n || hay[i] != 93 as byte {
+        return false;
+    }
+    out[0] = v;
+    return true;
+}
+
+// 从 read 的结果信封里取 `<path>…</path>` 之间的路径写进 out。
+// 取不到返回 false（read 失败时没有信封，那就不记）。
+export fn pm_ing_extract_path(result: &const byte, n: usize, out: &Buf) bool {
+    buf_reset(out);
+    const view: &[byte] = result[0: n];
+    const at: isize = find_sub(view, &"<path>"[0: 6], 0);
+    if at < 0 {
+        return false;
+    }
+    const from: usize = (at as usize) + 6;
+    const stop: isize = find_sub(view, &"</path>"[0: 7], from);
+    if stop < 0 || (stop as usize) <= from {
+        return false;
+    }
+    const pn: usize = (stop as usize) - from;
+    if pn > PM_KEY_MAX {
+        return false;
+    }
+    return buf_append(out, &result[from], pn);
+}
+
+// 从 read 的 footer 里取总行数：`(End of file - total N lines)` → N。
+// 取不到返回 false（撞了字节上限、只读了窗口时都没有这个 footer）。
+export fn pm_ing_lines_total(result: &const byte, n: usize, out: &isize) bool {
+    const view: &[byte] = result[0: n];
+    const at: isize = find_sub(view, &"(End of file - total "[0: 21], 0);
+    if at < 0 {
+        return false;
+    }
+    var i: usize = (at as usize) + 21;
+    var v: isize = 0;
+    var digits: usize = 0;
+    while i < n && digits < 12 {
+        const c: byte = result[i];
+        if c < 48 as byte || c > 57 as byte {
+            break;
+        }
+        v = v * 10 + ((c - 48 as byte) as isize);
+        digits = digits + 1;
+        i = i + 1;
+    }
+    if digits == 0 {
+        return false;
+    }
+    out[0] = v;
+    return true;
+}
+
+// 在段落里找**第一行**含信号词的行（error / fail / panic / cannot / not found），
+// 把该行去空白后写进 out（供「上次为什么红」这条 state 用）。找不到返回 false。
+// 为什么自己写一份而不复用 compact.uya 的 `cmp_line_is_signal`：那是 agent 层的剪枝
+// 策略（它的词表跟着剪枝规则变），而这里是记忆的摘要；两层各自演化更好（DESIGN §2.2）。
+export fn pm_ing_signal_line(text: &const byte, n: usize, out: &Buf) bool {
+    buf_reset(out);
+    var from: usize = 0;
+    while from < n && out.len == 0 {
+        var stop: usize = from;
+        while stop < n && text[stop] != 10 as byte {
+            stop = stop + 1;
+        }
+        const ln: usize = stop - from;
+        if ln > 0 && ln <= PM_ING_SIG_MAX {
+            var hit: bool = false;
+            if find_sub(text[from: stop], &"error"[0: 5], 0) >= 0 {
+                hit = true;
+            } else if find_sub(text[from: stop], &"Error"[0: 5], 0) >= 0 {
+                hit = true;
+            } else if find_sub(text[from: stop], &"error:"[0: 6], 0) >= 0 {
+                hit = true;
+            }
+            if !hit && find_sub(text[from: stop], &"FAIL"[0: 4], 0) >= 0 {
+                hit = true;
+            }
+            if !hit && find_sub(text[from: stop], &"panic"[0: 5], 0) >= 0 {
+                hit = true;
+            }
+            if hit {
+                var line: Buf = buf_new(PM_ING_SIG_MAX + 8);
+                defer { buf_free(&line); }
+                pm_ing_norm_cmd(&text[from], ln, &line);
+                const keep: usize = if line.len > PM_ING_ERR_MAX { PM_ING_ERR_MAX } else { line.len };
+                _ = buf_append(out, line.ptr as &const byte, keep);
+            }
+        }
+        from = stop + 1;
+    }
+    return out.len > 0;
+}
+
+// 这条命令是不是「验证命令」（`make …`）？验证命令的结果记成 `state`（绿/红），
+// 因为「上次 `make check` 是绿的」正是跨会话最值钱的那条事实。
+// 实测：`make check`/`make build` 在 4–5 个会话里逐字重复。
+export fn pm_ing_is_verify(cmd: &const byte, n: usize) bool {
+    if n < 5 {
+        return false;
+    }
+    if !bufx_mem_eq(cmd, "make", 4) {
+        return false;
+    }
+    return cmd[4] == 32 as byte || cmd[4] == 9 as byte;
+}
+
+// ============================================================
+// 写一条事实
+// ============================================================
+// 组装一条事实并追加到本会话分片。`mt`/`mt_ns`/`size` 全 0 = 不可校验。
+// 失败**静默**（记忆是尽力而为的旁路；盘满 / 权限问题不该打断一次回合）。
+fn pm_ing_put(ing: &PmIngest, kind: u8, key: &const byte, kn: usize,
+              value: &const byte, vn: usize, mt: i64, mt_ns: i64, size: i64,
+              ts: i64, src: &const byte) void {
+    if !ing.enabled || kn == 0 {
+        return;
+    }
+    var f: PmFact = PmFact{
+        kind: kind, status: PM_S_OBSERVED, ts: ts, ts_last: ts, n: 1,
+        key: buf_empty(), value: buf_empty(), src: buf_empty(),
+        mt: mt, mt_ns: mt_ns, size: size,
+    };
+    defer {
+        buf_free(&f.key);
+        buf_free(&f.value);
+        buf_free(&f.src);
+    }
+    if !buf_append(&f.key, key, kn) {
+        return;
+    }
+    if vn > 0 {
+        _ = buf_append(&f.value, value, vn);
+    }
+    _ = buf_append_cstr(&f.src, src);
+    if pm_store_append(ing.dir.ptr as &const byte, ing.dir.len,
+                       ing.sid.ptr as &const byte, ing.sid.len, &f) {
+        ing.n_facts = ing.n_facts + 1;
+    }
+}
+
+// 把 read 的相对路径解析成绝对路径写进 out：已经是 `/` 开头就原样，否则 `ws` + `/` + key。
+fn pm_ing_abs(ing: &const PmIngest, rel: &const byte, rn: usize, out: &Buf) void {
+    buf_reset(out);
+    if rn == 0 {
+        return;
+    }
+    if rel[0] == 47 as byte {
+        _ = buf_append(out, rel, rn);
+        return;
+    }
+    _ = buf_append(out, ing.ws.ptr as &const byte, ing.ws.len);
+    if ing.ws.len > 0 && ing.ws.ptr[ing.ws.len - 1] != 47 as byte {
+        _ = buf_append_byte(out, 47);
+    }
+    _ = buf_append(out, rel, rn);
+}
+
+// 解析工具参数里的一个字符串字段（未转义）写进 out。解析失败返回 false。
+fn pm_ing_arg(args: &const byte, an: usize, key: &const byte, key_len: usize, out: &Buf) bool {
+    if an == 0 || an > 262144 {
+        return false;
+    }
+    var raw: &void = malloc(65536);
+    defer { free(raw); }
+    if ((raw as &byte) as usize) == 0 {
+        return false;
+    }
+    var arena: Arena = Arena{ buffer: null, size: 0, used: 0 };
+    arena_init(&arena, raw as &byte, 65536);
+    var root: JsonValue = JsonValue.json_null();
+    if !js_parse(&arena, args as &byte, an, &root) {
+        return false;
+    }
+    return js_obj_get_str_unescaped(&root, key, key_len, out);
+}
+
+// ============================================================
+// 摄取一条工具结果
+// ============================================================
+// 按工具名分派。`read` → `layout`（路径 + 行数 + stat 三元组）；
+// `bash` → `commands`（**退出码 0 的命令**，含成功的验证命令）与 `state`（验证命令的绿/红）。
+// 其他工具（glob/grep/web/子代理…）本阶段**不抽**：它们的输出形状不稳定，
+// 抽出来的东西没有可判定的锚点，宁可少记。
+export fn pm_ingest_tool(ing: &PmIngest, name: &const byte, name_len: usize,
+                         args: &const byte, args_len: usize,
+                         result: &const byte, result_len: usize, now_ms: i64) void {
+    if !ing.enabled || name_len == 0 || result_len == 0 {
+        return;
+    }
+    // ---- read → layout ----
+    if name_len == 4 && bufx_mem_eq(name, "read", 4) {
+        // 失败的 read（`Error: …`）没有信封，`pm_ing_extract_path` 自己会拒掉
+        var rel: Buf = buf_new(PM_KEY_MAX);
+        defer { buf_free(&rel); }
+        if !pm_ing_extract_path(result, result_len, &rel) || rel.len == 0 {
+            return;
+        }
+        var abs: Buf = buf_new(PM_PATH_MAX);
+        defer { buf_free(&abs); }
+        pm_ing_abs(ing, rel.ptr as &const byte, rel.len, &abs);
+        if abs.len == 0 || abs.len + 1 > PM_PATH_MAX {
+            return;
+        }
+        var absz: Buf = buf_new(abs.len + 1);
+        defer { buf_free(&absz); }
+        _ = buf_append(&absz, abs.ptr as &const byte, abs.len);
+        _ = buf_append_byte(&absz, 0);
+        var st: FsStat = FsStat{ exists: false, is_dir: false, size: 0, mtime: 0, mtime_nsec: 0 };
+        _ = fs_stat(absz.ptr as &const byte, &st);
+        if !st.exists || st.is_dir {
+            return;
+        }
+        var val: Buf = buf_new(128);
+        defer { buf_free(&val); }
+        var lines: isize = 0;
+        if pm_ing_lines_total(result, result_len, &lines) {
+            _ = buf_append_cstr(&val, "read to end, " as &const byte);
+            _ = buf_append_i64(&val, lines as i64);
+            _ = buf_append_cstr(&val, " lines" as &const byte);
+        } else {
+            _ = buf_append_cstr(&val, "read (partial)" as &const byte);
+        }
+        pm_ing_put(ing, PM_K_LAYOUT, rel.ptr as &const byte, rel.len,
+                   val.ptr as &const byte, val.len, st.mtime, st.mtime_nsec, st.size,
+                   now_ms, "read" as &const byte);
+        return;
+    }
+    // ---- bash → commands / state ----
+    if name_len == 4 && bufx_mem_eq(name, "bash", 4) {
+        var raw: Buf = buf_new(PM_ING_CMD_MAX + 8);
+        defer { buf_free(&raw); }
+        if !pm_ing_arg(args, args_len, "command" as &const byte, 7, &raw) {
+            return;
+        }
+        var cmd: Buf = buf_new(PM_ING_CMD_MAX + 8);
+        defer { buf_free(&cmd); }
+        pm_ing_norm_cmd(raw.ptr as &const byte, raw.len, &cmd);
+        if cmd.len == 0 {
+            return;
+        }
+        var code: isize = 0;
+        if !pm_ing_find_exit(result, result_len, &code) {
+            return;   // 没有退出码 = 形状不可判定 → 不记
+        }
+        var val: Buf = buf_new(256);
+        defer { buf_free(&val); }
+        if code == 0 {
+            _ = buf_append_cstr(&val, "exit 0" as &const byte);
+        } else {
+            _ = buf_append_cstr(&val, "exit " as &const byte);
+            _ = buf_append_i64(&val, code as i64);
+        }
+        if pm_ing_is_verify(cmd.ptr as &const byte, cmd.len) {
+            // 验证命令（`make …`）：**两条腿都要走**，因为它们回答的是两个不同问题 ——
+            // ① commands：「这条命令在这个项目里可用」（成功的才记）——「这个项目怎么跑」；
+            // ② state：「上次跑它是什么结果」（绿/红都记）——「上次到哪了」。
+            // 只记一条会丢信息：只记 state 则开工包里没有「怎么跑」，只记 commands 则
+            // 「上次是红的」丢失。实测两者都是跨会话最值钱的那类事实。
+            if code == 0 {
+                pm_ing_put(ing, PM_K_COMMANDS, cmd.ptr as &const byte, cmd.len,
+                           val.ptr as &const byte, val.len, 0, 0, 0, now_ms, "bash" as &const byte);
+            }
+            if code != 0 {
+                var sig: Buf = buf_new(PM_ING_ERR_MAX + 8);
+                defer { buf_free(&sig); }
+                if pm_ing_signal_line(result, result_len, &sig) && sig.len > 0 {
+                    _ = buf_append_cstr(&val, ": " as &const byte);
+                    _ = buf_append(&val, sig.ptr as &const byte, sig.len);
+                }
+            }
+            pm_ing_put(ing, PM_K_STATE, cmd.ptr as &const byte, cmd.len,
+                       val.ptr as &const byte, val.len, 0, 0, 0, now_ms, "bash" as &const byte);
+            return;
+        }
+        // 非验证命令：只把**成功**的记成「这条命令在这个项目里可用」
+        // （失败的命令留给 state 那条腿；把它当 commands 会教模型重跑一条注定失败的命令）
+        if code == 0 {
+            pm_ing_put(ing, PM_K_COMMANDS, cmd.ptr as &const byte, cmd.len,
+                       val.ptr as &const byte, val.len, 0, 0, 0, now_ms, "bash" as &const byte);
+        }
+        return;
+    }
+}
+
+// ============================================================
+// 摄取一条用户消息
+// ============================================================
+// 只抽**指令型**的原话（含「不要 / 必须 / 约定 / 禁止 / always / never」这类词）作为
+// `conventions` 的**候选**。理由：跨会话重复输入的那部分才是要消灭的（实测 `继续` 29 次、
+// `提交` 5 次 —— 但那些是**会话内**的短指令，不是项目惯例）。
+// 候选一律 `PM_S_OBSERVED`：**模型与自动抽取都不能把它们晋升成 `confirmed`**，
+// 只有人 `/memory confirm` 才能（见 P65）。
+export fn pm_ingest_user(ing: &PmIngest, text: &const byte, n: usize, now_ms: i64) void {
+    if !ing.enabled || n < 16 || n > PM_KEY_MAX {
+        return;
+    }
+    var hit: bool = false;
+    if find_sub(text[0: n], &"不要"[0: 6], 0) >= 0 {
+        hit = true;
+    } else if find_sub(text[0: n], &"必须"[0: 6], 0) >= 0 {
+        hit = true;
+    } else if find_sub(text[0: n], &"约定"[0: 6], 0) >= 0 {
+        hit = true;
+    } else if find_sub(text[0: n], &"禁止"[0: 6], 0) >= 0 {
+        hit = true;
+    } else if find_sub(text[0: n], &"always "[0: 7], 0) >= 0 {
+        hit = true;
+    } else if find_sub(text[0: n], &"never "[0: 6], 0) >= 0 {
+        hit = true;
+    } else if find_sub(text[0: n], &"统一"[0: 6], 0) >= 0 {
+        hit = true;
+    }
+    if !hit {
+        return;
+    }
+    // 键取原话本身（归一后）；值写一句固定说明 —— 人的规矩不需要我们再解释一遍。
+    // **长度必须现算**（不能用字面量的字符数：中文一个字 3 字节，写死就会截断/越界）。
+    var key: Buf = buf_new(PM_KEY_MAX + 8);
+    defer { buf_free(&key); }
+    pm_ing_norm_cmd(text, n, &key);
+    if key.len == 0 {
+        return;
+    }
+    const note: &const byte = "proposed from a user message; not confirmed";
+    pm_ing_put(ing, PM_K_CONVENTIONS, key.ptr as &const byte, key.len,
+               note, bufx_cstr_len(note),
+               0, 0, 0, now_ms, "user" as &const byte);
+}

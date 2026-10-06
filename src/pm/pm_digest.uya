@@ -1,0 +1,242 @@
+// src/pm/pm_digest.uya — 项目记忆的开工包：渲染 + 失效校验（P64）
+//
+// 本文件：`pm_verify`（按 stat 三元组判定一条事实是否过期，**要 workspace**）、
+//   `pm_digest`（把事实集渲染成一段带字节预算的文本）、分区顺序（`pm_digest_order`）。
+// 不变量：① **每条事实注入前当场校验**：文件类事实比对 `(mtime, mtime_nsec, size)` 三元组
+//   （抄 `fs_obs_same_version` 的口径）；对不上就标 `STALE`（文件没了标 `GONE`）并**降级为
+//   提示**，绝不断言。实测 19.2% 被读过的文件之后会被改动 —— 不校验就是注入过期货。
+//   惯例类逐条标 `[confirmed]` / `[proposed]`：自动抽取永远只是候选，只有人确认过才算数。
+//   ② **正文永不注入**：只给「去哪读 + 出处 + 次数」。模型要看内容自己去 read，这样
+//   过期也不可能造成误改（现有 `fs_obs_same_version` 写闸门继续兜底）。
+//   ③ 截断顺序**确定且可解释**：commands → conventions → layout → state，越靠后越先被丢
+//   （state 最易过期）；**commands 永不先丢** —— 「这个项目怎么跑」是最值钱也最稳定的。
+//   ④ 预算按**字节**算，单条超预算就跳过该条、继续试后面的（不是整段截断 —— 截断会把
+//   一行切成半截，读起来像坏数据）。
+// 依赖：libc（syscall / unistd）；本仓 foundation/bufx、tools/fsx（`fs_stat`）、
+//   pm/pm_store（`PmSet`/`pm_set_sort`）、pm/pm_repo（`PM_PATH_MAX`）。
+// 命名：`pm_dg_*`（本文件内部）、`pm_digest`/`pm_verify`（对外）、`PM_DIGEST_*` 常量。
+
+use libc.syscall;
+use libc.unistd;
+
+export const PM_DIGEST_BUDGET: usize = 3072;   // 默认预算（字节）
+export const PM_DIGEST_MIN: usize = 256;       // 低于这个值就不注入（宁可不注入也不给碎片）
+export const PM_DIGEST_MAX_ITEMS: usize = 48;  // 单次注入的条数上限
+
+// 分区渲染顺序的数值化：commands(0) → conventions(1) → layout(2) → state(3)。
+// 这个顺序同时就是**耐久度的降序**：越靠前越稳定，也就是越晚被预算挤掉。
+export fn pm_digest_order(k: u8) i32 {
+    if k == PM_K_COMMANDS {
+        return 0;
+    }
+    if k == PM_K_CONVENTIONS {
+        return 1;
+    }
+    if k == PM_K_LAYOUT {
+        return 2;
+    }
+    return 3;
+}
+
+// 第 n 个要渲染的分区（0..3）；超出返回 255。
+fn pm_dg_kind_at(n: i32) u8 {
+    if n == 0 {
+        return PM_K_COMMANDS;
+    }
+    if n == 1 {
+        return PM_K_CONVENTIONS;
+    }
+    if n == 2 {
+        return PM_K_LAYOUT;
+    }
+    if n == 3 {
+        return PM_K_STATE;
+    }
+    return 255 as u8;
+}
+
+// 分区标题（英文，与工具/协议同语；正文面向模型）。
+// 「惯例」这一节刻意**不写 user-confirmed**：自动抽取的候选只是候选（`PM_S_OBSERVED`），
+// 只有人 `/memory confirm` 过才是确认的（`PM_S_CONFIRMED`）。标题写死了会变成一句谎话，
+// 所以确认与否标在**每一条**上（见 `pm_dg_line`）。
+fn pm_dg_title(k: u8) &const byte {
+    if k == PM_K_COMMANDS {
+        return "Commands that worked in this project" as &const byte;
+    }
+    if k == PM_K_CONVENTIONS {
+        return "Project rules (proposed unless marked confirmed)" as &const byte;
+    }
+    if k == PM_K_LAYOUT {
+        return "Key files (index only - read them for content)" as &const byte;
+    }
+    return "Last known state (verify before relying on it)" as &const byte;
+}
+
+// ============================================================
+// 失效校验
+// ============================================================
+// 一条文件类事实是否仍与盘上一致。返回：
+//   0 = 一致 / 不可校验；1 = 过期（三元组对不上）；2 = 文件已不存在。
+// 锚点全 0 视为「不可校验」→ 0（**不是**「过期」）：命令类事实本来就没有锚点。
+//
+// `ws` 是**必须**的：事实的 key 存的是 read 信封里的**相对路径**（那样模型拿到就能直接
+// read —— `fs_resolve` 拒绝绝对路径），而 stat 要绝对路径。少了 ws 就会拿相对路径去
+// stat 当前 cwd，结果是「所有文件都不存在」→ 全标 GONE（实测踩过：失效轮假装通过，
+// 因为 GONE 那条断言也满足）。
+export fn pm_verify(f: &const PmFact, ws: &const byte, ws_len: usize) i32 {
+    if f.kind != PM_K_LAYOUT {
+        return 0;   // 只有文件类事实带 stat 锚点
+    }
+    if f.mt == 0 && f.size == 0 && f.mt_ns == 0 {
+        return 0;   // 没记锚点 → 不可校验
+    }
+    if f.key.len == 0 || f.key.len + 1 > PM_PATH_MAX {
+        return 0;
+    }
+    var pz: Buf = buf_new(f.key.len + ws_len + 8);
+    defer { buf_free(&pz); }
+    // 绝对路径原样；相对路径拼到 ws 之下（与 `pm_ing_abs` 同一口径）
+    if f.key.ptr[0] == 47 as byte {
+        if !buf_append(&pz, f.key.ptr as &const byte, f.key.len) {
+            return 0;
+        }
+    } else {
+        // `pm_trim_slash` 返回的是**长度**（不是指针）；`ws` 是切片，取指针要用 `[0]` 的地址。
+        const wsn: usize = pm_trim_slash(ws, ws_len);
+        if wsn == 0 {
+            return 0;
+        }
+        if !buf_append(&pz, &ws[0], wsn) {
+            return 0;
+        }
+        if ws[wsn - 1] != 47 as byte {
+            if !buf_append_byte(&pz, 47) {
+                return 0;
+            }
+        }
+        if !buf_append(&pz, f.key.ptr as &const byte, f.key.len) {
+            return 0;
+        }
+    }
+    if !buf_append_byte(&pz, 0) {
+        return 0;
+    }
+    var st: FsStat = FsStat{ exists: false, is_dir: false, size: 0, mtime: 0, mtime_nsec: 0 };
+    _ = fs_stat(pz.ptr as &const byte, &st);
+    if !st.exists || st.is_dir {
+        return 2;   // 文件没了（被删 / 改名）—— 这条索引彻底失效
+    }
+    if st.mtime != f.mt || st.mtime_nsec != f.mt_ns || st.size != f.size {
+        return 1;   // 内容变过：**索引仍有用**（路径没错），但「读到末尾 N 行」这类断言失效
+    }
+    return 0;
+}
+
+// ============================================================
+// 渲染
+// ============================================================
+// 把一条事实渲染成 `<前缀>- <key> — <value> (Nx)` + 换行，**追加到 out**。
+// 前缀来自 `pm_verify`：1/2 时加 `STALE` / `GONE` 标注（提示语气，不是断言）。
+// 惯例类还标 `[confirmed]` / `[proposed]` —— **每条各自标**，因为同一节里两种都有。
+fn pm_dg_line(out: &Buf, f: &const PmFact, stale_kind: i32) void {
+    _ = buf_append_cstr(out, "- " as &const byte);
+    if stale_kind == 2 {
+        _ = buf_append_cstr(out, "GONE " as &const byte);
+    } else if stale_kind == 1 {
+        _ = buf_append_cstr(out, "STALE " as &const byte);
+    }
+    if f.kind == PM_K_CONVENTIONS {
+        if f.status == PM_S_CONFIRMED {
+            _ = buf_append_cstr(out, "[confirmed] " as &const byte);
+        } else {
+            _ = buf_append_cstr(out, "[proposed] " as &const byte);
+        }
+    }
+    _ = buf_append(out, f.key.ptr as &const byte, f.key.len);
+    if f.value.len > 0 {
+        _ = buf_append_cstr(out, " — " as &const byte);
+        _ = buf_append(out, f.value.ptr as &const byte, f.value.len);
+    }
+    if f.n > 1 {
+        _ = buf_append_cstr(out, " (" as &const byte);
+        _ = buf_append_i64(out, f.n as i64);
+        _ = buf_append_cstr(out, "x)" as &const byte);
+    }
+    _ = buf_append_byte(out, 10);
+}
+
+// 把一条事实渲染进**临时缓冲**，用于「先量长度再决定收不收」。
+// 为什么不直接往 out 上写再看长度：超预算时得回滚，而回滚要求记住长度 —— 临时缓冲更直白。
+fn pm_dg_measure(f: &const PmFact, ws: &const byte, ws_len: usize, tmp: &Buf) void {
+    buf_reset(tmp);
+    pm_dg_line(tmp, f, pm_verify(f, ws, ws_len));
+}
+
+// 渲染开工包。返回 false = **不该注入**（没有事实 / 预算太小 / 一条都没选中）。
+// 输出形如：
+//   <pm-memory>Project memory from earlier sessions in this repository. …
+//   \nCommands that worked in this project:\n- make check — exit 0 (4x)\n
+//   …其余分区…
+//   </pm-memory>
+// `s` 必须是已 `pm_set_sort` 过的（全序 → 逐字节可复现）。
+export fn pm_digest(s: &const PmSet, ws: &const byte, ws_len: usize, budget: usize, out: &Buf) bool {
+    buf_reset(out);
+    if s.n == 0 || budget < PM_DIGEST_MIN {
+        return false;
+    }
+    // 头要短：它是**每次注入的固定税**（预算再紧也得先放下它）。那句话必须留下
+    // （「这是索引不是内容」是本方案的安全前提），其余压到最短 —— 实测 229 B 的头会把
+    // 260 B 的紧预算吃掉，一条正文都放不下。
+    const hdr: &const byte = "<pm-memory>Learned from earlier sessions in this repo. This is an index, not file content: read a file before relying on its details; STALE/GONE means verify first.\n";
+    const ftr: &const byte = "</pm-memory>";
+    const hdr_n: usize = bufx_cstr_len(hdr);
+    const ftr_n: usize = bufx_cstr_len(ftr);
+    if budget <= hdr_n + ftr_n + 16 {
+        return false;
+    }
+    // 正文可用的字节数（头和尾先扣掉 —— 宁可少一条，也不许超预算）
+    const room: usize = budget - hdr_n - ftr_n;
+    var body: Buf = buf_new(room + (PM_VALUE_MAX + PM_KEY_MAX) * 2);
+    defer { buf_free(&body); }
+    var tmp: Buf = buf_new(PM_VALUE_MAX + PM_KEY_MAX + 64);
+    defer { buf_free(&tmp); }
+    var items: usize = 0;
+    var sect: i32 = 0;
+    while sect < 4 {
+        const kind: u8 = pm_dg_kind_at(sect);
+        var wrote_title: bool = false;
+        var i: usize = 0;
+        while i < s.n && items < PM_DIGEST_MAX_ITEMS {
+            const f: &const PmFact = &s.items[i];
+            i = i + 1;
+            if f.kind != kind {
+                continue;
+            }
+            pm_dg_measure(f, ws, ws_len, &tmp);
+            // 标题也要占预算：第一条确定能收时才写标题
+            const title_cost: usize = if wrote_title { 0 as usize } else { bufx_cstr_len(pm_dg_title(kind)) + 4 };
+            if body.len + title_cost + tmp.len > room {
+                continue;   // 这条放不下 → 试下一条（**不是**整段截断）
+            }
+            if !wrote_title {
+                _ = buf_append_cstr(&body, "\n" as &const byte);
+                _ = buf_append_cstr(&body, pm_dg_title(kind));
+                _ = buf_append_cstr(&body, ":\n" as &const byte);
+                wrote_title = true;
+            }
+            _ = buf_append(&body, tmp.ptr as &const byte, tmp.len);
+            items = items + 1;
+        }
+        sect = sect + 1;
+    }
+    if items == 0 {
+        return false;
+    }
+    if !buf_append(out, hdr, hdr_n) {
+        return false;
+    }
+    if !buf_append(out, body.ptr as &const byte, body.len) {
+        return false;
+    }
+    return buf_append(out, ftr, ftr_n);
+}
