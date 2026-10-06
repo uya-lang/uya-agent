@@ -810,6 +810,43 @@ warning: 模型输出到达 token 上限（max_tokens）被截断，本回合到
 **截断不收授权** —— 目标显然还没做完，而且截断那一轮的正文已经在历史里，下一轮（新预算）
 正好接着写；轮次上限兜住空转。
 
+#### 5.4.2 截断的**根因**：不发上限 = 把上限交给网关兜底（P61）
+
+P59 修的是**截断之后**怎么收场（别当错误、正文进历史）。但真机上「过 aigw 后**容易**报错」
+这件事的根因不在这条路径里 —— 它只是**症状的出口**。根因是**上限根本没发**：
+
+| 环 | 事实 | 出处 |
+|---|---|---|
+| 1 | 本仓 `cfg.max_tokens` 默认 `0` = **不发** `max_tokens` / `max_output_tokens`，理由是「对齐 DSH」 | `ag_config.uya` 的 `max_tokens: 0` |
+| 2 | 用户 `settings.yaml` 的 `aigw-local` 条目**没有 `maxTokens`**（只有 `contextWindow`）⇒ 一个字节都不发 | `~/.dsh/settings.yaml` |
+| 3 | aigw 的 openai-chat provider **替你补** `default_max_output_tokens: 8192` | aigw `internal/providers/openaichat/openaichat.go:474`（`chatReq.MaxTokens == nil && cfg.DefaultMaxOutputTokens > 0`） |
+| 4 | 模型**真实能力 65536** —— aigw 自己的 `/v1/models` 就这么公布 | `provider_models.max_output_tokens` / `/v1/models` |
+| 5 | 实测反复撞顶：网关日志 `output=8192, reasoning=8192`；`usage_records` 里 `terminated_reason='incomplete'` **只**出现在本仓（`client='unknown'`）的请求上 | `aigw-local.log` / `aigw.db` |
+
+**也就是「不发」≠「不限」，而是「把上限的决定权交给中间那一跳」** —— 而网关并不知道我们
+下一秒要写一个多大的文件。推理模型尤其致命：8192 的预算里思考可以先吃掉全部（实测
+`reasoning=8192`），正文与工具参数一个 token 都轮不到，于是 P59 只能把半截的工具调用整块丢掉。
+
+**「对齐 DSH」这条理由本身是读了一半**。DSH 确实不把**能力申报**（pi-ai 的 `Model.maxTokens`）
+当请求默认 —— 那只是「这个模型最多能出多少」；但它**自己的 deepseek 路线有请求默认**：
+`dsh-llm-deepseek` 里 `DEFAULT_MAX_TOKENS = 256e3`，`maxTokens: config.maxTokens ?? 256e3`
+经 `defaultMaxTokens` 落进 `resolveCallWithInfo`，**真的会随请求发出去**（pi-ai 那条路线的
+兜底同量级：`source.defaultMaxTokens ?? 32768`）。所以「发一个 256000」比「不发」**更**接近
+DSH 的实况。
+
+**修法**（P61）：`effective_max_tokens(cfg)` = `--max-tokens` > 目录 `maxTokens` >
+`DEFAULT_MAX_OUTPUT_TOKENS`（256000），两个构造器（`build_chat_request` /
+`build_responses_request`）**无条件发**；responses 侧仍抬到 `RESP_MSG_MIN_TOKENS`（16，
+OpenAI 硬下限，低于它的显式值会被 400 —— 比截断更坏）。`--print-config` 印**线上会发的值**
+与来源（以前 `cfg.max_tokens = 0` 时印 `0`，看着像「不发」，与 P56 的 `reasoning_effort`
+同一类「配置在说谎」）。
+
+**为什么给大不给小**：上限是**上限不是配额** —— 没有输出就不计费，给大了不多花钱；
+给小于真实能力才是真损失（白白截断）。实测**超过**上游能力也不 400：aigw 与 autodl 都照常
+返回 200，按各自真实上限截（`max_output_tokens: 999999` 实测 200；aigw 只对 **<16** 报
+`max_output_tokens must be >= 16`）。这条实测是「敢给大值」的依据 —— 否则「保守给 8192」
+反而会把根因重新引回来。
+
 ### 5.5 执行期两条纪律（P55）
 
 **来由是一次同任务 A/B 实测**：任务 = 「把 `src/` 下 50 个 `.uya` 按职责拆进子目录、全部改动
@@ -3601,3 +3638,37 @@ DEEPSEEK_API_KEY=sk-xxx ./build/uya-agent \
   （+5 = 那一个常量 + selftest 的 4 个标记字面量；常量不占函数额度），函数净增 **0**。
   验收：`rm -rf build && make build`（干净重编，函数净增 0）＋ `make selftest` 全绿 ＋
   `UYA_SELFTEST_EMPTY_ONLY=1 ./build/uya-agent --selftest`（三条收尾腿一起）。
+
+- P61：**截断的根因 —— 输出上限总是发**（§5.4.2）。用户报「过 aigw 后**容易**报错」，贴的是
+  P59 那两行 `warning:` + `[max-tokens] …已丢弃`。P59 修的是**截断之后**怎么收场（对，且继续保留）；
+  但「容易」这两个字指向的是**截断本身太频繁**：本仓默认 `max_tokens = 0` = **不发**（理由「对齐
+  DSH」），而用户的 `aigw-local` 条目没写 `maxTokens` ⇒ 一个字节都不发 ⇒ aigw 用它的
+  `default_max_output_tokens: 8192` 顶上（`openaichat.go:474`），而模型真实能力是 **65536**
+  （aigw 自己的 `/v1/models` 就这么公布）。DeepSeek-V4.1-Flash 是推理模型，8192 常被思考吃光
+  （网关日志实测 `output=8192, reasoning=8192`）→ `incomplete/max_output_tokens` → 半截工具调用
+  整块丢掉。**「不发」≠「不限」，而是把上限的决定权交给中间那一跳** —— 它不知道我们下一秒要写多大
+  的文件。数据库旁证：`usage_records` 里 `terminated_reason='incomplete'` **只**出现在本仓
+  （`client='unknown'`）的请求上。
+  **「对齐 DSH」读了一半**：DSH 确实不把 pi-ai 的**能力申报**当请求默认，但它**自己的** deepseek
+  路线有请求默认 —— `dsh-llm-deepseek` 的 `DEFAULT_MAX_TOKENS = 256e3`（`config.maxTokens ?? 256e3`）
+  经 `defaultMaxTokens` 落进 `resolveCallWithInfo` 后**真的会发**；pi-ai 那条路的兜底同量级
+  （`source.defaultMaxTokens ?? 32768`）。所以「发 256000」比「不发」**更**接近 DSH。
+  修法：新增 `effective_max_tokens(cfg)` = `--max-tokens` > 目录 `maxTokens` >
+  `DEFAULT_MAX_OUTPUT_TOKENS`（**256000**，照抄 DSH 的 `256e3`）；`build_chat_request` /
+  `build_responses_request` **无条件发**（responses 侧保留 16 的下限抬升 —— OpenAI 对
+  `max_output_tokens < 16` 直接 400，比截断更坏）；`--print-config` 印**线上会发的值**与来源
+  （`cfg.max_tokens = 0` 时以前印 `0`，看着像「不发」，与 P56 的 `reasoning_effort` 同一类
+  「配置在说谎」）。新增 `src_max_tokens` 来源码，三个赋值点（CLI / DSH 设置 / 模型目录）各自落码。
+  **为什么敢给大**：上限是**上限不是配额**（没输出就不计费），给小于真实能力才是真损失；实测
+  **超过**上游能力也不 400 —— aigw 与 autodl 对 `999999` 都照常 200、按各自真实上限截，aigw 只对
+  **<16** 报 `max_output_tokens must be >= 16`。这条实测是「敢给大值」的依据，否则「保守给 8192」
+  会把根因重新引回来。
+  **判定与验收**：`resp_build_round`（`selftest[resp-build]`）里新增两组断言 —— ① `cfg.max_tokens = 0`
+  时 chat 请求必须含 `"max_tokens":256000`、responses 请求必须含 `"max_output_tokens":256000`
+  （**焊死「不发」这条路口**）；② 显式 `4096` 必须原样发出、不能被默认值盖掉。既有断言
+  （`max_tokens = 8` → `max_output_tokens: 16`）继续守着下限抬升。
+  验收：`make check` ＋ `make build`（link-audit 通过）＋ `./build/uya-agent --selftest` **全绿
+  （SELFTEST PASS，152 条 ok）** ＋ `--print-config` 印 `max_tokens = 256000  (source: default;
+  sent as max_tokens)` ＋ `--dry-run` 的请求体末尾带 `"max_output_tokens":256000`。
+  网关侧同时把 `default_max_output_tokens` 抬到 65536（配置 + 管理 API PATCH，因为 bootstrap 是
+  `upsert`、**只补缺失字段**，改配置文件对已存在的 provider 行不生效 —— 这一点值得记一笔）。

@@ -111,7 +111,7 @@ readelf -lW build/uya-agent | grep -c INTERP    # 0 = 真静态
 | `--show-usage` | 每轮打印 token 用量（in/out/cache/reasoning） |
 | `--tool-lines N` | 工具正文：默认 `0` = 只留一行；`N>0` = 首尾各 N 行（含 diff / todo 清单） |
 | `--quiet` | 关闭工具内容块（回退到旧的最小转录：只有正文流） |
-| `--max-tokens N` / `--temperature N` | 发送 `max_tokens` / `temperature`（**默认都不发送**，对齐 DSH）。真被截断时（`finish_reason=length`）**不派发工具调用、正文留在对话里**，直接发「继续」接着做；退出码见 §1.1 的 `5` |
+| `--max-tokens N` / `--temperature N` | `--max-tokens` 覆盖**输出上限**（口径见 §「输出上限」条）；`--temperature` 默认不发送（对齐 DSH）。真被截断时（`finish_reason=length` / `incomplete`+`max_output_tokens`）**不派发工具调用、正文留在对话里**，直接发「继续」接着做；退出码见 §1.1 的 `5` |
 | `--exec-effort V` / `--exec-after N` | **低思考执行态**：前 N 步用 `--reasoning-effort` 把方案想清，第 N+1 步起切到 V 执行（**默认关**；人运行中 `/effort` 改过就不自动切）。设计取舍与实测方差见 [DESIGN.md §5.5](DESIGN.md) |
 | `--grace-steps N` | **收工预算**：验收类命令在改动之后首次跑绿起，还允许再走 N 步；`0` = 只提醒不截断（**默认**） |
 | `--plan` | 以 plan 模式启动（先出计划、批准后再执行）；plan 模式**真的拦写**，非交互会话（管道/CI）里没有审阅渠道 ⇒ 只产出计划、写工具始终被拒 |
@@ -408,6 +408,15 @@ DEEPSEEK_API_KEY=sk-xxx ./build/uya-agent \
   （新提供方解析不出凭据就清空 key 并告警，而不是沿用上一把）；**没声明 `baseURL` 的提供方**
   不动端点，只留一行说明（静默清空比「没跟上」更坏）。`--resume` 跟随会话记录的 provider 时
   走同一条路。见 [DESIGN.md §16 踩坑 96](DESIGN.md)。
+* **输出上限总是发**（P61）：`max_tokens`（completions）/ `max_output_tokens`（responses）
+  **每个请求都带**，口径是 `--max-tokens` > 模型目录的 `maxTokens` > 默认 **256000**
+  （照抄 DSH 自己的 `dsh-llm-deepseek`：`config.maxTokens ?? 256e3`，且它经 `defaultMaxTokens`
+  真的会随请求发出去）。**「不发」不再是这条路** —— 不发等于把上限的决定权交给中间那一跳，
+  而网关的兜底值往往比模型真实能力小得多：真机现场 `aigw` 的 `default_max_output_tokens: 8192`
+  顶上，DeepSeek-V4.1-Flash 写一个大文件时 8192 被思考吃光（网关日志实测
+  `output=8192, reasoning=8192`）→ `incomplete/max_output_tokens` → 半截工具调用只能整块丢掉
+  （P59），一轮白跑。上限是**上限不是配额**，给大了不会多花钱；实测超过上游能力也不会 400
+  （aigw 与 autodl 都照常 200，按真实上限截）。`--print-config` 印的是**线上真正会发的值**与来源。
 * **推理强度两条协议都发**：completions 走顶层 `reasoning_effort`（字段排在 `max_tokens`
   之后，保住前缀缓存），responses 走 `reasoning.effort`；`compat.supportsReasoningEffort=false`
   或 `off`/`none` 时不发。此前只有 responses 发，默认路由是 completions ⇒ 配置被静默丢弃
