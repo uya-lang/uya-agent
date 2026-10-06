@@ -32,17 +32,17 @@
 # 0.10 文档里的 `LINK_MODE=static` 对本路径**无效**（实测产物仍是 PIE 动态，那个变量
 # 是编译器自身构建脚本 compile.sh 用的）。
 
-# 编译器：用 /home/winger/uya/uya（0.10.3 + 两处「固定表」修复）。
+# 编译器：用 /home/winger/uya/uya（0.10.3 + 三处「固定表」修复）。
 # 为什么不再用 /home/winger/uya-0.10（0.10.1）：
 #   ① 0.10.1 的**显式输入文件数硬上限是 64**（第 65 个报「收集模块依赖失败: <编译器路径>」，
-#      报错指不到根因）。本仓拆完 17937/12957/11583 三个大文件后有 **89 个构建文件**，
+#      报错指不到根因）。本仓拆完 17937/12957/11583 三个大文件后有 **90 个构建文件**，
 #      0.10.1 直接编不动；
-#   ② 0.10.1 的 codegen `reachable_function_decls` 只有 4096 槽，超过就**静默丢函数**
-#      （定义与原型都不发射、调用点还在 ⇒ 宿主 C 报 implicit declaration + invalid
-#      initializer）。本仓 3600+ 个函数，正好踩在这条边界上。
-# 这两处都已在 /home/winger/uya/uya 修掉（见那边的提交：「输入文件表改为可增长」与
-# 「reachable 函数表改为按实际条数分配（修 >4096 个可达函数时静默丢函数）」）。
-# 换别的编译器时请先确认这两条都已修，否则 build 会以看不懂的方式失败。
+#   ② 0.10.1 的 checker 函数表与 codegen `reachable_function_decls`（4096 槽）都是**定长表**，
+#      满了就**静默丢函数**（定义与原型都不发射、调用点还在 ⇒ 宿主 C 报 implicit declaration
+#      + invalid initializer / 链接期 undefined reference）。本仓 3600+ 个函数正好踩在边界上。
+# 这三处都已在 /home/winger/uya/uya 修掉（提交：`fc577783` checker 五张定长表改动态哈希表、
+# `7c49de57` 输入文件表可增长、`1267dbc6` reachable 函数表按实际条数分配）。
+# 换别的编译器时请先确认这三条都已修，否则 build 会以看不懂的方式失败。
 UYA_ROOT ?= /home/winger/uya/uya/lib/
 UYA      ?= /home/winger/uya/uya/bin/uya
 
@@ -61,8 +61,9 @@ endif
 #      （实测：把 style.uya 排到 ask/entry/diff 之后，三处当场红）。所以下面
 #      term/tui/ 与 diff/ 两块是按**依赖序**排的，不是字母序 —— 加文件别打乱。
 #   ③ 显式输入文件数的硬上限是 **64**（uya 0.10.1）：第 65 个开始报「收集模块依赖失败」，
-#      报错完全指不到根因。拆分粒度受这个预算约束（v0.10.3 已解除，但它目前编不过
-#      本仓，原因见 CODING.md §6）。加文件前先数：`make -s print-src | wc -w`。
+#      报错完全指不到根因。**这条已在 0.10.3 解除**（输入文件表改为可增长，无数量上限），
+#      本仓现在 90 个文件；加文件只要守 ①② 与 CODING.md §1.3 的粒度。
+#      数文件：`make -s print-src | wc -w`。
 # 留在 src/ 根的 tools.uya 是 P50 起就不在构建里的已知死代码，故意不列。
 SRC := src/foundation/bufx.uya src/foundation/jsonx.uya src/foundation/yamlcfg.uya \
        src/net/httpc.uya src/net/httpstream.uya src/net/llm.uya src/net/sse.uya src/net/webx.uya \
@@ -171,13 +172,16 @@ doc-audit:
 	fi; \
 	echo "doc-audit: 通过（没有冲突标记）"
 
-# 函数表容量（编译器里写死的 FUNCTION_TABLE_SIZE，无开关）：**绝对条数**上限，不是「本仓还能加 0 个」。
+# 函数表容量（0.10.1 里写死的 FUNCTION_TABLE_SIZE，无开关）：**绝对条数**上限，不是「本仓还能加 0 个」。
 #   P53 实测：main 6756 声明通过、**+1 个空函数**就报「函数表容量不足」；
 #   P54 实测（同一台机器、同一份 uya 0.10）：6792 声明通过，再 +6 个空函数仍通过，+8 个红
-#   —— 也就是表容量在 6796 上下，而本仓当前余量约 4 个函数（各线合并后会变）。
+#   —— 也就是表容量在 6796 上下，而本仓当时余量约 4 个函数（各线合并后会变）。
 #   要命的地方在于增量编译看不出来（缓存），只有 `rm -rf build` 重编才炸，报错点还落在标准库里。
-#   所以「净增函数」的改动一律先清缓存重编一遍（见 §16 踩坑 87）。
 #   变量与常量不占这个额度，只有函数占；整理手段见踩坑 87。
+# ⇒ **0.10.3 已解除**：checker 的五张定长表改成通用动态哈希表（编译器提交 `fc577783`）。
+#   本仓实测：90 文件树上净增 50 个函数 + `rm -rf build && make build` → 通过（静态链接审计通过）。
+#   因此「净增函数按 0 处理」那条纪律作废。这段留下的用处只有一个：**换/降编译器时认得出症状**
+#   （报错点落在标准库、`make check` 全绿、只有清缓存重编才炸）。
 selftest: build codegen-audit doc-audit doc-cover e2e-exec e2e-accept-nudge e2e-config-flags e2e-title e2e-title-cmd e2e-title-auto e2e-mouse e2e-api e2e-steps e2e-permission e2e-sandbox e2e-tasks e2e-goal e2e-sessions e2e-resume-big e2e-diff e2e-ws e2e-model e2e-model-route e2e-worktree p30-check
 	UYA_BIN=$(UYA) $(OUT) --selftest
 

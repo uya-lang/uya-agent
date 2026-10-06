@@ -467,5 +467,6 @@ DEEPSEEK_API_KEY=sk-xxx ./build/uya-agent \
 * 剪贴板只支持 X11 的 unix socket（不做 TCP 转发、不做 Wayland 原生协议）。
 * 换到 `uya-0.11`：`tls/https.uya`、`std/json/*`、`x509/verify.uya` 与 0.10 逐字节相同，
   但 `libc/syscall.uya`、`std/runtime/runtime.uya`、`tls/ssl/context.uya` 有差异，需要重新验证。
-* **文件数上限 64 与函数表容量**（uya 0.10.1）：加文件前先数 `make -s print-src | wc -w`；
-  贡献函数的改动按**净增 0** 处理。见 [CODING.md §1.2.1 / §6](CODING.md)。
+* **文件数上限 64 与函数表容量**（uya 0.10.1 的两条硬约束）：**都已在 0.10.3 解除**
+  （输入文件表改为可增长、checker 的五张定长表改动态哈希表）；本仓现在是 90 个构建文件、
+  函数可以净增。换/降编译器前先读 [CODING.md §1.2.1 / §6](CODING.md) —— 症状与最小复现都记在那里。
