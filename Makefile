@@ -872,7 +872,8 @@ e2e-watch-pick: build
 	echo "e2e-watch-pick: 通过（清单一次回车即跟随 + 回合运行中当场开跟随浮层）"
 
 # P33/P35：/sessions 列表（离线，行式 REPL 走真二进制）：三列 = 标题 / 工作区 / session id，
-# 同 id 只留最后一条；**P35 起最新的排最后一行**（`--list-sessions` 与 `/sessions` 同一份）。
+# **只列有标题的会话**（空标题的行整条不见），同 id 只留最后一条；
+# **P35 起最新的排最后一行**（`--list-sessions` 与 `/sessions` 同一份）。
 # TUI 浮层那条腿（宽箱体 / 逐行宽度不变量 / 默认游标落在最新那条 / 选中项取完整 id）
 # 在 selftest 的 tui-sessions 轮里断言。
 e2e-sessions: build
@@ -880,10 +881,12 @@ e2e-sessions: build
 	home=build/selftest_sess_e2e; rm -rf $$home; mkdir -p $$home; \
 	ida=session-aaaa1111-1111-4111-8111-111111111111; \
 	idb=session-cccc3333-3333-4333-8333-333333333333; \
+	idc=session-dddd4444-4444-4444-8444-444444444444; \
 	{ \
 	  printf '%s\n' "{\"id\":\"$$ida\",\"cwd\":\"/w/old-a\",\"lastActiveAt\":1000,\"title\":\"OLDTITLE-旧会话第一次记录\",\"model\":\"m\",\"delegationDepth\":0,\"turns\":0,\"events\":0,\"path\":\"/x\"}"; \
-	  printf '%s\n' "{\"id\":\"$$idb\",\"cwd\":\"/w/none\",\"lastActiveAt\":7000,\"title\":\"\",\"model\":\"m\",\"delegationDepth\":0,\"turns\":0,\"events\":0,\"path\":\"/x\"}"; \
+	  printf '%s\n' "{\"id\":\"$$idb\",\"cwd\":\"/w/none\",\"lastActiveAt\":7000,\"title\":\"CTITLE-中间会话\",\"model\":\"m\",\"delegationDepth\":0,\"turns\":0,\"events\":0,\"path\":\"/x\"}"; \
 	  printf '%s\n' "{\"id\":\"$$ida\",\"cwd\":\"/w/new-a\",\"lastActiveAt\":9000,\"title\":\"NEWTITLE-最新会话第二次记录\",\"model\":\"m\",\"delegationDepth\":0,\"turns\":0,\"events\":0,\"path\":\"/x\"}"; \
+	  printf '%s\n' "{\"id\":\"$$idc\",\"cwd\":\"/w/notitle\",\"lastActiveAt\":11000,\"title\":\"\",\"model\":\"m\",\"delegationDepth\":0,\"turns\":0,\"events\":0,\"path\":\"/x\"}"; \
 	} > $$home/index.jsonl; \
 	out=$$(printf '/sessions\n/exit\n' | $(OUT) --no-dsh-config --no-tui --quiet --api-key dummy-key --agent-home $$home 2>&1); \
 	echo "$$out" | grep -qF "NEWTITLE" \
@@ -892,22 +895,28 @@ e2e-sessions: build
 		&& { echo "FAIL: 被取代的旧记录还在列表里（同 id 没取最后一条）"; echo "$$out"; exit 1; }; \
 	[ "$$(echo "$$out" | grep -c "$$ida")" -eq 1 ] \
 		|| { echo "FAIL: 同一个 session id 出现次数 != 1（去重没生效）"; echo "$$out"; exit 1; }; \
+	[ "$$(echo "$$out" | grep -c 'session-')" -eq 2 ] \
+		|| { echo "FAIL: 列表行数不是 2（空标题的会话应当被过滤掉）"; echo "$$out"; exit 1; }; \
+	echo "$$out" | grep -q "$$idc" \
+		&& { echo "FAIL: 空标题的会话（lastActiveAt 最大）还在列表里"; echo "$$out"; exit 1; }; \
 	echo "$$out" | grep -qF "(无标题)" \
-		|| { echo "FAIL: 空标题没有落到占位串上"; echo "$$out"; exit 1; }; \
+		&& { echo "FAIL: 空标题的会话还在列表里（占位串又出现了）"; echo "$$out"; exit 1; }; \
+	echo "$$out" | grep -qF "CTITLE-中间会话" \
+		|| { echo "FAIL: 有标题的中间会话不在列表里"; echo "$$out"; exit 1; }; \
 	echo "$$out" | grep -qE "/w/new-a +session-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$$" \
 		|| { echo "FAIL: 工作区列与完整 session id 没有排成「工作区在前、id 在行尾」"; echo "$$out"; exit 1; }; \
 	echo "$$out" | grep -q "session-" || { echo "FAIL: 列表里一个会话都没有"; echo "$$out"; exit 1; }; \
 	n_new=$$(echo "$$out" | grep -n "NEWTITLE" | head -1 | cut -d: -f1); \
-	n_old=$$(echo "$$out" | grep -n "(无标题)" | head -1 | cut -d: -f1); \
-	[ -n "$$n_new" ] && [ -n "$$n_old" ] && [ "$$n_new" -gt "$$n_old" ] \
+	n_mid=$$(echo "$$out" | grep -n "CTITLE" | head -1 | cut -d: -f1); \
+	[ -n "$$n_new" ] && [ -n "$$n_mid" ] && [ "$$n_new" -gt "$$n_mid" ] \
 		|| { echo "FAIL: 最新的没有排在最后一行（P35 的展示序）"; echo "$$out"; exit 1; }; \
 	last_id=$$(echo "$$out" | grep "session-" | tail -1 | sed 's/.*\(session-[0-9a-f-]*\).*/\1/'); \
 	[ "$$last_id" = "$$ida" ] \
-		|| { echo "FAIL: 最后一行不是 lastActiveAt 最大的那条（实际 $$last_id）"; echo "$$out"; exit 1; }; \
+		|| { echo "FAIL: 最后一行不是「有标题的会话里 lastActiveAt 最大」的那条（实际 $$last_id）"; echo "$$out"; exit 1; }; \
 	first_id=$$(echo "$$out" | grep "session-" | head -1 | sed 's/.*\(session-[0-9a-f-]*\).*/\1/'); \
 	[ "$$first_id" = "$$idb" ] \
-		|| { echo "FAIL: 第一行不是最旧的那条（缺 lastActiveAt 的 cccc 应当垫底/在最上）"; echo "$$out"; exit 1; }; \
-	echo "e2e-sessions: 通过（三列 / 最新的在最后一行 / 同 id 取最后一条 / 空标题占位 / id 完整）"
+		|| { echo "FAIL: 第一行不是最旧的有标题会话（实际 $$first_id）"; echo "$$out"; exit 1; }; \
+	echo "e2e-sessions: 通过（只列有标题的会话 / 三列 / 最新的在最后一行 / 同 id 取最后一条 / id 完整）"
 
 # P35：恢复会话段错误回归（离线，真二进制）：造一份 ~3 MiB 的会话日志，末尾再补一条
 # **没有换行**的残行，然后 --resume --dry-run。未修版本在这里稳定 SIGSEGV（退出码 139），
