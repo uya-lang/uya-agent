@@ -1,12 +1,14 @@
-// src/session/procx.uya — 进程 CPU 采样（P18）：机器上**所有** uya-agent 进程的综合 CPU 使用率
+// src/session/procx.uya — 进程采样（P18/P24）：**本会话进程树**的综合 CPU 与内存
 //
 // 本文件：模块级采样状态（`g_px_*`）与 `procx_reset`、只读读数（`procx_cpu_pct`/
 //   `procx_mem_kb`/`procx_mem_kind`/`procx_mem_kind_name`/`procx_proc_count`/
-//   `procx_last_span_ms`/`procx_failed`/`procx_hz`）、三个纯函数（`procx_pid_ok`/
-//   `procx_parse_stat`/`procx_pct_of`）、内存读取与格式化（`procx_find_kb`/
-//   `procx_fmt_mem_kb`）、以及采样驱动 `procx_sample_once`/`procx_tick`。
-// 不变量：① 采样范围是 `/proc` 下 comm 与本进程**相同**的全部进程（本进程 + 子代理 +
-//   其它终端/工作区的实例）；自己的 comm 取自 `/proc/self/stat`（二进制改名也照样匹配），
+//   `procx_last_span_ms`/`procx_failed`/`procx_hz`）、纯函数（`procx_pid_ok`/
+//   `procx_parse_stat`/`procx_pct_of`/`procx_tree_mark`）、行表与枚举（`PxRow`/
+//   `procx_scan_rows`）、内存读取与格式化（`procx_find_kb`/`procx_fmt_mem_kb`）、
+//   以及采样驱动 `procx_sample_once`/`procx_tick`。
+// 不变量：① 采样范围是**本进程 + 它的全部后代**里 comm 与本进程**相同**的那些
+//   （本进程、子代理、工作流子进程；口径与理由见下）；自己的 comm 取自
+//   `/proc/self/stat`（二进制改名也照样匹配），
 //   comm 取第一个 `(` 与**最后一个** `)` 之间（comm 里可以有空格和括号）；
 //   ② 只取 `utime + stime`，**不取** cutime/cstime —— 父子都是我们的进程时会把同一份 CPU
 //   算两遍；③ `PROCX_HZ`=100 是**常数**（USER_HZ，Linux 全架构固定），不是 sysconf 读数；
@@ -23,8 +25,18 @@
 //   `g_px_*` 静态状态。
 //
 // 口径：
-//   * 范围：`/proc` 下 comm 与本进程相同的**全部**进程 —— 本进程、子代理进程、
-//     其它终端/其它工作区里的实例。不是只看本会话进程树（要改只需换过滤条件）。
+//   * 范围：**本进程 + 它的后代**（进程树），且 comm 必须与本进程相同。不是
+//     机器上所有同名进程 —— 那是本文件最初（P18）的写法，症状是脚注把**别人的**
+//     会话算到用户头上：实测同机 14 个同名进程 PSS 合计 338 MB，而本会话树只有
+//     9 MB，一个空闲 agent 显示「内存 300M」就是这么来的（§16 踩坑 104）。
+//     过滤条件有两层，缺一不可：
+//       ① **树**：从本进程出发按 ppid 传递闭包（`procx_tree_mark`）。判别沿**所有**
+//          进程走，不只沿同名进程 —— agent → `bash`（工具子进程）→ 嵌套 agent
+//          这种链是真实存在的（selftest / workflow 就会跑出来），只沿同名进程走
+//          会把它整条丢掉。
+//       ② **comm**：只在**最后求和**时过滤。工具子进程（bash / node / python）
+//          不是我们的进程，峰值可达 GB 级，算进来会把数字顶爆（P18 的刻意排除，
+//          这条保留）。
 //     自己的 comm 从 `/proc/self/stat` 读出（二进制被改名也照样匹配；comm 上限
 //     15 字符，两侧同样截断，所以逐字节比较成立）。
 //   * 取值：`/proc/<pid>/stat` 的 utime + stime。**不取** cutime/cstime —— 父子
@@ -40,12 +52,14 @@
 //     只建立基线（不产生数字）。`/proc` 读不到 → 返回不可用，界面直接省略该字段。
 //
 // P24：同一次走查里顺带累加**内存**（`内存 312M`）：
-//   * 范围与 CPU 完全一致（comm 相同的那批进程）；取 `/proc/<pid>/smaps_rollup` 的
-//     `Pss:`（比例分摊 —— 子代理是 fork 出来的，PSS 不会把父子共享的页算两遍，RSS 会）。
+//   * 范围与 CPU 完全一致（同一次走查定下的那个进程集：树上 comm 相同的那批）；
+//     取 `/proc/<pid>/smaps_rollup` 的 `Pss:`（比例分摊 —— 子代理是 fork 出来的，
+//     PSS 不会把父子共享的页算两遍，RSS 会）。
 //   * 口径**整批统一**：一旦认准 PSS 就不再改；内核没有 `smaps_rollup`（< 4.14）时
 //     整批退回 `/proc/<pid>/status` 的 `VmRSS:`，不会 PSS/RSS 混着加。
 //   * 节奏 5 秒一次，比 CPU 慢一档：算 PSS 要遍历页表，3GB 进程实测 ~60ms/次，
 //     1 秒一次会把心跳（也就是界面）拖住；uya-agent 这类几十 MB 的进程 ~1ms。
+//     所以**先定集、后读数**：只有树上的同名进程才去读页表。
 
 use libc.syscall;
 use libc.unistd;
@@ -61,6 +75,31 @@ const PROCX_MEM_MAX: usize = 4096;    // smaps_rollup / status 前几 KB 就够�
 const PROCX_MEM_NONE: i32 = 0;
 const PROCX_MEM_PSS: i32 = 1;
 const PROCX_MEM_RSS: i32 = 2;
+
+// ============================================================
+// 行表（一次走查的快照）
+// ============================================================
+
+// 一行 = 一个 /proc 条目里我们要的三样东西 + 两个判定位。
+//   * `mine`：comm 与本进程相同（求和时只看它）；
+//   * `mark`：落在**本进程的进程树**里（procx_tree_mark 填）。
+// 为什么把「树」与「同名」分成两个位而不是合成一个 bool：判别必须先沿**所有**
+// 进程的 ppid 做传递闭包，而「是不是同名」只在最后求和时才有用 —— 合成一个位
+// 就得在遍历中途同时判两件事，跨 comm 的链（agent → bash → agent）会被切断。
+export struct PxRow {
+    pid: i32,
+    ppid: i32,
+    ticks: i64,
+    mine: bool,
+    mark: bool,
+}
+
+// 行表。一次采样走查要装下全机 /proc 的条目（本机实测 866 个），4096 × 24B
+// ≈ 96 KiB 放栈上太肥（心跳路径上的栈帧），所以是**模块级**的 —— 这个模块本来
+// 就是「进程内唯一一份采样状态」的定位（见下面那批 g_px_*）。
+var g_px_rows: [PxRow: PROCX_MAX_PROCS] = [PxRow{
+    pid: 0, ppid: 0, ticks: 0, mine: false, mark: false
+}: PROCX_MAX_PROCS];
 
 var g_px_comm: Buf = Buf{ ptr: null, len: 0, cap: 0 };
 var g_px_have_comm: bool = false;
@@ -96,7 +135,8 @@ export fn procx_cpu_pct() i32 {
     return g_px_pct;
 }
 
-// 内存合计（kB）；-1 = 不可用（还没采到 / 读不到 /proc）
+// 内存合计（kB）；-1 = 不可用（还没采到 / 读不到 /proc）。
+// 口径 = **本会话进程树**里 comm 相同的那些进程（见文件头「口径」），不是全机同名。
 export fn procx_mem_kb() i64 {
     return g_px_mem_kb;
 }
@@ -117,7 +157,8 @@ export fn procx_mem_kind_name() &const byte {
     return "" as &const byte;
 }
 
-// 最近一次采到的进程数（comm 相同的那批）；没采到过是 0
+// 最近一次采到的进程数（**本会话进程树**里 comm 相同的那些）；没采到过是 0。
+// 注意它**不是**全机同名进程数：别的终端/别的 worktree 的实例不算（见文件头）。
 export fn procx_proc_count() i32 {
     return g_px_count;
 }
@@ -152,11 +193,17 @@ export fn procx_pid_ok(name: &[byte]) bool {
 }
 
 // 解析一行 `/proc/<pid>/stat`：comm = 第一个 '(' 与**最后一个** ')' 之间
-// （comm 里可以有空格和括号，所以不能按空格切），utime/stime = ')' 之后的
-// 第 12、13 个字段（第 3 个字段是 state）。
-export fn procx_parse_stat(line: &[byte], comm: &Buf, ticks: &i64) bool {
+// （comm 里可以有空格和括号，所以不能按空格切），ppid = ')' 之后的第 2 个字段，
+// utime/stime = ')' 之后的第 12、13 个字段（第 1 个字段是 state）。
+//
+// ppid 是**进程树判别**要的（`procx_tree_mark`）：只保留这一份解析器，
+// 不另写一份「只取 ppid」的 —— 同一行两种切法迟早会漂移（comm 里带括号那条
+// 边界就是这么被踩出来的）。失败返回 false，此时 comm/ticks/ppid 都不可信。
+export fn procx_parse_stat(line: &[byte], comm: &Buf, ticks: &i64,
+    ppid: &i32) bool {
     buf_reset(comm);
     ticks[0] = 0;
+    ppid[0] = 0;
     const open_at: isize = bufx_find_byte(line, 40, 0);      // '('
     if open_at < 0 {
         return false;
@@ -183,6 +230,7 @@ export fn procx_parse_stat(line: &[byte], comm: &Buf, ticks: &i64) bool {
     var field: i32 = 0;
     var utime: i64 = -1;
     var stime: i64 = -1;
+    var have_ppid: bool = false;
     while i < line.len {
         // 跳空格
         while i < line.len && line.ptr[i] == 32 as byte {
@@ -199,7 +247,15 @@ export fn procx_parse_stat(line: &[byte], comm: &Buf, ticks: &i64) bool {
             digits = digits + 1;
             i = i + 1;
         }
-        if field == 12 {
+        if field == 2 {
+            // ppid 必须是数字：它不是可选字段 —— 缺了就没法做进程树判别，
+            // 让它过会把「这一行不属于任何树」静默当成「根进程」（ppid=0）。
+            if digits == 0 {
+                return false;
+            }
+            ppid[0] = i64_to_i32(v);
+            have_ppid = true;
+        } else if field == 12 {
             if digits == 0 {
                 return false;   // utime 必须是数字（缺字段 = 不是我们要的形状）
             }
@@ -218,7 +274,7 @@ export fn procx_parse_stat(line: &[byte], comm: &Buf, ticks: &i64) bool {
             i = i + 1;
         }
     }
-    if utime < 0 || stime < 0 {
+    if utime < 0 || stime < 0 || !have_ppid {
         return false;
     }
     ticks[0] = utime + stime;
@@ -242,6 +298,64 @@ export fn procx_pct_of(dticks: i64, dms: i64) i32 {
         return 0;
     }
     return p as i32;
+}
+
+// 在行表 rows[0, n) 里标出**以 root 为根的那棵进程树**（`mark = true`），
+// 返回被标的行数（含 root 自己）。root 不在表里 → 0。
+//
+// 为什么是**不动点**而不是「一趟扫下来」：行表按 `/proc` 的枚举顺序填，子进程
+// **完全可能排在父进程前面**（readdir 的顺序不是拓扑序）。一趟扫会漏掉「父还没
+// 被标时先遇到子」的那些行，而漏掉的正是链路中段 —— 症状是数字偶尔偏小、
+// 复现不了。所以反复扫，直到某一轮一个都没新增（内层 while 的 hit 哨兵）；
+// 最坏 O(n²) 但对全机 866 行、且通常 2–3 轮就收敛。
+//
+// 判别沿**所有**行的 ppid 走，与 comm 无关 —— 跨 comm 的链
+// （agent → bash → 嵌套 agent）必须能穿过去，否则嵌套会话树会被切断。
+// 自环（ppid == pid）不会让它转不停：标记只从 false 变 true，每轮至少新增一个
+// 才会继续，总量被 n 封顶。
+export fn procx_tree_mark(rows: &PxRow, n: usize, root: i32) i32 {
+    var marked: i32 = 0;
+    var i: usize = 0;
+    while i < n && i < PROCX_MAX_PROCS {
+        rows[i].mark = false;
+        if rows[i].pid == root {
+            rows[i].mark = true;
+            marked = marked + 1;
+        }
+        i = i + 1;
+    }
+    var again: bool = true;
+    while again {
+        again = false;
+        var k: usize = 0;
+        while k < n && k < PROCX_MAX_PROCS {
+            if !rows[k].mark && procx_row_parent_marked(rows, n, k) {
+                rows[k].mark = true;
+                marked = marked + 1;
+                again = true;
+            }
+            k = k + 1;
+        }
+    }
+    return marked;
+}
+
+// 第 k 行的 ppid 是否指向一个**已被标**的行（纯查表，不改状态）。
+// 单独一个函数是为了让「父在不在表里 / 父是不是被标」这两件事写在一处：
+// ppid 指向表外的行（父进程已经退出、或超出 PROCX_MAX_PROCS）→ 不算。
+fn procx_row_parent_marked(rows: &PxRow, n: usize, k: usize) bool {
+    const pp: i32 = rows[k].ppid;
+    if pp <= 0 {
+        return false;
+    }
+    var j: usize = 0;
+    while j < n && j < PROCX_MAX_PROCS {
+        if rows[j].pid == pp {
+            return rows[j].mark;
+        }
+        j = j + 1;
+    }
+    return false;
 }
 
 // 在 /proc/<pid>/smaps_rollup（`Pss:  1234 kB`）或 /proc/<pid>/status（`VmRSS:\t1234 kB`）
@@ -333,7 +447,8 @@ fn procx_self_comm() bool {
         return false;
     }
     var ticks: i64 = 0;
-    if !procx_parse_stat(line.ptr[0: line.len], &g_px_comm, &ticks) {
+    var ppid: i32 = 0;
+    if !procx_parse_stat(line.ptr[0: line.len], &g_px_comm, &ticks, &ppid) {
         return false;
     }
     if g_px_comm.len == 0 {
@@ -383,12 +498,13 @@ fn procx_read_mem(path: &Buf, base_len: usize, kind: &i32, kb: &i64) bool {
     return false;
 }
 
-// 扫一遍 /proc，累加 comm 匹配的进程的 utime+stime（with_mem 时顺带累加内存）。
-// 返回 false = 枚举失败。
-fn procx_scan(ticks: &i64, count: &i32, with_mem: bool, mem_kb: &i64, mem_kind: &i32) bool {
-    ticks[0] = 0;
-    count[0] = 0;
-    mem_kb[0] = -1;
+// 枚举 `/proc`，把每一条能解析的 `/proc/<pid>/stat` 收进行表 g_px_rows。
+// 返回 false = 枚举/comm 初始化失败；成功时 *out_n = 收进来的行数。
+//
+// 这一步**只收集、不判断**：`mine`（comm 同名）在这里填，`mark`（在不在树上）留给
+// `procx_tree_mark` —— 见 PxRow 的注释（两件事必须分开才穿得过跨 comm 的链）。
+fn procx_scan_rows(comm: &Buf, out_n: &i32) bool {
+    out_n[0] = 0;
     if !procx_self_comm() {
         return false;
     }
@@ -401,11 +517,8 @@ fn procx_scan(ticks: &i64, count: &i32, with_mem: bool, mem_kb: &i64, mem_kind: 
     defer { buf_free(&path); }
     var line: Buf = buf_new(PROCX_STAT_MAX);
     defer { buf_free(&line); }
-    var comm: Buf = buf_new(64);
-    defer { buf_free(&comm); }
-    var mem_sum: i64 = 0;
-    var mem_n: i32 = 0;
-    while count[0] < PROCX_MAX_PROCS {
+    var n: i32 = 0;
+    while n < PROCX_MAX_PROCS {
         const de: &Dirent = readdir(dp);
         if de == null {
             break;
@@ -422,7 +535,6 @@ fn procx_scan(ticks: &i64, count: &i32, with_mem: bool, mem_kb: &i64, mem_kind: 
         if !buf_append(&path, nm, ln) {
             break;
         }
-        const base_len: usize = path.len;                   // `/proc/<pid>`（后面拼后缀用）
         if !buf_append_cstr(&path, "/stat") {
             break;
         }
@@ -433,33 +545,108 @@ fn procx_scan(ticks: &i64, count: &i32, with_mem: bool, mem_kb: &i64, mem_kind: 
             continue;   // 进程刚消失 / 权限不足：跳过
         }
         var t: i64 = 0;
-        if !procx_parse_stat(line.ptr[0: line.len], &comm, &t) {
+        var pp: i32 = 0;
+        if !procx_parse_stat(line.ptr[0: line.len], comm, &t, &pp) {
             continue;
         }
-        if comm.len != g_px_comm.len {
+        const pid: i64 = parse_u64_at(nm[0: ln], 0, ln);
+        if pid <= 0 {
             continue;
         }
-        if !bufx_mem_eq(comm.ptr as &const byte, g_px_comm.ptr as &const byte, comm.len) {
-            continue;
-        }
-        ticks[0] = ticks[0] + t;
-        count[0] = count[0] + 1;
-        if with_mem {
-            var kb: i64 = 0;
-            if procx_read_mem(&path, base_len, mem_kind, &kb) {
-                mem_sum = mem_sum + kb;
-                mem_n = mem_n + 1;
+        const idx: usize = n as usize;
+        g_px_rows[idx].pid = i64_to_i32(pid);
+        g_px_rows[idx].ppid = pp;
+        g_px_rows[idx].ticks = t;
+        g_px_rows[idx].mine = procx_comm_is_mine(comm);
+        g_px_rows[idx].mark = false;
+        n = n + 1;
+    }
+    out_n[0] = n;
+    return true;
+}
+
+// 这一行的 comm 是不是本进程的（长度先比，再逐字节）。
+fn procx_comm_is_mine(comm: &const Buf) bool {
+    if comm.len == 0 || comm.len != g_px_comm.len {
+        return false;
+    }
+    return bufx_mem_eq(comm.ptr as &const byte, g_px_comm.ptr as &const byte,
+        comm.len);
+}
+
+// 求和：树上（mark）且同名（mine）的那些行 —— CPU 直接累加 ticks，内存按需读。
+// **只对这批行读页表**（先定集后读数，理由见文件头 P24 那段）。
+fn procx_sum_tree(rows: &PxRow, n: i32, with_mem: bool, ticks: &i64,
+    count: &i32, mem_kb: &i64, mem_kind: &i32) void {
+    ticks[0] = 0;
+    count[0] = 0;
+    mem_kb[0] = -1;
+    var sum: i64 = 0;
+    var c: i32 = 0;
+    var mem_sum: i64 = 0;
+    var mem_n: i32 = 0;
+    var i: i32 = 0;
+    while i < n && i < PROCX_MAX_PROCS {
+        const k: usize = i as usize;
+        if rows[k].mark && rows[k].mine {
+            sum = sum + rows[k].ticks;
+            c = c + 1;
+            if with_mem {
+                var kb: i64 = 0;
+                if procx_read_mem_pid(rows[k].pid, mem_kind, &kb) {
+                    mem_sum = mem_sum + kb;
+                    mem_n = mem_n + 1;
+                }
             }
         }
+        i = i + 1;
     }
+    ticks[0] = sum;
+    count[0] = c;
     if with_mem && mem_n > 0 {
         mem_kb[0] = mem_sum;
     }
+}
+
+// 读一个 pid 的内存（kB）：拼 `/proc/<pid>` 走 procx_read_mem。
+// kind[0] 的语义与「整批统一」的纪律见 procx_read_mem。
+fn procx_read_mem_pid(pid: i32, kind: &i32, kb: &i64) bool {
+    var path: Buf = buf_new(64);
+    defer { buf_free(&path); }
+    if !buf_append_cstr(&path, "/proc/" as &const byte) {
+        return false;
+    }
+    if !buf_append_i64(&path, pid as i64) {
+        return false;
+    }
+    const base_len: usize = path.len;
+    return procx_read_mem(&path, base_len, kind, kb);
+}
+
+// 扫一遍 /proc，累加**本会话进程树**上 comm 相同的那些进程的 utime+stime
+// （with_mem 时顺带累加内存）。返回 false = 枚举失败。
+fn procx_scan(ticks: &i64, count: &i32, with_mem: bool, mem_kb: &i64,
+    mem_kind: &i32) bool {
+    ticks[0] = 0;
+    count[0] = 0;
+    mem_kb[0] = -1;
+    var comm: Buf = buf_new(64);
+    defer { buf_free(&comm); }
+    var n: i32 = 0;
+    if !procx_scan_rows(&comm, &n) {
+        return false;
+    }
+    const me: i32 = i64_to_i32(sys_getpid() catch { 0 as i64; });
+    if me <= 0 {
+        return false;
+    }
+    _ = procx_tree_mark(&g_px_rows[0], n as usize, me);
+    procx_sum_tree(&g_px_rows[0], n, with_mem, ticks, count, mem_kb, mem_kind);
     return true;
 }
 
 // 立刻采一次（自测/诊断入口）。with_mem = 顺带采内存（慢一档，见文件头）。
-// 返回值 = 这次扫描是否成功。
+// 返回值 = 这次扫描是否成功。数字的口径是**本会话进程树**（文件头「口径」）。
 export fn procx_sample_once(now_ms: u64, with_mem: bool) bool {
     var ticks: i64 = 0;
     var count: i32 = 0;
