@@ -1,0 +1,1297 @@
+// src/plugin/mcpcfg.uya — MCP server 配置的发现与解析（P70）
+//
+// 本文件：`McpServer`/`McpSet` 与生命周期（`mcp_cfg_empty`/`mcp_set_init`/`mcp_set_free`/
+//   `mcp_set_push`）、名字与传输校验（`mcp_server_name_ok`/`mcp_transport_from_name`）、
+//   四个来源的发现（`mcp_cfg_collect` 一族：settings.yaml / mcp.json / cordis.yml / CLI），
+//   以及 cordis 行的映射（`mcp_cfg_cordis_row`）与 JSON 片段取值（`mcp_json_str`）。
+// 不变量：① **字段名与 DSH 的 `@deepseek-ai/dsh-mcp-client` 逐字一致**
+//   （transport/serverName/command/args/env/cwd/toolCallTimeoutMs），这样同一份配置
+//   DSH 与本仓都能吃；② `serverName` 必须 `^[A-Za-z0-9_-]{1,32}$`（DSH 的
+//   `SERVER_NAME_PATTERN`）—— 不合法整条丢掉，**不猜、不改名**（公开名要拼进工具名，
+//   脏名字会破坏协议）；③ 靠前的来源**先胜**（同名不覆盖）；④ 读不到 / 解析失败一律
+//   **不是致命错误**（离线要能跑），当作「没有这个来源」；⑤ `command` **不做 PATH 查找**
+//   （原样存下来交给 execve；`npx` 这类靠子进程 env 里的 PATH 解析，与 DSH 的
+//   cross-spawn 同口径）。
+// 依赖：libc.syscall/unistd（open/read/close 读文件）；本仓 foundation/bufx（Buf）、
+//   foundation/jsonx（`js_parse`/`js_obj_get` 一族）、foundation/yamlcfg（`YTree` 读
+//   settings.yaml）、session/session（`sess_file_exists`、`jw_str_into`）。
+// 命名：对外 `mcp_cfg_*` / `mcp_set_*` / `mcp_server_*` + `MCP_*` 常量，类型
+//   `McpServer` / `McpSet`；私有同样 `mcp_` 前缀。
+//
+// 四个来源（优先级高→低；**靠前的先胜**）：
+//   0 CLI `--mcp-server name=command args...`（`mcp_cfg_collect` 之前由
+// agent.uya 塞好）
+//   1 `$DSH_HOME/settings.yaml` 的 `uya-agent.mcp.<name>`（复用 dshcfg 的命名空间读法）
+//   2 `<projectRoot>/.dsh/mcp.json` + `~/.agents/mcp.json`（生态通用 `mcpServers`
+// 形状）
+//   3 `cordis.yml` 里 `name: "@deepseek-ai/dsh-mcp-client"` 的行（`config` 原样映射）
+//
+// 为什么还要读 cordis.yml：DSH 用户把 MCP server 写在 profile 的 cordis 行里，
+// 本仓继承它就能「同一份配置两边都能用」。进程内的 cordis 插件行（`@deepseek-ai/dsh-tool-*`）
+// **读了也跑不了**（那是 Node 进程内 TS 模块），所以只登记一条 `unsupported` 供
+// `--list-plugins` 如实报告。
+
+use libc.syscall;
+use libc.unistd;
+
+export const MCP_MAX_SERVERS: usize = 16;
+export const MCP_STR_MAX: usize = 4096;
+export const MCP_ARGS_MAX: usize = 16;
+export const MCP_NAME_MAX: usize = 32;
+// DSH 的 `DEFAULT_TOOL_CALL_TIMEOUT_MS`（`dsh-mcp-client/lib/index.js:722`）
+export const MCP_TIMEOUT_DEFAULT: u32 = 60000;
+
+export const MCP_TR_STDIO: u8 = 0;
+export const MCP_TR_HTTP: u8 = 1;      // 本版不实现，只如实登记（见 DESIGN §15）
+
+// 一条 MCP server 配置。
+// command/args 拆开放：execve 要 argv 数组，而 manifest 里 `command` + `args` 是两回事。
+export struct McpServer {
+    name: Buf,             // serverName（已校验；也是公开名 mcp__<name>__<raw> 的那一段）
+    transport: u8,
+    command: Buf,          // 可执行文件（相对路径按插件目录 / cwd 解析；不做 PATH 查找）
+    args: Buf,             // argv[1..] 以 '\n' 分隔（结构体里放不下变长数组）
+    env: Buf,              // 额外环境变量，每行 `K=V`（'\n' 分隔）
+    cwd: Buf,              // 空 = 用 agent 的当前工作区
+    timeout_ms: u32,
+    url: Buf,              // transport=HTTP 时用（本版不实现，只为如实报告）
+    source: u8,            // 0 cli / 1 dsh-settings / 2 mcp.json / 3 cordis.yml
+}
+
+export struct McpSet {
+    items: [McpServer: MCP_MAX_SERVERS],
+    n: usize,
+    // 扫到但跑不了的进程内 cordis 插件行（`@deepseek-ai/dsh-tool-*` 这类）：
+    // 只用来给 `--list-plugins` 报一句 unsupported，不参与执行。
+    unsupported: Buf,      // 每行一个包名
+    loaded: bool,          // 是否已经发现过（切工作区要复位，与 g_skills.scanned 同因）
+}
+
+// 一条「什么都没有」的 server（可安全 mcp_server_free）
+fn mcp_srv_empty() McpServer {
+    return McpServer{
+        name: buf_empty(),
+        transport: MCP_TR_STDIO,
+        command: buf_empty(),
+        args: buf_empty(),
+        env: buf_empty(),
+        cwd: buf_empty(),
+        timeout_ms: MCP_TIMEOUT_DEFAULT,
+        url: buf_empty(),
+        source: 0,
+    };
+}
+
+// 释放一条配置的五个 Buf，并复位成空（幂等：可对已 free 的再调）
+fn mcp_server_free(s: &McpServer) void {
+    buf_free(&s.name);
+    buf_free(&s.command);
+    buf_free(&s.args);
+    buf_free(&s.env);
+    buf_free(&s.cwd);
+    buf_free(&s.url);
+    s[0] = mcp_srv_empty();
+}
+
+// 初始化集合：N 条空槽（不预分配内部 Buf —— 用到了才分配，避免空启动付 16 份内存）
+export fn mcp_set_init(set: &McpSet) void {
+    var i: usize = 0;
+    while i < MCP_MAX_SERVERS {
+        set.items[i] = mcp_srv_empty();
+        i = i + 1;
+    }
+    set.n = 0;
+    set.unsupported = buf_empty();
+    set.loaded = false;
+}
+
+// 释放集合（幂等）
+export fn mcp_set_free(set: &McpSet) void {
+    var i: usize = 0;
+    while i < MCP_MAX_SERVERS {
+        mcp_server_free(&set.items[i]);
+        i = i + 1;
+    }
+    set.n = 0;
+    buf_free(&set.unsupported);
+    set.loaded = false;
+}
+
+// serverName 合法性 —— 逐字对齐 DSH 的 `SERVER_NAME_PATTERN = /^[A-Za-z0-9_-]{1,32}$/`。
+// 不合法整条丢掉：这个名字要拼进 `mcp__<name>__<raw>` 的工具名，脏名字会破坏
+// 模型侧的函数名契约（见 mcp_tool_public_name）。
+export fn mcp_server_name_ok(p: &const byte, n: usize) bool {
+    if n == 0 || n > MCP_NAME_MAX {
+        return false;
+    }
+    var i: usize = 0;
+    while i < n {
+        const c: byte = p[i];
+        // 行宽豁免：错误文案/诊断行是**单条不可断的字面量**（Uya 没有相邻字面量拼接）
+        const alpha: bool = (c >= 65 as byte && c <= 90 as byte) || (c >= 97 as byte && c <= 122 as byte);
+        const digit: bool = c >= 48 as byte && c <= 57 as byte;
+        if !alpha && !digit && c != 95 as byte && c != 45 as byte {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+// 传输名 → 常量；-1 = 不认识（调用方整条丢掉，不猜）
+export fn mcp_transport_from_name(p: &[byte]) i32 {
+    if bufx_eq_cstr(p.ptr as &const byte, p.len, "stdio" as &const byte) {
+        return MCP_TR_STDIO as i32;
+    }
+    if bufx_eq_cstr(p.ptr as &const byte, p.len, "streamable-http" as &const byte) {
+        return MCP_TR_HTTP as i32;
+    }
+    return -1;
+}
+
+// 来源名（`--list-plugins` / 诊断行用）
+export fn mcp_source_name(s: u8) &const byte {
+    if s == 1 {
+        return "dsh-settings" as &const byte;
+    }
+    if s == 2 {
+        return "mcp.json" as &const byte;
+    }
+    if s == 3 {
+        return "cordis.yml" as &const byte;
+    }
+    return "cli" as &const byte;
+}
+
+// 按名字找一条；没有返回 **-1**（0 是合法下标）
+export fn mcp_set_find(set: &const McpSet, name: &const byte, n: usize) isize {
+    var i: usize = 0;
+    while i < set.n && i < MCP_MAX_SERVERS {
+        const it: &const McpServer = &set.items[i];
+        if it.name.len == n && bufx_mem_eq(it.name.ptr as &const byte, name, n) {
+            return i as isize;
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+// 追加一条（**同名先到先得**：已存在就返回 false，不覆盖）。
+// 只做「把已解析好的字段拷进去」，分配在各调用点自己保证。
+fn mcp_set_push(set: &McpSet, srv: &const McpServer) bool {
+    if set.n >= MCP_MAX_SERVERS {
+        return false;
+    }
+    const nm: &[byte] = srv.name.ptr[0: srv.name.len];
+    if !mcp_server_name_ok(nm.ptr as &const byte, nm.len) {
+        return false;
+    }
+    if mcp_set_find(set, nm.ptr as &const byte, nm.len) >= 0 {
+        return false;
+    }
+    const slot: &McpServer = &set.items[set.n];
+    slot[0] = mcp_srv_empty();
+    slot.name = buf_new(srv.name.len + 8);
+    if !buf_valid(&slot.name) {
+        return false;
+    }
+    _ = buf_append(&slot.name, srv.name.ptr, srv.name.len);
+    slot.transport = srv.transport;
+    slot.timeout_ms = srv.timeout_ms;
+    slot.source = srv.source;
+    // 四个 Buf 逐个拷 —— **不**用 `[&Buf: 4]` 那种指针数组：uya 0.10 的 codegen
+    // 会把它生成为 `const struct Buf *dst[4]`（多一个 const），对 dst[i][0] 赋值
+    // 直接是 C 编译错误「assignment of read-only location」。逐个写没有这个问题。
+    slot.command = buf_new(srv.command.len + 16);
+    if !buf_valid(&slot.command) {
+        return false;
+    }
+    if srv.command.len > 0 {
+        _ = buf_append(&slot.command, srv.command.ptr, srv.command.len);
+    }
+    slot.args = buf_new(srv.args.len + 16);
+    if !buf_valid(&slot.args) {
+        return false;
+    }
+    if srv.args.len > 0 {
+        _ = buf_append(&slot.args, srv.args.ptr, srv.args.len);
+    }
+    slot.env = buf_new(srv.env.len + 16);
+    if !buf_valid(&slot.env) {
+        return false;
+    }
+    if srv.env.len > 0 {
+        _ = buf_append(&slot.env, srv.env.ptr, srv.env.len);
+    }
+    slot.cwd = buf_new(srv.cwd.len + 16);
+    if !buf_valid(&slot.cwd) {
+        return false;
+    }
+    if srv.cwd.len > 0 {
+        _ = buf_append(&slot.cwd, srv.cwd.ptr, srv.cwd.len);
+    }
+    set.n = set.n + 1;
+    return true;
+}
+
+// 记一个「扫到但跑不了」的包名（一行一条；去重，满了静默丢 —— 它只影响提示的完整度）
+fn mcp_unsupported_add(set: &McpSet, name: &[byte]) void {
+    if name.len == 0 {
+        return;
+    }
+    if !buf_valid(&set.unsupported) {
+        set.unsupported = buf_new(1024);
+    }
+    if !buf_valid(&set.unsupported) {
+        return;
+    }
+    // 去重：整段按行找一遍（条目数在个位数量级，不值得上哈希）
+    var i: usize = 0;
+    var start: usize = 0;
+    while i <= set.unsupported.len {
+        if i == set.unsupported.len || set.unsupported.ptr[i] == 10 as byte {
+            if i > start && bufx_mem_eq(set.unsupported.ptr + start, name.ptr, i - start) {
+                return;
+            }
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    if set.unsupported.len > 0 {
+        _ = buf_append_byte(&set.unsupported, 10);
+    }
+    _ = buf_append(&set.unsupported, name.ptr, name.len);
+}
+
+// -------------------- 小工具：从 JSON 文本里取值 --------------------
+//
+// 读 `settings.yaml`/`mcp.json` 之外的 JSON 片段时用（`mcp.json` 走 js_parse 那一族）。
+// 这里刻意不复用 jsonx 的 parse：`mcp.json` 的 `mcpServers` 里每一项的键集合是开放的
+// （生态里各家都往里塞自己的字段），逐个 parse 一份小 arena 更稳、也更好查。
+
+// 从 [p, p+n) 起跳过空白；返回新下标
+fn mcp_skip_ws(p: &const byte, n: usize, i: usize) usize {
+    var k: usize = i;
+    while k < n {
+        const c: byte = p[k];
+        if c != 32 as byte && c != 9 as byte && c != 10 as byte && c != 13 as byte {
+            break;
+        }
+        k = k + 1;
+    }
+    return k;
+}
+
+// 在 JSON 文本里找 `"key"` 后面的字符串值，写进 out（先 reset）。
+// 只做「找键 → 取字符串」这一件事；不做完整 JSON 校验（那不是本文件的职责，
+// 解析失败的上层后果是「这条 server 配不起来」，会被如实报出来）。
+export fn mcp_json_str(p: &const byte, n: usize, key: &const byte, out: &Buf) bool {
+    buf_reset(out);
+    const kn: usize = bufx_cstr_len(key);
+    if kn == 0 {
+        return false;
+    }
+    var i: usize = 0;
+    while i < n {
+        if p[i] != 34 as byte {
+            i = i + 1;
+            continue;
+        }
+        // 读一个键
+        const ks: usize = i + 1;
+        var ke: usize = ks;
+        var esc: bool = false;
+        while ke < n {
+            const c: byte = p[ke];
+            if esc {
+                esc = false;
+            } else if c == 92 as byte {
+                esc = true;
+            } else if c == 34 as byte {
+                break;
+            }
+            ke = ke + 1;
+        }
+        if ke >= n {
+            return false;
+        }
+        const hit: bool = (ke - ks) == kn && bufx_mem_eq(p + ks, key, kn);
+        var j: usize = mcp_skip_ws(p, n, ke + 1);
+        // ⚠ 名字对上**还不够** —— 后面必须紧跟 `:`，否则这一处只是**值**而不是键。
+        // 现场踩到：`{"type":"text","text":"…"}` 里找 `text`，第一次命中的是
+        // `"type":"text"` 的**值** `"text"`（它的下一个字符是 `,`）——
+        // 旧实现直接 `return false`，于是 content 里明明有 text 段却抽不出来，
+        // 工具结果变成「(the MCP tool returned no content)」。
+        // 正确口径：值位置上的同名字符串**跳过**，继续往后找真正的键。
+        if !hit || j >= n || p[j] != 58 as byte {
+            // 跳过这个字符串，继续找下一个候选键
+            i = ke + 1;
+            continue;
+        }
+        j = mcp_skip_ws(p, n, j + 1);
+        if j >= n || p[j] != 34 as byte {
+            return false;
+        }
+        // 取字符串值（含反转义：`\"` 与 `\\` 两种；路径里这两种最常见）
+        var k: usize = j + 1;
+        var bslash: bool = false;
+        while k < n {
+            const c: byte = p[k];
+            if bslash {
+                bslash = false;
+                _ = buf_append_byte(out, c);
+            } else if c == 92 as byte {
+                bslash = true;
+            } else if c == 34 as byte {
+                return true;
+            } else {
+                _ = buf_append_byte(out, c);
+            }
+            k = k + 1;
+        }
+        return false;
+    }
+    return false;
+}
+
+// 从 JSON 文本里取 `args` 数组 → 每项一行（'\n' 分隔）。空数组 / 缺字段都返回 true
+// 且 out 为空（「没有参数」是合法配置，不是错误）。
+// 同上：只认字符串数组（MCP 的 args 就是字符串数组，数字/对象是配置写错了 → 丢掉该项）。
+export fn mcp_json_args(p: &const byte, n: usize, key: &const byte, out: &Buf) bool {
+    buf_reset(out);
+    const kn: usize = bufx_cstr_len(key);
+    var i: usize = 0;
+    while i < n {
+        if p[i] != 34 as byte {
+            i = i + 1;
+            continue;
+        }
+        const ks: usize = i + 1;
+        var ke: usize = ks;
+        while ke < n && p[ke] != 34 as byte {
+            ke = ke + 1;
+        }
+        if ke >= n {
+            return false;
+        }
+        // 命中名字**还不够**：后面必须紧跟 `:`（否则这一处是**值**不是键 ——
+        // 见 mcp_json_str 里那段说明）。值位置上的同名字符串跳过、继续往后找。
+        const hit: bool = (ke - ks) == kn && bufx_mem_eq(p + ks, key, kn);
+        var j: usize = mcp_skip_ws(p, n, ke + 1);
+        if !hit || j >= n || p[j] != 58 as byte {
+            i = ke + 1;
+            continue;
+        }
+        j = mcp_skip_ws(p, n, j + 1);
+        if j >= n || p[j] != 91 as byte {
+            return false;   // 不是数组
+        }
+        j = j + 1;
+        var first: bool = true;
+        while j < n {
+            j = mcp_skip_ws(p, n, j);
+            if j >= n || p[j] == 93 as byte {
+                return true;
+            }
+            if p[j] == 44 as byte {
+                j = j + 1;
+                continue;
+            }
+            if p[j] != 34 as byte {
+                return false;   // 数组里有非字符串项
+            }
+            var k: usize = j + 1;
+            var item: Buf = buf_new(512);
+            defer { buf_free(&item); }
+            var bslash: bool = false;
+            var closed: bool = false;
+            while k < n {
+                const c: byte = p[k];
+                if bslash {
+                    bslash = false;
+                    _ = buf_append_byte(&item, c);
+                } else if c == 92 as byte {
+                    bslash = true;
+                } else if c == 34 as byte {
+                    closed = true;
+                    break;
+                } else {
+                    _ = buf_append_byte(&item, c);
+                }
+                k = k + 1;
+            }
+            if !closed {
+                return false;
+            }
+            if !first {
+                _ = buf_append_byte(out, 10);
+            }
+            _ = buf_append(out, item.ptr, item.len);
+            first = false;
+            j = k + 1;
+        }
+        return true;
+    }
+    return false;
+}
+
+// 从 JSON 文本里取整数字段（`toolCallTimeoutMs`）；缺字段 / 不合法返回 fallback
+export fn mcp_json_i64(p: &const byte, n: usize, key: &const byte, fallback: i64) i64 {
+    const kn: usize = bufx_cstr_len(key);
+    var i: usize = 0;
+    while i < n {
+        if p[i] != 34 as byte {
+            i = i + 1;
+            continue;
+        }
+        const ks: usize = i + 1;
+        var ke: usize = ks;
+        while ke < n && p[ke] != 34 as byte {
+            ke = ke + 1;
+        }
+        if ke >= n {
+            return fallback;
+        }
+        // 命中名字**还不够**：后面必须紧跟 `:`（否则这一处是**值**不是键 ——
+        // 见 mcp_json_str 里那段说明）。值位置上的同名字符串跳过、继续往后找。
+        const hit: bool = (ke - ks) == kn && bufx_mem_eq(p + ks, key, kn);
+        var j: usize = mcp_skip_ws(p, n, ke + 1);
+        if !hit || j >= n || p[j] != 58 as byte {
+            i = ke + 1;
+            continue;
+        }
+        j = mcp_skip_ws(p, n, j + 1);
+        var v: i64 = 0;
+        var digits: usize = 0;
+        while j < n {
+            const c: byte = p[j];
+            if c < 48 as byte || c > 57 as byte {
+                break;
+            }
+            v = v * 10 + ((c as i64) - 48);
+            digits = digits + 1;
+            j = j + 1;
+        }
+        if digits == 0 {
+            return fallback;
+        }
+        return v;
+    }
+    return fallback;
+}
+
+// -------------------- 读一个文件进 Buf（配置都小；失败静默） --------------------
+//
+// 与 fsx 的 `fs_read_file_all` 的区别：那个要求绝对路径 + NUL 结尾且带 limit 语义。
+// 这里要的是「读一个小文本文件，读不到就算了」，所以自己写一个（不新增 fsx 的导出面）。
+fn mcp_read_file(path_z: &const byte, limit: usize, out: &Buf) bool {
+    buf_reset(out);
+    const fd: i32 = sys_open(path_z, 0, 0) catch { -1; };
+    if fd < 0 {
+        return false;
+    }
+    defer { _ = sys_close(fd) catch {}; }
+    var chunk: [byte: 4096] = [0: 4096];
+    var total: usize = 0;
+    while total < limit {
+        const n: isize = sys_read(fd, &chunk[0], 4096) catch { 0 as isize; };
+        if n <= 0 {
+            break;
+        }
+        const un: usize = n as usize;
+        var i: usize = 0;
+        while i < un && total < limit {
+            _ = buf_append_byte(out, chunk[i]);
+            i = i + 1;
+            total = total + 1;
+        }
+        if un < 4096 {
+            break;
+        }
+    }
+    return out.len > 0;
+}
+
+// 把 `K=V` 追加进 env 缓冲（每行一条）；空键 / 空行跳过
+fn mcp_env_add(env: &Buf, kv: &[byte]) void {
+    if kv.len == 0 {
+        return;
+    }
+    // 必须有 '=' 且 '=' 不在首位
+    var eq: isize = -1;
+    var i: usize = 0;
+    while i < kv.len {
+        if kv.ptr[i] == 61 as byte {
+            eq = i as isize;
+            break;
+        }
+        i = i + 1;
+    }
+    if eq <= 0 {
+        return;
+    }
+    if env.len > 0 {
+        _ = buf_append_byte(env, 10);
+    }
+    _ = buf_append(env, kv.ptr, kv.len);
+}
+
+// 解析 `env` 对象（JSON 文本里的 `{"K":"V",...}`）→ 每行一条 `K=V`。
+// 只认顶层字符串对；嵌套对象（MCP 不支持）跳过。
+// 不拆：这是一段**线性 JSON 扫描器**（找键 → 跳过值 → 读一对字符串 → 反转义 → 落一行
+// `K=V`），状态全在这一个循环里（i/ke/j/k/m/q 六个游标互相咬合）。拆出来的子函数要
+// 传六个游标的当前值与回写位置，比现在更难读也更容易写错 —— AGENTS.md 对这类
+// 「一段线性协议解析」明确允许保留，故此处按该条款记一行说明。
+fn mcp_json_env(p: &const byte, n: usize, key: &const byte, out: &Buf) void {
+    buf_reset(out);
+    const kn: usize = bufx_cstr_len(key);
+    var i: usize = 0;
+    while i < n {
+        if p[i] != 34 as byte {
+            i = i + 1;
+            continue;
+        }
+        const ks: usize = i + 1;
+        var ke: usize = ks;
+        while ke < n && p[ke] != 34 as byte {
+            ke = ke + 1;
+        }
+        if ke >= n {
+            return;
+        }
+        // 命中名字**还不够**：后面必须紧跟 `:`（否则这一处是**值**不是键 ——
+        // 见 mcp_json_str 里那段说明）。值位置上的同名字符串跳过、继续往后找。
+        const hit: bool = (ke - ks) == kn && bufx_mem_eq(p + ks, key, kn);
+        var j: usize = mcp_skip_ws(p, n, ke + 1);
+        if !hit || j >= n || p[j] != 58 as byte {
+            i = ke + 1;
+            continue;
+        }
+        j = mcp_skip_ws(p, n, j + 1);
+        if j >= n || p[j] != 123 as byte {
+            return;   // 不是对象
+        }
+        j = j + 1;
+        while j < n {
+            j = mcp_skip_ws(p, n, j);
+            if j >= n || p[j] == 125 as byte {
+                return;
+            }
+            if p[j] == 44 as byte {
+                j = j + 1;
+                continue;
+            }
+            if p[j] != 34 as byte {
+                return;
+            }
+            // 键
+            var k: usize = j + 1;
+            var kv: Buf = buf_new(256);
+            defer { buf_free(&kv); }
+            var bslash: bool = false;
+            var closed: bool = false;
+            while k < n {
+                const c: byte = p[k];
+                if bslash {
+                    bslash = false;
+                    _ = buf_append_byte(&kv, c);
+                } else if c == 92 as byte {
+                    bslash = true;
+                } else if c == 34 as byte {
+                    closed = true;
+                    break;
+                } else {
+                    _ = buf_append_byte(&kv, c);
+                }
+                k = k + 1;
+            }
+            if !closed {
+                return;
+            }
+            var m: usize = mcp_skip_ws(p, n, k + 1);
+            if m >= n || p[m] != 58 as byte {
+                return;
+            }
+            m = mcp_skip_ws(p, n, m + 1);
+            if m >= n || p[m] != 34 as byte {
+                // 值不是字符串：跳过这一对（MCP 的 env 只允许字符串）
+                j = m;
+                continue;
+            }
+            _ = buf_append_byte(&kv, 61);   // '='
+            var q: usize = m + 1;
+            var qesc: bool = false;
+            var qclosed: bool = false;
+            while q < n {
+                const c: byte = p[q];
+                if qesc {
+                    qesc = false;
+                    _ = buf_append_byte(&kv, c);
+                } else if c == 92 as byte {
+                    qesc = true;
+                } else if c == 34 as byte {
+                    qclosed = true;
+                    break;
+                } else {
+                    _ = buf_append_byte(&kv, c);
+                }
+                q = q + 1;
+            }
+            if !qclosed {
+                return;
+            }
+            mcp_env_add(out, kv.ptr[0: kv.len]);
+            j = q + 1;
+        }
+        return;
+    }
+}
+
+// -------------------- 来源 2：mcp.json（生态通用 `mcpServers` 形状） --------------------
+//
+// 形状：`{"mcpServers":{"<name>":{"command":"…","args":[…],"env":{…},"cwd":"…"}}}`
+// 也容忍顶层直接是 `{"<name>":{...}}`（少了 `mcpServers` 一层的情况）。
+fn mcp_cfg_load_json_file(set: &McpSet, path_z: &const byte, source: u8) usize {
+    var text: Buf = buf_new(65536);
+    defer { buf_free(&text); }
+    if !buf_valid(&text) {
+        return 0;
+    }
+    if !mcp_read_file(path_z, 65536, &text) {
+        return 0;
+    }
+    const p: &const byte = text.ptr as &const byte;
+    const n: usize = text.len;
+    // 找到 `"mcpServers"` 的 '{'（找不到就用顶层 '{'）。
+    // ⚠ 搜的**必须带引号**（`"mcpServers"`，12 字节）：不带引号会在值位置上命中同名的
+    // 字符串，之后 `p[j] == ':'` 判不过 —— 而那些 `if` 是「找到了但形状不对」的分支，
+    // 于是整段被跳过、退化成「顶层 '{'」，`mcpServers` 这个名字反倒被当成一个 server 名
+    // 登记进去（现场症状：`--list-plugins` 里出现一个叫 `mcpServers` 的 server）。
+    var body: usize = 0;
+    var found: bool = false;
+    const key: &const byte = "\"mcpServers\"" as &const byte;
+    var i: usize = 0;
+    while i < n {
+        const at: isize = find_sub(text.ptr[0: n], key[0: 12], i);
+        if at < 0 {
+            break;
+        }
+        var j: usize = mcp_skip_ws(p, n, (at as usize) + 12);
+        if j < n && p[j] == 58 as byte {
+            j = mcp_skip_ws(p, n, j + 1);
+            if j < n && p[j] == 123 as byte {
+                body = j;
+                found = true;
+                break;
+            }
+        }
+        i = (at as usize) + 12;
+    }
+    if !found {
+        const top: usize = mcp_skip_ws(p, n, 0);
+        if top >= n || p[top] != 123 as byte {
+            return 0;
+        }
+        body = top;
+    }
+    return mcp_cfg_scan_servers(set, p, n, body, source);
+}
+
+// 从 `{` 开始逐项扫 `"<name>":{...}`。每项在**自己的切片**里解析（键集合是开放的，
+// 逐个切比一层层递归好查，也不会让一段坏配置毁掉整份文件）。
+// 行宽豁免：错误文案/诊断行是**单条不可断的字面量**（Uya 没有相邻字面量拼接）
+fn mcp_cfg_scan_servers(set: &McpSet, p: &const byte, n: usize, brace: usize, source: u8) usize {
+    var added: usize = 0;
+    var i: usize = brace + 1;
+    var depth: i32 = 0;
+    while i < n {
+        // 只在 depth==0 处取名字键
+        if depth == 0 && p[i] == 34 as byte {
+            const ks: usize = i + 1;
+            var ke: usize = ks;
+            var esc: bool = false;
+            while ke < n {
+                const c: byte = p[ke];
+                if esc {
+                    esc = false;
+                } else if c == 92 as byte {
+                    esc = true;
+                } else if c == 34 as byte {
+                    break;
+                }
+                ke = ke + 1;
+            }
+            if ke >= n {
+                break;
+            }
+            var j: usize = mcp_skip_ws(p, n, ke + 1);
+            if j < n && p[j] == 58 as byte {
+                j = mcp_skip_ws(p, n, j + 1);
+                if j < n && p[j] == 123 as byte {
+                    // 找到这一项的对象体 [j, end]
+                    const end: usize = mcp_json_obj_end(p, n, j);
+                    if end > j {
+                        if mcp_cfg_one(set, p + ks, ke - ks, p, n, j, end, source) {
+                            added = added + 1;
+                        }
+                        i = end + 1;
+                        continue;
+                    }
+                }
+            }
+            i = ke + 1;
+            continue;
+        }
+        if p[i] == 123 as byte || p[i] == 91 as byte {
+            depth = depth + 1;
+        } else if p[i] == 125 as byte || p[i] == 93 as byte {
+            if depth == 0 {
+                break;
+            }
+            depth = depth - 1;
+        }
+        i = i + 1;
+    }
+    return added;
+}
+
+// 从 `{`（下标 s）找配对的 `}`；失败返回 s（调用方判 `end > j`）
+fn mcp_json_obj_end(p: &const byte, n: usize, s: usize) usize {
+    var depth: i32 = 0;
+    var i: usize = s;
+    var instr: bool = false;
+    var esc: bool = false;
+    while i < n {
+        const c: byte = p[i];
+        if instr {
+            if esc {
+                esc = false;
+            } else if c == 92 as byte {
+                esc = true;
+            } else if c == 34 as byte {
+                instr = false;
+            }
+        } else if c == 34 as byte {
+            instr = true;
+        } else if c == 123 as byte {
+            depth = depth + 1;
+        } else if c == 125 as byte {
+            depth = depth - 1;
+            if depth == 0 {
+                return i;
+            }
+        }
+        i = i + 1;
+    }
+    return s;
+}
+
+// 解析 `mcpServers` 里的一项：name + 它自己的 JSON 片段 [body, end]
+fn mcp_cfg_one(set: &McpSet, name: &const byte, name_len: usize, p: &const byte, n: usize, body: usize, end: usize, source: u8) bool {
+    if !mcp_server_name_ok(name, name_len) {
+        return false;
+    }
+    // 把这一项的片段拷出来（`mcp_json_*` 收的是 [p, n) 这对参数；直接用原缓冲 + 偏移不好传）
+    var frag: Buf = buf_new(end - body + 1);
+    defer { buf_free(&frag); }
+    if !buf_valid(&frag) {
+        return false;
+    }
+    _ = buf_append(&frag, p + body, end - body + 1);
+    var srv: McpServer = mcp_srv_empty();
+    defer { mcp_server_free(&srv); }
+    srv.name = buf_new(name_len + 8);
+    srv.command = buf_new(256);
+    srv.args = buf_new(512);
+    srv.env = buf_new(512);
+    srv.cwd = buf_new(256);
+    if !buf_valid(&srv.name) || !buf_valid(&srv.command) || !buf_valid(&srv.args)
+        || !buf_valid(&srv.env) || !buf_valid(&srv.cwd) {
+        return false;
+    }
+    _ = buf_append(&srv.name, name, name_len);
+    const fp: &const byte = frag.ptr as &const byte;
+    const fn2: usize = frag.len;
+    _ = mcp_json_str(fp, fn2, "command" as &const byte, &srv.command);
+    if srv.command.len == 0 {
+        // 没有 command 的条目（`url` 形式的 HTTP server）也登记 —— 让 `--list-plugins`
+        // 能如实报「配了但不支持」，而不是静默消失
+        _ = mcp_json_str(fp, fn2, "url" as &const byte, &srv.url);
+        if srv.url.len == 0 {
+            return false;
+        }
+    }
+    _ = mcp_json_args(fp, fn2, "args" as &const byte, &srv.args);
+    mcp_json_env(fp, fn2, "env" as &const byte, &srv.env);
+    _ = mcp_json_str(fp, fn2, "cwd" as &const byte, &srv.cwd);
+    const t: i64 = mcp_json_i64(fp, fn2, "toolCallTimeoutMs" as &const byte, MCP_TIMEOUT_DEFAULT as i64);
+    srv.timeout_ms = if t > 0 && t < 3600000 { t as u32 } else { MCP_TIMEOUT_DEFAULT };
+    srv.transport = if srv.url.len > 0 { MCP_TR_HTTP } else { MCP_TR_STDIO };
+    srv.source = source;
+    return mcp_set_push(set, &srv);
+}
+
+// -------------------- 来源 3：cordis.yml 的 `@deepseek-ai/dsh-mcp-client` 行
+// --------------------
+//
+// DSH 把 MCP server 写成 cordis 行：
+//   - id: fs
+//     name: '@deepseek-ai/dsh-mcp-client'
+//     config:
+//       transport: stdio
+//       serverName: fs
+//       command: npx
+//       args: [...]
+// 本仓把 `config` **原样**映射成一条 server（字段同名，见文件头的不变量①）。
+// 顺带把跑不了的进程内插件行登记进 `unsupported`（那条信息只给 `--list-plugins`）。
+fn mcp_cfg_cordis_row(t: &const YTree, row: i32, set: &McpSet) bool {
+    const name: &[byte] = yt_get_str(t, row, "name");
+    if name.len == 0 {
+        return false;
+    }
+    const cfg: i32 = yt_get(t, row, "config");
+    if !bufx_eq_cstr(name.ptr as &const byte, name.len, "@deepseek-ai/dsh-mcp-client" as &const byte) {
+        // `@deepseek-ai/dsh-*` 别的行 = 进程内 cordis 插件（Node 进程内 TS 模块）。
+        // 读了也跑不了 —— 如实登记，不让用户以为「配了就会生效」。
+        // 前缀 17 字节（`@deepseek-ai/dsh-`）—— 写 18 会让这条判据**永远为假**，
+        // 于是进程内插件一行都不登记（自测 mcp-cfg 腿钉这条）。
+        if name.len > 17 && bufx_mem_eq(name.ptr, "@deepseek-ai/dsh-" as &const byte, 17)
+            && cfg >= 0 {
+            mcp_unsupported_add(set, name);
+        }
+        return false;
+    }
+    if cfg < 0 {
+        return false;
+    }
+    var srv: McpServer = mcp_srv_empty();
+    defer { mcp_server_free(&srv); }
+    srv.name = buf_new(MCP_STR_MAX);
+    srv.command = buf_new(512);
+    srv.args = buf_new(1024);
+    srv.env = buf_new(512);
+    srv.cwd = buf_new(512);
+    srv.url = buf_new(512);
+    if !buf_valid(&srv.name) || !buf_valid(&srv.command) || !buf_valid(&srv.args)
+        || !buf_valid(&srv.env) || !buf_valid(&srv.cwd) || !buf_valid(&srv.url) {
+        return false;
+    }
+    const sn: &[byte] = yt_get_str(t, cfg, "serverName");
+    if sn.len == 0 {
+        return false;
+    }
+    _ = buf_append(&srv.name, sn.ptr, sn.len);
+    const tr: &[byte] = yt_get_str(t, cfg, "transport");
+    if tr.len > 0 {
+        const tk: i32 = mcp_transport_from_name(tr);
+        if tk < 0 {
+            return false;   // 不认识的传输：整条丢掉（不猜）
+        }
+        srv.transport = tk as u8;
+    }
+    pt_append_str(&srv.command, yt_get_str(t, cfg, "command"));
+    pt_append_str(&srv.url, yt_get_str(t, cfg, "url"));
+    pt_append_str(&srv.cwd, yt_get_str(t, cfg, "cwd"));
+    // args：序列，每项一行
+    const an: i32 = yt_get(t, cfg, "args");
+    if an >= 0 && yt_kind(t, an) == YK_SEQ {
+        const cnt: usize = yt_len(t, an);
+        var k: usize = 0;
+        while k < cnt {
+            const it: i32 = yt_at(t, an, k);
+            const sv: &[byte] = yt_str(t, it);
+            if sv.len > 0 {
+                if srv.args.len > 0 {
+                    _ = buf_append_byte(&srv.args, 10);
+                }
+                _ = buf_append(&srv.args, sv.ptr, sv.len);
+            }
+            k = k + 1;
+        }
+    }
+    // env：映射（每行 `K=V`）
+    const en: i32 = yt_get(t, cfg, "env");
+    if en >= 0 && yt_kind(t, en) == YK_MAP {
+        var child: i32 = yt_child(t, en);
+        while child >= 0 {
+            const key: &[byte] = yt_key(t, child);
+            const val: &[byte] = yt_str(t, child);
+            var kv: Buf = buf_new(512);
+            defer { buf_free(&kv); }
+            if key.len > 0 && buf_valid(&kv) {
+                _ = buf_append(&kv, key.ptr, key.len);
+                _ = buf_append_byte(&kv, 61);
+                _ = buf_append(&kv, val.ptr, val.len);
+                mcp_env_add(&srv.env, kv.ptr[0: kv.len]);
+            }
+            child = yt_next(t, child);
+        }
+    }
+    const tms: i64 = yt_get_i64(t, cfg, "toolCallTimeoutMs", MCP_TIMEOUT_DEFAULT as i64);
+    srv.timeout_ms = if tms > 0 && tms < 3600000 { tms as u32 } else { MCP_TIMEOUT_DEFAULT };
+    if srv.transport == MCP_TR_HTTP && srv.url.len == 0 {
+        return false;
+    }
+    if srv.transport == MCP_TR_STDIO && srv.command.len == 0 {
+        return false;
+    }
+    srv.source = 3;
+    return mcp_set_push(set, &srv);
+}
+
+// 把一段 YAML 标量追加进 out（空值不追加）
+fn pt_append_str(dst: &Buf, src: &[byte]) void {
+    if src.len > 0 {
+        _ = buf_append(dst, src.ptr, src.len);
+    }
+}
+
+// 扫一份 cordis.yml（顶层序列；`config` 是列表时递归，与 prompt.uya 同款口径）
+fn mcp_cfg_load_cordis_file(set: &McpSet, path_z: &const byte) usize {
+    var tree: YTree = YTree{ nodes: [], n: 0, lines: [], nlines: 0, raw: buf_empty(), cur: 0, err_line: 0 };
+    yt_init(&tree);
+    defer { yt_free(&tree); }
+    if !yt_load_file(path_z, &tree) {
+        return 0;
+    }
+    const root: i32 = yt_root(&tree);
+    if root < 0 {
+        return 0;
+    }
+    const before: usize = set.n;
+    mcp_cfg_cordis_rows(&tree, root, set);
+    return set.n - before;
+}
+
+// 顶层序列逐行；每行的 `config` 若是序列则递归进去（group 型插件行）
+fn mcp_cfg_cordis_rows(t: &const YTree, node: i32, set: &McpSet) void {
+    if node < 0 || yt_kind(t, node) != YK_SEQ {
+        return;
+    }
+    const cnt: usize = yt_len(t, node);
+    var i: usize = 0;
+    while i < cnt {
+        const row: i32 = yt_at(t, node, i);
+        if row >= 0 {
+            _ = mcp_cfg_cordis_row(t, row, set);
+            const cfg: i32 = yt_get(t, row, "config");
+            if cfg >= 0 && yt_kind(t, cfg) == YK_SEQ {
+                mcp_cfg_cordis_rows(t, cfg, set);
+            }
+        }
+        i = i + 1;
+    }
+}
+
+// -------------------- 来源 1：settings.yaml 的 `uya-agent.mcp`
+// --------------------
+//
+// 形状（字段与上面完全同名，同一份配置 DSH 与本仓都能读）：
+//   uya-agent:
+//     mcp:
+//       fs:
+//         transport: stdio
+//         command: npx
+//         args: [...]
+fn mcp_cfg_load_settings(set: &McpSet, path_z: &const byte) usize {
+    var tree: YTree = YTree{ nodes: [], n: 0, lines: [], nlines: 0, raw: buf_empty(), cur: 0, err_line: 0 };
+    yt_init(&tree);
+    defer { yt_free(&tree); }
+    if !yt_load_file(path_z, &tree) {
+        return 0;
+    }
+    const root: i32 = yt_root(&tree);
+    if root < 0 {
+        return 0;
+    }
+    const ua: i32 = yt_get(&tree, root, "uya-agent");
+    if ua < 0 {
+        return 0;
+    }
+    const mcp: i32 = yt_get(&tree, ua, "mcp");
+    if mcp < 0 || yt_kind(&tree, mcp) != YK_MAP {
+        return 0;
+    }
+    const before: usize = set.n;
+    var child: i32 = yt_child(&tree, mcp);
+    while child >= 0 {
+        const sname: &[byte] = yt_key(&tree, child);
+        if sname.len > 0 && yt_kind(&tree, child) == YK_MAP {
+            mcp_cfg_settings_one(&tree, child, sname, set);
+        }
+        child = yt_next(&tree, child);
+    }
+    return set.n - before;
+}
+
+// -------------------- 来源 0：CLI `--mcp-server name=command [args…]`
+// --------------------
+//
+// 形状：`fs=npx -y @modelcontextprotocol/server-filesystem .`（每行一条，可多次）。
+// 为什么用 `name=` 而不是「两条参数」：serverName 是**模型侧工具名的组成部分**
+// （`mcp__<server>__<tool>`），必须能由用户显式指定；把它和命令揉在一个参数里，
+// 参数边界就靠第一个空格 —— 与 `--skill-dir` 那种纯路径参数不同，这里必须能表达
+// 「命令带参数」，所以用一个 `=` 把名字切出来。
+//
+// 解析失败**整条丢掉并记一行诊断**（不猜）：宁可让 `--list-plugins` 报「这条我没看懂」，
+// 也不要把半个命令当成可执行文件去 execve（那会以一个看不懂的退出码失败）。
+export fn mcp_cfg_load_cli(set: &McpSet, cli: &const Buf) usize {
+    if cli.len == 0 {
+        return 0;
+    }
+    if !buf_valid(&set.unsupported) {
+        set.unsupported = buf_new(1024);
+    }
+    var added: usize = 0;
+    var i: usize = 0;
+    var start: usize = 0;
+    while i <= cli.len {
+        if i == cli.len || cli.ptr[i] == 10 as byte {
+            if i > start {
+                if mcp_cfg_cli_one(set, cli.ptr + start, i - start) {
+                    added = added + 1;
+                } else {
+                    mcp_unsupported_add(set, cli.ptr[start: i - start]);
+                }
+            }
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    return added;
+}
+
+// 一条 CLI 配置：`name=command [args…]`
+fn mcp_cfg_cli_one(set: &McpSet, line: &const byte, n: usize) bool {
+    // 找 `=`（名字里不许有 `=` —— serverName 的允许字符集里就没有它）
+    var eq: isize = -1;
+    var i: usize = 0;
+    while i < n {
+        const c: byte = line[i];
+        if c == 61 as byte {
+            eq = i as isize;
+            break;
+        }
+        // 名字段只允许 name 字符集；一旦出现空格/斜杠就说明这条不是 `name=` 形状
+        if c == 32 as byte || c == 9 as byte {
+            return false;
+        }
+        i = i + 1;
+    }
+    if eq <= 0 {
+        return false;
+    }
+    const sn: usize = eq as usize;
+    if !mcp_server_name_ok(line, sn) {
+        return false;
+    }
+    var j: usize = sn + 1;
+    while j < n && (line[j] == 32 as byte || line[j] == 9 as byte) {
+        j = j + 1;
+    }
+    if j >= n {
+        return false;   // 只有名字没有命令
+    }
+    var srv: McpServer = mcp_srv_empty();
+    defer { mcp_server_free(&srv); }
+    srv.name = buf_new(sn + 8);
+    srv.command = buf_new(256);
+    srv.args = buf_new(512);
+    srv.env = buf_new(64);
+    srv.cwd = buf_new(64);
+    srv.url = buf_new(64);
+    if !buf_valid(&srv.name) || !buf_valid(&srv.command) || !buf_valid(&srv.args)
+        || !buf_valid(&srv.env) || !buf_valid(&srv.cwd) || !buf_valid(&srv.url) {
+        return false;
+    }
+    _ = buf_append(&srv.name, line, sn);
+    // 命令 = 空白分隔的第一个 token；其余按**原样**（含引号？不 —— shell 已经处理过一层，
+    // 这里只按空白切，不给引号第二种解释：多一种解释就多一处「本地能跑、CI 不能跑」）
+    var k: usize = j;
+    while k < n && line[k] != 32 as byte && line[k] != 9 as byte {
+        k = k + 1;
+    }
+    _ = buf_append(&srv.command, line + j, k - j);
+    // 其余 token 依次成 args；`K=V` 形状的 token 归到 env（MCP server 常要 env 传凭据，
+    // 没有它就只能靠配置文件）。判据：token 里有 `=` 且 `=` 前面是合法的环境变量名
+    // （`[A-Za-z_][A-Za-z0-9_]*`）—— 命令行参数里带 `=` 的很常见（`--opt=value`），
+    // 所以必须用「名字合法性」把它们区分开，不能凡有 `=` 就当 env。
+    while k < n {
+        while k < n && (line[k] == 32 as byte || line[k] == 9 as byte) {
+            k = k + 1;
+        }
+        if k >= n {
+            break;
+        }
+        const as0: usize = k;
+        while k < n && line[k] != 32 as byte && line[k] != 9 as byte {
+            k = k + 1;
+        }
+        if mcp_cfg_env_token(line + as0, k - as0) {
+            mcp_env_add(&srv.env, line[as0: k]);
+        } else {
+            if srv.args.len > 0 {
+                _ = buf_append_byte(&srv.args, 10);
+            }
+            _ = buf_append(&srv.args, line + as0, k - as0);
+        }
+    }
+    srv.transport = MCP_TR_STDIO;
+    srv.timeout_ms = MCP_TIMEOUT_DEFAULT;
+    srv.source = 0;
+    return mcp_set_push(set, &srv);
+}
+
+// 一个 CLI token 是不是 `K=V` 环境变量（`K` 必须合法）。
+// `--opt=value` / `-x=1` 这类参数名以 `-` 开头，判不过 —— 它们照旧进 args。
+fn mcp_cfg_env_token(t: &const byte, n: usize) bool {
+    if n < 3 {
+        return false;   // 至少 `A=1`
+    }
+    if t[0] == 45 as byte {
+        return false;   // 选项（`--opt=value` 不是环境变量）
+    }
+    var i: usize = 0;
+    var eq: isize = -1;
+    while i < n {
+        const c: byte = t[i];
+        if c == 61 as byte {
+            eq = i as isize;
+            break;
+        }
+        // 行宽豁免：错误文案/诊断行是**单条不可断的字面量**（Uya 没有相邻字面量拼接）
+        const alpha: bool = (c >= 65 as byte && c <= 90 as byte) || (c >= 97 as byte && c <= 122 as byte);
+        const digit: bool = c >= 48 as byte && c <= 57 as byte;
+        if i == 0 && !alpha && c != 95 as byte {
+            return false;
+        }
+        if i > 0 && !alpha && !digit && c != 95 as byte {
+            return false;
+        }
+        i = i + 1;
+    }
+    return eq > 0;
+}
+
+// -------------------- 发现入口 --------------------
+//
+// 四个来源按优先级高→低依次装载（**靠前的先胜**：`mcp_set_push` 同名不覆盖）。
+// 任何一个来源读不到 / 解析失败都**不是致命错误** —— 离线要能跑（与 dshcfg 同一条口径）。
+//
+// `root` 是 <projectRoot>（`instr_project_root` 算出来的那个）；空 = 没有项目根。
+// `dsh_home` 是 $DSH_HOME；空 = 不读 DSH 设置。
+export fn mcp_cfg_collect(set: &McpSet, root: &[byte], dsh_home: &[byte]) void {
+    if !buf_valid(&set.unsupported) {
+        set.unsupported = buf_new(1024);
+    }
+    // 1) $DSH_HOME/settings.yaml 的 uya-agent.mcp
+    if dsh_home.len > 0 {
+        var p: Buf = buf_new(MCP_STR_MAX);
+        defer { buf_free(&p); }
+        if buf_valid(&p) {
+            _ = buf_append(&p, dsh_home.ptr, dsh_home.len);
+            _ = buf_append_cstr(&p, "/settings.yaml");
+            _ = buf_append_byte(&p, 0);
+            _ = mcp_cfg_load_settings(set, p.ptr as &const byte);
+        }
+    }
+    // 2) <projectRoot>/.dsh/mcp.json（生态通用形状）
+    if root.len > 0 {
+        var p: Buf = buf_new(MCP_STR_MAX);
+        defer { buf_free(&p); }
+        if buf_valid(&p) {
+            _ = buf_append(&p, root.ptr, root.len);
+            _ = buf_append_cstr(&p, "/.dsh/mcp.json");
+            _ = buf_append_byte(&p, 0);
+            _ = mcp_cfg_load_json_file(set, p.ptr as &const byte, 2);
+        }
+    }
+    // 3) <projectRoot>/.dsh/cordis.yml 与 $DSH_HOME/profiles/*/cordis.yml 里的
+    // MCP 行。
+    //    只读「显式给到的这一份」与 DSH profile 的补丁层 —— 不去遍历整个 profiles 目录：
+    //    不知道用户当前用哪个 profile，猜错会加载他没在用的 server（那是隐形副作用）。
+    if root.len > 0 {
+        var p: Buf = buf_new(MCP_STR_MAX);
+        defer { buf_free(&p); }
+        if buf_valid(&p) {
+            _ = buf_append(&p, root.ptr, root.len);
+            _ = buf_append_cstr(&p, "/.dsh/cordis.yml");
+            _ = buf_append_byte(&p, 0);
+            _ = mcp_cfg_load_cordis_file(set, p.ptr as &const byte);
+        }
+    }
+    set.loaded = true;
+}
+
+// settings.yaml 里的一条 server（`name` 是映射的键）
+fn mcp_cfg_settings_one(t: &const YTree, node: i32, name: &[byte], set: &McpSet) bool {
+    if !mcp_server_name_ok(name.ptr as &const byte, name.len) {
+        return false;
+    }
+    var srv: McpServer = mcp_srv_empty();
+    defer { mcp_server_free(&srv); }
+    srv.name = buf_new(name.len + 8);
+    srv.command = buf_new(512);
+    srv.args = buf_new(1024);
+    srv.env = buf_new(512);
+    srv.cwd = buf_new(512);
+    srv.url = buf_new(512);
+    if !buf_valid(&srv.name) || !buf_valid(&srv.command) || !buf_valid(&srv.args)
+        || !buf_valid(&srv.env) || !buf_valid(&srv.cwd) || !buf_valid(&srv.url) {
+        return false;
+    }
+    _ = buf_append(&srv.name, name.ptr, name.len);
+    const tr: &[byte] = yt_get_str(t, node, "transport");
+    if tr.len > 0 {
+        const tk: i32 = mcp_transport_from_name(tr);
+        if tk < 0 {
+            return false;
+        }
+        srv.transport = tk as u8;
+    }
+    pt_append_str(&srv.command, yt_get_str(t, node, "command"));
+    pt_append_str(&srv.url, yt_get_str(t, node, "url"));
+    pt_append_str(&srv.cwd, yt_get_str(t, node, "cwd"));
+    const an: i32 = yt_get(t, node, "args");
+    if an >= 0 && yt_kind(t, an) == YK_SEQ {
+        const cnt: usize = yt_len(t, an);
+        var k: usize = 0;
+        while k < cnt {
+            const sv: &[byte] = yt_str(t, yt_at(t, an, k));
+            if sv.len > 0 {
+                if srv.args.len > 0 {
+                    _ = buf_append_byte(&srv.args, 10);
+                }
+                _ = buf_append(&srv.args, sv.ptr, sv.len);
+            }
+            k = k + 1;
+        }
+    }
+    const en: i32 = yt_get(t, node, "env");
+    if en >= 0 && yt_kind(t, en) == YK_MAP {
+        var child: i32 = yt_child(t, en);
+        while child >= 0 {
+            const key: &[byte] = yt_key(t, child);
+            const val: &[byte] = yt_str(t, child);
+            var kv: Buf = buf_new(512);
+            defer { buf_free(&kv); }
+            if key.len > 0 && buf_valid(&kv) {
+                _ = buf_append(&kv, key.ptr, key.len);
+                _ = buf_append_byte(&kv, 61);
+                _ = buf_append(&kv, val.ptr, val.len);
+                mcp_env_add(&srv.env, kv.ptr[0: kv.len]);
+            }
+            child = yt_next(t, child);
+        }
+    }
+    const tms: i64 = yt_get_i64(t, node, "toolCallTimeoutMs", MCP_TIMEOUT_DEFAULT as i64);
+    srv.timeout_ms = if tms > 0 && tms < 3600000 { tms as u32 } else { MCP_TIMEOUT_DEFAULT };
+    if srv.transport == MCP_TR_HTTP && srv.url.len == 0 {
+        return false;
+    }
+    if srv.transport == MCP_TR_STDIO && srv.command.len == 0 {
+        return false;
+    }
+    srv.source = 1;
+    return mcp_set_push(set, &srv);
+}

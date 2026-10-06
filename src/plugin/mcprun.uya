@@ -1,0 +1,705 @@
+// src/plugin/mcprun.uya — MCP server 的 stdio 会话（P70）
+//
+// 本文件：一个 MCP server 子进程的拉起与一问一答 —— 进程级状态（`g_mcp_live`）、
+//   启动（`mcprun_start`）、收口（`mcprun_stop`/`mcprun_stop_all`）、
+//   写一行 JSON（`mcprun_send`）、读一行 JSON 并**按 id 配对**（`mcprun_recv`），
+//   以及 `\n` 分帧的读行缓冲（`mcprun_read_line`）。
+// 不变量：① **stdio 就是协议通道** —— 与 bash 工具相反，这里 stdin/stdout **都要接管成管道**；
+//   只有 stderr 单独一根管（转诊断，**绝不混进 JSON 流**，否则一个 warning 就能让协议错位）。
+//   所以这里**不调** `sh_child_detach_stdio`（它会把 stdin 接到 /dev/null）。
+//   ② 子进程必须先 `sigx_reset_for_child()`：信号处置是继承的，否则它收到 TERM
+//   会去写父进程的终端（与 shellx / sandboxx 同一条纪律）。
+//   ③ 每条请求带唯一 id，**回合内按 id 配到那一条响应**；id 不匹配的行（通知 / 迟到响应）
+//   一律跳过 —— 规范允许 server 随时发通知。④ **不并发**：一问一答，谁也不用锁。
+//   ⑤ 读到的行超过 `MCP_LINE_MAX` 就丢弃**整行**（不是截断后当 JSON 解析 ——
+//   半个 JSON 解析失败的报错会把真正的原因盖掉）。
+// 行宽豁免：错误文案/诊断行是**单条不可断的字面量**（Uya 没有相邻字面量拼接）
+// 依赖：libc.syscall/unistd/fcntl/signal（fork/execve/pipe/poll/read/write/waitpid/kill）；
+//   本仓 foundation/bufx（Buf）、session/sigx（`sigx_reset_for_child`）、
+//   tools/shellx（`sh_kill_tree`
+// 按进程组收口）、agent/ag_plan_pump（`agent_pump_block` 泵点）。
+// 命名：对外 `mcprun_*` + `MCP_*` 常量；类型 `McpProc`；私有同样 `mcprun_` 前缀。
+//
+// 泵点：读等响应的每一圈都调 `agent_pump_block()` —— 用户的 esc / ctrl+c 必须能当场
+// 杀掉卡住的 server（与 bash 工具同一条纪律，见 §16 踩坑 44）。
+//
+// 退出与孤儿：`mcprun_stop` 走 `sh_kill_tree`（进程组收口）+ `waitpid` 收尸；
+// 进程退出前 agent.uya 会调 `mcprun_stop_all`。**不留孤儿**是自测的判据之一。
+
+use libc.syscall;
+use libc.unistd;
+use libc.fcntl;
+use libc.signal;
+
+export const MCP_MAX_PROCS: usize = 16;
+// 一行 JSON 的上限：MCP 的 tools/list 结果可能不小（每个工具带一份 inputSchema），
+// 1 MiB 对「几十个工具」是宽裕的；超了就整行丢（不变量⑤）。
+export const MCP_LINE_MAX: usize = 1048576;
+// 子进程 stderr 的留存上限（只留尾部，诊断够用；它不进协议流）
+const MCP_ERR_KEEP: usize = 4096;
+const MCP_POLL_MS: i32 = 50;
+// 收尾时给 server 自己退出的窗口（SIGTERM 之后）；超了就 SIGKILL
+const MCP_STOP_WAIT_MS: u64 = 300;
+// execve 的 argv 表容量（与 mcpcfg 的 MCP_ARGS_MAX 同量级；多留几格给 argv0 与空尾）
+const MCP_ARGS_MAX_Z: usize = 24;
+
+// 一个已拉起的 server 子进程
+export struct McpProc {
+    used: bool,
+    pid: i32,
+    to_fd: i32,          // 父 → 子（子进程的 stdin）
+    from_fd: i32,        // 子 → 父（子进程的 stdout）
+    err_fd: i32,         // 子进程的 stderr（非阻塞，只用来补诊断）
+    name: Buf,           // serverName（诊断用）
+    // 读行缓冲：`\n` 分帧的残余（一次 read 可能读到多行、或读到半行）
+    buf: Buf,
+    scan: usize,         // buf 里已经扫过的偏移（找过 `\n` 的位置）
+    id_seq: i64,         // 已发出的最大请求 id
+    err_tail: Buf,       // stderr 尾部（诊断行）
+    exited: bool,        // 子进程已收尸
+    code: i32,           // 退出码（exited 后有效）
+}
+
+var g_mcp_live: [McpProc: MCP_MAX_PROCS] = [McpProc{
+    used: false,
+    pid: 0,
+    to_fd: -1,
+    from_fd: -1,
+    err_fd: -1,
+    name: Buf{ ptr: null, len: 0, cap: 0 },
+    buf: Buf{ ptr: null, len: 0, cap: 0 },
+    scan: 0,
+    id_seq: 0,
+    err_tail: Buf{ ptr: null, len: 0, cap: 0 },
+    exited: false,
+    code: 0,
+}: MCP_MAX_PROCS];
+
+// 取第 i 个进程槽（越界返回 0 号 —— 调用方都先用 mcprun_slot 判过下标）
+fn mcprun_at(i: usize) &McpProc {
+    if i >= MCP_MAX_PROCS {
+        return &g_mcp_live[0];
+    }
+    return &g_mcp_live[i];
+}
+
+// 按 serverName 找活着的会话；没有返回 **-1**
+export fn mcprun_find(name: &const byte, n: usize) isize {
+    var i: usize = 0;
+    while i < MCP_MAX_PROCS {
+        const it: &McpProc = &g_mcp_live[i];
+        if it.used && it.name.len == n && bufx_mem_eq(it.name.ptr as &const byte, name, n) {
+            return i as isize;
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+// 按 pid 找会话（收尸时用）；没有返回 -1
+fn mcprun_by_pid(pid: i32) isize {
+    var i: usize = 0;
+    while i < MCP_MAX_PROCS {
+        if g_mcp_live[i].used && g_mcp_live[i].pid == pid {
+            return i as isize;
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+// 找一个空槽；没有返回 **-1**
+fn mcprun_free_slot() isize {
+    var i: usize = 0;
+    while i < MCP_MAX_PROCS {
+        if !g_mcp_live[i].used {
+            return i as isize;
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+// 把 argv/env 里的换行分隔串拆成指针数组。
+// `store` 是落点（调用方持有，fork 之后才能释放）；返回项数。
+// 为什么不用 `sh_env_array`：那套是「一次组装、所有子进程共用」的 bash 口径，
+// MCP 每个 server 的 env 都不同（`Config.env` 覆盖），所以自己拼一份。
+fn mcprun_split_lines(src: &const Buf, store: &Buf, ptrs: &(&const byte), cap: usize) usize {
+    var cnt: usize = 0;
+    if src.len == 0 {
+        ptrs[cnt] = null as &const byte;
+        return 0;
+    }
+    var i: usize = 0;
+    var start: usize = 0;
+    while i <= src.len {
+        if i == src.len || src.ptr[i] == 10 as byte {
+            if i > start && cnt + 1 < cap {
+                const at: usize = store.len;
+                _ = buf_append(store, src.ptr + start, i - start);
+                _ = buf_append_byte(store, 0);
+                ptrs[cnt] = &store.ptr[at] as &const byte;
+                cnt = cnt + 1;
+            }
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    ptrs[cnt] = null as &const byte;
+    return cnt;
+}
+
+// 组一份给子进程的 envp。
+//
+// 口径对齐 MCP SDK 1.30.0 的 `getDefaultEnvironment()`：
+//   `HOME LOGNAME PATH SHELL TERM USER` 这几个**继承**（`command: "npx"` 这类要能跑，
+//   所以 PATH 必须有），再叠加 `Config.env` 的显式覆盖。
+// 为什么不像 bash 工具那样整套 envp 透传：MCP server 是**第三方进程**，
+// 不需要看我们的 DSH_* 与凭据类变量；少给一份就少一处泄漏面。
+fn mcprun_build_env(extra: &const Buf, store: &Buf, ptrs: &(&const byte), cap: usize) usize {
+    const inherit: [&const byte: 6] = [
+        "HOME" as &const byte,
+        "LOGNAME" as &const byte,
+        "PATH" as &const byte,
+        "SHELL" as &const byte,
+        "TERM" as &const byte,
+        "USER" as &const byte,
+    ];
+    var cnt: usize = 0;
+    var i: usize = 0;
+    while i < 6 && cnt + 1 < cap {
+        const v: &byte = getenv(inherit[i]);
+        if (v as usize) != 0 {
+            const at: usize = store.len;
+            _ = buf_append_cstr(store, inherit[i]);
+            _ = buf_append_byte(store, 61);   // '='
+            _ = buf_append_cstr(store, v);
+            _ = buf_append_byte(store, 0);
+            ptrs[cnt] = &store.ptr[at] as &const byte;
+            cnt = cnt + 1;
+        }
+        i = i + 1;
+    }
+    // 显式覆盖：同名**后者胜**（规范语义）—— 先整段追加，重名由 execve 取最后一条
+    if extra.len > 0 {
+        var j: usize = 0;
+        var start: usize = 0;
+        while j <= extra.len && cnt + 1 < cap {
+            if j == extra.len || extra.ptr[j] == 10 as byte {
+                if j > start {
+                    const at: usize = store.len;
+                    _ = buf_append(store, extra.ptr + start, j - start);
+                    _ = buf_append_byte(store, 0);
+                    ptrs[cnt] = &store.ptr[at] as &const byte;
+                    cnt = cnt + 1;
+                }
+                start = j + 1;
+            }
+            j = j + 1;
+        }
+    }
+    ptrs[cnt] = null as &const byte;
+    return cnt;
+}
+
+// 开三根管道（in / out / err）。任一条失败就关掉**已开好的**并返回 false。
+fn mcprun_make_pipes(pin: &i32, pout: &i32, perr: &i32, err: &Buf) bool {
+    if (sys_pipe2(pin, 0) catch { -1; }) != 0 {
+        _ = buf_append_cstr(err, "pipe() failed");
+        return false;
+    }
+    if (sys_pipe2(pout, 0) catch { -1; }) != 0 {
+        _ = sys_close(pin[0]) catch {};
+        _ = sys_close(pin[1]) catch {};
+        _ = buf_append_cstr(err, "pipe() failed");
+        return false;
+    }
+    if (sys_pipe2(perr, 0) catch { -1; }) != 0 {
+        _ = sys_close(pin[0]) catch {};
+        _ = sys_close(pin[1]) catch {};
+        _ = sys_close(pout[0]) catch {};
+        _ = sys_close(pout[1]) catch {};
+        _ = buf_append_cstr(err, "pipe() failed");
+        return false;
+    }
+    return true;
+}
+
+// 把 argv / env 摊成 execve 要的两张指针表（`argv0_z` 是 argv[0]，已经 NUL 结尾）。
+// 两块 `store` 是**落点**：指针指向它们内部，所以它们必须活到 execve 之后
+// （调用方在 fork 之前准备好、fork 之后才 free —— 见 mcprun_start 的 defer）。
+fn mcprun_build_argv(argv0_z: &const byte, argv: &const Buf, extra_env: &const Buf,
+    a_store: &Buf, a_ptrs: &(&const byte), e_store: &Buf,
+    e_ptrs: &(&const byte)) void {
+    if buf_valid(a_store) {
+        a_ptrs[0] = argv0_z;
+        var an: usize = 1;
+        var rest: [&const byte: MCP_ARGS_MAX_Z] = [null as &const byte: MCP_ARGS_MAX_Z];
+        const rn: usize = mcprun_split_lines(argv, a_store, &rest[0], MCP_ARGS_MAX_Z);
+        var i: usize = 0;
+        while i < rn && an + 1 < MCP_ARGS_MAX_Z {
+            a_ptrs[an] = rest[i];
+            an = an + 1;
+            i = i + 1;
+        }
+        a_ptrs[an] = null as &const byte;
+    } else {
+        a_ptrs[0] = argv0_z;
+        a_ptrs[1] = null as &const byte;
+    }
+    if buf_valid(e_store) {
+        _ = mcprun_build_env(extra_env, e_store, e_ptrs, 64);
+    } else {
+        e_ptrs[0] = null as &const byte;
+    }
+}
+
+// 拉起一个 server 子进程。
+// `argv0` 是可执行文件（不做 PATH 查找：execve 只吃路径）；`argv` 是它以 '\n' 分隔的
+// 参数（`args`），`extra_env` 是 `K=V` 的额外环境，`cwd_z` 是可选的 NUL 结尾工作目录。
+// 成功返回槽位下标（>= 0）；失败返回 **-1**，并把原因写进 `err`（调用方的）。
+export fn mcprun_start(name: &const byte, name_len: usize, argv0_z: &const byte, argv: &const Buf, extra_env: &const Buf, cwd_z: &const byte, err: &Buf) isize {
+    if mcprun_find(name, name_len) >= 0 {
+        _ = buf_append_cstr(err, "already running");
+        return -1;
+    }
+    const slot: isize = mcprun_free_slot();
+    if slot < 0 {
+        _ = buf_append_cstr(err, "too many running MCP servers");
+        return -1;
+    }
+    // 三根管道：in(父写子读) / out(子写父读) / err(子写父读)。
+    // 抽成 `mcprun_make_pipes`：三条 pipe2 的失败清理是**递进**的（后一条失败要关掉
+    // 前面已经开好的），收在一处才不会漏关 fd。
+    var pin: [i32: 2] = [0: 2];
+    var pout: [i32: 2] = [0: 2];
+    var perr: [i32: 2] = [0: 2];
+    if !mcprun_make_pipes(&pin[0], &pout[0], &perr[0], err) {
+        return -1;
+    }
+    // argv / envp 必须在 fork **之前**落进两块「活到 execve 之后」的缓冲：
+    // 子进程 execve 要读的是它们，而子进程不能再去 malloc 父进程的 Buf。
+    // 组装抽成 `mcprun_build_argv`（自成一件「把 Buf 摊成指针表」的事）。
+    var a_store: Buf = buf_new(MCP_LINE_MAX);
+    var e_store: Buf = buf_new(65536);
+    defer { buf_free(&a_store); }
+    defer { buf_free(&e_store); }
+    var a_ptrs: [&const byte: MCP_ARGS_MAX_Z] = [null as &const byte: MCP_ARGS_MAX_Z];
+    var e_ptrs: [&const byte: 64] = [null as &const byte: 64];
+    mcprun_build_argv(argv0_z, argv, extra_env, &a_store, &a_ptrs[0],
+        &e_store, &e_ptrs[0]);
+    const pid64: i64 = sys_fork() catch {
+        _ = sys_close(pin[0]) catch {};
+        _ = sys_close(pin[1]) catch {};
+        _ = sys_close(pout[0]) catch {};
+        _ = sys_close(pout[1]) catch {};
+        _ = sys_close(perr[0]) catch {};
+        _ = sys_close(perr[1]) catch {};
+        _ = buf_append_cstr(err, "fork() failed");
+        return -1;
+    };
+    if pid64 == 0 {
+        // ---- 子进程 ----
+        // P1：信号处置是继承的 —— 必须先恢复默认（否则收到 TERM 会去写父进程的终端）
+        sigx_reset_for_child();
+        // ⚠ 这里**不调** sh_child_detach_stdio()：stdio 就是协议通道。
+        // 子进程自成一个会话（setsid），但保留 stdin/stdout/stderr 三根管道。
+        _ = setsid();
+        _ = sys_close(pin[1]) catch {};
+        _ = sys_close(pout[0]) catch {};
+        _ = sys_close(perr[0]) catch {};
+        _ = sys_dup2(pin[0], 0) catch {};
+        _ = sys_dup2(pout[1], 1) catch {};
+        _ = sys_dup2(perr[1], 2) catch {};
+        _ = sys_close(pin[0]) catch {};
+        _ = sys_close(pout[1]) catch {};
+        _ = sys_close(perr[1]) catch {};
+        if (cwd_z as usize) != 0 {
+            _ = sys_chdir(cwd_z as *const byte) catch {};
+        }
+        // execve 失败（路径不对 / 没权限）会静默退出 127 —— 父进程从
+        // 「读不到任何响应」+ 退出码 127 这一对事实里认出来（见 mcprun_recv 的收尸分支）。
+        _ = sys_execve(argv0_z, &a_ptrs[0], &e_ptrs[0]) catch {};
+        sys_exit(127);
+    }
+    // ---- 父进程 ----
+    const pid: i32 = i64_to_i32(pid64);
+    _ = sys_close(pin[0]) catch {};
+    _ = sys_close(pout[1]) catch {};
+    _ = sys_close(perr[1]) catch {};
+    // 读端非阻塞：泵点每圈都要能来看一眼，不能被一次 read 挂住
+    _ = sys_fcntl(pout[0], F_SETFL, O_NONBLOCK) catch {};
+    _ = sys_fcntl(perr[0], F_SETFL, O_NONBLOCK) catch {};
+    const si: usize = slot as usize;
+    const p: &McpProc = mcprun_at(si);
+    if p.used {
+        mcp_proc_free(si);
+    }
+    p[0] = McpProc{
+        used: true,
+        pid: pid,
+        to_fd: pin[1],
+        from_fd: pout[0],
+        err_fd: perr[0],
+        name: buf_new(name_len + 8),
+        buf: buf_new(65536),
+        scan: 0,
+        id_seq: 0,
+        err_tail: buf_new(MCP_ERR_KEEP),
+        exited: false,
+        code: 0,
+    };
+    if buf_valid(&p.name) {
+        _ = buf_append(&p.name, name, name_len);
+    }
+    return slot;
+}
+
+// 释放一个槽位（关三根 fd + 释放三个 Buf），并复位成空。**不 kill** —— 收尸走 mcprun_stop。
+fn mcp_proc_free(i: usize) void {
+    const p: &McpProc = mcprun_at(i);
+    if p.to_fd >= 0 {
+        _ = sys_close(p.to_fd) catch {};
+    }
+    if p.from_fd >= 0 {
+        _ = sys_close(p.from_fd) catch {};
+    }
+    if p.err_fd >= 0 {
+        _ = sys_close(p.err_fd) catch {};
+    }
+    buf_free(&p.name);
+    buf_free(&p.buf);
+    buf_free(&p.err_tail);
+    p[0] = McpProc{
+        used: false,
+        pid: 0,
+        to_fd: -1,
+        from_fd: -1,
+        err_fd: -1,
+        name: buf_empty(),
+        buf: buf_empty(),
+        scan: 0,
+        id_seq: 0,
+        err_tail: buf_empty(),
+        exited: false,
+        code: 0,
+    };
+}
+
+// 收一个会话：先温和（关 stdin 让 server 自己退 + SIGTERM 进程组），再 SIGKILL，
+// 最后 `waitpid` 收尸。**幂等**（重复调不会卡）。
+export fn mcprun_stop(i: usize) void {
+    if i >= MCP_MAX_PROCS || !g_mcp_live[i].used {
+        return;
+    }
+    const p: &McpProc = mcprun_at(i);
+    const pid: i32 = p.pid;
+    // 关掉 stdin：多数 server 看到 EOF 就自己收工（这是规范推荐的优雅退出路径）
+    if p.to_fd >= 0 {
+        _ = sys_close(p.to_fd) catch {};
+        p.to_fd = -1;
+    }
+    if !p.exited && pid > 0 {
+        var waited: u64 = 0;
+        while waited < MCP_STOP_WAIT_MS {
+            var n: usize = 0;
+            if mcprun_drain_err(p, &n) {
+                // 还在吐 stderr，说明还没死透；继续等
+            }
+            var st: i32 = 0;
+            const r: i32 = sys_waitpid(pid, &st, 1) catch { 0; };   // WNOHANG
+            if r > 0 {
+                p.exited = true;
+                p.code = (st >> 8) & 255;
+                break;
+            }
+            mcprun_sleep_ms(10);
+            waited = waited + 10;
+        }
+        if !p.exited {
+            // 到点还没走：整棵子树一起收（server 可能自己 fork 了子进程）
+            sh_kill_tree(pid);
+            var st2: i32 = 0;
+            _ = sys_waitpid(pid, &st2, 0) catch {};
+            p.exited = true;
+            p.code = 128 + 9;
+        }
+    }
+    mcp_proc_free(i);
+}
+
+// 收掉所有活着的会话（进程退出前调；子代理 fork 出来的副本也各有一份自己的表）
+export fn mcprun_stop_all() void {
+    var i: usize = 0;
+    while i < MCP_MAX_PROCS {
+        if g_mcp_live[i].used {
+            mcprun_stop(i);
+        }
+        i = i + 1;
+    }
+}
+
+// 毫秒级小睡（`nanosleep`；与 deleg_wait_slice 同款：**不许** poll 一个无效 fd）
+fn mcprun_sleep_ms(ms: u64) void {
+    var ts: TimeSpec = TimeSpec{ tv_sec: 0, tv_nsec: 0 };
+    ts.tv_sec = (ms / 1000) as i64;
+    ts.tv_nsec = ((ms - (ms / 1000) * 1000) * 1000000) as i64;
+    var rem: TimeSpec = TimeSpec{ tv_sec: 0, tv_nsec: 0 };
+    _ = sys_nanosleep(&ts, &rem) catch {};
+}
+
+// 把 stderr 里现有的内容吸进 err_tail（只留尾部 MCP_ERR_KEEP 字节）。
+// 返回 true = 吸到了东西。**非阻塞**：读到 0 就停。
+fn mcprun_drain_err(p: &McpProc, got: &usize) bool {
+    var any: bool = false;
+    var chunk: [byte: 1024] = [0: 1024];
+    var guard: usize = 0;
+    while guard < 16 {
+        guard = guard + 1;
+        // 行宽豁免：错误文案/诊断行是**单条不可断的字面量**（Uya 没有相邻字面量拼接）
+        const n: isize = sys_read(p.err_fd, &chunk[0], 1024) catch { 0 as isize; };
+        if n <= 0 {
+            break;
+        }
+        any = true;
+        got[0] = got[0] + (n as usize);
+        if !buf_valid(&p.err_tail) {
+            continue;
+        }
+        _ = buf_append(&p.err_tail, &chunk[0], n as usize);
+        if p.err_tail.len > MCP_ERR_KEEP {
+            buf_drop_prefix(&p.err_tail, p.err_tail.len - MCP_ERR_KEEP);
+        }
+    }
+    return any;
+}
+
+// 收到 fd 上的可读数据（非阻塞），追加进 p.buf。返回 true = 读到了新字节。
+// 读到 0（EOF）时：把 from_fd 关掉并返回 false —— 调用方据此判「server 走了」。
+fn mcprun_fill(p: &McpProc, eof: &bool) bool {
+    eof[0] = false;
+    if p.from_fd < 0 {
+        return false;
+    }
+    var chunk: [byte: 8192] = [0: 8192];
+    var any: bool = false;
+    var guard: usize = 0;
+    while guard < 32 {
+        guard = guard + 1;
+        const n: isize = sys_read(p.from_fd, &chunk[0], 8192) catch { -1 as isize; };
+        if n == 0 {
+            eof[0] = true;
+            return any;
+        }
+        if n < 0 {
+            return any;   // EAGAIN：暂时没数据
+        }
+        any = true;
+        if buf_valid(&p.buf) {
+            _ = buf_append(&p.buf, &chunk[0], n as usize);
+            // 缓冲没有 `\n` 且已经超上限 ⇒ 这一行坏了，整段丢掉重新开始
+            // （不变量⑤：绝不把半个 JSON 交给解析器）
+            if p.buf.len > MCP_LINE_MAX && bufx_find_byte(p.buf.ptr[0: p.buf.len], 10 as byte, 0) < 0 {
+                buf_reset(&p.buf);
+                p.scan = 0;
+            }
+        }
+    }
+    return any;
+}
+
+// 从 p.buf 里取出一整行（到 `\n` 为止，去掉 `\n` 与结尾 `\r`）写进 out。
+// 返回 true = 取到一行。取不到（还没有完整的行）返回 false 且 out 不动。
+fn mcprun_take_line(p: &McpProc, out: &Buf) bool {
+    const at: isize = bufx_find_byte(p.buf.ptr[0: p.buf.len], 10 as byte, p.scan);
+    if at < 0 {
+        p.scan = p.buf.len;
+        return false;
+    }
+    const nl: usize = at as usize;
+    const end: usize = if nl > 0 && p.buf.ptr[nl - 1] == 13 as byte { nl - 1 } else { nl };
+    buf_reset(out);
+    _ = buf_append(out, p.buf.ptr, end);
+    buf_drop_prefix(&p.buf, nl + 1);
+    p.scan = 0;
+    return true;
+}
+
+// 发一行 JSON（追加 `\n`）。返回 false = 写失败（管道断了 ⇒ server 已经走了）。
+export fn mcprun_send(i: usize, line: &const Buf) bool {
+    if i >= MCP_MAX_PROCS || !g_mcp_live[i].used {
+        return false;
+    }
+    const p: &McpProc = mcprun_at(i);
+    if p.to_fd < 0 {
+        return false;
+    }
+    var out: Buf = buf_new(line.len + 2);
+    defer { buf_free(&out); }
+    if !buf_valid(&out) {
+        return false;
+    }
+    _ = buf_append(&out, line.ptr, line.len);
+    _ = buf_append_byte(&out, 10);
+    var off: usize = 0;
+    while off < out.len {
+        const w: isize = sys_write(p.to_fd, out.ptr + off, out.len - off) catch { -1 as isize; };
+        if w <= 0 {
+            return false;
+        }
+        off = off + (w as usize);
+    }
+    return true;
+}
+
+// 下一个请求 id（单调递增；从 1 起 —— 0 留着当「无效 id」）
+export fn mcprun_next_id(i: usize) i64 {
+    const p: &McpProc = mcprun_at(i);
+    p.id_seq = p.id_seq + 1;
+    return p.id_seq;
+}
+
+// 读响应，直到拿到 `id == want_id` 的那一条（写进 out），或者超时 / server 退出。
+//
+// 返回码（**判据只有这几个**，调用方按它决定错误文本）：
+//   0 = 成功拿到匹配 id 的一行
+//   1 = 超时（timeout_ms 到点）
+//   2 = server 退出 / 管道断了（含 execve 失败静默退出 127）
+//   3 = 用户中止（esc / ctrl+c；已把 server 杀干净）
+//   4 = 单行超上限被丢弃（协议坏了）
+//
+// 不匹配 id 的行（通知、迟到响应）**直接跳过** —— 规范允许 server 随时发通知，
+// 一条 `notifications/...` 就把协议判死是错的。跳过时记进 diag（调用方可见）。
+export fn mcprun_recv(i: usize, want_id: i64, timeout_ms: u32, out: &Buf, diag: &Buf) i32 {
+    if i >= MCP_MAX_PROCS || !g_mcp_live[i].used {
+        return 2;
+    }
+    const p: &McpProc = mcprun_at(i);
+    const started: u64 = ua_now_ms();
+    var seed: usize = 0;
+    _ = mcprun_drain_err(p, &seed);
+    while true {
+        // 泵点：用户叫停就当场杀干净（与 bash 工具同一条纪律）
+        const ab: i32 = agent_pump_block();
+        if ab != TUI_ABORT_NONE {
+            mcprun_stop(i);
+            return 3;
+        }
+        var line: Buf = buf_empty();
+        defer { buf_free(&line); }
+        if mcprun_take_line(p, &line) {
+            // 这一行的 id 是不是我们要的那一条？
+            const got: i64 = mcp_line_id(line.ptr as &const byte, line.len);
+            if got == want_id {
+                buf_reset(out);
+                _ = buf_append(out, line.ptr, line.len);
+                return 0;
+            }
+            // 不匹配：跳过（记一行诊断，便于事后查「server 是不是在乱发东西」）
+            if buf_valid(diag) && diag.len < 2048 {
+                if diag.len > 0 {
+                    _ = buf_append_byte(diag, 10);
+                }
+                _ = buf_append_cstr(diag, "skipped line (id != ");
+                _ = buf_append_i64(diag, want_id);
+                _ = buf_append_cstr(diag, ")");
+            }
+            continue;
+        }
+        var eof: bool = false;
+        _ = mcprun_fill(p, &eof);
+        var got2: usize = 0;
+        _ = mcprun_drain_err(p, &got2);
+        if eof {
+            // server 走了：收尸拿到退出码（这是「execve 失败退出 127」的唯一线索）
+            var st: i32 = 0;
+            const r: i32 = sys_waitpid(p.pid, &st, 1) catch { 0; };
+            if r > 0 {
+                p.exited = true;
+                p.code = (st >> 8) & 255;
+            }
+            return 2;
+        }
+        // 子进程没关管道但其实已经死了（例如 execve 之后立刻崩）——
+        // 也走收尸分支，否则会一直等到超时（等超时是 60s，体感就是「卡住」）
+        var st2: i32 = 0;
+        const r2: i32 = sys_waitpid(p.pid, &st2, 1) catch { 0; };   // WNOHANG
+        if r2 > 0 {
+            p.exited = true;
+            p.code = (st2 >> 8) & 255;
+            // 死之前可能还留了最后几字节（管道理性上还在），再吸一次
+            var eof2: bool = false;
+            _ = mcprun_fill(p, &eof2);
+            if !mcprun_take_line(p, &line) {
+                return 2;
+            }
+            const got3: i64 = mcp_line_id(line.ptr as &const byte, line.len);
+            if got3 == want_id {
+                buf_reset(out);
+                _ = buf_append(out, line.ptr, line.len);
+                return 0;
+            }
+            return 2;
+        }
+        if timeout_ms > 0 && (ua_now_ms() - started) >= (timeout_ms as u64) {
+            return 1;
+        }
+        var pfds: [PollFd: 1] = [PollFd{ fd: p.from_fd, events: POLLIN, revents: 0 }];
+        _ = sys_poll(&pfds[0], 1, MCP_POLL_MS) catch {};
+    }
+}
+
+// 从一行 JSON 里取顶层 `"id"` 的整数值；没有 / 不是数字返回 **-1**。
+// 只认整数：本仓自己发的 id 全是整数（规范也允许字符串，但我们不产生那种 id，
+// 收到就当「不是给我的」跳过 —— 见 mcprun_recv 的注释）。
+fn mcp_line_id(p: &const byte, n: usize) i64 {
+    const key: &const byte = "\"id\"" as &const byte;
+    const at: isize = find_sub(p[0: n], key[0: 4], 0);
+    if at < 0 {
+        return -1;
+    }
+    var j: usize = mcp_skip_ws(p, n, (at as usize) + 4);
+    if j >= n || p[j] != 58 as byte {
+        return -1;
+    }
+    j = mcp_skip_ws(p, n, j + 1);
+    var v: i64 = 0;
+    var digits: usize = 0;
+    while j < n {
+        const c: byte = p[j];
+        if c < 48 as byte || c > 57 as byte {
+            break;
+        }
+        v = v * 10 + ((c as i64) - 48);
+        digits = digits + 1;
+        j = j + 1;
+    }
+    if digits == 0 {
+        return -1;
+    }
+    return v;
+}
+
+// 这一行的 id 是不是「我们发过的」那一类（用于诊断里区分通知与响应）。
+// 目前只给 `--list-plugins` 的诊断用，所以不额外导出别的形状。
+export fn mcprun_line_is_response(p: &const byte, n: usize) bool {
+    return mcp_line_id(p, n) >= 0;
+}
+
+// stderr 尾部（诊断行；空表示这个 server 一句抱怨都没有）
+export fn mcprun_err_tail(i: usize) &const Buf {
+    return &mcprun_at(i).err_tail;
+}
+
+// 会话是否还活着（`--list-plugins` 用）
+export fn mcprun_alive(i: usize) bool {
+    if i >= MCP_MAX_PROCS {
+        return false;
+    }
+    return g_mcp_live[i].used && !g_mcp_live[i].exited;
+}
+
+// 退出码（`exited` 后才有意义；诊断用）
+export fn mcprun_exit_code(i: usize) i32 {
+    return mcprun_at(i).code;
+}
