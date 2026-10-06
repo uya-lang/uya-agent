@@ -72,7 +72,7 @@ SRC := src/foundation/bufx.uya src/foundation/jsonx.uya src/foundation/yamlcfg.u
        src/term/view.uya src/term/watch.uya \
        src/tools/askuser.uya src/tools/fsx.uya src/tools/jobs.uya src/tools/perm.uya src/tools/sandboxx.uya src/tools/search.uya src/tools/shellx.uya \
        src/session/dshcfg.uya src/session/dshsess.uya src/session/inbox.uya src/session/modelx.uya src/session/procx.uya src/session/session.uya src/session/sigx.uya src/session/stats.uya \
-       src/agent/agent.uya src/agent/ag_config.uya src/agent/ag_title_prompt.uya src/agent/ag_tools_schema.uya src/agent/ag_request_stream.uya src/agent/ag_workspace_model.uya src/agent/ag_worktree.uya src/agent/ag_interactive_tasks.uya src/agent/ag_tui_sessions.uya src/agent/ag_plan_pump.uya src/agent/compact.uya src/agent/deleg.uya src/agent/goal.uya src/agent/instr.uya src/agent/plan.uya src/agent/prompt.uya src/agent/skill.uya src/agent/todo.uya src/agent/workflow.uya \
+       src/agent/agent.uya src/agent/ag_config.uya src/agent/ag_title_prompt.uya src/agent/ag_tools_schema.uya src/agent/ag_request_stream.uya src/agent/ag_workspace_model.uya src/agent/ag_worktree.uya src/agent/ag_interactive_tasks.uya src/agent/ag_tui_sessions.uya src/agent/ag_plan_pump.uya src/agent/ag_pm.uya src/agent/compact.uya src/agent/deleg.uya src/agent/goal.uya src/agent/instr.uya src/agent/plan.uya src/agent/prompt.uya src/agent/skill.uya src/agent/todo.uya src/agent/workflow.uya \
        src/pm/pm_repo.uya src/pm/pm_store.uya src/pm/pm_ingest.uya src/pm/pm_digest.uya \
        src/vcs/gitx.uya src/vcs/worktreex.uya \
        src/media/clipx.uya src/media/imgx.uya \
@@ -90,7 +90,7 @@ TASK ?= 创建 hello.uya，编译并运行它
 export UYA_ROOT
 export UYA_SPLIT_C_DIR := $(CURDIR)/build/uyacache
 
-.PHONY: all check print-src build link-audit selftest codegen-audit doc-audit doc-cover probe e2e e2e-config e2e-exec e2e-accept-nudge e2e-config-flags e2e-title e2e-title-cmd e2e-title-auto e2e-mouse e2e-api e2e-steps e2e-permission e2e-sandbox e2e-tasks e2e-goal e2e-sessions e2e-resume-big e2e-diff e2e-ws e2e-model e2e-model-route e2e-worktree e2e-watch e2e-watch-pick e2e-dsh p30-check tui-demo tui-selftest sess-selftest diff-selftest model-selftest panel-selftest clean shell-selftest pm-selftest
+.PHONY: all check print-src build link-audit selftest codegen-audit doc-audit doc-cover probe e2e e2e-config e2e-exec e2e-accept-nudge e2e-config-flags e2e-title e2e-title-cmd e2e-title-auto e2e-mouse e2e-api e2e-steps e2e-permission e2e-sandbox e2e-tasks e2e-goal e2e-memory e2e-sessions e2e-resume-big e2e-diff e2e-ws e2e-model e2e-model-route e2e-worktree e2e-watch e2e-watch-pick e2e-dsh p30-check tui-demo tui-selftest sess-selftest diff-selftest model-selftest panel-selftest clean shell-selftest pm-selftest
 
 all: build
 
@@ -183,7 +183,7 @@ doc-audit:
 #   本仓实测：90 文件树上净增 50 个函数 + `rm -rf build && make build` → 通过（静态链接审计通过）。
 #   因此「净增函数按 0 处理」那条纪律作废。这段留下的用处只有一个：**换/降编译器时认得出症状**
 #   （报错点落在标准库、`make check` 全绿、只有清缓存重编才炸）。
-selftest: build codegen-audit doc-audit doc-cover e2e-exec e2e-accept-nudge e2e-config-flags e2e-title e2e-title-cmd e2e-title-auto e2e-mouse e2e-api e2e-steps e2e-permission e2e-sandbox e2e-tasks e2e-goal e2e-sessions e2e-resume-big e2e-diff e2e-ws e2e-model e2e-model-route e2e-worktree p30-check
+selftest: build codegen-audit doc-audit doc-cover e2e-exec e2e-accept-nudge e2e-config-flags e2e-title e2e-title-cmd e2e-title-auto e2e-mouse e2e-api e2e-steps e2e-permission e2e-sandbox e2e-tasks e2e-goal e2e-memory e2e-sessions e2e-resume-big e2e-diff e2e-ws e2e-model e2e-model-route e2e-worktree p30-check
 	UYA_BIN=$(UYA) $(OUT) --selftest
 
 probe: build
@@ -289,6 +289,36 @@ e2e-goal: build
 	echo "$$out" | grep -qF "/goal [<objective>|edit <objective>|pause|resume|clear]" \
 		|| { echo "FAIL: /help 里没有 /goal"; exit 1; }; \
 	echo "e2e-goal: 通过（用法 / 创建 / 拒绝顶掉 / edit / pause·resume / clear 幂等 / 字面目标 / /help）"
+
+# P65：项目记忆的人类命令面（离线）：/memory 报告 / off / forget + --no-memory 的 print-config。
+# 开工包的**内容与注入**由 selftest 的 pm-e2e 轮断言（那边才拿得到历史）。
+e2e-memory: build
+	@set -e; \
+	home=build/selftest_pm_e2e; rm -rf $$home; mkdir -p $$home; \
+	out=$$($(OUT) --no-dsh-config --print-config 2>&1); \
+	echo "$$out" | grep -q "memory = on  (source: default)" \
+		|| { echo "FAIL: 默认应当是开"; exit 1; }; \
+	echo "$$out" | grep -q "budget = 3072 (default)" \
+		|| { echo "FAIL: 默认预算应当是 3072"; exit 1; }; \
+	out=$$($(OUT) --no-dsh-config --no-memory --print-config 2>&1); \
+	echo "$$out" | grep -q "memory = off  (source: cli)" \
+		|| { echo "FAIL: --no-memory 没生效"; exit 1; }; \
+	out=$$($(OUT) --no-dsh-config --memory-budget 512 --print-config 2>&1); \
+	echo "$$out" | grep -q "budget = 512" \
+		|| { echo "FAIL: --memory-budget 没生效"; exit 1; }; \
+	out=$$(printf '/memory\n/memory bogus\n/memory off\n/memory\n/help\n/exit\n' | \
+		UYA_AGENT_HOME=$$home $(OUT) --no-dsh-config --no-tui --api-key dummy-key --quiet 2>&1); \
+	echo "$$out" | grep -qF -- "--- 项目记忆 ---" \
+		|| { echo "FAIL: 裸 /memory 没有打出报告头"; echo "$$out"; exit 1; }; \
+	echo "$$out" | grep -qF "（这个项目还没有积累到任何事实" \
+		|| { echo "FAIL: 空态串不对"; exit 1; }; \
+	echo "$$out" | grep -qF "[memory] 用法：/memory 看报告" \
+		|| { echo "FAIL: 非法参数应当回用法"; exit 1; }; \
+	echo "$$out" | grep -qF "项目记忆：已关闭" \
+		|| { echo "FAIL: /memory off 之后报告应当说已关闭"; exit 1; }; \
+	echo "$$out" | grep -qF "/memory    项目记忆" \
+		|| { echo "FAIL: /help 里没有 /memory"; exit 1; }; \
+	echo "e2e-memory: 通过（print-config 两条 / 报告头 / 空态 / 非法参数 / off / /help）"
 
 # P26：/diff（离线）：在临时仓库里跑**真二进制**（滚动模式的单列文本回退）——
 # 必须列出改动文件（含未跟踪）、打出旧/新两侧内容；非仓库目录必须报错而不是静默无事发生。
