@@ -77,7 +77,7 @@ SRC := src/foundation/bufx.uya src/foundation/jsonx.uya src/foundation/yamlcfg.u
        src/vcs/gitx.uya src/vcs/worktreex.uya \
        src/media/clipx.uya src/media/imgx.uya \
        src/selftest/selftest.uya src/selftest/shellselftest.uya src/selftest/sigselftest.uya src/selftest/tuiselftest.uya \
-       src/selftest/st_core.uya src/selftest/st_mock_server.uya src/selftest/st_round_driver.uya src/selftest/st_tty_sse.uya src/selftest/st_sessions.uya src/selftest/st_read_window.uya src/selftest/st_view_watch.uya src/selftest/st_responses.uya src/selftest/st_stats_ctx.uya src/selftest/st_title.uya src/selftest/st_tasks_ws.uya src/selftest/st_goal_worktree.uya src/selftest/st_pm.uya \
+       src/selftest/st_core.uya src/selftest/st_mock_server.uya src/selftest/st_round_driver.uya src/selftest/st_tty_sse.uya src/selftest/st_sessions.uya src/selftest/st_read_window.uya src/selftest/st_view_watch.uya src/selftest/st_responses.uya src/selftest/st_stats_ctx.uya src/selftest/st_title.uya src/selftest/st_tasks_ws.uya src/selftest/st_goal_worktree.uya src/selftest/st_pm.uya src/selftest/st_pm2.uya \
        src/selftest/tuis_core.uya src/selftest/tuis_title_pty.uya src/selftest/tuis_exit_cmd.uya src/selftest/tuis_diff_scroll.uya src/selftest/tuis_title_ask.uya src/selftest/tuis_sessions_big.uya src/selftest/tuis_tail.uya \
        src/diff/model.uya src/diff/gitcmd.uya src/diff/rows.uya src/diff/view.uya src/diff/render.uya
 OUT := build/uya-agent
