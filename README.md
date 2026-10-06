@@ -94,8 +94,8 @@ readelf -lW build/uya-agent | grep -c INTERP    # 0 = 真静态
 | 选项 | 说明 |
 |---|---|
 | `--base-url URL` | 默认 `https://api.deepseek.com/v1`（也支持 `http://127.0.0.1:11434/v1` 这类本地明文端点） |
-| `--model NAME` | 默认 `deepseek-chat`。走模型目录收口 —— 命中就把该模型的 provider / contextWindow / maxTokens / input / compat **一起**搬过来（`/model` 同口径），目录里没有就只换名字并告警（能力保持不动） |
-| `--provider NAME` | 提供方键（可省略）：`settings.yaml` 里 `providers.<key>` 的那个 key，配 `--model` 用；省略时由目录反查 |
+| `--model NAME` | 默认 `deepseek-chat`。走模型目录收口 —— 命中就把该模型的 provider / contextWindow / maxTokens / input / compat **一起**搬过来（`/model` 同口径），目录里没有就只换名字并告警（能力保持不动）。**同名模型跨提供方**（两家都发布同一个 id）时用 `--model 提供方/名字` 指定是哪一家；只给名字时用当前提供方，并在回执里点出同名的那一家 |
+| `--provider NAME` | 提供方键（可省略）：`settings.yaml` 里 `providers.<key>` 的那个 key，配 `--model` 用；省略时由目录反查。显式给的这个键**当场生效**（端点 / 凭据 / 线协议一起解析），与 `--model` 谁先谁后都一样；**显式优先** —— 该提供方没发布这个名字时不会跨提供方回退（不会把你点的键悄悄换掉） |
 | `--effort V` | 推理强度（`--reasoning-effort` 的别名）：先按当前模型公布的档位校验，不在集合里则拒绝（`--reasoning-effort` 不校验、原样透传） |
 | `--reasoning-effort V` | 推理强度：**completions 发顶层 `reasoning_effort`，responses 发 `reasoning.effort`**（`compat.supportsReasoningEffort=false` 或 `off`/`none` = 不发），默认取 DSH 的 `agent-default-model.reasoningEffort` |
 | `--workspace DIR` | 工具的活动目录，默认当前目录；恢复会话时默认跟随会话记录的工作区，显式指定优先 |
@@ -150,7 +150,7 @@ readelf -lW build/uya-agent | grep -c INTERP    # 0 = 真静态
 ### 1.2 斜杠命令
 
 `/help` `/status` `/tasks [open|close|toggle]` `/goal [<objective>|edit <objective>|pause|resume|clear]`
-`/compact` `/plan` `/permission [预设]` `/model [名字]` `/effort [档位]` `/workspace [目录]`
+`/compact` `/plan` `/permission [预设]` `/model [名字|提供方/名字]` `/effort [档位]` `/workspace [目录]`
 `/worktree [on|off|start|status|finish|discard|list|reclaim]`（TUI 里裸命令开**动作选择框**，
 打开就回车 = `status`；`finish`/`discard` 选定后再过一道确认，`reclaim` 只清确定的垃圾、不确认）
 `/sessions` `/resume <id>` `/new` `/continue` `/diff` `/title [新标题]` `/image [路径]`
@@ -400,6 +400,20 @@ DEEPSEEK_API_KEY=sk-xxx ./build/uya-agent \
   **切模型不做上下文迁移**：历史原样保留，`{{model}}` 是建会话时求值的，所以 persona 里仍是旧
   模型名。选择进会话日志（`session/model`）但不进索引独立字段；子代理继承父的
   provider/model/强度，但**不能自己切**。
+* **同名模型按「提供方 + 名字」选**（P62）：DSH 的模型 id 通常全局唯一，但两家提供方发布**同一个
+  id** 是合法的（真机 `DeepSeek-V4.1-Flash` 就同时挂在 `aigw-local` 与 `autodl-api` 下）。这种
+  情况下「模型」是一个**二元组**，所以：
+  * `/model` 浮层每行都标出提供方（`✓ <名字> · <提供方>  effort: …`），`✓` **只挂在当前那一
+    条**上 —— 同名两行不会都像「正在用的那个」；
+  * 浮层里选中哪一行就切到**那一行那一家**（不再拿当前提供方去反查 —— 那会把「选另一家的同名
+    模型」解析回当前条，然后被幂等吞掉，表现为「回车之后什么都没发生」）；
+  * 文本与命令行用 **`提供方/名字`** 指定：`/model autodl-api/DeepSeek-V4.1-Flash`、
+    `--model autodl-api/DeepSeek-V4.1-Flash`。拆分只在**这一对确实在目录里**时才认，所以
+    `Qwen/Qwen3-32B` 这类 id 自带 `/` 的模型名不会被误拆成提供方；
+  * 只给名字时用**当前提供方**，并在回执里点出「另有提供方发布同名模型：<那几家>」以及
+    `提供方/名字` 的写法 —— 同名歧义不静默。切模型本身仍走上面那条「连端点与凭据一起跟随」；
+  * **显式优先**：`--provider P` / `/model P/名字` 给过的 P 不会被「跨提供方按名字回退」换掉
+    （P 下没有这个名字时按目录外的老口径处理：只换名字，能力与端点保持 P 的）。
 * **切模型会连端点与凭据一起跟随**（P37）：目录故意不存 `baseURL`（存了就要把凭据链复制成
   第二份），所以换提供方时**重新解析**那条路线 —— `base_url` / `apiKeyEnv` 解出来的密钥 /
   `api` 线协议三样一起换，并**逐 step 重建请求头**（否则 URL 走了、`Authorization` 还是旧
