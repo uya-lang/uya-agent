@@ -189,15 +189,23 @@ def main():
             failures.append("切换生效时回合已经结束了（窗口没撑住，判据不算数）")
 
         # ④ 回合结束（等慢 bash 收工，让第二条请求真的发出去）
+        # ⚠ 这里以前等的是「屏幕上有 `轮 ·` 且没有 `运行中`」—— 这条**否定式代理判据**
+        # 在回合**半途**就成立（踩坑 109 的现场）：脚注的 `轮 · ` 回合一开始就在，而状态区
+        # 那三档词是「思考中 / 输出中 / 运行中 」—— 慢 bash 一收工就回到「思考中」，
+        # 于是循环在答案上屏**之前**跳出，取样到一张还在跑的屏 ⇒ 约 5% 的假红。
+        # 判据改成等**正面事实**：PROV-B-ANSWER 只可能由新提供方那条答复产生，
+        # 正是这条腿要断言的语义（等 A 本身，别去猜「哪些字不在就等于 A 发生了」）。
         t1 = time.time()
         while time.time() - t1 < args.slow + 25:
             pd.pump(fd, scr, 0.3)
-            if "轮 ·" in scr.text() and "运行中" not in scr.text():
+            if "PROV-B-ANSWER" in scr.text():
                 break
         verdict["final_screen_has_b_answer"] = ("PROV-B-ANSWER" in scr.text())
         if not verdict["final_screen_has_b_answer"]:
             failures.append("切换之后那一轮不是 prov-b 答的（屏幕上没有 PROV-B-ANSWER）")
-        if os.environ.get("PTY_DUMP"):
+        # 失败时也打屏：flake 的现场（那一刻屏幕上到底是什么）是最难补的证据，
+        # 以前只有 PTY_DUMP=1 才打，定位一次要手工重跑好几轮。
+        if os.environ.get("PTY_DUMP") or failures:
             print("---- screen ----")
             print(scr.text())
     finally:
