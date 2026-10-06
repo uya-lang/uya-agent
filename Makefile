@@ -66,7 +66,7 @@ endif
 #      数文件：`make -s print-src | wc -w`。
 # 留在 src/ 根的 tools.uya 是 P50 起就不在构建里的已知死代码，故意不列。
 SRC := src/foundation/bufx.uya src/foundation/jsonx.uya src/foundation/yamlcfg.uya \
-       src/net/httpc.uya src/net/httpstream.uya src/net/llm.uya src/net/sse.uya src/net/webx.uya \
+       src/net/httpc.uya src/net/httpsrv.uya src/net/httpstream.uya src/net/llm.uya src/net/sse.uya src/net/webx.uya \
        src/term/mdview.uya src/term/tasks.uya src/term/tty.uya \
        src/term/tui/style.uya src/term/tui/keys.uya src/term/tui/frame.uya src/term/tui/entry.uya src/term/tui/screen.uya src/term/tui/overlay.uya src/term/tui/status.uya src/term/tui/ask.uya src/term/tui/watch.uya src/term/tui/diff.uya src/term/tui/hook.uya \
        src/term/view.uya src/term/watch.uya \
@@ -89,7 +89,7 @@ TASK ?= 创建 hello.uya，编译并运行它
 export UYA_ROOT
 export UYA_SPLIT_C_DIR := $(CURDIR)/build/uyacache
 
-.PHONY: all check print-src build link-audit selftest codegen-audit doc-audit doc-cover probe e2e e2e-config e2e-exec e2e-accept-nudge e2e-config-flags e2e-title e2e-title-cmd e2e-title-auto e2e-mouse e2e-api e2e-steps e2e-permission e2e-sandbox e2e-tasks e2e-goal e2e-sessions e2e-resume-big e2e-diff e2e-ws e2e-model e2e-model-route e2e-worktree e2e-watch e2e-watch-pick e2e-dsh p30-check tui-demo tui-selftest sess-selftest diff-selftest model-selftest panel-selftest clean shell-selftest
+.PHONY: all check print-src build link-audit selftest codegen-audit doc-audit lint-size lint-size-all doc-cover probe e2e e2e-config e2e-exec e2e-accept-nudge e2e-config-flags e2e-title e2e-title-cmd e2e-title-auto e2e-mouse e2e-api e2e-steps e2e-permission e2e-sandbox e2e-tasks e2e-goal e2e-sessions e2e-resume-big e2e-diff e2e-ws e2e-model e2e-model-route e2e-worktree e2e-watch e2e-watch-pick e2e-dsh p30-check tui-demo tui-selftest sess-selftest diff-selftest model-selftest panel-selftest clean shell-selftest
 
 all: build
 
@@ -171,6 +171,17 @@ doc-audit:
 		exit 1; \
 	fi; \
 	echo "doc-audit: 通过（没有冲突标记）"
+
+# AGENTS.md 三条硬指标：文件 ≤2000 行 / 函数 ≤100 行 / 行宽 ≤80 字符。
+# 判据与例外条款见 AGENTS.md；检查器是 scripts/lint_size.py（口径写死在那里）。
+#   * `lint-size`     —— **评审门槛**：只看 `git diff` 新增的行 + 未跟踪的新文件。
+#     改一行老代码不会因为那个函数本来就超长而红（历史存量不追，见 AGENTS.md）。
+#   * `lint-size-all` —— 看存量：全量报，**退出码恒 0**（只用来量进度，不当场红）。
+lint-size:
+	@python3 scripts/lint_size.py --changed
+
+lint-size-all:
+	@python3 scripts/lint_size.py --all
 
 # 函数表容量（0.10.1 里写死的 FUNCTION_TABLE_SIZE，无开关）：**绝对条数**上限，不是「本仓还能加 0 个」。
 #   P53 实测：main 6756 声明通过、**+1 个空函数**就报「函数表容量不足」；

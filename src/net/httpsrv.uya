@@ -1,0 +1,623 @@
+// src/net/httpsrv.uya — 极简 HTTP/1.1 服务端（纯 Uya，明文，`--web` 用）
+//
+// 本文件：监听套接字的建立与查询（`srv_listen` / `srv_local_port`）、非阻塞收连接
+//   （`srv_accept_nb`）、请求解析（`srv_recv_request` + `srv_head_value` /
+//   `srv_url_split` / `srv_query_get`）、响应发送（`srv_send_response` /
+//   `srv_send_head` / `srv_send_chunk`）与连接收尾（`srv_close`）。
+// 不变量：① **每响应一个 `Connection: close`** —— 这是本项目唯一支持的连接语义，
+//   绝不做 keep-alive：没有它就要处理「半关闭时客户端已经走人」「响应写到一半
+//   EAGAIN」这两类状态机，而浏览器对 `close` 的处理是完整且免费的；② 请求体一律按
+//   `Content-Length` 收全（**不支持 chunked 请求体**，浏览器表单与 fetch 都不会用它）；
+//   ③ `srv_recv_request` 返回 `SRV_RX_*` 码而不是 bool —— 「还没收全」与「连接坏了」
+//   必须分开，前者要 `poll` 等下一次可读，后者要当场关连接，合成一个 bool 就得让
+//   调用方自己再判一次（见 §16 踩坑 44「返回值被丢掉」同族）；④ 所有 fd 都是
+//   **非阻塞**的：`srv_listen` 起就设，`srv_accept_nb` 继承；⑤ **URL/query 的切片
+//   不用出参** —— Uya 的切片参数是值语义（`&[byte]` 传进去是描述符副本），写出参不
+//   成立。所以本文件的解析函数一律用**下标**（`url_off`/`url_len`、`path_len`、
+//   `q_off`/`q_len`）返回区间，调用方按 `rx.ptr[off: off+len]` 自己切片。
+// 依赖：无 `use` 行（靠合并命名空间拿 libc.syscall / libc.unistd / libc.fcntl 的
+//   符号）；本仓 foundation/bufx（Buf、`parse_u64_at`）。**不依赖 net/httpc**：那是
+//   客户端，`fill_sockaddr_ipv4` / `infd_nonblock` 是它内部的非导出件，本文件自己写
+//   一份（跨文件拿私有件会把两个方向钉死在一起）。
+// 命名：对外 `srv_*`（监听、收发、解析）；常量/状态码 `SRV_*`。
+//
+// 为什么不用 std.http.server / epoll_server：本项目的需求是「**少量、长命、单向
+// 流式**」的连接（一个页面 = 1 个 `/api/screen` 长连接 + 偶发的 POST），而 std 那一族
+// 是「多连接 + 每连接一个处理函数」的请求-响应模型，且它的 fd 生命周期由自己管
+// （拿不到我们还要一起 poll 的那些 master fd）。这里只需要一个 `poll` 集合，
+// 自己管反而更短、更可预测（与 net/httpc 手写 HTTP/1.1 同一条立场）。
+
+// ============================================================
+// 常量
+// ============================================================
+
+const SRV_AF_INET: i32 = 2;
+const SRV_SOCK_STREAM: i32 = 1;
+const SRV_IPPROTO_TCP: i32 = 6;
+
+// Linux 取值；本仓只跑 Linux（libc/syscall.uya 自己对 macos 分叉）。
+const SRV_SOL_SOCKET: i32 = 0xFFFF;
+const SRV_SO_REUSEADDR: i32 = 0x0004;
+
+const SRV_F_GETFL: i32 = 3;
+const SRV_F_SETFL: i32 = 4;
+const SRV_O_NONBLOCK: i32 = 0x800;
+
+// 请求上限：浏览器的 POST 只有两类 —— `/api/input` 的按键字节（几十字节）
+// 与 `/api/resize` 的表单（几十字节），8 KiB 绰绰有余；超了回 413 而不是越收越涨
+// （内存边界要是**显式**的）。
+export const SRV_REQ_MAX: usize = 8192;
+
+// 解析结果码（见文件头不变量 ③）
+export const SRV_RX_OK: i32 = 0;       // 完整请求已收全（头 + body 都在 rx 里）
+export const SRV_RX_MORE: i32 = 1;     // 还没收全，等下一次可读
+export const SRV_RX_EOF: i32 = 2;      // 对端关闭且没有完整请求（预连接/取消）
+export const SRV_RX_ERR: i32 = 3;      // 协议坏了或读错误
+export const SRV_RX_TOO_BIG: i32 = 4;  // 超过 SRV_REQ_MAX
+
+// 方法码
+export const SRV_M_GET: u8 = 0;
+export const SRV_M_POST: u8 = 1;
+export const SRV_M_OTHER: u8 = 2;
+
+// ============================================================
+// sockaddr 与小工具
+// ============================================================
+
+// 拼一个 AF_INET 的 sockaddr（16 字节，端口按网络序）到 out[0..16]。
+export fn srv_sockaddr(a: byte, b: byte, c: byte, d: byte, port: u16,
+    out: &byte) void {
+    var i: usize = 0;
+    while i < 16 {
+        out[i] = 0;
+        i = i + 1;
+    }
+    out[0] = SRV_AF_INET as byte;
+    out[1] = 0;
+    const pnet: u16 = ((port & (0xFF as u16)) << (8 as i32))
+        | (port >> (8 as i32));
+    out[2] = (pnet & 255 as u16) as byte;
+    out[3] = ((pnet >> 8) & 255 as u16) as byte;
+    out[4] = a;
+    out[5] = b;
+    out[6] = c;
+    out[7] = d;
+}
+
+// 从 sockaddr 的字节里取**主机序**端口（能让 0 端口变成内核分配的真实端口）。
+export fn srv_port_of(addr: &const byte) u16 {
+    const lo: u16 = addr[2] as u16;
+    const hi: u16 = addr[3] as u16;
+    return (hi << (8 as i32)) | lo;
+}
+
+// 把 fd 设成非阻塞。为什么必须：主循环用 `poll` 统一等就绪，任何一次
+// `read`/`accept` 卡住都等于整个 agent 冻住（这个进程同时还在跑 LLM 请求）。
+fn srv_nonblock(fd: i32) void {
+    const flags: i32 = sys_fcntl(fd, SRV_F_GETFL, 0) catch { -1; };
+    if flags < 0 {
+        return;
+    }
+    _ = sys_fcntl(fd, SRV_F_SETFL, flags | SRV_O_NONBLOCK) catch {};
+}
+
+// "a.b.c.d" → 四段（各 0–255）。段数不是 4 / 有空段 / 有非数字 / 超 255 都 false。
+export fn srv_scan_ipv4(s: &const byte, n: usize, out: &byte) bool {
+    var seg: usize = 0;
+    var val: i32 = 0;
+    var digits: usize = 0;
+    var i: usize = 0;
+    while i <= n {
+        if i == n || s[i] == 46 {                 // '.'
+            if digits == 0 || seg >= 4 {
+                return false;
+            }
+            out[seg] = val as byte;
+            seg = seg + 1;
+            val = 0;
+            digits = 0;
+        } else {
+            const ch: byte = s[i];
+            if ch < 48 || ch > 57 {
+                return false;
+            }
+            val = val * 10 + ((ch - 48) as i32);
+            if val > 255 {
+                return false;
+            }
+            digits = digits + 1;
+        }
+        i = i + 1;
+    }
+    return seg == 4;
+}
+
+// ============================================================
+// 监听
+// ============================================================
+
+// 建监听套接字并 listen。`port` 给 0 = 让内核分配（自测靠它避开固定端口冲突）。
+export fn srv_listen(a: byte, b: byte, c: byte, d: byte, port: u16,
+    backlog: i32) i32 {
+    const fd: i32 = sys_socket(SRV_AF_INET, SRV_SOCK_STREAM,
+        SRV_IPPROTO_TCP) catch { -1; };
+    if fd < 0 {
+        return -1;
+    }
+    var one: i32 = 1;
+    _ = sys_setsockopt(fd, SRV_SOL_SOCKET, SRV_SO_REUSEADDR,
+        &one as &void, 4 as u32) catch {};
+    var addr: [byte: 16] = [0: 16];
+    srv_sockaddr(a, b, c, d, port, &addr[0]);
+    if (sys_bind(fd, &addr[0] as &void, 16 as u32) catch { -1; }) != 0 {
+        srv_close(fd);
+        return -1;
+    }
+    if (sys_listen(fd, backlog) catch { -1; }) != 0 {
+        srv_close(fd);
+        return -1;
+    }
+    srv_nonblock(fd);
+    return fd;
+}
+
+// 取这个监听套接字**实际**绑到的端口。失败返回 0。
+export fn srv_local_port(fd: i32) u16 {
+    var got: [byte: 16] = [0: 16];
+    var glen: u32 = 16;
+    if (sys_getsockname(fd, &got[0] as &void, &glen) catch { -1; }) != 0 {
+        return 0;
+    }
+    return srv_port_of(&got[0]);
+}
+
+// 非阻塞 accept。返回 fd；没有待收连接或出错都返回 -1。
+// 这两个情况**故意不分**：调用方在 `poll` 说 POLLIN 之后调它，-1 就当作「这一圈
+// 白跑」（比如客户端在 accept 之前就断了），下一圈 poll 会重新说真话。
+export fn srv_accept_nb(lfd: i32) i32 {
+    var peer: [byte: 16] = [0: 16];
+    var alen: u32 = 16;
+    const cfd: i32 = sys_accept(lfd, &peer[0] as &void, &alen) catch { -1; };
+    if cfd < 0 {
+        return -1;
+    }
+    srv_nonblock(cfd);
+    return cfd;
+}
+
+// ============================================================
+// 请求解析
+// ============================================================
+
+// 在 [from, n) 里找第一个子串 pat；返回下标，找不到 -1。
+export fn srv_find(p: &const byte, from: usize, n: usize,
+    pat: &const byte, pl: usize) isize {
+    if pl == 0 || from >= n || n - from < pl {
+        return -1;
+    }
+    var i: usize = from;
+    while i + pl <= n {
+        var k: usize = 0;
+        var hit: bool = true;
+        while k < pl {
+            if p[i + k] != pat[k] {
+                hit = false;
+                break;
+            }
+            k = k + 1;
+        }
+        if hit {
+            return i as isize;
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+// 请求头名**大小写不敏感**：s[i..i+nl) 小写化后与 name 比，且紧跟 ':' 才算命中
+// （否则 `Content-LengthX:` 会被当成 `content-length`）。
+fn srv_name_eq(s: &const byte, i: usize, n: usize, name: &const byte,
+    nl: usize) bool {
+    if nl == 0 || i + nl >= n {
+        return false;
+    }
+    var k: usize = 0;
+    while k < nl {
+        var ch: byte = s[i + k];
+        if ch >= 65 && ch <= 90 {
+            ch = (ch + 32) as byte;
+        }
+        if ch != name[k] {
+            return false;
+        }
+        k = k + 1;
+    }
+    return s[i + nl] == 58;
+}
+
+// 在请求头 [0, head_end) 里查头 `name_lower`（**必须小写**），把值的起止下标写进
+// out_off/out_len（尾部空白与 CR 已吃掉）。找到返回 true。
+export fn srv_head_value(rx: &const byte, head_end: usize,
+    name_lower: &const byte, out_off: &usize, out_len: &usize) bool {
+    const n: usize = rx.len;
+    const nl: usize = bufx_cstr_len(name_lower);
+    var i: usize = 0;
+    while i < head_end {
+        if srv_name_eq(rx.ptr, i, n, name_lower, nl) {
+            var v: usize = i + nl + 1;    // 跳过 ':'
+            while v < head_end && (rx.ptr[v] == 32 || rx.ptr[v] == 9) {
+                v = v + 1;
+            }
+            var e: usize = v;
+            while e < head_end && rx.ptr[e] != 13 && rx.ptr[e] != 10 {
+                e = e + 1;
+            }
+            var e2: usize = e;
+            while e2 > v && (rx.ptr[e2 - 1] == 32 || rx.ptr[e2 - 1] == 9) {
+                e2 = e2 - 1;
+            }
+            out_off[0] = v;
+            out_len[0] = e2 - v;
+            return true;
+        }
+        while i < head_end && rx.ptr[i] != 10 {
+            i = i + 1;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+// 收全一个请求。`rx` 是调用方的累积缓冲（**调用方负责 `buf_reset` 后跨多次调用
+// 复用**）。返回 SRV_RX_OK 时出参有效：m_out = 方法码，url_off/url_len 指向请求行
+// 里的 URL，body_off 给出请求体的起点（无 body 时等于头结束位置）。
+export fn srv_recv_request(cfd: i32, rx: &Buf, m_out: &u8, url_off: &usize,
+    url_len: &usize, body_off: &usize) i32 {
+    var tmp: [byte: 4096] = [0: 4096];
+    var head_end: usize = 0;
+    while true {
+        const he: isize = srv_find(rx.ptr as &const byte, 0, rx.len,
+            "\r\n\r\n" as &const byte, 4);
+        if he >= 0 {
+            head_end = (he as usize) + 4;
+            var need: usize = 0;
+            var co: usize = 0;
+            var cl: usize = 0;
+            if srv_head_value(rx, head_end, "content-length" as &const byte,
+                &co, &cl) && cl > 0 {
+                const want: i64 = parse_u64_at(rx.ptr as &const byte, co, cl);
+                if want < 0 {
+                    return SRV_RX_ERR;
+                }
+                if (want as usize) > SRV_REQ_MAX {
+                    return SRV_RX_TOO_BIG;
+                }
+                need = want as usize;
+            }
+            if rx.len >= head_end + need {
+                body_off[0] = head_end;
+                if !srv_parse_request_line(rx, head_end, m_out, url_off,
+                    url_len) {
+                    return SRV_RX_ERR;
+                }
+                return SRV_RX_OK;
+            }
+        }
+        if rx.len >= SRV_REQ_MAX {
+            return SRV_RX_TOO_BIG;
+        }
+        const n: isize = sys_read(cfd, &tmp[0], 4096) catch { -1 as isize; };
+        if n == 0 {
+            return SRV_RX_EOF;
+        }
+        if n < 0 {
+            return SRV_RX_ERR;
+        }
+        if !buf_append(rx, &tmp[0], n as usize) {
+            return SRV_RX_ERR;
+        }
+    }
+}
+
+// 解析请求行 `METHOD SP URL SP VERSION`（限定在 [0, head_end) 里）。
+fn srv_parse_request_line(rx: &const Buf, head_end: usize, m_out: &u8,
+    url_off: &usize, url_len: &usize) bool {
+    if rx.len < 4 {
+        return false;
+    }
+    const p: &const byte = rx.ptr as &const byte;
+    const e: isize = srv_find(p, 0, head_end, "\r\n" as &const byte, 2);
+    if e < 0 {
+        return false;
+    }
+    const line_end: usize = e as usize;
+    const sp1: isize = srv_find(p, 0, line_end, " " as &const byte, 1);
+    if sp1 < 0 {
+        return false;
+    }
+    const s1: usize = sp1 as usize;
+    const sp2: isize = srv_find(p, s1 + 1, line_end, " " as &const byte, 1);
+    if sp2 < 0 {
+        return false;
+    }
+    const s2: usize = sp2 as usize;
+    if s2 <= s1 + 1 {
+        return false;
+    }
+    const ml: usize = s1;
+    if ml == 3 && p[0] == 71 && p[1] == 69 && p[2] == 84 {
+        m_out[0] = SRV_M_GET;
+    } else if ml == 4 && p[0] == 80 && p[1] == 79 && p[2] == 83 && p[3] == 84 {
+        m_out[0] = SRV_M_POST;
+    } else {
+        m_out[0] = SRV_M_OTHER;
+    }
+    url_off[0] = s1 + 1;
+    url_len[0] = s2 - (s1 + 1);
+    return true;
+}
+
+// 在 URL 里切出 path 与 query。两者都是**下标区间**出参（相对 url_off）：
+//   * path  = [url_off, url_off + path_len)
+//   * query = [url_off + q_off, url_off + q_off + q_len)   （无 '?' 时 q_len = 0）
+export fn srv_url_split(url: &const byte, url_off: usize, url_len: usize,
+    path_len: &usize, q_off: &usize, q_len: &usize) void {
+    var i: usize = 0;
+    while i < url_len {
+        if url[url_off + i] == 63 {           // '?'
+            path_len[0] = i;
+            q_off[0] = i + 1;
+            q_len[0] = url_len - (i + 1);
+            return;
+        }
+        i = i + 1;
+    }
+    path_len[0] = url_len;
+    q_off[0] = 0;
+    q_len[0] = 0;
+}
+
+// path 是否**正好**等于 lit（长短与逐字节都比）。用于端点分派。
+export fn srv_path_is(url: &const byte, url_off: usize, path_len: usize,
+    lit: &const byte) bool {
+    const ll: usize = bufx_cstr_len(lit);
+    if ll != path_len {
+        return false;
+    }
+    var i: usize = 0;
+    while i < ll {
+        if url[url_off + i] != lit[i] {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+// 在 query 里取键 `key` 的值，%XX 与 '+' 解码后**追加进** out（调用方先
+// `buf_reset`）。值的边界是下一个 '&'；键比较大小写敏感（前端自己拼的 query）。
+export fn srv_query_get(url: &const byte, q_off: usize, q_len: usize,
+    key: &const byte, out: &Buf) bool {
+    const kl: usize = bufx_cstr_len(key);
+    var i: usize = 0;
+    while i < q_len {
+        var eq: usize = i;
+        while eq < q_len && url[q_off + eq] != 61 && url[q_off + eq] != 38 {
+            eq = eq + 1;
+        }
+        if eq < q_len && url[q_off + eq] == 61 && eq - i == kl {
+            var hit: bool = true;
+            var k: usize = 0;
+            while k < kl {
+                if url[q_off + i + k] != key[k] {
+                    hit = false;
+                    break;
+                }
+                k = k + 1;
+            }
+            if hit {
+                srv_url_decode(url, q_off + eq + 1, q_len - (eq + 1), out);
+                return true;
+            }
+        }
+        while i < q_len && url[q_off + i] != 38 {
+            i = i + 1;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+// query 值（[from, from+len) 里到下一个 '&' 为止）解码后追加进 out：
+// `%XX` → 字节、`'+'` → 空格。
+export fn srv_url_decode(url: &const byte, from: usize, len: usize,
+    out: &Buf) void {
+    var i: usize = 0;
+    while i < len {
+        const ch: byte = url[from + i];
+        if ch == 38 {                     // '&' 之后是别的键了
+            return;
+        }
+        if ch == 37 && i + 2 < len {      // '%'
+            const hi: i32 = srv_hexval(url[from + i + 1]);
+            const lo: i32 = srv_hexval(url[from + i + 2]);
+            if hi >= 0 && lo >= 0 {
+                _ = buf_append_byte(out, (hi * 16 + lo) as byte);
+                i = i + 3;
+                continue;
+            }
+        }
+        if ch == 43 {                     // '+' = 空格（form-urlencoded）
+            _ = buf_append_byte(out, 32);
+        } else {
+            _ = buf_append_byte(out, ch);
+        }
+        i = i + 1;
+    }
+}
+
+// 十六进制位 → 值（0–15），不是十六进制返回 -1。
+fn srv_hexval(ch: byte) i32 {
+    if ch >= 48 && ch <= 57 {
+        return (ch - 48) as i32;
+    }
+    if ch >= 97 && ch <= 102 {
+        return ((ch - 97) + 10) as i32;
+    }
+    if ch >= 65 && ch <= 70 {
+        return ((ch - 65) + 10) as i32;
+    }
+    return -1;
+}
+
+// ============================================================
+// 响应
+// ============================================================
+
+// 拼并发送一个**完整**响应：头 + body，带 Content-Length 与 Connection: close。
+// 返回是否所有字节都写成功（失败时调用方只需关连接 —— 对端已经走人了）。
+export fn srv_send_response(fd: i32, status_line: &const byte,
+    ctype: &const byte, body: &const byte, blen: usize) bool {
+    var head: Buf = buf_new(blen + 512);
+    defer { buf_free(&head); }
+    if !buf_valid(&head) {
+        return false;
+    }
+    _ = buf_append_cstr(&head, "HTTP/1.1 ");
+    _ = buf_append_cstr(&head, status_line);
+    _ = buf_append_cstr(&head, "\r\nContent-Type: ");
+    _ = buf_append_cstr(&head, ctype);
+    _ = buf_append_cstr(&head, "\r\nContent-Length: ");
+    _ = buf_append_u64(&head, blen as u64);
+    _ = buf_append_cstr(&head, "\r\nConnection: close\r\n\r\n");
+    if !srv_write_all(fd, head.ptr as &const byte, head.len) {
+        return false;
+    }
+    if blen == 0 {
+        return true;
+    }
+    return srv_write_all(fd, body, blen);
+}
+
+// 只发响应头，后面跟**分块编码**的流（`/api/screen` 的长连接用它：长度事先未知）。
+// `extra` 可带附加头（以 "\r\n" 开头、以 "\r\n" 结尾），空则不带。
+export fn srv_send_head(fd: i32, status_line: &const byte, ctype: &const byte,
+    extra: &const byte, extra_len: usize) bool {
+    var head: Buf = buf_new(512);
+    defer { buf_free(&head); }
+    if !buf_valid(&head) {
+        return false;
+    }
+    _ = buf_append_cstr(&head, "HTTP/1.1 ");
+    _ = buf_append_cstr(&head, status_line);
+    _ = buf_append_cstr(&head, "\r\nContent-Type: ");
+    _ = buf_append_cstr(&head, ctype);
+    if extra_len > 0 {
+        _ = buf_append(&head, extra, extra_len);
+    }
+    _ = buf_append_cstr(&head,
+        "\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n");
+    return srv_write_all(fd, head.ptr as &const byte, head.len);
+}
+
+// 发一块分块编码的数据（chunked）。n 为 0 时**不写任何字节** —— 分块编码里的空块
+// 是「流结束」，语义不同；想结束流请直接关连接。
+export fn srv_send_chunk(fd: i32, p: &const byte, n: usize) bool {
+    if n == 0 {
+        return true;
+    }
+    var head: Buf = buf_new(24);
+    defer { buf_free(&head); }
+    if !buf_valid(&head) {
+        return false;
+    }
+    srv_append_hex(&head, n);
+    _ = buf_append_cstr(&head, "\r\n");
+    if !srv_write_all(fd, head.ptr as &const byte, head.len) {
+        return false;
+    }
+    if !srv_write_all(fd, p, n) {
+        return false;
+    }
+    return srv_write_all(fd, "\r\n" as &const byte, 2);
+}
+
+// 十六进制小写（分块长度头用）。`bufx` 只有 `hex_of`（定长 digest → 定长 hex），
+// 没有「整数 → hex」，所以这里自己写一个（分块长度头的格式是硬性的）。
+fn srv_append_hex(out: &Buf, v: usize) void {
+    const hexd: &[byte] = &"0123456789abcdef"[0: 16];
+    if v == 0 {
+        _ = buf_append_byte(out, 48);
+        return;
+    }
+    var tmp: [byte: 24] = [0: 24];
+    var n: usize = v;
+    var i: usize = 0;
+    while n > 0 && i < 24 {
+        tmp[i] = hexd[n % (16 as usize)];
+        n = n / (16 as usize);
+        i = i + 1;
+    }
+    while i > 0 {
+        i = i - 1;
+        _ = buf_append_byte(out, tmp[i]);
+    }
+}
+
+// 阻塞把 n 字节写干净。**写套接字不能用非阻塞 + 忙等重试**（会把 CPU 烧掉），
+// 所以对「没写完」用 `poll(POLLOUT)` 等 50ms 再试，最多 200 轮（≈10s 的停滞容忍）。
+export fn srv_write_all(fd: i32, p: &const byte, n: usize) bool {
+    var off: usize = 0;
+    var spins: i32 = 0;
+    while off < n {
+        const at: *const byte = @ptr_from_usize(
+            @usize_from_ptr(p as &const void) + off) as *const byte;
+        const w: isize = sys_write(fd, at, n - off) catch { -1 as isize; };
+        if w > 0 {
+            off = off + (w as usize);
+            spins = 0;
+            continue;
+        }
+        if w == 0 {
+            return false;
+        }
+        spins = spins + 1;
+        if spins > 200 {
+            return false;
+        }
+        var pfds: [PollFd: 1] = [PollFd{ fd: fd, events: POLLOUT, revents: 0 }];
+        _ = sys_poll(&pfds[0], 1, 50) catch {};
+    }
+    return true;
+}
+
+// 关连接（写失败/收尾都走它）。fd < 0 是空操作。
+export fn srv_close(fd: i32) void {
+    if fd < 0 {
+        return;
+    }
+    _ = sys_close(fd) catch {};
+}
+
+// ============================================================
+// 状态行与 Content-Type（页面/接口用到的就这几条，集中一处避免措辞漂移）
+// ============================================================
+
+export const SRV_ST_200: &const byte = "200 OK" as &const byte;
+export const SRV_ST_204: &const byte = "204 No Content" as &const byte;
+export const SRV_ST_400: &const byte = "400 Bad Request" as &const byte;
+export const SRV_ST_404: &const byte = "404 Not Found" as &const byte;
+export const SRV_ST_405: &const byte = "405 Method Not Allowed" as &const byte;
+export const SRV_ST_413: &const byte = "413 Content Too Large" as &const byte;
+
+// 行宽豁免：以下全是不可断的 MIME 字面量（断行会破坏 Content-Type 的原文）。
+export const SRV_CT_HTML: &const byte = "text/html; charset=utf-8" as &const byte;
+export const SRV_CT_TEXT: &const byte = "text/plain; charset=utf-8" as &const byte;
+export const SRV_CT_JSON: &const byte = "application/json; charset=utf-8" as &const byte;
+export const SRV_CT_NDJSON: &const byte = "application/x-ndjson; charset=utf-8" as &const byte;
+export const SRV_CT_PNG: &const byte = "image/png" as &const byte;
+export const SRV_CT_JPEG: &const byte = "image/jpeg" as &const byte;
+export const SRV_CT_GIF: &const byte = "image/gif" as &const byte;
+export const SRV_CT_WEBP: &const byte = "image/webp" as &const byte;
+// 行宽豁免：不可断的 MIME 字面量（断行会破坏 Content-Type 的原文）。
+export const SRV_CT_BIN: &const byte = "application/octet-stream" as &const byte;
