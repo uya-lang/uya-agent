@@ -1,0 +1,503 @@
+// src/selftest/st_pm.uya — 项目记忆的自测轮（P66）
+//
+// 本文件：P66 的三条验收轮 —— `pms_identity_round`（worktree 与主仓归一到同一个键）、
+//   `pms_roundtrip_round`（写 → 读 → 逐字节等价 + 归并 + 排序确定）、
+//   `pms_concurrent_round`（**并发轮**：两个分片交错写入后归并 == 串行基线）。
+// 不变量：① 每轮自己造**独占**目录（带 pid 后缀）并自己收干净 —— 整轮 selftest 会 fork
+//   许多子进程跑同一份 selftest，共享目录会互相踩（与 `wt_ws_pid` 同一条实测教训）；
+//   ② 轮内**不依赖真实时钟**：时间戳由夹具显式给定（`pms_fact` 的 ts），于是「同输入同
+//   输出」可断言；③ 反斜杠 / 引号 / 换行的往返必须原样 —— JSONL 的行边界不能被内容破坏。
+// 依赖：libc（syscall / unistd）；本仓 foundation/bufx、foundation/jsonx、tools/fsx、
+//   pm/pm_repo、pm/pm_store、vcs/gitx（造真 worktree 夹具）；断言助手用 `stx_*`。
+// 命名：`pms_*`（本文件的轮与夹具）。
+
+use libc.syscall;
+use libc.unistd;
+
+// bool → i64。`stx_num_eq` 只收 i64，而字面量 if 表达式会退成 i32（与既有的 `b2i` 同款）。
+fn pms_b(v: bool) i64 {
+    if v {
+        return 1;
+    }
+    return 0;
+}
+
+// 造一个独占测试根：`/tmp/selftest_pm_<tag>_<pid>`。
+// 为什么用绝对路径：整轮 selftest 里前几轮会**真的 chdir**（工作区那几轮），相对路径到
+// 这一轮时 cwd 已经不是仓库根了（与 `wt_ws_pid` 同一条教训）。
+fn pms_root(tag: &const byte, out: &Buf) void {
+    buf_reset(out);
+    _ = buf_append_cstr(out, "/tmp/selftest_pm_");
+    _ = buf_append_cstr(out, tag);
+    _ = buf_append_byte(out, 95);
+    const pid: i64 = sys_getpid() catch { 0 as i64; };
+    _ = buf_append_i64(out, pid);
+}
+
+// Buf → 带 NUL 的副本（给收 C 字符串的 syscall / gitx_run 用）。
+fn pms_z(src: &const Buf, out: &Buf) void {
+    buf_reset(out);
+    _ = buf_append(out, src.ptr as &const byte, src.len);
+    _ = buf_append_byte(out, 0);
+}
+
+// `src` + `suffix` → out（不含 NUL）。
+fn pms_cat(src: &const Buf, suffix: &const byte, out: &Buf) void {
+    buf_reset(out);
+    _ = buf_append(out, src.ptr as &const byte, src.len);
+    _ = buf_append_cstr(out, suffix);
+}
+
+// 造一条事实：字段全给，便于断言逐字节可比。返回**值**，调用方用 `pms_fact_free` 收。
+// 为什么不复用 `pm_fact_empty`：那个是 pm_store 的私有函数，这里显式写一份是为了让
+// 「测试夹具的零值」与「生产代码的零值」各自的意图都能被单独读出来。
+fn pms_fact(kind: u8, status: u8, ts: i64, key: &const byte,
+            value: &const byte) PmFact {
+    var f: PmFact = PmFact{
+        kind: kind, status: status, ts: ts, ts_last: ts, n: 1,
+        key: buf_empty(), value: buf_empty(), src: buf_empty(),
+        mt: 0, mt_ns: 0, size: 0,
+    };
+    _ = buf_append_cstr(&f.key, key);
+    _ = buf_append_cstr(&f.value, value);
+    _ = buf_append_cstr(&f.src, "sess-A");
+    return f;
+}
+
+// 释放一条**栈上**的 PmFact（`pm_set_free` 只管集合内部）。
+fn pms_fact_free(f: &PmFact) void {
+    buf_free(&f.key);
+    buf_free(&f.value);
+    buf_free(&f.src);
+}
+
+// 写进分片（sid 决定分片文件名）。
+fn pms_append(dir: &const Buf, sid: &const byte, f: &const PmFact) bool {
+    return pm_store_append(dir.ptr as &const byte, dir.len, sid,
+                           bufx_cstr_len(sid), f);
+}
+
+// 把集合渲染成 `kind|key|value|n` 逐行文本，用于**跨次读取**的逐字节比对。
+// 为什么不比内存结构：Buf 里的指针每次分配都不同，比结构等于比地址，永远不等。
+fn pms_render(s: &const PmSet, out: &Buf) void {
+    buf_reset(out);
+    var i: usize = 0;
+    while i < s.n {
+        const f: &const PmFact = &s.items[i];
+        _ = buf_append_cstr(out, pm_kind_name(f.kind));
+        _ = buf_append_byte(out, 124);
+        _ = buf_append(out, f.key.ptr as &const byte, f.key.len);
+        _ = buf_append_byte(out, 124);
+        _ = buf_append(out, f.value.ptr as &const byte, f.value.len);
+        _ = buf_append_byte(out, 124);
+        _ = buf_append_i64(out, f.n as i64);
+        _ = buf_append_byte(out, 10);
+        i = i + 1;
+    }
+}
+
+// 跑一条 git 子命令（stdout 丢弃，stderr 交给调用方）。argv 以 null 结尾。
+fn pms_git(argv: &(&const byte), errout: &Buf) i32 {
+    var o: Buf = buf_new(4096);
+    defer { buf_free(&o); }
+    return gitx_run(null as &const byte, argv, &o, errout, 4096);
+}
+
+// ============================================================
+// 轮 1：项目身份 —— worktree 与主仓必须归到**同一个**项目键
+// ============================================================
+// 这是整个方案能成立的前提：实测 167 次 session/workspace 是 worktree 切换，
+// 真实 cwd 每个会话都不同；按 cwd 算键等于每次都是新项目，记忆永远攒不起来。
+// 用**真仓**验（git init → 提交 → worktree add），不 mock `.git` 的文件形状。
+// 不拆：这是一条**线性**的验收轮 —— 夹具（真仓 + worktree）→ 断言同键 → 断言子目录 /
+// 尾斜杠 / 无 git 三种边界，每一步都依赖前面的产物。拆成小函数要把 6 个局部量
+// （root/rootz/wt/wtz/r_main/k_*）一路当参数穿进去，而 Uya 在「参数已经是指针、
+// 调用处又写 &参数」时会静默变成双指针（实测把这一轮拆完连炸四次段错误）。
+// 拆它的收益（可读性）远小于风险（把一条本来可信的验收轮改成不可信的）。
+fn pms_identity_round(tag: &const byte) bool {
+    var ok: bool = true;
+    var root: Buf = buf_new(256);
+    defer { buf_free(&root); }
+    pms_root("id" as &const byte, &root);
+    var rootz: Buf = buf_new(260);
+    defer { buf_free(&rootz); }
+    _ = pm_rm_rf(root.ptr as &const byte, root.len);
+    pms_z(&root, &rootz);
+    _ = sess_mkdir_p(rootz.ptr as &const byte);
+
+    var err: Buf = buf_new(4096);
+    defer { buf_free(&err); }
+    var av: [&const byte: 8] = [null as &const byte: 8];
+    av[0] = "git" as &const byte;
+    av[1] = "-C" as &const byte;
+    av[2] = rootz.ptr as &const byte;
+    av[3] = "init" as &const byte;
+    av[4] = "-q" as &const byte;
+    av[5] = null as &const byte;
+    const rc_init: i32 = pms_git(&av[0], &err);
+
+    var seed: Buf = buf_new(300);
+    defer { buf_free(&seed); }
+    pms_cat(&root, "/seed.txt" as &const byte, &seed);
+    var seedz: Buf = buf_new(304);
+    defer { buf_free(&seedz); }
+    pms_z(&seed, &seedz);
+    const wrote: bool =
+        write_text_file(seedz.ptr as &const byte, "seed\n" as &const byte);
+
+    // add
+    var ava: [&const byte: 8] = [null as &const byte: 8];
+    ava[0] = "git" as &const byte;
+    ava[1] = "-C" as &const byte;
+    ava[2] = rootz.ptr as &const byte;
+    ava[3] = "add" as &const byte;
+    ava[4] = "." as &const byte;
+    ava[5] = null as &const byte;
+    _ = pms_git(&ava[0], &err);
+    // commit（`-c user.*` 让夹具不依赖宿主 git 配置）
+    var avm: [&const byte: 12] = [null as &const byte: 12];
+    avm[0] = "git" as &const byte;
+    avm[1] = "-C" as &const byte;
+    avm[2] = rootz.ptr as &const byte;
+    avm[3] = "-c" as &const byte;
+    avm[4] = "user.email=t@t" as &const byte;
+    avm[5] = "-c" as &const byte;
+    avm[6] = "user.name=t" as &const byte;
+    avm[7] = "commit" as &const byte;
+    avm[8] = "-m" as &const byte;
+    avm[9] = "seed" as &const byte;
+    avm[10] = null as &const byte;
+    const rc_c: i32 = pms_git(&avm[0], &err);
+
+    // worktree add --detach <root>/wt
+    var wt: Buf = buf_new(300);
+    defer { buf_free(&wt); }
+    pms_cat(&root, "/wt" as &const byte, &wt);
+    var wtz: Buf = buf_new(304);
+    defer { buf_free(&wtz); }
+    pms_z(&wt, &wtz);
+    var avw: [&const byte: 10] = [null as &const byte: 10];
+    avw[0] = "git" as &const byte;
+    avw[1] = "-C" as &const byte;
+    avw[2] = rootz.ptr as &const byte;
+    avw[3] = "worktree" as &const byte;
+    avw[4] = "add" as &const byte;
+    avw[5] = "-q" as &const byte;
+    avw[6] = "--detach" as &const byte;
+    avw[7] = wtz.ptr as &const byte;
+    avw[8] = null as &const byte;
+    const rc_w: i32 = pms_git(&avw[0], &err);
+
+    const ready: bool = rc_init == 0 && wrote && rc_c == 0 && rc_w == 0;
+    stx_num_eq(tag, "夹具：真仓 + worktree 建成", pms_b(ready), 1, &ok);
+    if !ready {
+        _ = pm_rm_rf(root.ptr as &const byte, root.len);
+        return ok;
+    }
+
+    // 主仓根 vs worktree 根
+    var r_main: Buf = buf_new(PM_PATH_MAX);
+    defer { buf_free(&r_main); }
+    _ = pm_repo_root(root.ptr as &const byte, root.len, &r_main);
+    var r_wt: Buf = buf_new(PM_PATH_MAX);
+    defer { buf_free(&r_wt); }
+    _ = pm_repo_root(wt.ptr as &const byte, wt.len, &r_wt);
+    stx_eq(tag, "worktree 的根 = 主仓根", &r_wt, r_main.ptr as &const byte, &ok);
+
+    // 键相等（这才是真正被落盘用的那个量）
+    var k_main: Buf = buf_new(64);
+    defer { buf_free(&k_main); }
+    _ = pm_repo_key(r_main.ptr as &const byte, r_main.len, &k_main);
+    var k_wt: Buf = buf_new(64);
+    defer { buf_free(&k_wt); }
+    _ = pm_repo_key(r_wt.ptr as &const byte, r_wt.len, &k_wt);
+    stx_num_eq(tag, "项目键长度 = 32", k_wt.len as i64, 32, &ok);
+    stx_num_eq(tag, "worktree 与主仓同键",
+        pms_b(k_main.len == k_wt.len &&
+              bufx_mem_eq(k_main.ptr as &const byte,
+                          k_wt.ptr as &const byte, 32)),
+        1, &ok);
+
+    // 子目录也要归到同一个根（agent 的 cwd 常常是子目录）
+    var sub: Buf = buf_new(320);
+    defer { buf_free(&sub); }
+    pms_cat(&root, "/a/b" as &const byte, &sub);
+    var subz: Buf = buf_new(324);
+    defer { buf_free(&subz); }
+    pms_z(&sub, &subz);
+    _ = sess_mkdir_p(subz.ptr as &const byte);
+    var r_sub: Buf = buf_new(PM_PATH_MAX);
+    defer { buf_free(&r_sub); }
+    _ = pm_repo_root(sub.ptr as &const byte, sub.len, &r_sub);
+    stx_eq(tag, "子目录归到仓库根", &r_sub, r_main.ptr as &const byte, &ok);
+
+    // 尾部斜杠不影响根（`/a/b/` 与 `/a/b` 必须同键 —— 否则同仓两个键）
+    var slash: Buf = buf_new(320);
+    defer { buf_free(&slash); }
+    _ = buf_append(&slash, root.ptr as &const byte, root.len);
+    _ = buf_append_byte(&slash, 47);
+    var r_slash: Buf = buf_new(PM_PATH_MAX);
+    defer { buf_free(&r_slash); }
+    _ = pm_repo_root(slash.ptr as &const byte, slash.len, &r_slash);
+    stx_eq(tag, "尾部斜杠不影响根", &r_slash, r_main.ptr as &const byte, &ok);
+
+    // 不在 git 仓里：以传入目录为根，**不报错**（/tmp 那 341 个会话靠这条）
+    var r_nogit: Buf = buf_new(PM_PATH_MAX);
+    defer { buf_free(&r_nogit); }
+    const ok_nogit: bool = pm_repo_root("/tmp" as &const byte, 4, &r_nogit);
+    stx_num_eq(tag, "无 git 时以传入目录为根（不报错）",
+        pms_b(ok_nogit && r_nogit.len == 4), 1, &ok);
+
+    _ = pm_rm_rf(root.ptr as &const byte, root.len);
+    if ok {
+        out_err("selftest[");
+        out_err(tag);
+        out_err("] ok\n");
+    }
+    return ok;
+}
+
+// ============================================================
+// 轮 2：存储 round-trip —— 写 → 读 → 逐字节等价
+// ============================================================
+// 覆盖：① 事实经 JSONL 编解码后逐字段不变（含引号 / 反斜杠 / 换行）；
+// ② 同 (kind,key) 的多次观察**归并成一条**并把 n 累加；
+// ③ 排序确定 —— 两次读出的渲染结果逐字节相同（「开工包可复现」的地基）。
+fn pms_roundtrip_round(tag: &const byte) bool {
+    var ok: bool = true;
+    var root: Buf = buf_new(256);
+    defer { buf_free(&root); }
+    pms_root("rt" as &const byte, &root);
+    _ = pm_rm_rf(root.ptr as &const byte, root.len);
+
+    var key: Buf = buf_new(64);
+    defer { buf_free(&key); }
+    _ = pm_repo_key("proj/rt" as &const byte, 7, &key);
+    var dir: Buf = buf_new(512);
+    defer { buf_free(&dir); }
+    _ = pm_dir(root.ptr as &const byte, root.len, &key, &dir);
+    stx_num_eq(tag, "记忆目录非空", pms_b(dir.len > 0), 1, &ok);
+    stx_num_eq(tag, "记忆目录建成功",
+        pms_b(pm_ensure_dir(dir.ptr as &const byte, dir.len)), 1, &ok);
+
+    var f1: PmFact = pms_fact(PM_K_LAYOUT, PM_S_OBSERVED, 1000,
+        "src/agent/agent.uya" as &const byte, "入口 main / 参数解析" as &const byte);
+    defer { pms_fact_free(&f1); }
+    var f2: PmFact = pms_fact(PM_K_COMMANDS, PM_S_OBSERVED, 2000,
+        "make check" as &const byte, "词法/语法/类型检查" as &const byte);
+    defer { pms_fact_free(&f2); }
+    // 转义地狱：引号 + 反斜杠 + 换行（JSONL 的行边界必须不被破坏）
+    var f3: PmFact = pms_fact(PM_K_STATE, PM_S_OBSERVED, 3000,
+        "note" as &const byte, "say \"hi\" \\ end\nsecond line" as &const byte);
+    defer { pms_fact_free(&f3); }
+
+    stx_num_eq(tag, "写 layout",
+        pms_b(pms_append(&dir, "sess-1" as &const byte, &f1)), 1, &ok);
+    stx_num_eq(tag, "写 command",
+        pms_b(pms_append(&dir, "sess-1" as &const byte, &f2)), 1, &ok);
+    stx_num_eq(tag, "写含转义的 state",
+        pms_b(pms_append(&dir, "sess-1" as &const byte, &f3)), 1, &ok);
+
+    var s1: PmSet = pm_set_empty();
+    defer { pm_set_free(&s1); }
+    _ = pm_store_load(dir.ptr as &const byte, dir.len, &s1);
+    stx_num_eq(tag, "载入 3 条", s1.n as i64, 3, &ok);
+    pm_set_sort(&s1);
+    var a: Buf = buf_new(2048);
+    defer { buf_free(&a); }
+    pms_render(&s1, &a);
+
+    var s2: PmSet = pm_set_empty();
+    defer { pm_set_free(&s2); }
+    _ = pm_store_load(dir.ptr as &const byte, dir.len, &s2);
+    stx_num_eq(tag, "第二次载入 3 条", s2.n as i64, 3, &ok);
+    pm_set_sort(&s2);
+    var b: Buf = buf_new(2048);
+    defer { buf_free(&b); }
+    pms_render(&s2, &b);
+    stx_buf_eq(tag, "两次读出的渲染逐字节相同", &b, &a, &ok);
+
+    // 转义往返：那条 state 的 value 必须原样回来
+    var found: bool = false;
+    var i: usize = 0;
+    while i < s1.n {
+        const f: &const PmFact = &s1.items[i];
+        if f.kind == PM_K_STATE && f.key.len == 4 {
+            const want: &const byte =
+                "say \"hi\" \\ end\nsecond line" as &const byte;
+            if f.value.len == bufx_cstr_len(want) &&
+               bufx_mem_eq(f.value.ptr as &const byte, want, f.value.len) {
+                found = true;
+            }
+        }
+        i = i + 1;
+    }
+    stx_num_eq(tag, "含引号/反斜杠/换行的 value 原样往返", pms_b(found), 1, &ok);
+
+    // 同 (kind,key) 再写一次（另一个分片）→ 归并成一条，n 累加
+    var f2b: PmFact = pms_fact(PM_K_COMMANDS, PM_S_OBSERVED, 2500,
+        "make check" as &const byte, "词法/语法/类型检查" as &const byte);
+    defer { pms_fact_free(&f2b); }
+    stx_num_eq(tag, "重复观察写入另一分片",
+        pms_b(pms_append(&dir, "sess-2" as &const byte, &f2b)), 1, &ok);
+    var s3: PmSet = pm_set_empty();
+    defer { pm_set_free(&s3); }
+    _ = pm_store_load(dir.ptr as &const byte, dir.len, &s3);
+    stx_num_eq(tag, "重复观察归并后仍是 3 条", s3.n as i64, 3, &ok);
+    var ncmd: i64 = 0;
+    i = 0;
+    while i < s3.n {
+        if s3.items[i].kind == PM_K_COMMANDS {
+            ncmd = s3.items[i].n as i64;
+        }
+        i = i + 1;
+    }
+    stx_num_eq(tag, "同 key 的观察次数累加为 2", ncmd, 2, &ok);
+
+    _ = pm_rm_rf(root.ptr as &const byte, root.len);
+    if ok {
+        out_err("selftest[");
+        out_err(tag);
+        out_err("] ok\n");
+    }
+    return ok;
+}
+
+// ============================================================
+// 轮 3：并发轮 —— 两个分片交错写入，归并结果 == 另一种顺序
+// ============================================================
+// 钉的是**多写者丢更新**：实测同一仓库根下成百个会话（`/tmp` 一个 cwd 就 341 个）。若采用
+// 「共享快照重写」，后写的会把先写的整份覆盖掉 —— 前一个会话的信念静默消失。分片追加则不会。
+// 判据：交错写入（A1 B1 A2 B2）与（B1 A1 B2 A2）的归并结果**逐字节相同**；
+// 且分片确实是**两个文件**（否则「分片」这个前提本身没被验到）。
+// 不拆：同上 —— 两个仓（root/root2）与四个分片句柄互相引用，交错写入的判据
+// 正是「同一批事实两种顺序」，拆开就看不见这个对照了。
+fn pms_concurrent_round(tag: &const byte) bool {
+    var ok: bool = true;
+    var root: Buf = buf_new(256);
+    defer { buf_free(&root); }
+    pms_root("cc" as &const byte, &root);
+    _ = pm_rm_rf(root.ptr as &const byte, root.len);
+    var root2: Buf = buf_new(256);
+    defer { buf_free(&root2); }
+    pms_root("cc2" as &const byte, &root2);
+    _ = pm_rm_rf(root2.ptr as &const byte, root2.len);
+
+    var key: Buf = buf_new(64);
+    defer { buf_free(&key); }
+    _ = pm_repo_key("proj/cc" as &const byte, 7, &key);
+    var dirA: Buf = buf_new(512);
+    defer { buf_free(&dirA); }
+    _ = pm_dir(root.ptr as &const byte, root.len, &key, &dirA);
+    _ = pm_ensure_dir(dirA.ptr as &const byte, dirA.len);
+    var dirB: Buf = buf_new(512);
+    defer { buf_free(&dirB); }
+    _ = pm_dir(root2.ptr as &const byte, root2.len, &key, &dirB);
+    _ = pm_ensure_dir(dirB.ptr as &const byte, dirB.len);
+
+    var fa1: PmFact =
+        pms_fact(PM_K_LAYOUT, PM_S_OBSERVED, 100,
+                 "a1" as &const byte, "va1" as &const byte);
+    defer { pms_fact_free(&fa1); }
+    var fb1: PmFact =
+        pms_fact(PM_K_LAYOUT, PM_S_OBSERVED, 200,
+                 "b1" as &const byte, "vb1" as &const byte);
+    defer { pms_fact_free(&fb1); }
+    var fa2: PmFact =
+        pms_fact(PM_K_COMMANDS, PM_S_OBSERVED, 300,
+                 "a2" as &const byte, "va2" as &const byte);
+    defer { pms_fact_free(&fa2); }
+    // b2 与 a1 **同 (kind,key)**：跨会话的同一事实 → 必须归并，而不是出现两条
+    var fb2: PmFact =
+        pms_fact(PM_K_LAYOUT, PM_S_OBSERVED, 400,
+                 "a1" as &const byte, "va1b" as &const byte);
+    defer { pms_fact_free(&fb2); }
+
+    stx_num_eq(tag, "A1",
+        pms_b(pms_append(&dirA, "sess-A" as &const byte, &fa1)), 1, &ok);
+    stx_num_eq(tag, "B1",
+        pms_b(pms_append(&dirA, "sess-B" as &const byte, &fb1)), 1, &ok);
+    stx_num_eq(tag, "A2",
+        pms_b(pms_append(&dirA, "sess-A" as &const byte, &fa2)), 1, &ok);
+    stx_num_eq(tag, "B2",
+        pms_b(pms_append(&dirA, "sess-B" as &const byte, &fb2)), 1, &ok);
+
+    // 两个分片、各自非空 —— 「不共享快照」的现场证据
+    var shA: Buf = buf_new(512);
+    defer { buf_free(&shA); }
+    _ = pm_shard_path(dirA.ptr as &const byte, dirA.len,
+                      "sess-A" as &const byte, 6, &shA);
+    var shB: Buf = buf_new(512);
+    defer { buf_free(&shB); }
+    _ = pm_shard_path(dirA.ptr as &const byte, dirA.len,
+                      "sess-B" as &const byte, 6, &shB);
+    stx_num_eq(tag, "两个会话写的是两个分片",
+        pms_b(shA.len != shB.len ||
+              !bufx_mem_eq(shA.ptr as &const byte,
+                           shB.ptr as &const byte, shA.len)),
+        1, &ok);
+    var za: Buf = buf_new(516);
+    defer { buf_free(&za); }
+    pms_z(&shA, &za);
+    var zb: Buf = buf_new(516);
+    defer { buf_free(&zb); }
+    pms_z(&shB, &zb);
+    var stA: FsStat = FsStat{
+        exists: false, is_dir: false, size: 0, mtime: 0, mtime_nsec: 0,
+    };
+    var stB: FsStat = FsStat{
+        exists: false, is_dir: false, size: 0, mtime: 0, mtime_nsec: 0,
+    };
+    _ = fs_stat(za.ptr as &const byte, &stA);
+    _ = fs_stat(zb.ptr as &const byte, &stB);
+    stx_num_eq(tag, "两个分片都存在且非空",
+        pms_b(stA.exists && stB.exists &&
+              stA.size > 0 && stB.size > 0), 1, &ok);
+
+    var s1: PmSet = pm_set_empty();
+    defer { pm_set_free(&s1); }
+    _ = pm_store_load(dirA.ptr as &const byte, dirA.len, &s1);
+    pm_set_sort(&s1);
+    var r1: Buf = buf_new(2048);
+    defer { buf_free(&r1); }
+    pms_render(&s1, &r1);
+    stx_num_eq(tag, "交错写入后归并为 3 条（a1 与 b2 合并）", s1.n as i64, 3, &ok);
+
+    // 另一种交错顺序（B1 A1 B2 A2）→ 结果必须**逐字节一样**
+    _ = pms_append(&dirB, "sess-B" as &const byte, &fb1);
+    _ = pms_append(&dirB, "sess-A" as &const byte, &fa1);
+    _ = pms_append(&dirB, "sess-B" as &const byte, &fb2);
+    _ = pms_append(&dirB, "sess-A" as &const byte, &fa2);
+    var s2: PmSet = pm_set_empty();
+    defer { pm_set_free(&s2); }
+    _ = pm_store_load(dirB.ptr as &const byte, dirB.len, &s2);
+    pm_set_sort(&s2);
+    var r2: Buf = buf_new(2048);
+    defer { buf_free(&r2); }
+    pms_render(&s2, &r2);
+    stx_buf_eq(tag, "另一种交错顺序归并结果逐字节相同", &r2, &r1, &ok);
+
+    // 崩溃尾巴：往一个分片尾部追加半行（没有换行结尾）→ 必须被丢掉，前面的都算数
+    var half: Buf = buf_new(512);
+    defer { buf_free(&half); }
+    _ = buf_append_cstr(&half, "{\"kind\":\"layout\",\"status\":0,\"ts\":9");
+    _ = pm_append_file(za.ptr as &const byte,
+                       half.ptr as &const byte, half.len);
+    var s3: PmSet = pm_set_empty();
+    defer { pm_set_free(&s3); }
+    _ = pm_store_load(dirA.ptr as &const byte, dirA.len, &s3);
+    pm_set_sort(&s3);
+    var r3: Buf = buf_new(2048);
+    defer { buf_free(&r3); }
+    pms_render(&s3, &r3);
+    stx_buf_eq(tag, "半行尾部被丢掉、其余不变", &r3, &r1, &ok);
+
+    _ = pm_rm_rf(root.ptr as &const byte, root.len);
+    _ = pm_rm_rf(root2.ptr as &const byte, root2.len);
+    if ok {
+        out_err("selftest[");
+        out_err(tag);
+        out_err("] ok\n");
+    }
+    return ok;
+}

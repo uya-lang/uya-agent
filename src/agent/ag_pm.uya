@@ -1,0 +1,298 @@
+// src/agent/ag_pm.uya — 项目记忆的 agent 侧接线：注入 + 摄取钩子 + 会话级状态（P68）
+//
+// 本文件：会话级状态（`g_pm`）、`agent_pm_begin`（会话开始时算出目录 / 键并注入开工包）、
+//   `agent_pm_note_tool`（工具结果落地后摄取）、`agent_pm_note_user`（用户原话的候选惯例）、
+//   `agent_pm_report`（`/memory` 的人类可读报告）、`agent_pm_forget`（删掉整个记忆目录）。
+// 不变量：① **注入只有一次**（会话开始），且是**一条独立 user 消息** —— 与 `skills_catalog`
+//   同款。system prompt 一个字都不改，于是前缀缓存不受影响（§5.1/§5.2 的既有纪律）。
+//   ② `--no-memory` / `/memory off` 时**全程不读不写**：连目录都不碰，于是「关掉」与
+//   「没有这个功能」在行为上逐字节一致（自测的回归腿钉这条）。
+//   ③ 摄取**失败静默**：记忆是旁路，盘满 / 权限 / 解析失败都不许打断一次回合。
+//   ④ 目录与键**按会话算一次**（`agent_pm_begin`），中途换工作区不改它们 —— 一次会话
+//   只属于一个项目（换工作区是一次显式动作，那之后开的新会话算新项目）。
+// 依赖：libc（syscall / unistd）；本仓 foundation/bufx、agent/ag_config（Config /
+//   agent_default_home）、pm/pm_repo、pm/pm_store、pm/pm_ingest、pm/pm_digest。
+// 命名：`agent_pm_*`、`g_pm`、`AgentPm`。
+
+use libc.syscall;
+use libc.unistd;
+
+// 会话级的项目记忆状态。
+export struct AgentPm {
+    ready: bool,        // 目录与键已算好（false = 本会话不参与记忆）
+    dir: Buf,           // <agent_home>/memory/<repo-key>
+    key: Buf,           // repo-key（报告里显示前 8 位）
+    ws: Buf,            // 会话开始时的 workspace（校验相对路径要用它）
+    injected: bool,     // 开工包是否已经**尝试**过（只尝试一次）
+    pushed: bool,       // 是否真的注入了（injected 但没内容时为 false —— 报告要能区分）
+    n_ingested: i32,    // 本会话摄取的事实条数（报告用）
+}
+
+// 进程内唯一一份（与 `g_todos` / `g_goal` 同一族：可变状态量，不走常量大写前缀）。
+// ⚠ **不能**用 `buf_empty()` 做全局初始化式：那在 C 里不是常量（CODING.md §16 的踩坑），
+// 编译器会报 `initializer element is not constant`。所以全局用零值字面量（指针 null + 0），
+// 三个 Buf 在 `agent_pm_reset` / `agent_pm_begin` 里按需 `buf_new`。
+export var g_pm: AgentPm = AgentPm{
+    ready: false,
+    dir: Buf{ ptr: null, len: 0, cap: 0 },
+    key: Buf{ ptr: null, len: 0, cap: 0 },
+    ws: Buf{ ptr: null, len: 0, cap: 0 },
+    injected: false,
+    pushed: false,
+    n_ingested: 0,
+};
+
+// 本会话的摄取上下文。与 `g_pm` 分开是因为 `PmIngest` 有自己的生命周期
+// （`pm_ingest_init` / `pm_ingest_free`），混在一起会让「谁负责释放」变模糊。
+// 同样用零值字面量（理由见上）。
+var g_pm_ing: PmIngest = PmIngest{
+    dir: Buf{ ptr: null, len: 0, cap: 0 },
+    sid: Buf{ ptr: null, len: 0, cap: 0 },
+    ws: Buf{ ptr: null, len: 0, cap: 0 },
+    n_facts: 0,
+    enabled: false,
+};
+
+// 算项目身份：目录 + 键 + workspace，都在这里定下来。**只要 workspace，不要会话 id**。
+// 为什么要分开：`--resume` 那条路里 `agent_hist_from_log`（含注入点）跑在 `sess_open`
+// **之前**，那时 `g_sess.id` 还没生成 —— 若把「身份」与「分片名」绑成一个函数，恢复会话
+// 就注入不了开工包。分片名由 `agent_pm_set_sid` 在会话建好之后补上（摄取才需要它）。
+export fn agent_pm_begin(cfg: &const Config) bool {
+    // 先复位（`/new` / `--resume` 都走这条路，与 todo/goal 的会话级复位同一条纪律）
+    agent_pm_reset();
+    if cfg.memory_off {
+        return false;
+    }
+    var home: Buf = buf_new(1024);
+    defer { buf_free(&home); }
+    if !agent_default_home(cfg, &home) || home.len == 0 {
+        return false;
+    }
+    // 项目身份：按**归一化仓库根**算键，不按 cwd。实测 167 次 session/workspace 是
+    // worktree 切换（真实 cwd 每个会话都不同）—— 按 cwd 算等于每次都是新项目。
+    var root: Buf = buf_new(PM_PATH_MAX);
+    defer { buf_free(&root); }
+    if !pm_repo_root(cfg.workspace.ptr as &const byte, cfg.workspace.len,
+                     &root) {
+        return false;
+    }
+    if !pm_repo_key(root.ptr as &const byte, root.len, &g_pm.key) {
+        return false;
+    }
+    if !pm_dir(home.ptr as &const byte, home.len, &g_pm.key, &g_pm.dir) {
+        return false;
+    }
+    if g_pm.dir.len == 0 {
+        return false;
+    }
+    // 会话开始时的 workspace（校验锚点用）。`pm_verify` 要绝对路径，而事实的 key 可能是
+    // 相对路径（read 信封里的写法）——所以必须记下当时的 workspace。
+    buf_reset(&g_pm.ws);
+    if !buf_append(&g_pm.ws, cfg.workspace.ptr, cfg.workspace.len) {
+        return false;
+    }
+    g_pm.ready = true;
+    g_pm.injected = false;
+    g_pm.pushed = false;
+    g_pm.n_ingested = 0;
+    return true;
+}
+
+// 会话建好之后补上分片名，**摄取从此生效**。会话 id 为空时摄取保持关闭
+// （宁可不记，也不要写到一份来路不明的分片里）。
+export fn agent_pm_set_sid(sid: &const byte, sid_len: usize) bool {
+    if !g_pm.ready || sid_len == 0 || g_pm.dir.len == 0 {
+        return false;
+    }
+    return pm_ingest_init(&g_pm_ing, g_pm.dir.ptr as &const byte, g_pm.dir.len,
+                          sid, sid_len,
+                          g_pm.ws.ptr as &const byte, g_pm.ws.len);
+}
+
+// 释放并复位。幂等 —— 会话级复位（`agent_session_scoped_reset`）与进程退出都会调。
+export fn agent_pm_reset() void {
+    buf_free(&g_pm.dir);
+    buf_free(&g_pm.key);
+    buf_free(&g_pm.ws);
+    pm_ingest_free(&g_pm_ing);
+    g_pm.ready = false;
+    g_pm.injected = false;
+    g_pm.pushed = false;
+    g_pm.n_ingested = 0;
+}
+
+// 注入开工包：**一条独立 user 消息**，只注入一次。返回是否真的注入了。
+// 为什么独立 user 消息而不是 system 的一节：① 抄 `skills_catalog` 的现成做法；
+// ② system 前缀变了会让整段缓存失效（§5.1 的既有纪律）；③ 实测 `agent_hist_from_log`
+// 在 `--resume` 时会**重新注入**运行时上下文，所以恢复会话也吃得到这份开工包。
+export fn agent_pm_inject(cfg: &const Config, h: &History) bool {
+    if !g_pm.ready || g_pm.injected || cfg.memory_off {
+        return false;
+    }
+    g_pm.injected = true;   // 先置位：即使下面注不进去，也不再试第二次
+    var set: PmSet = pm_set_empty();
+    defer { pm_set_free(&set); }
+    if !pm_store_load(g_pm.dir.ptr as &const byte, g_pm.dir.len, &set) {
+        return false;
+    }
+    if set.n == 0 {
+        return false;   // 这个项目还没有记忆 —— 首次进来时就是这条路（行为与改动前一致）
+    }
+    pm_set_sort(&set);
+    const budget: usize = if cfg.memory_budget > 0 {
+        cfg.memory_budget
+    } else {
+        PM_DIGEST_BUDGET as usize
+    };
+    var dg: Buf = buf_new(budget + 4096);
+    defer { buf_free(&dg); }
+    if !pm_digest(&set, g_pm.ws.ptr as &const byte, g_pm.ws.len, budget, &dg) {
+        return false;
+    }
+    var pushed: bool = hist_push(h, ROLE_USER, dg.ptr as &const byte, dg.len);
+    while !pushed {
+        // 与 `agent_plan_snapshot_sync` 同款：历史满了就先丢最旧的（开工包是**新增**的
+        // 上下文，不该因为它放不下就整段丢掉）
+        if !hist_drop_oldest(h) {
+            return false;
+        }
+        pushed = hist_push(h, ROLE_USER, dg.ptr as &const byte, dg.len);
+    }
+    g_pm.pushed = true;
+    return true;
+}
+
+// 一条工具结果落地后摄取。失败静默（记忆是旁路）。
+export fn agent_pm_note_tool(name: &const byte, name_len: usize,
+                            args: &const byte, args_len: usize,
+                            result: &const byte, result_len: usize) void {
+    if !g_pm.ready || !g_pm_ing.enabled {
+        return;
+    }
+    _ = name_len;
+    const before: i32 = g_pm_ing.n_facts;
+    const t: u64 = ua_now_ms();
+    pm_ingest_tool(&g_pm_ing, name, name_len, args, args_len,
+                   result, result_len, t as i64);
+    g_pm.n_ingested = g_pm.n_ingested + (g_pm_ing.n_facts - before);
+}
+
+// 一条用户消息的候选惯例。只在含指令型词时才会真的落盘（见 `pm_ingest_user`）。
+export fn agent_pm_note_user(text: &const byte, text_len: usize) void {
+    if !g_pm.ready || !g_pm_ing.enabled {
+        return;
+    }
+    const before: i32 = g_pm_ing.n_facts;
+    const t: u64 = ua_now_ms();
+    pm_ingest_user(&g_pm_ing, text, text_len, t as i64);
+    g_pm.n_ingested = g_pm.n_ingested + (g_pm_ing.n_facts - before);
+}
+
+// ============================================================
+// 人类可读报告（`/memory`）
+// ============================================================
+// 打一份报告：目录、键、事实按类别计数、以及每条一行的清单（带 stale 标注）。
+// 与 `/tasks` 同性质：**只读**视图，不动历史、不改状态。
+export fn agent_pm_report(cfg: &const Config, out: &Buf) void {
+    if cfg.memory_off {
+        _ = buf_append_cstr(out, "项目记忆：已关闭（--no-memory 或 /memory off）\n");
+        return;
+    }
+    if !g_pm.ready {
+        _ = buf_append_cstr(out, "项目记忆：本会话不可用（不在 git 仓里，或取不到 agent home）\n");
+        return;
+    }
+    var set: PmSet = pm_set_empty();
+    defer { pm_set_free(&set); }
+    _ = pm_store_load(g_pm.dir.ptr as &const byte, g_pm.dir.len, &set);
+    _ = buf_append_cstr(out, "目录：");
+    _ = buf_append(out, g_pm.dir.ptr as &const byte, g_pm.dir.len);
+    _ = buf_append_cstr(out, "\n项目键：");
+    const kn: usize = if g_pm.key.len > 8 { 8 as usize } else { g_pm.key.len };
+    _ = buf_append(out, g_pm.key.ptr as &const byte, kn);
+    _ = buf_append_cstr(out, "…（按归一化仓库根算；worktree 与其主仓同键）\n");
+    _ = buf_append_cstr(out, "事实：");
+    _ = buf_append_i64(out, set.n as i64);
+    _ = buf_append_cstr(out, " 条，本会话新增 ");
+    _ = buf_append_i64(out, g_pm.n_ingested as i64);
+    _ = buf_append_cstr(out, " 条；开工包");
+    if (g_pm.pushed) {
+        _ = buf_append_cstr(out, "已注入（本会话一次）\n");
+    } else if (g_pm.injected) {
+        _ = buf_append_cstr(out, "未注入（没有可注入的事实）\n");
+    } else {
+        _ = buf_append_cstr(out, "未注入\n");
+    }
+    if set.n == 0 {
+        _ = buf_append_cstr(out, "（这个项目还没有积累到任何事实：先干活，工具结果会被自动记下来）\n");
+        return;
+    }
+    pm_set_sort(&set);
+    var i: usize = 0;
+    while i < set.n {
+        const f: &const PmFact = &set.items[i];
+        const stale: i32 = pm_verify(f, g_pm.ws.ptr as &const byte,
+                                     g_pm.ws.len);
+        _ = buf_append_cstr(out, "  " as &const byte);
+        _ = buf_append_cstr(out, pm_kind_name(f.kind));
+        _ = buf_append_cstr(out, "  " as &const byte);
+        if stale == 2 {
+            _ = buf_append_cstr(out, "GONE " as &const byte);
+        } else if stale == 1 {
+            _ = buf_append_cstr(out, "STALE " as &const byte);
+        }
+        if f.kind == PM_K_CONVENTIONS && f.status != PM_S_CONFIRMED {
+            _ = buf_append_cstr(out, "[proposed] " as &const byte);
+        }
+        _ = buf_append(out, f.key.ptr as &const byte, f.key.len);
+        if f.n > 1 {
+            _ = buf_append_cstr(out, " (" as &const byte);
+            _ = buf_append_i64(out, f.n as i64);
+            _ = buf_append_cstr(out, "x)" as &const byte);
+        }
+        _ = buf_append_byte(out, 10);
+        i = i + 1;
+    }
+    _ = buf_append_cstr(out, "（这是索引，不是文件内容；/memory forget 清空本项目记忆）\n");
+}
+
+// 清空本项目的记忆：**删掉整个目录**（观测分片与快照一起走）。
+// 与 `/goal clear` 同一条口径：删干净、不留 tombstone —— 删掉不等价于「默认状态」，
+// 而是「从没记过」（下次进来又是首次，行为与改动前一致）。
+export fn agent_pm_forget(cfg: &const Config, out: &Buf) bool {
+    _ = cfg;
+    if !g_pm.ready || g_pm.dir.len == 0 {
+        _ = buf_append_cstr(out, "[memory] 本会话没有可清的项目记忆\n");
+        return false;
+    }
+    // 删之前先把摄取停掉，免得删完又被写回来
+    pm_ingest_free(&g_pm_ing);
+    const ok: bool = pm_rm_rf(g_pm.dir.ptr as &const byte, g_pm.dir.len);
+    g_pm.n_ingested = 0;
+    if ok {
+        _ = buf_append_cstr(out, "[memory] 已清空本项目的记忆\n");
+    } else {
+        _ = buf_append_cstr(out, "[memory] 清空失败（目录不存在或不可删）\n");
+    }
+    return ok;
+}
+
+// 把 `--print-config` 的记忆两行写进 out（P68 的成本闸门读它）。
+// 形状刻意与既有行一致（`memory = off  (source: cli)`），e2e 的 grep 才对得上。
+export fn agent_pm_print_config(cfg: &const Config, out: &Buf) void {
+    _ = buf_append_cstr(out, "memory = ");
+    if (cfg.memory_off) {
+        _ = buf_append_cstr(out, "off  (source: cli)");
+    } else {
+        _ = buf_append_cstr(out, "on  (source: default)");
+    }
+    if (cfg.memory_budget > 0) {
+        _ = buf_append_cstr(out, "  budget = ");
+        _ = buf_append_i64(out, cfg.memory_budget as i64);
+    } else {
+        _ = buf_append_cstr(out, "  budget = ");
+        _ = buf_append_i64(out, PM_DIGEST_BUDGET as i64);
+        _ = buf_append_cstr(out, " (default)");
+    }
+    _ = buf_append_byte(out, 10);
+}
