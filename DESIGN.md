@@ -631,6 +631,12 @@ malloc(LLM_EVENT_ARENA) + arena_init
 | 100–106 | 工具引导（`SEC_READ`/`SEC_WRITE`/`SEC_EDIT`/`SEC_GLOB`/`SEC_GREP`/`SEC_BASH`/`SEC_JOBS`） | 本仓常量；read/bash 两条与 DSH 原文一致，其余为等价精简表述 | `SEC_BASH`/`SEC_JOBS` **仅 `allow_shell` 时** |
 | 107 | 收工纪律（`SEC_FINISH`） | 本仓常量（DSH 没有） | 总是 |
 
+**Uya 语言速查表**（P63 起**不在**上表里）：它曾经是本项目的补充节，每轮无条件追加在
+system 末尾（原文案 467 B）。那段文字只在「模型要写 / 改 Uya 源码」那一步有用，其余回合
+是纯粹的前缀开销 —— 现在改成按需的 **`uya_notes` 工具**（文案是 `prompt.uya` 的
+`UYA_LANG_NOTES`，工具入口 `uya_notes_tool`）。system 因此少一整节，速查表只在真调用
+那一步进对话。`agent_system_prompt` 末尾只再拼 worktree 纪律段（P37，非该模式时为空串）。
+
 **persona 默认文案**（`prompt.uya:18`）：
 `"You are a coding agent powered by the {{model}} model. Your working directory is {{cwd}}."`
 
@@ -957,7 +963,7 @@ front-matter = `---` 包起来的 YAML，必填 `name`（kebab-case，`[a-z0-9-]
 
 ### 6.1 工具目录：固定顺序
 
-28 个工具按**固定顺序**拼进请求（`tools_json`，`src/agent/agent.uya:2867`）。
+29 个工具按**固定顺序**拼进请求（`tools_json`，`src/agent/ag_tools_schema.uya`）。
 顺序**恒定**是关键设计：工具目录跨模式稳定 ⇒ 前缀缓存不会因为「模式变了」而失效。
 
 | 组 | 工具 | 条件 |
@@ -965,13 +971,14 @@ front-matter = `---` 包起来的 YAML，必填 `name`（kebab-case，`[a-z0-9-]
 | 文件 | `read` `write` `edit` `glob` `grep` | 总是 |
 | 执行 | `bash` `job_list` `job_output` `job_kill` | **`allow_shell` 时**（否则整组不出现） |
 | 会话与交互 | `workspace` `worktree` `set_title` `todo_write` `exit_plan_mode` `ask_user_question` | **总是**（含 plan 模式 —— 工具目录跨模式稳定） |
-| 技能与搜索 | `skill` `web_search` | 总是 |
+| 技能与搜索 | `skill` `uya_notes` `web_search` | 总是 |
 | 子代理 | `subagent` `subagent_fork` `list_agents` `subagent_output` `send_message` `interrupt_agent` `ralph` | 总是 |
 | 目标 | `create_goal` `get_goal` `update_goal` | 总是 |
 | 编排 | `workflow` | 总是 |
 
-schema 文本是 `TOOL_*` 常量（`agent.uya:2782-2838`），逐字对齐 DSH v0.1.1-rc.2 的
-standard preset（`agent.uya:2779`）。
+schema 文本是 `TOOL_*` 常量（`src/agent/ag_tools_schema.uya`），逐字对齐 DSH v0.1.1-rc.2 的
+standard preset。**唯二例外**是本仓自有的两个：`uya_notes`（P63，速查表）与 `run_shell`
+（死常量，未被 `tools_json` 引用）。
 
 **两种协议的 schema 差异只用文本变换实现**：`TOOL_FLAT_STRIP`（31 字节）去掉
 `{"type":"function","function":{` 前缀 + 去掉尾部大括号 → Responses 形状。这样**只有一份**
@@ -1001,6 +1008,8 @@ schema 真值，不会两边漂移。
 | `todo_write` | `todos[]` | — | 整表替换；去重与状态校验 |
 | `exit_plan_mode` | `plan` | — | plan 非空且**首字符 `#`**；非 plan 模式调用报错 |
 | `skill` | `name` | — | `<skill_content name="…"><skill_resources>…</skill_resources><skill_instructions>…</…>` |
+| `uya_notes` | — | — | Uya 语言速查表正文（`UYA_LANG_NOTES`，纯文本；只读、无参数 ——
+  read-only / plan 模式下照常可用） |
 | `web_search` | `queries[]` | — | 答案 + `Sources:` 列表（详见 §5.6） |
 | `subagent` | `prompt` `description` | `run_in_background`(默认 true) | `started background subagent sub-N` / 前台等到终态 |
 | `subagent_output` | `subagent_id` | `wait` `timeout_ms` | 增量正文 + `[status: …]` |
@@ -3187,6 +3196,27 @@ responses 用 `{"type":"input_image","detail":"auto","image_url":…}`；
    教训：**凡是「用户用一行文本指定一个实体」的地方，行里必须带够把那个实体唯一确定下来的字段**。
    判据写得再细也救不了「行里根本没这个信息」——而缺的那一半不会报错，只会让另一家的选择**静默失效**。
 
+100. **「浮层开着就藏光标」这条不变量，在「自带插入点的浮层」上是错的**（P66，用户报的）：
+   现场：`ask_user_question` 的提问弹窗里，自定义回答行（`✎ …`）明明能打字（`tui_ask_type`
+   追加、`tui_ask_backspace` 退格），屏幕上却**看不见任何插入点** —— 用户报的就是
+   「提问窗口里输入行没有光标」。
+   根因是两条各自都对的规则叠在一起：
+   ① `tui_cursor_place` 的口径是「`run == IDLE` 或**没有浮层**时显示真光标」（踩坑 66 定的：
+   浮层开着时键全被浮层吃掉，插入点不在输入行上，露出来只会误导）——而 ask 弹窗恰恰是在
+   **回合运行中**（`TUI_RUN_TOOL`）打开的，于是真光标被藏；
+   ② ask 的自定义回答行**只画文本、不画插入点那一格**。同族的 P48 input 型浮层是画了的
+   （`ask.uya` 里用 `TUI_ST_SEL` 反显光标那一格），ask 这条路当年漏了。
+   两条单独看都成立，合起来就是「能打字却看不见光标」。
+   **修法**：在 ask 的自定义回答行**固定留一格**画 `TUI_ST_SEL`（对齐 P48 的既有做法，
+   不动光标可见性那三条不变量）；文本预算从 `body_w - 2` 收到 `body_w - 3`，右侧补空格，
+   于是**整行显示列一个字节不变**（`│ ` + `✎ ` + 文本 + 插入点 + 补齐 + `│` = `w`，
+   `tuis_scan_rows` 的逐行宽度断言因此原样通过）。框宽预算同步加 1 列 —— 否则窄框上占位
+   会被多裁一格、白白早降一档。非打字态也画：那句话本来就落在这里。
+   教训：**「这个表面不需要光标」是个需要逐个表面验证的判断，不是一条可以整体套用的不变量**
+   —— 凡是「键落在这里、文本也写在这里」的浮层，都得自己把插入点画出来（真光标被藏时它是
+   唯一的可见反馈）。自测补三条腿（初始态 / 打字态 / 0 选项态），判据是「含 `✎ ` 的那一行里
+   存在一个 `TUI_ST_SEL` 段」，不写死列号（插入点跟着文本长度走）。
+
 ---
 
 ## 18. TLS 信任策略（重要，和标准库现状有关）
@@ -3719,9 +3749,46 @@ DEEPSEEK_API_KEY=sk-xxx ./build/uya-agent \
   网关侧同时把 `default_max_output_tokens` 抬到 65536（配置 + 管理 API PATCH，因为 bootstrap 是
   `upsert`、**只补缺失字段**，改配置文件对已存在的 provider 行不生效 —— 这一点值得记一笔）。
 
+- P63：**Uya 语言速查表从 system 前缀里挪出来（改成按需的 `uya_notes` 工具）+ 提问窗口的插入点**。
+  两件事都是**用户报的可见问题**，根因也都是「有一份东西一直在付固定开销」与「有一条不变量套错了面」：
+
+  ① **速查表每轮都发**（§5.1）。它原是本项目的补充节（`agent_extra_section`），**无条件**追加在
+  system 末尾 —— 467 B，每一轮请求都付，而它只在「模型要写 / 改 Uya 源码」那一步有用。
+  修法：删掉那一节，内容**扩成速查表**并搬进按需的 **`uya_notes` 工具**（零参数、只读）。
+  净账：system 少 **469 B**（正文 + 分隔符），工具表多 **245 B**（短描述 + 最小无参 schema）
+  ⇒ **每请求净 −224 B**；速查表正文（1.2 KB）只在真调用那一步进对话。
+  **描述刻意写短**：它同样是每轮请求的一部分，写长等于把刚省下的字节又花回工具表；
+  但触发条件（「写/改 `.uya` / `.ush` 之前」）不能省，否则模型不知道该何时调 —— 这一条有钉子（verdict 157）。
+  速查表内容**逐条在仓内与 `$UYA_ROOT/std` 核对过，不发明语法**：没有 `for`（实测全仓零 `for`）
+  只有 `while`；`match` / `!T` / `try` / `catch |err|` / `as!` / `defer` / 定长数组 `[T: N]` 与
+  `[0: N]` / 结构体字面量 `Type{...}` 都是真实用法；末两条（build 命令与 write 的真换行）
+  **逐字保留**旧文案 —— 它们是既有钉子（verdict 154/155）守着的句子。
+
+  ② **提问窗口里看不见光标**（踩坑 100）。`ask_user_question` 的弹窗里自定义回答行能打字，
+  但屏幕上没有任何插入点：真光标被「浮层开着就藏」的规则藏掉（弹窗正是在 `TUI_RUN_TOOL` 下开的），
+  而行上又没有自己画 —— 同族的 P48 input 型浮层画了，ask 这条当年漏了。
+  修法：该行**固定留一格**画 `TUI_ST_SEL`（对齐 P48），文本预算 `body_w-2 → body_w-3`、
+  右侧补空格 ⇒ **整行显示列逐字节不变**（逐行宽度不变量照旧）。
+
+  顺带：示例任务文案里那个 `Hello, DSH!` 改成 `Hello, uya!`（输入行占位 + `--tui-demo` 的计划与
+  转录），demo 里 diff 的「改前」保持 `Hello, DSH!` —— 「从 DSH 改成 uya」这句读起来才自洽，
+  改动也仍然看得见。`/diff` 浮层的合成夹具（`TUIS_DIFF_TEXT`）与真机记录**不动**。
+
+  **判定与验收**：`st_responses` 的条数断言 28 → 29；`prompt-todo-plan` 轮（mock mode 10）
+  新增五条钉子 —— 轮 0：system 里**不许**再出现速查表正文（152/153，判据只能用正文里的句子，
+  因为描述里本来就有 "Uya language cheat sheet" 那句，第一版就踩了这个假红）、工具表里**必须**有
+  `"name":"uya_notes"`（154）、描述里必须留着触发条件（157）；轮 1：`uya_notes` 真的跑了且正文
+  回灌进了请求（155 "Uya language cheat sheet" / 156 "UYA_ROOT=<lib>"）。`tui-ask` 轮新增三条
+  插入点断言（初始态 / 打字态 / 0 选项态，判据是「含 `✎ ` 的那一行里存在一个 `TUI_ST_SEL` 段」，
+  不写死列号）。
+  **两条防假绿对照实验**（都先看到红再改回来）：① 把速查表**加回** `agent_system_prompt`
+  ⇒ 红在 verdict **152**；② 把插入点那一格的 `TUI_ST_SEL` 换成 `TUI_ST_DEFAULT`
+  ⇒ `tui-ask` 三条腿当场全红。
+  验收：`make check` ＋ `rm -rf build && make selftest` 全绿（`SELFTEST PASS`）。
+
 ---
 
-## 20. 项目记忆（P63–P65，`src/pm/` + `agent/ag_pm.uya`）
+## 20. 项目记忆（P66–P68，`src/pm/` + `agent/ag_pm.uya`）
 
 这一节回答三件事：**为什么做**（实测数据）、**形状为什么是这样**（每条不变量对应一个
 实测踩过的坑）、**明确不做什么**。

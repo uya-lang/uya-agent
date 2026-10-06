@@ -290,7 +290,7 @@ e2e-goal: build
 		|| { echo "FAIL: /help 里没有 /goal"; exit 1; }; \
 	echo "e2e-goal: 通过（用法 / 创建 / 拒绝顶掉 / edit / pause·resume / clear 幂等 / 字面目标 / /help）"
 
-# P65：项目记忆的人类命令面（离线）：/memory 报告 / off / forget + --no-memory 的 print-config。
+# P68：项目记忆的人类命令面（离线）：/memory 报告 / off / forget + --no-memory 的 print-config。
 # 开工包的**内容与注入**由 selftest 的 pm-e2e 轮断言（那边才拿得到历史）。
 e2e-memory: build
 	@set -e; \
@@ -1026,7 +1026,7 @@ shell-selftest: build
 panel-selftest: build
 	UYA_SELFTEST_PANEL_ONLY=1 $(OUT) --selftest
 
-# P63：项目记忆的自测轮（项目身份归一 / 只追加分片 / 并发归并不丢更新），改 pm/ 时比整轮快
+# P66：项目记忆的自测轮（项目身份归一 / 只追加分片 / 并发归并不丢更新），改 pm/ 时比整轮快
 pm-selftest: build
 	UYA_SELFTEST_PM_ONLY=1 $(OUT) --selftest
 
