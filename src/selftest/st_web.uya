@@ -537,6 +537,194 @@ fn web_t_dispatch(cfg: &const Config, t: &WebTable, c: &WebConn,
 }
 
 // ============================================================
+// web-frame：推帧的**空帧判据**与「推完才推进基准」
+// ============================================================
+
+// 这一轮的现场（DESIGN §16 踩坑 106）：用户报「web 页面不会实时刷新」——
+// 首帧出来之后就再也不动了。根因是 `web_push_frame` 里的空帧判据：
+//   `srv_find(frame, "\"rows_changed\":[]", 16)`  —— **长度写成了 16，而那个
+//   字面量是 17 字节**。于是它拿「`"rows_changed":[` + 后面一个字节」去比，
+//   在**每一帧**里都命中（帧里必然有 `"rows_changed":[`）⇒ 判据恒为真 ⇒ 每一帧
+//   都被当空帧丢掉（实测：`syscw` 在首帧之后再不动一个字，页面上打字没反应）。
+// 判据全部走生产代码真用的那一支 `web_push_session` / `web_push_frame`（不另写
+// 一份等价判断 —— 那样就变成「自测绿、真机红」）。五条：
+//   ① **首帧是全量**，且给所有订阅者；
+//   ② **文本变了要推**，推出去的帧里要有刚写进去的那一行；
+//   ③ **光标单独动也推**：只动光标（一行文本都不改）⇒ 仍要出一帧（页面上光标块
+//      不动就是这条没做 —— `emu_frame_changed` 的由来）；
+//   ④ **真没变就不推**（空帧流量没有意义）：什么都不动 ⇒ 管道里一个字节都不多；
+//   ⑤ **多订阅者**：同一会话两条连接都要拿到（差分基准在会话上，推完才推进 ——
+//      老顺序是「第一个订阅者推完就推进基准」⇒ 第二条永远收不到）。
+//
+// 观测点是**管道的读端**（不是 `c.out`）：`web_push_frame` 排完队会立刻
+// `web_flush_conn` 尽力写一次，写成功就把 `c.out` 重置了 —— 只看 `c.out` 会
+// 把「推了并且写成功了」误判成「没推」。
+export fn web_frame_round(tag: &const byte) bool {
+    var ok: bool = true;
+    var t: WebTable = web_table_zero();
+    web_table_init(&t);
+    defer { web_table_free(&t); }
+    // 一条合成会话：**不 fork**（这一轮判的是推帧逻辑，子进程只会让它变慢、
+    // 还引入时序）。id / pending / scratch / emu 都按 `web_session_new` 的口径建。
+    if !web_t_session_make(&t, 0, "session-web-frame") {
+        tuis_fail(tag, "合成会话建不起来", &ok);
+        return false;
+    }
+    const s: &WebSession = &t.items[0];
+    // 两条连接（同一会话）—— 判据 ⑤ 用。用管道当连接：推帧只要求「能写出去」。
+    var conns: [WebConn: WEB_MAX_CONNS] = [web_conn_value_empty()
+        : WEB_MAX_CONNS];
+    var used: [bool: WEB_MAX_CONNS] = [false: WEB_MAX_CONNS];
+    var fds: [i32: 4] = [0: 4];
+    if !web_t_two_conns(&conns[0], &used[0], &fds[0], tag, &ok) {
+        return ok;
+    }
+    defer { web_t_conns_close(&conns[0], &used[0], &fds[0]); }
+    var got0: Buf = buf_new(0);
+    defer { buf_free(&got0); }
+    var got1: Buf = buf_new(0);
+    defer { buf_free(&got1); }
+    // ① 首帧：两条连接都要拿到，且必须是**全量**（只发差分拼不出屏幕）
+    web_push_session(s, &conns[0], &used[0], 0);
+    web_t_window(fds[0], &got0);
+    web_t_window(fds[2], &got1);
+    if got0.len == 0 || got1.len == 0 {
+        tuis_fail(tag, "首帧没有推给所有订阅者（第二条连接收不到帧）", &ok);
+    } else if find_sub(got0.ptr[0: got0.len],
+        "\"full\":true"[0: 11], 0) < 0 {
+        tuis_fail(tag, "首帧不是全量（新连接拼不出屏幕）", &ok);
+    }
+    // ② 改一行文本 ⇒ 必须推，且帧里要有那一行
+    const line: &const byte = "HELLO-FRAME" as &const byte;
+    emu_feed(&s.emu, line, 11);
+    web_push_session(s, &conns[0], &used[0], 0);
+    web_t_window(fds[0], &got0);
+    if got0.len == 0 {
+        tuis_fail(tag, "文本变了却一帧都不推（页面不刷新）", &ok);
+    } else if find_sub(got0.ptr[0: got0.len], line[0: 11], 0) < 0 {
+        tuis_fail(tag, "推出去的帧里没有刚写进去的那一行", &ok);
+    }
+    // ③ 只动光标（一行文本都不改）⇒ 仍要推 —— `ESC[1;5H` 只挪光标
+    const cur_move: &const byte = "\x1b[1;5H" as &const byte;
+    emu_feed(&s.emu, cur_move, 6);
+    web_push_session(s, &conns[0], &used[0], 0);
+    web_t_window(fds[0], &got0);
+    if got0.len == 0 {
+        tuis_fail(tag, "只动光标时一帧都不推（页面上光标块不动）", &ok);
+    }
+    // ④ 什么都不动 ⇒ 一个字节都不推（空帧流量没有意义）
+    web_push_session(s, &conns[0], &used[0], 0);
+    web_t_window(fds[0], &got0);
+    if got0.len != 0 {
+        tuis_fail(tag, "什么都没变还在推帧（空帧流量）", &ok);
+        tuis_puts("  推了 ");
+        tuis_num(got0.len);
+        tuis_puts(" 字节\n");
+    }
+    // ⑤ 再改一次文本：两条订阅者**都要**拿到（差分基准在会话上，推完才推进）
+    const line2: &const byte = "SECOND-LINE" as &const byte;
+    emu_feed(&s.emu, line2, 11);
+    web_push_session(s, &conns[0], &used[0], 0);
+    web_t_window(fds[0], &got0);
+    web_t_window(fds[2], &got1);
+    if got0.len == 0 || got1.len == 0 {
+        tuis_fail(tag, "同一会话的两条订阅者没有都拿到帧（第二条被基准推进吃掉）",
+            &ok);
+    }
+    if ok {
+        tuis_ok(tag, "推帧：文本变/光标动都推、真没变不推、多订阅者都拿到");
+    }
+    return ok;
+}
+
+// 开两对管道、建两条订阅同一会话的长连接。返回 false = 没建起来 —— 所以 `ok`
+// 保持原值（管道不可用 = 这一轮**跳过**、算过；初始化失败 = 已经置红）。
+fn web_t_two_conns(conns: &WebConn, used: &bool, fds: &i32,
+    tag: &const byte, ok: &bool) bool {
+    if (sys_pipe2(fds, 0) catch { -1; }) != 0 {
+        tuis_ok(tag, "跳过（管道不可用）");
+        return false;
+    }
+    if (sys_pipe2(fds + 2, 0) catch { -1; }) != 0 {
+        _ = sys_close(fds[0]) catch {};
+        _ = sys_close(fds[1]) catch {};
+        tuis_ok(tag, "跳过（管道不可用）");
+        return false;
+    }
+    // 读端非阻塞：下面按「这段窗口里读到了什么」判，不能卡住
+    web_t_nonblock(fds[0]);
+    web_t_nonblock(fds[2]);
+    if !web_conn_init(&conns[0], fds[1]) || !web_conn_init(&conns[1], fds[3]) {
+        tuis_fail(tag, "连接初始化失败", ok);
+        _ = sys_close(fds[0]) catch {};
+        _ = sys_close(fds[1]) catch {};
+        _ = sys_close(fds[2]) catch {};
+        _ = sys_close(fds[3]) catch {};
+        return false;
+    }
+    used[0] = true;
+    used[1] = true;
+    var k: usize = 0;
+    while k < 2 {
+        conns[k].st = WEB_CONN_STREAM;
+        conns[k].sess = 0;
+        k = k + 1;
+    }
+    return true;
+}
+
+// 收两对管道与两条连接（幂等；`used` 说哪几条真的建起来了）。
+fn web_t_conns_close(conns: &WebConn, used: &bool, fds: &i32) void {
+    if used[0] {
+        web_conn_free(&conns[0]);
+    }
+    if used[1] {
+        web_conn_free(&conns[1]);
+    }
+    _ = sys_close(fds[0]) catch {};
+    _ = sys_close(fds[1]) catch {};
+    _ = sys_close(fds[2]) catch {};
+    _ = sys_close(fds[3]) catch {};
+}
+
+// 「这一轮推了什么」的观测窗口：**先清空再读**管道。清空这一步不能省 ——
+// `web_t_drain` 是**追加**语义，不 reset 的话上一轮读到的字节会留在缓冲里，
+// 「这一轮没推」的断言就永远为假（假绿：什么都不推也算过）。
+fn web_t_window(fd: i32, out: &Buf) void {
+    buf_reset(out);
+    web_t_drain(fd, out);
+}
+
+// 建一条合成会话（不 fork、不开 PTY）：id / pending / scratch / emu 按生产口径建。
+// 返回 false = 分配失败。
+fn web_t_session_make(t: &WebTable, i: usize, id: &const byte) bool {
+    if i >= WEB_MAX_SESSIONS {
+        return false;
+    }
+    const s: &WebSession = &t.items[i];
+    s.id = buf_new(64);
+    s.pending = buf_new(256);
+    s.scratch = buf_new(EMU_MAX_COLS * 4 + 16);
+    var k: usize = 0;
+    while k < WEB_REPLAY_FRAMES {
+        s.replay[k] = buf_new(0);
+        k = k + 1;
+    }
+    if !buf_valid(&s.id) || !buf_valid(&s.pending) || !buf_valid(&s.scratch) {
+        return false;
+    }
+    if !emu_init(&s.emu, 100, 30) {
+        return false;
+    }
+    _ = buf_append(&s.id, id, bufx_cstr_len(id));
+    s.pid = 0;
+    s.master = -1;
+    s.alive = true;
+    t.n = i + 1;
+    return true;
+}
+
+// ============================================================
 // web-pty：会话子进程死掉之后，主循环必须**收口**而不是空转
 // ============================================================
 
