@@ -2001,7 +2001,8 @@ READY ──wt_finish──▶ FINISHED
 
 1. **只写给真 TTY**（`tty_title_begin()` 门控）；
 2. **直接 `sys_write`**，不能走 `tty_write`（sink 会把它吞成转录里的乱码）；
-3. 统一 `tty_title_clean_into` 清洗截断（**前 5 词 / ≤40 B**，上屏 ≤80 B）。
+3. 统一 `tty_title_clean_into` 清洗截断（**模型侧前 3 词 / ≤30 B = 10 个汉字以内**；上屏 ≤80 B，
+   用户手填 `/title` 用满 80 B）。
 
 `--continue` 的 `sess_open` 会清空标题。不支持 xterm 标题栈（`CSI 22 t` / `CSI 23 t`）的终端
 会忽略压栈/弹栈，退出后保留最后写的标题（**故意不写空标题**）。
@@ -2471,7 +2472,7 @@ responses 用 `{"type":"input_image","detail":"auto","image_url":…}`；
 | **对话协议是刻意「极简」的** | 历史只带文本与工具调用；不做多模态之外的内容类型 |
 | Responses 下**不回放 reasoning item** | 不发 `include: ["reasoning.encrypted_content"]`，也不发 `prompt_cache_key` / `prompt_cache_retention` |
 | **会话身份照发**（与「不发 prompt_cache_key」是两件事） | 每个请求都带 `x-deepseek-harness-session-id` + `Session-Id` 两个头，正文带 `client_metadata.session_id`（responses）/ `metadata.session_id`（chat）；运行时上下文带 `session workspace: "<JSON 路径>"`。口径对齐 DSH，`~/ai-gateway` 据此按会话归组、取工作区、识别标题行 |
-| **起标题提示词与 DSH 逐字同形** | system 段 `Create a concise title for an AI coding-assistant session …`、user 段 `Generate the session title from this JSON array of human messages:\n<JSON 数组>`，并带同一会话 id（网关照这两个前缀认 `call_kind=title`） |
+| **起标题提示词与 DSH 逐字同形** | system 段 `Create a concise title for an AI coding-assistant session …`、user 段 `Generate the session title from this JSON array of human messages:\n<JSON 数组>`，并带同一会话 id（网关照这两个前缀认 `call_kind=title`）。**唯一偏离**：system 段第三句（词数句）改成本项目口径「10 字以内 / 约 3 词」（DSH 原句 5 词 / 40 CJK 字符）—— 网关只匹配前两条前缀，这条可自定；硬约束另由 `tty_title_fallback_into`（3 词 / 30 B）收口 |
 | 历史按「外来消息」重放 | 只带文本与工具调用 |
 | 工具 schema **不带 `strict`** | |
 | **不做 404 之外的协议自动探测** | 换协议请显式 `--api=` |
@@ -2529,7 +2530,7 @@ responses 用 `{"type":"input_image","detail":"auto","image_url":…}`；
 36. **「当前状态」和「刚才发生了什么」混在一个变量会被静默丢**：`tui_ov_accept()` 先写结果再 `tui_overlay_close()` 清掉 `g_tui_ov_kind`，take 后读 kind 永远 0；kind 另存 `g_tui_ov_done`（见 §2）。
 37. **TUI 主循环丢命令返回值 → `/exit` 是摆设**：`agent_tui_command()` 三处写成 `_ = …`，直接输入或面板选 `/exit` 都不退出（`ctrl+d` 掩盖）；三处接上返回值，回归 `tui-pty` 改 `/exit`。
 38. **浮层标题字节数写死 = 读越界**：`tui_overlay_list` 的 `tn` 是字节数按它 memcpy；会话标题写 44（实 38）、状态 46（实 22）、确认 6（实 9）；能用 `bufx_cstr_len()` 量就别写死。
-39. **终端标题 OSC 三件事钉死**：只写给真 TTY（`tty_title_begin()` 门控）；直接 `sys_write` 不能走 `tty_write`（sink 会吞成乱码）；统一 `tty_title_clean_into` 清洗截断（前 5 词/40 B，上屏 80 B）。`--continue` 的 `sess_open` 会清空标题。
+39. **终端标题 OSC 三件事钉死**：只写给真 TTY（`tty_title_begin()` 门控）；直接 `sys_write` 不能走 `tty_write`（sink 会吞成乱码）；统一 `tty_title_clean_into` 清洗截断（模型侧前 3 词/30 B = 10 字以内，上屏 80 B）。`--continue` 的 `sess_open` 会清空标题。
 40. **「`/status` 没反应」四件事**：①面板派发后输入行留 `/`（拼成 `//status`），用 `tui_input_drop_slash_trigger()`；②无匹配静默，改还回输入行 + notice；③运行中面板结果等到回合末，加 `agent_tui_poll_pending_cmd()`；④`g_tui_ov_top` 是死变量，用 `tui_ov_box_h()`。
 41. **首 token 只认正文 delta**：推理/工具回合几乎空着，偶尔打到时 tok/s 爆表（实测 6371，真值 ≈158.6）；判据改「任意非空增量」（`got_payload`：正文/`reasoning_content`/`tool_calls` 参数），元数据帧不算；回归 `stream-firsttok-*`。
 42. **「被裁要补 `…`」的预算必须先扣一列**：`tui_put_clipped` 的 `…` 不在预算里，长行比方框宽 1 列；新增 `tui_ov_put_clipped()` 用 `tty_clip_bytes` 量后减一；回归拿会撑满的 `/permission` 量边界。
@@ -3293,7 +3294,7 @@ DEEPSEEK_API_KEY=sk-xxx ./build/uya-agent \
 | `max-tokens-cut` | P59（mock mode 44，**一个进程跑两个回合**）：① `finish_reason=length` + 正文 + 一个 `write trunc.txt` 调用 → 一个工具调用都不派发（`trunc.txt` 不存在、日志零 `tool/call`）、正文剪掉断口空白后进历史、`assistant/message` **不带 tool_calls**、转录是 `warning:` + `[max-tokens] …发「继续」…`（**没有** `error: model output was truncated`）、`turn/end` reason = `max-tokens`、那一回合返回 `5`；② 人打「继续」→ 第二个请求里**带着那段正文**、没有 `"role":"tool"`、没有 `"tool_calls"` → 回合以 0 收尾、`turn/end` reason = `completed` |
 | `tui-diag` | 4 KiB JSON 只留 ≤512 B、半截汉字变 U+FFFD、`tty_sink_on` 收尾关回 |
 | `read-window` | `(Showing lines 1-1000 of 4000. …)`、`offset=3500` 真读到、`limit=2000` |
-| `title-format` | OSC/CSI 清洗、40 B/80 B 上限切码点边界、`ESC[22t`/`ESC[23t` |
+| `title-format` | OSC/CSI 清洗、模型侧 30 B（10 字）/ 上屏 80 B 上限切码点边界、`ESC[22t`/`ESC[23t` |
 | `tty-title-pty` | 滚动模式真 PTY：`fd 2 + 无备用屏幕` 接线，弹栈在最后标题之后 |
 | `http401` | mock 401 + 错误体：打印状态与错误体并退出 3 |
 | `max-steps` | 显式 `max_steps=3`：3 步后熔断退出 3 |
@@ -3320,7 +3321,7 @@ DEEPSEEK_API_KEY=sk-xxx ./build/uya-agent \
 
 - PTY 延迟预算：`/status` 浮层 ≤800 ms、空闲 ≤150 ms、bash 跑着 ≤200/300 ms、压缩在飞 ≤300 ms。P30 实测 103–105 ms（旧 2245 ms）；P31 五场景 101/53/62/102/63 ms（旧 103/2280/242/103/2833 ms）；P39 `new-mid-turn` 回执 112 ms、中断 172 ms。
 - 退出码：正常 0；401 / 熔断 / `tool_calls` 序列化失败 3；崩溃 139；`SIGTERM` 143；`SIGKILL` 137。`resume-big-e2e` 未修 139 → 修后 0。
-- 结构尺寸：`sig-abi` 152 字节；`sig-term-restore` 恢复序列 26 字节（P22 四形状 26/18/31/23）；`tty-editor` termios 60 B；P32 四形状 42/34/47/39；`--title` 40 B / 80 B 上限切码点边界。
+- 结构尺寸：`sig-abi` 152 字节；`sig-term-restore` 恢复序列 26 字节（P22 四形状 26/18/31/23）；`tty-editor` termios 60 B；P32 四形状 42/34/47/39；`--title` 模型侧 30 B（10 字）/ 上屏 80 B 上限切码点边界。
 - 容量：`unlimited-steps` 14 轮；`history-long` 40×2 ≈124 条 / 80 条工具结果；`toolcalls-*` 9849 / 9618 字节（旧固定 8192）；`read-window` 4000 行 / 160 KB（读缓冲 116736）。
 - 逐字节不变量：每行显示列 ≤ cols 且正文层无 ESC / 无 NUL；diff 两栏竖线同列、改动行左右边界列相同；请求体无裸控制字节（判定码 240）；NUL 必须往返成 `\u0000`；SGR 编码 `ADD`=`38;5;42`、`ADD_BG`=`48;5;22`、`DEL_HL`=`48;5;124`；`stats-format` 缓存命中 12.5%→13%。
 - 真机：`autodl-api` / `DeepSeek-V4.1-Flash`，pin 指纹 `d0265eff…42538`；A5 任务 `write → bash → 结论` 3 步、产物 `hello` 独立运行输出 `Hello, Uya!`。`~/.dsh/.credentials.yaml` 那把 key 402 `Insufficient Balance`，故走 autodl 网关。Responses 真机只验到 `--print-config` 读对 `api = openai-responses (source: dsh-settings)` 且请求真打到 `/v1/responses`（`tirisen` 502、`aigw` DNS 失败）。
