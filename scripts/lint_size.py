@@ -57,6 +57,57 @@ def read_lines(path):
         return fh.read().split('\n')
 
 
+def strip_literals(line):
+    """把一行的**字符串/字符字面量与注释**抹掉（换成空格），只留代码。
+
+    为什么必须做：数花括号配平时，`"{\"sessions\":["` 这种字面量里的 `{` 会被
+    算成代码的花括号 ⇒ 函数边界算错 ⇒ 报出**假**的「函数过长」
+    （实测：`web_ep_sessions` 真实 58 行被报成 377 行）。
+    口径：`"..."`（含 `\\` 转义）、`` `...` ``（原始串，可跨行 —— 跨行的那部分由
+    调用方按「上一行还在原始串里」处理，见 scan_functions）、`//` 之后整行丢弃。
+    单引号在本仓不是字符串（Uya 用双引号与反引号），所以不当字面量处理。
+    """
+    out = []
+    i = 0
+    n = len(line)
+    in_str = False
+    in_raw = False
+    while i < n:
+        ch = line[i]
+        if in_raw:
+            # 反引号原始串：一直吃到下一个反引号（不认转义 —— 原始串里没有转义）
+            if ch == '`':
+                in_raw = False
+            out.append(' ')
+            i += 1
+            continue
+        if in_str:
+            if ch == '\\' and i + 1 < n:
+                out.append('  ')
+                i += 2
+                continue
+            if ch == '"':
+                in_str = False
+            out.append(' ')
+            i += 1
+            continue
+        if ch == '/' and i + 1 < n and line[i + 1] == '/':
+            break                      # 行注释：后面都不算代码
+        if ch == '"':
+            in_str = True
+            out.append(' ')
+            i += 1
+            continue
+        if ch == '`':
+            in_raw = True
+            out.append(' ')
+            i += 1
+            continue
+        out.append(ch)
+        i += 1
+    return ''.join(out), in_raw
+
+
 def scan_functions(lines):
     """返回 [(name, start_idx, end_idx)]（0 基闭区间）。
 
@@ -76,10 +127,12 @@ def scan_functions(lines):
         depth = 0
         seen_brace = False
         j = i
-        # 头部可能跨行（参数列表按 80 列折行），所以一直数到配平为止
+        # 头部可能跨行（参数列表按 80 列折行），所以一直数到配平为止。
+        # 计数前先把字面量抹掉（见 strip_literals：JSON 字面量里的花括号不算代码）。
         while j < n:
-            depth += lines[j].count('{') - lines[j].count('}')
-            if '{' in lines[j]:
+            code, _ = strip_literals(lines[j])
+            depth += code.count('{') - code.count('}')
+            if '{' in code:
                 seen_brace = True
             if seen_brace and depth <= 0:
                 break
@@ -99,8 +152,37 @@ def added_lines_for(path, changed_map):
     return changed_map.get(path)
 
 
-def check_file(path, changed_map):
-    """返回 (violations, stats)。violations 是 [(kind, line_no, detail)]。"""
+def block_has_marker(lines, idx):
+    """本行所在的「连续字面量块」里（含块上方 3 行的注释）有没有 `行宽豁免`。
+
+    反引号原始串可以跨行，所以判定要往后**和**往前找：从 idx 往前扫到最近的
+    未配对反引号（= 块的起点），再看起点上方几行有没有声明；也接受声明就写在
+    块内（有些人喜欢贴在第一条上）。
+    """
+    # 块内（含本行）有声明
+    if '行宽豁免' in lines[idx] or 'lint-size:ignore' in lines[idx]:
+        return True
+    # 往前找块起点：数反引号的奇偶
+    j = idx
+    depth = 0
+    limit = max(0, idx - 400)          # 兜底：别为一个坏行扫整份文件
+    while j >= limit:
+        depth += lines[j].count('`')
+        if depth % 2 == 1:
+            break                       # 找到了未闭合的那个反引号 = 块起点
+        j -= 1
+    lo = max(0, j - 3)
+    head = '\n'.join(lines[lo:idx + 1])
+    return '行宽豁免' in head or 'lint-size:ignore' in head
+
+
+def check_file(path, changed_map, map_key=None):
+    """返回 (violations, stats)。violations 是 [(kind, line_no, detail)]。
+
+    `map_key` 是 `changed_map` 里查这个文件用的键（**相对仓根**，git 给的就是这个
+    形状）；给 None 时用 path 本身。为什么要单独一个参数：调用方拿到的常常是拼好的
+    绝对路径，直接查表查不到 —— 那会让 `added` 退化成 None，**整份历史存量一起报**。
+    """
     try:
         lines = read_lines(path)
     except OSError as exc:
@@ -108,7 +190,7 @@ def check_file(path, changed_map):
     # 末尾换行会split出一个空串，不计入行数
     if lines and lines[-1] == '':
         lines = lines[:-1]
-    added = added_lines_for(path, changed_map)
+    added = added_lines_for(path if map_key is None else map_key, changed_map)
     viol = []
 
     # ① 文件长度：只有「整份都算新增」的新文件才判（改动老文件不判，见 AGENTS.md）
@@ -137,11 +219,14 @@ def check_file(path, changed_map):
         nchar = len(raw)
         if nchar <= LINE_MAX_CHARS:
             continue
-        # 豁免：本行或**上方 5 行内**有显式声明（长 URL / MIME 字面量这类不可断的
-        # 内容，一处声明覆盖一整块连续的字面量；见 AGENTS.md 的例外条款）。
-        lo = max(0, idx - 5)
-        near = '\n'.join(lines[lo:idx + 1])
-        if '行宽豁免' in near or 'lint-size:ignore' in near:
+        # 豁免：本行或**它所在的那一段连续字面量内**有显式声明。
+        # 「一段连续字面量」= 从本行往前找到那个还没闭合的反引号/双引号的开头
+        # （最小化的 CSS/JS 会写成几十行原始串，用固定的「上方 N 行」窗口会漏掉
+        # 块中间的行 —— 实测：5 行窗口只盖住前几行，剩下的照样红）。
+        # 判据见 AGENTS.md 的例外条款。
+        if '行宽豁免' in raw or 'lint-size:ignore' in raw:
+            continue
+        if block_has_marker(lines, idx):
             continue
         viol.append(('line-width', lineno,
                      '%d 字符（显示 %d 列）> %d'
@@ -239,15 +324,23 @@ def main():
     total_viol = 0
     for rel in targets:
         path = rel if os.path.isabs(rel) else os.path.join(root, rel)
-        viol, _ = check_file(path, changed_map)
+        # ⚠ `changed_map` 的键是**相对仓根的路径**（git 给的），而 `check_file`
+        # 拿到的是拼好的路径 —— 直接把绝对路径拿去查表必然查不到，于是
+        # `added` 退化成 None、**整份文件都按新增算**（所有历史存量一起报）。
+        # 判据：`--changed` 报出来的行号必须落在本次 diff 的 hunk 里。
+        # 所以这里把路径归一成相对形式再查表（绝对路径则相对 root 取）。
+        key = rel
+        if os.path.isabs(key):
+            key = os.path.relpath(key, root)
+        viol, _ = check_file(path, changed_map, key)
         if not viol:
             continue
-        print('%s:' % rel)
+        print('%s:' % key)
         for kind, lineno, detail in viol:
             total_viol += 1
             label = {'file-len': '文件过长', 'func-len': '函数过长',
                      'line-width': '行宽超限', 'io': '读不了'}[kind]
-            print('  %s:%d: %s（%s）' % (rel, lineno, label, detail))
+            print('  %s:%d: %s（%s）' % (key, lineno, label, detail))
 
     if total_viol == 0:
         scope = '本次改动' if changed_map is not None else '全部文件'
