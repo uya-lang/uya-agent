@@ -1,0 +1,1798 @@
+// src/agent/ag_request_stream.uya — agent.uya 的拆分片 4/9（纯搬移）
+//
+// 本文件：流式一步（P1）
+// 不变量：与原文件一致 —— 拆分只搬移，不改任何声明的代码；同族轮/段集中在一片里。
+// 依赖：见锚点 agent.uya 的文件头（本片与它同处合并命名空间，无本地 use）。
+// 命名：沿用原文件前缀（本片是同一历史模块的内部拆分）。
+
+// ============================================================
+// 流式一步（P1）
+//
+// 返回 STEP_CONTINUE 表示「已执行工具、继续下一步」，其余值是 agent_run 的退出码。
+// content 在流式过程中就直接打印（--quiet 关闭），收尾时不再重复打印。
+// ============================================================
+export const STEP_CONTINUE: i32 = 100;
+
+// P54：**退化响应 → 同一步重发**（step 循环的内部码，不是退出码）。
+//
+// 退化响应 = 上游正常收尾（不是 error、不是 max-tokens），但这一步既没有正文也没有工具调用。
+// 最典型的样子是「思考流了一大段、正文一个字都没有」，也可能反过来：上游嘴上说 tool_calls
+// 而调用在流里没了。这种响应不值得让整个回合失败 —— 同一份历史重发一次通常就有正文
+// （网关抖动 / 上游偶发只回思考）。
+//
+// 对齐 DSH 的 request-error 通道（`compaction-basic` 就是这么接 context-overflow 的）：
+// 重发发生在**同一步**（step 不递增、历史一个字节没动，所以重算出来的请求体逐字节相同），
+// 额度每步一次 —— 由 agent_note_degenerate 扣；扣不动时它给的是 AGENT_PROTO，不是这个码。
+// 于是这个码**只可能被 step 循环消费**（`continue` 重发），绝不会当退出码还回去。
+export const STEP_RETRY: i32 = 101;
+
+// 交互模式：本回合被用户 Ctrl-C 打断（不是错误，回到提示符即可）
+export const AGENT_INTERRUPTED: i32 = 130;
+
+// 每步允许的退化响应重发次数。写成常量是为了让证据里的 maxRetries 与真正执行的次数
+// 只有一个出处 —— 自测的「只重发一次」那条腿钉的就是它。
+const EMPTY_RETRY_MAX: i32 = 1;
+
+// 交互模式标志（前台界面唯一，用全局避免把参数穿过整条调用链）
+var g_interactive: bool = false;
+
+// P46：给自测用的一把钥匙 —— 「交互模式」这个标志决定了自动起标题跑不跑，
+// 而自测（headless）不走真终端入口，否则那条闸门永远测不到。
+export fn agent_set_interactive(v: bool) void {
+    g_interactive = v;
+}
+
+// ---- P55：执行期两条纪律的运行时状态（全局，避免把参数穿过整条调用链）----
+//   on：本回合已经切到 exec_effort
+//   off：人**运行中**手动改过强度 ⇒ 自动切换让位（人优先）；档位不被模型公布时也置它
+//   base：切换前的档位（本回合结束时还原；空 = 没切过）
+//   step：当前步号（step 边界写；工具的收尾钩子在 dispatch_tool_body 里，那儿拿不到 step）
+//   accept_step：验收类命令最近一次「改动之后」通过的步号（0 = 还没发生）
+//   mod_seq / accept_mod_seq：改动计数，用来判定「这次验收是不是新的」
+//   notes：已经给过几条收工提醒（上限见 GRACE_NOTE_MAX，别刷屏）
+//
+// ⚠ 这两个机制的代码全部内联在既有函数里（step 边界 / dispatch_tool_body），**一个顶层函数都没加**：
+//   本仓「顶层函数 reachable 集合」是编译器里写死的容量，HEAD 的余量是 0（§16 踩坑 87），
+//   加两个函数会撑爆表 —— 症状不是一句「容量不足」，而是链接期 undefined reference
+//   指着一堆**你没改过的**函数（实测踩过一次）。
+struct ExecState {
+    on: bool,
+    off: bool,
+    base: Buf,
+    step: i32,
+    accept_step: i32,
+    mod_seq: i64,
+    accept_mod_seq: i64,
+    notes: i32,
+}
+var g_exec: ExecState = ExecState{
+    on: false,
+    off: false,
+    base: Buf{ ptr: null, len: 0, cap: 0 },
+    step: 0,
+    accept_step: 0,
+    mod_seq: 0,
+    accept_mod_seq: 0,
+    notes: 0,
+};
+// 一个回合里最多给几条收工提醒（实测：同一条 make build 在一回合里被跑了三遍）
+const GRACE_NOTE_MAX: i32 = 2;
+
+// 流式路径上的错误诊断（与 `dump_http_error` 同一份口径，区别是流式那侧
+// 手上的体只有头部若干字节 —— 见 `LLM_ERR_HEAD`）。
+fn dump_stream_error(cfg: &const Config, status: i32, body: &const Buf) void {
+    _ = cfg;
+    out_err("model endpoint returned HTTP ");
+    out_err_dec(status as usize);
+    out_err("\n");
+    // 同 dump_http_error：流式路径的非 2xx 体也一律走转义预览（原文进日志）
+    out_diag("http-error-body", "body: ", body.ptr as &const byte, body.len);
+}
+
+// 打一行 token 用量（`--show-usage`）：in / out / cache / reasoning。
+// `usage_in` 是**非缓存输入**，所以打印时与 cache_read 分开列（§4.5.1）。
+fn print_usage_line(o: &const ChatOut) void {
+    out_err("[usage] in=");
+    out_err_dec(o.usage_in as usize);
+    out_err(" out=");
+    out_err_dec(o.usage_out as usize);
+    out_err(" cache_read=");
+    out_err_dec(o.usage_cache_read as usize);
+    out_err(" reasoning=");
+    out_err_dec(o.usage_reasoning as usize);
+    out_err("\n");
+}
+
+// 工具分发的「正文」版本：只写结果文本，不带 [tool name] 前缀。
+// 严格协议下工具名由 assistant 的 tool_calls + tool_call_id 表达，前缀是冗余。
+fn dispatch_tool_body(cfg: &Config, name: &const Buf, args_json: &const Buf, arena: &Arena, out: &Buf) void {
+    var parsed: bool = false;
+    var arg_val: JsonValue = JsonValue.json_null();
+    if args_json.len > 0 {
+        parsed = js_parse(arena, args_json.ptr, args_json.len, &arg_val);
+    }
+    if !parsed {
+        _ = buf_append_cstr(out, "error: tool arguments are not valid JSON (expects an object like {\"path\":\"...\"})\n");
+        return;
+    }
+    if sv_eq_cstr(name, "read") {
+        fs_tool_read(&g_fsctx, &g_fsobs, &arg_val, out);
+    } else if sv_eq_cstr(name, "write") {
+        fs_tool_write(&g_fsctx, &g_fsobs, &arg_val, out);
+    } else if sv_eq_cstr(name, "edit") {
+        fs_tool_edit(&g_fsctx, &g_fsobs, &arg_val, out);
+    } else if sv_eq_cstr(name, "glob") {
+        search_glob(&g_fsctx, &arg_val, out);
+    } else if sv_eq_cstr(name, "grep") {
+        search_grep(&g_fsctx, &arg_val, out);
+    } else if sv_eq_cstr(name, "bash") {
+        sh_tool_bash(cfg, &arg_val, out);
+    } else if sv_eq_cstr(name, "job_list") {
+        jobs_tool_list(&g_jobs, out);
+    } else if sv_eq_cstr(name, "job_output") {
+        jobs_tool_output(&g_jobs, &arg_val, out);
+    } else if sv_eq_cstr(name, "job_kill") {
+        jobs_tool_kill(&g_jobs, &arg_val, out);
+    } else if sv_eq_cstr(name, "todo_write") {
+        todo_tool_write(&g_todos, &arg_val, out);
+    } else if sv_eq_cstr(name, "workspace") {
+        ws_tool_workspace(cfg, &arg_val, out);
+    } else if sv_eq_cstr(name, "worktree") {
+        wt_tool_worktree(cfg, &arg_val, out);
+    } else if sv_eq_cstr(name, "set_title") {
+        agent_title_tool_set(cfg, &arg_val, out);
+    } else if sv_eq_cstr(name, "exit_plan_mode") {
+        plan_tool_exit(cfg, &g_plan, &arg_val, out);
+    } else if sv_eq_cstr(name, "ask_user_question") {
+        ask_tool_question(&arg_val, out);
+    } else if sv_eq_cstr(name, "skill") {
+        if !g_skills.scanned {
+            skills_collect(&g_skills, cfg.workspace.ptr[0: cfg.workspace.len], agent_dsh_home(), &cfg.skill_dirs);
+        }
+        skill_tool(&g_skills, &arg_val, out);
+    } else if sv_eq_cstr(name, "web_search") {
+        web_tool_search(cfg, &arg_val, out);
+    } else if sv_eq_cstr(name, "subagent") {
+        deleg_tool_subagent(cfg, &g_deleg, &arg_val, out, false);
+    } else if sv_eq_cstr(name, "subagent_fork") {
+        deleg_tool_subagent(cfg, &g_deleg, &arg_val, out, true);
+    } else if sv_eq_cstr(name, "list_agents") {
+        deleg_tool_list(&g_deleg, out);
+    } else if sv_eq_cstr(name, "subagent_output") {
+        deleg_tool_output(&g_deleg, &arg_val, out);
+    } else if sv_eq_cstr(name, "send_message") {
+        deleg_tool_send(cfg, &g_deleg, &arg_val, out);
+    } else if sv_eq_cstr(name, "interrupt_agent") {
+        deleg_tool_interrupt(&g_deleg, &arg_val, out);
+    } else if sv_eq_cstr(name, "ralph") {
+        deleg_tool_ralph(cfg, &g_deleg, &arg_val, out);
+    } else if sv_eq_cstr(name, "create_goal") {
+        goal_tool_create(cfg, &arg_val, out);
+    } else if sv_eq_cstr(name, "get_goal") {
+        goal_tool_get(cfg, out);
+    } else if sv_eq_cstr(name, "update_goal") {
+        goal_tool_update(cfg, &arg_val, out);
+    } else if sv_eq_cstr(name, "workflow") {
+        wf_tool_workflow(cfg, &arg_val, out);
+    } else {
+        _ = buf_append_cstr(out, "error: unknown tool");
+        return;
+    }
+    // P22：任务块的目标段吃的是内存投影 —— goal 工具刚写过盘，这里立刻重读一次
+    if sv_eq_cstr(name, "create_goal") || sv_eq_cstr(name, "get_goal") || sv_eq_cstr(name, "update_goal") {
+        tasks_goal_reload(cfg);
+    }
+    // ---- P55：执行期纪律的收尾钩子 ----
+    //
+    // 放在这里的原因有两个：① 两个工具派发点（流式 / 非流式）都必经 dispatch_tool_body，
+    // 一处顶两处；② 本仓「顶层函数 reachable 集合」是编译器里写死的容量，HEAD 的余量是 **0**
+    // （§16 踩坑 87：净增函数过不了清缓存重编），所以这两个机制都不新增顶层函数。
+    //
+    // 干两件事：
+    //   * 记「改动」：write / edit，或 bash 里**有一整段**是改动类命令（git / mv / sed / …）；
+    //   * 收工提醒：bash 里**有一整段**是验收类命令（make / pytest / cargo / …）且这一段跑绿时，
+    //     往结果尾部追加一行提醒（一回合最多 GRACE_NOTE_MAX 条），并把步号记进
+    //     g_exec.accept_step（--grace-steps 的锚点）。
+    //
+    // ⚠ 判据是**按段锚定**的，不是「命令文本里出现过 make」—— 第一版就是后者，真机上当场误报两次：
+    //   ① `git mv … && sed -i 's|src/x.uya|…|' Makefile && grep -n "make" …`（搬家命令，50 个文件
+    //      才搬了 1 个就被告知「验收已通过，提交并给出最终答复」）；
+    //   ② 探索期的 `grep …; time make build`（改动还没开始）。
+    //   误报会把模型往「提前收工」上带：那两腿反而更贵（$0.0472 / $0.0531，对照腿 $0.0272）。
+    //   分段对齐 shell 常见写法：`&&`、`;`、`|`、换行、`(` 都算段边界；段首的
+    //   time / sudo / env / nohup / nice / command 前缀先剥掉，再看这一段的第一个 token。
+    if sv_eq_cstr(name, "bash" as &const byte) {
+        var xcmd: Buf = buf_empty();
+        defer { buf_free(&xcmd); }
+        // ⚠ 两个坑都踩过：① 这个 helper 的第一个参数是**已 parse 的** `&JsonValue`（用上面的
+        // arg_val），传裸 args 文本会被隐式强转成指针、函数永远返回 false —— 静默失效，
+        // 日志里连一条痕迹都没有；② 它内部 `out[0] = buf_new(...)` 换掉整个缓冲，
+        // 所以出参必须是**空 Buf**（给 buf_new(256) 过去等于每次泄漏 256 字节）。
+        if js_obj_get_str_unescaped(&arg_val, "command" as &const byte, 7, &xcmd) {
+            // 段首 token 复用一个 64 字节的小 Buf（sv_eq_cstr 收的是 Buf，不是视图；
+            // 超过 64 字节的 token 一律不认 —— 验收命令的名字都不长）
+            var xtok: Buf = buf_new(64);
+            defer { buf_free(&xtok); }
+            var acc_hit: bool = false;
+            var mut_hit: bool = false;
+            var seg_head: bool = true;   // 处在段首（前导空白不算离开段首）
+            var i: usize = 0;
+            while i < xcmd.len {
+                const c: byte = xcmd.ptr[i];
+                if c == 59 as byte || c == 124 as byte || c == 38 as byte
+                    || c == 10 as byte || c == 13 as byte || c == 40 as byte {
+                    seg_head = true;
+                    i = i + 1;
+                    continue;
+                }
+                if c == 32 as byte || c == 9 as byte {
+                    i = i + 1;
+                    continue;
+                }
+                if seg_head {
+                    // 这一段的第一个 token = [i, j)
+                    var j: usize = i;
+                    while j < xcmd.len {
+                        const d: byte = xcmd.ptr[j];
+                        if d == 32 as byte || d == 9 as byte || d == 10 as byte || d == 13 as byte
+                            || d == 59 as byte || d == 124 as byte || d == 38 as byte {
+                            break;
+                        }
+                        j = j + 1;
+                    }
+                    buf_reset(&xtok);
+                    if j - i <= xtok.cap {
+                        _ = buf_append(&xtok, xcmd.ptr + i, j - i);
+                    }
+                    // 前缀剥掉再看下一个 token（`time make build` 这种要认出来）
+                    while sv_eq_cstr(&xtok, "time" as &const byte) || sv_eq_cstr(&xtok, "sudo" as &const byte)
+                        || sv_eq_cstr(&xtok, "nohup" as &const byte) || sv_eq_cstr(&xtok, "nice" as &const byte)
+                        || sv_eq_cstr(&xtok, "command" as &const byte) || sv_eq_cstr(&xtok, "env" as &const byte) {
+                        var k: usize = j;
+                        while k < xcmd.len && (xcmd.ptr[k] == 32 as byte || xcmd.ptr[k] == 9 as byte) {
+                            k = k + 1;
+                        }
+                        var m: usize = k;
+                        while m < xcmd.len {
+                            const d2: byte = xcmd.ptr[m];
+                            if d2 == 32 as byte || d2 == 9 as byte || d2 == 10 as byte || d2 == 13 as byte
+                                || d2 == 59 as byte || d2 == 124 as byte || d2 == 38 as byte {
+                                break;
+                            }
+                            m = m + 1;
+                        }
+                        if m <= k {
+                            break;
+                        }
+                        buf_reset(&xtok);
+                        if m - k <= xtok.cap {
+                            _ = buf_append(&xtok, xcmd.ptr + k, m - k);
+                        }
+                        j = m;
+                    }
+                    if sv_eq_cstr(&xtok, "make" as &const byte) || sv_eq_cstr(&xtok, "pytest" as &const byte)
+                        || sv_eq_cstr(&xtok, "npm" as &const byte) || sv_eq_cstr(&xtok, "yarn" as &const byte)
+                        || sv_eq_cstr(&xtok, "pnpm" as &const byte) || sv_eq_cstr(&xtok, "cargo" as &const byte)
+                        || sv_eq_cstr(&xtok, "go" as &const byte) || sv_eq_cstr(&xtok, "tsc" as &const byte)
+                        || sv_eq_cstr(&xtok, "gradle" as &const byte) || sv_eq_cstr(&xtok, "mvn" as &const byte)
+                        || sv_eq_cstr(&xtok, "cmake" as &const byte) || sv_eq_cstr(&xtok, "ninja" as &const byte)
+                        || sv_eq_cstr(&xtok, "bazel" as &const byte) || sv_eq_cstr(&xtok, "meson" as &const byte)
+                        || sv_eq_cstr(&xtok, "dotnet" as &const byte) || sv_eq_cstr(&xtok, "tox" as &const byte) {
+                        acc_hit = true;
+                    }
+                    if sv_eq_cstr(&xtok, "git" as &const byte) || sv_eq_cstr(&xtok, "mv" as &const byte)
+                        || sv_eq_cstr(&xtok, "cp" as &const byte) || sv_eq_cstr(&xtok, "rm" as &const byte)
+                        || sv_eq_cstr(&xtok, "mkdir" as &const byte) || sv_eq_cstr(&xtok, "touch" as &const byte)
+                        || sv_eq_cstr(&xtok, "sed" as &const byte) || sv_eq_cstr(&xtok, "patch" as &const byte)
+                        || sv_eq_cstr(&xtok, "tee" as &const byte) || sv_eq_cstr(&xtok, "truncate" as &const byte)
+                        || sv_eq_cstr(&xtok, "ln" as &const byte) || sv_eq_cstr(&xtok, "chmod" as &const byte) {
+                        mut_hit = true;
+                    }
+                    seg_head = false;
+                }
+                i = i + 1;
+            }
+            if mut_hit {
+                g_exec.mod_seq = g_exec.mod_seq + 1;
+            }
+            if acc_hit && g_exec.notes < GRACE_NOTE_MAX && g_exec.mod_seq > g_exec.accept_mod_seq
+                && view_find(out, "[exit code: 0]" as &const byte) >= 0 {
+                g_exec.accept_mod_seq = g_exec.mod_seq;
+                g_exec.notes = g_exec.notes + 1;
+                if g_exec.accept_step == 0 {
+                    g_exec.accept_step = g_exec.step;
+                }
+                _ = buf_append_cstr(out, "\n[acceptance] 验收命令已通过（第 ");
+                _ = buf_append_u64(out, g_exec.step as u64);
+                _ = buf_append_cstr(out, " 步）：收工纪律 —— 不要再跑这条验收命令、不要另造一条验收；与本次改动无关的既有失败记一行就走，不要追查、不要另拉基线。提交并给出最终答复。\n");
+            }
+        }
+    } else if sv_eq_cstr(name, "write" as &const byte) || sv_eq_cstr(name, "edit" as &const byte) {
+        g_exec.mod_seq = g_exec.mod_seq + 1;
+    }
+}
+
+// 折叠协议用（--compat-fold / 老端点）：[tool name] + 正文 + 换行
+fn dispatch_tool_buf(cfg: &Config, name: &const Buf, args_json: &const Buf, arena: &Arena, out: &Buf) void {
+    _ = buf_append_cstr(out, "[tool ");
+    _ = buf_append(out, name.ptr, name.len);
+    _ = buf_append_cstr(out, "] ");
+    dispatch_tool_body(cfg, name, args_json, arena, out);
+    _ = buf_append_byte(out, 10);
+}
+
+// 一个 tool_calls 元素的骨架：X / Y / Z 是三个字符串值的占位符（各占 1 字节），
+// 真实长度由 jw_str_esc_len 给。**必须与 calls_json_from_chat 的写法逐字对应** ——
+// 两边不一致时 calls_json_need 会算少，靠 calls_json_from_chat 的返回值兜底（见调用点）。
+const CALLS_JSON_SKELETON: &const byte = "{\"id\":X,\"type\":\"function\",\"function\":{\"name\":Y,\"arguments\":Z}}";
+// 预算余量：宁可多要几百字节，也不要因为骨架算错而把「参数有点大」误报成 OOM
+const CALLS_JSON_SLACK: usize = 256;
+
+// 序列化一批调用**需要多少字节**（精确值 + 余量）。
+//
+// 为什么要有它：以前这里是拍脑袋的 buf_new(8192)。工具参数一大（write 的正文、
+// 长 heredoc 的命令行、一次改好几个文件）序列化就 jw_overflow，调用点于是把
+// 「参数比 8 KiB 大」报成 "out of memory serializing tool_calls" 并**中止整轮**
+// （turn/end reason=error）。真机踩到：模型写一个 8 KiB 出头的 shim，命令行参数刚
+// 过线，于是「创建目录成功」之后的那一步直接死掉。
+//
+// 真正的上限不是这里：历史里单条 extra（tool_calls 原文）的上限是 MSG_CONTENT_MAX，
+// 8 KiB 只是当年随手写的容量。容量按需要算之后，「装不下」只剩真 OOM 一种可能。
+fn calls_json_need(o: &const ChatOut) usize {
+    const skeleton: usize = bufx_cstr_len(CALLS_JSON_SKELETON) - 3;   // 减掉 X/Y/Z 三个占位符
+    var n: usize = 2;   // [ ]
+    var i: usize = 0;
+    while i < o.ncalls {
+        if i > 0 {
+            n = n + 1;   // 元素之间的逗号
+        }
+        n = n + skeleton;
+        n = n + jw_str_esc_len(o.calls[i].id.ptr as &const byte, o.calls[i].id.len);
+        n = n + jw_str_esc_len(o.calls[i].name.ptr as &const byte, o.calls[i].name.len);
+        n = n + jw_str_esc_len(o.calls[i].args.ptr as &const byte, o.calls[i].args.len);
+        i = i + 1;
+    }
+    return n + CALLS_JSON_SLACK;
+}
+
+// 序列化一批调用的完整动作：**按实际需要分配 + 序列化**。
+//
+// 容量只有这一个出处（calls_json_need）—— 谁都不许再写「拍脑袋的固定容量」
+// （老代码就是 buf_new(8192)，工具参数刚过 8 KiB 就把整轮打成
+// "error: out of memory serializing tool_calls"）。自测的 toolcalls-cap 轮钉的就是它。
+//
+// out 必须是**空 Buf**（本函数内部新建；旧内容不会释放）。返回 false = 装不下
+// （预算都装不下＝只剩真 OOM 一种可能）。无论成功失败，调用方都要 buf_free(out)。
+fn calls_json_make(o: &const ChatOut, out: &Buf) bool {
+    out[0] = buf_new(calls_json_need(o));
+    return calls_json_from_chat(o, out);
+}
+
+// 把一批调用序列化成 assistant 的 tool_calls 数组原文（arguments 只转义一次）。
+// 返回 false = 缓冲装不下 —— 容量请用 calls_json_make 算，别自己给固定值。
+fn calls_json_from_chat(o: &const ChatOut, out: &Buf) bool {
+    var w: JsonWriter = JsonWriter{ buf: null, cap: 0, used: 0, overflow: false };
+    jw_init(&w, out.ptr, out.cap);
+    jw_byte(&w, 91);
+    var i: usize = 0;
+    while i < o.ncalls {
+        if i > 0 {
+            jw_byte(&w, 44);
+        }
+        jw_byte(&w, 123);
+        jw_key(&w, "id");
+        jw_str(&w, o.calls[i].id.ptr, o.calls[i].id.len);
+        jw_byte(&w, 44);
+        jw_key(&w, "type");
+        jw_str_cstr(&w, "function");
+        jw_byte(&w, 44);
+        jw_key(&w, "function");
+        jw_byte(&w, 123);
+        jw_key(&w, "name");
+        jw_str(&w, o.calls[i].name.ptr, o.calls[i].name.len);
+        jw_byte(&w, 44);
+        jw_key(&w, "arguments");
+        jw_str(&w, o.calls[i].args.ptr, o.calls[i].args.len);
+        jw_byte(&w, 125);
+        jw_byte(&w, 125);
+        i = i + 1;
+    }
+    jw_byte(&w, 93);
+    if jw_overflow(&w) {
+        return false;
+    }
+    out.len = jw_used(&w);
+    return true;
+}
+
+// 去掉尾部空白后的长度（DSH：中断时只保留 content/reasoning 的非空白前缀）
+export fn agent_trim_trailing_ws(p: &const byte, n: usize) usize {
+    var keep: usize = n;
+    while keep > 0 {
+        const c: byte = p[keep - 1];
+        if c == 32 as byte || c == 9 as byte || c == 10 as byte || c == 13 as byte {
+            keep = keep - 1;
+        } else {
+            break;
+        }
+    }
+    return keep;
+}
+
+// 流式一步。style 必须与 req 的组装协议一致（调用方用同一个 style 建 url/req）。
+// out_status 回传本次请求的 HTTP 状态码（0 = 没走到 HTTP）—— 协商回退要用它。
+// retry_ok = 本步剩余的退化响应重发额度（P54；指针一路带到 agent_finish_step 去扣）。
+fn agent_step_stream(cfg: &Config, style: u8, url: &const Buf, hdrs: &const Buf, req: &const Buf, arena: &Arena, h: &History, step: i32, interactive: bool, out_status: &i32, retry_ok: &bool) i32 {
+    var o: ChatOut = chat_out_new();
+    defer { chat_out_free(&o); }
+    var tc: TlsConn = tls_conn_empty();
+    var guard: FdGuard = FdGuard{ saved: -1, nullfd: -1, active: false };
+    tls_noise_mute(&guard, !cfg.tls_debug && !hc_debug);
+    const call_res: !i32 = llm_stream_style(
+        style,
+        url.ptr[0: url.len],
+        hdrs.ptr[0: hdrs.len],
+        req.ptr as &const byte,
+        req.len,
+        cfg.timeout_ms,
+        cfg.max_response,
+        cfg.verify,
+        cfg.pin.ptr[0: cfg.pin.len],
+        &o,
+        !cfg.quiet,
+        cfg.show_reasoning,
+        interactive
+    );
+    tls_noise_unmute(&guard);
+
+    var err_kind: i32 = 0;   // 0=无错 1=malformed 2=stream-closed 3=其它（传输/TLS） 4=用户中断
+    const status: i32 = call_res catch |err| {
+        const eid: i32 = (@error_id(err) as! i32).value;
+        var r: i32 = 3;
+        if eid == @error_id(error.LlmMalformed) {
+            r = 1;
+        } else if eid == @error_id(error.LlmStreamClosed) {
+            r = 2;
+        } else if eid == @error_id(error.LlmInterrupted) {
+            r = 4;
+        }
+        r;
+    };
+    if err_kind == 0 && (status == 1 || status == 2 || status == 3 || status == 4) {
+        err_kind = status;
+    }
+
+    // P16：不管后面走哪条路（成功 / 中断 / malformed / 网络），先把思考收拾干净 ——
+    // 显示上落一行、日志上记全文，并且把被思考行顶掉的提示符还回去。
+    // 正常路径下思考块早就因为「正文开始 / 工具调用开始」结算过了，这里是幂等的兜底。
+    agent_note_reasoning(step, &o);
+    // P18：首 token 边界。用 ChatOut 记下的那一刻写事件与折叠（不是现在），
+    // 否则 TTFT 会变成「整段流式时间」。非流式路径没有 delta，这里自然地不打点。
+    agent_bound_first_token(cfg, h, step, o.first_token_ms);
+
+    if err_kind == 4 {
+        // 对齐 DSH：中断流式时只保留 content/reasoning 的**非空白前缀**，
+        // **绝不**保留 tool_calls（参数可能是半截的）。
+        const keep: usize = agent_trim_trailing_ws(o.content.ptr as &const byte, o.content.len);
+        if keep > 0 {
+            var pushed_i: bool = hist_push(h, ROLE_ASSISTANT, o.content.ptr as &const byte, keep);
+            while !pushed_i {
+                if !hist_drop_oldest(h) {
+                    break;
+                }
+                pushed_i = hist_push(h, ROLE_ASSISTANT, o.content.ptr as &const byte, keep);
+            }
+        }
+        tty_puts(&tty_ui, 2, "\n[interrupted] 已中断本回合（历史保留，可直接继续输入）\n");
+        return AGENT_INTERRUPTED;
+    }
+
+    if err_kind == 1 {
+        // 坏 payload 的头部：走唯一诊断出口（不把裸字节刷进转录）
+        out_diag("malformed-sse-payload", "error: malformed SSE payload: ", o.err_text.ptr as &const byte, o.err_text.len);
+        return AGENT_PROTO;
+    }
+    if err_kind == 2 {
+        out_err("error: SSE stream ended without [DONE] (stream closed early)\n");
+        return AGENT_NET;
+    }
+    if err_kind == 3 {
+        out_err("error: 请求失败（网络或 TLS 校验）。\n");
+        if tc.observed_len > 0 {
+            out_err("  本次观测到的 leaf 证书 SHA-256 = ");
+            out_err_bytes(&tc.observed[0], tc.observed_len);
+            out_err("\n");
+            out_err("  链校验在真实站点常失败（见 §18）；用这个指纹重试：\n");
+            out_err("  uya-agent --tls-verify=pin --tls-pin <上面的指纹> ...\n");
+        } else {
+            out_err("  检查 base-url / 网络；证书问题可先用 --probe --tls-verify=none 看指纹。\n");
+        }
+        return AGENT_NET;
+    }
+    if status != 200 {
+        out_status[0] = status;
+        // 协商探测的那一次（未声明协议 + 端点不存在）不刷屏：由 api_negotiate() 打一行提示
+        if !api_may_negotiate(cfg, style, status) {
+            dump_stream_error(cfg, status, &o.err_text);
+        }
+        return AGENT_PROTO;
+    }
+    out_status[0] = status;
+
+    return agent_finish_step(cfg, arena, h, step, &o, req.len, retry_ok);
+}
+
+
+// P54：**退化响应**的唯一出口 —— 上游正常收尾，但这一步既没有正文也没有工具调用。
+//
+// ① 为什么要把证据一次给全：以前这里只打一句 "model returned neither content nor tool_calls"，
+// 会话日志里则只剩一条 `content=""` 的 assistant/message —— 事后分不清「上游说了 stop」还是
+// 「tool_calls 在流里丢了」，只能靠旁证凑。判据其实都在手上：
+//   * finish / have_finish / bad_finish：上游到底声明了什么（未知 finish_reason 的原文也在）；
+//   * reasoning 字节数：只思考没正文正是退化响应最典型的样子（正文一个字都没上来）；
+//   * usage：输出 token 花在哪儿了（思考里？还是压根没生成？）；
+//   * 本次请求的体量：prompt 字节数（我们真发出去的）+ prompt token 读数（提供方口径）。
+//
+// ② 为什么值得重发：同一请求再发一次通常就有正文。对齐 DSH 的 request-error 通道
+// （`compaction-basic` 接 context-overflow 就是这条）：**同一步**重发，历史一个字节没动，
+// 所以重算出来的请求体逐字节相同；额度每步一次（retry_ok 由 step 循环持有，指针传进来扣）。
+//
+// 返回 true = 已安排重发（调用方把这一步重来，即 STEP_RETRY）；false = 额度用尽，回合按错误收口。
+// 两个分支都**不留 assistant/message、不进历史、不计统计**：这一步没有任何产出，硬记一条空的
+// assistant 消息只会让「退化」和「模型真的回了空串」在日志里长得一模一样。
+fn agent_note_degenerate(step: i32, o: &const ChatOut, prompt_bytes: usize, retry_ok: &bool) bool {
+    const retrying: bool = retry_ok[0];
+    if retrying {
+        retry_ok[0] = false;   // 额度当场扣掉：同一步只可能重发 EMPTY_RETRY_MAX 次
+    }
+    const used: i64 = if retrying { 0 as i64 } else { EMPTY_RETRY_MAX as i64 };
+    // 负数读数只在「网关报的缓存命中 > prompt」时出现，证据里按 0 打（别打成一个天文数字）
+    const u_in: i64 = if o.usage_in > 0 { o.usage_in } else { 0 as i64 };
+    const u_cache_read: i64 = if o.usage_cache_read > 0 { o.usage_cache_read } else { 0 as i64 };
+    const u_cache_write: i64 = if o.usage_cache_write > 0 { o.usage_cache_write } else { 0 as i64 };
+    const u_out: i64 = if o.usage_out > 0 { o.usage_out } else { 0 as i64 };
+    const u_reason: i64 = if o.usage_reasoning > 0 { o.usage_reasoning } else { 0 as i64 };
+    const prompt_tokens: i64 = u_in + u_cache_read;
+    // finish 的机器名（证据与事件共用一份，避免两处各写一张表）
+    var fname: &const byte = "none" as &const byte;
+    if o.finish == LLM_FINISH_STOP {
+        fname = "stop" as &const byte;
+    } else if o.finish == LLM_FINISH_TOOL_CALLS {
+        fname = "tool_calls" as &const byte;
+    } else if o.finish == LLM_FINISH_MAX_TOKENS {
+        fname = "length" as &const byte;
+    } else if o.finish == LLM_FINISH_ERROR {
+        fname = "error" as &const byte;
+    }
+    // 未知 finish_reason 的原文是**外来字节**：转义 + 限长之后才许上屏（踩坑 33 的口径）
+    var bad: Buf = buf_new(128);
+    defer { buf_free(&bad); }
+    if buf_valid(&bad) && o.bad_finish.len > 0 {
+        _ = tty_diag_escape_into(&bad, o.bad_finish.ptr as &const byte, o.bad_finish.len, 64);
+    }
+
+    // 1) 转录一行：先说要干什么，再把证据（字段名固定，grep 得到）挂上
+    if retrying {
+        out_err("[retry] empty response from upstream (no content, no tool_calls) — resending the same request once");
+    } else {
+        out_err("error: model returned neither content nor tool_calls");
+    }
+    out_err(" [step=");
+    out_err_dec(step as usize);
+    out_err(" finish=");
+    out_err(fname);
+    out_err(" have_finish=");
+    if o.have_finish {
+        out_err("1");
+    } else {
+        out_err("0");
+    }
+    out_err(" bad_finish=");
+    if bad.len == 0 {
+        out_err("(none)");
+    } else {
+        out_err_bytes(bad.ptr as &const byte, bad.len);
+    }
+    out_err(" content=");
+    out_err_dec(o.content.len);
+    out_err("B reasoning=");
+    out_err_dec(o.reasoning.len);
+    out_err("B calls=");
+    out_err_dec(o.ncalls);
+    out_err(" usage={in=");
+    out_err_dec(u_in as usize);
+    out_err(" cache_read=");
+    out_err_dec(u_cache_read as usize);
+    out_err(" cache_write=");
+    out_err_dec(u_cache_write as usize);
+    out_err(" out=");
+    out_err_dec(u_out as usize);
+    out_err(" reasoning=");
+    out_err_dec(u_reason as usize);
+    out_err("} prompt=");
+    out_err_dec(prompt_bytes);
+    out_err("B/");
+    out_err_dec(prompt_tokens as usize);
+    out_err("tok retries=");
+    out_err_dec(used as usize);
+    out_err("/");
+    out_err_dec(EMPTY_RETRY_MAX as usize);
+    out_err("]\n");
+
+    // 2) 同一条证据进会话日志：resume / 事后排障看的就是它（形状对齐 DSH 的 llm/retry：
+    //    retry/maxRetries + 一个 failure 对象；retrying=false 表示「这次不重发了」）
+    if g_sess.save {
+        var ev: Buf = buf_new(1024);
+        defer { buf_free(&ev); }
+        if sess_begin(&g_sess, "llm/degenerate", &ev) {
+            _ = buf_append_cstr(&ev, "{\"turn\":");
+            _ = buf_append_i64(&ev, g_turn as i64);
+            _ = buf_append_cstr(&ev, ",\"step\":");
+            _ = buf_append_i64(&ev, step as i64);
+            _ = buf_append_cstr(&ev, ",\"reason\":\"empty-response\",\"retries\":");
+            _ = buf_append_i64(&ev, used);
+            _ = buf_append_cstr(&ev, ",\"maxRetries\":");
+            _ = buf_append_i64(&ev, EMPTY_RETRY_MAX as i64);
+            _ = buf_append_cstr(&ev, ",\"retrying\":");
+            if retrying {
+                _ = buf_append_cstr(&ev, "true");
+            } else {
+                _ = buf_append_cstr(&ev, "false");
+            }
+            _ = buf_append_cstr(&ev, ",\"failure\":{\"finish\":");
+            _ = jw_str_into(&ev, fname, bufx_cstr_len(fname));
+            _ = buf_append_cstr(&ev, ",\"finishCode\":");
+            _ = buf_append_i64(&ev, o.finish as i64);
+            _ = buf_append_cstr(&ev, ",\"haveFinish\":");
+            if o.have_finish {
+                _ = buf_append_cstr(&ev, "true");
+            } else {
+                _ = buf_append_cstr(&ev, "false");
+            }
+            _ = buf_append_cstr(&ev, ",\"badFinish\":");
+            _ = jw_str_into(&ev, bad.ptr as &const byte, bad.len);
+            _ = buf_append_cstr(&ev, ",\"contentBytes\":");
+            _ = buf_append_i64(&ev, o.content.len as i64);
+            _ = buf_append_cstr(&ev, ",\"reasoningBytes\":");
+            _ = buf_append_i64(&ev, o.reasoning.len as i64);
+            _ = buf_append_cstr(&ev, ",\"calls\":");
+            _ = buf_append_i64(&ev, o.ncalls as i64);
+            _ = buf_append_cstr(&ev, ",\"promptBytes\":");
+            _ = buf_append_i64(&ev, prompt_bytes as i64);
+            _ = buf_append_cstr(&ev, ",\"promptTokens\":");
+            _ = buf_append_i64(&ev, prompt_tokens);
+            _ = buf_append_cstr(&ev, ",\"sawDone\":");
+            if o.saw_done {
+                _ = buf_append_cstr(&ev, "true");
+            } else {
+                _ = buf_append_cstr(&ev, "false");
+            }
+            _ = buf_append_cstr(&ev, ",\"events\":");
+            _ = buf_append_i64(&ev, o.events as i64);
+            _ = buf_append_cstr(&ev, ",\"usage\":{\"in\":");
+            _ = buf_append_i64(&ev, u_in);
+            _ = buf_append_cstr(&ev, ",\"cacheRead\":");
+            _ = buf_append_i64(&ev, u_cache_read);
+            _ = buf_append_cstr(&ev, ",\"cacheWrite\":");
+            _ = buf_append_i64(&ev, u_cache_write);
+            _ = buf_append_cstr(&ev, ",\"out\":");
+            _ = buf_append_i64(&ev, u_out);
+            _ = buf_append_cstr(&ev, ",\"reasoning\":");
+            _ = buf_append_i64(&ev, u_reason);
+            _ = buf_append_cstr(&ev, "}}}");
+            _ = sess_end(&g_sess, &ev);
+        }
+    }
+    return retrying;
+}
+
+// 一步收尾（流式/非流式共用）：usage、finish 语义、工具派发、最终回答。
+// prompt_bytes = 本次请求体（prompt + tools + 外壳）的字节数 —— 退化响应的证据要用它，
+// 而它只有调用方（拼请求的那一层）知道，所以一路带下来。
+// retry_ok = 本步剩余的退化重发额度（指针：step 循环持有，这里扣）。
+fn agent_finish_step(cfg: &Config, arena: &Arena, h: &History, step: i32, o: &const ChatOut, prompt_bytes: usize, retry_ok: &bool) i32 {
+    // P9：记下这次请求的 prompt_tokens，作为下一次压缩判定的压力口径
+    g_last_prompt_tokens = o.usage_in + o.usage_cache_read;
+    if cfg.show_usage {
+        print_usage_line(o);
+    }
+    agent_cache_burst_note(cfg, o);
+    if o.finish == LLM_FINISH_ERROR {
+        // 网关消息同样是外来字节：转义 + 限长（原来是无上限原样打印）
+        out_diag("gateway-error", "model/gateway error: ", o.err_text.ptr as &const byte, o.err_text.len);
+        return AGENT_PROTO;
+    }
+
+    // P54：退化响应（正常收尾但既没正文也没工具调用）—— 先取证据、再决定重发。
+    // max-tokens 有自己的诊断分支（那是「截断」不是「退化」），所以先把它排掉。
+    if o.ncalls == 0 && o.content.len == 0 && o.finish != LLM_FINISH_MAX_TOKENS {
+        if agent_note_degenerate(step, o, prompt_bytes, retry_ok) {
+            return STEP_RETRY;
+        }
+        return AGENT_PROTO;
+    }
+
+    // P59：**max_tokens 截断**（§5.4.1）。三件事，一件都不能少：
+    //
+    // ① **不派发**任何工具调用 —— 参数可能是半截的，派发出去只会得到一条协议错
+    //    （对齐 DSH：它的 assembler 在 max-tokens 时把 tool-call 块整块滤掉）；
+    // ② 日志与历史**只留正文**：日志不留 tool_calls（keep_calls=false，理由见
+    //    `agent_log_assistant`），历史压一条普通 assistant 消息 —— 这与中断那条路
+    //    同一个形状（`agent_trim_trailing_ws` 剪掉断口处的空白再入史）；
+    // ③ 收口是 **warning 而不是 error**：截断不是「模型/协议出错」，是这一轮的输出
+    //    预算用完了。DSH 在这一步打的是 warn 色的「已达到输出 token 上限 / 回答被截断，
+    //    已有输出保留在对话中。发送"继续"可让模型接着输出」—— 本函数照抄它的语义。
+    //
+    // **为什么正文必须进历史**：用户看到「这一轮被截断了」之后的第一个动作就是回一句
+    // 「继续」。历史里没有那段正文的话，模型连自己刚写到哪都不知道，只能从零重来
+    // （真机现场：一整轮的工具调用白跑）。DSH 的提示语里那句「已有输出保留在对话中」
+    // 说的就是这件事。
+    if o.finish == LLM_FINISH_MAX_TOKENS {
+        agent_bound_assistant_message(cfg, h, step, o, false);
+        // 断口处的空白先剪掉：半句话尾巴上挂一串空白，下一轮请求里就是噪声
+        const keep_cut: usize = agent_trim_trailing_ws(o.content.ptr as &const byte, o.content.len);
+        if keep_cut > 0 {
+            var pushed_c: bool = hist_push(h, ROLE_ASSISTANT, o.content.ptr as &const byte, keep_cut);
+            while !pushed_c {
+                if !hist_drop_oldest(h) {
+                    break;
+                }
+                out_err("[history] dropped oldest message to stay within limits\n");
+                pushed_c = hist_push(h, ROLE_ASSISTANT, o.content.ptr as &const byte, keep_cut);
+            }
+        }
+        if keep_cut > 0 && o.printed_chars == 0 {
+            out_bytes(o.content.ptr as &const byte, keep_cut);
+        }
+        // 正文和收口那两行之间必须先断开：流式（默认）早就把正文打出去了、**不带收尾换行**，
+        // 少这一下 `warning:` 就会粘在半句话的尾巴上（与最终答复那条路同一个写法）。
+        if keep_cut > 0 {
+            out_err("\n");
+        }
+        // 转录：一句 warning + 一句「下一步怎么做」。--quiet 也照打 —— 它是「这一轮
+        // 没跑完、画面上的东西是半截的」的唯一信号，静音掉等于骗人。
+        out_err("warning: 模型输出到达 token 上限（max_tokens）被截断，本回合到此为止（不是错误）\n");
+        out_err("[max-tokens] ");
+        if o.ncalls > 0 {
+            out_err_dec(o.ncalls as usize);
+            out_err(" 个工具调用已丢弃（参数可能是半截的，派发只会得到协议错）；");
+        }
+        if keep_cut > 0 {
+            out_err("已产出的正文留在对话里 —— 直接发「继续」即可让模型接着做\n");
+        } else {
+            out_err("这一步没有正文可留（输出预算全花在思考上）—— 发「继续」重试，或调低推理强度 / 调高 max_tokens\n");
+        }
+        return AGENT_MAX_TOKENS;
+    }
+
+    agent_bound_assistant_message(cfg, h, step, o, true);
+
+    if o.ncalls > 0 {
+        if cfg.compat_fold {
+            // 折叠协议：工具结果拼成**一条 user 消息**回灌（老端点兼容）
+            var results: Buf = buf_new(16384);
+            if !buf_valid(&results) {
+                out_err("error: out of memory (tool results)\n");
+                return AGENT_PROTO;
+            }
+            _ = buf_append_cstr(&results, "工具执行结果如下，请据此继续；如果你已经能给出最终答案就直接回答：\n");
+            if o.content.len > 0 {
+                _ = buf_append_cstr(&results, "[你上一轮的说明] ");
+                _ = buf_append(&results, o.content.ptr, o.content.len);
+                _ = buf_append_byte(&results, 10);
+            }
+            var ci: usize = 0;
+            while ci < o.ncalls {
+                view_begin_tool(arena, &o.calls[ci].name, &o.calls[ci].args);
+                var res_f: Buf = buf_new(4096);
+                // tool/call 在派发**之前**落地，tool/result 在之后：日志上的时间差才是
+                // 真实工具耗时（统计的 toolMs 就吃这个差值）
+                agent_bound_tool_call(cfg, h, step, &o.calls[ci].id, &o.calls[ci].name, &o.calls[ci].args);
+                dispatch_tool_body(cfg, &o.calls[ci].name, &o.calls[ci].args, arena, &res_f);
+                view_end_tool(arena, &o.calls[ci].name, &o.calls[ci].args, &res_f);
+                agent_tasks_sync();
+                agent_bound_tool_result(cfg, h, step, &o.calls[ci].id, &res_f);
+                _ = buf_append_cstr(&results, "[tool ");
+                _ = buf_append(&results, o.calls[ci].name.ptr, o.calls[ci].name.len);
+                _ = buf_append_cstr(&results, "] ");
+                _ = buf_append(&results, res_f.ptr, res_f.len);
+                _ = buf_append_byte(&results, 10);
+                buf_free(&res_f);
+                ci = ci + 1;
+            }
+            var pushed_f: bool = hist_push(h, ROLE_USER, results.ptr as &const byte, results.len);
+            while !pushed_f {
+                if !hist_drop_oldest(h) {
+                    break;
+                }
+                out_err("[history] dropped oldest message to stay within limits\n");
+                pushed_f = hist_push(h, ROLE_USER, results.ptr as &const byte, results.len);
+            }
+            buf_free(&results);
+            if !pushed_f {
+                // 折叠路径没有 assistant(tool_calls) 要配对，失败不会留下坏历史；
+                // 超长文本已由 hist_fit_text 缩过，这里只剩真 OOM。
+                out_err("error: 工具结果无法写入历史（内存不足）\n");
+                return AGENT_PROTO;
+            }
+            return STEP_CONTINUE;
+        }
+
+        // 严格协议：assistant（含 tool_calls 原样）→ 逐条 role:"tool" 结果
+        //
+        // 容量按**实际需要**算（calls_json_make）：以前是固定 8192，工具参数一大就把
+        // 「参数比 8 KiB 大」误报成 "out of memory serializing tool_calls" 并中止整轮 ——
+        // 而且报错点在入史之前，那一步的 assistant 事件也不会落日志，事后无从查证。
+        const need: usize = calls_json_need(o);
+        var calls_json: Buf = buf_empty();
+        defer { buf_free(&calls_json); }
+        if !calls_json_make(o, &calls_json) {
+            // 容量是精确算的（还带 CALLS_JSON_SLACK 余量）：走到这里只剩真分配不出来
+            out_err("error: out of memory serializing tool_calls (");
+            out_err_dec(need);
+            out_err(" bytes)\n");
+            return AGENT_PROTO;
+        }
+        var pushed_a: bool = hist_push_msg(h, ROLE_ASSISTANT_CALLS, o.content.ptr as &const byte, o.content.len, calls_json.ptr as &const byte, calls_json.len);
+        while !pushed_a {
+            if !hist_drop_oldest(h) {
+                break;
+            }
+            out_err("[history] dropped oldest message to stay within limits\n");
+            pushed_a = hist_push_msg(h, ROLE_ASSISTANT_CALLS, o.content.ptr as &const byte, o.content.len, calls_json.ptr as &const byte, calls_json.len);
+        }
+        if !pushed_a {
+            // extra（tool_calls 原文）不能裁剪（截断就是非法 JSON，端点必 400），
+            // 所以超过单条上限只能整轮退出 —— 把两个数字都报出来，别再让人猜
+            out_err("error: could not append assistant message to history（tool_calls 原文 ");
+            out_err_dec(calls_json.len);
+            out_err(" 字节，单条上限 ");
+            out_err_dec(MSG_CONTENT_MAX);
+            out_err("；或内存不足）\n");
+            return AGENT_PROTO;
+        }
+        // 本步这一组的起点：它就是受保护区域的下界 —— 丢老消息时**不允许**碰到
+        // 这条 assistant(tool_calls) 以及它已经压入的 tool 结果，否则历史会变成
+        // 「悬空 tool_calls」，端点必然 400（历史默认不限条数，所以这条只在内存吃紧时生效）。
+        const group_start: usize = h.len - 1;
+
+        var ci: usize = 0;
+        while ci < o.ncalls {
+            view_begin_tool(arena, &o.calls[ci].name, &o.calls[ci].args);
+            var res: Buf = buf_new(4096);
+            if !buf_valid(&res) {
+                out_err("error: out of memory (tool result)\n");
+                hist_truncate_to(h, group_start);
+                return AGENT_PROTO;
+            }
+            agent_bound_tool_call(cfg, h, step, &o.calls[ci].id, &o.calls[ci].name, &o.calls[ci].args);
+            dispatch_tool_body(cfg, &o.calls[ci].name, &o.calls[ci].args, arena, &res);
+            view_end_tool(arena, &o.calls[ci].name, &o.calls[ci].args, &res);
+            agent_tasks_sync();
+            agent_bound_tool_result(cfg, h, step, &o.calls[ci].id, &res);
+            if res.len == 0 {
+                // 空结果在线上必须是 "(no output)"（对齐 DSH）
+                _ = buf_append_cstr(&res, "(no output)");
+            }
+            // 结果来自哪个工具，决定构请求时用哪条剪枝规则（P27：bash 走行式剪枝）
+            var rkind: u8 = CMP_KIND_TOOL;
+            if sv_eq_cstr(&o.calls[ci].name, "bash") {
+                rkind = CMP_KIND_BASH;
+            }
+            // 每条结果都必须进历史：assistant(tool_calls) 与它的 tool 结果是一个原子组，
+            // 半截的话请求会被端点以 "insufficient tool messages following tool_calls" 拒掉，
+            // 而且这条坏历史会一直留在会话里（/continue 永远 400）。
+            //
+            // 本组起点 = h.len - ci - 1（ci 条结果已在本组里；丢老消息只是让两边同比下移）。
+            // 它是 hist_drop_oldest_below 的上界：受保护区域之内一条都不许丢。
+            var pushed_t: bool = hist_push_tool_kind(h, rkind, res.ptr as &const byte, res.len, o.calls[ci].id.ptr as &const byte, o.calls[ci].id.len);
+            while !pushed_t {
+                var floor: usize = 1;
+                if h.len > ci + 1 {
+                    floor = h.len - ci - 1;
+                }
+                if !hist_drop_oldest_below(h, floor) {
+                    break;
+                }
+                out_err("[history] dropped oldest message to stay within limits\n");
+                pushed_t = hist_push_tool_kind(h, rkind, res.ptr as &const byte, res.len, o.calls[ci].id.ptr as &const byte, o.calls[ci].id.len);
+            }
+            buf_free(&res);
+            if !pushed_t {
+                // 回滚整组：宁可不记这一步，也不留下半截（历史必须始终满足配对要求）
+                var floor2: usize = 1;
+                if h.len > ci + 1 {
+                    floor2 = h.len - ci - 1;
+                }
+                hist_truncate_to(h, floor2);
+                out_err("error: out of memory appending tool result; step rolled back\n");
+                return AGENT_PROTO;
+            }
+            ci = ci + 1;
+        }
+        return STEP_CONTINUE;
+    }
+
+    if o.content.len > 0 {
+        if o.printed_chars == 0 {
+            out_bytes(o.content.ptr as &const byte, o.content.len);
+        }
+        out_err("\n");
+        return AGENT_OK;
+    }
+    out_err("error: model returned neither content nor tool_calls\n");
+    return AGENT_PROTO;
+}
+
+// 建历史：一条 system + 可选的第一条 user
+fn agent_hist_init(cfg: &const Config, h: &History, first: &const Buf) bool {
+    // P37：worktree 模式 —— 新会话在**建 system prompt 之前**就把工作区搬进 worktree
+    // （独立工作区执行）。调用点只有这里，所以「新会话」的判定就落在这个函数上：
+    // --resume / fork / 子代理 都不走这条路（它们的会话记录里已经带着工作区）。
+    agent_worktree_begin(cfg);
+    var sp: Buf = buf_new(32768);
+    defer { buf_free(&sp); }
+    if !agent_system_prompt(cfg, &sp) {
+        return false;
+    }
+    if !hist_push(h, ROLE_SYSTEM, sp.ptr as &const byte, sp.len) {
+        return false;
+    }
+    agent_inject_context(cfg, h);
+    agent_log_delegation(cfg);
+    if first.len > 0 {
+        return hist_push(h, ROLE_USER, first.ptr as &const byte, first.len);
+    }
+    return true;
+}
+
+// 一次 turn 的 step 循环：history 里已经包含 system 与本轮的 user 消息
+fn agent_turn_loop(cfg: &Config, h: &History) i32 {
+    g_turn = g_turn + 1;
+    agent_log_turn_start();
+    const rc: i32 = agent_turn_loop_inner(cfg, h);
+    // 回合结束时历史可能停在「一步只压了一半」的形状上（这一步的 tool 结果没能进历史）。
+    // 修回配对完整 —— 否则下一条 /continue 会被端点以
+    // "insufficient tool messages following tool_calls" 一直 400（用户实际踩到过）。
+    if h.len > 1 {
+        const tail_role: u8 = msg_at(h, h.len - 1).role;
+        if tail_role == ROLE_TOOL || tail_role == ROLE_ASSISTANT_CALLS {
+            const repaired: usize = hist_trim_incomplete_tail(h);
+            if repaired > 0 {
+                out_err("[history] 丢弃了 ");
+                out_err_dec(repaired);
+                out_err(" 条「未完成一轮」的尾部消息\n");
+            }
+        }
+    }
+    if rc == AGENT_INTERRUPTED {
+        agent_log_turn_end("aborted");
+    } else if rc == AGENT_OK {
+        agent_log_turn_end("completed");
+    } else if rc == AGENT_MAX_TOKENS {
+        // P59：对齐 DSH 的 turn/end reason —— 它在这一步记的是 `{kind:"max-tokens"}`：
+        // 「截断」既不是 completed（没走到最终答复）也不是 error（谁都没出错）。
+        agent_log_turn_end("max-tokens");
+    } else if rc == AGENT_NET {
+        agent_log_turn_end("error");
+    } else {
+        // 可能是 max-steps 熔断，也可能是协议/工具错
+        agent_log_turn_end("error");
+    }
+    st_turn_end();
+    agent_stats_sync(cfg, h);
+    // P46：自动起标题 —— 回合收尾**只挂待办**，真正发请求在空闲主循环里
+    // （理由见 agent_title_auto_schedule：在这里同步发会拖长「回合没结束」的窗口，
+    // 而运行中敲进来的命令要等 step 边界才被领取 —— p30-check 抓到过这条）。
+    if rc == AGENT_OK {
+        agent_title_auto_schedule(cfg);
+    }
+    agent_pump_ctx_end(cfg);
+    return rc;
+}
+
+// 非流式响应体按协议解析（两条路径共用同一个 ChatOut）
+fn agent_parse_nonstream(style: u8, root: &JsonValue, o: &ChatOut) !void {
+    if style == LLM_STYLE_RESPONSES {
+        return responses_out_from_nonstream(root, o);
+    }
+    return chat_out_from_nonstream(root, o);
+}
+
+// 非流式一步（--no-stream）：与流式共用 agent_finish_step 收尾。
+// style 必须与 req 的组装协议一致；out_status 回传 HTTP 状态码（协商回退要用）。
+fn agent_step_plain(cfg: &const Config, style: u8, url: &const Buf, hdrs: &const Buf, req: &const Buf, arena: &Arena, h: &History, step: i32, out_status: &i32, retry_ok: &bool) i32 {
+    var resp: Resp = resp_empty();
+    var tc: TlsConn = tls_conn_empty();
+    var guard: FdGuard = FdGuard{ saved: -1, nullfd: -1, active: false };
+    tls_noise_mute(&guard, !cfg.tls_debug && !hc_debug);
+    const call_res: !void = http_request(
+        url.ptr[0: url.len],
+        &"POST"[0: 4],
+        hdrs.ptr[0: hdrs.len],
+        req.ptr as &const byte,
+        req.len,
+        cfg.timeout_ms,
+        cfg.max_response,
+        cfg.verify,
+        cfg.pin.ptr[0: cfg.pin.len],
+        &resp,
+        &tc
+    );
+    tls_noise_unmute(&guard);
+    _ = call_res catch {
+        out_err("error: 请求失败（网络或 TLS 校验）。\n");
+        if tc.observed_len > 0 {
+            out_err("  本次观测到的 leaf 证书 SHA-256 = ");
+            out_err_bytes(&tc.observed[0], tc.observed_len);
+            out_err("\n");
+            out_err("  链校验在真实站点常失败（见 §18）；用这个指纹重试：\n");
+            out_err("  uya-agent --tls-verify=pin --tls-pin <上面的指纹> ...\n");
+        } else {
+            out_err("  检查 base-url / 网络；证书问题可先用 --probe --tls-verify=none 看指纹。\n");
+        }
+        return AGENT_NET;
+    };
+
+    if resp.status != 200 {
+        out_status[0] = resp.status;
+        // 协商探测的那一次不刷屏（同流式路径）
+        if !api_may_negotiate(cfg, style, resp.status) {
+            dump_http_error(resp.status, &resp.body);
+        }
+        resp_free(&resp);
+        return AGENT_PROTO;
+    }
+    out_status[0] = resp.status;
+
+    // 关键：std.json 的 parse 是**零拷贝**的 —— JsonValue 树（含所有字符串视图）
+    // 都指向输入缓冲区。所以先把响应体复制进 arena 再解析，解析完就能安全释放响应体；
+    // 否则会出现「偶发 use-after-free」：free 之后堆内存一被复用，
+    // choices/message 就查不到，表现为莫名其妙的 "response has no choices[0].message"。
+    const resp_len: usize = resp.body.len;
+    const body_copy: &byte = arena_alloc(arena, resp_len + 1);
+    if (body_copy as usize) == 0 {
+        out_err("error: out of memory copying response\n");
+        resp_free(&resp);
+        return AGENT_PROTO;
+    }
+    _ = mem_copy(body_copy, resp.body.ptr as &const byte, resp_len);
+    const body_copy_end: &byte = @ptr_from_usize(@usize_from_ptr(body_copy as &void) + resp_len) as &byte;
+    _ = mem_set(body_copy_end, 0, 1);
+    resp_free(&resp);
+
+    var root: JsonValue = JsonValue.json_null();
+    if !js_parse(arena, body_copy, resp_len, &root) {
+        out_err("error: cannot parse model response as JSON\n");
+        out_diag("non-json-body", "body: ", body_copy as &const byte, resp_len);
+        return AGENT_PROTO;
+    }
+
+    // 非流式响应 → 与流式相同的 ChatOut 结构，收尾逻辑完全共用
+    var o2: ChatOut = chat_out_new();
+    defer { chat_out_free(&o2); }
+    const fill_res: !void = agent_parse_nonstream(style, &root, &o2);
+    _ = fill_res catch {
+        out_err("error: cannot parse model response message\n");
+        return AGENT_PROTO;
+    };
+    // P16：非流式没有实时行，思考只在收尾时落一行 + 记全文（与流式同一个收尾口径）
+    agent_note_reasoning(step, &o2);
+    return agent_finish_step(cfg, arena, h, step, &o2, req.len, retry_ok);
+}
+
+// ---- P55：执行期两条纪律 ----
+//
+// 实测（同一个「把 50 个源文件拆进子目录」任务，dsh 对比 uya-agent）：
+//   * 输出 token 的 90% 是**思考**，正文只占 2%、工具参数两边几乎一样多；
+//   * uya-agent 的思考量是 dsh 的 4.5 倍，其中一条固定浪费是「方案在推理里被反复重列」
+//     （50 个文件的映射在 step10–17 被重列，`src/` 在一段推理里出现 281 次）；
+//   * 另一条是「验收通过之后还不收工」：make build 在同一回合里跑了三遍。
+// 所以这里加两个可判定的机制（都不改默认行为）：
+//   ① 低思考执行态（--exec-effort V --exec-after N）：前 N 步用配置档位把方案想清，
+//      之后切到 V 执行 —— 对齐实测里"想一次就进入低思考执行"的那种形态。
+//   ② 收工提醒 + 收工预算（--grace-steps N）：验收类 bash 命令在**改动之后**第一次跑绿时，
+//      往结果尾部追加一行提醒；配了 N 就再给 N 步收工，用尽即提前结束本回合。
+
+fn agent_turn_loop_inner(cfg: &Config, h: &History) i32 {
+    // P30：登记「当前回合」——阻塞循环里的统一泵点要用它来派发运行中的命令
+    // （P31：主循环跑命令时也登记同一份上下文，见 agent_pump_ctx_begin）
+    agent_pump_ctx_begin(cfg, h);
+    // P55：回合开始复位执行期纪律的那点状态 ——
+    //   * 上一回合切下去的低档位先还原（配置档位是每个回合的起点，不然一次任务之后就永久降档了）；
+    //   * 本回合的改动计数 / 验收锚点 / 提醒计数清零（收工预算按回合算）。
+    g_exec.mod_seq = 0;
+    g_exec.accept_mod_seq = 0;
+    g_exec.accept_step = 0;
+    g_exec.notes = 0;
+    if g_exec.on {
+        g_exec.on = false;
+        if g_exec.base.len > 0 {
+            _ = agent_effort_apply(cfg, g_exec.base.ptr as &const byte, g_exec.base.len, false, "exec-restore" as &const byte);
+        }
+    }
+    // ⚠ 请求头**逐 step** 重建（原来整回合只建一次）。Authorization 在里面，而模型/提供方
+    // 现在可以在回合运行中当场切换（/model、浮层）—— 只建一次的话 URL 会跟着新路线走、
+    // **密钥却还是旧提供方的**（踩坑 96 的孪生坑）。重建点就是下面每个 step 的
+    // api_url_into 旁边：两条都在同一处，谁都不会漏。
+    var hdrs: Buf = buf_new(512);
+    defer { buf_free(&hdrs); }
+
+    const arena_cap: usize = cfg.max_response + 65536;
+    const arena_raw: &void = malloc(arena_cap);
+    if ((arena_raw as &byte) as usize) == 0 {
+        out_err("error: out of memory (arena)\n");
+        return AGENT_PROTO;
+    }
+    defer { free(arena_raw); }
+    var arena: Arena = Arena{ buffer: null, size: 0, used: 0 };
+    arena_init(&arena, arena_raw as &byte, arena_cap);
+
+    var step: i32 = 0;
+    // max_steps <= 0（默认）＝ 不限步数：只有模型给出「不含 tool_calls 的最终答案」才结束。
+    // 显式给了正整数时才是熔断上限（下面循环结束后那条错误）。
+    while cfg.max_steps <= 0 || step < cfg.max_steps {
+        step = step + 1;
+        // P55：收工预算（--grace-steps N，默认 0 = 只提醒、不设硬上限）。
+        // 锚点是「验收类命令在改动之后第一次跑绿」的那一步：从那一步起只给 N 步收工，
+        // 用尽就提前结束本回合。默认关闭 —— 硬截断会让模型来不及给最终答复。
+        if cfg.grace_steps > 0 && g_exec.accept_step > 0 && step > g_exec.accept_step + cfg.grace_steps {
+            out_err("[grace] 验收已通过（第 ");
+            out_err_dec(g_exec.accept_step as usize);
+            out_err(" 步），收工预算 ");
+            out_err_dec(cfg.grace_steps as usize);
+            out_err(" 步已用尽：本回合提前收工（改动已保留，请查 /diff 或 git log）\n");
+            return AGENT_PROTO;
+        }
+        // P28：step 边界先问一句「用户是不是已经要停了」。
+        // 中断/退出意图在**下一个 step 边界**生效（DSH 口径）——那就没必要再发一个
+        // 注定会被自己掐断的请求出去：用户按下 esc/ctrl+d 之后，要的是**马上**回到输入态，
+        // 而不是等一个来回的网络（真机上这一下就是 1–2 秒）。
+        if tui_abort_state() != TUI_ABORT_NONE {
+            tty_puts(&tty_ui, 2, "\n[interrupted] 已中断本回合（历史保留，可直接继续输入）\n");
+            return AGENT_INTERRUPTED;
+        }
+        // DSH steer 语义：step 边界领取「运行期间用户敲进来的输入」，作为普通 user 消息
+        agent_claim_steer(cfg, h);
+        // P23：运行中在命令面板里选中的只读命令（/status 等）也在这一步派发 ——
+        // 以前面板结果只有主循环会取，而主循环整个回合都不跑，屏幕上就是「没反应」。
+        agent_tui_poll_pending_cmd(cfg, h);
+        // P30：step 边界是 /compact 的落点（运行中敲进来的排队命令终于有地方落地了）
+        agent_tui_step_boundary_cmd(cfg, h);
+        // P9：step 边界测压，必要时压缩上下文（DSH 也是在 request derivation 之前做）
+        if g_compact_enabled {
+            _ = agent_maybe_compact(cfg, h, step, false);
+        }
+        // P26：plan 模式变了就在这一步补推一份新快照（放在压缩之后：别刚推就被折进 checkpoint）
+        agent_plan_snapshot_sync(cfg, h);
+        // P34：工作区变了（模型自己调的 workspace 工具 / 人敲的 /workspace）也在这一步补推：
+        // 运行时上下文里那句 Current workspace 与新工作区的 AGENTS.md 都要跟上
+        agent_ws_snapshot_sync(cfg, h);
+        agent_bound_step_start(cfg, h, step);
+        // P55：低思考执行态 —— 前 exec_after 步用配置档位把方案想清，之后切到 exec_effort 执行。
+        // 只在配了 --exec-effort / --exec-after 时生效；逻辑内联在这里（本仓不能再加顶层函数，
+        // 见 ExecState 上面那段注释）。
+        g_exec.step = step;
+        if !g_exec.on && !g_exec.off && cfg.exec_after > 0 && cfg.exec_effort.len > 0 && step > cfg.exec_after {
+            if cfg.reasoning_effort.len > 0 {
+                buf_free(&g_exec.base);
+                g_exec.base = buf_new(cfg.reasoning_effort.len + 8);
+                _ = buf_append(&g_exec.base, cfg.reasoning_effort.ptr as &const byte, cfg.reasoning_effort.len);
+            }
+            const xrc: i32 = agent_effort_apply(cfg, cfg.exec_effort.ptr as &const byte, cfg.exec_effort.len, false, "exec-effort" as &const byte);
+            if xrc == 2 {
+                // 档位不在该模型公布的清单里：不切，并且别每一步白试一次
+                g_exec.off = true;
+                out_err("[exec-effort] 跳过：");
+                out_err_bytes(cfg.exec_effort.ptr, cfg.exec_effort.len);
+                out_err(" 不在当前模型公布的档位里\n");
+            } else {
+                g_exec.on = true;
+                if g_interactive {
+                    var xnote: Buf = buf_new(128);
+                    if buf_valid(&xnote) {
+                        _ = buf_append_cstr(&xnote, "执行期降档 → ");
+                        _ = buf_append(&xnote, cfg.exec_effort.ptr as &const byte, cfg.exec_effort.len);
+                        _ = buf_append_cstr(&xnote, "（前 ");
+                        _ = buf_append_u64(&xnote, cfg.exec_after as u64);
+                        _ = buf_append_cstr(&xnote, " 步用原档位）");
+                        tui_add_notice(xnote.ptr as &const byte, xnote.len);
+                        buf_free(&xnote);
+                    }
+                }
+            }
+        }
+        if g_interactive {
+            // 状态显示走提示符（避免两行光标的复杂度）；子代理面板在提示符上方
+            agent_agents_tick();
+            var ps: Buf = buf_new(64);
+            if buf_valid(&ps) {
+                _ = buf_append_cstr(&ps, "[step ");
+                _ = buf_append_u64(&ps, step as u64);
+                agent_prompt_suffix(&ps);
+                _ = buf_append_cstr(&ps, "] > ");
+                _ = buf_append_byte(&ps, 0);
+                tty_set_prompt(&tty_ui, ps.ptr as &const byte);
+                buf_free(&ps);
+                tty_draw_line(&tty_ui, 2);
+            }
+        }
+        arena_reset(&arena);
+
+        const need: usize = request_bytes_needed(h, cfg);
+        var req: Buf = buf_new(need);
+        if !buf_valid(&req) {
+            out_err("error: out of memory (request)\n");
+            agent_bound_step_end(cfg, h, step);
+            return AGENT_PROTO;
+        }
+        var url: Buf = buf_new(cfg.base_url.len + 24);
+        if !buf_valid(&url) {
+            buf_free(&req);
+            out_err("error: out of memory\n");
+            agent_bound_step_end(cfg, h, step);
+            return AGENT_PROTO;
+        }
+
+        // 协议协商：未声明时首个请求先按 responses 发；只有「端点不存在」（404/405/501）
+        // 才回退 chat/completions 并在**同一步**用另一个协议重发一次（每进程只协商一次）。
+        //
+        // P54：本步的**退化响应重发额度**（step 循环持有，agent_note_degenerate 扣）。
+        // 与协商回退同一个形状：都在这个内层循环里把同一步重发一次，历史不动 ——
+        // 于是重算出来的 url/req 与上一次逐字节相同（自测「重发的请求体一字不差」钉的就是它）。
+        var retry_ok: bool = EMPTY_RETRY_MAX > 0;
+        var step_rc: i32 = AGENT_PROTO;
+        var sent: bool = false;
+        while !sent {
+            const style: u8 = api_style_now(cfg);
+            if !api_url_into(cfg, style, &url) {
+                buf_free(&req);
+                buf_free(&url);
+                out_err("error: out of memory\n");
+                agent_bound_step_end(cfg, h, step);
+                return AGENT_PROTO;
+            }
+            // 与 url 同一处重建：两者必须描述**同一条**路线（见回合入口那条注释）
+            buf_reset(&hdrs);
+            if !build_headers(cfg, &hdrs) {
+                buf_free(&req);
+                buf_free(&url);
+                out_err("error: out of memory\n");
+                agent_bound_step_end(cfg, h, step);
+                return AGENT_PROTO;
+            }
+            if !build_model_request(cfg, h, &req, style) {
+                buf_free(&req);
+                buf_free(&url);
+                out_err("error: cannot build request（历史可能过大，试 /compact 或 --context-window）\n");
+                agent_bound_step_end(cfg, h, step);
+                return AGENT_PROTO;
+            }
+            var status: i32 = 0;
+            var rc: i32 = AGENT_PROTO;
+            if cfg.stream {
+                rc = agent_step_stream(cfg, style, &url, &hdrs, &req, &arena, h, step, g_interactive, &status, &retry_ok);
+            } else {
+                rc = agent_step_plain(cfg, style, &url, &hdrs, &req, &arena, h, step, &status, &retry_ok);
+            }
+            if api_negotiate(cfg, style, status) {
+                continue;   // 换协议重发：下一轮重算 url/req
+            }
+            api_lock(cfg, style);
+            if rc == STEP_RETRY {
+                // 退化响应：额度已经在 agent_note_degenerate 里扣掉、证据也落了，这里只管重来
+                continue;
+            }
+            step_rc = rc;
+            sent = true;
+        }
+        buf_free(&req);
+        buf_free(&url);
+        agent_bound_step_end(cfg, h, step);
+        if step_rc == STEP_CONTINUE {
+            continue;
+        }
+        return step_rc;
+    }
+    out_err("error: step limit reached (");
+    out_err_dec(cfg.max_steps as usize);
+    out_err(" steps); raise it with --max-steps N, or 0 for unlimited");
+    if g_interactive {
+        out_err("；输入 /continue 可继续，或直接给新任务");
+    }
+    out_err("\n");
+    return AGENT_PROTO;
+}
+
+
+// 建/恢复会话历史：先尝试恢复（含 system），否则新建（system + 可选首条 user）
+// tool_calls 数组里有几个调用（extra 是本项目自己序列化出来的数组原文）
+fn hist_calls_count(arena: &Arena, extra: &byte, extra_len: usize) usize {
+    if extra_len == 0 {
+        return 0;
+    }
+    arena_reset(arena);
+    var root: JsonValue = JsonValue.json_null();
+    if !js_parse(arena, extra, extra_len, &root) {
+        return 0;
+    }
+    return js_arr_len(&root);
+}
+
+// 下标 g 处的 assistant(tool_calls) 这一组是否**应答完整**：
+// 紧跟其后的 tool 消息条数等于调用条数，且每个 tool_call_id 都能在该组的调用 id 里找到。
+// 完整的一组才是网关接受的形状；不完整的一组必须整组丢掉。
+fn hist_group_ok(arena: &Arena, h: &const History, g: usize) bool {
+    if g >= h.len {
+        return false;
+    }
+    const a: &const Msg = msg_at(h, g);
+    if a.role != ROLE_ASSISTANT_CALLS || a.extra_len == 0 {
+        return false;
+    }
+    arena_reset(arena);
+    var root: JsonValue = JsonValue.json_null();
+    if !js_parse(arena, a.extra, a.extra_len, &root) {
+        return false;   // tool_calls 本身坏了：当作不完整（整组丢）
+    }
+    const nc: usize = js_arr_len(&root);
+    if nc == 0 {
+        return false;
+    }
+    var nt: usize = 0;
+    var i: usize = g + 1;
+    while i < h.len && msg_at(h, i).role == ROLE_TOOL {
+        nt = nt + 1;
+        i = i + 1;
+    }
+    if nt != nc {
+        return false;
+    }
+    var k: usize = 0;
+    while k < nc {
+        var cm: JsonValue = JsonValue.json_null();
+        if !js_arr_get(&root, k, &cm) {
+            return false;
+        }
+        var cid: JsonStrView = JsonStrView{ ptr: null, len: 0 };
+        if !js_obj_get_str(&cm, "id", 2, &cid) || cid.len == 0 {
+            return false;
+        }
+        var hit: bool = false;
+        var t: usize = 0;
+        while t < nt {
+            const tm: &const Msg = msg_at(h, g + 1 + t);
+            if tm.extra_len == cid.len {
+                var same: bool = true;
+                var q: usize = 0;
+                while q < cid.len {
+                    if tm.extra[q] != cid.ptr[q] {
+                        same = false;
+                        break;
+                    }
+                    q = q + 1;
+                }
+                if same {
+                    hit = true;
+                    break;
+                }
+            }
+            t = t + 1;
+        }
+        if !hit {
+            return false;
+        }
+        k = k + 1;
+    }
+    return true;
+}
+
+// 整段历史是否满足严格工具协议的配对要求：每个 assistant(tool_calls) 后面必须紧跟
+// 应答它的 N 条 tool，且不允许出现孤儿 tool 消息。自测/排障用，不进请求热路径。
+export fn hist_pairing_ok(h: &const History) bool {
+    const raw: &void = malloc(1 << 20);
+    if ((raw as &byte) as usize) == 0 {
+        return false;
+    }
+    defer { free(raw); }
+    var arena: Arena = Arena{ buffer: null, size: 0, used: 0 };
+    arena_init(&arena, raw as &byte, 1 << 20);
+    var i: usize = 0;
+    while i < h.len {
+        const r: u8 = msg_at(h, i).role;
+        if r == ROLE_ASSISTANT_CALLS {
+            if !hist_group_ok(&arena, h, i) {
+                return false;
+            }
+            const nc: usize = hist_calls_count(&arena, msg_at(h, i).extra, msg_at(h, i).extra_len);
+            i = i + 1 + nc;
+            continue;
+        }
+        if r == ROLE_TOOL {
+            return false;   // 孤儿 tool：它的 assistant 已经不在了
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+// 去掉结尾「不完整的一轮」：悬空的 tool 结果，以及应答不全（或压根没有应答）的
+// assistant(tool_calls)。三种场景都会遇到：
+//   1) fork 出来的子代理在父回合**进行中**读取父历史（父的 tool 结果还没落盘）；
+//   2) 会话日志在崩溃时停在半路；
+//   3) 某一组 tool 结果没能写进历史（旧实现里 MSG_MAX 打满就是这样）。
+// **只丢不完整的那一组**：完整的一组必须原样保留（旧实现会把完整的一组也丢掉，
+// 等于每次恢复都白丢一步）。修完以后历史一定满足配对要求，请求不会再被网关以
+// "an assistant message with 'tool_calls' must be followed by tool messages" 拒掉。
+export fn hist_trim_incomplete_tail(h: &History) usize {
+    const raw: &void = malloc(1 << 20);
+    if ((raw as &byte) as usize) == 0 {
+        return 0;   // 内存不足时不做破坏性裁剪
+    }
+    defer { free(raw); }
+    var arena: Arena = Arena{ buffer: null, size: 0, used: 0 };
+    arena_init(&arena, raw as &byte, 1 << 20);
+    var dropped: usize = 0;
+    while h.len > 1 {
+        const last: usize = h.len - 1;
+        const r: u8 = msg_at(h, last).role;
+        if r == ROLE_ASSISTANT_CALLS {
+            hist_truncate_to(h, last);   // 一个应答都没有：整条丢
+            dropped = dropped + 1;
+            continue;
+        }
+        if r != ROLE_TOOL {
+            break;   // 结尾是 user/system/纯文本 assistant：形状本来就是合法的
+        }
+        var start: usize = last;
+        while start > 0 && msg_at(h, start - 1).role == ROLE_TOOL {
+            start = start - 1;
+        }
+        if start == 0 || msg_at(h, start - 1).role != ROLE_ASSISTANT_CALLS {
+            dropped = dropped + (h.len - start);   // 孤儿 tool 结果
+            hist_truncate_to(h, start);
+            continue;
+        }
+        const g: usize = start - 1;
+        if hist_group_ok(&arena, h, g) {
+            break;   // 完整的一组：保留
+        }
+        dropped = dropped + (h.len - g);
+        hist_truncate_to(h, g);
+    }
+    return dropped;
+}
+
+// 回合前的历史准备（§3.2 的最后一步）。三条路：
+//   恢复（`--resume` / `--continue`）→ 读元信息定工作区 → `agent_hist_from_log` → 续写；
+//   `--resume-dsh` → 先导入 DSH 会话；
+//   新建 → `agent_hist_init`：`agent_worktree_begin`（可能 chdir）→ 装配 system prompt →
+//     注入运行时上下文 → 记 `subagent/start` → push 首条 user 消息。
+// **这个顺序不能换**：worktree 会 chdir，而 prompt 的 `{{cwd}}`、AGENTS.md、技能根
+// 全按当前工作目录求值（§3.2）。
+fn agent_history_begin(cfg: &Config, h: &History, first: &const Buf) bool {
+    fsctx_init(cfg);
+    // 统计是「当前会话」口径：换会话（/new、/resume）先清零，resume 的那一份由
+    // agent_hist_from_log 在扫描日志时重建
+    st_reset();
+    // 清单同理：它只活在这一条会话里（--resume 也不回填，见 README §7）。
+    // 放在这里而不是 /new、/resume 各自的落点：启动、fork、恢复、换会话走的都是这条路。
+    agent_session_scoped_reset();
+    g_ctx_est_at_sample = -1;
+    // 导入 DSH 自己的会话（--resume-dsh <id 前缀>）：读它的 jsonl(.zstd) 转成我们的历史，
+    // 然后开**我们自己的**会话继续（不写 DSH 的日志）
+    if cfg.resume_dsh.len > 0 {
+        var home: Buf = buf_new(1024);
+        defer { buf_free(&home); }
+        if agent_default_dsh_home(cfg, &home) {
+            var ss: DshSessions = DshSessions{ items: [], n: 0 };
+            dshs_init(&ss);
+            defer { dshs_free(&ss); }
+            dshs_list(home.ptr[0: home.len], &"x"[0: 0], &ss);
+            const found: isize = dshs_find(&ss, cfg.resume_dsh.ptr as &const byte);
+            if found < 0 {
+                out_err("error: 找不到 DSH 会话 ");
+                out_err_bytes(cfg.resume_dsh.ptr, cfg.resume_dsh.len);
+                out_err("（用 --list-dsh-sessions 看可用 id；id 前缀 8 个字符以上即可）\n");
+                return false;
+            }
+            const si: usize = found as usize;
+            if si >= DSHS_MAX {
+                return false;
+            }
+            // P22：DSH 的会话标题在日志的 session/title 事件里，导入时一并取出来
+            var dsh_title: Buf = buf_new(512);
+            defer { buf_free(&dsh_title); }
+            const n: usize = dshs_import(cfg, &ss.items[si], h, &dsh_title);
+            out_err("[dsh-session] 从 ");
+            out_err_bytes(ss.items[si].id.ptr, ss.items[si].id.len);
+            out_err(" 导入了 ");
+            out_err_dec(n);
+            out_err(" 条消息（cwd=");
+            out_err_bytes(ss.items[si].cwd.ptr, ss.items[si].cwd.len);
+            out_err("）\n");
+            if n > 0 {
+                _ = hist_trim_incomplete_tail(h);
+                if !agent_session_create(cfg) {
+                    return false;
+                }
+                // P22：标题要在 sess_open **之后**落（sess_open 会把 l.title 重置成空）
+                agent_title_adopt_imported(cfg, &dsh_title);
+                if first.len > 0 {
+                    _ = hist_push(h, ROLE_USER, first.ptr as &const byte, first.len);
+                }
+                return true;
+            }
+        }
+    }
+    // 子代理 fork：先把父会话历史读进来，但会话日志开一个新的（不写父的日志）
+    if cfg.fork_from.len > 0 {
+        var ppath: Buf = buf_empty();
+        defer { buf_free(&ppath); }
+        var pnext: i64 = 0;
+        var wscopy: Buf = buf_new(cfg.workspace.len + 1);
+        defer { buf_free(&wscopy); }
+        _ = buf_append(&wscopy, cfg.workspace.ptr, cfg.workspace.len);
+        _ = buf_append_byte(&wscopy, 0);
+        const found_parent: bool = sess_find(g_home.ptr as &const byte, wscopy.ptr as &const byte, cfg.fork_from.ptr as &const byte, cfg.fork_from.len, &ppath);
+        if (getenv("UYA_AGENT_DEBUG_SUBAGENT") as usize) != 0 {
+            out_err("[fork] parent_session=");
+            out_err_bytes(cfg.fork_from.ptr, cfg.fork_from.len);
+            out_err(" found=");
+            if found_parent {
+                out_err("Y");
+            } else {
+                out_err("N");
+            }
+            out_err("\n");
+        }
+        if found_parent {
+            const n: i32 = agent_hist_from_log(cfg, h, &ppath, &pnext, false);
+            if (getenv("UYA_AGENT_DEBUG_SUBAGENT") as usize) != 0 {
+                out_err("[fork] restored=");
+                out_err_dec(n as usize);
+                out_err("\n");
+            }
+            if n > 0 {
+                _ = hist_trim_incomplete_tail(h);   // 父回合进行中 → 尾部一定不完整
+            }
+        }
+        // 找不到父历史就退化成普通新会话
+    }
+    const opened: bool = agent_session_open(cfg, h, &cfg.resume_id);
+    if opened && h.len > 0 {
+        // 已从日志恢复（system 在里面）：本轮的任务/首条输入仍要接上去，
+        // 否则恢复运行只会看到上一轮的内容（踩过：模型回答了上一轮的话）。
+        if first.len > 0 {
+            var pushed: bool = hist_push(h, ROLE_USER, first.ptr as &const byte, first.len);
+            while !pushed {
+                if !hist_drop_oldest(h) {
+                    break;
+                }
+                pushed = hist_push(h, ROLE_USER, first.ptr as &const byte, first.len);
+            }
+            return pushed;
+        }
+        return true;
+    }
+    return agent_hist_init(cfg, h, first);
+}
+
+// 一次性运行（命令行给了任务）
+// --list-sessions：读索引打印 —— P33 起与 `/sessions` 浮层**同一份**三列排版
+// （标题 / 工作区 / session id，同 id 取最后一条；P35 起**最新的排最后一行**）
+fn agent_list_sessions(cfg: &const Config) i32 {
+    var home: Buf = buf_new(1024);
+    defer { buf_free(&home); }
+    if !agent_default_home(cfg, &home) {
+        out_err("error: 找不到 agent home（HOME 未设置？）\n");
+        return AGENT_USAGE;
+    }
+    var out: Buf = buf_new(16384);
+    defer { buf_free(&out); }
+    // P33：`--list-sessions` 这条路径排在 `agent_run_interactive` 之前，还没走过 tty_init
+    // （那时 tty_ui.cols 是全局初值 80）—— 这里只补「探一探 + 读一次窗口宽度」，
+    // 不重跑 tty_init（那会把行编辑器状态与历史清掉）。不在 TTY 上就是空操作。
+    if !tty_ui.is_tty {
+        tty_ui.is_tty = tty_probe(0);
+    }
+    tty_refresh_cols(&tty_ui);
+    // 滚动模式没有渲染层，宽度按终端宽度（`tty_body_width()`：收在 [40,200]）；
+    // 打印前再按列硬裁一遍（窄终端上 44 列的 id 不能让行折行）
+    const body: usize = tty_body_width();
+    var raw: Buf = buf_new(16384);
+    defer { buf_free(&raw); }
+    agent_sess_list_items(cfg, body, &raw);
+    if raw.len == 0 {
+        out_err("(没有会话记录)\n");
+        return AGENT_OK;
+    }
+    sess_rows_clip_into(&raw, body, &out);
+    out_err_bytes(out.ptr, out.len);
+    return AGENT_OK;
+}
+
+// 解析 --continue / --resume：把会话文件绝对路径写进 cfg.resume_id
+fn agent_resolve_resume(cfg: &Config, want: &const byte) bool {
+    var home: Buf = buf_new(1024);
+    defer { buf_free(&home); }
+    if !agent_default_home(cfg, &home) {
+        return false;
+    }
+    var hz: Buf = buf_new(home.len + 1);
+    defer { buf_free(&hz); }
+    _ = buf_append(&hz, home.ptr, home.len);
+    _ = buf_append_byte(&hz, 0);
+    var path: Buf = buf_new(1200);
+    defer { buf_free(&path); }
+    var found: bool = false;
+    var cwdz: Buf = buf_new(cfg.workspace.len + 1);
+    defer { buf_free(&cwdz); }
+    _ = buf_append(&cwdz, cfg.workspace.ptr, cfg.workspace.len);
+    _ = buf_append_byte(&cwdz, 0);
+    if bufx_cstr_len(want) == 0 || bufx_eq_cstr(want, bufx_cstr_len(want), "last") {
+        found = sess_find_last(hz.ptr as &const byte, cwdz.ptr as &const byte, &path);
+    } else {
+        found = sess_find(hz.ptr as &const byte, cwdz.ptr as &const byte, want, bufx_cstr_len(want), &path);
+    }
+    if !found {
+        return false;
+    }
+    buf_free(&cfg.resume_id);
+    cfg.resume_id = buf_new(path.len + 8);
+    return buf_append(&cfg.resume_id, path.ptr, path.len);
+}
+
+export // --dry-run：组装请求并打印（不可打印字节转义成 \xNN，便于找 NUL 之类的脏字节）
+// `--dry-run`：只组装并打印请求体（不可打印字节转义成 `\xNN`），不发请求。
+// 存在的意义是排查「脏字节」—— 请求体里混进控制字符时，看转义比看十六进制快。
+fn agent_dry_run(cfg: &Config) i32 {
+    var h: History = hist_init();
+    defer { hist_free(&h); }
+    // 走**真实**的建历史路径（含 --continue/--resume 的恢复），否则 dry-run 看到的不是真请求
+    if !agent_history_begin(cfg, &h, &cfg.task) {
+        out_err("error: cannot build history\n");
+        return AGENT_PROTO;
+    }
+    // 按真实历史算大小：历史默认不限条数，固定 256 KiB 会让长会话的 dry-run 直接报错
+    var req: Buf = buf_new(request_bytes_needed(&h, cfg));
+    defer { buf_free(&req); }
+    if !buf_valid(&req) {
+        out_err("error: out of memory (request buffer)\n");
+        return AGENT_PROTO;
+    }
+    const style: u8 = api_style_now(cfg);
+    if !build_model_request(cfg, &h, &req, style) {
+        out_err("error: cannot build request（历史可能过大，试 /compact 或 --context-window）\n");
+        return AGENT_PROTO;
+    }
+    out_err("[dry-run] api=");
+    out_err(llm_style_name(style));
+    if cfg.src_api == API_SRC_DEFAULT {
+        out_err(" (negotiable: 404/405/501 → chat/completions)");
+    }
+    out_err(" messages=");
+    out_err_dec(h.len);
+    out_err(" request_bytes=");
+    out_err_dec(req.len);
+    out_err("\n");
+    // 与诊断出口同一套转义（tty.uya::tty_diag_escape_into）：不可打印字节转义成 \xNN，
+    // 便于找 NUL 之类的脏字节。dry-run 要看**整条**请求体，所以 cap 开到最大展开长度。
+    var esc: Buf = buf_new(req.len * 4 + 16);
+    defer { buf_free(&esc); }
+    if buf_valid(&esc) {
+        _ = tty_diag_escape_into(&esc, req.ptr as &const byte, req.len, req.len * 4);
+        out_err_bytes(esc.ptr as &const byte, esc.len);
+    }
+    out_err("\n");
+    return AGENT_OK;
+}
+
+// getcwd 到 Buf。注意 sys_getcwd 返回的长度**含结尾 NUL**，
+// 不剥掉的话它会被当作路径的一部分（真实网关会报 invalid character '\x00'）。
+fn agent_getcwd_into(out: &Buf) bool {
+    var storage: [byte: 1024] = [0: 1024];
+    const res: !isize = sys_getcwd(&storage[0], 1024);
+    const raw_len: isize = res catch { 0 as isize; };
+    if raw_len <= 0 {
+        return false;
+    }
+    var n: usize = raw_len as usize;
+    if n >= 1024 {
+        n = 1023;
+    }
+    // 用指针走（固定数组下标要给编译器看的证明，指针下标不需要）
+    const base: &byte = &storage[0];
+    while n > 0 {
+        const p: &const byte = @ptr_from_usize(@usize_from_ptr(base as &void) + (n - 1)) as &const byte;
+        if p[0] != 0 as byte {
+            break;
+        }
+        n = n - 1;
+    }
+    if n == 0 {
+        return false;
+    }
+    buf_reset(out);
+    return buf_append(out, &storage[0], n);
+}
+
+// 工作目录默认值 = getcwd
+export fn agent_workspace_set_cwd(cfg: &Config) bool {
+    var got: Buf = buf_new(1024);
+    defer { buf_free(&got); }
+    if !agent_getcwd_into(&got) {
+        return false;
+    }
+    buf_free(&cfg.workspace);
+    cfg.workspace = buf_new(got.len + 8);
+    if !buf_valid(&cfg.workspace) {
+        return false;
+    }
+    return buf_append(&cfg.workspace, got.ptr as &const byte, got.len);
+}
+
+// 启动路径里的相对值 → 启动目录下的绝对路径。
+// 为什么必须固定：运行中切工作区是**真的 chdir**，相对路径会跟着跑到新工作区去 ——
+// 会话日志、技能目录、workflow 脚本这些「一次定下来、之后一直用」的路径不该跟着跑。
+fn agent_start_path_into(base: &const Buf, v: &const Buf, out: &Buf) void {
+    buf_reset(out);
+    if v.len == 0 {
+        return;
+    }
+    if v.ptr[0] == 47 as byte {
+        _ = buf_append(out, v.ptr as &const byte, v.len);
+        return;
+    }
+    _ = buf_append(out, base.ptr as &const byte, base.len);
+    _ = buf_append_byte(out, 47);
+    _ = buf_append(out, v.ptr as &const byte, v.len);
+}
+
+// 启动时把「一次定下来」的目录固定住：agent home / DSH home / uya 可执行文件，
+// 以及工作区本身（工作区还要顺带证明它存在且是目录）。
+fn agent_workspace_canon(cfg: &Config) void {
+    var here: Buf = buf_new(1024);
+    defer { buf_free(&here); }
+    if !agent_getcwd_into(&here) {
+        return;
+    }
+    var tmp: Buf = buf_new(2048);
+    defer { buf_free(&tmp); }
+    agent_start_path_into(&here, &cfg.agent_home, &tmp);
+    if tmp.len > 0 {
+        buf_reset(&cfg.agent_home);
+        _ = buf_append(&cfg.agent_home, tmp.ptr as &const byte, tmp.len);
+    }
+    agent_start_path_into(&here, &cfg.dsh_home, &tmp);
+    if tmp.len > 0 {
+        buf_reset(&cfg.dsh_home);
+        _ = buf_append(&cfg.dsh_home, tmp.ptr as &const byte, tmp.len);
+    }
+    // 只处理带 '/' 的：不带 '/' 的名字按 PATH 找（execve 收名字时按 cwd 找是另一回事，
+    // 那种用法本来就要求 cwd 不变，见 uya 那份 shim 的注释）
+    if bufx_find_byte(cfg.uya_bin.ptr[0: cfg.uya_bin.len], 47, 0) > 0 {
+        agent_start_path_into(&here, &cfg.uya_bin, &tmp);
+        buf_reset(&cfg.uya_bin);
+        _ = buf_append(&cfg.uya_bin, tmp.ptr as &const byte, tmp.len);
+    }
+    if cfg.workspace.len == 0 {
+        return;
+    }
+    if cfg.workspace.ptr[0] == 47 as byte {
+        return;   // 已经是绝对路径
+    }
+    var want: Buf = buf_new(cfg.workspace.len + 8);
+    defer { buf_free(&want); }
+    if !buf_append(&want, cfg.workspace.ptr as &const byte, cfg.workspace.len) {
+        return;
+    }
+    if agent_workspace_switch(cfg, want.ptr as &const byte, want.len) != WS_OK {
+        return;
+    }
+    var hz: Buf = buf_new(here.len + 1);
+    defer { buf_free(&hz); }
+    _ = buf_append(&hz, here.ptr as &const byte, here.len);
+    _ = buf_append_byte(&hz, 0);
+    _ = sys_chdir(&hz.ptr[0] as *const byte) catch {};
+}

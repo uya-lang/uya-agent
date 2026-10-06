@@ -1,0 +1,1541 @@
+// src/selftest/st_mock_server.uya — selftest.uya 的拆分片 2/12（纯搬移）
+//
+// 本文件：mock LLM 服务端（跑在 fork 出的子进程里）
+// 不变量：与原文件一致 —— 拆分只搬移，不改任何声明的代码；同族轮/段集中在一片里。
+// 依赖：见锚点 selftest.uya 的文件头（本片与它同处合并命名空间，无本地 use）。
+// 命名：沿用原文件前缀（本片是同一历史模块的内部拆分）。
+
+fn mock_server(lfd: i32) i32 {
+    var round: i32 = 0;
+    var verdict: i32 = 0;
+    var limit: i32 = 2;
+    var is_stream: bool = false;   // 由每轮请求体决定
+    // P54：退化响应轮要断言「重发的就是同一个请求」——把第一轮收到的请求原文留一份，
+    // 第二轮逐字节比对（比「数请求条数」强得多：改成多发一个带了新内容的请求就会红）。
+    var first_rx: Buf = buf_new(8192);
+    defer { buf_free(&first_rx); }
+    if mock_mode == 3 {
+        limit = 1;          // 401 轮：只服务一次，agent 拿到 401 就该退出
+    }
+    if mock_mode == 5 {
+        limit = 3;          // 熔断轮：agent 的 max_steps 是 3
+    }
+    if mock_mode == 6 {
+        limit = 1;          // 中断轮：客户端被打断后不会再发请求，只服务一次
+    }
+    if mock_mode == 12 {
+        limit = 1;          // 压缩轮：只断言「压缩之后的那一次请求」（摘要请求不占轮次）
+    }
+    if mock_mode == 13 {
+        limit = 2;          // 技能轮：工具轮 → 断言轮（/messages 不算轮次）
+    }
+    if mock_mode == 14 {
+        limit = 2;          // 派生轮：工具轮 → 断言轮（子代理的请求不算轮次）
+    }
+    if mock_mode == 16 {
+        limit = 1;          // workflow 轮：假脚本只派 1 个子代理
+    }
+    if mock_mode == 17 {
+        limit = 15;         // 不限步数轮：14 轮工具调用 + 1 轮最终答案
+    }
+    if mock_mode == 18 {
+        limit = HISTCAP_ROUNDS + 1;   // 长历史轮：40 轮工具调用 + 1 轮最终答案
+    }
+    if mock_mode == 19 {
+        limit = 2;          // responses 流式轮：工具轮 + 最终答案
+    }
+    if mock_mode == 20 {
+        limit = 2;          // responses 非流式轮：工具轮 + 最终答案
+    }
+    if mock_mode == 21 {
+        limit = 3;          // 协商轮：responses(404) + chat 工具轮 + chat 最终答案
+    }
+    if mock_mode == 22 {
+        limit = 1;          // responses 压缩轮：只断言「压缩之后的那一次请求」
+    }
+    if mock_mode == 23 {
+        limit = 2;          // 控制字节轮：工具轮（跑出 NUL）→ 断言轮
+    }
+    if mock_mode == 30 {
+        limit = 2;          // P21 只读轮：工具轮（write 被拒 / bash 无通道）→ 断言轮
+    }
+    if mock_mode == 31 {
+        limit = 2;          // P21 沙箱轮：工具轮（沙箱里写文件）→ 断言轮
+    }
+    if mock_mode == 26 {
+        limit = 2;          // P26 plan 闸门轮：工具轮（write/edit 被拒 + 无审阅渠道）→ 断言轮
+    }
+    if mock_mode == 24 {
+        limit = 1;          // 诊断回显轮：只服务一次（agent 拿到 400 就该退出）
+    }
+    if mock_mode == 25 {
+        limit = 2;          // 大参数轮：大参数工具轮 + 断言/最终答案轮
+    }
+    if mock_mode == 27 {
+        limit = 3;          // P28 退不出轮：长命令轮 → 被中断的那一轮 → 第二个任务的答案
+    }
+    if mock_mode == 40 {
+        limit = 1;          // P30 单步长流式轮：一个回合只有一步（长流式就停在中间）
+    }
+    if mock_mode == 41 || mock_mode == 42 {
+        limit = 2;          // P54 退化响应轮：①退化（只有思考）②重发（41 给正文 / 42 再退化一次）
+    }
+    if mock_mode == 43 {
+        limit = 4;          // P58 续跑轮：①create_goal ②人那一轮收尾 ③续跑轮（complete）④续跑轮收尾
+    }
+    if mock_mode == 44 {
+        limit = 2;          // P59 截断轮：①截断（正文 + 工具调用 + finish_reason=length）②「继续」那一轮
+    }
+    if mock_limit >= 0 {
+        limit = mock_limit; // 各轮自己覆盖（例如「工具跑着就退出」只服务 1 轮）
+    }
+    while round < limit {
+        // accept 最多等 10 秒：客户端不再发请求时 mock 必须自己退出，
+        // 否则「mock 卡在 accept」会变成整个自测卡死（踩过）
+        var lpfds: [PollFd: 1] = [PollFd{ fd: lfd, events: POLLIN, revents: 0 }];
+        const lpr: i32 = sys_poll(&lpfds[0], 1, 10000) catch { 0; };
+        if lpr <= 0 || (lpfds[0].revents & POLLIN) == 0 {
+            // 请求数不够也用同一个 verdict 通道报出来（否则「断言没跑」会被误判成通过）
+            if verdict == 0 && round < limit {
+                return 62 + round;   // 62/63/64… 表示只服务了 round 次
+            }
+            return verdict;
+        }
+        var peer: [byte: 16] = [0: 16];
+        var alen: u32 = 16;
+        const cfd: i32 = sys_accept(lfd, &peer[0] as &void, &alen) catch {
+            return 10;
+        };
+        var rx: Buf = buf_new(8192);
+        if !mock_read_request(cfd, &rx) {
+            buf_free(&rx);
+            _ = sys_close(cfd) catch {};
+            return 11;
+        }
+        // 全局不变量：任何请求体都不许带裸控制字节（chat 请求、responses 请求、
+        // web_search 的 provider 请求都算）。
+        // 判定码 240 与各 mode 自己的码（含 190…234）不冲突，看到 240 就是「转义漏了字节」。
+        if verdict == 0 && sel_body_raw_control(&rx) != 0 {
+            verdict = 240;
+        }
+        // P10：web_search 的 provider 请求（Anthropic Messages API）
+        if contains(&rx, "POST /messages") || contains(&rx, "/messages HTTP") {
+            expect(&rx, "web_search_20250305", 93, &verdict);   // 服务端搜索工具
+            expect(&rx, "x-api-key: selftest-web-key", 94, &verdict);
+            expect(&rx, "anthropic-version: 2023-06-01", 95, &verdict);
+            if sel_count_sub(&rx, "query=uya language") != 1 {
+                verdict = 96;   // 重复的 query 必须被去重（只出现一次）
+            }
+            expect(&rx, "query=second query", 97, &verdict);
+            if !mock_send_messages(cfd) {
+                verdict = 96;
+            }
+            buf_free(&rx);
+            _ = sys_close(cfd) catch {};
+            // 注意：provider 的 /messages 请求**不占** chat 轮次
+            continue;
+        }
+        is_stream = contains(&rx, "\"stream\":true");
+        if mock_mode == 19 {
+            // responses 流式：两轮请求都要断言「真按 responses 形状发」
+            var text19: Buf = buf_new(8192);
+            if round == 0 {
+                expect(&rx, "POST /v1/responses", 190, &verdict);
+                expect(&rx, "\"input\":", 191, &verdict);
+                expect_absent(&rx, "\"messages\":", 192, &verdict);
+                expect(&rx, "\"role\":\"developer\",\"content\":", 193, &verdict);
+                expect(&rx, "\"store\":false", 194, &verdict);
+                expect(&rx, "\"tools\":[{\"type\":\"function\",\"name\":\"read\"", 195, &verdict);
+                expect_absent(&rx, "\"function\":{\"name\"", 196, &verdict);
+                if !mock_resp_tool_text(&text19, "RESPONSES-TOOL-OK") {
+                    verdict = 197;
+                }
+            } else {
+                expect(&rx, "\"type\":\"function_call\",\"call_id\":\"call_r1\",\"name\":\"bash\"", 198, &verdict);
+                expect(&rx, "\"type\":\"function_call_output\",\"call_id\":\"call_r1\"", 199, &verdict);
+                expect(&rx, "RESPONSES-TOOL-OK", 200, &verdict);
+                expect_absent(&rx, "\"tool_call_id\"", 201, &verdict);
+                if !mock_resp_final_text(&text19, "RESPONSES-DONE") {
+                    verdict = 202;
+                }
+            }
+            if !mock_send_resp_sse(cfd, &text19) {
+                verdict = 203;
+            }
+            buf_free(&text19);
+            buf_free(&rx);
+            _ = sys_close(cfd) catch {};
+            round = round + 1;
+            continue;
+        }
+        if mock_mode == 20 {
+            // responses 非流式：请求必须 stream:false，响应是一次性 JSON
+            var body20: Buf = buf_new(8192);
+            if round == 0 {
+                expect(&rx, "POST /v1/responses", 205, &verdict);
+                expect(&rx, "\"stream\":false", 206, &verdict);
+                expect(&rx, "\"input\":", 207, &verdict);
+                if !mock_resp_json_tool(&body20, "RESPONSES-TOOL-OK") {
+                    verdict = 208;
+                }
+            } else {
+                expect(&rx, "\"type\":\"function_call_output\",\"call_id\":\"call_r1\"", 209, &verdict);
+                if !mock_resp_json_final(&body20, "RESPONSES-DONE") {
+                    verdict = 210;
+                }
+            }
+            if !mock_send(cfd, &body20) {
+                verdict = 211;
+            }
+            buf_free(&body20);
+            buf_free(&rx);
+            _ = sys_close(cfd) catch {};
+            round = round + 1;
+            continue;
+        }
+        if mock_mode == 21 {
+            // 协商轮：未声明协议 → 第一个请求必须是 responses（回 404 逼出回退），
+            // 之后每一轮都必须是 chat（第二轮也要，钉住「只协商一次」）
+            if round == 0 {
+                expect(&rx, "POST /v1/responses", 215, &verdict);
+                expect(&rx, "\"input\":", 216, &verdict);
+                var errb: Buf = buf_new(256);
+                _ = buf_append_cstr(&errb, "{\"error\":{\"message\":\"mock: no such endpoint\"}}");
+                if !mock_send_404(cfd, &errb) {
+                    verdict = 217;
+                }
+                buf_free(&errb);
+            } else {
+                expect(&rx, "POST /v1/chat/completions", 218, &verdict);
+                expect(&rx, "\"messages\":", 219, &verdict);
+                expect_absent(&rx, "\"input\":", 220, &verdict);
+                var body21: Buf = buf_new(1024);
+                if round == 1 {
+                    if !mock_steps_body(&body21) {
+                        verdict = 221;
+                    }
+                } else {
+                    expect(&rx, "RESPONSES-FALLBACK-OK", 222, &verdict);
+                    if !mock_final_body(&body21, "RESPONSES-DONE") {
+                        verdict = 223;
+                    }
+                }
+                if is_stream {
+                    if !mock_send_sse(cfd, &body21) {
+                        verdict = 224;
+                    }
+                } else if !mock_send(cfd, &body21) {
+                    verdict = 224;
+                }
+                buf_free(&body21);
+            }
+            buf_free(&rx);
+            _ = sys_close(cfd) catch {};
+            round = round + 1;
+            continue;
+        }
+        if mock_mode == 22 {
+            // responses 下的自动压缩：摘要请求与随后那次请求都必须走 /v1/responses
+            if contains(&rx, "acting as a compaction engine") {
+                expect(&rx, "POST /v1/responses", 225, &verdict);
+                expect_absent(&rx, "\"messages\":", 226, &verdict);
+                expect(&rx, "## Primary Request and Intent", 227, &verdict);
+                var sum22: Buf = buf_new(8192);
+                if !mock_resp_final_text(&sum22, "## Primary Request and Intent\n- 测试压缩\n\n## Next Step\n- 继续") {
+                    verdict = 228;
+                }
+                if !mock_send_resp_sse(cfd, &sum22) {
+                    verdict = 229;
+                }
+                buf_free(&sum22);
+                buf_free(&rx);
+                _ = sys_close(cfd) catch {};
+                continue;   // 摘要请求不占轮次
+            }
+            expect(&rx, "POST /v1/responses", 230, &verdict);
+            expect(&rx, "automatically generated checkpoint", 231, &verdict);
+            expect(&rx, "<compacted-summary>", 232, &verdict);
+            var body22: Buf = buf_new(8192);
+            if verdict == 0 && !mock_resp_final_text(&body22, "SELFTEST_COMPACT_RESP_OK") {
+                verdict = 233;
+            }
+            if !mock_send_resp_sse(cfd, &body22) {
+                verdict = 234;
+            }
+            buf_free(&body22);
+            buf_free(&rx);
+            _ = sys_close(cfd) catch {};
+            round = round + 1;
+            continue;
+        }
+        if mock_mode == 3 {
+            // 直接回 401 + 错误体
+            var errb: Buf = buf_new(256);
+            _ = buf_append_cstr(&errb, "{\"error\":{\"message\":\"mock unauthorized\",\"type\":\"invalid_request_error\"}}");
+            if !mock_send_401(cfd, &errb) {
+                verdict = 30;
+            }
+            buf_free(&errb);
+            buf_free(&rx);
+            _ = sys_close(cfd) catch {};
+            round = round + 1;
+            continue;
+        }
+        if mock_mode == 24 {
+            // 400 + 把收到的请求原样回显（转录里不许出现这段原文）
+            if !mock_send_400_echo(cfd, &rx) {
+                verdict = 34;
+            }
+            buf_free(&rx);
+            _ = sys_close(cfd) catch {};
+            round = round + 1;
+            continue;
+        }
+        if mock_mode == 40 {
+            // P30：单步长流式（正文等 mock_sse_gap_ns 之后才发）—— 用来验收「运行中敲 /status」
+            var body40: Buf = buf_new(1024);
+            if !mock_final_body(&body40, "SELFTEST_OK") {
+                verdict = 246;
+            }
+            if !mock_send_sse_slow(cfd, &body40) {
+                verdict = 247;
+            }
+            buf_free(&body40);
+            buf_free(&rx);
+            _ = sys_close(cfd) catch {};
+            round = round + 1;
+            continue;
+        }
+        if mock_mode == 41 || mock_mode == 42 {
+            // P54：**退化响应**轮。第一轮一律回「正常收尾（finish_reason=stop）+ 只有思考、
+            // 没有正文」—— 真机上最常见的退化形状，而且带 usage，好让证据里的 reasoning
+            // 字节数与 token 读数都有确定的对照值（sse_finish 的 100/40/7/3 那一组）。
+            // ⚠ 判定码一律 < 256：mock 是 fork 出来的子进程，码要经 sys_exit 回到父进程，
+            // 只留低 8 位（261..268 会显示成 5/8/12…，报出来的码张冠李戴 —— 第一版踩过）。
+            var text41: Buf = buf_new(4096);
+            var pl41: Buf = buf_new(1024);
+            if round == 0 {
+                expect(&rx, "POST /v1/chat/completions", 212, &verdict);
+                buf_reset(&first_rx);
+                _ = buf_append(&first_rx, rx.ptr, rx.len);
+                if !sse_delta_text(&text41, &pl41, MOCK_DEGEN_THINK, true) {
+                    verdict = 213;
+                }
+                if !sse_finish(&text41, &pl41, "stop", true) {
+                    verdict = 214;
+                }
+                _ = buf_append_cstr(&text41, "data: [DONE]\n\n");
+            } else {
+                // 第二轮 = 重发的那一次。**判据是逐字节相同**：退化那一步没有写进历史
+                // （也没有写 assistant/message），所以重算出来的请求体必须与第一轮一字不差。
+                if !mock_field_eq(&first_rx, &rx) {
+                    verdict = 249;
+                }
+                if mock_mode == 42 {
+                    // 第二腿：重发也只给空响应 —— 回合必须按错误收口（只重发一次，不许无限重发）
+                    if !sse_delta_text(&text41, &pl41, MOCK_DEGEN_THINK, true) {
+                        verdict = 175;
+                    }
+                    if !sse_finish(&text41, &pl41, "stop", true) {
+                        verdict = 176;
+                    }
+                    _ = buf_append_cstr(&text41, "data: [DONE]\n\n");
+                }
+            }
+            var sent41: bool = false;
+            if round == 0 || mock_mode == 42 {
+                // mock_send_resp_sse 干的只是「把一段现成的 SSE 文本按 chunked 发出去」（响应头
+                // 两条协议完全一样），所以 chat 这条路径照样能用 —— 这里要的是**自己拼帧**
+                // （只有思考 + finish_reason=stop + usage），mock_send_sse 那种「给 JSON 体、
+                // 它替你转一帧」不够用。
+                sent41 = mock_send_resp_sse(cfd, &text41);
+            } else {
+                // 重发成功：这一轮回正文，回合正常收尾（自测断言 AGENT_OK）
+                var body41: Buf = buf_new(1024);
+                if !mock_final_body(&body41, "SELFTEST-RETRY-OK") {
+                    verdict = 177;
+                }
+                sent41 = mock_send_sse(cfd, &body41);
+                buf_free(&body41);
+            }
+            if !sent41 {
+                verdict = 178;
+            }
+            buf_free(&text41);
+            buf_free(&pl41);
+            buf_free(&rx);
+            _ = sys_close(cfd) catch {};
+            round = round + 1;
+            continue;
+        }
+        if mock_mode == 43 {
+            // P58：**续跑**轮。第一发是「人那一轮」：模型调 create_goal 建一个 active+armed 的
+            // 目标（这一步会把进程本地的续跑授权打开）；回合结束后主循环空闲下来，驱动器应当
+            // 自己开第二轮，把 `<goal_round>` 当 user 消息投进来。
+            //
+            // 第二发的断言就是「驱动器真的跑起来了」：
+            //   * 请求里必须有 `<goal_round>` 与 `Round: 1/3`；
+            //   * objective 是**带引号的 JSON 字符串**（信封装不破）——由下面那条
+            //     `Objective: "…` 断言钉住；引号本身也应被转义成 `\"`（jw_str_into 的规则）。
+            // 四发：①人那一轮调 create_goal ②人那一轮的收尾正文（回合才结束、驱动器这时
+            //   才被调到）③**续跑那一轮的请求**（断言现场）+ 调 update_goal complete
+            //   ④续跑那一轮的收尾正文。
+            var body43: Buf = buf_new(2048);
+            if round == 0 {
+                if !mock_goal_body(&body43, 0) {
+                    verdict = 253;
+                }
+            } else if round == 1 {
+                if !mock_final_body(&body43, "P58-HUMAN-DONE") {
+                    verdict = 243;
+                }
+            } else if round == 2 {
+                expect(&rx, "<goal_round>" as &const byte, 254, &verdict);
+                expect(&rx, "Round: 1/3" as &const byte, 255, &verdict);
+                expect(&rx, "P58-SENTINEL" as &const byte, 236, &verdict);
+                // **信封没被顶破**（objective 里那个形似结束标签的片段只是数据）：
+                // 开局标签只出现一次，而结束标签出现两次 —— 一次是 objective 里的**字面数据**
+                // （它落在引号里），一次才是信封真正的收尾。escape 漏了的话这个比例立刻变。
+                if count_sub(&rx, "<goal_round>") != 1 {
+                    verdict = 237;
+                }
+                // 收尾标签只该比 objective 数据多出**一次**（信封自己那次）：目标正文里的
+                // `</goal_round>` 是数据、跟着 SENTINEL 走；多出来的那一个才是信封收尾。
+                if count_sub(&rx, "</goal_round>") != count_sub(&rx, "P58-SENTINEL") + 1 {
+                    verdict = 241;
+                }
+                // 目标里的引号必须**被转义**（请求里的原始字节是 `\"`）而不是裸引号：
+                // 裸引号会把那条 JSON 字符串提前关掉，模型收到的信封就残缺了。
+                if !contains(&rx, "Objective: \\\"P58-SENTINEL" as &const byte) {
+                    verdict = 242;
+                }
+                // 续跑这一轮：模型判定目标已达成，用**记账之后**的 revision（admit 把 revision
+                // 从 1 推到 2）把目标标成 complete。这一发同时钉两条：
+                //   ① 续跑轮里模型看到的是记账后的 revision（CAS 对得上才成功）；
+                //   ② complete 之后驱动器必须停（否则会一路跑到 maxGoalRounds）。
+                if !mock_goal_body(&body43, 1) {
+                    verdict = 238;
+                }
+            } else {
+                if !mock_final_body(&body43, "P58-ROUND-DONE") {
+                    verdict = 244;
+                }
+            }
+            var sent43: bool = false;
+            if is_stream {
+                sent43 = mock_send_sse(cfd, &body43);
+            } else {
+                sent43 = mock_send(cfd, &body43);
+            }
+            if !sent43 {
+                verdict = 239;
+            }
+            buf_free(&body43);
+            buf_free(&rx);
+            _ = sys_close(cfd) catch {};
+            round = round + 1;
+            continue;
+        }
+        if mock_mode == 44 {
+            // P59：**token 上限截断轮**（§5.4.1）。父进程在一个进程里跑**两个回合**，
+            // 这一边只服务两次请求：
+            //
+            //   ① 第一回合：正文 + 一个 write 调用 + `finish_reason=length` —— 真机上最典型的
+            //      截断形状（模型写到一半把这一轮的输出预算用完）。正文与工具调用**同时**有，
+            //      是为了让两条判据都能验：正文必须进历史、工具调用必须一个都不派发。
+            //   ② 第二回合（人打了「继续」）：**断言现场** —— 请求里必须带着那段正文
+            //      （历史保住了），且**没有** tool_calls / tool 结果（丢弃是彻底的）。
+            //
+            // ⚠ 判定码一律 < 256（mock 是 fork 出来的子进程，码经 sys_exit 只留低 8 位）；
+            //   140…148 这一段是本轮专用的空号段。
+            var text44: Buf = buf_new(4096);
+            var pl44: Buf = buf_new(1024);
+            var sent44: bool = false;
+            if round == 0 {
+                expect(&rx, "POST /v1/chat/completions", 140, &verdict);
+                if !sse_delta_text(&text44, &pl44, MOCK_TRUNC_PARTIAL, false) {
+                    verdict = 141;
+                }
+                if !sse_delta_tool(&text44, &pl44, 0, "call_trunc1", "write", MOCK_TRUNC_ARGS) {
+                    verdict = 142;
+                }
+                if !sse_finish(&text44, &pl44, "length", true) {
+                    verdict = 143;
+                }
+                _ = buf_append_cstr(&text44, "data: [DONE]\n\n");
+                // 自己拼帧（正文 + tool_calls + finish_reason=length + usage）：
+                // mock_send_sse 那种「给 JSON 体、它替你转一帧」表达不了 finish_reason=length。
+                sent44 = mock_send_resp_sse(cfd, &text44);
+            } else {
+                expect(&rx, MOCK_TRUNC_PARTIAL, 144, &verdict);
+                expect_absent(&rx, "\"role\":\"tool\"", 145, &verdict);
+                expect_absent(&rx, "\"tool_calls\"", 146, &verdict);
+                expect(&rx, "继续", 148, &verdict);
+                var body44: Buf = buf_new(1024);
+                if !mock_final_body(&body44, "SELFTEST-CONTINUE-OK") {
+                    verdict = 149;
+                }
+                sent44 = mock_send_sse(cfd, &body44);
+                buf_free(&body44);
+            }
+            if !sent44 {
+                verdict = 147;
+            }
+            buf_free(&text44);
+            buf_free(&pl44);
+            buf_free(&rx);
+            _ = sys_close(cfd) catch {};
+            round = round + 1;
+            continue;
+        }
+        if mock_mode == 25 {
+            // 踩坑 35：第一轮给一个 arguments > 8 KiB 的 write 调用（老的固定容量
+            // 就是在这里把整轮打成 "out of memory serializing tool_calls" 的），
+            // 第二轮断言大参数**一字不差**地回到了请求里、工具结果配对完整。
+            if round == 0 {
+                var sb25: Buf = buf_new(32768);
+                if !mock_bigcall_body(&sb25) {
+                    verdict = 250;
+                }
+                var sent25a: bool = false;
+                if is_stream {
+                    sent25a = mock_send_sse(cfd, &sb25);
+                } else {
+                    sent25a = mock_send(cfd, &sb25);
+                }
+                if !sent25a {
+                    verdict = 251;
+                }
+                buf_free(&sb25);
+            } else {
+                // 头尾标记都在 = arguments 一个字节都没少（截断/漏尾都会在这里露出来）
+                if !contains(&rx, "CAP-HEAD|") || !contains(&rx, "|CAP-TAIL") {
+                    verdict = 252;
+                }
+                // 工具真的派发了，结果也回灌了
+                if !contains(&rx, "Created file") {
+                    verdict = 253;
+                }
+                // assistant(tool_calls) 与它的 tool 结果必须配对完整（否则端点 400）
+                if !mock_pairing_ok(&rx) {
+                    verdict = 254;
+                }
+                var body25b: Buf = buf_new(512);
+                if verdict == 0 {
+                    if !mock_final_body(&body25b, "SELFTEST_BIGCALL_OK") {
+                        verdict = 255;
+                    }
+                } else if !mock_final_body(&body25b, "SELFTEST_FAIL") {
+                    verdict = 255;
+                }
+                var sent25b: bool = false;
+                if is_stream {
+                    sent25b = mock_send_sse(cfd, &body25b);
+                } else {
+                    sent25b = mock_send(cfd, &body25b);
+                }
+                if !sent25b {
+                    verdict = 256;
+                }
+                buf_free(&body25b);
+            }
+            buf_free(&rx);
+            _ = sys_close(cfd) catch {};
+            round = round + 1;
+            continue;
+        }
+        if mock_mode == 16 {
+            var body16: Buf = buf_new(256);
+            if !mock_final_body(&body16, "WF-AGENT-OK") {
+                verdict = 150;
+            }
+            var sent16: bool = false;
+            if is_stream {
+                sent16 = mock_send_sse(cfd, &body16);
+            } else {
+                sent16 = mock_send(cfd, &body16);
+            }
+            if !sent16 {
+                verdict = 151;
+            }
+            buf_free(&body16);
+            buf_free(&rx);
+            _ = sys_close(cfd) catch {};
+            round = round + 1;
+            continue;
+        }
+        if mock_mode == 17 {
+            // 不限步数轮：连给 14 轮 tool_calls（旧默认 12 会在第 12 步熔断），
+            // 第 15 轮才给最终答案。断言口径是「请求里的 tool_call_id 条数 == 已经跑过的步数」，
+            // 所以少跑一步（熔断/丢历史）都会被抓出来。
+            const tool_rounds: i32 = 14;
+            var body17: Buf = buf_new(512);
+            if round < tool_rounds {
+                if round > 0 && sel_count_sub(&rx, "\"tool_call_id\":\"call_step\"") != round as usize {
+                    verdict = 160;
+                }
+                if !mock_steps_body(&body17) {
+                    verdict = 161;
+                }
+            } else {
+                if sel_count_sub(&rx, "\"tool_call_id\":\"call_step\"") != tool_rounds as usize {
+                    verdict = 163;   // 14 步的工具结果必须一条不少地回到请求里
+                }
+                if !contains(&rx, "SELFTEST-STEP-OK") {
+                    verdict = 164;
+                }
+                if verdict == 0 {
+                    if !mock_final_body(&body17, "SELFTEST_UNLIMITED_OK") {
+                        verdict = 165;
+                    }
+                } else if !mock_final_body(&body17, "SELFTEST_FAIL") {
+                    verdict = 165;
+                }
+            }
+            var sent17: bool = false;
+            if is_stream {
+                sent17 = mock_send_sse(cfd, &body17);
+            } else {
+                sent17 = mock_send(cfd, &body17);
+            }
+            if !sent17 {
+                verdict = 162;
+            }
+            buf_free(&body17);
+            buf_free(&rx);
+            _ = sys_close(cfd) catch {};
+            round = round + 1;
+            continue;
+        }
+        if mock_mode == 23 {
+            // 控制字节轮（P15）：第 1 轮让 agent 跑一条**输出里有 NUL** 的命令，
+            // 第 2 轮断言这条工具结果回到请求里时，NUL 已经被转义成 \u0000。
+            // 为什么必须转义：裸 NUL 进请求体 = 非法 JSON，Go 网关 400
+            // invalid character '\x00' in string literal；而这条结果会一直留在历史里，
+            // 于是「继续」也会一轮接一轮地 400（真机踩过）。
+            // **两条协议都跑**（chat 与 responses 共用 jsonx 的转义，两边的请求体都要合法）：
+            // mock_expect_resp 由这一轮的 runner 设好，这里顺便断言端点没串。
+            var body23: Buf = buf_new(4096);
+            if mock_expect_resp {
+                expect(&rx, "POST /v1/responses", 241, &verdict);
+            } else {
+                expect(&rx, "POST /v1/chat/completions", 242, &verdict);
+            }
+            if round == 0 {
+                // 命令：printf 'A\000B' → stdout 里真的有一个 NUL（bash 的 printf 认 \000）
+                var cmd: Buf = buf_new(64);
+                defer { buf_free(&cmd); }
+                _ = buf_append_cstr(&cmd, "printf 'A\\000B'");
+                var built: bool = false;
+                if mock_expect_resp {
+                    built = mock_resp_tool_cmd(&body23, &cmd);
+                } else {
+                    built = mock_ctrl_body(&body23, &cmd);
+                }
+                if !built {
+                    verdict = 243;
+                }
+            } else {
+                // 回灌用的 id 字段名两条协议不同：chat 是 tool_call_id（只在工具消息里出现 1 次），
+                // responses 是 call_id（function_call 与 function_call_output 各一次 = 2）。
+                // （count_sub 的 needle 走 strlen，所以只能用字面量，不能拿没补 NUL 的 Buf）
+                var id_hits: i32 = 0;
+                var id_want: i32 = 1;
+                if mock_expect_resp {
+                    id_hits = count_sub(&rx, "\"call_id\":\"call_r1\"");
+                    id_want = 2;
+                } else {
+                    id_hits = count_sub(&rx, "\"tool_call_id\":\"call_ctrl\"");
+                }
+                if id_hits != id_want {
+                    verdict = 244;   // 带 NUL 的工具结果必须回到请求里（配对完整）
+                }
+                if count_sub(&rx, "A\\u0000B") != 1 {
+                    verdict = 245;   // 它必须以 \u0000（转义后）出现，不能是裸字节
+                }
+                var built2: bool = false;
+                if mock_expect_resp {
+                    built2 = mock_resp_final_text(&body23, "SELFTEST_CTRL_OK");
+                } else {
+                    built2 = mock_final_body(&body23, "SELFTEST_CTRL_OK");
+                }
+                if !built2 {
+                    verdict = 246;
+                }
+            }
+            var sent23: bool = false;
+            if mock_expect_resp {
+                sent23 = mock_send_resp_sse(cfd, &body23);
+            } else if is_stream {
+                sent23 = mock_send_sse(cfd, &body23);
+            } else {
+                sent23 = mock_send(cfd, &body23);
+            }
+            if !sent23 {
+                verdict = 247;
+            }
+            buf_free(&body23);
+            buf_free(&rx);
+            _ = sys_close(cfd) catch {};
+            round = round + 1;
+            continue;
+        }
+        if mock_mode == 27 {
+            // 「退不出」轮（P28）：第 1 轮给一条**长命令**（sleep 15），之后按请求内容分叉 ——
+            // 带第二个任务文本（"task-two"）的那一次给 SELFTEST-TUI-QUIT-OK，
+            // 其余（被中断的那一轮）给 SELFTEST-TUI-QUIT-MID：
+            //   ① 工具跑着的时候 ctrl+d → 必须立刻退出（不是等 sleep 跑完）；
+            //   ② esc → 必须**当场**杀掉工具进程，回合在 step 边界收口；
+            //   ③ 中断过的会话再提交一个任务 → 必须照常跑完（中断意图不能跨回合残留）。
+            // 判据按**请求内容**分叉而不是按轮号：中断那一轮到底发不发（发出去再被掐断，
+            // 还是压根不发）是实现细节，屏幕上的 OK 只能来自「带 task-two 的那次请求」。
+            // 中断会让客户端在读流读到一半时掐掉连接，所以这一轮**不看写失败**。
+            expect(&rx, "POST /v1/chat/completions", 250, &verdict);
+            var body24: Buf = buf_new(4096);
+            var got_ok: bool = false;
+            if round == 0 {
+                var cmd: Buf = buf_new(64);
+                defer { buf_free(&cmd); }
+                _ = buf_append_cstr(&cmd, "sleep 15");
+                if !mock_ctrl_body(&body24, &cmd) {
+                    verdict = 251;
+                }
+            } else if contains(&rx, "task-two" as &const byte) {
+                if !mock_final_body(&body24, "SELFTEST-TUI-QUIT-OK") {
+                    verdict = 252;
+                }
+                got_ok = true;
+            } else {
+                if !mock_final_body(&body24, "SELFTEST-TUI-QUIT-MID") {
+                    verdict = 253;
+                }
+            }
+            if is_stream {
+                _ = mock_send_sse(cfd, &body24);
+            } else {
+                _ = mock_send(cfd, &body24);
+            }
+            buf_free(&body24);
+            buf_free(&rx);
+            _ = sys_close(cfd) catch {};
+            round = round + 1;
+            if got_ok {
+                // 第二个任务的答案已经给出：客户端接下来只会 /exit，不等后面的请求了
+                limit = round;
+            }
+            continue;
+        }
+        if mock_mode == 18 {
+            // 长历史轮：前 HISTCAP_ROUNDS 轮各回 2 个 bash 调用，最后一轮给最终答案。
+            // 每个请求都必须配对完整 —— 端点 400 的判据在本地先钉住。
+            if !mock_pairing_ok(&rx) {
+                verdict = 170;
+            }
+            var body18: Buf = buf_new(2048);
+            if round < HISTCAP_ROUNDS {
+                if !mock_loop_body(&body18, round + 1) {
+                    verdict = 171;
+                }
+            } else {
+                // 80 条工具结果必须一条不少地留在请求里（默认不限制历史 = 不丢弃）
+                if count_sub(&rx, "\"tool_call_id\":\"call_h") != 2 * HISTCAP_ROUNDS {
+                    verdict = 174;
+                }
+                if !mock_final_body(&body18, "SELFTEST_HISTCAP_OK") {
+                    verdict = 172;
+                }
+            }
+            var sent18: bool = false;
+            if is_stream {
+                sent18 = mock_send_sse(cfd, &body18);
+            } else {
+                sent18 = mock_send(cfd, &body18);
+            }
+            if !sent18 {
+                verdict = 173;
+            }
+            buf_free(&body18);
+            buf_free(&rx);
+            _ = sys_close(cfd) catch {};
+            round = round + 1;
+            continue;
+        }
+        if mock_mode == 14 {
+            // 区分父子请求：用子代理特有的请求头（历史文本靠不住：fork 的子代理继承父的全部历史）
+            if contains(&rx, "x-uya-subagent: ") {
+                var sub: Buf = buf_new(512);
+                if !mock_final_body(&sub, "SUBAGENT-RESULT-MARKER 42") {
+                    verdict = 120;
+                }
+                var sent_sub: bool = false;
+                if is_stream {
+                    sent_sub = mock_send_sse(cfd, &sub);
+                } else {
+                    sent_sub = mock_send(cfd, &sub);
+                }
+                if !sent_sub {
+                    verdict = 121;
+                }
+                buf_free(&sub);
+                buf_free(&rx);
+                _ = sys_close(cfd) catch {};
+                continue;   // 子代理的请求不占 chat 轮次
+            }
+            if round == 0 {
+                expect(&rx, "\"name\":\"subagent\"", 122, &verdict);
+                expect(&rx, "\"name\":\"subagent_fork\"", 123, &verdict);
+                expect(&rx, "\"name\":\"ralph\"", 124, &verdict);
+                expect(&rx, "\"name\":\"create_goal\"", 125, &verdict);
+                expect(&rx, "\"name\":\"update_goal\"", 126, &verdict);
+                var sb14: Buf = buf_new(4096);
+                if !mock_deleg_body(&sb14) {
+                    verdict = 127;
+                }
+                var sent14: bool = false;
+                if is_stream {
+                    sent14 = mock_send_sse(cfd, &sb14);
+                } else {
+                    sent14 = mock_send(cfd, &sb14);
+                }
+                if !sent14 {
+                    verdict = 128;
+                }
+                buf_free(&sb14);
+            } else {
+                expect(&rx, "created goal-1", 101, &verdict);
+                expect(&rx, "revision = 1", 102, &verdict);              // get_goal 的输出
+                expect(&rx, "updated goal-1", 103, &verdict);
+                expect(&rx, "phase paused", 104, &verdict);
+                expect(&rx, "SUBAGENT-RESULT-MARKER", 105, &verdict);    // 子代理的结果回到父
+                expect(&rx, "sub-1 [subagent]", 106, &verdict);          // list_agents
+                expect(&rx, "[status: idle]", 110, &verdict);
+                expect(&rx, "[sub-2 status: idle]", 111, &verdict);      // subagent_fork 前台返回
+                expect(&rx, "[round 1]", 84, &verdict);                 // ralph 的逐轮报告
+                expect(&rx, "[round 2]", 83, &verdict);
+                var body14: Buf = buf_new(512);
+                if verdict == 0 {
+                    if !mock_final_body(&body14, "SELFTEST_DELEG_OK") {
+                        verdict = 136;
+                    }
+                } else if !mock_final_body(&body14, "SELFTEST_FAIL") {
+                    verdict = 137;
+                }
+                var sent14b: bool = false;
+                if is_stream {
+                    sent14b = mock_send_sse(cfd, &body14);
+                } else {
+                    sent14b = mock_send(cfd, &body14);
+                }
+                if !sent14b {
+                    verdict = 138;
+                }
+                buf_free(&body14);
+            }
+            buf_free(&rx);
+            _ = sys_close(cfd) catch {};
+            round = round + 1;
+            continue;
+        }
+        if mock_mode == 13 {
+            if round == 0 {
+                if !contains(&rx, "演示用技能") || !contains(&rx, "available_skills") {
+                    verdict = 97;   // 技能目录必须被注入
+                }
+                if !contains(&rx, "\"name\":\"skill\"") || !contains(&rx, "\"name\":\"web_search\"") {
+                    verdict = 98;   // 两个工具的 schema 都要在
+                }
+                var sb13: Buf = buf_new(2048);
+                if !mock_skill_body(&sb13) {
+                    verdict = 99;
+                }
+                var sent13: bool = false;
+                if is_stream {
+                    sent13 = mock_send_sse(cfd, &sb13);
+                } else {
+                    sent13 = mock_send(cfd, &sb13);
+                }
+                if !sent13 {
+                    verdict = 100;
+                }
+                buf_free(&sb13);
+            } else {
+                // 注意：结果文本在请求里是 JSON 字符串，引号被转义成 \" —— 断言不要带引号
+                expect(&rx, "skill_content name=", 101, &verdict);
+                expect(&rx, "demo-skill", 102, &verdict);
+                expect(&rx, "Base directory for this skill:", 103, &verdict);
+                expect(&rx, "SELFTEST-SKILL-BODY", 104, &verdict);
+                expect(&rx, "unknown or no longer available", 105, &verdict);
+                expect(&rx, "Uya is a small systems language.", 106, &verdict);
+                expect(&rx, "https://example.org/uya2", 107, &verdict);
+                expect(&rx, "Uya docs", 108, &verdict);
+                var body13: Buf = buf_new(512);
+                if verdict == 0 {
+                    if !mock_final_body(&body13, "SELFTEST_SKILL_OK") {
+                        verdict = 107;
+                    }
+                } else if !mock_final_body(&body13, "SELFTEST_FAIL") {
+                    verdict = 108;
+                }
+                var sent13b: bool = false;
+                if is_stream {
+                    sent13b = mock_send_sse(cfd, &body13);
+                } else {
+                    sent13b = mock_send(cfd, &body13);
+                }
+                if !sent13b {
+                    verdict = 109;
+                }
+                buf_free(&body13);
+            }
+            buf_free(&rx);
+            _ = sys_close(cfd) catch {};
+            round = round + 1;
+            continue;
+        }
+        if mock_mode == 11 {
+            // 剪枝轮：让 bash 产生 >8192 码点的输出，第二轮断言请求里出现剪枝标记
+            if round == 0 {
+                var sb11: Buf = buf_new(1024);
+                if !mock_prune_body(&sb11) {
+                    verdict = 76;
+                }
+                var sent11: bool = false;
+                if is_stream {
+                    sent11 = mock_send_sse(cfd, &sb11);
+                } else {
+                    sent11 = mock_send(cfd, &sb11);
+                }
+                if !sent11 {
+                    verdict = 77;
+                }
+                buf_free(&sb11);
+            } else {
+                if !contains(&rx, "[... bash output pruned: ") {
+                    verdict = 78;
+                }
+                // P27：中段的诊断行必须活下来 —— 旧规则（头 4096 + 尾 1024 码点）会把它丢掉，
+                // 这正是「bash 结果按信号行剪枝」要修的失败模式。@N: 前缀也一并断言。
+                if !contains(&rx, "@") || !contains(&rx, "MMMID-ERROR-unique-bash-signal-1") {
+                    verdict = 89;
+                }
+                // 剪枝后不该再出现完整的长输出（尾部片段仍在，所以只查中段特征）
+                if contains(&rx, "abcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghij") {
+                    verdict = 79;
+                }
+                var body11: Buf = buf_new(512);
+                if verdict == 0 {
+                    if !mock_final_body(&body11, "SELFTEST_PRUNE_OK") {
+                        verdict = 80;
+                    }
+                } else if !mock_final_body(&body11, "SELFTEST_FAIL") {
+                    verdict = 81;
+                }
+                var sent11b: bool = false;
+                if is_stream {
+                    sent11b = mock_send_sse(cfd, &body11);
+                } else {
+                    sent11b = mock_send(cfd, &body11);
+                }
+                if !sent11b {
+                    verdict = 82;
+                }
+                buf_free(&body11);
+            }
+            buf_free(&rx);
+            _ = sys_close(cfd) catch {};
+            round = round + 1;
+            continue;
+        }
+        if mock_mode == 12 {
+            // 压缩轮：压力在**第一步之前**就超标，所以顺序是
+            //   (1) 摘要请求（不占轮次）→ (2) 压缩之后的真实请求（断言 checkpoint）
+            if contains(&rx, "acting as a compaction engine") {
+                expect(&rx, "## Primary Request and Intent", 83, &verdict);   // 摘要提示词的模板
+                expect(&rx, "## Critical Context", 84, &verdict);
+                var sum: Buf = buf_new(512);
+                if !mock_final_body(&sum, "## Primary Request and Intent\n- 测试压缩\n\n## Next Step\n- 继续") {
+                    verdict = 85;
+                }
+                var sent12a: bool = false;
+                if is_stream {
+                    sent12a = mock_send_sse(cfd, &sum);
+                } else {
+                    sent12a = mock_send(cfd, &sum);
+                }
+                if !sent12a {
+                    verdict = 86;
+                }
+                buf_free(&sum);
+                buf_free(&rx);
+                _ = sys_close(cfd) catch {};
+                continue;   // 摘要请求不占 chat 轮次
+            }
+            expect(&rx, "automatically generated checkpoint", 88, &verdict);   // CHECKPOINT_PREAMBLE
+            expect(&rx, "<compacted-summary>", 89, &verdict);
+            expect(&rx, "## Primary Request and Intent", 90, &verdict);         // 摘要正文
+            var body12: Buf = buf_new(512);
+            if verdict == 0 {
+                if !mock_final_body(&body12, "SELFTEST_COMPACT_OK") {
+                    verdict = 91;
+                }
+            } else if !mock_final_body(&body12, "SELFTEST_FAIL") {
+                verdict = 92;
+            }
+            var sent12b: bool = false;
+            if is_stream {
+                sent12b = mock_send_sse(cfd, &body12);
+            } else {
+                sent12b = mock_send(cfd, &body12);
+            }
+            if !sent12b {
+                verdict = 93;
+            }
+            buf_free(&body12);
+            buf_free(&rx);
+            _ = sys_close(cfd) catch {};
+            round = round + 1;
+            continue;
+        }
+        if mock_mode == 10 {
+            // prompt/todo/plan 轮：第一轮断言 system prompt 与注入，第二轮断言工具结果
+            if round == 0 {
+                if buf_has_nul(&rx) {
+                    verdict = 75;   // 请求里有 NUL：长度/指针算错了
+                }
+                if !contains(&rx, "You are a coding agent powered by the selftest-model model") {
+                    verdict = 61;   // persona + {{model}} 替换
+                }
+                if !contains(&rx, "selftest_ws_prompt") {
+                    verdict = 62;   // {{cwd}} 替换
+                }
+                if !contains(&rx, "Use the read tool") {
+                    verdict = 63;   // 工具引导段
+                }
+                // 收工纪律（order 107）：这一节的三条都是「可判定情形」的约束，措辞被改坏
+                // 就等于静默失效 —— 而它没有任何编译期保护（纯字符串常量）。三条各钉一句：
+                // ① 文件已读全别重读；② 验收绿了就收工、别自造验证脚本；③ **清单要一起收口**
+                // （实测：agent 干完活常常忘了把 todo 标成 completed，清单停在 in_progress）。
+                if !contains(&rx, "(End of file - total N lines)` you already hold the whole file") {
+                    verdict = 76;
+                }
+                if !contains(&rx, "do not write verification scripts of your own unless the user asked for them") {
+                    verdict = 77;
+                }
+                if !contains(&rx, "a stale list is part of the deliverable, not bookkeeping") {
+                    verdict = 78;
+                }
+                // P55 追加的三句同样钉住（同样是纯字符串常量，改坏了没有任何编译期保护）：
+                // ④ 验收通过后别再跑它、别另造一条；⑤ 无关的既有失败记一行就走；⑥ 方案外化、别一步步重列
+                if !contains(&rx, "do not run it again — and do not invent a second acceptance command") {
+                    verdict = 79;
+                }
+                if !contains(&rx, "do not chase it, and do not build a baseline copy or a reference run to prove it was pre-existing") {
+                    verdict = 80;
+                }
+                if !contains(&rx, "do not re-enumerate the same files, paths or directory mapping in your reasoning step after step") {
+                    verdict = 81;
+                }
+                if !contains(&rx, "Current runtime context.") {
+                    verdict = 64;   // 运行时上下文（user 消息）
+                }
+                if !contains(&rx, "SELFTEST-AGENTS-MARKER") || !contains(&rx, "Instructions from:") {
+                    verdict = 65;   // AGENTS.md 注入
+                }
+                var sb10: Buf = buf_new(4096);
+                if !mock_prompt_body(&sb10) {
+                    verdict = 66;
+                }
+                var sent10: bool = false;
+                if is_stream {
+                    sent10 = mock_send_sse(cfd, &sb10);
+                } else {
+                    sent10 = mock_send(cfd, &sb10);
+                }
+                if !sent10 {
+                    verdict = 67;
+                }
+                buf_free(&sb10);
+            } else {
+                if !contains(&rx, "Updated todo list: 2 pending, 1 in progress, 1 completed.") {
+                    verdict = 68;
+                }
+                if !contains(&rx, "duplicate content") {
+                    verdict = 69;
+                }
+                if !contains(&rx, "exit_plan_mode is only available in plan mode") {
+                    verdict = 70;
+                }
+                if !contains(&rx, "requires a non-empty markdown plan starting with a # heading") {
+                    verdict = 71;
+                }
+                var body10: Buf = buf_new(512);
+                if verdict == 0 {
+                    if !mock_final_body(&body10, "SELFTEST_PROMPT_OK") {
+                        verdict = 72;
+                    }
+                } else if !mock_final_body(&body10, "SELFTEST_FAIL") {
+                    verdict = 73;
+                }
+                var sent10b: bool = false;
+                if is_stream {
+                    sent10b = mock_send_sse(cfd, &body10);
+                } else {
+                    sent10b = mock_send(cfd, &body10);
+                }
+                if !sent10b {
+                    verdict = 74;
+                }
+                buf_free(&body10);
+            }
+            buf_free(&rx);
+            _ = sys_close(cfd) catch {};
+            round = round + 1;
+            continue;
+        }
+        if mock_mode == 9 {
+            // bash / jobs 轮：一轮 6 个调用，第二轮断言结果文本
+            if round == 0 {
+                var sb9: Buf = buf_new(4096);
+                if !mock_jobs_body(&sb9) {
+                    verdict = 50;
+                }
+                var sent9: bool = false;
+                if is_stream {
+                    sent9 = mock_send_sse(cfd, &sb9);
+                } else {
+                    sent9 = mock_send(cfd, &sb9);
+                }
+                if !sent9 {
+                    verdict = 51;
+                }
+                buf_free(&sb9);
+            } else {
+                if !contains(&rx, "started background job job-1") {
+                    verdict = 52;
+                }
+                if !contains(&rx, "job-2 [bash]") {
+                    verdict = 53;   // job_list 必须列出两个任务
+                }
+                if !contains(&rx, "BG-DONE") {
+                    verdict = 54;   // job_output(wait) 拿到增量输出
+                }
+                if !contains(&rx, "[status: completed") {
+                    verdict = 55;
+                }
+                if !contains(&rx, "requested cancellation of job 2") {
+                    verdict = 56;
+                }
+                if !contains(&rx, "(no output)") || !contains(&rx, "[exit code: 0]") {
+                    verdict = 57;
+                }
+                var body9: Buf = buf_new(512);
+                if verdict == 0 {
+                    if !mock_final_body(&body9, "SELFTEST_JOBS_OK") {
+                        verdict = 58;
+                    }
+                } else if !mock_final_body(&body9, "SELFTEST_FAIL") {
+                    verdict = 59;
+                }
+                var sent9b: bool = false;
+                if is_stream {
+                    sent9b = mock_send_sse(cfd, &body9);
+                } else {
+                    sent9b = mock_send(cfd, &body9);
+                }
+                if !sent9b {
+                    verdict = 60;
+                }
+                buf_free(&body9);
+            }
+            buf_free(&rx);
+            _ = sys_close(cfd) catch {};
+            round = round + 1;
+            continue;
+        }
+        if mock_mode == 7 {
+            // 文件工具轮：一轮里发 6 个调用，第二轮断言每个结果的文本
+            if round == 0 {
+                var sb7: Buf = buf_new(4096);
+                if !mock_fs_body(&sb7) {
+                    verdict = 34;
+                }
+                var sent7: bool = false;
+                if is_stream {
+                    sent7 = mock_send_sse(cfd, &sb7);
+                } else {
+                    sent7 = mock_send(cfd, &sb7);
+                }
+                if !sent7 {
+                    verdict = 35;
+                }
+                buf_free(&sb7);
+            } else {
+                if !contains(&rx, "requires reading") {
+                    verdict = 36;   // 未读就覆盖 → 被观察策略拦住
+                }
+                if !contains(&rx, "2: beta two") || !contains(&rx, "3: gamma three") {
+                    verdict = 37;   // read 的窗口/行号
+                }
+                if !contains(&rx, "(Showing lines 2-3 of 5. Use offset=4 to continue.)") {
+                    verdict = 38;   // read 的 footer
+                }
+                if !contains(&rx, "Updated file") {
+                    verdict = 39;   // 读后覆盖成功
+                }
+                if !contains(&rx, "appears 2 times") {
+                    verdict = 40;   // edit 要求唯一匹配
+                }
+                if !contains(&rx, "has been updated successfully.") {
+                    verdict = 41;   // edit 成功
+                }
+                if !contains(&rx, "old_string not found") {
+                    verdict = 42;
+                }
+                // glob：*.txt 应当列出 doc.txt 与 note.txt
+                if !contains(&rx, "doc.txt") || !contains(&rx, "note.txt") {
+                    verdict = 46;
+                }
+                // grep：按文件分组 + "Line N: 预览"
+                if !contains(&rx, "Line 2: beta two") || !contains(&rx, "Line 4: beta four") {
+                    verdict = 47;
+                }
+                if !contains(&rx, "No matches found") {
+                    verdict = 48;
+                }
+                if !contains(&rx, "No files found") {
+                    verdict = 49;
+                }
+                var body7: Buf = buf_new(512);
+                if verdict == 0 {
+                    if !mock_final_body(&body7, "SELFTEST_FS_OK") {
+                        verdict = 43;
+                    }
+                } else if !mock_final_body(&body7, "SELFTEST_FAIL") {
+                    verdict = 44;
+                }
+                var sent7b: bool = false;
+                if is_stream {
+                    sent7b = mock_send_sse(cfd, &body7);
+                } else {
+                    sent7b = mock_send(cfd, &body7);
+                }
+                if !sent7b {
+                    verdict = 45;
+                }
+                buf_free(&body7);
+            }
+            buf_free(&rx);
+            _ = sys_close(cfd) catch {};
+            round = round + 1;
+            continue;
+        }
+        if mock_mode == 30 {
+            // P21 只读轮：write 必须被硬拒；bash 在非交互会话里必须 fail closed（不给它跑的机会）
+            if round == 0 {
+                expect(&rx, "Current uya-agent file policy: read-only." as &const byte, 101, &verdict);
+                expect(&rx, "The write and edit tools are refused" as &const byte, 102, &verdict);
+                expect(&rx, "needs the user's approval for every command" as &const byte, 103, &verdict);
+                var sb30: Buf = buf_new(4096);
+                if !mock_perm_body(&sb30) {
+                    verdict = 104;
+                }
+                var sent30: bool = false;
+                if is_stream {
+                    sent30 = mock_send_sse(cfd, &sb30);
+                } else {
+                    sent30 = mock_send(cfd, &sb30);
+                }
+                if !sent30 {
+                    verdict = 105;
+                }
+                buf_free(&sb30);
+            } else {
+                expect(&rx, "write is refused in read-only mode" as &const byte, 106, &verdict);
+                expect(&rx, "no answer channel" as &const byte, 110, &verdict);
+                expect(&rx, "1: alpha one" as &const byte, 111, &verdict);   // read 仍然照常工作
+                expect_absent(&rx, "PERM-BASH-RAN" as &const byte, 112, &verdict);   // bash 一个字都没跑
+                var body30: Buf = buf_new(512);
+                if verdict == 0 {
+                    if !mock_final_body(&body30, "SELFTEST_PERM_OK") {
+                        verdict = 113;
+                    }
+                } else if !mock_final_body(&body30, "SELFTEST_FAIL") {
+                    verdict = 114;
+                }
+                var sent30b: bool = false;
+                if is_stream {
+                    sent30b = mock_send_sse(cfd, &body30);
+                } else {
+                    sent30b = mock_send(cfd, &body30);
+                }
+                if !sent30b {
+                    verdict = 260;
+                }
+                buf_free(&body30);
+            }
+            buf_free(&rx);
+            _ = sys_close(cfd) catch {};
+            round = round + 1;
+            continue;
+        }
+        if mock_mode == 31 {
+            // P21 沙箱轮：工作区内可写、区外被内核拒绝，命令本身确实跑过（TOOL-MARK 打在 stdout）
+            if round == 0 {
+                var sb31: Buf = buf_new(4096);
+                if !mock_san_body(&sb31) {
+                    verdict = 115;
+                }
+                var sent31: bool = false;
+                if is_stream {
+                    sent31 = mock_send_sse(cfd, &sb31);
+                } else {
+                    sent31 = mock_send(cfd, &sb31);
+                }
+                if !sent31 {
+                    verdict = 116;
+                }
+                buf_free(&sb31);
+            } else {
+                expect(&rx, "TOOL-MARK" as &const byte, 117, &verdict);       // 命令真的在沙箱里跑过
+                expect(&rx, "[exit code: " as &const byte, 118, &verdict);    // 区外那次重定向失败 → 非零退出
+                var body31: Buf = buf_new(512);
+                if verdict == 0 {
+                    if !mock_final_body(&body31, "SELFTEST_SAN_OK") {
+                        verdict = 119;
+                    }
+                } else if !mock_final_body(&body31, "SELFTEST_FAIL") {
+                    verdict = 83;
+                }
+                var sent31b: bool = false;
+                if is_stream {
+                    sent31b = mock_send_sse(cfd, &body31);
+                } else {
+                    sent31b = mock_send(cfd, &body31);
+                }
+                if !sent31b {
+                    verdict = 84;
+                }
+                buf_free(&body31);
+            }
+            buf_free(&rx);
+            _ = sys_close(cfd) catch {};
+            round = round + 1;
+            continue;
+        }
+        if mock_mode == 26 {
+            // P26 plan 闸门轮：plan 模式下 write/edit 硬拒、exit_plan_mode 在管道里无渠道
+            if round == 0 {
+                expect(&rx, "Plan mode is active" as &const byte, 121, &verdict);
+                expect(&rx, "refused until the user approves a plan" as &const byte, 122, &verdict);
+                expect(&rx, "\"name\":\"exit_plan_mode\"" as &const byte, 123, &verdict);
+                var sb26: Buf = buf_new(4096);
+                if !mock_plan_body(&sb26) {
+                    verdict = 124;
+                }
+                var sent26: bool = false;
+                if is_stream {
+                    sent26 = mock_send_sse(cfd, &sb26);
+                } else {
+                    sent26 = mock_send(cfd, &sb26);
+                }
+                if !sent26 {
+                    verdict = 130;
+                }
+                buf_free(&sb26);
+            } else {
+                expect(&rx, "write is refused in plan mode" as &const byte, 125, &verdict);
+                expect(&rx, "edit is refused in plan mode" as &const byte, 126, &verdict);
+                expect(&rx, "no user-questions channel is available to review the plan" as &const byte, 127, &verdict);
+                expect_absent(&rx, "Created file" as &const byte, 128, &verdict);
+                expect_absent(&rx, "has been updated" as &const byte, 129, &verdict);
+                var body26: Buf = buf_new(512);
+                if verdict == 0 {
+                    if !mock_final_body(&body26, "SELFTEST_PLAN_GATE_OK") {
+                        verdict = 131;
+                    }
+                } else if !mock_final_body(&body26, "SELFTEST_FAIL") {
+                    verdict = 132;
+                }
+                var sent26b: bool = false;
+                if is_stream {
+                    sent26b = mock_send_sse(cfd, &body26);
+                } else {
+                    sent26b = mock_send(cfd, &body26);
+                }
+                if !sent26b {
+                    verdict = 133;
+                }
+                buf_free(&body26);
+            }
+            buf_free(&rx);
+            _ = sys_close(cfd) catch {};
+            round = round + 1;
+            continue;
+        }
+        if mock_mode == 6 {
+            // 中断轮：发一帧工具调用后挂 300ms（不发 [DONE]），客户端应被 Ctrl-C 打断
+            var sb6: Buf = buf_new(512);
+            _ = buf_append_cstr(&sb6, "{\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"working on it\",\"tool_calls\":[{\"id\":\"call_x1\",\"type\":\"function\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\\\"note.txt\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}");
+            if !mock_send_sse_nodone(cfd, &sb6) {
+                verdict = 33;
+            }
+            var req6: TimeSpec = TimeSpec{ tv_sec: 0, tv_nsec: 300000000 };
+            var rem6: TimeSpec = TimeSpec{ tv_sec: 0, tv_nsec: 0 };
+            _ = sys_nanosleep(&req6, &rem6) catch {};
+            buf_free(&sb6);
+            buf_free(&rx);
+            _ = sys_close(cfd) catch {};
+            round = round + 1;
+            continue;
+        }
+        if mock_mode == 5 {
+            // 一直给工具调用：agent 必须靠 max_steps 自己停下
+            var sb: Buf = buf_new(2048);
+            if !mock_toolcall_body(&sb, true) {
+                verdict = 31;
+            }
+            var sent5: bool = false;
+            if is_stream {
+                sent5 = mock_send_sse(cfd, &sb);
+            } else {
+                sent5 = mock_send(cfd, &sb);
+            }
+            if !sent5 {
+                verdict = 32;
+            }
+            buf_free(&sb);
+            buf_free(&rx);
+            _ = sys_close(cfd) catch {};
+            round = round + 1;
+            continue;
+        }
+        if round == 0 {
+            // 断言：tools schema 里 run_shell 的有无符合预期
+            const has_shell: bool = contains(&rx, "\"name\":\"bash\"");
+            if has_shell != mock_expect_shell {
+                verdict = 12;
+            }
+            var body: Buf = buf_new(4096);
+            var built: bool = false;
+            if mock_mode == 2 {
+                built = mock_toolcall_tools_body(&body);
+            } else {
+                built = mock_toolcall_body(&body, mock_expect_shell);
+            }
+            if !built {
+                buf_free(&body);
+                buf_free(&rx);
+                _ = sys_close(cfd) catch {};
+                return 13;
+            }
+            var sent_a: bool = false;
+            if is_stream {
+                sent_a = mock_send_sse(cfd, &body);
+            } else {
+                sent_a = mock_send(cfd, &body);
+            }
+            if !sent_a {
+                verdict = 14;
+            }
+            buf_free(&body);
+        } else {
+            // 断言：第二轮请求里必须带上第一轮的工具执行结果
+            if mock_mode != 2 {
+                // write 的结果信封：<path>note.txt</path> … Created file
+                if !contains(&rx, "Created file") || !contains(&rx, "note.txt") {
+                    verdict = 15;
+                }
+            }
+            // P3：运行中用户输入（steer）必须在**下一个 step 的请求**里出现
+            if mock_expect_steer && !contains(&rx, "STEER-MARKER") {
+                verdict = 29;
+            }
+            // P2 严格协议断言：assistant 的 tool_calls 原样回灌 + 每个结果都有配对的
+            // tool_call_id（折叠协议下这些都不该出现，见 --compat-fold 轮）
+            if mock_expect_fold {
+                // 折叠协议：必须有折叠头，且不能出现 role:"tool"
+                if !contains(&rx, "工具执行结果如下") || contains(&rx, "\"role\":\"tool\"") {
+                    verdict = 28;
+                }
+            } else if is_stream {
+                if !contains(&rx, "\"role\":\"assistant\"") || !contains(&rx, "\"tool_calls\"") {
+                    verdict = 23;
+                }
+                if !contains(&rx, "\"role\":\"tool\"") || !contains(&rx, "\"tool_call_id\"") {
+                    verdict = 24;
+                }
+                if !contains(&rx, "\"id\":\"call_") {
+                    verdict = 25;   // 调用 id 必须原样出现在历史里
+                }
+                // 配对数：tools 轮有 4 个调用，其它轮 1 个
+                // 每轮 mock 发出的调用数：shell 轮 2 个（write+bash）、
+                // no-shell 轮 1 个、tools 轮 4 个、熔断轮沿用 2 个
+                var want_ids: i32 = 2;
+                if mock_mode == 1 {
+                    want_ids = 1;
+                } else if mock_mode == 2 {
+                    want_ids = 4;
+                }
+                const got_ids: i32 = count_sub(&rx, "\"tool_call_id\":\"call_");
+                if got_ids != want_ids {
+                    verdict = 27;
+                }
+                // 折叠协议标记不该出现
+                if contains(&rx, "工具执行结果如下") {
+                    verdict = 26;
+                }
+            }
+            if mock_expect_shell && mock_mode != 2 {
+                if !contains(&rx, "SELFTEST-SHELL-OK") || !contains(&rx, "[exit code: 0]") {
+                    verdict = 19;
+                }
+            }
+            if mock_mode == 2 {
+                // 读回的文本在请求里应当只被转义一次：line1\nline2 \"q\" tail
+                // （如果字段值忘了反转义，这里会是 line1\\nline2，断言就会失败）
+                if !contains(&rx, "2: line2 \\\"q\\\" tail") {
+                    verdict = 20;
+                }
+                if !contains(&rx, "unsafe path") {
+                    verdict = 21;
+                }
+                if !contains(&rx, "[timed out after 300ms]") || !contains(&rx, "[killed by signal: 9]") {
+                    verdict = 22;
+                }
+            }
+            var body2: Buf = buf_new(1024);
+            if verdict == 0 {
+                if !mock_final_body(&body2, "SELFTEST_OK 已写入 note.txt") {
+                    buf_free(&body2);
+                    buf_free(&rx);
+                    _ = sys_close(cfd) catch {};
+                    return 16;
+                }
+            } else {
+                if !mock_final_body(&body2, "SELFTEST_FAIL") {
+                    buf_free(&body2);
+                    buf_free(&rx);
+                    _ = sys_close(cfd) catch {};
+                    return 17;
+                }
+            }
+            var sent: bool = false;
+            if is_stream {
+                sent = mock_send_sse(cfd, &body2);       // 流式路径（内部就是 chunked）
+            } else if mock_mode == 2 {
+                sent = mock_send_chunked(cfd, &body2);   // 非流式 + chunked 解码
+            } else {
+                sent = mock_send(cfd, &body2);
+            }
+            if !sent {
+                verdict = 18;
+            }
+            buf_free(&body2);
+        }
+        buf_free(&rx);
+        _ = sys_close(cfd) catch {};
+        round = round + 1;
+    }
+    _ = sys_close(lfd) catch {};
+    return verdict;
+}
