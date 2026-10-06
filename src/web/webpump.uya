@@ -1,0 +1,524 @@
+// src/web/webpump.uya — web 界面的主循环：一次 poll 管住所有 fd
+//
+// 本文件：入口（`web_run`）、地址解析（`web_addr_parse`）、主循环与一次泵
+//   （`web_loop` / `web_poll_once`）、以及五条具体动作 —— 收连接
+//   （`web_accept_conn`）、读 PTY 喂解释器（`web_read_pty`）、写 PTY
+//   （`web_write_pty`）、服务连接（`web_service_conn`）、推帧（`web_push_frame`）。
+// 不变量：① **一次 `poll` 覆盖五类 fd**：listen、每个会话 master 的读、每个
+//   会话 master 的写（有待发输入时）、每个连接的读/写。会话 ≤8、连接 ≤32，定长
+//   数组就够（`WEB_POLL_MAX`）；② 读 PTY **一次最多 16 KiB**，读完立刻喂解释器，
+//   再在**同一圈**推帧 —— 分两圈会让「按键 → 屏幕变化」多一个 50ms；③ 写 PTY 与
+//   写连接都是**非阻塞**的：写不完就把余量留在缓冲里，下一圈 `POLLOUT` 接着写
+//   （阻塞写会让整个 agent 冻住，而它在同一个进程里）；④ `web_push_frame` 只在
+//   差分非空时发 —— 空帧一个字节都不发（否则 20 帧/秒的空转流量）；⑤ 子进程死了
+//   （PTY 读到 EOF）就把那条会话标 `alive=false` 但**留着标签** —— 屏幕上是最后
+//   一帧，用户还能看见它说了什么（自动删标签会让「刚才那条怎么没了」无从解释）；
+//   ⑥ 退出走 `web_quit_wanted()`（ctrl+c → sigx 置位），收尾时按进程组收所有子进程。
+// 依赖：无 `use` 行（合并命名空间）；本仓 net/httpsrv（`srv_*`）、web/ttyemu
+//   （`emu_*`）、web/websrv（会话表）、web/webhttp（连接与端点）、session/sigx
+//   （`sigx_*`）、agent（`Config` / `agent_default_home`）。
+// 命名：`web_*`；常量 `WEB_*`。
+//
+// **为什么单线程 + 一个 poll**：工具链的堆并发分配是坏的（§16 踩坑 47：pthread
+// 8/8 崩），所以全仓都是「单线程 + 泵点」。这里同样：8 条会话 + 32 条连接全塞进
+// 一次 poll，谁就绪处理谁。代价是任何一处阻塞（读/写/子进程等待）都会冻住全部 ——
+// 所以文件头不变量 ②③ 是**硬要求**，不是优化。
+
+use libc.syscall;
+use libc.unistd;
+
+// ============================================================
+// 常量
+// ============================================================
+
+// poll 集合上限：1（listen）+ 会话读 + 会话写 + 连接读 + 连接写。
+const WEB_POLL_MAX: usize = 1 + WEB_MAX_SESSIONS * 2 + WEB_MAX_CONNS * 2;
+
+// 一次从 PTY 读多少（TUI 一帧在几百字节到几 KB；16 KiB 一次能吃掉一整批）
+const WEB_READ_CHUNK: usize = 16384;
+
+// poll 槽的种类
+const WEB_PK_LISTEN: u8 = 0;
+const WEB_PK_PTY_R: u8 = 1;
+const WEB_PK_PTY_W: u8 = 2;
+const WEB_PK_CONN: u8 = 3;
+
+// ============================================================
+// 地址
+// ============================================================
+
+// 解析 `IP:PORT`。只认 127.0.0.1 与 0.0.0.0（web 是本地单用户界面；想暴露给
+// 别的机器是**显式**决定，而且要在启动时打印警告）。空串 = 默认 127.0.0.1:8787；
+// 端口 0 = 让内核分配。
+export fn web_addr_parse(addr: &const byte, addr_len: usize, a: &byte,
+    b: &byte, c: &byte, d: &byte, port: &u16) bool {
+    if addr_len == 0 {
+        a[0] = 127;
+        b[0] = 0;
+        c[0] = 0;
+        d[0] = 1;
+        port[0] = 8787;
+        return true;
+    }
+    var i: usize = 0;
+    while i < addr_len && addr[i] != 58 {          // ':'
+        i = i + 1;
+    }
+    if i == 0 || i >= addr_len {
+        return false;
+    }
+    var quad: [byte: 4] = [0: 4];
+    if !srv_scan_ipv4(addr, i, &quad[0]) {
+        return false;
+    }
+    const is_loop: bool = quad[0] == 127 && quad[1] == 0 && quad[2] == 0
+        && quad[3] == 1;
+    const is_any: bool = quad[0] == 0 && quad[1] == 0 && quad[2] == 0
+        && quad[3] == 0;
+    if !is_loop && !is_any {
+        return false;
+    }
+    const ps: &const byte = addr + i + 1;
+    const pn: usize = addr_len - (i + 1);
+    if pn == 0 || pn > 5 {
+        return false;
+    }
+    var v: usize = 0;
+    var k: usize = 0;
+    while k < pn {
+        const ch: byte = ps[k];
+        if ch < 48 || ch > 57 {
+            return false;
+        }
+        v = v * 10 + ((ch - 48) as usize);
+        k = k + 1;
+    }
+    if v > 65535 {
+        return false;
+    }
+    a[0] = quad[0];
+    b[0] = quad[1];
+    c[0] = quad[2];
+    d[0] = quad[3];
+    port[0] = v as u16;
+    return true;
+}
+
+// ============================================================
+// 入口
+// ============================================================
+
+// `--web` 的入口：起监听 → 开首个会话 → 进主循环 → 收尾。
+export fn web_run(cfg: &const Config) i32 {
+    var a: byte = 0;
+    var b: byte = 0;
+    var c: byte = 0;
+    var d: byte = 0;
+    var port: u16 = 0;
+    if !web_addr_parse(cfg.web_addr.ptr as &const byte, cfg.web_addr.len,
+        &a, &b, &c, &d, &port) {
+        out_err("error: --web 的地址只支持 127.0.0.1:PORT 或 0.0.0.0:PORT");
+        out_err("（也可用 UYA_AGENT_WEB_ADDR）\n");
+        return AGENT_USAGE;
+    }
+    const lfd: i32 = srv_listen(a, b, c, d, port, 16);
+    if lfd < 0 {
+        out_err("error: web 监听失败（端口被占用？换个端口：--web 127.0.0.1:0）\n");
+        return AGENT_PROTO;
+    }
+    if !sigx_install_web() {
+        out_err("[web] 警告：终止信号处理器安装失败（ctrl+c 可能留下子进程）\n");
+    }
+    const real: u16 = srv_local_port(lfd);
+    out_err("[web] 打开 http://127.0.0.1:");
+    out_err_dec(real as usize);
+    out_err("/ （ctrl+c 退出）\n");
+    if a == 0 && b == 0 && c == 0 && d == 0 {
+        out_err("[web] 警告：监听 0.0.0.0 —— 同网段的机器都能访问这个 agent，");
+        out_err("而且**没有任何认证**\n");
+    }
+    var t: WebTable = web_table_zero();
+    web_table_init(&t);
+    defer { web_table_free(&t); }
+    var last: Buf = buf_new(1200);
+    defer { buf_free(&last); }
+    _ = web_first_session(cfg, &t, &last);
+    if t.n == 0 {
+        out_err("error: 起不了第一个会话（/dev/ptmx 打不开？）\n");
+        srv_close(lfd);
+        return AGENT_PROTO;
+    }
+    web_loop(cfg, &t, lfd);
+    srv_close(lfd);
+    return AGENT_OK;
+}
+
+// ============================================================
+// 主循环
+// ============================================================
+
+// 连接表 + 主循环。连接表是**定长数组**，`used[i]` 说这个槽有没有在用；
+// 退出时把在用的那些全释放（`defer` 保证异常路径也收）。
+fn web_loop(cfg: &const Config, t: &WebTable, lfd: i32) void {
+    var conns: [WebConn: WEB_MAX_CONNS] = [web_conn_value_empty()
+        : WEB_MAX_CONNS];
+    var used: [bool: WEB_MAX_CONNS] = [false: WEB_MAX_CONNS];
+    defer {
+        var i: usize = 0;
+        while i < WEB_MAX_CONNS {
+            if used[i] {
+                web_conn_free(&conns[i]);
+                used[i] = false;
+            }
+            i = i + 1;
+        }
+    }
+    while !web_quit_wanted() {
+        web_poll_once(cfg, t, lfd, &conns[0], &used[0]);
+    }
+    out_err("[web] 退出，正在收子进程…\n");
+}
+
+// 一次泵：poll → 各就绪 fd 的动作 → 推帧。
+//
+// 顺序有讲究：**先读 PTY（产出数据）再推帧（消费数据）**，这样一帧内的
+// 「按键 → 屏幕更新」只经过一圈（50ms）；反过来会慢一圈。
+fn web_poll_once(cfg: &const Config, t: &WebTable, lfd: i32,
+    conns: &WebConn, used: &bool) void {
+    var pfds: [PollFd: WEB_POLL_MAX] = [PollFd{ fd: -1, events: 0, revents: 0 }
+        : WEB_POLL_MAX];
+    var kind: [u8: WEB_POLL_MAX] = [0: WEB_POLL_MAX];
+    var idx: [usize: WEB_POLL_MAX] = [0: WEB_POLL_MAX];
+    var np: usize = 0;
+    if np < WEB_POLL_MAX {
+        pfds[np].fd = lfd;
+        pfds[np].events = POLLIN;
+        kind[np] = WEB_PK_LISTEN;
+        np = np + 1;
+    }
+    var i: usize = 0;
+    while i < t.n && i < WEB_MAX_SESSIONS {
+        const s: &const WebSession = &t.items[i];
+        if s.master >= 0 && np + 2 <= WEB_POLL_MAX {
+            pfds[np].fd = s.master;
+            pfds[np].events = POLLIN;
+            kind[np] = WEB_PK_PTY_R;
+            idx[np] = i;
+            np = np + 1;
+            if s.pending.len > 0 {
+                pfds[np].fd = s.master;
+                pfds[np].events = POLLOUT;
+                kind[np] = WEB_PK_PTY_W;
+                idx[np] = i;
+                np = np + 1;
+            }
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while i < WEB_MAX_CONNS && np < WEB_POLL_MAX {
+        if used[i] && conns[i].fd >= 0 {
+            pfds[np].fd = conns[i].fd;
+            if web_conn_pending(&conns[i]) {
+                pfds[np].events = POLLOUT;
+            } else {
+                pfds[np].events = POLLIN;
+            }
+            kind[np] = WEB_PK_CONN;
+            idx[np] = i;
+            np = np + 1;
+        }
+        i = i + 1;
+    }
+    _ = sys_poll(&pfds[0], np, WEB_POLL_MS) catch {};
+    var k: usize = 0;
+    while k < np {
+        const rv: i16 = pfds[k].revents;
+        if rv != 0 {
+            if kind[k] == WEB_PK_LISTEN {
+                if (rv & POLLIN) != 0 {
+                    web_accept_conn(&conns[0], &used[0], lfd);
+                }
+            } else if kind[k] == WEB_PK_PTY_R {
+                web_read_pty(t, idx[k]);
+            } else if kind[k] == WEB_PK_PTY_W {
+                web_write_pty(t, idx[k]);
+            } else if kind[k] == WEB_PK_CONN {
+                const ci: usize = idx[k];
+                if (rv & POLLOUT) != 0 {
+                    web_flush_conn(&conns[ci]);
+                } else {
+                    web_service_conn(cfg, t, &conns[ci], &used[0], ci);
+                }
+            }
+        }
+        k = k + 1;
+    }
+    web_push_all(t, &conns[0], &used[0]);
+}
+
+// 收一个新连接并挂进连接表。表满就直接关掉它（浏览器会重试，比留着排队好：
+// 留一个「半死」的连接会让它一直等响应）。
+fn web_accept_conn(conns: &WebConn, used: &bool, lfd: i32) void {
+    const fd: i32 = srv_accept_nb(lfd);
+    if fd < 0 {
+        return;
+    }
+    var i: usize = 0;
+    while i < WEB_MAX_CONNS {
+        if !used[i] {
+            if web_conn_init(&conns[i], fd) {
+                // rx/out 要**已经分配好**才能用（web_conn_init 失败时它是空的）
+                used[i] = true;
+            } else {
+                srv_close(fd);
+            }
+            return;
+        }
+        i = i + 1;
+    }
+    srv_close(fd);
+}
+
+// 读一条会话的 PTY：一次最多 WEB_READ_CHUNK，读完塞进解释器。
+// 读不到（EOF / 出错）就把这条会话标成 `alive = false` 并关掉读侧 ——
+// 但**留着标签与最后一帧**（理由见文件头不变量 ⑤）。
+fn web_read_pty(t: &WebTable, i: usize) void {
+    if i >= WEB_MAX_SESSIONS {
+        return;
+    }
+    const s: &WebSession = &t.items[i];
+    if s.master < 0 {
+        return;
+    }
+    var tmp: [byte: WEB_READ_CHUNK] = [0: WEB_READ_CHUNK];
+    const n: isize = sys_read(s.master, &tmp[0], WEB_READ_CHUNK) catch {
+        -1 as isize;
+    };
+    if n > 0 {
+        emu_feed(&s.emu, &tmp[0], n as usize);
+        web_annotate_images(s);
+        return;
+    }
+    // n == 0：子进程关了 PTY（真的退出了）⇒ 这条会话结束。
+    // n < 0：**不能**当成结束 —— 非阻塞 fd 上 `poll` 说可读之后 `read` 仍可能
+    // 返回 EAGAIN（信号打断、或同一圈里被别的读抢走），把它当 EOF 会让会话
+    // 「刚开就被判死」（实测：页面上一条会话都没有帧）。所以这里只留着，
+    // 下一圈 poll 会说真话；真死掉的会话由 n == 0 那一支收掉。
+    if n == 0 {
+        s.alive = false;
+        srv_close(s.master);
+        s.master = -1;
+    }
+}
+
+// 把 PTY master 的待发输入写出去（非阻塞：写不完的留在缓冲里）。
+fn web_write_pty(t: &WebTable, i: usize) void {
+    if i >= WEB_MAX_SESSIONS {
+        return;
+    }
+    const s: &WebSession = &t.items[i];
+    if s.master < 0 || s.pending.len == 0 {
+        return;
+    }
+    const w: isize = sys_write(s.master, s.pending.ptr as *const byte,
+        s.pending.len) catch { -1 as isize; };
+    if w > 0 {
+        buf_drop_prefix(&s.pending, w as usize);
+    } else if w < 0 {
+        // 真出错（EPIPE 之类）：把待发丢掉，别让它无限攒着
+        if !web_errno_again() {
+            buf_reset(&s.pending);
+        }
+    }
+}
+
+// 上一次系统调用是不是 EAGAIN / EWOULDBLOCK（11）。
+// `sys_write` 的 catch 只给 -1，拿不到 errno 的具体值；这里用一个保守判据：
+// 只要还有待发就留着（下一圈 POLLOUT 会说真话），真正死掉的会话会被
+// `web_read_pty` 的 EOF 分支收掉。
+fn web_errno_again() bool {
+    return true;
+}
+
+// 把连接队列里剩的字节写出去（非阻塞）。
+fn web_flush_conn(c: &WebConn) void {
+    if c.fd < 0 || c.out_off >= c.out.len {
+        return;
+    }
+    // **分块编码**：`/api/screen` 的响应头写的是 `Transfer-Encoding: chunked`，
+    // 所以正文必须带长度头（`<hex>\r\n<数据>\r\n`）。直接 `sys_write` 原始帧
+    // 会被浏览器当成畸形块而**整条丢弃** —— 症状是「流连上了，一个字节都不出来」
+    // （实测就是这个）。
+    // `srv_send_chunk` 是「一次写完一整块」的语义（内部对 EAGAIN 会 poll 重试），
+    // 所以这里整块交给它；写成功就把游标推到末尾。
+    const rest: usize = c.out.len - c.out_off;
+    const at: *const byte = @ptr_from_usize(
+        @usize_from_ptr(c.out.ptr as &const void) + c.out_off
+    ) as *const byte;
+    if srv_send_chunk(c.fd, at, rest) {
+        c.out_off = c.out.len;
+        buf_reset(&c.out);
+        c.out_off = 0;
+    }
+}
+
+// 服务一个可读的连接：按状态走 —— READ 收请求并分派，STREAM 只可能是对端
+// 关了（长连接是单向的：我们只发不收），DONE 直接收尾。
+fn web_service_conn(cfg: &const Config, t: &WebTable, c: &WebConn,
+    used: &bool, ci: usize) void {
+    if c.fd < 0 {
+        return;
+    }
+    if c.st == WEB_CONN_READ {
+        var id: Buf = buf_new(64);
+        defer { buf_free(&id); }
+        var q: Buf = buf_new(64);
+        defer { buf_free(&q); }
+        var m: u8 = 0;
+        var url_off: usize = 0;
+        var url_len: usize = 0;
+        var body_off: usize = 0;
+        const rc: i32 = srv_recv_request(c.fd, &c.rx, &m, &url_off, &url_len,
+            &body_off);
+        if rc == SRV_RX_MORE {
+            return;
+        }
+        if rc == SRV_RX_TOO_BIG {
+            _ = web_send_error(c.fd, SRV_ST_413, "request too large");
+            web_conn_close(c, used, ci);
+            return;
+        }
+        if rc != SRV_RX_OK {
+            web_conn_close(c, used, ci);
+            return;
+        }
+        // 分派。返回 true 的只有 `/api/screen`（长连接，fd 要留着推帧）；
+        // 其余端点在 `web_handle` 里已经把**完整响应**同步写完了。
+        const keep: bool = web_handle(cfg, t, c, m, url_off, url_len, body_off,
+            &id, &q);
+        if keep {
+            return;
+        }
+        // ⚠ 非长连接必须**当场关掉**，不能「留给下一圈 poll 自然收尾」：
+        // `srv_recv_request` 是**累积**式的（请求原文留在 `c.rx` 里），而客户端
+        // 收到响应前后还会送来 FIN/剩余字节 ⇒ 下一圈 `POLLIN` 又就绪 ⇒ 同一个
+        // `c.rx` 被再解析一遍 ⇒ **端点执行两次**。实测症状：一次
+        // `POST /api/sessions` 建出**两条**会话（`[dbg] RX_OK fd=7` 连打两次，
+        // 第二次 `rxlen=91` 就是那份旧请求）。
+        // 状态机在这里收口：READ →（收到完整请求）→ 分派 → 关（或 STREAM）。
+        web_conn_close(c, used, ci);
+        return;
+    }
+    if c.st == WEB_CONN_STREAM {
+        // 长连接我们只发不收：可读 = 对端发了东西（不该有）或关了。
+        var tmp: [byte: 512] = [0: 512];
+        const n: isize = sys_read(c.fd, &tmp[0], 512) catch { -1 as isize; };
+        if n <= 0 {
+            web_conn_close(c, used, ci);
+        }
+        return;
+    }
+    web_conn_close(c, used, ci);
+}
+
+// 关一个连接（fd + 槽位）。**幂等**。
+fn web_conn_close(c: &WebConn, used: &bool, ci: usize) void {
+    if c.fd >= 0 {
+        srv_close(c.fd);
+        c.fd = -1;
+    }
+    web_conn_free(c);
+    if ci < WEB_MAX_CONNS {
+        used[ci] = false;
+    }
+}
+
+// 给所有订阅了会话的连接推一帧。**差分为空就一个字节都不发**（空帧流量没有
+// 意义，而 `/api/screen` 是 50ms 一圈的长连接）。
+fn web_push_all(t: &WebTable, conns: &WebConn, used: &bool) void {
+    var i: usize = 0;
+    while i < WEB_MAX_SESSIONS {
+        const si: usize = i;
+        if si < t.n {
+            var j: usize = 0;
+            while j < WEB_MAX_CONNS {
+                if used[j] && conns[j].st == WEB_CONN_STREAM {
+                    if conns[j].sess == si as isize {
+                        web_push_frame(&t.items[si], &conns[j]);
+                    }
+                }
+                j = j + 1;
+            }
+        }
+        i = i + 1;
+    }
+}
+
+// 给一个连接推一帧（差分）。首次推发全量，之后只发变化的行；`emos_snapshot`
+// 在发完之后更新「上一帧」。
+fn web_push_frame(s: &WebSession, c: &WebConn) void {
+    var frame: Buf = buf_new(0);
+    defer { buf_free(&frame); }
+    const full: bool = !s.emu.have_prev;
+    const n: usize = emu_json_frame(&s.emu, s.id.ptr as &const byte, s.id.len,
+        full, &s.scratch, &frame);
+    if n == 0 {
+        return;
+    }
+    // 空帧（没有变化的行）只在首次发；之后真有变化才发。
+    if !full && emu_frame_is_empty(&frame) {
+        return;
+    }
+    if !web_conn_queue(c, frame.ptr as &const byte, frame.len) {
+        return;
+    }
+    emu_snapshot(&s.emu);
+    web_queue_replay_save(s, &frame);
+    // 立刻尽力写一次：小帧（几百字节）通常一次就写完，不必等下一圈 poll。
+    web_flush_conn(c);
+}
+
+// 把这一帧存进会话的「最近几帧」环形（新连接回放用）。**只在真的收到过
+// 请求的帧上存**（否则会把空帧也存进去，回放时前端反而看不到内容）。
+fn web_queue_replay_save(s: &WebSession, frame: &const Buf) void {
+    if frame.len == 0 || s.replay_n > WEB_REPLAY_FRAMES {
+        return;
+    }
+    // 环形下标：用「撞到上限就回零」而不是 `%` —— 数组边界证明器推不出取模的
+    // 范围（§16 踩坑 6 那一族：它只认直接的比较夹取），写成 if 才认。
+    var at: usize = s.replay_at;
+    if at >= WEB_REPLAY_FRAMES {
+        at = 0;
+    }
+    if at >= WEB_REPLAY_FRAMES {
+        return;
+    }
+    buf_reset(&s.replay[at]);
+    _ = buf_append(&s.replay[at], frame.ptr as &const byte, frame.len);
+    var nxt: usize = s.replay_at + 1;
+    if nxt >= WEB_REPLAY_FRAMES {
+        nxt = 0;
+    }
+    s.replay_at = nxt;
+    if s.replay_n < WEB_REPLAY_FRAMES {
+        s.replay_n = s.replay_n + 1;
+    }
+}
+
+// 这一帧是不是「什么都没变」（只有信封，`rows_changed` 与 `images` 都空）。
+// 判据是**字节**：`emu_json_frame` 里两个数组都空时，输出里必然是 `[]],[` 相邻 ——
+// 与其再解析一遍 JSON，不如直接找那个固定片段（帧是我们自己拼的，格式固定）。
+fn emu_frame_is_empty(frame: &const Buf) bool {
+    return srv_find(frame.ptr as &const byte, 0, frame.len,
+        "],\"images\":[]}" as &const byte, 14) >= 0
+        && srv_find(frame.ptr as &const byte, 0, frame.len,
+            "\"rows_changed\":[]" as &const byte, 16) >= 0;
+}
+
+// 退出请求：ctrl+c / SIGTERM 由 `sigx_install_web` 装的处理器置位。
+// **不用** `sigx_install_terminal` 那一套 —— 它的处理器立刻 `sys_exit`，会把所有
+// 会话子进程留成孤儿（理由见 sigx.uya 里 P60 那一段）。
+fn web_quit_wanted() bool {
+    return sigx_web_quit_wanted();
+}
