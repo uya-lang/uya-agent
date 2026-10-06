@@ -39,6 +39,7 @@ HEAD_DELAY_MS = int(sys.argv[4]) if len(sys.argv) > 4 else 0
 TOOL_CMD = sys.argv[5] if len(sys.argv) > 5 else ""
 
 REQS = []
+HEADS = []
 
 
 def read_request(conn):
@@ -69,7 +70,13 @@ def handle(conn):
     try:
         head, body = read_request(conn)
         REQS.append(body)
+        HEADS.append(head)
         sys.stderr.write("REQ #%d (%d bytes)\n" % (len(REQS), len(body)))
+        sys.stderr.flush()
+        # 会话身份与标题形状落盘：供 e2e-title-auto 断言「网关看得见会话 id / 工作区」。
+        # 写到 gw.err 里（同一个 stderr 文件），不改口径、不污染 SSE。
+        sys.stderr.write("HEAD #%d %s\n" % (len(HEADS), head.replace(b"\r\n", b" | ").decode("latin-1")))
+        sys.stderr.write("BODY #%d %s\n" % (len(REQS), body.decode("utf-8", "replace")))
         sys.stderr.flush()
         if HEAD_DELAY_MS > 0:
             # P31：响应头也压住 —— 客户端这一段完全没有泵点（hc_open 的读头循环是阻塞读）

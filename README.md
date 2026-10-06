@@ -418,6 +418,15 @@ DEEPSEEK_API_KEY=sk-xxx ./build/uya-agent \
 * **Responses 下不回放 reasoning item**（不发 `include: ["reasoning.encrypted_content"]`，
   也不发 `prompt_cache_key` / `prompt_cache_retention`）；历史按「外来消息」重放，只带文本与
   工具调用。工具 schema 不带 `strict`，也不做 404 之外的协议自动探测（换协议请显式 `--api=`）。
+* **会话身份照发**（与上面「不发 `prompt_cache_key`」是两件事）：每个请求都带
+  `x-deepseek-harness-session-id`（DSH 原样口径）+ `Session-Id`（`~/ai-gateway` 实读的那个）
+  两个头，正文再带一份 `client_metadata.session_id`（responses）/ `metadata.session_id`
+  （chat）。运行时上下文里另有 `session workspace: "<JSON 路径>"` 机读句。网关据此把请求
+  归到一次会话、取到工作区，并把标题调用认成 `call_kind=title` —— 见 [DESIGN.md](DESIGN.md) §15.4。
+* **起标题的提示词与 DSH 逐字同形**：system 段以 `Create a concise title for an AI
+  coding-assistant session` 开头，user 段以 `Generate the session title from this JSON array
+  of human messages:` 开头（后跟人类消息的 JSON 数组），且带**同一个**会话 id —— 网关按
+  这两个前缀识别标题行并抓标题。
 * **工作区**：「会话现在在哪」= 日志里最后一条 `session/workspace`（append-only、**权威**）；
   header 的 `cwd` 是创建时在哪（不再改写），索引里的 `cwd` 是「最后已知」缓存。恢复时定序
   `--workspace`/env > 最后一条 `session/workspace` > header `cwd` > 当前目录；记录的工作区不存在

@@ -683,6 +683,22 @@ e2e-title-auto: build
 	[ "$$n" -ge 2 ] || { echo "FAIL: 自动起标题没有多发请求（只看到 $$n 次）"; exit 1; }; \
 	grep -qF '"source":{"kind":"provider"}' $$ws/home/sessions/*/*/session.jsonl \
 		|| { echo "FAIL: 日志里没有 kind=provider 的 session/title"; exit 1; }; \
+	: "①b 网关看得见会话身份与工作区（每一次请求都要带；含标题那次侧路请求）"; \
+	sid=$$(grep -oF 'x-deepseek-harness-session-id: session-' $$ws/gw.err | head -1); \
+	[ -n "$$sid" ] || { echo "FAIL: 请求头里没有 DSH 口径的会话 id"; grep -F 'HEAD #' $$ws/gw.err | head -5; exit 1; }; \
+	[ "$$(grep -cF 'Session-Id: session-' $$ws/gw.err)" -eq "$$n" ] \
+		|| { echo "FAIL: 不是每个请求都带 Session-Id（网关实读的那一个）"; exit 1; }; \
+	[ "$$(grep -cF 'x-deepseek-harness-session-id: session-' $$ws/gw.err)" -eq "$$n" ] \
+		|| { echo "FAIL: 不是每个请求都带 x-deepseek-harness-session-id"; exit 1; }; \
+	[ "$$(grep -cF '"session_id":"session-' $$ws/gw.err)" -eq "$$n" ] \
+		|| { echo "FAIL: 不是每个请求的正文都带 session_id"; exit 1; }; \
+	grep -qF 'session workspace: \"' $$ws/gw.err \
+		|| { echo "FAIL: 运行时上下文里没有网关要的 session workspace 机读句"; exit 1; }; \
+	: "①c 标题侧路请求用 DSH 的两段式前缀（网关据此认 call_kind=title）"; \
+	grep -qF 'Create a concise title for an AI coding-assistant session' $$ws/gw.err \
+		|| { echo "FAIL: 标题请求的 system 段不是 DSH 前缀"; exit 1; }; \
+	grep -qF 'Generate the session title from this JSON array of human messages:' $$ws/gw.err \
+		|| { echo "FAIL: 标题请求的 user 段不是 DSH 前缀"; exit 1; }; \
 	: "② --no-title-auto：只有主请求，且没有 provider 事件"; \
 	if grep -qF '"source":{"kind":"provider"}' $$ws/home2/sessions/*/*/session.jsonl 2>/dev/null; then \
 		echo "FAIL: --no-title-auto 下仍然落了 provider 事件"; exit 1; \

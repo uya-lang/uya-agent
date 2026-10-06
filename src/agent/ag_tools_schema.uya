@@ -341,11 +341,40 @@ fn agent_request_img_extra(h: &const History) usize {
 // 多算不亏（够用一次分配），少算就是构请求失败。
 fn request_bytes_needed(h: &const History, cfg: &const Config) usize {
     const overhead: usize = 8192;
-    const tools_max: usize = 8192;   // 全部工具 schema 的上界
+    // tools schema 的真实长度（**不是**拍脑袋的 8192）：两种协议的工具 JSON 形状不同
+    // （chat 嵌套 function、responses 扁平），取两者较大的那个。
+    //
+    // 为什么必须实测：标题侧路请求只带 system + 一条 user（DSH 形状，见
+    // ag_title_prompt 的 agent_title_generate），`h.bytes` 很小，原来的 8192 兜底
+    // 就盖不住 tools schema，构请求会在 jw_overflow 上静默失败 —— 表现是「起标题
+    // 一个请求都不发、也没有报错」。工具表比历史更容易漏算，所以容量从真实取值来。
+    const tools_max: usize = tools_json_max_bytes(cfg.allow_shell);
     // P51：附件要按「读进来 + base64」之后的大小算（4/3 膨胀）。不算这一份的话，
     // 挂一张大图就会让构请求在 jw_overflow 上静默失败（请求体被截断）。
     const img_extra: usize = agent_request_img_extra(h);
     return h.bytes * 2 + overhead + tools_max + cfg.model.len * 2 + img_extra;
+}
+
+// tools schema 序列化后的最大长度（chat / responses 两种形状取大者）。
+// 用**独立**的临时缓冲，绝不碰 g_tools_scratch（那是构请求时的共享 scratch，
+// 在这里改写会把接下来真正要发出去的 tools 换成错的形状）。
+fn tools_json_max_bytes(allow_shell: bool) usize {
+    var tmp: Buf = buf_new(16384);
+    defer { buf_free(&tmp); }
+    if !buf_valid(&tmp) {
+        return 8192;   // 兜底：分配失败时退回旧口径，构请求自己会再报 overflow
+    }
+    var best: usize = 0;
+    if tools_json(&tmp, allow_shell, false) && tmp.len > best {
+        best = tmp.len;
+    }
+    if tools_json(&tmp, allow_shell, true) && tmp.len > best {
+        best = tmp.len;
+    }
+    if best == 0 {
+        return 8192;
+    }
+    return best;
 }
 
 
@@ -414,8 +443,9 @@ fn agent_push_user_with_imgs(h: &History, line: &const Buf, att_out: &Buf, have_
 }
 
 // 构 `chat/completions` 请求体。**字段顺序固定**：model / messages / stream /
-// stream_options / tools / temperature / max_tokens / reasoning_effort —— 顺序稳定是为了
-// 保住提供方的 KV 前缀缓存（字段插在中间会让缓存全失效）。
+// stream_options / tools / temperature / max_tokens / reasoning_effort / metadata(会话身份)
+// —— 顺序稳定是为了保住提供方的 KV 前缀缓存（字段插在中间会让缓存全失效）；
+// 新增字段一律**追加在末尾**（会话身份就是这么加的）。
 // tool 结果在**构请求这一层**过 `cmp_maybe_prune_kind`（剪枝不动历史，§5.3.1）。
 fn build_chat_request(cfg: &const Config, h: &const History, out: &Buf) bool {
     var w: JsonWriter = JsonWriter{ buf: null, cap: 0, used: 0, overflow: false };
@@ -531,6 +561,18 @@ fn build_chat_request(cfg: &const Config, h: &const History, out: &Buf) bool {
             jw_str(&w, cfg.reasoning_effort.ptr, cfg.reasoning_effort.len);
         }
     }
+    // 会话身份的正文副本（追加在**最末**，见本函数头「字段顺序」那条：新增字段只许往后加）：
+    // chat 协议没有 client_metadata，网关读的是通用 `metadata.session_id`
+    // （ai-gateway internal/responses/session.go 的 source 表第 4 档）。请求头同样带一份，
+    // 这里是给「只读正文、不看头」的网关留的位；空 id 不发（同 build_headers 的口径）。
+    if g_sess.id.len > 0 {
+        jw_byte(&w, 44);
+        jw_key(&w, "metadata");
+        jw_byte(&w, 123);
+        jw_key(&w, "session_id");
+        jw_str(&w, g_sess.id.ptr as &const byte, g_sess.id.len);
+        jw_byte(&w, 125);
+    }
     jw_byte(&w, 125);
     if jw_overflow(&w) {
         return false;
@@ -545,7 +587,8 @@ fn build_chat_request(cfg: &const Config, h: &const History, out: &Buf) bool {
 // 与 chat 的差别只在「外壳」：历史消息 → input items、工具 schema 扁平化、
 // max_tokens → max_output_tokens。内部历史/会话日志格式完全不动，映射只发生在这一刻。
 // 字段顺序固定，便于断言与 KV 前缀稳定：
-//   model, input, stream, store, tools, temperature, max_output_tokens, reasoning
+//   model, input, stream, store, tools, temperature, max_output_tokens, reasoning, client_metadata
+// （会话身份 client_metadata 同样是**追加在末尾**，不插进前缀里）
 // ============================================================
 const RESP_MSG_MIN_TOKENS: i64 = 16;   // OpenAI 拒绝 max_output_tokens < 16
 
@@ -832,6 +875,18 @@ fn build_responses_request(cfg: &const Config, h: &const History, out: &Buf) boo
         }
         jw_byte(&w, 125);
     }
+    // 会话身份的正文副本（追加在**最末**，保住 model/input/stream 的前缀顺序）：
+    // Codex 与 DSH 的 responses 调用都把根会话 id 放 client_metadata，ai-gateway 也把它
+    // 当作**正文权威位**（优先于请求头，见 internal/responses/session.go 的 source 表）。
+    // 空 id 不发。标题侧路请求走同一个构造器 ⇒ 自然带同一个 session_id。
+    if g_sess.id.len > 0 {
+        jw_byte(&w, 44);
+        jw_key(&w, "client_metadata");
+        jw_byte(&w, 123);
+        jw_key(&w, "session_id");
+        jw_str(&w, g_sess.id.ptr as &const byte, g_sess.id.len);
+        jw_byte(&w, 125);
+    }
     jw_byte(&w, 125);
     if jw_overflow(&w) {
         return false;
@@ -854,6 +909,31 @@ fn build_model_request(cfg: &const Config, h: &const History, out: &Buf, style: 
 fn build_headers(cfg: &const Config, out: &Buf) bool {
     if !buf_append_cstr(out, "Content-Type: application/json\r\n") {
         return false;
+    }
+    // 会话身份：网关按它把请求归组到一次会话（`~/ai-gateway` 的 request_logs.session_id）。
+    // 发两个名字，口径与用途各自独立：
+    //   * `x-deepseek-harness-session-id` —— DSH 原样口径（dsh-llm-deepseek 每个请求都带），
+    //     「我们像 DSH 一样报会话」这件事以此为准；
+    //   * `Session-Id` —— ai-gateway 现网**实际读取**的那个（internal/responses/session.go），
+    //     两个都发是为了今天就能被查到，而不是等网关侧也认 harness 头。
+    // 空 id 不发（`--no-save` 等极端兜底）：宁可不报身份，也不发一个空的会话名。
+    // 子代理沿用同一个 g_sess.id（它写的就是同一份会话日志），不另造 id。
+    if g_sess.id.len > 0 {
+        if !buf_append_cstr(out, "x-deepseek-harness-session-id: ") {
+            return false;
+        }
+        if !buf_append(out, g_sess.id.ptr as &const byte, g_sess.id.len) {
+            return false;
+        }
+        if !buf_append_cstr(out, "\r\nSession-Id: ") {
+            return false;
+        }
+        if !buf_append(out, g_sess.id.ptr as &const byte, g_sess.id.len) {
+            return false;
+        }
+        if !buf_append_cstr(out, "\r\n") {
+            return false;
+        }
     }
     // 子代理的请求带一个标记头：便于服务端/日志区分父子（自测也用它判断请求来自谁；
     // 不能靠 prompt 文本判断 —— fork 出来的子代理会继承父的整段历史）
