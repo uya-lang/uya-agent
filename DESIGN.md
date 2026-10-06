@@ -2464,6 +2464,8 @@ responses 用 `{"type":"input_image","detail":"auto","image_url":…}`；
 |---|---|
 | **对话协议是刻意「极简」的** | 历史只带文本与工具调用；不做多模态之外的内容类型 |
 | Responses 下**不回放 reasoning item** | 不发 `include: ["reasoning.encrypted_content"]`，也不发 `prompt_cache_key` / `prompt_cache_retention` |
+| **会话身份照发**（与「不发 prompt_cache_key」是两件事） | 每个请求都带 `x-deepseek-harness-session-id` + `Session-Id` 两个头，正文带 `client_metadata.session_id`（responses）/ `metadata.session_id`（chat）；运行时上下文带 `session workspace: "<JSON 路径>"`。口径对齐 DSH，`~/ai-gateway` 据此按会话归组、取工作区、识别标题行 |
+| **起标题提示词与 DSH 逐字同形** | system 段 `Create a concise title for an AI coding-assistant session …`、user 段 `Generate the session title from this JSON array of human messages:\n<JSON 数组>`，并带同一会话 id（网关照这两个前缀认 `call_kind=title`） |
 | 历史按「外来消息」重放 | 只带文本与工具调用 |
 | 工具 schema **不带 `strict`** | |
 | **不做 404 之外的协议自动探测** | 换协议请显式 `--api=` |
