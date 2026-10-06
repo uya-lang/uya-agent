@@ -2,8 +2,9 @@
 //
 // 本文件：网格与单元格（`EmuCell` / `EmuGrid`、`emu_init` / `emu_free`）、
 //   字节流解释（`emu_feed`：CSI / OSC / SGR / 正文）、网格快照与差分
-//   （`emu_snapshot` / `emu_row_diff` / `emu_row_text`）、JSON 输出
-//   （`emu_json_frame`）、外部对象锚点（`emu_obj_put` / `emu_obj_at`，图片用）。
+//   （`emu_snapshot` / `emu_frame_changed` / `emu_row_diff` / `emu_row_text`）、
+//   JSON 输出（`emu_json_frame`）、外部对象锚点（`emu_obj_put` / `emu_obj_at`，
+//   图片用）。
 // 不变量：① **只解白名单里的序列**（见 `emu_csi_exec`），遇到不认识的 CSI 一律
 //   **整条吃掉并丢弃** —— 绝不把序列字节当正文写进网格（否则屏幕上会出现 `[3m`
 //   这种垃圾），也绝不因为遇到新序列就挂掉；白名单与 `src/term/tui/` 实际发出的
@@ -14,7 +15,12 @@
 //   是一个外部对象的锚点」**，绝不承载字节 —— 字节走 `/api/image` 直传（这是
 //   「图片能不能显示」与「网格增量有多大」两件事解耦的关键，见 DESIGN 的 web 章）；
 //   ④ 差分按「行文本**逐字节**比较」算：同一行长度相同但内容不同（改了一个字）
-//   必须报变化，否则屏幕上就是旧字。
+//   必须报变化，否则屏幕上就是旧字；⑤ 「这一帧变了没有」由
+//   `emu_frame_changed` **在结构上**回答（行文本 + 光标位置 + 光标可见性 + 行数），
+//   调用方（webpump）**不许**拿拼好的 JSON 去找特征字节 —— 那样判据就绑在拼串
+//   格式与手写长度上，错一位就静默翻转（§16 踩坑 106：每帧都被当空帧丢掉，
+//   页面首帧之后再不动）；光标**必须**参与这条判据：在输入行里按 ←/→ 只动光标、
+//   一行文本都不改。
 // 依赖：无 `use` 行（合并命名空间拿 libc 的符号）；本仓 foundation/bufx
 //   （Buf / buf_*）、term/tty（`tty_utf8_decode` / `tty_char_cols` /
 //   `tty_utf8_next` —— 显示宽度的**唯一**真值就在那里，不另写一份）。
@@ -95,6 +101,13 @@ export struct EmuGrid {
     prev: [Buf: EMU_MAX_ROWS],   // 上一帧的行文本（差分用）
     prev_n: usize,
     have_prev: bool,
+    // 上一帧**发出去**的光标（行 / 显示列 / 可见性）。光标也要参与「这一帧空不空」
+    // 的判定：在输入行里左右移动只改光标、不改任何一行的文本，那一帧必须照推，
+    // 否则页面上的光标块不动（老版按字节嗅探空帧，把它连同行变化一起丢掉了 ——
+    // 见 DESIGN §16 踩坑 106）。
+    prev_cy: usize,
+    prev_col: usize,
+    prev_cursor_on: bool,
     st: u8,                 // 解释器状态（CSI/OSC 可能被 TCP 切开，必须跨 feed 保留）
     nparam: usize,
     params: [i32: EMU_MAX_PARAMS],
@@ -133,6 +146,9 @@ export fn emu_init(g: &EmuGrid, cols: usize, rows: usize) bool {
     g.attr = 0;
     g.prev_n = 0;
     g.have_prev = false;
+    g.prev_cy = 0;
+    g.prev_col = 0;
+    g.prev_cursor_on = true;
     g.st = EMU_ST_TEXT;
     g.nparam = 0;
     g.cur = -1;
@@ -828,7 +844,8 @@ export fn emu_obj_at(g: &const EmuGrid, x: usize, y: usize) i32 {
 // 差分
 // ============================================================
 
-// 把当前网格全部收进 prev（发完全量之后调用）。
+// 把当前网格全部收进 prev（发完一帧之后调用）。**光标也收** —— 下一帧的
+// 「变了没有」要连光标一起比（见 `emu_frame_changed`）。
 export fn emu_snapshot(g: &EmuGrid) void {
     var y: usize = 0;
     while y < g.rows {
@@ -837,7 +854,39 @@ export fn emu_snapshot(g: &EmuGrid) void {
         y = y + 1;
     }
     g.prev_n = g.rows;
+    g.prev_cy = g.cy;
+    g.prev_col = emu_cursor_col(g);
+    g.prev_cursor_on = g.cursor_on;
     g.have_prev = true;
+}
+
+// 自上一帧以来**有没有任何东西变**（行文本、光标位置、光标可见性、尺寸）。
+//
+// 为什么光标也必须算「变了」：在输入行里按 ←/→ 只移动光标，**一行文本都不改**
+// （实测：子进程那侧只写 `ESC[18;8H ESC[?25h`，没有一行重画）。老版只看行文本，
+// 于是这一帧被当空帧丢掉 —— 页面上的光标块不动，看着就像「卡住了」。
+// 尺寸变了也算（行数/列数变了要整屏重画）。
+//
+// `scratch` 是调用方借出的临时缓冲（逐行比文本用）；与 `emu_json_frame` 复用同一
+// 个缓冲是安全的 —— 两次调用是先后关系，不是嵌套。
+export fn emu_frame_changed(g: &const EmuGrid, scratch: &Buf) bool {
+    if !g.have_prev || g.prev_n != g.rows {
+        return true;
+    }
+    if g.cy != g.prev_cy || g.cursor_on != g.prev_cursor_on {
+        return true;
+    }
+    if emu_cursor_col(g) != g.prev_col {
+        return true;
+    }
+    var y: usize = 0;
+    while y < g.rows {
+        if emu_row_diff(g, y, scratch) {
+            return true;
+        }
+        y = y + 1;
+    }
+    return false;
 }
 
 // 第 y 行与上一帧是否不同（**逐字节**比；还没比过上一帧时全部算变化）。

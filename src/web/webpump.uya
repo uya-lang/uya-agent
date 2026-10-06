@@ -4,21 +4,27 @@
 //   （`web_loop` / `web_poll_once`）、以及具体动作 —— 收连接
 //   （`web_accept_conn`）、PTY 读槽就绪（`web_pty_ready`：读 `web_read_pty` /
 //   收口 `web_pty_eof` + `web_reap_child`）、写 PTY
-//   （`web_write_pty`）、服务连接（`web_service_conn`）、推帧（`web_push_frame`）。
+//   （`web_write_pty`）、服务连接（`web_service_conn`）、推帧
+//   （`web_push_session` / `web_push_frame`）。
 // 不变量：① **一次 `poll` 覆盖五类 fd**：listen、每个会话 master 的读、每个
 //   会话 master 的写（有待发输入时）、每个连接的读/写。会话 ≤8、连接 ≤32，定长
 //   数组就够（`WEB_POLL_MAX`）；② 读 PTY **一次最多 16 KiB**，读完立刻喂解释器，
 //   再在**同一圈**推帧 —— 分两圈会让「按键 → 屏幕变化」多一个 50ms；③ 写 PTY 与
 //   写连接都是**非阻塞**的：写不完就把余量留在缓冲里，下一圈 `POLLOUT` 接着写
-//   （阻塞写会让整个 agent 冻住，而它在同一个进程里）；④ `web_push_frame` 只在
-//   差分非空时发 —— 空帧一个字节都不发（否则 20 帧/秒的空转流量）；⑤ 子进程死了
+//   （阻塞写会让整个 agent 冻住，而它在同一个进程里）；④ 空帧一个字节都不发
+//   （否则 20 帧/秒的空转流量），而「空不空」由**结构判据** `emu_frame_changed`
+//   回答（行文本 + 光标位置 + 光标可见性 + 行数），**不许**拿拼好的 JSON 去找特征
+//   字节 —— 老版在那里把字面量长度写错一位，判据恒为真、首帧之后一帧都不推
+//   （§16 踩坑 106）；⑤ 子进程死了
 //   就把那条会话标 `alive=false` 但**留着标签** —— 屏幕上是最后一帧，用户还能看见
 //   它说了什么（自动删标签会让「刚才那条怎么没了」无从解释）；判死的依据是
 //   **`poll` 的 `POLLHUP`/`POLLERR`**，不是 `read` 的返回值（子进程死后 master 上
 //   的 `read` 给的是 EIO 而不是 0，只认 0 会收不掉 ⇒ 水平触发的 HUP 让主循环空转、
 //   页面上表现为打不进字 —— §16 踩坑 105）；收口时必须**关 master**（否则它永远
 //   留在 poll 集合里「就绪」）并回收子进程（否则留 `<defunct>` 僵尸）；
-//   ⑥ 退出走 `web_quit_wanted()`（ctrl+c → sigx 置位），收尾时按进程组收所有子进程。
+//   ⑥ 退出走 `web_quit_wanted()`（ctrl+c → sigx 置位），收尾时按进程组收所有子进程；
+//   ⑦ 差分基准在**会话**上：`web_push_session` 先算一次「变了没有」、发给每个订阅者、
+//   最后才 `emu_snapshot`（先快照会让同一会话的第二条连接永远收不到帧）。
 // 依赖：无 `use` 行（合并命名空间）；本仓 net/httpsrv（`srv_*`）、web/ttyemu
 //   （`emu_*`）、web/websrv（会话表）、web/webhttp（连接与端点）、session/sigx
 //   （`sigx_*`）、agent（`Config` / `agent_default_home`）。
@@ -505,49 +511,88 @@ fn web_conn_close(c: &WebConn, used: &bool, ci: usize) void {
     }
 }
 
-// 给所有订阅了会话的连接推一帧。**差分为空就一个字节都不发**（空帧流量没有
+// 给所有订阅了会话的连接推帧。**差分为空就一个字节都不发**（空帧流量没有
 // 意义，而 `/api/screen` 是 50ms 一圈的长连接）。
 fn web_push_all(t: &WebTable, conns: &WebConn, used: &bool) void {
     var i: usize = 0;
     while i < WEB_MAX_SESSIONS {
-        const si: usize = i;
-        if si < t.n {
-            var j: usize = 0;
-            while j < WEB_MAX_CONNS {
-                if used[j] && conns[j].st == WEB_CONN_STREAM {
-                    if conns[j].sess == si as isize {
-                        web_push_frame(&t.items[si], &conns[j]);
-                    }
-                }
-                j = j + 1;
-            }
+        if i < t.n && web_has_subscriber(conns, used, i as isize) {
+            web_push_session(&t.items[i], conns, used, i as isize);
         }
         i = i + 1;
     }
 }
 
-// 给一个连接推一帧（差分）。首次推发全量，之后只发变化的行；`emos_snapshot`
-// 在发完之后更新「上一帧」。
-fn web_push_frame(s: &WebSession, c: &WebConn) void {
+// 有没有连接订阅了这条会话。没有就别算差分 —— 一次比较是 30 行 × 行宽，
+// 空转的会话（8 条都开着而只看着一条）不该每 50ms 白做一遍。
+fn web_has_subscriber(conns: &WebConn, used: &bool, si: isize) bool {
+    var j: usize = 0;
+    while j < WEB_MAX_CONNS {
+        if used[j] && conns[j].st == WEB_CONN_STREAM && conns[j].sess == si {
+            return true;
+        }
+        j = j + 1;
+    }
+    return false;
+}
+
+// 一条会话这一轮的帧：**先算一次「变了没有」，再发给它的每个订阅者**。
+//
+// 顺序是硬要求：差分基准与 `emu_snapshot` 都在**会话**上（`s.emu.prev`），
+// 所以「变了没有」必须在任何连接拿到帧**之前**算好、`emu_snapshot` 必须等
+// 所有订阅者都发完再调。老版把这两件事都放在「给一个连接推一帧」里 ⇒ 第一个
+// 订阅者推完就推进了 prev ⇒ 同一会话的第二个订阅者永远算成「没变」、一个字节
+// 都收不到（同一个会话开两个页面时只有一个会刷新）。
+fn web_push_session(s: &WebSession, conns: &WebConn, used: &bool,
+    si: isize) void {
+    const changed: bool = emu_frame_changed(&s.emu, &s.scratch);
+    var sent: bool = false;
+    var j: usize = 0;
+    while j < WEB_MAX_CONNS {
+        if used[j] && conns[j].st == WEB_CONN_STREAM && conns[j].sess == si {
+            if web_push_frame(s, &conns[j], changed) {
+                sent = true;
+            }
+        }
+        j = j + 1;
+    }
+    if !sent {
+        return;
+    }
+    // 发完才推进「上一帧」：一轮之内所有订阅者看到的必须是同一个网格快照。
+    emu_snapshot(&s.emu);
+}
+
+// 把一条会话当前这一帧推给**一个**连接。返回「真的排进了队列」。
+//
+// **空帧的判据是网格里「有没有东西变」（`changed`，由调用方在本轮开头算好），
+// 不是把拼好的 JSON 拿来找字节**：老版拿 `srv_find` 去帧里找 `"rows_changed":[]`
+// （还把长度写成了 16 而那个字面量是 17 字节 —— 于是这个判据恒为真），结果
+// **每一帧都被当空帧丢掉**：首帧之后页面再也不刷新（见 DESIGN §16 踩坑 106）。
+//
+// `c.need_full`：这条连接还没拿到过全量帧（刚 `/api/screen` 建起来）。它必须先
+// 收一帧全量才能拼出屏幕 —— 只给它差分的话，没变过的那些行永远补不上（实测：
+// 刷新页面后屏幕只有零星几行）。发了全量就清掉这个标记，之后走差分。
+fn web_push_frame(s: &WebSession, c: &WebConn, changed: bool) bool {
+    const full: bool = !s.emu.have_prev || c.need_full;
+    if !full && !changed {
+        return false;
+    }
     var frame: Buf = buf_new(0);
     defer { buf_free(&frame); }
-    const full: bool = !s.emu.have_prev;
     const n: usize = emu_json_frame(&s.emu, s.id.ptr as &const byte, s.id.len,
         full, &s.scratch, &frame);
     if n == 0 {
-        return;
-    }
-    // 空帧（没有变化的行）只在首次发；之后真有变化才发。
-    if !full && emu_frame_is_empty(&frame) {
-        return;
+        return false;
     }
     if !web_conn_queue(c, frame.ptr as &const byte, frame.len) {
-        return;
+        return false;
     }
-    emu_snapshot(&s.emu);
+    c.need_full = false;
     web_queue_replay_save(s, &frame);
     // 立刻尽力写一次：小帧（几百字节）通常一次就写完，不必等下一圈 poll。
     web_flush_conn(c);
+    return true;
 }
 
 // 把这一帧存进会话的「最近几帧」环形（新连接回放用）。**只在真的收到过
@@ -575,16 +620,6 @@ fn web_queue_replay_save(s: &WebSession, frame: &const Buf) void {
     if s.replay_n < WEB_REPLAY_FRAMES {
         s.replay_n = s.replay_n + 1;
     }
-}
-
-// 这一帧是不是「什么都没变」（只有信封，`rows_changed` 与 `images` 都空）。
-// 判据是**字节**：`emu_json_frame` 里两个数组都空时，输出里必然是 `[]],[` 相邻 ——
-// 与其再解析一遍 JSON，不如直接找那个固定片段（帧是我们自己拼的，格式固定）。
-fn emu_frame_is_empty(frame: &const Buf) bool {
-    return srv_find(frame.ptr as &const byte, 0, frame.len,
-        "],\"images\":[]}" as &const byte, 14) >= 0
-        && srv_find(frame.ptr as &const byte, 0, frame.len,
-            "\"rows_changed\":[]" as &const byte, 16) >= 0;
 }
 
 // 退出请求：ctrl+c / SIGTERM 由 `sigx_install_web` 装的处理器置位。
