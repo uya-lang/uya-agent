@@ -22,7 +22,9 @@
 * **DSH 对齐**：直接读 `~/.dsh`（零参数启动即可跑通真机网关）；工具用 DSH 原名；文件观察策略
   （read-before-write / 版本守卫）；system prompt 分节装配；能直接读 DSH 自己的会话（含 zstd）。
 * **界面**：纯 Uya 写的全屏 TUI（常驻状态区 + 思考实时行 + 统计行/`ctx`/`cpu`/`内存` + 任务块 +
-  `/diff` 浮窗 + markdown 渲染 + 浮层全屏 + 终端标题）；滚动模式（`--no-tui`）退回纯文本转录。
+  `/diff` 浮窗 + markdown 渲染 + 浮层全屏 + 终端标题）；滚动模式（`--no-tui`）退回纯文本转录；
+  **web 界面**（`--web`）—— 顶栏列会话标题、标题下就是该会话的**真 TTY**、最右边 `+` 新建会话，
+  页面零外部依赖（不引 xterm.js、不走 CDN，终端解释器在服务端，见 §1.3）。
 * **能力**：会话落盘可恢复（`--continue` / `--resume` / `/sessions` —— 列表只列**有标题的**会话，
   无标题的仍可 `--resume <id>` 直达）；上下文管理（剪枝 +
   自动压缩）；技能发现 + `skill`；`web_search`；子代理一族（含 `ralph` 与 `/watch` 实时跟随）；
@@ -144,6 +146,7 @@ readelf -lW build/uya-agent | grep -c INTERP    # 0 = 真静态
 | `--debug-dump FILE` | 诊断的**原始字节**（网关错误体 / 坏 payload 头部等）追加落盘；默认关：转录里只有转义预览，全文仍进会话日志 `diag/dump` |
 | `--tui` / `--no-tui` | 全屏 TUI（**TTY 交互模式默认**）/ 退回滚动转录；`UYA_AGENT_TUI=0\|1` 同口径 |
 | `--tui-demo [WxH]` | 打印 TUI 若干屏的纯文本快照后退出（诊断 + 文档；也是 markdown 排版与浮层全屏的自测基准） |
+| `--web [ADDR]` | **web 界面**：起一个本地 HTTP 服务，浏览器里用（默认 `127.0.0.1:8787`；`127.0.0.1:0` = 内核分配端口；`UYA_AGENT_WEB=1` / `UYA_AGENT_WEB_ADDR` 同口径）。每个会话是一个**真 PTY 上的 agent 子进程**，跑的就是全屏 TUI；见 §1.3 |
 | `--title` / `--no-title` | 交互模式把**终端标题**写成当前会话标题（**默认开**） |
 | `--title-auto` / `--no-title-auto` | 每个新的人类消息之后让**模型起标题**（**默认开**；每次多发一个小请求） |
 | `--mouse` / `--no-mouse` | TUI 的**鼠标上报**开关（**默认开**，滚轮要靠它）。`--no-mouse` 让终端重新接管拖选 ⇒ **能选中文字复制**（同时失去滚轮翻转录，改用 `ctrl+↑/↓` 或 `pgup/pgdn`）；运行中还有 `F2` 与 `/mouse on\|off` |
@@ -161,7 +164,34 @@ readelf -lW build/uya-agent | grep -c INTERP    # 0 = 真静态
 `/sessions` `/resume <id>` `/new` `/continue` `/diff` `/title [新标题]` `/image [路径]`
 `/paste` `/fullscreen [on|off]` `/mouse on|off` `/exit`（`/quit` 同义）。
 
-### 1.3 环境变量
+### 1.3 web 界面（`--web`）
+
+```bash
+uya-agent --web                    # http://127.0.0.1:8787/
+uya-agent --web 127.0.0.1:9000     # 指定端口（端口写 0 = 内核分配，启动时打印真实端口）
+```
+
+页面上：
+
+* **顶栏**：一条会话一个标签，标签上是**会话标题**（模型 `set_title` / `/title` 起的 →
+  兜底用首条人类消息的前 5 个词 → 再兜底「会话 N」）；标题栏**最右边是 `+`**，点它新建会话。
+* **标题下面是该会话的终端**：那就是**真 TTY** —— 键盘、`tab` 切计划、`/status` 浮层、
+  `esc` 打断、`↑/↓` 历史都与在终端里跑一模一样（因为服务端跑的就是同一个全屏 TUI，
+  只是外面套了一层 PTY）。
+* 标签上的 `x` 结束该条会话；最多同时 8 条。
+
+**已知限制**（都写进 §7）：
+
+* **没有任何认证**，默认只绑 `127.0.0.1`。用 `0.0.0.0:PORT` 是**显式**决定，启动时会打警告。
+* **没有 HTTPS**（本地单用户够用）。
+* 终端解释器是**白名单**实现（只解这个 TUI 实际会发的那些序列），所以它是"够用"的而不是
+  通用终端：在里面跑一个需要滚屏区/字符集切换的全屏程序不会正确显示 —— 但 `uya-agent`
+  自己的 TUI 与它的 `bash` 工具不受影响。
+* 图片附件（`/image`）会显示在正文里；**粘贴剪贴板**（`ctrl+v` / `/paste`）请回终端用。
+
+---
+
+### 1.4 环境变量
 
 `UYA_AGENT_BASE_URL`、`UYA_AGENT_MODEL`、`UYA_AGENT_WORKSPACE`、
 `UYA_AGENT_MAX_STEPS`（步数熔断上限，`0` = 不限，也是默认值；非法值告警后按「不限」处理）、
@@ -219,6 +249,7 @@ make selftest              # 全量：清缓存重编 + link-audit + codegen-aud
 make tui-selftest          # 分域快速轮：只跑 TUI
 make sess-selftest         # 只跑 /sessions 与大日志
 make diff-selftest         # 只跑 src/diff/
+make web-selftest          # 只跑 web 界面（服务端终端解释器 / HTTP 侧 / 页面 / 分派语义）
 make pm-selftest           # 只跑 src/pm/（项目记忆）
 make UYA_SELFTEST_ONLY=x,y # 只跑指定的几轮
 ```
@@ -308,6 +339,21 @@ DEEPSEEK_API_KEY=sk-xxx ./build/uya-agent \
 按主题列出「做不到 / 故意不做 / 边界在哪」。
 
 **会话与界面**
+
+* **web 界面（`--web`）没有任何认证，也没有 HTTPS**：默认只绑 `127.0.0.1`；
+  `--web 0.0.0.0:PORT` 是**显式**决定（启动时会打一行警告）。同一个用户在自己机器上用，
+  不做多用户/权限隔离。
+* **web 的终端解释器是白名单实现**：只解 `uya-agent` 自己的 TUI 实际会发的那些序列
+  （光标定位 / 清屏 / 清行 / SGR / 备用屏幕 / 鼠标上报 / 括起粘贴 / 终端标题）。
+  所以它是"够用"而不是"通用终端"——在里面跑一个需要**滚屏区、字符集切换、sixel/kitty
+  图形协议**的全屏程序不会正确显示。`uya-agent` 自己的 TUI 与它的 `bash` 工具不受影响
+  （后者本来就没有终端）。**为什么不引 xterm.js**：它要么走 CDN（而自测是离线的），
+  要么把几十万行压缩 JS vendored 进仓 —— 与「只用 Uya 源码实现」冲突；而且解释器放在
+  服务端才能吃到本仓最贵的那条判据（见 DESIGN §11.8.2）。
+* **web 端不做剪贴板粘贴**（`ctrl+v` / `/paste`）：那是纯 Uya 的 X11 客户端，只在服务端
+  有 X 连接时才有意义，请回终端用。图片附件（`/image`）会正常显示在正文里。
+* **web 最多同时 8 条会话**（`WEB_MAX_SESSIONS`），每条一个子进程 + 一块终端网格
+  （约 2.3 MiB）。
 
 * **换会话只换「当前会话的」那段屏幕**：TUI 里 `/new`、`/resume <id>` 会把转录清成
   「只剩新会话」（`/resume` 再把历史回放一遍），但滚动模式（`--no-tui`）不重画 —— 那边的正文是

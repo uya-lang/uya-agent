@@ -1,0 +1,620 @@
+// src/web/webhttp.uya — web 界面的 HTTP 端点：分派、JSON 响应、图片直传
+//
+// 本文件：连接级状态机（`WebConn` / `web_conn_init` / `web_conn_free`）、端点
+//   分派（`web_handle`）、各端点实现（`web_ep_index` / `web_ep_sessions` /
+//   `web_ep_session_new` / `web_ep_screen` / `web_ep_input` / `web_ep_resize` /
+//   `web_ep_close` / `web_ep_image`）、响应辅助（`web_send_json` /
+//   `web_send_error`）。
+// 不变量：① **`/api/screen` 是唯一的长连接**，它只发不收；其余端点都是
+//   「收全请求 → 一个完整响应 → 关连接」（`srv_send_response` 自带
+//   `Connection: close`）。所以一个连接最多经历一个「长」阶段，状态机只有三态；
+//   ⚠ `web_handle` 的返回值语义是**「要不要留着这个连接」**（true 只给
+//   `/api/screen`），**不是**「响应写成功没有」—— 第一版把端点函数的返回值
+//   （其实是 `srv_send_response` 的「写成功」）直接当成了它，于是每个 JSON 端点
+//   都「留着连接」：下一圈 poll 又就绪、`c.rx` 里还留着同一份请求原文 ⇒
+//   **端点被执行两次**（实测：一次 `POST /api/sessions` 建出两条会话）。
+//   ② 端点先查表（`web_find`）再干活，**未知会话一律 404**，绝不把请求串当路径
+//   或 id 用（本文件是唯一碰 URL 的地方）；③ 图片 id 必须**只由十六进制字符组成
+//   且长度 1–64**，再拼 `<agent_home>/attachments/<id>.<ext>` —— 这是**路径穿越**
+//   的唯一入口，所以校验在拼路径**之前**，不认识的后缀（MIME）直接 404；
+//   ④ 图片字节**原样直传**（`imgx_load` 读文件 → `srv_send_response` 发出去），
+//   **不重编码、不缩放** —— 纯 Uya 没有 zlib/JPEG 编解码（imgx 文件头的硬约束），
+//   所以「浏览器自己解码」是唯一可行的路；⑤ 每响应必带 `Content-Type`：错误也
+//   必须带，否则浏览器把错误当文本、前端的 `res.json()` 会抛在解析上（那才是
+//   最难查的一种）；⑥ 长连接的帧**不在这里拼** —— 那是 `web_push_frame` 的事
+//   （它要 poll 到 POLLOUT 才吐，不能在这个函数里阻塞）。
+// 依赖：无 `use` 行（合并命名空间）；本仓 foundation/bufx、net/httpsrv（`srv_*`）、
+//   web/ttyemu（`emu_json_str` / `emu_json_frame`）、web/websrv（会话表）、
+//   web/webui（页面 HTML）、media/imgx（`imgx_sniff` / `imgx_load` / `imgx_ext`）、
+//   agent（`Config` / `agent_default_home`）。
+// 命名：`web_*`（端点与响应）、`WEB_*`（常量）、`WebConn`。
+//
+// 端点表（前端只认这几个）：
+//   GET  /                 页面（HTML，全内嵌，零外链）
+//   GET  /api/sessions     会话列表（顶栏的标签）
+//   POST /api/sessions     新建会话（顶栏最右边的 `+`）
+//   GET  /api/screen?id=   一帧一行的 NDJSON 长连接
+//   POST /api/input?id=    请求体 = 原文按键字节
+//   POST /api/resize?id=&cols=&rows=
+//   POST /api/close?id=    结束一条会话（收子进程 + 从表里摘掉）
+//   GET  /api/image?id=    附件图片直传（<agent_home>/attachments/<id>.<ext>）
+
+// ============================================================
+// 连接
+// ============================================================
+
+export const WEB_CONN_READ: u8 = 0;      // 正在收请求
+export const WEB_CONN_STREAM: u8 = 1;    // `/api/screen` 长连接，正在推帧
+export const WEB_CONN_DONE: u8 = 2;      // 已响应，等收尾
+
+export struct WebConn {
+    fd: i32,
+    st: u8,
+    rx: Buf,            // 请求原文累积
+    sid: Buf,           // 长连接订阅的会话 id
+    sess: isize,        // 会话下标（-1 = 没了）
+    out: Buf,           // 待写出去的字节；poll 到 POLLOUT 才吐（不阻塞主循环）
+    out_off: usize,
+    replay_i: usize,    // 新连接先补的「最近几帧」游标
+    replay_n: usize,
+}
+
+// 建一个连接（fd 由调用方持有，这里只借用）。失败返回 false。
+export fn web_conn_init(c: &WebConn, fd: i32) bool {
+    c.fd = fd;
+    c.st = WEB_CONN_READ;
+    c.rx = buf_new(4096);
+    c.sid = buf_new(64);
+    // out 给**非零容量**：`buf_valid()` 的判据是 `ptr != null && cap > 0`，
+    // 而 `buf_new(0)` 只返回一个空描述符（cap = 0）⇒ buf_valid 为假 ⇒ 这里
+    // 会把每一个新连接都判成「初始化失败」当场关掉。症状极具误导性：
+    // **accept 成功、然后一个字节都不读、连接被 RST**（实测 strace 里只有
+    // accept(5)=7，后面没有任何 read）。同族坑见 §16 踩坑 92。
+    c.out = buf_new(4096);
+    c.out_off = 0;
+    c.sess = -1;
+    c.replay_i = 0;
+    c.replay_n = 0;
+    return buf_valid(&c.rx) && buf_valid(&c.sid) && buf_valid(&c.out);
+}
+
+// 释放连接（**幂等**）。**不**关 fd —— fd 由调用方管。
+export fn web_conn_free(c: &WebConn) void {
+    buf_free(&c.rx);
+    buf_free(&c.sid);
+    buf_free(&c.out);
+    c.sess = -1;
+    c.out_off = 0;
+    c.replay_i = 0;
+    c.replay_n = 0;
+    c.st = WEB_CONN_DONE;
+}
+
+// 连接还有没有待写的字节（主循环据此决定要不要 poll POLLOUT）。
+export fn web_conn_pending(c: &const WebConn) bool {
+    return c.out_off < c.out.len;
+}
+
+// 把一段字节排进连接的待写队列（**追加**；`out_off == out.len` 时顺便重置，
+// 免得这条 Buf 只增不减）。
+export fn web_conn_queue(c: &WebConn, p: &const byte, n: usize) bool {
+    if c.out_off >= c.out.len {
+        buf_reset(&c.out);
+        c.out_off = 0;
+    }
+    return buf_append(&c.out, p, n);
+}
+
+// ============================================================
+// 响应辅助
+// ============================================================
+
+// 发一个 JSON 响应体（`Buf` 原文）。
+export fn web_send_json(fd: i32, body: &const Buf) bool {
+    return srv_send_response(fd, SRV_ST_200, SRV_CT_JSON,
+        body.ptr as &const byte, body.len);
+}
+
+// 发一个错误响应：**带 JSON 体**（前端统一 `{error:"…"}`，只需要一条错误分支）。
+export fn web_send_error(fd: i32, status: &const byte, msg: &const byte) bool {
+    var b: Buf = buf_new(256);
+    defer { buf_free(&b); }
+    if !buf_valid(&b) {
+        return false;
+    }
+    _ = buf_append_cstr(&b, "{\"error\":");
+    emu_json_str(&b, msg, bufx_cstr_len(msg));
+    _ = buf_append_cstr(&b, "}");
+    return srv_send_response(fd, status, SRV_CT_JSON,
+        b.ptr as &const byte, b.len);
+}
+
+// ============================================================
+// 端点分派
+// ============================================================
+
+// 处理一个**已经收全**的请求。返回 true = 长连接（调用方**不要**关 fd，把它
+// 转成 `WEB_CONN_STREAM` 继续推帧）；false = 已经响应完（调用方关 fd + 释放）。
+//
+// `id` / `q` 是调用方复用的空缓冲（进来时已 `buf_reset`）。
+export fn web_handle(cfg: &const Config, t: &WebTable, c: &WebConn,
+    m: u8, url_off: usize, url_len: usize, body_off: usize,
+    id: &Buf, q: &Buf) bool {
+    var path_len: usize = 0;
+    var q_off: usize = 0;
+    var q_len: usize = 0;
+    srv_url_split(c.rx.ptr as &const byte, url_off, url_len, &path_len,
+        &q_off, &q_len);
+    const url: &const byte = c.rx.ptr as &const byte;
+    if srv_path_is(url, url_off, path_len, "/" as &const byte)
+        || srv_path_is(url, url_off, path_len, "/index.html" as &const byte) {
+        if m != SRV_M_GET {
+            return web_send_error(c.fd, SRV_ST_405, "method not allowed");
+        }
+        _ = web_ep_index(c);
+        return false;
+    }
+    if srv_path_is(url, url_off, path_len, "/api/sessions" as &const byte) {
+        if m == SRV_M_GET {
+            _ = web_ep_sessions(cfg, c, t);
+            return false;
+        }
+        if m == SRV_M_POST {
+            _ = web_ep_session_new(cfg, c, t);
+            return false;
+        }
+        _ = web_send_error(c.fd, SRV_ST_405, "method not allowed");
+        return false;
+    }
+    if srv_path_is(url, url_off, path_len, "/api/screen" as &const byte) {
+        if m != SRV_M_GET {
+            _ = web_send_error(c.fd, SRV_ST_405, "method not allowed");
+            return false;
+        }
+        // 只有这一个端点是长连接
+        return web_ep_screen(c, t, url, url_off, q_off, q_len, id);
+    }
+    if srv_path_is(url, url_off, path_len, "/api/input" as &const byte) {
+        if m != SRV_M_POST {
+            _ = web_send_error(c.fd, SRV_ST_405, "method not allowed");
+            return false;
+        }
+        _ = web_ep_input(c, t, body_off, url, url_off, q_off, q_len, id);
+        return false;
+    }
+    if srv_path_is(url, url_off, path_len, "/api/resize" as &const byte) {
+        if m != SRV_M_POST {
+            _ = web_send_error(c.fd, SRV_ST_405, "method not allowed");
+            return false;
+        }
+        _ = web_ep_resize(c, t, url, url_off, q_off, q_len, id);
+        return false;
+    }
+    if srv_path_is(url, url_off, path_len, "/api/close" as &const byte) {
+        if m != SRV_M_POST {
+            _ = web_send_error(c.fd, SRV_ST_405, "method not allowed");
+            return false;
+        }
+        _ = web_ep_close(c, t, url, url_off, q_off, q_len, id);
+        return false;
+    }
+    if srv_path_is(url, url_off, path_len, "/api/image" as &const byte) {
+        if m != SRV_M_GET {
+            _ = web_send_error(c.fd, SRV_ST_405, "method not allowed");
+            return false;
+        }
+        _ = web_ep_image(cfg, c, url, url_off, q_off, q_len, id);
+        return false;
+    }
+    _ = q;
+    _ = web_send_error(c.fd, SRV_ST_404, "not found");
+    return false;
+}
+
+// 取 query 里的 `id`（没有就返回 false）。**所有带 id 的端点共用它** ——
+// 只有一处解析，就没有「某条路忘了校验」的可能。
+fn web_q_id(url: &const byte, url_off: usize, q_off: usize,
+    q_len: usize, id: &Buf) bool {
+    buf_reset(id);
+    if !srv_query_get(url, url_off, q_off, q_len, "id" as &const byte, id) {
+        return false;
+    }
+    return id.len > 0;
+}
+
+// ============================================================
+// 各端点
+// ============================================================
+
+// GET / —— 单页（HTML 全内嵌，零外链；见 web/webui.uya）。
+fn web_ep_index(c: &WebConn) bool {
+    var html: Buf = buf_new(8192);
+    defer { buf_free(&html); }
+    if !buf_valid(&html) {
+        return web_send_error(c.fd, SRV_ST_400, "out of memory");
+    }
+    web_index_html(&html);
+    return srv_send_response(c.fd, SRV_ST_200, SRV_CT_HTML,
+        html.ptr as &const byte, html.len);
+}
+
+// GET /api/sessions —— 顶栏的标签。每条给 id / 标题 / 工作区 / 是否活着 /
+// 是不是当前选中的那条。
+fn web_ep_sessions(cfg: &const Config, c: &WebConn, t: &WebTable) bool {
+    var b: Buf = buf_new(4096);
+    defer { buf_free(&b); }
+    if !buf_valid(&b) {
+        return web_send_error(c.fd, SRV_ST_400, "out of memory");
+    }
+    _ = buf_append_cstr(&b, "{\"sessions\":[");
+    var i: usize = 0;
+    while i < t.n && i < WEB_MAX_SESSIONS {
+        const s: &const WebSession = &t.items[i];
+        if i > 0 {
+            _ = buf_append_byte(&b, 44);
+        }
+        _ = buf_append_cstr(&b, "{\"id\":");
+        emu_json_str(&b, s.id.ptr as &const byte, s.id.len);
+        _ = buf_append_cstr(&b, ",\"alive\":");
+        if s.alive {
+            _ = buf_append_cstr(&b, "true");
+        } else {
+            _ = buf_append_cstr(&b, "false");
+        }
+        _ = buf_append_cstr(&b, ",\"cols\":");
+        _ = buf_append_u64(&b, s.cols as u64);
+        _ = buf_append_cstr(&b, ",\"rows\":");
+        _ = buf_append_u64(&b, s.rows as u64);
+        // 标题：优先用会话日志索引里那条 `title`（模型/人手起的），没有就用
+        // 服务端从日志尾部派生的兜底（首条人类消息），再没有就空串 ——
+        // 前端对空标题显示「会话 N」。
+        var title: Buf = buf_new(256);
+        defer { buf_free(&title); }
+        web_session_title(cfg, s, &title);
+        _ = buf_append_cstr(&b, ",\"title\":");
+        emu_json_str(&b, title.ptr as &const byte, title.len);
+        _ = buf_append_cstr(&b, ",\"current\":");
+        if i == t.cur {
+            _ = buf_append_cstr(&b, "true");
+        } else {
+            _ = buf_append_cstr(&b, "false");
+        }
+        _ = buf_append_byte(&b, 125);        // '}'
+        i = i + 1;
+    }
+    _ = buf_append_cstr(&b, "],\"max\":");
+    _ = buf_append_u64(&b, WEB_MAX_SESSIONS as u64);
+    _ = buf_append_byte(&b, 125);
+    return web_send_json(c.fd, &b);
+}
+
+// POST /api/sessions —— `+` 新建。用**请求体里给的尺寸**（前端把当前终端格子
+// 报上来）或默认画布。
+fn web_ep_session_new(cfg: &const Config, c: &WebConn, t: &WebTable) bool {
+    if t.n >= WEB_MAX_SESSIONS {
+        return web_send_error(c.fd, SRV_ST_400, "too many sessions");
+    }
+    const empty: Buf = buf_empty();
+    const idx: isize = web_session_new(cfg, t, &empty, EMU_DEF_COLS,
+        EMU_DEF_ROWS);
+    if idx < 0 {
+        return web_send_error(c.fd, SRV_ST_400, "cannot start session");
+    }
+    var b: Buf = buf_new(128);
+    defer { buf_free(&b); }
+    _ = buf_append_cstr(&b, "{\"id\":");
+    _ = buf_append_cstr(&b, "\"");
+    _ = buf_append(&b, web_id_of(t, idx as usize),
+        web_id_len_of(t, idx as usize));
+    _ = buf_append_cstr(&b, "\"}");
+    return web_send_json(c.fd, &b);
+}
+
+// GET /api/screen?id= —— 长连接。先发响应头（chunked），把「最近几帧」的回放
+// 排进队列，然后返回 true 让主循环接管推帧。
+fn web_ep_screen(c: &WebConn, t: &WebTable, url: &const byte, url_off: usize,
+    q_off: usize, q_len: usize, id: &Buf) bool {
+    if !web_q_id(url, url_off, q_off, q_len, id) {
+        return web_send_error(c.fd, SRV_ST_400, "missing id");
+    }
+    const si: isize = web_find(t, id.ptr as &const byte, id.len);
+    if si < 0 || si >= WEB_MAX_SESSIONS as isize {
+        return web_send_error(c.fd, SRV_ST_404, "unknown session");
+    }
+    if !srv_send_head(c.fd, SRV_ST_200, SRV_CT_NDJSON,
+        "" as &const byte, 0) {
+        return false;
+    }
+    c.st = WEB_CONN_STREAM;
+    c.sess = si;
+    buf_reset(&c.sid);
+    _ = buf_append(&c.sid, id.ptr, id.len);
+    // 回放最近几帧：页面刷新之后不至于空白（没有回放时前端会等到下一帧）。
+    // 下标显式夹取：数组边界证明器只认「正的 if 里做索引」（§16 踩坑 6）。
+    const ui: usize = si as usize;
+    if ui >= WEB_MAX_SESSIONS {
+        return true;
+    }
+    const s: &const WebSession = &t.items[ui];
+    c.replay_i = 0;
+    c.replay_n = s.replay_n;
+    web_queue_replay(c, s);
+    return true;
+}
+
+// 把会话的「最近几帧」按时间顺序排进连接队列。
+fn web_queue_replay(c: &WebConn, s: &const WebSession) void {
+    var k: usize = 0;
+    while k < s.replay_n && k < WEB_REPLAY_FRAMES {
+        const at: usize = (s.replay_at + WEB_REPLAY_FRAMES - s.replay_n + k)
+            % WEB_REPLAY_FRAMES;
+        if at < WEB_REPLAY_FRAMES {
+            const f: &const Buf = &s.replay[at];
+            if f.len > 0 {
+                _ = web_conn_queue(c, f.ptr as &const byte, f.len);
+            }
+        }
+        k = k + 1;
+    }
+}
+
+// POST /api/input?id= —— 请求体就是按键字节，原样进待写队列（下一次 POLLOUT
+// 吐给 PTY master）。子进程的 TUI 自己解键，服务端**不解释按键** —— 这是
+// 「web 端就是真 TTY」那条承诺的落点：服务端不当翻译层。
+fn web_ep_input(c: &WebConn, t: &WebTable, body_off: usize,
+    url: &const byte, url_off: usize, q_off: usize, q_len: usize,
+    id: &Buf) bool {
+    if !web_q_id(url, url_off, q_off, q_len, id) {
+        return web_send_error(c.fd, SRV_ST_400, "missing id");
+    }
+    const si: isize = web_find(t, id.ptr as &const byte, id.len);
+    if si < 0 || si >= WEB_MAX_SESSIONS as isize {
+        return web_send_error(c.fd, SRV_ST_404, "unknown session");
+    }
+    const s: &WebSession = &t.items[si as usize];
+    if body_off < c.rx.len {
+        _ = buf_append(&s.pending, c.rx.ptr + body_off, c.rx.len - body_off);
+    }
+    return web_send_ok(c.fd);
+}
+
+// POST /api/resize?id=&cols=&rows= —— 改画布：服务端网格 + PTY 窗口 + SIGWINCH。
+// 三件都要做，少一件屏幕上就不对：
+//   * 只改服务端网格 → 子进程还按旧尺寸排版，右边一片空白；
+//   * 只改 PTY 尺寸 → 重新解释全部字节也没用，网格装不下（超出被丢）；
+//   * 不发 SIGWINCH → TUI 的尺寸来自 TIOCGWINSZ 的**首次**读取，之后靠信号，
+//     不发的后果是「界面还是旧尺寸」（自测 tui-pty 轮钉的就是这条）。
+fn web_ep_resize(c: &WebConn, t: &WebTable, url: &const byte, url_off: usize,
+    q_off: usize, q_len: usize, id: &Buf) bool {
+    if !web_q_id(url, url_off, q_off, q_len, id) {
+        return web_send_error(c.fd, SRV_ST_400, "missing id");
+    }
+    const si: isize = web_find(t, id.ptr as &const byte, id.len);
+    if si < 0 || si >= WEB_MAX_SESSIONS as isize {
+        return web_send_error(c.fd, SRV_ST_404, "unknown session");
+    }
+    var qv: Buf = buf_new(16);
+    defer { buf_free(&qv); }
+    var cols: usize = 0;
+    var rows: usize = 0;
+    if srv_query_get(url, url_off, q_off, q_len, "cols" as &const byte, &qv) {
+        cols = web_dec_of(&qv);
+    }
+    buf_reset(&qv);
+    if srv_query_get(url, url_off, q_off, q_len, "rows" as &const byte, &qv) {
+        rows = web_dec_of(&qv);
+    }
+    if cols == 0 || rows == 0 {
+        return web_send_error(c.fd, SRV_ST_400, "bad cols/rows");
+    }
+    const s: &WebSession = &t.items[si as usize];
+    // 服务端网格与 PTY 尺寸都跟着改；PTY 改了要**显式**发 SIGWINCH（理由见上）。
+    // 先夹取再赋值（别写 `s.cols = if (…)`：见 ttyemu.emu_move_to 的注）
+    var wc: usize = cols;
+    if (wc > EMU_MAX_COLS) {
+        wc = EMU_MAX_COLS;
+    }
+    var wr: usize = rows;
+    if (wr > EMU_MAX_ROWS) {
+        wr = EMU_MAX_ROWS;
+    }
+    s.cols = wc;
+    s.rows = wr;
+    emu_resize(&s.emu, s.cols, s.rows);
+    if s.master >= 0 {
+        web_set_winsize(s.master, s.cols, s.rows);
+        if s.pid > 0 {
+            _ = sys_kill(s.pid as i64, SIGWINCH) catch {};
+        }
+    }
+    // 尺寸变了 ⇒ 前端要整屏重画（行宽列数都变了，增量没有意义）
+    emu_invalidate(&s.emu);
+    return web_send_ok(c.fd);
+}
+
+// POST /api/close?id= —— 结束一条会话：收子进程 + 关 master + 从表里**摘掉**
+// （后面的条目前移，`cur` 跟着修），并让订阅它的长连接下一圈自然收到 EOF。
+fn web_ep_close(c: &WebConn, t: &WebTable, url: &const byte, url_off: usize,
+    q_off: usize, q_len: usize, id: &Buf) bool {
+    if !web_q_id(url, url_off, q_off, q_len, id) {
+        return web_send_error(c.fd, SRV_ST_400, "missing id");
+    }
+    const si: isize = web_find(t, id.ptr as &const byte, id.len);
+    if si < 0 || si >= WEB_MAX_SESSIONS as isize {
+        return web_send_error(c.fd, SRV_ST_404, "unknown session");
+    }
+    web_remove_at(t, si as usize);
+    return web_send_ok(c.fd);
+}
+
+// GET /api/image?id= —— 附件图片**原样直传**（不重编码，见文件头不变量 ④）。
+// id 是 `imgx` 的内容寻址 sha256 十六进制串；`ext` 由请求方给（可选），不认识
+// 就按 png 试 —— 但**先校验 id 的字符集**，这是路径穿越的唯一入口。
+fn web_ep_image(cfg: &const Config, c: &WebConn, url: &const byte,
+    url_off: usize, q_off: usize, q_len: usize, id: &Buf) bool {
+    if !web_q_id(url, url_off, q_off, q_len, id) {
+        return web_send_error(c.fd, SRV_ST_400, "missing id");
+    }
+    if !web_id_is_hex(id) {
+        return web_send_error(c.fd, SRV_ST_404, "bad image id");
+    }
+    var home: Buf = buf_new(1024);
+    defer { buf_free(&home); }
+    if !agent_default_home(cfg, &home) {
+        return web_send_error(c.fd, SRV_ST_404, "no agent home");
+    }
+    // 依次试四种扩展名：id 是内容寻址的，但我们不记「这个 id 是哪种格式」，
+    // 而嗅探要读到字节才知道 —— 所以先按扩展名找文件，找到再嗅探确认。
+    const exts: [&const byte: 4] = [
+        "png" as &const byte, "jpg" as &const byte,
+        "gif" as &const byte, "webp" as &const byte,
+    ];
+    var k: usize = 0;
+    while k < 4 {
+        var path: Buf = buf_new(home.len + id.len + 32);
+        defer { buf_free(&path); }
+        _ = buf_append(&path, home.ptr, home.len);
+        _ = buf_append_cstr(&path, "/attachments/");
+        _ = buf_append(&path, id.ptr, id.len);
+        _ = buf_append_byte(&path, 46);              // '.'
+        _ = buf_append_cstr(&path, exts[k]);
+        var raw: Buf = buf_new(0);
+        defer { buf_free(&raw); }
+        if imgx_load(path.ptr as &const byte, path.len, &raw) && raw.len > 0 {
+            const ctype: &const byte = web_img_ctype(raw.ptr as &const byte,
+                raw.len);
+            if bufx_cstr_len(ctype) > 0 {
+                return srv_send_response(c.fd, SRV_ST_200, ctype,
+                    raw.ptr as &const byte, raw.len);
+            }
+        }
+        k = k + 1;
+    }
+    return web_send_error(c.fd, SRV_ST_404, "image not found");
+}
+
+// 图片 id 只许十六进制（1–64 位）。**这是路径穿越的唯一入口**：id 会被拼进
+// `<home>/attachments/<id>.<ext>`，放行 `..` 或 `/` 就能读到任意文件。
+fn web_id_is_hex(id: &const Buf) bool {
+    if id.len == 0 || id.len > 64 {
+        return false;
+    }
+    var i: usize = 0;
+    while i < id.len {
+        const b: byte = id.ptr[i];
+        const ok: bool = (b >= 48 && b <= 57) || (b >= 97 && b <= 102)
+            || (b >= 65 && b <= 70);
+        if !ok {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+// 按字节**嗅探**真格式给 Content-Type（不信扩展名 —— 决定浏览器怎么解的是它）。
+// 认不出返回空串（调用方据此继续试下一个扩展名）。
+fn web_img_ctype(p: &const byte, n: usize) &const byte {
+    var info: ImgInfo = ImgInfo{
+        kind: IMGX_NONE, width: 0, height: 0, bytes: 0,
+    };
+    if !imgx_sniff(p, n, &info) {
+        return "" as &const byte;
+    }
+    return imgx_mime(info.kind);
+}
+
+// 十进制解析（只吃数字，空串或超长返回 0）。
+fn web_dec_of(b: &const Buf) usize {
+    if b.len == 0 || b.len > 9 {
+        return 0;
+    }
+    var v: usize = 0;
+    var i: usize = 0;
+    while i < b.len {
+        const ch: byte = b.ptr[i];
+        if ch < 48 || ch > 57 {
+            return 0;
+        }
+        v = v * 10 + ((ch - 48) as usize);
+        i = i + 1;
+    }
+    return v;
+}
+
+// 一句 `{"ok":true}`（前端只关心有没有 error 字段）。
+fn web_send_ok(fd: i32) bool {
+    const body: &const byte = "{\"ok\":true}" as &const byte;
+    return srv_send_response(fd, SRV_ST_200, SRV_CT_JSON, body,
+        bufx_cstr_len(body));
+}
+
+// ============================================================
+// 会话表：摘掉一条
+// ============================================================
+
+// 把第 i 条从表里摘掉（后面的前移），并修 `cur`。摘掉的会话资源全释放。
+// 为什么是「前移」而不是「留空洞 + alive=false」：表是**定长数组**，留空洞就要
+// 处处判空洞；而 `n` 是唯一的存活口径（`+` 新建用 `t.n` 当下标），前移让不变量
+// 保持「`[0, n)` 全活」。
+export fn web_remove_at(t: &WebTable, i: usize) void {
+    if i >= t.n || i >= WEB_MAX_SESSIONS {
+        return;
+    }
+    web_session_free(&t.items[i]);
+    var k: usize = i;
+    while k + 1 < t.n && k + 1 < WEB_MAX_SESSIONS {
+        t.items[k] = t.items[k + 1];
+        // 源槽位置空：它的 Buf 指针已被搬走，置空避免 k+1 槽被二次释放
+        web_session_empty_slot(&t.items[k + 1]);
+        k = k + 1;
+    }
+    if t.n > 0 {
+        t.n = t.n - 1;
+    }
+    if t.n == 0 {
+        t.cur = 0;
+    } else if t.cur >= t.n {
+        t.cur = t.n - 1;
+    }
+}
+
+// 把一个槽位置成「空」（Buf 全空 = 没有分配，所以 free 是安全的）。
+export fn web_session_empty_slot(s: &WebSession) void {
+    s.id = buf_empty();
+    s.pending = buf_empty();
+    s.scratch = buf_empty();
+    s.pid = 0;
+    s.master = -1;
+    s.alive = false;
+    s.replay_n = 0;
+    s.replay_at = 0;
+    var i: usize = 0;
+    while i < WEB_REPLAY_FRAMES {
+        s.replay[i] = buf_empty();
+        i = i + 1;
+    }
+    var k: usize = 0;
+    while k < EMU_MAX_ROWS {
+        s.emu.prev[k] = buf_empty();
+        k = k + 1;
+    }
+    s.emu.osc = buf_empty();
+    s.emu.title = buf_empty();
+    s.emu.have_prev = false;
+}
+
+// 一个空连接槽（Buf 全是 `buf_empty()` = 没有分配，所以 free 安全）。
+export fn web_conn_value_empty() WebConn {
+    return WebConn{
+        fd: -1,
+        st: WEB_CONN_READ,
+        rx: buf_empty(),
+        sid: buf_empty(),
+        sess: -1,
+        out: buf_empty(),
+        out_off: 0,
+        replay_i: 0,
+        replay_n: 0,
+    };
+}

@@ -1,0 +1,1231 @@
+// src/web/ttyemu.uya — 服务端终端解释器：把子进程 TUI 写的帧字节解成一块网格
+//
+// 本文件：网格与单元格（`EmuCell` / `EmuGrid`、`emu_init` / `emu_free`）、
+//   字节流解释（`emu_feed`：CSI / OSC / SGR / 正文）、网格快照与差分
+//   （`emu_snapshot` / `emu_row_diff` / `emu_row_text`）、JSON 输出
+//   （`emu_json_frame`）、外部对象锚点（`emu_obj_put` / `emu_obj_at`，图片用）。
+// 不变量：① **只解白名单里的序列**（见 `emu_csi_exec`），遇到不认识的 CSI 一律
+//   **整条吃掉并丢弃** —— 绝不把序列字节当正文写进网格（否则屏幕上会出现 `[3m`
+//   这种垃圾），也绝不因为遇到新序列就挂掉；白名单与 `src/term/tui/` 实际发出的
+//   序列一一对应，自测有一条「捕获到的 CSI 终字节必须全在白名单内」的断言钉住；
+//   ② 网格是**定长**的（`EMU_MAX_ROWS` × `EMU_MAX_COLS`），超出的行/列直接丢掉 ——
+//   TUI 侧本来就有同样的上限（`TUI_MAX_ROWS` = 256），所以这里丢掉的是「终端比
+//   TUI 画布还小」那种情形，属于正常退化；③ 单元格里的 `obj_id` **只承载「这一格
+//   是一个外部对象的锚点」**，绝不承载字节 —— 字节走 `/api/image` 直传（这是
+//   「图片能不能显示」与「网格增量有多大」两件事解耦的关键，见 DESIGN 的 web 章）；
+//   ④ 差分按「行文本**逐字节**比较」算：同一行长度相同但内容不同（改了一个字）
+//   必须报变化，否则屏幕上就是旧字。
+// 依赖：无 `use` 行（合并命名空间拿 libc 的符号）；本仓 foundation/bufx
+//   （Buf / buf_*）、term/tty（`tty_utf8_decode` / `tty_char_cols` /
+//   `tty_utf8_next` —— 显示宽度的**唯一**真值就在那里，不另写一份）。
+// 命名：`emu_*`（网格与解释）、`EMU_*`（常量与状态码）。
+//
+// 为什么解释在服务端而不是浏览器端（xterm.js 那种做法）：
+//   ① 本仓最看重的判据是**同源** —— `tui_screen_text()` 存在的全部理由就是「断言与
+//      画帧同源，不许另写一份排版逻辑」。解释器放在服务端，web 端也能吃这条：
+//      `web-emu` 轮断言「emu 解出的网格文本与 `tui_screen_text()` 逐行相同」。
+//      换成浏览器端解释，这条判据立刻退化成「我们相信上游渲染对了」。
+//   ② 零外部依赖：xterm.js 要么走 CDN（自测是离线跑的，会整片红），要么把几十万行
+//      压缩 JS vendored 进仓（与「纯 Uya 源码」的立场冲突，还要在 Makefile 里管版本）。
+//   ③ 工作量被**实测**限定住了：`tui_flush`（frame.uya:205-262）一帧只发 6 类序列，
+//      没有滚屏区、没有 tab stop、没有字符集切换（TUI 正文层是单字节网格，见
+//      screen.uya:674 的注释）。所以这不是「重写 xterm.js」，是解这几类序列。
+
+// ============================================================
+// 常量
+// ============================================================
+
+// 网格上限。与 `term/tui` 的 `TUI_MAX_ROWS`（256）同量级；`--web` 的默认画布是
+// 100×30，自测最大 120×40。**每格 24 字节**（见 EmuCell），所以 200×500 的满格
+// 约 2.3 MiB —— 一个会话一块，`WEB_MAX_SESSIONS` = 8 时约 18 MiB 上限。
+export const EMU_MAX_ROWS: usize = 200;
+export const EMU_MAX_COLS: usize = 500;
+
+export const EMU_DEF_COLS: usize = 100;
+export const EMU_DEF_ROWS: usize = 30;
+
+// 属性位（SGR 1/2/3/4/7/9）
+export const EMU_ATTR_BOLD: u8 = 1;
+export const EMU_ATTR_DIM: u8 = 2;
+export const EMU_ATTR_ITALIC: u8 = 4;
+export const EMU_ATTR_UNDERLINE: u8 = 8;
+export const EMU_ATTR_REVERSE: u8 = 16;
+export const EMU_ATTR_STRIKE: u8 = 32;
+
+// 颜色模式：默认（跟页面主题）/ 索引色（0–255）/ 真彩（0xRRGGBB）
+export const EMU_COLOR_DEFAULT: i32 = -1;
+export const EMU_COLOR_IDX: i32 = 0;
+export const EMU_COLOR_RGB: i32 = 1;
+
+// 解释器状态
+const EMU_ST_TEXT: u8 = 0;
+const EMU_ST_ESC: u8 = 1;
+const EMU_ST_CSI: u8 = 2;
+const EMU_ST_OSC: u8 = 3;
+const EMU_ST_OSC_ESC: u8 = 4;
+// CSI 参数上限：TUI 最多 8 个 SGR 参数（`38;5;N;48;5;M`），16 绰绰有余
+const EMU_MAX_PARAMS: usize = 16;
+
+// ============================================================
+// 网格
+// ============================================================
+
+export struct EmuCell {
+    ch: u32,        // Unicode 码点（0 = 空白格）
+    fg: i32,        // EMU_COLOR_*
+    bg: i32,
+    fg_v: i32,      // 索引色 0–255；真彩 0xRRGGBB
+    bg_v: i32,
+    obj_id: i32,    // 外部对象锚点（0 = 普通格）；见文件头不变量 ③
+    attr: u8,       // EMU_ATTR_* 位
+    wide: u8,       // 0 = 普通格；1 = 宽字符的**首格**；2 = 宽字符占的**续格**
+}
+
+export struct EmuGrid {
+    cells: [EmuCell: EMU_MAX_ROWS * EMU_MAX_COLS],
+    cols: usize,
+    rows: usize,
+    cx: usize,              // 光标（0 基）
+    cy: usize,
+    fg: i32,                // 当前 SGR 状态（新写入的格子用它）
+    bg: i32,
+    fg_v: i32,
+    bg_v: i32,
+    attr: u8,
+    prev: [Buf: EMU_MAX_ROWS],   // 上一帧的行文本（差分用）
+    prev_n: usize,
+    have_prev: bool,
+    st: u8,                 // 解释器状态（CSI/OSC 可能被 TCP 切开，必须跨 feed 保留）
+    nparam: usize,
+    params: [i32: EMU_MAX_PARAMS],
+    cur: i32,               // 正在拼的数字（-1 = 本段还没数字）
+    priv: u8,               // 私有标记（'?' 等）
+    osc: Buf,               // OSC 载荷
+    cursor_on: bool,        // `ESC[?25h/l`
+    alt: bool,              // `ESC[?1049h/l`（备用屏；TUI 全程在里面）
+    title: Buf,             // OSC 2 的终端标题
+    // 被 feed 切开的 UTF-8 序列的**前半个**（最多 3 字节）：
+    // PTY 读一次 16 KiB，但 TCP/管道边界是任意的 —— 一个汉字（3 字节）完全可能
+    // 跨两次 `emu_feed`。不暂存就会把两半各解成 U+FFFD（屏幕上两个「?」），
+    // 而且**不可恢复**（字节已经吃掉了）。自测的「逐字节喂 == 整段喂」就是钉它。
+    pend: [byte: 4],
+    pend_n: usize,
+}
+
+// 建一块网格。失败返回 false（`osc`/`title` 分配不出来），失败时调用方仍应
+// `emu_free`（**幂等**）。`prev` 那些 Buf 用 `buf_new(0)`（空分配：真正要用的
+// 时候由 `buf_append` 自己长），而不是 `buf_empty()` —— 见踩坑 92 的同族。
+export fn emu_init(g: &EmuGrid, cols: usize, rows: usize) bool {
+    var c: usize = cols;
+    if c == 0 || c > EMU_MAX_COLS {
+        c = EMU_DEF_COLS;
+    }
+    var r: usize = rows;
+    if r == 0 || r > EMU_MAX_ROWS {
+        r = EMU_DEF_ROWS;
+    }
+    g.cols = c;
+    g.rows = r;
+    g.fg = EMU_COLOR_DEFAULT;
+    g.bg = EMU_COLOR_DEFAULT;
+    g.fg_v = 0;
+    g.bg_v = 0;
+    g.attr = 0;
+    g.prev_n = 0;
+    g.have_prev = false;
+    g.st = EMU_ST_TEXT;
+    g.nparam = 0;
+    g.cur = -1;
+    g.priv = 0;
+    g.cursor_on = true;
+    g.alt = false;
+    g.osc = buf_new(256);
+    g.title = buf_new(256);
+    g.pend_n = 0;
+    var i: usize = 0;
+    while i < EMU_MAX_ROWS {
+        g.prev[i] = buf_new(0);
+        i = i + 1;
+    }
+    emu_clear(g);
+    return buf_valid(&g.osc) && buf_valid(&g.title);
+}
+
+// 释放 `prev` / osc / title。**幂等**（buf_free 后清零），重复调用安全。
+export fn emu_free(g: &EmuGrid) void {
+    var i: usize = 0;
+    while i < EMU_MAX_ROWS {
+        buf_free(&g.prev[i]);
+        i = i + 1;
+    }
+    buf_free(&g.osc);
+    buf_free(&g.title);
+}
+
+// 改画布尺寸（页面 ResizeObserver 报来的）。**不动** prev（差分继续按行比，
+// 行数变少时由 `emu_json_rows` 的 `clear` 字段通知前端清屏）。
+// 缩小时右下角被裁掉的格子归零；放大时新露出的格子也是空白。
+export fn emu_resize(g: &EmuGrid, cols: usize, rows: usize) void {
+    var c: usize = cols;
+    if c == 0 || c > EMU_MAX_COLS {
+        c = EMU_DEF_COLS;
+    }
+    var r: usize = rows;
+    if r == 0 || r > EMU_MAX_ROWS {
+        r = EMU_DEF_ROWS;
+    }
+    if c == g.cols && r == g.rows {
+        return;
+    }
+    const old_rows: usize = g.rows;
+    const old_cols: usize = g.cols;
+    g.cols = c;
+    g.rows = r;
+    // 变窄：右边被裁掉的列归零（否则下次变宽会把旧字符露出来）
+    if c < old_cols {
+        var y: usize = 0;
+        while y < r && y < old_rows {
+            var x: usize = c;
+            while x < old_cols {
+                emu_cell_reset(g, x, y);
+                x = x + 1;
+            }
+            y = y + 1;
+        }
+    }
+    // 变矮：下边被裁掉的行归零
+    if r < old_rows {
+        var y: usize = r;
+        while y < old_rows {
+            emu_clear_row(g, y);
+            y = y + 1;
+        }
+    }
+    if g.cx >= g.cols {
+        g.cx = g.cols - 1;
+    }
+    if g.cy >= g.rows {
+        g.cy = g.rows - 1;
+    }
+}
+
+// 整屏清空（`ESC[2J` 与初始化都走它）。**不动** prev。
+export fn emu_clear(g: &EmuGrid) void {
+    var y: usize = 0;
+    while y < g.rows {
+        emu_clear_row(g, y);
+        y = y + 1;
+    }
+    g.cx = 0;
+    g.cy = 0;
+}
+
+// 清一整行（`ESC[2K`）。
+export fn emu_clear_row(g: &EmuGrid, y: usize) void {
+    if y >= g.rows {
+        return;
+    }
+    var x: usize = 0;
+    while x < g.cols {
+        emu_cell_reset(g, x, y);
+        x = x + 1;
+    }
+}
+
+// 把 (x, y) 归零（空白格 + 默认色）。
+// 索引前必须**显式**夹取：Uya 的数组边界证明器只认「正的 if 里做索引」
+// （§16 踩坑 6），`y * EMU_MAX_COLS + x` 这种算式它推不出来。
+fn emu_cell_reset(g: &EmuGrid, x: usize, y: usize) void {
+    if x >= EMU_MAX_COLS || y >= EMU_MAX_ROWS {
+        return;
+    }
+    const idx: usize = y * EMU_MAX_COLS + x;
+    if idx >= EMU_MAX_ROWS * EMU_MAX_COLS {
+        return;
+    }
+    g.cells[idx].ch = 0;
+    g.cells[idx].fg = EMU_COLOR_DEFAULT;
+    g.cells[idx].bg = EMU_COLOR_DEFAULT;
+    g.cells[idx].fg_v = 0;
+    g.cells[idx].bg_v = 0;
+    g.cells[idx].obj_id = 0;
+    g.cells[idx].attr = 0;
+    g.cells[idx].wide = 0;
+}
+
+// ============================================================
+// 解释：字节流 → 网格
+// ============================================================
+
+// 喂一段字节。**可跨调用切开**（CSI / OSC 的状态跨 feed 保留），所以调用方可以
+// 按 PTY 读到的任意分片调用它（最多几百字节，也可能正好切在 `ESC[` 中间）。
+export fn emu_feed(g: &EmuGrid, p: &const byte, n: usize) void {
+    // 先看有没有上一次留下的半个码点：有就把它与本段**前面**的字节拼成一个
+    // 临时缓冲再解释（不递归、不特判，路径只有一条）。
+    if g.pend_n > 0 && g.st == EMU_ST_TEXT {
+        var jo: [byte: 8] = [0: 8];
+        var jn: usize = 0;
+        var k: usize = 0;
+        while k < g.pend_n && k < 4 {
+            jo[jn] = g.pend[k];
+            jn = jn + 1;
+            k = k + 1;
+        }
+        g.pend_n = 0;
+        // 最多再补 4 个字节就够拼出任意一个码点（不完整的码点最多 3 字节 + 1）
+        var take: usize = 0;
+        while take < n && jn < 8 {
+            jo[jn] = p[take];
+            jn = jn + 1;
+            take = take + 1;
+        }
+        // 拼出来的这段按常规解释；剩下的原始字节接着走常规路径。
+        emu_feed_plain(g, &jo[0] as &const byte, jn);
+        if take < n {
+            emu_feed_plain(g, p + take, n - take);
+        }
+        return;
+    }
+    emu_feed_plain(g, p, n);
+}
+
+// 常规路径：把一段完整字节解成网格（CSI/OSC 状态跨调用保留）。
+fn emu_feed_plain(g: &EmuGrid, p: &const byte, n: usize) void {
+    var i: usize = 0;
+    while i < n {
+        const b: byte = p[i];
+        if g.st == EMU_ST_TEXT {
+            i = emu_feed_text(g, p, i, n);
+            continue;
+        }
+        if g.st == EMU_ST_ESC {
+            emu_feed_esc(g, b);
+        } else if g.st == EMU_ST_CSI {
+            emu_feed_csi(g, b);
+        } else if g.st == EMU_ST_OSC {
+            if b == 7 {                      // BEL 结束
+                emu_osc_end(g);
+            } else if b == 27 {
+                g.st = EMU_ST_OSC_ESC;
+            } else if g.osc.len < 512 {
+                _ = buf_append_byte(&g.osc, b);
+            }
+        } else {
+            // EMU_ST_OSC_ESC：ESC 之后是 '\\' 就是 ST 结束，否则当载荷继续
+            if b == 92 {
+                emu_osc_end(g);
+            } else {
+                g.st = EMU_ST_OSC;
+                if g.osc.len < 512 {
+                    _ = buf_append_byte(&g.osc, 27);
+                    _ = buf_append_byte(&g.osc, b);
+                }
+            }
+        }
+        i = i + 1;
+    }
+}
+
+// 正文段：一直消费到下一个 ESC（可打印字节写进网格，控制字节按光标动作处理）。
+// 返回**新的下标**（指向那个 ESC 之后，或 n）。
+fn emu_feed_text(g: &EmuGrid, p: &const byte, from: usize, n: usize) usize {
+    var i: usize = from;
+    while i < n {
+        const b: byte = p[i];
+        if b == 27 {
+            g.st = EMU_ST_ESC;
+            return i + 1;
+        }
+        if b == 13 {                 // CR：回车（列归零）
+            g.cx = 0;
+            i = i + 1;
+            continue;
+        }
+        if b == 10 {                 // LF：换行（TUI 不发，但外来字节别把光标搞乱）
+            if g.cy + 1 < g.rows {
+                g.cy = g.cy + 1;
+            }
+            i = i + 1;
+            continue;
+        }
+        if b == 8 {                  // BS：退一格
+            if g.cx > 0 {
+                g.cx = g.cx - 1;
+            }
+            i = i + 1;
+            continue;
+        }
+        if b < 32 || b == 127 {      // 其余控制字节：丢弃（绝不写进网格）
+            i = i + 1;
+            continue;
+        }
+        // 一个码点：够就解，不够就把这半个**留下来**等下一次 feed
+        // （PTY 的读边界是任意的，汉字很容易被切成两半）。
+        const need: usize = tty_utf8_len(b);
+        if need == 1 {
+            emu_put(g, b as u32);
+            i = i + 1;
+            continue;
+        }
+        if i + need > n {
+            // 后面这截不够一个完整码点：暂存（最多 3 字节）后结束这一段
+            emu_pend(g, p, i, n);
+            return n;
+        }
+        const cp: u32 = tty_utf8_decode(p, i, n);
+        const adv: usize = tty_utf8_next(p, i, n);
+        emu_put(g, cp);
+        i = adv;
+    }
+    return n;
+}
+
+// 把 `[i, n)` 这截**不完整的码点**存进 pend（供下一次 feed 拼上）。
+// 上限 3 字节 —— 最长的不完整前缀就是 4 字节码点的前 3 个（4 个字节必然完整）。
+fn emu_pend(g: &EmuGrid, p: &const byte, i: usize, n: usize) void {
+    g.pend_n = 0;
+    var k: usize = i;
+    while k < n && g.pend_n < 4 {
+        g.pend[g.pend_n] = p[k];
+        g.pend_n = g.pend_n + 1;
+        k = k + 1;
+    }
+}
+
+// 写一个码点到当前光标，并按**显示宽度**推光标。
+fn emu_put(g: &EmuGrid, cp: u32) void {
+    const w: usize = tty_char_cols(cp);
+    if w == 0 {
+        // 组合字符 / 零宽：丢弃。单元格只有一个 u32，附着不了组合序列；
+        // 而 TUI 的正文层不会有这类字符（screen.uya:674 的单字节网格），
+        // 所以「少一个装饰」比「多一个占位格把后面全部推歪」正确。
+        return;
+    }
+    if g.cx >= g.cols || g.cy >= g.rows {
+        return;              // 越界丢弃（不自动折行：TUI 自己按列数排版）
+    }
+    const idx: usize = g.cy * EMU_MAX_COLS + g.cx;
+    g.cells[idx].ch = cp;
+    g.cells[idx].fg = g.fg;
+    g.cells[idx].bg = g.bg;
+    g.cells[idx].fg_v = g.fg_v;
+    g.cells[idx].bg_v = g.bg_v;
+    g.cells[idx].attr = g.attr;
+    g.cells[idx].obj_id = 0;
+    g.cells[idx].wide = 1;
+    // 宽字符（CJK）占**两列**：下一格标成「续格」（wide = 2）。
+    // 为什么必须标记：`emu_row_text` 按「ch == 0 ⇒ 补一个空格」导出文本，而续格
+    // 的 ch 天生是 0 ⇒ 每遇到一个汉字就凭空多一个空格（实测：与 `tui_screen_text`
+    // 差 7 字节，全是汉字之间多出来的空格）。续格要**跳过**，不是补空格。
+    if w == 2 && g.cx + 1 < g.cols {
+        const idx2: usize = g.cy * EMU_MAX_COLS + (g.cx + 1);
+        g.cells[idx2].ch = 0;
+        g.cells[idx2].wide = 2;
+        g.cells[idx2].obj_id = 0;
+        g.cells[idx2].attr = g.attr;
+    }
+    g.cx = g.cx + w;
+}
+
+// ESC 之后的那个字节：'[' = CSI、']' = OSC，其余是两字节转义（丢弃）。
+fn emu_feed_esc(g: &EmuGrid, b: byte) void {
+    if b == 91 {                 // '['
+        g.st = EMU_ST_CSI;
+        g.nparam = 0;
+        g.cur = -1;
+        g.priv = 0;
+        return;
+    }
+    if b == 93 {                 // ']'
+        g.st = EMU_ST_OSC;
+        buf_reset(&g.osc);
+        return;
+    }
+    g.st = EMU_ST_TEXT;
+}
+
+// CSI 里的一个字节：数字/';' 收参数，私有标记记下来，终字节（0x40–0x7E）执行。
+fn emu_feed_csi(g: &EmuGrid, b: byte) void {
+    if b >= 48 && b <= 57 {                 // '0'–'9'
+        var v: i32 = g.cur;
+        if v < 0 {
+            v = 0;
+        }
+        v = v * 10 + ((b - 48) as i32);
+        if v > 100000 {
+            v = 100000;                      // 防溢出；真值不会这么大
+        }
+        g.cur = v;
+        return;
+    }
+    if b == 59 {                            // ';'
+        emu_push_param(g);
+        return;
+    }
+    if b == 63 || b == 62 || b == 61 {      // '?' / '>' / '='
+        g.priv = b;
+        return;
+    }
+    if b >= 32 && b <= 47 {                 // 中间字节：忽略
+        return;
+    }
+    if b >= 64 && b <= 126 {                // 终字节：执行
+        emu_push_param(g);
+        emu_csi_exec(g, b);
+        g.st = EMU_ST_TEXT;
+        return;
+    }
+    g.st = EMU_ST_TEXT;                     // 非法 CSI：丢掉整条
+}
+
+// 把正在拼的参数收进数组（`cur` 为 -1 = 「这一段没有数字」，原样存 -1，
+// 由 `emu_param` 按缺省值解释）。
+fn emu_push_param(g: &EmuGrid) void {
+    if g.nparam < EMU_MAX_PARAMS {
+        g.params[g.nparam] = g.cur;
+        g.nparam = g.nparam + 1;
+    }
+    g.cur = -1;
+}
+
+// 取第 i 个参数（缺失或「没有数字」时返回 def）。
+fn emu_param(g: &const EmuGrid, i: usize, def: i32) i32 {
+    if i >= g.nparam || i >= EMU_MAX_PARAMS {
+        return def;
+    }
+    const v: i32 = g.params[i];
+    if v < 0 {
+        return def;
+    }
+    return v;
+}
+
+// 执行一条 CSI（终字节 c）。**白名单**：其余一律丢弃（见文件头不变量 ①）。
+// 白名单就是 `tui_flush` / `tui_term_enter` / `tui_term_leave` 实际会发的那些：
+//   H/f 光标定位、J 清屏(2)、K 清行(2)、m SGR、h/l 私模式(25/1049/1000/1006/2004)。
+fn emu_csi_exec(g: &EmuGrid, c: byte) void {
+    if c == 72 || c == 102 {                 // 'H' / 'f'：光标定位（1 基）
+        emu_move_to(g, emu_param(g, 0, 1), emu_param(g, 1, 1));
+        return;
+    }
+    if c == 74 {                             // 'J'：清屏（本仓只用 2 = 整屏）
+        if emu_param(g, 0, 0) == 2 {
+            emu_clear(g);
+        }
+        return;
+    }
+    if c == 75 {                             // 'K'：清行（本仓只用 2 = 整行）
+        if emu_param(g, 0, 0) == 2 {
+            emu_clear_row(g, g.cy);
+        }
+        return;
+    }
+    if c == 109 {                            // 'm'：SGR
+        emu_sgr(g);
+        return;
+    }
+    if c == 104 || c == 108 {                // 'h' / 'l'：私模式
+        emu_private_mode(g, c == 104);
+        return;
+    }
+    // 其余（'A'–'G' 光标移动、'S'/'T' 滚屏、'r' 滚屏区、'n' 设备状态…）：
+    // TUI 不发；即便发来也丢弃 —— 宁可少一个效果，不可把光标搞乱。
+}
+
+// 私模式 `ESC[?<n>h/l`：只认 TUI 会发的几个；别的私模式**明确忽略**
+// （不去猜它的语义 —— 猜错就是把光标/整屏搞乱）。
+fn emu_private_mode(g: &EmuGrid, on: bool) void {
+    if g.priv != 63 {
+        return;
+    }
+    var i: usize = 0;
+    while i < g.nparam {
+        const m: i32 = g.params[i];
+        if m == 25 {
+            g.cursor_on = on;
+        } else if m == 1049 {
+            g.alt = on;
+            if on {
+                emu_clear(g);
+            }
+        }
+        i = i + 1;
+    }
+}
+
+// 光标定位：行/列都是 **1 基**，0 与负数按 1 处理（终端惯例），超出画布夹取。
+fn emu_move_to(g: &EmuGrid, row: i32, col: i32) void {
+    var r: i32 = row;
+    if (r < 1) {
+        r = 1;
+    }
+    var c: i32 = col;
+    if (c < 1) {
+        c = 1;
+    }
+    const rr: usize = (r - 1) as usize;
+    const cc: usize = (c - 1) as usize;
+    // ⚠ 这里**不能**写 `g.cy = if (…) {…} else {…}`：编译器为「赋值目标上的
+    // if 表达式」生成的 C 是 `g->cy = ({ const size_t t; if(…) t = …; t; })`
+    // —— 临时变量声明成了 **const 却还要赋值**，C 编译期直接报
+    // `assignment of read-only variable`。写成先算后赋（这里这样）就没有那个临时。
+    var ry: usize = rr;
+    if (ry >= g.rows) {
+        ry = g.rows - 1;
+    }
+    var cx2: usize = cc;
+    if (cx2 >= g.cols) {
+        cx2 = g.cols - 1;
+    }
+    g.cy = ry;
+    g.cx = cx2;
+}
+
+// SGR：把参数序列规范化成「前景 / 背景 / 属性」。
+// 认的形态**就是 `tui_sgr_into` 会产出的那些**，外加终端通用的几条：
+//   `0` 复位、`1 2 3 4 7 9` 属性、`22 23 24 27 29` 关属性、`30–37` / `90–97` 前景、
+//   `40–47` / `100–107` 背景、`39`/`49` 回默认、`38;5;N` / `48;5;N` 索引色、
+//   `38;2;R;G;B` / `48;2;R;G;B` 真彩（本仓不发，收下不吃亏）。
+fn emu_sgr(g: &EmuGrid) void {
+    if g.nparam == 0 {
+        emu_sgr_reset(g);
+        return;
+    }
+    var i: usize = 0;
+    while i < g.nparam {
+        const v: i32 = g.params[i];
+        if v == 0 {
+            emu_sgr_reset(g);
+        } else if v == 1 {
+            g.attr = g.attr | EMU_ATTR_BOLD;
+        } else if v == 2 {
+            g.attr = g.attr | EMU_ATTR_DIM;
+        } else if v == 3 {
+            g.attr = g.attr | EMU_ATTR_ITALIC;
+        } else if v == 4 {
+            g.attr = g.attr | EMU_ATTR_UNDERLINE;
+        } else if v == 7 {
+            g.attr = g.attr | EMU_ATTR_REVERSE;
+        } else if v == 9 {
+            g.attr = g.attr | EMU_ATTR_STRIKE;
+        } else if v >= 22 && v <= 29 {
+            emu_sgr_off(g, v);
+        } else if v >= 30 && v <= 37 {
+            g.fg = EMU_COLOR_IDX;
+            g.fg_v = v - 30;
+        } else if v == 39 {
+            g.fg = EMU_COLOR_DEFAULT;
+        } else if v >= 40 && v <= 47 {
+            g.bg = EMU_COLOR_IDX;
+            g.bg_v = v - 40;
+        } else if v == 49 {
+            g.bg = EMU_COLOR_DEFAULT;
+        } else if v >= 90 && v <= 97 {
+            g.fg = EMU_COLOR_IDX;
+            g.fg_v = (v - 90) + 8;
+        } else if v >= 100 && v <= 107 {
+            g.bg = EMU_COLOR_IDX;
+            g.bg_v = (v - 100) + 8;
+        } else if v == 38 || v == 48 {
+            i = emu_sgr_ext(g, i, v == 38);
+            continue;
+        }
+        i = i + 1;
+    }
+}
+
+// SGR 的「关掉某个属性」（22 = 关粗体与暗、23 = 关斜、24 = 关下划线、
+// 27 = 关反显、29 = 关删除线）。
+// 为什么要走 emu_attr_clear 而不是写 `g.attr & ~bit`：① 位运算的两个操作数
+// **类型必须一致**（编译器硬约束），`~bit` 会推断成 i32 而对不上 u8；
+// ② 写成 `g.attr & (0xFF as u8) ^ bit` 会被 C 的优先级坑到 —— `&` 比 `^` **松**，
+// 那实际是 `g.attr & (0xFF ^ bit)`，刚好把要清的位**留下**、把别的位清掉。
+// 显式「置位才清」没有这两个问题。
+fn emu_attr_clear(g: &EmuGrid, bit: u8) void {
+    if (g.attr & bit) != 0 {
+        g.attr = g.attr ^ bit;
+    }
+}
+
+// SGR 的「关属性」那几条（22/23/24/27/29）。
+// 走 `emu_attr_clear` 而不是 `g.attr & ~bit`：位运算的两个操作数**类型必须一致**
+// （编译器硬约束），而 `~bit` 会推断成 i32 对不上 u8；写成 `g.attr & (0xFF as u8) ^ bit`
+// 又会被 C 的优先级坑到（`&` 比 `^` 松，实际是 `g.attr & (0xFF ^ bit)`，刚好把要清
+// 的位**留下**、别的位清掉）。
+fn emu_sgr_off(g: &EmuGrid, v: i32) void {
+    if v == 22 {
+        emu_attr_clear(g, EMU_ATTR_BOLD);
+        emu_attr_clear(g, EMU_ATTR_DIM);
+    } else if v == 23 {
+        emu_attr_clear(g, EMU_ATTR_ITALIC);
+    } else if v == 24 {
+        emu_attr_clear(g, EMU_ATTR_UNDERLINE);
+    } else if v == 27 {
+        emu_attr_clear(g, EMU_ATTR_REVERSE);
+    } else if v == 29 {
+        emu_attr_clear(g, EMU_ATTR_STRIKE);
+    }
+}
+
+// `38` / `48` 的扩展色。i 指向 `38`/`48` 自己；返回**最后吃掉的参数下标**
+// （调用方接着 i+1 继续扫）。
+fn emu_sgr_ext(g: &EmuGrid, i: usize, is_fg: bool) usize {
+    const mode: i32 = emu_param(g, i + 1, -1);
+    if mode == 5 {
+        const n: i32 = emu_param(g, i + 2, 0);
+        if is_fg {
+            g.fg = EMU_COLOR_IDX;
+            g.fg_v = n;
+        } else {
+            g.bg = EMU_COLOR_IDX;
+            g.bg_v = n;
+        }
+        return i + 2;
+    }
+    if mode == 2 {
+        const r: i32 = emu_param(g, i + 2, 0);
+        const gg: i32 = emu_param(g, i + 3, 0);
+        const b: i32 = emu_param(g, i + 4, 0);
+        const rgb: i32 = ((r & 255) << 16) | ((gg & 255) << 8) | (b & 255);
+        if is_fg {
+            g.fg = EMU_COLOR_RGB;
+            g.fg_v = rgb;
+        } else {
+            g.bg = EMU_COLOR_RGB;
+            g.bg_v = rgb;
+        }
+        return i + 4;
+    }
+    return i + 1;
+}
+
+// SGR 复位：属性与前后景全回默认（`ESC[0m` 与裸 `ESC[m` 都走它）。
+fn emu_sgr_reset(g: &EmuGrid) void {
+    g.fg = EMU_COLOR_DEFAULT;
+    g.bg = EMU_COLOR_DEFAULT;
+    g.fg_v = 0;
+    g.bg_v = 0;
+    g.attr = 0;
+}
+
+// OSC 结束：`OSC 2;<标题>` 存进 title（自测要断言它），别的丢弃。
+fn emu_osc_end(g: &EmuGrid) void {
+    g.st = EMU_ST_TEXT;
+    if g.osc.len >= 2 && g.osc.ptr[0] == 50 && g.osc.ptr[1] == 59 {   // "2;"
+        buf_reset(&g.title);
+        _ = buf_append(&g.title, g.osc.ptr + 2, g.osc.len - 2);
+    }
+    buf_reset(&g.osc);
+}
+
+// ============================================================
+// 网格 → 文本（自测判据：必须与 tui_screen_text() 逐行相同）
+// ============================================================
+
+// 把第 y 行的文本追加进 out（**不含换行**）。
+// 行尾空白**去掉**：TUI 的行是按 cols 填满的（`tui_fill_row`），不去掉的话两边
+// 差一大截空格，逐行比对就没法做。
+export fn emu_row_text(g: &const EmuGrid, y: usize, out: &Buf) void {
+    if y >= g.rows {
+        return;
+    }
+    // 行尾：最后一个**非空白格**。判断时要把「宽字符的续格」当成非空白 ——
+    // 一个汉字落在行尾时，它的续格 ch 是 0，只按 ch 判会把汉字本身也算成空白。
+    var last: usize = 0;
+    var x: usize = 0;
+    while x < g.cols {
+        const c: EmuCell = g.cells[y * EMU_MAX_COLS + x];
+        if c.ch != 0 || c.wide == 2 {
+            last = x + 1;
+        }
+        x = x + 1;
+    }
+    x = 0;
+    while x < last {
+        const c: EmuCell = g.cells[y * EMU_MAX_COLS + x];
+        if c.wide == 2 {
+            x = x + 1;                        // 续格不产字符（宽字符已一次写完）
+            continue;
+        }
+        if c.ch == 0 {
+            _ = buf_append_byte(out, 32);     // 行**内**的洞补空格（保持列对齐）
+        } else {
+            emu_utf8_put(out, c.ch);
+        }
+        x = x + 1;
+    }
+}
+
+// 整屏文本（每行一段 + '\n'）。自测拿它与 `tui_screen_text()` 逐行比。
+export fn emu_text(g: &const EmuGrid, out: &Buf) void {
+    var y: usize = 0;
+    while y < g.rows {
+        emu_row_text(g, y, out);
+        _ = buf_append_byte(out, 10);
+        y = y + 1;
+    }
+}
+
+// 码点 → UTF-8 追加（1–4 字节）。坏码点写 '?'。
+fn emu_utf8_put(out: &Buf, cp: u32) void {
+    if cp < 0x80 {
+        _ = buf_append_byte(out, cp as byte);
+        return;
+    }
+    if cp < 0x800 {
+        _ = buf_append_byte(out, (0xC0 | (cp >> 6)) as byte);
+        _ = buf_append_byte(out, (0x80 | (cp & 0x3F)) as byte);
+        return;
+    }
+    if cp < 0x10000 {
+        _ = buf_append_byte(out, (0xE0 | (cp >> 12)) as byte);
+        _ = buf_append_byte(out, (0x80 | ((cp >> 6) & 0x3F)) as byte);
+        _ = buf_append_byte(out, (0x80 | (cp & 0x3F)) as byte);
+        return;
+    }
+    if cp <= 0x10FFFF {
+        _ = buf_append_byte(out, (0xF0 | (cp >> 18)) as byte);
+        _ = buf_append_byte(out, (0x80 | ((cp >> 12) & 0x3F)) as byte);
+        _ = buf_append_byte(out, (0x80 | ((cp >> 6) & 0x3F)) as byte);
+        _ = buf_append_byte(out, (0x80 | (cp & 0x3F)) as byte);
+        return;
+    }
+    _ = buf_append_byte(out, 63);       // '?'
+}
+
+// ============================================================
+// 外部对象锚点（图片通道；见文件头不变量 ③）
+// ============================================================
+
+// 把 (x, y) 起 span 列标成「外部对象 obj 的锚点」，返回它占用到第几列（不含）。
+// 调用方（websrv）在认出「这一行是 `[image] …` 回执」之后调用它。
+export fn emu_obj_put(g: &EmuGrid, x: usize, y: usize, obj: i32,
+    span: usize) usize {
+    if y >= g.rows || x >= g.cols {
+        return x;
+    }
+    var end: usize = x + span;
+    if end > g.cols {
+        end = g.cols;
+    }
+    var i: usize = x;
+    while i < end {
+        g.cells[y * EMU_MAX_COLS + i].obj_id = obj;
+        i = i + 1;
+    }
+    return end;
+}
+
+// 取 (x, y) 的锚点（0 = 没有）。自测与 JSON 输出用。
+export fn emu_obj_at(g: &const EmuGrid, x: usize, y: usize) i32 {
+    if y >= g.rows || x >= g.cols {
+        return 0;
+    }
+    return g.cells[y * EMU_MAX_COLS + x].obj_id;
+}
+
+// ============================================================
+// 差分
+// ============================================================
+
+// 把当前网格全部收进 prev（发完全量之后调用）。
+export fn emu_snapshot(g: &EmuGrid) void {
+    var y: usize = 0;
+    while y < g.rows {
+        buf_reset(&g.prev[y]);
+        emu_row_text(g, y, &g.prev[y]);
+        y = y + 1;
+    }
+    g.prev_n = g.rows;
+    g.have_prev = true;
+}
+
+// 第 y 行与上一帧是否不同（**逐字节**比；还没比过上一帧时全部算变化）。
+export fn emu_row_diff(g: &const EmuGrid, y: usize, scratch: &Buf) bool {
+    if !g.have_prev || y >= g.prev_n || y >= EMU_MAX_ROWS {
+        return true;
+    }
+    buf_reset(scratch);
+    emu_row_text(g, y, scratch);
+    const p: &Buf = &g.prev[y];
+    if scratch.len != p.len {
+        return true;
+    }
+    var i: usize = 0;
+    while i < scratch.len {
+        if scratch.ptr[i] != p.ptr[i] {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+// ============================================================
+// JSON 输出（前端只认这个形状）
+// ============================================================
+//
+// 形状（**一行一个 JSON，NDJSON**；前端按行解）：
+//   {"type":"screen","session":"…","cols":100,"rows":30,
+//    "clear":false,"cursor":[r,c,visible],
+//    "rows":[[3,"文本",[[0,5,1,38,5,45],…]],…],
+//    "images":[[row,col,obj,w,h],…]}
+// 其中 `rows` 里每一项是 `[行号, 文本, 段表]`；段表每项是
+// `[起始显示列, 列数, attr, fgMode, fgVal, bgMode, bgVal]`（列是**显示列**，
+// 与文本的码点下标不同 —— 前端按列画，所以给列）。
+// `clear` 为 true 时前端先清屏（行数变少、或首帧之后换了尺寸）。
+
+// 把 (x, y) 处那一段的样式三元组写出来。返回这一段到第几列（不含）。
+fn emu_seg_bounds(g: &const EmuGrid, x: usize, y: usize, end: &usize) void {
+    const c0: EmuCell = g.cells[y * EMU_MAX_COLS + x];
+    var i: usize = x + 1;
+    while i < g.cols {
+        const c: EmuCell = g.cells[y * EMU_MAX_COLS + i];
+        if c.wide == 2 {
+            i = i + 1;      // 续格跟着首格走，不算段边界
+            continue;
+        }
+        if c.ch == 0 && c0.ch != 0 && c0.wide != 1 {
+            break;      // 文本段后面是空白：段到此为止（空白的样式不画）
+        }
+        if c.ch != 0 && c0.ch == 0 && c0.wide != 1 {
+            break;
+        }
+        if c.fg != c0.fg || c.bg != c0.bg || c.fg_v != c0.fg_v
+            || c.bg_v != c0.bg_v || c.attr != c0.attr {
+            break;
+        }
+        i = i + 1;
+    }
+    end[0] = i;
+}
+
+// 把一行编码成 `[行号,"文本",[段…]]` 追加进 out。
+// `cols_of` 由调用方按行内**显示列**累加（宽字符占 2 列）。
+export fn emu_row_json(g: &const EmuGrid, y: usize, out: &Buf) void {
+    _ = buf_append_byte(out, 91);                       // '['
+    _ = buf_append_u64(out, y as u64);
+    _ = buf_append_byte(out, 44);                       // ','
+    // 文本（转义后）
+    var txt: Buf = buf_new(g.cols * 4 + 8);
+    defer { buf_free(&txt); }
+    emu_row_text(g, y, &txt);
+    emu_json_str(out, txt.ptr as &const byte, txt.len);
+    _ = buf_append_byte(out, 44);
+    // 段表
+    _ = buf_append_byte(out, 91);
+    var x: usize = 0;
+    var col: usize = 0;
+    var first: bool = true;
+    while x < g.cols {
+        const c: EmuCell = g.cells[y * EMU_MAX_COLS + x];
+        var end: usize = 0;
+        emu_seg_bounds(g, x, y, &end);
+        if end <= x {
+            end = x + 1;
+        }
+        const seg_cols: usize = emu_cols_span(g, x, end, y);
+        // 空白且默认样式的段不写（省体积；前端对没写的区段用默认样式）
+        const plain: bool = c.ch == 0 && c.fg == EMU_COLOR_DEFAULT
+            && c.bg == EMU_COLOR_DEFAULT && c.attr == 0;
+        if !plain {
+            if !first {
+                _ = buf_append_byte(out, 44);
+            }
+            first = false;
+            _ = buf_append_byte(out, 91);
+            _ = buf_append_u64(out, col as u64);
+            _ = buf_append_byte(out, 44);
+            _ = buf_append_u64(out, seg_cols as u64);
+            _ = buf_append_byte(out, 44);
+            _ = buf_append_u64(out, c.attr as u64);
+            _ = buf_append_byte(out, 44);
+            _ = buf_append_i64(out, c.fg as i64);
+            _ = buf_append_byte(out, 44);
+            _ = buf_append_i64(out, c.fg_v as i64);
+            _ = buf_append_byte(out, 44);
+            _ = buf_append_i64(out, c.bg as i64);
+            _ = buf_append_byte(out, 44);
+            _ = buf_append_i64(out, c.bg_v as i64);
+            _ = buf_append_byte(out, 93);               // ']'
+        }
+        col = col + seg_cols;
+        x = end;
+    }
+    _ = buf_append_byte(out, 93);
+    _ = buf_append_byte(out, 93);
+}
+
+// [x, end) 这些格子占多少**显示列**。
+fn emu_cols_span(g: &const EmuGrid, x: usize, end: usize, y: usize) usize {
+    var cols: usize = 0;
+    var i: usize = x;
+    while i < end {
+        const cp: u32 = g.cells[y * EMU_MAX_COLS + i].ch;
+        if cp == 0 {
+            cols = cols + 1;
+        } else {
+            const w: usize = tty_char_cols(cp);
+            cols = cols + (if (w == 0) { 1 as usize } else { w });
+        }
+        i = i + 1;
+    }
+    return cols;
+}
+
+// 一行的锚点（图片）：把这一行里所有 obj_id 的**连续区间**写成
+// `[row,col,obj,w,h]`。w/h 由调用方（websrv）在 `emu_json_rows` 之后补 —— 这里
+// 只输出「在哪、多宽」，高度是 1 格（TUI 的回执行本来就只有一行）。
+export fn emu_row_obj_json(g: &const EmuGrid, y: usize, out: &Buf) void {
+    var x: usize = 0;
+    var col: usize = 0;
+    var first: bool = true;
+    while x < g.cols {
+        const obj: i32 = g.cells[y * EMU_MAX_COLS + x].obj_id;
+        if obj == 0 {
+            col = col + 1;
+            x = x + 1;
+            continue;
+        }
+        // 收集同一个 obj 的连续区间
+        var e: usize = x;
+        while e < g.cols && g.cells[y * EMU_MAX_COLS + e].obj_id == obj {
+            e = e + 1;
+        }
+        const w: usize = emu_cols_span(g, x, e, y);
+        if !first {
+            _ = buf_append_byte(out, 44);
+        }
+        first = false;
+        _ = buf_append_byte(out, 91);
+        _ = buf_append_u64(out, y as u64);
+        _ = buf_append_byte(out, 44);
+        _ = buf_append_u64(out, col as u64);
+        _ = buf_append_byte(out, 44);
+        _ = buf_append_i64(out, obj as i64);
+        _ = buf_append_byte(out, 44);
+        _ = buf_append_u64(out, w as u64);
+        _ = buf_append_byte(out, 93);
+        col = col + w;
+        x = e;
+    }
+}
+
+// 编码一段 JSON 字符串（含首尾引号）。用本仓 foundation/jsonx 的转义规则
+// （`jw_str_esc_len` 那一族的口径：控制字节走 \u00XX，引号与反斜杠转义）。
+export fn emu_json_str(out: &Buf, p: &const byte, n: usize) void {
+    _ = buf_append_byte(out, 34);                   // '"'
+    var i: usize = 0;
+    while i < n {
+        const b: byte = p[i];
+        if b == 34 {
+            _ = buf_append_cstr(out, "\\\"");
+        } else if b == 92 {
+            _ = buf_append_cstr(out, "\\\\");
+        } else if b == 10 {
+            _ = buf_append_cstr(out, "\\n");
+        } else if b == 13 {
+            _ = buf_append_cstr(out, "\\r");
+        } else if b == 9 {
+            _ = buf_append_cstr(out, "\\t");
+        } else if b < 32 {
+            _ = buf_append_cstr(out, "\\u00");
+            emu_hex2(out, b);
+        } else {
+            _ = buf_append_byte(out, b);
+        }
+        i = i + 1;
+    }
+    _ = buf_append_byte(out, 34);
+}
+
+// 一个字节的两位小写十六进制。
+fn emu_hex2(out: &Buf, b: byte) void {
+    const hexd: &[byte] = &"0123456789abcdef"[0: 16];
+    _ = buf_append_byte(out, hexd[((b as i32) >> 4) as usize]);
+    _ = buf_append_byte(out, hexd[((b as i32) & 15) as usize]);
+}
+
+// ============================================================
+// 帧信封：把「哪些行变了」编码成一条 NDJSON
+// ============================================================
+//
+// 两种信封（前端只认 `type`）：
+//   {"type":"screen", …}   一帧网格（全量或增量；`full` 区分）
+//   {"type":"title", …}    会话标题变了（顶栏用；由 websrv 发，不经解释器）
+//
+// `emu_json_frame` 是**唯一**的装配点：全量与增量走同一条路，区别只在
+// `full = true` 时所有行都算「变了」。这样前端只有一份解码逻辑。
+
+// 装配一帧。`sid` 是会话 id（前端用来丢弃别的会话的帧），`scratch` 是调用方
+// 提供的临时缓冲（差分用；避免每帧分配）。
+// 返回写进 out 的字节数。
+export fn emu_json_frame(g: &EmuGrid, sid: &const byte, sid_len: usize,
+    full: bool, scratch: &Buf, out: &Buf) usize {
+    buf_reset(out);
+    _ = buf_append_cstr(out, "{\"type\":\"screen\",\"session\":");
+    emu_json_str(out, sid, sid_len);
+    _ = buf_append_cstr(out, ",\"cols\":");
+    _ = buf_append_u64(out, g.cols as u64);
+    _ = buf_append_cstr(out, ",\"rows\":");
+    _ = buf_append_u64(out, g.rows as u64);
+    // clear：整屏重来（首帧之后的行数变少，或调用方显式要全量重画）
+    _ = buf_append_cstr(out, ",\"full\":");
+    if full {
+        _ = buf_append_cstr(out, "true");
+    } else {
+        _ = buf_append_cstr(out, "false");
+    }
+    // 光标：行、列（**显示列**）、可见性
+    _ = buf_append_cstr(out, ",\"cursor\":[");
+    _ = buf_append_u64(out, g.cy as u64);
+    _ = buf_append_byte(out, 44);
+    _ = buf_append_u64(out, emu_cursor_col(g) as u64);
+    _ = buf_append_byte(out, 44);
+    if g.cursor_on {
+        _ = buf_append_cstr(out, "true");
+    } else {
+        _ = buf_append_cstr(out, "false");
+    }
+    _ = buf_append_byte(out, 93);
+    // 变化的行
+    _ = buf_append_cstr(out, ",\"rows_changed\":[");
+    var first: bool = true;
+    var y: usize = 0;
+    while y < g.rows {
+        const diff: bool = full || emu_row_diff(g, y, scratch);
+        if diff {
+            if !first {
+                _ = buf_append_byte(out, 44);
+            }
+            first = false;
+            emu_row_json(g, y, out);
+        }
+        y = y + 1;
+    }
+    _ = buf_append_byte(out, 93);
+    // 图片锚点（全量或增量都发：前端按行覆盖，重复发是幂等的）
+    _ = buf_append_cstr(out, ",\"images\":[");
+    first = true;
+    y = 0;
+    while y < g.rows {
+        const has: bool = emu_row_has_obj(g, y);
+        if has && (full || emu_row_diff(g, y, scratch)) {
+            if !first {
+                _ = buf_append_byte(out, 44);
+            }
+            first = false;
+            emu_row_obj_json(g, y, out);
+        }
+        y = y + 1;
+    }
+    _ = buf_append_cstr(out, "]}");
+    _ = buf_append_byte(out, 10);        // NDJSON：一行一帧
+    return out.len;
+}
+
+// 光标当前在第几**显示列**（0 基）。宽字符占 2 列，所以不能直接用 `g.cx`。
+fn emu_cursor_col(g: &const EmuGrid) usize {
+    var cols: usize = 0;
+    var x: usize = 0;
+    while x < g.cx && x < g.cols {
+        const cp: u32 = g.cells[g.cy * EMU_MAX_COLS + x].ch;
+        if cp == 0 {
+            cols = cols + 1;
+        } else {
+            const w: usize = tty_char_cols(cp);
+            cols = cols + (if (w == 0) { 1 as usize } else { w });
+        }
+        x = x + 1;
+    }
+    return cols;
+}
+
+// 第 y 行有没有锚点（图片）。有的话前端要在那一行盖 `<img>`。
+export fn emu_row_has_obj(g: &const EmuGrid, y: usize) bool {
+    if y >= g.rows {
+        return false;
+    }
+    var x: usize = 0;
+    while x < g.cols {
+        if g.cells[y * EMU_MAX_COLS + x].obj_id != 0 {
+            return true;
+        }
+        x = x + 1;
+    }
+    return false;
+}
+
+// 第一行**包含**字面量 lit 的行号（找不到返回 -1）。用于把 `/image` 的回执行
+// 定位到具体某一行，好把锚点打上去（websrv 用它，自测也用它）。
+export fn emu_find_row(g: &const EmuGrid, lit: &const byte) isize {
+    const ll: usize = bufx_cstr_len(lit);
+    if ll == 0 {
+        return -1;
+    }
+    var row: Buf = buf_new(0);
+    defer { buf_free(&row); }
+    var y: usize = 0;
+    while y < g.rows {
+        buf_reset(&row);
+        emu_row_text(g, y, &row);
+        if row.len >= ll {
+            var i: usize = 0;
+            while i + ll <= row.len {
+                var k: usize = 0;
+                var hit: bool = true;
+                while k < ll {
+                    if row.ptr[i + k] != lit[k] {
+                        hit = false;
+                        break;
+                    }
+                    k = k + 1;
+                }
+                if hit {
+                    return y as isize;
+                }
+                i = i + 1;
+            }
+        }
+        y = y + 1;
+    }
+    return -1;
+}
+
+// 第 y 行文本里 lit 出现在第几**显示列**（找不到 -1）。图片锚点的列由它算。
+export fn emu_find_col(g: &const EmuGrid, y: usize, lit: &const byte) isize {
+    const ll: usize = bufx_cstr_len(lit);
+    if ll == 0 || y >= g.rows {
+        return -1;
+    }
+    var row: Buf = buf_new(0);
+    defer { buf_free(&row); }
+    emu_row_text(g, y, &row);
+    if row.len < ll {
+        return -1;
+    }
+    var i: usize = 0;
+    while i + ll <= row.len {
+        var k: usize = 0;
+        var hit: bool = true;
+        while k < ll {
+            if row.ptr[i + k] != lit[k] {
+                hit = false;
+                break;
+            }
+            k = k + 1;
+        }
+        if hit {
+            return tty_cols_between(row.ptr as &const byte, 0, i) as isize;
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+// 让下一帧变成**全量**（尺寸变了、或调用方要求整屏重画时用）。
+// 只清 `have_prev`：`emu_snapshot` 会在下一帧发出后重建它。
+export fn emu_invalidate(g: &EmuGrid) void {
+    g.have_prev = false;
+    g.prev_n = 0;
+}

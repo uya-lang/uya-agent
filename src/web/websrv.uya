@@ -1,0 +1,925 @@
+// src/web/websrv.uya — web 界面的服务端：会话表 + 真 PTY + HTTP 泵
+//
+// 本文件：会话注册表（`WebSession` / `WebTable` 与 `web_*`）、PTY 的开与关
+//   （`web_pty_open` / `web_pty_close`）、子进程派生（`web_session_new`）、
+//   HTTP 端点分派（`web_serve_conn`）与主循环（`web_run` / `web_pump`）。
+// 不变量：① **每个会话是一个真 PTY 上的 `uya-agent` 子进程** —— 子进程跑
+//   `agent_run_tui()`（备用屏幕 + 帧 diff + 浮层 + markdown 全照旧），所以
+//   `src/term/**` 一行都不用改；② **会话 id 由服务端预生成**（`sess_new_id`）
+//   并经环境变量交给子进程（`UYA_AGENT_FORCE_SESSION_ID` → `cfg.force_session_id`
+//   → `sess_open(..., want_id, …)`）：`sess_session_path` 按 cwd 归一化分目录，
+//   同一个 cwd 下 id 唯一，而**子进程自由生成会让服务端找不到它**（页面上就
+//   恢复不了、也读不到标题）；③ URL 里的会话 id **必须是服务端认识的** ——
+//   所有 `/api/*` 都先 `web_find` 查表，查不到回 404，**绝不**把请求串当路径用；
+//   ④ 计数与索引处处**显式夹取**（Uya 的数组边界证明器只认「正的 if 里做索引」，
+//   §16 踩坑 6）；⑤ 所有 fd（listen / conn / master）都是非阻塞的，等就绪一律
+//   靠主循环那一次 `poll`；⑥ 收尾按**进程组**收子进程（`setsid` 之后 pgid == pid，
+//   `kill(-pid)` 连子孙一起收），否则退出后会留下野进程。
+// 依赖：无 `use` 行（合并命名空间）；本仓 foundation/bufx、net/httpsrv（`srv_*`）、
+//   web/ttyemu（`emu_*`）、session/session（`sess_new_id` / `sess_find_last` /
+//   `sess_index_rows_sorted`）、tools/shellx（`sh_env_prepare_kv` / `env_add_kv` /
+//   `sh_env_array`）、session/sigx（`sigx_reset_for_child`）、agent（`Config`、
+//   `agent_run_tui`）。
+// 命名：`web_*`（会话与端点）、`WEB_*`（常量）、`Ws*`（会话表内部结构）。
+//
+// 数据流（一趟）：
+//   浏览器 ──GET /api/screen──► 长连接（NDJSON：一帧一行）
+//          ◄──emu_json_frame─── websrv 把 PTY 读到的字节喂 emu，再取差分
+//   浏览器 ──POST /api/input──► 原样写进 PTY master（子进程 TUI 自己解键）
+//          ──POST /api/resize─► TIOCSWINSZ + kill(SIGWINCH)（TUI 自己重排）
+//
+// 为什么不用 WebSocket：`srv_*` 已经有 chunked 长连接（`/api/screen`），而
+// WebSocket 要多一套握手 + 帧编解码 + 掩码，收益只是「省一次往返」—— 在一个
+// 本地单用户页面上不值。NDJSON 还有个好处：`curl` 就能看（诊断友好）。
+
+// ============================================================
+// 常量
+// ============================================================
+
+export const WEB_MAX_SESSIONS: usize = 8;
+export const WEB_MAX_CONNS: usize = 32;
+
+// 一次 poll 的等待上限（与全仓其它阻塞循环的 ≤50ms 泵点纪律同口径）
+const WEB_POLL_MS: i32 = 50;
+
+// 每个会话留几帧「最近的画面」：新连接（含刷新页面）先把它们发一遍。
+// 为什么留帧而不是留原始字节：原始字节要重放得从头解释一遍（而解释器状态是
+// 增量的），留帧只要原样再发一次。
+const WEB_REPLAY_FRAMES: usize = 4;
+
+// PTY 相关 ioctl（Linux 取值，与自测的 tuis_open_pty 同一套）
+const WEB_TIOCSPTLCK: i64 = 0x40045431;
+const WEB_TIOCGPTN: i64 = 0x80045430;
+const WEB_TIOCSWINSZ: i64 = 0x5414;
+const WEB_TIOCGWINSZ: i64 = 0x5413;
+const WEB_O_RDWR_NOCTTY: i32 = 0x102;      // O_RDWR | O_NOCTTY
+
+// HTTP 端点
+const WEB_P_SESSIONS: &const byte = "/api/sessions" as &const byte;
+const WEB_P_SCREEN: &const byte = "/api/screen" as &const byte;
+const WEB_P_INPUT: &const byte = "/api/input" as &const byte;
+const WEB_P_RESIZE: &const byte = "/api/resize" as &const byte;
+const WEB_P_CLOSE: &const byte = "/api/close" as &const byte;
+const WEB_P_IMAGE: &const byte = "/api/image" as &const byte;
+
+// `/image` 的回执行以它开头；锚点打在这一行上（前端就在这一行盖 `<img>`）。
+export const WEB_IMG_MARK: &const byte = "[image]" as &const byte;
+
+// ============================================================
+// 会话表
+// ============================================================
+
+export struct WebSession {
+    id: Buf,            // 会话 id（服务端预生成，交给子进程）
+    pid: i32,           // 子进程 pid（0 = 没起来）
+    master: i32,        // PTY master fd（-1 = 关着）
+    cols: usize,
+    rows: usize,
+    alive: bool,
+    emu: EmuGrid,       // 网格是**大对象**（定长数组），随结构体一起在堆上
+    replay: [Buf: WEB_REPLAY_FRAMES],   // 最近的帧（环形）
+    replay_n: usize,
+    replay_at: usize,
+    pending: Buf,       // 待写进 PTY 的输入（poll 到 POLLOUT 才吐）
+    scratch: Buf,       // 差分用的临时缓冲（避免每帧分配）
+}
+
+export struct WebTable {
+    items: [WebSession: WEB_MAX_SESSIONS],
+    n: usize,
+    cur: usize,         // 当前选中的会话（`+` 之后指向新的那条）
+}
+
+// 初始化一张表（`n = 0`）。**不**分配任何 Buf —— 那些由 `web_session_new` 建，
+// 所以空表 `web_table_free` 是安全的（幂等）。
+export fn web_table_init(t: &WebTable) void {
+    t.n = 0;
+    t.cur = 0;
+}
+
+// 释放表里每一条会话占的资源（**幂等**）。
+export fn web_table_free(t: &WebTable) void {
+    var i: usize = 0;
+    while i < WEB_MAX_SESSIONS {
+        web_session_free(&t.items[i]);
+        i = i + 1;
+    }
+    t.n = 0;
+    t.cur = 0;
+}
+
+// 释放一条会话：先收子进程（按进程组），再关 master 与各 Buf。
+fn web_session_free(s: &WebSession) void {
+    web_pty_close(s);
+    buf_free(&s.id);
+    buf_free(&s.pending);
+    buf_free(&s.scratch);
+    var i: usize = 0;
+    while i < WEB_REPLAY_FRAMES {
+        buf_free(&s.replay[i]);
+        i = i + 1;
+    }
+    s.replay_n = 0;
+    s.replay_at = 0;
+    emu_free(&s.emu);
+    s.alive = false;
+}
+
+// 按 id 找会话，返回下标（-1 = 没有）。所有 `/api/*` 都先过它。
+export fn web_find(t: &const WebTable, id: &const byte, id_len: usize) isize {
+    if id_len == 0 {
+        return -1;
+    }
+    var i: usize = 0;
+    while i < t.n && i < WEB_MAX_SESSIONS {
+        const s: &const WebSession = &t.items[i];
+        if s.id.len == id_len {
+            var k: usize = 0;
+            var same: bool = true;
+            while k < id_len {
+                if s.id.ptr[k] != id[k] {
+                    same = false;
+                    break;
+                }
+                k = k + 1;
+            }
+            if same {
+                return i as isize;
+            }
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+// 取第 i 条会话（越界返回 null）。
+fn web_at(t: &WebTable, i: usize) &WebSession {
+    if i >= t.n || i >= WEB_MAX_SESSIONS {
+        return null as &WebSession;
+    }
+    return &t.items[i];
+}
+
+// ============================================================
+// PTY：开与关
+// ============================================================
+
+// 指针 → i64（ioctl 的地址参数要整数）。
+fn web_addr(p: &const void) i64 {
+    return (@usize_from_ptr(p)) as i64;
+}
+
+// 开一对 pty，返回 master fd（slave 路径写进 slave_path，**含尾 NUL**）。
+// 尾 NUL 是硬要求：路径要**直接喂子进程的 sys_open**（FFI），而 `buf_new` 只是
+// malloc（不置零）—— 省掉这一字节，sys_open 会把缓冲区后面的残留字节当成路径
+// 的一部分，子进程静默 `sys_exit(9)`（§16 踩坑 97，六轮真 PTY 自测当场红）。
+fn web_pty_open(slave_path: &Buf, cols: usize, rows: usize) i32 {
+    var ptmx: [byte: 16] = "/dev/ptmx";
+    const m: i32 = sys_open(&ptmx[0] as *const byte, WEB_O_RDWR_NOCTTY,
+        0) catch { -1; };
+    if m < 0 {
+        return -1;
+    }
+    var zero: i32 = 0;
+    if (sys_ioctl(m, WEB_TIOCSPTLCK, web_addr(&zero as &const void)) catch {
+        -1;
+    }) != 0 {
+        srv_close(m);
+        return -1;
+    }
+    var num: i32 = 0;
+    if (sys_ioctl(m, WEB_TIOCGPTN, web_addr(&num as &const void)) catch {
+        -1;
+    }) != 0 {
+        srv_close(m);
+        return -1;
+    }
+    buf_reset(slave_path);
+    _ = buf_append_cstr(slave_path, "/dev/pts/");
+    _ = buf_append_i64(slave_path, num as i64);
+    _ = buf_append_byte(slave_path, 0);        // 尾 NUL：见上面的注释
+    web_set_winsize(m, cols, rows);
+    return m;
+}
+
+// 对 master fd 设窗口尺寸（TIOCSWINSZ；8 字节 winsize = rows, cols, x, y）。
+export fn web_set_winsize(m: i32, cols: usize, rows: usize) void {
+    var ws: [byte: 8] = [0: 8];
+    const r: u16 = rows as u16;
+    const c: u16 = cols as u16;
+    ws[0] = (r & 255 as u16) as byte;
+    ws[1] = ((r >> 8) & 255 as u16) as byte;
+    ws[2] = (c & 255 as u16) as byte;
+    ws[3] = ((c >> 8) & 255 as u16) as byte;
+    _ = sys_ioctl(m, WEB_TIOCSWINSZ, web_addr(&ws[0] as &const void)) catch {};
+}
+
+// 读回窗口尺寸（自测断言「resize 真的到了子进程那一侧」用它）。
+export fn web_get_winsize(m: i32, cols: &usize, rows: &usize) bool {
+    var ws: [byte: 8] = [0: 8];
+    if (sys_ioctl(m, WEB_TIOCGWINSZ, web_addr(&ws[0] as &const void)) catch {
+        -1;
+    }) != 0 {
+        return false;
+    }
+    const r: u16 = ((ws[1] as u16) << 8) | (ws[0] as u16);
+    const c: u16 = ((ws[3] as u16) << 8) | (ws[2] as u16);
+    rows[0] = r as usize;
+    cols[0] = c as usize;
+    return true;
+}
+
+// 收一条会话的子进程：**按进程组**（先 SIGCONT 再 SIGKILL，再补一发单 pid），
+// 与 `sh_kill_tree` 同一套口径 —— 理由也一样：子进程 setsid 之后 `kill(-pid)`
+// 才能连它拉起的子孙一起收（否则 web 退出后留下野进程）。
+export fn web_pty_close(s: &WebSession) void {
+    if s.pid > 0 {
+        const neg: i64 = 0 - (s.pid as i64);
+        _ = sys_kill(neg, SIGCONT) catch {};
+        _ = sys_kill(neg, SIGKILL) catch {};
+        _ = sys_kill(s.pid as i64, SIGKILL) catch {};
+        var st: i32 = 0;
+        _ = sys_waitpid(s.pid, &st, 0) catch {};
+        s.pid = 0;
+    }
+    if s.master >= 0 {
+        srv_close(s.master);
+        s.master = -1;
+    }
+    s.alive = false;
+}
+
+// ============================================================
+// 开会话
+// ============================================================
+
+// 新建一条会话：预生成 id → 开 PTY → fork 子进程（跑真 TUI）。
+// 成功返回表内下标，失败 -1。调用方负责传**已经定好的画布尺寸**。
+export fn web_session_new(cfg: &const Config, t: &WebTable,
+    resume_from: &const Buf, cols: usize, rows: usize) isize {
+    if t.n >= WEB_MAX_SESSIONS {
+        return -1;
+    }
+    const idx: usize = t.n;
+    const s: &WebSession = &t.items[idx];
+    web_session_zero(s);
+    // 先算再赋（别写 `s.cols = if (…)`：见 ttyemu.emu_move_to 的注）
+    s.cols = EMU_DEF_COLS;
+    if (cols != 0) {
+        s.cols = cols;
+    }
+    s.rows = EMU_DEF_ROWS;
+    if (rows != 0) {
+        s.rows = rows;
+    }
+    s.id = buf_new(64);
+    s.pending = buf_new(256);
+    s.scratch = buf_new(EMU_MAX_COLS * 4 + 16);
+    // replay 用 `buf_new(0)`：它只是「还没存过帧」的容器，`buf_append` 会自己长；
+    // **不要**用 buf_valid 去判它（cap = 0 会被判成无效）。
+    var i: usize = 0;
+    while i < WEB_REPLAY_FRAMES {
+        s.replay[i] = buf_new(0);
+        i = i + 1;
+    }
+    if !buf_valid(&s.id) || !buf_valid(&s.pending) || !buf_valid(&s.scratch) {
+        out_err("[web] 会话缓冲分配失败\n");
+        return -1;
+    }
+    if !emu_init(&s.emu, s.cols, s.rows) {
+        out_err("[web] 终端网格分配失败\n");
+        return -1;
+    }
+    // 会话 id：恢复时从会话日志路径里取那一条的 id，否则新生成一个。
+    if resume_from.len > 0 {
+        if !web_id_from_path(resume_from, &s.id) {
+            _ = sess_new_id(&s.id);
+        }
+    } else {
+        _ = sess_new_id(&s.id);
+    }
+    if s.id.len == 0 {
+        return -1;
+    }
+    return web_spawn_into(cfg, t, idx, resume_from);
+}
+
+// 把一条会话的所有字段置成「空」（Buf 用 `buf_empty()`：**没有分配**，
+// 所以 `web_session_free` 是安全的；见踩坑 92 的同族 —— 出参缓冲必须是
+// `buf_empty()` 而不是 `buf_new(N)`）。
+fn web_session_zero(s: &WebSession) void {
+    s.id = buf_empty();
+    s.pending = buf_empty();
+    s.scratch = buf_empty();
+    s.pid = 0;
+    s.master = -1;
+    s.cols = EMU_DEF_COLS;
+    s.rows = EMU_DEF_ROWS;
+    s.alive = false;
+    s.replay_n = 0;
+    s.replay_at = 0;
+    var i: usize = 0;
+    while i < WEB_REPLAY_FRAMES {
+        s.replay[i] = buf_empty();
+        i = i + 1;
+    }
+    // emu 的 prev/osc/title 也要置空，这样「还没 emu_init 就 free」也安全
+    var k: usize = 0;
+    while k < EMU_MAX_ROWS {
+        s.emu.prev[k] = buf_empty();
+        k = k + 1;
+    }
+    s.emu.osc = buf_empty();
+    s.emu.title = buf_empty();
+    s.emu.have_prev = false;
+    s.emu.cols = EMU_DEF_COLS;
+    s.emu.rows = EMU_DEF_ROWS;
+}
+
+// 从会话日志路径里取出 id（`…/<id>/session.jsonl` 的倒数第二段）。
+// 为什么不 `sess_read_meta`：那要读整个文件头，而我们只要路径里那一段。
+fn web_id_from_path(path: &const Buf, out: &Buf) bool {
+    buf_reset(out);
+    var end: usize = path.len;
+    while end > 0 && path.ptr[end - 1] != 47 {
+        end = end - 1;
+    }
+    if end == 0 {
+        return false;
+    }
+    const file_end: usize = end - 1;
+    var start: usize = file_end;
+    while start > 0 && path.ptr[start - 1] != 47 {
+        start = start - 1;
+    }
+    if file_end <= start {
+        return false;
+    }
+    return buf_append(out, path.ptr + start, file_end - start);
+}
+
+// fork 出跑真 TUI 的子进程。`idx` 处的会话必须已经建好 id 与网格。
+//
+// 拆成「开 PTY + 备环境」与「fork/exec」两段（各 ≤100 行，AGENTS.md）：
+// 这两段之间**没有共享的可变状态**（argv/envp 都是本函数栈上的），所以切开是安全的。
+fn web_spawn_into(cfg: &const Config, t: &WebTable, idx: usize,
+    resume_from: &const Buf) isize {
+    // 显式夹取：数组边界证明器只认「正的 if 里做索引」（§16 踩坑 6），
+    // 它推不出「调用方保证 idx < t.n <= WEB_MAX_SESSIONS」。
+    if idx >= WEB_MAX_SESSIONS {
+        return -1;
+    }
+    const s: &WebSession = &t.items[idx];
+    var slave: Buf = buf_new(64);
+    defer { buf_free(&slave); }
+    const m: i32 = web_pty_open(&slave, s.cols, s.rows);
+    if m < 0 {
+        out_err("[web] 打不开 /dev/ptmx（pty 用完了？）\n");
+        return -1;
+    }
+    // 子进程要 exec **本进程自己**（不是 `cfg.uya_bin` —— 那是 `uya` 编译器，
+    // 是 workflow 跑 .ush 脚本用的）。用 `/proc/self/exe` 拿到自己的绝对路径：
+    // 这样无论用户是怎么起它的（相对路径 / PATH / 软链）都对。
+    var self_bin: Buf = buf_new(4096);
+    defer { buf_free(&self_bin); }
+    if !web_self_exe(&self_bin) {
+        out_err("[web] 读不到 /proc/self/exe\n");
+        srv_close(m);
+        return -1;
+    }
+    // 环境：把 id 与「要不要恢复」交给子进程（`web_child_env` 里拼）。
+    if !web_child_env(s, resume_from) {
+        srv_close(m);
+        return -1;
+    }
+    // 子进程的 argv：**必须显式带 flag**，不能只靠环境变量。理由：
+    // ① 父进程若是通过 `UYA_AGENT_WEB=1` 起的，那个变量会被子进程**继承** ——
+    //    子进程会再起一个 web 服务器（递归！），而不是跑 TUI；
+    // ② `--tui` 是子进程要做的事（备用屏幕 + 帧），得显式说。
+    // 环境里另加 `UYA_AGENT_WEB=0` 把继承来的关掉（双保险）。
+    var tui_arg: [byte: 8] = "--tui";
+    var argv: [&const byte: 3] = [self_bin.ptr as &const byte,
+        &tui_arg[0] as &const byte, null as &const byte];
+    const pid64: i64 = sys_fork() catch {
+        out_err("[web] fork 失败\n");
+        srv_close(m);
+        return -1;
+    };
+    if pid64 == 0 {
+        web_child_exec(m, &slave, self_bin.ptr as &const byte, &argv[0]);
+    }
+    s.pid = i64_to_i32(pid64);
+    s.master = m;
+    s.alive = true;
+    t.n = t.n + 1;
+    t.cur = idx;
+    return idx as isize;
+}
+
+// 拼子进程的环境（会话 id / 要不要恢复 / 画布尺寸 / 关掉 web 开关）。
+// 为什么在 fork **之前**拼：`sh_env_*` 用的是进程级的全局缓冲（`g_env_ptrs`），
+// 子进程 fork 之后直接用它 —— 所以必须在 fork 前准备好，子进程里不要再动。
+fn web_child_env(s: &const WebSession, resume_from: &const Buf) bool {
+    var idbuf: Buf = buf_new(s.id.len + 1);
+    defer { buf_free(&idbuf); }
+    if !buf_append(&idbuf, s.id.ptr, s.id.len) {
+        return false;
+    }
+    _ = buf_append_byte(&idbuf, 0);
+    var resbuf: Buf = buf_new(resume_from.len + 1);
+    defer { buf_free(&resbuf); }
+    if resume_from.len > 0 {
+        _ = buf_append(&resbuf, resume_from.ptr, resume_from.len);
+    }
+    _ = buf_append_byte(&resbuf, 0);
+    var cols: Buf = buf_new(16);
+    defer { buf_free(&cols); }
+    _ = buf_append_i64(&cols, s.cols as i64);
+    _ = buf_append_byte(&cols, 0);
+    var rows: Buf = buf_new(16);
+    defer { buf_free(&rows); }
+    _ = buf_append_i64(&rows, s.rows as i64);
+    _ = buf_append_byte(&rows, 0);
+    sh_env_prepare_kv("UYA_AGENT_FORCE_SESSION_ID" as &const byte,
+        idbuf.ptr as &const byte, "UYA_AGENT_WEB_RESUME" as &const byte,
+        resbuf.ptr as &const byte);
+    env_add_kv("UYA_AGENT_TUI_COLS" as &const byte, cols.ptr as &const byte,
+        cols.len - 1);
+    env_add_kv("UYA_AGENT_TUI_ROWS" as &const byte, rows.ptr as &const byte,
+        rows.len - 1);
+    env_add_kv("UYA_AGENT_WEB" as &const byte, "0" as &const byte, 1);
+    return true;
+}
+
+// 子进程侧：脱离父进程的会话与终端 → 开从设备当 0/1/2 → execve。**不返回**。
+// 顺序不能换：`setsid` 必须在开 slave **之前**（开了 slave 再 setsid 会被内核
+// 当成「抢控制终端」，可能失败）；开完 slave 就拿到了控制终端，TUI 的
+// TIOCGWINSZ / SIGWINCH / 备用屏幕才有意义。
+fn web_child_exec(master: i32, slave: &const Buf, exe: &const byte,
+    argv: &(&const byte)) void {
+    _ = sys_close(master) catch {};
+    _ = setsid();
+    sigx_reset_for_child();
+    const sf: i32 = sys_open(slave.ptr as *const byte, WEB_O_RDWR_NOCTTY,
+        0) catch { -1; };
+    if sf < 0 {
+        sys_exit(9);
+    }
+    _ = sys_dup2(sf, 0) catch {};
+    _ = sys_dup2(sf, 1) catch {};
+    _ = sys_dup2(sf, 2) catch {};
+    if sf > 2 {
+        _ = sys_close(sf) catch {};
+    }
+    _ = sys_execve(exe, argv, sh_env_array()) catch {};
+    // execve 失败（路径不对/没权限）：写一行给 PTY（父进程那边会看到），
+    // 再以 127 退出 —— 静默退出的话用户只看到「一个空白的标签」。
+    _ = sys_write(2, "[web/child] execve failed\n" as *const byte,
+        26) catch {};
+    sys_exit(127);
+}
+
+// glibc 的 setsid()（工具链没有 sys_setsid 包装；与 shellx 绑 glibc sigaction
+// 同一个写法/理由）。子进程必须自成会话：否则它和父进程同属一个进程组，
+// 父进程的进程组收口会连带收到自己，而且 PTY 从设备会变成父进程所在会话的
+// 控制终端（TUI 的读键会被行规程抢走）。
+extern "libc" fn setsid() i32;
+
+// ============================================================
+// 标题
+// ============================================================
+
+// 取一条会话的标题。优先级（与 TUI 的 `agent_title_base_set` 同口径）：
+//   ① 会话日志索引里那条 `title`（模型 `set_title` / 人手 `/title` / 自动起标题
+//      写进去的），② 服务端从日志尾部派生的兜底（首条人类消息，≤40 字节 /
+//      前 5 个词），③ 空串（前端显示「会话 N」）。
+// 为什么不只在浏览器端轮询：标题是**服务端**知道的事（会话日志在服务端），
+// 而且前端轮询会把「每秒一次的全量列表请求」变成常态。
+export fn web_session_title(cfg: &const Config, s: &const WebSession,
+    out: &Buf) void {
+    buf_reset(out);
+    var home: Buf = buf_new(1024);
+    defer { buf_free(&home); }
+    if !agent_default_home(cfg, &home) {
+        return;
+    }
+    var hz: Buf = buf_new(home.len + 1);
+    defer { buf_free(&hz); }
+    _ = buf_append(&hz, home.ptr, home.len);
+    _ = buf_append_byte(&hz, 0);
+    var rows: Buf = buf_new(0);
+    defer { buf_free(&rows); }
+    if !sess_index_rows_sorted(hz.ptr as &const byte, &rows) {
+        return;
+    }
+    if !web_index_title(&rows, s.id.ptr as &const byte, s.id.len, out) {
+        return;
+    }
+    if out.len == 0 {
+        web_title_from_log(cfg, s, out);
+    }
+}
+
+// 在索引行（每行一条 JSON）里找 `"id":"<want>"` 那一行，取它的 `"title"`。
+// 索引行**不保证**按 id 排序，所以是线性扫（行数 = 会话数，几十到几百）。
+fn web_index_title(rows: &const Buf, want: &const byte, want_len: usize,
+    out: &Buf) bool {
+    if want_len == 0 || rows.len == 0 {
+        return false;
+    }
+    var idpat: Buf = buf_new(want_len + 16);
+    defer { buf_free(&idpat); }
+    _ = buf_append_cstr(&idpat, "\"id\":\"");
+    _ = buf_append(&idpat, want, want_len);
+    _ = buf_append_cstr(&idpat, "\"");
+    var i: usize = 0;
+    while i < rows.len {
+        var e: usize = i;
+        while e < rows.len && rows.ptr[e] != 10 {
+            e = e + 1;
+        }
+        const ll: usize = e - i;
+        if ll > 0 {
+            const line: &const byte = rows.ptr + i;
+            if srv_find(line, 0, ll, idpat.ptr as &const byte,
+                idpat.len) >= 0 {
+                web_json_field(line, ll, "title" as &const byte, out);
+                return true;
+            }
+        }
+        i = e + 1;
+    }
+    return false;
+}
+
+// 从一行 JSON 里取 `"<key>":"<值>"` 的值（**不处理转义**：标题是给浏览器看的，
+// 前端自己会转义；这里只把原文抄出来）。找不到或值为空返回 false。
+fn web_json_field(line: &const byte, n: usize, key: &const byte,
+    out: &Buf) bool {
+    var pat: Buf = buf_new(32);
+    defer { buf_free(&pat); }
+    _ = buf_append_byte(&pat, 34);
+    _ = buf_append_cstr(&pat, key);
+    _ = buf_append_cstr(&pat, "\":\"");
+    const at: isize = srv_find(line, 0, n, pat.ptr as &const byte, pat.len);
+    if at < 0 {
+        return false;
+    }
+    const start: usize = (at as usize) + pat.len;
+    var e: usize = start;
+    while e < n && line[e] != 34 {
+        e = e + 1;
+    }
+    if e <= start {
+        return false;
+    }
+    return buf_append(out, line + start, e - start);
+}
+
+// 从会话日志尾部派生标题：**首条人类消息**的前 5 个词 / ≤40 字节。
+// 只在索引里还没有标题时用（会话刚开、模型还没起标题）。读日志尾部而不是整个
+// 文件：长会话（几 MB）整个读一遍只为了一个标题太贵。读不到就留空。
+fn web_title_from_log(cfg: &const Config, s: &const WebSession,
+    out: &Buf) void {
+    var home: Buf = buf_new(1024);
+    defer { buf_free(&home); }
+    if !agent_default_home(cfg, &home) {
+        return;
+    }
+    // 会话日志路径：扫 `<home>/sessions/*/<id>/session.jsonl`
+    var path: Buf = buf_new(1200);
+    defer { buf_free(&path); }
+    if !web_log_path(&home, s.id.ptr as &const byte, s.id.len, &path) {
+        return;
+    }
+    // 读**日志开头**那一段就够了：兜底标题要的是**首条**人类消息，它在文件
+    // 最前面。不读整个文件 —— 长会话几 MB，只为一个标题不值。
+    var head: Buf = buf_new(0);
+    defer { buf_free(&head); }
+    var pz: Buf = buf_new(path.len + 1);
+    defer { buf_free(&pz); }
+    _ = buf_append(&pz, path.ptr, path.len);
+    _ = buf_append_byte(&pz, 0);
+    if !fs_read_file_all(pz.ptr as &const byte, &head, 65536) {
+        return;
+    }
+    web_title_from_lines(&head, out);
+}
+
+// 在会话日志里找 `<home>/sessions/<cwd 编码>/<id>/session.jsonl`。
+// 会话按 cwd 归一化分目录，但我们不知道子进程用的是哪个 cwd 编码 —— 所以扫
+// `sessions/*` 逐个试（目录数 = 用户用过的工作区数，通常个位数）。
+fn web_log_path(home: &const Buf, id: &const byte, id_len: usize,
+    out: &Buf) bool {
+    buf_reset(out);
+    var root: Buf = buf_new(home.len + 16);
+    defer { buf_free(&root); }
+    _ = buf_append(&root, home.ptr, home.len);
+    _ = buf_append_cstr(&root, "/sessions");
+    _ = buf_append_byte(&root, 0);
+    const dirp: &DIR = opendir(&root.ptr[0] as *const byte);
+    if dirp == null {
+        return false;
+    }
+    defer { _ = closedir(dirp); }
+    while true {
+        const de: &Dirent = readdir(dirp);
+        if de == null {
+            break;
+        }
+        var name: Buf = buf_new(288);
+        defer { buf_free(&name); }
+        if !buf_append_cstr(&name, &de.d_name[0] as &const byte) {
+            continue;
+        }
+        if name.len < 2 || name.ptr[0] != 45 || name.ptr[1] != 45 {
+            continue;
+        }
+        var cand: Buf = buf_new(1200);
+        _ = buf_append_cstr(&cand, home.ptr as &const byte);
+        _ = buf_append_cstr(&cand, "/sessions/");
+        _ = buf_append(&cand, name.ptr, name.len);
+        _ = buf_append_byte(&cand, 47);
+        _ = buf_append(&cand, id, id_len);
+        _ = buf_append_cstr(&cand, "/session.jsonl");
+        _ = buf_append_byte(&cand, 0);
+        if sess_file_exists(cand.ptr as &const byte) {
+            buf_reset(out);
+            _ = buf_append(out, cand.ptr, cand.len - 1);
+            buf_free(&cand);
+            return true;
+        }
+        buf_free(&cand);
+    }
+    return false;
+}
+
+// 从日志尾部若干行里派生标题：找**第一条** `"role":"user"` 且不是注入类
+// （`<system-reminder>` / `Current runtime context` / note 前缀）的那条，取它
+// 文本的前 5 个词 / ≤40 字节。找不到返回（out 留空）。
+fn web_title_from_lines(tail: &const Buf, out: &Buf) void {
+    var i: usize = 0;
+    while i < tail.len {
+        var e: usize = i;
+        while e < tail.len && tail.ptr[e] != 10 {
+            e = e + 1;
+        }
+        const ll: usize = e - i;
+        if ll > 0 {
+            const line: &const byte = tail.ptr + i;
+            if srv_find(line, 0, ll, "\"role\":\"user\"" as &const byte,
+                13) >= 0 {
+                var txt: Buf = buf_new(0);
+                defer { buf_free(&txt); }
+                if web_json_field(line, ll, "text" as &const byte, &txt)
+                    && txt.len > 0 && !web_text_is_injected(&txt) {
+                    web_title_shorten(&txt, out);
+                    if out.len > 0 {
+                        return;
+                    }
+                }
+            }
+        }
+        i = e + 1;
+    }
+}
+
+// 注入类消息不当标题（与 TUI 的 `agent_tui_is_injected` 同口径的**宽松**版：
+// 只看前缀，因为这是「兜底标题」而不是「回放正文」，宁可漏判也不误判）。
+fn web_text_is_injected(t: &const Buf) bool {
+    const heads: [&const byte: 4] = [
+        "<system-reminder>" as &const byte,
+        "Current runtime context" as &const byte,
+        "[session]" as &const byte,
+        "[note]" as &const byte,
+    ];
+    var k: usize = 0;
+    while k < 4 {
+        const h: &const byte = heads[k];
+        const hl: usize = bufx_cstr_len(h);
+        if t.len >= hl {
+            var m: bool = true;
+            var i: usize = 0;
+            while i < hl {
+                if t.ptr[i] != h[i] {
+                    m = false;
+                    break;
+                }
+                i = i + 1;
+            }
+            if m {
+                return true;
+            }
+        }
+        k = k + 1;
+    }
+    return false;
+}
+
+// 标题缩写：空白折叠成单空格、取前 5 个词、总长 ≤40 字节（不切坏多字节字符）。
+// 口径与 `tui` 的标题派生一致（「前 5 个词 / ≤40 B」），这样顶栏与终端标题不会
+// 各说一套。
+fn web_title_shorten(src: &const Buf, out: &Buf) void {
+    buf_reset(out);
+    var words: usize = 0;
+    var i: usize = 0;
+    var pending_space: bool = false;
+    while i < src.len && words < 5 {
+        const ch: byte = src.ptr[i];
+        const adv: usize = tty_utf8_next(src.ptr as &const byte, i, src.len);
+        if ch == 32 || ch == 9 || ch == 10 || ch == 13 {
+            if out.len > 0 {
+                pending_space = true;
+            }
+            i = adv;
+            continue;
+        }
+        if pending_space {
+            if out.len + 1 > 40 {
+                break;
+            }
+            _ = buf_append_byte(out, 32);
+            pending_space = false;
+            words = words + 1;
+            if words >= 5 {
+                break;
+            }
+        }
+        if out.len + (adv - i) > 40 {
+            break;
+        }
+        _ = buf_append(out, src.ptr + i, adv - i);
+        i = adv;
+    }
+}
+
+// 一张空表（所有 Buf 都是 `buf_empty()` = 没有分配，所以 free 安全）。
+fn web_table_zero() WebTable {
+    return WebTable{
+        items: [web_session_value_empty(): WEB_MAX_SESSIONS],
+        n: 0,
+        cur: 0,
+    };
+}
+
+// 一个空会话槽。
+fn web_session_value_empty() WebSession {
+    return WebSession{
+        id: buf_empty(),
+        pid: 0,
+        master: -1,
+        cols: EMU_DEF_COLS,
+        rows: EMU_DEF_ROWS,
+        alive: false,
+        emu: emu_value_empty(),
+        replay: [buf_empty(): WEB_REPLAY_FRAMES],
+        replay_n: 0,
+        replay_at: 0,
+        pending: buf_empty(),
+        scratch: buf_empty(),
+    };
+}
+
+// 一块空网格（`prev` 那些 Buf 全是 `buf_empty()`）。cells 是定长数组，必须
+// 在这里给全默认值（`ch = 0` 就是空白格）。
+fn emu_value_empty() EmuGrid {
+    return EmuGrid{
+        cells: [EmuCell{ ch: 0, fg: EMU_COLOR_DEFAULT, bg: EMU_COLOR_DEFAULT,
+            fg_v: 0, bg_v: 0, obj_id: 0, attr: 0, wide: 0 }
+            : EMU_MAX_ROWS * EMU_MAX_COLS],
+        cols: EMU_DEF_COLS,
+        rows: EMU_DEF_ROWS,
+        cx: 0,
+        cy: 0,
+        fg: EMU_COLOR_DEFAULT,
+        bg: EMU_COLOR_DEFAULT,
+        fg_v: 0,
+        bg_v: 0,
+        attr: 0,
+        prev: [buf_empty(): EMU_MAX_ROWS],
+        prev_n: 0,
+        have_prev: false,
+        st: 0,
+        nparam: 0,
+        params: [-1: EMU_MAX_PARAMS],
+        cur: -1,
+        priv: 0,
+        osc: buf_empty(),
+        cursor_on: true,
+        alt: false,
+        title: buf_empty(),
+    };
+}
+
+// 开第一条会话：优先恢复用户最近那条（`sess_find_last`），拿不到就开新的。
+// **为什么要恢复**：用户打开页面时最想看到的是「上次那条接着说」，而不是一屏空白。
+// 恢复那条的 id 由服务端从日志路径里取（`web_id_from_path`）。
+fn web_first_session(cfg: &const Config, t: &WebTable, last: &Buf) isize {
+    var resumed: Buf = buf_empty();
+    defer { buf_free(&resumed); }
+    var home: Buf = buf_new(1024);
+    defer { buf_free(&home); }
+    if agent_default_home(cfg, &home) {
+        var hz: Buf = buf_new(home.len + 1);
+        defer { buf_free(&hz); }
+        _ = buf_append(&hz, home.ptr, home.len);
+        _ = buf_append_byte(&hz, 0);
+        var cwdz: Buf = buf_new(cfg.workspace.len + 1);
+        defer { buf_free(&cwdz); }
+        _ = buf_append(&cwdz, cfg.workspace.ptr, cfg.workspace.len);
+        _ = buf_append_byte(&cwdz, 0);
+        var path: Buf = buf_new(1200);
+        defer { buf_free(&path); }
+        _ = last;
+        if sess_find_last(hz.ptr as &const byte, cwdz.ptr as &const byte,
+            &path) {
+            _ = buf_append(&resumed, path.ptr, path.len);
+        }
+    }
+    return web_session_new(cfg, t, &resumed, EMU_DEF_COLS, EMU_DEF_ROWS);
+}
+
+// ============================================================
+// 图片锚点：把 `/image` 的回执行标成「这一格是个外部对象」
+// ============================================================
+
+// 在网格里找 `/image` 的回执行（以 `[image]` 开头），把这一行**从标记开始**的
+// 格子标成锚点。`obj_id` 取「行号 + 1」（>0 就行；前端只用它拼 `/api/image?id=`，
+// 而 id 的真值在那行文本里的标签上 —— 见 web_image_id_at）。
+//
+// 为什么锚点只标一格宽：图片的尺寸由**前端**按 CSS 决定（服务端不知道浏览器
+// 的字号），标一格只是给前端一个「插图从这里开始」的坐标。真正的图片 id 在
+// 文本里（`[image] 已挂 1 张 <名字>`），前端从那一行的文本里取 —— 但文本里是
+// **文件名**而不是内容寻址 id，所以这里把锚点的 `obj_id` 用作「第几张图」的序号，
+// 前端拿 `GET /api/attachments` 的列表按序号取 id。这样服务端不必把 id 塞进网格。
+export fn web_annotate_images(s: &WebSession) void {
+    var row: Buf = buf_new(0);
+    defer { buf_free(&row); }
+    var nth: i32 = 0;
+    var y: usize = 0;
+    while y < s.emu.rows {
+        buf_reset(&row);
+        emu_row_text(&s.emu, y, &row);
+        if web_row_has_mark(&row) {
+            nth = nth + 1;
+            _ = emu_obj_put(&s.emu, 0, y, nth, 1);
+        } else {
+            // 那一行已经不是回执行了（被后来的输出挤走）：锚点跟着消失。
+            // 判据是**重算**而不是增量维护 —— 增量维护要在每次 emu_feed 之后
+            // 精确知道「哪一行被改了」，而重算一遍是 O(行 × 行宽)，30 行无所谓。
+            _ = emu_obj_put(&s.emu, 0, y, 0, 1);
+        }
+        y = y + 1;
+    }
+}
+
+// 这一行是不是 `/image` 的回执行（含 `[image]` 标记）。
+fn web_row_has_mark(row: &const Buf) bool {
+    const mark: &const byte = WEB_IMG_MARK;
+    const ml: usize = bufx_cstr_len(mark);
+    if row.len < ml {
+        return false;
+    }
+    return find_sub(row.ptr[0: row.len], mark[0: ml], 0) >= 0;
+}
+
+// 取第 i 条会话的 id 指针 / 长度（JSON 输出用；越界给空）。
+// 第 i 条会话的 id（JSON 输出用；越界给空串）。
+export fn web_id_of(t: &const WebTable, i: usize) &const byte {
+    if i >= t.n || i >= WEB_MAX_SESSIONS {
+        return "" as &const byte;
+    }
+    return t.items[i].id.ptr as &const byte;
+}
+
+// 第 i 条会话的 id 长度（与 `web_id_of` 配对；越界给 0）。
+export fn web_id_len_of(t: &const WebTable, i: usize) usize {
+    if i >= t.n || i >= WEB_MAX_SESSIONS {
+        return 0;
+    }
+    return t.items[i].id.len;
+}
+
+// 取本进程自己的可执行文件路径（`readlink /proc/self/exe`），**带尾 NUL**
+// （要直接喂 `sys_execve`）。
+// 为什么不用 `get_argv(0)`：那可能是相对路径或软链，而子进程 execve 时的 cwd
+// 已经变了（且 execve 不查 PATH）。`/proc/self/exe` 是内核给的绝对真身。
+fn web_self_exe(out: &Buf) bool {
+    buf_reset(out);
+    var p: [byte: 16] = "/proc/self/exe";
+    var tmp: [byte: 4096] = [0: 4096];
+    const n: isize = sys_readlink(&p[0] as *const byte, &tmp[0], 4096) catch {
+        -1 as isize;
+    };
+    if n <= 0 {
+        return false;
+    }
+    const cn: usize = n as usize;
+    if cn >= 4096 {
+        return false;
+    }
+    if !buf_append(out, &tmp[0], cn) {
+        return false;
+    }
+    return buf_append_byte(out, 0);
+}
