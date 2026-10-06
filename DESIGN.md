@@ -232,9 +232,19 @@ main()                                    src/agent/agent.uya:9884
 | `g_pending_imgs` | `ImgList` | 回合 | 待发图片（**批次**语义：一次请求带走一批） |
 | `g_watch` + `g_watch_*` | 跟随态 | 回合/进程 | `/watch`（§11.6）；**进程状态，`--resume` 不回填** |
 | `g_mc` | `McTable` | 进程 | 模型目录（§3.1 第 3.5 步） |
+| `g_mc_ready` | `bool` | 进程 | 目录懒加载标志（自测用 `agent_models_reset` 丢掉重读） |
 | `g_title_*` | 标题 | 会话 | 终端标题栈 / 钉住 / 自动起标题 revision |
 | `g_interactive` | `bool` | 进程 | 交互模式（决定泵点与提示词形态） |
 | `g_pump_cfg` / `g_pump_hist` | 泵点上下文 | 回合 | 让**阻塞循环内部**的泵点也能派发命令 |
+
+> **模型选择的身份是 `(provider, model)` 二元组，不是模型名**（P62，踩坑 99）：`settings.yaml` 里
+> 两家提供方发布**同一个 id** 是合法的（真机 `DeepSeek-V4.1-Flash` 就挂在 `aigw-local` 与
+> `autodl-api` 两家）。所以 `McEntry` 的主键是二元组（`mx_find` 收两个参数），`/model` 浮层的
+> **每一行都带提供方**（`✓ <名字> · <提供方>  effort: …`，`✓` 按二元组比），反解也把提供方一起
+> 交回（`agent_model_item_parse` 的第三个出参）；文本 / 命令行用 **`提供方/名字`** 指定，且只在
+> 「这一对确实在目录里」时才拆（`Qwen/Qwen3-32B` 这类自带 `/` 的 id 不许被误拆）。
+> **推论**：任何「用一行文本指定一个模型」的地方，行里必须带够把二元组唯一确定下来的信息 ——
+> 缺了它不会报错，只会让另一家的选择**静默失效**（幂等分支在 `announce` 之前 `return 1`）。
 
 > **`g_pump_cfg/g_pump_hist` 为什么存在**：工具执行、DNS、TLS 握手这些**阻塞循环**里也要泵界面，
 > 而它们手里没有 `Config`/`History`。`agent_pump_ctx_begin` 在回合开始时登记一份，泵点就能
@@ -3104,6 +3114,41 @@ responses 用 `{"type":"input_image","detail":"auto","image_url":…}`；
 `Error: write is refused in read-only mode (the user granted no write access). Do not retry; …`，
 且 `bash` 每条命令先过人工批准闸门。
 
+99. **「模型」被当成一个名字，而它其实是一个二元组 —— 同名跨提供方时另一家永远选不中**（P62，用户报的）：
+   现场：`settings.yaml` 里 `aigw-local` 与 `autodl-api` **都**发布了 `id: DeepSeek-V4.1-Flash`
+   （默认路线是 `autodl-api`）。用户在 `/model` 浮层里选中另一家的那一行按回车，**屏幕上什么都不
+   发生** —— 信息行不变、也没有任何提示，看上去像「按键没生效」。
+   根因是**同一条链上有三处都把「模型」当成一个名字**，于是同名时每一处都各丢一半：
+   ① **显示层**：`agent_model_items_into` 每行只写模型名，`✓` 判据也只比 `cfg.model` ⇒ 同名两行
+   **都挂 ✓**，屏幕上分不出哪一行才是当前路线；
+   ② **选择层**：`agent_model_item_parse` 只反解出模型名，`agent_tui_model_handle` 于是只能拿
+   **当前** `cfg.provider` 去 `agent_model_apply` ⇒ 选另一家的同名行时 `mx_find(当前, 名字)` 命中的
+   还是**当前**那一条；
+   ③ **幂等分支**：`agent_model_apply` 判出「同一个 (provider, model)」就 `return 1`，而它在
+   `announce` **之前**返回 ⇒ 连一条 notice 都没有 ⇒ 「选不中」被伪装成「什么都没发生」。
+   `--model` / `/model <名字>` 这两条只给名字的路同样够不到第二家（`mx_find` 的跨提供方回退取
+   **第一个**匹配）。真机对照：`/status` 与 `--print-config` 一切正常，只有「选另一家」这一下是死的
+   —— 因为前两者读的是 `cfg`，而故障发生在「从一行文本回到二元组」这一步。
+   **修法**（把二元组一路带到底，且**绝不猜**）：
+   * 浮层每行写成 `✓|  <名字> · <提供方>  effort: …`（提供方紧跟名字，不放行尾：行尾会被框宽裁掉，
+     而档位清单随时能顶到框外）；`✓` 按 `(provider, model)` 比；
+   * 反解把提供方一起交出来（没有 ` · ` 标记的老格式交回空串，调用方退回当前提供方）；
+   * `agent_model_apply` 收 **`提供方/名字`** 写法，且**只在「这一对确实在目录里」时才拆**
+     （`Qwen/Qwen3-32B` 这类 id 自带 `/`：拆错会把请求发到别的路线，比「名字换了能力没跟上」更坏）；
+   * 幂等命中时补一条可见回执（`已经就是这个模型：<提供方>/<名字>`）—— 静默的 no-op 是最难查的形态；
+     回车落在**分组标题**（`# <提供方>`）上也给一条说明（那一行不是模型；同名模型恰好就夹在这些
+     标题之间，多按一下 ↑/↓ 再回车正是「什么都没发生」的经典现场）；
+   * 同名别家存在时，回执追加「另有提供方发布同名模型：…；要指定用 `提供方/名字`」；
+   * `--provider` 也**当场解析路线**（端点/凭据/协议），并在 `--model` 已给过时照新提供方重收口一次
+     —— 否则 `--provider P` 只改了个名字，`--provider P --model M` 还会把 P 的模型名打到旧端点上
+     （踩坑 96 的孪生形态）；两条参数顺序因此结果相同；
+   * **显式优先，且不许跨提供方回退把它吃掉**：`agent_model_apply` 在「指定提供方下查不到」时会按
+     名字**跨提供方**回退（那是 `/model <名字>` 的语义），拿它处理显式声明会把用户点的 P 悄悄换成
+     别家（症状：`--provider beta --model m` 打出来 `provider = alpha`）。所以显式给过 `--provider`
+     时先问一次目录：这一对在 P 下存在才收口，否则按「目录外」的老口径（只换名字 + 解析 P 的路线）。
+   教训：**凡是「用户用一行文本指定一个实体」的地方，行里必须带够把那个实体唯一确定下来的字段**。
+   判据写得再细也救不了「行里根本没这个信息」——而缺的那一半不会报错，只会让另一家的选择**静默失效**。
+
 ---
 
 ## 18. TLS 信任策略（重要，和标准库现状有关）
@@ -3200,15 +3245,15 @@ DEEPSEEK_API_KEY=sk-xxx ./build/uya-agent \
 | `diff-parse` | diff → 行表：MIX/多 hunk/CRLF/TAB/`Binary files`；P36 `gd_next_change` 环绕 |
 | `ws-resolve` | 恢复时工作区判定：显式优先、记录不存在 fallback、`WS_E_SAME` 幂等 |
 | `sess-meta-big` | ~3 MiB 日志 `sess_read_meta` 段错误回归（未修 139）、残行 `dropped_tail` |
-| `model-catalog` | provider 级 compat 继承、档位集合、`reasoningEfforts: false` 不公布、`none`==`off` |
-| `model-apply` | 切换跟随能力、旧档位回落 `off`、幂等返回 1、目录外不动能力；**P37 修复**：换提供方时 `base_url` 与 `api_style` **双向**跟随（beta→alpha→beta 都断言）、跟随来的来源码落 `dsh-settings`、**显式 `--base-url`/`--api-key` 不被覆盖**、提供方**没声明 `baseURL`** 时端点一个字节不动、**解析不出凭据**时清空 key（旧密钥绝不跨提供方）（踩坑 96） |
+| `model-catalog` | provider 级 compat 继承、档位集合、`reasoningEfforts: false` 不公布、`none`==`off`；**P62**：同名 a-two 跨提供方在目录里是**两条**且二元组查得开（能力各是各的） |
+| `model-apply` | 切换跟随能力、旧档位回落 `off`、幂等返回 1、目录外不动能力；**P62**：同名 a-two 用 `提供方/名字` **双向**指定（alpha↔delta：provider/contextWindow/端点都跟着换）、目录里查不到的左半段不被误拆（`Qwen/Qwen3-32B` 整串当模型名）；**P37 修复**：换提供方时 `base_url` 与 `api_style` **双向**跟随（beta→alpha→beta 都断言）、跟随来的来源码落 `dsh-settings`、**显式 `--base-url`/`--api-key` 不被覆盖**、提供方**没声明 `baseURL`** 时端点一个字节不动、**解析不出凭据**时清空 key（旧密钥绝不跨提供方）（踩坑 96） |
 | `effort-apply` | 公布的收、同值幂等返回 1、未公布拒 2、透传但 `effort_set=false` |
 | `model-log` | `session/model` 三字段取最后一条 |
 | `worktree` | 真 git：建 worktree + `dsh/<slug>`、闸门、`wt_finish` 合并且目录消失 |
 | `worktree-discard` | `wt_discard` 不合并；非仓库 `wt_provision` 判 `SKIPPED` |
 | `worktree-tool-msg` | 踩坑 80：走**真工具入口**带 `message` 的 finish —— `git log -1 --pretty=%s` 读回来的提交说明**逐字节**等于传入的 marker（`wt_finish` 把 `msg` 当 C 串，JSON 解出来的 Buf 没有 NUL 时会读到堆尾巴） |
 | `worktree-reclaim` | P49 残留回收（真 git，逐条对照）：**干净 + 零提交**的清了（目录与分支都没了）；**有未提交改动**的留、**有未合并提交**的留、**有活进程 cwd 在里面**的留（真 `fork`+`chdir`+`exec sleep` 当占用者，杀掉之后同一份扫描又能清掉它 —— 证明判据 ③ 真在判「活着」而不是碰巧被别的原因挡着）；**孤儿分支**（目录已没、`worktree list` 列不到）零提交的清掉、有提交的留（这一条钉的是判据自己：断言查报告里**没有** `kept branch …(git refused)`，否则会被 git 的第二道闸门兜成假绿 —— 第一版就漏在这儿）；`wt_reclaim_own` 清掉自己的空 worktree 后 `phase=DISCARDED` |
-| `tui-model` | `/model` 与 `/effort` 浮层：分组标题、`✓` 只在当前行、只列公布档位 |
+| `tui-model` | `/model` 与 `/effort` 浮层：分组标题、`✓` 只在当前行、只列公布档位；**P62**：同名 a-two 两行里 `✓` **只挂当前那一家**、反解带出提供方（老格式交回空串）、键盘走到另一家的同名行回车**真的换过去**（provider/能力/端点三样）、`提供方/名字` 写法、同名歧义有可见提示 |
 | `ws-tool` | workspace 工具：失败状态不变、日志/索引写入、`/diff` 头短路径 |
 | `diff-git` | 真 git：XY 码/numstat、未跟踪/删除、`gd_refresh`、P36 跨文件跳转 |
 | `tui-approve` | read-only 逐条批准：headless fail closed；真 PTY `↑`+回车后命令真跑 |
@@ -3257,7 +3302,7 @@ DEEPSEEK_API_KEY=sk-xxx ./build/uya-agent \
 | `tui-switch` | P39 换会话：清转录 → 回放 → 回执、脚注保留、滚动模式不动；P25 会话级状态：`/new`、`/resume` 清空 todo 清单（屏幕与 `g_todos.n` 两处），目标不跟着清 |
 | `tui-sessions` | `/sessions` 浮层：箱体铺开、默认游标在最后一项、完整 id |
 | `tui-sessions-big` | 踩坑 68：2000 项 —— 取行查表 vs 线性扫描**差分逐字节相同** + 取末项 20000 次的自校准比值（查表 ≪ 扫描）+ 第 0/中/末项文本正确 + home/end/↑/↓ 与 sel_set 自洽 + 列表与 reader 成帧各 < 1 s + 正文层无 ESC/NUL |
-| `tui-model` | P37 `/model`/`/effort` 浮层：按提供方分组、只列公布的档位、反解、非推理模型不开浮层；**P37 修复**：回合运行中选完模型 ⇒ **泵点当场收口**（`cfg.model` 立刻变、结果不再挂着、浮层已关） |
+| `tui-model` | P37 `/model`/`/effort` 浮层：按提供方分组、只列公布的档位、反解、非推理模型不开浮层；**P37 修复**：回合运行中选完模型 ⇒ **泵点当场收口**（`cfg.model` 立刻变、结果不再挂着、浮层已关）；**P62**：同名跨提供方（见踩坑 99）—— 行里带提供方、`✓` 按二元组、选中另一家的同名行真换过去 |
 | `tui-worktree` | P41 `/worktree` 动作选择浮层：标题/八个动作/✓ 标当前模式、反解只认动作行（「取消」不认）、默认游标 = `status`；`finish`/`discard` 选定不生效、先翻确认框（默认游标 = 取消）；**真 git**：确认前 worktree 目录与 phase 一个字节不动、确认后才合并 + 删除 |
 | `tui-mouse` | 踩坑 72 鼠标上报开关（`F2` / `/mouse` / `--no-mouse`）：标志位默认开 + `tui_set_mouse` 幂等；`F2` 两种编码（`ESC O Q` / `ESC[12~`）与 `/mouse on·off·非法`；**字节级**进/关/再开/关着进都与开关一致；帮助浮层里有 `F2` 那一条；**真 PTY** 两个方向（默认开必有 `1000h`、`mouse=false` 必无 `1000h`/`1006h`） |
 | `title-cmd` | P48 `/title` 与 `set_title`：清洗（80 B / 码点边界 / 控制序列全丢后为空 ⇒ 报错且标题**不动**）、钉住语义（`user` 置位后自动起标题不跑、`clear` 解锁）、revision 门控（同一条人类消息只生成一次）、落盘事件逐字节（kind 三档 + clear 的**空标题**事件）、索引同步、`set_title` 工具三支（合法/空串/缺键）、工具目录里有它 |

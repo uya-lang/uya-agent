@@ -320,32 +320,59 @@ e2e-diff: build
 #   ① 目录来自 DSH 设置：--print-config 要报 provider / 档位清单（构造一份假 settings.yaml）；
 #   ② 不认识模型名：只换名字，provider / contextWindow 保持不动（静默清空会让压缩失效）；
 #   ③ 行式 REPL：/model 报告 + 切换、/effort 报告 + 合法档位收、非法档位拒并列出可选；
-#   ④ 不公布档位的模型：--effort 原样透传（不 clamp），/effort 仍能报出当前值。
+#   ④ 不公布档位的模型：--effort 原样透传（不 clamp），/effort 仍能报出当前值；
+#   ⑤ P62 **同名跨提供方**：beta 也发布 a-think ⇒ 用 `beta/a-think` 必须换到 beta（provider 与
+#      contextWindow 都跟着走），只给名字时用当前提供方并在回执里点出同名的那一家。
 e2e-model: build
 	@set -e; \
 	home=build/selftest_p37_e2e; rm -rf $$home; mkdir -p $$home; \
-	printf 'llm-pi-ai:\n  providers:\n    {\n      alpha:\n        {\n          api: openai-responses,\n          baseURL: https://alpha.example/v1,\n          models:\n            [\n              { id: a-plain, contextWindow: 111000 },\n              { id: a-think, contextWindow: 222000, reasoningEfforts: { off: none, low: low, high: high } }\n            ]\n        }\n    }\nagent-default-model:\n  provider: alpha\n  model: a-think\n  reasoningEffort: high\n' > $$home/settings.yaml; \
+	printf 'llm-pi-ai:\n  providers:\n    {\n      alpha:\n        {\n          api: openai-responses,\n          baseURL: https://alpha.example/v1,\n          models:\n            [\n              { id: a-plain, contextWindow: 111000 },\n              { id: a-think, contextWindow: 222000, reasoningEfforts: { off: none, low: low, high: high } }\n            ]\n        },\n      beta:\n        {\n          api: openai-completions,\n          baseURL: https://beta.example/v1,\n          models:\n            [\n              { id: a-think, contextWindow: 444000, reasoningEfforts: { off: none } }\n            ]\n        }\n    }\nagent-default-model:\n  provider: alpha\n  model: a-think\n  reasoningEffort: high\n' > $$home/settings.yaml; \
 	run="$(CURDIR)/$(OUT) --dsh-home $$home --no-tui --quiet --api-key dummy-key"; \
 	out=$$($$run --print-config 2>&1); \
 	echo "$$out" | grep -q "model = a-think  (source: dsh-settings)" || { echo "FAIL: DSH 的默认模型没生效"; echo "$$out"; exit 1; }; \
 	echo "$$out" | grep -q "provider = alpha  (source: dsh-settings)" || { echo "FAIL: provider 没解析出来"; echo "$$out"; exit 1; }; \
-	echo "$$out" | grep -q "model_catalog = 2 model(s)" || { echo "FAIL: 目录条目数不对"; echo "$$out"; exit 1; }; \
+	echo "$$out" | grep -q "model_catalog = 3 model(s)" || { echo "FAIL: 目录条目数不对"; echo "$$out"; exit 1; }; \
 	echo "$$out" | grep -q "^efforts = off, low, high" || { echo "FAIL: 公布的档位清单不对"; echo "$$out"; exit 1; }; \
 	out=$$($$run --model not-in-catalog --print-config 2>&1); \
 	echo "$$out" | grep -q "model = not-in-catalog" || { echo "FAIL: 目录外的模型名没换上去"; exit 1; }; \
 	echo "$$out" | grep -q "provider = alpha" || { echo "FAIL: 目录外的模型不该清掉 provider"; echo "$$out"; exit 1; }; \
 	echo "$$out" | grep -q "context_window = 222000" || { echo "FAIL: 目录外的模型不该清掉 contextWindow"; echo "$$out"; exit 1; }; \
+	: "⑤ P62：同名 a-think 在 beta 下也有一份 ⇒ provider/名字 必须真的换到那一家"; \
+	out=$$($$run --model beta/a-think --print-config 2>&1); \
+	echo "$$out" | grep -q "provider = beta" || { echo "FAIL: \`--model beta/a-think\` 没把 provider 换到 beta（同名模型选不中）"; echo "$$out"; exit 1; }; \
+	echo "$$out" | grep -q "context_window = 444000" || { echo "FAIL: 同名 a-think 换到 beta 之后能力没跟着换"; echo "$$out"; exit 1; }; \
+	echo "$$out" | grep -q "base_url = https://beta.example/v1" || { echo "FAIL: 同名 a-think 换到 beta 之后端点没跟过去"; echo "$$out"; exit 1; }; \
+	: "⑤b 只给名字 = 用当前提供方（alpha），同名的那一家在 /model 报告里看得见"; \
+	out=$$($$run --model a-think --print-config 2>&1); \
+	echo "$$out" | grep -q "provider = alpha" || { echo "FAIL: 只给名字时应当用当前提供方"; echo "$$out"; exit 1; }; \
+	: "⑤c --provider 与 --model 的先后顺序无关（两条路都要落在 beta 上）"; \
+	out=$$($$run --provider beta --model a-think --print-config 2>&1); \
+	echo "$$out" | grep -q "provider = beta" || { echo "FAIL: \`--provider beta --model a-think\` 没落在 beta 上"; echo "$$out"; exit 1; }; \
+	echo "$$out" | grep -q "base_url = https://beta.example/v1" || { echo "FAIL: \`--provider beta --model a-think\` 的端点没跟着换"; echo "$$out"; exit 1; }; \
+	out=$$($$run --model a-think --provider beta --print-config 2>&1); \
+	echo "$$out" | grep -q "provider = beta" || { echo "FAIL: \`--model a-think --provider beta\` 没落在 beta 上"; echo "$$out"; exit 1; }; \
+	echo "$$out" | grep -q "base_url = https://beta.example/v1" || { echo "FAIL: \`--model a-think --provider beta\` 的端点没跟着换"; echo "$$out"; exit 1; }; \
+	: "⑤c2 显式优先：P 下没有这个模型时不许跨提供方回退（否则用户点的 P 会被悄悄换掉）"; \
+	out=$$($$run --provider beta --model a-plain --print-config 2>&1); \
+	echo "$$out" | grep -q "provider = beta" || { echo "FAIL: 显式 --provider beta + 不在它目录里的模型，provider 被跨提供方回退改掉了"; echo "$$out"; exit 1; }; \
+	echo "$$out" | grep -q "model = a-plain" || { echo "FAIL: 显式 --provider beta + a-plain 的模型名不对"; echo "$$out"; exit 1; }; \
 	out=$$(printf '/model\n/effort\n/effort bogus\n/effort low\n/effort\n/exit\n' | $$run 2>&1); \
 	echo "$$out" | grep -q "model      a-think  ·  provider alpha" || { echo "FAIL: /model 报告不对"; echo "$$out"; exit 1; }; \
 	echo "$$out" | grep -q "^efforts    off, low, high" || { echo "FAIL: /model 报告里没有档位清单"; echo "$$out"; exit 1; }; \
 	echo "$$out" | grep -q "# alpha" || { echo "FAIL: /model 报告没有按提供方分组"; echo "$$out"; exit 1; }; \
+	echo "$$out" | grep -q "a-think · alpha" || { echo "FAIL: /model 报告里同名两行没有各自标出提供方"; echo "$$out"; exit 1; }; \
+	echo "$$out" | grep -q "a-think · beta" || { echo "FAIL: /model 报告里同名两行没有各自标出提供方"; echo "$$out"; exit 1; }; \
 	echo "$$out" | grep -q "不是这个模型公布的档位" || { echo "FAIL: 非法档位没有报错"; echo "$$out"; exit 1; }; \
 	echo "$$out" | grep -q "推理强度已切换" || { echo "FAIL: /effort low 没切过去"; echo "$$out"; exit 1; }; \
+	: "⑤d 文本命令 /model beta/a-think 也要能指定同名里的另一家"; \
+	out=$$(printf '/model beta/a-think\n/model\n/exit\n' | $$run 2>&1); \
+	echo "$$out" | grep -q "模型已切换" || { echo "FAIL: \`/model beta/a-think\` 没切过去"; echo "$$out"; exit 1; }; \
+	echo "$$out" | grep -q "model      a-think  ·  provider beta" || { echo "FAIL: \`/model beta/a-think\` 没换到 beta"; echo "$$out"; exit 1; }; \
 	: "④ 不公布档位的模型：原样透传"; \
 	out=$$($$run --model a-plain --effort xhigh --print-config 2>&1); \
 	echo "$$out" | grep -q "reasoning_effort = xhigh" || { echo "FAIL: 不公布档位时应当原样透传"; echo "$$out"; exit 1; }; \
 	echo "$$out" | grep -q "not a level this model publishes" || { echo "FAIL: 透传的值应当被标出来（不是模型公布的档位）"; echo "$$out"; exit 1; }; \
-	echo "e2e-model: 通过（目录/能力跟随/目录外只换名字/REPL 报告与切换/非法档位拒/透传标注）"
+	echo "e2e-model: 通过（目录/能力跟随/目录外只换名字/REPL 报告与切换/非法档位拒/透传标注/同名跨提供方指定与提示/--provider 顺序无关）"
 
 # P37：**切模型要连端点与凭据一起跟随**（离线，真终端 + 两个假网关，不联网）
 #   用户报的症状是「中途切换不了模型」：切换看起来成功了（信息行/model 报告都变了），
