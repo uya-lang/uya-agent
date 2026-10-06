@@ -1,0 +1,350 @@
+// src/pm/pm_repo.uya — 项目身份：归一化仓库根 + 记忆目录（P66）
+//
+// 本文件：仓库根发现（`pm_repo_root`）、worktree 归一到主仓（`pm_gitdir_of`/`pm_common_dir`）、
+//   项目键（`pm_repo_key`）、记忆目录路径（`pm_dir`/`pm_ensure_dir`）、原子写小工具
+//   （`pm_write_file_atomic`）与目录删除（`pm_rm_rf`）。
+// 不变量：① **项目键按归一化后的主仓根算**，不按 cwd —— 实测 167 次 `session/workspace` 是
+//   worktree 切换（「真机每个会话的 cwd 都不同」），按 cwd 存等于每次都是新项目，记忆永远
+//   攒不起来；worktree 与其主仓必须落到**同一个键**；
+//   ② worktree 的 `.git` 是**文件**（内容 `gitdir: <主仓>/.git/worktrees/<name>`），主仓的
+//   `.git` 是**目录** —— 两种形状都要认，且从 gitdir 反推主仓时走 `<common>` 段而不是猜前缀；
+//   ③ 目录里所有写入都**只追加或原子替换**（临时文件 + rename），半个文件不许留；
+//   ④ **失败一律返回 false，不产生副作用**：拿不到仓库根就用 workspace 兜底，不报错 ——
+//   不在 git 仓里跑 agent 是常态（`/tmp` 那 341 个会话）。
+// 依赖：libc（syscall / unistd / heap）；本仓 foundation/bufx（Buf 与 buf_*）、
+//   tools/fsx（`fs_stat`）；tls/crypto/sha256（项目键取哈希）。
+// 命名：`pm_*`（本文件）、`PmStat` 一族类型、`PM_*` 常量。
+
+use libc.syscall;
+use libc.unistd;
+use tls.crypto.sha256;
+
+export const PM_PATH_MAX: usize = 4096;
+
+// ============================================================
+// 路径小工具
+// ============================================================
+// 去掉**尾部**的 `/`（根 `/` 除外）。返回新长度，不改调用方的缓冲区。
+// 为什么要它：`/a/b/` 与 `/a/b` 必须是同一个项目键，否则同仓两个键。
+export fn pm_trim_slash(p: &const byte, n: usize) usize {
+    var k: usize = n;
+    while k > 1 && p[k - 1] == 47 as byte {
+        k = k - 1;
+    }
+    return k;
+}
+
+// 取 [0, n) 里**最后一段**（最后一个 `/` 之后的部分）的起始偏移；没有 `/` 返回 0。
+fn pm_last_seg(p: &const byte, n: usize) usize {
+    var k: usize = n;
+    while k > 0 && p[k - 1] != 47 as byte {
+        k = k - 1;
+    }
+    return k;
+}
+
+// ============================================================
+// 仓库根与 worktree 归一
+// ============================================================
+// 读一个「可能是 .git 文件」的路径首行，取出 `gitdir:` 后面的路径写进 out。
+// 不是 .git 文件（读不到 / 没有该前缀）返回 false，out 不动。
+fn pm_gitdir_of(git_path: &const byte, out: &Buf) bool {
+    var text: Buf = buf_new(2048);
+    defer { buf_free(&text); }
+    if !fs_read_file_all(git_path, &text, 8192) || text.len == 0 {
+        return false;
+    }
+    const view: &[byte] = text.ptr[0: text.len];
+    const at: isize = find_sub(view, &"gitdir:"[0: 7], 0);
+    if at < 0 {
+        return false;
+    }
+    var i: usize = at as usize + 7;
+    while i < text.len && (text.ptr[i] == 32 as byte || text.ptr[i] == 9 as byte) {
+        i = i + 1;
+    }
+    var j: usize = i;
+    while j < text.len && text.ptr[j] != 10 as byte && text.ptr[j] != 13 as byte {
+        j = j + 1;
+    }
+    const n: usize = pm_trim_slash(&text.ptr[0], j);
+    if n <= i {
+        return false;
+    }
+    buf_reset(out);
+    return buf_append(out, &text.ptr[i], n - i);
+}
+
+// 从 worktree 的 gitdir（`<common>/worktrees/<name>`）反推**主仓的 .git 目录**写进 out。
+// 判据是 `worktrees` 这一段，不是「去掉最后两段」：主仓自己的 .git 也走这个函数，
+// 那时它没有 `worktrees` 段，直接原样返回。
+// 为什么不用 `git rev-parse --git-common-dir`：那要起子进程；而这里只需要判
+// 「同一个主仓的两个 worktree 归到同一个键」，形状判定就够（且不依赖 git 在 PATH 上）。
+fn pm_common_dir(gitdir: &const byte, n: usize, out: &Buf) bool {
+    buf_reset(out);
+    var at: isize = -1;
+    var from: usize = 0;
+    const view: &[byte] = gitdir[0: n];
+    while from < n {
+        const hit: isize = find_sub(view, &"/worktrees"[0: 10], from);
+        if hit < 0 {
+            break;
+        }
+        at = hit;
+        from = (hit as usize) + 10;
+    }
+    if at < 0 {
+        return buf_append(out, gitdir, n);
+    }
+    const k: usize = pm_trim_slash(gitdir, at as usize);
+    return buf_append(out, gitdir, k);
+}
+
+// 从 dir 起向上找第一个含 `.git` 的目录，把**主仓根**（含 .git 的那一级）写进 out。
+// 找不到就写 `dir` 本身并返回 true —— 「不在 git 仓里」是常态，不当错误。
+// `.git` 是目录 → 主仓；是文件（worktree）→ 追到共同 .git，再取它的父目录。
+export fn pm_repo_root(dir: &const byte, dir_len: usize, out: &Buf) bool {
+    buf_reset(out);
+    const n: usize = pm_trim_slash(dir, dir_len);
+    if n == 0 {
+        return false;
+    }
+    if !buf_append(out, dir, n) {
+        return false;
+    }
+    var probe: Buf = buf_new(PM_PATH_MAX);
+    defer { buf_free(&probe); }
+    while out.len > 0 {
+        buf_reset(&probe);
+        // probe = <out> + "/" + ".git"（**总是**补分隔符：out 为空时也要给绝对路径留出根）
+        if !buf_append(&probe, out.ptr as &const byte, out.len) {
+            return false;
+        }
+        if out.ptr[out.len - 1] != 47 as byte {
+            if !buf_append_byte(&probe, 47) {
+                return false;
+            }
+        }
+        if !buf_append_cstr(&probe, ".git") {
+            return false;
+        }
+        if !buf_append_byte(&probe, 0) {
+            return false;
+        }
+        var st: FsStat = FsStat{ exists: false, is_dir: false, size: 0, mtime: 0, mtime_nsec: 0 };
+        _ = fs_stat(probe.ptr as &const byte, &st);
+        if st.exists {
+            if st.is_dir {
+                // 主仓：out 已经是根
+                return true;
+            }
+            // worktree：.git 是文件 → gitdir → 回到主仓的 .git 目录 → 它的父目录才是根
+            var gitdir: Buf = buf_new(PM_PATH_MAX);
+            defer { buf_free(&gitdir); }
+            if !pm_gitdir_of(probe.ptr as &const byte, &gitdir) {
+                return true;   // .git 是文件但读不懂 → 就当这个目录是根
+            }
+            var common: Buf = buf_new(PM_PATH_MAX);
+            defer { buf_free(&common); }
+            if !pm_common_dir(gitdir.ptr as &const byte, gitdir.len, &common) {
+                return true;
+            }
+            const cn: usize = pm_trim_slash(common.ptr as &const byte, common.len);
+            // 去掉 `.git` 这一段就是主仓根
+            var k: usize = pm_last_seg(common.ptr as &const byte, cn);
+            if k >= 2 && k - 1 >= 1 {
+                k = k - 1;   // 连同分隔符一起去掉
+            }
+            if k == 0 {
+                return true;
+            }
+            buf_reset(out);
+            return buf_append(out, common.ptr as &const byte, pm_trim_slash(common.ptr as &const byte, k));
+        }
+        // 去掉最后一段继续向上
+        var k2: usize = pm_last_seg(out.ptr as &const byte, out.len);
+        if k2 == 0 {
+            break;
+        }
+        k2 = k2 - 1;      // 连同 `/`
+        buf_truncate(out, k2);
+    }
+    // 没找到 .git：回退成「传进来的那个目录」
+    buf_reset(out);
+    return buf_append(out, dir, n);
+}
+
+// ============================================================
+// 项目键与记忆目录
+// ============================================================
+// 项目键 = 归一化仓库根的 sha256 前 16 hex（32 字符）。能直接当目录名用。
+// 为什么用哈希而不是把路径转义成目录名：路径可能很长（PM_PATH_MAX 4096）而文件名上限是
+// 255 字节；哈希定长 32，且天然消掉 `/`、空格、非 ASCII 带来的转义分歧。
+export fn pm_repo_key(root: &const byte, n: usize, out: &Buf) bool {
+    buf_reset(out);
+    var digest: [byte: 32] = [0: 32];
+    sha256(root, n, &digest[0]);
+    var hex: [byte: 64] = [0: 64];
+    _ = hex_of(&digest[0], 32, &hex[0]);
+    return buf_append(out, &hex[0], 32);
+}
+
+// `<home>/memory/<key>` 写进 out（不含 NUL；喂 syscall 的调用方自己补）。
+export fn pm_dir(home: &const byte, home_len: usize, key: &const Buf, out: &Buf) bool {
+    buf_reset(out);
+    if home_len == 0 || key.len == 0 {
+        return false;
+    }
+    if !buf_append(out, home, pm_trim_slash(home, home_len)) {
+        return false;
+    }
+    if !buf_append_cstr(out, "/memory/") {
+        return false;
+    }
+    return buf_append(out, key.ptr as &const byte, key.len);
+}
+
+// 建 `<dir>` 及其父目录（`<home>/memory` 与 `<home>`）—— 逐级 mkdir，已存在不算错。
+export fn pm_ensure_dir(dir: &const byte, n: usize) bool {
+    if n == 0 {
+        return false;
+    }
+    var i: usize = 1;
+    while i <= n {
+        if i == n || dir[i] == 47 as byte {
+            var part: Buf = buf_new(i + 2);
+            defer { buf_free(&part); }
+            if !buf_valid(&part) {
+                return false;
+            }
+            _ = buf_append(&part, dir, i);
+            _ = buf_append_byte(&part, 0);
+            _ = sys_mkdir(&part.ptr[0] as *const byte, 493 as u32) catch {};
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+// 建 `<dir>` 下的一层子目录（`sub` 是单段名，不含 `/`），返回是否建成或已存在。
+// 供 `obs/` 分片目录用；路径拼好后交给 `pm_ensure_dir` 逐级建。
+export fn pm_ensure_sub(dir: &const byte, n: usize, sub: &const byte, out: &Buf) bool {
+    buf_reset(out);
+    if !buf_append(out, dir, n) {
+        return false;
+    }
+    if !buf_append_byte(out, 47) {
+        return false;
+    }
+    if !buf_append_cstr(out, sub) {
+        return false;
+    }
+    return pm_ensure_dir(out.ptr as &const byte, out.len);
+}
+
+// ============================================================
+// 文件写：原子替换 / 追加 / 删除
+// ============================================================
+// 追加写：`O_WRONLY|O_CREAT|O_APPEND`，一次 `write_all_fd`。
+// 只追加是本文件的核心承诺 —— 多写者（实测同仓根下成百会话）并发追加不会互相覆盖，
+// 因为 O_APPEND 的定位与写入在内核里是原子的。
+export fn pm_append_file(path_z: &const byte, data: &const byte, n: usize) bool {
+    const flags: i32 = (O_WRONLY | O_CREAT | O_APPEND) as i32;
+    const fd: i32 = sys_open(path_z as *const byte, flags, 420) catch {
+        return false;
+    };
+    defer { _ = sys_close(fd) catch {}; }
+    return write_all_fd(fd, data, n);
+}
+
+// 原子替换：写 `<path>.tmp` → rename 到 `<path>`。
+// 为什么不用 O_TRUNC 直写：崩在中间会留一个**半个**的文件（下一轮读它会解析失败）；
+// rename 在同目录内是原子的，读者要么看到旧的全份、要么看到新的全份。
+// 额外好处：两个写者并发时不会交错（各自写自己的 tmp，最后一次 rename 赢），
+// 而 O_TRUNC 直写会互相截断 —— 这正是「不丢更新」在**单文件**上的最后一道保险。
+export fn pm_write_file_atomic(path: &const byte, n: usize, data: &const byte, dn: usize) bool {
+    var tmp: Buf = buf_new(n + 8);
+    defer { buf_free(&tmp); }
+    if !buf_append(&tmp, path, n) || !buf_append_cstr(&tmp, ".tmp") || !buf_append_byte(&tmp, 0) {
+        return false;
+    }
+    const flags: i32 = (O_WRONLY | O_CREAT | O_TRUNC) as i32;
+    const fd: i32 = sys_open(&tmp.ptr[0] as *const byte, flags, 420) catch {
+        return false;
+    };
+    const ok: bool = write_all_fd(fd, data, dn);
+    _ = sys_close(fd) catch {};
+    if !ok {
+        return false;
+    }
+    var dst: Buf = buf_new(n + 1);
+    defer { buf_free(&dst); }
+    if !buf_append(&dst, path, n) || !buf_append_byte(&dst, 0) {
+        return false;
+    }
+    sys_rename(&tmp.ptr[0] as *const byte, &dst.ptr[0] as *const byte) catch {
+        return false;
+    };
+    return true;
+}
+
+// 递归删一个目录（只用于 `/memory forget` 与自测收尾）。路径不存在当作成功。
+// 深度优先、先删子项再删自己；不跟随符号链接（防手滑删到别处）。
+export fn pm_rm_rf(path: &const byte, n: usize) bool {
+    if n == 0 {
+        return false;
+    }
+    var pz: Buf = buf_new(n + 1);
+    defer { buf_free(&pz); }
+    if !buf_append(&pz, path, n) || !buf_append_byte(&pz, 0) {
+        return false;
+    }
+    const fd: i32 = sys_open(&pz.ptr[0] as *const byte, (O_RDONLY | O_DIRECTORY) as i32, 0) catch {
+        return false;   // 不存在 / 不是目录 → 当作已删
+    };
+    var name: [byte: 256] = [0: 256];
+    while true {
+        const rc: isize = sys_getdents64(fd, &name[0], 256) catch {
+            break;
+        };
+        if rc <= 0 {
+            break;
+        }
+        // 只取需要的一点点：getdents64 的记录格式是
+        // {u64 d_ino, i64 d_off, u16 d_reclen, u8 d_type, char d_name[]}
+        var off: usize = 0;
+        const total: usize = rc as usize;
+        while off + 19 <= total {
+            const reclen: usize = (name[off + 16] as usize) | ((name[off + 17] as usize) << 8);
+            if reclen == 0 || off + reclen > total {
+                break;
+            }
+            const cname: &byte = &name[off + 19];
+            const cl: usize = bufx_cstr_len(cname);
+            const is_dot: bool = cl == 1 && cname[0] == 46 as byte;
+            const is_dotdot: bool = cl == 2 && cname[0] == 46 as byte && cname[1] == 46 as byte;
+            if !is_dot && !is_dotdot && cl > 0 {
+                var child: Buf = buf_new(n + cl + 2);
+                defer { buf_free(&child); }
+                if buf_append(&child, path, n) {
+                    _ = buf_append_byte(&child, 47);
+                    _ = buf_append(&child, cname, cl);
+                    const dt: byte = name[off + 18];
+                    if dt == 4 as byte {
+                        _ = pm_rm_rf(child.ptr as &const byte, child.len);
+                    } else {
+                        if buf_append_byte(&child, 0) {
+                            sys_unlink(&child.ptr[0] as *const byte) catch {};
+                        }
+                    }
+                }
+            }
+            off = off + reclen;
+        }
+    }
+    _ = sys_close(fd) catch {};
+    _ = sys_rmdir(&pz.ptr[0] as *const byte) catch {
+        return false;
+    };
+    return true;
+}

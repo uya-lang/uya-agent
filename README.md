@@ -30,6 +30,10 @@
   自动压缩）；技能发现 + `skill`；`web_search`；子代理一族（含 `ralph` 与 `/watch` 实时跟随）；
   会话目标；workflow（`.ush` 脚本编排）；三级访问模式 + bwrap 内核沙箱；Git worktree
   （执行 → 合并 → 删除，连带残留回收）；图片附件与剪贴板粘贴（纯 Uya 的 X11 客户端）。
+* **项目记忆**（P66–P68）：跨会话记住「这个项目怎么跑、关键文件在哪、上次什么还红着」——
+  按**归一化仓库根**归类（worktree 与其主仓同键），只追加分片存储（多写者不丢更新），
+  开工包在会话开始时注入**一条独立 user 消息**（不改 system、不打掉前缀缓存）。
+  `/memory` 看报告、`/memory off` 关、`/memory forget` 清空；`--no-memory` / `--memory-budget N`。
 
 ---
 
@@ -124,6 +128,7 @@ readelf -lW build/uya-agent | grep -c INTERP    # 0 = 真静态
 | `--skill-dir DIR` | 额外的技能根（冒号分隔，可多次） |
 | `--uya-bin PATH` | 跑 workflow 脚本的解释器（默认 `$UYA_BIN` 或 `uya`） |
 | `--no-compact` / `--context-window N` | 关闭自动上下文压缩 / 指定压缩判定的窗口（默认取 DSH 模型条目） |
+| `--no-memory` / `--memory-budget N` | 关掉项目记忆（不读不写不注入）/ 开工包的字节预算（默认 3072） |
 | `--agent-home DIR` | 会话与索引的根目录（默认 `~/.uya-agent`） |
 | `--no-save` | 不写会话日志（只跑不记） |
 | `--continue` | 接着当前目录最近一条会话继续 |
@@ -245,6 +250,7 @@ make tui-selftest          # 分域快速轮：只跑 TUI
 make sess-selftest         # 只跑 /sessions 与大日志
 make diff-selftest         # 只跑 src/diff/
 make web-selftest          # 只跑 web 界面（服务端终端解释器 / HTTP 侧 / 页面 / 分派语义）
+make pm-selftest           # 只跑 src/pm/（项目记忆）
 make UYA_SELFTEST_ONLY=x,y # 只跑指定的几轮
 ```
 
@@ -371,8 +377,8 @@ DEEPSEEK_API_KEY=sk-xxx ./build/uya-agent \
   只有在前台跑（交互模式）才有。
   另外：`/watch` 是**进程状态**（`--resume` 不回填）；被跟随的子代理跑完或槽位被回收时跟随自动
   结束；`ralph` 跟随的是**当前轮**的日志，换轮时插一行 `[轮次切换]` 并从新日志头开始读。
-* **回合运行中的界面命令**：只读命令（`/status`、`/help`、`/tasks`、`/sessions`、`/goal`、
-  `/diff`、`/watch`（**含** `/watch sub-N`））在每个泵点当场派发并当场画一帧；`/model` 与
+* **回合运行中的界面命令**：只读命令（`/status`、`/help`、`/tasks`、`/memory`、`/sessions`、
+  `/goal`、`/diff`、`/watch`（**含** `/watch sub-N`））在每个泵点当场派发并当场画一帧；`/model` 与
   `/effort`（裸命令开浮层、`/model <名字>` 这类带参形态都算）同样在泵点当场生效 ——
   它们在浮层里选完/敲完就改状态并落一条 `session/model`，**下一个 step 的请求**已经是新模型；
   `/title <新标题>` 早已同路。`/new`、`/resume`
@@ -435,8 +441,8 @@ DEEPSEEK_API_KEY=sk-xxx ./build/uya-agent \
   （完整清单走 `/tasks`，子代理另有窗口，不进任务箱体）；刷新是「推」出来的，滚动模式下单个长
   step 期间秒数会停；清单与后台任务/子代理表是**进程状态**（`--resume` 不回填，只有目标在盘上
   `goal.json`、启动时重读）；**清单按会话清理**（`/new`、`/resume` 与启动一样清零），后台任务/
-  子代理表随 `/new` 复位，目标跨会话；浮层打开时常驻块被盖住，块不做鼠标交互、点击折叠、
-  跨会话记忆（`/tasks close` 只影响当前进程）。
+  子代理表随 `/new` 复位，目标跨会话；浮层打开时常驻块被盖住，块不做鼠标交互、点击折叠。
+  （**跨会话记忆**是另一套东西，见上面的「项目记忆」与 DESIGN §20。）
 * **会话目标**：`goal.json` 是**会话级记录**，同时由**同会话续跑驱动器**消费（P58，对齐 DSH 的
   `goal-round-driver`）：主循环空闲时，`phase=active` 且有授权的目标会自动开下一轮 —— 往**同一个
   会话**追加一条 `<goal_round>` user 消息（不开新 agent、不 fork 历史）。人类命令没有 `complete`
