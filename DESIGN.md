@@ -3574,6 +3574,34 @@ responses 用 `{"type":"input_image","detail":"auto","image_url":…}`；
     顺带补了 `/help` 文案：此前**一个字节都没提** ctrl+v（ctrl+p / ctrl+t / F2 都在），
     键修好了却没人知道它存在；并按「改了 help 文案就要钉子」的惯例加了断言。
 
+111. **布尔的能力申报装不下「只认三档」—— 网关说 `reasoning: true`，模型却拒收一半档位**（真机，本轮踩到）：
+    本轮给本机网关照单加两个 AutoDL 模型（`GLM-5.3-flash` / `hy4-preview`，改动在
+    `~/ai-gateway` 与本仓文档，见 §19 的验收记录）。实测 `GLM-5.3-flash` 时撞到这条：
+    它对 `reasoning_effort` **只认 `low` / `high` / `max`** —— `none` / `minimal` /
+    `medium` / `xhigh` 一律 `400 param=reasoning_effort`（每档重复 3 次一致），
+    并且**拒绝** `{"thinking":{"type":"disabled"}}`（「该模型始终思考，不支持关闭思考」）。
+
+    **形状**：网关（以及本仓的目录）的能力申报是**布尔**的 —— `capabilities.reasoning: true`、
+    `reasoningEfforts` 是一个「档位集合」。而「支持思考」与「支持哪些档位」是两件事，
+    前者装不下后者。于是任何「照抄全集」的档位表都会让用户选中一个**必然 400** 的档位：
+    网关侧 `degradation: strip` 只标记不剥离，请求照样带出去，错误原样透出。
+    这不是网关的 bug（它没有表达力去说「只认三档」），是**「能力申报只有布尔」与
+    「档位是一张表」之间的口径缺口**。
+
+    **本仓的处境与处置**：不发明档位这条规则（见 `session/modelx.uya` 文件头与
+    README「模型选择」一节）本来就要求**按模型公布的档位选**，而 DSH 的
+    `settings.yaml` 里那个 `reasoningEfforts:` 映射**恰好是逐模型写的** —— 也就是说
+    表达力在本仓这边是够的，缺的只是「照抄全集」这个坏习惯。所以处置是**文档口径**：
+    README 的模型一节写明「档位表必须按上游实测填」，并在真机 `aigw-local` 条目里
+    给这个模型只写 `{low, high, max}` 三档。
+
+    **同族的另一条观察**：同一批里 `hy4-preview` **任何请求都 402**（腾讯侧免费额度用尽、
+    未开后付费），三条路都一样，连参数校验都到不了 —— 于是能力**一个都测不出来**。
+    这时「申报为空」与「申报成 text-only」的区别就是本条的另一种形态：网关把空能力读作
+    **未知 → 不拦**，而写死一个猜测等于替上游下一个它没被要求做的决定。所以那一行的
+    `capabilities` 留空，等能真发出请求再补。两条合起来是同一个教训：
+    **申报的粒度不够时，宁可留白也不要填一个自己没测过的值**。
+
 ---
 
 ## 17. 工具实现要点
@@ -4247,6 +4275,42 @@ DEEPSEEK_API_KEY=sk-xxx ./build/uya-agent \
   修法与三条钉子、防假绿对照实验见 §16 踩坑 110；`tui-keys` 轮新增 ctrl+v 两条行为腿
   + 全部事件码两两比对的**根因哨兵** + help 文案钉子。`--tui-demo` 不受影响
   （它不画 help 浮层）。版本串不动（修复轮不占号）。
+
+- 真机模型增补（不占阶段号）：**AutoDL 的 `GLM-5.3-flash` 与 `hy4-preview` 上了本机网关**
+  （`aigw-local` → `127.0.0.1:8088` → `www.autodl.art`）。改动分两处：
+  `~/ai-gateway` 新增 `scripts/autodl-models.sh`（一次写全三层：供应商模型行含成本价、
+  对客模型目录项、模型路由；默认干跑、`--apply` 才写、整数算价、写后读回核对 +
+  `router/explain` + `pricing/simulate`）与 `docs/todo_done.md` 一节；本仓这边是
+  `~/.dsh/settings.yaml` 的 `aigw-local` 加两个条目 + README 的档位告诫 + §16 踩坑 111。
+
+  **为什么记在本仓**：两条实测结论都会改变本仓的行为，不是纯网关运维。
+  ① `GLM-5.3-flash` 对 `reasoning_effort` **只认 `low`/`high`/`max`**
+  （`none`/`minimal`/`medium`/`xhigh` → 400），而网关的能力申报只有布尔 ——
+  所以 DSH 那边那个 `reasoningEfforts:` 映射**必须按实测写**，照抄全集会让用户选中
+  一个必然 400 的档位（`degradation: strip` 只标记不剥离，错误原样透出）。见踩坑 111。
+  ② `hy4-preview` 现在**任何请求都 402**（腾讯侧免费额度用尽、未开后付费），
+  能力一个都没实测 ⇒ 网关侧 `capabilities` 留空（读作「未知 → 不拦」），本仓这边
+  也不给它写 `reasoningEfforts`（不发明档位那条规则的直接后果）。
+
+  **真机验收**（经网关 `/v1/responses`，`GLM-5.3-flash`）：① 普通话 → 200 `completed`；
+  ② **工具轮 + `reasoning_content` 回放**（`function_call` + `function_call_output`）
+  → 200 `completed`，正文用上了工具结果；③ **模型自己发出的工具调用** → 200，返回
+  `function_call get_weather {"city": "Beijing"}`。后两条正是 deepseek 方言
+  `replay_reasoning_content` 最会坏的地方（网关对没回传的历史补**空串**，实测被上游接受）。
+  计费反算三笔逐位相等（原生按维度 `ceil`、账本 = `ceil(原生合计 × 0.15)`：
+  `2593→389`、`208→32`、`239→36` 微美元），说明 CNY 规则集 × `fx_rates.CNY=150000`
+  的入账口径在这两个新模型上也是对的。
+
+  与 P61 那条同族的一点：两个模型**都没写 `maxTokens`**（上游没公布可引用的输出上限，
+  页面只给了上下文 1024K），所以本仓按 `effective_max_tokens` 发默认 **256000** ——
+  「不发 = 把上限交给中间那一跳」这条路口仍然焊死着（P61 的教训），
+  而 `hy4-preview` 的 `context_window` 写 1024000（那条是页面公布的事实，不是猜的）。
+
+  验收：网关侧干跑 + `--apply`（6 次写入全 200、读回三层逐字段一致、`router/explain`
+  候选在且 `excluded` 空、simulate 两个模型都对）+ 重启回归（`bootstrap done` 增量为 0、
+  `snapshot(models=3 provider_models=3 routes=3)`、日志 ERROR 计数与改动前相同）；
+  本仓侧 `make lint-size` / `make doc-audit` / `make build` 与 `--print-config` 两条
+  （见下一条 bullet 的实测输出）。
 
 ---
 
