@@ -889,21 +889,27 @@ e2e-title-cmd: build
 #
 # 为什么必须真 PTY：自动起标题**只服务交互界面**（管道/CI 上 tty_title_set 本来就是空操作，
 # 为一个看不见的东西多发请求没有道理）—— 所以行式 REPL 那一路它根本不会跑，
-# 这一条只能拿真终端验。驱动脚本内联在这里（不新增 testdata 脚本）：pty.fork 起真二进制，
-# 打一条任务，等「回合 + 静默期 + 起标题请求」都收场，再 ctrl+d 退出。
+# 这一条只能拿真终端验。驱动脚本见 testdata/pty_drive_title.py（pty.fork 起真二进制）。
 # 判据：日志里出现 kind=provider 的 session/title，且假网关收到了 ≥2 次请求；
 #       --no-title-auto 时两样都没有。
+#
+# P74 加第三腿（HOME_C）：打完任务**立刻 esc 中断** —— 首发点在回合里（第一个 step 跑完的
+# 边界），不是回合收尾，所以 aborted 的回合同样换得到标题。改前（只在 completed 收尾挂待办）
+# 这一腿的日志里一个 provider 事件都没有 —— 控制台的会话标题列正是因此空着的。
 e2e-title-auto: build
 	@set -e; \
-	ws=build/selftest_title_auto_e2e; rm -rf $$ws; mkdir -p $$ws/home $$ws/home2; \
+	ws=build/selftest_title_auto_e2e; rm -rf $$ws; mkdir -p $$ws/home $$ws/home2 $$ws/home3; \
 	python3 testdata/mock_gateway_sse.py 0 1 200 > $$ws/gw.log 2>$$ws/gw.err & \
 	gw=$$!; \
-	trap "kill $$gw 2>/dev/null || true" EXIT; \
+	python3 testdata/mock_gateway_sse.py 0 1 3000 > $$ws/gw2.log 2>$$ws/gw2.err & \
+	gw2=$$!; \
+	trap "kill $$gw $$gw2 2>/dev/null || true" EXIT; \
 	sleep 1.2; \
 	port=$$(awk '/^PORT/{print $$2}' $$ws/gw.log); \
-	[ -n "$$port" ] || { echo "FAIL: 假网关没打印端口"; cat $$ws/gw.log; exit 1; }; \
-	UYA_BIN="$(CURDIR)/$(OUT)" PORT="$$port" HOME_A="$$ws/home" HOME_B="$$ws/home2" \
-		python3 testdata/pty_drive_title.py; \
+	port2=$$(awk '/^PORT/{print $$2}' $$ws/gw2.log); \
+	[ -n "$$port" ] && [ -n "$$port2" ] || { echo "FAIL: 假网关没打印端口"; cat $$ws/gw.log $$ws/gw2.log; exit 1; }; \
+	UYA_BIN="$(CURDIR)/$(OUT)" PORT="$$port" PORT_SLOW="$$port2" HOME_A="$$ws/home" \
+		HOME_B="$$ws/home2" HOME_C="$$ws/home3" python3 testdata/pty_drive_title.py; \
 	: "① 默认（--title-auto）：起标题多发一次请求，并落 provider 事件"; \
 	n=$$(grep -c "REQ #" $$ws/gw.err || true); \
 	[ "$$n" -ge 2 ] || { echo "FAIL: 自动起标题没有多发请求（只看到 $$n 次）"; exit 1; }; \
@@ -925,11 +931,23 @@ e2e-title-auto: build
 		|| { echo "FAIL: 标题请求的 system 段不是 DSH 前缀"; exit 1; }; \
 	grep -qF 'Generate the session title from this JSON array of human messages:' $$ws/gw.err \
 		|| { echo "FAIL: 标题请求的 user 段不是 DSH 前缀"; exit 1; }; \
+	grep -qF 'within 15 characters' $$ws/gw.err \
+		|| { echo "FAIL: 词数句不是本项目的「15 字以内」口径"; exit 1; }; \
+	: "①d 标题请求里带的是人类消息原文（网关据此归组并抓标题）"; \
+	grep -qF '写一个 hello' $$ws/gw.err \
+		|| { echo "FAIL: 标题请求里没有那条人类消息"; exit 1; }; \
 	: "② --no-title-auto：只有主请求，且没有 provider 事件"; \
 	if grep -qF '"source":{"kind":"provider"}' $$ws/home2/sessions/*/*/session.jsonl 2>/dev/null; then \
 		echo "FAIL: --no-title-auto 下仍然落了 provider 事件"; exit 1; \
 	fi; \
-	: "③ 三来源都看得出来，CLI 压过 env"; \
+	: "③ esc 中断的回合（aborted）同样换得到标题：首发在回合里，不在收尾"; \
+	grep -qF '"reason":"aborted"' $$ws/home3/sessions/*/*/session.jsonl \
+		|| { echo "FAIL: 中断那一腿的回合不是 aborted（没测到中断回合）"; exit 1; }; \
+	grep -qF '"source":{"kind":"provider"}' $$ws/home3/sessions/*/*/session.jsonl \
+		|| { echo "FAIL: 被 esc 打断的回合没有起出标题（首发点还在收尾？）"; exit 1; }; \
+	t=$$(cat $$ws/gw.err $$ws/gw2.err | grep -cF 'Generate the session title from this JSON array of human messages:' || true); \
+	[ "$$t" -eq 2 ] || { echo "FAIL: 标题请求不是 2 次（A 一条 + 中断那条 C 一条；实为 $$t）"; exit 1; }; \
+	: "④ 三来源都看得出来，CLI 压过 env"; \
 	out=$$($(OUT) --no-dsh-config --print-config 2>&1); \
 	echo "$$out" | grep -q "title_auto = on  (source: default)" \
 		|| { echo "FAIL: 自动起标题默认应当是开"; exit 1; }; \
@@ -942,7 +960,7 @@ e2e-title-auto: build
 	out=$$(UYA_AGENT_TITLE_AUTO=0 $(OUT) --no-dsh-config --title-auto --print-config 2>&1); \
 	echo "$$out" | grep -q "title_auto = on  (source: cli)" \
 		|| { echo "FAIL: --title-auto 应当压过 UYA_AGENT_TITLE_AUTO=0"; exit 1; }; \
-	echo "e2e-title-auto: 通过（自动起标题发请求+落 provider 事件；--no-title-auto 两样都没有；三来源与 CLI 优先）"
+	echo "e2e-title-auto: 通过（回合里首发+落 provider；中断的回合也有标题；--no-title-auto 两样都没有；三来源与 CLI 优先）"
 
 # 踩坑 72：鼠标上报开关回归（离线，不联网）。默认开（滚轮要靠它）；--no-mouse / UYA_AGENT_MOUSE=0
 # 都要在 --print-config 的来源列上看得出来（来源码与 cfg_src_name 同口径），而且 CLI 压过 env。

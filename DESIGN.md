@@ -2157,19 +2157,26 @@ bash / node / python 峰值可达 GB 级，不算进来是刻意的）。
 
 1. **只写给真 TTY**（`tty_title_begin()` 门控）；
 2. **直接 `sys_write`**，不能走 `tty_write`（sink 会把它吞成转录里的乱码）；
-3. 统一 `tty_title_clean_into` 清洗截断（**模型侧前 3 词 / ≤30 B = 10 个汉字以内**；上屏 ≤80 B，
+3. 统一 `tty_title_clean_into` 清洗截断（**模型侧 3 词 / ≤45 B = 15 个汉字以内**；上屏 ≤80 B，
    用户手填 `/title` 用满 80 B）。
 
 `--continue` 的 `sess_open` 会清空标题。不支持 xterm 标题栈（`CSI 22 t` / `CSI 23 t`）的终端
 会忽略压栈/弹栈，退出后保留最后写的标题（**故意不写空标题**）。
 
+**会话标题只有一个来源：模型总结**（P74）。首条人类消息派生出来的那串（前 3 词 / ≤45 B）只是
+**备用标题**：不写 `g_sess.title`、不落 `session/title`、不写索引；模型还没起出来之前终端上
+显示的是基标题 `uya-agent · <工作目录名>`，模型彻底起不出来时才轮到它上屏。
+
 **执行中改标题（P46）**：`/title`、`set_title` 工具、模型自动起标题。
-自动起标题的三条硬边界：
+自动起标题的边界：
 
 | 边界 | 说明 |
 |---|---|
-| **同步的** | 单线程（踩坑 47 起不了第二条线程）：排在空闲主循环里，只有「距回合收尾与距最后一次敲键都 ≥900 ms」才发 |
-| **用户一动键盘就中止自己** | 那一轮标题不更新，下一条人类消息再试 —— 代价是标题偶尔「慢半拍」 |
+| **首发在回合里**（P74） | 待办在回合入口挂，第一次机会是**第一个 step 跑完的 step 边界** —— 不是回合收尾。收尾才发的话，长回合 / 被 esc 中断的回合在网关那边连一条 `call_kind=title` 的行都没有（踩坑 127） |
+| 为什么不放在「发第一个请求之前」 | 单线程（踩坑 47 起不了第二条线程），侧路请求是同步的，真网关上一个来回 1.2 s 上下 —— 放在首答之前等于每次首答白等一个往返 |
+| **一条会话只起一次** | 首次提示词口径（对齐 DSH 的 `automatic: "first-prompt"`）。之后要改走 `/title`、裸 `/title`、`set_title`。`g_title_auto_done` 同时就是「收尾不更新」的实现 |
+| **用户一动键盘就中止自己** | 那一轮标题不更新，而且**不记 revision**（待办留给下一次机会）；回合内那次被打断就由收尾之后空闲那条路补发 |
+| 空闲那条路等两段静默 | 「距挂待办与距最后一次敲键都 ≥900 ms」才发 —— 模型一步就答完的单步回合走的是它 |
 | 后台请求**不读键** | §4.7 |
 
 要彻底关掉用 `--no-title-auto`。
@@ -2320,12 +2327,12 @@ web 服务器（递归），而不是跑 TUI。实测症状：子进程 fork 出
 
 #### 11.8.5 标题从哪来（顶栏那一栏）
 
-优先级**三级**，与 TUI 的终端标题同口径（「前 5 个词 / ≤40 B」），这样顶栏与终端标题
-不会各说一套：
+优先级**三级**，与 TUI 的终端标题同口径（模型侧 3 词 / ≤45 B = 15 字），这样顶栏与终端
+标题不会各说一套：
 
 1. 会话日志索引（`<home>/index.jsonl`）里那条 `title` —— 模型 `set_title` / 人手
    `/title` / 自动起标题写进去的；
-2. 服务端从**会话日志开头** 64 KiB 派生：首条非注入类人类消息的前 5 个词（会话刚开、
+2. 服务端从**会话日志开头** 64 KiB 派生：首条非注入类人类消息的前 3 个词（会话刚开、
    模型还没起标题时的兜底）；
 3. 空串（前端显示「会话 N」）。
 
@@ -2957,7 +2964,7 @@ responses 用 `{"type":"input_image","detail":"auto","image_url":…}`；
 | Responses 下**不回放 reasoning item** | 不发 `include: ["reasoning.encrypted_content"]`，也不发 `prompt_cache_key` / `prompt_cache_retention` |
 | **会话身份照发**（与「不发 prompt_cache_key」是两件事） | 每个请求都带 `x-deepseek-harness-session-id` + `Session-Id` 两个头，正文带 `client_metadata.session_id`（responses）/ `metadata.session_id`（chat）；运行时上下文带 `session workspace: "<JSON 路径>"`。口径对齐 DSH，`~/ai-gateway` 据此按会话归组、取工作区、识别标题行 |
 | **客户身份靠 User-Agent，机读句报归类键**（P71） | 网关的客户端词表是**封闭**的 `dsh / codex / console / unknown`（`internal/responses/dimensions.go`），正文规则要求首条 system 逐字是 DSH 的 persona —— 我们不改自己的 persona（那是冒充，还会改模型行为），所以**唯一接缝是 UA**：发 `uya-agent/0.1 (deepseek-harness-compatible)`，命中它的 `deepseek-harness` 子串 ⇒ `client=dsh`。认不出客户端时网关**连 `workspace` 也一起丢**（那条维度只在 dsh/codex 两个分支里取），所以这不只是「客户端列好不好看」的问题。同时 `session workspace:` 报的是**归类键**（`pm_main_worktree_into`：linked worktree 折回主工作区，普通仓库的子目录原样），人读的 `Current workspace:` 仍是字面路径 —— 否则每个会话一条唯一 worktree 路径，工作区维度会退化成会话维度。已知边界：普通仓库的子目录按字面归；历史行不回填 |
-| **起标题提示词与 DSH 逐字同形** | system 段 `Create a concise title for an AI coding-assistant session …`、user 段 `Generate the session title from this JSON array of human messages:\n<JSON 数组>`，并带同一会话 id（网关照这两个前缀认 `call_kind=title`）。**唯一偏离**：system 段第三句（词数句）改成本项目口径「10 字以内 / 约 3 词」（DSH 原句 5 词 / 40 CJK 字符）—— 网关只匹配前两条前缀，这条可自定；硬约束另由 `tty_title_fallback_into`（3 词 / 30 B）收口 |
+| **起标题提示词与 DSH 逐字同形** | system 段 `Create a concise title for an AI coding-assistant session …`、user 段 `Generate the session title from this JSON array of human messages:\n<JSON 数组>`，并带同一会话 id（网关照这两个前缀认 `call_kind=title`）。**唯一偏离**：system 段第三句（词数句）改成本项目口径「15 字以内 / 约 3 词」（DSH 原句 5 词 / 40 CJK 字符 —— 它的 40 B 只放得下 13 个汉字）—— 网关只匹配前两条前缀，这条可自定；硬约束另由 `tty_title_fallback_into`（3 词 / 45 B）收口 |
 | 历史按「外来消息」重放 | 只带文本与工具调用 |
 | 工具 schema **不带 `strict`** | |
 | **不做 404 之外的协议自动探测** | 换协议请显式 `--api=` |
@@ -3027,7 +3034,7 @@ responses 用 `{"type":"input_image","detail":"auto","image_url":…}`；
 36. **「当前状态」和「刚才发生了什么」混在一个变量会被静默丢**：`tui_ov_accept()` 先写结果再 `tui_overlay_close()` 清掉 `g_tui_ov_kind`，take 后读 kind 永远 0；kind 另存 `g_tui_ov_done`（见 §2）。
 37. **TUI 主循环丢命令返回值 → `/exit` 是摆设**：`agent_tui_command()` 三处写成 `_ = …`，直接输入或面板选 `/exit` 都不退出（`ctrl+d` 掩盖）；三处接上返回值，回归 `tui-pty` 改 `/exit`。
 38. **浮层标题字节数写死 = 读越界**：`tui_overlay_list` 的 `tn` 是字节数按它 memcpy；会话标题写 44（实 38）、状态 46（实 22）、确认 6（实 9）；能用 `bufx_cstr_len()` 量就别写死。
-39. **终端标题 OSC 三件事钉死**：只写给真 TTY（`tty_title_begin()` 门控）；直接 `sys_write` 不能走 `tty_write`（sink 会吞成乱码）；统一 `tty_title_clean_into` 清洗截断（模型侧前 3 词/30 B = 10 字以内，上屏 80 B）。`--continue` 的 `sess_open` 会清空标题。
+39. **终端标题 OSC 三件事钉死**：只写给真 TTY（`tty_title_begin()` 门控）；直接 `sys_write` 不能走 `tty_write`（sink 会吞成乱码）；统一 `tty_title_clean_into` 清洗截断（模型侧 3 词/45 B = 15 字以内，上屏 80 B）。`--continue` 的 `sess_open` 会清空标题。
 40. **「`/status` 没反应」四件事**：①面板派发后输入行留 `/`（拼成 `//status`），用 `tui_input_drop_slash_trigger()`；②无匹配静默，改还回输入行 + notice；③运行中面板结果等到回合末，加 `agent_tui_poll_pending_cmd()`；④`g_tui_ov_top` 是死变量，用 `tui_ov_box_h()`。
 41. **首 token 只认正文 delta**：推理/工具回合几乎空着，偶尔打到时 tok/s 爆表（实测 6371，真值 ≈158.6）；判据改「任意非空增量」（`got_payload`：正文/`reasoning_content`/`tool_calls` 参数），元数据帧不算；回归 `stream-firsttok-*`。
 42. **「被裁要补 `…`」的预算必须先扣一列**：`tui_put_clipped` 的 `…` 不在预算里，长行比方框宽 1 列；新增 `tui_ov_put_clipped()` 用 `tty_clip_bytes` 量后减一；回归拿会撑满的 `/permission` 量边界。
@@ -4444,6 +4451,63 @@ responses 用 `{"type":"input_image","detail":"auto","image_url":…}`；
      教训：**一句话被抄成 N 份时，「改行为」的验收对象是那 N 处里的每一处** ——
      说明性文字的过期不会红任何一条命令，只能靠改的人自己把落点数清。
 
+127. **标题请求卡在「成功收尾」那一条路上 ⇒ 网关的会话标题列永远是空的**（P74，用户报的
+     「aigw 显示不出标题」）：现场是**三个症状一个根因**，而且每一个单独看都「像没问题」。
+
+     **① 触发点只有一个，还带条件。** `agent_title_auto_schedule` 的唯一调用点是
+     `if rc == AGENT_OK { … }` —— 于是**只有成功收尾的回合**才可能起标题：
+
+     | 回合收场 | provider 标题 | 网关 `call_kind=title` 行 |
+     |---|---|---|
+     | `completed` | 有 | 有 |
+     | `aborted`（esc） | **没有** | **没有** |
+     | 还在跑 | **没有** | **没有** |
+
+     而真正发请求还要等空闲主循环（回合里主循环整段不跑）—— **长回合跑着的整段时间里，
+     网关那边连一条 title 行都没有**。控制台的「请求日志 → 分组=会话」那张表标题列取的是
+     `MAX(title)`，而标题只写在 `call_kind=title` 的行上（网关的既定口径：别的行没产出过它），
+     于是那一列就是空的。
+
+     **② 屏幕上那个「标题」根本不是模型写的。** 首条消息落下 `source.kind = "fallback"`
+     的派生值（前 3 词）时它**同时**写进了 `g_sess.title`、日志、索引 —— 看起来已经有标题了，
+     其实是把一个「取前几个词」的结果当成会话标题在用。
+
+     **③ 上限是 10 个汉字（30 B），不是用户要的 15 字。** 现场那条首条消息
+     「实现标题15字以内的总结」（12 汉字 / 36 B）被切成 `实现标题15字以内的总` ——
+     30 B 正好截在词中间。用户原话「标题15字以内」说的就是这件事。
+
+     **修法（三条一起）**：① 待办在**回合入口**挂，第一次机会是**第一个 step 跑完的 step
+     边界**（用户已经拿到第一批输出，标题在同一个回合里落地）；收尾那条路撤掉 ——
+     **收尾不更新标题**。② 会话标题**只有一个来源：模型总结**；派生值降级成「备用标题」，
+     模型没起出来之前显示基标题 `uya-agent · <目录>`。③ 模型侧收口 3 词 / **45 B = 15 汉字**。
+
+     **为什么首发不放在「发第一个请求之前」**（DSH 是 JS 异步并发，它两边能同时发）：
+     本仓单线程（踩坑 47 起不了第二条线程），侧路请求是**同步**的 —— 实测真网关上这一个来回
+     **1.18–1.36 s**（连测三发）。放在首答之前等于用户的每一次首答都白等一个往返；
+     放在第一个 step 之后，aigw 不用等回合结束就能有标题。**代价**：被打断在「第一个 step
+     边界之前」的回合要等收尾之后空闲那条路补发（那一条带两段 900 ms 静默）。
+
+     **一条会话只自动起一次**（对齐 DSH 的 `automatic: "first-prompt"`）：`g_title_auto_done`
+     既是首次闩、也就是「收尾不更新」的实现 —— 之后要改标题走 `/title`、裸 `/title`、`set_title`。
+
+     **查这件事的顺序值得记下来**（三条判据，缺一条都会得出错的结论）：① 网关上**逐字相同**的
+     提示词打一发 ⇒ 记成 `call_kind=title` 且抓到标题（证明网关侧没问题，缺的是我们没发）；
+     ② 真 PTY 驱动真二进制 + 真网关，**回合还在跑的时候**查 `request_logs` ⇒ 标题行出现在
+     两次 `agent` 请求**之间**（22:43:16 → **22:43:18 title** → 22:43:19）；③ 会话日志里
+     `turn/end` 的时间戳晚于标题事件（22:43:18 标题、**22:43:22** `turn/end`）⇒ 确实不是收尾发的。
+
+     **防假绿对照（都做过，都先看到红）**：把 step 边界那次调用去掉 ⇒ `tui-pty` /
+     `tty-title-pty` 当场红（模型标题没上屏 + 派生词串反而上了屏）；把 `!g_title_auto_done`
+     去掉 ⇒ `title-cmd` 红三条（首次闩 / revision 门控）；把 `agent_title_derive` 改回写
+     `g_sess.title` ⇒ 红在「派生值不许被当成会话标题」；把待办改回只在 `rc == AGENT_OK` 挂
+     ⇒ `make e2e-title-auto` 的 C 腿（esc 中断）红。
+
+     **顺带修的自测机制**：mock 是按**轮号**断言请求形状的，而标题请求会出现在**任何**
+     跑得出一个回合的轮次里 —— 不认它就会把侧路请求当成「第 N 轮」，整套断言集体错位。
+     所以四处自建 mock 共用 `mock_serve_title`（回一个模型标题、**不占轮次**）。计数不能放
+     全局量里：mock 跑在 fork 出来的子进程，父进程读不到 —— 首发时机改按**屏幕字节的先后**
+     判（模型标题的 OSC 2 必须早于 mock 的最终答案），round == 0 那一半由 mock 就地断言。
+
 ---
 
 ## 17. 工具实现要点
@@ -4686,13 +4750,13 @@ DEEPSEEK_API_KEY=sk-xxx ./build/uya-agent \
 | `tui-model` | P37 `/model`/`/effort` 浮层：按提供方分组、只列公布的档位、反解、非推理模型不开浮层；**P37 修复**：回合运行中选完模型 ⇒ **泵点当场收口**（`cfg.model` 立刻变、结果不再挂着、浮层已关）；**P62**：同名跨提供方（见踩坑 99）—— 行里带提供方、`✓` 按二元组、选中另一家的同名行真换过去 |
 | `tui-worktree` | P41 `/worktree` 动作选择浮层：标题/八个动作/✓ 标当前模式、反解只认动作行（「取消」不认）、默认游标 = `status`；`finish`/`discard` 选定不生效、先翻确认框（默认游标 = 取消）；**真 git**：确认前 worktree 目录与 phase 一个字节不动、确认后才合并 + 删除 |
 | `tui-mouse` | 踩坑 72 鼠标上报开关（`F2` / `/mouse` / `--no-mouse`）：标志位默认开 + `tui_set_mouse` 幂等；`F2` 两种编码（`ESC O Q` / `ESC[12~`）与 `/mouse on·off·非法`；**字节级**进/关/再开/关着进都与开关一致；帮助浮层里有 `F2` 那一条；**真 PTY** 两个方向（默认开必有 `1000h`、`mouse=false` 必无 `1000h`/`1006h`） |
-| `title-cmd` | P48 `/title` 与 `set_title`：清洗（80 B / 码点边界 / 控制序列全丢后为空 ⇒ 报错且标题**不动**）、钉住语义（`user` 置位后自动起标题不跑、`clear` 解锁）、revision 门控（同一条人类消息只生成一次）、落盘事件逐字节（kind 三档 + clear 的**空标题**事件）、索引同步、`set_title` 工具三支（合法/空串/缺键）、工具目录里有它 |
+| `title-cmd` | P48 `/title` 与 `set_title`：清洗（80 B / 码点边界 / 控制序列全丢后为空 ⇒ 报错且标题**不动**）、钉住语义（`user` 置位后自动起标题不跑、`clear` 解锁）、revision 门控、落盘事件逐字节（kind 三档 + clear 的**空标题**事件）、索引同步、`set_title` 工具三支（合法/空串/缺键）、工具目录里有它；**P74**：派生的备用标题**不写** `g_sess.title`、**不落** `session/title`（口径：标题由模型总结）；`g_title_auto_done` 首次闩（起过一次之后连待办都不挂，硬挂上也不发） |
 | `tui-paste` | P50 括起粘贴九段：进/出粘贴态的字节级判据、CR **不许**提交（踩坑 83 的原始症状）、CRLF 折成一个换行、TAB 是字面内容且**帧里**不出现 TAB、粘贴里的 ANSI 序列逐字节保留、收尾标记被切开也认、断流时悬着的 ESC 不吞、上限对齐 200000 且超限有提示、光标列按显示口径（TAB 四个空格）+ **真 PTY** 粘 3 行只提交一次（按会话日志断言） |
 | `img-sniff` | P51 图片纯函数层：**真 PNG 字节**（zlib 压出来的 64×48）读尺寸、GIF87a/89a 小端、JPEG 段链（长度段在前，尺寸不在固定偏移）、WebP 三变体（VP8X/VP8L/VP8 ）、纯文本与截断 PNG 一律拒绝、字节/像素两道预算、内容寻址 id 稳定、base64（长度与 PNG 签名）、附件 JSON 往返（**数字字段** + 坏记录只跳那一项）、占位文案与 B/KiB/MiB 三档 |
 | `clip-parse` | P52 X11 客户端可测部分：`DISPLAY` 五种形态（`:0`/`unix:7`/`host:1.0`/空/畸形）与三种畸形拒绝、**真 Xauthority 字节流**的两条目配对（family 256 + display 号 + MIT-MAGIC-COOKIE-1；不存在的 display 号**不许**回退到别的条目）、失败码文案非空 |
 | `tui-title-input` | P48 标题输入框：预填 AI 建议可见 + 编辑（打字/backspace/delete/←→/home·end/ctrl+u/中间插入，**按码点**不劈汉字）+ enter 采纳交回编辑后的文本 / esc 取消**不算改名** + 太矮回落 0 + 方框逐行闭合 + 窄框不越界 + 运行中 `/title <t>` 进安全集而裸 `/title` 不进 |
 | `title-cmd-e2e` | `make e2e-title-cmd`：行式真二进制的用法串 / 改名回执 / `/status` 的 title 行 / clear / 空标题报错 / `/help` 可查 / 索引与日志落盘 |
-| `title-auto-e2e` | `make e2e-title-auto`：真 PTY + 假网关 —— 自动起标题**多发一次请求**并落 `kind=provider`；`--no-title-auto` 两样都没有；三来源（default/env/cli）与 CLI 优先 |
+| `title-auto-e2e` | `make e2e-title-auto`：真 PTY + 假网关，**三条腿** —— ① 默认：起标题多发一次请求并落 `kind=provider`（且请求里带 DSH 的两段式前缀 + 会话身份 + 「15 字以内」的词数句）；② `--no-title-auto`：两样都没有；③ **打完任务立刻 esc**（配一个每段流停 3 s 的慢网关）：回合 `reason=aborted`，标题照样有（首发在回合里，不是收尾）；外加三来源（default/env/cli）与 CLI 优先 |
 | `tui-md` | P47 markdown 渲染七段：① 行内（`**粗**`/`*斜*`/`~~删~~`/`` `code` ``/链接：标记不上屏、样式落在正确的列、`snake_case` 不被误判）；② 块级（标题去 `#` 并按级着色、无序/嵌套/有序列表、任务清单 `✓`·`·`、引用 `▏ `、分隔线、围栏去标记留语言标签且块内 CODE）；③ **长行不丢字**（60/80/100 列下 100 字符代码行 + 100 字符正文 + 60 汉字逐字符完整、且那些行没有 `…`）；④ **滚到代码块中间样式不串**（贴尾与上滚两面，闭合围栏不再被当成开始）；⑤ 表格（表头 BOLD、框线 DIM、各行列宽一致、8 列在 40 列下整块退回普通行且不丢内容）；⑥ plan 审阅浮层共用同一份渲染 + 方框逐行闭合；⑦ **长条目取行 O(1)**（查表 vs 线性扫描逐行差分 + 贴尾首帧/缓存帧/上翻 20 屏三条成帧预算） |
 | `sessions-e2e` | `make e2e-sessions`：只列有标题的会话（空标题整条不见）、最新在最后一行、同 id 取最后一条 |
 | `resume-big-e2e` | `make e2e-resume-big`：~3 MiB 会话 + 残行，`--resume --dry-run` 退出码 0 |
@@ -4733,7 +4797,7 @@ DEEPSEEK_API_KEY=sk-xxx ./build/uya-agent \
 | `max-tokens-cut` | P59（mock mode 44，**一个进程跑两个回合**）：① `finish_reason=length` + 正文 + 一个 `write trunc.txt` 调用 → 一个工具调用都不派发（`trunc.txt` 不存在、日志零 `tool/call`）、正文剪掉断口空白后进历史、`assistant/message` **不带 tool_calls**、转录是 `warning:` + `[max-tokens] …发「继续」…`（**没有** `error: model output was truncated`）、`turn/end` reason = `max-tokens`、那一回合返回 `5`；② 人打「继续」→ 第二个请求里**带着那段正文**、没有 `"role":"tool"`、没有 `"tool_calls"` → 回合以 0 收尾、`turn/end` reason = `completed` |
 | `tui-diag` | 4 KiB JSON 只留 ≤512 B、半截汉字变 U+FFFD、`tty_sink_on` 收尾关回 |
 | `read-window` | `(Showing lines 1-1000 of 4000. …)`、`offset=3500` 真读到、`limit=2000` |
-| `title-format` | OSC/CSI 清洗、模型侧 30 B（10 字）/ 上屏 80 B 上限切码点边界、`ESC[22t`/`ESC[23t` |
+| `title-format` | OSC/CSI 清洗、模型侧 45 B（15 字）/ 上屏 80 B 上限切码点边界、`ESC[22t`/`ESC[23t` |
 | `tty-title-pty` | 滚动模式真 PTY：`fd 2 + 无备用屏幕` 接线，弹栈在最后标题之后 |
 | `http401` | mock 401 + 错误体：打印状态与错误体并退出 3 |
 | `max-steps` | 显式 `max_steps=3`：3 步后熔断退出 3 |
@@ -4764,7 +4828,7 @@ DEEPSEEK_API_KEY=sk-xxx ./build/uya-agent \
 
 - PTY 延迟预算：`/status` 浮层 ≤800 ms、空闲 ≤150 ms、bash 跑着 ≤200/300 ms、压缩在飞 ≤300 ms。P30 实测 103–105 ms（旧 2245 ms）；P31 五场景 101/53/62/102/63 ms（旧 103/2280/242/103/2833 ms）；P39 `new-mid-turn` 回执 112 ms、中断 172 ms。
 - 退出码：正常 0；401 / 熔断 / `tool_calls` 序列化失败 3；崩溃 139；`SIGTERM` 143；`SIGKILL` 137。`resume-big-e2e` 未修 139 → 修后 0。
-- 结构尺寸：`sig-abi` 152 字节；`sig-term-restore` 恢复序列 26 字节（P22 四形状 26/18/31/23）；`tty-editor` termios 60 B；P32 四形状 42/34/47/39；`--title` 模型侧 30 B（10 字）/ 上屏 80 B 上限切码点边界。
+- 结构尺寸：`sig-abi` 152 字节；`sig-term-restore` 恢复序列 26 字节（P22 四形状 26/18/31/23）；`tty-editor` termios 60 B；P32 四形状 42/34/47/39；`--title` 模型侧 45 B（15 字）/ 上屏 80 B 上限切码点边界。
 - 容量：`unlimited-steps` 14 轮；`history-long` 40×2 ≈124 条 / 80 条工具结果；`toolcalls-*` 9849 / 9618 字节（旧固定 8192）；`read-window` 4000 行 / 160 KB（读缓冲 116736）。
 - 逐字节不变量：每行显示列 ≤ cols 且正文层无 ESC / 无 NUL；diff 两栏竖线同列、改动行左右边界列相同；请求体无裸控制字节（判定码 240）；NUL 必须往返成 `\u0000`；SGR 编码 `ADD`=`38;5;42`、`ADD_BG`=`48;5;22`、`DEL_HL`=`48;5;124`；`stats-format` 缓存命中 12.5%→13%。
 - 真机：`autodl-api` / `DeepSeek-V4.1-Flash`，pin 指纹 `d0265eff…42538`；A5 任务 `write → bash → 结论` 3 步、产物 `hello` 独立运行输出 `Hello, Uya!`。`~/.dsh/.credentials.yaml` 那把 key 402 `Insufficient Balance`，故走 autodl 网关。Responses 真机只验到 `--print-config` 读对 `api = openai-responses (source: dsh-settings)` 且请求真打到 `/v1/responses`（`tirisen` 502、`aigw` DNS 失败）。
