@@ -1418,6 +1418,46 @@ sess_open_resume            用会话自己的路径 + next_seq 续写
 （同名私有符号在合并命名空间撞车），而线上协议必须用 `std.json` ⇒ 自实现子集
 （`foundation/yamlcfg.uya`，§2.4）。
 
+#### 8.8.1 写回：人切完的模型路线落回 `agent-default-model`（P71）
+
+这一层以前**只读不写**：`/model`、`/effort` 只改这次会话的状态、落一条 `session/model`，
+下次启动仍然是 `settings.yaml` 里那个默认 —— 于是「我明明切了，重开又是旧的」。
+P71 补上写回，对齐 DSH 自己的行为：它的 `selectModel` RPC 会调
+`agentDefaultModel.saveSelection()`，由 `dsh-settings-file` 往同一个节做**叶级** diff 写回。
+
+| 项 | 本仓（`session/dshsave.uya`） |
+|---|---|
+| 触发 | 只有人：滚动模式 `/model <名字>`、`/effort <档位>`、TUI 浮层里选中（三条入口共用 `agent_model_save_default`） |
+| 不触发 | `--model` / `--effort`（CLI 一次性，DSH 的 entry-point 同口径）、`--resume` 的会话记录、`--exec-effort` 自动降档 |
+| 写什么 | **完整选择**：`provider` + `model` + `reasoningEffort` 一起。理由与 DSH 的注释一致 —— 「下一个模型没有档位时，只有一次完整的选择才能把 effort 清掉」 |
+| 改多少 | 只有那个节里的目标行；注释 / `!!js` 行 / 块标量 / 兄弟节**逐字节不变**，行数都不变 |
+| 提交 | `<file>.lock` 独占创建（0600）→ **重读** → 改 → `<file>.<pid>-<ms>.tmp` → `rename`；与 DSH 的 `dsh-atomic-write` 同一协议 |
+
+七条不变量（每条都对应一个真踩过或真拦住的形状）：
+
+1. **写回是副作用，不是前提** —— 调用点先切状态、后写盘，所以写失败只影响「下次启动」，
+   本次会话的选择一个字都不回滚。有专门的腿钉这条（锁被占 / 只读文件）。
+2. **只做叶级替换**，绝不「解析成树再整份重写」：那样会把注释与 `!!js` 行整片丢掉
+   （`yamlcfg` 的树只留键值，`!!js` 被中和成标量）。**首版就踩了这个**：打补丁那一步只抄了
+   节头那一行，`ui-theme` / `llm-pi-ai` 连同顶层注释一起没了 —— 而写前自检**说没问题**，
+   因为它只核对了那三项的值。教训：自检要钉**结构**（这一节还在不在顶层），不能只钉值。
+   现在多一条 `dshw_outside_same`：节外两段必须逐字节相同（整节追加那条路则要求原文本是前缀）。
+3. **绝不写空值**：`provider` / `model` 为空 ⇒ 那一行**原样不动**（写空串会让 DSH 的
+   `z.string().required()` 起不来）；只有 effort 为空才**删**那一行。
+4. **写前自检**：补丁后的文本自己 `yt_parse_text` 一遍，核对该节存在、是 map、三项值正确。
+5. **只认块状写法**：`agent-default-model: {…}` 一律拒（`DSHW_SHAPE`）并留一行说明 ——
+   认不出的形状不猜。
+6. **目标文件必须已存在**：不替用户新建一份设置（`DSHW_NOFILE` + 一行说明）。
+7. **别人的锁绝不删**：抢不到就让位（`DSHW_BUSY`）。DSH 自己的锁协议也写明「年龄证明不了
+   持有者已经死了，孤儿锁是运维动作」。抢锁超时取 **400 ms**（DSH 是 2 s）——这条在交互
+   路径上，卡 UI 比「这次没写回」更坏，而且失败可见、下次切换还会再试。
+
+静默只有两种：用户**显式**关掉（`--no-dsh-writeback` / `UYA_AGENT_DSH_WRITEBACK=0` /
+`--no-dsh-config`），以及文件里本来就是这份选择（`DSHW_SAME`，连 mtime 都不动）。
+其余一律留一行回执 —— 尤其是「目录是显式 `--dsh-home` 给的、里面却没有 `settings.yaml`」：
+那多半是路径写错了，静默的话用户只会看到「写回没生效」。为此目标目录的取法是
+**读过设置的那一份优先、退回 `--dsh-home`**：读设置失败时 `agent_dsh_home()` 是空的。
+
 ## 9. 子代理、目标、任务与编排
 
 这一节回答：**怎么把一个任务分出去并行做、怎么盯住它、怎么把多个子代理编排起来。**
@@ -3995,6 +4035,34 @@ responses 用 `{"type":"input_image","detail":"auto","image_url":…}`；
     教训：**「错的首屏」与「根本没有首屏」是两个 bug，别把后者当成前者的后果**。这里修了
     尺寸只解决第一个：第二个（不订阅）与尺寸无关，是拿「流在不在」当了「订阅对不对」的
     判据 —— 与踩坑 114 同一个形状（用错的东西当身份）。
+118. **「写前自检只核对值、不核对结构」= 把整份设置削成一个节还报绿**（P71，本轮实现里
+     自己踩的，被手工烟测当场抓住）：写回的补丁是「按行复制 + 就地替换」，而首版那一句
+     抄的起点写成了**节头那一行**（`buf_append(out, &t.ptr[hs], hend - hs)`）而不是从文件
+     头抄到节头。于是补丁结果里 `ui-theme` / `llm-pi-ai` 连同顶层注释**整片消失**，
+     文件只剩 `agent-default-model` 与它后面那点内容 —— 而写前自检（`dshw_verify`）
+     **说没问题**：它只核对了「这一节读出来是不是那三个值」，位置对不对它不问
+     （值确实对，节也确实读得出来）。真机上这就是「用户的模型表与权限预设被静默删掉」。
+     修法两条，缺一不可：①抄写起点改成从**第 0 字节**抄到节头；
+     ②自检补一条**结构**判据 `dshw_outside_same`（节头之前 + 节体之后两段必须逐字节相同；
+     整节追加那条路则要求原文本是补丁结果的**前缀** —— 追加只许往后长）。
+     判据本身也要能被证伪：把 ① 改回去重编，`dsh-writeback` 轮当场红 7 条。
+
+     教训：**「值对了」不等于「改对了」** —— 凡是对整份文件做「读-改-写」的地方，
+     自检必须同时钉「我改的那几处对了」与「我没碰的地方一个字节没变」。前半句是本轮写
+     自检时的第一反应，后半句才是这条命的来源；与踩坑 94（冲突标记没有任何测试看得见）
+     同族：**没有断言的那一半，坏了也不会有人报**。
+
+119. **自测断言自己也会「假绿」：夹具的值与被写值不同时，判据停掉照样绿**（P71，同轮）：
+     flow 节（`agent-default-model: {…}`）那条腿要钉「认不出的形状一律拒绝」。首版夹具写的是
+     `{provider: alpha, model: a-one}`，而要写进去的是 `beta/b-think` —— 判据被停掉（改成恒
+     `false`）之后，补丁会在 flow 行**后面**追加出重复的 `provider:` / `model:` 键，随后被
+     写前自检挡下，于是断言「返回 `DSHW_SHAPE` 且文件不变」**依然成立**：红的是自检，不是
+     那条判据。对照实验（把 `if shape != 0` 改成 `if false` 重编）证明了这个假绿 —— 一条都不红。
+     改成「夹具里的 flow 节**已经就是**要写的那两个值」之后，判据一停，追加就会真的写下去，
+     腿立刻红 2 条。
+
+     教训：**断言必须只有一条路径能满足它**。写「A 应当被拒」时先问一句：除了 A 之外，
+     还有谁会拒绝？有第二道闸门挡着的时候，第一道闸门是死是活测不出来。
 
 118. **`SO_REUSEADDR` 的常量抄成了 BSD 值 ⇒ Linux 上一个选项都没设上，而失败被
     `catch {}` 吞掉**（本轮，用户报的「运行 web 后 ctrl+c 报的错」）：
@@ -4232,6 +4300,7 @@ DEEPSEEK_API_KEY=sk-xxx ./build/uya-agent \
 | `model-apply` | 切换跟随能力、旧档位回落 `off`、幂等返回 1、目录外不动能力；**P62**：同名 a-two 用 `提供方/名字` **双向**指定（alpha↔delta：provider/contextWindow/端点都跟着换）、目录里查不到的左半段不被误拆（`Qwen/Qwen3-32B` 整串当模型名）；**P37 修复**：换提供方时 `base_url` 与 `api_style` **双向**跟随（beta→alpha→beta 都断言）、跟随来的来源码落 `dsh-settings`、**显式 `--base-url`/`--api-key` 不被覆盖**、提供方**没声明 `baseURL`** 时端点一个字节不动、**解析不出凭据**时清空 key（旧密钥绝不跨提供方）（踩坑 96） |
 | `effort-apply` | 公布的收、同值幂等返回 1、未公布拒 2、透传但 `effort_set=false` |
 | `model-log` | `session/model` 三字段取最后一条 |
+| `dsh-writeback` | P71 写回（`session/dshsave.uya`）：叶级替换（注释/兄弟节**逐字节**保留、行数不变）/ 幂等（`DSHW_SAME`，连 mtime 都不动）/ effort 清档 / 缺键追加节尾 / 整节缺失追加文末 / 空 provider 不写空值（那一行原样留）/ 需要引号的值（空格与 `#`）/ 控制字节拒写且文件不变 / flow 节拒（不猜、不整份重写）/ 锁被占让位（`DSHW_BUSY`）且**不删别人的锁** / 缺 `settings.yaml` 不新建 / 回执表（`SAME` 与 `SKIP` 一个字节不加）。**防假绿对照**：①把「从第 0 字节照抄」改回「只抄节头那一行」⇒ 红 7 条；②抢锁恒成功 ⇒ 红 3 条；③flow 判据停掉 ⇒ 红 2 条（这条首版是**假绿**：夹具值与被写值不同时，追加会被写前自检挡下，判据停掉照样绿 —— 夹具改成「已经就是那两个值」之后才真的钉住它） |
 | `worktree` | 真 git：建 worktree + `dsh/<slug>`、闸门、`wt_finish` 合并且目录消失 |
 | `worktree-discard` | `wt_discard` 不合并；非仓库 `wt_provision` 判 `SKIPPED` |
 | `worktree-tool-msg` | 踩坑 80：走**真工具入口**带 `message` 的 finish —— `git log -1 --pretty=%s` 读回来的提交说明**逐字节**等于传入的 marker（`wt_finish` 把 `msg` 当 C 串，JSON 解出来的 Buf 没有 NUL 时会读到堆尾巴） |
@@ -4345,7 +4414,7 @@ DEEPSEEK_API_KEY=sk-xxx ./build/uya-agent \
 **验证用的 make 目标与快捷入口**
 
 - 总闸门：`make selftest`（离线，含 `p30-check` 与全部轮次，SELFTEST PASS / 退出 0）、`make e2e`（真网关）。
-- 离线配套：`make check`（A1 类型检查）/ `build`（A2 产出 `build/uya-agent`）/ `codegen-audit` / `tui-selftest` / `shell-selftest` / `e2e-config-flags` / `e2e-api` / `e2e-steps` / `e2e-permission` / `e2e-sandbox` / `e2e-tasks` / `e2e-goal` / `e2e-sessions` / `e2e-resume-big` / `e2e-title` / `e2e-model` / `e2e-model-route` / `e2e-worktree` / `e2e-diff` / `e2e-watch` / `e2e-watch-pick` / `diff-selftest` / `panel-selftest` / `e2e-ws`。
+- 离线配套：`make check`（A1 类型检查）/ `build`（A2 产出 `build/uya-agent`）/ `codegen-audit` / `tui-selftest` / `shell-selftest` / `e2e-config-flags` / `e2e-api` / `e2e-steps` / `e2e-permission` / `e2e-sandbox` / `e2e-tasks` / `e2e-goal` / `e2e-sessions` / `e2e-resume-big` / `e2e-title` / `e2e-model` / `e2e-model-save` / `e2e-model-route` / `e2e-worktree` / `e2e-diff` / `e2e-watch` / `e2e-watch-pick` / `diff-selftest` / `panel-selftest` / `e2e-ws`。
 - PTY 场景：`make p30-check`（`testdata/pty_drive.py --suite`，10 个场景；P41 那场 `worktree-menu` 走
   两条入口 —— 命令面板里选中 `/worktree` 与裸 `/worktree` —— 到选择框 → ↓ 到 `finish` → 确认框 →
   回车取消，`PTY_DUMP=1` 会把两张框打出来；踩坑 114 那场 `tasks-ctrl-t` 要假网关的

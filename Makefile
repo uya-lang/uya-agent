@@ -72,7 +72,7 @@ SRC := src/foundation/bufx.uya src/foundation/jsonx.uya src/foundation/yamlcfg.u
        src/term/view.uya src/term/watch.uya \
        src/tools/askuser.uya src/tools/fsx.uya src/tools/jobs.uya src/tools/perm.uya src/tools/sandboxx.uya src/tools/search.uya src/tools/shellx.uya \
        src/plugin/mcpcfg.uya src/plugin/mcprun.uya src/plugin/mcp.uya src/plugin/mcptool.uya \
-       src/session/dshcfg.uya src/session/dshsess.uya src/session/inbox.uya src/session/modelx.uya src/session/procx.uya src/session/session.uya src/session/sigx.uya src/session/stats.uya \
+       src/session/dshcfg.uya src/session/dshsave.uya src/session/dshsess.uya src/session/inbox.uya src/session/modelx.uya src/session/procx.uya src/session/session.uya src/session/sigx.uya src/session/stats.uya \
        src/agent/agent.uya src/agent/ag_config.uya src/agent/ag_title_prompt.uya src/agent/ag_tools_schema.uya src/agent/ag_request_stream.uya src/agent/ag_workspace_model.uya src/agent/ag_worktree.uya src/agent/ag_interactive_tasks.uya src/agent/ag_tui_sessions.uya src/agent/ag_plan_pump.uya src/agent/ag_pm.uya src/agent/compact.uya src/agent/deleg.uya src/agent/goal.uya src/agent/instr.uya src/agent/plan.uya src/agent/prompt.uya src/agent/skill.uya src/agent/todo.uya src/agent/workflow.uya \
        src/pm/pm_repo.uya src/pm/pm_store.uya src/pm/pm_ingest.uya src/pm/pm_digest.uya \
        src/vcs/gitx.uya src/vcs/worktreex.uya \
@@ -93,7 +93,7 @@ TASK ?= 创建 hello.uya，编译并运行它
 export UYA_ROOT
 export UYA_SPLIT_C_DIR := $(CURDIR)/build/uyacache
 
-.PHONY: all check print-src build link-audit selftest codegen-audit doc-audit lint-size lint-size-all doc-cover probe e2e e2e-config e2e-exec e2e-accept-nudge e2e-config-flags e2e-title e2e-title-cmd e2e-title-auto e2e-mouse e2e-api e2e-steps e2e-permission e2e-sandbox e2e-tasks e2e-goal e2e-memory e2e-sessions e2e-resume-big e2e-diff e2e-ws e2e-model e2e-model-route e2e-worktree e2e-watch e2e-watch-pick e2e-dsh p30-check tui-demo tui-selftest web-selftest sess-selftest diff-selftest model-selftest panel-selftest clean shell-selftest pm-selftest mcp-selftest
+.PHONY: all check print-src build link-audit selftest codegen-audit doc-audit lint-size lint-size-all doc-cover probe e2e e2e-config e2e-exec e2e-accept-nudge e2e-config-flags e2e-title e2e-title-cmd e2e-title-auto e2e-mouse e2e-api e2e-steps e2e-permission e2e-sandbox e2e-tasks e2e-goal e2e-memory e2e-sessions e2e-resume-big e2e-diff e2e-ws e2e-model e2e-model-save e2e-model-route e2e-worktree e2e-watch e2e-watch-pick e2e-dsh p30-check tui-demo tui-selftest web-selftest sess-selftest diff-selftest model-selftest panel-selftest clean shell-selftest pm-selftest mcp-selftest
 
 all: build
 
@@ -197,7 +197,7 @@ lint-size-all:
 #   本仓实测：90 文件树上净增 50 个函数 + `rm -rf build && make build` → 通过（静态链接审计通过）。
 #   因此「净增函数按 0 处理」那条纪律作废。这段留下的用处只有一个：**换/降编译器时认得出症状**
 #   （报错点落在标准库、`make check` 全绿、只有清缓存重编才炸）。
-selftest: build codegen-audit doc-audit doc-cover e2e-exec e2e-accept-nudge e2e-config-flags e2e-title e2e-title-cmd e2e-title-auto e2e-mouse e2e-api e2e-steps e2e-permission e2e-sandbox e2e-tasks e2e-goal e2e-memory e2e-sessions e2e-resume-big e2e-diff e2e-ws e2e-model e2e-model-route e2e-worktree p30-check
+selftest: build codegen-audit doc-audit doc-cover e2e-exec e2e-accept-nudge e2e-config-flags e2e-title e2e-title-cmd e2e-title-auto e2e-mouse e2e-api e2e-steps e2e-permission e2e-sandbox e2e-tasks e2e-goal e2e-memory e2e-sessions e2e-resume-big e2e-diff e2e-ws e2e-model e2e-model-save e2e-model-route e2e-worktree p30-check
 	UYA_BIN=$(UYA) $(OUT) --selftest
 
 probe: build
@@ -417,7 +417,69 @@ e2e-model: build
 	out=$$($$run --model a-plain --effort xhigh --print-config 2>&1); \
 	echo "$$out" | grep -q "reasoning_effort = xhigh" || { echo "FAIL: 不公布档位时应当原样透传"; echo "$$out"; exit 1; }; \
 	echo "$$out" | grep -q "not a level this model publishes" || { echo "FAIL: 透传的值应当被标出来（不是模型公布的档位）"; echo "$$out"; exit 1; }; \
-	echo "e2e-model: 通过（目录/能力跟随/目录外只换名字/REPL 报告与切换/非法档位拒/透传标注/同名跨提供方指定与提示/--provider 顺序无关）"
+	: "⑥ P71：人敲的 /model 切完要写回设置（⑤d 刚切到 beta/a-think 的那一下也落盘）"; \
+	grep -q "provider: beta" $$home/settings.yaml || { echo "FAIL: 文本命令 /model beta/a-think 没有写回 settings.yaml"; cat $$home/settings.yaml; exit 1; }; \
+	grep -q "model: a-think" $$home/settings.yaml || { echo "FAIL: 写回设置时 model 不对"; cat $$home/settings.yaml; exit 1; }; \
+	echo "e2e-model: 通过（目录/能力跟随/目录外只换名字/REPL 报告与切换/非法档位拒/透传标注/同名跨提供方指定与提示/--provider 顺序无关/人敲的 /model 写回设置）"
+
+# P71：**人运行中切模型/强度 ⇒ 这份选择写回 DSH 设置**（离线，真二进制 + 真 settings.yaml）
+#   对齐 DSH 自己的行为：`selectModel` → `agentDefaultModel.saveSelection()` → 同一个
+#   `agent-default-model` 节。判据都是**文件本身**（textcmp 对照副本），不是回执文案：
+#     ① 两个提供方的夹具带注释 + 兄弟节；`/model beta/a-think` 之后：那三行变了，
+#        **注释与兄弟节逐字节不变**（`cmp` 只允许差异出现在节里 —— 用「去掉节之后相同」验）；
+#     ② `/effort low` 之后 `reasoningEffort` 跟着落；
+#     ③ **反腿**：`--model X`（CLI，一次性）一个字节都不写 —— 与 ① 共用同一份夹具快照；
+#     ④ **反腿**：`--no-dsh-config` 不写；`--no-dsh-writeback` 不写（且 print-config 说清来源）；
+#     ⑤ **反腿**：目录里没有 settings.yaml ⇒ 不新建、只留一行回执；
+#     ⑥ **反腿**：flow 写法的节 ⇒ 拒写、文件逐字节不变（不猜、也不整份重写）。
+e2e-model-save: build
+	@set -e; \
+	home=build/selftest_p71_save; rm -rf $$home; mkdir -p $$home; \
+	printf '# 顶层注释：写回必须保留它\nui-theme:\n  preference: dark\nagent-default-model:\n  provider: alpha\n  model: a-plain\n  reasoningEffort: high\nllm-pi-ai:\n  providers:\n    {\n      alpha:\n        {\n          api: openai-responses,\n          baseURL: https://alpha.example/v1,\n          models:\n            [\n              { id: a-plain, contextWindow: 111000 },\n              { id: a-think, contextWindow: 222000, reasoningEfforts: { off: none, low: low, high: high } }\n            ]\n        },\n      beta:\n        {\n          api: openai-completions,\n          baseURL: https://beta.example/v1,\n          models:\n            [\n              { id: a-think, contextWindow: 444000, reasoningEfforts: { off: none, low: low, high: high } }\n            ]\n        }\n    }\n' > $$home/settings.yaml; \
+	run="$(CURDIR)/$(OUT) --dsh-home $$home --no-tui --quiet --api-key dummy-key"; \
+	cp $$home/settings.yaml $$home/snap0; \
+	: "① 人敲 /model：三行跟着改，注释与兄弟节逐字节不变"; \
+	out=$$(printf '/model beta/a-think\n/effort low\n/exit\n' | $$run 2>&1); \
+	echo "$$out" | grep -q "已写回" || { echo "FAIL: /model 之后没有写回回执"; echo "$$out"; exit 1; }; \
+	grep -q "^  provider: beta$$" $$home/settings.yaml || { echo "FAIL: provider 没写回"; cat $$home/settings.yaml; exit 1; }; \
+	grep -q "^  model: a-think$$" $$home/settings.yaml || { echo "FAIL: model 没写回"; cat $$home/settings.yaml; exit 1; }; \
+	grep -q "^  reasoningEffort: low$$" $$home/settings.yaml || { echo "FAIL: reasoningEffort 没写回"; cat $$home/settings.yaml; exit 1; }; \
+	grep -q "^# 顶层注释：写回必须保留它$$" $$home/settings.yaml || { echo "FAIL: 顶层注释被写回弄丢了"; cat $$home/settings.yaml; exit 1; }; \
+	grep -q "^ui-theme:$$" $$home/settings.yaml || { echo "FAIL: 兄弟节 ui-theme 被写回弄丢了"; cat $$home/settings.yaml; exit 1; }; \
+	grep -q "a-plain, contextWindow: 111000" $$home/settings.yaml || { echo "FAIL: llm-pi-ai 那一大块被写回弄丢了"; cat $$home/settings.yaml; exit 1; }; \
+	: "①b 行数不变 = 只改了值、没增删任何一行"; \
+	a=$$(wc -l < $$home/snap0); b=$$(wc -l < $$home/settings.yaml); \
+	[ "$$a" = "$$b" ] || { echo "FAIL: 写回改了行数（$$a → $$b）——叶级替换不该增删行"; exit 1; }; \
+	: "② 反腿：CLI 的 --model/--effort 是**一次性**的，一个字节都不许写"; \
+	cp $$home/settings.yaml $$home/snap1; \
+	$$run --model a-plain --effort high --print-config >/dev/null 2>&1; \
+	cmp -s $$home/snap1 $$home/settings.yaml || { echo "FAIL: CLI 的 --model/--effort 把设置写了（那是一次性的）"; exit 1; }; \
+	: "③ 反腿：--no-dsh-writeback 之后 /model 不写（且 print-config 说实话）"; \
+	out=$$($$run --no-dsh-writeback --print-config 2>&1); \
+	echo "$$out" | grep -q "dsh_writeback = off  (source: cli)" || { echo "FAIL: --no-dsh-writeback 没生效"; echo "$$out"; exit 1; }; \
+	printf '/model alpha/a-plain\n/exit\n' | $$run --no-dsh-writeback >/dev/null 2>&1; \
+	cmp -s $$home/snap1 $$home/settings.yaml || { echo "FAIL: --no-dsh-writeback 之后仍然写了设置"; exit 1; }; \
+	out=$$($$run --print-config 2>&1); \
+	echo "$$out" | grep -q "dsh_writeback = on  (source: default)" || { echo "FAIL: 默认应当是开"; echo "$$out"; exit 1; }; \
+	: "③b env 那一档（UYA_AGENT_DSH_WRITEBACK=0）"; \
+	out=$$(UYA_AGENT_DSH_WRITEBACK=0 $$run --print-config 2>&1); \
+	echo "$$out" | grep -q "dsh_writeback = off  (source: env)" || { echo "FAIL: UYA_AGENT_DSH_WRITEBACK=0 没生效"; echo "$$out"; exit 1; }; \
+	: "④ 反腿：--no-dsh-config 不写（压根没读设置）"; \
+	printf '/model alpha/a-plain\n/exit\n' | $$run --no-dsh-config >/dev/null 2>&1; \
+	cmp -s $$home/snap1 $$home/settings.yaml || { echo "FAIL: --no-dsh-config 之后仍然写了设置"; exit 1; }; \
+	: "⑤ 反腿：目录里没有 settings.yaml ⇒ 不新建、只留一行说明"; \
+	none=build/selftest_p71_none; rm -rf $$none; mkdir -p $$none; \
+	out=$$(printf '/model a-think\n/exit\n' | $(CURDIR)/$(OUT) --dsh-home $$none --no-tui --quiet --api-key dummy-key 2>&1); \
+	echo "$$out" | grep -q "没有 settings.yaml" || { echo "FAIL: 缺设置文件时没有留下可见说明"; echo "$$out"; exit 1; }; \
+	[ -z "$$(ls -A $$none)" ] || { echo "FAIL: 缺设置文件时我们新建了东西：$$(ls -A $$none)"; exit 1; }; \
+	: "⑥ 反腿：flow 写法的节 ⇒ 拒写且文件逐字节不变"; \
+	flow=build/selftest_p71_flow; rm -rf $$flow; mkdir -p $$flow; \
+	printf 'agent-default-model: {provider: alpha, model: a-plain}\nllm-pi-ai:\n  providers: { alpha: { api: openai-completions, baseURL: "https://alpha.example/v1", models: [ { id: b-think } ] } }\n' > $$flow/settings.yaml; \
+	cp $$flow/settings.yaml $$flow/snap; \
+	out=$$(printf '/model b-think\n/exit\n' | $(CURDIR)/$(OUT) --dsh-home $$flow --no-tui --quiet --api-key dummy-key 2>&1); \
+	echo "$$out" | grep -q "不是块状写法" || { echo "FAIL: flow 节没有被拒（应当留一行说明）"; echo "$$out"; exit 1; }; \
+	cmp -s $$flow/snap $$flow/settings.yaml || { echo "FAIL: 被拒之后文件被改了"; exit 1; }; \
+	echo "e2e-model-save: 通过（/model 与 /effort 写回那三行 + 注释与兄弟节逐字节保留 + 行数不变 / CLI 一次性不写 / --no-dsh-writeback 与 env 两档 / --no-dsh-config 不写 / 缺文件不新建 / flow 节拒写）"
 
 # P37：**切模型要连端点与凭据一起跟随**（离线，真终端 + 两个假网关，不联网）
 #   用户报的症状是「中途切换不了模型」：切换看起来成功了（信息行/model 报告都变了），

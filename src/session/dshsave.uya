@@ -1,0 +1,753 @@
+// src/session/dshsave.uya — 把「运行中选定的模型路线」写回 DSH 设置（P71）
+//
+// 本文件：`DshwSel`（一份完整的默认选择）与唯一入口 `dshw_save`，以及它下面那几件小事：
+//   定位顶层 `agent-default-model:` 一节（`dshw_find_section`/`dshw_sec_scan`）、叶级改写
+//   （`dshw_patch` + `dshw_patch_new`）、值的写法（`dshw_value_into`）、写前自检
+//   （`dshw_verify`）、跨进程写锁（`dshw_lock`/`dshw_unlock`）、原子提交
+//   （`dshw_write_atomic`）与返回码 → 一行回执（`dshw_receipt_into`）。
+// 不变量：① **写回是副作用，不是前提** —— 写不成功只影响「下次启动的默认」，本次会话的选择
+//   一个字节都不回滚（调用方先切状态、后调这里，顺序不许反）；② **只做叶级替换** —— 注释、
+//   `!!js` 行、块标量、别的节（`llm-pi-ai` / `permission` / `ui-theme`…）逐字节不变，绝不
+//   「解析成树再整份重写」（那会把注释与 `!!js` 行全丢掉，见 DESIGN §8.8）；③ **绝不写空值**：
+//   provider / model 为空时**那一行原样不动**（写空串会让 DSH 的 `z.string().required()`
+//   起不来）；只有 effort 为空时才**删**那一行 —— 那是 DSH「一次完整选择」的清档语义；
+//   ④ **写前自检**：补丁后的文本必须自己解析得回来、且读回的三项正是要写的值，否则拒绝
+//   （宁可不写，也不留半坏的文件）；⑤ 目标只能是**块状写法**的节：flow 映射 / 内联标量一律
+//   拒绝（`DSHW_SHAPE`），不猜、不整份重写；⑥ 目标文件**必须已存在** —— 不替用户新建一份
+//   设置（`DSHW_NOFILE`）；⑦ 提交是「抢锁 → 重读 → 改 → 临时文件 → rename」，与 DSH 的
+//   `dsh-atomic-write` 同一协议；**别人的锁绝不删**（孤儿锁是运维动作）；不做 fsync
+//   （DSH 也把 crash durability 划在范围外）。
+// 依赖：libc（syscall / unistd）；本仓 foundation/bufx（Buf 与 buf_*）、foundation/yamlcfg
+//   （写前自检的 `yt_*`）、session/session（`sess_file_exists`）。
+// 命名：对外 `dshw_*` + 类型 `DshwSel` + 常量 `DSHW_*`；私有同样 `dshw_*` 前缀。
+
+use libc.syscall;
+use libc.unistd;
+
+// 返回码：0 写成了 / 1 文件里本来就是这份选择 / 2 没得写（没有 home、拼不出完整节）/
+// 3 形状或值不可写（flow 节、控制字节、自检不过）/ 4 写锁被占 / 5 IO 或内存失败 /
+// 6 settings.yaml 不存在（**不新建**）。
+export const DSHW_OK: i32 = 0;
+export const DSHW_SAME: i32 = 1;
+export const DSHW_SKIP: i32 = 2;
+export const DSHW_SHAPE: i32 = 3;
+export const DSHW_BUSY: i32 = 4;
+export const DSHW_FAIL: i32 = 5;
+export const DSHW_NOFILE: i32 = 6;
+
+// 节名与三个键名（唯一的真值：查找、新建、自检、回执都读它们）。
+// 抽成常量不只是防抄错：`"reasoningEffort" as &const byte` 一个词就 33 字符，
+// 散在十几处会把行宽顶出 80（AGENTS.md 第三条）。
+const DSHW_SEC: &const byte = "agent-default-model" as &const byte;
+const DSHW_K_PROVIDER: &const byte = "provider" as &const byte;
+const DSHW_K_MODEL: &const byte = "model" as &const byte;
+const DSHW_K_EFFORT: &const byte = "reasoningEffort" as &const byte;
+
+// 读盘上限：真机 settings.yaml 是 6.8 KB 量级，512 KiB 只用来挡住「读到别的东西」
+const DSHW_MAX_BYTES: usize = 524288;
+
+// 抢锁的总等待：**故意**比 DSH 的 2 s 短 —— 这条在交互路径上，卡 UI 比「这次没写回」更坏，
+// 而且失败是可见的（回执里说清楚），下次切换还会再试一遍。
+const DSHW_LOCK_WAIT_MS: u64 = 400;
+
+// 临时文件名给 pid + 毫秒留的余量（`<path>.<pid>-<ms>.tmp`）
+const DSHW_TMP_ROOM: usize = 64;
+
+// 一份**完整**的默认选择：provider + model + 可选的 effort（空 = 清掉那一行）。
+// 为什么三样一起给：DSH 的 `saveSelection` 收的就是完整选择，注释里写着理由 ——
+// 「下一个选中的模型没有档位时，只有一次完整的选择才能把 effort 清掉」。
+export struct DshwSel {
+    provider: &const byte,
+    pn: usize,
+    model: &const byte,
+    mn: usize,
+    effort: &const byte,
+    en: usize,
+}
+
+// ============================================================
+// 行扫描小工具（全部按「行首 + 行内容末」工作，不改写入参）
+// ============================================================
+// 下一行的行首（= 本行换行符之后；最后一行没有换行时返回 t.len）。
+fn dshw_line_end(t: &const Buf, off: usize) usize {
+    var i: usize = off;
+    while i < t.len && t.ptr[i] != 10 as byte {
+        i = i + 1;
+    }
+    if i < t.len {
+        return i + 1;
+    }
+    return i;
+}
+
+// 行**内容**的末尾（去掉 \n 与行尾的 \r）；`nl` 是 dshw_line_end 的结果。
+fn dshw_content_end(t: &const Buf, off: usize, nl: usize) usize {
+    var e: usize = nl;
+    if e > off && t.ptr[e - 1] == 10 as byte {
+        e = e - 1;
+    }
+    if e > off && t.ptr[e - 1] == 13 as byte {
+        e = e - 1;
+    }
+    return e;
+}
+
+// 行首缩进（空格/TAB 的个数）
+fn dshw_indent(t: &const Buf, off: usize, e: usize) usize {
+    var i: usize = off;
+    while i < e && (t.ptr[i] == 32 as byte || t.ptr[i] == 9 as byte) {
+        i = i + 1;
+    }
+    return i - off;
+}
+
+// 这一行是不是空白行（只有空格/TAB/CR）
+fn dshw_blank(t: &const Buf, off: usize, e: usize) bool {
+    var i: usize = off;
+    while i < e {
+        if t.ptr[i] != 32 as byte && t.ptr[i] != 9 as byte &&
+            t.ptr[i] != 13 as byte {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+// 这一行是不是注释行（首个非空白字符是 `#`）
+fn dshw_comment(t: &const Buf, off: usize, e: usize) bool {
+    const s: usize = off + dshw_indent(t, off, e);
+    return s < e && t.ptr[s] == 35 as byte;
+}
+
+// `s` 处是不是 `name` + 可选空格 + `:`。后半段那个冒号是**必须**的：
+// 否则 `models:` 会被当成 `model`、`modelOverrides:` 也会被误命中。
+fn dshw_name_at(t: &const Buf, s: usize, e: usize, name: &const byte) bool {
+    const n: usize = bufx_cstr_len(name);
+    if s + n > e || !bufx_mem_eq(&t.ptr[s], name, n) {
+        return false;
+    }
+    var i: usize = s + n;
+    while i < e && t.ptr[i] == 32 as byte {
+        i = i + 1;
+    }
+    return i < e && t.ptr[i] == 58 as byte;
+}
+
+// ============================================================
+// 定位：顶层 `agent-default-model:` 一节
+// ============================================================
+// 找顶层那一行。返回行首偏移，-1 = 文件里没有这一节。
+// `shape` 出参：0 = 块状写法（可改）；1 = 冒号后有内联值（flow 映射或标量 ⇒ 拒绝）。
+// 「顶层」的判据是**行首没有空白**：flow 映射与块标量的内容在 YAML 里必然缩进，
+// 所以这一条就足以把它们排除在外（DSH 的 settings.yaml 正是这么写的）。
+fn dshw_find_section(t: &const Buf, shape: &i32) isize {
+    shape[0] = 0;
+    var pos: usize = 0;
+    while pos < t.len {
+        const nl: usize = dshw_line_end(t, pos);
+        const e: usize = dshw_content_end(t, pos, nl);
+        if !dshw_blank(t, pos, e) && !dshw_comment(t, pos, e) &&
+            dshw_indent(t, pos, e) == 0 && dshw_name_at(t, pos, e, DSHW_SEC) {
+            var i: usize = pos + bufx_cstr_len(DSHW_SEC);
+            while i < e && t.ptr[i] == 32 as byte {
+                i = i + 1;
+            }
+            i = i + 1;   // 跳过 ':'
+            while i < e && (t.ptr[i] == 32 as byte || t.ptr[i] == 9 as byte) {
+                i = i + 1;
+            }
+            if i < e && t.ptr[i] != 35 as byte {
+                shape[0] = 1;
+            }
+            return pos as isize;
+        }
+        pos = nl;
+    }
+    return -1 as isize;
+}
+
+// 节体扫描（从 hend 这个**行首**开始）：
+//   body_end = 节的结束处（下一个顶层非空行的行首，或文件尾）
+//   ins      = 追加缺失键的插入点（节内最后一个非空行的下一行行首）
+//   ind      = 节内键的缩进（取第一个非空白非注释行；一行都没有时用 2）
+fn dshw_sec_scan(t: &const Buf, hend: usize, body_end: &usize,
+                 ins: &usize, ind: &usize) void {
+    body_end[0] = t.len;
+    ins[0] = hend;
+    ind[0] = 2;
+    var got_ind: bool = false;
+    var pos: usize = hend;
+    while pos < t.len {
+        const nl: usize = dshw_line_end(t, pos);
+        const e: usize = dshw_content_end(t, pos, nl);
+        if !dshw_blank(t, pos, e) && dshw_indent(t, pos, e) == 0 {
+            body_end[0] = pos;
+            return;
+        }
+        if !dshw_blank(t, pos, e) {
+            if !dshw_comment(t, pos, e) && !got_ind {
+                ind[0] = dshw_indent(t, pos, e);
+                got_ind = true;
+            }
+            ins[0] = nl;
+        }
+        pos = nl;
+    }
+}
+
+// 节体里这一行是哪个目标键：1 provider / 2 model / 3 reasoningEffort / 0 都不是。
+// 只在**节自己的缩进层**上认（嵌套结构里的同名键不动）。
+fn dshw_sec_key(t: &const Buf, off: usize, e: usize, ind: usize) i32 {
+    if dshw_blank(t, off, e) || dshw_comment(t, off, e) {
+        return 0;
+    }
+    if dshw_indent(t, off, e) != ind {
+        return 0;
+    }
+    const s: usize = off + ind;
+    if dshw_name_at(t, s, e, DSHW_K_PROVIDER) {
+        return 1;
+    }
+    if dshw_name_at(t, s, e, DSHW_K_MODEL) {
+        return 2;
+    }
+    if dshw_name_at(t, s, e, DSHW_K_EFFORT) {
+        return 3;
+    }
+    return 0;
+}
+
+// ============================================================
+// 值的写法与落笔
+// ============================================================
+// 裸写安全的字符集：字母数字与 `. _ / @ + -`（模型 id 与 provider 键的常见形状）。
+fn dshw_tok_ok(c: byte) bool {
+    if c >= 65 as byte && c <= 90 as byte {
+        return true;
+    }
+    if c >= 97 as byte && c <= 122 as byte {
+        return true;
+    }
+    if c >= 48 as byte && c <= 57 as byte {
+        return true;
+    }
+    return c == 46 as byte || c == 95 as byte || c == 47 as byte ||
+        c == 64 as byte || c == 43 as byte || c == 45 as byte;
+}
+
+// 这一项能不能裸写：**首字符必须是字母或下划线**。数字 / `-` / `.` / `+` 开头在 YAML 里
+// 会被读成数字或别的类型，而 DSH 的 schema 是 `z.string().required()` —— 那里读成数字
+// 等于让 DSH 起不来，所以这种值一律加引号（引号里的东西必然是字符串）。
+fn dshw_plain_start(c: byte) bool {
+    if c >= 65 as byte && c <= 90 as byte {
+        return true;
+    }
+    if c >= 97 as byte && c <= 122 as byte {
+        return true;
+    }
+    return c == 95 as byte;
+}
+
+// 把值写进 out：安全令牌裸写，其余加双引号并转义 `"` 与 `\`。
+// 含控制字节（< 0x20 或 0x7F）返回 false = **拒绝写**（写进去会毁掉整份设置）。
+fn dshw_value_into(out: &Buf, v: &const byte, vn: usize) bool {
+    if vn == 0 {
+        return false;
+    }
+    var safe: bool = dshw_plain_start(v[0]);
+    var i: usize = 0;
+    while i < vn {
+        const c: byte = v[i];
+        if c < 32 as byte || c == 127 as byte {
+            return false;
+        }
+        if !dshw_tok_ok(c) {
+            safe = false;
+        }
+        i = i + 1;
+    }
+    if safe {
+        return buf_append(out, v, vn);
+    }
+    if !buf_append_byte(out, 34) {
+        return false;
+    }
+    i = 0;
+    while i < vn {
+        const c: byte = v[i];
+        if (c == 34 as byte || c == 92 as byte) && !buf_append_byte(out, 92) {
+            return false;
+        }
+        if !buf_append_byte(out, c) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return buf_append_byte(out, 34);
+}
+
+// 缩进 ind 个空格
+fn dshw_pad(out: &Buf, ind: usize) bool {
+    var i: usize = 0;
+    while i < ind {
+        if !buf_append_byte(out, 32) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+// 一行 `<缩进><键>: <值>\n`。返回 false = 值不可写或内存失败（调用方落 DSHW_SHAPE）。
+fn dshw_emit_kv(out: &Buf, ind: usize, key: &const byte,
+                v: &const byte, vn: usize) bool {
+    return dshw_pad(out, ind) && buf_append_cstr(out, key) &&
+        buf_append_cstr(out, ": ") && dshw_value_into(out, v, vn) &&
+        buf_append_byte(out, 10);
+}
+
+// 插入点 `ins` 之前不是换行时先补一个（文件末尾那行可以没有尾换行）
+fn dshw_ins_break(out: &Buf, t: &const Buf, ins: usize) bool {
+    if ins > 0 && ins <= t.len && t.ptr[ins - 1] == 10 as byte {
+        return true;
+    }
+    return buf_append_byte(out, 10);
+}
+
+// 追加节里**缺的**那几行（只在有值且那一行确实缺时才追加）。
+// 返回 false = 值不可写或内存失败。
+fn dshw_flush_missing(out: &Buf, t: &const Buf, s: &const DshwSel, ins: usize,
+                      ind: usize, sp: bool, sm: bool, se: bool) bool {
+    var any: bool = false;
+    if !sp && s.pn > 0 {
+        any = true;
+    }
+    if !sm && s.mn > 0 {
+        any = true;
+    }
+    if !se && s.en > 0 {
+        any = true;
+    }
+    if !any {
+        return true;
+    }
+    if !dshw_ins_break(out, t, ins) {
+        return false;
+    }
+    if !sp && s.pn > 0 &&
+        !dshw_emit_kv(out, ind, DSHW_K_PROVIDER, s.provider, s.pn) {
+        return false;
+    }
+    if !sm && s.mn > 0 &&
+        !dshw_emit_kv(out, ind, DSHW_K_MODEL, s.model, s.mn) {
+        return false;
+    }
+    if !se && s.en > 0 &&
+        !dshw_emit_kv(out, ind, DSHW_K_EFFORT, s.effort, s.en) {
+        return false;
+    }
+    return true;
+}
+
+// 节不存在：整节追加到文件末尾。provider / model 缺一个就拼不出可用的默认选择 ⇒ DSHW_SKIP
+// （宁可不写，也不写一份 DSH 读不了的节）。
+fn dshw_patch_new(t: &const Buf, s: &const DshwSel, out: &Buf,
+                  changed: &bool) i32 {
+    if s.pn == 0 || s.mn == 0 {
+        return DSHW_SKIP;
+    }
+    if !buf_append(out, t.ptr as &const byte, t.len) {
+        return DSHW_FAIL;
+    }
+    if t.len > 0 && t.ptr[t.len - 1] != 10 as byte &&
+        !buf_append_byte(out, 10) {
+        return DSHW_FAIL;
+    }
+    if !buf_append_cstr(out, DSHW_SEC) || !buf_append_cstr(out, ":\n") {
+        return DSHW_FAIL;
+    }
+    if !dshw_emit_kv(out, 2, DSHW_K_PROVIDER, s.provider, s.pn) ||
+        !dshw_emit_kv(out, 2, DSHW_K_MODEL, s.model, s.mn) {
+        return DSHW_SHAPE;
+    }
+    if s.en > 0 &&
+        !dshw_emit_kv(out, 2, DSHW_K_EFFORT, s.effort, s.en) {
+        return DSHW_SHAPE;
+    }
+    changed[0] = true;
+    return DSHW_OK;
+}
+
+// 纯函数：文本进、文本出（不碰文件系统）。改动只有三处 —— 被选中的那几行就地改写、
+// 节里缺的行追加到节尾、effort 为空时删掉那一行；其余**逐字节**照抄。
+// 改写会带走那一行的行尾注释（与 DSH 的叶级 diff 同口径：改了的标量连同它的行内注释
+// 一起换掉，没动过的节点连注释保留）。
+fn dshw_patch(t: &const Buf, s: &const DshwSel, out: &Buf, changed: &bool) i32 {
+    changed[0] = false;
+    var shape: i32 = 0;
+    const hr: isize = dshw_find_section(t, &shape);
+    if hr < 0 {
+        return dshw_patch_new(t, s, out, changed);
+    }
+    if shape != 0 {
+        return DSHW_SHAPE;
+    }
+    const hs: usize = hr as usize;
+    const hend: usize = dshw_line_end(t, hs);
+    var body_end: usize = t.len;
+    var ins: usize = hend;
+    var ind: usize = 2;
+    dshw_sec_scan(t, hend, &body_end, &ins, &ind);
+    // 先空扫一遍节体，把「哪几行已经有了」定下来 —— 缺的那几行要在**同一个位置**（节尾）
+    // 追加，而那个位置在这趟复制里才走到；先扫一遍就不必在复制途中回头改已经写出去的东西。
+    var seen_p: bool = s.pn == 0;   // 值为空 = 「不缺」：那一行原样留着，绝不写空值
+    var seen_m: bool = s.mn == 0;
+    var seen_e: bool = s.en == 0;
+    var scan: usize = hend;
+    while scan < body_end {
+        const snl: usize = dshw_line_end(t, scan);
+        const se: usize = dshw_content_end(t, scan, snl);
+        const sk: i32 = dshw_sec_key(t, scan, se, ind);
+        if sk == 1 {
+            seen_p = true;
+        } else if sk == 2 {
+            seen_m = true;
+        } else if sk == 3 {
+            seen_e = true;
+        }
+        scan = snl;
+    }
+    if !buf_append(out, t.ptr as &const byte, hend) {
+        return DSHW_FAIL;   // 节头与**它前面的一切**（别的节、注释、!!js 行）原样照抄
+    }
+    var flushed: bool = false;
+    var pos: usize = hend;
+    while pos < body_end {
+        const nl: usize = dshw_line_end(t, pos);
+        const e: usize = dshw_content_end(t, pos, nl);
+        const k: i32 = dshw_sec_key(t, pos, e, ind);
+        if !flushed && ins == pos {
+            flushed = true;
+            if !dshw_flush_missing(out, t, s, ins, ind,
+                                   seen_p, seen_m, seen_e) {
+                return DSHW_SHAPE;
+            }
+        }
+        var keep: bool = true;      // 这一行原样抄过去吗
+        if k == 1 && s.pn > 0 {
+            keep = false;
+            if !dshw_emit_kv(out, ind, DSHW_K_PROVIDER, s.provider, s.pn) {
+                return DSHW_SHAPE;
+            }
+        } else if k == 2 && s.mn > 0 {
+            keep = false;
+            if !dshw_emit_kv(out, ind, DSHW_K_MODEL, s.model, s.mn) {
+                return DSHW_SHAPE;
+            }
+        } else if k == 3 && s.en > 0 {
+            keep = false;
+            if !dshw_emit_kv(out, ind, DSHW_K_EFFORT, s.effort, s.en) {
+                return DSHW_SHAPE;
+            }
+        } else if k == 3 {
+            keep = false;   // effort 为空 = 清掉那一行（DSH「一次完整选择」的清档语义）
+        }
+        if keep && !buf_append(out, &t.ptr[pos], nl - pos) {
+            return DSHW_FAIL;
+        }
+        pos = nl;
+    }
+    if !flushed &&
+        !dshw_flush_missing(out, t, s, ins, ind, seen_p, seen_m, seen_e) {
+        return DSHW_SHAPE;
+    }
+    if !buf_append(out, &t.ptr[body_end], t.len - body_end) {
+        return DSHW_FAIL;
+    }
+    changed[0] = !(out.len == t.len && bufx_mem_eq(out.ptr as &const byte,
+        t.ptr as &const byte, t.len));
+    return DSHW_OK;
+}
+
+// ============================================================
+// 写前自检
+// ============================================================
+// 树里的一项与要写的一致：要写的为空 = 那一项必须**不存在**。
+fn dshw_field_ok(t: &const YTree, node: i32, key: &const byte,
+                 v: &const byte, vn: usize) bool {
+    const c: i32 = yt_get(t, node, key);
+    if vn == 0 {
+        return c < 0;
+    }
+    if c < 0 {
+        return false;
+    }
+    const got: &[byte] = yt_str(t, c);
+    return got.len == vn && bufx_mem_eq(got.ptr, v, vn);
+}
+
+// 补丁后的文本必须自己解析得回来、且读回的三项正是要写的值 —— 不过就不写。
+// 为什么值得多花一次解析：写坏的 settings.yaml 会让 **DSH 起不来**，代价远大于这一遍。
+//
+// 这里还守一条**结构**判据：`agent-default-model` 必须仍是**顶层**的节。首版只查了「三项
+// 值对不对」，而值对不代表位置对 —— 打补丁那一步漏抄了节头之前的那一段，整份文件里就只剩
+// 这一个节，值的断言照样**全绿**（实测：`ui-theme` / `llm-pi-ai` 连同注释一起没了，而
+// 自检说没问题）。判据得钉在「它在顶层」，不能只钉在「它读得出来」。
+fn dshw_verify(d: &const Buf, s: &const DshwSel) bool {
+    var tree: YTree = YTree{ nodes: [], n: 0, lines: [], nlines: 0,
+        raw: buf_empty(), cur: 0, err_line: 0 };
+    yt_init(&tree);
+    defer { yt_free(&tree); }
+    if !yt_parse_text(d, &tree) {
+        return false;
+    }
+    const adm: i32 = yt_get(&tree, yt_root(&tree), DSHW_SEC);
+    if adm < 0 {
+        return false;
+    }
+    if yt_kind(&tree, adm) != YK_MAP {
+        return false;
+    }
+    if s.pn > 0 &&
+        !dshw_field_ok(&tree, adm, DSHW_K_PROVIDER, s.provider, s.pn) {
+        return false;
+    }
+    if s.mn > 0 && !dshw_field_ok(&tree, adm, DSHW_K_MODEL, s.model, s.mn) {
+        return false;
+    }
+    // effort 永远有口径：非空 = 要写进去，空 = 必须已被删掉
+    return dshw_field_ok(&tree, adm, DSHW_K_EFFORT, s.effort, s.en);
+}
+
+// 补丁有没有把**别人**的东西弄丢：节外（节头之前 + 节体之后）那两段必须逐字节不变，
+// 节体里也只有目标那几行允许不同。判据是「位置相同 + 节外逐字节相同」——
+// 比「整份文件长度接近」这种软判据硬得多：漏抄一段、多抄一段都当场判死。
+// `a` 里**没有**这一节时（整节追加那条路）改成「a 必须是 b 的前缀」：追加只许往后长，
+// 原来那几节一个字节都不许动。
+fn dshw_outside_same(a: &const Buf, b: &const Buf) bool {
+    var shape: i32 = 0;
+    const ha: isize = dshw_find_section(a, &shape);
+    const hb: isize = dshw_find_section(b, &shape);
+    if hb < 0 {
+        return false;   // 补丁之后连节都没有：那就不该走到写盘
+    }
+    if ha < 0 {
+        if b.len < a.len ||
+            !bufx_mem_eq(a.ptr as &const byte, b.ptr as &const byte, a.len) {
+            return false;
+        }
+        // 多出来的只能是那个「补上的尾换行」
+        return b.len == a.len || a.ptr[a.len - 1] == 10 as byte;
+    }
+    const sa: usize = ha as usize;
+    const sb: usize = hb as usize;
+    if sa != sb ||
+        !bufx_mem_eq(a.ptr as &const byte, b.ptr as &const byte, sa) {
+        return false;   // 节头之前那一段（别的节、注释、!!js 行）
+    }
+    var ae: usize = a.len;
+    var ai: usize = sa;
+    var ai2: usize = 2;
+    dshw_sec_scan(a, dshw_line_end(a, sa), &ae, &ai, &ai2);
+    var be: usize = b.len;
+    var bi: usize = sb;
+    var bi2: usize = 2;
+    dshw_sec_scan(b, dshw_line_end(b, sb), &be, &bi, &bi2);
+    const atail: usize = a.len - ae;
+    if atail != b.len - be {
+        return false;   // 节之后那一段（`llm-deepseek` 之类）长度都不同了
+    }
+    if atail == 0 {
+        return true;
+    }
+    return bufx_mem_eq(&a.ptr[ae], &b.ptr[be], atail);
+}
+
+// ============================================================
+// 落盘：跨进程写锁 + 原子替换
+// ============================================================
+// 睡 ms 毫秒（抢锁退避用；EINTR 由 nanosleep 的 rem 语义兜住，不看返回值）
+fn dshw_sleep_ms(ms: u64) void {
+    var ts: TimeSpec = TimeSpec{ tv_sec: 0, tv_nsec: 0 };
+    ts.tv_sec = (ms / 1000) as i64;
+    ts.tv_nsec = (((ms % 1000) as i64) * (1000000 as i64));
+    var rem: TimeSpec = TimeSpec{ tv_sec: 0, tv_nsec: 0 };
+    _ = sys_nanosleep(&ts, &rem) catch {};
+}
+
+// 抢写锁：`<file>.lock` 用 O_CREAT|O_EXCL 独占创建（0600），退避 20→200 ms，超时即让位。
+// 抢不到**不是错误**：DSH 正拿着锁写同一份设置是正常并发，我们这次不写就是了。
+fn dshw_lock(lock_z: &const byte) bool {
+    const flags: i32 = (O_WRONLY | O_CREAT | O_EXCL) as i32;
+    const deadline: u64 = ua_now_ms() + DSHW_LOCK_WAIT_MS;
+    var delay: u64 = 20;
+    var pidb: Buf = buf_new(32);
+    defer { buf_free(&pidb); }
+    while true {
+        const fd: i32 = sys_open(lock_z as *const byte, flags, 384) catch {
+            -1;
+        };
+        if fd >= 0 {
+            buf_reset(&pidb);
+            _ = buf_append_i64(&pidb, sys_getpid() catch { 0 as i64; });
+            _ = buf_append_byte(&pidb, 10);
+            _ = write_all_fd(fd, pidb.ptr as &const byte, pidb.len);
+            _ = sys_close(fd) catch {};
+            return true;
+        }
+        if ua_now_ms() >= deadline {
+            return false;
+        }
+        dshw_sleep_ms(delay);
+        if delay < 200 {
+            delay = delay * 2;
+        }
+    }
+}
+
+// 释放写锁（只删**我们自己**刚创建的那个：调用点保证先抢到才调）
+fn dshw_unlock(lock_z: &const byte) void {
+    _ = sys_unlink(lock_z as *const byte) catch {};
+}
+
+// 原子替换：临时文件独占创建（0600）→ 写满 → rename 覆盖。
+// 为什么不用 O_TRUNC 直写：崩在中间会留半个文件，而 DSH 下次启动读它就是解析失败；
+// rename 在同目录内是原子的，读者要么看到旧的全份、要么看到新的全份。
+fn dshw_write_atomic(path_z: &const byte, tmp_z: &const byte,
+                     d: &const Buf) bool {
+    const flags: i32 = (O_WRONLY | O_CREAT | O_EXCL) as i32;
+    const fd: i32 = sys_open(tmp_z as *const byte, flags, 384) catch {
+        return false;
+    };
+    const ok: bool = write_all_fd(fd, d.ptr as &const byte, d.len);
+    _ = sys_close(fd) catch {};
+    if !ok {
+        _ = sys_unlink(tmp_z as *const byte) catch {};
+        return false;
+    }
+    sys_rename(tmp_z, path_z) catch {
+        _ = sys_unlink(tmp_z as *const byte) catch {};
+        return false;
+    };
+    return true;
+}
+
+// base + suffix，末尾补 NUL（sys_open / rename 是 C 串口径 —— 少这一字节它们会一路
+// 读到缓冲区后面的脏字节，见 DESIGN 踩坑 57）。
+fn dshw_path_z(base: &const Buf, suffix: &const byte, out: &Buf) bool {
+    buf_reset(out);
+    return buf_append(out, base.ptr as &const byte, base.len) &&
+        buf_append_cstr(out, suffix) && buf_append_byte(out, 0);
+}
+
+// 读全份设置；超过 DSHW_MAX_BYTES 或读失败返回 false（宁可不写，也不在截断的文本上打补丁）。
+fn dshw_read_all(path_z: &const byte, out: &Buf) bool {
+    const fd: i32 = sys_open(path_z as *const byte, O_RDONLY as i32, 0) catch {
+        return false;
+    };
+    defer { _ = sys_close(fd) catch {}; }
+    buf_reset(out);
+    var tmp: [byte: 16384] = [0: 16384];
+    while true {
+        const n: isize = sys_read(fd, &tmp[0], 16384) catch { 0 as isize; };
+        if n <= 0 {
+            break;
+        }
+        if !buf_append(out, &tmp[0], n as usize) {
+            return false;
+        }
+        if out.len > DSHW_MAX_BYTES {
+            return false;
+        }
+    }
+    return out.len > 0;
+}
+
+// ============================================================
+// 对外：写回 + 回执
+// ============================================================
+// 把一份完整选择写进 `<home>/settings.yaml` 的 `agent-default-model`。
+// 先把选择落到状态里再调这里（不变量 ①）；返回码见文件头那行 DSHW_* 常量。
+export fn dshw_save(home: &const byte, hn: usize, s: &const DshwSel) i32 {
+    if hn == 0 {
+        return DSHW_SKIP;   // 没解析出 $DSH_HOME：没有可写的目标
+    }
+    var base: Buf = buf_new(hn + DSHW_TMP_ROOM);
+    defer { buf_free(&base); }
+    if !buf_append(&base, home, hn) {
+        return DSHW_FAIL;
+    }
+    var path: Buf = buf_new(hn + DSHW_TMP_ROOM);
+    defer { buf_free(&path); }
+    var lock: Buf = buf_new(hn + DSHW_TMP_ROOM);
+    defer { buf_free(&lock); }
+    var tmp: Buf = buf_new(hn + DSHW_TMP_ROOM);
+    defer { buf_free(&tmp); }
+    if !dshw_path_z(&base, "/settings.yaml" as &const byte, &path) ||
+        !dshw_path_z(&base, "/settings.yaml.lock" as &const byte, &lock) {
+        return DSHW_FAIL;
+    }
+    if !sess_file_exists(path.ptr as &const byte) {
+        return DSHW_NOFILE;   // 不替用户新建一份设置
+    }
+    if !dshw_lock(lock.ptr as &const byte) {
+        return DSHW_BUSY;
+    }
+    defer { dshw_unlock(lock.ptr as &const byte); }
+    // 抢到锁之后**重读**：期间别人（DSH 自己）可能刚写过，拿旧文本打补丁会把它抹掉
+    var text: Buf = buf_new(8192);
+    defer { buf_free(&text); }
+    if !dshw_read_all(path.ptr as &const byte, &text) {
+        return DSHW_FAIL;
+    }
+    var out: Buf = buf_new(text.len + 256);
+    defer { buf_free(&out); }
+    var changed: bool = false;
+    const rc: i32 = dshw_patch(&text, s, &out, &changed);
+    if rc != DSHW_OK {
+        return rc;
+    }
+    if !changed {
+        return DSHW_SAME;   // 文件里本来就是这份选择：一个字节都不碰（mtime 也不动）
+    }
+    if !dshw_verify(&out, s) || !dshw_outside_same(&text, &out) {
+        return DSHW_SHAPE;
+    }
+    var suffix: Buf = buf_new(48);
+    defer { buf_free(&suffix); }
+    _ = buf_append_cstr(&suffix, "/settings.yaml.");
+    _ = buf_append_i64(&suffix, sys_getpid() catch { 0 as i64; });
+    _ = buf_append_byte(&suffix, 45);
+    _ = buf_append_u64(&suffix, ua_now_ms());
+    _ = buf_append_cstr(&suffix, ".tmp");
+    if !dshw_path_z(&base, suffix.ptr as &const byte, &tmp) {
+        return DSHW_FAIL;
+    }
+    if !dshw_write_atomic(path.ptr as &const byte,
+                          tmp.ptr as &const byte, &out) {
+        return DSHW_FAIL;
+    }
+    return DSHW_OK;
+}
+
+// 返回码 → 一行回执。**DSHW_SAME / DSHW_SKIP 一个字节都不加**：
+// 「文件里本来就是它」和「本来就没得写」都不是需要用户知道的事，而每一行回执都是噪音。
+export fn dshw_receipt_into(rc: i32, out: &Buf) void {
+    if rc == DSHW_OK {
+        _ = buf_append_cstr(out, "[settings] 已写回 agent-default-model");
+        _ = buf_append_cstr(out, "（下次启动即用它）\n");
+    } else if rc == DSHW_NOFILE {
+        _ = buf_append_cstr(out, "[settings] 这个 DSH 目录里没有 settings.yaml：");
+        _ = buf_append_cstr(out, "没有写回（不替你新建一份）\n");
+    } else if rc == DSHW_SHAPE {
+        _ = buf_append_cstr(out, "[settings] agent-default-model 不是块状写法");
+        _ = buf_append_cstr(out, "（或值不可写）：没有写回；本次会话的切换照常生效\n");
+    } else if rc == DSHW_BUSY {
+        _ = buf_append_cstr(out, "[settings] 写锁被占（DSH 正在写同一份设置）：");
+        _ = buf_append_cstr(out, "这次没有写回；本次会话的切换照常生效\n");
+    } else if rc == DSHW_FAIL {
+        _ = buf_append_cstr(out, "[settings] 写回失败（IO 或内存）：");
+        _ = buf_append_cstr(out, "本次会话的切换照常生效\n");
+    }
+}
