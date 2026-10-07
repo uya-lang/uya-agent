@@ -115,7 +115,7 @@ readelf -lW build/uya-agent | grep -c INTERP    # 0 = 真静态
 | `--no-stream-options` | 不发送 `stream_options.include_usage` |
 | `--compat-fold` | 工具结果折叠成一条 user 消息（旧协议） |
 | `--show-reasoning` | 显示思考行。滚动模式下运行中在提示符那一行滚动、结束落一行；TUI 下另有一条默认就显示的实时行，这个开关在 TUI 里只管「额外把思考收进转录条目」。全文始终进会话日志 |
-| `--show-usage` | 每轮打印 token 用量（in/out/cache/reasoning） |
+| `--show-usage` | 每轮打印 token 用量（in/out/cache/reasoning）。提供方没回缓存明细时 `cache_read=?`（**不是 0** —— 「没读数」与「命中 0」是两件事，见 DESIGN §16 踩坑 123） |
 | `--tool-lines N` | 工具正文：默认 `0` = 只留一行；`N>0` = 首尾各 N 行（含 diff / todo 清单） |
 | `--quiet` | 关闭工具内容块（回退到旧的最小转录：只有正文流） |
 | `--max-tokens N` / `--temperature N` | `--max-tokens` 覆盖**输出上限**（口径见 §「输出上限」条）；`--temperature` 默认不发送（对齐 DSH）。真被截断时（`finish_reason=length` / `incomplete`+`max_output_tokens`）**不派发工具调用、正文留在对话里**，直接发「继续」接着做；退出码见 §1.1 的 `5` |

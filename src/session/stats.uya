@@ -80,6 +80,12 @@ export struct Stats {
     // resume 后靠它立刻算出上下文占用，不必等下一轮请求
     last_pressure: i64,
     have_pressure: bool,
+    // 命中率专用账（P72 踩坑 123）：只把「提供方给了缓存明细」的步算进分母。
+    // split_known_billed = 有明细的计费输入；split_unknown_billed/steps = 没明细的量与步数
+    // （界面据此标注「未拆分 N 步」，而不是把它当成 0% 命中）。
+    split_known_billed: i64,
+    split_unknown_billed: i64,
+    split_unknown_steps: i64,
     pending: [StatPending: STATS_PENDING_MAX],
     npending: usize,
 }
@@ -106,6 +112,9 @@ var g_stats: Stats = Stats{
     last_turn: 0,
     last_pressure: 0,
     have_pressure: false,
+    split_known_billed: 0,
+    split_unknown_billed: 0,
+    split_unknown_steps: 0,
     pending: [],
     npending: 0,
 };
@@ -168,6 +177,9 @@ export fn st_reset() void {
     g_stats.last_turn = 0;
     g_stats.last_pressure = 0;
     g_stats.have_pressure = false;
+    g_stats.split_known_billed = 0;
+    g_stats.split_unknown_billed = 0;
+    g_stats.split_unknown_steps = 0;
 }
 
 // ============================================================
@@ -199,7 +211,13 @@ export fn st_first_token(turn: i64, step: i64, ms: u64) void {
 
 // 一步收尾：llm/ttft/decode 时间 + token 账目
 // out_tokens <= 0 视为「提供方没上报输出 token」→ 不记 decode（见 §15.4 的偏差说明）
-export fn st_assistant_message(turn: i64, step: i64, ms: u64, in_uncached: i64, cache_read: i64, cache_write: i64, out_tokens: i64) void {
+//
+// split_known = 提供方这一步**给了缓存明细**。token 账目（含 last_pressure）无论真假都照记
+// —— 压力口径要的是真实 prompt 大小，与「读数拆没拆开」无关；只有**命中率**的分母受它影响，
+// 见 st_hit_rate_billed。把未知当 0 记进命中率会让看板凭空掉一截（P72 踩坑 123）。
+export fn st_assistant_message(turn: i64, step: i64, ms: u64, in_uncached: i64,
+        cache_read: i64, cache_write: i64, out_tokens: i64,
+        split_known: bool) void {
     const iu: i64 = st_clamp0(in_uncached);
     const cr: i64 = st_clamp0(cache_read);
     const cw: i64 = st_clamp0(cache_write);
@@ -210,6 +228,14 @@ export fn st_assistant_message(turn: i64, step: i64, ms: u64, in_uncached: i64, 
     g_stats.out_tokens = g_stats.out_tokens + ot;
     g_stats.last_pressure = iu + cr + cw;
     g_stats.have_pressure = true;
+    // 命中率专用账：只收「明细真给了」的步。未知步另计一桶，供界面标注「未拆分」。
+    if split_known {
+        g_stats.split_known_billed = g_stats.split_known_billed + iu + cr + cw;
+    } else if iu + cr + cw > 0 {
+        g_stats.split_unknown_billed = g_stats.split_unknown_billed
+            + iu + cr + cw;
+        g_stats.split_unknown_steps = g_stats.split_unknown_steps + 1;
+    }
 
     if !g_stats.have_open {
         return;
@@ -369,6 +395,15 @@ export fn st_fold_line(line: &const Buf) void {
         if turn < 0 || step < 0 {
             return;
         }
+        // cacheSplitKnown：新日志写 1/0（**数字**，因为 sess_json_i64 只认数字 —— 写成
+        // true/false 时两者都会回 -1，就跟"键不存在"混在一起了）。
+        //   * 0  ⇒ 这一步提供方没给明细，读数缺失；
+        //   * 1  ⇒ 有明细（含"明细说命中 0"）；
+        //   * -1 ⇒ 老日志没有这个键 ⇒ 按有明细读。那时上游还没有漏发明细的行为，
+        //          按有明细才是它当时的真值；读成未知会让历史会话的命中率整片消失。
+        const sk_raw: i64 = sess_json_i64(
+            view, "cacheSplitKnown" as &const byte);
+        const split_known: bool = sk_raw != 0;
         st_assistant_message(
             turn,
             step,
@@ -376,7 +411,8 @@ export fn st_fold_line(line: &const Buf) void {
             sess_json_i64(view, "inputTokens" as &const byte),
             sess_json_i64(view, "cacheReadTokens" as &const byte),
             sess_json_i64(view, "cacheWriteTokens" as &const byte),
-            sess_json_i64(view, "outputTokens" as &const byte)
+            sess_json_i64(view, "outputTokens" as &const byte),
+            split_known
         );
         return;
     }
@@ -429,6 +465,14 @@ export fn st_decode_ms() i64 { return g_stats.decode_ms; }
 export fn st_decode_tokens() i64 { return g_stats.decode_tokens; }
 // 计费输入 = 未缓存 + 缓存读 + 缓存写（三个互不重叠的桶；DSH 的 billedInput）
 export fn st_billed_input() i64 { return g_stats.in_uncached + g_stats.cache_read + g_stats.cache_write; }
+// 命中率的分母（P72 踩坑 123）：只算「提供方给了缓存明细」的步。
+// 与 st_billed_input 的差别就是那些没读数的步 —— 把未知当 0 计进分母会让命中率凭空掉一截。
+// 一步明细都没有时回 0，调用方据此显示 "-"（而不是 0%）。
+export fn st_hit_rate_billed() i64 { return g_stats.split_known_billed; }
+// 没拿到缓存明细的计费输入量（0 = 本会话没有这种情况）
+export fn st_split_unknown_billed() i64 { return g_stats.split_unknown_billed; }
+// 没拿到缓存明细的步数（界面用来标「未拆分 N 步」）
+export fn st_split_unknown_steps() i64 { return g_stats.split_unknown_steps; }
 // 输出 token 累计
 export fn st_out_tokens() i64 { return g_stats.out_tokens; }
 // 最近一次 provider 压力样本（= DSH 的 pressureTokens，三桶之和）
@@ -652,11 +696,21 @@ export fn st_line(out: &Buf) bool {
     if billed > 0 || g_stats.out_tokens > 0 {
         var ch: Buf = buf_new(32);
         defer { buf_free(&ch); }
-        if st_fmt_cache_hit(&ch, g_stats.cache_read, billed) {
+        // 命中率用**只含有明细的步**做分母（st_hit_rate_billed）：没读数的步计进来会把
+        // 命中率凭空拉低，那是「上游没报」，不是「缓存失效」（P72 踩坑 123）。
+        if st_fmt_cache_hit(&ch, g_stats.cache_read, st_hit_rate_billed()) {
             st_line_sep(out);
             _ = buf_append_cstr(out, "缓存命中 ");
             _ = buf_append(out, ch.ptr, ch.len);
             _ = buf_append_byte(out, 37);                   // '%'
+        }
+        // 有没读数的步就如实标出来：屏幕上的数字必须能被正确解读，否则「未拆分」会被
+        // 读成一次真实的缓存崩塌。
+        if g_stats.split_unknown_steps > 0 {
+            st_line_sep(out);
+            _ = buf_append_cstr(out, "未拆分 ");
+            _ = buf_append_i64(out, g_stats.split_unknown_steps);
+            _ = buf_append_cstr(out, " 步");
         }
         st_line_sep(out);
         _ = buf_append_cstr(out, "输入 ");
@@ -831,11 +885,17 @@ export fn st_stats_detail(out: &Buf) void {
     _ = buf_append_cstr(out, "\n缓存命中      ");
     var ch: Buf = buf_new(32);
     defer { buf_free(&ch); }
-    if st_fmt_cache_hit(&ch, g_stats.cache_read, st_billed_input()) {
+    // 同 st_line：分母只收有明细的步（P72 踩坑 123）。
+    if st_fmt_cache_hit(&ch, g_stats.cache_read, st_hit_rate_billed()) {
         _ = buf_append(out, ch.ptr, ch.len);
         _ = buf_append_cstr(out, "%");
     } else {
         _ = buf_append_cstr(out, "-");
+    }
+    if g_stats.split_unknown_steps > 0 {
+        _ = buf_append_cstr(out, "（另有 ");
+        _ = buf_append_i64(out, g_stats.split_unknown_steps);
+        _ = buf_append_cstr(out, " 步上游未回缓存明细，未计入）");
     }
     _ = buf_append_cstr(out, "\n输入/输出     ");
     st_fmt_tokens(out, st_billed_input());
