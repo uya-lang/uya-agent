@@ -89,7 +89,7 @@ readelf -dW build/uya-agent | grep -c NEEDED      # 0
   不会传下去，`--web` 启动时会**逐条点名**，不静默。
 
 判据是 `make e2e-portable`：把二进制拷到空目录、`HOME` 也是空目录、**没有 DSH、
-没有仓库**，再断言上面两条。细节见 [DESIGN.md §16 踩坑 122](DESIGN.md)。
+没有仓库**，再断言上面两条。细节见 [DESIGN.md §16 踩坑 124](DESIGN.md)。
 
 为什么开关必须写在 Makefile 的**行内赋值**里、为什么命令行的 `LDFLAGS=-static` 不算数、
 为什么文档里的 `LINK_MODE=static` 无效 —— 见 [DESIGN.md §16 踩坑 90](DESIGN.md)。
@@ -135,7 +135,7 @@ readelf -lW build/uya-agent | grep -c INTERP    # 0 = 真静态
 | `--no-stream-options` | 不发送 `stream_options.include_usage` |
 | `--compat-fold` | 工具结果折叠成一条 user 消息（旧协议） |
 | `--show-reasoning` | 显示思考行。滚动模式下运行中在提示符那一行滚动、结束落一行；TUI 下另有一条默认就显示的实时行，这个开关在 TUI 里只管「额外把思考收进转录条目」。全文始终进会话日志 |
-| `--show-usage` | 每轮打印 token 用量（in/out/cache/reasoning） |
+| `--show-usage` | 每轮打印 token 用量（in/out/cache/reasoning）。提供方没回缓存明细时 `cache_read=?`（**不是 0** —— 「没读数」与「命中 0」是两件事，见 DESIGN §16 踩坑 123） |
 | `--tool-lines N` | 工具正文：默认 `0` = 只留一行；`N>0` = 首尾各 N 行（含 diff / todo 清单） |
 | `--quiet` | 关闭工具内容块（回退到旧的最小转录：只有正文流） |
 | `--max-tokens N` / `--temperature N` | `--max-tokens` 覆盖**输出上限**（口径见 §「输出上限」条）；`--temperature` 默认不发送（对齐 DSH）。真被截断时（`finish_reason=length` / `incomplete`+`max_output_tokens`）**不派发工具调用、正文留在对话里**，直接发「继续」接着做；退出码见 §1.1 的 `5` |
@@ -331,6 +331,66 @@ uya-agent --list-plugins
 
 `--no-mcp`（或 `UYA_AGENT_MCP=0`）完全不读不连插件；一份 server 都没配时，
 工具表与没这个功能时**逐字节相同**。
+
+#### 接本机 aigw（ai-gateway）的 MCP
+
+aigw 自己就是 MCP server（`aigw mcp-serve`：11 个查询工具；令牌 scope 是
+`admin_read`/`admin` 时另有 3 个后台入口）。有一个**必须知道**的坑：它读的
+是**它自己那份** `config.yaml`，而那里 `database.path` 多半是相对路径
+（`./data/aigw.db`）—— 所以要么把子进程的 cwd 定在 aigw 部署根，要么用
+`GW_DATABASE_PATH` 给绝对路径。两样都没有时，它会按**当前工作区**去开库，
+于是报 `account not found`（或建出一个空库、一个工具都登记不上），
+而症状只是「配了 server 却没有工具」。
+
+```bash
+# ① CLI：用 GW_DATABASE_PATH 钉住（--mcp-server 没有 cwd 语法）。
+#    K=V 形状的 token 归 env，所以直接写在 SPEC 末尾即可。
+uya-agent --mcp-server "aigw=/media/winger/_dde_data/aigw/bin/aigw mcp-serve \
+--config /media/winger/_dde_data/aigw/config.yaml --account local \
+GW_DATABASE_PATH=/media/winger/_dde_data/aigw/data/aigw.db"
+
+# ② settings.yaml：用 cwd 指向 aigw 部署根（推荐；配置里不带环境变量）
+#   uya-agent:
+#     mcp:
+#       aigw:
+#         transport: stdio
+#         command: /media/winger/_dde_data/aigw/bin/aigw
+#         args: [mcp-serve, --config, /media/winger/_dde_data/aigw/config.yaml,
+#                --account, local]
+#         cwd: /media/winger/_dde_data/aigw
+
+# ③ 转发到运行中的网关（走令牌，scope 决定工具面：query 只有 11 个查询工具，
+#    admin_read/admin 另有 3 个后台入口）。令牌用「配置里的 env」交给子进程 ——
+#    父进程的环境**不会**继承进去（MCP server 是第三方进程，只给白名单
+#    HOME/LOGNAME/PATH/SHELL/TERM/USER + 配置显式给的 env）。
+uya-agent --mcp-server "aigw=/media/winger/_dde_data/aigw/bin/aigw mcp-serve \
+--endpoint http://127.0.0.1:8088/mcp --token-env GW_MCP_TOKEN \
+GW_MCP_TOKEN=aigw_mcp_xxx"
+
+uya-agent --list-plugins      # 核对：`aigw: 11 tool(s)`
+```
+
+③ 也可以走 settings.yaml（令牌不落在命令行上，推荐）：
+
+```yaml
+# uya-agent:
+#   mcp:
+#     aigw:
+#       transport: stdio
+#       command: /media/winger/_dde_data/aigw/bin/aigw
+#       args: [mcp-serve, --endpoint, http://127.0.0.1:8088/mcp,
+#              --token-env, GW_MCP_TOKEN]
+#       env: {GW_MCP_TOKEN: "aigw_mcp_xxx"}
+```
+
+`--account <name>` 是**本地 stdio 模式**：本机信任、不走令牌，只给 11 个只读
+工具（账户名可在控制台看，或 `sqlite3 <db> "select name from accounts"`）。
+要用后台工具就用 ③ 的转发模式配一个 scope 够的令牌 —— 令牌明文只在创建时
+出现一次，别写进仓库里的配置文件。
+
+接上以后，模型侧的工具名是 `mcp__aigw__get_balance`、
+`mcp__aigw__get_dashboard`、`mcp__aigw__list_requests` 这类
+（`mcp__<serverName>__<原名>`，同一个 server 在 DSH 里也这么叫）。
 
 ---
 

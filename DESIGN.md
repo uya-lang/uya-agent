@@ -497,6 +497,21 @@ struct History { items: &Msg, len, cap, bytes }                                 
 2. `o.usage_in = prompt_tokens - cached`：**DeepSeek 的 `prompt_tokens` 含缓存命中**，
    所以这个字段的语义是「**非缓存输入**」，不是原始 prompt_tokens。
 
+**两种缓存方言都要认，且「没明细」必须与「明细说 0」分开**（P72 踩坑 123）：
+
+| 形状 | 含义 |
+|---|---|
+| `prompt_cache_hit_tokens` / `prompt_cache_miss_tokens`（DeepSeek） | 有明细，miss 由提供方给出 |
+| `prompt_tokens_details.cached_tokens`（OpenAI 方言） | 有明细，miss = `prompt_tokens − cached` |
+| 两者都没有 | **没明细**：`usage_have_cache_split = false`，命中率据此排除该步 |
+
+上游会在两种形状之间**随机切换**（实测 autodl.art 的 DeepSeek-V4.1-Flash：始终带
+OpenAI 方言的 `cached_tokens`，但时有时无地省略 DeepSeek 那一对）。因此
+`usage_cache_read == 0` **不能**当作「命中 0」用 —— 判据只能是
+`usage_have_cache_split`（在**真读到明细字段**时置位，含 `cached_tokens: 0`）。
+下游一切「命中率」的分母都要走 `st_hit_rate_billed()`，把未知步排除在外并显示
+「未拆分 N 步」。
+
 #### 4.5.2 responses 侧
 
 事件表按作用分组：
@@ -642,7 +657,7 @@ malloc(LLM_EVENT_ARENA) + arena_init
 
 为什么必须有②：plan 策略段**只**在上游那份 preset 里，没有兜底时「拷到别的机器」
 会让它**整段消失**（实测 system 4469 B → 2132 B），而写闸门（§7）照样硬拒 write/edit ——
-模型被挡住写、又没被告知该调 `exit_plan_mode`。见 §16 踩坑 122。
+模型被挡住写、又没被告知该调 `exit_plan_mode`。见 §16 踩坑 124。
 
 为什么内嵌**整份**而不是只抄 plan 段那句：旋钮（`maxBytes` / pruner 的 8192/4096/1024 /
 `timeoutMs` …）与 persona 都在同一个文件里，只抄一段等于把上游其余部分**冻在代码里**，
@@ -4163,7 +4178,94 @@ responses 用 `{"type":"input_image","detail":"auto","image_url":…}`；
      改成「夹具里的 flow 节**已经就是**要写的那两个值」之后，判据一停，追加就会真的写下去，
      腿立刻红 2 条。
 
-122. **功能由「这台机器上有没有那个文件」决定 ⇒ 拷到别的机器上静默降级**（P73，用户报的
+122. **`p[a: k]` 第三次咬人：这次咬在 MCP 的 env 上，症状是「配了 server 却 0 个工具」**
+     （本轮，用户问「怎么接 aigw 的 MCP」时现场查出来的）：
+     用户按 README 的 `--mcp-server "name=command args…"` 形状接本机 aigw，
+     `--list-plugins` 却报 `aigw: no tools (MCP server exited or closed the pipe)`。
+     链路是三层叠出来的：
+     ① `mcpcfg.uya` 的 `mcp_cfg_cli_one` 把 `K=V` token 归到 env 时写的是
+     `line[as0: k]` —— 第二个参数是**从 as0 起的字节数**（踩坑 51/54 那条语义），
+     而 `k` 是 token 的**终点下标**，于是每个 env token 都从自己的首字节起多读
+     `as0` 字节：越过后面的参数，最后越到堆尾的脏字节；
+     ② 多读的尾巴里恰好混进堆尾残留（现场是 `\276\255\336`），子进程拿到的 env 变成
+     `GW_DATABASE_PATH=/…/aigw.db\276\255\336`；
+     ③ aigw 于是按这个名字**新建了一个乱码文件名的库**（现场在部署目录里真出现了
+     `aigw.db\276\255\336`），里面没有账户 ⇒ `account not found` ⇒ 握手失败。
+     为什么难查：`command` 路径长 + `K=V` 值长才露头（`as0` 要够大才读得出界，短 spec
+     读到的是同一行的其他参数，反而「看着像对的」）；而 `--list-plugins` 只给一句
+     「exited or closed the pipe」，真正的原因（子进程的 stderr）不在这一行里。
+     修法：`line[as0: k - as0]`（与 `yamlcfg.uya` 的 `seg.ptr[a: b - a]` 同一写法）。
+     自测补一条**判据换形状**的腿：旧断言 `bufx_contains(env, "FOO=bar")` 抓不住它
+     —— 多读的字节接在 `FOO=bar` **后面**，子串照样命中、腿照样绿。新腿按**长度**
+     钉（env 恰好 7 字节且逐字节相等），并故意在前面放长命令路径把 `as0` 撑大。
+     防假绿对照：把 `k - as0` 改回 `k` 重编 ⇒ `mcp-cfg` 当场红
+     （`env 长度不是 7（多读了字节…）`）。
+
+     教训：**「子串命中」不是「值正确」** —— 断言一个缓冲的内容时，
+     能被「尾巴上多挂东西」骗过的判据等于没判据（与踩坑 121 同族：判据得能证伪）。
+     同族第三次了（51/54 是前两次），凡写非零起点切片，第二参一律先写成 `end - start`。
+123. **「上游没给读数」被当成「读数说 0」⇒ 缓存命中率看板凭空掉三成，账单按最贵档多算**
+     （P72，用户问「为什么最近缓存命中率变低了」时查出来的）：
+     用户报「缓存命中率变低了」。查下来**缓存一点没坏**：按天看客户端账本，
+     只看「提供方真给了缓存明细」的步，10-07 的命中率是 **99.3%**（10-04/05/06 是
+     99.4 / 98.6 / 99.1）；掉到 88.7% 完全是另一类行拉低的 —— 那些行的
+     `cacheReadTokens = 0` 且 `inputTokens` 等于**整个 prompt**（当天 315 行 / 90.8M
+     token，而 10-02～10-06 合计只有 85 行）。
+     链路是**两处各自独立、症状一样**的静默路叠出来的：
+
+     ① **上游间歇换方言**（真机直连实测，autodl.art 的 DeepSeek-V4.1-Flash）：
+     它**始终**回 `prompt_tokens_details.cached_tokens`（值是真的：冷启动 0、
+     暖前缀 14968/19968），但会**时有时无地省略** DeepSeek 方言的
+     `prompt_cache_hit_tokens`/`prompt_cache_miss_tokens`。网关 `~/ai-gateway` 的
+     `ChatUsageToDimensions` 只认后者 ⇒ 落进 `else` 分支
+     `dims["input"] = prompt_tokens`，**整段已缓存的 prompt 记成未命中**。
+     ② 网关再往下游（responses 出口）发 usage 时，原来的 `UsageToWire` 是
+     `if cached > 0 { 发 input_tokens_details }` —— 于是「上游没发明细」与
+     「上游说命中 0」在客户端**发成同一个形状**（都没有 details）。本仓只读得到
+     后一种，把两种都当成了 0。
+
+     为什么难查：**没有任何一层报错**，而症状（0% 命中）与一次真实的缓存崩塌
+     长得一模一样。正面证据是「同会话后续步仍在读同一份前缀」：取每个无明细行，
+     在后续 5 步内找 `cacheReadTokens ≥ 90% × 该 prompt` 的请求 —— 154 行里 136 行
+     （88%）找到了，中间 prompt 只增长中位数 610 token。**前缀是热的，只是那一次
+     没把读数带回来。** 对照面也吻合：同一网关下游的真 DSH、真 Codex 当天同样中招
+     （11.8% / 8.9%），所以这不是本仓引起的。
+
+     代价（网关 `usage_records`，当天 DeepSeek 流量）：89.2M token 被按未命中价计费，
+     ￥88.38 vs 命中价 ￥1.77 ⇒ **多算 ￥86.61（≈$12.99）**，其中本仓客户端占 ￥46.63。
+     网关侧另有 1740 条 `usage was priced through a fallback rate` 的 WARN 是同一件事
+     的记账面（10-05/06 合计只有 267 条）。
+
+     修法（两侧都改，判据都落在「明细在不在」而不在数值上）：
+     * **网关**：`ChatUsage` 同时建模两种方言，取值优先级
+       DeepSeek 对 → `prompt_tokens_details.cached_tokens`（miss 由
+       `prompt_tokens - cached` 推出并钳 0）→ 裸 `input`；`UsageToWire` 改成
+       **按维度存在性**发 `input_tokens_details`（`cached_tokens: 0` 照发）；
+       请求日志与维度统计加 `cache_split_known`，控制台把「未拆分」与「0%」分开显示
+       （汇总行混有未拆分时改口径，不把兜底 0 加进去）。
+     * **本仓**：`ChatOut` 加 `usage_have_cache_split`（两个解析器在**真读到明细字段**
+       时置位）；`st_assistant_message` 收一个 `split_known`，命中率分母改用
+       `st_hit_rate_billed()`（只含有明细的步），未知步另计并显示「未拆分 N 步」；
+       `--show-usage` 缺明细时打 `cache_read=?(未回明细)`；`cmp_cache_burst` 前面加
+       `cmp_cache_unknown`，缺明细只记 `cache/unknown`、**不再误报 `cache/evicted`**
+       （实测 771 条事件里 375 条是这个假警报）。
+       压力口径（`last_pressure`）**不动**：压缩要的是真实 prompt 大小，与读数拆没拆开无关。
+
+     两个当场抓到的坑，都是自测挣来的：
+     * 「日志里写 `"cacheSplitKnown":false`」曾经是错的 —— 日志读回走
+       `sess_json_i64`，它**只认数字**：`true` 与 `false` 都没有数字位，两者都回 `-1`，
+       于是「明确未知」与「老日志没这个键」混成同一个值。改成 **1/0 数字**后才有三态
+       （`0` 未知 / `1` 有明细 / `-1` 老日志按有明细）。**自测（stats-fold）当场抓住的**，
+       若只跑实时路径永远看不见。
+     * 判据必须**两个方向都钉**：同一组数字（`miss == prompt`）在「有明细」时
+       **仍然要**被判成突发 —— 否则这次修法就把真正的淘汰一起静音了。
+       `cache-burst` 轮为此加了反向断言。
+
+     教训：**「没读数」必须与「读数是 0」在每一层都保持可区分** —— 从上游字段、
+     网关维度、日志字段、一直到屏幕上的百分比。任何一层把它们合并，都会在下游
+     变成一个看起来像"事实"的假数字，而假数字比缺数字贵得多（这里贵 50 倍）。
+
+124. **功能由「这台机器上有没有那个文件」决定 ⇒ 拷到别的机器上静默降级**（P73，用户报的
      「复制到其他机器上就能直接跑完整功能，包括 web」）：两处同族的坑，都是**没有报错**
      的那种坏法。
 
@@ -4352,11 +4454,12 @@ DEEPSEEK_API_KEY=sk-xxx ./build/uya-agent \
 | `tui-cmd` | 面板 ↔ `/status` 浮层：输入行不留 `/`、标题逐字节、正文层无 NUL、运行中 step 边界派发；**F 段（P57）**：循环选择（`↑` 顶→底 / `↓` 底→顶、中间项仍逐格走、`Home`/`End`/`PgUp`/`PgDn` 仍夹取、矮框里步长同为 ±1 时 `PgDn` 夹取而 `↓` 回绕的判别腿）+ 已输入文本画在标题栏（非空才画、退格跟随变短、长词保尾补 `…`、脏字节单行清洗、方框仍逐行闭合） |
 | `tui-scroll` | P32：2400 行条目 PgUp 到 `LONG-ROW-1`、`ESC[1;5H` 尾巴不漏、SGR 滚轮、鼠标上报开关 |
 | `stats-format` | 纯函数：duration/tokens/tok-s/缓存命中取整（12.5%→13%）与除零保护 |
-| `stats-line` | 整行逐字节（DSH 截图那行）+ 四种判据 |
-| `stats-fold` | 实时喂与日志回放 11 字段逐字节相同；重复 callId 取最后一次 |
+| `stats-line` | 整行逐字节（DSH 截图那行）+ 四种判据 + **P72**：缺明细的步不进命中率分母（真值 90% 不许被打成 0%）、全无明细时不报百分比、明细说 0 要照报 0% |
+| `stats-fold` | 实时喂与日志回放 11 字段逐字节相同；重复 callId 取最后一次；**P72**：`cacheSplitKnown` 三态（1 有明细 / 0 未知 / 缺键=老日志按有明细）两条路一致 |
 | `stats-context` | 占用率/`projectedTokens`/`~已用 / 容量`/20 格分段条逐字节 |
 | `stats-usage` | 端到端一轮（只给这轮开 usage），回合正常结束 |
 | `stats-log` | `step/start`↔`step/end` 成对、回放与实时逐字节相同 |
+| `cache-burst` | P28 突发未命中判据（4 组真数据要标记 / 5 组不标记 + payload 形状）；**P72 反向**：缺明细判成 `unknown` 而**不是**突发，有明细的整段未命中**仍要**报突发（少一半判据就会把真淘汰一起静音） |
 | `procx-parse` | `/proc/<pid>/stat`：comm 取首 `(` 到末 `)`、ppid 第 2 字段、utime/stime 第 12/13 字段、坏行必须失败 |
 | `procx-percent` | `Δticks × 1000 / Δms`：0/37/100/250、`Δms=0` 不可算、钳 999、`USER_HZ=100` |
 | `procx-tree` | P24b 进程树判别（纯函数合成数据）：root/子/孙、**行序打乱**（子先于父）、**跨 comm 桥接**（agent→bash→agent）、20 层链、父不在表里、root 不在表里、自环与 `ppid=0` 不卡死、空表 |
@@ -4470,8 +4573,8 @@ DEEPSEEK_API_KEY=sk-xxx ./build/uya-agent \
 | `web-size` | 新建会话的**尺寸握手**（踩坑 117）：真 fork 三条会话，断三条 —— ① 报 150×40 ⇒ 会话记 150×40 **且 PTY 窗口也是**（钉「尺寸真的到了子进程那侧」）② 不报（0/0）⇒ 默认画布 ③ 报超上限 ⇒ 夹到 `EMU_MAX_*` **且与网格 `emu.cols/rows` 一致**。防假绿对照：`web_session_new` 忽略参数 ⇒ 当场红三条（含 PTY 那条） |
 | `web-exit` | 子进程退出后**收摊还是留标签**（踩坑 115）：真 fork + 真 PTY 两条腿 —— ① **正常退出**（exit 0 = `/exit` / ctrl+d / 面板选中 `/exit`）⇒ `close_wanted` 置位、`web_sweep_closed` 之后表里没有它、订阅它的长连接被关掉**且管道里有分块终止块 `0\r\n\r\n`**（前端靠干净 EOF 把「会话结束」与「连接坏了」分开）、最后一帧不丢；② **被 SIGKILL** ⇒ 不置位、表里仍在（留标签看最后一帧）。防假绿对照：把「正常退出才置位」改回「一律不置位」⇒ 当场红四条 |
 | `web-listen` | 监听套接字的 `SO_REUSEADDR`（踩坑 118）：走**生产代码** `srv_listen` 两条腿 —— ① 选项 `getsockopt` 真读得回来（== 1）；② 真复现用户现场：起监听 → 连一条 → **服务端先关**（本侧留 `TIME_WAIT`，本地端口正是监听端口）→ 关监听 → **立刻**用同一端口重新 `srv_listen` ⇒ 必须成功。防假绿对照：把两条常量改回 BSD 的 `0xFFFF` / `0x0004` ⇒ 两条腿都红（用户报的「ctrl+c 之后 web 监听失败」） |
-| `web-childcfg` | P73：会话子进程的环境继承（踩坑 122 ②）。走**生产代码** `web_child_env`，判据看它排好的**环境数组**（`sh_env_array()`，不是 `getenv` —— 那读的是本进程真环境、看不见刚排好的表）：① 父进程给了非默认值时，14 条（权限/沙箱/端点/模型/凭据/档位/信任策略/指纹/工作区/home/max-steps/no-title/no-mouse/no-mcp）**逐条同名同值**；② 父进程没给（出厂默认）时那几条**不许注入**（否则把默认值钉死、挡住子进程读 `settings.yaml`）；③ `UYA_AGENT_WEB` 恒为 0（漏了它子进程递归起 web，踩坑 103）。**权限排第一**：它曾经被悄悄放宽成 `Full access`。防假绿对照：把 `web_child_env_cfg(cfg)` 换成 `_ = cfg;` 重编 ⇒ 当场红 10 条 |
-| `e2e-portable` | `make e2e-portable`（P73，踩坑 122）：把 `build/uya-agent` **拷到一个空目录**、`HOME` 也是空目录、**没有 DSH、没有仓库**（真新机器的样子），只带一个二进制。① 内嵌 preset 兜底：`--print-config` 报 `knobs (source: embedded)` 且旋钮值 == 内置缺省（逐字节）；跑一轮 `--plan` ⇒ 假网关收到的请求里必须有 `Make the plan decision-complete`（**该串只存在于上游 preset**，工作树与编译器树 0 命中 ⇒ 判据不可能假绿）；② **反向断言**：`--dsh-root testdata/preset-root` 时必须是 `source: preset` + `readLimit=1777`（内嵌不许夺磁盘的权）；③ web 会话子进程：只走命令行给 `--base-url/--model/--permission read-only/--agent-home`，断言假网关**收到**请求、请求里的模型是父进程给的那个、会话日志落在 `--agent-home` 下；④ `--no-dsh-config` 这类没有 env 口径的开关必须被启动日志点名。防假绿对照（两条都做过）：把内嵌兜底改成恒 `false` ⇒ 红在①；只停 plan 段的抽取（来源/旋钮照旧）⇒ 红在「plan 策略段缺失」；摘掉 `web_child_env_cfg(cfg)` ⇒ 红在③ |
+| `web-childcfg` | P73：会话子进程的环境继承（踩坑 124 ②）。走**生产代码** `web_child_env`，判据看它排好的**环境数组**（`sh_env_array()`，不是 `getenv` —— 那读的是本进程真环境、看不见刚排好的表）：① 父进程给了非默认值时，14 条（权限/沙箱/端点/模型/凭据/档位/信任策略/指纹/工作区/home/max-steps/no-title/no-mouse/no-mcp）**逐条同名同值**；② 父进程没给（出厂默认）时那几条**不许注入**（否则把默认值钉死、挡住子进程读 `settings.yaml`）；③ `UYA_AGENT_WEB` 恒为 0（漏了它子进程递归起 web，踩坑 103）。**权限排第一**：它曾经被悄悄放宽成 `Full access`。防假绿对照：把 `web_child_env_cfg(cfg)` 换成 `_ = cfg;` 重编 ⇒ 当场红 10 条 |
+| `e2e-portable` | `make e2e-portable`（P73，踩坑 124）：把 `build/uya-agent` **拷到一个空目录**、`HOME` 也是空目录、**没有 DSH、没有仓库**（真新机器的样子），只带一个二进制。① 内嵌 preset 兜底：`--print-config` 报 `knobs (source: embedded)` 且旋钮值 == 内置缺省（逐字节）；跑一轮 `--plan` ⇒ 假网关收到的请求里必须有 `Make the plan decision-complete`（**该串只存在于上游 preset**，工作树与编译器树 0 命中 ⇒ 判据不可能假绿）；② **反向断言**：`--dsh-root testdata/preset-root` 时必须是 `source: preset` + `readLimit=1777`（内嵌不许夺磁盘的权）；③ web 会话子进程：只走命令行给 `--base-url/--model/--permission read-only/--agent-home`，断言假网关**收到**请求、请求里的模型是父进程给的那个、会话日志落在 `--agent-home` 下；④ `--no-dsh-config` 这类没有 env 口径的开关必须被启动日志点名。防假绿对照（两条都做过）：把内嵌兜底改成恒 `false` ⇒ 红在①；只停 plan 段的抽取（来源/旋钮照旧）⇒ 红在「plan 策略段缺失」；摘掉 `web_child_env_cfg(cfg)` ⇒ 红在③ |
 | `tui-full` | P53 浮层全屏四组：**A** 非全屏仍是居中框（不顶格、`≤16` 行上限、第 30 项看不见）→ 全屏框 = 转录区（顶边第 0 行、左右边框 0 与 `cols-1`、标题 ` · 全屏`、行偏移表口径的逐行闭合、底边**正好**在 `panel_top-1`）+ 16 行上限解除（第 20 项可见、第 30 项仍不可见）；**B** `ctrl+f`（`0x06`）与 `F11`（`ESC[23~`）都切换，且**四种形态各认一次**（列表 / reader / ask / input）；**C** 不吃面板 / 状态区 / 脚注；**D** 没浮层时只落 notice、全屏态不跨浮层残留、`esc` 关掉后转录回来，终端太矮时 fail-closed 判据不变；**F** `/fullscreen` 四态（裸报状态 / `on` / `off` / 非法值只报错且状态不动、重复 `off` 幂等） |
 | `overlay-fullscreen` | `make p30-check` 第 9 场（真终端 + 假网关）：屏幕几何判据 —— 非全屏顶边 > 0 行且左边框 > 0 列 → `ctrl+f` 后顶边第 0 行、左右边框正好 `0` 与 `cols-1`、标题带 ` · 全屏`、面板与脚注都还在、底边行 < 面板行 → `F11` 关回居中 → 再全屏、`esc` 关掉后方框消失 |
 | `tasks-ctrl-t` | `make p30-check` 第 10 场（踩坑 114，真终端 + 假网关 `todo_first=1`）：回合**运行中**按 `ctrl+t` → `┌─ tasks ` ≤1.5 s 上屏**且那一刻 `SELFTEST_OK` 还没到** → 再按一次收回折叠行（实测 101 ms） |
