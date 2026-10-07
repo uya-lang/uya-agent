@@ -497,6 +497,21 @@ struct History { items: &Msg, len, cap, bytes }                                 
 2. `o.usage_in = prompt_tokens - cached`：**DeepSeek 的 `prompt_tokens` 含缓存命中**，
    所以这个字段的语义是「**非缓存输入**」，不是原始 prompt_tokens。
 
+**两种缓存方言都要认，且「没明细」必须与「明细说 0」分开**（P72 踩坑 123）：
+
+| 形状 | 含义 |
+|---|---|
+| `prompt_cache_hit_tokens` / `prompt_cache_miss_tokens`（DeepSeek） | 有明细，miss 由提供方给出 |
+| `prompt_tokens_details.cached_tokens`（OpenAI 方言） | 有明细，miss = `prompt_tokens − cached` |
+| 两者都没有 | **没明细**：`usage_have_cache_split = false`，命中率据此排除该步 |
+
+上游会在两种形状之间**随机切换**（实测 autodl.art 的 DeepSeek-V4.1-Flash：始终带
+OpenAI 方言的 `cached_tokens`，但时有时无地省略 DeepSeek 那一对）。因此
+`usage_cache_read == 0` **不能**当作「命中 0」用 —— 判据只能是
+`usage_have_cache_split`（在**真读到明细字段**时置位，含 `cached_tokens: 0`）。
+下游一切「命中率」的分母都要走 `st_hit_rate_billed()`，把未知步排除在外并显示
+「未拆分 N 步」。
+
 #### 4.5.2 responses 侧
 
 事件表按作用分组：
@@ -4116,6 +4131,67 @@ responses 用 `{"type":"input_image","detail":"auto","image_url":…}`；
     主流程」的正当写法，顺手把「失败」也藏了。所以这类 `catch {}` 旁边要么留一个可判
     的观测口（`srv_reuseaddr_ok` 就是），要么在启动时问一次。
 
+123. **「上游没给读数」被当成「读数说 0」⇒ 缓存命中率看板凭空掉三成，账单按最贵档多算**
+     （P72，用户问「为什么最近缓存命中率变低了」时查出来的）：
+     用户报「缓存命中率变低了」。查下来**缓存一点没坏**：按天看客户端账本，
+     只看「提供方真给了缓存明细」的步，10-07 的命中率是 **99.3%**（10-04/05/06 是
+     99.4 / 98.6 / 99.1）；掉到 88.7% 完全是另一类行拉低的 —— 那些行的
+     `cacheReadTokens = 0` 且 `inputTokens` 等于**整个 prompt**（当天 315 行 / 90.8M
+     token，而 10-02～10-06 合计只有 85 行）。
+     链路是**两处各自独立、症状一样**的静默路叠出来的：
+
+     ① **上游间歇换方言**（真机直连实测，autodl.art 的 DeepSeek-V4.1-Flash）：
+     它**始终**回 `prompt_tokens_details.cached_tokens`（值是真的：冷启动 0、
+     暖前缀 14968/19968），但会**时有时无地省略** DeepSeek 方言的
+     `prompt_cache_hit_tokens`/`prompt_cache_miss_tokens`。网关 `~/ai-gateway` 的
+     `ChatUsageToDimensions` 只认后者 ⇒ 落进 `else` 分支
+     `dims["input"] = prompt_tokens`，**整段已缓存的 prompt 记成未命中**。
+     ② 网关再往下游（responses 出口）发 usage 时，原来的 `UsageToWire` 是
+     `if cached > 0 { 发 input_tokens_details }` —— 于是「上游没发明细」与
+     「上游说命中 0」在客户端**发成同一个形状**（都没有 details）。本仓只读得到
+     后一种，把两种都当成了 0。
+
+     为什么难查：**没有任何一层报错**，而症状（0% 命中）与一次真实的缓存崩塌
+     长得一模一样。正面证据是「同会话后续步仍在读同一份前缀」：取每个无明细行，
+     在后续 5 步内找 `cacheReadTokens ≥ 90% × 该 prompt` 的请求 —— 154 行里 136 行
+     （88%）找到了，中间 prompt 只增长中位数 610 token。**前缀是热的，只是那一次
+     没把读数带回来。** 对照面也吻合：同一网关下游的真 DSH、真 Codex 当天同样中招
+     （11.8% / 8.9%），所以这不是本仓引起的。
+
+     代价（网关 `usage_records`，当天 DeepSeek 流量）：89.2M token 被按未命中价计费，
+     ￥88.38 vs 命中价 ￥1.77 ⇒ **多算 ￥86.61（≈$12.99）**，其中本仓客户端占 ￥46.63。
+     网关侧另有 1740 条 `usage was priced through a fallback rate` 的 WARN 是同一件事
+     的记账面（10-05/06 合计只有 267 条）。
+
+     修法（两侧都改，判据都落在「明细在不在」而不在数值上）：
+     * **网关**：`ChatUsage` 同时建模两种方言，取值优先级
+       DeepSeek 对 → `prompt_tokens_details.cached_tokens`（miss 由
+       `prompt_tokens - cached` 推出并钳 0）→ 裸 `input`；`UsageToWire` 改成
+       **按维度存在性**发 `input_tokens_details`（`cached_tokens: 0` 照发）；
+       请求日志与维度统计加 `cache_split_known`，控制台把「未拆分」与「0%」分开显示
+       （汇总行混有未拆分时改口径，不把兜底 0 加进去）。
+     * **本仓**：`ChatOut` 加 `usage_have_cache_split`（两个解析器在**真读到明细字段**
+       时置位）；`st_assistant_message` 收一个 `split_known`，命中率分母改用
+       `st_hit_rate_billed()`（只含有明细的步），未知步另计并显示「未拆分 N 步」；
+       `--show-usage` 缺明细时打 `cache_read=?(未回明细)`；`cmp_cache_burst` 前面加
+       `cmp_cache_unknown`，缺明细只记 `cache/unknown`、**不再误报 `cache/evicted`**
+       （实测 771 条事件里 375 条是这个假警报）。
+       压力口径（`last_pressure`）**不动**：压缩要的是真实 prompt 大小，与读数拆没拆开无关。
+
+     两个当场抓到的坑，都是自测挣来的：
+     * 「日志里写 `"cacheSplitKnown":false`」曾经是错的 —— 日志读回走
+       `sess_json_i64`，它**只认数字**：`true` 与 `false` 都没有数字位，两者都回 `-1`，
+       于是「明确未知」与「老日志没这个键」混成同一个值。改成 **1/0 数字**后才有三态
+       （`0` 未知 / `1` 有明细 / `-1` 老日志按有明细）。**自测（stats-fold）当场抓住的**，
+       若只跑实时路径永远看不见。
+     * 判据必须**两个方向都钉**：同一组数字（`miss == prompt`）在「有明细」时
+       **仍然要**被判成突发 —— 否则这次修法就把真正的淘汰一起静音了。
+       `cache-burst` 轮为此加了反向断言。
+
+     教训：**「没读数」必须与「读数是 0」在每一层都保持可区分** —— 从上游字段、
+     网关维度、日志字段、一直到屏幕上的百分比。任何一层把它们合并，都会在下游
+     变成一个看起来像"事实"的假数字，而假数字比缺数字贵得多（这里贵 50 倍）。
+
 ---
 
 ## 17. 工具实现要点
@@ -4269,11 +4345,12 @@ DEEPSEEK_API_KEY=sk-xxx ./build/uya-agent \
 | `tui-cmd` | 面板 ↔ `/status` 浮层：输入行不留 `/`、标题逐字节、正文层无 NUL、运行中 step 边界派发；**F 段（P57）**：循环选择（`↑` 顶→底 / `↓` 底→顶、中间项仍逐格走、`Home`/`End`/`PgUp`/`PgDn` 仍夹取、矮框里步长同为 ±1 时 `PgDn` 夹取而 `↓` 回绕的判别腿）+ 已输入文本画在标题栏（非空才画、退格跟随变短、长词保尾补 `…`、脏字节单行清洗、方框仍逐行闭合） |
 | `tui-scroll` | P32：2400 行条目 PgUp 到 `LONG-ROW-1`、`ESC[1;5H` 尾巴不漏、SGR 滚轮、鼠标上报开关 |
 | `stats-format` | 纯函数：duration/tokens/tok-s/缓存命中取整（12.5%→13%）与除零保护 |
-| `stats-line` | 整行逐字节（DSH 截图那行）+ 四种判据 |
-| `stats-fold` | 实时喂与日志回放 11 字段逐字节相同；重复 callId 取最后一次 |
+| `stats-line` | 整行逐字节（DSH 截图那行）+ 四种判据 + **P72**：缺明细的步不进命中率分母（真值 90% 不许被打成 0%）、全无明细时不报百分比、明细说 0 要照报 0% |
+| `stats-fold` | 实时喂与日志回放 11 字段逐字节相同；重复 callId 取最后一次；**P72**：`cacheSplitKnown` 三态（1 有明细 / 0 未知 / 缺键=老日志按有明细）两条路一致 |
 | `stats-context` | 占用率/`projectedTokens`/`~已用 / 容量`/20 格分段条逐字节 |
 | `stats-usage` | 端到端一轮（只给这轮开 usage），回合正常结束 |
 | `stats-log` | `step/start`↔`step/end` 成对、回放与实时逐字节相同 |
+| `cache-burst` | P28 突发未命中判据（4 组真数据要标记 / 5 组不标记 + payload 形状）；**P72 反向**：缺明细判成 `unknown` 而**不是**突发，有明细的整段未命中**仍要**报突发（少一半判据就会把真淘汰一起静音） |
 | `procx-parse` | `/proc/<pid>/stat`：comm 取首 `(` 到末 `)`、ppid 第 2 字段、utime/stime 第 12/13 字段、坏行必须失败 |
 | `procx-percent` | `Δticks × 1000 / Δms`：0/37/100/250、`Δms=0` 不可算、钳 999、`USER_HZ=100` |
 | `procx-tree` | P24b 进程树判别（纯函数合成数据）：root/子/孙、**行序打乱**（子先于父）、**跨 comm 桥接**（agent→bash→agent）、20 层链、父不在表里、root 不在表里、自环与 `ppid=0` 不卡死、空表 |
