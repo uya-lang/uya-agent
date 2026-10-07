@@ -524,7 +524,7 @@ DEEPSEEK_API_KEY=sk-xxx ./build/uya-agent \
   **档位表必须按上游实测填，不要照抄全集**：模型/网关的「支持思考」是布尔的，装不下
   「只认哪几档」——真机 `GLM-5.3-flash` 就只认 `low`/`high`/`max`，`none`/`minimal`/
   `medium`/`xhigh` 一律 400，而网关侧 `degradation: strip` 只标记不剥离，请求照样带出去、
-  错误原样透出。写全集等于给用户几个必然失败的选项（见 [DESIGN.md §16 踩坑 111](DESIGN.md)）。
+  错误原样透出。写全集等于给用户几个必然失败的选项（见 [DESIGN.md §16 踩坑 112](DESIGN.md)）。
   **切模型不做上下文迁移**：历史原样保留，`{{model}}` 是建会话时求值的，所以 persona 里仍是旧
   模型名。选择进会话日志（`session/model`）但不进索引独立字段；子代理继承父的
   provider/model/强度，但**不能自己切**。

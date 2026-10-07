@@ -3656,7 +3656,7 @@ responses 用 `{"type":"input_image","detail":"auto","image_url":…}`；
       没有断言的产物，全绿不代表它对。本轮补了 `mock_mode 25` 的 UA 断言（先验红：
       改回旧 UA ⇒ `verdict 204` + `SELFTEST FAIL`）。
 
-111. **布尔的能力申报装不下「只认三档」—— 网关说 `reasoning: true`，模型却拒收一半档位**（真机，本轮踩到）：
+112. **布尔的能力申报装不下「只认三档」—— 网关说 `reasoning: true`，模型却拒收一半档位**（真机，本轮踩到）：
     本轮给本机网关照单加两个 AutoDL 模型（`GLM-5.3-flash` / `hy4-preview`，改动在
     `~/ai-gateway` 与本仓文档，见 §19 的验收记录）。实测 `GLM-5.3-flash` 时撞到这条：
     它对 `reasoning_effort` **只认 `low` / `high` / `max`** —— `none` / `minimal` /
@@ -3683,6 +3683,17 @@ responses 用 `{"type":"input_image","detail":"auto","image_url":…}`；
     **未知 → 不拦**，而写死一个猜测等于替上游下一个它没被要求做的决定。所以那一行的
     `capabilities` 留空，等能真发出请求再补。两条合起来是同一个教训：
     **申报的粒度不够时，宁可留白也不要填一个自己没测过的值**。
+
+    **本条自己又踩了一次踩坑 110**：它最初写的是 **111**，而并行线（P71）也取了 111，
+    合并后 §16 里出现两个 111（`git log` 里三条同标题提交就是那次合并的形状）。
+    这与 110 是**同一个机制**：两条线各自取「下一个空号」，没有任何东西比对数值；
+    区别只是 110 的代价是运行时行为（键码撞号），这条的代价是文档编号。
+    处置沿用本仓已有的先例：**后落地的让号**（`da36d61`「main 已占 109，本线的撞号条
+    记成 110」、`bf396f7`「并行线已占 109/110，本线顺延为 111」、`fd0e81e`「81 被 main
+    的提问弹窗线占了，本线改为 82」—— 同一个动作在本仓已经做过至少三次）。
+    本线改成 **112**，三处交叉引用一并改掉。
+    顺带一提：`make lint-size` / `doc-audit` 都看不见这件事 —— 编号撞号没有任何检查器，
+    与 110 的「两个 `const i32` 同值完全合法」是同一类盲区。
 
 ---
 
@@ -4363,13 +4374,13 @@ DEEPSEEK_API_KEY=sk-xxx ./build/uya-agent \
   `~/ai-gateway` 新增 `scripts/autodl-models.sh`（一次写全三层：供应商模型行含成本价、
   对客模型目录项、模型路由；默认干跑、`--apply` 才写、整数算价、写后读回核对 +
   `router/explain` + `pricing/simulate`）与 `docs/todo_done.md` 一节；本仓这边是
-  `~/.dsh/settings.yaml` 的 `aigw-local` 加两个条目 + README 的档位告诫 + §16 踩坑 111。
+  `~/.dsh/settings.yaml` 的 `aigw-local` 加两个条目 + README 的档位告诫 + §16 踩坑 112。
 
   **为什么记在本仓**：两条实测结论都会改变本仓的行为，不是纯网关运维。
   ① `GLM-5.3-flash` 对 `reasoning_effort` **只认 `low`/`high`/`max`**
   （`none`/`minimal`/`medium`/`xhigh` → 400），而网关的能力申报只有布尔 ——
   所以 DSH 那边那个 `reasoningEfforts:` 映射**必须按实测写**，照抄全集会让用户选中
-  一个必然 400 的档位（`degradation: strip` 只标记不剥离，错误原样透出）。见踩坑 111。
+  一个必然 400 的档位（`degradation: strip` 只标记不剥离，错误原样透出）。见踩坑 112。
   ② `hy4-preview` 现在**任何请求都 402**（腾讯侧免费额度用尽、未开后付费），
   能力一个都没实测 ⇒ 网关侧 `capabilities` 留空（读作「未知 → 不拦」），本仓这边
   也不给它写 `reasoningEfforts`（不发明档位那条规则的直接后果）。
