@@ -101,9 +101,9 @@ readelf -lW build/uya-agent | grep -c INTERP    # 0 = 真静态
 | 选项 | 说明 |
 |---|---|
 | `--base-url URL` | 默认 `https://api.deepseek.com/v1`（也支持 `http://127.0.0.1:11434/v1` 这类本地明文端点） |
-| `--model NAME` | 默认 `deepseek-chat`。走模型目录收口 —— 命中就把该模型的 provider / contextWindow / maxTokens / input / compat **一起**搬过来（`/model` 同口径），目录里没有就只换名字并告警（能力保持不动）。**同名模型跨提供方**（两家都发布同一个 id）时用 `--model 提供方/名字` 指定是哪一家；只给名字时用当前提供方，并在回执里点出同名的那一家 |
+| `--model NAME` | 默认 `deepseek-chat`。走模型目录收口 —— 命中就把该模型的 provider / contextWindow / maxTokens / input / compat **一起**搬过来（`/model` 同口径），目录里没有就只换名字并告警（能力保持不动）。**同名模型跨提供方**（两家都发布同一个 id）时用 `--model 提供方/名字` 指定是哪一家；只给名字时用当前提供方，并在回执里点出同名的那一家。**命令行是一次性的**：它不会改 `settings.yaml`（要改默认用 `/model`） |
 | `--provider NAME` | 提供方键（可省略）：`settings.yaml` 里 `providers.<key>` 的那个 key，配 `--model` 用；省略时由目录反查。显式给的这个键**当场生效**（端点 / 凭据 / 线协议一起解析），与 `--model` 谁先谁后都一样；**显式优先** —— 该提供方没发布这个名字时不会跨提供方回退（不会把你点的键悄悄换掉） |
-| `--effort V` | 推理强度（`--reasoning-effort` 的别名）：先按当前模型公布的档位校验，不在集合里则拒绝（`--reasoning-effort` 不校验、原样透传） |
+| `--effort V` | 推理强度（`--reasoning-effort` 的别名）：先按当前模型公布的档位校验，不在集合里则拒绝（`--reasoning-effort` 不校验、原样透传）。与 `--model` 一样是**一次性**的，不写回设置 |
 | `--reasoning-effort V` | 推理强度：**completions 发顶层 `reasoning_effort`，responses 发 `reasoning.effort`**（`compat.supportsReasoningEffort=false` 或 `off`/`none` = 不发），默认取 DSH 的 `agent-default-model.reasoningEffort` |
 | `--workspace DIR` | 工具的活动目录，默认当前目录；恢复会话时默认跟随会话记录的工作区，显式指定优先 |
 | `--max-steps N` | **熔断上限**：最多几轮工具调用，**默认 0 = 不限** —— 一直跑到模型给出最终答案（对齐 DSH：它没有步数上限） |
@@ -139,7 +139,8 @@ readelf -lW build/uya-agent | grep -c INTERP    # 0 = 真静态
 | `--resume ID` | 恢复指定会话（`ID` 或 `last`） |
 | `--list-sessions` | 列出本机**有标题的**会话后退出（无标题的不进列表；`--resume <id>` 仍可直达） |
 | `--dsh-home DIR` | DSH 用户目录（默认 `$DSH_HOME` 或 `~/.dsh`） |
-| `--no-dsh-config` | 完全不读 DSH 设置 |
+| `--no-dsh-config` | 完全不读 DSH 设置（也因此**不写回**） |
+| `--no-dsh-writeback` | `/model`、`/effort` 切完**不写回** `settings.yaml`（`UYA_AGENT_DSH_WRITEBACK=0` 同口径）。注意这与 `--no-dsh-config` 不同：那个连模型路线与权限预设都不读 |
 | `--strict-dsh-config` | 读不到 DSH 设置就报错退出 |
 | `--dsh-root DIR` | packaged preset 根（读 persona / plan 段文案） |
 | `--print-config` | 打印生效配置、preset 旋钮与**来源**后退出（含 `tls_verify` / `tls_pin`） |
@@ -543,6 +544,22 @@ DEEPSEEK_API_KEY=sk-xxx ./build/uya-agent \
   **切模型不做上下文迁移**：历史原样保留，`{{model}}` 是建会话时求值的，所以 persona 里仍是旧
   模型名。选择进会话日志（`session/model`）但不进索引独立字段；子代理继承父的
   provider/model/强度，但**不能自己切**。
+* **人切完的选择会写回 DSH 设置**（P71）：`/model <名字>` 与 `/effort <档位>`（含 TUI 浮层里
+  选中）成功之后，把 `provider` / `model` / `reasoningEffort` **三样一起**写回
+  `$DSH_HOME/settings.yaml` 的 `agent-default-model` —— 于是**下次启动**的默认就是刚选的这条
+  路线。这与 DSH 自己的行为一致（它的 `selectModel` 会调 `agentDefaultModel.saveSelection`）。
+  四条纪律：
+  * **只改那三行**：注释、`!!js` 行、块标量、别的节（`llm-pi-ai` / `permission` / `ui-theme`…）
+    逐字节不变；**叶级替换**，行数都不变。写前会自己解析一遍并核对三项值，不过就不写。
+  * **原子提交 + 跨进程写锁**（与 DSH 的 `dsh-atomic-write` 同一协议）：`<file>.lock` 独占创建，
+    抢不到就**让位**（DSH 正在写是正常并发），临时文件 + rename 覆盖，别人的锁**绝不删**。
+  * **写失败不回滚**：那只是「下次启动的默认」没跟上，本次会话的选择照常生效；原因有一行回执。
+    「文件里本来就是这份选择」与「用户显式关掉」两种情况**不留回执**（那是噪音）。
+  * **边界，一律不写**：`--model` / `--effort`（命令行是**一次性**的，与 DSH 的 entry-point
+    同口径）、`--resume` 的会话记录、`--exec-effort` 自动降档、`--no-dsh-config`、
+    `--no-dsh-writeback`（`UYA_AGENT_DSH_WRITEBACK=0` 同口径）。设置文件是 flow 写法
+    （`agent-default-model: {…}`）时**拒绝并留一行说明**（不猜、也不整份重写）；目录里没有
+    `settings.yaml` 时**不替你新建**。
 * **同名模型按「提供方 + 名字」选**（P62）：DSH 的模型 id 通常全局唯一，但两家提供方发布**同一个
   id** 是合法的（真机 `DeepSeek-V4.1-Flash` 就同时挂在 `aigw-local` 与 `autodl-api` 下）。这种
   情况下「模型」是一个**二元组**，所以：
