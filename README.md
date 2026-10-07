@@ -572,6 +572,12 @@ DEEPSEEK_API_KEY=sk-xxx ./build/uya-agent \
   两个头，正文再带一份 `client_metadata.session_id`（responses）/ `metadata.session_id`
   （chat）。运行时上下文里另有 `session workspace: "<JSON 路径>"` 机读句。网关据此把请求
   归到一次会话、取到工作区，并把标题调用认成 `call_kind=title` —— 见 [DESIGN.md](DESIGN.md) §15.4。
+* **客户身份靠 User-Agent**（P71）：发 `uya-agent/0.1 (deepseek-harness-compatible)` ——
+  网关（`~/ai-gateway`）的客户端词表是封闭的 `dsh | codex | console | unknown`，只有
+  UA 这条接缝；认不出客户端时它**连工作区一起丢**（那条维度只在 dsh/codex 分支里取）。
+  代价：控制台上本仓与真 DSH 同桶。机读句 `session workspace:` 报的是**归类键** ——
+  Git worktree 会话折回**主工作区**（否则每个会话一条唯一 worktree 路径，工作区维度会
+  退化成会话维度）；人读的 `Current workspace:` 仍是会话真正的路径。
 * **起标题的提示词与 DSH 逐字同形**：system 段以 `Create a concise title for an AI
   coding-assistant session` 开头，user 段以 `Generate the session title from this JSON array
   of human messages:` 开头（后跟人类消息的 JSON 数组），且带**同一个**会话 id —— 网关按
