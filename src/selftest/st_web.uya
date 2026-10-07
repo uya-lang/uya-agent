@@ -1789,3 +1789,113 @@ fn web_t_sleep_ms(ms: i32) void {
     var rem: TimeSpec = TimeSpec{ tv_sec: 0, tv_nsec: 0 };
     _ = sys_nanosleep(&ts, &rem) catch {};
 }
+
+// ============================================================
+// web-listen：监听套接字的 SO_REUSEADDR（§16 踩坑 118）
+// ============================================================
+
+// 现场（用户报的「运行 web 后 ctrl+c 报监听失败」）：`--web` 用浏览器打开一次页面、
+// ctrl+c 退出，**紧接着**再用同一个端口跑一次，就得到
+//   error: web 监听失败（端口被占用？换个端口：--web 127.0.0.1:0）
+// 根因不是「谁还占着端口」：`src/net/httpsrv.uya` 的两条常量抄的是 BSD/macOS 的值
+// （`SOL_SOCKET = 0xFFFF`、`SO_REUSEADDR = 0x0004`），而 Linux 是 `1` / `2`。用错
+// 值时 `setsockopt` 以 `ENOPROTOOPT` 失败、又被调用点的 `catch {}` 吞了 ⇒ 监听
+// 套接字**一个选项都没设上**。浏览器每次加载页面都会留下 `TIME_WAIT`（本侧先关
+// 连接，那一半套接字的本地端口正是监听端口），没有 `SO_REUSEADDR` 就绑不回去。
+//
+// 判据两条，都走**生产代码** `srv_listen`：
+//   ① 监听套接字上 `SO_REUSEADDR` 真的读得回来（常量写错时这里当场 false）；
+//   ② 真复现用户现场：起监听 → 连一条 → **服务端先关**（本侧留 TIME_WAIT）→ 关
+//      监听 → **立刻**用同一端口重新 `srv_listen` ⇒ 必须成功。
+// 防假绿对照：把两条常量改回 `0xFFFF` / `0x0004` 重编 ⇒ 两条腿都红。
+export fn web_listen_round(tag: &const byte) bool {
+    var ok: bool = true;
+    web_t_listen_opt(tag, &ok);
+    web_t_listen_rebind(tag, &ok);
+    if ok {
+        tuis_ok(tag, "监听套接字：SO_REUSEADDR 真设上了 + TIME_WAIT 不挡同端口重启");
+    }
+    return ok;
+}
+
+// 腿①：`srv_listen` 之后 `SO_REUSEADDR` 必须读得回来（== 1）。`port = 0` 让内核
+// 分配端口，避开与机器上别的监听撞车（`web-http` 轮同一个口径）。
+fn web_t_listen_opt(tag: &const byte, ok: &bool) void {
+    const lfd: i32 = srv_listen(127, 0, 0, 1, 0, 16);
+    if lfd < 0 {
+        tuis_fail(tag, "srv_listen(127.0.0.1:0) 起不来", ok);
+        return;
+    }
+    if !srv_reuseaddr_ok(lfd) {
+        tuis_fail(tag, "监听套接字没设上 SO_REUSEADDR（常量抄成 BSD 值了？）", ok);
+    }
+    srv_close(lfd);
+}
+
+// 腿②：复现用户现场 —— 本侧先关连接留下 TIME_WAIT，立刻用同一端口重新监听。
+fn web_t_listen_rebind(tag: &const byte, ok: &bool) void {
+    const lfd: i32 = srv_listen(127, 0, 0, 1, 0, 16);
+    if lfd < 0 {
+        tuis_fail(tag, "srv_listen 起不来（重启那条腿的前半段）", ok);
+        return;
+    }
+    const port: u16 = srv_local_port(lfd);
+    if port == 0 {
+        tuis_fail(tag, "取不到内核分配的端口", ok);
+        srv_close(lfd);
+        return;
+    }
+    var acc: i32 = -1;
+    var cli: i32 = -1;
+    if !web_t_listen_connect(lfd, port, &acc, &cli) {
+        tuis_fail(tag, "连不上自己刚起的监听（自测环境有问题）", ok);
+        srv_close(lfd);
+        return;
+    }
+    // **服务端先关**：TIME_WAIT 才留在监听端口这一侧（用户现场就是这样）。
+    // 顺序不能反 —— 先关客户端的话 TIME_WAIT 落在它的临时端口上，这条腿会假绿。
+    srv_close(acc);
+    srv_close(cli);
+    srv_close(lfd);
+    const again: i32 = srv_listen(127, 0, 0, 1, port, 16);
+    if again < 0 {
+        tuis_fail(tag, "TIME_WAIT 挡住了同端口重启（用户报的「web 监听失败」）",
+            ok);
+        return;
+    }
+    srv_close(again);
+}
+
+// 连一次自己刚起的监听，把**两侧**的 fd 都从 `srv_out` / `cli_out` 带回来。
+// 客户端 fd 是**阻塞**的（本机 connect 立刻返回），服务端 accept 走非阻塞的
+// `srv_accept_nb` + 小重试：连上了不等于这一瞬间已经可 accept。
+//
+// 为什么要把客户端 fd 也交出去：**先关哪一侧决定了 TIME_WAIT 落在谁头上**。
+// TIME_WAIT 属于「先关」的那一半，而这条腿要的正是「监听端口这一侧留着 TIME_WAIT」
+// （用户现场就是服务端先关）—— 客户端在助手里顺手关掉的话，TIME_WAIT 就跑到客户端
+// 的临时端口上去了，这条腿会**假绿**（实测：正是这个把第一次写的对照放过去了）。
+fn web_t_listen_connect(lfd: i32, port: u16, srv_out: &i32,
+    cli_out: &i32) bool {
+    const cfd: i32 = sys_socket(AF_INET, SOCK_STREAM, IPPROTO_TCP) catch {
+        return false;
+    };
+    var addr: [byte: 16] = [0: 16];
+    srv_sockaddr(127, 0, 0, 1, port, &addr[0]);
+    if (sys_connect(cfd, &addr[0] as &void, 16 as u32) catch { -1; }) != 0 {
+        srv_close(cfd);
+        return false;
+    }
+    var tries: usize = 0;
+    while tries < 50 {
+        const sfd: i32 = srv_accept_nb(lfd);
+        if sfd >= 0 {
+            srv_out[0] = sfd;
+            cli_out[0] = cfd;
+            return true;
+        }
+        web_t_sleep_ms(10);
+        tries = tries + 1;
+    }
+    srv_close(cfd);
+    return false;
+}

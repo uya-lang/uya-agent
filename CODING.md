@@ -180,7 +180,7 @@ make doc-audit        # 文本文件里不许留 Git 冲突标记
 实际位置一致、**每个 `fn` / `export fn` 的紧邻上方要有 `//` 注释**。
 
 为什么这两件事需要单独一条审计：它们**没有任何功能断言看得见**。漏一行头注释、少一句函数
-注释，`make build`、`make selftest`（147 个具名轮次）、`link-audit`、`codegen-audit`、`doc-audit`
+注释，`make build`、`make selftest`（148 个具名轮次）、`link-audit`、`codegen-audit`、`doc-audit`
 **全绿** —— 与踩坑 94 同族：「全绿」只覆盖被断言过的东西，所以没有断言的产物必须自己有一条。
 它已并进 `make selftest`。
 

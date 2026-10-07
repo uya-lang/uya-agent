@@ -329,7 +329,7 @@ make mcp-selftest          # 只跑 src/plugin/（MCP 插件：公开名 / 握�
 make UYA_SELFTEST_ONLY=x,y # 只跑指定的几轮
 ```
 
-**逐轮覆盖点**（147 个具名轮次）见 [DESIGN.md §19](DESIGN.md) —— 那里也是**逐阶段的验收记录**
+**逐轮覆盖点**（148 个具名轮次）见 [DESIGN.md §19](DESIGN.md) —— 那里也是**逐阶段的验收记录**
 （P1–P58 的 before/after 命令、真机对照实验、被自测当场抓住的自身缺陷）。
 
 **验收纪律**（改完必须做，见 [CODING.md §5](CODING.md)）：
