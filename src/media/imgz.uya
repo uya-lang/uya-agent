@@ -1,0 +1,321 @@
+// src/media/imgz.uya — 图片压缩（把超预算的 JPEG 缩到预算内）
+//
+// 本文件：**只做「超预算 → 缩小」** —— 拿一坨图片字节与它的 `ImgInfo`，超预算
+//   就 JPEG 解码 → 整数倍下采样 → JPEG 重编码，直到字节与像素两道预算都过。
+//   不碰「收不收」的判定（那是 imgx 的事），也不碰附件落盘（那是 agent 的事）。
+// 不变量：① **只有真能在两道预算内做小才换掉原图** —— 解码失败、重编码失败、
+//   缩完还超、或缩完反而更大，一律保留原字节与原 info，让调用方走原来的
+//   「拒绝」路径；绝不返回半张图或更差的图；② 下采样只做**整数倍**（1/2、1/4…）：
+//   不做插值就不引入额外精度问题，每档只算一次，简单可测；③ 像素与字节是
+//   **两道**预算，必须都过（只过一道不算成功）；④ 像素没超时先试「同尺寸重压」
+//   （不丢分辨率 —— 超预算常常只是编码太肥），像素超了才从 1/2 起缩。
+// 依赖：foundation/bufx（Buf）；media/imgx（ImgInfo / imgx_check / IMGX_OK）；
+//   标准库 std.image.*（Image / jpeg_decode / jpeg_encode_q）、std.mem.allocator。
+// 命名：`imgz_*`、`IMGZ_*`、`ImgzResult`。
+//
+// 为什么单开一个文件而不塞进 imgx：imgx 是**判定层**（只读文件头、纯函数、零堆），
+// 本文件是**变换层**（要解码、要分配、要重编码）。失败语义也不同：imgx 说「收
+// 不收」，imgz 说「能不能变小」。混在一起会让 imgx 的头注释直接失守 —— 它明确
+// 写着「只做判定、不做变换」。
+
+use std.image.image.Image;
+use std.image.image.image_new;
+use std.image.image.image_free;
+use std.mem.allocator.get_allocator;
+use std.mem.allocator.MallocAllocator;
+use std.image.jpeg_decode.jpeg_decode;
+use std.image.jpeg_encode.jpeg_encode_q;
+use std.image.jpeg_encode.jpeg_max_bytes;
+
+// 下采样倍率的尝试上限：1/2 不行就 1/4、1/8、1/16。
+// 为什么止步 16：640000 像素的预算下，1/16 已能把 1.6 亿像素的图压进来；
+// 再大说明原图本身不寻常（该拒就拒），而每多一档就多一次解码 + 编码。
+export const IMGZ_MAX_SCALE: i32 = 16;
+
+// 重编码质量：比 std 缺省的 85 略低。缩图的目的就是省字节，而 80 与 85 在这个
+// 尺寸下肉眼无差，字节能省一截。
+export const IMGZ_QUALITY: i32 = 80;
+
+// 压缩尝试的结果。
+// ok = true 时 raw/info 已被替换成缩小后的图；false 时两者**保持原样**。
+export struct ImgzResult {
+    ok: bool,
+    scale: i32,             // 实际缩小的分母（1 = 只重压、没缩放）
+    before_bytes: usize,
+    after_bytes: usize,
+    width: i32,
+    height: i32,
+}
+
+// 空结果（ok = false、scale = 1）。
+export fn imgz_result_none() ImgzResult {
+    var z: ImgzResult = ImgzResult{
+        ok: false, scale: 1, before_bytes: 0, after_bytes: 0,
+        width: 0, height: 0,
+    };
+    return z;
+}
+
+// 把 !bool 收成 bool（失败 = false）。
+// Uya 的 catch 块必须产出成功类型的值，所以这类收口统一走这个形状。
+fn imgz_ok(r: !bool) bool {
+    return r catch { false; };
+}
+
+// 空位图（image_free 之前不得读写像素）。
+fn imgz_blank_image() Image {
+    var z: Image = Image{ width: 0, height: 0, channels: 0,
+        pixels: null, allocator: null };
+    return z;
+}
+
+// 这张图能不能进压缩链路（只认 JPEG：本仓解码器只解基线 JPEG，标准库也还没有
+// PNG / GIF / WebP 的编码器）。
+export fn imgz_can_shrink(kind: u8) bool {
+    return kind == 1;      // IMGX_JPEG
+}
+
+// 一张 w x h 的图重编码后的缓冲上界。
+export fn imgz_cap_for(w: i32, h: i32) usize {
+    return jpeg_max_bytes(w, h);
+}
+
+// 按分母 scale 缩放后的边长（向上取整，至少 1）。
+fn imgz_scaled_dim(v: i32, scale: i32) i32 {
+    var d: i32 = (v + scale - 1) / scale;
+    if d < 1 {
+        d = 1;
+    }
+    return d;
+}
+
+// 像素是否超预算（max_pixels = 0 表示用缺省）。
+fn imgz_pixels_over(info: &const ImgInfo, max_pixels: i64) bool {
+    var mp: i64 = max_pixels;
+    if mp <= 0 {
+        mp = 640000;             // 与 IMGX_DEF_MAX_PIXELS 同值
+    }
+    return (info.width * info.height) > mp;
+}
+
+// 把超预算的图缩到预算内。**只有真缩小了才改 raw/info**。
+// 参数：
+// - raw: 原图字节（成功时就地替换成缩小后的图）。
+// - info: 原图信息（成功时就地更新宽高与字节数）。
+// - max_bytes/max_pixels: 两道预算（0 = 用缺省）。
+// - alc: 分配器（解码平面、重编码缓冲、新图都用它）。
+// 返回：
+// - 结果；ok = false 时 raw/info 未被改动，调用方按原样走拒绝路径。
+export fn imgz_shrink(raw: &Buf, info: &ImgInfo, max_bytes: usize,
+                      max_pixels: i64, alc: MallocAllocator) ImgzResult {
+    var res: ImgzResult = imgz_result_none();
+    res.before_bytes = raw.len;
+    res.width = info.width;
+    res.height = info.height;
+    if !imgz_can_shrink(info.kind) {
+        return res;              // 只认 JPEG
+    }
+    if raw.len == 0 || info.width <= 0 || info.height <= 0 {
+        return res;
+    }
+    // 像素超预算时「同尺寸重压」过不了像素那道，直接从 1/2 起
+    var scale: i32 = 1;
+    if imgz_pixels_over(info, max_pixels) {
+        scale = 2;
+    }
+    while scale <= IMGZ_MAX_SCALE {
+        const sc: i32 = scale;          // 循环变量按值传（移动检查不放过它）
+        var got: ImgzResult = imgz_try_scale(raw, info, sc, max_bytes,
+            max_pixels, get_allocator()[0]);
+        if got.ok {
+            got.before_bytes = res.before_bytes;
+            got.scale = scale;
+            return got;
+        }
+        scale = scale * 2;
+    }
+    return res;
+}
+
+// 以固定分母试一次：解码 → 下采样（scale > 1 时）→ 重编码 → 两道预算判定。
+// 成功时**就地**替换 raw 与 info。
+// 参数：
+// - raw/info: 原图（成功时被替换）。
+// - scale: 分母（1 = 只重压不缩放）。
+// - max_bytes/max_pixels: 预算。
+// - alc: 分配器。
+// 返回：
+// - 结果；ok = false 表示这一档不行（调用方试下一档）。
+fn imgz_try_scale(raw: &Buf, info: &const ImgInfo, scale: i32,
+                  max_bytes: usize, max_pixels: i64,
+                  alc: MallocAllocator) ImgzResult {
+    var res: ImgzResult = imgz_result_none();
+    var src: Image = imgz_blank_image();
+    if !imgz_ok(jpeg_decode(raw.ptr as &const u8, raw.len, alc, &src)) {
+        return res;
+    }
+    defer { image_free(&src); }
+    if scale > 1 {
+        const nw: i32 = imgz_scaled_dim(src.width, scale);
+        const nh: i32 = imgz_scaled_dim(src.height, scale);
+        var small: Image = imgz_downscale(&src, nw, nh,
+            get_allocator()[0]) catch {
+            return res;
+        };
+        defer { image_free(&small); }
+        if !imgz_recode(&small, raw, info, max_bytes, max_pixels,
+            get_allocator()[0]) {
+            return res;
+        }
+    } else {
+        // 同尺寸重压：直接用解码结果（不复制结构体）
+        if !imgz_recode(&src, raw, info, max_bytes, max_pixels, alc) {
+            return res;
+        }
+    }
+    res.ok = true;
+    res.after_bytes = info.bytes;
+    res.width = info.width;
+    res.height = info.height;
+    return res;
+}
+
+// 重编码 small 并做两道预算判定；通过且确实更小时**就地**替换 raw/info。
+// 参数：
+// - small: 下采样后的图（scale = 1 时就是原图）。
+// - raw/info: 待替换的原图与信息。
+// - max_bytes/max_pixels: 预算。
+// - alc: 分配器。
+// 返回：
+// - true = 已替换（info.bytes 是新的字节数）；false = 这档不行（raw/info 未动）。
+fn imgz_recode(small: &const Image, raw: &Buf, info: &ImgInfo,
+               max_bytes: usize, max_pixels: i64,
+               alc: MallocAllocator) bool {
+    const cap: usize = imgz_cap_for(small.width, small.height);
+    if cap == 0 {
+        return false;
+    }
+    const buf: &u8 = alc.alloc(cap) catch { return false; };
+    defer { alc.dealloc(buf as &byte); }
+    var n: usize = 0;
+    if !imgz_ok(jpeg_encode_q(small, IMGZ_QUALITY, buf, cap, alc, &n)) {
+        return false;
+    }
+    // 两道预算用**与调用方同一个判定函数**，口径不会漂
+    var probe: ImgInfo = ImgInfo{
+        kind: info.kind, width: small.width, height: small.height, bytes: n,
+    };
+    var why: Buf = buf_new(160);
+    defer { buf_free(&why); }
+    if imgx_check(&probe, max_bytes, max_pixels, &why) != IMGX_OK {
+        return false;
+    }
+    // 重压有可能反而更大（原图已经压得很狠）：那就别换
+    if n >= raw.len {
+        return false;
+    }
+    // 就地替换：先拷进新 Buf，全部成功后再换，避免半途失败留下坏数据
+    var fresh: Buf = buf_new(n + 16);
+    defer { buf_free(&fresh); }
+    if !buf_append(&fresh, buf as &const byte, n) {
+        return false;
+    }
+    buf_reset(raw);
+    if !buf_append(raw, fresh.ptr as &const byte, fresh.len) {
+        return false;
+    }
+    info.kind = probe.kind;
+    info.width = probe.width;
+    info.height = probe.height;
+    info.bytes = n;
+    return true;
+}
+
+// 盒式平均下采样到 nw x nh（每通道独立平均）。
+// 参数：
+// - src: 源图（灰度或 RGB）。
+// - nw/nh: 目标尺寸（>= 1）。
+// - alc: 分配器。
+// 返回：
+// - ok: 新图；error: 尺寸非法或分配失败。
+fn imgz_downscale(src: &const Image, nw: i32, nh: i32,
+                  alc: MallocAllocator) !Image {
+    var dst: Image = try image_new(nw, nh, src.channels, alc);
+    var dy: i32 = 0;
+    while dy < nh {
+        var dx: i32 = 0;
+        while dx < nw {
+            imgz_box_pixel(src, &dst, dx, dy);
+            dx = dx + 1;
+        }
+        dy = dy + 1;
+    }
+    return dst;
+}
+
+// 写一个下采样后的像素：把源图里映射到 (dx,dy) 的那一块取盒式平均。
+// 参数：
+// - src: 源图。
+// - dst: 目标图（就地写）。
+// - dx/dy: 目标坐标。
+// 返回：
+// - 无。源块按「目标尺寸 ↔ 源尺寸」的比例映射；越界按边缘复制
+//   （宽高不是倍数时最后一行/列会取到边缘）。
+fn imgz_box_pixel(src: &const Image, dst: &const Image, dx: i32,
+                  dy: i32) void {
+    const x0: i32 = (dx * src.width) / dst.width;
+    var x1: i32 = ((dx + 1) * src.width) / dst.width;
+    const y0: i32 = (dy * src.height) / dst.height;
+    var y1: i32 = ((dy + 1) * src.height) / dst.height;
+    if x1 <= x0 {
+        x1 = x0 + 1;
+    }
+    if y1 <= y0 {
+        y1 = y0 + 1;
+    }
+    var c: i32 = 0;
+    while c < src.channels {
+        var sum: i32 = 0;
+        var n: i32 = 0;
+        var sy: i32 = y0;
+        while sy < y1 {
+            var py: i32 = sy;
+            if py >= src.height {
+                py = src.height - 1;
+            }
+            var sx: i32 = x0;
+            while sx < x1 {
+                var px: i32 = sx;
+                if px >= src.width {
+                    px = src.width - 1;
+                }
+                const off: usize = (((py as usize) * (src.width as usize)
+                    + (px as usize)) * (src.channels as usize))
+                    + (c as usize);
+                sum = sum + (src.pixels[off] as i32);
+                n = n + 1;
+                sx = sx + 1;
+            }
+            sy = sy + 1;
+        }
+        var v: i32 = 128;
+        if n > 0 {
+            v = sum / n;
+        }
+        const doff: usize = (((dy as usize) * (dst.width as usize)
+            + (dx as usize)) * (dst.channels as usize)) + (c as usize);
+        dst.pixels[doff] = imgz_clip_u8(v);
+        c = c + 1;
+    }
+}
+
+// 夹到 0..255。
+fn imgz_clip_u8(v: i32) u8 {
+    if v < 0 {
+        return 0 as u8;
+    }
+    if v > 255 {
+        return 255 as u8;
+    }
+    return (v as! u8).value;
+}
