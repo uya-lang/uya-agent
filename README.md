@@ -52,12 +52,14 @@ make sess-selftest # 只跑 /sessions 与大日志 meta 那几轮
 make diff-selftest # 只跑 src/diff/
 make shell-selftest # 只跑 bash 工具的进程侧
 make panel-selftest # 只跑子代理面板
+make e2e-portable  # 可搬运性：拷一个二进制到「新机器」（空 HOME/无 DSH/无仓库）跑完整功能
 make codegen-audit # 扫构建产物：不许出现「切片描述符 → 字节指针」的强转（终端乱码源头）
 make doc-audit     # 扫文本文件：不许留 Git 冲突标记（合并残留）
 make probe         # 传输层探针：打真实 https 端点，期望 HTTP 401（不需要 key）
 # 离线 e2e（不需要网络）：e2e-permission / e2e-sandbox / e2e-tasks / e2e-goal / e2e-sessions /
 #   e2e-resume-big / e2e-diff / e2e-ws / e2e-model / e2e-worktree / e2e-exec / e2e-accept-nudge /
-#   e2e-config-flags / e2e-title* / e2e-api / e2e-steps / e2e-mouse / e2e-watch / e2e-watch-pick
+#   e2e-config-flags / e2e-title* / e2e-api / e2e-steps / e2e-mouse / e2e-watch / e2e-watch-pick /
+#   e2e-portable
 make e2e TASK="..." PIN=<leaf sha256> [STEPS=N]   # 真实调用（需要 DEEPSEEK_API_KEY）
 ```
 
@@ -70,6 +72,24 @@ file build/uya-agent                              # statically linked
 readelf -lW build/uya-agent | grep -c INTERP      # 0
 readelf -dW build/uya-agent | grep -c NEEDED      # 0
 ```
+
+**只拷一个二进制就能跑完整功能**（含 web 界面）。两件事为此专门做过（P73）：
+
+* **DSH 标准 preset 已内嵌**（`src/agent/assets/agent.cordis.yml`，编译期 `@embed`）。
+  没装 DSH 的机器上，persona 与 **plan 策略段**照常完整 —— 否则 plan 模式下写闸门
+  照旧硬拒 write/edit，而模型**收不到**「该调 `exit_plan_mode`」那段引导。
+  装了 DSH 时**一律以磁盘上那份为准**（内嵌只是「没装」的兜底）。
+  来源可证：`--print-config` 报 `knobs (source: preset | embedded | defaults)`。
+* **`--web` 的会话子进程继承父进程的命令行配置**（靠环境变量）：`--permission` /
+  `--workspace` / `--agent-home` / `--base-url` / `--model` / `--tls-verify` …
+  都会跟着进会话。以前它们一条都不传，症状是「服务端好好的、标签页里权限却变成
+  Full access」或「自建网关变成打 api.deepseek.com」。
+  少数**没有环境变量口径**的开关（`--plan` / `--no-dsh-config` / `--quiet` /
+  `--no-shell` / `--tool-lines` / `--no-save` / `--skill-dir` / `--no-stream` …）
+  不会传下去，`--web` 启动时会**逐条点名**，不静默。
+
+判据是 `make e2e-portable`：把二进制拷到空目录、`HOME` 也是空目录、**没有 DSH、
+没有仓库**，再断言上面两条。细节见 [DESIGN.md §16 踩坑 122](DESIGN.md)。
 
 为什么开关必须写在 Makefile 的**行内赋值**里、为什么命令行的 `LDFLAGS=-static` 不算数、
 为什么文档里的 `LINK_MODE=static` 无效 —— 见 [DESIGN.md §16 踩坑 90](DESIGN.md)。
@@ -151,7 +171,7 @@ readelf -lW build/uya-agent | grep -c INTERP    # 0 = 真静态
 | `--debug-dump FILE` | 诊断的**原始字节**（网关错误体 / 坏 payload 头部等）追加落盘；默认关：转录里只有转义预览，全文仍进会话日志 `diag/dump` |
 | `--tui` / `--no-tui` | 全屏 TUI（**TTY 交互模式默认**）/ 退回滚动转录；`UYA_AGENT_TUI=0\|1` 同口径 |
 | `--tui-demo [WxH]` | 打印 TUI 若干屏的纯文本快照后退出（诊断 + 文档；也是 markdown 排版与浮层全屏的自测基准） |
-| `--web [ADDR]` | **web 界面**：起一个本地 HTTP 服务，浏览器里用（默认 `127.0.0.1:8787`；`127.0.0.1:0` = 内核分配端口；`UYA_AGENT_WEB=1` / `UYA_AGENT_WEB_ADDR` 同口径）。每个会话是一个**真 PTY 上的 agent 子进程**，跑的就是全屏 TUI；见 §1.3 |
+| `--web [ADDR]` | **web 界面**：起一个本地 HTTP 服务，浏览器里用（默认 `127.0.0.1:8787`；`127.0.0.1:0` = 内核分配端口；`UYA_AGENT_WEB=1` / `UYA_AGENT_WEB_ADDR` 同口径）。每个会话是一个**真 PTY 上的 agent 子进程**，跑的就是全屏 TUI；见 §1.3。**会话继承父进程的命令行配置**（`--permission` / `--workspace` / `--agent-home` / `--base-url` / `--model` / `--tls-*` …）；少数没有环境变量口径的开关会由启动日志逐条点名 |
 | `--title` / `--no-title` | 交互模式把**终端标题**写成当前会话标题（**默认开**） |
 | `--title-auto` / `--no-title-auto` | 每个新的人类消息之后让**模型起标题**（**默认开**；每次多发一个小请求） |
 | `--mouse` / `--no-mouse` | TUI 的**鼠标上报**开关（**默认开**，滚轮要靠它）。`--no-mouse` 让终端重新接管拖选 ⇒ **能选中文字复制**（同时失去滚轮翻转录，改用 `ctrl+↑/↓` 或 `pgup/pgdn`）；运行中还有 `F2` 与 `/mouse on\|off` |

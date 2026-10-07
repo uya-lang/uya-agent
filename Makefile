@@ -8,6 +8,7 @@
 #   make probe      # 传输层探针（默认打 api.deepseek.com，期望 HTTP 401）
 #   make e2e-diff   # /diff：真 git 的改动列表 + 单列文本回退 + 非仓库报错（离线）
 #   make e2e-ws     # 工作区：恢复时跟随会话记录 + 日志不改挂 + 显式优先 + 记录目录被删（离线）
+#   make e2e-portable # 拷一个二进制到「新机器」（空 HOME/无 DSH/无仓库）还能跑完整功能（离线）
 #   make e2e-tasks  # /tasks：报告头 / 空态串 / open / toggle / 非法参数（离线）
 #   make e2e-goal   # /goal：看状态 / 创建 / 拒绝顶掉 / edit / pause / resume / clear（离线）
 #   make e2e-sessions  # /sessions 三列 / 最新的在最后一行 / 同 id 取最后一条 / id 完整（离线）
@@ -81,7 +82,7 @@ SRC := src/foundation/bufx.uya src/foundation/jsonx.uya src/foundation/yamlcfg.u
        src/selftest/selftest.uya src/selftest/shellselftest.uya src/selftest/sigselftest.uya src/selftest/tuiselftest.uya \
        src/selftest/st_core.uya src/selftest/st_mock_server.uya src/selftest/st_round_driver.uya src/selftest/st_tty_sse.uya src/selftest/st_sessions.uya src/selftest/st_read_window.uya src/selftest/st_view_watch.uya src/selftest/st_responses.uya src/selftest/st_stats_ctx.uya src/selftest/st_title.uya src/selftest/st_tasks_ws.uya src/selftest/st_goal_worktree.uya src/selftest/st_pm.uya src/selftest/st_pm2.uya src/selftest/st_mcp.uya \
        src/selftest/tuis_core.uya src/selftest/tuis_title_pty.uya src/selftest/tuis_exit_cmd.uya src/selftest/tuis_diff_scroll.uya src/selftest/tuis_title_ask.uya src/selftest/tuis_sessions_big.uya src/selftest/tuis_tail.uya \
-       src/selftest/st_web.uya \
+       src/selftest/st_web.uya src/selftest/st_web_childcfg.uya \
        src/diff/model.uya src/diff/gitcmd.uya src/diff/rows.uya src/diff/view.uya src/diff/render.uya
 OUT := build/uya-agent
 
@@ -93,7 +94,7 @@ TASK ?= 创建 hello.uya，编译并运行它
 export UYA_ROOT
 export UYA_SPLIT_C_DIR := $(CURDIR)/build/uyacache
 
-.PHONY: all check print-src build link-audit selftest codegen-audit doc-audit lint-size lint-size-all doc-cover probe e2e e2e-config e2e-exec e2e-accept-nudge e2e-config-flags e2e-title e2e-title-cmd e2e-title-auto e2e-mouse e2e-api e2e-steps e2e-permission e2e-sandbox e2e-tasks e2e-goal e2e-memory e2e-sessions e2e-resume-big e2e-diff e2e-ws e2e-model e2e-model-save e2e-model-route e2e-worktree e2e-watch e2e-watch-pick e2e-dsh p30-check tui-demo tui-selftest web-selftest sess-selftest diff-selftest model-selftest panel-selftest clean shell-selftest pm-selftest mcp-selftest
+.PHONY: all check print-src build link-audit selftest codegen-audit doc-audit lint-size lint-size-all doc-cover probe e2e e2e-config e2e-exec e2e-accept-nudge e2e-config-flags e2e-title e2e-title-cmd e2e-title-auto e2e-mouse e2e-api e2e-steps e2e-permission e2e-sandbox e2e-tasks e2e-goal e2e-memory e2e-sessions e2e-resume-big e2e-diff e2e-ws e2e-model e2e-model-save e2e-model-route e2e-worktree e2e-watch e2e-watch-pick e2e-dsh e2e-portable p30-check tui-demo tui-selftest web-selftest sess-selftest diff-selftest model-selftest panel-selftest clean shell-selftest pm-selftest mcp-selftest
 
 all: build
 
@@ -197,7 +198,7 @@ lint-size-all:
 #   本仓实测：90 文件树上净增 50 个函数 + `rm -rf build && make build` → 通过（静态链接审计通过）。
 #   因此「净增函数按 0 处理」那条纪律作废。这段留下的用处只有一个：**换/降编译器时认得出症状**
 #   （报错点落在标准库、`make check` 全绿、只有清缓存重编才炸）。
-selftest: build codegen-audit doc-audit doc-cover e2e-exec e2e-accept-nudge e2e-config-flags e2e-title e2e-title-cmd e2e-title-auto e2e-mouse e2e-api e2e-steps e2e-permission e2e-sandbox e2e-tasks e2e-goal e2e-memory e2e-sessions e2e-resume-big e2e-diff e2e-ws e2e-model e2e-model-save e2e-model-route e2e-worktree p30-check
+selftest: build codegen-audit doc-audit doc-cover e2e-exec e2e-accept-nudge e2e-config-flags e2e-title e2e-title-cmd e2e-title-auto e2e-mouse e2e-api e2e-steps e2e-permission e2e-sandbox e2e-tasks e2e-goal e2e-memory e2e-sessions e2e-resume-big e2e-diff e2e-ws e2e-model e2e-model-save e2e-model-route e2e-worktree e2e-portable p30-check
 	UYA_BIN=$(UYA) $(OUT) --selftest
 
 probe: build
@@ -578,6 +579,97 @@ e2e-worktree: build
 #   ④ 记录的工作区被删（worktree 合并后就删是常态）→ 留在当前工作区 + 留话 + 记一条 fallback。
 # 会话日志用 python3 手写（格式与 sess_open 逐字节一致）：这一轮**不联网、不用模型**。
 # 两个工作区都用**绝对**路径：切换是真的 chdir，相对路径会被带到新工作区下面去。
+# P73：可搬运性 —— 「把 build/uya-agent 拷到别的机器上还能跑完整功能（含 web）」。
+# 这一轮把那个说法做成机器判据：**空 HOME + 无 DSH + 无仓库**（真新机器的样子），
+# 只带一个二进制。
+#
+# 两条腿，都是本轮修掉的静默降级：
+#   ① **plan 策略段**：以前只在磁盘上的 DSH preset 里，没装 DSH 时整段消失，而写闸门
+#      照样硬拒 write/edit（模型被挡住写、又没被告知该调 exit_plan_mode）。现在有
+#      编译期内嵌快照兜底 ⇒ 假网关收到的请求里必须出现只在那个文件里才有的句子。
+#      判据串在工作树与编译器树里 **0 命中**，所以它不可能假绿。
+#   ② **web 会话子进程的配置**：子进程是 fork+execve 出来的、argv 只带 `--tui`，
+#      父进程从命令行拿到的配置以前一个都没传 ⇒ 权限被悄悄放宽成 Full access、
+#      自建网关被换成默认端点。现在按环境变量注入 ⇒ 会话必须走父进程给的网关，
+#      且日志落在父进程给的 --agent-home 下。
+# 反向断言（不许夺权）：磁盘上真有 preset 时，**磁盘赢**（内嵌只是「没装」的兜底）。
+# 全程离线：假网关在 127.0.0.1，--print-config 不联网。
+e2e-portable: build
+	@set -e; \
+	root=$$(pwd); \
+	ws=/tmp/e2e_portable_$$$$; home=$$ws/home; newbin=$$ws/bin; \
+	gwlog=$$ws/gw.log; req=$$ws/req.bin; \
+	rm -rf $$ws; mkdir -p $$home $$newbin; \
+	cleanup() { kill $$gwp 2>/dev/null || true; rm -rf $$ws; }; \
+	trap cleanup EXIT; \
+	: "新机器：只拷一个二进制过去，HOME 是个空目录"; \
+	cp $(CURDIR)/$(OUT) $$newbin/uya-agent; \
+	python3 testdata/mock_gateway_portable.py 0 $$req > $$gwlog 2>&1 & \
+	gwp=$$!; \
+	sleep 0.5; \
+	port=$$(awk '/^PORT/{print $$2}' $$gwlog); \
+	if [ -z "$$port" ]; then echo "FAIL: 假网关没起来"; cat $$gwlog; exit 1; fi; \
+	: "---- ① 内嵌 preset 兜底：没装 DSH 也要有完整的 plan 段 ----"; \
+	out=$$(env -u UYA_AGENT_DSH_ROOT HOME=$$home $$newbin/uya-agent --no-dsh-config --print-config 2>&1); \
+	echo "$$out" | grep -q "knobs (source: embedded)" \
+		|| { echo "FAIL: 没装 DSH 时旋钮来源应当是 embedded"; echo "$$out" | grep knobs; exit 1; }; \
+	: "旋钮值必须与内置缺省逐字节相同（内嵌只是换来源，不改值）"; \
+	echo "$$out" | grep -q "readLimit=2000 readMaxBytes=51200 readMaxLine=2000" \
+		|| { echo "FAIL: 内嵌来源下 read 旋钮不是缺省值"; exit 1; }; \
+	echo "$$out" | grep -q "prune=8192/4096/1024/0/0 glob=100 grep=250/2000" \
+		|| { echo "FAIL: 内嵌来源下剪枝/搜索旋钮不是缺省值"; exit 1; }; \
+	: "跑一轮 plan：请求里必须有只存在于上游 preset 里的那句"; \
+	env -u UYA_AGENT_DSH_ROOT HOME=$$home UYA_AGENT_API_KEY=k \
+		$$newbin/uya-agent --no-dsh-config --plan --api=chat --model portable-m \
+		--base-url "http://127.0.0.1:$$port/v1" --workspace $$ws --agent-home $$home \
+		--max-steps 1 --quiet "plan something" >/dev/null 2>&1 || true; \
+	sleep 0.5; \
+	if [ ! -s $$req ]; then echo "FAIL: 假网关没收到请求（内嵌 preset 那一轮没跑起来）"; exit 1; fi; \
+	grep -q "Make the plan decision-complete" $$req \
+		|| { echo "FAIL: 没装 DSH 时 plan 策略段缺失（内嵌兜底没生效）"; exit 1; }; \
+	grep -q "Stay in plan mode" $$req \
+		|| { echo "FAIL: plan 段不在请求里"; exit 1; }; \
+	: "---- 反向断言：磁盘上有 preset 时磁盘赢 ----"; \
+	out=$$(env -u UYA_AGENT_DSH_ROOT HOME=$$home $$newbin/uya-agent \
+		--dsh-root testdata/preset-root --print-config 2>&1); \
+	echo "$$out" | grep -q "knobs (source: preset)" \
+		|| { echo "FAIL: 磁盘上有 preset 时来源应当是 preset（内嵌不许夺权）"; exit 1; }; \
+	echo "$$out" | grep -q "readLimit=1777" \
+		|| { echo "FAIL: 磁盘预设的旋钮没生效（被内嵌顶掉了）"; exit 1; }; \
+	: "---- ② web 会话子进程拿到父进程的命令行配置 ----"; \
+	rm -f $$req; webhome=$$ws/agenthome; mkdir -p $$webhome; \
+	setsid env -u UYA_AGENT_DSH_ROOT -u UYA_AGENT_BASE_URL -u UYA_AGENT_MODEL \
+		HOME=$$home UYA_AGENT_API_KEY=k \
+		$$newbin/uya-agent --no-dsh-config --web 127.0.0.1:0 --workspace $$ws \
+		--agent-home $$webhome --api=chat --model portable-child \
+		--permission read-only --base-url "http://127.0.0.1:$$port/v1" \
+		> $$ws/web.log 2>&1 < /dev/null & \
+	wpid=$$!; \
+	sleep 2; \
+	wport=$$(sed -n 's/.*http:\/\/127\.0\.0\.1:\([0-9]*\)\/.*/\1/p' $$ws/web.log | head -1); \
+	if [ -z "$$wport" ]; then echo "FAIL: --web 没起来"; cat $$ws/web.log; exit 1; fi; \
+	sid=$$(curl -s -X POST "http://127.0.0.1:$$wport/api/sessions" \
+		| sed 's/.*"id":"\([^"]*\)".*/\1/'); \
+	[ -n "$$sid" ] || { echo "FAIL: 建不了 web 会话"; exit 1; }; \
+	sleep 1; \
+	printf 'hello\r' > $$ws/keys.bin; \
+	curl -s -X POST --data-binary @$$ws/keys.bin \
+		"http://127.0.0.1:$$wport/api/input?id=$$sid" >/dev/null; \
+	sleep 3; \
+	kill $$wpid 2>/dev/null || true; \
+	if [ ! -s $$req ]; then \
+		echo "FAIL: web 会话没走父进程给的网关（子进程丢配置 / 权限被放宽）"; \
+		cat $$ws/web.log; exit 1; \
+	fi; \
+	grep -q '"model":"portable-child"\|"model": *"portable-child"' $$req \
+		|| { echo "FAIL: web 会话子进程没用父进程给的 --model"; exit 1; }; \
+	logs=$$(find $$webhome -name session.jsonl 2>/dev/null | wc -l); \
+	[ "$$logs" -ge 1 ] \
+		|| { echo "FAIL: web 会话日志没落在 --agent-home 下（子进程用了默认 home）"; exit 1; }; \
+	grep -q "不会.*传进会话子进程" $$ws/web.log \
+		|| { echo "FAIL: 没有把「不传的开关」说出来（--no-dsh-config 应当被点名）"; exit 1; }; \
+	echo "e2e-portable: 通过（空 HOME/无 DSH/无仓库：内嵌 preset 兜底 + plan 段在 + 磁盘优先 + web 子进程继承父配置与权限）"
+
 e2e-ws: build
 	@set -e; \
 	root=$$(pwd); ws=$$root/build/selftest_p31_e2e; home=$$ws/home; a=$$ws/a; b=$$ws/b; c=$$ws/c; \

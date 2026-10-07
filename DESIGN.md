@@ -627,10 +627,30 @@ malloc(LLM_EVENT_ARENA) + arena_init
 
 | order | 节 | 来源 | 何时出现 |
 |---|---|---|---|
-| 0 | persona | DSH preset（`agent.cordis.yml` 的 persona 行）；读不到用 DSH 标准 preset 的内置默认值（逐字） | 总是 |
+| 0 | persona | preset 的 persona 行（见下面三级来源）；读不到用内置默认值（逐字） | 总是 |
 | 50 | plan 策略 | preset 的 `plan-mode.section`，否则内置 | **仅 plan 模式激活时** |
 | 100–106 | 工具引导（`SEC_READ`/`SEC_WRITE`/`SEC_EDIT`/`SEC_GLOB`/`SEC_GREP`/`SEC_BASH`/`SEC_JOBS`） | 本仓常量；read/bash 两条与 DSH 原文一致，其余为等价精简表述 | `SEC_BASH`/`SEC_JOBS` **仅 `allow_shell` 时** |
 | 107 | 收工纪律（`SEC_FINISH`） | 本仓常量（DSH 没有） | 总是 |
+
+**preset 的「三级来源」**（P73）—— persona 与 plan 段都从它取：
+
+| 级 | 来源 | 何时 | `--print-config` 报 |
+|---|---|---|---|
+| ① | **磁盘**上的 `agent.cordis.yml`（`--dsh-root` > `$UYA_AGENT_DSH_ROOT` > 常见 npm 全局路径） | 装了就听它的（用户的权不被夺） | `knobs (source: preset)` |
+| ② | **编译期内嵌**快照（`prompt.uya` 的 `EMBEDDED_PRESET`，`@embed` 进来的同一份上游文件） | 这台机器**没装 DSH** | `knobs (source: embedded)` |
+| ③ | 内置缺省（`DEFAULT_PERSONA`） | 两级都失败（正常编译下到不了） | `knobs (source: defaults)` |
+
+为什么必须有②：plan 策略段**只**在上游那份 preset 里，没有兜底时「拷到别的机器」
+会让它**整段消失**（实测 system 4469 B → 2132 B），而写闸门（§7）照样硬拒 write/edit ——
+模型被挡住写、又没被告知该调 `exit_plan_mode`。见 §16 踩坑 122。
+
+为什么内嵌**整份**而不是只抄 plan 段那句：旋钮（`maxBytes` / pruner 的 8192/4096/1024 /
+`timeoutMs` …）与 persona 都在同一个文件里，只抄一段等于把上游其余部分**冻在代码里**，
+两条来源就分叉了。整份内嵌让「内嵌 = 上游的一个快照」，只有一处要跟着上游更新
+（`src/agent/assets/agent.cordis.yml`，**改了要重编**）。
+
+**persona 默认文案**（`prompt.uya:35`）：
+`"You are a coding agent powered by the {{model}} model. Your working directory is {{cwd}}."`
 
 **Uya 语言速查表**（P63 起**不在**上表里）：它曾经是本项目的补充节，每轮无条件追加在
 system 末尾（原文案 467 B）。那段文字只在「模型要写 / 改 Uya 源码」那一步有用，其余回合
@@ -2171,6 +2191,33 @@ bash / node / python 峰值可达 GB 级，不算进来是刻意的）。
 父进程若是通过 `UYA_AGENT_WEB=1` 起的，那个变量会被子进程**继承** ⇒ 子进程会再起一个
 web 服务器（递归），而不是跑 TUI。实测症状：子进程 fork 出来后立刻退出，页面上一条
 会话都没有帧。
+
+**子进程的配置靠环境变量传**（P73，`web_child_env_cfg`）。argv 只带 `--tui`，而
+**命令行给的东西不进环境** ⇒ 以前父进程的 CLI 配置一条都传不下去。实测后果（都是
+静默的，屏幕上只有一句「请求失败」）：
+
+| 父进程给的 | 子进程实际用的 | 危害 |
+|---|---|---|
+| `--permission read-only` | `Full access` | **权限被悄悄放宽**（最坏的一条） |
+| `--base-url 自建网关` | `api.deepseek.com` | 整轮打不通，页面上报「请求失败（网络或 TLS 校验）」 |
+| `--workspace DIR` | 子进程的 cwd | 读写落在错的目录 |
+| `--agent-home DIR` | 默认 `~/.uya-agent` | 「同一个 home 下找不到这条会话」 |
+| `--tls-verify=pin` | `chain` | 子进程一律校验失败 |
+
+两条纪律（`websrv.uya` 的 `web_child_env_cfg`）：
+
+* **只在非默认时注入**。父进程什么都没给时不写 —— 否则把默认值钉死在环境里，
+  挡住子进程自己去读 `settings.yaml`（那是它的合法来源）。
+* **必须用 `env_set_kv`（覆盖语义）**，不能用 `env_add_kv`。环境数组是先继承父进程的
+  整份环境再补项的，而 `getenv` 取**先命中的**那个 ——追加的同名项永远读不到。
+  实测症状：注入了 `UYA_AGENT_PERMISSION=read-only`，子进程屏幕上还是 `Full access`。
+
+**没有 env 口径的开关不传，但要**说出来**：`--plan` / `--no-dsh-config` / `--quiet` /
+`--no-shell` / `--tool-lines` / `--no-save` / `--skill-dir` / `--no-stream` /
+`--compat-fold` / `--dry-run` 这几条**没有**环境变量对应（`--plan` 实测确认过），
+所以 `--web` 启动时由 `web_warn_unpropagated` 逐条点名。为什么不为它们新造 env：
+那会把配置面扩成两套，并与「CLI > env > settings」的既有优先级语义打架
+（与踩坑 118/120 同族：**静默是缺陷**，说不出来就先报出来）。
 
 **画布尺寸由页面报、服务端夹**（新建会话的握手，见踩坑 117）：前端 `+` 时把
 `measure()` 量到的格子数拼进 `POST /api/sessions?cols=&rows=`，服务端过
@@ -4116,6 +4163,42 @@ responses 用 `{"type":"input_image","detail":"auto","image_url":…}`；
      改成「夹具里的 flow 节**已经就是**要写的那两个值」之后，判据一停，追加就会真的写下去，
      腿立刻红 2 条。
 
+122. **功能由「这台机器上有没有那个文件」决定 ⇒ 拷到别的机器上静默降级**（P73，用户报的
+     「复制到其他机器上就能直接跑完整功能，包括 web」）：两处同族的坑，都是**没有报错**
+     的那种坏法。
+
+     **① plan 策略段整段消失。** 它只在上游 DSH preset（`agent.cordis.yml` 的
+     `plan-mode.section`）里，而那一节要**从磁盘读**。实测同一个二进制、同一个 `--plan`，
+     只改「能不能找到 DSH 安装」：system prompt **4469 B → 2132 B**，plan 段一个字节都不剩。
+     最坏的搭配是：写闸门（§7 P26）是**编译进二进制**的、照样硬拒 write/edit ——
+     于是模型被挡住写、又没被告知该调 `exit_plan_mode`，现场只剩「它怎么不干活」。
+     顺带查出的孪生 bug：`preset_path()` 的 HOME 兜底用 `buf_append_cstr` 拼候选路径后
+     **直接喂 `sys_open`** —— 它**不补 NUL**（踩坑 2 的原话），`buf_new` 也不清零，于是
+     路径尾巴粘上那块内存里的残留字节。实测：**同一个二进制**，`cwd=/tmp` 读得到 preset、
+     `cwd` 是个长路径就读不到（strace 里它去
+     `open("…/@deepseek-ai/dsh-6e03-496b-9881-81544214")`，尾巴正是 cwd 的残留）。
+     修法：整份上游 preset 用 `@embed` 进二进制做**第二级来源**（磁盘 → 内嵌 → 内置缺省），
+     外加路径判定前补 NUL。
+
+     **② web 会话子进程丢掉父进程的整份命令行配置。** 会话子进程是 fork + execve 出来的，
+     argv **只带 `--tui`**，而**命令行给的东西不进环境** —— 于是父进程 `--permission
+     read-only`，浏览器里那个标签页是 `Full access`；父进程 `--base-url` 指自建网关，
+     子进程去打 `api.deepseek.com`（页面上只有一句「请求失败（网络或 TLS 校验）」）；
+     会话日志落到默认 home（`--agent-home` 白给）。**权限被悄悄放宽**是其中最坏的一条。
+     修法：spawn 前把父进程**已生效**的值注入子进程环境。
+
+     教训：**「装在哪、从哪读」这类前提，一旦由运行时的机器状态决定，就要问「这台机器上
+     没有它时会怎样」** —— 而答案不能是「静默少一段」。与踩坑 118/120 同族（静默是缺陷），
+     与踩坑 108 也有亲缘（都是「换个环境就变样」）。本轮把这条做成了机器判据：
+     `make e2e-portable` 在 `$HOME` 是空目录、没有 DSH、没有仓库的「新机器」上跑，
+     并且**判据串只存在于上游 preset 里**（全仓与编译器树 0 命中）⇒ 它不可能假绿。
+
+     两个实现细节值钱（都是实测撞出来的）：**a)** 注入必须用「覆盖」语义而不是「追加」——
+     环境数组是先继承父进程整份环境再补项的，而 `getenv` 取**先命中的**那个，追加的同名项
+     永远读不到（症状：明明注入了 `UYA_AGENT_PERMISSION=read-only`，屏幕上还是
+     `Full access`）；**b)** 只在父进程**非默认**时注入，否则把默认值钉死在环境里，
+     挡住子进程自己去读 `settings.yaml`（那是它的合法来源）。
+
 ---
 
 ## 17. 工具实现要点
@@ -4387,6 +4470,8 @@ DEEPSEEK_API_KEY=sk-xxx ./build/uya-agent \
 | `web-size` | 新建会话的**尺寸握手**（踩坑 117）：真 fork 三条会话，断三条 —— ① 报 150×40 ⇒ 会话记 150×40 **且 PTY 窗口也是**（钉「尺寸真的到了子进程那侧」）② 不报（0/0）⇒ 默认画布 ③ 报超上限 ⇒ 夹到 `EMU_MAX_*` **且与网格 `emu.cols/rows` 一致**。防假绿对照：`web_session_new` 忽略参数 ⇒ 当场红三条（含 PTY 那条） |
 | `web-exit` | 子进程退出后**收摊还是留标签**（踩坑 115）：真 fork + 真 PTY 两条腿 —— ① **正常退出**（exit 0 = `/exit` / ctrl+d / 面板选中 `/exit`）⇒ `close_wanted` 置位、`web_sweep_closed` 之后表里没有它、订阅它的长连接被关掉**且管道里有分块终止块 `0\r\n\r\n`**（前端靠干净 EOF 把「会话结束」与「连接坏了」分开）、最后一帧不丢；② **被 SIGKILL** ⇒ 不置位、表里仍在（留标签看最后一帧）。防假绿对照：把「正常退出才置位」改回「一律不置位」⇒ 当场红四条 |
 | `web-listen` | 监听套接字的 `SO_REUSEADDR`（踩坑 118）：走**生产代码** `srv_listen` 两条腿 —— ① 选项 `getsockopt` 真读得回来（== 1）；② 真复现用户现场：起监听 → 连一条 → **服务端先关**（本侧留 `TIME_WAIT`，本地端口正是监听端口）→ 关监听 → **立刻**用同一端口重新 `srv_listen` ⇒ 必须成功。防假绿对照：把两条常量改回 BSD 的 `0xFFFF` / `0x0004` ⇒ 两条腿都红（用户报的「ctrl+c 之后 web 监听失败」） |
+| `web-childcfg` | P73：会话子进程的环境继承（踩坑 122 ②）。走**生产代码** `web_child_env`，判据看它排好的**环境数组**（`sh_env_array()`，不是 `getenv` —— 那读的是本进程真环境、看不见刚排好的表）：① 父进程给了非默认值时，14 条（权限/沙箱/端点/模型/凭据/档位/信任策略/指纹/工作区/home/max-steps/no-title/no-mouse/no-mcp）**逐条同名同值**；② 父进程没给（出厂默认）时那几条**不许注入**（否则把默认值钉死、挡住子进程读 `settings.yaml`）；③ `UYA_AGENT_WEB` 恒为 0（漏了它子进程递归起 web，踩坑 103）。**权限排第一**：它曾经被悄悄放宽成 `Full access`。防假绿对照：把 `web_child_env_cfg(cfg)` 换成 `_ = cfg;` 重编 ⇒ 当场红 10 条 |
+| `e2e-portable` | `make e2e-portable`（P73，踩坑 122）：把 `build/uya-agent` **拷到一个空目录**、`HOME` 也是空目录、**没有 DSH、没有仓库**（真新机器的样子），只带一个二进制。① 内嵌 preset 兜底：`--print-config` 报 `knobs (source: embedded)` 且旋钮值 == 内置缺省（逐字节）；跑一轮 `--plan` ⇒ 假网关收到的请求里必须有 `Make the plan decision-complete`（**该串只存在于上游 preset**，工作树与编译器树 0 命中 ⇒ 判据不可能假绿）；② **反向断言**：`--dsh-root testdata/preset-root` 时必须是 `source: preset` + `readLimit=1777`（内嵌不许夺磁盘的权）；③ web 会话子进程：只走命令行给 `--base-url/--model/--permission read-only/--agent-home`，断言假网关**收到**请求、请求里的模型是父进程给的那个、会话日志落在 `--agent-home` 下；④ `--no-dsh-config` 这类没有 env 口径的开关必须被启动日志点名。防假绿对照（两条都做过）：把内嵌兜底改成恒 `false` ⇒ 红在①；只停 plan 段的抽取（来源/旋钮照旧）⇒ 红在「plan 策略段缺失」；摘掉 `web_child_env_cfg(cfg)` ⇒ 红在③ |
 | `tui-full` | P53 浮层全屏四组：**A** 非全屏仍是居中框（不顶格、`≤16` 行上限、第 30 项看不见）→ 全屏框 = 转录区（顶边第 0 行、左右边框 0 与 `cols-1`、标题 ` · 全屏`、行偏移表口径的逐行闭合、底边**正好**在 `panel_top-1`）+ 16 行上限解除（第 20 项可见、第 30 项仍不可见）；**B** `ctrl+f`（`0x06`）与 `F11`（`ESC[23~`）都切换，且**四种形态各认一次**（列表 / reader / ask / input）；**C** 不吃面板 / 状态区 / 脚注；**D** 没浮层时只落 notice、全屏态不跨浮层残留、`esc` 关掉后转录回来，终端太矮时 fail-closed 判据不变；**F** `/fullscreen` 四态（裸报状态 / `on` / `off` / 非法值只报错且状态不动、重复 `off` 幂等） |
 | `overlay-fullscreen` | `make p30-check` 第 9 场（真终端 + 假网关）：屏幕几何判据 —— 非全屏顶边 > 0 行且左边框 > 0 列 → `ctrl+f` 后顶边第 0 行、左右边框正好 `0` 与 `cols-1`、标题带 ` · 全屏`、面板与脚注都还在、底边行 < 面板行 → `F11` 关回居中 → 再全屏、`esc` 关掉后方框消失 |
 | `tasks-ctrl-t` | `make p30-check` 第 10 场（踩坑 114，真终端 + 假网关 `todo_first=1`）：回合**运行中**按 `ctrl+t` → `┌─ tasks ` ≤1.5 s 上屏**且那一刻 `SELFTEST_OK` 还没到** → 再按一次收回折叠行（实测 101 ms） |
