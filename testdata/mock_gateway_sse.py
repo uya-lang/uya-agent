@@ -20,6 +20,10 @@
     TOOL_CMD      非空时：第一次请求回一个 bash 工具调用（命令就是它），第二次请求
                   才回普通答案（默认 "" = 从不发 tool_calls）。用来造「长时间 bash」
                   与「有工具结果的历史」（压缩需要 shadow > 0）
+    TODO_FIRST    非 0 时：第一次请求回一个 `todo_write` 工具调用（三条清单，与
+                   `agent_tasks_fixture_demo` 同形），于是**常驻任务块的常驻行会真的
+                  出现**，之后的步骤才有可展开的内容（踩坑 114 的 PTY 腿要用它：
+                   四张表全空时 ctrl+t 只能落 notice，展开不出箱体）。
 
 行为：
   * 每次请求都是一段 chat/completions 的 SSE 流：先 reasoning_content（几帧，中间按
@@ -37,6 +41,7 @@ STEPS = int(sys.argv[2]) if len(sys.argv) > 2 else 1
 GAP_MS = int(sys.argv[3]) if len(sys.argv) > 3 else 3000
 HEAD_DELAY_MS = int(sys.argv[4]) if len(sys.argv) > 4 else 0
 TOOL_CMD = sys.argv[5] if len(sys.argv) > 5 else ""
+TODO_FIRST = int(sys.argv[6]) if len(sys.argv) > 6 else 0
 
 REQS = []
 HEADS = []
@@ -91,6 +96,25 @@ def handle(conn):
 
         base = {"id": "chatcmpl-p30", "object": "chat.completion.chunk",
                 "created": 0, "model": "p30-mock"}
+        if TODO_FIRST and b'"role":"tool"' not in body:
+            # 踩坑 114：第一次请求先要一个 `todo_write` 工具调用 —— 于是常驻任务块的
+            # 折叠行**真的**出现在屏幕上，后面的 ctrl+t 才有东西可展开。
+            # 三条清单与 `agent_tasks_fixture_demo` 同形（一条 completed / 一条
+            # in_progress / 一条 pending），判据认的是折叠行里的计数与箱体标题。
+            todos = [{"content": "在真 PTY 里按 ctrl+t", "status": "in_progress"},
+                     {"content": "钉住三条静默路", "status": "completed"},
+                     {"content": "补一段文档", "status": "pending"}]
+            tc = [{"index": 0, "id": "call_1", "type": "function",
+                   "function": {"name": "todo_write",
+                                "arguments": json.dumps({"todos": todos}, ensure_ascii=False)}}]
+            chunk(sse(dict(base, choices=[{"index": 0, "delta": {"role": "assistant",
+                                                                "tool_calls": tc}}])))
+            chunk(sse(dict(base, choices=[{"index": 0, "delta": {}, "finish_reason": "tool_calls"}])))
+            chunk(sse(dict(base, choices=[], usage={"prompt_tokens": 11, "completion_tokens": 7,
+                                                  "total_tokens": 18})))
+            chunk(b"data: [DONE]\n\n")
+            conn.sendall(b"0\r\n\r\n")
+            return
         if TOOL_CMD and b'"role":"tool"' not in body:
             # P31：第一次请求先要一个 bash 工具调用（用来造长 bash / 造出可压缩的历史）
             tc = [{"index": 0, "id": "call_1", "type": "function",
