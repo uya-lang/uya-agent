@@ -312,6 +312,66 @@ uya-agent --list-plugins
 `--no-mcp`（或 `UYA_AGENT_MCP=0`）完全不读不连插件；一份 server 都没配时，
 工具表与没这个功能时**逐字节相同**。
 
+#### 接本机 aigw（ai-gateway）的 MCP
+
+aigw 自己就是 MCP server（`aigw mcp-serve`：11 个查询工具；令牌 scope 是
+`admin_read`/`admin` 时另有 3 个后台入口）。有一个**必须知道**的坑：它读的
+是**它自己那份** `config.yaml`，而那里 `database.path` 多半是相对路径
+（`./data/aigw.db`）—— 所以要么把子进程的 cwd 定在 aigw 部署根，要么用
+`GW_DATABASE_PATH` 给绝对路径。两样都没有时，它会按**当前工作区**去开库，
+于是报 `account not found`（或建出一个空库、一个工具都登记不上），
+而症状只是「配了 server 却没有工具」。
+
+```bash
+# ① CLI：用 GW_DATABASE_PATH 钉住（--mcp-server 没有 cwd 语法）。
+#    K=V 形状的 token 归 env，所以直接写在 SPEC 末尾即可。
+uya-agent --mcp-server "aigw=/media/winger/_dde_data/aigw/bin/aigw mcp-serve \
+--config /media/winger/_dde_data/aigw/config.yaml --account local \
+GW_DATABASE_PATH=/media/winger/_dde_data/aigw/data/aigw.db"
+
+# ② settings.yaml：用 cwd 指向 aigw 部署根（推荐；配置里不带环境变量）
+#   uya-agent:
+#     mcp:
+#       aigw:
+#         transport: stdio
+#         command: /media/winger/_dde_data/aigw/bin/aigw
+#         args: [mcp-serve, --config, /media/winger/_dde_data/aigw/config.yaml,
+#                --account, local]
+#         cwd: /media/winger/_dde_data/aigw
+
+# ③ 转发到运行中的网关（走令牌，scope 决定工具面：query 只有 11 个查询工具，
+#    admin_read/admin 另有 3 个后台入口）。令牌用「配置里的 env」交给子进程 ——
+#    父进程的环境**不会**继承进去（MCP server 是第三方进程，只给白名单
+#    HOME/LOGNAME/PATH/SHELL/TERM/USER + 配置显式给的 env）。
+uya-agent --mcp-server "aigw=/media/winger/_dde_data/aigw/bin/aigw mcp-serve \
+--endpoint http://127.0.0.1:8088/mcp --token-env GW_MCP_TOKEN \
+GW_MCP_TOKEN=aigw_mcp_xxx"
+
+uya-agent --list-plugins      # 核对：`aigw: 11 tool(s)`
+```
+
+③ 也可以走 settings.yaml（令牌不落在命令行上，推荐）：
+
+```yaml
+# uya-agent:
+#   mcp:
+#     aigw:
+#       transport: stdio
+#       command: /media/winger/_dde_data/aigw/bin/aigw
+#       args: [mcp-serve, --endpoint, http://127.0.0.1:8088/mcp,
+#              --token-env, GW_MCP_TOKEN]
+#       env: {GW_MCP_TOKEN: "aigw_mcp_xxx"}
+```
+
+`--account <name>` 是**本地 stdio 模式**：本机信任、不走令牌，只给 11 个只读
+工具（账户名可在控制台看，或 `sqlite3 <db> "select name from accounts"`）。
+要用后台工具就用 ③ 的转发模式配一个 scope 够的令牌 —— 令牌明文只在创建时
+出现一次，别写进仓库里的配置文件。
+
+接上以后，模型侧的工具名是 `mcp__aigw__get_balance`、
+`mcp__aigw__get_dashboard`、`mcp__aigw__list_requests` 这类
+（`mcp__<serverName>__<原名>`，同一个 server 在 DSH 里也这么叫）。
+
 ---
 
 ## 3. 自测与验收
