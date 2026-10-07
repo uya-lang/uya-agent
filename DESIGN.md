@@ -4116,6 +4116,33 @@ responses 用 `{"type":"input_image","detail":"auto","image_url":…}`；
      改成「夹具里的 flow 节**已经就是**要写的那两个值」之后，判据一停，追加就会真的写下去，
      腿立刻红 2 条。
 
+122. **`p[a: k]` 第三次咬人：这次咬在 MCP 的 env 上，症状是「配了 server 却 0 个工具」**
+     （本轮，用户问「怎么接 aigw 的 MCP」时现场查出来的）：
+     用户按 README 的 `--mcp-server "name=command args…"` 形状接本机 aigw，
+     `--list-plugins` 却报 `aigw: no tools (MCP server exited or closed the pipe)`。
+     链路是三层叠出来的：
+     ① `mcpcfg.uya` 的 `mcp_cfg_cli_one` 把 `K=V` token 归到 env 时写的是
+     `line[as0: k]` —— 第二个参数是**从 as0 起的字节数**（踩坑 51/54 那条语义），
+     而 `k` 是 token 的**终点下标**，于是每个 env token 都从自己的首字节起多读
+     `as0` 字节：越过后面的参数，最后越到堆尾的脏字节；
+     ② 多读的尾巴里恰好混进堆尾残留（现场是 `\276\255\336`），子进程拿到的 env 变成
+     `GW_DATABASE_PATH=/…/aigw.db\276\255\336`；
+     ③ aigw 于是按这个名字**新建了一个乱码文件名的库**（现场在部署目录里真出现了
+     `aigw.db\276\255\336`），里面没有账户 ⇒ `account not found` ⇒ 握手失败。
+     为什么难查：`command` 路径长 + `K=V` 值长才露头（`as0` 要够大才读得出界，短 spec
+     读到的是同一行的其他参数，反而「看着像对的」）；而 `--list-plugins` 只给一句
+     「exited or closed the pipe」，真正的原因（子进程的 stderr）不在这一行里。
+     修法：`line[as0: k - as0]`（与 `yamlcfg.uya` 的 `seg.ptr[a: b - a]` 同一写法）。
+     自测补一条**判据换形状**的腿：旧断言 `bufx_contains(env, "FOO=bar")` 抓不住它
+     —— 多读的字节接在 `FOO=bar` **后面**，子串照样命中、腿照样绿。新腿按**长度**
+     钉（env 恰好 7 字节且逐字节相等），并故意在前面放长命令路径把 `as0` 撑大。
+     防假绿对照：把 `k - as0` 改回 `k` 重编 ⇒ `mcp-cfg` 当场红
+     （`env 长度不是 7（多读了字节…）`）。
+
+     教训：**「子串命中」不是「值正确」** —— 断言一个缓冲的内容时，
+     能被「尾巴上多挂东西」骗过的判据等于没判据（与踩坑 121 同族：判据得能证伪）。
+     同族第三次了（51/54 是前两次），凡写非零起点切片，第二参一律先写成 `end - start`。
+
 ---
 
 ## 17. 工具实现要点
