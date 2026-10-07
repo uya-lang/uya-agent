@@ -19,6 +19,8 @@
     overlay-fullscreen   （P53）浮层全屏：非全屏的 /status 是居中框 → ctrl+f 顶到屏幕四边
                          （顶边第 0 行、左右边框 0 与 cols-1）且不吃面板/脚注 → F11 关回居中
                          → 再全屏一次、esc 关掉浮层
+    tasks-ctrl-t         （踩坑 114）回合**运行中**按 ctrl+t：常驻任务块当场展开成箱体
+                         （≤1.5 s，且那一刻回合还在跑）→ 再按一次收回折叠行
 
 只依赖 Python 标准库；解释器把 pty 的输出按「屏幕重建」的方式解析（备用屏幕 + 光标定位）。
 """
@@ -248,12 +250,12 @@ def wait_text(fd, screen, needles, t0, max_ms=1500):
 
 
 def run_scenario(port, workspace, scenario, extra=None, gap_ms=None, steps=None,
-                 head_delay_ms=0, tool_cmd=None):
+                 head_delay_ms=0, tool_cmd=None, todo_first=0):
     """起一个假网关 + 一个真终端 TUI 子进程，跑一个场景，返回 verdict 字典。"""
     env_bin = BIN
     argv = [sys.executable, "testdata/mock_gateway_sse.py", "0",
             str(steps if steps is not None else 1), str(gap_ms if gap_ms is not None else 3000),
-            str(head_delay_ms), tool_cmd or ""]
+            str(head_delay_ms), tool_cmd or "", str(todo_first)]
     gw = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                           cwd=os.path.dirname(os.path.abspath(__file__)) + "/..")
     try:
@@ -354,6 +356,20 @@ def suite():
     check(v9.get("closed"), "全屏态下 esc 没有关掉浮层", failures)
     check(v9.get("border_gone"), "esc 关掉浮层之后方框还留在屏幕上", failures)
     all_v["fullscreen"] = v9
+    # ---- 踩坑 114：ctrl+t 在回合运行中当场展开常驻任务块 ----
+    v10 = run_scenario(0, base + "_ctrlt", "tasks-ctrl-t", gap_ms=9000, todo_first=1)
+    check(v10.get("collapsed_seen"),
+          "常驻块的折叠行没出现（一条 todo 都没上屏，这一场的判据不算数）", failures)
+    check(v10.get("turn_running"), "按 ctrl+t 之前回合就已经结束了（没复现出「运行中」那个现场）",
+          failures)
+    check(v10.get("box_seen"),
+          "回合运行中按 ctrl+t 没有展开出任务箱体（%s ms 内）" % (v10.get("box_ms"),), failures)
+    check(v10.get("box_while_running"),
+          "任务箱体是回合结束之后才补画的（用户按下去的那一刻仍然没反应）", failures)
+    check(v10.get("box_closed"), "再按一次 ctrl+t 没有收回任务箱体", failures)
+    check(v10.get("box_gone_ms") is not None or v10.get("box_closed"),
+          "收回之后折叠行没有回来（那块地方空着）", failures)
+    all_v["ctrl_t"] = v10
     print(json.dumps(all_v, ensure_ascii=False, indent=2))
     if failures:
         print("P30/P31 FAIL:")
@@ -373,8 +389,9 @@ def suite():
           "esc 关掉浮层）"
           % (v9.get("plain_top_row"), v9.get("full_cols"), v9.get("full_top_row"),
              v9.get("panel_row"), v9.get("f11_top_row")))
+    print("踩坑 114 PASS（ctrl+t 在回合运行中当场展开（%s ms，那一刻回合还在跑）→ 再按一次收回）"
+          % (v10.get("box_ms"),))
     return 0
-
 
 def _drive(port, workspace, scenario, extra=None):
     os.makedirs(workspace, exist_ok=True)
@@ -572,6 +589,38 @@ def _drive(port, workspace, scenario, extra=None):
             verdict["cancelled"] = "确认 finish？" not in screen.text()
             type_keys(fd, "\x1b")
             pump(fd, screen, 0.3)
+        elif scenario == "tasks-ctrl-t":
+            # 踩坑 114：ctrl+t 在**回合运行中**也必须当场生效（判据全是屏幕上的排版事实）。
+            # 这一场假网关的第一次请求回一个 `todo_write`，第二次请求的长流由 GAP_MS
+            # 撑住 —— 于是「第 2 步流式在飞」就是按键的那一刻，正好复现用户报的现场：
+            # 折叠行已经在屏幕上（有东西可展开），但主循环整段不在跑。
+            #   ① 运行中按 ctrl+t：`┌─ tasks ` 必须 ≤1.5 s 上屏，且那一刻假网关的
+            #      答复 `SELFTEST_OK` 还没出现（＝回合真的没结束，不是「回合跑完才补画」）；
+            #   ② 再按一次：箱体消失、折叠行回来（同一个键来回都灵）；
+            #   ③ esc 中断回合（收场）——不留一个跑着的回合给下一场。
+            t0 = time.time()
+            type_keys(fd, "跑一个任务\r")
+            # 折叠行的形状是「<首字形> 任务 c/n p%」：三种首字形都算，别写成裸「任务 」
+            # —— 用户那句话里也有「任务」两个字，那样的判据会在按键之前就成立。
+            collapsed_needles = ("▸ 任务 ", "✓ 任务 ", "· 任务 ")
+            verdict["collapsed_ms"] = wait_text(fd, screen, collapsed_needles, t0, 4000)
+            verdict["collapsed_seen"] = verdict["collapsed_ms"] is not None
+            pump(fd, screen, 0.6)
+            verdict["turn_running"] = not screen.has("SELFTEST_OK")
+            t1 = time.time()
+            type_keys(fd, "\x14")
+            verdict["box_ms"] = wait_text(fd, screen, ("┌─ tasks ",), t1, 1500)
+            verdict["box_seen"] = verdict["box_ms"] is not None
+            verdict["box_while_running"] = not screen.has("SELFTEST_OK")
+            if os.environ.get("PTY_DUMP"):
+                print("---- 运行中按 ctrl+t 之后的屏幕 ----")
+                print(screen.text())
+            t2 = time.time()
+            type_keys(fd, "\x14")
+            verdict["box_gone_ms"] = wait_text(fd, screen, collapsed_needles, t2, 1500)
+            verdict["box_closed"] = (not screen.has("┌─ tasks "))
+            type_keys(fd, "\x1b")
+            pump(fd, screen, 0.8)
         else:
             type_keys(fd, "随便跑一个任务\r")
             pump(fd, screen, 5.0)

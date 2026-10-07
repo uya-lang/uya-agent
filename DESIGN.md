@@ -1681,8 +1681,22 @@ log / result；没调 `wf_done` 时给 `(the script finished without calling wf_
 | 不用行数统计后台输出 | 1 MiB 缓冲逐行扫太贵 —— 用**字节数** |
 | 不给 job/deleg 加结束时间戳 | 要改状态机；所以**已结束项不显示时长** |
 
-**状态字形两套值空间别混**：todo 用 `TD_*`、job 用 `JOB_*`、deleg 用 `DELEG_*`
-（`view_status_glyph` 只认这一套）。
+**状态字形两套值空间别混**：todo 用 `TD_*`、job 用 `JOB_*`、deleg 用 `DELEG_*`（`view_status_glyph` 只认这一套）。
+
+**展开态的消费者有两个，而且必须共用一份实现**（踩坑 114）：`TUI_REQ_TASKS` 由**空闲主循环**
+与**泵点**（`agent_pump_block`）各自消费一次 —— 用户跑着 bash / 流式时按 ctrl+t，等主循环
+就是「按了没反应」（那是本条踩坑的主因）。两条路都调 `agent_tasks_toggle_apply`（翻显示位 +
+重建文本 + 空表时落 notice + 当场出帧），一处改两处生效。
+
+**这条待遇只给 ctrl+t**：它一个字节都不改历史（只翻显示位 + 重建只读文本，TUI 下零 IO）。
+tab（plan）/ shift+tab（access）**不能**照搬 —— 那两个会 `hist_push` 一份运行时快照进
+**正在被这一回合使用的** History。所以泵点上的取用口是**只认 TASKS** 的
+`tui_take_tasks_request()`，不是 `tui_take_request()`（后者会把还挂着的 plan / access /
+ctrl+v 一并吃掉）。
+
+**空态屏也画这块**（`tui_draw_tasks_block` 由 home 与 chat 共用，行预算收口在
+`tui_tasks_prepare`）：刚启动 / `/new` 之后按 ctrl+t 必须与对话态一个行为。
+四张表全空时块文本零字节 ⇒ home 的排版与 P22 之前**逐字节相同**（`make tui-demo` 第 ① 屏是判据）。
 
 ---
 
@@ -3768,6 +3782,51 @@ responses 用 `{"type":"input_image","detail":"auto","image_url":…}`；
     文本只是它的一部分。判据漏掉哪个维度，那个维度上的变化就变成静默失效。
     同族要注意的还有：`web_t_frame_has_reverse` 第一版拿**整段**管道数据去 `js_parse`，
     而读端可能停在上一帧的半截上（实测帧前面残留着 `ae`）—— 逐行解才是对的。
+114. **ctrl+t 没有反应：三条各自独立的静默路，症状一模一样**（修复，不占阶段号；
+    用户报的「ctrl+t 没有反应」）：
+    真 PTY（main 的二进制 + 假网关）逐场景按键复现出**三条**路，屏幕上的表现完全相同 ——
+    「按了 ctrl+t，一个字节都不动」：
+
+    | # | 现场 | 实测 | 根因 |
+    |---|---|---|---|
+    | ① | **回合运行中**按（bash / 流式 / 等响应头跑着时） | 3 s + 3 s 两次按键后屏幕**零变化**；esc 中断回合之后箱体才出现 —— 两次按键被压成一次 | 键层只置 `TUI_REQ_TASKS`，而**全仓唯一的消费者**是空闲主循环：回合期间主循环整段不跑 |
+    | ② | **空态屏**（刚启动 / `/new` 之后）按 | 即使目标 / 清单非空也零变化 | `tui_build_home` 里一行恒零（`g_tui_tasks_n = 0`），块根本不画 |
+    | ③ | **四张表全空**时按 | 永远静默：不画东西，也没有一句回话 | 块文本零字节，展开与收起在屏幕上没有可观察差别 |
+
+    ①是主因，形状与踩坑 44 / 73 同族：**键语义、透传、消费者三截里坏的是「谁去消费」那一格**。
+    回合里确实在读键（`agent_pump_block` → `tui_abort_check` → `tui_tick` → `tui_poll_keys`
+    → `tui_handle_keys`，请求被老老实实置上了），但那条路上**没有一个人看 `g_tui_req`** ——
+    与踩坑 44 的「键收下来了但没人看」是同一个形状。修法也沿用本仓既定套路：**在泵点当场消费**
+    （`agent_pump_block` 里取一次）。
+
+    **为什么只有 ctrl+t 能享受泵点待遇**（这条边界比修法本身更重要）：它**一个字节都不改历史** ——
+    只翻一个显示位 + 重建一张只读文本（`tasks_panel_sync` 在 TUI 下只 mark dirty，零 IO）。
+    tab（plan）/ shift+tab（access）**不行**：那两个会 `hist_push` 一份运行时快照进**正在被这一
+    回合使用的** History。所以泵点上的取用口必须是**只认 TASKS**的那一个（`tui_take_tasks_request`），
+    不能图省事写 `tui_take_request() == TUI_REQ_TASKS` —— 那个出口会把**任何**请求一并取走，
+    等于把还挂着的 plan / access / ctrl+v 悄悄吃掉（钉子直接钉住这条：泵点跑完，
+    `tui_take_request()` 还得能取到 `TUI_REQ_PLAN_ON`）。
+
+    ②的修法是把 chat 里画块那一段**原样抽成** `tui_draw_tasks_block`，home 与 chat 共用；
+    行预算也收口成 `tui_tasks_prepare`（两个屏的块高算法只留一份，否则迟早漂移）。
+    ③补一句 notice（「四张表都空 —— 展开也没有内容可看」）：**绝不静默**是踩坑 73 定下的口径，
+    一个什么都不画的按键最容易被当成坏了。
+
+    **钉子四条**（`tui-tasks` 轮新增 E 段 + `make p30-check` 第 10 场）：
+    ①帧级 —— 运行中只调 `agent_pump_block()`，展开态必须当场翻转、请求被消费掉，重画后箱体在屏上；
+    ②帧级 —— 无转录时块照样画、按得动，且面板不被顶掉、整屏仍铺满 rows 行；
+    ③帧级 —— 四表全空时必须多出一条 notice（`tui_entries_count` + 文案扫屏）；
+    ④真 PTY —— 回合运行中按 ctrl+t，`┌─ tasks ` ≤1.5 s 上屏**且那一刻 `SELFTEST_OK` 还没到**
+    （＝不是「回合跑完才补画」，实测 101 ms），再按一次收回折叠行。
+
+    **防假绿对照实验**（三条各自单独回退都当场红）：①摘掉泵点那次消费 ⇒ 帧级①与 PTY 腿红；
+    ②把 home 的 `g_tui_tasks_n = 0` 改回去 ⇒ 帧级②红；③去掉空文本 notice ⇒ 帧级③红。
+    既有判据一条不动：`--tui-demo` 七屏与修前**逐字节相同**（四张表全空时 home 排版零漂移，
+    这条本身就是「没有回归」的机器判据；`tui-frame` 的空态居中、`tui-switch` 的 D 段也全绿）。
+
+    教训：**「按了没反应」要先问「这个键的消费者是谁、他在不在跑」**。同一个键在三处可用性
+    不同的现场（空闲 / 运行中 / 空态）表现可以完全一致，而根因是三件互不相干的事 ——
+    只修主因的话，用户下次在空态屏上按同一个键，报的还是同一句话。
 
 ---
 
@@ -3970,7 +4029,7 @@ DEEPSEEK_API_KEY=sk-xxx ./build/uya-agent \
 | `subagent-goal` | 9 调用：goal 三工具、`subagent`/`subagent_output(wait)`、`ralph(maxRounds=2)` |
 | `tasks-render` | 进度条/百分比/体量、空态零字节、箱体 11 行逐行等宽 |
 | `tasks-scroll` | `--no-tui`：折叠行与 agents 箱体进面板；展开后每行 98 列 |
-| `tui-tasks` | 常驻任务块层序、`ctrl+t` 只置 `TUI_REQ_TASKS`、矮/窄退化；P29 `/goal` 浮层 |
+| `tui-tasks` | 常驻任务块层序、`ctrl+t` 只置 `TUI_REQ_TASKS`、矮/窄退化；P29 `/goal` 浮层；**E 段（踩坑 114）**：泵点消费 ctrl+t（运行中当场翻转 + 请求被消费 + 泵点只认 TASKS，tab 的请求原样留给主循环）、空态屏照样画块并按得动、四表全空时落 notice |
 | `skills-web-search` | 目录型技能注入 + `skill` 工具；Anthropic 形状 `web_search` 鉴权与去重 |
 | `compact-prune` | 20000 字符输出 → 剪枝标记、完整中段消失 |
 | `compact-auto` | 窗口 200 触发：摘要请求 → `automatically generated checkpoint` |
@@ -4038,6 +4097,7 @@ DEEPSEEK_API_KEY=sk-xxx ./build/uya-agent \
 | `web-seg` | 段表的**坐标单位**（踩坑 112）：喂合成行（窄文本 + 宽文本 + 空白 + **BMP 外字符** + SGR 反显）断言四条 —— ① 段首尾相接、无缝无叠；② 每段**显示列数** == 它切出来那段文本的真实列宽；③ **整行段列数合计 == 该行真实列宽**（这是「右边框对齐」的代数形式）+ 每段**只含一个宽度类**；④ 段边界落在**字符**边界上（按码元切片切不出半个代理对）。再把**真实捕获的 TUI 帧**（同 `web-emu` 的做法）逐行跑同一组判据（同源）。判据走 `emu_row_json` 的**真输出**（解 JSON），不另取内部状态。防假绿对照：把 `emu_cols_span` 改回「续格也数一列」重编 ⇒ 当场红 |
 | `tui-full` | P53 浮层全屏四组：**A** 非全屏仍是居中框（不顶格、`≤16` 行上限、第 30 项看不见）→ 全屏框 = 转录区（顶边第 0 行、左右边框 0 与 `cols-1`、标题 ` · 全屏`、行偏移表口径的逐行闭合、底边**正好**在 `panel_top-1`）+ 16 行上限解除（第 20 项可见、第 30 项仍不可见）；**B** `ctrl+f`（`0x06`）与 `F11`（`ESC[23~`）都切换，且**四种形态各认一次**（列表 / reader / ask / input）；**C** 不吃面板 / 状态区 / 脚注；**D** 没浮层时只落 notice、全屏态不跨浮层残留、`esc` 关掉后转录回来，终端太矮时 fail-closed 判据不变；**F** `/fullscreen` 四态（裸报状态 / `on` / `off` / 非法值只报错且状态不动、重复 `off` 幂等） |
 | `overlay-fullscreen` | `make p30-check` 第 9 场（真终端 + 假网关）：屏幕几何判据 —— 非全屏顶边 > 0 行且左边框 > 0 列 → `ctrl+f` 后顶边第 0 行、左右边框正好 `0` 与 `cols-1`、标题带 ` · 全屏`、面板与脚注都还在、底边行 < 面板行 → `F11` 关回居中 → 再全屏、`esc` 关掉后方框消失 |
+| `tasks-ctrl-t` | `make p30-check` 第 10 场（踩坑 114，真终端 + 假网关 `todo_first=1`）：回合**运行中**按 `ctrl+t` → `┌─ tasks ` ≤1.5 s 上屏**且那一刻 `SELFTEST_OK` 还没到** → 再按一次收回折叠行（实测 101 ms） |
 | `watch-pick-e2e` | `make e2e-watch-pick`：真终端 + 假网关两条腿 —— ①裸 `/watch` → 清单 → **一次回车**开跟随浮层（`[step …]`/`▸ bash …` 仍在子代理结束之前上屏）；②假网关把父代理的收尾按住 12 s，期间敲 `/watch sub-1` 必须**当场**开浮层（屏幕上还没有 `PARENT-DONE-OK`） |
 | `model-route-e2e` | `make e2e-model-route`：真终端 + **两个**假网关（各自记账模型名与 `Authorization`），两条腿（`--mode text` 带参命令 / `--mode overlay` 浮层）—— 回合被一条慢 bash 撑住时切换模型，断言**回合结束前**信息行就变成新模型/新提供方（实测 102 ms）、之后那条请求打到**新提供方**的网关（旧网关不再收到）、且带的是**新提供方**的密钥（旧密钥不跨提供方），那一轮的答案是新提供方给的。尾判等的是**正面事实** `PROV-B-ANSWER`（以前等「有 `轮 ·` 且没有 `运行中`」，那两半都在回合半途就成立 ⇒ 约 5% 假红，见踩坑 109；基线 104 次红 5 次、修后 104 次全绿，防假绿对照照红）。对照改动前：`VERDICT: FAIL` + 网关记账里 prov-a 收到全部请求（踩坑 96） |
 | `session-log` | 控制字节按字节往返、半条记录 `dropped_tail`、重建历史 |
@@ -4063,13 +4123,17 @@ DEEPSEEK_API_KEY=sk-xxx ./build/uya-agent \
 
 - 总闸门：`make selftest`（离线，含 `p30-check` 与全部轮次，SELFTEST PASS / 退出 0）、`make e2e`（真网关）。
 - 离线配套：`make check`（A1 类型检查）/ `build`（A2 产出 `build/uya-agent`）/ `codegen-audit` / `tui-selftest` / `shell-selftest` / `e2e-config-flags` / `e2e-api` / `e2e-steps` / `e2e-permission` / `e2e-sandbox` / `e2e-tasks` / `e2e-goal` / `e2e-sessions` / `e2e-resume-big` / `e2e-title` / `e2e-model` / `e2e-model-route` / `e2e-worktree` / `e2e-diff` / `e2e-watch` / `e2e-watch-pick` / `diff-selftest` / `panel-selftest` / `e2e-ws`。
-- PTY 场景：`make p30-check`（`testdata/pty_drive.py --suite`，8 个场景；P41 那场 `worktree-menu` 走
+- PTY 场景：`make p30-check`（`testdata/pty_drive.py --suite`，10 个场景；P41 那场 `worktree-menu` 走
   两条入口 —— 命令面板里选中 `/worktree` 与裸 `/worktree` —— 到选择框 → ↓ 到 `finish` → 确认框 →
-  回车取消，`PTY_DUMP=1` 会把两张框打出来）；
+  回车取消，`PTY_DUMP=1` 会把两张框打出来；踩坑 114 那场 `tasks-ctrl-t` 要假网关的
+  第 6 个参数 `todo_first=1`，它让第一次请求回一个 `todo_write` —— 折叠行真的在屏幕上，
+  「运行中按 ctrl+t」才有可观察的差别）；
   `make tui-demo` 是排版基准：P47 之前各阶段只差脚注版本串（`p22-tasks` … `p46-wpick`），
   P47 起正文那一屏按新的 markdown 排版变（标题/强调/列表/引用/带语言标签的代码块/表格），
   脚注仍是版本串那一处；P53 新增第 ⑦ 屏（浮层全屏）并把前六屏**逐字节**保持不变
-  （非全屏路径一个字节没动，所以这条本身就是「没有回归」的判据）。
+  （非全屏路径一个字节没动，所以这条本身就是「没有回归」的判据）；
+  踩坑 114 起第 ① 屏（空态 + 四表全空）同样**逐字节不变** —— 它是「空态屏加了任务块，
+  但没内容时排版零漂移」的机器判据。
 - 只跑子集的开关：`UYA_SELFTEST_TUI_ONLY`、`UYA_SELFTEST_PERM_ONLY=1`（P21+P26）、`UYA_SELFTEST_GOAL_ONLY=1`（P29）、`UYA_SELFTEST_SHELL_ONLY=1`（P38）、`UYA_SELFTEST_PANEL_ONLY=1`（P15+P40，`make panel-selftest`）、`UYA_SELFTEST_EMPTY_ONLY=1`（P54，退化响应两轮 —— 跑对照实验时用它，一次约 0.2 s）。
 - 探针：`make probe BASE=https://api.deepseek.com/v1` 期望 HTTP 401 + leaf 指纹。
 

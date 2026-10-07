@@ -895,6 +895,10 @@ e2e-dsh: build
 #     9) /status 开出来是居中框（顶边 > 0 行、左边框 > 0 列）→ ctrl+f 顶到屏幕四边
 #        （顶边第 0 行、左右边框正好 0 与 cols-1、标题带 ` · 全屏`）→ **面板与脚注都还在**、
 #        底边压在面板之上 → F11 关回居中（顶边 > 0 行）→ 再 ctrl+f、esc 关掉浮层
+#   踩坑 114 起再加一条「运行中按 ctrl+t」的验收（真终端；假网关第 6 个参数 todo_first=1
+#   让第一次请求回一个 todo_write，于是常驻块的折叠行真的在屏幕上）：
+#    10) 回合运行中（第 2 步流式在飞）按 ctrl+t → `┌─ tasks ` ≤1.5s 上屏，且那一刻
+#        SELFTEST_OK 还没出现（＝不是「回合跑完才补画」）→ 再按一次收回折叠行
 #   PTY_DUMP=1 会把子进程屏幕打出来（P41 那场会多打两张框的屏幕）；单跑一个场景：
 #     python3 testdata/pty_drive.py --port <假网关端口> --workspace /tmp/ws status-single-step
 p30-check: build
