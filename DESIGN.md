@@ -2691,6 +2691,7 @@ responses 用 `{"type":"input_image","detail":"auto","image_url":…}`；
 | **对话协议是刻意「极简」的** | 历史只带文本与工具调用；不做多模态之外的内容类型 |
 | Responses 下**不回放 reasoning item** | 不发 `include: ["reasoning.encrypted_content"]`，也不发 `prompt_cache_key` / `prompt_cache_retention` |
 | **会话身份照发**（与「不发 prompt_cache_key」是两件事） | 每个请求都带 `x-deepseek-harness-session-id` + `Session-Id` 两个头，正文带 `client_metadata.session_id`（responses）/ `metadata.session_id`（chat）；运行时上下文带 `session workspace: "<JSON 路径>"`。口径对齐 DSH，`~/ai-gateway` 据此按会话归组、取工作区、识别标题行 |
+| **客户身份靠 User-Agent，机读句报归类键**（P71） | 网关的客户端词表是**封闭**的 `dsh / codex / console / unknown`（`internal/responses/dimensions.go`），正文规则要求首条 system 逐字是 DSH 的 persona —— 我们不改自己的 persona（那是冒充，还会改模型行为），所以**唯一接缝是 UA**：发 `uya-agent/0.1 (deepseek-harness-compatible)`，命中它的 `deepseek-harness` 子串 ⇒ `client=dsh`。认不出客户端时网关**连 `workspace` 也一起丢**（那条维度只在 dsh/codex 两个分支里取），所以这不只是「客户端列好不好看」的问题。同时 `session workspace:` 报的是**归类键**（`pm_main_worktree_into`：linked worktree 折回主工作区，普通仓库的子目录原样），人读的 `Current workspace:` 仍是字面路径 —— 否则每个会话一条唯一 worktree 路径，工作区维度会退化成会话维度。已知边界：普通仓库的子目录按字面归；历史行不回填 |
 | **起标题提示词与 DSH 逐字同形** | system 段 `Create a concise title for an AI coding-assistant session …`、user 段 `Generate the session title from this JSON array of human messages:\n<JSON 数组>`，并带同一会话 id（网关照这两个前缀认 `call_kind=title`）。**唯一偏离**：system 段第三句（词数句）改成本项目口径「10 字以内 / 约 3 词」（DSH 原句 5 词 / 40 CJK 字符）—— 网关只匹配前两条前缀，这条可自定；硬约束另由 `tty_title_fallback_into`（3 词 / 30 B）收口 |
 | 历史按「外来消息」重放 | 只带文本与工具调用 |
 | 工具 schema **不带 `strict`** | |
@@ -3573,6 +3574,48 @@ responses 用 `{"type":"input_image","detail":"auto","image_url":…}`；
 
     顺带补了 `/help` 文案：此前**一个字节都没提** ctrl+v（ctrl+p / ctrl+t / F2 都在），
     键修好了却没人知道它存在；并按「改了 help 文案就要钉子」的惯例加了断言。
+111. **网关认不出本仓客户端，于是「工作区」一列永远是空的**（P71，用户报的「不能识别
+    uya-agent 客户端 / 不能识别工作区」）：
+    现场（只读查 `aigw.db`）：`client='unknown'` **2118** 行 vs `dsh` **10** 行，而
+    `workspace` 列**全库为空**。那 10 行 `dsh` 全是本仓的**标题**调用 —— 网关有一条
+    「标题调用就是 DSH 调用」的兜底，把我们的标题行认成了 DSH（8 个 session id 逐个
+    核对：6 个属 `~/.uya-agent`，另 2 个属真 DSH）。也就是说**唯一被认出来的那些行，
+    认的也是错的**。
+
+    根因有两层，第二层才是要命的那个：
+
+    | 环 | 事实 |
+    |---|---|
+    | 1 | 网关的客户端词表**封闭**：`dsh / codex / console / unknown`（`internal/responses/dimensions.go`）。判定顺序是「正文结构优先，User-Agent 仅兜底」 |
+    | 2 | 正文那条路要求首条 system 逐字以 `You are an AI agent powered by DeepSeek Harness.` 开头；我们的 persona 是自己的文案（`DEFAULT_PERSONA` / preset），**永远匹配不上** |
+    | 3 | UA 兜底认的是 `deepseek-harness` / `dsh/` 子串，我们发的是 `uya-agent/0.1`（写死在 `net/httpc.uya` 的 `build_request` 里）⇒ 落 `unknown` |
+    | 4 | **`workspace` 只在 `ClientCodex` / `ClientDSH` 两个分支里被赋值**（`dimensions.go` 的 switch）。走 `unknown` 就整段跳过 ⇒ 工作区维度恒空 |
+
+    第 4 环是关键：它不是「少显示一列」，而是**一条请求被认成谁，决定了它的工作区还
+    记不记得下来**。所以修「工作区识别」这件事，入口在「客户端识别」。
+
+    第二半是工作区本身的**口径**：本机 `agent-presets.default: git-worktree`，顶层会话
+    的 cwd 是 `<主仓>/.git/dsh-worktrees/session-<id>`（本会话实测：`previous=/home/winger/
+    uya-agent` → `workspace=…/.git/dsh-worktrees/session-0f6f924a-…`）。每个会话一条唯一
+    路径 ⇒ 工作区维度退化成会话维度（一桶一行）。要的是**归类到 git 主工作区**。
+
+    修法（两条，都在本仓；网关侧一个字节不动）：
+    * UA 改成 `uya-agent/0.1 (deepseek-harness-compatible)` ⇒ 命中 `deepseek-harness`；
+    * `session workspace:` 机读句改报**归类键**（`pm_main_worktree_into`：linked worktree
+      折回主工作区，普通仓库的子目录原样），人读的 `Current workspace:` 仍是字面路径。
+
+    为什么不改 persona 去冒充 DSH：那是**假话**（我们不是 DSH），而且 persona 会进
+    system prompt 影响模型行为 —— 为了一列统计去改模型看到的东西，代价与收益不成比例。
+    UA 那条也刻意写成 `compatible` 而不是冒充：我们报的是「同方言」，不是「我就是它」。
+
+    两条教训：
+    * **「客户端认不出」与「工作区为空」是同一个 bug**：维度之间可能有这种隐式依赖
+      （一个维度为空，是因为另一个维度没认出来）。查这类现场要先问「这条维度在代码里
+      是哪几个分支里赋值的」，而不是先怀疑采集。
+    * **UA 这类「线上字节」必须有断言**：它写死在 `httpc.uya` 里，改前全仓**没有任何
+      测试看得见它** —— 与踩坑 94（`=======` 残留）/「净增函数」（踩坑 87）同族：
+      没有断言的产物，全绿不代表它对。本轮补了 `mock_mode 25` 的 UA 断言（先验红：
+      改回旧 UA ⇒ `verdict 204` + `SELFTEST FAIL`）。
 
 ---
 
@@ -3861,7 +3904,7 @@ DEEPSEEK_API_KEY=sk-xxx ./build/uya-agent \
 | `unlimited-steps` | 默认不限步数：跑满 14 步、14 条 `tool_call_id` 带回、退出 0 |
 | `hist-keep` | `hist_drop_oldest` 留住 system 与任务原文、整组丢 tool；40 组后原文仍在 |
 | `toolcalls-cap` | 踩坑 35：`jw_str_esc_len` 与实际逐字节相等、`calls_json_need` 预算严丝合缝 |
-| `toolcalls-big` | 踩坑 35（mock mode 25）：9.6 KiB `write` 头尾标记回到第二请求、`agent_run` 返回 0 |
+| `toolcalls-big` | 踩坑 35（mock mode 25）：9.6 KiB `write` 头尾标记回到第二请求、`agent_run` 返回 0。同轮第 0 次请求还钉**客户身份**：`User-Agent: uya-agent/0.1 (deepseek-harness-compatible)`（P71，踩坑 109；改回旧 UA ⇒ `verdict 204`）与两个会话 id 头、`session workspace: \"` 机读句 |
 
 **验证用的 make 目标与快捷入口**
 
@@ -4360,7 +4403,7 @@ stat 三元组）/ `state`（上次什么结果）。`<repo-key>` = 归一化仓
 
 | 轮 | 覆盖点 |
 |---|---|
-| `pm-identity` | 真 git 仓 + 真 worktree：两者归到**同一个**键；子目录归到仓库根；尾部斜杠不影响；无 git 时以传入目录为根（不报错） |
+| `pm-identity` | 真 git 仓 + 真 worktree：两者归到**同一个**键；子目录归到仓库根；尾部斜杠不影响；无 git 时以传入目录为根（不报错）。**P71 兼验归类键**（`pm_main_worktree_into`）：worktree → 主工作区、主工作区/仓库子目录/无 git 三种情形**原样**（反向断言钉住「只折 linked worktree」）—— 判据与项目键同源，差别只在「子目录折不折」 |
 | `pm-roundtrip` | 写 → 读逐字节等价（含引号 / 反斜杠 / 换行）；同 `(kind,key)` 归并且 `n` 累加；两次读出渲染逐字节相同 |
 | `pm-concurrent` | 两种交错顺序的归并结果**逐字节相同**；两个分片都在且非空；半行尾部被丢掉、其余不变 |
 | `pm-ingest` | read → layout（带 stat 锚点）；成功的 bash → commands；`make …` 失败 → state 带错误摘要；**没有退出码的结果什么都不记**；失败的非验证命令不进 commands |
