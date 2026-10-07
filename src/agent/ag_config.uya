@@ -1302,18 +1302,22 @@ fn agent_default_home(cfg: &const Config, out: &Buf) bool {
 //   1) 人敲 `/title <新标题>` / `/title clear`（TUI 里裸 `/title` 先让模型起一个建议、
 //      填进输入框再让人改）；
 //   2) 模型自己调 `set_title` 工具；
-//   3) 自动起标题：每个新的人类消息之后（回合收口时）跑一次侧路请求，
-//      把 `session/title` 与索引换成模型给的标题（kind = provider）；
+//   3) 自动起标题：**首次提示词**、一条会话只起一次 —— 回合一开始挂待办，第一个 step
+//      跑完的边界发那一次侧路请求，把 `session/title` 与索引换成**模型总结的**标题
+//      （kind = provider）；收尾那条只是「还没首发就结束」的兜底，收尾**不更新**标题；
 //   4) `clear` 退回基标题并解锁自动起标题。
 //
-// kind 三档沿用 DSH：`fallback`（前 3 词兜底）/ `provider`（模型生成）/ `user`（人写、模型写、
+// 会话标题**只有一个来源：模型总结**。首条人类消息派生出来的那串（前 3 词 / ≤45 B）只是
+// **备用标题**：模型还没回来时终端上显示基标题，模型彻底起不出来时才轮到它上屏 ——
+// 它不进 `g_sess.title`、不落 `session/title`、不写索引。
+//
+// kind 三档沿用 DSH：`fallback`（派生备用值）/ `provider`（模型生成）/ `user`（人写、模型写、
 // 导入 —— **显式钉住**：钉住之后自动起标题不再动手，与 DSH 的 rename 同语义）。
 // 标题会不会被改写，只看**最后一条** `session/title` 事件的 kind 是不是 user；
 // 这个状态跟着日志（g_title_pinned），所以 --resume 之后仍然钉住。
 //
 // ⚠ 自动起标题是**同步**的侧路请求（单线程，踩坑 47：不能起第二条线程并发 malloc），
-// 所以它排在回合收口之后、回到输入态之前 —— 一次人类消息最多一个额外小请求，
-// `--no-title-auto` / UYA_AGENT_TITLE_AUTO=0 可关。
+// 一次会话最多一个额外小请求，`--no-title-auto` / UYA_AGENT_TITLE_AUTO=0 可关。
 // ============================================================
 
 var g_title_base: Buf = Buf{ ptr: null, len: 0, cap: 0 };
@@ -1321,8 +1325,16 @@ var g_title_base_ready: bool = false;
 var g_title_pinned: bool = false;        // 最后一条 title 事件是不是 user（显式钉住）
 var g_title_human_msgs: usize = 0;       // 本会话收到的人类消息条数（自动起标题的 revision）
 var g_title_auto_rev: usize = 0;         // 上一次自动起标题时的人类消息条数（revision 门控）
-var g_title_auto_done: bool = false;     // 本会话已经成功自动起过标题（供 /status 观测）
-var g_title_auto_pending: bool = false;  // 回合收尾挂下的待办（空闲主循环里消费）
+var g_title_auto_done: bool = false;     // 本会话已经自动起过标题（首次提示词口径：只起一次）
+var g_title_auto_pending: bool = false;  // 挂下的待办（回合里 step 边界 / 空闲循环里消费）
+// 自动起标题那次请求是**被用户打断**的吗（只有他动键盘 / 按 esc 这一种）。
+// 被打断不是失败：不记 revision、待办留给下一次机会（见 agent_title_auto_fire）。
+var g_title_gen_interrupted: bool = false;
+// 备用标题：模型还没起出来（或起不出来）时，终端上显示的就是它 —— 首条人类消息派生。
+// ⚠ 它**不是会话标题**：不进 `g_sess.title`、不落 `session/title`、不写索引、不进网关。
+// 会话标题只有一个来源 —— **模型总结**（口径见 §11.7）。
+var g_title_fallback: Buf = Buf{ ptr: null, len: 0, cap: 0 };
+var g_title_show_fallback: bool = false; // 模型彻底起不出来时，才让备用标题上屏
 // P46：当前在飞的是「后台请求」（自动起标题）。泵点据此**不读键盘/不派发命令** ——
 // 用户不知道它在飞，它就没有资格取走用户那几秒里敲的任何字节（见 agent_pump_block）。
 var g_bg_request: bool = false;
@@ -1387,8 +1399,7 @@ fn agent_title_base_into(out: &Buf, ws: &const byte, n: usize) void {
     }
 }
 
-// 用**首条用户消息**算初始标题（前 3 词 / ≤30 B = 10 字以内），
-// 并记住「用户没手动改过」这件事（手改之后不再被自动值覆盖）。
+// 算「基标题」（`uya-agent · <工作目录名>`）—— 会话还没有任何标题时终端上显示的就是它。
 fn agent_title_base_set(cfg: &const Config) void {
     if !buf_valid(&g_title_base) {
         g_title_base = buf_new(320);
@@ -1397,10 +1408,17 @@ fn agent_title_base_set(cfg: &const Config) void {
     g_title_base_ready = true;
 }
 
-// 把「当前会话标题」同步到终端（标题通道没开 / 清洗后为空时，tty 层自己会跳过）
+// 把「当前会话标题」同步到终端（标题通道没开 / 清洗后为空时，tty 层自己会跳过）。
+// 优先级：会话标题（模型给的 / 人写的 / 导入的）→ 基标题 `uya-agent · <目录>`。
+// `g_title_show_fallback` 那一档只在**模型起不出来**时才插进来（口径：标题由模型总结）。
 fn agent_title_apply() void {
     if g_sess.title.len > 0 {
         tty_title_set(g_sess.title.ptr as &const byte, g_sess.title.len);
+        return;
+    }
+    if g_title_show_fallback && g_title_fallback.len > 0 {
+        tty_title_set(g_title_fallback.ptr as &const byte,
+            g_title_fallback.len);
         return;
     }
     if g_title_base_ready {
@@ -1410,14 +1428,14 @@ fn agent_title_apply() void {
     tty_title_set("uya-agent" as &const byte, 10);
 }
 
-// 首条用户消息 → 兜底标题（本项目口径：前 3 个词、≤30 B = 10 字以内、清洗 + 空白折叠、按码点边界截断）。
-// 清洗后为空就**不**落标题，留给后面真正有内容的输入（DSH 的空输入等后来者）。
-// 只写内存里的 `g_sess.title`（`--no-save` 时同样要派生：终端标题不依赖落盘）；
-// 落 `session/title` 事件由调用方按 `g_sess.save` 决定，且**必须排在 user/message 之后**
-// （DSH 的事件顺序就是这样：title 事件引用它据以生成的 message seq）。
-// 返回 true = 这次真的派生了标题。
+// 首条用户消息 → **备用标题**（本项目口径：前 3 个词、≤45 B = 15 字以内、清洗 + 空白折叠、
+// 按码点边界截断）。它只进 `g_title_fallback`，**不是会话标题**：
+//   * 会话标题只有一个来源 —— 模型总结（见 §11.7 与 agent_title_auto_fire）；
+//   * 所以这里不写 `g_sess.title`、不落 `session/title` 事件、不写索引、不上屏
+//     （上屏要等 agent_title_apply 判到「模型起不出来」）。
+// 返回 true = 这次真的派生出了备用标题（调用方据此在回合里挂起标题请求）。
 fn agent_title_derive(text: &const byte, n: usize) bool {
-    if g_sess.title.len > 0 || n == 0 {
+    if n == 0 {
         return false;
     }
     var t: Buf = buf_new(TTY_TITLE_FALLBACK_BYTES + 16);
@@ -1426,21 +1444,12 @@ fn agent_title_derive(text: &const byte, n: usize) bool {
     if t.len == 0 {
         return false;
     }
-    buf_reset(&g_sess.title);
-    _ = buf_append(&g_sess.title, t.ptr as &const byte, t.len);
-    return true;
-}
-
-// 落一条标题事件（DSH 也有 session/title）
-fn agent_title_log_event() void {
-    var tev: Buf = buf_new(256);
-    defer { buf_free(&tev); }
-    if sess_begin(&g_sess, "session/title", &tev) {
-        _ = buf_append_cstr(&tev, "{\"title\":");
-        _ = jw_str_into(&tev, g_sess.title.ptr as &const byte, g_sess.title.len);
-        _ = buf_append_cstr(&tev, ",\"source\":{\"kind\":\"fallback\"}}");
-        _ = sess_end(&g_sess, &tev);
+    if !buf_valid(&g_title_fallback) {
+        g_title_fallback = buf_new(TTY_TITLE_FALLBACK_BYTES + 16);
     }
+    buf_reset(&g_title_fallback);
+    _ = buf_append(&g_title_fallback, t.ptr as &const byte, t.len);
+    return true;
 }
 
 // P46：把「当前标题」重新写进 `/sessions` 用的索引（标题列读的就是它）。
