@@ -22,7 +22,11 @@
 //   所以「浏览器自己解码」是唯一可行的路；⑤ 每响应必带 `Content-Type`：错误也
 //   必须带，否则浏览器把错误当文本、前端的 `res.json()` 会抛在解析上（那才是
 //   最难查的一种）；⑥ 长连接的帧**不在这里拼** —— 那是 `web_push_frame` 的事
-//   （它要 poll 到 POLLOUT 才吐，不能在这个函数里阻塞）。
+//   （它要 poll 到 POLLOUT 才吐，不能在这个函数里阻塞）；⑦ 长连接的**订阅身份
+//   是 `WebConn.sid`（会话 id）**，不是表内下标 —— 下标会随摘表前移，拿下标认会话
+//   会让「关掉前面一条」冻住后面所有订阅者（踩坑 114）；⑧ `/api/close` **只打
+//   `close_wanted` 标记**、不在这里摘表：摘表由主循环一圈末尾的 `web_sweep_closed`
+//   统一做（主循环手上还有一份移动前的 `idx[]`）。
 // 依赖：无 `use` 行（合并命名空间）；本仓 foundation/bufx、net/httpsrv（`srv_*`）、
 //   web/ttyemu（`emu_json_str` / `emu_json_frame`）、web/websrv（会话表）、
 //   web/webui（页面 HTML）、media/imgx（`imgx_sniff` / `imgx_load` / `imgx_ext`）、
@@ -32,11 +36,11 @@
 // 端点表（前端只认这几个）：
 //   GET  /                 页面（HTML，全内嵌，零外链）
 //   GET  /api/sessions     会话列表（顶栏的标签）
-//   POST /api/sessions     新建会话（顶栏最右边的 `+`）
+//   POST /api/sessions?cols=&rows=   新建会话（顶栏最右边的 `+`；尺寸 = 页面量到的格子数）
 //   GET  /api/screen?id=   一帧一行的 NDJSON 长连接
 //   POST /api/input?id=    请求体 = 原文按键字节
 //   POST /api/resize?id=&cols=&rows=
-//   POST /api/close?id=    结束一条会话（收子进程 + 从表里摘掉）
+//   POST /api/close?id=    结束一条会话（收子进程 + 打上"该摘了"的标记）
 //   GET  /api/image?id=    附件图片直传（<agent_home>/attachments/<id>.<ext>）
 
 // ============================================================
@@ -51,8 +55,7 @@ export struct WebConn {
     fd: i32,
     st: u8,
     rx: Buf,            // 请求原文累积
-    sid: Buf,           // 长连接订阅的会话 id
-    sess: isize,        // 会话下标（-1 = 没了）
+    sid: Buf,           // 长连接订阅的会话 id（**身份就是它**，不是表内下标）
     out: Buf,           // 待写出去的字节；poll 到 POLLOUT 才吐（不阻塞主循环）
     out_off: usize,
     replay_i: usize,    // 新连接先补的「最近几帧」游标
@@ -76,7 +79,6 @@ export fn web_conn_init(c: &WebConn, fd: i32) bool {
     // accept(5)=7，后面没有任何 read）。同族坑见 §16 踩坑 92。
     c.out = buf_new(4096);
     c.out_off = 0;
-    c.sess = -1;
     c.replay_i = 0;
     c.replay_n = 0;
     c.need_full = true;
@@ -88,7 +90,6 @@ export fn web_conn_free(c: &WebConn) void {
     buf_free(&c.rx);
     buf_free(&c.sid);
     buf_free(&c.out);
-    c.sess = -1;
     c.out_off = 0;
     c.replay_i = 0;
     c.replay_n = 0;
@@ -166,7 +167,7 @@ export fn web_handle(cfg: &const Config, t: &WebTable, c: &WebConn,
             return false;
         }
         if m == SRV_M_POST {
-            _ = web_ep_session_new(cfg, c, t);
+            _ = web_ep_session_new(cfg, c, t, url, url_off, q_off, q_len);
             return false;
         }
         _ = web_send_error(c.fd, SRV_ST_405, "method not allowed");
@@ -294,15 +295,21 @@ fn web_ep_sessions(cfg: &const Config, c: &WebConn, t: &WebTable) bool {
     return web_send_json(c.fd, &b);
 }
 
-// POST /api/sessions —— `+` 新建。用**请求体里给的尺寸**（前端把当前终端格子
-// 报上来）或默认画布。
-fn web_ep_session_new(cfg: &const Config, c: &WebConn, t: &WebTable) bool {
+// POST /api/sessions?cols=&rows= —— `+` 新建。尺寸用**页面量出来的格子数**：
+// 新建的标签第一次就能按正确宽度起 TUI，而不是先按 100×30 起来、等用户切一下标签
+// 才被 resize 追上（那中间的一屏是错的，也是用户报的「新建会话宽度不对」）。
+// 没带或带了 0 = 用默认画布（`web_size_clamp` 统一夹取）。
+fn web_ep_session_new(cfg: &const Config, c: &WebConn, t: &WebTable,
+    url: &const byte, url_off: usize, q_off: usize, q_len: usize) bool {
     if t.n >= WEB_MAX_SESSIONS {
         return web_send_error(c.fd, SRV_ST_400, "too many sessions");
     }
+    const cols: usize = web_q_size(url, url_off, q_off, q_len,
+        "cols" as &const byte);
+    const rows: usize = web_q_size(url, url_off, q_off, q_len,
+        "rows" as &const byte);
     const empty: Buf = buf_empty();
-    const idx: isize = web_session_new(cfg, t, &empty, EMU_DEF_COLS,
-        EMU_DEF_ROWS);
+    const idx: isize = web_session_new(cfg, t, &empty, cols, rows);
     if idx < 0 {
         return web_send_error(c.fd, SRV_ST_400, "cannot start session");
     }
@@ -314,6 +321,17 @@ fn web_ep_session_new(cfg: &const Config, c: &WebConn, t: &WebTable) bool {
         web_id_len_of(t, idx as usize));
     _ = buf_append_cstr(&b, "\"}");
     return web_send_json(c.fd, &b);
+}
+
+// 取 query 里的一个十进制尺寸（没有 / 不是数字 = 0 = 让 `web_size_clamp` 用默认）。
+fn web_q_size(url: &const byte, url_off: usize, q_off: usize, q_len: usize,
+    key: &const byte) usize {
+    var qv: Buf = buf_new(16);
+    defer { buf_free(&qv); }
+    if !srv_query_get(url, url_off, q_off, q_len, key, &qv) {
+        return 0;
+    }
+    return web_dec_of(&qv);
 }
 
 // GET /api/screen?id= —— 长连接。先发响应头（chunked），把「最近几帧」的回放
@@ -332,7 +350,8 @@ fn web_ep_screen(c: &WebConn, t: &WebTable, url: &const byte, url_off: usize,
         return false;
     }
     c.st = WEB_CONN_STREAM;
-    c.sess = si;
+    // 订阅身份 = **这个 id**（不是下标：下标会随摘表前移，见 webpump 的
+    // `web_conn_wants` 与 §16 踩坑 114）。
     // 回放是「最近几帧」，**不保证含全量帧**（会话刚开、或前 4 帧都是差分）——
     // 所以订阅之后照样要补一帧全量（`web_push_frame` 看这个标记）。
     c.need_full = true;
@@ -418,17 +437,10 @@ fn web_ep_resize(c: &WebConn, t: &WebTable, url: &const byte, url_off: usize,
     }
     const s: &WebSession = &t.items[si as usize];
     // 服务端网格与 PTY 尺寸都跟着改；PTY 改了要**显式**发 SIGWINCH（理由见上）。
-    // 先夹取再赋值（别写 `s.cols = if (…)`：见 ttyemu.emu_move_to 的注）
-    var wc: usize = cols;
-    if (wc > EMU_MAX_COLS) {
-        wc = EMU_MAX_COLS;
-    }
-    var wr: usize = rows;
-    if (wr > EMU_MAX_ROWS) {
-        wr = EMU_MAX_ROWS;
-    }
-    s.cols = wc;
-    s.rows = wr;
+    // 夹取一律走 `web_size_clamp`（与开会话同一条路）—— 否则 `s.cols` 会记着
+    // 用户报的 9999、而网格只有 500 列，两边各说一套。
+    s.cols = web_size_clamp(cols, EMU_MAX_COLS, EMU_DEF_COLS);
+    s.rows = web_size_clamp(rows, EMU_MAX_ROWS, EMU_DEF_ROWS);
     emu_resize(&s.emu, s.cols, s.rows);
     if s.master >= 0 {
         web_set_winsize(s.master, s.cols, s.rows);
@@ -441,10 +453,16 @@ fn web_ep_resize(c: &WebConn, t: &WebTable, url: &const byte, url_off: usize,
     return web_send_ok(c.fd);
 }
 
-// POST /api/close?id= —— 结束一条会话：收子进程 + 关 master + 从表里**摘掉**
-// （后面的条目前移，`cur` 跟着修），并让订阅它的长连接下一圈自然收到 EOF。
-fn web_ep_close(c: &WebConn, t: &WebTable, url: &const byte, url_off: usize,
-    q_off: usize, q_len: usize, id: &Buf) bool {
+// POST /api/close?id= —— 结束一条会话：收子进程 + 关 master + **打上「该摘了」的
+// 标记**，真正的摘表由主循环那一圈的 `web_sweep_closed` 做。
+//
+// 为什么不在**这里**摘（第一版就是那么写的，见踩坑 114）：主循环手上还有一份
+// 「poll 槽 → 会话下标」的映射（`idx[]`），此刻摘表会让后面的条目整体前移 ——
+// 剩下的槽就会读到错的会话；而订阅连接当时也是按下标认会话的，于是
+// 「关掉前面一条」等于让后面所有订阅者**永久收不到帧**（实测：长连接 `frames 6->6`）。
+// 标记 + 一圈末尾统一收摊，两条都治好。
+export fn web_ep_close(c: &WebConn, t: &WebTable, url: &const byte,
+    url_off: usize, q_off: usize, q_len: usize, id: &Buf) bool {
     if !web_q_id(url, url_off, q_off, q_len, id) {
         return web_send_error(c.fd, SRV_ST_400, "missing id");
     }
@@ -452,7 +470,7 @@ fn web_ep_close(c: &WebConn, t: &WebTable, url: &const byte, url_off: usize,
     if si < 0 || si >= WEB_MAX_SESSIONS as isize {
         return web_send_error(c.fd, SRV_ST_404, "unknown session");
     }
-    web_remove_at(t, si as usize);
+    t.items[si as usize].close_wanted = true;
     return web_send_ok(c.fd);
 }
 
@@ -621,7 +639,6 @@ export fn web_conn_value_empty() WebConn {
         st: WEB_CONN_READ,
         rx: buf_empty(),
         sid: buf_empty(),
-        sess: -1,
         out: buf_empty(),
         out_off: 0,
         replay_i: 0,

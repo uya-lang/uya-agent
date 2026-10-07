@@ -2,9 +2,11 @@
 //
 // 本文件：入口（`web_run`）、地址解析（`web_addr_parse`）、主循环与一次泵
 //   （`web_loop` / `web_poll_once`）、以及具体动作 —— 收连接
+//   （`web_poll_once`）、以及具体动作 —— 收连接
 //   （`web_accept_conn`）、PTY 读槽就绪（`web_pty_ready`：读 `web_read_pty` /
 //   收口 `web_pty_eof` + `web_reap_child`）、写 PTY
-//   （`web_write_pty`）、服务连接（`web_service_conn`）、推帧
+//   （`web_write_pty`）、服务连接（`web_service_conn`）、收摊
+//   （`web_sweep_closed` / `web_close_subscribers`）、推帧
 //   （`web_push_session` / `web_push_frame`）。
 // 不变量：① **一次 `poll` 覆盖五类 fd**：listen、每个会话 master 的读、每个
 //   会话 master 的写（有待发输入时）、每个连接的读/写。会话 ≤8、连接 ≤32，定长
@@ -15,16 +17,21 @@
 //   （否则 20 帧/秒的空转流量），而「空不空」由**结构判据** `emu_frame_changed`
 //   回答（行文本 + 光标位置 + 光标可见性 + 行数），**不许**拿拼好的 JSON 去找特征
 //   字节 —— 老版在那里把字面量长度写错一位，判据恒为真、首帧之后一帧都不推
-//   （§16 踩坑 106）；⑤ 子进程死了
-//   就把那条会话标 `alive=false` 但**留着标签** —— 屏幕上是最后一帧，用户还能看见
-//   它说了什么（自动删标签会让「刚才那条怎么没了」无从解释）；判死的依据是
+//   （§16 踩坑 106）；⑤ 子进程死了之后怎么处理，看**它是怎么没的**（踩坑 115）：
+//   正常退出（`/exit` / ctrl+d，退出码 0）⇒ 打 `close_wanted`、由 `web_sweep_closed`
+//   摘掉标签；异常没了 ⇒ **留着标签与最后一帧** —— 屏幕上是它最后说的话，用户还能
+//   看见（自动删标签会让「刚才那条怎么没了」无从解释）；判死的依据是
 //   **`poll` 的 `POLLHUP`/`POLLERR`**，不是 `read` 的返回值（子进程死后 master 上
 //   的 `read` 给的是 EIO 而不是 0，只认 0 会收不掉 ⇒ 水平触发的 HUP 让主循环空转、
 //   页面上表现为打不进字 —— §16 踩坑 105）；收口时必须**关 master**（否则它永远
 //   留在 poll 集合里「就绪」）并回收子进程（否则留 `<defunct>` 僵尸）；
 //   ⑥ 退出走 `web_quit_wanted()`（ctrl+c → sigx 置位），收尾时按进程组收所有子进程；
 //   ⑦ 差分基准在**会话**上：`web_push_session` 先算一次「变了没有」、发给每个订阅者、
-//   最后才 `emu_snapshot`（先快照会让同一会话的第二条连接永远收不到帧）。
+//   最后才 `emu_snapshot`（先快照会让同一会话的第二条连接永远收不到帧）；
+//   ⑧ **订阅的身份是会话 id，不是表内下标**（`web_conn_wants`）：下标是位置，会随
+//   摘表漂移 —— 拿下标认会话会让「关掉前面一条」冻住后面所有订阅者（踩坑 114）；
+//   ⑨ **摘表只发生在一圈就绪 fd 全部处理完之后**（`web_sweep_closed`）：`idx[]` 里
+//   记的是移动**前**的下标。收摊顺序是「先给订阅者写分块终止块 → 关连接 → 再摘表」。
 // 依赖：无 `use` 行（合并命名空间）；本仓 net/httpsrv（`srv_*`）、web/ttyemu
 //   （`emu_*`）、web/websrv（会话表）、web/webhttp（连接与端点）、session/sigx
 //   （`sigx_*`）、agent（`Config` / `agent_default_home`）。
@@ -265,6 +272,9 @@ fn web_poll_once(cfg: &const Config, t: &WebTable, lfd: i32,
         }
         k = k + 1;
     }
+    // 就绪 fd 全部处理完**才**收摊（摘表会让后面的条目整体前移，而上面的 `idx[]`
+    // 还是移动前的旧下标 —— 见 `web_sweep_closed` 与踩坑 114）。
+    web_sweep_closed(t, &conns[0], &used[0]);
     web_push_all(t, &conns[0], &used[0]);
 }
 
@@ -313,7 +323,14 @@ export fn web_pty_ready(t: &WebTable, i: usize, revents: i16) void {
 }
 
 // 收掉一条**真的结束**了的会话：关 master → 回收子进程 → 标 `alive = false`。
-// 但**留着标签与最后一帧**（理由见文件头不变量 ⑤）。
+//
+// 之后怎么处理这条会话，看子进程**是怎么没的**（这一区分以前丢了，见踩坑 115）：
+//   * **正常退出**（`/exit` / ctrl+d / 命令面板里选中 `/exit`，退出码 0）
+//     ⇒ 打上 `close_wanted`，由 `web_sweep_closed` 摘掉标签。用户已经明确说
+//     「我不用它了」，把标签留着只会攒出一排点不动的死标签；
+//   * **异常没了**（被信号杀 / 非零退出 / 收不到 wait status）
+//     ⇒ **留着标签与最后一帧**，屏幕上还能看见它说了什么（不变量 ⑤ 只对这条成立 ——
+//     自动删标签会让「刚才那条怎么没了」无从解释）。
 //
 // 两个「为什么」：
 // ① 为什么这里才是 EOF 判据：子进程死后 PTY master 上的 `read` 返回 **EIO**
@@ -335,12 +352,16 @@ export fn web_pty_eof(t: &WebTable, i: usize) void {
         srv_close(s.master);
         s.master = -1;
     }
-    if web_reap_child(s) {
+    var clean: bool = false;
+    if web_reap_child(s, &clean) {
         // **收到之后必须清 pid**：`web_pty_close`（退出收尾）会 `kill(-pid)` 与
         // `kill(pid)`，而 pid 已经被内核回收、可能被别的进程复用 —— 留着它去 kill
         // 就等于**误杀别人**。收不到（子进程还活着、只是关了 tty）才留着 pid，
         // 那种情况 kill 才是唯一能收干净的路。
         s.pid = 0;
+    }
+    if clean {
+        s.close_wanted = true;
     }
     s.alive = false;
 }
@@ -348,14 +369,74 @@ export fn web_pty_eof(t: &WebTable, i: usize) void {
 // 回收会话的子进程（**非阻塞**：WNOHANG）。返回「这次真的收到了」。
 // 不回收它就一直是 `<defunct>` 僵尸（实测：用户那三台实例各躺一个，父进程已经
 // 空转了 94 分钟）。
-fn web_reap_child(s: &WebSession) bool {
+//
+// `clean_out` 收「子进程是自己正常退出的吗」：wait status 的低 8 位是终止信号
+// （0 = 没被信号杀），次高 8 位是退出码 —— 两个都为 0 才算正常退出（`/exit` 与
+// ctrl+d 实测都是 exit code 0）。收不到子进程时不动它。
+fn web_reap_child(s: &WebSession, clean_out: &bool) bool {
     if s.pid <= 0 {
         return false;
     }
     var st: i32 = 0;
     // 第三参 `1` 是 WNOHANG（libc 没导出这个常量；与 sigselftest.uya 的既有写法一致）
     const w: i32 = sys_waitpid(s.pid, &st, 1) catch { -1; };
-    return w == s.pid;
+    const got: bool = w == s.pid;
+    if got {
+        const sig: i32 = st & 127;
+        const code: i32 = (st >> 8) & 255;
+        clean_out[0] = sig == 0 && code == 0;
+    }
+    return got;
+}
+
+// 收摊：把 `close_wanted` 那些会话**摘掉**，并先给订着它的长连接一个干净的收尾。
+//
+// 为什么单独一步、而且要等一圈就绪 fd 全部处理完：`web_remove_at` 会让后面的条目
+// 整体前移，而主循环手上的 `idx[]`（poll 槽 → 会话下标）还是**移动前**的旧下标 ——
+// 在处理途中摘表，后面的槽就会读到错的会话（同族：踩坑 114 的下标当身份）。
+//
+// 顺序：**先写分块终止块、再关连接、最后才摘表**。
+//   * 不写终止块：浏览器读到截断的分块体（network error），前端就没法把
+//     「会话正常结束」与「连接坏了」分开；
+//   * 先摘表再关连接：这条连接的下标会指向移动后的另一条会话，它接着就会收到
+//     别人的帧（实测症状：订阅最后一条时关掉第一条，长连接**再也不推帧** —— 因为
+//     `sess` 指向的那条刚好没人动它）。
+export fn web_sweep_closed(t: &WebTable, conns: &WebConn, used: &bool) void {
+    var i: usize = 0;
+    while i < t.n && i < WEB_MAX_SESSIONS {
+        const s: &const WebSession = &t.items[i];
+        if s.close_wanted {
+            web_close_subscribers(t, conns, used, i as isize);
+            web_remove_at(t, i);
+            // 移表之后同一个下标已经是**下一条**会话了：不前进，重新看这一格。
+            continue;
+        }
+        i = i + 1;
+    }
+}
+
+// 给订了会话 `si` 的所有长连接写终止块并关掉（幂等：没订阅者时什么都不做）。
+fn web_close_subscribers(t: &WebTable, conns: &WebConn, used: &bool,
+    si: isize) void {
+    if si < 0 || si >= WEB_MAX_SESSIONS as isize {
+        return;
+    }
+    const s: &const WebSession = &t.items[si as usize];
+    var j: usize = 0;
+    while j < WEB_MAX_CONNS {
+        const c: &WebConn = &conns[j];
+        if used[j] && c.st == WEB_CONN_STREAM && web_conn_wants(c, s) {
+            // 尽力写一次终止块：写不出去也无所谓（对端已经走了），反正下面要关。
+            _ = srv_send_end(c.fd);
+            used[j] = false;
+            if c.fd >= 0 {
+                srv_close(c.fd);
+                c.fd = -1;
+            }
+            web_conn_free(c);
+        }
+        j = j + 1;
+    }
 }
 
 // 读一条会话的 PTY：一次最多 WEB_READ_CHUNK，读完塞进解释器。
@@ -516,8 +597,8 @@ fn web_conn_close(c: &WebConn, used: &bool, ci: usize) void {
 fn web_push_all(t: &WebTable, conns: &WebConn, used: &bool) void {
     var i: usize = 0;
     while i < WEB_MAX_SESSIONS {
-        if i < t.n && web_has_subscriber(conns, used, i as isize) {
-            web_push_session(&t.items[i], conns, used, i as isize);
+        if i < t.n && web_has_subscriber(conns, used, &t.items[i]) {
+            web_push_session(&t.items[i], conns, used);
         }
         i = i + 1;
     }
@@ -525,15 +606,34 @@ fn web_push_all(t: &WebTable, conns: &WebConn, used: &bool) void {
 
 // 有没有连接订阅了这条会话。没有就别算差分 —— 一次比较是 30 行 × 行宽，
 // 空转的会话（8 条都开着而只看着一条）不该每 50ms 白做一遍。
-fn web_has_subscriber(conns: &WebConn, used: &bool, si: isize) bool {
+fn web_has_subscriber(conns: &WebConn, used: &bool, s: &const WebSession) bool {
+    if s.id.len == 0 {
+        return false;
+    }
     var j: usize = 0;
     while j < WEB_MAX_CONNS {
-        if used[j] && conns[j].st == WEB_CONN_STREAM && conns[j].sess == si {
+        if used[j] && conns[j].st == WEB_CONN_STREAM
+            && web_conn_wants(&conns[j], s) {
             return true;
         }
         j = j + 1;
     }
     return false;
+}
+
+// 这条连接订的是不是这条会话 —— 判据是**会话 id**，不是表内下标。
+//
+// 为什么不能拿下标当身份（踩坑 114）：下标是**位置**，`web_remove_at` 会让后面的
+// 条目整体前移，于是「连接记的 3」在别人被摘掉之后就指向了另一条会话。实测症状：
+// 订阅最后一条会话时关掉第一条，那条长连接**再也不推帧**（推给了下标 3 现在的
+// 那条，而它没变化）——页面永久冻死。id 是服务端预生成、且同一个 cwd 下唯一的
+// （`sess_session_path` 的保证），拿它当身份不会漂移。
+fn web_conn_wants(c: &const WebConn, s: &const WebSession) bool {
+    if s.id.len == 0 || c.sid.len != s.id.len {
+        return false;
+    }
+    return bufx_mem_eq(c.sid.ptr as &const byte, s.id.ptr as &const byte,
+        s.id.len);
 }
 
 // 一条会话这一轮的帧：**先算一次「变了没有」，再发给它的每个订阅者**。
@@ -543,13 +643,16 @@ fn web_has_subscriber(conns: &WebConn, used: &bool, si: isize) bool {
 // 所有订阅者都发完再调。老版把这两件事都放在「给一个连接推一帧」里 ⇒ 第一个
 // 订阅者推完就推进了 prev ⇒ 同一会话的第二个订阅者永远算成「没变」、一个字节
 // 都收不到（同一个会话开两个页面时只有一个会刷新）。
-fn web_push_session(s: &WebSession, conns: &WebConn, used: &bool,
-    si: isize) void {
+//
+// 订阅者按**会话 id** 认（`web_conn_wants`），不按表内下标 —— 下标会随摘表漂移，
+// 见踩坑 114 与 `web_conn_wants` 的注。
+fn web_push_session(s: &WebSession, conns: &WebConn, used: &bool) void {
     const changed: bool = emu_frame_changed(&s.emu, &s.scratch);
     var sent: bool = false;
     var j: usize = 0;
     while j < WEB_MAX_CONNS {
-        if used[j] && conns[j].st == WEB_CONN_STREAM && conns[j].sess == si {
+        if used[j] && conns[j].st == WEB_CONN_STREAM
+            && web_conn_wants(&conns[j], s) {
             if web_push_frame(s, &conns[j], changed) {
                 sent = true;
             }
