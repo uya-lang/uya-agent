@@ -4564,6 +4564,59 @@ responses 用 `{"type":"input_image","detail":"auto","image_url":…}`；
      形态上测）；反过来也成立：**新判据会照亮别处的既有缺陷**，那时先分清「是谁的账」——
      本轮这条是既有的，但它让「写回偶发失败」有了稳定复现路径，所以一并修掉。
 
+129. **换宿主编译器（GCC 14+）把四类「以前只是 warning」的账一次收走 —— 报错全在
+    编译器生成的 C 里，可改的只有 uya 侧与 Makefile**（本轮；本机 cc = GCC 15.2，
+    `make check` 全绿、`make build` 成片失败）：
+
+    ① **无体 `extern "libc" fn` 不发射 C 原型 ⇒ 隐式函数声明**。codegen 是**故意**不生成
+    这类声明的（`uya/src/codegen/c99/function.uya`：它假定宿主系统头已声明过），而 split-C
+    的每个 `.c` 只 include `uya_*.h`、从不 include 系统头 ⇒ `setsid`（websrv / shellx /
+    mcprun 三处）与 `sigaction`（sigx）的调用点在 C 里都是隐式声明。
+    **修法**：`src/cshim/uya_agent_libc_protos.h` 补原型，Makefile 用
+    `CFLAGS=… -include <那个头>` 注入。原型必须落在**出错的那个 TU** 里 ——
+    单放一个 `.c` 里（`@c_import`）没用，那只是另一个翻译单元。
+    那个头**绝不能 include 系统头**：生成的 `uya_part1_types.h` 自带 `int64_t` / `size_t`，
+    再拉进 glibc 的 `<sys/types.h>` 就是满屏 conflicting types（所以它只用 C 内置类型 +
+    前向声明 `struct SigxAction`）。
+
+    ② **指针类型对不上**（这一族最多，且每处都改得动）：自造同布局结构体传给 libc 指针
+    （`GxTimeVal` / `TuiTimeVal` vs `TimeVal` ⇒ 用 libc 的 `TimeVal` —— 同布局**不等于**
+    同一个 C 类型）；uya 侧收 `&byte`、实参是 `&const byte`（`jw_str` / `js_parse` /
+    `cstr_len` / `arg_starts_with` / `buf_from_cstr` ⇒ 入参收 `&const byte`，只在边界上
+    显式 `as &byte` 转一次，让 const 只在一处被抹掉）；`&g_watch_cfg` 而它**自己就是**
+    `&const Config`（取址成了 `Config**`）；`&fds`（`int(*)[2]`）当 `&i32` 用（⇒ `&fds[0]`）。
+
+    ③ **`{0}` 套在标量上**：`History.items` 是 `&Msg`（裸指针）不是切片，写 `items: []`
+    时 codegen 发出 `.items = {0}` ⇒ braces around scalar initializer
+    （⇒ 写 `items: null`）。
+
+    ④ **生成物里有裸方向控制符**：`escape_string_for_c` 只转义 `\n \t \r \\ "`，其余字节
+    原样吐进 C 字面量；夹具里的 U+202E（RLO）/ U+200B 于是变成生成物里的裸字节 ⇒ 宿主
+    的 `-Wbidi-chars` 报「源码里有方向控制符」（源码侧本来是转义写法）。⇒ 夹具改**按字节**喂。
+
+    **CFLAGS 怎么注入（同一条已经踩过两次）**：driver 按
+    `make -C <cache> CC=… CFLAGS=… …` 调它生成的 `build/uyacache/Makefile`，
+    **命令行变量压过里面的 `CFLAGS ?=`** —— 所以真生效的是 `make build` 那条命令上写的
+    `CFLAGS=`（`AGENT_CFLAGS`），生成 Makefile 里那行
+    `-std=c99 -Wall -Wextra -pedantic -I.` 对本路径**从不生效**（它只管「有人手跑
+    make -C build/uyacache」那一路）。写就写**全**：漏 `-std=c99` 会让
+    `typedef _Bool bool` 当场报错；**别**照抄那行「看着像基线」的档位 —— 落在生成代码上
+    实测从 **0 条**刷到 **1.8 万条**告警，而那些一条都不归本仓修，只会把真告警淹掉。
+    注入用**行内赋值**、不用 `export`（同踩坑 90：`export` 会漏进 `make selftest` 里
+    agent 自己发起的构建，等于把本仓的原型头强加给别人的编译）。手工编译按
+    `$(make -s print-cflags)` 带上。
+
+    **顺带揪出两处真 bug** —— 宿主 C 的报错只是把「uya checker 没拦住」显形：
+    `agent_effort_apply` 把 C 串传给了收 `&const Buf` 的 `sv_eq_cstr`（P55 那条「人手动
+    改过档位就别再自动降档」的判定一直在读错内存）；`agent_pm_note_tool` 的 (指针, 长度)
+    传的是 `&res_f.ptr, &res_f.len`（**取字段地址**当内容与长度 ⇒ 记进项目记忆的是错内存 +
+    一个巨大的长度）。
+
+    教训：**「只是 warning」不是可以欠的账，它只是把到期日推给下一次换编译器**。
+    这条链上没有任何判据看得见它（`make check` 只查 uya 类型，生成物里的 C 它不看），
+    所以「GCC 版本升到 14+」这件事本身要当成一次**全量重编 + 逐个收账**的时机。
+    同族：`make lint-size` / `doc-audit` 也看不见 C 侧的 const 与原型。
+
 ---
 
 ## 17. 工具实现要点

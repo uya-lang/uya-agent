@@ -44,8 +44,8 @@
 # 这三处都已在 /home/winger/uya/uya 修掉（提交：`fc577783` checker 五张定长表改动态哈希表、
 # `7c49de57` 输入文件表可增长、`1267dbc6` reachable 函数表按实际条数分配）。
 # 换别的编译器时请先确认这三条都已修，否则 build 会以看不懂的方式失败。
-UYA_ROOT ?= /home/winger/uya/uya/lib/
-UYA      ?= /home/winger/uya/uya/bin/uya
+UYA_ROOT ?= ../uya/lib/
+UYA      ?= ../uya/bin/uya
 
 STATIC ?= 1
 ifeq ($(STATIC),1)
@@ -53,6 +53,43 @@ AGENT_LDFLAGS := -static
 else
 AGENT_LDFLAGS :=
 endif
+
+# 给「无体 extern "libc" fn」（setsid / sigaction）补 C 原型 —— 编译器**故意**不发射
+# 这类原型（见 ../uya/src/codegen/c99/function.uya），它假设宿主系统头已声明；而 split-C
+# 的每个 .c 只 include uya_*.h，从不 include 系统头，所以调用点在 C 里是隐式声明。
+# GCC 14 起隐式函数声明是**错误**（本机 cc = GCC 15.2），不修就构建不过（踩坑 129）。
+#
+# 这也修「implicit declaration」，但与上面 ② 的**原因完全不同**，别混：
+#   上面 ② 是编译器**静默丢函数**（定长表满），修在编译器；
+#   这里是编译器**故意不发原型**，修在本仓的 CFLAGS 注入。
+#
+# 怎么注入：driver 按 `make -C <cache> CC=… CFLAGS=… LDFLAGS=… …` 调生成出来的
+# build/uyacache/Makefile（见 ../uya/src/driver/toolchain.uya 的 link_split_with_make），
+# **命令行 CFLAGS 压过生成 Makefile 里的 `CFLAGS ?=`** —— 所以 build 那条命令上写的
+# `CFLAGS=`（见 AGENT_CFLAGS）才是本次构建真用的宿主档位；生成 Makefile 里那行
+# `-std=c99 -Wall -Wextra -pedantic -I.` 对本路径**从不生效**（它只管「有人手跑
+# make -C build/uyacache」那一路）。
+#
+# 于是写回来的是 **driver 的默认值**（toolchain.uya：get_env_or_default("CFLAGS",
+# "-std=c99 -O0 -fno-builtin")），而且要写**全**：漏掉 `-std=c99` 会让
+# `typedef _Bool bool` 当场报「'bool' cannot be defined via 'typedef'」。
+#
+# 千万别照抄生成 Makefile 那行 —— 那不是「基线」，是**另一套档位**（丢 -fno-builtin、
+# 多开 -Wall -Wextra -pedantic）：这几条旗标落在**编译器生成的** C 上会刷出 1.8 万条
+# 告警（uya_part1_types.h 的 `_Atomic` 不算 C99、uya_split_protos.h 与 builtin 原型
+# 不匹配、asbang 的 `({})`、生成函数的 unused-function/parameter…），而那些一行都不
+# 归本仓修，只会把真告警淹掉。实测：抄它 0 条 → 1.8 万条。
+# 换编译器时对齐这里：`uya build` 回显的 cc 命令行里 `-c` 与 `-I.` 之间就是它。
+# 换档位用 AGENT_CFLAGS_BASE（`make build CFLAGS=…` 不算数，同踩坑 90 的 LDFLAGS）。
+# 原型也必须出现在**出错的那个 .c** 里：单放一个 .c 文件（@c_import）没用 ——
+# 那只是另一个翻译单元，看不到本 TU 的隐式声明。
+AGENT_C_PROTOS    := $(CURDIR)/src/cshim/uya_agent_libc_protos.h
+AGENT_CFLAGS_BASE ?= -std=c99 -O0 -fno-builtin
+AGENT_CFLAGS      := $(AGENT_CFLAGS_BASE) -include $(AGENT_C_PROTOS)
+
+# 为什么用行内赋值而不是 export（同踩坑 90 那条 LDFLAGS 的教训）：export 会漏进**所有**
+# recipe 的环境，包括 `make selftest`（它内部 fork bash、由 agent 自己去 `uya build` 编
+# 东西）—— 那等于把本仓的原型头强加给**别人**的构建。所以只加在编译那一条命令上。
 
 # 源码按**域**分目录（一个域一个子目录，一文件一职责）—— 见 CODING.md。
 # Uya 的模块是「目录即模块」，且跨目录**合并命名空间**，所以：
@@ -94,15 +131,21 @@ TASK ?= 创建 hello.uya，编译并运行它
 export UYA_ROOT
 export UYA_SPLIT_C_DIR := $(CURDIR)/build/uyacache
 
-.PHONY: all check print-src build link-audit selftest codegen-audit doc-audit lint-size lint-size-all doc-cover probe e2e e2e-config e2e-exec e2e-accept-nudge e2e-config-flags e2e-title e2e-title-cmd e2e-title-auto e2e-mouse e2e-api e2e-steps e2e-permission e2e-sandbox e2e-tasks e2e-goal e2e-memory e2e-sessions e2e-resume-big e2e-diff e2e-ws e2e-model e2e-model-save e2e-model-route e2e-worktree e2e-watch e2e-watch-pick e2e-dsh e2e-portable p30-check tui-demo tui-selftest web-selftest sess-selftest diff-selftest model-selftest panel-selftest clean shell-selftest pm-selftest mcp-selftest
+# 行宽豁免：一条 .PHONY 就是一张全仓目标清单，拆行反而看不清哪条丢了
+.PHONY: all check print-src print-cflags build link-audit selftest codegen-audit doc-audit lint-size lint-size-all doc-cover probe e2e e2e-config e2e-exec e2e-accept-nudge e2e-config-flags e2e-title e2e-title-cmd e2e-title-auto e2e-mouse e2e-api e2e-steps e2e-permission e2e-sandbox e2e-tasks e2e-goal e2e-memory e2e-sessions e2e-resume-big e2e-diff e2e-ws e2e-model e2e-model-save e2e-model-route e2e-worktree e2e-watch e2e-watch-pick e2e-dsh e2e-portable p30-check tui-demo tui-selftest web-selftest sess-selftest diff-selftest model-selftest panel-selftest clean shell-selftest pm-selftest mcp-selftest
 
 all: build
 
 # 打印源文件清单（一行，空格分隔）。给「不走 make 的手工编译」和脚手架用：
-#   uya build $(make -s print-src) -o build/uya-agent
+#   CFLAGS="$(make -s print-cflags)" uya build $(make -s print-src) -o build/uya-agent
 # 清单只在这一个地方维护（SRC），别在 README / 脚本里手抄。
 print-src:
 	@echo $(SRC)
+
+# 打印本仓需要的宿主 CFLAGS（driver 默认档位 + 原型头的 -include）。手工编译时按上面
+# 那条命令行带上；少了它，GCC 14+ 会把隐式函数声明当错误（踩坑 129）。
+print-cflags:
+	@echo $(AGENT_CFLAGS)
 
 check:
 	@mkdir -p build
@@ -110,7 +153,7 @@ check:
 
 build:
 	@mkdir -p build
-	LDFLAGS="$(AGENT_LDFLAGS)" $(UYA) build $(SRC) -o $(OUT)
+	CFLAGS="$(AGENT_CFLAGS)" LDFLAGS="$(AGENT_LDFLAGS)" $(UYA) build $(SRC) -o $(OUT)
 ifeq ($(STATIC),1)
 	@$(MAKE) --no-print-directory link-audit
 endif
