@@ -408,6 +408,9 @@ make sess-selftest         # 只跑 /sessions 与大日志
 make diff-selftest         # 只跑 src/diff/
 make web-selftest          # 只跑 web 界面（服务端终端解释器 / HTTP 侧 / 页面 / 分派语义 / PTY 收口 / 段表单位 / 新建尺寸 / 退出收摊）
 make pm-selftest           # 只跑 src/pm/（项目记忆）
+make e2e-memory-live       # 项目记忆的**真机接线**：跑真二进制，断言分片真的落盘
+                           # （带真 stat 锚点）+ 跨会话注入 + 改→STALE + 删→GONE
+                           # （纯函数自测覆盖不到接线层，见 DESIGN §16 踩坑 129）
 make mcp-selftest          # 只跑 src/plugin/（MCP 插件：公开名 / 握手 / 派发 / 降级）
 make UYA_SELFTEST_ONLY=x,y # 只跑指定的几轮
 ```
