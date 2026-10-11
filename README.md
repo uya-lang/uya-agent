@@ -4,7 +4,9 @@
 多轮 loop 直到给出结论。**不引入任何 C 代码、`@c_import` 或其它语言**，只依赖 Uya 语言与
 随编译器分发的标准库。
 
-**P0–P59 全部完成**，主线版本串 `p59-max-tokens`。
+**P0–P76 全部完成**，主线版本串 `p59-max-tokens`（**版本串只在选定要动
+`AGENT_VERSION` 的那条线才改** —— P60 起各线都沿用 `p59-max-tokens`，见
+`src/agent/ag_tui_sessions.uya` 的编号说明；各阶段做了什么见 [DESIGN.md §19](DESIGN.md)）。
 
 | 文档 | 看什么 |
 |---|---|
@@ -416,8 +418,9 @@ make mcp-selftest          # 只跑 src/plugin/（MCP 插件：公开名 / 握�
 make UYA_SELFTEST_ONLY=x,y # 只跑指定的几轮
 ```
 
-**逐轮覆盖点**（148 个具名轮次）见 [DESIGN.md §19](DESIGN.md) —— 那里也是**逐阶段的验收记录**
-（P1–P58 的 before/after 命令、真机对照实验、被自测当场抓住的自身缺陷）。
+**逐轮覆盖点**（§19 的轮次表共 **171 行 / 170 个不重名**的轮次 —— `tui-model` 记了两条）
+见 [DESIGN.md §19](DESIGN.md) —— 那里也是**逐阶段的验收记录**
+（P1–P76 的 before/after 命令、真机对照实验、被自测当场抓住的自身缺陷）。
 
 **验收纪律**（改完必须做，见 [CODING.md §5](CODING.md)）：
 
@@ -759,5 +762,5 @@ DEEPSEEK_API_KEY=sk-xxx ./build/uya-agent \
 * 换到 `uya-0.11`：`tls/https.uya`、`std/json/*`、`x509/verify.uya` 与 0.10 逐字节相同，
   但 `libc/syscall.uya`、`std/runtime/runtime.uya`、`tls/ssl/context.uya` 有差异，需要重新验证。
 * **文件数上限 64 与函数表容量**（uya 0.10.1 的两条硬约束）：**都已在 0.10.3 解除**
-  （输入文件表改为可增长、checker 的五张定长表改动态哈希表）；本仓现在是 90 个构建文件、
+  （输入文件表改为可增长、checker 的五张定长表改动态哈希表）；本仓现在是 113 个构建文件、
   函数可以净增。换/降编译器前先读 [CODING.md §1.2.1 / §6](CODING.md) —— 症状与最小复现都记在那里。
