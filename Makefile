@@ -94,7 +94,7 @@ TASK ?= 创建 hello.uya，编译并运行它
 export UYA_ROOT
 export UYA_SPLIT_C_DIR := $(CURDIR)/build/uyacache
 
-.PHONY: all check print-src build link-audit selftest codegen-audit doc-audit lint-size lint-size-all doc-cover probe e2e e2e-config e2e-exec e2e-accept-nudge e2e-config-flags e2e-title e2e-title-cmd e2e-title-auto e2e-mouse e2e-api e2e-steps e2e-permission e2e-sandbox e2e-tasks e2e-goal e2e-memory e2e-sessions e2e-resume-big e2e-diff e2e-ws e2e-model e2e-model-save e2e-model-route e2e-worktree e2e-watch e2e-watch-pick e2e-dsh e2e-portable p30-check tui-demo tui-selftest web-selftest sess-selftest diff-selftest model-selftest panel-selftest clean shell-selftest pm-selftest mcp-selftest
+.PHONY: all check print-src build link-audit selftest codegen-audit doc-audit lint-size lint-size-all doc-cover probe e2e e2e-config e2e-exec e2e-accept-nudge e2e-config-flags e2e-title e2e-title-cmd e2e-title-auto e2e-mouse e2e-api e2e-steps e2e-permission e2e-sandbox e2e-tasks e2e-goal e2e-memory e2e-memory-live e2e-sessions e2e-resume-big e2e-diff e2e-ws e2e-model e2e-model-save e2e-model-route e2e-worktree e2e-watch e2e-watch-pick e2e-dsh e2e-portable p30-check tui-demo tui-selftest web-selftest sess-selftest diff-selftest model-selftest panel-selftest clean shell-selftest pm-selftest mcp-selftest
 
 all: build
 
@@ -198,7 +198,7 @@ lint-size-all:
 #   本仓实测：90 文件树上净增 50 个函数 + `rm -rf build && make build` → 通过（静态链接审计通过）。
 #   因此「净增函数按 0 处理」那条纪律作废。这段留下的用处只有一个：**换/降编译器时认得出症状**
 #   （报错点落在标准库、`make check` 全绿、只有清缓存重编才炸）。
-selftest: build codegen-audit doc-audit doc-cover e2e-exec e2e-accept-nudge e2e-config-flags e2e-title e2e-title-cmd e2e-title-auto e2e-mouse e2e-api e2e-steps e2e-permission e2e-sandbox e2e-tasks e2e-goal e2e-memory e2e-sessions e2e-resume-big e2e-diff e2e-ws e2e-model e2e-model-save e2e-model-route e2e-worktree e2e-portable p30-check
+selftest: build codegen-audit doc-audit doc-cover e2e-exec e2e-accept-nudge e2e-config-flags e2e-title e2e-title-cmd e2e-title-auto e2e-mouse e2e-api e2e-steps e2e-permission e2e-sandbox e2e-tasks e2e-goal e2e-memory e2e-memory-live e2e-sessions e2e-resume-big e2e-diff e2e-ws e2e-model e2e-model-save e2e-model-route e2e-worktree e2e-portable p30-check
 	UYA_BIN=$(UYA) $(OUT) --selftest
 
 probe: build
@@ -334,6 +334,118 @@ e2e-memory: build
 	echo "$$out" | grep -qF "/memory    项目记忆" \
 		|| { echo "FAIL: /help 里没有 /memory"; exit 1; }; \
 	echo "e2e-memory: 通过（print-config 两条 / 报告头 / 空态 / 非法参数 / off / /help）"
+
+# P68 尾巴：项目记忆的**真机接线**回归（离线，靠 testdata/mock_gateway_memory.py）。
+#
+# 为什么必须单开一轮：`src/selftest/st_pm2.uya` 的 pm-e2e 轮**直接调**摄取函数、并手写正确
+# 的参数（`res.ptr` / `res.len`），所以它证明的是「摄取函数本身对」，**不是接线对** ——
+# 生产代码里那两处坏调用点它一条都覆盖不到：
+#   ① `agent_pm_set_sid` 排在 `agent_pm_begin` 之前 ⇒ 绑定失败 ⇒ `g_pm_ing.enabled` 恒 false；
+#   ② 传 `&res.ptr` / `&res.len`（**字段的地址**）而不是 `res.ptr` / `res.len`（值）
+#      ⇒ 野指针 + 天文数字长度 ⇒ 段错误。
+# 两处叠加的后果是**记忆从来没写进盘过**（现象被读成「记忆一直不失效」，其实盘上是空的），
+# 而当时 151 轮 selftest + 6 轮 pm-selftest 全绿。这一轮跑**真二进制**，钉五条腿：
+#   ① 摄取真的落盘，且 layout 那条**带真 stat 锚点**（锚点全 0 = 摄取没拿到 stat）；
+#   ② 跨会话真的注入（只看 `<pm-memory>…</pm-memory>` 那一小段，不看整包请求）；
+#   ③ 改了文件那条真的标 STALE；④ 删了文件那条真的标 GONE；⑤ `--no-memory` 真的不落盘。
+e2e-memory-live: build
+	@set -e; \
+	ws=$(CURDIR)/build/e2e_mem_ws; \
+	home=$(CURDIR)/build/e2e_mem_home; \
+	home_nm=$(CURDIR)/build/e2e_mem_home_nomem; \
+	rm -rf $$ws $$home $$home_nm; mkdir -p $$ws; \
+	printf 'build:\n\t@echo MEM-BUILD-OK\n' > $$ws/Makefile; \
+	printf 'mem live line one\nmem live line two\n' > $$ws/README.md; \
+	: "夹具必须是**自己的** git 仓：否则 pm_repo_root 一路走到本仓的 .git，"; \
+	: "项目键会跟真仓库撞上（那就不隔离了，也会污染真记忆目录）"; \
+	: "没有 git 也不 skip：项目键会退化成 workspace 路径本身，五条腿照样成立（与 e2e-diff 的 skip 不同）"; \
+	( cd $$ws && git init -q . ) || true; \
+	dl=$(CURDIR)/build/e2e_mem_d1; d2=$(CURDIR)/build/e2e_mem_d2; \
+	d3=$(CURDIR)/build/e2e_mem_d3; d4=$(CURDIR)/build/e2e_mem_d4; \
+	d5=$(CURDIR)/build/e2e_mem_d5; \
+	: "每会话一个**新**网关进程：脚本按本进程收到的第几次请求推进，复用会错位"; \
+	run_sess() { \
+		dump="$$1"; h="$$2"; task="$$3"; shift 3; \
+		rm -f "$$dump" "$$dump.gw"; \
+		UYA_MEM_DUMP="$$dump" python3 testdata/mock_gateway_memory.py 0 README.md "make -n" > "$$dump.gw" 2>&1 & \
+		pid=$$!; \
+		i=0; \
+		while [ ! -s "$$dump.gw" ] && [ $$i -lt 60 ]; do sleep 0.1; i=$$((i+1)); done; \
+		port=$$(awk '/^PORT/{print $$2}' "$$dump.gw"); \
+		if [ -z "$$port" ]; then \
+			echo "FAIL: 假网关没起来"; cat "$$dump.gw"; \
+			kill $$pid 2>/dev/null || true; exit 1; \
+		fi; \
+		rc=0; \
+		UYA_AGENT_API_KEY=k $(OUT) --no-dsh-config --no-stream --no-tui --quiet \
+			--base-url "http://127.0.0.1:$$port/v1" --api=chat --model mock-model \
+			--workspace $$ws --agent-home "$$h" --tls-verify=none "$$@" "$$task" \
+			> "$$dump.out" 2>&1 || rc=$$?; \
+		kill $$pid 2>/dev/null || true; \
+		if [ $$rc -ne 0 ]; then \
+			echo "FAIL: agent 退出码 $$rc（139=段错误，通常是把字段地址当值传）"; \
+			tail -5 "$$dump.out"; exit 1; \
+		fi; \
+	}; \
+	: "只取注入的那一小段：整包请求里 README.md 还会从工具参数里出现，那是假绿"; \
+	mem_block() { grep -o '<pm-memory>.*</pm-memory>' "$$1" | head -1; }; \
+	: "---- 会话 1：摄取 ----"; \
+	run_sess "$$dl" "$$home" "第一个会话"; \
+	shard=$$(find $$home -path '*memory*/obs/*.jsonl' | head -1); \
+	if [ -z "$$shard" ]; then \
+		echo "FAIL: 一个记忆分片都没落盘（摄取整条死了）"; \
+		echo "      先查 agent_pm_set_sid 的绑定时机，再查 note_tool 的传参"; \
+		tail -5 "$$dl.out"; exit 1; \
+	fi; \
+	lg=$$(grep '"kind":"layout"' $$shard | head -1); \
+	echo "$$lg" | grep -q '"key":"README.md"' \
+		|| { echo "FAIL: layout 事实里没有 README.md"; cat $$shard; exit 1; }; \
+	echo "$$lg" | grep -q '"mt":0,' \
+		&& { echo "FAIL: layout 的 mtime 锚点是 0（摄取没拿到真 stat）"; exit 1; } || true; \
+	echo "$$lg" | grep -q '"mtNs":0,' \
+		&& { echo "FAIL: layout 的 mtime_nsec 锚点是 0（摄取没拿到真 stat）"; exit 1; } || true; \
+	echo "$$lg" | grep -q '"size":0,' \
+		&& { echo "FAIL: layout 的 size 锚点是 0（摄取没拿到真 stat）"; exit 1; } || true; \
+	grep -q '"kind":"command"' $$shard \
+		|| { echo "FAIL: bash 那条命令没被记成 commands"; cat $$shard; exit 1; }; \
+	: "---- 会话 2：跨会话注入（记忆的定义）+ 未改动时不许标 STALE ----"; \
+	run_sess "$$d2" "$$home" "第二个会话"; \
+	blk2=$$(mem_block "$$d2"); \
+	[ -n "$$blk2" ] || { echo "FAIL: 第二个会话没有注入开工包"; tail -5 "$$d2.out"; exit 1; }; \
+	echo "$$blk2" | grep -qF 'README.md' \
+		|| { echo "FAIL: 开工包里没有上个会话记下的路径"; echo "$$blk2"; exit 1; }; \
+	echo "$$blk2" | grep -qF 'make -n' \
+		|| { echo "FAIL: 开工包里没有上个会话记下的命令"; echo "$$blk2"; exit 1; }; \
+	: "按 'STALE <路径>' 判，不按裸 STALE —— 头一句提示语里本来就有 STALE 这个词"; \
+	echo "$$blk2" | grep -qF 'STALE README.md' \
+		&& { echo "FAIL: 文件没动却标了 STALE（锚点比对口径不对）"; echo "$$blk2"; exit 1; } || true; \
+	: "---- 会话 3：改了文件 → 那条必须降级为 STALE ----"; \
+	printf 'mem live line one\nmem live line two\nMOVED\n' > $$ws/README.md; \
+	run_sess "$$d3" "$$home" "第三个会话"; \
+	blk3=$$(mem_block "$$d3"); \
+	[ -n "$$blk3" ] || { echo "FAIL: 第三个会话没有注入开工包"; exit 1; }; \
+	echo "$$blk3" | grep -qF 'STALE README.md' \
+		|| { echo "FAIL: 改了文件却仍当断言注入（失效校验没生效）"; echo "$$blk3"; exit 1; }; \
+	echo "$$blk3" | grep -qF 'README.md' \
+		|| { echo "FAIL: 过期那条被整条丢掉了（索引仍有用，应当保留并标 STALE）"; exit 1; }; \
+	echo "$$blk3" | grep -qF 'mem live line one' \
+		&& { echo "FAIL: 文件正文被注入了（只许给指针，不许给内容）"; exit 1; } || true; \
+	: "---- 会话 4：删了文件 → 那条必须标 GONE ----"; \
+	rm -f $$ws/README.md; \
+	run_sess "$$d4" "$$home" "第四个会话"; \
+	blk4=$$(mem_block "$$d4"); \
+	[ -n "$$blk4" ] || { echo "FAIL: 第四个会话没有注入开工包"; exit 1; }; \
+	echo "$$blk4" | grep -qF 'GONE README.md' \
+		|| { echo "FAIL: 删掉的文件没标 GONE"; echo "$$blk4"; exit 1; }; \
+	: "---- 会话 5：--no-memory 全程不读不写 ----"; \
+	run_sess "$$d5" "$$home_nm" "第五个会话" --no-memory; \
+	if [ -d $$home_nm/memory ]; then \
+		echo "FAIL: --no-memory 仍然建了记忆目录"; find $$home_nm/memory | head; exit 1; \
+	fi; \
+	blk5=$$(mem_block "$$d5"); \
+	[ -z "$$blk5" ] \
+		|| { echo "FAIL: --no-memory 仍然注入了开工包"; exit 1; }; \
+	echo "e2e-memory-live: 通过（摄取落盘带真锚点 / 跨会话注入 / 改→STALE / 删→GONE / --no-memory 不落盘）"
 
 # P26：/diff（离线）：在临时仓库里跑**真二进制**（滚动模式的单列文本回退）——
 # 必须列出改动文件（含未跟踪）、打出旧/新两侧内容；非仓库目录必须报错而不是静默无事发生。
