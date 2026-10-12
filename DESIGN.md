@@ -36,7 +36,7 @@ uya-agent 是一个**纯 Uya 源码**实现的命令行编程 agent：给它一�
 | 多线程渲染（TUI 与 agent loop 分两条线程） | 机制成立（`libc.pthread` + `sys_tgkill` 唤醒），但工具链堆并发分配实测 8/8 崩（`double free detected in tcache 2`）、pthread 互斥不干净 ⇒ 选「单线程 + 泵点加密」（踩坑 47，见 §11） |
 | 真抢占式中断 | 同上，只能是**协作式**：所有阻塞循环按 ≤50 ms 的粒度插泵点 |
 | 代码语法高亮、图片在终端里渲染、鼠标拖选 | 终端不渲染图片（只给占位行）；JPEG 的**编解码**已有（`std.image`），渲染仍交给终端自己（见 §15） |
-| 改标准库 `lib/tls` | 链校验的缺陷在标准库侧，本项目**不改标准库**，改为在 agent 侧提供三档信任策略（§18） |
+| 改标准库 `lib/tls` | 链校验的缺陷在标准库侧，本项目**不改标准库**，改为在 agent 侧提供四档信任策略（§18） |
 | 会话内落盘的 tool 输出 spill（DSH 有） | 只保留内存尾部；记为**已知偏离**（§6.5） |
 
 ## 2. 分层与依赖
@@ -380,9 +380,9 @@ struct History { items: &Msg, len, cap, bytes }                                 
 1. `std.http` 的请求头构造器**固定只发** Host/Connection/Content-Type/Content-Length，
    **加不了 `Authorization`** —— 而这是 LLM 网关的硬要求；
 2. `tls.https` 只导出 GET，且单次只读一个 4096 字节 record，**装不下 LLM 的响应**；
-3. `lib/tls` 的链校验在真实站点上基本不可用（§18），所以要自己接 leaf 指纹钉扎。
+3. `lib/tls` 的链校验在真实站点上**根本**不可用（§18），所以自己接 leaf 指纹钉扎（TOFU / pin）。
 
-**信任策略**：三档 `chain`（默认）/ `pin` / `none`，详见 §18。leaf SHA-256 从
+**信任策略**：四档 `tofu`（默认）/ `chain` / `pin` / `none`，详见 §18。leaf SHA-256 从
 `HandshakeCtx.server_flight_msg` **自己解析**（不依赖 `cert_parse` 的 RSA 前提），实测与
 `openssl s_client | openssl x509 -outform DER | sha256sum` 完全一致。
 
@@ -1261,7 +1261,7 @@ write/edit **成功后刷新**记录。
 |---|---|---|
 | `--permission` | 权限模式（上面三级） | `danger-full-access` |
 | `--sandbox` / `UYA_AGENT_SANDBOX` | **是否**尝试内核沙箱（`0`/`off` = 等价于 `--no-sandbox`） | 开 |
-| `--tls-verify` | 传输信任策略（§18） | `chain` |
+| `--tls-verify` | 传输信任策略（§18） | `tofu` |
 
 `SAN_AUTO=0`（未指定，按可用性探测）/ `SAN_OFF=1`（明确关）。
 
@@ -2311,7 +2311,7 @@ web 服务器（递归），而不是跑 TUI。实测症状：子进程 fork 出
 | `--base-url 自建网关` | `api.deepseek.com` | 整轮打不通，页面上报「请求失败（网络或 TLS 校验）」 |
 | `--workspace DIR` | 子进程的 cwd | 读写落在错的目录 |
 | `--agent-home DIR` | 默认 `~/.uya-agent` | 「同一个 home 下找不到这条会话」 |
-| `--tls-verify=pin` | `chain` | 子进程一律校验失败 |
+| `--tls-verify=pin` | `tofu` | 子进程一律校验失败 |
 
 两条纪律（`websrv.uya` 的 `web_child_env_cfg`）：
 
@@ -3003,7 +3003,7 @@ responses 用 `{"type":"input_image","detail":"auto","image_url":…}`；
 | 多线程（渲染线程 / 真抢占式中断） | 工具链堆并发分配 8/8 崩（踩坑 47）⇒ 单线程 + 泵点 |
 | DNS 与 TLS 握手期间可中断 | 在 `lib/tls` 调用内部，插不进泵点（DNS ≤5 s、握手 ≤`timeout_ms`） |
 | 明文 `http://` 的请求体写入分片泵 | 明文路径没有分片 |
-| 改标准库 `lib/tls` | 见 §18 —— 缺陷在标准库侧，本项目在 agent 侧提供三档策略 |
+| 改标准库 `lib/tls` | 见 §18 —— 缺陷在标准库侧，本项目在 agent 侧提供四档策略 |
 | 换到 `uya 0.11` | `tls/https.uya`、`std/json/*`、`x509/verify.uya` 与 0.10 逐字节相同，但 `libc/syscall.uya`、`std/runtime/runtime.uya`、`tls/ssl/context.uya` 有差异，需重新验证 |
 
 ### 15.2 会话与界面
@@ -3108,6 +3108,17 @@ responses 用 `{"type":"input_image","detail":"auto","image_url":…}`；
 20. **信号处理器在 uya 0.10.1 不可用**：`libc.signal.signal(SIGTERM, &handler as &void)` 一被调用就 SIGSEGV（`kill -TERM` 后 139）；恢复终端功能只能不做。
 21. **`lib/tls` 把握手全过程写到 fd 2**（`https_debug`/`hs_debug`）：发请求期间把 fd 2 指向 `/dev/null`（dup2 往返），否则满屏 `[HS] ...`；`--tls-debug` 保留。
 22. **把 `&"字面量"[0:n]` 传给 `*const byte`**：写的是切片描述符地址的字节（终端乱码，`\r\x1b[2K` 发不出去）；用数组字面量取址或 `as *const byte`；`make codegen-audit` 会扫。
+    **P78 补两个「同一个坑的另一半」——它们都过类型检查、过编译（甚至过 `codegen-audit`），只在运行时坏**：
+    ① 形参是**裸指针** `&const byte` 时，`f(&"example.com"[0: 11])` 传进去的是描述符的**地址**，
+    被调方按 `const uint8_t*` 读，拿到的是描述符头 8 字节（那 8 字节是**指针值本身**）——
+    实测字符串内容变成 `"BA"` / `"OA"` / `"NA"` 这种两字节碎片，而所有检查全绿。
+    形参是**切片** `&[byte]` 时，同一句写法生成的是正确的描述符**值** ⇒
+    `buf_append(&body, &"x"[0: 1], 1)` 这种看起来一模一样的写法能过，纯属巧合。
+    **判据**：把字面量喂给裸指针形参时，写成 `const S: &const byte = "lit" as &const byte;`
+    （本仓既有写法，见 `net/httpc.uya` 的 `HC_USER_AGENT`）。
+    ② `const X: &[byte] = &"lit"[0: n];` 这类**切片常量**根本编不过：codegen 生成
+    `const uint8_t * const X = (struct uya_slice_uint8_t){...}`（描述符去初始化裸指针），
+    宿主 C 报 `invalid initializer`。
 23. **光标位置用「挂起换行」口径**：写满 `cols` 列时光标仍在最后一列，写满 80 列行号是 0（`tty_end_row_col`/`tty_rows_of` 同口径）；`ESC[0A` 上移 1 行，参数 0 宁可不发。
 24. **流式输出期间输入行不在第 0 列**：擦除前先回该行起始列再 `ESC[J`，否则擦掉同行正文；`tty.uya` 维护 `out_col`/`out_wrap`/`start_col`。
 25. **「影响加载的 flag」必须预扫**：`--dsh-home`/`--no-dsh-config`/`--strict-dsh-config` 因解析顺序静默失效（`--print-config` 仍显示 `source: dsh-settings`）；主循环前预扫，回归 `make e2e-config-flags`。
@@ -4748,6 +4759,36 @@ responses 用 `{"type":"input_image","detail":"auto","image_url":…}`；
     这条链上没有任何判据看得见它（`make check` 只查 uya 类型，生成物里的 C 它不看），
     所以「GCC 版本升到 14+」这件事本身要当成一次**全量重编 + 逐个收账**的时机。
     同族：`make lint-size` / `doc-audit` 也看不见 C 侧的 const 与原型。
+132. **默认档在真实站点上必然失败 ⇒ 新机器第一次跑就是「请求失败（网络或 TLS 校验）」**
+     （P78，用户报的：Ubuntu 26 那台 `uya-agent hi` 直接报这个）。
+     三条独立缺陷叠在一起，**每一条单独都不致命，合起来让默认配置完全不可用**：
+
+     ① **`chain` 是默认档，而它必然失败**：§18 节旧版写的「`example.com` 恰好能过」是**错的**
+     （实测同样失败）。真身是 `ssl_capture_peer_chain_from_server_flight` 按「带 record 头」
+     的缓冲扫 `server_flight_msg`，而那个字段存的是**不含 record 头**的握手消息流 ⇒
+     `ctx.peer_leaf` 恒 NULL。新机器没有 `~/.dsh/settings.yaml`（落默认档），于是第一次连接
+     就撞在这上面。**旧文档把「实现细节不可用」写成了「真实站点通常失败」，而「通常」这个词
+     把「必然」的严重性掩盖了** —— 与踩坑 126 同族：结论散落多处时，措辞的软硬会跟着漂。
+     ② **`pin` / `none` 被无谓地绑在系统根证书库上**：`tls_open` 里 `trust_store_load_system`
+     失败就 `HcTlsUnsupported`，与档位无关。实测：把 `/etc/ssl` 挂空之后，`pin` 档**拿着正确
+     的指纹**也连不上。判据（leaf 指纹）与体检报告（CA 库）本该无关。
+     ③ **流式路径把观测到的指纹丢掉了**：`llm_stream_style` 里那个 `TlsConn` 是**它的局部
+     变量**，agent 侧的 `tc` 从来没传进去 ⇒ `tc.observed_len` 恒 0 ⇒ 错误分支永远走不到
+     「打印指纹」那一支。**最需要指纹的那条路上，指纹被丢掉了** —— 用户只看到
+     「检查 base-url / 网络」，而答案就在指头上。
+
+     **修法**：默认档改 `tofu`（首次记录 leaf 指纹、之后强制相符，存
+     `<agent home>/tls_pins`）；`pin`/`tofu`/`none` 不再加载 CA 库；chain 的失败原因拆成
+     `HcTlsNoChain`/`HcTlsNoAnchors`/`HcTlsNoLeaf` 三个可指路的错误码；观测指纹走
+     `hc_last_leaf_ptr()` 全局（流式路径拿不到 TlsConn，别再指望传对象进去）。
+     验收：`tls-pin` + `tls-tofu` 两轮自测（离线），**防假绿对照两处都做过** ——
+     把 `tp_trusts` 改成忽略指纹比对 ⇒ 3 条当场红；把「首次落盘」那行删掉 ⇒ 5 条当场红。
+
+     **连带抓出的一条自测纪律**：`tls-tofu` 轮第一版是「照着 `tls_tofu_decide` 的形状再写
+     一遍」——它收 `&TlsConn`（离线造不出来），所以我当初复刻了判据。结果是**把产品里
+     「首次落盘」删掉，自测全绿**（上面那个对照实验）：覆盖的是**测试自己的复刻品**。
+     修法是把判据本体摘成不收 TlsConn 的 `tls_tofu_verdict`，自测直接调它。
+     与踩坑 121 同族：**判据只要不是产品代码本身，就会在某个时刻只证明「复刻品是对的」**。
 
 ---
 
@@ -4837,23 +4878,51 @@ responses 用 `{"type":"input_image","detail":"auto","image_url":…}`；
 ## 18. TLS 信任策略（重要，和标准库现状有关）
 
 `lib/tls` 是**真 TLS 1.2 客户端**（SNI、ECDHE-P256、PRF、Finished、系统信任库），实测对
-`api.deepseek.com` 能完成握手并拿到 `HTTP/1.1 401`。但它的**链校验在真实站点上基本不可用**：
+`api.deepseek.com` 能完成握手并拿到 `HTTP/1.1 401`。但它的**链校验在真实站点上根本不可用** ——
+下面每条都是本轮逐条实测的（不是从标准库源码猜的）：
 
-* `verify_chain_rsa` 要求「服务端发来的**链顶**证书公钥 == 某个信任锚」——真实站点不会把自己的
-  根证书一并发来，所以这条路对 `api.deepseek.com` / `ping0.com` 都失败（`example.com` 恰好能过）；
-* `cert_verify_signature` 只支持 SHA-256 + RSA PKCS#1 v1.5，SHA-384 的链过不去；
-* `ssl_set_peer_identity` 把 `peer_san/peer_cn` 设成**我们自己传进去的期望域名**，
+* **`ctx.peer_leaf` 恒为 NULL**（这条是致命的）：`ssl_capture_peer_chain_from_server_flight`
+  按「**带 record 头**」的缓冲扫 `server_flight_msg`（它先读 `data[record_pos] != 22` 就
+  `return`），而 `hdr.server_flight_msg` 存的恰恰是**不含 record 头**的握手消息流
+  （类型 1 + 长度 3 + 内容，见 `hs_parse_*` 里那段保存循环）。于是它对真实站点**一个证书都
+  解析不出来**。自测证据：`--probe --tls-verify=chain` 对 `www.autodl.art`、`example.com`、
+  `api.deepseek.com` **一律** `HcTlsUnsupported`，打点显示 `peer_leaf=NULL`。
+  ⇒ **`chain` 档在真实站点上是必然失败，不是「通常失败」**（本节旧版写的
+  「`example.com` 恰好能过」是错的，实测它同样失败）。
+* **`verify_chain_rsa` 要求「服务端发来的链顶公钥 == 某个信任锚」**：真实站点不发根证书，
+  所以就算把链解析出来也过不去。
+* **`mpi_mul` 装不下 RSA-2048**：`MPI_MAX_LIMBS = 32`（32×64 = 2048 **位**），而
+  `mpi_mul` 的守卫是 `a.n + b.n > MPI_MAX_LIMBS` ⇒ 两个 2048 位数相乘需要 64 个 limb，
+  直接 `TlsBadInput`。实测：agent 侧自己把 leaf 的 tbs/sig/公钥字段全解对之后调
+  `rsa_verify_pkcs1_v15_sha256`，仍然 `TlsCryptoFailure`。
+  ⇒ **在现有标准库上「自己补一条链校验」也做不到**，不是接错线的问题。
+* **信任库只读前 64 KiB**：`TRUST_STORE_READ_BUF_SIZE = 65536`，而 Debian/Deepin 的
+  `ca-certificates.crt` 是 224449 字节 / 150 张证书 ⇒ 只装进**前 44 张**。实测
+  `DigiCert Global Root G2`（`www.autodl.art` 的链顶）在偏移 75389 —— **在读窗口之外**。
+* **`ssl_set_peer_identity` 把 `peer_san/peer_cn` 设成我们自己传进去的期望域名**，
   所以标准库那一步「主机名校验」实际是拿期望值和期望值比，等于没校验。
 
-因此本项目**不改标准库**，而是在 agent 侧提供三档策略：
+因此本项目**不改标准库**，而是在 agent 侧提供**四档**策略：
 
 | 模式 | 行为 |
 |---|---|
-| `--tls-verify=chain`（默认） | 握手后调用导出的 `verify_chain_rsa`，语义与标准库一致——安全，但真实站点通常会失败，失败时会打印精确原因 |
-| `--tls-verify=pin` | 跳过链校验，直接校验**服务端 leaf 证书 DER 的 SHA-256** 是否等于 `--tls-pin`。指纹从 `HandshakeCtx.server_flight_msg` 自己解析出来（不依赖 `cert_parse` 的 RSA 前提），实测与 `openssl s_client \| openssl x509 -outform DER \| sha256sum` 完全一致 |
-| `--tls-verify=none` | 不校验，仅打印观测到的 leaf SHA-256 与告警，方便你先 TOFU 再改成 `pin` |
+| `--tls-verify=tofu`（默认） | **首次使用即信任**：第一次连某主机就把 leaf SHA-256 记进指纹库（`<agent home>/tls_pins`），之后每次都必须逐字节相符，不符即拒（`HcPinMismatch`）。不需要 CA 库、不需要人手抄指纹 ⇒ 新机器开箱可用，且强于 `none` |
+| `--tls-verify=chain` | 握手后调用导出的 `verify_chain_rsa`。**真实站点上必然失败**（理由见上），保留它是为了「中间人告警」这条路：真有中间人时它落在签名/CA 约束那一支，而不是 `peer_leaf=NULL` 那一支 |
+| `--tls-verify=pin` | 直接校验**服务端 leaf 证书 DER 的 SHA-256** 是否等于 `--tls-pin`。指纹从 `HandshakeCtx.server_flight_msg` 自己解析出来（不依赖 `cert_parse` 的 RSA 前提），实测与 `openssl s_client \| openssl x509 -outform DER \| sha256sum` 完全一致 |
+| `--tls-verify=none` | 不校验，仅打印观测到的 leaf SHA-256 与告警 |
 
-推荐用法：先跑一次 `--probe --tls-verify=none` 拿到指纹，之后一律用 pin 模式：
+**为什么默认档是 `tofu` 而不是 `chain`**：`chain` 在真实站点上**必然**失败，而新机器
+（没有 `~/.dsh/settings.yaml` ⇒ 落默认档）第一次跑 `uya-agent hi` 就会看到
+「请求失败（网络或 TLS 校验）」—— 这正是用户报的那个症状（Ubuntu 26 那台）。`tofu` 是唯一
+既能当默认、又不放弃防护的档位（`none` 无防护；`pin` 要人手抄指纹）。
+
+**指纹库**（P78）：`<agent home>/tls_pins`，一行一条 `<host> <64 位小写 hex>`，`#` 注释与空行
+忽略，同一主机可有多条（站点轮换证书/多机房是常态，命中任意一条即通过）。主机名与指纹比对
+都做大小写折叠。`$UYA_AGENT_TLS_PINS` 可整条覆盖路径；`--print-config` 的 `tls_pins` 打的就是它。
+**只有 chain 档加载系统根证书库** —— `pin` / `tofu` / `none` 的判据是 leaf 指纹，与 CA 库无关
+（实测：把 `/etc/ssl` 挂空之后，旧代码里 `pin` 档**拿着正确的指纹**也报 `HcTlsUnsupported`）。
+
+推荐用法：默认档什么都不用配就能连上；要更强的保证就钉死指纹：
 
 ```bash
 ./build/uya-agent --probe --tls-verify=none                 # 记下 leaf_sha256
@@ -4865,9 +4934,16 @@ DEEPSEEK_API_KEY=sk-xxx ./build/uya-agent \
 本地明文端点（ollama / llama.cpp 的 OpenAI 兼容接口）不走 TLS，直接
 `--base-url http://127.0.0.1:11434/v1` 即可。
 
+**失败时的诊断**：四档的失败原因各有各的修法，所以错误码是分开的
+（`HcTlsNoChain` / `HcTlsNoAnchors` / `HcTlsNoLeaf` / `HcPinMismatch`），不是一律
+「检查 base-url / 网络」。观测到的 leaf 指纹从 `hc_last_leaf_ptr()` 取 —— 流式路径**拿不到
+`TlsConn`**（`llm_stream_style` 里那个是它的局部变量），旧代码因此在这条最需要指纹的路上
+把指纹丢掉了（踩坑 132）。
+
 > 后续可做的（本项目**没做**）：给 `lib/tls` 补一条真正的链构建（用 issuer/签名关系从 leaf 走到
-> 信任锚、支持 SHA-384）、并把 leaf 的 SAN 真正解析出来做主机名校验。做完之后 `chain` 模式就能
-> 直接对云端可用、也不再需要 pin。
+> 信任锚、支持 SHA-384）、把 `MPI_MAX_LIMBS` 提到 RSA-2048 需要的大小、把信任库改成读全文件、
+> 并把 leaf 的 SAN 真正解析出来做主机名校验。**这四件事做完之前 `chain` 档都不可能对云端可用**
+> —— 只做「链构建」那一件是不够的（`mpi_mul` 那一关就过不去）。
 
 ---
 
@@ -5024,6 +5100,7 @@ DEEPSEEK_API_KEY=sk-xxx ./build/uya-agent \
 | `web-exit` | 子进程退出后**收摊还是留标签**（踩坑 115）：真 fork + 真 PTY 两条腿 —— ① **正常退出**（exit 0 = `/exit` / ctrl+d / 面板选中 `/exit`）⇒ `close_wanted` 置位、`web_sweep_closed` 之后表里没有它、订阅它的长连接被关掉**且管道里有分块终止块 `0\r\n\r\n`**（前端靠干净 EOF 把「会话结束」与「连接坏了」分开）、最后一帧不丢；② **被 SIGKILL** ⇒ 不置位、表里仍在（留标签看最后一帧）。防假绿对照：把「正常退出才置位」改回「一律不置位」⇒ 当场红四条 |
 | `web-listen` | 监听套接字的 `SO_REUSEADDR`（踩坑 118）：走**生产代码** `srv_listen` 两条腿 —— ① 选项 `getsockopt` 真读得回来（== 1）；② 真复现用户现场：起监听 → 连一条 → **服务端先关**（本侧留 `TIME_WAIT`，本地端口正是监听端口）→ 关监听 → **立刻**用同一端口重新 `srv_listen` ⇒ 必须成功。防假绿对照：把两条常量改回 BSD 的 `0xFFFF` / `0x0004` ⇒ 两条腿都红（用户报的「ctrl+c 之后 web 监听失败」） |
 | `web-childcfg` | P73：会话子进程的环境继承（踩坑 124 ②）。走**生产代码** `web_child_env`，判据看它排好的**环境数组**（`sh_env_array()`，不是 `getenv` —— 那读的是本进程真环境、看不见刚排好的表）：① 父进程给了非默认值时，14 条（权限/沙箱/端点/模型/凭据/档位/信任策略/指纹/工作区/home/max-steps/no-title/no-mouse/no-mcp）**逐条同名同值**；② 父进程没给（出厂默认）时那几条**不许注入**（否则把默认值钉死、挡住子进程读 `settings.yaml`）；③ `UYA_AGENT_WEB` 恒为 0（漏了它子进程递归起 web，踩坑 103）。**权限排第一**：它曾经被悄悄放宽成 `Full access`。防假绿对照：把 `web_child_env_cfg(cfg)` 换成 `_ = cfg;` 重编 ⇒ 当场红 10 条 |
+| `tls-pin` / `tls-tofu` | P78 信任档位（踩坑 132，离线、不联网、不需要证书）：`tls-pin` 段验指纹库的纯函数 —— 两行好行 + `#` 注释 + 空行解析出 2 条、主机名与指纹**两侧**大小写折叠、4 行畸形（hex 过短/过长/非 hex/只有主机名）一律跳过而**不中止**（后面那行好行必须还在）、CRLF 行尾与末行无换行都认、同一主机多条指纹命中任意一条、追加行必须是 `<host> <小写 hex>\n`、空库什么都不信、长度不是 64 的查询一律不认；`tls-tofu` 段起**真的临时目录 + 真的文件**走闭环 —— 首次 `FRESH` 且那一行**真的落盘了**、二次 `TRUSTED`、指纹变了 `MISMATCH`、另一台主机照样 `FRESH` 且**不覆盖**第一台的记录。防假绿对照两处：把 `tp_trusts` 改成忽略指纹比对 ⇒ 红 3 条；把 `tls_tofu_verdict` 里「首次落盘」那行删掉 ⇒ 红 5 条 |
 | `e2e-portable` | `make e2e-portable`（P73，踩坑 124）：把 `build/uya-agent` **拷到一个空目录**、`HOME` 也是空目录、**没有 DSH、没有仓库**（真新机器的样子），只带一个二进制。① 内嵌 preset 兜底：`--print-config` 报 `knobs (source: embedded)` 且旋钮值 == 内置缺省（逐字节）；跑一轮 `--plan` ⇒ 假网关收到的请求里必须有 `Make the plan decision-complete`（**该串只存在于上游 preset**，工作树与编译器树 0 命中 ⇒ 判据不可能假绿）；② **反向断言**：`--dsh-root testdata/preset-root` 时必须是 `source: preset` + `readLimit=1777`（内嵌不许夺磁盘的权）；③ web 会话子进程：只走命令行给 `--base-url/--model/--permission read-only/--agent-home`，断言假网关**收到**请求、请求里的模型是父进程给的那个、会话日志落在 `--agent-home` 下；④ `--no-dsh-config` 这类没有 env 口径的开关必须被启动日志点名。防假绿对照（两条都做过）：把内嵌兜底改成恒 `false` ⇒ 红在①；只停 plan 段的抽取（来源/旋钮照旧）⇒ 红在「plan 策略段缺失」；摘掉 `web_child_env_cfg(cfg)` ⇒ 红在③ |
 | `tui-full` | P53 浮层全屏四组：**A** 非全屏仍是居中框（不顶格、`≤16` 行上限、第 30 项看不见）→ 全屏框 = 转录区（顶边第 0 行、左右边框 0 与 `cols-1`、标题 ` · 全屏`、行偏移表口径的逐行闭合、底边**正好**在 `panel_top-1`）+ 16 行上限解除（第 20 项可见、第 30 项仍不可见）；**B** `ctrl+f`（`0x06`）与 `F11`（`ESC[23~`）都切换，且**四种形态各认一次**（列表 / reader / ask / input）；**C** 不吃面板 / 状态区 / 脚注；**D** 没浮层时只落 notice、全屏态不跨浮层残留、`esc` 关掉后转录回来，终端太矮时 fail-closed 判据不变；**F** `/fullscreen` 四态（裸报状态 / `on` / `off` / 非法值只报错且状态不动、重复 `off` 幂等） |
 | `overlay-fullscreen` | `make p30-check` 第 9 场（真终端 + 假网关）：屏幕几何判据 —— 非全屏顶边 > 0 行且左边框 > 0 列 → `ctrl+f` 后顶边第 0 行、左右边框正好 `0` 与 `cols-1`、标题带 ` · 全屏`、面板与脚注都还在、底边行 < 面板行 → `F11` 关回居中 → 再全屏、`esc` 关掉后方框消失 |

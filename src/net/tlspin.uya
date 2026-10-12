@@ -1,0 +1,282 @@
+// src/net/tlspin.uya — leaf 证书指纹库（TOFU 与 pin 的判据来源）
+//
+// 本文件：指纹库的**内存模型**（TpEntry/TpStore）、文本格式解析（tp_parse）、按主机查找
+//   （tp_find）、追加一条（tp_format_entry）、以及 sha256 hex 的规范形（tp_norm_hex）。
+//   落盘/读盘都在 net/httpc.uya（它才持有 tls_open 的观测结果），本文件只做纯数据变换，
+//   因此**离线可测**（selftest 直接喂字符串进来断言，不需要网络与证书）。
+// 不变量：① 主机名比较**大小写无关**，指纹比较前一律折成小写 hex（两者都做规范化，
+//   否则「同一个站点换了个大小写」会被判成不匹配）；② 指纹必须是**恰好 64 个 hex 字符**，
+//   长度不对的条目一律当无效行跳过（不猜、不截断）；③ 解析**永不 panic**：任何畸形行
+//   跳过继续，坏行不许把整库读废（库是安全判据，读废会让用户连不上任何站点）；
+//   ④ 一个主机可以有**多条**指纹（站点轮换证书/多机房多 leaf 是常态），
+//   命中任意一条即算通过。
+// 依赖：本仓 foundation/bufx（Buf / buf_append_cstr）。不依赖 lib/tls —— 所以离线可测。
+// 命名：`Tp*`（类型与常量）、`tp_*`（函数）。
+//
+// 文件格式（每行一条，`#` 开头的行与空行忽略）：
+//     <host> <64 位小写 hex>
+// 为什么不用 JSON：这个库要能在**任何**环境下被手工编辑与 diff（用户排障时会打开它看
+// 「我上次信任的是哪个指纹」），一主机一行的纯文本比 JSON 更不容易写坏，也不需要解析器。
+
+use libc.heap;
+use libc.stdlib;
+
+// 一个主机最多记多少条指纹（多机房轮换够用；超了就丢掉最老的，见 tp_add）
+export const TP_MAX_PER_HOST: usize = 4;
+// 整库最多多少条（256 条 × 一条 80 字节 ≈ 20 KB，读一次的开销可忽略）
+export const TP_MAX_ENTRIES: usize = 256;
+// 主机名上限（RFC 1123 是 253；取 256 留余量）
+const TP_HOST_MAX: usize = 256;
+export const TP_HEX_LEN: usize = 64;
+
+export struct TpEntry {
+    host: Buf,
+    hex: [byte: TP_HEX_LEN],
+    host_len: usize,
+}
+
+export struct TpStore {
+    items: [TpEntry: TP_MAX_ENTRIES],
+    n: usize,
+}
+
+// 一个字节是不是空白（空格 / 制表 / 回车 / 换行）—— 解析按空白切列。
+fn tp_is_space(c: byte) bool {
+    if c == (32 as byte) || c == (9 as byte) {
+        return true;
+    }
+    return c == (13 as byte) || c == (10 as byte);
+}
+
+// 一个字节是不是 `#`（注释行起点）。
+fn tp_is_hash(c: byte) bool {
+    return c == (35 as byte);
+}
+
+// 小写化一个 ASCII 字节（非字母原样返回）。
+fn tp_lower(c: byte) byte {
+    if c >= 65 && c <= 90 {
+        return (c + 32) as byte;
+    }
+    return c;
+}
+
+// 一个字节是不是 hex 数字（0-9 a-f A-F / 大小写都认）。
+fn tp_is_hex(c: byte) bool {
+    if c >= 48 && c <= 57 {
+        return true;
+    }
+    if c >= 97 && c <= 102 {
+        return true;
+    }
+    if c >= 65 && c <= 70 {
+        return true;
+    }
+    return false;
+}
+
+// 把 64 字节的 hex 折成小写并校验：返回 true = 是合法指纹。
+// 长度不是 64、或出现非 hex 字符 ⇒ false（调用方当无效行跳过，不猜不截断）。
+export fn tp_norm_hex(src: &const byte, n: usize, out: &byte) bool {
+    if n != TP_HEX_LEN {
+        return false;
+    }
+    var i: usize = 0;
+    while i < TP_HEX_LEN {
+        const c: byte = src[i];
+        if !tp_is_hex(c) {
+            return false;
+        }
+        out[i] = tp_lower(c);
+        i = i + 1;
+    }
+    return true;
+}
+
+// 两个主机名是否相同（大小写无关）。
+export fn tp_host_eq(
+    a: &const byte,
+    an: usize,
+    b: &const byte,
+    bn: usize
+) bool {
+    // 主机名比对大小写无关 —— 否则「同一个站点换了个大小写」会被判成不匹配
+    if an != bn {
+        return false;
+    }
+    var i: usize = 0;
+    while i < an {
+        if tp_lower(a[i]) != tp_lower(b[i]) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+// 空的指纹库（零条目，不分配）。
+export fn tp_empty() TpStore {
+    var z: TpEntry = TpEntry{
+        host: Buf{ ptr: null, len: 0, cap: 0 },
+        hex: [0: TP_HEX_LEN],
+        host_len: 0,
+    };
+    return TpStore{ items: [z: TP_MAX_ENTRIES], n: 0 };
+}
+
+// 释放库里每条主机名缓冲（解析失败/结束时都要调；可安全重复调用）。
+export fn tp_free(s: &TpStore) void {
+    var i: usize = 0;
+    while i < s.n {
+        buf_free(&s.items[i].host);
+        i = i + 1;
+    }
+    s.n = 0;
+}
+
+// 解析整个库文本。返回**成功解析的条目数**；畸形行跳过（不 panic、不中止）。
+// 已经非空的库会被先清空 —— 调用方不必自己 reset。
+export fn tp_parse(s: &TpStore, text: &const byte, n: usize) usize {
+    tp_free(s);
+    var pos: usize = 0;
+    while pos < n && s.n < TP_MAX_ENTRIES {
+        // 取一行。注意：这里**不能**在赋值之后重新赋一个切片字面量
+        // （`line = text[a: b]` 之后再 `line = line[0: k]`）—— uya 会把切片字面量
+        // 生成成 `(struct uya_slice_uint8_t){...}` 去初始化一个 `const uint8_t *`，
+        // 宿主 C 直接报 invalid initializer。所以用两个变量分别承接两步。
+        var line_end: usize = pos;
+        while line_end < n && text[line_end] != (10 as byte) {
+            line_end = line_end + 1;
+        }
+        var line_len: usize = line_end - pos;
+        const line_ptr: &const byte = &text[pos];
+        pos = line_end + 1;
+        // 去掉行尾的 \r（CRLF 文件）
+        if line_len > 0 && line_ptr[line_len - 1] == (13 as byte) {
+            line_len = line_len - 1;
+        }
+        // 跳过行首空白；空行与 # 注释行忽略
+        var i: usize = 0;
+        while i < line_len && tp_is_space(line_ptr[i]) {
+            i = i + 1;
+        }
+        if i >= line_len || tp_is_hash(line_ptr[i]) {
+            continue;   // 空行或注释行
+        }
+        // 第一列 = host
+        const host_start: usize = i;
+        while i < line_len && !tp_is_space(line_ptr[i]) {
+            i = i + 1;
+        }
+        const host_len: usize = i - host_start;
+        if host_len == 0 || host_len > TP_HOST_MAX {
+            continue;
+        }
+        // 跳过列间空白
+        while i < line_len && tp_is_space(line_ptr[i]) {
+            i = i + 1;
+        }
+        // 第二列 = hex（长度正好 64，且全是 hex）
+        const hex_len: usize = line_len - i;
+        var norm: [byte: TP_HEX_LEN] = [0: TP_HEX_LEN];
+        if !tp_norm_hex(&line_ptr[i], hex_len, &norm[0]) {
+            continue;
+        }
+        const idx: usize = s.n;
+        s.items[idx].host = buf_new(host_len + 1);   // 多 1 字节余量
+        if !buf_append(&s.items[idx].host, &line_ptr[host_start], host_len) {
+            buf_free(&s.items[idx].host);
+            continue;
+        }
+        s.items[idx].host_len = host_len;
+        var k: usize = 0;
+        while k < TP_HEX_LEN {
+            s.items[idx].hex[k] = norm[k];
+            k = k + 1;
+        }
+        s.n = s.n + 1;
+    }
+    return s.n;
+}
+
+// 库里是否有 host 的条目（不管指纹是什么）。
+export fn tp_has_host(
+    s: &const TpStore,
+    host: &const byte,
+    host_len: usize
+) bool {
+    // 只问「库里有没有这台主机」——与指纹是什么无关（调用方用它区分首次与变更）
+    var i: usize = 0;
+    while i < s.n {
+        const h: &const byte = s.items[i].host.ptr;
+        const hn: usize = s.items[i].host_len;
+        if tp_host_eq(h, hn, host, host_len) {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+// host 是否被信任：库里存在该主机，且**至少有一条**指纹与 hex 逐字节相同。
+// 库里没有这个主机 ⇒ false（调用方据此区分「首次见到」与「变了」）。
+export fn tp_trusts(
+    s: &const TpStore,
+    host: &const byte,
+    host_len: usize,
+    hex: &const byte,
+    hex_len: usize
+) bool {
+    if hex_len != TP_HEX_LEN {
+        return false;
+    }
+    var i: usize = 0;
+    while i < s.n {
+        const h: &const byte = s.items[i].host.ptr;
+        const hn: usize = s.items[i].host_len;
+        if tp_host_eq(h, hn, host, host_len) {
+            var same: bool = true;
+            var k: usize = 0;
+            while k < TP_HEX_LEN {
+                if tp_lower(hex[k]) != s.items[i].hex[k] {
+                    same = false;
+                    break;
+                }
+                k = k + 1;
+            }
+            if same {
+                return true;
+            }
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+// 追加一条记录到**文本缓冲**（给落盘用）：`<host> <hex>\n`。
+// hex 必须是已经规范化过的 64 位小写 —— 调用方用 tp_norm_hex 折过再传。
+// 返回 false = 缓冲装不下（调用方自己决定是否报错；本函数不改写已有内容）。
+export fn tp_format_entry(
+    out: &Buf,
+    host: &const byte,
+    host_len: usize,
+    hex: &const byte
+) bool {
+    if host_len == 0 || host_len > TP_HOST_MAX {
+        return false;
+    }
+    if !buf_append(out, host, host_len) {
+        return false;
+    }
+    if !buf_append_byte(out, 32 as byte) {
+        return false;
+    }
+    var i: usize = 0;
+    while i < TP_HEX_LEN {
+        if !buf_append_byte(out, tp_lower(hex[i])) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return buf_append_byte(out, 10 as byte);
+}
