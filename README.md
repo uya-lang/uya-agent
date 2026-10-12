@@ -181,7 +181,7 @@ readelf -lW build/uya-agent | grep -c INTERP    # 0 = 真静态
 | `--title-auto` / `--no-title-auto` | 让**模型给会话起标题**（**默认开**）。一条会话只起一次：首次提示词之后、第一个 step 跑完就在回合里发那一个小请求（收尾不更新标题） |
 | `--mouse` / `--no-mouse` | TUI 的**鼠标上报**开关（**默认开**，滚轮要靠它）。`--no-mouse` 让终端重新接管拖选 ⇒ **能选中文字复制**（同时失去滚轮翻转录，改用 `ctrl+↑/↓` 或 `pgup/pgdn`）；运行中还有 `F2` 与 `/mouse on\|off` |
 | `--color=MODE` | `auto`（默认）/ `always` / `never` / `16` / `256`；`NO_COLOR` 也认 |
-| `--tls-verify=chain\|pin\|none` | TLS 信任策略，默认 `chain`，见 §5 |
+| `--tls-verify=tofu\|chain\|pin\|none` | TLS 信任策略，**默认 `tofu`**（首次记录 leaf 指纹、之后强制相符），见 §4 |
 | `--tls-pin HEX` | `pin` 模式要求的 leaf 证书 SHA-256（小写 hex） |
 | `--tls-debug` / `--http-debug` | 保留 `lib/tls` 的握手调试输出 / 打印每轮响应的头与体首字节 |
 
@@ -437,8 +437,14 @@ make selftest                   # 离线端到端
 
 ## 4. TLS 信任策略
 
-`lib/tls` 是**真 TLS 1.2 客户端**，但它的**链校验在真实站点上基本不可用**，所以本项目在 agent
-侧提供三档策略。**推荐**：先 `--tls-verify=none` 拿到 leaf 指纹，之后一律用 `pin`。
+`lib/tls` 是**真 TLS 1.2 客户端**，但它的**链校验在真实站点上根本不可用**（`ctx.peer_leaf`
+恒为 NULL —— 详见 [DESIGN.md §18](DESIGN.md)），所以本项目在 agent 侧提供四档策略。
+
+**默认档是 `tofu`**（Trust On First Use）：第一次连某主机就把它的 leaf 证书 SHA-256 记进
+`<agent home>/tls_pins`，之后每次都必须逐字节相符，不符即拒。**开箱即用**，不需要 CA 库、
+也不需要人手抄指纹 —— 新机器（没有 DSH 设置）第一次跑就能连上，同时还有中间人防护。
+
+要更强的保证（指纹完全由你定）就先探一次再钉死：
 
 ```bash
 ./build/uya-agent --probe --tls-verify=none                 # 记下 leaf_sha256
@@ -447,8 +453,8 @@ DEEPSEEK_API_KEY=sk-xxx ./build/uya-agent \
   "创建 hello.uya，编译并运行它"
 ```
 
-三档的语义、为什么 `chain` 在真实站点上会失败、leaf 指纹怎么算 —— 见
-[DESIGN.md §18](DESIGN.md)。
+四档的语义、为什么 `chain` 在真实站点上**必然**失败（三条标准库缺陷，逐条实测）、
+leaf 指纹怎么算、指纹库放哪儿 —— 见 [DESIGN.md §18](DESIGN.md)。
 
 本地明文端点（ollama / llama.cpp 的 OpenAI 兼容接口）不走 TLS，直接
 `--base-url http://127.0.0.1:11434/v1` 即可。
