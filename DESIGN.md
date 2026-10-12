@@ -5572,6 +5572,75 @@ DEEPSEEK_API_KEY=sk-xxx ./build/uya-agent \
   本仓侧 `make lint-size` / `make doc-audit` / `make build` 与 `--print-config` 两条
   （见下一条 bullet 的实测输出）。
 
+### 19.1 与 DSH 的头对头（OpenBench 4 题，P78）
+
+**问题**：同一个模型（`aigw-local/DeepSeek-V4.1-Flash`，推理强度 `max`）、同一批任务，
+harness 差多少？用的是第三方基准 **OpenBench**（`minghinmatthewlam/openbench`，
+专为「换 harness、不换模型」设计；**不是 DSH 官网的 bench** —— 官网没有 bench 页）。
+
+任务 4 个：`taskflow`（修 5 处逻辑缺陷让 25 个单测全绿）、`make-ci-green`（16 个）、
+`add-feature`（给 miniconf 加 `@include`）、`webcore`（给微框架加类型化路由/挂载/内容协商）。
+判据是**任务自带的 pristine 测试套件**（cwd 指向 agent 的工作区副本，改工作区里的测试没用），
+按 `test_ids.txt` 逐条隔离跑、给部分分 `SCORE: 0.0-1.0`。
+装置在 `build/openbench_vs_dsh/`（gitignored，含 README 与复现命令）。
+
+**三道控制先立住**（都在花钱之前）：
+
+| 控制 | 期望 | 实测 |
+|---|---|---|
+| 负控 `--harness null` | 未改动的仓库必须拿基线分 | `0.28 / 0.3125 / 0.40 / 0.30`，`success` 全 false ✓ |
+| 正控 叠 `solution/` | 必须全 1.0（证明题有解、判据不是恒假） | 四个**全 1.0000** ✓ |
+| 通路 假 key / 真调用 | adapter 能被 runner 调起、`SCORE` 落盘 | 两侧都调起；token 数与网关账本**逐数相等** ✓ |
+
+**配对轮结果**（两侧输出上限都设 256000，见下「坑一」）：
+
+| 任务 | uya-agent | dsh | |
+|---|---|---|---|
+| `taskflow` | 1.0 · 82.6 s · 613 k tok | 1.0 · **45.1 s** · **373 k tok** | dsh 快 1.8×、省 1.6× |
+| `make-ci-green` | 1.0 · 24.3 s · 121 k | 1.0 · **22.5 s** · **104 k** | 基本持平（dsh 略优） |
+| `add-feature` | 1.0 · **53.9 s** · **118 k** | 1.0 · 76.2 s · 253 k | uya-agent 快 1.4×、省 2.1× |
+| `webcore` | **1.0**（补测轮 514.6 s · 54 步） | 1.0 · 729.9 s · 63 步 | 都能解；配对轮 uya-agent 那格被上游掐断（见「坑三」） |
+
+⇒ **能力上没有差距**：4 题两侧都能拿到满分（`webcore` 的 uya-agent 满分来自补测轮，
+不是本轮的 0.30）。**差距全在效率与稳健性上**，且**方向按任务而分**：dsh 在最难的多模块
+推理题（`taskflow`）上明显更快更省；uya-agent 在「按规格加一个特性」（`add-feature`）上更快更省。
+
+**三条踩坑（都是实测，不是推测）**：
+
+**坑一：跨 harness 的输出上限必须显式配对，否则结论会反过来。** pi-ai 目录给
+`DeepSeek-V4.1-Flash` 的默认 `maxTokens` 是 **32768**，而本仓 `--max-tokens` 默认 **256000**。
+第一轮没配对时 dsh 在 `webcore` 上「每步都正常、到第 16 步撞顶」
+（会话日志：`outputTokens: 32768` + `finish reason: max-tokens`）——
+它想把整个实现写在一次推理里，撞顶后**一个字节都没落盘**（`workspace_changed=false`），
+得分停在基线 0.30。把 dsh 的 `maxTokens` 提到 256000 后，**同一个任务 78 步跑完、1.0000**。
+⇒ 第一轮那张表**是错的**，已作废；凡跨 harness 比输出上限，必须配对并写进报告。
+
+**坑二（给本仓的、可行动的）：本仓没有传输层重试，dsh 有。**
+dsh 的 `dsh-base` 挂了 `dsh-llm-retry`，默认策略是
+**对 `TRANSPORT`/`TIMEOUT`/`SERVER`/`RATE_LIMIT`/`EMPTY_RESPONSE` 重试 5 次**，
+退避 500 ms–10 s、10% 抖动；本仓 `agent_step_stream` 收到 `err_kind == 3`
+（网络/TLS）直接 `return AGENT_NET`（退出码 2），**一层重试都没有**。
+实测差距：配对窗口内 dsh **100 次请求 0 次失败**，本仓 **163 次请求 2 次失败**；
+`webcore` 上本仓累计被上游掐断 **4 次**（延迟 108–261 s 后 `upstream_error`），
+唯一一次跑通的补测轮拿了满分 —— 也就是说**丢的全是本来能解出来的题**。
+⇒ 这是本轮唯一一条**直接该改本仓**的结论：一次 5xx/超时不该让整个任务作废。
+
+**坑三：上游故障不是 harness 缺陷，别把它记成能力差。** 网关历史里
+`upstream_error` 两边都出现过（`unknown`/`dsh`/`uya-agent` 全有），是共享基础设施问题。
+本仓那一格 0.30 全部来自「被掐断」而不是「做不出来」—— 报告里必须这么写，
+否则就把基础设施故障读成了 harness 差距。
+
+**本仓侧顺带量到的**：本仓平均每次请求的 prompt 是 **56 k token（峰值 213 k）**，
+dsh 是 **18.6 k（峰值 53 k）** —— 3× 差距。两者上下文管理策略不同（本仓每步带全历史，
+dsh 有压缩/剪枝），这既解释了本仓更高的单请求成本，也解释了它更容易撞上上游的
+长请求不稳定。`reasoning` 一列**两侧不可比**：dsh 本版本的会话日志**不写
+`reasoningTokens`**（只有 `inputTokens`/`outputTokens`/`cacheReadTokens`），
+而账本里确实有 reasoning 计数 ⇒ 报告里 dsh 那列留空，不填 0。
+
+**边界（不许读过头）**：n=1（`webcore` 另补了重复轮），**不是统计显著**，报的是方向性差异；
+金额上从打通到收尾（含干跑、作废的第一轮、补测轮与三次诊断复现）总共约 **¥0.84**，
+其中**配对轮本身 ¥0.13**。
+
 ---
 
 ## 20. 项目记忆（P66–P68，`src/pm/` + `agent/ag_pm.uya`）
