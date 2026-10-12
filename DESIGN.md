@@ -734,10 +734,37 @@ plan 的补推**放在压缩之后**：别刚推就被折进 checkpoint。
 | `cmp_prune_head` | `4096` | 保留头部码点数 |
 | `cmp_prune_tail` | `1024` | 保留尾部码点数 |
 | `CMP_PRUNE_MARK` | `"\n\n[... tool result middle pruned ...]\n\n"` | 固定标记，**逐字对齐 DSH** |
+| `cmp_prune_pressure_gated` | `true` | **P79 压力闸门**：没有压力就不剪（见下） |
 
 **「只在构请求时生效（不动历史）」是刻意的不变量**：① 天然幂等 —— 每一步都重新从原文算，
 不会「剪了又剪」；② 会话日志里留的是**原文**，事后能用完整证据复盘；③ `--resume` 后重新
 构请求仍得到同一结果。代价是每步都要重算一次（可接受，这是纯字节操作）。
+
+**P79：必须再有「压力达标」这道闸门，否则会自锁**（这条是 4 题头对头测出来的，见 §19.1）。
+原来剪枝**每步无条件生效** —— 只要单条工具结果超过 8192 码点就剪。而 DSH 用**同一套数字**
+却只在压力达标时才剪（它自己的 README：*"Below-pressure step checks never prune"*）。
+缺这道闸门会形成一个**自锁循环**：
+
+| 步 | 动作 | 结果码点 | 后果 |
+|---|---|---|---|
+| 9 | `read scheduler.py` | 16623 | 中段被剪掉 |
+| 10 | 模型为**找回中段**窄读 `offset=100 limit=200` | 8489 | **又被剪** |
+| 11 | 再补两次更窄的读 | 4691 / 3280 | 这才拿到 |
+
+实测 taskflow：**29 次 read 里 11 次是这种补救读**，23 步里 21 步在探索，**第 19 步才第一次
+写文件**。判定口径是 `cmp_prune_armed(未剪原文字节, context_window)`：
+与压缩**同一条触发线** `floor(window × thresholdRatio)`，`context_window <= 0`（未知）时
+**保守剪**（宁可丢中段也不撑爆请求）。
+
+**闸门输入刻意不用 `cmp_request_bytes`**：那个函数自己会调剪枝，拿它当闸门输入等于
+「剪枝决定要不要剪枝」的循环论证（剪过之后字节变小 ⇒ 压力看起来不达标 ⇒ 不剪 ⇒ 又变大）。
+所以单开了 `cmp_raw_tool_bytes`（数**未剪**原文）。
+
+**实测收益**（同题同模型，只加这道闸门）：taskflow 模型调用 **24 → 17 次**，
+read **29 → 17 次**，超阈值 read **8 → 5 次**，得分都是 **1.0000**；
+`make-ci-green`（源文件全小于阈值）行为不变（11 次 / 1.0000）—— 回归腿。
+A/B 对照臂（把阈值从 8192 直接提到 200000，不改代码）是 24 → 13 次，
+说明**丢掉的确实是纯浪费**，而不是把剪枝的收益一起丢了。
 
 **按码点而不是字节计数**：对齐 DSH 的 `Array.from(text).length` —— 中文内容按字节算会
 比按字符算早 3 倍触发，剪枝阈值就失去意义。`bufx_utf8_count` / `bufx_utf8_prefix_bytes` /
@@ -4680,6 +4707,58 @@ responses 用 `{"type":"input_image","detail":"auto","image_url":…}`；
      **自测喂的输入形状，决定了它能照亮的缺陷种类**：纯函数轮用「理想输入」写，
      就只能证明「理想输入下对」。
 
+131. **换宿主编译器（GCC 14+）把四类「以前只是 warning」的账一次收走 —— 报错全在
+    编译器生成的 C 里，可改的只有 uya 侧与 Makefile**（本轮；本机 cc = GCC 15.2，
+    `make check` 全绿、`make build` 成片失败）：
+
+    ① **无体 `extern "libc" fn` 不发射 C 原型 ⇒ 隐式函数声明**。codegen 是**故意**不生成
+    这类声明的（`uya/src/codegen/c99/function.uya`：它假定宿主系统头已声明过），而 split-C
+    的每个 `.c` 只 include `uya_*.h`、从不 include 系统头 ⇒ `setsid`（websrv / shellx /
+    mcprun 三处）与 `sigaction`（sigx）的调用点在 C 里都是隐式声明。
+    **修法**：`src/cshim/uya_agent_libc_protos.h` 补原型，Makefile 用
+    `CFLAGS=… -include <那个头>` 注入。原型必须落在**出错的那个 TU** 里 ——
+    单放一个 `.c` 里（`@c_import`）没用，那只是另一个翻译单元。
+    那个头**绝不能 include 系统头**：生成的 `uya_part1_types.h` 自带 `int64_t` / `size_t`，
+    再拉进 glibc 的 `<sys/types.h>` 就是满屏 conflicting types（所以它只用 C 内置类型 +
+    前向声明 `struct SigxAction`）。
+
+    ② **指针类型对不上**（这一族最多，且每处都改得动）：自造同布局结构体传给 libc 指针
+    （`GxTimeVal` / `TuiTimeVal` vs `TimeVal` ⇒ 用 libc 的 `TimeVal` —— 同布局**不等于**
+    同一个 C 类型）；uya 侧收 `&byte`、实参是 `&const byte`（`jw_str` / `js_parse` /
+    `cstr_len` / `arg_starts_with` / `buf_from_cstr` ⇒ 入参收 `&const byte`，只在边界上
+    显式 `as &byte` 转一次，让 const 只在一处被抹掉）；`&g_watch_cfg` 而它**自己就是**
+    `&const Config`（取址成了 `Config**`）；`&fds`（`int(*)[2]`）当 `&i32` 用（⇒ `&fds[0]`）。
+
+    ③ **`{0}` 套在标量上**：`History.items` 是 `&Msg`（裸指针）不是切片，写 `items: []`
+    时 codegen 发出 `.items = {0}` ⇒ braces around scalar initializer
+    （⇒ 写 `items: null`）。
+
+    ④ **生成物里有裸方向控制符**：`escape_string_for_c` 只转义 `\n \t \r \\ "`，其余字节
+    原样吐进 C 字面量；夹具里的 U+202E（RLO）/ U+200B 于是变成生成物里的裸字节 ⇒ 宿主
+    的 `-Wbidi-chars` 报「源码里有方向控制符」（源码侧本来是转义写法）。⇒ 夹具改**按字节**喂。
+
+    **CFLAGS 怎么注入（同一条已经踩过两次）**：driver 按
+    `make -C <cache> CC=… CFLAGS=… …` 调它生成的 `build/uyacache/Makefile`，
+    **命令行变量压过里面的 `CFLAGS ?=`** —— 所以真生效的是 `make build` 那条命令上写的
+    `CFLAGS=`（`AGENT_CFLAGS`），生成 Makefile 里那行
+    `-std=c99 -Wall -Wextra -pedantic -I.` 对本路径**从不生效**（它只管「有人手跑
+    make -C build/uyacache」那一路）。写就写**全**：漏 `-std=c99` 会让
+    `typedef _Bool bool` 当场报错；**别**照抄那行「看着像基线」的档位 —— 落在生成代码上
+    实测从 **0 条**刷到 **1.8 万条**告警，而那些一条都不归本仓修，只会把真告警淹掉。
+    注入用**行内赋值**、不用 `export`（同踩坑 90：`export` 会漏进 `make selftest` 里
+    agent 自己发起的构建，等于把本仓的原型头强加给别人的编译）。手工编译按
+    `$(make -s print-cflags)` 带上。
+
+    **顺带揪出两处真 bug** —— 宿主 C 的报错只是把「uya checker 没拦住」显形：
+    `agent_effort_apply` 把 C 串传给了收 `&const Buf` 的 `sv_eq_cstr`（P55 那条「人手动
+    改过档位就别再自动降档」的判定一直在读错内存）；`agent_pm_note_tool` 的 (指针, 长度)
+    传的是 `&res_f.ptr, &res_f.len`（**取字段地址**当内容与长度 ⇒ 记进项目记忆的是错内存 +
+    一个巨大的长度）。
+
+    教训：**「只是 warning」不是可以欠的账，它只是把到期日推给下一次换编译器**。
+    这条链上没有任何判据看得见它（`make check` 只查 uya 类型，生成物里的 C 它不看），
+    所以「GCC 版本升到 14+」这件事本身要当成一次**全量重编 + 逐个收账**的时机。
+    同族：`make lint-size` / `doc-audit` 也看不见 C 侧的 const 与原型。
 132. **默认档在真实站点上必然失败 ⇒ 新机器第一次跑就是「请求失败（网络或 TLS 校验）」**
      （P78，用户报的：Ubuntu 26 那台 `uya-agent hi` 直接报这个）。
      三条独立缺陷叠在一起，**每一条单独都不致命，合起来让默认配置完全不可用**：
@@ -5596,6 +5675,112 @@ DEEPSEEK_API_KEY=sk-xxx ./build/uya-agent \
   `snapshot(models=3 provider_models=3 routes=3)`、日志 ERROR 计数与改动前相同）；
   本仓侧 `make lint-size` / `make doc-audit` / `make build` 与 `--print-config` 两条
   （见下一条 bullet 的实测输出）。
+
+### 19.1 与 DSH 的头对头（OpenBench 4 题，P78）
+
+**问题**：同一个模型（`aigw-local/DeepSeek-V4.1-Flash`，推理强度 `max`）、同一批任务，
+harness 差多少？用的是第三方基准 **OpenBench**（`minghinmatthewlam/openbench`，
+专为「换 harness、不换模型」设计；**不是 DSH 官网的 bench** —— 官网没有 bench 页）。
+
+任务 4 个：`taskflow`（修 5 处逻辑缺陷让 25 个单测全绿）、`make-ci-green`（16 个）、
+`add-feature`（给 miniconf 加 `@include`）、`webcore`（给微框架加类型化路由/挂载/内容协商）。
+判据是**任务自带的 pristine 测试套件**（cwd 指向 agent 的工作区副本，改工作区里的测试没用），
+按 `test_ids.txt` 逐条隔离跑、给部分分 `SCORE: 0.0-1.0`。
+测量装置（两个 adapter + dsh 的隔离 home 模板 + 复现命令）已入库：
+[`testdata/openbench_adapters/`](testdata/openbench_adapters/README.md) —— 它是**验收装置**，
+不进 `Makefile` 的 `SRC`、不参与构建（与 `testdata/` 下其它验收脚本同口径）。
+
+**三道控制先立住**（都在花钱之前）：
+
+| 控制 | 期望 | 实测 |
+|---|---|---|
+| 负控 `--harness null` | 未改动的仓库必须拿基线分 | `0.28 / 0.3125 / 0.40 / 0.30`，`success` 全 false ✓ |
+| 正控 叠 `solution/` | 必须全 1.0（证明题有解、判据不是恒假） | 四个**全 1.0000** ✓ |
+| 通路 假 key / 真调用 | adapter 能被 runner 调起、`SCORE` 落盘 | 两侧都调起；token 数与网关账本**逐数相等** ✓ |
+
+**配对轮结果**（两侧输出上限都设 256000，见下「坑一」）：
+
+| 任务 | uya-agent | dsh | |
+|---|---|---|---|
+| `taskflow` | 1.0 · 82.6 s · 613 k tok | 1.0 · **45.1 s** · **373 k tok** | dsh 快 1.8×、省 1.6× |
+| `make-ci-green` | 1.0 · 24.3 s · 121 k | 1.0 · **22.5 s** · **104 k** | 基本持平（dsh 略优） |
+| `add-feature` | 1.0 · **53.9 s** · **118 k** | 1.0 · 76.2 s · 253 k | uya-agent 快 1.4×、省 2.1× |
+| `webcore` | **1.0**（补测轮 514.6 s · 54 步） | 1.0 · 729.9 s · 63 步 | 都能解；配对轮 uya-agent 那格被上游掐断（见「坑三」） |
+
+⇒ **能力上没有差距**：4 题两侧都能拿到满分（`webcore` 的 uya-agent 满分来自补测轮，
+不是本轮的 0.30）。**差距全在效率与稳健性上**，且**方向按任务而分**：dsh 在最难的多模块
+推理题（`taskflow`）上明显更快更省；uya-agent 在「按规格加一个特性」（`add-feature`）上更快更省。
+
+**三条踩坑（都是实测，不是推测）**：
+
+**坑一：跨 harness 的输出上限必须显式配对，否则结论会反过来。** pi-ai 目录给
+`DeepSeek-V4.1-Flash` 的默认 `maxTokens` 是 **32768**，而本仓 `--max-tokens` 默认 **256000**。
+第一轮没配对时 dsh 在 `webcore` 上「每步都正常、到第 16 步撞顶」
+（会话日志：`outputTokens: 32768` + `finish reason: max-tokens`）——
+它想把整个实现写在一次推理里，撞顶后**一个字节都没落盘**（`workspace_changed=false`），
+得分停在基线 0.30。把 dsh 的 `maxTokens` 提到 256000 后，**同一个任务 78 步跑完、1.0000**。
+⇒ 第一轮那张表**是错的**，已作废；凡跨 harness 比输出上限，必须配对并写进报告。
+
+**坑二（给本仓的、可行动的）：本仓没有传输层重试，dsh 有。**
+dsh 的 `dsh-base` 挂了 `dsh-llm-retry`，默认策略是
+**对 `TRANSPORT`/`TIMEOUT`/`SERVER`/`RATE_LIMIT`/`EMPTY_RESPONSE` 重试 5 次**，
+退避 500 ms–10 s、10% 抖动；本仓 `agent_step_stream` 收到 `err_kind == 3`
+（网络/TLS）直接 `return AGENT_NET`（退出码 2），**一层重试都没有**。
+实测差距：配对窗口内 dsh **100 次请求 0 次失败**，本仓 **163 次请求 2 次失败**；
+`webcore` 上本仓累计被上游掐断 **4 次**（延迟 108–261 s 后 `upstream_error`），
+唯一一次跑通的补测轮拿了满分 —— 也就是说**丢的全是本来能解出来的题**。
+⇒ 这是本轮唯一一条**直接该改本仓**的结论：一次 5xx/超时不该让整个任务作废。
+
+**坑三：上游故障不是 harness 缺陷，别把它记成能力差。** 网关历史里
+`upstream_error` 两边都出现过（`unknown`/`dsh`/`uya-agent` 全有），是共享基础设施问题。
+本仓那一格 0.30 全部来自「被掐断」而不是「做不出来」—— 报告里必须这么写，
+否则就把基础设施故障读成了 harness 差距。
+
+**本仓侧顺带量到的**：本仓平均每次请求的 prompt 是 **56 k token（峰值 213 k）**，
+dsh 是 **18.6 k（峰值 53 k）** —— 3× 差距。两者上下文管理策略不同（本仓每步带全历史，
+dsh 有压缩/剪枝），这既解释了本仓更高的单请求成本，也解释了它更容易撞上上游的
+长请求不稳定。`reasoning` 一列**两侧不可比**：dsh 本版本的会话日志**不写
+`reasoningTokens`**（只有 `inputTokens`/`outputTokens`/`cacheReadTokens`），
+而账本里确实有 reasoning 计数 ⇒ 报告里 dsh 那列留空，不填 0。
+
+**边界（不许读过头）**：n=1（`webcore` 另补了重复轮），**不是统计显著**，报的是方向性差异；
+金额上从打通到收尾（含干跑、作废的第一轮、补测轮与三次诊断复现）总共约 **¥0.84**，
+其中**配对轮本身 ¥0.13**。
+
+### 19.2 P79：修 §19.1 量出来的那个真缺陷（剪枝压力闸门）
+
+§19.1 只报告了差距，其中 `taskflow` 那格（dsh 快 1.8× / 省 1.6×）**有具体根因**，本节修掉它。
+根因不是「能力」，是 §5.3.1 记的那条：剪枝**每步无条件生效** ⇒ 读一个 >8192 的文件中段被剪
+⇒ 模型为找回中段再窄读 ⇒ 那一段又被剪 ⇒ **自锁**。DSH 同套数字但只在压力达标时剪。
+
+**修法**：加 `cmp_prune_armed()` 闸门（与压缩同一条触发线），两个构请求点都过它；
+**不动**「只在构请求层、不改历史」那条不变量，也**不动** 8192/4096/1024 三个 DSH 同款默认值。
+
+**验收（都是实测）**：
+
+| 判据 | 结果 |
+|---|---|
+| `st_stats_ctx` / `prune-bash` 新增 6 条（低压力不剪、高压力要剪、窗口未知仍剪、闸门关掉=旧行为、恰好到线、闸门输入=未剪原文） | 全绿 |
+| **负控①** 把闸门写成恒 `true` | 「低压力不剪」+「差一点不到线不剪」**当场红** |
+| **负控②** 把闸门写成恒 `false` | 「高压力要剪」+「恰好到线要剪」**当场红** |
+| `make selftest`（全轮） | PASS |
+| `make lint-size` | 通过（4 个文件） |
+| `uya check`（全 113 文件） | 通过 |
+
+**真机复核**（同题同模型，只多了这道闸门）：
+
+| | 模型调用 | read 次数 | 超阈值 read | 得分 |
+|---|---|---|---|---|
+| taskflow 改前 | 24 | 29 | 8 | 1.0000 |
+| taskflow 改后 | **17** | **17** | **5** | 1.0000 |
+| make-ci-green 改后（回归腿） | 11（不变） | — | — | 1.0000 |
+
+**踩坑（编译器）**：本机默认的 `/home/winger/uya-0.10/bin/uya` 是 **v0.10.1**，
+还带着 **64 个显式输入文件的上限**（CODING.md §1.2.1 记的就是这条）——本仓现在 **113 个**
+构建文件，用它 `check`/`build` 只会报 `收集模块依赖失败: <编译器路径>`，
+**报错指不到根因、看起来像编译器坏了**。实测 60 个文件过、70 个就炸，正是那条上限。
+可用的编译器是 **v0.10.3**（`/home/winger/uya/uya/bin/uya`，`UYA_ROOT=/home/winger/uya/uya/lib/`）。
+⇒ 换机/重装后第一步先 `uya --version` 认版本，别把这条当代码 bug 查。
 
 ---
 
