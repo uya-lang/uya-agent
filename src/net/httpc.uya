@@ -1,16 +1,18 @@
 // src/net/httpc.uya — 极简 HTTP/1.1 客户端（明文 + TLS），纯 Uya
 //
 // 本文件：URL 解析（url_parse）、DNS（std.net.dns）、TCP 连接（tcp_connect）、TLS 开壳
-//   （tls_open + 三档信任策略）、请求构造（build_request）、连接读（conn_read）、整段式请求
-//   （http_request，非流式路径）、leaf 指纹解析与比对、TLS 噪声静音（tls_noise_mute）、
-//   客户身份（HC_USER_AGENT，网关据此辨认客户端，P71）。
-// 不变量：① 信任策略只有三档且**默认 chain**（chain / pin / none，见 §5）；② leaf SHA-256
+//   （tls_open + 四档信任策略）、请求构造（build_request）、连接读（conn_read）、整段式请求
+//   （http_request，非流式路径）、leaf 指纹解析与比对、TOFU 指纹库的读写、TLS 噪声静音
+//   （tls_noise_mute）、客户身份（HC_USER_AGENT，网关据此辨认客户端，P71）。
+// 不变量：① 信任策略四档且**默认 tofu**（chain / pin / tofu / none，见 §18）；② leaf SHA-256
 //   从 `HandshakeCtx.server_flight_msg` 自己解析，**不依赖 `cert_parse` 的 RSA 前提**；③
 //   `tls_noise_mute` 把 `dup(2)` 存进 `g_err_fd`，显示层必须经 `err_fd()` 写（踩坑 30 同族）；
-//   ④ 明文与 TLS 走同一条上层路径，调用方不需要分支。
+//   ④ 明文与 TLS 走同一条上层路径，调用方不需要分支；⑤ 系统根证书库**只有 chain 档加载**
+//   （pin / tofu / none 的判据是 leaf 指纹，与 CA 库无关 —— 见踩坑 132）。
 // 依赖：libc（fcntl/heap/stdlib/syscall/unistd）、std.http.types、std.net.dns、std.string.strlen、
 //   lib/tls（tls.common / crypto.sha256 / https / ssl.context / ssl.handshake / ssl.record /
-//   x509.cert.Cert / x509.trust_store / x509.verify）；本仓 foundation/bufx、net/httpstream。
+//   x509.cert.Cert / x509.trust_store / x509.verify）；本仓 foundation/bufx、
+//   net/tlspin 与 net/httpstream（合并命名空间，无本地 use）。
 // 命名：`hc_*`（连接与请求原语）、`url_parse`/`tcp_connect`/`tls_open`/`build_request`/`conn_read`、
 //   `Tls*` 常量、`http_request`。
 //
@@ -58,6 +60,10 @@ export error HcOutOfMemory;
 export error HcTlsUnsupported;
 export error HcPinMismatch;
 export error HcTimeout;
+// chain 档的两条**可指路**的失败（以前一律糊成 HcTlsUnsupported，排障时指不到根因）：
+export error HcTlsNoChain;      // 握手成功但 stdlib 没解析出对端证书链（真实站点的必然结果）
+export error HcTlsNoAnchors;    // 机器上没有系统根证书库（chain 档才需要）
+export error HcTlsNoLeaf;       // 握手成功但没从 flight 里拿到 leaf 证书（无法算指纹）
 
 // ============================================================
 // 常量
@@ -87,6 +93,95 @@ const HC_USER_AGENT: &const byte =
 
 // --http-debug：把响应头与体首字节原始打出来（排查网关怪异响应）
 export var hc_debug: bool = false;
+
+// ============================================================
+// TOFU 指纹库（HC_VERIFY_TOFU 的判据来源）
+//
+// 路径由 agent 层在启动时钉进来（`hc_set_tofu_path`，取 `<agent_home>/tls_pins`）——
+// 传输层不认识 agent home，也不该认识。没钉过路径时 TOFU 退化成 none 的语义（见
+// `tls_tofu_decide`），绝不静默假装校验过。
+// ============================================================
+const HC_PIN_FILE_MAX: usize = 65536;
+// TOFU 判据的三态（数值本身无意义，只用来区分分支）
+const TP_VERDICT_UNPINNED: i32 = 0;   // 没配指纹库：不判据（等价 none 的语义）
+const TP_VERDICT_TRUSTED: i32 = 1;    // 库里有这台主机且指纹相符
+const TP_VERDICT_MISMATCH: i32 = 2;   // 库里有这台主机但指纹不符
+const TP_VERDICT_FRESH: i32 = 3;      // 首次见到（已记录）
+var hc_tofu_enabled: bool = false;
+var hc_tofu_path: Buf = Buf{ ptr: null, len: 0, cap: 0 };
+
+// 钉住指纹库路径（C 串，调用方保证 NUL 结尾）。空串 = 关掉记录能力。
+export fn hc_set_tofu_path(path: &const byte) bool {
+    buf_free(&hc_tofu_path);
+    hc_tofu_enabled = false;
+    if (path as usize) == 0 || bufx_cstr_len(path) == 0 {
+        return false;
+    }
+    hc_tofu_path = buf_new(bufx_cstr_len(path) + 8);
+    if !buf_append_cstr_z(&hc_tofu_path, path) {
+        buf_free(&hc_tofu_path);
+        return false;
+    }
+    hc_tofu_enabled = true;
+    return true;
+}
+
+// 指纹库路径（测试与 --print-config 用）。返回内部缓冲的切片，调用方不许留存。
+// 没钉过路径时返回**空切片**（len = 0，ptr 指向一个真实存在的字节）——
+// 不要写 `&""[0: 0]`：那是「切片字面量取地址」，codegen 会生成
+// `*((struct uya_slice_uint8_t){...})` 这类非法初始化，宿主 C 当场报 invalid initializer。
+// 末尾的 NUL **不对外**：这个缓冲是 C 串（sys_open 要用），但报给人看的路径里带上那个
+// 不可见字节，复制去 `cat` 会失败、逐字节比对也会红 —— 只有真看不见时才叫坑。
+export fn hc_tofu_path_now() &[byte] {
+    if !hc_tofu_enabled || hc_tofu_path.len == 0 {
+        return hc_tofu_path.ptr[0: 0];
+    }
+    if hc_tofu_path.ptr[hc_tofu_path.len - 1] == (0 as byte) {
+        return hc_tofu_path.ptr[0: hc_tofu_path.len - 1];
+    }
+    return hc_tofu_path.ptr[0: hc_tofu_path.len];
+}
+
+// ============================================================
+// 最近一次握手的 leaf 指纹（给「连接失败」的诊断用）
+//
+// 为什么要有这个全局：**流式路径拿不到 TlsConn**。`llm_stream_style` 里那个 TlsConn 是
+// 它自己的局部变量，agent 侧的 `agent_step_stream` 里也声明了一个 `tc`，但**从来没有传给
+// 它** —— 于是 `tc.observed_len` 恒为 0，错误分支永远走不到「打印指纹」那一支，用户只看到
+// 一句「检查 base-url / 网络」（踩坑 132 的现场：最需要指纹的那条路上指纹被丢掉了）。
+//
+// 一个进程里的 TLS 连接是**串行**的（流式一次一个；自动起标题的请求排在 step 边界），
+// 所以「最近一次握手观测到的 leaf」正好就是刚刚失败那一次连接的 leaf。
+// ============================================================
+var hc_leaf_buf: [byte: 64] = [0: 64];
+var hc_leaf_n: usize = 0;
+
+// 记下这次握手观测到的指纹（tls_open 在算完之后调；没有 leaf 时清空）。
+fn hc_record_last_leaf(c: &const TlsConn) void {
+    if c.observed_len != 64 {
+        hc_leaf_n = 0;
+        return;
+    }
+    var i: usize = 0;
+    while i < 64 {
+        hc_leaf_buf[i] = c.observed[i];
+        i = i + 1;
+    }
+    hc_leaf_n = 64;
+}
+
+// 最近一次握手观测到的 leaf 指纹：**指针 + 长度**两个口（没观测到时 len = 0）。
+// 为什么不返回切片：`hc_last_leaf` 是定长数组 `[byte: 64]`，对它写 `arr[0: n]` 时
+// codegen 会把返回的切片描述符推成 `uya_slice_int32_t`（元素类型猜错了），宿主 C 报
+// invalid initializer。定长数组一律走「指针 + 长度」，别走切片。
+export fn hc_last_leaf_ptr() &const byte {
+    return &hc_leaf_buf[0];
+}
+
+// 最近一次握手观测到的 leaf 指纹长度（0 = 没观测到）。
+export fn hc_last_leaf_len() usize {
+    return hc_leaf_n;
+}
 
 // 换行也用数组字面量：`&"\n"[0: 1]` 求值是**切片描述符**的地址，sys_write 会把这
 // 8 字节指针的第一个字节写出去 —— 屏幕上多一个乱码字节（与 tty.uya 里的坑同一个）。
@@ -130,6 +225,13 @@ fn hc_dbg_dec(label: &const byte, v: usize) void {
 export const HC_VERIFY_CHAIN: i32 = 0;
 export const HC_VERIFY_PIN: i32 = 1;
 export const HC_VERIFY_NONE: i32 = 2;
+// HC_VERIFY_TOFU = 「首次使用即信任」（Trust On First Use）：默认档。
+// 三档老策略在真机上都有同一个死结 —— chain 在真实站点上**必然失败**（见 §18 与踩坑 132），
+// 于是新机器（没有 DSH 设置 ⇒ 取默认档）第一次跑就是「请求失败（网络或 TLS 校验）」；
+// pin 又要求人手抄一个 64 位 hex 指纹，不开箱即用。TOFU 是这两者之间唯一能默认的档：
+// 第一次连某主机就把 leaf 指纹记进指纹库（pin 文件），之后每次都必须逐字节相符 ——
+// 强于 none（有防护）、弱于 pin（第一次没有可比对的基准，是 TOFU 的固有代价）。
+export const HC_VERIFY_TOFU: i32 = 3;
 
 // ============================================================
 // URL
@@ -392,6 +494,9 @@ export struct TlsConn {
     observed: [byte: 64],
     observed_len: usize,
     verified: bool,
+    anchors_ready: bool,     // 信任锚是否真的加载过（只有 chain 档需要）
+    host: &const byte,       // 这次连接的主机（TOFU 记账用；非 NUL 结尾）
+    host_len: usize,
 }
 
 // 一个空 TlsConn（fd = -1、四个上下文指针为 null、verified = false）。
@@ -407,6 +512,9 @@ export fn tls_conn_empty() TlsConn {
         observed: [0: 64],
         observed_len: 0,
         verified: false,
+        anchors_ready: false,
+        host: null,
+        host_len: 0,
     };
 }
 
@@ -474,8 +582,9 @@ fn tls_pin_matches(c: &TlsConn, pin: &[byte]) bool {
 
 // verify: HC_VERIFY_CHAIN / HC_VERIFY_PIN / HC_VERIFY_NONE
 // 在已连通的 fd（c.fd）上跑 TLS 握手并按 verify 档位判定信任：
-//   HC_VERIFY_CHAIN 走 stdlib 链校验（要求服务端发根证书，真实站点常失败 → `HcTlsUnsupported`）
+//   HC_VERIFY_CHAIN 走 stdlib 链校验（要求服务端发根证书，**真实站点上必然失败** → `HcTlsUnsupported`）
 //   HC_VERIFY_PIN   比对 leaf SHA-256 指纹（不匹配 `HcPinMismatch`）
+//   HC_VERIFY_TOFU  首次见到某主机则记录其 leaf 指纹，之后必须逐字节相符（不匹配 `HcPinMismatch`）
 //   HC_VERIFY_NONE  不校验
 // 分配的 4 个上下文一律交给 tls_conn_free 释放；成功时 c.verified 记录是否真的校验过。
 export fn tls_open(c: &TlsConn, host: &const byte, host_len: usize, verify: i32, pin: &[byte]) !void {
@@ -508,10 +617,25 @@ export fn tls_open(c: &TlsConn, host: &const byte, host_len: usize, verify: i32,
     // 它仍会把服务端 flight 里的证书链解析到 ctx.peer_leaf/peer_chain。
     ssl_set_insecure_skip_verify(ctx, true);
     ssl_set_skip_hostname_verify(ctx, true);
-    if !trust_store_load_system(ts) {
-        return error.HcTlsUnsupported;
+    // 信任锚**只有 chain 档需要**。pin / none / tofu 三档一律按 leaf 指纹判定，加载根证书
+    // 会在「机器上没有 CA 库」时把这三档一起拖死（实测：把 /etc/ssl 挂空之后，pin 档拿着
+    // **正确**的指纹也报 HcTlsUnsupported）—— 这是把「指甲的判据」绑在「体检报告」上。
+    c.anchors_ready = false;
+    if verify == HC_VERIFY_CHAIN {
+        if !trust_store_load_system(ts) {
+            return error.HcTlsNoAnchors;
+        }
+        ssl_set_peer_chain(
+            ctx,
+            null as &const Cert,
+            null as &const Cert,
+            0,
+            trust_store_get_certs(ts),
+            trust_store_get_count(ts),
+            KU_DIGITAL_SIGNATURE
+        );
+        c.anchors_ready = true;
     }
-    ssl_set_peer_chain(ctx, null as &const Cert, null as &const Cert, 0, trust_store_get_certs(ts), trust_store_get_count(ts), KU_DIGITAL_SIGNATURE);
     ssl_set_hostname(ctx, host, host_len);
     ssl_set_peer_identity(ctx, host, host_len, host, host_len);
     https_client_handshake(c.fd, ctx) catch {
@@ -519,9 +643,18 @@ export fn tls_open(c: &TlsConn, host: &const byte, host_len: usize, verify: i32,
     };
     tls_capture_leaf(c);
     tls_compute_observed(c);
+    hc_record_last_leaf(c);
+    c.host = host;
+    c.host_len = host_len;
     c.verified = false;
     if verify == HC_VERIFY_NONE {
         return;
+    }
+    // 没有 leaf 就什么都没有可信的 —— 三档都必须在这里挡住（以前 pin 档靠
+    // `tls_pin_matches` 里长度比对顺带挡住，但现在要在错误信息里说清「是没拿到证书」，
+    // 分开报比让上层猜更有用）。
+    if c.observed_len != 64 {
+        return error.HcTlsNoLeaf;
     }
     if verify == HC_VERIFY_PIN {
         if !tls_pin_matches(c, pin) {
@@ -530,14 +663,153 @@ export fn tls_open(c: &TlsConn, host: &const byte, host_len: usize, verify: i32,
         c.verified = true;
         return;
     }
-    // HC_VERIFY_CHAIN：用 stdlib 的链校验（要求服务端把根证书一并发来）
-    if ctx.peer_leaf == null as &const Cert {
-        return error.HcTlsUnsupported;
+    if verify == HC_VERIFY_TOFU {
+        return tls_tofu_decide(c, host, host_len);
     }
-    verify_chain_rsa(ctx.peer_leaf, ctx.peer_chain, ctx.peer_chain_len, trust_store_get_certs(ts), trust_store_get_count(ts), KU_DIGITAL_SIGNATURE) catch {
-        return error.HcTlsUnsupported;
+    // HC_VERIFY_CHAIN：用 stdlib 的链校验（要求服务端把根证书一并发来）
+    tls_chain_verify(c) catch |err| {
+        return err;
     };
     c.verified = true;
+    return;
+}
+
+// TOFU 的判定与落盘：库里有这台主机 …
+//   * 指纹相符 ⇒ 通过（verified = true）；
+//   * 指纹不符 ⇒ `HcPinMismatch`（**注意这是真的变了**，与「首次见到」是两回事）；
+//   * 没有这台主机 ⇒ 记下这一条再放行（verified = false：本次没有任何**先验**可比对，
+//     如实记账，别把「首次」算成「验过」）。
+//
+// 为什么首次也要看**主机**而不只是写一行：TOFU 的价值全在第二次连接上，所以查找必须
+// 能在库里找到上一次写的那行 —— 主机名比对大小写无关（tp_host_eq），指纹比对折叠小写。
+fn tls_tofu_decide(c: &TlsConn, host: &const byte, host_len: usize) !void {
+    const r: i32 = tls_tofu_verdict(
+        host, host_len, &c.observed[0], c.observed_len);
+    c.verified = r == TP_VERDICT_TRUSTED;
+    if r == TP_VERDICT_MISMATCH {
+        return error.HcPinMismatch;
+    }
+    return;
+}
+
+// TOFU 的**判据本体**（不含 TlsConn，因而离线可测）：返回三态结论。
+//
+// 为什么要把判据从 `tls_tofu_decide` 里摘出来：那个函数收 `&TlsConn`，而 TlsConn 只有走完
+// 真握手才填得满 —— 离线造不出来。自测若「照着它的形状再写一遍」，覆盖的就是**测试自己
+// 的复刻品**而不是产品代码：本文件第一版正是如此，把「首次不落盘」这行删掉之后自测**全绿**
+// （防假绿对照实测），而 TOFU 的全部价值就是那行落盘。摘出来之后，自测直接调这个函数，
+// 打点落在真判据上。
+//
+// 三态：TRUSTED（命中）/ MISMATCH（有记录但不符）/ FRESH（首次，已记录）。
+fn tls_tofu_verdict(
+    host: &const byte,
+    host_len: usize,
+    hex: &const byte,
+    hex_len: usize
+) i32 {
+    if !hc_tofu_enabled {
+        // 没配指纹库路径（比如纯库调用方没走 agent 的配置）⇒ 退化成 none 的语义，
+        // 但要留痕：不静默假装校验过。
+        return TP_VERDICT_UNPINNED;
+    }
+    var store: TpStore = tp_empty();
+    defer { tp_free(&store); }
+    tls_tofu_load(&store);
+    if tp_has_host(&store, host, host_len) {
+        if tp_trusts(&store, host, host_len, hex, hex_len) {
+            return TP_VERDICT_TRUSTED;
+        }
+        return TP_VERDICT_MISMATCH;
+    }
+    // 首次见到：记录。写失败不算连接失败 —— 判据是「能不能连上」，不是「能不能记账」；
+    // 但结论是 FRESH，调用方据此把 `verified` 留成 false，如实反映「本次没有先验可比对」。
+    _ = tls_tofu_append(host, host_len, hex);
+    return TP_VERDICT_FRESH;
+}
+
+// 从指纹库文件读全部文本并解析进 store（文件不存在/读不动 ⇒ 空库，不是错误）。
+fn tls_tofu_load(store: &TpStore) void {
+    var text: Buf = buf_new(HC_PIN_FILE_MAX);
+    defer { buf_free(&text); }
+    const pz: &const byte = hc_tofu_path.ptr as &const byte;
+    const fd: i32 = sys_open(pz as *const byte, O_RDONLY as i32, 0) catch {
+        return;
+    };
+    while text.len < HC_PIN_FILE_MAX {
+        const room: usize = text.cap - text.len;
+        const got: isize = sys_read(fd, &text.ptr[text.len], room) catch {
+            break;
+        };
+        if got <= 0 {
+            break;
+        }
+        text.len = text.len + (got as usize);
+    }
+    _ = sys_close(fd) catch {};
+    if text.len == 0 {
+        return;
+    }
+    _ = tp_parse(store, text.ptr, text.len);
+}
+
+// 把 `host hex` 追加到指纹库文件末尾（不存在就创建）。返回是否写成功。
+// 追加而不是重写：库里可能已经有别的站点（以及这台主机的多条轮换指纹），
+// 重写会把别人的条目一起丢掉 —— 本函数**只追加**，不改动任何已有字节。
+fn tls_tofu_append(host: &const byte, host_len: usize, hex: &const byte) bool {
+    var line: Buf = buf_new(host_len + TP_HEX_LEN + 8);
+    defer { buf_free(&line); }
+    if !tp_format_entry(&line, host, host_len, hex) {
+        return false;
+    }
+    const flags: i32 = (O_WRONLY | O_CREAT | O_APPEND) as i32;
+    const pz: &const byte = hc_tofu_path.ptr as &const byte;
+    const fd: i32 = sys_open(pz as *const byte, flags, 420 as i32) catch {
+        return false;
+    };
+    var off: usize = 0;
+    var ok: bool = true;
+    while off < line.len {
+        const w: isize = sys_write(fd, &line.ptr[off], line.len - off) catch {
+            ok = false;
+            break;
+        };
+        if w <= 0 {
+            ok = false;
+            break;
+        }
+        off = off + (w as usize);
+    }
+    _ = sys_close(fd) catch {};
+    return ok;
+}
+
+// 链校验：把 stdlib 的失败原因翻译成**能指路的**错误码，而不是一律 `HcTlsUnsupported`。
+//
+// 三条失败路径各有各的修法，糊成一个错误码等于把排障线索丢掉：
+//   * peer_leaf 为空 ⇒ `HcTlsNoChain`（本仓实测：真实站点**一律**走这条 —— stdlib 的
+//     `ssl_capture_peer_chain_from_server_flight` 认的是带 record 头的 in_ 缓冲，
+//     而 hdr.server_flight_msg 存的是**不含 record 头**的握手消息流，于是它解析不出任何证书，
+//     见 §18 / 踩坑 132。所以 chain 档在真实站点上是**必然**失败，不是偶发）；
+//   * 信任锚为空 ⇒ `HcTlsNoAnchors`（机器上没有 CA 库）；
+//   * 其它 ⇒ `HcTlsUnsupported`（签名/有效期/CA 约束不符 —— 真有中间人时会落在这里）。
+fn tls_chain_verify(c: &TlsConn) !void {
+    if !c.anchors_ready {
+        return error.HcTlsNoAnchors;
+    }
+    const ctx: &SslContext = c.ctx;
+    if ctx.peer_leaf == null as &const Cert {
+        return error.HcTlsNoChain;
+    }
+    verify_chain_rsa(
+        ctx.peer_leaf,
+        ctx.peer_chain,
+        ctx.peer_chain_len,
+        trust_store_get_certs(c.ts),
+        trust_store_get_count(c.ts),
+        KU_DIGITAL_SIGNATURE
+    ) catch {
+        return error.HcTlsUnsupported;
+    };
     return;
 }
 

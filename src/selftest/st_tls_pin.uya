@@ -1,0 +1,379 @@
+// src/selftest/st_tls_pin.uya — P78 自测轮：TOFU 指纹库与信任档位的判定
+//
+// 本文件：指纹库的纯函数轮（解析 / 查找 / 追加格式 / 畸形行容错 / 大小写与 CRLF 归一）
+//   与 TOFU 判定的**落盘轮**（首次记录 → 二次相符 → 篡改报错 → 按主机分别记账）。
+// 不变量：① 全部离线（不联网、不需要证书）—— 判据喂的是文本与 64 位 hex 字符串；
+//   ② 每条断言都能**单独**红：防假绿对照两处已实测（见 DESIGN §16 踩坑 132）；
+//   ③ 指纹库的路径走 `build/` 下的临时目录，绝不碰真 home；轮末把全局路径清掉。
+// 依赖：见锚点 selftest.uya 的文件头（本片与它同处合并命名空间，无本地 use）。
+// 命名：沿用 selftest 轮的前缀 `tpf_`（TLS pin fingerprint）。
+
+// 主机名字面量一律声明成**裸指针常量**（`"x" as &const byte`），长度用 bufx_cstr_len 现算。
+//
+// 为什么不用 `const X: &[byte] = &"x"[0: n]`：那样 codegen 会生成
+// `const uint8_t * const X = (struct uya_slice_uint8_t){...}` —— 切片描述符去初始化一个
+// 裸指针，宿主 C 报 "invalid initializer"，**编都编不过**。
+// 也不要在调用点写 `f(&"example.com"[0: 11])`：形参是裸指针 `&const byte` 时，它生成的是
+// 「描述符的地址」当 `const uint8_t*`，被调方拿到的是描述符头 8 字节（指针值本身），
+// 字符串内容变成垃圾 —— 本文件第一版实测读出来是 "BA"/"OA"/"NA" 这种两字节碎片，
+// 而编译器与类型检查全绿。这是本仓踩坑 22 那一族（切片字面量取址）的又一次咬人。
+const STR_EXAMPLE: &const byte = "example.com" as &const byte;
+const STR_EXAMPLE_UP: &const byte = "EXAMPLE.COM" as &const byte;
+const STR_API: &const byte = "api.test" as &const byte;
+const STR_NOPE: &const byte = "nope.test" as &const byte;
+const STR_GOOD: &const byte = "good.test" as &const byte;
+const STR_CRLF: &const byte = "crlf.test" as &const byte;
+const STR_NOEOL: &const byte = "noeol.test" as &const byte;
+const STR_MULTI: &const byte = "multi.test" as &const byte;
+const STR_HOSTTEST: &const byte = "Host.Test" as &const byte;
+const STR_OTHER: &const byte = "other.test" as &const byte;
+const STR_EXAMPLE_SP: &const byte = "example.com " as &const byte;
+const STR_NOEOL_SP: &const byte = "noeol.test " as &const byte;
+const STR_CRLF_END: &const byte = "\r\n" as &const byte;
+
+// 断言失败：打一行带轮名的诊断并置 ok = false（与 ty_fail 同形）。
+fn tpf_fail(what: &const byte, ok: &bool) void {
+    out_err("selftest[tls-pin] FAIL: ");
+    out_err(what);
+    out_err("\n");
+    ok[0] = false;
+}
+
+// 生成一串 n 个字符 c（写进 out）。返回 n。
+//
+// 为什么处处用生成而不是字面量：手写 64 个 hex 字符**数错个数看不出来**，而长度不是 64 的
+// 指纹会被 tp_norm_hex 整行跳过 —— 测试于是以「解析出 0 条」的形式失败，看起来像解析器的
+// 缺陷。本文件第一版就是这么红的（两处字面量分别只有 62 与 67 位）。生成出来就不会数错。
+fn tpf_fill(c: byte, n: usize, out: &byte) usize {
+    var i: usize = 0;
+    while i < n {
+        out[i] = c;
+        i = i + 1;
+    }
+    return n;
+}
+
+// 把 n 个字符 c 追加进 buf（给「拼一行指纹库文本」用）。
+fn tpf_add_run(b: &Buf, c: byte, n: usize) bool {
+    var i: usize = 0;
+    while i < n {
+        if !buf_append_byte(b, c) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+// 追加一行 `<host> <c × 64>\n`（c 是指纹的重复字符）。
+fn tpf_add_line(b: &Buf, host: &const byte, host_len: usize, c: byte) bool {
+    if !buf_append(b, host, host_len) {
+        return false;
+    }
+    if !buf_append_byte(b, 32 as byte) {
+        return false;
+    }
+    if !tpf_add_run(b, c, 64) {
+        return false;
+    }
+    return buf_append_byte(b, 10 as byte);
+}
+
+// 造两个基准指纹缓冲：ha = 'a'×64，hb = 'b'×64。
+fn tpf_two_hex(ha: &byte, hb: &byte) void {
+    _ = tpf_fill(97 as byte, 64, ha);
+    _ = tpf_fill(98 as byte, 64, hb);
+}
+
+// 指纹库轮第一段：基本解析 / 查找 / 大小写归一 / 长度闸门。
+fn tpf_store_round(tag: &const byte) bool {
+    var ok: bool = true;
+    var s: TpStore = tp_empty();
+    defer { tp_free(&s); }
+    var ha: [byte: 64] = [0: 64];
+    var hb: [byte: 64] = [0: 64];
+    var hc: [byte: 64] = [0: 64];
+    tpf_two_hex(&ha[0], &hb[0]);
+    _ = tpf_fill(99 as byte, 64, &hc[0]);
+    var body: Buf = buf_new(1024);
+    defer { buf_free(&body); }
+
+    // ---- A) 两行好行 + 一行注释 + 一行空行 ----
+    _ = buf_append_cstr(&body, "# comment\n\n");
+    _ = tpf_add_line(&body, STR_EXAMPLE, 11, 97 as byte);
+    _ = tpf_add_line(&body, STR_API, bufx_cstr_len(STR_API), 98 as byte);
+    const n: usize = tp_parse(&s, body.ptr, body.len);
+    if n != 2 {
+        tpf_fail("两行好行 + 注释 + 空行应当解析出 2 条", &ok);
+    }
+    if !tp_has_host(&s, STR_EXAMPLE, bufx_cstr_len(STR_EXAMPLE)) {
+        tpf_fail("库里有 example.com 却查不到（注释/空行干扰了之后的解析）", &ok);
+    }
+    // 库里是 'a'×64；拿 'c'×64 去查必须为假（这一条挡住「忽略指纹比对」的退化）
+    if tp_trusts(&s, STR_EXAMPLE_UP, 11, &hc[0], 64) {
+        tpf_fail("库里是 'a'×64，用 'c'×64 查不该命中", &ok);
+    }
+    // 主机名大写、指纹大写，都要能命中（两侧都做大小写折叠）
+    if !tp_trusts(&s, STR_EXAMPLE_UP, 11, &ha[0], 64) {
+        tpf_fail("主机名大写时应当命中（大小写无关）", &ok);
+    }
+    var hb_up: [byte: 64] = [0: 64];
+    _ = tpf_fill(66 as byte, 64, &hb_up[0]);
+    if !tp_trusts(&s, STR_API, 8, &hb_up[0], 64) {
+        tpf_fail("库里是小写 b、查询给大写 B 应当命中（指纹折叠小写）", &ok);
+    }
+    if tp_trusts(&s, STR_EXAMPLE, 11, &hb[0], 64) {
+        tpf_fail("库里没有的指纹不该被判为受信任", &ok);
+    }
+    if tp_trusts(&s, STR_NOPE, 9, &ha[0], 64) {
+        tpf_fail("库里没有的主机不该被判为受信任", &ok);
+    }
+    if tp_has_host(&s, STR_NOPE, 9) {
+        tpf_fail("库里没有的主机 tp_has_host 应当为假", &ok);
+    }
+    // 长度不是 64 的指纹查询一律不认（不许截断/补齐去凑）
+    if tp_trusts(&s, STR_EXAMPLE, 11, &ha[0], 63) {
+        tpf_fail("长度 63 的指纹不该被判为受信任", &ok);
+    }
+    if ok {
+        out_err("selftest[");
+        out_err(tag);
+        out_err("] ok（指纹库解析/查找/归一）\n");
+    }
+    return ok;
+}
+
+// 指纹库轮第二段：畸形行容错 / CRLF 与末行无换行 / 多指纹 / 追加格式 / 空库。
+// 与 tpf_store_round 分开只为守住 AGENTS.md 的函数 ≤100 行 —— 判据之间没有先后依赖。
+fn tpf_store_round_b(tag: &const byte) bool {
+    var ok: bool = true;
+    var s: TpStore = tp_empty();
+    defer { tp_free(&s); }
+    var ha: [byte: 64] = [0: 64];
+    var hb: [byte: 64] = [0: 64];
+    tpf_two_hex(&ha[0], &hb[0]);
+    var body: Buf = buf_new(1024);
+    defer { buf_free(&body); }
+
+    // ---- B) 畸形行一律跳过，不许把整库读废 ----
+    _ = buf_append_cstr(&body, "short 1234\n");
+    _ = buf_append_cstr(&body, "toolong ");
+    _ = tpf_add_run(&body, 49 as byte, 65);        // hex 太长（65 位）
+    _ = buf_append_byte(&body, 10);
+    _ = buf_append_cstr(&body, "nonhex ");
+    _ = tpf_add_run(&body, 122 as byte, 64);       // 64 位但不是 hex（'z'）
+    _ = buf_append_byte(&body, 10);
+    _ = tpf_add_line(&body, STR_GOOD, 9, 67 as byte);
+    _ = buf_append_cstr(&body, "onlyhost\n");      // 只有主机名
+    const nb: usize = tp_parse(&s, body.ptr, body.len);
+    if nb != 1 {
+        tpf_fail("4 行畸形 + 1 行好行应当只剩 1 条（畸形行必须跳过而不是中止）", &ok);
+    }
+    if !tp_has_host(&s, STR_GOOD, 9) {
+        tpf_fail("畸形行之后的**最后**一行好行丢了（解析提前中止）", &ok);
+    }
+
+    // ---- C) CRLF 行尾与末行无换行都要认 ----
+    buf_reset(&body);
+    _ = tpf_add_line(&body, STR_CRLF, 9, 100 as byte);
+    body.len = body.len - 1;                        // 把末行的 \n 换成 \r\n
+    _ = buf_append(&body, STR_CRLF_END, 2);
+    _ = buf_append(&body, STR_NOEOL_SP, 11);
+    _ = tpf_add_run(&body, 101 as byte, 64);        // 'e'×64，**不补换行**
+    const nc: usize = tp_parse(&s, body.ptr, body.len);
+    if nc != 2 {
+        tpf_fail("CRLF 行 + 末行无换行应当解析出 2 条", &ok);
+    }
+    var he: [byte: 64] = [0: 64];
+    _ = tpf_fill(101 as byte, 64, &he[0]);
+    if !tp_trusts(&s, STR_NOEOL, 10, &he[0], 64) {
+        tpf_fail("末行没有换行结尾时指纹没读到（或带着 \\r 一起比了）", &ok);
+    }
+
+    // ---- D) 多条指纹：命中任意一条即通过（站点轮换证书）----
+    buf_reset(&body);
+    _ = tpf_add_line(&body, STR_MULTI, 10, 49 as byte);   // '1'×64
+    _ = tpf_add_line(&body, STR_MULTI, 10, 50 as byte);   // '2'×64
+    const nm: usize = tp_parse(&s, body.ptr, body.len);
+    if nm != 2 {
+        tpf_fail("同一主机的两条指纹应当都进库", &ok);
+    }
+    var h2: [byte: 64] = [0: 64];
+    _ = tpf_fill(50 as byte, 64, &h2[0]);
+    if !tp_trusts(&s, STR_MULTI, 10, &h2[0], 64) {
+        tpf_fail("同一主机的第二条指纹没被认（命中任意一条即通过）", &ok);
+    }
+
+    // ---- E) 追加格式：`<host> <小写 hex>\n` ----
+    var line: Buf = buf_new(256);
+    defer { buf_free(&line); }
+    var ha_up: [byte: 64] = [0: 64];
+    _ = tpf_fill(65 as byte, 64, &ha_up[0]);        // 'A'×64（输出必须折成小写）
+    if !tp_format_entry(&line, STR_HOSTTEST, 9, &ha_up[0]) {
+        tpf_fail("tp_format_entry 返回了 false", &ok);
+    }
+    var want: Buf = buf_new(256);
+    defer { buf_free(&want); }
+    _ = buf_append_cstr(&want, "Host.Test ");
+    _ = tpf_add_run(&want, 97 as byte, 64);
+    _ = buf_append_byte(&want, 10);
+    if line.len != want.len {
+        tpf_fail("追加行的长度不对（应为 `<host> <小写 hex>\\n`）", &ok);
+    } else if !bufx_mem_eq(line.ptr as &const byte,
+                           want.ptr as &const byte, want.len) {
+        tpf_fail("追加行的内容不对（指纹没折成小写？）", &ok);
+    }
+
+    // ---- F) 空库：什么都不信 ----
+    var empty: TpStore = tp_empty();
+    defer { tp_free(&empty); }
+    if tp_trusts(&empty, STR_EXAMPLE, 11, &ha[0], 64) {
+        tpf_fail("空库不该相信任何主机", &ok);
+    }
+    if tp_has_host(&empty, STR_EXAMPLE, 11) {
+        tpf_fail("空库不该有主机", &ok);
+    }
+    if ok {
+        out_err("selftest[");
+        out_err(tag);
+        out_err("] ok（畸形容错/CRLF/多指纹/追加格式/空库）\n");
+    }
+    return ok;
+}
+
+// 直接读指纹库文件的原文（把「产品到底写了什么字节」取出来断言，而不是去问产品
+// 「你写了吗」—— 判据要读事实，见踩坑 129）。
+fn tpf_read_file(out: &Buf) bool {
+    const path: &[byte] = hc_tofu_path_now();
+    if path.len == 0 {
+        return false;
+    }
+    buf_reset(out);
+    var pz: Buf = buf_new(path.len + 1);
+    defer { buf_free(&pz); }
+    if !buf_append(&pz, path.ptr, path.len) || !buf_append_byte(&pz, 0) {
+        return false;
+    }
+    const fd: i32 = sys_open(pz.ptr as *const byte, O_RDONLY as i32, 0) catch {
+        return false;
+    };
+    while out.len < out.cap {
+        const room: usize = out.cap - out.len;
+        const got: isize = sys_read(fd, &out.ptr[out.len], room) catch {
+            break;
+        };
+        if got <= 0 {
+            break;
+        }
+        out.len = out.len + (got as usize);
+    }
+    _ = sys_close(fd) catch {};
+    return true;
+}
+
+// 落盘的库里是否**缺**这一条（缺 = 判据没落盘，应当报红）。
+//
+// 判据是「文件里有没有那一行原文」，不是「解析后查得到吗」—— 后者会把自己写的解析器也
+// 一起验进去，写盘坏了反而看不出来（踩坑 129：判据要读事实）。
+fn tpf_file_lacks(host: &const byte, host_len: usize, hex: &const byte) bool {
+    var text: Buf = buf_new(8192);
+    defer { buf_free(&text); }
+    if !tpf_read_file(&text) {
+        return true;
+    }
+    var want: Buf = buf_new(host_len + 80);
+    defer { buf_free(&want); }
+    if !tp_format_entry(&want, host, host_len, hex) {
+        return true;
+    }
+    if want.len > text.len {
+        return true;
+    }
+    return find_sub(text.ptr[0: text.len], want.ptr[0: want.len], 0) < 0;
+}
+
+// 调**产品代码**里的 TOFU 判据（`tls_tofu_verdict`）走一遍，返回三态结论。
+//
+// 这里以前是「照着 tls_tofu_decide 的形状再写一遍」—— 错在覆盖的是测试自己的复刻品：
+// 把产品里「首次落盘」那一行删掉，自测**全绿**（防假绿对照实测），而 TOFU 的全部价值就是
+// 那一行。现在判据本体被摘成了 `tls_tofu_verdict`（不收 TlsConn，离线可调），打点落在真代码上。
+fn tpf_tofu_verdict(host: &const byte, host_len: usize, hex: &const byte) i32 {
+    return tls_tofu_verdict(host, host_len, hex, 64);
+}
+
+// TOFU 的落盘轮：走临时目录里的真文件，验「首次记录 → 二次相符 → 篡改报错」这条闭环。
+//
+// 为什么要有落盘这一轮：`tpf_store_round` 只喂文本给纯函数，**「append 真的把行写进文件了
+// 吗」与「load 真的读回来了吗」它一个字都没覆盖** —— 而这正是 TOFU 的全部机制
+// （踩坑 129 同族：判据要读事实，不能读「看起来还在」）。
+fn tpf_tofu_round(tag: &const byte) bool {
+    var ok: bool = true;
+    var ha: [byte: 64] = [0: 64];
+    var hb: [byte: 64] = [0: 64];
+    tpf_two_hex(&ha[0], &hb[0]);
+    const home: &const byte = "build/selftest_tls_pins" as &const byte;
+    _ = sess_mkdir_p(home);
+    const pins: &const byte =
+        "build/selftest_tls_pins/tls_pins" as &const byte;
+    _ = sys_unlink(pins) catch {};   // 上一轮的残留先删（判的是「首次」行为）
+
+    if !hc_set_tofu_path(pins) {
+        tpf_fail("hc_set_tofu_path 对合法路径返回了 false", &ok);
+        return ok;
+    }
+    // 路径确实钉上了（读事实，而不是「以为钉上了」）
+    const now: &[byte] = hc_tofu_path_now();
+    const pn: usize = bufx_cstr_len(pins);
+    if now.len != pn {
+        tpf_fail("hc_tofu_path_now 回读的路径长度与钉进去的不一致", &ok);
+    } else if !bufx_mem_eq(now.ptr, pins, pn) {
+        tpf_fail("hc_tofu_path_now 回读的路径内容与钉进去的不一致", &ok);
+    }
+
+    // ---- A) 首次：库里没有这台主机 ⇒ FRESH，且**那一行真的落盘** ----
+    const host: &const byte = "tofu.test" as &const byte;
+    if tpf_tofu_verdict(host, 9, &ha[0]) != TP_VERDICT_FRESH {
+        tpf_fail("首次 TOFU 结论应当是 FRESH（放行并记录）", &ok);
+    }
+    if tpf_file_lacks(host, 9, &ha[0]) {
+        tpf_fail("首次 TOFU 之后指纹**没有**落盘（下次就没有先验可比对）", &ok);
+    }
+
+    // ---- B) 二次相符 ⇒ TRUSTED ----
+    if tpf_tofu_verdict(host, 9, &ha[0]) != TP_VERDICT_TRUSTED {
+        tpf_fail("库里指纹一致时 TOFU 结论应当是 TRUSTED", &ok);
+    }
+
+    // ---- C) 指纹变了（库里 a、服务端给 b）⇒ MISMATCH ----
+    // 防假绿对照：把 tp_trusts 改成忽略比对 ⇒ 这一条当场红（已实测）。
+    if tpf_tofu_verdict(host, 9, &hb[0]) != TP_VERDICT_MISMATCH {
+        tpf_fail("指纹与库中记录不符时应当 MISMATCH（防护形同虚设）", &ok);
+    }
+
+    // ---- D) 另一台主机：仍然 FRESH，且不覆盖第一台的记录 ----
+    if tpf_tofu_verdict(STR_OTHER, 10, &hb[0]) != TP_VERDICT_FRESH {
+        tpf_fail("另一台主机的首次连接应当是 FRESH（按主机分别记账）", &ok);
+    }
+    if tpf_file_lacks(STR_OTHER, 10, &hb[0]) {
+        tpf_fail("第二台主机的指纹没落盘", &ok);
+    }
+    if tpf_file_lacks(host, 9, &ha[0]) {
+        tpf_fail("写第二台主机时把第一台的记录弄丢了（应当只追加）", &ok);
+    }
+
+    _ = hc_set_tofu_path(null as &const byte);   // 别把临时库留给后面的轮次
+    if ok {
+        out_err("selftest[");
+        out_err(tag);
+        out_err("] ok（TOFU 首次记录/二次相符/篡改报错/按主机分账）\n");
+    }
+    return ok;
+}
+
+// 两轮的合体入口（selftest.uya 里一行调用）。
+fn tpf_rounds(tag: &const byte) bool {
+    const a: bool = tpf_store_round(tag);
+    const b: bool = tpf_store_round_b(tag);
+    const c: bool = tpf_tofu_round(tag);
+    return a && b && c;
+}

@@ -57,11 +57,10 @@ var g_rtx_kind: i32 = RTX_K_NONE;
 var g_rtx_status: i32 = 0;        // RTX_K_STATUS 时的 HTTP 状态码
 var g_rtx_printed: usize = 0;     // 失败那次已经打到屏幕上的正文字节数（给用户看的边界）
 var g_rtx_tls_seen: bool = false; // RTX_K_TRANSPORT 时是否观测到 leaf 证书（证据里要区分）
-// 失败那一刻的 leaf SHA-256 与体内错误原文：两者都活不过 `agent_step_*` 的返回
-// （TlsConn 与 ChatOut 都是那个函数的栈上局部量），而收口时要原样打给用户 ——
-// 所以在这里留一份副本。64 字节 = `TlsConn.observed` 的容量。
-var g_rtx_sha: [byte: 64] = [0: 64];
-var g_rtx_sha_len: usize = 0;
+// 体内错误原文：它活不过 `agent_step_*` 的返回（ChatOut 是那个函数的栈上局部量），
+// 而收口时要原样打给用户 —— 所以在这里留一份副本。
+// **指纹不需要副本**：`hc_last_leaf_ptr()`/`hc_last_leaf_len()` 是 net/httpc 里的
+// 进程级全局（最近一次握手观测到的那个），`agent_step_*` 返回之后照样读得到。
 var g_rtx_reason: Buf = Buf{ ptr: null, len: 0, cap: 0 };
 
 // agent_rtx_after_failure 的三个返回值（见那里的注释：三者混起来就会出现
@@ -84,7 +83,6 @@ fn agent_rtx_begin() void {
     g_rtx_status = 0;
     g_rtx_printed = 0;
     g_rtx_tls_seen = false;
-    g_rtx_sha_len = 0;
     if buf_valid(&g_rtx_reason) {
         buf_reset(&g_rtx_reason);
     }
@@ -105,21 +103,6 @@ fn agent_rtx_kind_name(k: i32) &const byte {
         return "upstream-error" as &const byte;
     }
     return "none" as &const byte;
-}
-
-// 记下「这一次失败手上有的证据」——TLS 指纹与体内错误原文都活不过 agent_step_* 的返回，
-// 而收口与转录都要它们（见 agent_rtx_give_up）。n 会被夹到 64 字节（TlsConn.observed 的容量）。
-fn agent_rtx_note_sha(p: &const byte, n: usize) void {
-    var k: usize = n;
-    if k > 64 {
-        k = 64;
-    }
-    var i: usize = 0;
-    while i < k {
-        g_rtx_sha[i] = p[i];
-        i = i + 1;
-    }
-    g_rtx_sha_len = k;
 }
 
 // 同一件事对体内错误原文：抄一份到 g_rtx_reason（收口时走 out_diag 的转义预览）。
@@ -530,6 +513,84 @@ fn calls_json_from_chat(o: &const ChatOut, out: &Buf) bool {
     return true;
 }
 
+// TLS 相关失败的**唯一出口**（流式 / 非流式两条路共用）。`kind` 是 httpc 那侧区分出来的
+// 具体原因（0 = 非 TLS 类，1 = 指纹不符，2 = 没拿到 leaf，3 = chain 拿不到链，
+// 4 = chain 没有信任锚，5 = chain 校验不过）。
+//
+// 为什么要分这么细：这五条**修法完全不同**，而它们以前全糊成一句「检查 base-url / 网络」——
+// 用户手里最需要的东西（观测到的指纹、以及「这次到底是哪一步不认」）全被丢掉了。
+// 尤其指纹：它在流式路径上以前**根本没传出来**（`llm_stream_style` 里的 TlsConn 是局部变量），
+// 所以最需要指纹的那条路给不出指纹（见踩坑 132）。
+//
+// 观测到的指纹来自 httpc 的 `hc_last_leaf_ptr()` / `hc_last_leaf_len()`（握手时记下的），
+// 不是 TlsConn —— 流式路径拿不到 TlsConn。
+fn agent_tls_fail_report(cfg: &const Config, kind: i32) void {
+    out_err("error: 请求失败（网络或 TLS 校验）。\n");
+    const leaf: &const byte = hc_last_leaf_ptr();
+    const leaf_n: usize = hc_last_leaf_len();
+    if kind == 1 {
+        // 指纹不符：把「配置的」与「服务端给的」并排打出来，别让人自己去找
+        out_err("  leaf 指纹与信任记录不符（站点换了证书，或者有人在中间）。\n");
+        if leaf_n == 64 {
+            out_err("  服务端 leaf SHA-256 = ");
+            out_err_bytes(leaf, leaf_n);
+            out_err("\n");
+        }
+        if cfg.verify == HC_VERIFY_TOFU {
+            // 先把切片取进局部再取 .ptr/.len：直接对函数返回值写
+            // `f().ptr` 会让 codegen 生成 `&f().ptr`（对临时结构体取址），宿主 C 报
+            // "lvalue required as unary '&' operand"。
+            const pins: &[byte] = hc_tofu_path_now();
+            out_err("  信任记录在 ");
+            out_err_bytes(pins.ptr, pins.len);
+            out_err("\n");
+            out_err("  确认这是你要连的站点之后，删掉库里那台主机的一行再重试。\n");
+        } else {
+            out_err("  配置的 --tls-pin 与它不符；确认无误后改用新指纹重试。\n");
+        }
+        return;
+    }
+    if kind == 2 {
+        out_err("  握手成功但没取到 leaf 证书（无法计算指纹）。\n");
+        out_err("  用 --probe 看传输层细节；这通常是中间设备改写了握手。\n");
+        return;
+    }
+    if kind == 3 {
+        out_err("  chain 档需要标准库解析出证书链，但它没解析出来。\n");
+        out_err("  真实站点上这是**必然**结果（见 DESIGN §18）；请改用默认的 ");
+        out_err("--tls-verify=tofu。\n");
+        if leaf_n == 64 {
+            out_err("  服务端 leaf SHA-256 = ");
+            out_err_bytes(leaf, leaf_n);
+            out_err("\n");
+        }
+        return;
+    }
+    if kind == 4 {
+        out_err("  chain 档需要系统根证书库，这台机器上没有找到。\n");
+        out_err("  装 ca-certificates，或改用默认的 --tls-verify=tofu（不需要 CA 库）。\n");
+        return;
+    }
+    if kind == 5 {
+        out_err("  chain 档的证书链校验没有通过（签名 / 有效期 / CA 约束）。\n");
+        if leaf_n == 64 {
+            out_err("  服务端 leaf SHA-256 = ");
+            out_err_bytes(leaf, leaf_n);
+            out_err("\n");
+        }
+        return;
+    }
+    if leaf_n == 64 {
+        out_err("  本次观测到的 leaf 证书 SHA-256 = ");
+        out_err_bytes(leaf, leaf_n);
+        out_err("\n");
+        out_err("  想钉住它就重试：\n");
+        out_err("  uya-agent --tls-verify=pin --tls-pin <上面的指纹> ...\n");
+    } else {
+        out_err("  检查 base-url / 网络；证书问题可先用 --probe --tls-verify=none 看指纹。\n");
+    }
+}
+
 // 去掉尾部空白后的长度（DSH：中断时只保留 content/reasoning 的非空白前缀）
 export fn agent_trim_trailing_ws(p: &const byte, n: usize) usize {
     var keep: usize = n;
@@ -573,6 +634,9 @@ fn agent_step_stream(cfg: &Config, style: u8, url: &const Buf, hdrs: &const Buf,
     var err_kind: i32 = 0;   // 0=无错 1=malformed 2=stream-closed 3=其它（传输/TLS） 4=用户中断
     // P82：可重试的传输错（连接/IO/超时/半截响应头/流早断）—— 判据在 net/retryx 里唯一一份。
     var err_retry: bool = false;
+    // 传输失败时**具体**是哪一个 TLS 错误（0=非 TLS 类）。两者不冲突、都要留着：
+    // `err_tls` 决定「不可重试的那几种怎么解释给用户听」，`err_retry` 决定「要不要重发」。
+    var err_tls: i32 = 0;
     const status: i32 = call_res catch |err| {
         const eid: i32 = (@error_id(err) as! i32).value;
         err_retry = rtx_retryable_err(eid);
@@ -583,6 +647,16 @@ fn agent_step_stream(cfg: &Config, style: u8, url: &const Buf, hdrs: &const Buf,
             r = 2;
         } else if eid == @error_id(error.LlmInterrupted) {
             r = 4;
+        } else if eid == @error_id(error.HcPinMismatch) {
+            err_tls = 1;   // 指纹不符（pin 或 TOFU）
+        } else if eid == @error_id(error.HcTlsNoLeaf) {
+            err_tls = 2;   // 握手成功但没拿到 leaf
+        } else if eid == @error_id(error.HcTlsNoChain) {
+            err_tls = 3;   // chain 档：stdlib 没解析出证书链
+        } else if eid == @error_id(error.HcTlsNoAnchors) {
+            err_tls = 4;   // chain 档：机器上没有 CA 库
+        } else if eid == @error_id(error.HcTlsUnsupported) {
+            err_tls = 5;   // chain 档：签名/有效期/CA 约束不符
         }
         r;
     };
@@ -633,23 +707,17 @@ fn agent_step_stream(cfg: &Config, style: u8, url: &const Buf, hdrs: &const Buf,
         return AGENT_NET;
     }
     if err_kind == 3 {
+        // 可重试的那一类（连接被拒/IO/超时/半截响应头）先走重发；
+        // 不可重试的（证书信任族：pin/TOFU 不符、没取到 leaf、chain 档的各种不行）
+        // 交给 `agent_tls_fail_report` —— 它按**具体**是哪一种给出可操作的下一步
+        // （这一层解释比「网络或 TLS 校验」有用得多，不能因为加了重试就把它绕过去）。
         if err_retry {
             g_rtx_kind = RTX_K_TRANSPORT;
-            g_rtx_tls_seen = tc.observed_len > 0;
-            agent_rtx_note_sha(&tc.observed[0], tc.observed_len);
+            g_rtx_tls_seen = hc_last_leaf_len() > 0;
             g_rtx_printed = o.printed_chars;
             return STEP_RETRY_NET;
         }
-        out_err("error: 请求失败（网络或 TLS 校验）。\n");
-        if tc.observed_len > 0 {
-            out_err("  本次观测到的 leaf 证书 SHA-256 = ");
-            out_err_bytes(&tc.observed[0], tc.observed_len);
-            out_err("\n");
-            out_err("  链校验在真实站点常失败（见 §18）；用这个指纹重试：\n");
-            out_err("  uya-agent --tls-verify=pin --tls-pin <上面的指纹> ...\n");
-        } else {
-            out_err("  检查 base-url / 网络；证书问题可先用 --probe --tls-verify=none 看指纹。\n");
-        }
+        agent_tls_fail_report(cfg, err_tls);
         return AGENT_NET;
     }
     if status != 200 {
@@ -967,7 +1035,6 @@ fn agent_rtx_after_failure(cfg: &const Config, step: i32,
 // 之所以要有一个「收口」函数：重试把「失败 → 报错」这一步推迟了，推迟之后必须有人
 // 用**逐字节相同**的文案把它补回来，否则 `--api-retry-max 0` 这条负控腿就失去意义。
 fn agent_rtx_give_up(cfg: &const Config, attempt: i32) i32 {
-    _ = cfg;
     if g_rtx_kind == RTX_K_STREAM {
         out_err(RTX_ERR_STREAM_CLOSED);
         return AGENT_NET;
@@ -986,19 +1053,13 @@ fn agent_rtx_give_up(cfg: &const Config, attempt: i32) i32 {
             g_rtx_reason.ptr as &const byte, g_rtx_reason.len);
         return AGENT_PROTO;
     }
-    // 传输/TLS：与不可重试那条支路**逐字节相同**（含指纹提示），免得两条路各长一个样。
-    // 指纹留在 g_rtx_sha 里 —— 失败那一刻的 TlsConn 早就随函数返回没了，而用户要的
-    // 正是「这一次的 leaf 指纹」（`--tls-verify=pin` 直接拿它去配）。
-    out_err("error: 请求失败（网络或 TLS 校验）。\n");
-    if g_rtx_sha_len > 0 {
-        out_err("  本次观测到的 leaf 证书 SHA-256 = ");
-        out_err_bytes(&g_rtx_sha[0], g_rtx_sha_len);
-        out_err("\n");
-        out_err("  链校验在真实站点常失败（见 §18）；用这个指纹重试：\n");
-        out_err("  uya-agent --tls-verify=pin --tls-pin <上面的指纹> ...\n");
-    } else {
-        out_err("  检查 base-url / 网络；证书问题可先用 --probe --tls-verify=none 看指纹。\n");
-    }
+    // 传输错：**复用**不可重试那条支路的报告函数（`agent_tls_fail_report`），
+    // 免得两条路各长一个样 —— 它按具体是哪一种给下一步，指纹从 net/httpc 的
+    // 进程级全局读（失败那一刻的 TlsConn 早没了，但那个全局还在）。
+    // 重试场景下 `err_tls` 多是 0（纯 IO/超时）⇒ 走它的通用分支：打指纹 +
+    // 「--tls-verify=pin」的下一步。真要是 TLS 信任族，重试预算本就拦不住它，
+    // 但那几种在分类表里**不可重试**，不会走到这里。
+    agent_tls_fail_report(cfg, 0);
     if attempt > 1 {
         out_err("  （已重试 ");
         out_err_dec((attempt - 1) as usize);
@@ -1388,30 +1449,36 @@ fn agent_step_plain(cfg: &const Config, style: u8, url: &const Buf, hdrs: &const
         &tc
     );
     tls_noise_unmute(&guard);
+    // 非流式这一路与流式共用同一套分类：可重试的（连接/IO/超时/半截）交 step 循环重发，
+    // 不可重试的 TLS 信任族交给 `agent_tls_fail_report` 按**具体**哪一种给下一步。
     var net_retry: bool = false;
+    var tls_kind: i32 = 0;
     _ = call_res catch |err| {
-        net_retry = rtx_retryable_err((@error_id(err) as! i32).value);
+        const eid: i32 = (@error_id(err) as! i32).value;
+        net_retry = rtx_retryable_err(eid);
+        var kind: i32 = 0;
+        if eid == @error_id(error.HcPinMismatch) {
+            kind = 1;
+        } else if eid == @error_id(error.HcTlsNoLeaf) {
+            kind = 2;
+        } else if eid == @error_id(error.HcTlsNoChain) {
+            kind = 3;
+        } else if eid == @error_id(error.HcTlsNoAnchors) {
+            kind = 4;
+        } else if eid == @error_id(error.HcTlsUnsupported) {
+            kind = 5;
+        }
+        tls_kind = kind;
     };
     if net_retry {
         // P82：瞬时传输错 —— 交给 step 循环退避后重发（同一步、历史不动）
         g_rtx_kind = RTX_K_TRANSPORT;
-        g_rtx_tls_seen = tc.observed_len > 0;
-        agent_rtx_note_sha(&tc.observed[0], tc.observed_len);
+        g_rtx_tls_seen = hc_last_leaf_len() > 0;
         return STEP_RETRY_NET;
     }
-    _ = call_res catch {
-        out_err("error: 请求失败（网络或 TLS 校验）。\n");
-        if tc.observed_len > 0 {
-            out_err("  本次观测到的 leaf 证书 SHA-256 = ");
-            out_err_bytes(&tc.observed[0], tc.observed_len);
-            out_err("\n");
-            out_err("  链校验在真实站点常失败（见 §18）；用这个指纹重试：\n");
-            out_err("  uya-agent --tls-verify=pin --tls-pin <上面的指纹> ...\n");
-        } else {
-            out_err("  检查 base-url / 网络；证书问题可先用 --probe --tls-verify=none 看指纹。\n");
-        }
-        return AGENT_NET;
-    };
+    // 不可重试的传输错（TLS 信任族 / URL / 内存）：按**具体**哪一种给出下一步，再收口。
+    agent_tls_fail_report(cfg, tls_kind);
+    return AGENT_NET;
 
     if resp.status != 200 {
         out_status[0] = resp.status;

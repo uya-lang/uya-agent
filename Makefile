@@ -104,10 +104,11 @@ AGENT_CFLAGS      := $(AGENT_CFLAGS_BASE) -include $(AGENT_C_PROTOS)
 #      数文件：`make -s print-src | wc -w`。
 # 留在 src/ 根的 tools.uya 是 P50 起就不在构建里的已知死代码，故意不列。
 SRC := src/foundation/bufx.uya src/foundation/jsonx.uya src/foundation/yamlcfg.uya \
-       src/net/httpc.uya src/net/httpsrv.uya src/net/httpstream.uya src/net/llm.uya src/net/retryx.uya src/net/sse.uya src/net/webx.uya \
+       src/net/tlspin.uya src/net/httpc.uya src/net/httpsrv.uya src/net/httpstream.uya src/net/llm.uya src/net/retryx.uya src/net/sse.uya src/net/webx.uya \
        src/term/mdview.uya src/term/tasks.uya src/term/tty.uya \
        src/term/tui/style.uya src/term/tui/keys.uya src/term/tui/frame.uya src/term/tui/entry.uya src/term/tui/screen.uya src/term/tui/overlay.uya src/term/tui/status.uya src/term/tui/ask.uya src/term/tui/watch.uya src/term/tui/diff.uya src/term/tui/hook.uya \
        src/term/view.uya src/term/watch.uya \
+       src/ui/ui_port.uya src/ui/be_null.uya src/ui/ui_reg.uya \
        src/tools/askuser.uya src/tools/fsx.uya src/tools/jobs.uya src/tools/perm.uya src/tools/sandboxx.uya src/tools/search.uya src/tools/shellx.uya \
        src/plugin/mcpcfg.uya src/plugin/mcprun.uya src/plugin/mcp.uya src/plugin/mcptool.uya \
        src/session/dshcfg.uya src/session/dshsave.uya src/session/dshsess.uya src/session/inbox.uya src/session/modelx.uya src/session/procx.uya src/session/session.uya src/session/sigx.uya src/session/stats.uya \
@@ -119,7 +120,7 @@ SRC := src/foundation/bufx.uya src/foundation/jsonx.uya src/foundation/yamlcfg.u
        src/selftest/selftest.uya src/selftest/shellselftest.uya src/selftest/sigselftest.uya src/selftest/tuiselftest.uya \
        src/selftest/st_core.uya src/selftest/st_mock_server.uya src/selftest/st_round_driver.uya src/selftest/st_tty_sse.uya src/selftest/st_sessions.uya src/selftest/st_read_window.uya src/selftest/st_view_watch.uya src/selftest/st_responses.uya src/selftest/st_stats_ctx.uya src/selftest/st_title.uya src/selftest/st_tasks_ws.uya src/selftest/st_goal_worktree.uya src/selftest/st_pm.uya src/selftest/st_pm2.uya src/selftest/st_mcp.uya \
        src/selftest/tuis_core.uya src/selftest/tuis_title_pty.uya src/selftest/tuis_exit_cmd.uya src/selftest/tuis_diff_scroll.uya src/selftest/tuis_title_ask.uya src/selftest/tuis_sessions_big.uya src/selftest/tuis_tail.uya src/selftest/tuis_marquee_row.uya \
-       src/selftest/st_web.uya src/selftest/st_web_childcfg.uya \
+       src/selftest/st_web.uya src/selftest/st_web_childcfg.uya src/selftest/st_tls_pin.uya \
        src/diff/model.uya src/diff/gitcmd.uya src/diff/rows.uya src/diff/view.uya src/diff/render.uya
 OUT := build/uya-agent
 
@@ -132,7 +133,7 @@ export UYA_ROOT
 export UYA_SPLIT_C_DIR := $(CURDIR)/build/uyacache
 
 # 行宽豁免：一条 .PHONY 就是一张全仓目标清单，拆行反而看不清哪条丢了
-.PHONY: all check print-src print-cflags build link-audit selftest codegen-audit doc-audit lint-size lint-size-all doc-cover probe e2e e2e-config e2e-exec e2e-accept-nudge e2e-retry e2e-config-flags e2e-title e2e-title-cmd e2e-title-auto e2e-mouse e2e-api e2e-steps e2e-permission e2e-sandbox e2e-tasks e2e-goal e2e-memory e2e-memory-live e2e-sessions e2e-resume-big e2e-diff e2e-ws e2e-model e2e-model-save e2e-model-route e2e-worktree e2e-watch e2e-watch-pick e2e-dsh e2e-portable p30-check tui-demo tui-selftest web-selftest sess-selftest diff-selftest model-selftest panel-selftest clean shell-selftest pm-selftest mcp-selftest
+.PHONY: all check print-src print-cflags build link-audit selftest codegen-audit doc-audit lint-size lint-size-all doc-cover ui-audit probe e2e e2e-config e2e-exec e2e-accept-nudge e2e-retry e2e-config-flags e2e-title e2e-title-cmd e2e-title-auto e2e-mouse e2e-api e2e-steps e2e-permission e2e-sandbox e2e-tasks e2e-goal e2e-memory e2e-memory-live e2e-sessions e2e-resume-big e2e-diff e2e-ws e2e-model e2e-model-save e2e-model-route e2e-worktree e2e-watch e2e-watch-pick e2e-dsh e2e-portable p30-check tui-demo tui-selftest web-selftest sess-selftest diff-selftest model-selftest panel-selftest clean shell-selftest pm-selftest mcp-selftest
 
 all: build
 
@@ -202,6 +203,19 @@ doc-cover:
 	@python3 testdata/doc_cover.py
 	@echo "doc-cover: 完成"
 
+# P80 界面后端接缝审计（`testdata/ui_audit.py`）。守的是**结构约束**，不是行为：
+#   ① 最要命的一条 —— `&具体struct as &接口`（**能编译、能链接，运行期 SIGSEGV**：
+#      codegen 不构造 {vtable, data} 对。实测退出码 139）。编译期与自测都看不见它，
+#      只有跑到那条路径才炸；
+#   ② 执行层直呼后端私有符号（`betui_` 等）= 绕过了端口，换后端又得改执行核；
+#   ③ 端口层依赖执行核（`Config` / `agent_` / `g_sess`）= 后端换不动、也不能独立自测；
+#   ④ `be_*.uya` 里的后端忘了写 `: UiBackend`（漏实现**方法**是编译期错误，
+#      但整个 struct 忘了标注不报错）；
+#   ⑤ 注册表 `g_reg` 槽位没填满（空槽 vtable = null，切过去即崩）。
+# 六条判据的机器实现与防假绿对照见 CODING.md §1.4 与 DESIGN.md §11.9。
+ui-audit:
+	@python3 testdata/ui_audit.py
+
 # 文档审计：仓库里不许留 Git 冲突标记（`<<<<<<<` / `=======` / `>>>>>>>`）。
 # 来历见 §16 踩坑 94：一条合并残留的 `=======` 从 P53 那次合并（3e62301）
 # 一直躺到 P56 —— 编译、自测、link-audit 全绿，**没有任何测试看得见它**，所以只能靠这条审计扫。
@@ -241,7 +255,7 @@ lint-size-all:
 #   本仓实测：90 文件树上净增 50 个函数 + `rm -rf build && make build` → 通过（静态链接审计通过）。
 #   因此「净增函数按 0 处理」那条纪律作废。这段留下的用处只有一个：**换/降编译器时认得出症状**
 #   （报错点落在标准库、`make check` 全绿、只有清缓存重编才炸）。
-selftest: build codegen-audit doc-audit doc-cover e2e-exec e2e-accept-nudge e2e-retry e2e-config-flags e2e-title e2e-title-cmd e2e-title-auto e2e-mouse e2e-api e2e-steps e2e-permission e2e-sandbox e2e-tasks e2e-goal e2e-memory e2e-memory-live e2e-sessions e2e-resume-big e2e-diff e2e-ws e2e-model e2e-model-save e2e-model-route e2e-worktree e2e-portable p30-check
+selftest: build codegen-audit doc-audit doc-cover ui-audit e2e-exec e2e-accept-nudge e2e-retry e2e-config-flags e2e-title e2e-title-cmd e2e-title-auto e2e-mouse e2e-api e2e-steps e2e-permission e2e-sandbox e2e-tasks e2e-goal e2e-memory e2e-memory-live e2e-sessions e2e-resume-big e2e-diff e2e-ws e2e-model e2e-model-save e2e-model-route e2e-worktree e2e-portable p30-check
 	UYA_BIN=$(UYA) $(OUT) --selftest
 
 probe: build
@@ -1043,8 +1057,8 @@ e2e-config-flags: build
 	out=$$($(OUT) --dsh-home /nonexistent --print-config 2>&1); \
 	echo "$$out" | grep -q "dsh_home = /nonexistent  (loaded: no)" \
 		|| { echo "FAIL: --dsh-home 没有生效"; exit 1; }; \
-	echo "$$out" | grep -q "tls_verify = chain  (source: default)" \
-		|| { echo "FAIL: 读不到 DSH 设置时应回落到内置默认 chain"; exit 1; }; \
+	echo "$$out" | grep -q "tls_verify = tofu  (source: default)" \
+		|| { echo "FAIL: 读不到 DSH 设置时应回落到内置默认 tofu"; exit 1; }; \
 	if $(OUT) --strict-dsh-config --dsh-home /nonexistent --print-config >/dev/null 2>&1; then \
 		echo "FAIL: --strict-dsh-config 读不到设置却没有报错退出"; exit 1; \
 	fi; \
