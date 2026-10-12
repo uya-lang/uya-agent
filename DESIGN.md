@@ -814,6 +814,38 @@ bash 结果占请求窗口 **57.9%**，read 只占 **12.9%**；其中会走到�
 开关：`--no-compact` / `--context-window N` / `/compact`（运行中敲的排 step 边界）。
 `compaction/summary` 事件落日志。
 
+#### 5.3.4 上下文窗口的来源链（P81）
+
+上面两条（剪枝的压力闸门、压缩的触发线）都算 `floor(contextWindow × …)` —— 所以
+**`contextWindow` 从哪来**决定了它们什么时候生效。四档来源，从高到低：
+
+| 档 | 来源 | 实现点 | `--print-config` 的 source |
+|---|---|---|---|
+| ① | `--context-window N` | `agent.uya` 的 CLI 解析 | `cli` |
+| ② | `UYA_AGENT_CONTEXT_WINDOW=N` | `agent.uya` 的 env 段 | `env` |
+| ③ | `settings.yaml` 的 `uya-agent.contextWindows` | `modelx.uya` 的 `mx_read_windows` | `uya-agent` |
+| ④ | DSH 模型条目的 `contextWindow` | `agent_apply_dsh` / 模型目录 | `dsh-settings` |
+
+**定稿只有一个地方**：`agent_ctxwin_settle`（启动收尾 + 每次切模型 / 恢复会话都调它）。
+这解决了一个具体故障：以前 `--context-window N --model M` 与 `--model M --context-window N`
+**结果不同** —— 后解析的 `--model` 会按目录条目把刚定下的窗口盖回去（谁在后面谁赢）。
+定稿点放在**所有** CLI 解析之后，于是两种顺序逐字节相同（`e2e-ctxwindow` 用整份
+`--print-config` 的 `cmp` 钉这条）。
+
+四条口径（都是「配置不许说谎」）：
+
+| 口径 | 为什么 |
+|---|---|
+| ①② 是**显式**的，本会话谁也不许覆盖（切模型也不动） | 人是按**这一条路线**给的窗口（autodl 那种纯 env 部署连 DSH 目录都没有）；跟着目录改等于把显式配置降级成猜测 |
+| ③ 压过 ④ | 映射就是为「目录里没写 `contextWindow`」的路线准备的；同名模型跨提供方时用 `提供方/名字` 精确指定，裸名字是粗口径（键**整串匹配**，不做前缀） |
+| 一条来源都没有 ⇒ **沿用**，来源码退回 `default` | 清成 `-1` 会让压缩**静默**失效（`cmp_pressure_limit(<=0)=0`），与「目录外的模型名只换名字、能力保持不动」同一条理由；退回 `default` 是因为值来自**上一个**模型，照抄上一个模型的来源就是假话（实测：从映射里有的 w-one 切到没有的 w-five 之后仍标 `uya-agent`） |
+| 值必须是**纯十进制正整数**（1..999999999） | `yt_get_i64` / `parse_i32_arg` 都「读到第一个非数字为止」：`256K` 静默变 256、`abc` 静默变 0（= 窗口未知）—— 两条都让压缩线跑到谁也不认识的位置。拒绝的粒度分三处：CLI **报错退出**（与 `--permission bogus` 同口径）、env **告警后忽略**、设置里那条**跳过并计数**（`--print-config` 印 `skipped N`，启动另有一行 warning） |
+
+**可证出口两条**：机器侧是 `--print-config` 的 `context_window = N (source: …)` 与
+`context_window_map = N model(s)`；人侧是 `/model` 报告里的 `ctx` 行（裸 `/model` 与切完模型
+之后都会重画）。`-1`（未知）在 `--print-config` 里印成 `-1 (unknown)` 而**不是** `as usize`
+出来的 18446744073709551615 —— 那是同一类「配置在说谎」，顺手一起修了。
+
 ### 5.4 退化响应（空回复）：证据 + 同一步重发一次
 
 **判据**（`agent_finish_step`）：`finish` **不是** error、**不是** max-tokens，而这一步
@@ -2850,6 +2882,8 @@ responses 用 `{"type":"input_image","detail":"auto","image_url":…}`；
 | agent | `EMPTY_RETRY_MAX` | 1 | 退化响应每步重发额度 |
 | agent | `request_bytes_needed` | `h.bytes*2 + 8192 + 8192 + model.len*2 + img_extra` | 请求缓冲预算 |
 | agent | `TOOL_FLAT_STRIP` | 31 字节 | Responses 形状的 schema 前缀，去掉即 flat |
+| modelx | `MX_MAX` / `MX_LEVELS` | 256 / 7 | 模型目录条目上限 / DSH 的七个推理档位 |
+| modelx | `MX_WIN_MAX` / `MX_WIN_MAX_VALUE` | 32 / `999999999` | `uya-agent.contextWindows` 的条目上限 / 窗口值上限（**9 位十进制**——定死位数，解析才不会溢出，同时挡住 `1000000000` 这类误写） |
 | compact | `cmp_prune_threshold` / `head` / `tail` | 8192 / 4096 / 1024 **码点** | 对齐 DSH `thresholdChars` / `headChars` / `tailChars` |
 | compact | `CMP_BASH_MIN_BUDGET` | 512 | 低于此不剪 bash 结果（剪了也没信息量） |
 | compact | `CMP_BASH_SIGNAL_PERMILLE` | 800 | 中段预算里信号行最多占 80% |
@@ -5012,6 +5046,7 @@ DEEPSEEK_API_KEY=sk-xxx ./build/uya-agent \
 | `model-apply` | 切换跟随能力、旧档位回落 `off`、幂等返回 1、目录外不动能力；**P62**：同名 a-two 用 `提供方/名字` **双向**指定（alpha↔delta：provider/contextWindow/端点都跟着换）、目录里查不到的左半段不被误拆（`Qwen/Qwen3-32B` 整串当模型名）；**P37 修复**：换提供方时 `base_url` 与 `api_style` **双向**跟随（beta→alpha→beta 都断言）、跟随来的来源码落 `dsh-settings`、**显式 `--base-url`/`--api-key` 不被覆盖**、提供方**没声明 `baseURL`** 时端点一个字节不动、**解析不出凭据**时清空 key（旧密钥绝不跨提供方）（踩坑 96） |
 | `effort-apply` | 公布的收、同值幂等返回 1、未公布拒 2、透传但 `effort_set=false` |
 | `model-log` | `session/model` 三字段取最后一条 |
+| `ctxwin` | P81 上下文窗口的来源链（离线、纯函数 + 假目录）：映射**压过**目录条目（目录 111000 / 映射 555000 ⇒ 555000）、`提供方/名字` 压过裸名字（裸 222000 / 精确 666000 ⇒ 666000，夹具里**裸那条写在前面** ⇒ 「先命中的赢」的错误实现会红）、同名模型跨提供方各自成条（beta/c-three ⇒ 777000）、只给裸名字那条腿、映射没写⇒目录条目兜底（123000 src 1）、**目录里根本没有**这个模型也照映射走（888000 src 5 —— autodl 那种纯 env 部署的形态）、一条来源都没有⇒**沿用**且来源码退回 0、**键是整串匹配**（`c-fi` 不许吃掉 `c-five` / 模型 `c-f` 不许被 `c-fi` 匹配）、显式（src 2/3）切模型也不被动、`--no-dsh-config` 不读映射、非法值**跳过并计数**（`c-four: 256K` 不许被截断成 256）。**防假绿对照 4 次**（每次先看到红再改回）：①去掉显式守卫 + 映射不参与 ⇒ 红 8 条；②键匹配改「键以查询开头」⇒ `c-f` 那条红；③键匹配改「查询以键开头」⇒ `c-five` 那条红（**②③ 是补出来的**：原计划的「目录外沿用原值」那条腿**抓不住**前缀匹配，见下面 §19.3）；④env 入口整段变死代码 ⇒ `e2e-ctxwindow` 的 env 腿红 |
 | `dsh-writeback` | P71 写回（`session/dshsave.uya`）：叶级替换（注释/兄弟节**逐字节**保留、行数不变）/ 幂等（`DSHW_SAME`，连 mtime 都不动）/ effort 清档 / 缺键追加节尾 / 整节缺失追加文末 / 空 provider 不写空值（那一行原样留）/ 需要引号的值（空格与 `#`）/ 控制字节拒写且文件不变 / flow 节拒（不猜、不整份重写）/ 锁被占让位（`DSHW_BUSY`）且**不删别人的锁** / 缺 `settings.yaml` 不新建 / 回执表（`SAME` 与 `SKIP` 一个字节不加）。**防假绿对照**：①把「从第 0 字节照抄」改回「只抄节头那一行」⇒ 红 7 条；②抢锁恒成功 ⇒ 红 3 条；③flow 判据停掉 ⇒ 红 2 条（这条首版是**假绿**：夹具值与被写值不同时，追加会被写前自检挡下，判据停掉照样绿 —— 夹具改成「已经就是那两个值」之后才真的钉住它） |
 | `worktree` | 真 git：建 worktree + `dsh/<slug>`、闸门、`wt_finish` 合并且目录消失 |
 | `worktree-discard` | `wt_discard` 不合并；非仓库 `wt_provision` 判 `SKIPPED` |
@@ -5781,6 +5816,59 @@ dsh 有压缩/剪枝），这既解释了本仓更高的单请求成本，也解
 **报错指不到根因、看起来像编译器坏了**。实测 60 个文件过、70 个就炸，正是那条上限。
 可用的编译器是 **v0.10.3**（`/home/winger/uya/uya/bin/uya`，`UYA_ROOT=/home/winger/uya/uya/lib/`）。
 ⇒ 换机/重装后第一步先 `uya --version` 认版本，别把这条当代码 bug 查。
+
+### 19.3 P81：模型的上下文窗口（`uya-agent.contextWindows` + env + CLI）
+
+> 编号说明：**P80 被名字解析那条线占了**（`705b7f6`：`resolv.conf` 读窗口 + `UYA_AGENT_DNS`，
+> 踩坑 133），本线条因此在合并时按惯例让位、记成 **P81**（与「P74/P78 合并 main：踩坑编号
+> 让位」同一套做法，踩坑 110 一族）。两条线改的文件重合 8 个，合并时逐处取并集。
+
+用户报的原始症状是「上下文窗口配不动」：只有 `--context-window` 一个入口，而真机那条路线
+（`autodl.art` 的 `DeepSeek-V4.1-Flash`，纯 env 部署）既没有 DSH 目录条目、又必须手工传 flag。
+动手前先量了三条现状（都是 `--print-config` 实测）：
+
+| # | 事实 | 现场 |
+|---|---|---|
+| ① | `--context-window` 与 `--model` **谁赢取决于命令行顺序** | `--context-window 99999 --model a-plain` ⇒ `111000 (dsh-settings)`；反序 ⇒ `99999 (cli)` |
+| ② | 模型来自 env（或 DSH 默认路线）时，窗口取的是**那条路线**的值 | `UYA_AGENT_MODEL=a-plain`（目录里 111000）+ 默认路线 a-think（222000）⇒ 印 `model = a-plain` 而 `context_window = 222000` |
+| ③ | `-1`（未知）被 `as usize` 印成 `18446744073709551615` | `--no-dsh-config --print-config` |
+
+①②③ 都是「配置在说谎」这一族，所以修法一并收口：**四档来源 + 一个定稿点 + 两条可证出口**
+（§5.3.4 是设计，这里是验收）。
+
+**验收（都是实测）**：
+
+| 判据 | 结果 |
+|---|---|
+| 新增自测轮 `ctxwin`（9 条腿，见 §19 上表） | 全绿 |
+| 新增 `make e2e-ctxwindow`（8 条腿，真二进制 + 真 settings.yaml，**`env -i` 起**） | 全绿 |
+| **负控①** 去掉显式守卫 + 映射不参与 | 自测轮红 8 条（映射压不过条目、显式被覆盖） |
+| **负控②** 键匹配改成「键以查询开头」 | `c-f` 那条腿红 |
+| **负控③** 键匹配改成「查询以键开头」 | `c-five` 那条腿红 |
+| **负控④** env 入口整段变死代码 | `e2e-ctxwindow` 的 env 腿红 |
+| `make lint-size` / `make doc-cover` / `make doc-audit` / `uya check` / `make build` | 全通过 |
+
+**负控②③ 是补出来的** —— 原计划只打算用「目录外沿用原值」那条腿抓前缀匹配，实测**抓不住**
+（前缀匹配下 `c-six` 本来就查不到任何键，行为与正确实现一致）。真正的判据得让「一个键是另一个
+模型名的一部分」：于是夹具里加了 `c-fi: 101010` 与模型 `c-five` / `c-f`，两个方向各自一条腿。
+这是本轮最值钱的一条经验：**「我加了这个判据」与「这个判据真的能红」是两件事**，
+写判据时先问「哪种错误实现会让它红、那种实现现在会被别的判据拦住吗」。
+
+**与既有口径的一致性**：不写回设置文件（那是 P71 那条线的事，本轮只读）；不读 DSH 的
+provider 级 `defaultContextWindow`（DSH 自己的兜底链，本仓另有需要时再单开一轮）；
+子代理继承父的窗口（走的是同一份 `Config`），`--exec-effort` 那类自动降档不碰它。
+
+**已知的环境噪声（都不是本轮引入的，逐条量过）**：
+
+| 现象 | 现场 | 结论 |
+|---|---|---|
+| `make e2e-model` / `e2e-config-flags` 在**宿主已导出 `UYA_AGENT_*`** 的机器上红 | 本沙箱导出了 5 个 `UYA_AGENT_*`（含 `UYA_AGENT_MODEL`），断言 `base_url = … (source: default)` 的腿因此失败 | 这两个目标假定「干净的机器」；`env -i` 起就全绿（实测 4 个目标一起过）。`e2e-ctxwindow` 因此**一律 `env -i` 起**，两种环境都绿 |
+| 整轮 `--selftest` 里 `fs-tools` 红（`mock server verdict 47`） | 47 = grep 工具结果里该有 `Line 2: beta two`；而 grep 工具是 **ripgrep 子进程**，这台机器上 `rg` 根本不存在 | 环境缺 `rg`；与本轮无关 |
+| 同轮里 `compact-auto` 红（`verdict 88`） | 88 = 压缩后的请求里该有 checkpoint 前言 | 与 `rg` 同类的环境/顺序问题：判据两条 —— ① 换成干净 env、清空 fixture 重跑，**红法逐字相同**；② 该轮走 `agent_run`（进程内），而 `agent_run` → `agent_history_begin` → `agent_turn_loop` **一个字节都不碰**模型目录 / `agent_ctxwin_settle`（新增的调用点只有 `main`、`agent_model_apply`、`agent_model_resume_apply`）⇒ 本轮改动在那条路径上不可达 |
+| `tui-paste` 时红时绿 | 真 PTY 轮，三轮里红两轮 | 踩坑 98 那一族（跨轮残留的键盘时钟 / PTY 时序），单跑另说 |
+
+其余 164 条 `selftest[…] ok` 与全部模型相关 e2e（`e2e-model` / `e2e-model-save` /
+`e2e-model-route` / `e2e-config-flags`）在干净 env 下全过。
 
 ---
 

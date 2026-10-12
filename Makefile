@@ -241,7 +241,7 @@ lint-size-all:
 #   本仓实测：90 文件树上净增 50 个函数 + `rm -rf build && make build` → 通过（静态链接审计通过）。
 #   因此「净增函数按 0 处理」那条纪律作废。这段留下的用处只有一个：**换/降编译器时认得出症状**
 #   （报错点落在标准库、`make check` 全绿、只有清缓存重编才炸）。
-selftest: build codegen-audit doc-audit doc-cover e2e-exec e2e-accept-nudge e2e-config-flags e2e-title e2e-title-cmd e2e-title-auto e2e-mouse e2e-api e2e-steps e2e-permission e2e-sandbox e2e-tasks e2e-goal e2e-memory e2e-memory-live e2e-sessions e2e-resume-big e2e-diff e2e-ws e2e-model e2e-model-save e2e-model-route e2e-worktree e2e-portable p30-check
+selftest: build codegen-audit doc-audit doc-cover e2e-exec e2e-accept-nudge e2e-config-flags e2e-title e2e-title-cmd e2e-title-auto e2e-mouse e2e-api e2e-steps e2e-permission e2e-sandbox e2e-tasks e2e-goal e2e-memory e2e-memory-live e2e-sessions e2e-resume-big e2e-diff e2e-ws e2e-model e2e-model-save e2e-model-route e2e-ctxwindow e2e-worktree e2e-portable p30-check
 	UYA_BIN=$(UYA) $(OUT) --selftest
 
 probe: build
@@ -577,6 +577,59 @@ e2e-model: build
 	grep -q "provider: beta" $$home/settings.yaml || { echo "FAIL: 文本命令 /model beta/a-think 没有写回 settings.yaml"; cat $$home/settings.yaml; exit 1; }; \
 	grep -q "model: a-think" $$home/settings.yaml || { echo "FAIL: 写回设置时 model 不对"; cat $$home/settings.yaml; exit 1; }; \
 	echo "e2e-model: 通过（目录/能力跟随/目录外只换名字/REPL 报告与切换/非法档位拒/透传标注/同名跨提供方指定与提示/--provider 顺序无关/人敲的 /model 写回设置）"
+
+# P81：**上下文窗口的来源链**（离线，真二进制 + 真 settings.yaml）。
+# 四档来源：目录条目（dsh-settings）< `uya-agent.contextWindows`（uya-agent）<
+# `UYA_AGENT_CONTEXT_WINDOW`（env）< `--context-window`（cli）；都没有就沿用。
+# 判据：
+#   ① 目录条目；② 映射压过目录条目（含 `提供方/名字` 精确口径）；③ env 压过映射；
+#   ④ cli 压过 env；⑤ **两个 flag 的先后顺序无关**（以前是「谁在后面谁赢」，同一对参数
+#   结果不同 —— 这条是回归腿）；⑥ 非法值：CLI 报错退出（usage），env 只告警并忽略，
+#   设置里那条被跳过并计数；⑦ `--no-dsh-config` 不读映射，什么都没有时是 `-1 (unknown)`；
+#   ⑧ 人这一侧的出口：/model 报告的 ctx 行带来源，沿用要说出来。
+# ⚠ 一律 `env -i` 起：宿主环境里的 `UYA_AGENT_MODEL` / `UYA_AGENT_BASE_URL` 之类会把这些
+#   判据搅在一起（本仓的 e2e 目标里就属它最依赖「干净的机器」）。
+e2e-ctxwindow: build
+	@set -e; \
+	home=build/selftest_p80_e2e; rm -rf $$home; mkdir -p $$home; \
+	printf 'llm-pi-ai:\n  providers:\n    {\n      alpha:\n        {\n          api: openai-responses,\n          baseURL: https://alpha.example/v1,\n          apiKeyEnv: ALPHA_KEY,\n          models:\n            [\n              { id: w-one, contextWindow: 111000 },\n              { id: w-two },\n              { id: w-five, contextWindow: 222000 },\n              { id: w-six }\n            ]\n        }\n    }\nagent-default-model:\n  provider: alpha\n  model: w-one\nui-theme:\n  preference: dark\nuya-agent:\n  contextWindows:\n    w-one: 555000\n    alpha/w-two: 666000\n    bad-one: 256K\n' > $$home/settings.yaml; \
+	run() { env -i PATH=/usr/bin:/bin HOME=$$HOME $(CURDIR)/$(OUT) --dsh-home $$home --agent-home $$home/agent --no-dsh-writeback --api-key dummy-key --print-config "$$@"; }; \
+	: "① 映射没写、目录条目写了 ⇒ dsh-settings"; \
+	out=$$(run --model w-five 2>&1); \
+	echo "$$out" | grep -q "context_window = 222000  (source: dsh-settings)" || { echo "FAIL: 目录条目的 contextWindow 没生效"; echo "$$out"; exit 1; }; \
+	: "② 映射压过目录条目（111000 被 555000 盖掉）"; \
+	out=$$(run 2>&1); \
+	echo "$$out" | grep -q "context_window = 555000  (source: uya-agent)" || { echo "FAIL: uya-agent.contextWindows 没压过目录条目"; echo "$$out"; exit 1; }; \
+	echo "$$out" | grep -q "context_window_map = 2 model(s)  (skipped 1 entry/entries" || { echo "FAIL: 映射的条数/跳过计数不对"; echo "$$out"; exit 1; }; \
+	out=$$(run --model w-two 2>&1); \
+	echo "$$out" | grep -q "context_window = 666000  (source: uya-agent)" || { echo "FAIL: \`提供方/名字\` 那条映射没查到（目录条目里 w-two 没有窗口）"; echo "$$out"; exit 1; }; \
+	: "③ env 压过映射；④ cli 压过 env"; \
+	out=$$(env -i PATH=/usr/bin:/bin HOME=$$HOME UYA_AGENT_CONTEXT_WINDOW=123456 $(CURDIR)/$(OUT) --dsh-home $$home --agent-home $$home/agent --no-dsh-writeback --api-key dummy-key --print-config --model w-two 2>&1); \
+	echo "$$out" | grep -q "context_window = 123456  (source: env)" || { echo "FAIL: UYA_AGENT_CONTEXT_WINDOW 没压过映射"; echo "$$out"; exit 1; }; \
+	out=$$(env -i PATH=/usr/bin:/bin HOME=$$HOME UYA_AGENT_CONTEXT_WINDOW=123456 $(CURDIR)/$(OUT) --dsh-home $$home --agent-home $$home/agent --no-dsh-writeback --api-key dummy-key --print-config --model w-two --context-window 99999 2>&1); \
+	echo "$$out" | grep -q "context_window = 99999  (source: cli)" || { echo "FAIL: --context-window 没压过 env"; echo "$$out"; exit 1; }; \
+	: "⑤ 顺序无关：同一对参数、两种顺序，整份 --print-config 逐字节相同"; \
+	run --model w-two --context-window 99999 > $$home/order-a.txt 2>&1; \
+	run --context-window 99999 --model w-two > $$home/order-b.txt 2>&1; \
+	cmp -s $$home/order-a.txt $$home/order-b.txt || { echo "FAIL: --model 与 --context-window 的先后顺序会改变结果"; diff $$home/order-a.txt $$home/order-b.txt | head -20; exit 1; }; \
+	grep -q "context_window = 99999  (source: cli)" $$home/order-a.txt || { echo "FAIL: 顺序 A 里 cli 的窗口没生效"; exit 1; }; \
+	: "⑥ 非法值：CLI 报错退出（usage），env 只告警并忽略"; \
+	if run --context-window abc >/dev/null 2>&1; then \
+		echo "FAIL: --context-window abc 应当报错退出"; exit 1; \
+	fi; \
+	out=$$(env -i PATH=/usr/bin:/bin HOME=$$HOME UYA_AGENT_CONTEXT_WINDOW=256K $(CURDIR)/$(OUT) --dsh-home $$home --agent-home $$home/agent --no-dsh-writeback --api-key dummy-key --print-config 2>&1); \
+	echo "$$out" | grep -q "warning: UYA_AGENT_CONTEXT_WINDOW 不是正整数" || { echo "FAIL: 非法 env 值没有告警"; echo "$$out"; exit 1; }; \
+	echo "$$out" | grep -q "context_window = 555000  (source: uya-agent)" || { echo "FAIL: 非法 env 值被忽略之后应当回落到映射"; echo "$$out"; exit 1; }; \
+	: "⑦ --no-dsh-config：映射不读；一次都没人给过就是 -1 (unknown)"; \
+	out=$$(env -i PATH=/usr/bin:/bin HOME=$$HOME $(CURDIR)/$(OUT) --no-dsh-config --no-dsh-writeback --api-key dummy-key --print-config 2>&1); \
+	echo "$$out" | grep -q "context_window = -1 (unknown)  (source: default)" || { echo "FAIL: 没有来源时窗口应当印成 -1 (unknown)（不许把 -1 当 usize 印成天文数字）"; echo "$$out"; exit 1; }; \
+	echo "$$out" | grep -q "context_window_map = 0 model(s)  (--no-dsh-config: settings not read)" || { echo "FAIL: --no-dsh-config 时不该读 contextWindows（且要说明）"; echo "$$out"; exit 1; }; \
+	: "⑧ 人这一侧的出口：/model 报告的 ctx 行带来源，沿用要说出来"; \
+	out=$$(printf '/model\n/exit\n' | env -i PATH=/usr/bin:/bin HOME=$$HOME $(CURDIR)/$(OUT) --dsh-home $$home --agent-home $$home/agent --no-dsh-writeback --api-key dummy-key --no-tui --quiet 2>&1); \
+	echo "$$out" | grep -q "ctx        555000  (source: uya-agent)" || { echo "FAIL: /model 报告没有印出窗口与来源"; echo "$$out"; exit 1; }; \
+	out=$$(printf '/model w-six\n/model\n/exit\n' | env -i PATH=/usr/bin:/bin HOME=$$HOME $(CURDIR)/$(OUT) --dsh-home $$home --agent-home $$home/agent --no-dsh-writeback --api-key dummy-key --no-tui --quiet 2>&1); \
+	echo "$$out" | grep -q "ctx        555000  (source: default，沿用上一个模型的值)" || { echo "FAIL: 切到没有窗口的模型之后应当说清是「沿用」，不许照抄上一个模型的来源"; echo "$$out"; exit 1; }; \
+	echo "e2e-ctxwindow: 通过（目录条目 < 映射 < env < cli；顺序无关；非法值 CLI 拒·env 忽略·设置跳过并计数；--no-dsh-config 不读映射；-1 (unknown) 口径；/model 报告的 ctx 行）"
 
 # P71：**人运行中切模型/强度 ⇒ 这份选择写回 DSH 设置**（离线，真二进制 + 真 settings.yaml）
 #   对齐 DSH 自己的行为：`selectModel` → `agentDefaultModel.saveSelection()` → 同一个

@@ -62,9 +62,9 @@ make codegen-audit # 扫构建产物：不许出现「切片描述符 → 字节
 make doc-audit     # 扫文本文件：不许留 Git 冲突标记（合并残留）
 make probe         # 传输层探针：打真实 https 端点，期望 HTTP 401（不需要 key）
 # 离线 e2e（不需要网络）：e2e-permission / e2e-sandbox / e2e-tasks / e2e-goal / e2e-sessions /
-#   e2e-resume-big / e2e-diff / e2e-ws / e2e-model / e2e-worktree / e2e-exec / e2e-accept-nudge /
-#   e2e-config-flags / e2e-title* / e2e-api / e2e-steps / e2e-mouse / e2e-watch / e2e-watch-pick /
-#   e2e-portable
+#   e2e-resume-big / e2e-diff / e2e-ws / e2e-model / e2e-ctxwindow / e2e-worktree / e2e-exec /
+#   e2e-accept-nudge / e2e-config-flags / e2e-title* / e2e-api / e2e-steps / e2e-mouse /
+#   e2e-watch / e2e-watch-pick / e2e-portable
 make e2e TASK="..." PIN=<leaf sha256> [STEPS=N]   # 真实调用（需要 DEEPSEEK_API_KEY）
 ```
 
@@ -156,7 +156,7 @@ readelf -lW build/uya-agent | grep -c INTERP    # 0 = 真静态
 | `--no-mcp` | 不读不连任何 MCP 插件（`UYA_AGENT_MCP=0` 同口径） |
 | `--list-plugins` | 打印插件与工具的诊断后退出（排查「为什么工具数是 0」的第一个入口） |
 | `--uya-bin PATH` | 跑 workflow 脚本的解释器（默认 `$UYA_BIN` 或 `uya`） |
-| `--no-compact` / `--context-window N` | 关闭自动上下文压缩 / 指定压缩判定的窗口（默认取 DSH 模型条目） |
+| `--no-compact` / `--context-window N` | 关闭自动上下文压缩 / 指定压缩判定的**上下文窗口**（纯十进制正整数，非法值报错退出）。只认这四档来源，从高到低：`--context-window` > `UYA_AGENT_CONTEXT_WINDOW` > `settings.yaml` 的 `uya-agent.contextWindows` 映射 > DSH 模型条目的 `contextWindow`；一条都没有就**沿用**（一次都没人给过时是 `-1` = 未知，此时自动压缩不触发）。前两档是**显式**的：本会话里切模型也不动它。见 §7「上下文窗口」 |
 | `--no-memory` / `--memory-budget N` | 关掉项目记忆（不读不写不注入）/ 开工包的字节预算（默认 3072） |
 | `--agent-home DIR` | 会话与索引的根目录（默认 `~/.uya-agent`） |
 | `--no-save` | 不写会话日志（只跑不记） |
@@ -247,6 +247,7 @@ uya-agent --web 127.0.0.1:9000     # 指定端口（端口写 0 = 内核分配�
 `UYA_AGENT_MAX_STEPS`（步数熔断上限，`0` = 不限，也是默认值；非法值告警后按「不限」处理）、
 `UYA_AGENT_API`（非法值告警后按「未声明」处理，即仍会先试 responses）、
 `UYA_AGENT_REASONING_EFFORT`（`off`/`none` = 不发）、
+`UYA_AGENT_CONTEXT_WINDOW`（压缩判定的上下文窗口，纯十进制正整数；非法值告警后忽略）、
 `UYA_AGENT_EXEC_EFFORT` / `UYA_AGENT_EXEC_AFTER` / `UYA_AGENT_GRACE_STEPS`、
 `UYA_AGENT_PERMISSION`（三档访问模式，非法值告警后忽略）、
 `UYA_AGENT_SANDBOX`（`0`/`off` = 等价于 `--no-sandbox`）、`UYA_AGENT_BWRAP`（bwrap 路径）、
@@ -468,13 +469,14 @@ leaf 指纹怎么算、指纹库放哪儿 —— 见 [DESIGN.md §18](DESIGN.md)
 | 来源 | 位置 |
 |---|---|
 | DSH 设置 | `$DSH_HOME/settings.yaml`（模型路线 / 权限 `defaultPreset` / 技能根 / preset 旋钮）、`.credentials.yaml`（凭据）、`.env` |
+| **本仓自己的设置** | 同一份 `settings.yaml` 的 `uya-agent:` 节 —— 目前只有 `contextWindows:`（模型 → 上下文窗口，见 §7） |
 | 环境变量 | `UYA_AGENT_*`（见 §1.3） |
 | 命令行 | `--xxx`（最高优先级） |
 
 `--print-config` 会把**生效值与来源**一起印出来（每个取值带 `cli` / `env` / `dsh-settings` /
-`default` 标签）—— 这是「配置到底生效了没有」唯一可证的出口。
+`uya-agent` / `default` 标签）—— 这是「配置到底生效了没有」唯一可证的出口。
 `--dsh-home` / `--dsh-root` / `--no-dsh-config` / `--strict-dsh-config` 在**读设置之前**预扫，
-所以它们不会被设置覆盖。
+所以它们不会被设置覆盖；`--no-dsh-config` 时 `uya-agent:` 那一节（连同模型目录）**都不读**。
 
 ---
 
@@ -631,8 +633,7 @@ leaf 指纹怎么算、指纹库放哪儿 —— 见 [DESIGN.md §18](DESIGN.md)
 **模型、工作区与 worktree**
 
 * **模型选择与推理强度**：目录**只读本地 `settings.yaml`**（不远程拉取提供方目录，也不读
-  `modelOverrides`）；设置里没写 `contextWindow` 时目录条目是 -1，这种路线请显式
-  `--context-window N`。目录外的模型名**只换名字**（provider / contextWindow / maxTokens /
+  `modelOverrides`）。目录外的模型名**只换名字**（provider / contextWindow / maxTokens /
   compat 一律保持不动，只打警告）—— 静默清空 `contextWindow` 会让自动压缩失效，比「名字换了
   能力没跟上」更坏。`/effort` **不发明档位**：只接受当前模型公布的档位，模型没写
   `reasoningEfforts`（或 `false`）时不开浮层，`--effort` / `--reasoning-effort` 原样透传
@@ -644,6 +645,33 @@ leaf 指纹怎么算、指纹库放哪儿 —— 见 [DESIGN.md §18](DESIGN.md)
   **切模型不做上下文迁移**：历史原样保留，`{{model}}` 是建会话时求值的，所以 persona 里仍是旧
   模型名。选择进会话日志（`session/model`）但不进索引独立字段；子代理继承父的
   provider/model/强度，但**不能自己切**。
+* **上下文窗口**（P81）：压缩与剪枝的判定基准，四档来源从高到低 ——
+
+  | 档 | 来源 | 写法 | `--print-config` 的 source |
+  |---|---|---|---|
+  | ① | 命令行 | `--context-window N` | `cli` |
+  | ② | 环境变量 | `UYA_AGENT_CONTEXT_WINDOW=N` | `env` |
+  | ③ | 本仓设置节 | `settings.yaml` 的 `uya-agent.contextWindows` 映射 | `uya-agent` |
+  | ④ | DSH 模型条目 | `providers.<p>.models[].contextWindow` | `dsh-settings` |
+
+  一条都没有时**沿用**现有值（一次都没人给过就是 `-1` = 未知）。五条硬边界：
+  * ①② 是**显式**的 —— 本会话里谁都不许覆盖，切模型也不动（`/model` 报告里的
+    `ctx` 行会显示当前值 + 来源）；③ 压过 ④（映射就是为「目录里没写 `contextWindow`
+    的路线」准备的：autodl 那种纯 env 部署连目录都没有，映射照样管用）；
+  * 键是 `提供方/名字` 或裸名字，**整串精确匹配**（不做前缀、不折大小写）：同名模型跨提供方时
+    用 `提供方/名字` 指定，裸名字是「这一家都这样」的粗口径；
+  * 值必须是**纯十进制正整数**（1..999999999）。`256K` / `0x100000` / 负数**一律拒绝**——
+    `256K` 那种写法按「读到第一个非数字为止」会静默变成 256，比拒绝坏得多。拒绝的粒度分三处：
+    `--context-window abc` **报错退出**（usage）；`UYA_AGENT_CONTEXT_WINDOW=256K` 告警后**忽略**；
+    设置里那条**跳过并计数**（`--print-config` 印 `skipped N entry/entries`，启动时也有一行 warning）；
+  * **`--model` 与 `--context-window` 的先后顺序无关**（定稿在所有 CLI 解析之后做一次）。
+    以前是「谁在后面谁赢」：`--context-window 99999 --model m` 会把刚给的值换成目录里的值；
+  * `--no-dsh-config` 时 ③④ 都不读（与模型目录同一条口径）；`-1`（未知）时自动压缩不触发
+    （`floor(window × 0.8)` 恒 0），剪枝走「保守剪」那一支 —— 所以窗口配错是**静默**的行为变化，
+    这也是给它一个可证出口的原因。
+* **人的出口是 `/model` 报告的那一行 `ctx`**（`--print-config` 是机器那一侧）：切到一个既没写
+  映射、目录条目也没写窗口的模型时，它会明确说「沿用上一个模型的值」——沿用可以，但不说等于
+  让人以为配置生效了。
 * **人切完的选择会写回 DSH 设置**（P71）：`/model <名字>` 与 `/effort <档位>`（含 TUI 浮层里
   选中）成功之后，把 `provider` / `model` / `reasoningEffort` **三样一起**写回
   `$DSH_HOME/settings.yaml` 的 `agent-default-model` —— 于是**下次启动**的默认就是刚选的这条
