@@ -5653,6 +5653,7 @@ dsh 的 `dsh-base` 挂了 `dsh-llm-retry`，默认策略是
 `webcore` 上本仓累计被上游掐断 **4 次**（延迟 108–261 s 后 `upstream_error`），
 唯一一次跑通的补测轮拿了满分 —— 也就是说**丢的全是本来能解出来的题**。
 ⇒ 这是本轮唯一一条**直接该改本仓**的结论：一次 5xx/超时不该让整个任务作废。
+**（已修：P82，见 §19.3 —— 上面这几段保留为当时的现场记录，判据与验收在那一节。）**
 
 **坑三：上游故障不是 harness 缺陷，别把它记成能力差。** 网关历史里
 `upstream_error` 两边都出现过（`unknown`/`dsh`/`uya-agent` 全有），是共享基础设施问题。
@@ -5704,6 +5705,108 @@ dsh 有压缩/剪枝），这既解释了本仓更高的单请求成本，也解
 **报错指不到根因、看起来像编译器坏了**。实测 60 个文件过、70 个就炸，正是那条上限。
 可用的编译器是 **v0.10.3**（`/home/winger/uya/uya/bin/uya`，`UYA_ROOT=/home/winger/uya/uya/lib/`）。
 ⇒ 换机/重装后第一步先 `uya --version` 认版本，别把这条当代码 bug 查。
+
+### 19.3 P82：给主链加传输层重试（修 §19.1 坑二）
+
+§19.1 的坑二是本轮唯一一条**直接该改本仓**的结论，本轮把它做掉：**本仓原来一层重试都没有** ——
+`agent_step_stream` 收到 `err_kind == 3`（网络/TLS）直接 `return AGENT_NET`（退出码 2），
+一次 5xx/超时就作废整个任务。配对窗口内的实测：dsh **100 次请求 0 次失败**（它挂了
+`dsh-llm-retry`，对 `TRANSPORT`/`TIMEOUT`/`SERVER`/`RATE_LIMIT`/`EMPTY_RESPONSE` 重试 5 次、
+退避 500 ms–10 s + 10% 抖动），本仓 **163 次请求 2 次失败**；`webcore` 上累计被掐断 4 次
+（延迟 108–261 s 后 `upstream_error`）—— 丢的全是本来能解出来的题。
+
+**修法**：新增 `src/net/retryx.uya`（**分类与退避的唯一出处**：`rtx_retryable_err` /
+`rtx_retryable_status` / `rtx_retryable_body_code`、纯函数 `rtx_backoff_from`、
+可测的 `rtx_backoff_ms`、进程级预算 `rtx_set_max`/`rtx_max`/`rtx_exhausted`、
+裸 sleep `rtx_sleep_ms`），step 循环里加第二个内部码 `STEP_RETRY_NET`（102）——
+与 P54 的 `STEP_RETRY`（101）**形状刻意一样**：同一步重发、历史一个字节不动，
+所以重算出来的 url/req 与上一次**逐字节相同**。
+
+**四条不变量**（都可测，判据见下）：
+
+| # | 不变量 | 为什么它是承重的 |
+|---|---|---|
+| ① | **同一步重发**：step 不递增、历史不动 ⇒ 请求体逐字节相同 | 往重发路径里塞一个字节（换 header、压条消息、step 推进一格）都会让 mock 端的比对当场红 |
+| ② | **退避期间可中断**：≤50 ms 切片 + `llm_pump_input`，esc/ctrl+c/ctrl+d 立刻收口成 130 | 这是「无限重试」不变成「无限卡死」的**唯一**凭据（与踩坑 44 同族） |
+| ③ | **有界出口**：`--api-retry-max 0` 逐字节回到 P82 之前的行为 | CI/排障要能 fail fast；也是负控腿的判据 |
+| ④ | **失败种类不因重试而混同**：传输错始终 `2`、非 200/协议错始终 `3` | 脚本靠退出码分辨「该重跑」与「配置错了」，重试不许把它抹平 |
+
+**分类表**（写进 `retryx.uya` 文件头，改它之前先问「这条错重试真的会变好吗」）：
+
+| 重试 | 不重试 |
+|---|---|
+| 连接被拒/断开/超时、响应头半截（`HcConnectFailed`/`HcIoFailed`/`HcTimeout`/`HcBadResponse`）、SSE 没等到 `[DONE]`（`LlmStreamClosed`） | 证书信任（`HcPinMismatch`/`HcTlsUnsupported` —— 确定性的配置问题，重试只会刷屏）、坏 payload（`LlmMalformed`，重复的坏字节）、URL/过大/内存（`HcBadUrl`/`HcTooLarge`/`HcOutOfMemory`） |
+| HTTP **408 / 425 / 429 / 5xx** | HTTP 400 / 401 / 403 / 404 / 405 / 422…（配置与鉴权错）；**404 仍归 `api_may_negotiate` 走协议协商**，所以不在重试集合里 |
+| 体内错误帧且 `error.code` ∈ {server_error, rate_limit_exceeded, overloaded_error, insuffi­cient_system_resource, internal_error, api_error, upstream_error, timeout} | **code 不认识的一律不重试**（不替上游猜：`context_length_exceeded` 那种越重发越糟）、用户中断（人优先） |
+
+**为什么必须要机器码而不是散文**：`ChatOut` 新增 `err_code`（`llm.uya` 三处已有解析 `error.code`
+的地方各回填一次），因为 `err_text` 是**给人看**的前缀（240 B 上限、可能是 message 而不是 code）——
+拿散文去搜关键词会重发 `context_length_exceeded`。
+
+**退避**：**0.5–3.0 s 均匀随机**（`rtx_backoff_from` 是纯函数，自测逐值验区间；
+`rtx_backoff_ms` 用 xorshift64，种子 = `ua_now_ms() ^ (pid << 16)`）。抖动不是为了「等更久」，
+而是让同一故障下的多个客户端不同时回来。
+
+**验收（都是实测）**：
+
+| 判据 | 结果 |
+|---|---|
+| `net-retry`（mock mode 45：503→429→200）：两条 `[retry]` + 日志两条 `llm/retry` + **三次请求逐字节相同** + `step/start` 只有一条 + 退出 0 | 绿 |
+| `net-retry-intr`（mode 46：503 之后**退避里**按 ctrl+c）：退出码 **130**、只有一条 `[retry]`、转录**没有** `error:` | 绿 |
+| `net-retry-401`（mode 47）：401 属不可重试 ⇒ `[retry]` **零条**、当场以 3 收口 | 绿 |
+| `make e2e-retry` 五条腿：默认重发到成功 / `0`（1 次请求即退 3）/ `1`（同）/ `2`（退 0、一条重试）/ **死端口 `--api-retry-max 3` ⇒ 退 2 而不是 3** | 绿 |
+| `make lint-size` / `make doc-audit` / `make doc-cover` | 通过 |
+| `make selftest`（全轮） | 见下 |
+
+**防假绿对照实验（五条，都先看到红）**：
+
+| # | 改动 | 结果 |
+|---|---|---|
+| ① | 把 5xx 从 `rtx_retryable_status` 里摘掉 | `net-retry` 六条断言一起红（行数/序号/日志条数/attempt） |
+| ② | `agent_rtx_wait` 去掉 `llm_pump_input`（只睡不读键） | `net-retry-intr` 红（重试行数、日志条数、「已中断本回合」那条全对不上） |
+| ③ | 把日志侧 `llm/retry` 的事件类型名改掉 | 转录仍绿、**日志侧两条红** ⇒ 证明「日志判据」不是转录判据的复读 |
+| ④ | 重发前往历史压一条 `PERTURB` | `net-retry` 红在 **mock 端判定码**（逐字节比对）—— 退出码照样 0，只有这个判据抓得住 |
+| ⑤ | `rtx_exhausted` 恒 `false`（预算闸门失效） | selftest **三条全绿**，`make e2e-retry` **红在 `off` 腿**（退出 0、两次重试）⇒ 「预算是 step 循环读的」这件事只有 e2e 覆盖得到 |
+
+⚠ 对照实验 ③ 顺手抓到自测自身的一个真缺陷：`netretry_check` 第一版把两半的返回值写成了
+`return true`（常量）而不是累积的判定 —— 症状是**转录里 FAIL 一行行在打、整轮却报 PASS**
+（`SELFTEST RETRY PASS`）。这是本仓踩坑 86「判据要读事实」的又一个现场：**改写判据代码
+之后，负控必须重跑一遍**，否则「红过」这件事作废。
+
+**整轮跑出来的两个真缺陷**（都是「只在完整流程里才暴露」那一族，单跑 `UYA_SELFTEST_*_ONLY`
+一条都看不见 —— 与踩坑 108/87 同族）：
+
+1. **闸门被每个自建 cfg 的调用方重新拧开。** 第一版 `agent_turn_loop_inner` 无条件
+   `rtx_set_max(cfg.api_retry_max)`，而 `cfg_default()` 里那一位是 `RTX_UNLIMITED` ⇒
+   `selftest_main` 顶部那句 `rtx_set_max(0)` **当场失效**（每一个夹具轮次都把它拧回去）
+   ⇒ 撞上「mock 服务完 `limit` 轮就退出」的轮次就无限重试。**实测量到的现场**：
+   `make selftest` 卡在 `e2e-portable` **35 分钟**（整轮套件没有全局超时），
+   假网关的 `req.bin` 从几百字节涨到 **30 MB** —— 因为那一轮的假网关回的是**非 SSE 的
+   整段 JSON**，而客户端要的是流 ⇒ `LlmStreamClosed`（分类表里正好可重试）。
+   **修法两条**：① agent 侧只在 `src_api_retry != 0`（人显式给过）时才动进程级闸门
+   —— 与 web 子进程「没给就不注入」同一条纪律；② `e2e-portable` 那一发显式
+   `--api-retry-max 0`（它验的是「请求里有没有 plan 段」，不是「网关答得好不好」）。
+   **教训**：「进程级默认值 + 每个调用方都带一份 cfg」这个组合里，**无条件照抄 = 把别人的
+   设置覆盖掉**；判据不是「我这份 cfg 是什么」，而是「这一位到底有没有人显式给过」。
+2. **一条天生会 flake 的断言。** 第一版拿「两次真跑的退避值不相等」当「随机数在动」的判据
+   —— 两次独立取样有 **1/2501** 的概率撞上同一个值，整轮 selftest 里红过一次。
+   **修法**：把这件事改成**确定性**判据（`rtx_backoff_pure_check`：喂 300 个连续读数，
+   看区间与取值个数），并单独成一轮 `net-retry-backoff`（不起 mock、几微秒跑完）。
+   **教训**：判「随机」不能靠「观察到两个不同的样本」，那本身是概率事件；要么改成对
+   生成函数的确定性判据，要么明确接受概率并写清它。
+
+**边界（不许读过头）**：
+
+* **不加到侧路请求上**：`--probe`（诊断那一发本来就要立刻知道结果）、自动起标题、
+  压缩摘要一律**不重试** —— 它们是侧路/后台请求，失败是良性的（标题可选、压缩下个 step
+  边界自然会再试），而且不该占着用户的时间。重试只在 `agent_step_stream` /
+  `agent_step_plain` 这两个**主链**出口上。
+* **不动 `llm_stream_style` 内部**：`st_responses` / `st_round_driver` 里那些直接调解析器的
+  轮次因此不受影响（它们钉的是协议解析，不是重试策略）。
+* **自测里默认关**：`selftest_main` 顶部 `rtx_set_max(0)`（与 `wt_set_on(false)` 同一条纪律：
+  会改变全局行为的东西，自测必须自己钉住初值）—— 否则 mock 服务完 `limit` 轮就退出，
+  任何「客户端还会再发一次」的腿都会撞 ECONNREFUSED 然后无限重试下去（整轮套件没有全局
+  超时，一个轮次就能拖死它）。P82 那三轮自己把闸门开回来。
 
 ---
 

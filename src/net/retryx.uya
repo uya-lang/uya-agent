@@ -1,0 +1,207 @@
+// src/net/retryx.uya — 主链请求的传输层重试策略（P82）
+//
+// 本文件：失败分类的**唯一**判据（`rtx_retryable_err` / `rtx_retryable_status` /
+//   `rtx_retryable_body_code`）、退避时长的纯函数（`rtx_backoff_from`）与带种子的
+//   `rtx_backoff_ms`、可中断等待（`rtx_wait`）、进程级预算（`rtx_set_max`/`rtx_max`）。
+// 不变量：① **分类表是本文件唯一一份** —— 调用方（agent 的 step 循环）不许自己再写一遍
+//   「哪些错该重试」，否则两处迟早分叉；② 退避等待**必须服务键盘**（≤50 ms 切片 + 泵点），
+//   否则「无限重试」就变成「无限卡死」（用户按 esc 没反应，与踩坑 44 同族）；
+//   ③ 等待用**裸 nanosleep**，不许写成「poll 一个无效 fd」（poll 对 fd<0 立刻返回，
+//   等待会变成自旋打满 CPU、日志乱飞 —— 见 deleg.uya 的同一条纪律）；
+//   ④ 预算是**进程级**的（出厂默认无限），调用方在**每一次重发前**读一次 —— 于是
+//   `rtx_set_max(0)` 能当场关掉它（自测/CI 靠这条 fail fast）。
+// 依赖：libc.syscall（nanosleep）；本仓 foundation/bufx（`ua_now_ms`）与 agent 的阻塞泵点
+//   `agent_pump_block`（合并命名空间下可见；net 层调它有先例：httpc 的 `agent_pump_light`）。
+// 命名：对外 `rtx_*` + 常量 `RTX_*`；本文件没有类型。
+//
+// 为什么要有这个文件（现场见 DESIGN §19.1 坑二 / §19.3）：
+//   上游一次 5xx / 超时 / 把 SSE 流掐断，本仓原来**一层重试都没有** —— 直接
+//   `return AGENT_NET`（退出码 2），整个任务作废。实测：配对窗口内 dsh 100 次请求 0 次失败、
+//   本仓 163 次请求 2 次失败，`webcore` 上累计被掐断 4 次（延迟 108–261 s 后
+//   `upstream_error`），丢的全是本来能解出来的题。
+//
+// 分类（**改这张表之前先问一句：这条错重试真的会变好吗**）：
+//   * 重试：连接被拒/断开/超时、响应头半截、SSE 没等到 `[DONE]`、HTTP 408/425/429/5xx、
+//     体内错误帧且 code 属瞬时集合（server_error / rate_limit_exceeded /
+//     overloaded_error / insufficient_system_resource / internal_error /
+//     api_error / upstream_error / timeout）；
+//   * 不重试：证书信任（pin/chain 不匹配、TLS 不支持 —— 确定性的配置问题，重试只会刷屏）、
+//     坏 payload（重复的坏字节）、URL/过大/内存（本机错误）、4xx 配置与鉴权错（401/403/404…）、
+//     用户中断（人优先）、以及**code 不认识的错误帧**（不替上游猜：`context_length_exceeded`
+//     这类必须 fast fail）。
+//
+// 退避：**0.5–3 s 均匀随机**（每次尝试独立取值）。抖动的意义不是「等更久」而是
+// 「让同一故障下的多个客户端不同时回来」。取值必须是**纯函数**（`rtx_backoff_from`），
+// 这样自测能逐值验区间，而不是「跑一遍看它大概在哪儿」。
+
+use libc.syscall;
+
+// 退避区间的两个端点（毫秒）。改这里就是改 User 可见的行为，所以写成常量 + 注释。
+export const RTX_MIN_MS: i32 = 500;
+export const RTX_MAX_MS: i32 = 3000;
+
+// 预算：-1 = 无限（出厂默认）、0 = 关（一次都不重发）、N > 0 = 最多重发 N 次。
+export const RTX_UNLIMITED: i32 = -1;
+
+// 进程级预算（`rtx_set_max` 写、`rtx_max` 读）。出厂默认 = 无限。
+var g_rtx_max: i32 = RTX_UNLIMITED;
+
+// 退避取值的**状态**（xorshift64 的当前值）。初值 0 = 「还没种过」，
+// 第一次取用时用墙上时间 + pid 播种。
+var g_rtx_seed: u64 = 0;
+
+// xorshift64：一层就够用的伪随机（不需要密码学强度，只要「每次不一样」）。
+fn rtx_mix(x: u64) u64 {
+    var v: u64 = x;
+    if v == 0 {
+        v = 88172645463325252 as u64;   // 0 是 xorshift 的不动点，必须避开
+    }
+    v = v ^ (v << (13 as i32));
+    v = v ^ (v >> (7 as i32));
+    v = v ^ (v << (17 as i32));
+    return v;
+}
+
+// 把一次随机读数映射进 `[RTX_MIN_MS, RTX_MAX_MS]`（**纯函数**，自测逐值验它）。
+// 区间宽度 = MAX-MIN+1；`r % width` 落在 [0, width-1]，加 MIN 就是闭区间。
+export fn rtx_backoff_from(r: u64) i32 {
+    const width: u64 = ((RTX_MAX_MS - RTX_MIN_MS) + 1) as u64;
+    return RTX_MIN_MS + ((r % width) as i32);
+}
+
+// 本次退避时长（毫秒）：先取一个随机读数（必要时播种），再走上面那个纯函数。
+export fn rtx_backoff_ms() i32 {
+    if g_rtx_seed == 0 {
+        // 种子 = 墙上时间 ^ (pid << 16)：同一毫秒起的两个进程也不会同相位。
+        const pid: i64 = sys_getpid() catch { 0 as i64; };
+        const pmix: u64 = ((pid as u64) & 65535 as u64) << (16 as i32);
+        g_rtx_seed = ua_now_ms() ^ pmix;
+        if g_rtx_seed == 0 {
+            g_rtx_seed = 1 as u64;
+        }
+    }
+    g_rtx_seed = rtx_mix(g_rtx_seed);
+    return rtx_backoff_from(g_rtx_seed);
+}
+
+// 设预算：-1 无限 / 0 关 / N > 0 上限。负数（除 -1）按「关」处理，不静默当无限。
+export fn rtx_set_max(n: i32) void {
+    if n < 0 && n != RTX_UNLIMITED {
+        g_rtx_max = 0;
+        return;
+    }
+    g_rtx_max = n;
+}
+
+// 当前预算（调用方在**每一次重发前**读它，所以运行中改也当场生效）。
+export fn rtx_max() i32 {
+    return g_rtx_max;
+}
+
+// 预算用完了吗。attempt = **已经发出去的**次数（第一次请求之后是 1）。
+//   * 无限：永远 false（只有用户中断能停）；
+//   * 0：第一次失败就 false（= 今天的行为）；
+//   * N：已经发过 N 次就不再重发（最多再发 N-1 次）。
+export fn rtx_exhausted(attempt: i32) bool {
+    if g_rtx_max == RTX_UNLIMITED {
+        return false;
+    }
+    if g_rtx_max <= 0 {
+        return true;
+    }
+    return attempt >= g_rtx_max;
+}
+
+// 错误码分类：可重试吗。eid 是 `@error_id(err)` 的整数值（调用方传进来，避免这里依赖
+// 上层才知道的错误类型集合）。分类表见文件头 —— 这里只做「名字 → 是否重试」的映射。
+export fn rtx_retryable_err(eid: i32) bool {
+    if eid == @error_id(error.HcConnectFailed) {
+        return true;
+    }
+    if eid == @error_id(error.HcIoFailed) {
+        return true;
+    }
+    if eid == @error_id(error.HcTimeout) {
+        return true;
+    }
+    if eid == @error_id(error.HcBadResponse) {
+        return true;
+    }
+    // SSE 在 [DONE] 之前断掉：上游把流掐了（实测最主要的一种现场）
+    if eid == @error_id(error.LlmStreamClosed) {
+        return true;
+    }
+    return false;
+}
+
+// HTTP 状态码分类：可重试吗。
+//   * 408 请求超时 / 425 too early / 429 限流 / 5xx 服务端错 —— 瞬时，值得再发一次；
+//   * 其余（400/401/403/404/405/422…）是配置与鉴权错，重试只会把同一个错刷很多遍。
+// 注意 404 仍旧交给 `api_may_negotiate` 走协议协商那条路（本函数说它「可重试」会让
+// 协商永远轮不上），所以这里**不含 404**。
+export fn rtx_retryable_status(status: i32) bool {
+    if status == 408 || status == 425 || status == 429 {
+        return true;
+    }
+    return status >= 500 && status <= 599;
+}
+
+// 体内错误帧的错误码分类（chat/responses 两家都在 body 里带 `error.code`）。
+// 认不出的一律**不重试** —— 不替上游猜（`context_length_exceeded` 那种必须 fast fail）。
+export fn rtx_retryable_body_code(code: &const byte, n: usize) bool {
+    if n == 0 {
+        return false;
+    }
+    if bufx_eq_cstr(code, n, "server_error" as &const byte) {
+        return true;
+    }
+    if bufx_eq_cstr(code, n, "rate_limit_exceeded" as &const byte) {
+        return true;
+    }
+    if bufx_eq_cstr(code, n, "overloaded_error" as &const byte) {
+        return true;
+    }
+    if bufx_eq_cstr(code, n, "insufficient_system_resource" as &const byte) {
+        return true;
+    }
+    if bufx_eq_cstr(code, n, "internal_error" as &const byte) {
+        return true;
+    }
+    if bufx_eq_cstr(code, n, "api_error" as &const byte) {
+        return true;
+    }
+    if bufx_eq_cstr(code, n, "upstream_error" as &const byte) {
+        return true;
+    }
+    if bufx_eq_cstr(code, n, "timeout" as &const byte) {
+        return true;
+    }
+    return false;
+}
+
+// 睡 ms 毫秒（**裸 nanosleep**，与 `deleg_wait_slice` / `dshw_sleep_ms` 同款）。
+//
+// ⚠ **不许**写成「poll 一个无效 fd」：poll 对 fd<0 立刻返回，等待会退化成自旋
+// （CPU 打满、日志乱飞）—— 这条纪律在 deleg.uya 与 mcprun.uya 都写着，是实测踩过的。
+// EINTR 由 nanosleep 的 rem 语义兜住，不看返回值。
+//
+// 这里**只提供「睡一格」**，「睡几格、每格之间问什么」由调用方（agent 层的
+// `agent_rtx_wait`）决定 —— 因为「要不要停」那件事要读键盘，而读键入口在 term/tui
+// 那一层（`llm_pump_input`），net/ 不该反向依赖它。
+export fn rtx_sleep_ms(ms: i32) void {
+    if ms <= 0 {
+        return;
+    }
+    var ts: TimeSpec = TimeSpec{ tv_sec: 0, tv_nsec: 0 };
+    ts.tv_sec = (ms / 1000) as i64;
+    ts.tv_nsec = (((ms % 1000) as i64) * (1000000 as i64));
+    var rem: TimeSpec = TimeSpec{ tv_sec: 0, tv_nsec: 0 };
+    _ = sys_nanosleep(&ts, &rem) catch {};
+}
+
+// 退避等待的**切片粒度**（毫秒）。调用方拿它切分总时长，每一片之后问一次「要不要停」。
+//
+// 为什么必须切片：无限重试的全部风险都在这里。一块睡 3 s 的话，网关挂着时用户按 esc
+// 要等下一次醒来才被看见（3 s 起步、串起来就是「按了没反应」）；切到 50 ms 之后，
+// 人按下去到收口只差一个切片。
+export const RTX_TICK_MS: i32 = 50;

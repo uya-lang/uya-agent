@@ -26,8 +26,113 @@ export const STEP_CONTINUE: i32 = 100;
 // 于是这个码**只可能被 step 循环消费**（`continue` 重发），绝不会当退出码还回去。
 export const STEP_RETRY: i32 = 101;
 
+// P82：**传输层失败 → 同一步重发**（另一个 step 循环的内部码，同样不是退出码）。
+//
+// 与 P54 那个 `STEP_RETRY` 的区别只有一处：那个是「上游正常收尾但什么都没给」（退化响应，
+// 额度每步一次），这个是「请求根本没成功 / 服务端说它现在不行」（瞬时失败，默认不限次数、
+// 退避 0.5–3 s）。两条路的形状刻意做成一样：**同一步重发、历史一个字节不动** ——
+// 于是重算出来的请求体与上一次逐字节相同（自测的逐字节比对钉的就是它）。
+//
+// 为什么把「要不要重试」放在调用点而不是深处：分类要看的证据只有这一层有
+// （错误码 / HTTP 状态 / 体内错误 code），而**等待**要服务键盘（`rtx_wait`）——
+// 两件事都落在这一个内层 `while !sent` 里，判据在 net/retryx 只有一份。
+export const STEP_RETRY_NET: i32 = 102;
+
 // 交互模式：本回合被用户 Ctrl-C 打断（不是错误，回到提示符即可）
 export const AGENT_INTERRUPTED: i32 = 130;
+
+// ---- P82：待重发的原因（跨 agent_step_* → step 循环 的唯一通道）----
+//
+// 为什么用全局而不是出参：`agent_step_stream` / `agent_step_plain` / `agent_finish_step`
+// 的签名已经很长（再加两个出参，每一处调用点都要跟着改），而这三者都在**同一个 step 循环
+// 的同一轮**里跑完 —— 生命周期天然是「写一次、当场读走」，不会跨 step 串味。
+// 每次进循环前由 `agent_rtx_begin` 复位，所以「上一轮的原因」不可能被当下一次的证据。
+export const RTX_K_NONE: i32 = 0;        // 没有待重发的失败
+export const RTX_K_TRANSPORT: i32 = 1;   // 连接/DNS/IO/超时（含 TLS 校验失败与半截响应头）
+export const RTX_K_STREAM: i32 = 2;      // SSE 在 [DONE] 之前断掉
+export const RTX_K_STATUS: i32 = 3;      // HTTP 瞬时状态码（408/425/429/5xx）
+export const RTX_K_BODY: i32 = 4;        // HTTP 200 + 体内错误帧（瞬时 code）
+
+var g_rtx_kind: i32 = RTX_K_NONE;
+var g_rtx_status: i32 = 0;        // RTX_K_STATUS 时的 HTTP 状态码
+var g_rtx_printed: usize = 0;     // 失败那次已经打到屏幕上的正文字节数（给用户看的边界）
+var g_rtx_tls_seen: bool = false; // RTX_K_TRANSPORT 时是否观测到 leaf 证书（证据里要区分）
+// 失败那一刻的 leaf SHA-256 与体内错误原文：两者都活不过 `agent_step_*` 的返回
+// （TlsConn 与 ChatOut 都是那个函数的栈上局部量），而收口时要原样打给用户 ——
+// 所以在这里留一份副本。64 字节 = `TlsConn.observed` 的容量。
+var g_rtx_sha: [byte: 64] = [0: 64];
+var g_rtx_sha_len: usize = 0;
+var g_rtx_reason: Buf = Buf{ ptr: null, len: 0, cap: 0 };
+
+// agent_rtx_after_failure 的三个返回值（见那里的注释：三者混起来就会出现
+// 「人叫停了却被当成预算用尽」这类错收口）。
+const RTX_GO_GIVEUP: i32 = 0;
+const RTX_GO_RETRY: i32 = 1;
+const RTX_GO_INTERRUPTED: i32 = 2;
+
+// 两段反复出现的文案。提成常量只为守住 80 字符行宽（Uya 没有相邻字面量拼接）。
+// 它们必须与 P82 之前**逐字节相同** —— `--api-retry-max 0` 那条负控腿比的就是这个。
+const RTX_ERR_STREAM_CLOSED: &const byte =
+    "error: SSE stream ended without [DONE] (stream closed early)\n"
+    as &const byte;
+const RTX_MSG_INTERRUPTED: &const byte =
+    "\n[interrupted] 已中断本回合（历史保留，可直接继续输入）\n" as &const byte;
+
+// 回到「没有待重发的失败」。
+fn agent_rtx_begin() void {
+    g_rtx_kind = RTX_K_NONE;
+    g_rtx_status = 0;
+    g_rtx_printed = 0;
+    g_rtx_tls_seen = false;
+    g_rtx_sha_len = 0;
+    if buf_valid(&g_rtx_reason) {
+        buf_reset(&g_rtx_reason);
+    }
+}
+
+// 待重发的原因名（转录与 `llm/retry` 事件共用一份，避免两处各写一张表）。
+fn agent_rtx_kind_name(k: i32) &const byte {
+    if k == RTX_K_TRANSPORT {
+        return "transport" as &const byte;
+    }
+    if k == RTX_K_STREAM {
+        return "stream-closed" as &const byte;
+    }
+    if k == RTX_K_STATUS {
+        return "http-status" as &const byte;
+    }
+    if k == RTX_K_BODY {
+        return "upstream-error" as &const byte;
+    }
+    return "none" as &const byte;
+}
+
+// 记下「这一次失败手上有的证据」——TLS 指纹与体内错误原文都活不过 agent_step_* 的返回，
+// 而收口与转录都要它们（见 agent_rtx_give_up）。n 会被夹到 64 字节（TlsConn.observed 的容量）。
+fn agent_rtx_note_sha(p: &const byte, n: usize) void {
+    var k: usize = n;
+    if k > 64 {
+        k = 64;
+    }
+    var i: usize = 0;
+    while i < k {
+        g_rtx_sha[i] = p[i];
+        i = i + 1;
+    }
+    g_rtx_sha_len = k;
+}
+
+// 同一件事对体内错误原文：抄一份到 g_rtx_reason（收口时走 out_diag 的转义预览）。
+fn agent_rtx_note_reason(p: &const byte, n: usize) void {
+    if !buf_valid(&g_rtx_reason) {
+        g_rtx_reason = buf_new(LLM_ERR_HEAD + 8);
+        if !buf_valid(&g_rtx_reason) {
+            return;
+        }
+    }
+    buf_reset(&g_rtx_reason);
+    _ = buf_append(&g_rtx_reason, p, n);
+}
 
 // 每步允许的退化响应重发次数。写成常量是为了让证据里的 maxRetries 与真正执行的次数
 // 只有一个出处 —— 自测的「只重发一次」那条腿钉的就是它。
@@ -466,8 +571,11 @@ fn agent_step_stream(cfg: &Config, style: u8, url: &const Buf, hdrs: &const Buf,
     tls_noise_unmute(&guard);
 
     var err_kind: i32 = 0;   // 0=无错 1=malformed 2=stream-closed 3=其它（传输/TLS） 4=用户中断
+    // P82：可重试的传输错（连接/IO/超时/半截响应头/流早断）—— 判据在 net/retryx 里唯一一份。
+    var err_retry: bool = false;
     const status: i32 = call_res catch |err| {
         const eid: i32 = (@error_id(err) as! i32).value;
+        err_retry = rtx_retryable_err(eid);
         var r: i32 = 3;
         if eid == @error_id(error.LlmMalformed) {
             r = 1;
@@ -513,10 +621,25 @@ fn agent_step_stream(cfg: &Config, style: u8, url: &const Buf, hdrs: &const Buf,
         return AGENT_PROTO;
     }
     if err_kind == 2 {
-        out_err("error: SSE stream ended without [DONE] (stream closed early)\n");
+        // P82：流早断是**可重试**的（上游把连接掐了，重发一次通常就正常）。
+        // 判据不在这里自己写 —— 上面那一次 `rtx_retryable_err` 已经定过性了；
+        // 这里只保证「分类与落点一致」：它说可重试就走重试那条路，不许在这儿又打一遍错误。
+        if err_retry {
+            g_rtx_kind = RTX_K_STREAM;
+            g_rtx_printed = o.printed_chars;
+            return STEP_RETRY_NET;
+        }
+        out_err(RTX_ERR_STREAM_CLOSED);
         return AGENT_NET;
     }
     if err_kind == 3 {
+        if err_retry {
+            g_rtx_kind = RTX_K_TRANSPORT;
+            g_rtx_tls_seen = tc.observed_len > 0;
+            agent_rtx_note_sha(&tc.observed[0], tc.observed_len);
+            g_rtx_printed = o.printed_chars;
+            return STEP_RETRY_NET;
+        }
         out_err("error: 请求失败（网络或 TLS 校验）。\n");
         if tc.observed_len > 0 {
             out_err("  本次观测到的 leaf 证书 SHA-256 = ");
@@ -531,6 +654,15 @@ fn agent_step_stream(cfg: &Config, style: u8, url: &const Buf, hdrs: &const Buf,
     }
     if status != 200 {
         out_status[0] = status;
+        // P82：瞬时状态码（408/425/429/5xx）走重试那条路，其余照旧当场收口。
+        // 协商探测那一次**不**重试：404 是「这个端点不存在」，重发一百次也还是 404
+        // （它是本仓唯一一处「换个协议再试」的正当理由，走 api_negotiate）。
+        if rtx_retryable_status(status) {
+            g_rtx_kind = RTX_K_STATUS;
+            g_rtx_status = status;
+            g_rtx_printed = o.printed_chars;
+            return STEP_RETRY_NET;
+        }
         // 协商探测的那一次（未声明协议 + 端点不存在）不刷屏：由 api_negotiate() 打一行提示
         if !api_may_negotiate(cfg, style, status) {
             dump_stream_error(cfg, status, &o.err_text);
@@ -706,6 +838,175 @@ fn agent_note_degenerate(step: i32, o: &const ChatOut, prompt_bytes: usize, retr
     return retrying;
 }
 
+// P82：可中断的退避等待 —— 睡 ms 毫秒，每 `RTX_TICK_MS` 服务一次键盘/界面。
+// 返回 true = 用户要停（esc / ctrl+c / ctrl+d），调用方负责把这一步收口成本回合的终态。
+//
+// 为什么这一层（而不是 net/retryx）负责读键：唯一的读键入口是
+// `llm_pump_input`（TUI 走 `tui_pump_input`、滚动模式走 `tty_pump` + ESC/Ctrl-C 事件），
+// 它在 net/llm.uya 里且**必须**与流式循环共用同一套语义（键只能有一套意思）——
+// 而 net/ 排在 term/ 之前，反过来依赖会踩「常量排在后面 ⇒ 推断成 void」那条硬约束。
+// 于是分工是：retryx 给「睡一格」与「退避多长」，这里负责「每格之间问一次要不要停」。
+//
+// `llm_pump_input` 已经把「敲完整行 → steer 收件箱」「Ctrl-C/Esc → 中断」做完，
+// 所以这里与流式循环里那段是**同一份行为**：网关挂着时按 esc = 立刻收口（不是等 3 s）。
+fn agent_rtx_wait(ms: i32) bool {
+    var left: i32 = ms;
+    while left > 0 {
+        const slice: i32 = if left > RTX_TICK_MS { RTX_TICK_MS } else { left };
+        rtx_sleep_ms(slice);
+        const ev: i32 = llm_pump_input();
+        // 判据与 llm.uya 的流式循环逐条对齐：中断/退出都必须**立刻**停读
+        // （踩坑 44：只认前两个会把 ctrl+d 吞掉，用户看着像退不出）。
+        if ev == TTY_EV_CTRL_C || ev == TTY_EV_ESC || ev == TTY_EV_EOF {
+            return true;
+        }
+        left = left - slice;
+    }
+    return false;
+}
+
+// P82：一次失败之后要不要、以及能不能重发 —— step 循环里**唯一**读退避的地方。
+//
+// 返回值（三个结果必须分得清清楚楚，混起来就会出现「人叫停了却被当成预算用尽」）：
+//   `RTX_GO_RETRY`      = 已退避完毕，调用方把这一步重来（`continue` 内层循环）；
+//   `RTX_GO_GIVEUP`     = 预算用尽，调用方按 `g_rtx_kind` 把失败**照今天的口径**报出去；
+//   `RTX_GO_INTERRUPTED`= 用户在退避里叫停，调用方直接以 AGENT_INTERRUPTED 收口
+//                         （**不许**再打错误行：人叫停不是错误）。
+//
+// 四件事按顺序做，每一件都有明确理由：
+//   ① 预算闸门在**最前面**：`--api-retry-max 0` / 自测的 `rtx_set_max(0)` 必须一次都不等
+//      （否则「关掉重试」在 CI 里仍然要等一个 0.5–3 s 的退避，白等）；
+//   ② 先说清「发生了什么、要等多久、怎么停」再睡 —— 用户看到的必须是一句能打断的话，
+//      而不是一片沉默（网关挂着时沉默 3 s 与卡死没有区别）；
+//   ③ 退避期间**服务键盘**（`rtx_wait` 内部 ≤50 ms 切片 + 泵点）：esc/ctrl+c 立刻收口，
+//      这是「无限重试」不变成「无限卡死」的唯一凭据；
+//   ④ 同一条证据进会话日志（`llm/retry`）—— resume / 事后排障看的就是它。
+//
+// 为什么 attempt 从 1 起：它是**已经发出去的次数**，第一次失败时是 1；于是
+// `rtx_exhausted(1)` 在 `--api-retry-max 1` 下为 true = 「只发一次」，与字面意思一致。
+fn agent_rtx_after_failure(cfg: &const Config, step: i32,
+                           attempt: i32, backoff: &i32) i32 {
+    if rtx_exhausted(attempt) {
+        return RTX_GO_GIVEUP;
+    }
+    const wait_ms: i32 = rtx_backoff_ms();
+    backoff[0] = wait_ms;
+    const kname: &const byte = agent_rtx_kind_name(g_rtx_kind);
+    // 转录：一行说清「失败了什么 / 第几次 / 等多久 / 怎么停」。--quiet 也照打 ——
+    // 它是「这一刻屏幕上为什么没动静」的唯一解释。
+    out_err("[retry] ");
+    out_err(kname);
+    if g_rtx_kind == RTX_K_STATUS {
+        out_err(" HTTP ");
+        out_err_dec(g_rtx_status as usize);
+    }
+    out_err(" attempt=");
+    out_err_dec(attempt as usize);
+    out_err(" backoff=");
+    out_err_dec((wait_ms / 1000) as usize);
+    out_err(".");
+    out_err_dec(((wait_ms % 1000) / 100) as usize);
+    out_err("s（ctrl+c 中断；--api-retry-max 0 可关）\n");
+    if g_rtx_printed > 0 {
+        // 失败那次已经吐出去的正文是**半截的**（终端没法回退）。说清楚，别让人以为它丢了。
+        out_err("  （上一次失败前已显示 ");
+        out_err_dec(g_rtx_printed);
+        out_err(" 字节正文；它没有进历史，重发后会重新生成）\n");
+    }
+    if cfg.tui && tui_active() {
+        var note: Buf = buf_new(160);
+        if buf_valid(&note) {
+            _ = buf_append_cstr(&note, "重试中（");
+            _ = buf_append(&note, kname, bufx_cstr_len(kname));
+            _ = buf_append_cstr(&note, "，第 ");
+            _ = buf_append_u64(&note, attempt as u64);
+            _ = buf_append_cstr(&note, " 次）");
+            tui_add_notice(note.ptr as &const byte, note.len);
+            buf_free(&note);
+        }
+    }
+    // 会话日志：形状对齐 DSH 的 `llm/retry`（attempt/maxRetries + 一个 reason）
+    if g_sess.save {
+        var ev: Buf = buf_new(512);
+        defer { buf_free(&ev); }
+        if sess_begin(&g_sess, "llm/retry", &ev) {
+            _ = buf_append_cstr(&ev, "{\"turn\":");
+            _ = buf_append_i64(&ev, g_turn as i64);
+            _ = buf_append_cstr(&ev, ",\"step\":");
+            _ = buf_append_i64(&ev, step as i64);
+            _ = buf_append_cstr(&ev, ",\"attempt\":");
+            _ = buf_append_i64(&ev, attempt as i64);
+            _ = buf_append_cstr(&ev, ",\"maxRetries\":");
+            _ = buf_append_i64(&ev, rtx_max() as i64);
+            _ = buf_append_cstr(&ev, ",\"reason\":");
+            _ = jw_str_into(&ev, kname, bufx_cstr_len(kname));
+            _ = buf_append_cstr(&ev, ",\"status\":");
+            _ = buf_append_i64(&ev, g_rtx_status as i64);
+            _ = buf_append_cstr(&ev, ",\"backoffMs\":");
+            _ = buf_append_i64(&ev, wait_ms as i64);
+            _ = buf_append_cstr(&ev, ",\"printedChars\":");
+            _ = buf_append_i64(&ev, g_rtx_printed as i64);
+            _ = buf_append_cstr(&ev, ",\"tlsObserved\":");
+            if g_rtx_tls_seen {
+                _ = buf_append_cstr(&ev, "true");
+            } else {
+                _ = buf_append_cstr(&ev, "false");
+            }
+            _ = buf_append_cstr(&ev, "}");
+            _ = sess_end(&g_sess, &ev);
+        }
+    }
+    if agent_rtx_wait(wait_ms) {
+        return RTX_GO_INTERRUPTED;
+    }
+    return RTX_GO_RETRY;
+}
+
+// P82：预算用尽/不可重试时，把待重发的那次失败**按今天的口径**报出去（退出码不变）。
+// 返回该退出码（AGENT_NET / AGENT_PROTO）—— 调用方直接 return 它。
+// 之所以要有一个「收口」函数：重试把「失败 → 报错」这一步推迟了，推迟之后必须有人
+// 用**逐字节相同**的文案把它补回来，否则 `--api-retry-max 0` 这条负控腿就失去意义。
+fn agent_rtx_give_up(cfg: &const Config, attempt: i32) i32 {
+    _ = cfg;
+    if g_rtx_kind == RTX_K_STREAM {
+        out_err(RTX_ERR_STREAM_CLOSED);
+        return AGENT_NET;
+    }
+    if g_rtx_kind == RTX_K_STATUS {
+        out_err("model endpoint returned HTTP ");
+        out_err_dec(g_rtx_status as usize);
+        out_err("\n");
+        if g_rtx_status == 429 {
+            out_err("  （限流：重试预算已用尽，见 --api-retry-max）\n");
+        }
+        return AGENT_PROTO;
+    }
+    if g_rtx_kind == RTX_K_BODY {
+        out_diag("gateway-error", "model/gateway error: ",
+            g_rtx_reason.ptr as &const byte, g_rtx_reason.len);
+        return AGENT_PROTO;
+    }
+    // 传输/TLS：与不可重试那条支路**逐字节相同**（含指纹提示），免得两条路各长一个样。
+    // 指纹留在 g_rtx_sha 里 —— 失败那一刻的 TlsConn 早就随函数返回没了，而用户要的
+    // 正是「这一次的 leaf 指纹」（`--tls-verify=pin` 直接拿它去配）。
+    out_err("error: 请求失败（网络或 TLS 校验）。\n");
+    if g_rtx_sha_len > 0 {
+        out_err("  本次观测到的 leaf 证书 SHA-256 = ");
+        out_err_bytes(&g_rtx_sha[0], g_rtx_sha_len);
+        out_err("\n");
+        out_err("  链校验在真实站点常失败（见 §18）；用这个指纹重试：\n");
+        out_err("  uya-agent --tls-verify=pin --tls-pin <上面的指纹> ...\n");
+    } else {
+        out_err("  检查 base-url / 网络；证书问题可先用 --probe --tls-verify=none 看指纹。\n");
+    }
+    if attempt > 1 {
+        out_err("  （已重试 ");
+        out_err_dec((attempt - 1) as usize);
+        out_err(" 次仍失败；提升上限见 --api-retry-max）\n");
+    }
+    return AGENT_NET;
+}
+
 // 一步收尾（流式/非流式共用）：usage、finish 语义、工具派发、最终回答。
 // prompt_bytes = 本次请求体（prompt + tools + 外壳）的字节数 —— 退化响应的证据要用它，
 // 而它只有调用方（拼请求的那一层）知道，所以一路带下来。
@@ -718,6 +1019,17 @@ fn agent_finish_step(cfg: &Config, arena: &Arena, h: &History, step: i32, o: &co
     }
     agent_cache_burst_note(cfg, o);
     if o.finish == LLM_FINISH_ERROR {
+        // P82：**体内错误帧**里带的是机器码时，先看它属不属瞬时集合 —— 属就走重试
+        // （`server_error`/`rate_limit_exceeded`/… 再发一次通常就好了）。认不出的码
+        // 一律不重试：不替上游猜（`context_length_exceeded` 那种越重发越糟）。
+        if rtx_retryable_body_code(o.err_code.ptr as &const byte,
+                                   o.err_code.len) {
+            g_rtx_kind = RTX_K_BODY;
+            agent_rtx_note_reason(o.err_text.ptr as &const byte,
+                                  o.err_text.len);
+            g_rtx_printed = o.printed_chars;
+            return STEP_RETRY_NET;
+        }
         // 网关消息同样是外来字节：转义 + 限长（原来是无上限原样打印）
         out_diag("gateway-error", "model/gateway error: ", o.err_text.ptr as &const byte, o.err_text.len);
         return AGENT_PROTO;
@@ -1076,6 +1388,17 @@ fn agent_step_plain(cfg: &const Config, style: u8, url: &const Buf, hdrs: &const
         &tc
     );
     tls_noise_unmute(&guard);
+    var net_retry: bool = false;
+    _ = call_res catch |err| {
+        net_retry = rtx_retryable_err((@error_id(err) as! i32).value);
+    };
+    if net_retry {
+        // P82：瞬时传输错 —— 交给 step 循环退避后重发（同一步、历史不动）
+        g_rtx_kind = RTX_K_TRANSPORT;
+        g_rtx_tls_seen = tc.observed_len > 0;
+        agent_rtx_note_sha(&tc.observed[0], tc.observed_len);
+        return STEP_RETRY_NET;
+    }
     _ = call_res catch {
         out_err("error: 请求失败（网络或 TLS 校验）。\n");
         if tc.observed_len > 0 {
@@ -1092,6 +1415,13 @@ fn agent_step_plain(cfg: &const Config, style: u8, url: &const Buf, hdrs: &const
 
     if resp.status != 200 {
         out_status[0] = resp.status;
+        // P82：瞬时状态码走重试（与流式同一条判据）；其余照旧当场收口
+        if rtx_retryable_status(resp.status) {
+            g_rtx_kind = RTX_K_STATUS;
+            g_rtx_status = resp.status;
+            resp_free(&resp);
+            return STEP_RETRY_NET;
+        }
         // 协商探测的那一次不刷屏（同流式路径）
         if !api_may_negotiate(cfg, style, resp.status) {
             dump_http_error(resp.status, &resp.body);
@@ -1154,6 +1484,19 @@ fn agent_turn_loop_inner(cfg: &Config, h: &History) i32 {
     // P30：登记「当前回合」——阻塞循环里的统一泵点要用它来派发运行中的命令
     // （P31：主循环跑命令时也登记同一份上下文，见 agent_pump_ctx_begin）
     agent_pump_ctx_begin(cfg, h);
+    // P82：把这份配置里的重试预算交给策略层（`retryx` 是**进程级**的：分类与退避都在那儿，
+    // 而它不该反向依赖 Config）。
+    //
+    // ⚠ **只有人显式给过**（`src_api_retry != 0`：CLI / env / 自测自己设的）才**改动**它 ——
+    // 这条判据是承重的，实测踩过：`cfg_default()` 里是 `RTX_UNLIMITED`，若无条件照抄，那么
+    // **每一个自建 cfg 的调用方**（自测每条轮次的夹具、子代理的 cfg 拷贝）都会把闸门重新
+    // 拧回「不限次数」⇒ `selftest_main` 那句 `rtx_set_max(0)` 当场失效 ⇒ 撞上「mock 服务完
+    // 就退出」的轮次就无限重试下去（实测：整轮 `make selftest` 卡在 e2e-portable 上 35 分钟，
+    // 假网关的 req.bin 涨到 30 MB）。
+    // 「没给就别动」与 web 子进程注入那条纪律同口径（没给就不注入，别把默认值钉死在别人身上）。
+    if cfg.src_api_retry != 0 {
+        rtx_set_max(cfg.api_retry_max);
+    }
     // P55：回合开始复位执行期纪律的那点状态 ——
     //   * 上一回合切下去的低档位先还原（配置档位是每个回合的起点，不然一次任务之后就永久降档了）；
     //   * 本回合的改动计数 / 验收锚点 / 提醒计数清零（收工预算按回合算）。
@@ -1306,9 +1649,14 @@ fn agent_turn_loop_inner(cfg: &Config, h: &History) i32 {
         // 与协商回退同一个形状：都在这个内层循环里把同一步重发一次，历史不动 ——
         // 于是重算出来的 url/req 与上一次逐字节相同（自测「重发的请求体一字不差」钉的就是它）。
         var retry_ok: bool = EMPTY_RETRY_MAX > 0;
+        // P82：本步**已经发出去**的次数（第一次失败时是 1）+ 待重发的原因（每轮复位）。
+        // 传输层重试与上面那两件事（协商 / 退化响应）共用这一个内层循环，于是三者的
+        // 共同不变量只在这里成立一次：**历史与 step 都不动，重算出的 url/req 逐字节相同**。
+        var attempt: i32 = 0;
         var step_rc: i32 = AGENT_PROTO;
         var sent: bool = false;
         while !sent {
+            agent_rtx_begin();
             const style: u8 = api_style_now(cfg);
             if !api_url_into(cfg, style, &url) {
                 buf_free(&req);
@@ -1335,6 +1683,7 @@ fn agent_turn_loop_inner(cfg: &Config, h: &History) i32 {
             }
             var status: i32 = 0;
             var rc: i32 = AGENT_PROTO;
+            attempt = attempt + 1;
             if cfg.stream {
                 rc = agent_step_stream(cfg, style, &url, &hdrs, &req, &arena, h, step, g_interactive, &status, &retry_ok);
             } else {
@@ -1346,6 +1695,25 @@ fn agent_turn_loop_inner(cfg: &Config, h: &History) i32 {
             api_lock(cfg, style);
             if rc == STEP_RETRY {
                 // 退化响应：额度已经在 agent_note_degenerate 里扣掉、证据也落了，这里只管重来
+                continue;
+            }
+            if rc == STEP_RETRY_NET {
+                // P82：瞬时失败 —— 退避之后**同一步**重发（默认不限次数，可中断）。
+                // 预算用尽 / 人在退避里叫停 / 退避结束该重发，三种结果各有各的收口。
+                var backoff: i32 = 0;
+                const go: i32 =
+                    agent_rtx_after_failure(cfg, step, attempt, &backoff);
+                if go == RTX_GO_RETRY {
+                    continue;
+                }
+                if go == RTX_GO_INTERRUPTED {
+                    tty_puts(&tty_ui, 2, RTX_MSG_INTERRUPTED);
+                    step_rc = AGENT_INTERRUPTED;
+                    sent = true;
+                    continue;
+                }
+                step_rc = agent_rtx_give_up(cfg, attempt);
+                sent = true;
                 continue;
             }
             step_rc = rc;

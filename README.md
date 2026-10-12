@@ -4,8 +4,8 @@
 多轮 loop 直到给出结论。**不引入任何 C 代码、`@c_import` 或其它语言**，只依赖 Uya 语言与
 随编译器分发的标准库。
 
-**P0–P76 全部完成**，主线版本串 `p59-max-tokens`（**版本串只在选定要动
-`AGENT_VERSION` 的那条线才改** —— P60 起各线都沿用 `p59-max-tokens`，见
+**P0–P82 全部完成**，主线版本串 `p82-net-retry`（**版本串只在选定要动
+`AGENT_VERSION` 的那条线才改** —— 各线都沿用最近一次改动后的版本串，见
 `src/agent/ag_tui_sessions.uya` 的编号说明；各阶段做了什么见 [DESIGN.md §19](DESIGN.md)）。
 
 | 文档 | 看什么 |
@@ -146,6 +146,7 @@ readelf -lW build/uya-agent | grep -c INTERP    # 0 = 真静态
 | `--max-tokens N` / `--temperature N` | `--max-tokens` 覆盖**输出上限**（口径见 §「输出上限」条）；`--temperature` 默认不发送（对齐 DSH）。真被截断时（`finish_reason=length` / `incomplete`+`max_output_tokens`）**不派发工具调用、正文留在对话里**，直接发「继续」接着做；退出码见 §1.1 的 `5` |
 | `--exec-effort V` / `--exec-after N` | **低思考执行态**：前 N 步用 `--reasoning-effort` 把方案想清，第 N+1 步起切到 V 执行（**默认关**；人运行中 `/effort` 改过就不自动切）。设计取舍与实测方差见 [DESIGN.md §5.5](DESIGN.md) |
 | `--grace-steps N` | **收工预算**：验收类命令在改动之后首次跑绿起，还允许再走 N 步；`0` = 只提醒不截断（**默认**） |
+| `--api-retry-max N` | **传输层重试上限**：连接失败 / IO / 超时 / SSE 早断 / HTTP 408·425·429·5xx 会退避 **0.5–3 s 随机**后重发同一请求。**不给 = 不限次数**（直到成功或你 esc/ctrl+c）；`0` = 一次都不重试（逐字节回到旧行为，CI/排障用）；`N>0` = 最多发 N 次。`UYA_AGENT_API_RETRY_MAX` 同口径 |
 | `--plan` | 以 plan 模式启动（先出计划、批准后再执行）；plan 模式**真的拦写**，非交互会话（管道/CI）里没有审阅渠道 ⇒ 只产出计划、写工具始终被拒 |
 | `--permission MODE` | **访问模式**：`read-only` / `workspace-write` / `danger-full-access`（默认）。也收 `--permission=<MODE>`；非法值**报错退出**。来源优先级 CLI > `UYA_AGENT_PERMISSION` > DSH `permission.defaultPreset` |
 | `--no-sandbox` | 关掉 bash 的内核沙箱（bwrap）：confined 模式不再套壳、也不再 fail closed（启动打一行警告） |
@@ -248,6 +249,7 @@ uya-agent --web 127.0.0.1:9000     # 指定端口（端口写 0 = 内核分配�
 `UYA_AGENT_API`（非法值告警后按「未声明」处理，即仍会先试 responses）、
 `UYA_AGENT_REASONING_EFFORT`（`off`/`none` = 不发）、
 `UYA_AGENT_EXEC_EFFORT` / `UYA_AGENT_EXEC_AFTER` / `UYA_AGENT_GRACE_STEPS`、
+`UYA_AGENT_API_RETRY_MAX`（同 `--api-retry-max`：`0` = 不重试）、
 `UYA_AGENT_PERMISSION`（三档访问模式，非法值告警后忽略）、
 `UYA_AGENT_SANDBOX`（`0`/`off` = 等价于 `--no-sandbox`）、`UYA_AGENT_BWRAP`（bwrap 路径）、
 `UYA_AGENT_TITLE` / `UYA_AGENT_TITLE_AUTO`（`0` = 关，其它非空值 = 开；CLI 优先）、
@@ -261,6 +263,10 @@ uya-agent --web 127.0.0.1:9000     # 指定端口（端口写 0 = 内核分配�
 `5` **模型输出到达 token 上限被截断**（`finish_reason=length`）：这一轮没跑到最终答复，
 但**不是错误** —— 截断前的正文已经留在对话里，`--continue` 之后发一句「继续」即可接着做
 （工具调用一律丢弃：参数可能是半截的）。交互形态（REPL / TUI）里不按「异常」处理。
+
+> `2` / `3` 现在只在**重试预算用尽**时才会出现：瞬时失败（连接不上、5xx、限流、流早断）
+> 先退避重发，默认不限次数，直到成功或你中断（`--api-retry-max 0` 可关掉重试，让脚本
+> 立刻拿到旧行为）。**失败种类不因重试而混同**：传输错始终是 `2`、非 200/协议错始终是 `3`。
 
 ---
 
@@ -754,6 +760,14 @@ DEEPSEEK_API_KEY=sk-xxx ./build/uya-agent \
   永久丢失）；文件观察表也**不持久化**（恢复会话后要重新 `read` 才能 `edit`）。
 * **执行期两条纪律默认关**：`--exec-effort`/`--exec-after`（低思考执行态）与 `--grace-steps`
   （收工预算）默认都不生效；实测方差很大，**结论待测**（见 [DESIGN.md §5.5.3](DESIGN.md)）。
+* **传输层重试默认不限次数（P82）**：两条要留意的边界。① **网关彻底挂死时它会一直重试**
+  （这正是设计：一次 5xx 不该让整个任务作废，而实测口径下本仓曾因此丢掉本来能解的题）；
+  退避期间每 ≤50 ms 服务一次键盘，**esc / ctrl+c / ctrl+d 立刻收口**；CI/脚本里想要
+  fail fast 就 `--api-retry-max 0` 或 `UYA_AGENT_API_RETRY_MAX=0`。
+  ② **中途断流的重发会在屏幕上留下半截正文** —— 终端没法回退，那一段是失败那次的残影；
+  失败那次的正文**不进历史**（所以下一发是干净的、正确性不受影响），转录里会明说
+  「上一次失败前已显示 N 字节正文」。分类表（哪些重试、哪些绝不重试）见
+  `src/net/retryx.uya` 的文件头与 [DESIGN.md §19.3](DESIGN.md)。
 
 **平台与编译器**
 

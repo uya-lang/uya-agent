@@ -607,6 +607,287 @@ fn stop_shape_check(tag: &const byte, cap: &const Buf, home: &const byte, ws: &c
     return pass;
 }
 
+// P82：**传输层重试**轮（mode 45/46/47）的判据。
+//
+// 这三轮各自钉一条不变量，合起来才是「无限重试」这件事的完整判据：
+//   ① 45（503 → 429 → 200）：重试真的发生了、且**重发的请求与首次逐字节相同**
+//      （逐字节比对在 mock 端，比数请求条数强得多）、退避落在 [500,3000]、转录两行 `[retry]`、
+//      会话日志两条 `llm/retry` 且字段齐全、**step 只有一条**（同一步重发）、回合以 0 收口；
+//   ② 46（503 之后人在退避里按 ctrl+c）：退出码是 AGENT_INTERRUPTED（**不是**错误码，
+//      也不是「预算用尽」）—— 这是「无限重试不变成无限卡死」的唯一凭据；
+//   ③ 47（401）：分类表说它不可重试 ⇒ 转录里**一条 `[retry]` 都不许有**、立刻 AGENT_PROTO。
+//      它是「分类写宽了」的探测器（把「所有非 200」都算可重试 ⇒ 这里当场红）。
+//
+// 为什么退避区间要在这里再查一遍（mock 端查不了）：退避是**客户端**算的随机数，
+// 只有转录里那一行 `backoff=1.7s` 是它的可观测形式。区间判据同时挡住两种写错的实现：
+// 常数（永远同一个值 → 25（=2500/100）个桶里只有一个出现）与出界（>3.0s / <0.5s）。
+fn netretry_check(tag: &const byte, cap: &const Buf, home: &const byte,
+                  ws: &const byte, mode: i32, mock_rc: i32, ok: &bool) bool {
+    _ = ok;
+    var pass: bool = true;
+    // 两半**都要跑**（不提前返回）：转录与日志各钉不同的东西，一次跑完能一眼看全。
+    _ = netretry_transcript_check(tag, cap, mode, mock_rc, &pass);
+    _ = netretry_log_check(tag, home, ws, mode, &pass);
+    return pass;
+}
+
+// 转录那一半：`[retry] …` 行的条数、原因、序号，以及每行声明的退避值落在区间里。
+// 返回 false = 连基本形状都不对（调用方不必再查日志）。
+fn netretry_transcript_check(tag: &const byte, cap: &const Buf, mode: i32,
+                             mock_rc: i32, pass: &bool) bool {
+    var retries: i32 = 0;
+    var pos: usize = 0;
+    while pos < cap.len {
+        const found: isize = find_from(cap.ptr as &const byte, cap.len,
+            RTX_MARK, 8, pos);
+        if found < 0 {
+            break;
+        }
+        pos = (found as usize) + 8;
+        retries = retries + 1;
+        const ms: i32 = rtx_backoff_in_line(cap.ptr as &const byte,
+                                            cap.len, found as usize);
+        if ms < 0 {
+            ty_fail(tag, "转录里的 [retry] 行没有 backoff= 那一段", pass);
+            continue;
+        }
+        if ms < RTX_MIN_MS || ms > RTX_MAX_MS {
+            ty_fail(tag, "退避值不在 [0.5s, 3.0s] 区间里（转录里那一行对不上）", pass);
+        }
+    }
+    if mode == 45 {
+        if retries != 2 {
+            ty_fail(tag, "转录里的 [retry] 行数不是 2（503 + 429 各一条）", pass);
+        }
+        if !contains(cap, "[retry] http-status HTTP 503 attempt=1 ") {
+            ty_fail(tag, "第一次重试没说明是 HTTP 503（原因/序号对不上）", pass);
+        }
+        if !contains(cap, "[retry] http-status HTTP 429 attempt=2 ") {
+            ty_fail(tag, "第二次重试没说明是 HTTP 429（序号没跟着涨？）", pass);
+        }
+        if contains(cap, "error: ") {
+            ty_fail(tag, "重试成功的那一轮里出现了 error: 行（失败被当成终止态报出去了）", pass);
+        }
+    }
+    if mode == 46 {
+        if retries != 1 {
+            ty_fail(tag, "中断轮的重试行数不是 1（退避里按 ctrl+c 之后不该再有第二条）", pass);
+        }
+        if contains(cap, "error: ") {
+            ty_fail(tag, "人在退避里叫停却报了 error: 行（人叫停不是错误）", pass);
+        }
+        if !contains(cap, "[interrupted] 已中断本回合") {
+            ty_fail(tag, "退避期间的中断没有走「已中断本回合」那条路", pass);
+        }
+    }
+    if mode == 47 {
+        if retries != 0 {
+            ty_fail(tag, "401 被重试了（认证/配置错重发一百次还是同一个错）", pass);
+        }
+        // 收口文案走的是 `dump_stream_error`（流式非 200 的唯一出口）——它不打 `error:`
+        // 前缀，打的是状态行加转义后的错误体。别照抄别的轮次的判据（会误报）。
+        if !contains(cap, "model endpoint returned HTTP 401") {
+            ty_fail(tag, "401 没有当场报错收口（转录里看不到 401 状态行）", pass);
+        }
+    }
+    // ⚠ **不许**在这里断言「两次退避不相等」：两次独立取样有 1/2501 的概率撞上同一个值，
+    // 那是一条**天生会 flake** 的判据（实测在整轮 selftest 里红过一次）。「随机数真的在动」
+    // 改由下面那条**确定性**判据覆盖：`rtx_backoff_from` 是纯函数，直接喂 300 个连续读数
+    // 看它落在区间里、且取值个数足够多 —— 那才是「不是常数」的可判定形式（见
+    // `rtx_backoff_pure_check`，它不依赖任何一次真跑的运气）。
+    if mock_rc != 0 {
+        ty_fail(tag, "mock 端判定码非 0（请求形状/次数与期望不符）", pass);
+    }
+    return pass[0];
+}
+
+// P82：退避函数的**纯函数**判据（不依赖任何一次真跑的运气）。
+// 三件事一起钉死：
+//   ① 区间：任何读数映射出来都必须在 [RTX_MIN_MS, RTX_MAX_MS] 闭区间里；
+//   ② 端点可达：`r = 0` 给下界、`r = RTX_MAX_MS - RTX_MIN_MS` 给上界（宽度算错一格就红）；
+//   ③ 不是常数：300 个连续读数的**不同取值个数**要足够多（常数实现恒为 1）。
+// 为什么要有 ③：把「随机数没生效」写成「两次取样不相等」是错的（1/2501 会撞），
+// 而「300 个读数的取值分布」是确定性的 —— 同一个输入序列永远给同一个结论。
+fn rtx_backoff_pure_check(tag: &const byte, ok: &bool) bool {
+    var pass: bool = true;
+    const width: i32 = (RTX_MAX_MS - RTX_MIN_MS) + 1;
+    if rtx_backoff_from(0 as u64) != RTX_MIN_MS {
+        ty_fail(tag, "rtx_backoff_from(0) 不是下界（区间左端算错）", &pass);
+    }
+    if rtx_backoff_from((width - 1) as u64) != RTX_MAX_MS {
+        ty_fail(tag, "rtx_backoff_from(width-1) 不是上界（区间右端算错）", &pass);
+    }
+    var r: u64 = 12345 as u64;
+    var i: i32 = 0;
+    var min_seen: i32 = 100000;
+    var max_seen: i32 = -1;
+    var distinct: i32 = 0;
+    var seen: [bool: 4096] = [false: 4096];
+    while i < 300 {
+        // 用乘法混一下，模拟「连续取用同一个种子」的形态
+        r = (r * (6364136223846793005 as u64)) + (1442695040888963407 as u64);
+        const v: i32 = rtx_backoff_from(r);
+        if v < RTX_MIN_MS || v > RTX_MAX_MS {
+            ty_fail(tag, "退避值跑出 [0.5s, 3.0s] 区间（区间判据写错）", &pass);
+            i = 300;
+            continue;
+        }
+        if v < min_seen {
+            min_seen = v;
+        }
+        if v > max_seen {
+            max_seen = v;
+        }
+        const bucket: usize = (v - RTX_MIN_MS) as usize;
+        if bucket < 4096 && !seen[bucket] {
+            seen[bucket] = true;
+            distinct = distinct + 1;
+        }
+        i = i + 1;
+    }
+    // 常数实现只会命中一个桶；真随机的 300 个样本几乎必然铺开（宽度 2501）
+    if distinct < 50 {
+        ty_fail(tag, "300 个连续读数只落进几个桶（退避成了常数）", &pass);
+    }
+    _ = ok;
+    return pass;
+}
+
+// 会话日志那一半：`llm/retry` 的条数与字段，以及「重发不推进 step」这条不变量。
+fn netretry_log_check(tag: &const byte, home: &const byte, ws: &const byte,
+                      mode: i32, pass: &bool) bool {
+    var path: Buf = buf_new(1200);
+    defer { buf_free(&path); }
+    if !sess_find_last(home, ws, &path) {
+        ty_fail(tag, "找不到刚跑完的会话（会话日志没落盘？）", pass);
+        return false;
+    }
+    // sess_reader_load 把路径当 C 串（§16 坑 2）：Buf 不带 NUL，自己补一个
+    if !buf_append_byte(&path, 0) {
+        ty_fail(tag, "路径缓冲不够补 NUL", pass);
+        return false;
+    }
+    path.len = path.len - 1;
+    var r: SessReader = sess_reader_empty();
+    defer { sess_reader_free(&r); }
+    if !sess_reader_load(path.ptr as &const byte, &r) {
+        ty_fail(tag, "会话日志读不出来", pass);
+        return false;
+    }
+    var line: Buf = buf_new(65536);
+    defer { buf_free(&line); }
+    var typ: Buf = buf_new(64);
+    defer { buf_free(&typ); }
+    var rtx_events: i32 = 0;
+    var steps: i32 = 0;
+    var rtx_bad: i32 = 0;
+    var last_attempt: i64 = -1;
+    while sess_next(&r, &line) {
+        buf_reset(&typ);
+        if !sess_line_type(&line, &typ) {
+            continue;
+        }
+        const view: &[byte] = line.ptr[0: line.len];
+        if sv_eq_cstr(&typ, "step/start") {
+            steps = steps + 1;
+            continue;
+        }
+        if !sv_eq_cstr(&typ, "llm/retry") {
+            continue;
+        }
+        rtx_events = rtx_events + 1;
+        last_attempt = sess_json_i64(view, "attempt");
+        // 字段一个都不能少（缺字段时 sess_json_i64 给 -1）
+        if sess_json_i64(view, "step") != 1
+            || sess_json_i64(view, "maxRetries") != RTX_UNLIMITED as i64
+            || sess_json_i64(view, "backoffMs") < (RTX_MIN_MS as i64)
+            || sess_json_i64(view, "backoffMs") > (RTX_MAX_MS as i64)
+            || sess_json_i64(view, "printedChars") < 0
+            || sess_json_i64(view, "status") < 0
+            || !contains(&line, "\"turn\":") {
+            rtx_bad = rtx_bad + 1;
+        }
+    }
+    var want_rtx: i32 = 0;
+    if mode == 45 {
+        want_rtx = 2;
+    } else if mode == 46 {
+        want_rtx = 1;
+    }
+    if rtx_events != want_rtx {
+        ty_fail(tag, "会话日志里的 llm/retry 条数不对（重试没记账或记多了）", pass);
+    }
+    if rtx_bad != 0 {
+        ty_fail(tag, "llm/retry 的字段不全（attempt/backoffMs/reason/step）", pass);
+    }
+    if mode == 45 && last_attempt != 2 {
+        ty_fail(tag, "最后一条 llm/retry 的 attempt 不是 2", pass);
+    }
+    // 重发必须发生在**同一步**里：三条腿都只有一个 step/start
+    if steps != 1 {
+        ty_fail(tag, "step/start 不是 1 条（重发必须发生在同一步里，历史不许动）", pass);
+    }
+    return pass[0];
+}
+
+// 从 `[retry] ` 那一行的行首起，按「秒.十分之一秒」读回它声明的退避毫秒数。
+// 返回 -1 = 这一行没有 backoff= 那一段（判据会报红）。
+fn rtx_backoff_in_line(p: &const byte, n: usize, at: usize) i32 {
+    const line_end: usize = line_end_at(p, n, at);
+    const bo: isize = find_from(p, line_end, "backoff=" as &const byte, 8, at);
+    if bo < 0 {
+        return -1;
+    }
+    const b0: usize = (bo as usize) + 8;
+    const sec: i32 = digit_at(p, n, b0);
+    var frac: i32 = 0;
+    if b0 + 1 < n && p[b0 + 1] == 46 as byte {
+        frac = digit_at(p, n, b0 + 2);
+    }
+    return sec * 1000 + frac * 100;
+}
+
+// 从 off 起找 `[retry] ` 出现的位置（找不到 -1）。自己写一个而不是复用 bufx 的：
+// bufx 那份接口是「Buf + 起止」，而这里要在**捕获缓冲**上按 us 游标反复扫。
+fn find_from(p: &const byte, n: usize, lit: &const byte,
+             ln: usize, off: usize) isize {
+    if off >= n || ln == 0 || ln > n {
+        return -1 as isize;
+    }
+    var i: usize = off;
+    while i + ln <= n {
+        if bufx_mem_eq(&p[i], lit, ln) {
+            return i as isize;
+        }
+        i = i + 1;
+    }
+    return -1 as isize;
+}
+
+// 从 off 起找到行尾（`\n` 或缓冲末尾）。
+fn line_end_at(p: &const byte, n: usize, off: usize) usize {
+    var i: usize = off;
+    while i < n {
+        if p[i] == 10 as byte {
+            return i;
+        }
+        i = i + 1;
+    }
+    return n;
+}
+
+// 读位置 i 上的一个十进制数字（非数字给 0）。
+fn digit_at(p: &const byte, n: usize, i: usize) i32 {
+    if i >= n {
+        return 0;
+    }
+    const c: byte = p[i];
+    if c < 48 as byte || c > 57 as byte {
+        return 0;
+    }
+    return (c as i32) - 48;
+}
+
 // **端到端单轮驱动**：设好 mock 开关 → 准备假 DSH_HOME/工作区 → fork 出 mock 子进程 →
 // 在父进程里跑完整 agent 循环（build_request → http → 工具执行 → 回灌 → 下一轮），
 // 再按 mode 断言转录、退出码与写出的文件。mode 见文件头的「自测轮次模式」表；
@@ -699,6 +980,20 @@ fn selftest_round(base: &const Config, tag: &const byte, mode: i32, allow_shell:
     }
     c.timeout_ms = 15000;
     c.quiet = true;
+    // P82：传输层重试的三条腿自己开闸门（`selftest_main` 把整轮默认关掉了，见那里的注释）。
+    // 三条都走**出厂默认**（不限次数）：45 要验「默认就该重试」；46 要验「退避里被 ctrl+c
+    // 打断」（预算若给 0，退避那一步根本不会发生，这一轮就退化成「什么都没测」）；
+    // 47 要验「401 不进重试集合」—— 用默认值才能让「分类写宽了」当场红，
+    // 而不是被一个小的预算兜住。
+    //
+    // ⚠ **必须同时把 src_api_retry 标成「人显式给过」**（3 = cli）：agent 那边只在
+    // `src_api_retry != 0` 时才动进程级的闸门（见 `agent_turn_loop_inner` 那段注释）——
+    // 只改 api_retry_max 而不打这个标，闸门仍是 `selftest_main` 关掉的那一档，
+    // 这三轮会退化成「一次都不重试」而全红（实测踩过）。
+    if mode == 45 || mode == 46 || mode == 47 {
+        c.api_retry_max = RTX_UNLIMITED;
+        c.src_api_retry = 3;
+    }
     // 会话落到 build/ 下，别污染 ~/.uya-agent
     c.agent_home = buf_new(64);
     _ = buf_append_cstr(&c.agent_home, "build/selftest_agent_home");
@@ -714,6 +1009,18 @@ fn selftest_round(base: &const Config, tag: &const byte, mode: i32, allow_shell:
         var ctrl_c: [byte: 1] = [3: 1];
         tty_feed(&tty_ui, &ctrl_c[0], 1);
     }
+    // P82（mode 46）：**退避期间**的中断 —— 按键同样是预先塞进队列，但这一轮
+    // `g_interactive` 是 false，所以流式循环**不读键**（`llm_stream_style` 只在
+    // interactive 时才调 `llm_pump_input`）。于是那个 ctrl+c 会一直躺在队列里，
+    // 直到退避那一段的 `agent_rtx_wait` 去读它 —— 这正是要测的时机：
+    // 请求已经发出去了、503 也回来了、人**在等退避的时候**按了 ctrl+c。
+    // 若把 g_interactive 设成 true（像 mode 6 那样），键会被流式循环当场吃掉，
+    // 退避那一段就永远走不到（这一轮会退化成「又测了一遍 mode 6」）。
+    if mode == 46 {
+        tty_init(&tty_ui, 0);
+        var ctrl_c46: [byte: 1] = [3: 1];
+        tty_feed(&tty_ui, &ctrl_c46[0], 1);
+    }
     // 诊断轮（24）：把 fd 2 抓进文件，跑完逐字节断言「到底往转录里打了什么」
     // P54：退化响应轮（41/42）同样要抓 —— 「空回复分支要把证据打出来」这件事只有抓下来
     // 逐字看才算验过（真机上日志里只剩一条 content="" 正是用户报的那个现场）。
@@ -728,6 +1035,11 @@ fn selftest_round(base: &const Config, tag: &const byte, mode: i32, allow_shell:
         agent_set_debug_dump("build/selftest_diag_dump.bin" as &const byte,
             bufx_cstr_len("build/selftest_diag_dump.bin" as &const byte));
     } else if mode == 41 || mode == 42 || mode == 44 {
+        var cap_path: [byte: 64] = "build/selftest_diag_stderr.txt";
+        cap_saved = vw_cap_on(&cap_path[0] as &const byte, &cfd);
+    } else if mode == 45 || mode == 46 || mode == 47 {
+        // P82：三轮的判据全在**转录的那一行 `[retry] …`** 上（退避值、原因、序号），
+        // 所以必须把 fd 2 抓下来逐字看 —— 只看退出码分不出「退避了 0.5 s」与「没退避」。
         var cap_path: [byte: 64] = "build/selftest_diag_stderr.txt";
         cap_saved = vw_cap_on(&cap_path[0] as &const byte, &cfd);
     }
@@ -772,6 +1084,10 @@ fn selftest_round(base: &const Config, tag: &const byte, mode: i32, allow_shell:
         var cap_path: [byte: 64] = "build/selftest_diag_stderr.txt";
         vw_cap_off(&cap_path[0] as &const byte, cap_saved, cfd, &cap_text);
         agent_set_debug_dump("" as &const byte, 0);
+    }
+    if mode == 45 || mode == 46 || mode == 47 {
+        var cap_path3: [byte: 64] = "build/selftest_diag_stderr.txt";
+        vw_cap_off(&cap_path3[0] as &const byte, cap_saved, cfd, &cap_text);
     }
     g_interactive = false;
     inbox_globals_free();
@@ -831,6 +1147,15 @@ fn selftest_round(base: &const Config, tag: &const byte, mode: i32, allow_shell:
             ok = false;
         }
     }
+    if mode == 45 || mode == 46 || mode == 47 {
+        // P82：传输层重试三条腿 —— 转录的 `[retry]` 行 + 会话日志的 `llm/retry` 事件
+        // （两边都要查：只查日志的话，「屏幕上什么都没说」这条会漏过去；只查转录的话，
+        // 「事件字段缺了」这条会漏过去）。
+        const rhome: &const byte = "build/selftest_agent_home" as &const byte;
+        if !netretry_check(tag, &cap_text, rhome, ws, mode, mock_rc, &ok) {
+            ok = false;
+        }
+    }
     if mode == 44 {
         // P59：截断轮另外三条端到端判据（都不是「日志里看得出来」能替代的）：
         //   ① 截断那一回合的返回码是 AGENT_MAX_TOKENS（5）—— 不是 3（模型/协议错），
@@ -860,6 +1185,16 @@ fn selftest_round(base: &const Config, tag: &const byte, mode: i32, allow_shell:
     var expect_rc: i32 = AGENT_OK;
     if mode == 3 || mode == 5 || mode == 24 || mode == 42 {
         // 42：重发也只给空响应 —— 回合按协议错误收口（重试只发生一次，第二次就地放弃）
+        expect_rc = AGENT_PROTO;
+    }
+    if mode == 46 {
+        // P82：**退避期间被 ctrl+c 打断** —— 退出码必须是「已中断」（130），不是错误码。
+        // 这一条正是「无限重试不变成无限卡死」的凭据：网关挂着时人按 ctrl+c，要的是
+        // 立刻回到提示符，而不是等退避睡完、更不是把这一次失败报成 error。
+        expect_rc = AGENT_INTERRUPTED;
+    }
+    if mode == 47 {
+        // P82：401 属不可重试 —— 当场以协议错误收口（与 P82 之前逐字节相同的行为）
         expect_rc = AGENT_PROTO;
     }
     if interrupt {

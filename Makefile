@@ -104,7 +104,7 @@ AGENT_CFLAGS      := $(AGENT_CFLAGS_BASE) -include $(AGENT_C_PROTOS)
 #      数文件：`make -s print-src | wc -w`。
 # 留在 src/ 根的 tools.uya 是 P50 起就不在构建里的已知死代码，故意不列。
 SRC := src/foundation/bufx.uya src/foundation/jsonx.uya src/foundation/yamlcfg.uya \
-       src/net/httpc.uya src/net/httpsrv.uya src/net/httpstream.uya src/net/llm.uya src/net/sse.uya src/net/webx.uya \
+       src/net/httpc.uya src/net/httpsrv.uya src/net/httpstream.uya src/net/llm.uya src/net/retryx.uya src/net/sse.uya src/net/webx.uya \
        src/term/mdview.uya src/term/tasks.uya src/term/tty.uya \
        src/term/tui/style.uya src/term/tui/keys.uya src/term/tui/frame.uya src/term/tui/entry.uya src/term/tui/screen.uya src/term/tui/overlay.uya src/term/tui/status.uya src/term/tui/ask.uya src/term/tui/watch.uya src/term/tui/diff.uya src/term/tui/hook.uya \
        src/term/view.uya src/term/watch.uya \
@@ -132,7 +132,7 @@ export UYA_ROOT
 export UYA_SPLIT_C_DIR := $(CURDIR)/build/uyacache
 
 # 行宽豁免：一条 .PHONY 就是一张全仓目标清单，拆行反而看不清哪条丢了
-.PHONY: all check print-src print-cflags build link-audit selftest codegen-audit doc-audit lint-size lint-size-all doc-cover probe e2e e2e-config e2e-exec e2e-accept-nudge e2e-config-flags e2e-title e2e-title-cmd e2e-title-auto e2e-mouse e2e-api e2e-steps e2e-permission e2e-sandbox e2e-tasks e2e-goal e2e-memory e2e-memory-live e2e-sessions e2e-resume-big e2e-diff e2e-ws e2e-model e2e-model-save e2e-model-route e2e-worktree e2e-watch e2e-watch-pick e2e-dsh e2e-portable p30-check tui-demo tui-selftest web-selftest sess-selftest diff-selftest model-selftest panel-selftest clean shell-selftest pm-selftest mcp-selftest
+.PHONY: all check print-src print-cflags build link-audit selftest codegen-audit doc-audit lint-size lint-size-all doc-cover probe e2e e2e-config e2e-exec e2e-accept-nudge e2e-retry e2e-config-flags e2e-title e2e-title-cmd e2e-title-auto e2e-mouse e2e-api e2e-steps e2e-permission e2e-sandbox e2e-tasks e2e-goal e2e-memory e2e-memory-live e2e-sessions e2e-resume-big e2e-diff e2e-ws e2e-model e2e-model-save e2e-model-route e2e-worktree e2e-watch e2e-watch-pick e2e-dsh e2e-portable p30-check tui-demo tui-selftest web-selftest sess-selftest diff-selftest model-selftest panel-selftest clean shell-selftest pm-selftest mcp-selftest
 
 all: build
 
@@ -241,7 +241,7 @@ lint-size-all:
 #   本仓实测：90 文件树上净增 50 个函数 + `rm -rf build && make build` → 通过（静态链接审计通过）。
 #   因此「净增函数按 0 处理」那条纪律作废。这段留下的用处只有一个：**换/降编译器时认得出症状**
 #   （报错点落在标准库、`make check` 全绿、只有清缓存重编才炸）。
-selftest: build codegen-audit doc-audit doc-cover e2e-exec e2e-accept-nudge e2e-config-flags e2e-title e2e-title-cmd e2e-title-auto e2e-mouse e2e-api e2e-steps e2e-permission e2e-sandbox e2e-tasks e2e-goal e2e-memory e2e-memory-live e2e-sessions e2e-resume-big e2e-diff e2e-ws e2e-model e2e-model-save e2e-model-route e2e-worktree e2e-portable p30-check
+selftest: build codegen-audit doc-audit doc-cover e2e-exec e2e-accept-nudge e2e-retry e2e-config-flags e2e-title e2e-title-cmd e2e-title-auto e2e-mouse e2e-api e2e-steps e2e-permission e2e-sandbox e2e-tasks e2e-goal e2e-memory e2e-memory-live e2e-sessions e2e-resume-big e2e-diff e2e-ws e2e-model e2e-model-save e2e-model-route e2e-worktree e2e-portable p30-check
 	UYA_BIN=$(UYA) $(OUT) --selftest
 
 probe: build
@@ -774,9 +774,14 @@ e2e-portable: build
 	echo "$$out" | grep -q "prune=8192/4096/1024/0/0 glob=100 grep=250/2000" \
 		|| { echo "FAIL: 内嵌来源下剪枝/搜索旋钮不是缺省值"; exit 1; }; \
 	: "跑一轮 plan：请求里必须有只存在于上游 preset 里的那句"; \
+	: "⚠ 这一发**必须** --api-retry-max 0（P82）：本轮的假网关回的是**非 SSE** 的整段 JSON，"; \
+	: "   而客户端要的是流 ⇒ 那是 LlmStreamClosed（分类表里可重试）⇒ 不退避的话它会一直重发"; \
+	: "   （实测：req.bin 从几百字节涨到 30 MB，整轮 make selftest 卡死 35 分钟）。"; \
+	: "   这一轮的判据是「请求里有没有 plan 段」，不是「网关答得好不好」，所以关掉重试最贴题。"; \
 	env -u UYA_AGENT_DSH_ROOT HOME=$$home UYA_AGENT_API_KEY=k \
 		$$newbin/uya-agent --no-dsh-config --plan --api=chat --model portable-m \
 		--base-url "http://127.0.0.1:$$port/v1" --workspace $$ws --agent-home $$home \
+		--api-retry-max 0 \
 		--max-steps 1 --quiet "plan something" >/dev/null 2>&1 || true; \
 	sleep 0.5; \
 	if [ ! -s $$req ]; then echo "FAIL: 假网关没收到请求（内嵌 preset 那一轮没跑起来）"; exit 1; fi; \
@@ -929,6 +934,104 @@ e2e-exec: build
 	turns=$$(grep -c '"type":"turn/start"' $$log || true); \
 	[ "$$turns" = "2" ] || { echo "FAIL: 期望 2 个回合，实际 $$turns（第二行被当成 steer 了？）"; exit 1; }; \
 	echo "e2e-exec: 通过（默认关；CLI/env 生效；--help 有；降档 → exec-effort；回合开始 → exec-restore；2 回合）"
+
+# P82：**传输层失败 → 退避重发**（离线，真二进制 + 假网关，不联网）。
+#   现场见 DESIGN §19.1 坑二：上游一次 5xx / 超时 / 掐断流，本仓原来一层重试都没有 ——
+#   直接退出码 2，整个任务作废（配对窗口内本仓 163 次请求 2 次失败，丢的全是能解的题）。
+#
+#   四条腿（判据全落在**网关侧收到的请求体**与退出码上，不只看转录）：
+#     ① 默认（不限次数）：503→503→200 ⇒ 退出 0、两条 `[retry]`、日志两条 `llm/retry`、
+#        **三次请求逐字节相同**（同一步重发、历史一个字节没动）；
+#     ② `--api-retry-max 0`：503 之后**当场**退出，网关只收到 1 次请求（闸门关得掉）；
+#     ③ `--api-retry-max 1`：发满 1 次就不再发，网关只收到 1 次请求（上限被尊重）；
+#     ④ `--api-retry-max 2`：503→200 ⇒ 退出 0、只有一条 `[retry]`（上限 2 = 最多发 2 次）；
+#     ⑤ 死端口（传输错，连不上）：`--api-retry-max 3` ⇒ 退出 **2**（不是 3）+ 两条 `[retry]`
+#        —— 第 ⑤ 条专门钉「退出码与失败种类对得上」：非 200 走 AGENT_PROTO(3)，
+#        传输错走 AGENT_NET(2)，重试**不许**把这个区别抹平（脚本靠它分辨该不该重跑）。
+#   为什么②③要单独成腿：`0` 这一档最要紧（CI 要的 fail fast），而它最容易写错 ——
+#   `parse_i32_arg` 把 0 当无效值，照抄过来 `--api-retry-max 0` 会静默变成「无限重试」。
+e2e-retry: build
+	@set -e; \
+	ws=$(CURDIR)/build/e2e_retry_ws; rm -rf $$ws; mkdir -p $$ws; \
+	: "规范和值本身（离线，不联网）"; \
+	out=$$($(OUT) --no-dsh-config --print-config 2>&1); \
+	echo "$$out" | grep -q "api_retry_max = unlimited (-1)  (source: default)" \
+		|| { echo "FAIL: 默认应当是「不限次数」"; echo "$$out" | grep api_retry_max; exit 1; }; \
+	out=$$($(OUT) --no-dsh-config --api-retry-max 0 --print-config 2>&1); \
+	echo "$$out" | grep -q "api_retry_max = 0  (source: cli)" \
+		|| { echo "FAIL: --api-retry-max 0 没生效（0 被当成无效值了？）"; echo "$$out" | grep api_retry_max; exit 1; }; \
+	out=$$(UYA_AGENT_API_RETRY_MAX=3 $(OUT) --no-dsh-config --print-config 2>&1); \
+	echo "$$out" | grep -q "api_retry_max = 3  (source: env)" \
+		|| { echo "FAIL: UYA_AGENT_API_RETRY_MAX 没生效"; exit 1; }; \
+	out=$$(UYA_AGENT_API_RETRY_MAX=zz $(OUT) --no-dsh-config --print-config 2>&1); \
+	echo "$$out" | grep -q "warning: UYA_AGENT_API_RETRY_MAX" \
+		|| { echo "FAIL: 非法 UYA_AGENT_API_RETRY_MAX 没有告警"; exit 1; }; \
+	echo "$$out" | grep -q "api_retry_max = unlimited (-1)" \
+		|| { echo "FAIL: 非法值应回落到默认（不限）"; exit 1; }; \
+	$(OUT) --help 2>&1 | grep -q -- "--api-retry-max" \
+		|| { echo "FAIL: --help 里没有 --api-retry-max"; exit 1; }; \
+	: "四条端到端腿：每条一个**全新的**网关进程（脚本按收到的请求数推进，复用会错位）"; \
+	run_leg() { \
+		tag="$$1"; fails="$$2"; maxarg="$$3"; want_rc="$$4"; want_req="$$5"; \
+		want_retry="$$6"; \
+		home=$(CURDIR)/build/e2e_retry_home_$$tag; rm -rf $$home; mkdir -p $$home; \
+		gwlog=$(CURDIR)/build/e2e_retry_gw_$$tag.log; \
+		python3 testdata/mock_gateway_retry.py 0 $$fails 503 > $$gwlog 2>&1 & \
+		gw=$$!; \
+		sleep 0.7; \
+		port=$$(awk '/^PORT/{print $$2}' $$gwlog); \
+		if [ -z "$$port" ]; then echo "FAIL: $$tag 的假网关没起来"; cat $$gwlog; kill $$gw 2>/dev/null || true; exit 1; fi; \
+		rc=0; \
+		UYA_AGENT_API_KEY=k $(OUT) --no-dsh-config --no-tui --quiet \
+			--base-url "http://127.0.0.1:$$port/v1" --api=chat --model mock-model \
+			--workspace $$ws --agent-home $$home --tls-verify=none \
+			$$maxarg "say hi" > $(CURDIR)/build/e2e_retry_out_$$tag.txt 2>&1 || rc=$$?; \
+		sleep 0.3; kill $$gw 2>/dev/null || true; \
+		[ "$$rc" = "$$want_rc" ] \
+			|| { echo "FAIL: $$tag 退出码 $$rc（期望 $$want_rc）"; cat $(CURDIR)/build/e2e_retry_out_$$tag.txt; exit 1; }; \
+		n=$$(grep -c "^REQ " $$gwlog || true); \
+		[ "$$n" = "$$want_req" ] \
+			|| { echo "FAIL: $$tag 网关收到 $$n 次请求（期望 $$want_req）"; cat $$gwlog; exit 1; }; \
+		: "重发的请求必须与首次**逐字节相同**（same=0 就是有人在中途动了历史/请求）"; \
+		bad=$$(grep -c "same=0" $$gwlog || true); \
+		[ "$$bad" = "0" ] \
+			|| { echo "FAIL: $$tag 有请求与首次不同（重发路径动了请求体）"; cat $$gwlog; exit 1; }; \
+		k=$$(grep -c "\[retry\] " $(CURDIR)/build/e2e_retry_out_$$tag.txt || true); \
+		[ "$$k" = "$$want_retry" ] \
+			|| { echo "FAIL: $$tag 转录里的 [retry] 行数 $$k（期望 $$want_retry）"; cat $(CURDIR)/build/e2e_retry_out_$$tag.txt; exit 1; }; \
+		log=$$(ls $$home/sessions/*/*/session.jsonl 2>/dev/null | head -1); \
+		if [ -z "$$log" ]; then echo "FAIL: $$tag 没有落会话日志"; exit 1; fi; \
+		ev=$$(grep -c '"type":"llm/retry"' $$log || true); \
+		[ "$$ev" = "$$want_retry" ] \
+			|| { echo "FAIL: $$tag 日志里的 llm/retry 条数 $$ev（期望 $$want_retry）"; grep llm/retry $$log; exit 1; }; \
+		st=$$(grep -c '"type":"step/start"' $$log || true); \
+		[ "$$st" = "1" ] || { echo "FAIL: $$tag 的 step/start 不是 1 条（重发必须同一步）"; exit 1; }; \
+	}; \
+	run_leg default 2 "" 0 3 2; \
+	run_leg off 2 "--api-retry-max 0" 3 1 0; \
+	run_leg one 2 "--api-retry-max 1" 3 1 0; \
+	run_leg two 1 "--api-retry-max 2" 0 2 1; \
+	: "重试确实等了：那一行的 backoff= 必须在 [0.5s, 3.0s] 区间里"; \
+	grep -q "backoff=[0-2]\.[0-9]s" $(CURDIR)/build/e2e_retry_out_default.txt \
+		|| { echo "FAIL: 默认腿的退避值不在 0.5–3.0 s 区间里"; grep retry $(CURDIR)/build/e2e_retry_out_default.txt; exit 1; }; \
+	grep -q "ctrl+c 中断" $(CURDIR)/build/e2e_retry_out_default.txt \
+		|| { echo "FAIL: [retry] 行没有告诉用户怎么停（ctrl+c）"; exit 1; }; \
+	: "⑤ 传输错（死端口）：重试了、但退出码仍是 2（不许与「服务端说不行」的 3 混为一谈）"; \
+	home=$(CURDIR)/build/e2e_retry_home_dead; rm -rf $$home; mkdir -p $$home; \
+	: "端口 1 上不会有人监听（connect 立刻 ECONNREFUSED）—— 用它当「连不上」的稳定现场"; \
+	rc=0; \
+	UYA_AGENT_API_KEY=k $(OUT) --no-dsh-config --no-tui --quiet --api-retry-max 3 \
+		--base-url "http://127.0.0.1:1/v1" --api=chat --model mock-model \
+		--workspace $$ws --agent-home $$home --tls-verify=none \
+		"say hi" > $(CURDIR)/build/e2e_retry_out_dead.txt 2>&1 || rc=$$?; \
+	[ "$$rc" = "2" ] \
+		|| { echo "FAIL: 死端口那一次的退出码是 $$rc（期望 2 = 传输错）"; cat $(CURDIR)/build/e2e_retry_out_dead.txt; exit 1; }; \
+	k=$$(grep -c "\[retry\] transport" $(CURDIR)/build/e2e_retry_out_dead.txt || true); \
+	[ "$$k" = "2" ] \
+		|| { echo "FAIL: 死端口那次的重试行数 $$k（期望 2：发了 3 次 = 重试 2 次）"; cat $(CURDIR)/build/e2e_retry_out_dead.txt; exit 1; }; \
+	grep -q "请求失败（网络或 TLS 校验）" $(CURDIR)/build/e2e_retry_out_dead.txt \
+		|| { echo "FAIL: 预算用尽后没有按旧口径报「请求失败」（负控腿失去意义）"; exit 1; }; \
+	echo "e2e-retry: 通过（默认重发到成功 + 0/1/2 三个上限各自生效 + 重发逐字节相同 + 同一步 + 退出码分类不变）"
 # CLI flag 回归：--dsh-home / --no-dsh-config / --strict-dsh-config 决定「去哪儿读设置」，
 # 必须在下一次加载之前生效（曾经因为完整 CLI 解析排在加载之后而三个 flag 全部静默失效，
 # 见 §16 踩坑 25）。离线可跑：--print-config 不联网。
