@@ -86,8 +86,8 @@ Uya 是**目录即模块**，而且本仓实测：**跨目录是合并命名空�
   （+12 片）、`agent/agent.uya` 13129 → 683（+9 片）、`selftest/tuiselftest.uya` 11710 → 141
   （+7 片）。**拆分当时全仓最大文件 1949 行**；后来两条线往自测片里加段，
   现在又有 2 个文件长过 2000 —— `selftest/tuis_diff_scroll.uya` 2155（P74）、
-  `selftest/tuis_tail.uya` 2049（P75 那轮的修复）（加段前先看一眼目标文件行数，
-  别把拆完的账欠回去；拆法仍是纯搬移，见本节末）。
+  `selftest/tuis_tail.uya` 2068（P75 那轮的修复；P80 清夹具 + 绊线又加了几行）
+  （加段前先看一眼目标文件行数，别把拆完的账欠回去；拆法仍是纯搬移，见本节末）。
 * **单函数 > 200 行** → **仍是历史欠账**，本轮拆分刻意没动函数边界（纯搬移，函数体逐行不变）：
   当前最大是 `selftest/st_mock_server.uya` 的 `mock_server`（1609 行）、`agent/agent.uya`
   的 `main`（818 行）、`selftest/tuis_diff_scroll.uya` 的 `tui_diff_round`（634 行）。
