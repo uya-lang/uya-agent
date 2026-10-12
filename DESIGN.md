@@ -5582,7 +5582,9 @@ harness 差多少？用的是第三方基准 **OpenBench**（`minghinmatthewlam/
 `add-feature`（给 miniconf 加 `@include`）、`webcore`（给微框架加类型化路由/挂载/内容协商）。
 判据是**任务自带的 pristine 测试套件**（cwd 指向 agent 的工作区副本，改工作区里的测试没用），
 按 `test_ids.txt` 逐条隔离跑、给部分分 `SCORE: 0.0-1.0`。
-装置在 `build/openbench_vs_dsh/`（gitignored，含 README 与复现命令）。
+测量装置（两个 adapter + dsh 的隔离 home 模板 + 复现命令）已入库：
+[`testdata/openbench_adapters/`](testdata/openbench_adapters/README.md) —— 它是**验收装置**，
+不进 `Makefile` 的 `SRC`、不参与构建（与 `testdata/` 下其它验收脚本同口径）。
 
 **三道控制先立住**（都在花钱之前）：
 
