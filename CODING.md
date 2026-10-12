@@ -236,9 +236,18 @@ Makefile 的 `UYA` / `UYA_ROOT` 默认就指向它）。下面第 1、2 条是 *
 4. **codegen 的 reachable 函数表**（`C99_MAX_REACHABLE_FUNCTIONS`，0.10.x 是 4096）：超过就**静默丢函数**
    —— 定义与原型都不发射、调用点还在 ⇒ 宿主 C 报 `implicit declaration` + `invalid initializer`
    （报错点在调用处，根因在表满）。**已修**：按 checker 的实际条数分配 + 满时 2 倍扩容（编译器提交 `1267dbc6`）。
+5. **宿主编译器在严格化（GCC 14 起）**：`-Wimplicit-function-declaration` 等一批原本只是告警的
+   东西变成**错误**，而报错全落在编译器**生成的** C 里 —— `make check` 看不见（它只查 uya 类型）。
+   四类症状（缺原型的无体 `extern "libc" fn` / 指针类型对不上 / `{0}` 套在标量上 /
+   生成物里的裸方向控制符）与修法见 [DESIGN.md](DESIGN.md) §16 踩坑 131。
+   本仓的修补点：`src/cshim/uya_agent_libc_protos.h` + Makefile 的 `AGENT_CFLAGS`
+   （手工编译按 `$(make -s print-cflags)` 带上）。**本机 cc = GCC 15.2**。
+   这条**不是**编译器的 bug（与上面 1/2/4 不同）—— 是 codegen 的合法输出撞上了新规则，
+   所以换 GCC 版本时要预留「全量重编 + 逐个收账」的时间。
 
-实测（本仓，0.10.3，干净重编）：`make check` 通过、`rm -rf build && make build` 通过（静态链接审计通过）、
-113 个输入文件与 2792 个函数都在。**0.10.3 早期确实编不过本仓**（`thread_worker_set_nonblock` 的
+实测（本仓，0.10.3 + GCC 15.2，干净重编）：`make check` 通过、
+`rm -rf build && make build` 通过（静态链接审计通过）、113 个输入文件与
+2792 个函数都在。**0.10.3 早期确实编不过本仓**（`thread_worker_set_nonblock` 的
 定义没被发射），根因就是上面第 4 条那条 4096 截断，已随 `1267dbc6` 修掉。
 
 因此「净增函数按净增 0 处理」「别把 `src/` 拆到 64 个文件以上」这两条纪律**都不再生效**：
