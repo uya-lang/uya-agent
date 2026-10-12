@@ -3,7 +3,8 @@
 // 本文件：`PmIngest`（一次会话的摄取上下文）、`pm_ingest_init`/`pm_ingest_free`、
 //   `pm_ingest_tool`（从一条工具结果抽事实）、`pm_ingest_user`（从用户原话抽**候选**惯例）、
 //   一组纯文本小工具（`pm_ing_norm_cmd`/`pm_ing_find_exit`/`pm_ing_extract_path`/
-//   `pm_ing_lines_total`/`pm_ing_signal_line`）。
+//   `pm_ing_lines_total`/`pm_ing_signal_line`/`pm_ing_single_line`/
+//   `pm_ing_truncated`/`pm_ing_cd_drop`）。
 // 不变量：① **确定性抽取，绝不调 LLM** —— 让模型自己抽「主张」等于把自证换个位置；
 //   同一份工具结果必须永远抽出同一条事实（时间戳由调用方给，不读时钟）。
 //   ② 事实的 `value` 只放**指针与概要**（路径、行数、退出码、首条错误行），**绝不放文件
@@ -12,6 +13,10 @@
 //   认不出形状就**什么都不记**（宁可少记，不可记错）。
 //   ④ 每条事实都带出处（`src` = 工具名）与 stat 锚点，供注入侧做失效校验；
 //   锚点全 0 表示「这条不可校验」（不是「校验通过」）。
+//   ⑤ **只记「重跑得起来」的命令**：多行的、以及被 512 上限截断的一律不记 —— 事实里
+//   存的是**折叠成一行**的文本，重跑它并不等价（实测 19% 的 bash 调用是多行、14% 触到
+//   上限）。另外把「cd 到本会话工作区」这个**恒真**前缀剥掉，否则同一条命令在每个
+//   worktree 里都是新键、跨会话的 `n` 永远累加不起来。
 // 依赖：libc（syscall / unistd）；本仓 foundation/bufx、foundation/jsonx、tools/fsx
 //   （`fs_stat`）、pm/pm_store（`PmFact`/`pm_store_append`）。
 // 命名：`pm_ing_*`（本文件内部工具）、`pm_ingest_*`（对外入口）、`PmIngest`、`PM_ING_*`。
@@ -78,8 +83,10 @@ export fn pm_ingest_free(ing: &PmIngest) void {
 // 纯文本小工具
 // ============================================================
 // 空白折叠：把连续的空格 / tab / 换行压成一个空格，并去掉首尾。
-// 为什么需要：同一条命令在不同会话里缩进 / 换行不一样（多行 heredoc、复制粘贴），
-// 不归一就会变成两条事实 —— 而它们本来就该是「同一条命令」。
+// 为什么需要：同一条命令在不同会话里缩进 / 空格不一样（复制粘贴、`echo` 前多敲了几个
+// 空格），不归一就会变成两条事实 —— 而它们本来就该是「同一条命令」。
+// 注意它**不再是**多行命令的通道：多行命令在 `pm_ing_single_line` 就被拒了（见那里的
+// 理由），所以这里换行只会出现在「行尾的收尾换行」上，折叠掉正好。
 export fn pm_ing_norm_cmd(src: &const byte, n: usize, out: &Buf) void {
     buf_reset(out);
     var i: usize = 0;
@@ -106,6 +113,91 @@ export fn pm_ing_norm_cmd(src: &const byte, n: usize, out: &Buf) void {
         }
         i = i + 1;
     }
+}
+
+// 这条命令是不是「一行能重跑」的？**多行一律拒**。
+//
+// 为什么必须拒（实测 64906 条真 bash 调用，19% 是多行）：事实里存的是 `pm_ing_norm_cmd`
+// 折叠后的**一行**文本，而多行命令折叠后并**不等价** —— heredoc 的正文被压成同一行，
+// `for x in a b; do … done` 的换行没了，重跑它要么语法错、要么跑出别的东西。记忆的价值
+// 全在「照着重跑一遍」，存一条重跑不起来的命令比不存更糟：它会把模型引向一条死路。
+//
+// 判据只看**原始**命令（归一化之前）：归一化正是把证据抹掉的那一步。
+export fn pm_ing_single_line(cmd: &const byte, n: usize) bool {
+    var i: usize = 0;
+    while i < n {
+        if cmd[i] == 10 as byte || cmd[i] == 13 as byte {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+// 归一化后**恰好**触到 `PM_ING_CMD_MAX` ⇒ 尾巴被砍掉了。返回 true = 拒。
+//
+// 为什么必须拒（实测 14% 的真 bash 调用触到上限）：`pm_ing_norm_cmd` 是**硬截断**，不是
+// 摘要 —— 存进去的是一条到半个 token 就断掉的命令（`… | grep -E "行 > 2000|文件`），
+// 既跑不起来、又占掉预算的很大一块。宁可少记，不可记错。
+export fn pm_ing_truncated(cmd: &const byte, n: usize) bool {
+    return n >= PM_ING_CMD_MAX;
+}
+
+// `cd <本会话工作区> && ` 这个前缀占多少字节（0 = 没有 / 不剥）。
+//
+// 剥它的理由：bash 本来就**跑在**工作区里（`sh_resolve_workdir` 的默认值），所以
+// 「先 cd 到自己已经在的地方」是个**恒真**前缀 —— 对重跑没有任何影响，却让同一条命令在
+// 每个 worktree 里都算一个新 key。实测 64906 条真 bash 调用：56% 带 `cd X && ` 前缀，
+// 其中 6535 条的目标**恰好**是当时的工作区；不剥的话跨会话的 `n` 几乎永远停在 1
+// （本仓实测 470 个命令 key 里 468 个 n == 1 —— 而 `ls -la` / `make check` 这类
+// 「逐字重复」正是记忆最该记账的那部分）。
+//
+// **只剥「目标 == ws」这一种**：其余 29370 条 `cd X && …` 里的 X 是别的地方（`/tmp`、
+// 另一个仓、另一个 worktree）—— 剥掉就改了语义（`cd /tmp && ls` ≠ `ls`），宁可留着。
+// 这条边界本身就是判据：只剥可证的恒真前缀。
+export fn pm_ing_cd_drop(cmd: &const byte, n: usize, ws: &const byte,
+                         ws_len: usize) usize {
+    if n < 8 || ws_len == 0 {
+        return 0;
+    }
+    if cmd[0] != 99 as byte || cmd[1] != 100 as byte {   // "cd"
+        return 0;
+    }
+    if cmd[2] != 32 as byte && cmd[2] != 9 as byte {
+        return 0;
+    }
+    var i: usize = 3;
+    while i < n && (cmd[i] == 32 as byte || cmd[i] == 9 as byte) {
+        i = i + 1;
+    }
+    const ts: usize = i;
+    while i < n && cmd[i] != 32 as byte && cmd[i] != 9 as byte {
+        i = i + 1;
+    }
+    if i == ts {
+        return 0;
+    }
+    // 两边都按「去尾斜杠」比：`cd /a/b/` 与 ws `/a/b` 是同一个地方
+    const wsn: usize = pm_trim_slash(ws, ws_len);
+    const tgtn: usize = pm_trim_slash(&cmd[ts], i - ts);
+    if tgtn == 0 || tgtn != wsn || !bufx_mem_eq(&cmd[ts], ws, tgtn) {
+        return 0;
+    }
+    while i < n && (cmd[i] == 32 as byte || cmd[i] == 9 as byte) {
+        i = i + 1;
+    }
+    if i + 1 >= n || cmd[i] != 38 as byte || cmd[i + 1] != 38 as byte {
+        return 0;   // 不是 `&& ` 就保守：`cd X; foo` / `cd X &&foo` 都不剥
+    }
+    i = i + 2;
+    const before: usize = i;
+    while i < n && (cmd[i] == 32 as byte || cmd[i] == 9 as byte) {
+        i = i + 1;
+    }
+    if i == before || i >= n {
+        return 0;   // `cd X &&` 后面空着 → 没东西可重跑，不剥
+    }
+    return i;
 }
 
 // 在 hay 里找 `[exit code: N]` 并解析 N 写进 out（isize，避免 i64/i32 的摩擦）。
@@ -390,6 +482,9 @@ export fn pm_ingest_tool(ing: &PmIngest, name: &const byte, name_len: usize,
 // 摄取一条 bash 结果：`commands`（成功的命令）与 `state`（验证命令的绿/红）。
 // 从 `pm_ingest_tool` 拆出来（AGENTS.md 的函数 ≤100 行）；函数体逐行与原处相同，
 // 只是不再需要自己判工具名 —— 调用点已经判过了。
+//
+// 三道闸门（见文件头 ⑤）：**多行的拒**、**触到上限的拒**、**剥掉恒真的 `cd <ws> &&`**。
+// 前两道只影响「记不记」，第三道决定了 key 长什么样 —— 它让同一条命令终于能跨会话累加。
 fn pm_ingest_bash(ing: &PmIngest, args: &const byte, args_len: usize,
                    result: &const byte, result_len: usize,
                    now_ms: i64) void {
@@ -398,11 +493,19 @@ fn pm_ingest_bash(ing: &PmIngest, args: &const byte, args_len: usize,
     if !pm_ing_arg(args, args_len, "command" as &const byte, 7, &raw) {
         return;
     }
+    if raw.len == 0 || !pm_ing_single_line(raw.ptr as &const byte, raw.len) {
+        return;   // 多行：折叠成一行之后重跑不等价 → 不记
+    }
+    const drop: usize = pm_ing_cd_drop(raw.ptr as &const byte, raw.len,
+                                       ing.ws.ptr as &const byte, ing.ws.len);
     var cmd: Buf = buf_new(PM_ING_CMD_MAX + 8);
     defer { buf_free(&cmd); }
-    pm_ing_norm_cmd(raw.ptr as &const byte, raw.len, &cmd);
+    pm_ing_norm_cmd(&raw.ptr[drop], raw.len - drop, &cmd);
     if cmd.len == 0 {
         return;
+    }
+    if pm_ing_truncated(cmd.ptr as &const byte, cmd.len) {
+        return;   // 触到上限 = 尾巴被砍掉了 → 存进去也重跑不起来
     }
     var code: isize = 0;
     if !pm_ing_find_exit(result, result_len, &code) {
