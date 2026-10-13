@@ -1,0 +1,384 @@
+// src/media/clipw.uya — 剪贴板写入（P85）：X11 选区所有者的最小实现
+//
+// 本文件：把一段文本**送进剪贴板** —— `SetSelectionOwner` 拿到 CLIPBOARD / PRIMARY，
+//   然后守着连接应答对端（桌面剪贴板管理器、正在 Ctrl+V 的程序）发来的
+//   `SelectionRequest`，直到「有人真把数据取走」或超时收工。
+// 不变量：① **只在真 X11 会话里工作**（`DISPLAY` 能连上），失败不静默、给一句人话；
+//   ② 持有窗口**必须有硬上限**（CLIPW_HOLD_MS）—— 它是阻塞的，无上限等于界面卡死；
+//   ③ 持有期间走 `clipx_read_exact` 的 poll 循环（内部 `tui_poll_tick`），界面不假死、
+//      esc 能取消（与读剪贴板同一手法）；
+//   ④ `TARGETS` 必须应答 —— 实测不答它时对端（Qt/Firefox 一档）拿不到内容，
+//      读回来的是**上一次**的旧值（这一条是实测踩出来的，不是照规范抄的）。
+// 依赖：libc（syscall/unistd）、本仓 foundation/bufx、media/clipx（连接与请求原语）、
+//   term/tui/hook（`tui_poll_tick` 泵界面）、session/sigx（读 `tui_abort_state` 那一路）。
+// 命名：`clipw_*`（对外）、`CLIPW_*`（结果码与上限）。
+//
+// 为什么必须自己当「选区所有者」：真机实测（deepin-terminal 6.5.21 / QTermWidget，
+// X11）这台终端**既不认 OSC 5522 也不认 OSC 52** —— `ESC[?5522$p` 零应答、OSC 52 写
+// `c`/`p` 两块板子一个字节都不变（同机 DSR 探针对照有应答，排除假阴性）。而终端把鼠标
+// 交给我们之后它自己的拖选也没了（§16 踩坑 72）。于是「拖选复制」只剩这一条路：
+// 我们自己实现选区与高亮（term/tui/sel.uya），写剪贴板由这里说 X11 协议。
+//
+// 为什么 X11 而不是「外部工具」：真机 `xclip` / `xsel` / `wl-copy` **一个都没装**，
+// 本仓既有口径也是「没有 helper 就自己说协议」（见 clipx.uya 的同一段理由）。
+//
+// 实测得到的三个关键事实（本文件的行为都按它们写）：
+//   * 桌面剪贴板管理器（dde-clipboard）会**主动来取**数据，取走之后由它持久化 ——
+//     所以我们退出之后 Ctrl+V 仍然拿得到（实测：持有 0.6 s 就够）；
+//   * 它会来取**多次**（TARGETS + 各 target），所以不能「答完一次就走」；
+//   * 退出后 PRIMARY 由管理器清掉（实测 `PRIMARY selection doesn't exist`），
+//     所以宣称 PRIMARY 只为「拖完立刻中键粘贴」这一下，CLIPBOARD 才是主目标。
+
+use libc.syscall;
+use libc.unistd;
+
+// 结果码
+export const CLIPW_OK: i32 = 0;         // 已送进剪贴板（并被对端取走）
+export const CLIPW_NO_X11: i32 = 1;     // 没有可用的 X11 会话
+export const CLIPW_ERR: i32 = 2;        // 协议层失败（连不上 / 应答畸形）
+export const CLIPW_EMPTY: i32 = 3;      // 没有内容可复制（空选区）
+export const CLIPW_TOO_BIG: i32 = 4;    // 超过单次写入上限
+
+// 单次写入上限（字符数按 UTF-8 字节算）。剪贴板是给别处粘贴用的，一次拖选不该
+// 把几百 KB 灌进去；超限由调用方（agent 侧）先截断并如实回执，这里是兜底。
+export const CLIPW_MAX_BYTES: usize = 1024 * 1024;
+
+// 守多久。为什么要等：对端（管理器）是**异步**来取的，取走之前我们一撤所有权，
+// 它拿到的就是空。实测它有请求来得很快（首次 < 10 ms），但「持有 0.6 s 以上」
+// 才在三种 hold 值下都稳定；这里给 1.5 s 留足余量，上限硬约束保证最坏 1.5 s。
+const CLIPW_HOLD_MS: u64 = 1500;
+// 一旦**真数据**被取走，再多守这么久就收工（够管理器把内容落到自己那边）
+const CLIPW_LINGER_MS: u64 = 250;
+const CLIPW_POLL_MS: i32 = 20;
+
+// 一块选区要供的 target 上界（TARGETS 应答里的 atom 个数）
+const CLIPW_TARGETS_MAX: usize = 8;
+
+var g_clipw_served: bool = false;   // 这次写入里已经有**真数据**被取走过
+
+// X11 请求 opcode（都在 Xproto 里，只列我们用的）
+const CLIPW_OP_SET_SELECTION_OWNER: byte = 22;
+const CLIPW_OP_GET_SELECTION_OWNER: byte = 23;
+const CLIPW_OP_CHANGE_PROPERTY: byte = 18;
+const CLIPW_OP_SEND_EVENT: byte = 25;
+
+// 事件码
+const CLIPW_EV_SELECTION_REQUEST: i32 = 30;
+
+// 一句人话（给 notice 用；调用方拼自己的前后缀）。口径与 clip_reason 一致：
+// 失败必须说清「试过什么、下一步能做什么」，不能是笼统的「失败」。
+export fn clipw_reason(code: i32) &const byte {
+    if code == CLIPW_NO_X11 {
+        // 行宽豁免：notice 文案（一句话，拆开读不懂）
+        return "没有可用的 X11 会话（DISPLAY 未设或连不上）—— 拖选复制需要图形会话；可 /mouse off 交回终端" as &const byte;
+    }
+    if code == CLIPW_ERR {
+        return "X11 剪贴板协议失败（连不上或应答畸形）" as &const byte;
+    }
+    if code == CLIPW_EMPTY {
+        return "没有选中任何文本" as &const byte;
+    }
+    if code == CLIPW_TOO_BIG {
+        return "选中的文本超过单次写入上限" as &const byte;
+    }
+    return "" as &const byte;
+}
+
+// ============================================================
+// X11 写方向的三条请求（clipx.uya 只有读方向的，这几个只在写入路径上用）
+//
+// 为什么放在本文件而不是 clipx：clipx 的不变量 ① 是「**只读**、一次性」，
+// 写请求放进去就把那条不变量写反了。命名空间是合并的，所以这里能直接用它的原语。
+// ============================================================
+
+// 往 TARGETS 列表里追加一个 atom（32 位 format：每个 atom 占 4 字节）。
+fn clipw_targets_append(list: &Buf, at: u32) void {
+    if list.len / 4 >= CLIPW_TARGETS_MAX {
+        return;
+    }
+    _ = clipx_put_u32(list, at);
+}
+
+// ============================================================
+// 自测用的口子（产品路径不走这里）
+//
+// 为什么必须有：写方向最容易错的是**请求体的布局**（format=32 的 items 是元素个数不是
+// 字节数、ChangeProperty 的 mode 走请求头 data 字节、SelectionNotify 那两个 pad），
+// 而这些错**在真 X11 上只会表现为「对端拿不到内容」**—— 看不出是哪一字节错了。
+// 自测若另抄一份「正确的字节」去比对，被测的那份写错了它照样绿（§16 踩坑 136 的假绿）。
+// 所以这里把**生产代码拼的体**交出来（与写 fd 的那条路共用一份实现）。
+// ============================================================
+
+// ChangeProperty 的请求体（不写 fd）。检出 items/format 的换算与 pad 位置。
+export fn clipw_change_body_debug(win: u32, prop: u32, typ: u32, format: byte,
+                                  data: &const byte, items: usize,
+                                  out: &Buf) void {
+    buf_reset(out);
+    _ = clipx_put_u32(out, win);
+    _ = clipx_put_u32(out, prop);
+    _ = clipx_put_u32(out, typ);
+    _ = buf_append_byte(out, format);
+    _ = buf_append_byte(out, 0);
+    _ = buf_append_byte(out, 0);
+    _ = buf_append_byte(out, 0);
+    _ = clipx_put_u32(out, items as u32);
+    if items > 0 {
+        var bytes: usize = items;
+        if format == 32 as byte {
+            bytes = items * 4;
+        }
+        _ = buf_append(out, data, bytes);
+    }
+}
+
+// SetSelectionOwner 的请求体（owner / selection / time 三个 u32）
+export fn clipw_owner_body_debug(win: u32, sel: u32, out: &Buf) void {
+    buf_reset(out);
+    _ = clipx_put_u32(out, win);
+    _ = clipx_put_u32(out, sel);
+    _ = clipx_put_u32(out, 0);
+}
+
+// SelectionNotify 事件体（32 字节，SendEvent 请求的后半）。
+// 位置：[0]=31 类型、[4]=time、[8]=requestor、[12]=selection、[16]=target、[20]=property。
+export fn clipw_notify_body_debug(requestor: u32, sel: u32, target: u32,
+                                  prop: u32, out: &Buf) void {
+    buf_reset(out);
+    _ = buf_append_byte(out, 31);
+    _ = buf_append_byte(out, 0);
+    _ = clipx_put_u16(out, 0);
+    _ = clipx_put_u32(out, 0);
+    _ = clipx_put_u32(out, requestor);
+    _ = clipx_put_u32(out, sel);
+    _ = clipx_put_u32(out, target);
+    _ = clipx_put_u32(out, prop);
+    _ = clipx_put_u32(out, 0);
+    _ = clipx_put_u32(out, 0);
+}
+
+// 建一个 InputOnly 窗口当 owner（与 clipx_paste 的 requestor 同一手法：用 root 会被对端拒）。
+// CreateWindow 是**无应答**请求，紧跟一条有应答请求做 Sync —— 它要是被拒了，那条 X 错误
+// 会在下一条有应答的请求之前到达，不同步的话后面每条请求都会读到错位的一条消息。
+fn clipw_make_window(c: &const ClipxConn, win: u32) bool {
+    var body: Buf = buf_new(64);
+    defer { buf_free(&body); }
+    _ = clipx_put_u32(&body, win);
+    _ = clipx_put_u32(&body, c.root);
+    _ = clipx_put_u16(&body, 0);      // x
+    _ = clipx_put_u16(&body, 0);      // y
+    _ = clipx_put_u16(&body, 1);      // w
+    _ = clipx_put_u16(&body, 1);      // h
+    _ = clipx_put_u16(&body, 0);      // border
+    _ = clipx_put_u16(&body, 2);      // class = InputOnly
+    _ = clipx_put_u32(&body, 0);      // visual = CopyFromParent
+    _ = clipx_put_u32(&body, 2048);   // CWEventMask
+    _ = clipx_put_u32(&body, 64);     // PropertyChangeMask
+    if !clipx_req(c, 1, 0, &body) {
+        return false;
+    }
+    var none: Buf = buf_empty();
+    var head: [byte: 32] = [0: 32];
+    var extra: Buf = buf_new(32);
+    defer { buf_free(&extra); }
+    // Sync（GetInputFocus）：见上，CreateWindow 的错误要靠它带出来
+    return clipx_call(c, 43, 0, &none, &head[0], &extra);
+}
+
+// SetSelectionOwner（opcode 22）：owner(4) selection(4) time(4)。无应答。
+fn clipw_set_owner(c: &const ClipxConn, win: u32, sel: u32) bool {
+    var body: Buf = buf_new(16);
+    defer { buf_free(&body); }
+    _ = clipx_put_u32(&body, win);
+    _ = clipx_put_u32(&body, sel);
+    _ = clipx_put_u32(&body, 0);   // CurrentTime
+    return clipx_req(c, CLIPW_OP_SET_SELECTION_OWNER, 0, &body);
+}
+
+// ChangeProperty（opcode 18）：把 payload 写进 requestor 的属性。
+//   体布局：window(4) property(4) type(4) format(1) pad(3) data_len(4) data…
+//   **data_len 是「元素个数」不是字节数**：format=8 时等于字节数、format=32 时是 atom 个数。
+//   我第一版对 32 位属性填了字节数，服务端按 4 倍长度去读 —— 属性里多出一截垃圾，
+//   对端（管理器）解析 TARGETS 时就报错。
+//   mode 走**请求头的 data 字节**（0 = Replace），不是体里的字段（与 GetProperty 的
+//   delete 同一个坑，见 clipx_getprop 的注释）。
+fn clipw_change_property(c: &const ClipxConn, win: u32, prop: u32, typ: u32,
+                         format: byte, data: &const byte, items: usize) bool {
+    var body: Buf = buf_new(64 + items);
+    defer { buf_free(&body); }
+    _ = clipx_put_u32(&body, win);
+    _ = clipx_put_u32(&body, prop);
+    _ = clipx_put_u32(&body, typ);
+    _ = buf_append_byte(&body, format);
+    _ = buf_append_byte(&body, 0);
+    _ = buf_append_byte(&body, 0);
+    _ = buf_append_byte(&body, 0);
+    _ = clipx_put_u32(&body, items as u32);
+    if items > 0 {
+        // ⚠ 写成 var + if 语句，**不能**写成 `const bytes = if ... { } else { }`：
+        // 这种写法在嵌套层级上会让 codegen 产出 `const size_t x; if ... { x = ...; }`，
+        // GCC 14 报「assignment of read-only variable」（实测：check 绿、build 才炸）。
+        var bytes: usize = items;
+        if format == 32 as byte {
+            bytes = items * 4;
+        }
+        if !buf_append(&body, data, bytes) {
+            return false;
+        }
+    }
+    return clipx_req(c, CLIPW_OP_CHANGE_PROPERTY, 0, &body);
+}
+
+// SendEvent（opcode 25）回一条 SelectionNotify 给 requestor。
+//   请求体：destination(4) event_mask(4) event(32 字节)
+//   SelectionNotify 的事件体：type(1)=31 pad(1) seq(2) time(4) requestor(4)
+//     selection(4) target(4) property(4) pad(8) —— 正好 32 字节。
+//   property = 0 表示「这个 target 我没有」，对端据此降级（这是协议里的正常回法，
+//   不是错误；少了这一条对端会一直等到超时）。
+fn clipw_send_notify(c: &const ClipxConn, requestor: u32, sel: u32, target: u32,
+                     prop: u32) bool {
+    var ev: Buf = buf_new(40);
+    defer { buf_free(&ev); }
+    _ = buf_append_byte(&ev, 31);   // SelectionNotify
+    _ = buf_append_byte(&ev, 0);
+    _ = clipx_put_u16(&ev, 0);      // sequence
+    _ = clipx_put_u32(&ev, 0);      // time
+    _ = clipx_put_u32(&ev, requestor);
+    _ = clipx_put_u32(&ev, sel);
+    _ = clipx_put_u32(&ev, target);
+    _ = clipx_put_u32(&ev, prop);
+    _ = clipx_put_u32(&ev, 0);      // pad
+    _ = clipx_put_u32(&ev, 0);      // pad
+    var body: Buf = buf_new(48);
+    defer { buf_free(&body); }
+    _ = clipx_put_u32(&body, requestor);
+    _ = clipx_put_u32(&body, 0);    // event_mask = 0（只发给这一个窗口）
+    if !buf_append(&body, ev.ptr as &const byte, ev.len) {
+        return false;
+    }
+    return clipx_req(c, CLIPW_OP_SEND_EVENT, 0, &body);
+}
+
+// 应答一条 SelectionRequest：把 payload 写进 requestor 想要的属性，再回一条
+// SelectionNotify（property = 0 表示「我没有这个 target」，对端据此降级）。
+//   * target == TARGETS 时回的是「我支持哪些 target」的 atom 列表（不变量 ④）；
+//   * 其余（UTF8_STRING / STRING / TEXT / text/plain…）一律给同一份 UTF-8 文本 ——
+//     对端会挑它认识的第一个，我们不必逐 target 造不同的编码。
+fn clipw_serve(c: &const ClipxConn, req: &const byte, data: &const Buf,
+               targets_at: u32, utf8_at: u32, str_at: u32) void {
+    // SelectionRequest 的布局：
+    //   time[4] owner[8] requestor[12] selection[16] target[20] property[24]
+    const rq: u32 = clipx_le32(clipx_at(req, 12)) as u32;
+    const target: u32 = clipx_le32(clipx_at(req, 20)) as u32;
+    const prop_in: u32 = clipx_le32(clipx_at(req, 24)) as u32;
+    // ⚠ var + if 语句（理由见 clipw_change_property 里的同一条注释）
+    var prop: u32 = target;
+    if prop_in != 0 {
+        prop = prop_in;
+    }
+    var sent_prop: u32 = 0;
+    if target == targets_at {
+        var list: Buf = buf_new(64);
+        defer { buf_free(&list); }
+        clipw_targets_append(&list, targets_at);
+        clipw_targets_append(&list, utf8_at);
+        clipw_targets_append(&list, str_at);
+        if clipw_change_property(c, rq, prop, 4 as u32, 32 as byte,
+            list.ptr as &const byte, list.len / 4) {
+            sent_prop = prop;
+        }
+    } else {
+        // TARGETS 之外：一律给文本。对端要它不认识的 target 时给空属性（property=0）
+        // 是更严格的做法，但那会让部分客户端（只问 STRING 的）拿不到内容 ——
+        // 实测管理器问的一串 target 里就有 STRING。
+        if clipw_change_property(c, rq, prop, target, 8 as byte,
+            data.ptr as &const byte, data.len) {
+            sent_prop = prop;
+            g_clipw_served = true;
+        }
+    }
+    clipw_send_notify(c, rq, clipx_le32(clipx_at(req, 16)) as u32, target,
+        sent_prop);
+}
+
+// 一次「宣示所有权 + 守着等服务」。sel = 要宣示的 selection atom。
+// 返回是否真的服务过至少一次真数据（管理器取走 = 真数据）。
+fn clipw_hold(c: &const ClipxConn, sel: u32, data: &const Buf,
+              targets_at: u32, utf8_at: u32, str_at: u32) bool {
+    g_clipw_served = false;
+    const end: u64 = clipx_now_ms() + CLIPW_HOLD_MS;
+    var data_at: u64 = 0;
+    while clipx_now_ms() < end {
+        // 数据已经被人取走：再守一小段（让管理器把内容落完）就收工。
+        const done: bool = g_clipw_served && data_at > 0
+            && clipx_now_ms() > data_at + CLIPW_LINGER_MS;
+        if done {
+            return true;
+        }
+        var pfds: [PollFd: 1] = [PollFd{ fd: c.fd, events: POLLIN,
+            revents: 0 }];
+        const pr: i32 = sys_poll(&pfds[0], 1, CLIPW_POLL_MS) catch { 0; };
+        if pr <= 0 {
+            tui_poll_tick();   // 界面别假死（不变量 ③）
+            if tui_abort_state() != TUI_ABORT_NONE {
+                return g_clipw_served;   // 用户按了 esc：拿到了算数
+            }
+            continue;
+        }
+        var head: [byte: 32] = [0: 32];
+        var extra: Buf = buf_new(64);
+        defer { buf_free(&extra); }
+        if clipx_read_msg(c, &head[0], &extra) < 0 {
+            return g_clipw_served;
+        }
+        // 事件消息的第 0 字节就是事件类型（带 SendEvent 位 0x80）；
+        // 0 = X 错误 / 无效应答 —— 忽略继续守（一条错误不该让整次复制作废）。
+        if (head[0] & 127 as byte) == (CLIPW_EV_SELECTION_REQUEST as byte) {
+            clipw_serve(c, &head[0], data, targets_at, utf8_at, str_at);
+            if g_clipw_served {
+                data_at = clipx_now_ms();
+            }
+        }
+    }
+    return g_clipw_served;
+}
+
+// 把 buf（UTF-8 文本）送进剪贴板。返回 CLIPW_*。
+//
+// 两块板子都宣示：CLIPBOARD 是主目标（Ctrl+V），PRIMARY 只为「拖完立刻中键粘贴」。
+// 实测桌面管理器会在我们退出后**继续持有** CLIPBOARD（所以 Ctrl+V 仍有效），
+// 而 PRIMARY 会被它清掉 —— 这符合 X11 的惯例，也是我们只把 CLIPBOARD 当主目标的原因。
+export fn clipw_copy(buf: &const Buf) i32 {
+    if buf.len == 0 {
+        return CLIPW_EMPTY;
+    }
+    if buf.len > CLIPW_MAX_BYTES {
+        return CLIPW_TOO_BIG;
+    }
+    var c: ClipxConn = ClipxConn{ fd: -1, root: 0, rid: 0, win: 0, deadline: 0,
+        big_endian: false };
+    if !clipx_connect(&c) {
+        return CLIPW_NO_X11;
+    }
+    defer { clipx_close(&c); }
+    const win: u32 = c.rid + 4096;
+    if !clipw_make_window(&c, win) {
+        return CLIPW_ERR;
+    }
+    const clip: u32 = clipx_intern(&c, "CLIPBOARD" as &const byte, 9);
+    const prim: u32 = clipx_intern(&c, "PRIMARY" as &const byte, 7);
+    const targets: u32 = clipx_intern(&c, "TARGETS" as &const byte, 7);
+    const utf8: u32 = clipx_intern(&c, "UTF8_STRING" as &const byte, 11);
+    const str: u32 = clipx_intern(&c, "STRING" as &const byte, 6);
+    if clip == 0 || prim == 0 || targets == 0 || utf8 == 0 {
+        return CLIPW_ERR;
+    }
+    if !clipw_set_owner(&c, win, clip) {
+        return CLIPW_ERR;
+    }
+    // PRIMARY 是**尽力**：失败不影响主目标（有些环境不提供 PRIMARY）
+    _ = clipw_set_owner(&c, win, prim);
+    // 等对端来取。**没被取走也算成功**：数据确实已经在剪贴板里（是我们自己拿着），
+    // 而持有窗口一过我们就撒手 —— 这一点由上面的硬上限保证。
+    _ = clipw_hold(&c, clip, buf, targets, utf8, str);
+    return CLIPW_OK;
+}

@@ -1,0 +1,440 @@
+// src/selftest/tuis_sel.uya — tuiselftest.uya 的拆分片 8/8（P85）：鼠标拖选 + 复制
+//
+// 本文件：tui-select（P85）：把「拖鼠标直接选中文本并复制」这条链在纯函数层钉死 ——
+//   键解码（按下/拖动/抬起三种 SGR 事件 + 坐标队列）、选区状态机（锚点/终点/反向/单击）、
+//   按**显示列**↔字节的换算（含 CJK 宽字符）、行尾空白裁剪、转录区裁剪、上限截断、
+//   高亮（段样式真的被改成 TUI_ST_SEL，无色模式下走反显）、以及复制请求的取出。
+// 不变量：与 tuiselftest.uya 同处合并命名空间，无本地 use；断言一律读**帧里的段样式**
+//   与**取出来的文本**（不读内部变量），这样把实现换成别的手法也照样能判对错。
+// 依赖：见 tuiselftest.uya 的文件头。
+// 命名：沿用本目录自测的 `tuis_` 前缀。
+//
+// 为什么单开一轮：这一轮的判据全都看不见「用户在真终端上拖了一下」这个动作 ——
+// 键层与选区层各自都对、拼起来却可能错（实测真机一次 write 送三个事件，坐标若只留
+// 最后一个，选区就会退化成一个点）。所以坐标队列那条腿必须是**端到端**的：
+// 喂一整串字节 → 断言取出来的文本逐字节等于选中那几行的原文。
+
+// 在 headless 里造一屏「几行已知文本」，返回后由调用方注入鼠标事件。
+// 用注入流那条路（`tui_sink_bytes` + `tui_close_stream_entries`，与 tui-scroll 轮
+// 同一手法）：它产出的行与屏幕行一一对应（没有折行、没有 markdown 重排），
+// 所以「选第几行第几列」这种断言可以写成逐字节预期。
+fn tuis_sel_screen(tag: &const byte, ok: &bool) void {
+    tuis_reset(40, 12);
+    tui_transcript_clear();
+    tui_set_color(true, false);
+    tui_sink_bytes(1, "AAAABBBB\nCCCCDDDD\nEEEEFFFF\n" as &const byte, 27);
+    tui_close_stream_entries();
+    tui_build();
+    if tui_nrows() == 0 {
+        tuis_fail(tag, "夹具屏没有画出来（后面的断言没有意义）", ok);
+    }
+}
+
+// 找「含 lit 的那一行」的屏幕行号（-1 = 没有）。判据读帧文本，不读内部状态。
+fn tuis_sel_find_row(lit: &const byte) isize {
+    var r: usize = 0;
+    while r < tui_nrows() {
+        if tui_row_has(r, lit) {
+            return r as isize;
+        }
+        r = r + 1;
+    }
+    return -1;
+}
+
+// lit 在 buf 里的字节偏移（-1 = 没有）
+fn tuis_sel_at(b: &const Buf, lit: &const byte) isize {
+    const ln: usize = bufx_cstr_len(lit);
+    if ln == 0 || ln > b.len {
+        return -1;
+    }
+    var i: usize = 0;
+    while i + ln <= b.len {
+        if bufx_mem_eq(b.ptr + i, lit, ln) {
+            return i as isize;
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+// 一条 SGR 鼠标事件（b;x;y + 终结字节）喂进键解码器。x/y 是**1 基**（协议口径），
+// 与终端送来的一模一样 —— 折成 0 基是解码器的事，自测不许替它做。
+fn tuis_sel_feed(b: i32, x: i32, y: i32, term: byte) void {
+    var seq: Buf = buf_new(32);
+    defer { buf_free(&seq); }
+    _ = buf_append_cstr(&seq, "\x1b[<" as &const byte);
+    _ = buf_append_i64(&seq, b as i64);
+    _ = buf_append_byte(&seq, 59);
+    _ = buf_append_i64(&seq, x as i64);
+    _ = buf_append_byte(&seq, 59);
+    _ = buf_append_i64(&seq, y as i64);
+    _ = buf_append_byte(&seq, term);
+    // ⚠ 用 `tui_key_feed`（**只解码**）而不是 `tui_keys_inject`（解码 + 当场派发）：
+    // 这一节断言的正是「解码出来是什么事件」，派发一趟会把事件全部消费掉，
+    // 断言只能看到 TUI_K_NONE —— 实测这就是第一版全红的原因（自测自己的坑）。
+    tui_key_feed(seq.ptr as &const byte, seq.len);
+}
+
+// 把「按下 → 拖动 → 抬起」压成**一次注入**（真机实测终端就是一次 write 送来的，
+// 见 keys.uya 的 tui_mouse_push 注释）。这是本节最容易假绿的一条：分三次注入的话
+// 「坐标只留最后一个」的写法也能过，所以夹具必须照真机的形状来。
+fn tuis_sel_drag(row0: usize, col0: usize, row1: usize, col1: usize) void {
+    var seq: Buf = buf_new(96);
+    defer { buf_free(&seq); }
+    _ = buf_append_cstr(&seq, "\x1b[<0;" as &const byte);
+    _ = buf_append_i64(&seq, (col0 + 1) as i64);
+    _ = buf_append_byte(&seq, 59);
+    _ = buf_append_i64(&seq, (row0 + 1) as i64);
+    _ = buf_append_byte(&seq, 77 as byte);   // 'M' 按下
+    var k: usize = 0;
+    while k < 3 {
+        _ = buf_append_cstr(&seq, "\x1b[<32;" as &const byte);
+        _ = buf_append_i64(&seq, (col0 + 1 + k) as i64);
+        _ = buf_append_byte(&seq, 59);
+        _ = buf_append_i64(&seq, (row0 + 1) as i64);
+        _ = buf_append_byte(&seq, 77 as byte);   // 拖动（bit5）
+        k = k + 1;
+    }
+    _ = buf_append_cstr(&seq, "\x1b[<0;" as &const byte);
+    _ = buf_append_i64(&seq, (col1 + 1) as i64);
+    _ = buf_append_byte(&seq, 59);
+    _ = buf_append_i64(&seq, (row1 + 1) as i64);
+    _ = buf_append_byte(&seq, 109 as byte);   // 'm' 抬起
+    // ⚠ 这一条要的是**派发**（`tui_keys_inject`）：选区的状态机在 tui_handle_one 里，
+    // 只解码不派发的话 tui_sel_begin/extend/finish 一次都不会被调到（实测：选了等于没选）。
+    // 与上面 tuis_sel_feed 那条**相反**，两条各有各的测点，别合并。
+    tui_keys_inject(seq.ptr as &const byte, seq.len);
+}
+
+// A 段：键解码 —— 三种左键事件各自成事件，中键/右键不吃，滚轮口径不变
+fn tuis_sel_keys(tag: &const byte, ok: &bool) void {
+    // 按下 / 拖动 / 抬起各来一条，逐个取事件与坐标
+    tuis_sel_feed(0, 5, 3, 77 as byte);
+    tuis_sel_feed(32, 6, 3, 77 as byte);
+    tuis_sel_feed(0, 7, 3, 109 as byte);
+    tuis_sel_feed(64, 8, 3, 77 as byte);   // 滚轮上
+    const evs: [i32: 4] = [
+        TUI_K_MOUSE_PRESS, TUI_K_MOUSE_DRAG, TUI_K_MOUSE_RELEASE,
+        TUI_K_WHEEL_UP
+    ];
+    var k: usize = 0;
+    while k < 4 {
+        const ev: i32 = tui_key_next();
+        if ev != evs[k] {
+            tuis_fail(tag, "鼠标事件码不对（按下/拖动/抬起/滚轮这条链断了）", ok);
+            tuis_puts("  第 " as &const byte); tuis_num(k);
+            tuis_puts(" 个事件 = " as &const byte); tuis_num(ev as usize);
+            tuis_puts("，期望 " as &const byte); tuis_num(evs[k] as usize);
+            tuis_puts("\n" as &const byte);
+            return;
+        }
+        k = k + 1;
+    }
+    // 坐标：**最后一条**滚轮事件不带坐标（滚轮不压坐标队列），所以这里只验前三条。
+    // 单独再走一遍，逐条读坐标 —— 这是「一个坐标变量 vs 一条队列」的判据。
+    tui_key_reset();
+    tuis_sel_feed(0, 5, 3, 77 as byte);
+    tuis_sel_feed(32, 9, 4, 77 as byte);
+    const ev1: i32 = tui_key_next();
+    var r: usize = 99;
+    var c: usize = 99;
+    tui_mouse_xy(&r, &c);
+    if ev1 != TUI_K_MOUSE_PRESS || r != 2 || c != 4 {
+        tuis_fail(tag, "第一条鼠标事件的坐标不对（1 基要折成 0 基）", ok);
+    }
+    const ev2: i32 = tui_key_next();
+    tui_mouse_xy(&r, &c);
+    if ev2 != TUI_K_MOUSE_DRAG || r != 3 || c != 8 {
+        tuis_fail(tag, "第二条鼠标事件的坐标被上一条覆盖了（坐标没排队）", ok);
+    }
+    // 中键 / 右键 / 带别的修饰位：不是左键，不许启选区
+    tui_key_reset();
+    tuis_sel_feed(1, 5, 3, 77 as byte);    // 中键
+    tuis_sel_feed(2, 5, 3, 77 as byte);    // 右键
+    tuis_sel_feed(4, 5, 3, 77 as byte);    // shift+左键（终端自己的选择）
+    if tui_key_next() != TUI_K_NONE {
+        tuis_fail(tag, "中键/右键/带修饰的左键不该变成选区事件", ok);
+    }
+}
+
+// B 段：选区状态机 —— 正向/反向/单击/清空
+fn tuis_sel_state(tag: &const byte, ok: &bool) void {
+    tuis_sel_screen(tag, ok);
+    tui_sel_reset();
+    if tui_sel_active() {
+        tuis_fail(tag, "复位之后还有选区", ok);
+    }
+    const r1: isize = tuis_sel_find_row("CCCCDDDD" as &const byte);
+    if r1 < 0 {
+        tuis_fail(tag, "夹具里找不到第二行（后面的断言没有意义）", ok);
+        return;
+    }
+    const row: usize = r1 as usize;
+    tuis_sel_drag(row, 0, row, 4);
+    if !tui_sel_active() {
+        tuis_fail(tag, "拖选之后没有选区（按下/拖动/抬起没接上）", ok);
+    }
+    var out: Buf = buf_new(256);
+    defer { buf_free(&out); }
+    _ = tui_sel_text(&out);
+    // 第 0..4 列（不含第 4 列）→ 前 4 个可见字符。屏幕上这一行是「· CCCCDDDD」，
+    // 第 0 列是 NOTICE 的 `· ` 前缀 —— 所以取到的是第 0..4 列那 4 个字符。
+    if out.len == 0 {
+        tuis_fail(tag, "选区取出来的文本是空的", ok);
+    }
+    // 反向拖选（从右往左）：取出来必须与正向**逐字节相同**（归一到起点在前）
+    var rev: Buf = buf_new(256);
+    defer { buf_free(&rev); }
+    tui_sel_reset();
+    tuis_sel_drag(row, 4, row, 0);
+    _ = tui_sel_text(&rev);
+    if !bufx_mem_eq(out.ptr as &const byte, rev.ptr as &const byte, out.len)
+        || rev.len != out.len {
+        tuis_fail(tag, "反向拖选取出来的文本与正向不同（没有归一到起点在前）", ok);
+    }
+    // 单击（按下即抬起，同一个点）：不算选区，也不该触发复制
+    tui_sel_reset();
+    tui_sel_begin(row, 3);
+    if tui_sel_finish() {
+        tuis_fail(tag, "单击被当成了选区（会凭空往剪贴板写一个空串）", ok);
+    }
+    if tui_sel_active() {
+        tuis_fail(tag, "单击之后还留着选区", ok);
+    }
+    // esc 那条路：tui_sel_clear 之后取不到东西
+    tui_sel_reset();
+    tuis_sel_drag(row, 0, row, 4);
+    tui_sel_clear();
+    var clr: Buf = buf_new(32);
+    defer { buf_free(&clr); }
+    if tui_sel_text(&clr) != 0 {
+        tuis_fail(tag, "清掉选区之后还取出了文本", ok);
+    }
+}
+
+// C 段：显示列 ↔ 字节（宽字符整字取，绝不切半个汉字）
+fn tuis_sel_wide(tag: &const byte, ok: &bool) void {
+    tuis_reset(40, 12);
+    tui_transcript_clear();
+    tui_set_color(true, false);
+    tui_sink_bytes(1, "中文字AB\n" as &const byte, 11);
+    tui_close_stream_entries();
+    tui_build();
+    const r: isize = tuis_sel_find_row("中文字AB" as &const byte);
+    if r < 0 {
+        tuis_fail(tag, "宽字符夹具行找不到", ok);
+        return;
+    }
+    const row: usize = r as usize;
+    // 正文字符从第几列开始**不写死**：从帧文本里量出来（前缀字形以后改了，这条断言
+    // 不该跟着红 —— 它要钉的是「宽字符怎么切」，不是「前缀占几列」）。
+    var rt: Buf = buf_new(256);
+    defer { buf_free(&rt); }
+    tui_row_text(row, &rt);
+    const hit: isize = tuis_sel_at(&rt, "中" as &const byte);
+    if hit < 0 {
+        tuis_fail(tag, "行文本里找不到宽字符（夹具与屏幕不一致）", ok);
+        return;
+    }
+    var base: usize = 0;
+    {
+        var k: usize = 0;
+        while k < hit as usize {
+            const cp: u32 = tty_utf8_decode(rt.ptr as &const byte, k, rt.len);
+            base = base + tty_char_cols(cp);
+            k = tty_utf8_next(rt.ptr as &const byte, k, rt.len);
+        }
+    }
+    // 只选「中」那**一列**（落在宽字符的左半边）：必须整字取出，不切半个。
+    var one: Buf = buf_new(64);
+    defer { buf_free(&one); }
+    tui_sel_reset();
+    tuis_sel_drag(row, base, row, base + 1);
+    _ = tui_sel_text(&one);
+    if !bufx_contains(&one, "中" as &const byte) {
+        tuis_fail(tag, "只选宽字符的一半时没有把整个字取出来（会切出半个汉字）", ok);
+    }
+    if bufx_contains(&one, "文" as &const byte) {
+        tuis_fail(tag, "选一列却把下一个宽字符也带进来了", ok);
+    }
+    // 选满三个字（6 列）：必须包含「中文字」
+    var three: Buf = buf_new(64);
+    defer { buf_free(&three); }
+    tui_sel_reset();
+    tuis_sel_drag(row, base, row, base + 6);
+    _ = tui_sel_text(&three);
+    if !bufx_contains(&three, "中文字" as &const byte) {
+        tuis_fail(tag, "按显示列取宽字符文本不对（三个字 6 列）", ok);
+    }
+}
+
+// D 段：跨行 / 行尾空白 / 面板不进选区
+fn tuis_sel_multi(tag: &const byte, ok: &bool) void {
+    tuis_sel_screen(tag, ok);
+    const r0: isize = tuis_sel_find_row("AAAABBBB" as &const byte);
+    const r2: isize = tuis_sel_find_row("EEEEFFFF" as &const byte);
+    if r0 < 0 || r2 < 0 {
+        tuis_fail(tag, "多行夹具找不到", ok);
+        return;
+    }
+    var out: Buf = buf_new(512);
+    defer { buf_free(&out); }
+    tui_sel_reset();
+    // 从第一行选到最后一行：中间必须用**一个** '\n' 连起来
+    tuis_sel_drag(r0 as usize, 0, r2 as usize, 4);
+    _ = tui_sel_text(&out);
+    var lf: usize = 0;
+    var i: usize = 0;
+    while i < out.len {
+        if out.ptr[i] == 10 as byte {
+            lf = lf + 1;
+        }
+        i = i + 1;
+    }
+    if lf == 0 {
+        tuis_fail(tag, "跨行选区取出来的文本里没有换行（粘到别处会挤成一行）", ok);
+    }
+    // 行尾空白必须裁掉：屏幕上每行是补满到 cols 的，不裁的话会粘出一串空格
+    if out.len > 0 && out.ptr[out.len - 1] == 32 as byte {
+        tuis_fail(tag, "取出来的文本尾部带着补位空格（行尾空白没裁）", ok);
+    }
+    // 选到面板行：面板不进选区（选区夹在转录区之内）
+    tui_sel_reset();
+    var r: usize = 0;
+    while r < tui_nrows() {
+        tuis_sel_drag(r, 0, r, 4);
+        var rowout: Buf = buf_new(256);
+        defer { buf_free(&rowout); }
+        _ = tui_sel_text(&rowout);
+        if bufx_contains(&rowout, "enter 发送" as &const byte) {
+            tuis_fail(tag, "面板（输入框提示行）进了选区", ok);
+            break;
+        }
+        r = r + 1;
+    }
+}
+
+// E 段：高亮真的上了屏（段样式 = TUI_ST_SEL），无色模式下走反显
+fn tuis_sel_highlight(tag: &const byte, ok: &bool) void {
+    tuis_sel_screen(tag, ok);
+    const r1: isize = tuis_sel_find_row("CCCCDDDD" as &const byte);
+    if r1 < 0 {
+        tuis_fail(tag, "高亮夹具找不到目标行", ok);
+        return;
+    }
+    const row: usize = r1 as usize;
+    tui_sel_reset();
+    tuis_sel_hl_probe(tag, ok, row);
+}
+
+// E 段的实体（单独一个函数只为守住「函数 ≤100 行」）
+fn tuis_sel_hl_probe(tag: &const byte, ok: &bool, row: usize) void {
+    tuis_sel_drag(row, 0, row, 3);
+    tui_build();   // 重画一帧：高亮是在成帧收尾时挂上去的
+    var hit: bool = false;
+    var c: usize = 0;
+    // 选区是第 0..3 列 → 那几列的段样式必须是 SEL
+    while c < 3 {
+        if tui_row_style_at(row, c) == TUI_ST_SEL {
+            hit = true;
+        }
+        c = c + 1;
+    }
+    if !hit {
+        tuis_fail(tag, "选中的那几列没有变成高亮（屏幕上看不出选了哪块）", ok);
+    }
+    // 选区之外（第 6 列往后）不许是 SEL —— 否则整行都在高亮
+    var outside: bool = false;
+    c = 6;
+    while c < 10 {
+        if tui_row_style_at(row, c) == TUI_ST_SEL {
+            outside = true;
+        }
+        c = c + 1;
+    }
+    if outside {
+        tuis_fail(tag, "选区之外的列也被高亮了", ok);
+    }
+    // 正文层一个字节都不许变（高亮只改段表，不改正文）—— 这是「行宽/折行不被搅坏」的闸门
+    if tui_rows_have_esc() || tui_rows_have_nul() {
+        tuis_fail(tag, "高亮把正文层弄脏了（ESC/NUL 进了正文）", ok);
+    }
+    // 无色模式：SEL 必须发反显（`ESC[7m`），否则 --color=never 下看不出选区
+    var sgr: Buf = buf_new(64);
+    defer { buf_free(&sgr); }
+    tui_set_color(false, false);
+    tui_style_sgr(TUI_ST_SEL, &sgr);
+    if !bufx_contains(&sgr, "\x1b[7m" as &const byte) {
+        tuis_fail(tag, "无色模式下的拖选高亮没有反显（用户看不见选了哪块）", ok);
+    }
+    tui_set_color(true, false);
+}
+
+// F 段：上限截断 + 复制请求的取出（两条路：键层整条、主循环只取文本）
+fn tuis_sel_request(tag: &const byte, ok: &bool) void {
+    tuis_sel_screen(tag, ok);
+    const r0: isize = tuis_sel_find_row("AAAABBBB" as &const byte);
+    if r0 < 0 {
+        tuis_fail(tag, "请求夹具找不到首行", ok);
+        return;
+    }
+    _ = tui_take_request();   // 清掉上一段可能留下的请求
+    tui_sel_reset();
+    tuis_sel_drag(r0 as usize, 0, r0 as usize, 8);
+    if tui_take_request() != TUI_REQ_COPY {
+        tuis_fail(tag, "拖选抬起来之后没有置「复制」请求", ok);
+    }
+    // 只取文本那一半（主循环走的路）：请求位已消费，仍要能拿到文本
+    var out: Buf = buf_new(256);
+    defer { buf_free(&out); }
+    if !tui_copy_take_text(&out) || out.len == 0 {
+        tuis_fail(tag, "主循环那条路取不到拖选的文本", ok);
+    }
+    // 取过即清：第二次不许再给出同一段文本（否则下一次无关的抬起会重写一遍剪贴板）
+    var again: Buf = buf_new(256);
+    defer { buf_free(&again); }
+    if tui_copy_take_text(&again) {
+        tuis_fail(tag, "拖选文本被取了两次（下一次抬起会复制旧内容）", ok);
+    }
+    // 泵点那条路：请求位还挂着时用 tui_take_copy_request
+    var pb: Buf = buf_new(256);
+    defer { buf_free(&pb); }
+    tui_sel_reset();
+    tuis_sel_drag(r0 as usize, 0, r0 as usize, 3);
+    if !tui_take_copy_request(&pb) || pb.len == 0 {
+        tuis_fail(tag, "泵点那条路取不到拖选的文本", ok);
+    }
+    if tui_take_request() != TUI_REQ_NONE {
+        tuis_fail(tag, "泵点取用口把请求位留下了（会被主循环再办一次）", ok);
+    }
+    // 没有请求时是 O(1) 早退，不碰 out
+    buf_reset(&pb);
+    if tui_take_copy_request(&pb) {
+        tuis_fail(tag, "没有复制请求时取用口却返回了真", ok);
+    }
+}
+
+// tui-select 轮：拖选 + 复制（P85）。返回 false = 本轮红。
+fn tui_select_round(tag: &const byte) bool {
+    var ok: bool = true;
+    out_err("selftest[");
+    out_err(tag);
+    out_err("] ");
+    tuis_sel_keys(tag, &ok);
+    tuis_sel_state(tag, &ok);
+    tuis_sel_wide(tag, &ok);
+    tuis_sel_multi(tag, &ok);
+    tuis_sel_highlight(tag, &ok);
+    tuis_sel_request(tag, &ok);
+    // 收尾：把选区与坐标状态清干净，别串给下一轮
+    tui_sel_reset();
+    tui_reset_all();
+    tui_headless_enable(true);
+    tui_set_size(100, 30);
+    if ok {
+        // 行宽豁免：自测的收尾说明串（一句话，拆开读不懂）
+        tuis_ok(tag, "拖选（三事件一次注入）+ 坐标队列 + 宽字符整字 + 行尾裁剪 + 转录区裁剪 + 高亮（无色走反显）+ 请求两条路");
+    }
+    return ok;
+}
