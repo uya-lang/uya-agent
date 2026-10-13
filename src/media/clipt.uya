@@ -1,0 +1,806 @@
+// src/media/clipt.uya — 剪贴板来源之一：**终端协议**（P83）：OSC 5522 客户端
+//
+// 本文件：把「用户眼前那块剪贴板」通过**终端模拟器本身**读回来。全流程 ——
+//   能力探测（`clipt_available`：DECRQM `CSI ? 5522 $ p` + 缓存的短超时）、发查询
+//   （`clipt_query`：`OSC 5522 ; type=read[:id=…] ; <base64(mime 列表)>`）、
+//   收帧（`clipt_recv`：借 term/oscin 从 fd 0 摘出终端应答）、解析
+//   （`clipt_parse_meta` / `clipt_take_frame`：status / mime / **逐块 base64**）、
+//   择优（`clipt_paste`）、失败成句（`clipt_reason`）。
+// 不变量：① **每个 DATA 分块单独 base64 解码再拼接** —— 规范要求每块自带 padding，
+//   把整串拼起来再解会当场坏（kitty 的块大小是编码前 4096 B）；② `id` 是**进程内递增**
+//   计数且只含 `[a-zA-Z0-9-_+.]`，不属于本次 id 的应答一律丢弃（上一轮超时后迟到的应答
+//   不许串到下一位）；③ 探测结果**按进程缓存，阴性也缓存** —— 否则每次粘贴都白等一个超时；
+//   ④ 写序列走**界面自己的 fd**（TUI = `tui_out_fd()`，滚动 = 2），**绝不走 `tty_write`**：
+//   TUI 激活时 `tty_sink_on = true`，走那条会把控制序列吞进转录（踩坑 39 同族）；
+//   ⑤ `isatty(0)` 为假 ⇒ 一个字节都不发（管道/一次性运行里不许有控制序列）；⑥ 等待期间
+//   读到的**透传**字节仍要送进键解码器 —— `esc` 照常取消，界面照常不假死。
+// 依赖：libc（syscall/unistd）、std.encoding.base64（**解码**，编码用 mime 的 8 位 ASCII
+//   自实现 —— 见 `clipt_b64_ascii`）、foundation/bufx、term/oscin（摘帧）、term/tty（写出
+//   序列）、term/tui/hook（泵点、输出 fd、取消状态）；本仓 media/imgx（结果交给附件管线）、
+//   media/clip（仲裁层）。
+// 命名：`clipt_*`、`CLIPT_*`（结果码与上限）。
+//
+// **为什么这是最重要的一路**（本轮的动机）：X11 客户端（media/clipx）读的是**跑着我们的
+// 那台机器**的剪贴板。SSH 到远端时，用户的截图在**自己笔记本**上，远端那块剪贴板是空的 ——
+// 于是「粘一张图给多模态模型」在 SSH 下永远失败。终端协议把请求发回**终端模拟器**，
+// 由它去读**本地**剪贴板，再把数据经同一条 tty 送回。这条路与本机/远端、X11/Wayland/macOS
+// 都无关，是唯一能穿过 SSH 的通道。
+//
+// 协议出处：kitty 的 OSC 5522（`sw.kovidgoyal.net/kitty/clipboard/`）；ghostty 也实现了
+// 同一条（`terminal/osc.zig` 的 `kitty_clipboard_protocol`）。线格式（逐字节）：
+//   查询  ESC ] 5 5 2 2 ; type=read[:id=<id>] ; <base64("image/png …")> BEL
+//   探测  ESC [ ? 5 5 2 2 $ p
+//   应答  ESC ] 5 5 2 2 ; type=read:status=OK[:id=<id>] BEL
+// ESC ] 5 5 2 2 ; type=read:status=DATA[:id=<id>]:mime=<base64> ; <base64 分块>
+//   BEL
+//         ESC ] 5 5 2 2 ; type=read:status=DONE[:id=<id>] BEL
+//         ESC ] 5 5 2 2 ; type=read:status=<ENOSYS|EPERM|EBUSY>[:id=<id>] BEL
+//   探测答 ESC [ ? 5 5 2 2 ; <Ps> $ y      （Ps 0/4 = 不支持）
+
+use libc.syscall;
+use libc.unistd;
+use std.encoding.base64.decode_base64;
+
+// 结果码（与 CLIPX_* / CLIP_* 保持同一套语义，便于仲裁层直译）
+export const CLIPT_NONE: i32 = 0;          // 剪贴板空
+export const CLIPT_TEXT: i32 = 1;          // 读到文本
+export const CLIPT_IMAGE: i32 = 2;         // 读到图片（mime 见 mime_out）
+export const CLIPT_UNSUPPORTED: i32 = 3;   // 终端不支持 5522 / 我们在管道里
+export const CLIPT_DENIED: i32 = 4;        // 终端或用户拒绝了（EPERM）
+export const CLIPT_BUSY: i32 = 5;          // 终端忙（EBUSY）
+export const CLIPT_ERR: i32 = 6;           // 协议层失败（超时 / 畸形）
+export const CLIPT_TOO_BIG: i32 = 7;       // 超过我们的读取上限
+
+// 单次读取的字节上限：与 CLIPX_MAX_BYTES 同值（一张 4K 截图 PNG 2–8 MiB）。
+// 超出**明确拒绝、不静默截断** —— 半个 PNG 发给模型只会得到坏请求。
+const CLIPT_MAX_BYTES: usize = 24 * 1024 * 1024;
+// 探测超时（毫秒）：短 —— 没人应答就是「不支持」，这是**每一次**粘贴都要付的成本。
+const CLIPT_PROBE_MS: u64 = 250;
+// 读取超时（毫秒）：宽 —— kitty 首次读剪贴板会**弹授权框**，人点一下要时间。
+const CLIPT_READ_MS: u64 = 10000;
+const CLIPT_POLL_MS: i32 = 20;
+
+// ============================================================
+// 小工具
+// ============================================================
+fn clipt_now_ms() u64 {
+    return ua_now_ms();
+}
+
+// 8 位 ASCII 的 base64（mime 串只有 ASCII，不需要 UTF-8 处理）。
+// 为什么不用 std 的编码器：那个吃 `&[byte]` 切片，而这里要编的是常量字面量；
+// 16 行的查表比搬一套切片描述符更直接，也让 mime 的字节**看得见**。
+fn clipt_b64_ascii(p: &const byte, n: usize, out: &Buf) bool {
+    var i: usize = 0;
+    while i + 3 <= n {
+        const a: u32 = p[i] as u32;
+        const b: u32 = p[i + 1] as u32;
+        const c: u32 = p[i + 2] as u32;
+        const v: u32 = (a << 16) | (b << 8) | c;
+        if !clipt_b64_put(out, (v >> 18) & 63) {
+            return false;
+        }
+        if !clipt_b64_put(out, (v >> 12) & 63) {
+            return false;
+        }
+        if !clipt_b64_put(out, (v >> 6) & 63) {
+            return false;
+        }
+        if !clipt_b64_put(out, v & 63) {
+            return false;
+        }
+        i = i + 3;
+    }
+    const rem: usize = n - i;
+    if rem == 1 {
+        const v: u32 = (p[i] as u32) << 16;
+        if !clipt_b64_put(out, (v >> 18) & 63) {
+            return false;
+        }
+        if !clipt_b64_put(out, (v >> 12) & 63) {
+            return false;
+        }
+        if !buf_append_byte(out, 61 as byte) {     // '='
+            return false;
+        }
+        return buf_append_byte(out, 61 as byte);
+    }
+    if rem == 2 {
+        const v: u32 = ((p[i] as u32) << 16) | ((p[i + 1] as u32) << 8);
+        if !clipt_b64_put(out, (v >> 18) & 63) {
+            return false;
+        }
+        if !clipt_b64_put(out, (v >> 12) & 63) {
+            return false;
+        }
+        if !clipt_b64_put(out, (v >> 6) & 63) {
+            return false;
+        }
+        return buf_append_byte(out, 61 as byte);
+    }
+    return true;
+}
+
+// 6 位值 → base64 字符（标准字母表 + `=` 由调用方补）
+fn clipt_b64_put(out: &Buf, six: u32) bool {
+    if six < 26 {
+        return buf_append_byte(out,
+            (65 as u32 + six) as byte);        // 'A'..'Z'
+    }
+    if six < 52 {
+        return buf_append_byte(out,
+            (97 as u32 + (six - 26)) as byte); // 'a'..'z'
+    }
+    if six < 62 {
+        return buf_append_byte(out,
+            (48 as u32 + (six - 52)) as byte); // '0'..'9'
+    }
+    if six == 62 {
+        return buf_append_byte(out, 43 as byte);                       // '+'
+    }
+    return buf_append_byte(out, 47 as byte);                           // '/'
+}
+
+// ============================================================
+// 写出：能力探测与读请求
+// ============================================================
+
+// 界面自己的输出 fd。**绝不走 `tty_write`**（见不变量 ④）。
+// fd < 0（headless / 没有界面）时返回 -1，调用方据此直接判「不支持」。
+fn clipt_out_fd() i32 {
+    const f: i32 = tui_out_fd();
+    if f >= 0 {
+        return f;
+    }
+    return 2;
+}
+
+// 我们想读的 mime，按**优先级**排（多模态场景下截图比它旁边那段文字更有信息量）。
+// 与 media/clipx 的 `clipx_paste` 用同一份顺序 —— 两个来源的择优口径必须一致，
+// 否则「同一块剪贴板、换个来源就贴上不同的东西」。
+// 返回常量数组的字节数（数组由调用方按 5 个常量取）。
+fn clipt_want_n() usize {
+    return 5;
+}
+
+// 第 idx 个想要的 mime 字面量（idx 越界回空串）
+fn clipt_want(idx: usize) &const byte {
+    if idx == 0 {
+        return "image/png" as &const byte;
+    }
+    if idx == 1 {
+        return "image/jpeg" as &const byte;
+    }
+    if idx == 2 {
+        return "image/gif" as &const byte;
+    }
+    if idx == 3 {
+        return "image/webp" as &const byte;
+    }
+    if idx == 4 {
+        return "text/plain" as &const byte;
+    }
+    return "" as &const byte;
+}
+
+// 第 idx 个想要的是不是图片（决定结果码，也决定交给哪条附件管线）
+fn clipt_want_is_image(idx: usize) bool {
+    return idx < 4;
+}
+
+// 探针：`ESC [ ? 5 5 2 2 $ p`（DECRQM）。只写 9 字节，等应答归 `clipt_probe_wait`。
+// ⚠ 九个字节一个都不能少：`$`（36）是 DECRQM 的区别位 —— 少了它就退化成一条
+// **别的** CSI（`ESC[?5522p` 是 DECSET/DECRST 家族的形状），终端要么忽略要么改状态，
+// 而**应答永远不会来**。实测症状：探测超时、每次粘贴白等 250 ms（踩坑 136）。
+fn clipt_send_probe(fd: i32) bool {
+    var q: Buf = buf_new(16);
+    defer { buf_free(&q); }
+    clipt_probe_into(&q);
+    const w: isize = sys_write(fd, q.ptr as *const byte,
+        q.len) catch { -1 as isize; };
+    return w == (q.len as isize);
+}
+
+// 探针字节的**唯一实现**（写 fd 与自测断言共用一份）。为什么必须共用：
+// 自测若另抄一份「正确的字节」去比对，被测的那份写错了它照样绿 —— 实测踩坑 136
+// 就是这个假绿：`$` 被覆盖成 `p`，PTY 轮看得见（探测超时），纯函数轮看不见。
+fn clipt_probe_into(out: &Buf) void {
+    buf_reset(out);
+    _ = buf_append_byte(out, 27);   // ESC
+    _ = buf_append_byte(out, 91);   // '['
+    _ = buf_append_byte(out, 63);   // '?'
+    _ = buf_append_byte(out, 53);   // '5'
+    _ = buf_append_byte(out, 53);   // '5'
+    _ = buf_append_byte(out, 50);   // '2'
+    _ = buf_append_byte(out, 50);   // '2'
+    _ = buf_append_byte(out, 36);   // '$'
+    _ = buf_append_byte(out, 112);  // 'p'
+}
+
+// 读请求：`ESC ] 5522 ; type=read[:id=<id>] ; <base64(mime 列表)> BEL`
+// 整条序列**一次写完** —— 拆成多次写，进程正好死在中间就会留下一个没终结的 OSC，
+// 终端会把后面的输出一起吃掉（与 `tty_title_set` 同一条教训）。
+fn clipt_send_read(fd: i32, id: &const byte, idn: usize) bool {
+    var list: Buf = buf_new(96);
+    defer { buf_free(&list); }
+    var k: usize = 0;
+    while k < clipt_want_n() {
+        const m: &const byte = clipt_want(k);
+        const mn: usize = bufx_cstr_len(m);
+        if mn == 0 {
+            k = k + 1;
+            continue;
+        }
+        if list.len > 0 {
+            _ = buf_append_byte(&list, 32 as byte);    // 空格分隔
+        }
+        _ = buf_append(&list, m, mn);
+        k = k + 1;
+    }
+    var b64: Buf = buf_new(160);
+    defer { buf_free(&b64); }
+    if !clipt_b64_ascii(list.ptr as &const byte, list.len, &b64) {
+        return false;
+    }
+    var seq: Buf = buf_new(256 + idn);
+    defer { buf_free(&seq); }
+    _ = buf_append_byte(&seq, 27);
+    _ = buf_append_byte(&seq, 93);                     // ']'
+    _ = buf_append_cstr(&seq, "5522;type=read" as &const byte);
+    if idn > 0 {
+        _ = buf_append_cstr(&seq, ":id=" as &const byte);
+        _ = buf_append(&seq, id, idn);
+    }
+    _ = buf_append_byte(&seq, 59);                     // ';'
+    _ = buf_append(&seq, b64.ptr as &const byte, b64.len);
+    _ = buf_append_byte(&seq, 7);                      // BEL
+    const w: isize = sys_write(fd, seq.ptr as *const byte,
+        seq.len) catch { -1 as isize; };
+    return w == (seq.len as isize);
+}
+
+// ============================================================
+// 读入：借 oscin 从 fd 0 摘帧
+// ============================================================
+
+// 读一次 fd 0（带超时），把字节过一遍扫描器。
+//   * 透传字节 → 键解码器（这样 `esc` 能取消、界面不假死）；
+//   * 完整帧 → 由调用方用 `oscin_frame_kind()` 判。
+// 返回：1 = 收到一帧，0 = 还没（超时 / 只读到按键），-1 = 被取消（esc / ctrl+c / 退出）。
+//
+// ⚠ **两条顺序上的讲究**（都踩过）：
+//   ① **armed 期间 fd 0 归我** —— `oscin_borrowed()` 让 `tui_poll_keys` 早退，
+//      否则它会把终端应答当按键先读走，扫描器一个字节都看不到（踩坑 137）；
+//   ② 自己 `read` 之后才 `tui_poll_tick()` —— tick 里的键路虽然已经让开，
+//      但尺寸 / spinner / 心跳还是要推，界面不能假死（与读取 X11 剪贴板同一手法）。
+fn clipt_pump_once(deadline: u64) i32 {
+    // 挂起段里还有帧字节：**先把它解完**，别去等新字节 —— 一次 read 里常常是
+    // `OK`+`DATA`(多块)+`DONE` 连着到的，而我们一次只交付一帧（见 oscin 的不变量 ⑥）。
+    // 不做这一步的话，收到第一帧之后就永远等在那里，症状是「请求发出一遍又一遍、
+    // 数据就是收不回来」（实测踩坑 138）。
+    if oscin_pending() {
+        var zero: [byte: 1] = [0: 1];
+        var pass0: Buf = buf_new(64);
+        defer { buf_free(&pass0); }
+        oscin_feed(&zero[0], 0, &pass0);
+        if pass0.len > 0 {
+            clipt_dispatch_keys(&pass0);
+        }
+        if oscin_frame_kind() != OSCIN_KIND_NONE {
+            return 1;
+        }
+    }
+    var pfds: [PollFd: 1] = [PollFd{ fd: 0, events: POLLIN, revents: 0 }];
+    const pr: i32 = sys_poll(&pfds[0], 1, CLIPT_POLL_MS) catch { 0; };
+    if pr > 0 {
+        var tmp: [byte: 512] = [0: 512];
+        clipt_read_batch(&tmp[0], 512);
+    }
+    clipt_flush_stale();  // 攥太久的半截前缀吐回键解码器（esc 取消靠这条）
+    tui_poll_tick();      // 界面别假死（键路由已被 oscin_borrowed 让开）
+    if tui_abort_state() != TUI_ABORT_NONE {
+        return -1;
+    }
+    if oscin_frame_kind() != OSCIN_KIND_NONE {
+        return 1;
+    }
+    if clipt_now_ms() > deadline {
+        return 0;
+    }
+    return 0;
+}
+
+// 从 fd 0 读一批（最多 n 字节）并过扫描器：透传进键解码器、完整帧留给调用方。
+// EINTR（SIGWINCH 等）当作「没读到」，**绝不当** EOF（当 EOF 会让一次终端缩放
+// 把等待当场结束掉）。
+fn clipt_read_batch(buf: &byte, n: usize) void {
+    const rr: !isize = sys_read(0, buf, n);
+    const got: isize = rr catch { 0 as isize; };
+    if got <= 0 {
+        return;
+    }
+    var pass: Buf = buf_new(1024);
+    defer { buf_free(&pass); }
+    oscin_feed(buf, got as usize, &pass);
+    if pass.len > 0 {
+        clipt_dispatch_keys(&pass);
+    }
+}
+
+// 等待循环里的「过期让路」：把攥了太久的半截前缀吐回键解码器。
+// 为什么必须有：`esc` 是取消键，而 `ESC ] 5522 …` 也以 `ESC` 开头 —— 两者在前几字节
+// 无法区分。扫描器只在短窗口内攥着（见 oscin_expire），窗口一过就吐回来，
+// 于是「按 esc 取消」在 armed 期间照样当场生效。
+fn clipt_flush_stale() void {
+    var pass: Buf = buf_new(64);
+    defer { buf_free(&pass); }
+    if oscin_expire(&pass) && pass.len > 0 {
+        clipt_dispatch_keys(&pass);
+    }
+}
+
+// 把透传字节送进**当前形态**的键解码器：TUI 走 tui、滚动模式走 tty。
+// 两条路都要走 —— 不然 SSH 里按 esc 取消粘贴的那个键会被我们吃掉。
+fn clipt_dispatch_keys(p: &const Buf) void {
+    if tui_active() {
+        tui_keys_feed(p.ptr as &const byte, p.len);
+        return;
+    }
+    tty_feed(&tty_ui, p.ptr as &const byte, p.len);
+    tty_flush_esc(&tty_ui);
+}
+
+// 等探测应答。返回：1 = 支持，0 = 不支持（含不应答），-1 = 被取消。
+// 判定只看 DECRPM 的 Ps：0/4 = 不支持（规范），其余（含 1/2/3）= 支持。
+fn clipt_probe_wait() i32 {
+    const deadline: u64 = clipt_now_ms() + CLIPT_PROBE_MS;
+    oscin_arm(OSCIN_WANT_PROBE);
+    defer { oscin_disarm(); }
+    while true {
+        if oscin_frame_kind() == OSCIN_KIND_DECRPM {
+            var meta: Buf = buf_new(64);
+            defer { buf_free(&meta); }
+            var pay: Buf = buf_new(64);
+            defer { buf_free(&pay); }
+            oscin_frame(&meta, &pay);
+            return clipt_parse_decrpm(&meta);
+        }
+        const r: i32 = clipt_pump_once(deadline);
+        if r < 0 {
+            return -1;
+        }
+        if r == 0 && clipt_now_ms() > deadline {
+            return 0;
+        }
+    }
+}
+
+// 解析 DECRPM 的载荷：形状是 `;<Ps>$y`，我们要中间的十进制 Ps。
+// 0 与 4 是「不支持」（规范写死的两个值），其余算支持。
+fn clipt_parse_decrpm(meta: &const Buf) i32 {
+    var v: i32 = -1;
+    var i: usize = 0;
+    while i < meta.len {
+        const c: byte = meta.ptr[i];
+        if c >= 48 as byte && c <= 57 as byte {
+            if v < 0 {
+                v = 0;
+            }
+            v = v * 10 + ((c as i32) - 48);
+        } else if v >= 0 {
+            break;      // 数字段结束
+        }
+        i = i + 1;
+    }
+    if v == 0 || v == 4 {
+        return 0;
+    }
+    if v < 0 {
+        return 0;       // 畸形：宁可不支持（fail-safe，与探测超时同一条路）
+    }
+    return 1;
+}
+
+// ============================================================
+// 应答解析
+// ============================================================
+
+// 从 metadata 里取某个键的值，写进 out（先清空）。
+// metadata 是 `:` 分隔的 `k=v` 列表（规范），键名是 ASCII。找到返回 true。
+fn clipt_meta_get(meta: &const Buf, key: &const byte, kn: usize,
+                  out: &Buf) bool {
+    buf_reset(out);
+    var i: usize = 0;
+    while i < meta.len {
+        // 键从 i 开始；到 '=' 或 ':' 或结尾为止
+        var e: usize = i;
+        while e < meta.len && meta.ptr[e] != 61 as byte
+            && meta.ptr[e] != 58 as byte {
+            e = e + 1;
+        }
+        const is_key: bool = (e - i) == kn && bufx_mem_eq(meta.ptr + i, key,
+            kn);
+        if e < meta.len && meta.ptr[e] == 61 as byte {          // '='
+            var v: usize = e + 1;
+            while v < meta.len && meta.ptr[v] != 58 as byte {   // ':'
+                v = v + 1;
+            }
+            if is_key {
+                _ = buf_append(out, meta.ptr + e + 1, v - (e + 1));
+                return true;
+            }
+            i = v + 1;
+            continue;
+        }
+        i = e + 1;
+    }
+    return false;
+}
+
+// 本次查询的 id（进程内递增；重试时换一个，所以上一轮迟到的应答认不出来）。
+var g_clipt_seq: u32 = 0;
+
+// 造一个新 id（写进 out，**不含** NUL）。用十进制计数器：字符集天然合法（`[0-9]`）。
+fn clipt_new_id(out: &Buf) void {
+    buf_reset(out);
+    g_clipt_seq = g_clipt_seq + 1;
+    _ = buf_append_cstr(out, "u" as &const byte);
+    _ = buf_append_u64(out, g_clipt_seq as u64);
+}
+
+// 解析一条 OSC 帧的 metadata，看它属不属于本次 id、是什么 status。
+// 结果码：0 = 与本轮无关（丢弃），1 = OK，2 = DATA，3 = DONE，4 = 拒绝/忙/不支持，5 = 畸形。
+fn clipt_frame_status(meta: &const Buf, id: &const byte, idn: usize) i32 {
+    var buf: Buf = buf_new(64);
+    defer { buf_free(&buf); }
+    if !clipt_meta_get(meta, "type" as &const byte, 4, &buf) {
+        return 0;
+    }
+    if !bufx_eq_cstr(buf.ptr as &const byte, buf.len, "read" as &const byte) {
+        return 0;
+    }
+    // id 必须与本次一致。**没有 id 的应答也接受**（老实现/不实现 id 的终端），
+    // 但只要对端给了 id，就必须对上 —— 否则是上一轮迟到的。
+    // ⚠ 比 id 要用 `bufx_mem_eq`（**长度已知**），**不能**用 `bufx_eq_cstr` ——
+    // `id` 是调用方的 Buf，**不保证 NUL 结尾**，而 `bufx_eq_cstr` 的第三个参数是
+    // 当**字面量**用的（它内部 `bufx_cstr_len(lit)` 一路扫到 0）。传 Buf 指针进去就是
+    // 读缓冲区后面的垃圾 ⇒ 长度对不上 ⇒ 永远判「不是这一轮」（实测踩坑 142：
+    // 纯函数自测全绿，真 PTY 上「读请求发出一遍又一遍、数据收不回来」）。
+    if clipt_meta_get(meta, "id" as &const byte, 2, &buf) {
+        if buf.len != idn || !bufx_mem_eq(buf.ptr as &const byte, id, idn) {
+            return 0;
+        }
+    }
+    if !clipt_meta_get(meta, "status" as &const byte, 6, &buf) {
+        return 5;
+    }
+    if bufx_eq_cstr(buf.ptr as &const byte, buf.len, "OK" as &const byte) {
+        return 1;
+    }
+    if bufx_eq_cstr(buf.ptr as &const byte, buf.len, "DATA" as &const byte) {
+        return 2;
+    }
+    if bufx_eq_cstr(buf.ptr as &const byte, buf.len, "DONE" as &const byte) {
+        return 3;
+    }
+    if bufx_eq_cstr(buf.ptr as &const byte, buf.len, "EPERM" as &const byte)
+        || bufx_eq_cstr(buf.ptr as &const byte, buf.len,
+            "ENOSYS" as &const byte)
+        || bufx_eq_cstr(buf.ptr as &const byte, buf.len,
+            "EBUSY" as &const byte) {
+        return 4;
+    }
+    return 5;
+}
+
+// 从一条 DATA 帧取出 mime：metadata 里 `mime=<base64>`，**值本身是 base64**，
+// 解出来才是 mime 串（规范明确要求）。
+fn clipt_frame_mime(meta: &const Buf, out: &Buf) bool {
+    buf_reset(out);
+    var eb: Buf = buf_new(64);
+    defer { buf_free(&eb); }
+    if !clipt_meta_get(meta, "mime" as &const byte, 4, &eb) {
+        return false;
+    }
+    return clipt_b64_decode(&eb, out);
+}
+
+// base64 解码（走 std 的实现，吃切片）。失败返回 false（畸形 —— 规范要求终端拒绝
+// 非法 base64，我们对**收到**的非法数据同样不猜）。
+fn clipt_b64_decode(src: &const Buf, out: &Buf) bool {
+    buf_reset(out);
+    if src.len == 0 {
+        return true;
+    }
+    const need: usize = ((src.len + 3) / 4) * 3 + 4;
+    if !buf_reserve(out, need) {
+        return false;
+    }
+    const got: !usize = decode_base64(src.ptr[0: src.len], out.ptr[0: out.cap]);
+    const w: usize = got catch {
+        return false;
+    };
+    out.len = w;
+    return true;
+}
+
+// ============================================================
+// 对外入口
+// ============================================================
+
+// 探测结果缓存：0 = 没探过，1 = 支持，2 = 不支持。
+// **阴性也缓存** —— 不支持是常态（deepin-terminal 就不支持），每次粘贴都白等 250 ms
+// 是不可接受的（不变量 ③）。
+var g_clipt_probed: i32 = 0;
+// 本次读取已经收下的是「第几优先」的那一档（`clipt_want` 的下标；-1 = 还没收到）。
+// 为什么要有它：`CLIPT_IMAGE` 那一档有四个 mime 公用同一个码，只看码分不出
+// 「同一档的下一块」与「更低优先的别的档」（见 clipt_take_data 的注释）。
+var g_clipt_slot: i32 = -1;
+
+// 终端协议这条路能不能用：必须①stdin 是终端（`isatty(0)`）②探测通过。
+fn clipt_available(force: bool) bool {
+    if g_clipt_probed != 0 && !force {
+        return g_clipt_probed == 1;
+    }
+    g_clipt_probed = 2;
+    if !tty_probe(0) {
+        return false;
+    }
+    const fd: i32 = clipt_out_fd();
+    if fd < 0 {
+        return false;
+    }
+    oscin_reset();
+    if !clipt_send_probe(fd) {
+        return false;
+    }
+    const pw: i32 = clipt_probe_wait();
+    if pw == 1 {
+        g_clipt_probed = 1;
+        return true;
+    }
+    return false;
+}
+
+// 重置探测缓存（自测与「终端换了」的极端场景用）
+export fn clipt_reset_probe() void {
+    g_clipt_probed = 0;
+    oscin_reset();
+}
+
+// 读一次剪贴板。返回 CLIPT_*；`mime_out` 是图片的 MIME（文本时为空）。
+// **不**在这里做预算判定：那是 imgx 的事，调用方按同一套规则拒绝并给文案。
+// 从`clipt_available(false)` 已经确定支持开始，最多阻塞 CLIPT_READ_MS。
+export fn clipt_paste(out: &Buf, mime_out: &Buf) i32 {
+    buf_reset(out);
+    buf_reset(mime_out);
+    if !clipt_available(false) {
+        return CLIPT_UNSUPPORTED;
+    }
+    const fd: i32 = clipt_out_fd();
+    g_clipt_slot = -1;
+    var id: Buf = buf_new(16);
+    defer { buf_free(&id); }
+    clipt_new_id(&id);
+    oscin_arm(OSCIN_WANT_DATA);
+    defer { oscin_disarm(); }
+    if !clipt_send_read(fd, id.ptr as &const byte, id.len) {
+        return CLIPT_ERR;
+    }
+    return clipt_collect(out, mime_out, &id);
+}
+
+// 收应答直到 DONE。逐个 DATA 分块**单独解码**（不变量 ①），按 mime 归到
+// 「想要的那一档」，命中即用；没有数据的 mime 跳过继续（规范允许终端少给几种）。
+// 返回 CLIPT_*。
+fn clipt_collect(out: &Buf, mime_out: &Buf, id: &const Buf) i32 {
+    const deadline: u64 = clipt_now_ms() + CLIPT_READ_MS;
+    var saw_ok: bool = false;
+    var code: i32 = CLIPT_NONE;
+    var chunk: Buf = buf_new(8192);
+    defer { buf_free(&chunk); }
+    var meta: Buf = buf_new(1024);
+    defer { buf_free(&meta); }
+    var pay: Buf = buf_new(8192);
+    defer { buf_free(&pay); }
+    var mime: Buf = buf_new(64);
+    defer { buf_free(&mime); }
+    while true {
+        if oscin_frame_kind() == OSCIN_KIND_OSC {
+            oscin_frame(&meta, &pay);
+            const st: i32 = clipt_frame_status(&meta, id.ptr as &const byte,
+                id.len);
+            if st == 3 {
+                return code;                     // DONE：本轮结束
+            }
+            if st == 4 {
+                // EPERM / ENOSYS / EBUSY：分辨一下，文案不同
+                var why: Buf = buf_new(32);
+                defer { buf_free(&why); }
+                if clipt_meta_get(&meta, "status" as &const byte, 6, &why) {
+                    if bufx_eq_cstr(why.ptr as &const byte, why.len,
+                        "EPERM" as &const byte) {
+                        return CLIPT_DENIED;
+                    }
+                    if bufx_eq_cstr(why.ptr as &const byte, why.len,
+                        "EBUSY" as &const byte) {
+                        return CLIPT_BUSY;
+                    }
+                }
+                return CLIPT_UNSUPPORTED;
+            }
+            if st == 5 {
+                return CLIPT_ERR;
+            }
+            if st == 1 {
+                saw_ok = true;
+            }
+            if st == 2 {
+                if !clipt_frame_mime(&meta, &mime) {
+                    return CLIPT_ERR;
+                }
+                if !clipt_take_data(&mime, &pay, out, mime_out, &code, &chunk) {
+                    return CLIPT_TOO_BIG;
+                }
+            }
+            continue;
+        }
+        const r: i32 = clipt_pump_once(deadline);
+        if r < 0 {
+            return code;      // 用户按了 esc：拿到的算数（没有就 NONE）
+        }
+        if r == 0 && clipt_now_ms() > deadline {
+            // 超时：**有数据就算成功**（终端可能就是不回 DONE），没有则明确报告
+            if code != CLIPT_NONE {
+                return code;
+            }
+            if saw_ok {
+                return CLIPT_NONE;   // OK 也回了、数据一个都没给 = 剪贴板里没我们认识的格式
+            }
+            return CLIPT_ERR;
+        }
+    }
+}
+
+// 处理一个 DATA 分块：解码（单独解！）→ 若这个 mime 是我们想要的档，就追加到 out。
+// 返回 false = 超过上限（调用方拒绝整次读取）。
+//   * `chunk` 是调用方的复用缓冲，避免每块都 malloc；
+//   * 图片按 mime 归类，文本只认 `text/plain`（UTF8_STRING 是 X11 的叫法，
+//     终端协议用标准 mime）；
+//   * `code` / `mime_out` 记「已经命中哪一档」。
+// **自测必须走这一个函数**（`clipt_take_data_debug`）：另抄一份「逐块解码」的循环去断言，
+// 被测的那份改成「整串拼接后再解」照样绿 —— 实测踩坑 139 的假绿。
+fn clipt_take_data(mime: &const Buf, pay: &const Buf, out: &Buf,
+                   mime_out: &Buf, code: &i32, chunk: &Buf) bool {
+    if !clipt_b64_decode(pay, chunk) {
+        return true;      // 坏块跳过（不因此丢掉已经收好的其它块）
+    }
+    var slot: i32 = -1;
+    var k: usize = 0;
+    while k < clipt_want_n() {
+        const w: &const byte = clipt_want(k);
+        const wn: usize = bufx_cstr_len(w);
+        if wn > 0 && bufx_eq_cstr(mime.ptr as &const byte, mime.len, w) {
+            slot = k as i32;
+            break;
+        }
+        k = k + 1;
+    }
+    if slot < 0 {
+        return true;      // 不是我们要的格式（终端可能多给几种）
+    }
+    // 已经命中过一档时怎么处理这一块（**同一个 mime 的后续块必须接着拼**）：
+    //   * 同一档（`slot == g_clipt_slot`）：继续追加 —— 大图就是被切成多块发的；
+    //   * 更低优先（`slot > g_clipt_slot`）：丢弃 —— 前面的档已经在收了；
+    //   * 更高优先（`slot < g_clipt_slot`）：作废旧的、从头收 —— 规范允许终端不按
+    //     我们要的顺序给，而多模态场景下截图比它旁边那段文字更有信息量。
+    // 判据必须用**下标**而不是 `code`：`CLIPT_IMAGE` 那一档有四个 mime 公用一个码，
+    // 只看码就分不出「同一档的下一块」与「更低优先的别的档」（实测踩坑 140：
+    // 文本块把已经收好的图片覆盖成了「一坨文本」）。
+    if g_clipt_slot >= 0 {
+        if (slot as i32) > g_clipt_slot {
+            return true;
+        }
+        if (slot as i32) < g_clipt_slot {
+            buf_reset(out);
+            buf_reset(mime_out);
+            code[0] = CLIPT_NONE;
+            g_clipt_slot = -1;
+        }
+    }
+    if out.len + chunk.len > CLIPT_MAX_BYTES {
+        return false;
+    }
+    if !buf_append(out, chunk.ptr as &const byte, chunk.len) {
+        return false;
+    }
+    const is_img: bool = clipt_want_is_image(slot as usize);
+    code[0] = if is_img { CLIPT_IMAGE } else { CLIPT_TEXT };
+    g_clipt_slot = slot;
+    if is_img {
+        buf_reset(mime_out);
+        _ = buf_append(mime_out, mime.ptr as &const byte, mime.len);
+    }
+    return true;
+}
+
+// 一句人话（给 notice 用；调用方拼自己的前后缀）。
+export fn clipt_reason(code: i32) &const byte {
+    if code == CLIPT_UNSUPPORTED {
+        return "这个终端不支持读剪贴板的协议（OSC 5522）" as &const byte;
+    }
+    if code == CLIPT_DENIED {
+        return "终端或你拒绝了这次剪贴板读取" as &const byte;
+    }
+    if code == CLIPT_BUSY {
+        return "终端忙（可能同时有另一个程序在读剪贴板），过一下再试" as &const byte;
+    }
+    if code == CLIPT_ERR {
+        return "终端应答超时或格式不对" as &const byte;
+    }
+    if code == CLIPT_NONE {
+        return "剪贴板里没有图片也没有文本" as &const byte;
+    }
+    return "" as &const byte;
+}
+
+// ============================================================
+// 自测用的两个口子（产品路径不走这里）
+// ============================================================
+
+// 把「读请求」拼进 out 而不写 fd —— 自测要**逐字节**比对规范形状，
+// 不能只在真终端上「看起来能用」。
+export fn clipt_send_read_debug(out: &Buf, id: &const byte, idn: usize) bool {
+    var list: Buf = buf_new(96);
+    defer { buf_free(&list); }
+    var k: usize = 0;
+    while k < clipt_want_n() {
+        const m: &const byte = clipt_want(k);
+        const mn: usize = bufx_cstr_len(m);
+        if mn > 0 {
+            if list.len > 0 {
+                _ = buf_append_byte(&list, 32 as byte);
+            }
+            _ = buf_append(&list, m, mn);
+        }
+        k = k + 1;
+    }
+    var b64: Buf = buf_new(160);
+    defer { buf_free(&b64); }
+    if !clipt_b64_ascii(list.ptr as &const byte, list.len, &b64) {
+        return false;
+    }
+    buf_reset(out);
+    _ = buf_append_byte(out, 27);
+    _ = buf_append_byte(out, 93);
+    _ = buf_append_cstr(out, "5522;type=read" as &const byte);
+    if idn > 0 {
+        _ = buf_append_cstr(out, ":id=" as &const byte);
+        _ = buf_append(out, id, idn);
+    }
+    _ = buf_append_byte(out, 59);
+    _ = buf_append(out, b64.ptr as &const byte, b64.len);
+    return buf_append_byte(out, 7);
+}
+
+// base64 编码的公开别名（自测造「终端应答」夹具要用同一个编码器 ——
+// 用它而不是另写一份，才能保证「我们解的就是我们自己编的」这条闭环成立）
+export fn clipt_b64_ascii_debug(p: &const byte, n: usize, out: &Buf) bool {
+    return clipt_b64_ascii(p, n, out);
+}
+
+// 把探测请求拼进 out 而不写 fd（自测要逐字节比对 —— 见 `clipt_send_probe` 的注释）
+export fn clipt_send_probe_debug(out: &Buf) bool {
+    clipt_probe_into(out);
+    return out.len == 9;
+}
+
+// 自测入口：把一块 base64 载荷喂进**真正的**分块装配路径（见 clipt_take_data 的注释）。
+// 返回 false = 拒收（超上限 / 坏块）。
+export fn clipt_take_data_debug(mime: &const Buf, pay_b64: &const Buf,
+                                out: &Buf, mime_out: &Buf,
+                                code: &i32) bool {
+    var chunk: Buf = buf_new(pay_b64.len + 8);
+    defer { buf_free(&chunk); }
+    return clipt_take_data(mime, pay_b64, out, mime_out, code, &chunk);
+}

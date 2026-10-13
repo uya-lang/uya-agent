@@ -1,0 +1,469 @@
+// src/term/oscin.uya — 终端回帧扫描器（P83）：从 fd 0 上摘走终端自己的应答
+//
+// 本文件：一个**纯字节状态机** `oscin_feed`。它把 fd 0 读来的一批字节分成两路 ——
+//   「终端对我们查询的应答」被摘走（`oscin_frame_*` 取走），其余**逐字节原样**
+//   追加到调用方的 Buf（下称「透传」）。认两种帧：
+//     * OSC 5522（`ESC ] 5 5 2 2 ; <metadata> [ ; <base64> ] BEL|ST`）—— 剪贴板数据；
+//     * DECRPM（`ESC [ ? 5 5 2 2 ; <Ps> $ y`）—— 能力探测应答。
+// 不变量：① 除这两种帧外**一个字节都不许改**（粘贴内容里的 `ESC[31m` 必须原样进输入行）；
+//   ② **分片安全** —— `ESC` / `ESC ]` / 半截 base64 在**任意字节处**切开都要能续上
+//   （终端与 SSH 一定会切片）；③ **fail-safe** —— 只有完整的帧才被消费，未终结的捕获
+//   一律**整段吐回**透传（`oscin_expire` / `oscin_flush_pending` / 超上限 / 解除等待四条路），
+//   绝不永久吞掉用户按键；④ 捕获缓冲有硬上限 `OSCIN_CAP_MAX`（超了就不是我们能处理的帧）；
+//   ⑤ **没 armed 时一个字节都不攥**（逐字节原样透传）—— 键盘路径上「什么都不做」是唯一
+//   不会引入回归的行为（见 `oscin_feed` 的注释）；⑥ **一次只交付一帧**：一次 read 里
+//   连着来了 OK+DATA+DONE 三帧时，把没处理完的尾巴存进挂起段，等调用方取走这一帧
+//   再接着解（不这样做会把前两帧覆盖掉 —— 实测就是这个症状：只认到最后一帧）；
+//   ⑦ 不读 fd、不画屏、不判定语义（metadata 是什么意思归 media/clipt 管）。
+// 依赖：foundation/bufx（`Buf`、`ua_now_ms`）。**不依赖** term/tty 与 term/tui ——
+//   两个键盘入口（TUI 的 `tui_poll_keys`、滚动模式的 `tty_feed`）都要调它，
+//   谁也不能把对方拽进来。
+// 命名：`oscin_*`、`OSCIN_*`。
+//
+// 为什么必须拦（踩坑 135）：终端应答与用户的**按键走同一条 fd 0**。不拦的话
+// `ESC ] 5 5 2 2 ; …` 会被键解码器当成「ESC + 一串普通字符」打进输入行 ——
+// 屏幕上多出一坨 base64，而真正要等的那帧数据反而不见了。
+
+// 帧类型（`oscin_frame_kind()` 的返回）
+export const OSCIN_KIND_NONE: i32 = 0;     // 没有帧
+export const OSCIN_KIND_OSC: i32 = 1;      // OSC 5522（剪贴板数据）
+export const OSCIN_KIND_DECRPM: i32 = 2;   // DECRPM（探测应答）
+const OSCIN_KIND_UNDEC: i32 = 3;           // 还在对前缀，两个候选都活着
+
+// 在等什么（`oscin_arm` 的参数）。**只有 `want` 与帧类型相配时才交付** ——
+// 否则上一轮迟到的应答会串到下一位（见 media/clipt 的 id 校验）。
+export const OSCIN_WANT_NONE: i32 = 0;
+export const OSCIN_WANT_DATA: i32 = 1;
+export const OSCIN_WANT_PROBE: i32 = 2;
+
+// 单帧捕获上限：OSC 5522 的 DATA 块编码前 ≤ 4096 B（规范），base64 后 ≈ 5.5 KiB；
+// 给到 64 KiB 是「远超任何合法帧」，超了就说明这不是我们等的帧（吐回透传）。
+const OSCIN_CAP_MAX: usize = 64 * 1024;
+// 挂起段上限（一次 read 的尾巴；512 的读缓冲装得下，给 4 KiB 富余）
+const OSCIN_PEND_MAX: usize = 4096;
+// 两个前缀都是 7 字节：`ESC ] 5 5 2 2 ;` 与 `ESC [ ? 5 5 2 2`。
+// 于是**两种情况捕获体都从下标 7 开始**，`oscin_deliver` 只用一个常量。
+const OSCIN_PFX_N: usize = 7;
+const OSCIN_BODY_AT: usize = 7;
+
+// 状态：0 = 透传，1 = 捕获中，2 = 捕获中且上一个字节是 ESC（可能是 ST 的一半）
+const OSCIN_ST_PASS: i32 = 0;
+const OSCIN_ST_CAP: i32 = 1;
+const OSCIN_ST_CAP_ESC: i32 = 2;
+
+const OSCIN_ESC: byte = 27 as byte;
+const OSCIN_BEL: byte = 7 as byte;
+const OSCIN_BACKSLASH: byte = 92 as byte;
+const OSCIN_SEMI: byte = 59 as byte;
+
+var g_oscin_st: i32 = OSCIN_ST_PASS;
+var g_oscin_kind: i32 = OSCIN_KIND_NONE;
+var g_oscin_want: i32 = OSCIN_WANT_NONE;
+var g_oscin_have: i32 = OSCIN_KIND_NONE;
+var g_oscin_cap_ms: u64 = 0;      // 本次捕获最近进食的时刻（判「陈旧」用）
+var g_oscin_cap: Buf = Buf{ ptr: null, len: 0, cap: 0 };
+var g_oscin_meta: Buf = Buf{ ptr: null, len: 0, cap: 0 };
+var g_oscin_pay: Buf = Buf{ ptr: null, len: 0, cap: 0 };
+var g_oscin_pend: Buf = Buf{ ptr: null, len: 0, cap: 0 };
+
+// 四个缓冲惰性分配（幂等）
+fn oscin_ensure() void {
+    if !buf_valid(&g_oscin_cap) {
+        g_oscin_cap = buf_new(OSCIN_CAP_MAX + 8);
+    }
+    if !buf_valid(&g_oscin_meta) {
+        g_oscin_meta = buf_new(OSCIN_CAP_MAX + 8);
+    }
+    if !buf_valid(&g_oscin_pay) {
+        g_oscin_pay = buf_new(OSCIN_CAP_MAX + 8);
+    }
+    if !buf_valid(&g_oscin_pend) {
+        g_oscin_pend = buf_new(OSCIN_PEND_MAX + 8);
+    }
+}
+
+// 复位（自测与「换会话要清干净」用）：捕获、挂起段、待取帧、armed 全清。
+export fn oscin_reset() void {
+    g_oscin_st = OSCIN_ST_PASS;
+    g_oscin_kind = OSCIN_KIND_NONE;
+    g_oscin_want = OSCIN_WANT_NONE;
+    g_oscin_have = OSCIN_KIND_NONE;
+    if buf_valid(&g_oscin_cap) {
+        buf_reset(&g_oscin_cap);
+    }
+    if buf_valid(&g_oscin_pend) {
+        buf_reset(&g_oscin_pend);
+    }
+}
+
+// 声明「我在等哪一类帧」。传 `OSCIN_WANT_NONE` 等于解除。
+// **armed 期间等于「fd 0 借给我了」** —— 键解码器那条路必须让开（见 `oscin_borrowed`），
+// 否则它会先一步把终端应答当按键读走（踩坑 137）。
+// **解除时不吐捕获**：吐回需要一个 out 缓冲，那一刻调用方不一定在键盘路径上。
+// 解除之后攥着的那几个字节在下一次 `oscin_feed` 的入口被吐回（见那边的第 0 步）。
+export fn oscin_arm(want: i32) void {
+    g_oscin_want = want;
+}
+
+// 解除等待。与 `oscin_arm(OSCIN_WANT_NONE)` 同义，单独一个名字是为了调用点好读。
+export fn oscin_disarm() void {
+    g_oscin_want = OSCIN_WANT_NONE;
+}
+
+// fd 0 现在归谁。**true = 等待方正在用它**（armed 中），键解码器这条路必须让开：
+// 终端应答与按键同走 fd 0，两边都去 `read` 的话，先跑的那个把字节吃掉 ——
+// 实测症状是「探测永远超时」（应答被 `tui_poll_keys` 喂进了键解码器，踩坑 137）。
+// 调用点：`tui_poll_keys` 开头早退；等待方自己读、把透传部分喂回 `tui_keys_feed`。
+export fn oscin_borrowed() bool {
+    return g_oscin_want != OSCIN_WANT_NONE;
+}
+
+// 待取帧的类型（`OSCIN_KIND_*`；0 = 没有）。**不消费** —— 配对的是 `oscin_frame()`。
+export fn oscin_frame_kind() i32 {
+    return g_oscin_have;
+}
+
+// 当前捕获进度（已收字节数；0 = 没在捕获）。观测与自测用：判「在收」而不是「收了什么」。
+export fn oscin_capture_len() usize {
+    if g_oscin_st == OSCIN_ST_PASS || !buf_valid(&g_oscin_cap) {
+        return 0;
+    }
+    return g_oscin_cap.len;
+}
+
+// 当前捕获是否已经**确定**是 OSC 5522（= 正在收剪贴板数据）。
+// 等待方据此决定「能不能把半截捕获吐回去」：已确定的 OSC 帧吐回去就等于把
+// base64 倒进输入行，宁可不吐（由调用方的读超时兜底）。
+export fn oscin_in_osc() bool {
+    return g_oscin_kind == OSCIN_KIND_OSC;
+}
+
+// 前缀判定：`ESC ] 5 5 2 2 ;` 的第 idx 个字节是不是 c。
+// 不写模块级数组常量 —— Uya 会把模块级 const 的数字数组推断成 int32（见 tuis_tail 的注释）。
+fn oscin_pfx_osc_ok(idx: usize, c: byte) bool {
+    if idx == 0 {
+        return c == OSCIN_ESC;
+    }
+    if idx == 1 {
+        return c == 93 as byte;          // ']'
+    }
+    if idx == 2 || idx == 3 {
+        return c == 53 as byte;          // '5'
+    }
+    if idx == 4 || idx == 5 {
+        return c == 50 as byte;          // '2'
+    }
+    return c == OSCIN_SEMI;              // idx == 6
+}
+
+// 前缀判定：`ESC [ ? 5 5 2 2` 的第 idx 个字节是不是 c。
+fn oscin_pfx_csi_ok(idx: usize, c: byte) bool {
+    if idx == 0 {
+        return c == OSCIN_ESC;
+    }
+    if idx == 1 {
+        return c == 91 as byte;          // '['
+    }
+    if idx == 2 {
+        return c == 63 as byte;          // '?'
+    }
+    if idx == 3 || idx == 4 {
+        return c == 53 as byte;          // '5'
+    }
+    return c == 50 as byte;              // idx == 5 / 6
+}
+
+// 往捕获里追加一个字节；超上限返回 false（调用方据此把整段吐回透传）。
+fn oscin_push(c: byte) bool {
+    oscin_ensure();
+    g_oscin_cap_ms = ua_now_ms();
+    if g_oscin_cap.len >= OSCIN_CAP_MAX {
+        return false;
+    }
+    return buf_append_byte(&g_oscin_cap, c);
+}
+
+// 把半截捕获**原样吐回**透传，并回到「无捕获」。未终结的帧走这条路（不变量 ③）。
+fn oscin_flush(out: &Buf) void {
+    if buf_valid(&g_oscin_cap) && g_oscin_cap.len > 0 {
+        _ = buf_append(out, g_oscin_cap.ptr as &const byte, g_oscin_cap.len);
+        buf_reset(&g_oscin_cap);
+    }
+    g_oscin_st = OSCIN_ST_PASS;
+    g_oscin_kind = OSCIN_KIND_NONE;
+}
+
+// 陈旧判定：armed 期间攥着一个**不完整**的前缀超过这个时长，就当它不是我们的帧。
+// 为什么必须有这条：`ESC` 是「取消」键 —— 等待方要能当场收到它。而 `ESC ] 5522 …`
+// 也是从 `ESC` 开头，两者在前几个字节上无法区分。所以：短窗口内继续等（真应答通常
+// 一次就读全），窗口一过就把攥着的字节吐回键解码器（那就是用户按的 esc）。
+const OSCIN_STALE_MS: u64 = 50;
+
+// 吐回「攥了太久」的不完整捕获，返回是否吐了东西。
+// 等待方在自己的等待循环里调它（每次 poll 超时调一次）—— 过期即让路。
+// 已经确定是 OSC / DECRPM 帧的**不吐**：那会儿吐出去就是把 base64 倒进输入行。
+export fn oscin_expire(out: &Buf) bool {
+    if g_oscin_st == OSCIN_ST_PASS || g_oscin_kind != OSCIN_KIND_UNDEC {
+        return false;
+    }
+    if ua_now_ms() - g_oscin_cap_ms < OSCIN_STALE_MS {
+        return false;
+    }
+    const had: usize = if buf_valid(&g_oscin_cap) { g_oscin_cap.len } else { 0
+        as usize };
+    oscin_flush(out);
+    return had > 0;
+}
+
+// 帧完整了：把捕获拆成 metadata / payload 存好，按 `want` 决定交付还是丢弃。
+//   * OSC：捕获体是 `<metadata>[;<payload>]`，按**第一个** `;` 切（payload 是 base64，
+//     自己不含 `;`，所以第一个 `;` 就是分界）；
+//   * DECRPM：捕获体是 `;<Ps>$y`，整个进 metadata（语义归 media/clipt）。
+fn oscin_deliver() void {
+    oscin_ensure();
+    buf_reset(&g_oscin_meta);
+    buf_reset(&g_oscin_pay);
+    const body: &const byte = g_oscin_cap.ptr as &const byte;
+    const blen: usize = g_oscin_cap.len;
+    var deliver: bool = false;
+    if g_oscin_kind == OSCIN_KIND_OSC {
+        var cut: usize = blen;                 // 没有第二个 ';' = 没有载荷
+        var j: usize = OSCIN_BODY_AT;
+        while j < blen {
+            if body[j] == OSCIN_SEMI {
+                cut = j;
+                break;
+            }
+            j = j + 1;
+        }
+        if cut > OSCIN_BODY_AT {
+            _ = buf_append(&g_oscin_meta, body + OSCIN_BODY_AT,
+                cut - OSCIN_BODY_AT);
+        }
+        if cut < blen {
+            _ = buf_append(&g_oscin_pay, body + (cut + 1), blen - (cut + 1));
+        }
+        deliver = g_oscin_want == OSCIN_WANT_DATA;
+    } else {
+        if blen > OSCIN_BODY_AT {
+            _ = buf_append(&g_oscin_meta, body + OSCIN_BODY_AT,
+                blen - OSCIN_BODY_AT);
+        }
+        deliver = g_oscin_want == OSCIN_WANT_PROBE;
+    }
+    g_oscin_have = if deliver { g_oscin_kind } else { OSCIN_KIND_NONE };
+    buf_reset(&g_oscin_cap);
+    g_oscin_kind = OSCIN_KIND_NONE;
+}
+
+// 捕获中的单字节步进。返回 true = 这一字节被吃进捕获；false = 捕获已吐回，
+// **本字节要重新处理**（它可能是一个新的 `ESC`，调用方据此不推进下标）。
+fn oscin_step(c: byte, out: &Buf) bool {
+    // (a) 候选还没定：逐字节对前缀，两边都对不上就整段吐回
+    if g_oscin_kind == OSCIN_KIND_UNDEC {
+        const idx: usize = g_oscin_cap.len;
+        var mask: i32 = 0;
+        if idx < OSCIN_PFX_N && oscin_pfx_osc_ok(idx, c) {
+            mask = mask | 1;
+        }
+        if idx < OSCIN_PFX_N && oscin_pfx_csi_ok(idx, c) {
+            mask = mask | 2;
+        }
+        if mask == 0 {
+            oscin_flush(out);
+            return false;
+        }
+        if !oscin_push(c) {
+            oscin_flush(out);
+            return false;
+        }
+        if g_oscin_cap.len >= OSCIN_PFX_N {
+            // 前缀吃满：idx 6 上 OSC 要 `;`、CSI 要 `2` —— 两者不同，所以到这一步已经唯一
+            g_oscin_kind = if (mask & 1) != 0 { OSCIN_KIND_OSC } else {
+                OSCIN_KIND_DECRPM };
+        }
+        return true;
+    }
+    // (b) OSC 5522：BEL 或 `ESC \` 收尾；其余（含单个 ESC）都是载荷
+    if g_oscin_kind == OSCIN_KIND_OSC {
+        if g_oscin_st == OSCIN_ST_CAP_ESC {
+            if c == OSCIN_BACKSLASH {
+                // `ESC \` = ST：刚追加的那个 ESC 是终结符的一半，从载荷里摘掉
+                if g_oscin_cap.len > 0 {
+                    buf_truncate(&g_oscin_cap, g_oscin_cap.len - 1);
+                }
+                g_oscin_st = OSCIN_ST_PASS;
+                oscin_deliver();
+                return true;
+            }
+            g_oscin_st = OSCIN_ST_CAP;     // 那个 ESC 是载荷的一部分
+        }
+        if c == OSCIN_ESC {
+            g_oscin_st = OSCIN_ST_CAP_ESC;
+        } else if c == OSCIN_BEL {
+            g_oscin_st = OSCIN_ST_PASS;
+            oscin_deliver();
+            return true;
+        }
+        if !oscin_push(c) {
+            oscin_flush(out);
+            return false;
+        }
+        return true;
+    }
+    // (c) DECRPM：CSI 的终结字节一律落在 0x40..0x7e；到它就收尾
+    // 体必须以 `;` 开头（规范：`CSI ? 5522 ; Ps $ y`）—— 没有它就不是 DECRPM，
+    // 整段吐回。这条让「畸形序列被当帧吞掉」不可能发生（用户真敲出这串也不例外）。
+    if g_oscin_cap.len == OSCIN_BODY_AT {
+        if c != OSCIN_SEMI {
+            oscin_flush(out);
+            return false;
+        }
+        return oscin_push(c);
+    }
+    if c >= 64 as byte && c <= 126 as byte {
+        g_oscin_st = OSCIN_ST_PASS;
+        oscin_deliver();
+        return true;
+    }
+    if !oscin_push(c) {
+        oscin_flush(out);
+        return false;
+    }
+    return true;
+}
+
+// 扫一段字节，返回**吃掉了多少**。正常情况吃完整段；一旦交付了一帧就提前收手
+// （不变量 ⑥：一次只交付一帧，尾巴留给调用方取走之后再解）。
+fn oscin_scan(p: &const byte, n: usize, out: &Buf) usize {
+    var i: usize = 0;
+    while i < n {
+        const c: byte = p[i];
+        if g_oscin_st == OSCIN_ST_PASS {
+            if c == OSCIN_ESC && g_oscin_want != OSCIN_WANT_NONE {
+                g_oscin_st = OSCIN_ST_CAP;
+                g_oscin_kind = OSCIN_KIND_UNDEC;
+                g_oscin_cap_ms = ua_now_ms();
+                buf_reset(&g_oscin_cap);
+                _ = buf_append_byte(&g_oscin_cap, c);
+                i = i + 1;
+                continue;
+            }
+            _ = buf_append_byte(out, c);
+            i = i + 1;
+            continue;
+        }
+        if !oscin_step(c, out) {
+            continue;      // 已吐回：本字节按透传重新处理（**不**推进 i）
+        }
+        i = i + 1;
+        if g_oscin_have != OSCIN_KIND_NONE {
+            return i;      // 交付了一帧：剩下的字节是挂起段（调用方取走后再喂回来）
+        }
+    }
+    return n;
+}
+
+// 把尾巴存进挂起段（超上限就丢掉 —— 那不是按键，是白噪声）
+fn oscin_stash(p: &const byte, n: usize) void {
+    oscin_ensure();
+    var take: usize = n;
+    if take > OSCIN_PEND_MAX {
+        take = OSCIN_PEND_MAX;
+    }
+    _ = buf_append(&g_oscin_pend, p, take);
+}
+
+// 喂一批 fd 0 的原始字节：透传部分**追加**到 `out`（调用方负责清它），完整帧被摘走。
+// `out` 与内部捕获缓冲绝不共用同一个 Buf。
+//
+// **没 armed 时逐字节原样透传、连捕获都不开**（不变量 ⑤）：
+//   * 键盘路径上「什么都不做」是唯一不会引入回归的行为。反过来（每个 ESC 都开捕获）
+//     会把**裸 ESC / 方向键**攥在手里 —— 行编辑器等的那个 `ESC` 永远不来，
+//     实测 tty-editor 轮 16 条断言当场全红（这正是那个「关键取舍」的代价面）。
+//   * 「不 armed 时把一整条 5522 原样放进输入行」不是注入面：应答只在 armed 期间被
+//     `oscin_deliver` 交付，而 armed 期间的伪造帧还要过 `id` 校验（media/clipt 那条）。
+export fn oscin_feed(p: &const byte, n: usize, out: &Buf) void {
+    oscin_ensure();
+    // 0) 上一轮解除等待时攥着的半截：现在有 out 了，先吐回键路（不变量 ③）
+    if g_oscin_st != OSCIN_ST_PASS && g_oscin_want == OSCIN_WANT_NONE {
+        oscin_flush(out);
+    }
+    if g_oscin_want == OSCIN_WANT_NONE && g_oscin_st == OSCIN_ST_PASS
+        && g_oscin_pend.len == 0 {
+        if n > 0 {
+            _ = buf_append(out, p, n);
+        }
+        return;
+    }
+    var cur: &const byte = p;
+    var rem: usize = n;
+    var guard: usize = 0;
+    while guard < 8 {
+        guard = guard + 1;
+        // 1) 先把挂起段解干净（它排在前面：那是更早读到的字节）。
+        //    为什么拷进局部 Buf 而不是「搬走 g_oscin_pend 再换一个新的」：
+        //    Uya 不许在循环里移动（move）一个循环外的变量的所有权（实测「循环中的变量不能移动」）。
+        //    拷贝一份的代价是一次 ≤4 KiB 的 memcpy，挂在粘贴这条冷路径上完全可以接受。
+        if g_oscin_pend.len > 0 {
+            var seg: Buf = buf_new(g_oscin_pend.len + 8);
+            if !buf_valid(&seg) {
+                return;
+            }
+            _ = buf_append(&seg, g_oscin_pend.ptr as &const byte,
+                g_oscin_pend.len);
+            buf_reset(&g_oscin_pend);
+            const used: usize = oscin_scan(seg.ptr as &const byte, seg.len,
+                out);
+            if used < seg.len {
+                oscin_stash(seg.ptr as &const byte + used, seg.len - used);
+            }
+            buf_free(&seg);
+            continue;      // 挂起段处理干净了，回头处理 cur
+        }
+        if rem == 0 {
+            return;
+        }
+        const used2: usize = oscin_scan(cur, rem, out);
+        if used2 < rem {
+            oscin_stash(cur + used2, rem - used2);
+            return;
+        }
+        rem = 0;
+    }
+}
+
+// 还有没有**已收到但还没交付**的帧字节（挂起段非空）？等待方据此在不来新字节时
+// 也继续把同一批里的后续帧解出来（一次 read 里常常是 OK+DATA+DONE 三帧连着到）。
+export fn oscin_pending() bool {
+    return buf_valid(&g_oscin_pend) && g_oscin_pend.len > 0;
+}
+
+// 把半截捕获吐回透传（公开版，给「超时 / 放弃等待」用）。返回是否真的吐了东西。
+// 调用方拿到 out 里新增的字节后要自己送去键解码器 —— 那才是「用户按键没被吞掉」。
+export fn oscin_flush_pending(out: &Buf) bool {
+    if g_oscin_st == OSCIN_ST_PASS {
+        return false;
+    }
+    const had: usize = if buf_valid(&g_oscin_cap) { g_oscin_cap.len } else { 0
+        as usize };
+    oscin_flush(out);
+    return had > 0;
+}
+
+// 取走当前帧：metadata / payload 分别拷进调用方的两个 Buf（先清空），并清掉待取标记。
+// 没有帧时两个 out 都被清空。
+export fn oscin_frame(meta: &Buf, pay: &Buf) void {
+    buf_reset(meta);
+    buf_reset(pay);
+    if g_oscin_have == OSCIN_KIND_NONE {
+        return;
+    }
+    if buf_valid(&g_oscin_meta) && g_oscin_meta.len > 0 {
+        _ = buf_append(meta, g_oscin_meta.ptr as &const byte, g_oscin_meta.len);
+    }
+    if buf_valid(&g_oscin_pay) && g_oscin_pay.len > 0 {
+        _ = buf_append(pay, g_oscin_pay.ptr as &const byte, g_oscin_pay.len);
+    }
+    g_oscin_have = OSCIN_KIND_NONE;
+}
