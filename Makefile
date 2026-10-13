@@ -9,6 +9,7 @@
 #   make e2e-diff   # /diff：真 git 的改动列表 + 单列文本回退 + 非仓库报错（离线）
 #   make e2e-ws     # 工作区：恢复时跟随会话记录 + 日志不改挂 + 显式优先 + 记录目录被删（离线）
 #   make e2e-portable # 拷一个二进制到「新机器」（空 HOME/无 DSH/无仓库）还能跑完整功能（离线）
+#   make e2e-dns    # 名字解析：自家解析器（假 DNS + .invalid 域名）与失败时的人话（离线）
 #   make e2e-tasks  # /tasks：报告头 / 空态串 / open / toggle / 非法参数（离线）
 #   make e2e-goal   # /goal：看状态 / 创建 / 拒绝顶掉 / edit / pause / resume / clear（离线）
 #   make e2e-sessions  # /sessions 三列 / 最新的在最后一行 / 同 id 取最后一条 / id 完整（离线）
@@ -121,6 +122,7 @@ SRC := src/foundation/bufx.uya src/foundation/jsonx.uya src/foundation/yamlcfg.u
        src/selftest/st_core.uya src/selftest/st_mock_server.uya src/selftest/st_round_driver.uya src/selftest/st_tty_sse.uya src/selftest/st_sessions.uya src/selftest/st_read_window.uya src/selftest/st_view_watch.uya src/selftest/st_responses.uya src/selftest/st_stats_ctx.uya src/selftest/st_title.uya src/selftest/st_tasks_ws.uya src/selftest/st_goal_worktree.uya src/selftest/st_pm.uya src/selftest/st_pm2.uya src/selftest/st_mcp.uya \
        src/selftest/tuis_core.uya src/selftest/tuis_title_pty.uya src/selftest/tuis_exit_cmd.uya src/selftest/tuis_diff_scroll.uya src/selftest/tuis_title_ask.uya src/selftest/tuis_sessions_big.uya src/selftest/tuis_tail.uya src/selftest/tuis_marquee_row.uya \
        src/selftest/st_web.uya src/selftest/st_web_childcfg.uya src/selftest/st_tls_pin.uya \
+       src/selftest/st_dns.uya \
        src/diff/model.uya src/diff/gitcmd.uya src/diff/rows.uya src/diff/view.uya src/diff/render.uya
 OUT := build/uya-agent
 
@@ -133,7 +135,7 @@ export UYA_ROOT
 export UYA_SPLIT_C_DIR := $(CURDIR)/build/uyacache
 
 # 行宽豁免：一条 .PHONY 就是一张全仓目标清单，拆行反而看不清哪条丢了
-.PHONY: all check print-src print-cflags build link-audit selftest codegen-audit doc-audit lint-size lint-size-all doc-cover ui-audit probe e2e e2e-config e2e-exec e2e-accept-nudge e2e-retry e2e-config-flags e2e-title e2e-title-cmd e2e-title-auto e2e-mouse e2e-api e2e-steps e2e-permission e2e-sandbox e2e-tasks e2e-goal e2e-memory e2e-memory-live e2e-sessions e2e-resume-big e2e-diff e2e-ws e2e-model e2e-model-save e2e-model-route e2e-worktree e2e-watch e2e-watch-pick e2e-dsh e2e-portable p30-check tui-demo tui-selftest web-selftest sess-selftest diff-selftest model-selftest panel-selftest clean shell-selftest pm-selftest mcp-selftest
+.PHONY: all check print-src print-cflags build link-audit selftest codegen-audit doc-audit lint-size lint-size-all doc-cover ui-audit probe e2e e2e-config e2e-exec e2e-accept-nudge e2e-retry e2e-config-flags e2e-title e2e-title-cmd e2e-title-auto e2e-mouse e2e-api e2e-steps e2e-permission e2e-sandbox e2e-tasks e2e-goal e2e-memory e2e-memory-live e2e-sessions e2e-resume-big e2e-diff e2e-ws e2e-model e2e-model-save e2e-model-route e2e-ctxwindow e2e-worktree e2e-watch e2e-watch-pick e2e-dsh e2e-portable e2e-dns p30-check tui-demo tui-selftest web-selftest sess-selftest diff-selftest model-selftest panel-selftest clean shell-selftest pm-selftest mcp-selftest
 
 all: build
 
@@ -255,7 +257,7 @@ lint-size-all:
 #   本仓实测：90 文件树上净增 50 个函数 + `rm -rf build && make build` → 通过（静态链接审计通过）。
 #   因此「净增函数按 0 处理」那条纪律作废。这段留下的用处只有一个：**换/降编译器时认得出症状**
 #   （报错点落在标准库、`make check` 全绿、只有清缓存重编才炸）。
-selftest: build codegen-audit doc-audit doc-cover ui-audit e2e-exec e2e-accept-nudge e2e-retry e2e-config-flags e2e-title e2e-title-cmd e2e-title-auto e2e-mouse e2e-api e2e-steps e2e-permission e2e-sandbox e2e-tasks e2e-goal e2e-memory e2e-memory-live e2e-sessions e2e-resume-big e2e-diff e2e-ws e2e-model e2e-model-save e2e-model-route e2e-worktree e2e-portable p30-check
+selftest: build codegen-audit doc-audit doc-cover ui-audit e2e-exec e2e-accept-nudge e2e-retry e2e-config-flags e2e-title e2e-title-cmd e2e-title-auto e2e-mouse e2e-api e2e-steps e2e-permission e2e-sandbox e2e-tasks e2e-goal e2e-memory e2e-memory-live e2e-sessions e2e-resume-big e2e-diff e2e-ws e2e-model e2e-model-save e2e-model-route e2e-ctxwindow e2e-worktree e2e-portable e2e-dns p30-check
 	UYA_BIN=$(UYA) $(OUT) --selftest
 
 probe: build
@@ -591,6 +593,59 @@ e2e-model: build
 	grep -q "provider: beta" $$home/settings.yaml || { echo "FAIL: 文本命令 /model beta/a-think 没有写回 settings.yaml"; cat $$home/settings.yaml; exit 1; }; \
 	grep -q "model: a-think" $$home/settings.yaml || { echo "FAIL: 写回设置时 model 不对"; cat $$home/settings.yaml; exit 1; }; \
 	echo "e2e-model: 通过（目录/能力跟随/目录外只换名字/REPL 报告与切换/非法档位拒/透传标注/同名跨提供方指定与提示/--provider 顺序无关/人敲的 /model 写回设置）"
+
+# P81：**上下文窗口的来源链**（离线，真二进制 + 真 settings.yaml）。
+# 四档来源：目录条目（dsh-settings）< `uya-agent.contextWindows`（uya-agent）<
+# `UYA_AGENT_CONTEXT_WINDOW`（env）< `--context-window`（cli）；都没有就沿用。
+# 判据：
+#   ① 目录条目；② 映射压过目录条目（含 `提供方/名字` 精确口径）；③ env 压过映射；
+#   ④ cli 压过 env；⑤ **两个 flag 的先后顺序无关**（以前是「谁在后面谁赢」，同一对参数
+#   结果不同 —— 这条是回归腿）；⑥ 非法值：CLI 报错退出（usage），env 只告警并忽略，
+#   设置里那条被跳过并计数；⑦ `--no-dsh-config` 不读映射，什么都没有时是 `-1 (unknown)`；
+#   ⑧ 人这一侧的出口：/model 报告的 ctx 行带来源，沿用要说出来。
+# ⚠ 一律 `env -i` 起：宿主环境里的 `UYA_AGENT_MODEL` / `UYA_AGENT_BASE_URL` 之类会把这些
+#   判据搅在一起（本仓的 e2e 目标里就属它最依赖「干净的机器」）。
+e2e-ctxwindow: build
+	@set -e; \
+	home=build/selftest_p80_e2e; rm -rf $$home; mkdir -p $$home; \
+	printf 'llm-pi-ai:\n  providers:\n    {\n      alpha:\n        {\n          api: openai-responses,\n          baseURL: https://alpha.example/v1,\n          apiKeyEnv: ALPHA_KEY,\n          models:\n            [\n              { id: w-one, contextWindow: 111000 },\n              { id: w-two },\n              { id: w-five, contextWindow: 222000 },\n              { id: w-six }\n            ]\n        }\n    }\nagent-default-model:\n  provider: alpha\n  model: w-one\nui-theme:\n  preference: dark\nuya-agent:\n  contextWindows:\n    w-one: 555000\n    alpha/w-two: 666000\n    bad-one: 256K\n' > $$home/settings.yaml; \
+	run() { env -i PATH=/usr/bin:/bin HOME=$$HOME $(CURDIR)/$(OUT) --dsh-home $$home --agent-home $$home/agent --no-dsh-writeback --api-key dummy-key --print-config "$$@"; }; \
+	: "① 映射没写、目录条目写了 ⇒ dsh-settings"; \
+	out=$$(run --model w-five 2>&1); \
+	echo "$$out" | grep -q "context_window = 222000  (source: dsh-settings)" || { echo "FAIL: 目录条目的 contextWindow 没生效"; echo "$$out"; exit 1; }; \
+	: "② 映射压过目录条目（111000 被 555000 盖掉）"; \
+	out=$$(run 2>&1); \
+	echo "$$out" | grep -q "context_window = 555000  (source: uya-agent)" || { echo "FAIL: uya-agent.contextWindows 没压过目录条目"; echo "$$out"; exit 1; }; \
+	echo "$$out" | grep -q "context_window_map = 2 model(s)  (skipped 1 entry/entries" || { echo "FAIL: 映射的条数/跳过计数不对"; echo "$$out"; exit 1; }; \
+	out=$$(run --model w-two 2>&1); \
+	echo "$$out" | grep -q "context_window = 666000  (source: uya-agent)" || { echo "FAIL: \`提供方/名字\` 那条映射没查到（目录条目里 w-two 没有窗口）"; echo "$$out"; exit 1; }; \
+	: "③ env 压过映射；④ cli 压过 env"; \
+	out=$$(env -i PATH=/usr/bin:/bin HOME=$$HOME UYA_AGENT_CONTEXT_WINDOW=123456 $(CURDIR)/$(OUT) --dsh-home $$home --agent-home $$home/agent --no-dsh-writeback --api-key dummy-key --print-config --model w-two 2>&1); \
+	echo "$$out" | grep -q "context_window = 123456  (source: env)" || { echo "FAIL: UYA_AGENT_CONTEXT_WINDOW 没压过映射"; echo "$$out"; exit 1; }; \
+	out=$$(env -i PATH=/usr/bin:/bin HOME=$$HOME UYA_AGENT_CONTEXT_WINDOW=123456 $(CURDIR)/$(OUT) --dsh-home $$home --agent-home $$home/agent --no-dsh-writeback --api-key dummy-key --print-config --model w-two --context-window 99999 2>&1); \
+	echo "$$out" | grep -q "context_window = 99999  (source: cli)" || { echo "FAIL: --context-window 没压过 env"; echo "$$out"; exit 1; }; \
+	: "⑤ 顺序无关：同一对参数、两种顺序，整份 --print-config 逐字节相同"; \
+	run --model w-two --context-window 99999 > $$home/order-a.txt 2>&1; \
+	run --context-window 99999 --model w-two > $$home/order-b.txt 2>&1; \
+	cmp -s $$home/order-a.txt $$home/order-b.txt || { echo "FAIL: --model 与 --context-window 的先后顺序会改变结果"; diff $$home/order-a.txt $$home/order-b.txt | head -20; exit 1; }; \
+	grep -q "context_window = 99999  (source: cli)" $$home/order-a.txt || { echo "FAIL: 顺序 A 里 cli 的窗口没生效"; exit 1; }; \
+	: "⑥ 非法值：CLI 报错退出（usage），env 只告警并忽略"; \
+	if run --context-window abc >/dev/null 2>&1; then \
+		echo "FAIL: --context-window abc 应当报错退出"; exit 1; \
+	fi; \
+	out=$$(env -i PATH=/usr/bin:/bin HOME=$$HOME UYA_AGENT_CONTEXT_WINDOW=256K $(CURDIR)/$(OUT) --dsh-home $$home --agent-home $$home/agent --no-dsh-writeback --api-key dummy-key --print-config 2>&1); \
+	echo "$$out" | grep -q "warning: UYA_AGENT_CONTEXT_WINDOW 不是正整数" || { echo "FAIL: 非法 env 值没有告警"; echo "$$out"; exit 1; }; \
+	echo "$$out" | grep -q "context_window = 555000  (source: uya-agent)" || { echo "FAIL: 非法 env 值被忽略之后应当回落到映射"; echo "$$out"; exit 1; }; \
+	: "⑦ --no-dsh-config：映射不读；一次都没人给过就是 -1 (unknown)"; \
+	out=$$(env -i PATH=/usr/bin:/bin HOME=$$HOME $(CURDIR)/$(OUT) --no-dsh-config --no-dsh-writeback --api-key dummy-key --print-config 2>&1); \
+	echo "$$out" | grep -q "context_window = -1 (unknown)  (source: default)" || { echo "FAIL: 没有来源时窗口应当印成 -1 (unknown)（不许把 -1 当 usize 印成天文数字）"; echo "$$out"; exit 1; }; \
+	echo "$$out" | grep -q "context_window_map = 0 model(s)  (--no-dsh-config: settings not read)" || { echo "FAIL: --no-dsh-config 时不该读 contextWindows（且要说明）"; echo "$$out"; exit 1; }; \
+	: "⑧ 人这一侧的出口：/model 报告的 ctx 行带来源，沿用要说出来"; \
+	out=$$(printf '/model\n/exit\n' | env -i PATH=/usr/bin:/bin HOME=$$HOME $(CURDIR)/$(OUT) --dsh-home $$home --agent-home $$home/agent --no-dsh-writeback --api-key dummy-key --no-tui --quiet 2>&1); \
+	echo "$$out" | grep -q "ctx        555000  (source: uya-agent)" || { echo "FAIL: /model 报告没有印出窗口与来源"; echo "$$out"; exit 1; }; \
+	out=$$(printf '/model w-six\n/model\n/exit\n' | env -i PATH=/usr/bin:/bin HOME=$$HOME $(CURDIR)/$(OUT) --dsh-home $$home --agent-home $$home/agent --no-dsh-writeback --api-key dummy-key --no-tui --quiet 2>&1); \
+	echo "$$out" | grep -q "ctx        555000  (source: default，沿用上一个模型的值)" || { echo "FAIL: 切到没有窗口的模型之后应当说清是「沿用」，不许照抄上一个模型的来源"; echo "$$out"; exit 1; }; \
+	echo "e2e-ctxwindow: 通过（目录条目 < 映射 < env < cli；顺序无关；非法值 CLI 拒·env 忽略·设置跳过并计数；--no-dsh-config 不读映射；-1 (unknown) 口径；/model 报告的 ctx 行）"
 
 # P71：**人运行中切模型/强度 ⇒ 这份选择写回 DSH 设置**（离线，真二进制 + 真 settings.yaml）
 #   对齐 DSH 自己的行为：`selectModel` → `agentDefaultModel.saveSelection()` → 同一个
@@ -1288,6 +1343,91 @@ e2e-api: build
 	echo "$$out" | grep -q '\"messages\":' \
 		|| { echo "FAIL: --api=chat 应当组装 chat 请求体"; exit 1; }; \
 	echo "e2e-api: 通过（默认 responses+一次性协商；--api= / UYA_AGENT_API 显式声明；非法值报错）"
+
+# DNS 解析器发现的端到端（离线，踩坑 133）：全程只打 127.0.0.1。
+#   * 正腿：`UYA_AGENT_DNS` 指向假解析器 + `--base-url http://mock-dns-e2e.invalid:…`
+#     —— `.invalid` 是 RFC 2606 保留域，任何**真**解析器都一定回 NXDOMAIN，所以这一轮
+#     跑绿只可能是本进程把查询发到了假解析器上（判据不可能靠机器上碰巧存在的 DNS 蒙对）；
+#   * 反腿：同一个域名、把解析器换成一个没人听的端口 ⇒ 必须是「域名解析失败」+ 退出码 2 +
+#     给 `UYA_AGENT_DNS` 这条自救路，**且不许提 TLS**（那正是这条线要修的谎）；
+#     流式与非流式**各跑一遍** —— 两条路的档位映射以前是各写一份的（非流式那份连档位
+#     都没有，DNS 失败只会说「检查 base-url / 网络」）；
+#   * `--print-config` 的 `dns = … (source: …)`：显式解析器与本地文件两个来源各验一条。
+e2e-dns: build
+	@set -e; \
+	ws=$$(pwd)/build/selftest_dns_e2e; req=$$ws/req.bin; \
+	rm -rf $$ws; mkdir -p $$ws; \
+	dnslog=$$ws/dns.log; gwlog=$$ws/gw.log; \
+	cleanup() { kill $$dnsp 2>/dev/null || true; kill $$gwp 2>/dev/null || true; \
+		rm -rf $$ws; }; \
+	trap cleanup EXIT; \
+	python3 testdata/mock_dns.py 0 127.0.0.1 > $$dnslog 2>&1 & dnsp=$$!; \
+	python3 testdata/mock_gateway_portable.py 0 $$req > $$gwlog 2>&1 & gwp=$$!; \
+	sleep 0.6; \
+	dp=$$(awk '/^PORT/{print $$2}' $$dnslog); \
+	gp=$$(awk '/^PORT/{print $$2}' $$gwlog); \
+	[ -n "$$dp" ] || { echo "FAIL: 假 DNS 没起来"; cat $$dnslog; exit 1; }; \
+	[ -n "$$gp" ] || { echo "FAIL: 假网关没起来"; cat $$gwlog; exit 1; }; \
+	: "---- ① 正腿：自家解析器 + .invalid 域名（真解析器必然解不出来）----"; \
+	: "  假网关回的是整段 JSON，所以两条腿都走 --no-stream（SSE 那条由 selftest 的轮次管）"; \
+	rc=0; \
+	env -u UYA_AGENT_BASE_URL UYA_AGENT_DNS=127.0.0.1:$$dp UYA_AGENT_API_KEY=k \
+		$(OUT) --no-dsh-config --no-tui --no-stream --api=chat --model dns-m \
+		--base-url "http://mock-dns-e2e.invalid:$$gp/v1" --workspace $$ws \
+		--agent-home $$ws/home --timeout-ms 20000 "hi" \
+		> $$ws/out.txt 2>&1 || rc=$$?; \
+	[ "$$rc" = "0" ] || { echo "FAIL: 显式解析器那一轮没跑通（rc=$$rc）"; \
+		cat $$ws/out.txt; cat $$dnslog; exit 1; }; \
+	grep -q "PORTABLE-OK" $$ws/out.txt \
+		|| { echo "FAIL: 假网关的答复没上屏（请求没到）"; cat $$ws/out.txt; exit 1; }; \
+	[ -s $$req ] || { echo "FAIL: 假网关一个请求都没收到"; exit 1; }; \
+	grep -q '"model":"dns-m"\|"model": *"dns-m"' $$req \
+		|| { echo "FAIL: 请求里的模型不是父进程给的那个"; head -c 400 $$req; exit 1; }; \
+	: "---- ①b 正腿：responses 那条协议上也一样（同一个解析器）----"; \
+	rc=0; \
+	env -u UYA_AGENT_BASE_URL UYA_AGENT_DNS=127.0.0.1:$$dp UYA_AGENT_API_KEY=k \
+		$(OUT) --no-dsh-config --no-tui --no-stream --api=responses --model dns-r \
+		--base-url "http://mock-dns-e2e.invalid:$$gp/v1" --workspace $$ws \
+		--agent-home $$ws/home --timeout-ms 20000 "hi" \
+		> $$ws/out2.txt 2>&1 || rc=$$?; \
+	[ "$$rc" = "0" ] || { echo "FAIL: responses 那条腿没跑通（rc=$$rc）"; \
+		cat $$ws/out2.txt; exit 1; }; \
+	grep -q '"model":"dns-r"\|"model": *"dns-r"' $$req \
+		|| { echo "FAIL: responses 那次请求没到假网关"; head -c 400 $$req; exit 1; }; \
+	: "---- ② 反腿：解析器不通（流式）----"; \
+	rc=0; \
+	env -u UYA_AGENT_BASE_URL UYA_AGENT_DNS=127.0.0.1:1 UYA_AGENT_API_KEY=k \
+		$(OUT) --no-dsh-config --no-tui --api=chat --model dns-m \
+		--base-url "http://mock-dns-e2e.invalid:$$gp/v1" --workspace $$ws \
+		--agent-home $$ws/home --timeout-ms 5000 "hi" > $$ws/bad.txt 2>&1 || rc=$$?; \
+	[ "$$rc" = "2" ] || { echo "FAIL: 解析失败时退出码应当是 2（传输错），实际 $$rc"; \
+		cat $$ws/bad.txt; exit 1; }; \
+	grep -q "域名解析失败" $$ws/bad.txt \
+		|| { echo "FAIL: 没说是域名解析失败"; cat $$ws/bad.txt; exit 1; }; \
+	grep -q "UYA_AGENT_DNS" $$ws/bad.txt \
+		|| { echo "FAIL: 没给出 UYA_AGENT_DNS 这条自救路"; cat $$ws/bad.txt; exit 1; }; \
+	if grep -q "TLS" $$ws/bad.txt; then \
+		echo "FAIL: DNS 失败却说成了 TLS（这条线要修的就是这个谎）"; \
+		cat $$ws/bad.txt; exit 1; fi; \
+	: "---- ③ 反腿：解析器不通（非流式：另一条路也要分类）----"; \
+	rc=0; \
+	env -u UYA_AGENT_BASE_URL UYA_AGENT_DNS=127.0.0.1:1 UYA_AGENT_API_KEY=k \
+		$(OUT) --no-dsh-config --no-tui --no-stream --api=chat --model dns-m \
+		--base-url "http://mock-dns-e2e.invalid:$$gp/v1" --workspace $$ws \
+		--agent-home $$ws/home --timeout-ms 5000 "hi" > $$ws/bad2.txt 2>&1 || rc=$$?; \
+	[ "$$rc" = "2" ] || { echo "FAIL: 非流式那条路的退出码应当是 2，实际 $$rc"; \
+		cat $$ws/bad2.txt; exit 1; }; \
+	grep -q "域名解析失败" $$ws/bad2.txt \
+		|| { echo "FAIL: 非流式那条路还在说「网络或 TLS 校验」"; \
+		cat $$ws/bad2.txt; exit 1; }; \
+	: "---- ④ --print-config 的 dns 行（两个来源）----"; \
+	out=$$(env -u UYA_AGENT_DNS $(OUT) --no-dsh-config --print-config 2>&1); \
+	echo "$$out" | grep -q "^dns = " \
+		|| { echo "FAIL: print-config 没有 dns 那一行"; echo "$$out" | grep -i dns; exit 1; }; \
+	out=$$(UYA_AGENT_DNS=127.0.0.1:$$dp $(OUT) --no-dsh-config --print-config 2>&1); \
+	echo "$$out" | grep -q "dns = 127.0.0.1:$$dp  (source: \$$UYA_AGENT_DNS)" \
+		|| { echo "FAIL: 显式解析器的来源没报成 env"; echo "$$out" | grep "^dns"; exit 1; }; \
+	echo "e2e-dns: 通过（自家解析器跑通 .invalid；流式与非流式都把 DNS 失败说成人话；print-config 两个来源）"
 
 # 步数默认值回归（离线，--print-config 不联网）：默认不限步数（0）；CLI 与环境变量同口径。
 # 默认值从「12 步熔断」改成「不限」是本仓库的显式决策（对齐 DSH：没有步数上限），

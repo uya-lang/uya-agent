@@ -814,6 +814,38 @@ bash 结果占请求窗口 **57.9%**，read 只占 **12.9%**；其中会走到�
 开关：`--no-compact` / `--context-window N` / `/compact`（运行中敲的排 step 边界）。
 `compaction/summary` 事件落日志。
 
+#### 5.3.4 上下文窗口的来源链（P81）
+
+上面两条（剪枝的压力闸门、压缩的触发线）都算 `floor(contextWindow × …)` —— 所以
+**`contextWindow` 从哪来**决定了它们什么时候生效。四档来源，从高到低：
+
+| 档 | 来源 | 实现点 | `--print-config` 的 source |
+|---|---|---|---|
+| ① | `--context-window N` | `agent.uya` 的 CLI 解析 | `cli` |
+| ② | `UYA_AGENT_CONTEXT_WINDOW=N` | `agent.uya` 的 env 段 | `env` |
+| ③ | `settings.yaml` 的 `uya-agent.contextWindows` | `modelx.uya` 的 `mx_read_windows` | `uya-agent` |
+| ④ | DSH 模型条目的 `contextWindow` | `agent_apply_dsh` / 模型目录 | `dsh-settings` |
+
+**定稿只有一个地方**：`agent_ctxwin_settle`（启动收尾 + 每次切模型 / 恢复会话都调它）。
+这解决了一个具体故障：以前 `--context-window N --model M` 与 `--model M --context-window N`
+**结果不同** —— 后解析的 `--model` 会按目录条目把刚定下的窗口盖回去（谁在后面谁赢）。
+定稿点放在**所有** CLI 解析之后，于是两种顺序逐字节相同（`e2e-ctxwindow` 用整份
+`--print-config` 的 `cmp` 钉这条）。
+
+四条口径（都是「配置不许说谎」）：
+
+| 口径 | 为什么 |
+|---|---|
+| ①② 是**显式**的，本会话谁也不许覆盖（切模型也不动） | 人是按**这一条路线**给的窗口（autodl 那种纯 env 部署连 DSH 目录都没有）；跟着目录改等于把显式配置降级成猜测 |
+| ③ 压过 ④ | 映射就是为「目录里没写 `contextWindow`」的路线准备的；同名模型跨提供方时用 `提供方/名字` 精确指定，裸名字是粗口径（键**整串匹配**，不做前缀） |
+| 一条来源都没有 ⇒ **沿用**，来源码退回 `default` | 清成 `-1` 会让压缩**静默**失效（`cmp_pressure_limit(<=0)=0`），与「目录外的模型名只换名字、能力保持不动」同一条理由；退回 `default` 是因为值来自**上一个**模型，照抄上一个模型的来源就是假话（实测：从映射里有的 w-one 切到没有的 w-five 之后仍标 `uya-agent`） |
+| 值必须是**纯十进制正整数**（1..999999999） | `yt_get_i64` / `parse_i32_arg` 都「读到第一个非数字为止」：`256K` 静默变 256、`abc` 静默变 0（= 窗口未知）—— 两条都让压缩线跑到谁也不认识的位置。拒绝的粒度分三处：CLI **报错退出**（与 `--permission bogus` 同口径）、env **告警后忽略**、设置里那条**跳过并计数**（`--print-config` 印 `skipped N`，启动另有一行 warning） |
+
+**可证出口两条**：机器侧是 `--print-config` 的 `context_window = N (source: …)` 与
+`context_window_map = N model(s)`；人侧是 `/model` 报告里的 `ctx` 行（裸 `/model` 与切完模型
+之后都会重画）。`-1`（未知）在 `--print-config` 里印成 `-1 (unknown)` 而**不是** `as usize`
+出来的 18446744073709551615 —— 那是同一类「配置在说谎」，顺手一起修了。
+
 ### 5.4 退化响应（空回复）：证据 + 同一步重发一次
 
 **判据**（`agent_finish_step`）：`finish` **不是** error、**不是** max-tokens，而这一步
@@ -2970,6 +3002,8 @@ responses 用 `{"type":"input_image","detail":"auto","image_url":…}`；
 | httpstream | `HC_PUMP_POLL_MS` | 50 | poll / 泵点粒度（= 「阻塞循环 ≤50 ms 插泵点」那条纪律） |
 | httpstream | `HC_TLS_CHUNK` | 16384 | TLS record 明文上限；每条 record 之后插泵点 |
 | httpc | 响应体上限 | 默认 `262144` | `--max-response` |
+| httpc | `HC_RESOLV_MAX` | 16384 | 解析器文件（resolv.conf）**整份读**的上限；撞上限置 `hc_resolv_trunc` 并报出来，不静默当「没有」（踩坑 133；标准库那边的窗口是 512 字节，正是那条坑） |
+| httpc | `HC_DNS_SERVER_MAX` / `HC_TARGET_MAX` | 64 / 256 | 解析器串（`a.b.c.d[:端口]`）/ 诊断里记的「最近一次连接目标」主机名 |
 | llm | `LLM_MAX_CALLS` | 16 | `calls` 固定数组容量；槽位用尽 `llm_slot` 返回 -1 |
 | llm | `LLM_EVENT_ARENA` | `262144` | 每事件 parse 的 arena；逐事件 reset |
 | llm | `LLM_ERR_HEAD` | 240 | `err_text` 只留坏 payload / 错误体的**头部** |
@@ -2978,6 +3012,8 @@ responses 用 `{"type":"input_image","detail":"auto","image_url":…}`；
 | agent | `EMPTY_RETRY_MAX` | 1 | 退化响应每步重发额度 |
 | agent | `request_bytes_needed` | `h.bytes*2 + 8192 + 8192 + model.len*2 + img_extra` | 请求缓冲预算 |
 | agent | `TOOL_FLAT_STRIP` | 31 字节 | Responses 形状的 schema 前缀，去掉即 flat |
+| modelx | `MX_MAX` / `MX_LEVELS` | 256 / 7 | 模型目录条目上限 / DSH 的七个推理档位 |
+| modelx | `MX_WIN_MAX` / `MX_WIN_MAX_VALUE` | 32 / `999999999` | `uya-agent.contextWindows` 的条目上限 / 窗口值上限（**9 位十进制**——定死位数，解析才不会溢出，同时挡住 `1000000000` 这类误写） |
 | compact | `cmp_prune_threshold` / `head` / `tail` | 8192 / 4096 / 1024 **码点** | 对齐 DSH `thresholdChars` / `headChars` / `tailChars` |
 | compact | `CMP_BASH_MIN_BUDGET` | 512 | 低于此不剪 bash 结果（剪了也没信息量） |
 | compact | `CMP_BASH_SIGNAL_PERMILLE` | 800 | 中段预算里信号行最多占 80% |
@@ -4918,7 +4954,55 @@ responses 用 `{"type":"input_image","detail":"auto","image_url":…}`；
      修法是把判据本体摘成不收 TlsConn 的 `tls_tofu_verdict`，自测直接调它。
      与踩坑 121 同族：**判据只要不是产品代码本身，就会在某个时刻只证明「复刻品是对的」**。
 
-133. **自带 agent home 的真 PTY 轮：夹具不清就是两路残留，而症状指着产品**（P80，收 P76
+133. **名字解析的「读窗口」比文件短 ⇒ 名字永远解不开，而报的是「TLS 校验」**（P80，用户报的：
+     同一条 `uya-agent hi` 在新的那台机器上换成这个症状）。现场与判定过程：
+
+     * **症状**：`./autodl.art; uya-agent hi` ⇒ `error: 请求失败（网络或 TLS 校验）。`（退出码 2）。
+     * **反证三条**（**先证伪「是 TLS」再往下走**，这一步省不得）：① `--probe --tls-verify=none`
+       报 `HcConnectFailed` —— 连握手都没进；② 同一轮的 `strace` 里**一次 `socket` 都没有**，
+       只有 `open("/etc/resolv.conf")` + `read(fd, …, 512)`；③ base-url 换成 IP 直连
+       （`https://101.126.37.23/api/v1`）时同一份代码 TCP + TLS + HTTP 全通，`curl` 同 key 打
+       `/v1/responses` 也是 200。⇒ **是名字解析，不是 TLS**。
+     * **根因**：`std.net.dns` 的 `dns_parse_resolv_conf_first_nameserver` **只读
+       `/etc/resolv.conf` 的前 512 字节**，就在这 512 字节里找 `nameserver`。而本机那份是
+       systemd 的 stub-resolv.conf：**920 字节、`nameserver 127.0.0.53` 在偏移 866** ——
+       正好在窗口之外 ⇒ `DnsNoNameserver` ⇒ 被 `tcp_connect` 糊成 `HcConnectFailed` ⇒
+       顶层那句「网络或 TLS 校验」。静态链接下不能用 `getaddrinfo`（NSS 要 `dlopen`，见 §16），
+       所以这一步只能自己做对。
+     * **和 P78 是同一条线**：P78 修的是「默认档在真实站点上必然 TLS 失败」（TOFU），
+       这台机器上下一个症状就是这条 —— 都是「**读窗口太小，就当文件里没有**」：
+       信任库读前 64 KiB（`DigiCert Global Root G2` 在偏移 75389，见 §18）与这里读前 512 字节
+       是同一个坑的两个实例。判据也一样：**窗口外的东西不会被报出来，只会被当成不存在**。
+
+     **修法**（不改标准库 —— §18 的既定立场：改了它，用户在新机器上 `clone` 本仓仍然坏）：
+     `src/net/httpc.uya` 自己**整份读**解析器文件（`hc_resolv_read`，上限 16 KiB、撞上限置
+     `hc_resolv_trunc` 而**不是**静默当成「没有」），按行扫描摘第一个可用 IPv4 的 `nameserver`
+     （`hc_resolv_scan`，纯函数、离线可测），再把结果喂给 `dns_client_init`；
+     `$UYA_AGENT_DNS`（`a.b.c.d[:端口]`）可以用一个环境变量直接指定解析器，**排障不必改文件、
+     也不必 root**。失败的**口径也分开了**：名字解析失败报 `HcDnsFailed`、TCP 连不上报
+     `HcConnectFailed`、TLS 握手谈崩报新的 `HcHandshakeFailed` —— 以前三种共用一个码，
+     用户只能看到「检查 base-url / 网络」，而真话（没解开名字、换哪台 DNS）就在手上。
+     显示层的档位映射 `agent_net_fail_kind` **两条路共用**：流式与非流式以前各写一份，
+     非流式那份只认 5 个 TLS 码 ⇒ `--no-stream` 下 DNS 失败永远落回那句兜底话。
+
+     **自测**（离线，`dns-resolv` 轮 + `make e2e-dns`）：扫描轮的夹具**特意造出** >512 字节的
+     注释头（并断言 `ns_off > 512`，判据的形状钉在断言里），真文件轮写一份同样形状的临时
+     `resolv.conf`、把路径钉进去、断言产品给出的解析器串**逐字节**是 `127.0.0.53`；
+     `e2e-dns` 用假 DNS（`testdata/mock_dns.py`）+ `.invalid` 域名（RFC 2606 保留域，
+     **真解析器必然解不出来** ⇒ 跑绿只可能来自自家解析器）跑通一轮，再用一个没人听的端口
+     验「DNS 失败必须说成人话、且不许提 TLS」（流式与非流式各一条腿）。
+     **防假绿对照两处（都真做过）**：
+     ① 把整份读退回 `buf_new(512)`（老口径）⇒ **真文件轮 4 条红**（「临时文件里有 nameserver
+     却说没有」等）。注意**扫描轮那两条不红** —— 它们直接喂文本、不走读文件，这正是
+     「回归腿要打在**接线**上，不是打在纯函数上」的现场：纯函数对、接线错，一样是坏。
+     这条对照还顺带红了覆盖轮的 2 条断言，翻出来产品里一个真问题：**原因记账没有优先级** ——
+     读窗口一变，`TRUNC` 就把「`$UYA_AGENT_DNS` 值非法」覆盖掉了。判据没变，是记账顺序错了
+     （见 `hc_dns_err_rank`）。
+     ② 把关键字匹配改回「老实现那类写法」（在**整行**里按前缀找 `nameserver`、参数取它后面
+     那个 token、不认注释）⇒ **扫描轮 3 条红**（注释行被当真 / `nameserverX` 被当真 /
+     `;` 注释与 tab 分隔没被认）。⇒ 两条对照都落在**不同**的段上，说明判据不是同一件事
+     的数次复述。
+134. **自带 agent home 的真 PTY 轮：夹具不清就是两路残留，而症状指着产品**（P80，收 P76
      那笔记成「既有失败」的账）。`tui-paste` 的真 PTY 腿用一个专用 home
      `build/selftest_agent_home_paste`，而它**从不清理** —— 而这一轮自己就是污染源，
      因为它真跑一整轮（mock LLM 让它 `bash echo …` 与 `write note.txt`）：
@@ -5114,6 +5198,14 @@ DEEPSEEK_API_KEY=sk-xxx ./build/uya-agent \
 `TlsConn`**（`llm_stream_style` 里那个是它的局部变量），旧代码因此在这条最需要指纹的路上
 把指纹丢掉了（踩坑 132）。
 
+**「连不上」的口径从 P80 起再分三档**（踩坑 133）：`HcDnsFailed`（名字没解开 —— 看解析器
+与 `$UYA_AGENT_DNS`）、`HcConnectFailed`（TCP 没连上 —— 看网络/代理/端口）、
+`HcHandshakeFailed`（TCP 已连上、握手谈崩 —— 看证书/中间设备）。这一档与上面那四档
+**不是同一件事**：前者是「信任判定不通过」（连接已经建立，是我们拒了它），
+后者是「连接压根没建立」。两族共用一个出口 `agent_net_fail_report(cfg, kind)`
+（`kind` 6/7/8 是新三档），第一行话术也分开了，所以 `uya-agent hi` 在 DNS 坏掉的机器上
+**不会再假装是 TLS 问题** —— 那正是这次用户看到的那句谎话。
+
 > 后续可做的（本项目**没做**）：给 `lib/tls` 补一条真正的链构建（用 issuer/签名关系从 leaf 走到
 > 信任锚、支持 SHA-384）、把 `MPI_MAX_LIMBS` 提到 RSA-2048 需要的大小、把信任库改成读全文件、
 > 并把 leaf 的 SAN 真正解析出来做主机名校验。**这四件事做完之前 `chain` 档都不可能对云端可用**
@@ -5186,6 +5278,7 @@ DEEPSEEK_API_KEY=sk-xxx ./build/uya-agent \
 | `model-apply` | 切换跟随能力、旧档位回落 `off`、幂等返回 1、目录外不动能力；**P62**：同名 a-two 用 `提供方/名字` **双向**指定（alpha↔delta：provider/contextWindow/端点都跟着换）、目录里查不到的左半段不被误拆（`Qwen/Qwen3-32B` 整串当模型名）；**P37 修复**：换提供方时 `base_url` 与 `api_style` **双向**跟随（beta→alpha→beta 都断言）、跟随来的来源码落 `dsh-settings`、**显式 `--base-url`/`--api-key` 不被覆盖**、提供方**没声明 `baseURL`** 时端点一个字节不动、**解析不出凭据**时清空 key（旧密钥绝不跨提供方）（踩坑 96） |
 | `effort-apply` | 公布的收、同值幂等返回 1、未公布拒 2、透传但 `effort_set=false` |
 | `model-log` | `session/model` 三字段取最后一条 |
+| `ctxwin` | P81 上下文窗口的来源链（离线、纯函数 + 假目录）：映射**压过**目录条目（目录 111000 / 映射 555000 ⇒ 555000）、`提供方/名字` 压过裸名字（裸 222000 / 精确 666000 ⇒ 666000，夹具里**裸那条写在前面** ⇒ 「先命中的赢」的错误实现会红）、同名模型跨提供方各自成条（beta/c-three ⇒ 777000）、只给裸名字那条腿、映射没写⇒目录条目兜底（123000 src 1）、**目录里根本没有**这个模型也照映射走（888000 src 5 —— autodl 那种纯 env 部署的形态）、一条来源都没有⇒**沿用**且来源码退回 0、**键是整串匹配**（`c-fi` 不许吃掉 `c-five` / 模型 `c-f` 不许被 `c-fi` 匹配）、显式（src 2/3）切模型也不被动、`--no-dsh-config` 不读映射、非法值**跳过并计数**（`c-four: 256K` 不许被截断成 256）。**防假绿对照 4 次**（每次先看到红再改回）：①去掉显式守卫 + 映射不参与 ⇒ 红 8 条；②键匹配改「键以查询开头」⇒ `c-f` 那条红；③键匹配改「查询以键开头」⇒ `c-five` 那条红（**②③ 是补出来的**：原计划的「目录外沿用原值」那条腿**抓不住**前缀匹配，见下面 §19.3）；④env 入口整段变死代码 ⇒ `e2e-ctxwindow` 的 env 腿红 |
 | `dsh-writeback` | P71 写回（`session/dshsave.uya`）：叶级替换（注释/兄弟节**逐字节**保留、行数不变）/ 幂等（`DSHW_SAME`，连 mtime 都不动）/ effort 清档 / 缺键追加节尾 / 整节缺失追加文末 / 空 provider 不写空值（那一行原样留）/ 需要引号的值（空格与 `#`）/ 控制字节拒写且文件不变 / flow 节拒（不猜、不整份重写）/ 锁被占让位（`DSHW_BUSY`）且**不删别人的锁** / 缺 `settings.yaml` 不新建 / 回执表（`SAME` 与 `SKIP` 一个字节不加）。**防假绿对照**：①把「从第 0 字节照抄」改回「只抄节头那一行」⇒ 红 7 条；②抢锁恒成功 ⇒ 红 3 条；③flow 判据停掉 ⇒ 红 2 条（这条首版是**假绿**：夹具值与被写值不同时，追加会被写前自检挡下，判据停掉照样绿 —— 夹具改成「已经就是那两个值」之后才真的钉住它） |
 | `worktree` | 真 git：建 worktree + `dsh/<slug>`、闸门、`wt_finish` 合并且目录消失 |
 | `worktree-discard` | `wt_discard` 不合并；非仓库 `wt_provision` 判 `SKIPPED` |
@@ -5244,7 +5337,7 @@ DEEPSEEK_API_KEY=sk-xxx ./build/uya-agent \
 | `tui-worktree` | P41 `/worktree` 动作选择浮层：标题/八个动作/✓ 标当前模式、反解只认动作行（「取消」不认）、默认游标 = `status`；`finish`/`discard` 选定不生效、先翻确认框（默认游标 = 取消）；**真 git**：确认前 worktree 目录与 phase 一个字节不动、确认后才合并 + 删除 |
 | `tui-mouse` | 踩坑 72 鼠标上报开关（`F2` / `/mouse` / `--no-mouse`）：标志位默认开 + `tui_set_mouse` 幂等；`F2` 两种编码（`ESC O Q` / `ESC[12~`）与 `/mouse on·off·非法`；**字节级**进/关/再开/关着进都与开关一致；帮助浮层里有 `F2` 那一条；**真 PTY** 两个方向（默认开必有 `1000h`、`mouse=false` 必无 `1000h`/`1006h`） |
 | `title-cmd` | P48 `/title` 与 `set_title`：清洗（80 B / 码点边界 / 控制序列全丢后为空 ⇒ 报错且标题**不动**）、钉住语义（`user` 置位后自动起标题不跑、`clear` 解锁）、revision 门控、落盘事件逐字节（kind 三档 + clear 的**空标题**事件）、索引同步、`set_title` 工具三支（合法/空串/缺键）、工具目录里有它；**P74**：派生的备用标题**不写** `g_sess.title`、**不落** `session/title`（口径：标题由模型总结）；`g_title_auto_done` 首次闩（起过一次之后连待办都不挂，硬挂上也不发） |
-| `tui-paste` | P50 括起粘贴九段：进/出粘贴态的字节级判据、CR **不许**提交（踩坑 83 的原始症状）、CRLF 折成一个换行、TAB 是字面内容且**帧里**不出现 TAB、粘贴里的 ANSI 序列逐字节保留、收尾标记被切开也认、断流时悬着的 ESC 不吞、上限对齐 200000 且超限有提示、光标列按显示口径（TAB 四个空格）+ **真 PTY** 粘 3 行只提交一次（按会话日志断言；P80 起轮次开头**清空**夹具 home，并加一条「启动屏上不许有用户条目」的绊线 —— 见踩坑 133） |
+| `tui-paste` | P50 括起粘贴九段：进/出粘贴态的字节级判据、CR **不许**提交（踩坑 83 的原始症状）、CRLF 折成一个换行、TAB 是字面内容且**帧里**不出现 TAB、粘贴里的 ANSI 序列逐字节保留、收尾标记被切开也认、断流时悬着的 ESC 不吞、上限对齐 200000 且超限有提示、光标列按显示口径（TAB 四个空格）+ **真 PTY** 粘 3 行只提交一次（按会话日志断言；P80 起轮次开头**清空**夹具 home，并加一条「启动屏上不许有用户条目」的绊线 —— 见踩坑 134） |
 | `img-sniff` | P51 图片纯函数层：**真 PNG 字节**（zlib 压出来的 64×48）读尺寸、GIF87a/89a 小端、JPEG 段链（长度段在前，尺寸不在固定偏移）、WebP 三变体（VP8X/VP8L/VP8 ）、纯文本与截断 PNG 一律拒绝、字节/像素两道预算、内容寻址 id 稳定、base64（长度与 PNG 签名）、附件 JSON 往返（**数字字段** + 坏记录只跳那一项）、占位文案与 B/KiB/MiB 三档 |
 | `clip-parse` | P52 X11 客户端可测部分：`DISPLAY` 五种形态（`:0`/`unix:7`/`host:1.0`/空/畸形）与三种畸形拒绝、**真 Xauthority 字节流**的两条目配对（family 256 + display 号 + MIT-MAGIC-COOKIE-1；不存在的 display 号**不许**回退到别的条目）、失败码文案非空 |
 | `tui-title-input` | P48 标题输入框：预填 AI 建议可见 + 编辑（打字/backspace/delete/←→/home·end/ctrl+u/中间插入，**按码点**不劈汉字）+ enter 采纳交回编辑后的文本 / esc 取消**不算改名** + 太矮回落 0 + 方框逐行闭合 + 窄框不越界 + 运行中 `/title <t>` 进安全集而裸 `/title` 不进 |
@@ -5276,6 +5369,8 @@ DEEPSEEK_API_KEY=sk-xxx ./build/uya-agent \
 | `web-childcfg` | P73：会话子进程的环境继承（踩坑 124 ②）。走**生产代码** `web_child_env`，判据看它排好的**环境数组**（`sh_env_array()`，不是 `getenv` —— 那读的是本进程真环境、看不见刚排好的表）：① 父进程给了非默认值时，14 条（权限/沙箱/端点/模型/凭据/档位/信任策略/指纹/工作区/home/max-steps/no-title/no-mouse/no-mcp）**逐条同名同值**；② 父进程没给（出厂默认）时那几条**不许注入**（否则把默认值钉死、挡住子进程读 `settings.yaml`）；③ `UYA_AGENT_WEB` 恒为 0（漏了它子进程递归起 web，踩坑 103）。**权限排第一**：它曾经被悄悄放宽成 `Full access`。防假绿对照：把 `web_child_env_cfg(cfg)` 换成 `_ = cfg;` 重编 ⇒ 当场红 10 条 |
 | `tls-pin` / `tls-tofu` | P78 信任档位（踩坑 132，离线、不联网、不需要证书）：`tls-pin` 段验指纹库的纯函数 —— 两行好行 + `#` 注释 + 空行解析出 2 条、主机名与指纹**两侧**大小写折叠、4 行畸形（hex 过短/过长/非 hex/只有主机名）一律跳过而**不中止**（后面那行好行必须还在）、CRLF 行尾与末行无换行都认、同一主机多条指纹命中任意一条、追加行必须是 `<host> <小写 hex>\n`、空库什么都不信、长度不是 64 的查询一律不认；`tls-tofu` 段起**真的临时目录 + 真的文件**走闭环 —— 首次 `FRESH` 且那一行**真的落盘了**、二次 `TRUSTED`、指纹变了 `MISMATCH`、另一台主机照样 `FRESH` 且**不覆盖**第一台的记录。防假绿对照两处：把 `tp_trusts` 改成忽略指纹比对 ⇒ 红 3 条；把 `tls_tofu_verdict` 里「首次落盘」那行删掉 ⇒ 红 5 条 |
 | `e2e-portable` | `make e2e-portable`（P73，踩坑 124）：把 `build/uya-agent` **拷到一个空目录**、`HOME` 也是空目录、**没有 DSH、没有仓库**（真新机器的样子），只带一个二进制。① 内嵌 preset 兜底：`--print-config` 报 `knobs (source: embedded)` 且旋钮值 == 内置缺省（逐字节）；跑一轮 `--plan` ⇒ 假网关收到的请求里必须有 `Make the plan decision-complete`（**该串只存在于上游 preset**，工作树与编译器树 0 命中 ⇒ 判据不可能假绿）；② **反向断言**：`--dsh-root testdata/preset-root` 时必须是 `source: preset` + `readLimit=1777`（内嵌不许夺磁盘的权）；③ web 会话子进程：只走命令行给 `--base-url/--model/--permission read-only/--agent-home`，断言假网关**收到**请求、请求里的模型是父进程给的那个、会话日志落在 `--agent-home` 下；④ `--no-dsh-config` 这类没有 env 口径的开关必须被启动日志点名。防假绿对照（两条都做过）：把内嵌兜底改成恒 `false` ⇒ 红在①；只停 plan 段的抽取（来源/旋钮照旧）⇒ 红在「plan 策略段缺失」；摘掉 `web_child_env_cfg(cfg)` ⇒ 红在③ |
+| `dns-resolv` | P80 名字解析（踩坑 133，离线、不联网、不需要证书）：**四段**。① 纯扫描：夹具**特意造出** >512 字节的注释头（并断言 `ns_off > 512`，把「现场的形状」钉进断言）——老实现只读前 512 字节 ⇒ 判成「文件里没有 nameserver」；另加注释行/`;` 注释/`nameserverX`/关键字后必须空白/行尾注释/tab/CRLF/末行无换行/先 v6 后 v4/只有 v6/畸形行不中止/空与纯注释；② 真文件闭环：写一份同形状的临时 `resolv.conf`、把路径钉进去 ⇒ 解析器串**逐字节** `127.0.0.53`、来源 = 文件、删掉文件后**不再**声称来自文件（原因 = 打不开）；③ 覆盖：`$UYA_AGENT_DNS` 合法值优先、非法值**不采用**且记 `ENV_BAD`、端口越界同判、清掉后不报 env。**防假绿对照两处（都真做过）**：① 把整份读退回 `buf_new(512)` ⇒ **真文件轮 4 条红**（扫描轮那两条**不红** —— 纯函数对、接线错也算坏，所以回归腿必须打在读文件那一层）；这条对照顺带抓出产品里一个真缺陷：原因记账没有优先级，`TRUNC` 会盖掉「变量值非法」（修成 `hc_dns_err_rank`）。② 关键字改回「整行按前缀找 + 参数取下一个 token」⇒ 扫描轮 3 条红 |
+| `e2e-dns` | `make e2e-dns`（P80，踩坑 133，离线，全程只打 127.0.0.1）：假 DNS（`testdata/mock_dns.py`）+ 假网关 + `.invalid` 域名（**RFC 2606 保留域，真解析器必然解不出来** ⇒ 跑绿只可能来自自家解析器）。① 正腿：`UYA_AGENT_DNS` 指向假 DNS ⇒ 退出 0、答复上屏、网关真收到；①b 同一条在 responses 协议上；②③ 反腿：解析器换成一个没人听的端口 ⇒ 退出 2、「域名解析失败」、给出 `UYA_AGENT_DNS` 这条路，**且 stderr 里不许出现 TLS**（流式与非流式各一条腿 —— 两条路的档位映射以前是各写一份的）；④ `--print-config` 的 `dns = … (source: …)` 两种来源各验一条 |
 | `tui-full` | P53 浮层全屏四组：**A** 非全屏仍是居中框（不顶格、`≤16` 行上限、第 30 项看不见）→ 全屏框 = 转录区（顶边第 0 行、左右边框 0 与 `cols-1`、标题 ` · 全屏`、行偏移表口径的逐行闭合、底边**正好**在 `panel_top-1`）+ 16 行上限解除（第 20 项可见、第 30 项仍不可见）；**B** `ctrl+f`（`0x06`）与 `F11`（`ESC[23~`）都切换，且**四种形态各认一次**（列表 / reader / ask / input）；**C** 不吃面板 / 状态区 / 脚注；**D** 没浮层时只落 notice、全屏态不跨浮层残留、`esc` 关掉后转录回来，终端太矮时 fail-closed 判据不变；**F** `/fullscreen` 四态（裸报状态 / `on` / `off` / 非法值只报错且状态不动、重复 `off` 幂等） |
 | `overlay-fullscreen` | `make p30-check` 第 9 场（真终端 + 假网关）：屏幕几何判据 —— 非全屏顶边 > 0 行且左边框 > 0 列 → `ctrl+f` 后顶边第 0 行、左右边框正好 `0` 与 `cols-1`、标题带 ` · 全屏`、面板与脚注都还在、底边行 < 面板行 → `F11` 关回居中 → 再全屏、`esc` 关掉后方框消失 |
 | `tasks-ctrl-t` | `make p30-check` 第 10 场（踩坑 114，真终端 + 假网关 `todo_first=1`）：回合**运行中**按 `ctrl+t` → `┌─ tasks ` ≤1.5 s 上屏**且那一刻 `SELFTEST_OK` 还没到** → 再按一次收回折叠行（实测 101 ms） |
@@ -5695,7 +5790,7 @@ DEEPSEEK_API_KEY=sk-xxx ./build/uya-agent \
   逐字节不变）；`--tui-demo` 与改动前逐字节相同（demo 里没有列表浮层）。
   记了一笔**既有失败**：`tui-paste` 的两条真 PTY 断言在本轮基线上同样红（CR 被当成回车提交
   / 会话日志里没有那条三行合一的 user 消息），当时判为「与本轮改动无关」。**那条判断是错的**
-  —— P80 查清它是夹具残留（见踩坑 133），两条红都不是粘贴逻辑的毛病。留这行是为了记住
+  —— P80 查清它是夹具残留（见踩坑 134），两条红都不是粘贴逻辑的毛病。留这行是为了记住
   代价：一句听起来像产品缺陷的失败文案（「CR 被当成了回车提交」）可以让一个夹具缺陷
   以「既有失败」的名义活过好几轮。
 
@@ -5965,6 +6060,61 @@ dsh 有压缩/剪枝），这既解释了本仓更高的单请求成本，也解
 ⇒ 换机/重装后第一步先 `uya --version` 认版本，别把这条当代码 bug 查。
 
 ### 19.3 P82：给主链加传输层重试（修 §19.1 坑二）
+### 19.4 P81：模型的上下文窗口（`uya-agent.contextWindows` + env + CLI）
+
+> 编号说明：**P80 被名字解析那条线占了**（`705b7f6`：`resolv.conf` 读窗口 + `UYA_AGENT_DNS`，
+> 踩坑 133），本线条因此在合并时按惯例让位、记成 **P81**（与「P74/P78 合并 main：踩坑编号
+> 让位」同一套做法，踩坑 110 一族）。两条线改的文件重合 8 个，合并时逐处取并集。
+
+用户报的原始症状是「上下文窗口配不动」：只有 `--context-window` 一个入口，而真机那条路线
+（`autodl.art` 的 `DeepSeek-V4.1-Flash`，纯 env 部署）既没有 DSH 目录条目、又必须手工传 flag。
+动手前先量了三条现状（都是 `--print-config` 实测）：
+
+| # | 事实 | 现场 |
+|---|---|---|
+| ① | `--context-window` 与 `--model` **谁赢取决于命令行顺序** | `--context-window 99999 --model a-plain` ⇒ `111000 (dsh-settings)`；反序 ⇒ `99999 (cli)` |
+| ② | 模型来自 env（或 DSH 默认路线）时，窗口取的是**那条路线**的值 | `UYA_AGENT_MODEL=a-plain`（目录里 111000）+ 默认路线 a-think（222000）⇒ 印 `model = a-plain` 而 `context_window = 222000` |
+| ③ | `-1`（未知）被 `as usize` 印成 `18446744073709551615` | `--no-dsh-config --print-config` |
+
+①②③ 都是「配置在说谎」这一族，所以修法一并收口：**四档来源 + 一个定稿点 + 两条可证出口**
+（§5.3.4 是设计，这里是验收）。
+
+**验收（都是实测）**：
+
+| 判据 | 结果 |
+|---|---|
+| 新增自测轮 `ctxwin`（9 条腿，见 §19 上表） | 全绿 |
+| 新增 `make e2e-ctxwindow`（8 条腿，真二进制 + 真 settings.yaml，**`env -i` 起**） | 全绿 |
+| **负控①** 去掉显式守卫 + 映射不参与 | 自测轮红 8 条（映射压不过条目、显式被覆盖） |
+| **负控②** 键匹配改成「键以查询开头」 | `c-f` 那条腿红 |
+| **负控③** 键匹配改成「查询以键开头」 | `c-five` 那条腿红 |
+| **负控④** env 入口整段变死代码 | `e2e-ctxwindow` 的 env 腿红 |
+| `make lint-size` / `make doc-cover` / `make doc-audit` / `uya check` / `make build` | 全通过 |
+
+**负控②③ 是补出来的** —— 原计划只打算用「目录外沿用原值」那条腿抓前缀匹配，实测**抓不住**
+（前缀匹配下 `c-six` 本来就查不到任何键，行为与正确实现一致）。真正的判据得让「一个键是另一个
+模型名的一部分」：于是夹具里加了 `c-fi: 101010` 与模型 `c-five` / `c-f`，两个方向各自一条腿。
+这是本轮最值钱的一条经验：**「我加了这个判据」与「这个判据真的能红」是两件事**，
+写判据时先问「哪种错误实现会让它红、那种实现现在会被别的判据拦住吗」。
+
+**与既有口径的一致性**：不写回设置文件（那是 P71 那条线的事，本轮只读）；不读 DSH 的
+provider 级 `defaultContextWindow`（DSH 自己的兜底链，本仓另有需要时再单开一轮）；
+子代理继承父的窗口（走的是同一份 `Config`），`--exec-effort` 那类自动降档不碰它。
+
+**已知的环境噪声（都不是本轮引入的，逐条量过）**：
+
+| 现象 | 现场 | 结论 |
+|---|---|---|
+| `make e2e-model` / `e2e-config-flags` 在**宿主已导出 `UYA_AGENT_*`** 的机器上红 | 本沙箱导出了 5 个 `UYA_AGENT_*`（含 `UYA_AGENT_MODEL`），断言 `base_url = … (source: default)` 的腿因此失败 | 这两个目标假定「干净的机器」；`env -i` 起就全绿（实测 4 个目标一起过）。`e2e-ctxwindow` 因此**一律 `env -i` 起**，两种环境都绿 |
+| 整轮 `--selftest` 里 `fs-tools` 红（`mock server verdict 47`） | 47 = grep 工具结果里该有 `Line 2: beta two`；而 grep 工具是 **ripgrep 子进程**，这台机器上 `rg` 根本不存在 | 环境缺 `rg`；与本轮无关 |
+| 同轮里 `compact-auto` 红（`verdict 88`） | 88 = 压缩后的请求里该有 checkpoint 前言 | 与 `rg` 同类的环境/顺序问题：判据两条 —— ① 换成干净 env、清空 fixture 重跑，**红法逐字相同**；② 该轮走 `agent_run`（进程内），而 `agent_run` → `agent_history_begin` → `agent_turn_loop` **一个字节都不碰**模型目录 / `agent_ctxwin_settle`（新增的调用点只有 `main`、`agent_model_apply`、`agent_model_resume_apply`）⇒ 本轮改动在那条路径上不可达 |
+| `tui-paste` 时红时绿 | 真 PTY 轮，三轮里红两轮 | 踩坑 98 那一族（跨轮残留的键盘时钟 / PTY 时序），单跑另说 |
+
+其余 164 条 `selftest[…] ok` 与全部模型相关 e2e（`e2e-model` / `e2e-model-save` /
+`e2e-model-route` / `e2e-config-flags`）在干净 env 下全过。
+
+---
+
 
 §19.1 的坑二是本轮唯一一条**直接该改本仓**的结论，本轮把它做掉：**本仓原来一层重试都没有** ——
 `agent_step_stream` 收到 `err_kind == 3`（网络/TLS）直接 `return AGENT_NET`（退出码 2），
@@ -6066,7 +6216,7 @@ dsh 有压缩/剪枝），这既解释了本仓更高的单请求成本，也解
   任何「客户端还会再发一次」的腿都会撞 ECONNREFUSED 然后无限重试下去（整轮套件没有全局
   超时，一个轮次就能拖死它）。P82 那三轮自己把闸门开回来。
 
-### 19.4 P79 交付后复测：**n=1 的「dsh 快 1.8×」是噪声，被 n=3 推翻**
+### 19.5 P79 交付后复测：**n=1 的「dsh 快 1.8×」是噪声，被 n=3 推翻**
 
 §19.1 那张表是 **n=1**，当时就标了「不是统计显著」。复测把三题各跑 **n=3**，
 结论**变了**，记在这里以免那份 n=1 的数字被当成定论引用。
