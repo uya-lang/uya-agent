@@ -179,6 +179,95 @@ def check_registry_full():
     return bad
 
 
+# ---- G：端口通道号不许直通 term/ 层 ----
+# 两套编号**不同**（实测）：端口是 MAIN=1 / REASON=2 / NOTICE=3；而 TUI 内部
+# `tui_sink_bytes` 是 1=正文 / 2=通知 / 3=思考（`tty_reason_write` 送的就是 3）。
+# 所以 `tui_sink_bytes(chan, …)` 这种「原样转发」会把**思考和通知对调** —— 不崩、
+# 不报错、编译期也看不见，只是内容串位。所有转发必须过一张显式映射表。
+TERM_CALL = re.compile(r'\b((?:tui|tty)_[A-Za-z0-9_]*)\s*\(')
+# 端口侧那个「通道」形参的名字（后端实现里就叫 chan，接口规定如此）
+PORT_CHAN_NAMES = ('chan',)
+
+
+def check_chan_passthrough():
+    """G：`src/ui/` 里把 `chan` 原样喂给 `tui_*` / `tty_*` = 通道编号直通。"""
+    bad = []
+    for rel in uya_files('src/ui'):
+        for i, line in enumerate(read_lines(rel), 1):
+            code = strip_comment(line)
+            hit = False
+            for m in TERM_CALL.finditer(code):
+                args = code[m.end():m.end() + 200]
+                for v in PORT_CHAN_NAMES:
+                    if re.search(r'(?<![A-Za-z0-9_])%s(?![A-Za-z0-9_])' % v, args):
+                        bad.append('%s:%d: %s' % (rel, i, line.strip()))
+                        hit = True
+                        break
+                if hit:
+                    break
+    return bad
+
+
+# ---- H：`ui_use` 的目标槽必须真有后端 ----
+# 判据要读**真值**：`g_reg` 的数组字面量里那一槽是不是 `g_null`。只看「有没有
+# `ui_reg_put(UI_BE_X)`」是不够的 —— `ui_reg_put(UI_BE_X, g_null)` 与「没登记」在
+# 运行期是同一件事（丢输出 + 提问 fail closed），那样这条判据自己就是假绿的。
+BE_DECL = re.compile(r'UI_BE_([A-Z0-9_]+)\s*:\s*u8\s*=\s*(\d+)')
+USE_DECL = re.compile(r'ui_use\s*\(\s*UI_BE_([A-Z0-9_]+)\s*\)')
+# g_reg 的数组字面量（判据 E 也用它）= 槽位真值的唯一来源
+REG_LITERAL = re.compile(
+    r'var\s+g_reg\s*:\s*\[UiBackend\s*:\s*UI_BE_MAX\]\s*=\s*\[([^\]]*)\]')
+
+
+def backend_slot_state():
+    """读 `g_reg` 字面量：返回 (槽下标 → 元素原文, 后端名 → 编号)。
+
+    元素原文用来判「这一槽是不是空后端」（`g_null` = 没真后端）。
+    """
+    src = ''.join(read_lines('src/ui/ui_reg.uya'))
+    m = REG_LITERAL.search(src)
+    if not m:
+        return None, None
+    slots = [x.strip() for x in m.group(1).split(',') if x.strip()]
+    names = {}
+    for rel in uya_files('src/ui'):
+        for line in read_lines(rel):
+            for mm in BE_DECL.finditer(strip_comment(line)):
+                names[mm.group(1)] = int(mm.group(2))
+    return slots, names
+
+
+def check_use_is_registered():
+    """H：每个 `ui_use(UI_BE_X)` 的槽在 `g_reg` 里都不能是空后端。
+
+    **`UI_BE_NULL` 是例外**：它的槽本来就该是 `g_null`（那正是「没有界面」这个状态
+    本身），`ui_use(UI_BE_NULL)` 是**正常收尾**。要抓的是另一种：切到一个**还没落地**
+    的非空后端（`UI_BE_SCROLL` / `UI_BE_EVENTS` 这类占位槽）—— 那时界面看起来"切
+    过去了"，实际什么都不显示。
+    """
+    slots, names = backend_slot_state()
+    if slots is None:
+        return ['src/ui/ui_reg.uya: 找不到 g_reg 的数组字面量（判据 H 需要它保持这个形状）']
+    bad = []
+    for rel in uya_files('src'):
+        for i, line in enumerate(read_lines(rel), 1):
+            for m in USE_DECL.finditer(strip_comment(line)):
+                name = m.group(1)
+                if name == 'NULL':
+                    continue          # 正常收尾，见 docstring
+                idx = names.get(name)
+                if idx is None or idx >= len(slots):
+                    bad.append('%s:%d: ui_use(UI_BE_%s) —— 该后端号没有对应的 '
+                               'g_reg 槽' % (rel, i, name))
+                    continue
+                elem = slots[idx]
+                if elem in ('g_null', 'null'):
+                    bad.append('%s:%d: ui_use(UI_BE_%s) 的槽里是空后端 —— '
+                               '切过去会静默丢弃一切输出、提问一律 fail closed'
+                               % (rel, i, name))
+    return bad
+
+
 # ---- F：欠账计数（进展量，不判失败）----
 def count_debt():
     """F：执行层里 tui_active() / tui_overlay_kind() 的出现次数（P80 的目标是 0）。"""
@@ -202,6 +291,9 @@ def main():
         ('C 端口层依赖执行核', check_port_purity()),
         ('D 后端没有实现 UiBackend', check_backend_impl()),
         ('E 注册表槽位没填满', check_registry_full()),
+        ('G 端口通道号直通 term/ 层（端口 REASON=2/NOTICE=3 vs TUI 3/2）',
+         check_chan_passthrough()),
+        ('H `ui_use` 切到空后端（静默丢弃一切输出）', check_use_is_registered()),
     ]
     failed = 0
     for title, bad in sections:

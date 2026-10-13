@@ -1,0 +1,322 @@
+// src/ui/be_tui.uya — 全屏 TUI 后端：把 `UiBackend` 接到 `term/tui/` 上
+//
+// 本文件：`TuiBe`（`UiBackend` 的全屏实现）—— 7 个方法全部委托 `term/tui/` 的
+//   现有符号。它是「执行核不认识界面」这条设计的**第一个真实后端**：端口层
+//   只认效果（`text` / `status` / `pump` / `ask` / `start` / `stop` / `on`），
+//   画成什么样全在这里决定。
+// 不变量：① **通道映射必须显式**（见下）—— 端口与 TUI 内部的编号不是同一套；
+//   ② **本文件不许认识 `Config` / `agent_` / `g_sess`**（审计判据 C）：raw 模式、
+//   `sigx_*`、标题栈、鼠标启动值这些依赖 `Config` 的动作**留在 `agent_tui_start`**，
+//   本文件只做「起帧」；③ `ask` 的**没渠道一律 fail closed**（返回
+//   `error.UiNoChannel`，绝不假装「用户拒绝了」——那会让人以为有人回答过）；
+//   ④ 本文件只在 `term/tui/` 之上做转发，**不复制任何排版逻辑**（排版是共享库）。
+// 依赖：本域 ui/ui_port（接口与常量）、term/tui/（frame / hook / entry / status /
+//   ask / diff / overlay）、term/tty（无需 —— 帧 fd 由 `tui_start` 持有）。
+// 命名：`TuiBe`；方法名由接口规定（`kind_name` / `start` / `stop` / `text` /
+//   `status` / `pump` / `on` / `ask`），它们**只经接口调用**，所以不带文件前缀。
+//
+// ⚠ **两套通道编号（本文件最容易错的一处，实测）**：
+//
+//   | 语义   | 端口（UI_CH_*） | TUI 内部（tui_sink_bytes） |
+//   |--------|-----------------|----------------------------|
+//   | 正文   | 1               | 1                          |
+//   | 思考   | 2               | **3**（`tty_reason_write`）|
+//   | 通知   | 3               | **2**（按行切开）          |
+//
+// 三个里错了两个。所以下面**只走 `betui_chan_map()` 这一张表**，任何地方都不许把
+// 端口的 `chan` 直接喂给 `tui_sink_bytes`（那正是 `make ui-audit` 判据 G 钉的东西：
+// 它不崩、不报错、编译期看不见，只是**思考和通知对调**）。
+
+// ============================================================
+// 通道映射（唯一一份）
+// ============================================================
+
+// 端口通道号 → TUI 内部通道号。表里**没有**的取值回 0 = 丢弃（fail closed：
+// 不认识的通道宁可什么都不画，也不猜一个塞进去）。
+fn betui_chan_map(chan: u8) i32 {
+    if chan == UI_CH_MAIN {
+        return 1;
+    }
+    if chan == UI_CH_REASON {
+        return 3;
+    }
+    if chan == UI_CH_NOTICE {
+        return 2;
+    }
+    return 0;
+}
+
+// ============================================================
+// 后端
+// ============================================================
+
+export struct TuiBe : UiBackend {
+    // started 由本后端自己记：`tui_active()` 读的是 TUI 的 `g_tui_on`，两者在
+    // 「headless 自测」下会分叉（那里 g_tui_on 是被 tui_headless_enable 顶起来的）。
+    // 端口问的是「这个后端活没活」，所以用自己的位，别去猜 TUI 的。
+    started: bool,
+
+    // 机器名。
+    fn kind_name(self: &Self) &const byte {
+        return "tui" as &const byte;
+    }
+
+    // 起界面：只做「起帧」这一半。
+    //
+    // **不在这里做的**（都由 `agent_tui_start` 负责，因为它们依赖 `Config`）：
+    //   ① raw 模式（`tty_raw_on`）；② 信号处置（`sigx_install_terminal` /
+    //   `sigx_install_winch` / `sigx_arm`）；③ 私有输出 fd 的 `dup`；④ 标题栈；
+    //   ⑤ 鼠标上报的启动值；⑥ 状态区初始值（模型 / cwd / 分支 / 档位 / 命令行）。
+    // 那些全是「进入全屏界面」的**外部条件**，端口层不认识它们是设计的一部分
+    // （审计判据 C 明令禁止 `src/ui/` 出现 `Config`）。
+    //
+    // `tui_start` 自己会发 1049h 进备用屏幕、开括起粘贴、按需开鼠标。cols/rows 为 0
+    // 时 `tui_set_size` 不动画布（`agent_tui_start` 已经在 tui_start 之后设过一次）。
+    fn start(self: &Self, cols: usize, rows: usize) bool {
+        tui_start(tui_out_fd());
+        tui_set_size(cols, rows);
+        self.started = true;
+        return true;
+    }
+
+    // 收界面：幂等（没 start 过也能调）。
+    fn stop(self: &Self) void {
+        if self.started {
+            tui_stop();
+        }
+        self.started = false;
+    }
+
+    // 一个**离散条目**：一次调用 = 一条条目，**不切行、不续接**（与 `text` 相反）。
+    // 这一族的三个入口（user / steer / tool）在 TUI 里各是一种条目类型；
+    // notice 另走 `betui_add_notice`（它自带 512 B/条的上限口径）。
+    fn entry(self: &Self, kind: u8, p: &const byte, n: usize) void {
+        if n == 0 && kind != UI_ENT_TOOL {
+            return;   // tool 块允许空（调用方用它补一个空行，见 agent_tui_seed_history）
+        }
+        if kind == UI_ENT_USER {
+            betui_add_user(p, n);
+            return;
+        }
+        if kind == UI_ENT_STEER {
+            betui_add_steer(p, n);
+            return;
+        }
+        if kind == UI_ENT_TOOL {
+            betui_add_tool_block(p, n);
+            return;
+        }
+        if kind == UI_ENT_NOTICE {
+            // 走 TUI 自己的 NOTICE 入口：它按 `tui_notice_append` 的 512 B/条口径截断，
+            // 并**新起一条**条目（这正是离散语义，不能改走 `text` 的字节流）。
+            betui_add_notice(p, n);
+            return;
+        }
+        // 表外的条目种类：丢弃，**不猜**（fail closed）。
+        return;
+    }
+
+    // 一条文本事实：**过映射表**（见文件头的两套编号）。
+    fn text(self: &Self, chan: u8, p: &const byte, n: usize) void {
+        if n == 0 {
+            return;
+        }
+        const c: i32 = betui_chan_map(chan);
+        if c <= 0 {
+            return;
+        }
+        tui_sink_bytes(c, p, n);
+    }
+
+    // 一条状态事实（what = UI_ST_*）。**载荷形状就是「事实」本身**，这里只做
+    // 「事实 → TUI setter」的搬运，不做任何排版决定。
+    //
+    // `UI_ST_RUN` 的载荷是**两行**：第一行十进制运行态（UI_RUN_*），第二行可选标签
+    // （如 "Bash(make check)"）—— 用 `\n` 分隔，与 `UI_ST_MODEL` 的 `/` 同一套
+    // 「纯文本、自己切」口径（端口层不认识 `Buf` 之外的类型，也不做 JSON）。
+    fn status(self: &Self, what: u8, p: &const byte, n: usize) void {
+        if what == UI_ST_RUN {
+            var kind: u8 = UI_RUN_IDLE;
+            var label: &const byte = "" as &const byte;
+            var ln: usize = 0;
+            var cut: usize = n;
+            var i: usize = 0;
+            while i < n {
+                if p[i] == 10 as byte {
+                    cut = i;
+                    break;
+                }
+                i = i + 1;
+            }
+            // 第一行按十进制读运行态；读不出来（不是数字）= 沿用 IDLE，**不猜**。
+            var v: u8 = 0;
+            if cut > 0 {
+                const d: i64 = parse_u64_at(p[0: cut], 0, cut);
+                if d >= 0 && d <= 255 {
+                    v = d as u8;
+                }
+            }
+            kind = betui_run_map(v);
+            if cut < n {
+                label = &p[cut + 1];
+                ln = n - cut - 1;
+            }
+            tui_set_run(kind, label, ln);
+            return;
+        }
+        if what == UI_ST_TEXT {
+            tui_set_stats(p, n);
+            return;
+        }
+        if what == UI_ST_PLAN {
+            // "1" / "0"（端口口径）。别的一律按关（fail closed：看不懂就不许假装开着）。
+            tui_set_plan(n == 1 && p[0] == 49 as byte);
+            return;
+        }
+        if what == UI_ST_ACCESS {
+            // 端口口径：`PERM_*` 的**十进制字节**。解析不出来（空 / 非数字 / 越界）
+            // 就**保持不动** —— 这条纪律与其他几条一致：显示层是**镜像**，不是真值源，
+            // 看不懂的载荷不许把屏幕上的访问模式改掉（否则一个坏载荷会显示成
+            // 「用户把权限降了」，而策略本身没变 —— 屏幕与事实分叉是最难查的一类）。
+            if n > 0 {
+                const d: i64 = parse_u64_at(p[0: n], 0, n);
+                if d >= 0 && d <= 255 {
+                    tui_set_access(d as u8);
+                }
+            }
+            return;
+        }
+        if what == UI_ST_CTX {
+            if n > 0 {
+                const d: i64 = parse_u64_at(p[0: n], 0, n);
+                if d >= 0 {
+                    tui_set_ctx(d as i32);
+                }
+            }
+            return;
+        }
+        // UI_ST_MODEL / UI_ST_TASKS：TUI 侧没有「按文本收」的 setter（模型是
+        // `tui_set_model(model, provider)` 两段、任务块由 `tasks_panel_sync()` 从
+        // tasks.uya 自取）。这两条**本轮不接**，如实留空而不是猜一个形状塞进去。
+        return;
+    }
+
+    // 泵一次界面：把「等输入」与「刷帧」合成一次调用（阻塞循环里跑）。
+    // 返回中断意图码（0 = 无事）—— 端口口径与 `tui_pump_input()` 一致，
+    // 所以这里直呼它（**不是** `chan`，判据 G 不管这一处）。
+    fn pump(self: &Self, timeout_ms: i32) i32 {
+        if timeout_ms > 0 {
+            _ = tui_poll_keys(timeout_ms);
+        } else {
+            tui_poll_tick();
+        }
+        return tui_pump_input();
+    }
+
+    // 问一个事实。
+    fn on(self: &Self, what: u8) bool {
+        if what == UI_ON_ACTIVE {
+            return self.started && tui_active();
+        }
+        if what == UI_ON_OVERLAY_OK {
+            // fail closed 的判据：终端太矮时浮层画不出来 ⇒ 「看不见就不许做」。
+            return self.started && tui_active() && tui_overlay_available();
+        }
+        return false;
+    }
+
+    // 提问（UI_ASK_*）。**没渠道一律 `error.UiNoChannel`**。
+    //
+    // 分流：approve / plan / reader 走各自的阻塞等待（kind 决定浮层形态），title 走
+    // input 型等待。语义与 `tools/askuser.uya` 今天的口径一致：返回 1 = 采纳、
+    // 0 = 取消/中断、**回 error 才是「没有渠道」**。
+    fn ask(self: &Self, req: &const UiReq, ans: &UiAns) !i32 {
+        if !self.started || !tui_active() {
+            return error.UiNoChannel;
+        }
+        if !tui_overlay_available() {
+            // 浮层画不出来 = 这个后端此刻没有问答渠道（**不是**用户拒绝）。
+            return error.UiNoChannel;
+        }
+        if req.kind == UI_ASK_TITLE {
+            const rc: i32 = tui_title_input_wait(req.title, req.tn,
+                req.body, req.bn, &ans.text);
+            if rc == 1 {
+                ans.sel = 0;
+                return UI_ANS_OK as i32;
+            }
+            return UI_ANS_CANCEL as i32;
+        }
+        var pick: Buf = buf_new(1024);
+        defer { buf_free(&pick); }
+        var want: u8 = TUI_OVK_APPROVE;
+        var rc: i32 = 0;
+        if req.kind == UI_ASK_APPROVE {
+            want = TUI_OVK_APPROVE;
+            rc = tui_confirm_wait(want, req.title, req.tn, req.body, req.bn,
+                req.items, req.inlen, req.sel, &pick);
+        } else if req.kind == UI_ASK_PLAN {
+            want = TUI_OVK_PLAN;
+            rc = tui_reader_wait(want, req.title, req.tn, req.body, req.bn,
+                req.items, req.inlen, req.sel, &pick);
+        } else if req.kind == UI_ASK_READER {
+            want = TUI_OVK_TASKS;
+            rc = tui_reader_wait(want, req.title, req.tn, req.body, req.bn,
+                req.items, req.inlen, req.sel, &pick);
+        } else if req.kind == UI_ASK_QUESTION {
+            rc = tui_ask_wait(req.title, req.tn, req.body, req.bn,
+                req.items, req.inlen, false, req.sel);
+        } else {
+            // 不认识的提问种类：不猜浮层，如实说没渠道。
+            return error.UiNoChannel;
+        }
+        if rc != 1 {
+            return UI_ANS_CANCEL as i32;
+        }
+        // 选中项的下标：`tui_confirm_wait` / `tui_reader_wait` 回的是**原文**，
+        // 这里按 `req.items` 逐行回查（与 askuser 的「按下标回查，不反解文本」
+        // 同一口径）。
+        const pp: &const byte = pick.ptr as &const byte;
+        ans.sel = betui_pick_index(req.items, req.inlen, pp, pick.len);
+        return UI_ANS_OK as i32;
+    }
+}
+
+// 端口运行态 → TUI 运行态。表里没有的取值回 IDLE（fail closed：不认识就是空闲）。
+fn betui_run_map(v: u8) u8 {
+    if v == UI_RUN_THINK {
+        return TUI_RUN_THINK;
+    }
+    if v == UI_RUN_STREAM {
+        return TUI_RUN_STREAM;
+    }
+    if v == UI_RUN_TOOL {
+        return TUI_RUN_TOOL;
+    }
+    return TUI_RUN_IDLE;
+}
+
+// 在 `\n` 分隔的选项表里回查 `pick` 是第几行（0 起）。找不到回 0 ——
+// 调用方只在 rc == 1（采纳）时才读它，而那时 pick 一定来自这张表。
+fn betui_pick_index(items: &const byte, inlen: usize,
+    pick: &const byte, pn: usize) usize {
+    if inlen == 0 || pn == 0 {
+        return 0;
+    }
+    var idx: usize = 0;
+    var start: usize = 0;
+    var i: usize = 0;
+    while i <= inlen {
+        const at_end: bool = i == inlen;
+        if at_end || items[i] == 10 as byte {
+            const seg: usize = i - start;
+            if seg == pn && bufx_mem_eq(&items[start], pick, pn) {
+                return idx;
+            }
+            idx = idx + 1;
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    return 0;
+}

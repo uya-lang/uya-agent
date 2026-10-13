@@ -109,7 +109,7 @@ SRC := src/foundation/bufx.uya src/foundation/jsonx.uya src/foundation/yamlcfg.u
        src/term/oscin.uya src/term/mdview.uya src/term/tasks.uya src/term/tty.uya \
        src/term/tui/style.uya src/term/tui/keys.uya src/term/tui/frame.uya src/term/tui/entry.uya src/term/tui/screen.uya src/term/tui/overlay.uya src/term/tui/status.uya src/term/tui/ask.uya src/term/tui/watch.uya src/term/tui/diff.uya src/term/tui/hook.uya \
        src/term/view.uya src/term/watch.uya \
-       src/ui/ui_port.uya src/ui/be_null.uya src/ui/ui_reg.uya \
+       src/ui/ui_port.uya src/ui/be_null.uya src/ui/be_tui.uya src/ui/be_events.uya src/ui/ui_reg.uya src/ui/ui_fwd.uya \
        src/tools/askuser.uya src/tools/fsx.uya src/tools/jobs.uya src/tools/perm.uya src/tools/sandboxx.uya src/tools/search.uya src/tools/shellx.uya \
        src/plugin/mcpcfg.uya src/plugin/mcprun.uya src/plugin/mcp.uya src/plugin/mcptool.uya \
        src/session/dshcfg.uya src/session/dshsave.uya src/session/dshsess.uya src/session/inbox.uya src/session/modelx.uya src/session/procx.uya src/session/session.uya src/session/sigx.uya src/session/stats.uya \
@@ -123,7 +123,7 @@ SRC := src/foundation/bufx.uya src/foundation/jsonx.uya src/foundation/yamlcfg.u
        src/selftest/tuis_core.uya src/selftest/tuis_title_pty.uya src/selftest/tuis_exit_cmd.uya src/selftest/tuis_diff_scroll.uya src/selftest/tuis_title_ask.uya src/selftest/tuis_sessions_big.uya src/selftest/tuis_tail.uya src/selftest/tuis_marquee_row.uya \
        src/selftest/st_web.uya src/selftest/st_web_childcfg.uya src/selftest/st_tls_pin.uya \
        src/selftest/st_dns.uya \
-       src/selftest/st_clip.uya \
+       src/selftest/st_clip.uya src/selftest/tuis_ui_port.uya src/selftest/tuis_events.uya \
        src/diff/model.uya src/diff/gitcmd.uya src/diff/rows.uya src/diff/view.uya src/diff/render.uya
 OUT := build/uya-agent
 
