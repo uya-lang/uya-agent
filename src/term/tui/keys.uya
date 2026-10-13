@@ -59,6 +59,15 @@ export const TUI_K_MOUSE_TOGGLE: i32 = 29;
 // 终端一字节，任何终端都送得到）与 `F11`（`ESC[23~`）。F11 是「全屏」的通行直觉，但
 // 很多桌面环境把它抢去当窗口全屏，所以 ctrl+f 才是主绑定、F11 是顺手的备选。
 export const TUI_K_FULLSCREEN: i32 = 30;
+// P84：拖选（左键按下 / 拖动 / 抬起）。为什么非做不可：终端把鼠标交给我们之后它自己的
+// 拖选就没了（踩坑 72），而真机实测这台终端（deepin-terminal 6.5.21 / QTermWidget）
+// **既不认 OSC 5522 也不认 OSC 52** —— 探针 `ESC[?5522$p` 零应答、OSC 52 写 `c`/`p`
+// 两块板子一个字节都不变（同机的 DSR 探针对照有应答，所以不是「读不到」的假阴性）。
+// 于是「拖选复制」只能自己实现：TUI 记选区 + 画高亮，复制交给 X11 选区所有权。
+// 坐标随事件一起给（`tui_mouse_xy`）：事件队列只放得下一个 i32，与字符队列同一套分工。
+export const TUI_K_MOUSE_PRESS: i32 = 32;
+export const TUI_K_MOUSE_DRAG: i32 = 33;
+export const TUI_K_MOUSE_RELEASE: i32 = 34;
 
 // 一次滚轮滚几行（与 PgUp/PgDn 的一屏同一口径之外的细粒度）
 const TUI_WHEEL_STEP: usize = 5;
@@ -88,6 +97,11 @@ var g_tui_np: i32 = 0;          // 已收几个参数
 // P25：SGR 鼠标（`ESC[<b;x;yM`）。b 的 bit6(64) = 滚轮，低两位 0=上 1=下。
 var g_tui_x10_left: i32 = 0;    // 老式 X10 鼠标 `ESC[M` 后面还剩几个字节要吃
 var g_tui_mouse_sgr: bool = false;   // 本次 CSI 是 `<` 起头的 SGR 鼠标
+// P84：最近一次鼠标坐标（**0 基**行/列，越界夹到 0）。事件队列只装得下一个 i32，
+// 所以 x/y 与事件码分两条路走 —— 与字符队列（g_tui_chars + TUI_K_CHAR）同一套分工：
+// 派发方收到 MOUSE_* 就立刻用 tui_mouse_xy 取这一对的坐标。
+var g_tui_mouse_row: usize = 0;
+var g_tui_mouse_col: usize = 0;
 var g_tui_utf: usize = 0;       // UTF-8 已收到的字节数
 var g_tui_utf_have: usize = 0;
 var g_tui_utf_buf: [byte: 8] = [0: 8];
@@ -206,6 +220,9 @@ export fn tui_key_reset() void {
     g_tui_utf_have = 0;
     g_tui_mouse_sgr = false;
     g_tui_x10_left = 0;
+    g_tui_mouse_row = 0;
+    g_tui_mouse_col = 0;
+    g_tui_mouse_qn = 0;
     if buf_valid(&g_tui_chars) {
         buf_reset(&g_tui_chars);
     }
@@ -243,12 +260,72 @@ fn tui_csi_arg(idx: i32) i32 {
     return 0;
 }
 
-// SGR 鼠标收尾：`ESC[<b;x;y` + M/m。
-//   * 只认滚轮（b 的 bit6 / 也就是 64..127 那一档且低两位是 0/1）；
-//   * 其它按下/抬起/移动一律吃掉 —— 我们不画自己的选择层，选中由终端的
-//     shift/option 路走（与「不做鼠标选择」口径一致）。
-fn tui_mouse_finish() void {
-    tui_csi_push();   // y 也收进来（不用，但保证状态干净）
+// 鼠标坐标记一笔（协议里 x/y 都是 **1 基**，这里统一折成 0 基；负数/越界夹到 0）。
+// 为什么夹取而不是丢弃：终端可能报出窗口外的坐标（拖到边缘、窗口刚缩过），
+// 丢掉整条事件会让「拖到边缘再拖回来」的选区断在半路。
+fn tui_mouse_set_xy(ix: i32, iy: i32) void {
+    g_tui_mouse_col = if ix > 1 { (ix - 1) as usize } else { 0 as usize };
+    g_tui_mouse_row = if iy > 1 { (iy - 1) as usize } else { 0 as usize };
+}
+
+// 压一个鼠标事件：**坐标与事件一起压**（同一个下标对上同一条事件）。
+//
+// 为什么必须是队列而不是两个变量：真机实测终端把 `按下 + 拖动 + 抬起` **一次 write**
+// 送过来（45 字节一条），于是一整串事件在同一次 tui_key_feed 里解码、排队、再逐个派发。
+// 只留「最近一次坐标」的话，三个事件读到的都是**最后一个**坐标 —— 选区锚点与终点
+// 会变成同一个点，拖选等于没拖（屏幕上什么都不高亮）。字符队列（g_tui_chars +
+// TUI_K_CHAR）是同一个道理，这里照它的分工办。
+const TUI_MOUSEQ_MAX: usize = 512;
+var g_tui_mouse_qr: [i32: TUI_MOUSEQ_MAX] = [0: TUI_MOUSEQ_MAX];
+var g_tui_mouse_qc: [i32: TUI_MOUSEQ_MAX] = [0: TUI_MOUSEQ_MAX];
+var g_tui_mouse_qn: usize = 0;
+
+// 坐标 + 事件一起入队。队列满就**两个都不压** —— 只压一个会让坐标与事件错位，
+// 后面每一条事件都会拿到上一条的坐标（比丢一次按键坏得多）。
+fn tui_mouse_push(ix: i32, iy: i32, ev: i32) void {
+    if g_tui_mouse_qn >= TUI_MOUSEQ_MAX || g_tui_evn >= TUI_EVQ_MAX {
+        return;
+    }
+    tui_mouse_set_xy(ix, iy);
+    g_tui_mouse_qr[g_tui_mouse_qn] = g_tui_mouse_row as i32;
+    g_tui_mouse_qc[g_tui_mouse_qn] = g_tui_mouse_col as i32;
+    g_tui_mouse_qn = g_tui_mouse_qn + 1;
+    tui_ev_push(ev);
+}
+
+// 取**队首**那条鼠标事件的坐标（0 基行/列，**消费式**：取一次前进一格）。
+// 派发方必须在每一条 MOUSE_PRESS/DRAG/RELEASE 上恰好调一次 —— 与
+// `tui_key_take_char` 对 TUI_K_CHAR 的要求一字不差。
+// 队列空（调用方没按约定配对）时返回上一次的坐标并**不前进**：宁可坐标不动，
+// 也不许把后面的事件全部错位一格。
+export fn tui_mouse_xy(row: &usize, col: &usize) void {
+    if g_tui_mouse_qn > 0 {
+        const ir: i32 = g_tui_mouse_qr[0];
+        const ic: i32 = g_tui_mouse_qc[0];
+        g_tui_mouse_row = if ir > 0 { ir as usize } else { 0 as usize };
+        g_tui_mouse_col = if ic > 0 { ic as usize } else { 0 as usize };
+        var i: usize = 0;
+        while i + 1 < g_tui_mouse_qn {
+            g_tui_mouse_qr[i] = g_tui_mouse_qr[i + 1];
+            g_tui_mouse_qc[i] = g_tui_mouse_qc[i + 1];
+            i = i + 1;
+        }
+        g_tui_mouse_qn = g_tui_mouse_qn - 1;
+    }
+    row[0] = g_tui_mouse_row;
+    col[0] = g_tui_mouse_col;
+}
+
+// SGR 鼠标收尾：`ESC[<b;x;y` + M/m（f 就是那个终结字节）。
+//   * 滚轮（b 的 bit6，64..127）：折成 WHEEL_UP/DOWN —— **与 P25 一个字节不变**；
+//   * 左键（b & 3 == 0）：按下 / 拖动（bit5）/ 抬起（终结字节 `m`）折成 P84 的三个事件；
+//   * 中键 / 右键 / 其它修饰组合一律吃掉 —— 终端菜单与用户习惯留在终端那边。
+//
+// 为什么拖动只认 bit5 就够：真机实测（deepin-terminal 6.5.21 / QTermWidget，xdotool 驱动）
+// 只要开了 `?1000h`，按住拖动就会送来 `ESC[<32;x;yM`（bit5 = 32），**不需要 `?1002h`**。
+// 所以 `TUI_MOUSE_ON` 那 16 字节原样不动（三个自测轮钉着它们，动了就要连改三处）。
+fn tui_mouse_finish(f: byte) void {
+    tui_csi_push();   // y 也收进来
     const b: i32 = tui_csi_arg(0);
     if b >= 64 && b < 128 {
         const low: i32 = b - 64;
@@ -257,7 +334,29 @@ fn tui_mouse_finish() void {
         } else if low == 1 {
             tui_ev_push(TUI_K_WHEEL_DOWN);
         }
+        return;
     }
+    if (b & 3) != 0 {
+        return;   // 中键 / 右键：不启选区
+    }
+    // 带修饰的（bit2..4 = shift/alt/ctrl —— 位掩码与 CSI 的「1 + 掩码」同一套：
+    // shift=4 / alt=8 / ctrl=16）一律**不吃**。为什么必须显式滤掉：左键的「哪一键」
+    // 只看最低两位，所以 shift+左键的 b=4 低两位仍是 0 —— 不滤的话它与普通左键
+    // 走同一条路，而用户按 shift 的意图恰恰是「这次用终端自己的选择」。
+    if (b & 28) != 0 {
+        return;
+    }
+    const ix: i32 = tui_csi_arg(1);
+    const iy: i32 = tui_csi_arg(2);
+    if (b & 32) != 0 {
+        tui_mouse_push(ix, iy, TUI_K_MOUSE_DRAG);
+        return;
+    }
+    if f == 109 as byte {
+        tui_mouse_push(ix, iy, TUI_K_MOUSE_RELEASE);   // 'm' = 抬起
+        return;
+    }
+    tui_mouse_push(ix, iy, TUI_K_MOUSE_PRESS);
 }
 
 // 修饰键位：xterm 的 CSI 修饰参数是「1 + 位掩码」（shift=1 / alt=2 / ctrl=4）。
@@ -387,7 +486,7 @@ fn tui_esc_final(f: byte) void {
         // SGR 鼠标（P25）：按第一个参数 b 折成滚轮事件。必须 `ESC[<` 起头 ——
         // 裸 `ESC[M` 是 X10 鼠标（下面那条），`ESC[2M` 是「删 2 行」（忽略）。
         if g_tui_mouse_sgr {
-            tui_mouse_finish();
+            tui_mouse_finish(f);
             return;
         }
         if !g_tui_esc_have && g_tui_np == 0 {

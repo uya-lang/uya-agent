@@ -1,0 +1,285 @@
+// src/term/tui/sel.uya — 全屏 TUI（P84）：鼠标拖选 + 选中文本提取
+//
+// 本文件：拖选状态（按下记锚点 / 拖动伸终点 / 抬起冻结）、按**屏幕行列**取选区、
+//   高亮区间查询（成帧时逐行问它，见 frame 的 tui_encode_row）、以及把选区还原成
+//   **纯文本**（复制用，交给 media/clipw 送进 X11 剪贴板）。
+// 不变量：① 选区坐标是**屏幕行列**（0 基），不是转录行号 —— 滚动时选区原地不动
+//   （与终端自己的拖选一致），所以它不会跟着文本跑；
+//   ② 一律按**显示列**取字符，宽字符整取整取 —— 绝不在半个汉字中间切；
+//   ③ 行尾空白裁掉（粘到别处不会拖一串空格），行间用 '\n' 连接；
+//   ④ 选区夹在转录区内（行 < g_tui_panel_top）—— 面板 / 状态区 / 脚注不进选区；
+//   ⑤ 没有选区时 `tui_sel_span` 恒 false，成帧路径与 P84 之前**逐字节一致**。
+// 依赖：term/tui/style（帧模型与行表）、term/tty（字符宽度与 UTF-8 步进）。
+// 命名：`tui_sel_*`（对外）、`g_tui_sel_*`（内部）。
+//
+// 为什么要有这个文件：终端把鼠标交给我们之后，它自己的拖选就没了（§16 踩坑 72），
+// 而真机实测用户这台终端（deepin-terminal 6.5.21 / QTermWidget）**既不认 OSC 5522
+// 也不认 OSC 52** —— 探针 `ESC[?5522$p` 零应答、OSC 52 写 `c`/`p` 两块板子一个字节
+// 都不变（同机 DSR 探针对照有应答，排除「读不到」的假阴性）。于是「拖选复制」只能
+// 自己实现：这里负责「选了什么」与「文本长什么样」，送剪贴板是 media/clipw 的事。
+
+// 选区的字节上限（与 TUI_IN_MAX 同量级：一次拖选够选中一整屏多的文本）。
+// 超限**明确提示并截断**，不静默（与粘贴上限同一条纪律）。
+export const TUI_SEL_MAX: usize = 200000;
+
+var g_tui_sel_on: bool = false;      // 有选区（抬起之后仍为真：选区留在屏幕上）
+var g_tui_sel_drag: bool = false;    // 正在拖（按下到抬起之间）
+var g_tui_sel_ar: usize = 0;         // 锚点行（0 基屏幕行）
+var g_tui_sel_ac: usize = 0;         // 锚点列（0 基显示列）
+var g_tui_sel_er: usize = 0;         // 终点行
+var g_tui_sel_ec: usize = 0;         // 终点列
+var g_tui_sel_over: bool = false;    // 上一次提取超限了（回执要说清楚）
+
+// 行夹到转录区之内（`g_tui_panel_top` 之上）。帧还没建（nrows == 0）时返回 0。
+fn tui_sel_clamp_row(r: usize) usize {
+    var lim: usize = g_tui_panel_top;
+    if lim > g_tui_nrows {
+        lim = g_tui_nrows;
+    }
+    if lim == 0 {
+        return 0;
+    }
+    if r + 1 > lim {
+        return lim - 1;
+    }
+    return r;
+}
+
+// 列夹到终端宽度之内（拖到窗口外时终端可能报出界坐标，见 keys 的 tui_mouse_set_xy）
+fn tui_sel_clamp_col(c: usize) usize {
+    if c > g_tui_cols {
+        return g_tui_cols;
+    }
+    return c;
+}
+
+// 归一到「起点在前」的一对行列（行优先）。锚点可以比终点靠后（反向拖选）。
+fn tui_sel_bounds(r0: &usize, c0: &usize, r1: &usize, c1: &usize) void {
+    const fwd: bool = g_tui_sel_ar < g_tui_sel_er
+        || (g_tui_sel_ar == g_tui_sel_er && g_tui_sel_ac <= g_tui_sel_ec);
+    if fwd {
+        r0[0] = g_tui_sel_ar;
+        c0[0] = g_tui_sel_ac;
+        r1[0] = g_tui_sel_er;
+        c1[0] = g_tui_sel_ec;
+    } else {
+        r0[0] = g_tui_sel_er;
+        c0[0] = g_tui_sel_ec;
+        r1[0] = g_tui_sel_ar;
+        c1[0] = g_tui_sel_ac;
+    }
+}
+
+// 选区现在是空的吗（一个点 = 空：单击不构成选区，也就不该去动剪贴板）
+fn tui_sel_empty() bool {
+    return g_tui_sel_ar == g_tui_sel_er && g_tui_sel_ac == g_tui_sel_ec;
+}
+
+// 有选区吗（成帧路径用它做早退：没有选区时一个字节都不多花）
+export fn tui_sel_active() bool {
+    if !g_tui_sel_on {
+        return false;
+    }
+    return !tui_sel_empty();
+}
+
+// 正在拖吗（自测断言用）
+export fn tui_sel_dragging() bool {
+    return g_tui_sel_drag;
+}
+
+// 按下：记锚点并**清掉上一次的选区**（新的一次拖选从干净状态开始）。
+export fn tui_sel_begin(row: usize, col: usize) void {
+    g_tui_sel_drag = true;
+    g_tui_sel_on = true;
+    g_tui_sel_over = false;
+    g_tui_sel_ar = tui_sel_clamp_row(row);
+    g_tui_sel_ac = tui_sel_clamp_col(col);
+    g_tui_sel_er = g_tui_sel_ar;
+    g_tui_sel_ec = g_tui_sel_ac;
+    tui_mark_dirty();
+}
+
+// 拖动：伸终点（只改状态 + 置脏，不做任何 IO —— 拖一次会来几十条这种事件）
+export fn tui_sel_extend(row: usize, col: usize) void {
+    if !g_tui_sel_drag {
+        return;
+    }
+    g_tui_sel_er = tui_sel_clamp_row(row);
+    g_tui_sel_ec = tui_sel_clamp_col(col);
+    tui_mark_dirty();
+}
+
+// 抬起：冻结选区。返回「是不是一个非空选区」—— 空选区（单击）不该触发复制。
+export fn tui_sel_finish() bool {
+    if !g_tui_sel_drag {
+        return false;
+    }
+    g_tui_sel_drag = false;
+    if tui_sel_empty() {
+        g_tui_sel_on = false;
+        tui_mark_dirty();
+        return false;
+    }
+    tui_mark_dirty();
+    return true;
+}
+
+// 清掉选区（esc / 新一次按下 / 换会话）
+export fn tui_sel_clear() void {
+    g_tui_sel_on = false;
+    g_tui_sel_drag = false;
+    g_tui_sel_over = false;
+    tui_mark_dirty();
+}
+
+// 复位到初值（自测复位 / 换会话）。与 clear 分开只为语义清楚：这个连内部计数一起清。
+export fn tui_sel_reset() void {
+    tui_sel_clear();
+    g_tui_sel_ar = 0;
+    g_tui_sel_ac = 0;
+    g_tui_sel_er = 0;
+    g_tui_sel_ec = 0;
+}
+
+// 第 r 行被选中的**显示列**区间 [c0, c1)（成帧时逐行问它）。返回 false = 这一行没选区。
+// 早退顺序有讲究：先问「有没有选区」，没有就立刻 false —— 这是每行每帧都要走的路。
+export fn tui_sel_span(r: usize, c0: &usize, c1: &usize) bool {
+    if !tui_sel_active() {
+        return false;
+    }
+    var r0: usize = 0;
+    var sc0: usize = 0;
+    var r1: usize = 0;
+    var sc1: usize = 0;
+    tui_sel_bounds(&r0, &sc0, &r1, &sc1);
+    if r + 1 <= r0 || r > r1 {
+        return false;
+    }
+    var a: usize = 0;
+    if r == r0 {
+        a = sc0;
+    }
+    var b: usize = g_tui_cols;
+    if r == r1 {
+        b = sc1;
+    }
+    if b <= a {
+        return false;   // 末行落在第 0 列（选区在那里不含任何字符）
+    }
+    c0[0] = a;
+    c1[0] = b;
+    return true;
+}
+
+// 取一行的 [c0, c1) 列 → 追加进 out（**行尾空白裁掉**）。返回追加的字节数。
+// 空白判定按 ASCII：正文层里行尾的填充就是空格（tui_fill_row 补的），
+// 全角空格不会被误裁（它是两个字节，不等于 32）。
+fn tui_sel_row_into(r: usize, c0: usize, c1: usize, out: &Buf) usize {
+    if r >= g_tui_nrows {
+        return 0;
+    }
+    const off: usize = tui_row_text_off(r);
+    const len: usize = tui_row_text_len(r);
+    if len == 0 {
+        return 0;
+    }
+    // 两头**都向外取整**（见 style 里那一对 helper 的注释）：区间端点永远不会
+    // 落在一个宽字符中间 —— 这是「只选一列却切出半个汉字」的修法。
+    const b0: usize = tui_row_col_byte0(off, len, c0);
+    const b1: usize = tui_row_col_byte1(off, len, c1);
+    if b1 <= b0 {
+        return 0;
+    }
+    var e: usize = b1;
+    while e > b0 && g_tui_text.ptr[e - 1] == 32 as byte {
+        e = e - 1;
+    }
+    if e <= b0 {
+        return 0;   // 整段都是空白：这一行等于空行
+    }
+    if !buf_append(out, g_tui_text.ptr + b0, e - b0) {
+        return 0;
+    }
+    return e - b0;
+}
+
+// 把选区还原成纯文本追加进 out，返回追加的字节数。
+// 行为：逐行取 [c0,c1) → 行尾空白裁掉 → 行间补 '\n' → **末尾的空行整段丢掉**
+// （拖到正文末尾之外时不会粘出一串换行）。
+// 上限：超过 TUI_SEL_MAX 就停手并置 `tui_sel_over` —— 调用方据此在回执里说清
+// 「被截断了」，绝不静默丢字（与粘贴上限同一条纪律）。
+export fn tui_sel_text(out: &Buf) usize {
+    g_tui_sel_over = false;
+    if !tui_sel_active() {
+        return 0;
+    }
+    var r0: usize = 0;
+    var c0: usize = 0;
+    var r1: usize = 0;
+    var c1: usize = 0;
+    tui_sel_bounds(&r0, &c0, &r1, &c1);
+    const start: usize = out.len;
+    var mark: usize = start;   // 最后一行**非空**内容之后的位置（末尾空行靠它裁掉）
+    var r: usize = r0;
+    while r <= r1 {
+        var a: usize = 0;
+        if r == r0 {
+            a = c0;
+        }
+        var b: usize = g_tui_cols;
+        if r == r1 {
+            b = c1;
+        }
+        if b > a {
+            const n: usize = tui_sel_row_into(r, a, b, out);
+            if n > 0 {
+                mark = out.len;
+            }
+        }
+        if r < r1 {
+            _ = buf_append_byte(out, 10 as byte);
+        }
+        if out.len - start >= TUI_SEL_MAX {
+            g_tui_sel_over = true;
+            break;
+        }
+        r = r + 1;
+    }
+    if out.len > mark {
+        buf_truncate(out, mark);
+    }
+    return out.len - start;
+}
+
+// 上一次提取超限了吗（回执要说清楚「被截断了」，不静默）
+export fn tui_sel_over() bool {
+    return g_tui_sel_over;
+}
+
+// 把选区画成高亮：对转录区里每个被选中的屏幕行改挂 TUI_ST_SEL（反显 + 粗）。
+//
+// 调用时机**必须是成帧收尾**（所有行都画完之后、tui_cursor_place 之前）：
+// tui_row_mark_span 往段表尾部追加重挂的段，早调的话后面新开的行会把段表挤满。
+// 浮层开着时**不画**：那时转录区被浮层盖住，行号对不上，高亮会落在浮层的框线上。
+export fn tui_sel_paint() void {
+    if !tui_sel_active() {
+        return;
+    }
+    if g_tui_ov != TUI_OV_NONE {
+        return;
+    }
+    var lim: usize = g_tui_panel_top;
+    if lim > g_tui_nrows {
+        lim = g_tui_nrows;
+    }
+    var r: usize = 0;
+    while r < lim {
+        var c0: usize = 0;
+        var c1: usize = 0;
+        if tui_sel_span(r, &c0, &c1) {
+            tui_row_mark_span(r, c0, c1, TUI_ST_SEL);
+        }
+        r = r + 1;
+    }
+}
