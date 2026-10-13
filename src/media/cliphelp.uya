@@ -1,0 +1,619 @@
+// src/media/cliphelp.uya — 剪贴板来源之三：**外部 helper**（P83）：wl-paste / xclip / xsel /
+//   pbpaste
+//
+// 本文件：按桌面环境挑候选 helper（`cliphelp_candidates`）、在 PATH 与几个常见位置里
+//   解析可执行文件（`cliphelp_resolve`，带进程级 memo）、跑一次取数
+//   （`cliphelp_run`：fork + 双管道 + poll + 超时按**进程组**收）、两个格式约定不同的
+//   取法（`cliphelp_pick`：先问 TARGETS，再按优先级取图片、最后取文本）、结果成句
+//   （`cliphelp_reason`）。
+// 不变量：① 子进程必须 `sigx_reset_for_child()` + `sh_child_detach_stdio()` —— helper
+//   **绝不许碰用户的终端**（它抢 tui 的 fd 0 就是踩坑 60/39 的老账）；② 墙钟超时与中止
+//   一律**按进程组** `sh_kill_tree(pid)` 收（helper 可能 fork 子进程）；③ stdout 上限定
+//   `CLIPH_MAX_BYTES`，超出**明确拒绝、不静默截断**；④ helper 的 stderr 只进诊断，
+//   **绝不铺屏**（外来字节不得原样上屏，踩坑同 §16）；⑤ 探测结果按进程 memo
+//   （`g_cliph_probed`）：一次进程只扫一遍 PATH；⑥ helper 起不来回 `CLIPH_NO_HELPER`，
+//   这是**正常情况**（多数桌面本来就没有），不是错误。
+// 依赖：libc（syscall/unistd/fcntl/signal）、std.runtime.saved_envp；本仓 session/sigx
+//   （子进程复位信号处置）、tools/shellx（`sh_child_detach_stdio` / `sh_kill_tree`）、
+//   foundation/bufx。
+// 命名：`cliphelp_*`（对外）、`cliph_*`（私有）、`CLIPH_*`（结果码与上限）。
+//
+// 这条路**在 SSH 下没用**（读的是**远端**那台机器的剪贴板，用户的图在自己机器上）——
+// 所以它排在终端协议之后（见 media/clip 的优先级表）。它真正解决问题的地方是
+// **Wayland 会话且终端不支持 OSC 5522**（wl-paste）与 **macOS**（pbpaste / pngpaste）。
+// DESIGN.md §13.2 的「Wayland 下走外部 helper 回落」承诺的就是这一段。
+
+use libc.syscall;
+use libc.unistd;
+use libc.fcntl;
+use libc.signal;
+use std.runtime.saved_envp;
+
+// 结果码
+export const CLIPH_NONE: i32 = 0;          // helper 在，但剪贴板里没我们要的东西
+export const CLIPH_TEXT: i32 = 1;          // 读到文本
+export const CLIPH_IMAGE: i32 = 2;         // 读到图片
+export const CLIPH_NO_HELPER: i32 = 3;     // PATH 里没有任何认识的 helper
+export const CLIPH_ERR: i32 = 4;           // 起来了但失败了（超时 / 非零退出）
+export const CLIPH_TOO_BIG: i32 = 5;       // 超过读取上限
+
+const CLIPH_MAX_BYTES: usize = 24 * 1024 * 1024;
+const CLIPH_TIMEOUT_MS: u64 = 4000;
+const CLIPH_POLL_MS: i32 = 20;
+const CLIPH_ERR_CAP: usize = 8192;
+const CLIPH_X_OK: i32 = 1;
+
+// 候选表的上限（4 种 helper × 最多 4 个路径段）
+const CLIPH_MAX_CAND: usize = 8;
+
+// 认识的 helper 种类
+const CLIPH_K_WLPASTE: u8 = 0;
+const CLIPH_K_XCLIP: u8 = 1;
+const CLIPH_K_XSEL: u8 = 2;
+const CLIPH_K_PBPASTE: u8 = 3;
+const CLIPH_K_PNGPASTE: u8 = 4;
+
+var g_cliph_probed: bool = false;
+var g_cliph_path: Buf = Buf{ ptr: null, len: 0, cap: 0 };   // 命中的绝对路径（带 NUL）
+var g_cliph_kind: u8 = 0;
+
+// 静态缓冲惰性分配（幂等）
+fn cliph_ensure() void {
+    if !buf_valid(&g_cliph_path) {
+        g_cliph_path = buf_new(4096);
+    }
+}
+
+// 环境变量存在且非空（走 `getenv`：被测代码与自测看到的是**同一份**环境，
+// `saved_envp` 是进程启动时那一份快照，setenv 改不动它）。
+fn cliph_env_present(name: &const byte, nn: usize) bool {
+    _ = nn;
+    const v: &byte = getenv(name as *const byte);
+    return (v as usize) != 0 && bufx_cstr_len(v as &const byte) > 0;
+}
+
+// 这个 helper 名字对应的种类。idx 越界返回 255。
+fn cliph_kind_of(idx: usize) u8 {
+    if idx == 0 {
+        return CLIPH_K_WLPASTE;
+    }
+    if idx == 1 {
+        return CLIPH_K_XCLIP;
+    }
+    if idx == 2 {
+        return CLIPH_K_XSEL;
+    }
+    if idx == 3 {
+        return CLIPH_K_PBPASTE;
+    }
+    if idx == 4 {
+        return CLIPH_K_PNGPASTE;
+    }
+    return 255;
+}
+
+// 第 idx 个候选的程序名（Uya 的合并命名空间里不要模块级字符串数组 —— 推断成 int32）
+fn cliph_name(idx: usize) &const byte {
+    if idx == 0 {
+        return "wl-paste" as &const byte;
+    }
+    if idx == 1 {
+        return "xclip" as &const byte;
+    }
+    if idx == 2 {
+        return "xsel" as &const byte;
+    }
+    if idx == 3 {
+        return "pbpaste" as &const byte;
+    }
+    if idx == 4 {
+        return "pngpaste" as &const byte;
+    }
+    return "" as &const byte;
+}
+
+// 这个候选**在当前会话里值得试**吗。判据只看环境形状，不看 helper 是否存在：
+//   * wl-paste：WAYLAND_DISPLAY 非空；
+//   * xclip / xsel：DISPLAY 非空；
+//   * pbpaste / pngpaste：不设条件（它们在 Linux 上根本不存在，PATH 解析会自然落空）——
+//     但 Darwin 上 X11/Wayland 都没有，靠这一条才走到。
+// 为什么按环境挑而不是「全都试一遍」：每个候选都要起一个子进程，在 SSH 下白起 5 个进程
+// 只为拿到 5 个「连不上」是纯粹的浪费。
+fn cliph_worth(idx: usize) bool {
+    const k: u8 = cliph_kind_of(idx);
+    if k == CLIPH_K_WLPASTE {
+        return cliph_env_present("WAYLAND_DISPLAY" as &const byte, 15);
+    }
+    if k == CLIPH_K_XCLIP || k == CLIPH_K_XSEL {
+        return cliph_env_present("DISPLAY" as &const byte, 7);
+    }
+    return true;
+}
+
+// 这个候选能不能执行（access X_OK）。cand **必须**是 NUL 结尾的 C 串。
+fn cliph_probe_path(cand: &const Buf) bool {
+    if cand.len == 0 {
+        return false;
+    }
+    const rc: i32 = sys_access(cand.ptr as *const byte, CLIPH_X_OK) catch {
+        -1;
+    };
+    return rc == 0;
+}
+
+// 试一个 PATH 段：拼成 `<dir>/<名字>`（段末已有 `/` 就不重复加）并补 NUL。
+// 命中返回 true（out 里就是可执行路径，带 NUL）。
+fn cliph_try_dir(dir: &const byte, dn: usize, name: &const byte,
+                 out: &Buf) bool {
+    if dn == 0 {
+        return false;
+    }
+    buf_reset(out);
+    _ = buf_append(out, dir, dn);
+    if out.ptr[out.len - 1] != 47 as byte {
+        _ = buf_append_byte(out, 47);
+    }
+    _ = buf_append_cstr(out, name);
+    _ = buf_append_byte(out, 0);
+    return cliph_probe_path(out);
+}
+
+// 在 PATH 里找 `name`；找不到再试几个常见位置。out 里是带 NUL 的绝对路径。
+// PATH 从 `saved_envp` 里读（与 gitx 同一口径：setenv 之后 getenv 看不到，自测要造 PATH）。
+fn cliph_resolve(name: &const byte, out: &Buf) bool {
+    buf_reset(out);
+    if bufx_cstr_len(name) == 0 {
+        return false;
+    }
+    var cand: Buf = buf_new(4096);
+    defer { buf_free(&cand); }
+    // PATH 补一个 NUL 再用（C 串口径：扫描靠 NUL 找段尾）。用 getenv 而不是扫 saved_envp：
+    // 自测要能把假 helper 目录**前置**进 PATH，而 saved_envp 是**进程启动时**的那一份，
+    // setenv 之后 getenv 才看得到（与 sandboxx 的 san_probe_path 同一条口径）。
+    var pv: Buf = buf_new(4096);
+    defer { buf_free(&pv); }
+    const pe: &byte = getenv("PATH");
+    if (pe as usize) != 0 {
+        const pn: usize = bufx_cstr_len(pe as &const byte);
+        _ = buf_append(&pv, pe as &const byte, pn);
+    }
+    _ = buf_append_byte(&pv, 0);
+    const pathv: &const byte = pv.ptr as &const byte;
+    var got: bool = false;
+    var seg: usize = 0;
+    while !got {
+        var e: usize = seg;
+        while pathv[e] != 58 as byte && pathv[e] != 0 as byte {    // ':'
+            e = e + 1;
+        }
+        if e > seg && cliph_try_dir(pathv + seg, e - seg, name, &cand) {
+            _ = buf_append(out, cand.ptr as &const byte, cand.len);
+            got = true;
+            break;
+        }
+        if pathv[e] == 0 as byte {
+            break;
+        }
+        seg = e + 1;
+    }
+    if got {
+        return true;
+    }
+    // 常见位置兜底（PATH 被清空的场景：systemd 服务、GUI 启动器）
+    var dirs: [&const byte: 4] = [
+        "/usr/bin" as &const byte,
+        "/usr/local/bin" as &const byte,
+        "/bin" as &const byte,
+        null as &const byte,
+    ];
+    var i: usize = 0;
+    while (dirs[i] as usize) != 0 {
+        const d: &const byte = dirs[i];
+        if cliph_try_dir(d, bufx_cstr_len(d), name, &cand) {
+            _ = buf_append(out, cand.ptr as &const byte, cand.len);
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+// 扫一遍候选表，把命中的 helper 绝对路径与种类存进 `g_cliph_path` / `g_cliph_kind`。
+// 命中一个就停（优先级 = 表的顺序：wl-paste > xclip > xsel > pbpaste > pngpaste）。
+// 结果 memo（`g_cliph_probed`）—— 一次进程只扫一遍。`force` 给自测留口子。
+export fn cliphelp_probe(force: bool) bool {
+    cliph_ensure();
+    if g_cliph_probed && !force {
+        return g_cliph_path.len > 1;
+    }
+    g_cliph_probed = true;
+    buf_reset(&g_cliph_path);
+    var idx: usize = 0;
+    while idx < CLIPH_MAX_CAND {
+        const name: &const byte = cliph_name(idx);
+        if bufx_cstr_len(name) == 0 {
+            break;
+        }
+        if cliph_worth(idx) {
+            var cand: Buf = buf_new(4096);
+            defer { buf_free(&cand); }
+            if cliph_resolve(name, &cand) {
+                _ = buf_append(&g_cliph_path, cand.ptr as &const byte,
+                    cand.len);
+                g_cliph_kind = cliph_kind_of(idx);
+                return true;
+            }
+        }
+        idx = idx + 1;
+    }
+    return false;
+}
+
+// 有没有可用的 helper（含一次探测）
+export fn cliphelp_available() bool {
+    return cliphelp_probe(false);
+}
+
+// ============================================================
+// 跑一次 helper
+// ============================================================
+
+// 跑 helper（argv 是 C 串数组，argv[0] 由调用方给全路径），stdout 收进 out。
+// 返回退出码；负数 = 起不来（-1 fork/pipe 失败，-2 超时，-3 被用户取消）。
+// 不变量：信号复位 + 脱离终端 + 超时/取消按**进程组**收（见文件头）。
+fn cliph_run(argv: &(&const byte), out: &Buf) i32 {
+    buf_reset(out);
+    var op: [i32: 2] = [0: 2];
+    var ep: [i32: 2] = [0: 2];
+    if (sys_pipe2(&op[0], 0) catch { -1; }) != 0 {
+        return -1;
+    }
+    if (sys_pipe2(&ep[0], 0) catch { -1; }) != 0 {
+        _ = sys_close(op[0]) catch {};
+        _ = sys_close(op[1]) catch {};
+        return -1;
+    }
+    const pid64: i64 = sys_fork() catch {
+        _ = sys_close(op[0]) catch {};
+        _ = sys_close(op[1]) catch {};
+        _ = sys_close(ep[0]) catch {};
+        _ = sys_close(ep[1]) catch {};
+        return -1;
+    };
+    if pid64 == 0 {
+        // 子进程：只做系统调用
+        _ = sys_close(op[0]) catch {};
+        _ = sys_close(ep[0]) catch {};
+        sigx_reset_for_child();
+        // helper 绝不许碰用户的终端（不变量 ①）
+        sh_child_detach_stdio();
+        _ = sys_dup2(op[1], 1) catch {};
+        _ = sys_dup2(ep[1], 2) catch {};
+        _ = sys_close(op[1]) catch {};
+        _ = sys_close(ep[1]) catch {};
+        _ = sys_execve(argv[0], argv, saved_envp) catch {};
+        sys_exit(127);
+    }
+    const pid: i32 = i64_to_i32(pid64);
+    _ = sys_close(op[1]) catch {};
+    _ = sys_close(ep[1]) catch {};
+    var err: Buf = buf_new(512);
+    defer { buf_free(&err); }
+    var pfds: [PollFd: 2] = [
+        PollFd{ fd: op[0], events: POLLIN, revents: 0 },
+        PollFd{ fd: ep[0], events: POLLIN, revents: 0 },
+    ];
+    const started: u64 = ua_now_ms();
+    var done: bool = false;
+    var timed: bool = false;
+    var aborted: bool = false;
+    var code: i32 = 0;
+    var chunk: [byte: 8192] = [0: 8192];
+    while !done {
+        pfds[0].revents = 0;
+        pfds[1].revents = 0;
+        tui_poll_tick();      // 界面别假死（与 gitx 同一手法）
+        if tui_abort_state() != TUI_ABORT_NONE {
+            sh_kill_tree(pid);
+            aborted = true;
+            done = true;
+            break;
+        }
+        const pr: i32 = sys_poll(&pfds[0], 2, CLIPH_POLL_MS) catch { 0; };
+        if pr > 0 {
+            cliph_drain(&pfds[0], op[0], out, CLIPH_MAX_BYTES, &chunk[0], 8192);
+            cliph_drain(&pfds[1], ep[0], &err, CLIPH_ERR_CAP, &chunk[0], 8192);
+        }
+        if (ua_now_ms() - started) >= CLIPH_TIMEOUT_MS {
+            timed = true;
+            sh_kill_tree(pid);
+            done = true;
+            break;
+        }
+        var st: i32 = 0;
+        const r: i32 = sys_waitpid(pid, &st, 1) catch { 0; };   // WNOHANG
+        if r == pid {
+            done = true;
+            const sig: i32 = st & 127;
+            code = if sig != 0 { 128 + sig } else { (st >> (8 as i32)) & 255 };
+        }
+    }
+    // 收尾排空（超限部分照读不误，否则子进程可能还卡在 write 上）
+    var guard: usize = 0;
+    while guard < 64 {
+        guard = guard + 1;
+        const n2: isize = sys_read(op[0], &chunk[0],
+            8192) catch { 0 as isize; };
+        if n2 <= 0 {
+            break;
+        }
+        cliph_append_capped(out, &chunk[0], n2 as usize, CLIPH_MAX_BYTES);
+    }
+    _ = sys_close(op[0]) catch {};
+    _ = sys_close(ep[0]) catch {};
+    var st2: i32 = 0;
+    _ = sys_waitpid(pid, &st2, 0) catch {};
+    if aborted {
+        return -3;
+    }
+    if timed {
+        return -2;
+    }
+    return code;
+}
+
+// 从一个管道 fd 读一次并追加（带上限；stderr 也走它，只是 cap 小）。
+// `chunk` 是调用方的复用缓冲（**指针 + 长度**两个参数：不用 `&[byte]` 切片描述符 ——
+// 那会生成 `struct uya_slice_uint8_t` 形参，与 C 侧的调用约定对不上，实测链接失败）。
+fn cliph_drain(pfd: &const PollFd, fd: i32, out: &Buf, cap: usize,
+               chunk: &byte, cn: usize) void {
+    const rev: i16 = pfd.revents;
+    if (rev & POLLIN) == 0 && (rev & POLLHUP) == 0 && (rev & POLLERR) == 0 {
+        return;
+    }
+    const n: isize = sys_read(fd, chunk, cn) catch { 0 as isize; };
+    if n > 0 {
+        cliph_append_capped(out, chunk, n as usize, cap);
+    }
+}
+
+// 追加但不超过 cap（超出部分**丢弃** —— 但调用方要从 `len == cap` 判「满了」并拒绝）
+fn cliph_append_capped(dst: &Buf, p: &const byte, n: usize, cap: usize) void {
+    if dst.len >= cap {
+        return;
+    }
+    var take: usize = n;
+    if dst.len + take > cap {
+        take = cap - dst.len;
+    }
+    _ = buf_append(dst, p, take);
+}
+
+// ============================================================
+// 取数（每个 helper 的命令行形状都不同）
+// ============================================================
+
+// 一次取数的两个阶段共用的 argv 槽位（进程级、单次调用有效）
+const CLIPH_ARGV_MAX: usize = 12;
+var g_cliph_argv: [&const byte: CLIPH_ARGV_MAX] = [null as &const byte:
+    CLIPH_ARGV_MAX];
+
+// 组一条 argv：把常量列表写进静态槽位，末位补 null。
+fn cliph_argv_set(items: &(&const byte), n: usize) &(&const byte) {
+    var i: usize = 0;
+    while i < n && i < (CLIPH_ARGV_MAX - 1) {
+        g_cliph_argv[i] = items[i];
+        i = i + 1;
+    }
+    g_cliph_argv[i] = null as &const byte;
+    return &g_cliph_argv[0];
+}
+
+// 按优先级取一次。返回 CLIPH_*，`mime_out` 是图片的 MIME。
+// 形状差异（每种 helper 都得单独说）：
+//   * wl-paste：`--list-types` 拿类型表 → `--type <mime>` 取。它给的是**标准 mime**。
+//   * xclip   ：`-t TARGETS -o` 拿类型表（每行一个 atom）→ `-t <atom> -o` 取。
+//   * xsel    ：只能取文本（`-b -o`）。
+//   * pbpaste ：只能取文本。
+//   * pngpaste：直接吐 PNG 字节（`-` = stdout）；没有就非零退出。
+fn cliphelp_pick(out: &Buf, mime_out: &Buf) i32 {
+    buf_reset(out);
+    buf_reset(mime_out);
+    if !cliphelp_probe(false) {
+        return CLIPH_NO_HELPER;
+    }
+    const exe: &const byte = g_cliph_path.ptr as &const byte;
+    var types: Buf = buf_new(4096);
+    defer { buf_free(&types); }
+    var tmp: Buf = buf_new(1 << 16);
+    defer { buf_free(&tmp); }
+    // pngpaste / xsel / pbpaste：没有「按类型取」这一步，直接取
+    if g_cliph_kind == CLIPH_K_PNGPASTE {
+        var a: [&const byte: 3] = [exe, "-" as &const byte,
+            null as &const byte];
+        const rc: i32 = cliph_run(cliph_argv_set(&a[0], 2), &tmp);
+        return cliph_accept(&tmp, CLIPH_IMAGE, "image/png" as &const byte, out,
+            mime_out, rc);
+    }
+    if g_cliph_kind == CLIPH_K_XSEL {
+        var a: [&const byte: 4] = [exe, "-b" as &const byte,
+            "-o" as &const byte, null as &const byte];
+        const rc: i32 = cliph_run(cliph_argv_set(&a[0], 3), &tmp);
+        return cliph_accept(&tmp, CLIPH_TEXT, "" as &const byte, out, mime_out,
+            rc);
+    }
+    if g_cliph_kind == CLIPH_K_PBPASTE {
+        var a: [&const byte: 2] = [exe, null as &const byte];
+        const rc: i32 = cliph_run(cliph_argv_set(&a[0], 1), &tmp);
+        return cliph_accept(&tmp, CLIPH_TEXT, "" as &const byte, out, mime_out,
+            rc);
+    }
+    // wl-paste / xclip：先问类型表，再按优先级逐个取
+    const have: bool = cliph_list_types(exe, &types);
+    var i: usize = 0;
+    while i < clipt_want_n() {
+        const w: &const byte = clipt_want(i);
+        const wn: usize = bufx_cstr_len(w);
+        if wn == 0 {
+            i = i + 1;
+            continue;
+        }
+        if have && !cliph_types_has(&types, w, wn) {
+            i = i + 1;
+            continue;
+        }
+        const rc2: i32 = cliph_fetch_one(exe, w, &tmp);
+        // **超时 / 被取消是致命的**：立刻收手，不再试下一个类型。
+        // 不这样做的话，一个卡住的 helper 会被我们按类型各跑一遍（5 个类型 × 4 s 超时 =
+        // 20 s，实测 24.1 s）—— 用户看到的是「按一下 ctrl+v，界面卡了半分钟」。
+        // 「没拿到数据」（非零退出 / 空输出）才是可跳过的。
+        if rc2 == -2 {
+            return CLIPH_ERR;
+        }
+        if rc2 == -3 {
+            return CLIPH_ERR;
+        }
+        if rc2 != 0 || tmp.len == 0 {
+            i = i + 1;
+            continue;
+        }
+        const want_img: bool = clipt_want_is_image(i);
+        const code: i32 = if want_img { CLIPH_IMAGE } else { CLIPH_TEXT };
+        return cliph_accept(&tmp, code, w, out, mime_out, 0);
+    }
+    return CLIPH_NONE;
+}
+
+// 类型表（一次性）。wl-paste 给标准 mime 每行一条；xclip 的 TARGETS 也是每行一个 atom。
+// 拿不到不算错（老 xclip 可能不支持 TARGETS）—— 那就退化成「每个类型都试一遍」。
+fn cliph_list_types(exe: &const byte, out: &Buf) bool {
+    buf_reset(out);
+    var tmp: Buf = buf_new(8192);
+    defer { buf_free(&tmp); }
+    var rc: i32 = 0;
+    if g_cliph_kind == CLIPH_K_WLPASTE {
+        var a: [&const byte: 4] = [
+            exe, "--list-types" as &const byte, null as &const byte,
+                null as &const byte,
+        ];
+        rc = cliph_run(cliph_argv_set(&a[0], 2), &tmp);
+    } else {
+        var a: [&const byte: 6] = [
+            exe, "-selection" as &const byte, "clipboard" as &const byte,
+            "-t" as &const byte, "TARGETS" as &const byte, null as &const byte,
+        ];
+        rc = cliph_run(cliph_argv_set(&a[0], 5), &tmp);
+    }
+    if rc != 0 || tmp.len == 0 {
+        return false;
+    }
+    _ = buf_append(out, tmp.ptr as &const byte, tmp.len);
+    return true;
+}
+
+// 取一个具体类型。返回 helper 的退出码（负数 = 起不来/超时/被取消，见 `cliph_run`）。
+// 调用方按「负数致命、非零可跳过」分派（见 cliphelp_pick 的注释）。
+fn cliph_fetch_one(exe: &const byte, mime: &const byte, out: &Buf) i32 {
+    buf_reset(out);
+    if g_cliph_kind == CLIPH_K_WLPASTE {
+        var a: [&const byte: 4] = [
+            exe, "--type" as &const byte, mime, null as &const byte,
+        ];
+        return cliph_run(cliph_argv_set(&a[0], 3), out);
+    }
+    if g_cliph_kind == CLIPH_K_XCLIP {
+        var a: [&const byte: 6] = [
+            exe, "-selection" as &const byte, "clipboard" as &const byte,
+            "-t" as &const byte, mime, null as &const byte,
+        ];
+        return cliph_run(cliph_argv_set(&a[0], 5), out);
+    }
+    return -1;
+}
+
+// 类型表里有没有这一项（按**行**比对：每行一个类型名，允许行尾 CR/LF）。
+fn cliph_types_has(types: &const Buf, want: &const byte, wn: usize) bool {
+    var i: usize = 0;
+    while i < types.len {
+        var e: usize = i;
+        while e < types.len && types.ptr[e] != 10 as byte {
+            e = e + 1;
+        }
+        var end: usize = e;
+        if end > i && types.ptr[end - 1] == 13 as byte {
+            end = end - 1;
+        }
+        if (end - i) == wn && bufx_mem_eq(types.ptr + i, want, wn) {
+            return true;
+        }
+        i = e + 1;
+    }
+    return false;
+}
+
+// 收口：把 helper 的输出按「成功与否」翻成 CLIPH_*。
+//   * 退出码非 0 或空输出 ⇒ 这一档没拿到（NONE，不是错误 —— 类型表里报了但取不出来
+//     是常见现象，比如图片被应用延迟渲染）；
+//   * 超上限 ⇒ CLIPH_TOO_BIG（**明确拒绝**，不静默截断）。
+fn cliph_accept(tmp: &const Buf, code: i32, mime: &const byte, out: &Buf,
+                mime_out: &Buf, rc: i32) i32 {
+    if rc == -2 {
+        return CLIPH_ERR;
+    }
+    if rc != 0 || tmp.len == 0 {
+        return CLIPH_NONE;
+    }
+    if tmp.len >= CLIPH_MAX_BYTES {
+        return CLIPH_TOO_BIG;
+    }
+    if !buf_append(out, tmp.ptr as &const byte, tmp.len) {
+        return CLIPH_ERR;
+    }
+    if code == CLIPH_IMAGE {
+        buf_reset(mime_out);
+        _ = buf_append_cstr(mime_out, mime);
+    }
+    return code;
+}
+
+// 对外入口：读一次剪贴板（helper 这条路）。
+export fn cliphelp_paste(out: &Buf, mime_out: &Buf) i32 {
+    return cliphelp_pick(out, mime_out);
+}
+
+// 命中的 helper 名（给回执文案用；没命中回空串）
+export fn cliphelp_name() &const byte {
+    if !cliphelp_probe(false) {
+        return "" as &const byte;
+    }
+    return cliph_name_by_kind(g_cliph_kind);
+}
+
+// 种类 → 程序名
+fn cliph_name_by_kind(k: u8) &const byte {
+    var i: usize = 0;
+    while i < CLIPH_MAX_CAND {
+        if cliph_kind_of(i) == k {
+            return cliph_name(i);
+        }
+        i = i + 1;
+    }
+    return "" as &const byte;
+}
+
+// 一句人话
+export fn cliphelp_reason(code: i32) &const byte {
+    if code == CLIPH_NO_HELPER {
+        return "PATH 里没有 wl-paste / xclip / xsel 这类剪贴板工具" as &const byte;
+    }
+    if code == CLIPH_ERR {
+        return "外部剪贴板工具失败（超时或非零退出）" as &const byte;
+    }
+    if code == CLIPH_TOO_BIG {
+        return "剪贴板内容超过读取上限（24 MiB）" as &const byte;
+    }
+    if code == CLIPH_NONE {
+        return "剪贴板里没有图片也没有文本" as &const byte;
+    }
+    return "" as &const byte;
+}

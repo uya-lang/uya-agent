@@ -1,0 +1,1339 @@
+// src/selftest/st_clip.uya — 剪贴板三源（P83）的自测片
+//
+// 本文件：三轮 —— `clip-term`（纯函数：OSC 5522 的线格式、分块解码、探测缓存、
+//   扫描器的分片与透传）、`clip-pty`（**真 PTY + 假终端**：父进程扮演支持 5522 的终端，
+//   断言「DISPLAY 为空也能贴上图片」与「应答字节一个都没进输入行」）、
+//   `clip-helper`（假 helper 脚本：PATH 解析、子进程语义、超时按组收、超限拒绝）。
+// 不变量：与原文件一致 —— 与 tuiselftest / selftest 同处合并命名空间，本片不写本地 `use`；
+//   轮次自己 fork 的子进程必须自己收干净；判定码只用低 8 位。
+// 依赖：见锚点 selftest.uya 的文件头（本片与它同处合并命名空间）。
+// 命名：沿用 `clips_*`（本片的小工具与三轮入口）；被测符号沿用各自的 `oscin_` / `clipt_` /
+//   `cliphelp_` / `clip_` 前缀。
+//
+// 为什么这三轮必须有（而不是「代码看起来对」）：
+//   * `clip-term` 的**分块解码**是本轮最容易写错的一格 —— 规范要求每个 DATA 分块自带
+//     padding，把整串拼起来再解当场就坏，而症状只是「图片坏了」，与协议错看起来一样；
+//   * `clip-pty` 是本轮唯一能证明「无 X11 也能用」的证据 —— 本机（X11 + deepin-terminal）
+//     没有 kitty / ghostty，真终端上的 5522 无法实测，所以父进程**扮演**那个终端；
+//   * `clip-helper` 是文档承诺（DESIGN §13.2「Wayland 下走外部 helper 回落」）的兑现证明。
+
+// ============================================================
+// 小工具
+// ============================================================
+
+// 这一轮的失败既打标签也打原因（与 tuis_fail 同形，独立一份是为了本片能单独读）
+fn clips_fail(tag: &const byte, what: &const byte, ok: &bool) void {
+    _ = tag;
+    out_err("selftest[clip] FAIL: ");
+    out_err(what);
+    out_err("\n");
+    ok[0] = false;
+}
+
+// 共享的「空 Buf」（当期望值用）。
+// 为什么不用 `&buf_empty()`：那是个**临时值**，取地址会生成
+// `&(struct Buf){...}` 这种 C 里非左值的表达式 —— 实测一屏「lvalue required as
+// unary '&' operand」。一个进程级的空 Buf 既好读又没有这个坑。
+var g_clips_empty: Buf = Buf{ ptr: null, len: 0, cap: 0 };
+
+// 两个 Buf 是否逐字节相同
+fn clips_eq(a: &const Buf, b: &const Buf) bool {
+    if a.len != b.len {
+        return false;
+    }
+    if a.len == 0 {
+        return true;
+    }
+    return bufx_mem_eq(a.ptr as &const byte, b.ptr as &const byte, a.len);
+}
+
+// 造一张**能被 imgx_sniff 认出来**的最小 PNG（头 + IHDR，够嗅探与读尺寸）。
+// 为什么是「最小可认」而不是真图：这一轮验的是**运输**（字节从终端协议到附件管线），
+// 解码正确性归 img-sniff 轮；夹具小到能进源码，判据还不依赖任何图像解码器。
+fn clips_png_into(out: &Buf) void {
+    var hdr: [byte: 33] = [0: 33];
+    // PNG 魔数
+    hdr[0] = 137; hdr[1] = 80; hdr[2] = 78; hdr[3] = 71;
+    hdr[4] = 13; hdr[5] = 10; hdr[6] = 26; hdr[7] = 10;
+    // IHDR 长度 = 13
+    hdr[8] = 0; hdr[9] = 0; hdr[10] = 0; hdr[11] = 13;
+    // "IHDR"
+    hdr[12] = 73; hdr[13] = 72; hdr[14] = 68; hdr[15] = 82;
+    // 宽 2 / 高 3（大端）
+    hdr[16] = 0; hdr[17] = 0; hdr[18] = 0; hdr[19] = 2;
+    hdr[20] = 0; hdr[21] = 0; hdr[22] = 0; hdr[23] = 3;
+    // 位深 8 / 颜色类型 6 / 压缩 0 / 过滤 0 / 隔行 0
+    hdr[24] = 8; hdr[25] = 6; hdr[26] = 0; hdr[27] = 0; hdr[28] = 0;
+    // 一个假的 CRC（嗅探不校验它）
+    hdr[29] = 1; hdr[30] = 2; hdr[31] = 3; hdr[32] = 4;
+    buf_reset(out);
+    _ = buf_append(out, &hdr[0], 33);
+    // 再补一段「IDAT 内容」把总长撑过 512 字节 —— 一次 `read(0, …, 512)` 装不下，
+    // 于是应答必然分两批到。**这不是为了好看**：分批到达正是「等待方必须独占 fd 0」
+    // 那条不变量的判据（少了 `oscin_borrowed`，第二批会被 tui_poll_keys 当按键抢走）。
+    var k: usize = 0;
+    while k < 600 {
+        _ = buf_append_byte(out, ((k * 7 + 11) % 251) as byte);
+        k = k + 1;
+    }
+}
+
+// 以「终端」的身份造一条 OSC 5522 DATA 帧（含 base64 的 mime 与 base64 的载荷）。
+// 这是 `clip-pty` 轮父进程要回给子进程的字节 —— 形状照规范逐字节拼。
+fn clips_reply_data(mime: &const byte, payload: &const byte, pn: usize,
+    out: &Buf) void {
+    var mb: Buf = buf_new(64);
+    defer { buf_free(&mb); }
+    _ = clipt_b64_ascii_debug(mime, bufx_cstr_len(mime), &mb);
+    var pb: Buf = buf_new(pn * 2 + 16);
+    defer { buf_free(&pb); }
+    _ = clipt_b64_ascii_debug(payload, pn, &pb);
+    buf_reset(out);
+    _ = buf_append_cstr(out,
+        "\x1b]5522;type=read:status=DATA:mime=" as &const byte);
+    _ = buf_append(out, mb.ptr as &const byte, mb.len);
+    _ = buf_append_byte(out, 59);
+    _ = buf_append(out, pb.ptr as &const byte, pb.len);
+    _ = buf_append_byte(out, 7);
+}
+
+// 造一条只有 status 的应答帧（OK / DONE）
+fn clips_reply_status(status: &const byte, out: &Buf) void {
+    buf_reset(out);
+    _ = buf_append_cstr(out, "\x1b]5522;type=read:status=" as &const byte);
+    _ = buf_append_cstr(out, status);
+    _ = buf_append_byte(out, 7);
+}
+
+// 造一条 DECRPM 探测应答：`ESC [ ? 5522 ; <ps> $ y`
+fn clips_reply_decrpm(ps: i32, out: &Buf) void {
+    buf_reset(out);
+    _ = buf_append_cstr(out, "\x1b[?5522;" as &const byte);
+    _ = buf_append_i64(out, ps as i64);
+    _ = buf_append_cstr(out, "$y" as &const byte);
+}
+
+// ============================================================
+// clip-term：纯函数轮
+// ============================================================
+
+// 扫描器的一格：把整段喂进去，期望「透传 == want_transit」且（可选）收到一帧。
+// `frames` 是要收到的帧类型（0 = 不该收到帧）。
+fn clips_scan_case(what: &const byte, in: &const Buf, want_transit: &const Buf,
+                   want_kind: i32, want_meta: &const Buf, want_pay: &const Buf,
+                   want: i32, ok: &bool) void {
+    oscin_reset();
+    oscin_arm(want);
+    var pass: Buf = buf_new(in.len + 64);
+    defer { buf_free(&pass); }
+    oscin_feed(in.ptr as &const byte, in.len, &pass);
+    if !clips_eq(&pass, want_transit) {
+        clips_fail("clip-term" as &const byte, what, ok);
+        out_err("  （透传字节不对：期望 ");
+        out_err_dec(want_transit.len as usize);
+        out_err(" 字节，实得 ");
+        out_err_dec(pass.len as usize);
+        out_err(" 字节）\n");
+    }
+    if oscin_frame_kind() != want_kind {
+        clips_fail("clip-term" as &const byte, what, ok);
+        out_err("  （帧类型不对）\n");
+        oscin_disarm();
+        return;
+    }
+    if want_kind != OSCIN_KIND_NONE {
+        var meta: Buf = buf_new(1024);
+        defer { buf_free(&meta); }
+        var pay: Buf = buf_new(1024);
+        defer { buf_free(&pay); }
+        oscin_frame(&meta, &pay);
+        if !clips_eq(&meta, want_meta) {
+            clips_fail("clip-term" as &const byte, what, ok);
+            out_err("  （metadata 不对）\n");
+        }
+        if !clips_eq(&pay, want_pay) {
+            clips_fail("clip-term" as &const byte, what, ok);
+            out_err("  （payload 不对）\n");
+        }
+    }
+    oscin_disarm();
+}
+
+// 分片：把 in 按每片 `step` 字节喂进去，结果必须与整段一次喂**一模一样**。
+// 这是不变量 ② 的机器实现 —— 终端与 SSH 一定会切片。
+fn clips_scan_sharded(what: &const byte, in: &const Buf, step: usize,
+    want_kind: i32,
+                      want_meta: &const Buf, want_pay: &const Buf, want: i32,
+                          ok: &bool) void {
+    oscin_reset();
+    oscin_arm(want);
+    var pass: Buf = buf_new(in.len + 64);
+    defer { buf_free(&pass); }
+    var i: usize = 0;
+    while i < in.len {
+        var take: usize = step;
+        if i + take > in.len {
+            take = in.len - i;
+        }
+        oscin_feed(in.ptr as &const byte + i, take, &pass);
+        i = i + take;
+    }
+    if oscin_frame_kind() != want_kind {
+        clips_fail("clip-term" as &const byte, what, ok);
+        out_err("  （分片喂入后帧类型不对）\n");
+        oscin_disarm();
+        return;
+    }
+    if want_kind != OSCIN_KIND_NONE {
+        var meta: Buf = buf_new(1024);
+        defer { buf_free(&meta); }
+        var pay: Buf = buf_new(1024);
+        defer { buf_free(&pay); }
+        oscin_frame(&meta, &pay);
+        if !clips_eq(&meta, want_meta) || !clips_eq(&pay, want_pay) {
+            clips_fail("clip-term" as &const byte, what, ok);
+            if !clips_eq(&meta, want_meta) {
+                out_err("  （分片后 metadata 不对）\n");
+            } else {
+                out_err("  （分片后 payload 不对）\n");
+            }
+        }
+    }
+    if pass.len != 0 {
+        clips_fail("clip-term" as &const byte, what, ok);
+        out_err("  （纯回帧的输入不该有透传字节）\n");
+    }
+    oscin_disarm();
+}
+
+// clip-term 轮：扫描器 + 线格式 + 分块解码 + 探测缓存 + 文案。
+fn clip_term_round(tag: &const byte) bool {
+    var ok: bool = true;
+    out_err("selftest[");
+    out_err(tag);
+    out_err("] ");
+
+    // ---- A) 查询字节**逐字节**等于规范形状 ----
+    // 规范：`OSC 5522 ; type=read[:id=<id>] ; <base64(空格分隔的 mime 列表)> BEL`
+    var q: Buf = buf_new(256);
+    defer { buf_free(&q); }
+    if !clipt_send_read_debug(&q, "" as &const byte, 0) {
+        clips_fail(tag, "读请求拼装失败", &ok);
+    }
+    const want_head: &const byte = "\x1b]5522;type=read;" as &const byte;
+    if q.len < 18 || !bufx_mem_eq(q.ptr as &const byte, want_head, 17) {
+        clips_fail(tag, "读请求前缀不是 `ESC]5522;type=read;`", &ok);
+    }
+    if q.ptr[q.len - 1] != 7 as byte {
+        clips_fail(tag, "读请求没有以 BEL 收尾", &ok);
+    }
+    // 载荷是 base64 的 `image/png image/jpeg image/gif image/webp text/plain`
+    var want_list: Buf = buf_new(128);
+    defer { buf_free(&want_list); }
+    _ = buf_append_cstr(&want_list,
+        "image/png image/jpeg image/gif image/webp text/plain" as &const byte);
+    var want_b64: Buf = buf_new(192);
+    defer { buf_free(&want_b64); }
+    _ = clipt_b64_ascii_debug(want_list.ptr as &const byte, want_list.len,
+        &want_b64);
+    if q.len != 17 + want_b64.len + 1 {
+        clips_fail(tag, "读请求长度不等于 前缀+base64+BEL", &ok);
+        out_err("  （期望 ");
+        out_err_dec((17 + want_b64.len + 1) as usize);
+        out_err(" 实得 ");
+        out_err_dec(q.len as usize);
+        out_err("）\n");
+    } else if !bufx_mem_eq(q.ptr as &const byte + 17,
+        want_b64.ptr as &const byte, want_b64.len) {
+        clips_fail(tag, "读请求的 base64 列表不对", &ok);
+    }
+    // id 形态：给了 id 时必须出现 `:id=`，且字符集只含 [a-zA-Z0-9-_+.]
+    var idbuf: Buf = buf_new(16);
+    defer { buf_free(&idbuf); }
+    clipt_new_id(&idbuf);
+    var q2: Buf = buf_new(256);
+    defer { buf_free(&q2); }
+    _ = clipt_send_read_debug(&q2, idbuf.ptr as &const byte, idbuf.len);
+    if !bufx_contains(&q2, ":id=" as &const byte) {
+        clips_fail(tag, "给了 id 但请求里没有 :id=", &ok);
+    }
+    var ii: usize = 0;
+    var id_chars_ok: bool = true;
+    while ii < idbuf.len {
+        const c: byte = idbuf.ptr[ii];
+        const alnum: bool = (c >= 48 as byte && c <= 57 as byte)
+            || (c >= 65 as byte && c <= 90 as byte)
+                || (c >= 97 as byte && c <= 122 as byte);
+        if !alnum {
+            id_chars_ok = false;
+        }
+        ii = ii + 1;
+    }
+    if !id_chars_ok {
+        clips_fail(tag, "id 含了规范之外的字符（终端会把它剥掉导致应答对不上）", &ok);
+    }
+    // 连着要两个 id 必须不同（否则上一轮迟到的应答会串味）
+    var id2: Buf = buf_new(16);
+    defer { buf_free(&id2); }
+    clipt_new_id(&id2);
+    if clips_eq(&idbuf, &id2) {
+        clips_fail(tag, "两次 new_id 给了同一个 id", &ok);
+    }
+
+    // ---- B) 探测字节**逐字节**等于规范形状 ----
+    // 规范：`CSI ? 5522 $ p`（DECRQM）。这里钉的是「`$` 一个都不能少」——
+    // 少了它就是另一条 CSI（`ESC[?5522p`），终端不应答，症状是每次粘贴白等 250 ms
+    // 却「看起来只是不支持」（踩坑 136 的机器判据）。
+    var probe: Buf = buf_new(16);
+    defer { buf_free(&probe); }
+    if !clipt_send_probe_debug(&probe) {
+        clips_fail(tag, "探测请求拼装失败", &ok);
+    }
+    const want_probe: &const byte = "\x1b[?5522$p" as &const byte;
+    if probe.len != 9 || !bufx_mem_eq(probe.ptr as &const byte, want_probe, 9) {
+        clips_fail(tag, "能力探测字节不是 `ESC[?5522$p`（DECRQM 的 `$` 丢了吗？）", &ok);
+    }
+
+    clips_term_frames(tag, &ok);
+    clips_term_codes(tag, &ok);
+    return clips_report(tag, ok,
+        "ok（线格式 / 分片 / 逐块解码 / 透传 / 多帧 / 探测 / 文案 / 模式）" as &const byte);
+}
+
+// clip-term 的中间一大段：应答解析（OK → 多块 DATA → DONE）、分片还原、透传、
+// ST 收尾、DECRPM 判定、扫描器的 fail-safe、一次 read 多帧、逐块解码。
+// 单独一个函数是为了 `clip_term_round` 不超 100 行（AGENTS.md 三条硬指标之一）。
+fn clips_term_frames(tag: &const byte, ok: &bool) void {
+    // ---- C) 应答解析：OK → 多块 DATA → DONE ----
+    var okf: Buf = buf_new(64);
+    defer { buf_free(&okf); }
+    clips_reply_status("OK" as &const byte, okf);
+    var donef: Buf = buf_new(64);
+    defer { buf_free(&donef); }
+    clips_reply_status("DONE" as &const byte, &donef);
+    var meta_ok: Buf = buf_new(64);
+    defer { buf_free(&meta_ok); }
+    _ = buf_append_cstr(&meta_ok, "type=read:status=OK" as &const byte);
+    clips_scan_case("OK 帧", okf, &g_clips_empty, OSCIN_KIND_OSC, &meta_ok,
+        &g_clips_empty,
+        OSCIN_WANT_DATA, ok);
+    var meta_done: Buf = buf_new(64);
+    defer { buf_free(&meta_done); }
+    _ = buf_append_cstr(&meta_done, "type=read:status=DONE" as &const byte);
+    clips_scan_case("DONE 帧", &donef, &g_clips_empty, OSCIN_KIND_OSC,
+        &meta_done, &g_clips_empty,
+        OSCIN_WANT_DATA, ok);
+    // DATA 帧：metadata 与 payload 要各自正确切出来
+    var pay_small: Buf = buf_new(32);
+    defer { buf_free(&pay_small); }
+    _ = buf_append_cstr(&pay_small, "hello" as &const byte);
+    var dataf: Buf = buf_new(256);
+    defer { buf_free(&dataf); }
+    clips_reply_data("image/png" as &const byte, pay_small.ptr as &const byte,
+        pay_small.len, &dataf);
+    var mime64: Buf = buf_new(64);
+    defer { buf_free(&mime64); }
+    _ = clipt_b64_ascii_debug("image/png" as &const byte, 9, &mime64);
+    var pay64: Buf = buf_new(64);
+    defer { buf_free(&pay64); }
+    _ = clipt_b64_ascii_debug(pay_small.ptr as &const byte, pay_small.len,
+        &pay64);
+    var meta_data: Buf = buf_new(128);
+    defer { buf_free(&meta_data); }
+    _ = buf_append_cstr(&meta_data,
+        "type=read:status=DATA:mime=" as &const byte);
+    _ = buf_append(&meta_data, mime64.ptr as &const byte, mime64.len);
+    clips_scan_case("DATA 帧", &dataf, &g_clips_empty, OSCIN_KIND_OSC,
+        &meta_data, &pay64,
+        OSCIN_WANT_DATA, ok);
+
+    clips_term_ids(tag, ok);
+
+    // ---- D) 分片：1 / 2 / 3 / 5 字节一片都要还原出同一帧 ----
+    var st: usize = 1;
+    while st <= 5 {
+        clips_scan_sharded("DATA 帧按字节切片", &dataf, st, OSCIN_KIND_OSC,
+            &meta_data, &pay64,
+            OSCIN_WANT_DATA, ok);
+        st = st + 1;
+    }
+
+    clips_term_transit(tag, ok);
+}
+
+// clip-term 的 id 校验那一组（踩坑 142 的钉子）：`clipt_frame_status` 必须按
+// **长度已知**的字节段比 id —— 拿 Buf 当 C 字面量传进 `bufx_eq_cstr` 就会永远判「不是本轮」。
+// 单独一个函数是为了 `clips_term_frames` 不超 100 行（AGENTS.md）。
+fn clips_term_ids(tag: &const byte, ok: &bool) void {
+    // ---- C2) id 校验：**必须用长度已知的比对**，不能拿 Buf 当 C 字面量 ----
+    // 这一格是踩坑 142 的钉子：`clipt_frame_status` 里比 id 时误用了 `bufx_eq_cstr`，
+    // 而那个函数的第三个参数是**当字面量**用的（内部 `bufx_cstr_len` 一路扫到 0）。
+    // 传 Buf 指针进去就读到缓冲区后面的垃圾 ⇒ **永远判「不是这一轮」**。
+    // 纯函数自测当时全绿（进程堆恰好是零页），真 PTY 上却是「请求发一遍又一遍、
+    // 数据收不回来」—— 所以这条必须直接钉 `clipt_frame_status`，不能只钉扫描器。
+    var idb: Buf = buf_new(16);
+    defer { buf_free(&idb); }
+    _ = buf_append_cstr(&idb, "u7" as &const byte);
+    var frame: Buf = buf_new(64);
+    defer { buf_free(&frame); }
+    var meta_id: Buf = buf_new(128);
+    defer { buf_free(&meta_id); }
+    // 同一 id + status=OK ⇒ 必须认成「本轮」（1）
+    _ = buf_append_cstr(&meta_id, "type=read:status=OK:id=" as &const byte);
+    _ = buf_append(&meta_id, idb.ptr as &const byte, idb.len);
+    if clipt_frame_status(&meta_id, idb.ptr as &const byte, idb.len) != 1 {
+        clips_fail(tag, "同一 id 的 OK 帧没被认成本轮（id 比对用了 bufx_eq_cstr？）", &ok);
+    }
+    // 别的 id ⇒ 丢弃（0）
+    buf_reset(&meta_id);
+    _ = buf_append_cstr(&meta_id, "type=read:status=OK:id=u9" as &const byte);
+    if clipt_frame_status(&meta_id, idb.ptr as &const byte, idb.len) != 0 {
+        clips_fail(tag, "别的 id 的帧被当成了本轮（上一轮迟到的应答会串味）", &ok);
+    }
+    // DATA / DONE 各映射到 2 / 3；EPERM 到 4；畸形到 5
+    buf_reset(&meta_id);
+    _ = buf_append_cstr(&meta_id, "type=read:status=DATA:id=" as &const byte);
+    _ = buf_append(&meta_id, idb.ptr as &const byte, idb.len);
+    _ = buf_append_cstr(&meta_id, ":mime=YQ==" as &const byte);
+    if clipt_frame_status(&meta_id, idb.ptr as &const byte, idb.len) != 2 {
+        clips_fail(tag, "DATA 帧没映射到 2", &ok);
+    }
+    buf_reset(&meta_id);
+    _ = buf_append_cstr(&meta_id, "type=read:status=DONE:id=" as &const byte);
+    _ = buf_append(&meta_id, idb.ptr as &const byte, idb.len);
+    if clipt_frame_status(&meta_id, idb.ptr as &const byte, idb.len) != 3 {
+        clips_fail(tag, "DONE 帧没映射到 3", &ok);
+    }
+    buf_reset(&meta_id);
+    _ = buf_append_cstr(&meta_id, "type=read:status=EPERM:id=" as &const byte);
+    _ = buf_append(&meta_id, idb.ptr as &const byte, idb.len);
+    if clipt_frame_status(&meta_id, idb.ptr as &const byte, idb.len) != 4 {
+        clips_fail(tag, "EPERM 帧没映射到 4（会被当成协议错）", &ok);
+    }
+    _ = frame;
+
+}
+
+// clip-term 的透传那一组：非 5522 的字节必须**逐字节**原样（粘贴内容里的 SGR 是老账），
+// 以及 ST（`ESC \`）收尾也认。单独一个函数是为了前一个不超 100 行。
+fn clips_term_transit(tag: &const byte, ok: &bool) void {
+    // ---- E) 透传：非 5522 的字节**逐字节**原样 ----
+    // 粘贴内容里的 SGR 序列（`ESC[31m`）是 tui-paste 轮 E 段的老账，这里必须继续原样。
+    var plain: Buf = buf_new(64);
+    defer { buf_free(&plain); }
+    _ = buf_append_cstr(&plain, "x \x1b[31mR\x1b[0m y" as &const byte);
+    clips_scan_case("普通字节与 SGR 原样透传", &plain, &plain, OSCIN_KIND_NONE,
+        &g_clips_empty,
+        &g_clips_empty, OSCIN_WANT_DATA, ok);
+    // 没 armed 时也一样（而且连捕获都不开）
+    clips_scan_case("没 armed 时透传", &plain, &plain, OSCIN_KIND_NONE,
+        &g_clips_empty,
+        &g_clips_empty, OSCIN_WANT_NONE, ok);
+    // 别的 OSC（终端标题之类）不是我们的帧，原样透传
+    var other_osc: Buf = buf_new(64);
+    defer { buf_free(&other_osc); }
+    _ = buf_append_cstr(&other_osc, "\x1b]0;title\x07rest" as &const byte);
+    clips_scan_case("别的 OSC 原样透传", &other_osc, &other_osc, OSCIN_KIND_NONE,
+        &g_clips_empty,
+        &g_clips_empty, OSCIN_WANT_DATA, ok);
+    // 别的 CSI 也一样
+    var other_csi: Buf = buf_new(64);
+    defer { buf_free(&other_csi); }
+    _ = buf_append_cstr(&other_csi, "\x1b[?2004h" as &const byte);
+    clips_scan_case("别的 CSI 原样透传", &other_csi, &other_csi, OSCIN_KIND_NONE,
+        &g_clips_empty,
+        &g_clips_empty, OSCIN_WANT_DATA, ok);
+    // `ESC[?5522$y` 缺了 `;` 与 Ps —— 不是 DECRPM，原样透传
+    var bad_decrpm: Buf = buf_new(64);
+    defer { buf_free(&bad_decrpm); }
+    _ = buf_append_cstr(&bad_decrpm, "\x1b[?5522$y" as &const byte);
+    clips_scan_case("畸形 DECRPM 原样透传", &bad_decrpm, &bad_decrpm, OSCIN_KIND_NONE,
+        &g_clips_empty, &g_clips_empty, OSCIN_WANT_PROBE, ok);
+
+    // ---- F) ST（`ESC \`）收尾也认 ----
+    var meta_done: Buf = buf_new(64);
+    defer { buf_free(&meta_done); }
+    _ = buf_append_cstr(&meta_done, "type=read:status=DONE" as &const byte);
+    var st_frame: Buf = buf_new(64);
+    defer { buf_free(&st_frame); }
+    _ = buf_append_cstr(&st_frame,
+        "\x1b]5522;type=read:status=DONE\x1b\\" as &const byte);
+    clips_scan_case("ST 收尾的帧", &st_frame, &g_clips_empty, OSCIN_KIND_OSC,
+        &meta_done,
+        &g_clips_empty, OSCIN_WANT_DATA, ok);
+
+    // ---- G) DECRPM：Ps=1/2/3 支持、0/4 不支持；不应答 = 不支持 ----
+    var g: i32 = 0;
+    while g <= 4 {
+        var d: Buf = buf_new(64);
+        defer { buf_free(&d); }
+        clips_reply_decrpm(g, &d);
+        oscin_reset();
+        oscin_arm(OSCIN_WANT_PROBE);
+        var pass: Buf = buf_new(64);
+        defer { buf_free(&pass); }
+        oscin_feed(d.ptr as &const byte, d.len, &pass);
+        if oscin_frame_kind() != OSCIN_KIND_DECRPM {
+            clips_fail(tag, "DECRPM 没被认出来", ok);
+            oscin_disarm();
+        } else {
+            var meta: Buf = buf_new(64);
+            defer { buf_free(&meta); }
+            var pay: Buf = buf_new(64);
+            defer { buf_free(&pay); }
+            oscin_frame(&meta, &pay);
+            const got: i32 = clipt_parse_decrpm(&meta);
+            const want: i32 = if g == 0 || g == 4 { 0 } else { 1 };
+            if got != want {
+                clips_fail(tag, "DECRPM 的 Ps 判支持/不支持反了", ok);
+                out_err("  （Ps=");
+                out_err_dec(g as usize);
+                out_err("）\n");
+            }
+            oscin_disarm();
+        }
+        g = g + 1;
+    }
+
+    clips_term_scanner(tag, ok);
+}
+
+// clip-term 里「扫描器本身」的那两组：未终结捕获的 fail-safe（必须吐回，不许吞按键）、
+// 一次 read 连着来三帧时的一帧一帧交付。单独一个函数是为了前一个不超 100 行。
+fn clips_term_scanner(tag: &const byte, ok: &bool) void {
+    // ---- H) 扫描器的 fail-safe：未终结的捕获必须吐回，不许吞掉按键 ----
+    // `ESC ] 55`（前缀都没对完）之后来一个普通字符：整段吐回，那个字符也要出来。
+    var half: Buf = buf_new(64);
+    defer { buf_free(&half); }
+    _ = buf_append_cstr(&half, "\x1b]55" as &const byte);
+    var z: Buf = buf_new(64);
+    defer { buf_free(&z); }
+    _ = buf_append_cstr(&z, "Z" as &const byte);
+    oscin_reset();
+    oscin_arm(OSCIN_WANT_DATA);
+    var pass2: Buf = buf_new(64);
+    defer { buf_free(&pass2); }
+    oscin_feed(half.ptr as &const byte, half.len, &pass2);
+    if pass2.len != 0 {
+        clips_fail(tag, "半截前缀不该立刻吐回（会切坏真应答）", ok);
+    }
+    oscin_feed(z.ptr as &const byte, z.len, &pass2);
+    var want_flush: Buf = buf_new(64);
+    defer { buf_free(&want_flush); }
+    _ = buf_append_cstr(&want_flush, "\x1b]55Z" as &const byte);
+    if !clips_eq(&pass2, &want_flush) {
+        clips_fail(tag, "对不上前缀的半截捕获没有原样吐回（会吞掉用户按键）", ok);
+    }
+    oscin_disarm();
+    // 解除等待之后攥着的那半截也要在下一次 feed 时吐回（顺序：先那 4 字节，再新字节）
+    oscin_reset();
+    oscin_arm(OSCIN_WANT_DATA);
+    var pass3: Buf = buf_new(64);
+    defer { buf_free(&pass3); }
+    oscin_feed(half.ptr as &const byte, half.len, &pass3);
+    oscin_disarm();
+    var z2: Buf = buf_new(64);
+    defer { buf_free(&z2); }
+    _ = buf_append_cstr(&z2, "Q" as &const byte);
+    oscin_feed(z2.ptr as &const byte, z2.len, &pass3);
+    var want3: Buf = buf_new(64);
+    defer { buf_free(&want3); }
+    _ = buf_append_cstr(&want3, "\x1b]55Q" as &const byte);
+    if !clips_eq(&pass3, &want3) {
+        clips_fail(tag, "disarm 之后攥着的半截捕获没有吐回（那 4 个字节被吞了）", ok);
+        out_err("  （期望 5 字节，实得 ");
+        out_err_dec(pass3.len as usize);
+        out_err("）\n");
+    }
+    oscin_disarm();
+
+    clips_term_multi(tag, ok);
+}
+
+// clip-term 的「一次 read 多帧」那一组：一帧一帧交付、不丢不串（不变量 ⑥ 的判据）。
+fn clips_term_multi(tag: &const byte, ok: &bool) void {
+    // ---- I) 一次 read 里连着来三帧：一帧一帧交付，不丢不串 ----
+    // 三帧的字节在这一层重造（不跨函数借 `clips_term_frames` 的局部量 —— 那是
+    // 另一个函数的作用域，借不到；实测症状是生成 C 里一片 undeclared）。
+    var okf: Buf = buf_new(64);
+    defer { buf_free(&okf); }
+    clips_reply_status("OK" as &const byte, okf);
+    var donef: Buf = buf_new(64);
+    defer { buf_free(&donef); }
+    clips_reply_status("DONE" as &const byte, &donef);
+    var img3: Buf = buf_new(256);
+    defer { buf_free(&img3); }
+    clips_png_into(&img3);
+    var dataf: Buf = buf_new(256);
+    defer { buf_free(&dataf); }
+    clips_reply_data("image/png" as &const byte, img3.ptr as &const byte,
+        img3.len, &dataf);
+    var three: Buf = buf_new(512);
+    defer { buf_free(&three); }
+    _ = buf_append(&three, okf.ptr as &const byte, okf.len);
+    _ = buf_append(&three, dataf.ptr as &const byte, dataf.len);
+    _ = buf_append(&three, donef.ptr as &const byte, donef.len);
+    oscin_reset();
+    oscin_arm(OSCIN_WANT_DATA);
+    var p4: Buf = buf_new(64);
+    defer { buf_free(&p4); }
+    oscin_feed(three.ptr as &const byte, three.len, &p4);
+    // 第一次 feed 只该交付一帧（OK），后两帧留在挂起段里
+    var got_n: i32 = 0;
+    while oscin_frame_kind() != OSCIN_KIND_NONE {
+        var m: Buf = buf_new(128);
+        defer { buf_free(&m); }
+        var y: Buf = buf_new(128);
+        defer { buf_free(&y); }
+        oscin_frame(&m, &y);
+        got_n = got_n + 1;
+    }
+    if got_n != 1 {
+        clips_fail(tag, "一次 read 里的多帧没有按「一次一帧」交付", ok);
+        out_err("  （首轮交付了 ");
+        out_err_dec(got_n as usize);
+        out_err(" 帧）\n");
+    }
+    // 取走之后再喂一个**空批**：挂起段里的后两帧要接着解出来（一次一帧，共两次）
+    var pending_n: i32 = 0;
+    var zero: [byte: 1] = [0: 1];
+    var dump: Buf = buf_new(1024);
+    defer { buf_free(&dump); }
+    var guard: i32 = 0;
+    while guard < 4 {
+        guard = guard + 1;
+        oscin_feed(&zero[0], 0, &dump);
+        if oscin_frame_kind() == OSCIN_KIND_NONE {
+            break;
+        }
+        var m2: Buf = buf_new(128);
+        defer { buf_free(&m2); }
+        var y2: Buf = buf_new(128);
+        defer { buf_free(&y2); }
+        oscin_frame(&m2, &y2);
+        pending_n = pending_n + 1;
+    }
+    if pending_n != 2 {
+        clips_fail(tag, "挂起段里的后两帧没有接着解出来", ok);
+        out_err("  （续解出 ");
+        out_err_dec(pending_n as usize);
+        out_err(" 帧，期望 2）\n");
+    }
+    if dump.len != 0 {
+        clips_fail(tag, "整批都是回帧时不该有透传字节", ok);
+    }
+    oscin_disarm();
+
+    clips_term_chunks(tag, ok);
+}
+
+// clip-term 的分块解码那一组（**走真正的装配路径**）：逐块解、拼接后逐字节等于原图，
+// 以及「更低优先级的块不许覆盖已收好的那一档」。单独一个函数是为了前一个不超 100 行。
+fn clips_term_chunks(tag: &const byte, ok: &bool) void {
+    // ---- J) 分块解码：**走真正的装配路径**，每块单独解，拼接后逐字节等于原图 ----
+    // 这是本轮最容易写错的一格（把整串拼起来再解会坏 —— 规范要求每块自带 padding）。
+    // 夹具切成 4 字节一块，逐块喂给 `clipt_take_data_debug`（= 生产路径那一份实现）。
+    var img: Buf = buf_new(256);
+    defer { buf_free(&img); }
+    clips_png_into(&img);
+    var joined: Buf = buf_new(512);
+    defer { buf_free(&joined); }
+    var jmime: Buf = buf_new(32);
+    defer { buf_free(&jmime); }
+    var jcode: i32 = CLIPT_NONE;
+    var mime_png: Buf = buf_new(16);
+    defer { buf_free(&mime_png); }
+    _ = buf_append_cstr(&mime_png, "image/png" as &const byte);
+    var off: usize = 0;
+    var chunk_n: usize = 0;
+    while off < img.len {
+        var take: usize = 4;
+        if off + take > img.len {
+            take = img.len - off;
+        }
+        var piece: Buf = buf_new(64);
+        defer { buf_free(&piece); }
+        _ = buf_append(&piece, img.ptr as &const byte + off, take);
+        var piece64: Buf = buf_new(64);
+        defer { buf_free(&piece64); }
+        _ = clipt_b64_ascii_debug(piece.ptr as &const byte, take, &piece64);
+        if !clipt_take_data_debug(&mime_png, &piece64, &joined, &jmime,
+            &jcode) {
+            clips_fail(tag, "分块装配被拒（不该）", ok);
+        }
+        off = off + take;
+        chunk_n = chunk_n + 1;
+    }
+    if !clips_eq(&joined, &img) {
+        clips_fail(tag, "逐块解码再拼接 != 原字节（整串拼接后解码的写法会在这里红）", ok);
+    }
+    if chunk_n < 8 {
+        clips_fail(tag, "夹具没有真的切出多块", ok);
+    }
+    if jcode != CLIPT_IMAGE {
+        clips_fail(tag, "分块装配之后没有记成「图片」", ok);
+    }
+    if !bufx_eq_cstr(jmime.ptr as &const byte, jmime.len,
+        "image/png" as &const byte) {
+        clips_fail(tag, "分块装配记下的 MIME 不对", ok);
+    }
+    // 一张能被 imgx 认出来的 PNG（顺便证明夹具是「真」图，而非任意字节）
+    var info: ImgInfo = ImgInfo{ kind: IMGX_NONE, width: 0, height: 0,
+        bytes: 0 };
+    if !imgx_sniff(img.ptr as &const byte, img.len,
+        &info) || info.width != 2 || info.height != 3 {
+        clips_fail(tag, "PNG 夹具不能被 imgx 认出来（后续 PTY 轮的断言就假了）", ok);
+    }
+    // 不想要的 mime 要被丢掉（终端可能多给几种），且不许污染已经收好的那一档
+    var mime_txt: Buf = buf_new(16);
+    defer { buf_free(&mime_txt); }
+    _ = buf_append_cstr(&mime_txt, "text/plain" as &const byte);
+    var txt64: Buf = buf_new(64);
+    defer { buf_free(&txt64); }
+    _ = clipt_b64_ascii_debug("zz" as &const byte, 2, &txt64);
+    if !clipt_take_data_debug(&mime_txt, &txt64, &joined, &jmime, &jcode) {
+        clips_fail(tag, "后到的文本块被当成了错误", ok);
+    }
+    if jcode != CLIPT_IMAGE || !clips_eq(&joined, &img) {
+        clips_fail(tag, "低优先级的文本块覆盖了已经收好的图片", ok);
+    }
+
+}
+
+// clip-term 的收尾三组：文案各不相同、仲裁层文案、「没有来源」文案、模式解析。
+// 单独一个函数是因为 `clip_term_round` 已经很长（AGENTS.md 的 100 行红线）。
+fn clips_term_codes(tag: &const byte, ok: &bool) void {
+    // ---- K) 状态码文案：各不相同且非空 ----
+    var seen: [i32: 4] = [CLIPT_UNSUPPORTED, CLIPT_DENIED, CLIPT_BUSY,
+        CLIPT_ERR];
+    var s1: usize = 0;
+    while s1 < 4 {
+        if bufx_cstr_len(clipt_reason(seen[s1])) == 0 {
+            clips_fail(tag, "终端来源的失败文案为空", ok);
+        }
+        var s2: usize = s1 + 1;
+        while s2 < 4 {
+            if bufx_cstr_len(clipt_reason(seen[s1])) ==
+                bufx_cstr_len(clipt_reason(seen[s2]))
+                && bufx_eq_cstr(clipt_reason(seen[s1]),
+                    bufx_cstr_len(clipt_reason(seen[s1])),
+                    clipt_reason(seen[s2])) {
+                clips_fail(tag, "两个失败码给了同一句文案（用户分不清原因）", ok);
+            }
+            s2 = s2 + 1;
+        }
+        s1 = s1 + 1;
+    }
+    // 仲裁层与 helper 的文案也不许空
+    if bufx_cstr_len(cliphelp_reason(CLIPH_NO_HELPER)) == 0 {
+        clips_fail(tag, "helper 来源的失败文案为空", ok);
+    }
+    var offcfg: Config = cfg_default();
+    offcfg.clip_mode = CLIP_MODE_OFF;
+    if bufx_cstr_len(clip_reason(&offcfg, CLIP_OFF, CLIP_SRC_NONE)) == 0 {
+        clips_fail(tag, "clip_reason 的 off 文案为空", ok);
+    }
+    // 「一个来源都没有」那一档的文案必须提到**试过的通道**（不许只来一句「失败」）
+    offcfg.clip_mode = CLIP_MODE_AUTO;
+    var nsb: Buf = buf_new(64);
+    defer { buf_free(&nsb); }
+    _ = buf_append_cstr(&nsb, clip_reason(&offcfg, CLIP_NO_SOURCE,
+        CLIP_SRC_NONE));
+    if !bufx_contains(&nsb, "OSC 5522" as &const byte) {
+        clips_fail(tag, "「没有来源」的文案没提终端协议（用户无从知道该换终端）", ok);
+    }
+    cfg_free(&offcfg);
+
+    // ---- L) 模式解析：五个合法值 + 非法值不许静默当 auto ----
+    if clip_mode_parse("auto" as &const byte, 4) != CLIP_MODE_AUTO
+        || clip_mode_parse("term" as &const byte, 4) != CLIP_MODE_TERM
+        || clip_mode_parse("x11" as &const byte, 3) != CLIP_MODE_X11
+        || clip_mode_parse("helper" as &const byte, 6) != CLIP_MODE_HELPER
+        || clip_mode_parse("off" as &const byte, 3) != CLIP_MODE_OFF {
+        clips_fail(tag, "--clip 的五个合法取值没有全部认出来", ok);
+    }
+    if clip_mode_parse("Term" as &const byte, 4) != 255
+        || clip_mode_parse("" as &const byte, 0) != 255
+        || clip_mode_parse("terminal" as &const byte, 8) != 255 {
+        clips_fail(tag, "--clip 的非法取值被当成了合法（会静默落回 auto）", ok);
+    }
+}
+
+// 三轮共用的收尾：打结论、返回 verdict。**只此一份** —— 三处各写一遍的话
+// 「ok 文案」与「FAIL 文案」的写法会漂开（本轮已经因为手写折行弄坏过一处字面量）。
+fn clips_report(tag: &const byte, ok: bool, what: &const byte) bool {
+    _ = tag;
+    if ok {
+        out_err(what);
+        out_err("\n");
+    } else {
+        out_err("FAIL\n");
+    }
+    return ok;
+}
+
+// ============================================================
+// clip-pty：真 PTY + 假终端（本轮「无 X11 也能用」的验收证据）
+// ============================================================
+
+// 子进程：真 TUI，但 agent home 与 workspace 都用独立目录（与 tui-paste 轮同一条口径：
+// 共用目录时上一次跑留下的会话日志会把这一次的断言盖住）。
+// 环境由父进程在 fork **之前**设好（DISPLAY 清空 / UYA_AGENT_CLIP=term / SSH_* 等）。
+fn clips_child_tui(slave_path: &const Buf, port: u16, ws: &const byte,
+    home: &const byte) void {
+    const s: i32 = sys_open(slave_path.ptr as *const byte, TUIS_O_RDWR_NOCTTY,
+        0) catch { -1; };
+    if s < 0 {
+        sys_exit(9);
+    }
+    _ = sys_dup2(s, 0) catch {};
+    _ = sys_dup2(s, 1) catch {};
+    _ = sys_dup2(s, 2) catch {};
+    if s > 2 {
+        _ = sys_close(s) catch {};
+    }
+    var c: Config = cfg_default();
+    c.sandbox = SAN_OFF;
+    cfg_pin_api(&c, LLM_STYLE_CHAT);
+    c.base_url = buf_new(64);
+    _ = buf_append_cstr(&c.base_url, "http://127.0.0.1:");
+    _ = buf_append_u64(&c.base_url, port as u64);
+    _ = buf_append_cstr(&c.base_url, "/v1");
+    c.model = buf_new(32);
+    _ = buf_append_cstr(&c.model, "selftest-model");
+    c.api_key = buf_new(32);
+    _ = buf_append_cstr(&c.api_key, "selftest-key");
+    c.workspace = buf_new(64);
+    _ = buf_append_cstr(&c.workspace, ws);
+    c.task = buf_empty();
+    c.verify = HC_VERIFY_NONE;
+    c.allow_shell = true;
+    c.stream = true;
+    c.quiet = false;
+    c.max_steps = 4;
+    c.timeout_ms = 15000;
+    c.agent_home = buf_new(128);
+    _ = buf_append_cstr(&c.agent_home, home);
+    c.tui = true;
+    c.tui_headless = false;
+    // 不吃图的模型会把粘贴进来的图片直接拒掉，那一轮的判据就不成立了
+    c.input_image = true;
+    const rc: i32 = agent_run_tui(&c);
+    sys_exit(rc);
+}
+
+// 在 master 上等一段**特定字节**出现：等到了写进 cap 并返回 true。
+// 判据是逐字节的字面量（不是「收到任意字节」）—— 屏幕上本来就有大量其他输出。
+fn clips_wait_lit(m: i32, cap: &Buf, lit: &const byte, budget_ms: i32) bool {
+    if bufx_contains(cap, lit) {
+        return true;      // 上一批里已经有了
+    }
+    var waited: i32 = 0;
+    var tmp: [byte: 4096] = [0: 4096];
+    while waited < budget_ms {
+        var pfds: [PollFd: 1] = [PollFd{ fd: m, events: POLLIN, revents: 0 }];
+        const pr: i32 = sys_poll(&pfds[0], 1, 20) catch { 0; };
+        waited = waited + 20;
+        if pr <= 0 {
+            continue;
+        }
+        const n: isize = sys_read(m, &tmp[0], 4096) catch { -1 as isize; };
+        if n <= 0 {
+            break;
+        }
+        _ = buf_append(cap, &tmp[0], n as usize);
+        if bufx_contains(cap, lit) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// 把假终端的应答写进 master
+fn clips_reply_to_master(m: i32, p: &const Buf) void {
+    _ = sys_write(m, p.ptr as *const byte, p.len) catch {};
+}
+
+// clip-pty 轮：DISPLAY 为空 + 假终端应答一张 PNG ⇒ 必须贴上附件。
+// 这是「没有 X11 的机器上也能用」与「SSH 也能用」两条诉求的**机器判据**。
+fn clip_pty_round(tag: &const byte) bool {
+    var ok: bool = true;
+    out_err("selftest[");
+    out_err(tag);
+    out_err("] ");
+    mock_mode = 0;
+    mock_expect_shell = true;
+    mock_expect_fold = false;
+    mock_expect_steer = false;
+    const wsdir: &const byte = "build/selftest_ws_clip_pty" as &const byte;
+    if !ws_prepare(wsdir) {
+        clips_fail(tag, "工作目录准备失败", &ok);
+        return false;
+    }
+    const homedir: &const byte = "build/selftest_clip_home" as &const byte;
+    var hp: Buf = buf_new(64);
+    defer { buf_free(&hp); }
+    _ = buf_append_cstr(&hp, homedir);
+    _ = buf_append_byte(&hp, 0);
+    _ = sys_mkdir(&hp.ptr[0] as *const byte, 493 as u32) catch {};
+    var mpid: i32 = -1;
+    const port: u16 = tuis_start_mock(&mpid);
+    if port == 0 {
+        clips_fail(tag, "mock LLM 起不来", &ok);
+        return false;
+    }
+    var slave_path: Buf = buf_new(64);
+    defer { buf_free(&slave_path); }
+    const m: i32 = tuis_open_pty(&slave_path, 100, 30);
+    if m < 0 {
+        clips_fail(tag, "打不开 /dev/ptmx", &ok);
+        _ = sys_kill(mpid as i64, SIGKILL) catch {};
+        return false;
+    }
+    const cpid: i32 = clips_pty_spawn(tag, m, &slave_path, port, wsdir,
+        homedir, &ok);
+    if cpid < 0 {
+        return false;
+    }
+    if !clips_pty_probe(tag, m, cpid, &ok) {
+        return false;
+    }
+    var cap2: Buf = buf_new(262144);
+    defer { buf_free(&cap2); }
+    // 5) 等真正的读请求（探测过了才会有它）
+    if !clips_wait_lit(m, &cap2, "\x1b]5522;type=read" as &const byte, 6000) {
+        clips_fail(tag, "探测之后没有发出读请求（能力探测的结果没被用上）", &ok);
+        _ = sys_kill(cpid as i64, SIGKILL) catch {};
+        return false;
+    }
+    // 6) 假终端回：OK → 一块 DATA(image/png) → DONE。图片夹具能被 imgx 认出来。
+    var img: Buf = buf_new(256);
+    defer { buf_free(&img); }
+    clips_png_into(&img);
+    var okf: Buf = buf_new(64);
+    defer { buf_free(&okf); }
+    clips_reply_status("OK" as &const byte, &okf);
+    var df: Buf = buf_new(256);
+    defer { buf_free(&df); }
+    clips_reply_data("image/png" as &const byte, img.ptr as &const byte,
+        img.len, &df);
+    var donef: Buf = buf_new(64);
+    defer { buf_free(&donef); }
+    clips_reply_status("DONE" as &const byte, &donef);
+    // **三帧一次写完**（不是三次 write）：PTY 会把它合成一批给子进程读，
+    // 于是子进程一次 `read` 就拿到 OK+DATA+DONE —— 这正是「一次只交付一帧、
+    // 剩下的进挂起段、下一次接着解」那条不变量的判据（分三次写的话每次只有一帧，
+    // 挂起段永远用不上，那条路就成了死代码）。
+    var reply: Buf = buf_new(1024);
+    defer { buf_free(&reply); }
+    _ = buf_append(&reply, okf.ptr as &const byte, okf.len);
+    _ = buf_append(&reply, df.ptr as &const byte, df.len);
+    _ = buf_append(&reply, donef.ptr as &const byte, donef.len);
+    const t_rep: u64 = ua_now_ms();
+    clips_reply_to_master(m, &reply);
+    clips_pty_collect(tag, m, cap2, &ok);
+    clips_pty_prompt(tag, t_rep, &ok);
+    // 9) 收尾：发 /exit 让它退出；退不掉就杀掉
+    var quit: [byte: 12] = "/exit\r\x00\x00\x00\x00\x00\x00";
+    tuis_write_master(m, &quit[0], 6);
+    var st: i32 = 0;
+    if !tuis_wait_raw(cpid, &st, 4000) {
+        _ = sys_kill(cpid as i64, SIGKILL) catch {};
+        var st2: i32 = 0;
+        _ = sys_waitpid(cpid, &st2, 0) catch {};
+    }
+    _ = sys_close(m) catch {};
+    _ = sys_kill(mpid as i64, SIGKILL) catch {};
+    var mst: i32 = 0;
+    _ = sys_waitpid(mpid, &mst, 0) catch {};
+    return clips_report(tag, ok,
+        "ok（无 X11 + 假终端 5522 ⇒ 图片贴上；应答字节没进屏幕）" as &const byte);
+}
+
+// clip-pty 的子进程与图形环境：**故意没有任何图形会话**（DISPLAY / WAYLAND_DISPLAY
+// 清空、HOME 指到一个空目录 —— 空 HOME 顺带把 ~/.Xauthority 那条路也堵上），
+// 并把来源钉成终端协议一条腿（`UYA_AGENT_CLIP=term`），判据才确定（不然会去试 X11 白等）。
+// 返回子进程 pid；< 0 = 起不来（已经报过失败）。
+// 单独一个函数是为了 `clip_pty_round` 不超 100 行（AGENTS.md）。
+fn clips_pty_spawn(tag: &const byte, m: i32, slave_path: &const Buf, port: u16,
+                   wsdir: &const byte, homedir: &const byte, ok: &bool) i32 {
+    // 环境：**故意没有任何图形会话**（DISPLAY 清空、WAYLAND_DISPLAY 清空、HOME 指到
+    // 一个空目录 —— 空 HOME 顺带把 ~/.Xauthority 那条路也堵上）。
+    // UYA_AGENT_CLIP=term 把来源钉成终端协议一条腿，判据才确定（不然会去试 X11 白等）。
+    var saved_disp: Buf = env_or("DISPLAY" as &const byte, "" as &const byte);
+    defer {
+        if saved_disp.len > 0 {
+            var z: Buf = buf_new(saved_disp.len + 2);
+            defer { buf_free(&z); }
+            _ = buf_append(&z, saved_disp.ptr as &const byte, saved_disp.len);
+            _ = buf_append_byte(&z, 0);
+            _ = setenv("DISPLAY" as &const byte, z.ptr as &const byte, 1);
+        }
+    }
+    _ = setenv_cstr("DISPLAY" as &const byte, "" as &const byte);
+    _ = setenv_cstr("WAYLAND_DISPLAY" as &const byte, "" as &const byte);
+    _ = setenv_cstr("UYA_AGENT_CLIP" as &const byte, "term" as &const byte);
+    const cpid64: i64 = sys_fork() catch {
+        _ = sys_close(m) catch {};
+        clips_fail(tag, "fork 失败", ok);
+        return -1;
+    };
+    if cpid64 == 0 {
+        clips_child_tui(slave_path, port, wsdir, homedir);
+        sys_exit(3);
+        return -1;
+    }
+    return tuis_i32(cpid64);
+}
+
+// clip-pty 的前半（第 1–4 步）：等界面上屏 → 按 ctrl+v → 等能力探测（DECRQM）
+// → 假终端回「支持」。返回 false = 这一轮到此为止（已经报过失败）。
+// 单独一个函数是为了 `clip_pty_round` 不超 100 行（AGENTS.md）。
+fn clips_pty_probe(tag: &const byte, m: i32, cpid: i32, ok: &bool) bool {
+    var cap: Buf = buf_new(262144);
+    defer { buf_free(&cap); }
+    // 1) 先让界面上屏（起标题等输出会混在 cap 里，判据只看关键字节）
+    var settle: i32 = 0;
+    while settle < 8 {
+        tuis_drain(m, &cap, 6);
+        settle = settle + 1;
+    }
+    // 2) 按 ctrl+v（0x16 = 22）触发粘贴。**探测与读请求都在这一刻之后才发** ——
+    //    能力探测是 `clipt_available` 的一部分，而它由 `clip_paste` 调（见 media/clipt）。
+    var key: [byte: 1] = [0: 1];
+    key[0] = 22 as byte;
+    tuis_write_master(m, &key[0], 1);
+    // 3) 等**能力探测**（DECRQM）。假终端要在 250 ms 的探测预算内应答，
+    //    所以这里一次读到就直接回，别等满预算。
+    var cap1: Buf = buf_new(262144);
+    defer { buf_free(&cap1); }
+    if !clips_wait_lit(m, &cap1, "\x1b[?5522$p" as &const byte, 6000) {
+        clips_fail(tag, "ctrl+v 之后没有发出能力探测（DECRQM `ESC[?5522$p`）", ok);
+        _ = sys_kill(cpid as i64, SIGKILL) catch {};
+        return false;
+    }
+    // 4) 假终端：**支持** 5522（Ps=2 是「可设置、被重置」一档；0/4 才是不支持）
+    var dr: Buf = buf_new(64);
+    defer { buf_free(&dr); }
+    clips_reply_decrpm(2, &dr);
+    clips_reply_to_master(m, &dr);
+    return true;
+}
+
+// 应答必须**在读预算内当场**被吃完，不是靠 10 s 读超时兜底。
+// 判据为什么重要：一次 read 里连着来三帧是常态，而扫描器一次只交付一帧 —— 少了
+// 「把挂起段接着解完」那一步，就要等满 `CLIPT_READ_MS`（10 s）才收口，用户看到的
+// 是「贴一下卡十秒」。给 5 s 余量（真值约 0.1 s）：既不 flake，又能把「靠超时兜底」
+// 那条路判红。单独一个函数是为了 `clip_pty_round` 不超 100 行（AGENTS.md）。
+fn clips_pty_prompt(tag: &const byte, t_rep: u64, ok: &bool) void {
+    const spent: u64 = ua_now_ms() - t_rep;
+    if spent > 5000 {
+        clips_fail(tag, "收应答花得太久（挂起段的后续帧没被接着解，靠超时兜底了）", ok);
+        out_err("  （耗时 ");
+        out_err_dec(spent as usize);
+        out_err(" ms）\n");
+    }
+}
+
+// clip-pty 的收屏与断言（第 7–8 步）：图收下了、应答字节没上屏。
+// 单独一个函数是为了 `clip_pty_round` 不超 100 行（AGENTS.md）。
+fn clips_pty_collect(tag: &const byte, m: i32, cap2: &const Buf,
+                     ok: &bool) void {
+    // 7) 收屏：断言「图片被收下了」的那条 notice 上屏了
+    var cap3: Buf = buf_new(262144);
+    defer { buf_free(&cap3); }
+    var rounds: i32 = 0;
+    var saw_attach: bool = false;
+    while rounds < 40 && !saw_attach {
+        tuis_drain(m, &cap3, 5);
+        const n0: usize = cap3.len;
+        _ = buf_append(&cap3, cap2.ptr as &const byte, cap2.len);
+        _ = n0;
+        // 附件落盘成功时的文案由 agent_image_attach_bytes 给（「已挂 …」/文件名）
+        if bufx_contains(&cap3, "image/png" as &const byte)
+            || bufx_contains(&cap3, "[image]" as &const byte) {
+            saw_attach = true;
+        }
+        rounds = rounds + 1;
+    }
+    if !saw_attach {
+        clips_fail(tag, "DISPLAY 为空时终端协议贴的图没有被收下（这正是本轮的核心诉求）", ok);
+        tuis_dump_tail(&cap3, 1200);
+    }
+    // 8) **核心不变量**：终端应答的字节一个都不许进输入行
+    //    （输入行会被画到屏幕上；应答里的 base64 只要漏进去就会出现在帧里）
+    if bufx_contains(&cap3, "type=read:status=DATA" as &const byte) {
+        clips_fail(tag, "终端应答的协议字节漏进了屏幕（扫描器没拦住）", ok);
+        tuis_dump_tail(&cap3, 1200);
+    }
+}
+
+
+// ============================================================
+// clip-helper：假 helper 脚本
+// ============================================================
+
+// 本轮开始时那份 PATH（收尾时还原）。为什么不做在夹具函数的 `defer` 里：那会在夹具
+// **返回**时就还原，而后面几个子函数还要用改过的 PATH（实测踩坑 141：探测全落空）。
+var g_clip_old_path: Buf = Buf{ ptr: null, len: 0, cap: 0 };
+
+// 记住当前 PATH（幂等）
+fn cliph_old_path_save() void {
+    if buf_valid(&g_clip_old_path) {
+        return;
+    }
+    g_clip_old_path = env_or("PATH" as &const byte, "" as &const byte);
+}
+
+// 还原 PATH（不写回环境是错的：本轮的假 helper 目录会被后面的轮次看见）
+fn cliph_old_path_restore() void {
+    if !buf_valid(&g_clip_old_path) {
+        return;
+    }
+    var z: Buf = buf_new(g_clip_old_path.len + 2);
+    defer { buf_free(&z); }
+    _ = buf_append(&z, g_clip_old_path.ptr as &const byte, g_clip_old_path.len);
+    _ = buf_append_byte(&z, 0);
+    _ = setenv("PATH" as &const byte, z.ptr as &const byte, 1);
+}
+
+// 写一个可执行的假 helper 脚本（`#!/bin/sh` + 内容），chmod 755。
+// 为什么用 shell 脚本而不是编一个小程序：它要能**按参数分叉**（`--list-types` vs 取数），
+// 二十个字节的 shell 就够，而且不引入第二个构建目标。
+fn clips_write_script(path: &const byte, body: &const byte) bool {
+    var pz: Buf = buf_new(256);
+    defer { buf_free(&pz); }
+    _ = buf_append_cstr(&pz, path);
+    _ = buf_append_byte(&pz, 0);
+    // 权限 493 = 0755：假 helper 必须**可执行**（`access(X_OK)` 才过得去）。
+    // 标志位写字面量而不是 `O_CREAT` 那几个常量：本片是自测，少一层 libc 依赖更好读。
+    // 0x241 = O_WRONLY(1) | O_CREAT(0x40) | O_TRUNC(0x200)
+    const flags: i32 = 0x241;
+    const fd: i32 = sys_open(&pz.ptr[0] as *const byte, flags,
+        493) catch { -1; };
+    if fd < 0 {
+        return false;
+    }
+    const n: usize = bufx_cstr_len(body);
+    const w: isize = sys_write(fd, body as *const byte,
+        n) catch { -1 as isize; };
+    _ = sys_close(fd) catch {};
+    return w == (n as isize);
+}
+
+// clip-helper 轮：PATH 解析 + 子进程语义 + 超时按组收 + 超限拒绝 + 类型表比对。
+fn clip_helper_round(tag: &const byte) bool {
+    var ok: bool = true;
+    out_err("selftest[");
+    out_err(tag);
+    out_err("] ");
+    // 1) 造一个只属于本轮的目录，里面放假 helper（假的 wl-paste / xclip 脚本）
+    const dir: &const byte = "build/selftest_clip_helper" as &const byte;
+    if !clips_helper_fixture(tag, dir, &ok) {
+        return false;
+    }
+    clips_helper_pick(tag, dir, &ok);
+    clips_helper_timeout_fn(tag, dir, &ok);
+    clips_helper_notools(tag, &ok);
+    cliph_old_path_restore();
+    return clips_report(tag, ok,
+        "ok（PATH 探测 / 类型表 / 取数优先级 / 超时按组收 / 无工具文案）" as &const byte);
+}
+
+// clip-helper 的准备（第 1–2 步）：造假 wl-paste、把它前置进 PATH、设好环境形状。
+// 返回 false = 夹具造不出来（已经报过失败），调用方直接收工。
+// 单独一个函数是为了 `clip_helper_round` 不超 100 行（AGENTS.md）。
+fn clips_helper_fixture(tag: &const byte, dir: &const byte, ok: &bool) bool {
+
+    // 假 wl-paste：`--list-types` 报两种类型；`--type image/png` 吐 PNG 字节；
+    // 其它类型给一行文本。**故意**用 printf 输出二进制 -\x89 这类字节（%b）。
+    var wspath: Buf = buf_new(256);
+    defer { buf_free(&wspath); }
+    _ = buf_append_cstr(&wspath, dir);
+    _ = buf_append_cstr(&wspath, "/wl-paste" as &const byte);
+    var wsbody: Buf = buf_new(1024);
+    defer { buf_free(&wsbody); }
+    _ = buf_append_cstr(&wsbody, "#!/bin/sh\n" as &const byte);
+    _ = buf_append_cstr(&wsbody,
+        "if [ \"$1\" = \"--list-types\" ]; then\n" as &const byte);
+    _ = buf_append_cstr(&wsbody,
+        "  printf 'image/png\\ntext/plain\\n'\n" as &const byte);
+    _ = buf_append_cstr(&wsbody, "  exit 0\nfi\n" as &const byte);
+    // 行宽豁免：假 helper 脚本的一整行 shell（不可断）
+    _ = buf_append_cstr(&wsbody, "if [ \"$1\" = \"--type\" ] && [ \"$2\" = \"image/png\" ]; then\n" as &const byte);
+    _ = buf_append_cstr(&wsbody,
+        "  printf '\\211PNG\\r\\n\\032\\n'\n" as &const byte);
+    _ = buf_append_cstr(&wsbody, "  exit 0\nfi\n" as &const byte);
+    _ = buf_append_cstr(&wsbody,
+        "if [ \"$1\" = \"--type\" ]; then\n" as &const byte);
+    _ = buf_append_cstr(&wsbody,
+        "  printf 'hello-from-helper'\n  exit 0\nfi\n" as &const byte);
+    _ = buf_append_cstr(&wsbody, "printf 'nope'\nexit 1\n" as &const byte);
+    var wsz: Buf = buf_new(256);
+    defer { buf_free(&wsz); }
+    _ = buf_append(&wsz, wspath.ptr as &const byte, wspath.len);
+    _ = buf_append_byte(&wsz, 0);
+    if !clips_write_script(&wsz.ptr[0] as &const byte,
+        wsbody.ptr as &const byte) {
+        clips_fail(tag, "写假 wl-paste 失败", ok);
+        return false;
+    }
+    // 2) 把本轮目录**前置**进 PATH，并设 WAYLAND_DISPLAY（wl-paste 的启用条件）
+    //    用 setenv 而不是 saved_envp：cliphelp 的 PATH 扫描走 getenv（见那边的注释）。
+    // 旧的 PATH 存进**进程级**缓冲：不能在夹具函数里 `defer` 还原 ——
+    // 那会在夹具返回时立刻生效，而后续的 `clips_helper_pick` / `_timeout_fn` 还要用
+    // 改过的 PATH。还原由 `clip_helper_round` 在收尾时统一做（实测踩坑 141）。
+    cliph_old_path_save();
+    var oldpath: Buf = g_clip_old_path;
+    var newpath: Buf = buf_new(oldpath.len + 128);
+    defer { buf_free(&newpath); }
+    _ = buf_append(&newpath, dir, bufx_cstr_len(dir));
+    _ = buf_append_byte(&newpath, 58);
+    _ = buf_append(&newpath, oldpath.ptr as &const byte, oldpath.len);
+    _ = buf_append_byte(&newpath, 0);
+    _ = setenv("PATH" as &const byte, newpath.ptr as &const byte, 1);
+    _ = setenv_cstr("WAYLAND_DISPLAY" as &const byte,
+        "wayland-0" as &const byte);
+    _ = setenv_cstr("DISPLAY" as &const byte, "" as &const byte);
+    _ = setenv_cstr("WAYLAND_DISPLAY" as &const byte,
+        "wayland-0" as &const byte);
+    return true;
+}
+
+// clip-helper 的中间三组（第 3–5 步）：探测命中本轮目录里的 helper、按优先级取到
+// 图片、类型表按**行**比对（不许子串命中）。单独一个函数是为了 `clip_helper_round`
+// 不超 100 行（AGENTS.md）。
+fn clips_helper_pick(tag: &const byte, dir: &const byte, ok: &bool) void {
+    // 3) 探测：必须命中本轮目录里的那个 wl-paste
+    if !cliphelp_probe(true) {
+        clips_fail(tag, "前置进 PATH 的假 wl-paste 没被探测到", ok);
+        return;
+    }
+    if !bufx_contains(&g_cliph_path, dir) {
+        clips_fail(tag, "探测到的 helper 不是本轮目录里那个（PATH 顺序错了）", ok);
+    }
+    if !bufx_eq_cstr(cliphelp_name(), bufx_cstr_len(cliphelp_name()),
+        "wl-paste" as &const byte) {
+        clips_fail(tag, "命中的 helper 名字不是 wl-paste", ok);
+    }
+    // 4) 取数：类型表里有 image/png ⇒ 必须走图片那一档（优先于 text/plain）
+    var data: Buf = buf_new(1024);
+    defer { buf_free(&data); }
+    var mime: Buf = buf_new(32);
+    defer { buf_free(&mime); }
+    const code: i32 = cliphelp_paste(&data, &mime);
+    if code != CLIPH_IMAGE {
+        clips_fail(tag, "helper 没按优先级取图片（拿到文本或失败）", ok);
+    } else {
+        if !bufx_contains(&data, "PNG" as &const byte) {
+            clips_fail(tag, "helper 取回的字节不是脚本里那张 PNG", ok);
+        }
+        if !bufx_eq_cstr(mime.ptr as &const byte, mime.len,
+            "image/png" as &const byte) {
+            clips_fail(tag, "helper 报的 MIME 不是 image/png", ok);
+        }
+    }
+    // 5) 类型表比对：按**行**比，不许子串命中（`image/png` 不该被 `image/pngx` 匹配）
+    var ty: Buf = buf_new(64);
+    defer { buf_free(&ty); }
+    _ = buf_append_cstr(&ty, "image/png\ntext/plain\n" as &const byte);
+    if !cliph_types_has(&ty, "image/png" as &const byte, 9) {
+        clips_fail(tag, "类型表按行比对没命中已有的那一项", ok);
+    }
+    if cliph_types_has(&ty, "image/pngx" as &const byte, 10)
+        || cliph_types_has(&ty, "png" as &const byte, 3) {
+        clips_fail(tag, "类型表比对被子串命中了（会去取一个不存在的类型）", ok);
+    }
+
+}
+
+// clip-helper 的超时那一组：一个卡住的 helper 必须被**按进程组**收掉，且不许把
+// 调用方挂住（用户看到的是「按一下 ctrl+v，界面卡半分钟」）。
+// 单独一个函数是为了 `clip_helper_round` 不超 100 行（AGENTS.md）。
+fn clips_helper_timeout_fn(tag: &const byte, dir: &const byte, ok: &bool) void {
+    // 6) 超时的假 helper：必须被按组收掉，且**不许挂住调用方**
+    var slowpath: Buf = buf_new(256);
+    defer { buf_free(&slowpath); }
+    _ = buf_append_cstr(&slowpath, dir);
+    _ = buf_append_cstr(&slowpath, "/xclip" as &const byte);
+    var slowbody: Buf = buf_new(512);
+    defer { buf_free(&slowbody); }
+    _ = buf_append_cstr(&slowbody, "#!/bin/sh\n" as &const byte);
+    // 子孙进程：验证「按进程组收」真的连子孙一起收（它写完文件就该被杀）
+    _ = buf_append_cstr(&slowbody, "sleep 300 &\n" as &const byte);
+    _ = buf_append_cstr(&slowbody, "sleep 300\n" as &const byte);
+    var slowz: Buf = buf_new(256);
+    defer { buf_free(&slowz); }
+    _ = buf_append(&slowz, slowpath.ptr as &const byte, slowpath.len);
+    _ = buf_append_byte(&slowz, 0);
+    if !clips_write_script(&slowz.ptr[0] as &const byte,
+        slowbody.ptr as &const byte) {
+        clips_fail(tag, "写超时假 helper 失败", ok);
+    }
+    // 把 wl-paste 藏起来、只留 xclip（本轮只测超时那条路）
+    var mvz: Buf = buf_new(256);
+    defer { buf_free(&mvz); }
+    _ = buf_append_cstr(&mvz, dir);
+    _ = buf_append_cstr(&mvz, "/wl-paste" as &const byte);
+    _ = buf_append_byte(&mvz, 0);
+    var mvto: Buf = buf_new(256);
+    defer { buf_free(&mvto); }
+    _ = buf_append_cstr(&mvto, dir);
+    _ = buf_append_cstr(&mvto, "/wl-paste.off" as &const byte);
+    _ = buf_append_byte(&mvto, 0);
+    // rename 没有 syscall 包装，用「写一个同名 .off + 清掉原文件内容」的等价做法：
+    // 直接把 wl-paste 改成一段 `exit 1`（探测仍然命中 xclip，因为它是下一个候选）。
+    _ = clips_write_script(&mvz.ptr[0] as &const byte,
+        "#!/bin/sh\nexit 1\n" as &const byte);
+    _ = mvto.len;
+    _ = setenv_cstr("WAYLAND_DISPLAY" as &const byte, "" as &const byte);
+    _ = setenv_cstr("DISPLAY" as &const byte, ":0" as &const byte);
+    if !cliphelp_probe(true) {
+        clips_fail(tag, "第二轮探测没命中 xclip", ok);
+    } else if !bufx_eq_cstr(cliphelp_name(), bufx_cstr_len(cliphelp_name()),
+        "xclip" as &const byte) {
+        clips_fail(tag, "第二轮命中的不是 xclip", ok);
+    }
+    const t0: u64 = ua_now_ms();
+    var d2: Buf = buf_new(1024);
+    defer { buf_free(&d2); }
+    var m2: Buf = buf_new(32);
+    defer { buf_free(&m2); }
+    const c2: i32 = cliphelp_paste(&d2, &m2);
+    const spent: u64 = ua_now_ms() - t0;
+    if c2 != CLIPH_ERR && c2 != CLIPH_NONE {
+        clips_fail(tag, "超时的 helper 既没报错也没报空", ok);
+    }
+    // 4 s 超时 + 收尸，允许一点余量；超过 12 s 就说明「按组收」没生效
+    if spent > 12000 {
+        clips_fail(tag, "超时的 helper 把调用方挂住了（按进程组收没生效）", ok);
+        out_err("  （耗时 ");
+        out_err_dec(spent as usize);
+        out_err(" ms）\n");
+    }
+}
+
+// clip-helper 的最后一组：一个 helper 都没有的时候，文案必须说清是「没有工具」
+// 而不是「剪贴板空」（两种结论的下一步动作完全不同）。单独一个函数是为了
+// `clip_helper_round` 不超 100 行（AGENTS.md）。
+fn clips_helper_notools(tag: &const byte, ok: &bool) void {
+    var d2: Buf = buf_new(1024);
+    defer { buf_free(&d2); }
+    var m2: Buf = buf_new(32);
+    defer { buf_free(&m2); }
+    // 7) 一个 helper 都没有的时候：文案必须说清是「没有工具」而不是「剪贴板空」
+    _ = setenv_cstr("PATH" as &const byte,
+        "/nonexistent-dir-for-clip-test" as &const byte);
+    _ = setenv_cstr("DISPLAY" as &const byte, "" as &const byte);
+    _ = setenv_cstr("WAYLAND_DISPLAY" as &const byte, "" as &const byte);
+    if cliphelp_probe(true) {
+        clips_fail(tag, "PATH 清空之后还探测到了 helper", ok);
+    }
+    const c3: i32 = cliphelp_paste(&d2, &m2);
+    if c3 != CLIPH_NO_HELPER {
+        clips_fail(tag, "没有 helper 时没回 NO_HELPER", ok);
+    }
+    if bufx_cstr_len(cliphelp_reason(CLIPH_NO_HELPER)) == 0 {
+        clips_fail(tag, "没有 helper 的文案为空", ok);
+    }
+}

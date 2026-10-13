@@ -1,0 +1,407 @@
+// src/media/clip.uya — 剪贴板仲裁（P83）：按优先级把三个来源串起来，给一个结果码
+//
+// 本文件：`clip_paste` —— 按「终端协议 → X11 → 外部 helper」的顺序试，第一个拿到非空
+//   结果的赢；`clip_mode` 覆盖（auto / term / x11 / helper / off，来自 `--clip` / env）；
+//   `clip_reason` 把结果码 + 命中的来源翻成**一句说清「试过什么」的人话**；
+//   `clip_src_name` 给回执用；`clip_ssh_hint` 判「这是不是 SSH 会话」（回执必须标明
+//   读的是**远端**剪贴板，否则就是在骗用户）。
+// 不变量：① **终端协议排第一** —— 它是唯一能穿过 SSH 的通道（见下的长注释），
+//   SSH 下若让 X11 先答，会拿到远端那块空剪贴板并把「没有图片也没有文本」当成结论；
+//   ② 三个来源各自**只读一次**，不重试（一次性快照语义，与 P52 的口径一致）；
+//   ③ 结果码是**统一**的（`CLIP_*`），调用方（agent 侧 UI 分流）不需要认识三个来源的码；
+//   ④ 回执必须**指名来源**，且 SSH 下必须标出「远端」—— 用户按一下就知道读的是哪块板子；
+//   ⑤ 全失败时给**最有信息量**的那个原因（谁最接近成功就说谁），不是笼统的「失败」。
+// 依赖：foundation/bufx；本仓 media/clipt（终端协议）、media/clipx（X11）、
+//   media/cliphelp（外部 helper）。**本文件不碰 fd、不起子进程**：那些都在三个来源里。
+// 命名：`clip_*`、`CLIP_*`（结果码、来源码与模式）。
+//   * **终端协议**读的是**用户眼前那块**剪贴板 —— 本机、SSH、Wayland、macOS 都是它，
+//     因为请求发给终端模拟器、由它读**本地**剪贴板再把数据经 tty 送回来。唯一的前提是
+//     终端支持 OSC 5522（kitty / ghostty 一档；deepin-terminal 不支持，那就落到下一档）。
+//   * **X11** 读的是**跑着我们的那台机器**的剪贴板。本机 X11 上正确；**SSH 下是错的**
+//     ——用户的截图在自己笔记本上，远端这块板子是空的。所以它必须排在终端之后。
+//   * **外部 helper** 与 X11 同一个毛病（读远端），但它能覆盖 Wayland（wl-paste）与
+//     macOS（pbpaste / pngpaste）—— 本机这两类会话下 X11 客户端根本连不上。
+//
+// 为什么不做常驻监听：剪贴板是「用户按一下才看」的东西，常驻只会白占连接与一轮轮询；
+// 一次性读取失败的回执也更干净（用户知道为什么没贴上）。
+
+// 结果码（统一）
+export const CLIP_NONE: i32 = 0;         // 剪贴板空 / 没有我们要的格式
+export const CLIP_TEXT: i32 = 1;         // 读到文本
+export const CLIP_IMAGE: i32 = 2;        // 读到图片（mime 见 mime_out）
+export const CLIP_NO_SOURCE: i32 = 3;    // 一个来源都没有
+export const CLIP_DENIED: i32 = 4;       // 终端或用户拒绝了
+export const CLIP_TOO_BIG: i32 = 5;      // 超过读取上限
+export const CLIP_ERR: i32 = 6;          // 协议层失败
+export const CLIP_OFF: i32 = 7;          // 用户关掉了（clip_mode = off）
+
+// 命中的来源
+export const CLIP_SRC_NONE: i32 = 0;
+export const CLIP_SRC_TERM: i32 = 1;
+export const CLIP_SRC_X11: i32 = 2;
+export const CLIP_SRC_HELPER: i32 = 3;
+
+// 模式（`--clip` / `UYA_AGENT_CLIP`）。`auto` 是产品默认；其余四档是**确定性**入口：
+// 自测要能只走一条腿（否则 PTY 轮里只能赌超时），用户也要一个关掉整条线的开关。
+export const CLIP_MODE_AUTO: u8 = 0;
+export const CLIP_MODE_TERM: u8 = 1;
+export const CLIP_MODE_X11: u8 = 2;
+export const CLIP_MODE_HELPER: u8 = 3;
+export const CLIP_MODE_OFF: u8 = 4;
+
+// 解析 `--clip` / env 的值；认不出返回 255（调用方报错，别静默当 auto）。
+export fn clip_mode_parse(p: &const byte, n: usize) u8 {
+    if n == 4 && bufx_eq_cstr(p, n, "auto" as &const byte) {
+        return CLIP_MODE_AUTO;
+    }
+    if n == 4 && bufx_eq_cstr(p, n, "term" as &const byte) {
+        return CLIP_MODE_TERM;
+    }
+    if n == 3 && bufx_eq_cstr(p, n, "x11" as &const byte) {
+        return CLIP_MODE_X11;
+    }
+    if n == 6 && bufx_eq_cstr(p, n, "helper" as &const byte) {
+        return CLIP_MODE_HELPER;
+    }
+    if n == 3 && bufx_eq_cstr(p, n, "off" as &const byte) {
+        return CLIP_MODE_OFF;
+    }
+    return 255;
+}
+
+// 模式名（`/status`、诊断与自测断言用）
+export fn clip_mode_name(m: u8) &const byte {
+    if m == CLIP_MODE_AUTO {
+        return "auto" as &const byte;
+    }
+    if m == CLIP_MODE_TERM {
+        return "term" as &const byte;
+    }
+    if m == CLIP_MODE_X11 {
+        return "x11" as &const byte;
+    }
+    if m == CLIP_MODE_HELPER {
+        return "helper" as &const byte;
+    }
+    if m == CLIP_MODE_OFF {
+        return "off" as &const byte;
+    }
+    return "?" as &const byte;
+}
+
+// 来源名（回执文案用）
+export fn clip_src_name(s: i32) &const byte {
+    if s == CLIP_SRC_TERM {
+        return "终端" as &const byte;
+    }
+    if s == CLIP_SRC_X11 {
+        return "X11" as &const byte;
+    }
+    if s == CLIP_SRC_HELPER {
+        return "外部工具" as &const byte;
+    }
+    return "" as &const byte;
+}
+
+// 这是不是 SSH 会话。**决定回执要不要标「远端」** —— 有 SSH 连接时 X11/helper 读到的
+// 是远端的剪贴板，不标出来用户会以为贴错了。
+export fn clip_is_ssh() bool {
+    const c: &byte = getenv("SSH_CONNECTION");
+    if (c as usize) != 0 && bufx_cstr_len(c as &const byte) > 0 {
+        return true;
+    }
+    const t: &byte = getenv("SSH_TTY");
+    return (t as usize) != 0 && bufx_cstr_len(t as &const byte) > 0;
+}
+
+// 一次读取里「已经攒下的最好结果」。三个来源共用一份记录，避免在调用点堆七八个临时量。
+struct ClipTry {
+    code: i32,        // 目前最好的结果码（CLIP_*）
+    src: i32,         // 给出这个结果的来源
+    tried_term: bool, // 试过哪些（回执要如实说）
+    tried_x11: bool,
+    tried_helper: bool,
+    term_why: i32,    // 各来源自己的码（CLIP_* 口径，失败时用来挑最有信息量的原因）
+    x11_why: i32,
+    helper_why: i32,
+}
+
+// 空记录
+fn clip_try_new() ClipTry {
+    return ClipTry{
+        code: CLIP_NONE, src: CLIP_SRC_NONE,
+        tried_term: false, tried_x11: false, tried_helper: false,
+        term_why: CLIP_NO_SOURCE, x11_why: CLIP_NO_SOURCE,
+            helper_why: CLIP_NO_SOURCE,
+    };
+}
+
+// 把三个来源的码（各自的 CLIPT_/CLIPX_/CLIPH_）翻成统一的 CLIP_*。
+fn clip_term_code(c: i32) i32 {
+    if c == CLIPT_TEXT {
+        return CLIP_TEXT;
+    }
+    if c == CLIPT_IMAGE {
+        return CLIP_IMAGE;
+    }
+    if c == CLIPT_DENIED {
+        return CLIP_DENIED;
+    }
+    if c == CLIPT_TOO_BIG {
+        return CLIP_TOO_BIG;
+    }
+    if c == CLIPT_ERR {
+        return CLIP_ERR;
+    }
+    if c == CLIPT_BUSY {
+        return CLIP_ERR;
+    }
+    if c == CLIPT_UNSUPPORTED {
+        return CLIP_NO_SOURCE;
+    }
+    return CLIP_NONE;
+}
+
+// 同上（X11）
+fn clip_x11_code(c: i32) i32 {
+    if c == CLIPX_TEXT {
+        return CLIP_TEXT;
+    }
+    if c == CLIPX_IMAGE {
+        return CLIP_IMAGE;
+    }
+    if c == CLIPX_TOO_BIG {
+        return CLIP_TOO_BIG;
+    }
+    if c == CLIPX_ERR {
+        return CLIP_ERR;
+    }
+    if c == CLIPX_NO_X11 {
+        return CLIP_NO_SOURCE;
+    }
+    return CLIP_NONE;
+}
+
+// 同上（helper）
+fn clip_helper_code(c: i32) i32 {
+    if c == CLIPH_TEXT {
+        return CLIP_TEXT;
+    }
+    if c == CLIPH_IMAGE {
+        return CLIP_IMAGE;
+    }
+    if c == CLIPH_TOO_BIG {
+        return CLIP_TOO_BIG;
+    }
+    if c == CLIPH_ERR {
+        return CLIP_ERR;
+    }
+    if c == CLIPH_NO_HELPER {
+        return CLIP_NO_SOURCE;
+    }
+    return CLIP_NONE;
+}
+
+// 这一档是不是「拿到了东西」（正结果）。拿到就停止往下试。
+fn clip_is_hit(code: i32) bool {
+    return code == CLIP_TEXT || code == CLIP_IMAGE;
+}
+
+// 该不该试终端这一路：模式允许 + 不是 web 形态。
+// **web 排除**：web 子进程的 stdin 是 web 服务端自己持有的 PTY，没有「用户的终端」，
+// 发出去的 5522 询问没人会答（白等一次探测超时）。浏览器那边用浏览器自己的剪贴板。
+fn clip_should_term(cfg: &const Config) bool {
+    if cfg.web {
+        return false;
+    }
+    if cfg.clip_mode == CLIP_MODE_AUTO || cfg.clip_mode == CLIP_MODE_TERM {
+        return true;
+    }
+    return false;
+}
+
+// 该不该试 X11
+fn clip_should_x11(cfg: &const Config) bool {
+    return cfg.clip_mode == CLIP_MODE_AUTO || cfg.clip_mode == CLIP_MODE_X11;
+}
+
+// 该不该试 helper
+fn clip_should_helper(cfg: &const Config) bool {
+    return cfg.clip_mode == CLIP_MODE_AUTO || cfg.clip_mode == CLIP_MODE_HELPER;
+}
+
+// 试终端一路，结果记进 t。
+fn clip_try_term(t: &ClipTry, out: &Buf, mime_out: &Buf) void {
+    t.tried_term = true;
+    var m: Buf = buf_new(32);
+    defer { buf_free(&m); }
+    const c: i32 = clipt_paste(out, &m);
+    t.term_why = clip_term_code(c);
+    if clip_is_hit(t.term_why) {
+        t.code = t.term_why;
+        t.src = CLIP_SRC_TERM;
+        buf_reset(mime_out);
+        _ = buf_append(mime_out, m.ptr as &const byte, m.len);
+    }
+}
+
+// 试 X11 一路，结果记进 t。
+fn clip_try_x11(t: &ClipTry, out: &Buf, mime_out: &Buf) void {
+    t.tried_x11 = true;
+    var m: Buf = buf_new(32);
+    defer { buf_free(&m); }
+    const c: i32 = clipx_paste(out, &m);
+    t.x11_why = clip_x11_code(c);
+    if clip_is_hit(t.x11_why) {
+        t.code = t.x11_why;
+        t.src = CLIP_SRC_X11;
+        buf_reset(mime_out);
+        _ = buf_append(mime_out, m.ptr as &const byte, m.len);
+    }
+}
+
+// 试 helper 一路，结果记进 t。
+fn clip_try_helper(t: &ClipTry, out: &Buf, mime_out: &Buf) void {
+    t.tried_helper = true;
+    var m: Buf = buf_new(32);
+    defer { buf_free(&m); }
+    const c: i32 = cliphelp_paste(out, &m);
+    t.helper_why = clip_helper_code(c);
+    if clip_is_hit(t.helper_why) {
+        t.code = t.helper_why;
+        t.src = CLIP_SRC_HELPER;
+        buf_reset(mime_out);
+        _ = buf_append(mime_out, m.ptr as &const byte, m.len);
+    }
+}
+
+// 对外入口：读一次剪贴板。返回 CLIP_*；成功时 `out` 是字节、`mime_out` 是图片 MIME，
+// `src_out` 是命中的来源（回执要用）。
+//
+// 顺序与短路都在这里（不变量 ①）：**拿到正结果立刻停**（后面的来源读的是另一块板子，
+// 再试只会把已经拿到的结果覆盖成更差的一个）。
+export fn clip_paste(cfg: &const Config, out: &Buf, mime_out: &Buf,
+                     src_out: &i32) i32 {
+    buf_reset(out);
+    buf_reset(mime_out);
+    src_out[0] = CLIP_SRC_NONE;
+    if cfg.clip_mode == CLIP_MODE_OFF {
+        return CLIP_OFF;
+    }
+    var t: ClipTry = clip_try_new();
+    if clip_should_term(cfg) {
+        clip_try_term(&t, out, mime_out);
+        if clip_is_hit(t.code) {
+            src_out[0] = t.src;
+            return t.code;
+        }
+    }
+    if clip_should_x11(cfg) {
+        clip_try_x11(&t, out, mime_out);
+        if clip_is_hit(t.code) {
+            src_out[0] = t.src;
+            return t.code;
+        }
+    }
+    if clip_should_helper(cfg) {
+        clip_try_helper(&t, out, mime_out);
+        if clip_is_hit(t.code) {
+            src_out[0] = t.src;
+            return t.code;
+        }
+    }
+    src_out[0] = CLIP_SRC_NONE;
+    return clip_worst(&t);
+}
+
+// 全失败时挑「最有信息量」的那个码（不变量 ⑤）。
+// 优先级：拒绝 / 超限 / 协议错 > 空板子 > 一个来源都没有。
+// 为什么「空板子」压过「没有来源」：前者说明来源是通的、只是板子上没东西（用户该去复制
+// 一次）；后者说明这台机器上根本没有可用的通道（用户该换终端或装 xclip）。两种结论的
+// 下一步动作完全不同，所以不能并成一句「粘贴失败」。
+fn clip_worst(t: &const ClipTry) i32 {
+    var best: i32 = CLIP_NO_SOURCE;
+    if t.term_why == CLIP_DENIED || t.x11_why == CLIP_DENIED
+        || t.helper_why == CLIP_DENIED {
+        return CLIP_DENIED;
+    }
+    if t.term_why == CLIP_TOO_BIG || t.x11_why == CLIP_TOO_BIG
+        || t.helper_why == CLIP_TOO_BIG {
+        return CLIP_TOO_BIG;
+    }
+    if t.term_why == CLIP_ERR {
+        best = CLIP_ERR;
+    }
+    if t.term_why == CLIP_NONE || t.x11_why == CLIP_NONE
+        || t.helper_why == CLIP_NONE {
+        // 有来源通了但板子是空的：这个结论比「没有来源」有用
+        if best == CLIP_NO_SOURCE {
+            best = CLIP_NONE;
+        }
+    }
+    if !t.tried_term && !t.tried_x11 && !t.tried_helper {
+        return CLIP_NO_SOURCE;
+    }
+    return best;
+}
+
+// 一句人话：**必须说清试过哪些、为什么都不行**，SSH 下还要标出「远端」。
+// 拆成三个小函数是因为四种结局（拒绝 / 超限 / 空板子 / 全无来源）的措辞差别很大，
+// 挤在一个函数里会变成一坨 if。
+export fn clip_reason(cfg: &const Config, code: i32, src: i32) &const byte {
+    if code == CLIP_OFF {
+        return "剪贴板粘贴已关闭（--clip off / UYA_AGENT_CLIP=off）" as &const byte;
+    }
+    if code == CLIP_DENIED {
+        return "终端或你拒绝了这次剪贴板读取" as &const byte;
+    }
+    if code == CLIP_TOO_BIG {
+        return "剪贴板内容超过读取上限（24 MiB）" as &const byte;
+    }
+    if code == CLIP_ERR {
+        return "读剪贴板失败（协议错或超时）" as &const byte;
+    }
+    if code == CLIP_NONE {
+        return "剪贴板里没有图片也没有文本" as &const byte;
+    }
+    if code == CLIP_NO_SOURCE {
+        return clip_no_source_reason(cfg, src);
+    }
+    return "" as &const byte;
+}
+
+// 「一个来源都没有」这一档的文案：把**这台机器上为什么都不行**说全。
+// 分三种现场：只有终端可试（本机无 X11 无 helper）、只有 X11/helper 可试（终端不支持）、
+// 两者都试过。SSH 下另加一句「helper 读的是远端」。
+fn clip_no_source_reason(cfg: &const Config, src: i32) &const byte {
+    _ = src;
+    if clip_is_ssh() {
+        // 行宽豁免：一整句给用户看的话（不可断，断了就不是一句话）
+        return "读不到剪贴板：这个终端不支持 5522，X11/外部工具读的又是**远端**那台机器的剪贴板（你的图在自己机器上）——换 kitty / ghostty 一类的终端即可" as &const byte;
+    }
+    if cfg.clip_mode == CLIP_MODE_TERM {
+        return "这个终端不支持读剪贴板的协议（OSC 5522）" as &const byte;
+    }
+    if cfg.clip_mode == CLIP_MODE_X11 {
+        return "没有可用的 X11 会话（DISPLAY 未设或连不上）" as &const byte;
+    }
+    if cfg.clip_mode == CLIP_MODE_HELPER {
+        return "PATH 里没有 wl-paste / xclip / xsel 这类剪贴板工具" as &const byte;
+    }
+    return "没有可用的剪贴板来源：这个终端不支持 OSC 5522，DISPLAY 未设或连不上，PATH 里也没有 wl-paste /
+        xclip 这类工具" as &const byte;
+}
+
+// 成功回执里「从哪读的」那半句。SSH 下**必须**标出「远端」—— 那不是用户眼前的板子。
+export fn clip_src_hint(src: i32) &const byte {
+    if src == CLIP_SRC_TERM {
+        return "（你面前的剪贴板）" as &const byte;
+    }
+    if src == CLIP_SRC_X11 || src == CLIP_SRC_HELPER {
+        if clip_is_ssh() {
+            return "（**远端**机器的剪贴板）" as &const byte;
+        }
+        return "" as &const byte;
+    }
+    return "" as &const byte;
+}

@@ -4,7 +4,7 @@
 多轮 loop 直到给出结论。**不引入任何 C 代码、`@c_import` 或其它语言**，只依赖 Uya 语言与
 随编译器分发的标准库。
 
-**P0–P82 全部完成**，主线版本串 `p82-net-retry`（**版本串只在选定要动
+**P0–P83 全部完成**，主线版本串 `p83-clip-any`（**版本串只在选定要动
 `AGENT_VERSION` 的那条线才改** —— 各线都沿用最近一次改动后的版本串，见
 `src/agent/ag_tui_sessions.uya` 的编号说明；各阶段做了什么见 [DESIGN.md §19](DESIGN.md)）。
 
@@ -537,8 +537,9 @@ leaf 指纹怎么算、指纹库放哪儿 —— 见 [DESIGN.md §18](DESIGN.md)
   （后者本来就没有终端）。**为什么不引 xterm.js**：它要么走 CDN（而自测是离线的），
   要么把几十万行压缩 JS vendored 进仓 —— 与「只用 Uya 源码实现」冲突；而且解释器放在
   服务端才能吃到本仓最贵的那条判据（见 DESIGN §11.8.2）。
-* **web 端不做「读服务端剪贴板」那种粘贴**（终端的 `ctrl+v` / `/paste`）：那是纯 Uya 的
-  X11 客户端，只在服务端有 X 连接时才有意义（图片附件因此贴不进来），请回终端用。
+* **web 端不做「读服务端剪贴板」那种粘贴**（终端的 `ctrl+v` / `/paste`）：那几条来源
+  读的都是**跑着服务端的那台机器**的剪贴板（终端协议那条尤其：web 子进程的 stdin 是
+  服务端自己持有的 PTY，没有「用户的终端」），所以图片附件贴不进来，请回终端用。
   **浏览器自己的剪贴板**（原生 `ctrl+v`）可以把文本插进输入行 —— 走 IME 代理输入框，
   包成括起粘贴。图片附件（`/image`）会正常显示在正文里。
 * **web 最多同时 8 条会话**（`WEB_MAX_SESSIONS`），每条一个子进程 + 一块终端网格
@@ -814,7 +815,12 @@ leaf 指纹怎么算、指纹库放哪儿 —— 见 [DESIGN.md §18](DESIGN.md)
 **平台与编译器**
 
 * 目标平台是 Linux x86-64（代码里的 syscall / 常量按这个平台写）。
-* 剪贴板只支持 X11 的 unix socket（不做 TCP 转发、不做 Wayland 原生协议）。
+* **剪贴板有三条来源**（P83，按优先级）：① **终端协议**（kitty 的 OSC 5522，ghostty
+  同款）—— **SSH 下唯一能读到你本地剪贴板的路**；② X11 unix socket（本机 X11、
+  终端不支持 5522 时用）；③ 外部 helper（Wayland 的 `wl-paste`、macOS 的 `pbpaste`）。
+  **读的是哪一块会写在回执里**，SSH 下标明「远端」。局限：终端不支持 5522 时 SSH 里
+  贴不了（另两条读的是远端）；不做 OSC 52 读取、不做 5522 的 paste-event 模式、
+  不做 tmux/screen 的 DCS 透传。用 `--clip` / `UYA_AGENT_CLIP` 可以钉死来源或关掉。
 * 换到 `uya-0.11`：`tls/https.uya`、`std/json/*`、`x509/verify.uya` 与 0.10 逐字节相同，
   但 `libc/syscall.uya`、`std/runtime/runtime.uya`、`tls/ssl/context.uya` 有差异，需要重新验证。
 * **文件数上限 64 与函数表容量**（uya 0.10.1 的两条硬约束）：**都已在 0.10.3 解除**

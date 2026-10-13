@@ -57,7 +57,7 @@ uya-agent 是一个**纯 Uya 源码**实现的命令行编程 agent：给它一�
 | `vcs/` | git：只读跑 git、worktree | 「它跑 git 吗？」 |
 | `plugin/` | MCP 插件：配置解析、常驻子进程、公开名归一化、`mcp` 元工具（4 个文件，见 §21） | 「它接的是外部 server 吗？」 |
 | `diff/` | 写工具正文的行级 diff + `/diff` 显示层（5 个文件） | 「它是 diff 的哪一段？」 |
-| `media/` | 图片附件、剪贴板 | 「它是二进制媒体吗？」 |
+| `media/` | 图片附件（`imgx`/`imgz`）、剪贴板三源（`clip` 仲裁 + `clipt` 终端协议 + `clipx` X11 + `cliphelp` 外部工具） | 「它是二进制媒体吗？」 |
 | `selftest/` | 自测轮：`selftest.uya` / `tuiselftest.uya` 只留文件头 + 入口（`selftest_main` / `tui_selftest_all`），轮次按段拆成 `st_*.uya` 17 片与 `tuis_*.uya` 8 片（拆分后又长了新轮，见 §19） | 「它只在 `--selftest` 里跑吗？」 |
 
 ### 2.2 依赖方向
@@ -2938,51 +2938,87 @@ responses 用 `{"type":"input_image","detail":"auto","image_url":…}`；
 且字节与 info 一字不动）。**用紧凑预算而不是嵌一张几 MB 的大图**：代码路径相同，
 而夹具小到能进源码。
 
-### 13.2 剪贴板（`media/clipx.uya`）
+### 13.2 剪贴板（`media/clip.uya` + 三个来源）
 
-**为什么手写 X11 协议**：本机（deepin-terminal / X11）**没有** `xclip` / `xsel` / `wl-paste`，
-而「粘一张截图给多模态模型」是核心诉求 —— 没有外部 helper 就得自己说协议。
+**先说结论：粘贴不是「一条路」，是三条路按优先级试**（P83）。`ctrl+v` / `/paste` 一律
+经过 `media/clip.uya` 的 `clip_paste`，它按下面的顺序试，**第一个拿到非空结果的赢**：
 
-**协议范围（刻意最小）**：
+| 顺序 | 来源 | 文件 | 什么时候命中 | 为什么在这个位置 |
+|---|---|---|---|---|
+| 1 | **终端协议（OSC 5522）** | `media/clipt.uya` | stdin 是终端且探测（DECRQM）通过 | **唯一能读到「用户眼前那块」剪贴板的路** —— SSH 下也成立 |
+| 2 | X11 协议 | `media/clipx.uya` | `DISPLAY` 可用且连得上 | 本机 X11（deepin-terminal 这类不支持 5522 的终端）今天就能用的那条，行为不变 |
+| 3 | 外部 helper | `media/cliphelp.uya` | PATH 里有 `wl-paste`/`xclip`/`xsel`/`pbpaste` | Wayland（wl-paste）与 macOS（pbpaste/pngpaste）的落点 |
 
-| 阶段 | 细节 |
-|---|---|
-| 连接 | `/tmp/.X11-unix/X<n>`（`DISPLAY` 的 unix 分支）+ `~/.Xauthority` 的 **MIT-MAGIC-COOKIE-1** 认证（family 256 = Local，名字 18 字节，display 号按 socket 名末尾十进制配对）；读不到 cookie 就**匿名试一次** |
-| 请求 | `InternAtom` / `CreateWindow`（**InputOnly**，PropertyChangeMask）/ `GetSelectionOwner` / `ConvertSelection` / `GetProperty` / `DeleteProperty` |
-| 数据 | `bytes_after` 循环取完；**`INCR`**（大图必然走这条）按 `PropertyNotify` 增量收 |
-| 目标优先级 | **`image/png` → `jpeg` → `gif` → `webp` → `UTF8_STRING`** |
-| 边界 | 只支持 X11 unix socket（不做 TCP 转发、不做 Wayland 原生协议）；Wayland 下走外部 helper 回落 |
+**为什么终端协议排第一**（本轮的核心设计决定，也是「没有 X11 也能用 / SSH 也能用」的答案）：
+
+X11 客户端与外部 helper 读的都是**跑着我们的那台机器**的剪贴板。SSH 到远端时，用户的
+截图在**自己笔记本**上，远端那块剪贴板是空的 —— 于是「粘一张图给多模态模型」在 SSH 下
+**永远失败**，而且失败得很难查（它看起来就像「剪贴板里没东西」）。终端协议把请求发给
+**终端模拟器**，由它去读**本地**剪贴板、再把数据经同一条 tty 送回来。这条路与本机/远端、
+X11/Wayland/macOS 都无关，是唯一能穿过 SSH 的通道。所以它必须排第一：**在 SSH 下若让
+X11 先答，就会拿到远端那块空板子并把「没有图片也没有文本」当成结论。**
+
+协议用 kitty 的 **OSC 5522**（`sw.kovidgoyal.net/kitty/clipboard/`；ghostty 也实现了
+同一条 —— 它的 `terminal/osc.zig` 里有 `kitty_clipboard_protocol`）。线格式（逐字节）：
+
+```
+查询  ESC ] 5 5 2 2 ; type=read[:id=<id>] ; <base64("image/png image/jpeg …")> BEL
+探测  ESC [ ? 5 5 2 2 $ p                       （DECRQM）
+应答  ESC ] 5 5 2 2 ; type=read:status=OK[:id=<id>] BEL
+      ESC ] 5 5 2 2 ; type=read:status=DATA[:id=<id>]:mime=<base64> ; <base64 分块> BEL
+      ESC ] 5 5 2 2 ; type=read:status=DONE[:id=<id>] BEL
+      ESC ] 5 5 2 2 ; type=read:status=<ENOSYS|EPERM|EBUSY>[:id=<id>] BEL
+探测答 ESC [ ? 5 5 2 2 ; <Ps> $ y                （Ps 0/4 = 不支持）
+```
 
 | 上限 | 值 | 理由 |
 |---|---|---|
-| `CLIPX_MAX_BYTES` | `24*1024*1024` | 一张 4K 截图 PNG 通常 2–8 MiB，给到 24 MiB 足够；超过**明确拒绝、不静默截断** —— 半个 PNG 发给模型只会得到坏请求 |
-| `CLIPX_TIMEOUT_MS` | 2500 | 整次读取（建连/认证/TARGETS/取数据/INCR） |
-| `CLIPX_POLL_MS` | 20 | |
+| `CLIPT_MAX_BYTES` / `CLIPH_MAX_BYTES` / `CLIPX_MAX_BYTES` | `24*1024*1024` | 一张 4K 截图 PNG 通常 2–8 MiB；超过**明确拒绝、不静默截断** —— 半个 PNG 发给模型只会得到坏请求 |
+| `CLIPT_PROBE_MS` | 250 | 探测是**每次粘贴都要付**的成本：短 —— 没人应答就是「不支持」 |
+| `CLIPT_READ_MS` | 10000 | 读是**人在点**的：kitty 首次读会弹授权框，点一下要时间 |
+| `CLIPH_TIMEOUT_MS` | 4000 | helper 是本地进程，超了就是卡住了（按进程组收） |
+| `OSCIN_CAP_MAX` | 64 KiB | 单帧捕获上限：OSC 5522 的 DATA 块编码前 ≤ 4096 B（base64 后 ≈ 5.5 KiB），64 KiB 是「远超任何合法帧」 |
+| `OSCIN_STALE_MS` | 50 | 半截前缀攥多久算「这不是我们的帧」（好把 `esc` 让给用户） |
 
-**五个实测踩到的协议细节**（每一条都值得单独记住，因为症状都指向别处）：
+**`term/oscin.uya`：终端应答与按键走同一条 fd 0，必须拦。** 这是本轮最要紧的一层。
+终端对我们查询的应答从 **fd 0** 回来，和用户按键是**同一个字节流** —— 不拦的话
+`ESC ] 5 5 2 2 ; …` 会被键解码器当成「ESC + 一串普通字符」**打进输入行**（屏幕上多出
+一坨 base64，而真正要等的那帧数据反而不见了）。`oscin_feed` 是个纯字节状态机，认两种帧
+（OSC 5522 与 DECRPM），其余字节**逐字节原样**透传；完整帧摘走、半截的**整段吐回**
+（不变量 ③，绝不永久吞掉用户按键）。
 
-| # | 细节 | 写错时的症状 |
-|---|---|---|
-| 1 | `clipx_req` 的长度字段 = 整条请求的 **4 字节单位数**，**含 4 字节头与自己补的 pad**（先算 body pad **再**加头） | 服务端按短长度截断、请求体尾部被当成**下一条请求**开头，随后一堆 X 错误 |
-| 2 | `clipx_call` 应答**就是成功** —— **不要**把 `head[1]` 当错误码 | `GetInputFocus` 的 `revert-to = 1` 被读成「错误 1」（实测） |
-| 3 | `clipx_convert` 的 `deadline` 是**每一步**的预算，不是整轮总预算 | 当总预算时，前面握手 + 8 次 `InternAtom` 花掉大半，`ConvertSelection` 一进去就过期 ⇒ 表现为「**永远等不到 SelectionNotify**」 |
-| 4 | `SelectionNotify` 的事件类型在 `head[0] & 0x7f == 31`，property 在**偏移 16** | 读成 `[12]`（那是 target）⇒ 拿非属性 atom 去 `GetProperty` **永远取不到数据**（实测日志 `ev first=159 type=0`） |
-| 5 | `clipx_getprop` 的 body 是 `window(4) property(4) type(4) long-offset(4) long-length(4)`，**没有 delete 字段** —— `delete` 走请求头 data 字节 | 塞进体里 ⇒ 服务端把 `window` 解成 `delete`、其余全错位 ⇒ 「**读回来永远是空**」 |
+**没 armed 时一个字节都不攥**：键盘路径上「什么都不做」是唯一不会引入回归的行为。
+反过来（每个 `ESC` 都开捕获）会把**裸 ESC / 方向键**攥在手里 —— 行编辑器等的那个 `ESC`
+永远不来，实测 `tty-editor` 轮 16 条断言当场全红。这条是设计里最贵的一格取舍。
 
-**INCR 判定用「`format == 32` 且首块 4 字节」**这个特征，随后按 `PropertyNotify`
-（type 28、state = 0 NewValue、atom 匹配）逐块 `GetProperty`，空块 = 结束；
-累计超 `CLIPX_MAX_BYTES` 即失败。
+**armed 期间 fd 0 归等待方**（`oscin_borrowed`）：`tui_poll_keys` 一开头就早退，
+由等待方自己 `read`、把**透传**部分喂回 `tui_keys_feed`（所以按键一个都不丢）。
+不这样做的话两边都去 `read`，先跑的把应答吃掉 —— 症状是「能力探测永远超时」，
+看起来只是「这个终端不支持」。等待方读完之后才 `tui_poll_tick()`（推 spinner/尺寸/心跳）。
 
-**`clipx_paste`**：自己 `CreateWindow` 一个 InputOnly 窗口当 requestor ——
-**用 root 会被对端拒**（实测拿 root 当 requestor **永远等不到 SelectionNotify**）；
-`CreateWindow` 是**无应答**请求，紧跟一条 `GetInputFocus` 做 **Sync**
-（不同步的话后面每条请求都会读到错位的一条消息）。
+**一次只交付一帧**（不变量 ⑥）：一次 `read` 里常常是 `OK`+`DATA`(多块)+`DONE` 连着到。
+`oscin_feed` 交付一帧就把剩下的存进**挂起段**、提前收手；等待方取走这一帧后再喂一个
+空批，接着解下一帧。不做这一步的话，收到第一帧之后就永远等在那里。
 
-**读剪贴板期间 `clipx_read_exact` 里 `tui_poll_tick()` 泵界面** ⇒ 界面不假死、esc 也进得来。
+**结果并入 agent**（`agent_clip_paste`，只做 UI 分流）：`CLIP_IMAGE` →
+`agent_image_attach_bytes(..., from_clip = true, cfg.input_image)`；`CLIP_TEXT` → TUI
+插进输入行（**不提交**，可以接着编辑）/ 滚动模式直接打；其余 → notice
+「粘贴失败：`<clip_reason>`」。**回执必须指名来源**，且 SSH 下标出「**远端**」——
+那条路上拿到的不是用户眼前的板子，不标出来就是在骗人。
 
-**结果并入 agent**：`CLIPX_IMAGE` → `agent_image_attach_bytes(..., from_clip = true, cfg.input_image)`；
-`CLIPX_TEXT` → TUI 插进输入行（**不提交**，可以接着编辑）/ 滚动模式直接打；
-其余 → notice「粘贴失败：`<reason>`」。
+**`--clip` / `UYA_AGENT_CLIP`**：`auto`（默认）| `term` | `x11` | `helper` | `off`。
+四档确定性入口的用处：自测要能只走一条腿（否则 PTY 轮里只能赌超时），用户也要一个
+关掉整条线的开关。**web 形态不走终端腿**（`cfg.web`）：web 子进程的 stdin 是服务端自己
+持有的 PTY，没有「用户的终端」，发出去的询问没人会答。
+
+**外部 helper（`media/cliphelp.uya`）** 按环境挑候选（`WAYLAND_DISPLAY` → wl-paste、
+`DISPLAY` → xclip/xsel、无条件 → pbpaste/pngpaste），命令形状每种都不同：
+wl-paste 走 `--list-types` + `--type <mime>`、xclip 走 `-t TARGETS -o` + `-t <atom> -o`、
+xsel 只能取文本、pngpaste 直接吐 PNG。子进程一律 `sigx_reset_for_child()` +
+`sh_child_detach_stdio()`（**绝不碰用户的终端**），超时/取消**按进程组**收。
+
+**X11 客户端（`media/clipx.uya`）** 的协议细节（那五个「差一格」）保留在 §16 踩坑 85；
+本轮只把它从「唯一来源」改成「来源之二」，**语义一字未动**。
 
 ## 14. 上限常量与不变量总表
 
@@ -3072,7 +3108,7 @@ responses 用 `{"type":"input_image","detail":"auto","image_url":…}`；
 | view | `VIEW_LINE_FALLBACK` / `AG_MAX` / `AG_INNER_MIN` / `AG_MSG_MAX` / `THINK_MS` | 80 / 4 / 30 / 320 / 80 | 面板与思考节流 |
 | watch | `WATCH_BUF_MAX` / `WATCH_PREVIEW_MAX` | `262144` / 320 | 跟随缓冲 / 单行预览 |
 | media | `IMGX_DEF_MAX_BYTES` / `MAX_PIXELS` / `MAX_PER_MSG` | `8 MiB` / 640000 / 8 | 见 §13.1 |
-| media | `CLIPX_MAX_BYTES` / `TIMEOUT_MS` / `POLL_MS` | `24 MiB` / 2500 / 20 | 见 §13.2 |
+| media | `CLIPX_MAX_BYTES` / `TIMEOUT_MS` / `POLL_MS` | `24 MiB` / 2500 / 20 | 见 §13.2（X11 那一路；三源的上限（`CLIPT_`/`CLIPH_`/`OSCIN_`）在同一节） |
 | web | `WEB_MAX_QUERIES` / `MAX_RESULTS` / `MAX_USES` | 4 / 8 / 5 | 参数校验串写死 "at most 4" |
 | web | snippet 截断 / 非 200 body 摘要 | 300 码点 / 400 字节 | |
 | skill | `SKILL_MAX` / `DESC_MAX` / `BODY_MAX` / `PATH_MAX` / `ROOTS_MAX` | 64 / 500 / `262144` / 4096 / 12 | |
@@ -3245,7 +3281,18 @@ responses 用 `{"type":"input_image","detail":"auto","image_url":…}`；
 ### 15.5 平台
 
 目标平台是 **Linux x86-64**（代码里的 syscall / 常量按这个平台写）。
-剪贴板只支持 **X11 的 unix socket**（不做 TCP 转发、不做 Wayland 原生协议）。
+
+剪贴板分三条来源（见 §13.2）。各自的平台边界：
+
+* **终端协议（首选）** 只支持 kitty 的 **OSC 5522**（ghostty 同款）。**不做** OSC 52 的
+  读取（只带文本，且多数终端出于安全默认关闭）、**不做** 5522 的 paste-event 模式
+  （`DECSET 5522`，会引入**非用户主动**的授权弹窗，与「按一下才读一次」冲突）、
+  **不做** tmux/screen 的 DCS 透传（那取决于它们，不支持就靠探测失败回落）。
+* **X11** 只支持 unix socket（不做 TCP 转发）。
+* **外部 helper** 只在 PATH 里真有 `wl-paste`/`xclip`/`xsel`/`pbpaste` 时可用。
+
+**SSH 下能用的只有第一条**：另两条读的是**远端**那台机器的剪贴板。终端不支持 5522
+时，SSH 会话里就**贴不了** —— 这一句会如实出现在失败回执里（而不是含糊的「失败」）。
 
 ## 16. 用 Uya 写这类程序踩过的坑
 
@@ -5048,6 +5095,62 @@ responses 用 `{"type":"input_image","detail":"auto","image_url":…}`；
      自己的对照；② 没动其它共用 `build/selftest_agent_home` 的真 PTY 轮
      （`tui-pty`/`tui-quit`/`tui-access`…）—— 同族风险在，但不在本轮范围。
 
+135. **终端应答与用户按键走同一条 fd 0**（P83）：手写 OSC 5522 客户端时，最要命的一格不是
+   协议本身，而是**回帧的入口**。终端把 `ESC ] 5 5 2 2 ; …` 应答写在**同一个 fd 0** 上，
+   键解码器看到的就是「ESC + 一串普通字符」—— 它会把这串 base64 **打进输入行**。所以
+   必须有 `term/oscin.uya` 这一层拦。**反过来的教训更贵**：第一版让扫描器「每个 ESC 都开
+   捕获」，结果把**裸 ESC / 方向键**攥在手里，行编辑器等的那个 `ESC` 永远不来 ——
+   `tty-editor` 轮 16 条断言当场全红。修法是**没 armed 时一个字节都不攥**（逐字节原样透传）。
+
+136. **DECRQM 少一个 `$` 就是另一条 CSI**（P83）：能力探测的字节是
+   `ESC [ ? 5 5 2 2 $ p`（**9** 字节）。第一版写成 8 字节数组、末位放 `'p'`，把 `$` 覆盖掉了
+   —— 发出去的是 `ESC[?5522p`（DECSET 家族的形状），终端要么忽略要么改状态，而**应答永远
+   不会来**。症状是「探测超时、每次粘贴白等 250 ms」，看起来只是「这个终端不支持」。
+   **顺带一条测试教训**：纯函数轮最初自己抄了一份「正确的字节」去比对，被测的那份写错了
+   它照样绿 —— 只有真 PTY 轮（假终端不应答）才看得见。修法：探针字节**只留一份实现**
+   （`clipt_probe_into`），写 fd 与自测断言共用。
+
+137. **等待方必须在 armed 期间独占 fd 0**（P83）：`clip_paste` 自己 `read`，但等待循环里
+   还会调 `tui_poll_tick()` —— 而 tick 内部的 `tui_poll_keys` 也读 fd 0，它**先一步**把
+   应答当成按键吃掉了。扫描器于是一个字节都看不到，症状**与 136 一模一样**（探测永远超时）。
+   修法：`oscin_borrowed()` 让 `tui_poll_keys` 一开头早退，透传字节由等待方喂回
+   `tui_keys_feed`（按键一个都不丢）。**顺序也有讲究**：先自己 `read`，再 tick。
+   **判据教训**（同 136）：夹具的应答一次 `write` 装得下 512 字节时这条不变量**测不出来**
+   —— 必须把 PNG 夹具撑过分片边界，让应答必然分两批到。
+
+138. **一次 read 里连着来三帧，而扫描器一次只交付一帧**（P83）：`OK` + `DATA`(多块) +
+   `DONE` 常常在同一批字节里。若交付第一帧后**丢掉**剩下的，就永远等在那里 —— 症状是
+   「读请求发出一遍又一遍、数据就是收不回来」，而代码看起来完全正确。修法：交付一帧后
+   把尾巴存进**挂起段**并提前收手，等待方取走这一帧后喂一个**空批**接着解下一帧。
+
+139. **逐块 base64 解码是硬要求，自测也必须走生产路径**（P83）：OSC 5522 规定每个 `DATA`
+   分块**自带 padding**（kitty 的块大小是编码前 4096 B）。把整串拼起来再解会当场坏，
+   而症状只是「图片坏了」，与协议错长得一样。**测试上的坑**：自测最初自己写了个
+   「逐块解码再拼接」的循环去断言，被测的那份改成「整串拼接后解码」照样绿 —— 假绿。
+   修法：加 `clipt_take_data_debug`，让自测走**同一份**装配实现。
+
+140. **`CLIPT_IMAGE` 那一档有四个 mime 公用一个码，只看码分不出优先级**（P83）：
+   「收了 png 之后又来 jpeg」与「收了图片之后又来文本」在 `code` 上**同形**。第一版的守卫
+   写成了 `code != NONE && code != IMAGE`，于是**低优先级的文本块把已经收好的图片覆盖了**
+   （粘出来的「图」其实是一坨文本）。修法：用 `clipt_want` 的**下标**记「已经收下第几优先」，
+   `slot > 已收` 丢弃、`slot < 已收` 作废重收、相等则继续拼接（大图本来就要多块）。
+   这条是**自测先红**（「低优先级的文本块覆盖了已经收好的图片」），不是真机上发现的。
+
+141. **假 helper 的 `PATH` 不能在夹具函数里 `defer` 还原**（P83）：`defer` 在夹具**返回**时
+   就生效，而后面几个子函数还要用改过的 `PATH` 去探测 —— 症状是「前置进 PATH 的假
+   wl-paste 没被探测到」，指向的是探测逻辑而不是夹具。修法：存进进程级缓冲，由**轮次**
+   在收尾时统一 `cliph_old_path_restore()`。
+
+142. **`bufx_eq_cstr` 的第三个参数是「字面量」，不是另一个 Buf**（P83）：比协议里的 `id`
+   时写成了 `bufx_eq_cstr(buf.ptr, buf.len, id)` —— 而那个函数内部是
+   `bufx_cstr_len(lit)`，**一路扫到 0**。`id` 是调用方的 `Buf`（**不保证 NUL 结尾**），
+   于是它读到缓冲区后面的垃圾 ⇒ 长度对不上 ⇒ **永远判「不是这一轮」**。
+   **症状**：读请求发出一遍又一遍、一个 DATA 都收不回来；`clip-term` 却全绿
+   （进程堆恰好是零页）—— 又是「纯函数绿、真路径红」。**修法**：比两个长度已知的字节段
+   一律用 `bufx_mem_eq(p, q, n)`；`bufx_eq_cstr` 只用于「Buf vs **字面量**」。
+   **判据教训**：这条只能靠**直接钉 `clipt_frame_status`**（同一 id ⇒ 1、别的 id ⇒ 0）
+   才抓得住 —— 假终端那个夹具的 id 恰好也是 `u1`，扫描器那几轮根本碰不到这条比较。
+
 ---
 
 ## 17. 工具实现要点
@@ -5339,6 +5442,7 @@ DEEPSEEK_API_KEY=sk-xxx ./build/uya-agent \
 | `title-cmd` | P48 `/title` 与 `set_title`：清洗（80 B / 码点边界 / 控制序列全丢后为空 ⇒ 报错且标题**不动**）、钉住语义（`user` 置位后自动起标题不跑、`clear` 解锁）、revision 门控、落盘事件逐字节（kind 三档 + clear 的**空标题**事件）、索引同步、`set_title` 工具三支（合法/空串/缺键）、工具目录里有它；**P74**：派生的备用标题**不写** `g_sess.title`、**不落** `session/title`（口径：标题由模型总结）；`g_title_auto_done` 首次闩（起过一次之后连待办都不挂，硬挂上也不发） |
 | `tui-paste` | P50 括起粘贴九段：进/出粘贴态的字节级判据、CR **不许**提交（踩坑 83 的原始症状）、CRLF 折成一个换行、TAB 是字面内容且**帧里**不出现 TAB、粘贴里的 ANSI 序列逐字节保留、收尾标记被切开也认、断流时悬着的 ESC 不吞、上限对齐 200000 且超限有提示、光标列按显示口径（TAB 四个空格）+ **真 PTY** 粘 3 行只提交一次（按会话日志断言；P80 起轮次开头**清空**夹具 home，并加一条「启动屏上不许有用户条目」的绊线 —— 见踩坑 134） |
 | `img-sniff` | P51 图片纯函数层：**真 PNG 字节**（zlib 压出来的 64×48）读尺寸、GIF87a/89a 小端、JPEG 段链（长度段在前，尺寸不在固定偏移）、WebP 三变体（VP8X/VP8L/VP8 ）、纯文本与截断 PNG 一律拒绝、字节/像素两道预算、内容寻址 id 稳定、base64（长度与 PNG 签名）、附件 JSON 往返（**数字字段** + 坏记录只跳那一项）、占位文案与 B/KiB/MiB 三档 |
+| `clip-term` / `clip-pty` / `clip-helper` | P83 剪贴板三源（见 §13.2）：`clip-term` = 纯函数（读请求/探测字节**逐字节**比对规范、分片喂入逐字节还原、**逐块** base64 解码走生产路径、非 5522 字节原样透传、一次 read 多帧的一帧一帧交付、DECRPM 的 Ps 判定与缓存、失败文案两两不同、`--clip` 五个取值 + 非法值不落回 auto）；`clip-helper` = 假 helper 脚本（PATH 前置探测、类型表**按行**比对不许子串命中、取数优先级、卡住的 helper **按进程组收且不许挂住**、无工具时的文案）；`clip-pty` = **真 PTY + 假终端**（父进程扮演支持 5522 的终端）：DISPLAY 为空也能贴上图片、应答字节**一个都没进屏幕**、收应答在读预算内当场完成 |
 | `clip-parse` | P52 X11 客户端可测部分：`DISPLAY` 五种形态（`:0`/`unix:7`/`host:1.0`/空/畸形）与三种畸形拒绝、**真 Xauthority 字节流**的两条目配对（family 256 + display 号 + MIT-MAGIC-COOKIE-1；不存在的 display 号**不许**回退到别的条目）、失败码文案非空 |
 | `tui-title-input` | P48 标题输入框：预填 AI 建议可见 + 编辑（打字/backspace/delete/←→/home·end/ctrl+u/中间插入，**按码点**不劈汉字）+ enter 采纳交回编辑后的文本 / esc 取消**不算改名** + 太矮回落 0 + 方框逐行闭合 + 窄框不越界 + 运行中 `/title <t>` 进安全集而裸 `/title` 不进 |
 | `title-cmd-e2e` | `make e2e-title-cmd`：行式真二进制的用法串 / 改名回执 / `/status` 的 title 行 / clear / 空标题报错 / `/help` 可查 / 索引与日志落盘 |
@@ -6596,3 +6700,52 @@ read-only 下钩子**一律不跑**的理由：钩子能改工具参数、能改
 实现这一条时还顺带修了编译器两处**固定容量表**（详见 §16 与那两个提交）：
 call edge 表（`MAX_FN_CALL_EDGES`）与顶层变量类型查找的降级路径 ——
 不加插件文件时碰不到，加了就编不过，而报错点落在**与改动毫无关系**的文件里。
+### 19.6 P83：剪贴板改成三源（无 X11 / SSH 也能贴）
+
+**为什么做**：原来的剪贴板只有 X11 一条路，于是「粘一张截图给多模态模型」在
+**Wayland 会话**、**没有图形界面的机器**、以及**SSH 到远端**时全都失败 —— 最后一种最要命，
+因为它失败得很像「剪贴板里没东西」。同时 `DESIGN §13.2` 与失败文案早就**承诺**了一条
+并不存在的「外部 helper 回落」。
+
+**做了什么**：三条来源按优先级（`media/clip.uya` 仲裁）—— ① **终端协议**（`media/clipt.uya`
+的 OSC 5522 客户端，`term/oscin.uya` 负责从 fd 0 摘回帧）② X11（`media/clipx.uya`，
+**语义一字未动**，只是从「唯一」变成「之二」）③ 外部 helper（`media/cliphelp.uya`）。
+**终端协议排第一的关键理由**：它把请求发给**终端模拟器**、由它读**本地**剪贴板 ——
+是唯一能穿过 SSH 的通道；X11 与 helper 读的都是**远端**那台机器，SSH 下必须让终端先答。
+回执会**指名来源**，SSH 下标出「远端」。
+
+**验收**（`make selftest` 全绿；新增三轮见 §19 的表）：
+
+| # | 判据 | 怎么验 |
+|---|---|---|
+| ① | **无 X11 也能贴到图** | `clip-pty`：子进程环境里 `DISPLAY`/`WAYLAND_DISPLAY` 清空、来源钉成 `term`；父进程扮演终端回 `OK`+`DATA(image/png)`+`DONE` ⇒ 断言图片被收下 |
+| ② | **应答字节不进输入行** | 同一轮：断言屏幕上（捕获的帧字节里）**没有** `type=read:status=DATA` |
+| ③ | 线格式逐字节对 | `clip-term`：读请求与探针都按规范字节比对（探针**只留一份实现**，见踩坑 136） |
+| ④ | 分片与透传 | `clip-term`：1/2/3/5 字节一片都还原；非 5522 字节（含 `ESC[31m`）**逐字节**原样 |
+| ⑤ | 逐块 base64 | `clip-term` 走 `clipt_take_data_debug`（**同一份生产实现**）拼接后逐字节等于原图（踩坑 139） |
+| ⑥ | 优先级不被覆盖 | 同一轮：**低优先级的文本块不许覆盖已收好的图片**（踩坑 140；这条自测先红） |
+| ⑦ | helper 超时不挂住 | `clip-helper`：`sleep 300` 的假 helper 必须**按进程组**收掉且耗时 < 12 s（实测 24.1 s 的版本当场红） |
+| ⑧ | 假 helper 探测 | 前置进 PATH 的脚本被认出来、取数按类型表优先级走 |
+| ⑨ | **id 比对用长度已知的字节段** | `clip-term` 直接钉 `clipt_frame_status`（同一 id ⇒ 1、别的 id ⇒ 0、DATA/DONE/EPERM ⇒ 2/3/4）；踩坑 142 —— 纯函数与假终端都**碰不到**这条比较 |
+
+**防假绿对照**（每次都先看到红再改回）：
+
+| # | 改坏什么 | 结果 |
+|---|---|---|
+| A | 探针的 `$`（36）换成 `p` —— 即踩坑 136 的原始 bug | `clip-term` **红**（探针字节不对）+ `clip-pty` **红**（没有探测） |
+| B | `clipt_take_data` 改成「拼接后再解码」 | 三轮**全红**（`clip-term` 的逐块断言、`clip-pty` 的收图、以及优先级那条） |
+| C | 去掉 `oscin_borrowed` 的早退（让 tick 抢 fd 0） | `clip-pty` **红**（应答被键路吃掉 ⇒ 图收不下）—— **前提是夹具撑过分片边界**，见踩坑 137 |
+| D | 扫描器对每个 `ESC` 都开捕获 | `tty-editor` 轮 **16 条断言全红**（裸 ESC 被攥住）—— 这是本轮最贵的回归，见踩坑 135 |
+| E | 去掉挂起段的续解 | `clip-pty` **红**（数据收不回来，靠 10 s 超时兜底） |
+| F | id 比对改回 `bufx_eq_cstr(..., id)`（踩坑 142 的原始 bug） | `clip-term` **红 4 条**（同一 id 认不出、DATA/DONE/EPERM 全错位）；**`clip-pty` 不红** —— 夹具的 id 恰好也是 `u1`，所以这条必须有直接断言 |
+
+**未实测的部分**（如实记账）：本机是 **X11 + deepin-terminal**，没有 kitty / ghostty，也没有
+`wl-paste` —— 所以 ① 真终端上 kitty 弹授权框、点一下、图贴上这一步，② 真实 Wayland 会话上的
+`wl-paste` 这一腿，**都没有在真机上跑过**。协议形状是对着 kitty 的官方规范、`kitty/clipboard.py`
+与 ghostty 的 `terminal/osc.zig` 三处核实的；验收靠**假终端 PTY 轮**。tmux/screen 是否透传
+5522 取决于它们，我们不实现 DCS 包装（不支持就靠探测失败回落）。
+
+**没顺手做的**：OSC 52 的读取（只带文本、多数终端出于安全默认关闭）、5522 的 paste-event
+模式（`DECSET 5522`，会引入**非用户主动**的授权弹窗，与「按一下才读一次」冲突）——
+两条都记在 §15.5。
+
