@@ -119,7 +119,7 @@ SRC := src/foundation/bufx.uya src/foundation/jsonx.uya src/foundation/yamlcfg.u
        src/web/ttyemu.uya src/web/webui.uya src/web/websrv.uya src/web/webhttp.uya src/web/webpump.uya \
        src/media/clipx.uya src/media/clipt.uya src/media/cliphelp.uya src/media/clip.uya src/media/imgx.uya src/media/imgz.uya \
        src/selftest/selftest.uya src/selftest/shellselftest.uya src/selftest/sigselftest.uya src/selftest/tuiselftest.uya \
-       src/selftest/st_core.uya src/selftest/st_mock_server.uya src/selftest/st_round_driver.uya src/selftest/st_tty_sse.uya src/selftest/st_sessions.uya src/selftest/st_read_window.uya src/selftest/st_view_watch.uya src/selftest/st_responses.uya src/selftest/st_stats_ctx.uya src/selftest/st_title.uya src/selftest/st_tasks_ws.uya src/selftest/st_goal_worktree.uya src/selftest/st_pm.uya src/selftest/st_pm2.uya src/selftest/st_mcp.uya \
+       src/selftest/st_core.uya src/selftest/st_mock_server.uya src/selftest/st_round_driver.uya src/selftest/st_tty_sse.uya src/selftest/st_sessions.uya src/selftest/st_read_window.uya src/selftest/st_view_watch.uya src/selftest/st_responses.uya src/selftest/st_stats_ctx.uya src/selftest/st_title.uya src/selftest/st_tasks_ws.uya src/selftest/st_vision.uya src/selftest/st_goal_worktree.uya src/selftest/st_pm.uya src/selftest/st_pm2.uya src/selftest/st_mcp.uya \
        src/selftest/tuis_core.uya src/selftest/tuis_title_pty.uya src/selftest/tuis_exit_cmd.uya src/selftest/tuis_diff_scroll.uya src/selftest/tuis_title_ask.uya src/selftest/tuis_sessions_big.uya src/selftest/tuis_tail.uya src/selftest/tuis_marquee_row.uya \
        src/selftest/st_web.uya src/selftest/st_web_childcfg.uya src/selftest/st_tls_pin.uya \
        src/selftest/st_dns.uya \
@@ -136,7 +136,7 @@ export UYA_ROOT
 export UYA_SPLIT_C_DIR := $(CURDIR)/build/uyacache
 
 # 行宽豁免：一条 .PHONY 就是一张全仓目标清单，拆行反而看不清哪条丢了
-.PHONY: all check print-src print-cflags build link-audit selftest codegen-audit doc-audit lint-size lint-size-all doc-cover ui-audit probe e2e e2e-config e2e-exec e2e-accept-nudge e2e-retry e2e-config-flags e2e-title e2e-title-cmd e2e-title-auto e2e-mouse e2e-api e2e-steps e2e-permission e2e-sandbox e2e-tasks e2e-goal e2e-memory e2e-memory-live e2e-sessions e2e-resume-big e2e-diff e2e-ws e2e-model e2e-model-save e2e-model-route e2e-ctxwindow e2e-worktree e2e-watch e2e-watch-pick e2e-dsh e2e-portable e2e-dns p30-check tui-demo tui-selftest web-selftest sess-selftest diff-selftest model-selftest panel-selftest clean shell-selftest pm-selftest mcp-selftest
+.PHONY: all check print-src print-cflags build link-audit selftest codegen-audit doc-audit lint-size lint-size-all doc-cover ui-audit probe e2e e2e-config e2e-exec e2e-accept-nudge e2e-retry e2e-config-flags e2e-title e2e-title-cmd e2e-title-auto e2e-mouse e2e-api e2e-steps e2e-permission e2e-sandbox e2e-tasks e2e-goal e2e-memory e2e-memory-live e2e-sessions e2e-resume-big e2e-diff e2e-ws e2e-model e2e-model-save e2e-model-route e2e-ctxwindow e2e-inputimage e2e-worktree e2e-watch e2e-watch-pick e2e-dsh e2e-portable e2e-dns p30-check tui-demo tui-selftest web-selftest sess-selftest diff-selftest model-selftest panel-selftest clean shell-selftest pm-selftest mcp-selftest
 
 all: build
 
@@ -258,7 +258,7 @@ lint-size-all:
 #   本仓实测：90 文件树上净增 50 个函数 + `rm -rf build && make build` → 通过（静态链接审计通过）。
 #   因此「净增函数按 0 处理」那条纪律作废。这段留下的用处只有一个：**换/降编译器时认得出症状**
 #   （报错点落在标准库、`make check` 全绿、只有清缓存重编才炸）。
-selftest: build codegen-audit doc-audit doc-cover ui-audit e2e-exec e2e-accept-nudge e2e-retry e2e-config-flags e2e-title e2e-title-cmd e2e-title-auto e2e-mouse e2e-api e2e-steps e2e-permission e2e-sandbox e2e-tasks e2e-goal e2e-memory e2e-memory-live e2e-sessions e2e-resume-big e2e-diff e2e-ws e2e-model e2e-model-save e2e-model-route e2e-ctxwindow e2e-worktree e2e-portable e2e-dns p30-check
+selftest: build codegen-audit doc-audit doc-cover ui-audit e2e-exec e2e-accept-nudge e2e-retry e2e-config-flags e2e-title e2e-title-cmd e2e-title-auto e2e-mouse e2e-api e2e-steps e2e-permission e2e-sandbox e2e-tasks e2e-goal e2e-memory e2e-memory-live e2e-sessions e2e-resume-big e2e-diff e2e-ws e2e-model e2e-model-save e2e-model-route e2e-ctxwindow e2e-inputimage e2e-worktree e2e-portable e2e-dns p30-check
 	UYA_BIN=$(UYA) $(OUT) --selftest
 
 probe: build
@@ -647,6 +647,56 @@ e2e-ctxwindow: build
 	out=$$(printf '/model w-six\n/model\n/exit\n' | env -i PATH=/usr/bin:/bin HOME=$$HOME $(CURDIR)/$(OUT) --dsh-home $$home --agent-home $$home/agent --no-dsh-writeback --api-key dummy-key --no-tui --quiet 2>&1); \
 	echo "$$out" | grep -q "ctx        555000  (source: default，沿用上一个模型的值)" || { echo "FAIL: 切到没有窗口的模型之后应当说清是「沿用」，不许照抄上一个模型的来源"; echo "$$out"; exit 1; }; \
 	echo "e2e-ctxwindow: 通过（目录条目 < 映射 < env < cli；顺序无关；非法值 CLI 拒·env 忽略·设置跳过并计数；--no-dsh-config 不读映射；-1 (unknown) 口径；/model 报告的 ctx 行）"
+
+# P84：**收图能力位**（离线，真二进制 + 真 settings.yaml + 真 PNG）。
+#   口径是「默认支持」：出厂就是开，只有**明确说不支持**才关 ——
+#     ① 目录条目 `input:` 含 image ⇒ 开；**存在但不含**（`[text]`）⇒ **关**（以前只 OR 真、
+#        从不清零，切到纯文本模型照收图，收下的必然 400）；**整键没写** ⇒ 沿用（默认支持）；
+#     ② 纯 env 路线（`--no-dsh-config` + `UYA_AGENT_MODEL`）**零配置**就能挂图 —— 本轮的正题；
+#     ③ `UYA_AGENT_INPUT_IMAGE=0`（env）与 `--input-image` / `--no-input-image`（cli）是**钉子**：
+#        压过目录条目、且切模型也不动；
+#     ④ 非法值只告警并忽略（绝不静默当开）；
+#     ⑤ `--print-config` 的 `input_image = … (source: …)` 四档逐条可证。
+#   图是 45 字节的**真 PNG**（IHDR 1×1）：`printf` 八进制写出，不往仓里加二进制夹具。
+#   ⚠ 一律 `env -i` 起（宿主导出的 `UYA_AGENT_*` 会把这几条判据搅在一起，同 e2e-ctxwindow）。
+e2e-inputimage: build
+	@set -e; \
+	home=build/selftest_p84_e2e; rm -rf $$home; mkdir -p $$home/att; \
+	printf 'llm-pi-ai:\n  providers:\n    {\n      alpha:\n        {\n          api: openai-responses,\n          baseURL: https://alpha.example/v1,\n          apiKeyEnv: ALPHA_KEY,\n          models:\n            [\n              { id: a-vision, input: [ text, image ] },\n              { id: a-plain, input: [ text ] },\n              { id: a-none }\n            ]\n        }\n    }\nagent-default-model:\n  provider: alpha\n  model: a-vision\n' > $$home/settings.yaml; \
+	printf '\211PNG\015\012\032\012\000\000\000\015IHDR\000\000\000\001\000\000\000\001\010\002\000\000\000\220wS\336\000\000\000\000IEND\256B\140\202' > $$home/att/one.png; \
+	run() { env -i PATH=/usr/bin:/bin HOME=$$HOME $(CURDIR)/$(OUT) --dsh-home $$home --agent-home $$home/agent --no-dsh-writeback --api-key dummy-key "$$@"; }; \
+	: "① 目录条目：含 image ⇒ 开；存在但不含 ⇒ 关；整键没写 ⇒ 沿用（默认支持）"; \
+	out=$$(run --print-config 2>&1); \
+	echo "$$out" | grep -q "^input_image = true  (source: dsh-settings)" || { echo "FAIL: \`input: [text, image]\` 没被认成支持"; echo "$$out"; exit 1; }; \
+	out=$$(run --print-config --model a-plain 2>&1); \
+	echo "$$out" | grep -q "^input_image = false  (source: dsh-settings)" || { echo "FAIL: \`input: [text]\` 是**明确声明不支持**，必须真的关掉（以前只 OR 真、从不清零）"; echo "$$out"; exit 1; }; \
+	out=$$(run --print-config --model a-none 2>&1); \
+	echo "$$out" | grep -q "^input_image = true  (source: default；没有声明过 ⇒ 默认支持)" || { echo "FAIL: 整键没写 \`input:\` 时应当沿用「默认支持」，且来源不许冒称 dsh-settings"; echo "$$out"; exit 1; }; \
+	: "② 纯 env 路线**零配置**就能挂图（本轮的正题：以前这里必被拒）"; \
+	out=$$(printf '/image %s\n/exit\n' "$$home/att/one.png" | env -i PATH=/usr/bin:/bin HOME=$$HOME UYA_AGENT_MODEL=my-vlm $(CURDIR)/$(OUT) --no-dsh-config --agent-home $$home/agent2 --no-dsh-writeback --api-key k --base-url http://127.0.0.1:1/v1 --no-tui --quiet 2>&1); \
+	echo "$$out" | grep -q "已挂上：" || { echo "FAIL: 纯 env 路线（默认支持）应当能挂上图，实际被拒了"; echo "$$out"; exit 1; }; \
+	echo "$$out" | grep -q "图片 image/png" || { echo "FAIL: 挂上的图没有逐项元数据行"; echo "$$out"; exit 1; }; \
+	: "③ 钉子：env=0 压过目录的「支持」；cli 压过 env；--no-input-image 压过目录"; \
+	out=$$(env -i PATH=/usr/bin:/bin HOME=$$HOME UYA_AGENT_INPUT_IMAGE=0 $(CURDIR)/$(OUT) --dsh-home $$home --agent-home $$home/agent --no-dsh-writeback --api-key dummy-key --print-config 2>&1); \
+	echo "$$out" | grep -q "^input_image = false  (source: env)" || { echo "FAIL: UYA_AGENT_INPUT_IMAGE=0 没压过目录条目里的「支持」"; echo "$$out"; exit 1; }; \
+	out=$$(env -i PATH=/usr/bin:/bin HOME=$$HOME UYA_AGENT_INPUT_IMAGE=0 $(CURDIR)/$(OUT) --dsh-home $$home --agent-home $$home/agent --no-dsh-writeback --api-key dummy-key --print-config --input-image 2>&1); \
+	echo "$$out" | grep -q "^input_image = true  (source: cli)" || { echo "FAIL: --input-image 没压过 env"; echo "$$out"; exit 1; }; \
+	out=$$(run --print-config --no-input-image 2>&1); \
+	echo "$$out" | grep -q "^input_image = false  (source: cli)" || { echo "FAIL: --no-input-image 没压过目录里的「支持」"; echo "$$out"; exit 1; }; \
+	: "③b 钉子切模型也不动（显式优先）"; \
+	out=$$(env -i PATH=/usr/bin:/bin HOME=$$HOME UYA_AGENT_INPUT_IMAGE=0 $(CURDIR)/$(OUT) --dsh-home $$home --agent-home $$home/agent --no-dsh-writeback --api-key dummy-key --print-config --model a-vision 2>&1); \
+	echo "$$out" | grep -q "^input_image = false  (source: env)" || { echo "FAIL: env 给的钉子被 --model 的目录条目覆盖了"; echo "$$out"; exit 1; }; \
+	: "④ 非法值只告警并忽略（绝不静默当开）」"; \
+	out=$$(env -i PATH=/usr/bin:/bin HOME=$$HOME UYA_AGENT_INPUT_IMAGE=maybe $(CURDIR)/$(OUT) --dsh-home $$home --agent-home $$home/agent --no-dsh-writeback --api-key dummy-key --print-config --model a-plain 2>&1); \
+	echo "$$out" | grep -q "warning: UYA_AGENT_INPUT_IMAGE 取值须为" || { echo "FAIL: 非法 env 值没有告警"; echo "$$out"; exit 1; }; \
+	echo "$$out" | grep -q "^input_image = false  (source: dsh-settings)" || { echo "FAIL: 非法 env 值被忽略之后应当回落到目录条目"; echo "$$out"; exit 1; }; \
+	: "⑤ 人这一侧的出口：/model 报告的 image 行（含「要收图」的出口名）」"; \
+	out=$$(printf '/model\n/exit\n' | run --no-input-image --no-tui --quiet 2>&1); \
+	echo "$$out" | grep -q "^image      off  (source: cli" || { echo "FAIL: /model 报告没有 image 行"; echo "$$out"; exit 1; }; \
+	echo "$$out" | grep -q "要收图：--input-image 或 UYA_AGENT_INPUT_IMAGE=1" || { echo "FAIL: 关掉收图时没给出怎么打开的出口"; echo "$$out"; exit 1; }; \
+	out=$$(printf '/model\n/exit\n' | run --no-tui --quiet 2>&1); \
+	echo "$$out" | grep -q "^image      on  (source: dsh-settings)" || { echo "FAIL: 目录声明支持时 image 行应当印 on + dsh-settings"; echo "$$out"; exit 1; }; \
+	echo "e2e-inputimage: 通过（默认支持；目录三态；纯 env 零配置可挂图；env/cli 钉住且切模型不动；非法值告警忽略；--print-config 与 /model 两个出口）"
 
 # P71：**人运行中切模型/强度 ⇒ 这份选择写回 DSH 设置**（离线，真二进制 + 真 settings.yaml）
 #   对齐 DSH 自己的行为：`selectModel` → `agentDefaultModel.saveSelection()` → 同一个

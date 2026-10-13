@@ -2840,6 +2840,11 @@ var r: UiBackend = g_reg[0];
 | 构请求按 4/3 膨胀留缓冲（`request_bytes_needed`） | `jw_overflow` **静默**截断请求体（挂了图，发出去却没有） |
 | 查模型目录的 `input` 有没有 `image`（`cfg.input_image`） | 在不吃图的模型上收下来，请求照样 400 |
 
+**收图能力位的口径是「默认支持」（P84）**：出厂 `true`，只有**明确说不支持**才关 ——
+① `--no-input-image`（cli）② `UYA_AGENT_INPUT_IMAGE=0`（env）③ 目录条目写了 `input:`
+但**不含** `image`（如 `[text]`）⇒ 关。**信息不足一律当支持**：条目**没写** `input:`、
+目录里没这个名字、`--no-dsh-config` —— 全部沿用现状。原因见下面那张表与 §16 踩坑 143。
+
 **与 DSH 的差别在能力，不在流程**：这四个问题 DSH 也要回答，只是它手上有 zlib 与图片库，
 任意格式都能重编码到预算内，看上去像「顺手就做了」；纯 Uya 只有 JPEG 编解码器
 （`std.image`），PNG/GIF/WebP 超预算**只能拒**。web 端同理：**直传原始字节、让浏览器
@@ -3001,7 +3006,8 @@ X11 先答，就会拿到远端那块空板子并把「没有图片也没有文�
 空批，接着解下一帧。不做这一步的话，收到第一帧之后就永远等在那里。
 
 **结果并入 agent**（`agent_clip_paste`，只做 UI 分流）：`CLIP_IMAGE` →
-`agent_image_attach_bytes(..., from_clip = true, cfg.input_image)`；`CLIP_TEXT` → TUI
+`agent_image_attach_bytes(..., from_clip = true, cfg.input_image)`（能力位的口径与来源链见
+§13.1 与 §19.7：**默认支持**）；`CLIP_TEXT` → TUI
 插进输入行（**不提交**，可以接着编辑）/ 滚动模式直接打；其余 → notice
 「粘贴失败：`<clip_reason>`」。**回执必须指名来源**，且 SSH 下标出「**远端**」——
 那条路上拿到的不是用户眼前的板子，不标出来就是在骗人。
@@ -5150,6 +5156,26 @@ xsel 只能取文本、pngpaste 直接吐 PNG。子进程一律 `sigx_reset_for_
    一律用 `bufx_mem_eq(p, q, n)`；`bufx_eq_cstr` 只用于「Buf vs **字面量**」。
    **判据教训**：这条只能靠**直接钉 `clipt_frame_status`**（同一 id ⇒ 1、别的 id ⇒ 0）
    才抓得住 —— 假终端那个夹具的 id 恰好也是 `u1`，扫描器那几轮根本碰不到这条比较。
+143. **能力位只在 `true` 方向被写过一次 ⇒ 切模型永不清零，env 路线也永远拿不到它**（P84）：
+    `cfg.input_image` 出厂 `false`，全仓只有两处写它（`agent_apply_dsh` 那条路线解出来的
+    模型条目、`agent_model_adopt_caps` 里命中目录条目的模型），**两处都是
+    `if e.input_image { cfg.input_image = true; }`** —— 没有一处能写成 `false`。两个症状：
+    * **切到不吃图的模型照收图**：`--model a-vision`（目录说吃图）之后再 `--model a-plain`
+      （目录明写 `input: [text]`），`input_image` 仍是 `true`；用户挂上图、请求带出去，
+      网关回 **400** —— 而本地那句「当前模型不吃图」的拒绝反而**再也**不会出现。
+    * **env 给的模型拿不到能力**：`UYA_AGENT_MODEL=a-vision` **不查目录**（只有 `--model` /
+      `/model` 走 `agent_model_apply`），于是目录里写着 `input: [text, image]` 也照样
+      `input_image = false` —— 纯 env 部署（autodl 那类连 DSH 目录都没有）**永远挂不上图**；
+      而 `--print-config` 只印一个 `false`，看不出是「目录说了不支持」还是「这条路没查目录」。
+    **根因是两件事被压成了一个 bool**：「声明了不支持」与「根本没声明」分不开，于是
+    「清零」这个动作无处安放、「没有信息」也无处表达。**修法**：能力位改**三态**
+    （`MX_IMG_UNSET` / `MX_IMG_YES` / `MX_IMG_NO`；`modelx` 与 `dshcfg` 两份解析器同一套口径）
+    + 一个**定稿点** `agent_vision_settle`（与 `agent_ctxwin_settle` 同形：启动收尾、切模型、
+    恢复会话各调一次），口径收成「**默认支持** + 三个明确的关法」，并给它一对可证出口
+    （`--print-config` 的 `input_image = … (source: …)` 与 `/model` 的 `image` 行）。
+    **判据教训**：只调 `agent_vision_settle` 的自测腿**抓不住「调用点漏了」** ——
+    把 `agent_model_apply` 里那一次 settle 删掉再跑，九条腿**一条不红**（实测）；
+    必须有一条腿**走真入口**（`agent_model_apply`）才算数，见 §19.7。
 
 ---
 
@@ -5382,6 +5408,7 @@ DEEPSEEK_API_KEY=sk-xxx ./build/uya-agent \
 | `effort-apply` | 公布的收、同值幂等返回 1、未公布拒 2、透传但 `effort_set=false` |
 | `model-log` | `session/model` 三字段取最后一条 |
 | `ctxwin` | P81 上下文窗口的来源链（离线、纯函数 + 假目录）：映射**压过**目录条目（目录 111000 / 映射 555000 ⇒ 555000）、`提供方/名字` 压过裸名字（裸 222000 / 精确 666000 ⇒ 666000，夹具里**裸那条写在前面** ⇒ 「先命中的赢」的错误实现会红）、同名模型跨提供方各自成条（beta/c-three ⇒ 777000）、只给裸名字那条腿、映射没写⇒目录条目兜底（123000 src 1）、**目录里根本没有**这个模型也照映射走（888000 src 5 —— autodl 那种纯 env 部署的形态）、一条来源都没有⇒**沿用**且来源码退回 0、**键是整串匹配**（`c-fi` 不许吃掉 `c-five` / 模型 `c-f` 不许被 `c-fi` 匹配）、显式（src 2/3）切模型也不被动、`--no-dsh-config` 不读映射、非法值**跳过并计数**（`c-four: 256K` 不许被截断成 256）。**防假绿对照 4 次**（每次先看到红再改回）：①去掉显式守卫 + 映射不参与 ⇒ 红 8 条；②键匹配改「键以查询开头」⇒ `c-f` 那条红；③键匹配改「查询以键开头」⇒ `c-five` 那条红（**②③ 是补出来的**：原计划的「目录外沿用原值」那条腿**抓不住**前缀匹配，见下面 §19.3）；④env 入口整段变死代码 ⇒ `e2e-ctxwindow` 的 env 腿红 |
+| `vision` | P84 收图能力位的来源链（离线、纯函数 + 假目录）：`vision_flag_parse` 八个词逐值 + 非法值（`maybe`/`2`/空/`TRUE`）**判 -1 不许静默当开**、出厂默认是「开 + src 0」（**默认支持**）、`input: [text, image]` ⇒ on(src 1)、**`input: [text]` ⇒ off(src 1)**（本轮修掉的那个洞）、**整键没写 ⇒ 沿用 on(src 0)**（「没声明」不是「不支持」）、同名跨提供方时 beta 那份没写 ⇒ 沿用（不许拿 alpha 那条来填）、目录外名字 ⇒ 沿用 + src 退回 0、显式（src 2/3）钉住、`--no-dsh-config` 不动、**两条走真入口**（`agent_model_apply`：切到不支持要真关、切回要真开 —— 调用点漏了 settle 时只调函数的腿全绿，见踩坑 143）。**防假绿对照 5 次**（每次先看到红再改回）：①去掉切模型时那次 settle ⇒ 红 2 条（**最初全绿**，补了真入口腿才抓住）；②去掉显式守卫 ⇒ 红 2 条；③出厂值改回 false ⇒ 本轮回红 2 条 + `e2e-inputimage` 红；④去掉 print-config 的 source ⇒ e2e 红；⑤去掉 web 注入 ⇒ `web-childcfg` 红 |
 | `dsh-writeback` | P71 写回（`session/dshsave.uya`）：叶级替换（注释/兄弟节**逐字节**保留、行数不变）/ 幂等（`DSHW_SAME`，连 mtime 都不动）/ effort 清档 / 缺键追加节尾 / 整节缺失追加文末 / 空 provider 不写空值（那一行原样留）/ 需要引号的值（空格与 `#`）/ 控制字节拒写且文件不变 / flow 节拒（不猜、不整份重写）/ 锁被占让位（`DSHW_BUSY`）且**不删别人的锁** / 缺 `settings.yaml` 不新建 / 回执表（`SAME` 与 `SKIP` 一个字节不加）。**防假绿对照**：①把「从第 0 字节照抄」改回「只抄节头那一行」⇒ 红 7 条；②抢锁恒成功 ⇒ 红 3 条；③flow 判据停掉 ⇒ 红 2 条（这条首版是**假绿**：夹具值与被写值不同时，追加会被写前自检挡下，判据停掉照样绿 —— 夹具改成「已经就是那两个值」之后才真的钉住它） |
 | `worktree` | 真 git：建 worktree + `dsh/<slug>`、闸门、`wt_finish` 合并且目录消失 |
 | `worktree-discard` | `wt_discard` 不合并；非仓库 `wt_provision` 判 `SKIPPED` |
@@ -6749,3 +6776,56 @@ call edge 表（`MAX_FN_CALL_EDGES`）与顶层变量类型查找的降级路径
 模式（`DECSET 5522`，会引入**非用户主动**的授权弹窗，与「按一下才读一次」冲突）——
 两条都记在 §15.5。
 
+
+### 19.7 P84：图片能力位「默认支持」+ 两个显式出口
+
+**为什么做**：用户问的是「怎么通过环境变量给模型加图片支持」—— 查下来发现**没有这条路**，
+而且现场比「缺一个 flag」更坏（见 §16 踩坑 143 的两个症状）：能力位只会被写成 `true`、
+从不清零，且 env 给的模型**从不查目录**。于是本轮把口径与出口一起补齐。
+
+**口径**：**默认支持**（出厂 `true`）。三个明确的关法，两个可证出口。
+
+| 档 | 来源 | 写法 | source |
+|---|---|---|---|
+| ① | 命令行 | `--no-input-image` / `--input-image` | `cli` |
+| ② | 环境变量 | `UYA_AGENT_INPUT_IMAGE=0\|1` | `env` |
+| ③ | 模型目录条目 | `input:` **存在**但不含 `image` | `dsh-settings` |
+| ④ | 都没有 | —— | `default`（**支持**） |
+
+**四条不变量**（都可测，判据见下）：
+
+| # | 不变量 | 为什么它是承重的 |
+|---|---|---|
+| ① | **三态**：`UNSET`（没写 `input:`）/ `YES` / `NO` 分得开 | 「没声明」与「声明不支持」压成一个 bool 时，「清零」与「没信息」都无处安放 —— 这正是踩坑 143 的根因 |
+| ② | **一个定稿点**：`agent_vision_settle`（启动收尾 / 切模型 / 恢复会话各一次） | 能力位散布在 `agent_apply_dsh` 与 `adopt_caps` 两处时，切模型那条路漏了一次就是「照收图 ⇒ 400」 |
+| ③ | **显式优先**：env / cli 给过的钉子，切模型也不动 | 网关不认图时 `=0` 要能把目录里乐观的 `true` 压回去；否则人唯一的出口被目录悄悄改掉 |
+| ④ | **信息不足一律当支持**，但**不许静默** | fail-closed 会让纯 env 部署（autodl 那类）永远挂不上图 —— 而那正是本轮要解决的场景；沿用可以，但 `/model` 与切换回执必须说出来 |
+
+**与上下文窗口的关系**：形状刻意同构（四档来源 + 单一 `*_settle` + 两个出口 + 显式钉住），
+但**默认值相反** —— 窗口「一次都没人给过」是 `-1`（未知、压缩不触发），能力位「没声明」是
+**开**。这不是不一致：窗口猜错的代价是**静默行为变化**（该压不压），能力位猜错的代价是
+**一句明确的 400**，两者的保守方向本来就该相反。
+
+**验收**（都是实测）：
+
+| 判据 | 结果 |
+|---|---|
+| 新增自测轮 `vision`（§19 上表：12 条腿，含**走真入口** `agent_model_apply` 的两条） | 绿 |
+| 新增 `make e2e-inputimage`（6 条腿，真二进制 + 真 settings.yaml + 真 45 B PNG，`env -i` 起） | 绿 |
+| `web-childcfg` 扩到 15 条（收图位显式关掉时要传进子进程；出厂值**不许**注入） | 绿 |
+| `make lint-size` / `make doc-cover` / `make doc-audit` / `make check` / `make build` | 全通过 |
+
+**防假绿对照（五条，都先看到红再改回）**：
+
+| # | 改坏什么 | 结果 |
+|---|---|---|
+| A | 去掉 `agent_model_apply` 里那次 `agent_vision_settle` | `vision` 轮**红 2 条**（切到不支持没关、切回支持没开）—— ⚠ 这一条**最初是绿的**：腿只调 settle 函数、不碰调用点。补了「走真入口」那两条腿才抓住，见踩坑 143 的判据教训 |
+| B | 去掉 `agent_vision_settle` 的显式守卫 | **红 2 条**（env 钉子被目录覆盖、cli 钉子被目录覆盖） |
+| C | 出厂值改回 `false` | `vision` 轮**红 2 条**（默认不再是「支持」、`--no-dsh-config` 那条也跟着红）+ `e2e-inputimage` **红**（纯 env 路线挂不上图）—— 这条直接钉「默认支持」 |
+| D | 去掉 `--print-config` 的 `(source: …)` | `e2e-inputimage` **红**（四档 source 全部对不上） |
+| E | 去掉 web 子进程的收图位注入 | `web-childcfg` **红 1 条**（终端关了、浏览器里还开着） |
+
+**没顺手做的**：`uya-agent.inputImages` 设置映射（DSH 的 `input:` 已经是那条路的原生写法，
+再加一份就是第二个真值源）；能力清单语法（今天只有 image 一种能力，`--context-window` 也没
+发明语法）；把 `input_image` 写进会话日志（会话记录里的模型已经足够重建 —— 能力位按当前目录
+重新定稿，这才是「切完看得见」的那一半）。
