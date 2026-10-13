@@ -158,6 +158,7 @@ readelf -lW build/uya-agent | grep -c INTERP    # 0 = 真静态
 | `--list-plugins` | 打印插件与工具的诊断后退出（排查「为什么工具数是 0」的第一个入口） |
 | `--uya-bin PATH` | 跑 workflow 脚本的解释器（默认 `$UYA_BIN` 或 `uya`） |
 | `--no-compact` / `--context-window N` | 关闭自动上下文压缩 / 指定压缩判定的**上下文窗口**（纯十进制正整数，非法值报错退出）。只认这四档来源，从高到低：`--context-window` > `UYA_AGENT_CONTEXT_WINDOW` > `settings.yaml` 的 `uya-agent.contextWindows` 映射 > DSH 模型条目的 `contextWindow`；一条都没有就**沿用**（一次都没人给过时是 `-1` = 未知，此时自动压缩不触发）。前两档是**显式**的：本会话里切模型也不动它。见 §7「上下文窗口」 |
+| `--input-image` / `--no-input-image` | 这个模型**收不收图**（`/image`、`ctrl+v`、`/paste` 挂不挂得上）。**默认支持** —— 只有明确了「不支持」才关：目录条目写了 `input:` 但不含 `image`（如 `[text]`），或这两个 flag / `UYA_AGENT_INPUT_IMAGE=0`。两个 flag 是**显式**的：本会话里切模型也不动它。见 §7「图片能力位」 |
 | `--no-memory` / `--memory-budget N` | 关掉项目记忆（不读不写不注入）/ 开工包的字节预算（默认 3072） |
 | `--agent-home DIR` | 会话与索引的根目录（默认 `~/.uya-agent`） |
 | `--no-save` | 不写会话日志（只跑不记） |
@@ -249,6 +250,8 @@ uya-agent --web 127.0.0.1:9000     # 指定端口（端口写 0 = 内核分配�
 `UYA_AGENT_API`（非法值告警后按「未声明」处理，即仍会先试 responses）、
 `UYA_AGENT_REASONING_EFFORT`（`off`/`none` = 不发）、
 `UYA_AGENT_CONTEXT_WINDOW`（压缩判定的上下文窗口，纯十进制正整数；非法值告警后忽略）、
+`UYA_AGENT_INPUT_IMAGE=1\|0`（模型收不收图；**默认支持**，只有 `=0` 才关 ——
+认不出的一律告警后忽略，绝不静默当开）、
 `UYA_AGENT_EXEC_EFFORT` / `UYA_AGENT_EXEC_AFTER` / `UYA_AGENT_GRACE_STEPS`、
 `UYA_AGENT_API_RETRY_MAX`（同 `--api-retry-max`：`0` = 不重试）、
 `UYA_AGENT_PERMISSION`（三档访问模式，非法值告警后忽略）、
@@ -590,8 +593,10 @@ leaf 指纹怎么算、指纹库放哪儿 —— 见 [DESIGN.md §18](DESIGN.md)
   `/fullscreen` 与快捷键都不进历史、不改会话。
 * **TUI 不做**鼠标点击/拖选/选择（滚轮做了）、可折叠卡片、分屏、主题切换 UI。
   **图片**能挂给多模态模型（`/image` / `ctrl+v` / `/paste`），但**终端里不渲染** —— 屏幕上只有
-  一行占位（格式 + 宽高 + 大小 + 文件名）。超预算的 **JPEG 会自动缩小**（DESIGN §13.1.1），
-  PNG/GIF/WebP 仍只能拒（纯 Uya 没有 zlib，也没有这三种格式的编码器）。
+  一行占位（格式 + 宽高 + 大小 + 文件名）。收不收图按 §7「图片能力位」那条链（**默认支持**：
+  纯 env 路线零配置可挂图；目录写了 `input: [text]` 或 `--no-input-image` 才关）。超预算的
+  **JPEG 会自动缩小**（DESIGN §13.1.1），PNG/GIF/WebP 仍只能拒（纯 Uya 没有 zlib，
+  也没有这三种格式的编码器）。
   但**「选中文字复制」是终端自己的事**：TUI 默认开着鼠标上报，一开终端的拖选就被我们吃掉 ⇒
   想拖选复制得按 `F2` / `/mouse off` 关掉（或开着时按住 shift 拖选）。
   `--resume` 只回填最近 200 条历史（注入类消息不回填），`--resume-dsh` 走同一条回填路径。
@@ -687,6 +692,28 @@ leaf 指纹怎么算、指纹库放哪儿 —— 见 [DESIGN.md §18](DESIGN.md)
 * **人的出口是 `/model` 报告的那一行 `ctx`**（`--print-config` 是机器那一侧）：切到一个既没写
   映射、目录条目也没写窗口的模型时，它会明确说「沿用上一个模型的值」——沿用可以，但不说等于
   让人以为配置生效了。
+* **图片能力位**（P84）：`/image`、`ctrl+v`、`/paste` 收不收图，口径是「**默认支持**」——
+  出厂就是开，只有**明确说不支持**才关：
+
+  | 档 | 来源 | 写法 | `--print-config` 的 source |
+  |---|---|---|---|
+  | ① | 命令行 | `--no-input-image` / `--input-image` | `cli` |
+  | ② | 环境变量 | `UYA_AGENT_INPUT_IMAGE=0\|1` | `env` |
+  | ③ | DSH 模型条目 | `input:` **存在**但不含 `image`（如 `[text]`） | `dsh-settings` |
+  | ④ | 以上都没有 | —— | `default`（**支持**，就是出厂值） |
+
+  * **纯 env 部署不用配任何东西**：`UYA_AGENT_MODEL=my-vlm` 这种路线（目录里连这条都没有）
+    直接就能挂图 —— 这正是加这一档的起因；
+  * ①② 是**显式**的：本会话里切模型也不动它（`=0` 能把目录里乐观的 `true` 压回去 ——
+    网关不认图时用这个，免得每挂一张吃一个 400）；
+  * ③ 是**新增的一半**：以前这一位只会被写成 `true`、从不清零，于是切到纯文本模型照收图，
+    收下的**必然 400**（见 [DESIGN.md §16 踩坑 143](DESIGN.md)）；
+  * **信息不足一律当支持**：条目**没写** `input:`（与「写了不含」是两件事）、目录里没这个名字、
+    `--no-dsh-config`、设置读不到 —— 全部沿用现状。沿用可以，但**不许静默**：`/model` 会印
+    `image  on  (source: default，没有声明过（默认支持）)`，关掉时还会带上怎么打开；
+  * 代价（故意选的）：模型真不吃图时拿到的是网关 **400**，不是本地那句拒绝 ——
+    出口就是 ①② 与目录里写 `input: [text]`，拒绝话术与 `/model` 的 `image` 行会点名它们；
+  * `--print-config` 印 `input_image = true|false  (source: …)`（与 `context_window` 同形）。
 * **人切完的选择会写回 DSH 设置**（P71）：`/model <名字>` 与 `/effort <档位>`（含 TUI 浮层里
   选中）成功之后，把 `provider` / `model` / `reasoningEffort` **三样一起**写回
   `$DSH_HOME/settings.yaml` 的 `agent-default-model` —— 于是**下次启动**的默认就是刚选的这条
