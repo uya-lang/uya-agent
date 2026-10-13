@@ -254,6 +254,10 @@ uya-agent --web 127.0.0.1:9000     # 指定端口（端口写 0 = 内核分配�
 `UYA_AGENT_MOUSE`（`0` = 关鼠标上报、可直接拖选复制；CLI 优先）、
 `UYA_AGENT_MCP`（`0` = 不读不连 MCP 插件，等价 `--no-mcp`）、
 `UYA_AGENT_WEB_TLS_VERIFY` / `UYA_AGENT_WEB_TLS_PIN`（搜索主机的信任策略，默认继承 cfg）、
+`UYA_AGENT_DNS`（**显式指定 DNS 解析器**，`IP` 或 `IP:端口`，例如 `1.1.1.1` 或
+`127.0.0.53:53`；不写时本进程自己**整份**读 `/etc/resolv.conf` 取第一个 IPv4 的
+`nameserver` —— **改文件/要 root 不再是排障的前提**，`--print-config` 的 `dns = …`
+会打印实际会用的那一台与它的来源）、
 以及 key（三选一）：`UYA_AGENT_API_KEY` / `DEEPSEEK_API_KEY` / `OPENAI_API_KEY`。
 
 **退出码**：`0` 成功 · `1` 用法/配置错 · `2` 传输错（DNS/TCP/TLS/超时）· `3` 模型或协议错
@@ -261,6 +265,10 @@ uya-agent --web 127.0.0.1:9000     # 指定端口（端口写 0 = 内核分配�
 `5` **模型输出到达 token 上限被截断**（`finish_reason=length`）：这一轮没跑到最终答复，
 但**不是错误** —— 截断前的正文已经留在对话里，`--continue` 之后发一句「继续」即可接着做
 （工具调用一律丢弃：参数可能是半截的）。交互形态（REPL / TUI）里不按「异常」处理。
+退出码 2 这类失败**会自己说清是哪一段坏的**：名字没解开（DNS）会说域名、用的哪台解析器、
+为什么（超时/拒绝/文件里没有 nameserver 行…）以及 `UYA_AGENT_DNS` 这条自救路；
+TCP 连不上会打出目标 `主机:端口`；TLS 握手失败再单独一档。三种情形以前共用一句
+「请求失败（网络或 TLS 校验）」，等于把答案丢掉（见 DESIGN §16 踩坑 133）。
 
 ---
 

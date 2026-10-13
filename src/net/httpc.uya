@@ -1,20 +1,23 @@
 // src/net/httpc.uya — 极简 HTTP/1.1 客户端（明文 + TLS），纯 Uya
 //
-// 本文件：URL 解析（url_parse）、DNS（std.net.dns）、TCP 连接（tcp_connect）、TLS 开壳
-//   （tls_open + 四档信任策略）、请求构造（build_request）、连接读（conn_read）、整段式请求
-//   （http_request，非流式路径）、leaf 指纹解析与比对、TOFU 指纹库的读写、TLS 噪声静音
-//   （tls_noise_mute）、客户身份（HC_USER_AGENT，网关据此辨认客户端，P71）。
+// 本文件：URL 解析（url_parse）、DNS 解析器发现与名字解析（hc_resolv_* / hc_dns_*，
+//   P80）、TCP 连接（tcp_connect）、TLS 开壳（tls_open + 四档信任策略）、请求构造
+//   （build_request）、连接读（conn_read）、整段式请求（http_request，非流式路径）、
+//   leaf 指纹解析与比对、TOFU 指纹库的读写、TLS 噪声静音（tls_noise_mute）、客户身份
+//   （HC_USER_AGENT，网关据此辨认客户端，P71）。
 // 不变量：① 信任策略四档且**默认 tofu**（chain / pin / tofu / none，见 §18）；② leaf SHA-256
 //   从 `HandshakeCtx.server_flight_msg` 自己解析，**不依赖 `cert_parse` 的 RSA 前提**；③
 //   `tls_noise_mute` 把 `dup(2)` 存进 `g_err_fd`，显示层必须经 `err_fd()` 写（踩坑 30 同族）；
 //   ④ 明文与 TLS 走同一条上层路径，调用方不需要分支；⑤ 系统根证书库**只有 chain 档加载**
-//   （pin / tofu / none 的判据是 leaf 指纹，与 CA 库无关 —— 见踩坑 132）。
+//   （pin / tofu / none 的判据是 leaf 指纹，与 CA 库无关 —— 见踩坑 132）；⑥ **名字解析器
+//   自己找**（整份读 resolv.conf，不截断），失败报 `HcDnsFailed`；连接/握手失败各报
+//   `HcConnectFailed` / `HcHandshakeFailed` —— 这三条路的修法不同，不许糊成一个码（踩坑 133）。
 // 依赖：libc（fcntl/heap/stdlib/syscall/unistd）、std.http.types、std.net.dns、std.string.strlen、
 //   lib/tls（tls.common / crypto.sha256 / https / ssl.context / ssl.handshake / ssl.record /
 //   x509.cert.Cert / x509.trust_store / x509.verify）；本仓 foundation/bufx、
 //   net/tlspin 与 net/httpstream（合并命名空间，无本地 use）。
 // 命名：`hc_*`（连接与请求原语）、`url_parse`/`tcp_connect`/`tls_open`/`build_request`/`conn_read`、
-//   `Tls*` 常量、`http_request`。
+//   `Tls*` 常量、`http_request`。DNS 那一节：`HcResolvHit` + `hc_resolv_*`/`hc_dns_*`。
 //
 // 为什么不用 std.http.http1_async / tls.https：
 //   1) std.http 的请求头构造器固定只发 Host/Connection/Content-Type/Content-Length，
@@ -53,6 +56,12 @@ use tls.x509.verify.verify_chain_rsa;
 // ============================================================
 export error HcBadUrl;
 export error HcConnectFailed;
+// 名字解析失败（DNS）。**与 `HcConnectFailed` 分开**：前者的修法是去看解析器
+// （resolv.conf / $UYA_AGENT_DNS），后者的修法是去看网络，糊成一个码就是把答案丢掉
+// （踩坑 133：用户只看到「请求失败（网络或 TLS 校验）」，而真话是「名字没解开」）。
+export error HcDnsFailed;
+// TLS 握手失败（TCP 已经连上了）。同样分开：连接失败看网络，握手失败看证书/协议。
+export error HcHandshakeFailed;
 export error HcIoFailed;
 export error HcTooLarge;
 export error HcBadResponse;
@@ -351,6 +360,566 @@ export fn url_parse(url: &[byte], out: &Url) !void {
 }
 
 // ============================================================
+// DNS 解析器发现（/etc/resolv.conf 与 $UYA_AGENT_DNS）
+//
+// 为什么本仓自己再读一遍 resolv.conf：标准库那条路（`std.net.dns` 的
+// `dns_parse_resolv_conf_first_nameserver`）**只读文件的前 512 字节**，就在这 512 字节里
+// 找 `nameserver`。systemd 的 stub-resolv.conf 前面是一大段说明注释：本机实测该文件
+// 920 字节、`nameserver 127.0.0.53` 落在**偏移 866** —— 于是「文件里没有 nameserver」
+// 被判成 `DnsNoNameserver`，名字解析当场失败（现场见 §16 踩坑 133：`uya-agent hi` 报
+// 「请求失败（网络或 TLS 校验）」，而 strace 里**一次 socket 调用都没有**）。
+// 静态链接下不能用 `getaddrinfo`（NSS 要 dlopen，见 §16），所以只能把这一步自己做对。
+//
+// 判据是**纯函数**（`hc_resolv_scan` 只吃文本，离线可测），读文件与读环境都只在
+// `hc_dns_resolve` 一处；自测把路径钉到临时文件（`hc_resolv_set_path`，与
+// `hc_set_tofu_path` 同一个先例），因此既不联网、也不碰真的 /etc/resolv.conf。
+// ============================================================
+// 解析器文件的读取上限。**整份读到 EOF 才是重点**（这就是本节的来由）；上限只防
+// 「这不是 resolv.conf 而是个大文件」：撞上置 `hc_resolv_trunc` 并**说出来**，
+// 绝不静默当成「文件里没有」—— 那正是踩坑 133 的形状。
+const HC_RESOLV_MAX: usize = 16384;
+// 解析器串（`a.b.c.d[:port]`）的容量；最长 `255.255.255.255:65535` 是 21 字节。
+const HC_DNS_SERVER_MAX: usize = 64;
+// 「最近一次连接目标」能记下的主机名长度（只用于显示，超了截断）。
+const HC_TARGET_MAX: usize = 256;
+
+const HC_RESOLV_PATH: &const byte = "/etc/resolv.conf" as &const byte;
+// "nameserver" 的字节（配置项**区分大小写**，用逐字节比而不是大小写折叠）。
+const HC_RESOLV_KW: &const byte = "nameserver" as &const byte;
+
+// 解析器的**来源**（`hc_dns_src_now()`）。ENV / FILE 是「真找到并用了」，
+// STDLIB 是「我们没找到，交给标准库自己再找一遍」，NONE 只在失败路径上短暂出现。
+export const HC_DNS_FROM_NONE: i32 = 0;
+export const HC_DNS_FROM_ENV: i32 = 1;
+export const HC_DNS_FROM_FILE: i32 = 2;
+export const HC_DNS_FROM_STDLIB: i32 = 3;
+
+// 解析失败/只能用默认路径的**原因**（`hc_dns_err_now()`）。前六条是「找解析器」阶段的，
+// 后四条是「发查询」阶段的 —— 两段的修法不同，所以不合并成一个「解析失败」。
+export const HC_DNS_ERR_NONE: i32 = 0;
+export const HC_DNS_ERR_NO_SERVER: i32 = 1;   // 文件里没有可用 IPv4 的 nameserver 行
+export const HC_DNS_ERR_ONLY_V6: i32 = 2;     // 只配了 IPv6 的 nameserver
+export const HC_DNS_ERR_TRUNC: i32 = 3;       // 文件比 HC_RESOLV_MAX 还大（读窗口外还有）
+export const HC_DNS_ERR_ENV_BAD: i32 = 4;     // $UYA_AGENT_DNS 的值不像 IP[:端口]
+export const HC_DNS_ERR_OPEN: i32 = 5;        // 打不开解析器文件
+export const HC_DNS_ERR_NXDOMAIN: i32 = 6;    // 查询明确回了「没有这个名字」
+export const HC_DNS_ERR_TIMEOUT: i32 = 7;     // 解析器不答
+export const HC_DNS_ERR_SERVER: i32 = 8;      // 解析器回了错/拒绝/响应坏
+export const HC_DNS_ERR_NET: i32 = 9;         // 到解析器这一跳就不通
+
+export struct HcResolvHit {
+    found: bool,
+    saw_v6: bool,
+    ip: [byte: 4],
+}
+
+var hc_resolv_path: Buf = Buf{ ptr: null, len: 0, cap: 0 };
+var hc_dns_override: Buf = Buf{ ptr: null, len: 0, cap: 0 };
+var hc_dns_server: Buf = Buf{ ptr: null, len: 0, cap: 0 };
+var hc_dns_src_v: i32 = HC_DNS_FROM_NONE;
+var hc_dns_err_v: i32 = HC_DNS_ERR_NONE;
+var hc_resolv_trunc: bool = false;
+var hc_target_buf: [byte: HC_TARGET_MAX] = [0: HC_TARGET_MAX];
+var hc_target_n: usize = 0;
+var hc_target_port: u16 = 0;
+
+// 钉住解析器文件路径（C 串）。空串/null = 恢复默认 /etc/resolv.conf（也算成功）。
+// 由自测用它指向 build/ 下的临时文件；产品路径从不改它。
+export fn hc_resolv_set_path(path: &const byte) bool {
+    buf_free(&hc_resolv_path);
+    hc_resolv_path = Buf{ ptr: null, len: 0, cap: 0 };
+    if (path as usize) == 0 || bufx_cstr_len(path) == 0 {
+        return true;
+    }
+    hc_resolv_path = buf_new(bufx_cstr_len(path) + 8);
+    if !buf_append_cstr_z(&hc_resolv_path, path) {
+        buf_free(&hc_resolv_path);
+        hc_resolv_path = Buf{ ptr: null, len: 0, cap: 0 };
+        return false;
+    }
+    return true;
+}
+
+// 解析器文件路径（C 字符串，`sys_open` 要用；给诊断与 `--print-config` 看的是
+// `hc_resolv_path_ptr/len` 那一对）。
+fn hc_resolv_path_z() &const byte {
+    if hc_resolv_path.len > 0 {
+        return hc_resolv_path.ptr as &const byte;
+    }
+    return HC_RESOLV_PATH;
+}
+
+// 解析器文件路径的切片口：**指针 + 长度**两件套（不是切片 —— 同 `hc_last_leaf_*` 的理由：
+// 定长数组/内部缓冲对外只给指针与长度，免得 codegen 去猜元素类型）。末尾的 NUL 不对外。
+export fn hc_resolv_path_ptr() &const byte {
+    if hc_resolv_path.len > 0 {
+        return hc_resolv_path.ptr as &const byte;
+    }
+    return HC_RESOLV_PATH;
+}
+
+// 解析器文件路径的长度（不含末尾那个 NUL）。
+export fn hc_resolv_path_len() usize {
+    if hc_resolv_path.len > 0 {
+        return hc_resolv_path.len - 1;
+    }
+    return bufx_cstr_len(HC_RESOLV_PATH);
+}
+
+// 钉住「用户显式指定的解析器」（C 串，`a.b.c.d[:port]`）。空 = 没指定。
+// 由 agent 层在启动时读 `$UYA_AGENT_DNS` 钉进来 —— 传输层不认识环境变量，
+// 与 `hc_set_tofu_path` 是同一个分工。
+export fn hc_dns_set_override(z: &const byte) bool {
+    buf_free(&hc_dns_override);
+    hc_dns_override = Buf{ ptr: null, len: 0, cap: 0 };
+    if (z as usize) == 0 || bufx_cstr_len(z) == 0 {
+        return true;
+    }
+    hc_dns_override = buf_new(bufx_cstr_len(z) + 8);
+    if !buf_append_cstr_z(&hc_dns_override, z) {
+        buf_free(&hc_dns_override);
+        hc_dns_override = Buf{ ptr: null, len: 0, cap: 0 };
+        return false;
+    }
+    return true;
+}
+
+// 最近一次解析用的解析器（不含 NUL；没找到时 len = 0）。
+export fn hc_dns_server_ptr() &const byte {
+    return hc_dns_server.ptr as &const byte;
+}
+
+// 最近一次解析用的解析器串长度（与 `hc_dns_server_ptr` 成对）。
+export fn hc_dns_server_len() usize {
+    return hc_dns_server.len;
+}
+
+// 解析器的来源 / 解析失败的原因（两个都是**只读快照**，给诊断与 `--print-config`）。
+// 解析器的**来源**（`HC_DNS_FROM_*`）：env / 解析器文件 / 标准库默认。
+export fn hc_dns_src_now() i32 {
+    return hc_dns_src_v;
+}
+
+// 最近一次解析失败的**原因**（`HC_DNS_ERR_*`），人话在 agent 侧那张表里。
+export fn hc_dns_err_now() i32 {
+    return hc_dns_err_v;
+}
+
+// 最近一次要连的主机名与端口（**指针 + 长度**）。
+//
+// 为什么要复制一份：`Url` 在 `http_request` / `llm_stream_style` 里是**局部变量**，
+// `defer url_free(&u)` 在错误冒到显示层之前就把它释放了 —— 拿 Url 的指针去报错是悬空的
+// （同 `hc_last_leaf_*` 的理由，见踩坑 132 ③）。超长主机名截断：它只用于显示。
+fn hc_target_record(host: &const byte, host_len: usize, port: u16) void {
+    var n: usize = host_len;
+    if n > HC_TARGET_MAX {
+        n = HC_TARGET_MAX;
+    }
+    hc_target_n = n;
+    hc_target_port = port;
+    var i: usize = 0;
+    while i < n {
+        hc_target_buf[i] = host[i];
+        i = i + 1;
+    }
+}
+
+// 最近一次连接目标的主机名（**指针 + 长度**；`hc_target_record` 记下的那份拷贝）。
+export fn hc_target_host_ptr() &const byte {
+    return &hc_target_buf[0];
+}
+
+// 最近一次连接目标的主机名长度。
+export fn hc_target_host_len() usize {
+    return hc_target_n;
+}
+
+// 最近一次连接目标的端口（诊断里 `主机:端口` 的那一半）。
+export fn hc_target_port_now() u16 {
+    return hc_target_port;
+}
+
+// 一个字节是不是空白（空格 / 制表 / CR —— CRLF 行尾的文件也要认；'\n' 是行界，
+// 不在这里，反正行内不会出现）。
+fn hc_resolv_ws(c: byte) bool {
+    return c == (32 as byte) || c == (9 as byte) || c == (13 as byte);
+}
+
+// 一个字节是不是注释起点（resolv.conf 的两种注释都认：`#` 与 `;`）。
+fn hc_resolv_comment(c: byte) bool {
+    return c == (35 as byte) || c == (59 as byte);
+}
+
+// 一个字节是不是「token 到此为止」：空白，或行内注释的起点
+// （`nameserver 1.1.1.1 # 备用` 这种行要取到 IP 为止）。
+fn hc_resolv_token_end(c: byte) bool {
+    return hc_resolv_ws(c) || hc_resolv_comment(c);
+}
+
+// 这一行（从 p 起、到 line_end 止）是不是 `nameserver` 配置项：关键字 10 字节**逐字节**
+// 相等，且**紧跟一个空白**。两个都必须判：
+//   * 不做大小写折叠 —— resolv.conf 的关键字区分大小写，`NameServer` 不是配置项；
+//   * 关键字后面必须真有空白 —— 单看 `starts_with("nameserver")` 会把
+//     `nameserverX 9.9.9.9` 这种行也吃进来（老实现就是这么栽的）。
+fn hc_resolv_kw(text: &[byte], p: usize, line_end: usize) bool {
+    if line_end - p < 11 {
+        return false;
+    }
+    var i: usize = 0;
+    while i < 10 {
+        if text.ptr[p + i] != HC_RESOLV_KW[i] {
+            return false;
+        }
+        i = i + 1;
+    }
+    return hc_resolv_ws(text.ptr[p + 10]);
+}
+
+// 取一个 `nameserver` 的参数：能当 IPv4 就记下来，带 ':' 的当 IPv6 **记账**（但继续
+// 往后找 IPv4 —— 本模块只做 IPv4 传输，v6-only 的机器要能明确报出来，而不是「没配」）。
+fn hc_resolv_take_token(
+    text: &[byte],
+    from: usize,
+    to: usize,
+    hit: &HcResolvHit
+) void {
+    if to <= from {
+        return;
+    }
+    const tok: &[byte] = text[from: to - from];
+    var ip: [byte: 4] = [0: 4];
+    if scan_ipv4(tok.ptr, tok.len, &ip[0]) {
+        if !hit.found {
+            hit.ip[0] = ip[0];
+            hit.ip[1] = ip[1];
+            hit.ip[2] = ip[2];
+            hit.ip[3] = ip[3];
+            hit.found = true;
+        }
+        return;
+    }
+    var i: usize = 0;
+    while i < tok.len {
+        if tok.ptr[i] == (58 as byte) {
+            hit.saw_v6 = true;
+            return;
+        }
+        i = i + 1;
+    }
+}
+
+// 扫一遍 resolv.conf 的**全部文本**，取第一个可用 IPv4 的 `nameserver`。
+//
+// 每一条都是能单独变红的判据（见 selftest 的 `dns-resolv` 轮）：
+//   * 允许行首空白；`#` / `;` 注释行与空行跳过 —— **注释里的
+//     「nameserver 9.9.9.9」是常态**（systemd 那个文件里就有）；
+//   * IPv4 必须是四段十进制（复用 `scan_ipv4`）：`999.1.1.1`、`1.2.3` 一律不算；
+//   * 畸形行跳过而**不中止** —— 它后面那行好行必须还能被找到；
+//   * 认 tab 分隔、CRLF 行尾、末行无换行。
+export fn hc_resolv_scan(text: &[byte]) HcResolvHit {
+    var hit: HcResolvHit = HcResolvHit{
+        found: false, saw_v6: false, ip: [0: 4],
+    };
+    var i: usize = 0;
+    while i < text.len {
+        var line_end: usize = i;
+        while line_end < text.len && text.ptr[line_end] != (10 as byte) {
+            line_end = line_end + 1;
+        }
+        var p: usize = i;
+        while p < line_end && hc_resolv_ws(text.ptr[p]) {
+            p = p + 1;
+        }
+        // 空行（p 到行尾）与注释行都跳过
+        var is_comment: bool = true;
+        if p < line_end {
+            is_comment = hc_resolv_comment(text.ptr[p]);
+        }
+        if !is_comment && hc_resolv_kw(text, p, line_end) {
+            var q: usize = p + 10;
+            while q < line_end && hc_resolv_ws(text.ptr[q]) {
+                q = q + 1;
+            }
+            var e: usize = q;
+            while e < line_end && !hc_resolv_token_end(text.ptr[e]) {
+                e = e + 1;
+            }
+            hc_resolv_take_token(text, q, e, &hit);
+        }
+        i = line_end + 1;
+    }
+    return hit;
+}
+
+// 把解析器文件**整份**读进 out（循环读到 EOF，或读满 out 的容量）。
+// 返回 false = 打不开/没读到字节（原因记进 hc_dns_err_v）；读满容量置 hc_resolv_trunc。
+fn hc_resolv_read(out: &Buf) bool {
+    hc_resolv_trunc = false;
+    const pz: &const byte = hc_resolv_path_z();
+    const fd: i32 = sys_open(pz as *const byte, O_RDONLY as i32, 0) catch {
+        hc_dns_err_set(HC_DNS_ERR_OPEN);
+        return false;
+    };
+    while out.len < out.cap {
+        const room: usize = out.cap - out.len;
+        const got: isize = sys_read(fd, &out.ptr[out.len], room) catch {
+            break;
+        };
+        if got <= 0 {
+            break;
+        }
+        out.len = out.len + (got as usize);
+    }
+    _ = sys_close(fd) catch {};
+    if out.len >= out.cap {
+        hc_resolv_trunc = true;
+    }
+    return out.len > 0;
+}
+
+// `hit` 里那四段 → 点分十进制写进 out（调用方已确认 `hit.found`）。返回 false = 分配失败。
+// 参数收整个 hit 而不是四个 byte：四个 byte 的调用点会顶穿 80 列硬指标（见 §19）。
+fn hc_dns_format(out: &Buf, hit: &const HcResolvHit) bool {
+    if !buf_append_u64(out, hit.ip[0] as u64) {
+        return false;
+    }
+    if !buf_append_byte(out, 46) {
+        return false;
+    }
+    if !buf_append_u64(out, hit.ip[1] as u64) {
+        return false;
+    }
+    if !buf_append_byte(out, 46) {
+        return false;
+    }
+    if !buf_append_u64(out, hit.ip[2] as u64) {
+        return false;
+    }
+    if !buf_append_byte(out, 46) {
+        return false;
+    }
+    return buf_append_u64(out, hit.ip[3] as u64);
+}
+
+// `a.b.c.d[:port]` 是不是一个能喂给 `dns_client_init` 的解析器串。
+// 端口段要么不写，要么是 1..65535 的十进制 —— 其它一律 false（调用方据此报 ENV_BAD，
+// 而不是把垃圾喂下去、再以「没解析器」的形式失败）。
+fn hc_dns_addr_ok(s: &[byte]) bool {
+    if s.len < 7 || s.len > 21 {
+        return false;
+    }
+    var cut: usize = s.len;
+    var i: usize = 0;
+    while i < s.len {
+        if s.ptr[i] == (58 as byte) {
+            cut = i;
+            break;
+        }
+        i = i + 1;
+    }
+    const host: &[byte] = s[0: cut];
+    var ip: [byte: 4] = [0: 4];
+    if !scan_ipv4(host.ptr, host.len, &ip[0]) {
+        return false;
+    }
+    if cut == s.len {
+        return true;
+    }
+    const port: &[byte] = s[cut + 1: s.len - (cut + 1)];
+    if port.len == 0 || port.len > 5 {
+        return false;
+    }
+    var v: usize = 0;
+    var k: usize = 0;
+    while k < port.len {
+        const ch: byte = port.ptr[k];
+        if !is_digit(ch) {
+            return false;
+        }
+        v = v * 10 + ((ch as usize) - 48);
+        k = k + 1;
+    }
+    return v >= 1 && v <= 65535;
+}
+
+// 原因的**优先级**（只有一个坑位，一趟解析里可能撞上好几条，一次只能报一条；
+// 数值大者保留）：
+//   * `$UYA_AGENT_DNS` 的值非法最优先 —— 那是用户**刚写下的东西**，与别的原因叠加时
+//     必须被看见，否则整趟排查都在修另一个问题；
+//   * 其次是「我们没拿到解析器」那四条细节（打不开 > 截断 > 只有 v6 > 没配）：它们的
+//     修法各不相同，而查询阶段的原因多半只是它们的**后果**（没有解析器 ⇒ 标准库那条路
+//     也找不到 ⇒ 报「没找到解析器」，那句话反而指不到真正该改的地方）；
+//   * 查询阶段的原因（no-such-name / 超时 / 拒绝 / 不可达）排最后：它们只在**真拿到
+//     解析器并问了**之后才出现，那时前面四条根本不成立。
+//
+// 这条优先级是**对照实验逼出来的**：把「整份读」退回 512 字节（见 §19 的对照①）时，
+// 断言红在「原因被后面的 TRUNC 覆盖」上 —— 判据没变，是产品的记账顺序错了。
+fn hc_dns_err_rank(err: i32) i32 {
+    if err == HC_DNS_ERR_ENV_BAD {
+        return 6;
+    }
+    if err == HC_DNS_ERR_OPEN {
+        return 5;
+    }
+    if err == HC_DNS_ERR_TRUNC {
+        return 4;
+    }
+    if err == HC_DNS_ERR_ONLY_V6 {
+        return 3;
+    }
+    if err == HC_DNS_ERR_NO_SERVER {
+        return 2;
+    }
+    return 1;   // 查询阶段那四条
+}
+
+// 记一条原因：优先级见 `hc_dns_err_rank`，同级后到者覆盖（同级里后写的更接近现场）。
+fn hc_dns_err_set(err: i32) void {
+    if hc_dns_err_v == HC_DNS_ERR_NONE {
+        hc_dns_err_v = err;
+        return;
+    }
+    if hc_dns_err_rank(err) >= hc_dns_err_rank(hc_dns_err_v) {
+        hc_dns_err_v = err;
+    }
+}
+
+// 选一个解析器写进 res_out（不含 NUL 的 `a.b.c.d[:port]`）。返回 true = 有一个显式的
+// 解析器可以喂给 `dns_client_init`；false = 没有（res_out 空 ⇒ 调用方走标准库的默认路径
+// —— 我们只是**多**找一遍，不抢它的活，找不到时的行为与没有本节时逐字节相同）。
+//
+// 优先级：`$UYA_AGENT_DNS`（用户显式指定）> 解析器文件里的第一个 IPv4 > 标准库默认。
+// 无论走哪条，都把「来源」与「原因」记进 hc_dns_src_v / hc_dns_err_v —— 这两笔账是失败时
+// 那句人话的全部依据（四种原因共用一个错误码，就是踩坑 133 里答案被丢掉的机制）。
+export fn hc_dns_resolve(res_out: &Buf) bool {
+    buf_reset(res_out);
+    buf_reset(&hc_dns_server);
+    hc_dns_src_v = HC_DNS_FROM_NONE;
+    hc_dns_err_v = HC_DNS_ERR_NONE;
+    // ① 显式指定：值非法就记一笔（**不静默**），但继续往下找（下一个来源可能可用）
+    if hc_dns_override.len > 0 {
+        const ov: &[byte] = hc_dns_override.ptr[0: hc_dns_override.len - 1];
+        if hc_dns_addr_ok(ov) {
+            if !buf_append(res_out, ov.ptr, ov.len) {
+                hc_dns_err_v = HC_DNS_ERR_SERVER;
+                return false;
+            }
+            _ = buf_append(&hc_dns_server, ov.ptr, ov.len);
+            hc_dns_src_v = HC_DNS_FROM_ENV;
+            return true;
+        }
+        hc_dns_err_v = HC_DNS_ERR_ENV_BAD;
+    }
+    // ② 解析器文件：整份读，按行扫（**不截断**，见 HC_RESOLV_MAX）
+    var text: Buf = buf_new(HC_RESOLV_MAX);
+    defer { buf_free(&text); }
+    if buf_valid(&text) && hc_resolv_read(&text) {
+        const hit: HcResolvHit = hc_resolv_scan(text.ptr[0: text.len]);
+        if hit.found {
+            if !hc_dns_format(res_out, &hit) {
+                hc_dns_err_v = HC_DNS_ERR_SERVER;
+                return false;
+            }
+            _ = buf_append(&hc_dns_server, res_out.ptr, res_out.len);
+            hc_dns_src_v = HC_DNS_FROM_FILE;
+            return true;
+        }
+        // 读到了、但里面没有可用 IPv4：三种情况分开报（修法各不相同）
+        if hc_resolv_trunc {
+            hc_dns_err_set(HC_DNS_ERR_TRUNC);
+        } else if hit.saw_v6 {
+            hc_dns_err_set(HC_DNS_ERR_ONLY_V6);
+        } else {
+            hc_dns_err_set(HC_DNS_ERR_NO_SERVER);
+        }
+    }
+    // ③ 都没有：交给标准库自己再找一遍（找不到就还是老样子，我们不假装找到过）
+    hc_dns_src_v = HC_DNS_FROM_STDLIB;
+    hc_dns_err_set(HC_DNS_ERR_NO_SERVER);
+    return false;
+}
+
+// 把 `std.net.dns` 的查询失败翻译成「给用户看的」原因（诊断句要用它）。
+fn hc_dns_err_from_query(eid: i32) void {
+    if eid == @error_id(error.DnsNoSuchName) {
+        hc_dns_err_set(HC_DNS_ERR_NXDOMAIN);
+    } else if eid == @error_id(error.DnsTimeout) {
+        hc_dns_err_set(HC_DNS_ERR_TIMEOUT);
+    } else if eid == @error_id(error.DnsNetworkUnreachable) {
+        hc_dns_err_set(HC_DNS_ERR_NET);
+    } else if eid == @error_id(error.DnsNoNameserver) {
+        hc_dns_err_set(HC_DNS_ERR_NO_SERVER);
+    } else if eid == @error_id(error.DnsInvalidName) {
+        hc_dns_err_set(HC_DNS_ERR_NXDOMAIN);
+    } else {
+        hc_dns_err_set(HC_DNS_ERR_SERVER);
+    }
+}
+
+// 发一次 A 查询（`ip` 收 4 字节地址、`ip_len` 收长度）。失败**一律** `HcDnsFailed`，
+// 原因记进 hc_dns_err_v（诊断那句话的依据）。单开一个函数只是为了行宽与「两跳各管一段」。
+fn hc_dns_query_a(
+    ctx: &DnsClient,
+    host: &const byte,
+    host_len: usize,
+    ip: &byte,
+    ip_len: &usize
+) !void {
+    const q: !usize =
+        dns_client_resolve_first_ipv4(ctx, host, host_len, ip, 4, ip_len);
+    const n: usize = q catch |err| {
+        const eid: i32 = (@error_id(err) as! i32).value;
+        hc_dns_err_from_query(eid);
+        return error.HcDnsFailed;
+    };
+    if n != 4 || ip_len[0] != 4 {
+        hc_dns_err_set(HC_DNS_ERR_NXDOMAIN);
+        return error.HcDnsFailed;
+    }
+}
+
+// 名字 → sockaddr：先向 `hc_dns_resolve` 要一个解析器，再让 std.net.dns 发一下查询。
+// 失败**一律** `HcDnsFailed`，原因记进 hc_dns_err_v（诊断那句话的依据）。
+fn hc_resolve_sockaddr(
+    host: &const byte,
+    host_len: usize,
+    port: u16,
+    timeout_ms: u32,
+    addr: &byte
+) !void {
+    var resolver: Buf = buf_new(HC_DNS_SERVER_MAX);
+    defer { buf_free(&resolver); }
+    const explicit: bool = hc_dns_resolve(&resolver);
+    var dns_ctx: DnsClient = DnsClient{
+        nameserver: [0: 16],
+        nameserver_len: 0,
+        nameserver_port: 53,
+        timeout_ms: 5000,
+        query_id: 0,
+        prefer_family: 0,
+    };
+    // 没找到解析器时喂一个**空切片**：`dns_client_init` 于是不动 nameserver，
+    // 查询时走它自己的默认路径（与没有本节时的行为一致）。
+    var empty_resolver: [byte: 0] = [];
+    if explicit {
+        dns_client_init(&dns_ctx, resolver.ptr[0: resolver.len]);
+    } else {
+        dns_client_init(&dns_ctx, &empty_resolver[0: 0]);
+    }
+    var timeout_for_dns: u32 = 5000;
+    if timeout_ms > 0 && timeout_ms < timeout_for_dns {
+        timeout_for_dns = timeout_ms;
+    }
+    dns_client_set_timeout_ms(&dns_ctx, timeout_for_dns);
+    var ipv4: [byte: 4] = [0: 4];
+    var ipv4_len: usize = 0;
+    hc_dns_query_a(&dns_ctx, host, host_len, &ipv4[0], &ipv4_len) catch {
+        return error.HcDnsFailed;
+    };
+    fill_sockaddr_ipv4(ipv4[0], ipv4[1], ipv4[2], ipv4[3], port, addr);
+}
+
+// ============================================================
 // TCP
 // ============================================================
 fn fill_sockaddr_ipv4(a: byte, b: byte, c: byte, d: byte, port: u16, out: &byte) void {
@@ -427,12 +996,16 @@ fn set_sock_timeout(fd: i32, opt: i32, timeout_ms: u32) void {
     _ = sys_setsockopt(fd, SOL_SOCKET, opt, &tv[0] as &void, 16 as u32) catch {};
 }
 
-// DNS + TCP 一步到位：`localhost` 硬编码 127.0.0.1，能 scan_ipv4 就直连，否则走 std.net.dns
-// 解析第一个 IPv4。timeout_ms > 0 时同时设读写超时。失败统一返回 `HcConnectFailed`。
+// DNS + TCP 一步到位：`localhost` 硬编码 127.0.0.1，能 scan_ipv4 就直连，否则先由
+// `hc_dns_resolve` 找解析器（P80：整份读 resolv.conf，见本节上面那一节）再走 std.net.dns。
+// timeout_ms > 0 时同时设读写超时。
+// **名字解析失败返回 `HcDnsFailed`**，socket/connect 失败才是 `HcConnectFailed` ——
+// 这两条路的修法不同（看解析器 vs 看网络），共用一个码就是把答案丢掉（踩坑 133）。
 export fn tcp_connect(host: &const byte, host_len: usize, port: u16, timeout_ms: u32) !i32 {
     var addr: [byte: 16] = [0: 16];
     var ip: [byte: 4] = [0: 4];
     var is_localhost: bool = false;
+    hc_target_record(host, host_len, port);
     if host_len == 9 && eq_ignore_case(host[0: 9], &"localhost"[0: 9]) {
         is_localhost = true;
     }
@@ -441,30 +1014,7 @@ export fn tcp_connect(host: &const byte, host_len: usize, port: u16, timeout_ms:
     } else if scan_ipv4(host, host_len, &ip[0]) {
         fill_sockaddr_ipv4(ip[0], ip[1], ip[2], ip[3], port, &addr[0]);
     } else {
-        var dns_ctx: DnsClient = DnsClient{
-            nameserver: [0: 16],
-            nameserver_len: 0,
-            nameserver_port: 53,
-            timeout_ms: 5000,
-            query_id: 0,
-            prefer_family: 0,
-        };
-        var empty_resolver: [byte: 0] = [];
-        dns_client_init(&dns_ctx, &empty_resolver[0: 0]);
-        var timeout_for_dns: u32 = 5000;
-        if timeout_ms > 0 && timeout_ms < timeout_for_dns {
-            timeout_for_dns = timeout_ms;
-        }
-        dns_client_set_timeout_ms(&dns_ctx, timeout_for_dns);
-        var ipv4: [byte: 4] = [0: 4];
-        var ipv4_len: usize = 0;
-        dns_client_resolve_first_ipv4(&dns_ctx, host, host_len, &ipv4[0], 4, &ipv4_len) catch {
-            return error.HcConnectFailed;
-        };
-        if ipv4_len != 4 {
-            return error.HcConnectFailed;
-        }
-        fill_sockaddr_ipv4(ipv4[0], ipv4[1], ipv4[2], ipv4[3], port, &addr[0]);
+        try hc_resolve_sockaddr(host, host_len, port, timeout_ms, &addr[0]);
     }
     const fd: i32 = sys_socket(AF_INET, SOCK_STREAM, IPPROTO_TCP) catch {
         return error.HcConnectFailed;
@@ -638,8 +1188,11 @@ export fn tls_open(c: &TlsConn, host: &const byte, host_len: usize, verify: i32,
     }
     ssl_set_hostname(ctx, host, host_len);
     ssl_set_peer_identity(ctx, host, host_len, host, host_len);
+    // 握手失败**不再**糊成 `HcConnectFailed`：这一步能走到说明 TCP 已经连上了，
+    // 于是「连不上」与「握手谈崩」是两条不同的修法（看网络 vs 看证书/协议），
+    // 报同一个码等于让人去查错的那一半（踩坑 133）。
     https_client_handshake(c.fd, ctx) catch {
-        return error.HcConnectFailed;
+        return error.HcHandshakeFailed;
     };
     tls_capture_leaf(c);
     tls_compute_observed(c);

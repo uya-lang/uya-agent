@@ -2842,6 +2842,8 @@ responses 用 `{"type":"input_image","detail":"auto","image_url":…}`；
 | httpstream | `HC_PUMP_POLL_MS` | 50 | poll / 泵点粒度（= 「阻塞循环 ≤50 ms 插泵点」那条纪律） |
 | httpstream | `HC_TLS_CHUNK` | 16384 | TLS record 明文上限；每条 record 之后插泵点 |
 | httpc | 响应体上限 | 默认 `262144` | `--max-response` |
+| httpc | `HC_RESOLV_MAX` | 16384 | 解析器文件（resolv.conf）**整份读**的上限；撞上限置 `hc_resolv_trunc` 并报出来，不静默当「没有」（踩坑 133；标准库那边的窗口是 512 字节，正是那条坑） |
+| httpc | `HC_DNS_SERVER_MAX` / `HC_TARGET_MAX` | 64 / 256 | 解析器串（`a.b.c.d[:端口]`）/ 诊断里记的「最近一次连接目标」主机名 |
 | llm | `LLM_MAX_CALLS` | 16 | `calls` 固定数组容量；槽位用尽 `llm_slot` 返回 -1 |
 | llm | `LLM_EVENT_ARENA` | `262144` | 每事件 parse 的 arena；逐事件 reset |
 | llm | `LLM_ERR_HEAD` | 240 | `err_text` 只留坏 payload / 错误体的**头部** |
@@ -4790,6 +4792,55 @@ responses 用 `{"type":"input_image","detail":"auto","image_url":…}`；
      修法是把判据本体摘成不收 TlsConn 的 `tls_tofu_verdict`，自测直接调它。
      与踩坑 121 同族：**判据只要不是产品代码本身，就会在某个时刻只证明「复刻品是对的」**。
 
+133. **名字解析的「读窗口」比文件短 ⇒ 名字永远解不开，而报的是「TLS 校验」**（P80，用户报的：
+     同一条 `uya-agent hi` 在新的那台机器上换成这个症状）。现场与判定过程：
+
+     * **症状**：`./autodl.art; uya-agent hi` ⇒ `error: 请求失败（网络或 TLS 校验）。`（退出码 2）。
+     * **反证三条**（**先证伪「是 TLS」再往下走**，这一步省不得）：① `--probe --tls-verify=none`
+       报 `HcConnectFailed` —— 连握手都没进；② 同一轮的 `strace` 里**一次 `socket` 都没有**，
+       只有 `open("/etc/resolv.conf")` + `read(fd, …, 512)`；③ base-url 换成 IP 直连
+       （`https://101.126.37.23/api/v1`）时同一份代码 TCP + TLS + HTTP 全通，`curl` 同 key 打
+       `/v1/responses` 也是 200。⇒ **是名字解析，不是 TLS**。
+     * **根因**：`std.net.dns` 的 `dns_parse_resolv_conf_first_nameserver` **只读
+       `/etc/resolv.conf` 的前 512 字节**，就在这 512 字节里找 `nameserver`。而本机那份是
+       systemd 的 stub-resolv.conf：**920 字节、`nameserver 127.0.0.53` 在偏移 866** ——
+       正好在窗口之外 ⇒ `DnsNoNameserver` ⇒ 被 `tcp_connect` 糊成 `HcConnectFailed` ⇒
+       顶层那句「网络或 TLS 校验」。静态链接下不能用 `getaddrinfo`（NSS 要 `dlopen`，见 §16），
+       所以这一步只能自己做对。
+     * **和 P78 是同一条线**：P78 修的是「默认档在真实站点上必然 TLS 失败」（TOFU），
+       这台机器上下一个症状就是这条 —— 都是「**读窗口太小，就当文件里没有**」：
+       信任库读前 64 KiB（`DigiCert Global Root G2` 在偏移 75389，见 §18）与这里读前 512 字节
+       是同一个坑的两个实例。判据也一样：**窗口外的东西不会被报出来，只会被当成不存在**。
+
+     **修法**（不改标准库 —— §18 的既定立场：改了它，用户在新机器上 `clone` 本仓仍然坏）：
+     `src/net/httpc.uya` 自己**整份读**解析器文件（`hc_resolv_read`，上限 16 KiB、撞上限置
+     `hc_resolv_trunc` 而**不是**静默当成「没有」），按行扫描摘第一个可用 IPv4 的 `nameserver`
+     （`hc_resolv_scan`，纯函数、离线可测），再把结果喂给 `dns_client_init`；
+     `$UYA_AGENT_DNS`（`a.b.c.d[:端口]`）可以用一个环境变量直接指定解析器，**排障不必改文件、
+     也不必 root**。失败的**口径也分开了**：名字解析失败报 `HcDnsFailed`、TCP 连不上报
+     `HcConnectFailed`、TLS 握手谈崩报新的 `HcHandshakeFailed` —— 以前三种共用一个码，
+     用户只能看到「检查 base-url / 网络」，而真话（没解开名字、换哪台 DNS）就在手上。
+     显示层的档位映射 `agent_net_fail_kind` **两条路共用**：流式与非流式以前各写一份，
+     非流式那份只认 5 个 TLS 码 ⇒ `--no-stream` 下 DNS 失败永远落回那句兜底话。
+
+     **自测**（离线，`dns-resolv` 轮 + `make e2e-dns`）：扫描轮的夹具**特意造出** >512 字节的
+     注释头（并断言 `ns_off > 512`，判据的形状钉在断言里），真文件轮写一份同样形状的临时
+     `resolv.conf`、把路径钉进去、断言产品给出的解析器串**逐字节**是 `127.0.0.53`；
+     `e2e-dns` 用假 DNS（`testdata/mock_dns.py`）+ `.invalid` 域名（RFC 2606 保留域，
+     **真解析器必然解不出来** ⇒ 跑绿只可能来自自家解析器）跑通一轮，再用一个没人听的端口
+     验「DNS 失败必须说成人话、且不许提 TLS」（流式与非流式各一条腿）。
+     **防假绿对照两处（都真做过）**：
+     ① 把整份读退回 `buf_new(512)`（老口径）⇒ **真文件轮 4 条红**（「临时文件里有 nameserver
+     却说没有」等）。注意**扫描轮那两条不红** —— 它们直接喂文本、不走读文件，这正是
+     「回归腿要打在**接线**上，不是打在纯函数上」的现场：纯函数对、接线错，一样是坏。
+     这条对照还顺带红了覆盖轮的 2 条断言，翻出来产品里一个真问题：**原因记账没有优先级** ——
+     读窗口一变，`TRUNC` 就把「`$UYA_AGENT_DNS` 值非法」覆盖掉了。判据没变，是记账顺序错了
+     （见 `hc_dns_err_rank`）。
+     ② 把关键字匹配改回「老实现那类写法」（在**整行**里按前缀找 `nameserver`、参数取它后面
+     那个 token、不认注释）⇒ **扫描轮 3 条红**（注释行被当真 / `nameserverX` 被当真 /
+     `;` 注释与 tab 分隔没被认）。⇒ 两条对照都落在**不同**的段上，说明判据不是同一件事
+     的数次复述。
+
 ---
 
 ## 17. 工具实现要点
@@ -4939,6 +4990,14 @@ DEEPSEEK_API_KEY=sk-xxx ./build/uya-agent \
 「检查 base-url / 网络」。观测到的 leaf 指纹从 `hc_last_leaf_ptr()` 取 —— 流式路径**拿不到
 `TlsConn`**（`llm_stream_style` 里那个是它的局部变量），旧代码因此在这条最需要指纹的路上
 把指纹丢掉了（踩坑 132）。
+
+**「连不上」的口径从 P80 起再分三档**（踩坑 133）：`HcDnsFailed`（名字没解开 —— 看解析器
+与 `$UYA_AGENT_DNS`）、`HcConnectFailed`（TCP 没连上 —— 看网络/代理/端口）、
+`HcHandshakeFailed`（TCP 已连上、握手谈崩 —— 看证书/中间设备）。这一档与上面那四档
+**不是同一件事**：前者是「信任判定不通过」（连接已经建立，是我们拒了它），
+后者是「连接压根没建立」。两族共用一个出口 `agent_net_fail_report(cfg, kind)`
+（`kind` 6/7/8 是新三档），第一行话术也分开了，所以 `uya-agent hi` 在 DNS 坏掉的机器上
+**不会再假装是 TLS 问题** —— 那正是这次用户看到的那句谎话。
 
 > 后续可做的（本项目**没做**）：给 `lib/tls` 补一条真正的链构建（用 issuer/签名关系从 leaf 走到
 > 信任锚、支持 SHA-384）、把 `MPI_MAX_LIMBS` 提到 RSA-2048 需要的大小、把信任库改成读全文件、
@@ -5102,6 +5161,8 @@ DEEPSEEK_API_KEY=sk-xxx ./build/uya-agent \
 | `web-childcfg` | P73：会话子进程的环境继承（踩坑 124 ②）。走**生产代码** `web_child_env`，判据看它排好的**环境数组**（`sh_env_array()`，不是 `getenv` —— 那读的是本进程真环境、看不见刚排好的表）：① 父进程给了非默认值时，14 条（权限/沙箱/端点/模型/凭据/档位/信任策略/指纹/工作区/home/max-steps/no-title/no-mouse/no-mcp）**逐条同名同值**；② 父进程没给（出厂默认）时那几条**不许注入**（否则把默认值钉死、挡住子进程读 `settings.yaml`）；③ `UYA_AGENT_WEB` 恒为 0（漏了它子进程递归起 web，踩坑 103）。**权限排第一**：它曾经被悄悄放宽成 `Full access`。防假绿对照：把 `web_child_env_cfg(cfg)` 换成 `_ = cfg;` 重编 ⇒ 当场红 10 条 |
 | `tls-pin` / `tls-tofu` | P78 信任档位（踩坑 132，离线、不联网、不需要证书）：`tls-pin` 段验指纹库的纯函数 —— 两行好行 + `#` 注释 + 空行解析出 2 条、主机名与指纹**两侧**大小写折叠、4 行畸形（hex 过短/过长/非 hex/只有主机名）一律跳过而**不中止**（后面那行好行必须还在）、CRLF 行尾与末行无换行都认、同一主机多条指纹命中任意一条、追加行必须是 `<host> <小写 hex>\n`、空库什么都不信、长度不是 64 的查询一律不认；`tls-tofu` 段起**真的临时目录 + 真的文件**走闭环 —— 首次 `FRESH` 且那一行**真的落盘了**、二次 `TRUSTED`、指纹变了 `MISMATCH`、另一台主机照样 `FRESH` 且**不覆盖**第一台的记录。防假绿对照两处：把 `tp_trusts` 改成忽略指纹比对 ⇒ 红 3 条；把 `tls_tofu_verdict` 里「首次落盘」那行删掉 ⇒ 红 5 条 |
 | `e2e-portable` | `make e2e-portable`（P73，踩坑 124）：把 `build/uya-agent` **拷到一个空目录**、`HOME` 也是空目录、**没有 DSH、没有仓库**（真新机器的样子），只带一个二进制。① 内嵌 preset 兜底：`--print-config` 报 `knobs (source: embedded)` 且旋钮值 == 内置缺省（逐字节）；跑一轮 `--plan` ⇒ 假网关收到的请求里必须有 `Make the plan decision-complete`（**该串只存在于上游 preset**，工作树与编译器树 0 命中 ⇒ 判据不可能假绿）；② **反向断言**：`--dsh-root testdata/preset-root` 时必须是 `source: preset` + `readLimit=1777`（内嵌不许夺磁盘的权）；③ web 会话子进程：只走命令行给 `--base-url/--model/--permission read-only/--agent-home`，断言假网关**收到**请求、请求里的模型是父进程给的那个、会话日志落在 `--agent-home` 下；④ `--no-dsh-config` 这类没有 env 口径的开关必须被启动日志点名。防假绿对照（两条都做过）：把内嵌兜底改成恒 `false` ⇒ 红在①；只停 plan 段的抽取（来源/旋钮照旧）⇒ 红在「plan 策略段缺失」；摘掉 `web_child_env_cfg(cfg)` ⇒ 红在③ |
+| `dns-resolv` | P80 名字解析（踩坑 133，离线、不联网、不需要证书）：**四段**。① 纯扫描：夹具**特意造出** >512 字节的注释头（并断言 `ns_off > 512`，把「现场的形状」钉进断言）——老实现只读前 512 字节 ⇒ 判成「文件里没有 nameserver」；另加注释行/`;` 注释/`nameserverX`/关键字后必须空白/行尾注释/tab/CRLF/末行无换行/先 v6 后 v4/只有 v6/畸形行不中止/空与纯注释；② 真文件闭环：写一份同形状的临时 `resolv.conf`、把路径钉进去 ⇒ 解析器串**逐字节** `127.0.0.53`、来源 = 文件、删掉文件后**不再**声称来自文件（原因 = 打不开）；③ 覆盖：`$UYA_AGENT_DNS` 合法值优先、非法值**不采用**且记 `ENV_BAD`、端口越界同判、清掉后不报 env。**防假绿对照两处（都真做过）**：① 把整份读退回 `buf_new(512)` ⇒ **真文件轮 4 条红**（扫描轮那两条**不红** —— 纯函数对、接线错也算坏，所以回归腿必须打在读文件那一层）；这条对照顺带抓出产品里一个真缺陷：原因记账没有优先级，`TRUNC` 会盖掉「变量值非法」（修成 `hc_dns_err_rank`）。② 关键字改回「整行按前缀找 + 参数取下一个 token」⇒ 扫描轮 3 条红 |
+| `e2e-dns` | `make e2e-dns`（P80，踩坑 133，离线，全程只打 127.0.0.1）：假 DNS（`testdata/mock_dns.py`）+ 假网关 + `.invalid` 域名（**RFC 2606 保留域，真解析器必然解不出来** ⇒ 跑绿只可能来自自家解析器）。① 正腿：`UYA_AGENT_DNS` 指向假 DNS ⇒ 退出 0、答复上屏、网关真收到；①b 同一条在 responses 协议上；②③ 反腿：解析器换成一个没人听的端口 ⇒ 退出 2、「域名解析失败」、给出 `UYA_AGENT_DNS` 这条路，**且 stderr 里不许出现 TLS**（流式与非流式各一条腿 —— 两条路的档位映射以前是各写一份的）；④ `--print-config` 的 `dns = … (source: …)` 两种来源各验一条 |
 | `tui-full` | P53 浮层全屏四组：**A** 非全屏仍是居中框（不顶格、`≤16` 行上限、第 30 项看不见）→ 全屏框 = 转录区（顶边第 0 行、左右边框 0 与 `cols-1`、标题 ` · 全屏`、行偏移表口径的逐行闭合、底边**正好**在 `panel_top-1`）+ 16 行上限解除（第 20 项可见、第 30 项仍不可见）；**B** `ctrl+f`（`0x06`）与 `F11`（`ESC[23~`）都切换，且**四种形态各认一次**（列表 / reader / ask / input）；**C** 不吃面板 / 状态区 / 脚注；**D** 没浮层时只落 notice、全屏态不跨浮层残留、`esc` 关掉后转录回来，终端太矮时 fail-closed 判据不变；**F** `/fullscreen` 四态（裸报状态 / `on` / `off` / 非法值只报错且状态不动、重复 `off` 幂等） |
 | `overlay-fullscreen` | `make p30-check` 第 9 场（真终端 + 假网关）：屏幕几何判据 —— 非全屏顶边 > 0 行且左边框 > 0 列 → `ctrl+f` 后顶边第 0 行、左右边框正好 `0` 与 `cols-1`、标题带 ` · 全屏`、面板与脚注都还在、底边行 < 面板行 → `F11` 关回居中 → 再全屏、`esc` 关掉后方框消失 |
 | `tasks-ctrl-t` | `make p30-check` 第 10 场（踩坑 114，真终端 + 假网关 `todo_first=1`）：回合**运行中**按 `ctrl+t` → `┌─ tasks ` ≤1.5 s 上屏**且那一刻 `SELFTEST_OK` 还没到** → 再按一次收回折叠行（实测 101 ms） |
