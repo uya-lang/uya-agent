@@ -2833,6 +2833,34 @@ var r: UiBackend = g_reg[0];
 | `dlopen` 式运行时加载后端 | `make link-audit` 钉死真静态链接（无 `PTE_INTERP` / 无 `NEEDED`）。本仓的「插件」= **编译期注册 + 运行期接口选择** |
 | 用 `src/cshim/*.h` 定义 C 函数指针 typedef 绕开接口 | 要写 C（违反 §1.1 目标 1），且给所有后端开一个 C ABI 面 |
 | 把 `web` 现有的 PTY + `ttyemu` 路线一起换掉 | 会碰掉 `web-emu` 轮的「解释器网格 == `tui_screen_text()` 逐行相同」这条同源判据 —— 必须独立一轮决策（P81 候选） |
+
+#### 11.9.6 通往「DSH webui」的剩余工作（路线图，实测过的约束）
+
+目标形态：**不改 DSH 的 webui**，让 DSH 的浏览器前端（`@deepseek-ai/dsh-web-frontend/dist`，
+4.6 MiB / 89 文件）吃**本仓**的事实流。已验证 DSH 自己留了三个正式接缝
+（静态 dist、`webserver/index-inject` 注入表、`__DSH_TRANSPORT__` 页全局），所以这是
+「当它的宿主」而不是给它打补丁。
+
+| 步 | 内容 | 关键约束（实测） |
+|---|---|---|
+| ① **形状适配层** | 本仓日志 → DSH 的 `SessionEvent` | DSH 浏览器按 `surfaceOp` 判「这条进不进对话面」：**`user/message` / `assistant/message` / `tool/result` 缺它就不渲染**（三条都缺 ⇒ 界面上一条消息都没有，且**没有报错**）。本仓今天**不写** `surfaceOp`、不写 `message.id`，`assistant.message.content` 是**字符串**而 DSH 要 `ContentBlock[]`、`tool/result` 是扁平 `content`+`callId` 而 DSH 要 `message.content[0].tool-result`。**所以适配层不可省**（这也是本轮 `be_events` 选「结构事实」而不是「终端字节」的理由：适配点天然落在后端里） |
+| ② `/api` unary + WS 下行 | DSH 浏览器认 52 个方法（最小可聊天集约 28 个）+ 两条**必须**是 WebSocket 的下行（普通 GET 返 426，**没有 SSE 回落**）。好消息：两条下行**只发不收**，所以纯 Uya 只要握手 + 不掩码的 text 帧编码（`sha1_digest` / `encode_base64` 标准库都有；`std/http/websocket_*.uya` 也在，但它拖 `tls.https`，建议自己写薄的一份） |
+| ③ dist 静态服务 + 注入 | 只读服务 DSH 的 dist；**复刻 `bootInjections()`**：内联 queue 脚本 + 两个 parser-blocking preload + `window.__DSH_BOOT__` 全局，插在 `<head>` 开标签之后 |
+| ④ 会话模型 | DSH 线协议要「同进程多会话 + 实时事件流」，而本仓 `--web` 今天是「每会话一个真 PTY 子进程 + 服务端解释器网格」。**这是最大的架构分歧**（不是代码量问题） |
+
+两个已知的硬约束，动手前必须先解决：
+
+| 约束 | 实测 | 影响 |
+|---|---|---|
+| `SRV_REQ_MAX = 8192`（**头 + 体总量**）且不支持 chunked 请求体 | `net/httpsrv.uya` | DSH 的 `session.prompt` 允许 300 MiB 体（内联图片 base64）⇒ **不改就是「发一张图就 413」** |
+| DSH wire **没有协议版本字段** | `host.describe` 里没有（DSH 自己的已知限制） | 版本耦合是**结构性**的，只能靠「阶段 0 探针 + 回归轮」兜住，不能靠协商 |
+
+**建议的下一步（可证伪、且便宜）**：先用 Node 起一个最小宿主只实现
+`host.describe` + `session.list` + `session.history` + 两条下行，喂**一份经形状适配的
+本仓会话日志**，用真浏览器验四件事：① DSH shell 起得来吗；② 最小 roster（14 个 client 包
+的 inject 闭包）全 active 吗（DSH 的 shell 是**全有或全无**：任一 entry pending/failed 就
+整页 `page.fail()`）；③ 侧栏列得出本仓会话吗；④ **一条 user/assistant/tool 消息渲染得出
+卡片吗**。任一条不过就停手改自研路线 —— 后面每一步都建立在它上面。
 | 给每个模块都套一层接口 | 接口是重手段（一次间接调用 + 一份 vtable）。只在「按运行期取值选实现」的接缝上用 |
 
 ---
