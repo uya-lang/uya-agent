@@ -2926,6 +2926,42 @@ var r: UiBackend = g_reg[0];
 > 两者的夹具来源不同（手写 vs 产品输出），所以能各自抓到对方抓不到的缺陷
 > （第五批的教训③就是这个道理）。
 
+**第八批：宿主进了产品（`src/web/whost.uya`，`--dsh-web`）** —— 上面那两条是 python
+探针证的；这一批把同一套东西**搬进产品二进制**，于是「不改 DSH 的 webui」不再只是
+一个可行性结论，而是**本仓的一个运行形态**：
+
+```
+./build/uya-agent --dsh-web 127.0.0.1:8790
+[dsh-web] DSH 前端（只读它的 dist，不改一个字节）：http://127.0.0.1:8790/ （ctrl+c 退出）
+```
+
+一条命令自证：`make dsh-web-check`（起产品二进制 + headless chromium + CDP 断言；
+没装 DSH / 没 chromium 时**跳过**）。实测**连续 6/6 通过**。
+
+产品宿主做了四件事（与探针一一对应，但都不是 python 了）：
+只读服务 DSH 那份 `dist`；复刻 `bootInjections()`（内联 queue 脚本 + 两个
+parser-blocking preload + `window.__DSH_BOOT__`）；按最小 roster 服务
+`/plugins/<id>/client.js`；`/api` 接 `web/wsess.uya` 的译文（两条下行是真 WebSocket）。
+
+**搬进产品才暴露出来的六个坑**（探针那份是 python，单线程模型不同，所以这些
+**只有真产品跑起来才会遇到**；每个都记在这里，因为它们的症状都**离原因很远**）：
+
+| # | 坑 | 症状 | 根因 |
+|---|---|---|---|
+| 1 | **C 串语义**：`sys_open` 要 NUL 结尾，而 `buf_append_cstr` 只按长度追加 | 「路径明明对，却打不开」；roster 里**前 3 个包 ok、其余 11 个 FAIL**（新分配的缓冲恰好是零页就成功） | 忘了补 NUL。三处（bundle 路径 / index 路径 / 事件源路径） |
+| 2 | **`dist` + `rel` 之间少一个 `/`** | 拼出 `distfavicon.svg`，而症状是「文件明明在、`/assets/*` 全 404」 | 拼路径时只去掉了开头的 `/`，没补分隔符 |
+| 3 | **不要「按文本回搜结构」** | 在 entries 的 JSON 文本里搜 `{"id":"<pkg>","url":"…` 恒回 -1（同样的文本、同样的子串，纯函数轮却过） | 改成**装 entries 时顺手攒** preload 片段，彻底绕开搜索 —— 那本来也是脆的（JSON 一改格式就断） |
+| 4 | **`if` 表达式赋 `const` 会生成坏 C** | 编译期过、`cc` 报 `assignment of read-only variable __uya_ifexpr_N` | 本仓已知形态（第五批踩过）；改 `var` + `if` |
+| 5 | **非阻塞 fd 上 `read < 0` 不是断开** | `[web-runtime] connection lost` 反复重连、shell 卡在最早两步 | `srv_accept_nb` 设了 `O_NONBLOCK`：`-1` 常常只是 EAGAIN。要回「再等等」而不是掐连接 |
+| 6 | **单线程里同步写 450KB 会饿死下行** | 同上（也是「连接丢失」），且**间歇**发生 —— 最难查的一类假红 | 一个 bundle 450KB、14 个约 3MB。分块写 + 每圈只处理一个就绪者，poll 间隔就回到毫秒级 |
+
+还有两条是**判据**层面的（`dwh_rpc_err` 用 `bufx_cstr_len` 读一个没 NUL 的缓冲 ⇒
+错误消息里混进了 HTTP 响应头；`host.describe` 给 `/` ⇒ shell 只发 2 个 API 就停）。
+
+**为什么值得记**：六个坑里 **5 个的症状都是「页面空着 / 连接丢失」**，而原因分别在
+字符串长度、路径拼接、文本搜索、codegen、fd 语义、调度上。它们**没有一个**能在
+`make check`（类型检查）里被抓住 —— 能抓住它们的是「真起一个浏览器、读它的控制台」。
+
 **下一步**：把 `/api` 的最小面从 6 个方法扩到「最小可聊天集」（约 28 个，见本节上表），
 `session.prompt` 先接成一个「写进 `agent/inbox` 让真 agent 跑」的回路。**这一步开始就要
 动 `SRV_REQ_MAX`**（8192 是「头+体」总量，发一张图就 413）。

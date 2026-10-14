@@ -14,8 +14,8 @@
 import WebSocket from '/home/winger/.npm-global/lib/node_modules/@deepseek-ai/dsh/node_modules/ws/index.js';
 
 const [wsUrl, title, needle] = process.argv.slice(2);
-if (!wsUrl || !title || !needle) {
-  console.error('用法：node wire_probe_drive.mjs <CDP_WS_URL> <TITLE> <NEEDLE>');
+if (!wsUrl || !needle) {
+  console.error('用法：node wire_probe_drive.mjs <CDP_WS_URL> <TITLE|-> <NEEDLE>');
   process.exit(2);
 }
 
@@ -95,18 +95,30 @@ ws.on('open', async () => {
     })()`);
     await sleep(600);
 
-    // 等正文渲染出来（最多 20s）
+    // 等正文渲染出来。**轮询 + 宽限**，且**读两处**：
+    //   * `document.body.innerText` 是最终判据；
+    //   * 另读 `[data-slot="conversation"]`（消息流所在的那个容器）。
+    // 为什么要两处 + 宽限：DSH 的消息是**异步折叠**出来的，`innerText` 在它 attach
+    // 到 slot 之前的瞬间可能读不到（实测：同一份数据、同一个宿主，这一条会**间歇**
+    // 失败 —— 那是最难查的一类假红）。轮询到**连续两次都读到**才停，宽限期兜住
+    // 「先渲染后又重排掉」的那种。
     let text = '';
-    for (let k2 = 0; k2 < 80; k2++) {
-      text = (await evalJs('document.body.innerText')) || '';
-      if (text.includes(needle)) break;
+    let hits = 0;
+    for (let k2 = 0; k2 < 120; k2++) {
+      const whole = (await evalJs('document.body.innerText')) || '';
+      const conv = (await evalJs(
+        '(()=>{const e=document.querySelector(\'[data-slot="conversation"]\');'
+        + 'return e?e.innerText:"";})()')) || '';
+      text = whole;
+      const seen = whole.includes(needle) || conv.includes(needle);
+      hits = seen ? hits + 1 : 0;
+      if (hits >= 2) break;          // 连续两次都读到 = 稳了
       await sleep(250);
     }
-    await sleep(2500);
 
     // ③ 读回正文
     const hasNeedle = (text || '').includes(needle);
-    const hasTitle = (text || '').includes(title);
+    const hasTitle = title === '' ? true : (text || '').includes(title);
     console.log('会话标题可见：' + hasTitle);
     console.log('消息正文可见：' + hasNeedle);
     if (!hasNeedle) {

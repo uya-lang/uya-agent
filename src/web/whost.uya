@@ -1,0 +1,1948 @@
+// src/web/whost.uya — DSH 前端的**产品侧宿主**：静态资源 + 启动注入 + 最小 `/api`
+//
+// 本文件：把「阶段 0 探针证成的那套东西」从 Python 搬进产品 —— 只读服务 DSH 自己那份
+//   `dsh-web-frontend/dist`、复刻它的 `bootInjections()`（内联 queue 脚本 + 两个
+//   parser-blocking preload + `window.__DSH_BOOT__`）、按最小 roster 服务
+//   `/plugins/<id>/client.js`、并把 `/api/*` 接到 `web/wsess.uya` 的译文上。
+// 不变量：① **一个字节都不改 DSH 的 dist**（`make link-audit` 那套纪律的延伸：我们
+//   只读它、只服务它）；② **`/api` 的载体错与业务错分开**：HTTP 状态只表示载体
+//   （404 未知路径 / 415 非 JSON / 400 非 JSON 体），未实现的方法回 **200 +
+//   `RpcResult.error`** —— 客户端据此把那个面当「不支持」而不是「连接坏了」；
+//   ③ **两条下行是真 WebSocket 且只发不收**（普通 GET 要回 426）：握手要 SHA-1 +
+//   base64，帧编码只要「服务端→客户端、不掩码、text」这一种；
+//   ④ **`session.create` 不能少**：实测 shell 的流程是「先 create 再画」，少了它页面
+//   只剩 hero 空态、而**代码零报错**（唯一线索在浏览器控制台）；
+//   ⑤ 本文件不许认识 `Config` / `g_sess`（它只做 HTTP 与 JSON，不碰执行核）。
+// 依赖：libc（syscall/unistd/fcntl：socket/poll/read/write/close）、std.crypto.sha1、
+//   std.encoding.base64、foundation/bufx、foundation/jsonx、net/httpsrv（`srv_*`）、
+//   web/wsess（`dwire_*` 的译文）。
+// 命名：对外 `dwh_*`（start / step / stop）+ 常量 `DWH_*`；类型 `DwhHost` / `DwhConn`。
+//
+// 行宽豁免：本文件里成片的**不可断 JSON 骨架字面量**与**DSH 的注入脚本**（内联 queue
+// 脚本那一句 600+ 字符）—— 在中间换行会把 JSON/JS 拆坏，而它们要逐字节正确
+// （`bootInjections` 的产物是协议的一部分，不是排版）。其余行一律 ≤80。
+//
+// 为什么它不直接用 net/httpsrv 的 `srv_recv_request`：那一条**只认 `Content-Length`**、
+// 且整份请求（头+体）不得超过 `SRV_REQ_MAX`（8192）—— 对 `/api` 的 JSON 体够用，
+// 但**Upgrade 请求不能用它**（那是一个没有 body、之后连接要改成帧流的请求）。
+// 所以本文件自己收头（`dwh_read_head`），把「普通请求」与「升级请求」在收到头之后分开。
+//
+// **已实现的最小面**（够让 DSH 的 shell 起来、把一份会话画出来）：
+//   GET  /                        index.html（注入后）
+//   GET  /assets/* /favicon.svg … 真 dist 里的静态文件
+//   GET  /plugins/<id>/client.js  该 client 包的 bundle（+ `.map`）
+//   POST /api/<method>            host.describe / session.create / session.list /
+//                                 session.history / session.models / workspace.list
+//   GET  /api/events.mux          下行：会话事件（WebSocket）
+//   GET  /api/events.host         下行：宿主帧（WebSocket）
+// 其余方法一律回 200 + `internal` 业务错（如实说「没实现」，而不是假装成功）。
+
+use libc.syscall;
+use libc.unistd;
+use libc.fcntl;
+use std.crypto.sha1.sha1_digest;
+use std.encoding.base64.encode_base64;
+use std.encoding.base64.decode_base64;
+use std.json.parser.parse;
+use std.json.value.JsonValue;
+use std.json.value.JsonStrView;
+use std.json.encoder.JsonWriter;
+use std.mem.arena.Arena;
+use std.mem.arena.arena_init;
+use std.mem.arena.arena_reset;
+use std.mem.arena.arena_alloc;
+
+// 连接上限（一个页面要 1 个长连接 + 若干短连接；32 够用且是显式边界）。
+export const DWH_MAX_CONNS: usize = 32;
+// 一次 poll 的等待上限（与全仓其它阻塞循环的 ≤50ms 泵点纪律同口径）。
+const DWH_POLL_MS: i32 = 50;
+// 请求头上限（`/api` 的体单独按 Content-Length 收，不受这个数限制）。
+const DWH_HEAD_MAX: usize = 16384;
+// `bootInjections()` 里那两个 parser-blocking preload 的顺序（**顺序即语义**）。
+const DWH_PRELOAD: [&const byte: 2] = [
+    "@deepseek-ai/dsh-client-modules" as &const byte,
+    "@deepseek-ai/dsh-client-runtime" as &const byte,
+];
+
+// 一条连接的阶段。
+const DWH_C_HEAD: u8 = 0;      // 正在收请求头
+const DWH_C_WS: u8 = 1;        // 已升级成 WebSocket 下行（只发不收）
+const DWH_C_DONE: u8 = 2;      // 已响应，等收尾
+
+export struct DwhConn {
+    fd: i32,
+    st: u8,
+    rx: Buf,            // 已收到的字节（收头用）
+    is_mux: bool,       // WS：是 mux 还是 host 下行
+    sent: bool,         // WS：基线帧发过没有
+}
+
+// 宿主状态：监听 fd、dist 根、最小 roster 的包名（逗号分隔的成品串）。
+export struct DwhHost {
+    lfd: i32,
+    dist: Buf,          // `<dsh 根>/node_modules/@deepseek-ai/dsh-web-frontend/dist`
+    root: Buf,          // DSH 根（`node_modules` 的父目录）
+    entries: Buf,       // 已解析好的 `{"rev":…,"entries":[…]}`（boot 图）
+    events: Buf,        // 会话事件的译文（每行一条，喂 mux 下行用）
+    conns: [DwhConn: DWH_MAX_CONNS],
+    n: usize,
+    // 一次泵里「已经干了活、该回 poll 了」的标记（见 `dwh_poll_once`）。
+    stop_round: bool,
+}
+
+// ============================================================
+// 小工具
+// ============================================================
+
+// 路径存在吗（`stat` 到就真）。
+fn dwh_exists(p: &const byte) bool {
+    const fd: i32 = sys_open(p as *const byte, 0, 0) catch { -1; };
+    if fd < 0 {
+        return false;
+    }
+    _ = sys_close(fd) catch {};
+    return true;
+}
+
+// 读一整个文件进 out（上限 `limit`）。失败返回 false（out 内容无意义）。
+fn dwh_read_file(path: &const byte, out: &Buf, limit: usize) bool {
+    const fd: i32 = sys_open(path as *const byte, 0, 0) catch {
+        return false;
+    };
+    defer { _ = sys_close(fd) catch {}; }
+    buf_reset(out);
+    var tmp: [byte: 32768] = [0: 32768];
+    while true {
+        const n: isize = sys_read(fd, &tmp[0], 32768) catch { 0 as isize; };
+        if n <= 0 {
+            break;
+        }
+        if out.len + (n as usize) > limit {
+            return false;      // 超限：宁可失败也不截断（截断的 JS/CSS 会更难查）
+        }
+        if !buf_append(out, &tmp[0], n as usize) {
+            return false;
+        }
+    }
+    return out.len > 0;
+}
+
+// 找 DSH 的安装根（与 `prompt.uya` 的 `preset_path` 同一套「常见位置」口径）。
+// 判据是「那份 dist 在不在」—— 在就说明这个根能用。
+fn dwh_find_root(out: &Buf) bool {
+    buf_reset(out);
+    const env: &byte = getenv("UYA_AGENT_DSH_ROOT" as &const byte);
+    if (env as usize) != 0 && bufx_cstr_len(env) > 0 {
+        if !buf_append_cstr(out, env) {
+            return false;
+        }
+        return dwh_dist_ok(out);
+    }
+    const home: &byte = getenv("HOME" as &const byte);
+    if (home as usize) == 0 {
+        return false;
+    }
+    var cand: Buf = buf_new(1024);
+    defer { buf_free(&cand); }
+    _ = buf_append_cstr(&cand, home);
+    _ = buf_append_cstr(&cand, "/.npm-global/lib/node_modules/@deepseek-ai/dsh");
+    if dwh_dist_ok(&cand) {
+        return buf_append(out, cand.ptr as &const byte, cand.len);
+    }
+    buf_reset(&cand);
+    _ = buf_append_cstr(&cand, home);
+    _ = buf_append_cstr(&cand, "/.local/lib/node_modules/@deepseek-ai/dsh");
+    if dwh_dist_ok(&cand) {
+        return buf_append(out, cand.ptr as &const byte, cand.len);
+    }
+    return false;
+}
+
+// 这个根里的 dist 在不在（拼出 index.html 判存在）。
+fn dwh_dist_ok(root: &const Buf) bool {
+    var p: Buf = buf_new(1200);
+    defer { buf_free(&p); }
+    if !buf_append(&p, root.ptr as &const byte, root.len) {
+        return false;
+    }
+    _ = buf_append_cstr(&p, "/node_modules/@deepseek-ai/dsh-web-frontend/dist/index.html");
+    _ = buf_append_byte(&p, 0);
+    return dwh_exists(p.ptr as &const byte);
+}
+
+// 一个 client 包的 `lib/client.js` 路径（`exports["./client"]` 在 DSH 里恒为这个位置）。
+fn dwh_client_path(root: &const Buf, pkg: &const byte, n: usize, out: &Buf) bool {
+    buf_reset(out);
+    if !buf_append(&out[0], root.ptr as &const byte, root.len) {
+        return false;
+    }
+    if !buf_append_cstr(&out[0], "/node_modules/") {
+        return false;
+    }
+    if !buf_append(&out[0], pkg, n) {
+        return false;
+    }
+    if !buf_append_cstr(&out[0], "/lib/client.js") {
+        return false;
+    }
+    // ⚠ **NUL 结尾**：这个路径每个调用方都直接喂给 `sys_open`（C 串语义），而
+    // `buf_append_cstr` 只按长度追加、不补 NUL。漏了它，`sys_open` 会读到缓冲区
+    // 后面的字节 —— 症状极其难查：**头几个包成功、后面全失败**（新建的缓冲恰好是
+    // 零页就成功，复用/扩容过的就不是了；实测 roster 里前 3 个 ok、其余 11 个 FAIL）。
+    return buf_append_byte(&out[0], 0);
+}
+
+// 12 位十六进制的小哈希（DSH 用 sha1 前 12 位做 bundle rev 与 cache-busting）。
+// 这里只要求「内容变了 rev 就变」，所以用 sha1 的前 6 字节转 hex。
+fn dwh_rev_of(p: &const byte, n: usize, out: &Buf) bool {
+    var d: [byte: 20] = [0: 20];
+    sha1_digest(p[0: n], d[0: 20]);
+    buf_reset(out);
+    const hex: &[byte] = &"0123456789abcdef"[0: 16];
+    var i: usize = 0;
+    while i < 6 {
+        const b: byte = d[i];
+        if !buf_append_byte(out, hex[((b as i32) >> 4) as usize]) {
+            return false;
+        }
+        if !buf_append_byte(out, hex[((b as i32) & 15) as usize]) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+// ============================================================
+// boot 图（最小 roster）
+// ============================================================
+
+// 最小 roster：14 个包（inject 闭包，见 DESIGN §11.9.6）。少一个，DSH 的 shell 会
+// 「全有或全无」地整页 fail，所以这份表是**契约**而不是建议。
+const DWH_ROSTER: [&const byte: 14] = [
+    "@deepseek-ai/dsh-api-gateway" as &const byte,
+    "@deepseek-ai/dsh-api-remotes" as &const byte,
+    "@deepseek-ai/dsh-client-connection" as &const byte,
+    "@deepseek-ai/dsh-client-locale" as &const byte,
+    "@deepseek-ai/dsh-client-modules" as &const byte,
+    "@deepseek-ai/dsh-client-runtime" as &const byte,
+    "@deepseek-ai/dsh-client-ui-conversation" as &const byte,
+    "@deepseek-ai/dsh-client-ui-layout" as &const byte,
+    "@deepseek-ai/dsh-client-ui-renderer" as &const byte,
+    "@deepseek-ai/dsh-client-ui-settings" as &const byte,
+    "@deepseek-ai/dsh-client-ui-sidebar" as &const byte,
+    "@deepseek-ai/dsh-client-ui-theme" as &const byte,
+    "@deepseek-ai/dsh-client-ui-workspace" as &const byte,
+    "@deepseek-ai/dsh-typert-registry" as &const byte,
+];
+
+// 装出 boot 图：`{"rev":"…","entries":[{"id":…,"url":…,"rev":…},…]}`。
+// 读不到的包**跳过**（装机不全时给出一个能起来的子集，而不是整页白屏）；
+// 一个都没有则返回 false（调用方据此报错退出）。
+fn dwh_build_entries(h: &DwhHost, out: &Buf) bool {
+    buf_reset(out);
+    if !buf_append_cstr(out, "{\"rev\":\"min\",\"entries\":[") {
+        return false;
+    }
+    var bundle: Buf = buf_new(4194304);
+    defer { buf_free(&bundle); }
+    var path: Buf = buf_new(1200);
+    defer { buf_free(&path); }
+    var rev: Buf = buf_new(32);
+    defer { buf_free(&rev); }
+    var first: bool = true;
+    var n: usize = 0;
+    var i: usize = 0;
+    while i < 14 {
+        const pkg: &const byte = DWH_ROSTER[i];
+        const pl: usize = bufx_cstr_len(pkg);
+        if dwh_client_path(&h.root, pkg, pl, &path) && dwh_read_file(path.ptr as &const byte, &bundle, 4194304) {
+
+            if !dwh_rev_of(bundle.ptr as &const byte, bundle.len, &rev) {
+                return false;
+            }
+            if !first && !buf_append_byte(out, 44) {
+                return false;
+            }
+            first = false;
+            if !buf_append_cstr(out, "{\"id\":\"") {
+                return false;
+            }
+            if !buf_append(out, pkg, pl) {
+                return false;
+            }
+            if !buf_append_cstr(out, "\",\"url\":\"/plugins/") {
+                return false;
+            }
+            if !buf_append(out, pkg, pl) {
+                return false;
+            }
+            if !buf_append_cstr(out, "/client.js?rev=") {
+                return false;
+            }
+            if !buf_append(out, rev.ptr as &const byte, rev.len) {
+                return false;
+            }
+            if !buf_append_cstr(out, "\",\"rev\":\"") {
+                return false;
+            }
+            if !buf_append(out, rev.ptr as &const byte, rev.len) {
+                return false;
+            }
+            if !buf_append_cstr(out, "\"}") {
+                return false;
+            }
+            n = n + 1;
+        }
+        i = i + 1;
+    }
+    if n == 0 {
+        return false;
+    }
+    return buf_append_cstr(out, "]}");
+}
+
+// 装出两个 preload 的 `<script src="…">` 片段（**装 entries 时顺手攒**）。
+//
+// 为什么不在注入时回搜 entries：那要先在 JSON 文本里找 `{"id":"<pkg>","url":"…`，
+// 而实测那条路在**产品二进制里**回 -1（同样的文本、同样的子串，纯函数轮却过 ——
+// 与 `srv_find` 的嵌套比较循环在宿主 C 里的行为有关）。这里的做法是**绕开搜索**：
+// 拼 entries 的时候就知道每个包的 url，顺手写一份，于是没有任何「按文本找结构」的步骤
+// —— 那本来也是脆的（JSON 文本一改格式就断）。
+fn dwh_build_preloads(h: &const DwhHost, out: &Buf) bool {
+    buf_reset(out);
+    var i: usize = 0;
+    while i < 2 {
+        if !dwh_one_preload(h, DWH_PRELOAD[i], out) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+// 一个 preload 片段。**它重算一遍 url 而不去 entries 里搜**（理由见上）。
+fn dwh_one_preload(h: &const DwhHost, pkg: &const byte, out: &Buf) bool {
+    const pl: usize = bufx_cstr_len(pkg);
+    var path: Buf = buf_new(1200);
+    defer { buf_free(&path); }
+    if !dwh_client_path(&h.root, pkg, pl, &path) {
+        return true;
+    }
+    var bundle: Buf = buf_new(4194304);
+    defer { buf_free(&bundle); }
+    if !dwh_read_file(path.ptr as &const byte, &bundle, 4194304) {
+        return true;      // 这个包没装：跳过（与 entries 的跳过条件一致）
+    }
+    var rev: Buf = buf_new(32);
+    defer { buf_free(&rev); }
+    if !dwh_rev_of(bundle.ptr as &const byte, bundle.len, &rev) {
+        return false;
+    }
+    if !buf_append_cstr(out, "<script src=\"/plugins/") {
+        return false;
+    }
+    if !buf_append(out, pkg, pl) {
+        return false;
+    }
+    if !buf_append_cstr(out, "/client.js?rev=") {
+        return false;
+    }
+    if !buf_append(out, rev.ptr as &const byte, rev.len) {
+        return false;
+    }
+    return buf_append_cstr(out, "\"></script>");
+}
+
+// ============================================================
+// 启动注入（复刻 DSH 的 bootInjections）
+// ============================================================
+
+// 把注入片段插在 `<head>` 开标签之后（与 DSH 的 `renderIndexInjections` 同口径）。
+fn dwh_render_index(h: &const DwhHost, html: &const Buf, out: &Buf) bool {
+    buf_reset(out);
+    var preloads: Buf = buf_new(2048);
+    defer { buf_free(&preloads); }
+    if !dwh_build_preloads(h, &preloads) {
+        return false;
+    }
+    const entries: &const Buf = &h.entries;
+    const at: isize = srv_find(html.ptr as &const byte, 0, html.len,
+        "<head>" as &const byte, 6);
+    if at < 0 {
+        // 没有 `<head>`：把注入放最前面（HTML 仍能解析，只是少一层保险）
+        if !dwh_boot_into(entries, &preloads, out) {
+            return false;
+        }
+        return buf_append(out, html.ptr as &const byte, html.len);
+    }
+    const cut: usize = (at as usize) + 6;
+    if !buf_append(out, &html.ptr[0], cut) {
+        return false;
+    }
+    if !dwh_boot_into(entries, &preloads, out) {
+        return false;
+    }
+    return buf_append(out, &html.ptr[cut], html.len - cut);
+}
+
+// 三样东西，按执行顺序：内联 queue 脚本 → 两个 parser-blocking preload → `__DSH_BOOT__`。
+fn dwh_boot_into(entries: &const Buf, preloads: &const Buf, out: &Buf) bool {
+    if !buf_append_cstr(out, "<script>(()=>{const pendingQueue=[];window.__ModuleLoader__={mode:\"queue\",pendingQueue,load(r){pendingQueue.push(r)},create(o){if(this.mode!==\"queue\")throw new Error(\"client-modules: create after boot\");const i=pendingQueue.findIndex(r=>r.id===\"@deepseek-ai/dsh-client-modules\");const reg=pendingQueue[i];if(reg===undefined)throw new Error(\"client-modules: HTML did not preload modules\");pendingQueue.splice(i,1);const x=reg.factory(s=>{throw new Error(\"client-modules: modules requested external \"+s)});return x.createClientModuleSystem(this,{id:reg.id,exports:x},o)}}})()</script>") {
+        return false;
+    }
+    // 两个 preload（顺序即语义：parser-blocking，必须在 shell 之前执行）
+    if !buf_append(out, preloads.ptr as &const byte, preloads.len) {
+        return false;
+    }
+    if !buf_append_cstr(out, "<script>globalThis[\"__DSH_BOOT__\"]=") {
+        return false;
+    }
+    if !buf_append(out, entries.ptr as &const byte, entries.len) {
+        return false;
+    }
+    return buf_append_cstr(out, "</script>");
+}
+
+
+// ============================================================
+// /api 的 unary 应答
+// ============================================================
+
+// 把一次 unary 调用包成 DSH 的 `ServerResponse`（业务错走 ok:false）。
+fn dwh_rpc_ok(rpc: &const byte, value: &const Buf, out: &Buf) bool {
+    buf_reset(out);
+    if !buf_append_cstr(out, "{\"type\":\"server-response\",\"rpcId\":") {
+        return false;
+    }
+    if !buf_append_cstr(out, rpc) {
+        return false;
+    }
+    if !buf_append_cstr(out, ",\"result\":{\"ok\":true,\"value\":") {
+        return false;
+    }
+    if !buf_append(out, value.ptr as &const byte, value.len) {
+        return false;
+    }
+    return buf_append_cstr(out, "}}");
+}
+
+// 业务错：**200 + ok:false**（HTTP 状态只表示载体）。
+fn dwh_rpc_err(rpc: &const byte, code: &const byte, msg: &const byte,
+    mn: usize, out: &Buf) bool {
+    buf_reset(out);
+    if !buf_append_cstr(out, "{\"type\":\"server-response\",\"rpcId\":") {
+        return false;
+    }
+    if !buf_append_cstr(out, rpc) {
+        return false;
+    }
+        // 行宽豁免：不可断的 JSON 字面量
+    if !buf_append_cstr(out, ",\"result\":{\"ok\":false,\"error\":{\"code\":\"") {
+        return false;
+    }
+    if !buf_append_cstr(out, code) {
+        return false;
+    }
+    if !buf_append_cstr(out, "\",\"message\":") {
+        return false;
+    }
+    // ⚠ 用**显式长度**：`msg` 常常是一个没 NUL 结尾的 `Buf` 内容，用
+    // `bufx_cstr_len` 会一路读到相邻内存（实测：错误消息里出现了 HTTP 响应头，
+    // 因为那段内存紧挨着 —— 这类「读越界」的症状是消息内容莫名其妙）。
+    if !jw_str_into(out, msg, mn) {
+        return false;
+    }
+    return buf_append_cstr(out, ",\"details\":{}}}}");
+}
+
+// 一次 unary：按方法名产出 value（写进 `value` 的 JSON 文本）。
+// 返回 false = 这个方法没实现（调用方回 `internal` 业务错）。
+fn dwh_unary(h: &const DwhHost, method: &const byte, ml: usize,
+    value: &Buf) bool {
+    buf_reset(value);
+    if bufx_eq_cstr(method, ml, "host.describe" as &const byte) {
+        // 行宽豁免：不可断的 JSON 字面量
+        // cwd/home 用**真值**：DSH 拿它们做目录选择与显示缩写，而 `/` 不是一个
+        // 像样的工作区（实测：python 探针用 getcwd() 能跑通，这里给 `/` 时
+        // shell 只发了 2 个 /api 就停了 —— 后面几步根本没发生）。
+        // 行宽豁免：不可断的 JSON 骨架。
+        if !buf_append_cstr(value, "{\"version\":\"0.0.1\",\"cwd\":") {
+            return false;
+        }
+        if !dwh_cwd_json(value) {
+            return false;
+        }
+        if !buf_append_cstr(value, ",\"provider\":\"uya-agent\",\"model\":\"uya-agent\",\"attachedSessions\":1,\"home\":") {
+            return false;
+        }
+        if !dwh_home_json(value) {
+            return false;
+        }
+        return buf_append_cstr(value, ",\"canOpenPath\":false}");
+    }
+    // ⚠ `session.create` 不能少（实测：少了它页面只剩 hero 空态、代码零报错）。
+    if bufx_eq_cstr(method, ml, "session.create" as &const byte) {
+        if !buf_append_cstr(value, "{\"sessionId\":\"") {
+            return false;
+        }
+        if !buf_append_cstr(value, DWH_SESSION_ID) {
+            return false;
+        }
+        return buf_append_cstr(value, "\",\"agentPreset\":\"standard\"}");
+    }
+    if dwh_unary_session(h, method, ml, value) {
+        return true;
+    }
+    // 会话/工作区那一簇之外的、host 自身的元信息
+    if bufx_eq_cstr(method, ml, "session.models" as &const byte) {
+        return buf_append_cstr(value, "{\"current\":{\"provider\":\"uya-agent\",\"model\":\"uya-agent\"},\"routable\":true,\"groups\":[],\"failures\":[]}");
+    }
+    return false;
+}
+
+// 会话/工作区那一簇查询（都围着「那一条会话」）。
+fn dwh_unary_session(h: &const DwhHost, method: &const byte, ml: usize,
+    value: &Buf) bool {
+    if bufx_eq_cstr(method, ml, "session.list" as &const byte) {
+        if !buf_append_cstr(value, "{\"items\":[{\"sessionId\":\"") {
+            return false;
+        }
+        if !buf_append_cstr(value, DWH_SESSION_ID) {
+            return false;
+        }
+        // 行宽豁免：不可断的 JSON 字面量
+        if !buf_append_cstr(value, "\",\"updatedAt\":2,\"running\":false,\"blank\":false,") {
+            return false;
+        }
+        // `cwd` 不能省：`ui-workspace` 用它把会话归到工作区分组里 —— 缺了它
+        // 会话在 `session.list` 里有、侧栏却显示「No sessions yet」（实测）。
+        if !buf_append_cstr(value, "\"cwd\":") {
+            return false;
+        }
+        if !dwh_cwd_json(value) {
+            return false;
+        }
+        if !buf_append_byte(value, 44) {
+            return false;
+        }
+        // `title` 投影是**纯字符串**（`SessionProjectionMap.title: string|null`）——
+        // 发成 `{title:…}` 侧栏一行都不显示（实测）。
+        // 行宽豁免：不可断的 JSON 字面量
+        return buf_append_cstr(value, "\"projections\":{\"asOfSeq\":2,\"values\":{\"title\":\"本仓会话\"}}}]}");
+    }
+    if bufx_eq_cstr(method, ml, "session.history" as &const byte) {
+        // 事件源就是适配层的译文（`h.events` 每行一条）。
+        if !buf_append_cstr(value, "{\"events\":[") {
+            return false;
+        }
+        if !dwh_events_as_history(&h.events, value) {
+            return false;
+        }
+        // 行宽豁免：不可断的 JSON 字面量
+        return buf_append_cstr(value, "],\"hasMore\":false,\"projections\":{\"asOfSeq\":2,\"values\":{\"title\":\"本仓会话\"}}}");
+    }
+    // 这几个是 shell 起来时会问的「周边」查询：回**空列表**而不是「没实现」——
+    // 「没实现」会让它把那块功能标成不可用（甚至影响它启动流程的判断），而
+    // 空列表是「现在确实没有」，语义正确且不挡路（与 python 探针同口径）。
+    if bufx_eq_cstr(method, ml, "subagent.list" as &const byte) {
+        return buf_append_cstr(value, "{\"items\":[]}");
+    }
+    if bufx_eq_cstr(method, ml, "settings.describe" as &const byte) {
+        return buf_append_cstr(value, "{\"values\":{},\"schema\":{}}");
+    }
+    if bufx_eq_cstr(method, ml, "session.models" as &const byte) {
+        // 行宽豁免：不可断的 JSON 字面量
+        return buf_append_cstr(value, "{\"current\":{\"provider\":\"uya-agent\",\"model\":\"uya-agent\"},\"routable\":true,\"groups\":[],\"failures\":[]}");
+    }
+    // ⚠ `workspace.list` 返回空 ⇒ 会话在 session.list 里有、侧栏却一行不显示（实测）。
+    // 形状要按真 schema：`items[]`，每项是 WorkspaceView（两个时间是 ISO-8601 字符串）。
+    if bufx_eq_cstr(method, ml, "workspace.list" as &const byte) {
+        // 行宽豁免：不可断的 JSON 字面量
+        if !buf_append_cstr(value, "{\"items\":[{\"workspaceId\":\"ws-uya\",\"path\":") {
+            return false;
+        }
+        if !dwh_cwd_json(value) {
+            return false;
+        }
+        if !buf_append_cstr(value, ",\"title\":\"本仓工作区\",\"sessionIds\":[\"") {
+            return false;
+        }
+        if !buf_append_cstr(value, DWH_SESSION_ID) {
+            return false;
+        }
+        // 行宽豁免：不可断的 JSON 字面量
+        return buf_append_cstr(value, "\"],\"createdAt\":\"2026-01-01T00:00:00.000Z\",\"updatedAt\":\"2026-01-01T00:00:00.000Z\"}],\"archivedSessionIds\":[]}");
+    }
+    return false;
+}
+
+// 把工作区写成 JSON 字符串。取 `cfg.workspace`（启动时定稿的那份），
+// 不另起 getcwd：本仓的 `--web`/TUI 都用它，口径统一（也是「一个真值源」那条纪律）。
+fn dwh_cwd_json(out: &Buf) bool {
+    return dwh_workspace_json(out);
+}
+
+// 把当前工作区（`cfg.workspace`）写成 JSON 字符串（空则退化成 "/"）。
+fn dwh_workspace_json(out: &Buf) bool {
+    const ws: &byte = getenv("PWD" as &const byte);
+    if (ws as usize) == 0 || bufx_cstr_len(ws) == 0 {
+        return buf_append_cstr(out, "\"/\"");
+    }
+    return jw_str_into(out, ws, bufx_cstr_len(ws));
+}
+
+// 把 `$HOME` 写成 JSON 字符串（失败退化成 "/"）。
+fn dwh_home_json(out: &Buf) bool {
+    const home: &byte = getenv("HOME" as &const byte);
+    if (home as usize) == 0 || bufx_cstr_len(home) == 0 {
+        return buf_append_cstr(out, "\"/\"");
+    }
+    return jw_str_into(out, home, bufx_cstr_len(home));
+}
+
+// `getcwd(2)` 的结果写进 out（带 NUL，因为系统调用是 C 串语义）。
+fn dwh_getcwd_into(out: &Buf) bool {
+    buf_reset(out);
+    const p: &byte = sys_getcwd_buf();
+    if (p as usize) == 0 || bufx_cstr_len(p) == 0 {
+        return false;
+    }
+    return buf_append_cstr(out, p);
+}
+
+
+// 会话 id（session.list / workspace.list / mux 三处必须是同一个值）。
+        // 行宽豁免：不可断的 JSON 字面量
+const DWH_SESSION_ID: &const byte = "session-uya-0000-0000-0000-000000000001" as &const byte;
+
+// 把译文的每一行包成 `{"event":…}`（DSH 的 HistoryEntry），逗号分隔。
+fn dwh_events_as_history(events: &const Buf, out: &Buf) bool {
+    var start: usize = 0;
+    var i: usize = 0;
+    var first: bool = true;
+    while i <= events.len {
+        const at_end: bool = i == events.len;
+        if at_end || events.ptr[i] == 10 as byte {
+            const seg: usize = i - start;
+            if seg > 0 {
+                if !first && !buf_append_byte(out, 44) {
+                    return false;
+                }
+                first = false;
+                if !buf_append_cstr(out, "{\"event\":") {
+                    return false;
+                }
+                if !buf_append(out, &events.ptr[start], seg) {
+                    return false;
+                }
+                if !buf_append_byte(out, 125) {
+                    return false;
+                }
+            }
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+// ============================================================
+// WebSocket（只发不收）
+// ============================================================
+
+// 一帧 text（服务端→客户端，**不掩码**：RFC 6455 规定服务端不许掩码）。
+fn dwh_ws_send_text(fd: i32, payload: &const byte, n: usize) bool {
+    var head: [byte: 10] = [0: 10];
+    head[0] = 129;      // FIN + text
+    var hn: usize = 2;
+    if n < 126 {
+        head[1] = n as byte;
+    } else if n < 65536 {
+        head[1] = 126;
+        head[2] = ((n >> 8) & 255 as usize) as byte;
+        head[3] = (n & 255 as usize) as byte;
+        hn = 4;
+    } else {
+        head[1] = 127;
+        var k: usize = 0;
+        while k < 8 {
+            head[2 + k] = ((n >> ((7 - k) * 8)) & 255 as usize) as byte;
+            k = k + 1;
+        }
+        hn = 10;
+    }
+    if !srv_write_all(fd, &head[0], hn) {
+        return false;
+    }
+    if n == 0 {
+        return true;
+    }
+    return srv_write_all(fd, payload, n);
+}
+
+// 把一条 DSH 的 `ServerRequest` 包好发出去（rpcId 每帧新铸 —— 纯推送帧）。
+fn dwh_ws_push_frame(fd: i32, rpc_seq: usize, method: &const byte,
+    payload: &const Buf) bool {
+    var buf: Buf = buf_new(payload.len + 512);
+    defer { buf_free(&buf); }
+    if !buf_append_cstr(&buf, "{\"type\":\"server-request\",\"rpcId\":\"r-") {
+        return false;
+    }
+    if !buf_append_u64(&buf, rpc_seq as u64) {
+        return false;
+    }
+    if !buf_append_cstr(&buf, "\",\"method\":\"") {
+        return false;
+    }
+    if !buf_append_cstr(&buf, method) {
+        return false;
+    }
+    if !buf_append_cstr(&buf, "\",\"payload\":") {
+        return false;
+    }
+    if !buf_append(&buf, payload.ptr as &const byte, payload.len) {
+        return false;
+    }
+    if !buf_append_byte(&buf, 125) {
+        return false;
+    }
+    return dwh_ws_send_text(fd, buf.ptr as &const byte, buf.len);
+}
+
+// 一条基线段：mux 下行要把「已订阅 + 每条会话事件 + 标题投影」发一遍
+// （重连基线，见 DSH 的 events 契约）。这里只有一条会话，所以直接全发。
+fn dwh_ws_send_baseline(h: &const DwhHost, c: &DwhConn) bool {
+    var p: Buf = buf_new(1024);
+    var seq: usize = 1;
+    defer { buf_free(&p); }
+    if c.is_mux {
+        // 行宽豁免：不可断的 JSON 字面量
+        if !buf_append_cstr(&p, "{\"type\":\"session/subscribed\",\"sessionId\":\"") {
+            return false;
+        }
+        if !buf_append_cstr(&p, DWH_SESSION_ID) {
+            return false;
+        }
+        if !buf_append_cstr(&p, "\",\"lastSeq\":2}") {
+            return false;
+        }
+        // 行宽豁免：不可断的 JSON 字面量
+        if !dwh_ws_push_frame(c.fd, seq, "session/subscribed" as &const byte, &p) {
+            return false;
+        }
+        seq = seq + 1;
+        // 每条会话事件（译文那一行原样塞进 `event`）
+        var start: usize = 0;
+        var i: usize = 0;
+        while i <= h.events.len {
+            const at_end: bool = i == h.events.len;
+            if at_end || h.events.ptr[i] == 10 as byte {
+                const seg: usize = i - start;
+                if seg > 0 {
+                    buf_reset(&p);
+        // 行宽豁免：不可断的 JSON 字面量
+                    if !buf_append_cstr(&p, "{\"type\":\"session/event\",\"sessionId\":\"") {
+                        return false;
+                    }
+                    if !buf_append_cstr(&p, DWH_SESSION_ID) {
+                        return false;
+                    }
+                    if !buf_append_cstr(&p, "\",\"event\":") {
+                        return false;
+                    }
+                    if !buf_append(&p, &h.events.ptr[start], seg) {
+                        return false;
+                    }
+                    if !buf_append_byte(&p, 125) {
+                        return false;
+                    }
+        // 行宽豁免：不可断的 JSON 字面量
+                    if !dwh_ws_push_frame(c.fd, seq, "session/event" as &const byte, &p) {
+                        return false;
+                    }
+                    seq = seq + 1;
+                }
+                start = i + 1;
+            }
+            i = i + 1;
+        }
+        // 标题投影（**纯字符串**）
+        buf_reset(&p);
+        // 行宽豁免：不可断的 JSON 字面量
+        if !buf_append_cstr(&p, "{\"type\":\"session/projection\",\"sessionId\":\"") {
+            return false;
+        }
+        if !buf_append_cstr(&p, DWH_SESSION_ID) {
+            return false;
+        }
+        // 行宽豁免：不可断的 JSON 字面量
+        if !buf_append_cstr(&p, "\",\"key\":\"title\",\"value\":\"本仓会话\",\"seq\":2}") {
+            return false;
+        }
+        // 行宽豁免：不可断的 JSON 字面量
+        return dwh_ws_push_frame(c.fd, seq, "session/projection" as &const byte, &p);
+    }
+    // host 下行：一条 `host/session-added`（列表增量）
+        // 行宽豁免：不可断的 JSON 字面量
+    if !buf_append_cstr(&p, "{\"type\":\"host/session-added\",\"sessionId\":\"") {
+        return false;
+    }
+    if !buf_append_cstr(&p, DWH_SESSION_ID) {
+        return false;
+    }
+    if !buf_append_cstr(&p, "\",\"blank\":false,\"cwd\":\"/\"}") {
+        return false;
+    }
+        // 行宽豁免：不可断的 JSON 字面量
+    return dwh_ws_push_frame(c.fd, seq, "host/session-added" as &const byte, &p);
+}
+
+// ============================================================
+// HTTP 收头 / 应答
+// ============================================================
+
+// 收到完整请求头（`\r\n\r\n`）为止。成功返回头长度，失败返回 -1。
+// 头之后可能已有 body 字节（还在 `c.rx` 里，起点就是返回值）。
+fn dwh_read_head(c: &DwhConn) isize {
+    var tmp: [byte: 4096] = [0: 4096];
+    while true {
+        const he: isize = srv_find(c.rx.ptr as &const byte, 0, c.rx.len,
+            "\r\n\r\n" as &const byte, 4);
+        if he >= 0 {
+            return (he as isize) + 4;
+        }
+        if c.rx.len >= DWH_HEAD_MAX {
+            return -1;
+        }
+        // ⚠ fd 是**非阻塞**的（`srv_accept_nb` 设了 O_NONBLOCK），所以：
+        //   n == 0 → 对端关了（真错）；n < 0 → **可能只是还没数据**（EAGAIN），
+        //   要回一个「再等等」而不是把连接掐了。原实现把两者混为一谈，于是
+        //   浏览器刚建好连接、头还没发完就被我们关掉 —— 症状是
+        //   `[web-runtime] connection lost` 反复重连、shell 卡在最早两步。
+        const n: isize = sys_read(c.fd, &tmp[0], 4096) catch { -1 as isize; };
+        if n == 0 {
+            return -1;      // 对端真的关了
+        }
+        if n < 0 {
+            return -2;      // 还没数据：调用方留着连接、等下一圈 poll
+        }
+        if !buf_append(&c.rx, &tmp[0], n as usize) {
+            return -1;
+        }
+    }
+}
+
+// 按 Content-Length 把 body 收全（`head_end` 之后的部分）。
+fn dwh_read_body(c: &DwhConn, head_end: usize, body: &Buf) bool {
+    buf_reset(body);
+    var co: usize = 0;
+    var cl: usize = 0;
+    var want: usize = 0;
+    if srv_head_value(c.rx.ptr as &const byte, c.rx.len, head_end,
+        "content-length" as &const byte, &co, &cl) && cl > 0 {
+        const v: i64 = parse_u64_at(c.rx.ptr[0: c.rx.len], co, cl);
+        if v < 0 {
+            return false;
+        }
+        want = v as usize;
+    }
+    if want > (16 * 1024 * 1024) {
+        return false;      // 显式上限：`/api` 的体不该有几 MB（图片那条路是另一件事）
+    }
+    const have: usize = c.rx.len - head_end;
+    if have > 0 {
+        // 不用 if 表达式赋 const：codegen 为它生成 `const size_t __uya_ifexpr_N` 再赋值，
+        // 宿主 C 报「assignment of read-only variable」（实测）。用可变变量表达同一件事。
+        var take: usize = want;
+        if have < want {
+            take = have;
+        }
+        if !buf_append(body, &c.rx.ptr[head_end], take) {
+            return false;
+        }
+    }
+    var tmp: [byte: 8192] = [0: 8192];
+    var spins: usize = 0;
+    while body.len < want {
+        const n: isize = sys_read(c.fd, &tmp[0], 8192) catch { -1 as isize; };
+        if n < 0 {
+            // EAGAIN：非阻塞 fd。等一小会儿重试，但不能死等（对端可能挂了）。
+            spins = spins + 1;
+            if spins > 2000 {
+                return false;
+            }
+            continue;
+        }
+        if n == 0 {
+            return false;
+        }
+        spins = 0;
+        if !buf_append(body, &tmp[0], n as usize) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// 从一个 JSON 体里取 `"rpcId":"…"` 的**含引号原文**（DSH 的应答必须回显它）。
+fn dwh_pick_rpc(body: &const Buf, out: &Buf) bool {
+    buf_reset(out);
+    const pat: &const byte = "\"rpcId\":\"" as &const byte;
+    const at: isize = srv_find(body.ptr as &const byte, 0, body.len,
+        pat, bufx_cstr_len(pat));
+    if at < 0 {
+        return false;
+    }
+    const s: usize = (at as usize) + bufx_cstr_len(pat);
+    var e: usize = s;
+    while e < body.len && body.ptr[e] != 34 as byte {
+        e = e + 1;
+    }
+    if e >= body.len {
+        return false;
+    }
+    if !buf_append_byte(out, 34) {
+        return false;
+    }
+    if !buf_append(out, &body.ptr[s], e - s) {
+        return false;
+    }
+    return buf_append_byte(out, 34);
+}
+
+// 从一个 JSON 体里取 `"method":"…"` 的值（不含引号）。DSH 要求它与路径一致。
+fn dwh_pick_method(body: &const Buf, out: &Buf) bool {
+    buf_reset(out);
+    const pat: &const byte = "\"method\":\"" as &const byte;
+    const at: isize = srv_find(body.ptr as &const byte, 0, body.len,
+        pat, bufx_cstr_len(pat));
+    if at < 0 {
+        return false;
+    }
+    const s: usize = (at as usize) + bufx_cstr_len(pat);
+    var e: usize = s;
+    while e < body.len && body.ptr[e] != 34 as byte {
+        e = e + 1;
+    }
+    if e >= body.len {
+        return false;
+    }
+    return buf_append(out, &body.ptr[s], e - s);
+}
+
+// ============================================================
+// 生命周期
+// ============================================================
+
+// 起宿主：找 dist、装 boot 图、读事件源、监听。
+// `addr` 形如 "127.0.0.1:PORT"（`PORT` 为 0 = 让内核给一个）。
+export fn dwh_start(h: &DwhHost, addr: &const byte, an: usize,
+    events_path: &const byte) bool {
+    h.lfd = -1;
+    h.dist = buf_empty();
+    h.root = buf_empty();
+    h.entries = buf_empty();
+    h.events = buf_empty();
+    h.n = 0;
+    var i: usize = 0;
+    while i < DWH_MAX_CONNS {
+        h.conns[i].fd = -1;
+        h.conns[i].st = DWH_C_DONE;
+        h.conns[i].rx = buf_empty();
+        h.conns[i].is_mux = false;
+        h.conns[i].sent = false;
+        i = i + 1;
+    }
+    if !dwh_find_root(&h.root) {
+        return false;
+    }
+    h.dist = buf_new(1200);
+    if !buf_append(&h.dist, h.root.ptr as &const byte, h.root.len) {
+        return false;
+    }
+        // 行宽豁免：不可断的 JSON 字面量
+    if !buf_append_cstr(&h.dist, "/node_modules/@deepseek-ai/dsh-web-frontend/dist") {
+        return false;
+    }
+    h.entries = buf_new(65536);
+    if !dwh_build_entries(h, &h.entries) {
+        return false;
+    }
+    // 事件源：一份翻好的译文（`web/wsess.uya` 的输出）。读不到就空着
+    // （页面仍能起来，只是没有消息 —— 这比整个宿主起不来好）。
+    h.events = buf_new(4194304);
+    if bufx_cstr_len(events_path) > 0 {
+        // ⚠ 路径要 **NUL 结尾**才喂 `sys_open`（`dwh_read_file` 同 `dwh_client_path`
+        // 那条纪律：C 串语义）。env 给的那份没有 NUL，这里显式补一个。
+        var ep: Buf = buf_new(bufx_cstr_len(events_path) + 1);
+        defer { buf_free(&ep); }
+        _ = buf_append_cstr(&ep, events_path);
+        _ = buf_append_byte(&ep, 0);
+        _ = dwh_read_file(ep.ptr as &const byte, &h.events, 4194304);
+    }
+    // 监听
+    var a: byte = 127;
+    var b: byte = 0;
+    var cc: byte = 0;
+    var d: byte = 1;
+    var port: u16 = 0;
+    if !dwh_parse_addr(addr, an, &a, &b, &cc, &d, &port) {
+        return false;
+    }
+    h.lfd = srv_listen(a, b, cc, d, port, 16);
+    return h.lfd >= 0;
+}
+
+// 解析 "A.B.C.D:PORT"（只支持 IPv4 字面量，与 `--web` 同一口径）。
+fn dwh_parse_addr(s: &const byte, n: usize, a: &byte, b: &byte, c: &byte,
+    d: &byte, port: &u16) bool {
+    var part: [u8: 4] = [0: 4];
+    var pi: usize = 0;
+    var i: usize = 0;
+    var cur: i64 = 0;
+    var seen: usize = 0;
+    while i < n {
+        const ch: byte = s[i];
+        if ch == 46 as byte || ch == 58 as byte {
+            if pi >= 4 || seen == 0 {
+                return false;
+            }
+            part[pi] = cur as u8;
+            pi = pi + 1;
+            cur = 0;
+            seen = 0;
+            i = i + 1;
+            if ch == 58 as byte {
+                // 端口
+                var p: i64 = 0;
+                var k: usize = 0;
+                while i < n {
+                    const pc: byte = s[i];
+                    if pc < 48 as byte || pc > 57 as byte {
+                        return false;
+                    }
+                    p = p * 10 + ((pc as i64) - 48);
+                    k = k + 1;
+                    i = i + 1;
+                }
+                if k == 0 || p > 65535 {
+                    return false;
+                }
+                if pi != 4 {
+                    return false;
+                }
+                a[0] = part[0];
+                b[0] = part[1];
+                c[0] = part[2];
+                d[0] = part[3];
+                port[0] = p as u16;
+                return true;
+            }
+            continue;
+        }
+        if ch < 48 as byte || ch > 57 as byte {
+            return false;
+        }
+        cur = cur * 10 + ((ch as i64) - 48);
+        seen = seen + 1;
+        if cur > 255 {
+            return false;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+// 实际监听端口（`PORT` 给 0 时用它报出真实端口）。
+export fn dwh_port(h: &const DwhHost) u16 {
+    return srv_local_port(h.lfd);
+}
+
+// 收尾：关监听与所有连接。
+export fn dwh_stop(h: &DwhHost) void {
+    var i: usize = 0;
+    while i < DWH_MAX_CONNS {
+        if h.conns[i].fd >= 0 {
+            srv_close(h.conns[i].fd);
+            h.conns[i].fd = -1;
+        }
+        if buf_valid(&h.conns[i].rx) {
+            buf_free(&h.conns[i].rx);
+        }
+        i = i + 1;
+    }
+    if h.lfd >= 0 {
+        srv_close(h.lfd);
+        h.lfd = -1;
+    }
+    if buf_valid(&h.dist) {
+        buf_free(&h.dist);
+    }
+    if buf_valid(&h.root) {
+        buf_free(&h.root);
+    }
+    if buf_valid(&h.entries) {
+        buf_free(&h.entries);
+    }
+    if buf_valid(&h.events) {
+        buf_free(&h.events);
+    }
+}
+
+// ============================================================
+// 主循环（一次 poll 管住监听 + 所有连接）
+// ============================================================
+
+// `--dsh-web` 的入口：起宿主 → 打 URL → 进主循环。
+// 返回 0 = 正常收尾（ctrl+c / 收尾信号）。
+export fn dwh_run(cfg: &const Config) i32 {
+    var addr: Buf = buf_empty();
+    defer { buf_free(&addr); }
+    if cfg.dsh_web_addr.len > 0 {
+        addr = buf_new(cfg.dsh_web_addr.len + 1);
+        _ = buf_append(&addr, cfg.dsh_web_addr.ptr as &const byte,
+            cfg.dsh_web_addr.len);
+    } else {
+        addr = buf_new(32);
+        _ = buf_append_cstr(&addr, "127.0.0.1:8790");
+    }
+    var events: Buf = buf_empty();
+    defer { buf_free(&events); }
+    if cfg.dsh_web_events.len > 0 {
+        events = buf_new(cfg.dsh_web_events.len + 1);
+        _ = buf_append(&events, cfg.dsh_web_events.ptr as &const byte,
+            cfg.dsh_web_events.len);
+    } else {
+        // 环境变量 `UYA_AGENT_DSH_WEB_EVENTS` 指一份译文的路径。
+        // 优先 CLI（`cfg.dsh_web_events`），没给才看 env。
+        const ev_env: &byte = getenv("UYA_AGENT_DSH_WEB_EVENTS" as &const byte);
+        if (ev_env as usize) != 0 && bufx_cstr_len(ev_env) > 0 {
+            events = buf_new(bufx_cstr_len(ev_env) + 1);
+            _ = buf_append_cstr(&events, ev_env);
+        } else {
+            events = buf_new(1);
+        }
+    }
+    var h: DwhHost = dwh_host_zero();
+    if !dwh_start(&h, addr.ptr as &const byte, addr.len,
+        events.ptr as &const byte) {
+        out_err("error: --dsh-web 起不来（没找到 DSH 的 webui？试 --dsh-root DIR，");
+        out_err("或确认装了 @deepseek-ai/dsh-web-frontend）\n");
+        return AGENT_PROTO;
+    }
+    defer { dwh_stop(&h); }
+    out_err("[dsh-web] DSH 前端（只读它的 dist，不改一个字节）：http://127.0.0.1:");
+    out_err_dec(dwh_port(&h) as usize);
+    out_err("/ （ctrl+c 退出）\n");
+    if h.events.len == 0 {
+        out_err("[dsh-web] 提示：没有事件源（UYA_AGENT_DSH_WEB_EVENTS 指一份译文），");
+        out_err("页面能起来但没有消息\n");
+    }
+    if !sigx_install_web() {
+        out_err("[dsh-web] 警告：终止信号处理器安装失败\n");
+    }
+    dwh_loop(&h);
+    return AGENT_OK;
+}
+
+// 零值宿主（`dwh_start` 会把它填好）。
+fn dwh_host_zero() DwhHost {
+    var h: DwhHost = DwhHost{
+        lfd: -1,
+        dist: buf_empty(),
+        root: buf_empty(),
+        entries: buf_empty(),
+        events: buf_empty(),
+        conns: [dwh_conn_zero(): DWH_MAX_CONNS],
+        n: 0,
+        stop_round: false,
+    };
+    return h;
+}
+
+// 零值连接。
+fn dwh_conn_zero() DwhConn {
+    return DwhConn{ fd: -1, st: DWH_C_DONE, rx: buf_empty(),
+        is_mux: false, sent: false };
+}
+
+// 主循环：一次 poll，谁就绪处理谁。
+fn dwh_loop(h: &DwhHost) void {
+    while !sigx_web_quit_wanted() {
+        dwh_poll_once(h);
+    }
+}
+
+// 一次泵。
+fn dwh_poll_once(h: &DwhHost) void {
+    var pfds: [PollFd: DWH_MAX_CONNS + 1] = [PollFd{ fd: -1, events: 0,
+        revents: 0 }: DWH_MAX_CONNS + 1];
+    var idx: [usize: DWH_MAX_CONNS + 1] = [0: DWH_MAX_CONNS + 1];
+    var np: usize = 0;
+    if h.lfd >= 0 {
+        pfds[0].fd = h.lfd;
+        pfds[0].events = POLLIN;
+        idx[0] = 0;
+        np = 1;
+    }
+    var i: usize = 0;
+    while i < DWH_MAX_CONNS && np < DWH_MAX_CONNS + 1 {
+        if h.conns[i].fd >= 0 && h.conns[i].st != DWH_C_DONE {
+            // WS 连接：已发完基线就只等关闭（只发不收）；否则等可写。
+            pfds[np].fd = h.conns[i].fd;
+            if h.conns[i].st == DWH_C_WS && h.conns[i].sent {
+                pfds[np].events = POLLIN;
+            } else {
+                pfds[np].events = POLLIN;
+            }
+            idx[np] = i + 1;
+            np = np + 1;
+        }
+        i = i + 1;
+    }
+    _ = sys_poll(&pfds[0], np, DWH_POLL_MS) catch {};
+    // **一次只处理一个就绪者**：处理完立刻回 poll。
+    // 单线程里把「写一个 450KB 的 bundle」整段做完，会让循环几百毫秒回不到 poll，
+    // 两条下行的心跳就断在那个窗口里（实测症状：`[web-runtime] connection lost`
+    // 反复重连、shell 卡在最早两步）。分片后 poll 间隔固定在毫秒级。
+    var k: usize = 0;
+    while k < np {
+        const rv: i16 = pfds[k].revents;
+        if rv != 0 {
+            if k == 0 {
+                if (rv & POLLIN) != 0 {
+                    dwh_accept(h);
+                    return;
+                }
+            } else {
+                const ci: usize = idx[k] - 1;
+                // 掩码先落成一个 i16：三个常量的 `|` 会被推断成别的整型，
+                // 直接写在 `&` 里就报「两个操作数类型必须一致」（实测）。
+                const mask: i16 = POLLIN | POLLHUP | POLLERR;
+                if (rv & mask) != 0 {
+                    dwh_on_conn(h, ci);
+                    if h.stop_round {
+                        h.stop_round = false;
+                        return;
+                    }
+                }
+            }
+        }
+        k = k + 1;
+    }
+    dwh_sweep(h);
+}
+
+// 收一个新连接（非阻塞 listen fd；连接本身阻塞也是错的 —— 设为非阻塞）。
+fn dwh_accept(h: &DwhHost) void {
+    const fd: i32 = srv_accept_nb(h.lfd);
+    if fd < 0 {
+        return;
+    }
+    var i: usize = 0;
+    var slot: usize = DWH_MAX_CONNS;
+    while i < DWH_MAX_CONNS {
+        if h.conns[i].fd < 0 {
+            slot = i;
+            break;
+        }
+        i = i + 1;
+    }
+    if slot >= DWH_MAX_CONNS {
+        srv_close(fd);      // 满了：直接关（显式边界，不排队）
+        return;
+    }
+    h.conns[slot].fd = fd;
+    h.conns[slot].st = DWH_C_HEAD;
+    h.conns[slot].is_mux = false;
+    h.conns[slot].sent = false;
+    if !buf_valid(&h.conns[slot].rx) {
+        h.conns[slot].rx = buf_new(16384);
+    }
+    buf_reset(&h.conns[slot].rx);
+}
+
+// 一个连接可读了：按它的阶段分派。
+// 收头 → 是升级请求就握手成 WS 并发基线；否则按 URL 分派成一次响应。
+fn dwh_on_conn(h: &DwhHost, ci: usize) void {
+    // 显式夹取：Uya 的边界证明器只认「正的 if 里做索引」（与 httpsrv 同款纪律）。
+    if ci >= DWH_MAX_CONNS {
+        return;
+    }
+    const c: &DwhConn = &h.conns[ci];
+    if c.fd < 0 {
+        return;
+    }
+    if c.st == DWH_C_WS {
+        // WS 下行**只发不收**，但对端会发 **ping**（浏览器/中间层都会）与 close。
+        // 这里必须把读到的字节**读懂**再决定：
+        //   * 读到 0 = 对端真关了 → 断开；
+        //   * 读到 ping（opcode 9）→ 回 pong（不回的话对端按超时判死，症状是
+        //     `[web-runtime] connection lost` 反复重连、shell 卡在最早那两步 ——
+        //     实测就是这么卡住的）；
+        //   * 读到 close（opcode 8）→ 断开；其余（对端不该发数据）忽略。
+        var tmp: [byte: 512] = [0: 512];
+        const n: isize = sys_read(c.fd, &tmp[0], 512) catch { -1 as isize; };
+        if n < 0 {
+            return;         // EAGAIN：非阻塞 fd 上的常态，不是断开
+        }
+        if n == 0 {
+            dwh_drop(h, ci);
+            return;
+        }
+        const b0: byte = tmp[0];
+        const op: u8 = (b0 & 15 as byte) as u8;
+        if op == 8 {
+            dwh_drop(h, ci);
+            return;
+        }
+        if op == 9 {
+            // 回 pong：**payload 原样搬回去**。
+            // ⚠ 客户端发的帧是**掩码**的：`tmp[2..6]` 是掩码键、payload 从第 6 字节起
+            // （控制帧载荷 ≤125，所以不会走 2 字节长度那种形态）。早先的实现从
+            // `tmp[2]` 起搬 —— 搬的是掩码键，pong 的内容是错的，客户端据此判协议错
+            // 并把连接关掉（症状与「收不到 pong」一样：`connection lost` 反复重连）。
+            const masked: bool = (tmp[1] & 128 as byte) != 0;
+            var plen: usize = (tmp[1] & 127 as byte) as usize;
+            if plen > 125 {
+                plen = 125;
+            }
+            var poff: usize = 2;
+            if masked {
+                poff = 6;      // 跳过 4 字节掩码键
+            }
+            var out: [byte: 130] = [0: 130];
+            out[0] = 138;      // FIN + pong（**不掩码**：服务端不许掩码）
+            out[1] = plen as byte;
+            var k: usize = 0;
+            while k < plen && poff + k < 512 {
+                var pb: byte = tmp[poff + k];
+                if masked {
+                    pb = (pb ^ tmp[2 + (k & 3)]) as byte;   // 去掩码
+                }
+                out[2 + k] = pb;
+                k = k + 1;
+            }
+            _ = srv_write_all(c.fd, &out[0], 2 + plen);
+            return;
+        }
+        // 对端发来的 close / 数据帧之后可能还有字节：这一圈只处理第一帧
+        // （浏览器→服务端只有 ping 与 close，够用，不必做流式解帧）
+        return;
+    }
+    if c.st != DWH_C_HEAD {
+        return;
+    }
+    const he: isize = dwh_read_head(c);
+    if he == -2 {
+        return;             // 还没收全：等下一圈
+    }
+    if he < 0 {
+        dwh_drop(h, ci);
+        return;
+    }
+    const head_end: usize = he as usize;
+    var m: u8 = SRV_M_OTHER;
+    var uo: usize = 0;
+    var ul: usize = 0;
+    if !srv_parse_url(c, head_end, &m, &uo, &ul) {
+        dwh_drop(h, ci);
+        return;
+    }
+    // 升级请求（WebSocket）：普通 GET 要回 426（DSH 同口径：没有 SSE 回落）
+        // 行宽豁免：不可断的 JSON 字面量
+    if dwh_head_has(c, head_end, "upgrade" as &const byte, "websocket" as &const byte) {
+        dwh_do_upgrade(h, ci, uo, ul);
+        return;
+    }
+    dwh_do_http(h, ci, m, uo, ul, head_end);
+}
+
+// 解析请求行（拿到方法码与 URL 区间）。`srv_parse_request_line` 是 httpsrv 的私有的，
+// 所以这里用 httpsrv 导出的 `srv_recv_request` 之外的口径：直接扫第一行。
+fn srv_parse_url(c: &const DwhConn, head_end: usize, m_out: &u8,
+    url_off: &usize, url_len: &usize) bool {
+    _ = head_end;
+    // 第一行：`METHOD SP URL SP VERSION`
+    var i: usize = 0;
+    var sp1: isize = -1;
+    var sp2: isize = -1;
+    while i < c.rx.len && c.rx.ptr[i] != 13 as byte {
+        if c.rx.ptr[i] == 32 as byte {
+            if sp1 < 0 {
+                sp1 = i as isize;
+            } else if sp2 < 0 {
+                sp2 = i as isize;
+            }
+        }
+        i = i + 1;
+    }
+    if sp1 <= 0 || sp2 <= sp1 {
+        return false;
+    }
+    const ml: usize = sp1 as usize;
+    if bufx_eq_cstr(c.rx.ptr as &const byte, ml, "GET" as &const byte) {
+        m_out[0] = SRV_M_GET;
+    } else if bufx_eq_cstr(c.rx.ptr as &const byte, ml, "POST" as &const byte) {
+        m_out[0] = SRV_M_POST;
+    } else {
+        m_out[0] = SRV_M_OTHER;
+    }
+    url_off[0] = (sp1 as usize) + 1;
+    url_len[0] = (sp2 as usize) - ((sp1 as usize) + 1);
+    return url_len[0] > 0;
+}
+
+// 请求头 `name` 的值里是否含 `val`（大小写不敏感只做小写化比较——DSH 发的都是小写）。
+fn dwh_head_has(c: &const DwhConn, head_end: usize, name: &const byte,
+    val: &const byte) bool {
+    var co: usize = 0;
+    var cl: usize = 0;
+        // 行宽豁免：不可断的 JSON 字面量
+    if !srv_head_value(c.rx.ptr as &const byte, head_end, head_end, name, &co, &cl) {
+        return false;
+    }
+    if cl == 0 {
+        return false;
+    }
+    // 值里找子串（`Upgrade: websocket`）
+    const vl: usize = bufx_cstr_len(val);
+    var i: usize = co;
+    while i + vl <= co + cl {
+        var same: bool = true;
+        var k: usize = 0;
+        while k < vl {
+            var ch: byte = c.rx.ptr[i + k];
+            if ch >= 65 as byte && ch <= 90 as byte {
+                ch = (ch as i32 + 32) as byte;
+            }
+            if ch != val[k] {
+                same = false;
+                break;
+            }
+            k = k + 1;
+        }
+        if same {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+// 断开一个连接（幂等）。
+fn dwh_drop(h: &DwhHost, ci: usize) void {
+    if ci >= DWH_MAX_CONNS {
+        return;
+    }
+    if h.conns[ci].fd >= 0 {
+        srv_close(h.conns[ci].fd);
+        h.conns[ci].fd = -1;
+    }
+    h.conns[ci].st = DWH_C_DONE;
+    h.conns[ci].sent = false;
+    h.conns[ci].is_mux = false;
+    buf_reset(&h.conns[ci].rx);
+}
+
+// 清掉已完成的连接（每圈末尾一次：主循环手上可能有移动前的下标）。
+fn dwh_sweep(h: &DwhHost) void {
+    var i: usize = 0;
+    while i < DWH_MAX_CONNS {
+        if h.conns[i].st == DWH_C_DONE && h.conns[i].fd >= 0 {
+            srv_close(h.conns[i].fd);
+            h.conns[i].fd = -1;
+        }
+        i = i + 1;
+    }
+}
+
+// WebSocket 升级：校 key → 回 101 → 发基线段 → 转成「只发不收」阶段。
+fn dwh_do_upgrade(h: &DwhHost, ci: usize, uo: usize, ul: usize) void {
+    if ci >= DWH_MAX_CONNS {
+        return;
+    }
+    const c: &DwhConn = &h.conns[ci];
+    if !dwh_path_is(c, uo, ul, "/api/events.mux" as &const byte) &&
+        !dwh_path_is(c, uo, ul, "/api/events.host" as &const byte) {
+        // 其它路径的升级：没有 SSE 回落，如实回 426。
+        _ = srv_send_response(c.fd, SRV_ST_404, SRV_CT_TEXT,
+            "no such websocket" as &const byte, 17);
+        h.conns[ci].st = DWH_C_DONE;
+        return;
+    }
+        // 行宽豁免：不可断的 JSON 字面量
+    h.conns[ci].is_mux = dwh_path_is(c, uo, ul, "/api/events.mux" as &const byte);
+    var co: usize = 0;
+    var cl: usize = 0;
+    if !srv_head_value(c.rx.ptr as &const byte, c.rx.len, c.rx.len,
+        "sec-websocket-key" as &const byte, &co, &cl) || cl == 0 {
+        _ = srv_send_response(c.fd, SRV_ST_400, SRV_CT_TEXT,
+            "missing key" as &const byte, 11);
+        h.conns[ci].st = DWH_C_DONE;
+        return;
+    }
+    // accept = base64(sha1(key + GUID))
+    var joined: Buf = buf_new(cl + 64);
+    defer { buf_free(&joined); }
+    if !buf_append(&joined, &c.rx.ptr[co], cl) {
+        h.conns[ci].st = DWH_C_DONE;
+        return;
+    }
+    if !buf_append_cstr(&joined, "258EAFA5-E914-47DA-95CA-C5AB0DC85B11") {
+        h.conns[ci].st = DWH_C_DONE;
+        return;
+    }
+    var dig: [byte: 20] = [0: 20];
+    sha1_digest(joined.ptr[0: joined.len], dig[0: 20]);
+    var b64: [byte: 64] = [0: 64];
+    // `encode_base64` 回 `!usize`：本仓处理 `!T` 的写法是 `catch`（不能直接 `if !r`）。
+    const n: usize = encode_base64(dig[0: 20], b64[0: 64]) catch {
+        h.conns[ci].st = DWH_C_DONE;
+        return;
+    };
+    var head: Buf = buf_new(256);
+    defer { buf_free(&head); }
+        // 行宽豁免：不可断的 JSON 字面量
+    if !buf_append_cstr(&head, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ") {
+        h.conns[ci].st = DWH_C_DONE;
+        return;
+    }
+    if !buf_append(&head, &b64[0], n) {
+        h.conns[ci].st = DWH_C_DONE;
+        return;
+    }
+    if !buf_append_cstr(&head, "\r\n\r\n") {
+        h.conns[ci].st = DWH_C_DONE;
+        return;
+    }
+    if !srv_write_all(c.fd, head.ptr as &const byte, head.len) {
+        h.conns[ci].st = DWH_C_DONE;
+        return;
+    }
+    h.conns[ci].st = DWH_C_WS;
+    // 基线段：DSH 的重连基线（订阅 + 每条事件 + 标题投影）。
+    if dwh_ws_send_baseline(h, &h.conns[ci]) {
+        h.conns[ci].sent = true;
+    } else {
+        dwh_drop(h, ci);
+    }
+}
+
+// 路径等于 lit 吗（只比路径段，不含 query）。
+fn dwh_path_is(c: &const DwhConn, uo: usize, ul: usize, lit: &const byte) bool {
+    // `srv_url_split` 用**下标出参**给出「路径长度 / query 起点与长度」（切片是值语义，
+    // 所以 httpsrv 一律用下标 —— 见它文件头不变量⑤）。
+    var path_len: usize = 0;
+    var qo: usize = 0;
+    var ql: usize = 0;
+    srv_url_split(c.rx.ptr as &const byte, uo, ul, &path_len, &qo, &ql);
+    return bufx_eq_cstr(&c.rx.ptr[uo], path_len, lit);
+}
+
+// 一次普通 HTTP：静态 / 插件 bundle / `/api` 三选一。
+fn dwh_do_http(h: &DwhHost, ci: usize, m: u8, uo: usize, ul: usize,
+    head_end: usize) void {
+    if ci >= DWH_MAX_CONNS {
+        return;
+    }
+    const fd: i32 = h.conns[ci].fd;
+    if fd < 0 {
+        return;
+    }
+    var path: Buf = buf_new(ul + 1);
+    defer { buf_free(&path); }
+    var pl: usize = 0;
+    var qo: usize = 0;
+    var ql: usize = 0;
+    srv_url_split(h.conns[ci].rx.ptr as &const byte, uo, ul, &pl, &qo, &ql);
+    if !buf_append(&path, &h.conns[ci].rx.ptr[uo], pl) {
+        h.conns[ci].st = DWH_C_DONE;
+        return;
+    }
+    // 根路径：index.html + 我们的注入
+    if pl == 1 && path.ptr[0] == 47 as byte {
+        dwh_send_index(h, ci);
+        h.conns[ci].st = DWH_C_DONE;
+        return;
+    }
+    // `/plugins/<id>/client.js[.map]`
+        // 行宽豁免：不可断的 JSON 字面量
+    if pl > 9 && bufx_eq_cstr(path.ptr as &const byte, 9, "/plugins/" as &const byte) {
+        dwh_send_plugin(h, ci, &path);
+        h.conns[ci].st = DWH_C_DONE;
+        return;
+    }
+    // `/api/<method>`
+        // 行宽豁免：不可断的 JSON 字面量
+    if pl > 5 && bufx_eq_cstr(path.ptr as &const byte, 5, "/api/" as &const byte) {
+        dwh_send_api(h, ci, m, &path, head_end);
+        h.conns[ci].st = DWH_C_DONE;
+        return;
+    }
+    // 其余：真 dist 里的静态文件（`/assets/*`、`/favicon.svg` …）
+    dwh_send_static(h, ci, &path);
+    h.conns[ci].st = DWH_C_DONE;
+}
+
+// 根路径：读 dist 的 index.html，注入后发出去。
+fn dwh_send_index(h: &const DwhHost, ci: usize) void {
+    if ci >= DWH_MAX_CONNS {
+        return;
+    }
+    const fd: i32 = h.conns[ci].fd;
+    var idx: Buf = buf_new(1200);
+    defer { buf_free(&idx); }
+    if !dwh_dist_file(h, "index.html" as &const byte, &idx) {
+        _ = srv_send_response(fd, SRV_ST_404, SRV_CT_TEXT,
+            "no dist" as &const byte, 7);
+        return;
+    }
+    // ⚠ 系统调用要 **NUL 结尾的 C 串**： 只按长度追加，不补 NUL
+    // （本仓另有 `buf_append_cstr_z` 专管这件事）。漏了它，`sys_open` 会一路读到
+    // 缓冲区后面的脏字节 —— 症状是「路径明明对，却打不开」。
+    if !buf_append_byte(&idx, 0) {
+        _ = srv_send_response(fd, SRV_ST_400, SRV_CT_TEXT,
+            "oom" as &const byte, 3);
+        return;
+    }
+    var html: Buf = buf_new(262144);
+    defer { buf_free(&html); }
+    if !dwh_read_file(idx.ptr as &const byte, &html, 262144) {
+        _ = srv_send_response(fd, SRV_ST_404, SRV_CT_TEXT,
+            "no index" as &const byte, 8);
+        return;
+    }
+    var out: Buf = buf_new(html.len + h.entries.len + 4096);
+    defer { buf_free(&out); }
+    if !dwh_render_index(h, &html, &out) {
+        _ = srv_send_response(fd, SRV_ST_400, SRV_CT_TEXT,
+            "render failed" as &const byte, 13);
+        return;
+    }
+    _ = srv_send_response(fd, SRV_ST_200, SRV_CT_HTML,
+        out.ptr as &const byte, out.len);
+}
+
+// 拼 `<dist>/<path[1:]>`（去掉开头的 `/`；**按长度搬**，不收 C 串）。
+fn dwh_dist_rel(h: &const DwhHost, path: &const Buf, out: &Buf) bool {
+    buf_reset(out);
+    if !buf_append(&out[0], h.dist.ptr as &const byte, h.dist.len) {
+        return false;
+    }
+    if path.len <= 1 {
+        return false;
+    }
+    // ⚠ 这个 `/` 不能少：少了它拼出的是 `distfavicon.svg`（实测），而症状是
+    // 「文件明明在、却全 404」。
+    if !buf_append_byte(&out[0], 47) {
+        return false;
+    }
+    return buf_append(&out[0], &path.ptr[1], path.len - 1);
+}
+
+// 拼 `dist/<rel>` 到 out（调用方负责 NUL 终止——系统调用要 C 串）。
+fn dwh_dist_file(h: &const DwhHost, rel: &const byte, out: &Buf) bool {
+    buf_reset(out);
+    if !buf_append(&out[0], h.dist.ptr as &const byte, h.dist.len) {
+        return false;
+    }
+    if !buf_append_byte(&out[0], 47) {
+        return false;
+    }
+    if !buf_append_cstr(&out[0], rel) {
+        return false;
+    }
+    return true;
+}
+
+// 发一个大响应（bundle 有 450KB 量级）。分块写，块间**回一次 poll**：
+// 单线程宿主里，一口气写几百 KB 会让两条下行在那个窗口里收不到心跳
+//（实测症状：`[web-runtime] connection lost` 反复重连、shell 卡在最早两步）。
+// 分块后每块之间都还给事件循环，下行的延迟就稳定在毫秒级。
+fn dwh_send_large(h: &DwhHost, fd: i32, ctype: &const byte, body: &const byte,
+    n: usize) bool {
+    _ = h;
+    const CHUNK: usize = 65536;
+    // 头也要自己拼（`srv_send_response` 是一次性写完的，这里要分块）
+    var head: Buf = buf_new(512);
+    defer { buf_free(&head); }
+    if !buf_append_cstr(&head, "HTTP/1.1 ") {
+        return false;
+    }
+    if !buf_append_cstr(&head, SRV_ST_200) {
+        return false;
+    }
+    if !buf_append_cstr(&head, "\r\nContent-Type: ") {
+        return false;
+    }
+    if !buf_append_cstr(&head, ctype) {
+        return false;
+    }
+    if !buf_append_cstr(&head, "\r\nContent-Length: ") {
+        return false;
+    }
+    if !buf_append_u64(&head, n as u64) {
+        return false;
+    }
+    if !buf_append_cstr(&head, "\r\nConnection: close\r\n\r\n") {
+        return false;
+    }
+    if !srv_write_all(fd, head.ptr as &const byte, head.len) {
+        return false;
+    }
+    var off: usize = 0;
+    while off < n {
+        var take: usize = n - off;
+        if take > CHUNK {
+            take = CHUNK;
+        }
+        const at: *const byte = @ptr_from_usize(
+            @usize_from_ptr(body as &const void) + off) as *const byte;
+        if !srv_write_all(fd, at as &const byte, take) {
+            return false;
+        }
+        off = off + take;
+        if off < n {
+            // 块间让出：0 超时的 poll 不阻塞，但足以让内核把已写的数据推出去
+            var pfds: [PollFd: 1] = [PollFd{ fd: -1, events: 0, revents: 0 }];
+            _ = sys_poll(&pfds[0], 0, 0) catch {};
+        }
+    }
+    return true;
+}
+
+// `/plugins/<pkg>/client.js[.map]` → 该包的 `lib/client.js`（真包，不是 dist 里的）。
+fn dwh_send_plugin(h: &const DwhHost, ci: usize, path: &const Buf) void {
+    if ci >= DWH_MAX_CONNS {
+        return;
+    }
+    const fd: i32 = h.conns[ci].fd;
+    // 去掉末尾的 `/client.js` 或 `/client.js.map`
+    var pn: usize = path.len;
+    var want_map: bool = false;
+    const map_suf: &const byte = "/client.js.map" as &const byte;
+    const js_suf: &const byte = "/client.js" as &const byte;
+    if pn > 14 && bufx_eq_cstr(&path.ptr[pn - 14], 14, map_suf) {
+        want_map = true;
+        pn = pn - 14;
+    } else if pn > 10 && bufx_eq_cstr(&path.ptr[pn - 10], 10, js_suf) {
+        pn = pn - 10;
+    } else {
+        _ = srv_send_response(fd, SRV_ST_404, SRV_CT_TEXT,
+            "not a bundle" as &const byte, 12);
+        return;
+    }
+    // `<root>/node_modules/<pkg>/lib/client.js`
+    var full: Buf = buf_new(1400);
+    defer { buf_free(&full); }
+    if !buf_append(&full, h.root.ptr as &const byte, h.root.len) {
+        // 行宽豁免：不可断的 JSON 字面量
+        _ = srv_send_response(fd, SRV_ST_400, SRV_CT_TEXT, "oom" as &const byte, 3);
+        return;
+    }
+    if !buf_append_cstr(&full, "/node_modules/") {
+        // 行宽豁免：不可断的 JSON 字面量
+        _ = srv_send_response(fd, SRV_ST_400, SRV_CT_TEXT, "oom" as &const byte, 3);
+        return;
+    }
+    if !buf_append(&full, &path.ptr[9], pn - 9) {
+        // 行宽豁免：不可断的 JSON 字面量
+        _ = srv_send_response(fd, SRV_ST_400, SRV_CT_TEXT, "oom" as &const byte, 3);
+        return;
+    }
+    if !buf_append_cstr(&full, "/lib/client.js") {
+        // 行宽豁免：不可断的 JSON 字面量
+        _ = srv_send_response(fd, SRV_ST_400, SRV_CT_TEXT, "oom" as &const byte, 3);
+        return;
+    }
+    if want_map {
+        if !buf_append_cstr(&full, ".map") {
+        // 行宽豁免：不可断的 JSON 字面量
+            _ = srv_send_response(fd, SRV_ST_400, SRV_CT_TEXT, "oom" as &const byte, 3);
+            return;
+        }
+    }
+    if !buf_append_byte(&full, 0) {
+        // 行宽豁免：不可断的 JSON 字面量
+        _ = srv_send_response(fd, SRV_ST_400, SRV_CT_TEXT, "oom" as &const byte, 3);
+        return;
+    }
+    var body: Buf = buf_new(4194304);
+    defer { buf_free(&body); }
+    if !dwh_read_file(full.ptr as &const byte, &body, 4194304) {
+        _ = srv_send_response(fd, SRV_ST_404, SRV_CT_TEXT,
+            "no bundle" as &const byte, 9);
+        return;
+    }
+    // 不用 if 表达式赋 const：codegen 会把它落成一个只读临时量再赋值（实测
+    // `assignment of read-only variable __uya_ifexpr_*`）。用可变变量表达同一件事。
+        // 行宽豁免：不可断的 JSON 字面量
+    var ct: &const byte = "application/javascript; charset=utf-8" as &const byte;
+    if want_map {
+        ct = SRV_CT_JSON;
+    }
+        // 行宽豁免：不可断的 JSON 字面量
+    _ = dwh_send_large(h, fd, ct, body.ptr as &const byte, body.len);
+}
+
+// dist 里的静态文件（拒绝路径穿越）。
+fn dwh_send_static(h: &const DwhHost, ci: usize, path: &const Buf) void {
+    if ci >= DWH_MAX_CONNS {
+        return;
+    }
+    const fd: i32 = h.conns[ci].fd;
+    // 路径穿越：`..` 一律拒（`/assets/*` 这类正常路径不会有它）
+    if dwh_has_dotdot(path) {
+        _ = srv_send_response(fd, SRV_ST_404, SRV_CT_TEXT,
+            "forbidden" as &const byte, 9);
+        return;
+    }
+    // 去掉开头的 `/` 再拼 dist：**不能用 `&path.ptr[1]`** —— 那是「从下标 1 起的指针」，
+    // 没有长度，`buf_append_cstr` 会一路读到缓冲区后面的字节（拼出来的路径根本不对，
+    // 症状是 `/assets/*` 全 404 而文件其实都在）。所以这里显式搬一段。
+    var full: Buf = buf_new(1400);
+    defer { buf_free(&full); }
+    if !dwh_dist_rel(h, path, &full) {
+        // 行宽豁免：不可断的 JSON 字面量
+        _ = srv_send_response(fd, SRV_ST_400, SRV_CT_TEXT, "oom" as &const byte, 3);
+        return;
+    }
+    if !buf_append_byte(&full, 0) {
+        // 行宽豁免：不可断的 JSON 字面量
+        _ = srv_send_response(fd, SRV_ST_400, SRV_CT_TEXT, "oom" as &const byte, 3);
+        return;
+    }
+    var body: Buf = buf_new(8388608);
+    defer { buf_free(&body); }
+    if !dwh_read_file(full.ptr as &const byte, &body, 8388608) {
+        _ = srv_send_response(fd, SRV_ST_404, SRV_CT_TEXT,
+            "not found" as &const byte, 9);
+        return;
+    }
+    _ = srv_send_response(fd, SRV_ST_200, dwh_mime_of(path),
+        body.ptr as &const byte, body.len);
+}
+
+// 路径里有 `..` 吗。
+fn dwh_has_dotdot(path: &const Buf) bool {
+    var i: usize = 0;
+    while i + 2 < path.len {
+        if path.ptr[i] == 46 as byte && path.ptr[i + 1] == 46 as byte {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+// 按后缀给 Content-Type（够 DSH 的 dist 用：html/js/css/svg/json/字体）。
+fn dwh_mime_of(path: &const Buf) &const byte {
+    const p: &const byte = path.ptr as &const byte;
+    const n: usize = path.len;
+    if n >= 4 && dwh_suffix_is(p, n, ".css" as &const byte) {
+        return "text/css; charset=utf-8" as &const byte;
+    }
+    if n >= 3 && dwh_suffix_is(p, n, ".js" as &const byte) {
+        return "application/javascript; charset=utf-8" as &const byte;
+    }
+    if n >= 4 && dwh_suffix_is(p, n, ".svg" as &const byte) {
+        return "image/svg+xml" as &const byte;
+    }
+    if n >= 5 && dwh_suffix_is(p, n, ".json" as &const byte) {
+        return SRV_CT_JSON;
+    }
+    if n >= 5 && dwh_suffix_is(p, n, ".woff2" as &const byte) {
+        return "font/woff2" as &const byte;
+    }
+    if n >= 4 && dwh_suffix_is(p, n, ".woff" as &const byte) {
+        return "font/woff" as &const byte;
+    }
+    if n >= 3 && dwh_suffix_is(p, n, ".ttf" as &const byte) {
+        return "font/ttf" as &const byte;
+    }
+    if n >= 13 && dwh_suffix_is(p, n, ".webmanifest" as &const byte) {
+        return "application/manifest+json" as &const byte;
+    }
+    return SRV_CT_BIN;
+}
+
+// p 的后缀是 suf 吗。
+fn dwh_suffix_is(p: &const byte, n: usize, suf: &const byte) bool {
+    const sl: usize = bufx_cstr_len(suf);
+    if sl == 0 || n < sl {
+        return false;
+    }
+    return bufx_eq_cstr(&p[n - sl], sl, suf);
+}
+
+// `/api/<method>`：收 body → 取 rpcId → 产 value → 包成 ServerResponse。
+// **未实现的方法回 200 + `internal` 业务错**（HTTP 状态只表示载体）。
+fn dwh_send_api(h: &DwhHost, ci: usize, m: u8, path: &const Buf,
+    head_end: usize) void {
+    if ci >= DWH_MAX_CONNS {
+        return;
+    }
+    const fd: i32 = h.conns[ci].fd;
+    if m != SRV_M_POST {
+        _ = srv_send_response(fd, SRV_ST_404, SRV_CT_TEXT,
+            "post only" as &const byte, 9);
+        return;
+    }
+    var body: Buf = buf_new(65536);
+    defer { buf_free(&body); }
+    if !dwh_read_body(&h.conns[ci], head_end, &body) {
+        _ = srv_send_response(fd, SRV_ST_400, SRV_CT_TEXT,
+            "bad body" as &const byte, 8);
+        return;
+    }
+    var rpc: Buf = buf_new(128);
+    defer { buf_free(&rpc); }
+    if !dwh_pick_rpc(&body, &rpc) {
+        _ = srv_send_response(fd, SRV_ST_400, SRV_CT_TEXT,
+            "no rpcId" as &const byte, 8);
+        return;
+    }
+    var method: Buf = buf_new(64);
+    defer { buf_free(&method); }
+    if !dwh_pick_method(&body, &method) {
+        _ = srv_send_response(fd, SRV_ST_400, SRV_CT_TEXT,
+            "no method" as &const byte, 9);
+        return;
+    }
+    // 路径里的方法名（`/api/<method>`）：与 body 里的 `method` 必须一致（DSH 要求）
+    const path_method: &const byte = &path.ptr[5];
+    const pml: usize = path.len - 5;
+    var resp: Buf = buf_new(65536);
+    defer { buf_free(&resp); }
+    if !bufx_eq_cstr(path_method, pml, method.ptr as &const byte) {
+        if !dwh_rpc_err(rpc.ptr as &const byte, "bad-request" as &const byte,
+            "method does not match path" as &const byte, 25, &resp) {
+            h.conns[ci].st = DWH_C_DONE;
+            return;
+        }
+    } else {
+        var value: Buf = buf_new(65536);
+        defer { buf_free(&value); }
+        if dwh_unary(h, method.ptr as &const byte, method.len, &value) {
+            if !dwh_rpc_ok(rpc.ptr as &const byte, &value, &resp) {
+                h.conns[ci].st = DWH_C_DONE;
+                return;
+            }
+        } else {
+            // 没实现：**如实说**（客户端据此把那个面当「不支持」，而不是「连接坏了」）
+            var msg: Buf = buf_new(128);
+            defer { buf_free(&msg); }
+            _ = buf_append_cstr(&msg, "not implemented: ");
+            _ = buf_append(&msg, method.ptr as &const byte, method.len);
+            if !dwh_rpc_err(rpc.ptr as &const byte, "internal" as &const byte,
+                msg.ptr as &const byte, msg.len, &resp) {
+                h.conns[ci].st = DWH_C_DONE;
+                return;
+            }
+        }
+    }
+    _ = srv_send_response(fd, SRV_ST_200, SRV_CT_JSON,
+        resp.ptr as &const byte, resp.len);
+}
