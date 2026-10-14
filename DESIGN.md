@@ -3153,7 +3153,49 @@ S→C {"type":"item","streamId":"<uuid>","value":{"type":"ready","clientId":"<uu
 > ③④ 同症状不同因，这正是「症状离原因很远」的形态：两者都表现为「只解第一条」。
 > 如果只修 ③ 就收工，④ 会让它看起来**没修好**。
 
-##### 八、未解：页面仍 `connection lost, retry #N`（如实记，不假装做完）
+##### 八、第十三~十四批：会话流接通了，消息渲染还差一步
+
+第十一批修掉「帧少一个 `}`」之后，连接不再重连。第十三、十四批继续推进，
+把页面从「白屏 + 选工作区」推到「**完整的聊天界面挂载、会话被选中**」，
+控制台**零错误零告警**、37 个 slot（`conversation.*` 全套）、entries 65
+（与真 DSH 逐数相同）。**但消息正文仍没折进对话区**（`make dsh-web-check`
+那条仍红）。这一节把**做成了什么**与**排除过什么**都钉住。
+
+**做成的（都是实测）**：
+
+| # | 缺陷 | 症状 | 根因 |
+|---|---|---|---|
+| 1 | `workspace/follow` 与 `workspace.list` 不一致 | 页面停在 `Choose workspace`、**从不开 `session/follow`** | follow 的 baseline 回 `items: []` 而 unary 回一个工作区 ⇒ 客户端「从流里」看到零个工作区。**单看任一条都对，只有不一致才出问题** ⇒ 现在共用 `dwh_workspace_item` |
+| 2 | `dwh_remote_item` 的 `extra` 当 C 串量长度 | 帧里混进**上次用过的缓冲残留**（`…"]ace","@deepseek-ai/…`）⇒ JSON 坏 ⇒ `close(4002)` | `extra` 常是另一个 `Buf`（无 NUL），`bufx_cstr_len` 读进相邻内存。改成显式长度 |
+| 3 | `dwh_remote_item` 缓冲写死 2048 | 几千字节的 snapshot 被**截断**（浏览器收到 462 字节，裸 socket 3141）⇒ 4002 | 改成按 `extra` 长度算 |
+| 4 | snapshot 缺 `assistantStream` | 客户端拿到 snapshot 第一句就 `throw`（"omitted its opted-in opening baseline"）⇒ 整条流不折 | 补 `{revision:0}`（形状取自真 DSH） |
+| 5 | `session/list` 的 `projections` 缺 `kind` | `unreachable variant in session list projection block kind: undefined` | 客户端是判别联合，补 `"kind":"sequenced"` |
+| 6 | roster 按「有 bundle」而不是 profile 名单 | `voice-input` 拿不到 speech catalog ⇒ `conversation.input.activity` slot **整块崩掉** | 差集 5 个包（2 个 experimental + schedule + 2 个 directory-picker）；后者由 host 侧运行期按平台启用 |
+
+**`blank` 必须是 true**：客户端只在 `blank && cwd === workspace.path &&
+workspace.sessionIds.includes(id)` 三者全成立时才**复用**会话，否则转
+`sessions.create`（本仓没有可建的会话）。
+
+**排除过的（负面结果，免得重走）**：
+
+| 假设 | 怎么排除的 |
+|---|---|
+| `isSeeded` 该给 true | 试过 true/false 两种，结果一样（客户端不报错、`conversation.session` 仍空） |
+| 缺 `session/end-seed` seed 事件 | 补了真 DSH 的四条 seed（permission/preset / sandbox/mode / approval/policy / session/end-seed），**仍空** |
+| sessionId 格式要 UUID | 换成真 DSH 的 UUID 形态，**仍空**（已回退） |
+| 帧字段被 `assertSessionWireEvent` 拒 | 逐条核对：我的 event 键（type/seq/time/data/surfaceOp）全在白名单、`data` 里有 `turn`/`step`、`SURFACE_EVENT_TYPES` 五个类型全对 |
+| 客户端报错被吞 | 控制台**零输出**（连 warning 都没有）—— 说明是「状态没被填充」而不是「渲染失败」 |
+
+**下一步的入口（本轮缩小到的位置）**：客户端**选中会话**的链路。
+`session/create` 从未被调用 ⇒ workspace 的 `restoreSelection` 没走到
+`connectWorkspace`。而它要求 `watchNavigation` 的 reconcile 里
+`workspace.phase === "ready" && sessions.phase === "ready"`。已实测两条流
+（`workspace/follow` 带工作区、`session/follow` 开得起来）都在，
+所以嫌疑落在 **`mainReference` 是否已被别处设过**（若已设，reconcile 直接
+`initial = "done"` 返回）或 `clearArchivedCurrent()` 的早退。下一轮直接从
+读 `selection` store 的初值与 `mainReference` 的赋值点入手。
+
+##### 九、历史记录：`connection lost` 的排查（第十一批已解）
 
 第十批之后，`generation is still not ready` 那条告警**消失了**（说明 `$events`
 的 `ready` 已被接受），但页面仍每 3 秒重连。**已排除的**（都是实测）：
