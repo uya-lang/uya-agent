@@ -1,0 +1,755 @@
+// src/web/wsess.uya — 把本仓的会话日志**适配成 DSH 的 SessionEvent 形状**
+//
+// 本文件：`dwire_*` —— 逐行读本仓的 `session.jsonl`，把每一行**翻译成** DSH 浏览器
+//   前端认的那套形状（`{"type":…,"seq":…,"time":…,"data":…}` 信封 + DSH 的 `data` 内层
+//   结构），写进调用方给的 `Buf`。
+// 不变量：① **只翻译、不改本仓日志**：日志是 `--resume` 与 stats 折叠的真值源，它的形状
+//   不许为了浏览器而变 —— 适配只发生在「出网」这一步（这就是它单独一个文件的原因）；
+//   ② **`surfaceOp` 是硬要求**：DSH 浏览器按它判「这条进不进对话面」，而
+//   `user/message` / `assistant/message` / `tool/result` 三类**缺它就不渲染**
+//   （三条都缺 = 界面上一条消息都没有，且**没有任何报错**）；本仓不写它，所以这里补
+//   `"surfaceOp":"append"`；
+//   ③ **`id` 也是硬要求**（user/assistant 两类）：DSH 的 fold 拿 `data.id` 当条目身份，
+//   而本仓的 user/message 里没有 id、assistant 的 message 里也没有 —— 这里按
+//   `"<id前缀>-<seq>"` **确定性派生**一个（同样的日志必然得到同样的 id，便于对账；
+//   不用随机数：那会让同一份日志每次重开都变成"新消息"）；
+//   ④ **`content` 是块数组**，不是字符串：DSH 的类型是 `ContentBlock[]`
+//   （`{type:"text",text}` / `{type:"reasoning",text}` /
+//   `{type:"tool-call",…}`），
+//   而本仓 assistant 的 content 是一整段**字符串** ⇒ 包成 `[{type:"text",text:…}]`；
+//   ⑤ **`tool/result` 要包成 message**：DSH 读
+//   `data.message.content[0]`（一个 `tool-result` 块）与
+//   `data.message.source.callId`，
+//   而本仓是扁平的 `content` + `callId`；
+//   ⑥ **`turn/end` 的 reason 是对象**：DSH 读 `data.reason.kind`，本仓写的是**字符串**
+//   ⇒ 映射成 `{"kind":…}`（`aborted` 还要带 `reason:{kind:"user"}`，见 DSH 的
+//   `TurnEndReasonMap`）；
+//   ⑦ 认不出的类型**原样透传**（DSH 的 fold 对未知类型是 `default: return`，宽容）——
+//   这样本仓的私有事件（`session/worktree` / `assistant/first-token` / `diag/dump`）
+//   不会把整条流弄坏，也不会把将来的新事件挡在外面；
+//   ⑧ 本文件**不许认识 `Config` / `g_sess`**（它只做文本变换，纯函数，可独立自测）。
+// 依赖：foundation/bufx（Buf / find_sub / bufx_*）、foundation/jsonx（jw_str_into 走
+//   session/session 的那一份 —— 转义规则全仓只许有一份）。
+// 命名：对外 `dwire_*`（`dwire_line` 是唯一入口）+ 常量 `DWIRE_*`。
+//
+// 为什么是「逐行翻译」而不是「解析成结构再重排」：本仓日志**一行一个事件**（追加-only、
+// 崩溃时最后一行可能不完整），而 DSH 也是行式事件流。逐行翻译保住这条同构，
+// 于是「日志 → 浏览器」不需要一个中间全量模型（那在大日志上要么吃内存、要么改成分页）。
+//
+// **已知边界（如实记账）**：本文件只做**形状**适配，不做**语义**补齐 ——
+//   * DSH 的 `assistant/chunk`（token 级流式）本仓不写，所以浏览器端**没有逐字流式**，
+//     只有整条 `assistant/message` 落地后一次性出现（要流式得让执行核写 chunk 事件，
+//     那是执行核的改动，不属于"适配"）；
+//   * 本仓的 `assistant/reasoning` 是**独立事件**，DSH 的 fold 不认它（`default: return`），
+//     所以这里把它**折进** `assistant/message` 的 `content` 数组（`{type:"reasoning"}`），
+//     而不是原样透传 —— 否则思考内容在浏览器里整段消失；
+//   * `tool/call` 本仓带着 `name`/`arguments`，DSH 的 fold 从 `assistant/message` 的
+//     `tool-call` 块里取调用信息，所以这里把它也包成一条 `assistant/message`（见下）。
+
+use libc.heap;
+
+// 一行译文的上限（与 session.uya 的单行上限同量级；超了整条丢弃，不写半条）。
+export const DWIRE_LINE_MAX: usize = 4194304;
+
+// 把本仓日志的一行（`line`，含结尾 `\n`）翻译成 DSH 形状，追加进 `out`。
+// 返回 false = 这行不是可翻译的事件（空行 / 不完整尾行 / 内存不足）——调用方跳过它。
+// **成功时 `out` 里一定是一行完整的 JSON + `\n`**（消费者按行解析）。
+// `typ` 是不是 `lit`（把 `bufx_eq_cstr(typ.ptr as &const byte, typ.len, …)` 收成一行 ——
+// 那个写法在分派处出现 8 次，每次都超行宽）。
+fn dwire_is(typ: &const Buf, lit: &const byte) bool {
+    return bufx_eq_cstr(typ.ptr as &const byte, typ.len, lit);
+}
+
+// 把本仓日志的一行（`line`，含结尾 `\n`）翻译成 DSH 形状，追加进 `out`。
+// 返回 false = 这行不是可翻译的事件（空行 / 头行 / 不完整尾行 / 内存不足），调用方跳过它。
+// **成功时 `out` 里一定是一行完整的 JSON + `\n`**（消费者按行解析）。
+export fn dwire_line(line: &const Buf, out: &Buf) bool {
+    buf_reset(out);
+    var typ: Buf = buf_new(64);
+    defer { buf_free(&typ); }
+    if !sess_line_type(line, &typ) {
+        return false;
+    }
+    // 首行是 header（`"type":"session"`），浏览器不需要它（它会由 session.list 提供）。
+    if dwire_is(typ, "session" as &const byte) {
+        return false;
+    }
+    if dwire_is(typ, "user/message" as &const byte) {
+        return dwire_user(line, out);
+    }
+    if dwire_is(typ, "assistant/message" as &const byte) {
+        return dwire_assistant(line, out);
+    }
+    if dwire_is(typ, "assistant/reasoning" as &const byte) {
+        return dwire_reasoning(line, out);
+    }
+    if dwire_is(typ, "tool/call" as &const byte) {
+        return dwire_tool_call(line, out);
+    }
+    if dwire_is(typ, "tool/result" as &const byte) {
+        return dwire_tool_result(line, out);
+    }
+    if dwire_is(typ, "turn/end" as &const byte) {
+        return dwire_turn_end(line, out);
+    }
+    // 其余（turn/start、step/start、step/end、session/title、session/model、
+    //   session/workspace、session/worktree、llm/retry、plan/mode、
+//   compaction/summary、
+    //   diag/dump、assistant/first-token…）：**原样透传**（不变量⑦）。
+    return dwire_passthrough(line, out);
+}
+
+// ---- 信封 ----
+
+// 写 DSH 的信封前半：`{"type":"<typ>","seq":N,"time":N,"data":{`。
+// 本仓的信封与 DSH 的**逐字段同形**（都是 type/seq/time/data），所以这里只搬 `seq`/`time`
+// 两个数字，不改名、不改序。
+// ⚠ **`,"data":{` 里的那个 `{` 与结尾的 `"` 都不能少**：少了 `"` 就是 `…"time":1{`
+// （JSON 结构坏掉），少了 `{` 就是 `…"data":"turn":2` —— 两种都**不影响任何子串断言**
+// （`"seq":0` / `"surfaceOp":"append"` 全都还在），只有拿真 schema 校验才抓得住
+// （实测：这两处都是外部 oracle 抓出来的，见 §11.9.6）。
+fn dwire_head(line: &const Buf, typ: &const byte, out: &Buf) bool {
+    if !buf_append_cstr(out, "{\"type\":\"") {
+        return false;
+    }
+    if !buf_append_cstr(out, typ) {
+        return false;
+    }
+    if !buf_append_cstr(out, "\",\"seq\":") {
+        return false;
+    }
+    const seq: i64 = sess_line_seq(line);
+    if !buf_append_i64(out, seq) {
+        return false;
+    }
+    if !buf_append_cstr(out, ",\"time\":") {
+        return false;
+    }
+    const t: i64 = sess_json_i64(line.ptr[0: line.len], "time" as &const byte);
+    if !buf_append_i64(out, t) {
+        return false;
+    }
+    return buf_append_cstr(out, ",\"data\":{");
+}
+
+// 信封收尾：`}` 关掉 `data`，再按需在**信封层**补 `"surfaceOp":"append"`，最后关掉整行。
+// `surfaceOp` 必须是 `data` 的**兄弟**（DSH 的 `sessionEventSchema` 就在信封层读它）——
+// 写进 `data` 里结构合法但**语义丢了**：DSH 的 fold 会因为「没有 surfaceOp」而不渲染
+// 这条消息（且不报错），所以它的位置和存在性一样重要。
+fn dwire_tail(out: &Buf, need_surface: bool) bool {
+    if !buf_append_byte(out, 125) {
+        return false;
+    }
+    if need_surface {
+        if !buf_append_cstr(out, ",\"surfaceOp\":\"append\"") {
+            return false;
+        }
+    }
+    return buf_append_cstr(out, "}\n");
+}
+
+// 派生一个**确定性**消息 id：`<会话 id 前缀><seq>`。
+// 为什么不用随机 id：同一份日志每次重开必须得到同样的 id，否则浏览器把同一条消息
+// 当成新消息（消息身份是 fold 的去重键，见不变量③）。
+// 形状取 `m-<seq>`：DSH 只要求它是非空字符串（`messageIdSchema = z.string().min(1)`），
+// 所以不必伪造 UUID。
+fn dwire_msg_id(seq: i64, out: &Buf) bool {
+    if !buf_append_cstr(out, "m-") {
+        return false;
+    }
+    return buf_append_i64(out, seq);
+}
+
+// 原样透传（把本仓那一行直接拷过去，**只补 surfaceOp 之类 DSH 必需的字段**）。
+// 这里刻意**不**重新序列化：本仓那行的 data 内部形状与 DSH 兼容的部分就照原样用，
+// 不兼容的才在各自的分支里改。
+fn dwire_passthrough(line: &const Buf, out: &Buf) bool {
+    if line.len == 0 {
+        return false;
+    }
+    // 去掉可能的结尾换行，稍后统一补一个。
+    var n: usize = line.len;
+    while n > 0 && (line.ptr[n - 1] == 10 as byte
+        || line.ptr[n - 1] == 13 as byte) {
+        n = n - 1;
+    }
+    if !buf_append(out, line.ptr as &const byte, n) {
+        return false;
+    }
+    return buf_append_byte(out, 10);
+}
+
+// ---- 各事件的翻译 ----
+
+// `user/message`：本仓是
+//   `{"role":"user","content":[{"type":"text","text":…}],"source":{…}}`
+// DSH 要 `data.id`（fold 的条目身份）+ **事件级** `surfaceOp`。
+fn dwire_user(line: &const Buf, out: &Buf) bool {
+    if !dwire_head(line, "user/message" as &const byte, out) {
+        return false;
+    }
+    if !buf_append_cstr(out, "\"role\":\"user\",\"content\":") {
+        return false;
+    }
+    if !dwire_copy_array(line, "content" as &const byte, out) {
+        return false;
+    }
+    if !buf_append_cstr(out, ",\"source\":") {
+        return false;
+    }
+    if !dwire_copy_object(line, "source" as &const byte, out) {
+        return false;
+    }
+    if !buf_append_cstr(out, ",\"id\":") {
+        return false;
+    }
+    const seq: i64 = sess_line_seq(line);
+    var id: Buf = buf_new(32);
+    defer { buf_free(&id); }
+    if !dwire_msg_id(seq, &id) {
+        return false;
+    }
+    if !jw_str_into(out, id.ptr as &const byte, id.len) {
+        return false;
+    }
+    // 信封收尾 + **事件级 surfaceOp**
+    return dwire_tail(out, true);
+}
+
+// `assistant/message`：本仓是
+//   `{"turn":N,"step":N,"message":{"role":"assistant","content":"<整段字符串>",
+//     "tool_calls":[…]?},"usage":{…}}`
+// DSH 要：`message.content` 是 **ContentBlock[]**（不是字符串）、`message.id`、
+//   事件级 `surfaceOp`。所以这里把字符串包成一个 text 块，并把 `tool_calls` 也翻成块。
+fn dwire_assistant(line: &const Buf, out: &Buf) bool {
+    if !dwire_head(line, "assistant/message" as &const byte, out) {
+        return false;
+    }
+    if !buf_append_cstr(out, "\"turn\":") {
+        return false;
+    }
+    if !dwire_i64_of(line, "turn" as &const byte, out) {
+        return false;
+    }
+    if !buf_append_cstr(out, ",\"step\":") {
+        return false;
+    }
+    if !dwire_i64_of(line, "step" as &const byte, out) {
+        return false;
+    }
+    // 行宽豁免：这一段是**不可断的 JSON 骨架字面量**（在中间换行会把 JSON 拆坏）。
+    if !buf_append_cstr(out, ",\"message\":{\"role\":\"assistant\",\"content\":[") {
+        return false;
+    }
+    // 正文：本仓的 `message.content` 是**字符串** ⇒ 包成 `{type:"text",text:…}`
+    var body: Buf = buf_new(DWIRE_LINE_MAX);
+    defer { buf_free(&body); }
+    if !dwire_string_field(line, "content" as &const byte, &body) {
+        buf_reset(&body);
+    }
+    var first: bool = true;
+    if body.len > 0 {
+        if !buf_append_cstr(out, "{\"type\":\"text\",\"text\":") {
+            return false;
+        }
+        if !jw_str_into(out, body.ptr as &const byte, body.len) {
+            return false;
+        }
+        if !buf_append_byte(out, 125) {
+            return false;
+        }
+        first = false;
+    }
+    // tool_calls：本仓是
+    //   `[{"id":…,"type":"function","function":{"name":…,"arguments":…}}]`
+    // ⇒ 翻成 DSH 的 `{type:"tool-call",id,name,arguments}` 块
+    // （`arguments` 是**原始 JSON 字符串**，与 DSH 的 `ToolCallBlock.arguments` 同型）。
+    if !dwire_tool_calls_into(line, out, &first) {
+        return false;
+    }
+    if !buf_append_cstr(out, "],\"id\":") {
+        return false;
+    }
+    var id: Buf = buf_new(32);
+    defer { buf_free(&id); }
+    if !dwire_msg_id(sess_line_seq(line), &id) {
+        return false;
+    }
+    if !jw_str_into(out, id.ptr as &const byte, id.len) {
+        return false;
+    }
+    // source：DSH 的 assistant 要有 `{kind:"model",provider,model}`。本仓的
+    // assistant 事件里**没有** provider/model（那是会话级的），所以这里给一个最小合法值
+    // —— 缺 source 会被 DSH 的 fold 当即抛错（`source.kind` 是必读字段）。
+    // 行宽豁免：不可断的 JSON 骨架字面量（同上）。
+    if !buf_append_cstr(out, ",\"source\":{\"kind\":\"model\",\"provider\":\"uya-agent\",\"model\":\"uya-agent\"}") {
+        return false;
+    }
+    if !buf_append_byte(out, 125) {
+        return false;
+    }
+    // usage 原样带上（DSH 的 `usage` 是可选的，字段名同型：inputTokens/outputTokens…）
+    var usage: Buf = buf_new(512);
+    defer { buf_free(&usage); }
+    if dwire_copy_object(line, "usage" as &const byte, &usage) {
+        if !buf_append_cstr(out, ",\"usage\":") {
+            return false;
+        }
+        if !buf_append(out, usage.ptr as &const byte, usage.len) {
+            return false;
+        }
+    }
+    return dwire_tail(out, true);
+}
+
+// `assistant/reasoning`：本仓的独立事件，DSH 的 fold **不认**（`default: return`）⇒
+// 折成一条 `assistant/message`，正文放在 `content` 的 `reasoning` 块里（DSH 认得
+// `ReasoningBlock`）。这样思考内容才在浏览器里看得见（见文件头的已知边界）。
+// ⚠ 正文在 **`data.message.reasoning_content`**（不是 `data.text`）：本仓这个事件的形状
+// 是「跟着 `assistant/message` 走、message 包一层、字段名用线上协议名」
+// （见 `ag_title_prompt.uya` 的 `agent_reasoning_event_json`）。实测按 `data.text` 读
+// 会**静默取到空串** —— 思考整段消失而不报错，所以这里显式取两层。
+fn dwire_reasoning(line: &const Buf, out: &Buf) bool {
+    if !dwire_head(line, "assistant/message" as &const byte, out) {
+        return false;
+    }
+    if !buf_append_cstr(out, "\"turn\":") {
+        return false;
+    }
+    if !dwire_i64_of(line, "turn" as &const byte, out) {
+        return false;
+    }
+    if !buf_append_cstr(out, ",\"step\":") {
+        return false;
+    }
+    if !dwire_i64_of(line, "step" as &const byte, out) {
+        return false;
+    }
+    var msg: Buf = buf_new(DWIRE_LINE_MAX);
+    defer { buf_free(&msg); }
+    if !dwire_copy_object(line, "message" as &const byte, &msg) {
+        return false;
+    }
+    var body: Buf = buf_new(DWIRE_LINE_MAX);
+    defer { buf_free(&body); }
+    if !dwire_str_span(&msg, "reasoning_content" as &const byte, &body) {
+        return false;
+    }
+    // 行宽豁免：不可断的 JSON 骨架字面量（同上）。
+    if !buf_append_cstr(out, ",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"reasoning\",\"text\":") {
+        return false;
+    }
+    if !jw_str_into(out, body.ptr as &const byte, body.len) {
+        return false;
+    }
+    if !buf_append_cstr(out, "}],\"id\":") {
+        return false;
+    }
+    var id: Buf = buf_new(32);
+    defer { buf_free(&id); }
+    if !dwire_msg_id(sess_line_seq(line), &id) {
+        return false;
+    }
+    if !jw_str_into(out, id.ptr as &const byte, id.len) {
+        return false;
+    }
+    if !buf_append_cstr(out, ",\"source\":{\"kind\":\"model\",\"provider\":\"uya-agent\",\"model\":\"uya-agent\"}}") {
+        return false;
+    }
+    return dwire_tail(out, true);
+}
+
+// `tool/call`：本仓是 `{"turn":N,"step":N,"callId":…,"name":…,"arguments":…}`。
+// DSH 的 fold **不看** `tool/call` 的独立形状吗？——看：它读
+// `data.callId`/`data.name`/`data.arguments` 来开一个工具节点
+// （`match: event.type === "tool/call"`）。
+// 所以这条**字段同型、可原样透传**，只需补信封（本地也没有 surfaceOp 要求：
+// `tool/call` 不在 DSH 的 `SURFACE_EVENT_TYPES` 里）。
+fn dwire_tool_call(line: &const Buf, out: &Buf) bool {
+    if !dwire_head(line, "tool/call" as &const byte, out) {
+        return false;
+    }
+    if !buf_append_cstr(out, "\"turn\":") {
+        return false;
+    }
+    if !dwire_i64_of(line, "turn" as &const byte, out) {
+        return false;
+    }
+    if !buf_append_cstr(out, ",\"step\":") {
+        return false;
+    }
+    if !dwire_i64_of(line, "step" as &const byte, out) {
+        return false;
+    }
+    if !buf_append_cstr(out, ",\"callId\":") {
+        return false;
+    }
+    if !dwire_copy_str_field(line, "callId" as &const byte, out) {
+        return false;
+    }
+    if !buf_append_cstr(out, ",\"name\":") {
+        return false;
+    }
+    if !dwire_copy_str_field(line, "name" as &const byte, out) {
+        return false;
+    }
+    if !buf_append_cstr(out, ",\"arguments\":") {
+        return false;
+    }
+    if !dwire_copy_str_field(line, "arguments" as &const byte, out) {
+        return false;
+    }
+    // `tool/call` 不在 DSH 的 `SURFACE_EVENT_TYPES` 里 ⇒ 不带 surfaceOp。
+    return dwire_tail(out, false);
+}
+
+// `tool/result`：本仓是扁平的 `{"turn":N,"step":N,"callId":…,"content":…}`；
+// DSH 要 `data.message`（一条 `role:"user"` 的消息），其 `content[0]` 是
+// `{type:"tool-result",toolCallId,content:[…]}`、`source` 是
+// `{kind:"tool",callId}`。
+// 内容本仓是一整段**字符串** ⇒ 包成 `[{type:"text",text:…}]` 作为工具结果的 content。
+fn dwire_tool_result(line: &const Buf, out: &Buf) bool {
+    if !dwire_head(line, "tool/result" as &const byte, out) {
+        return false;
+    }
+    if !buf_append_cstr(out, "\"turn\":") {
+        return false;
+    }
+    if !dwire_i64_of(line, "turn" as &const byte, out) {
+        return false;
+    }
+    if !buf_append_cstr(out, ",\"step\":") {
+        return false;
+    }
+    if !dwire_i64_of(line, "step" as &const byte, out) {
+        return false;
+    }
+    var cid: Buf = buf_new(256);
+    defer { buf_free(&cid); }
+    if !dwire_string_field(line, "callId" as &const byte, &cid) {
+        return false;
+    }
+    var body: Buf = buf_new(DWIRE_LINE_MAX);
+    defer { buf_free(&body); }
+    if !dwire_string_field(line, "content" as &const byte, &body) {
+        buf_reset(&body);
+    }
+    // 行宽豁免：不可断的 JSON 骨架字面量（同上）。
+    if !buf_append_cstr(out, ",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"tool-result\",\"toolCallId\":") {
+        return false;
+    }
+    if !jw_str_into(out, cid.ptr as &const byte, cid.len) {
+        return false;
+    }
+    if !buf_append_cstr(out, ",\"content\":[{\"type\":\"text\",\"text\":") {
+        return false;
+    }
+    if !jw_str_into(out, body.ptr as &const byte, body.len) {
+        return false;
+    }
+    if !buf_append_cstr(out, "}]}],\"source\":{\"kind\":\"tool\",\"callId\":") {
+        return false;
+    }
+    if !jw_str_into(out, cid.ptr as &const byte, cid.len) {
+        return false;
+    }
+    if !buf_append_cstr(out, "},\"id\":") {
+        return false;
+    }
+    var id: Buf = buf_new(32);
+    defer { buf_free(&id); }
+    if !dwire_msg_id(sess_line_seq(line), &id) {
+        return false;
+    }
+    if !jw_str_into(out, id.ptr as &const byte, id.len) {
+        return false;
+    }
+    // 关掉嵌套的 `"message":{…}`，再由 dwire_tail 关 `data` 与整行。
+    if !buf_append_byte(out, 125) {
+        return false;
+    }
+    // `tool/result` 也在 DSH 的 `SURFACE_EVENT_TYPES` 里 ⇒ 必须带 surfaceOp。
+    return dwire_tail(out, true);
+}
+
+// `turn/end`：本仓的 `reason` 是**字符串**（"completed"/"aborted"/"max-tokens"/"error"），
+// DSH 读的是对象 `data.reason.kind`（它的 `TurnEndReasonMap`）。
+// `aborted` 还要带 `reason:{kind:"user"}`（DSH 的 `TurnEndCancelCause` 是必填的）。
+fn dwire_turn_end(line: &const Buf, out: &Buf) bool {
+    if !dwire_head(line, "turn/end" as &const byte, out) {
+        return false;
+    }
+    if !buf_append_cstr(out, "\"turn\":") {
+        return false;
+    }
+    if !dwire_i64_of(line, "turn" as &const byte, out) {
+        return false;
+    }
+    var r: Buf = buf_new(64);
+    defer { buf_free(&r); }
+    if !dwire_string_field(line, "reason" as &const byte, &r) {
+        buf_reset(&r);
+    }
+    if !buf_append_cstr(out, ",\"reason\":{\"kind\":") {
+        return false;
+    }
+    if r.len == 0 {
+        // 没写 reason 的老日志：DSH 那边「什么都没说」最接近的是 completed。
+        if !buf_append_cstr(out, "\"completed\"") {
+            return false;
+        }
+    } else if !jw_str_into(out, r.ptr as &const byte, r.len) {
+        return false;
+    }
+    if dwire_is(&r, "aborted" as &const byte) {
+        if !buf_append_cstr(out, ",\"reason\":{\"kind\":\"user\"}") {
+            return false;
+        }
+    } else if dwire_is(&r, "error" as &const byte) {
+        // DSH 的 error 分支要一个 `LlmFailure`（`message` 与 `code` 必填）。
+        if !buf_append_cstr(out, ",\"error\":{\"message\":\"turn failed\",\"code\":\"UNKNOWN\"}") {
+            return false;
+        }
+    }
+    // 关掉嵌套的 `"reason":{…}`，再由 dwire_tail 关 `data` 与整行。
+    if !buf_append_byte(out, 125) {
+        return false;
+    }
+    return dwire_tail(out, false);
+}
+
+// ---- 字段搬运小工具（都只认「本仓自己写出来的形状」，不引 std.json）----
+
+
+// 写一个数字字段的**值**（键由调用方写）。
+fn dwire_i64_of(line: &const Buf, key: &const byte, out: &Buf) bool {
+    var v: i64 = sess_json_i64(line.ptr[0: line.len], key);
+    if v < 0 {
+        v = 0;
+    }
+    return buf_append_i64(out, v);
+}
+
+// 原样搬一个**字符串字段的值**（含两侧引号与转义）。本仓写日志时已经转义过，
+// 所以这里逐字节搬即可 —— 重新转义反而会把 `\n` 变成 `\\n`（双重转义）。
+// 找不到（键不存在）时返回 false，由调用方决定默认值。
+fn dwire_copy_str_field(line: &const Buf, key: &const byte,
+    out: &Buf) bool {
+    var span: Buf = buf_new(64);
+    defer { buf_free(&span); }
+    if !dwire_span_of(line, key, &span) {
+        return false;
+    }
+    return buf_append(out, span.ptr as &const byte, span.len);
+}
+
+// 取一个字符串字段的**原文**（已 unescape 的字节，不含引号）。
+fn dwire_string_field(line: &const Buf, key: &const byte, out: &Buf) bool {
+    return dwire_str_span(line, key, out);
+}
+
+// 原样搬一个数组字段（`"key":[…]`，含方括号）。
+fn dwire_copy_array(line: &const Buf, key: &const byte, out: &Buf) bool {
+    var a: Buf = buf_new(DWIRE_LINE_MAX);
+    defer { buf_free(&a); }
+    if !sess_extract_array(line.ptr[0: line.len], key, &a) {
+        return false;
+    }
+    return buf_append(out, a.ptr as &const byte, a.len);
+}
+
+// 原样搬一个对象字段（`"key":{…}`，含花括号）。对象里可能嵌套对象/数组/字符串，
+// 所以按括号配对扫（字符串态与转义都跳过）。
+fn dwire_copy_object(line: &const Buf, key: &const byte, out: &Buf) bool {
+    var pat: Buf = buf_new(64);
+    defer { buf_free(&pat); }
+    _ = buf_append_byte(&pat, 34);
+    _ = buf_append_cstr(&pat, key);
+    _ = buf_append_cstr(&pat, "\":{");
+    const at: isize = find_sub(line.ptr[0: line.len], pat.ptr[0: pat.len], 0);
+    if at < 0 {
+        return false;
+    }
+    const start: usize = (at as usize) + pat.len - 1;   // 指向 '{'
+    var depth: i32 = 0;
+    var i: usize = start;
+    var in_str: bool = false;
+    var esc: bool = false;
+    while i < line.len {
+        const c: byte = line.ptr[i];
+        if in_str {
+            if esc {
+                esc = false;
+            } else if c == 92 as byte {
+                esc = true;
+            } else if c == 34 as byte {
+                in_str = false;
+            }
+        } else if c == 34 as byte {
+            in_str = true;
+        } else if c == 123 as byte {
+            depth = depth + 1;
+        } else if c == 125 as byte {
+            depth = depth - 1;
+            if depth == 0 {
+                return buf_append(out, &line.ptr[start], (i - start) + 1);
+            }
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+// 取字符串字段的**原文**（含两侧引号，逐字节）写进 out。
+fn dwire_span_of(line: &const Buf, key: &const byte, out: &Buf) bool {
+    var pat: Buf = buf_new(64);
+    defer { buf_free(&pat); }
+    _ = buf_append_byte(&pat, 34);
+    _ = buf_append_cstr(&pat, key);
+    _ = buf_append_cstr(&pat, "\":\"");
+    const at: isize = find_sub(line.ptr[0: line.len], pat.ptr[0: pat.len], 0);
+    if at < 0 {
+        return false;
+    }
+    const start: usize = (at as usize) + pat.len - 1;   // 指向开引号
+    var i: usize = start + 1;
+    var esc: bool = false;
+    while i < line.len {
+        const c: byte = line.ptr[i];
+        if esc {
+            esc = false;
+        } else if c == 92 as byte {
+            esc = true;
+        } else if c == 34 as byte {
+            buf_reset(out);
+            return buf_append(out, &line.ptr[start], (i - start) + 1);
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+// 取字符串字段的**反转义后**内容（不含引号）。走 jsonx 的唯一一份完整反转义。
+fn dwire_str_span(line: &const Buf, key: &const byte, out: &Buf) bool {
+    var span: Buf = buf_new(DWIRE_LINE_MAX);
+    defer { buf_free(&span); }
+    if !dwire_span_of(line, key, &span) {
+        return false;
+    }
+    if span.len < 2 {
+        return false;
+    }
+    // 去掉两侧引号（span 一定以 `"` 开头、以 `"` 结尾），交给 jsonx 的反转义。
+    var view: JsonStrView = JsonStrView{ ptr: null as &byte, len: 0 };
+    view.ptr = &span.ptr[1];
+    view.len = span.len - 2;
+    buf_reset(out);
+    return sv_unescape(&view, out);
+}
+
+// 把本仓的 `tool_calls` 数组翻成 DSH 的 `tool-call` 块，逐个追加进 out（前面自带逗号）。
+// `first` 由调用方维护（它已经写过正文块时传 false，这里就不再补前导逗号）。
+fn dwire_tool_calls_into(line: &const Buf, out: &Buf, first: &bool) bool {
+    var arr: Buf = buf_new(DWIRE_LINE_MAX);
+    defer { buf_free(&arr); }
+    if !sess_extract_array(line.ptr[0: line.len], "tool_calls" as &const byte, &arr) {
+        return true;   // 没有 tool_calls 是正常的
+    }
+    var i: usize = 0;
+    while i < arr.len {
+        // 每个调用是一个对象：找 `{`…`}` 配对
+        var obj: Buf = buf_new(4096);
+        defer { buf_free(&obj); }
+        if !dwire_object_at(arr.ptr as &const byte, arr.len, i, &obj) {
+            break;
+        }
+        i = i + 1;
+        if !dwire_emit_one_call(&obj, out, first) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// 从 `a[0, n)` 的 `from` 位置起，取第一个完整的对象（含括号）。
+// 收 `指针 + 长度` 而不是切片：本仓切片参数是值语义，切片没有 `.len` 可读（实测编译期报错）。
+fn dwire_object_at(a: &const byte, n: usize, from: usize, out: &Buf) bool {
+    var i: usize = from;
+    var depth: i32 = 0;
+    var started: bool = false;
+    var start: usize = 0;
+    var in_str: bool = false;
+    var esc: bool = false;
+    while i < n {
+        const c: u8 = a[i];
+        if in_str {
+            if esc {
+                esc = false;
+            } else if c == 92 as byte {
+                esc = true;
+            } else if c == 34 as byte {
+                in_str = false;
+            }
+        } else if c == 34 as byte {
+            in_str = true;
+        } else if c == 123 as byte {
+            if !started {
+                started = true;
+                start = i;
+            }
+            depth = depth + 1;
+        } else if c == 125 as byte {
+            depth = depth - 1;
+            if started && depth == 0 {
+                buf_reset(out);
+                return buf_append(out, &a[start], (i - start) + 1);
+            }
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+// 一个 `{"id":…,"function":{"name":…,"arguments":…}}` → DSH 的 tool-call 块。
+fn dwire_emit_one_call(obj: &const Buf, out: &Buf, first: &bool) bool {
+    var id: Buf = buf_new(256);
+    defer { buf_free(&id); }
+    if !dwire_string_field(obj, "id" as &const byte, &id) {
+        return true;   // 没有 id 的调用块跳过（不该发生；跳过比写坏一行好）
+    }
+    var name: Buf = buf_new(256);
+    defer { buf_free(&name); }
+    if !dwire_string_field(obj, "name" as &const byte, &name) {
+        buf_reset(&name);
+    }
+    var args: Buf = buf_new(DWIRE_LINE_MAX);
+    defer { buf_free(&args); }
+    if !dwire_string_field(obj, "arguments" as &const byte, &args) {
+        buf_reset(&args);
+    }
+    if !first[0] && !buf_append_byte(out, 44) {
+        return false;
+    }
+    first[0] = false;
+    if !buf_append_cstr(out, "{\"type\":\"tool-call\",\"id\":") {
+        return false;
+    }
+    if !jw_str_into(out, id.ptr as &const byte, id.len) {
+        return false;
+    }
+    if !buf_append_cstr(out, ",\"name\":") {
+        return false;
+    }
+    if !jw_str_into(out, name.ptr as &const byte, name.len) {
+        return false;
+    }
+    if !buf_append_cstr(out, ",\"arguments\":") {
+        return false;
+    }
+    // `arguments` 是**原始 JSON 字符串**（DSH 的 `ToolCallBlock.arguments` 同型），
+    // 所以按字符串再转义一次写出去 —— 它本身是文本，不是要展开的对象。
+    if !jw_str_into(out, args.ptr as &const byte, args.len) {
+        return false;
+    }
+    return buf_append_byte(out, 125);
+}

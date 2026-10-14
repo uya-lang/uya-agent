@@ -116,14 +116,14 @@ SRC := src/foundation/bufx.uya src/foundation/jsonx.uya src/foundation/yamlcfg.u
        src/agent/agent.uya src/agent/ag_config.uya src/agent/ag_title_prompt.uya src/agent/ag_tools_schema.uya src/agent/ag_request_stream.uya src/agent/ag_workspace_model.uya src/agent/ag_worktree.uya src/agent/ag_interactive_tasks.uya src/agent/ag_tui_sessions.uya src/agent/ag_plan_pump.uya src/agent/ag_pm.uya src/agent/compact.uya src/agent/deleg.uya src/agent/goal.uya src/agent/instr.uya src/agent/plan.uya src/agent/prompt.uya src/agent/skill.uya src/agent/todo.uya src/agent/workflow.uya \
        src/pm/pm_repo.uya src/pm/pm_store.uya src/pm/pm_ingest.uya src/pm/pm_digest.uya \
        src/vcs/gitx.uya src/vcs/worktreex.uya \
-       src/web/ttyemu.uya src/web/webui.uya src/web/websrv.uya src/web/webhttp.uya src/web/webpump.uya \
+       src/web/ttyemu.uya src/web/webui.uya src/web/wsess.uya src/web/websrv.uya src/web/webhttp.uya src/web/webpump.uya \
        src/media/clipx.uya src/media/clipt.uya src/media/cliphelp.uya src/media/clip.uya src/media/imgx.uya src/media/imgz.uya \
        src/selftest/selftest.uya src/selftest/shellselftest.uya src/selftest/sigselftest.uya src/selftest/tuiselftest.uya \
        src/selftest/st_core.uya src/selftest/st_mock_server.uya src/selftest/st_round_driver.uya src/selftest/st_tty_sse.uya src/selftest/st_sessions.uya src/selftest/st_read_window.uya src/selftest/st_view_watch.uya src/selftest/st_responses.uya src/selftest/st_stats_ctx.uya src/selftest/st_title.uya src/selftest/st_tasks_ws.uya src/selftest/st_vision.uya src/selftest/st_goal_worktree.uya src/selftest/st_pm.uya src/selftest/st_pm2.uya src/selftest/st_mcp.uya \
        src/selftest/tuis_core.uya src/selftest/tuis_title_pty.uya src/selftest/tuis_exit_cmd.uya src/selftest/tuis_diff_scroll.uya src/selftest/tuis_title_ask.uya src/selftest/tuis_sessions_big.uya src/selftest/tuis_tail.uya src/selftest/tuis_marquee_row.uya \
        src/selftest/st_web.uya src/selftest/st_web_childcfg.uya src/selftest/st_tls_pin.uya \
        src/selftest/st_dns.uya \
-       src/selftest/st_clip.uya src/selftest/tuis_ui_port.uya src/selftest/tuis_events.uya \
+       src/selftest/st_clip.uya src/selftest/st_wire.uya src/selftest/tuis_ui_port.uya src/selftest/tuis_events.uya \
        src/diff/model.uya src/diff/gitcmd.uya src/diff/rows.uya src/diff/view.uya src/diff/render.uya
 OUT := build/uya-agent
 
@@ -136,7 +136,7 @@ export UYA_ROOT
 export UYA_SPLIT_C_DIR := $(CURDIR)/build/uyacache
 
 # 行宽豁免：一条 .PHONY 就是一张全仓目标清单，拆行反而看不清哪条丢了
-.PHONY: all check print-src print-cflags build link-audit selftest codegen-audit doc-audit lint-size lint-size-all doc-cover ui-audit probe e2e e2e-config e2e-exec e2e-accept-nudge e2e-retry e2e-config-flags e2e-title e2e-title-cmd e2e-title-auto e2e-mouse e2e-api e2e-steps e2e-permission e2e-sandbox e2e-tasks e2e-goal e2e-memory e2e-memory-live e2e-sessions e2e-resume-big e2e-diff e2e-ws e2e-model e2e-model-save e2e-model-route e2e-ctxwindow e2e-inputimage e2e-worktree e2e-watch e2e-watch-pick e2e-dsh e2e-portable e2e-dns p30-check tui-demo tui-selftest web-selftest sess-selftest diff-selftest model-selftest panel-selftest clean shell-selftest pm-selftest mcp-selftest
+.PHONY: all check wire-schema print-src print-cflags build link-audit selftest codegen-audit doc-audit lint-size lint-size-all doc-cover ui-audit probe e2e e2e-config e2e-exec e2e-accept-nudge e2e-retry e2e-config-flags e2e-title e2e-title-cmd e2e-title-auto e2e-mouse e2e-api e2e-steps e2e-permission e2e-sandbox e2e-tasks e2e-goal e2e-memory e2e-memory-live e2e-sessions e2e-resume-big e2e-diff e2e-ws e2e-model e2e-model-save e2e-model-route e2e-ctxwindow e2e-inputimage e2e-worktree e2e-watch e2e-watch-pick e2e-dsh e2e-portable e2e-dns p30-check tui-demo tui-selftest web-selftest sess-selftest diff-selftest model-selftest panel-selftest clean shell-selftest pm-selftest mcp-selftest
 
 all: build
 
@@ -218,6 +218,15 @@ doc-cover:
 # 六条判据的机器实现与防假绿对照见 CODING.md §1.4 与 DESIGN.md §11.9。
 ui-audit:
 	@python3 testdata/ui_audit.py
+
+# P80：形状适配层（本仓日志 → DSH SessionEvent）的**外部** oracle。
+# 为什么不能只靠 `selftest[wire-adapt]`：那一轮的断言都是**子串**判据，而「JSON 结构
+# 坏掉」能完全绕过它们 —— 实测抓到过两种（`…"time":1{"role":…` 漏收尾引号、
+# `"data":{{` 多花括号），两次都是子串全中、只有 schema 判红。
+# 所以这条判据交给 **DSH 自己的 zod schema** 来判（我们适配出的东西必须是它认得的
+# —— 这就是「不改 DSH 的 webui」的前提）。本机没装 DSH 时**跳过**（不是失败）。
+wire-schema: build
+	@python3 testdata/wire_schema_check.py
 
 # 文档审计：仓库里不许留 Git 冲突标记（`<<<<<<<` / `=======` / `>>>>>>>`）。
 # 来历见 §16 踩坑 94：一条合并残留的 `=======` 从 P53 那次合并（3e62301）

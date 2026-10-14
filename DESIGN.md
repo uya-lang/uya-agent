@@ -2855,13 +2855,39 @@ var r: UiBackend = g_reg[0];
 | `SRV_REQ_MAX = 8192`（**头 + 体总量**）且不支持 chunked 请求体 | `net/httpsrv.uya` | DSH 的 `session.prompt` 允许 300 MiB 体（内联图片 base64）⇒ **不改就是「发一张图就 413」** |
 | DSH wire **没有协议版本字段** | `host.describe` 里没有（DSH 自己的已知限制） | 版本耦合是**结构性**的，只能靠「阶段 0 探针 + 回归轮」兜住，不能靠协商 |
 
-**建议的下一步（可证伪、且便宜）**：先用 Node 起一个最小宿主只实现
-`host.describe` + `session.list` + `session.history` + 两条下行，喂**一份经形状适配的
-本仓会话日志**，用真浏览器验四件事：① DSH shell 起得来吗；② 最小 roster（14 个 client 包
-的 inject 闭包）全 active 吗（DSH 的 shell 是**全有或全无**：任一 entry pending/failed 就
-整页 `page.fail()`）；③ 侧栏列得出本仓会话吗；④ **一条 user/assistant/tool 消息渲染得出
-卡片吗**。任一条不过就停手改自研路线 —— 后面每一步都建立在它上面。
-| 给每个模块都套一层接口 | 接口是重手段（一次间接调用 + 一份 vtable）。只在「按运行期取值选实现」的接缝上用 |
+**① 形状适配层已落地（P80 第五批，`src/web/wsess.uya`）**——这是**两条 web 路线
+（自研 / DSH 适配）的共同前置**，因为两条都要「结构事实」而不是终端字节。它逐行读本仓
+`session.jsonl`、翻译成 DSH 的 `SessionEvent` 形状，**不改本仓日志一个字节**（日志仍是
+`--resume` 与 stats 折叠的真值源）。落地内容：
+
+| 翻译 | 本仓形状 | DSH 要的形状 | 为什么不能省 |
+|---|---|---|---|
+| `user/message` | 有 `role`/`content`/`source`，**没有** `id`、没有 `surfaceOp` | 要 `data.id`（fold 的条目身份）+ **事件级** `surfaceOp` | **缺 `surfaceOp` 这条不渲染**（DSH 的 fold 拿它判「进不进对话面」），而**没有任何报错** |
+| `assistant/message` | `message.content` 是**一整段字符串** | `ContentBlock[]` | 字符串直接喂进去，DSH 那边取不到块 |
+| `assistant/reasoning` | **独立事件**，正文在 `data.message.reasoning_content` | DSH 的 fold **不认**这个类型名 | 不折进 `assistant/message` 的 `reasoning` 块，思考内容整段消失 |
+| `tool/result` | 扁平 `content` + `callId` | `data.message.content[0]` 是 `tool-result` 块、`message.source.callId` 有值 | 否则工具卡片不渲染 |
+| `turn/end` | `reason` 是**字符串** | `reason.kind` 是**对象**（`aborted` 还要内层 `{kind:"user"}`） | 错误/截断提示不出现 |
+| 其余（`turn/start`、`step/*`、`session/title`、`llm/retry`…） | — | 原样透传 | DSH 的 fold 对未知类型是 `default: return`（宽容），所以本仓私有事件不会把流弄坏 |
+
+**三条实测教训（这一批最贵的部分）**：
+
+| # | 教训 | 现场 |
+|---|---|---|
+| ① | **子串断言抓不住「JSON 结构坏掉」** | 第一版漏了 `,"data":{` 的收尾引号与花括号（译成 `…"time":1{"role":…`、`"data":{{…`）—— `selftest[wire-adapt]` 的 8 条子串断言**全部通过**，而 8/8 条译文都不是合法 JSON。**只有 DSH 自己的 zod schema 判得红** |
+| ② | 所以这条判据**必须有外部 oracle** | 新增 `make wire-schema`（`testdata/wire_schema_check.py`）：跑二进制的 dump，交给 DSH 装的 `sessionEventSchema` 逐条校验。本机没装 DSH 时**跳过**（不是失败）。**防假绿对照**：把 ① 那个 bug 装回去 ⇒ 子串轮仍 `ok`，`wire-schema` 报 **8/8 不合 schema** |
+| ③ | **按「我猜的形状」写夹具 = 把缺陷抄成正确** | 第一版夹具是我按印象写的（`assistant/reasoning` 的正文放在 `data.text`、`assistant.message.content` 当成块数组）。改用**真实日志行**逐字节做夹具之后，当场暴露出两处读错字段（正文其实在 `data.message.reasoning_content`、`content` 其实是字符串） |
+
+**当前状态**：`dwire_*` 是**纯函数**（`Buf` 进 `Buf` 出，不认识 `Config`/`g_sess`），
+`selftest[wire-adapt]` 8 段（`user` / `assistant` / `reasoning` / `tool` / `turn/end` /
+边界 / 确定性 / 转义），`make wire-schema` 把译文交给 DSH 验。二进制 `--selftest`
+**183 轮绿**、`--tui-demo` 逐字节相同。
+
+**下一步（可证伪、且便宜）**：用 Node 起一个最小宿主只实现 `host.describe` +
+`session.list` + `session.history` + 两条下行（WebSocket），喂**本适配层的输出**，
+用真浏览器验四件事：① DSH shell 起得来吗；② 最小 roster（14 个 client 包的 inject 闭包）
+全 active 吗（DSH 的 shell 是**全有或全无**：任一 entry pending/failed 就整页 `page.fail()`）；
+③ 侧栏列得出本仓会话吗；④ **一条 user/assistant/tool 消息渲染得出卡片吗**。
+任一条不过就停手改自研路线 —— 后面每一步都建立在它上面。
 
 ---
 
