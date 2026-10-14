@@ -3118,8 +3118,8 @@ parser-blocking preload + `window.__DSH_BOOT__`）；按最小 roster 服务
 | 2 | 删 `DWH_ROSTER` / `DWH_PRELOAD`，改扫描 + 读 `dsh.client.inject` | 页面上出现 25 个 `data-slot` | **已做**（第九批） |
 | 3 | `/api` 方法名改斜杠（`session/list` 等） | 真 DSH 的 11 个调用不再回 `bad-request` | **已做**（第九批） |
 | 4 | `/api/remote.mux`（0.2.0 唯一的下行） | 三条流的 `open` 都收到 `item` | **已做**（第十批） |
-| 5 | 查清客户端的 `connection lost` 从哪来（见下「未解」） | 页面不再 `connection lost, retry #N` | **未解** |
-| 6 | `dynamicCordisRunner/{inventory,syncInspectManifest}`、`session/modelCatalog` | 控制台零告警 | 待做 |
+| 5 | 消息渲染（`data.stream` + end-seed 位置 + cursor） | `make dsh-web-check` 通过 | **已做**（第十八批，3/3 稳定） |
+| 6 | `dynamicCordisRunner/{inventory,syncInspectManifest}`、`session/modelCatalog` | 控制台零告警 | **已做**（第十二批） |
 | 7 | 资源定位链 + `--dsh-assets` | 日志显示用的是该目录；DSH 树零写入 | 待做 |
 | 8 | `--dsh-assets-install`（`npm pack` 取 72 个包） | 离线/在线各验一次 | 待做 |
 | 9 | token/cookie 鉴权（可选，取决于是否要对外） | 不带 token 401、带 token 可用 | 待做 |
@@ -3153,7 +3153,113 @@ S→C {"type":"item","streamId":"<uuid>","value":{"type":"ready","clientId":"<uu
 > ③④ 同症状不同因，这正是「症状离原因很远」的形态：两者都表现为「只解第一条」。
 > 如果只修 ③ 就收工，④ 会让它看起来**没修好**。
 
-##### 八、未解：页面仍 `connection lost, retry #N`（如实记，不假装做完）
+##### 八、第十三~十四批：会话流接通了，消息渲染还差一步
+
+第十一批修掉「帧少一个 `}`」之后，连接不再重连。第十三、十四批继续推进，
+把页面从「白屏 + 选工作区」推到「**完整的聊天界面挂载、会话被选中**」，
+控制台**零错误零告警**、37 个 slot（`conversation.*` 全套）、entries 65
+（与真 DSH 逐数相同）。**但消息正文仍没折进对话区**（`make dsh-web-check`
+那条仍红）。这一节把**做成了什么**与**排除过什么**都钉住。
+
+**做成的（都是实测）**：
+
+| # | 缺陷 | 症状 | 根因 |
+|---|---|---|---|
+| 1 | `workspace/follow` 与 `workspace.list` 不一致 | 页面停在 `Choose workspace`、**从不开 `session/follow`** | follow 的 baseline 回 `items: []` 而 unary 回一个工作区 ⇒ 客户端「从流里」看到零个工作区。**单看任一条都对，只有不一致才出问题** ⇒ 现在共用 `dwh_workspace_item` |
+| 2 | `dwh_remote_item` 的 `extra` 当 C 串量长度 | 帧里混进**上次用过的缓冲残留**（`…"]ace","@deepseek-ai/…`）⇒ JSON 坏 ⇒ `close(4002)` | `extra` 常是另一个 `Buf`（无 NUL），`bufx_cstr_len` 读进相邻内存。改成显式长度 |
+| 3 | `dwh_remote_item` 缓冲写死 2048 | 几千字节的 snapshot 被**截断**（浏览器收到 462 字节，裸 socket 3141）⇒ 4002 | 改成按 `extra` 长度算 |
+| 4 | snapshot 缺 `assistantStream` | 客户端拿到 snapshot 第一句就 `throw`（"omitted its opted-in opening baseline"）⇒ 整条流不折 | 补 `{revision:0}`（形状取自真 DSH） |
+| 5 | `session/list` 的 `projections` 缺 `kind` | `unreachable variant in session list projection block kind: undefined` | 客户端是判别联合，补 `"kind":"sequenced"` |
+| 6 | roster 按「有 bundle」而不是 profile 名单 | `voice-input` 拿不到 speech catalog ⇒ `conversation.input.activity` slot **整块崩掉** | 差集 5 个包（2 个 experimental + schedule + 2 个 directory-picker）；后者由 host 侧运行期按平台启用 |
+
+**`blank` 必须是 true**：客户端只在 `blank && cwd === workspace.path &&
+workspace.sessionIds.includes(id)` 三者全成立时才**复用**会话，否则转
+`sessions.create`（本仓没有可建的会话）。
+
+**排除过的（负面结果，免得重走）**：
+
+| 假设 | 怎么排除的 |
+|---|---|
+| `isSeeded` 该给 true | 试过 true/false 两种，结果一样（客户端不报错、`conversation.session` 仍空） |
+| 缺 `session/end-seed` seed 事件 | 补了真 DSH 的四条 seed（permission/preset / sandbox/mode / approval/policy / session/end-seed），**仍空** |
+| sessionId 格式要 UUID | 换成真 DSH 的 UUID 形态，**仍空**（已回退） |
+| 帧字段被 `assertSessionWireEvent` 拒 | 逐条核对：我的 event 键（type/seq/time/data/surfaceOp）全在白名单、`data` 里有 `turn`/`step`、`SURFACE_EVENT_TYPES` 五个类型全对 |
+| 客户端报错被吞 | 控制台**零输出**（连 warning 都没有）—— 说明是「状态没被填充」而不是「渲染失败」 |
+
+**下一步的入口（本轮缩小到的位置）**：客户端**选中会话**的链路。
+`session/create` 从未被调用 ⇒ workspace 的 `restoreSelection` 没走到
+`connectWorkspace`。而它要求 `watchNavigation` 的 reconcile 里
+`workspace.phase === "ready" && sessions.phase === "ready"`。已实测两条流
+（`workspace/follow` 带工作区、`session/follow` 开得起来）都在，
+所以嫌疑落在 **`mainReference` 是否已被别处设过**（若已设，reconcile 直接
+`initial = "done"` 返回）或 `clearArchivedCurrent()` 的早退。下一轮直接从
+读 `selection` store 的初值与 `mainReference` 的赋值点入手。
+
+##### 八之三、第十八批：**消息渲染通过** —— `make dsh-web-check` 绿了（3/3 稳定）
+
+    PASS shell 挂载
+    会话标题可见：true
+    消息正文可见：true
+    PASS 消息渲染
+    dsh-web-check: 通过 —— 产品二进制 --dsh-web 把本仓会话渲染进了 DSH 的 webui
+
+**根因**：`assistant/message` 的 `data` 里缺 **`stream`**（chunk 级回放：
+`block-start` / `block-end` / `finish`）。客户端的 fold 靠它建消息节点 ——
+`message.content` 虽然在场也折不出节点，而**控制台一句抱怨都没有**。
+
+**方法论（这一段比结论更值得复用）**：
+
+| 步 | 做法 | 得到什么 |
+|---|---|---|
+| ① | `dsh --profile headless "回答两个字：收到"` 造一个**真有消息**的会话 | 一份可对照的**权威样本** |
+| ② | 用它的 `dsh-auth` cookie 直连 `/api/remote.mux`，发 `session/follow`，解 WS 帧 | 22 records 的 snapshot（31KB） |
+| ③ | **把样本的 22 条事件当夹具喂给我的宿主** | **渲染出来了** ⇒ 宿主代码没问题，差别在数据 |
+| ④ | 二分数据：`content` 同形、`surfaceOp` 同形、seq/cursor 都对 | 唯一差别 = `data.stream` |
+| ⑤ | 手工在夹具里补 `stream` 验证 | 假设成立，再回产品代码实现 |
+
+> 前十七批我一直在**读客户端源码猜形状**，走了很多弯路（`isSeeded`、seed 事件、
+> sessionId 格式、字段白名单 —— 全是负面结果）。**一旦有了权威样本，二分只花了
+> 几步。** 教训：缺参照物时先造参照物，别继续猜。
+
+**这一批顺带修掉的真缺陷**：
+
+| # | 缺陷 | 症状 |
+|---|---|---|
+| 1 | `session/end-seed` **位置错**（我放在开头 seed 里，真 DSH 在**最后一条**） | 我的夹具不渲染、真夹具渲染得出来 —— 两者数据几乎一样，只有它位置不同 |
+| 2 | `cursor` 与末条 seq **差一** | `did not end at its requested cursor` |
+| 3 | `dwh_seq_of` 按连写 `"seq":` 找，真日志是 `"seq": 8`（**冒号后有空格**） | seq 读成 0 ⇒ cursor 恒 0 |
+
+**实现**：`dwh_is_assistant_msg` / `dwh_assistant_with_stream` / `dwh_stream_of` /
+`dwh_one_block` —— 由译文自己的 `"content":[…]` **原文**按顶层逗号切块，
+逐块造 `block-start` + `block-end`，末尾补 `finish`。不做 JSON 重序列化
+（`std.json` 的视图指向原缓冲、转义未解码，重序列化只是多一个出错点）。
+
+##### 八之二、第十五~十六批：会话真正选中（`blank` / `cursor` / `seq` 三处）
+
+这三处是「会话选中 + 历史加载」的最后一组卡点，**判据相互矛盾**是它们最坑的地方：
+
+| # | 字段 | 客户端要的值 | 坑在哪 |
+|---|---|---|---|
+| 1 | `session/list` 的 `blank` | **`false`** | 客户端**两处判据相反**：`reuseOrCreateBlank`（自动复用空会话）要 `blank === true`，而 `restoreSelection`（把会话设成主视图）是 `if (!summary.blank) replaceMain(...)` —— 只有 `false` 才**直接选中**。给 `true` 时它转去 `sessions.create`（本仓没有可建的会话）⇒ 永久停在 hero。**两处都读同一份 `session/list`，所以只能满足后者**（前者只是「复用」的优化） |
+| 2 | snapshot 的 `cursor` | 末条记录的 `seq`（**不加一**） | `assertPageThrough` 拿 `tailCursor(page) === through` 判，加一恒不等 ⇒ `page did not end at its requested cursor`（显示在对话区**正文位置**，看着像消息加载失败） |
+| 3 | 译文记录的 `seq` | 从 seed 之后**接着排** | seed 占了 0..3、译文也从 0 起头 ⇒ 连续性检查判 `page contains discontinuous entries`。新增 `dwh_shift_seq` 把 `"seq":N` 改写成 `N+4` |
+
+另外补了 `session/list` 的 **`agentAvailable`**（真 DSH 每条 item 都有，实测 380 条
+逐字段核过：`sessionId/updatedAt/agentAvailable/running/blank/cwd/projections`）。
+
+**实测进展**（真 chromium + CDP，真会话日志 16 条事件）：
+- 侧栏出现「本仓工作区 / 本仓会话」两级；**会话被选中**（header = 本仓会话）
+- 对话区**不再报错**（此前是红字 `Failed to load history: …`）
+- composer 活着；snapshot 的 seq **0..19 连续**、`cursor === 末条 seq`（逐条核过）
+
+**仍未完成**：消息正文没进 `conversation.session`（该 slot 的 innerHTML 仍为空）。
+**一条重要的空白**：我至今**没有一份「真 DSH 带消息的 snapshot」**作对照 ——
+实测抓到的真 DSH 会话都是空的（records 只有 4 条 seed）。所以「有消息时客户端
+到底怎么折」这件事，我手上没有权威样本，只有自己的形状推导。下一轮第一件事
+应当是**造一个带消息的真 DSH 会话来抓样本**（`dsh --profile headless "…"` 跑一轮），
+再拿它逐字段对照 —— 那比我再猜一轮划算得多。
+
+##### 九、历史记录：`connection lost` 的排查（第十一批已解）
 
 第十批之后，`generation is still not ready` 那条告警**消失了**（说明 `$events`
 的 `ready` 已被接受），但页面仍每 3 秒重连。**已排除的**（都是实测）：
