@@ -70,6 +70,8 @@ export struct DwhConn {
     st: u8,
     rx: Buf,            // 已收到的字节（收头用）
     is_mux: bool,       // WS：是 mux 还是 host 下行
+    is_remote: bool,    // WS：是 0.2.0 的 `remote.mux`（要**收发**，不是只发）
+    remote_ready: bool, // 已回过 `$events` 那条 `ready`（幂等）
     sent: bool,         // WS：基线帧发过没有
 }
 
@@ -437,7 +439,8 @@ fn dwh_read_inject(h: &DwhHost, cname: &const byte, cl: usize, out: &Buf) bool {
 }
 
 // `<root>/node_modules/@deepseek-ai/<pkg>/package.json`（NUL 结尾）。
-fn dwh_pkg_json_path(h: &DwhHost, cname: &const byte, cl: usize, out: &Buf) bool {
+fn dwh_pkg_json_path(h: &DwhHost, cname: &const byte, cl: usize,
+                     out: &Buf) bool {
     buf_reset(out);
     if !buf_append(out, h.root.ptr as &const byte, h.root.len) {
         return false;
@@ -614,8 +617,10 @@ fn dwh_one_batch(recs: &const Buf, out: &Buf, first: &bool, boot: bool) bool {
 // 扫目录会把它们扫进来，而它们进图后**激活失败**（`failed`）⇒ 整页 boot 报
 // `1 entry did not activate`、`data-slot` 一个都不挂。所以这里显式排除。
 fn dwh_is_excluded(pkg: &const byte, pl: usize) bool {
-    return dwh_eq(pkg, pl, "@deepseek-ai/dsh-client-ui-directory-picker-browse" as &const byte)
-        || dwh_eq(pkg, pl, "@deepseek-ai/dsh-client-ui-directory-picker-native" as &const byte);
+    // 行宽豁免：两个不可断的包名
+    const browse: &const byte = "@deepseek-ai/dsh-client-ui-directory-picker-browse" as &const byte;
+    const native: &const byte = "@deepseek-ai/dsh-client-ui-directory-picker-native" as &const byte;
+    return dwh_eq(pkg, pl, browse) || dwh_eq(pkg, pl, native);
 }
 
 // 包名相等（长度与字节都比）。
@@ -1133,6 +1138,13 @@ fn dwh_ws_send_baseline(h: &const DwhHost, c: &DwhConn) bool {
     var p: Buf = buf_new(1024);
     var seq: usize = 1;
     defer { buf_free(&p); }
+    if c.is_remote {
+        // 0.2.0：**没有基线**。实测真 DSH 在这条连接上只等客户端的 `open` 帧，
+        // 服务端唯一主动发的是某条流的 `item`（如 `$events` 的 `ready`）。
+        // 所以这里什么都不发 —— 发一个「像 0.1.1 那样的 subscribed」反而会让
+        // 客户端把未知帧当错误。
+        return true;
+    }
     if c.is_mux {
         // 行宽豁免：不可断的 JSON 字面量
         if !buf_append_cstr(&p, "{\"type\":\"session/subscribed\",\"sessionId\":\"") {
@@ -1369,6 +1381,8 @@ export fn dwh_start(h: &DwhHost, addr: &const byte, an: usize,
         h.conns[i].st = DWH_C_DONE;
         h.conns[i].rx = buf_empty();
         h.conns[i].is_mux = false;
+        h.conns[i].is_remote = false;
+        h.conns[i].remote_ready = false;
         h.conns[i].sent = false;
         i = i + 1;
     }
@@ -1594,7 +1608,7 @@ fn dwh_host_zero() DwhHost {
 // 零值连接。
 fn dwh_conn_zero() DwhConn {
     return DwhConn{ fd: -1, st: DWH_C_DONE, rx: buf_empty(),
-        is_mux: false, sent: false };
+        is_mux: false, is_remote: false, remote_ready: false, sent: false };
 }
 
 // 主循环：一次 poll，谁就绪处理谁。
@@ -1686,6 +1700,8 @@ fn dwh_accept(h: &DwhHost) void {
     h.conns[slot].fd = fd;
     h.conns[slot].st = DWH_C_HEAD;
     h.conns[slot].is_mux = false;
+    h.conns[slot].is_remote = false;
+    h.conns[slot].remote_ready = false;
     h.conns[slot].sent = false;
     if !buf_valid(&h.conns[slot].rx) {
         h.conns[slot].rx = buf_new(16384);
@@ -1725,6 +1741,26 @@ fn dwh_on_conn(h: &DwhHost, ci: usize) void {
         const op: u8 = (b0 & 15 as byte) as u8;
         if op == 8 {
             dwh_drop(h, ci);
+            return;
+        }
+        if op == 1 && c.is_remote {
+            // 文本帧 = 客户端的一条 `open`（或 `item`/`end`）。0.2.0 的下行是**双向**的，
+            // 这条分支就是与 0.1.1 最本质的差别（那时只有 ping/close 两种输入）。
+            //
+            // ⚠ **一次 read 里可能有多条帧**：客户端启动时把 `workspace/follow`、
+            // `speech/follow`、`$events` 三条 `open` 连着写（实测一个 TCP 段里就有），
+            // 而这里早先只解**第一条**、其余整段丢掉 —— 于是 `$events` 那条永远收不到
+            // `ready`，客户端判「连接没就绪」并每 3 秒重连一次
+            // （症状：`connection lost, retry #N`，而单发一条帧的裸 socket 测试**正常**）。
+            // 所以必须把这一段里的帧**全解完**。
+            var off: usize = 0;
+            while off < (n as usize) {
+                const used: usize = dwh_remote_frame(h, ci, &tmp[off], (n as usize) - off);
+                if used == 0 {
+                    break;      // 残帧：等下一圈（帧不会跨 read 拆得这么碎，保守处理）
+                }
+                off = off + used;
+            }
             return;
         }
         if op == 9 {
@@ -1873,6 +1909,8 @@ fn dwh_drop(h: &DwhHost, ci: usize) void {
     h.conns[ci].st = DWH_C_DONE;
     h.conns[ci].sent = false;
     h.conns[ci].is_mux = false;
+    h.conns[ci].is_remote = false;
+    h.conns[ci].remote_ready = false;
     buf_reset(&h.conns[ci].rx);
 }
 
@@ -1894,16 +1932,22 @@ fn dwh_do_upgrade(h: &DwhHost, ci: usize, uo: usize, ul: usize) void {
         return;
     }
     const c: &DwhConn = &h.conns[ci];
-    if !dwh_path_is(c, uo, ul, "/api/events.mux" as &const byte) &&
-        !dwh_path_is(c, uo, ul, "/api/events.host" as &const byte) {
+    // 三条都收：`remote.mux` 是 **0.2.0 唯一的**下行（实测真 DSH 只开这一个
+    // WebSocket）；`events.mux` / `events.host` 是 0.1.1 的两条，留着不碍事
+    // （旧版装了也能用，而它俩现在是死路径）。
+    const is_remote: bool = dwh_path_is(c, uo, ul, "/api/remote.mux" as &const byte);
+    const is_emux: bool = dwh_path_is(c, uo, ul, "/api/events.mux" as &const byte);
+    const is_ehost: bool = dwh_path_is(c, uo, ul, "/api/events.host" as &const byte);
+    if !is_remote && !is_emux && !is_ehost {
         // 其它路径的升级：没有 SSE 回落，如实回 426。
         _ = srv_send_response(c.fd, SRV_ST_404, SRV_CT_TEXT,
             "no such websocket" as &const byte, 17);
         h.conns[ci].st = DWH_C_DONE;
         return;
     }
+    h.conns[ci].is_remote = is_remote;
         // 行宽豁免：不可断的 JSON 字面量
-    h.conns[ci].is_mux = dwh_path_is(c, uo, ul, "/api/events.mux" as &const byte);
+    h.conns[ci].is_mux = is_emux;
     var co: usize = 0;
     var cl: usize = 0;
     if !srv_head_value(c.rx.ptr as &const byte, c.rx.len, c.rx.len,
@@ -2381,4 +2425,255 @@ fn dwh_send_api(h: &DwhHost, ci: usize, m: u8, path: &const Buf,
     }
     _ = srv_send_response(fd, SRV_ST_200, SRV_CT_JSON,
         resp.ptr as &const byte, resp.len);
+}
+
+// ============================================================
+// 0.2.0 的 `remote.mux`（双向流多路复用）
+// ============================================================
+
+// 一条客户端文本帧 → 解码去掩码 → 按 `type` 分派。
+//
+// 帧格式（客户端→服务端**必须掩码**）：`b0` = FIN|opcode、`b1` = MASK|len、
+// 然后 4 字节掩码键、再 payload。长度有 7 位 / 16 位 / 64 位三种形态，`open` 帧
+// 里带 payload（实测 130~250 字节），所以 16 位那种必须支持（126 分支）。
+// 解一条帧，返回它占用的字节数（0 = 残帧，等更多数据）。
+fn dwh_remote_frame(h: &DwhHost, ci: usize, frame: &const byte,
+                    n: usize) usize {
+    if ci >= DWH_MAX_CONNS || n < 6 {
+        return 0;
+    }
+    const masked: bool = (frame[1] & 128 as byte) != 0;
+    var plen: usize = (frame[1] & 127 as byte) as usize;
+    var poff: usize = 2;
+    if plen == 126 {
+        if n < 8 {
+            return 0;
+        }
+        plen = ((frame[2] as usize) << 8) | (frame[3] as usize);
+        poff = 4;
+    } else if plen == 127 {
+        return 0;    // 64 位长度：`open` 帧不会这么大，不实现（也不假装支持）
+    }
+    // ⚠ 掩码键的位置**跟着长度形态走**：7 位长度时在 2，16 位时在 4。
+    // 早先这里写死 `frame[2 + (k & 3)]` —— 于是 16 位长度的帧（`session/follow`
+    // 那种 300 字节的 `open`）解出来是**乱码**，`endpoint` 认不出、整条流不回。
+    // 实测症状：客户端每次只收到零个响应，把连接判成「没就绪」并重连。
+    const moff: usize = poff;
+    if masked {
+        if n < poff + 4 {
+            return 0;
+        }
+        poff = poff + 4;
+    }
+    if poff + plen > n {
+        plen = n - poff;      // 收不齐就按收到的部分处理（`open` 很小，一帧就到）
+    }
+    // 这一帧占用的字节数 = 帧头 + 4 字节掩码键（若掩码）+ payload
+    const consumed: usize = poff + plen;
+    var text: Buf = buf_new(plen + 8);
+    defer { buf_free(&text); }
+    var k: usize = 0;
+    while k < plen {
+        var b: byte = frame[poff + k];
+        if masked {
+            b = (b ^ frame[moff + (k & 3)]) as byte;
+        }
+        if !buf_append_byte(&text, b) {
+            return 0;
+        }
+        k = k + 1;
+    }
+    dwh_remote_dispatch(h, ci, &text);
+    // **返回这一帧占用的字节数** —— 上面那个循环靠它往前走。
+    // 这里曾经漏写（函数末尾是隐式返回 0），于是循环第一圈就 `break`，
+    // 一段里的**后续帧全丢**（症状与「只解第一条」一模一样）。
+    return consumed;
+}
+
+// 按 `type` 分派一条已解码的文本。现在只认 `open`（客户端开的流）；`item`/`end`
+// 是客户端往**上行**流塞数据用的，本仓的上行面还没接，忽略即可（不能报错：
+// 报错会让客户端把整条连接判死）。
+fn dwh_remote_dispatch(h: &DwhHost, ci: usize, text: &const Buf) void {
+    // ⚠ 判据是 `"type":"open"` 这个**键值对**，不是 `"open"` 这个键 ——
+    // 帧的形状是 `{"type":"open","streamId":…}`，`open` 是**值**。
+    // 早先按「键」判恒不成立 ⇒ 所有 `open` 都被丢掉（实测：探针显示
+    // `remote_text` 进来了，而 `open` 处理一次都没执行）。
+    // ⚠ 找的是 `"type"` 与 `"open"` **两个片段**，不是一个连写的
+    // `"type":"open"`：JSON 的冒号后**允许空白**（实测 python 的默认
+    // `json.dumps` 就发 `{"type": "open", …}`，中间有空格）——
+    // 连写判据在这种帧上恒不成立，而它不报错、只是什么都处理不了。
+    if !dwh_has_frag(text, "\"type\"" as &const byte) {
+        return;
+    }
+    if !dwh_has_frag(text, "\"open\"" as &const byte) {
+        return;
+    }
+    var sid: Buf = buf_new(64);
+    defer { buf_free(&sid); }
+    var ep: Buf = buf_new(64);
+    defer { buf_free(&ep); }
+    if !dwh_pick_str(text, "streamId" as &const byte, &sid) {
+        return;
+    }
+    if !dwh_pick_str(text, "endpoint" as &const byte, &ep) {
+        return;
+    }
+    dwh_remote_open(h, ci, &sid, &ep);
+}
+
+// 某个 `endpoint` 的 `open` → 回一条 `item`。
+//
+// 实测真 DSH 在启动时开这三条（10 秒内共 8 帧）：
+//   `workspace/follow` → baseline（工作区清单）
+//   `$events`          → **ready**（这条是连接「就绪」的判据，不回它客户端会
+//                        报 `generation is still not ready` 并**反复重连** ——
+//                        这正是本宿主此前「connection lost, retry #1..3」的根因）
+//   `session/control`  → baseline（投影）
+// 其余（`session/follow` 等）暂时回一条空的 baseline，让客户端不吊死。
+fn dwh_remote_open(h: &const DwhHost, ci: usize, sid: &const Buf,
+                   ep: &const Buf) void {
+    if ci >= DWH_MAX_CONNS {
+        return;
+    }
+    const fd: i32 = h.conns[ci].fd;
+    if bufx_eq_cstr(ep.ptr as &const byte, ep.len, "$events" as &const byte) {
+        dwh_remote_item(fd, sid, "ready" as &const byte,
+            "\"clientId\":\"uya-host\"," as &const byte, &h.events);
+        return;
+    }
+    if bufx_eq_cstr(ep.ptr as &const byte, ep.len, "workspace/follow" as &const byte) {
+        dwh_remote_item(fd, sid, "baseline" as &const byte,
+            "\"value\":{\"items\":[]}" as &const byte, &h.events);
+        return;
+    }
+    // 其余流：一条退化的 baseline（客户端据此认为「这条流没有数据」而不是挂住）
+    dwh_remote_item(fd, sid, "baseline" as &const byte,
+        "\"value\":{}" as &const byte, &h.events);
+}
+
+// 一条 `{"type":"item","streamId":…,"value":{…}}` 帧。
+// `extra` 是 value 里的**固定片段**（含尾逗号），尾部补本仓的会话 id。
+fn dwh_remote_item(fd: i32, sid: &const Buf, kind: &const byte,
+                   extra: &const byte, events: &const Buf) void {
+    var p: Buf = buf_new(2048);
+    defer { buf_free(&p); }
+    if !buf_append_cstr(&p, "{\"type\":\"item\",\"streamId\":\"") {
+        return;
+    }
+    if !buf_append(&p, sid.ptr as &const byte, sid.len) {
+        return;
+    }
+    if !buf_append_cstr(&p, "\",\"value\":{\"type\":\"") {
+        return;
+    }
+    if !buf_append_cstr(&p, kind) {
+        return;
+    }
+    // `extra` 已经是**完整的后续字段**（含 `"` 与逗号由调用方负责），
+    // 所以这里只在它非空时补一个分隔逗号。
+    if bufx_cstr_len(extra) > 0 {
+        if !buf_append_cstr(&p, "\",") {
+            return;
+        }
+        if !buf_append_cstr(&p, extra) {
+            return;
+        }
+    }
+    // `$events` 要 host（客户端读 `host.home`）。
+    //
+    // ⚠ **`value` 的**字段数必须精确**：客户端用 `exactKeys(value, ["type"])`
+    // 或 `["type","streamId","value"]` 校验每一条帧 —— 多一个字段就整条判非法，
+    // 而它的表现是把**整条连接**判死并重连（`connection lost, retry #N`），
+    // 不是「这条流没数据」。实测：我早先给非 `ready` 的流多塞了一个
+    // `sessionId`，于是每帧都被拒、页面每 3 秒重连一次。
+    // 所以这里只发真 DSH 发过的那两个字段，一个都不多加。
+    if bufx_eq_cstr(kind, 5, "ready" as &const byte) {
+        if !buf_append_cstr(&p, "\"host\":{\"home\":") {
+            return;
+        }
+        if !dwh_home_json(&p) {
+            return;
+        }
+        if !buf_append_byte(&p, 125) {
+            return;
+        }
+    }
+    if !buf_append_byte(&p, 125) {
+        return;
+    }
+        // `events` 目前不参与这条帧的正文（会话事件那几条流还没接），
+        // 显式用掉参数以免「未使用」告警。
+    if events.len > 0 {
+        // 有意为空：见上
+    }
+    _ = dwh_ws_send_text(fd, p.ptr as &const byte, p.len);
+}
+
+// 文本里有没有这个片段（**按字节找**，不做 JSON 解析：帧的判别只需要两个片段）。
+fn dwh_has_frag(text: &const Buf, frag: &const byte) bool {
+    return srv_find(text.ptr as &const byte, 0, text.len,
+        frag, bufx_cstr_len(frag)) >= 0;
+}
+
+// 文本里有没有 `"<key>"` 这个键（粗判：够用来分辨帧的 `type`）。
+fn dwh_has_key(text: &const Buf, key: &const byte) bool {
+    var pat: Buf = buf_new(32);
+    defer { buf_free(&pat); }
+    if !buf_append_byte(&pat, 34) {
+        return false;
+    }
+    if !buf_append_cstr(&pat, key) {
+        return false;
+    }
+    if !buf_append_byte(&pat, 34) {
+        return false;
+    }
+    return srv_find(text.ptr as &const byte, 0, text.len,
+        pat.ptr as &const byte, pat.len) >= 0;
+}
+
+// 取 `"<key>":"<value>"` 里的 value（写进 `out`）。找不到返回 false。
+fn dwh_pick_str(text: &const Buf, key: &const byte, out: &Buf) bool {
+    var pat: Buf = buf_new(32);
+    defer { buf_free(&pat); }
+    // 判据是 `"key"` 后跟**一个冒号**（不假定冒号紧贴引号）：JSON 允许冒号前后
+    // 有空白，实测 python 的 `json.dumps` 默认就发 `"streamId": "s1"`。
+    // 先找 `"key"`，再从它后面找冒号与开引号。
+    if !buf_append_byte(&pat, 34) {
+        return false;
+    }
+    if !buf_append_cstr(&pat, key) {
+        return false;
+    }
+    if !buf_append_byte(&pat, 34) {
+        return false;
+    }
+    const at: isize = srv_find(text.ptr as &const byte, 0, text.len,
+        pat.ptr as &const byte, pat.len);
+    if at < 0 {
+        return false;
+    }
+    var i: usize = (at as usize) + pat.len;
+    while i < text.len && (text.ptr[i] == 32 as byte || text.ptr[i] == 9 as byte) {
+        i = i + 1;
+    }
+    if i >= text.len || text.ptr[i] != 58 as byte {
+        return false;         // 不是「键：值」形态（可能是键名的一部分）
+    }
+    i = i + 1;
+    while i < text.len && (text.ptr[i] == 32 as byte || text.ptr[i] == 9 as byte) {
+        i = i + 1;
+    }
+    if i >= text.len || text.ptr[i] != 34 as byte {
+        return false;         // 值不是字符串（本函数只取字符串）
+    }
+    i = i + 1;
+    buf_reset(out);
+    while i < text.len && text.ptr[i] != 34 as byte {
+        if !buf_append_byte(out, text.ptr[i]) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return out.len > 0;
 }
