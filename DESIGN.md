@@ -3195,6 +3195,31 @@ workspace.sessionIds.includes(id)` 三者全成立时才**复用**会话，否�
 `initial = "done"` 返回）或 `clearArchivedCurrent()` 的早退。下一轮直接从
 读 `selection` store 的初值与 `mainReference` 的赋值点入手。
 
+##### 八之二、第十五~十六批：会话真正选中（`blank` / `cursor` / `seq` 三处）
+
+这三处是「会话选中 + 历史加载」的最后一组卡点，**判据相互矛盾**是它们最坑的地方：
+
+| # | 字段 | 客户端要的值 | 坑在哪 |
+|---|---|---|---|
+| 1 | `session/list` 的 `blank` | **`false`** | 客户端**两处判据相反**：`reuseOrCreateBlank`（自动复用空会话）要 `blank === true`，而 `restoreSelection`（把会话设成主视图）是 `if (!summary.blank) replaceMain(...)` —— 只有 `false` 才**直接选中**。给 `true` 时它转去 `sessions.create`（本仓没有可建的会话）⇒ 永久停在 hero。**两处都读同一份 `session/list`，所以只能满足后者**（前者只是「复用」的优化） |
+| 2 | snapshot 的 `cursor` | 末条记录的 `seq`（**不加一**） | `assertPageThrough` 拿 `tailCursor(page) === through` 判，加一恒不等 ⇒ `page did not end at its requested cursor`（显示在对话区**正文位置**，看着像消息加载失败） |
+| 3 | 译文记录的 `seq` | 从 seed 之后**接着排** | seed 占了 0..3、译文也从 0 起头 ⇒ 连续性检查判 `page contains discontinuous entries`。新增 `dwh_shift_seq` 把 `"seq":N` 改写成 `N+4` |
+
+另外补了 `session/list` 的 **`agentAvailable`**（真 DSH 每条 item 都有，实测 380 条
+逐字段核过：`sessionId/updatedAt/agentAvailable/running/blank/cwd/projections`）。
+
+**实测进展**（真 chromium + CDP，真会话日志 16 条事件）：
+- 侧栏出现「本仓工作区 / 本仓会话」两级；**会话被选中**（header = 本仓会话）
+- 对话区**不再报错**（此前是红字 `Failed to load history: …`）
+- composer 活着；snapshot 的 seq **0..19 连续**、`cursor === 末条 seq`（逐条核过）
+
+**仍未完成**：消息正文没进 `conversation.session`（该 slot 的 innerHTML 仍为空）。
+**一条重要的空白**：我至今**没有一份「真 DSH 带消息的 snapshot」**作对照 ——
+实测抓到的真 DSH 会话都是空的（records 只有 4 条 seed）。所以「有消息时客户端
+到底怎么折」这件事，我手上没有权威样本，只有自己的形状推导。下一轮第一件事
+应当是**造一个带消息的真 DSH 会话来抓样本**（`dsh --profile headless "…"` 跑一轮），
+再拿它逐字段对照 —— 那比我再猜一轮划算得多。
+
 ##### 九、历史记录：`connection lost` 的排查（第十一批已解）
 
 第十批之后，`generation is still not ready` 那条告警**消失了**（说明 `$events`
