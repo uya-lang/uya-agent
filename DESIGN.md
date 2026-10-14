@@ -3112,17 +3112,46 @@ parser-blocking preload + `window.__DSH_BOOT__`）；按最小 roster 服务
 
 ##### 六、工作项（顺序即依赖）
 
-| # | 内容 | 判据 |
-|---|---|---|
-| 1 | boot 图加 `batches`（每包一批 + bootstrap 只放 `dsh-client-modules`） | `make dsh-web-check` 在 0.2.0 下通过 |
-| 2 | 删 `DWH_ROSTER` / `DWH_PRELOAD`，改扫描 | 页面上出现 0.2.0 的原生面板（`Trajectory` 等） |
-| 3 | 资源定位链 + `--dsh-assets` | 日志显示用的是该目录；DSH 树零写入 |
-| 4 | `--dsh-assets-install`（`npm pack` 取 72 个包） | 离线/在线各验一次 |
-| 5 | `/api` 面改斜杠（`session/list` 等 11 个） | 真 DSH 里能列会话 |
-| 6 | token/cookie 鉴权（可选，取决于是否要对外） | 不带 token 401、带 token 可用 |
+| # | 内容 | 判据 | 状态 |
+|---|---|---|---|
+| 1 | boot 图加 `batches`（每包一批 + bootstrap 只放 `dsh-client-modules`） | 0.2.0 的 `parseBootManifest` 逐条自查通过 | **已做**（第九批） |
+| 2 | 删 `DWH_ROSTER` / `DWH_PRELOAD`，改扫描 + 读 `dsh.client.inject` | 页面上出现 25 个 `data-slot` | **已做**（第九批） |
+| 3 | `/api` 方法名改斜杠（`session/list` 等） | 真 DSH 的 11 个调用不再回 `bad-request` | **已做**（第九批） |
+| 4 | `/api/remote.mux`（0.2.0 唯一的下行） | 三条流的 `open` 都收到 `item` | **已做**（第十批） |
+| 5 | `$events/result` unary + 把会话事件推上去 | 页面不再 `connection lost, retry #N` | 待做 |
+| 6 | `dynamicCordisRunner/{inventory,syncInspectManifest}`、`session/modelCatalog` | 控制台零告警 | 待做 |
+| 7 | 资源定位链 + `--dsh-assets` | 日志显示用的是该目录；DSH 树零写入 | 待做 |
+| 8 | `--dsh-assets-install`（`npm pack` 取 72 个包） | 离线/在线各验一次 | 待做 |
+| 9 | token/cookie 鉴权（可选，取决于是否要对外） | 不带 token 401、带 token 可用 | 待做 |
 
-**风险**：第 5、6 条是 0.2.0 新增的面，我目前只观测到「它发哪些调用」，
-还没验证「我该怎么回」；所以第 1~4 条（结构与资源）先做，第 5 条单独立项验证。
+##### 七、第十批实测：`/api/remote.mux` 的精确契约
+
+0.2.0 把下行从「两条只发的 WS」换成「**一条双向的流多路复用**」。实测真 DSH
+全量启动只开 **一个** WebSocket，8 帧里三条流：
+
+```
+C→S {"type":"open","streamId":"<uuid>","endpoint":"workspace/follow","payload":{"args":{}}}
+S→C {"type":"item","streamId":"<uuid>","value":{"type":"baseline","value":{"items":[…]}}}
+C→S {"type":"open","streamId":"<uuid>","endpoint":"$events","payload":{"args":{}}}
+S→C {"type":"item","streamId":"<uuid>","value":{"type":"ready","clientId":"<uuid>","host":{"home":"/home/winger"}}}
+```
+
+`$events` 的 `ready` 是**连接就绪的判据**：不回它，客户端报
+`generation is still not ready after 3000ms` → `connection was not ready within
+15000ms` → `connection lost, retry #N`，每 3 秒一轮。
+
+**四个只在真浏览器里才暴露的坑**（裸 socket 测试全绿，所以它们都是「假绿」的
+反例；每条都记在 `whost.uya` 的注释里）：
+
+| # | 坑 | 症状 | 根因 |
+|---|---|---|---|
+| 1 | 掩码键偏移**跟着长度形态走** | 300 字节的 `open` 解成乱码、那条流无响应 | 7 位长度时掩码在 2、16 位时在 4；写死 `frame[2+(k&3)]` |
+| 2 | **`exactKeys`**：帧的字段数必须精确 | 每条帧被拒、整条连接判死并重连 | 客户端用 `exactKeys(value, […])` 校验；多一个 `sessionId` 就非法。**它的表现是「连接坏了」而不是「这条流没数据」** |
+| 3 | 一次 read 里**可能有多条帧** | `$events` 永远收不到 `ready`（客户端把三条 `open` 连着写） | 早先只解第一条、其余整段丢掉 |
+| 4 | `dwh_remote_frame` **漏写 `return consumed`** | 与 ③ 一模一样 | 隐式返回 0 ⇒ 上面那个循环第一圈就 `break` |
+
+> ③④ 同症状不同因，这正是「症状离原因很远」的形态：两者都表现为「只解第一条」。
+> 如果只修 ③ 就收工，④ 会让它看起来**没修好**。
 
 ---
 
