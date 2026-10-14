@@ -109,21 +109,21 @@ SRC := src/foundation/bufx.uya src/foundation/jsonx.uya src/foundation/yamlcfg.u
        src/term/oscin.uya src/term/mdview.uya src/term/tasks.uya src/term/tty.uya \
        src/term/tui/style.uya src/term/tui/keys.uya src/term/tui/frame.uya src/term/tui/entry.uya src/term/tui/screen.uya src/term/tui/sel.uya src/term/tui/overlay.uya src/term/tui/status.uya src/term/tui/ask.uya src/term/tui/watch.uya src/term/tui/diff.uya src/term/tui/hook.uya \
        src/term/view.uya src/term/watch.uya \
-       src/ui/ui_port.uya src/ui/be_null.uya src/ui/ui_reg.uya \
+       src/ui/ui_port.uya src/ui/be_null.uya src/ui/be_tui.uya src/ui/be_events.uya src/ui/ui_reg.uya src/ui/ui_fwd.uya \
        src/tools/askuser.uya src/tools/fsx.uya src/tools/jobs.uya src/tools/perm.uya src/tools/sandboxx.uya src/tools/search.uya src/tools/shellx.uya \
        src/plugin/mcpcfg.uya src/plugin/mcprun.uya src/plugin/mcp.uya src/plugin/mcptool.uya \
        src/session/dshcfg.uya src/session/dshsave.uya src/session/dshsess.uya src/session/inbox.uya src/session/modelx.uya src/session/procx.uya src/session/session.uya src/session/sigx.uya src/session/stats.uya \
        src/agent/agent.uya src/agent/ag_config.uya src/agent/ag_title_prompt.uya src/agent/ag_tools_schema.uya src/agent/ag_request_stream.uya src/agent/ag_workspace_model.uya src/agent/ag_worktree.uya src/agent/ag_interactive_tasks.uya src/agent/ag_tui_sessions.uya src/agent/ag_plan_pump.uya src/agent/ag_pm.uya src/agent/compact.uya src/agent/deleg.uya src/agent/goal.uya src/agent/instr.uya src/agent/plan.uya src/agent/prompt.uya src/agent/skill.uya src/agent/todo.uya src/agent/workflow.uya \
        src/pm/pm_repo.uya src/pm/pm_store.uya src/pm/pm_ingest.uya src/pm/pm_digest.uya \
        src/vcs/gitx.uya src/vcs/worktreex.uya \
-       src/web/ttyemu.uya src/web/webui.uya src/web/websrv.uya src/web/webhttp.uya src/web/webpump.uya \
+       src/web/ttyemu.uya src/web/webui.uya src/web/wsess.uya src/web/whost.uya src/web/websrv.uya src/web/webhttp.uya src/web/webpump.uya \
        src/media/clipx.uya src/media/clipw.uya src/media/clipt.uya src/media/cliphelp.uya src/media/clip.uya src/media/imgx.uya src/media/imgz.uya \
        src/selftest/selftest.uya src/selftest/shellselftest.uya src/selftest/sigselftest.uya src/selftest/tuiselftest.uya \
        src/selftest/st_core.uya src/selftest/st_mock_server.uya src/selftest/st_round_driver.uya src/selftest/st_tty_sse.uya src/selftest/st_sessions.uya src/selftest/st_read_window.uya src/selftest/st_view_watch.uya src/selftest/st_responses.uya src/selftest/st_stats_ctx.uya src/selftest/st_title.uya src/selftest/st_tasks_ws.uya src/selftest/st_vision.uya src/selftest/st_goal_worktree.uya src/selftest/st_goal_sess.uya src/selftest/st_pm.uya src/selftest/st_pm2.uya src/selftest/st_mcp.uya \
        src/selftest/tuis_core.uya src/selftest/tuis_title_pty.uya src/selftest/tuis_exit_cmd.uya src/selftest/tuis_diff_scroll.uya src/selftest/tuis_title_ask.uya src/selftest/tuis_sessions_big.uya src/selftest/tuis_tail.uya src/selftest/tuis_marquee_row.uya src/selftest/tuis_sel.uya \
        src/selftest/st_web.uya src/selftest/st_web_childcfg.uya src/selftest/st_tls_pin.uya \
        src/selftest/st_dns.uya \
-       src/selftest/st_clip.uya \
+       src/selftest/st_clip.uya src/selftest/st_wire.uya src/selftest/tuis_ui_port.uya src/selftest/tuis_events.uya \
        src/diff/model.uya src/diff/gitcmd.uya src/diff/rows.uya src/diff/view.uya src/diff/render.uya
 OUT := build/uya-agent
 
@@ -136,7 +136,7 @@ export UYA_ROOT
 export UYA_SPLIT_C_DIR := $(CURDIR)/build/uyacache
 
 # 行宽豁免：一条 .PHONY 就是一张全仓目标清单，拆行反而看不清哪条丢了
-.PHONY: all check print-src print-cflags build link-audit selftest codegen-audit doc-audit lint-size lint-size-all doc-cover ui-audit probe e2e e2e-config e2e-exec e2e-accept-nudge e2e-retry e2e-config-flags e2e-title e2e-title-cmd e2e-title-auto e2e-mouse e2e-api e2e-steps e2e-permission e2e-sandbox e2e-tasks e2e-goal e2e-memory e2e-memory-live e2e-sessions e2e-resume-big e2e-diff e2e-ws e2e-model e2e-model-save e2e-model-route e2e-ctxwindow e2e-inputimage e2e-worktree e2e-watch e2e-watch-pick e2e-dsh e2e-portable e2e-dns p30-check tui-demo tui-selftest web-selftest sess-selftest diff-selftest model-selftest panel-selftest clean shell-selftest pm-selftest mcp-selftest
+.PHONY: all check wire-schema wire-probe wire-probe-real dsh-web-check print-src print-cflags build link-audit selftest codegen-audit doc-audit lint-size lint-size-all doc-cover ui-audit probe e2e e2e-config e2e-exec e2e-accept-nudge e2e-retry e2e-config-flags e2e-title e2e-title-cmd e2e-title-auto e2e-mouse e2e-api e2e-steps e2e-permission e2e-sandbox e2e-tasks e2e-goal e2e-memory e2e-memory-live e2e-sessions e2e-resume-big e2e-diff e2e-ws e2e-model e2e-model-save e2e-model-route e2e-ctxwindow e2e-inputimage e2e-worktree e2e-watch e2e-watch-pick e2e-dsh e2e-portable e2e-dns p30-check tui-demo tui-selftest web-selftest sess-selftest diff-selftest model-selftest panel-selftest clean shell-selftest pm-selftest mcp-selftest
 
 all: build
 
@@ -218,6 +218,43 @@ doc-cover:
 # 六条判据的机器实现与防假绿对照见 CODING.md §1.4 与 DESIGN.md §11.9。
 ui-audit:
 	@python3 testdata/ui_audit.py
+
+# P80：形状适配层（本仓日志 → DSH SessionEvent）的**外部** oracle。
+# 为什么不能只靠 `selftest[wire-adapt]`：那一轮的断言都是**子串**判据，而「JSON 结构
+# 坏掉」能完全绕过它们 —— 实测抓到过两种（`…"time":1{"role":…` 漏收尾引号、
+# `"data":{{` 多花括号），两次都是子串全中、只有 schema 判红。
+# 所以这条判据交给 **DSH 自己的 zod schema** 来判（我们适配出的东西必须是它认得的
+# —— 这就是「不改 DSH 的 webui」的前提）。本机没装 DSH 时**跳过**（不是失败）。
+wire-schema: build
+	@python3 testdata/wire_schema_check.py
+
+# P80：**阶段 0 探针** —— 「不改 DSH 的 webui 能不能当本仓的前端」这句可证伪的话。
+# 它起一个最小宿主（只读服务 DSH 自己那份 dist + 复刻它的 `bootInjections()` +
+# 最小 14 包 roster + `/api` 接本仓适配层的输出），再起 headless chromium 用 CDP
+# 驱动到「消息渲染出来」，断言标题与正文（两条只可能来自我们的事件流）。
+# 本机没装 DSH 或没有 chromium 时**跳过**（不是失败）—— 它在别的机器上也该能跑。
+wire-probe:
+	@python3 testdata/wire_probe_host.py --selftest-drive
+
+# P80：**真日志**那一腿 —— 用产品适配层（web/wsess.uya）翻一份真的本仓 session.jsonl，
+# 再走同一个探针。它与上一条的分工：上一条验「形状与最小面能起来」，这一条验
+# 「**一整份真会话**能从头翻到尾并渲染出来」（含本仓那些 DSH 不认识的私有事件）。
+# LOG 不给时自动挑 build/ 下第一份真有内容的 session.jsonl。
+# P80：**产品侧**的端到端验收 —— 起 --dsh-web（产品二进制，不是 python 探针），
+# 再用 headless chromium + CDP 驱动到「DSH 的界面里渲染出本仓会话的消息」。
+# 这是本目标（基于 ui_backend 接入 DSH webui）在**产品**上的判据。
+# 没装 DSH / 没 chromium 时跳过（退出 0）。
+dsh-web-check: build
+	@sh testdata/dsh_web_check.sh
+
+wire-probe-real:
+	@log="$(LOG)"; \
+	if [ -z "$$log" ]; then \
+		log=$$(find build -name session.jsonl -size +500c 2>/dev/null | head -1); \
+	fi; \
+	if [ -z "$$log" ]; then echo "wire-probe-real: 跳过 —— 找不到真会话日志（先跑 make selftest 生成一份）"; exit 0; fi; \
+	echo "wire-probe-real: 用 $$log"; \
+	python3 testdata/wire_probe_host.py --selftest-drive --real-log "$$log"
 
 # 文档审计：仓库里不许留 Git 冲突标记（`<<<<<<<` / `=======` / `>>>>>>>`）。
 # 来历见 §16 踩坑 94：一条合并残留的 `=======` 从 P53 那次合并（3e62301）

@@ -1,0 +1,310 @@
+// src/ui/be_events.uya — 事实流后端：把界面事实写成一行一个 JSON（NDJSON）
+//
+// 本文件：`EventsBe`（`UiBackend` 的事实流实现）—— 每条事实落成一行 JSON 写进一个
+//   fd（`start` 给的输出目标），**不画任何东西**。
+// 不变量：① **它不认识任何界面**（没有光标、没有列宽、没有浮层）—— 这正是它存在的
+//   意义：native / robot / 未来的 web 前端都是它的消费者，各自决定怎么画；
+//   ② 一行**一定完整**（含结尾 `\n`）才写出：半行会让消费者按行解析时错位，所以先拼
+//   进缓冲、成功后一次性写；③ 拼不出就**丢弃并计数**（`dropped`），绝不写半行；
+//   ④ `ask` 一律 `error.UiNoChannel` —— 事实流是**单向**的，没有回答回路
+//   （要问答就得配一条输入通道，那是另一件事，见 DESIGN §11.9 的后续）；
+//   ⑤ 本文件不许认识 `Config` / `agent_` / `g_sess`（审计判据 C）。
+// 依赖：本域 ui/ui_port（接口与常量）、foundation/bufx（Buf）、foundation/jsonx
+//   （JsonWriter / jw_*）、libc.syscall（sys_write）。
+// 命名：`EventsBe`；方法名由接口规定，它们只经接口调用，所以不带文件前缀；
+//   私有辅助一律 `beev_*`。
+//
+// 线格式（每行一条，`type` 是判别键；消费者按 `type` 分派，**认不出的必须忽略**）：
+//   {"type":"text","chan":1,"data":"…"}            chan = UI_CH_*
+//   {"type":"entry","kind":1,"data":"…"}           kind = UI_ENT_*
+//   {"type":"status","what":1,"data":"…"}          what = UI_ST_*
+//   {"type":"run","state":3,"label":"…"}           state = UI_RUN_*
+//   {"type":"pump","intent":0}                     泵点（消费者用它做心跳）
+//   {"type":"start","cols":100,"rows":30}
+//   {"type":"stop","dropped":0}
+//
+// 为什么 `status` 的 `UI_ST_RUN` 另立一个 `run` 类型：它的载荷是「十进制状态 + 可选
+// 标签」两段，压进 `data` 就得让消费者自己切字符串（那是把端口的编码细节泄漏出去）。
+// 其余 `UI_ST_*` 的载荷本来就是给显示用的**整段文本**，原样透传即可。
+
+use libc.syscall;
+
+// 一行 JSON 的缓冲上限。事实是「给显示用的文本」，单条 64 KiB 已经远超任何一条
+// 诊断（TUI 自己的 NOTICE 口径是 512 B/条）。超了就丢弃并计数 —— **绝不写半行**。
+const BEEV_LINE_MAX: usize = 65536;
+
+export struct EventsBe : UiBackend {
+    // 输出目标 fd（-1 = 没 start 过 / 没地方写）。
+    out_fd: i32,
+    started: bool,
+    // 丢弃计数（缓冲不够或写失败）。诊断用：它不为 0 说明消费者看到的是**残缺的流**，
+    // 而残缺是静默的（少几行而已），所以这个数字必须能被查。
+    dropped: u64,
+
+    fn kind_name(self: &Self) &const byte {
+        return "events" as &const byte;
+    }
+
+    // 起：记住输出 fd。没有资源要申请，`cols`/`rows` 只作一条 `start` 事实报出去
+    // （消费者自己决定要不要用）。
+    fn start(self: &Self, cols: usize, rows: usize) bool {
+        self.out_fd = beev_out_fd();
+        self.started = true;
+        self.dropped = 0;
+        var b: Buf = buf_new(128);
+        defer { buf_free(&b); }
+        if beev_begin(&b, "start" as &const byte) {
+            _ = buf_append_cstr(&b, ",\"cols\":");
+            _ = buf_append_u64(&b, cols as u64);
+            _ = buf_append_cstr(&b, ",\"rows\":");
+            _ = buf_append_u64(&b, rows as u64);
+            _ = buf_append_byte(&b, 125);
+            beev_commit(self, &b);
+        } else {
+            self.dropped = self.dropped + 1;
+        }
+        return true;
+    }
+
+    // 收：报一条 `stop`（带丢弃计数），然后掐掉 fd。幂等。
+    fn stop(self: &Self) void {
+        if !self.started {
+            self.out_fd = -1;
+            return;
+        }
+        var b: Buf = buf_new(128);
+        defer { buf_free(&b); }
+        if beev_begin(&b, "stop" as &const byte) {
+            _ = buf_append_cstr(&b, ",\"dropped\":");
+            _ = buf_append_u64(&b, self.dropped);
+            _ = buf_append_byte(&b, 125);
+            beev_commit(self, &b);
+        }
+        self.started = false;
+        self.out_fd = -1;
+    }
+
+    // 一条文本事实（chan = UI_CH_*）。
+    fn text(self: &Self, chan: u8, p: &const byte, n: usize) void {
+        beev_emit_str(self, "text" as &const byte, "chan" as &const byte,
+            chan, p, n);
+    }
+
+    // 一个离散条目（kind = UI_ENT_*）。**与 `text` 分开报**：消费者能据此恢复
+    // 「这是独立一条」的边界（见 ui_port 的 `entry` 注释）。
+    fn entry(self: &Self, kind: u8, p: &const byte, n: usize) void {
+        beev_emit_str(self, "entry" as &const byte, "kind" as &const byte,
+            kind, p, n);
+    }
+
+    // 一条状态事实（what = UI_ST_*）。`UI_ST_RUN` 另立 `run` 类型（见文件头）。
+    fn status(self: &Self, what: u8, p: &const byte, n: usize) void {
+        if what == UI_ST_RUN {
+            beev_emit_run(self, p, n);
+            return;
+        }
+        beev_emit_str(self, "status" as &const byte, "what" as &const byte,
+            what, p, n);
+    }
+
+    // 泵一次界面：**不阻塞、不读输入**（事实流是单向的），只报一条心跳。
+    // 返回值恒 0 —— 这个后端没有「中断意图」这个概念（消费者要中断只能另开通道）。
+    fn pump(self: &Self, timeout_ms: i32) i32 {
+        var b: Buf = buf_new(64);
+        defer { buf_free(&b); }
+        if beev_begin(&b, "pump" as &const byte) {
+            _ = buf_append_cstr(&b, ",\"intent\":0}");
+            beev_commit(self, &b);
+        } else {
+            self.dropped = self.dropped + 1;
+        }
+        return 0;
+    }
+
+    // 事实查询。`UI_ON_ACTIVE` 如实报；`UI_ON_OVERLAY_OK` **恒假** ——
+    // 事实流没有浮层，所以「看不见就不许做」那条闸门在它这里一律关着（fail closed）。
+    fn on(self: &Self, what: u8) bool {
+        if what == UI_ON_ACTIVE {
+            return self.started;
+        }
+        return false;
+    }
+
+    // 提问：**一律 fail closed**。事实流是单向的，没有回答回路 ——
+    // 回 `error.UiNoChannel` 是「没人能回答」，不是「用户拒绝了」。
+    fn ask(self: &Self, req: &const UiReq, ans: &const UiAns) !i32 {
+        return error.UiNoChannel;
+    }
+}
+
+// 输出 fd。刻意与 TUI 的 `tui_out_fd()` 分开命名：事实流的消费者可能是管道/文件，
+// 而 TUI 的 fd 是 `dup(1)` 的副本 —— 混用会把 JSON 写进备用屏幕。
+// 取值规则：环境变量 `UYA_AGENT_EVENTS_FD` 给一个十进制 fd；没给就用 1（stdout）。
+fn beev_out_fd() i32 {
+    const s: &byte = getenv("UYA_AGENT_EVENTS_FD" as &const byte);
+    if s == null as &byte {
+        return 1;
+    }
+    const v: i64 = parse_u64_at(s[0: bufx_cstr_len(s as &const byte)], 0,
+        bufx_cstr_len(s as &const byte));
+    if v < 0 || v > 65535 {
+        return 1;
+    }
+    return v as i32;
+}
+
+// 一个空的 JsonWriter（`jw_init` 之前只需要这一个「未初始化」形状）。
+fn beev_jw() JsonWriter {
+    return JsonWriter{ buf: null, cap: 0, used: 0, overflow: false };
+}
+
+// 开一条事实：`{"type":"<typ>"`。返回 false = 缓冲不够（调用方丢弃并计数）。
+// ⚠ **收尾那个 `"` 不能少**：少了它整行 JSON 就是坏的，而症状是「消费者一条都解不出来」
+// （自测第一版就是这个：`{"type":"start,` —— 手工拼 JSON 最容易漏的正是这种引号，
+// 所以这条有专门的回归腿，见 `tuis_events.uya` 的 `start` 形状断言）。
+fn beev_begin(out: &Buf, typ: &const byte) bool {
+    if !buf_append_cstr(out, "{\"type\":\"") {
+        return false;
+    }
+    if !buf_append_cstr(out, typ) {
+        return false;
+    }
+    return buf_append_byte(out, 34);
+}
+
+// 一条「<key>:<十进制>, "data":"<转义文本>"}」事实。
+// 走 JsonWriter 转义（`jw_str`）—— 那段是本仓唯一一份完整的 RFC 8259 转义实现，
+// 自己手写一份必然在控制字节/引号上分叉（`jw_str_esc_len` 的注释记了这条）。
+fn beev_emit_str(self: &EventsBe, typ: &const byte, key: &const byte,
+    code: u8, p: &const byte, n: usize) void {
+    if !self.started || self.out_fd < 0 {
+        return;
+    }
+    // 预算：信封 + 编码（十进制最多 3 位）+ 转义后的 data + 收尾。
+    const need: usize = 96 + jw_str_esc_len(p, n);
+    var b: Buf = buf_new(need);
+    defer { buf_free(&b); }
+    if !buf_valid(&b) {
+        self.dropped = self.dropped + 1;
+        return;
+    }
+    if !beev_begin(&b, typ) {
+        self.dropped = self.dropped + 1;
+        return;
+    }
+    // `,"<key>":<code>` —— 四个片段分四次 append，任何一次失败都整条丢弃。
+    if !buf_append_cstr(&b, ",\"") {
+        self.dropped = self.dropped + 1;
+        return;
+    }
+    if !buf_append_cstr(&b, key) {
+        self.dropped = self.dropped + 1;
+        return;
+    }
+    if !buf_append_cstr(&b, "\":") || !buf_append_u64(&b, code as u64) {
+        self.dropped = self.dropped + 1;
+        return;
+    }
+    if !buf_append_cstr(&b, ",\"data\":") {
+        self.dropped = self.dropped + 1;
+        return;
+    }
+    // 转义走 JsonWriter（它写的是「已转义的字符串」，含两侧引号）。
+    var w: JsonWriter = beev_jw();
+    const room: usize = b.cap - b.len;
+    jw_init(&w, &b.ptr[b.len], room);
+    jw_str(&w, p, n);
+    if jw_overflow(&w) {
+        self.dropped = self.dropped + 1;   // 放不下 ⇒ 整条丢弃，**不写半行**
+        return;
+    }
+    b.len = b.len + jw_used(&w);
+    if !buf_append_byte(&b, 125) {
+        self.dropped = self.dropped + 1;
+        return;
+    }
+    beev_commit(self, &b);
+}
+
+// 一条 `run` 事实：载荷是「十进制状态」+ 可选 `\n标签`（见 ui_port 的 UI_ST_RUN）。
+fn beev_emit_run(self: &EventsBe, p: &const byte, n: usize) void {
+    if !self.started || self.out_fd < 0 {
+        return;
+    }
+    // 切出第一行（状态码）与其余（标签）。
+    var cut: usize = n;
+    var i: usize = 0;
+    while i < n {
+        if p[i] == 10 as byte {
+            cut = i;
+            break;
+        }
+        i = i + 1;
+    }
+    var state: i64 = 0;
+    if cut > 0 {
+        const d: i64 = parse_u64_at(p[0: cut], 0, cut);
+        if d >= 0 {
+            state = d;
+        }
+    }
+    const label_len: usize = if cut < n { n - cut - 1 } else { 0 as usize };
+    const label: &const byte = if cut < n {
+        &p[cut + 1]
+    } else {
+        "" as &const byte
+    };
+    const need: usize = 96 + jw_str_esc_len(label, label_len);
+    var b: Buf = buf_new(need);
+    defer { buf_free(&b); }
+    if !buf_valid(&b) || !beev_begin(&b, "run" as &const byte) {
+        self.dropped = self.dropped + 1;
+        return;
+    }
+    if !buf_append_cstr(&b, ",\"state\":") || !buf_append_i64(&b, state) {
+        self.dropped = self.dropped + 1;
+        return;
+    }
+    if !buf_append_cstr(&b, ",\"label\":") {
+        self.dropped = self.dropped + 1;
+        return;
+    }
+    var w: JsonWriter = beev_jw();
+    const room: usize = b.cap - b.len;
+    jw_init(&w, &b.ptr[b.len], room);
+    jw_str(&w, label, label_len);
+    if jw_overflow(&w) {
+        self.dropped = self.dropped + 1;
+        return;
+    }
+    b.len = b.len + jw_used(&w);
+    if !buf_append_byte(&b, 125) {
+        self.dropped = self.dropped + 1;
+        return;
+    }
+    beev_commit(self, &b);
+}
+
+// 补换行后一次性写出。**一次 write 一整行**：消费者按行解析，半行会错位。
+fn beev_commit(self: &EventsBe, b: &Buf) void {
+    if self.out_fd < 0 {
+        return;
+    }
+    if !buf_append_byte(b, 10) {
+        self.dropped = self.dropped + 1;
+        return;
+    }
+    var off: usize = 0;
+    while off < b.len {
+        const w: isize = sys_write(self.out_fd, &b.ptr[off],
+            b.len - off) catch {
+            self.dropped = self.dropped + 1;
+            return;
+        };
+        if w <= 0 {
+            self.dropped = self.dropped + 1;
+            return;
+        }
+        off = off + (w as usize);
+    }
+}

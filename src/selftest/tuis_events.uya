@@ -1,0 +1,386 @@
+// src/selftest/tuis_events.uya — 事实流后端（`be_events`）的离线自测轮
+//
+// 本文件：`tui_events_round`（轮次名 `ui-events`）—— 把事实流**真的写进一个管道**、
+//   再把字节读回来逐条解析，验证线格式、转义、边界与 fail-closed。内部拆成几段
+//   （`uev_emit_*` / `uev_shape_*` / `uev_escape_*` / `uev_closed_*`）。
+// 不变量：① 断言只看**写出去的字节**（不看后端内部状态）—— 消费者拿到的就是那些
+//   字节，所以「内部对了但序列化错了」必须能被抓到；
+//   ② 每条断言都按**行**做（`\n` 切），因为「一行一条完整 JSON」正是这份线格式的
+//   契约：半行 = 消费者解析错位；
+//   ③ 每段开头 `ui_use(UI_BE_EVENTS)`（见踩坑 145：不选后端就落到空后端、静默全空）。
+// 依赖：libc（syscall/unistd：pipe2/close/read/fcntl）、foundation/bufx、ui/ui_port、
+//   ui/ui_reg、ui/be_events（经 `ui_use(UI_BE_EVENTS)` 间接）。
+// 命名：对外 `tui_events_round`；私有 `uev_*`（夹具与断言）；轮次名 `ui-events`。
+
+// 事实流的输出目标与读取端：把 fd 1 临时接到管道写端，于是「默认写 fd 1」的
+// `be_events` 就把字节送进了我们能读的地方。**不用环境变量**：那条路要改进程环境，
+// 而自测不该动 `UYA_AGENT_EVENTS_FD`（它还会被 fork 的子进程继承）。
+struct UevPipe {
+    rfd: i32,
+    wfd: i32,
+    saved: i32,      // 被挪走的原 fd 1
+    on: bool,
+}
+
+// 建管道并把 fd 1 接过去。失败回一个 `on == false` 的壳（调用方据此判红）。
+fn uev_pipe_open() UevPipe {
+    var r: UevPipe = UevPipe{ rfd: -1, wfd: -1, saved: -1, on: false };
+    var fds: [i32: 2] = [0: 2];
+    if (sys_pipe2(&fds[0], 0) catch { -1; }) != 0 {
+        return r;
+    }
+    r.rfd = fds[0];
+    r.wfd = fds[1];
+    uev_nonblock(r.rfd);
+    r.saved = sys_dup(1) catch { -1; };
+    _ = sys_dup2(r.wfd, 1) catch {};
+    r.on = true;
+    return r;
+}
+
+// 把 fd 1 **接回管道写端**。每段都要重新接一次：`uev_pipe_restore` 会把 fd 1 还回原处，
+// 而原处是终端 —— 不重接的话后面几段的字节就写到终端上去了，症状是「读回来是空的」
+// （第一版就是这么错的：第 2 段的断言全看不到内容）。
+fn uev_pipe_attach(p: &const UevPipe) void {
+    if p.wfd >= 0 {
+        _ = sys_dup2(p.wfd, 1) catch {};
+    }
+}
+
+// 把 fd 1 还回原处。**读管道之前必须调**，否则后续 stderr 也进管道、把事实流搅脏。
+// ⚠ **`saved` 不在这里关**：本轮的几段是「接上 → 写 → 还回去 → 再接下」反复用的，
+// 用完就清的话第二次 `attach` 就再也还不回来了 —— fd 1 会一直指着管道写端，而
+// `uev_pipe_close` 把写端关掉之后，**下一次写 stdout 就是 SIGPIPE（实测退出码 141，
+// 整个 selftest 在 san-shell 之后静默死掉）**。`saved` 一律留给 `uev_pipe_close` 收。
+fn uev_pipe_restore(p: &const UevPipe) void {
+    if p.saved >= 0 {
+        _ = sys_dup2(p.saved, 1) catch {};
+    }
+}
+
+// 收尾（幂等，**顺序不能换**）：先把 fd 1 还原，再关两端。
+// 先还原是**硬要求**：`saved` 一旦跟着关掉，fd 1 就永远指着那个管道写端了。
+fn uev_pipe_close(p: &UevPipe) void {
+    uev_pipe_restore(p);
+    if p.saved >= 0 {
+        _ = sys_close(p.saved) catch {};
+    }
+    if p.rfd >= 0 {
+        _ = sys_close(p.rfd) catch {};
+    }
+    if p.wfd >= 0 {
+        _ = sys_close(p.wfd) catch {};
+    }
+}
+
+
+// 三行端口入口的短包装：**载荷长度一律 `bufx_cstr_len`**（手数长度错过一次，
+// 见 tuis_ui_port.uya 的不变量④），包装只是为了让调用点不超行宽。
+fn uev_text(chan: u8, p: &const byte) void {
+    ui_text(chan, p, bufx_cstr_len(p));
+}
+
+// 一个离散条目（kind = UI_ENT_*）。
+fn uev_entry(kind: u8, p: &const byte) void {
+    ui_entry(kind, p, bufx_cstr_len(p));
+}
+
+// 一条状态事实（what = UI_ST_*）。
+fn uev_status(what: u8, p: &const byte) void {
+    ui_status(what, p, bufx_cstr_len(p));
+}
+
+// 把管道读侧设成非阻塞（fcntl F_GETFL/F_SETFL + O_NONBLOCK）。
+fn uev_nonblock(fd: i32) void {
+    const flags: i32 = sys_fcntl(fd, 3, 0) catch { -1; };
+    if flags < 0 {
+        return;
+    }
+    _ = sys_fcntl(fd, 4, flags | 0x800) catch {};
+}
+
+// 从管道读侧把已写出的字节全读出来（非阻塞，有多少读多少）。
+fn uev_drain(rfd: i32, out: &Buf) usize {
+    var total: usize = 0;
+    var tmp: [byte: 4096] = [0: 4096];
+    while true {
+        const n: isize = sys_read(rfd, &tmp[0], 4096) catch { -1 as isize; };
+        if n <= 0 {
+            break;
+        }
+        if !buf_append(out, &tmp[0], n as usize) {
+            break;
+        }
+        total = total + (n as usize);
+    }
+    return total;
+}
+
+// out[start, start+len) 里有没有 lit（逐字节）。
+fn uev_seg_has(p: &const byte, start: usize, len: usize,
+    lit: &const byte) bool {
+    const m: usize = bufx_cstr_len(lit);
+    if m == 0 || len < m {
+        return false;
+    }
+    var i: usize = start;
+    const end: usize = start + len;
+    while i + m <= end {
+        if bufx_mem_eq(&p[i], lit, m) {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+// out 里有没有**完整的一行**（以 `\n` 结尾）满足该行含有 lit。
+// 「完整」是这条线格式的核心契约：半行不算数。
+fn uev_has_line(out: &const Buf, lit: &const byte) bool {
+    var start: usize = 0;
+    var i: usize = 0;
+    while i < out.len {
+        if out.ptr[i] == 10 as byte {
+            const seg: usize = i - start;
+            if seg > 0 && uev_seg_has(out.ptr, start, seg, lit) {
+                return true;
+            }
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+// 每条完整行都必须是配平的大括号形状（以 `{` 开头、`}` 结尾、括号计数配平）。
+// 这一条能抓住「引号漏了/转义错了」这类拼装错误 —— 它们都表现为形状坏掉。
+fn uev_lines_balanced(out: &const Buf, tag: &const byte, ok: &bool) void {
+    var start: usize = 0;
+    var i: usize = 0;
+    while i <= out.len {
+        const at_end: bool = i == out.len;
+        if at_end || out.ptr[i] == 10 as byte {
+            const seg: usize = i - start;
+            if seg > 0 {
+                const bad_head: bool = out.ptr[start] != 123 as byte;
+                const bad_tail: bool = out.ptr[i - 1] != 125 as byte;
+                if bad_head || bad_tail {
+                    tuis_fail(tag, "事实流里有一行不是 {…} 形状（半行或拼装错了）",
+                        ok);
+                    return;
+                }
+                if !uev_braces_balanced(out.ptr, start, seg) {
+                    tuis_fail(tag, "事实流里有一行大括号不配平", ok);
+                    return;
+                }
+            } else if !at_end {
+                tuis_fail(tag, "事实流里出现了空行（应当「一行一条」）", ok);
+                return;
+            }
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+}
+
+// 括号计数（`{}` 与 `[]` 都算）。**必须过字符串态** —— 载荷里带引号与转义，
+// 直接数字符会把 `"` 内的括号也算进去。
+fn uev_braces_balanced(p: &const byte, off: usize, n: usize) bool {
+    var depth: i32 = 0;
+    var in_str: bool = false;
+    var esc: bool = false;
+    var i: usize = off;
+    const end: usize = off + n;
+    while i < end {
+        const c: byte = p[i];
+        if in_str {
+            if esc {
+                esc = false;
+            } else if c == 92 as byte {
+                esc = true;
+            } else if c == 34 as byte {
+                in_str = false;
+            }
+        } else if c == 34 as byte {
+            in_str = true;
+        } else if c == 123 as byte || c == 91 as byte {
+            depth = depth + 1;
+        } else if c == 125 as byte || c == 93 as byte {
+            depth = depth - 1;
+            if depth < 0 {
+                return false;
+            }
+        }
+        i = i + 1;
+    }
+    return depth == 0 && !in_str;
+}
+
+// 段 1：正常一轮事实 —— 每种事实都在，判别键与取值都对。
+fn uev_emit_all(tag: &const byte, ok: &bool, p: &const UevPipe) void {
+    ui_use(UI_BE_EVENTS);
+    if ui_kind() != UI_BE_EVENTS {
+        tuis_fail(tag, "ui_use(UI_BE_EVENTS) 之后 ui_kind() 不是 EVENTS", ok);
+    }
+    if !bufx_eq_cstr(ui_kind_name(), bufx_cstr_len(ui_kind_name()),
+        "events" as &const byte) {
+        tuis_fail(tag, "事实流后端的 kind_name 不是 \"events\"", ok);
+    }
+    _ = ui_start(100, 30);
+    uev_text(UI_CH_MAIN, "正文一段" as &const byte);
+    uev_text(UI_CH_REASON, "思考一段" as &const byte);
+    uev_text(UI_CH_NOTICE, "通知一条\n" as &const byte);
+    uev_entry(UI_ENT_USER, "用户输入" as &const byte);
+    uev_entry(UI_ENT_NOTICE, "独立回执" as &const byte);
+    uev_status(UI_ST_PLAN, "1" as &const byte);
+    uev_status(UI_ST_ACCESS, "2" as &const byte);
+    uev_status(UI_ST_RUN, "3\nBash(make check)" as &const byte);
+    _ = ui_pump(0);
+    ui_stop();
+    uev_pipe_restore(p);
+}
+
+// 段 1 的断言：形状 + 每种事实的判别键 + 载荷真的带上了。
+fn uev_check_all(tag: &const byte, ok: &bool, cap: &const Buf) void {
+    uev_lines_balanced(cap, tag, ok);
+    // `start` 的形状是**逐字节**钉的 —— 这一条专治「手工拼 JSON 漏引号」
+    // （第一版就是 `{"type":"start,`，整行坏掉；见 be_events 的 beev_begin 注释）。
+    if !uev_has_line(cap,
+        "{\"type\":\"start\",\"cols\":100,\"rows\":30}" as &const byte) {
+        tuis_fail(tag, "没有 `start` 事实（或形状不对）", ok);
+    }
+    if !uev_has_line(cap, "\"type\":\"text\",\"chan\":1" as &const byte) {
+        tuis_fail(tag, "UI_CH_MAIN 没有报成 chan=1 的 text 事实", ok);
+    }
+    if !uev_has_line(cap, "\"type\":\"text\",\"chan\":2" as &const byte) {
+        tuis_fail(tag, "UI_CH_REASON 没有报成 chan=2 的 text 事实", ok);
+    }
+    if !uev_has_line(cap, "\"type\":\"text\",\"chan\":3" as &const byte) {
+        tuis_fail(tag, "UI_CH_NOTICE 没有报成 chan=3 的 text 事实", ok);
+    }
+    if !uev_has_line(cap, "\"type\":\"entry\",\"kind\":1" as &const byte) {
+        tuis_fail(tag, "UI_ENT_USER 没有报成 kind=1 的 entry 事实", ok);
+    }
+    if !uev_has_line(cap, "\"type\":\"entry\",\"kind\":4" as &const byte) {
+        tuis_fail(tag, "UI_ENT_NOTICE 没有报成 kind=4 的 entry 事实", ok);
+    }
+    if !uev_has_line(cap, "\"type\":\"status\",\"what\":4" as &const byte) {
+        tuis_fail(tag, "UI_ST_PLAN 没有报成 what=4 的 status 事实", ok);
+    }
+    // UI_ST_RUN 另立 `run` 类型（状态码 + 标签两段）。
+    if !uev_has_line(cap, "\"type\":\"run\",\"state\":3" as &const byte) {
+        tuis_fail(tag, "UI_ST_RUN 没有报成 state=3 的 run 事实", ok);
+    }
+    if !uev_has_line(cap, "Bash(make check)" as &const byte) {
+        tuis_fail(tag, "run 事实里没有带上标签", ok);
+    }
+    if !uev_has_line(cap, "\"type\":\"pump\"" as &const byte) {
+        tuis_fail(tag, "泵点没有报心跳事实", ok);
+    }
+    if !uev_has_line(cap, "\"type\":\"stop\",\"dropped\":" as &const byte) {
+        tuis_fail(tag, "没有 `stop` 事实（或没带 dropped 计数）", ok);
+    }
+    if !uev_has_line(cap, "正文一段" as &const byte) {
+        tuis_fail(tag, "text 事实里没有载荷内容", ok);
+    }
+    if !uev_has_line(cap, "用户输入" as &const byte) {
+        tuis_fail(tag, "entry 事实里没有载荷内容", ok);
+    }
+    // 载荷里的换行必须被**转义**（原样写出去就是半行 ⇒ 消费者解析错位）。
+    if !uev_has_line(cap, "通知一条\\n" as &const byte) {
+        tuis_fail(tag, "载荷里的换行没转义（原样写出去会截成两行）", ok);
+    }
+}
+
+// 段 2：转义（引号 / 反斜杠 / 制表）。这是「自己手写转义必然分叉」那条的回归腿。
+fn uev_check_escape(tag: &const byte, ok: &bool, p: &UevPipe) void {
+    uev_pipe_attach(p);
+    _ = ui_start(80, 24);
+    // 载荷刻意含引号 / 反斜杠 / 制表：它们是「两字节短转义」的代表
+    // （见 jsonx 的 jw_str_esc_len），也是手写转义最容易漏的三处。
+    const dirty: &const byte = "引号\"与反斜杠\\与制表\t结束" as &const byte;
+    uev_text(UI_CH_MAIN, dirty);
+    ui_stop();
+    uev_pipe_restore(p);
+    var cap: Buf = buf_new(65536);
+    defer { buf_free(&cap); }
+    _ = uev_drain(p.rfd, &cap);
+    uev_lines_balanced(&cap, tag, ok);
+    if !uev_has_line(&cap,
+        "引号\\\"与反斜杠\\\\与制表\\t" as &const byte) {
+        tuis_fail(tag, "转义不对（引号/反斜杠/制表要按 RFC 8259 转义）", ok);
+    }
+}
+
+// 段 3：单向流的 fail-closed 与 `on` 的事实口径。
+fn uev_check_closed(tag: &const byte, ok: &bool) void {
+    ui_use(UI_BE_EVENTS);
+    const req: UiReq = UiReq{
+        kind: UI_ASK_APPROVE, id: 1,
+        title: "t" as &const byte, tn: 1,
+        body: "b" as &const byte, bn: 1,
+        items: "" as &const byte, inlen: 0,
+        sel: 0, timeout_ms: 0,
+    };
+    var ans: UiAns = UiAns{ status: 0, sel: 0, text: buf_empty() };
+    const no_channel: i32 = -777;
+    const rc: i32 = ui_ask(&req, &ans) catch { no_channel; };
+    if rc != no_channel {
+        tuis_fail(tag, "事实流的 ui_ask 没回 UiNoChannel（单向流不该装能问答）",
+            ok);
+    }
+    if ui_on(UI_ON_OVERLAY_OK) {
+        tuis_fail(tag, "事实流的 UI_ON_OVERLAY_OK 应当恒假（它没有浮层）", ok);
+    }
+    if ui_on(UI_ON_ACTIVE) {
+        tuis_fail(tag, "stop 之后 UI_ON_ACTIVE 仍为真", ok);
+    }
+}
+
+// 段 4：没 start 就不写（不该在没人要的时候往 fd 里塞字节）。
+fn uev_check_unstarted(tag: &const byte, ok: &bool, p: &UevPipe) void {
+    uev_pipe_attach(p);
+    const x: &const byte = "没 start 过就不该出现" as &const byte;
+    uev_text(UI_CH_MAIN, x);
+    uev_pipe_restore(p);
+    var cap: Buf = buf_new(4096);
+    defer { buf_free(&cap); }
+    _ = uev_drain(p.rfd, &cap);
+    if cap.len != 0 {
+        tuis_fail(tag, "没 start 过却写了字节", ok);
+    }
+}
+
+// 整轮：四段各跑各的，**不早退**（一次看到所有红）。
+export fn tui_events_round(tag: &const byte) bool {
+    var ok: bool = true;
+    var p: UevPipe = uev_pipe_open();
+    defer { uev_pipe_close(&p); }
+    if !p.on {
+        tuis_fail(tag, "建管道 / 接管 fd 1 失败", &ok);
+        return false;
+    }
+
+    uev_emit_all(tag, &ok, &p);
+    var cap: Buf = buf_new(65536);
+    defer { buf_free(&cap); }
+    _ = uev_drain(p.rfd, &cap);
+    if cap.len == 0 {
+        tuis_fail(tag, "事实流一个字节都没写出来", &ok);
+    } else {
+        uev_check_all(tag, &ok, &cap);
+        if !uev_has_line(&cap, "\"type\":\"start\"" as &const byte) {
+            tuis_fail(tag, "没有 `start` 事实（信封缺 type 判别键）", &ok);
+        }
+    }
+
+    uev_check_escape(tag, &ok, &p);
+    uev_check_closed(tag, &ok);
+    uev_check_unstarted(tag, &ok, &p);
+
+    ui_use(UI_BE_NULL);      // 收尾：别把选择留给下一轮
+    if ok {
+        tuis_ok(tag, "事实流：线格式 / 判别键 / 转义 / fail closed / 未 start 不写");
+    }
+    return ok;
+}

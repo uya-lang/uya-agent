@@ -2690,6 +2690,8 @@ var r: UiBackend = g_reg[0];
 | C `src/ui/**` 出现 `Config` / `agent_` / `g_sess` | 端口层反向依赖执行核，后端换不动、也不能独立自测 |
 | D `be_*.uya` 里的 struct 没写 `: UiBackend` | 假后端（漏**方法**会编译报错，整个忘标注不会） |
 | E 注册表槽位没填满 | 空槽 vtable = null，`ui_use` 切过去即崩 |
+| G `src/ui/**` 把 `chan` 原样喂给 `tui_*`/`tty_*` | **通道编号直通** ⇒ 思考与通知对调（踩坑 148，静默串位） |
+| H `ui_use(UI_BE_X)` 的槽里是 `g_null`（`NULL` 除外） | 切到一个**还没落地**的后端 ⇒ 静默丢弃一切输出（不崩，所以最难查） |
 | F `tui_active()` / `tui_overlay_kind()` 欠账数 | **进展量**（P80 目标 0）：过渡期只报数不判红 —— 硬红了这条审计在过渡期永远红，那样的审计会被关掉 |
 
 五条硬判据都做了防假绿对照（各装回一次违例 ⇒ 当场红）。
@@ -2700,11 +2702,58 @@ var r: UiBackend = g_reg[0];
 `ui_reg`），`make ui-audit`，以及 CODING.md §1.4 的接口规范与陷阱。运行期实测过：
 注册表切换、`ui_ask` 的 `error.UiNoChannel`、空后端零字节输出、无段错误。
 
+**已落地（P80 第二批：接口真正生效）**——这一批的关键事实是「第一批建好了但**没人用**」：
+
+| 事实 | 读数 |
+|---|---|
+| 第一批交付时执行核调 `ui_*` 的次数 | **0**（`ui_text` / `ui_status` / `ui_pump` / `ui_ask` / `ui_use` / `ui_reg_put` 逐个精确匹配全是 0） |
+| 同一时刻执行核直呼 `tui_*` / `tty_*` 的次数 | **602**（`agent` 500 / `net` 46 / `tools` 36 / `media` 14 / `diff` 5 / `vcs` 1） |
+| `g_reg` 四个槽 | 全填 `g_null`（即「切到任何后端都丢输出」） |
+| `ui_port.uya` 文件头声称存在的 `ui_on` | **不存在**（文档与代码分叉） |
+
+所以第二批做的是「把接口接上电」，**不是**搬 600 个调用点：
+
+| 内容 | 落点 |
+|---|---|
+| `be_tui.uya`：`TuiBe : UiBackend`（第一个真实后端，7 + 1 个方法） | 新增 292 行 |
+| `ui_on(what)`：`UI_ON_ACTIVE` / `UI_ON_OVERLAY_OK` 两个**事实**查询 | `ui_port` / `ui_reg` / `be_null` / `be_tui` |
+| 接线：`agent_tui_start` 末尾 `ui_use(UI_BE_TUI)`；`agent_tui_stop` **开头** `ui_use(UI_BE_NULL)` | `ag_plan_pump`（两行） |
+| `ui-port` 自测轮（5 段：注册表 / fail closed / **通道映射** / status 转发 / `ui_on`） | `tuis_ui_port.uya` |
+| `ui-audit` 判据 G / H（见下） | `testdata/ui_audit.py` |
+
+**验收**（全部实测）：`--tui-demo` **逐字节相同**（334 行 / 57765 B，改动前后 `cmp` 通过）；
+`make selftest` 185 轮绿；`make lint-size` / `make ui-audit` 通过。
+
+> ⚠ 一个**必须记住的两套通道编号**（`make ui-audit` 判据 G 就是钉它的）：端口的
+> `UI_CH_*` 是 MAIN=1 / **REASON=2** / **NOTICE=3**，而 TUI 内部的 `tui_sink_bytes`
+> 是 1=正文 / **2=通知** / **3=思考**（`tty_reason_write` 送的就是 3）。三个里错了两个，
+> 而错法是**静默串位**（不崩、不报错、编译期看不见，只是思考与通知对调）。所以
+> `be_tui.text` 必须过一张显式映射表 `betui_chan_map()`；**任何地方都不许把端口的
+> `chan` 直接喂给 `tui_sink_bytes`**。这条的回归腿必须按**条目种类**断言（`uip_chan_check`），
+> 不能只断言「屏幕上有字」—— 对调之后两边都「有字」。
+
+**判据 G / H 的理由**（两条都做了防假绿对照：装回违例 ⇒ 退出码 1，改回 ⇒ 0）：
+
+* **G 端口通道号直通**：`src/ui/` 里把 `chan` 原样传给 `tui_*` / `tty_*` = 上面那个对调。
+* **H `ui_use` 切到空后端**：判据读的是 `g_reg` 字面量里那一槽**是不是 `g_null`**
+  （只看「有没有 `ui_reg_put(UI_BE_X)`」是假绿的 —— `ui_reg_put(UI_BE_X, g_null)` 与
+  「没登记」在运行期是同一件事）。`UI_BE_NULL` 是**例外**：它的槽本来就该是空后端，
+  `ui_use(UI_BE_NULL)` 是正常收尾。要抓的是「切到一个还没落地的非空后端」——
+  那时界面看起来「切过去了」，实际什么都不显示。这正是 §2.4 那条
+  「SIGSEGV 陷阱以外还有静默陷阱」的同族：空后端的 vtable **有效**，所以不崩。
+
+**第二批实测抓出的两个真缺陷**（都由新自测轮抓住，改前先看到红）：
+
+| # | 缺陷 | 症状 | 修法 |
+|---|---|---|---|
+| ① | `be_tui.status` 的 `UI_ST_ACCESS` 分支：非法载荷（非数字）被解析成 0 并**照样设置** | 屏幕上的访问模式显示成「用户降权了」，而策略本身没动 —— **屏幕与事实分叉** | 解析不出来就**保持不动**（显示层是镜像，不是真值源） |
+| ② | 自测轮里 `UI_ST_TEXT` 的载荷长度**手数成 13**（实际 14） | 截断后的载荷悄悄变成另一种事实，屏幕上只是少一个字符 | 载荷一律走 `bufx_cstr_len`（这条已写进该文件的头注释不变量④） |
+
 **后续按族推进**（每族独立绿，绝不并行开两族 —— 半迁移态最难查）：
 
 | 阶段 | 内容 | 完成判据 |
 |---|---|---|
-| 2 | A 族（文本/转录 236 处）过端口 | `--tui-demo` 快照逐字节相同 |
+| 2 | A 族（文本/转录 224 处）过端口 | `--tui-demo` 快照逐字节相同 |
 | 3 | B 族（状态 62 处）+ 倒置 `term/tasks.uya` 对 `agent/` 的 122 处反向依赖 | `term/tasks` 不再引用 `agent/` |
 | 4 | C 族（泵点/输入 57 处），循环所有权归后端 | `make p30-check` |
 | 5 | D 族（提问/浮层 68 处），意图通道 + fail closed | 判据 F 清零（改硬判据） |
@@ -2715,6 +2764,95 @@ var r: UiBackend = g_reg[0];
 （154 个）而不是按调用点推进（600 个）。**同后端内部互调直呼后端私有函数、不许绕端口**
 （防「端口里再调端口」的无限递归）。
 
+**阶段 2 的第一片已落地（P80 第三批：离散条目族）**——动手前先解决了一个**词表问题**：
+
+| 结论 | 依据 |
+|---|---|
+| A 族**不是一族**，是两种**边界语义相反**的输出 | ①**字节流**（`tui_sink_bytes(1/3)`、`tty_write(fd 1/2)`）：要能**续接**，否则一段流式正文会碎成几十条；②**离散条目**（`tui_add_notice` / `add_user` / `add_steer` / `add_tool_block`）：一次调用一条，**不许续接**，否则连续两条回执会粘成一条 |
+| 压进一个 `text(chan)` 就会**静默改排版** | `tui_add_notice` 另有「512 B/条上限 + 每次新起条目」的口径，而 chan-2 的 `tui_sink_line` 是「按 `\n` 切 + 续接上一条 NOTICE」。实测把 `add_notice` 改成走 `sink(2)` 后 `--tui-demo` 与 TUI 自测**都照不出来**（它们不覆盖连续两条回执），所以这条只能靠**结构**兜，不能指望现有回归网 |
+| 修法：端口加一个**独立方法** `entry(kind, …)` | `UI_ENT_USER` / `UI_ENT_STEER` / `UI_ENT_TOOL` / `UI_ENT_NOTICE` 一张新表。两个方法各自一张词表，**不共用一个 `chan` 号**（共用了就得在运行时猜调用方意图） |
+| `ui_text` 当时**零生产调用点** | 所以扩词表是零代价的 —— 这一条让「趁早把形状定对」变得便宜 |
+
+落地内容：`ui_fwd.uya`（**同名转发器**：`tui_add_notice` 等沿用旧名，体内只做 `ui_entry(...)`）、
+`term/tui/entry.uya` 的四个实现改名 `betui_*`、`term/` 内的调用点直呼 `betui_*`（不绕端口）、
+`be_null` / `be_tui` 各加 `entry`。
+
+**这一批实测抓出的三处真缺陷**（都由既有回归网抓到，改前先看到红）：
+
+| # | 缺陷 | 症状 |
+|---|---|---|
+| ① | `agent_tui_demo` 从不 `ui_use` | 它只 build 帧、不进备用屏幕，于是端口入口落到**空后端**上：`--tui-demo` 第 50/81 行的「你」与工具块**整片消失** |
+| ② | `be_tui.entry` 里仍写着 `tui_add_user` 等旧名 | 定义已改名 `betui_*`，于是链接期 `undefined reference`。**注意：改成不存在的符号编译期不报错**（合并命名空间里它看起来就是个外部函数），只有链接时才炸 —— 所以「改名」这类改动必须真的走一次 `make build` |
+| ③ | TUI 自测夹具（`tuis_reset`）从不选后端 | 与①同因：8 条「转录里没有…」的断言当场红 —— 夹具整轮在测 TUI 渲染，却把输出丢进了空后端 |
+| ④ | `agent_run_tui` 的 **headless 分支**也不选后端 | 与①同因、但**当时不红**（那条路的既有轮次恰好没有输出经过端口入口）。这是**潜伏**的一处：改动后按「同类现场」主动清查才找到，已补 `ui_use(UI_BE_TUI)` |
+
+> 三条的**共同根因**是同一件事：**「选后端」这个动作原先只发生在 `agent_tui_start` 一处**，
+> 而演示屏与自测夹具都绕过它。修法是在各自的复位/入口处显式 `ui_use`。
+> 这也是判据 H 的另一面：H 管「别切到空后端」，而这里管「该切的时候要切」。
+
+**验收**（全部实测）：`--tui-demo` 仍**逐字节相同**；TUI 自测 **34 轮全绿**；全量 `make selftest`
+**185 轮绿**（唯一失败是既有的 `clip-helper` 夹具缺陷，与本轮无关，`main` 的 `ab68e75` 已修）；
+`lint-size` / `ui-audit` / `check` / `build`（真静态）全过。
+
+**阶段 2 的第二片已落地（P80 第四批：事实流后端 `be_events`）**——它是**自研 web / DSH 适配
+两条路线的共同底座**（DESIGN §11.8 的 web 路线今天靠「PTY 子进程 + 服务端解释器网格」，
+而事实流让前端**不必**解释终端字节：它直接吃结构事实）。
+
+| 内容 | 落点 |
+|---|---|
+| `be_events.uya`：`EventsBe : UiBackend`，把每条事实写成**一行一条完整 JSON**（NDJSON） | 新增约 330 行 |
+| 注册：`EVENTS` 槽从 `g_null` 换成 `g_events_be`（**判据 H 的「别切到空后端」当场有了实效**） | `ui_reg` |
+| `ui-events` 自测轮：真写进管道、再读回来逐条解析（线格式 / 判别键 / 转义 / fail closed / 未 start 不写） | `tuis_events.uya` |
+
+**线格式**（`type` 是判别键，消费者**认不出的必须忽略**，这样才能扩）：
+
+```
+{"type":"text","chan":1,"data":"…"}     chan = UI_CH_*
+{"type":"entry","kind":1,"data":"…"}    kind = UI_ENT_*
+{"type":"status","what":1,"data":"…"}   what = UI_ST_*
+{"type":"run","state":3,"label":"…"}    state = UI_RUN_*
+{"type":"pump","intent":0} / {"type":"start","cols":…,"rows":…} / {"type":"stop","dropped":N}
+```
+
+三条设计决定：**① `UI_ST_RUN` 另立 `run` 类型**（它的载荷是「状态码 + 可选标签」两段，
+压进 `data` 就得让消费者自己切字符串 —— 那是把端口的编码细节泄漏出去）；
+**② `ask` 一律 `UiNoChannel`**（事实流是**单向**的，没有回答回路；要问答得另配输入通道，
+那是独立一件事）；**③ 一行拼不完整就整条丢弃并计入 `dropped`**（绝不写半行 —— 半行会让
+按行解析的消费者**静默错位**，而错位后的症状是「后面所有事实都串了」，极难查）。
+
+**这一批实测抓出的三处真缺陷**（都由新自测轮或既有回归网抓到）：
+
+| # | 缺陷 | 症状 |
+|---|---|---|
+| ① | `beev_begin` 少写一个收尾 `"` | 整行变成 `{"type":"start,` —— **一条都解不出来**。手工拼 JSON 最容易漏的就是这种引号，所以自测里有一条**逐字节**钉 `start` 形状的断言 |
+| ② | 自测夹具把 fd 1 接到管道后**用完就清 `saved`** | 第二次 `attach` 再也还不回来 ⇒ 管道写端关掉后 fd 1 悬空 ⇒ 下一次写 stdout **SIGPIPE**（实测 141）。**症状极隐蔽**：`make selftest` 在 `san-shell` 之后**静默死掉**，前 125 轮全绿、看不出与本次改动的关系（基线二进制同一轮跑到 179） |
+| ③ | 两处测试夹具有裸 `wfd`/未注释函数 | `link`/`doc-cover` 抓到（漏参 + 缺函数头注释）|
+
+> ②的教训值得单记：**测试夹具动 fd 1 时，还原路径必须与「可能出错的所有分支」一样多**。
+> 这里第一版把 `saved` 当成「一次性」的（`restore` 里顺手 `close`），而本轮的设计是
+> **反复接线**（接上 → 写 → 还回 → 再接）—— 两者的生命周期假设不一致，于是「第二次之后
+> 就再也还不回来」。修法是**谁开谁关**：`saved` 只由 `uev_pipe_close` 收，`restore` 只做
+> `dup2` 还原。
+
+**验收**（全部实测）：二进制 `--selftest` **181 轮绿**（基线 179 + 本轮 2 轮），退出码与基线
+同为 3（唯一失败是既有的 `clip-helper`）；`--tui-demo` 仍**逐字节相同**；`lint-size` /
+`doc-cover` / `ui-audit` / `check` / `build`（真静态）全过。
+
+**阶段 2 剩下的部分**（下一批）：字节流那一半（`tui_sink_bytes(1/3)` 与 126 处
+`tty_puts(&tty_ui, 2, …)` + 28 处 `tty_write`）。它比离散条目**简单**（转发基本等价，
+没有条目边界问题），但两条遗留约束要先解决：
+
+| 约束 | 实测 | 影响 |
+|---|---|---|
+| **`UI_BE_SCROLL` 槽还没落地** | 该槽是 `g_null`（现在是唯一一个） | 滚动模式下 `agent_tui_start` 不被调用 ⇒ `ui_use` 停在空后端 ⇒ **滚动模式的显示输出会被端口静默丢掉**。所以字节流那一半**必须**和 `be_scroll` 同一批做，或者端口入口保留「无后端时直呼 `term/`」的兜底 |
+| **`tty_puts` / `tty_write` 兼作诊断通道** | 它们**本来就是两模式漏斗**（`tty_sink_on` 为真走转录、否则直写 fd） | 转发时要保住「滚动模式直写 fd 2」这条路（`warning:`、`error:` 这类必须始终可见），不能一律当 UI 事实吞掉 |
+
+**一个测试隔离的既有缺口**（本批实测撞上，与代码无关）：`make e2e-tasks` **不设
+`UYA_AGENT_HOME`**，于是 `<HOME>/.uya-agent/goal.json` 里若存在一个活跃目标（本会话自己
+的 goal 就是），`/tasks` 的空态串就变成「有目标」那一版，`e2e-tasks` 报 `FAIL: 空态串不对`。
+判据：把那个文件挪开，同一轮立刻通过（实测）。**修法留给后续**（该目标应当像其它 e2e 那样
+用独立的 `UYA_AGENT_HOME`），本轮只记录。
+
 **明确不做**（都是决定，不是遗漏）：
 
 | 不做 | 理由 |
@@ -2722,7 +2860,269 @@ var r: UiBackend = g_reg[0];
 | `dlopen` 式运行时加载后端 | `make link-audit` 钉死真静态链接（无 `PTE_INTERP` / 无 `NEEDED`）。本仓的「插件」= **编译期注册 + 运行期接口选择** |
 | 用 `src/cshim/*.h` 定义 C 函数指针 typedef 绕开接口 | 要写 C（违反 §1.1 目标 1），且给所有后端开一个 C ABI 面 |
 | 把 `web` 现有的 PTY + `ttyemu` 路线一起换掉 | 会碰掉 `web-emu` 轮的「解释器网格 == `tui_screen_text()` 逐行相同」这条同源判据 —— 必须独立一轮决策（P81 候选） |
-| 给每个模块都套一层接口 | 接口是重手段（一次间接调用 + 一份 vtable）。只在「按运行期取值选实现」的接缝上用 |
+
+#### 11.9.6 通往「DSH webui」的剩余工作（路线图，实测过的约束）
+
+目标形态：**不改 DSH 的 webui**，让 DSH 的浏览器前端（`@deepseek-ai/dsh-web-frontend/dist`，
+4.6 MiB / 89 文件）吃**本仓**的事实流。已验证 DSH 自己留了三个正式接缝
+（静态 dist、`webserver/index-inject` 注入表、`__DSH_TRANSPORT__` 页全局），所以这是
+「当它的宿主」而不是给它打补丁。
+
+| 步 | 内容 | 关键约束（实测） |
+|---|---|---|
+| ① **形状适配层** | 本仓日志 → DSH 的 `SessionEvent` | DSH 浏览器按 `surfaceOp` 判「这条进不进对话面」：**`user/message` / `assistant/message` / `tool/result` 缺它就不渲染**（三条都缺 ⇒ 界面上一条消息都没有，且**没有报错**）。本仓今天**不写** `surfaceOp`、不写 `message.id`，`assistant.message.content` 是**字符串**而 DSH 要 `ContentBlock[]`、`tool/result` 是扁平 `content`+`callId` 而 DSH 要 `message.content[0].tool-result`。**所以适配层不可省**（这也是本轮 `be_events` 选「结构事实」而不是「终端字节」的理由：适配点天然落在后端里） |
+| ② `/api` unary + WS 下行 | DSH 浏览器认 52 个方法（最小可聊天集约 28 个）+ 两条**必须**是 WebSocket 的下行（普通 GET 返 426，**没有 SSE 回落**）。好消息：两条下行**只发不收**，所以纯 Uya 只要握手 + 不掩码的 text 帧编码（`sha1_digest` / `encode_base64` 标准库都有；`std/http/websocket_*.uya` 也在，但它拖 `tls.https`，建议自己写薄的一份） |
+| ③ dist 静态服务 + 注入 | 只读服务 DSH 的 dist；**复刻 `bootInjections()`**：内联 queue 脚本 + 两个 parser-blocking preload + `window.__DSH_BOOT__` 全局，插在 `<head>` 开标签之后 |
+| ④ 会话模型 | DSH 线协议要「同进程多会话 + 实时事件流」，而本仓 `--web` 今天是「每会话一个真 PTY 子进程 + 服务端解释器网格」。**这是最大的架构分歧**（不是代码量问题） |
+
+两个已知的硬约束，动手前必须先解决：
+
+| 约束 | 实测 | 影响 |
+|---|---|---|
+| `SRV_REQ_MAX = 8192`（**头 + 体总量**）且不支持 chunked 请求体 | `net/httpsrv.uya` | DSH 的 `session.prompt` 允许 300 MiB 体（内联图片 base64）⇒ **不改就是「发一张图就 413」** |
+| DSH wire **没有协议版本字段** | `host.describe` 里没有（DSH 自己的已知限制） | 版本耦合是**结构性**的，只能靠「阶段 0 探针 + 回归轮」兜住，不能靠协商 |
+
+**① 形状适配层已落地（P80 第五批，`src/web/wsess.uya`）**——这是**两条 web 路线
+（自研 / DSH 适配）的共同前置**，因为两条都要「结构事实」而不是终端字节。它逐行读本仓
+`session.jsonl`、翻译成 DSH 的 `SessionEvent` 形状，**不改本仓日志一个字节**（日志仍是
+`--resume` 与 stats 折叠的真值源）。落地内容：
+
+| 翻译 | 本仓形状 | DSH 要的形状 | 为什么不能省 |
+|---|---|---|---|
+| `user/message` | 有 `role`/`content`/`source`，**没有** `id`、没有 `surfaceOp` | 要 `data.id`（fold 的条目身份）+ **事件级** `surfaceOp` | **缺 `surfaceOp` 这条不渲染**（DSH 的 fold 拿它判「进不进对话面」），而**没有任何报错** |
+| `assistant/message` | `message.content` 是**一整段字符串** | `ContentBlock[]` | 字符串直接喂进去，DSH 那边取不到块 |
+| `assistant/reasoning` | **独立事件**，正文在 `data.message.reasoning_content` | DSH 的 fold **不认**这个类型名 | 不折进 `assistant/message` 的 `reasoning` 块，思考内容整段消失 |
+| `tool/result` | 扁平 `content` + `callId` | `data.message.content[0]` 是 `tool-result` 块、`message.source.callId` 有值 | 否则工具卡片不渲染 |
+| `turn/end` | `reason` 是**字符串** | `reason.kind` 是**对象**（`aborted` 还要内层 `{kind:"user"}`） | 错误/截断提示不出现 |
+| 其余（`turn/start`、`step/*`、`session/title`、`llm/retry`…） | — | 原样透传 | DSH 的 fold 对未知类型是 `default: return`（宽容），所以本仓私有事件不会把流弄坏 |
+
+**三条实测教训（这一批最贵的部分）**：
+
+| # | 教训 | 现场 |
+|---|---|---|
+| ① | **子串断言抓不住「JSON 结构坏掉」** | 第一版漏了 `,"data":{` 的收尾引号与花括号（译成 `…"time":1{"role":…`、`"data":{{…`）—— `selftest[wire-adapt]` 的 8 条子串断言**全部通过**，而 8/8 条译文都不是合法 JSON。**只有 DSH 自己的 zod schema 判得红** |
+| ② | 所以这条判据**必须有外部 oracle** | 新增 `make wire-schema`（`testdata/wire_schema_check.py`）：跑二进制的 dump，交给 DSH 装的 `sessionEventSchema` 逐条校验。本机没装 DSH 时**跳过**（不是失败）。**防假绿对照**：把 ① 那个 bug 装回去 ⇒ 子串轮仍 `ok`，`wire-schema` 报 **8/8 不合 schema** |
+| ③ | **按「我猜的形状」写夹具 = 把缺陷抄成正确** | 第一版夹具是我按印象写的（`assistant/reasoning` 的正文放在 `data.text`、`assistant.message.content` 当成块数组）。改用**真实日志行**逐字节做夹具之后，当场暴露出两处读错字段（正文其实在 `data.message.reasoning_content`、`content` 其实是字符串） |
+
+**当前状态**：`dwire_*` 是**纯函数**（`Buf` 进 `Buf` 出，不认识 `Config`/`g_sess`），
+`selftest[wire-adapt]` 8 段（`user` / `assistant` / `reasoning` / `tool` / `turn/end` /
+边界 / 确定性 / 转义），`make wire-schema` 把译文交给 DSH 验。二进制 `--selftest`
+**183 轮绿**、`--tui-demo` 逐字节相同。
+
+**阶段 0 探针：通过（P80 第六批，`make wire-probe`）** —— 「不改 DSH 的 webui 能不能当
+本仓的前端」这句**可证伪的话，答案是能**。四件事全部实测成立：
+
+| # | 判据 | 结果 |
+|---|---|---|
+| ① | DSH 的 shell 起得来吗 | **起得来**：`data-slot="root"` 挂载，`conversation` / `sidebar.*` 等 23 个 slot 全部注册 |
+| ② | 最小 roster（14 包 inject 闭包）全 active 吗 | **全 active**：14 个 `client.js` 全部按次序加载，**零** `did not activate`（DSH 是「全有或全无」，任一 pending/failed 就整页 fail） |
+| ③ | 本仓会话进得了侧栏吗 | **进得了**：`session.list` + `workspace.list` 之后工作区标题与分组都画出来了 |
+| ④ | 消息渲染得出吗 | **渲染得出**：正文里读到 `探针会话（本仓适配层）` 与 `PROBE-ASSISTANT-OK`，还带 `1 turns · 1 steps` 统计行 |
+
+**探针做了什么**（`testdata/wire_probe_host.py` + `wire_probe_drive.mjs`，`make wire-probe`
+一条命令）：只读服务 DSH 自己那份 `dist`（**一个字节都不改**）、复刻它的 `bootInjections()`
+（内联 queue 脚本 + 两个 parser-blocking preload + `window.__DSH_BOOT__`）、按最小 roster
+服务 `/plugins/<id>/client.js`、把 `/api/*` 接到一份离线会话数据上（两条下行是真 WebSocket，
+**只发不收**）。然后用 headless chromium + CDP 驱动，断言只可能来自我们事件流的两条文本。
+
+**这一批实测到的四件事**（三条是坑）：
+
+| # | 事实 | 为什么值得记 |
+|---|---|---|
+| ① | **`surfaceOp` 就是那道门，实测可证伪** | 防假绿对照：把合成事件里的 `surfaceOp` 去掉 ⇒ 探针**退出码 1**，日志是「shell 挂载 PASS、标题可见 true、**正文可见 false**」。即：host 完全正常、DSH 也认这条事件，**只是不渲染** —— 与第一轮从 bundle 里读出来的结论逐字吻合 |
+| ② | **shell 要的是 `session.create`，不是「列出来让我挑」** | 第一版只实现了 `session.list`，页面上只有 hero 空态、**看起来像我们的数据没送到**；真正的证据在**浏览器控制台**：`initial workspace selection failed: SessionCreateError: … probe: session.create not implemented`。只跑 `--dump-dom` 永远查不到这条 —— **要读 console 与异常**（`Page.navigate` + `Runtime.consoleAPICalled`） |
+| ③ | **`workspace.list` 返回空 ⇒ 会话在 `session.list` 里有、侧栏却一行不显示** | 侧栏是**按工作区分组**画的（`ui-workspace` 的 `Ungrouped` 回退）。形状还要按真 schema 来：是 `items[]`（不是 `workspaces[]`），且每个 `WorkspaceView` 带 `workspaceId/path/title/sessionIds/createdAt/updatedAt`（两个时间都是 **ISO-8601 字符串**） |
+| ④ | **本机 chromium 的 DevTools 端只绑 IPv6 回环** | 用 `127.0.0.1` 连 CDP 是 `ECONNREFUSED`，`localhost` 就通 —— 症状是「detached 起能连、`subprocess.Popen` 起连不上」这种**假象**（其实与启动方式无关，只与地址族有关） |
+
+**判据教训（延续第五批那条）**：②③两条都是「**页面上只是空**、代码零报错」的形态，
+子串断言与 `--dump-dom` 都抓不住；能抓住它们的是**浏览器控制台的告警**与**真 schema
+校验**。所以这一批的三条判据各有各的 oracle，缺一条都会留下一个静默的洞。
+
+**同批又证成了「真日志」那一腿（`make wire-probe-real`）**：探针默认喂合成事件，而这条
+把它换成**一份真的本仓 `session.jsonl`** —— 由**产品里那份适配层**（`web/wsess.uya`，
+经新出口 `UYA_SELFTEST_WIRE_FILE`）逐行翻译，再走同一个宿主与同一套断言。实测：
+
+| 判据 | 结果 |
+|---|---|
+| 真日志能从头翻到尾 | **16 条事件**（一份 `p30_suite_intr` 的会话），含本仓那些 DSH **不认识**的私有事件（`assistant/first-token` / `step/*` / `turn/start`）—— 它们原样透传，没有把流弄断 |
+| 每条译文都合 DSH 的 schema | **16/16 通过**（同一份 zod oracle） |
+| 真日志在真浏览器里渲染得出 | **渲染得出**：`第一个长任务`（用户）/ `Think` + `第 1/1 段思考…`（思考块）/ `SELFTEST_OK`（助手）/ `2 turns · 2 steps | LLM 4.1s`（统计行） |
+
+> 为什么这条值得单列：前一条（合成数据）**证明的是「形状对」**，这一条证明的是
+> **「一整份真会话的形状都对」** —— 包括那些我们没为它写过翻译分支的事件。
+> 两者的夹具来源不同（手写 vs 产品输出），所以能各自抓到对方抓不到的缺陷
+> （第五批的教训③就是这个道理）。
+
+**第八批：宿主进了产品（`src/web/whost.uya`，`--dsh-web`）** —— 上面那两条是 python
+探针证的；这一批把同一套东西**搬进产品二进制**，于是「不改 DSH 的 webui」不再只是
+一个可行性结论，而是**本仓的一个运行形态**：
+
+```
+./build/uya-agent --dsh-web 127.0.0.1:8790
+[dsh-web] DSH 前端（只读它的 dist，不改一个字节）：http://127.0.0.1:8790/ （ctrl+c 退出）
+```
+
+一条命令自证：`make dsh-web-check`（起产品二进制 + headless chromium + CDP 断言；
+没装 DSH / 没 chromium 时**跳过**）。实测**连续 6/6 通过**。
+
+产品宿主做了四件事（与探针一一对应，但都不是 python 了）：
+只读服务 DSH 那份 `dist`；复刻 `bootInjections()`（内联 queue 脚本 + 两个
+parser-blocking preload + `window.__DSH_BOOT__`）；按最小 roster 服务
+`/plugins/<id>/client.js`；`/api` 接 `web/wsess.uya` 的译文（两条下行是真 WebSocket）。
+
+**搬进产品才暴露出来的六个坑**（探针那份是 python，单线程模型不同，所以这些
+**只有真产品跑起来才会遇到**；每个都记在这里，因为它们的症状都**离原因很远**）：
+
+| # | 坑 | 症状 | 根因 |
+|---|---|---|---|
+| 1 | **C 串语义**：`sys_open` 要 NUL 结尾，而 `buf_append_cstr` 只按长度追加 | 「路径明明对，却打不开」；roster 里**前 3 个包 ok、其余 11 个 FAIL**（新分配的缓冲恰好是零页就成功） | 忘了补 NUL。三处（bundle 路径 / index 路径 / 事件源路径） |
+| 2 | **`dist` + `rel` 之间少一个 `/`** | 拼出 `distfavicon.svg`，而症状是「文件明明在、`/assets/*` 全 404」 | 拼路径时只去掉了开头的 `/`，没补分隔符 |
+| 3 | **不要「按文本回搜结构」** | 在 entries 的 JSON 文本里搜 `{"id":"<pkg>","url":"…` 恒回 -1（同样的文本、同样的子串，纯函数轮却过） | 改成**装 entries 时顺手攒** preload 片段，彻底绕开搜索 —— 那本来也是脆的（JSON 一改格式就断） |
+| 4 | **`if` 表达式赋 `const` 会生成坏 C** | 编译期过、`cc` 报 `assignment of read-only variable __uya_ifexpr_N` | 本仓已知形态（第五批踩过）；改 `var` + `if` |
+| 5 | **非阻塞 fd 上 `read < 0` 不是断开** | `[web-runtime] connection lost` 反复重连、shell 卡在最早两步 | `srv_accept_nb` 设了 `O_NONBLOCK`：`-1` 常常只是 EAGAIN。要回「再等等」而不是掐连接 |
+| 6 | **单线程里同步写 450KB 会饿死下行** | 同上（也是「连接丢失」），且**间歇**发生 —— 最难查的一类假红 | 一个 bundle 450KB、14 个约 3MB。分块写 + 每圈只处理一个就绪者，poll 间隔就回到毫秒级 |
+
+还有两条是**判据**层面的（`dwh_rpc_err` 用 `bufx_cstr_len` 读一个没 NUL 的缓冲 ⇒
+错误消息里混进了 HTTP 响应头；`host.describe` 给 `/` ⇒ shell 只发 2 个 API 就停）。
+
+**为什么值得记**：六个坑里 **5 个的症状都是「页面空着 / 连接丢失」**，而原因分别在
+字符串长度、路径拼接、文本搜索、codegen、fd 语义、调度上。它们**没有一个**能在
+`make check`（类型检查）里被抓住 —— 能抓住它们的是「真起一个浏览器、读它的控制台」。
+
+#### 11.9.7 适配 DSH 0.2.0 + 资源获取（设计，先于代码）
+
+上面的第八批是照 **DSH 0.1.1-rc.2** 写的。把全局 DSH 升到 **0.2.0-rc.2** 之后，
+`make dsh-web-check` **当场就坏**（一行报错，见下表）。本节定下适配方案与
+「DSH 的资源从哪来」，**在动代码之前**把契约钉死。
+
+##### 一、病根：0.2.0 改了五处契约（都是实测，不是读文档猜的）
+
+| # | 契约 | 0.1.1（我照它写的） | 0.2.0（实测） | 症状 |
+|---|---|---|---|---|
+| ① | boot 图 | `{rev, entries}` | **`{rev, entries, batches}`** | `client-modules: boot manifest batches must be an array` |
+| ② | parser preload | 两个：`dsh-client-modules` + `dsh-client-runtime` | **一个**：只有 `dsh-client-modules` | `dsh-client-runtime` **这个包已不存在** |
+| ③ | 页面包数 | 43 个声明 `dsh.client` | **71 个**（roster 里 65 个） | 我只发 14 个 ⇒ DSH 原生面板全缺 |
+| ④ | `/api` 方法名 | 点号（`session.list`…） | **点号 0 个**，全是**斜杠**（`session/list`，134 个） | 我的 `/api/session.list` 在 0.2.0 下**根本不会被调用** |
+| ⑤ | 鉴权 | 无 | **token + cookie**：不带 token `401`，带 token `303` 并种 cookie | 我的宿主没有这套 |
+
+**权威来源不是我的阅读，是「真 DSH 跑起来 + 浏览器里读页面状态」**：
+起 `dsh --profile web --port 7711`，用 CDP 读 `globalThis.__DSH_BOOT__`、
+记它发出的 `/api` 调用、抓它注入的 `<head>`。下表全部来自那一次观测。
+
+##### 二、实测到的 0.2.0 契约（适配的判据）
+
+**boot 图**（65 entries / 3 batches）：
+
+```json
+{"rev":"a04c4ccd2abe",
+ "entries":[{"id":"@deepseek-ai/dsh-client-ui-open-in-app",
+             "url":"plugins/??@deepseek-ai/dsh-client-ui-open-in-app/client.js&rev=d692006e2822",
+             "rev":"d692006e2822",
+             "inject":["@deepseek-ai/dsh-api-gateway", …]}, …],
+ "batches":[{"phase":"bootstrap",   "rev":"bb9cf61bc9b8","entries":[1 个]},
+            {"phase":"application", "rev":"0b42dc805a0c","entries":[58 个]},
+            {"phase":"application", "rev":"5ffeed26951f","entries":[6 个]}]}
+```
+
+`entries[]` 每行可有 `inject` / `external` / `immediately`；`batches[]` 的
+`phase` 只有 `bootstrap` / `application` 两种。**校验规则**（读 `parseBootManifest`）：
+
+- `rev` 字符串；`entries`、`batches` 都必须是数组
+- entry：`id`/`url`/`rev` 三个字符串，`id` 不得重复
+- batch：`phase` ∈ {bootstrap, application}、`url`/`rev` 字符串、
+  `entries` **非空**字符串数组、每个 id **只能属于一个 batch**
+- 每个 entry **必须**属于某个 batch（否则报 "belongs to no initial-load batch"）
+
+**批为什么要切**：combo URL 有 **3072 字节**上限（`MAX_COMBO_URL_BYTES`），
+超了就分片 —— 所以 58 + 6 那两个 application 批是**因为 URL 太长而切开**的。
+单包 URL 只有几十字节，**不会触发分片**。
+
+**注入行**（真 DSH 的 `<head>`，34083 字节）：
+
+| 顺序 | 行 | 说明 |
+|---|---|---|
+| 1 | `globalThis["__DSH_CONTACT_CONFIG__"] = …` | 可选配置全局 |
+| 2 | 内联 queue 脚本 | `window.__ModuleLoader__` 的 queue 模式 |
+| 3 | `<link rel="preload" as="script" href="plugins/??…">` ×2 | application 批 |
+| 4 | `<script src="plugins/??@deepseek-ai/dsh-client-modules/client.js&rev=…">` | **唯一的** parser-blocking bootstrap |
+| 5 | `globalThis["__DSH_BOOT__"] = {…}` | 图本身 |
+| 6 | 4 个可选配置全局 | `__DSH_SHORTCUTS_CONFIG__` 等 |
+
+那 4 个配置全局**都有兜底**（如 `?? {}`、`resolveConnectionConfig(undefined)`），
+所以缺了不致命 —— 但**发出去更省事**（页面少走降级路径）。
+
+**`/api` 面**：0.2.0 启动只打 **11 个**斜杠调用：
+`agentPresets/list`、`commands/list`、`credentials/describe`、
+`dynamicCordisRunner/inventory`、`dynamicCordisRunner/syncInspectManifest`、
+`permissionPresets/catalog`、`session/create`、`session/list`、
+`session/modelCatalog`、`settings/describe`、`skills/list`。
+
+##### 三、设计：三件事，各自独立
+
+**① boot 图：产 `batches`，但**不实现 combo 服务**。
+
+校验器只要求 `url` 是**字符串**，不校验它长什么样。所以每个包发一个 batch、
+`url` 用我现有的单包形态 `/plugins/<id>/client.js?rev=<sha1前12>` 即可 ——
+**绕开 combo 解析**（那是 3072 字节分片 + `??` 逗号表 + 合并 sourcemap，
+本仓不需要为它写代码）。这条是本次设计里最省的一刀。
+
+**② roster：删掉硬编码，改成扫描。**
+
+`DWH_ROSTER`（14 个写死的包名）删除，改成扫 DSH 树里所有
+`package.json` 含 `dsh.client` 的包（0.2.0 实测 71 个，roster 里 65 个）。
+`DWH_PRELOAD`（写死的两个）也删除 —— bootstrap 批只放 `dsh-client-modules`。
+
+**③ 资源获取：从 npm 取，不从 GitHub 取。**（详见下一节）
+
+##### 四、资源获取：为什么必须走 npm 而不是源码仓库（实测）
+
+要求是「从源码仓库取最新的构建物」。**这条走不通**，三条实测证据：
+
+| 证据 | 结果 |
+|---|---|
+| `GET /repos/deepseek-ai/deepseek-harness/contents/packages/client/ui-conversation` | 只有 `src/`、`tests/`、`package.json` —— **没有 `lib/client.js`** |
+| `GET …/contents/apps/web` | 有 `web/` 目录，**没有 `dist/`** |
+| `GET …/releases`（5 个 release） | **assets = 0**（一个构建物附件都没有） |
+
+即：**源码仓库里只有源码**，`dist` 与 `lib/client.js` 都是构建产物，
+不进版本库。而 `npm` 上发布的包**自带**它们（实测 `npm pack`）：
+
+| 包 | tgz | 内容 |
+|---|---|---|
+| `@deepseek-ai/dsh-web-frontend@0.2.0-rc.2` | 1.70 MiB | `package/dist/`（**130 个文件**，含 index.html / assets / fonts / langs） |
+| `@deepseek-ai/dsh-client-ui-conversation@0.2.0-rc.2` | 0.25 MiB | `package/lib/client.js` + `lib/index.js` |
+
+取件很快（3 个包 3.1 秒），0.2.0 全量资源约 **16.9 MiB**
+（71 个 bundle 11.4 MiB + dist 5.8 MiB）。
+
+**设计**：`--dsh-assets-repo` 默认指向 npm registry（**能真取到构建物**的那一个）；
+显式给 GitHub 地址时**报错说明**「该仓库不含构建物」，而不是静默失败或下回源码让用户
+自己 build（本仓是纯 Uya、无 Node 工具链，build 不出 dist）。
+
+##### 五、资源定位链（运行期只读）
+
+```
+① --dsh-assets DIR      （新：仓库/本地缓存里那份）
+② --dsh-root   DIR      （已有：本机装的 DSH 树）
+③ 常见位置             （已有：~/.npm-global/… / ~/.local/…）
+```
+
+给不存在的目录要**明确报错**，不静默跳到下一级（否则「以为在用缓存、其实在用全局」
+这种假象会浪费排查时间）。
+
+##### 六、工作项（顺序即依赖）
+
+| # | 内容 | 判据 |
+|---|---|---|
+| 1 | boot 图加 `batches`（每包一批 + bootstrap 只放 `dsh-client-modules`） | `make dsh-web-check` 在 0.2.0 下通过 |
+| 2 | 删 `DWH_ROSTER` / `DWH_PRELOAD`，改扫描 | 页面上出现 0.2.0 的原生面板（`Trajectory` 等） |
+| 3 | 资源定位链 + `--dsh-assets` | 日志显示用的是该目录；DSH 树零写入 |
+| 4 | `--dsh-assets-install`（`npm pack` 取 72 个包） | 离线/在线各验一次 |
+| 5 | `/api` 面改斜杠（`session/list` 等 11 个） | 真 DSH 里能列会话 |
+| 6 | token/cookie 鉴权（可选，取决于是否要对外） | 不带 token 401、带 token 可用 |
+
+**风险**：第 5、6 条是 0.2.0 新增的面，我目前只观测到「它发哪些调用」，
+还没验证「我该怎么回」；所以第 1~4 条（结构与资源）先做，第 5 条单独立项验证。
 
 ---
 
@@ -5332,6 +5732,35 @@ QTermWidget）对 `ESC[?5522$p`（DECRQM）**零应答**，OSC 52 写 `c`/`p` �
    修法验证：新增 `goal-sess` 轮（两条真会话 + 一条 `--no-save` 会话），先做**对照实验** ——
    把 `goal_path` 的会话目录分支短路回修前行为 → 9 条断言当场红（含「乙看到了甲的目标」），
    改回即绿。
+148. **两套通道编号：三个里错了两个，而错法是静默串位**（P80 第二批）：界面后端接缝的
+    `UiBackend.text(chan)` 里，端口的 `UI_CH_*` 是 **MAIN=1 / REASON=2 / NOTICE=3**；而
+    TUI 内部的 `tui_sink_bytes(chan)` 是 **1=正文 / 2=通知（按 `\n` 切行）/ 3=思考**
+    （`tty_reason_write` 送的就是 3，`tty_write` 把 fd 1→1、fd 2→2）。于是最自然的写法
+    `tui_sink_bytes(chan, p, n)`（原样转发）会把**思考与通知对调** —— 不崩、不报错、
+    编译期看不见、`--tui-demo` 也照不出来（它只喂 1/2 两个通道），只是用户看到的
+    「思考」区里出现命令回执、回执区里出现推理过程。
+    **修法**：转发必须过一张显式映射表（`betui_chan_map`），并且 `make ui-audit` 加一条
+    硬判据 G（`src/ui/` 里把 `chan` 原样喂给 `tui_*`/`tty_*` 即红）。
+    **判据教训（与 143 同族）**：「屏幕上有没有字」抓不住对调 —— 对调之后两边都有字；
+    必须按**条目种类**数（`tui_entry_kind` == `TUI_E_REASON` / `TUI_E_NOTICE`）。
+    同类还有一个**静默陷阱**：未登记的后端槽里是 `g_null`，它的 vtable **有效**，
+    所以 `ui_use` 切过去**不崩**，只是从此丢弃一切输出 —— 判据 H 兜它，而判据必须读
+    `g_reg` 字面量里那一槽是不是 `g_null`（只看「有没有 `ui_reg_put`」是假绿的）。
+
+149. **「选后端」原先只发生在一个地方，而演示屏与自测夹具都绕过它**（P80 第三批）：
+    `ui_use(UI_BE_TUI)` 只写在 `agent_tui_start` 里。改名接端口之后，凡是**不调它**却
+    又要渲染 TUI 的路径全都会落到空后端上，症状一律是「整片内容变空」而**没有任何报错**：
+    * `--tui-demo`（只 build 帧、不进备用屏幕）⇒ 第 50/81 行的「你」与工具块整片消失；
+    * TUI 自测夹具（`tuis_reset`）⇒ 8 条「转录里没有…」的断言当场红 —— 夹具整轮在测
+      TUI 渲染，却把输出丢进了空后端。
+    **教训**：把「谁有权决定界面」搬进端口时，**「选择」这个动作本身也是要被搬的东西** ——
+    只搬「输出接口」不搬「选择时机」，就会得到「接口对了、后端没选上」这种**静默全空**。
+    判据 H 管的是「别切到空后端」，管不了「该切的时候没切」；后者只能靠每条渲染路径
+    自己显式 `ui_use`（演示屏、自测夹具、**以及 headless 分支**各一处 —— 前三处是红色的
+    现场，第四处是按同类清查出来的**潜伏**现场，见 §11.9.5 的缺陷表④）。
+    **孪生一条（改名类改动的通用陷阱）**：定义改名成 `betui_*` 之后，`be_tui.uya` 里的
+    调用点漏改**编译期不报错** —— 合并命名空间里 `tui_add_user` 看起来就是个外部函数，
+    只有 `make build` 链接时才炸 `undefined reference`。所以「改名」不能只跑 `make check`。
 
 ---
 
