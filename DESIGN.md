@@ -3118,8 +3118,8 @@ parser-blocking preload + `window.__DSH_BOOT__`）；按最小 roster 服务
 | 2 | 删 `DWH_ROSTER` / `DWH_PRELOAD`，改扫描 + 读 `dsh.client.inject` | 页面上出现 25 个 `data-slot` | **已做**（第九批） |
 | 3 | `/api` 方法名改斜杠（`session/list` 等） | 真 DSH 的 11 个调用不再回 `bad-request` | **已做**（第九批） |
 | 4 | `/api/remote.mux`（0.2.0 唯一的下行） | 三条流的 `open` 都收到 `item` | **已做**（第十批） |
-| 5 | 查清客户端的 `connection lost` 从哪来（见下「未解」） | 页面不再 `connection lost, retry #N` | **未解** |
-| 6 | `dynamicCordisRunner/{inventory,syncInspectManifest}`、`session/modelCatalog` | 控制台零告警 | 待做 |
+| 5 | 消息渲染（`data.stream` + end-seed 位置 + cursor） | `make dsh-web-check` 通过 | **已做**（第十八批，3/3 稳定） |
+| 6 | `dynamicCordisRunner/{inventory,syncInspectManifest}`、`session/modelCatalog` | 控制台零告警 | **已做**（第十二批） |
 | 7 | 资源定位链 + `--dsh-assets` | 日志显示用的是该目录；DSH 树零写入 | 待做 |
 | 8 | `--dsh-assets-install`（`npm pack` 取 72 个包） | 离线/在线各验一次 | 待做 |
 | 9 | token/cookie 鉴权（可选，取决于是否要对外） | 不带 token 401、带 token 可用 | 待做 |
@@ -3194,6 +3194,45 @@ workspace.sessionIds.includes(id)` 三者全成立时才**复用**会话，否�
 所以嫌疑落在 **`mainReference` 是否已被别处设过**（若已设，reconcile 直接
 `initial = "done"` 返回）或 `clearArchivedCurrent()` 的早退。下一轮直接从
 读 `selection` store 的初值与 `mainReference` 的赋值点入手。
+
+##### 八之三、第十八批：**消息渲染通过** —— `make dsh-web-check` 绿了（3/3 稳定）
+
+    PASS shell 挂载
+    会话标题可见：true
+    消息正文可见：true
+    PASS 消息渲染
+    dsh-web-check: 通过 —— 产品二进制 --dsh-web 把本仓会话渲染进了 DSH 的 webui
+
+**根因**：`assistant/message` 的 `data` 里缺 **`stream`**（chunk 级回放：
+`block-start` / `block-end` / `finish`）。客户端的 fold 靠它建消息节点 ——
+`message.content` 虽然在场也折不出节点，而**控制台一句抱怨都没有**。
+
+**方法论（这一段比结论更值得复用）**：
+
+| 步 | 做法 | 得到什么 |
+|---|---|---|
+| ① | `dsh --profile headless "回答两个字：收到"` 造一个**真有消息**的会话 | 一份可对照的**权威样本** |
+| ② | 用它的 `dsh-auth` cookie 直连 `/api/remote.mux`，发 `session/follow`，解 WS 帧 | 22 records 的 snapshot（31KB） |
+| ③ | **把样本的 22 条事件当夹具喂给我的宿主** | **渲染出来了** ⇒ 宿主代码没问题，差别在数据 |
+| ④ | 二分数据：`content` 同形、`surfaceOp` 同形、seq/cursor 都对 | 唯一差别 = `data.stream` |
+| ⑤ | 手工在夹具里补 `stream` 验证 | 假设成立，再回产品代码实现 |
+
+> 前十七批我一直在**读客户端源码猜形状**，走了很多弯路（`isSeeded`、seed 事件、
+> sessionId 格式、字段白名单 —— 全是负面结果）。**一旦有了权威样本，二分只花了
+> 几步。** 教训：缺参照物时先造参照物，别继续猜。
+
+**这一批顺带修掉的真缺陷**：
+
+| # | 缺陷 | 症状 |
+|---|---|---|
+| 1 | `session/end-seed` **位置错**（我放在开头 seed 里，真 DSH 在**最后一条**） | 我的夹具不渲染、真夹具渲染得出来 —— 两者数据几乎一样，只有它位置不同 |
+| 2 | `cursor` 与末条 seq **差一** | `did not end at its requested cursor` |
+| 3 | `dwh_seq_of` 按连写 `"seq":` 找，真日志是 `"seq": 8`（**冒号后有空格**） | seq 读成 0 ⇒ cursor 恒 0 |
+
+**实现**：`dwh_is_assistant_msg` / `dwh_assistant_with_stream` / `dwh_stream_of` /
+`dwh_one_block` —— 由译文自己的 `"content":[…]` **原文**按顶层逗号切块，
+逐块造 `block-start` + `block-end`，末尾补 `finish`。不做 JSON 重序列化
+（`std.json` 的视图指向原缓冲、转义未解码，重序列化只是多一个出错点）。
 
 ##### 八之二、第十五~十六批：会话真正选中（`blank` / `cursor` / `seq` 三处）
 
