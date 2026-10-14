@@ -2962,9 +2962,140 @@ parser-blocking preload + `window.__DSH_BOOT__`）；按最小 roster 服务
 字符串长度、路径拼接、文本搜索、codegen、fd 语义、调度上。它们**没有一个**能在
 `make check`（类型检查）里被抓住 —— 能抓住它们的是「真起一个浏览器、读它的控制台」。
 
-**下一步**：把 `/api` 的最小面从 6 个方法扩到「最小可聊天集」（约 28 个，见本节上表），
-`session.prompt` 先接成一个「写进 `agent/inbox` 让真 agent 跑」的回路。**这一步开始就要
-动 `SRV_REQ_MAX`**（8192 是「头+体」总量，发一张图就 413）。
+#### 11.9.7 适配 DSH 0.2.0 + 资源获取（设计，先于代码）
+
+上面的第八批是照 **DSH 0.1.1-rc.2** 写的。把全局 DSH 升到 **0.2.0-rc.2** 之后，
+`make dsh-web-check` **当场就坏**（一行报错，见下表）。本节定下适配方案与
+「DSH 的资源从哪来」，**在动代码之前**把契约钉死。
+
+##### 一、病根：0.2.0 改了五处契约（都是实测，不是读文档猜的）
+
+| # | 契约 | 0.1.1（我照它写的） | 0.2.0（实测） | 症状 |
+|---|---|---|---|---|
+| ① | boot 图 | `{rev, entries}` | **`{rev, entries, batches}`** | `client-modules: boot manifest batches must be an array` |
+| ② | parser preload | 两个：`dsh-client-modules` + `dsh-client-runtime` | **一个**：只有 `dsh-client-modules` | `dsh-client-runtime` **这个包已不存在** |
+| ③ | 页面包数 | 43 个声明 `dsh.client` | **71 个**（roster 里 65 个） | 我只发 14 个 ⇒ DSH 原生面板全缺 |
+| ④ | `/api` 方法名 | 点号（`session.list`…） | **点号 0 个**，全是**斜杠**（`session/list`，134 个） | 我的 `/api/session.list` 在 0.2.0 下**根本不会被调用** |
+| ⑤ | 鉴权 | 无 | **token + cookie**：不带 token `401`，带 token `303` 并种 cookie | 我的宿主没有这套 |
+
+**权威来源不是我的阅读，是「真 DSH 跑起来 + 浏览器里读页面状态」**：
+起 `dsh --profile web --port 7711`，用 CDP 读 `globalThis.__DSH_BOOT__`、
+记它发出的 `/api` 调用、抓它注入的 `<head>`。下表全部来自那一次观测。
+
+##### 二、实测到的 0.2.0 契约（适配的判据）
+
+**boot 图**（65 entries / 3 batches）：
+
+```json
+{"rev":"a04c4ccd2abe",
+ "entries":[{"id":"@deepseek-ai/dsh-client-ui-open-in-app",
+             "url":"plugins/??@deepseek-ai/dsh-client-ui-open-in-app/client.js&rev=d692006e2822",
+             "rev":"d692006e2822",
+             "inject":["@deepseek-ai/dsh-api-gateway", …]}, …],
+ "batches":[{"phase":"bootstrap",   "rev":"bb9cf61bc9b8","entries":[1 个]},
+            {"phase":"application", "rev":"0b42dc805a0c","entries":[58 个]},
+            {"phase":"application", "rev":"5ffeed26951f","entries":[6 个]}]}
+```
+
+`entries[]` 每行可有 `inject` / `external` / `immediately`；`batches[]` 的
+`phase` 只有 `bootstrap` / `application` 两种。**校验规则**（读 `parseBootManifest`）：
+
+- `rev` 字符串；`entries`、`batches` 都必须是数组
+- entry：`id`/`url`/`rev` 三个字符串，`id` 不得重复
+- batch：`phase` ∈ {bootstrap, application}、`url`/`rev` 字符串、
+  `entries` **非空**字符串数组、每个 id **只能属于一个 batch**
+- 每个 entry **必须**属于某个 batch（否则报 "belongs to no initial-load batch"）
+
+**批为什么要切**：combo URL 有 **3072 字节**上限（`MAX_COMBO_URL_BYTES`），
+超了就分片 —— 所以 58 + 6 那两个 application 批是**因为 URL 太长而切开**的。
+单包 URL 只有几十字节，**不会触发分片**。
+
+**注入行**（真 DSH 的 `<head>`，34083 字节）：
+
+| 顺序 | 行 | 说明 |
+|---|---|---|
+| 1 | `globalThis["__DSH_CONTACT_CONFIG__"] = …` | 可选配置全局 |
+| 2 | 内联 queue 脚本 | `window.__ModuleLoader__` 的 queue 模式 |
+| 3 | `<link rel="preload" as="script" href="plugins/??…">` ×2 | application 批 |
+| 4 | `<script src="plugins/??@deepseek-ai/dsh-client-modules/client.js&rev=…">` | **唯一的** parser-blocking bootstrap |
+| 5 | `globalThis["__DSH_BOOT__"] = {…}` | 图本身 |
+| 6 | 4 个可选配置全局 | `__DSH_SHORTCUTS_CONFIG__` 等 |
+
+那 4 个配置全局**都有兜底**（如 `?? {}`、`resolveConnectionConfig(undefined)`），
+所以缺了不致命 —— 但**发出去更省事**（页面少走降级路径）。
+
+**`/api` 面**：0.2.0 启动只打 **11 个**斜杠调用：
+`agentPresets/list`、`commands/list`、`credentials/describe`、
+`dynamicCordisRunner/inventory`、`dynamicCordisRunner/syncInspectManifest`、
+`permissionPresets/catalog`、`session/create`、`session/list`、
+`session/modelCatalog`、`settings/describe`、`skills/list`。
+
+##### 三、设计：三件事，各自独立
+
+**① boot 图：产 `batches`，但**不实现 combo 服务**。
+
+校验器只要求 `url` 是**字符串**，不校验它长什么样。所以每个包发一个 batch、
+`url` 用我现有的单包形态 `/plugins/<id>/client.js?rev=<sha1前12>` 即可 ——
+**绕开 combo 解析**（那是 3072 字节分片 + `??` 逗号表 + 合并 sourcemap，
+本仓不需要为它写代码）。这条是本次设计里最省的一刀。
+
+**② roster：删掉硬编码，改成扫描。**
+
+`DWH_ROSTER`（14 个写死的包名）删除，改成扫 DSH 树里所有
+`package.json` 含 `dsh.client` 的包（0.2.0 实测 71 个，roster 里 65 个）。
+`DWH_PRELOAD`（写死的两个）也删除 —— bootstrap 批只放 `dsh-client-modules`。
+
+**③ 资源获取：从 npm 取，不从 GitHub 取。**（详见下一节）
+
+##### 四、资源获取：为什么必须走 npm 而不是源码仓库（实测）
+
+要求是「从源码仓库取最新的构建物」。**这条走不通**，三条实测证据：
+
+| 证据 | 结果 |
+|---|---|
+| `GET /repos/deepseek-ai/deepseek-harness/contents/packages/client/ui-conversation` | 只有 `src/`、`tests/`、`package.json` —— **没有 `lib/client.js`** |
+| `GET …/contents/apps/web` | 有 `web/` 目录，**没有 `dist/`** |
+| `GET …/releases`（5 个 release） | **assets = 0**（一个构建物附件都没有） |
+
+即：**源码仓库里只有源码**，`dist` 与 `lib/client.js` 都是构建产物，
+不进版本库。而 `npm` 上发布的包**自带**它们（实测 `npm pack`）：
+
+| 包 | tgz | 内容 |
+|---|---|---|
+| `@deepseek-ai/dsh-web-frontend@0.2.0-rc.2` | 1.70 MiB | `package/dist/`（**130 个文件**，含 index.html / assets / fonts / langs） |
+| `@deepseek-ai/dsh-client-ui-conversation@0.2.0-rc.2` | 0.25 MiB | `package/lib/client.js` + `lib/index.js` |
+
+取件很快（3 个包 3.1 秒），0.2.0 全量资源约 **16.9 MiB**
+（71 个 bundle 11.4 MiB + dist 5.8 MiB）。
+
+**设计**：`--dsh-assets-repo` 默认指向 npm registry（**能真取到构建物**的那一个）；
+显式给 GitHub 地址时**报错说明**「该仓库不含构建物」，而不是静默失败或下回源码让用户
+自己 build（本仓是纯 Uya、无 Node 工具链，build 不出 dist）。
+
+##### 五、资源定位链（运行期只读）
+
+```
+① --dsh-assets DIR      （新：仓库/本地缓存里那份）
+② --dsh-root   DIR      （已有：本机装的 DSH 树）
+③ 常见位置             （已有：~/.npm-global/… / ~/.local/…）
+```
+
+给不存在的目录要**明确报错**，不静默跳到下一级（否则「以为在用缓存、其实在用全局」
+这种假象会浪费排查时间）。
+
+##### 六、工作项（顺序即依赖）
+
+| # | 内容 | 判据 |
+|---|---|---|
+| 1 | boot 图加 `batches`（每包一批 + bootstrap 只放 `dsh-client-modules`） | `make dsh-web-check` 在 0.2.0 下通过 |
+| 2 | 删 `DWH_ROSTER` / `DWH_PRELOAD`，改扫描 | 页面上出现 0.2.0 的原生面板（`Trajectory` 等） |
+| 3 | 资源定位链 + `--dsh-assets` | 日志显示用的是该目录；DSH 树零写入 |
+| 4 | `--dsh-assets-install`（`npm pack` 取 72 个包） | 离线/在线各验一次 |
+| 5 | `/api` 面改斜杠（`session/list` 等 11 个） | 真 DSH 里能列会话 |
+| 6 | token/cookie 鉴权（可选，取决于是否要对外） | 不带 token 401、带 token 可用 |
+
+**风险**：第 5、6 条是 0.2.0 新增的面，我目前只观测到「它发哪些调用」，
+还没验证「我该怎么回」；所以第 1~4 条（结构与资源）先做，第 5 条单独立项验证。
 
 ---
 
