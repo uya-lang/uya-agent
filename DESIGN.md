@@ -2882,12 +2882,40 @@ var r: UiBackend = g_reg[0];
 边界 / 确定性 / 转义），`make wire-schema` 把译文交给 DSH 验。二进制 `--selftest`
 **183 轮绿**、`--tui-demo` 逐字节相同。
 
-**下一步（可证伪、且便宜）**：用 Node 起一个最小宿主只实现 `host.describe` +
-`session.list` + `session.history` + 两条下行（WebSocket），喂**本适配层的输出**，
-用真浏览器验四件事：① DSH shell 起得来吗；② 最小 roster（14 个 client 包的 inject 闭包）
-全 active 吗（DSH 的 shell 是**全有或全无**：任一 entry pending/failed 就整页 `page.fail()`）；
-③ 侧栏列得出本仓会话吗；④ **一条 user/assistant/tool 消息渲染得出卡片吗**。
-任一条不过就停手改自研路线 —— 后面每一步都建立在它上面。
+**阶段 0 探针：通过（P80 第六批，`make wire-probe`）** —— 「不改 DSH 的 webui 能不能当
+本仓的前端」这句**可证伪的话，答案是能**。四件事全部实测成立：
+
+| # | 判据 | 结果 |
+|---|---|---|
+| ① | DSH 的 shell 起得来吗 | **起得来**：`data-slot="root"` 挂载，`conversation` / `sidebar.*` 等 23 个 slot 全部注册 |
+| ② | 最小 roster（14 包 inject 闭包）全 active 吗 | **全 active**：14 个 `client.js` 全部按次序加载，**零** `did not activate`（DSH 是「全有或全无」，任一 pending/failed 就整页 fail） |
+| ③ | 本仓会话进得了侧栏吗 | **进得了**：`session.list` + `workspace.list` 之后工作区标题与分组都画出来了 |
+| ④ | 消息渲染得出吗 | **渲染得出**：正文里读到 `探针会话（本仓适配层）` 与 `PROBE-ASSISTANT-OK`，还带 `1 turns · 1 steps` 统计行 |
+
+**探针做了什么**（`testdata/wire_probe_host.py` + `wire_probe_drive.mjs`，`make wire-probe`
+一条命令）：只读服务 DSH 自己那份 `dist`（**一个字节都不改**）、复刻它的 `bootInjections()`
+（内联 queue 脚本 + 两个 parser-blocking preload + `window.__DSH_BOOT__`）、按最小 roster
+服务 `/plugins/<id>/client.js`、把 `/api/*` 接到一份离线会话数据上（两条下行是真 WebSocket，
+**只发不收**）。然后用 headless chromium + CDP 驱动，断言只可能来自我们事件流的两条文本。
+
+**这一批实测到的四件事**（三条是坑）：
+
+| # | 事实 | 为什么值得记 |
+|---|---|---|
+| ① | **`surfaceOp` 就是那道门，实测可证伪** | 防假绿对照：把合成事件里的 `surfaceOp` 去掉 ⇒ 探针**退出码 1**，日志是「shell 挂载 PASS、标题可见 true、**正文可见 false**」。即：host 完全正常、DSH 也认这条事件，**只是不渲染** —— 与第一轮从 bundle 里读出来的结论逐字吻合 |
+| ② | **shell 要的是 `session.create`，不是「列出来让我挑」** | 第一版只实现了 `session.list`，页面上只有 hero 空态、**看起来像我们的数据没送到**；真正的证据在**浏览器控制台**：`initial workspace selection failed: SessionCreateError: … probe: session.create not implemented`。只跑 `--dump-dom` 永远查不到这条 —— **要读 console 与异常**（`Page.navigate` + `Runtime.consoleAPICalled`） |
+| ③ | **`workspace.list` 返回空 ⇒ 会话在 `session.list` 里有、侧栏却一行不显示** | 侧栏是**按工作区分组**画的（`ui-workspace` 的 `Ungrouped` 回退）。形状还要按真 schema 来：是 `items[]`（不是 `workspaces[]`），且每个 `WorkspaceView` 带 `workspaceId/path/title/sessionIds/createdAt/updatedAt`（两个时间都是 **ISO-8601 字符串**） |
+| ④ | **本机 chromium 的 DevTools 端只绑 IPv6 回环** | 用 `127.0.0.1` 连 CDP 是 `ECONNREFUSED`，`localhost` 就通 —— 症状是「detached 起能连、`subprocess.Popen` 起连不上」这种**假象**（其实与启动方式无关，只与地址族有关） |
+
+**判据教训（延续第五批那条）**：②③两条都是「**页面上只是空**、代码零报错」的形态，
+子串断言与 `--dump-dom` 都抓不住；能抓住它们的是**浏览器控制台的告警**与**真 schema
+校验**。所以这一批的三条判据各有各的 oracle，缺一条都会留下一个静默的洞。
+
+**下一步**：把探针从「离线合成数据」推到「真读本仓会话日志」——即让宿主调
+`dwire_*`（用 `UYA_SELFTEST_WIRE_DUMP` 那条出口喂），再把 `/api` 的最小面从 6 个方法
+扩到「最小可聊天集」（约 28 个，见本节上表），`session.prompt` 先接成一个「写进
+`agent/inbox` 让真 agent 跑」的回路。**这一步开始就要动 `SRV_REQ_MAX`**（8192 是
+「头+体」总量，发一张图就 413）。
 
 ---
 

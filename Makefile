@@ -136,7 +136,7 @@ export UYA_ROOT
 export UYA_SPLIT_C_DIR := $(CURDIR)/build/uyacache
 
 # 行宽豁免：一条 .PHONY 就是一张全仓目标清单，拆行反而看不清哪条丢了
-.PHONY: all check wire-schema print-src print-cflags build link-audit selftest codegen-audit doc-audit lint-size lint-size-all doc-cover ui-audit probe e2e e2e-config e2e-exec e2e-accept-nudge e2e-retry e2e-config-flags e2e-title e2e-title-cmd e2e-title-auto e2e-mouse e2e-api e2e-steps e2e-permission e2e-sandbox e2e-tasks e2e-goal e2e-memory e2e-memory-live e2e-sessions e2e-resume-big e2e-diff e2e-ws e2e-model e2e-model-save e2e-model-route e2e-ctxwindow e2e-inputimage e2e-worktree e2e-watch e2e-watch-pick e2e-dsh e2e-portable e2e-dns p30-check tui-demo tui-selftest web-selftest sess-selftest diff-selftest model-selftest panel-selftest clean shell-selftest pm-selftest mcp-selftest
+.PHONY: all check wire-schema wire-probe print-src print-cflags build link-audit selftest codegen-audit doc-audit lint-size lint-size-all doc-cover ui-audit probe e2e e2e-config e2e-exec e2e-accept-nudge e2e-retry e2e-config-flags e2e-title e2e-title-cmd e2e-title-auto e2e-mouse e2e-api e2e-steps e2e-permission e2e-sandbox e2e-tasks e2e-goal e2e-memory e2e-memory-live e2e-sessions e2e-resume-big e2e-diff e2e-ws e2e-model e2e-model-save e2e-model-route e2e-ctxwindow e2e-inputimage e2e-worktree e2e-watch e2e-watch-pick e2e-dsh e2e-portable e2e-dns p30-check tui-demo tui-selftest web-selftest sess-selftest diff-selftest model-selftest panel-selftest clean shell-selftest pm-selftest mcp-selftest
 
 all: build
 
@@ -227,6 +227,14 @@ ui-audit:
 # —— 这就是「不改 DSH 的 webui」的前提）。本机没装 DSH 时**跳过**（不是失败）。
 wire-schema: build
 	@python3 testdata/wire_schema_check.py
+
+# P80：**阶段 0 探针** —— 「不改 DSH 的 webui 能不能当本仓的前端」这句可证伪的话。
+# 它起一个最小宿主（只读服务 DSH 自己那份 dist + 复刻它的 `bootInjections()` +
+# 最小 14 包 roster + `/api` 接本仓适配层的输出），再起 headless chromium 用 CDP
+# 驱动到「消息渲染出来」，断言标题与正文（两条只可能来自我们的事件流）。
+# 本机没装 DSH 或没有 chromium 时**跳过**（不是失败）—— 它在别的机器上也该能跑。
+wire-probe:
+	@python3 testdata/wire_probe_host.py --selftest-drive
 
 # 文档审计：仓库里不许留 Git 冲突标记（`<<<<<<<` / `=======` / `>>>>>>>`）。
 # 来历见 §16 踩坑 94：一条合并残留的 `=======` 从 P53 那次合并（3e62301）
