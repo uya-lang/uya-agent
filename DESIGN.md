@@ -1691,9 +1691,30 @@ ralph → `<watch_base>-rN`，N 由管道里已收到的 `[round N]` 行推出
 
 ### 9.3 会话目标（`agent/goal.uya`）
 
-**持久化**：`<agent_home>/goal.json`（**手写 JSON**，`O_WRONLY|O_CREAT|O_TRUNC` 权限 420）。
+**持久化**：**会话目录**里的 `goal.json` ——
+`<agent_home>/sessions/--<规范化 cwd>--/<session-id>/goal.json`（与 `session.jsonl` 同目录；
+**手写 JSON**，`O_WRONLY|O_CREAT|O_TRUNC` 权限 420）。
 字段：`id` / `revision` / `phase` / `objective` / `round` / `maxRounds` / `blocker` / `armed`。
 读文件上限 65536，用 64 KiB arena 解析。
+
+**为什么落在会话目录里（P87）**：goal 是**会话级**的东西，与「这台机器上装了这个 agent」无关。
+修前它落在 `<agent_home>/goal.json`，于是同一个 home 下**所有会话共用一份目标**：甲会话建的
+目标乙会话一打开就看到（还带着 `armed=true`，甲的目标会被乙那条进程接着续跑），乙想建自己的
+目标则被「A goal is already active.」顶回来 —— web 那种一个 home 下并存 8 条子进程会话的形态
+症状最重（真机复现：两条 `UYA_AGENT_HOME` 相同的会话，第二条一启动就显示第一条的目标）。
+挪进会话目录之后，「属于会话」由**文件位置**保证，跨会话隔离不需要任何额外判断，也天然跟着
+会话一起被删/被搬。
+
+`goal_path` 的三条判据（缺一条就退回 `<agent_home>/goal.json`）：① `g_sess.path` 的尾名整段
+就是 `/session.jsonl` 且 `g_sess.id` 非空；② 它在**本次 `cfg` 的 agent home** 底下（`g_sess`
+是进程级的，而夹具会换 `cfg.agent_home` 去测别的 home）；③ 紧跟 home 的那一段必须是
+`/sessions/`（只比前缀的话，`/tmp/ab` 这种兄弟目录会被误判）。退回那条路是**故意留的**：
+`--print-config` 之类没开会话的路径上 `/goal` 仍然可用。落盘前先补一次 mkdir
+（`goal_dir_ensure`）：`--no-save` 的会话不建目录，而目标照样要存得下。
+
+**不迁移历史文件**：修前留在 home 根上的那份是**孤儿**，不删也不读 —— 猜「哪条会话该继承它」
+比留在那儿更坏（与 `/goal clear` 的「删干净」口径一致）。**目标也不跨会话继承**：旧的那份留在
+旧会话目录里，回头 `--resume` 那条会话它还在。
 
 | 工具 | 语义 |
 |---|---|
@@ -1712,7 +1733,9 @@ ralph → `<watch_base>-rN`，N 由管道里已收到的 `[round N]` 行推出
 （例：`/goal pause after verification` 创建的就是那个字面目标）。
 
 **与主循环的交互点**：派发 create/get/update 后立刻 `tasks_goal_reload`；启动/TUI 建历史时也
-reload；内存投影放在 `term/tasks.uya`（`tasks_goal_ref`），面板读它。
+reload；**换会话（`/new`、`/resume`）也 reload**（P87：目标跟着会话走，那份投影必须跟着换，
+否则屏幕上还挂着上一条会话的目标）—— 两个落点各自在 `tasks_panel_sync` **之前**重读一次
+（面板文本是从投影重建的）；内存投影放在 `term/tasks.uya`（`tasks_goal_ref`），面板读它。
 
 **两个 `armed`**：`Goal.armed` 是**盘上**那份（跨进程持久、`get_goal` 报它），`g_goal_armed`
 是**进程本地**的续跑授权（驱动器认的是它）。分开的理由见 §9.5 —— 合并的话 `--resume` 会把
@@ -1755,6 +1778,9 @@ TUI 那一条另加两道**人的优先权**：`tui_abort_state() != QUIT`（按
 都走的那个收口）把 `g_goal_armed` 清掉，**盘上的 phase / revision 一个字节不动**。要接着自动跑
 必须由人明确授权（`update_goal action=resume` 或 `/goal resume`）—— 与 DSH 的
 「会话 resume / fork 之后 active 目标是 disarmed」同一条。
+**授权不跨会话**与**目标不跨会话**是两件事（P87）：前者是「这一轮的继续跑由谁授权」，后者是
+「目标是哪条会话的」—— 换会话之后目标换成了新会话自己那份（多半是「一个都没有」），
+而授权一律收回，两件事各管各的。
 
 **为什么把驱动器收在一个函数里**：本仓顶层函数表的余量是 **0**（CODING.md §6 / §16 坑 87），
 所以「该不该开」与「记账 + 拼正文」合成一个 `goal_round_admit`，收口那段内联在 `agent_goal_drive`。
@@ -5281,6 +5307,32 @@ QTermWidget）对 `ESC[?5522$p`（DECRQM）**零应答**，OSC 52 写 `c`/`p` �
    format 1 + pad 3 + **items 4**）＋数据，我第一版按 16 字节头写期望值，于是断言红在
    生产代码其实是对的那一侧 —— **测试自己的期望值也要按规范核**。
 
+147. **「会话目标」落在 home 级文件里 ⇒ 同一台机器的所有会话共用一份目标**（P87，用户报的
+   「goal 不是回话级别的」）。真机现场：甲会话 `/goal 基于uibackend 接入dsh web ui…` 建了目标，
+   乙会话（另起一个进程、全新会话、**同一个 `UYA_AGENT_HOME`**）一启动 `/goal` 就看到**甲的目标**
+   而且 `armed=true`；乙想建自己的目标则被 `A goal is already active. Use /goal edit …` 顶回来。
+   最重的形态是 web：`WEB_MAX_SESSIONS` = 8 条会话是 8 个子进程，服务端把**同一个**
+   `UYA_AGENT_HOME` 传给它们 —— 8 条会话抢一份目标，且甲的目标会被**任何一个**乙的进程自动续跑。
+   **根因不是「谁忘了清」，而是落点选错了层**：`goal_path` 拿 `agent_default_home(cfg)` 拼
+   `<agent_home>/goal.json`，而 `agent_home` 表达的是「这台机器上 agent 装在哪」，与
+   `session.jsonl` 那条会话身份（`<home>/sessions/--<cwd>--/<id>/`）**毫无关系** ——
+   名字叫「会话目标」，实际是「home 级单例」。**修法**：把 `goal.json` 挪进**会话目录**
+   （与 `session.jsonl` 同目录），「属于会话」由**文件位置**保证，隔离不需要任何额外判断。
+   **三条判据缺一不可**（`goal_session_dir`）：① 尾名整段是 `/session.jsonl` 且会话 id 非空；
+   ② 它在**本次 `cfg` 的 home** 底下 —— `g_sess` 是**进程级**的，而夹具会换 `cfg.agent_home`
+   去测别的 home（不判这条就会往夹具没准备的地方写）；③ 紧跟 home 的是 `/sessions/` 而不是
+   只比前缀（`/tmp/ab` 与 `/tmp/abc` 差一个字符，只比前缀会误判）。**退回分支是故意留的**：
+   拿不到会话时仍落 `<agent_home>/goal.json`（`--print-config` 那条路径上 `/goal` 照样可用）。
+   孪生一条（**换了落点还得换投影**）：目标那份内存投影（`tasks_goal_ref`）是**推**出来的，
+   `/new`、`/resume` 两个落点光清清单不够 —— 不重读的话屏幕上还挂着上一条会话的目标，
+   而新会话本该一个都没有；重读必须在 `tasks_panel_sync` **之前**（面板文本从投影重建）。
+   **判据教训**：「状态该属于哪一层」要看**它被谁消费**：goal 由「同一个会话续跑」的驱动器
+   消费（§9.5），那就必须与会话同生命周期 —— 落在 home 上等于把「会话级」写成了「进程级」，
+   而它**编译期、类型检查、原有自测全都看不见**（旧自测恰好钉的是「目标不该被清」，方向相反）。
+   修法验证：新增 `goal-sess` 轮（两条真会话 + 一条 `--no-save` 会话），先做**对照实验** ——
+   把 `goal_path` 的会话目录分支短路回修前行为 → 9 条断言当场红（含「乙看到了甲的目标」），
+   改回即绿。
+
 ---
 
 ## 17. 工具实现要点
@@ -6997,3 +7049,47 @@ call edge 表（`MAX_FN_CALL_EDGES`）与顶层变量类型查找的降级路径
 倍数，照抄 `clipt_take_data` 是错的）、写方向的 helper（本机 `wl-copy`/`xclip` 一个都没装，
 且它们会 daemonize 持有选区，超时按进程组收有连带杀掉持有者的风险）、行内双击选词 /
 三击选行 / 拖到边缘自动滚动（第一版不叠手感参数）。
+
+### 19.9 P87：目标属于会话（修「goal 不是回话级别的」）
+
+**用户报的**：goal 应该是**属于会话**的，不同会话不共享。
+
+**复现（修前，真二进制，两条独立会话共用同一个 `UYA_AGENT_HOME`）**：
+
+```
+$ printf '/goal 会话甲的目标\n/exit\n' | … uya-agent    # 会话甲
+Goal created … Objective: 会话甲的目标 …
+
+$ printf '/goal\n/exit\n'            | … uya-agent    # 会话乙（另一个进程、全新会话）
+Status: active
+Objective: 会话甲的目标                                 # ← 乙看到的是甲的目标
+Activation: armed                                      # ← 甲的目标还会被乙续跑
+
+$ printf '/goal 第二条会话想干自己的活\n/exit\n' | … uya-agent
+A goal is already active. Use /goal edit …             # ← 乙连自己的目标都建不了
+```
+
+**根因**：`goal_path` 用 `agent_default_home(cfg)` 拼 `<agent_home>/goal.json` ——
+落点表达的是「agent 装在哪」，与会话身份（`<home>/sessions/--<cwd>--/<id>/`）无关，
+所以「会话目标」实际是 **home 级单例**。web 最重：8 条会话子进程共用同一个 home。
+
+**修法**：`goal.json` 挪进**会话目录**（与 `session.jsonl` 同目录）；`goal_session_dir`
+三条判据（尾名整段 / 在本次 `cfg` 的 home 底下 / 紧跟 `/sessions/`）全中才用会话目录，
+否则退回旧的 home 根路径（`--print-config` 那条路仍可用）。落盘前补一次 mkdir
+（`--no-save` 的会话不建目录）。换会话（`/new`、`/resume`）后那份内存投影跟着重读，
+且必须在 `tasks_panel_sync` 之前。历史遗留的 home 根那份**不迁移、不删、不再读**。
+
+**对照实验（先看到红）**：把 `goal_path` 的会话目录分支短路回修前行为
+（`if false && goal_session_dir(…)`）重编 → `goal-sess` 轮**9 条断言当场红**，
+包括「会话乙看到了会话甲的目标（不同会话不该共享 goal）」「会话乙应当能建自己的目标
+（要 0，实得 1）」；改回即绿。这条对照是必须的：**旧的 `tui-switch` D 段钉的恰好是
+相反的语义**（「目标跨会话、不该被清」），只改实现不改断言的话两边一起绿。
+
+**验收**：`make check` / `make build`（静态链接审计通过）全绿；
+`--selftest` **SELFTEST PASS**（184 轮 ok、0 条 FAIL，含新轮 `goal-sess`）；
+`make e2e-goal` 通过；`tui-switch` 轮 D 段改成「/new 与 /resume 之后投影与屏幕都不再挂着
+上一条会话的目标」+ 一条**防假绿**断言（重装夹具后目标段照旧画得出来 —— 证明「消失」是
+因为换了会话，不是因为面板整个坏了）；`lint-size` / `doc-audit` / `doc-cover` 通过。
+
+**明确不做**：目标跨会话继承、迁移历史 `goal.json`、给 goal 加「全局目标」这种第二形态
+（DSH 的 goal 也是 per-session）。
