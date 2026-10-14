@@ -1,12 +1,14 @@
 // src/agent/goal.uya — 会话级目标（P11，对齐 DSH 的 goal 工具）+ 同会话续跑驱动器
 //
-// 本文件：持久化（`goal_path`/`goal_load`/`goal_save`，手写 JSON）、字段读写小工具
+// 本文件：持久化（`goal_session_dir`/`goal_path`/`goal_load`/`goal_save`，手写 JSON）、
+//   字段读写小工具
 //   （`goal_set`/`goal_set_n`/`goal_set_lit`/`goal_is_space`/`goal_phase_is`）、
 //   三个工具入口（`goal_tool_get`/`goal_tool_create`/`goal_tool_update`）、
 //   人类命令面（`goal_cmd_run` 与它的几条回执）、**同会话 Goal Round 驱动器**
 //   （`goal_round_admit`：一次调用同时回答「该不该开下一轮」并把这一轮记在账上）。
 // 不变量：① `update_goal` 是 **CAS**：id 与 revision 都必须精确匹配（`goal-3` / `3` 都收），
-//   过期即拒并要求重取 —— 目标**跨进程/跨回合**持久，没有这道校验两个并发分支会静默互相覆盖；
+//   过期即拒并要求重取 —— 目标**跨进程/跨回合**持久（同一个会话重新打开还是它），
+//   没有这道校验两个并发分支会静默互相覆盖；
 //   ② `blocked` 需要非空 `blocked_reason` 且 **round < 2 时拒绝**（DSH 规则：同一阻塞条件
 //   至少连续 3 轮）；③ `phase` 只有 active / paused / complete / blocked；
 //   ④ 已有**未完成**目标时 `create` 拒绝顶掉；⑤ `/goal clear` 是**删文件、不留 tombstone**
@@ -14,7 +16,10 @@
 //   **字面目标**（`/goal pause after verification` 创建的就是那个字面目标）；
 //   ⑦ **`round` 只在一次续跑真正开始之后才 +1**（`goal_round_admit` 里落盘），被拒的预留
 //   **不消耗轮号** —— 与 DSH 的 `roundsStarted` 口径一致；⑧ 续跑授权分**盘上**（`Goal.armed`，
-//   `get_goal` 报它）与**进程本地**（`g_goal_armed`）两份，后者**不跨会话**。
+//   `get_goal` 报它）与**进程本地**（`g_goal_armed`）两份，后者**不跨会话**；
+//   ⑨ 目标**属于会话**：落点是**会话目录**里的 `goal.json`（与 `session.jsonl` 同目录），
+//   所以两条会话各有各的目标、互不可见 —— 这是「会话目标」这个名字的实体化
+//   （修前落在 agent_home 根上，同一台机器的所有会话共用一份）。
 // 依赖：libc（syscall / unistd）；本仓 foundation/bufx、foundation/jsonx、session/session。
 // 命名：`goal_*`、`Goal`、`GOAL_*`。
 //
@@ -28,9 +33,16 @@
 //     清成进程本地的未授权。于是 `--resume` 之后目标还在盘上、自动续跑却停着，要接着跑必须
 //     由人明确授权（`/goal resume` 或 `update_goal action=resume`）—— 与 DSH 的激活边界同一条。
 //
-// 目标存在 agent_home 下的 goal.json 里，跨进程可读；字段：objective / phase /
-// round / maxRounds / blocker / revision / id。update_goal 要求**精确的 id 与 revision**
-// （取值前必须先 get_goal），这样并发/过期写入会被挡住。
+// 目标存在**会话目录**下的 goal.json 里（`<agent_home>/sessions/--<cwd>--/<id>/goal.json`），
+// 跨进程可读；字段：objective / phase / round / maxRounds / blocker / revision / id。
+// update_goal 要求**精确的 id 与 revision**（取值前必须先 get_goal），这样并发/过期写入会被挡住。
+//
+// 落点为什么跟着会话走（P87）：goal 是**会话级**的东西，与「这台机器上装了这个 agent」
+// 无关。原来落在 agent_home 根上，于是同一个 home 下所有会话共用一份目标 ——
+// 甲会话建的目标乙会话一打开就看到（还带着 armed=true，甲的目标会被乙的进程续跑），
+// 乙想建自己的目标则被「A goal is already active.」顶回来；web 那种一个 home 下并存
+// 8 条会话的形态里症状最重。挪进会话目录之后，「属于会话」由**文件位置**保证，
+// 跨会话隔离不需要任何额外判断。
 //
 // phase：active（自动续跑）/ paused / complete / blocked
 
@@ -88,9 +100,66 @@ export fn goal_free(g: &Goal) void {
     buf_free(&g.blocker);
 }
 
-// 算出 `<agent_home>/goal.json` 的路径写进 out（调用方的）。
-// home 走 `agent_default_home`，所以与「会话」同一层 ⇒ **目标跨会话**（`/new` 之后还是同一个）。
+// 会话日志的尾名（`sess_session_path` 拼的就是它）。目标文件与它**同目录** ⇒ 属于会话。
+const GOAL_SESS_TAIL: &const byte = "/session.jsonl" as &const byte;
+
+// 会话目录在 home 底下的那段前缀（判据③：只比 home 前缀的话，`/tmp/ab` 与 `/tmp/abc`
+// 这种兄弟目录会被误判成会话目录）。
+const GOAL_SESS_ROOT: &const byte = "/sessions/" as &const byte;
+
+// 会话目录（会话日志路径去掉尾名那一段）写进 dir。命中返回 true；否则 dir 一个字节不动。
+//
+// 三条同时成立才算命中（缺一条就由 `goal_path` 退回 agent home 根）：
+//   ① `g_sess.path` 的尾名整段就是 `/session.jsonl`（只认整段，不做「路径里出现过」），
+//      且 `g_sess.id` 非空 —— 会话身份齐了；
+//   ② 它在**本次 cfg 的 agent home** 底下（`<home>/sessions/`）—— `g_sess` 是进程级的，
+//      而夹具会换 `cfg.agent_home` 去测别的 home（那时 `g_sess` 里那条会话属于**另一个**
+//      home，按它落盘会写到夹具没准备的地方）；
+//   ③ home 只是整条路径的前缀还不够，紧跟的必须是 `/sessions/` —— 否则 `/tmp/ab` 这种
+//      前缀相同的兄弟目录会被误判成会话目录。
+fn goal_session_dir(cfg: &const Config, dir: &Buf) bool {
+    const n: usize = g_sess.path.len;
+    const tn: usize = bufx_cstr_len(GOAL_SESS_TAIL);
+    if g_sess.id.len == 0 || n <= tn {
+        return false;
+    }
+    const p: &const byte = g_sess.path.ptr as &const byte;
+    if !bufx_mem_eq(&p[n - tn] as &const byte, GOAL_SESS_TAIL, tn) {
+        return false;
+    }
+    var home: Buf = buf_new(1024);
+    defer { buf_free(&home); }
+    if !agent_default_home(cfg, &home) || home.len == 0 {
+        return false;
+    }
+    const sn: usize = bufx_cstr_len(GOAL_SESS_ROOT);
+    if n < home.len + sn {
+        return false;
+    }
+    if !bufx_mem_eq(p, home.ptr as &const byte, home.len) {
+        return false;
+    }
+    if !bufx_mem_eq(&p[home.len] as &const byte, GOAL_SESS_ROOT, sn) {
+        return false;
+    }
+    buf_reset(dir);
+    return buf_append_span(dir, p, 0, n - tn);
+}
+
+// 算出目标文件的路径写进 out（调用方的）。**属于会话**（P87）：会话目录里那份优先，
+// 于是两条会话各有各的目标、互不可见。
+// 拿不到会话（还没开会话，例如 `--print-config` 那条路径；或 `g_sess` 属于别的 home）
+// 就退回 `<agent_home>/goal.json` —— 与「落点跟着会话走」之前的行为一致。
 fn goal_path(cfg: &const Config, out: &Buf) bool {
+    var dir: Buf = buf_new(1200);
+    defer { buf_free(&dir); }
+    if goal_session_dir(cfg, &dir) {
+        buf_reset(out);
+        if !buf_append(out, dir.ptr, dir.len) {
+            return false;
+        }
+        return buf_append_cstr(out, "/goal.json");
+    }
     var home: Buf = buf_new(1024);
     defer { buf_free(&home); }
     if !agent_default_home(cfg, &home) {
@@ -99,6 +168,29 @@ fn goal_path(cfg: &const Config, out: &Buf) bool {
     buf_reset(out);
     _ = buf_append(&out[0], home.ptr, home.len);
     return buf_append_cstr(out, "/goal.json");
+}
+
+// 落盘前把目标文件**所在的目录**补出来（逐级 mkdir，已存在不算错）。
+// 为什么要补：`--no-save` 的会话不建目录（`sess_open` 在建目录之前就返回了），而目标
+// 照样要落盘 —— 不补的话 sys_open 会因为目录不存在而失败，目标静默存不下。
+// 目录不存在（找不到分隔符 / 只在根）就直接返回 false，让写盘那一步去报错。
+fn goal_dir_ensure(p: &const byte, n: usize) bool {
+    var i: usize = n;
+    while i > 0 {
+        if p[i - 1] == 47 as byte {
+            break;
+        }
+        i = i - 1;
+    }
+    if i <= 1 {
+        return false;
+    }
+    var dir: Buf = buf_new(i + 1);
+    defer { buf_free(&dir); }
+    if !buf_append_span(&dir, p, 0, i - 1) {
+        return false;
+    }
+    return buf_append_byte(&dir, 0) && sess_mkdir_p(dir.ptr as &const byte);
 }
 
 // 用切片给 dst 赋值（先 reset）。空 src 只 reset ——「设成空」与「不设」同义，
@@ -189,12 +281,15 @@ export fn goal_load(cfg: &const Config, g: &Goal) bool {
 // 把手写 JSON 落盘（`O_WRONLY|O_CREAT|O_TRUNC`，权限 420）。
 // 字段顺序固定：id / revision / phase / objective / round / maxRounds / blocker / armed。
 // 写失败返回 false；调用方（goal_tool_* 与 goal_cmd_run）据此回一句错误。
+// P87：落点可能在会话目录里，而那个目录不一定已经建出来（`--no-save` 的会话不建目录），
+// 所以写之前先补一次 mkdir —— 补不出来不算错，交给下面的 sys_open 去报。
 export fn goal_save(cfg: &const Config, g: &const Goal) bool {
     var p: Buf = buf_new(1200);
     defer { buf_free(&p); }
     if !goal_path(cfg, &p) {
         return false;
     }
+    _ = goal_dir_ensure(p.ptr as &const byte, p.len);
     if !buf_append_byte(&p, 0) {
         return false;
     }
