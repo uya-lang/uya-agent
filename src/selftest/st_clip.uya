@@ -1024,6 +1024,156 @@ fn clips_pty_probe(tag: &const byte, m: i32, cpid: i32, ok: &bool) bool {
     return true;
 }
 
+// 睡眠一段时间（毫秒）。自测里扮"慢终端"要用。
+fn clips_sleep_ms(ms: u64) void {
+    var ts: TimeSpec = TimeSpec{ tv_sec: (ms / 1000 as u64) as i64,
+        tv_nsec: ((ms % 1000 as u64) * 1000000 as u64) as i64 };
+    var rem: TimeSpec = TimeSpec{ tv_sec: 0, tv_nsec: 0 };
+    _ = sys_nanosleep(&ts, &rem) catch {};
+}
+
+// clip-slow 的后半（第 6–8 步）：回数据（慢一点）→ 断言图片贴上 → 收尾。
+// 单独一个函数是为了 `clip_slow_round` 不超 100 行（AGENTS.md）。
+fn clips_slow_deliver(tag: &const byte, m: i32, cpid: i32, mpid: i32,
+                      cap2: &const Buf, ok: &bool) void {
+    var img: Buf = buf_new(256);
+    defer { buf_free(&img); }
+    clips_png_into(&img);
+    var okf: Buf = buf_new(64);
+    defer { buf_free(&okf); }
+    clips_reply_status("OK" as &const byte, &okf);
+    var df: Buf = buf_new(256);
+    defer { buf_free(&df); }
+    clips_reply_data("image/png" as &const byte, img.ptr as &const byte,
+        img.len, &df);
+    var donef: Buf = buf_new(64);
+    defer { buf_free(&donef); }
+    clips_reply_status("DONE" as &const byte, &donef);
+    var reply: Buf = buf_new(1024);
+    defer { buf_free(&reply); }
+    _ = buf_append(&reply, okf.ptr as &const byte, okf.len);
+    _ = buf_append(&reply, df.ptr as &const byte, df.len);
+    _ = buf_append(&reply, donef.ptr as &const byte, donef.len);
+    const t_rep: u64 = ua_now_ms();
+    clips_reply_to_master(m, &reply);
+    // 判据：图片真的贴上了
+    clips_pty_collect(tag, m, cap2, ok);
+    clips_pty_prompt(tag, t_rep, ok);
+    // 收尾：发 /exit 让它退出；退不掉就杀掉
+    var quit: [byte: 12] = "/exit\r\x00\x00\x00\x00\x00\x00";
+    tuis_write_master(m, &quit[0], 6);
+    var st: i32 = 0;
+    if !tuis_wait_raw(cpid, &st, 4000) {
+        _ = sys_kill(cpid as i64, SIGKILL) catch {};
+        var st2: i32 = 0;
+        _ = sys_waitpid(cpid, &st2, 0) catch {};
+    }
+    _ = sys_kill(mpid as i64, SIGKILL) catch {};
+    var st3: i32 = 0;
+    _ = sys_waitpid(mpid, &st3, 0) catch {};
+}
+
+// clip-slow 的前半（第 1–5 步）：界面上屏 → ctrl+v → 等探测 → **慢应答** → 等读请求。
+// 返回 false = 这一轮到此为止（已经报过失败）。
+fn clips_slow_probe(tag: &const byte, m: i32, cpid: i32, ok: &bool) bool {
+    var cap: Buf = buf_new(262144);
+    defer { buf_free(&cap); }
+    var settle: i32 = 0;
+    while settle < 8 {
+        tuis_drain(m, &cap, 6);
+        settle = settle + 1;
+    }
+    var key: [byte: 1] = [0: 1];
+    key[0] = 22 as byte;
+    tuis_write_master(m, &key[0], 1);
+    var cap1: Buf = buf_new(262144);
+    defer { buf_free(&cap1); }
+    if !clips_wait_lit(m, &cap1, "\x1b[?5522$p" as &const byte, 6000) {
+        clips_fail(tag, "ctrl+v 之后没有发出能力探测", ok);
+        _ = sys_kill(cpid as i64, SIGKILL) catch {};
+        return false;
+    }
+    // **慢**应答：400 ms 之后才回"支持"。
+    // 原预算 250 ms ⇒ 这一刻程序已经放弃并判"不支持"（修复前这一轮必红）。
+    clips_sleep_ms(400);
+    var dr: Buf = buf_new(64);
+    defer { buf_free(&dr); }
+    clips_reply_decrpm(2, &dr);
+    clips_reply_to_master(m, &dr);
+    var cap2: Buf = buf_new(262144);
+    defer { buf_free(&cap2); }
+    if !clips_wait_lit(m, &cap2, "\x1b]5522;type=read" as &const byte, 6000) {
+        clips_fail(tag, "慢终端（400ms 应答）之后没有发出读请求 —— 探测预算不够，被判成「不支持」了", ok);
+        _ = sys_kill(cpid as i64, SIGKILL) catch {};
+        return false;
+    }
+    return true;
+}
+
+// clip-slow 轮：**慢终端**（响应延迟 400 ms）也必须能贴上图片。
+//
+// 为什么必须有这一轮：`clip-pty` 的假终端是**立即**应答的，所以"探测预算够不够"
+// 从来没被真正测过。而真实世界里有一条极常见的路径：**跨境 SSH** —— 探针要从终端
+// 走到远端程序再走回来，一趟就是网络 RTT 本身。实测本机 ↔ 香港的 ping RTT 是
+// 377 ms，探针完整往返 ~378 ms。原来的 `CLIPT_PROBE_MS = 250` 比它小，
+// 于是每一次探测都在应答到达前超时，用户看到的是
+// 「这个终端不支持 5522 …… 换 kitty / ghostty 即可」——一句把人引向错误方向的诊断
+// （终端明明支持，换终端也治不好）。
+//
+// 这一轮把 400 ms 的延迟**固化进测试**：它 > 原来的 250 ms（所以修复前必红），
+// 又 < 现在的 1500 ms（所以修复后必绿）。判据是"图片真的贴上了"，
+// 而不是"探测函数返回了 true"——后者在假终端里太好骗。
+fn clip_slow_round(tag: &const byte) bool {
+    var ok: bool = true;
+    out_err("selftest[");
+    out_err(tag);
+    out_err("] ");
+    mock_mode = 0;
+    mock_expect_shell = true;
+    mock_expect_fold = false;
+    mock_expect_steer = false;
+    const wsdir: &const byte = "build/selftest_ws_clip_slow" as &const byte;
+    if !ws_prepare(wsdir) {
+        clips_fail(tag, "工作目录准备失败", &ok);
+        return false;
+    }
+    const homedir: &const byte = "build/selftest_clip_slow_home" as &const byte;
+    var hp: Buf = buf_new(64);
+    defer { buf_free(&hp); }
+    _ = buf_append_cstr(&hp, homedir);
+    _ = buf_append_byte(&hp, 0);
+    _ = sys_mkdir(&hp.ptr[0] as *const byte, 493 as u32) catch {};
+    var mpid: i32 = -1;
+    const port: u16 = tuis_start_mock(&mpid);
+    if port == 0 {
+        clips_fail(tag, "mock LLM 起不来", &ok);
+        return false;
+    }
+    var slave_path: Buf = buf_new(64);
+    defer { buf_free(&slave_path); }
+    const m: i32 = tuis_open_pty(&slave_path, 100, 30);
+    if m < 0 {
+        clips_fail(tag, "打不开 /dev/ptmx", &ok);
+        _ = sys_kill(mpid as i64, SIGKILL) catch {};
+        return false;
+    }
+    const cpid: i32 = clips_pty_spawn(tag, m, &slave_path, port, wsdir,
+        homedir, &ok);
+    if cpid < 0 {
+        return false;
+    }
+    if !clips_slow_probe(tag, m, cpid, &ok) {
+        return false;
+    }
+    var cap2: Buf = buf_new(262144);
+    defer { buf_free(&cap2); }
+    clips_slow_deliver(tag, m, cpid, mpid, &cap2, &ok);
+    if ok {
+        out_err("ok（400ms 慢终端也能贴图：探测预算容得下跨境 RTT）\n");
+    }
+    return ok;
+}
+
 // 应答必须**在读预算内当场**被吃完，不是靠 10 s 读超时兜底。
 // 判据为什么重要：一次 read 里连着来三帧是常态，而扫描器一次只交付一帧 —— 少了
 // 「把挂起段接着解完」那一步，就要等满 `CLIPT_READ_MS`（10 s）才收口，用户看到的
