@@ -3118,7 +3118,7 @@ parser-blocking preload + `window.__DSH_BOOT__`）；按最小 roster 服务
 | 2 | 删 `DWH_ROSTER` / `DWH_PRELOAD`，改扫描 + 读 `dsh.client.inject` | 页面上出现 25 个 `data-slot` | **已做**（第九批） |
 | 3 | `/api` 方法名改斜杠（`session/list` 等） | 真 DSH 的 11 个调用不再回 `bad-request` | **已做**（第九批） |
 | 4 | `/api/remote.mux`（0.2.0 唯一的下行） | 三条流的 `open` 都收到 `item` | **已做**（第十批） |
-| 5 | `$events/result` unary + 把会话事件推上去 | 页面不再 `connection lost, retry #N` | 待做 |
+| 5 | 查清客户端的 `connection lost` 从哪来（见下「未解」） | 页面不再 `connection lost, retry #N` | **未解** |
 | 6 | `dynamicCordisRunner/{inventory,syncInspectManifest}`、`session/modelCatalog` | 控制台零告警 | 待做 |
 | 7 | 资源定位链 + `--dsh-assets` | 日志显示用的是该目录；DSH 树零写入 | 待做 |
 | 8 | `--dsh-assets-install`（`npm pack` 取 72 个包） | 离线/在线各验一次 | 待做 |
@@ -3152,6 +3152,26 @@ S→C {"type":"item","streamId":"<uuid>","value":{"type":"ready","clientId":"<uu
 
 > ③④ 同症状不同因，这正是「症状离原因很远」的形态：两者都表现为「只解第一条」。
 > 如果只修 ③ 就收工，④ 会让它看起来**没修好**。
+
+##### 八、未解：页面仍 `connection lost, retry #N`（如实记，不假装做完）
+
+第十批之后，`generation is still not ready` 那条告警**消失了**（说明 `$events`
+的 `ready` 已被接受），但页面仍每 3 秒重连。**已排除的**（都是实测）：
+
+| 排除项 | 怎么排的 |
+|---|---|
+| 我的帧不合法 | 客户端的 `parseRemoteStreamServerMessage` 用 `exactKeys` 校验；我的三条流都按它发（`ready` 只 `type/clientId/host`，`baseline` 只 `type/value`），且浏览器里**没有** `invalid Remote stream frame` / `4002` 关闭事件 |
+| 我的宿主关连接 | 裸 socket 挂 25 秒：**无 EOF、无 close 帧**；两个并发连接（`workspace/follow` + `$events`）互不影响 |
+| 多帧一段 / 漏 return | 修前修后都是「三帧一次写能收到三条响应」（裸 socket 验证） |
+| 缺配置全局 | 真 DSH 有 6 个 `__DSH_*` 全局，我只发 `__DSH_BOOT__`；但读客户端源码：`__DSH_TRANSPORT__` 是 `?.`（有 `document.baseURI` 回落）、`__DSH_CONNECTION_RECOVERY__` 经 `resolveConnectionConfig()` 补默认值 ⇒ **都不必需** |
+
+**剩下的线索**：`dsh-client-connection` 的 `ConnectionController` 只在它的
+`source`（= gateway 的 `pumpEvents`）**结束或抛错**时才 `connection lost`。
+而 `pumpEvents` 的 `for await` 只在 `openStream` 的迭代器结束/抛错时退出，
+`StreamInbox.next()` 本身是**无限阻塞**的。所以嫌疑集中在
+「`openStream` 返回的那个迭代器为什么结束」—— 下一轮从
+`dsh-client-connection` 的 `source` 参数怎么接上 `pumpEvents` 入手
+（这是本轮唯一没走完的一跳）。
 
 ---
 
