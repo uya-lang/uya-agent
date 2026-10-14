@@ -1,9 +1,10 @@
 // src/web/whost.uya — DSH 前端的**产品侧宿主**：静态资源 + 启动注入 + 最小 `/api`
 //
 // 本文件：把「阶段 0 探针证成的那套东西」从 Python 搬进产品 —— 只读服务 DSH 自己那份
-//   `dsh-web-frontend/dist`、复刻它的 `bootInjections()`（内联 queue 脚本 + 两个
-//   parser-blocking preload + `window.__DSH_BOOT__`）、按最小 roster 服务
-//   `/plugins/<id>/client.js`、并把 `/api/*` 接到 `web/wsess.uya` 的译文上。
+//   `dsh-web-frontend/dist`、复刻它的 `bootInjections()`（内联 queue 脚本 + 一个
+//   parser-blocking bootstrap script + `window.__DSH_BOOT__`）、按**扫描出的 roster**
+//   服务 `/plugins/<id>/client.js`、并把 `/api/*` 接到 `web/wsess.uya` 的译文上。
+//   roster 与 boot 图的契约见 DESIGN §11.9.7（0.2.0 的 `batches`）。
 // 不变量：① **一个字节都不改 DSH 的 dist**（`make link-audit` 那套纪律的延伸：我们
 //   只读它、只服务它）；② **`/api` 的载体错与业务错分开**：HTTP 状态只表示载体
 //   （404 未知路径 / 415 非 JSON / 400 非 JSON 体），未实现的方法回 **200 +
@@ -58,11 +59,6 @@ export const DWH_MAX_CONNS: usize = 32;
 const DWH_POLL_MS: i32 = 50;
 // 请求头上限（`/api` 的体单独按 Content-Length 收，不受这个数限制）。
 const DWH_HEAD_MAX: usize = 16384;
-// `bootInjections()` 里那两个 parser-blocking preload 的顺序（**顺序即语义**）。
-const DWH_PRELOAD: [&const byte: 2] = [
-    "@deepseek-ai/dsh-client-modules" as &const byte,
-    "@deepseek-ai/dsh-client-runtime" as &const byte,
-];
 
 // 一条连接的阶段。
 const DWH_C_HEAD: u8 = 0;      // 正在收请求头
@@ -82,7 +78,8 @@ export struct DwhHost {
     lfd: i32,
     dist: Buf,          // `<dsh 根>/node_modules/@deepseek-ai/dsh-web-frontend/dist`
     root: Buf,          // DSH 根（`node_modules` 的父目录）
-    entries: Buf,       // 已解析好的 `{"rev":…,"entries":[…]}`（boot 图）
+    entries: Buf,       // 已解析好的 `{"rev":…,"entries":[…],"batches":[…]}`（boot 图）
+    preloads: Buf,      // bootstrap 的 `<script src="…">` 片段（启动时算一次）
     events: Buf,        // 会话事件的译文（每行一条，喂 mux 下行用）
     conns: [DwhConn: DWH_MAX_CONNS],
     n: usize,
@@ -214,132 +211,444 @@ fn dwh_rev_of(p: &const byte, n: usize, out: &Buf) bool {
 }
 
 // ============================================================
-// boot 图（最小 roster）
+// boot 图（roster 由**扫描**得出，不写死）
 // ============================================================
 
-// 最小 roster：14 个包（inject 闭包，见 DESIGN §11.9.6）。少一个，DSH 的 shell 会
-// 「全有或全无」地整页 fail，所以这份表是**契约**而不是建议。
-const DWH_ROSTER: [&const byte: 14] = [
-    "@deepseek-ai/dsh-api-gateway" as &const byte,
-    "@deepseek-ai/dsh-api-remotes" as &const byte,
-    "@deepseek-ai/dsh-client-connection" as &const byte,
-    "@deepseek-ai/dsh-client-locale" as &const byte,
-    "@deepseek-ai/dsh-client-modules" as &const byte,
-    "@deepseek-ai/dsh-client-runtime" as &const byte,
-    "@deepseek-ai/dsh-client-ui-conversation" as &const byte,
-    "@deepseek-ai/dsh-client-ui-layout" as &const byte,
-    "@deepseek-ai/dsh-client-ui-renderer" as &const byte,
-    "@deepseek-ai/dsh-client-ui-settings" as &const byte,
-    "@deepseek-ai/dsh-client-ui-sidebar" as &const byte,
-    "@deepseek-ai/dsh-client-ui-theme" as &const byte,
-    "@deepseek-ai/dsh-client-ui-workspace" as &const byte,
-    "@deepseek-ai/dsh-typert-registry" as &const byte,
-];
+// roster 上限（0.2.0 实测 71 个带 `lib/client.js` 的包；留一倍余量防未来增长）。
+const DWH_ROSTER_MAX: usize = 160;
+// 一个包名的上限（DSH 的实测最长约 50 字符；留余量）。
+const DWH_PKG_MAX: usize = 128;
+// `@deepseek-ai` 作用域目录名（roster 的扫描根，见 `dwh_scan_roster`）。
+const DWH_SCOPE: &const byte = "@deepseek-ai" as &const byte;
 
-// 装出 boot 图：`{"rev":"…","entries":[{"id":…,"url":…,"rev":…},…]}`。
-// 读不到的包**跳过**（装机不全时给出一个能起来的子集，而不是整页白屏）；
-// 一个都没有则返回 false（调用方据此报错退出）。
-fn dwh_build_entries(h: &DwhHost, out: &Buf) bool {
-    buf_reset(out);
-    if !buf_append_cstr(out, "{\"rev\":\"min\",\"entries\":[") {
+// 一条 roster 记录：包名 + 它的 `lib/client.js` 内容哈希（rev）。
+// **一条记录一个缓冲**（包名 `\0` rev `\0` inject `\0` 交错），不是平行数组：
+// 平行数组要求「每个数组的格位」与「名字数组的字节偏移」对齐，而 rev 恒为
+// 12 字符、包名却长短不一 —— 用同一个 `off` 去索引两边**必然错位**（实测症状：
+// bootstrap 那段 `<script src=…?rev=>` 里 **rev 是空的**，而 entries 里是对的）。
+// 交错之后「读一条 = 走三个 `\0`」，不变量只剩一条。
+//
+// 第三段 `inject` 是 `package.json` 的 `dsh.client.inject` 原文（一个 JSON 数组）。
+// **为什么必须有它**：客户端的激活判据是「声明的服务都在了才 apply」，而「声明」
+// 就从这一行读（它不认识包装了什么服务）。不发这个字段 ⇒ 每个依赖服务的插件都
+// 停在 `pending (waiting for services: …)`，实测 35 个 entries 不激活、页面半死
+// （`data-slot` 一个都没有，而**控制台只有一个 "did not activate" 的汇总错**）。
+export struct DwhRoster {
+    recs: Buf,        // 每条：包名 `\0` rev `\0` inject `\0`
+    n: usize,
+}
+
+// 扫描出 roster：`<root>/node_modules/@deepseek-ai/<pkg>/lib/client.js` 存在即入选。
+//
+// **为什么扫目录而不是读 `package.json` 的 `dsh.client`**：实测两者**完全等价** ——
+// 0.2.0 里「有 `lib/client.js`」的 71 个包 == 「声明了 `dsh.client`」的 71 个包，
+// 两个方向的差集都是空。扫目录省掉一个 JSON 解析器与一份冗余判据（`exports["./client"]`
+// 在 DSH 里恒为 `lib/client.js`，见 `dwh_client_path`）。
+//
+// **顺序**：getdents64 的顺序由文件系统定，而 boot 图的顺序**不承载语义**
+// （客户端按 `inject` 依赖图自己拓扑排序，见它的 `orderEntries`）。所以这里不排序，
+// 只要求「同一次运行内稳定」。rev 也在这里顺手算掉（反正要读文件校验）。
+fn dwh_scan_roster(h: &DwhHost, r: &DwhRoster) bool {
+    buf_reset(&r.recs);
+    r.n = 0;
+    var dir: Buf = buf_new(1200);
+    defer { buf_free(&dir); }
+    if !dwh_scope_dir(&h.root, &dir) {
         return false;
     }
+    const fd: i32 = sys_open(dir.ptr as &const byte, (O_RDONLY | O_DIRECTORY) as i32, 0) catch {
+        return false;      // 没有作用域目录 ⇒ 没装 DSH 的 client 包
+    };
+    defer { _ = sys_close(fd) catch {}; }
+    var ents: [byte: 32768] = [0: 32768];
     var bundle: Buf = buf_new(4194304);
     defer { buf_free(&bundle); }
     var path: Buf = buf_new(1200);
     defer { buf_free(&path); }
     var rev: Buf = buf_new(32);
     defer { buf_free(&rev); }
-    var first: bool = true;
-    var n: usize = 0;
-    var i: usize = 0;
-    while i < 14 {
-        const pkg: &const byte = DWH_ROSTER[i];
-        const pl: usize = bufx_cstr_len(pkg);
-        if dwh_client_path(&h.root, pkg, pl, &path) && dwh_read_file(path.ptr as &const byte, &bundle, 4194304) {
-
-            if !dwh_rev_of(bundle.ptr as &const byte, bundle.len, &rev) {
-                return false;
-            }
-            if !first && !buf_append_byte(out, 44) {
-                return false;
-            }
-            first = false;
-            if !buf_append_cstr(out, "{\"id\":\"") {
-                return false;
-            }
-            if !buf_append(out, pkg, pl) {
-                return false;
-            }
-            if !buf_append_cstr(out, "\",\"url\":\"/plugins/") {
-                return false;
-            }
-            if !buf_append(out, pkg, pl) {
-                return false;
-            }
-            if !buf_append_cstr(out, "/client.js?rev=") {
-                return false;
-            }
-            if !buf_append(out, rev.ptr as &const byte, rev.len) {
-                return false;
-            }
-            if !buf_append_cstr(out, "\",\"rev\":\"") {
-                return false;
-            }
-            if !buf_append(out, rev.ptr as &const byte, rev.len) {
-                return false;
-            }
-            if !buf_append_cstr(out, "\"}") {
-                return false;
-            }
-            n = n + 1;
+    while r.n < DWH_ROSTER_MAX {
+        const rc: isize = sys_getdents64(fd, &ents[0], 32768) catch {
+            break;
+        };
+        if rc <= 0 {
+            break;
         }
-        i = i + 1;
-    }
-    if n == 0 {
-        return false;
-    }
-    return buf_append_cstr(out, "]}");
-}
-
-// 装出两个 preload 的 `<script src="…">` 片段（**装 entries 时顺手攒**）。
-//
-// 为什么不在注入时回搜 entries：那要先在 JSON 文本里找 `{"id":"<pkg>","url":"…`，
-// 而实测那条路在**产品二进制里**回 -1（同样的文本、同样的子串，纯函数轮却过 ——
-// 与 `srv_find` 的嵌套比较循环在宿主 C 里的行为有关）。这里的做法是**绕开搜索**：
-// 拼 entries 的时候就知道每个包的 url，顺手写一份，于是没有任何「按文本找结构」的步骤
-// —— 那本来也是脆的（JSON 文本一改格式就断）。
-fn dwh_build_preloads(h: &const DwhHost, out: &Buf) bool {
-    buf_reset(out);
-    var i: usize = 0;
-    while i < 2 {
-        if !dwh_one_preload(h, DWH_PRELOAD[i], out) {
+        if !dwh_scan_chunk(h, &ents[0], rc as usize, r, &bundle, &path, &rev) {
             return false;
         }
-        i = i + 1;
+    }
+    return r.n > 0;
+}
+
+// 扫一块 getdents64 输出：记录格式是
+// `{u64 d_ino, i64 d_off, u16 d_reclen, u8 d_type, char d_name[]}`（`d_name` 在 +19）。
+fn dwh_scan_chunk(h: &DwhHost, buf: &byte, total: usize, r: &DwhRoster,
+                  bundle: &Buf, path: &Buf, rev: &Buf) bool {
+    var off: usize = 0;
+    while off + 19 <= total {
+        const reclen: usize =
+            (buf[off + 16] as usize) | ((buf[off + 17] as usize) << 8);
+        if reclen == 0 || off + reclen > total {
+            return true;      // 残记录：留给下一次 getdents（或就此结束）
+        }
+        const cname: &byte = &buf[off + 19];
+        const cl: usize = bufx_cstr_len(cname);
+        if cl > 0 && cl <= DWH_PKG_MAX && cname[0] != 46 as byte {
+            if !dwh_try_pkg(h, cname, cl, r, bundle, path, rev) {
+                return false;
+            }
+            if r.n >= DWH_ROSTER_MAX {
+                return true;
+            }
+        }
+        off = off + reclen;
     }
     return true;
 }
 
-// 一个 preload 片段。**它重算一遍 url 而不去 entries 里搜**（理由见上）。
-fn dwh_one_preload(h: &const DwhHost, pkg: &const byte, out: &Buf) bool {
-    const pl: usize = bufx_cstr_len(pkg);
-    var path: Buf = buf_new(1200);
-    defer { buf_free(&path); }
-    if !dwh_client_path(&h.root, pkg, pl, &path) {
-        return true;
-    }
-    var bundle: Buf = buf_new(4194304);
-    defer { buf_free(&bundle); }
-    if !dwh_read_file(path.ptr as &const byte, &bundle, 4194304) {
-        return true;      // 这个包没装：跳过（与 entries 的跳过条件一致）
-    }
-    var rev: Buf = buf_new(32);
-    defer { buf_free(&rev); }
-    if !dwh_rev_of(bundle.ptr as &const byte, bundle.len, &rev) {
+// 一个候选目录名：`lib/client.js` 读得到就收进 roster（含 rev）。
+// 读不到**不是错误**（作用域下 288 个目录里只有 71 个是 client 包）。
+fn dwh_try_pkg(h: &DwhHost, cname: &const byte, cl: usize, r: &DwhRoster,
+               bundle: &Buf, path: &Buf, rev: &Buf) bool {
+    var pkg: Buf = buf_new(bufx_cstr_len(DWH_SCOPE) + cl + 2);
+    defer { buf_free(&pkg); }
+    if !buf_append(&pkg, DWH_SCOPE, bufx_cstr_len(DWH_SCOPE)) {
         return false;
     }
-    if !buf_append_cstr(out, "<script src=\"/plugins/") {
+    if !buf_append_byte(&pkg, 47) {
+        return false;
+    }
+    if !buf_append(&pkg, cname, cl) {
+        return false;
+    }
+    const pl: usize = pkg.len;
+    if !dwh_client_path(&h.root, pkg.ptr as &const byte, pl, path) {
+        return false;
+    }
+    if !dwh_read_file(path.ptr as &const byte, bundle, 4194304) {
+        return true;      // 不是 client 包（或读不动）：跳过
+    }
+    if !dwh_rev_of(bundle.ptr as &const byte, bundle.len, rev) {
+        return false;
+    }
+    var inj: Buf = buf_new(2048);
+    defer { buf_free(&inj); }
+    if dwh_is_excluded(pkg.ptr as &const byte, pl) {
+        return true;      // 明确排除的（见 dwh_is_excluded）
+    }
+    if !dwh_read_inject(h, cname, cl, &inj) {
+        return true;      // 读不到 dsh.client：不是 client 包，跳过
+    }
+    if !buf_append(&r.recs, pkg.ptr as &const byte, pl) ||
+        !buf_append_byte(&r.recs, 0) {
+        return false;
+    }
+    if !buf_append(&r.recs, rev.ptr as &const byte, rev.len) ||
+        !buf_append_byte(&r.recs, 0) {
+        return false;
+    }
+    if !buf_append(&r.recs, inj.ptr as &const byte, inj.len) ||
+        !buf_append_byte(&r.recs, 0) {
+        return false;
+    }
+    r.n = r.n + 1;
+    return true;
+}
+
+// 读一个包的 `package.json` → `dsh.client.inject` 的**原文**（JSON 数组）。
+// 拿不到（没有 `dsh.client`、坏了、或是别的形状）返回 false —— 调用方据此把
+// 这个目录当「不是 client 包」。这与「有 `lib/client.js`」是同一个判据的两半：
+// 实测 71 个有 bundle 的包里 67 个带 `inject`（4 个没有 = 谁都不依赖），
+// 而**没有一个包是「有 inject 没 bundle」** —— 所以两半都查，谁缺都跳过。
+fn dwh_read_inject(h: &DwhHost, cname: &const byte, cl: usize, out: &Buf) bool {
+    var path: Buf = buf_new(1200);
+    defer { buf_free(&path); }
+    if !dwh_pkg_json_path(h, cname, cl, &path) {
+        return false;
+    }
+    var doc: Buf = buf_new(262144);
+    defer { buf_free(&doc); }
+    if !dwh_read_file(path.ptr as &const byte, &doc, 262144) {
+        return false;
+    }
+    var arena: Arena = Arena{ buffer: null, size: 0, used: 0 };
+    var abuf: [byte: 262144] = [0: 262144];
+    arena_init(&arena, &abuf[0], 262144);
+    var root: JsonValue = JsonValue.json_null();
+    if !js_parse(&arena, doc.ptr as &const byte, doc.len, &root) {
+        return false;
+    }
+    var dsh: JsonValue = JsonValue.json_null();
+    if !js_obj_get(&root, "dsh" as &const byte, 3, &dsh) {
+        return false;
+    }
+    var cli: JsonValue = JsonValue.json_null();
+    if !js_obj_get(&dsh, "client" as &const byte, 6, &cli) {
+        return false;
+    }
+    var inn: JsonValue = JsonValue.json_null();
+    if !js_obj_get(&cli, "inject" as &const byte, 6, &inn) {
+        // 没有 inject：合法（谁都不依赖）—— 发一个空数组。
+        buf_reset(out);
+        return buf_append_cstr(out, "[]");
+    }
+    // 转成 `["a","b"]`（只取字符串元素；DSH 那边也只认这些）
+    buf_reset(out);
+    if !buf_append_byte(out, 91) {
+        return false;
+    }
+    var i: usize = 0;
+    const n: usize = js_arr_len(&inn);
+    var first: bool = true;
+    while i < n {
+        var el: JsonValue = JsonValue.json_null();
+        if js_arr_get(&inn, i, &el) {
+            var sv: JsonStrView = JsonStrView{ ptr: null, len: 0 };
+            if js_str_of(&el, &sv) && sv.len > 0 {
+                if !first && !buf_append_byte(out, 44) {
+                    return false;
+                }
+                first = false;
+                if !buf_append_byte(out, 34) {
+                    return false;
+                }
+                // ⚠ 反转义要写进**另一个**缓冲：`sv_unescape_to_buf` 是
+                // `out[0] = buf_new(…)`（它**替换**目标缓冲，不是追加），
+                // 直接喂 `out` 会把上面那个 `["` 丢掉 —— 实测症状：`inject`
+                // 发出的是 `@deepseek-ai/…"]`（少了开头的 `["`），而外层 JSON
+                // 就此坏掉、浏览器报的却是别处。
+                var un: Buf = buf_new(sv.len + 8);
+                defer { buf_free(&un); }
+                if !sv_unescape(&sv, &un) {
+                    return false;
+                }
+                if !buf_append(out, un.ptr as &const byte, un.len) {
+                    return false;
+                }
+                if !buf_append_byte(out, 34) {
+                    return false;
+                }
+            }
+        }
+        i = i + 1;
+    }
+    return buf_append_byte(out, 93);
+}
+
+// `<root>/node_modules/@deepseek-ai/<pkg>/package.json`（NUL 结尾）。
+fn dwh_pkg_json_path(h: &DwhHost, cname: &const byte, cl: usize, out: &Buf) bool {
+    buf_reset(out);
+    if !buf_append(out, h.root.ptr as &const byte, h.root.len) {
+        return false;
+    }
+    if !buf_append_cstr(out, "/node_modules/") {
+        return false;
+    }
+    if !buf_append(out, DWH_SCOPE, bufx_cstr_len(DWH_SCOPE)) {
+        return false;
+    }
+    if !buf_append_byte(out, 47) {
+        return false;
+    }
+    if !buf_append(out, cname, cl) {
+        return false;
+    }
+    if !buf_append_cstr(out, "/package.json") {
+        return false;
+    }
+    return buf_append_byte(out, 0);
+}
+
+// 作用域目录：`<dsh 根>/node_modules/@deepseek-ai`（NUL 结尾，喂 sys_open）。
+fn dwh_scope_dir(root: &const Buf, out: &Buf) bool {
+    buf_reset(out);
+    if !buf_append(out, root.ptr as &const byte, root.len) {
+        return false;
+    }
+    if !buf_append_cstr(out, "/node_modules/") {
+        return false;
+    }
+    if !buf_append(out, DWH_SCOPE, bufx_cstr_len(DWH_SCOPE)) {
+        return false;
+    }
+    return buf_append_byte(out, 0);
+}
+
+// 装出 boot 图：`{"rev":"…","entries":[…],"batches":[…]}`。
+// 读不到的包**跳过**（装机不全时给出一个能起来的子集，而不是整页白屏）；
+// 一个都没有则返回 false（调用方据此报错退出）。
+//
+// **`batches` 是 0.2.0 新增的**（0.1.1 只有 `rev`+`entries`）。客户端的
+// `parseBootManifest` 逐字段校验，缺 `batches` 直接抛
+// `boot manifest batches must be an array`（实测）。规则（读它的源码得出）：
+// ① `phase` 只能是 `bootstrap` / `application`；② 每批 `url`/`rev` 是字符串、
+// `entries` 是**非空**字符串数组；③ 每个 entry **必须**属于某一批、且**只能属于一批**。
+//
+// 这里**每个包一批**、`url` 用本仓现有的**单包**形态（`/plugins/<id>/client.js?rev=`）。
+// 为什么不用 DSH 原生的 combo（`/plugins/??a/client.js,b/client.js&rev=`）：combo 是为
+// 「一个 `<script src>` 里塞多个包」省请求数，代价是 **URL 有 3072 字节上限**（超了它自己
+// 按包边界分片，实测 65 个包被切成 58+6 两批）＋服务端要解 `??` 逗号表 + 合并 sourcemap。
+// 而校验器**只要求 `url` 是字符串**，不看它长什么样 ⇒ 单包 URL 合法，
+// 本仓因此不需要实现 combo 解析。`entry.url` 与 `batch.url` 同值：客户端优先用
+// `initialUrl`（即 batch 的），`entry.url` 是它换实现时的回落（读 `arrive()` 得出）。
+//
+// `bootstrap` 只放 `dsh-client-modules`（0.2.0 的 `PARSER_PRELOAD_IDS` 就它一个）：
+// 它必须在 shell 之前 parser-blocking 执行，其余全走 `application`。
+fn dwh_build_entries(h: &DwhHost, out: &Buf) bool {
+    buf_reset(out);
+    var r: DwhRoster = DwhRoster{ recs: buf_empty(), n: 0 };
+    defer { buf_free(&r.recs); }
+    r.recs = buf_new(24576);
+    if !dwh_scan_roster(h, &r) {
+        return false;
+    }
+    if !buf_append_cstr(out, "{\"rev\":\"min\",\"entries\":[") {
+        return false;
+    }
+    if !dwh_emit_entries(&r.recs, out) {
+        return false;
+    }
+    if !buf_append_cstr(out, "],\"batches\":[") {
+        return false;
+    }
+    if !dwh_append_batches(&r.recs, out) {
+        return false;
+    }
+    // 收尾：`]`（batches 数组）＋ `}`（对象）。0.2.0 那份是两层 ——
+    // 少写外层 `}` 的话 JSON **是坏的**而外层看不出（浏览器里报的是
+    // `batches must be an array`，指向的却是下一个字段）。
+    return buf_append_cstr(out, "]}");
+}
+
+// `entries` 数组：每包一行 `{id,url,rev}`（`url` 与下面的 batch 同值）。
+fn dwh_emit_entries(recs: &const Buf, out: &Buf) bool {
+    var off: usize = 0;
+    var first: bool = true;
+    while off < recs.len {
+        const pkg: &const byte = &recs.ptr[off];
+        const pl: usize = bufx_cstr_len(pkg);
+        const rev: &const byte = &recs.ptr[off + pl + 1];
+        const rl: usize = bufx_cstr_len(rev);
+        const inj: &const byte = &recs.ptr[off + pl + 1 + rl + 1];
+        if !first && !buf_append_byte(out, 44) {
+            return false;
+        }
+        first = false;
+        if !buf_append_cstr(out, "{\"id\":\"") {
+            return false;
+        }
+        if !buf_append(out, pkg, pl) {
+            return false;
+        }
+        if !buf_append_cstr(out, "\",\"url\":\"/plugins/") {
+            return false;
+        }
+        if !buf_append(out, pkg, pl) {
+            return false;
+        }
+        if !buf_append_cstr(out, "/client.js?rev=") {
+            return false;
+        }
+        if !buf_append_cstr(out, rev) {
+            return false;
+        }
+        if !buf_append_cstr(out, "\",\"rev\":\"") {
+            return false;
+        }
+        if !buf_append_cstr(out, rev) {
+            return false;
+        }
+        // `inject` **必须发**：客户端拿它判「这个插件声明的服务到齐了没」，
+        // 少了它每个依赖服务的插件都停在 pending（理由见 DwhRoster 的注释）。
+        if !buf_append_cstr(out, "\",\"inject\":") {
+            return false;
+        }
+        if !buf_append_cstr(out, inj) {
+            return false;
+        }
+        // 收尾只有对象自己的 `}` —— 这里曾经多写了一个 `"`（`\"}`），
+        // 于是 inject 数组被当成字符串的尾巴、整个图**坏在别处**才报出来。
+        if !buf_append_byte(out, 125) {
+            return false;
+        }
+        const il: usize = bufx_cstr_len(inj);
+        off = off + pl + 1 + rl + 1 + il + 1;
+    }
+    return true;
+}
+
+// 产出 `batches` 数组：`dsh-client-modules` 一批 `bootstrap`，其余各自一批
+// `application`（每包一批 ⇒ 单包 URL，见 `dwh_build_entries` 的说明）。
+fn dwh_append_batches(recs: &const Buf, out: &Buf) bool {
+    // `first` 是「还没写过任何一批」的标志，**按指针传**（跨两次调用累计）。
+    var first: bool = true;
+    if !dwh_one_batch(recs, out, &first, true) {
+        return false;
+    }
+    return dwh_one_batch(recs, out, &first, false);
+}
+
+// 一遍 batch：`boot` 为真只挑 `dsh-client-modules`，为假挑其余每一个包。
+fn dwh_one_batch(recs: &const Buf, out: &Buf, first: &bool, boot: bool) bool {
+    var off: usize = 0;
+    while off < recs.len {
+        const pkg: &const byte = &recs.ptr[off];
+        const pl: usize = bufx_cstr_len(pkg);
+        const rev: &const byte = &recs.ptr[off + pl + 1];
+        const rl: usize = bufx_cstr_len(rev);
+        const il: usize = bufx_cstr_len(&recs.ptr[off + pl + 1 + rl + 1]);
+        if dwh_is_boot_pkg(pkg, pl) == boot {
+            if !dwh_put_batch(out, first, pkg, pl, rev, boot) {
+                return false;
+            }
+        }
+        off = off + pl + 1 + rl + 1 + il + 1;
+    }
+    return true;
+}
+
+// 该包是不是 bootstrap 包（0.2.0 的 `PARSER_PRELOAD_IDS` 只有它一个）。
+// 明确**不**进图的包：DSH 自己的 roster 里没有它们（它们由 host 侧的
+// `dsh-host-directory-picker-auto` 在运行期按平台动态启用，静态名单里看不到）。
+// 扫目录会把它们扫进来，而它们进图后**激活失败**（`failed`）⇒ 整页 boot 报
+// `1 entry did not activate`、`data-slot` 一个都不挂。所以这里显式排除。
+fn dwh_is_excluded(pkg: &const byte, pl: usize) bool {
+    return dwh_eq(pkg, pl, "@deepseek-ai/dsh-client-ui-directory-picker-browse" as &const byte)
+        || dwh_eq(pkg, pl, "@deepseek-ai/dsh-client-ui-directory-picker-native" as &const byte);
+}
+
+// 包名相等（长度与字节都比）。
+fn dwh_eq(pkg: &const byte, pl: usize, want: &const byte) bool {
+    return bufx_eq_cstr(pkg, pl, want);
+}
+
+fn dwh_is_boot_pkg(pkg: &const byte, pl: usize) bool {
+    const want: &const byte = "@deepseek-ai/dsh-client-modules" as &const byte;
+    return bufx_eq_cstr(pkg, pl, want);
+}
+
+// 写一批。`first` 是「见过了吗」的标记（跨调用累计，所以走 `&Buf` 传地址）。
+fn dwh_put_batch(out: &Buf, first: &bool, pkg: &const byte, pl: usize,
+                 rev: &const byte, boot: bool) bool {
+    if !(*first) {
+        if !buf_append_byte(out, 44) {
+            return false;
+        }
+    }
+    if !buf_append_cstr(out, "{\"phase\":\"") {
+        return false;
+    }
+    if boot {
+        if !buf_append_cstr(out, "bootstrap") {
+            return false;
+        }
+    } else {
+        if !buf_append_cstr(out, "application") {
+            return false;
+        }
+    }
+    if !buf_append_cstr(out, "\",\"url\":\"/plugins/") {
         return false;
     }
     if !buf_append(out, pkg, pl) {
@@ -348,10 +657,74 @@ fn dwh_one_preload(h: &const DwhHost, pkg: &const byte, out: &Buf) bool {
     if !buf_append_cstr(out, "/client.js?rev=") {
         return false;
     }
-    if !buf_append(out, rev.ptr as &const byte, rev.len) {
+    if !buf_append_cstr(out, rev) {
         return false;
     }
-    return buf_append_cstr(out, "\"></script>");
+    if !buf_append_cstr(out, "\",\"rev\":\"") {
+        return false;
+    }
+    if !buf_append_cstr(out, rev) {
+        return false;
+    }
+    if !buf_append_cstr(out, "\",\"entries\":[\"") {
+        return false;
+    }
+    if !buf_append(out, pkg, pl) {
+        return false;
+    }
+    if !buf_append_cstr(out, "\"]}") {
+        return false;
+    }
+    *first = false;
+    return true;
+}
+
+// 装出 **bootstrap** 包的 `<script src="…">` 片段（parser-blocking）。
+//
+// **0.2.0 的 preload 只有一个**：`dsh-client-modules`。0.1.1 是两个（它还带
+// `dsh-client-runtime`），而那个包在 0.2.0 里**已经不存在**了 —— 照旧发两个的话，
+// 第二个会 404 而**不会**报错（`<script src>` 404 是静默的），正好把「升级之后起不来」
+// 伪装成别的问题。所以这里不再写死包名表，而是**按 `dwh_is_boot_pkg` 判定**，
+// 与 `batches` 里挑 bootstrap 那批用的是同一个判据（两处必须一致，见 `dwh_one_batch`）。
+//
+// 顺序即语义：这一段必须是 `script-src`（不是 `preload`），它要在 shell 之前执行。
+fn dwh_build_preloads(h: &const DwhHost, out: &Buf) bool {
+    buf_reset(out);
+    var r: DwhRoster = DwhRoster{ recs: buf_empty(), n: 0 };
+    defer { buf_free(&r.recs); }
+    r.recs = buf_new(24576);
+    if !dwh_scan_roster(h, &r) {
+        return false;
+    }
+    var off: usize = 0;
+    while off < r.recs.len {
+        const pkg: &const byte = &r.recs.ptr[off];
+        const pl: usize = bufx_cstr_len(pkg);
+        // `rl` 要在 if 之外也可见（下面的三段步进用它）—— 作用域别缩在分支里
+        const rl: usize = bufx_cstr_len(&r.recs.ptr[off + pl + 1]);
+        if dwh_is_boot_pkg(pkg, pl) {
+            const rev: &const byte = &r.recs.ptr[off + pl + 1];
+            if !buf_append_cstr(out, "<script src=\"/plugins/") {
+                return false;
+            }
+            if !buf_append(out, pkg, pl) {
+                return false;
+            }
+            if !buf_append_cstr(out, "/client.js?rev=") {
+                return false;
+            }
+            if !buf_append_cstr(out, rev) {
+                return false;
+            }
+            if !buf_append_cstr(out, "\"></script>") {
+                return false;
+            }
+        }
+        // 统一按三段步进（名字 / rev / inject 各跟一个 `\0`）
+        const il: usize = bufx_cstr_len(&r.recs.ptr[off + pl + 1 + rl + 1]);
+        off = off + pl + 1 + rl + 1 + il + 1;
+    }
+    return true;
 }
 
 // ============================================================
@@ -361,17 +734,13 @@ fn dwh_one_preload(h: &const DwhHost, pkg: &const byte, out: &Buf) bool {
 // 把注入片段插在 `<head>` 开标签之后（与 DSH 的 `renderIndexInjections` 同口径）。
 fn dwh_render_index(h: &const DwhHost, html: &const Buf, out: &Buf) bool {
     buf_reset(out);
-    var preloads: Buf = buf_new(2048);
-    defer { buf_free(&preloads); }
-    if !dwh_build_preloads(h, &preloads) {
-        return false;
-    }
+    const preloads: &const Buf = &h.preloads;
     const entries: &const Buf = &h.entries;
     const at: isize = srv_find(html.ptr as &const byte, 0, html.len,
         "<head>" as &const byte, 6);
     if at < 0 {
         // 没有 `<head>`：把注入放最前面（HTML 仍能解析，只是少一层保险）
-        if !dwh_boot_into(entries, &preloads, out) {
+        if !dwh_boot_into(entries, preloads, out) {
             return false;
         }
         return buf_append(out, html.ptr as &const byte, html.len);
@@ -380,18 +749,18 @@ fn dwh_render_index(h: &const DwhHost, html: &const Buf, out: &Buf) bool {
     if !buf_append(out, &html.ptr[0], cut) {
         return false;
     }
-    if !dwh_boot_into(entries, &preloads, out) {
+    if !dwh_boot_into(entries, preloads, out) {
         return false;
     }
     return buf_append(out, &html.ptr[cut], html.len - cut);
 }
 
-// 三样东西，按执行顺序：内联 queue 脚本 → 两个 parser-blocking preload → `__DSH_BOOT__`。
+// 三样东西，按执行顺序：内联 queue 脚本 → bootstrap script → `__DSH_BOOT__`。
 fn dwh_boot_into(entries: &const Buf, preloads: &const Buf, out: &Buf) bool {
     if !buf_append_cstr(out, "<script>(()=>{const pendingQueue=[];window.__ModuleLoader__={mode:\"queue\",pendingQueue,load(r){pendingQueue.push(r)},create(o){if(this.mode!==\"queue\")throw new Error(\"client-modules: create after boot\");const i=pendingQueue.findIndex(r=>r.id===\"@deepseek-ai/dsh-client-modules\");const reg=pendingQueue[i];if(reg===undefined)throw new Error(\"client-modules: HTML did not preload modules\");pendingQueue.splice(i,1);const x=reg.factory(s=>{throw new Error(\"client-modules: modules requested external \"+s)});return x.createClientModuleSystem(this,{id:reg.id,exports:x},o)}}})()</script>") {
         return false;
     }
-    // 两个 preload（顺序即语义：parser-blocking，必须在 shell 之前执行）
+    // bootstrap script（顺序即语义：parser-blocking，必须在 shell 之前执行）
     if !buf_append(out, preloads.ptr as &const byte, preloads.len) {
         return false;
     }
@@ -410,12 +779,16 @@ fn dwh_boot_into(entries: &const Buf, preloads: &const Buf, out: &Buf) bool {
 // ============================================================
 
 // 把一次 unary 调用包成 DSH 的 `ServerResponse`（业务错走 ok:false）。
-fn dwh_rpc_ok(rpc: &const byte, value: &const Buf, out: &Buf) bool {
+fn dwh_rpc_ok(rpc: &const byte, rl: usize, value: &const Buf, out: &Buf) bool {
     buf_reset(out);
     if !buf_append_cstr(out, "{\"type\":\"server-response\",\"rpcId\":") {
         return false;
     }
-    if !buf_append_cstr(out, rpc) {
+    // ⚠ `rpcId` 是**带长度**的（调用方给的是 `rpc.ptr`，那个 Buf 没有 NUL）：
+    // 用 `buf_append_cstr` 会一路读到相邻内存 —— 实测症状是长 uuid 的响应体里
+    // 混进几个垃圾字节（`pu@,`），于是客户端 `JSON.parse` 报
+    // `Expected ',' or '}' … at position 72`，而它说的是**我拼坏的那段**。
+    if !buf_append(out, rpc, rl) {
         return false;
     }
     if !buf_append_cstr(out, ",\"result\":{\"ok\":true,\"value\":") {
@@ -428,13 +801,14 @@ fn dwh_rpc_ok(rpc: &const byte, value: &const Buf, out: &Buf) bool {
 }
 
 // 业务错：**200 + ok:false**（HTTP 状态只表示载体）。
-fn dwh_rpc_err(rpc: &const byte, code: &const byte, msg: &const byte,
+fn dwh_rpc_err(rpc: &const byte, rl: usize, code: &const byte, msg: &const byte,
     mn: usize, out: &Buf) bool {
     buf_reset(out);
     if !buf_append_cstr(out, "{\"type\":\"server-response\",\"rpcId\":") {
         return false;
     }
-    if !buf_append_cstr(out, rpc) {
+    // 同 `dwh_rpc_ok`：`rpcId` 按长度写，别当 C 串
+    if !buf_append(out, rpc, rl) {
         return false;
     }
         // 行宽豁免：不可断的 JSON 字面量
@@ -456,12 +830,48 @@ fn dwh_rpc_err(rpc: &const byte, code: &const byte, msg: &const byte,
     return buf_append_cstr(out, ",\"details\":{}}}}");
 }
 
+// `a/b` → `a.b`（0.2.0 的斜杠名字规范成本宿主内部的点号名字）。
+// 只换**第一个** `/`：`dynamicCordisRunner/inventory` 这类名字里也只有一段斜杠。
+fn dwh_slash_to_dot(method: &const byte, ml: usize, out: &Buf) bool {
+    buf_reset(out);
+    var i: usize = 0;
+    var done: bool = false;
+    while i < ml {
+        const c: byte = method[i];
+        if c == 47 as byte && !done {
+            if !buf_append_byte(out, 46) {
+                return false;
+            }
+            done = true;
+        } else {
+            if !buf_append_byte(out, c) {
+                return false;
+            }
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
 // 一次 unary：按方法名产出 value（写进 `value` 的 JSON 文本）。
 // 返回 false = 这个方法没实现（调用方回 `internal` 业务错）。
 fn dwh_unary(h: &const DwhHost, method: &const byte, ml: usize,
     value: &Buf) bool {
     buf_reset(value);
-    if bufx_eq_cstr(method, ml, "host.describe" as &const byte) {
+    // 0.2.0 的方法名是**斜杠**形状（`session/list`、`session/modelCatalog`），
+    // 而本宿主的实现是按 0.1.1 的**点号**名字写的（`session.list`）。这里把斜杠
+    // 换成点号做一次规范化，下面所有分支照旧 —— 两代名字于是都认。
+    //
+    // 为什么不是「加一遍别名分支」：那要在每个分支上抄第二遍名字，两边日后必然漂
+    // （而这正是 0.2.0 升级踩到的形态：名字变了、分支没变，症状是**静默不响应**）。
+    var norm: Buf = buf_new(ml + 1);
+    defer { buf_free(&norm); }
+    if !dwh_slash_to_dot(method, ml, &norm) {
+        return false;
+    }
+    const mn: &const byte = norm.ptr as &const byte;
+    const mnl: usize = norm.len;
+    if bufx_eq_cstr(mn, mnl, "host.describe" as &const byte) {
         // 行宽豁免：不可断的 JSON 字面量
         // cwd/home 用**真值**：DSH 拿它们做目录选择与显示缩写，而 `/` 不是一个
         // 像样的工作区（实测：python 探针用 getcwd() 能跑通，这里给 `/` 时
@@ -482,7 +892,7 @@ fn dwh_unary(h: &const DwhHost, method: &const byte, ml: usize,
         return buf_append_cstr(value, ",\"canOpenPath\":false}");
     }
     // ⚠ `session.create` 不能少（实测：少了它页面只剩 hero 空态、代码零报错）。
-    if bufx_eq_cstr(method, ml, "session.create" as &const byte) {
+    if bufx_eq_cstr(mn, mnl, "session.create" as &const byte) {
         if !buf_append_cstr(value, "{\"sessionId\":\"") {
             return false;
         }
@@ -491,11 +901,11 @@ fn dwh_unary(h: &const DwhHost, method: &const byte, ml: usize,
         }
         return buf_append_cstr(value, "\",\"agentPreset\":\"standard\"}");
     }
-    if dwh_unary_session(h, method, ml, value) {
+    if dwh_unary_session(h, mn, mnl, value) {
         return true;
     }
     // 会话/工作区那一簇之外的、host 自身的元信息
-    if bufx_eq_cstr(method, ml, "session.models" as &const byte) {
+    if bufx_eq_cstr(mn, mnl, "session.models" as &const byte) {
         return buf_append_cstr(value, "{\"current\":{\"provider\":\"uya-agent\",\"model\":\"uya-agent\"},\"routable\":true,\"groups\":[],\"failures\":[]}");
     }
     return false;
@@ -549,7 +959,14 @@ fn dwh_unary_session(h: &const DwhHost, method: &const byte, ml: usize,
         return buf_append_cstr(value, "{\"items\":[]}");
     }
     if bufx_eq_cstr(method, ml, "settings.describe" as &const byte) {
-        return buf_append_cstr(value, "{\"values\":{},\"schema\":{}}");
+        // 形状是**从真 DSH 0.2.0 抄的**（0.1.1 那份 `{values,schema}` 在 0.2.0 下
+        // 会让设置面板整片塌掉：客户端 `mirrored.view.namespaces.find(…)` 撞
+        // `undefined` ⇒ `Cannot read properties of undefined (reading 'find')`，
+        // 而它表现为「Failed to load plugins」+ 4 个设置插件列名，看不出是设置的事）。
+        // 本仓没有可写的设置文档 ⇒ `namespaces` 是**空数组**（不是 `{}`：
+        // 客户端对它 `.find()`，形状必须是数组）、`hasDocument` 如实给 false。
+        return buf_append_cstr(value,
+            "{\"writable\":false,\"hasDocument\":false,\"namespaces\":[]}");
     }
     if bufx_eq_cstr(method, ml, "session.models" as &const byte) {
         // 行宽豁免：不可断的 JSON 字面量
@@ -943,6 +1360,7 @@ export fn dwh_start(h: &DwhHost, addr: &const byte, an: usize,
     h.dist = buf_empty();
     h.root = buf_empty();
     h.entries = buf_empty();
+    h.preloads = buf_empty();
     h.events = buf_empty();
     h.n = 0;
     var i: usize = 0;
@@ -967,6 +1385,14 @@ export fn dwh_start(h: &DwhHost, addr: &const byte, an: usize,
     }
     h.entries = buf_new(65536);
     if !dwh_build_entries(h, &h.entries) {
+        return false;
+    }
+    // bootstrap script 片段**在这里算一次**（渲染 index 时直接用）。
+    // 为什么不放在渲染里重算：算它要**重扫 roster 并把 71 个 bundle 全读一遍**
+    // （0.2.0 实测约 11 MiB）；而每个页面的 index 请求都会走那条路 ——
+    // 单线程宿主里那是白白阻塞下行。契约不变（同一次运行内 bundle 不会变）。
+    h.preloads = buf_new(1024);
+    if !dwh_build_preloads(h, &h.preloads) {
         return false;
     }
     // 事件源：一份翻好的译文（`web/wsess.uya` 的输出）。读不到就空着
@@ -1085,6 +1511,9 @@ export fn dwh_stop(h: &DwhHost) void {
     if buf_valid(&h.entries) {
         buf_free(&h.entries);
     }
+    if buf_valid(&h.preloads) {
+        buf_free(&h.preloads);
+    }
     if buf_valid(&h.events) {
         buf_free(&h.events);
     }
@@ -1153,6 +1582,7 @@ fn dwh_host_zero() DwhHost {
         dist: buf_empty(),
         root: buf_empty(),
         entries: buf_empty(),
+        preloads: buf_empty(),
         events: buf_empty(),
         conns: [dwh_conn_zero(): DWH_MAX_CONNS],
         n: 0,
@@ -1916,9 +2346,14 @@ fn dwh_send_api(h: &DwhHost, ci: usize, m: u8, path: &const Buf,
     const pml: usize = path.len - 5;
     var resp: Buf = buf_new(65536);
     defer { buf_free(&resp); }
-    if !bufx_eq_cstr(path_method, pml, method.ptr as &const byte) {
-        if !dwh_rpc_err(rpc.ptr as &const byte, "bad-request" as &const byte,
-            "method does not match path" as &const byte, 25, &resp) {
+    // ⚠ 两边都是**带长度**的字节，不能拿 `bufx_eq_cstr` 比：它的第三个参数是
+    // 「NUL 结尾的字面量」，而 `method` 是个 Buf（没有 NUL）—— 那样它会一路读到
+    // 缓冲区后面的字节算长度，长度对不上就恒判「不匹配」（实测症状：所有 `/api`
+    // 调用都回 `bad-request`，而页面只是「某些面板读不出来」）。
+    if pml != method.len || !bufx_mem_eq(path_method, method.ptr as &const byte, pml) {
+        if !dwh_rpc_err(rpc.ptr as &const byte, rpc.len,
+            "bad-request" as &const byte,
+            "method does not match path" as &const byte, 26, &resp) {
             h.conns[ci].st = DWH_C_DONE;
             return;
         }
@@ -1926,7 +2361,7 @@ fn dwh_send_api(h: &DwhHost, ci: usize, m: u8, path: &const Buf,
         var value: Buf = buf_new(65536);
         defer { buf_free(&value); }
         if dwh_unary(h, method.ptr as &const byte, method.len, &value) {
-            if !dwh_rpc_ok(rpc.ptr as &const byte, &value, &resp) {
+            if !dwh_rpc_ok(rpc.ptr as &const byte, rpc.len, &value, &resp) {
                 h.conns[ci].st = DWH_C_DONE;
                 return;
             }
@@ -1936,7 +2371,8 @@ fn dwh_send_api(h: &DwhHost, ci: usize, m: u8, path: &const Buf,
             defer { buf_free(&msg); }
             _ = buf_append_cstr(&msg, "not implemented: ");
             _ = buf_append(&msg, method.ptr as &const byte, method.len);
-            if !dwh_rpc_err(rpc.ptr as &const byte, "internal" as &const byte,
+            if !dwh_rpc_err(rpc.ptr as &const byte, rpc.len,
+                "internal" as &const byte,
                 msg.ptr as &const byte, msg.len, &resp) {
                 h.conns[ci].st = DWH_C_DONE;
                 return;
