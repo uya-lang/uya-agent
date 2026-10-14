@@ -26,6 +26,7 @@ import json
 import os
 import re
 import socket
+import subprocess
 import sys
 import threading
 
@@ -183,6 +184,34 @@ def render_index(html, head_markup):
 
 
 # ---- 离线会话数据：信封用本仓适配层的译文，外圈补 DSH 的 RPC 信封 ----
+
+def adapt_real_log(log_path, out_path):
+    """用**二进制的适配层**翻一份真日志（`UYA_SELFTEST_WIRE_FILE`），写到 out_path。
+
+    为什么不在这里用 Python 抄一遍翻译：那等于把「适配」实现两份，而两份一定会分叉
+    —— 要验的恰恰是**产品里那份**（`web/wsess.uya`）翻出来的东西 DSH 认不认。
+
+    Returns:
+        (ok, 行数)。ok=False = 二进制没跑成 / 没输出。
+    """
+    binary = os.path.join(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))), "build", "uya-agent")
+    if not os.path.exists(binary):
+        return False, 0
+    env = dict(os.environ, UYA_SELFTEST_WIRE_FILE=log_path)
+    try:
+        r = subprocess.run([binary, "--selftest"], capture_output=True,
+                           env=env, timeout=120)
+    except (OSError, subprocess.TimeoutExpired):
+        return False, 0
+    text = (r.stderr or b"").decode("utf-8", "replace")
+    lines = [l for l in text.split("\n") if l.startswith("{")]
+    if not lines:
+        return False, 0
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+    return True, len(lines)
+
 
 def load_dump(path):
     """读 `--wire-dump` 的译文行（每行一条 DSH SessionEvent）。
@@ -526,7 +555,7 @@ def handle(conn, host):
     conn.close()
 
 
-def selftest_drive():
+def selftest_drive(real_log=""):
     """一条命令自证：起宿主 + 起 headless chromium + 用 CDP 驱动到「消息渲染出来」。
 
     这是**可证伪**的那一步：它回答「DSH 的 webui（一个字节都不改）能不能当本仓的前端」。
@@ -550,7 +579,33 @@ def selftest_drive():
         print("wire-probe: 跳过 —— 本机没装 DSH。")
         return 0
 
-    events = synth_events([])
+    # 有真日志就用真日志（`--real-log`）：那才是「本仓的会话」而不是合成样本。
+    # 断言文本随之换成真日志里必然出现的两条（夹具里的 `PROBE-ASSISTANT-OK` 换掉）。
+    needle = PROBE_NEEDLE
+    if real_log:
+        outp = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "..", "build", "wire_probe_real.jsonl")
+        ok, n = adapt_real_log(real_log, outp)
+        if not ok:
+            print("wire-probe: 失败 —— 适配层没翻出任何事件。")
+            return 1
+        events = load_dump(outp)
+        print("wire-probe: 真日志翻了 %d 条事件" % n)
+        # 从译文里挑一条**用户消息**的正文当断言（它只可能来自那份日志）
+        needle = ""
+        for e in events:
+            if e.get("type") == "user/message":
+                for b in e["data"].get("content", []):
+                    if b.get("type") == "text" and b.get("text"):
+                        needle = b["text"]
+                        break
+            if needle:
+                break
+        if not needle:
+            print("wire-probe: 失败 —— 那份日志里没有可断言的用户消息。")
+            return 1
+    else:
+        events = synth_events([])
     host = Host(root, events, "")
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -595,7 +650,7 @@ def selftest_drive():
         drive = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                              "wire_probe_drive.mjs")
         env = dict(os.environ, WIRE_PROBE_URL="http://127.0.0.1:%d/" % port)
-        r = subprocess.run(["node", drive, ws_url, PROBE_TITLE, PROBE_NEEDLE],
+        r = subprocess.run(["node", drive, ws_url, PROBE_TITLE, needle],
                            capture_output=True, env=env, timeout=180)
         out = (r.stdout or b"").decode("utf-8", "replace")
         err = (r.stderr or b"").decode("utf-8", "replace")
@@ -627,6 +682,10 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=8799)
     ap.add_argument("--dump", default="")
+    ap.add_argument("--real-log", default="",
+                    help="一份真的本仓 session.jsonl（用产品适配层翻它）")
+    ap.add_argument("--dump-out", default="",
+                    help="把翻好的译文写到这个文件（默认临时文件）")
     ap.add_argument("--once", action="store_true",
                     help="自检一次就退出（不长期驻留）")
     ap.add_argument("--selftest-drive", action="store_true",
@@ -634,13 +693,27 @@ def main():
     args = ap.parse_args()
 
     if args.selftest_drive:
-        return selftest_drive()
+        return selftest_drive(args.real_log)
 
     root = find_dsh()
     if root is None:
         print("wire-probe: 跳过 —— 本机没装 DSH（找不到 dsh-web-frontend/dist）。")
         return 0
-    events = synth_events(load_dump(args.dump))
+    if args.real_log:
+        outp = args.dump_out or os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "..", "build",
+            "wire_probe_real.jsonl")
+        ok, n = adapt_real_log(args.real_log, outp)
+        if not ok:
+            print("wire-probe: 失败 —— 适配层没翻出任何事件（%s）" % args.real_log)
+            return 1
+        print("wire-probe: 真日志翻了 %d 条事件（%s）" % (n, outp))
+        events = load_dump(outp)
+        if not events:
+            print("wire-probe: 失败 —— 译文读不回来。")
+            return 1
+    else:
+        events = synth_events(load_dump(args.dump))
     host = Host(root, events, args.dump)
     if not host.entries:
         print("wire-probe: 失败 —— 最小 roster 一个 client bundle 都没找到。")

@@ -136,7 +136,7 @@ export UYA_ROOT
 export UYA_SPLIT_C_DIR := $(CURDIR)/build/uyacache
 
 # 行宽豁免：一条 .PHONY 就是一张全仓目标清单，拆行反而看不清哪条丢了
-.PHONY: all check wire-schema wire-probe print-src print-cflags build link-audit selftest codegen-audit doc-audit lint-size lint-size-all doc-cover ui-audit probe e2e e2e-config e2e-exec e2e-accept-nudge e2e-retry e2e-config-flags e2e-title e2e-title-cmd e2e-title-auto e2e-mouse e2e-api e2e-steps e2e-permission e2e-sandbox e2e-tasks e2e-goal e2e-memory e2e-memory-live e2e-sessions e2e-resume-big e2e-diff e2e-ws e2e-model e2e-model-save e2e-model-route e2e-ctxwindow e2e-inputimage e2e-worktree e2e-watch e2e-watch-pick e2e-dsh e2e-portable e2e-dns p30-check tui-demo tui-selftest web-selftest sess-selftest diff-selftest model-selftest panel-selftest clean shell-selftest pm-selftest mcp-selftest
+.PHONY: all check wire-schema wire-probe wire-probe-real print-src print-cflags build link-audit selftest codegen-audit doc-audit lint-size lint-size-all doc-cover ui-audit probe e2e e2e-config e2e-exec e2e-accept-nudge e2e-retry e2e-config-flags e2e-title e2e-title-cmd e2e-title-auto e2e-mouse e2e-api e2e-steps e2e-permission e2e-sandbox e2e-tasks e2e-goal e2e-memory e2e-memory-live e2e-sessions e2e-resume-big e2e-diff e2e-ws e2e-model e2e-model-save e2e-model-route e2e-ctxwindow e2e-inputimage e2e-worktree e2e-watch e2e-watch-pick e2e-dsh e2e-portable e2e-dns p30-check tui-demo tui-selftest web-selftest sess-selftest diff-selftest model-selftest panel-selftest clean shell-selftest pm-selftest mcp-selftest
 
 all: build
 
@@ -235,6 +235,19 @@ wire-schema: build
 # 本机没装 DSH 或没有 chromium 时**跳过**（不是失败）—— 它在别的机器上也该能跑。
 wire-probe:
 	@python3 testdata/wire_probe_host.py --selftest-drive
+
+# P80：**真日志**那一腿 —— 用产品适配层（web/wsess.uya）翻一份真的本仓 session.jsonl，
+# 再走同一个探针。它与上一条的分工：上一条验「形状与最小面能起来」，这一条验
+# 「**一整份真会话**能从头翻到尾并渲染出来」（含本仓那些 DSH 不认识的私有事件）。
+# LOG 不给时自动挑 build/ 下第一份真有内容的 session.jsonl。
+wire-probe-real:
+	@log="$(LOG)"; \
+	if [ -z "$$log" ]; then \
+		log=$$(find build -name session.jsonl -size +500c 2>/dev/null | head -1); \
+	fi; \
+	if [ -z "$$log" ]; then echo "wire-probe-real: 跳过 —— 找不到真会话日志（先跑 make selftest 生成一份）"; exit 0; fi; \
+	echo "wire-probe-real: 用 $$log"; \
+	python3 testdata/wire_probe_host.py --selftest-drive --real-log "$$log"
 
 # 文档审计：仓库里不许留 Git 冲突标记（`<<<<<<<` / `=======` / `>>>>>>>`）。
 # 来历见 §16 踩坑 94：一条合并残留的 `=======` 从 P53 那次合并（3e62301）
