@@ -3139,7 +3139,7 @@ parser-blocking preload + `window.__DSH_BOOT__`）；按最小 roster 服务
 | 6 | `dynamicCordisRunner/{inventory,syncInspectManifest}`、`session/modelCatalog` | 控制台零告警 | **已做**（第十二批） |
 | 7 | 资源定位链 + `--dsh-assets` | DSH 树零写入 | **已做**（第十九批） |
 | 8 | `--dsh-assets-install` 取件（`src/web/dshget.uya`） | 装出来的那份能渲染 | **已做**（第二十批） |
-| 9 | token/cookie 鉴权（可选，取决于是否要对外） | 不带 token 401、带 token 可用 | 待做 |
+| 9 | 访问令牌（`src/web/dshauth.uya`） | 不带令牌 401 / 带令牌 303+cookie / 带 cookie 200 | **已做**（第二十一批） |
 
 ##### 七、第十批实测：`/api/remote.mux` 的精确契约
 
@@ -3306,6 +3306,38 @@ fork/exec/收集输出（与 `gitx_run` 同形，但可执行文件由调用方�
   `error: 取件失败（npm 取件：网络 / 权限 / 包名）→ DIR` + 原样 `E502 …`
   + 「换源用 `--dsh-assets-repo`，换落点用 `--dsh-assets-dir`」
 - **缺工具**：PATH 里没有 npm ⇒ 「装一个 Node.js 再来」
+
+##### 八之五、第二十一批：访问令牌（工作项⑨）—— 九个工作项全做完
+
+新增 `src/web/dshauth.uya`，闸门接在 `dwh_do_http` 的**一切服务之前**
+（未通过时连 index 与静态资源都不给，与真 DSH 同口径）。
+
+**默认不启用**：绑回环不校验（本机看页面是最常见的用法，要令牌只会碍事）；
+显式 `--dsh-token T` 才校验。**绑非回环而没给令牌时自动生成并打出来** ——
+把服务暴露到局域网却毫无门槛是明确的安全缺陷，而「打出来」让正常用法
+（把 URL 发给同事）仍然一步到位。
+
+行为逐条对齐真 DSH（实测）：
+
+| 请求 | 响应 |
+|---|---|
+| 无令牌 / 错令牌 | **401** |
+| 对令牌（URL） | **303** + `Location: ./` + `Cache-Control: no-store` + `Set-Cookie: dsh-auth-<tok>=1; Path=/; Max-Age=2592000; HttpOnly; SameSite=Strict` |
+| 对令牌（Cookie）/ 多 cookie 里含对的 | **200** |
+
+两条取舍：**比较是定长常数时间**（逐字节 XOR 累加 —— 令牌不该因为「第几位不匹配」
+泄露前缀；本地服务里不算高危，但这条比提前返回还便宜）；**令牌只从两处来**
+（URL 查询串 / Cookie），不从 `Referer`、不从自定义头。
+
+**三个坑**：
+
+| # | 坑 | 症状 |
+|---|---|---|
+| 1 | `srv_url_split` 的 `q_off` 是**相对 url 起点**的偏移，我当绝对下标用 | 读的是路径那段字节 ⇒「带对令牌也被判 401」 |
+| 2 | Cookie 是 `name=value`，我要求「整段等于 `dsh-auth-<tok>`」 | 恒不匹配；改成「以它开头且紧跟 `=`」—— 那个 `=` 不能省（否则 `…<tok>EXTRA` 也放行） |
+| 3 | `SRV_ST_401`/`SRV_ST_303` 原本不存在；`dwh_auth_gate` 要改 `conns[ci].st` | 编译错两处；补状态常量 + 形参改可变引用 |
+
+实测（真浏览器）：带令牌进页面 → 303 → cookie → **会话消息完整渲染**。
 
 ##### 九、历史记录：`connection lost` 的排查（第十一批已解）
 
