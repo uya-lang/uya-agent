@@ -1749,6 +1749,19 @@ ralph → `<watch_base>-rN`，N 由管道里已收到的 `[round N]` 行推出
 **控制词只有独占整行时才不区分大小写**，其余非空后缀都是**字面目标**
 （例：`/goal pause after verification` 创建的就是那个字面目标）。
 
+**人看的正文里，Objective / Blocker 压成一行**（`goal_render_user`）：这两个字段是**外来
+文本**（`create_goal` 能塞多行、塞 ESC），而这段正文要么进 TUI 浮层、要么打进转录里的一行
+—— 行内的 `'\n'` 会把方框拆坏、让后几行从第 0 列开始（踩坑 81 那一族）。折行直接复用
+`tasks_flat_into`（`term/tasks.uya`：`tui_clean_into` + 换行/回车折成空格），与常驻块、
+`/tasks` 报告**同源**，不在这里另写一套。键名 `Status:` / `Rounds:` / `Activation:` /
+`Commands:` 一个字节都不动（逐字对齐 DSH 的 commands/command-goal）。
+
+**写盘的转义与读盘的反转义必须对称**（`goal_set_unescaped`）：`goal_save` 用 `jw_str_into`
+写盘，它把 `"` `\` 与全部控制字节转义；而 `js_obj_get_str` 给的是**零拷贝原始视图**
+（转义序列没被解码）。不带反转义就把它当正文用，用户看到的是字面量 `\n`（两个字符）而不是
+换行 —— 实测 `/goal A\B` 存盘再读回会变成 `A\\B`，每存读一次多一层反斜杠。这与 `jsonx.uya`
+里 `jw_str_into` 那句「改一边就得改另一边」是同一条纪律。
+
 **与主循环的交互点**：派发 create/get/update 后立刻 `tasks_goal_reload`；启动/TUI 建历史时也
 reload；**换会话（`/new`、`/resume`）也 reload**（P87：目标跟着会话走，那份投影必须跟着换，
 否则屏幕上还挂着上一条会话的目标）—— 两个落点各自在 `tasks_panel_sync` **之前**重读一次
@@ -1862,6 +1875,18 @@ log / result；没调 `wf_done` 时给 `(the script finished without calling wf_
 | 不给 job/deleg 加结束时间戳 | 要改状态机；所以**已结束项不显示时长** |
 
 **状态字形两套值空间别混**：todo 用 `TD_*`、job 用 `JOB_*`、deleg 用 `DELEG_*`（`view_status_glyph` 只认这一套）。
+
+**折叠行的目标段带单位与正文**（用户报的：`目标 3/20` 里那个 `20` 是什么、目标正文在哪）：
+形状是 `目标 3/20轮 · <目标正文>`（非 active 时是 `目标 阻塞 · <正文>`）。
+`轮` 是单位 —— 分母是**轮次上限**（`/goal` 建的一律 20），分子是已自动续跑的轮数；正文走
+`tasks_flat_into` 压成**一行**（与箱体、`/tasks` 报告同一份口径）。展开箱体那行同一形状
+（`▸ active · 3/20轮 · <正文>`，`round` 这个词去掉：单位已经写在数字后面）。
+
+**目标段放不下时只裁正文，头不许丢**（`tasks_seg_clip_into`）：折叠行的老规矩是「超宽就从
+尾部丢整段」，而目标段是**最后一段、也是唯一带正文的一段** —— 照老规矩加长之后，窄终端上
+连 `目标 3/20轮` 都一起消失，而那两个数正是这一行唯一的进度。所以目标段走一条新路：
+头保住，正文按显示列裁短补 `…`（头 + 1 列都放不下才认输、退回「丢整段」）。
+其余三段（任务 / 后台 / 子代理）的行为**一个字节不改**。
 
 **展开态的消费者有两个，而且必须共用一份实现**（踩坑 114）：`TUI_REQ_TASKS` 由**空闲主循环**
 与**泵点**（`agent_pump_block`）各自消费一次 —— 用户跑着 bash / 流式时按 ctrl+t，等主循环
@@ -6362,9 +6387,9 @@ DEEPSEEK_API_KEY=sk-xxx ./build/uya-agent \
 | `preset-knobs-dshsess` | 假 preset 旋钮与 persona 标量；假 DSH 会话扫描/导入角色序列 |
 | `workflow` | 五钩子协议 + 真 `uya run` 编译 `.ush` 脚本 |
 | `subagent-goal` | 9 调用：goal 三工具、`subagent`/`subagent_output(wait)`、`ralph(maxRounds=2)` |
-| `tasks-render` | 进度条/百分比/体量、空态零字节、箱体 11 行逐行等宽 |
+| `tasks-render` | 进度条/百分比/体量、空态零字节、箱体 11 行逐行等宽；**§19.12**：折叠行的目标段带 `轮` 单位与正文、正文带换行压成一行、放不下时**只裁正文不丢头**（26..78 逐档扫描 + 两条前缀等值） |
 | `tasks-scroll` | `--no-tui`：折叠行与 agents 箱体进面板；展开后每行 98 列 |
-| `tui-tasks` | 常驻任务块层序、`ctrl+t` 只置 `TUI_REQ_TASKS`、矮/窄退化；P29 `/goal` 浮层；**E 段（踩坑 114）**：泵点消费 ctrl+t（运行中当场翻转 + 请求被消费 + 泵点只认 TASKS，tab 的请求原样留给主循环）、空态屏照样画块并按得动、四表全空时落 notice |
+| `tui-tasks` | 常驻任务块层序、`ctrl+t` 只置 `TUI_REQ_TASKS`、矮/窄退化；折叠行的 `目标 N/M轮` 与目标正文真在屏幕上（§19.12）；P29 `/goal` 浮层；**E 段（踩坑 114）**：泵点消费 ctrl+t（运行中当场翻转 + 请求被消费 + 泵点只认 TASKS，tab 的请求原样留给主循环）、空态屏照样画块并按得动、四表全空时落 notice |
 | `skills-web-search` | 目录型技能注入 + `skill` 工具；Anthropic 形状 `web_search` 鉴权与去重 |
 | `compact-prune` | 20000 字符输出 → 剪枝标记、完整中段消失 |
 | `compact-auto` | 窗口 200 触发：摘要请求 → `automatically generated checkpoint` |
@@ -6395,7 +6420,7 @@ DEEPSEEK_API_KEY=sk-xxx ./build/uya-agent \
 | `responses-compact` | mock mode 22：摘要与压缩后请求都走 `/v1/responses` |
 | `api-flags` | `make e2e-api`：默认 responses+negotiable；`--api=chat`/env 生效 |
 | `tasks-e2e` | `make e2e-tasks`：`/tasks`、`open`/`toggle`、非法参数报错 |
-| `goal-cmd` | P29 `/goal` 纯函数：控制词独占整行、状态块四段、`clear` 幂等；**P58 续跑判定九腿**（未授权 / 授权即开 / 轮号递增 / complete 停 / 轮次用尽标 blocked+round-limit / resume 重开 / pause 收授权 / **objective 转义与信封完整性** / 无目标不开） |
+| `goal-cmd` | P29 `/goal` 纯函数：控制词独占整行、状态块四段、`clear` 幂等；**§19.12**：`Objective:`/`Blocker:` 压成一行、读盘反转义（写读转义必须对称）；**P58 续跑判定九腿**（未授权 / 授权即开 / 轮号递增 / complete 停 / 轮次用尽标 blocked+round-limit / resume 重开 / pause 收授权 / **objective 转义与信封完整性** / 无目标不开） |
 | `goal-e2e` | `make e2e-goal`：真 REPL 11 条命令逐条 grep |
 | `sess-list` | 去重取最后一条、按 `lastActiveAt` 降序、8 档列宽退化、完整 id |
 | `sess-list-big` | 踩坑 68：6000 行大索引 —— 归并排序与「金标准（未修的插入排序）」逐行等价、两把键各自有序、排两次结果相同、去重 2000 条、行尾 id 完整（抽查首/中/末） |
@@ -8074,3 +8099,55 @@ SYS / TASK / calls(c1,c2) / tool(c1) / USER「继续」
 
 **验收**：`make check` / `make build`（静态链接审计通过）全绿；`--selftest` 新增
 `hist-pairing` / `pair-recover` 两轮 ok；`lint-size` 通过。
+
+### 19.12 用户报的：**折叠行的「目标 3/20」没有单位、也看不到目标正文**（不占阶段号）
+
+**用户报的两件事**（同一处界面）：① 常驻块折叠行只写 `目标 3/20` —— 那个 `20` 是什么
+（轮次上限？任务数？），屏幕上没有任何一处说得清；② 目标正文只在 `/goal` 弹窗里看得到，
+折叠行上一个字都没有，不打开弹窗就不知道这个目标到底是什么。
+
+**根因不是算错，是没人说**：`20` 是 `Goal.max_rounds`（轮次上限），`3` 是**自动续跑驱动器**
+开过的轮数（`goal_round_admit` 里 `round+1` 落盘；人在输入行打的回合**不计入**）。
+折叠行当初只有一个「1 行预算」，所以正文压根没进这一段。
+
+**改法（四处同一形状）**：
+
+| 处 | 改成 |
+|---|---|
+| 折叠行 | `目标 3/20轮 · <目标正文>`（非 active：`目标 阻塞 · <正文>`） |
+| 展开箱体 | `▸ active · 3/20轮 · <正文>`（去掉 `round` 这个词 —— 单位已经在数字后面） |
+| `/goal` 弹窗 | `Objective:` / `Blocker:` **压成一行**（外来文本不许在帧里拆行） |
+| 读盘 | `goal_set_unescaped`：`goal_save` 转义了，读回来必须反转义 |
+
+**顺手抓到一个存量缺陷（写读转义不对称）**：写这方面那条测试（带 `\n` 的 blocker）第一版
+**红得莫名其妙** —— 打出来的 `Blocker:` 里是**字面量** `\n`（两个字符）。根因是
+`goal_save` 用 `jw_str_into` 转义、而 `goal_load` 用 `js_obj_get_str` 取**零拷贝原始视图**
+（转义没解码）当正文。实测 `/goal A\B` 存盘再读回变成 `A\\B`，**每存读一次多一层反斜杠**。
+修法是 `goal_set_unescaped`（`sv_unescape_to_buf`，失败退回原始视图：宁可显示得难看，
+也不静默丢内容）。这条与「目标正文单行显示」是同一件事的两半 —— 不解码的话，
+用户看到的仍然是 `\n` 而不是空格。
+
+**验收**（都是实测）：
+
+| 判据 | 结果 |
+|---|---|
+| `tasks-render` 新增：四条逐字节断言（含正文）、正文带 `\n` 压成一行、裁正文保头（26..78 逐档扫描 + 两条前缀等值） | 绿 |
+| `tui-tasks`：折叠行上有 `目标 3/20轮` **与**正文前缀（屏幕上看得见的判据） | 绿 |
+| `goal-cmd` 新增：读盘反转义 + `Objective:`/`Blocker:` 压成一行（两条路都钉） | 绿 |
+| `make lint-size` / `doc-audit` / `doc-cover` / `check` / `build`（静态链接审计） | 全通过 |
+
+**防假绿对照（五条，都先看到红再改回）**：
+
+| # | 改坏什么 | 结果 |
+|---|---|---|
+| A | 去掉 `轮` 单位 | `tasks-render` **红 10 条**（四条逐字节 + 裁尾 + 箱体） |
+| B | 折叠行不接正文（只留头） | **红 4 条**（四段齐 / 只有目标 / blocked / 带换行） |
+| C | 裁正文那条路短路（`if false && seg_head[i] > 0`，退回「丢整段」） | **红 4 条**（扫描判据 + 两条前缀等值 + 箱体）+ `tui-tasks` 红 1 条 —— 证明新路真被走到，不是靠老路径兜底 |
+| D | 弹窗不做单行化 | `goal-cmd` **红 2 条**（`Objective:` 没压成一行、正文拆成了两行） |
+| E | 读盘不做反转义 | `goal-cmd` **红 1 条**（读盘回来的目标没有反转义）—— ⚠ 这一条**最初是绿的**：腿只调内存那一份，不碰读盘。补了「裸 `/goal` 走读盘」那一腿才抓住 |
+
+**明确不做**：不改三段（任务 / 后台 / 子代理）的显示与丢段规矩；不动 `Rounds:` /
+`Status:` / `Activation:` / `Commands:` 的键名（DSH 逐字对齐，`make e2e-goal` 也在 grep
+它们）；不往 `/goal` 弹窗加解释文字（这一轮的结论是「用单位 + 正文说清楚」，不是加一段
+说明）；不改 `get_goal` 工具面的 `round = N / M` 键值排版（模型面本来就有字段名，无歧义）；
+不认领阶段号、不动 `AGENT_VERSION`（用户报的体验修复）。
