@@ -3138,7 +3138,7 @@ parser-blocking preload + `window.__DSH_BOOT__`）；按最小 roster 服务
 | 5 | 消息渲染（`data.stream` + end-seed 位置 + cursor） | `make dsh-web-check` 通过 | **已做**（第十八批，3/3 稳定） |
 | 6 | `dynamicCordisRunner/{inventory,syncInspectManifest}`、`session/modelCatalog` | 控制台零告警 | **已做**（第十二批） |
 | 7 | 资源定位链 + `--dsh-assets` | DSH 树零写入 | **已做**（第十九批） |
-| 8 | `--dsh-assets-install`（`npm pack` 取 72 个包） | 离线/在线各验一次 | 待做 |
+| 8 | `--dsh-assets-install` 取件（`src/web/dshget.uya`） | 装出来的那份能渲染 | **已做**（第二十批） |
 | 9 | token/cookie 鉴权（可选，取决于是否要对外） | 不带 token 401、带 token 可用 | 待做 |
 
 ##### 七、第十批实测：`/api/remote.mux` 的精确契约
@@ -3275,6 +3275,37 @@ workspace.sessionIds.includes(id)` 三者全成立时才**复用**会话，否�
 到底怎么折」这件事，我手上没有权威样本，只有自己的形状推导。下一轮第一件事
 应当是**造一个带消息的真 DSH 会话来抓样本**（`dsh --profile headless "…"` 跑一轮），
 再拿它逐字段对照 —— 那比我再猜一轮划算得多。
+
+##### 八之四、第二十批：取件（工作项⑧）—— 解压交给系统工具
+
+    uya-agent --dsh-assets-install --dsh-assets-dir DIR --dsh-web …
+    [dsh-assets] 取件中（npm install DIR）…
+    [dsh-assets] 装好了：DIR
+
+于是**本机没装 DSH 也能用** `--dsh-web`。
+
+**核心取舍：解压一律交给系统工具。** 一条
+`npm install --prefix DIR --no-audit --no-fund --no-save @deepseek-ai/dsh`
+把「取件 + 解 tgz + 摊平布局」全做完 ⇒ 本仓**不需要 tar/gzip/xz 的任何代码**。
+不这么做的话要自己写 inflate（几百行、纯负债），而格式解压没有一种该由本仓实现；
+取件本身（网络、缓存、校验、镜像）也早被 npm 做透了。**本仓只做编排。**
+
+放在 `src/web/dshget.uya`（不碰 `whost` 的服务逻辑）：扫 PATH 找可执行文件、
+fork/exec/收集输出（与 `gitx_run` 同形，但可执行文件由调用方给）。
+
+| # | 纪律 | 为什么 |
+|---|---|---|
+| ① | **只写 `--dsh-assets-dir` 底下** | 已装的那份 DSH 一个字节都不碰（「只读 DSH」的纪律在安装这条路上同样适用） |
+| ② | **不静默降级** | 任何一步失败就整条失败，不留半份资源让 `--dsh-assets` 指向它 |
+| ③ | **文案指向那一步** | 失败分档（缺工具 / npm 取件 / 产出布局），并把**那一步的 stderr 原样带出来** —— 取件失败的主因是网络与权限，线索只在 stderr 里 |
+
+实测三条路径：
+- **成功**：289 个包 / 71 个带 bundle / dist 齐 ⇒ 布局校验通过；再用
+  `--dsh-assets DIR` 起宿主 + 真浏览器 ⇒ **消息渲染出来**
+- **坏源**：`registry=http://127.0.0.1:1/` ⇒
+  `error: 取件失败（npm 取件：网络 / 权限 / 包名）→ DIR` + 原样 `E502 …`
+  + 「换源用 `--dsh-assets-repo`，换落点用 `--dsh-assets-dir`」
+- **缺工具**：PATH 里没有 npm ⇒ 「装一个 Node.js 再来」
 
 ##### 九、历史记录：`connection lost` 的排查（第十一批已解）
 
