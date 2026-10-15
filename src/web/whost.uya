@@ -68,10 +68,16 @@ const DWH_C_DONE: u8 = 2;      // 已响应，等收尾
 export struct DwhConn {
     fd: i32,
     st: u8,
-    // 这条连接开的**逻辑流**的 streamId（`remote.mux` 的 `open` 里给的）。
-    // 空 = 还没开过流。宿主主动推帧（活事件 / 宿主事件）时要按它标 ——
-    // 标错 streamId 客户端就把那条帧算到别的流上（而症状是「那个面板没数据」）。
-    sid: Buf,
+    // 这条连接开过的**所有**逻辑流的 streamId（`remote.mux` 的 `open` 里给的），
+    // 每行一个（含 `\n`）。空 = 还没开过流。
+    //
+    // ⚠ 必须是**一份清单**而不是一个值：0.2.0 把**所有**流多路复用在同一
+    // 条 WebSocket 上（实测：`session/follow`、`$events`、`session/control`
+    // 三条 `open` 写在同一个 socket 上）。只记住「最后一条」时，宿主按
+    // `session/follow` 找连接会找到一条**它的 sid 已经是 session/control** 的连接
+    // ⇒ 找不到 ⇒ 活事件一帧都不推；而页面上的表现是「消息发出去了、答复不出来」
+    // （实测：日志里答复在、单开 socket 的探针也能收到 —— 只有真浏览器那条路静默）。
+    sids: Buf,
     rx: Buf,            // 已收到的字节（收头用）
     is_mux: bool,       // WS：是 mux 还是 host 下行
     is_remote: bool,    // WS：是 0.2.0 的 `remote.mux`（要**收发**，不是只发）
@@ -101,10 +107,17 @@ export struct DwhHost {
     child: DwhChild,
     // 模型目录与当前选择（`dwhmodel.uya`）。宿主是它的唯一持有者。
     model: DwhModel,
-    // 三条下行流的 streamId（客户端 `open` 时记下来，之后推帧要按它标）。
+    // 某条 endpoint 上开过的**全部** streamId（每行一个，含 `\n`）。
     //   f_sid：`session/follow`（活事件走这条）
     //   e_sid：`$events`（`api-session/status` 这类宿主事件走这条）
     // 空 = 那条流还没开（此时不推，等它开了再说）。
+    //
+    // ⚠ 是**清单**而不是一个值：真实客户端会在同一条 WebSocket 上把
+    // `session/follow` 开**好几次**（实测：一次加载里开了 3 条 —— 会话切换、
+    // 重连、以及 shell 自己那次），而它只认最后那条。宿主只记「最新的一条」时，
+    // 推出去的事件带着**旧 streamId**，客户端算到一条已经废弃的流上 ⇒ 页面上
+    // 什么也不显示（实测：日志里答复在、单开 socket 的探针也能收到 —— 只有真
+    // 浏览器那条路静默）。所以**按 endpoint 推给所有开过的流**。
     f_sid: Buf,
     e_sid: Buf,
     // 上一圈推给浏览器的事件水位（`h.events` 里已推到的字节偏移）。
@@ -1182,6 +1195,34 @@ fn dwh_prompt(h: &DwhHost, body: &const Buf, value: &Buf) bool {
     return buf_append_cstr(value, "{\"accepted\":true}");
 }
 
+// 从请求体走到**真正的入参对象**。
+//
+// ⚠ 真实的 0.2.0 客户端多包一层：`payload.args.request.{requestId,sessionId,
+// mode,content}`（实测抓到的 body）。裸探针（我自己拼的）是
+// `payload.args.{…}` 直接摊平 —— **两种都要认**：只认一种时另一种就是
+// 「发了消息没反应」，而两种的差别在 body 里只差一个键名。
+// 判据是「`args` 里有 `content` 就用它，否则看 `args.request`」（`content` 是
+// 那条消息的正文数组，两种形状里都只出现在最内层）。
+fn dwh_req_args(root: &const JsonValue, out: &JsonValue) bool {
+    var payload: JsonValue = JsonValue.json_null();
+    var args: JsonValue = JsonValue.json_null();
+    if !js_obj_get(root, "payload" as &const byte, 7, &payload) ||
+        !js_obj_get(&payload, "args" as &const byte, 4, &args) {
+        return false;
+    }
+    var content: JsonValue = JsonValue.json_null();
+    if js_obj_get(&args, "content" as &const byte, 7, &content) {
+        *out = args;
+        return true;
+    }
+    var req: JsonValue = JsonValue.json_null();
+    if !js_obj_get(&args, "request" as &const byte, 7, &req) {
+        return false;
+    }
+    *out = req;
+    return true;
+}
+
 // 取 `payload.args` 里的正文。返回 0 = 取到了；1 = 参数不对；2 = 有非 text 的块。
 //
 // 逐个块走（`content` 是数组）：多条 text 块按顺序拼起来（DSH 的语义就是
@@ -1195,10 +1236,8 @@ fn dwh_prompt_text(body: &const Buf, out: &Buf) i32 {
     if !js_parse(&arena, body.ptr as &const byte, body.len, &root) {
         return 1;
     }
-    var payload: JsonValue = JsonValue.json_null();
     var args: JsonValue = JsonValue.json_null();
-    if !js_obj_get(&root, "payload" as &const byte, 7, &payload) ||
-        !js_obj_get(&payload, "args" as &const byte, 4, &args) {
+    if !dwh_req_args(&root, &args) {
         return 1;
     }
     var sess: JsonStrView = JsonStrView{ ptr: null, len: 0 };
@@ -1360,10 +1399,10 @@ fn dwh_select_args(body: &const Buf, prov: &Buf, model: &Buf,
     if !js_parse(&arena, body.ptr as &const byte, body.len, &root) {
         return false;
     }
-    var payload: JsonValue = JsonValue.json_null();
+    // 与 `dwh_prompt_text` 同一个形状问题：真实客户端把入参包在
+    // `payload.args.request` 里（见 `dwh_req_args`）。
     var args: JsonValue = JsonValue.json_null();
-    if !js_obj_get(&root, "payload" as &const byte, 7, &payload) ||
-        !js_obj_get(&payload, "args" as &const byte, 4, &args) {
+    if !dwh_req_args(&root, &args) {
         return false;
     }
     var sess: JsonStrView = JsonStrView{ ptr: null, len: 0 };
@@ -1918,15 +1957,15 @@ export fn dwh_start(h: &DwhHost, cfg: &const Config, addr: &const byte,
     h.live = false;
     h.child = dwhc_zero();
     h.model = dwhm_zero();
-    h.f_sid = buf_new(64);
-    h.e_sid = buf_new(64);
+    h.f_sid = buf_new(512);
+    h.e_sid = buf_new(512);
     h.pushed = 0;
     var i: usize = 0;
     while i < DWH_MAX_CONNS {
         h.conns[i].fd = -1;
         h.conns[i].st = DWH_C_DONE;
         h.conns[i].rx = buf_empty();
-        h.conns[i].sid = buf_empty();
+        h.conns[i].sids = buf_empty();
         h.conns[i].is_mux = false;
         h.conns[i].is_remote = false;
         h.conns[i].remote_ready = false;
@@ -1978,6 +2017,13 @@ export fn dwh_start(h: &DwhHost, cfg: &const Config, addr: &const byte,
     }
     // 模型目录：**两种模式都装**（只读演示也要能看见本机有哪些模型 ——
     // 「页面里能选」与「选了能生效」是两件事，前者不依赖活会话）。
+    //
+    // ⚠ 设置根在**这里**也要保证解出来：只读演示模式根本不走 `dwh_live_start`
+    // （那条路里才有解它的代码），而目录**两种模式都要**。少了这一步时只读演示
+    // 恒报「读不到 settings.yaml」（实测：`dwhm_load` 拿一个空 home 去拼路径）。
+    if h.dsh_home.len == 0 && !dwh_dsh_home(h, cfg) {
+        out_err("[dsh-web] 定不出 DSH 设置根（$HOME 没设？）\n");
+    }
     if !dwhm_load(&h.model, &h.dsh_home) {
         out_err("[dsh-web] 提示：读不到 DSH 的 settings.yaml，模型选择器会是空的\n");
     }
@@ -2032,7 +2078,7 @@ fn dwh_live_start(h: &DwhHost, cfg: &const Config) bool {
         return false;
     }
     // DSH 的设置根：模型目录与子进程的 persona 都从它来（`--dsh-home` 优先）。
-    if !dsh_home_resolve(cfg.dsh_home.ptr as &const byte, &h.dsh_home) {
+    if !dwh_dsh_home(h, cfg) {
         out_err("[dsh-web] 定不出 DSH 设置根（$HOME 没设？）\n");
         return false;
     }
@@ -2060,6 +2106,39 @@ fn dwh_live_start(h: &DwhHost, cfg: &const Config) bool {
         out_err("\n");
     }
     return true;
+}
+
+// 解 DSH 的设置根（`--dsh-home` > `$DSH_HOME` > `~/.dsh`）并记进宿主。
+// 幂等：已经有值时直接返回 true（两种模式都会调到它）。
+fn dwh_dsh_home(h: &DwhHost, cfg: &const Config) bool {
+    if h.dsh_home.len > 0 {
+        return true;
+    }
+    // ⚠ `dsh_home_resolve` 的入参是 **C 串**（它 `bufx_cstr_len` 量长度），而
+    // `cfg.dsh_home` 是个 `Buf`（没有 NUL 结尾）：直接传它的指针会一路读到相邻
+    // 内存 —— 实测拼出来的路径是 `/tmp/lp2/dsh4`（多带一个字节），`mx_load`
+    // 打开它当然失败，而症状只是「读不到 settings.yaml、模型选择器会是空的」。
+    // 所以**先补一个 NUL 再传**。
+    var ex: Buf = buf_empty();
+    defer { buf_free(&ex); }
+    if cfg.dsh_home.len > 0 {
+        ex = buf_new(cfg.dsh_home.len + 1);
+        if !buf_append(&ex, cfg.dsh_home.ptr as &const byte, cfg.dsh_home.len) {
+            return false;
+        }
+        if !buf_append_byte(&ex, 0) {
+            return false;
+        }
+    }
+    const expl: &const byte = if ex.len > 0 {
+        ex.ptr as &const byte
+    } else {
+        "" as &const byte
+    };
+    if !dsh_home_resolve(expl, &h.dsh_home) {
+        return false;
+    }
+    return h.dsh_home.len > 0;
 }
 
 // 一圈的活会话维护：收子进程的新行、翻成事件、攒进 `h.events`（**只追加**），
@@ -2123,7 +2202,28 @@ fn dwh_live_push_events(h: &const DwhHost) void {
     if h.f_sid.len == 0 {
         return;      // 那条流还没开：先攒着（快照会给全量）
     }
-    const fd: i32 = dwh_fd_of_stream(h, &h.f_sid);
+    // **按每一条开过的流各推一份**（每条帧带**它自己**的 streamId）。
+    // 见 `f_sid` 的注：真实客户端在同一条连接上把 `session/follow` 开好几次，
+    // 只认最后那条 —— 只推给「最新的一条」时，推出去的事件带着旧 id 就被丢弃。
+    var s0: usize = 0;
+    var k: usize = 0;
+    while k <= h.f_sid.len {
+        const at_end: bool = k == h.f_sid.len;
+        if at_end || h.f_sid.ptr[k] == 10 as byte {
+            const sl: usize = k - s0;
+            if sl > 0 {
+                dwh_push_one_stream(h, &h.f_sid.ptr[s0], sl);
+            }
+            s0 = k + 1;
+        }
+        k = k + 1;
+    }
+}
+
+// 把 `h.pushed` 之后的新事件推给**一条**流（`sid` 是它的 streamId）。
+fn dwh_push_one_stream(h: &const DwhHost, sid: &const byte, sl: usize) void {
+    var sidb: Buf = Buf{ ptr: sid as *byte, len: sl, cap: sl };
+    const fd: i32 = dwh_fd_of_stream(h, &sidb);
     if fd < 0 {
         return;
     }
@@ -2134,7 +2234,7 @@ fn dwh_live_push_events(h: &const DwhHost) void {
         if at_end || h.events.ptr[i] == 10 as byte {
             const seg: usize = i - start;
             if seg > 0 {
-                dwh_live_frame(h, fd, &h.events.ptr[start], seg);
+                dwh_live_frame(h, fd, sid, sl, &h.events.ptr[start], seg);
             }
             start = i + 1;
         }
@@ -2153,17 +2253,18 @@ fn dwh_live_mark(h: &DwhHost) void {
 // 一条事件帧：`{"type":"item","streamId":…,"value":{"type":"event","event":{…}}}`。
 // 与快照里的 `records[]` 是**同一条事件的两种载体**（快照是批量、这是增量），
 // 所以 `event` 的字节完全一样 —— 客户端 fold 的是同一个对象。
-fn dwh_live_frame(h: &const DwhHost, fd: i32, ev: &const byte,
-    n: usize) void {
+fn dwh_live_frame(h: &const DwhHost, fd: i32, sid: &const byte, sl: usize,
+    ev: &const byte, n: usize) void {
     if fd < 0 {
         return;
     }
-    var p: Buf = buf_new(n + h.f_sid.len + 128);
+    _ = h;
+    var p: Buf = buf_new(n + sl + 128);
     defer { buf_free(&p); }
     if !buf_append_cstr(&p, "{\"type\":\"item\",\"streamId\":\"") {
         return;
     }
-    if !buf_append(&p, h.f_sid.ptr as &const byte, h.f_sid.len) {
+    if !buf_append(&p, sid, sl) {
         return;
     }
     if !buf_append_cstr(&p, "\",\"value\":{\"type\":\"event\",\"event\":") {
@@ -2175,7 +2276,19 @@ fn dwh_live_frame(h: &const DwhHost, fd: i32, ev: &const byte,
     if !buf_append_cstr(&p, "}}") {
         return;
     }
+    dwh_dbg_frame(&p);
     _ = dwh_ws_send_text(fd, p.ptr as &const byte, p.len);
+}
+
+// 调试：把每一帧的**前 160 字节**打到 stderr（定位「客户端判帧非法」用）。
+fn dwh_dbg_frame(p: &const Buf) void {
+    var n: usize = p.len;
+    if n > 160 {
+        n = 160;
+    }
+    out_err("[dbg-frame] ");
+    _ = sys_write(2, p.ptr as *const byte, n);
+    out_err("\n");
 }
 
 // 开着 `sid` 这条流的那条连接的 **fd**（没有回 -1）。
@@ -2186,14 +2299,44 @@ fn dwh_live_frame(h: &const DwhHost, fd: i32, ev: &const byte,
 fn dwh_fd_of_stream(h: &const DwhHost, sid: &const Buf) i32 {
     var i: usize = 0;
     while i < DWH_MAX_CONNS {
-        if h.conns[i].fd >= 0 && h.conns[i].sid.len == sid.len
-            && bufx_mem_eq(h.conns[i].sid.ptr as &const byte,
-                sid.ptr as &const byte, sid.len) {
+        if h.conns[i].fd >= 0 && dwh_sids_has(&h.conns[i].sids, sid) {
             return h.conns[i].fd;
         }
         i = i + 1;
     }
     return -1;
+}
+
+// 往一份 streamId 清单里追加一条（每行一个，含 `\n`）。已经有的不重复加
+// （同名流重开时 `sid` 不同，所以去重的判据是整行相等）。
+fn dwh_sid_add(list: &Buf, sid: &const Buf) bool {
+    if dwh_sids_has(list, sid) {
+        return true;
+    }
+    if !buf_append(list, sid.ptr as &const byte, sid.len) {
+        return false;
+    }
+    return buf_append_byte(list, 10);
+}
+
+// 这份清单（每行一个 streamId）里有 `sid` 吗（整行逐字节比，不做前缀匹配 ——
+// 前缀匹配会让 `sf` 命中 `sf2`，于是帧被推到**另一条流**上）。
+fn dwh_sids_has(list: &const Buf, sid: &const Buf) bool {
+    var start: usize = 0;
+    var i: usize = 0;
+    while i <= list.len {
+        const at_end: bool = i == list.len;
+        if at_end || list.ptr[i] == 10 as byte {
+            const seg: usize = i - start;
+            if seg == sid.len && seg > 0
+                && bufx_mem_eq(&list.ptr[start], sid.ptr as &const byte, seg) {
+                return true;
+            }
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    return false;
 }
 
 // 把一条**宿主事件**推给 `$events`（`api-session/status` 走这条）。
@@ -2204,7 +2347,28 @@ fn dwh_host_event(h: &const DwhHost, name: &const byte, running: bool) void {
     if h.e_sid.len == 0 {
         return;
     }
-    const fd: i32 = dwh_fd_of_stream(h, &h.e_sid);
+    // 同 `dwh_live_push_events`：**每一条开过的 `$events` 流各推一份**
+    // （`$events` 也会被开好几次 —— 实测一次加载里有两三条）。
+    var s0: usize = 0;
+    var k: usize = 0;
+    while k <= h.e_sid.len {
+        const at_end: bool = k == h.e_sid.len;
+        if at_end || h.e_sid.ptr[k] == 10 as byte {
+            const sl: usize = k - s0;
+            if sl > 0 {
+                dwh_host_event_one(h, &h.e_sid.ptr[s0], sl, name, running);
+            }
+            s0 = k + 1;
+        }
+        k = k + 1;
+    }
+}
+
+// 把一条宿主事件推给**一条** `$events` 流。
+fn dwh_host_event_one(h: &const DwhHost, sid: &const byte, sl: usize,
+    name: &const byte, running: bool) void {
+    var sidb: Buf = Buf{ ptr: sid as *byte, len: sl, cap: sl };
+    const fd: i32 = dwh_fd_of_stream(h, &sidb);
     if fd < 0 {
         return;
     }
@@ -2213,7 +2377,7 @@ fn dwh_host_event(h: &const DwhHost, name: &const byte, running: bool) void {
     if !buf_append_cstr(&p, "{\"type\":\"item\",\"streamId\":\"") {
         return;
     }
-    if !buf_append(&p, h.e_sid.ptr as &const byte, h.e_sid.len) {
+    if !buf_append(&p, sid, sl) {
         return;
     }
     if !buf_append_cstr(&p, "\",\"value\":{\"type\":\"emit\",\"event\":") {
@@ -2262,7 +2426,26 @@ fn dwh_live_error(h: &const DwhHost, msg: &const Buf) void {
     if h.f_sid.len == 0 {
         return;
     }
-    const fd: i32 = dwh_fd_of_stream(h, &h.f_sid);
+    var s0: usize = 0;
+    var k: usize = 0;
+    while k <= h.f_sid.len {
+        const at_end: bool = k == h.f_sid.len;
+        if at_end || h.f_sid.ptr[k] == 10 as byte {
+            const sl: usize = k - s0;
+            if sl > 0 {
+                dwh_live_error_one(h, &h.f_sid.ptr[s0], sl, msg);
+            }
+            s0 = k + 1;
+        }
+        k = k + 1;
+    }
+}
+
+// 把一条 `error` 帧推给**一条** `session/follow` 流（见 `dwh_live_error`）。
+fn dwh_live_error_one(h: &const DwhHost, sid: &const byte, sl: usize,
+    msg: &const Buf) void {
+    var sidb: Buf = Buf{ ptr: sid as *byte, len: sl, cap: sl };
+    const fd: i32 = dwh_fd_of_stream(h, &sidb);
     if fd < 0 {
         return;
     }
@@ -2271,7 +2454,7 @@ fn dwh_live_error(h: &const DwhHost, msg: &const Buf) void {
     if !buf_append_cstr(&p, "{\"type\":\"error\",\"streamId\":\"") {
         return;
     }
-    if !buf_append(&p, h.f_sid.ptr as &const byte, h.f_sid.len) {
+    if !buf_append(&p, sid, sl) {
         return;
     }
     // 行宽豁免：不可断的 JSON 骨架
@@ -2363,8 +2546,8 @@ export fn dwh_stop(h: &DwhHost) void {
         if buf_valid(&h.conns[i].rx) {
             buf_free(&h.conns[i].rx);
         }
-        if buf_valid(&h.conns[i].sid) {
-            buf_free(&h.conns[i].sid);
+        if buf_valid(&h.conns[i].sids) {
+            buf_free(&h.conns[i].sids);
         }
         i = i + 1;
     }
@@ -2503,7 +2686,7 @@ fn dwh_host_zero() DwhHost {
 
 // 零值连接。
 fn dwh_conn_zero() DwhConn {
-    return DwhConn{ fd: -1, st: DWH_C_DONE, sid: buf_empty(), rx: buf_empty(),
+    return DwhConn{ fd: -1, st: DWH_C_DONE, sids: buf_empty(), rx: buf_empty(),
         is_mux: false, is_remote: false, remote_ready: false, sent: false };
 }
 
@@ -2626,10 +2809,10 @@ fn dwh_accept(h: &DwhHost) void {
         h.conns[slot].rx = buf_new(16384);
     }
     buf_reset(&h.conns[slot].rx);
-    if !buf_valid(&h.conns[slot].sid) {
-        h.conns[slot].sid = buf_new(64);
+    if !buf_valid(&h.conns[slot].sids) {
+        h.conns[slot].sids = buf_new(256);
     }
-    buf_reset(&h.conns[slot].sid);
+    buf_reset(&h.conns[slot].sids);
 }
 
 // 一个连接可读了：按它的阶段分派。
@@ -2841,7 +3024,50 @@ fn dwh_drop(h: &DwhHost, ci: usize) void {
     h.conns[ci].is_remote = false;
     h.conns[ci].remote_ready = false;
     buf_reset(&h.conns[ci].rx);
-    buf_reset(&h.conns[ci].sid);
+    dwh_forget_streams(h, ci);
+    buf_reset(&h.conns[ci].sids);
+}
+
+// 一条连接没了 ⇒ 把它开过的流从 `f_sid` / `e_sid` 里**摘掉**。
+//
+// 为什么必须摘：那两份清单是「往哪儿推」的唯一判据，而 `dwh_fd_of_stream`
+// 找不到连接时**只是不推**（静默）。不摘的后果不是报错，而是清单里躺着一条
+// 已经死掉的 streamId —— 下次有事件时推给一条**没人听的**流，而真正活着的那条
+// 一个字节都收不到（实测：浏览器只收到 baseline/snapshot，一条 event 帧都没
+// 收到，而宿主这边 15 帧全「发出去了」）。
+fn dwh_forget_streams(h: &DwhHost, ci: usize) void {
+    // 显式夹取：数组边界证明器只认「正的 if 里做索引」（与 `dwh_on_conn` 同款）。
+    if ci >= DWH_MAX_CONNS || h.conns[ci].sids.len == 0 {
+        return;
+    }
+    dwh_sids_prune(&h.f_sid, &h.conns[ci].sids);
+    dwh_sids_prune(&h.e_sid, &h.conns[ci].sids);
+}
+
+// 从 `list` 里删掉 `drop`（另一份清单）里出现的每一条（整行逐字节比）。
+fn dwh_sids_prune(list: &Buf, drop: &const Buf) void {
+    var keep: Buf = buf_new(list.len + 1);
+    defer { buf_free(&keep); }
+    var start: usize = 0;
+    var i: usize = 0;
+    while i <= list.len {
+        const at_end: bool = i == list.len;
+        if at_end || list.ptr[i] == 10 as byte {
+            const seg: usize = i - start;
+            if seg > 0 {
+                var one: Buf = Buf{ ptr: &list.ptr[start], len: seg,
+                    cap: seg };
+                if !dwh_sids_has(drop, &one) {
+                    _ = buf_append(&keep, &list.ptr[start], seg);
+                    _ = buf_append_byte(&keep, 10);
+                }
+            }
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    buf_reset(list);
+    _ = buf_append(list, keep.ptr as &const byte, keep.len);
 }
 
 // 清掉已完成的连接（每圈末尾一次：主循环手上可能有移动前的下标）。
@@ -2851,6 +3077,15 @@ fn dwh_sweep(h: &DwhHost) void {
         if h.conns[i].st == DWH_C_DONE && h.conns[i].fd >= 0 {
             srv_close(h.conns[i].fd);
             h.conns[i].fd = -1;
+            // ⚠ **必须**同时把它开过的流从推送清单里摘掉。
+            // 这里从前只关 fd（`dwh_drop` 那一套清理一个都不做），于是
+            // `f_sid` / `e_sid` 里永远留着已经死掉的 streamId：下一次有事件时
+            // `dwh_fd_of_stream` 找不到那条连接（它 `fd < 0` 了）⇒ **一条都不推**，
+            // 而**真正活着**的那条流一个字节都收不到（实测：浏览器 374 帧里
+            // 一条 event 都没有，而宿主这边 15 帧全「发出去了」——帧推给了一条
+            // 早就关了的流，`dwh_fd_of_stream` 按 streamId 找连接、找到的是死的那条，
+            // 于是活的那条被跳过）。
+            dwh_forget_streams(h, i);
         }
         i = i + 1;
     }
@@ -3488,13 +3723,15 @@ fn dwh_remote_open(h: &DwhHost, ci: usize, sid: &const Buf,
         return;
     }
     const fd: i32 = h.conns[ci].fd;
-    // 记下这条流的 streamId：宿主主动推帧（活事件 / `api-session/status`）时要按它标。
-    // 一条连接只开一条流（客户端每种流一条连接），所以这里直接覆盖。
-    buf_reset(&h.conns[ci].sid);
-    _ = buf_append(&h.conns[ci].sid, sid.ptr as &const byte, sid.len);
+    // 记下这条流的 streamId（**追加**，见 `sids` 的注）：宿主主动推帧时要按它找连接。
+    if !buf_append(&h.conns[ci].sids, sid.ptr as &const byte, sid.len) {
+        return;
+    }
+    _ = buf_append_byte(&h.conns[ci].sids, 10);
     if bufx_eq_cstr(ep.ptr as &const byte, ep.len, "$events" as &const byte) {
-        buf_reset(&h.e_sid);
-        _ = buf_append(&h.e_sid, sid.ptr as &const byte, sid.len);
+        if !dwh_sid_add(&h.e_sid, sid) {
+            return;
+        }
         const rdy: &const byte = "\"clientId\":\"uya-host\"," as &const byte;
         dwh_remote_item(fd, sid, "ready" as &const byte, rdy,
             bufx_cstr_len(rdy), &h.events);
@@ -3570,8 +3807,9 @@ fn dwh_remote_open(h: &DwhHost, ci: usize, sid: &const Buf,
     // 与 `/api/session/history` 用的是同一份译文 —— 所以这里**不需要新的翻译**。
     if bufx_eq_cstr(ep.ptr as &const byte, ep.len,
         "session/follow" as &const byte) {
-        buf_reset(&h.f_sid);
-        _ = buf_append(&h.f_sid, sid.ptr as &const byte, sid.len);
+        if !dwh_sid_add(&h.f_sid, sid) {
+            return;
+        }
         // 快照就是「到此刻为止的全部译文」⇒ 水位直接推到末尾：下面再推增量时
         // 不会把快照里已经给过的行重发（重发会被 fold 当成同一个 id 的重复事件）。
         dwh_send_snapshot(fd, sid, h, &h.events);
@@ -3743,7 +3981,7 @@ fn dwh_send_snapshot(fd: i32, sid: &const Buf, h: &const DwhHost,
     }
     var p: Buf = buf_new(events.len + 4096);
     defer { buf_free(&p); }
-    if !dwh_snapshot_frame(sid, events, &proj, &p) {
+    if !dwh_snapshot_frame(sid, events, &proj, h.live, &p) {
         return;
     }
     _ = dwh_ws_send_text(fd, p.ptr as &const byte, p.len);
@@ -3759,8 +3997,23 @@ fn dwh_send_snapshot(fd: i32, sid: &const Buf, h: &const DwhHost,
 // **做成形参而不是在这里现算**：这一帧要能被自测当纯函数验（`web-snapshot` 轮），
 // 而现算就要把宿主（目录、当前选择）拖进来 —— 那一轮只需验 JSON 结构。
 // 调用方用 `dwhm_projection_json`（活会话）或一个中性值（自测）。
+// `live` = 这批译文是**活会话**的（`dwhc_one_line` 已经把它们整体后移过
+// `DWH_LIVE_SHIFT`，而且日志还在长）。两种模式在**seq 口径**上根本不同：
+//
+//   * 静态（`--dsh-web-events` 那份译文）：译文的 seq 从 0 起，快照要**自己**
+//     补 3 条 seed 并把译文后移 `DWH_SEED_SEQS`，末尾再压一条 `session/end-seed`
+//     收口 —— 那是「一份有头有尾的历史」；
+//   * 活会话：译文已经后移过（`DWH_LIVE_SHIFT` = seed 3 条 + 收口 1 条），
+//     **不能再移一次**，也**不能**在末尾补 end-seed（会话还在长，收口标记会把
+//     后面的活事件挡在「已收口」之外）。
+//
+// ⚠ 从前两种模式共用一条路，于是活会话的快照把已经位移过的译文**又移了 3**：
+// 快照里最后一条是 `N+3`，而紧接着推上来的活事件是 `N+1` —— 客户端读到的
+// seq **往回跳**，`page contains discontinuous entries` ⇒ `close(4002)` 并
+// 每 3 秒重连一次；每重连一次都重新快照、再跳一次，**永远转圈**（实测：
+// 一次加载里 85 次 `ready`、页面停在「Loading history…」）。
 export fn dwh_snapshot_frame(sid: &const Buf, events: &const Buf,
-    model: &const Buf, p: &Buf) bool {
+    model: &const Buf, live: bool, p: &Buf) bool {
     buf_reset(p);
     if !buf_append_cstr(p, "{\"type\":\"item\",\"streamId\":\"") {
         return false;
@@ -3807,7 +4060,16 @@ export fn dwh_snapshot_frame(sid: &const Buf, events: &const Buf,
     // 「末条是几号」，cursor 与 end-seed 都用它。
     const has_seed: bool = dwh_has_frag(events, "session/end-seed" as &const byte);
     var last: u64 = dwh_events_last_seq(events);
-    if !has_seed {
+    // 活会话：译文已经后移过、也不补 seed/收口 ⇒ 末条就是末条（见 `live` 的注）。
+    // 只有「一份静止的历史」那条路才需要下面这套重排。
+    var write_seed: bool = !has_seed;
+    if live {
+        write_seed = dwh_live_needs_seed(events);
+        if !write_seed {
+            last = dwh_events_last_seq(events);
+        }
+    }
+    if !has_seed && (!live || write_seed) {
         if last > 0 {
             // 译文整体后移 `DWH_SEED_SEQS`，再让 end-seed 接在末条译文**之后**
             // （少这个 +1 就与末条译文撞号 ⇒ `page contains discontinuous
@@ -3824,7 +4086,7 @@ export fn dwh_snapshot_frame(sid: &const Buf, events: &const Buf,
     if !buf_append_cstr(p, ",\"records\":[") {
         return false;
     }
-    if !dwh_records_all(events, has_seed, last, p) {
+    if !dwh_records_all(events, has_seed, live, last, p) {
         return false;
     }
     // `hasMore` + `projections`：真 DSH 的 projections 很大，这里给**同名的空值**
@@ -3859,6 +4121,14 @@ export fn dwh_snapshot_frame(sid: &const Buf, events: &const Buf,
     return buf_append_cstr(p, "}}");
 }
 
+// 活会话的这批译文要不要补那三条 seed？判据是**它自己有没有内容**：
+//   * 空（刚连上、还没人说话）：补 seed 0..2 + 收口 3，第一条活事件正好接 `4`；
+//   * 非空：译文已经带着 `DWH_LIVE_SHIFT` 的位移，**什么都不补** —— 补了会与
+//     译文撞号，而不补则第一条活事件接得上（见 `dwh_snapshot_frame` 的注）。
+fn dwh_live_needs_seed(events: &const Buf) bool {
+    return dwh_events_last_seq(events) == 0;
+}
+
 // `records[]` 的段间逗号：**只在不是第一条时**写，并翻掉 `first`。
 // seed / 译文 / end-seed 三段共用它（从前各写各的，零事件源时就多出一个逗号
 // ⇒ 非法 JSON，见 `dwh_seed_records` 的注释）。
@@ -3879,12 +4149,18 @@ fn dwh_record_sep(out: &Buf, first: &bool) bool {
 //   * 少一个：seed 写了逗号却没翻 `first` ⇒ 后一段以为自己是第一条、不写 ⇒ `}}{`
 // `tail` 是收口那条 `session/end-seed` 的 seq（`has_seed` 时它已经在译文里，
 // 这里不再补）。
-fn dwh_records_all(events: &const Buf, has_seed: bool, tail: u64,
-    p: &Buf) bool {
+fn dwh_records_all(events: &const Buf, has_seed: bool, live: bool,
+    tail: u64, p: &Buf) bool {
     var first: bool = true;
     // **译文里已经有 seed 段时不再插**（真 DSH 的日志本来就带
     // `permission/preset`…`session/end-seed`）：无条件插会让 seq 撞车。
-    if !has_seed {
+    // 活会话：译文已经后移过 ⇒ **只有译文为空时**才补那三条 seed
+    // （补了才能让第一条活事件接在 `3+1` 上；见 `dwh_live_needs_seed`）。
+    var write: bool = !has_seed;
+    if live {
+        write = dwh_live_needs_seed(events);
+    }
+    if write {
         if !dwh_seed_records(p, &first) {
             return false;
         }
@@ -3893,14 +4169,21 @@ fn dwh_records_all(events: &const Buf, has_seed: bool, tail: u64,
     // （此前传的是 `has_seed`，正好反了 —— 实测症状：喂真夹具时 cursor=21
     //   而末条 seq=25，客户端报 `did not end at its requested cursor`。）
     var sh: u64 = DWH_SEED_SEQS;
-    if has_seed {
+    var close_mark: bool = !has_seed;
+    if live {
+        // 活会话的译文**已经**位移过（`DWH_LIVE_SHIFT`）：这里一个字节都不移。
+        sh = 0;
+        close_mark = dwh_live_needs_seed(events);
+    } else if has_seed {
         sh = 0;
     }
     if !dwh_records(events, p, sh, &first) {
         return false;
     }
     // 收口标记：`session/end-seed` 放在**译文之后**（理由见 `DWH_SEED_SEQS`）。
-    if has_seed {
+    // 活会话**不补**它：会话还在长，收口标记会把后面的活事件挡在「已收口」之外
+    // （客户端按它判「继承的前缀到此为止」）。
+    if !close_mark {
         return true;
     }
     if !dwh_record_sep(p, &first) {
@@ -3945,19 +4228,11 @@ fn dwh_records(events: &const Buf, out: &Buf, sh: u64,
                 // 二分出来的：两者的 `message.content` 同形、`surfaceOp` 同形、
                 // seq/cursor 都对，**唯一差别**就是真那份的 `data` 里多
                 // `stream`（7 条 chunk）与 `usage`。补上就渲染出来了（实测）。
-                if dwh_is_assistant_msg(&events.ptr[start], seg) {
-                    // 行宽豁免：不可断的调用
-                    if !dwh_assistant_with_stream(&events.ptr[start], seg, sh, out) {
-                        return false;
-                    }
-                } else if sh > 0 {
-                    if !dwh_shift_seq(&events.ptr[start], seg, sh, out) {
-                        return false;
-                    }
-                } else {
-                    if !buf_append(out, &events.ptr[start], seg) {
-                        return false;
-                    }
+                // 这一段（含 `assistant/message` 的 `stream` 补全）与活事件帧
+                // **同一处**实现，见 `dwh_event_bytes`。
+                // 行宽豁免：不可断的调用
+                if !dwh_event_bytes(&events.ptr[start], seg, sh, out) {
+                    return false;
                 }
                 if !buf_append_byte(out, 125) {
                     return false;
@@ -3968,6 +4243,24 @@ fn dwh_records(events: &const Buf, out: &Buf, sh: u64,
         i = i + 1;
     }
     return true;
+}
+
+// **一行日志译文 → 一条 DSH 事件的字节**（快照 `records[]` 与活事件帧共用这一个）。
+//
+// 为什么必须共用：`assistant/message` 要补一个 `data.stream`（chunk 级回放），
+// 而这件事**只有一处**知道 —— 从前快照那条路补了、活事件那条路没补，于是
+// 「历史里的助手消息能渲染、刚聊出来的那一条渲染不出来」（实测：同一个会话里
+// 用户那条渲染了、答复那条没有，而日志里两条都在）。
+// `sh` = seq 位移量（两处口径不同，见 `dwh_shift_seq`）。
+export fn dwh_event_bytes(line: &const byte, n: usize, sh: u64,
+    out: &Buf) bool {
+    if dwh_is_assistant_msg(line, n) {
+        return dwh_assistant_with_stream(line, n, sh, out);
+    }
+    if sh > 0 {
+        return dwh_shift_seq(line, n, sh, out);
+    }
+    return buf_append(out, line, n);
 }
 
 // 译文里最后一条的 `seq`（游标水位）。取不到就回 0。
