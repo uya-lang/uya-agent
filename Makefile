@@ -11,6 +11,7 @@
 #   make e2e-portable # 拷一个二进制到「新机器」（空 HOME/无 DSH/无仓库）还能跑完整功能（离线）
 #   make e2e-dns    # 名字解析：自家解析器（假 DNS + .invalid 域名）与失败时的人话（离线）
 #   make e2e-tasks  # /tasks：报告头 / 空态串 / open / toggle / 非法参数（离线）
+#   make e2e-tasks-resume # 清单跨进程恢复：一个进程写、另一个进程 --resume 还看得到（离线）
 #   make e2e-goal   # /goal：看状态 / 创建 / 拒绝顶掉 / edit / pause / resume / clear（离线）
 #   make e2e-sessions  # /sessions 三列 / 最新的在最后一行 / 同 id 取最后一条 / id 完整（离线）
 #   make e2e-resume-big # ~3 MiB 会话日志 --resume 不段错误 + 最后一条 workspace 取到（离线）
@@ -119,7 +120,7 @@ SRC := src/foundation/bufx.uya src/foundation/jsonx.uya src/foundation/yamlcfg.u
        src/web/ttyemu.uya src/web/dshauth.uya src/web/dshget.uya src/web/webui.uya src/web/wsess.uya src/web/dwhchild.uya src/web/dwhmodel.uya src/web/whost.uya src/web/websrv.uya src/web/webhttp.uya src/web/webpump.uya \
        src/media/clipx.uya src/media/clipw.uya src/media/clipt.uya src/media/cliphelp.uya src/media/clip.uya src/media/imgx.uya src/media/imgz.uya \
        src/selftest/selftest.uya src/selftest/shellselftest.uya src/selftest/sigselftest.uya src/selftest/tuiselftest.uya \
-       src/selftest/st_core.uya src/selftest/st_mock_server.uya src/selftest/st_round_driver.uya src/selftest/st_tty_sse.uya src/selftest/st_sessions.uya src/selftest/st_read_window.uya src/selftest/st_view_watch.uya src/selftest/st_responses.uya src/selftest/st_stats_ctx.uya src/selftest/st_ctxfit.uya src/selftest/st_title.uya src/selftest/st_tasks_ws.uya src/selftest/st_vision.uya src/selftest/st_goal_worktree.uya src/selftest/st_goal_sess.uya src/selftest/st_pm.uya src/selftest/st_pm2.uya src/selftest/st_mcp.uya \
+       src/selftest/st_core.uya src/selftest/st_mock_server.uya src/selftest/st_round_driver.uya src/selftest/st_tty_sse.uya src/selftest/st_sessions.uya src/selftest/st_read_window.uya src/selftest/st_view_watch.uya src/selftest/st_responses.uya src/selftest/st_stats_ctx.uya src/selftest/st_ctxfit.uya src/selftest/st_title.uya src/selftest/st_tasks_ws.uya src/selftest/st_vision.uya src/selftest/st_goal_worktree.uya src/selftest/st_goal_sess.uya src/selftest/st_todo_resume.uya src/selftest/st_pm.uya src/selftest/st_pm2.uya src/selftest/st_mcp.uya \
        src/selftest/tuis_core.uya src/selftest/tuis_title_pty.uya src/selftest/tuis_exit_cmd.uya src/selftest/tuis_diff_scroll.uya src/selftest/tuis_title_ask.uya src/selftest/tuis_sessions_big.uya src/selftest/tuis_tail.uya src/selftest/tuis_marquee_row.uya src/selftest/tuis_sel.uya src/selftest/tuis_mem.uya \
        src/selftest/st_web.uya src/selftest/st_web_childcfg.uya src/selftest/st_web_live.uya src/selftest/st_tls_pin.uya \
        src/selftest/st_dns.uya \
@@ -136,7 +137,7 @@ export UYA_ROOT
 export UYA_SPLIT_C_DIR := $(CURDIR)/build/uyacache
 
 # 行宽豁免：一条 .PHONY 就是一张全仓目标清单，拆行反而看不清哪条丢了
-.PHONY: all check wire-schema wire-probe wire-probe-real dsh-web-check print-src print-cflags build link-audit selftest codegen-audit doc-audit lint-size lint-size-all doc-cover ui-audit probe e2e e2e-config e2e-exec e2e-accept-nudge e2e-retry e2e-config-flags e2e-title e2e-title-cmd e2e-title-auto e2e-mouse e2e-api e2e-steps e2e-permission e2e-sandbox e2e-tasks e2e-goal e2e-memory e2e-memory-live e2e-sessions e2e-resume-big e2e-diff e2e-ws e2e-model e2e-model-save e2e-model-route e2e-ctxwindow e2e-inputimage e2e-worktree e2e-watch e2e-watch-pick e2e-dsh e2e-portable e2e-dns p30-check tui-demo tui-selftest web-selftest sess-selftest diff-selftest model-selftest panel-selftest clean shell-selftest pm-selftest mcp-selftest
+.PHONY: all check wire-schema wire-probe wire-probe-real dsh-web-check print-src print-cflags build link-audit selftest codegen-audit doc-audit lint-size lint-size-all doc-cover ui-audit probe e2e e2e-config e2e-exec e2e-accept-nudge e2e-retry e2e-config-flags e2e-title e2e-title-cmd e2e-title-auto e2e-mouse e2e-api e2e-steps e2e-permission e2e-sandbox e2e-tasks e2e-tasks-resume e2e-goal e2e-memory e2e-memory-live e2e-sessions e2e-resume-big e2e-diff e2e-ws e2e-model e2e-model-save e2e-model-route e2e-ctxwindow e2e-inputimage e2e-worktree e2e-watch e2e-watch-pick e2e-dsh e2e-portable e2e-dns p30-check tui-demo tui-selftest web-selftest sess-selftest diff-selftest model-selftest panel-selftest clean shell-selftest pm-selftest mcp-selftest
 
 all: build
 
@@ -295,7 +296,7 @@ lint-size-all:
 #   本仓实测：90 文件树上净增 50 个函数 + `rm -rf build && make build` → 通过（静态链接审计通过）。
 #   因此「净增函数按 0 处理」那条纪律作废。这段留下的用处只有一个：**换/降编译器时认得出症状**
 #   （报错点落在标准库、`make check` 全绿、只有清缓存重编才炸）。
-selftest: build codegen-audit doc-audit doc-cover ui-audit e2e-exec e2e-accept-nudge e2e-retry e2e-config-flags e2e-title e2e-title-cmd e2e-title-auto e2e-mouse e2e-api e2e-steps e2e-permission e2e-sandbox e2e-tasks e2e-goal e2e-memory e2e-memory-live e2e-sessions e2e-resume-big e2e-diff e2e-ws e2e-model e2e-model-save e2e-model-route e2e-ctxwindow e2e-inputimage e2e-worktree e2e-portable e2e-dns p30-check
+selftest: build codegen-audit doc-audit doc-cover ui-audit e2e-exec e2e-accept-nudge e2e-retry e2e-config-flags e2e-title e2e-title-cmd e2e-title-auto e2e-mouse e2e-api e2e-steps e2e-permission e2e-sandbox e2e-tasks e2e-tasks-resume e2e-goal e2e-memory e2e-memory-live e2e-sessions e2e-resume-big e2e-diff e2e-ws e2e-model e2e-model-save e2e-model-route e2e-ctxwindow e2e-inputimage e2e-worktree e2e-portable e2e-dns p30-check
 	UYA_BIN=$(UYA) $(OUT) --selftest
 
 probe: build
@@ -370,6 +371,42 @@ e2e-tasks: build
 	echo "$$out" | grep -qF "/tasks     任务状态进度" \
 		|| { echo "FAIL: /help 里没有 /tasks"; exit 1; }; \
 	echo "e2e-tasks: 通过（报告头 / 空态串 / open / toggle / 非法参数 / /help）"
+
+# 清单的**跨进程**恢复（踩坑 155）：一个进程里让模型写一份清单（假网关第一次请求回
+# `todo_write`，夹具见 testdata/mock_gateway_sse.py 的 TODO_FIRST=1），**另一个进程**
+# `--resume` 那条会话再敲 `/tasks` —— 清单必须还在。
+#   为什么必须跨进程：进程内的「折回来对不对」由 selftest 的 todo-resume 轮钉（那边
+#   可以直接调 `agent_hist_from_log`）；这一条钉的是**线上那条链**（真二进制 + 真日志 +
+#   真 argv 解析），它坏掉时 selftest 可以全绿（同族：P89 的 pair-recover 立的规矩）。
+#   判据是夹具里那三条清单的正文与计数行，落在 `/tasks` 打出来的**报告文本**上。
+e2e-tasks-resume: build
+	@set -e; \
+	ws=build/selftest_tasks_resume; rm -rf $$ws; mkdir -p $$ws/ws; \
+	python3 testdata/mock_gateway_sse.py 0 1 200 0 "" 1 > $$ws/gw.log 2>&1 & \
+	gw=$$!; \
+	trap "kill $$gw 2>/dev/null || true" EXIT; \
+	sleep 1.2; \
+	port=$$(awk '/^PORT/{print $$2}' $$ws/gw.log); \
+	[ -n "$$port" ] || { echo "FAIL: 假网关没打印端口"; cat $$ws/gw.log; exit 1; }; \
+	( cd $$ws/ws && printf '做一件事\n/exit\n' | \
+		UYA_AGENT_HOME=$$PWD/../home ../../../$(OUT) --no-dsh-config --no-tui \
+		--api-key dummy-key --quiet --base-url "http://127.0.0.1:$$port/v1" \
+		--api=chat --model mock-model >/dev/null 2>&1 ); \
+	sid=$$(grep -o '"id":"session-[0-9a-f-]*"' $$ws/home/index.jsonl | head -1 | cut -d'"' -f4); \
+	[ -n "$$sid" ] || { echo "FAIL: 没开出会话（index.jsonl 里找不到 id）"; exit 1; }; \
+	log=$$(find $$ws/home/sessions -name session.jsonl | head -1); \
+	grep -qF '"type":"todo/write"' $$log \
+		|| { echo "FAIL: 日志里没有 todo/write（清单没落盘）"; exit 1; }; \
+	( cd $$ws/ws && printf '/tasks\n/exit\n' | \
+		UYA_AGENT_HOME=$$PWD/../home ../../../$(OUT) --no-dsh-config --no-tui \
+		--api-key dummy-key --resume $$sid 2>&1 ) > $$ws/out.txt; \
+	grep -qF "在真 PTY 里按 ctrl+t" $$ws/out.txt \
+		|| { echo "FAIL: --resume 之后 /tasks 里没有那条清单（恢复会话看不到清单）"; cat $$ws/out.txt; exit 1; }; \
+	grep -qF "清单      1/3" $$ws/out.txt \
+		|| { echo "FAIL: --resume 之后 /tasks 的计数行不对"; cat $$ws/out.txt; exit 1; }; \
+	grep -qF "钉住三条静默路" $$ws/out.txt \
+		|| { echo "FAIL: --resume 之后 /tasks 里少了 completed 那条"; cat $$ws/out.txt; exit 1; }; \
+	echo "e2e-tasks-resume: 通过（另一个进程 --resume 之后 /tasks 里清单还在，三条与计数都对）"
 
 # P29：/goal（离线，行式 REPL 走真二进制）：空态用法 / 创建 / 拒绝顶掉未完成的 goal /
 # edit 只换目标 / pause·resume 翻 armed / clear 幂等 / 字面目标规则 / /help 里查得到。

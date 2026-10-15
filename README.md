@@ -61,7 +61,8 @@ make e2e-portable  # 可搬运性：拷一个二进制到「新机器」（空 H
 make codegen-audit # 扫构建产物：不许出现「切片描述符 → 字节指针」的强转（终端乱码源头）
 make doc-audit     # 扫文本文件：不许留 Git 冲突标记（合并残留）
 make probe         # 传输层探针：打真实 https 端点，期望 HTTP 401（不需要 key）
-# 离线 e2e（不需要网络）：e2e-permission / e2e-sandbox / e2e-tasks / e2e-goal / e2e-sessions /
+# 离线 e2e（不需要网络）：e2e-permission / e2e-sandbox / e2e-tasks / e2e-tasks-resume /
+#   e2e-goal / e2e-sessions /
 #   e2e-resume-big / e2e-diff / e2e-ws / e2e-model / e2e-ctxwindow / e2e-worktree / e2e-exec /
 #   e2e-accept-nudge / e2e-config-flags / e2e-title* / e2e-api / e2e-steps / e2e-mouse /
 #   e2e-watch / e2e-watch-pick / e2e-portable
@@ -705,9 +706,11 @@ leaf 指纹怎么算、指纹库放哪儿 —— 见 [DESIGN.md §18](DESIGN.md)
 
 * **任务状态**：已结束的后台任务/子代理**没有时长**（只记了开始时刻）；常驻块**只列运行中**的
   （完整清单走 `/tasks`，子代理另有窗口，不进任务箱体）；刷新是「推」出来的，滚动模式下单个长
-  step 期间秒数会停；清单与后台任务/子代理表是**进程状态**（`--resume` 不回填，只有目标在盘上、
-  启动时重读）；**清单按会话清理**（`/new`、`/resume` 与启动一样清零），后台任务/
-  子代理表随 `/new` 复位，目标**按会话**重读（见下一条）；浮层打开时常驻块被盖住，
+  step 期间秒数会停；**清单按会话落盘**（每条提交写一条 `todo/write`，`--resume` /
+  `/resume` / `--continue` 之后折出**最后一次**那份 —— 修前它只在内存里，恢复后恒为空），
+  后台任务/子代理表是**进程状态**（`--resume` 不回填）；**清单按会话清理**：换会话
+  （`/new`、`/resume`）清空，**回合开始也清空**（DSH 口径：清单是这一回合的执行清单），
+  后台任务/子代理表随 `/new` 复位，目标**按会话**重读（见下一条）；浮层打开时常驻块被盖住，
   块不做鼠标交互、点击折叠。折叠行的目标段带**单位与正文**：`目标 3/20轮 · <目标正文>` ——
   `轮` 后面那个数是**轮次上限**（不是任务数），正文与 `round` 的解释见下一条；放不下时
   **只裁正文**，`目标 3/20轮` 始终在（窄终端上也看得见进度）。
@@ -726,6 +729,8 @@ leaf 指纹怎么算、指纹库放哪儿 —— 见 [DESIGN.md §18](DESIGN.md)
   `--resume`）就是换目标，`/new` 之后新会话**没有**目标。**目标不跨会话继承**：旧的那份留在
   旧会话目录里，回头 `--resume` 那条会话它还在。另外**续跑授权不跨会话**（见 §7 的续跑条目）；
   拿不到会话时（还没开会话）落点退回 `<agent_home>/goal.json`，与修前同一条路。
+  **恢复一条还没说过话的会话**（日志只有 header）沿用**同一个会话**（id 与目录都不换）——
+  修前它会被降级成「新建会话」，目录一换目标就跟着「消失」（踩坑 154，见 DESIGN §19.13）。
 
 **模型、工作区与 worktree**
 

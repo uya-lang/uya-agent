@@ -1502,7 +1502,9 @@ sess_read_meta      一次读盘拿 header(id/cwd) + 逐行扫最后一条 sessi
    ↓  ★ 必须在 agent_hist_from_log 之前定工作区 ★
 agent_hist_from_log sess_reader_load 整文件读入、跳 header → sess_next 逐行
    ├─ 每行先 st_fold_line（折叠统计）
-   └─ 按 seq 连续性校验（不连续打印 [session] 警告：seq 不连续）
+   ├─ 按 seq 连续性校验（不连续打印 [session] 警告：seq 不连续）
+   ├─ todo/write → todo_from_json（会话级清单，后写覆盖先写；§9.2）
+   └─ turn/start → todo_clear（DSH 投影同序：清单是**这一回合**的）
 hist_trim_incomplete_tail   丢未完成一轮的尾部
 hist_repair_pairing         丢**任何位置**的悬空组（P89：半组不在结尾时上面那条修不好，§19.11）
 sess_open_resume            用会话自己的路径 + next_seq 续写
@@ -1513,6 +1515,15 @@ sess_open_resume            用会话自己的路径 + next_seq 续写
 
 `l.cwd` 传**当前**工作区（索引的工作区列按它写，**header 不动**）。
 折叠统计与日志在 resume 时对齐：`st_reset()` + 逐行 `st_fold_line`。
+
+**折出 0 条有两种含义，必须分开**（踩坑 154）：`agent_hist_from_log` 的返回值数的是
+**历史消息**，而清单与 `session/title` 不进历史 —— 所以「一条消息都没有」既可能是
+**空会话**（日志只有 header，`sess_has_events` 为假），也可能是**日志坏了**。
+前者是**恢复成功**：沿用同一个 id 与同一份路径（`sess_open_resume`，`next_seq` 取那份
+「迭代到最后一条事件」的值）—— 若照旧降级成「改为新建会话」，会话 id 与目录当场换掉，
+落在会话目录里的 `goal.json`（P87：目标属于会话，靠**文件位置**保证）就再也找不到，
+表现是「恢复会话之后目标没了」，还会在 `sessions/` 下留一个空壳目录。后者（有事件却
+折不出消息）才走「日志无法解析，改为新建会话」。
 
 ### 8.7 与 DSH 会话格式的兼容读取
 
@@ -1697,9 +1708,11 @@ ralph → `<watch_base>-rN`，N 由管道里已收到的 `[round N]` 行推出
 | **整表替换** | 每次提交**完整**列表；回显 `Updated todo list: N pending, N in progress, N completed.` |
 | 校验顺序 | 先**全量**校验再落状态（content 去空白非空、列表内不重复、status ∈ 三值）—— 不这么做会出现「一半校验过一半没过」的半更新 |
 | 上限 | `TODO_MAX = 32` |
-| **回合开始时清空** | DSH 口径：todo 是**这一回合**的执行清单 |
+| **提交落 `todo/write`** | 提交成功的那一版整表写成一条会话事件（`data.todos` 数组，与 DSH 的 `exec.agent.session.append("todo/write", { todos })` 同形）。**只有走到提交那一行的**才写 —— 被任何一档校验拒掉的提交一个字节都不进日志（「日志与实际派发必须一致」，§5.4.1） |
+| **恢复时折最后一次** | `agent_hist_from_log` 认 `todo/write`（后写覆盖先写）。**修过的 bug**：原来清单只在内存里（`g_todos`），日志里一个字节都不写 ⇒ `--resume` / `/resume` / `--continue` 之后恒为空（用户报的「恢复会话后 tasks 没了」）。折回来是**全或无**：任一条不合法就一个字节都不改（半截清单比没有清单更难查） |
+| **回合开始时清空** | DSH 口径（与投影 `apply: turn/start → null` 同序，折叠侧同一个判据）。**修过的 bug**：那句 `todo_clear` 从前**从来没接线**（只写在注释里）⇒ 上一条回合的清单一直挂着；且它排在 `g_sess.save` 判断**之前**（`--no-save` 同样清） |
 | 换会话时也清 | `agent_session_scoped_reset`。**修过的 bug**：原来没人清 ⇒ `/new` 之后清单还挂着上一条会话的「第几步」 |
-| **列表不再注入回上下文** | 与 DSH 一致 —— 那是 UI/replay 状态，不是模型输入 |
+| **列表不再注入回上下文** | 与 DSH 一致 —— 那是 UI/replay 状态，不是模型输入（**落盘 ≠ 注入**：恢复折的是屏幕/报告上的那份，模型那边一个字节都看不到） |
 
 **plan（`agent/plan.uya`）**：见 §7.4。
 状态 `PlanState{active, pending}`，`pending` 是 DSH `set()` 语义的简化（这里只在 step 边界检查，
@@ -6306,6 +6319,38 @@ QTermWidget）对 `ESC[?5522$p`（DECRQM）**零应答**，OSC 52 写 `c`/`p` �
     增量都会进转录；好在这条路每个增量只送「最新一行」，`tui_sink_reason` 又把条目
     钉在 `TUI_REASON_TAIL` —— 所以它不是内存增长源，但值得知道：转录里**有**思考。
 
+154. **会话身份被一次「静默降级」换掉 ⇒ 会话级状态（目标）跟着换目录，看起来像「丢了」**
+    （本轮，用户报的「恢复会话后 goal、tasks 没有恢复」的**前半条**）：
+    现场可复现 —— `/goal 把测试跑绿` 之后 `--resume <同一 id>`，屏幕上打
+    `[session] 日志为空或无法解析，改为新建会话`，紧接着 `/goal` 报
+    `No goal is currently set.`，而**老会话目录里的 `goal.json` 一个字节都没动**。
+    根因不是「没读盘」，是**「折出几条消息」被当成了「恢复成不成功」**：
+    `agent_hist_from_log` 处理一条**只有 header** 的日志时结构上完全成功（推了 system +
+    上下文注入段），但 `added` 是 0（清单与 `session/title` 都不算历史消息）⇒
+    `agent_session_open` 判 `n > 0` 失败 ⇒ 落到 `sess_open` 新建分支 ⇒ **id 与目录当场
+    换掉**。而 P87 之后「目标属于会话」是**文件位置**保证的
+    （`<home>/sessions/--<cwd>--/<id>/goal.json`）——位置一换，目标就「没了」。
+    孪生症状：每恢复一次就在 `sessions/` 下多一个空壳目录（现网真机 2809 个
+    goal/空日志目录，一堆 `lines=1`），而它**完全静默**（那句回执说的是「日志为空」，
+    没人会把它读成「我换了你的会话 id」）。
+    修法：判据挪到会话层 —— 新增 `sess_has_events`（读到过一条**完整事件行**），
+    折出 0 条时用它分开「空会话」（复原会话身份，`sess_open_resume` 沿用原 id/路径）
+    与「日志坏了」（才走新建）。**这类缺陷的通用形状**：一个「失败」被降级成一个
+    「成功的另一种结果」时，凡是**按文件位置/名字**绑定的状态都会静默改指 ——
+    降级点必须自己证明「我确实该降级」，不能只看上游那个数字。
+    验收与对照实验见 §19.13（`goal-sess` D 段四条判据；E 组对照把降级改回去 ⇒ 红 4 条）。
+
+155. **注释里写着「回合开始时清空」，而那句调用**从来没接线** —— 清单跨回合一直挂着**
+    （同轮的另一半；与 154 是**两条**根因，别混）：`todo.uya` 的文件头与
+    `agent_log_turn_start` 的注释都写着「回合开始清空（DSH 口径）」，DSH 那边也确实是
+    `apply: turn/start → null`；而本仓 `todo_clear` 的调用点**只有**
+    `agent_session_scoped_reset`（换会话那一处）—— 于是「上一回合的清单」会一直挂在
+    常驻块与 `/tasks` 里，直到模型自己再写一次 `todo_write`。修法是把那一句补在
+    `agent_log_turn_start` 里（并排在 `g_sess.save` 判断**之前**：`--no-save` 也要清）。
+    **教训**：「注释写着的口径」与「真被调用到的口径」是两件事，而 `doc-cover` 只查
+    注释在不在 —— 一条只活在注释里的不变量，在任何验收里都不会红。
+    对照实验 D（把那一句拿掉 ⇒ 只有「回合开始清空」那条测红）见 §19.13。
+
 ---
 
 ## 17. 工具实现要点
@@ -6586,9 +6631,11 @@ DEEPSEEK_API_KEY=sk-xxx ./build/uya-agent \
 | `responses-fallback` | mock mode 21：`/responses` 404 → 同一步改 chat，只协商一次 |
 | `responses-compact` | mock mode 22：摘要与压缩后请求都走 `/v1/responses` |
 | `api-flags` | `make e2e-api`：默认 responses+negotiable；`--api=chat`/env 生效 |
-| `tasks-e2e` | `make e2e-tasks`：`/tasks`、`open`/`toggle`、非法参数报错 |
+| `tasks-e2e` | `make e2e-tasks`：`/tasks`、`open`/`toggle`、非法参数报错；`make e2e-tasks-resume`：**跨进程**恢复（进程 A 写清单 → 进程 B `--resume` 后 `/tasks` 还在，§19.13） |
 | `goal-cmd` | P29 `/goal` 纯函数：控制词独占整行、状态块四段、`clear` 幂等；**§19.12**：`Objective:`/`Blocker:` 压成一行、读盘反转义（写读转义必须对称）；**P58 续跑判定九腿**（未授权 / 授权即开 / 轮号递增 / complete 停 / 轮次用尽标 blocked+round-limit / resume 重开 / pause 收授权 / **objective 转义与信封完整性** / 无目标不开） |
 | `goal-e2e` | `make e2e-goal`：真 REPL 11 条命令逐条 grep |
+| `goal-sess` | P87 目标属于会话（两条会话互不可见）；**§19.13 D 段**：空日志的恢复不换会话身份（目标还在、id/路径逐字节不变、目录数不变） |
+| `todo-resume` | **§19.13**：清单的落盘与折回 —— 提交落 `todo/write`（线上字节逐字段）/ 清空内存折回来一致 / 面板出「任务 1/3」/ 折到 `turn/start` 出空 / 回合开始清空内存清单 |
 | `sess-list` | 去重取最后一条、按 `lastActiveAt` 降序、8 档列宽退化、完整 id |
 | `sess-list-big` | 踩坑 68：6000 行大索引 —— 归并排序与「金标准（未修的插入排序）」逐行等价、两把键各自有序、排两次结果相同、去重 2000 条、行尾 id 完整（抽查首/中/末） |
 | `tui-switch` | P39 换会话：清转录 → 回放 → 回执、脚注保留、滚动模式不动；P25 会话级状态：`/new`、`/resume` 清空 todo 清单（屏幕与 `g_todos.n` 两处），目标不跟着清 |
@@ -8319,3 +8366,53 @@ SYS / TASK / calls(c1,c2) / tool(c1) / USER「继续」
 它们）；不往 `/goal` 弹窗加解释文字（这一轮的结论是「用单位 + 正文说清楚」，不是加一段
 说明）；不改 `get_goal` 工具面的 `round = N / M` 键值排版（模型面本来就有字段名，无歧义）；
 不认领阶段号、不动 `AGENT_VERSION`（用户报的体验修复）。
+
+### 19.13 用户报的：**恢复会话后 goal / tasks 没有恢复**（不占阶段号）
+
+**用户报的一句话**：「修复恢复会话后，goal、tasks 没有恢复的问题」。先按现场分了两件事
+（都在 TUI/`--no-tui` 那条线上），各有各的根因 —— 都不是「goal.json 没读」：
+
+| 现象 | 实测 | 根因 |
+|---|---|---|
+| 清单（tasks）恢复后恒为空 | `/tasks` 打「（没有任务：todo 清单为空…）」，而真会话日志里有 3 次 `todo_write` 调用 | 清单**从来不落盘**：整个仓 `grep "todo/write"` 零命中 —— 它只是内存里的 `g_todos`，进程一换就没了（DSH 是把它当**会话事件**写的） |
+| 恢复一条**只有 header** 的会话之后目标也没了 | 可复现：`/goal 把测试跑绿` → `--resume <同一 id>` → `[session] 日志为空或无法解析，改为新建会话` → `/goal` 报 `No goal is currently set.`，而老目录的 `goal.json` 一个字节没动 | `agent_hist_from_log` 对空日志**结构上成功**但折出 0 条消息 ⇒ `agent_session_open` 判 `n > 0` 失败 ⇒ 落到 `sess_open` 新建分支 ⇒ **id 与目录当场换掉**，而 P87 之后「目标属于会话」是**文件位置**保证的（`<home>/sessions/--<cwd>--/<id>/goal.json`）⇒ 目标「消失」；顺带每次都在 `sessions/` 下新造一个空目录（现网真机 2809 个 goal/空日志目录，一堆 `lines=1`） |
+
+**先记两条实测（用来划边界，别把「不是 bug 的」也修了）**：① `--resume <id>` /
+`--resume last` / `--continue` / TUI `/resume <id>` / `/sessions` 浮层选中，**goal 那条
+本来就是好的**（真 PTY 抓帧确认：常驻块与 `/tasks` 都出现 `目标 ▸ active · 3/20轮 · <正文>`，
+连恢复一条 16000 行的大会话也一样）；② 「恢复之后目标在、但不自动续跑」**是设计**
+（P58：续跑授权不跨进程，要接着跑得人明确 `/goal resume`）—— 不在这条的范围里。
+
+**改法（四处，按数据流自下而上）**：
+
+| 处 | 改成 |
+|---|---|
+| `agent/todo.uya` | 新增 `todo_log_write`（把提交成功的整表写一条 `todo/write`；`data.todos` 数组，与 DSH 的 `exec.agent.session.append("todo/write", { todos })` 同形）与 `todo_from_json`（折回，**全或无**）。调用点只有 `todo_tool_write` 的提交分支一处 —— 被校验拒掉的提交一个字节都不进日志 |
+| `agent/ag_title_prompt.uya`（折叠侧） | `agent_hist_from_log` 认 `todo/write`（后写覆盖先写）与 `turn/start`（`todo_clear`）—— 与 DSH 投影 `apply: todo/write → event.data.todos / turn/start → null` 同序 |
+| `agent/ag_title_prompt.uya`（写侧） | `agent_log_turn_start` 里补上那句**从来没接线**的 `todo_clear(&g_todos)`（注释与 `todo.uya` 的文件头都写着「回合开始时清空」，而调用点只有换会话那一处）；它排在 `g_sess.save` 判断**之前**（`--no-save` 同样清） |
+| `session/session.uya` + `agent_session_open` | 新增 `sess_has_events`（读到过一条**完整事件行**）：折出 0 条时用它把「空会话」与「日志坏了」分开 —— 空会话走 `sess_open_resume` **沿用原 id / 原路径**（`next_seq` 取那份「迭代到最后一条事件」的值，空日志即 0）；有事件却折不出才走「改为新建会话」 |
+
+**验收**（离线，全部实测）：
+
+| 判据 | 结果 |
+|---|---|
+| `make e2e-tasks-resume`（新目标）：进程 A 让模型写清单 → 进程 B `--resume` 后 `/tasks` | 绿（三条正文 + 计数行 `清单 1/3` 都在） |
+| `--selftest` 新增 `todo-resume` 轮：写（线上字节逐字段）/ 折（清空内存后一致）/ 面板（`任务 1/3`）/ 复位（折到 `turn/start` 出空）/ 回合开始清空 | 绿 |
+| `goal-sess` 轮新增 D 段：空日志恢复 → 目标还在、id 与路径逐字节不变、会话目录数不变 | 绿（真机也复现过同一场景：`--resume` 之后 `/goal` 仍报 `Objective: 把测试跑绿`，`sessions/` 下不加目录） |
+| `make lint-size` / `make check` / `make build`（静态链接审计） | 全通过 |
+
+**防假绿对照（五条，每条都先看到红再改回）**：
+
+| # | 改坏什么 | 结果 |
+|---|---|---|
+| A | `todo_tool_write` 里不调 `todo_log_write` | `todo-resume` **红 2 条**（「不是正好一条」+「日志里没有」）、`e2e-tasks-resume` **红**（日志里没有 `todo/write`） |
+| B | 折叠侧删掉 `todo/write` 分支 | `todo-resume` **红 2 条**（清单不一致 + 面板空的）、`e2e-tasks-resume` **红**（恢复后 `/tasks` 空）—— 与 A 是**两截**：A 只红写那一条 |
+| C | 折叠侧删掉 `turn/start` 分支 | `todo-resume` **只红 1 条**（「折到 turn/start 之后清单没复位」），其余仍绿 —— 复位那条腿自己可测 |
+| D | `agent_log_turn_start` 里拿掉 `todo_clear` | `todo-resume` **只红 1 条**（「回合开始没清空上一回合的清单」）—— 与 C 分得开（C 测折叠侧、D 测产品侧那一句） |
+| E | `empty_log` 恒假（退回老行为） | `goal-sess` **红 4 条**（换了 id / 换了路径 / 新造目录 +1 / 目标不见了） |
+
+**明确不做**：不给清单加「恢复后注入回模型上下文」的语义（DSH：那是 UI/replay 状态，
+不是第二条模型消息）；不迁移、不删历史遗留的**孤儿** `goal.json`（与 §9.3「不迁移历史文件」
+同口径）；不动 `/goal` 的续跑授权口径（P58 的 `--resume` 后 disarmed 是设计）；
+不改 `--dsh-web` 那两个写死的投影（`goal:null` / `todos:null` 是另一条线、另一套判据）；
+不认领阶段号、不动 `AGENT_VERSION`（用户报的缺陷修复）。
