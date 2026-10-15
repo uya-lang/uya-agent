@@ -246,6 +246,45 @@ ws.on('open', async () => {
         kinds[k] = (kinds[k] || 0) + 1;
       }
       console.error('WS 帧总数：' + wsFrames.length + ' 分类：' + JSON.stringify(kinds));
+      // **决定性判据**：拿客户端自己的规则逐帧验（`parseRemoteStreamServerMessage`
+      // 的 `exactKeys`）。哪一帧不合规，它就会 `close(4002)` 并整条重连。
+      const violations = [];
+      for (const f of wsFrames) {
+        let v;
+        try { v = JSON.parse(f); } catch (e) {
+          violations.push('NOT JSON: ' + String(e).slice(0, 60) + ' | ' + f.slice(0, 120));
+          continue;
+        }
+        const keys = Object.keys(v);
+        const okItem = (v.type === 'item')
+          && ((keys.length === 2 && keys.includes('streamId'))
+              || (keys.length === 3 && keys.includes('streamId') && keys.includes('value')));
+        const okEnd = v.type === 'end' && keys.length === 2 && keys.includes('streamId');
+        const okErr = v.type === 'error' && keys.length === 3
+          && keys.includes('streamId') && keys.includes('error');
+        if (!okItem && !okEnd && !okErr) {
+          violations.push('BAD KEYS ' + JSON.stringify(keys) + ' type=' + v.type
+            + ' | ' + f.slice(0, 160));
+        }
+      }
+      console.error('不合客户端规则的帧：' + violations.length);
+      console.error(violations.slice(0, 5).join('\n'));
+      // 违规帧的**完整**样本落盘（对比宿主发出的字节时用它 —— 截断的输出会误导
+      // 排查方向：160 字节的截断看起来像「帧本身坏了」，实测为此多绕了一轮）。
+      {
+        const fs = await import('node:fs');
+        const badFrames = wsFrames.filter((f) => {
+          try { JSON.parse(f); return false; } catch { return true; }
+        });
+        fs.writeFileSync('/tmp/uya_browser_bad_frames.txt',
+          badFrames.join('\n@@@\n'));
+        console.error('违规帧已落盘：/tmp/uya_browser_bad_frames.txt（'
+          + badFrames.length + '）');
+      }
+      const others = wsFrames.filter((f) => !f.includes('"type":"event"')
+        && !f.includes('"type":"snapshot"') && !f.includes('"type":"baseline"')
+        && !f.includes('"type":"ready"') && !f.includes('"type":"error"'));
+      console.error('other 帧样本：' + others.slice(0, 3).map((f) => f.slice(0, 160)).join(' || '));
       console.error('--- 事件帧（前 4 条，各 200 字）---');
       console.error(wsFrames.filter((f) => f.includes('"type":"event"'))
         .slice(0, 4).map((f) => f.slice(0, 200)).join('\n'));

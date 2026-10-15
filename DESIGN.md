@@ -3140,6 +3140,9 @@ parser-blocking preload + `window.__DSH_BOOT__`）；按最小 roster 服务
 | 7 | 资源定位链 + `--dsh-assets` | DSH 树零写入 | **已做**（第十九批） |
 | 8 | `--dsh-assets-install` 取件（`src/web/dshget.uya`） | 装出来的那份能渲染 | **已做**（第二十批） |
 | 9 | 访问令牌（`src/web/dshauth.uya`） | 不带令牌 401 / 带令牌 303+cookie / 带 cookie 200 | **已做**（第二十一批） |
+| 10 | 用户报的「页面坏了」两条（快照逗号 + 四个设置页签） | 第二腿（零事件源）+ `selftest[web-panel]` | **已做**（第二十二批） |
+| 11 | **活会话**：零参数起一条真会话（子进程 + 输入帧 + 日志 tail） | 打字 ⇒ 答复渲染进页面（`dsh-web-check` 第三腿） | **已做**（第二十三批） |
+| 12 | **模型选择**：目录现读 + `selectModel` 落两处 | 切模型 ⇒ 请求打到另一家（第四腿） | **已做**（第二十三批） |
 
 ##### 七、第十批实测：`/api/remote.mux` 的精确契约
 
@@ -3413,6 +3416,68 @@ T+8s  本仓会话 | Failed to load history: api gateway: invalid Remote
 > 教训与第五批同族，但换了个面：**判据覆盖的是「我想到的那条路」**。
 > `dsh-web-check` 一直绿，是因为它永远先喂一份译文；用户跑的是没有译文的那条。
 > 所以这一批给那条命令加了第二腿 —— **同一份代码的两条输入路径，各要一条判据**。
+
+##### 八之七、第二十三批：`--dsh-web` 真正能聊天（活会话 + 模型选择）
+
+用户报的两条：「模型选择器空的」与「打不了字」。两条都不是崩溃 —— 页面能开、
+历史能画，只是**选择器里一个模型都没有**、**在输入框里打字没有任何反应**。
+根因是 `--dsh-web` 当时是一条**只读**链路（事件源是启动前用 `--selftest` 翻好的
+一份**静态译文**，页面里没有任何活着的 agent），加上 `session/modelCatalog` 回的
+是写死的 `groups:[]`。
+
+**设计（四条决定）**
+
+| 决定 | 理由 |
+|---|---|
+| 活会话 = **一个子进程 + 他的会话日志当事件源** | 日志已经是本仓的**真值源**（`dwire_line` 的产物被 `make wire-schema` 验过）；父进程用 `UYA_AGENT_FORCE_SESSION_ID` 预生成 id，于是 `sess_session_path` 算得出那份日志，`sys_read` 追它即可 —— **不另开父子协议** |
+| 输入走 **JSON 帧**（`UYA_AGENT_STDIN_FRAMES=1`） | 裸行口径下「一条消息」与「一行传输」是同一个东西，而浏览器 textarea 里的一条消息**可以有换行**（shift+enter）—— 帧口径把两者解耦 |
+| 模型目录从 `settings.yaml` 现读（`mx_*`），选择落**两处**（子进程的 `/model` + 宿主投影） | 只落一处就是「界面变了、请求没变」或反过来 |
+| 两种模式由 `UYA_AGENT_DSH_WEB_EVENTS` 明确分开 | 给了译文 = 只读演示（老行为一字不改）；没给 = 活会话（用户零参数的形态） |
+
+**这一批挖出来的七个真缺陷**（每一个都实测定位，且都不是「报错」而是「静默」）：
+
+| # | 缺陷 | 症状 |
+|---|---|---|
+| 1 | **`turn/end` 的 `reason` 拼成了非法联合成员** | DSH 的 `reason` 是判别联合（`completed` / `aborted`+**嵌套** `reason` / `error`+`error` 对象），旧实现把三个分支拼在**同一层** ⇒ 客户端 `assertSessionWireEvent` 拒帧 ⇒ `close(4002)` ⇒ **整个会话的历史都封住了**（页面「Failed to load history」+ 每 3 秒重连） |
+| 2 | **快照在活会话模式下重复位移 seq** | 译文已被 tail 后移 `DWH_LIVE_SHIFT`（3 条 seed + 收口 1），快照又移了一次 `DWH_SEED_SEQS` ⇒ 快照末条比第一条活事件**大 3** ⇒ 客户端判 `discontinuous` 并永久重连（实测一次加载 84 次重连） |
+| 3 | **子进程的 stdout/stderr 指到了会话日志** | 会话日志是宿主的事件源；把 fd 1/2 指过去时，任何普通文本都**追加进日志**并与相邻 JSONL 粘成一行（实测 `PROV-A-ANSWER{"type":"assistant/first-token",…}`）⇒ 译文不再是合法 JSON。现在两者都指 `child.log`，**日志只由 `sess_*` 那条 fd 写** |
+| 4 | **子进程与父进程共享文件偏移** | `dup2` 复制的是**同一个 open file description**：父进程在读日志（tail）会推进共享偏移，子进程下一次写就**打在读游标处**（实测覆写成 `PROV-A-ANSWER/message","seq":0,…`）。子进程自己 `open(O_APPEND)` 才有独立偏移 |
+| 5 | **一条连接只记一个 streamId** | 0.2.0 把三条流**多路复用**在同一条 WebSocket 上，而客户端对同一条流会**开好几次**（实测一次加载 3 条 `session/follow`）；只记「最后一条」时推出去的事件带着旧 id ⇒ 被丢弃。改成按 endpoint 记**清单**、逐条推 |
+| 6 | **`dwh_sweep` 被 `return` 跳过** | 收摊只发生在圈末，而 `dwh_accept` / 活会话写端就绪那两条分支都直接 `return` ⇒ 完成态的连接永远不回收（32 个槽）⇒ 连接被占满后新连接直接关掉 ⇒ 客户端「连上就断、每 3 秒重连」（实测 382 次 `open`、87 次重连）。**外加**：连接关掉时没把它的 streamId 从推送清单里摘掉（`dwh_fd_of_stream` 找到**死**连接就跳过 ⇒ 真正活着的那条一个事件都收不到：实测浏览器 374 帧里 0 条 event） |
+| 7 | **`turn/end` 之外还有一条 0.1.1 的基线段** | 升级成 `remote.mux` 之后仍在发 `{"type":"server-request",…}`（0.1.1 的订阅基线）⇒ 客户端对**每一条**收到的帧做 `exactKeys` 校验 ⇒ 拒帧、整条重连。0.2.0 的「基线」是**客户端 `open` 之后**我们按流回的那一条 |
+
+**两处执行核的修复**（都在这一批里暴露）：
+
+* `dsh_home_resolve` 的入参是 **C 串**，而 `cfg.dsh_home` 是**没有 NUL 的 `Buf`** ——
+  直接传指针会读到相邻内存，拼出的路径多带一个字节（实测 `/tmp/lp2/dsh4`），
+  于是「读不到 settings.yaml、模型选择器空的」。两个调用点都改成先补 NUL；
+* `web_child_env_cfg` 把 `BASE_URL` / 密钥**无条件**钉进子进程环境 —— 而它们的
+  来源可能是 DSH 设置（`src == 1`），钉进去等于给子进程装了一个「**env 显式来源**」，
+  而切模型时显式来源**不许被覆盖**（P37 的 `agent_route_apply`）⇒ `/model 别家/名字`
+  只换了名字、**端点留在老提供方**（实测假网关收到 `model=model-b` 打在 A 口）。
+  现在只有 `src == 2/3`（人显式给过）才注入。
+
+**判据（五条腿 + 三轮自测，各有各的 oracle）**：
+
+| # | 判据 | oracle | 覆盖的缺陷 |
+|---|---|---|---|
+| ① | `selftest[web-models]`：目录是合法 JSON、四个顶层键齐、`default` **在 groups 里**、档位只列公布的、同名跨提供方**两条** | 本仓 JSON 解析器 | 「选择器空的」那族 |
+| ② | `selftest[web-chat]`：输入帧转义**闭环**（引号/反斜杠/换行/中文）、多行不被拆开、快照位移 +3 / 活事件位移 +4 | 解析器 + 逐字节比对 | 静默的「一条消息被拆成几回合」与 seq 断流 |
+| ③ | `selftest[web-err-env]`：业务错必须是**合法 JSON** 且能拆成 `ok:false` | 解析器 | 缺陷 ① 的同族（本条**当场抓住了 `dwh_rpc_owned_err` 少一个 `}`**：它让每个业务错都变成 `ok:true`+垃圾值） |
+| ④ | `make dsh-web-check` 第三、四腿：**真键盘打字** ⇒ 答复渲染；切模型 ⇒ 请求真的打到另一家 | 真 chromium + CDP；**假网关收到的 model/端口**（不是页面显示的名字） | 「打不了字」「选择器点了没反应」 |
+| ⑤ | `make dsh-web-check` 第五腿：会话日志**每一行**都是合法 JSON | 逐行 `json.loads` | 缺陷 ③④（诊断混进日志）——它**不会**让前四腿变红，所以必须单列 |
+
+**工具面新增**（都在 `testdata/`，不进产品）：`mock_gateway_answer.py`（当场答一句的
+假网关 —— `mock_gateway_route.py` 那个会先要一条慢 bash，对这两腿太间接）、
+`dsh_web_live_home.py`（造两个提供方的模型目录夹具）、`dsh_web_log_check.py`（日志
+逐行 JSON 判据）、`dsh_web_chat_drive.mjs` / `dsh_web_model_drive.mjs`（CDP 驱动，
+**内含按客户端 `exactKeys` 规则逐帧自检**的那一段 —— 它是定位缺陷 ①⑦ 的入口）。
+
+**这一批最贵的一条方法论**：`make dsh-web-check` 前四腿全绿时页面**仍然是坏的**，
+因为「帧发出去了」与「客户端接受了」是两件事。真正定位到根因的那一步是
+**把客户端判据抄成断言**（`exactKeys` 那一段）与**解客户端 close 帧里的
+code/reason**（`dwh_log_close`，`invalid Remote stream frame`）—— 两者都在
+「症状之外」的地方取证。
 
 ##### 九、历史记录：`connection lost` 的排查（第十一批已解）
 

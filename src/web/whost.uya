@@ -919,6 +919,71 @@ fn dwh_rpc_err(rpc: &const byte, rl: usize, code: &const byte, msg: &const byte,
     return buf_append_cstr(out, ",\"details\":{}}}}");
 }
 
+// 解一条客户端 close 帧（opcode 8）的 code 与 reason 并打到 stderr。
+//
+// 为什么值得为它写一个函数：客户端**主动**关连接时会把原因写在帧里
+// （`4002 invalid Remote stream frame` / `1000` 等），而它自己**不打印**任何
+// 东西 —— 这是「帧为什么不合法」的唯一线索（本仓在 P80 上两次靠它定位）。
+// 帧格式与其它客户端帧一样：`b0` = FIN|opcode、`b1` = MASK|len（可能 126/127）、
+// 掩码键、payload。**必须按长度形态取掩码偏移**（写死 `2+(k&3)` 会把 126 形态
+// 解成乱码 —— 第十批踩过同一个坑）。
+fn dwh_log_close(frame: &const byte, n: usize) void {
+    if n < 2 {
+        return;
+    }
+    var plen: usize = (frame[1] & 127 as byte) as usize;
+    var poff: usize = 2;
+    if plen == 126 {
+        if n < 4 {
+            return;
+        }
+        plen = ((frame[2] as usize) << 8) | (frame[3] as usize);
+        poff = 4;
+    } else if plen == 127 {
+        if n < 10 {
+            return;
+        }
+        poff = 10;
+    }
+    const masked: bool = (frame[1] & 128 as byte) != 0;
+    const moff: usize = poff;
+    if masked {
+        if n < poff + 4 {
+            return;
+        }
+        poff = poff + 4;
+    }
+    if poff >= n {
+        return;
+    }
+    var code: u32 = 0;
+    if n >= poff + 2 {
+        code = ((frame[poff] as u32) << 8) | (frame[poff + 1] as u32);
+    }
+    // 掩码是**按 payload 的下标**循环用的（`(i - payload起点) & 3`）——
+    // 用一个自增计数器会在跳过 code 那两字节之后**错位 2**（实测：解出来是
+    // 一串乱码，而乱码会让人以为是帧坏了，其实只是掩码偏移算错）。
+    const pstart: usize = poff;
+    var msg: Buf = buf_new(256);
+    defer { buf_free(&msg); }
+    var i: usize = pstart + 2;
+    while i < n {
+        var b: byte = frame[i];
+        if masked {
+            b = (b ^ frame[moff + ((i - pstart) & 3)]) as byte;
+        }
+        _ = buf_append_byte(&msg, b);
+        i = i + 1;
+    }
+    out_err("[dsh-web] 客户端关了这条连接：code=");
+    out_err_dec(code as usize);
+    out_err(" reason=");
+    if msg.len > 0 {
+        _ = sys_write(2, msg.ptr as *const byte, msg.len);
+    }
+    out_err("\n");
+}
+
 // `a/b` → `a.b`（0.2.0 的斜杠名字规范成本宿主内部的点号名字）。
 // 只换**第一个** `/`：`dynamicCordisRunner/inventory` 这类名字里也只有一段斜杠。
 fn dwh_slash_to_dot(method: &const byte, ml: usize, out: &Buf) bool {
@@ -1216,10 +1281,16 @@ fn dwh_req_args(root: &const JsonValue, out: &JsonValue) bool {
         return true;
     }
     var req: JsonValue = JsonValue.json_null();
-    if !js_obj_get(&args, "request" as &const byte, 7, &req) {
-        return false;
+    if js_obj_get(&args, "request" as &const byte, 7, &req) {
+        *out = req;
+        return true;
     }
-    *out = req;
+    // 第三种形态：**入参直接摊在 `args` 里**（`session/selectModel` 那种
+    // 「只有几个平字段」的方法；客户端对这种没有 `content`/`request` 可包）。
+    // 少了这一支，那种请求会被当成「参数不对」—— 实测：模型驱动器发的
+    // `{"args":{"sessionId":…,"provider":…,"model":…}}` 被判参数错，
+    // 而它自己的字段一个不缺。
+    *out = args;
     return true;
 }
 
@@ -1320,7 +1391,14 @@ fn dwh_rpc_owned_err(value: &Buf, code: &const byte, msg: &const byte) bool {
     if !buf_append_cstr(value, ",\"message\":") {
         return false;
     }
-    return jw_str_into(value, msg, bufx_cstr_len(msg));
+    if !jw_str_into(value, msg, bufx_cstr_len(msg)) {
+        return false;
+    }
+    // ⚠ **收尾那个 `}` 不能少**：少了它这段不是合法 JSON，`dwh_take_owned_err`
+    // 解不开 ⇒ 走 `dwh_rpc_ok` ⇒ 客户端收到 `ok:true` + 一段带标记的垃圾值，
+    // 于是把它当成功的返回值继续走（症状是「点了没反应」，离根因极远 —— 实测，
+    // 而且是被 `web-err-env` 那一轮当场抓住的：它对正常值也判「业务错」）。
+    return buf_append_byte(value, 125);
 }
 
 // 拆 `dwh_rpc_owned_err` 写下的内部标记。返回 false = 这不是错误（是正常的 value）。
@@ -2221,6 +2299,23 @@ fn dwh_live_push_events(h: &const DwhHost) void {
 }
 
 // 把 `h.pushed` 之后的新事件推给**一条**流（`sid` 是它的 streamId）。
+// 一条日志译文（含尾 `\n`）→ 它**不含换行**的那一段。
+//
+// ⚠ 必须去掉尾 `\n`：`dwhc_raw` 里的每一行是「含换行的完整行」（那是
+// `dwire_line` 的产物），而它要被**嵌进一条 JSON 帧**里 ——
+// 那个换行会让帧变成两行：`{"type":"item",…,"event":{…}}\n}`，
+// 客户端的 `parseRemoteStreamServerMessage` 当场判**不是合法 JSON**
+// ⇒ `invalid Remote stream frame` ⇒ `close(4002)` 并每 3 秒重连
+// （实测：一次加载 84 次重连、页面停在初始态，而宿主这边每一帧都「发成功了」——
+// 字号对不上时症状离原因极远）。
+fn dwh_trim_nl(line: &const byte, n: usize) usize {
+    if n > 0 && line[n - 1] == 10 as byte {
+        return n - 1;
+    }
+    return n;
+}
+
+// 把「还没推过的」译文逐行推给**一条** `session/follow` 流（见 `dwh_live_frame`）。
 fn dwh_push_one_stream(h: &const DwhHost, sid: &const byte, sl: usize) void {
     var sidb: Buf = Buf{ ptr: sid as *byte, len: sl, cap: sl };
     const fd: i32 = dwh_fd_of_stream(h, &sidb);
@@ -2232,7 +2327,7 @@ fn dwh_push_one_stream(h: &const DwhHost, sid: &const byte, sl: usize) void {
     while i <= h.events.len {
         const at_end: bool = i == h.events.len;
         if at_end || h.events.ptr[i] == 10 as byte {
-            const seg: usize = i - start;
+            const seg: usize = dwh_trim_nl(&h.events.ptr[start], i - start);
             if seg > 0 {
                 dwh_live_frame(h, fd, sid, sl, &h.events.ptr[start], seg);
             }
@@ -2276,19 +2371,7 @@ fn dwh_live_frame(h: &const DwhHost, fd: i32, sid: &const byte, sl: usize,
     if !buf_append_cstr(&p, "}}") {
         return;
     }
-    dwh_dbg_frame(&p);
     _ = dwh_ws_send_text(fd, p.ptr as &const byte, p.len);
-}
-
-// 调试：把每一帧的**前 160 字节**打到 stderr（定位「客户端判帧非法」用）。
-fn dwh_dbg_frame(p: &const Buf) void {
-    var n: usize = p.len;
-    if n > 160 {
-        n = 160;
-    }
-    out_err("[dbg-frame] ");
-    _ = sys_write(2, p.ptr as *const byte, n);
-    out_err("\n");
 }
 
 // 开着 `sid` 这条流的那条连接的 **fd**（没有回 -1）。
@@ -2748,15 +2831,27 @@ fn dwh_poll_once(h: &DwhHost) void {
             if k == 0 {
                 if (rv & POLLIN) != 0 {
                     dwh_accept(h);
+                    // ⚠ 走之前**必须**收摊：`dwh_accept` 每圈都可能被调到
+                    // （页面的静态资源是一个请求一条连接），而 `return` 会跳过
+                    // 本圈末尾的 `dwh_sweep` ⇒ 完成态的连接永远不回收 ⇒ 32 个槽
+                    // 满了之后新连接被直接关掉，客户端表现是「连上就断、每 3 秒
+                    // 重连」（实测：一次加载 87 次重连、页面停在初始态）。
+                    dwh_sweep(h);
                     return;
                 }
             } else if idx[k] > DWH_MAX_CONNS {
-                // 活会话的 fd（日志 / stdin）：这一圈有它就够了 —— 具体的读/写
-                // 统一在下面的 `dwh_live_tick` 里做（那里是**一处**口径：
-                // 收尸、写 stdin、读日志、推帧四件事的顺序不能乱）。
-                dwh_live_tick(h);
-                dwh_live_mark(h);
-                return;
+                // 活会话的写端（管道）就绪：读/写统一在 `dwh_live_tick` 里做
+                // （那里是**一处**口径：收尸、写 stdin、读日志、推帧四件事的顺序
+                // 不能乱）。
+                //
+                // ⚠ **不能直接 `return`**：那会跳过本圈末尾的 `dwh_sweep` ——
+                // 而 `DWH_C_DONE` 的连接（对端关了、或响应写完了）**只有它收**。
+                // 不收的后果不是报错，而是连接槽被占满：`DWH_MAX_CONNS` = 32，
+                // 浏览器一轮开 4~5 条，几轮之后 `dwh_accept` 开始直接关新连接
+                // ⇒ 客户端看到的是「连上就断」并**每 3 秒重连一次**，而页面永远
+                // 停在初始态（实测：一次加载里 87 次 `ready`、382 次 `open`，
+                // 而宿主这边一切「正常」）。
+                break;
             } else {
                 const ci: usize = idx[k] - 1;
                 // 掩码先落成一个 i16：三个常量的 `|` 会被推断成别的整型，
@@ -2766,6 +2861,7 @@ fn dwh_poll_once(h: &DwhHost) void {
                     dwh_on_conn(h, ci);
                     if h.stop_round {
                         h.stop_round = false;
+                        dwh_sweep(h);
                         return;
                     }
                 }
@@ -2852,6 +2948,9 @@ fn dwh_on_conn(h: &DwhHost, ci: usize) void {
             // ⚠ 想查「客户端为什么关」时，**要解掩码读 code/reason** ——
             // 客户端主动关会带自解释的原因（如 `4002 invalid Remote stream frame`），
             // 而它是「我发的帧不合法」的唯一线索（实测靠它定位到两处）。
+            // 这里把它解出来打一行（**唯一的现场线索**：客户端关连接时用它说话，
+            // 而它不写自己的控制台）。
+            dwh_log_close(&tmp[0], n as usize);
             dwh_drop(h, ci);
             return;
         }
@@ -3161,7 +3260,20 @@ fn dwh_do_upgrade(h: &DwhHost, ci: usize, uo: usize, ul: usize) void {
         return;
     }
     h.conns[ci].st = DWH_C_WS;
-    // 基线段：DSH 的重连基线（订阅 + 每条事件 + 标题投影）。
+    // ⚠ **0.2.0 的 `remote.mux` 一条基线都不许发**：它的下行只有
+    // `item` / `end` / `error` 三种帧，且客户端对**每一条**收到的帧做
+    // `exactKeys` 校验 —— 收到 `{"type":"server-request",…}`（0.1.1 的
+    // 「订阅 + 事件 + 投影」基线段）当场抛 `invalid Remote stream frame` 并
+    // `close(4002)`，然后每 3 秒重连一次（实测：一次加载 84 次重连、页面永远
+    // 停在初始态，而宿主这边一切「正常」—— 帧确实发出去了，只是**不该发**）。
+    // 0.2.0 的「基线」是**客户端自己 `open` 之后**由我们按流回的那一条
+    // （`ready` / `baseline` / `snapshot`，见 `dwh_remote_open`）。
+    if h.conns[ci].is_remote {
+        h.conns[ci].sent = true;
+        return;
+    }
+    // 0.1.1 的两条老下行（`events.mux` / `events.host`）仍走基线段 ——
+    // 留着它们只为「旧版装了也能用」，那条路没有被 0.2.0 的校验管着。
     if dwh_ws_send_baseline(h, &h.conns[ci]) {
         h.conns[ci].sent = true;
     } else {
@@ -3705,9 +3817,6 @@ fn dwh_remote_dispatch(h: &DwhHost, ci: usize, text: &const Buf) void {
     if !dwh_pick_str(text, "endpoint" as &const byte, &ep) {
         return;
     }
-    out_err("[dbg-open2] ep=");
-    _ = sys_write(2, ep.ptr as *const byte, ep.len);
-    out_err("\n");
     dwh_remote_open(h, ci, &sid, &ep);
 }
 
