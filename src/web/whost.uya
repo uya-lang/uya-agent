@@ -83,6 +83,7 @@ export struct DwhHost {
     entries: Buf,       // 已解析好的 `{"rev":…,"entries":[…],"batches":[…]}`（boot 图）
     preloads: Buf,      // bootstrap 的 `<script src="…">` 片段（启动时算一次）
     events: Buf,        // 会话事件的译文（每行一条，喂 mux 下行用）
+    token: Buf,         // 访问令牌（空 = 不校验；见 `dshauth.uya` 不变量①）
     conns: [DwhConn: DWH_MAX_CONNS],
     n: usize,
     // 一次泵里「已经干了活、该回 poll 了」的标记（见 `dwh_poll_once`）。
@@ -1485,13 +1486,15 @@ fn dwh_pick_method(body: &const Buf, out: &Buf) bool {
 // 起宿主：找 dist、装 boot 图、读事件源、监听。
 // `addr` 形如 "127.0.0.1:PORT"（`PORT` 为 0 = 让内核给一个）。
 export fn dwh_start(h: &DwhHost, addr: &const byte, an: usize,
-    events_path: &const byte, assets: &const byte, al: usize) bool {
+    events_path: &const byte, assets: &const byte, al: usize,
+    token: &const byte, tl: usize) bool {
     h.lfd = -1;
     h.dist = buf_empty();
     h.root = buf_empty();
     h.entries = buf_empty();
     h.preloads = buf_empty();
     h.events = buf_empty();
+    h.token = buf_empty();
     h.n = 0;
     var i: usize = 0;
     while i < DWH_MAX_CONNS {
@@ -1549,7 +1552,31 @@ export fn dwh_start(h: &DwhHost, addr: &const byte, an: usize,
         return false;
     }
     h.lfd = srv_listen(a, b, cc, d, port, 16);
-    return h.lfd >= 0;
+    if h.lfd < 0 {
+        return false;
+    }
+    // 访问令牌（见 `dshauth.uya` 不变量①）：
+    //   * 显式给了 `--dsh-token` ⇒ 用它；
+    //   * 绑**非回环**（别人能连上）而没给 ⇒ **自动生成一个并打出来** ——
+    //     把服务暴露到局域网却毫无门槛是明确的安全缺陷，而「打出来」让正常的
+    //     用法（把 URL 发给同事）仍然一步到位；
+    //   * 绑回环 ⇒ 不校验（本机看页面是最常见的用法，要令牌只会碍事）。
+    if tl > 0 {
+        if !buf_append(&h.token, token, tl) {
+            return false;
+        }
+    } else if a != 127 || b != 0 || cc != 0 || d != 1 {
+        h.token = buf_new(DSHAUTH_TOKEN_LEN + 1);
+        if !dshauth_make(&h.token) {
+            return false;
+        }
+        out_err("[dsh-web] 绑在非回环地址 —— 已生成本次访问令牌：\n");
+        out_err("[dsh-web]   ");
+        _ = srv_write_all(2, h.token.ptr as &const byte, h.token.len);
+        out_err("\n");
+        out_err("[dsh-web] 首次访问带 `?token=`（之后靠 cookie）；换令牌重启即可。\n");
+    }
+    return true;
 }
 
 // 解析 "A.B.C.D:PORT"（只支持 IPv4 字面量，与 `--web` 同一口径）。
@@ -1702,7 +1729,8 @@ export fn dwh_run(cfg: &const Config) i32 {
         use_al = assets.len;
     }
     if !dwh_start(&h, addr.ptr as &const byte, addr.len,
-        events.ptr as &const byte, use_assets, use_al) {
+        events.ptr as &const byte, use_assets, use_al,
+        cfg.dsh_token.ptr as &const byte, cfg.dsh_token.len) {
         out_err("error: --dsh-web 起不来（没找到 DSH 的 webui？试 --dsh-root DIR，");
         out_err("或确认装了 @deepseek-ai/dsh-web-frontend）\n");
         return AGENT_PROTO;
@@ -2173,6 +2201,13 @@ fn dwh_do_http(h: &DwhHost, ci: usize, m: u8, uo: usize, ul: usize,
     if !buf_append(&path, &h.conns[ci].rx.ptr[uo], pl) {
         h.conns[ci].st = DWH_C_DONE;
         return;
+    }
+    // 访问令牌（`--dsh-token` / 绑非回环时的自动生成）。**排在一切服务之前** ——
+    // 未通过时连 index 与静态资源都不给（真 DSH 同口径：不带令牌 401）。
+    if h.token.len > 0 {
+        if !dwh_auth_gate(h, ci, uo + qo, ql, head_end) {
+            return;
+        }
     }
     // 根路径：index.html + 我们的注入
     if pl == 1 && path.ptr[0] == 47 as byte {
@@ -3565,4 +3600,65 @@ fn dwh_assets_home(cfg: &const Config, out: &Buf) void {
     if (h as usize) != 0 && bufx_cstr_len(h) > 0 {
         _ = buf_append_cstr(out, h);
     }
+}
+
+
+// 一道鉴权闸。返回 false = 已经回过响应（调用方直接收尾）。
+//
+// ⚠ `qo` 必须是**绝对**下标：`srv_url_split` 给的 `q_off` 是**相对 url 起点**的
+// （它的实现里 `i` 从 0 数到 `url_len`），调用方要自己加 `url_off`。这里踩过一次 ——
+// 症状是「带对令牌也被判 401」（因为读的是路径那段字节）。
+//
+// 三态（`dshauth_check`）：URL 带令牌 ⇒ 303 + `Set-Cookie`（浏览器之后靠 cookie）；
+// cookie 带令牌 ⇒ 放行；都没有 ⇒ 401。
+fn dwh_auth_gate(h: &DwhHost, ci: usize, qo: usize, ql: usize,
+                 head_end: usize) bool {
+    // 显式夹取：Uya 的边界证明器只认「正的 if 里做索引」（与全仓同款纪律），
+    // 调用方已经查过一次，但**证明不透传**，所以这里自己再证一遍。
+    if ci >= DWH_MAX_CONNS {
+        return false;
+    }
+    const fd: i32 = h.conns[ci].fd;
+    // Cookie 头（可缺）
+    var co: usize = 0;
+    var cl: usize = 0;
+    const has: bool = srv_head_value(h.conns[ci].rx.ptr as &const byte, head_end,
+        head_end, "cookie" as &const byte, &co, &cl) && cl > 0;
+    var cookie: &const byte = null as &const byte;
+    if has {
+        cookie = &h.conns[ci].rx.ptr[co];
+    }
+    // 查询串拷进一个真 `Buf`：直接造 `Buf{ptr: &rx[qo]}` 过不了边界证明
+    // （Uya 只认「正的 if 里做索引」那一套），拷一份最省事且没有歧义。
+    var q: Buf = buf_new(ql + 1);
+    defer { buf_free(&q); }
+    if ql > 0 && !buf_append(&q, &h.conns[ci].rx.ptr[qo], ql) {
+        return false;
+    }
+    const verdict: u8 = dshauth_check(&q, cookie, cl,
+        h.token.ptr as &const byte, h.token.len);
+    if verdict == DSHAUTH_OK {
+        return true;
+    }
+    if verdict == DSHAUTH_NEED {
+        // 401：不给任何内容（也不给 `WWW-Authenticate` —— 我们没有 realm 概念）
+        _ = srv_send_response(fd, SRV_ST_401, SRV_CT_TEXT,
+            "unauthorized\n" as &const byte, 13);
+        h.conns[ci].st = DWH_C_DONE;
+        return false;
+    }
+    // GRANT：种 cookie 后回首页（带令牌的 URL 不该留在地址栏里）
+    var head: Buf = buf_new(512 + h.token.len);
+    defer { buf_free(&head); }
+    _ = buf_append_cstr(&head, "HTTP/1.1 303 See Other\r\n");
+    _ = buf_append_cstr(&head, "Location: ./\r\n");
+    _ = buf_append_cstr(&head, "Cache-Control: no-store\r\n");
+    _ = buf_append_cstr(&head, "Set-Cookie: ");
+    _ = buf_append_cstr(&head, DSHAUTH_COOKIE_PREFIX);
+    _ = buf_append(&head, h.token.ptr as &const byte, h.token.len);
+    _ = buf_append_cstr(&head, "=1; Path=/; Max-Age=2592000; HttpOnly; SameSite=Strict\r\n");
+    _ = buf_append_cstr(&head, "Content-Length: 0\r\nConnection: close\r\n\r\n");
+    _ = srv_write_all(fd, head.ptr as &const byte, head.len);
+    h.conns[ci].st = DWH_C_DONE;
+    return false;
 }
