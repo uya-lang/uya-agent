@@ -3,7 +3,9 @@
 // 本文件：件① tool 结果剪枝（通用 `cmp_maybe_prune` + bash 专用行式 `cmp_maybe_prune_bash`
 //   与兜底 `cmp_span_cut`）**及其压力闸门 `cmp_prune_armed`**（P79：没压力就不剪，
 //   否则会自锁成补救读，见 §5.3.1）；件② 自动压缩（`cmp_*` 的 checkpoint 组装、
-//   保留量估算 `cmp_retain_bytes`）；另有观测用的小工具（`cmp_cache_burst`、
+//   保留量估算 `cmp_retain_bytes`）；件③ P88 的**保守** token 估算与「装得下」判据
+//   （`cmp_est_tokens` / `cmp_summary_budget` / `cmp_fit_start`，给摘要请求与恢复路径用，
+//   见 §19.10）；另有观测用的小工具（`cmp_cache_burst`、
 //   `cmp_pressure_limit`、`cmp_line_ptr`）。旋钮是一组 `var cmp_*`，preset 可覆盖。
 // 不变量：① 剪枝**只在构请求层生效、不动历史** —— 于是天然幂等、日志里留的是原文、
 //   `--resume` 后重新构请求仍得同一结果；② 剪枝**按码点**计数（对齐 DSH `Array.from(text).length`），
@@ -12,7 +14,9 @@
 //   ⑤ 预算太小或保留量不足预算 1/4 时**退回通用规则**（任何输入都不比旧行为更差）；
 //   ⑥ 压缩压力口径 = `usage_in + usage_cache_read`（= prompt_tokens，与 DSH tokenMeter 一致），
 //   拿不到 usage 时退化成「字节 / 4」估算；触发线 `floor(window × 0.8)`；
-//   ⑦ 压缩的**硬规则**：摘要不比被遮蔽内容短就**拒绝**（否则「压缩」会反而撑大上下文）。
+//   ⑦ 压缩的**硬规则**：摘要不比被遮蔽内容短就**拒绝**（否则「压缩」会反而撑大上下文）；
+//   ⑧ **两套 token 口径不许合并**：调度用 `bytes / 4`（中位口径，估偏只是早晚一步的事），
+//   安全用 `CMP_EST_*`（2.5 B/tok，低估会让请求发出去被窗口拒掉 —— 那条路上没有第二次机会）。
 // 依赖：无 `use` 行；依赖 foundation/bufx（Buf / `bufx_utf8_count` / `bufx_utf8_prefix_bytes` /
 //   `bufx_utf8_suffix_offset`）与 foundation/jsonx。
 // 命名：`cmp_*`、`CMP_*`、`CHECKPOINT_*`。
@@ -602,6 +606,129 @@ fn cmp_retain_bytes(total_bytes: usize) usize {
         keep = 64;
     }
     return keep;
+}
+
+// ============================================================
+// P88：自保用的**保守** token 估算与「装得下」判据
+// ============================================================
+// 口径与 `cmp_prune_armed` / `agent_pressure_tokens` 的 `bytes / 4` **刻意不同**，别合并：
+//   * 那两个是**调度**判据（这一步该不该剪、该不该压），`/4` 是实测校准过的中位口径，
+//     估偏一点只是早晚一步的事；
+//   * 这个是**安全**判据（这条请求会不会被窗口拒掉）。在这里**低估就是灾难** ——
+//     估低了以为装得下，请求发出去换回一个 400，而那条路上往往**没有第二次机会**
+//     （现场见 §19.10：会话从此再也发不出任何请求）。
+// 实测本机 360 组「新增字节 / prompt token 增量」：中位 3.25 B/tok、p05 2.90 B/tok。
+// 取 **2.5 B/tok** ⇒ 最坏情况仍留 16% 余量（宁可多压一点，不可发出去被打回）。
+export const CMP_EST_NUM: usize = 2;
+export const CMP_EST_DEN: usize = 5;
+
+// 一段字节的保守 token 估算（向上取整到 1）。只吃长度，不吃内容 ——
+// 于是它对调用方是纯函数、可逐值自测。
+export fn cmp_est_tokens(nbytes: usize) i64 {
+    return (((nbytes * CMP_EST_NUM) / CMP_EST_DEN) as i64) + 1;
+}
+
+// 摘要请求的输入预算 = `window × 85%`。留 15% 给三样不在这个估算里的东西：
+//   ① tools schema（实测本仓约 20 KB）② 摘要提示词与 JSON 外壳 ③ 提供方对
+//   「输入 + 输出预留」的合计口径差异（实测那条错只按输入算，但不替上游打包票）。
+// `window <= 0`（未知）返回 0 = 不设闸门（与 `cmp_pressure_limit` 同口径：不知道就别拦）。
+//
+// ⚠ **它高于触发线（0.8）不是笔误**，两者是不同的量：触发线答「什么时候开始压」，
+// 预算答「摘要请求最多占多少」。预算必须**高于**触发线才合理 —— 压力刚过线时，
+// 摘要请求（只带被遮蔽的那一段）还得有放得下的余地。别顺手把两者调成同一个数。
+export const CMP_SUMMARY_BUDGET_PERMILLE: i64 = 850;
+
+// 见上：摘要请求的输入预算（token）。0 = 窗口未知，不设闸门。
+export fn cmp_summary_budget(context_window: i64) i64 {
+    if context_window <= 0 {
+        return 0;
+    }
+    return (context_window * CMP_SUMMARY_BUDGET_PERMILLE) / (1000 as i64);
+}
+
+// 在 [from, to) 里挑一个**起点**，使 `[起点, to)` 的保守估算尽量装进 budget；
+// 一段都装不下时返回 to（= 没有可发的内容，调用方按「压不动」收口）。
+//
+// 为什么从**新往旧**挑：越靠近尾部的内容越相关，而装不下时被舍掉的是最老的那一段。
+// 为什么要往后收拢 tool 结果：起点落在 orphan tool 上会被端点直接 400
+// （它的 assistant(tool_calls) 已经被丢在外面了 —— 与 `cmp_shadow_count` 的收拢同一条纪律）。
+export fn cmp_fit_start(h: &const History, from: usize, to: usize,
+                        budget: i64) usize {
+    if from >= to {
+        return to;
+    }
+    var i: usize = to;
+    var est: i64 = 0;
+    while i > from {
+        const idx: usize = i - 1;
+        const m: &const Msg = msg_at(h, idx);
+        const add: i64 = cmp_est_tokens(m.text_len + m.extra_len);
+        if est + add > budget {
+            break;
+        }
+        est = est + add;
+        i = idx;
+    }
+    while i < to && msg_at(h, i).role == ROLE_TOOL {
+        i = i + 1;
+    }
+    return i;
+}
+
+// ============================================================
+// P88：恢复之后的**硬闸门** —— 折出来的历史必须装得进窗口
+// ============================================================
+// 为什么恢复这条路要单独有一道闸门（§19.10 的现场）：压缩原来只改内存里的历史，
+// 日志里没有 checkpoint，于是 `--resume` 折出来的历史**可能比窗口还大**。此时
+//   * 主请求 400（超窗）；
+//   * 摘要请求也 400（它当时同样带整份历史）⇒ 压不动 ⇒ **这个会话再也发不出请求**。
+// 落盘 checkpoint 之后主路已经不会造出这种历史了，但那不构成「不会再发生」的理由：
+// 老日志（P88 之前写下的那些）还在，它们折出来就是超窗的。所以这里保一道**确定性**
+// 的兜底：折完就量一次，装不下就从头丢，直到装得下（或只剩注入的那几条）。
+//
+// 返回丢掉的条数。`budget <= 0`（窗口未知）时一条都不丢 —— 不知道就别乱丢东西。
+export fn cmp_fit_history(h: &History, context_window: i64) usize {
+    const budget: i64 = cmp_summary_budget(context_window);
+    if budget <= 0 || h.len == 0 {
+        return 0;
+    }
+    var dropped: usize = 0;
+    while h.len > 1 {
+        const keep_from: usize = cmp_fit_start(h, 1, h.len, budget);
+        if keep_from <= 1 {
+            return dropped;                // 已经装得下（1 = system 之后全留）
+        }
+        // 丢掉 [1, keep_from) 那一段，并把保留段整体前移
+        hist_drop_prefix(h, keep_from);
+        dropped = dropped + (keep_from - 1);
+    }
+    return dropped;
+}
+
+// 丢掉下标 [1, keep_from) 的消息（**保留下标 0 的 system**），其余整体前移。
+// 与 `hist_drop_oldest_below` 的区别：那个一次只丢一组（且必须照顾工具配对），
+// 这个按**已经算好的边界**一次丢一段 —— 边界由 `cmp_fit_start` 给，它保证
+// 保留段的开头不是孤儿 tool 结果。
+fn hist_drop_prefix(h: &History, keep_from: usize) void {
+    if keep_from <= 1 || keep_from >= h.len {
+        return;
+    }
+    var k: usize = 1;
+    while k < keep_from {
+        const mk: &Msg = msg_at_mut(h, k);
+        h.bytes = h.bytes - (mk.text_len + mk.extra_len);
+        msg_free_one(mk);
+        k = k + 1;
+    }
+    const removed: usize = keep_from - 1;
+    var i: usize = 1;
+    while i + removed < h.len {
+        const dm: &Msg = msg_at_mut(h, i);
+        const sm: &Msg = msg_at_mut(h, i + removed);
+        dm[0] = sm[0];
+        i = i + 1;
+    }
+    h.len = h.len - removed;
 }
 
 // 该压哪一段：从 system 之后开始，留下尾部 retain 比例；返回遮蔽条数（0 = 不用压）

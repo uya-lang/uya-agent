@@ -1,0 +1,705 @@
+// src/selftest/st_ctxfit.uya — P88：上下文超窗的自保（纯函数轮 + 一轮端到端）
+//
+// 本文件：`overflow-pred` / `ctx-est` / `ctx-fit-start` / `ctx-fit-history` 四轮纯函数
+//   （溢出判据 `rtx_context_overflow`、保守 token 估算与预算 `cmp_est_tokens` /
+//   `cmp_summary_budget`、装得下的起点 `cmp_fit_start`、恢复后的硬闸门
+//   `cmp_fit_history`），以及 `overflow-recover` 那**一轮端到端**（假网关把上游的 400
+//   包成 HTTP 500，客户端必须认出溢出、就地压缩、同一步重发）。
+// 不变量：① 四条纯函数轮不起 mock、不碰网络、不写会话日志，几微秒跑完；
+//   ② 端到端那一轮**只服务一次成功请求** —— 正确行为是「压缩之后复用同一步」，
+//      所以它天然也是「不许走网络重试」的探测器（走重试会再发一个请求，而 mock 已退）。
+//   为什么要单独成一轮：这几个判据是「请求不许超窗」这条链上的**全部**机器判据，
+//   而它们最容易被后续改动「顺手统一口径」改坏（尤其把保守估算并回 `bytes / 4`）。
+// 依赖：见锚点 selftest.uya 的文件头（本片与它同处合并命名空间，无本地 use）。
+// 命名：沿用原文件前缀（本片是同一历史模块的内部拆分）。
+
+// P88 轮：上下文超窗的自保（纯函数）
+//
+// 起因是一个**真机会话死锁**（§19.10）：408 步、4.4 MB 的会话在 `--resume` 之后
+// 再也发不出任何请求 —— 主请求 400（超窗），而摘要请求**同样**超窗 ⇒ 压不动 ⇒
+// 屏幕上只剩网关用 500 包起来的那句 `Input exceeds the context limit`，敲三次
+// 「继续」都是同一个 400。
+//
+// 这一轮钉住这条链上**每一处**纯函数判据。四条各自都能单独变红：
+//   ① `rtx_context_overflow` —— 认得出「溢出」，且**不误认**「限流」；
+//   ② `cmp_est_tokens` —— 保守（同样字节估出的 token 数不少于 /4 口径）；
+//   ③ `cmp_fit_start` —— 从新往旧装、装不下的边界与孤儿 tool 收拢；
+//   ④ `cmp_fit_history` —— 折出来的历史超预算时从头丢到装得下。
+// ============================================================
+
+// 造一条 role/内容都给定的消息（本轮的夹具）。
+fn ofx_push(h: &History, role: u8, text: &const byte, n: usize) void {
+    _ = hist_push(h, role, text, n);
+}
+
+// 造 n 字节的填充正文（内容本身不参与判据，只吃长度）。
+fn ofx_fill(out: &Buf, n: usize) void {
+    buf_reset(out);
+    var i: usize = 0;
+    while i < n {
+        _ = buf_append_byte(out, 97 as byte);
+        i = i + 1;
+    }
+}
+
+// 溢出判据轮：本机网关那条原文必须认出来，而「限流 / 配额」那类**不许**被误认成溢出
+// （误认会白跑一次压缩：良性；但反过来把溢出当限流就是无限重试，那才是恶性的）。
+fn overflow_pred_round(tag: &const byte) bool {
+    var ok: bool = true;
+    // ① 现场原文（aigw 包出来的那句，逐字节取自真会话日志的 diag/dump）
+    var b: Buf = buf_new(512);
+    defer { buf_free(&b); }
+    // 行宽豁免：这段是**逐字节**取自真会话日志的网关原文（判据就是它的措辞），不可断。
+    _ = buf_append_cstr(&b, "{\"error\":{\"message\":\"[invalid_params]: {\\\"error\\\":");
+    _ = buf_append_cstr(&b, "{\\\"message\\\":\\\"Input exceeds the context limit (1048568 tokens).");
+    _ = buf_append_cstr(&b, " Please shorten the input.");
+    stx_num_eq(tag, "认出网关那句原文",
+        b2i(rtx_context_overflow(&b)), 1, &ok);
+    // ② DeepSeek 官方措辞
+    buf_reset(&b);
+    _ = buf_append_cstr(&b, "This model's maximum context length is 65536");
+    _ = buf_append_cstr(&b, " tokens");
+    stx_num_eq(tag, "认出 maximum context length",
+        b2i(rtx_context_overflow(&b)), 1, &ok);
+    buf_reset(&b);
+    _ = buf_append_cstr(&b, "error code: context_length_exceeded");
+    stx_num_eq(tag, "认出 context_length_exceeded",
+        b2i(rtx_context_overflow(&b)), 1, &ok);
+    buf_reset(&b);
+    _ = buf_append_cstr(&b, "The prompt is too long for this model");
+    stx_num_eq(tag, "认出 too long for this model",
+        b2i(rtx_context_overflow(&b)), 1, &ok);
+    // ③ **不许**把限流/配额误认成溢出（这两类是「等一等/去充值」，与压历史无关）
+    buf_reset(&b);
+    _ = buf_append_cstr(&b, "{\"error\":{\"code\":\"rate_limit_exceeded\",");
+    _ = buf_append_cstr(&b, "\"message\":\"Too many requests\"}}");
+    stx_num_eq(tag, "限流不算溢出",
+        b2i(rtx_context_overflow(&b)), 0, &ok);
+    buf_reset(&b);
+    _ = buf_append_cstr(&b, "insufficient balance: your credit is exhausted");
+    stx_num_eq(tag, "欠费不算溢出",
+        b2i(rtx_context_overflow(&b)), 0, &ok);
+    // ④ 空体与无关字节：不认（空体是「没有证据」，不许猜）
+    buf_reset(&b);
+    stx_num_eq(tag, "空体不认", b2i(rtx_context_overflow(&b)), 0, &ok);
+    _ = buf_append_cstr(&b, "model endpoint returned HTTP 400");
+    stx_num_eq(tag, "只有状态码不认",
+        b2i(rtx_context_overflow(&b)), 0, &ok);
+    // ⑤ 溢出**不是**瞬时错：它不许落在可重试状态码那条分类里（否则无限重试）
+    stx_num_eq(tag, "400 本就不是可重试状态码",
+        b2i(rtx_retryable_status(400)), 0, &ok);
+    // ⑥ 但网关包成 500 时状态码**是**可重试的 —— 这正是必须先判溢出的理由
+    stx_num_eq(tag, "500 是可重试状态码（所以顺序重要）",
+        b2i(rtx_retryable_status(500)), 1, &ok);
+    if ok {
+        out_err("selftest[");
+        out_err(tag);
+        out_err("] ok（溢出措辞 4 条 / 误认 2 条 / 分类顺序）\n");
+    }
+    return ok;
+}
+
+// 保守估算轮：同样字节数下，`cmp_est_tokens` 必须**不低于** `bytes/4`（调度口径）。
+// 这条是「安全判据不许低估」的机器化 —— 低估会让请求发出去被窗口拒掉（§19.10）。
+fn ctx_est_round(tag: &const byte) bool {
+    var ok: bool = true;
+    // ① 逐值：2.5 B/tok 向上取整（+1 保证 0 字节也给 1，别让空段白拿 0 预算）
+    stx_num_eq(tag, "0 字节 = 1 token", cmp_est_tokens(0), 1, &ok);
+    stx_num_eq(tag, "2 字节 = 1 token", cmp_est_tokens(2), 1, &ok);
+    stx_num_eq(tag, "10 字节 = 5 token", cmp_est_tokens(10), 5, &ok);
+    stx_num_eq(tag, "100 字节 = 41 token", cmp_est_tokens(100), 41, &ok);
+    stx_num_eq(tag, "1000 字节 = 401 token", cmp_est_tokens(1000), 401, &ok);
+    stx_num_eq(tag, "1 MB = 419431 token", cmp_est_tokens(1048576),
+               419431, &ok);
+    // ② 不低估：对一批长度，保守口径恒 >= /4 口径（实测中位 3.25 B/tok、
+    //    p05 2.90 —— 2.5 让最坏情况仍留 16% 余量）
+    var n: usize = 1;
+    var bad: i64 = 0;
+    while n <= 200000 {
+        const safe: i64 = cmp_est_tokens(n);
+        const sched: i64 = (n as i64) / 4;
+        if safe < sched {
+            bad = bad + 1;
+        }
+        n = n * 2;
+    }
+    stx_num_eq(tag, "任何长度都不低于 /4 口径", bad, 0, &ok);
+    // ③ 预算闸门：window × 85%（未知窗口 = 0 = 不设闸门，与 cmp_pressure_limit 同口径）
+    stx_num_eq(tag, "窗口未知不设闸门",
+        cmp_summary_budget(0), 0, &ok);
+    stx_num_eq(tag, "窗口负数不设闸门",
+        cmp_summary_budget(-1), 0, &ok);
+    stx_num_eq(tag, "100000 窗口 = 85000 预算",
+        cmp_summary_budget(100000), 85000, &ok);
+    // ④ 预算与触发线的关系：触发线（0.8）是「什么时候开始压」，预算是「摘要请求最多占
+    //    多少」，两者是不同的量 —— 预算**高于**触发线才合理：压力刚过触发线时，
+    //    摘要请求（它只带被遮蔽的那一段，通常远小于压力）必须还有放得下的余地。
+    //    判据是两条：预算 < 窗口（留了余量），且 预算 > 触发线（别把闸门卡得比触发线还紧）。
+    stx_num_eq(tag, "预算小于窗口",
+        b2i(cmp_summary_budget(1000000) < 1000000 as i64), 1, &ok);
+    stx_num_eq(tag, "预算高于触发线",
+        b2i(cmp_summary_budget(1000000) > cmp_pressure_limit(1000000)), 1, &ok);
+    if ok {
+        out_err("selftest[");
+        out_err(tag);
+        out_err("] ok（2.5 B/tok 保守 / 永不低估 / 预算 85% 且严于触发线）\n");
+    }
+    return ok;
+}
+
+// 「装得下」轮：从新往旧挑起点、工具配对收拢、一条都装不下时的确定行为。
+fn ctx_fit_start_round(tag: &const byte) bool {
+    var ok: bool = true;
+    var msgs: History = hist_init();
+    defer { hist_free(&msgs); }
+    var f: Buf = buf_new(4096);
+    defer { buf_free(&f); }
+    // 夹具：system + 10 条各 100 字节 + 尾部一条 tool
+    _ = hist_push(&msgs, ROLE_SYSTEM, "SYS" as &const byte, 3);
+    var i: usize = 0;
+    while i < 10 {
+        ofx_fill(&f, 100);
+        _ = hist_push(&msgs, ROLE_USER, f.ptr as &const byte, f.len);
+        i = i + 1;
+    }
+    // ① 预算很大 ⇒ 一条都不丢（起点 = from）
+    stx_num_eq(tag, "预算很大从 from 起",
+        cmp_fit_start(&msgs, 1, msgs.len, 100000 as i64) as i64, 1, &ok);
+    // ② 预算只够 3 条（每条 est = 100/2.5+1 = 41）⇒ 起点落在倒数第 3 条
+    //    msgs.len = 11，尾部 3 条 = 下标 8,9,10 ⇒ 起点 8
+    const b3: i64 = 3 * 41;
+    stx_num_eq(tag, "只够 3 条时起点 = 8",
+        cmp_fit_start(&msgs, 1, msgs.len, b3) as i64, 8, &ok);
+    // ③ 预算只够 2 条 ⇒ 起点 9
+    stx_num_eq(tag, "只够 2 条时起点 = 9",
+        cmp_fit_start(&msgs, 1, msgs.len, (2 * 41) as i64) as i64, 9, &ok);
+    // ④ 预算连一条都不够 ⇒ 返回 to（调用方据此判「压不动」，不许发出注定 400 的请求）
+    stx_num_eq(tag, "一条都装不下返回 to",
+        cmp_fit_start(&msgs, 1, msgs.len, 1 as i64) as i64,
+        msgs.len as i64, &ok);
+    // ⑤ 起点不许落在**孤儿 tool 结果**上（它的 assistant 已被丢在外面 ⇒ 端点直接 400）
+    var g: History = hist_init();
+    defer { hist_free(&g); }
+    _ = hist_push(&g, ROLE_SYSTEM, "SYS" as &const byte, 3);
+    _ = hist_push_msg(&g, ROLE_ASSISTANT_CALLS, "a" as &const byte, 1,
+                      "[{\"id\":\"c1\"}]" as &const byte, 15);
+    ofx_fill(&f, 100);
+    _ = hist_push(&g, ROLE_TOOL, f.ptr as &const byte, f.len);
+    _ = hist_push(&g, ROLE_TOOL, f.ptr as &const byte, f.len);
+    // 预算只够 1 条 ⇒ 朴素起点会落在第一条 tool 上；收拢之后必须跳过两条 tool
+    const one: i64 = cmp_est_tokens(100);
+    const at: usize = cmp_fit_start(&g, 1, g.len, one);
+    stx_num_eq(tag, "孤儿 tool 被收拢掉",
+        b2i(at >= g.len), 1, &ok);
+    // ⑥ from >= to 是空区间（防御：调用方给反了不许越界）
+    stx_num_eq(tag, "空区间返回 to",
+        cmp_fit_start(&msgs, 5, 5, 1000 as i64) as i64, 5, &ok);
+    if ok {
+        out_err("selftest[");
+        out_err(tag);
+        out_err("] ok（从新往旧 / 边界 3 档 / 孤儿收拢 / 空区间）\n");
+    }
+    return ok;
+}
+
+// 折叠兜底轮：恢复之后折出来的历史装不进窗口时，必须**从头丢到装得下**，
+// 且 system（下标 0）永远不许被丢 —— 丢了它请求就没有骨架了。
+fn ctx_fit_history_round(tag: &const byte) bool {
+    var ok: bool = true;
+    var h: History = hist_init();
+    defer { hist_free(&h); }
+    var f: Buf = buf_new(4096);
+    defer { buf_free(&f); }
+    // 夹具：system + 100 条各 1000 字节（保守口径每条 401 token）
+    _ = hist_push(&h, ROLE_SYSTEM, "SYSSYSSYS" as &const byte, 9);
+    var i: usize = 0;
+    while i < 100 {
+        ofx_fill(&f, 1000);
+        _ = hist_push(&h, ROLE_USER, f.ptr as &const byte, f.len);
+        i = i + 1;
+    }
+    const before: usize = h.len;
+    // ① 窗口未知（<=0）⇒ 一条都不丢（不知道就别乱丢东西）
+    stx_num_eq(tag, "窗口未知不丢",
+        cmp_fit_history(&h, -1) as i64, 0, &ok);
+    stx_num_eq(tag, "窗口未知条数不变",
+        h.len as i64, before as i64, &ok);
+    // ② 窗口 = 1000 ⇒ 预算 = 850 token ⇒ 只装得下 2 条（401×2 = 802）
+    const dropped: usize = cmp_fit_history(&h, 1000 as i64);
+    stx_num_eq(tag, "确实丢了东西",
+        b2i(dropped > 0), 1, &ok);
+    stx_num_eq(tag, "system 还在（下标 0 是 system）",
+        b2i(msg_at(&h, 0).role == ROLE_SYSTEM), 1, &ok);
+    // ③ 丢完之后**真的装得下**：剩下的总量不超过预算（这就是这一轮存在的原因）
+    var est: i64 = 0;
+    var k: usize = 0;
+    while k < h.len {
+        const m: &const Msg = msg_at(&h, k);
+        est = est + cmp_est_tokens(m.text_len + m.extra_len);
+        k = k + 1;
+    }
+    stx_num_eq(tag, "丢完确实装得下",
+        b2i(est <= cmp_summary_budget(1000 as i64)), 1, &ok);
+    // ④ 小历史不动：装得下就一条都不丢（这条防「顺手多丢」）
+    var s: History = hist_init();
+    defer { hist_free(&s); }
+    _ = hist_push(&s, ROLE_SYSTEM, "SYS" as &const byte, 3);
+    _ = hist_push(&s, ROLE_USER, "hi" as &const byte, 2);
+    stx_num_eq(tag, "装得下就不丢",
+        cmp_fit_history(&s, 1000000 as i64) as i64, 0, &ok);
+    stx_num_eq(tag, "装得下条数不变", s.len as i64, 2, &ok);
+    // ⑤ 只剩 system 时停手（不许丢到空历史 —— 那会让下一步构请求失败）
+    var t: History = hist_init();
+    defer { hist_free(&t); }
+    _ = hist_push(&t, ROLE_SYSTEM, "SYS" as &const byte, 3);
+    _ = cmp_fit_history(&t, 1 as i64);
+    stx_num_eq(tag, "只剩 system 也留着", t.len as i64, 1, &ok);
+    if ok {
+        out_err("selftest[");
+        out_err(tag);
+        out_err("] ok（未知窗口不丢 / 丢到装得下 / 保住 system / 小历史不动）\n");
+    }
+    return ok;
+}
+// ============================================================
+// P88：**超窗 → 就地压缩 → 同一步重发**轮（mode 48）
+// ============================================================
+// 起因是一个真机会话死锁（§19.10）：408 步、4.4 MB 的会话在 `--resume` 之后再也发不出
+// 任何请求 —— 主请求被窗口拒掉，而**摘要请求同样带整份历史**、同样被拒 ⇒ 压不动。
+// 屏幕上只剩网关用 **HTTP 500** 包起来的那句 `Input exceeds the context limit`，
+// 敲三次「继续」都是同一个 400。
+//
+// 这一轮钉住三件事，每一件都能单独变红：
+//   ① **不许走网络重试**：500 是可重试状态码，所以「分类写在溢出判据之前」会让这一轮
+//      收到的是与第一次**逐字节相同**的重发请求（mock 端断言第二次请求带 checkpoint，
+//      于是「走了重试」当场红）；
+//   ② **真的压过**：第二次请求里必须出现 checkpoint 前言 + 摘要正文；
+//   ③ **摘要请求不许带整份历史**：只在最老那段里出现的标记不许出现在摘要请求里
+//      （这是 §5.3.3 那道预算闸门的机器判据）。
+//
+// 夹具：任务里塞一段 ≥ 8192 字节的正文，让历史**必须**被压（窗口给 4000 token，
+// 保守口径下这段必然超线）。`MOCK_OVERFLOW_OLD_MARK` 是该段里的标记。
+fn overflow_round(base: &const Config, tag: &const byte, ws: &const byte) bool {
+    _ = base;
+    mock_mode = 48;
+    mock_expect_shell = false;
+    mock_expect_fold = false;
+    mock_expect_steer = false;
+    if !ws_prepare(ws) {
+        out_err("selftest: cannot prepare workspace\n");
+        return false;
+    }
+    var port: u16 = 0;
+    const pid: i32 = ctxfit_spawn_mock(&port);
+    if pid < 0 {
+        return false;
+    }
+
+    var c: Config = cfg_default();
+    cfg_pin_api(&c, LLM_STYLE_CHAT);
+    c.base_url = buf_new(64);
+    _ = buf_append_cstr(&c.base_url, "http://127.0.0.1:");
+    _ = buf_append_u64(&c.base_url, port as u64);
+    _ = buf_append_cstr(&c.base_url, "/v1");
+    c.model = buf_new(32);
+    _ = buf_append_cstr(&c.model, "selftest-model");
+    c.api_key = buf_new(32);
+    _ = buf_append_cstr(&c.api_key, "selftest-key");
+    c.workspace = buf_new(strlen(ws) + 8);
+    _ = buf_append_cstr(&c.workspace, ws);
+    // 夹具（home + 合成日志 + 解析出的路径）—— 见 `ctxfit_prepare_fixture` 的注释
+    var home: Buf = buf_new(strlen(ws) + 64);
+    defer { buf_free(&home); }
+    var resume_path: Buf = buf_new(strlen(ws) + 320);
+    defer { buf_free(&resume_path); }
+    if !ctxfit_prepare_fixture(ws, &home, &resume_path) {
+        return false;
+    }
+    c.verify = HC_VERIFY_NONE;
+    c.allow_shell = false;
+    c.stream = true;
+    c.sandbox = SAN_OFF;
+    c.max_steps = 2;
+    c.timeout_ms = 15000;
+    c.quiet = true;
+    // 窗口给 200000：这份日志按保守口径约 45000 token，**装得下** ⇒ 恢复时那道
+    // `cmp_fit_history` 闸门不动它（见上面那段为什么必须如此），而触发线（160000）
+    // 也不会在 step 边界先自动压一次 —— 于是这一轮唯一能引发压缩的，就是假网关
+    // 回的那个「超窗 500」。**触发源唯一**是这一轮能定性的前提。
+    c.context_window = 200000 as i64;
+    c.agent_home = buf_new(home.len + 8);
+    _ = buf_append(&c.agent_home, home.ptr as &const byte, home.len);
+    c.resume_id = buf_new(resume_path.len + 8);
+    _ = buf_append(&c.resume_id, resume_path.ptr as &const byte,
+                   resume_path.len);
+    inbox_globals_init();
+    const rc: i32 = agent_run(&c);
+    cfg_free(&c);
+    const mock_rc: i32 = wait_child(pid);
+
+    var ok: bool = true;
+    out_err("selftest[");
+    out_err(tag);
+    out_err("] ");
+    if rc != AGENT_OK {
+        out_err("FAIL: agent_run returned ");
+        out_err_dec(rc as usize);
+        ok = false;
+    } else if mock_rc != 0 {
+        out_err("FAIL: mock server verdict ");
+        out_err_dec(mock_rc as usize);
+        ok = false;
+    } else {
+        out_err("ok");
+    }
+    out_err("\n");
+    return ok;
+}
+
+// ---------------------------------------------------------------------------
+// overflow-recover 轮的夹具：用**真实**的会话写入器造一份日志（不手拼 JSON）
+// ---------------------------------------------------------------------------
+// 为什么用写入器而不是手写文件：目录名是按路径 slug 出来的（`--<slug>--`），手拼容易
+// 与 `sess_find` 的算法错位 —— 那样这一轮会退化成「找不到会话 ⇒ 走了新建那条路」，
+// 而判据（切片边界）就整个失效了（**红不出来**的假绿比红更坏）。
+// 写入器顺手保证了日志的字节形状与真实会话逐字段一致。
+const CTXFIT_SID: &const byte =
+    "session-c7f17c71-1111-4222-8333-444455556666" as &const byte;
+// assistant(tool_calls) 那一组的 JSON（形状要合法：折叠侧会数它有几个调用）
+// 行宽豁免：tool_calls 数组的**线上形状**（折叠侧要按它数调用条数），不可断。
+const CTXFIT_CALLS: &const byte =
+    "[{\"id\":\"call_cf1\",\"type\":\"function\",\"function\":{\"name\":\"read\",\"arguments\":\"{}\"}}]"
+    as &const byte;
+
+// 写一份合成会话日志到 `home`。返回 false = 建目录/写盘失败（调用方红）。
+// 形状：header → [长 user（带 OLD_MARK）→ 40 组 assistant/tool] → 尾 user（带 TAIL_MARK）。
+// 40 组是照着「压力要过触发线」定的：每组约 2000 字节 ⇒ 保守口径 800 token，
+// 40 组 ≈ 32000 token，而这一轮的窗口给 4000（触发线 3200）—— 远超，不靠运气。
+fn ctxfit_write_log(home: &const Buf) bool {
+    var hp: Buf = buf_new(home.len + 1);
+    defer { buf_free(&hp); }
+    _ = buf_append(&hp, home.ptr, home.len);
+    _ = buf_append_byte(&hp, 0);
+    if !sess_mkdir_p(hp.ptr as &const byte) {
+        return false;
+    }
+    var log: SessionLog = sess_log_empty();
+    defer { sess_log_free(&log); }
+    const ws_fix: &const byte = "build/selftest_ws_overflow" as &const byte;
+    if !sess_open(&log, hp.ptr as &const byte, ws_fix,
+                  "selftest-model" as &const byte, "uya-agent" as &const byte,
+                  CTXFIT_SID, true, 0 as i64, true) {
+        return false;
+    }
+    // ① 最老的那条长 user 消息（被遮蔽段）
+    var old: Buf = buf_new(41024);
+    defer { buf_free(&old); }
+    _ = buf_append_cstr(&old, MOCK_OVERFLOW_OLD_MARK);
+    var i: usize = 0;
+    while i < 20000 {
+        _ = buf_append_byte(&old, 120 as byte);   // 'x'
+        i = i + 1;
+    }
+    if !ctxfit_log_user(&log, &old) {
+        return false;
+    }
+    // ② 40 组 assistant(tool_calls) + tool 结果（把压力顶过触发线）
+    var fill: Buf = buf_new(2048);
+    defer { buf_free(&fill); }
+    var g: usize = 0;
+    while g < 40 {
+        buf_reset(&fill);
+        var k: usize = 0;
+        while k < 2000 {
+            _ = buf_append_byte(&fill, 121 as byte);   // 'y'
+            k = k + 1;
+        }
+        if !ctxfit_log_group(&log, &fill) {
+            return false;
+        }
+        g = g + 1;
+    }
+    // ③ 尾 user 消息（保留段）
+    var tail: Buf = buf_new(256);
+    defer { buf_free(&tail); }
+    _ = buf_append_cstr(&tail, CTXFIT_TAIL_MARK);
+    return ctxfit_log_user(&log, &tail);
+}
+
+// 写一条 `user/message` 事件（裸 JSON 拼装：这一轮不需要转义，两个标记都是纯 ASCII）。
+fn ctxfit_log_user(log: &const SessionLog, text: &const Buf) bool {
+    var ev: Buf = buf_new(text.len + 256);
+    defer { buf_free(&ev); }
+    if !sess_begin(log, "user/message" as &const byte, &ev) {
+        return false;
+    }
+    _ = buf_append_cstr(&ev, "{\"role\":\"user\",\"content\":");
+    _ = buf_append_cstr(&ev, "[{\"type\":\"text\",\"text\":");
+    if !jw_str_into(&ev, text.ptr as &const byte, text.len) {
+        return false;
+    }
+    _ = buf_append_cstr(&ev, "}],\"source\":{\"kind\":\"user\"}}");
+    return sess_end(log, &ev);
+}
+
+// 写一组 `assistant/message`（带 tool_calls）+ `tool/result`（配对完整，折叠时不会被丢）。
+fn ctxfit_log_group(log: &const SessionLog, body: &const Buf) bool {
+    var ev: Buf = buf_new(body.len + 512);
+    defer { buf_free(&ev); }
+    if !sess_begin(log, "assistant/message" as &const byte, &ev) {
+        return false;
+    }
+    _ = buf_append_cstr(&ev, "{\"turn\":1,\"step\":1,\"message\":");
+    _ = buf_append_cstr(&ev, "{\"role\":\"assistant\",\"content\":\"\",");
+    _ = buf_append_cstr(&ev, "\"tool_calls\":");
+    _ = buf_append_cstr(&ev, CTXFIT_CALLS);
+    _ = buf_append_cstr(&ev, "}}");
+    if !sess_end(log, &ev) {
+        return false;
+    }
+    buf_reset(&ev);
+    if !sess_begin(log, "tool/result" as &const byte, &ev) {
+        return false;
+    }
+    _ = buf_append_cstr(&ev, "{\"turn\":1,\"step\":1,\"callId\":\"call_cf1\",");
+    _ = buf_append_cstr(&ev, "\"content\":");
+    if !jw_str_into(&ev, body.ptr as &const byte, body.len) {
+        return false;
+    }
+    _ = buf_append_cstr(&ev, "}");
+    return sess_end(log, &ev);
+}
+
+// 起一个 mock 子进程并回传它监听的端口；返回子进程 pid（< 0 = 起不来）。
+// 抽出来只为守住函数长度（这段 socket 样板有 30 多行，与判据无关）——
+// 与 `selftest_round` / `round_run_api` 里的同一段逐行等价。
+fn ctxfit_spawn_mock(port_out: &u16) i32 {
+    const lfd: i32 = sys_socket(AF_INET, SOCK_STREAM, IPPROTO_TCP) catch {
+        out_err("selftest: socket() failed\n");
+        return -1;
+    };
+    var one: i32 = 1;
+    _ = sys_setsockopt(lfd, SOL_SOCKET, SO_REUSEADDR, &one as &void,
+                       4 as u32) catch {};
+    var addr: [byte: 16] = [0: 16];
+    fill_sockaddr_ipv4(127, 0, 0, 1, 0, &addr[0]);
+    _ = sys_bind(lfd, &addr[0] as &void, 16 as u32) catch {
+        _ = sys_close(lfd) catch {};
+        return -1;
+    };
+    _ = sys_listen(lfd, 4) catch {
+        _ = sys_close(lfd) catch {};
+        return -1;
+    };
+    var got: [byte: 16] = [0: 16];
+    var glen: u32 = 16;
+    _ = sys_getsockname(lfd, &got[0] as &void, &glen) catch {
+        _ = sys_close(lfd) catch {};
+        return -1;
+    };
+    port_out[0] = ((got[2] as u16) << (8 as i32)) | (got[3] as u16);
+    const pid64: i64 = sys_fork() catch {
+        _ = sys_close(lfd) catch {};
+        return -1;
+    };
+    if pid64 == 0 {
+        const rc0: i32 = mock_server(lfd);
+        sys_exit(rc0);
+    }
+    _ = sys_close(lfd) catch {};
+    return i64_to_i32(pid64);
+}
+
+// overflow-recover 轮的夹具：建一份**合成会话日志**并解析出它的路径。
+// 返回 false = 建日志或解析路径失败（调用方红）。
+//
+// 日志形状刻意做成「**装得下**窗口，但被网关判超窗」（这是 §19.10 的真实形状）：
+//   * 开头一条 user 消息带 `MOCK_OVERFLOW_OLD_MARK` → 它落在**被遮蔽段**里；
+//   * 之后堆 40 组 assistant/工具结果；
+//   * 最后一条 user 消息带 `CTXFIT_TAIL_MARK` → 它落在**保留段**里。
+// 两条标记就是切片边界的正负判据：摘要请求该带前者、不该带后者。
+//
+// ⚠ **路径必须用 `sess_find` 拿，不许手拼**：目录名是按 workspace 路径 slug 出来的
+// （`--<slug>--`），手拼必然错位 —— 错位的表现是「没恢复、走了新建那条路」，
+// 判据全部落空却**看着绿**（实测踩过一次）。
+fn ctxfit_prepare_fixture(ws: &const byte, home_out: &Buf, path_out: &Buf) bool {
+    buf_reset(home_out);
+    _ = buf_append_cstr(home_out, ws);
+    _ = buf_append_cstr(home_out, "_home");
+    // 先整份删掉：这个 home 是**这一轮专用**的夹具目录，而上一轮的残留会让日志被
+    // 追加成「两份会话」—— 症状是 `seq 不连续` 加历史翻倍（实测踩过）。
+    _ = pm_rm_rf(home_out.ptr as &const byte, home_out.len);
+    if !ctxfit_write_log(home_out) {
+        out_err("selftest: cannot write fixture session log\n");
+        return false;
+    }
+    var homez: Buf = buf_new(home_out.len + 1);
+    defer { buf_free(&homez); }
+    _ = buf_append(&homez, home_out.ptr as &const byte, home_out.len);
+    _ = buf_append_byte(&homez, 0);
+    if !sess_find(homez.ptr as &const byte, ws, CTXFIT_SID,
+                  bufx_cstr_len(CTXFIT_SID), path_out) {
+        out_err("selftest: fixture session log not found\n");
+        return false;
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// ctx-fold 轮：`--resume` 折叠 checkpoint（P88 第三道闸门的**唯一**机器判据）
+// ---------------------------------------------------------------------------
+// 为什么这轮必须单独存在：落盘写得再对，只要折叠侧不认那条事件，`--resume` 就会把
+// 被压掉的整段**原样折回来** —— 会话回到超窗状态，而这个错误**没有任何其它断言看得见**
+// （压缩当回合是成功的、日志里也确实有 checkpoint 事件）。§19.10 那个死锁的第二半
+// 就是它，所以这里直接调 `agent_hist_from_log` 钉三件事：
+//   ① checkpoint **之前**折出来的消息必须消失（否则 resume 等于没压过）；
+//   ② checkpoint 的正文必须在（否则历史丢了内容，模型失去上下文）；
+//   ③ 恢复时**重新注入**的那几条（system + 运行时上下文）必须留着
+//      （它们不进日志，丢了就没有请求骨架了）。
+fn ctx_fold_round(tag: &const byte) bool {
+    var ok: bool = true;
+    var path: Buf = buf_new(1200);
+    defer { buf_free(&path); }
+    if !ctxfold_fixture(tag, &path, &ok) {
+        return false;
+    }
+    // 折叠它
+    var c: Config = cfg_default();
+    defer { cfg_free(&c); }
+    var h: History = hist_init();
+    defer { hist_free(&h); }
+    var next_seq: i64 = 0;
+    const added: i32 = agent_hist_from_log(&c, &h, &path, &next_seq, false);
+    // 条数是 3 而不是 2：恢复时**重新注入**的运行时上下文也走 `added` 计数
+    // （system 不算，它是在 `agent_hist_from_log` 开头单独压进去的）。
+    // 这条断言的意义是「折叠确实发生了 3 件事」—— 数字改大改小都会红。
+    stx_num_eq(tag, "折出消息（注入段 + checkpoint + 尾部）", added as i64, 3, &ok);
+    // 拼出全文，逐条判据都在它上面查（历史里存的是裸指针，不能直接当 C 串）
+    var all: Buf = buf_new(8192);
+    defer { buf_free(&all); }
+    var i: usize = 0;
+    while i < h.len {
+        const m: &const Msg = msg_at(&h, i);
+        if m.text_len > 0 {
+            _ = buf_append(&all, m.text as &const byte, m.text_len);
+        }
+        _ = buf_append_byte(&all, 10);
+        i = i + 1;
+    }
+    // ① checkpoint 之前的消息必须消失（这条就是「resume 等于没压过」的探测器）
+    stx_num_eq(tag, "checkpoint 之前的消息已消失",
+        b2i(contains(&all, CTXFOLD_PRE_MARK)), 0, &ok);
+    // ② checkpoint 正文必须留着
+    stx_num_eq(tag, "checkpoint 正文留着",
+        b2i(contains(&all, "CHECKPOINT-BODY-MARK")), 1, &ok);
+    // ③ checkpoint 之后的消息必须留着
+    stx_num_eq(tag, "checkpoint 之后的消息留着",
+        b2i(contains(&all, CTXFOLD_POST_MARK)), 1, &ok);
+    // ④ 恢复时重新注入的那几条必须留着（system 一定在；丢了就没有请求骨架）
+    stx_num_eq(tag, "system 仍在最前",
+        b2i(h.len > 0 && msg_at(&h, 0).role == ROLE_SYSTEM), 1, &ok);
+    // ⑤ 顺序：checkpoint 必须排在尾部那条消息**之前**
+    const pos_ck: isize = find_sub(all.ptr[0: all.len],
+                                   "CHECKPOINT-BODY-MARK"[0: 20], 0);
+    const pos_post: isize = find_sub(all.ptr[0: all.len],
+                                     CTXFOLD_POST_MARK[0: 17], 0);
+    stx_num_eq(tag, "checkpoint 排在尾部之前",
+        b2i(pos_ck >= 0 && pos_post >= 0 && pos_ck < pos_post), 1, &ok);
+    if ok {
+        out_err("selftest[");
+        out_err(tag);
+        out_err("] ok（之前消失 / 正文留着 / 之后留着 / system 在位 / 顺序对）\n");
+    }
+    return ok;
+}
+
+// 夹具：起点那条消息的标记（checkpoint **之前**，折叠后必须消失）
+const CTXFOLD_PRE_MARK: &const byte = "CTXFOLD-PRE-GONE" as &const byte;
+// 夹具：终点那条消息的标记（checkpoint **之后**，必须留着）
+const CTXFOLD_POST_MARK: &const byte = "CTXFOLD-POST-KEEP" as &const byte;
+// 夹具会话 id
+const CTXFOLD_SID: &const byte =
+    "session-cf01d000-1111-4222-8333-444455556666" as &const byte;
+
+// 写一条 checkpoint 事件（形状与 `agent_log_checkpoint` 逐字段一致：
+// `user/message` + `source.kind = "compaction"` + `shadowed` / `omittedFrom`）。
+fn ctxfold_log_ck(log: &const SessionLog, ck: &const Buf) bool {
+    var ev: Buf = buf_new(ck.len + 512);
+    defer { buf_free(&ev); }
+    if !sess_begin(log, "user/message" as &const byte, &ev) {
+        return false;
+    }
+    _ = buf_append_cstr(&ev, "{\"role\":\"user\",\"content\":");
+    _ = buf_append_cstr(&ev, "[{\"type\":\"text\",\"text\":");
+    if !jw_str_into(&ev, ck.ptr as &const byte, ck.len) {
+        return false;
+    }
+    _ = buf_append_cstr(&ev, "}]");
+    _ = buf_append_cstr(&ev, ",\"shadowed\":1,\"omittedFrom\":0");
+    _ = buf_append_cstr(&ev, ",\"source\":{\"kind\":\"compaction\"}}");
+    return sess_end(log, &ev);
+}
+
+// ctx-fold 轮的夹具：建一份带 checkpoint 的会话日志，并把解析出的路径写进 `path`。
+// 返回 false = 夹具没建起来（已用 `ty_fail` 记过红，调用方直接返回）。
+//
+// 日志形状：user（在 checkpoint **之前**）→ checkpoint → user（在它之后）。
+// 前者的标记折叠后必须消失、后者必须留着 —— 两个标记就是那条不变量的正负判据。
+fn ctxfold_fixture(tag: &const byte, path: &Buf, ok: &bool) bool {
+    var home: Buf = buf_new(512);
+    defer { buf_free(&home); }
+    _ = buf_append_cstr(&home, "build/selftest_ctxfold_home");
+    var hp: Buf = buf_new(600);
+    defer { buf_free(&hp); }
+    _ = buf_append(&hp, home.ptr as &const byte, home.len);
+    _ = buf_append_byte(&hp, 0);
+    _ = pm_rm_rf(home.ptr as &const byte, home.len);
+    if !sess_mkdir_p(hp.ptr as &const byte) {
+        ty_fail(tag, "建不了夹具目录", ok);
+        return false;
+    }
+    var log: SessionLog = sess_log_empty();
+    defer { sess_log_free(&log); }
+    const ws_fix: &const byte = "build/selftest_ws_ctxfold" as &const byte;
+    if !sess_open(&log, hp.ptr as &const byte, ws_fix,
+                  "selftest-model" as &const byte, "uya-agent" as &const byte,
+                  CTXFOLD_SID, true, 0 as i64, true) {
+        ty_fail(tag, "开不了夹具日志", ok);
+        return false;
+    }
+    var pre: Buf = buf_new(512);
+    defer { buf_free(&pre); }
+    _ = buf_append_cstr(&pre, CTXFOLD_PRE_MARK);
+    _ = buf_append_cstr(&pre, " 这条消息在 checkpoint 之前，折叠后必须消失");
+    if !ctxfit_log_user(&log, &pre) {
+        ty_fail(tag, "写不了 checkpoint 之前的消息", ok);
+        return false;
+    }
+    // checkpoint 事件（就是 `agent_log_checkpoint` 写的那个形状）
+    var ck: Buf = buf_new(512);
+    defer { buf_free(&ck); }
+    _ = buf_append_cstr(&ck, "CHECKPOINT-BODY-MARK 压过的摘要正文");
+    if !ctxfold_log_ck(&log, &ck) {
+        ty_fail(tag, "写不了 checkpoint 事件", ok);
+        return false;
+    }
+    var post: Buf = buf_new(512);
+    defer { buf_free(&post); }
+    _ = buf_append_cstr(&post, CTXFOLD_POST_MARK);
+    _ = buf_append_cstr(&post, " 这条在 checkpoint 之后，必须留着");
+    if !ctxfit_log_user(&log, &post) {
+        ty_fail(tag, "写不了 checkpoint 之后的消息", ok);
+        return false;
+    }
+    // 解析日志路径（同夹具那条纪律：不许手拼 slug 目录）
+    var hz: Buf = buf_new(home.len + 1);
+    defer { buf_free(&hz); }
+    _ = buf_append(&hz, home.ptr as &const byte, home.len);
+    _ = buf_append_byte(&hz, 0);
+    if !sess_find(hz.ptr as &const byte, ws_fix,
+                  CTXFOLD_SID, bufx_cstr_len(CTXFOLD_SID), path) {
+        ty_fail(tag, "找不到夹具日志", ok);
+        return false;
+    }
+    return true;
+}

@@ -268,6 +268,67 @@ fn agent_pressure_tokens(cfg: &const Config, h: &const History) i64 {
     return est;
 }
 
+// P88：组**摘要请求**的输入 —— `system + 被遮蔽的那一段 + 摘要提示词`。
+//
+// 为什么不再带整份历史（这是 §19.10 那个死锁的根因）：摘要请求原来是把 `h` 整个复制
+// 一份再挂提示词，于是**它自己的体量与主请求一样大** —— 历史一旦超过窗口，连
+// 「压小它」的那一发请求也被同一个窗口拒掉，压缩永远起不来，而屏幕上只看到主请求
+// 反复 500/400。摘要只需要看**要被替换掉的那一段**，所以这里只带那一段。
+//
+// 预算闸门（`budget`）：系统提示词 + 提示词 + 工具表先扣掉，剩下的按**保守**口径
+// （`CMP_EST_*`）从**新往旧**装。装不下的最老那几段直接不进摘要请求 —— 它们照样会被
+// `cmp_apply` 遮蔽掉，只是没有进摘要（`from_out` 回传起点，调用方据此如实回执）。
+//
+// ⚠ **闸门只在窗口装得下「固定开销」时才生效**（`budget > fixed`）：窗口小到连
+// system + 提示词 + 工具表都放不下时，它已经不是一个「请求上界」了（那是触发线的
+// 语义 —— 实测 `compact-auto` 那轮给的 200 就是这种口径），此时**退回不设闸门**
+// 的旧行为。反过来（不区分这一档就一律拦下）会让压缩在一切小窗口配置上**永远**
+// 不发生 —— 而「压缩永远不发生」正是 §19.10 那个死锁的成因，等于用一个死锁换另一个。
+// 返回 false 只剩一条路：闸门生效、但**一条**被遮蔽的消息都装不进去（摘要无从谈起）。
+fn agent_summary_input(cfg: &const Config, h: &const History, shadow: usize,
+                       tmp: &History, from_out: &usize) bool {
+    var prompt: Buf = buf_new(8192);
+    defer { buf_free(&prompt); }
+    if !cmp_summary_prompt(&prompt) {
+        return false;
+    }
+    var from: usize = 1;                     // 0 = system，永远保留（它是请求的骨架）
+    const budget: i64 = cmp_summary_budget(cfg.context_window);
+    if budget > 0 {
+        // 先扣掉三样不随遮蔽段伸缩的东西：system、摘要提示词、tools schema。
+        var fixed: i64 = 0;
+        if h.len > 0 {
+            const sys_n: usize = msg_at(h, 0).text_len + msg_at(h, 0).extra_len;
+            fixed = cmp_est_tokens(sys_n);
+        }
+        fixed = fixed + cmp_est_tokens(prompt.len);
+        fixed = fixed + cmp_est_tokens(tools_json_max_bytes(cfg.allow_shell));
+        const room: i64 = budget - fixed;
+        // room <= 0 = 窗口装不下固定开销 ⇒ 窗口不是可用的请求上界，闸门让开（见上）。
+        if room > 0 {
+            from = cmp_fit_start(h, 1, shadow, room);
+            if from >= shadow {
+                return false;
+            }
+        }
+    }
+    from_out[0] = from;
+    // system 原文（照抄）＋ 被遮蔽段的正文
+    var i: usize = 0;
+    while i < shadow {
+        if i != 0 && i < from {
+            i = i + 1;
+            continue;                        // 预算外的最老那几段：不进摘要请求
+        }
+        const m: &const Msg = msg_at(h, i);
+        _ = hist_push_msg_kind(tmp, m.role, m.kind, m.text as &const byte,
+                               m.text_len, m.extra as &const byte,
+                               m.extra_len);
+        i = i + 1;
+    }
+    return hist_push(tmp, ROLE_USER, prompt.ptr as &const byte, prompt.len);
+}
+
 // force=true 时忽略阈值（/compact 手动触发）
 fn agent_maybe_compact(cfg: &const Config, h: &History, step: i32, force: bool) bool {
     const cw: i64 = cfg.context_window;
@@ -283,22 +344,23 @@ fn agent_maybe_compact(cfg: &const Config, h: &History, step: i32, force: bool) 
     if shadow == 0 {
         return false;
     }
-    // 组摘要请求：历史副本 + 摘要提示词（DSH 把提示词作为最后一条 user 消息）
+    // 组摘要请求：system + 被遮蔽段 + 摘要提示词（DSH 把提示词作为最后一条 user 消息）
     var tmp: History = hist_init();
     defer { hist_free(&tmp); }
-    var i: usize = 0;
-    while i < h.len {
-        const m: &const Msg = msg_at(h, i);
-        _ = hist_push_msg_kind(&tmp, m.role, m.kind, m.text as &const byte, m.text_len, m.extra as &const byte, m.extra_len);
-        i = i + 1;
-    }
-    var prompt: Buf = buf_new(8192);
-    defer { buf_free(&prompt); }
-    if !cmp_summary_prompt(&prompt) {
+    var from: usize = 1;
+    if !agent_summary_input(cfg, h, shadow, &tmp, &from) {
+        // 预算闸门都没放行（连 system + 提示词都装不下窗口）：**不许**发出这一发，
+        // 它只会换回一个 400，还会把「压不动」伪装成「摘要失败」。
+        if !cfg.quiet {
+            out_err("[compact] 摘要请求放不进上下文窗口，跳过本次压缩（见 --context-window）\n");
+        }
         return false;
     }
-    if !hist_push(&tmp, ROLE_USER, prompt.ptr as &const byte, prompt.len) {
-        return false;
+    if from > 1 && !cfg.quiet {
+        // 如实回执：最老的那几段没有进摘要，它们会被直接换成 checkpoint（信息有损）
+        out_err("[compact] 注：最老的 ");
+        out_err_dec((from - 1) as usize);
+        out_err(" 条放不进摘要请求，将被直接丢弃\n");
     }
     var req: Buf = buf_new(request_bytes_needed(&tmp, cfg));
     defer { buf_free(&req); }
@@ -368,7 +430,13 @@ fn agent_maybe_compact(cfg: &const Config, h: &History, step: i32, force: bool) 
     }
     if status != 200 || o.content.len == 0 {
         if !cfg.quiet {
-            out_err("[compact] 摘要请求失败，跳过本次压缩\n");
+            out_err("[compact] 摘要请求失败，跳过本次压缩");
+            if status != 0 {
+                out_err("（HTTP ");
+                out_err_dec(status as usize);
+                out_err("）");
+            }
+            out_err("\n");
         }
         return false;
     }
@@ -391,6 +459,10 @@ fn agent_maybe_compact(cfg: &const Config, h: &History, step: i32, force: bool) 
         if agent_system_prompt(cfg, &sp) {
             _ = hist_insert_at(h, 0, ROLE_SYSTEM, sp.ptr as &const byte, sp.len, null, 0);
         }
+        // P88：**落盘**。不落这一步的话压缩只活在内存里，而 `--resume` 是把日志
+        // 从头折一遍 —— 被压掉的那一段会原样回来，下次启动又是同一个超窗死锁
+        // （§19.10 记录的正是这个：会话从此再也发不出任何请求）。
+        agent_log_checkpoint(ck.ptr as &const byte, ck.len, shadow, from);
     }
     if !cfg.quiet {
         out_err("[compact] 已压缩较早的 ");

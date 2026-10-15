@@ -847,6 +847,46 @@ fn agent_log_simple(typ: &const byte, payload: &const byte) void {
     _ = sess_end(&g_sess, &ev);
 }
 
+// P88：把一条 checkpoint **落盘**（`user/message` + `source.kind = "compaction"`）。
+//
+// 为什么要落（§19.10 的根因之一）：`--resume` 把日志**从头折一遍**，而压缩原来只改内存
+// 里的历史、日志里只留下一句 `compaction/summary`。于是「被压掉的那一段」下次启动原样回来，
+// 会话又回到超窗状态 —— 而这一次连压都压不动了（摘要请求同样超窗），表现就是**这个会话
+// 再也发不出任何请求**（实测连敲三次「继续」都是同一个 400）。
+//
+// 形状对齐 DSH：它把 checkpoint 写成一条 `user/message`，`source.kind` 区分来源
+// （这里是 `"compaction"`，与人的 `"user"`、插话的 `"steer"` 并列）。折叠侧
+// （`agent_hist_from_log`）认这个 kind，把此前累积的消息**丢掉**、只留 checkpoint ——
+// 于是「折日志」与「内存里的历史」是同一份东西。
+//
+// 另带两个数：`shadowed`（被替换掉的条数）与 `omittedFrom`（有几条最老的没进摘要，
+// 0 = 全进了）。它们是事后复盘唯一的证据 —— 信息有损是多少，只有这里记得下来。
+fn agent_log_checkpoint(ck: &const byte, ck_len: usize,
+                        shadowed: usize, omitted: usize) void {
+    if !g_sess.save || ck_len == 0 {
+        return;
+    }
+    var ev: Buf = buf_new(ck_len + 256);
+    defer { buf_free(&ev); }
+    if !sess_begin(&g_sess, "user/message", &ev) {
+        return;
+    }
+    _ = buf_append_cstr(&ev, "{\"role\":\"user\",\"content\":");
+    _ = buf_append_cstr(&ev, "[{\"type\":\"text\",\"text\":");
+    if !jw_str_into(&ev, ck, ck_len) {
+        return;
+    }
+    _ = buf_append_cstr(&ev, "}]");
+    _ = buf_append_cstr(&ev, ",\"shadowed\":");
+    _ = buf_append_i64(&ev, shadowed as i64);
+    _ = buf_append_cstr(&ev, ",\"omittedFrom\":");
+    const omit_n: i64 = if omitted > 1 { (omitted - 1) as i64 }
+                        else { 0 as i64 };
+    _ = buf_append_i64(&ev, omit_n);
+    _ = buf_append_cstr(&ev, ",\"source\":{\"kind\":\"compaction\"}}");
+    _ = sess_end(&g_sess, &ev);
+}
+
 // 回合开始：`g_turn` 加一、写 `turn/start`，并把会话级的 todo 清空（DSH 口径）。
 fn agent_log_turn_start() void {
     var ev: Buf = buf_new(64);
@@ -921,8 +961,14 @@ fn agent_hist_from_log(cfg: &const Config, h: &History, path: &const Buf, out_ne
     defer { buf_free(&text); }
     var extra: Buf = buf_new(65536);
     defer { buf_free(&extra); }
+    var kd: Buf = buf_new(32);
+    defer { buf_free(&kd); }
     var added: i32 = 0;
     var expect: i64 = 0;
+    // P88：checkpoint 折叠的**基线** = 此刻历史里已有的那几条（system + 运行时上下文 /
+    // AGENTS.md / 技能目录 / 开工包）。它们不进日志，所以每次恢复都要重新注入一次；
+    // 折叠一个 checkpoint 时保留它们、丢掉此后折出来的消息（见下面那个分支）。
+    const baseline: usize = h.len;
     out_next_seq[0] = 0;
     if fold_stats {
         st_reset();
@@ -947,6 +993,22 @@ fn agent_hist_from_log(cfg: &const Config, h: &History, path: &const Buf, out_ne
         }
         const view: &[byte] = line.ptr[0: line.len];
         if sv_eq_cstr(&typ, "user/message") {
+            // P88：checkpoint 事件（`source.kind = "compaction"`）**改写折叠基线**：
+            // 它记录了「此前的消息已被压成这一条」，所以先把折叠出来的消息丢掉，只留
+            // system + 注入段，再把 checkpoint 压进去。不认它的话 `--resume` 会把被压掉的
+            // 那一段原样折回来 —— 下一次启动又是同一个超窗死锁（§19.10 就是它）。
+            if sess_json_str(view, "kind", &kd) && kd.len > 0
+                && bufx_eq_cstr(kd.ptr as &const byte, kd.len,
+                                "compaction" as &const byte) {
+                _ = agent_fold_reset_to_baseline(h, baseline);
+                const have_ck: bool = sess_json_str(view, "text", &text);
+                if have_ck && text.len > 0
+                    && hist_push(h, ROLE_USER, text.ptr as &const byte,
+                                 text.len) {
+                    added = added + 1;
+                }
+                continue;
+            }
             if sess_json_str(view, "text", &text) && text.len > 0 {
                 // P51：图片附件（`"attachments":[...]`）随消息一起回放 —— 少了它，
                 // --resume 之后那些图就发不出去了（历史里存的是路径 + 元数据）。
@@ -999,15 +1061,24 @@ fn agent_hist_from_log(cfg: &const Config, h: &History, path: &const Buf, out_ne
                 // P46：钉住与否只看**最后一条** title 事件的 kind（latest-wins，与 DSH 的
                 // foldSessionTitle 同口径）。不读它的话 `--resume` 之后钉住状态就丢了，
                 // 自动起标题会把用户手写的标题覆盖掉。
-                var kd: Buf = buf_new(32);
-                defer { buf_free(&kd); }
-                g_title_pinned = sess_json_str(view, "kind", &kd)
-                    && bufx_eq_cstr(kd.ptr as &const byte, kd.len, "user" as &const byte);
+                var kd2: Buf = buf_new(32);
+                defer { buf_free(&kd2); }
+                g_title_pinned = sess_json_str(view, "kind", &kd2)
+                    && bufx_eq_cstr(kd2.ptr as &const byte, kd2.len,
+                                    "user" as &const byte);
             }
         }
     }
     if r.dropped_tail {
         out_err("[session] 最后一条记录不完整，已丢弃（崩溃恢复）\n");
+    }
+    // P88：折完量一次 —— 折出来的历史必须**装得进窗口**，否则这个会话一开口就是 400，
+    // 而 400 那条路上连压缩都发不出去（§19.10）。装不下就从头丢（保住 system）。
+    const dropped_fit: usize = cmp_fit_history(h, cfg.context_window);
+    if dropped_fit > 0 {
+        out_err("[session] 历史装不进上下文窗口，已丢弃最老的 ");
+        out_err_dec(dropped_fit);
+        out_err(" 条消息（见 --context-window）\n");
     }
     out_next_seq[0] = expect;   // 续写时接着这个 seq 往下写
     return added;
@@ -1016,6 +1087,18 @@ fn agent_hist_from_log(cfg: &const Config, h: &History, path: &const Buf, out_ne
 // 取字段并复制到独立缓冲（sess_json_str 内部用临时缓冲，这里要留下副本）
 fn sess_json_string_dup(view: &[byte], key: &const byte, out: &Buf) bool {
     return sess_json_str(view, key, out);
+}
+
+// P88：折叠到一个 checkpoint 时，把历史收回到 `baseline` 条（= 恢复时注入的那几条：
+// system + 运行时上下文 / AGENTS.md / 技能 / 开工包）。`hist_truncate_to` 已经做了
+// 「释放 + 计数」的全部工作，这里只是给它一个名字，让折叠侧那条不变量读得出来：
+// **checkpoint 之后折出来的消息属于 checkpoint 内部，不许活着穿过下一条 checkpoint**。
+fn agent_fold_reset_to_baseline(h: &History, baseline: usize) bool {
+    if baseline == 0 || baseline > h.len {
+        return false;
+    }
+    hist_truncate_to(h, baseline);
+    return true;
 }
 
 // 打开（或恢复）会话：返回 false 表示只能新建

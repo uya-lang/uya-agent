@@ -38,6 +38,18 @@ export const STEP_RETRY: i32 = 101;
 // 两件事都落在这一个内层 `while !sent` 里，判据在 net/retryx 只有一份。
 export const STEP_RETRY_NET: i32 = 102;
 
+// P88：**上下文超窗 → 就地压缩后同一步重发**（第三个 step 循环的内部码）。
+//
+// 为什么它不是 `STEP_RETRY_NET` 的一种：那一条**不动历史**（重发的请求体与上次逐字节
+// 相同），而这一条恰恰相反 —— 它要先回到 step 边界去压缩，**历史必须被改小**，
+// 否则再发一次还是同一个 400。两者的收口条件也不同：网络的收口是「预算用尽/人叫停」，
+// 超窗的收口是「压不动了」（没有可压的段、或摘要放不进窗口）。
+//
+// 额度**每回合一次**（不是每步）：压缩是重活（一次额外模型请求），而同一个回合里
+// 反复「压一点→再试→又超窗」只会把时间烧在摘要上。压过一次仍超窗，就按协议错收口，
+// 把窗口配置的问题（`--context-window`）如实报出来让人处理。
+export const STEP_RETRY_OVERFLOW: i32 = 103;
+
 // 交互模式：本回合被用户 Ctrl-C 打断（不是错误，回到提示符即可）
 export const AGENT_INTERRUPTED: i32 = 130;
 
@@ -52,6 +64,9 @@ export const RTX_K_TRANSPORT: i32 = 1;   // 连接/DNS/IO/超时（含 TLS 校�
 export const RTX_K_STREAM: i32 = 2;      // SSE 在 [DONE] 之前断掉
 export const RTX_K_STATUS: i32 = 3;      // HTTP 瞬时状态码（408/425/429/5xx）
 export const RTX_K_BODY: i32 = 4;        // HTTP 200 + 体内错误帧（瞬时 code）
+// P88：上下文超窗（HTTP 400/413，或网关包成 500 的那种）。它与上面四类**互斥**：
+// 那四类都是「重发同一个请求」能好的，这一类只有「先把历史改小」才有出路。
+export const RTX_K_OVERFLOW: i32 = 5;
 
 var g_rtx_kind: i32 = RTX_K_NONE;
 var g_rtx_status: i32 = 0;        // RTX_K_STATUS 时的 HTTP 状态码
@@ -62,6 +77,12 @@ var g_rtx_tls_seen: bool = false; // RTX_K_TRANSPORT 时是否观测到 leaf 证
 // **指纹不需要副本**：`hc_last_leaf_ptr()`/`hc_last_leaf_len()` 是 net/httpc 里的
 // 进程级全局（最近一次握手观测到的那个），`agent_step_*` 返回之后照样读得到。
 var g_rtx_reason: Buf = Buf{ ptr: null, len: 0, cap: 0 };
+
+// P88：本回合还剩几次「超窗就地压缩」的额度（回合入口置位）。
+// 为什么每回合一次而不是每步一次：压缩是一次额外的模型请求（重活），而同一个回合里
+// 反复「压一点 → 再试 → 又超窗」只会把时间烧在摘要上。压过一次仍超窗 = 窗口配置
+// 本身不对（`--context-window` 小于真实窗口），那时候该说话的是人，不是循环。
+var g_overflow_left: bool = false;
 
 // agent_rtx_after_failure 的三个返回值（见那里的注释：三者混起来就会出现
 // 「人叫停了却被当成预算用尽」这类错收口）。
@@ -887,6 +908,18 @@ fn agent_step_stream(cfg: &Config, style: u8, url: &const Buf, hdrs: &const Buf,
     }
     if status != 200 {
         out_status[0] = status;
+        // P88：**先**认「上下文超窗」，它必须排在瞬时状态码之前。
+        // 现场（§19.10）：本机网关把上游的 400 包成 `[invalid_params]` + HTTP 500 发回来，
+        // 500 落在 `rtx_retryable_status` 里 ⇒ 默认无限重试的闸门会一直重发同一个必然
+        // 失败的请求，真正的错因（窗口超了）被这层包装盖得严严实实。溢出**不是**瞬时错：
+        // 重发一百次还是溢出，唯一出路是先把历史改小（回到 step 循环去压）。
+        if rtx_context_overflow(&o.err_text) {
+            g_rtx_kind = RTX_K_OVERFLOW;
+            g_rtx_status = status;
+            agent_rtx_note_reason(o.err_text.ptr as &const byte,
+                                  o.err_text.len);
+            return STEP_RETRY_OVERFLOW;
+        }
         // P82：瞬时状态码（408/425/429/5xx）走重试那条路，其余照旧当场收口。
         // 协商探测那一次**不**重试：404 是「这个端点不存在」，重发一百次也还是 404
         // （它是本仓唯一一处「换个协议再试」的正当理由，走 api_negotiate）。
@@ -1203,6 +1236,15 @@ fn agent_rtx_give_up(cfg: &const Config, attempt: i32) i32 {
     if g_rtx_kind == RTX_K_STREAM {
         out_err(RTX_ERR_STREAM_CLOSED);
         return AGENT_NET;
+    }
+    // P88：超窗不该走到这里（它由 `STEP_RETRY_OVERFLOW` 那条路单独收口），但分类表
+    // 多了一档就得有对应的出口 —— 静默落进下面「传输错」的通用分支会给出完全错的建议
+    // （「查 --tls-verify」对超窗毫无意义）。这条只是兜底，正常情况下到不了。
+    if g_rtx_kind == RTX_K_OVERFLOW {
+        out_err("error: 请求超出上下文窗口（HTTP ");
+        out_err_dec(g_rtx_status as usize);
+        out_err("）—— 试 /compact、--context-window N，或 /new 开个新会话\n");
+        return AGENT_PROTO;
     }
     if g_rtx_kind == RTX_K_STATUS {
         out_err("model endpoint returned HTTP ");
@@ -1646,6 +1688,15 @@ fn agent_step_plain(cfg: &const Config, style: u8, url: &const Buf, hdrs: &const
 
     if resp.status != 200 {
         out_status[0] = resp.status;
+        // P88：与流式那条路**同一条判据**（`rtx_context_overflow`），顺序也一样：
+        // 溢出排在瞬时状态码之前（网关用 500 包 400 的现场见流式那段的注释）。
+        if rtx_context_overflow(&resp.body) {
+            g_rtx_kind = RTX_K_OVERFLOW;
+            g_rtx_status = resp.status;
+            agent_rtx_note_reason(resp.body.ptr as &const byte, resp.body.len);
+            resp_free(&resp);
+            return STEP_RETRY_OVERFLOW;
+        }
         // P82：瞬时状态码走重试（与流式同一条判据）；其余照旧当场收口
         if rtx_retryable_status(resp.status) {
             g_rtx_kind = RTX_K_STATUS;
@@ -1728,6 +1779,8 @@ fn agent_turn_loop_inner(cfg: &Config, h: &History) i32 {
     if cfg.src_api_retry != 0 {
         rtx_set_max(cfg.api_retry_max);
     }
+    // P88：本回合的「超窗就地压缩」额度（每回合一次，见 STEP_RETRY_OVERFLOW 那段）
+    g_overflow_left = true;
     // P55：回合开始复位执行期纪律的那点状态 ——
     //   * 上一回合切下去的低档位先还原（配置档位是每个回合的起点，不然一次任务之后就永久降档了）；
     //   * 本回合的改动计数 / 验收锚点 / 提醒计数清零（收工预算按回合算）。
@@ -1944,6 +1997,28 @@ fn agent_turn_loop_inner(cfg: &Config, h: &History) i32 {
                     continue;
                 }
                 step_rc = agent_rtx_give_up(cfg, attempt);
+                sent = true;
+                continue;
+            }
+            if rc == STEP_RETRY_OVERFLOW {
+                // P88：上下文超窗 —— **改小历史再重发**（唯一有出路的那条路）。
+                // 额度每回合一次：`g_overflow_left` 在回合入口置位，这里扣。
+                if g_overflow_left {
+                    g_overflow_left = false;
+                    const done: bool = agent_maybe_compact(cfg, h, step, true);
+                    if (done) {
+                        // 历史变了 ⇒ 下一轮重算 url/req（内层循环本来就是这么写的）
+                        out_err("[compact] 就地压缩完成，重发本步请求\n");
+                        continue;
+                    }
+                }
+                // 压不动（没有可压的段 / 摘要放不进窗口 / 额度已用）：按协议错收口，
+                // 并把**人能做的那件事**说出来 —— 否则用户看到的只是一句 HTTP 400。
+                out_err("error: 请求超出上下文窗口，且本回合压不动了");
+                out_err("（试 /compact、--context-window N，或 /new 开个新会话）\n");
+                out_diag("context-overflow", "body: ",
+                    g_rtx_reason.ptr as &const byte, g_rtx_reason.len);
+                step_rc = AGENT_PROTO;
                 sent = true;
                 continue;
             }
