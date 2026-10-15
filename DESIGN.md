@@ -1504,6 +1504,7 @@ agent_hist_from_log sess_reader_load 整文件读入、跳 header → sess_next 
    ├─ 每行先 st_fold_line（折叠统计）
    └─ 按 seq 连续性校验（不连续打印 [session] 警告：seq 不连续）
 hist_trim_incomplete_tail   丢未完成一轮的尾部
+hist_repair_pairing         丢**任何位置**的悬空组（P89：半组不在结尾时上面那条修不好，§19.11）
 sess_open_resume            用会话自己的路径 + next_seq 续写
 ```
 
@@ -6189,6 +6190,8 @@ DEEPSEEK_API_KEY=sk-xxx ./build/uya-agent \
 | `compact-auto` | 窗口 200 触发：摘要请求 → `automatically generated checkpoint` |
 | `history-long` | 40 轮 × 2（≈124 条）配对完整、最后一轮 80 条工具结果不少 |
 | `hist-repair` | 完整组不丢、缺应答整组丢、`hist_pairing_ok` 复核 |
+| `hist-pairing` | **P89**：悬空组**在中间**（后面跟着 user）—— 尾部修复对它瞎，全段修复整组丢且不误伤后面的消息；孤儿 tool 在中间；全合法的历史一条不动 |
+| `pair-recover` | **P89 端到端**：合成「悬空 tool_calls + user」的日志 → `--resume` → 假网关断言**请求体里没有那个悬空的 id**（判据落在线上字节上；删掉接线这一轮就红，见 §19.11） |
 | `prompt-todo-plan` | system prompt/`{{cwd}}`/AGENTS.md 注入、请求无 NUL、todo 与 plan |
 | `bash-jobs` | 一轮 6 调用：后台短/长任务、`job_list`、`job_output(wait=true)`、`job_kill` |
 | `fs-tools` | 一轮 10 调用：write 未读拒、edit 多匹配拒、glob/grep；落盘逐字节 |
@@ -7793,3 +7796,101 @@ A goal is already active. Use /goal edit …             # ← 乙连自己的�
 **明确不做**：把压缩做成 DSH 那样的「日志事务」（`compaction/start`+`compaction/end` 配对、
 落盘原子性）—— 本仓的日志是追加-only 的，checkpoint 事件 + 折叠基线已经够用；
 也不做「自动降低 `--context-window`」（窗口是人的配置，猜错了比报错更坏）。
+
+### 19.11 P89：悬空的工具调用**不在结尾**时修不好（会话被自己的历史卡死）
+
+**用户报的**（P88 修好超窗之后紧接着）：
+
+```
+model endpoint returned HTTP 400
+  · body: {"error":{"message":"[invalid_params]: {\"error\":{\"message\":\"An assistant
+    message with 'tool_calls' must be followed by tool messages responding to each
+    'tool_call_id'. (insufficient tool messages following tool_calls message) …
+ · [turn] 本回合异常结束（可直接输入继续）
+```
+
+**现场**（`session-43e46f8b`，就是 §19.10 那一条会话）：日志 seq 15049–15051
+
+```
+15049  assistant/message   tool_calls=[call_00_zdqw…]      ← 落了盘
+15050  tool/call           call_00_zdqw…  (bash 命令)      ← 落了盘
+15051  user/message        「继续」                         ← 人下一次启动敲的
+       ✗ 没有 tool/result                                  ← 进程在这里被 kill 了
+```
+
+那一步跑的是 `ps -eo pid,args | grep "uya-agent" | grep -v grep`（模型正在清理它自己
+留下的测试进程）。**进程被信号 15 杀掉**，于是 `tool/call` 落了日志、应答它的
+`tool/result` 没来得及落 —— 日志里留下一个**悬空的 `assistant(tool_calls)`**。
+
+**根因：修复只看结尾，而半组不在结尾。**`hist_trim_incomplete_tail` 从最后一条往前看：
+
+```
+while h.len > 1 {
+    last = h.len - 1                    ← 只看最后一条
+    if last 是 assistant_calls → 丢
+    if last 不是 tool         → break    ← 「继续」是 user ⇒ 立刻收工，什么都不做
+    ...
+}
+```
+
+结尾是 `user`（合法的尾巴）⇒ 它**立刻 break**，那个悬空的组**从头到尾没被看过**。
+而折叠出来的历史里，这一组后面还跟着五条「继续」——它们才是把尾巴变成合法 user 的
+原因。于是合并之后每一发请求都被端点拒掉：**这个会话再也发不出请求**。
+
+复现（纯函数，三条断言）：
+
+```
+SYS / TASK / calls(c1,c2) / tool(c1) / USER「继续」
+  hist_pairing_ok            → false（确实不合法）
+  hist_trim_incomplete_tail  → 0     ← **旧实现完全看不见它**（结尾是 user）
+  hist_pairing_ok（修后）     → 仍然 false ⇒ 请求会被拒
+```
+
+**修法：`hist_repair_pairing`（扫全段）** —— 判据与 `hist_pairing_ok` 共用同一个
+（`hist_group_ok`：调用条数对不上、或某个 `tool_call_id` 找不到应答），但**遍历整段**
+而不是只看结尾。三种动作：
+
+| 遇到 | 动作 |
+|---|---|
+| 完整的一组 | 跳过它应答的那几条 tool（`i += 1 + nc`），**一条都不动** |
+| 不配对的组 | 从它开始连它后面那些 tool 一起丢（**整组丢** —— 半组比没有更坏） |
+| 孤儿 tool | 单条丢（它的 assistant 已经不在了） |
+
+配一个第三种区间删除 `hist_remove_range`（与 `hist_truncate_to` 切尾巴、
+`hist_drop_oldest_below` 从头丢并列：**中间挖一段**）。
+
+接线两处（都要，理由不同）：
+
+* `agent_hist_from_log` 之后（`--resume` / `--continue` 那条路）—— 真机现场在这儿；
+* `agent_turn_loop` 收尾 —— 上面那条只看结尾，而**回合收尾时后面可能已经有一条
+  user**（运行中敲进来的 steer）。它是「本回合收尾必然留下合法历史」这条不变量的
+  唯一出口检查：**在自己这边发现形状坏了，比让端点回 400 再让人猜好得多**。
+
+**两条先看到红的对照（都要，而且它们覆盖的**不是**同一件事）**：
+
+| 改法 | `hist-pairing` | `pair-recover` |
+|---|---|---|
+| 判据写坏（`if true` 短路 `hist_group_ok`） | **红**（4 条断言） | （不适用） |
+| 接线删掉（`const unpaired: usize = 0;`） | 绿 | **红**（verdict 170） |
+
+第二条是这一轮最贵的教训：**判据与接线必须分别可测**。第一版只写了 `hist-pairing`
+（纯函数），把接线删掉之后它**照旧全绿** —— 那个「绿」只证明函数本身对，不证明有人
+调它。`pair-recover`（端到端：合成一份「悬空组 + user」的日志，`--resume` 之后假网关
+断言**请求体里没有那个悬空的 id**）补上了这一半。判据落在**线上字节**上，不看我们
+以为自己做了什么。
+
+**顺手抓到的一个挂死**：那个循环按「删掉之后 i 不动、再看同一个下标」写；而
+`hist_remove_range` 拒绝动下标 0（system 是请求骨架）。两者凑在一起，**万一** 0 号位
+是不配对的组，循环就**永远转下去** —— 挂死，不是崩溃（挂死没有任何出口，比 400 坏得多）。
+修法是那一档必须前进一步。这一条**必须**有测试：它只在「0 号位是 assistant_calls」时
+触发，而那个形状在正常历史里不可能出现 —— 没有测试的话谁也不会发现它挂。
+实测把那个分支短路（`if false && i == 0`）重跑：整轮 selftest **rc=124 超时挂死**
+（连 `hist-pairing` 那一行都到不了）；改回即绿。
+
+**明确不做**：给悬空的那一步补一条「工具未执行」的假 `tool/result`。那会往历史里写
+一条**没发生过**的事实，而模型下一轮会据此以为命令跑过了 —— 宁可丢掉那一步（它本来
+就没有产出）。也不改 `hist_trim_incomplete_tail` 的语义：它管的是**尾部**，改名会让
+「谁负责哪一段」这条边界糊掉。
+
+**验收**：`make check` / `make build`（静态链接审计通过）全绿；`--selftest` 新增
+`hist-pairing` / `pair-recover` 两轮 ok；`lint-size` 通过。
