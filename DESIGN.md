@@ -3137,7 +3137,7 @@ parser-blocking preload + `window.__DSH_BOOT__`）；按最小 roster 服务
 | 4 | `/api/remote.mux`（0.2.0 唯一的下行） | 三条流的 `open` 都收到 `item` | **已做**（第十批） |
 | 5 | 消息渲染（`data.stream` + end-seed 位置 + cursor） | `make dsh-web-check` 通过 | **已做**（第十八批，3/3 稳定） |
 | 6 | `dynamicCordisRunner/{inventory,syncInspectManifest}`、`session/modelCatalog` | 控制台零告警 | **已做**（第十二批） |
-| 7 | 资源定位链 + `--dsh-assets` | 日志显示用的是该目录；DSH 树零写入 | 待做 |
+| 7 | 资源定位链 + `--dsh-assets` | DSH 树零写入 | **已做**（第十九批） |
 | 8 | `--dsh-assets-install`（`npm pack` 取 72 个包） | 离线/在线各验一次 | 待做 |
 | 9 | token/cookie 鉴权（可选，取决于是否要对外） | 不带 token 401、带 token 可用 | 待做 |
 
