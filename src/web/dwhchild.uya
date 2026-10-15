@@ -1,0 +1,736 @@
+// src/web/dwhchild.uya — `--dsh-web` 的**活会话**：对话子进程 + 输入帧 + 事件 tail
+//
+// 本文件：对话子进程的生命周期（`dwhc_start` / `dwhc_stop` / `dwhc_alive`）、
+//   输入（`dwhc_send_prompt`：一行 `{"text":"…"}` 写进子进程 stdin）、
+//   输出（`dwhc_tick`：把会话日志**新增的完整行**逐行翻成 DSH 的 SessionEvent，
+//   攒成 `{"type":"event","event":{…}}` 帧，交给宿主推给浏览器）。
+// 不变量：① **一个宿主一条会话**：今天 `--dsh-web` 只服务一条会话（`DWH_SESSION_ID`
+//   那一条），所以这里是**一个**子进程、**一份** tail 状态，不是表；
+//   ② **事件源是会话日志本身**，不是另开一条父子协议 —— 日志已经是本仓的真值源，
+//   `dwire_line` 的产物已经被 DSH 自己的 zod 验过（`make wire-schema`）。字号
+//   （读游标）就是**文件偏移**：父进程预生成会话 id 交给子进程
+//   （`UYA_AGENT_FORCE_SESSION_ID`，与 `--web` 同一个通道），于是父进程算得出路径
+//   （`sess_session_path`）并在子进程写它之前就知道它在哪；
+//   ③ **只在完整行上翻译**：日志是逐行追加的（`sess_end` → `write_all_fd`），
+//   读到没有 `\n` 的尾巴时**留在缓冲里等下一圈** —— 半行翻出来就是坏 JSON，而它的
+//   症状是客户端 `close(4002)` 并整条重连（与快照逗号那次的形态一模一样）；
+//   ④ **写 stdin 非阻塞**：写不完的留在 `pending` 里，下一圈 `POLLOUT` 接着写。
+//   阻塞写会把整个宿主冻住（子进程在读 LLM 时不会读 stdin，管道一满就死锁）；
+//   ⑤ **seq 位移只有一个口径**：快照里 seed 占 0..2、`session/end-seed` 收在 `last`，
+//   所以活事件要整体后移 `DWH_LIVE_SHIFT`（= `DWH_SEED_SEQS` + 1）；少那个 +1 就是
+//   「快照末条之后接不上」，客户端判 `discontinuous entries` 断流；
+//   ⑥ 子进程死了要**收尸**（`waitpid`）并说清楚 —— 留一个僵尸 + 一个不响应的输入框
+//   是最坏形态。
+// 依赖：无 `use` 行（合并命名空间）；本仓 foundation/bufx、session/session
+//   （`sess_session_path` / `sess_norm_cwd`）、web/wsess（`dwire_line`）、
+//   tools/shellx（`sh_env_prepare` / `env_add_kv` / `sh_env_array`）、
+//   session/sigx（`sigx_reset_for_child`）、agent（`Config`）。
+// 命名：`dwhc_*`（子进程与 tail）、`DWHC_*`（常量）；类型 `DwhChild`。
+//
+// 为什么子进程跑的是**行式 REPL**（`--no-tui` + 非 tty stdin）：那正是 `--web` 的子进程
+// 之外唯一「一个进程 = 一条会话、回合制」的形态，且它的输入本来就是一行一条消息
+// （`agent_repl_plain`）；`UYA_AGENT_STDIN_FRAMES=1` 只把「一行」换成「一帧」，
+// 好让一条消息里的换行不被当成几次提交（见 `cfg.stdin_frames`）。
+//
+// 与 `whost.uya` 的分工：本文件**不认识 HTTP / WebSocket**（它只吐帧），宿主负责把帧
+// 送上连接。反过来宿主也不认识 fork/管道/tail。这样两半都能单独自测。
+
+use libc.syscall;
+use libc.unistd;
+
+// 一次从会话日志读多少（一帧的正文在几百字节到几 KB；读大一点省系统调用）。
+const DWHC_READ: usize = 32768;
+
+// 打开会话日志的标志：`O_RDWR | O_CREAT`（0420 = 0644）。
+// **写字面量而不是 `O_RDWR | O_CREAT`**：那两个常量来自 `libc.syscall`，
+// 写成位或表达式时 codegen 在 C 里生成一个**非常量初始化器**（`libc_O_RDWR |
+// libc_O_CREAT` 不是 C 的常量表达式）⇒ `initializer element is not constant` 编译失败
+// —— 与 `websrv.uya` 的 `WEB_O_RDWR_NOCTTY = 0x102` 同一条口径（那里也是手写的）。
+// 0x2 | 0x40 = O_RDWR | O_CREAT（Linux x86-64 的取值）。
+const DWHC_O_LOG: i32 = 0x42;
+
+// 子进程写日志用：`O_WRONLY | O_CREAT | O_APPEND`（0x441）。
+// **`O_APPEND` 不能少**：没有它时写打在**共享偏移**处（子进程 dup 来的描述符
+// 与父进程的读游标是同一个），实测会把日志覆写成非法 JSON —— 见 `dwhc_child_exec`。
+const DWHC_O_LOG_APPEND: i32 = 0x441;
+// 第三参 `1` 是 WNOHANG（libc 没导出这个常量；与 `webpump.uya` / `cliphelp.uya`
+// 的既有写法一致 —— 本仓在那里已经用过同一个字面量）。
+const DWHC_WNOHANG: i32 = 1;
+
+// 会话日志读缓冲的上限：超过这个数还没有换行，说明日志坏了（本仓单行上限是
+// `session.uya` 的 `SESS_LINE_MAX` 量级）—— 丢弃并计数，不无限长。
+const DWHC_LINE_MAX: usize = 4194304;
+
+// stdin 写缓冲上限（待发输入）。一条用户消息按 256 KiB 算 —— 超过就**明确拒绝**
+// （宿主据此回业务错），不许静默截断（截断的消息会让模型看到半句话）。
+const DWHC_IN_MAX: usize = 262144;
+
+// 活事件帧的 seq 位移：开头三条 seed（0..2）+ 收口那条 `session/end-seed`。
+// 见不变量⑤ —— 这个 +1 不是可选的。
+const DWH_LIVE_SHIFT: u64 = DWH_SEED_SEQS + 1;
+
+// 对话子进程 + tail 状态。
+export struct DwhChild {
+    pid: i32,           // 子进程（0 = 没起过）
+    wfd: i32,           // 写端（子进程的 stdin）（-1 = 没有）
+    pending: Buf,       // 待写进 stdin 的字节（非阻塞写的余量）
+    log_path: Buf,      // 会话日志的路径（含尾 NUL，直接喂 sys_open）
+    err_path: Buf,      // 子进程诊断的落点（含尾 NUL；**不是**会话日志，见 dwhc_child_exec）
+    lfd: i32,           // 日志读 fd（-1 = 还没打开）
+    off: i64,           // 已读到的文件偏移
+    part: Buf,          // 读到但还没凑成整行的尾巴
+    raw: Buf,           // 这一圈新翻出来的译文（每行一条，`\n` 结尾）
+    stop_err: Buf,      // 子进程异常结束时的说明（空 = 没出事）
+    reaped: bool,       // 已经收过尸（防重复 waitpid）
+}
+
+// 零值（`dwhc_start` 会把它填好）。
+export fn dwhc_zero() DwhChild {
+    return DwhChild{
+        pid: 0,
+        wfd: -1,
+        pending: buf_empty(),
+        log_path: buf_empty(),
+        err_path: buf_empty(),
+        lfd: -1,
+        off: 0,
+        part: buf_empty(),
+        raw: buf_empty(),
+        stop_err: buf_empty(),
+        reaped: false,
+    };
+}
+
+// 打开三把 fd：`fds[0..1]` 是输入管道、`fds[1]` 留给自己写、`c.lfd` 是会话日志、
+// `dfd` 是子进程诊断。返回 false = 有一步失败（**此时已经把开出来的都关上**，
+// 不留半份状态）。抽出来只为守住「函数 ≤100 行」（AGENTS.md）——
+// 切点在「把 fd 备齐」与「fork 出去」这条天然分界上。
+fn dwhc_fds_open(c: &DwhChild, fds: &i32, dfd: &i32) bool {
+    if (sys_pipe2(fds, 0) catch { -1; }) != 0 {
+        out_err("[dsh-web] 开管道失败（fd 用完了？）\n");
+        return false;
+    }
+    // 日志用 `O_CREAT` 先建出来：这样「子进程还没写第一行」时父进程读它也不是
+    // ENOENT（否则要另写一条「文件还没出现」的等待逻辑）。
+    const lfd: i32 = sys_open(c.log_path.ptr as *const byte,
+        DWHC_O_LOG, 420) catch { -1; };
+    if lfd < 0 {
+        dwhc_fds_abort(fds);
+        out_err("[dsh-web] 打不开会话日志的落点（目录建不出来？）\n");
+        return false;
+    }
+    c.lfd = lfd;
+    c.off = 0;
+    // 诊断落点（子进程的 fd 2）。与日志**同一个目录**（一起被清、一起被找），
+    // 但文件名不同：它不是 JSONL，别让任何人把它当事件源。
+    if !dwhc_err_path(c) {
+        _ = sys_close(lfd) catch {};
+        c.lfd = -1;
+        dwhc_fds_abort(fds);
+        out_err("[dsh-web] 拼不出子进程诊断文件的路径\n");
+        return false;
+    }
+    const d: i32 = sys_open(c.err_path.ptr as *const byte,
+        DWHC_O_LOG, 420) catch { -1; };
+    if d < 0 {
+        _ = sys_close(lfd) catch {};
+        c.lfd = -1;
+        dwhc_fds_abort(fds);
+        out_err("[dsh-web] 开不了子进程诊断文件\n");
+        return false;
+    }
+    *dfd = d;
+    return true;
+}
+
+// 关掉管道两端（`dwhc_fds_open` 失败路径与 fork 失败路径共用）。
+fn dwhc_fds_abort(fds: &i32) void {
+    _ = sys_close(fds[0]) catch {};
+    _ = sys_close(fds[1]) catch {};
+}
+
+// 起一个活会话。成功返回 true；失败时**已经**在 stderr 上说清了原因（调用方据此
+// 决定要不要退化成只读模式，不必再猜）。
+//
+// 顺序（每一步失败都往前回滚 fd，不留半份状态）：
+//   ① 拼会话日志路径（按 `cfg.workspace` 归一化，与子进程同一条口径）；
+//   ② 开管道（读端给子进程的 stdin，写端留给自己）；
+//   ③ 打开日志落点 —— 用 `O_CREAT` 先建出来：这样「子进程还没写第一行」时
+//      父进程读它也不是 ENOENT（否则要另写一条「文件还没出现」的等待逻辑）；
+//   ④ fork + exec 自己（`--no-tui`，环境里带会话 id / 帧模式 / 父进程的生效配置）。
+export fn dwhc_start(c: &DwhChild, cfg: &const Config, home: &const Buf,
+    sid: &const byte, sn: usize) bool {
+    c.pid = 0;
+    c.wfd = -1;
+    c.pending = buf_new(4096);
+    c.log_path = buf_new(home.len + sn + 128);
+    c.err_path = buf_new(home.len + sn + 128);
+    c.lfd = -1;
+    c.off = 0;
+    c.part = buf_new(8192);
+    c.raw = buf_new(65536);
+    c.stop_err = buf_new(256);
+    c.reaped = false;
+    if !buf_valid(&c.pending) || !buf_valid(&c.log_path) || !buf_valid(&c.part)
+        || !buf_valid(&c.raw) || !buf_valid(&c.stop_err)
+        || !buf_valid(&c.err_path) {
+        return false;
+    }
+    if !dwhc_log_path(c, cfg, home, sid, sn) {
+        out_err("[dsh-web] 拼不出会话日志路径（--agent-home / 工作区有问题？）\n");
+        return false;
+    }
+    // 三把 fd：输入管道（读端给子进程）、会话日志（父进程读 + 子进程写）、
+    // 子进程诊断（只有子进程写）。任何一步失败都要把前面的收干净（`dwhc_fds_open`）。
+    var fds: [i32: 2] = [0: 2];
+    var dfd: i32 = -1;
+    if !dwhc_fds_open(c, &fds[0], &dfd) {
+        return false;
+    }
+    // 子进程的环境：**在 fork 之前**拼好（`sh_env_*` 用的是进程级全局缓冲，
+    // 子进程 fork 之后直接用它 —— 见 `web_child_env` 的同一条注释）。
+    if !dwhc_child_env(cfg, sid, sn, fds[0]) {
+        _ = sys_close(c.lfd) catch {};
+        c.lfd = -1;
+        _ = sys_close(dfd) catch {};
+        dwhc_fds_abort(&fds[0]);
+        out_err("[dsh-web] 拼子进程环境失败\n");
+        return false;
+    }
+    var self_bin: Buf = buf_new(4096);
+    defer { buf_free(&self_bin); }
+    if !dwhc_self_exe(&self_bin) {
+        _ = sys_close(c.lfd) catch {};
+        c.lfd = -1;
+        _ = sys_close(dfd) catch {};
+        dwhc_fds_abort(&fds[0]);
+        out_err("[dsh-web] 读不到 /proc/self/exe\n");
+        return false;
+    }
+    var notui: [byte: 9] = "--no-tui";
+    var argv: [&const byte: 3] = [self_bin.ptr as &const byte,
+        &notui[0] as &const byte, null as &const byte];
+    const pid64: i64 = sys_fork() catch {
+        _ = sys_close(c.lfd) catch {};
+        c.lfd = -1;
+        _ = sys_close(dfd) catch {};
+        dwhc_fds_abort(&fds[0]);
+        out_err("[dsh-web] fork 失败\n");
+        return false;
+    };
+    if pid64 == 0 {
+        dwhc_child_exec(fds[0], fds[1], c.lfd, dfd,
+            self_bin.ptr as &const byte, &argv[0]);
+    }
+    _ = sys_close(fds[0]) catch {};        // 读端只有子进程要
+    _ = sys_close(dfd) catch {};           // 诊断文件只有子进程要写
+    c.wfd = fds[1];
+    // 写端非阻塞（不变量④）：子进程在读 LLM 时不会读 stdin，阻塞写会冻住宿主。
+    _ = sys_fcntl(c.wfd, F_SETFL, O_NONBLOCK) catch {};
+    c.pid = i64_to_i32(pid64);
+    return true;
+}
+
+// 子进程侧：把 fd 0/1/2 换成管道读端与日志，然后 execve。**不返回**（失败就 _exit）。
+// `dfd`：诊断落到哪。**不能是会话日志**（`lfd`）—— 行式 REPL 把 `/model`、
+// 运行提示、`warning:` 这类**非 JSON** 文本打进 `err_fd()`（默认 2），而会话日志
+// 是逐行 JSONL、是宿主本文件的事件源：混进一行中文，`sess_reader` 与
+// `dwire_line` 都会把它当「解不出来的行」跳过，而 `--resume` 那一侧读到它就是
+// 一行噪音（实测：日志里出现裸 `模型已切换` 与 `推理强度已切换`）。
+// 所以三条 fd 各归各位：0 = 输入管道、1 = 会话日志（**只有** JSONL）、
+// 2 = 诊断文件（宿主启动时打它的路径，出问题时人看那一个）。
+fn dwhc_child_exec(rfd: i32, wfd: i32, lfd: i32, dfd: i32,
+    exe: &const byte, argv: &(&const byte)) void {
+    _ = sys_close(wfd) catch {};
+    sigx_reset_for_child();
+    // ⚠ 会话日志**必须重新打开（`O_APPEND`），不能 dup 父进程那把 fd**。
+    //
+    // `dup2` 复制的是**同一个 open file description**（父子共享文件偏移），
+    // 而父进程正在**读**这份日志（tail）——读会推进那个共享偏移。于是子进程
+    // 下一次写不是「接在末尾」，而是「打在父进程的读游标处」：
+    // 实测症状是日志被**覆写**成
+    // `PROV-A-ANSWER/message","seq":0,…`（助手答复的正文盖掉了
+    // `{"type":"user` 这 14 个字节），于是译文不再是合法 JSON、快照坏掉、
+    // 客户端判 `invalid Remote stream frame` 整条重连。
+    // 自己 open 一份（`O_APPEND`）就有了独立偏移与「写必在末尾」的语义。
+    // ⚠ **fd 1 与 fd 2 都指到诊断文件（`dfd`），一个都不指会话日志**。
+    //
+    // 会话日志只许由子进程自己的 `sess_*` 那条 fd 写（它用 `O_APPEND`，见
+    // `session.uya`）。把 fd 1 或 2 指到日志上时，任何普通文本都会追加进日志 ——
+    // 实测两种都发生过：助手答复的正文（`PROV-A-ANSWER`）与 LLM 的错误诊断
+    // （`model endpoint returned HTTP 401`）都曾被写进日志，与相邻的 JSONL 粘成
+    // 一行（`PROV-A-ANSWER{"type":"assistant/first-token",…}`），于是译文不再是
+    // 合法 JSON、快照坏掉、客户端判 `invalid Remote stream frame` 并每 3 秒重连，
+    // 页面停在初始态。
+    //
+    // `lfd`（父进程那把、与父进程的读游标共享偏移）**一个字节都不许留**在子进程里。
+    _ = sys_dup2(rfd, 0) catch {};
+    _ = sys_dup2(dfd, 1) catch {};
+    _ = sys_dup2(dfd, 2) catch {};
+    if rfd > 2 {
+        _ = sys_close(rfd) catch {};
+    }
+    if dfd > 2 {
+        _ = sys_close(dfd) catch {};
+    }
+    if lfd > 2 {
+        _ = sys_close(lfd) catch {};
+    }
+    _ = sys_execve(exe, argv, sh_env_array()) catch {};
+    _ = sys_write(2, "[dsh-web/child] execve failed\n" as *const byte,
+        bufx_cstr_len("[dsh-web/child] execve failed\n" as &const byte));
+    sys_exit(9);
+}
+
+// 子进程的环境：会话 id（复用现成通道）/ 帧模式 / 关掉继承来的形态开关，再叠加
+// 父进程**从命令行拿到的那份生效配置**（`web_child_env_cfg`：模型路线、权限、
+// 落点、旋钮）—— 少了它，浏览器里的会话会与终端分叉（踩坑 124 的同一条理由）。
+fn dwhc_child_env(cfg: &const Config, sid: &const byte, sn: usize,
+    rfd: i32) bool {
+    var idbuf: Buf = buf_new(sn + 1);
+    defer { buf_free(&idbuf); }
+    if !buf_append(&idbuf, sid, sn) {
+        return false;
+    }
+    _ = buf_append_byte(&idbuf, 0);
+    var fdbuf: Buf = buf_new(16);
+    defer { buf_free(&fdbuf); }
+    _ = buf_append_i64(&fdbuf, rfd as i64);
+    _ = buf_append_byte(&fdbuf, 0);
+    sh_env_prepare_kv("UYA_AGENT_FORCE_SESSION_ID" as &const byte,
+        idbuf.ptr as &const byte,
+        "UYA_AGENT_STDIN_FRAMES" as &const byte, "1" as &const byte);
+    // 子进程**不是** web/dsh-web 宿主：继承来的开关要显式关掉，否则它会再起一个
+    // 服务器（递归）—— 与 `--web` 子进程同一条双保险。
+    env_set_kv("UYA_AGENT_WEB" as &const byte, "0" as &const byte, 1);
+    env_set_kv("UYA_AGENT_DSH_WEB" as &const byte, "0" as &const byte, 1);
+    // `--dsh-web` 的宿主在收尾时会 kill 整个进程组；子进程自成一组长一点，
+    // 但仍然显式声明「这是一条对话子进程」，便于现场排查。
+    env_set_kv("UYA_AGENT_DSH_WEB_CHILD" as &const byte, "1" as &const byte, 1);
+    env_set_kv("UYA_AGENT_TUI" as &const byte, "0" as &const byte, 1);
+    web_child_env_cfg(cfg);
+    // DSH 设置根：`--dsh-home` 没有 env 口径（只有 `$DSH_HOME` 这一条），而
+    // `web_child_env_cfg` 只传 `--dsh-root`（那是 preset 树）—— 于是宿主用
+    // `--dsh-home DIR` 时，子进程仍去读默认的 `~/.dsh`：**父子的模型路线与权限
+    // 分叉**（宿主页面按 DIR 显示模型、子进程按 ~/.dsh 发请求）。
+    // 这里把父进程**解析后的**值当成 `$DSH_HOME` 传下去，两条链于是同源。
+    if cfg.dsh_home.len > 0 {
+        env_set_kv("DSH_HOME" as &const byte, cfg.dsh_home.ptr,
+            cfg.dsh_home.len);
+    }
+    // `--no-dsh-config` 同样没有 env 口径：不传的话子进程会去读设置，而宿主没有。
+    if cfg.no_dsh_config {
+        env_set_kv("UYA_AGENT_NO_DSH_CONFIG" as &const byte,
+            "1" as &const byte, 1);
+    }
+    return true;
+}
+
+// 会话日志路径（`<agent-home>/sessions/--<归一化 cwd>--/<id>/session.jsonl`，补尾 NUL）。
+//
+// 为什么不自己拼：归一化规则（`/` → `-`）与 `sess_find` 的扫描口径必须**逐字节一致**，
+// 否则父进程读的那条路与子进程写的那条路是两个文件（而症状是「发了消息没反应」）。
+fn dwhc_log_path(c: &DwhChild, cfg: &const Config, home: &const Buf,
+    sid: &const byte, sn: usize) bool {
+    var hz: Buf = buf_new(home.len + 1);
+    defer { buf_free(&hz); }
+    if !buf_append(&hz, home.ptr as &const byte, home.len) {
+        return false;
+    }
+    if !buf_append_byte(&hz, 0) {
+        return false;
+    }
+    var cwd: Buf = buf_new(1024);
+    defer { buf_free(&cwd); }
+    // 工作区取 `cfg.workspace`（启动时定稿的那份）—— 与 `sess_open` 用的同一个值，
+    // 不另起 `getcwd`：`--workspace` 与恢复会话都会改它，而路径归一化必须与子进程同源。
+    if cfg.workspace.len == 0 {
+        return false;
+    }
+    if !buf_append(&cwd, cfg.workspace.ptr as &const byte, cfg.workspace.len) {
+        return false;
+    }
+    _ = buf_append_byte(&cwd, 0);
+    var idz: Buf = buf_new(sn + 1);
+    defer { buf_free(&idz); }
+    if !buf_append(&idz, sid, sn) {
+        return false;
+    }
+    _ = buf_append_byte(&idz, 0);
+    if !sess_session_path(hz.ptr as &const byte, cwd.ptr as &const byte,
+        idz.ptr as &const byte, sn, &c.log_path) {
+        return false;
+    }
+    // ⚠ **补尾 NUL**：`sess_session_path` 的产物是一个 `Buf`（无 NUL），而下游
+    // 全是 C 串语义（`sys_open` / `sess_mkdir_p`）。不补的话 `sys_open` 会一路
+    // 读进相邻内存 —— 实测症状：宿主打开的是
+    // `…/session.jsonllerrr` 这个**不存在的文件**（`O_CREAT` 于是把它建出来），
+    // 而子进程写的是正确那份 ⇒ 宿主永远读到 0 字节、页面一条消息都不出。
+    if !buf_append_byte(&c.log_path, 0) {
+        return false;
+    }
+    // 目录必须先存在（`sess_open` 会自己建，但父进程先打开文件的话就没有那个机会）。
+    return dwhc_mkdir_for(&c.log_path);
+}
+
+// 子进程诊断文件的路径：与日志同目录、名字是 `child.log`。
+// 为什么放同目录：删会话目录时它一起没（不留孤儿），而且现场排查时两样东西在一起。
+fn dwhc_err_path(c: &DwhChild) bool {
+    // `log_path` 是 `…/<id>/session.jsonl`：把最后那一段换掉。
+    var n: usize = c.log_path.len;
+    if n > 0 && c.log_path.ptr[n - 1] == 0 as byte {
+        n = n - 1;      // 尾 NUL（见 dwhc_log_path）
+    }
+    var cut: usize = n;
+    while cut > 0 && c.log_path.ptr[cut - 1] != 47 as byte {
+        cut = cut - 1;
+    }
+    if cut == 0 {
+        return false;
+    }
+    buf_reset(&c.err_path);
+    if !buf_append(&c.err_path, c.log_path.ptr as &const byte, cut) {
+        return false;
+    }
+    if !buf_append_cstr(&c.err_path, "child.log") {
+        return false;
+    }
+    return buf_append_byte(&c.err_path, 0);
+}
+
+// 子进程诊断文件的路径（宿主启动时打给人看；尾 NUL 已去掉）。
+export fn dwhc_err_path_of(c: &const DwhChild) &const Buf {
+    return &c.err_path;
+}
+
+// 为 `path`（会话日志）建出它的目录链 `<home>/sessions/--cwd--/<id>`。
+// 走 `sess_mkdir_p`（本仓已有的实现，口径与 `sess_open` 一致）；
+// 已经存在时它返回 false，那不是错误。
+fn dwhc_mkdir_for(path: &const Buf) bool {
+    // 去掉最后一段（`/session.jsonl`）。路径**含尾 NUL**（见 `dwhc_log_path`），
+    // 所以先跳过它再找分隔符 —— 不跳的话「最后一个 `/` 之后」会多算一个字节。
+    var n: usize = path.len;
+    if n > 0 && path.ptr[n - 1] == 0 as byte {
+        n = n - 1;
+    }
+    var cut: usize = n;
+    while cut > 0 && path.ptr[cut - 1] != 47 as byte {
+        cut = cut - 1;
+    }
+    if cut == 0 {
+        return false;
+    }
+    var dir: Buf = buf_new(cut + 1);
+    defer { buf_free(&dir); }
+    if !buf_append(&dir, path.ptr as &const byte, cut - 1) {
+        return false;
+    }
+    if !buf_append_byte(&dir, 0) {
+        return false;
+    }
+    _ = sess_mkdir_p(dir.ptr as &const byte);
+    return true;
+}
+
+// 读 `/proc/self/exe`（自己的绝对路径，含尾 NUL）—— 与 `web_self_exe` 同一手法。
+// 为什么不用 `get_argv(0)`：那可能是相对路径或软链，而子进程 execve 时的 cwd 已变。
+fn dwhc_self_exe(out: &Buf) bool {
+    buf_reset(out);
+    var p: [byte: 16] = "/proc/self/exe";
+    var tmp: [byte: 4096] = [0: 4096];
+    const n: isize = sys_readlink(&p[0] as *const byte, &tmp[0], 4096) catch {
+        -1 as isize;
+    };
+    if n <= 0 || (n as usize) >= 4096 {
+        return false;
+    }
+    if !buf_append(out, &tmp[0], n as usize) {
+        return false;
+    }
+    return buf_append_byte(out, 0);
+}
+
+// ============================================================
+// 输入：一条消息 → 一行 `{"text":"…"}`
+// ============================================================
+
+// 把 `text` 排进待发缓冲（一行一帧）。返回：0 = 排队了；1 = 队列满（**明确拒绝**，
+// 不截断）；2 = 没有子进程（已经死了）。
+//
+// **在写之前就排进 `pending` 而不是直接 write**：写是非阻塞的（不变量④），写不完
+// 的余量必须留在同一个缓冲里，否则「这一条消息的后半截」会在下一圈乱序拼到另一条
+// 消息前面 —— 那正是「两次发言粘成一句」的形态。
+export fn dwhc_send_prompt(c: &DwhChild, text: &const byte, n: usize) i32 {
+    if c.wfd < 0 || c.pid == 0 {
+        return 2;
+    }
+    if c.pending.len + n + 32 > DWHC_IN_MAX {
+        return 1;
+    }
+    if !buf_append_cstr(&c.pending, "{\"text\":") {
+        return 1;
+    }
+    if !jw_str_into(&c.pending, text, n) {
+        return 1;
+    }
+    if !buf_append_cstr(&c.pending, "}\n") {
+        return 1;
+    }
+    return 0;
+}
+
+// 一条 slash 命令（裸行，不经 JSON 帧）排进待发缓冲 —— 模型选择走这条路
+// （`/model <prov>/<model>`、`/effort <level>`）。返回码同 `dwhc_send_prompt`。
+export fn dwhc_send_line(c: &DwhChild, line: &const byte, n: usize) i32 {
+    if c.wfd < 0 || c.pid == 0 {
+        return 2;
+    }
+    if c.pending.len + n + 8 > DWHC_IN_MAX {
+        return 1;
+    }
+    if !buf_append(&c.pending, line, n) {
+        return 1;
+    }
+    if !buf_append_byte(&c.pending, 10) {
+        return 1;
+    }
+    return 0;
+}
+
+// 把待发缓冲尽量写出去（非阻塞）。写不动就留着，下一圈 `POLLOUT` 再来。
+// 返回 false = 管道坏了（子进程死了/关了 stdin）——宿主据此把会话标成不可用。
+export fn dwhc_flush(c: &DwhChild) bool {
+    if c.wfd < 0 {
+        return true;
+    }
+    while c.pending.len > 0 {
+        const n: isize = sys_write(c.wfd, c.pending.ptr as *const byte,
+            c.pending.len) catch { -1 as isize; };
+        if n < 0 {
+            // EAGAIN 与「真坏了」都走这里：靠 `dwhc_poll_alive` 判死，
+            // 所以这里只当「这一圈写不动」。
+            return true;
+        }
+        if n == 0 {
+            return true;
+        }
+        const used: usize = n as usize;
+        if used >= c.pending.len {
+            c.pending.len = 0;
+            break;
+        }
+        // 把剩下的搬到前面（`Buf` 没有「消费前 N 字节」的操作，只能搬）
+        var k: usize = 0;
+        var i: usize = used;
+        while i < c.pending.len {
+            c.pending.ptr[k] = c.pending.ptr[i];
+            k = k + 1;
+            i = i + 1;
+        }
+        c.pending.len = k;
+    }
+    return true;
+}
+
+// 还有待发字节吗（宿主据此把写端放进 `POLLOUT`）。
+export fn dwhc_wants_write(c: &const DwhChild) bool {
+    return c.pending.len > 0 && c.wfd >= 0;
+}
+
+// 写端 fd（宿主 poll 用；-1 = 没有）。
+export fn dwhc_wfd(c: &const DwhChild) i32 {
+    return c.wfd;
+}
+
+// 子进程还在吗（`waitpid(WNOHANG)` 收尸）。返回 false = 已经结束，
+// 此时 `dwhc_err` 里有说明（退出码）。
+//
+// 为什么要主动收：子进程异常退出（比如没 key）时，不 `waitpid` 就留一个僵尸；
+// 而宿主看见的是「输入框还在，发出去没反应」—— 必须变成一句可见的说明。
+export fn dwhc_poll_alive(c: &DwhChild) bool {
+    if c.pid == 0 {
+        return false;
+    }
+    if c.reaped {
+        return false;
+    }
+    var st: i32 = 0;
+    const r: i32 = sys_waitpid(c.pid, &st, DWHC_WNOHANG) catch { 0; };
+    if r == 0 {
+        return true;               // 还活着
+    }
+    c.reaped = true;
+    buf_reset(&c.stop_err);
+    const code: i32 = (st >> 8) & 255;
+    _ = buf_append_cstr(&c.stop_err, "对话子进程已退出（退出码 ");
+    _ = buf_append_i64(&c.stop_err, code as i64);
+    _ = buf_append_cstr(&c.stop_err, "）—— 看会话日志的末尾几行");
+    return false;
+}
+
+// 子进程的说明（空 = 没出事）。宿主在 `error` 帧 / stderr 里用它。
+export fn dwhc_err(c: &const DwhChild) &const Buf {
+    return &c.stop_err;
+}
+
+// ============================================================
+// 输出：会话日志 → DSH 的 SessionEvent（活事件）
+// ============================================================
+
+// 读一次日志、翻出**完整的**新行。返回这一圈新翻出来的条数（0 = 没有新东西）。
+//
+// 三条纪律（都是不变量③⑤的落地）：
+//   * 只翻**见到 `\n`** 的行；尾巴留在 `part` 里等下一圈；
+//   * 译文进 `raw`（每行一条，含 `\n`）—— 宿主一帧一条地推，不在这里拼大 JSON；
+//   * `seq` 整体后移 `DWH_LIVE_SHIFT`（唯一口径，见不变量⑤）。
+export fn dwhc_tick(c: &DwhChild) usize {
+    if c.lfd < 0 {
+        return 0;
+    }
+    buf_reset(&c.raw);
+    var n: usize = 0;
+    // 最多读 4 次：一条消息能产生好几行（turn/start、step/*、assistant/message…），
+    // 而一圈里全读掉比「下一圈再说」让首字快得多。4 次是显式边界（防一圈吃太久，
+    // 宿主是单线程的，见 `whost.uya` 的泵点纪律）。
+    var rounds: usize = 0;
+    while rounds < 4 {
+        const got: isize = sys_read(c.lfd, c.part.ptr + c.part.len,
+            c.part.cap - c.part.len) catch { -1 as isize; };
+        if got <= 0 {
+            break;
+        }
+        c.off = c.off + (got as i64);
+        c.part.len = c.part.len + (got as usize);
+        n = n + dwhc_take_lines(c);
+        rounds = rounds + 1;
+        if c.part.len + DWHC_READ > c.part.cap {
+            break;
+        }
+    }
+    // 读缓冲要留得下下一批：`part` 只装**半行**，整行已经搬走了，所以它的长度
+    // 天然很小；但日志坏掉（几 MB 没有换行）时要显式放弃，不无限长。
+    if c.part.len >= DWHC_LINE_MAX {
+        out_err("[dsh-web] 会话日志有一行超过上限，已丢弃半行（日志坏了？）\n");
+        c.part.len = 0;
+    }
+    return n;
+}
+
+// 把 `part` 里所有**完整行**翻成译文搬进 `raw`，返回条数。
+fn dwhc_take_lines(c: &DwhChild) usize {
+    var n: usize = 0;
+    var start: usize = 0;
+    var i: usize = 0;
+    while i < c.part.len {
+        if c.part.ptr[i] != 10 as byte {
+            i = i + 1;
+            continue;
+        }
+        const seg: usize = (i + 1) - start;
+        if seg > 1 {
+            if dwhc_one_line(&c.part.ptr[start], seg, &c.raw) {
+                n = n + 1;
+            }
+        }
+        start = i + 1;
+        i = i + 1;
+    }
+    if start > 0 {
+        var k: usize = 0;
+        var j: usize = start;
+        while j < c.part.len {
+            c.part.ptr[k] = c.part.ptr[j];
+            k = k + 1;
+            j = j + 1;
+        }
+        c.part.len = k;
+    }
+    return n;
+}
+
+// 一行日志 → 一行译文（带 `\n`）追加进 `out`。返回 false = 这行不翻（头行 / 空行 /
+// 解不出来），调用方跳过。
+fn dwhc_one_line(line: &const byte, n: usize, out: &Buf) bool {
+    var src: Buf = Buf{ ptr: line as *byte, len: n, cap: n };
+    var one: Buf = buf_new(8192);
+    defer { buf_free(&one); }
+    if !dwire_line(&src, &one) {
+        return false;
+    }
+    // ⚠ 走**共用的**那一处（`dwh_event_bytes`）而不是只做位移：`assistant/message`
+    // 要补 `data.stream`，漏了它时「历史里的助手消息能渲染、刚聊出来的渲染不出来」
+    // （实测：同一个会话里用户那条渲染了、答复那条没有，而日志里两条都在）。
+    // 行宽豁免：不可断的调用（三个实参各自都是一个完整概念）
+    return dwh_event_bytes(one.ptr as &const byte, one.len, DWH_LIVE_SHIFT,
+        out);
+}
+
+// 这一圈新翻出来的译文（每行一条，`\n` 结尾）。宿主一帧一条地推。
+export fn dwhc_raw(c: &const DwhChild) &const Buf {
+    return &c.raw;
+}
+
+// 有没有新东西（快捷判据；省得宿主每次都问 `raw.len`）。
+export fn dwhc_has_raw(c: &const DwhChild) bool {
+    return c.raw.len > 0;
+}
+
+// 会话日志的 fd（-1 = 没有）。**宿主不许把它放进 `poll`**：普通文件恒为就绪，
+// 那样 `poll` 会立刻返回、主循环空转（实测：100% CPU + HTTP 请求全不回）。
+// 新行由主循环的 50ms 超时兜住（`whost.uya` 的 `DWH_POLL_MS`）。
+// 导出它只为自测与诊断（「日志打开了吗」）。
+export fn dwhc_lfd(c: &const DwhChild) i32 {
+    return c.lfd;
+}
+
+// 睡 `ms` 毫秒（收摊时给子进程一点收尾时间；用 `nanosleep` 而不是忙等）。
+fn dwhc_sleep_ms(ms: i64) bool {
+    const sec: i64 = ms / 1000;
+    const ns: i64 = (ms - sec * 1000) * 1000000;
+    var req: TimeSpec = TimeSpec{ tv_sec: sec, tv_nsec: ns };
+    var rem: TimeSpec = TimeSpec{ tv_sec: 0, tv_nsec: 0 };
+    const r: i32 = sys_nanosleep(&req, &rem) catch { -1; };
+    return r == 0;
+}
+
+// 收摊：关 fd、收子进程（**连同它的进程组**：子进程自己 setsid 不了 ——
+// 它没有终端，但 bash 工具会派孙子；按组收才不留野进程，与 `web_run` 同口径）。
+export fn dwhc_stop(c: &DwhChild, hard: bool) void {
+    if c.wfd >= 0 {
+        _ = sys_close(c.wfd) catch {};
+        c.wfd = -1;
+    }
+    if c.lfd >= 0 {
+        _ = sys_close(c.lfd) catch {};
+        c.lfd = -1;
+    }
+    if c.pid != 0 && !c.reaped {
+        if hard {
+            _ = sys_kill(-(c.pid as i64), SIGTERM) catch {};
+        }
+        // 关掉 stdin 之后行式 REPL 会读到 EOF 自己收尾；给它一次机会（不无限等）。
+        var st: i32 = 0;
+        var tries: usize = 0;
+        while tries < 40 {
+            const r: i32 = sys_waitpid(c.pid, &st, DWHC_WNOHANG) catch { -1; };
+            if r != 0 {
+                c.reaped = true;
+                break;
+            }
+            _ = dwhc_sleep_ms(10);
+            tries = tries + 1;
+        }
+        if !c.reaped {
+            _ = sys_kill(-(c.pid as i64), SIGKILL) catch {};
+            _ = sys_waitpid(c.pid, &st, 0) catch { 0; };
+            c.reaped = true;
+        }
+    }
+    c.pid = 0;
+    buf_free(&c.pending);
+    buf_free(&c.log_path);
+    buf_free(&c.err_path);
+    buf_free(&c.part);
+    buf_free(&c.raw);
+    buf_free(&c.stop_err);
+}

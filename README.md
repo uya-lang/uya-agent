@@ -256,8 +256,14 @@ uya-agent --dsh-web                     # http://127.0.0.1:8790/
 uya-agent --dsh-web 127.0.0.1:8790      # 指定端口（端口 0 = 内核分配）
 ```
 
-**要看到消息必须给事件源**：页面起来 ≠ 有内容。事件源是一份**预先翻好的译文**
-（本仓 `session.jsonl` → DSH `SessionEvent` 的快照，由 `web/wsess.uya` 翻译），两步：
+**两种模式**（由有没有事件源决定，启动时会打出来）：
+
+| 模式 | 怎么起 | 能做什么 |
+|---|---|---|
+| **活会话**（默认，用户零参数跑的形态） | 直接 `uya-agent --dsh-web` | **在页面里聊天**：打字 → 回车 ⇒ 消息送进一个真 agent 子进程，答复经会话日志流回页面；右上角的**模型选择器**列出本机 `settings.yaml` 里的模型，选了**真的会切**（模型名与端点一起换） |
+| **只读演示** | 给 `UYA_AGENT_DSH_WEB_EVENTS=<译文>` | 只把一份**预先翻好的译文**（本仓 `session.jsonl` → DSH `SessionEvent`，由 `web/wsess.uya` 翻译）画成历史；这时 `session/prompt` 明确回业务错「只读模式」，不假装收到 |
+
+只读演示那份译文这样造（两行）：
 
 ```bash
 log=$(find ~/.uya-agent/sessions -name session.jsonl -size +500c | head -1)
@@ -265,10 +271,22 @@ UYA_SELFTEST_WIRE_FILE="$log" uya-agent --selftest 2>/tmp/ev.ndjson   # 逐行�
 UYA_AGENT_DSH_WEB_EVENTS=/tmp/ev.ndjson uya-agent --no-dsh-config --dsh-web
 ```
 
-不给事件源时它会自己说清楚：`[dsh-web] 提示：没有事件源（…），页面能起来但没有消息`
-（页面本身仍然正常 —— 这是 P80 第二十二批修掉的那条：从前这里会因为快照
+**活会话的两条纪律**（都是实测踩出来的，见 DESIGN §11.9.7 第八之七节）：
+
+* 子进程的 **stdout/stderr 都落到 `<会话目录>/child.log`** —— 会话日志只由
+  `sess_*` 那条 fd 写。把 fd 1/2 指到日志上时，助手答复与 LLM 诊断会**追加进
+  JSONL**（粘成 `PROV-A-ANSWER{"type":"assistant/first-token",…}`），而日志是宿主的
+  事件源 ⇒ 整条会话的历史都渲染不出来；
+* **模型目录来自 DSH 设置**（`--dsh-home` / `$DSH_HOME` / `~/.dsh`）。`--dsh-home`
+  与 `--no-dsh-config` 是**互斥的两条路**：前者说「去这里读」，后者说「什么都别读」
+  —— 想用某个目录里的模型就必须**不给** `--no-dsh-config`。
+
+**没有 API 凭据时**页面照常能开、消息也进会话，只是请求发不出去（启动时 stderr 会
+警告一句，子进程的诊断在 `child.log` 里）。
+
+页面本身仍然正常 —— 这是 P80 第二十二批修掉的那条：从前零事件源时会因为快照
 `records[]` 多一个逗号而整帧被客户端拒掉，页面红字「加载会话历史失败」+ 每 3 秒重连；
-见 DESIGN §11.9.7 与 §16 踩坑 150）。
+见 DESIGN §11.9.7 与 §16 踩坑 150。
 
 **本机没装 DSH 时**：资源定位链是 `--dsh-assets DIR` → `--dsh-root DIR`
 （或 `UYA_AGENT_DSH_ROOT`）→ `~/.npm-global/…` → `~/.local/…`，给不存在的目录**直接报错**
@@ -280,8 +298,10 @@ uya-agent --dsh-assets ~/dsh-assets --dsh-web        # 之后都指这份
 ```
 
 **一条命令自证**：`make dsh-web-check` —— 起产品二进制 + headless chromium，
-两条腿都跑（**有译文**渲染出消息；**零事件源**无红字、不重连）。没装 DSH 或没有
-chromium 时**跳过**（不是失败）。
+**五条腿**都跑：① 有译文时渲染出消息；② 零事件源无红字、不重连；③ 在页面里**真
+打字**、断言假网关的答复渲染出来；④ **切模型**之后请求真的打到另一家（判据是假
+网关收到的模型名与端口，不是页面上的显示名）；⑤ 会话日志**每一行**都是合法 JSON。
+没装 DSH 或没有 chromium 时**跳过**（不是失败）。
 
 ---
 
