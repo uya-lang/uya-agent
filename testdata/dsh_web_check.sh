@@ -98,3 +98,36 @@ if [ $rc -ne 0 ]; then
     exit $rc
 fi
 echo "dsh-web-check: 通过 —— 产品二进制 --dsh-web 把本仓会话渲染进了 DSH 的 webui"
+
+# ── 第二腿：**零事件源**（用户零参数跑 `--dsh-web` 的形态）───────────────
+#
+# 为什么必须单跑这一腿：上面那条只覆盖「有译文」的路，而用户报的现场恰恰是
+# **没有**译文的那一路 —— 快照 `records[]` 多一个逗号（`},,{`）时客户端拒帧、
+# `close(4002)`，页面红字「加载会话历史失败」+ 每 3 秒重连一次，而上面那条
+# （有译文、seed 与译文之间正好需要那个逗号）**照样绿**。
+# 判据在 `dsh_web_zero_drive.mjs`：合成器活着 + 红字不在 + 不重连。
+zero_port=$(python3 -c "import socket;s=socket.socket();s.bind(('127.0.0.1',0));print(s.getsockname()[1]);s.close()")
+"$bin" --no-dsh-config --dsh-web "127.0.0.1:$zero_port" \
+    >"$root/build/dshweb_check_zero.log" 2>&1 &
+zhost=$!
+trap 'kill $host $zhost 2>/dev/null || true' EXIT
+i=0
+while [ $i -lt 40 ]; do
+    if curl -s --max-time 2 -o /dev/null "http://127.0.0.1:$zero_port/"; then
+        break
+    fi
+    sleep 0.5
+    i=$((i+1))
+done
+curl -s --max-time 2 -o /dev/null "http://127.0.0.1:$zero_port/" \
+    || { echo "dsh-web-check: 失败 —— 零事件源的 --dsh-web 没起来（看 build/dshweb_check_zero.log）"; exit 1; }
+
+zero_rc=0
+WIRE_PROBE_URL="http://127.0.0.1:$zero_port/" \
+    node "$root/testdata/dsh_web_zero_drive.mjs" "$ws" || zero_rc=$?
+kill $zhost 2>/dev/null || true
+if [ $zero_rc -ne 0 ]; then
+    echo "dsh-web-check: 失败 —— 零事件源那一路（用户零参数跑的形态）"
+    exit $zero_rc
+fi
+echo "dsh-web-check: 通过 —— 零事件源也能起（无红字、不重连）"

@@ -3339,6 +3339,81 @@ fork/exec/收集输出（与 `gitx_run` 同形，但可执行文件由调用方�
 
 实测（真浏览器）：带令牌进页面 → 303 → cookie → **会话消息完整渲染**。
 
+##### 八之六、第二十二批：用户报的两条「页面坏了」—— 逗号与四个页签
+
+用户实测报了两条：**「一直加载会话历史失败」**与**「设置界面、模型加载供应商也失败」**。
+两条都不是崩溃、也不是我自己那条 `make dsh-web-check` 能看见的（它对这两条**全绿**），
+所以先复现、再定根因。两条的根因**毫无关系**，各自记在下面。
+
+**① 「加载会话历史失败」= 快照 `records[]` 的逗号，而它是两面的缺陷**
+
+用户跑的是**零参数** `./build/uya-agent --dsh-web`（没有 `UYA_AGENT_DSH_WEB_EVENTS`
+事件源）—— 而 `dsh-web-check` 那条判据**总是**先喂一份译文，所以它从来没走过这条路。
+
+现场（真 chromium + CDP 抓的 DOM/控制台）：
+
+```
+T+4s  本仓会话 | Loading history… | Message or run a task, …
+T+8s  本仓会话 | Failed to load history: api gateway: invalid Remote
+      stream frame (gateway/internal) | …
+控制台  warning: [connection] connection lost, retry #1…#9（每 3 秒一轮）
+```
+
+`invalid Remote stream frame` 是客户端 `stream-client.js` 的 `receive()`：帧过不了
+`parseRemoteStreamServerMessage` 就 `close(4002)` 并整条重连（**不是**「这条流没数据」）。
+根因在快照的 `records[]` —— `dwh_seed_records` 把**收尾逗号焊死在字面量尾部**：
+
+| 情形 | 从前发出的字节 | 结果 |
+|---|---|---|
+| 零事件源（用户现场） | `…"never"}}}` + `,` + `,{"type":…end-seed` ⇒ `},,{` | 非法 JSON |
+| 有译文（`dsh-web-check` 那条） | seed 的收尾逗号**正好**是它该要的那个 | 合法 ⇒ 假绿 |
+
+`},,{` 的每个**片段**都在，所以子串断言全中 —— 与 §11.9.7 第五批「子串抓不住结构坏掉」
+是同一个教训。修法是**一个真值源**：seed / 译文 / end-seed 三段共用一个 `first`
+（`dwh_record_sep`），谁都不许自带逗号。改完当场还暴露了**反方向**的半成品
+（seed 写了逗号却没翻 `first` ⇒ 后一段不写 ⇒ `}}{`）—— 两个方向的症状**一模一样**，
+这正是「纪律必须落在一处」的理由。
+
+同一帧还修掉一个**判据不一致**：零事件源时 `cursor` 算成 0 而 `end-seed` 写 3
+（两处各算一次）。客户端的 `assertPageThrough` 拿 `tailCursor(page) === through` 判，
+不等就报 `page did not end at its requested cursor`（显示在对话区**正文位置**，
+看着像消息加载失败）。现在 `last` 只算一次，`cursor` 与 `end-seed` 都用它。
+
+**② 「设置/模型供应商加载失败」= 四个页签各调了一族本仓没实现的方法**
+
+设置对话框四个页签各自把整片渲染成一句「未实现」（实测逐页点过）：
+
+| 页签 | 调的方法 | 用户看到的 |
+|---|---|---|
+| General | `permissionPresets/catalog` | `Permission` 一行 `internal: not implemented: …`，整块 `Unavailable` |
+| Models | `llm/listProviders`、`llm/listConfigurableProviders` | `Loading the provider directory failed: not implemented: llm/listProviders` + `Retry` |
+| Built-in plugins | `pluginInventory/list` | `Plugins are temporarily unavailable.` |
+| Agent presets | `agentPresets/list` | `not implemented: agentPresets/list` |
+
+新增 `dwh_unary_settings`（六个方法，形状**逐个从真 DSH 的 typert host 抄**
+`z.object` 的键名与可选性，不按印象写）。这一簇是**只读元信息**，本仓没有可写的设置
+文档 ⇒ 中性值语义正确（`settings.describe` 已经如实给 `writable:false`）。
+
+顺带修掉一个**投影缺陷**（它是这次才暴露的：`permissionPresets/catalog` 一旦有值，
+客户端就走到了从前没人走的那条路）：快照的 `projections.values.permissions` 给 `{}`
+是错的 —— 它的**视图**是 `{currentValue}`，客户端拿 `currentValue` 去
+`catalog.options` 里找，找不到就回落成「把 `undefined` 当名字」⇒
+`displayPresetName` 里 `name.split` 抛 `TypeError` ⇒ slot
+`conversation.input.permission` **整块崩掉**（实测：控制台两条 error）。
+给 `{"currentValue":"danger-full-access"}` 之后那一行正常显示 `Full access`。
+
+**判据（这一批的三条腿，各有各的 oracle）**：
+
+| # | 判据 | oracle | 防假绿对照 |
+|---|---|---|---|
+| ① | `selftest[web-snapshot]`：两种事件源下快照都是**合法 JSON**，且 `cursor == 末条 seq` | 本仓的 JSON 解析器（`js_parse`）—— 子串对 `},,{` 是瞎的 | 把收尾逗号装回 seed ⇒ 四条断言全红 |
+| ② | `selftest[web-panel]`：六个方法**都实现了** + 回值合法 + **形状类型对**（该数组的给数组） | 本仓解析器 + 首字符判类型 | 删掉 `llm.listProviders` 分支 ⇒ 当场红 |
+| ③ | `make dsh-web-check` 的**第二腿**：用户那个**零参数**形态 —— 合成器活着 + 红字不在 + `connection lost` **0 次** | 真 chromium + CDP（读 DOM 与控制台） | 把收尾逗号装回 ⇒ 这条腿红（而**第一腿照样绿**，正是它当初漏掉用户现场的原因） |
+
+> 教训与第五批同族，但换了个面：**判据覆盖的是「我想到的那条路」**。
+> `dsh-web-check` 一直绿，是因为它永远先喂一份译文；用户跑的是没有译文的那条。
+> 所以这一批给那条命令加了第二腿 —— **同一份代码的两条输入路径，各要一条判据**。
+
 ##### 九、历史记录：`connection lost` 的排查（第十一批已解）
 
 第十批之后，`generation is still not ready` 那条告警**消失了**（说明 `$events`
@@ -5996,6 +6071,48 @@ QTermWidget）对 `ESC[?5522$p`（DECRQM）**零应答**，OSC 52 写 `c`/`p` �
     **孪生一条（改名类改动的通用陷阱）**：定义改名成 `betui_*` 之后，`be_tui.uya` 里的
     调用点漏改**编译期不报错** —— 合并命名空间里 `tui_add_user` 看起来就是个外部函数，
     只有 `make build` 链接时才炸 `undefined reference`。所以「改名」不能只跑 `make check`。
+
+150. **「判据覆盖的是我想到的那条路」：一条命令绿了，而用户跑的是它的另一条输入路径**
+    （P80 第二十二批，用户报的）。用户报两条「页面坏了」，而 `make dsh-web-check`
+    对**两条都绿**。第一条的现场：零参数 `./build/uya-agent --dsh-web`（没有事件源）
+    ⇒ 页面 `Failed to load history: api gateway: invalid Remote stream frame`，
+    控制台每 3 秒一轮 `connection lost, retry`。`dsh-web-check` 之所以看不见：
+    它**总是**先拿 `--selftest` 把一份真日志翻成译文再起宿主（那条路是**有**译文的）。
+    根因是快照 `records[]` 的逗号 —— `dwh_seed_records` 把收尾逗号**焊在字面量尾部**：
+
+    | 输入路径 | 从前发出的字节 | 结果 |
+    |---|---|---|
+    | 零事件源（**用户跑的**） | `…"never"}}},` + `,{…end-seed…` ⇒ `},,{` | 非法 JSON ⇒ 拒帧、4002、重连 |
+    | 有译文（**判据跑的**） | seed 的收尾逗号正好是它该要的那个 | 合法 ⇒ **绿** |
+
+    **两件事值得记**：① `},,{` 的每个**片段**都在（`user/message`、`end-seed`、
+    `"seq":3` …），所以子串断言全中 —— 与 §11.9.7 第五批「子串抓不住结构坏掉」同族，
+    这次换了个面；② 修的时候当场又写出**反方向**的半成品（seed 写了逗号却没翻
+    `first` ⇒ 后一段以为自己是第一条、不写 ⇒ `}}{`），而**两个方向的页面症状一模一样**
+    ⇒ 逗号纪律必须落在**一处**（`dwh_record_sep` + 共用的 `first`），不能三段各写各的。
+    **判据修法**：给同一条命令加**第二腿**（同一份代码的**另一条输入路径**），
+    并用本仓的 JSON 解析器当 oracle（`selftest[web-snapshot]`）——
+    子串对「结构坏掉」是瞎的。**通用教训**：一条命令的判据要按**输入路径**清点，
+    而不是按「我实现的分支」清点；`--dsh-web` 有事件源与零事件源两条，就欠一条判据。
+
+151. **「设置面板」那一族错误是「红字」而不是崩溃 ⇒ 只有把每个页签都点一遍才看得见**
+    （P80 第二十二批，用户报的，与 150 同批但根因无关）。用户在设置界面看到
+    「模型加载供应商也失败」。四个页签各自把整片渲染成一句「未实现」（实测逐个点过）：
+    General → `permissionPresets/catalog`、Models → `llm/listProviders` +
+    `llm/listConfigurableProviders`、Built-in plugins → `pluginInventory/list`、
+    Agent presets → `agentPresets/list`。**这是最容易被判成「那个功能本来就没有」的形态**：
+    不崩、不白屏，只是一片写着 `internal: not implemented: <方法名>` 的区域。
+    **修法**：`dwh_unary_settings` 六个方法，形状**逐个从真 DSH 的 typert host 抄**
+    （`z.object` 的键名与可选性）—— 猜形状的代价比「未实现」更高：
+    `settings.describe` 那次把 `namespaces` 给成对象（客户端对它 `.find()`）让设置面板
+    **整片塌掉**，症状与「没实现」完全不同。
+    **同批暴露的投影缺陷**（这次才走到那条路）：快照的
+    `projections.values.permissions` 给 `{}` 是错的 —— 它的**视图**是 `{currentValue}`，
+    客户端拿它去 `catalog.options` 里找，找不到就回落成「把 `undefined` 当名字」⇒
+    `displayPresetName` 里 `name.split` 抛 `TypeError` ⇒ slot
+    `conversation.input.permission` **整块崩掉**。**教训**：给「投影」填中性值时，
+    要按**客户端的视图 schema**（`{currentValue}`）而不是按「这里大概是个对象」——
+    `{}` 不是「空值」，它是「一个所有键都 undefined 的值」。
 
 ---
 

@@ -179,6 +179,10 @@ readelf -lW build/uya-agent | grep -c INTERP    # 0 = 真静态
 | `--tui` / `--no-tui` | 全屏 TUI（**TTY 交互模式默认**）/ 退回滚动转录；`UYA_AGENT_TUI=0\|1` 同口径 |
 | `--tui-demo [WxH]` | 打印 TUI 若干屏的纯文本快照后退出（诊断 + 文档；也是 markdown 排版与浮层全屏的自测基准） |
 | `--web [ADDR]` | **web 界面**：起一个本地 HTTP 服务，浏览器里用（默认 `127.0.0.1:8787`；`127.0.0.1:0` = 内核分配端口；`UYA_AGENT_WEB=1` / `UYA_AGENT_WEB_ADDR` 同口径）。每个会话是一个**真 PTY 上的 agent 子进程**，跑的就是全屏 TUI；见 §1.3。**会话继承父进程的命令行配置**（`--permission` / `--workspace` / `--agent-home` / `--base-url` / `--model` / `--tls-*` …）；少数没有环境变量口径的开关会由启动日志逐条点名 |
+| `--dsh-web [ADDR]` | **DSH 自己的前端**（默认 `127.0.0.1:8790`）：只读服务本机那份 `dsh-web-frontend/dist`（**一个字节都不改**），并把 `/api` 接到本仓会话上；与 `--web` 并列、可同时给（不同端口）。见 §1.4 |
+| `--dsh-assets DIR` | DSH 资源目录（**优先于** `--dsh-root`；给不存在的目录**直接报错**，不静默回退）—— 本机没装 DSH 时指一份取件缓存 |
+| `--dsh-assets-install` | **取件**：`npm install` 到 `--dsh-assets-dir`（解压交给系统工具，本仓不实现）；`--dsh-assets-repo URL` 换源 |
+| `--dsh-token T` | `--dsh-web` 的访问令牌：绑回环**不校验**（本机看页面不需要门槛），绑非回环而不给会**自动生成并打印** |
 | `--title` / `--no-title` | 交互模式把**终端标题**写成当前会话标题（**默认开**） |
 | `--title-auto` / `--no-title-auto` | 让**模型给会话起标题**（**默认开**）。一条会话只起一次：首次提示词之后、第一个 step 跑完就在回合里发那一个小请求（收尾不更新标题） |
 | `--mouse` / `--no-mouse` | TUI 的**鼠标上报**开关（**默认开**：滚轮翻转录 + **拖选即复制**）。`--no-mouse` 让终端重新接管鼠标 ⇒ 用它自己的拖选与选区（同时失去滚轮翻转录，改用 `ctrl+↑/↓` 或 `pgup/pgdn`）；运行中还有 `F2` 与 `/mouse on\|off` |
@@ -241,9 +245,47 @@ uya-agent --web 127.0.0.1:9000     # 指定端口（端口写 0 = 内核分配�
 * 新建会话的尺寸是**页面报上来的**（`POST /api/sessions?cols=&rows=`）：不会先起一屏
   100 列的界面（踩坑 117）。
 
+### 1.4 DSH 自己的前端（`--dsh-web`）
+
+**这条与 §1.3 是两件事**：`--web` 服务的是本仓自己的页面（每个会话一个真 PTY）；
+`--dsh-web` 服务的是**你本机装的那份 DSH 前端** —— 只读它的 `dist`（**一个字节都不改**），
+复刻它的 `bootInjections()`，并把 `/api` 接到本仓会话上。两者可以同时给（不同端口）。
+
+```bash
+uya-agent --dsh-web                     # http://127.0.0.1:8790/
+uya-agent --dsh-web 127.0.0.1:8790      # 指定端口（端口 0 = 内核分配）
+```
+
+**要看到消息必须给事件源**：页面起来 ≠ 有内容。事件源是一份**预先翻好的译文**
+（本仓 `session.jsonl` → DSH `SessionEvent` 的快照，由 `web/wsess.uya` 翻译），两步：
+
+```bash
+log=$(find ~/.uya-agent/sessions -name session.jsonl -size +500c | head -1)
+UYA_SELFTEST_WIRE_FILE="$log" uya-agent --selftest 2>/tmp/ev.ndjson   # 逐行译文
+UYA_AGENT_DSH_WEB_EVENTS=/tmp/ev.ndjson uya-agent --no-dsh-config --dsh-web
+```
+
+不给事件源时它会自己说清楚：`[dsh-web] 提示：没有事件源（…），页面能起来但没有消息`
+（页面本身仍然正常 —— 这是 P80 第二十二批修掉的那条：从前这里会因为快照
+`records[]` 多一个逗号而整帧被客户端拒掉，页面红字「加载会话历史失败」+ 每 3 秒重连；
+见 DESIGN §11.9.7 与 §16 踩坑 150）。
+
+**本机没装 DSH 时**：资源定位链是 `--dsh-assets DIR` → `--dsh-root DIR`
+（或 `UYA_AGENT_DSH_ROOT`）→ `~/.npm-global/…` → `~/.local/…`，给不存在的目录**直接报错**
+（不静默回退，否则会「以为在用缓存、其实在用全局」）。完全没有 DSH 时取件：
+
+```bash
+uya-agent --dsh-assets-install --dsh-assets-dir ~/dsh-assets --dsh-web
+uya-agent --dsh-assets ~/dsh-assets --dsh-web        # 之后都指这份
+```
+
+**一条命令自证**：`make dsh-web-check` —— 起产品二进制 + headless chromium，
+两条腿都跑（**有译文**渲染出消息；**零事件源**无红字、不重连）。没装 DSH 或没有
+chromium 时**跳过**（不是失败）。
+
 ---
 
-### 1.4 环境变量
+### 1.5 环境变量
 
 `UYA_AGENT_BASE_URL`、`UYA_AGENT_MODEL`、`UYA_AGENT_WORKSPACE`、
 `UYA_AGENT_MAX_STEPS`（步数熔断上限，`0` = 不限，也是默认值；非法值告警后按「不限」处理）、
@@ -487,7 +529,7 @@ leaf 指纹怎么算、指纹库放哪儿 —— 见 [DESIGN.md §18](DESIGN.md)
 |---|---|
 | DSH 设置 | `$DSH_HOME/settings.yaml`（模型路线 / 权限 `defaultPreset` / 技能根 / preset 旋钮）、`.credentials.yaml`（凭据）、`.env` |
 | **本仓自己的设置** | 同一份 `settings.yaml` 的 `uya-agent:` 节 —— 目前只有 `contextWindows:`（模型 → 上下文窗口，见 §7） |
-| 环境变量 | `UYA_AGENT_*`（见 §1.3） |
+| 环境变量 | `UYA_AGENT_*`（见 §1.5） |
 | 命令行 | `--xxx`（最高优先级） |
 
 `--print-config` 会把**生效值与来源**一起印出来（每个取值带 `cli` / `env` / `dsh-settings` /
