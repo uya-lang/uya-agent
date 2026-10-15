@@ -1,11 +1,14 @@
 // src/term/tui/entry.uya — 全屏 TUI：转录条目 / NOTICE / 清洗 / 折行 / 行渲染 / sink
 //
-// 本文件：转录条目表与长度上限、NOTICE 条目（诊断 fd 2 的落点，也是「乱码」最容易灌屏
-//   的地方）、控制字节与 ESC 序列清洗、按显示列的折行、行渲染（P46：markdown 交给 mdview
-//   纯函数层，这里只做前缀分类），以及写入 sink（`tty_write` / `tty_reason_write` 的字节
-//   怎么变成条目 —— **唯一的条目入口**）。
+// 本文件：转录条目表与长度上限（正文 + **派生缓冲**两条线，见 TUI_DERIVED_MAX）、
+//   NOTICE 条目（诊断 fd 2 的落点，也是「乱码」最容易灌屏的地方）、控制字节与 ESC 序列
+//   清洗、按显示列的折行、行渲染（P46：markdown 交给 mdview 纯函数层，这里只做前缀分类），
+//   以及写入 sink（`tty_write` / `tty_reason_write` 的字节怎么变成条目 —— **唯一的条目入口**）。
 // 不变量：清洗之后的行文本仍不得含 ESC / NUL；折行结果按显示列、续行保留原行缩进；
-//   别处不许直接往条目表里塞。
+//   别处不许直接往条目表里塞；**记账恒等式** `g_tui_text_total == Σ 条目 text.len`、
+//   `g_tui_derived_total == Σ (wrap + md + 行表)`（各自的「加」只有
+//   `tui_entry_append` 一处、「减」只有丢条目 / 单条截断 / 思考截尾 / 重折四处；
+//   selftest[tui-mem] 每轮用 `tui_text_bytes()` / `tui_derived_bytes()` 复算对照）。
 // 依赖：term/mdview、style、foundation/bufx。
 // 命名：本目录统一 `tui_` / `TUI_` 前缀（uya 没有闭包，模块级名字全局合并）。
 
@@ -28,6 +31,21 @@ const TUI_MAX_ENTRIES: usize = 512;
 const TUI_ENTRY_MAX: usize = 262144;        // 单条上限 256 KiB
 const TUI_TEXT_MAX: usize = 4194304;        // 转录正文总量上限 4 MiB
 const TUI_REASON_TAIL: usize = 4096;        // 思考条目只留最新一段
+
+// **派生缓冲**的总量上限（真实堆占用，见 tui_entry_derived_bytes）。
+//
+// 为什么除正文之外还要单开一条线：TUI_TEXT_MAX 只数 `text`，而每条 markdown 条目
+// 还带一份**与折行文本逐字节等长**的样式 `md`，折行文本本身又带一份行偏移表
+// （按折行**行数** × 8 字节）。实测一份 4 MiB 正文的真实驻留是它的 2–3 倍；
+// 病态输入（巨缩进的长行 —— 续行 room = width - indent 只剩几列时，每行 76 字节
+// 缩进只换 4 个正文字节）能到十倍以上。所以「4 MiB 上限」这句话在正文口径下
+// 是**真话但不是全貌**：这条线才是管住驻留内存的那一条。
+//
+// **取值 = 正文上限的 4 倍（16 MiB）**：实测正常 markdown 灌到正文上限（512 条 ×
+// 8 KB ≈ 3.6 MiB）时派生约 10.9 MiB ≈ **3.0× 正文**，4 倍留出约 30% 余量 ⇒ 正常内容
+// 一条都不会因为它被丢；而上面那种病态输入（一两千个空格的长行）比值能到 15× 以上，
+// 仍然被这条线挡在 16 MiB。实测数字见 DESIGN §11.5 与 selftest[tui-mem]（两段都打印）。
+const TUI_DERIVED_MAX: usize = 16777216;
 
 // 踩坑 68：行偏移表 —— 取第 i 行的字节区间。
 //
@@ -81,12 +99,93 @@ var g_tui_entries: [TuiEntry: TUI_MAX_ENTRIES] = [TuiEntry{
 }: TUI_MAX_ENTRIES];
 var g_tui_nent: usize = 0;          // 已用条目数（环形）
 var g_tui_estart: usize = 0;        // 环形起点
-var g_tui_text_total: usize = 0;    // 正文总量记账
-var g_tui_dropped: usize = 0;       // 被丢掉的老条目数（顶部会写一行）
+var g_tui_text_total: usize = 0;    // 正文记账（= Σ text.len，见 tui_entry_append）
+var g_tui_derived_total: usize = 0; // 派生记账（wrap+md+行表，见 TUI_DERIVED_MAX）
+var g_tui_dropped: usize = 0;       // 被丢掉的老条目数（溢出时在转录第 0 行写一行）
 
 // 当前转录里的条目数（环形表已用格数，不含被丢掉的老条目）。
 export fn tui_entries_count() usize {
     return g_tui_nent;
+}
+
+// 被丢掉的老条目数（0 = 一条都没丢过）。转录顶部那行提示与 selftest 读它。
+export fn tui_entries_dropped() usize {
+    return g_tui_dropped;
+}
+
+// 正文总量（字节）：**从各条目的 text.len 现算**，不读 g_tui_text_total。
+//
+// 为什么另算一份而不是直接返回计数器：这两者必须互为对照 —— 计数器是「记账」，
+// 这里是「实况」。selftest[tui-mem] 的恒等式判据就靠这一对；生产路径读的仍是计数器。
+export fn tui_text_bytes() usize {
+    var total: usize = 0;
+    var i: usize = 0;
+    while i < g_tui_nent {
+        total = total + tui_entry_at(i).text.len;
+        i = i + 1;
+    }
+    return total;
+}
+
+// 正文总量记账值的只读出口（与 tui_text_bytes() 对照用）。
+export fn tui_text_accounted() usize {
+    return g_tui_text_total;
+}
+
+// 派生缓冲的实况（字节）：Σ (wrap.len + md.len + 行偏移表格数 × 8)。
+// 与 g_tui_derived_total 同口径 —— 一个现算、一个记账（对照判据同上）。
+// 行表按 **cap** 算：`tui_lineidx_build` 只在行数超过现有容量时才重分配，实际占的
+// 就是 cap 格（按 n 算会低报，恒等式立刻对不上 —— 实测差 9 格 = 72 B）。
+export fn tui_derived_bytes() usize {
+    var total: usize = 0;
+    var i: usize = 0;
+    while i < g_tui_nent {
+        const e: &TuiEntry = tui_entry_at(i);
+        const per: usize = @size_of(usize) as usize;
+        total = total + e.wrap.len + e.md.len + e.wrap_ix.cap * per;
+        i = i + 1;
+    }
+    return total;
+}
+
+// 派生缓冲记账值的只读出口。
+export fn tui_derived_accounted() usize {
+    return g_tui_derived_total;
+}
+
+// 最后一条条目的正文长度（字节）；一条都没有时 0。**只给观测用** ——
+// selftest[tui-mem] 的单条上限判据读它（见那里为什么不能用「正文总量」当判据）。
+export fn tui_entry_text_len() usize {
+    if g_tui_nent == 0 {
+        return 0;
+    }
+    return tui_entry_at(g_tui_nent - 1).text.len;
+}
+
+// 当前存活的**条目缓冲分配**块数（text / wrap / md / wrap_ix 四种各算一块）。
+//
+// 用途只有一个：`tui_transcript_clear()` 必须把它清回 0。以前 `wrap_ix` 的释放写在
+// `if buf_valid(&md)` 分支里，而 md 只有 ASSIST 条目才分配 —— TOOL / USER / NOTICE
+// 的折行索引于是每次换会话都漏一次（实测：换 10 次会话漏 10 块）。
+export fn tui_entry_live_allocs() usize {
+    var n: usize = 0;
+    var i: usize = 0;
+    while i < TUI_MAX_ENTRIES {
+        if buf_valid(&g_tui_entries[i].text) {
+            n = n + 1;
+        }
+        if buf_valid(&g_tui_entries[i].wrap) {
+            n = n + 1;
+        }
+        if buf_valid(&g_tui_entries[i].md) {
+            n = n + 1;
+        }
+        if (g_tui_entries[i].wrap_ix.offs as usize) != 0 {
+            n = n + 1;
+        }
+        i = i + 1;
+    }
+    return n;
 }
 
 
@@ -184,12 +283,20 @@ fn tui_notice_newline(e: &TuiEntry) void {
     if e.notice_full {
         return;
     }
-    if buf_append_byte(&e.text, 10) {
-        g_tui_text_total = g_tui_text_total + 1;
-    }
+    tui_entry_append_nl(e);
 }
 
-// 丢最老的一条（环形前进）
+// 往条目补一个换行字节。NOTICE / TOOL 的整行入口共用这一处。
+//
+// ⚠ 走的仍是 `tui_entry_append`（**记账的「加」只有那一处**），不自己 `buf_append_byte`：
+// 那条 clamp 管的是**它自己**写进去的字节，跟在后面直接补换行的话一条条目会长到
+// `TUI_ENTRY_MAX + 1`（实测 262145 —— selftest[tui-mem] 的单条上限判据抓到的就是它）。
+fn tui_entry_append_nl(e: &TuiEntry) void {
+    var nl: [byte: 1] = [10];
+    tui_entry_append(e, &nl[0], 1);
+}
+
+// 丢最老的一条（环形前进）。记账（正文 + 派生）与四块缓冲一起放掉。
 fn tui_entry_drop_oldest() void {
     if g_tui_nent == 0 {
         return;
@@ -197,6 +304,8 @@ fn tui_entry_drop_oldest() void {
     const s: usize = g_tui_estart;
     if s < TUI_MAX_ENTRIES {
         g_tui_text_total = g_tui_text_total - g_tui_entries[s].text.len;
+        g_tui_derived_total = g_tui_derived_total
+            - tui_entry_derived_bytes(&g_tui_entries[s]);
         buf_free(&g_tui_entries[s].text);
         buf_free(&g_tui_entries[s].wrap);
         buf_free(&g_tui_entries[s].md);
@@ -207,13 +316,26 @@ fn tui_entry_drop_oldest() void {
     g_tui_dropped = g_tui_dropped + 1;
 }
 
-// 新建一条条目：先按条数上限（TUI_MAX_ENTRIES）与正文总量上限（TUI_TEXT_MAX）丢掉最老的，
-// 再从环形表尾部取槽位初始化。返回新条目的逻辑下标；失败返回负值。
+// 一条条目的派生缓冲字节数（wrap + md + 行偏移表格数 × 8 字节/格）。
+// 记账（g_tui_derived_total）与上限闸门（TUI_DERIVED_MAX）共用这一个口径。
+fn tui_entry_derived_bytes(e: &const TuiEntry) usize {
+    const per: usize = @size_of(usize) as usize;
+    return e.wrap.len + e.md.len + e.wrap_ix.cap * per;
+}
+
+// 新建一条条目：先按条数上限（TUI_MAX_ENTRIES）、正文总量上限（TUI_TEXT_MAX）与
+// **派生缓冲上限**（TUI_DERIVED_MAX，见那个常量的注释）丢掉最老的，再从环形表尾部
+// 取槽位初始化。返回新条目的逻辑下标；失败返回负值。
 fn tui_entry_new(kind: u8) i32 {
     while g_tui_nent >= TUI_MAX_ENTRIES {
         tui_entry_drop_oldest();
     }
     while g_tui_text_total > TUI_TEXT_MAX && g_tui_nent > 0 {
+        tui_entry_drop_oldest();
+    }
+    // 保底留 1 条：派生量来自折行，而折行是每帧按需做的 —— 只剩一条时它是**唯一**
+    // 还能看到的内容，把它也丢掉就变成「屏幕上什么都没有，模型还在说话」。
+    while g_tui_derived_total > TUI_DERIVED_MAX && g_tui_nent > 1 {
         tui_entry_drop_oldest();
     }
     const s: usize = (g_tui_estart + g_tui_nent) % TUI_MAX_ENTRIES;
@@ -230,16 +352,31 @@ fn tui_entry_append(e: &TuiEntry, p: &const byte, n: usize) void {
     if n == 0 {
         return;
     }
-    if e.text.len + n > TUI_ENTRY_MAX {
-        const over: usize = e.text.len + n - TUI_ENTRY_MAX;
+    var src: &const byte = p;
+    var take: usize = n;
+    // 单条上限必须对**这一块**也成立：只从头部丢旧字节的话，一次塞进来 1 MiB，
+    // 条目的 text 就长到 1 MiB —— 上限形同虚设（长工具结果一次整块交进来时就是这样）。
+    if take > TUI_ENTRY_MAX {
+        src = p + (n - TUI_ENTRY_MAX);
+        take = TUI_ENTRY_MAX;
+    }
+    if e.text.len + take > TUI_ENTRY_MAX {
+        const over: usize = e.text.len + take - TUI_ENTRY_MAX;
         if over >= e.text.len {
+            g_tui_text_total = g_tui_text_total - e.text.len;
             buf_reset(&e.text);
         } else {
+            g_tui_text_total = g_tui_text_total - over;
             buf_truncate(&e.text, e.text.len - over);
         }
     }
-    if buf_append(&e.text, p, n) {
-        g_tui_text_total = g_tui_text_total + n;
+    if buf_append(&e.text, src, take) {
+        // ⚠ 记账必须与真实长度同步：这里以前累加的是**请求长度 n** 而不是实际接受的
+        // `take`，且头部丢弃的 `over` 从来不减 —— 于是计数器只增不减、越跑越虚高，
+        // 转录会比标称的 TUI_TEXT_MAX **早得多**开始丢老条目（长会话里用户看到的
+        // 就是「老内容莫名其妙没了」）。恒等式 `g_tui_text_total == Σ text.len`
+        // 由 selftest[tui-mem] 每轮复算对照。
+        g_tui_text_total = g_tui_text_total + take;
     }
     e.wrap_valid = false;
     tui_mark_dirty();
@@ -475,6 +612,9 @@ fn tui_entry_ensure_wrap(i: usize, width: usize) void {
     if e.wrap_valid && e.wrap_width == width {
         return;
     }
+    // 重折之前先把它上一次贡献的派生量从记账里扣掉，折完再加回来 ——
+    // 派生量是**随宽度变化**的（折得越窄行数越多），不重算就会越滚越大。
+    g_tui_derived_total = g_tui_derived_total - tui_entry_derived_bytes(e);
     if !buf_valid(&e.wrap) {
         e.wrap = buf_new(4096);
     }
@@ -497,6 +637,8 @@ fn tui_entry_ensure_wrap(i: usize, width: usize) void {
     tui_lineidx_build(&e.wrap_ix, &e.wrap);
     e.wrap_width = width;
     e.wrap_valid = true;
+    // 重折之后按**新的** wrap/md/行表把派生量加回来（上面先减掉了旧的）
+    g_tui_derived_total = g_tui_derived_total + tui_entry_derived_bytes(e);
 }
 
 
@@ -850,6 +992,10 @@ fn tui_sink_reason(p: &const byte, n: usize) void {
             e2.text.ptr[k] = e2.text.ptr[cut + k];
             k = k + 1;
         }
+        // ⚠ 这里丢掉的字节（改前 += 记账、丢字节却一个都不减）就是「计数器只增不减」
+        // 的另一半来源。思考条目**每次超上限都丢一次**，于是它自己把计数器推到
+        // 远超真实占用 —— 转录因此提前丢老条目。
+        g_tui_text_total = g_tui_text_total - (e2.text.len - k);
         buf_truncate(&e2.text, k);
         e2.wrap_valid = false;
     }
@@ -880,8 +1026,7 @@ fn tui_sink_line(p: &const byte, n: usize) void {
         }
         const e: &TuiEntry = tui_entry_at(idx as usize);
         tui_entry_append(e, p, n);
-        _ = buf_append_byte(&e.text, 10);
-        g_tui_text_total = g_tui_text_total + 1;
+        tui_entry_append_nl(e);
         return;
     }
     const lastk: u8 = tui_last_kind();
@@ -892,8 +1037,7 @@ fn tui_sink_line(p: &const byte, n: usize) void {
             tui_notice_newline(e2);
         } else {
             tui_entry_append(e2, p, n);
-            _ = buf_append_byte(&e2.text, 10);
-            g_tui_text_total = g_tui_text_total + 1;
+            tui_entry_append_nl(e2);
         }
         return;
     }

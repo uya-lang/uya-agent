@@ -1,0 +1,335 @@
+// src/selftest/tuis_mem.uya — 转录的内存纪律（本轮修复）：记账 / 上限 / 清空泄漏
+//
+// 本文件：tui-mem 轮 —— 转录（`term/tui/entry.uya`）的**内存纪律**四段：
+//   ① 记账恒等式（`g_tui_text_total` 必须逐字节等于 Σ 条目 text.len，见 tui_text_bytes）；
+//   ② 派生缓冲（wrap + md + 行偏移表）也记账、也受上限管（TUI_DERIVED_MAX）；
+//   ③ 清空之后**存活分配 = 0**（换会话不许漏 wrap_ix —— 它以前写在 `if buf_valid(md)` 里）；
+//   ④ 单条上限（TUI_ENTRY_MAX）对「一次整块塞进来」也成立；丢过条目之后转录第 0 行
+//      出现「更早的 N 条已省略」。
+// 不变量：与 tuiselftest.uya 同处合并命名空间，无本地 use；断言读**实况值**
+//   （`tui_text_bytes` / `tui_derived_bytes` / `tui_entry_live_allocs`）与**帧文本**，
+//   不读记账变量本身 —— 否则「记账实现坏了」这件事会被同一个坏实现掩盖。
+// 依赖：见 tuiselftest.uya 的文件头。
+// 命名：沿用本目录自测的 `tuis_` 前缀（轮次为 `tui_mem_round`）。
+//
+// 为什么单开一轮：这一轮盯的四件事**全都没有任何屏幕断言看得见** —— 记账虚高只是
+// 「老条目比标称更早被丢」，派生缓冲超限只是「RSS 比 4 MiB 高几倍」，换会话漏一块
+// 行偏移表在屏幕上完全看不出来。三样都得靠**数值判据**（恒等式 / 上限 / 存活计数）
+// 才看得见，所以必须有这一轮。三条防假绿对照实验（各自单独回退都会当场红）写在各段注释里。
+
+// 造一条「缩进极深的长行」的工具块（第 0 行是工具头，后面 n 行是续行）。
+//
+// 为什么用这个夹具：非 markdown 条目的**续行** room = 折行预算 − 缩进，而缩进夹在
+// `w - 4`；行越长，每 4 个源字节就要配 56 字节缩进重新折一行 ⇒ 折行文本比正文大
+// 十几倍。这是正文里真实存在的形态（工具输出里的对齐表、嵌套 JSON、深缩进的报告），
+// 也是 `TUI_DERIVED_MAX` 那条线唯一要挡的东西。
+//
+// ⚠ 第 0 行必须是 `✓ ` 工具头：否则这些**缩进行**会被 sink 当诊断收进 NOTICE 条目，
+// 而 NOTICE 有 512 B/条的硬上限 —— 夹具会被静默吃掉（第一版实测：灌了 2.7 MB，
+// 正文只剩 588 B）。
+fn tuis_mem_indented(lines: usize, width: usize, out: &Buf) void {
+    buf_reset(out);
+    _ = buf_append_cstr(out, "✓ Bash(deep) · exit=0\n");
+    var i: usize = 0;
+    while i < lines {
+        var k: usize = 0;
+        while k < width {
+            _ = buf_append_byte(out, 32);
+            k = k + 1;
+        }
+        _ = buf_append_cstr(out, "X\n");
+        i = i + 1;
+    }
+}
+
+// 往 out 里拼一段**普通** markdown 正文（带表格/围栏/行内标记）。
+// 这一段是「上限不许误伤正常内容」的正对照臂。
+//
+// ⚠ 调用方复用它、每轮 `buf_reset` 后再拼：`md` 是 30 遍 × 约 3 KiB 的夹具，
+// 在 4096 容量的缓冲上每遍都重新分配一次纯属浪费（实测把 B 段拖慢一大截）。
+fn tuis_mem_md_chunk(i: usize, reps: usize, out: &Buf) void {
+    buf_reset(out);
+    var r: usize = 0;
+    while r < reps {
+        _ = buf_append_cstr(out, "### 小节 ");
+        _ = buf_append_u64(out, i as u64);
+        // 行宽豁免：夹具的 markdown 正文（一整段字面量，拆开就看不出排版形态）
+        _ = buf_append_cstr(out, "\n\n正文带 **粗体** 与 `code` 与 [链接](https://e.com/p)。\n\n- 项一\n- 项二\n\n| 列A | 列B |\n| --- | ---: |\n| 值 | 1 |\n\n```uya\nconst X: usize = 1;\n```\n\n");
+        r = r + 1;
+    }
+}
+
+// 灌 n 条普通 markdown 助手正文（各自成一条条目），每条重复 reps 遍。
+// reps = 1 时单条约 200 B（小助手正文）；reps = 40 时约 8 KB（真实的大段回答）。
+fn tuis_mem_feed_md(n: usize, reps: usize) void {
+    var md: Buf = buf_new(65536);
+    defer { buf_free(&md); }
+    var i: usize = 0;
+    while i < n {
+        tuis_mem_md_chunk(i, reps, &md);
+        tui_sink_bytes(1, md.ptr as &const byte, md.len);
+        tui_close_stream_entries();
+        i = i + 1;
+    }
+}
+
+// A 段：记账恒等式 —— 正文（Σ text.len）与派生（wrap + md + 行表）两个数都要**精确**。
+//
+// 这条判据是「记账只加不减」那个缺陷的唯一出口：修前 `g_tui_text_total` 只增不减
+// （思考条目每次截尾丢掉的字节不减、单条超限从头部丢掉的字节不减），于是它长时间
+// **大于** Σ text.len —— 转录会比标称的 4 MiB 早得多开始丢老条目。
+// 对照实验：把 `tui_sink_reason` 里那句减账删掉重编，本段当场红。
+fn tuis_mem_account(tag: &const byte, ok: &bool) void {
+    tuis_reset(80, 30);
+    // 先喂一段普通正文与工具输出（走 append 那条路）
+    tuis_mem_feed_md(6, 1);
+    tui_sink_bytes(2, "✓ Read(a.uya) · 3 lines\n" as &const byte, 27);
+    tui_sink_flush_partial();
+    // 再灌思考：每次超 TUI_REASON_TAIL 都会从头部丢一段（**这里就是减账的现场**）
+    var think: Buf = buf_new(8192);
+    defer { buf_free(&think); }
+    var i: usize = 0;
+    while i < 40 {
+        buf_reset(&think);
+        _ = buf_append_cstr(&think, "思考第 ");
+        _ = buf_append_u64(&think, i as u64);
+        _ = buf_append_cstr(&think, " 段：");
+        var k: usize = 0;
+        while k < 200 {
+            _ = buf_append_cstr(&think, "核对记账与真实长度是否一致。");
+            k = k + 1;
+        }
+        _ = buf_append_byte(&think, 10);
+        tui_sink_bytes(3, think.ptr as &const byte, think.len);
+        i = i + 1;
+    }
+    // 折行是每帧按需做的 —— 先在两种宽度下各成一次帧，逼迫重折与重建行表
+    tui_build();
+    tui_set_size(120, 30);
+    tui_build();
+    tui_set_size(61, 30);
+    tui_build();
+    const real: usize = tui_text_bytes();
+    const acct: usize = tui_text_accounted();
+    if real == 0 {
+        tuis_fail(tag, "夹具没有产生任何正文（后面的断言没有意义）", ok);
+        return;
+    }
+    if real != acct {
+        tuis_fail(tag, "正文记账与实况不符（只加不减 ⇒ 转录会比标称更早丢老条目）", ok);
+        tuis_puts("  实况 Σ text.len = " as &const byte); tuis_num(real);
+        tuis_puts("，记账 = " as &const byte); tuis_num(acct);
+        tuis_puts("\n" as &const byte);
+    }
+    const dreal: usize = tui_derived_bytes();
+    const dacct: usize = tui_derived_accounted();
+    if dreal == 0 {
+        tuis_fail(tag, "派生缓冲一个字都没记上（wrap/md/行表没进记账）", ok);
+        return;
+    }
+    if dreal != dacct {
+        tuis_fail(tag, "派生记账与实况不符（重折时要先减旧的再加新的）", ok);
+        tuis_puts("  实况 = " as &const byte); tuis_num(dreal);
+        tuis_puts("，记账 = " as &const byte); tuis_num(dacct);
+        tuis_puts("\n" as &const byte);
+    }
+    // 顺带把「4 MiB 是正文口径」这件事量出来给日志看（正常内容派生 ≈ 2–3× 正文）
+    tuis_puts("selftest[tui-mem] 实测：正文 " as &const byte); tuis_num(real);
+    tuis_puts(" B / 派生 " as &const byte); tuis_num(dreal);
+    tuis_puts(" B（折行+样式+行表）\n" as &const byte);
+}
+
+// B 段：派生上限 —— 正常内容一条都不许被它丢掉；病态输入（巨缩进长行）必须被挡住。
+//
+// 对照实验：把 `tui_entry_new` 里那条 `while g_tui_derived_total > TUI_DERIVED_MAX`
+// 删掉重编，本段的「病态」腿当场红（派生会一路涨到 19× 正文）。
+fn tuis_mem_derived_cap(tag: &const byte, ok: &bool) void {
+    // B1）正常 markdown 灌到**正文上限附近**（每条 8 KB × 512 条 ≈ 4 MiB）：
+    // 派生量必须仍然在 TUI_DERIVED_MAX **之内** —— 这就是「派生上限只挡病态输入、
+    // 一条正常内容都不会因为它被丢」的可执行版本（也是 DESIGN §11.5 那张实测表的出处）。
+    tuis_reset(80, 30);
+    tuis_mem_feed_md(600, 40);
+    tui_build();
+    const t1: usize = tui_text_bytes();
+    const d1: usize = tui_derived_bytes();
+    tuis_puts("selftest[tui-mem] 正常 markdown：条目 " as &const byte);
+    tuis_num(tui_entries_count());
+    tuis_puts(" 条 / 正文 " as &const byte); tuis_num(t1);
+    tuis_puts(" B / 派生 " as &const byte); tuis_num(d1);
+    tuis_puts(" B（派生上限 " as &const byte); tuis_num(TUI_DERIVED_MAX);
+    tuis_puts("）\n" as &const byte);
+    if t1 < 3000000 {
+        tuis_fail(tag, "正常 markdown 没灌到正文上限附近（这一段量不出「不误伤」）", ok);
+        return;
+    }
+    if d1 >= TUI_DERIVED_MAX {
+        tuis_fail(tag, "正常内容把派生上限顶到了（上限会误伤正常历史长度）", ok);
+    }
+    // 正文记账在「灌满 + 折行」之后仍必须精确（折行不改 text，但丢条目会改）
+    if tui_derived_accounted() != d1 {
+        tuis_fail(tag, "正常内容折行之后派生记账与实况不符", ok);
+    }
+
+    // B2）病态输入：巨缩进长行。派生上限必须把它夹在 TUI_DERIVED_MAX 附近
+    tuis_reset(80, 30);
+    var line: Buf = buf_new(256);
+    defer { buf_free(&line); }
+    tuis_mem_indented(1000, 900, &line);     // ≈ 900 KiB 正文，折行后约 15×
+    var k: usize = 0;
+    while k < 8 {
+        tui_sink_bytes(2, line.ptr as &const byte, line.len);
+        tui_sink_flush_partial();
+        tui_build();
+        k = k + 1;
+    }
+    const d2: usize = tui_derived_bytes();
+    tuis_puts("selftest[tui-mem] 病态夹具：正文 " as &const byte);
+    tuis_num(tui_text_bytes());
+    tuis_puts(" B / 派生 " as &const byte); tuis_num(d2);
+    tuis_puts(" B（上限 " as &const byte); tuis_num(TUI_DERIVED_MAX);
+    tuis_puts("）\n" as &const byte);
+    // 判据是**有界**，不是「恰好 ≤ 上限」：派生量只有折行之后才知道，所以闸门在
+    // **新建条目时**看的是上一条的全量值 —— 最后留下那一条可以超出上限一个条目的量
+    // （实测 20.4 MB vs 上限 16 MiB，超出部分就是夹具那一条自己）。要挡的是
+    // 「无上限时一路涨」（这个夹具的比值是 26×正文，灌 8 条就是 164 MB）。
+    const bound: usize = TUI_DERIVED_MAX * 2;
+    if d2 > bound {
+        tuis_fail(tag, "病态输入的派生缓冲没被上限挡住（真实驻留会失控）", ok);
+        tuis_puts("  派生 = " as &const byte); tuis_num(d2);
+        tuis_puts("，有界判据 = " as &const byte);
+        tuis_num(bound);
+        tuis_puts("\n" as &const byte);
+    }
+    if tui_entries_dropped() == 0 {
+        tuis_fail(tag, "病态输入一条老条目都没丢（上限没生效，这段断言没意义）", ok);
+    }
+    // 保底：不许把最后一条也丢掉（屏幕上总得有东西）
+    if tui_entries_count() == 0 {
+        tuis_fail(tag, "上限把转录清空了（保底留 1 条没生效）", ok);
+    }
+    if tui_derived_accounted() != tui_derived_bytes() {
+        tuis_fail(tag, "丢条目之后派生记账与实况不符（丢的那条没减账）", ok);
+    }
+}
+
+// C 段：清空之后存活分配必须归零 —— 换会话（`/new` / `/resume`）走的就是这条路。
+//
+// 对照实验：把 `tui_transcript_clear` 里的 `tui_lineidx_reset(&…wrap_ix)` 挪回
+// `if buf_valid(&md)` 块里重编，本段当场红（TOOL / USER / NOTICE 的折行索引漏掉）。
+fn tuis_mem_clear_allocs(tag: &const byte, ok: &bool) void {
+    tuis_reset(80, 30);
+    // 三种条目各来一条：ASSIST（有 md）/ TOOL / USER / NOTICE（都没有 md）
+    tuis_mem_feed_md(2, 1);
+    tui_sink_bytes(2, "✓ Read(b.uya) · 3 lines\n" as &const byte, 27);
+    tui_sink_bytes(2, "不认识的诊断行\n" as &const byte, 24);
+    tui_sink_flush_partial();
+    const um: &const byte = "用户的一句话" as &const byte;
+    betui_add_user(um, bufx_cstr_len(um));
+    tui_build();                  // 折行 + 建行偏移表（表就是泄漏的那一块）
+    const live_before: usize = tui_entry_live_allocs();
+    if live_before == 0 {
+        tuis_fail(tag, "夹具一条条目都没建起来（后面的断言没有意义）", ok);
+        return;
+    }
+    // 反复清十次：漏一块就会恒 > 0（修前每次换会话漏一次，攒在堆上）
+    var i: usize = 0;
+    while i < 10 {
+        tui_transcript_clear();
+        i = i + 1;
+    }
+    const live: usize = tui_entry_live_allocs();
+    if live != 0 {
+        tuis_fail(tag, "清转录之后还有存活的条目分配（换会话在漏内存）", ok);
+        tuis_puts("  存活块数 = " as &const byte); tuis_num(live);
+        tuis_puts("（修前每次换会话漏的是 wrap_ix 那块）\n" as &const byte);
+    }
+    if tui_text_accounted() != 0 || tui_derived_accounted() != 0 {
+        tuis_fail(tag, "清转录之后记账没归零（下一段会话的账从零开始才算对）", ok);
+    }
+    if tui_entries_count() != 0 || tui_entries_dropped() != 0 {
+        tuis_fail(tag, "清转录之后条数/丢弃计数没归零", ok);
+    }
+}
+
+// D 段：单条上限对「一次整块塞进来」也成立；丢过条目之后第 0 行给出提示。
+//
+// 对照实验：把 `tui_entry_append` 里那句「take > TUI_ENTRY_MAX 就只留尾部」删掉重编，
+// 本段的第一条当场红（一条 1 MiB 的工具结果会让 text 长到 1 MiB）。
+fn tuis_mem_entry_cap(tag: &const byte, ok: &bool) void {
+    tuis_reset(80, 30);
+    // 一次塞一个**远大于** TUI_ENTRY_MAX 的工具行（长工具结果整块交进来时的真实形状）。
+    // ⚠ 必须以 `✓ ` 起头、且整块**只有一行**：不以工具头起头的行会被 sink 当诊断收进
+    // NOTICE 条目，而 NOTICE 自带 512 B/条的上限 —— 夹具会被静默吃掉，这条判据就永远
+    // 是绿的（第一版实测：灌 1 MiB，最后那条条目只有 512 B）。
+    const big: usize = 1048576;
+    var blk: Buf = buf_new(big + 64);
+    defer { buf_free(&blk); }
+    _ = buf_append_cstr(&blk, "✓ Bash(big) · ");
+    var i: usize = 0;
+    while i < big {
+        _ = buf_append_byte(&blk, 65 as byte + ((i % 26) as byte));
+        i = i + 1;
+    }
+    _ = buf_append_byte(&blk, 10);
+    tui_sink_bytes(2, blk.ptr as &const byte, blk.len);
+    tui_sink_flush_partial();
+    // ⚠ 判据必须是「**一条**条目的 text.len」，不能是「正文总量」（第一版就是后者，
+    // 于是这条是**假绿**：没有 clamp 时它照样不超 2×上限，因为带上限的头部丢弃
+    // 会把那条自己截回去 —— 实测把 clamp 删掉重编，整轮照样 PASS）。
+    // 单条口径拿到之后这条才有牙齿：没有 clamp 时它恰好落在 1 MiB。
+    const one: usize = tui_entry_text_len();
+    if one > 262144 {
+        tuis_fail(tag, "单条上限没挡住整块输入（一条条目的正文超过 TUI_ENTRY_MAX）", ok);
+        tuis_puts("  单条 text.len = " as &const byte); tuis_num(one);
+        tuis_puts("\n" as &const byte);
+    }
+    if one == 0 {
+        tuis_fail(tag, "整块输入一个字都没进转录（夹具不对，这一条没意义）", ok);
+    }
+    // 多灌几轮把转录灌爆：丢过条目之后第 0 行必须给出「更早的 N 条已省略」。
+    // 夹具用 markdown 正文（每条约 450 B）而不是工具块：单条上限那一段刚证明过
+    // 一条工具块最多 256 KiB，用它当夹具要 1000+ 条才灌得满，白等（实测）。
+    tuis_reset(60, 16);
+    tuis_mem_feed_md(600, 1);
+    if tui_entries_dropped() == 0 {
+        tuis_fail(tag, "灌了 600 条正文还没丢过条目（环形表没满，这段断言没意义）", ok);
+    }
+    // 上滚 → 顶部那一行应当是提示而不是空白（start_line > 0 时才会写）
+    tui_scroll_up(30);
+    tui_build();
+    if !tui_more_above() {
+        tuis_fail(tag, "上滚之后 more_above 仍为假（夹具不对）", ok);
+        return;
+    }
+    if !tuis_screen_has("更早的" as &const byte) {
+        tuis_fail(tag, "丢过条目却没有任何提示（用户以为转录就这么多）", ok);
+    }
+    if !tuis_screen_has("已省略" as &const byte) {
+        tuis_fail(tag, "顶部提示里没有「已省略」这几个字（文案不对）", ok);
+    }
+    tui_scroll_end();
+    tui_build();
+}
+
+// tui-mem 轮：转录的内存纪律（记账 / 派生上限 / 清空泄漏 / 单条上限 + 省略提示）。
+// 返回 false = 本轮红。
+fn tui_mem_round(tag: &const byte) bool {
+    var ok: bool = true;
+    out_err("selftest[");
+    out_err(tag);
+    out_err("] ");
+    tuis_mem_account(tag, &ok);
+    tuis_mem_derived_cap(tag, &ok);
+    tuis_mem_clear_allocs(tag, &ok);
+    tuis_mem_entry_cap(tag, &ok);
+    // 收尾：清干净，别把这一轮的转录串给下一轮
+    tui_transcript_clear();
+    tui_reset_all();
+    tui_headless_enable(true);
+    tui_set_size(100, 30);
+    if ok {
+        // 行宽豁免：自测的收尾说明串（一句话，拆开读不懂）
+        tuis_ok(tag, "记账恒等式（正文+派生，含思考截尾与重折）+ 派生上限只挡病态输入（正常 markdown 派生 <3×正文）+ 清空后存活分配 = 0（换会话不漏行偏移表）+ 单条上限对整块输入成立 + 丢过条目后顶部给「更早的 N 条已省略」");
+    }
+    return ok;
+}
