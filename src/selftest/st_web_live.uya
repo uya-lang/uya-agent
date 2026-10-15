@@ -1,0 +1,631 @@
+// src/selftest/st_web_live.uya — P80 第二十三批：活会话那两轮的判据
+//
+// 本文件：`web-models`（模型目录装配成 DSH 的形状）与 `web-chat`（活会话的
+//   输入帧 / 事件 tail / seq 位移）两轮。它们与 `st_web.uya` 的那几轮分开，
+//   理由与那边一样：改这一块时只想跑这一块（`UYA_SELFTEST_WEB_ONLY` 已带上它们）。
+// 不变量：① 判据要用**外部 oracle** 而不是子串：目录那一轮的产物交给本仓的
+//   JSON 解析器解（`},,{` 那类结构坏掉，子串断言全中而解析器判红 —— 那条教训
+//   写在 `st_web.uya` 的 `web-snapshot` 轮里）；
+//   ② 每一条断言都要能说出「错了会怎样」：形状错 ⇒ 客户端 `undefined` 崩 /
+//   面板空着，seq 错 ⇒ 客户端判不连续并**整条断流**；
+//   ③ 活会话的输入帧与 tail 都是**纯数据**（`Buf` 进 `Buf` 出），所以这一轮
+//   不 fork 任何进程 —— 真 fork 那一段的判据在 `make dsh-web-check`（真浏览器）。
+// 依赖：无 `use` 行（合并命名空间）；foundation/bufx、foundation/jsonx、
+//   session/modelx、session/session（`sess_mkdir_p`）、web/dwhchild（`dwhc_*`）、
+//   web/dwhmodel（`dwhm_*`）、web/whost（`dwh_snapshot_frame` / `dwh_shift_seq` /
+//   `DWH_SEED_SEQS`）、selftest/tuis_core（`tuis_*` 断言助手）。
+// 命名：`wl_*`（本文件的助手）。
+
+// 造模型目录 fixture 的 DSH home（与 `st_tasks_ws.uya` 的 `MX_HOME` 分开：
+// 两轮的 fixture 内容不同，共用一个目录会互相踩）。
+const WL_HOME: &const byte = "build/selftest_web_live_home" as &const byte;
+
+// 一份只含「两个提供方 + 各自档位 + 一个非推理模型」的 settings.yaml。
+//
+// 三条腿各要一个形状：
+//   * `alpha`：两档（发布 off/low/high）；
+//   * `beta` ：`reasoningEfforts: false` ⇒ **一个档位都不许出现**（不发明档位）；
+//   * `gamma`：**与 alpha 同名**（`dup`）⇒ 目录里必须是两条、分组不同
+//     （客户端的 `routable` 判据是 (provider, model) 二元组）。
+fn wl_fixture_write() bool {
+    _ = sess_mkdir_p(WL_HOME);
+    var p: Buf = buf_new(256);
+    defer { buf_free(&p); }
+    // 只有**最后**一段能用 append_cstr_z（它把 NUL 也写进缓冲，之后的追加会落在
+    // NUL 后面 —— 本仓反复踩过的那条）。
+    _ = buf_append_cstr(&p, WL_HOME);
+    _ = buf_append_cstr_z(&p, "/settings.yaml");
+    // 行宽豁免：YAML 夹具是**不可断**的一段结构（拆行会改掉它的语义）
+    const body: &const byte = "llm-pi-ai:\n  providers:\n    {\n      alpha:\n        {\n          api: openai-completions,\n          baseURL: https://alpha.example/v1,\n          models:\n            [\n              { id: a-think, contextWindow: 111000, reasoningEfforts: { off: none, low: low, high: high }, reasoning: { defaultEffort: low } },\n              { id: dup, contextWindow: 222000 }\n            ]\n        },\n      beta:\n        {\n          api: openai-completions,\n          models:\n            [\n              { id: b-plain, reasoningEfforts: false },\n              { id: dup, contextWindow: 333000, reasoningEfforts: { off: none } }\n            ]\n        }\n    }\n" as &const byte;
+    return write_text_file(p.ptr as &const byte, body);
+}
+
+// 一段文本是不是合法 JSON（本仓的解析器判；与 `st_web.uya` 的 `web_t_json_ok` 同法）。
+fn wl_json_ok(text: &Buf) bool {
+    const raw: &void = malloc(1 << 18);
+    if ((raw as &byte) as usize) == 0 {
+        return false;
+    }
+    defer { free(raw); }
+    var arena: Arena = Arena{ buffer: null, size: 0, used: 0 };
+    arena_init(&arena, raw as &byte, 1 << 18);
+    var root: JsonValue = JsonValue.json_null();
+    return js_parse(&arena, text.ptr as &const byte, text.len, &root);
+}
+
+// 解 `text` 并取一条路径（逐级 `js_obj_get` / `js_arr_get` 由调用方给），
+// 只用来判「这个键在不在、值是不是这个」。
+fn wl_get(root: &const JsonValue, key: &const byte, out: &JsonValue) bool {
+    return js_obj_get(root, key, bufx_cstr_len(key), out);
+}
+
+// 按路径逐级取（`path` 是一串 NUL 结尾的名字，`N` 段）。
+fn wl_walk(root: &const JsonValue, path: &(&const byte), n: usize,
+    out: &JsonValue) bool {
+    var cur: JsonValue = *root;
+    var i: usize = 0;
+    while i < n {
+        if !wl_get(&cur, path[i], &cur) {
+            return false;
+        }
+        i = i + 1;
+    }
+    *out = cur;
+    return true;
+}
+
+// ============================================================
+// 第十一轮 `web-models`：模型目录必须是 DSH 的形状、内容来自 settings.yaml
+// ============================================================
+//
+// 用户报的现场是「设置界面里模型选择器空的」/「模型加载供应商也失败」。
+// 那两种症状在页面上的表现都只是「一块区域空着或一行红字」，没有崩溃 ——
+// 所以这一轮按**客户端的读法**逐条判：
+//   ① `groups[].id` 是 provider、`groups[].models[].id` 是模型 id；
+//   ② `default` 的 (provider,model) **必须能在 groups 里找到**（否则客户端的
+//      `routable` 判 false，触发器变灰 —— 而这是它唯一的判据）；
+//   ③ 档位只列**公布过的**（beta 的 b-plain 是 `reasoningEfforts: false`
+//      ⇒ 它连 `reasoning` 键都不该有）；
+//   ④ 同名模型跨提供方是**两条**。
+export fn web_models_round(tag: &const byte) bool {
+    var ok: bool = true;
+    agent_models_reset();
+    if !wl_fixture_write() {
+        tuis_fail(tag, "造 settings.yaml fixture 失败", &ok);
+        return ok;
+    }
+    var m: DwhModel = dwhm_zero();
+    defer { dwhm_free(&m); }
+    var home: Buf = buf_new(256);
+    defer { buf_free(&home); }
+    _ = buf_append_cstr(&home, WL_HOME);
+    if !dwhm_load(&m, &home) {
+        tuis_fail(tag, "dwhm_load 读不到 fixture 的 settings.yaml", &ok);
+        return ok;
+    }
+    var cat: Buf = buf_new(8192);
+    defer { buf_free(&cat); }
+    if !dwhm_catalog_json(&m, &cat) {
+        tuis_fail(tag, "目录拼不出来", &ok);
+        return ok;
+    }
+    // ① 必须是合法 JSON（结构坏掉时下面那些子串判据全是瞎的）
+    if !wl_json_ok(&cat) {
+        tuis_fail(tag, "session/modelCatalog 不是合法 JSON", &ok);
+        return ok;
+    }
+    var keys: [&const byte: 4] = ["default" as &const byte,
+        "routableProviders" as &const byte, "groups" as &const byte,
+        "failures" as &const byte];
+    wl_check_top(tag, &cat, &keys[0], 4, &ok);
+    wl_check_default(tag, &cat, &ok);
+    wl_check_groups(tag, &cat, &ok);
+    wl_check_levels(tag, &cat, &ok);
+    // `session/models`（0.1.1 的门面）与目录**同源**：同样合法、同样有 groups。
+    var mv: Buf = buf_new(8192);
+    defer { buf_free(&mv); }
+    if !dwhm_models_json(&m, &mv) {
+        tuis_fail(tag, "session/models 拼不出来", &ok);
+    } else if !wl_json_ok(&mv) {
+        tuis_fail(tag, "session/models 不是合法 JSON", &ok);
+    }
+    if ok {
+        tuis_ok(tag, "模型目录：合法 JSON + 四个顶层键齐 + default 在 groups 里 + 档位只列公布的 + 同名跨提供方两条 + models 门面同源");
+    }
+    return ok;
+}
+
+// 顶层四个键齐（客户端逐个读它们；缺一个就是某块面板 undefined）。
+fn wl_check_top(tag: &const byte, cat: &const Buf, keys: &(&const byte),
+    n: usize, ok: &bool) void {
+    var arena: Arena = Arena{ buffer: null, size: 0, used: 0 };
+    var abuf: [byte: 65536] = [0: 65536];
+    arena_init(&arena, &abuf[0], 65536);
+    var root: JsonValue = JsonValue.json_null();
+    if !js_parse(&arena, cat.ptr as &const byte, cat.len, &root) {
+        tuis_fail(tag, "目录解不开（不该发生：上面刚判过）", ok);
+        return;
+    }
+    var i: usize = 0;
+    while i < n {
+        var v: JsonValue = JsonValue.json_null();
+        if !wl_get(&root, keys[i], &v) {
+            tuis_fail(tag, "目录缺顶层键（客户端会读它）", ok);
+        }
+        i = i + 1;
+    }
+}
+
+// `default` 的 (provider,model) 必须出现在某个 group 的 models 里。
+// 这是客户端 `routable` 的**唯一**判据（`dsh-client-ui-model-selection`）。
+fn wl_check_default(tag: &const byte, cat: &const Buf, ok: &bool) void {
+    var arena: Arena = Arena{ buffer: null, size: 0, used: 0 };
+    var abuf: [byte: 65536] = [0: 65536];
+    arena_init(&arena, &abuf[0], 65536);
+    var root: JsonValue = JsonValue.json_null();
+    if !js_parse(&arena, cat.ptr as &const byte, cat.len, &root) {
+        return;
+    }
+    var def: JsonValue = JsonValue.json_null();
+    if !wl_get(&root, "default" as &const byte, &def) {
+        tuis_fail(tag, "目录没有 default", ok);
+        return;
+    }
+    var pv: JsonStrView = JsonStrView{ ptr: null, len: 0 };
+    var mv2: JsonStrView = JsonStrView{ ptr: null, len: 0 };
+    if !js_obj_get_str(&def, "provider" as &const byte, 8, &pv) ||
+        !js_obj_get_str(&def, "model" as &const byte, 5, &mv2) {
+        tuis_fail(tag, "default 缺 provider / model", ok);
+        return;
+    }
+    var groups: JsonValue = JsonValue.json_null();
+    if !wl_get(&root, "groups" as &const byte, &groups) {
+        return;
+    }
+    const ng: usize = js_arr_len(&groups);
+    if ng == 0 {
+        tuis_fail(tag, "目录里一个模型都没有（选择器会是空的）", ok);
+        return;
+    }
+    if !wl_group_has(&groups, ng, &pv, &mv2) {
+        tuis_fail(tag, "default 那一对不在 groups 里（客户端的 routable 判 false，触发器会变灰）", ok);
+    }
+}
+
+// `groups` 里有没有 (provider=gid, model) 这一对。
+fn wl_group_has(groups: &const JsonValue, ng: usize, pv: &const JsonStrView,
+    mv: &const JsonStrView) bool {
+    var i: usize = 0;
+    while i < ng {
+        var g: JsonValue = JsonValue.json_null();
+        if js_arr_get(groups, i, &g) {
+            var gid: JsonStrView = JsonStrView{ ptr: null, len: 0 };
+            if js_obj_get_str(&g, "id" as &const byte, 2, &gid)
+                && gid.len == pv.len
+                && bufx_mem_eq(gid.ptr as &const byte, pv.ptr as &const byte,
+                    pv.len) {
+                var ms: JsonValue = JsonValue.json_null();
+                if wl_get(&g, "models" as &const byte, &ms)
+                    && wl_models_has(&ms, js_arr_len(&ms), mv) {
+                    return true;
+                }
+            }
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+// models[] 里有没有这个 id。
+fn wl_models_has(ms: &const JsonValue, n: usize, mv: &const JsonStrView) bool {
+    var i: usize = 0;
+    while i < n {
+        var mo: JsonValue = JsonValue.json_null();
+        if js_arr_get(ms, i, &mo) {
+            var id: JsonStrView = JsonStrView{ ptr: null, len: 0 };
+            if js_obj_get_str(&mo, "id" as &const byte, 2, &id)
+                && id.len == mv.len
+                && bufx_mem_eq(id.ptr as &const byte, mv.ptr as &const byte,
+                    mv.len) {
+                return true;
+            }
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+// 分组结构：每个 group 有 id / name / models，且**同名 `dup` 出现在两个不同的
+// group**（跨提供方是两条 —— 二元组判据的地基）。
+fn wl_check_groups(tag: &const byte, cat: &const Buf, ok: &bool) void {
+    var arena: Arena = Arena{ buffer: null, size: 0, used: 0 };
+    var abuf: [byte: 65536] = [0: 65536];
+    arena_init(&arena, &abuf[0], 65536);
+    var root: JsonValue = JsonValue.json_null();
+    if !js_parse(&arena, cat.ptr as &const byte, cat.len, &root) {
+        return;
+    }
+    var groups: JsonValue = JsonValue.json_null();
+    if !wl_get(&root, "groups" as &const byte, &groups) {
+        return;
+    }
+    const ng: usize = js_arr_len(&groups);
+    if ng != 2 {
+        tuis_fail(tag, "groups 不是 2 组（fixture 里是 alpha / beta 两个提供方）", ok);
+        return;
+    }
+    var i: usize = 0;
+    while i < ng {
+        var g: JsonValue = JsonValue.json_null();
+        if !js_arr_get(&groups, i, &g) {
+            tuis_fail(tag, "groups[] 取不出来", ok);
+            return;
+        }
+        var id: JsonStrView = JsonStrView{ ptr: null, len: 0 };
+        var nm: JsonStrView = JsonStrView{ ptr: null, len: 0 };
+        var ms: JsonValue = JsonValue.json_null();
+        if !js_obj_get_str(&g, "id" as &const byte, 2, &id) ||
+            !js_obj_get_str(&g, "name" as &const byte, 4, &nm) ||
+            !wl_get(&g, "models" as &const byte, &ms) {
+            tuis_fail(tag, "group 缺 id / name / models（客户端逐字段读）", ok);
+            return;
+        }
+        if js_arr_len(&ms) == 0 {
+            tuis_fail(tag, "有个 group 一个模型都没有（空的组会画成一行空白）", ok);
+        }
+        i = i + 1;
+    }
+    // 同名 `dup`：两个 group 各自都该有一条。
+    var d: JsonStrView = JsonStrView{ ptr: null, len: 0 };
+    d.ptr = "dup" as &const byte;
+    d.len = 3;
+    var found: usize = 0;
+    i = 0;
+    while i < ng {
+        var g2: JsonValue = JsonValue.json_null();
+        if js_arr_get(&groups, i, &g2) {
+            var ms2: JsonValue = JsonValue.json_null();
+            if wl_get(&g2, "models" as &const byte, &ms2)
+                && wl_models_has(&ms2, js_arr_len(&ms2), &d) {
+                found = found + 1;
+            }
+        }
+        i = i + 1;
+    }
+    if found != 2 {
+        tuis_fail(tag, "同名模型 dup 应当在两个 provider 下各有一条（跨提供方两条）", ok);
+    }
+}
+
+// 档位：alpha/a-think 该有 reasoning；beta/b-plain（`reasoningEfforts: false`）
+// **连 `reasoning` 键都不该有** —— 不发明档位（`mx_levels_into` 同一条口径）。
+fn wl_check_levels(tag: &const byte, cat: &const Buf, ok: &bool) void {
+    var arena: Arena = Arena{ buffer: null, size: 0, used: 0 };
+    var abuf: [byte: 65536] = [0: 65536];
+    arena_init(&arena, &abuf[0], 65536);
+    var root: JsonValue = JsonValue.json_null();
+    if !js_parse(&arena, cat.ptr as &const byte, cat.len, &root) {
+        return;
+    }
+    var groups: JsonValue = JsonValue.json_null();
+    if !wl_get(&root, "groups" as &const byte, &groups) {
+        return;
+    }
+    const ng: usize = js_arr_len(&groups);
+    var i: usize = 0;
+    while i < ng {
+        var g: JsonValue = JsonValue.json_null();
+        if js_arr_get(&groups, i, &g) {
+            var gid: JsonStrView = JsonStrView{ ptr: null, len: 0 };
+            var ms: JsonValue = JsonValue.json_null();
+            if js_obj_get_str(&g, "id" as &const byte, 2, &gid)
+                && wl_get(&g, "models" as &const byte, &ms) {
+                wl_level_of_group(tag, &gid, &ms, js_arr_len(&ms), ok);
+            }
+        }
+        i = i + 1;
+    }
+}
+
+// 一组里每个模型的 `reasoning` 该不该有、档位对不对。
+fn wl_level_of_group(tag: &const byte, gid: &const JsonStrView,
+    ms: &const JsonValue, n: usize, ok: &bool) void {
+    var i: usize = 0;
+    while i < n {
+        var mo: JsonValue = JsonValue.json_null();
+        if js_arr_get(ms, i, &mo) {
+            var id: JsonStrView = JsonStrView{ ptr: null, len: 0 };
+            var re: JsonValue = JsonValue.json_null();
+            const has: bool = wl_get(&mo, "reasoning" as &const byte, &re);
+            if js_obj_get_str(&mo, "id" as &const byte, 2, &id) {
+                // `beta/b-plain` 是 `reasoningEfforts: false`（**声明了**不支持）
+                // ⇒ 连 `reasoning` 键都不许有（不发明档位）。
+                // `alpha/dup` 是**根本没写** `reasoningEfforts` ⇒ 同样没有键
+                // （`mx_read_efforts` 对「没写」什么都不推断）。
+                // 反过来 `alpha/a-think` / `beta/dup` 公布了档位 ⇒ 必须有。
+                const plain: bool = wl_is(gid, "beta" as &const byte)
+                    && wl_is(&id, "b-plain" as &const byte);
+                const undeclared: bool = wl_is(&id, "dup" as &const byte)
+                    && wl_is(gid, "alpha" as &const byte);
+                if (plain || undeclared) && has {
+                    tuis_fail(tag, "没公布档位的模型不该有 reasoning 键（不发明档位）", ok);
+                }
+                if !plain && !undeclared && !has {
+                    tuis_fail(tag, "公布了档位的模型缺 reasoning 键（Effort 那一行画不出来）", ok);
+                }
+                if has {
+                    wl_efforts_ok(tag, &id, &re, ok);
+                }
+            }
+        }
+        i = i + 1;
+    }
+}
+
+// 一段 JsonStrView 是不是这个 C 串字面量。
+fn wl_is(s: &const JsonStrView, lit: &const byte) bool {
+    const ln: usize = bufx_cstr_len(lit);
+    if s.len != ln {
+        return false;
+    }
+    if ln == 0 {
+        return true;
+    }
+    return bufx_mem_eq(s.ptr as &const byte, lit, ln);
+}
+
+// `reasoning.efforts[]` 非空、每项有 id / name；`defaultEffort` 若在则必须是
+// 其中一项（客户端拿它去 `.find()`，找不到就显示原始值）。
+fn wl_efforts_ok(tag: &const byte, id: &const JsonStrView, re: &const JsonValue,
+    ok: &bool) void {
+    var ef: JsonValue = JsonValue.json_null();
+    if !wl_get(re, "efforts" as &const byte, &ef) {
+        tuis_fail(tag, "reasoning 缺 efforts（客户端遍历它画菜单）", ok);
+        return;
+    }
+    const ne: usize = js_arr_len(&ef);
+    if ne == 0 {
+        tuis_fail(tag, "efforts 是空的（有 reasoning 键就必须有档位）", ok);
+        return;
+    }
+    var i: usize = 0;
+    var names: [byte: 128] = [0: 128];
+    var nn: usize = 0;
+    while i < ne {
+        var e: JsonValue = JsonValue.json_null();
+        if js_arr_get(&ef, i, &e) {
+            var eid: JsonStrView = JsonStrView{ ptr: null, len: 0 };
+            var enm: JsonStrView = JsonStrView{ ptr: null, len: 0 };
+            if !js_obj_get_str(&e, "id" as &const byte, 2, &eid) ||
+                !js_obj_get_str(&e, "name" as &const byte, 4, &enm) {
+                tuis_fail(tag, "efforts[] 缺 id / name", ok);
+            } else {
+                nn = wl_join(&names, nn, &eid);
+            }
+        }
+        i = i + 1;
+    }
+    var de: JsonStrView = JsonStrView{ ptr: null, len: 0 };
+    if js_obj_get_str(re, "defaultEffort" as &const byte, 13, &de) {
+        if !wl_in_list(&names, nn, &de) {
+            tuis_fail(tag, "defaultEffort 不在 efforts 里（客户端 find 不到会显示原始值）", ok);
+        }
+    }
+    _ = id;
+}
+
+// 把 `s` 追加进 `dst`（`|` 分隔的清单），返回新的长度。用于「一行清单 + 查找」。
+fn wl_join(dst: &byte, n: usize, s: &const JsonStrView) usize {
+    var i: usize = 0;
+    var k: usize = n;
+    if k > 0 && k < 127 {
+        dst[k] = 124;      // '|'
+        k = k + 1;
+    }
+    while i < s.len && k < 127 {
+        dst[k] = s.ptr[i];
+        k = k + 1;
+        i = i + 1;
+    }
+    return k;
+}
+
+// `|id1|id2|…|` 里有没有这个 id（两头补 `|` 之后按 `|id|` 找）。
+fn wl_in_list(dst: &const byte, n: usize, s: &const JsonStrView) bool {
+    var pat: Buf = buf_new(s.len + 4);
+    defer { buf_free(&pat); }
+    if !buf_append_byte(&pat, 124) {
+        return false;
+    }
+    if !buf_append(&pat, s.ptr as &const byte, s.len) {
+        return false;
+    }
+    if !buf_append_byte(&pat, 124) {
+        return false;
+    }
+    var hay: Buf = buf_new(n + 4);
+    defer { buf_free(&hay); }
+    if !buf_append_byte(&hay, 124) {
+        return false;
+    }
+    if !buf_append(&hay, dst, n) {
+        return false;
+    }
+    if !buf_append_byte(&hay, 124) {
+        return false;
+    }
+    return srv_find(hay.ptr as &const byte, 0, hay.len,
+        pat.ptr as &const byte, pat.len) >= 0;
+}
+
+// 第十二轮那一句通过语（拆两条常量拼：一条整行写会超 80 字符的行宽指标）。
+const WL_CHAT_NOTE_A: &const byte = "活会话：输入帧转义闭环（引号/反斜杠/换行/中文）" as &const byte;
+const WL_CHAT_NOTE_B: &const byte = " + 多行不被拆开 + 快照位移" as &const byte;
+const WL_CHAT_NOTE_D: &const byte = " DWH_SEED_SEQS" as &const byte;
+const WL_CHAT_NOTE_C: &const byte = " + 活事件位移多一" as &const byte;
+
+// ============================================================
+// 第十二轮 `web-chat`：活会话的输入帧、事件 tail 与 seq 位移
+// ============================================================
+//
+// 这一轮盯三件会**静默**出错的事（每一件在页面上都只是「发了消息没反应」或
+// 「加载会话历史失败」）：
+//   ① 一条消息里的换行必须**原样**送过去（JSON 帧的意义：裸行会把一条多行
+//      消息拆成几个回合）；
+//   ② tail 只翻**完整行**：半行翻出来就是坏 JSON（客户端 `close(4002)`）；
+//   ③ 活事件的 seq 位移与快照的**差一**关系（`DWH_SEED_SEQS + 1`）—— 不一致
+//      就是客户端判不连续并整条断流。
+export fn web_chat_round(tag: &const byte) bool {
+    var ok: bool = true;
+    wl_check_frame_escape(tag, &ok);
+    wl_check_frame_multiline(tag, &ok);
+    wl_check_shift(tag, &ok);
+    wl_check_live_shift(tag, &ok);
+    if ok {
+        // 两段常量拼一条（`tuis_ok` 只吃一个指针；拆两条只为守住行宽指标）
+        var note: Buf = buf_new(256);
+        defer { buf_free(&note); }
+        _ = buf_append_cstr(&note, WL_CHAT_NOTE_A);
+        _ = buf_append_cstr(&note, WL_CHAT_NOTE_B);
+        _ = buf_append_cstr(&note, WL_CHAT_NOTE_D);
+        _ = buf_append_cstr(&note, WL_CHAT_NOTE_C);
+        _ = buf_append_byte(&note, 0);
+        tuis_ok(tag, note.ptr as &const byte);
+    }
+    return ok;
+}
+
+// ① 输入帧：`{"text":"…"}` 的转义必须是合法 JSON，且反转义回来**逐字节等于原文**。
+// 判据是闭环（不是「里面有没有某个子串」）：转义两边一个是 `jw_str_into`、
+// 一个是 `sv_unescape`，任何一边写错都会在这里露出来。
+fn wl_check_frame_escape(tag: &const byte, ok: &bool) void {
+    // 行宽豁免：这是一条**不可断**的夹具（引号与转义本身就是要验的内容）
+    const src: &const byte = "引号\" 反斜杠\\ 换行\n制表\t 中文 「」 emoji 🚀" as &const byte;
+    const sn: usize = bufx_cstr_len(src);
+    var frame: Buf = buf_new(256);
+    defer { buf_free(&frame); }
+    if !buf_append_cstr(&frame, "{\"text\":") {
+        tuis_fail(tag, "拼帧失败", ok);
+        return;
+    }
+    if !jw_str_into(&frame, src, sn) {
+        tuis_fail(tag, "转义失败", ok);
+        return;
+    }
+    if !buf_append_byte(&frame, 125) {
+        tuis_fail(tag, "封帧失败", ok);
+        return;
+    }
+    if !wl_json_ok(&frame) {
+        tuis_fail(tag, "输入帧不是合法 JSON（有裸控制字符/未转义的引号）", ok);
+        return;
+    }
+    if !wl_frame_roundtrip(tag, &frame, src, sn, ok) {
+        return;
+    }
+}
+
+// 解一帧、反转义、与原文逐字节比。
+fn wl_frame_roundtrip(tag: &const byte, frame: &const Buf,
+    src: &const byte, sn: usize, ok: &bool) bool {
+    var arena: Arena = Arena{ buffer: null, size: 0, used: 0 };
+    var abuf: [byte: 65536] = [0: 65536];
+    arena_init(&arena, &abuf[0], 65536);
+    var root: JsonValue = JsonValue.json_null();
+    if !js_parse(&arena, frame.ptr as &const byte, frame.len, &root) {
+        tuis_fail(tag, "输入帧解不开", ok);
+        return false;
+    }
+    var sv: JsonStrView = JsonStrView{ ptr: null, len: 0 };
+    if !js_obj_get_str(&root, "text" as &const byte, 4, &sv) {
+        tuis_fail(tag, "输入帧没有 text 键（执行核读不到正文）", ok);
+        return false;
+    }
+    var back: Buf = buf_new(sn + 8);
+    defer { buf_free(&back); }
+    if !sv_unescape(&sv, &back) {
+        tuis_fail(tag, "反转义失败", ok);
+        return false;
+    }
+    if back.len != sn || !bufx_mem_eq(back.ptr as &const byte, src, sn) {
+        tuis_fail(tag, "反转义回来的正文与原文不一致（转义/反转义两边口径分叉）", ok);
+        return false;
+    }
+    return true;
+}
+
+// ② 多行消息：正文里的 `\n` 绝不能变成帧本身的换行 —— 帧必须是**一行**
+// （执行核按 `\n` 切帧，多出来的换行就成了「第二条帧」，也就是「一次发言
+// 变成两个回合」）。
+fn wl_check_frame_multiline(tag: &const byte, ok: &bool) void {
+    const src: &const byte = "第一行\n第二行\n第三行" as &const byte;
+    const sn: usize = bufx_cstr_len(src);
+    var frame: Buf = buf_new(256);
+    defer { buf_free(&frame); }
+    _ = buf_append_cstr(&frame, "{\"text\":");
+    _ = jw_str_into(&frame, src, sn);
+    _ = buf_append_byte(&frame, 125);
+    _ = buf_append_byte(&frame, 10);      // 帧自己的收尾换行（`dwhc_send_prompt` 加的那个）
+    var nl: usize = 0;
+    var i: usize = 0;
+    while i < frame.len {
+        if frame.ptr[i] == 10 as byte {
+            nl = nl + 1;
+        }
+        i = i + 1;
+    }
+    if nl != 1 {
+        tuis_fail(tag, "一帧里出现了多个换行（正文的换行没被转义 ⇒ 一条消息会被拆成几个回合）", ok);
+    }
+}
+
+// ③ 快照位移：快照里译文的 seq 必须整体后移 `DWH_SEED_SEQS`（开头三条 seed 占了
+// 0..2）。判据取一条已知 seq 的译文、位移后**解出来**比它大 3。
+fn wl_check_shift(tag: &const byte, ok: &bool) void {
+    // 行宽豁免：不可断的 JSON 夹具字面量
+    const line: &const byte = "{\"type\":\"turn/start\",\"seq\":7,\"time\":1,\"data\":{\"turn\":1}}" as &const byte;
+    var out: Buf = buf_new(256);
+    defer { buf_free(&out); }
+    if !dwh_shift_seq(line, bufx_cstr_len(line), DWH_SEED_SEQS, &out) {
+        tuis_fail(tag, "位移失败", ok);
+        return;
+    }
+    if !wl_seq_is(&out, 7 + 3) {
+        tuis_fail(tag, "快照位移不对（应当是 +DWH_SEED_SEQS = +3）", ok);
+    }
+}
+
+// ④ 活事件位移：比快照**多一**（快照末尾压着一条 `session/end-seed`）。
+// 差这一下就是客户端判 `discontinuous entries` 并整条断流的现场。
+fn wl_check_live_shift(tag: &const byte, ok: &bool) void {
+    var out: Buf = buf_new(256);
+    defer { buf_free(&out); }
+    const line: &const byte = "{\"type\":\"turn/start\",\"seq\":7,\"time\":1,\"data\":{\"turn\":1}}" as &const byte;
+    if !dwh_shift_seq(line, bufx_cstr_len(line), DWH_LIVE_SHIFT, &out) {
+        tuis_fail(tag, "位移失败", ok);
+        return;
+    }
+    if !wl_seq_is(&out, 7 + 4) {
+        tuis_fail(tag, "活事件位移不对（应当是 +DWH_SEED_SEQS+1 = +4）", ok);
+    }
+}
+
+// `out` 里的 `"seq"` 是不是 `want`（解出来判，不找子串）。
+fn wl_seq_is(out: &const Buf, want: i64) bool {
+    var arena: Arena = Arena{ buffer: null, size: 0, used: 0 };
+    var abuf: [byte: 65536] = [0: 65536];
+    arena_init(&arena, &abuf[0], 65536);
+    var root: JsonValue = JsonValue.json_null();
+    if !js_parse(&arena, out.ptr as &const byte, out.len, &root) {
+        return false;
+    }
+    var sv: JsonValue = JsonValue.json_null();
+    if !wl_get(&root, "seq" as &const byte, &sv) {
+        return false;
+    }
+    var v: i64 = -1;
+    if !js_i64_of(&sv, &v) {
+        return false;
+    }
+    return v == want;
+}

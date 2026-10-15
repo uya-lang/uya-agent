@@ -1007,6 +1007,12 @@ fn tty_read_line_blocking() i32 {
 }
 
 // 行式 REPL（stdin 不是 TTY：管道/重定向）。同一份 history 连续对话。
+//
+// P80：`cfg.stdin_frames` 打开时输入是 **JSON 帧**（一行一帧），正文取 `{"text":"…"}`。
+// 两处差别，别的一字不改（提示符、slash 命令、`exit`、EOF 口径都同一条路）：
+//   ① **不打 `> ` 提示符** —— 那几行会混进 stderr，而 `--dsh-web` 的宿主把 stderr
+//      当诊断读（每一行都会被当成「子进程说了什么」）；
+//   ② 输入缓冲放大到 `REPL_FRAME_MAX`（多行消息 + 转义后的一条正文）。
 fn agent_repl_plain(cfg: &Config) i32 {
     var h: History = hist_init();
     defer { hist_free(&h); }
@@ -1016,21 +1022,35 @@ fn agent_repl_plain(cfg: &Config) i32 {
         out_err("error: cannot build history\n");
         return AGENT_PROTO;
     }
-    var inbuf: Buf = buf_new(8192);
+    // 不用 `if` 表达式选长度：codegen 为它生成 `const size_t __uya_ifexpr_N`
+    // 再赋值，宿主 C 会报「assignment of read-only variable」（同 whost.uya 记过的那条）。
+    var inbuf_cap: usize = 8192;
+    if cfg.stdin_frames {
+        inbuf_cap = REPL_FRAME_MAX;
+    }
+    var inbuf: Buf = buf_new(inbuf_cap);
     defer { buf_free(&inbuf); }
     var line: Buf = buf_new(4096);
     defer { buf_free(&line); }
-    if !buf_valid(&inbuf) || !buf_valid(&line) {
+    var text: Buf = buf_new(4096);
+    defer { buf_free(&text); }
+    if !buf_valid(&inbuf) || !buf_valid(&line) || !buf_valid(&text) {
         out_err("error: out of memory\n");
         return AGENT_PROTO;
     }
-    out_err("uya-agent REPL（stdin 不是终端：行式输入）— 空行/exit/Ctrl-D 退出\n");
+    if !cfg.stdin_frames {
+        out_err("uya-agent REPL（stdin 不是终端：行式输入）— 空行/exit/Ctrl-D 退出\n");
+    }
     var rc: i32 = AGENT_OK;
     while true {
-        out_err("> ");
+        if !cfg.stdin_frames {
+            out_err("> ");
+        }
         const n: isize = read_line(&inbuf, &line);
         if n <= 0 {
-            out_err("\n");
+            if !cfg.stdin_frames {
+                out_err("\n");
+            }
             break;
         }
         if line.len == 0 {
@@ -1047,16 +1067,30 @@ fn agent_repl_plain(cfg: &Config) i32 {
             }
             continue;
         }
+        // P80：帧模式下这一行是 `{"text":"…"}` —— 正文要**反转义**取出来，
+        // 整行本身不是正文（见 `cfg.stdin_frames` 的注：多行消息靠这里保住）。
+        var body: &const Buf = &line;
+        if cfg.stdin_frames {
+            if !agent_repl_frame_text(&line, &text) {
+                continue;      // 解不出来：诊断已经打过了，不把坏帧当正文
+            }
+            if text.len == 0 {
+                continue;
+            }
+            body = &text;
+        }
         var att: Buf = buf_new(1024);
         defer { buf_free(&att); }
         var have_att: bool = false;
-        const pushed: bool = agent_push_user_with_imgs(&h, &line, &att, &have_att);
+        const pushed: bool = agent_push_user_with_imgs(&h, body, &att,
+            &have_att);
         _ = pushed;
         if !pushed {
             out_err("error: 无法把任务写入历史\n");
             continue;
         }
-        agent_log_user_att(line.ptr as &const byte, line.len, false, &att, &have_att);
+        agent_log_user_att(body.ptr as &const byte, body.len, false, &att,
+            &have_att);
         rc = agent_turn_loop(cfg, &h);
         // P59：截断（AGENT_MAX_TOKENS）不算异常 —— 上面已经用 `warning:` + `[max-tokens] …`
         // 说清「怎么回事 + 发「继续」接着做」，再报一句「异常结束」只会让人以为出事了。
@@ -1066,6 +1100,43 @@ fn agent_repl_plain(cfg: &Config) i32 {
         }
     }
     return rc;
+}
+
+// 一帧输入的上限（含 JSON 转义后的正文）。一条消息按 64 KiB 正文算：
+// 转义最坏情形是每个字节变 6 个字节（`\uXXXX`）也够，且远超任何正常粘贴。
+// 超了 `read_line` 自己会拒绝（它判 `inbuf.cap`），提示走 `error: … 单行过长`。
+const REPL_FRAME_MAX: usize = 524288;
+
+// 解一帧 `{"text":"…"}`：把反转义后的正文写进 `out`（**reset 过**）。
+// 返回 false = 这帧不能用（不是 JSON / 没有 `text` / 正文解不出来）。
+//
+// 为什么失败要**说清楚**：宿主（`--dsh-web`）把 stderr 当诊断读，而静默丢弃一帧
+// 在浏览器里的表现是「发了消息，什么也没发生」—— 那是本仓最贵的一类症状。
+fn agent_repl_frame_text(line: &const Buf, out: &Buf) bool {
+    buf_reset(out);
+    var raw: &void = malloc(65536);
+    if ((raw as &byte) as usize) == 0 {
+        out_err("[frame] 解帧失败：内存不足\n");
+        return false;
+    }
+    defer { free(raw); }
+    var arena: Arena = Arena{ buffer: null, size: 0, used: 0 };
+    arena_init(&arena, raw as &byte, 65536);
+    var root: JsonValue = JsonValue.json_null();
+    if !js_parse(&arena, line.ptr as &const byte, line.len, &root) {
+        out_err("[frame] 解帧失败：这一行不是合法 JSON（已丢弃）\n");
+        return false;
+    }
+    var sv: JsonStrView = JsonStrView{ ptr: null, len: 0 };
+    if !js_obj_get_str(&root, "text", 4, &sv) {
+        out_err("[frame] 解帧失败：帧里没有 text（已丢弃）\n");
+        return false;
+    }
+    if !sv_unescape(&sv, out) {
+        out_err("[frame] 解帧失败：正文转义不完整（已丢弃）\n");
+        return false;
+    }
+    return true;
 }
 
 // 交互入口：TTY 走 raw 模式行编辑器，否则退回行式 REPL

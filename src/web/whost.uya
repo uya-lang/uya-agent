@@ -68,6 +68,10 @@ const DWH_C_DONE: u8 = 2;      // 已响应，等收尾
 export struct DwhConn {
     fd: i32,
     st: u8,
+    // 这条连接开的**逻辑流**的 streamId（`remote.mux` 的 `open` 里给的）。
+    // 空 = 还没开过流。宿主主动推帧（活事件 / 宿主事件）时要按它标 ——
+    // 标错 streamId 客户端就把那条帧算到别的流上（而症状是「那个面板没数据」）。
+    sid: Buf,
     rx: Buf,            // 已收到的字节（收头用）
     is_mux: bool,       // WS：是 mux 还是 host 下行
     is_remote: bool,    // WS：是 0.2.0 的 `remote.mux`（要**收发**，不是只发）
@@ -84,10 +88,29 @@ export struct DwhHost {
     preloads: Buf,      // bootstrap 的 `<script src="…">` 片段（启动时算一次）
     events: Buf,        // 会话事件的译文（每行一条，喂 mux 下行用）
     token: Buf,         // 访问令牌（空 = 不校验；见 `dshauth.uya` 不变量①）
+    // DSH 的设置根（`--dsh-home` / `$DSH_HOME` / `~/.dsh`）：模型目录从它读。
+    dsh_home: Buf,
     conns: [DwhConn: DWH_MAX_CONNS],
     n: usize,
     // 一次泵里「已经干了活、该回 poll 了」的标记（见 `dwh_poll_once`）。
     stop_round: bool,
+    // P80 第二十三批：**活会话**（没给事件源时起）。见 `dwhchild.uya`。
+    //   live：开着没有（给了 `--dsh-web-events` / `UYA_AGENT_DSH_WEB_EVENTS` 就
+    //     是**只读演示**模式 —— 那条路一个字节都不改）
+    live: bool,
+    child: DwhChild,
+    // 模型目录与当前选择（`dwhmodel.uya`）。宿主是它的唯一持有者。
+    model: DwhModel,
+    // 三条下行流的 streamId（客户端 `open` 时记下来，之后推帧要按它标）。
+    //   f_sid：`session/follow`（活事件走这条）
+    //   e_sid：`$events`（`api-session/status` 这类宿主事件走这条）
+    // 空 = 那条流还没开（此时不推，等它开了再说）。
+    f_sid: Buf,
+    e_sid: Buf,
+    // 上一圈推给浏览器的事件水位（`h.events` 里已推到的字节偏移）。
+    // **只增不减**：它同时是「哪些行已经发过」的唯一记账（重发会让客户端
+    // 判重复、漏发会让它断流）。
+    pushed: usize,
 }
 
 // ============================================================
@@ -908,8 +931,11 @@ fn dwh_slash_to_dot(method: &const byte, ml: usize, out: &Buf) bool {
 
 // 一次 unary：按方法名产出 value（写进 `value` 的 JSON 文本）。
 // 返回 false = 这个方法没实现（调用方回 `internal` 业务错）。
-fn dwh_unary(h: &const DwhHost, method: &const byte, ml: usize,
-    value: &Buf) bool {
+// `h` 是可变的：`session/prompt` / `session/selectModel` 要**真的动手**
+// （往子进程 stdin 排帧、改宿主的选择、推宿主事件）—— 只读的那几条用不到，
+// 但签名只有一份（两套签名会让「哪条能改状态」变成要读实现才知道的事）。
+fn dwh_unary(h: &DwhHost, method: &const byte, ml: usize,
+    body: &const Buf, value: &Buf) bool {
     buf_reset(value);
     // 0.2.0 的方法名是**斜杠**形状（`session/list`、`session/modelCatalog`），
     // 而本宿主的实现是按 0.1.1 的**点号**名字写的（`session.list`）。这里把斜杠
@@ -954,12 +980,20 @@ fn dwh_unary(h: &const DwhHost, method: &const byte, ml: usize,
         }
         return buf_append_cstr(value, "\",\"agentPreset\":\"standard\"}");
     }
+    // P80 第二十三批：**聊天**与**模型选择**两条新面。
+    // ⚠ 它们要**读请求体的 `payload.args`**（`dwh_unary_session` 那一簇是纯查询，
+    // 拿不到 body）—— 所以分派点在**这一层**，不是在那簇里面。
+    if dwh_unary_chat(h, mn, mnl, body, value) {
+        return true;
+    }
     if dwh_unary_session(h, mn, mnl, value) {
         return true;
     }
-    // 会话/工作区那一簇之外的、host 自身的元信息
+    // 会话/工作区那一簇之外的、host 自身的元信息。
+    // `session.models` 与 `session/modelCatalog` **同源**（见 `dwhm_models_json`）：
+    // 0.1.1 与 0.2.0 两个面板读的是同一个目录，有效模型列表不该有两份答案。
     if bufx_eq_cstr(mn, mnl, "session.models" as &const byte) {
-        return buf_append_cstr(value, "{\"current\":{\"provider\":\"uya-agent\",\"model\":\"uya-agent\"},\"routable\":true,\"groups\":[],\"failures\":[]}");
+        return dwhm_models_json(&h.model, value);
     }
     return false;
 }
@@ -1043,11 +1077,11 @@ fn dwh_unary_session(h: &const DwhHost, method: &const byte, ml: usize,
         "dynamicCordisRunner.syncInspectManifest" as &const byte) {
         return buf_append_cstr(value, "{\"accepted\":0,\"rejected\":[]}");
     }
-    // `session/modelCatalog`：客户端用它画模型选择器。形状取自真 DSH：
-    // `{default:{provider,model},routableProviders:[…],groups:[…]}`。
+    // `session/modelCatalog`：客户端用它画模型选择器。形状取自真 DSH 的 zod
+    // （`ModelCatalog`），**内容**来自本机的 `settings.yaml`（`dwhmodel.uya`）。
+    // 从前这里回的是写死的 `groups:[]` ⇒ 选择器永远是空的（用户报的那一条）。
     if bufx_eq_cstr(method, ml, "session.modelCatalog" as &const byte) {
-        // 行宽豁免：不可断的 JSON 字面量
-        return buf_append_cstr(value, "{\"default\":{\"provider\":\"uya-agent\",\"model\":\"uya-agent\"},\"routableProviders\":[\"uya-agent\"],\"groups\":[]}");
+        return dwhm_catalog_json(&h.model, value);
     }
     if bufx_eq_cstr(method, ml, "settings.describe" as &const byte) {
         // 形状是**从真 DSH 0.2.0 抄的**（0.1.1 那份 `{values,schema}` 在 0.2.0 下
@@ -1060,8 +1094,10 @@ fn dwh_unary_session(h: &const DwhHost, method: &const byte, ml: usize,
             "{\"writable\":false,\"hasDocument\":false,\"namespaces\":[]}");
     }
     if bufx_eq_cstr(method, ml, "session.models" as &const byte) {
-        // 行宽豁免：不可断的 JSON 字面量
-        return buf_append_cstr(value, "{\"current\":{\"provider\":\"uya-agent\",\"model\":\"uya-agent\"},\"routable\":true,\"groups\":[],\"failures\":[]}");
+        // 0.1.1 的那条门面（`{current,routable,groups,failures}`）：内容与
+        // `modelCatalog` **同源**（同一个目录、同一个当前值，组装函数也共用）——
+        // 两处各写一份就是「新旧两个面板显示不同的模型」。
+        return dwhm_models_json(&h.model, value);
     }
     // ⚠ `workspace.list` 返回空 ⇒ 会话在 session.list 里有、侧栏却一行不显示（实测）。
     // 形状要按真 schema：`items[]`，每项是 WorkspaceView（两个时间是 ISO-8601 字符串）。
@@ -1075,6 +1111,323 @@ fn dwh_unary_session(h: &const DwhHost, method: &const byte, ml: usize,
         return buf_append_cstr(value, "],\"archivedSessionIds\":[],\"pinnedSessionIds\":[]}");
     }
     return dwh_unary_settings(method, ml, value);
+}
+
+// ============================================================
+// P80 第二十三批：聊天与模型选择（两条认识请求体的 unary）
+// ============================================================
+//
+// 与 `dwh_unary_settings` 的**分工**：那一簇是**只读元信息**（形状对就行），
+// 这两条要**读请求体里的 `payload.args`** —— 所以它们多一个 `body` 形参。
+// 形状逐字段照 DSH 的 zod（`session/prompt` / `session/selectModel`），
+// 入参与出参都要对：入参多了/少了客户端不报错（它是它自己发的），
+// 出参形状错了才是「发了消息没反应」。
+
+// 两句业务错的措辞（拆两条常量拼：一条整行写会超 80 字符的行宽指标）。
+const DWH_RO_NOTE: &const byte = "只读模式（起了 --dsh-web-events / UYA_AGENT_DSH_WEB_EVENTS）：这条会话没有活的 agent，消息不会被处理" as &const byte;
+const DWH_SELMODEL_NOTE: &const byte = "session/selectModel 的参数不对（要 sessionId / provider / model，reasoningEffort 可选）" as &const byte;
+
+// 聊天那一簇。返回 true = 这个方法归它管（**无论成败**：认领了但业务失败也要
+// 回一条说清楚的业务错，而不是让调用方回「not implemented」——
+// 后者让客户端把整个面当「不支持」）。
+fn dwh_unary_chat(h: &DwhHost, method: &const byte, ml: usize,
+    body: &const Buf, value: &Buf) bool {
+    if bufx_eq_cstr(method, ml, "session.prompt" as &const byte) {
+        return dwh_prompt(h, body, value);
+    }
+    if bufx_eq_cstr(method, ml, "session.selectModel" as &const byte) {
+        return dwh_select_model(h, body, value);
+    }
+    return false;
+}
+
+// `session/prompt`：把浏览器发来的正文变成子进程 stdin 上的一帧。
+//
+// 入参（DSH 的 `SessionPromptRequest`）：`{requestId,sessionId,mode:"queue"|"steer",
+// content:[{type:"text",text}|{type:"image",…}|…],clientTimeZone?}`。
+// 出参：`{accepted:true}`。
+//
+// 三条纪律：
+//   ① **只认 text**：图片/文件附件要原样的 base64 走一条本仓还没接的路（体上限是
+//      另一条独立线，见 DESIGN §11.9.6）。遇到非 text 的块**如实回业务错**，
+//      绝不静默丢掉用户贴的内容（「发送成功了但图片没上去」比报错坏得多）。
+//   ② **只读模式明确拒绝**：给了事件源（译文）时没有子进程可送 —— 回一条
+//      「这是只读演示」的错，别让用户对着一个吞消息的输入框。
+//   ③ 会话 id 必须是我们那条：客户端可能开着别的会话的标签（多标签页），
+//      回错会话的消息会让用户以为「发给 A 的结果出现在 B 里」。
+fn dwh_prompt(h: &DwhHost, body: &const Buf, value: &Buf) bool {
+    var text: Buf = buf_new(4096);
+    defer { buf_free(&text); }
+    const rc: i32 = dwh_prompt_text(body, &text);
+    if rc != 0 {
+        return dwh_ok_or_err(value, rc);
+    }
+    if !h.live {
+        return dwh_rpc_owned_err(value, "internal",
+            DWH_RO_NOTE);
+    }
+    const s: i32 = dwhc_send_prompt(&h.child, text.ptr as &const byte,
+        text.len);
+    if s == 1 {
+        return dwh_rpc_owned_err(value, "gateway/bad-request",
+            "这一条太长（或上一条还没送完）：请缩短后重发");
+    }
+    if s == 2 {
+        return dwh_rpc_owned_err(value, "internal",
+            "对话子进程已经退出，消息送不进去（看启动日志与会话日志末尾）");
+    }
+    // 收到就算「接受」：真正的回合在子进程里跑（与 DSH 的语义一致 ——
+    // `accepted` 只表示「入队了」）。`running` 那一拍由 `turn/start` 推给客户端。
+    _ = dwh_host_event(h, "api-session/status" as &const byte, true);
+    return buf_append_cstr(value, "{\"accepted\":true}");
+}
+
+// 取 `payload.args` 里的正文。返回 0 = 取到了；1 = 参数不对；2 = 有非 text 的块。
+//
+// 逐个块走（`content` 是数组）：多条 text 块按顺序拼起来（DSH 的语义就是
+// 「一条消息里的几个块」），遇到 image/file 立刻返回 2（纪律①）。
+fn dwh_prompt_text(body: &const Buf, out: &Buf) i32 {
+    buf_reset(out);
+    var arena: Arena = Arena{ buffer: null, size: 0, used: 0 };
+    var abuf: [byte: 65536] = [0: 65536];
+    arena_init(&arena, &abuf[0], 65536);
+    var root: JsonValue = JsonValue.json_null();
+    if !js_parse(&arena, body.ptr as &const byte, body.len, &root) {
+        return 1;
+    }
+    var payload: JsonValue = JsonValue.json_null();
+    var args: JsonValue = JsonValue.json_null();
+    if !js_obj_get(&root, "payload" as &const byte, 7, &payload) ||
+        !js_obj_get(&payload, "args" as &const byte, 4, &args) {
+        return 1;
+    }
+    var sess: JsonStrView = JsonStrView{ ptr: null, len: 0 };
+    if !js_obj_get_str(&args, "sessionId" as &const byte, 9, &sess) {
+        return 1;
+    }
+    if !sv_eq_cstr_view(&sess, DWH_SESSION_ID) {
+        return 1;
+    }
+    var content: JsonValue = JsonValue.json_null();
+    if !js_obj_get(&args, "content" as &const byte, 7, &content) {
+        return 1;
+    }
+    const n: usize = js_arr_len(&content);
+    if n == 0 {
+        return 1;
+    }
+    var i: usize = 0;
+    while i < n {
+        var blk: JsonValue = JsonValue.json_null();
+        if !js_arr_get(&content, i, &blk) {
+            return 1;
+        }
+        var kind: JsonStrView = JsonStrView{ ptr: null, len: 0 };
+        if !js_obj_get_str(&blk, "type" as &const byte, 4, &kind) {
+            return 1;
+        }
+        if !sv_eq_cstr_view(&kind, "text" as &const byte) {
+            return 2;
+        }
+        var t: JsonStrView = JsonStrView{ ptr: null, len: 0 };
+        if !js_obj_get_str(&blk, "text" as &const byte, 4, &t) {
+            return 1;
+        }
+        if !sv_unescape(&t, out) {
+            return 1;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// 一个 `JsonStrView` 与一个 C 串字面量逐字节比（`sv_unescape` 之前用）。
+fn sv_eq_cstr_view(s: &const JsonStrView, lit: &const byte) bool {
+    const ln: usize = bufx_cstr_len(lit);
+    if s.len != ln {
+        return false;
+    }
+    if ln == 0 {
+        return true;
+    }
+    return bufx_mem_eq(s.ptr as &const byte, lit, ln);
+}
+
+// 把 `dwh_prompt_text` 的返回码变成一条**说清楚**的业务错。
+// 用 `dwh_rpc_owned_err` 的形态（下面那个）—— 这条只是把三个码映射成人话。
+fn dwh_ok_or_err(value: &Buf, rc: i32) bool {
+    if rc == 2 {
+        return dwh_rpc_owned_err(value, "gateway/bad-request",
+            "这一条里带了图片/文件附件：本仓的 --dsh-web 还没接附件那条路（正文可以照发）");
+    }
+    return dwh_rpc_owned_err(value, "gateway/bad-request",
+        "session/prompt 的参数不对（要 requestId/sessionId/mode/content）");
+}
+
+// 一条**业务错**：`{"__err":true,"code":…,"message":…}` —— 让 `dwh_unary` 的调用方
+// （`dwh_send_api`）能把它包成 `ok:false` 的响应（而不是把这串当成了成功的 value）。
+//
+// 为什么用这个内部标记而不是直接在这里写响应：`dwh_unary` 的契约是「写 value」，
+// 响应信封（rpcId / ok / error）只有 `dwh_send_api` 知道。多一条返回路径就会有两处
+// 拼信封的地方 —— 而拼错信封的症状（`invalid server-response`）离原因很远。
+fn dwh_rpc_owned_err(value: &Buf, code: &const byte, msg: &const byte) bool {
+    buf_reset(value);
+    if !buf_append_cstr(value, "{\"__err\":true,\"code\":") {
+        return false;
+    }
+    if !jw_str_into(value, code, bufx_cstr_len(code)) {
+        return false;
+    }
+    if !buf_append_cstr(value, ",\"message\":") {
+        return false;
+    }
+    return jw_str_into(value, msg, bufx_cstr_len(msg));
+}
+
+// 拆 `dwh_rpc_owned_err` 写下的内部标记。返回 false = 这不是错误（是正常的 value）。
+// `code` / `msg` 拿到之后发给 `dwh_rpc_err`（拼信封只有那一处）。
+fn dwh_take_owned_err(value: &const Buf, code: &Buf, msg: &Buf) bool {
+    buf_reset(code);
+    buf_reset(msg);
+    if !dwh_has_frag(value, "\"__err\":true" as &const byte) {
+        return false;
+    }
+    var arena: Arena = Arena{ buffer: null, size: 0, used: 0 };
+    var abuf: [byte: 65536] = [0: 65536];
+    arena_init(&arena, &abuf[0], 65536);
+    var root: JsonValue = JsonValue.json_null();
+    if !js_parse(&arena, value.ptr as &const byte, value.len, &root) {
+        return false;
+    }
+    return dwh_take_str(&root, "code" as &const byte, 4, code)
+        && dwh_take_str(&root, "message" as &const byte, 7, msg);
+}
+
+// `session/selectModel`：切模型。入参 `{sessionId,provider,model,reasoningEffort?}`，
+// 出参 `{selected:{provider,model,reasoningEffort?}}`。
+//
+// **两处都要落**（`dwhmodel.uya` 不变量③）：
+//   ① 执行核：往子进程 stdin 写 `/model <provider>/<model>` 与（给了档位时）
+//      `/effort <level>` 两行 —— 那是真正生效的地方，会话日志里会落一条
+//      `session/model`（`--resume` 跟着它走）；
+//   ② 投影：宿主自己的当前值（浏览器里的选择器读它）。
+// 只落一处 = 「界面变了、请求没变」或反过来 —— 两种都骗人。
+fn dwh_select_model(h: &DwhHost, body: &const Buf, value: &Buf) bool {
+    var prov: Buf = buf_new(128);
+    defer { buf_free(&prov); }
+    var model: Buf = buf_new(128);
+    defer { buf_free(&model); }
+    var eff: Buf = buf_new(64);
+    defer { buf_free(&eff); }
+    if !dwh_select_args(body, &prov, &model, &eff) {
+        return dwh_rpc_owned_err(value, "gateway/bad-request",
+            DWH_SELMODEL_NOTE);
+    }
+    // 目录里没有这一对：**如实拒绝**（DSH 的 `session/model-unavailable`）。
+    // 静默接受会让选择器显示一个永远不会生效的模型。
+    if !dwhm_has(&h.model, prov.ptr as &const byte, prov.len,
+        model.ptr as &const byte, model.len) {
+        return dwh_rpc_owned_err(value, "session/model-unavailable",
+            "这个模型不在本机的模型目录里（看 DSH 的 settings.yaml）");
+    }
+    const rc: i32 = dwhm_select(&h.model, prov.ptr as &const byte, prov.len,
+        model.ptr as &const byte, model.len, eff.ptr as &const byte, eff.len);
+    if rc == 2 {
+        return dwh_rpc_owned_err(value, "gateway/bad-request",
+            "这个模型没有公布那个推理档位");
+    }
+    // ① 执行核（活会话才有；只读模式下只更新宿主的选择，让界面保持一致）
+    if h.live {
+        if !dwh_push_model_cmd(h, &prov, &model, &eff) {
+            return dwh_rpc_owned_err(value, "internal",
+                "切模型的命令送不进对话子进程（它可能已经退出）");
+        }
+    }
+    // ② 出参 + 投影帧（两处都用同一个 `dwhm_selected_json`，见上面那条注）
+    if !dwhm_selected_json(&h.model, value) {
+        return false;
+    }
+    return true;
+}
+
+// 取 `session/selectModel` 的三个字段（`sessionId` 必须是我们那条；`reasoningEffort` 可选）。
+fn dwh_select_args(body: &const Buf, prov: &Buf, model: &Buf,
+    eff: &Buf) bool {
+    var arena: Arena = Arena{ buffer: null, size: 0, used: 0 };
+    var abuf: [byte: 65536] = [0: 65536];
+    arena_init(&arena, &abuf[0], 65536);
+    var root: JsonValue = JsonValue.json_null();
+    if !js_parse(&arena, body.ptr as &const byte, body.len, &root) {
+        return false;
+    }
+    var payload: JsonValue = JsonValue.json_null();
+    var args: JsonValue = JsonValue.json_null();
+    if !js_obj_get(&root, "payload" as &const byte, 7, &payload) ||
+        !js_obj_get(&payload, "args" as &const byte, 4, &args) {
+        return false;
+    }
+    var sess: JsonStrView = JsonStrView{ ptr: null, len: 0 };
+    if !js_obj_get_str(&args, "sessionId" as &const byte, 9, &sess) {
+        return false;
+    }
+    if !sv_eq_cstr_view(&sess, DWH_SESSION_ID) {
+        return false;
+    }
+    if !dwh_take_str(&args, "provider" as &const byte, 8, prov) {
+        return false;
+    }
+    if !dwh_take_str(&args, "model" as &const byte, 5, model) {
+        return false;
+    }
+    // `reasoningEffort` 是**可选**的：没给就留空（= 不动现有档位，与
+    // `agent_model_apply` 的 `effort_set` 口径一致）。
+    _ = dwh_take_str(&args, "reasoningEffort" as &const byte, 15, eff);
+    return prov.len > 0 && model.len > 0;
+}
+
+// 取一个**可选的**字符串字段（反转义后写进 out）。返回 false = 没有这个键 / 类型不对。
+fn dwh_take_str(obj: &const JsonValue, key: &const byte, kl: usize,
+    out: &Buf) bool {
+    var sv: JsonStrView = JsonStrView{ ptr: null, len: 0 };
+    if !js_obj_get_str(obj, key, kl, &sv) {
+        return false;
+    }
+    buf_reset(out);
+    return sv_unescape(&sv, out);
+}
+
+// 往子进程 stdin 排 `/model` 与 `/effort` 两行（P62 的 `provider/model` 写法）。
+fn dwh_push_model_cmd(h: &DwhHost, prov: &const Buf, model: &const Buf,
+    eff: &const Buf) bool {
+    var line: Buf = buf_new(prov.len + model.len + 32);
+    defer { buf_free(&line); }
+    if !buf_append_cstr(&line, "/model ") {
+        return false;
+    }
+    if !buf_append(&line, prov.ptr as &const byte, prov.len) {
+        return false;
+    }
+    if !buf_append_byte(&line, 47) {
+        return false;
+    }
+    if !buf_append(&line, model.ptr as &const byte, model.len) {
+        return false;
+    }
+    if dwhc_send_line(&h.child, line.ptr as &const byte, line.len) != 0 {
+        return false;
+    }
+    if eff.len == 0 {
+        return true;
+    }
+    var l2: Buf = buf_new(eff.len + 16);
+    defer { buf_free(&l2); }
+    if !buf_append_cstr(&l2, "/effort ") {
+        return false;
+    }
+    if !buf_append(&l2, eff.ptr as &const byte, eff.len) {
+        return false;
+    }
+    return dwhc_send_line(&h.child, l2.ptr as &const byte, l2.len) == 0;
 }
 
 // 设置面板那一簇（General / Models / Built-in plugins / Agent presets 四个页签）。
@@ -1202,9 +1555,15 @@ fn dwh_permission_json(out: &Buf, preset: &const byte) bool {
 // 它在**最后一条**（seq 21/22），因为它的语义是「历史到此为止」的收口标记。
 // 我此前把它和第 4 条开头 seed 放在一起，位置错了（症状：我方夹具不渲染，
 // 而真夹具渲染得出来 —— 两者数据形状几乎一样，只有 end-seed 的位置不同）。
-const DWH_SEED_SEQS: u64 = 3;
+// `pub`：`dwhchild.uya` 的 `DWH_LIVE_SHIFT` 从它算（活事件的位移是它 +1）。
+// 两处都写死数字就会各自漂移，而漂移的症状是客户端断流（见 `dwh_shift_seq`）。
+export const DWH_SEED_SEQS: u64 = 3;
 
-const DWH_SESSION_ID: &const byte = "session-uya-0000-0000-0000-000000000001" as &const byte;
+// 会话 id（session.list / workspace.list / mux 三处必须是同一个值；`--dsh-web` 今天
+// 只有这一条会话）。**导出**：`dwhchild.uya` 拿它当子进程的
+// `UYA_AGENT_FORCE_SESSION_ID`，并据此算出会话日志路径 —— 两处各写一个常量就会变成
+// 「父进程读的文件不是子进程写的那个」，而症状只是「发了消息没反应」。
+export const DWH_SESSION_ID: &const byte = "session-uya-0000-0000-0000-000000000001" as &const byte;
 
 // 把译文的每一行包成 `{"event":…}`（DSH 的 HistoryEntry），逗号分隔。
 fn dwh_events_as_history(events: &const Buf, out: &Buf) bool {
@@ -1544,8 +1903,8 @@ fn dwh_pick_method(body: &const Buf, out: &Buf) bool {
 
 // 起宿主：找 dist、装 boot 图、读事件源、监听。
 // `addr` 形如 "127.0.0.1:PORT"（`PORT` 为 0 = 让内核给一个）。
-export fn dwh_start(h: &DwhHost, addr: &const byte, an: usize,
-    events_path: &const byte, assets: &const byte, al: usize,
+export fn dwh_start(h: &DwhHost, cfg: &const Config, addr: &const byte,
+    an: usize, events_path: &const byte, assets: &const byte, al: usize,
     token: &const byte, tl: usize) bool {
     h.lfd = -1;
     h.dist = buf_empty();
@@ -1554,12 +1913,20 @@ export fn dwh_start(h: &DwhHost, addr: &const byte, an: usize,
     h.preloads = buf_empty();
     h.events = buf_empty();
     h.token = buf_empty();
+    h.dsh_home = buf_empty();
     h.n = 0;
+    h.live = false;
+    h.child = dwhc_zero();
+    h.model = dwhm_zero();
+    h.f_sid = buf_new(64);
+    h.e_sid = buf_new(64);
+    h.pushed = 0;
     var i: usize = 0;
     while i < DWH_MAX_CONNS {
         h.conns[i].fd = -1;
         h.conns[i].st = DWH_C_DONE;
         h.conns[i].rx = buf_empty();
+        h.conns[i].sid = buf_empty();
         h.conns[i].is_mux = false;
         h.conns[i].is_remote = false;
         h.conns[i].remote_ready = false;
@@ -1601,6 +1968,19 @@ export fn dwh_start(h: &DwhHost, addr: &const byte, an: usize,
         _ = buf_append_byte(&ep, 0);
         _ = dwh_read_file(ep.ptr as &const byte, &h.events, 4194304);
     }
+    // P80 第二十三批：**没给事件源就是活会话**（用户零参数跑 `--dsh-web` 的形态）。
+    // 给了译文那条路（只读演示）一个字节都不改：不 fork、`session/prompt` 回
+    // 业务错 —— 那正是「快照逗号」与「零事件源」两条判据各自覆盖的形态。
+    if h.events.len == 0 {
+        if !dwh_live_start(h, cfg) {
+            return false;
+        }
+    }
+    // 模型目录：**两种模式都装**（只读演示也要能看见本机有哪些模型 ——
+    // 「页面里能选」与「选了能生效」是两件事，前者不依赖活会话）。
+    if !dwhm_load(&h.model, &h.dsh_home) {
+        out_err("[dsh-web] 提示：读不到 DSH 的 settings.yaml，模型选择器会是空的\n");
+    }
     // 监听
     var a: byte = 127;
     var b: byte = 0;
@@ -1636,6 +2016,275 @@ export fn dwh_start(h: &DwhHost, addr: &const byte, an: usize,
         out_err("[dsh-web] 首次访问带 `?token=`（之后靠 cookie）；换令牌重启即可。\n");
     }
     return true;
+}
+
+// ============================================================
+// P80 第二十三批：活会话（子进程 + 日志 tail + 输入帧）
+// ============================================================
+
+// 起活会话：定 agent home / DSH home → fork 对话子进程 → 打开会话日志。
+// 失败**不静默**：每一条都在 stderr 上说了原因（用户零参数跑时这是唯一的线索）。
+fn dwh_live_start(h: &DwhHost, cfg: &const Config) bool {
+    var home: Buf = buf_new(1024);
+    defer { buf_free(&home); }
+    if !agent_default_home(cfg, &home) {
+        out_err("[dsh-web] 定不出 agent home（$HOME 没设？）\n");
+        return false;
+    }
+    // DSH 的设置根：模型目录与子进程的 persona 都从它来（`--dsh-home` 优先）。
+    if !dsh_home_resolve(cfg.dsh_home.ptr as &const byte, &h.dsh_home) {
+        out_err("[dsh-web] 定不出 DSH 设置根（$HOME 没设？）\n");
+        return false;
+    }
+    if !dwhc_start(&h.child, cfg, &home, DWH_SESSION_ID,
+        bufx_cstr_len(DWH_SESSION_ID)) {
+        out_err("[dsh-web] 对话子进程起不来；页面能开但发消息不会有回应\n");
+        return false;
+    }
+    h.live = true;
+    // 没有凭据是最常见的「起得来但不回话」：**在启动时就说清楚**，别让用户对着
+    // 一个不回话的输入框猜（子进程自己也会在它的日志里报同一件事）。
+    if cfg.api_key.len == 0 {
+        out_err("[dsh-web] 警告：没有 API 凭据（UYA_AGENT_API_KEY / --api-key）——");
+        out_err("消息会进会话，但请求发不出去\n");
+    }
+    out_err("[dsh-web] 活会话已就绪：浏览器里的消息会送到这条会话（id=");
+    _ = srv_write_all(2, DWH_SESSION_ID, bufx_cstr_len(DWH_SESSION_ID));
+    out_err("）\n");
+    // 子进程的诊断落在**另一个文件**（不是会话日志 —— 那份必须是干净的 JSONL，
+    // 见 `dwhc_child_exec`）。把路径打出来：出问题时人直接去看它。
+    const ep: &const Buf = dwhc_err_path_of(&h.child);
+    if ep.len > 0 {
+        out_err("[dsh-web] 子进程诊断：");
+        _ = srv_write_all(2, ep.ptr as &const byte, ep.len);
+        out_err("\n");
+    }
+    return true;
+}
+
+// 一圈的活会话维护：收子进程的新行、翻成事件、攒进 `h.events`（**只追加**），
+// 再把「还没推过的」那一段逐个推给订阅者。
+//
+// 为什么事件也进 `h.events` 而不是另开一份：`session/follow` 的**快照**与
+// `/api/session/history` 都从 `h.events` 读（那两处一行都不改），活事件只是
+// 「这份译文又长了一截」—— 一个真值源，两个消费口。
+fn dwh_live_tick(h: &DwhHost) void {
+    if !h.live {
+        return;
+    }
+    // ① 子进程死了吗（收尸 + 一条可见的说明，然后就不再装活着）
+    if !dwhc_poll_alive(&h.child) {
+        var msg: Buf = buf_new(256);
+        defer { buf_free(&msg); }
+        if dwhc_err(&h.child).len > 0 {
+            if !buf_append(&msg, dwhc_err(&h.child).ptr as &const byte,
+                dwhc_err(&h.child).len) {
+                return;
+            }
+        }
+        dwh_live_error(h, &msg);
+        dwhc_stop(&h.child, false);
+        h.live = false;
+        return;
+    }
+    // ② 待发输入尽量写出去（非阻塞；写不完留到下一圈）
+    _ = dwhc_flush(&h.child);
+    // ③ 新行 → 译文：追加进 `h.events`（快照 / history 与下行共用这一份）
+    const n: usize = dwhc_tick(&h.child);
+    if n > 0 {
+        _ = buf_append(&h.events, dwhc_raw(&h.child).ptr as &const byte,
+            dwhc_raw(&h.child).len);
+        dwh_live_push_events(h);
+        // ④ `turn/end` 到了 ⇒ 这一回合结束：推 `api-session/status(sid,false)`。
+        // 客户端的 `running` 只从这条宿主事件来（`dsh-client-ui-session` 的
+        // `ctx.remote.$on("api-session/status", …)`），消息流里**没有**它 ——
+        // 不推的话「停止」按钮永远转着（而 agent 早就答完了）。
+        if dwh_new_has_turn_end(&h.child) {
+            dwh_host_event(h, "api-session/status" as &const byte, false);
+        }
+    }
+}
+
+// 这一批新行里有没有 `turn/end`（按字节找 `"type":"turn/end"`，容忍冒号后的空白）。
+// 为什么按字节找而不是解析：`dwhc_one_line` 刚写出来的就是 `dwire_*` 的产物，
+// 形状是本仓自己定的；这里只是「这一批要不要多推一帧」的判据。
+fn dwh_new_has_turn_end(c: &const DwhChild) bool {
+    const raw: &const Buf = dwhc_raw(c);
+    return srv_find(raw.ptr as &const byte, 0, raw.len,
+        "\"turn/end\"" as &const byte,
+        bufx_cstr_len("\"turn/end\"" as &const byte)) >= 0;
+}
+
+// 把 `h.events` 里**还没推过**的行逐个推给 `session/follow`。
+//
+// seq 位移在 `dwhc_one_line` 里已经做过（`DWH_LIVE_SHIFT`），所以这里原样发 ——
+// 同一行的位移**只能有一处**：这里再过一遍就是双重位移，客户端判不连续并断流。
+fn dwh_live_push_events(h: &const DwhHost) void {
+    if h.f_sid.len == 0 {
+        return;      // 那条流还没开：先攒着（快照会给全量）
+    }
+    const fd: i32 = dwh_fd_of_stream(h, &h.f_sid);
+    if fd < 0 {
+        return;
+    }
+    var start: usize = h.pushed;
+    var i: usize = h.pushed;
+    while i <= h.events.len {
+        const at_end: bool = i == h.events.len;
+        if at_end || h.events.ptr[i] == 10 as byte {
+            const seg: usize = i - start;
+            if seg > 0 {
+                dwh_live_frame(h, fd, &h.events.ptr[start], seg);
+            }
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    // 水位推进：`pushed` 是 `usize` 而 `h` 是 const —— 由调用方（`dwh_live_tick`）
+    // 在推完之后用同一个值回写（见 `dwh_live_mark`）。
+}
+
+// 记下「已经推到哪里」（与 `dwh_live_push_events` 配对；分开是为了让推那一半
+// 不碰宿主状态 —— 它要能被自测当纯函数验）。
+fn dwh_live_mark(h: &DwhHost) void {
+    h.pushed = h.events.len;
+}
+
+// 一条事件帧：`{"type":"item","streamId":…,"value":{"type":"event","event":{…}}}`。
+// 与快照里的 `records[]` 是**同一条事件的两种载体**（快照是批量、这是增量），
+// 所以 `event` 的字节完全一样 —— 客户端 fold 的是同一个对象。
+fn dwh_live_frame(h: &const DwhHost, fd: i32, ev: &const byte,
+    n: usize) void {
+    if fd < 0 {
+        return;
+    }
+    var p: Buf = buf_new(n + h.f_sid.len + 128);
+    defer { buf_free(&p); }
+    if !buf_append_cstr(&p, "{\"type\":\"item\",\"streamId\":\"") {
+        return;
+    }
+    if !buf_append(&p, h.f_sid.ptr as &const byte, h.f_sid.len) {
+        return;
+    }
+    if !buf_append_cstr(&p, "\",\"value\":{\"type\":\"event\",\"event\":") {
+        return;
+    }
+    if !buf_append(&p, ev, n) {
+        return;
+    }
+    if !buf_append_cstr(&p, "}}") {
+        return;
+    }
+    _ = dwh_ws_send_text(fd, p.ptr as &const byte, p.len);
+}
+
+// 开着 `sid` 这条流的那条连接的 **fd**（没有回 -1）。
+//
+// 返回 fd 而不是下标：Uya 的数组边界证明器只认「正的 if 里做索引」，拿一个
+// `isize` 回调用点再 `as usize` 索引是过不了证明的（实测报「数组索引安全证明
+// 失败」）。循环变量 `i` 是能证明的，所以在这里取完就返回。
+fn dwh_fd_of_stream(h: &const DwhHost, sid: &const Buf) i32 {
+    var i: usize = 0;
+    while i < DWH_MAX_CONNS {
+        if h.conns[i].fd >= 0 && h.conns[i].sid.len == sid.len
+            && bufx_mem_eq(h.conns[i].sid.ptr as &const byte,
+                sid.ptr as &const byte, sid.len) {
+            return h.conns[i].fd;
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+// 把一条**宿主事件**推给 `$events`（`api-session/status` 走这条）。
+//
+// 形状取自 DSH 的 `parseRemoteEventFrame`：`{type:"emit",event:"<名>",args:[…]}`，
+// 三条键**一个都不能多**（`hasExactRemoteEventKeys`）。
+fn dwh_host_event(h: &const DwhHost, name: &const byte, running: bool) void {
+    if h.e_sid.len == 0 {
+        return;
+    }
+    const fd: i32 = dwh_fd_of_stream(h, &h.e_sid);
+    if fd < 0 {
+        return;
+    }
+    var p: Buf = buf_new(256);
+    defer { buf_free(&p); }
+    if !buf_append_cstr(&p, "{\"type\":\"item\",\"streamId\":\"") {
+        return;
+    }
+    if !buf_append(&p, h.e_sid.ptr as &const byte, h.e_sid.len) {
+        return;
+    }
+    if !buf_append_cstr(&p, "\",\"value\":{\"type\":\"emit\",\"event\":") {
+        return;
+    }
+    if !jw_str_into(&p, name, bufx_cstr_len(name)) {
+        return;
+    }
+    if !buf_append_cstr(&p, ",\"args\":[") {
+        return;
+    }
+    if !jw_str_into(&p, DWH_SESSION_ID, bufx_cstr_len(DWH_SESSION_ID)) {
+        return;
+    }
+    if !buf_append_cstr(&p, ",") {
+        return;
+    }
+    // 不用 `if` 表达式挑字面量：codegen 为它生成一个 `int32_t __uya_ifexpr_N`
+    // 临时量（**指针塞进 int**），宿主 C 直接报 `makes integer from pointer`
+    // 而在 cc 段失败 —— 编译期检查看不见这个（同 `if` 表达式选长度那条）。
+    const rv: &const byte = if running {
+        "true" as &const byte
+    } else {
+        "false" as &const byte
+    };
+    if !buf_append_cstr(&p, rv) {
+        return;
+    }
+    if !buf_append_cstr(&p, "]}}") {
+        return;
+    }
+    _ = dwh_ws_send_text(fd, p.ptr as &const byte, p.len);
+}
+
+// 活会话出事了（子进程没了 / 没 key / 请求失败）：推一条 `error` 帧 + 拼一句人话。
+//
+// 为什么要有 `error` 帧：客户端的流校验认 `{type:"error",streamId,error:{code,
+// message,details}}`（`parseRemoteStreamServerMessage`），收到之后它会把这条流
+// **收干净**而不是每 3 秒重连 —— 后者是「页面看起来还在转」的最坏形态。
+fn dwh_live_error(h: &const DwhHost, msg: &const Buf) void {
+    if msg.len > 0 {
+        out_err("[dsh-web] ");
+        _ = srv_write_all(2, msg.ptr as &const byte, msg.len);
+        out_err("\n");
+    }
+    if h.f_sid.len == 0 {
+        return;
+    }
+    const fd: i32 = dwh_fd_of_stream(h, &h.f_sid);
+    if fd < 0 {
+        return;
+    }
+    var p: Buf = buf_new(msg.len + 256);
+    defer { buf_free(&p); }
+    if !buf_append_cstr(&p, "{\"type\":\"error\",\"streamId\":\"") {
+        return;
+    }
+    if !buf_append(&p, h.f_sid.ptr as &const byte, h.f_sid.len) {
+        return;
+    }
+    // 行宽豁免：不可断的 JSON 骨架
+    if !buf_append_cstr(&p, "\",\"error\":{\"code\":\"session/host-unavailable\",\"message\":") {
+        return;
+    }
+    if !jw_str_into(&p, msg.ptr as &const byte, msg.len) {
+        return;
+    }
+    if !buf_append_cstr(&p, ",\"details\":{}}}") {
+        return;
+    }
+    _ = dwh_ws_send_text(fd, p.ptr as &const byte, p.len);
 }
 
 // 解析 "A.B.C.D:PORT"（只支持 IPv4 字面量，与 `--web` 同一口径）。
@@ -1714,6 +2363,9 @@ export fn dwh_stop(h: &DwhHost) void {
         if buf_valid(&h.conns[i].rx) {
             buf_free(&h.conns[i].rx);
         }
+        if buf_valid(&h.conns[i].sid) {
+            buf_free(&h.conns[i].sid);
+        }
         i = i + 1;
     }
     if h.lfd >= 0 {
@@ -1734,6 +2386,22 @@ export fn dwh_stop(h: &DwhHost) void {
     }
     if buf_valid(&h.events) {
         buf_free(&h.events);
+    }
+    // 活会话：先收子进程（**hard**：宿主要退出了，别让一条还在读 LLM 的子进程
+    // 拖着整个进程组），再释放两条流的 streamId 与模型目录。
+    if h.live {
+        dwhc_stop(&h.child, true);
+        h.live = false;
+    }
+    dwhm_free(&h.model);
+    if buf_valid(&h.f_sid) {
+        buf_free(&h.f_sid);
+    }
+    if buf_valid(&h.e_sid) {
+        buf_free(&h.e_sid);
+    }
+    if buf_valid(&h.dsh_home) {
+        buf_free(&h.dsh_home);
     }
 }
 
@@ -1787,7 +2455,7 @@ export fn dwh_run(cfg: &const Config) i32 {
         use_assets = assets.ptr as &const byte;
         use_al = assets.len;
     }
-    if !dwh_start(&h, addr.ptr as &const byte, addr.len,
+    if !dwh_start(&h, cfg, addr.ptr as &const byte, addr.len,
         events.ptr as &const byte, use_assets, use_al,
         cfg.dsh_token.ptr as &const byte, cfg.dsh_token.len) {
         out_err("error: --dsh-web 起不来（没找到 DSH 的 webui？试 --dsh-root DIR，");
@@ -1798,7 +2466,9 @@ export fn dwh_run(cfg: &const Config) i32 {
     out_err("[dsh-web] DSH 前端（只读它的 dist，不改一个字节）：http://127.0.0.1:");
     out_err_dec(dwh_port(&h) as usize);
     out_err("/ （ctrl+c 退出）\n");
-    if h.events.len == 0 {
+    // 只读演示模式下才提这句：活会话**开始时** `events` 当然是空的（它会长出来），
+    // 在那种模式下打「没有事件源」是**假话**，而假提示会让用户以为功能坏了。
+    if !h.live {
         out_err("[dsh-web] 提示：没有事件源（UYA_AGENT_DSH_WEB_EVENTS 指一份译文），");
         out_err("页面能起来但没有消息\n");
     }
@@ -1821,13 +2491,19 @@ fn dwh_host_zero() DwhHost {
         conns: [dwh_conn_zero(): DWH_MAX_CONNS],
         n: 0,
         stop_round: false,
+        live: false,
+        child: dwhc_zero(),
+        model: dwhm_zero(),
+        f_sid: buf_empty(),
+        e_sid: buf_empty(),
+        pushed: 0,
     };
     return h;
 }
 
 // 零值连接。
 fn dwh_conn_zero() DwhConn {
-    return DwhConn{ fd: -1, st: DWH_C_DONE, rx: buf_empty(),
+    return DwhConn{ fd: -1, st: DWH_C_DONE, sid: buf_empty(), rx: buf_empty(),
         is_mux: false, is_remote: false, remote_ready: false, sent: false };
 }
 
@@ -1849,6 +2525,18 @@ fn dwh_poll_once(h: &DwhHost) void {
         pfds[0].events = POLLIN;
         idx[0] = 0;
         np = 1;
+    }
+    // 活会话的**写端**（管道）进 poll 集合：有待发输入时等它可写，写出去就回。
+    //
+    // ⚠ **会话日志的 fd 不进 poll 集合**：普通文件在 `poll` 里**恒为就绪**
+    // （内核不把「文件末尾」当未就绪），于是 `poll` 立刻返回、每圈都空转 ——
+    // 实测形态是宿主 100% CPU 占着一个核、HTTP 请求一个都不回（curl 超时）。
+    // 日志的新行靠 `DWH_POLL_MS`（50ms）的超时兜住，与全仓其它泵点同一条纪律。
+    if h.live && dwhc_wants_write(&h.child) && np < DWH_MAX_CONNS + 1 {
+        pfds[np].fd = dwhc_wfd(&h.child);
+        pfds[np].events = POLLOUT;
+        idx[np] = DWH_MAX_CONNS + 1;
+        np = np + 1;
     }
     var i: usize = 0;
     while i < DWH_MAX_CONNS && np < DWH_MAX_CONNS + 1 {
@@ -1879,6 +2567,13 @@ fn dwh_poll_once(h: &DwhHost) void {
                     dwh_accept(h);
                     return;
                 }
+            } else if idx[k] > DWH_MAX_CONNS {
+                // 活会话的 fd（日志 / stdin）：这一圈有它就够了 —— 具体的读/写
+                // 统一在下面的 `dwh_live_tick` 里做（那里是**一处**口径：
+                // 收尸、写 stdin、读日志、推帧四件事的顺序不能乱）。
+                dwh_live_tick(h);
+                dwh_live_mark(h);
+                return;
             } else {
                 const ci: usize = idx[k] - 1;
                 // 掩码先落成一个 i16：三个常量的 `|` 会被推断成别的整型，
@@ -1896,6 +2591,10 @@ fn dwh_poll_once(h: &DwhHost) void {
         k = k + 1;
     }
     dwh_sweep(h);
+    // 没有 fd 就绪的那一圈也要维护活会话（子进程可能刚刚退出 —— 那是**没有**
+    // 任何 fd 事件可等的形态，只靠 poll 永远发现不了）。
+    dwh_live_tick(h);
+    dwh_live_mark(h);
 }
 
 // 收一个新连接（非阻塞 listen fd；连接本身阻塞也是错的 —— 设为非阻塞）。
@@ -1927,6 +2626,10 @@ fn dwh_accept(h: &DwhHost) void {
         h.conns[slot].rx = buf_new(16384);
     }
     buf_reset(&h.conns[slot].rx);
+    if !buf_valid(&h.conns[slot].sid) {
+        h.conns[slot].sid = buf_new(64);
+    }
+    buf_reset(&h.conns[slot].sid);
 }
 
 // 一个连接可读了：按它的阶段分派。
@@ -2138,6 +2841,7 @@ fn dwh_drop(h: &DwhHost, ci: usize) void {
     h.conns[ci].is_remote = false;
     h.conns[ci].remote_ready = false;
     buf_reset(&h.conns[ci].rx);
+    buf_reset(&h.conns[ci].sid);
 }
 
 // 清掉已完成的连接（每圈末尾一次：主循环手上可能有移动前的下标）。
@@ -2637,8 +3341,23 @@ fn dwh_send_api(h: &DwhHost, ci: usize, m: u8, path: &const Buf,
     } else {
         var value: Buf = buf_new(65536);
         defer { buf_free(&value); }
-        if dwh_unary(h, method.ptr as &const byte, method.len, &value) {
-            if !dwh_rpc_ok(rpc.ptr as &const byte, rpc.len, &value, &resp) {
+        if dwh_unary(h, method.ptr as &const byte, method.len, &body, &value) {
+            // 业务错走**同一条出口**：`dwh_unary` 的契约是「写 value」，而它偶尔要
+            // 回答「这个请求不合法」—— 那也写进 value，但带一个内部标记
+            // （`dwh_rpc_owned_err`）。在这里一次性拆成 `ok:false` 的信封 ——
+            // 两处各拼一次信封就会有两份「怎么拼错误响应」的知识。
+            var code: Buf = buf_new(64);
+            defer { buf_free(&code); }
+            var msg: Buf = buf_new(512);
+            defer { buf_free(&msg); }
+            if dwh_take_owned_err(&value, &code, &msg) {
+                if !dwh_rpc_err(rpc.ptr as &const byte, rpc.len,
+                    code.ptr as &const byte, msg.ptr as &const byte, msg.len,
+                    &resp) {
+                    h.conns[ci].st = DWH_C_DONE;
+                    return;
+                }
+            } else if !dwh_rpc_ok(rpc.ptr as &const byte, rpc.len, &value, &resp) {
                 h.conns[ci].st = DWH_C_DONE;
                 return;
             }
@@ -2763,13 +3482,19 @@ fn dwh_remote_dispatch(h: &DwhHost, ci: usize, text: &const Buf) void {
 //                        这正是本宿主此前「connection lost, retry #1..3」的根因）
 //   `session/control`  → baseline（投影）
 // 其余（`session/follow` 等）暂时回一条空的 baseline，让客户端不吊死。
-fn dwh_remote_open(h: &const DwhHost, ci: usize, sid: &const Buf,
+fn dwh_remote_open(h: &DwhHost, ci: usize, sid: &const Buf,
                    ep: &const Buf) void {
     if ci >= DWH_MAX_CONNS {
         return;
     }
     const fd: i32 = h.conns[ci].fd;
+    // 记下这条流的 streamId：宿主主动推帧（活事件 / `api-session/status`）时要按它标。
+    // 一条连接只开一条流（客户端每种流一条连接），所以这里直接覆盖。
+    buf_reset(&h.conns[ci].sid);
+    _ = buf_append(&h.conns[ci].sid, sid.ptr as &const byte, sid.len);
     if bufx_eq_cstr(ep.ptr as &const byte, ep.len, "$events" as &const byte) {
+        buf_reset(&h.e_sid);
+        _ = buf_append(&h.e_sid, sid.ptr as &const byte, sid.len);
         const rdy: &const byte = "\"clientId\":\"uya-host\"," as &const byte;
         dwh_remote_item(fd, sid, "ready" as &const byte, rdy,
             bufx_cstr_len(rdy), &h.events);
@@ -2806,9 +3531,34 @@ fn dwh_remote_open(h: &const DwhHost, ci: usize, sid: &const Buf,
     // `Cannot convert undefined or null to object`（实测）。给空对象即可。
     if bufx_eq_cstr(ep.ptr as &const byte, ep.len,
         "session/control" as &const byte) {
-        const cbl: &const byte = "\"value\":{\"projections\":{}}" as &const byte;
-        dwh_remote_item(fd, sid, "baseline" as &const byte, cbl,
-            bufx_cstr_len(cbl), &h.events);
+        // `session/control` 的 baseline：`{value:{projections:<key>:{asOfSeq,values}}}`。
+        // 从前给 `{}` 是「先把连接喂活」的最小形状，而**模型选择器读的是这里的
+        // `modelSelection`**（客户端的 `ModelDirectory.syncInputs`：
+        // `projected.next ?? catalog.default`）—— 空对象时它停在 `catalog.default`，
+        // 于是「选了模型但触发器不更新」。键的真值源只有一处（`dwhm_projection_json`）。
+        // ⚠ `dwhm_projection_json` / `dwhm_current_json` 都是**先 reset 出参**的
+        // （它们是「产出一个值」的函数）—— 直接把前缀写进同一个缓冲的话，那一下
+        // reset 就把前缀抹掉了。实测症状：帧变成 `"type":"baseline",{…`（非法 JSON，
+        // 客户端拒帧、整条控制流不折）。所以**先渲染成独立的一份再拼**。
+        var pv: Buf = buf_new(512);
+        defer { buf_free(&pv); }
+        if !dwhm_projection_json(&h.model, &pv) {
+            return;
+        }
+        var ctl: Buf = buf_new(pv.len + 128);
+        defer { buf_free(&ctl); }
+        // 行宽豁免：不可断的 JSON 骨架
+        if !buf_append_cstr(&ctl, "\"value\":{\"projections\":{\"modelSelection\":{\"asOfSeq\":0,\"values\":") {
+            return;
+        }
+        if !buf_append(&ctl, pv.ptr as &const byte, pv.len) {
+            return;
+        }
+        if !buf_append_cstr(&ctl, "}}}") {
+            return;
+        }
+        dwh_remote_item(fd, sid, "baseline" as &const byte,
+            ctl.ptr as &const byte, ctl.len, &h.events);
         return;
     }
     // `session/follow`：**这是消息能渲染出来的那条流**。
@@ -2820,7 +3570,12 @@ fn dwh_remote_open(h: &const DwhHost, ci: usize, sid: &const Buf,
     // 与 `/api/session/history` 用的是同一份译文 —— 所以这里**不需要新的翻译**。
     if bufx_eq_cstr(ep.ptr as &const byte, ep.len,
         "session/follow" as &const byte) {
+        buf_reset(&h.f_sid);
+        _ = buf_append(&h.f_sid, sid.ptr as &const byte, sid.len);
+        // 快照就是「到此刻为止的全部译文」⇒ 水位直接推到末尾：下面再推增量时
+        // 不会把快照里已经给过的行重发（重发会被 fold 当成同一个 id 的重复事件）。
         dwh_send_snapshot(fd, sid, h, &h.events);
+        h.pushed = h.events.len;
         return;
     }
     // 其余流：一条退化的 baseline（客户端据此认为「这条流没有数据」而不是挂住）
@@ -2981,9 +3736,14 @@ fn dwh_pick_str(text: &const Buf, key: &const byte, out: &Buf) bool {
 // 而症状是「页面空着 + 一条看不懂的 TypeError」。
 fn dwh_send_snapshot(fd: i32, sid: &const Buf, h: &const DwhHost,
                      events: &const Buf) void {
+    var proj: Buf = buf_new(512);
+    defer { buf_free(&proj); }
+    if !dwhm_projection_json(&h.model, &proj) {
+        return;
+    }
     var p: Buf = buf_new(events.len + 4096);
     defer { buf_free(&p); }
-    if !dwh_snapshot_frame(sid, events, &p) {
+    if !dwh_snapshot_frame(sid, events, &proj, &p) {
         return;
     }
     _ = dwh_ws_send_text(fd, p.ptr as &const byte, p.len);
@@ -2995,8 +3755,12 @@ fn dwh_send_snapshot(fd: i32, sid: &const Buf, h: &const DwhHost,
 // **静默的**（客户端拒帧后页面只是空着或红一行「加载会话历史失败」）。所以它
 // 必须能被自测**当数据**验（`st_web` 的 `snapshot` 段拿本仓的 JSON 解析器解它，
 // 见那一轮的不变量③：结构坏掉要由**外部 oracle** 判，子串断言抓不住）。
+// `model` = 已经渲染好的 `modelSelection` 投影值（`{lastUsed,next}`）。
+// **做成形参而不是在这里现算**：这一帧要能被自测当纯函数验（`web-snapshot` 轮），
+// 而现算就要把宿主（目录、当前选择）拖进来 —— 那一轮只需验 JSON 结构。
+// 调用方用 `dwhm_projection_json`（活会话）或一个中性值（自测）。
 export fn dwh_snapshot_frame(sid: &const Buf, events: &const Buf,
-    p: &Buf) bool {
+    model: &const Buf, p: &Buf) bool {
     buf_reset(p);
     if !buf_append_cstr(p, "{\"type\":\"item\",\"streamId\":\"") {
         return false;
@@ -3079,7 +3843,7 @@ export fn dwh_snapshot_frame(sid: &const Buf, events: &const Buf,
     if !buf_append_cstr(p, "\"projections\":{\"asOfSeq\":0,\"values\":") {
         return false;
     }
-    if !dwh_projection_values(p) {
+    if !dwh_projection_values(model, p) {
         return false;
     }
     if !buf_append_byte(p, 125) {
@@ -3128,7 +3892,11 @@ fn dwh_records_all(events: &const Buf, has_seed: bool, tail: u64,
     // 传「**没插** seed」：插了 seed 才占用 0..3，那时才需要把译文后移。
     // （此前传的是 `has_seed`，正好反了 —— 实测症状：喂真夹具时 cursor=21
     //   而末条 seq=25，客户端报 `did not end at its requested cursor`。）
-    if !dwh_records(events, p, !has_seed, &first) {
+    var sh: u64 = DWH_SEED_SEQS;
+    if has_seed {
+        sh = 0;
+    }
+    if !dwh_records(events, p, sh, &first) {
         return false;
     }
     // 收口标记：`session/end-seed` 放在**译文之后**（理由见 `DWH_SEED_SEQS`）。
@@ -3153,7 +3921,8 @@ fn dwh_records_all(events: &const Buf, has_seed: bool, tail: u64,
 
 // `records[]`：把译文每一行包成 `{"type":"event","event":<那条>}`（逗号分隔）。
 // `first` 由调用方带进来（上面那段 seed 可能已经写过东西了）。
-fn dwh_records(events: &const Buf, out: &Buf, shifted: bool,
+// `sh` = seq 位移量（0 = 不位移，见 `dwh_shift_seq`）。
+fn dwh_records(events: &const Buf, out: &Buf, sh: u64,
     first: &bool) bool {
     var start: usize = 0;
     var i: usize = 0;
@@ -3168,7 +3937,7 @@ fn dwh_records(events: &const Buf, out: &Buf, shifted: bool,
                 if !buf_append_cstr(out, "{\"type\":\"event\",\"event\":") {
                     return false;
                 }
-                // ⚠ 译文的 `seq` 要**整体后移** `DWH_SEED_SEQS`（seed 占了 0..3）：
+                // ⚠ 译文的 `seq` 要**整体后移**（seed 占了 0..2）：
                 // 两段都用 0 起头时客户端的连续性检查当场判
                 // `page contains discontinuous entries`（实测）。
                 // `assistant/message` 要**补一个 `data.stream`**（chunk 级回放）——
@@ -3178,11 +3947,11 @@ fn dwh_records(events: &const Buf, out: &Buf, shifted: bool,
                 // `stream`（7 条 chunk）与 `usage`。补上就渲染出来了（实测）。
                 if dwh_is_assistant_msg(&events.ptr[start], seg) {
                     // 行宽豁免：不可断的调用
-                    if !dwh_assistant_with_stream(&events.ptr[start], seg, shifted, out) {
+                    if !dwh_assistant_with_stream(&events.ptr[start], seg, sh, out) {
                         return false;
                     }
-                } else if shifted {
-                    if !dwh_shift_seq(&events.ptr[start], seg, out) {
+                } else if sh > 0 {
+                    if !dwh_shift_seq(&events.ptr[start], seg, sh, out) {
                         return false;
                     }
                 } else {
@@ -3288,9 +4057,14 @@ fn dwh_seed_records(out: &Buf, first: &bool) bool {
 }
 
 
-// 把一条译文的 `"seq":N` 改写成 `"seq":N+DWH_SEED_SEQS` 后写进 `out`（其余字节原样）。
+// 把一条译文的 `"seq":N` 改写成 `"seq":N+sh` 后写进 `out`（其余字节原样）。
 // 找不到 `"seq":` 就原样拷过去（不认识的形状不要拦）。
-fn dwh_shift_seq(line: &const byte, n: usize, out: &Buf) bool {
+//
+// `sh`（位移量）是**形参**而不是常量：快照里译文的位移是 `DWH_SEED_SEQS`（开头三条
+// seed 占 0..2），而 `/api` 活事件流的位移是 `DWH_SEED_SEQS + 1`（快照末尾还压着一条
+// `session/end-seed`）—— 两处口径不同，写死一个常量就等于让另一处错位，而错位的症状
+// 是客户端判 `discontinuous entries` 并**整条断流**（见 `DWH_LIVE_SHIFT`）。
+fn dwh_shift_seq(line: &const byte, n: usize, sh: u64, out: &Buf) bool {
     const pat: &const byte = "\"seq\":" as &const byte;
     const pl: usize = bufx_cstr_len(pat);
     const at: isize = srv_find(line, 0, n, pat, pl);
@@ -3319,7 +4093,7 @@ fn dwh_shift_seq(line: &const byte, n: usize, out: &Buf) bool {
         v = v * 10 + ((line[i] as u64) - 48);
         i = i + 1;
     }
-    if !buf_append_u64(out, v + DWH_SEED_SEQS) {
+    if !buf_append_u64(out, v + sh) {
         return false;
     }
     return buf_append(out, &line[e], n - e);
@@ -3330,7 +4104,8 @@ fn dwh_shift_seq(line: &const byte, n: usize, out: &Buf) bool {
 // snapshot 得出）。值用中性值 —— 本仓没有真值的那些给 null / 0 / [] / {}，
 // 但**键必须齐**：客户端在 fold 里按名字读它们，缺键会让某个 slot 抛
 // `Cannot read properties of undefined`（那类症状离原因很远）。
-fn dwh_projection_values(out: &Buf) bool {
+// `model` = 已经渲染好的 `modelSelection` 值（见 `dwh_snapshot_frame`）。
+fn dwh_projection_values(model: &const Buf, out: &Buf) bool {
     if !buf_append_cstr(out, "{\"title\":\"本仓会话\",\"goal\":null,") {
         return false;
     }
@@ -3389,7 +4164,15 @@ fn dwh_projection_values(out: &Buf) bool {
         return false;
     }
     // 行宽豁免：不可断的 JSON 字面量
-    if !buf_append_cstr(out, "\"modelSelection\":{\"lastUsed\":null,\"next\":null},") {
+    // `modelSelection` 与 `session/control` 的 baseline **同源**（同一个组装函数）——
+    // 两处不一致时选择器会在「打开会话」与「切会话」之间跳回默认值。
+    if !buf_append_cstr(out, "\"modelSelection\":") {
+        return false;
+    }
+    if !buf_append(out, model.ptr as &const byte, model.len) {
+        return false;
+    }
+    if !buf_append_byte(out, 44) {
         return false;
     }
     if !buf_append_cstr(out, "\"sessionListMetadata\":{},\"imageLimits\":{}}") {
@@ -3422,8 +4205,9 @@ fn dwh_has_frag_b(p: &const byte, n: usize, frag: &const byte) bool {
 //   → `block-end`（带整块）→ … → 最后一条 `finish`。
 // 我们从译文自己的 `data.message.content`（块数组）造 —— **不需要新信息**，
 // 只是把已经有的块表达成客户端折消息时要的 chunk 序列。
-// `shifted` 为真时同样把 `"seq":N` 后移（与其它记录口径一致）。
-fn dwh_assistant_with_stream(line: &const byte, n: usize, shifted: bool,
+// `sh` = seq 位移量（0 = 不位移）：这条消息的 `"seq":N` 要写成 `N+sh`。
+// 与 `dwh_records` 的 `sh` 是**同一个值**（快照 / 活事件流两处口径不同，见 `dwh_shift_seq`）。
+fn dwh_assistant_with_stream(line: &const byte, n: usize, sh: u64,
                             out: &Buf) bool {
     // 先取出 `message.content`（用 jsonx 解析：这里要按块数组逐块走）
     var arena: Arena = Arena{ buffer: null, size: 0, used: 0 };
@@ -3440,8 +4224,8 @@ fn dwh_assistant_with_stream(line: &const byte, n: usize, shifted: bool,
         !js_obj_get(&d, "message" as &const byte, 7, &msg) ||
         !js_obj_get(&msg, "content" as &const byte, 7, &cont) {
         // 没有块数组：原样写
-        if shifted {
-            return dwh_shift_seq(line, n, out);
+        if sh > 0 {
+            return dwh_shift_seq(line, n, sh, out);
         }
         return buf_append(out, line, n);
     }
@@ -3449,8 +4233,8 @@ fn dwh_assistant_with_stream(line: &const byte, n: usize, shifted: bool,
     // 简法：整行重写 = 前半（到 `"data":{` 为止）+ `"stream":[…],` + 后半去掉首 `{`
     const at: isize = srv_find(line, 0, n, "\"data\"" as &const byte, 6);
     if at < 0 {
-        if shifted {
-            return dwh_shift_seq(line, n, out);
+        if sh > 0 {
+            return dwh_shift_seq(line, n, sh, out);
         }
         return buf_append(out, line, n);
     }
@@ -3460,8 +4244,8 @@ fn dwh_assistant_with_stream(line: &const byte, n: usize, shifted: bool,
         i = i + 1;
     }
     if i >= n {
-        if shifted {
-            return dwh_shift_seq(line, n, out);
+        if sh > 0 {
+            return dwh_shift_seq(line, n, sh, out);
         }
         return buf_append(out, line, n);
     }
@@ -3469,9 +4253,9 @@ fn dwh_assistant_with_stream(line: &const byte, n: usize, shifted: bool,
     // 首个 `{` 之前含 `"type"` 与 `"seq"`，所以那段要过一遍位移；`"data":{`
     // 本身是纯文本，直接补。
     const cut: usize = i + 1;                      // `{` 之后
-    if shifted {
+    if sh > 0 {
         // `"seq":N` 在 `{` 之前 ⇒ 把前缀（含 `{`）过位移
-        if !dwh_shift_seq(&line[0], cut, out) {
+        if !dwh_shift_seq(&line[0], cut, sh, out) {
             return false;
         }
     } else {
