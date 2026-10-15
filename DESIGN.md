@@ -6139,6 +6139,34 @@ QTermWidget）对 `ESC[?5522$p`（DECRQM）**零应答**，OSC 52 写 `c`/`p` �
     要按**客户端的视图 schema**（`{currentValue}`）而不是按「这里大概是个对象」——
     `{}` 不是「空值」，它是「一个所有键都 undefined 的值」。
 
+152. **「出参先 `buf_new`」这个老习惯在 `pm_fact_decode` 里 ⇒ 记忆攒得越多、空闲 agent 的
+    RSS 越大**（用户报的「内存进来就 56M」）：
+    现场：一个刚起、**一步都没走**的 agent 报 57 MB；而 `--no-memory`、空 agent home、
+    别的 cwd 全是 10 MB —— 数字完全跟着**本仓的记忆分片**走，与 `pm-memory` 那段注入
+    文本的大小无关（预算 3072 B 固定）。
+    逐层二分（同一份真机记忆目录，`--no-save` 直接 EOF 退出）：全目录 57 MB →
+    只留小分片 31 MB → 只留一个 502 KB 分片 15 MB → 空 11 MB；把行数按
+    1000/2000/4000/8000 铺开是 11/19/35/62 MB，**线性于行数**（≈4096 B/行）；
+    把 `value` 写长写短都不影响 ⇒ 是**每条一次固定开销**，不是数据本身。
+    根因：`pm_fact_decode` 的三个出参写成了 `var key: Buf = buf_new(PM_KEY_MAX)` 这种形状
+    （key 256 + value 2048 + src 256），而 `js_obj_get_str_unescaped` 内部走
+    `sv_unescape_to_buf` —— 那是 `out[0] = buf_new(s.len + 8)`，**直接覆盖出参指针**，
+    原来那三块永不 free。每解析一行泄漏 2560 B，加上堆头与 16 B 对齐正好对上 4096 B/行。
+    踩坑 92 的「孪生一条」当时只改了 `ag_request_stream` 那一处，`pm_store` 这处漏了 ——
+    同一个 API 的同一个语义坑踩了第二次，而且这次的量级是**静态**的：
+    一次载入 6931 行 = 17 MB 净漏，随分片累积单调变大。
+    修法：三处初值改 `buf_empty()`（既有的 `defer { buf_free(...) }` 不用动）。
+    判据（实测，`--no-save` + stdin EOF 采 `/proc/<pid>/statm` 峰值）：
+    修前 57～62 MB → 修后 **4～5 MB**，同一份输入重复跑一致；
+    语义侧由 `make pm-selftest` 的 `pm-roundtrip` 覆盖（它照样走 decode 路径）。
+    **内存量级本身没有自测**，量它的办法就是这条：拿真机 `~/.uya-agent/memory/<key>/obs/`
+    当输入，两版二进制各采一次峰值。
+    教训：**「出参给一个已分配的 Buf」在 Uya 里不是优化，是 bug** —— 只要被调用方以
+    `out[0] = buf_new(...)` 开头，那句预分配就是纯泄漏。仓里正确形状一律是
+    `buf_empty()` + `defer { buf_free(&…) }`（`buf_reserve` 的「按需扩容」语义与这种
+    「整体替换」语义不是一回事，别混）。自查：
+    `grep -rn -B2 'js_obj_get_str_unescaped' src | grep 'buf_new('` —— 现在应该 0 命中。
+
 ---
 
 ## 17. 工具实现要点
