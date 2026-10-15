@@ -1,23 +1,31 @@
 // src/agent/todo.uya — todo_write（P8，对齐 DSH tool-todo）
 //
 // 本文件：清单项与状态的零值/生命周期（`td_item_empty`/`todo_init`/`todo_free`）、
-//   工具入口 `todo_tool_write`（校验 + 整表替换 + 回显）、空白处理 `td_trim`、
-//   状态串映射 `td_status_of`。
+//   工具入口 `todo_tool_write`（校验 + 整表替换 + 回显）、**落盘**（`todo_log_write`）
+//   与**折回**（`todo_from_json`）、空白处理 `td_trim`、状态串映射 `td_status_of`。
 // 不变量：① **整表替换** —— 每次调用提交完整列表，不做增量合并；
 //   ② **先全量校验再落状态**（content 去空白后非空、列表内不重复、status 合法、条数 ≤ 32）——
 //   否则会出现「一半校验过一半没过」的半更新；③ 上限 `TODO_MAX = 32`；
 //   ④ 清单**不再注入回上下文**（与 DSH 一致：那是 UI/replay 状态，不是第二条模型消息）；
 //   ⑤ 清空时机有两个：**回合开始时**（`todo_clear`，DSH 口径）与**换会话时**
-//   （agent 的 `agent_session_scoped_reset`）。
-// 依赖：无 `use` 行；依赖 foundation/bufx（Buf / bufx_mem_eq）、foundation/jsonx
-//   （JsonValue / JsonStrView / js_obj_get / js_arr_len）。
+//   （agent 的 `agent_session_scoped_reset`）；
+//   ⑥ **提交成功的整表落一条 `todo/write` 事件**（后写覆盖先写），恢复会话时由
+//   `agent_hist_from_log` 折回最后一次 —— 修前清单只在内存里，`--resume` 之后恒为空。
+// 依赖：无 `use` 行；依赖 libc.heap（malloc/free，同 goal.uya 的手法）、
+//   foundation/bufx（Buf / bufx_mem_eq）、foundation/jsonx
+//   （Arena / arena_init / JsonValue / JsonStrView / js_parse / js_obj_get /
+//   js_obj_get_str / js_arr_len / js_arr_get）。
 // 命名：`td_*`（清单项与校验）、`todo_*`（集合与工具入口）、`TodoItem`/`TodoState`、
 //   `TD_PENDING`/`TD_INPROGRESS`/`TD_COMPLETED`。
 //
 // 整表替换语义：每次调用都提交**完整**列表；回显
 // `Updated todo list: N pending, N in progress, N completed.`
 // 校验：content 去空白后非空、列表内不重复；status 只能是三个枚举值。
-// 列表**不会**再注入回上下文（与 DSH 一致：那是 UI/replay 状态，不是第二条模型消息）。
+// 列表**不会**再注入回上下文（与 DSH 一致：那是 UI/replay 状态，不是第二条模型消息）；
+// 它落进**会话日志**（`todo/write`，与 DSH 的
+// `exec.agent.session.append("todo/write", { todos })` 逐字段同形），恢复时折最后一次、
+// 下一个 `turn/start` 清空 —— 与 DSH 的投影
+// （`apply: todo/write → event.data.todos / turn/start → null`）同序。
 
 const TODO_MAX: usize = 32;
 const TODO_CONTENT_MAX: usize = 4096;
@@ -101,7 +109,152 @@ fn td_status_of(v: &const JsonStrView, out: &u8) bool {
     return false;
 }
 
-// `todo_write` 工具：**整表替换**语义（每次提交完整列表）。
+// 把**当前**清单写一条 `todo/write` 会话事件（`g_sess.save` 为假时什么都不写）。
+//
+// 为什么要落盘：清单原来只活在内存里（`g_todos`），`--resume` 之后恒为空 —— 用户看到
+// 的就是「恢复会话后任务清单没了」。落一条事件之后，恢复那条路（`agent_hist_from_log`）
+// 折最后一次就是当时的清单；下一个 `turn/start` 再清空。形状与 DSH 的
+// `exec.agent.session.append("todo/write", { todos })` 逐字段同形（`data.todos` 是数组）。
+//
+// 调用点只有 `todo_tool_write` 的提交分支一处 —— 「日志与实际派发必须一致」这条纪律
+// （见 §5.4.1）要求它**只**记真正落进状态的那一版：被校验拒掉的提交一个字节都不许进日志。
+export fn todo_log_write(s: &const TodoState) void {
+    var ev: Buf = buf_new(256);
+    defer { buf_free(&ev); }
+    if !sess_begin(&g_sess, "todo/write", &ev) {
+        return;
+    }
+    _ = buf_append_cstr(&ev, "{\"todos\":[");
+    var i: usize = 0;
+    while i < s.n {
+        if i > 0 {
+            _ = buf_append_byte(&ev, 44);
+        }
+        _ = buf_append_cstr(&ev, "{\"content\":");
+        _ = jw_str_into(&ev, s.items[i].content.ptr as &const byte,
+                        s.items[i].content.len);
+        // status 是**我们自己**的三个字面量之一（内容由 `td_status_of` 保证），
+        // 不含需要转义的字节 —— 直接写引号 + 名字，不走 jw_str_into（那要传长度，
+        // 而三个名字不等长：pending 7 / in_progress 11 / completed 9，写错会读越界）。
+        _ = buf_append_cstr(&ev, ",\"status\":\"");
+        _ = buf_append_cstr(&ev, td_status_name(s.items[i].status));
+        _ = buf_append_cstr(&ev, "\"}");
+        i = i + 1;
+    }
+    _ = buf_append_cstr(&ev, "]}");
+    _ = sess_end(&g_sess, &ev);
+}
+
+// status 枚举 → 线缆上的字面量（DSH 投影 schema 的三个枚举值）。
+fn td_status_name(st: u8) &const byte {
+    if st == TD_INPROGRESS {
+        return "in_progress" as &const byte;
+    }
+    if st == TD_COMPLETED {
+        return "completed" as &const byte;
+    }
+    return "pending" as &const byte;
+}
+
+// 折一条 `todo/write` 事件的 `data.todos` 数组回状态（`p` 是**整行**事件文本）。
+//
+// **全或无**：任何一条不合法（content 去空白后为空、status 不是三值之一、条数超上限、
+// 结构不是数组）就一个字节都不改，返回 false。理由与 `todo_tool_write` 的「先全量校验
+// 再落状态」同一条：半截清单比没有清单更难查（屏幕上会挂着一份不存在的计划）。
+//
+// ⚠ 数组在 **`data` 里面**（信封是 `{type, seq, time, data:{todos:[…]}}`）——
+// 少了往里钻一层就恒返回 false，而那表现为「清单照样恢复不出来」，与没写这条事件
+// 一模一样（实测踩到过：第一版只取顶层 `todos`，恢复后清单仍为空）。
+//
+// 不做去重校验：日志里的那一份是**我们自己**写下去的（写之前已经查过重复），
+// 而这里再查一遍只会让「手改过的日志」整条被丢掉 —— 少显示一条胜过整块消失。
+export fn todo_from_json(s: &TodoState, p: &const byte, n: usize) bool {
+    var arena_raw: &void = malloc(65536);
+    defer { free(arena_raw); }
+    if ((arena_raw as &byte) as usize) == 0 {
+        return false;
+    }
+    var arena: Arena = Arena{ buffer: null, size: 0, used: 0 };
+    arena_init(&arena, arena_raw as &byte, 65536);
+    var root: JsonValue = JsonValue.json_null();
+    if !js_parse(&arena, p, n, &root) {
+        return false;
+    }
+    var data: JsonValue = JsonValue.json_null();
+    if !js_obj_get(&root, "data", 4, &data) {
+        return false;
+    }
+    var arr: JsonValue = JsonValue.json_null();
+    if !js_obj_get(&data, "todos", 5, &arr) {
+        return false;
+    }
+    const cnt: usize = js_arr_len(&arr);
+    if cnt > TODO_MAX {
+        return false;
+    }
+    // 先全量校验到一份暂存里，全过了才动 s（与工具入口同一条纪律）
+    var staged: [Buf: TODO_MAX] = [buf_empty(): TODO_MAX];
+    var statuses: [u8: TODO_MAX] = [0: TODO_MAX];
+    var keep: usize = 0;
+    var ok: bool = true;
+    var i: usize = 0;
+    while i < cnt && ok {
+        var item: JsonValue = JsonValue.json_null();
+        if !js_arr_get(&arr, i, &item) {
+            ok = false;
+            break;
+        }
+        var cv: JsonStrView = JsonStrView{ ptr: null, len: 0 };
+        if !js_obj_get_str(&item, "content", 7, &cv) {
+            ok = false;
+            break;
+        }
+        var a: usize = 0;
+        var l: usize = 0;
+        td_trim(cv.ptr as &const byte, cv.len, &a, &l);
+        if l == 0 {
+            ok = false;
+            break;
+        }
+        var sv: JsonStrView = JsonStrView{ ptr: null, len: 0 };
+        var st: u8 = 0;
+        if !js_obj_get_str(&item, "status", 6, &sv) || !td_status_of(&sv, &st) {
+            ok = false;
+            break;
+        }
+        staged[keep] = buf_new(l + 8);
+        if !buf_valid(&staged[keep]) {
+            ok = false;
+            break;
+        }
+        if !sv_unescape(&cv, &staged[keep]) {
+            // 反转义失败退回原始视图（与 goal_set_unescaped 同一条：宁可显示得难看，
+            // 也不静默丢内容）
+            buf_reset(&staged[keep]);
+            _ = buf_append(&staged[keep], cv.ptr as &const byte, cv.len);
+        }
+        statuses[keep] = st;
+        keep = keep + 1;
+        i = i + 1;
+    }
+    if !ok {
+        var j: usize = 0;
+        while j < keep {
+            buf_free(&staged[j]);
+            j = j + 1;
+        }
+        return false;
+    }
+    todo_free(s);
+    var m: usize = 0;
+    while m < keep {
+        s.items[m].content = staged[m];
+        s.items[m].status = statuses[m];
+        m = m + 1;
+    }
+    s.n = keep;
+    return true;
+}
 // 先**全量**校验（content 去空白后非空、列表内不重复、status 合法、条数 ≤ TODO_MAX）
 // 再落状态 —— 不这么做会出现「一半校验过一半没过」的半更新。
 // 结果文本回显 `Updated todo list: N pending, N in progress, N completed.`。
@@ -201,6 +354,9 @@ export fn todo_tool_write(s: &TodoState, args: &const JsonValue, out: &Buf) void
         }
         m = m + 1;
     }
+    // 落一条 `todo/write`：**只有走到这一行的提交**才会进日志（被上面任何一档拒掉的
+    // 提交一个字节都不写）。恢复会话时折最后一次 —— 见 `todo_log_write` 的注释。
+    todo_log_write(s);
     var np: usize = 0;
     var ni: usize = 0;
     var nc: usize = 0;
