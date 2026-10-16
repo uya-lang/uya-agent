@@ -137,7 +137,7 @@ export UYA_ROOT
 export UYA_SPLIT_C_DIR := $(CURDIR)/build/uyacache
 
 # 行宽豁免：一条 .PHONY 就是一张全仓目标清单，拆行反而看不清哪条丢了
-.PHONY: all check wire-schema wire-probe wire-probe-real dsh-web-check print-src print-cflags build link-audit selftest codegen-audit doc-audit lint-size lint-size-all doc-cover ui-audit probe e2e e2e-config e2e-exec e2e-accept-nudge e2e-retry e2e-config-flags e2e-title e2e-title-cmd e2e-title-auto e2e-mouse e2e-api e2e-steps e2e-permission e2e-sandbox e2e-tasks e2e-tasks-resume e2e-goal e2e-memory e2e-memory-live e2e-sessions e2e-resume-big e2e-diff e2e-ws e2e-model e2e-model-save e2e-model-route e2e-ctxwindow e2e-inputimage e2e-worktree e2e-watch e2e-watch-pick e2e-dsh e2e-portable e2e-dns p30-check tui-demo tui-selftest web-selftest sess-selftest diff-selftest model-selftest panel-selftest clean shell-selftest pm-selftest mcp-selftest
+.PHONY: all check wire-schema wire-probe wire-probe-real dsh-web-check dsh-settings-check print-src print-cflags build link-audit selftest codegen-audit doc-audit lint-size lint-size-all doc-cover ui-audit probe e2e e2e-config e2e-exec e2e-accept-nudge e2e-retry e2e-config-flags e2e-title e2e-title-cmd e2e-title-auto e2e-mouse e2e-api e2e-steps e2e-permission e2e-sandbox e2e-tasks e2e-tasks-resume e2e-goal e2e-memory e2e-memory-live e2e-sessions e2e-resume-big e2e-diff e2e-ws e2e-model e2e-model-save e2e-model-route e2e-provider e2e-ctxwindow e2e-inputimage e2e-worktree e2e-watch e2e-watch-pick e2e-dsh e2e-portable e2e-dns p30-check tui-demo tui-selftest web-selftest sess-selftest diff-selftest model-selftest panel-selftest clean shell-selftest pm-selftest mcp-selftest
 
 all: build
 
@@ -296,7 +296,7 @@ lint-size-all:
 #   本仓实测：90 文件树上净增 50 个函数 + `rm -rf build && make build` → 通过（静态链接审计通过）。
 #   因此「净增函数按 0 处理」那条纪律作废。这段留下的用处只有一个：**换/降编译器时认得出症状**
 #   （报错点落在标准库、`make check` 全绿、只有清缓存重编才炸）。
-selftest: build codegen-audit doc-audit doc-cover ui-audit e2e-exec e2e-accept-nudge e2e-retry e2e-config-flags e2e-title e2e-title-cmd e2e-title-auto e2e-mouse e2e-api e2e-steps e2e-permission e2e-sandbox e2e-tasks e2e-tasks-resume e2e-goal e2e-memory e2e-memory-live e2e-sessions e2e-resume-big e2e-diff e2e-ws e2e-model e2e-model-save e2e-model-route e2e-ctxwindow e2e-inputimage e2e-worktree e2e-portable e2e-dns p30-check
+selftest: build codegen-audit doc-audit doc-cover ui-audit e2e-exec e2e-accept-nudge e2e-retry e2e-config-flags e2e-title e2e-title-cmd e2e-title-auto e2e-mouse e2e-api e2e-steps e2e-permission e2e-sandbox e2e-tasks e2e-tasks-resume e2e-goal e2e-memory e2e-memory-live e2e-sessions e2e-resume-big e2e-diff e2e-ws e2e-model e2e-model-save e2e-model-route e2e-provider e2e-ctxwindow e2e-inputimage e2e-worktree e2e-portable e2e-dns p30-check
 	UYA_BIN=$(UYA) $(OUT) --selftest
 
 probe: build
@@ -668,6 +668,75 @@ e2e-model: build
 	grep -q "provider: beta" $$home/settings.yaml || { echo "FAIL: 文本命令 /model beta/a-think 没有写回 settings.yaml"; cat $$home/settings.yaml; exit 1; }; \
 	grep -q "model: a-think" $$home/settings.yaml || { echo "FAIL: 写回设置时 model 不对"; cat $$home/settings.yaml; exit 1; }; \
 	echo "e2e-model: 通过（目录/能力跟随/目录外只换名字/REPL 报告与切换/非法档位拒/透传标注/同名跨提供方指定与提示/--provider 顺序无关/人敲的 /model 写回设置）"
+
+# P90：**提供方键的 env 档**（`UYA_AGENT_PROVIDER`；离线，真二进制 + 真 settings.yaml）
+#   现场：容器 / CI / `--dsh-web` 的对话子进程都只有环境这一条入口，而「换一家提供方跑」
+#   以前只能靠命令行，或者改 settings.yaml 里的 `agent-default-model.provider` ——
+#   后者顺带改掉的是**用户自己的**默认路线。判据：
+#     ① env 压过 settings.yaml，且**路线跟着走**（端点 / `apiKeyEnv` 解出来的密钥 /
+#        线协议一起换）；
+#     ② cli 压过 env（`--provider`）；
+#     ③ 显式优先：env 钉住的提供方不会被 `--model <别家的名字>` 跨提供方回退换掉；
+#     ④ env 给全两个（provider + model）时按**二元组**定稿（窗口来自那一条目录条目）；
+#     ⑤ 凭据不跨提供方（新提供方解析不出凭据 ⇒ 清空 key + 一行告警）、没声明 `baseURL`
+#        的提供方**不动端点**（两件事都不许猜）；
+#     ⑥ 反腿：没给 env ⇒ 一切照旧是 dsh-settings；
+#     ⑦ 与 `--provider P` **同口径**：同一份设置、两条路，除来源标签外逐字节相同；
+#     ⑧ `--resume` 仍跟随会话记录（env 给的是**默认路线**，不是把这一次恢复钉死）。
+#   ⚠ 一律 `env -i` 起（宿主导出的 `UYA_AGENT_*` 会把这几条判据搅在一起，同 e2e-ctxwindow）。
+e2e-provider: build
+	@set -e; \
+	home=build/selftest_p90_e2e; rm -rf $$home; mkdir -p $$home; \
+	printf 'llm-pi-ai:\n  providers:\n    {\n      alpha:\n        {\n          api: openai-responses,\n          baseURL: https://alpha.example/v1,\n          apiKeyEnv: ALPHA_KEY,\n          models:\n            [\n              { id: a-plain, contextWindow: 111000 }\n            ]\n        },\n      beta:\n        {\n          api: openai-completions,\n          baseURL: https://beta.example/v1,\n          apiKeyEnv: BETA_KEY,\n          models:\n            [\n              { id: a-think, contextWindow: 444000, reasoningEfforts: { off: none, low: low } }\n            ]\n        },\n      gamma:\n        {\n          api: openai-completions,\n          models:\n            [\n              { id: g-one }\n            ]\n        }\n    }\nagent-default-model:\n  provider: alpha\n  model: a-plain\n' > $$home/settings.yaml; \
+	bin=$(CURDIR)/$(OUT); \
+	cfg="--dsh-home $$home --agent-home $$home/agent --no-dsh-writeback"; \
+	: "e = 「干净环境 + 两个假凭据」的包装：所有腿都从它走，别的变量一个都不许漏进来"; \
+	e() { env -i PATH=/usr/bin:/bin HOME=$$HOME ALPHA_KEY=alpha-key-1234 BETA_KEY=beta-key-5678 "$$@"; }; \
+	: "⑥ 反腿：没给 env ⇒ provider / 端点 / 凭据还是设置里那一条"; \
+	out=$$(e $$bin $$cfg --print-config 2>&1); \
+	echo "$$out" | grep -q "^provider = alpha  (source: dsh-settings)" || { echo "FAIL: 没给 env 时 provider 应当还是设置里的 alpha"; echo "$$out" | head -12; exit 1; }; \
+	echo "$$out" | grep -q "^api_key = alp…1234  (source: dsh-settings)" || { echo "FAIL: 没给 env 时密钥应当来自设置里的 ALPHA_KEY"; echo "$$out" | head -12; exit 1; }; \
+	: "① env 压过设置，且路线（端点 / 凭据 / 协议）跟着这家走"; \
+	out=$$(e UYA_AGENT_PROVIDER=beta $$bin $$cfg --print-config 2>&1); \
+	echo "$$out" | grep -q "^provider = beta  (source: env)" || { echo "FAIL: UYA_AGENT_PROVIDER=beta 没生效"; echo "$$out" | head -12; exit 1; }; \
+	echo "$$out" | grep -q "^base_url = https://beta.example/v1" || { echo "FAIL: 端点没跟着 env 给的提供方走（请求会打在 alpha 上）"; echo "$$out" | head -12; exit 1; }; \
+	echo "$$out" | grep -q "^api_key = bet…5678" || { echo "FAIL: 凭据没跟着 env 给的提供方走"; echo "$$out" | head -12; exit 1; }; \
+	echo "$$out" | grep -q "^api = openai-completions" || { echo "FAIL: 线协议没跟着 env 给的提供方走"; echo "$$out" | head -12; exit 1; }; \
+	: "② cli 压过 env"; \
+	out=$$(e UYA_AGENT_PROVIDER=beta $$bin $$cfg --provider alpha --print-config 2>&1); \
+	echo "$$out" | grep -q "^provider = alpha  (source: cli)" || { echo "FAIL: --provider alpha 没压过 env 里的 beta"; echo "$$out" | head -12; exit 1; }; \
+	echo "$$out" | grep -q "^base_url = https://alpha.example/v1" || { echo "FAIL: cli 压过 env 之后端点没跟着回 alpha"; exit 1; }; \
+	echo "$$out" | grep -q "^api_key = alp…1234" || { echo "FAIL: cli 压过 env 之后凭据没跟着回 alpha"; exit 1; }; \
+	: "③ 显式优先：env 钉住的 beta 不许被 --model 跨提供方回退换掉（a-plain 只在 alpha 下）"; \
+	out=$$(e UYA_AGENT_PROVIDER=beta $$bin $$cfg --model a-plain --print-config 2>&1); \
+	echo "$$out" | grep -q "^provider = beta  (source: env)" || { echo "FAIL: env 给的提供方被 --model 的跨提供方回退改掉了"; echo "$$out" | head -12; exit 1; }; \
+	echo "$$out" | grep -q "^model = a-plain" || { echo "FAIL: --model a-plain 的模型名不对"; exit 1; }; \
+	echo "$$out" | grep -q "^base_url = https://beta.example/v1" || { echo "FAIL: 回退发生之后端点也跟着跑了"; exit 1; }; \
+	: "④ env 给全两个 ⇒ 按二元组定稿（窗口来自 beta 下那一条）"; \
+	out=$$(e UYA_AGENT_PROVIDER=beta UYA_AGENT_MODEL=a-think $$bin $$cfg --print-config 2>&1); \
+	echo "$$out" | grep -q "^model = a-think  (source: env)" || { echo "FAIL: UYA_AGENT_MODEL 没生效（或来源没印成 env）"; echo "$$out" | head -12; exit 1; }; \
+	echo "$$out" | grep -q "^context_window = 444000  (source: dsh-settings)" || { echo "FAIL: 窗口没有按 (provider, model) 二元组取（同名模型跨提供方时能力各是各的）"; echo "$$out" | head -12; exit 1; }; \
+	echo "$$out" | grep -q "^efforts = off, low" || { echo "FAIL: 档位清单没按 beta 下的 a-think 取"; exit 1; }; \
+	: "⑤ 两处不许猜：解析不出凭据 ⇒ 清空；没声明 baseURL ⇒ 端点一个字节不动"; \
+	out=$$(e UYA_AGENT_PROVIDER=gamma $$bin $$cfg --print-config 2>&1); \
+	echo "$$out" | grep -q "warning: provider gamma 没解析出凭据" || { echo "FAIL: 新提供方解析不出凭据时没有告警"; exit 1; }; \
+	echo "$$out" | grep -q "^api_key = (none)" || { echo "FAIL: 旧提供方的密钥被沿用了（凭据泄露）"; echo "$$out" | head -12; exit 1; }; \
+	echo "$$out" | grep -q "^base_url = https://alpha.example/v1" || { echo "FAIL: gamma 没声明 baseURL，端点就该保持不动（不许清空也不许猜）"; exit 1; }; \
+	: "⑦ 与 --provider P 同口径（除来源标签外逐字节相同）"; \
+	e UYA_AGENT_PROVIDER=beta $$bin $$cfg --print-config > $$home/env.txt 2>&1; \
+	e $$bin $$cfg --provider beta --print-config > $$home/cli.txt 2>&1; \
+	sed 's/^provider = beta  (source: env)$$/provider = beta  (source: PIN)/' $$home/env.txt > $$home/env.norm; \
+	sed 's/^provider = beta  (source: cli)$$/provider = beta  (source: PIN)/' $$home/cli.txt > $$home/cli.norm; \
+	cmp -s $$home/env.norm $$home/cli.norm || { echo "FAIL: env 与 cli 两条路的 provider 口径不一致"; diff $$home/env.norm $$home/cli.norm | head -20; exit 1; }; \
+	: "⑧ --resume 仍跟随会话记录（env 是默认路线，不是钉子）"; \
+	sid=session-00000000-0000-4000-8000-000000000090; \
+	mkdir -p $$home/agent/sessions/--selftest-p90--/$$sid; \
+	printf '{"type":"session","version":0,"id":"%s","createdAt":1790000000000,"cwd":"%s","delegationDepth":0,"agentPreset":"standard","model":"a-plain","provider":"uya-agent"}\n{"type":"user/message","seq":0,"time":1,"data":{"content":[{"type":"text","text":"hello"}]}}\n{"type":"session/model","seq":1,"time":2,"data":{"provider":"alpha","model":"a-plain"}}\n' "$$sid" "$(CURDIR)" > $$home/agent/sessions/--selftest-p90--/$$sid/session.jsonl; \
+	out=$$(printf '/model\n/exit\n' | e UYA_AGENT_PROVIDER=beta $$bin $$cfg --no-tui --quiet --resume $$sid 2>&1); \
+	echo "$$out" | grep -q "\[session\] 模型跟随会话：a-plain" || { echo "FAIL: --resume 没有跟随会话记录的模型"; echo "$$out" | head -12; exit 1; }; \
+	echo "$$out" | grep -q "model      a-plain  ·  provider alpha" || { echo "FAIL: 恢复出来的路线不是会话记录那一条（env 不该钉住它）"; echo "$$out" | head -12; exit 1; }; \
+	echo "$$out" | grep -q "provider beta" && { echo "FAIL: env 给的提供方把会话记录的路线顶掉了"; echo "$$out" | head -12; exit 1; }; \
+	echo "e2e-provider: 通过（env 压过设置且路线跟随 / cli 压过 env / 显式优先不回退 / 二元组定稿能力 / 凭据与端点两处不猜 / 反腿未给 env 照旧 / 与 --provider 同口径 / --resume 仍跟随会话）"
 
 # P81：**上下文窗口的来源链**（离线，真二进制 + 真 settings.yaml）。
 # 四档来源：目录条目（dsh-settings）< `uya-agent.contextWindows`（uya-agent）<

@@ -8416,3 +8416,64 @@ SYS / TASK / calls(c1,c2) / tool(c1) / USER「继续」
 同口径）；不动 `/goal` 的续跑授权口径（P58 的 `--resume` 后 disarmed 是设计）；
 不改 `--dsh-web` 那两个写死的投影（`goal:null` / `todos:null` 是另一条线、另一套判据）；
 不认领阶段号、不动 `AGENT_VERSION`（用户报的缺陷修复）。
+
+### 19.14 P90：**提供方名能不能用环境变量给**（`UYA_AGENT_PROVIDER`）
+
+**用户问的一句话**：「uya-agent 可以通过环境变量设置供应商的名称吗」。查了一遍：
+`UYA_AGENT_BASE_URL` / `UYA_AGENT_MODEL` / `UYA_AGENT_API` / `UYA_AGENT_API_KEY` 都有
+env 档，**只有提供方键没有** —— 而它恰恰是「请求打到哪一家、用哪一把密钥」的那一半。
+
+**为什么这一条不只是省事（现状的三种坏法）**：
+
+| 现场 | 现状 |
+|---|---|
+| 容器 / CI 部署 | 只有环境这一条入口。换一家提供方只能改 `settings.yaml` 的 `agent-default-model.provider` —— 而那是**用户自己的默认路线**，改它等于把本机交互式使用也一起改了 |
+| `--dsh-web` 的对话子进程 | 宿主用 `--provider P` 起，子进程的 argv 只有 `--tui`，环境里也没有提供方 ⇒ 父子对「去哪一家」分叉（与踩坑 124 的 `--base-url` 现场同形） |
+| `--resume` + 环境 | 没有 env 档时这条无解；有了 env 档还要说清它与会话记录谁说话（见下） |
+
+**口径（三层优先级，由位置保证、不由判断保证）**：`cli`（`--provider`）> `env`
+（`UYA_AGENT_PROVIDER`）> `dsh-settings`（`agent-default-model.provider`）。
+
+* **名字在第 1 步落、路线在第 3.51 步解析**。为什么拆开：`--dsh-home` 的预扫在第 2 步，
+  在第 1 步解析就会去默认 `~/.dsh` 里找这个提供方（症状是「设置里明明有它」却解析不出
+  路线）；而第 1 步必须先把名字落进 `cfg.provider`，`agent_apply_dsh` 那条
+  `!cfg.provider_set` 才挡得住设置里的 provider。解析本身复用 `agent_route_apply`
+  （P37 那一处收口）⇒ 端点 / 凭据 / 线协议一起跟随，并且自带两条纪律：**显式给过的
+  `base_url` / `key` / `api` 一律不动**；**解析不出凭据就清空**（旧密钥绝不跨提供方）。
+* **与 `--provider P` 同口径**：`e2e-provider` 的第 ⑦ 条腿把两条路的 `--print-config`
+  **逐字节**比（只把来源标签归一化）—— 这是「env 档不是第三套语义」的机器判据。
+* **显式优先**：`UYA_AGENT_PROVIDER=beta --model a-plain`（a-plain 只在 alpha 下）不许
+  跨提供方回退把 beta 换掉 —— `pinned` 判据从「`src_provider == 3`」扩成
+  「2 或 3」，env 与 cli 在这里是同一档。
+* **`--resume` 仍跟随会话记录**（env 给的是**本次启动的默认路线**，不是钉子）。这一条是
+  想清楚才这么定的：把 env 的提供方也做成钉子，`--dsh-web` 里「用户刚切到 B，重开标签页」
+  就会被宿主的默认路线按回 A —— 那是把修好的一半又弄坏。显式那两档里真正被钉住的仍然
+  只有端点与凭据（`agent_route_apply` 的口径），回执里打出来的端点就是**实际会用的**那个。
+  与 DSH 自己的 `agent-default-model.provider` 同一个槽位，语义也一致：会话记录优先。
+* **web 子进程注入**（`web_child_env_cfg`）：只在**显式来源**（env = 2 / cli = 3）时注入
+  `UYA_AGENT_PROVIDER`；来自设置（`src == 1`）时**不注入** —— 那是部署默认路线，子进程
+  自己会解析，注入了等于把它钉成「env 显式」，切模型时端点就不跟了（上面那条纪律的反面）。
+* 顺带一处诚实性修复：`UYA_AGENT_MODEL` 给的模型以前在 `--print-config` 里印成
+  `source: default`（旁边 `provider` 却印 `env`）—— 现在 env 档落来源码 2，人不用再猜。
+
+**验收**（离线；真二进制 + 真 settings.yaml，一律 `env -i` 起）：
+
+| 判据 | 结果 |
+|---|---|
+| `make e2e-provider`（新目标，8 条腿）：① env 压过设置且**路线跟着走**（端点 / `apiKeyEnv` 解出的密钥 / 线协议）；② cli 压过 env；③ 显式优先不回退；④ env 给全两个 ⇒ 按二元组定稿（`context_window` 444000 来自 beta 下那条）；⑤ 凭据不跨提供方（清空 + 告警）、没声明 `baseURL` 就不动端点；⑥ 反腿：没给 env ⇒ 一切照旧 dsh-settings；⑦ 与 `--provider P` 除来源标签外**逐字节**相同；⑧ `--resume` 仍跟随会话记录 | 全绿 |
+| `web-childcfg` 轮（P73 那一轮扩表 15 → 16）：显式来源必须注入、**设置来源不许注入** | 绿 |
+| 回归（离线，**干净机器口径**：`env -i` 或 `HOME` 指向空目录 + 不导出 `UYA_AGENT_*` / `DSH_HOME`）：`e2e-model` / `e2e-model-save` / `e2e-ctxwindow` / `e2e-inputimage` / `e2e-ws` / `e2e-config-flags` / `e2e-portable` | 全绿 |
+| `make lint-size` / `make doc-audit` / `make codegen-audit` / `make ui-audit` | 绿（`doc-cover` 红在**别处**：`dshdoc.uya` / `dshfile.uya` / `dwhschema.uya` 的既有缺口，与本轮无关） |
+
+**防假绿对照（真跑过：改坏 → 看到红 → 改回 → 再绿）**：
+
+| # | 改坏什么 | 结果 |
+|---|---|---|
+| A | `web_child_env_cfg` 里那次注入整段停掉（`if false`） | `web-childcfg` **红 1 条**，文案正是「提供方没传进子进程（浏览器里会打回设置里的默认路线）」 |
+| B | 名字落进 `cfg.provider` 但**不解析路线**（去掉 3.51 那一步） | `e2e-provider` **红**：`FAIL: 端点没跟着 env 给的提供方走（请求会打在 alpha 上）` |
+| C | `pinned` 判据退回只认 cli（`src_provider == 3`） | `e2e-provider` **红**：`FAIL: env 给的提供方被 --model 的跨提供方回退改掉了` |
+
+**明确不做**：不加 `UYA_AGENT_PROVIDER` 的「钉子」语义（理由见上）；不改 `--resume` 的
+模型/档位跟随口径（P37 的老规矩：只有 cli 显式给过 `--model`/`--effort` 才让位）；
+不新增 `UYA_AGENT_PROVIDER` 的取值校验（提供方键是用户设置里的任意字符串，认不出就是
+「路线解析不出来」这一条既有路径，与 `--provider` 完全一致）；不动 web 宿主的其它注入。

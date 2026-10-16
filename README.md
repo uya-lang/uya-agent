@@ -128,7 +128,7 @@ readelf -lW build/uya-agent | grep -c INTERP    # 0 = 真静态
 |---|---|
 | `--base-url URL` | 默认 `https://api.deepseek.com/v1`（也支持 `http://127.0.0.1:11434/v1` 这类本地明文端点） |
 | `--model NAME` | 默认 `deepseek-chat`。走模型目录收口 —— 命中就把该模型的 provider / contextWindow / maxTokens / input / compat **一起**搬过来（`/model` 同口径），目录里没有就只换名字并告警（能力保持不动）。**同名模型跨提供方**（两家都发布同一个 id）时用 `--model 提供方/名字` 指定是哪一家；只给名字时用当前提供方，并在回执里点出同名的那一家。**命令行是一次性的**：它不会改 `settings.yaml`（要改默认用 `/model`） |
-| `--provider NAME` | 提供方键（可省略）：`settings.yaml` 里 `providers.<key>` 的那个 key，配 `--model` 用；省略时由目录反查。显式给的这个键**当场生效**（端点 / 凭据 / 线协议一起解析），与 `--model` 谁先谁后都一样；**显式优先** —— 该提供方没发布这个名字时不会跨提供方回退（不会把你点的键悄悄换掉） |
+| `--provider NAME` | 提供方键（可省略）：`settings.yaml` 里 `providers.<key>` 的那个 key，配 `--model` 用；省略时由目录反查（同口径的 env 档是 `UYA_AGENT_PROVIDER`，优先级 cli > env > 设置）。显式给的这个键**当场生效**（端点 / 凭据 / 线协议一起解析），与 `--model` 谁先谁后都一样；**显式优先** —— 该提供方没发布这个名字时不会跨提供方回退（不会把你点的键悄悄换掉） |
 | `--effort V` | 推理强度（`--reasoning-effort` 的别名）：先按当前模型公布的档位校验，不在集合里则拒绝（`--reasoning-effort` 不校验、原样透传）。与 `--model` 一样是**一次性**的，不写回设置 |
 | `--reasoning-effort V` | 推理强度：**completions 发顶层 `reasoning_effort`，responses 发 `reasoning.effort`**（`compat.supportsReasoningEffort=false` 或 `off`/`none` = 不发），默认取 DSH 的 `agent-default-model.reasoningEffort` |
 | `--workspace DIR` | 工具的活动目录，默认当前目录；恢复会话时默认跟随会话记录的工作区，显式指定优先 |
@@ -308,7 +308,11 @@ uya-agent --dsh-assets ~/dsh-assets --dsh-web        # 之后都指这份
 
 ### 1.5 环境变量
 
-`UYA_AGENT_BASE_URL`、`UYA_AGENT_MODEL`、`UYA_AGENT_WORKSPACE`、
+`UYA_AGENT_BASE_URL`、`UYA_AGENT_MODEL`、
+`UYA_AGENT_PROVIDER`（提供方键 = `settings.yaml` 里 `providers.<key>` 的那个 key，
+与 `--provider` 同口径：端点 / 凭据 / 线协议跟着它解析，CLI 压过它；容器 / CI /
+`--dsh-web` 的对话子进程只有环境这一条入口，这个变量就是给它们的）、
+`UYA_AGENT_WORKSPACE`、
 `UYA_AGENT_MAX_STEPS`（步数熔断上限，`0` = 不限，也是默认值；非法值告警后按「不限」处理）、
 `UYA_AGENT_API`（非法值告警后按「未声明」处理，即仍会先试 responses）、
 `UYA_AGENT_REASONING_EFFORT`（`off`/`none` = 不发）、
@@ -834,6 +838,12 @@ leaf 指纹怎么算、指纹库放哪儿 —— 见 [DESIGN.md §18](DESIGN.md)
   （新提供方解析不出凭据就清空 key 并告警，而不是沿用上一把）；**没声明 `baseURL` 的提供方**
   不动端点，只留一行说明（静默清空比「没跟上」更坏）。`--resume` 跟随会话记录的 provider 时
   走同一条路。见 [DESIGN.md §16 踩坑 96](DESIGN.md)。
+* **env 档的提供方**（P90）：`UYA_AGENT_PROVIDER=<key>` 把「这条路线的提供方」搬进环境，
+  口径与 `--provider` **逐字相同**（除 `--print-config` 里的来源标签：`env` vs `cli`）——
+  端点 / 凭据 / 线协议一起解析，`--model` 不会把它跨提供方回退换掉，`cli` 压过它。它给的是
+  **本次启动的默认路线**（与设置里的 `agent-default-model.provider` 同一个槽位，只是 env
+  压过设置）；`--resume` 仍跟随会话记录的那一条 —— 不把这一次恢复钉死在环境上
+  （`--dsh-web` 的标签页重开之后回到用户刚切的模型，而不是宿主的默认路线）。
 * **输出上限总是发**（P61）：`max_tokens`（completions）/ `max_output_tokens`（responses）
   **每个请求都带**，口径是 `--max-tokens` > 模型目录的 `maxTokens` > 默认 **256000**
   （照抄 DSH 自己的 `dsh-llm-deepseek`：`config.maxTokens ?? 256e3`，且它经 `defaultMaxTokens`
