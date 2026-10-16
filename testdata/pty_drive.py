@@ -21,6 +21,12 @@
                          → 再全屏一次、esc 关掉浮层
     tasks-ctrl-t         （踩坑 114）回合**运行中**按 ctrl+t：常驻任务块当场展开成箱体
                          （≤1.5 s，且那一刻回合还在跑）→ 再按一次收回折叠行
+    goal-menu            （P91）面板里选中 /goal 与裸 /goal 都开**动作选择框**（六个动作 +
+                         ✓ create）→ 打开就回车 = 看状态（`No goal is currently set.`，
+                         且盘上**不能**冒出一个叫 "status" 的目标）→ 再开一次、↓ 到 create
+                         → 回车弹**单行输入框** → 敲正文回车 → `Goal created` + 正文上屏；
+                         再开一次 → ✓ 已挪到 pause（真按键那条腿是 headless 测不了的：
+                         阻塞的输入框在 headless 里收不到注入的键）
 
 只依赖 Python 标准库；解释器把 pty 的输出按「屏幕重建」的方式解析（备用屏幕 + 光标定位）。
 """
@@ -370,6 +376,23 @@ def suite():
     check(v10.get("box_gone_ms") is not None or v10.get("box_closed"),
           "收回之后折叠行没有回来（那块地方空着）", failures)
     all_v["ctrl_t"] = v10
+    # ---- P91：/goal 的动作选择框（真终端里的人机路径）----
+    v11 = run_scenario(0, base + "_goalmenu", "goal-menu")
+    check(v11.get("palette_menu_seen"), "命令面板里选中 /goal 没有开出动作选择框", failures)
+    check(v11.get("palette_items"), "动作选择框里没有列全六个动作", failures)
+    check(v11.get("palette_marked"), "无目标时 ✓ 没有挂在 create 那一行", failures)
+    check(v11.get("menu_seen"), "裸 /goal 没有开出动作选择框", failures)
+    check(v11.get("typed"), "输入框那条路没走通（敲进去的正文没进回执）", failures)
+    check(v11.get("created_seen"), "输入框里敲正文回车之后没有出现 Goal created", failures)
+    check(v11.get("objective_txt"), "create 之后目标正文没有上屏（objective 不对）", failures)
+    check(v11.get("menu2_ms") is not None, "有目标之后裸 /goal 没有开回动作选择框", failures)
+    check(v11.get("marked_pause"), "有目标且 armed 时 ✓ 没有挪到 pause 那一行", failures)
+    check(v11.get("marked_create_gone"), "有目标时 create 那一行还挂着 ✓", failures)
+    check(v11.get("status_seen"), "有目标时「打开就回车」没有看到状态（不是 status 那一行？）",
+          failures)
+    check(v11.get("no_status_goal"),
+          "`/goal status` 被当成了字面目标（盘上多出一个叫 status 的目标）", failures)
+    all_v["goal_menu"] = v11
     print(json.dumps(all_v, ensure_ascii=False, indent=2))
     if failures:
         print("P30/P31 FAIL:")
@@ -391,6 +414,11 @@ def suite():
              v9.get("panel_row"), v9.get("f11_top_row")))
     print("踩坑 114 PASS（ctrl+t 在回合运行中当场展开（%s ms，那一刻回合还在跑）→ 再按一次收回）"
           % (v10.get("box_ms"),))
+    print("P91 PASS（/goal 动作框：面板选中 %s ms · 裸命令 %s ms · 输入框 %s ms · "
+          "create 落盘 %s ms；六个动作与 ✓ create 都在，打开就回车 = 看状态且没建出 "
+          "status 目标，有目标后 ✓ 挪到 pause）"
+          % (v11.get("palette_ms"), v11.get("menu_ms"), v11.get("input_ms"),
+             v11.get("created_ms")))
     return 0
 
 def _drive(port, workspace, scenario, extra=None):
@@ -587,6 +615,89 @@ def _drive(port, workspace, scenario, extra=None):
             type_keys(fd, "\r")
             pump(fd, screen, 0.5)
             verdict["cancelled"] = "确认 finish？" not in screen.text()
+            type_keys(fd, "\x1b")
+            pump(fd, screen, 0.3)
+        elif scenario == "goal-menu":
+            # P91：/goal 的动作选择框（真终端 + 真按键）。这一场**不发请求、不建会话**：
+            # 只验「面板选中或裸命令开出动作框 → 打开就回车 = 看状态 → ↓ 到 create →
+            # 回车弹输入框 → 敲正文回车 → 落盘 + 开状态浮层 → ✓ 跟着挪到 pause」
+            # 这条人机路径（正是用户报的那条：选中 goal 回车之后只有一张只读报告）。
+            # ① 命令面板里选中 /goal
+            type_keys(fd, "\x10")
+            pump(fd, screen, 0.4)
+            type_keys(fd, "goal")
+            pump(fd, screen, 0.4)
+            tp = time.time()
+            type_keys(fd, "\r")
+            verdict["palette_ms"] = wait_text(
+                fd, screen, ("会话目标（enter 执行 · esc 取消）",), tp, 1500)
+            verdict["palette_menu_seen"] = verdict["palette_ms"] is not None
+            txt = screen.text()
+            verdict["palette_items"] = all(w in txt for w in
+                                           ("status", "create", "edit", "pause", "resume", "clear"))
+            verdict["palette_marked"] = "✓ create" in txt
+            type_keys(fd, "\x1b")
+            pump(fd, screen, 0.4)
+            # ② 裸命令：动作框 + 打开就回车 = 看状态
+            t0 = time.time()
+            type_keys(fd, "/goal\r")
+            verdict["menu_ms"] = wait_text(
+                fd, screen, ("会话目标（enter 执行 · esc 取消）",), t0, 1500)
+            verdict["menu_seen"] = verdict["menu_ms"] is not None
+            if os.environ.get("PTY_DUMP"):
+                print("---- /goal 动作选择框 ----")
+                print(screen.text())
+            # ↓ 一次 → create，回车 → 输入框（先验这条，因为它才是「动作真的跑起来」）
+            # ⚠ 这里**别**改用字面的 "↓"：那是 UTF-8 文本，经 STRING 路径进来会在
+            # 输入行里落下 "↓"、把命令面板的过滤器搞乱（实测：`没有匹配的命令：↓`）；
+            # 方向键就是 `\x1b[B`（与上面 worktree 那一场同一套按键）
+            type_keys(fd, "\x1b[B")
+            pump(fd, screen, 0.3)
+            t1 = time.time()
+            type_keys(fd, "\r")
+            # 输入框是**阻塞式**的：回车那一刻光标停止转、面板换成 4 行高的框。
+            # 光看 `input_ms` 会栽在时序上（那个框可能只画了一两帧就被后面的键推走），
+            # 所以判据落在**它真的起过作用**上：敲进去的正文最终出现在 goal.json 的回执里
+            # （见 created_seen / objective_txt）。
+            verdict["input_ms"] = wait_text(fd, screen, ("新目标（enter 采纳 · esc 取消）",), t1, 1500)
+            verdict["input_seen"] = verdict["input_ms"] is not None
+            type_keys(fd, "把 goal 菜单这条腿测了")
+            pump(fd, screen, 0.3)
+            # 输入框吃键了吗？框里应当有那行正文（拿屏幕上的编辑行当判据）。
+            # ⚠ 输入框只在**等键**时画：敲完这一行到按回车之间可能一帧都还没刷，
+            # 所以这里只记录下来（`typed` 那条判据落在回执的正文上，见下）。
+            verdict["input_echo"] = "把 goal 菜单这条腿测了" in screen.text()
+            t2 = time.time()
+            type_keys(fd, "\r")
+            verdict["created_ms"] = wait_text(fd, screen, ("Goal created",), t2, 2000)
+            verdict["created_seen"] = verdict["created_ms"] is not None
+            verdict["objective_txt"] = "Objective: 把 goal 菜单这条腿测了" in screen.text()
+            # 「输入框那条路真的走通」的判据：敲进去的 10 个汉字原样进了回执
+            # （框本身在阻塞等键里画不画得上，是时序问题；赌那个会 flaky）
+            verdict["typed"] = verdict["objective_txt"]
+            if os.environ.get("PTY_DUMP"):
+                print("---- create 之后的挂状态浮层 ----")
+                print(screen.text())
+            type_keys(fd, "\x1b")
+            pump(fd, screen, 0.3)
+            # ③ 有目标之后再开菜单：✓ 挪到 pause；打开就回车 = 看状态（不建新目标）
+            t3 = time.time()
+            type_keys(fd, "/goal\r")
+            verdict["menu2_ms"] = wait_text(
+                fd, screen, ("会话目标（enter 执行 · esc 取消）",), t3, 1500)
+            txt2 = screen.text()
+            verdict["marked_pause"] = "✓ pause" in txt2
+            verdict["marked_create_gone"] = "✓ create" not in txt2
+            type_keys(fd, "\r")
+            t4 = time.time()
+            # `Status: active` 是 goal_cmd_show 的正文（等 "Status:" —— 别等到菜单
+            # 的那一行 `... — 看当前状态`，那是个子串陷阱）
+            # 同样按「最终状态」判：`Status: active` 是这张浮层的正文（等 "Goal" 会漏 ——
+            # 它也可能来自别处），这里多给一点预算
+            verdict["status_ms"] = wait_text(fd, screen, ("Status: active",), t4, 3000)
+            verdict["status_seen"] = verdict["status_ms"] is not None
+            # 关键否定判据：`/goal status` 若被当字面目标，盘上会多出一个叫 status 的目标
+            verdict["no_status_goal"] = "Objective: status" not in screen.text()
             type_keys(fd, "\x1b")
             pump(fd, screen, 0.3)
         elif scenario == "tasks-ctrl-t":

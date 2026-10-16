@@ -1784,6 +1784,30 @@ reload；**换会话（`/new`、`/resume`）也 reload**（P87：目标跟着会
 是**进程本地**的续跑授权（驱动器认的是它）。分开的理由见 §9.5 —— 合并的话 `--resume` 会把
 上一条会话的授权继承过来。
 
+**TUI 的命令面（P91）：裸 `/goal` 开**动作选择浮层**（`TUI_OVK_GOAL_MENU`），六个动作
+一行一个 —— `status / create / edit / pause / resume / clear`。三件事写死在这一层里：
+
+* **游标默认停在 `status`** ⇒「打开就回车」逐字节等于 P29 的裸命令（看状态），老手感不变；
+* **六个动作执行完都开原来那张状态浮层**（`TUI_OVK_GOAL`，正文就是 `goal_cmd_run` 的
+  输出）—— 措辞与状态机只有一处实现，浮层只负责拼命令与展示；
+* `✓` 挂在「**当前续跑态对应的那个动作**」上（对齐 DSH `GoalBar` 的 `commandHint` 口径）：
+  `active+armed → pause`、`paused / blocked / active-disarmed → resume`、
+  无目标或 `complete → create`。与 `/worktree` 的 `on/off ✓` 是同一套观感。
+
+**⚠ 一条边界（写在这里因为它是本节最容易踩的一格）：`status` / `create` / `edit` 不走
+`goal_cmd_run` 的控制词解析**（分别走 `goal_cmd_show` / `goal_cmd_create` / `goal_cmd_edit`）。
+那边的控制词只有 `clear/pause/resume/edit`，**其余任何非空后缀都是字面目标** ——
+菜单默认游标那一行是 `status`，走解析就会真的建出一个叫 "status" 的目标；输入框里填的
+正文是**数据**（填「pause」若走解析就变成了一次暂停）。控制词那条路只属于「人敲的整行」。
+
+**`clear` 不翻二次确认**（与 `/worktree` 的 `finish/discard` 不同）：DSH 的 `GoalBar` 清除
+本身就不确认，`/goal clear` 今天也没有；菜单行自带一句「不可撤销」，且游标默认不落在它上面。
+
+**回合运行中的分工**：动作浮层的结果**只在主循环收口**（`create/edit` 要弹 P48 的阻塞式
+单行输入框，塞进泵点就是在流式/工具循环的中间阻塞等按键）；泵点只给一次回执（复用面板
+那套 `agent_pump_receipt_*` 去重）并把结果**原样留在队列里** —— 与 `/access` `/worktree`
+`/sessions` 同一分工。
+
 ### 9.5 同会话续跑驱动器（P58，`goal_round_admit`）
 
 `phase=active` + 有授权 = 自动开下一轮。对齐 DSH 的
@@ -2347,7 +2371,7 @@ bash / node / python 峰值可达 GB 级，不算进来是刻意的）。
 
 | 形态 | kind 前缀 | 状态 | 用途 |
 |---|---|---|---|
-| 列表 | `TUI_OVK_*`（18 种） | 条目 + 游标 + 过滤词 | 命令面板 / `/sessions` / `/help` / `/model` / `/permission` / `/worktree` / `/watch` 清单 |
+| 列表 | `TUI_OVK_*`（19 种） | 条目 + 游标 + 过滤词 | 命令面板 / `/sessions` / `/help` / `/model` / `/permission` / `/worktree` / `/goal`（P91 动作选择）/ `/watch` 清单 |
 | reader | `TUI_OV_READER` | 可滚动正文 | plan 审阅 / `/status` / `/tasks` 长文本 |
 | diff | `TUI_OV_DIFF` | 左文件列表 + 右两栏 | `/diff` |
 | ask | `TUI_OVK_ASK` | 问题 + 选项 + 自定义行 | `ask_user_question` |
@@ -6601,7 +6625,7 @@ DEEPSEEK_API_KEY=sk-xxx ./build/uya-agent \
 | `subagent-goal` | 9 调用：goal 三工具、`subagent`/`subagent_output(wait)`、`ralph(maxRounds=2)` |
 | `tasks-render` | 进度条/百分比/体量、空态零字节、箱体 11 行逐行等宽；**§19.12**：折叠行的目标段带 `轮` 单位与正文、正文带换行压成一行、放不下时**只裁正文不丢头**（26..78 逐档扫描 + 两条前缀等值） |
 | `tasks-scroll` | `--no-tui`：折叠行与 agents 箱体进面板；展开后每行 98 列 |
-| `tui-tasks` | 常驻任务块层序、`ctrl+t` 只置 `TUI_REQ_TASKS`、矮/窄退化；折叠行的 `目标 N/M轮` 与目标正文真在屏幕上（§19.12）；P29 `/goal` 浮层；**E 段（踩坑 114）**：泵点消费 ctrl+t（运行中当场翻转 + 请求被消费 + 泵点只认 TASKS，tab 的请求原样留给主循环）、空态屏照样画块并按得动、四表全空时落 notice |
+| `tui-tasks` | 常驻任务块层序、`ctrl+t` 只置 `TUI_REQ_TASKS`、矮/窄退化；折叠行的 `目标 N/M轮` 与目标正文真在屏幕上（§19.12）；P29 `/goal` 浮层、**P91 动作选择框**（六动作 + ✓ 挪位 + 打开就回车 = 看状态且不建 status 目标 + pause/resume/clear 真翻盘 + 泵点只回执不执行）；**E 段（踩坑 114）**：泵点消费 ctrl+t（运行中当场翻转 + 请求被消费 + 泵点只认 TASKS，tab 的请求原样留给主循环）、空态屏照样画块并按得动、四表全空时落 notice |
 | `skills-web-search` | 目录型技能注入 + `skill` 工具；Anthropic 形状 `web_search` 鉴权与去重 |
 | `compact-prune` | 20000 字符输出 → 剪枝标记、完整中段消失 |
 | `compact-auto` | 窗口 200 触发：摘要请求 → `automatically generated checkpoint` |
@@ -6711,7 +6735,8 @@ DEEPSEEK_API_KEY=sk-xxx ./build/uya-agent \
 
 - 总闸门：`make selftest`（离线，含 `p30-check` 与全部轮次，SELFTEST PASS / 退出 0）、`make e2e`（真网关）。
 - 离线配套：`make check`（A1 类型检查）/ `build`（A2 产出 `build/uya-agent`）/ `codegen-audit` / `tui-selftest` / `shell-selftest` / `e2e-config-flags` / `e2e-api` / `e2e-steps` / `e2e-permission` / `e2e-sandbox` / `e2e-tasks` / `e2e-goal` / `e2e-sessions` / `e2e-resume-big` / `e2e-title` / `e2e-model` / `e2e-model-save` / `e2e-model-route` / `e2e-worktree` / `e2e-diff` / `e2e-watch` / `e2e-watch-pick` / `diff-selftest` / `panel-selftest` / `e2e-ws`。
-- PTY 场景：`make p30-check`（`testdata/pty_drive.py --suite`，10 个场景；P41 那场 `worktree-menu` 走
+- PTY 场景：`make p30-check`（`testdata/pty_drive.py --suite`，11 个场景；P91 那场 `goal-menu` 是**真按键**那条腿
+  —— 输入框的同步采纳路在 headless 里收不到注入的键，只能在真终端里测；P41 那场 `worktree-menu` 走
   两条入口 —— 命令面板里选中 `/worktree` 与裸 `/worktree` —— 到选择框 → ↓ 到 `finish` → 确认框 →
   回车取消，`PTY_DUMP=1` 会把两张框打出来；踩坑 114 那场 `tasks-ctrl-t` 要假网关的
   第 6 个参数 `todo_first=1`，它让第一次请求回一个 `todo_write` —— 折叠行真的在屏幕上，
@@ -8477,3 +8502,43 @@ env 档，**只有提供方键没有** —— 而它恰恰是「请求打到哪�
 模型/档位跟随口径（P37 的老规矩：只有 cli 显式给过 `--model`/`--effort` 才让位）；
 不新增 `UYA_AGENT_PROVIDER` 的取值校验（提供方键是用户设置里的任意字符串，认不出就是
 「路线解析不出来」这一条既有路径，与 `--provider` 完全一致）；不动 web 宿主的其它注入。
+
+### 19.15 P91：`/goal` 在 TUI 里开**动作选择浮层**（用户报的）
+
+**用户报的**：命令面板里选中 `goal` 回车之后，屏幕上只有一张状态报告。目标这件事有六个
+动作（看 / 建 / 改 / 暂停 / 恢复 / 清除），却没有一处能把它们**列出来** —— 而同一条线上的
+`/permission`、`/model`、`/effort`、`/worktree` 早就都是底对齐选择浮层了（P41 那条注释里
+写着同一句话）。
+
+**改法**（口径见 §9.3 末那一节）：裸 `/goal`（手敲或面板选中）→ `TUI_OVK_GOAL_MENU`
+动作框（六行 + `✓`，游标默认 `status`）；`create`/`edit` 用 P48 的单行输入框收正文
+（`edit` 预填当前正文）；六个动作走完都开原来那张状态浮层。带参数 `/goal <objective>`
+与滚动模式**一个字节不改**。
+
+**为什么新开一个 kind 而不借 `TUI_OVK_GOAL`**：那个 kind 在接收端是「纯查看，enter 不
+派发」语义（结果没人接、被静默丢掉）—— 与 `/watch` 曾经借 `/tasks` 的 kind 是同一条坑
+（§16 踩坑 65/73 那一族）。这也正是「加一个浮层要同时改三处」的那条纪律：开浮层、主循环
+消费、泵点回执，缺一处就是「按了没反应」。
+
+**验收**（都是实测）：
+
+| 判据 | 结果 |
+|---|---|
+| `tui-tasks` 的 H 段（抽成 `tuis_goal_menu_case`）：清单有 `/goal`、裸命令开的是 `GOAL_MENU`、六动作与 gloss 上屏、无目标时 `✓ create`、**打开就回车 = status 且盘上不冒 "status" 目标**、有目标后 `✓ pause`、pause/resume 真翻 phase+armed、`esc` 取消不改目标、空正文拒掉、认不出的行不执行、clear 删文件 + 投影清空 | 绿 |
+| `tui-tasks` 的泵点腿：回合运行中只落**一次**回执、结果仍在队列（`tui_overlay_result_pending`）、盘上零改动 | 绿 |
+| `make p30-check` 第 11 场 `goal-menu`（真终端 + 真按键）：面板选中 59 ms 开框、裸命令 62 ms、`↓`+回车弹输入框、敲正文回车 62 ms 出 `Goal created` + 正文上屏、再开框 `✓ pause`、打开就回车看到 `Status: active` 且没有 `Objective: status` | 绿 |
+| `make tui-selftest` / `make p30-check` / `make lint-size` / `doc-cover` / `ui-audit` / `check` / `build`（静态链接审计） | 全通过 |
+
+**两条踩到的坑（都记在这里，因为都很容易重犯）**：
+
+* **headless 测不了阻塞式输入框的「敲正文→回车」**：`tui_title_input_wait` 一进去就
+  `tui_key_reset()`（排队键丢掉），而 headless 的注入键**就是**那条队列 —— 注入的键到不了
+  阻塞循环。所以 P48 的轮次同样只用**非阻塞**的 `tui_overlay_input_open` 测编辑。这一轮
+  的处理：把「框的标题 + 预填」抽成 `agent_tui_goal_prompt`（生产与自测**同一个函数**），
+  敲正文那条腿交给 `p30-check` 的真终端场。
+* **PTY 驱动里的 `↓` 必须是 `\x1b[B`**：`ESC [ B` 是方向键的转义序列；发字面的 UTF-8
+  `↓` 会走 STRING 路径，在**输入行**里落一个 `↓`（实测把命令面板的过滤器搞乱：
+  `没有匹配的命令：↓`）。
+
+**明确不做**：滚动模式的浮层（那边没有浮层，`/goal` 照旧打转录）；`clear` 的二次确认
+（理由见 §9.3）；新起第二个命令名（`/goal` 一个入口就够）；不动 `AGENT_VERSION`。

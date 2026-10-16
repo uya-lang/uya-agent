@@ -195,6 +195,7 @@ readelf -lW build/uya-agent | grep -c INTERP    # 0 = 真静态
 ### 1.2 斜杠命令
 
 `/help` `/status` `/tasks [open|close|toggle]` `/goal [<objective>|edit <objective>|pause|resume|clear]`
+（TUI 里裸命令开**动作选择框**，打开就回车 = 看状态；`create`/`edit` 再用输入框填正文）
 `/compact` `/plan` `/permission [预设]` `/model [名字|提供方/名字]` `/effort [档位]` `/workspace [目录]`
 `/worktree [on|off|start|status|finish|discard|list|reclaim]`（TUI 里裸命令开**动作选择框**，
 打开就回车 = `status`；`finish`/`discard` 选定后再过一道确认，`reclaim` 只清确定的垃圾、不确认）
