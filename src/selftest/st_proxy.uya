@@ -1,0 +1,742 @@
+// src/selftest/st_proxy.uya — P92 自测轮：出站代理（取值解析 / 路由 / CONNECT 隧道）
+//
+// 本文件：`pxr_parse_round`（纯函数轮：三种合法形状、默认端口、凭据头的线上字节、
+//   回环绕过判据、七类非法值各自的原因码、清空之后不残状态）与 `pxr_live_round`
+//   （**现地假代理轮**：父进程起一个 127.0.0.1 上的假代理，fork 出的子进程按脚本逐条
+//   断言请求行、转发/拒绝应答；父进程拿产品代码真跑 `hc_connect` / `http_request`）。
+// 不变量：① **全程离线**（只打 127.0.0.1，不联网、不需要证书）；② 线上的判据是**字面量
+//   逐字节**（期望值在自测里**独立写死**，不用 `hpx_connect_head` 拼 —— 用产品代码拼期望值
+//   等于让判据与实现共享同一个错误）；③ 轮末把代理状态清掉（`hpx_set(null)`），
+//   绝不把「配了代理」留给后面的轮次；④ 子进程按脚本服务**固定条数**的连接，超时自己退出
+//   （不许把父进程吊死在 accept 上）。
+// 依赖：见锚点 selftest.uya 的文件头（本片与它同处合并命名空间，无本地 use）；
+//   产品侧是 net/proxyx（解析/状态）+ net/httpc（路由与隧道）。
+// 命名：沿用自测轮的前缀 `pxr_`（proxy round）。
+//
+// 分工的**边界**：这一轮不覆盖「env 真的被读」与「CLI 压过 env」—— 判据要真改环境变量，
+// 而本进程没有 `setenv`（libc 不导出）。那两条由 `make e2e-proxy` 用真二进制跑
+// （`--print-config` 三种来源 + 正腿 + 反腿），见 DESIGN §19.16。
+
+// 字面量一律声明成**裸指针常量**（`"x" as &const byte`）：形参是 `&const byte` 时在调用点
+// 写 `&"x"[0: n]` 传的是切片描述符的地址，被调方拿到的是描述符头 8 字节（踩坑 22）。
+const PXR_OK_PLAIN: &const byte = "proxy.test:3128" as &const byte;
+const PXR_OK_SCHEME: &const byte = "http://proxy.test:3128" as &const byte;
+const PXR_OK_AUTH: &const byte =
+    "http://user:pass@proxy.test:3128" as &const byte;
+const PXR_OK_NOPORT: &const byte = "http://proxy.test" as &const byte;
+const PXR_OK_SLASH: &const byte = "http://proxy.test:3128/" as &const byte;
+// 期望的凭据头（逐字节）：base64("user:pass") = dXNlcjpwYXNz。
+const PXR_AUTH_HDR: &const byte =
+    "Proxy-Authorization: Basic dXNlcjpwYXNz\r\n" as &const byte;
+const PXR_AUTH_LEN: usize = 41;   // 上一条的字节数（数错就当场红，见 B 段断言）
+// 找凭据头用的小段（不含 CRLF 那一段也能定位；长度现算，不写魔法数字）。
+const PXR_AUTH_NEEDLE: &const byte =
+    "Proxy-Authorization: Basic dXNlcjpwYXNz" as &const byte;
+// 非法值（每一条对应 hpx_parse 的一个原因码）
+const PXR_BAD_SCHEME: &const byte = "socks5://proxy.test:1080" as &const byte;
+const PXR_BAD_SCHEME2: &const byte = "https://proxy.test:8443" as &const byte;
+const PXR_BAD_HOST: &const byte = "http://:3128" as &const byte;
+const PXR_BAD_HOST6: &const byte = "[::1]:3128" as &const byte;
+const PXR_BAD_PORT: &const byte = "proxy.test:abc" as &const byte;
+const PXR_BAD_PORT2: &const byte = "proxy.test:0" as &const byte;
+const PXR_BAD_PORT3: &const byte = "proxy.test:65536" as &const byte;
+const PXR_BAD_USER: &const byte = "user@proxy.test:3128" as &const byte;
+const PXR_BAD_EXTRA: &const byte = "proxy.test:3128/foo" as &const byte;
+
+// 假代理脚本里的线上字面量（自测**独立**写死的期望值，见文件头②）
+// 行宽豁免：这些是 CONNECT 的线上原文，断行就不再是它了。
+const PXR_WIRE_CONNECT: &const byte =
+    "CONNECT proxy-selftest.invalid:8443 HTTP/1.1\r\nHost: proxy-selftest.invalid:8443\r\nProxy-Authorization: Basic dXNlcjpwYXNz\r\n\r\n"
+    as &const byte;
+const PXR_WIRE_ABS: &const byte =
+    "POST http://proxy-selftest.invalid:8081/v1/chat HTTP/1.1\r\nHost: proxy-selftest.invalid:8081\r\nUser-Agent: "
+    as &const byte;
+const PXR_WIRE_BYPASS: &const byte = "GET /x HTTP/1.1\r\nHost: " as &const byte;
+const PXR_REPLY_200: &const byte =
+    "HTTP/1.1 200 Connection established\r\n\r\n" as &const byte;
+const PXR_REPLY_407: &const byte =
+    "HTTP/1.1 407 Proxy Authentication Required\r\n\r\n" as &const byte;
+const PXR_REPLY_502: &const byte = "HTTP/1.1 502 Bad Gateway\r\n\r\n" as &const byte;
+const PXR_REPLY_ABS: &const byte =
+    "HTTP/1.1 200 OK\r\nContent-Length: 12\r\n\r\nPROXY-ABS-OK" as &const byte;
+const PXR_REPLY_BYPASS: &const byte =
+    "HTTP/1.1 200 OK\r\nContent-Length: 9\r\n\r\nBYPASS-OK" as &const byte;
+const PXR_ECHO: &const byte = "PING-THROUGH-TUNNEL" as &const byte;
+
+// 假代理要服务的连接条数（父进程的脚本步数与它一一对应）。
+const PXR_CONNS: i32 = 5;
+// 子进程等连接的总预算（毫秒）：父进程某一步早退时，别让它吊在 accept 上。
+const PXR_ACCEPT_BUDGET_MS: u64 = 12000;
+
+// 断言失败：打一行带轮名的诊断并置 ok = false（与 dnr_fail 同形）。
+fn pxr_fail(what: &const byte, ok: &bool) void {
+    out_err("selftest[proxy] FAIL: ");
+    out_err(what);
+    out_err("\n");
+    ok[0] = false;
+}
+
+// 裸指针 + 长度是否逐字节等于字面量（不比 NUL、不做折叠）。
+fn pxr_eq_ptr(p: &const byte, n: usize, lit: &const byte) bool {
+    if n != bufx_cstr_len(lit) {
+        return false;
+    }
+    var i: usize = 0;
+    while i < n {
+        if p[i] != lit[i] {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+// 钉一个值进去并断言 hpx_set 的返回码（期望 true = 合法 / false = 非法）。
+fn pxr_set_expect(lit: &const byte, want: bool, what: &const byte,
+    ok: &bool) void {
+    const got: bool = hpx_set(lit);
+    if got != want {
+        pxr_fail(what, ok);
+    }
+}
+
+// 一个取值解析出来的三段（host/port/凭据）是否与期望逐字节相同。
+fn pxr_parse_expect(lit: &const byte, host: &const byte, port: u16,
+    auth: bool, what: &const byte, ok: &bool) void {
+    const n: usize = bufx_cstr_len(lit);
+    var out: HpxUrl = hpx_url_empty();
+    const rc: i32 = hpx_parse(lit[0: n], &out);
+    if rc != HPX_E_NONE {
+        pxr_fail(what, ok);
+        return;
+    }
+    if !pxr_eq_ptr(&lit[out.host_off], out.host_len, host) {
+        pxr_fail(what, ok);
+        return;
+    }
+    if out.port != port || out.has_auth != auth {
+        pxr_fail(what, ok);
+    }
+}
+
+// 纯函数轮 A：三种合法形状 / 默认端口 / 凭据头的线上字节 / 清空。
+//
+// 分三段而不是一段：单函数要守住 AGENTS.md 的 100 行（这一段是三组判据，
+// 合并回去就是 150+ 行）。三段的边界按**判据是什么**切，不按行数凑。
+fn pxr_parse_round(tag: &const byte) bool {
+    var ok: bool = true;
+    // ---- A) 三种合法形状 + 默认端口 + 末尾一个 `/` ----
+    pxr_parse_expect(PXR_OK_PLAIN, "proxy.test" as &const byte, 3128,
+        false, "host:port 没解析出主机名/端口", &ok);
+    pxr_parse_expect(PXR_OK_SCHEME, "proxy.test" as &const byte, 3128,
+        false, "http://host:port 没解析出来", &ok);
+    pxr_parse_expect(PXR_OK_AUTH, "proxy.test" as &const byte, 3128,
+        true, "带凭据的形状没解析出来", &ok);
+    pxr_parse_expect(PXR_OK_NOPORT, "proxy.test" as &const byte,
+        HPX_DEFAULT_PORT, false, "省了端口时应当按默认端口", &ok);
+    pxr_parse_expect(PXR_OK_SLASH, "proxy.test" as &const byte, 3128,
+        false, "末尾一个 `/` 应当被容忍（copy-paste 的常见形态）", &ok);
+
+    // ---- B) 凭据头的线上字节（逐字节，含结尾 CRLF）----
+    if !hpx_set(PXR_OK_AUTH) {
+        pxr_fail("带凭据的合法值被 hpx_set 拒了", &ok);
+        return ok;
+    }
+    const want_n: usize = bufx_cstr_len(PXR_AUTH_HDR);
+    if want_n != PXR_AUTH_LEN {
+        pxr_fail("夹具自身坏了：PXR_AUTH_LEN 与实际字面量长度不符", &ok);
+        return ok;
+    }
+    if hpx_auth_len() != want_n {
+        pxr_fail("凭据头长度与期望不符（base64 或分隔符不对）", &ok);
+    } else if !pxr_eq_ptr(hpx_auth_ptr(), hpx_auth_len(), PXR_AUTH_HDR) {
+        pxr_fail("凭据头不是逐字节的 Proxy-Authorization: Basic …", &ok);
+    }
+    // 主机名与端口也要回读得出（CONNECT 要用它去连）
+    if !pxr_eq_ptr(hpx_host_ptr(), hpx_host_len(), "proxy.test" as &const byte)
+        || hpx_port() != 3128 {
+        pxr_fail("hpx_set 之后主机名/端口回读不对", &ok);
+    }
+    if !pxr_eq_ptr(hpx_val_ptr(), hpx_val_len(), PXR_OK_AUTH) {
+        pxr_fail("回读的原值不是用户写下的那串字节", &ok);
+    }
+    // 没有凭据时不发那个头（长度 0）
+    _ = hpx_set(PXR_OK_PLAIN);
+    if hpx_auth_len() != 0 {
+        pxr_fail("没配凭据却拼出了 Proxy-Authorization 头", &ok);
+    }
+
+    if ok {
+        out_err("selftest[");
+        out_err(tag);
+        out_err("] ok（三种合法形状 / 默认端口 / 凭据头字节）\n");
+    }
+    return ok;
+}
+
+// 纯函数轮 B：回环绕过（三条真、四条「看着像回环其实不是」）。
+// 这七条是「本机目标一律直连」这条不变量的全部判据，值得单独一组。
+fn pxr_bypass_round() bool {
+    var ok: bool = true;
+    // ---- C) 回环绕过：三条真、四条假 ----
+    if !hpx_bypass("localhost" as &const byte, 9) {
+        pxr_fail("localhost 应当绕过代理", &ok);
+    }
+    if !hpx_bypass("LOCALHOST" as &const byte, 9) {
+        pxr_fail("localhost 的大小写不该影响判据", &ok);
+    }
+    if !hpx_bypass("127.0.0.1" as &const byte, 9) {
+        pxr_fail("127.0.0.1 应当绕过代理", &ok);
+    }
+    if !hpx_bypass("127.9.9.9" as &const byte, 9) {
+        pxr_fail("127/8 的其它地址也应当绕过代理", &ok);
+    }
+    if !hpx_bypass("::1" as &const byte, 3) {
+        pxr_fail("::1 应当绕过代理", &ok);
+    }
+    // 这几条是「看着像回环、其实不是」：判据必须是四段十进制 + 首段 127
+    if hpx_bypass("127.example.com" as &const byte, 15) {
+        pxr_fail("127.example.com 不是回环（域名不是地址）", &ok);
+    }
+    if hpx_bypass("128.0.0.1" as &const byte, 9) {
+        pxr_fail("128.0.0.1 不在 127/8 里", &ok);
+    }
+    if hpx_bypass("127.256.0.1" as &const byte, 11) {
+        pxr_fail("127.256.0.1 不是合法地址（每段 <= 255）", &ok);
+    }
+    if hpx_bypass("127.1" as &const byte, 5) {
+        pxr_fail("127.1 的简写不认（与 tcp_connect 的四段口径一致）", &ok);
+    }
+
+    return ok;
+}
+
+// 纯函数轮 C：七类非法值各指原因 / 不许半采纳 / 清空 / 失败分档。
+fn pxr_reject_round(tag: &const byte) bool {
+    var ok: bool = true;
+    // ---- D) 非法值：每一条都要**拒掉**，而且原因码要指到具体哪一种 ----
+    // 为什么逐条查原因码：只说「非法」时用户不知道改哪儿（`https://` 与 `端口 0`
+    // 的修法完全不同），而这个码就是启动期那句人话的判据。
+    pxr_set_expect(PXR_BAD_SCHEME, false, "socks5:// 应当被拒", &ok);
+    if hpx_err_now() != HPX_E_SCHEME {
+        pxr_fail("socks5:// 的原因码不是「只支持 http://」", &ok);
+    }
+    pxr_set_expect(PXR_BAD_SCHEME2, false, "https:// 应当被拒", &ok);
+    if hpx_err_now() != HPX_E_SCHEME {
+        pxr_fail("https:// 的原因码不是「只支持 http://」", &ok);
+    }
+    pxr_set_expect(PXR_BAD_HOST, false, "空主机名应当被拒", &ok);
+    if hpx_err_now() != HPX_E_HOST {
+        pxr_fail("空主机名的原因码不对", &ok);
+    }
+    pxr_set_expect(PXR_BAD_HOST6, false, "IPv6 字面量应当被拒", &ok);
+    if hpx_err_now() != HPX_E_HOST {
+        pxr_fail("IPv6 字面量的原因码不是「主机名非法」", &ok);
+    }
+    pxr_set_expect(PXR_BAD_PORT, false, "非数字端口应当被拒", &ok);
+    if hpx_err_now() != HPX_E_PORT {
+        pxr_fail("非数字端口的原因码不对", &ok);
+    }
+    pxr_set_expect(PXR_BAD_PORT2, false, "端口 0 应当被拒", &ok);
+    if hpx_err_now() != HPX_E_PORT {
+        pxr_fail("端口 0 的原因码不对", &ok);
+    }
+    pxr_set_expect(PXR_BAD_PORT3, false, "端口 65536 应当被拒", &ok);
+    if hpx_err_now() != HPX_E_PORT {
+        pxr_fail("越界端口的原因码不对", &ok);
+    }
+    pxr_set_expect(PXR_BAD_USER, false, "只有用户名的 userinfo 应当被拒", &ok);
+    if hpx_err_now() != HPX_E_USERINFO {
+        pxr_fail("userinfo 缺 `:` 时没记成「凭据形状」", &ok);
+    }
+    pxr_set_expect(PXR_BAD_EXTRA, false, "带路径的取值应当被拒", &ok);
+    if hpx_err_now() != HPX_E_EXTRA {
+        pxr_fail("带路径的取值没被记成「端口后有东西」", &ok);
+    }
+    // 非法值**不许半采纳**：上面最后一条是坏值，此刻代理必须处于「没配」的状态
+    if hpx_active() {
+        pxr_fail("取值非法之后代理还处于生效状态（半采纳了）", &ok);
+    }
+
+    // ---- E) 清空之后不该再报 active（`--no-proxy` 走的就是这条）----
+    _ = hpx_set(PXR_OK_PLAIN);
+    if !hpx_active() {
+        pxr_fail("合法值没让代理生效", &ok);
+    }
+    _ = hpx_set(null as &const byte);
+    if hpx_active() || hpx_port() != 0 {
+        pxr_fail("清空之后代理还生效（或者端口没清）", &ok);
+    }
+    _ = hpx_set("" as &const byte);
+    if hpx_active() {
+        pxr_fail("空串应当等于「没配代理」", &ok);
+    }
+
+    // ---- F) 失败分类：可重试/不可重试两档（判据与 retryx 同一条）----
+    if !hpx_retryable(HPX_E_DIAL, 0) {
+        pxr_fail("连不上代理应当是「可重试」（代理刚起来那几秒）", &ok);
+    }
+    if !hpx_retryable(HPX_E_TIMEOUT, 0) {
+        pxr_fail("隧道超时应当是「可重试」", &ok);
+    }
+    if !hpx_retryable(HPX_E_STATUS, 503) {
+        pxr_fail("CONNECT 503 应当是「可重试」", &ok);
+    }
+    if hpx_retryable(HPX_E_STATUS, 407) {
+        pxr_fail("407（凭据错）不该被重试（配置面，重发只会刷屏）", &ok);
+    }
+    if hpx_retryable(HPX_E_BADRESP, 0) {
+        pxr_fail("应答畸形不该被重试", &ok);
+    }
+
+    if ok {
+        out_err("selftest[");
+        out_err(tag);
+        out_err("] ok（七类非法值各指原因 / 清空 / 失败分档）\n");
+    }
+    return ok;
+}
+
+// ============================================================
+// 现地假代理轮
+// ============================================================
+// 假代理的读：从 fd 读到 `\r\n\r\n` 为止（上限 8 KiB），返回读到的总长度（0 = 失败/EOF）。
+//
+// 用一个循环把「读头」这件小事收在一处：脚本里每个 step 都要用，而且要认「对端把
+// 请求头与（隧道里的）第一段数据一起发来」—— 那种情况下多出来的字节就是隧道数据，
+// 必须留在缓冲里给隧道的回显逻辑用。
+fn pxr_read_head(fd: i32, rx: &Buf) usize {
+    buf_reset(rx);
+    var tmp: [byte: 2048] = [0: 2048];
+    while true {
+        const view: &[byte] = rx.ptr[0: rx.len];
+        if find_sub(view, &"\r\n\r\n"[0: 4], 0) >= 0 {
+            return rx.len;
+        }
+        if rx.len > 8192 {
+            return 0;
+        }
+        const n: usize = https_read_some(fd, &tmp[0], 2048) catch {
+            return 0;
+        };
+        if n == 0 {
+            return 0;
+        }
+        if !buf_append(rx, &tmp[0], n) {
+            return 0;
+        }
+    }
+    return 0;
+}
+
+// 假代理的写：整段写满（失败当本 step 失败）。
+fn pxr_send(fd: i32, lit: &const byte) bool {
+    const n: usize = bufx_cstr_len(lit);
+    https_write_all(fd, lit, n) catch {
+        return false;
+    };
+    return true;
+}
+
+// 服务一条连接：读到请求头（存在 rx 里，长度 head_n），返回 false = 对端没把请求发全。
+fn pxr_take_request(cfd: i32, rx: &Buf, head_n: &usize) bool {
+    const n: usize = pxr_read_head(cfd, rx);
+    if n == 0 {
+        return false;
+    }
+    head_n[0] = n;
+    return true;
+}
+
+// 断言收到的请求头**逐字节**等于期望（期望从自测的字面量来，不用产品代码拼）。
+fn pxr_expect_head(rx: &const Buf, head_n: usize, want: &const byte) bool {
+    const wn: usize = bufx_cstr_len(want);
+    if head_n != wn {
+        return false;
+    }
+    return pxr_eq_ptr(rx.ptr as &const byte, wn, want);
+}
+
+// 隧道步（step 1）：断言 CONNECT 原文，回 200，再把客户端随后的字节**原样回显**。
+// 回显是「隧道真的是透明的」这条判据的落点：如果实现把隧道当成了普通请求/响应
+// （比如自己吃掉了一段），回显就回不来。
+fn pxr_step_tunnel(cfd: i32, rx: &Buf) i32 {
+    var head_n: usize = 0;
+    if !pxr_take_request(cfd, rx, &head_n) {
+        return 1;
+    }
+    if !pxr_expect_head(rx, head_n, PXR_WIRE_CONNECT) {
+        return 2;
+    }
+    if !pxr_send(cfd, PXR_REPLY_200) {
+        return 3;
+    }
+    // 隧道里的那段：读多少回多少（客户端写完 PING 之后读回同一串）
+    var tmp: [byte: 512] = [0: 512];
+    const n: usize = https_read_some(cfd, &tmp[0], 512) catch {
+        return 4;
+    };
+    if n == 0 {
+        return 4;
+    }
+    https_write_all(cfd, &tmp[0], n) catch {
+        return 4;
+    };
+    return 0;
+}
+
+// 明文代理步（step 2）：断言**绝对形式**的请求行 + 那个头，回一条最小的 200。
+// 判据只写到 User-Agent 之前：UA 之后还有别的头（Content-Length 等），
+// 而这一段掐的正是「请求行写绝对形式 + Host 是目标」这件事。
+fn pxr_step_abs(cfd: i32, rx: &Buf) i32 {
+    var head_n: usize = 0;
+    if !pxr_take_request(cfd, rx, &head_n) {
+        return 5;
+    }
+    const wn: usize = bufx_cstr_len(PXR_WIRE_ABS);
+    if head_n < wn || !pxr_eq_ptr(rx.ptr as &const byte, wn, PXR_WIRE_ABS) {
+        return 6;
+    }
+    // 凭据头也要在（明文代理那一路的凭据），且必须在 User-Agent 之前
+    const an: usize = bufx_cstr_len(PXR_AUTH_NEEDLE);
+    if find_sub(rx.ptr[0: head_n], PXR_AUTH_NEEDLE[0: an], 0) < 0 {
+        return 7;
+    }
+    if !pxr_send(cfd, PXR_REPLY_ABS) {
+        return 8;
+    }
+    return 0;
+}
+
+// 拒绝步（step 3/4）：断言 CONNECT 原文，回 407 / 502。
+fn pxr_step_reject(cfd: i32, rx: &Buf, reply: &const byte) i32 {
+    var head_n: usize = 0;
+    if !pxr_take_request(cfd, rx, &head_n) {
+        return 9;
+    }
+    if !pxr_expect_head(rx, head_n, PXR_WIRE_CONNECT) {
+        return 10;
+    }
+    if !pxr_send(cfd, reply) {
+        return 11;
+    }
+    return 0;
+}
+
+// 回环绕过步（step 5）：请求直接打到**本假代理**（父进程把代理指向死端口，
+// 若绕过没生效就根本连不上），且请求行必须是**相对形式**。
+fn pxr_step_bypass(cfd: i32, rx: &Buf) i32 {
+    var head_n: usize = 0;
+    if !pxr_take_request(cfd, rx, &head_n) {
+        return 12;
+    }
+    const wn: usize = bufx_cstr_len(PXR_WIRE_BYPASS);
+    if head_n < wn || !pxr_eq_ptr(rx.ptr as &const byte, wn, PXR_WIRE_BYPASS) {
+        return 13;
+    }
+    if !pxr_send(cfd, PXR_REPLY_BYPASS) {
+        return 14;
+    }
+    return 0;
+}
+
+// 假代理主体（跑在 fork 出来的子进程里）：按脚本服务 PXR_CONNS 条连接，
+// 第一个失败项的编号当退出码返回（0 = 全过）。
+// 为什么按**固定条数**服务而不是「服务到被杀」：父进程的脚本步数是一定的，
+// 服务完就退，父进程的 wait_child 才能拿到一个有意义的退出码。
+fn pxr_fake_proxy(lfd: i32) i32 {
+    var rx: Buf = buf_new(4096);
+    defer { buf_free(&rx); }
+    if !buf_valid(&rx) {
+        return 90;
+    }
+    const t0: u64 = ua_now_ms();
+    var served: i32 = 0;
+    while served < PXR_CONNS {
+        if (ua_now_ms() - t0) > PXR_ACCEPT_BUDGET_MS {
+            return 91;   // 父进程少走了几步（诊断里能一眼看出是脚本没对上）
+        }
+        var pfds: [PollFd: 1] = [PollFd{ fd: lfd, events: POLLIN, revents: 0 }];
+        const pr: i32 = sys_poll(&pfds[0], 1, 200) catch { 0; };
+        if pr <= 0 {
+            continue;
+        }
+        var peer: [byte: 16] = [0: 16];
+        var plen: u32 = 16;
+        const cfd: i32 =
+            sys_accept(lfd, &peer[0] as &void, &plen) catch { -1; };
+        if cfd < 0 {
+            continue;
+        }
+        var rc: i32 = 0;
+        if served == 0 {
+            rc = pxr_step_tunnel(cfd, &rx);
+        } else if served == 1 {
+            rc = pxr_step_abs(cfd, &rx);
+        } else if served == 2 {
+            rc = pxr_step_reject(cfd, &rx, PXR_REPLY_407);
+        } else if served == 3 {
+            rc = pxr_step_reject(cfd, &rx, PXR_REPLY_502);
+        } else {
+            rc = pxr_step_bypass(cfd, &rx);
+        }
+        _ = sys_close(cfd) catch {};
+        if rc != 0 {
+            return rc;   // 第一个失败项就是答案（后面的步骤依赖前面的状态）
+        }
+        served = served + 1;
+    }
+    return 0;
+}
+
+// 起一个 127.0.0.1 上的监听套接字（端口 0 = 内核分配），返回 fd；失败返回 -1。
+fn pxr_listen(out_port: &u16) i32 {
+    const lfd: i32 = sys_socket(AF_INET, SOCK_STREAM, IPPROTO_TCP) catch {
+        return -1;
+    };
+    var one: i32 = 1;
+    _ = sys_setsockopt(lfd, SOL_SOCKET, SO_REUSEADDR, &one as &void,
+        4 as u32) catch {};
+    var addr: [byte: 16] = [0: 16];
+    fill_sockaddr_ipv4(127, 0, 0, 1, 0, &addr[0]);
+    if (sys_bind(lfd, &addr[0] as &void, 16 as u32) catch { -1; }) != 0 {
+        _ = sys_close(lfd) catch {};
+        return -1;
+    }
+    if (sys_listen(lfd, 4) catch { -1; }) != 0 {
+        _ = sys_close(lfd) catch {};
+        return -1;
+    }
+    const p: u16 = srv_local_port(lfd);
+    if p == 0 {
+        _ = sys_close(lfd) catch {};
+        return -1;
+    }
+    out_port[0] = p;
+    return lfd;
+}
+
+// 把父进程的脚本算出来的两个 URL 拼好（代理端口 / 目标端口都来自内核分配）。
+fn pxr_url(out: &Buf, scheme: &const byte, host: &const byte, port: u16,
+    path: &const byte) void {
+    buf_reset(out);
+    _ = buf_append_cstr(out, scheme);
+    _ = buf_append_cstr(out, host);
+    _ = buf_append_byte(out, 58);
+    _ = buf_append_u64(out, port as u64);
+    _ = buf_append_cstr(out, path);
+}
+
+// 父进程的 step 1：https 目标 ⇒ CONNECT 隧道，且隧道是透明的（回显的字节逐字节相同）。
+fn pxr_parent_tunnel(ok: &bool) void {
+    var u: Buf = buf_new(128);
+    defer { buf_free(&u); }
+    pxr_url(&u, "https://" as &const byte,
+        "proxy-selftest.invalid" as &const byte, 8443,
+        "/v1/chat" as &const byte);
+    var pu: Url = url_empty();
+    const pr: !void = url_parse(u.ptr[0: u.len], &pu);
+    _ = pr catch {
+        pxr_fail("step1：URL 没解析出来（自测夹具自己坏了）", ok);
+        return;
+    };
+    const route0: u8 = hc_route_for(&pu);
+    if route0 != HC_ROUTE_TUNNEL {
+        pxr_fail("step1：https 目标配了代理，路由却不是 CONNECT 隧道", ok);
+        url_free(&pu);
+        return;
+    }
+    // 路由写回用一个可写变量接着：`hc_connect` 自己会重算一次路由（同一条
+    // `hc_route_for` 的结论），这里给它一个可写的落点只是形状要求。
+    var rt: u8 = route0;
+    const fd: i32 = hc_connect(&pu, 8000, &rt) catch {
+        pxr_fail("step1：隧道没打通（CONNECT 没被代理接受）", ok);
+        url_free(&pu);
+        return;
+    };
+    url_free(&pu);
+    defer { _ = sys_close(fd) catch {}; }
+    const body: &const byte = PXR_ECHO;
+    const bn: usize = bufx_cstr_len(body);
+    https_write_all(fd, body, bn) catch {
+        pxr_fail("step1：往隧道里写失败", ok);
+        return;
+    };
+    var back: [byte: 64] = [0: 64];
+    const got: usize = https_read_some(fd, &back[0], 64) catch {
+        pxr_fail("step1：从隧道里读失败", ok);
+        return;
+    };
+    if got != bn || !pxr_eq_ptr(&back[0], got, body) {
+        pxr_fail("step1：隧道不透明（回显的字节与写进去的不一样）", ok);
+    }
+}
+
+// 父进程的 step 2：http 目标 ⇒ 连代理、请求行写绝对形式，应答体逐字节收下。
+fn pxr_parent_abs(ok: &bool, proxy_port: u16) void {
+    var u: Buf = buf_new(128);
+    defer { buf_free(&u); }
+    pxr_url(&u, "http://" as &const byte,
+        "proxy-selftest.invalid" as &const byte, 8081,
+        "/v1/chat" as &const byte);
+    // 空的 pin 切片：**不能**写 `&""[0: 0]`（那是「切片字面量取地址」，踩坑 22），
+    // 也不能用 `buf_empty().ptr[0: 0]`（那是空指针切片）—— 借一个真缓冲的头。
+    var eb: Buf = buf_new(1);
+    defer { buf_free(&eb); }
+    var body: Buf = buf_new(4);
+    defer { buf_free(&body); }
+    _ = buf_append_cstr(&body, "{}");
+    var r: Resp = resp_empty();
+    defer { resp_free(&r); }
+    var tc: TlsConn = tls_conn_empty();
+    const call: !void = http_request(u.ptr[0: u.len], &"POST"[0: 4],
+        &"X-Test: 1\r\n"[0: 11], body.ptr as &const byte, body.len, 8000,
+        65536, HC_VERIFY_NONE, eb.ptr[0: 0], &r, &tc);
+    _ = call catch {
+        out_err("selftest[proxy] note: step2 失败时代理端口 = ");
+        out_err_dec(proxy_port as usize);
+        out_err("\n");
+        pxr_fail("step2：明文目标走代理没成功（绝对形式那条路）", ok);
+        return;
+    };
+    if r.status != 200 {
+        pxr_fail("step2：经代理拿到状态码不是 200", ok);
+        return;
+    }
+    if !pxr_eq_ptr(r.body.ptr as &const byte, r.body.len,
+        "PROXY-ABS-OK" as &const byte) {
+        pxr_fail("step2：经代理拿到的体不是逐字节的那 12 个字节", ok);
+    }
+}
+
+// 父进程的 step 3/4：两种「被代理拒绝」要落到两个不同的错误码上。
+fn pxr_parent_reject(ok: &bool, want_failed: bool, want_status: i32) void {
+    var u: Buf = buf_new(128);
+    defer { buf_free(&u); }
+    pxr_url(&u, "https://" as &const byte,
+        "proxy-selftest.invalid" as &const byte, 8443,
+        "/v1/chat" as &const byte);
+    var pu: Url = url_empty();
+    const pr: !void = url_parse(u.ptr[0: u.len], &pu);
+    _ = pr catch {
+        pxr_fail("拒绝腿：URL 没解析出来", ok);
+        return;
+    };
+    var route: u8 = HC_ROUTE_DIRECT;
+    const res: !i32 = hc_connect(&pu, 8000, &route);
+    url_free(&pu);
+    _ = res catch |err| {
+        const eid: i32 = (@error_id(err) as! i32).value;
+        const is_failed: bool = eid == @error_id(error.HcProxyFailed);
+        const is_unavail: bool = eid == @error_id(error.HcProxyUnavailable);
+        if want_failed && !is_failed {
+            pxr_fail("407 那一腿应当报「代理失败（不可重试）」", ok);
+        }
+        if !want_failed && !is_unavail {
+            pxr_fail("502 那一腿应当报「代理暂时不可用（可重试）」", ok);
+        }
+        if hpx_status_now() != want_status {
+            pxr_fail("拒绝腿记下的状态码不是代理回的那个", ok);
+        }
+        return;
+    };
+    pxr_fail("被代理拒绝的腿却连上了", ok);
+}
+
+// 父进程的 step 5：目标是回环 ⇒ 无论如何都直连（代理指向一个没人听的端口）。
+fn pxr_parent_bypass(ok: &bool, target_port: u16) void {
+    _ = hpx_set("127.0.0.1:1" as &const byte);
+    var u: Buf = buf_new(128);
+    defer { buf_free(&u); }
+    pxr_url(&u, "http://" as &const byte, "127.0.0.1" as &const byte,
+        target_port, "/x" as &const byte);
+    var eb: Buf = buf_new(1);
+    defer { buf_free(&eb); }
+    var nb: Buf = buf_new(1);
+    defer { buf_free(&nb); }
+    var r: Resp = resp_empty();
+    defer { resp_free(&r); }
+    var tc: TlsConn = tls_conn_empty();
+    const call: !void = http_request(u.ptr[0: u.len], &"GET"[0: 3],
+        eb.ptr[0: 0], nb.ptr as &const byte, 0, 8000, 65536, HC_VERIFY_NONE,
+        eb.ptr[0: 0], &r, &tc);
+    _ = call catch {
+        pxr_fail("回环目标没绕过代理（本该直连，却去连了那个死端口）", ok);
+        return;
+    };
+    if !pxr_eq_ptr(r.body.ptr as &const byte, r.body.len,
+        "BYPASS-OK" as &const byte) {
+        pxr_fail("回环那条腿的体不对（连到的可能不是夹具）", ok);
+    }
+}
+
+// 现地假代理轮：起假代理 → 五个步骤逐条断言 → 收子进程的判定码。
+fn pxr_live_round(tag: &const byte) bool {
+    var ok: bool = true;
+    var proxy_port: u16 = 0;
+    const lfd: i32 = pxr_listen(&proxy_port);
+    if lfd < 0 {
+        pxr_fail("夹具：假代理没监听起来", &ok);
+        return ok;
+    }
+    const pid64: i64 = sys_fork() catch {
+        _ = sys_close(lfd) catch {};
+        pxr_fail("夹具：fork 假代理失败", &ok);
+        return ok;
+    };
+    if pid64 == 0 {
+        sys_exit(pxr_fake_proxy(lfd));
+    }
+    const pid: i32 = i64_to_i32(pid64);
+    _ = sys_close(lfd) catch {};   // 父进程不需要这个监听套接字
+    // 假代理地址就是**真代理**地址：`host:port` 形状里 host 用回环（clash 那种本机代理
+    // 的常态），目标用 `.invalid` 域名 ⇒ 不会被回环绕过规则放行。
+    // ⚠ 拼接纪律：`hpx_set` 收的是 **C 串**（`bufx_cstr_len` 要扫到 NUL），而
+    // `buf_append_cstr` **不补 NUL**、`buf_append_cstr_z` 会把 NUL 补在**值中间**
+    // （端口就丢了）—— 只有「cstr + 端口 + 显式补一个 0」这一种拼法是对的。
+    // 本轮第一版先后踩了这两个（症状都是「合法值被 hpx_set 拒掉」，看原因码毫无道理）。
+    var pv: Buf = buf_new(64);
+    defer { buf_free(&pv); }
+    _ = buf_append_cstr(&pv, "http://user:pass@127.0.0.1:");
+    _ = buf_append_u64(&pv, proxy_port as u64);
+    _ = buf_append_byte(&pv, 0);
+    if !hpx_set(pv.ptr as &const byte) {
+        out_err("selftest[proxy] note: hpx_set 失败，原因码 = ");
+        out_err_dec(hpx_err_now() as usize);
+        out_err("\n");
+        pxr_fail("夹具：把假代理钉进传输层失败", &ok);
+        _ = sys_kill(pid as i64, SIGKILL) catch {};
+        _ = wait_child(pid);
+        return ok;
+    }
+    // 五个步骤的顺序与子进程脚本一一对应（少走一步会让子进程超时退出并报 91）
+    pxr_parent_tunnel(&ok);
+    pxr_parent_abs(&ok, proxy_port);
+    pxr_parent_reject(&ok, true, 407);
+    pxr_parent_reject(&ok, false, 502);
+    pxr_parent_bypass(&ok, proxy_port);
+    const rc: i32 = wait_child(pid);
+    if rc != 0 {
+        out_err("selftest[proxy] note: 假代理判定码 = ");
+        out_err_dec(rc as usize);
+        out_err("（1..14 = 第几步的哪条断言；90 = 内存；91 = 等连接超时）\n");
+        pxr_fail("假代理侧的断言没过（线上的字节与期望不符）", &ok);
+    }
+    _ = hpx_set(null as &const byte);   // 别把代理留给后面的轮次
+    if ok {
+        out_err("selftest[");
+        out_err(tag);
+        out_err("] ok（CONNECT 原文 / 隧道回显透明 / 绝对形式请求行 / ");
+        out_err("407 与 502 各自归位 / 回环绕过）\n");
+    }
+    return ok;
+}
+
+// 两段的合体入口（selftest.uya 里一行调用）。
+fn pxr_rounds(tag: &const byte) bool {
+    const a: bool = pxr_parse_round(tag);
+    const b: bool = pxr_bypass_round();
+    const c: bool = pxr_reject_round(tag);
+    const d: bool = pxr_live_round(tag);
+    return a && b && c && d;
+}

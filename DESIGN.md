@@ -46,7 +46,7 @@ uya-agent 是一个**纯 Uya 源码**实现的命令行编程 agent：给它一�
 | 域 | 装什么 | 判定问句 |
 |---|---|---|
 | `foundation/` | 零依赖底座：字节缓冲、JSON、YAML | 「它能依赖谁？」—— 只依赖 `libc`/`std` |
-| `net/` | 传输与协议：HTTP、流式、SSE、LLM 协议 | 「它说网络协议吗？」 |
+| `net/` | 传输与协议：HTTP、流式、SSE、LLM 协议、出站代理与指纹库 | 「它说网络协议吗？」 |
 | `web/` | `--web` 的界面侧：服务端终端解释器、HTTP 收口、页面与泵点（5 个文件，见 §11.8） | 「它只在 web 界面里跑吗？」 |
 | `term/` | 终端与界面：tty、markdown、转录显示、任务块 | 「它在画屏幕吗？」 |
 | `term/tui/` | 全屏 TUI（按依赖序拆成 11 个文件） | 「它是 TUI 的哪一段？」 |
@@ -6705,6 +6705,8 @@ DEEPSEEK_API_KEY=sk-xxx ./build/uya-agent \
 | `tls-pin` / `tls-tofu` | P78 信任档位（踩坑 132，离线、不联网、不需要证书）：`tls-pin` 段验指纹库的纯函数 —— 两行好行 + `#` 注释 + 空行解析出 2 条、主机名与指纹**两侧**大小写折叠、4 行畸形（hex 过短/过长/非 hex/只有主机名）一律跳过而**不中止**（后面那行好行必须还在）、CRLF 行尾与末行无换行都认、同一主机多条指纹命中任意一条、追加行必须是 `<host> <小写 hex>\n`、空库什么都不信、长度不是 64 的查询一律不认；`tls-tofu` 段起**真的临时目录 + 真的文件**走闭环 —— 首次 `FRESH` 且那一行**真的落盘了**、二次 `TRUSTED`、指纹变了 `MISMATCH`、另一台主机照样 `FRESH` 且**不覆盖**第一台的记录。防假绿对照两处：把 `tp_trusts` 改成忽略指纹比对 ⇒ 红 3 条；把 `tls_tofu_verdict` 里「首次落盘」那行删掉 ⇒ 红 5 条 |
 | `e2e-portable` | `make e2e-portable`（P73，踩坑 124）：把 `build/uya-agent` **拷到一个空目录**、`HOME` 也是空目录、**没有 DSH、没有仓库**（真新机器的样子），只带一个二进制。① 内嵌 preset 兜底：`--print-config` 报 `knobs (source: embedded)` 且旋钮值 == 内置缺省（逐字节）；跑一轮 `--plan` ⇒ 假网关收到的请求里必须有 `Make the plan decision-complete`（**该串只存在于上游 preset**，工作树与编译器树 0 命中 ⇒ 判据不可能假绿）；② **反向断言**：`--dsh-root testdata/preset-root` 时必须是 `source: preset` + `readLimit=1777`（内嵌不许夺磁盘的权）；③ web 会话子进程：只走命令行给 `--base-url/--model/--permission read-only/--agent-home`，断言假网关**收到**请求、请求里的模型是父进程给的那个、会话日志落在 `--agent-home` 下；④ `--no-dsh-config` 这类没有 env 口径的开关必须被启动日志点名。防假绿对照（两条都做过）：把内嵌兜底改成恒 `false` ⇒ 红在①；只停 plan 段的抽取（来源/旋钮照旧）⇒ 红在「plan 策略段缺失」；摘掉 `web_child_env_cfg(cfg)` ⇒ 红在③ |
 | `dns-resolv` | P80 名字解析（踩坑 133，离线、不联网、不需要证书）：**四段**。① 纯扫描：夹具**特意造出** >512 字节的注释头（并断言 `ns_off > 512`，把「现场的形状」钉进断言）——老实现只读前 512 字节 ⇒ 判成「文件里没有 nameserver」；另加注释行/`;` 注释/`nameserverX`/关键字后必须空白/行尾注释/tab/CRLF/末行无换行/先 v6 后 v4/只有 v6/畸形行不中止/空与纯注释；② 真文件闭环：写一份同形状的临时 `resolv.conf`、把路径钉进去 ⇒ 解析器串**逐字节** `127.0.0.53`、来源 = 文件、删掉文件后**不再**声称来自文件（原因 = 打不开）；③ 覆盖：`$UYA_AGENT_DNS` 合法值优先、非法值**不采用**且记 `ENV_BAD`、端口越界同判、清掉后不报 env。**防假绿对照两处（都真做过）**：① 把整份读退回 `buf_new(512)` ⇒ **真文件轮 4 条红**（扫描轮那两条**不红** —— 纯函数对、接线错也算坏，所以回归腿必须打在读文件那一层）；这条对照顺带抓出产品里一个真缺陷：原因记账没有优先级，`TRUNC` 会盖掉「变量值非法」（修成 `hc_dns_err_rank`）。② 关键字改回「整行按前缀找 + 参数取下一个 token」⇒ 扫描轮 3 条红 |
+| `proxy` | P92 出站代理（离线，只打 127.0.0.1）：**四段**。① 形状：`host:port` / `http://host:port` / 带 `user:pass@` 三种合法 + 省端口按 8080 + 末尾一个 `/` 容忍；② 凭据头**逐字节**（`Proxy-Authorization: Basic dXNlcjpwYXNz\r\n`，期望值在自测里独立写死 —— 用产品代码拼期望值等于让判据与实现共享同一个错误）；③ 回环绕过九条（`localhost`/`127.0.0.1`/`127.9.9.9`/`::1` 真；`127.example.com`/`128.0.0.1`/`127.256.0.1`/`127.1` 假）；④ 七类非法值**各指原因**（scheme / host / port / userinfo / extra / toobig / 空）、非法值**不许半采纳**、清空后不报 active、失败分档（可重试与不可重试）。**现地假代理轮**（回环套接字 + fork，verdict 走退出码）：CONNECT 请求行与 `Host` 逐字节 + 隧道**回显透明** / 绝对形式请求行 + `Host` 是目标 + 凭据头在 / 407 ⇒ `HcProxyFailed` 且状态码记对 / 502 ⇒ `HcProxyUnavailable` / 回环绕过。**防假绿对照三处（都真做过）**：CONNECT 目标写成代理自己 ⇒ 隧道步红；绝对形式退回相对形式 ⇒ 假代理步红；删掉回环绕过 ⇒ 回环腿红。另一条记在踩坑里的：`url_host(&u)`（`u` 已是 `&const Url`）会让自测**直接 SIGSEGV**，而编译器全绿 |
+| `e2e-proxy` | `make e2e-proxy`（P92，离线，全程只打 127.0.0.1）：假代理（`testdata/mock_proxy.py`，**真转发**：解析绝对形式请求行、或建 CONNECT 隧道后双向搬字节）+ 假网关 + `.invalid` 域名（目标名只用于**断言**，真连接经代理的 `--upstream` 落到假网关 —— 与 `e2e-dns` 用假解析器把 `.invalid` 指到本机是同一手法）。① 正腿：`UYA_AGENT_PROXY` ⇒ 退出 0、答复上屏、**假网关真收到**（`req.bin` 非空 + 模型名）**且**代理日志是绝对形式；② 流式那条路（`hc_open`）另起 SSE 网关 + 第二个代理，答复与代理日志都断言；③ 凭据腿断言 `Proxy-Authorization: Basic dXNlcjpwYXNz`；④ `--proxy` CLI 档同效；⑤ `--no-proxy` 之后代理日志**行数不增**（真直连）；⑥⑦ 反腿：代理死端口 / CONNECT 被回 407 ⇒ 退出 2、说「代理没打通」、指名 `UYA_AGENT_PROXY`、**不许出现 TLS/DNS 字样**（407 那条另断言文案带状态码）；⑧ 反腿：值非法（env 与 CLI 各一次）⇒ 退出 1 + 为什么 + 点名来源；⑨ `--print-config` 四种来源（default / env / cli / `--no-proxy`）；⑩ 回环绕过（代理指死端口，目标 `127.0.0.1` 照样通） |
 | `e2e-dns` | `make e2e-dns`（P80，踩坑 133，离线，全程只打 127.0.0.1）：假 DNS（`testdata/mock_dns.py`）+ 假网关 + `.invalid` 域名（**RFC 2606 保留域，真解析器必然解不出来** ⇒ 跑绿只可能来自自家解析器）。① 正腿：`UYA_AGENT_DNS` 指向假 DNS ⇒ 退出 0、答复上屏、网关真收到；①b 同一条在 responses 协议上；②③ 反腿：解析器换成一个没人听的端口 ⇒ 退出 2、「域名解析失败」、给出 `UYA_AGENT_DNS` 这条路，**且 stderr 里不许出现 TLS**（流式与非流式各一条腿 —— 两条路的档位映射以前是各写一份的）；④ `--print-config` 的 `dns = … (source: …)` 两种来源各验一条 |
 | `tui-full` | P53 浮层全屏四组：**A** 非全屏仍是居中框（不顶格、`≤16` 行上限、第 30 项看不见）→ 全屏框 = 转录区（顶边第 0 行、左右边框 0 与 `cols-1`、标题 ` · 全屏`、行偏移表口径的逐行闭合、底边**正好**在 `panel_top-1`）+ 16 行上限解除（第 20 项可见、第 30 项仍不可见）；**B** `ctrl+f`（`0x06`）与 `F11`（`ESC[23~`）都切换，且**四种形态各认一次**（列表 / reader / ask / input）；**C** 不吃面板 / 状态区 / 脚注；**D** 没浮层时只落 notice、全屏态不跨浮层残留、`esc` 关掉后转录回来，终端太矮时 fail-closed 判据不变；**F** `/fullscreen` 四态（裸报状态 / `on` / `off` / 非法值只报错且状态不动、重复 `off` 幂等） |
 | `tui-mem` | 转录的内存纪律（踩坑 153，**四段判据全是数值、屏幕上看不见**）：① 记账恒等式 —— `tui_text_bytes()`（现算 Σ text.len）必须**逐字节等于** `tui_text_accounted()`（记账），派生同理；夹具含思考超 `TUI_REASON_TAIL` 的截尾与**两种宽度下重折**（这两条正是修前「只加不减」的两个现场），并打印实测的正文/派生字节数；② 派生上限 —— 正常 markdown 灌到正文上限附近（512 条 / 3.6 MB）派生必须 **< 上限**（实测 10.9 MB，即「一条正常内容都不会因为它被丢」的可执行版本），病态夹具（缩进 900 列的长行）派生必须**有界**（实测 20.4 MB）且真丢过条目、且不许把最后一条也丢掉；③ 清空 —— `tui_transcript_clear()` ×10 之后 `tui_entry_live_allocs()` 必须 **= 0**（ASSIST/TOOL/USER/NOTICE 四种条目都建过；修前漏的是 TOOL/USER/NOTICE 的 `wrap_ix`），三个记账与丢弃计数一起归零；④ 单条上限对**整块输入**成立（`✓ ` 起头的 1 MiB 工具行 ⇒ 该条目 `text.len` 不许超 `TUI_ENTRY_MAX`）+ 丢过条目后上滚时第 0 行出现「更早的 N 条已省略」。防假绿对照四次（见踩坑 153） |
@@ -8542,3 +8544,82 @@ env 档，**只有提供方键没有** —— 而它恰恰是「请求打到哪�
 
 **明确不做**：滚动模式的浮层（那边没有浮层，`/goal` 照旧打转录）；`clear` 的二次确认
 （理由见 §9.3）；新起第二个命令名（`/goal` 一个入口就够）；不动 `AGENT_VERSION`。
+
+### 19.16 P92：出站代理（`UYA_AGENT_PROXY` / `--proxy` / `--no-proxy`）
+
+**为什么要做**：企业网里访问模型端点只有一条路 —— **走代理**。在此之前本仓一个字节都
+不会走代理（`httpc` 直连 `tcp_connect`），于是「公司网里跑不起来」这件事在代码里没有
+出口，只能靠改 DNS/hosts 之类的外围手段绕。与 P80（`$UYA_AGENT_DNS`）是同一族：
+**多给一个可证的、能排障的出口**，而不是让失败长成一句「检查 base-url / 网络」。
+
+**形状**（唯一权威是 `net/proxyx` 的 `hpx_parse`）：
+
+| 项 | 口径 |
+|---|---|
+| 取值 | `host:port` · `http://host:port` · `http://user:pass@host:port`（scheme 与凭据都可省；末尾一个 `/` 允许） |
+| 缺端口 | 按 **8080** |
+| 来源 | CLI（`--proxy` / `--proxy=`）> `$UYA_AGENT_PROXY` > 无（直连）；`--no-proxy` = 显式关掉，压过 env |
+| 只支持 | **`http://` 明文代理**（HTTPS 目标打 CONNECT 隧道）—— `https://` / `socks5://` **报错退出** |
+| 值非法 | **`rc=1`**，消息点名是哪个入口给的 + 合法形状 + 具体是哪一处非法（七类原因码） |
+
+**五条不变量（每条都对应一处会咬人的地方）**：
+
+1. **TLS 判据一个字不变**：CONNECT 只搬字节，TLS 握手仍是**与目标主机**谈 ——
+   SNI / leaf 指纹 / TOFU / pin 全部照旧。代理要中间人就必须换 MITM 证书，那时 `pin`/TOFU
+   会如实报指纹不符（这正是想要的：**不让代理悄悄改变信任链**）。
+2. **传输层不认识环境变量**：`httpc` / `proxyx` 都不读 env；`agent_setup_proxy()` 由
+   agent 层在**第一次连接之前**钉进去（与 `hc_dns_set_override` / `hc_set_tofu_path` 同一
+   条纪律，踩坑 133 的修法）。
+3. **本机目标一律直连**：`localhost` / `127.0.0.0/8`（四段十进制）/ `::1` 走
+   `hpx_bypass`。理由不是「省一次转发」，而是**本机进程不该被代理**（`--dsh-web` 连本机
+   网关、自测夹具、用户的本地 vLLM/ollama）；代理多半没有回环转发，不绕就是本机自测全红。
+4. **失败口径分开**：`HcProxyUnavailable`（连不上代理 / 隧道超时 / 502·503·504，**可重试**）
+   与 `HcProxyFailed`（407 凭据错 / 403 / 应答畸形，**不可重试**）是两个码 —— 判据是
+   retryx 那条「重发一次会不会变好」（代理刚起来那几秒正是要救的现场；凭据错重发只会刷屏）。
+   显示层是**同一档**（`kind 9`），按 `hpx_err_now()` 说人话，且**不提 TLS/DNS**。
+5. **子进程覆盖三条路**：`--proxy X` 注入值；`UYA_AGENT_PROXY=X` 走 `env_set_kv` **换掉**
+   继承来的同名项；`--no-proxy` 注入**空值**挡住继承 —— 与 `UYA_AGENT_WEB=0` 同款双保险
+   （踩坑 103/124）。注入点只有 `websrv` 的 `web_child_env_cfg2` 一处，`--web` 与
+   `--dsh-web` 两条 spawn 路径共用它。
+
+**分工**：`net/proxyx` 是**纯数据变换**（解析、状态、报文拼装、应答状态行、失败分类），
+零 I/O —— 与 `net/tlspin` 同形，所以整份判据离线可测；真实连接（`tcp_connect`）与
+CONNECT 那一次读写留在 `net/httpc`（它才知道名字解析与泵点）。这顺带守住了 httpc 的体量
+（改完 1905 行，离 2000 还有余量）。
+
+**验收**：
+
+| 判据 | 位置 | 结果 |
+|---|---|---|
+| 三种合法形状 / 默认端口 / 凭据头**逐字节** / 回环绕过九条 / 七类非法值**各指原因** / 非法不半采纳 / 清空 / 失败分档 | `selftest[proxy]`（`UYA_SELFTEST_PROXY_ONLY=1`、`make proxy-selftest`） | 绿 |
+| **现地假代理**（回环套接字 + fork）：CONNECT 请求行与 `Host` 逐字节 + 隧道**回显透明** / 绝对形式请求行 + `Host` 是目标 / 407 ⇒ `HcProxyFailed` + 状态码 / 502 ⇒ `HcProxyUnavailable` / 回环绕过 | 同上 | 绿 |
+| **真二进制穿过代理到上游**：假代理（`testdata/mock_proxy.py`，真转发）+ 假网关，断言**假网关真收到**请求（`req.bin` 非空 + 模型名）**且**代理日志是绝对形式；流式那条腿另起 SSE 网关 + 第二个代理；凭据腿断言 `Proxy-Authorization: Basic dXNlcjpwYXNz`；`--proxy` CLI 档同效；`--no-proxy` 后代理日志**不再增长** | `make e2e-proxy`（并入 `selftest`） | 绿 |
+| 反腿：代理死端口 ⇒ `rc=2` + 「代理没打通」+ 指名 `UYA_AGENT_PROXY` + **不许出现 TLS/DNS 字样**；CONNECT 被回 407 ⇒ `rc=2` + 文案带状态码；非法值（env 与 CLI 各一次）⇒ `rc=1` + 为什么；`--print-config` 的 default/env/cli/`--no-proxy` 四种来源 | `make e2e-proxy` | 绿 |
+| 回环那条腿：代理指向死端口，目标 `127.0.0.1` 照样跑通 | `make e2e-proxy` | 绿 |
+| `web_childcfg`：`--proxy` 进子进程 / 默认不注入 / `--no-proxy` 注空值 | `selftest[web-childcfg]` | 绿 |
+
+**防假绿对照（都真做过，不是设想）**：
+
+* 把 CONNECT 的目标写成**代理自己**（`hpx_bypass` 里改成不做回环绕过也会顺带红）⇒
+  `selftest[proxy]` 的隧道步与 `e2e-proxy` 的 ①② 当场红（线上字节与上游收不到）。
+* 把绝对形式退回**相对形式**（`hc_append_target` 直接走 path）⇒ 隧道的假代理步红，
+  且 `e2e-proxy` ① 报「代理日志里没有相对/绝对形式那一行」。
+* 删掉**回环绕过**（`hc_route_for` 不看 `hpx_bypass`）⇒ 回环那条腿连到死端口、红。
+* 把 `hc_connect` 里的 `url_host(u)` 写回 `url_host(&u)`（`u` 本身已是 `&const Url`，
+  多取一次地址拿到的是**形参的地址**）⇒ `selftest[proxy]` 直接 SIGSEGV（本轮第一版就是
+  这么崩的；同族：踩坑 22 的「切片字面量取址」）。这条记在这里，因为**编译器全绿**。
+
+**明确不做**（不是遗漏）：
+
+* **SOCKS5 / `https://` 代理**：要另写一条协议；本轮给的是「报错退出」而不是静默降级。
+* **`HTTPS_PROXY` / `HTTP_PROXY` / `NO_PROXY`**：两个来源会让「为什么走了代理」难查；
+  `--dsh-assets-install` 的 `npm` 取件仍只认 npm 自己的变量（如实记在这里）。
+* **入站服务**（`--web` / `--dsh-web` 的监听）不受影响；MCP 是 stdio，不涉及。
+* **明文 HTTP 目标撞上代理 407** 时，407 是以「普通响应状态」回来的（不是 CONNECT 被拒），
+  本轮的报错是状态码那一路的常规文案。HTTPS 目标（LLM 端点的主流形态）不受此影响。
+
+**一处顺带修掉的老谎**：`agent_finish_retry`（预算用尽）以前把档位**写死 0**，于是
+「已重试 N 次仍失败」那一行永远落回笼统的「网络或 TLS 校验」。代理那两条是**可重试**的，
+必然走这条路 ⇒ 不修就等于新功能的报错被重试层吃掉。现在失败档位跨重试留住
+（`g_rtx_tls_kind`），`make e2e-retry` 的死端口负控腿也随之从「断言那句笼统话」收紧成
+「断言**连不上服务器**，且不许出现 TLS 校验」。

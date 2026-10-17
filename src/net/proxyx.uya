@@ -1,0 +1,593 @@
+// src/net/proxyx.uya — 出站代理（P92）：取值解析、路由判据、CONNECT 报文与记账
+//
+// 本文件：代理取值的解析（`hpx_parse`，三种合法形状 + 七类非法各给一个原因码）、
+//   进程级状态与钉桩（`hpx_set` 与 `hpx_host_*` 一族）、回环绕过判据（`hpx_bypass`，
+//   纯函数）、CONNECT 报文构造（`hpx_connect_head`）、CONNECT 应答状态行解析
+//   （`hpx_head_status`，纯函数）、失败原因记账（`hpx_note_fail` / `hpx_err_now`）与
+//   「要不要重发」的分类（`hpx_retryable`）。
+// 不变量：① **本文件不做任何 I/O**（连接、写请求、读应答都在 net/httpc 里，与
+//   net/tlspin 的分工同形）—— 所以全部判据离线可测；② 取值非法时**整份不采纳**且清空
+//   既有状态（绝不留下半份配置让后来的连接用错代理）；③ 回环（`localhost` / `127.0.0.0/8`
+//   / `::1`）**一律直连**，不是可配置项（理由见 `hpx_bypass`）；④ 只认 `http://` 明文代理，
+//   `https://` / `socks5://` 等**明确报错**而不是静默降级成直连。
+// 依赖：本仓 foundation/bufx；libc 只用到 std.encoding.base64（拼代理凭据）。
+// 命名：`hpx_*`（函数）、`Hpx*`（类型）、`HPX_*`（常量与原因码）。
+
+use std.encoding.base64.encode_base64;
+
+// ============================================================
+// 常量与原因码
+// ============================================================
+// 取值上限：`http://user:pass@host:port` 撑不到 256 字节，1024 是「明显写错」的止损线 ——
+// 不设上限的话一段误粘贴的文本会被当代理地址钉进去。
+export const HPX_VAL_MAX: usize = 1024;
+const HPX_HOST_MAX: usize = 256;
+const HPX_TARGET_MAX: usize = 256;
+// CONNECT 应答头的上限。真实应答是 `HTTP/1.1 200 Connection established\r\n\r\n`，
+// 带 `Proxy-Agent` 等头也就几百字节；8 KiB 是「对端在说别的协议」的止损线。
+export const HPX_HEAD_MAX: usize = 8192;
+// 不给端口时的默认值。8080 是明文代理的惯例（3128 是 squid、7890 是 clash —— 猜一个
+// 不如让用户写全；这里只兜「`http://proxy.corp`」这种省略写法）。
+export const HPX_DEFAULT_PORT: u16 = 8080;
+
+// 失败原因（`hpx_err_now()` 的取值）。**只给码，人话在 agent 层** ——
+// 与 `hc_dns_err_now()` / `agent_dns_err_text()` 同一分工（显示层不猜、也不复刻判据）。
+export const HPX_E_NONE: i32 = 0;
+export const HPX_E_DIAL: i32 = 1;       // 连不上代理（TCP 没建立）
+export const HPX_E_TIMEOUT: i32 = 2;    // 隧道应答没回来（超时）
+export const HPX_E_STATUS: i32 = 3;   // CONNECT 被拒（状态码见 hpx_status_now）
+export const HPX_E_BADRESP: i32 = 4;    // 应答畸形（不是 HTTP / 没读完就断）
+export const HPX_E_BADVAL: i32 = 5;     // 取值非法（下面五条是细分的「哪一种非法」）
+export const HPX_E_SCHEME: i32 = 6;   // 只支持 http://（https / socks5 等）
+export const HPX_E_HOST: i32 = 7;       // 主机名空 / 含非法字符 / IPv6 字面量
+export const HPX_E_PORT: i32 = 8;       // 端口非数字 / 0 / 越界
+export const HPX_E_USERINFO: i32 = 9;   // userinfo 里没有 `:`（只有用户名，怎么发凭据没定论）
+export const HPX_E_EXTRA: i32 = 10;     // host:port 之后还有别的东西（路径等）
+export const HPX_E_TOOBIG: i32 = 11;    // 取值超 HPX_VAL_MAX
+
+// ============================================================
+// 状态（进程级；由 agent 层在启动时钉进来）
+//
+// 传输层不认识环境变量 —— `hpx_set` 的调用点是 `agent_setup_proxy`，与
+// `hc_dns_set_override` / `hc_set_tofu_path` 是同一条纪律（踩坑 133 的修法）。
+// ============================================================
+var hpx_val: Buf = Buf{ ptr: null, len: 0, cap: 0 };     // 原值（打印与实际值同源）
+var hpx_host: Buf = Buf{ ptr: null, len: 0, cap: 0 };   // NUL 结尾（tcp_connect 要）
+var hpx_auth: Buf = Buf{ ptr: null, len: 0, cap: 0 };   // 预拼好的凭据头（含 CRLF）
+var hpx_active: bool = false;
+var hpx_port: u16 = 0;
+var hpx_err: i32 = HPX_E_NONE;
+var hpx_status: i32 = 0;      // 最近一次 CONNECT 应答的状态码（0 = 没拿到）
+// 最近一次隧道尝试的**目标**（不是代理）：诊断要能同时说出「代理是谁、要去哪」。
+var hpx_target: [byte: HPX_TARGET_MAX] = [0: HPX_TARGET_MAX];
+var hpx_target_n: usize = 0;
+var hpx_target_port: u16 = 0;
+
+// 清空全部状态（钉新值之前、或取值非法时都走这里）。不释放 hpx_val 之外的缓冲分配，
+// 由 hpx_set 自己决定 —— 这个函数只负责「状态回到没配代理」。
+fn hpx_reset_state() void {
+    hpx_active = false;
+    hpx_port = 0;
+    hpx_err = HPX_E_NONE;
+    hpx_status = 0;
+    hpx_target_n = 0;
+    hpx_target_port = 0;
+}
+
+// ============================================================
+// 取值解析（纯函数，离线可测）
+// ============================================================
+// 解析结果：host/user/pass 都是**原值切片里的偏移**（不另分配；调用方用完即弃）。
+export struct HpxUrl {
+    host_off: usize,
+    host_len: usize,
+    port: u16,
+    user_off: usize,
+    user_len: usize,
+    pass_off: usize,
+    pass_len: usize,
+    has_auth: bool,
+}
+
+// 一个空解析结果（调用方零初始化之后喂给 hpx_parse）。
+export fn hpx_url_empty() HpxUrl {
+    return HpxUrl{ host_off: 0, host_len: 0, port: 0, user_off: 0,
+        user_len: 0, pass_off: 0, pass_len: 0, has_auth: false };
+}
+
+// 主机名字符集：字母数字与 `.` `-` `_`。**不接受** `[`（IPv6 字面量）——
+// 本仓的传输层只做 IPv4（`tcp_connect` 不解析 v6），收下一个连不上的地址不如当场说清。
+fn hpx_host_char_ok(c: byte) bool {
+    if is_digit(c) {
+        return true;
+    }
+    if c >= 65 && c <= 90 {
+        return true;
+    }
+    if c >= 97 && c <= 122 {
+        return true;
+    }
+    return c == 46 || c == 45 || c == 95;
+}
+
+// 端口段：全是十进制数字、值 1..65535（0 与越界都算非法 —— 都要能指到具体哪一处错）。
+fn hpx_port_span(v: &[byte], from: usize, n: usize, out: &u16) i32 {
+    if from >= n {
+        return HPX_E_PORT;
+    }
+    var i: usize = from;
+    var val: i64 = 0;
+    while i < n {
+        if !is_digit(v.ptr[i]) {
+            return HPX_E_PORT;
+        }
+        val = val * (10 as i64) + ((v.ptr[i] as i64) - (48 as i64));
+        if val > 65535 {
+            return HPX_E_PORT;
+        }
+        i = i + 1;
+    }
+    if val <= 0 {
+        return HPX_E_PORT;
+    }
+    out[0] = val as u16;
+    return HPX_E_NONE;
+}
+
+// 解析一个代理取值。返回 **HPX_E_NONE(0)** = 合法，否则是上面那一族原因码。
+//
+// 合法形状（`http://` 与凭据都可省，端口省了按 HPX_DEFAULT_PORT）：
+//     host:port  ·  http://host:port  ·  http://user:pass@host:port
+// 末尾一个 `/` 允许（`http://h:1/` 是 copy-paste 的常见形态），再多的路径段一律拒绝 ——
+// 代理地址里的路径没有语义，收下它等于悄悄丢掉用户写的东西。
+//
+// 判据的**顺序**是刻意的：先剥 `://`，再剥 `@`，最后才判 host/port —— 这样
+// `http://user:pass@host:port` 与 `user@host:port`（非法）走的是同一条路的两个出口。
+fn hpx_parse_body(v: &[byte], out: &HpxUrl) i32 {
+    const n: usize = v.len;
+    if n == 0 {
+        return HPX_E_HOST;
+    }
+    var i: usize = 0;
+    // ① scheme：有 `://` 才当作 scheme 段来判（`host:port` 里的 `:` 不是 scheme）
+    const sep: isize = find_sub(v, &"://"[0: 3], 0);
+    if sep >= 0 {
+        const sl: usize = sep as usize;
+        if !(sl == 4 || sl == 5) {
+            return HPX_E_SCHEME;
+        }
+        if !eq_ignore_case(v.ptr[0: sl], &"http"[0: 4]) {
+            return HPX_E_SCHEME;
+        }
+        i = sl + 3;
+    }
+    // 剥掉末尾一个 `/`
+    var end: usize = n;
+    if end > i && v.ptr[end - 1] == 47 as byte {
+        end = end - 1;
+    }
+    if end <= i {
+        return HPX_E_HOST;
+    }
+    // ② userinfo（可选）：`user:pass@`
+    const at: isize = bufx_find_byte(v.ptr[0: end], 64 as byte, i);
+    if at >= 0 {
+        const al: usize = at as usize;
+        if al <= i {
+            return HPX_E_HOST;
+        }
+        const colon: isize = bufx_find_byte(v.ptr[i: al], 58 as byte, 0);
+        if colon < 0 {
+            return HPX_E_USERINFO;
+        }
+        out.user_off = i;
+        out.user_len = (colon as usize);
+        out.pass_off = i + (colon as usize) + 1;
+        out.pass_len = al - out.pass_off;
+        out.has_auth = true;
+        i = al + 1;
+    }
+    // ③ host[:port]；host 里不许再出现 `@`
+    var host_end: usize = i;
+    while host_end < end && v.ptr[host_end] != 58 as byte {
+        host_end = host_end + 1;
+    }
+    if host_end == i {
+        return HPX_E_HOST;
+    }
+    var k: usize = i;
+    while k < host_end {
+        if !hpx_host_char_ok(v.ptr[k]) {
+            return HPX_E_HOST;
+        }
+        k = k + 1;
+    }
+    out.host_off = i;
+    out.host_len = host_end - i;
+    if host_end == end {
+        out.port = HPX_DEFAULT_PORT;
+        return HPX_E_NONE;
+    }
+    // 端口段：先按「连续数字」切出这一段，再看它后面还有没有东西 ——
+    // 这个顺序是判据的一部分：`h:3128/foo` 的真话是「端口后面多了东西」，
+    // 而不是「端口不是数字」（两者的修法完全不同，用户看到的文案也不同）。
+    var d: usize = host_end + 1;
+    while d < end && is_digit(v.ptr[d]) {
+        d = d + 1;
+    }
+    if d == host_end + 1 {
+        return HPX_E_PORT;
+    }
+    var prt: u16 = 0;
+    const pe: i32 = hpx_port_span(v, host_end + 1, d, &prt);
+    if pe != HPX_E_NONE {
+        return pe;
+    }
+    // 端口后面还有东西（`h:1/x` 之类）：路径段没有语义，拒绝而不是丢掉。
+    // 只放行**末尾单独一个** `/`（copy-paste 常态）—— 剥它的那一步在上面（`end` 已经减过）。
+    if d < end {
+        return HPX_E_EXTRA;
+    }
+    if end < n && !(n - end == 1 && v.ptr[n - 1] == 47 as byte) {
+        return HPX_E_EXTRA;
+    }
+    out.port = prt;
+    return HPX_E_NONE;
+}
+
+// 公开的解析入口：长度/上限校验 + 交给 hpx_parse_body。返回 0 = 合法。
+export fn hpx_parse(v: &[byte], out: &HpxUrl) i32 {
+    out[0] = hpx_url_empty();
+    if v.len > HPX_VAL_MAX {
+        return HPX_E_TOOBIG;
+    }
+    return hpx_parse_body(v, out);
+}
+
+// ============================================================
+// 回环绕过（纯函数）
+// ============================================================
+// 四段十进制 IPv4 且首段是 127（与 httpc 的 `scan_ipv4` 同口径：**必须四段**，
+// 所以 `127.1` 这种简写不算 —— 它本来也不是我们要放行的东西）。
+fn hpx_ipv4_loopback(p: &[byte], n: usize) bool {
+    var i: usize = 0;
+    var part: i32 = 0;
+    var digits: i32 = 0;
+    var idx: i32 = 0;
+    var first: i32 = -1;
+    while i < n {
+        const c: byte = p.ptr[i];
+        if is_digit(c) {
+            part = part * 10 + ((c as i32) - 48);
+            digits = digits + 1;
+            if part > 255 {
+                return false;
+            }
+        } else if c == 46 as byte {
+            if digits == 0 {
+                return false;
+            }
+            if idx == 0 {
+                first = part;
+            }
+            idx = idx + 1;
+            part = 0;
+            digits = 0;
+        } else {
+            return false;
+        }
+        i = i + 1;
+    }
+    if digits == 0 || idx != 3 {
+        return false;
+    }
+    return first == 127;
+}
+
+// 这台主机要不要**绕过**代理。三条：`localhost`（大小写无关）、`127.0.0.0/8`、`::1`。
+//
+// 为什么绕过是硬编码的一条而不是配置项：本机进程（`--dsh-web` 连本机网关、自测夹具、
+// 用户的本地 vLLM/ollama）走代理纯属添乱，而且代理多半没开回环转发 ⇒ **本机自测会红**。
+// 用户真正要代理的是「出网」那一段。要更细的规则（`no_proxy` 列表）另行一轮加，
+// 那时这个函数就是唯一要改的地方。
+export fn hpx_bypass(host: &const byte, n: usize) bool {
+    if n == 9 && eq_ignore_case(host[0: 9], &"localhost"[0: 9]) {
+        return true;
+    }
+    if n == 3 && host[0] == 58 as byte && host[1] == 58 as byte
+        && host[2] == 49 as byte {
+        return true;   // ::1
+    }
+    return hpx_ipv4_loopback(host[0: n], n);
+}
+
+// ============================================================
+// 报文构造（纯函数）
+// ============================================================
+// 拼 `Proxy-Authorization: Basic <b64(user:pass)>\r\n` 进 out（**含结尾 CRLF**，
+// 两处用法都把它整段追加：CONNECT 头与绝对形式请求的附加头）。
+// 没有凭据时什么都不写、返回 true（「没配凭据」不是错误）。
+export fn hpx_auth_build(user: &const byte, ul: usize, pass: &const byte,
+    pl: usize, out: &Buf) bool {
+    buf_reset(out);
+    if ul == 0 {
+        return true;
+    }
+    const raw_len: usize = ul + 1 + pl;
+    var raw: Buf = buf_new(raw_len + 1);
+    defer { buf_free(&raw); }
+    if !buf_valid(&raw) {
+        return false;
+    }
+    if !buf_append(&raw, user, ul) || !buf_append_byte(&raw, 58)
+        || !buf_append(&raw, pass, pl) {
+        return false;
+    }
+    const b64_cap: usize = ((raw_len + 2) / 3) * 4 + 4;
+    var b64: Buf = buf_new(b64_cap);
+    defer { buf_free(&b64); }
+    if !buf_valid(&b64) {
+        return false;
+    }
+    const got: !usize = encode_base64(raw.ptr[0: raw_len], b64.ptr[0: b64.cap]);
+    const w: usize = got catch {
+        return false;
+    };
+    if !buf_append_cstr(out, "Proxy-Authorization: Basic ") {
+        return false;
+    }
+    return buf_append(out, b64.ptr, w) && buf_append_cstr(out, "\r\n");
+}
+
+// 拼一条 CONNECT 请求（追加进 out，不清空）：
+//     CONNECT <host>:<port> HTTP/1.1\r\n
+//     Host: <host>:<port>\r\n
+//     [Proxy-Authorization: Basic <b64>]\r\n
+// `Host` 必须带（HTTP/1.1 的强制头，老代理按它做虚拟主机路由）。
+export fn hpx_connect_head(out: &Buf, host: &const byte, host_len: usize,
+    port: u16) bool {
+    if !buf_append_cstr(out, "CONNECT ") {
+        return false;
+    }
+    if !buf_append(out, host, host_len) || !buf_append_byte(out, 58) {
+        return false;
+    }
+    if !buf_append_u64(out, port as u64) {
+        return false;
+    }
+    if !buf_append_cstr(out, " HTTP/1.1\r\nHost: ") {
+        return false;
+    }
+    if !buf_append(out, host, host_len) || !buf_append_byte(out, 58) {
+        return false;
+    }
+    if !buf_append_u64(out, port as u64) {
+        return false;
+    }
+    if !buf_append_cstr(out, "\r\n") {
+        return false;
+    }
+    if hpx_auth.len > 0 {
+        if !buf_append(out, hpx_auth.ptr, hpx_auth.len) {
+            return false;
+        }
+    }
+    return buf_append_cstr(out, "\r\n");
+}
+
+// 从 CONNECT 的应答头里取状态码；格式不对返回 **0**（调用方据此记 BADRESP）。
+// 与 httpc 的 `parse_status` 同一口径（`HTTP/1.x <3 位数字>`），但**不复用**它：
+// 一个在 httpc（先于本文件）、一个在这里，复用会把「谁定义判据」搅浑；
+// 这段一共十几行，重复的代价小于耦合的代价。
+export fn hpx_head_status(head: &[byte], n: usize) i32 {
+    var sp: usize = 0;
+    while sp < n && head.ptr[sp] != 32 {
+        sp = sp + 1;
+    }
+    if sp + 4 > n {
+        return 0;
+    }
+    var v: i32 = 0;
+    var i: usize = 0;
+    while i < 3 {
+        const c: byte = head.ptr[sp + 1 + i];
+        if !is_digit(c) {
+            return 0;
+        }
+        v = v * 10 + ((c as i32) - 48);
+        i = i + 1;
+    }
+    return v;
+}
+
+// ============================================================
+// 钉桩 / 访问器 / 记账
+// ============================================================
+// 钉住代理取值。**空值/null = 清掉**（= 直连，返回 true）；非法值返回 **false** 且
+// 状态清空（绝不留下半份配置）。
+//
+// 为什么非法值不在这里打日志：这一层没有「用户看得见的地方」（传输层不知道界面），
+// 而且启动期与自测都要能看到**返回码**而不是一行没人读的 stderr —— 报错文案在
+// agent 层（`agent_proxy_bad_value_report`），它按 `hpx_err_now()` 给具体原因。
+export fn hpx_set(v: &const byte) bool {
+    buf_free(&hpx_val);
+    buf_free(&hpx_host);
+    buf_free(&hpx_auth);
+    hpx_val = buf_empty();
+    hpx_host = buf_empty();
+    hpx_auth = buf_empty();
+    hpx_reset_state();
+    if (v as usize) == 0 || bufx_cstr_len(v) == 0 {
+        return true;
+    }
+    const n: usize = bufx_cstr_len(v);
+    var parsed: HpxUrl = hpx_url_empty();
+    const rc: i32 = hpx_parse(v[0: n], &parsed);
+    if rc != HPX_E_NONE {
+        hpx_err = rc;
+        return false;
+    }
+    hpx_val = buf_new(n + 1);
+    hpx_host = buf_new(parsed.host_len + 1);
+    if !buf_valid(&hpx_val) || !buf_valid(&hpx_host) {
+        hpx_reset_state();
+        hpx_err = HPX_E_BADVAL;
+        return false;
+    }
+    if !buf_append(&hpx_val, v, n) || !buf_append_byte(&hpx_val, 0) {
+        hpx_reset_state();
+        hpx_err = HPX_E_BADVAL;
+        return false;
+    }
+    if !buf_append(&hpx_host, &v[parsed.host_off], parsed.host_len)
+        || !buf_append_byte(&hpx_host, 0) {
+        hpx_reset_state();
+        hpx_err = HPX_E_BADVAL;
+        return false;
+    }
+    if parsed.has_auth {
+        var auth: Buf = buf_new(512);
+        defer { buf_free(&auth); }
+        if !hpx_auth_build(&v[parsed.user_off], parsed.user_len,
+            &v[parsed.pass_off], parsed.pass_len, &auth) {
+            hpx_reset_state();
+            hpx_err = HPX_E_BADVAL;
+            return false;
+        }
+        hpx_auth = buf_new(auth.len + 1);
+        if !buf_valid(&hpx_auth)
+            || !buf_append(&hpx_auth, auth.ptr, auth.len) {
+            hpx_reset_state();
+            hpx_err = HPX_E_BADVAL;
+            return false;
+        }
+    }
+    hpx_port = parsed.port;
+    hpx_active = true;
+    return true;
+}
+
+// 配了代理没有（`--no-proxy` / 空值之后恒 false）。
+export fn hpx_active() bool {
+    return hpx_active && hpx_host.len > 1;
+}
+
+// 代理主机的**非 NUL 结尾**指针（长度看 hpx_host_len）。
+export fn hpx_host_ptr() &const byte {
+    if hpx_host.len == 0 {
+        return null as &const byte;
+    }
+    return hpx_host.ptr as &const byte;
+}
+
+// 代理主机长度（不含末尾 NUL）。
+export fn hpx_host_len() usize {
+    if hpx_host.len == 0 {
+        return 0;
+    }
+    return hpx_host.len - 1;
+}
+
+// 代理端口（没配时 0）。
+export fn hpx_port() u16 {
+    return hpx_port;
+}
+
+// 原值（打印用）：指针 + 长度。hpx_val 存的是**原样值**，所以 `--print-config` 印的
+// 就是用户写下的那串字节 —— 不另拼一份「规范化之后」的文本（两份迟早会不一致）。
+export fn hpx_val_ptr() &const byte {
+    if hpx_val.len == 0 {
+        return null as &const byte;
+    }
+    return hpx_val.ptr as &const byte;
+}
+
+// 原值长度（不含末尾 NUL）。
+export fn hpx_val_len() usize {
+    if hpx_val.len == 0 {
+        return 0;
+    }
+    return hpx_val.len - 1;
+}
+
+// 预拼好的 Proxy-Authorization 头（含 CRLF）；没配凭据时长度 0。
+export fn hpx_auth_ptr() &const byte {
+    if hpx_auth.len == 0 {
+        return null as &const byte;
+    }
+    return hpx_auth.ptr as &const byte;
+}
+
+// Proxy-Authorization 头的长度。
+export fn hpx_auth_len() usize {
+    return hpx_auth.len;
+}
+
+// 最近一次失败的原因码（HPX_E_*）。
+export fn hpx_err_now() i32 {
+    return hpx_err;
+}
+
+// 最近一次 CONNECT 应答的状态码（0 = 没拿到应答）。
+export fn hpx_status_now() i32 {
+    return hpx_status;
+}
+
+// 记一次隧道尝试的目标（诊断要同时说出「代理是谁、要去哪」）。
+export fn hpx_note_target(host: &const byte, host_len: usize, port: u16) void {
+    var n: usize = host_len;
+    if n > HPX_TARGET_MAX {
+        n = HPX_TARGET_MAX;
+    }
+    var i: usize = 0;
+    while i < n {
+        hpx_target[i] = host[i];
+        i = i + 1;
+    }
+    hpx_target_n = n;
+    hpx_target_port = port;
+}
+
+// 记账一次代理侧失败。status 只在 HPX_E_STATUS 时有意义（其余传 0）。
+export fn hpx_note_fail(err: i32, status: i32) void {
+    hpx_err = err;
+    hpx_status = status;
+}
+
+// 清掉上一次的失败记账（成功连上之后调，免得诊断里留着上一次的原因）。
+export fn hpx_note_ok() void {
+    hpx_err = HPX_E_NONE;
+    hpx_status = 0;
+}
+
+// 隧道目标的主机（非 NUL 结尾），没试过时长度 0。
+export fn hpx_target_ptr() &const byte {
+    return &hpx_target[0];
+}
+
+// 隧道目标的长度。
+export fn hpx_target_len() usize {
+    return hpx_target_n;
+}
+
+// 隧道目标的端口（没试过时 0）。
+export fn hpx_target_port() u16 {
+    return hpx_target_port;
+}
+
+// ============================================================
+// 失败分类：「重发一次会不会变好」（判据与 net/retryx 同一条）
+// ============================================================
+//   * 连不上代理 / 隧道超时 / 502·503·504 —— **可重试**：代理刚起来（clash 启动要几秒）、
+//     隧道上游抖一下，正是重发能救的现场；
+//   * 407/403 等 4xx 与畸形应答 —— **不可重试**：凭据错、代理在说别的协议，属配置面，
+//     重发一百次还是同一句（与 `rtx_retryable_err` 把 DNS/握手归为不可重试同一理由）。
+export fn hpx_retryable(err: i32, status: i32) bool {
+    if err == HPX_E_DIAL || err == HPX_E_TIMEOUT {
+        return true;
+    }
+    if err == HPX_E_STATUS {
+        return status == 502 || status == 503 || status == 504;
+    }
+    return false;
+}
