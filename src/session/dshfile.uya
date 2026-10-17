@@ -1,0 +1,400 @@
+// src/session/dshfile.uya — DSH 配置文档那一族的**文件层**（读 / 原子写 / 翻译）
+//
+// 本文件：三件与「文件」有关、但**不碰行表**的事 ——
+//   ① 读一份文本（`dshd_read_file` / `dshd_read_text`）：读不到不算错（legacy 那份
+//      可能本来就不在，那是 0.2.0 的正常形态）；
+//   ② 原子落盘（`dshd_save`）：抢 `<path>.lock` → 临时文件（0600）→ rename，与 P71 的
+//      `dshsave.uya` 同一协议；
+//   ③ **patch → legacy 形状的翻译**（`dshd_settings_text`）：0.2.0 之后没有
+//      `settings.yaml` 了（启动时被导入并改名成 `.imported`），而模型目录
+//      （`modelx.uya`）与路线解析（`dshcfg.uya`）都是按那份形状写的 —— 这里把 patch
+//      文档里我们认识的几节摊平成同样的形状，于是上游一行都不用改，
+//      而且「页面里加的提供方」与「请求打到哪儿」天然同源。
+// 不变量：① **不新建文档**（`dshd_save` 只改已存在的文件；写新文件是调用方的事）；
+//   ② 抢不到锁就让位（`DSHD_BUSY`，别人的锁绝不删）；③ 翻译只搬**认识的几节**，
+//   不认识的键不搬、也不猜语义；一节「legacy 里有没有」用 `yt_parse_text` 判
+//   （子串搜会把 `x-llm-pi-ai:` 这类也算命中）。
+// 依赖：libc（syscall / unistd）；本仓 foundation/bufx、foundation/yamlcfg、
+//   session/dshdoc（`DshDoc` 与 `dshd_rev` / `dshd_open` / `dshd_cfg_text`）。
+// 命名：对外 `dshd_*`（与 dshdoc 同族）；私有 `dshf_*`。
+
+use libc.syscall;
+use libc.unistd;
+
+// ============================================================
+// 取文件
+// ============================================================
+
+// 读整个文件进 out。返回 DSHD_OK / DSHD_NOFILE / DSHD_IO / DSHD_SHAPE（超上限）。
+export fn dshd_read_file(path_z: &const byte, out: &Buf) i32 {
+    const fd: i32 = sys_open(path_z as *const byte, O_RDONLY as i32, 0) catch {
+        return DSHD_NOFILE;
+    };
+    defer { _ = sys_close(fd) catch {}; }
+    var tmp: [byte: 16384] = [0: 16384];
+    while true {
+        const n: isize = sys_read(fd, &tmp[0], 16384) catch { 0 as isize; };
+        if n <= 0 {
+            break;
+        }
+        if out.len + (n as usize) > DSHD_MAX_BYTES {
+            return DSHD_SHAPE;      // 超限：宁可拒绝也不截断（截断的 YAML 更难查）
+        }
+        if !buf_append(out, &tmp[0], n as usize) {
+            return DSHD_IO;
+        }
+    }
+    return DSHD_OK;
+}
+
+// 读一份文件进 out（读不到就是空 out，**不报错**）：给「legacy settings.yaml 可能存在
+// 也可能不存在」那条路用 —— 两种形态都是正常的，不是错误。
+export fn dshd_read_text(path: &const byte, out: &Buf) bool {
+    buf_reset(out);
+    var z: Buf = buf_new(bufx_cstr_len(path) + 1);
+    defer { buf_free(&z); }
+    _ = buf_append_cstr(&z, path);
+    _ = buf_append_byte(&z, 0);
+    return dshd_read_file(z.ptr as &const byte, out) == DSHD_OK;
+}
+
+// 拼 `<home>/profiles/<profile>/cordis.patch.yml`（尾 NUL）。
+fn dd_path_of(home: &const Buf, profile: &const Buf, out: &Buf) bool {
+    buf_reset(out);
+    if home.len == 0 || profile.len == 0 {
+        return false;
+    }
+    if !buf_append(out, home.ptr as &const byte, home.len) {
+        return false;
+    }
+    if !buf_append_cstr(out, "/profiles/") {
+        return false;
+    }
+    if !buf_append(out, profile.ptr as &const byte, profile.len) {
+        return false;
+    }
+    if !buf_append_cstr(out, "/cordis.patch.yml") {
+        return false;
+    }
+    return buf_append_byte(out, 0);
+}
+
+// 文本指纹（FNV-1a 64 截到 i64）：只用来判「页面拿的是不是当前这一版」。
+export fn dshd_rev(text: &const Buf) i64 {
+    var h: u64 = 14695981039346656037;
+    var i: usize = 0;
+    while i < text.len {
+        h = h ^ (text.ptr[i] as u64);
+        h = h * 1099511628211;
+        i = i + 1;
+    }
+    return (h & 0x7fffffffffffffff) as i64;
+}
+
+// 打开（读）一份文档。`home`/`profile` 为空 ⇒ DSHD_NOFILE。
+export fn dshd_open(d: &DshDoc, home: &const Buf, profile: &const Buf) i32 {
+    dshd_free(d);
+    var p: Buf = buf_new(home.len + profile.len + 64);
+    if !dd_path_of(home, profile, &p) {
+        buf_free(&p);
+        return DSHD_NOFILE;
+    }
+    var t: Buf = buf_new(65536);
+    const rc: i32 = dshd_read_file(p.ptr as &const byte, &t);
+    if rc != DSHD_OK {
+        buf_free(&p);
+        buf_free(&t);
+        return rc;
+    }
+    d.home = buf_new(home.len + 8);
+    _ = buf_append(&d.home, home.ptr as &const byte, home.len);
+    d.profile = buf_new(profile.len + 8);
+    _ = buf_append(&d.profile, profile.ptr as &const byte, profile.len);
+    d.path = p;
+    d.text = t;
+    d.rev = dshd_rev(&d.text);
+    d.loaded = true;
+    return DSHD_OK;
+}
+// ============================================================
+// 落盘：抢锁 → 临时文件 → rename（与 dshsave.uya 同一协议）
+// ============================================================
+
+fn dshf_sleep_ms(ms: u64) void {
+    var ts: TimeSpec = TimeSpec{ tv_sec: 0, tv_nsec: 0 };
+    ts.tv_sec = (ms / 1000) as i64;
+    ts.tv_nsec = (((ms % 1000) as i64) * (1000000 as i64));
+    _ = sys_nanosleep(&ts, &ts) catch {};
+}
+
+// 抢 `<path>.lock`（0600、独占创建，写进自己的 pid）。别人的锁**绝不删**。
+fn dshf_lock(lock_z: &const byte) bool {
+    const flags: i32 = (O_WRONLY | O_CREAT | O_EXCL) as i32;
+    const deadline: u64 = ua_now_ms() + DSHD_LOCK_WAIT_MS;
+    var delay: u64 = 20;
+    var pidb: Buf = buf_new(32);
+    defer { buf_free(&pidb); }
+    while true {
+        const fd: i32 = sys_open(lock_z as *const byte, flags, 384) catch {
+            -1;
+        };
+        if fd >= 0 {
+            buf_reset(&pidb);
+            _ = buf_append_i64(&pidb, sys_getpid() catch { 0 as i64; });
+            _ = buf_append_byte(&pidb, 10);
+            _ = write_all_fd(fd, pidb.ptr as &const byte, pidb.len);
+            _ = sys_close(fd) catch {};
+            return true;
+        }
+        if ua_now_ms() >= deadline {
+            return false;
+        }
+        dshf_sleep_ms(delay);
+        if delay < 200 {
+            delay = delay * 2;
+        }
+    }
+}
+
+// 把文本原子地写到 `d.path`：临时文件（`<path>.<pid>-<ms>.tmp`）→ rename。
+// 成功后内存里那份也换成新文本（`rev` 跟着更新），调用方不用重开文件。
+export fn dshd_save(d: &DshDoc, text: &const Buf) i32 {
+    if !d.loaded || d.path.len == 0 {
+        return DSHD_NOFILE;
+    }
+    var lock: Buf = buf_new(d.path.len + 16);
+    defer { buf_free(&lock); }
+    _ = buf_append(&lock, d.path.ptr as &const byte, d.path.len - 1);
+    _ = buf_append_cstr_z(&lock, ".lock");
+    if !dshf_lock(lock.ptr as &const byte) {
+        return DSHD_BUSY;
+    }
+    defer { _ = sys_unlink(lock.ptr as *const byte) catch {}; }
+    var tmp: Buf = buf_new(d.path.len + 64);
+    defer { buf_free(&tmp); }
+    // 临时文件名按**长度**拼（`d.path` 是个没有 NUL 的 Buf，走 cstr 口径会读到堆残留）
+    _ = buf_append(&tmp, d.path.ptr as &const byte, d.path.len - 1);
+    _ = buf_append_byte(&tmp, 46);
+    _ = buf_append_i64(&tmp, sys_getpid() catch { 0 as i64; });
+    _ = buf_append_byte(&tmp, 45);
+    _ = buf_append_i64(&tmp, ua_now_ms() as i64);
+    _ = buf_append_cstr_z(&tmp, ".tmp");
+    const flags: i32 = (O_WRONLY | O_CREAT | O_EXCL) as i32;
+    const fd: i32 = sys_open(tmp.ptr as *const byte, flags, 384) catch {
+        return DSHD_IO;
+    };
+    const wok: bool = write_all_fd(fd, text.ptr as &const byte, text.len);
+    _ = sys_close(fd) catch {};
+    if !wok {
+        _ = sys_unlink(tmp.ptr as *const byte) catch {};
+        return DSHD_IO;
+    }
+    sys_rename(tmp.ptr as &const byte, d.path.ptr as &const byte) catch {
+        _ = sys_unlink(tmp.ptr as *const byte) catch {};
+        return DSHD_IO;
+    };
+    buf_reset(&d.text);
+    if !buf_append(&d.text, text.ptr as &const byte, text.len) {
+        return DSHD_IO;
+    }
+    d.rev = dshd_rev(&d.text);
+    return DSHD_OK;
+}
+
+// 返回码 → 一句给页面看的话（业务错里带它，用户才知道为什么没写成）。
+export fn dshd_code_text(rc: i32) &const byte {
+    if rc == DSHD_NOFILE {
+        // 行宽豁免：不可断的中文错误文案（拆两条拼）
+        return "找不到 DSH 的配置文档（profiles/<profile>/cordis.patch.yml）" as &const byte;
+    }
+    if rc == DSHD_NOENTRY {
+        return "配置文档里没有这一节（llm-pi-ai 的 config）" as &const byte;
+    }
+    if rc == DSHD_SHAPE {
+        return "这一节的写法本仓改不了（只支持块状写法）" as &const byte;
+    }
+    if rc == DSHD_OPS {
+        return "这个改动路径不支持（只支持 <节>.<键> 的叶级改写）" as &const byte;
+    }
+    if rc == DSHD_BUSY {
+        return "配置文档被别的进程锁着，稍后再试" as &const byte;
+    }
+    if rc == DSHD_STALE {
+        return "设置已被别处改动，请刷新后重试" as &const byte;
+    }
+    return "写配置文档失败" as &const byte;
+}
+// ============================================================
+// patch 文档 → legacy 形状的文本（给模型目录与路线复用现成的读码）
+// ============================================================
+//
+// 0.2.0 之后**没有** `settings.yaml` 了（启动时被导入并改名成 `.imported`），而本仓
+// 的模型目录（`modelx.uya`）与路线解析（`dshcfg.uya`）都是按那份 legacy 形状写的。
+// 这里做一次**翻译**：把 patch 文档里我们认识的几节摊平成同样的形状，
+// 于是上游一行都不用改 —— 而且「页面里加的提供方」与「请求打到哪儿」天然同源。
+//
+// 只翻译**认识的那几节**（不认识的键不搬，也不猜它们的语义）；顺序即文本顺序。
+const DSHD_SECTIONS: usize = 6;
+
+// 第 i 个可翻译的节名（顺序即写出顺序；越界返回最后一节的名字 —— 调用方只在
+// `i < DSHD_SECTIONS` 时调它，返回常量是为了让边界证明器永远有个指针可用）。
+fn dshf_section_name(i: usize) &const byte {
+    if i == 0 {
+        return "agent-default-model" as &const byte;
+    }
+    if i == 1 {
+        return "llm-pi-ai" as &const byte;
+    }
+    if i == 2 {
+        return "llm-deepseek" as &const byte;
+    }
+    if i == 3 {
+        return "permission" as &const byte;
+    }
+    if i == 4 {
+        return "agent-presets" as &const byte;
+    }
+    return "uya-agent" as &const byte;
+}
+
+// 把一段文本按 `n` 个空格整体右移（空行保持空）。
+fn dshf_indent_into(src: &const Buf, n: usize, out: &Buf) bool {
+    var i: usize = 0;
+    var at_line_start: bool = true;
+    while i < src.len {
+        const c: byte = src.ptr[i];
+        if at_line_start && c != 10 as byte {
+            if !dshd_spaces(out, n) {
+                return false;
+            }
+            at_line_start = false;
+        }
+        if !buf_append_byte(out, c) {
+            return false;
+        }
+        if c == 10 as byte {
+            at_line_start = true;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+// `settings.yaml` 的文本 + patch 文档里**它没有的**那几节。
+//
+// 为什么按节判「有没有」而不是整份二选一：patch 文档只覆盖它写过的节（DSH 的
+// composition 也是这样叠的），一份还留着的 legacy 文件与 patch 各写一半是**正常**
+// 形态；整份二选一会把另一半悄悄丢掉。判据走 `yt_parse_text`（不是子串搜 ——
+// 子串会把 `x-llm-pi-ai:` 这类也算命中）。
+//
+// `home_z` 必须是调用方**已经解析好的** DSH home（`dsh_home_resolve` 的结果），
+// 这里**不再自己读 `DSH_HOME`**：两处各自解析会分叉成「`--dsh-home` / `--dsh-root`
+// 指的那份」与「env 指的那份」，而且自测会去读真机 `~/.dsh` 里的真实 patch 文档 ——
+// 于是 `--selftest` 在有 DSH 配置的机器上红、在干净机器上绿（实测，P88）。
+export fn dshd_settings_text(legacy: &const Buf, home_z: &const byte, out: &Buf) bool {
+    buf_reset(out);
+    var have: [bool: DSHD_SECTIONS] = [false: DSHD_SECTIONS];
+    if legacy.len > 0 {
+        if !buf_append(out, legacy.ptr as &const byte, legacy.len) {
+            return false;
+        }
+        var t: YTree = YTree{ nodes: [], n: 0, lines: [], nlines: 0,
+            raw: buf_empty(), cur: 0, err_line: 0 };
+        yt_init(&t);
+        if yt_parse_text(legacy, &t) {
+            const root: i32 = yt_root(&t);
+            var i: usize = 0;
+            while i < DSHD_SECTIONS {
+                if yt_get(&t, root, dshf_section_name(i)) >= 0 {
+                    have[i] = true;
+                }
+                i = i + 1;
+            }
+        }
+        yt_free(&t);
+        // 末尾没有换行时补一个（下面要接着写新节）
+        if out.len > 0 && out.ptr[out.len - 1] != 10 as byte {
+            if !buf_append_byte(out, 10) {
+                return false;
+            }
+        }
+    }
+    return dshf_append_patch(out, &have, home_z);
+}
+
+// patch 文档的路径（`<home>/profiles/<profile>/cordis.patch.yml`）：
+// profile 名按 `UYA_AGENT_DSH_PROFILE` > `$DSH_PROFILE` > `web`（与宿主同一口径）。
+export fn dshd_profile_name(out: &Buf) bool {
+    buf_reset(out);
+    const e1: &byte = getenv("UYA_AGENT_DSH_PROFILE" as &const byte);
+    const e2: &byte = getenv("DSH_PROFILE" as &const byte);
+    if (e1 as usize) != 0 && bufx_cstr_len(e1) > 0 {
+        return buf_append_cstr(out, e1);
+    }
+    if (e2 as usize) != 0 && bufx_cstr_len(e2) > 0 {
+        return buf_append_cstr(out, e2);
+    }
+    return buf_append_cstr(out, "web");
+}
+
+// 把 patch 文档里 `have[]` 为假的节追加到 out。
+//
+// `home_z` 是调用方解析好的 DSH home（见 dshd_settings_text 上方的说明），**不读 env**。
+fn dshf_append_patch(out: &Buf, have: &const bool, home_z: &const byte) bool {
+    if bufx_cstr_len(home_z) == 0 {
+        return true;            // 没有 home：没有 patch 文档可读，不算失败
+    }
+    var home: Buf = buf_new(bufx_cstr_len(home_z) + 32);
+    defer { buf_free(&home); }
+    if !buf_append_cstr(&home, home_z) {
+        return false;
+    }
+    var prof: Buf = buf_new(64);
+    defer { buf_free(&prof); }
+    _ = dshd_profile_name(&prof);
+    var d: DshDoc = dshd_zero();
+    defer { dshd_free(&d); }
+    if dshd_open(&d, &home, &prof) != DSHD_OK {
+        return true;            // 没有那份文档：只有 legacy 一半也是正常形态
+    }
+    var i: usize = 0;
+    while i < DSHD_SECTIONS {
+        if !have[i] {
+            if !dshf_emit_section(&d, dshf_section_name(i), out) {
+                return false;
+            }
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+// 一节：`<名字>:` + 它的 config 块（整体右移两格）。文档里没有这一节时什么都不写。
+fn dshf_emit_section(d: &const DshDoc, name: &const byte, out: &Buf) bool {
+    var cfg: Buf = buf_new(4096);
+    defer { buf_free(&cfg); }
+    if !dshd_cfg_text(d, name, bufx_cstr_len(name), &cfg) {
+        return true;
+    }
+    if cfg.len == 0 {
+        return true;
+    }
+    if !buf_append_cstr(out, name) || !buf_append_cstr(out, ":\n") {
+        return false;
+    }
+    return dshf_indent_into(&cfg, 2, out);
+}
+
+// 新建一份文本文件（0600、独占创建）。已存在 ⇒ DSHD_OK（调用方接着改它就是）。
+export fn dshd_write_new(path_z: &const byte, text: &const Buf) i32 {
+    const flags: i32 = (O_WRONLY | O_CREAT | O_EXCL) as i32;
+    const fd: i32 = sys_open(path_z as *const byte, flags, 384) catch {
+        return DSHD_OK;
+    };
+    const ok: bool = write_all_fd(fd, text.ptr as &const byte, text.len);
+    _ = sys_close(fd) catch {};
+    if !ok {
+        return DSHD_IO;
+    }
+    return DSHD_OK;
+}

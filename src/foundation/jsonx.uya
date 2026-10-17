@@ -4,9 +4,12 @@
 //   **自带 RFC 8259 字符串转义**（jw_str_esc_len / jw_write_escaped）、反转义
 //   （sv_unescape / sv_unescape_to_buf，含 `\uXXXX` 与代理对合成）。
 // 不变量：① `jw_*` 溢出时只置 `overflow=true` **静默丢弃**（片段必须是合法 JSON，调用方
-//   最后查 `jw_overflow`）；② `jw_str_esc_len` 与 `jw_write_escaped` 的规则**必须一一对应**
-//   （改一处就要改另一处），返回值含两侧引号；③ `js_obj_get` 的 key 上限 120 字节、内部
-//   缓冲固定 128；④ `js_obj_get_str_unescaped` 的产物是**堆缓冲**，调用方负责 `buf_free`。
+//   最后查 `jw_overflow`）；② `jw_str_esc_len` 与 `jw_write_escaped` / `jw_str` 的
+//   规则**必须一一对应**（改一处就要改另一处），返回值含两侧引号；
+//   ③ `js_obj_get` 的 key 上限 120 字节、内部缓冲固定 128；
+//   ④ `js_obj_get_str_unescaped` 的产物是**堆缓冲**，调用方负责 `buf_free`；
+//   ⑤ 写出去的两个方向都**不许产生非法 UTF-8**：非法字节在 `jw_str` 里变 U+FFFD
+//   （踩坑 156），代理项在 `append_utf8` 里变 U+FFFD（详见「字符串转义」一节）。
 // 依赖：std.json（encoder + parser + value）、std.mem.arena、std.string.strlen；本仓
 //   foundation/bufx（Buf / sv_unescape 的目标缓冲 / bufx_*）。
 // 命名：`jw_*`（写）、`js_*`（读导航）、`sv_unescape*`（反转义）。
@@ -88,11 +91,26 @@ export fn jw_byte(w: &JsonWriter, b: byte) void {
 //   Invalid request, invalid character '\x00' in string literal
 // 而且这条工具结果会一直留在历史里 —— 之后**每一轮**请求都带着它，会话彻底变成
 // 「继续也报 400」。所以这里的规则必须与 RFC 8259 一致：0x00…0x1f 全部转义。
+//
+// 同族第二条（踩坑 156）：**非法 UTF-8 也必须挡在这一层**。网关的 JSON 解析器是严格的
+// UTF-8 解码器，`bash` 输出里一个按字节截断的半个汉字（E2 / E6 9C）、或 `\uD83D` 单独
+// 出现时按 WTF-8 编出的 ED A0 BD，都会被它判成
+// 行宽豁免：网关原文，不可断
+//   Failed to parse the request body as JSON: input[165].output: invalid unicode code point
+// ——同样是「这一条结果永久留在历史 ⇒ 之后每轮都 400」。修法：不是字符的字节
+// 一律写成 U+FFFD（EF BF BD），规则表在 bufx_utf8_seq_len（严进，含代理项与过长编码）。
 // ============================================================
 
 // 该字节是否必须转义（" \ 与全部控制字节）
 fn jw_needs_escape(b: byte) bool {
     return b < 32 as byte || b == 34 as byte || b == 92 as byte;
+}
+
+// 写一个 U+FFFD（非法 UTF-8 字节、代理项、超范围码点的替身）
+fn jw_write_replacement(w: &JsonWriter) void {
+    jw_byte(w, 239);
+    jw_byte(w, 191);
+    jw_byte(w, 189);
 }
 
 // 写出一个必须转义的字节
@@ -126,34 +144,56 @@ fn jw_write_escaped(w: &JsonWriter, b: byte) void {
 
 // 转义字符串（作为 value）。`ptr` 只读，收 `&const byte`：调用点既有 `Buf.ptr`（`&byte`）
 // 也有 `"…" as &const byte` 字面量，收 `&byte` 会让后者在宿主 C 报 discards const。
+//
+// 三段走法：ASCII 快路径（一段不必转义的字节一次写完）→ 单个控制字节/引号/反斜杠 →
+// 一段**合法**多字节序列一次写完；非法字节写一个 U+FFFD 并前进 1 字节（踩坑 156）。
 export fn jw_str(w: &JsonWriter, ptr: &const byte, len: usize) void {
     jw_byte(w, 34);
     var i: usize = 0;
     while i < len {
-        // 快路径：把「一段不需要转义的字节」一次写完，只在本段末尾做转义
+        const v: i32 = ptr[i] as i32;
+        if v >= 128 {
+            // 合法多字节：把后续连续的合法序列一起原样搬过去（中文正文的常态）
+            var j: usize = i;
+            while j < len && (ptr[j] as i32) >= 128 {
+                const sl: usize = bufx_utf8_seq_len(ptr, len, j);
+                if sl == 0 {
+                    break;
+                }
+                j = j + sl;
+            }
+            if j == i {
+                jw_write_replacement(w);
+                i = i + 1;
+            } else {
+                jw_raw(w, &ptr[i], j - i);
+                i = j;
+            }
+            continue;
+        }
+        if jw_needs_escape(ptr[i]) {
+            jw_write_escaped(w, ptr[i]);
+            i = i + 1;
+            continue;
+        }
+        // 快路径：把「一段不需要转义的 ASCII」一次写完
         var j: usize = i;
         while j < len {
-            if jw_needs_escape(ptr[j]) {
+            if jw_needs_escape(ptr[j]) || (ptr[j] as i32) >= 128 {
                 break;
             }
             j = j + 1;
         }
-        if j > i {
-            jw_raw(w, &ptr[i], j - i);
-            i = j;
-        }
-        if i < len {
-            jw_write_escaped(w, ptr[i]);
-            i = i + 1;
-        }
+        jw_raw(w, &ptr[i], j - i);
+        i = j;
     }
     jw_byte(w, 34);
 }
 
 // jw_str 会写出多少字节（**含两侧引号**）—— 精确值，给「先算容量、再一次性写进
-// 固定缓冲」的地方用（见 agent.uya 的 calls_json_need）。规则必须与 jw_write_escaped
-// 一一对应：\n \r \t \b \f 是两字节短转义，其余控制字节是六字节 \u00XX，
-// " 与 \ 两字节，其余一字节。
+// 固定缓冲」的地方用（见 agent.uya 的 calls_json_need）。规则必须与 jw_write_escaped /
+// jw_str 一一对应：\n \r \t \b \f 是两字节短转义，其余控制字节是六字节 \u00XX，
+// " 与 \ 两字节，合法 UTF-8 多字节序列按原长，**非法字节三字节**（U+FFFD）。
 export fn jw_str_esc_len(p: &const byte, n: usize) usize {
     var total: usize = 2;   // 两侧引号
     var i: usize = 0;
@@ -165,12 +205,23 @@ export fn jw_str_esc_len(p: &const byte, n: usize) usize {
             } else {
                 total = total + 6;
             }
+            i = i + 1;
         } else if b == 34 as byte || b == 92 as byte {
             total = total + 2;
+            i = i + 1;
+        } else if (b as i32) >= 128 {
+            const sl: usize = bufx_utf8_seq_len(p, n, i);
+            if sl == 0 {
+                total = total + 3;
+                i = i + 1;
+            } else {
+                total = total + sl;
+                i = i + sl;
+            }
         } else {
             total = total + 1;
+            i = i + 1;
         }
-        i = i + 1;
     }
     return total;
 }
@@ -364,10 +415,15 @@ fn read_u4(s: &const JsonStrView, off: usize) i32 {
     return v;
 }
 
-// 按 1/2/3/4 字节 UTF-8 编码，把码点 cp 追加进 out；cp < 0（代理项残留等）时静默跳过并返回 true。
-fn append_utf8(out: &Buf, cp: i32) bool {
-    if cp < 0 {
-        return true;
+// 按 1/2/3/4 字节 UTF-8 编码，把码点 cp 追加进 out。
+//
+// cp 不是「字符」时（< 0、代理项 U+D800…U+DFFF、> U+10FFFF）一律写 U+FFFD，**不**按
+// 原始码点编 —— 那样会造出 0xED 0xA0 0xBD 这种非法 UTF-8（WTF-8），它一旦进了历史，
+// 之后每一轮请求都被网关判 invalid unicode code point（踩坑 156）。
+fn append_utf8(out: &Buf, cp_in: i32) bool {
+    var cp: i32 = cp_in;
+    if cp < 0 || cp > 1114111 || (cp >= 55296 && cp <= 57343) {
+        cp = 65533;     // U+FFFD
     }
     if cp < 128 {
         return buf_append_byte(out, cp as byte);
