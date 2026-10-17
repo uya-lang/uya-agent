@@ -6765,6 +6765,7 @@ DEEPSEEK_API_KEY=sk-xxx ./build/uya-agent \
 | `empty-retry` | P54（mock mode 41）：第一轮回「finish_reason=stop + 只有思考、没有正文」→ 转录里那一行证据（`finish=stop have_finish=1 bad_finish=(none) content=0B reasoning=45B calls=0 usage={in=60 cache_read=40 cache_write=0 out=7 reasoning=3} prompt=…B/100tok retries=0/1`）+ 日志一条 `llm/degenerate`（字段逐项核对）→ **同一步重发**：第二轮请求与第一轮**逐字节相同**、`step/start` 仍只有一条、唯一那条 `assistant/message` 的正文是 `SELFTEST-RETRY-OK`、回合退出 0 |
 | `empty-retry-giveup` | P54（mock mode 42）：重发也只给空响应 → 只重发**一次**（两条 `llm/degenerate`：`retrying=true/retries=0` → `retrying=false/retries=1`）、退化那一步**一条 `assistant/message` 都没有**、转录里留下带同一条证据的错误行、回合按协议错误退出 3 |
 | `max-tokens-cut` | P59（mock mode 44，**一个进程跑两个回合**）：① `finish_reason=length` + 正文 + 一个 `write trunc.txt` 调用 → 一个工具调用都不派发（`trunc.txt` 不存在、日志零 `tool/call`）、正文剪掉断口空白后进历史、`assistant/message` **不带 tool_calls**、转录是 `warning:` + `[max-tokens] …发「继续」…`（**没有** `error: model output was truncated`）、`turn/end` reason = `max-tokens`、那一回合返回 `5`；② 人打「继续」→ 第二个请求里**带着那段正文**、没有 `"role":"tool"`、没有 `"tool_calls"` → 回合以 0 收尾、`turn/end` reason = `completed` |
+| `turn-retry` | P94（mock mode 50）：退化两发（第二发与第一发**逐字节相同**）⇒ 同一步的重发额度用尽、回合按错误收场 ⇒ **自动替人打一句「继续」**开新回合 ⇒ 第三发请求体里带着 `"role":"user","content":"继续"` ⇒ 退出 0。判据三侧：转录 `[turn-retry]` 行（第 1/2 次、`backoff=` 落在 [0.5s,3.0s]、`esc/ctrl+c 可停`）、日志（`turn/start` 2 条、`turn/end` 先 `error` 后 `completed`、`turn/retry` 1 条且 attempt=1/maxRetries=2、一条「继续」的 `user/message`）、mock 侧请求体 |
 | `tui-diag` | 4 KiB JSON 只留 ≤512 B、半截汉字变 U+FFFD、`tty_sink_on` 收尾关回 |
 | `read-window` | `(Showing lines 1-1000 of 4000. …)`、`offset=3500` 真读到、`limit=2000` |
 | `title-format` | OSC/CSI 清洗、模型侧 45 B（15 字）/ 上屏 80 B 上限切码点边界、`ESC[22t`/`ESC[23t` |
@@ -8753,3 +8754,63 @@ TLS 校验）」，而真相是「这台站点换了一张同样合法的证书�
 `lib/tls` 的三条死路；把 `chain` 档换成这条链校验（它从「真实站点上必然失败」变成能用，
 属于另一轮的改动）；`pin` 档支持多条配置指纹（这次要的是「TOFU 学新证书」，不是
 「`--tls-pin` 写多个」）；淘汰旧条目（见上）。
+
+### 19.18 P94：回合异常结束之后**自动替人打一句「继续」**
+
+**用户报的**（原话）：「本回合异常结束（可直接输入继续）自动像 连接重试一样的策略重试」。
+现场就是那一行提示：回合以非 0 收场，屏幕上丢下一句「[turn] 本回合异常结束（可直接输入
+继续）」，而人接着敲一句「继续」，多半就好了 —— 那件事机器自己会做，不该每次都问人。
+
+**先定边界：只对「空响应」开闸，不给所有失败开**。三条理由：
+
+1. **传输层那半边已经有主**：连接被拒 / IO / 超时 / SSE 早断 / 408·425·429·5xx 由
+   `net/retryx` 在**同一步**里退避重发（默认不限次数，请求体逐字节相同）。回合级再插
+   一手，只会把同一次失败重放两遍，还把「重发的是同一发请求」这条不变量搅浑。
+2. **确定性失败的出口是修配置，不是再来一次**：401/403/404、坏 payload、上下文超窗压不
+   动、步数熔断、OOM —— 重发一百次还是同一个错，而每重发一次都真花钱。不替上游猜，
+   与 `retryx` 的分类表同一条纪律。
+3. **空响应恰恰是「人打继续就好了」的那一类**：上游正常收尾（`finish=stop`）却既没正文
+   也没有工具调用。本仓为它已经有「同一步重发一次」（P54）；那一次也没成时，剩下的路
+   就是**接着跑一回合**。判据因此很窄：`agent_note_degenerate` 在额度用尽时置一个提示
+   位，回合层只在「提示位定过性 + 退出码是协议错」时才继续。
+
+**修法**（新文件 `agent/ag_turn_retry.uya` + `agent_turn_loop` 外面一层循环）：套在
+`agent_turn_loop` 这一层，而不是各个交互入口 —— `/continue`、滚动模式、TUI、一次性
+任务、子代理**都走它**。判据只有一份答案，五个调用点不必各写一遍（「一处定义」）。
+
+| 要素 | 取值 | 为什么 |
+|---|---|---|
+| 退避 | `rtx_backoff_ms()`：0.5–3 s 随机 | 与传输层重试**同一套数值**（用户的原话就是「像连接重试一样」）；抖动让同一故障下的多个客户端不同时回来 |
+| 中断 | `agent_rtx_wait`：≤50 ms 切片 + 泵点 | esc / ctrl+c / ctrl+d 当场收口 —— 自动重试不许变成「按了没反应」（踩坑 44 同族） |
+| 预算 | `TURN_RETRY_MAX = 2`，`0` = 关 | 回合级**不做无限**：一次传输重发只多一发请求，一次自动继续会再跑一整段 step 循环（模型可能连着调几十个工具）。连两次都空，交回人手最稳 |
+| 账 | 转录一行 `[turn-retry] … backoff=1.7s（esc/ctrl+c 可停）` + 会话日志 `turn/retry` | 屏幕要能解释「为什么又动起来了」，日志要能复盘「继续了几次、等了多久」。`--quiet` 也照打 |
+| 注入 | 与 `/continue` **逐字相同**的「继续」，走 `agent_push_user_with_imgs` + `agent_log_user_att` | 历史、模型看到的东西、会话日志三样因此一致（图片附件与条数上限的腾挪也复用同一条路） |
+| 收尾 | 预算用尽 / 不可重试 → 原退出码交回去 | 「本回合异常结束」那句话仍由调用方照旧打出来；`--api-retry-max 0` 那类负控腿的退出码判据不受影响 |
+| 全局闸门 | `turn_retry_set_max(0)`（`selftest_main` 里钉住） | 与 `rtx_set_max(0)` 同一条纪律：会改变全局行为的东西，自测必须自己钉住初值 |
+
+**一个容易写错的顺序**：每次进 `agent_turn_loop_once` 之前都要**清提示位**。不清的话，
+上一回合留下的「空响应」会给这一回合的 401 当通行证 —— 一个确定性的错被自动重跑，预算
+花在必然失败的请求上。另一条：**先退避再注入**（人在退避里叫停时，历史里不该多出一条
+没人要的 user 消息）。
+
+**自测**（`turn-retry`，mock mode 50）：三发三态 —— ①退化（只有思考）②与①**逐字节
+相同**的重发（再退化 ⇒ 额度用尽 ⇒ 回合按错误收场）③自动继续之后那一发。判据三侧：
+转录的 `[turn-retry]` 行（序号 / 预算 / 退避区间 / 怎么停）、会话日志（`turn/start` 两条、
+`turn/end` 先 `error` 后 `completed`、`turn/retry` 一条且字段齐全、一条「继续」的
+`user/message`）、mock 侧的请求体里那条 `"role":"user","content":"继续"`。
+
+**防假绿对照（两次都真做过）**：
+
+① 把这一轮的预算改回 `0`（等于没有自动继续）⇒ 三类判据一起红（转录、日志、退出码
+`agent_run returned 3`）；
+② 把注入的文案改成「接着」⇒ **两侧**同时红：日志侧「没有那条继续的 user/message」，
+mock 侧 `mock server verdict 254`。
+⚠ ②顺手抓到本条自测自身的一条假绿：第一版 mock 侧只搜「继续」两个字，而**系统提示词里
+本来就有「继续」** ⇒ 文案改错也照样绿。判据必须落在**整条消息的形状**上
+（`"role":"user","content":"继续"`），不能落在裸的文案上。
+
+**边界（明确不做）**：不把 `AGENT_MAX_TOKENS` 与 `AGENT_INTERRUPTED` 算作异常（前者有
+`[max-tokens]` 的专门出口，后者是人叫停）；不在退避里抢 steer 的顺序（退避期间敲进来的
+正文照旧进 steer 收件箱，下一个 step 边界生效）；不给回合级做「无限次」（理由见预算那一
+行）；子代理与一次性任务同样吃这条规则，但它们与主回合共用同一个进程级预算 —— 单线程
+主循环下回合不会嵌套，所以不存在互相偷额度的问题。
