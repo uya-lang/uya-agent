@@ -73,6 +73,16 @@ export error HcTimeout;
 export error HcTlsNoChain;      // 握手成功但 stdlib 没解析出对端证书链（真实站点的必然结果）
 export error HcTlsNoAnchors;    // 机器上没有系统根证书库（chain 档才需要）
 export error HcTlsNoLeaf;       // 握手成功但没从 flight 里拿到 leaf 证书（无法算指纹）
+// P92：代理侧的两条失败。**与上面那些分开**是这条线的全部价值 —— 配了代理之后
+// 「连不上」有三种完全不同的修法（看网络 / 看代理 / 看域名），糊成一个码就是把答案丢掉
+// （踩坑 133 的同一条纪律）：
+//   * `HcProxyUnavailable` = **可重试**的那一半（连不上代理、隧道应答超时、
+//     CONNECT 回 502/503/504 —— 代理刚起来 / 隧道上游抖一下，正是重发能救的现场）；
+//   * `HcProxyFailed` = **不可重试**的那一半（407 凭据错、403 被拒、应答畸形 ——
+//     属配置面，重发一百次还是同一句）。
+// 判据在 net/proxyx 的 `hpx_retryable`（一处定义，两处用：这里抛码、retryx 分类）。
+export error HcProxyUnavailable;
+export error HcProxyFailed;
 
 // ============================================================
 // 常量
@@ -102,6 +112,13 @@ const HC_USER_AGENT: &const byte =
 
 // --http-debug：把响应头与体首字节原始打出来（排查网关怪异响应）
 export var hc_debug: bool = false;
+
+// P92：一次出站请求走三条路里的哪一条。由 `hc_connect` 定（它同时决定连谁），
+// 再交给 `build_request` 决定请求行写相对还是绝对形式 —— **判据与用法同源**，
+// 不会出现「连了代理却发了相对请求」这种半对状态。
+export const HC_ROUTE_DIRECT: u8 = 0;      // 直连目标（没配代理，或目标是回环）
+export const HC_ROUTE_TUNNEL: u8 = 1;      // HTTPS 目标：CONNECT 打隧道，TLS 与目标谈
+export const HC_ROUTE_PROXY_ABS: u8 = 2;   // HTTP 目标：连代理，请求行写绝对形式
 
 // ============================================================
 // TOFU 指纹库（HC_VERIFY_TOFU 的判据来源）
@@ -1031,6 +1048,199 @@ export fn tcp_connect(host: &const byte, host_len: usize, port: u16, timeout_ms:
 }
 
 // ============================================================
+// P92：出站代理（路由 + CONNECT 隧道）
+//
+// 分工：**取值解析、状态、失败分类、报文拼装都在 net/proxyx**（那边零 I/O、离线可测），
+// 这一节只做「谁去连、连谁」以及隧道那一次真实的读写。为什么不把隧道也放进 proxyx：
+// 它要 `tcp_connect`（名字解析在这里）与 `tui_active()`（泵点在这里），搬过去只会
+// 把 proxyx 从纯数据变换变成又一个传输层，失掉「离线可测」这条。
+//
+// 三条路（`HC_ROUTE_*`）：
+//   * 没配代理，或目标是回环（`hpx_bypass`）⇒ `DIRECT`，与从前逐字节相同；
+//   * HTTPS 目标 ⇒ `TUNNEL`：先连代理、`CONNECT host:port` 打成隧道，之后的 TLS
+//     握手仍是**与目标主机**谈 —— SNI / leaf 指纹 / TOFU / pin 判据一个字不变。
+//     这是「代理只搬字节、不参与信任」这条不变量的落点：隧道那一段是明文，但里面跑的
+//     TLS 是端到端的，代理看不到明文（要看得见就得用户自己换 MITM 证书，那时 pin/tofu
+//     会如实报指纹不符 —— 这正是我们要的行为）。
+//   * HTTP 目标 ⇒ `PROXY_ABS`：连代理，请求行写**绝对形式**（见 `build_request`）。
+// ============================================================
+
+// 连代理并打通一条到 `host:port` 的隧道，返回可用于 TLS 握手的 fd。
+//
+// 失败分两档（判据在 `hpx_retryable`，一处定义）：可重试的抛 `HcProxyUnavailable`，
+// 其余抛 `HcProxyFailed`。**两种情况都会记账**（`hpx_note_fail`），显示层据此说人话。
+fn hc_proxy_tunnel(host: &const byte, host_len: usize, port: u16,
+    timeout_ms: u32) !i32 {
+    hpx_note_target(host, host_len, port);
+    const fd: i32 = tcp_connect(hpx_host_ptr(), hpx_host_len(), hpx_port(),
+        timeout_ms) catch |err| {
+        const eid: i32 = (@error_id(err) as! i32).value;
+        if eid == @error_id(error.HcDnsFailed) {
+            return error.HcDnsFailed;   // 代理主机名没解开：还是「看解析器」那条路
+        }
+        hpx_note_fail(HPX_E_DIAL, 0);
+        return error.HcProxyUnavailable;
+    };
+    var req: Buf = buf_new(512);
+    defer { buf_free(&req); }
+    if !buf_valid(&req) || !hpx_connect_head(&req, host, host_len, port) {
+        _ = sys_close(fd) catch {};
+        hpx_note_fail(HPX_E_BADRESP, 0);
+        return error.HcProxyFailed;
+    }
+    https_write_all(fd, req.ptr as &const byte, req.len) catch {
+        _ = sys_close(fd) catch {};
+        hpx_note_fail(HPX_E_TIMEOUT, 0);
+        return error.HcProxyUnavailable;
+    };
+    const st: i32 = hc_tunnel_read_head(fd, timeout_ms);
+    if st == 0 {
+        _ = sys_close(fd) catch {};
+        const e: i32 = hpx_err_now();
+        if hpx_retryable(e, 0) {
+            return error.HcProxyUnavailable;
+        }
+        return error.HcProxyFailed;
+    }
+    if st != 200 {
+        _ = sys_close(fd) catch {};
+        hpx_note_fail(HPX_E_STATUS, st);
+        if hpx_retryable(HPX_E_STATUS, st) {
+            return error.HcProxyUnavailable;
+        }
+        return error.HcProxyFailed;
+    }
+    hpx_note_ok();
+    return fd;
+}
+
+// 读 CONNECT 的应答头，返回状态码（0 = 失败，原因已由 hpx_note_fail 记账）。
+//
+// 「读完之后 rx 里还剩字节」= 代理在隧道建立之后又发了数据。这种情形**当失败**处理：
+// 那些字节属于隧道，丢掉它们会让随后的 TLS 握手中途错位（症状是「握手失败」，
+// 而真话是代理乱发东西）—— 报错比静默吃掉强。
+fn hc_tunnel_read_head(fd: i32, timeout_ms: u32) i32 {
+    var rx: Buf = buf_new(1024);
+    defer { buf_free(&rx); }
+    if !buf_valid(&rx) {
+        hpx_note_fail(HPX_E_BADRESP, 0);
+        return 0;
+    }
+    var tmp: [byte: 1024] = [0: 1024];
+    const t0: u64 = ua_now_ms();
+    var head_end: usize = 0;
+    while true {
+        const view: &[byte] = rx.ptr[0: rx.len];
+        const he: isize = find_sub(view, &"\r\n\r\n"[0: 4], 0);
+        if he >= 0 {
+            head_end = (he as usize) + 4;
+            break;
+        }
+        if rx.len > HPX_HEAD_MAX {
+            hpx_note_fail(HPX_E_BADRESP, 0);
+            return 0;
+        }
+        // 与 httpc 的其它读循环同一套：TUI 里 poll(≤50ms) + 泵点，非 TUI 阻塞读。
+        if tui_active() {
+            var pfds: [PollFd: 1] =
+                [PollFd{ fd: fd, events: POLLIN, revents: 0 }];
+            const pr: i32 = sys_poll(&pfds[0], 1, 50) catch { 0; };
+            if pr <= 0 {
+                if timeout_ms > 0 && (ua_now_ms() - t0) >= (timeout_ms as u64) {
+                    hpx_note_fail(HPX_E_TIMEOUT, 0);
+                    return 0;
+                }
+                agent_pump_light();
+                continue;
+            }
+        }
+        const n: usize = https_read_some(fd, &tmp[0], 1024) catch {
+            hpx_note_fail(HPX_E_BADRESP, 0);
+            return 0;
+        };
+        if n == 0 {
+            hpx_note_fail(HPX_E_BADRESP, 0);   // 头都没读完就断了
+            return 0;
+        }
+        if !buf_append(&rx, &tmp[0], n) {
+            hpx_note_fail(HPX_E_BADRESP, 0);
+            return 0;
+        }
+    }
+    if rx.len != head_end {
+        hpx_note_fail(HPX_E_BADRESP, 0);
+        return 0;
+    }
+    const st: i32 = hpx_head_status(rx.ptr[0: head_end], head_end);
+    if st == 0 {
+        hpx_note_fail(HPX_E_BADRESP, 0);
+    }
+    return st;
+}
+
+// 一次出站请求落在哪条路上（**不连接**，纯判据）。
+// 与 `hc_connect` 共用它 —— 于是 `--probe` 印出来的路由与真跑的那条**同源**，
+// 不会出现「探测说走隧道、实际直连」这种只有真机才暴露的分叉。
+export fn hc_route_for(u: &const Url) u8 {
+    if !hpx_active() || hpx_bypass(url_host(u), u.host_len) {
+        return HC_ROUTE_DIRECT;
+    }
+    if u.tls {
+        return HC_ROUTE_TUNNEL;
+    }
+    return HC_ROUTE_PROXY_ABS;
+}
+
+// 路由名（诊断/`--probe` 用）。
+export fn hc_route_name(route: u8) &const byte {
+    if route == HC_ROUTE_TUNNEL {
+        return "CONNECT tunnel" as &const byte;
+    }
+    if route == HC_ROUTE_PROXY_ABS {
+        return "absolute-form" as &const byte;
+    }
+    return "direct" as &const byte;
+}
+
+// 从 URL 文本直接问路由（`--probe` 手上只有一串 URL）。解析失败按直连报 ——
+// 那种情况下 `http_request` 会在更早的地方以 `HcBadUrl` 停下，这里不必再抢答。
+export fn hc_route_for_url(url: &[byte]) u8 {
+    var u: Url = url_empty();
+    const pr: !void = url_parse(url, &u);
+    _ = pr catch {
+        return HC_ROUTE_DIRECT;
+    };
+    const r: u8 = hc_route_for(&u);
+    url_free(&u);
+    return r;
+}
+
+// 一次出站连接：定路由（写进 route）、必要时先打隧道，返回可用的 fd。
+// 这是 `http_request` 与 `httpstream` 两条路**共用**的唯一入口 —— 代理要不要起作用，
+// 只看它，不看调用方（调用方只负责把 route 传给 build_request）。
+export fn hc_connect(u: &const Url, timeout_ms: u32, route: &u8) !i32 {
+    route[0] = hc_route_for(u);
+    if route[0] == HC_ROUTE_DIRECT {
+        return tcp_connect(url_host(u), u.host_len, u.port, timeout_ms);
+    }
+    if route[0] == HC_ROUTE_TUNNEL {
+        return hc_proxy_tunnel(url_host(u), u.host_len, u.port, timeout_ms);
+    }
+    hpx_note_target(url_host(u), u.host_len, u.port);
+    const fd: i32 = tcp_connect(hpx_host_ptr(), hpx_host_len(), hpx_port(),
+        timeout_ms) catch |err| {
+        const eid: i32 = (@error_id(err) as! i32).value;
+        if eid == @error_id(error.HcDnsFailed) {
+            return error.HcDnsFailed;
+        }
+        hpx_note_fail(HPX_E_DIAL, 0);
+        return error.HcProxyUnavailable;
+    };
+    hpx_note_ok();
+    return fd;
+}
+
+// ============================================================
 // TLS 会话
 // ============================================================
 export struct TlsConn {
@@ -1515,22 +1725,9 @@ export fn resp_free(r: &Resp) void {
     buf_free(&r.body);
 }
 
-// 拼请求头（追加进 out，不清空）：请求行 + Host（非默认端口才带 :port）+ User-Agent +
-// extra_headers 原样 + Content-Length + `Connection: close`。body 由调用方另行追加。
-// 分配失败返回 false。
-fn build_request(u: &const Url, method: &[byte], extra_headers: &[byte], body_len: usize, out: &Buf) bool {
-    if !buf_append_slice(out, method) {
-        return false;
-    }
-    if !buf_append_byte(out, 32) {
-        return false;
-    }
-    if !buf_append(out, url_path(u), u.path_len) {
-        return false;
-    }
-    if !buf_append_cstr(out, " HTTP/1.1\r\nHost: ") {
-        return false;
-    }
+// 拼 `Host: host[:port]` 那一行（默认端口不带端口号）。
+// 直连与走代理两种形态共用同一个头 —— 代理改的是请求行，不改 Host。
+fn hc_append_host_header(u: &const Url, out: &Buf) bool {
     if !buf_append(out, url_host(u), u.host_len) {
         return false;
     }
@@ -1538,13 +1735,62 @@ fn build_request(u: &const Url, method: &[byte], extra_headers: &[byte], body_le
     if u.tls {
         default_port = 443;
     }
-    if u.port != default_port {
-        if !buf_append_byte(out, 58) {
+    if u.port == default_port {
+        return true;
+    }
+    if !buf_append_byte(out, 58) {
+        return false;
+    }
+    return buf_append_u64(out, u.port as u64);
+}
+
+// 拼请求行的目标部分：直连写相对路径（`/v1/chat/completions`），走明文代理写**绝对形式**
+// （`http://api.example.com/v1/chat/completions`）。
+//
+// 为什么绝对形式是必须的：代理要靠它认出去哪（这正是「代理模式」与「源服务器模式」的区别），
+// 写成相对路径时请求会被路由到代理自己身上 —— 症状是 404 或代理的欢迎页，与网络错无关，
+// 很难从「请求失败」这四个字里查出来。
+fn hc_append_target(u: &const Url, route: u8, out: &Buf) bool {
+    if route != HC_ROUTE_PROXY_ABS {
+        return buf_append(out, url_path(u), u.path_len);
+    }
+    // 走绝对形式的**只可能是明文目标**（HTTPS 一律走 CONNECT 隧道，见 hc_connect）；
+    // 但这里仍按 u.tls 取 scheme，免得将来多一条路由时这里变成静默错的源头。
+    if u.tls {
+        if !buf_append_cstr(out, "https://") {
             return false;
         }
-        if !buf_append_u64(out, u.port as u64) {
+    } else {
+        if !buf_append_cstr(out, "http://") {
             return false;
         }
+    }
+    if !hc_append_host_header(u, out) {
+        return false;
+    }
+    return buf_append(out, url_path(u), u.path_len);
+}
+
+// 拼请求头（追加进 out，不清空）：请求行 + Host（非默认端口才带 :port）+ User-Agent +
+// extra_headers 原样（走明文代理时前面先加 Proxy-Authorization）+ Content-Length +
+// `Connection: close`。body 由调用方另行追加。分配失败返回 false。
+// route 取自 `hc_connect` 写回的那个值 —— 路由与请求形态**同源**，不会半对。
+fn build_request(u: &const Url, method: &[byte], extra_headers: &[byte],
+    body_len: usize, route: u8, out: &Buf) bool {
+    if !buf_append_slice(out, method) {
+        return false;
+    }
+    if !buf_append_byte(out, 32) {
+        return false;
+    }
+    if !hc_append_target(u, route, out) {
+        return false;
+    }
+    if !buf_append_cstr(out, " HTTP/1.1\r\nHost: ") {
+        return false;
+    }
+    if !hc_append_host_header(u, out) {
+        return false;
     }
     if !buf_append_cstr(out, "\r\nUser-Agent: ") {
         return false;
@@ -1554,6 +1800,13 @@ fn build_request(u: &const Url, method: &[byte], extra_headers: &[byte], body_le
     }
     if !buf_append_cstr(out, "\r\n") {
         return false;
+    }
+    // 明文代理的凭据：只有绝对形式那一路需要（CONNECT 那一路在 hpx_connect_head 里带上）。
+    // 直连时**一个字节都不发** —— 把凭据发给源服务器是最没有理由的一种泄漏。
+    if route == HC_ROUTE_PROXY_ABS && hpx_auth_len() > 0 {
+        if !buf_append(out, hpx_auth_ptr(), hpx_auth_len()) {
+            return false;
+        }
     }
     if extra_headers.len > 0 {
         if !buf_append(out, extra_headers.ptr, extra_headers.len) {
@@ -1704,7 +1957,10 @@ export fn http_request(
     try url_parse(url, &u);
     defer { url_free(&u); }
 
-    const fd: i32 = try tcp_connect(url_host(&u), u.host_len, u.port, timeout_ms);
+    // P92：连谁、走哪条路（直连 / CONNECT 隧道 / 明文代理）由 `hc_connect` 一处定 ——
+    // 它把路由写进 route，紧接的 build_request 据此决定请求行写相对还是绝对形式。
+    var route: u8 = HC_ROUTE_DIRECT;
+    const fd: i32 = try hc_connect(&u, timeout_ms, &route);
     defer { _ = sys_close(fd) catch {}; }
 
     tls_out.fd = fd;
@@ -1719,7 +1975,7 @@ export fn http_request(
     if !buf_valid(&req) {
         return error.HcOutOfMemory;
     }
-    if !build_request(&u, method, extra_headers, body_len, &req) {
+    if !build_request(&u, method, extra_headers, body_len, route, &req) {
         return error.HcOutOfMemory;
     }
     if !buf_append(&req, body, body_len) {

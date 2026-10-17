@@ -10,6 +10,7 @@
 #   make e2e-ws     # 工作区：恢复时跟随会话记录 + 日志不改挂 + 显式优先 + 记录目录被删（离线）
 #   make e2e-portable # 拷一个二进制到「新机器」（空 HOME/无 DSH/无仓库）还能跑完整功能（离线）
 #   make e2e-dns    # 名字解析：自家解析器（假 DNS + .invalid 域名）与失败时的人话（离线）
+#   make e2e-proxy  # 出站代理：穿过假代理到达上游（绝对形式 + CONNECT 隧道），反腿说人话（离线）
 #   make e2e-tasks  # /tasks：报告头 / 空态串 / open / toggle / 非法参数（离线）
 #   make e2e-tasks-resume # 清单跨进程恢复：一个进程写、另一个进程 --resume 还看得到（离线）
 #   make e2e-goal   # /goal：看状态 / 创建 / 拒绝顶掉 / edit / pause / resume / clear（离线）
@@ -106,7 +107,7 @@ AGENT_CFLAGS      := $(AGENT_CFLAGS_BASE) -include $(AGENT_C_PROTOS)
 #      数文件：`make -s print-src | wc -w`。
 # 留在 src/ 根的 tools.uya 是 P50 起就不在构建里的已知死代码，故意不列。
 SRC := src/foundation/bufx.uya src/foundation/jsonx.uya src/foundation/yamlcfg.uya \
-       src/net/tlspin.uya src/net/httpc.uya src/net/httpsrv.uya src/net/httpstream.uya src/net/llm.uya src/net/retryx.uya src/net/sse.uya src/net/webx.uya \
+       src/net/tlspin.uya src/net/proxyx.uya src/net/httpc.uya src/net/httpsrv.uya src/net/httpstream.uya src/net/llm.uya src/net/retryx.uya src/net/sse.uya src/net/webx.uya \
        src/term/oscin.uya src/term/mdview.uya src/term/tasks.uya src/term/tty.uya \
        src/term/tui/style.uya src/term/tui/keys.uya src/term/tui/frame.uya src/term/tui/entry.uya src/term/tui/screen.uya src/term/tui/sel.uya src/term/tui/overlay.uya src/term/tui/status.uya src/term/tui/ask.uya src/term/tui/watch.uya src/term/tui/diff.uya src/term/tui/hook.uya \
        src/term/view.uya src/term/watch.uya \
@@ -123,7 +124,7 @@ SRC := src/foundation/bufx.uya src/foundation/jsonx.uya src/foundation/yamlcfg.u
        src/selftest/st_core.uya src/selftest/st_mock_server.uya src/selftest/st_round_driver.uya src/selftest/st_tty_sse.uya src/selftest/st_sessions.uya src/selftest/st_read_window.uya src/selftest/st_view_watch.uya src/selftest/st_responses.uya src/selftest/st_stats_ctx.uya src/selftest/st_ctxfit.uya src/selftest/st_title.uya src/selftest/st_tasks_ws.uya src/selftest/st_vision.uya src/selftest/st_goal_worktree.uya src/selftest/st_goal_sess.uya src/selftest/st_todo_resume.uya src/selftest/st_pm.uya src/selftest/st_pm2.uya src/selftest/st_mcp.uya \
        src/selftest/tuis_core.uya src/selftest/tuis_title_pty.uya src/selftest/tuis_exit_cmd.uya src/selftest/tuis_diff_scroll.uya src/selftest/tuis_title_ask.uya src/selftest/tuis_sessions_big.uya src/selftest/tuis_tail.uya src/selftest/tuis_marquee_row.uya src/selftest/tuis_sel.uya src/selftest/tuis_mem.uya \
        src/selftest/st_web.uya src/selftest/st_web_childcfg.uya src/selftest/st_web_live.uya src/selftest/st_tls_pin.uya \
-       src/selftest/st_dns.uya \
+       src/selftest/st_dns.uya src/selftest/st_proxy.uya \
        src/selftest/st_clip.uya src/selftest/st_wire.uya src/selftest/tuis_ui_port.uya src/selftest/tuis_events.uya \
        src/diff/model.uya src/diff/gitcmd.uya src/diff/rows.uya src/diff/view.uya src/diff/render.uya
 OUT := build/uya-agent
@@ -137,7 +138,7 @@ export UYA_ROOT
 export UYA_SPLIT_C_DIR := $(CURDIR)/build/uyacache
 
 # 行宽豁免：一条 .PHONY 就是一张全仓目标清单，拆行反而看不清哪条丢了
-.PHONY: all check wire-schema wire-probe wire-probe-real dsh-web-check dsh-settings-check print-src print-cflags build link-audit selftest codegen-audit doc-audit lint-size lint-size-all doc-cover ui-audit probe e2e e2e-config e2e-exec e2e-accept-nudge e2e-retry e2e-config-flags e2e-title e2e-title-cmd e2e-title-auto e2e-mouse e2e-api e2e-steps e2e-permission e2e-sandbox e2e-tasks e2e-tasks-resume e2e-goal e2e-memory e2e-memory-live e2e-sessions e2e-resume-big e2e-diff e2e-ws e2e-model e2e-model-save e2e-model-route e2e-provider e2e-ctxwindow e2e-inputimage e2e-worktree e2e-watch e2e-watch-pick e2e-dsh e2e-portable e2e-dns p30-check tui-demo tui-selftest web-selftest sess-selftest diff-selftest model-selftest panel-selftest clean shell-selftest pm-selftest mcp-selftest
+.PHONY: all check wire-schema wire-probe wire-probe-real dsh-web-check dsh-settings-check print-src print-cflags build link-audit selftest codegen-audit doc-audit lint-size lint-size-all doc-cover ui-audit probe e2e e2e-config e2e-exec e2e-accept-nudge e2e-retry e2e-config-flags e2e-title e2e-title-cmd e2e-title-auto e2e-mouse e2e-api e2e-steps e2e-permission e2e-sandbox e2e-tasks e2e-tasks-resume e2e-goal e2e-memory e2e-memory-live e2e-sessions e2e-resume-big e2e-diff e2e-ws e2e-model e2e-model-save e2e-model-route e2e-provider e2e-ctxwindow e2e-inputimage e2e-worktree e2e-watch e2e-watch-pick e2e-dsh e2e-portable e2e-proxy p30-check tui-demo tui-selftest web-selftest sess-selftest diff-selftest model-selftest panel-selftest clean shell-selftest pm-selftest mcp-selftest proxy-selftest
 
 all: build
 
@@ -296,7 +297,7 @@ lint-size-all:
 #   本仓实测：90 文件树上净增 50 个函数 + `rm -rf build && make build` → 通过（静态链接审计通过）。
 #   因此「净增函数按 0 处理」那条纪律作废。这段留下的用处只有一个：**换/降编译器时认得出症状**
 #   （报错点落在标准库、`make check` 全绿、只有清缓存重编才炸）。
-selftest: build codegen-audit doc-audit doc-cover ui-audit e2e-exec e2e-accept-nudge e2e-retry e2e-config-flags e2e-title e2e-title-cmd e2e-title-auto e2e-mouse e2e-api e2e-steps e2e-permission e2e-sandbox e2e-tasks e2e-tasks-resume e2e-goal e2e-memory e2e-memory-live e2e-sessions e2e-resume-big e2e-diff e2e-ws e2e-model e2e-model-save e2e-model-route e2e-provider e2e-ctxwindow e2e-inputimage e2e-worktree e2e-portable e2e-dns p30-check
+selftest: build codegen-audit doc-audit doc-cover ui-audit e2e-exec e2e-accept-nudge e2e-retry e2e-config-flags e2e-title e2e-title-cmd e2e-title-auto e2e-mouse e2e-api e2e-steps e2e-permission e2e-sandbox e2e-tasks e2e-tasks-resume e2e-goal e2e-memory e2e-memory-live e2e-sessions e2e-resume-big e2e-diff e2e-ws e2e-model e2e-model-save e2e-model-route e2e-provider e2e-ctxwindow e2e-inputimage e2e-worktree e2e-portable e2e-dns e2e-proxy p30-check
 	UYA_BIN=$(UYA) $(OUT) --selftest
 
 probe: build
@@ -1292,8 +1293,14 @@ e2e-retry: build
 	k=$$(grep -c "\[retry\] transport" $(CURDIR)/build/e2e_retry_out_dead.txt || true); \
 	[ "$$k" = "2" ] \
 		|| { echo "FAIL: 死端口那次的重试行数 $$k（期望 2：发了 3 次 = 重试 2 次）"; cat $(CURDIR)/build/e2e_retry_out_dead.txt; exit 1; }; \
-	grep -q "请求失败（网络或 TLS 校验）" $(CURDIR)/build/e2e_retry_out_dead.txt \
-		|| { echo "FAIL: 预算用尽后没有按旧口径报「请求失败」（负控腿失去意义）"; exit 1; }; \
+	: "  预算用尽之后**要说对是哪一档**（P92 收紧：以前这条腿断言的是那句笼统的"; \
+	: "  「网络或 TLS 校验」，而那正是踩坑 133 要消灭的谎 —— 死端口是「连不上」不是 TLS。"; \
+	: "  现在断言「连不上服务器」：它同时证了「失败档位跨重试没丢」这条"; \
+	grep -q "请求失败（连不上服务器）" $(CURDIR)/build/e2e_retry_out_dead.txt \
+		|| { echo "FAIL: 预算用尽后没说清是「连不上服务器」（档位在重试路上丢了）"; \
+		cat $(CURDIR)/build/e2e_retry_out_dead.txt; exit 1; }; \
+	if grep -q "TLS 校验" $(CURDIR)/build/e2e_retry_out_dead.txt; then \
+		echo "FAIL: 死端口却说成了 TLS 校验"; exit 1; fi; \
 	echo "e2e-retry: 通过（默认重发到成功 + 0/1/2 三个上限各自生效 + 重发逐字节相同 + 同一步 + 退出码分类不变）"
 # CLI flag 回归：--dsh-home / --no-dsh-config / --strict-dsh-config 决定「去哪儿读设置」，
 # 必须在下一次加载之前生效（曾经因为完整 CLI 解析排在加载之后而三个 flag 全部静默失效，
@@ -1623,6 +1630,195 @@ e2e-dns: build
 		|| { echo "FAIL: 显式解析器的来源没报成 env"; echo "$$out" | grep "^dns"; exit 1; }; \
 	echo "e2e-dns: 通过（自家解析器跑通 .invalid；流式与非流式都把 DNS 失败说成人话；print-config 两个来源）"
 
+# P92：出站代理（离线，全程只打 127.0.0.1）。
+#   判据的形状：
+#     * 正腿必须**穿过代理到达上游** —— 断言假网关真收到了请求（`req.bin` 非空）**且**
+#       代理日志里那一行是**绝对形式**（`ABS POST http://…`）。只断言「答复上屏」时，
+#       直连的实现也能跑绿（那就成了假绿）。
+#     * 反腿必须说人话且**不许提 TLS/DNS** —— 配了代理时「连不上」的真原因是代理，
+#       而这条线要修的正是「三种失败糊成同一句」（与 e2e-dns 的反腿同形）。
+#     * 回环那条腿是「本机目标一律直连」的落点：代理指向一个死端口，请求照样跑通。
+e2e-proxy: build
+	@set -e; \
+	ws=$$(pwd)/build/selftest_proxy_e2e; req=$$ws/req.bin; \
+	rm -rf $$ws; mkdir -p $$ws; \
+	plog=$$ws/proxy.log; gwlog=$$ws/gw.log; \
+	cleanup() { for p in $$pp $$gwp $$rp $$gws $$ps2; do \
+		kill $$p 2>/dev/null || true; done; rm -rf $$ws; }; \
+	trap cleanup EXIT; \
+	: "--- 起夹具：网关先起（代理要把它当 --upstream 的目标改写）---"; \
+	python3 testdata/mock_gateway_portable.py 0 $$req > $$gwlog 2>&1 & gwp=$$!; \
+	python3 testdata/mock_proxy.py 0 $$ws/reject.log --reject 407 \
+		> $$ws/reject.port 2>&1 & rp=$$!; \
+	sleep 0.6; \
+	gport=$$(awk '/^PORT/{print $$2}' $$gwlog); \
+	[ -n "$$gport" ] || { echo "FAIL: 假网关没起来"; cat $$gwlog; exit 1; }; \
+	: "--- 假代理：目标名（.invalid）只用于断言，真连接经 --upstream 落到假网关 ---"; \
+	python3 testdata/mock_proxy.py 0 $$plog --upstream 127.0.0.1:$$gport \
+		> $$ws/proxy.port 2>&1 & pp=$$!; \
+	: "--- 流式那条路要真的 SSE 上游：另一个网关 + 另一个代理 ---"; \
+	python3 testdata/mock_gateway_sse.py 0 1 50 > $$ws/gwsse.log 2>&1 & gws=$$!; \
+	sleep 0.8; \
+	sport=$$(awk '/^PORT/{print $$2}' $$ws/gwsse.log); \
+	[ -n "$$sport" ] || { echo "FAIL: SSE 假网关没起来"; \
+		cat $$ws/gwsse.log; exit 1; }; \
+	python3 testdata/mock_proxy.py 0 $$ws/proxysse.log \
+		--upstream 127.0.0.1:$$sport > $$ws/proxysse.port 2>&1 & ps2=$$!; \
+	sleep 0.6; \
+	pport=$$(awk '/^PORT/{print $$2}' $$ws/proxy.port); \
+	rport=$$(awk '/^PORT/{print $$2}' $$ws/reject.port); \
+	sport2=$$(awk '/^PORT/{print $$2}' $$ws/proxysse.port); \
+	[ -n "$$pport" ] || { echo "FAIL: 假代理没起来"; cat $$ws/proxy.port; exit 1; }; \
+	[ -n "$$rport" ] || { echo "FAIL: 拒绝腿的假代理没起来"; \
+		cat $$ws/reject.port; exit 1; }; \
+	[ -n "$$sport2" ] || { echo "FAIL: 流式那条腿的假代理没起来"; \
+		cat $$ws/proxysse.port; exit 1; }; \
+	: "---- ① 正腿：env 档，请求穿过代理到达上游（明文目标 = 绝对形式）----"; \
+	rc=0; \
+	env -u UYA_AGENT_BASE_URL UYA_AGENT_PROXY=127.0.0.1:$$pport UYA_AGENT_API_KEY=k \
+		$(OUT) --no-dsh-config --no-tui --no-stream --api=chat --model px-m \
+		--base-url "http://mock-proxy-e2e.invalid:$$gport/v1" --workspace $$ws \
+		--agent-home $$ws/home --timeout-ms 20000 "hi" \
+		> $$ws/out.txt 2>&1 || rc=$$?; \
+	[ "$$rc" = "0" ] || { echo "FAIL: 走代理那一轮没跑通（rc=$$rc）"; \
+		cat $$ws/out.txt; cat $$plog; exit 1; }; \
+	grep -q "PORTABLE-OK" $$ws/out.txt \
+		|| { echo "FAIL: 假网关的答复没上屏"; cat $$ws/out.txt; exit 1; }; \
+	[ -s $$req ] || { echo "FAIL: 假网关一个请求都没收到（请求没穿过代理）"; exit 1; }; \
+	grep -q '"model":"px-m"\|"model": *"px-m"' $$req \
+		|| { echo "FAIL: 请求里的模型不是父进程给的那个"; head -c 400 $$req; exit 1; }; \
+	grep -q "^ABS POST http://mock-proxy-e2e.invalid:$$gport/v1" $$plog \
+		|| { echo "FAIL: 代理日志里没有绝对形式的请求行（代理模式没生效）"; \
+		cat $$plog; exit 1; }; \
+	: "---- ② 正腿：流式那条路（hc_open）也走同一个代理 ----"; \
+	rc=0; \
+	env -u UYA_AGENT_BASE_URL UYA_AGENT_PROXY=127.0.0.1:$$sport2 UYA_AGENT_API_KEY=k \
+		$(OUT) --no-dsh-config --no-tui --api=chat --model px-s \
+		--base-url "http://mock-proxy-e2e.invalid:$$sport/v1" --workspace $$ws \
+		--agent-home $$ws/home --timeout-ms 20000 "hi" \
+		> $$ws/out2.txt 2>&1 || rc=$$?; \
+	[ "$$rc" = "0" ] || { echo "FAIL: 流式那一轮没跑通（rc=$$rc）"; \
+		cat $$ws/out2.txt; exit 1; }; \
+	grep -q "SELFTEST_OK" $$ws/out2.txt \
+		|| { echo "FAIL: 流式那条路的答复没上屏"; cat $$ws/out2.txt; exit 1; }; \
+	grep -q "^ABS POST http://mock-proxy-e2e.invalid:$$sport/v1" $$ws/proxysse.log \
+		|| { echo "FAIL: 流式那条路的请求没走代理"; \
+		cat $$ws/proxysse.log; exit 1; }; \
+	: "---- ③ 凭据腿：user:pass@ 要变成 Proxy-Authorization: Basic … ----"; \
+	rc=0; \
+	env -u UYA_AGENT_BASE_URL \
+		UYA_AGENT_PROXY="http://user:pass@127.0.0.1:$$pport" UYA_AGENT_API_KEY=k \
+		$(OUT) --no-dsh-config --no-tui --no-stream --api=chat --model px-c \
+		--base-url "http://mock-proxy-e2e.invalid:$$gport/v1" --workspace $$ws \
+		--agent-home $$ws/home --timeout-ms 20000 "hi" \
+		> $$ws/out3.txt 2>&1 || rc=$$?; \
+	[ "$$rc" = "0" ] || { echo "FAIL: 带凭据那一轮没跑通（rc=$$rc）"; \
+		cat $$ws/out3.txt; exit 1; }; \
+	grep -q "^AUTH Basic dXNlcjpwYXNz" $$plog \
+		|| { echo "FAIL: 代理没收到 Proxy-Authorization（凭据没发出去）"; \
+		cat $$plog; exit 1; }; \
+	: "---- ④ CLI 档：--proxy 与 env 同效 ----"; \
+	rc=0; \
+	env -u UYA_AGENT_BASE_URL -u UYA_AGENT_PROXY UYA_AGENT_API_KEY=k \
+		$(OUT) --no-dsh-config --no-tui --no-stream --api=chat --model px-cli \
+		--proxy 127.0.0.1:$$pport \
+		--base-url "http://mock-proxy-e2e.invalid:$$gport/v1" --workspace $$ws \
+		--agent-home $$ws/home --timeout-ms 20000 "hi" \
+		> $$ws/out4.txt 2>&1 || rc=$$?; \
+	[ "$$rc" = "0" ] || { echo "FAIL: --proxy 那一轮没跑通（rc=$$rc）"; \
+		cat $$ws/out4.txt; exit 1; }; \
+	grep -q '"model":"px-cli"\|"model": *"px-cli"' $$req \
+		|| { echo "FAIL: --proxy 那一轮的请求没到上游"; exit 1; }; \
+	: "---- ⑤ --no-proxy 压过 env（直连：代理日志里不该再多一行）----"; \
+	before=$$(wc -l < $$plog); \
+	rc=0; \
+	env -u UYA_AGENT_BASE_URL UYA_AGENT_PROXY=127.0.0.1:$$pport UYA_AGENT_API_KEY=k \
+		$(OUT) --no-dsh-config --no-tui --no-stream --api=chat --model px-off \
+		--no-proxy --base-url "http://127.0.0.1:$$gport/v1" --workspace $$ws \
+		--agent-home $$ws/home --timeout-ms 20000 "hi" \
+		> $$ws/out5.txt 2>&1 || rc=$$?; \
+	[ "$$rc" = "0" ] || { echo "FAIL: --no-proxy 那一轮没跑通（rc=$$rc）"; \
+		cat $$ws/out5.txt; exit 1; }; \
+	after=$$(wc -l < $$plog); \
+	[ "$$before" = "$$after" ] \
+		|| { echo "FAIL: --no-proxy 之后代理还是被用了"; cat $$plog; exit 1; }; \
+	: "---- ⑥ 反腿：代理连不上 ⇒ rc=2、说代理、不许提 TLS/DNS ----"; \
+	rc=0; \
+	env -u UYA_AGENT_BASE_URL UYA_AGENT_PROXY=127.0.0.1:1 UYA_AGENT_API_KEY=k \
+		$(OUT) --no-dsh-config --no-tui --api=chat --model px-m --api-retry-max 0 \
+		--base-url "http://mock-proxy-e2e.invalid:$$gport/v1" --workspace $$ws \
+		--agent-home $$ws/home --timeout-ms 5000 "hi" > $$ws/bad.txt 2>&1 || rc=$$?; \
+	[ "$$rc" = "2" ] || { echo "FAIL: 代理连不上时退出码应当是 2（传输错），实际 $$rc"; \
+		cat $$ws/bad.txt; exit 1; }; \
+	grep -q "代理没打通" $$ws/bad.txt \
+		|| { echo "FAIL: 没说是代理没打通"; cat $$ws/bad.txt; exit 1; }; \
+	grep -q "UYA_AGENT_PROXY" $$ws/bad.txt \
+		|| { echo "FAIL: 没给出 UYA_AGENT_PROXY 这条自救路"; cat $$ws/bad.txt; exit 1; }; \
+	if grep -q "TLS\|域名解析" $$ws/bad.txt; then \
+		echo "FAIL: 代理失败却说成了 TLS/DNS（这条线要修的就是这个谎）"; \
+		cat $$ws/bad.txt; exit 1; fi; \
+	: "---- ⑦ 反腿：CONNECT 被回 407 ⇒ rc=2、文案点名凭据 ----"; \
+	: "  目标写成 https://（走 CONNECT 隧道）：隧道被拒时根本不会开始 TLS 握手，"; \
+	: "  所以这条腿不需要证书，也不联网 —— 它判的正是「代理拒绝」那一档。"; \
+	rc=0; \
+	env -u UYA_AGENT_BASE_URL UYA_AGENT_PROXY=127.0.0.1:$$rport UYA_AGENT_API_KEY=k \
+		$(OUT) --no-dsh-config --no-tui --api=chat --model px-m --api-retry-max 0 \
+		--base-url "https://mock-proxy-e2e.invalid:$$gport/v1" --workspace $$ws \
+		--agent-home $$ws/home --timeout-ms 5000 "hi" > $$ws/bad2.txt 2>&1 || rc=$$?; \
+	[ "$$rc" = "2" ] || { echo "FAIL: 407 时退出码应当是 2，实际 $$rc"; \
+		cat $$ws/bad2.txt; exit 1; }; \
+	grep -q "407" $$ws/bad2.txt \
+		|| { echo "FAIL: 407 的文案里没带状态码（用户不知道该改凭据）"; \
+		cat $$ws/bad2.txt; exit 1; }; \
+	: "---- ⑧ 反腿：取值非法（env 与 CLI 各一次）⇒ rc=1 + 形状提示 ----"; \
+	rc=0; \
+	env -u UYA_AGENT_BASE_URL UYA_AGENT_PROXY="socks5://127.0.0.1:1080" \
+		UYA_AGENT_API_KEY=k $(OUT) --no-dsh-config --no-tui --print-config \
+		> $$ws/bad3.txt 2>&1 || rc=$$?; \
+	[ "$$rc" = "1" ] || { echo "FAIL: 非法代理取值应当 rc=1（用法错），实际 $$rc"; \
+		cat $$ws/bad3.txt; exit 1; }; \
+	grep -q "只支持 http://" $$ws/bad3.txt \
+		|| { echo "FAIL: 没点出「只支持 http://」"; cat $$ws/bad3.txt; exit 1; }; \
+	grep -q "UYA_AGENT_PROXY" $$ws/bad3.txt \
+		|| { echo "FAIL: 没点名来源是 UYA_AGENT_PROXY"; cat $$ws/bad3.txt; exit 1; }; \
+	rc=0; \
+	env -u UYA_AGENT_BASE_URL -u UYA_AGENT_PROXY UYA_AGENT_API_KEY=k \
+		$(OUT) --no-dsh-config --no-tui --proxy=127.0.0.1:70000 --print-config \
+		> $$ws/bad4.txt 2>&1 || rc=$$?; \
+	[ "$$rc" = "1" ] || { echo "FAIL: 端口越界的 --proxy= 应当 rc=1，实际 $$rc"; \
+		cat $$ws/bad4.txt; exit 1; }; \
+	grep -q "来源：--proxy" $$ws/bad4.txt \
+		|| { echo "FAIL: 没点名来源是 --proxy"; cat $$ws/bad4.txt; exit 1; }; \
+	: "---- ⑨ --print-config 的 proxy 行（default / env / cli / --no-proxy）----"; \
+	out=$$(env -u UYA_AGENT_PROXY $(OUT) --no-dsh-config --print-config 2>&1); \
+	echo "$$out" | grep -q "^proxy = (none)  (source: default)" \
+		|| { echo "FAIL: 默认应当是 (none)/default"; echo "$$out" | grep "^proxy"; exit 1; }; \
+	out=$$(UYA_AGENT_PROXY=127.0.0.1:$$pport $(OUT) --no-dsh-config --print-config 2>&1); \
+	echo "$$out" | grep -q "^proxy = 127.0.0.1:$$pport  (source: env)" \
+		|| { echo "FAIL: env 档没印成 env"; echo "$$out" | grep "^proxy"; exit 1; }; \
+	out=$$(env -u UYA_AGENT_PROXY $(OUT) --no-dsh-config --print-config \
+		--proxy 127.0.0.1:$$pport 2>&1); \
+	echo "$$out" | grep -q "^proxy = 127.0.0.1:$$pport  (source: cli)" \
+		|| { echo "FAIL: cli 档没印成 cli"; echo "$$out" | grep "^proxy"; exit 1; }; \
+	out=$$(UYA_AGENT_PROXY=127.0.0.1:$$pport $(OUT) --no-dsh-config --print-config \
+		--no-proxy 2>&1); \
+	echo "$$out" | grep -q "^proxy = (disabled by --no-proxy)  (source: cli)" \
+		|| { echo "FAIL: --no-proxy 没印成「显式关掉」"; echo "$$out" | grep "^proxy"; \
+		exit 1; }; \
+	: "---- ⑩ 回环绕过：代理指向死端口，本机目标照样直连跑通 ----"; \
+	rc=0; \
+	env -u UYA_AGENT_BASE_URL UYA_AGENT_PROXY=127.0.0.1:1 UYA_AGENT_API_KEY=k \
+		$(OUT) --no-dsh-config --no-tui --no-stream --api=chat --model px-loop \
+		--base-url "http://127.0.0.1:$$gport/v1" --workspace $$ws \
+		--agent-home $$ws/home --timeout-ms 20000 "hi" \
+		> $$ws/out6.txt 2>&1 || rc=$$?; \
+	[ "$$rc" = "0" ] || { echo "FAIL: 回环目标没绕过代理（rc=$$rc）"; \
+		cat $$ws/out6.txt; exit 1; }; \
+	grep -q "PORTABLE-OK" $$ws/out6.txt \
+		|| { echo "FAIL: 绕过代理那一轮没拿到答复"; cat $$ws/out6.txt; exit 1; }; \
+	echo "e2e-proxy: 通过（请求真穿过代理到上游；流式/凭据/CLI 档各一条；代理失败说人话；非法值 rc=1；回环绕过）"
+
+
 # 步数默认值回归（离线，--print-config 不联网）：默认不限步数（0）；CLI 与环境变量同口径。
 # 默认值从「12 步熔断」改成「不限」是本仓库的显式决策（对齐 DSH：没有步数上限），
 # 所以这条常驻守着：默认值、显式值、0、非法值告警四条路径都要对。
@@ -1801,6 +1997,12 @@ tui-demo: build
 # TUI 相关自测轮（只跑 frame/keys/sink/turn/pty，改动 TUI 时比整轮 selftest 快得多）
 tui-selftest: build
 	UYA_SELFTEST_TUI_ONLY=1 $(OUT) --selftest
+
+# P92：出站代理的两段自测（纯函数：形状/默认端口/凭据头字节/回环绕过/七类非法值各指原因；
+# 现地假代理：CONNECT 原文与隧道透明 / 绝对形式请求行 / 407 与 502 各自归位 / 回环绕过）。
+# 改 net/proxyx 或那条路由时比整轮 selftest 快得多 —— 判据全是线上字节与回环套接字，不联网。
+proxy-selftest: build
+	UYA_SELFTEST_PROXY_ONLY=1 $(OUT) --selftest
 
 # P37：模型选择 / 推理强度 / worktree 的自测轮（改这条线时比整轮 selftest 快）
 model-selftest: build

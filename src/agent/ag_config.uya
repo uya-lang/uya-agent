@@ -175,6 +175,16 @@ export struct Config {
     sandbox: u8,              // SAN_AUTO（默认，探测 bwrap）/ SAN_OFF（--no-sandbox）
     sandbox_src: u8,          // 来源（0 默认 / 2 env / 3 cli）
     bwrap: Buf,               // --bwrap / UYA_AGENT_BWRAP：显式指定 bwrap 路径
+    // P92：出站代理（`--proxy` / `UYA_AGENT_PROXY` / `--no-proxy`）。
+    //
+    // 为什么需要一个 Config 字段而不是只读环境变量：`--web` / `--dsh-web` 的会话子进程是
+    // fork+exec 出来的，它们的配置只能从环境继承（踩坑 124）—— 父进程 `--proxy X` 起的
+    // 服务端，浏览器里的会话必须走同一个代理，否则「终端里通、标签页里不通」。
+    // 来源码（`proxy_src`）就是给那一处注入用的：0 = 没给（不注入，子进程自己读环境）；
+    // 2 = env（注入，覆盖继承来的旧值）；3 = cli（注入）。`--no-proxy` 是 **src = 3
+    // 且值为空** 的组合：它要能压过继承来的 `UYA_AGENT_PROXY`（见 web_child_env_cfg2）。
+    proxy: Buf,
+    proxy_src: u8,
     // 父进程**预先**为子代理指定的会话 id（NUL 结尾的 C 字符串）。
     // 为什么要有它：父进程 spawn 之后要拿子会话 id 才能 send_message 续跑，
     // 但子进程是 fork 出来的、id 由子进程自己生成，父进程无从得知（原实现里
@@ -325,6 +335,8 @@ fn cfg_default() Config {
         sandbox: SAN_AUTO,
         sandbox_src: 0,
         bwrap: buf_empty(),
+        proxy: buf_empty(),
+        proxy_src: 0,
         force_session_id: buf_empty(),
         web: false,
         web_addr: buf_empty(),
@@ -376,6 +388,7 @@ fn cfg_free(c: &Config) void {
     buf_free(&c.task);
     buf_free(&c.pin);
     buf_free(&c.bwrap);
+    buf_free(&c.proxy);
 }
 
 // ============================================================
@@ -1477,6 +1490,158 @@ fn agent_default_home(cfg: &const Config, out: &Buf) bool {
         return false;
     }
     return buf_append_cstr(out, "/.uya-agent");
+}
+
+// ============================================================
+// P92：出站代理（`--proxy` / `--no-proxy` / `$UYA_AGENT_PROXY`）
+//
+// 位置与 `agent_setup_dns` 并列，理由也相同：传输层不认识环境变量，这一层把「用哪个代理」
+// 钉进 net/proxyx，而且必须赶在**第一次连接之前**（连 DNS 都还没解析）。
+//
+// 与 `$UYA_AGENT_DNS` 的分工差异（刻意，不是抄漏）：DNS 那一档「值非法 = 告警后忽略」，
+// 因为它的失效方式是**可见的**（解析失败会说「没解开名字」并指向 `UYA_AGENT_DNS`）；
+// 代理这一档若静默忽略，症状是「直连还在走」—— 在只有代理能出网的环境里，用户看到的是
+// 一轮又一轮超时/连不上，而真正的原因（你写的那个变量没被采纳）一个字都不会出现。
+// 所以这一档**非法即报错退出**（`AGENT_USAGE`），并在消息里点名是哪个入口给的。
+// ============================================================
+
+// 把生效的代理钉进传输层。返回 0 = ok（含「没配代理」与「`--no-proxy`」），
+// 非 0 = 值非法（原因码来自 net/proxyx 的 HPX_E_*，调用方据此说人话后退出）。
+//
+// 取值来自 `cfg.proxy` —— env 与 CLI 两条入口在 main 里都已经收口到它，
+// 所以这里**只认 cfg**（多一个来源就多一处口径分叉）。
+export fn agent_setup_proxy(cfg: &const Config) i32 {
+    if cfg.proxy_src == 3 && cfg.proxy.len == 0 {
+        // 显式 `--no-proxy`：清掉传输层里可能已经钉着的值（env 那一档先跑过）
+        _ = hpx_set(null as &const byte);
+        return 0;
+    }
+    if cfg.proxy.len == 0 {
+        _ = hpx_set(null as &const byte);
+        return 0;
+    }
+    var z: Buf = buf_new(cfg.proxy.len + 1);
+    defer { buf_free(&z); }
+    if !buf_append(&z, cfg.proxy.ptr, cfg.proxy.len)
+        || !buf_append_byte(&z, 0) {
+        return HPX_E_BADVAL;
+    }
+    if !hpx_set(z.ptr as &const byte) {
+        return hpx_err_now();
+    }
+    return 0;
+}
+
+// 代理取值非法的**人话**（每个原因一条修法，理由见上面那一段）。
+// 由 main 在 `agent_setup_proxy` 返回非 0 时调用后退出（`AGENT_USAGE` = 1）。
+export fn agent_proxy_bad_value_report(cfg: &const Config, rc: i32) void {
+    out_err("error: 代理取值非法（");
+    out_err_bytes(cfg.proxy.ptr, cfg.proxy.len);
+    out_err("）—— ");
+    if rc == HPX_E_SCHEME {
+        out_err("只支持 http:// 明文代理（https 与 socks5 不在本轮范围）。\n");
+    } else if rc == HPX_E_HOST {
+        out_err("主机名缺了或含非法字符（不收 IPv6 字面量）。\n");
+    } else if rc == HPX_E_PORT {
+        out_err("端口要写成 1..65535 的十进制数。\n");
+    } else if rc == HPX_E_USERINFO {
+        out_err("凭据要写成 user:pass@host:port（只有用户名时不知道发什么）。\n");
+    } else if rc == HPX_E_EXTRA {
+        out_err("host:port 后面不该有别的东西（代理地址里的路径没有语义）。\n");
+    } else if rc == HPX_E_TOOBIG {
+        out_err("取值太长（超过 ");
+        out_err_dec(HPX_VAL_MAX);
+        out_err(" 字节）。\n");
+    } else {
+        out_err("认不出这个形状。\n");
+    }
+    out_err("  合法形状：host:port · http://host:port · ");
+    out_err("http://user:pass@host:port（端口省了按 ");
+    out_err_dec(HPX_DEFAULT_PORT as usize);
+    out_err("）。\n");
+    if cfg.proxy_src == 3 {
+        out_err("  来源：--proxy\n");
+    } else {
+        out_err("  来源：UYA_AGENT_PROXY（用 --no-proxy 可以显式关掉代理）\n");
+    }
+}
+
+// `--print-config` 的代理那一行：印**实际生效的**取值与来源。
+//
+// 与 DNS 那一行的差别：这里不「跑一遍解析链」（代理不需要，值就在手上）—— 印的就是
+// 用户写下的那串字节（原值，不另拼「规范化之后」的文本，两份迟早会不一致）。
+export fn agent_print_proxy_line(cfg: &const Config) void {
+    out_err("proxy = ");
+    if cfg.proxy.len == 0 {
+        if cfg.proxy_src == 3 {
+            out_err("(disabled by --no-proxy)");
+        } else {
+            out_err("(none)");
+        }
+    } else {
+        out_err_bytes(cfg.proxy.ptr, cfg.proxy.len);
+    }
+    out_err("  (source: ");
+    if cfg.proxy_src == 3 {
+        out_err("cli");
+    } else if cfg.proxy_src == 2 {
+        out_err("env");
+    } else {
+        out_err("default");
+    }
+    out_err(")\n");
+}
+
+// 代理侧失败的人话（kind 9）。
+//
+// 三件事一次说全：**代理是谁**、**要去哪**、**为什么没打通**，再加一条自救路。
+// 判据全在 net/proxyx 记的账里（`hpx_err_now` / `hpx_status_now` / `hpx_target_*`），
+// 显示层不猜、也不复刻判据（踩坑 132 的教训）。
+// 与 `agent_dns_fail_report` 同一形状 —— 传输层的失败都要能指到「下一步改哪里」。
+export fn agent_proxy_fail_report() void {
+    out_err("error: 请求失败（代理没打通）。\n");
+    out_err("  代理 = ");
+    out_err_bytes(hpx_host_ptr(), hpx_host_len());
+    out_err(":");
+    out_err_dec(hpx_port() as usize);
+    out_err("\n");
+    // 「要去哪」用**隧道目标**那一份（`hpx_target_*`），不是 `hc_target_*`：
+    // 走代理时 `hc_target_*` 记的是**代理自己**（tcp_connect 记的是它连上的那个地址），
+    // 印出来会与上面那行逐字重复 —— 而用户最需要的就是「代理是谁、想去哪」这两件不同的事。
+    const th: &const byte = hpx_target_ptr();
+    const tn: usize = hpx_target_len();
+    if tn > 0 {
+        out_err("  目标 = ");
+        out_err_bytes(th, tn);
+        out_err(":");
+        out_err_dec(hpx_target_port() as usize);
+        out_err("\n");
+    }
+    const err: i32 = hpx_err_now();
+    out_err("  原因：");
+    if err == HPX_E_DIAL {
+        out_err("连不上代理（TCP 没建立 —— 代理没在跑 / 地址写错）");
+    } else if err == HPX_E_TIMEOUT {
+        out_err("代理不应答（隧道请求读超时）");
+    } else if err == HPX_E_STATUS {
+        const st: i32 = hpx_status_now();
+        out_err("代理拒绝了 CONNECT（HTTP ");
+        out_err_dec(st as usize);
+        if st == 407 {
+            out_err("：要凭据 —— 把 user:pass@ 写进代理地址");
+        } else if st == 403 {
+            out_err("：代理不许去这个目标");
+        } else if st == 502 || st == 503 || st == 504 {
+            out_err("：代理连不上上游（它自己也在抖，重发往往就好）");
+        }
+    } else if err == HPX_E_BADRESP {
+        out_err("代理的应答不合法（或隧道建立后又发了数据）");
+    } else {
+        out_err("未知（用 --probe 看传输层细节）");
+    }
+    out_err("\n");
+    out_err("  本机目标会绕过代理；其余目标走 UYA_AGENT_PROXY。");
+    out_err("改完重试，或 --no-proxy 关掉代理直连。\n");
 }
 
 // ============================================================

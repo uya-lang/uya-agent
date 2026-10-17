@@ -152,6 +152,8 @@ readelf -lW build/uya-agent | grep -c INTERP    # 0 = 真静态
 | `--permission MODE` | **访问模式**：`read-only` / `workspace-write` / `danger-full-access`（默认）。也收 `--permission=<MODE>`；非法值**报错退出**。来源优先级 CLI > `UYA_AGENT_PERMISSION` > DSH `permission.defaultPreset` |
 | `--no-sandbox` | 关掉 bash 的内核沙箱（bwrap）：confined 模式不再套壳、也不再 fail closed（启动打一行警告） |
 | `--bwrap PATH` | 指定 bwrap 可执行文件（默认探测 `/usr/bin/bwrap`、`/bin/bwrap`、`/usr/local/bin/bwrap`） |
+| `--proxy URL` | **出站请求走代理**：`host:port` / `http://host:port` / `http://user:pass@host:port`（端口省了按 8080）。只支持 **`http://` 明文代理**：HTTPS 目标打 `CONNECT` 隧道（TLS 仍与目标主机谈，指纹/pin/TOFU 判据一个字不变），HTTP 目标用绝对形式转发。**本机目标一律直连**（`localhost` / `127.0.0.0/8` / `::1`）。值非法**报错退出**（`1`），不静默直连。env 档是 `UYA_AGENT_PROXY`，CLI 压过它 |
+| `--no-proxy` | 不走代理（**压过** `UYA_AGENT_PROXY`）；`--web` / `--dsh-web` 的会话子进程也会拿到空值，挡住继承来的代理 |
 | `--worktree` / `--no-worktree` | **独立工作区执行**：会话开始建 git worktree + `dsh/<slug>` 分支，干完用 `worktree` 工具 `finish` 提交/合并/删除；DSH `agent-presets.default=git-worktree` 会自动开 |
 | `--skill-dir DIR` | 额外的技能根（冒号分隔，可多次） |
 | `--mcp-server SPEC` | 加一个 MCP 插件 server（可多次）。`SPEC = name=command [args…] [K=V…]`，例：`--mcp-server "fs=npx -y @mcp/server-filesystem ."`。见 [§2.1](#21-插件mcp) |
@@ -332,6 +334,10 @@ uya-agent --dsh-assets ~/dsh-assets --dsh-web        # 之后都指这份
 `127.0.0.53:53`；不写时本进程自己**整份**读 `/etc/resolv.conf` 取第一个 IPv4 的
 `nameserver` —— **改文件/要 root 不再是排障的前提**，`--print-config` 的 `dns = …`
 会打印实际会用的那一台与它的来源）、
+`UYA_AGENT_PROXY`（**出站代理**：`host:port` / `http://user:pass@host:port`，
+同 `--proxy`；只认 `http://` 明文代理，`https://` 与 `socks5://` **报错退出**而不是
+静默直连 —— 静默直连在只有代理能出网的环境里等于把失败说成「网络不好」。
+`--print-config` 的 `proxy = …` 会打印实际生效的值与来源）、
 以及 key（三选一）：`UYA_AGENT_API_KEY` / `DEEPSEEK_API_KEY` / `OPENAI_API_KEY`。
 
 **退出码**：`0` 成功 · `1` 用法/配置错 · `2` 传输错（DNS/TCP/TLS/超时）· `3` 模型或协议错
@@ -343,6 +349,9 @@ uya-agent --dsh-assets ~/dsh-assets --dsh-web        # 之后都指这份
 为什么（超时/拒绝/文件里没有 nameserver 行…）以及 `UYA_AGENT_DNS` 这条自救路；
 TCP 连不上会打出目标 `主机:端口`；TLS 握手失败再单独一档。三种情形以前共用一句
 「请求失败（网络或 TLS 校验）」，等于把答案丢掉（见 DESIGN §16 踩坑 133）。
+**配了代理时又多一档**：代理没打通（连不上代理 / CONNECT 被拒 / 应答畸形）
+会把**代理**、**目标**、**为什么**一起说出来，并指名 `UYA_AGENT_PROXY` 这条自救路；
+**不会**说成 TLS 或 DNS（见 DESIGN §19.16）。
 
 > `2` / `3` 现在只在**重试预算用尽**时才会出现：瞬时失败（连接不上、5xx、限流、流早断）
 > 先退避重发，默认不限次数，直到成功或你中断（`--api-retry-max 0` 可关掉重试，让脚本
