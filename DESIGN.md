@@ -6530,7 +6530,7 @@ QTermWidget）对 `ESC[?5522$p`（DECRQM）**零应答**，OSC 52 写 `c`/`p` �
 
 | 模式 | 行为 |
 |---|---|
-| `--tls-verify=tofu`（默认） | **首次使用即信任**：第一次连某主机就把 leaf SHA-256 记进指纹库（`<agent home>/tls_pins`），之后每次都必须逐字节相符，不符即拒（`HcPinMismatch`）。不需要 CA 库、不需要人手抄指纹 ⇒ 新机器开箱可用，且强于 `none` |
+| `--tls-verify=tofu`（默认） | **首次使用即信任**：第一次连某主机就把 leaf SHA-256 记进指纹库（`<agent home>/tls_pins`），之后每次都必须逐字节相符，不符即拒（`HcPinMismatch`）；**唯一的例外是 P92**：没记过的那张证书若链能验到系统根，就学进库并放行（`--no-tls-tofu-learn` 关掉，见 §19.17）。不需要 CA 库、不需要人手抄指纹 ⇒ 新机器开箱可用，且强于 `none` |
 | `--tls-verify=chain` | 握手后调用导出的 `verify_chain_rsa`。**真实站点上必然失败**（理由见上），保留它是为了「中间人告警」这条路：真有中间人时它落在签名/CA 约束那一支，而不是 `peer_leaf=NULL` 那一支 |
 | `--tls-verify=pin` | 直接校验**服务端 leaf 证书 DER 的 SHA-256** 是否等于 `--tls-pin`。指纹从 `HandshakeCtx.server_flight_msg` 自己解析出来（不依赖 `cert_parse` 的 RSA 前提），实测与 `openssl s_client \| openssl x509 -outform DER \| sha256sum` 完全一致 |
 | `--tls-verify=none` | 不校验，仅打印观测到的 leaf SHA-256 与告警 |
@@ -6543,6 +6543,9 @@ QTermWidget）对 `ESC[?5522$p`（DECRQM）**零应答**，OSC 52 写 `c`/`p` �
 **指纹库**（P78）：`<agent home>/tls_pins`，一行一条 `<host> <64 位小写 hex>`，`#` 注释与空行
 忽略，同一主机可有多条（站点轮换证书/多机房是常态，命中任意一条即通过）。主机名与指纹比对
 都做大小写折叠。`$UYA_AGENT_TLS_PINS` 可整条覆盖路径；`--print-config` 的 `tls_pins` 打的就是它。
+**多条怎么来的**（P92）：除了人手往里加，`tofu` 档会在「新证书过了发证机构校验」时**自己追加
+一行**（每台主机最多 4 条，到上限就不再追加、也不淘汰）；链校验用本仓自己实现的
+`net/rsav` + `net/x509min` + `net/cachain`（不走 lib/tls，理由见 §18 的三条死路，细节见 §19.17）。
 **只有 chain 档加载系统根证书库** —— `pin` / `tofu` / `none` 的判据是 leaf 指纹，与 CA 库无关
 （实测：把 `/etc/ssl` 挂空之后，旧代码里 `pin` 档**拿着正确的指纹**也报 `HcTlsUnsupported`）。
 
@@ -6742,6 +6745,7 @@ DEEPSEEK_API_KEY=sk-xxx ./build/uya-agent \
 | `web-listen` | 监听套接字的 `SO_REUSEADDR`（踩坑 118）：走**生产代码** `srv_listen` 两条腿 —— ① 选项 `getsockopt` 真读得回来（== 1）；② 真复现用户现场：起监听 → 连一条 → **服务端先关**（本侧留 `TIME_WAIT`，本地端口正是监听端口）→ 关监听 → **立刻**用同一端口重新 `srv_listen` ⇒ 必须成功。防假绿对照：把两条常量改回 BSD 的 `0xFFFF` / `0x0004` ⇒ 两条腿都红（用户报的「ctrl+c 之后 web 监听失败」） |
 | `web-childcfg` | P73：会话子进程的环境继承（踩坑 124 ②）。走**生产代码** `web_child_env`，判据看它排好的**环境数组**（`sh_env_array()`，不是 `getenv` —— 那读的是本进程真环境、看不见刚排好的表）：① 父进程给了非默认值时，14 条（权限/沙箱/端点/模型/凭据/档位/信任策略/指纹/工作区/home/max-steps/no-title/no-mouse/no-mcp）**逐条同名同值**；② 父进程没给（出厂默认）时那几条**不许注入**（否则把默认值钉死、挡住子进程读 `settings.yaml`）；③ `UYA_AGENT_WEB` 恒为 0（漏了它子进程递归起 web，踩坑 103）。**权限排第一**：它曾经被悄悄放宽成 `Full access`。防假绿对照：把 `web_child_env_cfg(cfg)` 换成 `_ = cfg;` 重编 ⇒ 当场红 10 条 |
 | `tls-pin` / `tls-tofu` | P78 信任档位（踩坑 132，离线、不联网、不需要证书）：`tls-pin` 段验指纹库的纯函数 —— 两行好行 + `#` 注释 + 空行解析出 2 条、主机名与指纹**两侧**大小写折叠、4 行畸形（hex 过短/过长/非 hex/只有主机名）一律跳过而**不中止**（后面那行好行必须还在）、CRLF 行尾与末行无换行都认、同一主机多条指纹命中任意一条、追加行必须是 `<host> <小写 hex>\n`、空库什么都不信、长度不是 64 的查询一律不认；`tls-tofu` 段起**真的临时目录 + 真的文件**走闭环 —— 首次 `FRESH` 且那一行**真的落盘了**、二次 `TRUSTED`、指纹变了 `MISMATCH`、另一台主机照样 `FRESH` 且**不覆盖**第一台的记录。防假绿对照两处：把 `tp_trusts` 改成忽略指纹比对 ⇒ 红 3 条；把 `tls_tofu_verdict` 里「首次落盘」那行删掉 ⇒ 红 5 条 |
+| `tls-ca` | P92 链校验与 TOFU 学习（**离线**，夹具是 `testdata/tls_ca` 里自签测试 CA 出的证书，不跑 openssl）：好链（leaf+inter，库里只有根）必须过；SAN 通配 `*.wild.test` 匹配 `a.wild.test`、**不**匹配 `a.b.wild.test` 与 `wild.test`；`SAN=other.test` 的证书不授权 `good.test`；缺中间证书 / 空库+服务端自带自签根 / 库里没有根 三种断链都必须拒（且原因指向对的那一条）；**签名改一个字节必须拒**（改的是签名值本身，不是 TBS —— 改 TBS 会先撞上「扩展畸形」那条更早的判据，签名腿就被别的检查顶替了）；ECDSA P-256 链必须过；有效期三态（现在有效 / notAfter 在过去 / notBefore 在未来 / **拿不到系统时间（now=0）必须判无效** —— 有效期是硬条件，时钟缺失等于这条没验过）；TOFU 学习五态 —— 首次 FRESH、换指纹 MISMATCH、学习关着仍 MISMATCH、学习开着 LEARNED 且**新行真的落盘**（学过之后该指纹变成 TRUSTED）、到 4 条上限只放行不追加。防假绿对照：拆掉 `rv_check_em` 的 DigestInfo 比对 ⇒ 签名腿红；拆掉主机名检查 ⇒ 通配腿红 |
 | `e2e-portable` | `make e2e-portable`（P73，踩坑 124）：把 `build/uya-agent` **拷到一个空目录**、`HOME` 也是空目录、**没有 DSH、没有仓库**（真新机器的样子），只带一个二进制。① 内嵌 preset 兜底：`--print-config` 报 `knobs (source: embedded)` 且旋钮值 == 内置缺省（逐字节）；跑一轮 `--plan` ⇒ 假网关收到的请求里必须有 `Make the plan decision-complete`（**该串只存在于上游 preset**，工作树与编译器树 0 命中 ⇒ 判据不可能假绿）；② **反向断言**：`--dsh-root testdata/preset-root` 时必须是 `source: preset` + `readLimit=1777`（内嵌不许夺磁盘的权）；③ web 会话子进程：只走命令行给 `--base-url/--model/--permission read-only/--agent-home`，断言假网关**收到**请求、请求里的模型是父进程给的那个、会话日志落在 `--agent-home` 下；④ `--no-dsh-config` 这类没有 env 口径的开关必须被启动日志点名。防假绿对照（两条都做过）：把内嵌兜底改成恒 `false` ⇒ 红在①；只停 plan 段的抽取（来源/旋钮照旧）⇒ 红在「plan 策略段缺失」；摘掉 `web_child_env_cfg(cfg)` ⇒ 红在③ |
 | `dns-resolv` | P80 名字解析（踩坑 133，离线、不联网、不需要证书）：**四段**。① 纯扫描：夹具**特意造出** >512 字节的注释头（并断言 `ns_off > 512`，把「现场的形状」钉进断言）——老实现只读前 512 字节 ⇒ 判成「文件里没有 nameserver」；另加注释行/`;` 注释/`nameserverX`/关键字后必须空白/行尾注释/tab/CRLF/末行无换行/先 v6 后 v4/只有 v6/畸形行不中止/空与纯注释；② 真文件闭环：写一份同形状的临时 `resolv.conf`、把路径钉进去 ⇒ 解析器串**逐字节** `127.0.0.53`、来源 = 文件、删掉文件后**不再**声称来自文件（原因 = 打不开）；③ 覆盖：`$UYA_AGENT_DNS` 合法值优先、非法值**不采用**且记 `ENV_BAD`、端口越界同判、清掉后不报 env。**防假绿对照两处（都真做过）**：① 把整份读退回 `buf_new(512)` ⇒ **真文件轮 4 条红**（扫描轮那两条**不红** —— 纯函数对、接线错也算坏，所以回归腿必须打在读文件那一层）；这条对照顺带抓出产品里一个真缺陷：原因记账没有优先级，`TRUNC` 会盖掉「变量值非法」（修成 `hc_dns_err_rank`）。② 关键字改回「整行按前缀找 + 参数取下一个 token」⇒ 扫描轮 3 条红 |
 | `proxy` | P92 出站代理（离线，只打 127.0.0.1）：**四段**。① 形状：`host:port` / `http://host:port` / 带 `user:pass@` 三种合法 + 省端口按 8080 + 末尾一个 `/` 容忍；② 凭据头**逐字节**（`Proxy-Authorization: Basic dXNlcjpwYXNz\r\n`，期望值在自测里独立写死 —— 用产品代码拼期望值等于让判据与实现共享同一个错误）；③ 回环绕过九条（`localhost`/`127.0.0.1`/`127.9.9.9`/`::1` 真；`127.example.com`/`128.0.0.1`/`127.256.0.1`/`127.1` 假）；④ 七类非法值**各指原因**（scheme / host / port / userinfo / extra / toobig / 空）、非法值**不许半采纳**、清空后不报 active、失败分档（可重试与不可重试）。**现地假代理轮**（回环套接字 + fork，verdict 走退出码）：CONNECT 请求行与 `Host` 逐字节 + 隧道**回显透明** / 绝对形式请求行 + `Host` 是目标 + 凭据头在 / 407 ⇒ `HcProxyFailed` 且状态码记对 / 502 ⇒ `HcProxyUnavailable` / 回环绕过。**防假绿对照三处（都真做过）**：CONNECT 目标写成代理自己 ⇒ 隧道步红；绝对形式退回相对形式 ⇒ 假代理步红；删掉回环绕过 ⇒ 回环腿红。另一条记在踩坑里的：`url_host(&u)`（`u` 已是 `&const Url`）会让自测**直接 SIGSEGV**，而编译器全绿 |
@@ -8662,3 +8666,90 @@ CONNECT 那一次读写留在 `net/httpc`（它才知道名字解析与泵点）
 必然走这条路 ⇒ 不修就等于新功能的报错被重试层吃掉。现在失败档位跨重试留住
 （`g_rtx_tls_kind`），`make e2e-retry` 的死端口负控腿也随之从「断言那句笼统话」收紧成
 「断言**连不上服务器**，且不许出现 TLS 校验」。
+---
+
+### 19.17 P92：`tls_pins` 要多条 —— 「新证书过了发证机构校验才学进库」
+
+**用户报的**（原话）：「tls_pins 支持多个，因为有些网站可能有多个证书，验证合法的都应该可
+以用」，追问之后定下的口径是 **D + 新证书要到发证机构验证通过后记录**：库里已经记过的指纹
+仍然必须逐字节相符，**没记过的**那张只有在「链能验到系统信任根」时才接受并追加一行。
+
+**为什么这是对的（而不是「改成谁都能加」）**：多证书站点（证书轮换、多机房各发各的 leaf、
+CDN 换证）在 TOFU 档下**必然**撞上 `HcPinMismatch` —— 用户看到的是一句「请求失败（网络或
+TLS 校验）」，而真相是「这台站点换了一张同样合法的证书」。但「一律接受新证书」等于把 TOFU
+唯一的防护（变了就拒）拆掉，中间人只要能让握手成功就行。用户里那句话里的**「验证合法」**
+正是分界线：新证书必须自己走一遍链校验。
+
+**链校验是谁做的：本仓自己做的，不 exec openssl**。标准库那条路走不通（§18 的三条死路），
+但缺的是**两个具体零件**，不是整门课：
+
+| 缺什么 | 本轮怎么补 |
+|---|---|
+| `x509/cert.uya` 只解 RSA 公钥，且**不给** subject / issuer / SAN ⇒ 建不了路径、做不了主机名校验 | 新文件 `net/x509min.uya`：自己的最小 DER 走查（`xm_hdr`），解析 TBS 区间、签名算法、issuer/subject 原始 DER、有效期、basicConstraints（CA + pathLen）、keyUsage、extKeyUsage（serverAuth / anyEKU）、SPKI（RSA n/e 或 EC 未压缩点）、**SAN 的 dNSName 列表**。所有 DER 读取都带**显式长度**（`der_len`），未知 critical 扩展、重复扩展、畸形扩展一律 `ext_invalid` 整张作废（fail-closed） |
+| `mpi_mul` 装不下 RSA-2048（`MPI_MAX_LIMBS = 32`，两个 2048 位数相乘要 64 limb）⇒ 验签必失败 | 新文件 `net/rsav.uya`：自己的大数（`[u32: 130]`）+ Montgomery CIOS + `e` 的模幂 + PKCS#1 v1.5 的 DigestInfo 逐字节比对。CIOS 单步上界 `(2^32-1)^2 + 2(2^32-1) = 2^64-1` 正好塞进 u64，所以**不需要 u128**（语言里也没有） |
+| 信任库只读前 64 KiB（224 KB 的库只进 44 张） | 新文件 `net/cachain.uya`：自己整份读系统 CA 库（上限 1 MiB），PEM 拆块 + base64 解码，**建索引**（一次扫完，之后按 subject 长度预筛），按 `issuer == subject` 从叶往上建路径 |
+
+`net/cachain.uya` 的判定（每一条都是**必须**，缺一条就等于没验）：签名（RSA 走 `rv_`、ECDSA
+走 lib 的 `ecdsa_verify_p256/p384`）、有效期、父证书 `basicConstraints CA:TRUE`（且
+**critical**）、`pathLenConstraint`、父证书 `keyUsage` 里有 `keyCertSign`（有声明才查）、
+**锚点必须真的在系统库里**（服务端自带的自签根只被当作「链走到头了」，不算信任）、叶子按 SAN
+的 dNSName 匹配主机名（**没有 SAN 就失败，不退 CN** —— 退 CN 那条老路主流客户端已废弃，猜出来
+的「大概对」比失败更危险）。
+
+三条派生纪律（都是「别让一次尝试的结论把另一次的原因顶掉」这一族）：
+
+* **keyUsage 的位号只有一处定义**：`net/x509min.uya` 直接按 RFC 5280 的位号存
+  （bit5 = keyCertSign），`net/cachain.uya` 的 `CC_KU_KEY_CERT_SIGN` 就是 `1 << 5`。
+  早先一边按「倒序编号」存、一边拿 `0x04` 去与，正牌 CA 会被判「没有 keyCertSign」整条链拒掉。
+* **同一 issuer 名字在库里可能不止一张**（新旧同名根、交叉签发副本）：`cc_find_in_flight`
+  / `cc_find_in_bundle` 都带 `from` 游标逐张试，只试第一张会把「换过根、两张都还在」的
+  正常站点判成链断。
+* **失败原因要留住最先那句**：逐张重试会反复覆盖 `cc_last_reason`，最后往往停在「找不到
+  签发者」这种兜底话上。`cc_step` 把第一次「验不过」的原因抄进 `keep`，全部候选都失败后
+  原样交出来 —— 用户需要看到的是「签名验不过 / 不在有效期 / 没有 CA 位」，不是兜底句。
+
+
+**TOFU 的三态因此长成四态**（`net/httpc.uya`）：
+
+| 情形 | 旧行为 | 现在 |
+|---|---|---|
+| 库里没这台主机 | `FRESH`：记一条、放行（verified=false） | 不变 |
+| 库里有且指纹命中 | `TRUSTED`，放行 | 不变 |
+| 库里有、指纹不命中 | `HcPinMismatch` | **`tls_tofu_ca_check`**：链验过 ⇒ 追加一行 + `LEARNED`（放行，verified=true）；验不过 / 做不了 ⇒ 仍 `Mismatch` |
+| 库已满 `TP_MAX_PER_HOST`（4 条） | —— | 放行（`LEARNED`）但**不再追加**：库是只追加的，不淘汰旧条目（淘汰会让「上次信任的那张」悄悄失效） |
+
+开关（默认**开**，因为这就是要的行为；关掉 = 逐字节回到旧行为）：`--tls-tofu-learn` /
+`--no-tls-tofu-learn`、`UYA_AGENT_TLS_TOFU_LEARN=0|1`、设置 `uya-agent.tls.tofu-learn`
+（**三态**：没写就不覆盖内置默认，二态会把「没写」读成 false，升级之后行为悄悄变）。
+系统 CA 库可以用 `--ca-bundle PATH` / `UYA_AGENT_CA_BUNDLE` 覆盖，默认按
+`$SSL_CERT_FILE` → Debian/Deepin → RHEL → 通用四档自己找。`--print-config` 打三行：
+`tls_tofu_learn`（含来源）、`ca_bundle`（含来源）、原有的 `tls_pins`。
+
+**失败必须留一句话**：`cc_last_reason()` 里的原因会被 `ag_request_stream` 在
+`HcPinMismatch` 的报错里印出来（「已按发证机构校验这次的新证书：<为什么没过>」）。
+没有系统 CA 库、算法不支持（SHA-1 / RSA-PSS / Ed25519）、握手缓冲把链截断 —— 三种都
+**明确失败**，绝不静默放行。
+
+**自己写密码学判据的风险与对策**：最大的风险是「看着对」。所以判据分段验、每段都能单独红：
+
+* `rsav` 先用真实站点抓下来的 RSA-2048 证书跑通（`api.deepseek.com` 的 leaf 由
+  `TrustAsia DV TLS RSA CA 2025` 签，验签通过），再补一组与 `pow()` 对拍的模幂用例；
+* 自测夹具是**自签测试 CA** 出的证书（`testdata/tls_ca/`，有效期 30000 天，`gen.sh` 记录
+  生成命令）：好链 / 错主机名 / 缺中间证书 / 服务端自带自签根 + 空库 / 签名改一个字节 /
+  ECDSA P-256 链；
+* 防假绿对照（本轮实测两处）：把 `rv_check_em` 里的 DigestInfo 比对拆掉 ⇒ 签名腿红；
+  把 `cc_verify` 里的主机名检查拆掉 ⇒ 通配腿红。另外本轮**被自测当场抓住三个自身缺陷**：
+  ① CIOS 收尾丢了 `t[n]` 那次条件减法（症状：小指数对、大指数全错，RSA-2048 的模幂整段
+  算错）；② `rv_from_be` 按未去前导 0 的字节数算 limb 数（DER 的 2048 位模数是 513 字节
+  ⇒ 129 limb，而数值只占 64 个，`rv_cmp` 先比 n 于是全错）；③ SAN 用定长槽存却按「前面各
+  条长度之和」读（第二条读出来是槽里的空洞，`*.wild.test` 永远匹配不上）。
+
+**性能**：RSA 链一次校验 ~6–9 ms（含首次把 224 KB 的库扫成索引）；ECDSA（P-256）那条
+~300–600 ms（lib 的 `ecdsa_verify_p256` 是朴素实现）。它只在「新证书」这条路上跑
+（TOFU 学到过之后走的是查表），所以这个代价可以接受 —— 但**别**把它搬到每次握手都跑的
+路径上。
+
+**明确不做**：OCSP / 吊销列表 / CT 日志（离线不可得，做了也是假的安全感）；改
+`lib/tls` 的三条死路；把 `chain` 档换成这条链校验（它从「真实站点上必然失败」变成能用，
+属于另一轮的改动）；`pin` 档支持多条配置指纹（这次要的是「TOFU 学新证书」，不是
+「`--tls-pin` 写多个」）；淘汰旧条目（见上）。

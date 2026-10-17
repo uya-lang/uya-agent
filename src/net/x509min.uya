@@ -1,0 +1,860 @@
+// src/net/x509min.uya — 最小 X.509 解析（链校验要的那些字段，别的一概不解）
+//
+// 本文件：DER 头解析（xm_hdr）、证书整体解析（xm_parse → XmCert）、扩展解析
+//   （basicConstraints / keyUsage / extKeyUsage / subjectAltName）、有效期与时间换算
+//   （xm_time / xm_days_from_civil / xm_now）、以及主机名与签名判据（xm_host_match /
+//   xm_signed_by）。
+// 不变量：① **不复制 DER** —— XmCert 只记偏移与长度，DER 寿命由调用方保证；② 畸形 DER
+//   一律失败，不猜长度、不跳过安全相关字段；③ 只认本仓真的能验的 RSA PKCS#1 v1.5 /
+//   ECDSA P-256/P-384 + SHA-256/384；④ 未知 critical extension、无法完整保留的 SAN、
+//   无有效系统时间都 fail-closed；⑤ 所有 DER 读取都带显式 der_len，不用伪造容量边界。
+// 依赖：net/rsav、lib/tls 的 sha256 / sha384 / ecdsa_verify_p256 /
+//   ecdsa_verify_p384、
+//   libc 的 gettimeofday。不依赖 lib/tls 的 x509 解析器（不给 subject/issuer/SAN）。
+// 命名：结构 `XmCert`，函数 `xm_*`，常量 `XM_*`。
+
+use libc.TimeVal;
+use libc.sys_gettimeofday;
+use tls.crypto.sha256;
+use tls.crypto.sha384;
+use tls.crypto.ec.ecdsa_verify_p256;
+use tls.crypto.ec.ecdsa_verify_p384;
+
+// 签名算法（本仓能验的那几种；其余一律 XM_SIG_UNSUPPORTED）
+export const XM_SIG_UNSUPPORTED: u8 = 0;
+export const XM_SIG_RSA_SHA256: u8 = 1;
+export const XM_SIG_RSA_SHA384: u8 = 2;
+export const XM_SIG_ECDSA_SHA256: u8 = 3;
+export const XM_SIG_ECDSA_SHA384: u8 = 4;
+
+// 公钥算法
+export const XM_KEY_NONE: u8 = 0;
+export const XM_KEY_RSA: u8 = 1;
+export const XM_KEY_EC_P256: u8 = 2;
+export const XM_KEY_EC_P384: u8 = 3;
+
+export const XM_MAX_SAN: usize = 8;
+export const XM_SAN_MAX: usize = 128;
+export const XM_EC_PUB_MAX: usize = 97;
+
+const XM_TAG_INT: byte = 0x02;
+const XM_TAG_BIT: byte = 0x03;
+const XM_TAG_OCT: byte = 0x04;
+const XM_TAG_OID: byte = 0x06;
+const XM_TAG_BOOL: byte = 0x01;
+const XM_TAG_SEQ: byte = 0x30;
+const XM_TAG_UTC: byte = 0x17;
+const XM_TAG_GEN: byte = 0x18;
+const XM_TAG_EX0: byte = 0xA0;
+const XM_TAG_EX3: byte = 0xA3;
+
+// serverAuth / anyExtendedKeyUsage OID
+const XM_EKU_SERVER_AUTH: [byte: 8] = [0x2B, 0x06, 0x01, 0x05,
+    0x05, 0x07, 0x03, 0x01];
+const XM_EKU_ANY: [byte: 4] = [0x55, 0x1D, 0x25, 0x00];
+
+// 证书解析结果：DER 只记录指针/长度与偏移；小公钥和 SAN 拷进定长字段。
+export struct XmCert {
+    ok: bool,
+    der: &const byte,
+    der_len: usize,
+    tbs_off: usize,
+    tbs_len: usize,
+    sig_off: usize,
+    sig_len: usize,
+    sig_alg: u8,
+    key_alg: u8,
+    rsa_n: [byte: 512],
+    rsa_n_len: usize,
+    rsa_e: [byte: 8],
+    rsa_e_len: usize,
+    ec_pub: [byte: XM_EC_PUB_MAX],
+    ec_pub_len: usize,
+    issuer_off: usize,
+    issuer_len: usize,
+    subject_off: usize,
+    subject_len: usize,
+    not_before: i64,
+    not_after: i64,
+    has_validity: bool,
+    has_basic: bool,
+    basic_critical: bool,
+    ext_invalid: bool,
+    san_seen: bool,
+    is_ca: bool,
+    has_path_len: bool,
+    max_path_len: i32,
+    has_key_usage: bool,
+    key_usage: u16,
+    eku_seen: bool,
+    has_eku: bool,
+    server_auth: bool,
+    san_n: usize,
+    san: [byte: XM_MAX_SAN * XM_SAN_MAX],
+    san_len: [usize: XM_MAX_SAN],
+}
+
+// 空证书：ok=false，全部区间长度为 0。
+export fn xm_empty() XmCert {
+    return XmCert{
+        ok: false, der: null as &const byte, der_len: 0,
+        tbs_off: 0, tbs_len: 0, sig_off: 0, sig_len: 0,
+        sig_alg: XM_SIG_UNSUPPORTED, key_alg: XM_KEY_NONE,
+        rsa_n: [0: 512], rsa_n_len: 0, rsa_e: [0: 8], rsa_e_len: 0,
+        ec_pub: [0: XM_EC_PUB_MAX], ec_pub_len: 0,
+        issuer_off: 0, issuer_len: 0, subject_off: 0, subject_len: 0,
+        not_before: 0, not_after: 0, has_validity: false,
+        has_basic: false, basic_critical: false, ext_invalid: false,
+        san_seen: false, is_ca: false, has_path_len: false,
+        max_path_len: 0, has_key_usage: false, key_usage: 0,
+        eku_seen: false, has_eku: false, server_auth: false,
+        san_n: 0, san: [0: XM_MAX_SAN * XM_SAN_MAX],
+        san_len: [0: XM_MAX_SAN],
+    };
+}
+
+// 依次取第 i 个 SAN（i 越界给空串）。SAN 固定槽位存储。
+export fn xm_san_len(c: &const XmCert, i: usize) usize {
+    if i >= c.san_n || i >= @len(c.san_len) { return 0; }
+    return c.san_len[i];
+}
+
+// 第 i 个 SAN 的起点（每槽 XM_SAN_MAX 字节）
+export fn xm_san_off(c: &const XmCert, i: usize) usize {
+    return i * XM_SAN_MAX;
+}
+
+// 有界读写：唯一直接访问 DER / 定长字节数组的接缝。
+fn xm_get(p: &const byte, n: usize, i: usize) byte {
+    if i < n { return p[i]; }
+    return 0 as byte;
+}
+
+// 有界写：唯一直接写定长字节数组的接缝
+fn xm_put(p: &byte, n: usize, i: usize, v: byte) void {
+    if i < n { p[i] = v; }
+}
+
+// DER：读 pos 处 TLV 头，输出 tag、值起点、值长度；长度编码必须最短。
+fn xm_hdr(der: &const byte, n: usize, pos: usize, tag: &u8,
+    vstart: &usize, vlen: &usize) bool {
+    if pos > n || n - pos < 2 { return false; }
+    tag[0] = xm_get(der, n, pos);
+    var p: usize = pos + 1;
+    const l0: byte = xm_get(der, n, p);
+    p = p + 1;
+    var len: usize = l0 as usize;
+    if (l0 & (0x80 as byte)) != (0 as byte) {
+        const nb: usize = (l0 & (0x7F as byte)) as usize;
+        if nb == 0 || nb > 4 || p > n || nb > n - p { return false; }
+        len = 0;
+        var i: usize = 0;
+        while i < nb {
+            len = (len << 8) | (xm_get(der, n, p + i) as usize);
+            i = i + 1;
+        }
+        if xm_get(der, n, p) == 0 || len < 128 { return false; }
+        p = p + nb;
+    }
+    if p > n || len > n - p { return false; }
+    vstart[0] = p;
+    vlen[0] = len;
+    return true;
+}
+
+// 区间安全拷贝；调用方提供同一个来源长度，不能用猜出来的缓冲容量代替。
+fn xm_copy(dst: &byte, cap: usize, src: &const byte, src_len: usize,
+    off: usize, len: usize) bool {
+    if len > cap || off > src_len || len > src_len - off { return false; }
+    var i: usize = 0;
+    while i < len {
+        xm_put(dst, cap, i, xm_get(src, src_len, off + i));
+        i = i + 1;
+    }
+    return true;
+}
+
+// DER 正整数 → 去掉符号位 00，拒绝负数和非最短 INTEGER。
+fn xm_copy_int(dst: &byte, cap: usize, len_out: &usize, src: &const byte,
+    src_len: usize, off: usize, len: usize) bool {
+    if len == 0 || off > src_len || len > src_len - off { return false; }
+    const first: byte = xm_get(src, src_len, off);
+    if first >= 0x80 as byte { return false; }
+    var st: usize = 0;
+    if len > 1 && first == 0 {
+        if (xm_get(src, src_len, off + 1) & (0x80 as byte)) == 0 {
+            return false;
+        }
+        st = 1;
+    }
+    const m: usize = len - st;
+    if m == 0 || !xm_copy(dst, cap, src, src_len, off + st, m) { return false; }
+    len_out[0] = m;
+    return true;
+}
+
+// OID 逐字节比对（长度也必须相等，短前缀不算命中）
+fn xm_oid_is(der: &const byte, der_len: usize, off: usize, len: usize,
+    want: &const byte, want_len: usize) bool {
+    if len != want_len || off > der_len || len > der_len - off { return false; }
+    var i: usize = 0;
+    while i < len {
+        if xm_get(der, der_len, off + i) != want[i] { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+// Certificate.signatureAlgorithm / TBSCertificate.signature OID。
+fn xm_sig_alg_of(der: &const byte, der_len: usize, off: usize, len: usize) u8 {
+    const rsa256: [byte: 9] = [0x2A,0x86,0x48,0x86,0xF7,0x0D,0x01,0x01,0x0B];
+    const rsa384: [byte: 9] = [0x2A,0x86,0x48,0x86,0xF7,0x0D,0x01,0x01,0x0C];
+    const ec256: [byte: 8] = [0x2A,0x86,0x48,0xCE,0x3D,0x04,0x03,0x02];
+    const ec384: [byte: 8] = [0x2A,0x86,0x48,0xCE,0x3D,0x04,0x03,0x03];
+    if xm_oid_is(der,der_len,off,len,&rsa256[0],9) { return XM_SIG_RSA_SHA256; }
+    if xm_oid_is(der,der_len,off,len,&rsa384[0],9) { return XM_SIG_RSA_SHA384; }
+    if xm_oid_is(der,der_len,off,len,&ec256[0],8) {
+        return XM_SIG_ECDSA_SHA256;
+    }
+    if xm_oid_is(der,der_len,off,len,&ec384[0],8) {
+        return XM_SIG_ECDSA_SHA384;
+    }
+    return XM_SIG_UNSUPPORTED;
+}
+
+// 年/月/日 → Unix 纪元日（Howard Hinnant days_from_civil）
+fn xm_days_from_civil(y: i64, m: i64, d: i64) i64 {
+    var yy: i64 = y;
+    if m <= 2 { yy = y - 1; }
+    var era: i64 = yy;
+    if yy < 0 { era = yy - 399; }
+    era = era / 400;
+    const yoe: i64 = yy - era * 400;
+    const mp: i64 = (m + 9) % (12 as i64);
+    const doy: i64 = (153 * mp + 2) / 5 + d - 1;
+    const doe: i64 = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    return era * 146097 + doe - 719468;
+}
+
+// 大端无符号整数 → i32（装不下返回 -1，调用方按失败处理）
+fn xm_uint_of(der: &const byte, bound: usize, off: usize, len: usize) i32 {
+    if len == 0 || off > bound || len > bound - off { return -1; }
+    var v: i64 = 0;
+    var i: usize = 0;
+    while i < len {
+        v = (v << 8) | (xm_get(der, bound, off + i) as i64);
+        i = i + 1;
+    }
+    return v as! i32 catch { -1 as i32; };
+}
+
+// 连续十进制数字 → i64（碰到非数字返回 -1）
+fn xm_digits(p: &const byte, bound: usize, off: usize, n: usize) i64 {
+    if off > bound || n > bound - off { return -1; }
+    var v: i64 = 0;
+    var i: usize = 0;
+    while i < n {
+        const c: byte = xm_get(p, bound, off + i);
+        if c < 48 || c > 57 { return -1; }
+        v = v * 10 + ((c - (48 as byte)) as i64);
+        i = i + 1;
+    }
+    return v;
+}
+
+// 某年某月的天数（含闰年规则）
+fn xm_days_in_month(y: i64, m: i64) i64 {
+    if m == 2 {
+        if y % (4 as i64) == 0
+            && (y % (100 as i64) != 0 || y % (400 as i64) == 0) { return 29; }
+        return 28;
+    }
+    if m == 4 || m == 6 || m == 9 || m == 11 { return 30; }
+    return 31;
+}
+
+// GeneralizedTime 14 位、UTCTime 12 位，再以 Z 收尾；拒绝偏移/小数。
+fn xm_time(p: &const byte, bound: usize, off: usize, len: usize, tag: byte,
+    out: &i64) bool {
+    var yw: usize = 4;
+    if tag == XM_TAG_UTC { yw = 2; }
+    if (tag != XM_TAG_UTC && tag != XM_TAG_GEN) || len != yw + 11
+        || off > bound || len > bound - off
+        || xm_get(p,bound,off+len-1) != 90 { return false; }
+    var y: i64 = xm_digits(p,bound,off,yw);
+    if y < 0 { return false; }
+    if yw == 2 { if y >= 50 { y = 1900 + y; } else { y = 2000 + y; } }
+    const mo: i64 = xm_digits(p,bound,off+yw,2);
+    const day: i64 = xm_digits(p,bound,off+yw+2,2);
+    const h: i64 = xm_digits(p,bound,off+yw+4,2);
+    const mi: i64 = xm_digits(p,bound,off+yw+6,2);
+    const sec: i64 = xm_digits(p,bound,off+yw+8,2);
+    if mo < 1 || mo > 12 || day < 1 || day > xm_days_in_month(y,mo)
+        || h > 23 || mi > 59 || sec > 59 { return false; }
+    out[0] = xm_days_from_civil(y,mo,day)*86400+h*3600+mi*60+sec;
+    return true;
+}
+
+// 系统时间（Unix 秒）。拿不到返回 0 —— 调用方据此判「有效期没验过」
+export fn xm_now() i64 {
+    var tv: TimeVal = TimeVal{};
+    const r: i32 = sys_gettimeofday(&tv,null as &void) catch { -1; };
+    if r != 0 { return 0; }
+    return tv.tv_sec;
+}
+
+// 有效期判定。**没有可信的系统时间就判无效**：有效期是链校验的硬条件，时钟拿不到
+// 就等于这一条没验过 —— 这时唯一安全的答案是「不认这张证书」（调用方于是不会学新
+// 指纹，用户看到的是明确的失败，而不是一堆「已信任」的假记录）。
+export fn xm_time_valid(c: &const XmCert, now: i64) bool {
+    if !c.has_validity || now <= 0 || c.not_before > c.not_after {
+        return false;
+    }
+    return now >= c.not_before && now <= c.not_after;
+}
+
+// SPKI 算法 OID → 本仓能处理的公钥算法
+fn xm_key_alg_of(der: &const byte, n: usize, off: usize, len: usize) u8 {
+    const rsa: [byte: 9] = [0x2A,0x86,0x48,0x86,0xF7,0x0D,0x01,0x01,0x01];
+    const ec: [byte: 7] = [0x2A,0x86,0x48,0xCE,0x3D,0x02,0x01];
+    if xm_oid_is(der,n,off,len,&rsa[0],9) { return XM_KEY_RSA; }
+    if xm_oid_is(der,n,off,len,&ec[0],7) { return XM_KEY_EC_P256; }
+    return XM_KEY_NONE;
+}
+
+// EC namedCurve OID → P-256 / P-384（其余一律不支持）
+fn xm_curve_of(der: &const byte, n: usize, off: usize, len: usize) u8 {
+    const p256: [byte: 8] = [0x2A,0x86,0x48,0xCE,0x3D,0x03,0x01,0x07];
+    const p384: [byte: 5] = [0x2B,0x81,0x04,0x00,0x22];
+    if xm_oid_is(der,n,off,len,&p256[0],8) { return XM_KEY_EC_P256; }
+    if xm_oid_is(der,n,off,len,&p384[0],5) { return XM_KEY_EC_P384; }
+    return XM_KEY_NONE;
+}
+
+// RSA AlgorithmIdentifier 必须是 rsaEncryption+NULL；EC 必须是 explicit namedCurve。
+fn xm_parse_spki(c: &XmCert, der: &const byte, n: usize, pos: usize) bool {
+    var tag: u8 = 0; var vs: usize = 0; var vl: usize = 0;
+    if !xm_hdr(der,n,pos,&tag,&vs,&vl) || tag != XM_TAG_SEQ { return false; }
+    const end: usize = vs + vl;
+    var at: u8 = 0; var as_: usize = 0; var al: usize = 0;
+    if !xm_hdr(der,n,vs,&at,&as_,&al) || at != XM_TAG_SEQ { return false; }
+    const ae: usize = as_ + al;
+    var ot: u8 = 0; var os: usize = 0; var ol: usize = 0;
+    if !xm_hdr(der,n,as_,&ot,&os,&ol) || ot != XM_TAG_OID { return false; }
+    c.key_alg = xm_key_alg_of(der,n,os,ol);
+    const p2: usize = os + ol;
+    if c.key_alg == XM_KEY_RSA {
+        var pt: u8 = 0; var ps: usize = 0; var pl: usize = 0;
+        if !xm_hdr(der,n,p2,&pt,&ps,&pl) || pt != 0x05 || pl != 0
+            || ps != ae { return false; }
+    } else if c.key_alg == XM_KEY_EC_P256 {
+        var ct: u8 = 0; var cs: usize = 0; var cl: usize = 0;
+        if !xm_hdr(der,n,p2,&ct,&cs,&cl) || ct != XM_TAG_OID
+            || cs + cl != ae { return false; }
+        c.key_alg = xm_curve_of(der,n,cs,cl);
+        if c.key_alg == XM_KEY_NONE { return false; }
+    } else { return false; }
+    if ae >= end { return false; }
+    var bt: u8 = 0; var bs: usize = 0; var bl: usize = 0;
+    if !xm_hdr(der,n,ae,&bt,&bs,&bl) || bt != XM_TAG_BIT || bl < 2
+        || bs + bl != end || xm_get(der,n,bs) != 0 { return false; }
+    const kb: usize = bs + 1;
+    const kn: usize = bl - 1;
+    if c.key_alg == XM_KEY_RSA { return xm_parse_rsa_pub(c,der,n,kb); }
+    if (c.key_alg == XM_KEY_EC_P256 && kn != 65)
+        || (c.key_alg == XM_KEY_EC_P384 && kn != 97)
+        || xm_get(der,n,kb) != 4 { return false; }
+    if !xm_copy(&c.ec_pub[0],XM_EC_PUB_MAX,der,n,kb,kn) { return false; }
+    c.ec_pub_len = kn;
+    return true;
+}
+
+// RSAPublicKey ::= SEQUENCE { n INTEGER, e INTEGER }（n 最多 512 字节）
+fn xm_parse_rsa_pub(c: &XmCert, der: &const byte, n: usize, off: usize) bool {
+    var tag: u8 = 0; var vs: usize = 0; var vl: usize = 0;
+    if !xm_hdr(der,n,off,&tag,&vs,&vl) || tag != XM_TAG_SEQ { return false; }
+    const end: usize = vs + vl;
+    var nt: u8 = 0; var ns: usize = 0; var nl: usize = 0;
+    if !xm_hdr(der,n,vs,&nt,&ns,&nl) || nt != XM_TAG_INT || nl == 0
+        || ns + nl >= end { return false; }
+    if !xm_copy_int(&c.rsa_n[0],512,&c.rsa_n_len,der,n,ns,nl) { return false; }
+    const epos: usize = ns + nl;
+    var et: u8 = 0; var es: usize = 0; var el: usize = 0;
+    if !xm_hdr(der,n,epos,&et,&es,&el) || et != XM_TAG_INT || el == 0
+        || es + el != end
+        || !xm_copy_int(&c.rsa_e[0],8,&c.rsa_e_len,der,n,es,el) {
+        return false;
+    }
+    // 模数与指数的**最低位**必须是 1（大端存储 ⇒ 看最后一个字节；早先误看 [0]，
+    // 那是最高的字节，几乎必然偶 ⇒ 所有 RSA 证书都被判畸形）
+    if c.rsa_n_len == 0 || c.rsa_e_len == 0 {
+        return false;
+    }
+    if (xm_get(&c.rsa_n[0], @len(c.rsa_n), c.rsa_n_len - 1) & (1 as byte))
+        == (0 as byte)
+        || (xm_get(&c.rsa_e[0], @len(c.rsa_e), c.rsa_e_len - 1)
+            & (1 as byte)) == (0 as byte) {
+        return false;
+    }
+    return true;
+}
+
+// basicConstraints：CA 位与 pathLen 都要。畸形（多余字段、坏 BOOLEAN、负 pathLen、
+// 有 pathLen 却没有 CA:TRUE）一律记 ext_invalid（整张证书作废），**不**借
+// basic_critical 当错误标记 —— 那个字段随后就被真实的 critical 值覆盖，
+// 等于把畸形证书当成正常证书放过去。
+fn xm_parse_basic(c: &XmCert, der: &const byte, n: usize, off: usize,
+    len: usize, critical: bool) void {
+    c.has_basic = true;
+    c.basic_critical = critical;
+    var tag: u8 = 0; var vs: usize = 0; var vl: usize = 0;
+    if !xm_hdr(der,n,off,&tag,&vs,&vl) || tag != XM_TAG_SEQ
+        || vs + vl != off + len {
+        c.ext_invalid = true; return;
+    }
+    const end: usize = vs + vl;
+    var p: usize = vs;
+    if p < end {
+        var bt: u8 = 0; var bs: usize = 0; var bl: usize = 0;
+        if !xm_hdr(der,n,p,&bt,&bs,&bl) { c.ext_invalid = true; return; }
+        if bt == XM_TAG_BOOL {
+            // DER 的 BOOLEAN 只有 00 / FF 两种编码，别的值当畸形，不猜真假
+            const bv: byte = xm_get(der,n,bs);
+            if bl != 1 || (bv != (0 as byte) && bv != (255 as byte)) {
+                c.ext_invalid = true; return;
+            }
+            c.is_ca = bv != (0 as byte);
+            p = bs + bl;
+        }
+    }
+    if p < end {
+        var it: u8 = 0; var isv: usize = 0; var il: usize = 0;
+        if !xm_hdr(der,n,p,&it,&isv,&il) || it != XM_TAG_INT
+            || il == 0 || il > 5 || isv + il != end {
+            c.ext_invalid = true; return;
+        }
+        var poff: usize = isv; var plen: usize = il;
+        const first: byte = xm_get(der,n,isv);
+        if first >= 0x80 as byte { c.ext_invalid = true; return; }
+        if il > 1 && first == 0 {
+            if (xm_get(der,n,isv+1) & (0x80 as byte)) == 0 {
+                c.ext_invalid = true; return;      // 非最短编码
+            }
+            poff = isv + 1; plen = il - 1;
+        }
+        if plen == 0 || plen > 4 { c.ext_invalid = true; return; }
+        c.max_path_len = xm_uint_of(der,n,poff,plen);
+        if c.max_path_len < 0 { c.ext_invalid = true; return; }
+        c.has_path_len = true; p = isv + il;
+    }
+    if p != end || (c.has_path_len && !c.is_ca) { c.ext_invalid = true; }
+}
+
+// keyUsage：**bit 号就直接当位号存**（bit0 = digitalSignature … bit5 = keyCertSign），
+// 所以 keyCertSign 是 0x0020。判据侧一律用 CC_KU_KEY_CERT_SIGN 取这个位，别在两处
+// 各写一个数字：早先这里把 bit 倒着摆、判据侧写 0x04，两边对不上，正当的 CA 会被拒。
+fn xm_parse_key_usage(c: &XmCert, der: &const byte, n: usize, off: usize,
+    len: usize) void {
+    var t: u8 = 0; var s: usize = 0; var l: usize = 0;
+    if !xm_hdr(der,n,off,&t,&s,&l) || t != XM_TAG_BIT
+        || s + l != off + len || l < 2 || l > 6 {
+        c.ext_invalid = true; return;
+    }
+    const unused: byte = xm_get(der,n,s);
+    const data_len: usize = l - 1;
+    const ub: usize = unused as usize;
+    if unused > 7 || ub >= data_len * 8 { c.ext_invalid = true; return; }
+    if ub > 0 {
+        const mask: byte = (((1 as u8) << (ub as i32)) - (1 as u8)) as byte;
+        if (xm_get(der,n,s+l-1) & mask) != (0 as byte) {
+            c.ext_invalid = true; return;     // 「未用位」里带了 1：畸形
+        }
+    }
+    c.has_key_usage = true; c.key_usage = 0;
+    const bits: usize = data_len * 8 - ub;
+    var i: usize = 0;
+    while i < bits && i < 16 {
+        const oct: usize = i / 8;
+        const sh: i32 = 7 - ((i % 8) as i32);
+        if ((xm_get(der,n,s+1+oct) >> sh) & (1 as byte)) != (0 as byte) {
+            c.key_usage = c.key_usage | ((1 as u16) << (i as i32));
+        }
+        i = i + 1;
+    }
+}
+
+// SAN：只保留 dNSName，其余类型（iPAddress / URI / email）跳过且不参与匹配。
+// 畸形一律**整条作废**（san_seen = false），不做「保留前面几条」—— 部分保留会让一张
+// 畸形证书按剩下的名字匹配成功，那正是 fail-open。
+fn xm_parse_san(c: &XmCert, der: &const byte, n: usize, off: usize,
+    len: usize) void {
+    c.san_seen = false; c.san_n = 0;
+    var t: u8 = 0; var s: usize = 0; var l: usize = 0;
+    if !xm_hdr(der,n,off,&t,&s,&l) || t != XM_TAG_SEQ
+        || s + l != off + len { return; }
+    const end: usize = s + l;
+    var p: usize = s;
+    while p < end {
+        var nt: u8 = 0; var ns: usize = 0; var nl: usize = 0;
+        if !xm_hdr(der,n,p,&nt,&ns,&nl) || ns + nl > end { return; }
+        if nt == (0x82 as u8) {
+            if nl == 0 || nl > XM_SAN_MAX || c.san_n >= XM_MAX_SAN {
+                return;
+            }
+            var k: usize = 0;
+            while k < nl {
+                const ch: byte = xm_get(der,n,ns+k);
+                if ch == 0 || ch > 127 { return; }
+                xm_put(&c.san[0],@len(c.san),c.san_n*XM_SAN_MAX+k,ch);
+                k = k + 1;
+            }
+            c.san_len[c.san_n] = nl; c.san_n = c.san_n + 1;
+        }
+        p = ns + nl;
+    }
+    c.san_seen = true;
+}
+
+// EKU：出现即**限权** —— 只有 serverAuth 或 anyEKU 才算「能用于 TLS 服务端」。
+fn xm_parse_eku(c: &XmCert, der: &const byte, n: usize, off: usize,
+    len: usize) void {
+    c.eku_seen = true; c.has_eku = false; c.server_auth = false;
+    var t: u8 = 0; var s: usize = 0; var l: usize = 0;
+    if !xm_hdr(der,n,off,&t,&s,&l) || t != XM_TAG_SEQ
+        || s + l != off + len { c.ext_invalid = true; return; }
+    const end: usize = s + l;
+    var p: usize = s;
+    while p < end {
+        var ot: u8 = 0; var os: usize = 0; var ol: usize = 0;
+        if !xm_hdr(der,n,p,&ot,&os,&ol) || ot != XM_TAG_OID
+            || ol == 0 || os + ol > end {
+            c.ext_invalid = true; return;
+        }
+        if xm_oid_is(der,n,os,ol,&XM_EKU_SERVER_AUTH[0],8) {
+            c.has_eku = true; c.server_auth = true;
+        }
+        if xm_oid_is(der,n,os,ol,&XM_EKU_ANY[0],4) { c.has_eku = true; }
+        p = os + ol;
+    }
+}
+
+// 扩展列表：认识的四个各解析一次；**重复出现**（RFC 5280 禁止）与未知 critical
+// 一律 fail-closed。每层区间都要对得上自己那一层的长度，不能借整份 DER 的长度兜底。
+fn xm_parse_exts(c: &XmCert, der: &const byte, n: usize, off: usize,
+    len: usize) void {
+    var t: u8=0; var s: usize=0; var l: usize=0;
+    if !xm_hdr(der,n,off,&t,&s,&l) || t!=XM_TAG_EX3
+        || s+l != off+len { c.ext_invalid=true; return; }
+    var st: u8=0; var ss: usize=0; var sl: usize=0;
+    if !xm_hdr(der,n,s,&st,&ss,&sl) || st!=XM_TAG_SEQ
+        || ss+sl != s+l { c.ext_invalid=true; return; }
+    const end: usize=ss+sl;
+    const oid_basic: [byte:3]=[0x55,0x1D,0x13];
+    const oid_ku: [byte:3]=[0x55,0x1D,0x0F];
+    const oid_san: [byte:3]=[0x55,0x1D,0x11];
+    const oid_eku: [byte:3]=[0x55,0x1D,0x25];
+    var done_basic: bool=false; var done_ku: bool=false;
+    var done_san: bool=false; var done_eku: bool=false;
+    var p: usize=ss;
+    while p<end {
+        var et: u8=0; var es: usize=0; var el: usize=0;
+        if !xm_hdr(der,n,p,&et,&es,&el) || et!=XM_TAG_SEQ {
+            c.ext_invalid=true; return;
+        }
+        const ee: usize=es+el;
+        if ee>end { c.ext_invalid=true; return; }
+        var ot: u8=0; var os: usize=0; var ol: usize=0;
+        if !xm_hdr(der,n,es,&ot,&os,&ol) || ot!=XM_TAG_OID || ol==0 {
+            c.ext_invalid=true; return;
+        }
+        const ib: bool=xm_oid_is(der,n,os,ol,&oid_basic[0],3);
+        const ik: bool=xm_oid_is(der,n,os,ol,&oid_ku[0],3);
+        const is: bool=xm_oid_is(der,n,os,ol,&oid_san[0],3);
+        const ie: bool=xm_oid_is(der,n,os,ol,&oid_eku[0],3);
+        var q: usize=os+ol; var critical: bool=false;
+        if q<ee && xm_get(der,n,q)==XM_TAG_BOOL {
+            var bt: u8=0; var bs: usize=0; var bl: usize=0;
+            if !xm_hdr(der,n,q,&bt,&bs,&bl) || bl!=1 {
+                c.ext_invalid=true; return;
+            }
+            critical=xm_get(der,n,bs)!=(0 as byte); q=bs+bl;
+        }
+        var vt: u8=0; var vv: usize=0; var vl: usize=0;
+        if !xm_hdr(der,n,q,&vt,&vv,&vl) || vt!=XM_TAG_OCT || vv+vl!=ee {
+            c.ext_invalid=true; return;
+        }
+        if ib {
+            if done_basic { c.ext_invalid=true; return; }
+            done_basic=true; xm_parse_basic(c,der,n,vv,vl,critical);
+        } else if ik {
+            if done_ku { c.ext_invalid=true; return; }
+            done_ku=true; xm_parse_key_usage(c,der,n,vv,vl);
+        } else if is {
+            if done_san { c.ext_invalid=true; return; }
+            done_san=true; xm_parse_san(c,der,n,vv,vl);
+        } else if ie {
+            if done_eku { c.ext_invalid=true; return; }
+            done_eku=true; xm_parse_eku(c,der,n,vv,vl);
+        } else if critical { c.ext_invalid=true; return; }
+        p=ee;
+    }
+}
+
+// TBSCertificate 里链校验要的那些字段。每一层都按**自己那一层的长度**收口：版本 [0]
+// 必须是 EXPLICIT INTEGER 0..2，serial 是 INTEGER，TBS 里的签名算法是 SEQUENCE，
+// issuer/subject 非空，validity 正好两个时间；尾部只认 [1] / [2]（uniqueID）与 [3]
+// （扩展），别的字段一律拒 —— 不认识的字段意味着这张证书不是我们理解的那张。
+fn xm_parse_tbs(c: &XmCert, der: &const byte, n: usize, vs: usize,
+    vl: usize) bool {
+    const end: usize=vs+vl; var p: usize=vs;
+    if p<end && xm_get(der,n,p)==XM_TAG_EX0 {
+        var t: u8=0; var s: usize=0; var l: usize=0;
+        if !xm_hdr(der,n,p,&t,&s,&l) || s+l>end { return false; }
+        var it: u8=0; var isv: usize=0; var il: usize=0;
+        if !xm_hdr(der,n,s,&it,&isv,&il) || it!=XM_TAG_INT
+            || il!=1 || isv+il!=s+l || xm_get(der,n,isv)>2 { return false; }
+        p=s+l;
+    }
+    // serialNumber 与 TBS 里的 signature（AlgorithmIdentifier）
+    if !xm_skip_tag(der,n,&p,XM_TAG_INT,end) { return false; }
+    if !xm_skip_tag(der,n,&p,XM_TAG_SEQ,end) { return false; }
+    const ioff: usize=p;
+    var it2: u8=0; var is_: usize=0; var il: usize=0;
+    if !xm_hdr(der,n,p,&it2,&is_,&il) || it2!=XM_TAG_SEQ
+        || is_+il>end || il==0 { return false; }
+    c.issuer_off=ioff; c.issuer_len=is_+il-ioff; p=is_+il;
+    var vt: u8=0; var vs2: usize=0; var vl2: usize=0;
+    if !xm_hdr(der,n,p,&vt,&vs2,&vl2) || vt!=XM_TAG_SEQ
+        || vs2+vl2>end { return false; }
+    var nb: i64=0; var na: i64=0;
+    if !xm_one_time(der,n,vs2,&nb) { return false; }
+    const p2: usize=xm_time_end(der,n,vs2);
+    if !xm_one_time(der,n,p2,&na) { return false; }
+    if xm_time_end(der,n,p2)!=vs2+vl2 { return false; }
+    c.not_before=nb; c.not_after=na; c.has_validity=true; p=vs2+vl2;
+    const soff: usize=p;
+    var st: u8=0; var ss: usize=0; var sl: usize=0;
+    if !xm_hdr(der,n,p,&st,&ss,&sl) || st!=XM_TAG_SEQ
+        || ss+sl>end || sl==0 { return false; }
+    c.subject_off=soff; c.subject_len=ss+sl-soff; p=ss+sl;
+    if p>=end || !xm_parse_spki(c,der,n,p) { return false; }
+    p=xm_time_end(der,n,p);
+    while p<end {
+        var t: u8=0; var s: usize=0; var l: usize=0;
+        if !xm_hdr(der,n,p,&t,&s,&l) || s+l>end { return false; }
+        if t==XM_TAG_EX3 { xm_parse_exts(c,der,n,p,s+l-p); }
+        else if t!=(0x81 as u8) && t!=(0x82 as u8) { return false; }
+        p=s+l;
+    }
+    return p==end && !c.ext_invalid;
+}
+
+// 跳过 pos 处一个 TLV，并要求它的 tag 是 want、整段不越过 end。
+fn xm_skip_tag(der: &const byte, n: usize, pos: &usize, want: byte,
+    end: usize) bool {
+    var t: u8=0; var s: usize=0; var l: usize=0;
+    if !xm_hdr(der,n,pos[0],&t,&s,&l) || t!=want || s+l>end { return false; }
+    pos[0]=s+l; return true;
+}
+
+// 跳过 pos 处的一个 TLV
+fn xm_skip_one(der: &const byte, n: usize, pos: &usize) bool {
+    var t: u8=0; var s: usize=0; var l: usize=0;
+    if !xm_hdr(der,n,pos[0],&t,&s,&l) { return false; }
+    pos[0]=s+l; return true;
+}
+
+// pos 处 TLV 的结束偏移（解析失败返回 n，让调用方的 `p < end` 直接为假）
+fn xm_time_end(der: &const byte, n: usize, pos: usize) usize {
+    var t: u8=0; var s: usize=0; var l: usize=0;
+    if !xm_hdr(der,n,pos,&t,&s,&l) { return n; }
+    return s+l;
+}
+
+// pos 处的一个 Time（UTCTime / GeneralizedTime）→ Unix 秒
+fn xm_one_time(der: &const byte, n: usize, pos: usize, out: &i64) bool {
+    var t: u8=0; var s: usize=0; var l: usize=0;
+    if !xm_hdr(der,n,pos,&t,&s,&l) { return false; }
+    return xm_time(der,n,s,l,t,out);
+}
+
+// 解析整张证书：过则 ok = true，区间仍指向 der（按不变量①不复制）
+export fn xm_parse(c: &XmCert, der: &const byte, der_len: usize) bool {
+    c[0]=xm_empty(); c.der=der; c.der_len=der_len;
+    var t1: u8=0; var s1: usize=0; var l1: usize=0;
+    if !xm_hdr(der,der_len,0,&t1,&s1,&l1) || t1!=XM_TAG_SEQ
+        || s1+l1!=der_len { return false; }
+    var t2: u8=0; var s2: usize=0; var l2: usize=0;
+    if !xm_hdr(der,der_len,s1,&t2,&s2,&l2) || t2!=XM_TAG_SEQ { return false; }
+    c.tbs_off=s1; c.tbs_len=s2+l2-s1;
+    var t3: u8=0; var s3: usize=0; var l3: usize=0;
+    if !xm_hdr(der,der_len,s2+l2,&t3,&s3,&l3) || t3!=XM_TAG_SEQ {
+        return false;
+    }
+    var ot: u8=0; var os: usize=0; var ol: usize=0;
+    if !xm_hdr(der,der_len,s3,&ot,&os,&ol) || ot!=XM_TAG_OID { return false; }
+    c.sig_alg=xm_sig_alg_of(der,der_len,os,ol);
+    if c.sig_alg==XM_SIG_UNSUPPORTED { return false; }
+    var q: usize=os+ol;
+    if c.sig_alg==XM_SIG_RSA_SHA256 || c.sig_alg==XM_SIG_RSA_SHA384 {
+        var pt: u8=0; var ps: usize=0; var pl: usize=0;
+        if !xm_hdr(der,der_len,q,&pt,&ps,&pl) || pt!=0x05 || pl!=0 {
+            return false;
+        }
+        q=ps;
+    }
+    if q!=s3+l3 { return false; }
+    var t4: u8=0; var s4: usize=0; var l4: usize=0;
+    if !xm_hdr(der,der_len,s3+l3,&t4,&s4,&l4) || t4!=XM_TAG_BIT
+        || l4<2 || xm_get(der,der_len,s4)!=0 { return false; }
+    c.sig_off=s4+1; c.sig_len=l4-1;
+    if !xm_parse_tbs(c,der,der_len,s2,l2) { return false; }
+    var p: usize=s2;
+    if xm_get(der,der_len,p)==XM_TAG_EX0 { p=xm_time_end(der,der_len,p); }
+    if !xm_skip_one(der,der_len,&p) { return false; }
+    var at: u8=0; var as_: usize=0; var al: usize=0;
+    if !xm_hdr(der,der_len,p,&at,&as_,&al) || at!=XM_TAG_SEQ { return false; }
+    var vtag: u8=0; var vstart: usize=0; var vlen: usize=0;
+    if !xm_hdr(der,der_len,as_,&vtag,&vstart,&vlen) || vtag!=XM_TAG_OID
+        || xm_sig_alg_of(der,der_len,vstart,vlen)!=c.sig_alg { return false; }
+    c.ok=true; return true;
+}
+
+// child 的 issuer 是否等于 parent 的 subject（名字按 DER 逐字节比）
+export fn xm_issuer_is(child: &const XmCert, parent: &const XmCert) bool {
+    if !child.ok || !parent.ok || child.issuer_len==0
+        || child.issuer_len!=parent.subject_len { return false; }
+    var i: usize=0;
+    while i<child.issuer_len {
+        if xm_get(child.der,child.der_len,child.issuer_off+i)
+            != xm_get(parent.der,parent.der_len,parent.subject_off+i) {
+            return false;
+        }
+        i=i+1;
+    }
+    return true;
+}
+
+// 自签：名字相同**且**自签名验得过（只比名字是不够的）
+export fn xm_self_signed(c: &const XmCert) bool {
+    if !c.ok || c.issuer_len==0 || c.issuer_len!=c.subject_len { return false; }
+    var i: usize=0;
+    while i<c.issuer_len {
+        if xm_get(c.der,c.der_len,c.issuer_off+i)
+            != xm_get(c.der,c.der_len,c.subject_off+i) { return false; }
+        i=i+1;
+    }
+    return xm_signed_by(c,c);
+}
+
+// 按签名算法对 TBS 求摘要
+fn xm_tbs_hash(c: &const XmCert, out: &byte, out_len: &usize) bool {
+    if c.tbs_len==0 || c.tbs_off>c.der_len || c.tbs_len>c.der_len-c.tbs_off {
+        return false;
+    }
+    if c.sig_alg==XM_SIG_RSA_SHA384 || c.sig_alg==XM_SIG_ECDSA_SHA384 {
+        sha384(&c.der[c.tbs_off],c.tbs_len,out); out_len[0]=48; return true;
+    }
+    if c.sig_alg==XM_SIG_RSA_SHA256 || c.sig_alg==XM_SIG_ECDSA_SHA256 {
+        sha256(&c.der[c.tbs_off],c.tbs_len,out); out_len[0]=32; return true;
+    }
+    return false;
+}
+
+// ECDSA-Sig-Value → r / s 的定长大端（其余形态一律拒）
+fn xm_ecdsa_rs(c: &const XmCert, r: &byte, s: &byte, n: usize) bool {
+    var t: u8=0; var vs: usize=0; var vl: usize=0;
+    if !xm_hdr(c.der,c.der_len,c.sig_off,&t,&vs,&vl) || t!=XM_TAG_SEQ
+        || vs+vl!=c.sig_off+c.sig_len { return false; }
+    var rt: u8=0; var rs: usize=0; var rl: usize=0;
+    if !xm_hdr(c.der,c.der_len,vs,&rt,&rs,&rl) || rt!=XM_TAG_INT
+        || rl==0 || rs+rl>=vs+vl { return false; }
+    var st: u8=0; var ss: usize=0; var sl: usize=0;
+    if !xm_hdr(c.der,c.der_len,rs+rl,&st,&ss,&sl) || st!=XM_TAG_INT
+        || sl==0 || ss+sl!=vs+vl { return false; }
+    return xm_der_int_fixed(c.der,c.der_len,rs,rl,r,n)
+        && xm_der_int_fixed(c.der,c.der_len,ss,sl,s,n);
+}
+
+// DER INTEGER → 右对齐定长大端（去掉符号位 00，超长返回 false）
+fn xm_der_int_fixed(der: &const byte, der_len: usize, off: usize, len: usize,
+    out: &byte, n: usize) bool {
+    if len==0 || off>der_len || len>der_len-off { return false; }
+    var st: usize=0;
+    if xm_get(der,der_len,off)>=(0x80 as byte) { return false; }
+    if len>1 && xm_get(der,der_len,off)==0 {
+        if (xm_get(der,der_len,off+1)&(0x80 as byte))==0 { return false; }
+        st=1;
+    }
+    const m: usize=len-st;
+    if m>n { return false; }
+    var i: usize=0; while i<n { xm_put(out,n,i,0); i=i+1; }
+    var k: usize=0;
+    while k<m { xm_put(out,n,n-m+k,xm_get(der,der_len,off+st+k)); k=k+1; }
+    return true;
+}
+
+// 用 signer 的公钥验 c 的签名（RSA 走 rv_，ECDSA 走 lib 的 p256/p384）
+export fn xm_signed_by(c: &const XmCert, signer: &const XmCert) bool {
+    if !c.ok || !signer.ok || c.sig_len==0 { return false; }
+    var hash: [byte: 48]=[0:48]; var hlen: usize=0;
+    if !xm_tbs_hash(c,&hash[0],&hlen) { return false; }
+    if c.sig_alg==XM_SIG_RSA_SHA256 || c.sig_alg==XM_SIG_RSA_SHA384 {
+        if signer.key_alg!=XM_KEY_RSA || signer.rsa_n_len==0 { return false; }
+        var alg: u8=RV_ALG_SHA256; if hlen==48 { alg=RV_ALG_SHA384; }
+        return rv_verify_pkcs1(alg,&signer.rsa_n[0],signer.rsa_n_len,
+            &signer.rsa_e[0],signer.rsa_e_len,&c.der[c.sig_off],c.sig_len,
+            &hash[0],hlen);
+    }
+    var r: [byte:48]=[0:48]; var s: [byte:48]=[0:48];
+    if signer.key_alg==XM_KEY_EC_P256 {
+        if !xm_ecdsa_rs(c,&r[0],&s[0],32) { return false; }
+        return ecdsa_verify_p256(&signer.ec_pub[0],&hash[0],&r[0],&s[0])==0;
+    }
+    if signer.key_alg==XM_KEY_EC_P384 {
+        if !xm_ecdsa_rs(c,&r[0],&s[0],48) { return false; }
+        return ecdsa_verify_p384(&signer.ec_pub[0],&hash[0],&r[0],&s[0])==0;
+    }
+    return false;
+}
+
+// 一条 SAN 模式与主机名比对（只支持左端 `*.` 的整标签通配）
+export fn xm_host_match_one(pat: &const byte, pn: usize, host: &const byte,
+    hn: usize) bool {
+    if pn==0 || hn==0 { return false; }
+    if pat[0]==42 {
+        if pn<3 || pat[1]!=46 || hn<=pn-1 { return false; }
+        const suffix: usize=pn-1; var i: usize=0;
+        while i<suffix {
+            if byte_lower(host[hn-suffix+i])!=byte_lower(pat[1+i]) {
+                return false;
+            }
+            i=i+1;
+        }
+        const pre: usize=hn-suffix;
+        if pre==0 { return false; }
+        var k: usize=0;
+        while k<pre { if host[k]==46 { return false; } k=k+1; }
+        return true;
+    }
+    if pn!=hn { return false; }
+    var j: usize=0;
+    while j<hn {
+        if byte_lower(pat[j])!=byte_lower(host[j]) { return false; }
+        j=j+1;
+    }
+    return true;
+}
+
+// 叶子的 SAN 里有没有名字授权 host（没有 SAN ⇒ false）
+export fn xm_host_match(c: &const XmCert, host: &const byte, hn: usize) bool {
+    if !c.san_seen || c.san_n==0 || hn==0 { return false; }
+    const base: &byte=&c.san[0]; var i: usize=0;
+    while i<c.san_n {
+        const off: usize=xm_san_off(c,i); const len: usize=xm_san_len(c,i);
+        if len>0 && off<=@len(c.san) && len<=@len(c.san)-off
+            && xm_host_match_one(&base[off],len,host,hn) { return true; }
+        i=i+1;
+    }
+    return false;
+}

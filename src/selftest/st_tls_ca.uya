@@ -1,0 +1,612 @@
+// src/selftest/st_tls_ca.uya — P92 自测轮：证书链校验（自实现）与 TOFU 的「学习」语义
+//
+// 本文件：夹具读取（tca_read / tca_der）、假握手消息的拼装（tca_flight_*）、以及七条腿：
+//   好链通过 / 主机名（含左端通配）/ 链断了 / 签名被改 / ECDSA 那条 / 有效期判定 /
+//   TOFU 学新指纹（含「学习关」与「到上限」两态）。
+// 不变量：① **全部离线**：夹具是 testdata/tls_ca 下提交好的证书（自签测试 CA 出的，
+//   有效期 30000 天），不联网、不需要 openssl；② 判据都打在**产品代码**上
+//   （cc_verify / xm_* / tls_tofu_learn），不是照形状复刻的复制品；③ 每条腿都能单独红
+//   （防假绿对照见 DESIGN §19 的 P92 一节）；④ 临时指纹库落在 build/ 下，轮末清掉路径。
+// 依赖：见锚点 selftest.uya 的文件头（本片与它同处合并命名空间，无本地 use）。
+// 命名：本轮前缀 `tca_`（TLS chain / ca）。
+
+// 夹具目录（自测从仓库根跑，所以是相对路径）
+const TCA_DIR: &const byte = "testdata/tls_ca/" as &const byte;
+
+// 一次读盘的上限（最大的夹具 1.3 KB；DER 一次性读，够用就行）
+const TCA_FILE_MAX: usize = 8192;
+
+// 「假握手消息」缓冲：Certificate 消息 = 类型(1) + 长度(3) + 列表长(3) + 每张(3 + DER)
+var g_tca_fl: [byte: 16384] = [0: 16384];
+// 单张证书的 DER（读盘与解码共用）
+var g_tca_der: [byte: TCA_FILE_MAX] = [0: TCA_FILE_MAX];
+// 拼链时的中转（每张证书先读进来再追加）
+var g_tca_tmp: [byte: TCA_FILE_MAX] = [0: TCA_FILE_MAX];
+
+// 断言失败：打一行带轮名的诊断并置 ok = false
+fn tca_fail(what: &const byte, ok: &bool) void {
+    out_err("selftest[tls-ca] FAIL: ");
+    out_err(what);
+    out_err("\n");
+    ok[0] = false;
+}
+
+// 把一个路径读进 out（返回字节数；读不到返回 0）
+fn tca_read(path: &const byte, n: usize, out: &byte, cap: usize) usize {
+    var z: Buf = buf_new(n + 1);
+    defer { buf_free(&z); }
+    if !buf_append(&z, path, n) || !buf_append_byte(&z, 0) {
+        return 0;
+    }
+    const fd: i32 = sys_open(z.ptr as *const byte, 256 as i32, 0) catch {
+        return 0;
+    };
+    var got: usize = 0;
+    while got < cap {
+        const r: isize = sys_read(fd, &out[got], cap - got) catch {
+            0 as isize;
+        };
+        if r <= 0 {
+            break;
+        }
+        got = got + (r as usize);
+    }
+    _ = sys_close(fd) catch {};
+    return got;
+}
+
+// 读一张夹具证书（PEM）并解成 DER 进 der（返回 DER 字节数，0 = 失败）
+fn tca_der(name: &const byte, name_n: usize, der: &Buf) bool {
+    var path: Buf = buf_new(128);
+    defer { buf_free(&path); }
+    if !buf_append_cstr(&path, TCA_DIR) || !buf_append(&path, name, name_n) {
+        return false;
+    }
+    // 路径要给 sys_open 用 ⇒ 必须 NUL 结尾（补上但**不计入** path.len 之外的使用）
+    if !buf_append_byte(&path, 0) {
+        return false;
+    }
+    const n: usize = tca_read(path.ptr as &const byte, path.len - 1,
+        &g_tca_tmp[0], TCA_FILE_MAX);
+    if n == 0 {
+        return false;
+    }
+    var text: Buf = Buf{ ptr: &g_tca_tmp[0], len: n, cap: n };
+    var pos: usize = 0;
+    var off: usize = 0;
+    var len: usize = 0;
+    if !cc_pem_next(&text, &pos, &off, &len) {
+        return false;
+    }
+    return cc_pem_decode(&text, off, len, der);
+}
+
+// 开始拼一条假握手消息：先占 7 个字节（消息头 4 + 列表长 3），返回游标
+fn tca_flight_begin() usize {
+    var i: usize = 0;
+    while i < 7 {
+        g_tca_fl[i] = 0 as byte;
+        i = i + 1;
+    }
+    return 7;
+}
+
+// 往假握手消息里追加一张证书，返回新游标（越界返回 0）
+fn tca_flight_add(cur: usize, der: &const byte, n: usize) usize {
+    if cur + 3 + n > @len(g_tca_fl) {
+        return 0;
+    }
+    g_tca_fl[cur] = ((n >> 16) & (255 as usize)) as! byte catch { 0 as byte; };
+    g_tca_fl[cur + 1] = ((n >> 8) & (255 as usize)) as! byte catch {
+        0 as byte;
+    };
+    g_tca_fl[cur + 2] = (n & (255 as usize)) as! byte catch { 0 as byte; };
+    var i: usize = 0;
+    while i < n {
+        g_tca_fl[cur + 3 + i] = der[i];
+        i = i + 1;
+    }
+    return cur + 3 + n;
+}
+
+// 收尾：把消息头与列表长填好，返回整条消息的长度（失败返回 0）
+fn tca_flight_end(cur: usize) usize {
+    if cur < 7 {
+        return 0;
+    }
+    // 消息体的「列表长」只数证书项自己（3 + DER 之和），消息头的「长度」才把列表长那
+    // 3 个字节也算进去 —— 这两个数差 3，写成同一个会让解析器判定「链是坏的」（自测当场红）
+    const list: usize = cur - 7;
+    const total: usize = cur - 4;
+    g_tca_fl[0] = 11 as byte;                       // Certificate
+    g_tca_fl[1] = ((total >> 16) & (255 as usize)) as! byte catch {
+        0 as byte;
+    };
+    g_tca_fl[2] = ((total >> 8) & (255 as usize)) as! byte catch { 0 as byte; };
+    g_tca_fl[3] = (total & (255 as usize)) as! byte catch { 0 as byte; };
+    g_tca_fl[4] = ((list >> 16) & (255 as usize)) as! byte catch { 0 as byte; };
+    g_tca_fl[5] = ((list >> 8) & (255 as usize)) as! byte catch { 0 as byte; };
+    g_tca_fl[6] = (list & (255 as usize)) as! byte catch { 0 as byte; };
+    return cur;
+}
+
+// 拼一条链：c1 [c2 [c3]]（名字一律是 TCA_DIR 下的文件名）
+fn tca_chain(n1: &const byte, n1l: usize, n2: &const byte, n2l: usize) usize {
+    var d: Buf = buf_new(TCA_FILE_MAX);
+    defer { buf_free(&d); }
+    var cur: usize = tca_flight_begin();
+    if !tca_der(n1, n1l, &d) {
+        return 0;
+    }
+    cur = tca_flight_add(cur, d.ptr, d.len);
+    if cur == 0 {
+        return 0;
+    }
+    if n2l > 0 {
+        if !tca_der(n2, n2l, &d) {
+            return 0;
+        }
+        cur = tca_flight_add(cur, d.ptr, d.len);
+        if cur == 0 {
+            return 0;
+        }
+    }
+    return tca_flight_end(cur);
+}
+
+// 读一个夹具库（PEM 文本）进 out
+fn tca_bundle(name: &const byte, name_n: usize, out: &Buf) bool {
+    var path: Buf = buf_new(128);
+    defer { buf_free(&path); }
+    if !buf_append_cstr(&path, TCA_DIR) || !buf_append(&path, name, name_n) {
+        return false;
+    }
+    if !buf_append_byte(&path, 0) {
+        return false;              // sys_open / cc_bundle_load 都吃 C 串
+    }
+    return cc_bundle_load(path.ptr as &const byte, out);
+}
+
+// 跑一次 cc_verify 并把结论与「预期」比；reason 非空时还要求失败原因里含它
+fn tca_expect(
+    what: &const byte,
+    flen: usize,
+    host: &const byte,
+    hn: usize,
+    bundle: &const Buf,
+    want: i32,
+    ok: &bool
+) void {
+    var in: CcIn = CcIn{ flight: &g_tca_fl[0], flen: flen,
+        host: host, host_len: hn, bundle: bundle };
+    const r: i32 = cc_verify(&in);
+    if r != want {
+        // 把「要什么 / 得到什么 / 为什么」一并打出来：链校验的失败原因隔着一层判据，
+        // 只报一句「应当拒」会让人再猜一轮
+        out_err("  期望 ");
+        out_err_dec(want as usize);
+        out_err("，实际 ");
+        out_err_dec(r as usize);
+        out_err("（flen = ");
+        out_err_dec(flen);
+        out_err("）");
+        const why: &[byte] = cc_last_reason();
+        if why.len > 0 {
+            out_err("：");
+            out_err_bytes(why.ptr, why.len);
+        }
+        out_err("\n");
+        tca_fail(what, ok);
+    }
+}
+
+// 失败原因里是否含子串（用来确认「拒得有理由」，而不只是拒了）
+fn tca_reason_has(needle: &const byte, nn: usize) bool {
+    const why: &[byte] = cc_last_reason();
+    if why.len < nn {
+        return false;
+    }
+    const at: isize = find_sub(why, needle[0: nn], 0);
+    return at >= 0;
+}
+
+// 腿 1：好链通过 + 主机名（精确 / 左端通配 / 跨级通配 / 无左标签 / 完全不符）
+fn tca_leg_hosts(tag: &const byte, ok: &bool) void {
+    var b: Buf = buf_new(TCA_FILE_MAX);
+    defer { buf_free(&b); }
+    if !tca_bundle("root.pem" as &const byte, 8, &b) {
+        tca_fail("读不到夹具 root.pem", ok);
+        return;
+    }
+    const fl: usize = tca_chain("leaf.pem" as &const byte, 8,
+        "inter.pem" as &const byte, 9);
+    if fl == 0 {
+        tca_fail("拼不出 leaf+inter 的假握手消息", ok);
+        return;
+    }
+    tca_expect("好链（good.test）应当通过", fl,
+        "good.test" as &const byte, 9, &b, CC_OK, ok);
+    if !ok[0] {
+        return;
+    }
+    tca_expect("*.wild.test 应当匹配 a.wild.test", fl,
+        "a.wild.test" as &const byte, 11, &b, CC_OK, ok);
+    tca_expect("*.wild.test 不该匹配 a.b.wild.test（跨级）", fl,
+        "a.b.wild.test" as &const byte, 13, &b, CC_FAIL, ok);
+    tca_expect("*.wild.test 不该匹配 wild.test（没有左标签）", fl,
+        "wild.test" as &const byte, 9, &b, CC_FAIL, ok);
+    tca_expect("other.test 不该通过", fl,
+        "other.test" as &const byte, 10, &b, CC_FAIL, ok);
+    if !tca_reason_has("SAN" as &const byte, 3) {
+        tca_fail("主机名不符时的原因没指向 SAN", ok);
+    }
+    _ = tag;
+}
+
+// 腿 2：错主机名的**证书**（SAN=other.test）连 good.test 必须拒
+fn tca_leg_badhost(tag: &const byte, ok: &bool) void {
+    var b: Buf = buf_new(TCA_FILE_MAX);
+    defer { buf_free(&b); }
+    if !tca_bundle("root.pem" as &const byte, 8, &b) {
+        tca_fail("读不到夹具 root.pem", ok);
+        return;
+    }
+    const fl: usize = tca_chain("badhost.pem" as &const byte, 11,
+        "inter.pem" as &const byte, 9);
+    if fl == 0 {
+        tca_fail("拼不出 badhost+inter 的假握手消息", ok);
+        return;
+    }
+    tca_expect("SAN=other.test 的证书不该授权 good.test", fl,
+        "good.test" as &const byte, 9, &b, CC_FAIL, ok);
+    _ = tag;
+}
+
+// 腿 3：链断掉的三种形态
+fn tca_leg_broken(tag: &const byte, ok: &bool) void {
+    var b: Buf = buf_new(TCA_FILE_MAX);
+    defer { buf_free(&b); }
+    if !tca_bundle("root.pem" as &const byte, 8, &b) {
+        tca_fail("读不到夹具 root.pem", ok);
+        return;
+    }
+    // ① 服务端只发叶子（不发中间证书）⇒ 库里只有根，接不上
+    var only: usize = tca_chain("leaf.pem" as &const byte, 8,
+        "" as &const byte, 0);
+    if only == 0 {
+        tca_fail("拼不出「只发叶子」的假握手消息", ok);
+        return;
+    }
+    tca_expect("只发叶子（缺中间证书）必须拒", only,
+        "good.test" as &const byte, 9, &b, CC_FAIL, ok);
+    // ② 服务端把自签根也发来了，但库是空的 ⇒ 自签不能自证
+    var empty: Buf = buf_new(64);
+    defer { buf_free(&empty); }
+    var cur: usize = tca_flight_begin();
+    var d: Buf = buf_new(TCA_FILE_MAX);
+    defer { buf_free(&d); }
+    if !tca_der("leaf.pem" as &const byte, 8, &d) {
+        tca_fail("读不到 leaf.pem", ok);
+        return;
+    }
+    cur = tca_flight_add(cur, d.ptr, d.len);
+    if !tca_der("inter.pem" as &const byte, 9, &d) {
+        tca_fail("读不到 inter.pem", ok);
+        return;
+    }
+    cur = tca_flight_add(cur, d.ptr, d.len);
+    if !tca_der("root.pem" as &const byte, 8, &d) {
+        tca_fail("读不到 root.pem", ok);
+        return;
+    }
+    cur = tca_flight_add(cur, d.ptr, d.len);
+    const full: usize = tca_flight_end(cur);
+    if full == 0 {
+        tca_fail("拼不出「叶子+中间+根」的假握手消息", ok);
+        return;
+    }
+    tca_expect("空库 + 服务端自带自签根 必须拒", full,
+        "good.test" as &const byte, 9, &empty, CC_FAIL, ok);
+    if !tca_reason_has("服务端自带" as &const byte, 15) {
+        tca_fail("空库拒绝时的原因没说明「服务端自带的根不算信任」", ok);
+    }
+    // ③ 库里有中间证书但没有根 ⇒ 还是接不到锚点
+    var noRoot: Buf = buf_new(TCA_FILE_MAX);
+    defer { buf_free(&noRoot); }
+    if !tca_bundle("inter.pem" as &const byte, 9, &noRoot) {
+        tca_fail("读不到夹具 inter.pem", ok);
+        return;
+    }
+    const chain2: usize = tca_chain("leaf.pem" as &const byte, 8,
+        "inter.pem" as &const byte, 9);
+    tca_expect("库里没有根（只有中间）必须拒", chain2,
+        "good.test" as &const byte, 9, &noRoot, CC_FAIL, ok);
+    _ = tag;
+}
+
+// 腿 4：签名被改一个字节必须拒（改的是叶子证书的签名值）
+fn tca_leg_tamper(tag: &const byte, ok: &bool) void {
+    var b: Buf = buf_new(TCA_FILE_MAX);
+    defer { buf_free(&b); }
+    if !tca_bundle("root.pem" as &const byte, 8, &b) {
+        tca_fail("读不到夹具 root.pem", ok);
+        return;
+    }
+    var leafder: Buf = buf_new(TCA_FILE_MAX);
+    defer { buf_free(&leafder); }
+    if !tca_der("leaf.pem" as &const byte, 8, &leafder) {
+        tca_fail("读不到 leaf.pem", ok);
+        return;
+    }
+    var leaf: XmCert = xm_empty();
+    if !xm_parse(&leaf, leafder.ptr, leafder.len) {
+        tca_fail("夹具 leaf.pem 解析失败", ok);
+        return;
+    }
+    // 改**签名值**的最后一个字节（不是 TBS）：DER 结构仍然完好、能解析出来，唯一
+    // 不对的就是签名本身 —— 这样断言才落在「验签」上。改 TBS 尾部会先撞上「扩展畸形」
+    // 那条更早的判据，签名腿就被别的检查顶替了（等于没测签名）。
+    if leaf.sig_len == 0 || leaf.sig_off + leaf.sig_len > leafder.len {
+        tca_fail("签名区间越界（解析器算错了）", ok);
+        return;
+    }
+    const at: usize = leaf.sig_off + leaf.sig_len - 1;
+    leafder.ptr[at] = leafder.ptr[at] ^ (0xFF as byte);
+    var cur: usize = tca_flight_begin();
+    cur = tca_flight_add(cur, leafder.ptr, leafder.len);
+    var d: Buf = buf_new(TCA_FILE_MAX);
+    defer { buf_free(&d); }
+    if !tca_der("inter.pem" as &const byte, 9, &d) {
+        tca_fail("读不到 inter.pem", ok);
+        return;
+    }
+    cur = tca_flight_add(cur, d.ptr, d.len);
+    const fl: usize = tca_flight_end(cur);
+    if fl == 0 {
+        tca_fail("拼不出「坏叶子+中间」的假握手消息", ok);
+        return;
+    }
+    tca_expect("签名被改一个字节必须拒", fl,
+        "good.test" as &const byte, 9, &b, CC_FAIL, ok);
+    if !tca_reason_has("签名" as &const byte, 6) {
+        tca_fail("签名不符时的原因没指向「签名」", ok);
+    }
+    _ = tag;
+}
+
+// 腿 5：ECDSA（P-256）那条路 —— 叶子由 P-256 中间签，签名走 ecdsa_verify_p256
+fn tca_leg_ecdsa(tag: &const byte, ok: &bool) void {
+    var b: Buf = buf_new(TCA_FILE_MAX);
+    defer { buf_free(&b); }
+    if !tca_bundle("root.pem" as &const byte, 8, &b) {
+        tca_fail("读不到夹具 root.pem", ok);
+        return;
+    }
+    const fl: usize = tca_chain("ecleaf.pem" as &const byte, 10,
+        "ecinter.pem" as &const byte, 11);
+    if fl == 0 {
+        tca_fail("拼不出 ecleaf+ecinter 的假握手消息", ok);
+        return;
+    }
+    tca_expect("ECDSA 链（ec.test）应当通过", fl,
+        "ec.test" as &const byte, 7, &b, CC_OK, ok);
+    tca_expect("ECDSA 链也不该授权 good.test", fl,
+        "good.test" as &const byte, 9, &b, CC_FAIL, ok);
+    _ = tag;
+}
+
+// 腿 6：有效期判定（把解析结果的 notAfter 拨到过去 —— 夹具本身不会过期）
+fn tca_leg_time(tag: &const byte, ok: &bool) void {
+    var leafder: Buf = buf_new(TCA_FILE_MAX);
+    defer { buf_free(&leafder); }
+    if !tca_der("leaf.pem" as &const byte, 8, &leafder) {
+        tca_fail("读不到 leaf.pem", ok);
+        return;
+    }
+    var leaf: XmCert = xm_empty();
+    if !xm_parse(&leaf, leafder.ptr, leafder.len) {
+        tca_fail("夹具 leaf.pem 解析失败", ok);
+        return;
+    }
+    if !leaf.has_validity {
+        tca_fail("夹具 leaf.pem 没有解析出有效期", ok);
+        return;
+    }
+    const now: i64 = xm_now();
+    if !xm_time_valid(&leaf, now) {
+        tca_fail("夹具 leaf.pem 现在应当是有效的（有效期到 2100 年以后）", ok);
+    }
+    // 拨到过去：notAfter = 1000（1970 年）。直接改这一份（结构体赋值算「移动」，
+    // 复制一份再改在这门语言里不可用）
+    const saved_after: i64 = leaf.not_after;
+    leaf.not_after = 1000;
+    if xm_time_valid(&leaf, now) {
+        tca_fail("notAfter 在过去时不该判有效", ok);
+    }
+    leaf.not_after = saved_after;
+    // 拨到未来：notBefore = now + 1 天
+    const saved_before: i64 = leaf.not_before;
+    leaf.not_before = now + 86400;
+    if xm_time_valid(&leaf, now) {
+        tca_fail("notBefore 在未来时不该判有效", ok);
+    }
+    leaf.not_before = saved_before;
+    // 拿不到系统时间（now = 0）时必须判**无效**：有效期是链校验的硬条件，时钟缺失
+    // 就等于这一条没验过。这条反向断言防的是「时钟一坏就把所有证书放过去」。
+    if xm_time_valid(&leaf, 0) {
+        tca_fail("没有系统时钟时不该判有效（必须 fail-closed）", ok);
+    }
+    _ = tag;
+}
+
+// 拨一个 64 位 hex 进 out（生成而不是手写：数错位数看不出来，见 tpf_fill 的注释）
+fn tca_hex(c: byte, out: &byte) void {
+    var i: usize = 0;
+    while i < 64 {
+        out[i] = c;
+        i = i + 1;
+    }
+}
+
+// 指纹库文件里现在有几行（0 = 文件不存在/空）
+fn tca_pin_lines(path: &const byte, n: usize) usize {
+    const got: usize = tca_read(path, n, &g_tca_tmp[0], TCA_FILE_MAX);
+    var lines: usize = 0;
+    var i: usize = 0;
+    while i < got {
+        if g_tca_tmp[i] == (10 as byte) {
+            lines = lines + 1;
+        }
+        i = i + 1;
+    }
+    return lines;
+}
+
+// 腿 7：TOFU 的「学新指纹」——库里已经记过 a×64，这次服务端给 b×64：
+//   * 学习开着 ⇒ tls_tofu_learn 追加一行并返回 LEARNED；随后 b 变成 TRUSTED；
+//   * 学习关着 ⇒ 返回 MISMATCH（= 逐字节回到旧行为）；
+//   * 到上限（TP_MAX_PER_HOST）⇒ 返回 LEARNED 但**不再追加**（库只追加、不淘汰）。
+fn tca_leg_learn(tag: &const byte, ok: &bool) void {
+    const home: &const byte = "build/selftest_tls_ca" as &const byte;
+    _ = sess_mkdir_p(home);
+    const pins: &const byte = "build/selftest_tls_ca/tls_pins" as &const byte;
+    _ = sys_unlink(pins) catch {};
+    if !hc_set_tofu_path(pins) {
+        tca_fail("hc_set_tofu_path 对合法路径返回了 false", ok);
+        return;
+    }
+    const host: &const byte = "learn.test" as &const byte;
+    var ha: [byte: 64] = [0: 64];
+    var hb: [byte: 64] = [0: 64];
+    tca_hex(97 as byte, &ha[0]);      // 'a'×64
+    tca_hex(98 as byte, &hb[0]);      // 'b'×64
+    // 首次：FRESH（记下 a）
+    if tls_tofu_verdict(host, 10, &ha[0], 64) != TP_VERDICT_FRESH {
+        tca_fail("首次应当是 FRESH", ok);
+    }
+    // 同一台主机换了指纹：学习**之前**判据仍然是 MISMATCH
+    if tls_tofu_verdict(host, 10, &hb[0], 64) != TP_VERDICT_MISMATCH {
+        tca_fail("库里只有 a×64 时，b×64 应当判 MISMATCH", ok);
+    }
+    if tca_pin_lines(pins, bufx_cstr_len(pins)) != 1 {
+        tca_fail("首次记录之后库里应当正好 1 行", ok);
+    }
+    // 学习关着：不追加、结论 MISMATCH
+    hc_set_tofu_learn(false);
+    if tls_tofu_learn(host, 10, &hb[0], 64) != TP_VERDICT_MISMATCH {
+        tca_fail("学习关着时 tls_tofu_learn 应当返回 MISMATCH", ok);
+    }
+    hc_set_tofu_learn(true);
+    // 学习开着：追加一行 + LEARNED
+    if tls_tofu_learn(host, 10, &hb[0], 64) != TP_VERDICT_LEARNED {
+        tca_fail("学习开着时 tls_tofu_learn 应当返回 LEARNED", ok);
+    }
+    if tca_pin_lines(pins, bufx_cstr_len(pins)) != 2 {
+        tca_fail("学到的新指纹没有真的落盘（库应当有 2 行）", ok);
+    }
+    // 学完之后 b 就是可信的了（这才是「多证书站点能连上」的实质）
+    if tls_tofu_verdict(host, 10, &hb[0], 64) != TP_VERDICT_TRUSTED {
+        tca_fail("学过 b×64 之后它应当判 TRUSTED", ok);
+    }
+    // 到上限：再学 c×64 / d×64 追平上限，第 5 条只放行、不追加
+    var hc: [byte: 64] = [0: 64];
+    var hd: [byte: 64] = [0: 64];
+    var he: [byte: 64] = [0: 64];
+    tca_hex(99 as byte, &hc[0]);
+    tca_hex(100 as byte, &hd[0]);
+    tca_hex(101 as byte, &he[0]);
+    _ = tls_tofu_learn(host, 10, &hc[0], 64);
+    _ = tls_tofu_learn(host, 10, &hd[0], 64);
+    const before: usize = tca_pin_lines(pins, bufx_cstr_len(pins));
+    if before != 4 {
+        tca_fail("追到上限时库应当有 4 行（TP_MAX_PER_HOST）", ok);
+    }
+    if tls_tofu_learn(host, 10, &he[0], 64) != TP_VERDICT_LEARNED {
+        tca_fail("到上限之后链验过的那条仍应放行（LEARNED）", ok);
+    }
+    const after: usize = tca_pin_lines(pins, bufx_cstr_len(pins));
+    if after != before {
+        tca_fail("到上限之后不该再追加（库只追加、不淘汰）", ok);
+    }
+    hc_set_tofu_learn(true);
+    _ = hc_set_tofu_path(null as &const byte);   // 别把临时库留给后面的轮次
+    _ = tag;
+}
+
+// 本轮的总入口（selftest.uya 里一行调用）
+fn tca_rounds(tag: &const byte) bool {
+    var ok: bool = true;
+    tca_leg_hosts(tag, &ok);
+    tca_leg_badhost(tag, &ok);
+    tca_leg_broken(tag, &ok);
+    tca_leg_tamper(tag, &ok);
+    tca_leg_ecdsa(tag, &ok);
+    tca_leg_time(tag, &ok);
+    tca_leg_learn(tag, &ok);
+    tca_leg_wire(tag, &ok);
+    if ok {
+        out_err("selftest[");
+        out_err(tag);
+        // 行宽豁免：一条不可断的自测摘要文案（中文），拆行读不出原句
+        out_err("] ok（链验到系统根 / 主机名与通配 / 缺中间证书 / 自签根不算信任 / 签名被改 / ECDSA / 有效期 / 学新指纹 / 握手缓冲接线）\n");
+    }
+    return ok;
+}
+
+// 腿 8：**真接线** —— 握手缓冲 → tls_tofu_ca_check → net/cachain 这条链。
+// 为什么要这一腿：前面几条腿走的都是 `cc_verify` 直调，而产品里真正的入口是
+// `tls_tofu_decide → tls_tofu_ca_check`（它要从 TlsConn 里掏 server_flight_msg、自己找库、
+// 把结论翻成 CC_*）。不测这一步，「手上好用的函数」与「产品里接的那根线」可以各对各的。
+// 顺带覆盖 `--ca-bundle` 那条**钉住路径**的支路（这里钉成夹具里的 root.pem）。
+fn tca_leg_wire(tag: &const byte, ok: &bool) void {
+    const fl: usize = tca_chain("leaf.pem" as &const byte, 8,
+        "inter.pem" as &const byte, 9);
+    if fl == 0 || fl > 8192 {
+        tca_fail("拼不出 leaf+inter 的假握手消息", ok);
+        return;
+    }
+    // 把假握手消息塞进一个真的 HandshakeCtx，再包成 TlsConn —— 产品代码读的就是这个字段
+    var hs: HandshakeCtx = HandshakeCtx{};
+    var i: usize = 0;
+    while i < fl {
+        hs.server_flight_msg[i] = g_tca_fl[i];
+        i = i + 1;
+    }
+    hs.server_flight_msg_len = fl;
+    var tc: TlsConn = tls_conn_empty();
+    tc.hs = &hs;
+    // 钉住 CA 库 = 夹具里的自签根（覆盖「调用方给了路径」那条支路）
+    var zb: Buf = buf_new(256);
+    defer { buf_free(&zb); }
+    // 注意：前半段用 buf_append_cstr（**不带** NUL），NUL 只在最后补一次。
+    // 写成 buf_append_cstr_z(TCA_DIR) 会把 NUL 夹在路径中间，打开的是 "testdata/tls_ca/"。
+    if !buf_append_cstr(&zb, TCA_DIR)
+        || !buf_append_cstr(&zb, "root.pem" as &const byte) {
+        tca_fail("拼不出 CA 库路径", ok);
+        return;
+    }
+    if !buf_append_byte(&zb, 0) {
+        tca_fail("CA 库路径没 NUL 结尾", ok);
+        return;
+    }
+    if !hc_set_chain_bundle(zb.ptr as &const byte) {
+        tca_fail("hc_set_chain_bundle 对合法路径返回了 false", ok);
+        return;
+    }
+    const r: i32 = tls_tofu_ca_check(&tc, "good.test" as &const byte, 9);
+    if r != CC_OK {
+        tca_fail("握手缓冲里的好链没通过 tls_tofu_ca_check", ok);
+        const why: &[byte] = cc_last_reason();
+        if why.len > 0 {
+            out_err("  原因：");
+            out_err_bytes(why.ptr, why.len);
+            out_err("\n");
+        }
+    }
+    const r2: i32 = tls_tofu_ca_check(&tc, "other.test" as &const byte, 10);
+    if r2 != CC_FAIL {
+        tca_fail("握手缓冲里的好链也不该授权 other.test", ok);
+    }
+    _ = hc_set_chain_bundle(null as &const byte);   // 让后面的腿回到「自动找库」
+    _ = tag;
+}

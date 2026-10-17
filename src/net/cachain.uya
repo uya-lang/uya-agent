@@ -1,0 +1,624 @@
+// src/net/cachain.uya — 用本仓自己的 X.509 实现做「证书链校验」（不依赖 lib/tls 的链校验）
+//
+// 本文件：系统 CA 库的发现与整份读取（cc_bundle_path / cc_bundle_load）、PEM 拆块与
+//   base64 解码（cc_pem_next / cc_pem_decode）、库索引（cc_bundle_index）、握手消息流里的证书枚举
+//   （cc_flight_count / cc_flight_cert）、把子证书接到父证书上的单步校验（cc_step）、
+//   以及入口 cc_verify（返回 CC_OK / CC_FAIL / CC_UNSUPPORTED 三态）。
+// 不变量：① **信任锚必须真的在系统库里** —— 服务端自带的自签根不构成信任（自签只被看作
+//   「链走到头了」）；② 每一跳都要验：签名、有效期、basicConstraints 的 CA 位、pathLen、
+//   keyUsage 的 keyCertSign（有声明才查）；③ 叶子只看 SAN 的 dNSName（没有 SAN 就失败，
+//   不退 CN —— 退 CN 那条老路主流客户端已经废弃，猜出来的「大概对」比失败更危险）；
+//   ④ 失败**必须留一句话**（cc_last_reason），因为「为什么连不上」是用户唯一的抓手；
+//   ⑤ 库只整份读一次、按需解析：解析结果里带 DER 指针，所以「从库里选中的那张证书」要
+//   拷进调用方的 Buf 再解析一次（否则下一次解码就把它的 DER 覆盖掉）。
+// 依赖：foundation/bufx、net/x509min（XmCert / xm_parse / xm_signed_by /
+//   xm_host_match）、
+//   std.encoding.base64、libc（open/read/close/access）。**不改 lib/tls**：它的链校验在
+//   真实站点上必然失败（DESIGN §18 记了三条标准库缺陷），这里走的是另一条路。
+// 命名：函数 `cc_*`，常量 `CC_*`，结构 `CcIn`。
+
+use std.encoding.base64.decode_base64_mime;
+
+// 三态结论
+export const CC_OK: i32 = 1;             // 链完整、每一跳都验过、锚点在系统库里
+export const CC_FAIL: i32 = 0;           // 验不过（具体原因见 cc_last_reason）
+export const CC_UNSUPPORTED: i32 = -1;   // 做不了（没有系统 CA 库 / 算法不支持 / 缓冲截断）
+
+// 一条链最多几跳（真实站点 2–4 跳；8 跳已经离谱到该拒绝了）
+export const CC_MAX_DEPTH: usize = 8;
+// 系统 CA 库读多少字节上限（Debian/Deepin 的 ca-certificates.crt 是 224 KB）
+export const CC_BUNDLE_MAX: usize = 1048576;
+// 单张证书 DER 的上限
+export const CC_DER_MAX: usize = 16384;
+// 库里最多找多少张证书（150 是 Debian 的量级，524 是 mozilla 全家桶的量级）
+export const CC_MAX_BUNDLE_CERTS: usize = 512;
+
+// keyUsage 的 keyCertSign 位：RFC 5280 里是 bit5，而 net/x509min 把「RFC 位号」直接
+// 当位号存进 key_usage（bit0 = digitalSignature），所以这里是 1 << 5 = 0x0020。
+// 只认这一个常量 —— 早先一边倒序编号、一边写 0x04，正牌 CA 会被判「没有
+// keyCertSign」而整条链拒掉。
+const CC_KU_KEY_CERT_SIGN: u16 = 0x0020;
+
+// 一次校验的输入（flight 是握手消息流，bundle 是整份系统 CA 库文本）
+export struct CcIn {
+    flight: &const byte,
+    flen: usize,
+    host: &const byte,
+    host_len: usize,
+    bundle: &const Buf,
+}
+
+// 最近一次失败的说明（一句话；成功时清空）
+var g_cc_reason: Buf = Buf{ ptr: null, len: 0, cap: 0 };
+
+// 换一条失败原因（多次调用只保留最后一次，因为最后一次才是链断掉的地方）
+export fn cc_set_reason(p: &const byte, n: usize) void {
+    if !buf_valid(&g_cc_reason) {
+        g_cc_reason = buf_new(256);
+    }
+    buf_reset(&g_cc_reason);
+    _ = buf_append(&g_cc_reason, p, n);
+}
+
+// 最近一条失败原因（没有就返回空切片）
+export fn cc_last_reason() &[byte] {
+    if !buf_valid(&g_cc_reason) {
+        return g_cc_reason.ptr[0: 0];
+    }
+    return g_cc_reason.ptr[0: g_cc_reason.len];
+}
+
+// 记一句固定原因并返回 CC_FAIL（省得每处都写三行）
+fn cc_fail(p: &const byte) i32 {
+    var i: usize = 0;
+    while p[i] != (0 as byte) {
+        i = i + 1;
+    }
+    cc_set_reason(p, i);
+    return CC_FAIL;
+}
+
+// 记一句固定原因并返回 CC_UNSUPPORTED
+fn cc_unsupported(p: &const byte) i32 {
+    _ = cc_fail(p);
+    return CC_UNSUPPORTED;
+}
+
+// 系统 CA 库的候选路径（按优先级）：$SSL_CERT_FILE → Debian/Deepin → RHEL → 通用
+// 返回 true = 找到第一个**存在**的文件，路径以 NUL 结尾写进 out
+export fn cc_bundle_path(out: &Buf) bool {
+    buf_reset(out);
+    const env: &byte = getenv("SSL_CERT_FILE");
+    if (env as usize) != 0 && bufx_cstr_len(env) > 0 {
+        var z: Buf = buf_new(bufx_cstr_len(env) + 1);
+        defer { buf_free(&z); }
+        if buf_append_cstr_z(&z, env) {
+            if cc_exists(z.ptr as &const byte) {
+                return buf_append_cstr_z(out, env);
+            }
+        }
+    }
+    // 行宽豁免：四个系统 CA 库的固定路径，拆行反而看不清优先级
+    const cands: &const byte = "/etc/ssl/certs/ca-certificates.crt\0/etc/pki/tls/certs/ca-bundle.crt\0/etc/ssl/cert.pem\0/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem\0";
+    var off: usize = 0;
+    while off < bufx_cstr_len(cands) {
+        const one: &const byte = &cands[off];
+        const len: usize = bufx_cstr_len(one);
+        if cc_exists(one) {
+            return buf_append_cstr_z(out, one);
+        }
+        off = off + len + 1;
+    }
+    return false;
+}
+
+// 文件存在且可读（sys_access R_OK）
+fn cc_exists(p: &const byte) bool {
+    const r: i32 = sys_access(p as *const byte, 4) catch { -1; };
+    return r == 0;
+}
+
+// 整份读进 out（**不截断**、不按行扫；超过 CC_BUNDLE_MAX 就当读不动）
+export fn cc_bundle_load(path: &const byte, out: &Buf) bool {
+    buf_reset(out);
+    const fd: i32 = sys_open(path as *const byte, O_RDONLY as i32, 0) catch {
+        return false;
+    };
+    var ok: bool = true;
+    const room: usize = 65536;
+    while out.len < CC_BUNDLE_MAX {
+        // 不用 `if ... { } else { }` 表达式初始化 const：编译器会把它摊成
+        // `const size_t x; if (...) { x = ...; }`，宿主 C 报
+        // 「assignment of read-only variable」（踩坑 131 的同类）。
+        var want: usize = room;
+        if CC_BUNDLE_MAX - out.len < room {
+            want = CC_BUNDLE_MAX - out.len;
+        }
+        if !buf_reserve(out, want) {
+            ok = false;
+            break;
+        }
+        const got: isize = sys_read(fd, &out.ptr[out.len], want) catch {
+            ok = false;
+            break;
+        };
+        if got > (room as isize) {
+            ok = false;                // 防止内核/FFI 返回超出提供缓冲的长度
+            break;
+        }
+        if got <= 0 {
+            break;
+        }
+        out.len = out.len + (got as usize);
+    }
+    _ = sys_close(fd) catch {};
+    if out.len >= CC_BUNDLE_MAX {
+        ok = false;                       // 库大到读不完：判「拿不到可信库」，不半份凑数
+    }
+    return ok && out.len > 0;
+}
+
+// 从 pos 起找**下一块** PEM 证书的正文区间（不含 BEGIN/END 行）。
+// pos 会被推到这一块的 END 之后，于是「顺着扫一遍」是 O(n) —— 这条很要命：
+// 早先的写法是「每次从 0 开始找第 i 块」，150 张证书就是 150 次整份扫描（224 KB × 150），
+// 实测单次链校验被它拖到 170 ms。
+export fn cc_pem_next(b: &const Buf, pos: &usize, off: &usize, len: &usize) bool {
+    const begin: &const byte = "-----BEGIN CERTIFICATE-----";
+    const endm: &const byte = "-----END CERTIFICATE-----";
+    const bn: usize = 27;
+    const en: usize = 25;
+    const from: usize = pos[0];
+    if from >= b.len {
+        return false;
+    }
+    const hit: isize = find_sub(b.ptr[0: b.len], begin[0: bn], from);
+    if hit < 0 {
+        return false;
+    }
+    const bs: usize = hit as usize;
+    const body: usize = bs + bn;
+    if body >= b.len {
+        return false;
+    }
+    const ehit: isize = find_sub(b.ptr[0: b.len], endm[0: en], body);
+    if ehit < 0 {
+        return false;
+    }
+    const es: usize = ehit as usize;
+    off[0] = body;
+    len[0] = es - body;
+    pos[0] = es + en;
+    return true;
+}
+
+// 把一段 PEM 正文 base64 解码进 der
+export fn cc_pem_decode(b: &const Buf, off: usize, len: usize, der: &Buf) bool {
+    buf_reset(der);
+    const need: usize = ((len / 4) + 1) * 3;
+    if !buf_reserve(der, need) {
+        return false;
+    }
+    // 注意切片第二个数是**长度**不是终点（踩坑 51/54）：写 `b.ptr[off: off+len]`
+    // 会从 off 起读 off+len 个字节 —— 读到库尾之外，解码器报 InvalidToken。
+    const src: &[byte] = b.ptr[off: len];
+    const dst: &[byte] = der.ptr[0: der.cap];
+    const got: !usize = decode_base64_mime(src, dst);
+    const n: usize = got catch {
+        return false;
+    };
+    der.len = n;
+    return n > 0;
+}
+
+// 系统库的**索引**：一次扫完，之后每次查找只看「候选那几张」。
+// 每条只记三样：正文在库文本里的偏移/长度、subject 名字的长度（做廉价预筛）。
+// 不记 subject 字节：真要比名字时把那一张解码出来解析一遍，比的是同一份 DER。
+export struct CcIdxEnt {
+    off: usize,
+    len: usize,
+    subj_len: usize,
+}
+
+export struct CcIdx {
+    n: usize,
+    items: [CcIdxEnt: CC_MAX_BUNDLE_CERTS],
+    ready: bool,
+    key_ptr: usize,
+    key_len: usize,
+}
+
+// 库索引（进程级缓存：同一份库只扫一次）
+var g_cc_idx: CcIdx = CcIdx{
+    n: 0,
+    items: [CcIdxEnt{ off: 0, len: 0, subj_len: 0 }: CC_MAX_BUNDLE_CERTS],
+    ready: false,
+    key_ptr: 0,
+    key_len: 0,
+};
+
+// 扫一遍库、建索引。返回 false = 库读不出证书（空库/格式全坏）。
+export fn cc_bundle_index(bundle: &const Buf, scratch: &Buf) bool {
+    const kp: usize = bundle.ptr as usize;
+    if g_cc_idx.ready && g_cc_idx.key_ptr == kp
+        && g_cc_idx.key_len == bundle.len {
+        return g_cc_idx.n > 0;
+    }
+    g_cc_idx.ready = false;
+    g_cc_idx.n = 0;
+    var pos: usize = 0;
+    while g_cc_idx.n < CC_MAX_BUNDLE_CERTS {
+        var off: usize = 0;
+        var len: usize = 0;
+        if !cc_pem_next(bundle, &pos, &off, &len) {
+            break;
+        }
+        if !cc_pem_decode(bundle, off, len, scratch) {
+            continue;
+        }
+        var cand: XmCert = xm_empty();
+        if !xm_parse(&cand, scratch.ptr, scratch.len) {
+            continue;
+        }
+        const k: usize = g_cc_idx.n;
+        g_cc_idx.items[k].off = off;
+        g_cc_idx.items[k].len = len;
+        g_cc_idx.items[k].subj_len = cand.subject_len;
+        g_cc_idx.n = g_cc_idx.n + 1;
+    }
+    g_cc_idx.key_ptr = kp;
+    g_cc_idx.key_len = bundle.len;
+    g_cc_idx.ready = true;
+    return g_cc_idx.n > 0;
+}
+
+// 握手消息流里的证书张数（Certificate 消息：3 字节列表长 + 每张 3 字节长度 + DER）
+export fn cc_flight_count(flight: &const byte, flen: usize) usize {
+    var off: usize = cc_flight_cert_body(flight, flen);
+    if off == 0 || off + 3 > flen {
+        return 0;
+    }
+    const list: usize = ((flight[off] as usize) << 16)
+        | ((flight[off + 1] as usize) << 8) | (flight[off + 2] as usize);
+    if list + 3 > flen - off {
+        return 0;
+    }
+    var p: usize = off + 3;
+    const end: usize = off + 3 + list;
+    var n: usize = 0;
+    while p + 3 <= end {
+        const cl: usize = ((flight[p] as usize) << 16)
+            | ((flight[p + 1] as usize) << 8) | (flight[p + 2] as usize);
+        if cl == 0 || p + 3 + cl > end {
+            break;
+        }
+        n = n + 1;
+        p = p + 3 + cl;
+    }
+    return n;
+}
+
+// Certificate 消息体的起点（type 11 = Certificate）。找不到返回 0。
+fn cc_flight_cert_body(flight: &const byte, flen: usize) usize {
+    var p: usize = 0;
+    while p + 4 <= flen {
+        const mtype: byte = flight[p];
+        const mlen: usize = ((flight[p + 1] as usize) << 16)
+            | ((flight[p + 2] as usize) << 8) | (flight[p + 3] as usize);
+        if p + 4 + mlen > flen {
+            return 0;
+        }
+        if mtype == (11 as byte) && mlen >= 3 {
+            return p + 4;
+        }
+        p = p + 4 + mlen;
+    }
+    return 0;
+}
+
+// 第 i 张证书的 DER 区间（i 从 0 = 叶子起）
+export fn cc_flight_cert(flight: &const byte, flen: usize, i: usize,
+    off: &usize, len: &usize) bool {
+    const body: usize = cc_flight_cert_body(flight, flen);
+    if body == 0 || body + 3 > flen {
+        return false;
+    }
+    const list: usize = ((flight[body] as usize) << 16)
+        | ((flight[body + 1] as usize) << 8) | (flight[body + 2] as usize);
+    if list + 3 > flen - body {
+        return false;
+    }
+    var p: usize = body + 3;
+    const end: usize = body + 3 + list;
+    var k: usize = 0;
+    while p + 3 <= end {
+        const cl: usize = ((flight[p] as usize) << 16)
+            | ((flight[p + 1] as usize) << 8) | (flight[p + 2] as usize);
+        if cl == 0 || p + 3 + cl > end {
+            return false;
+        }
+        if k == i {
+            off[0] = p + 3;
+            len[0] = cl;
+            return true;
+        }
+        k = k + 1;
+        p = p + 3 + cl;
+    }
+    return false;
+}
+
+// 这张证书是不是自签（issuer 名字 == subject 名字；只比名字，不验自签名）
+fn cc_self_issued(x: &const XmCert) bool {
+    if x.issuer_len == 0 || x.issuer_len != x.subject_len {
+        return false;
+    }
+    var i: usize = 0;
+    while i < x.issuer_len {
+        if x.der[x.issuer_off + i] != x.der[x.subject_off + i] {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+// 系统库里是否有**逐字节等于**这张 DER 的证书（自签根要靠它证明「这个根是被信任的」）
+fn cc_bundle_has_der(bundle: &const Buf, der: &const byte, der_len: usize,
+    scratch: &Buf) bool {
+    if !cc_bundle_index(bundle, scratch) {
+        return false;
+    }
+    // 预筛：PEM 正文长度与 DER 字节数是 4:3 的关系（差几个字节的填充/换行）
+    var i: usize = 0;
+    while i < g_cc_idx.n {
+        const bl: usize = g_cc_idx.items[i].len;
+        const est: usize = (bl / 4) * 3;
+        if est + 8 >= der_len && der_len + 8 >= est {
+            if cc_pem_decode(bundle, g_cc_idx.items[i].off, bl, scratch) {
+                if scratch.len == der_len
+                    && bufx_mem_eq(scratch.ptr, der, der_len) {
+                    return true;
+                }
+            }
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+// 在系统库里找 cur 的签发者，**从 from 起**找下一张候选（from = 上一张命中的序号 + 1）。
+// 为什么要能一张张试：同一个 issuer 名字在库里可能有不止一张（同名的新旧根、交叉签发
+// 副本），只试第一张会把「换过根、两张都还在」的正常站点判成链断。
+// 找到就把它的 DER 拷进 der_out 再解析进 out（**必须拷贝**：scratch 下一次解码就被
+// 覆盖，XmCert 里的指针会悬空）。
+fn cc_find_in_bundle(bundle: &const Buf, cur: &const XmCert, from: usize,
+    scratch: &Buf, der_out: &Buf, out: &XmCert, next: &usize) bool {
+    if !cc_bundle_index(bundle, scratch) {
+        return false;
+    }
+    var i: usize = from;
+    while i < g_cc_idx.n && i < CC_MAX_BUNDLE_CERTS {
+        // 名字长度不等就一定不是它 —— 这一条预筛把「每跳解析 150 张证书」降到 1–2 张
+        if g_cc_idx.items[i].subj_len == cur.issuer_len {
+            if cc_pem_decode(bundle, g_cc_idx.items[i].off,
+                g_cc_idx.items[i].len, scratch) {
+                buf_reset(der_out);
+                if !buf_append(der_out, scratch.ptr, scratch.len) {
+                    return false;
+                }
+                if xm_parse(out, der_out.ptr, der_out.len)
+                    && xm_issuer_is(cur, out) {
+                    next[0] = i + 1;
+                    return true;
+                }
+            }
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+// 从服务端发来的证书里找 cur 的签发者（i 从 1 起 —— 0 是叶子），同样从 from 起。
+fn cc_find_in_flight(c: &const CcIn, cur: &const XmCert, from: usize,
+    out: &XmCert, next: &usize) bool {
+    const cnt: usize = cc_flight_count(c.flight, c.flen);
+    var i: usize = from;
+    while i < cnt {
+        var off: usize = 0;
+        var len: usize = 0;
+        if cc_flight_cert(c.flight, c.flen, i, &off, &len)
+            && len <= CC_DER_MAX {
+            // 直接解析进 out：本语言不许把**循环里造的**结构体赋值移出去
+            // （「循环中的变量不能移动」），所以不经过临时变量。
+            if xm_parse(out, &c.flight[off], len)
+                && xm_issuer_is(cur, out) {
+                next[0] = i + 1;
+                return true;
+            }
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+// 父证书的「资格」检查：签名、有效期、CA 位、pathLen、keyCertSign、EKU。
+// ca_below = 这张父证书**之下**的非自签中间证书张数（叶子不算），由 cc_step 维护；
+// self-issued（交叉签发）副本不占 pathLen 名额，所以只在非自签时加一。
+fn cc_check_parent(cur: &const XmCert, parent: &const XmCert,
+    ca_below: usize, now: i64) i32 {
+    if !xm_signed_by(cur, parent) {
+        return cc_fail("签发者的签名验不过（链上有证书被换过，或算法不受支持）");
+    }
+    if !xm_time_valid(parent, now) {
+        return cc_fail("签发者证书不在有效期内");
+    }
+    if parent.ext_invalid {
+        return cc_fail("签发者证书含畸形或无法安全解析的扩展");
+    }
+    if !parent.has_basic || !parent.basic_critical || !parent.is_ca {
+        return cc_fail("签发者证书没有有效且 critical 的 basicConstraints CA:TRUE");
+    }
+    if parent.eku_seen && !parent.has_eku {
+        return cc_fail("签发者证书的 extendedKeyUsage 不允许 TLS serverAuth");
+    }
+    if parent.has_path_len && ca_below > (parent.max_path_len as usize) {
+        return cc_fail("签发者证书的 pathLenConstraint 不够长");
+    }
+    if parent.has_key_usage
+        && (parent.key_usage & CC_KU_KEY_CERT_SIGN) == (0 as u16) {
+        return cc_fail("签发者证书的 keyUsage 里没有 keyCertSign");
+    }
+    return CC_OK;
+}
+
+// 一个「槽」：一张解析好的证书 + 它 DER 的稳定副本。
+// 为什么要槽：XmCert 里的 issuer/subject/TBS 都是**指回 DER 的指针**，而系统库里那张
+// 证书的 DER 是从临时缓冲解出来的 —— 不拷一份，下一次解码就把它的 DER 覆盖掉，
+// 于是「验父证书的签名」会读到别人的字节。
+export struct CcSlot {
+    cert: XmCert,
+    der: Buf,
+}
+
+// 往上一跳。返回 2 = 父在系统库里（锚点，收工）、1 = 父是服务端发的（继续往上）、
+// 0 = 失败（原因已写进 cc_last_reason）。below 回填下一轮该用的 ca_below。
+fn cc_step(cur: &const XmCert, c: &const CcIn, ca_below: usize, now: i64,
+    scratch: &Buf, out: &CcSlot, below: &usize) i32 {
+    if cc_self_issued(cur) {
+        // 自签证书本身不构成信任：只有「这一份 DER 就在系统库里」才算
+        if cc_bundle_has_der(c.bundle, cur.der, cur.der_len, scratch) {
+            return 2;
+        }
+        return cc_fail("链顶是服务端自带的根证书，而它不在系统 CA 库里");
+    }
+    // 下一轮的口径：只有**非自签**的这张才占父证书的 pathLen 名额
+    if cc_self_issued(cur) {
+        below[0] = ca_below;
+    } else {
+        below[0] = ca_below + 1;
+    }
+    // ① 服务端自己发的中间证书：候选可能不止一张，逐张验到一张为止
+    var from: usize = 1;
+    var next: usize = 0;
+    var saw_root: bool = false;
+    // 「试过、但验不过」的那句原因要留住：逐张重试会把 cc_last_reason 反复覆盖，
+    // 最后往往会停在「找不到签发者」这种不含真实缘由的兜底话上 —— 用户就看不到
+    // 「签名验不过 / 不在有效期 / 没有 CA 位」这些真正要紧的原因。
+    var keep: Buf = buf_new(256);
+    defer { buf_free(&keep); }
+    var have_keep: bool = false;
+    while cc_find_in_flight(c, cur, from, &out.cert, &next) {
+        from = next;
+        if xm_self_signed(&out.cert) {
+            // 服务端自带的自签根不能当信任锚；它能否作为链上的一张，交给 ② 按
+            // 「库里有没有同一份 DER」判（那里也会验它的签名）。
+            saw_root = true;
+            continue;
+        }
+        if cc_check_parent(cur, &out.cert, ca_below, now) == CC_OK {
+            return 1;
+        }
+        if !have_keep {
+            if cc_keep_reason(&keep) {
+                have_keep = true;
+            }
+        }
+    }
+    // ② 系统库：名字对得上的可能有好几张，逐张试
+    from = 0;
+    while cc_find_in_bundle(c.bundle, cur, from, scratch, &out.der, &out.cert,
+        &next) {
+        from = next;
+        if cc_check_parent(cur, &out.cert, ca_below, now) == CC_OK {
+            return 2;
+        }
+        if !have_keep {
+            if cc_keep_reason(&keep) {
+                have_keep = true;
+            }
+        }
+    }
+    if have_keep {
+        cc_set_reason(keep.ptr, keep.len);
+        return CC_FAIL;
+    }
+    if saw_root {
+        return cc_fail("链顶是服务端自带的根证书，而它不在系统 CA 库里");
+    }
+    return cc_fail("链上找不到这张证书的签发者（服务端没发中间证书，系统库里也没有）");
+}
+
+// 把当前的失败原因抄进 keep（没有原因就返回 false）
+fn cc_keep_reason(keep: &Buf) bool {
+    const why: &[byte] = cc_last_reason();
+    if why.len == 0 || why.len > keep.cap {
+        return false;
+    }
+    buf_reset(keep);
+    return buf_append(keep, why.ptr, why.len);
+}
+
+// 入口：验一条握手拿到的链。host 是要连的那个主机名（叶子必须授权它）。
+// 返回 CC_OK / CC_FAIL / CC_UNSUPPORTED，失败原因用 cc_last_reason 取。
+export fn cc_verify(c: &const CcIn) i32 {
+    var off: usize = 0;
+    var len: usize = 0;
+    if !cc_flight_cert(c.flight, c.flen, 0, &off, &len) {
+        return cc_unsupported(
+            "握手消息里没有证书链（可能被中间设备改写了握手）");
+    }
+    if len > CC_DER_MAX {
+        return cc_unsupported("叶子证书超过 16 KB（握手缓冲装不下整条链）");
+    }
+    var leaf: XmCert = xm_empty();
+    if !xm_parse(&leaf, &c.flight[off], len) {
+        return cc_fail("叶子证书解析失败，或签名/公钥算法不受支持");
+    }
+    const now: i64 = xm_now();
+    if !xm_time_valid(&leaf, now) {
+        return cc_fail("叶子证书不在有效期内");
+    }
+    if leaf.ext_invalid || (leaf.has_basic && !leaf.basic_critical) {
+        return cc_fail("叶子证书含畸形扩展或非 critical basicConstraints");
+    }
+    if leaf.eku_seen && !leaf.has_eku {
+        return cc_fail("叶子证书的 extendedKeyUsage 不允许 TLS serverAuth");
+    }
+    if !leaf.san_seen {
+        return cc_fail("叶子证书的 SAN 扩展畸形或超出实现上限");
+    }
+    if !xm_host_match(&leaf, c.host, c.host_len) {
+        return cc_fail("叶子证书的 SAN 里没有这个主机名");
+    }
+    var scratch: Buf = buf_new(CC_DER_MAX);
+    defer { buf_free(&scratch); }
+    // 两个槽交替：验证的是 A 里的证书，父写进 B，下一轮反过来 —— 这样「当前证书的 DER」
+    // 在整个校验期间都不会被覆盖。
+    var sa: CcSlot = CcSlot{ cert: leaf, der: buf_new(CC_DER_MAX) };
+    defer { buf_free(&sa.der); }
+    var sb: CcSlot = CcSlot{ cert: xm_empty(), der: buf_new(CC_DER_MAX) };
+    defer { buf_free(&sb.der); }
+    var use_b: bool = true;
+    var ca_below: usize = 0;
+    var below: usize = 0;
+    var depth: usize = 0;
+    while depth < CC_MAX_DEPTH {
+        var r: i32 = 0;
+        if use_b {
+            r = cc_step(&sa.cert, c, ca_below, now, &scratch, &sb, &below);
+        } else {
+            r = cc_step(&sb.cert, c, ca_below, now, &scratch, &sa, &below);
+        }
+        if r == 0 {
+            return CC_FAIL;
+        }
+        if r == 2 {
+            cc_set_reason("", 0);      // 成功：把上一次失败的原因清掉
+            return CC_OK;
+        }
+        use_b = !use_b;
+        ca_below = below;
+        depth = depth + 1;
+    }
+    return cc_fail("证书链超过 8 跳（不像正常站点，拒绝）");
+}
