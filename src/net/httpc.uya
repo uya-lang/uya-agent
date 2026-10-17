@@ -116,8 +116,16 @@ const TP_VERDICT_UNPINNED: i32 = 0;   // 没配指纹库：不判据（等价 no
 const TP_VERDICT_TRUSTED: i32 = 1;    // 库里有这台主机且指纹相符
 const TP_VERDICT_MISMATCH: i32 = 2;   // 库里有这台主机但指纹不符
 const TP_VERDICT_FRESH: i32 = 3;      // 首次见到（已记录）
+// 库里有这台主机、指纹不符，但这次的新证书**过了发证机构校验**，于是追加一条并放行
+// （P92「证书轮换」；开关见 hc_tofu_learn）
+const TP_VERDICT_LEARNED: i32 = 4;
 var hc_tofu_enabled: bool = false;
 var hc_tofu_path: Buf = Buf{ ptr: null, len: 0, cap: 0 };
+// 学习开关（默认开：这就是 P92 要的行为；关掉 = 逐字节回到「证书一变就拒」）
+var hc_tofu_learn: bool = true;
+// 发证机构校验要用的系统 CA 库（懒加载：第一次真需要时才整份读进来）
+var hc_chain_bundle: Buf = Buf{ ptr: null, len: 0, cap: 0 };
+var hc_chain_bundle_tried: bool = false;
 
 // 钉住指纹库路径（C 串，调用方保证 NUL 结尾）。空串 = 关掉记录能力。
 export fn hc_set_tofu_path(path: &const byte) bool {
@@ -149,6 +157,91 @@ export fn hc_tofu_path_now() &[byte] {
         return hc_tofu_path.ptr[0: hc_tofu_path.len - 1];
     }
     return hc_tofu_path.ptr[0: hc_tofu_path.len];
+}
+
+// 开/关「新证书过发证机构校验就学进库」（P92）。默认开。
+export fn hc_set_tofu_learn(on: bool) void {
+    hc_tofu_learn = on;
+}
+
+// 现在开着没有（--print-config 与自测读它）
+export fn hc_tofu_learn_now() bool {
+    return hc_tofu_learn;
+}
+
+// 钉住系统 CA 库的路径（C 串）。不钉 = 让 net/cachain 按 SSL_CERT_FILE 与常见位置自己找。
+export fn hc_set_chain_bundle(path: &const byte) bool {
+    buf_free(&hc_chain_bundle);
+    hc_chain_bundle_tried = false;
+    if (path as usize) == 0 || bufx_cstr_len(path) == 0 {
+        return false;
+    }
+    hc_chain_bundle = buf_new(bufx_cstr_len(path) + 8);
+    if !buf_append_cstr_z(&hc_chain_bundle, path) {
+        buf_free(&hc_chain_bundle);
+        return false;
+    }
+    return true;
+}
+
+// 系统 CA 库（整份文本）。第一次调用才读盘；读不到就返回空 Buf（此时链校验一律报
+// 「拿不到可信库」，绝不静默放行）。
+fn tls_tofu_bundle() &[byte] {
+    if hc_chain_bundle_tried {
+        return hc_chain_bundle.ptr[0: hc_chain_bundle.len];
+    }
+    hc_chain_bundle_tried = true;
+    var path: Buf = buf_new(512);
+    defer { buf_free(&path); }
+    if hc_chain_bundle.len > 0 {
+        // 调用方钉过路径：照它读（$UYA_AGENT_CA_BUNDLE / --ca-bundle 的落点）。
+        // **必须补一个 NUL**：`cc_bundle_load` 里是 `sys_open(path as *const byte)`，
+        // 吃的是 C 串语义；少了这个字节，打开的是缓冲后面那段垃圾（症状是「明明有库，
+        // 却说拿不到可信库」—— 与 selftest 里拼夹具路径踩的是同一个坑）。
+        if !buf_append(&path, hc_chain_bundle.ptr, hc_chain_bundle.len - 1) {
+            return hc_chain_bundle.ptr[0: 0];
+        }
+        if !buf_append_byte(&path, 0) {
+            return hc_chain_bundle.ptr[0: 0];
+        }
+    } else if !cc_bundle_path(&path) {
+        return hc_chain_bundle.ptr[0: 0];
+    }
+    var loaded: Buf = buf_new(CC_BUNDLE_MAX);
+    const ok: bool = cc_bundle_load(path.ptr as &const byte, &loaded);
+    buf_free(&hc_chain_bundle);
+    hc_chain_bundle = loaded;
+    if !ok {
+        buf_free(&hc_chain_bundle);
+        hc_chain_bundle = buf_new(8);
+    }
+    return hc_chain_bundle.ptr[0: hc_chain_bundle.len];
+}
+
+// 发证机构校验：把这次握手的整条链交给 net/cachain 验一遍。返回 CC_OK / CC_FAIL /
+// CC_UNSUPPORTED（-1 表示做不了：没库、算法不支持、握手缓冲截断 ⇒ 一律当「没验过」）。
+fn tls_tofu_ca_check(
+    c: &const TlsConn,
+    host: &const byte,
+    host_len: usize
+) i32 {
+    const b: &[byte] = tls_tofu_bundle();
+    if b.len == 0 {
+        // 这条原因含中文：长度是**字节**数（54），手数容易错 —— 自测里有对它的断言
+        // 行宽豁免：一条不可断的报错文案（含中文），拆行反而看不出原句
+        const no_ca: &const byte = "这台机器上没有可用的系统 CA 库（装 ca-certificates，或用 --ca-bundle 指定）";
+        cc_set_reason(no_ca, 54);
+        return CC_UNSUPPORTED;
+    }
+    var bundle: Buf = Buf{ ptr: b.ptr, len: b.len, cap: b.len };
+    var in: CcIn = CcIn{
+        flight: &c.hs.server_flight_msg[0],
+        flen: c.hs.server_flight_msg_len,
+        host: host,
+        host_len: host_len,
+        bundle: &bundle,
+    };
+    return cc_verify(&in);
 }
 
 // ============================================================
@@ -1229,20 +1322,55 @@ export fn tls_open(c: &TlsConn, host: &const byte, host_len: usize, verify: i32,
 
 // TOFU 的判定与落盘：库里有这台主机 …
 //   * 指纹相符 ⇒ 通过（verified = true）；
-//   * 指纹不符 ⇒ `HcPinMismatch`（**注意这是真的变了**，与「首次见到」是两回事）；
+//   * 指纹不符 ⇒ 先做**发证机构校验**（P92）：过了就把这次的新指纹追加进库并放行
+//     （LEARNED），没过才是 `HcPinMismatch`（**注意这是真的变了**，与「首次见到」是两回事）；
 //   * 没有这台主机 ⇒ 记下这一条再放行（verified = false：本次没有任何**先验**可比对，
 //     如实记账，别把「首次」算成「验过」）。
 //
 // 为什么首次也要看**主机**而不只是写一行：TOFU 的价值全在第二次连接上，所以查找必须
 // 能在库里找到上一次写的那行 —— 主机名比对大小写无关（tp_host_eq），指纹比对折叠小写。
 fn tls_tofu_decide(c: &TlsConn, host: &const byte, host_len: usize) !void {
-    const r: i32 = tls_tofu_verdict(
+    var r: i32 = tls_tofu_verdict(
         host, host_len, &c.observed[0], c.observed_len);
-    c.verified = r == TP_VERDICT_TRUSTED;
+    if r == TP_VERDICT_MISMATCH && hc_tofu_learn {
+        // 多证书站点（轮换 / 多机房）在这条路上：只有**链能验到系统根**才算新证书可信
+        const ca: i32 = tls_tofu_ca_check(c, host, host_len);
+        if ca == CC_OK {
+            r = tls_tofu_learn(host, host_len, &c.observed[0], c.observed_len);
+        }
+    }
+    c.verified = r == TP_VERDICT_TRUSTED || r == TP_VERDICT_LEARNED;
     if r == TP_VERDICT_MISMATCH {
         return error.HcPinMismatch;
     }
     return;
+}
+
+// 「学一条新指纹」：库里有这台主机但指纹没记过，且链校验已过 ⇒ 追加一行
+// （库是**只追加**的：上限 TP_MAX_PER_HOST 到了就不再追加，但仍然放行 —— 判据是
+// 「这张证书可不可信」，不是「能不能记账」）。
+// 返回 TP_VERDICT_LEARNED（学成了；或已满上限但链验过）/ MISMATCH（学习关着）。
+export fn tls_tofu_learn(
+    host: &const byte,
+    host_len: usize,
+    hex: &const byte,
+    hex_len: usize
+) i32 {
+    if !hc_tofu_learn {
+        return TP_VERDICT_MISMATCH;
+    }
+    if !hc_tofu_enabled {
+        return TP_VERDICT_MISMATCH;      // 没有库路径：不记账也不放行（失败要显式）
+    }
+    var store: TpStore = tp_empty();
+    defer { tp_free(&store); }
+    tls_tofu_load(&store);
+    const have: usize = tp_count_host(&store, host, host_len);
+    if have >= TP_MAX_PER_HOST || store.n >= TP_MAX_ENTRIES {
+        return TP_VERDICT_LEARNED;       // 满了：不追加（库只追加，不淘汰），链验过就放行
+    }
+    _ = tls_tofu_append(host, host_len, hex);
+    return TP_VERDICT_LEARNED;
 }
 
 // TOFU 的**判据本体**（不含 TlsConn，因而离线可测）：返回三态结论。

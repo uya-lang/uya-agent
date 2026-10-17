@@ -1,0 +1,595 @@
+// src/net/rsav.uya — RSA 验签专用的大数（u32 limb + Montgomery CIOS）
+//
+// 本文件：定长大数 RvNum（130 个 u32 limb = 4160 位）与它的纯函数：大端字节串互转
+//   （rv_from_be / rv_to_be / rv_cmp）、Montgomery 上下文（RvMont + rv_mont_init）、
+//   CIOS 乘法（rv_mont_mul）、模幂（rv_modexp），以及验签入口 rv_verify_pkcs1
+//   （PKCS#1 v1.5 的 DigestInfo 逐字节比对）。
+// 不变量：① 只做**公钥**运算（验签），没有私钥路径，因此不做常数时间处理（也没有秘密
+//   要保护）；② limb 以 u32 为基、小端（l[0] 是最低位）；③ CIOS 的中间量必须塞进 u64
+//   —— 单步上界 (2^32-1)^2 + (2^32-1) + (2^32-1) = 2^64-1，正好不溢出（这也是本文件
+//   不用 u128 的原因：语言里没有 u128）；④ 任何畸形输入（模数为偶、长度不符、签名
+//   ≥ 模数、指数为空、签名长度与模数不等）一律返回 false，绝不 panic、也绝不「差不多
+//   算出来」；⑤ 所有对**内嵌数组**的读写都经 rv_get/rv_put/rv_tget/rv_tput ——
+//   检查器要能证明下标 < 长度，裸写 `a.l[i]` 在 i 是运行时值时会被判「安全证明失败」。
+// 依赖：std.mem（mem_set/mem_copy）。**不依赖 lib/tls** —— 标准库的 mpi 用 64 位 limb，
+//   两个 2048 位数相乘要 64 个 limb 而守卫写死 32（DESIGN §18 第 3 条），所以只能自己写。
+// 命名：类型 `RvNum`/`RvMont`，函数 `rv_*`，常量 `RV_*`。
+
+use libc.syscall;
+use std.mem.mem.mem_set;
+
+// 130 × 32 = 4160 位（RSA-4096 是 4096 位，多留 2 个 limb 给倍增/回绕的余量）
+export const RV_LIMBS: usize = 130;
+// 一次能装下的最大字节数（大端序列化用）
+export const RV_MAX_BYTES: usize = RV_LIMBS * 4;
+// CIOS 的工作缓冲比数本身多 2 个 limb（t[n] 与 t[n+1] 都要写得下）
+const RV_T_LIMBS: usize = RV_LIMBS + 2;
+
+// PKCS#1 v1.5 里 DigestInfo 摘要算法编号（不是 OID，是本文件自己的枚举）
+export const RV_ALG_SHA256: u8 = 1;
+export const RV_ALG_SHA384: u8 = 2;
+
+// SHA-256 的 DigestInfo 前缀：SEQUENCE{ SEQUENCE{ OID 2.16.840.1.101.3.4.2.1,
+// NULL }, OCTET STRING } —— 后接 32 字节摘要
+const RV_DI_SHA256: [byte: 19] = [0x30, 0x31, 0x30, 0x0d, 0x06, 0x09, 0x60,
+    0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01, 0x05, 0x00, 0x04, 0x20];
+// SHA-384 的 DigestInfo 前缀（OID 尾部是 02，长度字段跟着变）
+const RV_DI_SHA384: [byte: 19] = [0x30, 0x41, 0x30, 0x0d, 0x06, 0x09, 0x60,
+    0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x02, 0x05, 0x00, 0x04, 0x30];
+
+// 定长大数：l[0] 是最低位 limb，n 是有效 limb 数（0 = 数值零）
+export struct RvNum {
+    l: [u32: RV_LIMBS],
+    n: usize,
+}
+
+// Montgomery 上下文：模数、-N^{-1} mod 2^32、R^2 mod N、参与运算的 limb 数
+export struct RvMont {
+    n: RvNum,
+    rr: RvNum,
+    n0inv: u32,
+    nl: usize,
+}
+
+// CIOS 工作缓冲按线程隔离。TLS 请求通常单线程，但共享静态会让并发请求互相覆盖
+// 中间积，导致错误签名偶发通过/失败；每个线程一次复用 4 KB，避免每个平方都清栈数组。
+struct RvWork { t: [u32: RV_T_LIMBS] }
+var g_rv_work: [RvWork: 64] = [RvWork{ t: [0: RV_T_LIMBS] }: 64];
+var g_rv_work_mutex: pthread_mutex_t = pthread_mutex_t{
+    state: 0, owner: 0, type: PTHREAD_MUTEX_RECURSIVE };
+
+// 线程槽：本实现最多支持 64 个并发线程，超限时验证失败（fail-closed）。
+fn rv_thread_slot() usize {
+    const tid: i32 = sys_gettid() catch |err| { _ = err; 0; };
+    if tid <= 0 { return 64; }
+    return (tid as usize) % (64 as usize);
+}
+
+// u64 → u32 的截断（本语言里窄化转换是 `as!`，它返回 `!T`，所以统一在这里收口）
+fn rv_u32(v: u64) u32 {
+    const r: u32 = v as! u32 catch { 0 as u32; };
+    return r;
+}
+
+// usize → i32（移位量要 i32；调用方都是小数值）
+fn rv_i32(v: usize) i32 {
+    const r: i32 = v as! i32 catch { 0 as i32; };
+    return r;
+}
+
+// i32 → usize（只用于循环下标，调用方保证非负）
+fn rv_usize(v: i32) usize {
+    const r: usize = v as! usize catch { 0 as usize; };
+    return r;
+}
+
+// 零值
+export fn rv_zero() RvNum {
+    return RvNum{ l: [0: RV_LIMBS], n: 0 };
+}
+
+// 取第 i 个 limb（越界一律 0 —— CIOS 里两个操作数可能比模数短）
+fn rv_get(a: &const RvNum, i: usize) u32 {
+    if i < @len(a.l) {
+        return a.l[i];
+    }
+    return 0 as u32;
+}
+
+// 写第 i 个 limb（越界丢弃；调用方都先判过长度）
+fn rv_put(a: &RvNum, i: usize, v: u32) void {
+    if i < @len(a.l) {
+        a.l[i] = v;
+    }
+}
+
+// 单个全局工作区 + 递归 mutex。外层模幂持锁直到最后一次平方，嵌套 mont_mul 可递归
+// 获取；不会被另一个线程覆盖（返回 null 表示 lock 失败，调用方 fail-closed）。
+var g_rv_locked: bool = false;
+
+// 取全局 CIOS 工作区的锁（取不到 ⇒ 调用方 fail-closed）
+fn rv_work_lock() bool {
+    if pthread_mutex_lock(&g_rv_work_mutex) != 0 { return false; }
+    g_rv_locked = true;
+    return true;
+}
+
+// 放锁（只有真锁住过才解，重复调用安全）
+fn rv_work_unlock() void {
+    if g_rv_locked {
+        g_rv_locked = false;
+        _ = pthread_mutex_unlock(&g_rv_work_mutex);
+    }
+}
+
+// 当前互斥工作区
+fn rv_work_ptr() &RvWork {
+    return &g_rv_work[0];
+}
+
+// CIOS 工作缓冲读（越界一律 0）
+fn rv_tget(w: &const RvWork, i: usize) u32 {
+    if i < @len(w.t) { return w.t[i]; }
+    return 0 as u32;
+}
+
+// CIOS 工作缓冲写（越界丢弃）
+fn rv_tput(w: &RvWork, i: usize, v: u32) void {
+    if i < @len(w.t) { w.t[i] = v; }
+}
+
+// 只清当前线程的工作区
+fn rv_tzero(w: &RvWork) void {
+    _ = mem_set(&w.t[0] as &byte, 0, RV_T_LIMBS * 4);
+}
+
+// 整体清零（`n` 也归零）—— 所有「重置这块数」的地方都走它
+fn rv_clear(a: &RvNum) void {
+    _ = mem_set(&a.l[0] as &byte, 0, RV_LIMBS * 4);
+    a.n = 0;
+}
+
+// 把 src 复制进 dst（高位清零，`n` 一起带走）
+fn rv_copy(dst: &RvNum, src: &const RvNum) void {
+    rv_clear(dst);
+    var i: usize = 0;
+    while i < src.n && i < @len(dst.l) {
+        dst.l[i] = src.l[i];
+        i = i + 1;
+    }
+    dst.n = i;
+    rv_trim(dst);
+}
+
+// 去掉高位那些为 0 的 limb（所有写操作之后都要过一遍，`n` 才是数值的真长度）
+fn rv_trim(a: &RvNum) void {
+    while a.n > 0 && a.n <= @len(a.l) && rv_get(a, a.n - 1) == (0 as u32) {
+        a.n = a.n - 1;
+    }
+}
+
+// 从大端字节串读入（跳过前导 0；超过容量 ⇒ false）。
+// 注意 `n` 必须按**去掉前导 0 之后**的字节数折算 limb 数：DER 里的 INTEGER 为表示正数
+// 会多带一个 0x00，2048 位模数因此是 513 字节 —— 若按 513 算就是 129 个 limb，而数值
+// 其实只占 64 个，后续 rv_cmp 先比 n，结论会全错（这条在自测的 RSA-2048 向量上抓到过）。
+export fn rv_from_be(a: &RvNum, p: &const byte, n: usize) bool {
+    if n > RV_MAX_BYTES {
+        return false;
+    }
+    rv_clear(a);
+    var start: usize = 0;
+    while start < n && p[start] == (0 as byte) {
+        start = start + 1;
+    }
+    const m: usize = n - start;
+    var i: usize = 0;
+    while i < m {
+        const li: usize = i / 4;
+        const w: u32 = (p[n - 1 - i] as u32) << rv_i32((i % (4 as usize)) * 8);
+        rv_put(a, li, rv_get(a, li) | w);
+        i = i + 1;
+    }
+    a.n = (m + 3) / 4;
+    rv_trim(a);
+    return true;
+}
+
+// 写成**定长**大端字节串（out_len 是模数字节数；装不下 ⇒ false）。
+// 判「装得下」按**有效字节数**而不是 limb 数：模数去掉前导 0 之后可能只有 255 字节
+// （2047 位），而 limb 数是 64 → 若按 limbs*4 判就会把合法结果判成装不下。
+export fn rv_to_be(v: &const RvNum, out: &byte, out_len: usize) bool {
+    const need: usize = (rv_bit_len(v) + 7) / 8;
+    if need > out_len || out_len > RV_MAX_BYTES {
+        return false;
+    }
+    var i: usize = 0;
+    while i < out_len {
+        const w: u32 = rv_get(v, i / 4);
+        const sh: i32 = rv_i32((i % (4 as usize)) * 8);
+        out[out_len - 1 - i] = (w >> sh) as! byte catch { 0 as byte; };
+        i = i + 1;
+    }
+    return true;
+}
+
+// 比较：a<b 返回 -1，相等 0，a>b 返回 1
+export fn rv_cmp(a: &const RvNum, b: &const RvNum) i32 {
+    if a.n != b.n {
+        if a.n < b.n {
+            return -1;
+        }
+        return 1;
+    }
+    if a.n == 0 {
+        return 0;
+    }
+    var i: usize = a.n;
+    while i > 0 {
+        i = i - 1;
+        const x: u32 = rv_get(a, i);
+        const y: u32 = rv_get(b, i);
+        if x != y {
+            if x < y {
+                return -1;
+            }
+            return 1;
+        }
+    }
+    return 0;
+}
+
+// a -= b（要求 a >= b；无符号回绕正是这里要的减法性质）
+fn rv_sub_in_place(a: &RvNum, b: &const RvNum) void {
+    var borrow: u64 = 0;
+    var i: usize = 0;
+    while i < a.n && i < @len(a.l) {
+        const av: u64 = a.l[i] as u64;
+        const bv: u64 = (rv_get(b, i) as u64) + borrow;
+        a.l[i] = rv_u32(av - bv);
+        if av < bv {
+            borrow = 1;
+        } else {
+            borrow = 0;
+        }
+        i = i + 1;
+    }
+    rv_trim(a);
+}
+
+// a <<= 1，返回移出最高位的那个位（0/1）；有多余 limb 时顺手把进位装进去
+fn rv_shl1(a: &RvNum) u32 {
+    var carry: u32 = 0 as u32;
+    var i: usize = 0;
+    while i < a.n && i < @len(a.l) {
+        const v: u32 = a.l[i];
+        a.l[i] = (v << (1 as i32)) | carry;
+        carry = v >> (31 as i32);
+        i = i + 1;
+    }
+    if carry != (0 as u32) && a.n < @len(a.l) {
+        a.l[a.n] = carry;
+        a.n = a.n + 1;
+    }
+    return carry;
+}
+
+// x = 2x mod m（调用约定：x < m；m 至少给倍增留了一个 limb 的余量）
+fn rv_dbl_mod(x: &RvNum, m: &const RvNum) void {
+    _ = rv_shl1(x);
+    if rv_cmp(x, m) >= 0 {
+        rv_sub_in_place(x, m);
+    }
+}
+
+// 位长（数值为 0 ⇒ 0）
+export fn rv_bit_len(a: &const RvNum) usize {
+    if a.n == 0 {
+        return 0;
+    }
+    var bits: usize = (a.n - 1) * 32;
+    var w: u32 = rv_get(a, a.n - 1);
+    while w != (0 as u32) {
+        bits = bits + 1;
+        w = w >> (1 as i32);
+    }
+    return bits;
+}
+
+// 取第 i 位（i 是**低位起**的位号）
+export fn rv_bit(a: &const RvNum, i: usize) bool {
+    const li: usize = i / 32;
+    if li >= a.n {
+        return false;
+    }
+    const sh: i32 = rv_i32(i % (32 as usize));
+    return ((rv_get(a, li) >> sh) & (1 as u32)) != (0 as u32);
+}
+
+// 初始化 Montgomery 上下文：算出 n0inv = -N^{-1} mod 2^32 与 rr = R^2 mod N。
+// 返回 false = 模数为 0/偶数/太大（偶数模数在 Montgomery 里无解，直接拒）
+export fn rv_mont_init(mt: &RvMont, mdl: &const RvNum) bool {
+    if mdl.n == 0 || mdl.n + 2 > RV_LIMBS {
+        return false;
+    }
+    if (mdl.l[0] & (1 as u32)) == (0 as u32) {
+        return false;
+    }
+    rv_copy(&mt.n, mdl);
+    mt.nl = mdl.n;
+    // Newton 迭代把有效位数翻倍：1 → 2 → 4 → 8 → 16 → 32 位
+    var inv: u32 = 1 as u32;
+    var k: i32 = 0;
+    while k < 5 {
+        const t: u32 = (2 as u32) - (mdl.l[0] * inv);   // 回绕即「模 2^32」
+        inv = inv * t;
+        k = k + 1;
+    }
+    mt.n0inv = (0 as u32) - inv;
+    // rr = 2^(64*nl) mod N：从 1 出发倍增 64*nl 次（每次保持 x < N，倍增后再减）
+    var x: RvNum = rv_zero();
+    x.l[0] = 1 as u32;
+    x.n = 1;
+    var s: usize = 0;
+    while s < 64 * mdl.n {
+        rv_dbl_mod(&x, mdl);
+        s = s + 1;
+    }
+    rv_copy(&mt.rr, &x);
+    return true;
+}
+
+// CIOS 的第 i 轮：t += a*b[i]，再左移一格（右移掉的低位由 m*N 抵消）。
+fn rv_cios_step(a: &const RvNum, b: &const RvNum, i: usize,
+    mt: &const RvMont, w: &RvWork) bool {
+    const n: usize = mt.nl;
+    if n + 2 > RV_T_LIMBS || i >= n {
+        return false;
+    }
+    const bi: u64 = rv_get(b, i) as u64;
+    var c: u64 = 0;
+    var j: usize = 0;
+    while j < n {
+        const s: u64 = (rv_tget(w, j) as u64)
+            + ((rv_get(a, j) as u64) * bi) + c;
+        rv_tput(w, j, rv_u32(s));
+        c = s >> (32 as i32);
+        j = j + 1;
+    }
+    const s2: u64 = (rv_tget(w, n) as u64) + c;
+    rv_tput(w, n, rv_u32(s2));
+    rv_tput(w, n + 1, rv_u32(s2 >> (32 as i32)));
+    // m = t[0] * n0inv mod 2^32：加 m*N 让最低 limb 归零，再把整条右移一格
+    const ml: u32 = rv_u32((rv_tget(w, 0) as u64) * (mt.n0inv as u64));
+    var c2: u64 = 0;
+    var k: usize = 0;
+    while k < n {
+        const s3: u64 = (rv_tget(w, k) as u64)
+            + ((ml as u64) * (rv_get(&mt.n, k) as u64)) + c2;
+        if k > 0 {
+            rv_tput(w, k - 1, rv_u32(s3));
+        }
+        c2 = s3 >> (32 as i32);
+        k = k + 1;
+    }
+    const s4: u64 = (rv_tget(w, n) as u64) + c2;
+    rv_tput(w, n - 1, rv_u32(s4));
+    rv_tput(w, n, rv_u32((rv_tget(w, n + 1) as u64) + (s4 >> (32 as i32))));
+    return true;
+}
+
+// out = a * b * R^{-1} mod N（R = 2^(32*nl)）。out 可以与 a/b 同一块内存。
+fn rv_mont_mul_inner(
+    out: &RvNum,
+    a: &const RvNum,
+    b: &const RvNum,
+    mt: &const RvMont,
+    w: &RvWork
+) bool {
+    const n: usize = mt.nl;
+    if n == 0 || n + 2 > RV_T_LIMBS { return false; }
+    rv_tzero(w);
+    var i: usize = 0;
+    while i < n {
+        if !rv_cios_step(a, b, i, mt, w) {
+            return false;
+        }
+        i = i + 1;
+    }
+    // 收尾：t 比结果多一个 limb，t[n] 可能是 1（也就是结果 ≥ 2^(32n)）。**丢了它就会漏掉
+    // 那次条件减法** —— 症状是「小指数对、大指数错」：值大起来 t[n] 才变 1，而按低 n 个
+    // limb 去和模数比大小会判成「比模数小」，于是减不掉 N，结果整体多一个 2^(32n)。
+    // 自测里 RSA-2048 的模块幂就是这么错的（先对小 case 全绿，指数一大就全错）。
+    const hi: u32 = rv_tget(w, n);
+    rv_clear(out);
+    var k: usize = 0;
+    while k < n {
+        out.l[k] = rv_tget(w, k);
+        k = k + 1;
+    }
+    out.n = n;
+    rv_trim(out);
+    if hi != (0 as u32) || rv_cmp(out, &mt.n) >= 0 {
+        rv_sub_in_place(out, &mt.n);
+    }
+    return true;
+}
+
+// 单次 Montgomery 乘法也持锁，避免与并发模幂共享工作缓冲。
+export fn rv_mont_mul(
+    out: &RvNum,
+    a: &const RvNum,
+    b: &const RvNum,
+    mt: &const RvMont
+) bool {
+    if !rv_work_lock() { return false; }
+    defer { rv_work_unlock(); }
+    const w: &RvWork = rv_work_ptr();
+    return rv_mont_mul_inner(out, a, b, mt, w);
+}
+
+// out = base^exp mod N（Montgomery 下的平方-乘；exp 为 0 ⇒ false）
+export fn rv_modexp(
+    out: &RvNum,
+    base: &const RvNum,
+    exp: &const RvNum,
+    mt: &RvMont
+) bool {
+    if !rv_work_lock() { return false; }
+    defer { rv_work_unlock(); }
+    const bits: usize = rv_bit_len(exp);
+    if bits == 0 {
+        return false;
+    }
+    if rv_cmp(base, &mt.n) >= 0 {
+        return false;
+    }
+    var one: RvNum = rv_zero();
+    one.l[0] = 1 as u32;
+    one.n = 1;
+    var acc: RvNum = rv_zero();
+    var bm: RvNum = rv_zero();
+    const w: &RvWork = rv_work_ptr();
+    if !rv_mont_mul_inner(&acc, &one, &mt.rr, mt, w) {
+        return false;
+    }
+    if !rv_mont_mul_inner(&bm, base, &mt.rr, mt, w) {
+        return false;
+    }
+    var i: usize = bits;
+    while i > 0 {
+        i = i - 1;
+        if !rv_mont_mul_inner(&acc, &acc, &acc, mt, w) {
+            return false;
+        }
+        if rv_bit(exp, i) {
+            if !rv_mont_mul_inner(&acc, &acc, &bm, mt, w) {
+                return false;
+            }
+        }
+    }
+    return rv_mont_mul_inner(out, &acc, &one, mt, w);
+}
+
+// em 的 [off, off+n) 是否与 pref 逐字节相同
+fn rv_di_eq(em: &const byte, off: usize, pref: &const byte, n: usize) bool {
+    var i: usize = 0;
+    while i < n {
+        if em[off + i] != pref[i] {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+// 按 RFC 8017 §9.2 检查 EM（EM = 00 || 01 || PS(≥8 个 FF) || 00 || DigestInfo）
+fn rv_check_em(
+    em: &const byte,
+    em_len: usize,
+    alg: u8,
+    hash: &const byte,
+    hash_len: usize
+) bool {
+    var hash_want: usize = 32;
+    if alg == RV_ALG_SHA384 {
+        hash_want = 48;
+    } else if alg != RV_ALG_SHA256 {
+        return false;
+    }
+    if hash_len != hash_want || em_len < 3 + 8 + 19 + hash_len {
+        return false;
+    }
+    if em[0] != (0 as byte) || em[1] != (1 as byte) {
+        return false;
+    }
+    var i: usize = 2;
+    while i < em_len && em[i] == (255 as byte) {
+        i = i + 1;
+    }
+    if i - 2 < 8 {
+        return false;              // PS 至少 8 字节 0xFF，否则就是伪造的填充
+    }
+    if i >= em_len || em[i] != (0 as byte) {
+        return false;
+    }
+    i = i + 1;
+    if i + 19 + hash_len != em_len {
+        return false;
+    }
+    var ok: bool = false;
+    if alg == RV_ALG_SHA256 {
+        ok = rv_di_eq(em, i, &RV_DI_SHA256[0], 19);
+    } else {
+        ok = rv_di_eq(em, i, &RV_DI_SHA384[0], 19);
+    }
+    if !ok {
+        return false;
+    }
+    i = i + 19;
+    var k: usize = 0;
+    while k < hash_len {
+        if em[i + k] != hash[k] {
+            return false;
+        }
+        k = k + 1;
+    }
+    return true;
+}
+
+// 验一张证书的签名：用 `n`/`e` 解出 EM，再与 `hash` 的 DigestInfo 比对。
+// 返回 false = 签名不合法、或参数畸形（长度不符/签名越界/模数为偶）。
+export fn rv_verify_pkcs1(
+    alg: u8,
+    n: &const byte,
+    n_len: usize,
+    e: &const byte,
+    e_len: usize,
+    sig: &const byte,
+    sig_len: usize,
+    hash: &const byte,
+    hash_len: usize
+) bool {
+    if n_len == 0 || n_len > RV_MAX_BYTES || e_len == 0 || e_len > 8 {
+        return false;
+    }
+    // DER 里的 INTEGER 为表示正数会多带一个 0x00（2048 位模数因此是 513 字节），而签名
+    // 长度严格等于模数的**有效**字节数 —— 所以先跳过 n 的前导 0 再比长度，否则合法的
+    // 签名会被长度判据直接挡掉（自测的 RSA-2048 向量就是这么红的）。
+    var nstart: usize = 0;
+    while nstart < n_len && n[nstart] == (0 as byte) {
+        nstart = nstart + 1;
+    }
+    const nl: usize = n_len - nstart;
+    if nl == 0 || sig_len != nl {
+        return false;
+    }
+    var nnum: RvNum = rv_zero();
+    if !rv_from_be(&nnum, n, n_len) {
+        return false;
+    }
+    var mt: RvMont = RvMont{ n: rv_zero(), rr: rv_zero(),
+        n0inv: 0 as u32, nl: 0 };
+    if !rv_mont_init(&mt, &nnum) {
+        return false;
+    }
+    var s: RvNum = rv_zero();
+    if !rv_from_be(&s, sig, sig_len) {
+        return false;
+    }
+    if rv_cmp(&s, &nnum) >= 0 {
+        return false;
+    }
+    var e2: RvNum = rv_zero();
+    if !rv_from_be(&e2, e, e_len) {
+        return false;
+    }
+    var m: RvNum = rv_zero();
+    if !rv_modexp(&m, &s, &e2, &mt) {
+        return false;
+    }
+    var em: [byte: RV_MAX_BYTES] = [0: RV_MAX_BYTES];
+    if !rv_to_be(&m, &em[0], nl) {
+        return false;
+    }
+    return rv_check_em(&em[0], nl, alg, hash, hash_len);
+}

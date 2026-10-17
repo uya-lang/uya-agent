@@ -530,6 +530,15 @@ make selftest                   # 离线端到端
 `<agent home>/tls_pins`，之后每次都必须逐字节相符，不符即拒。**开箱即用**，不需要 CA 库、
 也不需要人手抄指纹 —— 新机器（没有 DSH 设置）第一次跑就能连上，同时还有中间人防护。
 
+**一个站点有多张证书怎么办**（P92）：多证书站点（证书轮换、多机房各发各的 leaf、CDN 换证）
+在纯 TOFU 下会撞「指纹不符」。所以 `tofu` 档多了一条：库里的指纹**照旧必须逐字节相符**，
+但**没记过**的那张证书如果**链能验到系统信任根**，就把它追加进 `tls_pins` 并放行
+（每台主机最多 4 条，到上限只放行、不再追加）。链校验用的是本仓自己实现的那一套
+（`net/rsav` + `net/x509min` + `net/cachain`，只认 RSA/ECDSA + SHA-256/384，不需要
+openssl）。不想要这个行为就 `--no-tls-tofu-learn`（或 `UYA_AGENT_TLS_TOFU_LEARN=0`、
+设置里 `uya-agent.tls.tofu-learn: false`）；系统 CA 库可以用 `--ca-bundle PATH` 指定。
+细节与「为什么不是无条件接受新证书」见 [DESIGN.md §19.16](DESIGN.md)。
+
 要更强的保证（指纹完全由你定）就先探一次再钉死：
 
 ```bash
