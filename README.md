@@ -180,7 +180,7 @@ readelf -lW build/uya-agent | grep -c INTERP    # 0 = 真静态
 | `--dry-run` | 只组装请求并打印（不可打印字节转义成 `\xNN`，排查脏字节） |
 | `--debug-dump FILE` | 诊断的**原始字节**（网关错误体 / 坏 payload 头部等）追加落盘；默认关：转录里只有转义预览，全文仍进会话日志 `diag/dump` |
 | `--tui` / `--no-tui` | 全屏 TUI（**TTY 交互模式默认**）/ 退回滚动转录；`UYA_AGENT_TUI=0\|1` 同口径 |
-| `--tui-demo [WxH]` | 打印 TUI 若干屏的纯文本快照后退出（诊断 + 文档；也是 markdown 排版与浮层全屏的自测基准） |
+| `--tui-demo [WxH]` | 打印 TUI 若干屏的纯文本快照后退出（诊断 + 文档；也是 markdown 排版与浮层全屏的自测基准）。**不给 WxH 时画布按眼前终端取小**（上限 160x40）：终端更窄就照终端排 —— 否则 160 列的快照在 80/120 列的终端里每行都会折成两行，脚注与输入行当场散架（Windows 客户机上经 `uya-ssh.exe` 到中文控制台就是这个形态）。stdin 是 TTY 但宽高为 0 时兜 80x24（与真界面 `tty_init` / `tui_size_refresh` 同口径）；重定向/管道（非 TTY）时保持 160x40，输出与从前**逐字节相同** |
 | `--web [ADDR]` | **web 界面**：起一个本地 HTTP 服务，浏览器里用（默认 `127.0.0.1:8787`；`127.0.0.1:0` = 内核分配端口；`UYA_AGENT_WEB=1` / `UYA_AGENT_WEB_ADDR` 同口径）。每个会话是一个**真 PTY 上的 agent 子进程**，跑的就是全屏 TUI；见 §1.3。**会话继承父进程的命令行配置**（`--permission` / `--workspace` / `--agent-home` / `--base-url` / `--model` / `--tls-*` …）；少数没有环境变量口径的开关会由启动日志逐条点名 |
 | `--dsh-web [ADDR]` | **DSH 自己的前端**（默认 `127.0.0.1:8790`）：只读服务本机那份 `dsh-web-frontend/dist`（**一个字节都不改**），并把 `/api` 接到本仓会话上；与 `--web` 并列、可同时给（不同端口）。见 §1.4 |
 | `--dsh-assets DIR` | DSH 资源目录（**优先于** `--dsh-root`；给不存在的目录**直接报错**，不静默回退）—— 本机没装 DSH 时指一份取件缓存 |
