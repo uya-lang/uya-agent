@@ -114,11 +114,11 @@ SRC := src/foundation/bufx.uya src/foundation/jsonx.uya src/foundation/yamlcfg.u
        src/ui/ui_port.uya src/ui/be_null.uya src/ui/be_tui.uya src/ui/be_events.uya src/ui/ui_reg.uya src/ui/ui_fwd.uya \
        src/tools/askuser.uya src/tools/fsx.uya src/tools/jobs.uya src/tools/perm.uya src/tools/sandboxx.uya src/tools/search.uya src/tools/shellx.uya \
        src/plugin/mcpcfg.uya src/plugin/mcprun.uya src/plugin/mcp.uya src/plugin/mcptool.uya \
-       src/session/dshcfg.uya src/session/dshsave.uya src/session/dshsess.uya src/session/inbox.uya src/session/modelx.uya src/session/procx.uya src/session/session.uya src/session/sigx.uya src/session/stats.uya \
+       src/session/dshcfg.uya src/session/dshcred.uya src/session/dshdoc.uya src/session/dshfile.uya src/session/dshsave.uya src/session/dshsess.uya src/session/inbox.uya src/session/modelx.uya src/session/procx.uya src/session/session.uya src/session/sigx.uya src/session/stats.uya \
        src/agent/agent.uya src/agent/ag_config.uya src/agent/ag_title_prompt.uya src/agent/ag_tools_schema.uya src/agent/ag_request_stream.uya src/agent/ag_workspace_model.uya src/agent/ag_worktree.uya src/agent/ag_interactive_tasks.uya src/agent/ag_tui_sessions.uya src/agent/ag_plan_pump.uya src/agent/ag_pm.uya src/agent/compact.uya src/agent/deleg.uya src/agent/goal.uya src/agent/instr.uya src/agent/plan.uya src/agent/prompt.uya src/agent/skill.uya src/agent/todo.uya src/agent/workflow.uya \
        src/pm/pm_repo.uya src/pm/pm_store.uya src/pm/pm_ingest.uya src/pm/pm_digest.uya \
        src/vcs/gitx.uya src/vcs/worktreex.uya \
-       src/web/ttyemu.uya src/web/dshauth.uya src/web/dshget.uya src/web/webui.uya src/web/wsess.uya src/web/dwhchild.uya src/web/dwhmodel.uya src/web/whost.uya src/web/websrv.uya src/web/webhttp.uya src/web/webpump.uya \
+       src/web/ttyemu.uya src/web/dshauth.uya src/web/dshget.uya src/web/webui.uya src/web/wsess.uya src/web/dwhchild.uya src/web/dwhmodel.uya src/web/dwhschema.uya src/web/dwhset.uya src/web/whost.uya src/web/websrv.uya src/web/webhttp.uya src/web/webpump.uya \
        src/media/clipx.uya src/media/clipw.uya src/media/clipt.uya src/media/cliphelp.uya src/media/clip.uya src/media/imgx.uya src/media/imgz.uya \
        src/selftest/selftest.uya src/selftest/shellselftest.uya src/selftest/sigselftest.uya src/selftest/tuiselftest.uya \
        src/selftest/st_core.uya src/selftest/st_mock_server.uya src/selftest/st_round_driver.uya src/selftest/st_tty_sse.uya src/selftest/st_sessions.uya src/selftest/st_read_window.uya src/selftest/st_view_watch.uya src/selftest/st_responses.uya src/selftest/st_stats_ctx.uya src/selftest/st_ctxfit.uya src/selftest/st_title.uya src/selftest/st_tasks_ws.uya src/selftest/st_vision.uya src/selftest/st_goal_worktree.uya src/selftest/st_goal_sess.uya src/selftest/st_todo_resume.uya src/selftest/st_pm.uya src/selftest/st_pm2.uya src/selftest/st_mcp.uya \
@@ -248,6 +248,13 @@ wire-probe:
 # 没装 DSH / 没 chromium 时跳过（退出 0）。
 dsh-web-check: build
 	@sh testdata/dsh_web_check.sh
+
+# P88：设置页那一簇 RPC 的判据（`--dsh-web` 里「加提供方 / 改 / 删 / 凭据」那几条）。
+# 与 `dsh-web-check` 的分工：那条走**真 chromium**（页面真的画出来了没有），这条走
+# **RPC + 磁盘字节**（写进去的东西对不对）—— 一次写操作的失败模式往往只在后者可见
+# （页面显示成功、文件没变，或者反过来）。
+dsh-settings-check: build
+	@python3 testdata/dsh_settings_probe.py --bin $(OUT)
 
 wire-probe-real:
 	@log="$(LOG)"; \

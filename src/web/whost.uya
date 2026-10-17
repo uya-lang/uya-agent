@@ -96,6 +96,15 @@ export struct DwhHost {
     token: Buf,         // 访问令牌（空 = 不校验；见 `dshauth.uya` 不变量①）
     // DSH 的设置根（`--dsh-home` / `$DSH_HOME` / `~/.dsh`）：模型目录从它读。
     dsh_home: Buf,
+    // P88：设置页读写哪一个 profile 的配置文档（`--dsh-profile` / `$DSH_PROFILE` /
+    // `web`）。0.2.0 的配置**按 profile 分家**，写错 profile 的症状是
+    // 「页面上的模型目录还是空的」——写进了另一份文档。
+    profile: Buf,
+    // 那份配置文档（`profiles/<profile>/cordis.patch.yml`）的**只读快照**。
+    // 每次设置类请求**重新读一次**：页面之外的进程（`dsh web` 自己、编辑器）
+    // 随时可能改它，拿一份缓存去写就会覆盖别人的改动。`rev` 是页面做冲突判定的
+    // 那个 revision。
+    doc: DshDoc,
     conns: [DwhConn: DWH_MAX_CONNS],
     n: usize,
     // 一次泵里「已经干了活、该回 poll 了」的标记（见 `dwh_poll_once`）。
@@ -890,8 +899,8 @@ fn dwh_rpc_ok(rpc: &const byte, rl: usize, value: &const Buf, out: &Buf) bool {
 }
 
 // 业务错：**200 + ok:false**（HTTP 状态只表示载体）。
-fn dwh_rpc_err(rpc: &const byte, rl: usize, code: &const byte, msg: &const byte,
-    mn: usize, out: &Buf) bool {
+fn dwh_rpc_err(rpc: &const byte, rl: usize, code: &const byte, cl: usize,
+    msg: &const byte, mn: usize, out: &Buf) bool {
     buf_reset(out);
     if !buf_append_cstr(out, "{\"type\":\"server-response\",\"rpcId\":") {
         return false;
@@ -904,7 +913,12 @@ fn dwh_rpc_err(rpc: &const byte, rl: usize, code: &const byte, msg: &const byte,
     if !buf_append_cstr(out, ",\"result\":{\"ok\":false,\"error\":{\"code\":\"") {
         return false;
     }
-    if !buf_append_cstr(out, code) {
+    // ⚠ 用**显式长度**写 code，与 `rpcId` 同一条纪律：走过业务错那条路时 `code`
+    // 是一个 `Buf` 的内容（**没有 NUL 结尾**），当 C 串读会一路读到相邻内存
+    // （实测：错误码变成 `settings/conflictprofiles/web/cordis.patch.yml` ——
+    // 后面的字节是**同一个进程里前一次拼路径留下的**，而字面量那条路一直是好的，
+    // 所以这个缺陷在「code 永远是字面量」的年代看不出来）。
+    if !buf_append(out, code, cl) {
         return false;
     }
     if !buf_append_cstr(out, "\",\"message\":") {
@@ -1061,6 +1075,9 @@ fn dwh_unary(h: &DwhHost, method: &const byte, ml: usize,
     // P80 第二十三批：**聊天**与**模型选择**两条新面。
     // ⚠ 它们要**读请求体的 `payload.args`**（`dwh_unary_session` 那一簇是纯查询，
     // 拿不到 body）—— 所以分派点在**这一层**，不是在那簇里面。
+    if dwh_unary_cfg(h, mn, mnl, body, value) {
+        return true;
+    }
     if dwh_unary_chat(h, mn, mnl, body, value) {
         return true;
     }
@@ -1161,16 +1178,6 @@ fn dwh_unary_session(h: &const DwhHost, method: &const byte, ml: usize,
     if bufx_eq_cstr(method, ml, "session.modelCatalog" as &const byte) {
         return dwhm_catalog_json(&h.model, value);
     }
-    if bufx_eq_cstr(method, ml, "settings.describe" as &const byte) {
-        // 形状是**从真 DSH 0.2.0 抄的**（0.1.1 那份 `{values,schema}` 在 0.2.0 下
-        // 会让设置面板整片塌掉：客户端 `mirrored.view.namespaces.find(…)` 撞
-        // `undefined` ⇒ `Cannot read properties of undefined (reading 'find')`，
-        // 而它表现为「Failed to load plugins」+ 4 个设置插件列名，看不出是设置的事）。
-        // 本仓没有可写的设置文档 ⇒ `namespaces` 是**空数组**（不是 `{}`：
-        // 客户端对它 `.find()`，形状必须是数组）、`hasDocument` 如实给 false。
-        return buf_append_cstr(value,
-            "{\"writable\":false,\"hasDocument\":false,\"namespaces\":[]}");
-    }
     if bufx_eq_cstr(method, ml, "session.models" as &const byte) {
         // 0.1.1 的那条门面（`{current,routable,groups,failures}`）：内容与
         // `modelCatalog` **同源**（同一个目录、同一个当前值，组装函数也共用）——
@@ -1189,6 +1196,122 @@ fn dwh_unary_session(h: &const DwhHost, method: &const byte, ml: usize,
         return buf_append_cstr(value, "],\"archivedSessionIds\":[],\"pinnedSessionIds\":[]}");
     }
     return dwh_unary_settings(method, ml, value);
+}
+
+// ============================================================
+// P88：设置面板那一簇（settings / credentials / llm）
+// ============================================================
+//
+// 这一簇与上面那簇（`dwh_unary_settings`：只读元信息）的分工：**这些要知道请求体**
+// （`settings/mutate` 的 ops、`credentials/set` 的 ref+value），而且要**动手**
+// （改配置文档、写凭据文件）。所以它们在这里分派，实现放在 `dwhset.uya`。
+//
+// 认领 = 返回 true（**无论成败**）：业务失败也要回一条说清楚的业务错，
+// 不能落到「not implemented」那条路上 —— 那会让客户端把整个面当不支持。
+fn dwh_unary_cfg(h: &DwhHost, method: &const byte, ml: usize,
+    body: &const Buf, value: &Buf) bool {
+    const is_desc: bool = bufx_eq_cstr(method, ml, "settings.describe" as &const byte);
+    const is_mut: bool = bufx_eq_cstr(method, ml, "settings.mutate" as &const byte);
+    if !is_desc && !is_mut
+        && !bufx_eq_cstr(method, ml, "settings.replace" as &const byte)
+        && !bufx_eq_cstr(method, ml, "settings.update" as &const byte)
+        && !bufx_eq_cstr(method, ml, "credentials.describe" as &const byte)
+        && !bufx_eq_cstr(method, ml, "credentials.set" as &const byte)
+        && !bufx_eq_cstr(method, ml, "credentials.unset" as &const byte)
+        && !bufx_eq_cstr(method, ml, "llm.listProviders" as &const byte)
+        && !bufx_eq_cstr(method, ml, "llm.listConfigurableProviders" as &const byte)
+        && !bufx_eq_cstr(method, ml, "llm.discoverModels" as &const byte) {
+        return false;
+    }
+    // `settings/replace|update`：客户端这一版不用它们（它只发 mutate）。
+    // 如实拒绝比「假装写了」好 —— 那两种写法的语义是**整节替换**，本仓的
+    // 行级改写做不到，做了就是静默丢字段。
+    if bufx_eq_cstr(method, ml, "settings.replace" as &const byte)
+        || bufx_eq_cstr(method, ml, "settings.update" as &const byte) {
+        return dwh_rpc_owned_err(value, "internal",
+            "本仓的设置页只支持 settings/mutate（整节替换不在这里实现）");
+    }
+    if bufx_eq_cstr(method, ml, "llm.discoverModels" as &const byte) {
+        return dwh_rpc_owned_err(value, "internal", dwhs_discover_note());
+    }
+    // 只读的那几条：文档打不开也算「如实回答」（列表为空 / 不可写）
+    const rc: i32 = dwh_doc_refresh(h);
+    if bufx_eq_cstr(method, ml, "settings.describe" as &const byte) {
+        _ = rc;
+        return dwhs_describe(&h.doc, value);
+    }
+    // ⚠ 凭据那三条**不依赖 patch 文档**：钥匙存在 `.credentials.yaml` 里，
+    // 与「这台机器的 profile 文档在不在」是两件事。把它们挂在文档上时，
+    // 没装 DSH 的机器会连「填一个密钥」都做不到（而那条路本来只要 home）。
+    if bufx_eq_cstr(method, ml, "credentials.describe" as &const byte)
+        || bufx_eq_cstr(method, ml, "credentials.set" as &const byte)
+        || bufx_eq_cstr(method, ml, "credentials.unset" as &const byte) {
+        return dwh_cred_request(h, method, ml, body, value);
+    }
+    if bufx_eq_cstr(method, ml, "llm.listProviders" as &const byte) {
+        return dwhs_list_providers(&h.doc, value);
+    }
+    if bufx_eq_cstr(method, ml, "llm.listConfigurableProviders" as &const byte) {
+        return dwhs_list_configurable(&h.doc, value);
+    }
+    // 剩下的那几条是写：文档必须打得开（打不开 ⇒ 一条业务错，带上那句话）
+    if rc != DSHD_OK {
+        return dwh_rpc_owned_err(value, "internal", dshd_code_text(rc));
+    }
+    // 剩下的都要读 `payload.args`：解析失败就是**参数不对**（别把失败的原因
+    // 说成「写不进去」—— 排查会跑偏）
+    var arena: Arena = Arena{ buffer: null, size: 0, used: 0 };
+    var abuf: [byte: 262144] = [0: 262144];
+    arena_init(&arena, &abuf[0], 262144);
+    var root: JsonValue = JsonValue.json_null();
+    var args: JsonValue = JsonValue.json_null();
+    if !js_parse(&arena, body.ptr as &const byte, body.len, &root)
+        || !dwh_req_args(&root, &args) {
+        return dwh_rpc_owned_err(value, "bad-request", "请求体里没有 payload.args");
+    }
+    if bufx_eq_cstr(method, ml, "settings.mutate" as &const byte) {
+        const mrc: i32 = dwhs_mutate(&h.doc, &args, value);
+        if mrc == 0 {
+            // 配置文档刚变 ⇒ 模型目录重读一次：不然「页面里刚加的提供方」在同一个
+            // 宿主进程里永远进不了选择器（页面的模型菜单读的就是那份目录）。
+            dwhm_reload(&h.model);
+            return true;
+        }
+        return dwh_rpc_owned_err(value, dwhs_code_of(mrc), dshd_code_text(mrc));
+    }
+    return true;
+}
+
+// 凭据那三条（`credentials/describe|set|unset`）。
+//
+// 单独一支的理由见上面那句注释：它们的真值源是 `<DSH_HOME>/.credentials.yaml` 与
+// **环境变量**，与 patch 文档没有关系 —— 挂在一起时，「本机没装 DSH web profile」
+// 这种完全正常的形态下连填一个密钥都做不到。
+fn dwh_cred_request(h: &DwhHost, method: &const byte, ml: usize,
+    body: &const Buf, value: &Buf) bool {
+    const is_desc: bool = bufx_eq_cstr(method, ml, "credentials.describe" as &const byte);
+    var arena: Arena = Arena{ buffer: null, size: 0, used: 0 };
+    var abuf: [byte: 262144] = [0: 262144];
+    arena_init(&arena, &abuf[0], 262144);
+    var root: JsonValue = JsonValue.json_null();
+    var args: JsonValue = JsonValue.json_null();
+    if !js_parse(&arena, body.ptr as &const byte, body.len, &root)
+        || !dwh_req_args(&root, &args) {
+        return dwh_rpc_owned_err(value, "bad-request", "请求体里没有 payload.args");
+    }
+    if is_desc {
+        return dwhs_cred_describe(&h.dsh_home, &args, value);
+    }
+    var rc: i32 = DSHD_OK;
+    if bufx_eq_cstr(method, ml, "credentials.set" as &const byte) {
+        rc = dwhs_cred_set(&h.dsh_home, &args);
+    } else {
+        rc = dwhs_cred_unset(&h.dsh_home, &args);
+    }
+    if rc == DSHD_OK {
+        return buf_append_cstr(value, "null");
+    }
+    return dwh_rpc_owned_err(value, dwhs_code_of(rc), dshd_code_text(rc));
 }
 
 // ============================================================
@@ -1561,34 +1684,21 @@ fn dwh_push_model_cmd(h: &DwhHost, prov: &const Buf, model: &const Buf,
 //
 // 形状全部**从真 DSH 的 typert host 逐个抄**（`z.object` 的键名与可选性），
 // 不按印象写 —— 形状猜错时客户端是 `undefined` 崩，比「未实现」更难查。
-// 导出（`export`）：`st_web` 的 `web-panel` 轮按方法名逐个调它 —— 这一簇的缺陷
-// 形态是「四个页签各一条红字」，只有把每个方法都调一遍（或把页签都点一遍）才看得见。
+//
+// ⚠ P88 起这一层**只是兜底**：`settings.*` / `credentials.*` / `llm.*` 的真实现搬到了
+// `dwh_unary_cfg`（那些要 host：文档快照、凭据根、模型目录），这里只剩三条纯常量。
+// 判据要打**页面走的那个口**（`dwh_unary`）—— 对着这一层写判据会把「真实现没接上」
+// 判成绿（`st_web` 的 `web-panel` 轮当初就这么绿过，见踩坑 150 的形状）。
 export fn dwh_unary_settings(method: &const byte, ml: usize, value: &Buf) bool {
     // `permissionPresets/catalog`：三个档位 + 默认档（值与本仓的访问模式同名）。
     if bufx_eq_cstr(method, ml, "permissionPresets.catalog" as &const byte) {
         // 行宽豁免：不可断的 JSON 字面量
         return buf_append_cstr(value, "{\"options\":[{\"value\":\"read-only\",\"name\":\"read-only\",\"description\":\"只读：写工具被拒，bash 逐条批准\"},{\"value\":\"workspace-write\",\"name\":\"workspace-write\",\"description\":\"工作区写：bash 关在内核沙箱里，只能写工作区\"},{\"value\":\"danger-full-access\",\"name\":\"danger-full-access\",\"description\":\"全权：不限制（默认）\"}],\"defaultOptions\":[{\"value\":\"danger-full-access\",\"name\":\"danger-full-access\"}],\"defaultPreset\":\"danger-full-access\"}");
     }
-    // `llm/listProviders` / `llm/listConfigurableProviders`：本仓只有一条路线
-    // （模型来自 DSH 设置），所以是**一个** provider；可配置的那条是空数组
-    // （本仓的设置文档不可写 ⇒ 「没有可配置项」比「列一堆改不动的」诚实）。
-    if bufx_eq_cstr(method, ml, "llm.listProviders" as &const byte) {
-        return buf_append_cstr(value,
-            "[{\"id\":\"uya-agent\",\"name\":\"uya-agent\"}]");
-    }
-    if bufx_eq_cstr(method, ml, "llm.listConfigurableProviders" as &const byte) {
-        return buf_append_cstr(value, "[]");
-    }
     // `agentPresets/list`：一条标准档（会话就是按它建的，见 `session.create`）。
     if bufx_eq_cstr(method, ml, "agentPresets.list" as &const byte) {
         // 行宽豁免：不可断的 JSON 字面量
         return buf_append_cstr(value, "{\"presets\":[{\"id\":\"standard\",\"isDefault\":true,\"name\":\"standard\"}]}");
-    }
-    // `credentials/describe`：形状是 `Record<string, {configured,writable}>`。
-    // 本仓不读凭据（DSH 设置那条路走的是 `.credentials.yaml`，回给页面没有意义）
-    // ⇒ **空映射**：客户端据此画「没有需要配置的凭据」，而不是报错。
-    if bufx_eq_cstr(method, ml, "credentials.describe" as &const byte) {
-        return buf_append_cstr(value, "{}");
     }
     // `pluginInventory/list`：本仓的插件是编译期注册的，没有可检视的动态清单
     // ⇒ 回**空列表**（页签显示「没有插件」，而不是「暂时不可用」）。
@@ -2031,6 +2141,8 @@ export fn dwh_start(h: &DwhHost, cfg: &const Config, addr: &const byte,
     h.events = buf_empty();
     h.token = buf_empty();
     h.dsh_home = buf_empty();
+    h.profile = buf_empty();
+    h.doc = dshd_zero();
     h.n = 0;
     h.live = false;
     h.child = dwhc_zero();
@@ -2104,6 +2216,16 @@ export fn dwh_start(h: &DwhHost, cfg: &const Config, addr: &const byte,
     }
     if !dwhm_load(&h.model, &h.dsh_home) {
         out_err("[dsh-web] 提示：读不到 DSH 的 settings.yaml，模型选择器会是空的\n");
+    }
+    // P88：设置页要写的那份文档（`profiles/<profile>/cordis.patch.yml`）。
+    // **打不开不报错**：页面照开，设置页如实显示「不可写」——比整个宿主起不来好。
+    _ = dwh_profile_resolve(h, cfg);
+    var drc: i32 = dshd_open(&h.doc, &h.dsh_home, &h.profile);
+    if drc != DSHD_OK {
+        out_err("[dsh-web] 提示：设置页只读（");
+        _ = srv_write_all(2, dshd_code_text(drc),
+            bufx_cstr_len(dshd_code_text(drc)));
+        out_err("）—— 写进配置文档那条路要它能打开\n");
     }
     // 监听
     var a: byte = 127;
@@ -2217,6 +2339,53 @@ fn dwh_dsh_home(h: &DwhHost, cfg: &const Config) bool {
         return false;
     }
     return h.dsh_home.len > 0;
+}
+
+// 定 profile 名（`--dsh-profile` > `$UYA_AGENT_DSH_PROFILE` > `$DSH_PROFILE` > `web`）。
+// 为什么 `web` 是默认：`--dsh-web` 服务的界面就是 `dsh web` 那个 profile；
+// 用户跑别的 profile（`dsh tui`）时那份 patch 在另一个目录，这时要用 flag/env 指定。
+fn dwh_profile_resolve(h: &DwhHost, cfg: &const Config) bool {
+    if h.profile.len > 0 {
+        return true;
+    }
+    if cfg.dsh_profile.len > 0 {
+        h.profile = buf_new(cfg.dsh_profile.len + 8);
+        _ = buf_append(&h.profile, cfg.dsh_profile.ptr as &const byte, cfg.dsh_profile.len);
+        return true;
+    }
+    const e1: &byte = getenv("UYA_AGENT_DSH_PROFILE" as &const byte);
+    const e2: &byte = getenv("DSH_PROFILE" as &const byte);
+    // 不用 if-表达式（`const x = if c { a } else { b }` 的 C 后端会生成一个只读的
+    // 语句表达式变量 ⇒ 编译不过；这里是 `var` + 两条分支，同一语义）
+    var pick: &byte = e2;
+    if (e1 as usize) != 0 && bufx_cstr_len(e1) > 0 {
+        pick = e1;
+    }
+    if (pick as usize) != 0 && bufx_cstr_len(pick) > 0 {
+        h.profile = buf_new(bufx_cstr_len(pick) + 8);
+        _ = buf_append_cstr(&h.profile, pick);
+        return true;
+    }
+    h.profile = buf_new(16);
+    _ = buf_append_cstr(&h.profile, "web");
+    return true;
+}
+
+// 设置类请求的**唯一入口**：把那份文档重读一遍（外面可能刚改过），读失败时
+// 保留上一次的快照（页面于是仍能显示字段，只是写会被拒 —— 比整块空掉好）。
+fn dwh_doc_refresh(h: &DwhHost) i32 {
+    if h.dsh_home.len == 0 {
+        return DSHD_NOFILE;
+    }
+    var fresh: DshDoc = dshd_zero();
+    const rc: i32 = dshd_open(&fresh, &h.dsh_home, &h.profile);
+    if rc != DSHD_OK {
+        dshd_free(&fresh);
+        return rc;
+    }
+    dshd_free(&h.doc);
+    h.doc = fresh;
+    return DSHD_OK;
 }
 
 // 一圈的活会话维护：收子进程的新行、翻成事件、攒进 `h.events`（**只追加**），
@@ -2669,6 +2838,10 @@ export fn dwh_stop(h: &DwhHost) void {
     if buf_valid(&h.dsh_home) {
         buf_free(&h.dsh_home);
     }
+    if buf_valid(&h.profile) {
+        buf_free(&h.profile);
+    }
+    dshd_free(&h.doc);
 }
 
 // ============================================================
@@ -3679,8 +3852,9 @@ fn dwh_send_api(h: &DwhHost, ci: usize, m: u8, path: &const Buf,
     // 缓冲区后面的字节算长度，长度对不上就恒判「不匹配」（实测症状：所有 `/api`
     // 调用都回 `bad-request`，而页面只是「某些面板读不出来」）。
     if pml != method.len || !bufx_mem_eq(path_method, method.ptr as &const byte, pml) {
-        if !dwh_rpc_err(rpc.ptr as &const byte, rpc.len,
-            "bad-request" as &const byte,
+        const badc: &const byte = "bad-request" as &const byte;
+        if !dwh_rpc_err(rpc.ptr as &const byte, rpc.len, badc,
+            bufx_cstr_len(badc),
             "method does not match path" as &const byte, 26, &resp) {
             h.conns[ci].st = DWH_C_DONE;
             return;
@@ -3699,8 +3873,8 @@ fn dwh_send_api(h: &DwhHost, ci: usize, m: u8, path: &const Buf,
             defer { buf_free(&msg); }
             if dwh_take_owned_err(&value, &code, &msg) {
                 if !dwh_rpc_err(rpc.ptr as &const byte, rpc.len,
-                    code.ptr as &const byte, msg.ptr as &const byte, msg.len,
-                    &resp) {
+                    code.ptr as &const byte, code.len,
+                    msg.ptr as &const byte, msg.len, &resp) {
                     h.conns[ci].st = DWH_C_DONE;
                     return;
                 }
@@ -3714,8 +3888,9 @@ fn dwh_send_api(h: &DwhHost, ci: usize, m: u8, path: &const Buf,
             defer { buf_free(&msg); }
             _ = buf_append_cstr(&msg, "not implemented: ");
             _ = buf_append(&msg, method.ptr as &const byte, method.len);
-            if !dwh_rpc_err(rpc.ptr as &const byte, rpc.len,
-                "internal" as &const byte,
+            const inl: &const byte = "internal" as &const byte;
+            if !dwh_rpc_err(rpc.ptr as &const byte, rpc.len, inl,
+                bufx_cstr_len(inl),
                 msg.ptr as &const byte, msg.len, &resp) {
                 h.conns[ci].st = DWH_C_DONE;
                 return;

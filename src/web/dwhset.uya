@@ -1,0 +1,571 @@
+// src/web/dwhset.uya — `--dsh-web` 的**设置面板**那一簇（`settings/*`、`credentials/*`）
+//
+// 本文件：把宿主侧那份 DSH 配置文档（`session/dshdoc.uya`）与凭据文件装成 DSH 0.2.0
+//   设置页要的形状 ——
+//   * `settings.describe`（`dwhs_describe`）：
+//     `{writable,hasDocument,namespaces[]}`，
+//     名字空间视图逐字段照 `dsh-settings` 的 `SettingsNamespaceView`；
+//   * `settings.mutate`（`dwhs_mutate`）：页面发来的 path ops → 文档 → 落盘 → 回新视图；
+//   * `credentials.describe|set|unset`（`dwhs_cred_*`）：
+//     `$DSH_HOME/.credentials.yaml`；
+//   * `llm.listProviders|listConfigurableProviders|discoverModels`
+//     （`dwhs_llm_*`）。
+// 为什么这一簇非有不可：设置页的**每一个编辑控件**都要先拿到一份可写的视图才出现 ——
+//   「只读」时页面根本不渲染「添加提供方」那张卡片（不是报错，是**没有那个按钮**），
+//   于是用户能看见模型清单却一个都加不了。
+// 不变量：① **形状照抄不发明**（`z.object` 的键名与可选性逐个对过，见 DESIGN 那一节）：
+//   形状猜错的代价是 `undefined` 崩或整块塌掉，比「未实现」更难查；② **写失败要说清楚**：
+//   一切失败翻成一条业务错（带 `dshd_code_text` 的那句话），绝不静默返回旧视图 ——
+//   静默在这一簇里表现为「点了提交、界面没变、也没报错」；③ **revision 是冲突判据**：
+//   页面拿的 revision 与当前文档不一致就拒（`DSHD_STALE`），不覆盖别人的改动；
+//   ④ **本文件不认识 `Config`/`g_sess`**（与 `dwhmodel.uya` 同一条纪律），只吃
+//   `DshDoc` 与 JSON。
+// 依赖：无 `use` 行（合并命名空间）；本仓 session/dshdoc（`dshd_*`）、web/dwhschema
+//   （`dwh_schema_json`）、foundation/jsonx（`JsonValue` 走查）、session/session
+//   （`jw_str_into`）、net/httpc（`http_request`，只在 `llm/discoverModels` 用到）。
+// 命名：对外 `dwhs_*`；私有 `dwhs_*` 同名前缀（本文件没有跨文件私有符号）。
+
+// 本仓**只**把 `llm-pi-ai` 这一节挂到设置页上：它是「自定义提供方」那一张卡片的家
+// （`ui-settings-models` 的 `layoutOf` 认的就是这个 ns）。`llm-deepseek` 那一节本仓
+// 读得到、但编辑它要另一份 schema 信封，v1 不开（开一半比不开更坏：卡片会画出来、
+// 提交却过不了校验）。
+const DWHS_NS: &const byte = "llm-pi-ai" as &const byte;
+
+// 一次 `settings.mutate` 里 ops 的上限（与 `DSHD_OPS_MAX` 同量级：页面一次改几个键）。
+const DWHS_OPS_MAX: usize = 16;
+
+// `credentials/describe` 一次问几个 ref（页面把每个提供方的 ref 一起问）。
+const DWHS_REF_MAX: usize = 32;
+
+// 页面显示的提供方名字（本仓的目录只有 id，没有 displayName 时回落到 id）。
+fn dwhs_display_name(prov: &const Buf, out: &Buf) bool {
+    buf_reset(out);
+    return buf_append(out, prov.ptr as &const byte, prov.len);
+}
+
+// 一份 namespace 视图（`SettingsNamespaceView`）。
+//
+// 字段逐个对 DSH 的 `dsh-settings`：
+//   autoGenerate(boolean) / ns(string) / schema(JsonValue) / value(JsonValue) /
+//   base?(JsonValue) / user?(JsonValue) / applies:'live' /
+//   secrets[{path,set}] / revision(number)
+//
+// **`value` 与 `user` 都是文档里那一节**：本仓没有「schema 默认值」这一层
+// （`base` 因此省略），而客户端的「这个键被用户覆盖过吗」判据读的正是 `user`
+// （`schema.hasPath(namespace.user, …)` ⇒ `removable`），两者给同一份是对的。
+export fn dwhs_ns_view(d: &const DshDoc, out: &Buf) bool {
+    buf_reset(out);
+    if !buf_append_cstr(out, "{\"autoGenerate\":false,\"ns\":") {
+        return false;
+    }
+    if !jw_str_into(out, DWHS_NS, bufx_cstr_len(DWHS_NS)) {
+        return false;
+    }
+    if !buf_append_cstr(out, ",\"schema\":") {
+        return false;
+    }
+    if !dwh_schema_json(out) {
+        return false;
+    }
+    var cfg: Buf = buf_new(4096);
+    defer { buf_free(&cfg); }
+    const ok: bool = dshd_config_json(d, DWHS_NS, bufx_cstr_len(DWHS_NS), &cfg);
+    if !buf_append_cstr(out, ",\"value\":") {
+        return false;
+    }
+    if ok {
+        if !buf_append(out, cfg.ptr as &const byte, cfg.len) {
+            return false;
+        }
+    } else if !buf_append_cstr(out, "{}") {
+        return false;
+    }
+    if !buf_append_cstr(out, ",\"user\":") {
+        return false;
+    }
+    if ok {
+        if !buf_append(out, cfg.ptr as &const byte, cfg.len) {
+            return false;
+        }
+    } else if !buf_append_cstr(out, "{}") {
+        return false;
+    }
+    // `secrets`：schema 里 `role("credential-ref")` 的槽位（`apiKeyEnv`）**不算**
+    // secret（它的值是引用名、明文在凭据文件里），所以这一族本仓恒空。
+    if !buf_append_cstr(out, ",\"applies\":\"live\",\"secrets\":[]") {
+        return false;
+    }
+    if !buf_append_cstr(out, ",\"revision\":") {
+        return false;
+    }
+    if !buf_append_i64(out, d.rev) {
+        return false;
+    }
+    return buf_append_byte(out, 125);
+}
+
+// `settings.describe`：文档在 ⇒ 可写 + 一个命名空间；文档不在 ⇒ 如实说不可写
+// （「今天这份部署没有可编辑的文档」比假装可写、提交时报错诚实）。
+export fn dwhs_describe(d: &const DshDoc, out: &Buf) bool {
+    buf_reset(out);
+    if !d.loaded {
+        // 形状与真 DSH 一致（`namespaces` 必须是**数组**：客户端对它 `.find()`）。
+        return buf_append_cstr(out,
+            "{\"writable\":false,\"hasDocument\":false,\"namespaces\":[]}");
+    }
+    if !buf_append_cstr(out,
+        "{\"writable\":true,\"hasDocument\":true,\"namespaces\":[") {
+        return false;
+    }
+    // ⚠ 视图要写进**临时**缓冲再拼：`dwhs_ns_view` 自己会 `buf_reset(out)`
+    // （它也给 `settings/mutate` 当整份返回值用），直接往里写会把刚写的前缀抹掉
+    // —— 实测症状：`settings.describe` 回的**不是** `{writable,…,namespaces:[…]}`，
+    // 而是裸的一份命名空间视图 ⇒ 客户端 `view.namespaces` 是 undefined ⇒
+    // 设置面板整片塌（与「形状给错」那一类同族）。
+    var view: Buf = buf_new(16384);
+    defer { buf_free(&view); }
+    if !dwhs_ns_view(d, &view) {
+        return false;
+    }
+    if !buf_append(out, view.ptr as &const byte, view.len) {
+        return false;
+    }
+    return buf_append_cstr(out, "]}");
+}
+
+// ============================================================
+// `settings/mutate`
+// ============================================================
+
+// 一条 op 的路径段（写进 op 的 seg[k]）。
+fn dwhs_take_seg(op: &DshdOp, k: usize, sv: &const JsonStrView) bool {
+    if k >= DSHD_PATH_MAX {
+        return false;
+    }
+    buf_reset(&op.seg[k]);
+    return sv_unescape(sv, &op.seg[k]);
+}
+
+// 把请求里的 `ops` 数组装进 `DshdOps`。返回 0 = 装好了；1 = 形状不对。
+//
+// 只认 DSH 那两种 op（`{op:'set',path,value}` / `{op:'unset',path}`）；别的写法**拒绝**
+// （`dwhs_mutate` 会回一条业务错，而不是把 ops 悄悄丢掉 —— 丢掉就是「点了没反应」）。
+fn dwhs_take_ops(args: &const JsonValue, ops: &DshdOps) i32 {
+    var arr: JsonValue = JsonValue.json_null();
+    if !js_obj_get(args, "ops" as &const byte, 3, &arr) {
+        return 1;
+    }
+    const n: usize = js_arr_len(&arr);
+    if n == 0 || n > DWHS_OPS_MAX {
+        return 1;
+    }
+    var i: usize = 0;
+    while i < n {
+        var it: JsonValue = JsonValue.json_null();
+        if !js_arr_get(&arr, i, &it) {
+            return 1;
+        }
+        var opb: JsonStrView = JsonStrView{ ptr: null, len: 0 };
+        if !js_obj_get_str(&it, "op" as &const byte, 2, &opb) {
+            return 1;
+        }
+        var path: JsonValue = JsonValue.json_null();
+        if !js_obj_get(&it, "path" as &const byte, 4, &path) {
+            return 1;
+        }
+        const pn: usize = js_arr_len(&path);
+        if pn == 0 || pn > DSHD_PATH_MAX {
+            return 1;
+        }
+        const op: &DshdOp = dshd_ops_add(ops);
+        if !sv_eq_cstr_view(&opb, "set" as &const byte) {
+            op.kind = DSHD_KIND_UNSET;
+        } else {
+            op.kind = DSHD_KIND_SET;
+            var val: JsonValue = JsonValue.json_null();
+            if !js_obj_get(&it, "value" as &const byte, 5, &val) {
+                return 1;
+            }
+            op.val = val;
+        }
+        var k: usize = 0;
+        while k < pn {
+            var seg: JsonValue = JsonValue.json_null();
+            var sv: JsonStrView = JsonStrView{ ptr: null, len: 0 };
+            if !js_arr_get(&path, k, &seg) || !js_str_of(&seg, &sv) {
+                return 1;
+            }
+            if !dwhs_take_seg(op, k, &sv) {
+                return 1;
+            }
+            k = k + 1;
+        }
+        op.nseg = pn;
+        i = i + 1;
+    }
+    return 0;
+}
+
+// 请求里的 `expectedRevision`（可选；没给 = 不做冲突判定，与 DSH 的
+// 「expectedRevision 省略即无栅栏写」同口径）。
+fn dwhs_expected_rev(args: &const JsonValue, out: &i64, has: &bool) void {
+    has[0] = false;
+    out[0] = 0;
+    var v: JsonValue = JsonValue.json_null();
+    if !js_obj_get(args, "expectedRevision" as &const byte, 16, &v) {
+        return;
+    }
+    var n: i64 = 0;
+    if !js_i64_of(&v, &n) {
+        return;
+    }
+    has[0] = true;
+    out[0] = n;
+}
+
+// `settings/mutate`：`{ns, ops:[…], expectedRevision?}` → 新视图。
+//
+// 落盘顺序**不可反**：先 `dshd_mutate`（内容层，含写前自检）→ 再 `dshd_save`（IO 层）。
+// 中途失败时磁盘上那份**逐字节没动**（`dshd_save` 是临时文件 + rename）。
+export fn dwhs_mutate(d: &DshDoc, args: &const JsonValue, out: &Buf) i32 {
+    var nsb: JsonStrView = JsonStrView{ ptr: null, len: 0 };
+    if !js_obj_get_str(args, "ns" as &const byte, 2, &nsb) {
+        return 1;
+    }
+    if !sv_eq_cstr_view(&nsb, DWHS_NS) {
+        return 1;
+    }
+    var exp: i64 = 0;
+    var has_exp: bool = false;
+    dwhs_expected_rev(args, &exp, &has_exp);
+    if has_exp && exp != d.rev {
+        return DSHD_STALE;
+    }
+    var ops: DshdOps = dshd_ops_zero();
+    defer { dshd_ops_free(&ops); }
+    if dwhs_take_ops(args, &ops) != 0 {
+        return DSHD_OPS;
+    }
+    var text: Buf = buf_new(d.text.len + 4096);
+    defer { buf_free(&text); }
+    var rc: i32 = dshd_mutate(d, DWHS_NS, bufx_cstr_len(DWHS_NS), &ops, &text);
+    if rc != DSHD_OK {
+        return rc;
+    }
+    rc = dshd_save(d, &text);
+    if rc != DSHD_OK {
+        return rc;
+    }
+    return if dwhs_ns_view(d, out) { 0 } else { DSHD_IO };
+}
+
+// ============================================================
+// `credentials/*`
+// ============================================================
+
+// 一条 `credentials/describe` 项：`{configured, source?, writable}`。
+// 凭据链与 DSH 一致：**文件里的 refs 优先，环境变量兜底**；环境变量那条路
+// `writable:false`（写进文件也盖不过它 —— 那是 DSH 的优先级，本仓照抄）。
+fn dwhs_cred_item(home: &const Buf, ref: &const Buf, out: &Buf) bool {
+    var val: Buf = buf_new(512);
+    defer { buf_free(&val); }
+    const rc: i32 = dshd_cred_get(home, ref, &val);
+    if rc == 0 && val.len > 0 {
+        return buf_append_cstr(out,
+            "{\"configured\":true,\"source\":\"stored\",\"writable\":true}");
+    }
+    var z: Buf = buf_new(ref.len + 1);
+    defer { buf_free(&z); }
+    if !buf_append(&z, ref.ptr as &const byte, ref.len)
+        || !buf_append_byte(&z, 0) {
+        return false;
+    }
+    const env: &byte = getenv(z.ptr as &const byte);
+    if (env as usize) != 0 && bufx_cstr_len(env) > 0 {
+        // 行宽豁免：不可断的 JSON 字面量（拆两条常量拼）
+        return buf_append_cstr(out,
+            "{\"configured\":true,\"source\":\"environment\",\"writable\":false}");
+    }
+    return buf_append_cstr(out,
+        "{\"configured\":false,\"writable\":true}");
+}
+
+// `credentials/describe(refs: string[])` →
+// `Record<ref, {configured,source,writable}>`。
+export fn dwhs_cred_describe(home: &const Buf, args: &const JsonValue,
+    out: &Buf) bool {
+    var arr: JsonValue = JsonValue.json_null();
+    if !js_obj_get(args, "refs" as &const byte, 4, &arr) {
+        buf_reset(out);
+        return buf_append_cstr(out, "{}");
+    }
+    const n: usize = js_arr_len(&arr);
+    buf_reset(out);
+    if !buf_append_byte(out, 123) {
+        return false;
+    }
+    var first: bool = true;
+    var i: usize = 0;
+    while i < n && i < DWHS_REF_MAX {
+        var sv: JsonStrView = JsonStrView{ ptr: null, len: 0 };
+        var it: JsonValue = JsonValue.json_null();
+        if js_arr_get(&arr, i, &it) && js_str_of(&it, &sv) {
+            var ref: Buf = buf_new(sv.len + 8);
+            defer { buf_free(&ref); }
+            if sv_unescape(&sv, &ref) && ref.len > 0 {
+                if !first && !buf_append_byte(out, 44) {
+                    return false;
+                }
+                first = false;
+                if !jw_str_into(out, ref.ptr as &const byte, ref.len) {
+                    return false;
+                }
+                if !buf_append_byte(out, 58) {
+                    return false;
+                }
+                if !dwhs_cred_item(home, &ref, out) {
+                    return false;
+                }
+            }
+        }
+        i = i + 1;
+    }
+    return buf_append_byte(out, 125);
+}
+
+// `credentials/set(ref, value)`（出参是 `void`：客户端只看成功与否）。
+export fn dwhs_cred_set(home: &const Buf, args: &const JsonValue) i32 {
+    var refs: JsonStrView = JsonStrView{ ptr: null, len: 0 };
+    var vals: JsonStrView = JsonStrView{ ptr: null, len: 0 };
+    if !js_obj_get_str(args, "ref" as &const byte, 3, &refs) {
+        return DSHD_OPS;
+    }
+    if !js_obj_get_str(args, "value" as &const byte, 5, &vals) {
+        return DSHD_OPS;
+    }
+    var ref: Buf = buf_new(refs.len + 8);
+    defer { buf_free(&ref); }
+    var val: Buf = buf_new(vals.len + 8);
+    defer { buf_free(&val); }
+    if !sv_unescape(&refs, &ref) || !sv_unescape(&vals, &val) {
+        return DSHD_IO;
+    }
+    if ref.len == 0 || val.len == 0 {
+        return DSHD_OPS;        // 空值不是「删」：删有专门的 `unset`
+    }
+    return dshd_cred_set(home, &ref, &val);
+}
+
+// `credentials/unset(ref)`（幂等）。
+export fn dwhs_cred_unset(home: &const Buf, args: &const JsonValue) i32 {
+    var refs: JsonStrView = JsonStrView{ ptr: null, len: 0 };
+    if !js_obj_get_str(args, "ref" as &const byte, 3, &refs) {
+        return DSHD_OPS;
+    }
+    var ref: Buf = buf_new(refs.len + 8);
+    defer { buf_free(&ref); }
+    if !sv_unescape(&refs, &ref) {
+        return DSHD_IO;
+    }
+    if ref.len == 0 {
+        return DSHD_OPS;
+    }
+    return dshd_cred_unset(home, &ref);
+}
+
+// ============================================================
+// `llm/*`
+// ============================================================
+
+// 文档里 `llm-pi-ai.providers` 下的路由清单（去重、按文档序）。
+// 读法：把那一节摊平成 YAML 文本再交给 `mx_*` 那套读码 —— 一份真值源。
+fn dwhs_routes_into(d: &const DshDoc, out: &Buf) bool {
+    buf_reset(out);
+    var cfg: Buf = buf_new(4096);
+    defer { buf_free(&cfg); }
+    if !dshd_cfg_text(d, DWHS_NS, bufx_cstr_len(DWHS_NS), &cfg) {
+        return true;        // 没有这一节 ⇒ 空清单
+    }
+    var t: YTree = YTree{ nodes: [], n: 0, lines: [], nlines: 0,
+        raw: buf_empty(), cur: 0, err_line: 0 };
+    yt_init(&t);
+    defer { yt_free(&t); }
+    if !yt_parse_text(&cfg, &t) {
+        return true;
+    }
+    const root: i32 = yt_root(&t);
+    const provs: i32 = yt_get(&t, root, "providers" as &const byte);
+    if provs < 0 {
+        return true;
+    }
+    var c: i32 = yt_child(&t, provs);
+    while c >= 0 {
+        const key: &[byte] = yt_key(&t, c);
+        if key.len > 0 {
+            if out.len > 0 && !buf_append_byte(out, 10) {
+                return false;
+            }
+            if !buf_append(out, key.ptr as &const byte, key.len) {
+                return false;
+            }
+        }
+        c = yt_next(&t, c);
+    }
+    return true;
+}
+
+// `llm/listProviders`：**已注册**的路由（客户端用它判 `active`）。本仓活会话里
+// 每个提供方都是真的可用（路线由子进程现算），所以文档里有几条就报几条。
+export fn dwhs_list_providers(d: &const DshDoc, out: &Buf) bool {
+    var routes: Buf = buf_new(512);
+    defer { buf_free(&routes); }
+    if !dwhs_routes_into(d, &routes) {
+        return false;
+    }
+    buf_reset(out);
+    if !buf_append_byte(out, 91) {
+        return false;
+    }
+    var first: bool = true;
+    var pos: usize = 0;
+    while pos <= routes.len {
+        var e: usize = pos;
+        while e < routes.len && routes.ptr[e] != 10 as byte {
+            e = e + 1;
+        }
+        if e > pos {
+            if !first && !buf_append_byte(out, 44) {
+                return false;
+            }
+            first = false;
+            if !buf_append_cstr(out, "{\"id\":") {
+                return false;
+            }
+            if !jw_str_into(out, &routes.ptr[pos] as &const byte, e - pos) {
+                return false;
+            }
+            if !buf_append_cstr(out, ",\"name\":") {
+                return false;
+            }
+            if !jw_str_into(out, &routes.ptr[pos] as &const byte, e - pos) {
+                return false;
+            }
+            if !buf_append_byte(out, 125) {
+                return false;
+            }
+        }
+        if e >= routes.len {
+            break;
+        }
+        pos = e + 1;
+    }
+    return buf_append_byte(out, 93);
+}
+
+// `llm/listConfigurableProviders`：可配置的提供方 **declared profile**
+// （`{provider,displayName,settingsNs,settingsPath,declared?}`）。
+// 本仓的每一条都是「人写在配置文档里的」⇒ `declared: true`（客户端据此允许编辑
+// 线协议那一栏 —— 装了目录的路线才有默认协议可谈）。
+export fn dwhs_list_configurable(d: &const DshDoc, out: &Buf) bool {
+    var routes: Buf = buf_new(512);
+    defer { buf_free(&routes); }
+    if !dwhs_routes_into(d, &routes) {
+        return false;
+    }
+    buf_reset(out);
+    if !buf_append_byte(out, 91) {
+        return false;
+    }
+    var first: bool = true;
+    var pos: usize = 0;
+    while pos <= routes.len {
+        var e: usize = pos;
+        while e < routes.len && routes.ptr[e] != 10 as byte {
+            e = e + 1;
+        }
+        if e > pos {
+            if !first && !buf_append_byte(out, 44) {
+                return false;
+            }
+            first = false;
+            var name: Buf = buf_new(64);
+            defer { buf_free(&name); }
+            if !buf_append(&name, &routes.ptr[pos] as &const byte, e - pos) {
+                return false;
+            }
+            if !dwhs_one_configurable(&name, out) {
+                return false;
+            }
+        }
+        if e >= routes.len {
+            break;
+        }
+        pos = e + 1;
+    }
+    return buf_append_byte(out, 93);
+}
+
+// 一条 `listConfigurableProviders` 项。
+fn dwhs_one_configurable(prov: &const Buf, out: &Buf) bool {
+    var disp: Buf = buf_new(prov.len + 8);
+    defer { buf_free(&disp); }
+    if !dwhs_display_name(prov, &disp) {
+        return false;
+    }
+    if !buf_append_cstr(out, "{\"provider\":") {
+        return false;
+    }
+    if !jw_str_into(out, prov.ptr as &const byte, prov.len) {
+        return false;
+    }
+    if !buf_append_cstr(out, ",\"displayName\":") {
+        return false;
+    }
+    if !jw_str_into(out, disp.ptr as &const byte, disp.len) {
+        return false;
+    }
+    if !buf_append_cstr(out, ",\"settingsNs\":") {
+        return false;
+    }
+    if !jw_str_into(out, DWHS_NS, bufx_cstr_len(DWHS_NS)) {
+        return false;
+    }
+    if !buf_append_cstr(out, ",\"settingsPath\":[\"providers\",") {
+        return false;
+    }
+    if !jw_str_into(out, prov.ptr as &const byte, prov.len) {
+        return false;
+    }
+    return buf_append_cstr(out, "],\"declared\":true}");
+}
+
+// `llm/discoverModels` 的**一句话**：本仓不做端点探测。
+//
+// 为什么不做：那要按页面上的草稿（baseURL + 协议 + 一次性密钥）发一次真请求，
+// 而「列模型」这件事在本仓的部署里没有意义 —— 文档里的模型清单是**人写的**，
+// 页面上的「模型」编辑器本来就是手填。回一条**说清楚**的业务错，让那张卡片
+// 干净地退回去手填，而不是给一个空下拉框（空下拉框看起来像「这个端点没有模型」）。
+export fn dwhs_discover_note() &const byte {
+    return "本仓不做端点探测：模型的清单请手填（它来自 DSH 的配置文档）" as &const byte;
+}
+
+// 返回码 → 带命名空间的业务错码。
+//
+// 为什么不用一个笼统的 `internal`：客户端把这些码原样显示给用户（Models 页把
+// 失败消息渲染在卡片上），而 `stale`（revision 冲突）与 `settings/conflict` 在
+// 真 DSH 里是**可重试**的一类，笼统的 internal 会让用户以为「这个功能坏了」。
+export fn dwhs_code_of(rc: i32) &const byte {
+    if rc == DSHD_STALE {
+        return "settings/conflict" as &const byte;
+    }
+    if rc == DSHD_OPS {
+        return "bad-request" as &const byte;
+    }
+    if rc == DSHD_BUSY {
+        return "gateway/unavailable" as &const byte;
+    }
+    if rc == DSHD_NOFILE || rc == DSHD_NOENTRY {
+        return "settings/not-configurable" as &const byte;
+    }
+    return "internal" as &const byte;
+}

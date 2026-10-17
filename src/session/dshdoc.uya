@@ -1,0 +1,1882 @@
+// src/session/dshdoc.uya — DSH 0.2.0 的**配置文档**（profile patch）读写
+//
+// 本文件：`dshd_*` —— 把 DSH 0.2.0 **真正读的那份文档**
+//   （`$DSH_HOME/profiles/<profile>/cordis.patch.yml`：一份顶层 YAML **序列**，
+//   每项 `- {id, name, config}` 是一条 loader patch）读成结构化视图，并按设置页
+//   发来的 path ops 做**键级/块级**改写（`dshd_mutate`），写回走
+//   「抢锁 → 临时文件 → rename」（与 P71 的 `dshsave.uya` 同一协议）。
+// 为什么是它而不是 `settings.yaml`：0.2.0 启动时把 `settings.yaml` **导入并改名**
+//   成 `settings.yaml.imported`（`dsh-settings` 的 `importLegacyDocument`），此后
+//   一切读写都落在 profile 的 patch 层上 —— 盯着那份 legacy 文件读，症状是
+//   「模型目录永远是空的」，而**没有任何报错**。
+// 不变量：① **只做局部的行级替换** —— 被改的只有目标键的那几行，注释、`!!js` 行、
+//   兄弟条目、别的 ns **逐字节不变**（整份「解析成树再重写」会把注释全丢掉，
+//   P71 首版踩过一次，见 DESIGN §8.8.1）；② **不新建文档** —— 文档不存在就
+//   `DSHD_NOFILE` 交回调用方报错，不替用户造一份（同 P71 的 `DSHW_NOFILE`）；
+//   ③ **认不出的形状就拒绝**：值不是块状（`config: {}` 这类内联值）、路径里带
+//   引号/冒号/换行 —— 一律 `DSHD_SHAPE` / `DSHD_OPS`，绝不猜（猜错的代价是把用户
+//   的设置改坏，而用户看不出是哪一步改坏的）；④ **写前自检**：改完的文本必须自己
+//   解析得回来、且目标 ns 的条目还原地找得到（`dshd_mutate` 末尾那两段），否则不落盘；
+//   ⑤ 读侧的标量**按引号判类型**（`"1"` 是字符串、`1` 是数字）—— 这是本仓自己的
+//   读码，不借 `yamlcfg`：那一层**丢引号信息**（`YNode.val` 已去引号），拿它当
+//   类型源会把 `contextWindow: "1000000"` 读成数字、把 `apiKeyEnv: 1000000` 读成
+//   字符串，两个方向的错都只在界面上表现为「这一个提供方不可用」。
+// 依赖：libc（syscall / unistd）；本仓 foundation/bufx、foundation/jsonx
+//   （`JsonValue` 走查：ops 的值是**已解析的 JSON**，这里只负责把它写成 YAML）、
+//   foundation/yamlcfg（写前自检那一次 `yt_parse_text`）、session/session
+//   （`jw_str_into`）。
+// 命名：对外 `dshd_*`（读写入口）+ 类型 `DshDoc`/`DshdOps`/`DshdOp` + 常量 `DSHD_*`；
+//   私有 `dv_*`（视图上的导航与取值）/`dy_*`（YAML 生成）/`dd_*`（文档与拼接）。
+
+use libc.syscall;
+use libc.unistd;
+
+// 返回码。0 = 成功；其余都**带语义**回给调用方（设置面板把它们翻成一句可见的话，
+// 不静默 —— 静默的失败在这一簇里表现为「点了没反应」）。
+export const DSHD_OK: i32 = 0;
+export const DSHD_NOFILE: i32 = 1;   // 文档不存在（**不新建**）
+export const DSHD_NOENTRY: i32 = 2;  // 文档里没有这个 ns 的条目（或没有 config 节）
+export const DSHD_SHAPE: i32 = 3;    // 形状不认（内联值 / 缩进怪 / 自检不过）
+export const DSHD_OPS: i32 = 4;      // 路径不支持（空段、段数过多、段里有控制字节）
+export const DSHD_BUSY: i32 = 5;     // 写锁被占（别人的锁绝不删）
+export const DSHD_IO: i32 = 6;       // 读写或内存失败
+export const DSHD_STALE: i32 = 7;    // revision 不符（页面拿的是旧视图）
+
+// 文档上限：真机 profile patch 是 KB 量级；512 KiB / 2048 行只用来挡住「读到别的东西」。
+export const DSHD_MAX_BYTES: usize = 524288;
+export const DSHD_MAX_LINES: usize = 2048;
+
+// 一次 ops 请求的上限（页面一次提交最多几个键）与单个路径的段数上限。
+export const DSHD_OPS_MAX: usize = 16;
+export const DSHD_PATH_MAX: usize = 4;
+
+// 抢锁的总等待：与 `dshsave.uya` 同口径 —— 这条在交互路径上，卡界面比「这次没写」更坏，
+// 而失败是可见的（回执里说清楚），用户再点一次还会重试。
+export const DSHD_LOCK_WAIT_MS: u64 = 400;
+
+export const DSHD_KIND_SET: u8 = 0;
+export const DSHD_KIND_UNSET: u8 = 1;
+
+// 文档里的一行：`off` = 行首，`end` = 行尾（不含 `\n`），`indent` = 前导空格数。
+// 空行与注释行也在表里（缩进计算与「块到哪里结束」都要看它们）。
+struct DshLine {
+    off: usize,
+    end: usize,
+    indent: usize,
+}
+
+// 一份文本 + 它的行表（所有导航都在这个视图上做；改一次就重建一次）。
+struct DshView {
+    text: Buf,
+    lines: [DshLine: DSHD_MAX_LINES],
+    n: usize,
+}
+
+// 一个键的**块**：`first` = 键所在行，`after` = 块后第一行（不含），`indent` = 键的缩进。
+struct DshRange {
+    first: usize,
+    after: usize,
+    indent: usize,
+    ok: bool,
+}
+
+// 一段字节（inline 值的原文；`has` = 有值）。
+struct DshSlice {
+    off: usize,
+    len: usize,
+    has: bool,
+}
+
+// 一条 path op。`seg` 是相对**该 ns 的 config 节**的路径（如 `providers/acme/baseURL`）。
+// `val` 是**已解析的 JSON 值**（op=set 时用；指向调用方的 arena，本文件只读它）。
+export struct DshdOp {
+    kind: u8,
+    nseg: usize,
+    seg: [Buf: DSHD_PATH_MAX],
+    val: JsonValue,
+}
+
+// 一次 `settings/mutate` 的 ops（定长表 + 计数；槽位必须先 `dshd_ops_init`）。
+export struct DshdOps {
+    items: [DshdOp: DSHD_OPS_MAX],
+    n: usize,
+}
+
+// 一份**打开的**配置文档。
+export struct DshDoc {
+    home: Buf,      // DSH 设置根（`--dsh-home` / `$DSH_HOME` / `~/.dsh`）
+    profile: Buf,   // profile 名（`--dsh-profile` / `$DSH_PROFILE` / `web`）
+    // `<home>/profiles/<profile>/cordis.patch.yml` + 尾 NUL（C 串口径）
+    path: Buf,
+    text: Buf,      // 文档原文（读进来的那一份）
+    rev: i64,       // 文本指纹（页面拿它做写前冲突判据）
+    loaded: bool,
+}
+
+// 一张空的行表（`text` 是**未分配**的空 Buf：调用方直接往上追加，别当它已初始化）。
+fn dv_empty_view() DshView {
+    return DshView{ text: buf_empty(),
+        lines: [DshLine{ off: 0, end: 0, indent: 0 }: DSHD_MAX_LINES], n: 0 };
+}
+
+// 零值（宿主把它按值放进自己的状态里）。
+// 一份空文档（Buf 全是 `buf_empty()`：没分配过，所以 `dshd_free` 对它是安全的）。
+export fn dshd_zero() DshDoc {
+    return DshDoc{ home: buf_empty(), profile: buf_empty(), path: buf_empty(),
+        text: buf_empty(), rev: 0, loaded: false };
+}
+
+// 释放这份文档持有的四个缓冲（`loaded` 复位；对 `dshd_zero()` 的产物安全）。
+export fn dshd_free(d: &DshDoc) void {
+    if buf_valid(&d.home) {
+        buf_free(&d.home);
+    }
+    if buf_valid(&d.profile) {
+        buf_free(&d.profile);
+    }
+    if buf_valid(&d.path) {
+        buf_free(&d.path);
+    }
+    if buf_valid(&d.text) {
+        buf_free(&d.text);
+    }
+    d.loaded = false;
+}
+
+// 一条 op 的空槽（`seg` 每格都要显式初始化，否则指向的是栈上的垃圾）。
+// op 的第 k 段（定长数组元素取地址**必须带上界检查**：C 后端才生成 `&op->seg[k]`，
+// 否则它是一个结构体值、不能当指针初始化 —— 与 `mx_entry_at` 同一条纪律）。
+fn dd_seg(op: &const DshdOp, k: usize) &const Buf {
+    if k >= DSHD_PATH_MAX {
+        return &op.seg[0];
+    }
+    return &op.seg[k];
+}
+
+// 一条空 op（kind = set、零段路径、值是 JSON null —— 由 `dshd_ops_init` 铺满全表）。
+fn dd_op_empty() DshdOp {
+    return DshdOp{ kind: DSHD_KIND_SET, nseg: 0,
+        seg: [buf_empty(): DSHD_PATH_MAX], val: JsonValue.json_null() };
+}
+
+// 一整张空 ops 表（调用方按值起表用；槽位已经初始化过）。
+export fn dshd_ops_zero() DshdOps {
+    return DshdOps{ items: [dd_op_empty(): DSHD_OPS_MAX], n: 0 };
+}
+
+// 全表清零（**必须先调**：定长数组的槽不是自动初始化的）。
+export fn dshd_ops_init(o: &DshdOps) void {
+    var i: usize = 0;
+    while i < DSHD_OPS_MAX {
+        o.items[i] = dd_op_empty();
+        i = i + 1;
+    }
+    o.n = 0;
+}
+
+// 释放全表各段的堆缓冲（只释放前 `n` 条、每条路径的前 `nseg` 段）。
+export fn dshd_ops_free(o: &DshdOps) void {
+    var i: usize = 0;
+    while i < o.n {
+        var k: usize = 0;
+        while k < DSHD_PATH_MAX {
+            const sp: &const Buf = dd_seg(&o.items[i], k);
+            if buf_valid(sp) {
+                buf_free(sp);
+            }
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    o.n = 0;
+}
+
+// 追加一条 op，返回它的槽位指针（拿指针而不是值：uya 里整条结构体不能在循环里赋值）。
+export fn dshd_ops_add(o: &DshdOps) &DshdOp {
+    if o.n >= DSHD_OPS_MAX {
+        return &o.items[0];
+    }
+    const idx: usize = o.n;
+    o.n = o.n + 1;
+    return &o.items[idx];
+}
+
+// ============================================================
+// 读一份文件进 out（**文件层**在 `dshfile.uya`：读不到不算错、超限拒绝、原子写）。
+// 这里只留一句转发：`dshd_open` 要它。
+export fn dshd_read_file_z(path_z: &const byte, out: &Buf) i32 {
+    return dshd_read_file(path_z, out);
+}
+
+// 行表与导航
+// ============================================================
+
+// 建行表（顺带把行数上限卡住）。
+fn dv_index(v: &DshView) bool {
+    v.n = 0;
+    var off: usize = 0;
+    var i: usize = 0;
+    while off < v.text.len {
+        if i >= DSHD_MAX_LINES {
+            return false;
+        }
+        var e: usize = off;
+        while e < v.text.len && v.text.ptr[e] != 10 as byte {
+            e = e + 1;
+        }
+        var ind: usize = off;
+        while ind < e && v.text.ptr[ind] == 32 as byte {
+            ind = ind + 1;
+        }
+        const lp: &DshLine = dl_at_m(v, i);
+        lp.off = off;
+        lp.end = e;
+        lp.indent = ind - off;
+        i = i + 1;
+        off = e + 1;
+    }
+    v.n = i;
+    return true;
+}
+
+// 用一份文本建视图（拷贝文本；调用方随后只读视图）。
+fn dv_of(text: &const Buf, v: &DshView) bool {
+    v.text = buf_new(text.len + 64);
+    v.n = 0;
+    if !buf_append(&v.text, text.ptr as &const byte, text.len) {
+        return false;
+    }
+    return dv_index(v);
+}
+
+// 释放行表持有的那份文本（`lines[]` 只是偏移，没有自己的内存）。
+fn dv_free(v: &DshView) void {
+    if buf_valid(&v.text) {
+        buf_free(&v.text);
+    }
+    v.n = 0;
+}
+
+// 行表的只读取行（定长数组的下标必须带字面量上界检查，编译器的安全证明才过）。
+fn dl_at(w: &const DshView, i: usize) &const DshLine {
+    if i >= DSHD_MAX_LINES {
+        return &w.lines[0];
+    }
+    return &w.lines[i];
+}
+
+// 行表的可变取行（越界回退到 lines[0]，仅为通过安全证明，不表示语义正确）。
+fn dl_at_m(w: &DshView, i: usize) &DshLine {
+    if i >= DSHD_MAX_LINES {
+        return &w.lines[0];
+    }
+    return &w.lines[i];
+}
+
+// 一行是不是空行（只有空白）。
+fn dv_blank(v: &const DshView, i: usize) bool {
+    return dl_at(v, i).indent >= (dl_at(v, i).end - dl_at(v, i).off);
+}
+
+// 这一行从内容起点看是不是注释。
+fn dv_comment(v: &const DshView, i: usize) bool {
+    if dv_blank(v, i) {
+        return false;
+    }
+    return v.text.ptr[dl_at(v, i).off + dl_at(v, i).indent] == 35 as byte;
+}
+
+// 这一行的内容是不是一个序列项（`- …`）。
+fn dv_dash(v: &const DshView, i: usize) bool {
+    if dv_blank(v, i) || dv_comment(v, i) {
+        return false;
+    }
+    const s: usize = dl_at(v, i).off + dl_at(v, i).indent;
+    if s >= dl_at(v, i).end {
+        return false;
+    }
+    if v.text.ptr[s] != 45 as byte {
+        return false;
+    }
+    return s + 1 >= dl_at(v, i).end || v.text.ptr[s + 1] == 32 as byte;
+}
+
+// 一段字节（在 `e` 之前）是不是一个序列项的开头（`- `）——`dv_key_any` 与
+// `dv_inline` 都要剥这个前缀，剥法必须**只有一处**（分头写会有一处漏掉某个边界，
+// 而症状是「同一个键一处找得到、另一处找不到」）。
+fn dv_dash_at(v: &const DshView, s: usize, e: usize) bool {
+    if s + 1 >= e {
+        return false;
+    }
+    if v.text.ptr[s] != 45 as byte {
+        return false;
+    }
+    return v.text.ptr[s + 1] == 32 as byte;
+}
+
+// 行 i 的 key（不看缩进；`- key: …` 的 `- ` 会剥掉）。false = 这行不是 `key: …`。
+fn dv_key_any(v: &const DshView, i: usize, out: &Buf) bool {
+    if dv_blank(v, i) || dv_comment(v, i) {
+        return false;
+    }
+    var s: usize = dl_at(v, i).off + dl_at(v, i).indent;
+    const e: usize = dl_at(v, i).end;
+    if dv_dash_at(v, s, e) {
+        s = s + 2;
+    }
+    var c: usize = s;
+    while c < e && v.text.ptr[c] != 58 as byte {
+        c = c + 1;
+    }
+    if c >= e {
+        return false;
+    }
+    // `:` 必须是「键的结束」（后面跟空格或到行尾）—— `https://…` 里的冒号不算。
+    if c + 1 < e && v.text.ptr[c + 1] != 32 as byte
+        && v.text.ptr[c + 1] != 9 as byte {
+        return false;
+    }
+    var ks: usize = s;
+    var ke: usize = c;
+    while ks < ke && v.text.ptr[ks] == 32 as byte {
+        ks = ks + 1;
+    }
+    while ke > ks && v.text.ptr[ke - 1] == 32 as byte {
+        ke = ke - 1;
+    }
+    // ⚠ 键名去引号：本仓**自己写出来的**键是加双引号的（`"providers":`，见 `dy_quoted`），
+    // 而调用方拿来比的总是纯文本（`providers`）。不剥引号时「刚写进去的键下一次就查不到」
+    // ——症状是「加了提供方、界面里没有」，而写出来的文件本身完全正确。
+    var kslice: DshSlice = DshSlice{ off: ks, len: ke - ks, has: true };
+    return dv_unquote(v, &kslice, out);
+}
+
+// 行 i 在缩进 `indent` 上是一个 `key: …` 吗？
+fn dv_key(v: &const DshView, i: usize, indent: usize, out: &Buf) bool {
+    if dl_at(v, i).indent != indent {
+        return false;
+    }
+    return dv_key_any(v, i, out);
+}
+
+// 行 i 的 inline 值（`:` 之后的原文，去两侧空白与行尾注释）。没有值 ⇒ has = false。
+fn dv_inline(v: &const DshView, i: usize, out: &DshSlice) void {
+    out.has = false;
+    out.off = 0;
+    out.len = 0;
+    var s: usize = dl_at(v, i).off + dl_at(v, i).indent;
+    const e: usize = dl_at(v, i).end;
+    if dv_dash_at(v, s, e) {
+        s = s + 2;
+    }
+    var c: usize = s;
+    while c < e && v.text.ptr[c] != 58 as byte {
+        c = c + 1;
+    }
+    if c >= e {
+        return;
+    }
+    var vs: usize = c + 1;
+    var ve: usize = e;
+    while vs < ve && (v.text.ptr[vs] == 32 as byte
+        || v.text.ptr[vs] == 9 as byte) {
+        vs = vs + 1;
+    }
+    while ve > vs && (v.text.ptr[ve - 1] == 32 as byte
+        || v.text.ptr[ve - 1] == 9 as byte) {
+        ve = ve - 1;
+    }
+    // 行尾注释：` #…`（前面有空格的）不算值的一部分
+    var k: usize = vs;
+    while k < ve {
+        if v.text.ptr[k] == 35 as byte && k > vs
+            && v.text.ptr[k - 1] == 32 as byte {
+            ve = k;
+            while ve > vs && v.text.ptr[ve - 1] == 32 as byte {
+                ve = ve - 1;
+            }
+            break;
+        }
+        k = k + 1;
+    }
+    if ve <= vs {
+        return;
+    }
+    out.has = true;
+    out.off = vs;
+    out.len = ve - vs;
+}
+
+// 片段的第一个字节（`has` 假时给 0）。
+fn dv_first(v: &const DshView, s: &const DshSlice) byte {
+    if !s.has {
+        return 0;
+    }
+    return v.text.ptr[s.off];
+}
+
+// 这段片段与字面量逐字节相同吗。
+fn dv_eq_lit(v: &const DshView, s: &const DshSlice, lit: &const byte) bool {
+    if !s.has {
+        return false;
+    }
+    const n: usize = bufx_cstr_len(lit);
+    if n != s.len {
+        return false;
+    }
+    if n == 0 {
+        return true;
+    }
+    return bufx_mem_eq(&v.text.ptr[s.off] as &const byte, lit, n);
+}
+
+// 键所在行的**块**结束行（块后第一行）。子行 = 缩进更深，或同缩进的 `- ` 序列项。
+//
+// ⚠ 两种键的判据**不一样**，混起来会吞掉整篇文档（实测：顶层条目
+// `- id: ui-theme` 的块一路吃到文件末尾，于是第二个条目永远找不到 ——
+// 症状是「加了提供方、下一次读还是空的」，而**任何**报错都没有）：
+//   * 键**本身是序列项**（`- id: …`）⇒ 同缩进的下一行**结束**这个块（那是下一条）；
+//   * 键是普通映射键（`models:`）⇒ 同缩进的 `- ` 项是**它的**序列，继续算它的块
+//     （YAML 允许序列项与键同缩进）。
+fn dv_block_end(v: &const DshView, k: usize, ki: usize) usize {
+    var j: usize = k + 1;
+    const kdash: bool = dv_dash(v, k);
+    while j < v.n {
+        if !dv_blank(v, j) && !dv_comment(v, j) {
+            const ind: usize = dl_at(v, j).indent;
+            if ind > ki {
+                j = j + 1;
+                continue;
+            }
+            if ind == ki && kdash {
+                return j;
+            }
+            if ind == ki && dv_dash(v, j) {
+                j = j + 1;
+                continue;
+            }
+            return j;
+        }
+        j = j + 1;
+    }
+    return j;
+}
+
+// 可替换范围的**结束行下标**（不含）：从块尾往回跳过空行与注释行（它们留在原地）。
+fn dv_block_trim(v: &const DshView, k: usize, after: usize) usize {
+    var j: usize = after;
+    while j > k + 1 {
+        const i: usize = j - 1;
+        if dv_blank(v, i) || dv_comment(v, i) {
+            j = j - 1;
+            continue;
+        }
+        break;
+    }
+    return j;
+}
+
+// 行下标 a（含）到 b（不含）的字节范围；b 越过末行时取到文本末尾。
+fn dv_bytes(v: &const DshView, a: usize, b: usize, out: &DshSlice) void {
+    out.off = dl_at(v, a).off;
+    out.has = true;
+    if b >= v.n {
+        out.len = v.text.len - out.off;
+    } else {
+        out.len = dl_at(v, b).off - out.off;
+    }
+}
+
+// 在 [from, to) 里找 `key` 的**直接子块**（只认第一个子行的缩进那一层）。
+fn dv_find_child(v: &const DshView, from: usize, to: usize, parent: usize,
+    key: &const byte, kl: usize, out: &DshRange) bool {
+    return dv_find_key_in(v, from, to, parent, false, key, kl, out);
+}
+
+// **顶层**（文档根 / 一个映射的最外层）里的一个键：第一层内容行的缩进就是这一层，
+// 所以「子行必须比父缩进更深」这条判据在这里不成立（拿父缩进 0 去比，会把
+// `version:` / `refs:` 这些顶层键全判成「没有子行」——实测症状：凭据文件里的
+// 每一个 ref 都被当成不存在，界面上「已配置的密钥」全是空的）。
+fn dv_find_root(v: &const DshView, from: usize, to: usize,
+    key: &const byte, kl: usize, out: &DshRange) bool {
+    return dv_find_key_in(v, from, to, 0, true, key, kl, out);
+}
+
+// ⚠ `key` 一律**带长度**：调用方给的常常是一个 `Buf` 的内容（没有 NUL 结尾），
+// 当 C 串读会一路读到相邻内存 —— 症状是「夹具里的第一条凭据查不到、第二条能查到」
+// 这种**位置相关**的怪事（`bufx_cstr_len` 读到哪就在哪停）。
+fn dv_find_key_in(v: &const DshView, from: usize, to: usize, parent: usize,
+    is_root: bool, key: &const byte, kl: usize, out: &DshRange) bool {
+    out.ok = false;
+    var j: usize = from;
+    var ci: usize = 0;
+    var have_ci: bool = false;
+    while j < to {
+        if dv_blank(v, j) || dv_comment(v, j) {
+            j = j + 1;
+            continue;
+        }
+        if !have_ci {
+            if !is_root && dl_at(v, j).indent <= parent {
+                return false;       // 没有子行
+            }
+            ci = dl_at(v, j).indent;
+            have_ci = true;
+        }
+        if dl_at(v, j).indent == ci {
+            var s: Buf = buf_new(64);
+            defer { buf_free(&s); }
+            if dv_key(v, j, ci, &s) && s.len == kl
+                && bufx_mem_eq(s.ptr as &const byte, key, kl) {
+                out.first = j;
+                out.indent = ci;
+                out.after = dv_block_end(v, j, ci);
+                out.ok = true;
+                return true;
+            }
+        }
+        j = j + 1;
+    }
+    return false;
+}
+
+// 找 `id:` 等于 ns 的顶层序列项，返回它的整块。
+fn dv_find_entry(v: &const DshView, ns: &const byte, nl: usize,
+    out: &DshRange) bool {
+    out.ok = false;
+    var j: usize = 0;
+    while j < v.n {
+        if dv_dash(v, j) && dl_at(v, j).indent == 0 {
+            const after: usize = dv_block_end(v, j, 0);
+            var s: Buf = buf_new(64);
+            defer { buf_free(&s); }
+            var iv: DshSlice = DshSlice{ off: 0, len: 0, has: false };
+            if dv_key(v, j, 0, &s) && s.len == 2
+                && bufx_mem_eq(s.ptr as &const byte, "id" as &const byte, 2) {
+                dv_inline(v, j, &iv);
+                // ⚠ 值要**去引号**再比：`- id: "llm-pi-ai"` 是合法 YAML（本仓
+                // 自己写的新条目就是加引号的），拿原文比会把带引号的条目当成
+                // 「没有这一节」——症状是「加了条目、下一次读还是空的」。
+                var idb: Buf = buf_new(64);
+                defer { buf_free(&idb); }
+                if iv.has && dv_unquote(v, &iv, &idb) && idb.len == nl
+                    && bufx_mem_eq(idb.ptr as &const byte, ns, nl) {
+                    out.first = j;
+                    out.after = after;
+                    out.indent = 0;
+                    out.ok = true;
+                    return true;
+                }
+            }
+            j = after;
+            continue;
+        }
+        j = j + 1;
+    }
+    return false;
+}
+
+// ns 条目的 `config` **键**（first = `config:` 那一行；子行在 [first+1, after)）。
+fn dv_config_of(v: &const DshView, ns: &const byte, nl: usize,
+    out: &DshRange) bool {
+    out.ok = false;
+    var e: DshRange = DshRange{ first: 0, after: 0, indent: 0, ok: false };
+    if !dv_find_entry(v, ns, nl, &e) {
+        return false;
+    }
+    return dv_find_child(v, e.first + 1, e.after, e.indent,
+        "config" as &const byte, 6, out);
+}
+
+// 从 config 的内容行里走一条路径（前 nseg 段）；末段命中时 out 指向**那个键的块**，
+// 没命中时 out.ok = false 且 out_ci 是「新键该用的缩进」。
+fn dv_walk(v: &const DshView, cfg: &const DshRange, path: &const DshdOp,
+    nseg: usize, out: &DshRange, out_ci: &usize) bool {
+    out.ok = false;
+    out_ci[0] = cfg.indent + 2;
+    if nseg == 0 {
+        return false;
+    }
+    var from: usize = cfg.first + 1;
+    var to: usize = cfg.after;
+    var parent: usize = cfg.indent;
+    var i: usize = 0;
+    while i < nseg {
+        var r: DshRange = DshRange{ first: 0, after: 0, indent: 0, ok: false };
+        const last: bool = i + 1 == nseg;
+        const segb: &const Buf = dd_seg(path, i);
+        if !dv_find_child(v, from, to, parent,
+            segb.ptr as &const byte, segb.len, &r) {
+            out_ci[0] = parent + 2;
+            return true;            // 没找到：调用方按 last 决定「插」还是「拒」
+        }
+        if last {
+            out.first = r.first;
+            out.after = r.after;
+            out.indent = r.indent;
+            out.ok = true;
+            return true;
+        }
+        from = r.first + 1;
+        to = r.after;
+        parent = r.indent;
+        i = i + 1;
+    }
+    return false;
+}
+
+// ============================================================
+// 读：块 → JSON（按引号判类型）
+// ============================================================
+
+// 把一段标量片段解成**纯文本**：去引号 + 解转义（`\n`/`\"`/`''`）。
+fn dv_unquote(v: &const DshView, s: &const DshSlice, out: &Buf) bool {
+    buf_reset(out);
+    const p: &const byte = &v.text.ptr[s.off] as &const byte;
+    const c0: byte = dv_first(v, s);
+    if c0 != 34 as byte && c0 != 39 as byte {
+        return buf_append(out, p, s.len);
+    }
+    const q: byte = c0;
+    var i: usize = 1;
+    while i + 1 < s.len {
+        if q == 34 as byte && p[i] == 92 as byte && i + 1 < s.len {
+            const nx: byte = p[i + 1];
+            if nx == 110 as byte {
+                _ = buf_append_byte(out, 10);
+            } else if nx == 116 as byte {
+                _ = buf_append_byte(out, 9);
+            } else if nx == 114 as byte {
+                _ = buf_append_byte(out, 13);
+            } else {
+                _ = buf_append_byte(out, nx);
+            }
+            i = i + 2;
+            continue;
+        }
+        if q == 39 as byte && p[i] == 39 as byte && i + 1 < s.len
+            && p[i + 1] == 39 as byte {
+            _ = buf_append_byte(out, 39);
+            i = i + 2;
+            continue;
+        }
+        _ = buf_append_byte(out, p[i]);
+        i = i + 1;
+    }
+    return true;
+}
+
+// 一个标量片段 → JSON（`"…"`/`'…'` 是字符串；true/false 是布尔；纯整数是数字；
+// 其余按字符串写出去）。
+fn dv_scalar_json(v: &const DshView, s: &const DshSlice, out: &Buf) bool {
+    const p: &const byte = &v.text.ptr[s.off] as &const byte;
+    const c0: byte = dv_first(v, s);
+    if c0 == 34 as byte || c0 == 39 as byte {
+        var tmp: Buf = buf_new(s.len + 8);
+        defer { buf_free(&tmp); }
+        if !dv_unquote(v, s, &tmp) {
+            return false;
+        }
+        return jw_str_into(out, tmp.ptr as &const byte, tmp.len);
+    }
+    if dv_eq_lit(v, s, "true" as &const byte) {
+        return buf_append_cstr(out, "true");
+    }
+    if dv_eq_lit(v, s, "false" as &const byte) {
+        return buf_append_cstr(out, "false");
+    }
+    if dv_eq_lit(v, s, "null" as &const byte)
+        || dv_eq_lit(v, s, "~" as &const byte) {
+        return buf_append_cstr(out, "null");
+    }
+    var digits: bool = true;
+    var i: usize = 0;
+    if c0 == 45 as byte {
+        i = 1;
+    }
+    if i >= s.len {
+        digits = false;
+    }
+    while i < s.len {
+        if !is_digit(p[i]) {
+            digits = false;
+            break;
+        }
+        i = i + 1;
+    }
+    if digits {
+        return buf_append(out, p, s.len);
+    }
+    return jw_str_into(out, p, s.len);
+}
+
+// 一个映射块（[from, to) 之间缩进为 indent 的 `key: …` 行）→ JSON 对象。
+// `head` >= 0 时先放那一行（`- key: …` 的序列元素：它的键缩进与 rest 不同）。
+fn dv_map_json(v: &const DshView, from: usize, to: usize, indent: usize,
+    head: i64, out: &Buf) bool {
+    if !buf_append_byte(out, 123) {
+        return false;
+    }
+    var first: bool = true;
+    var cur: i64 = head;
+    var j: usize = from;
+    while cur >= 0 || j < to {
+        var at: usize = 0;
+        var is_head: bool = false;
+        if cur >= 0 {
+            at = cur as usize;
+            cur = -1;
+            is_head = true;
+        } else {
+            at = j;
+            j = j + 1;
+            if dv_blank(v, at) || dv_comment(v, at)
+                || dl_at(v, at).indent != indent {
+                continue;
+            }
+        }
+        var kb: Buf = buf_new(128);
+        defer { buf_free(&kb); }
+        if is_head {
+            if !dv_key_any(v, at, &kb) {
+                continue;
+            }
+        } else if !dv_key(v, at, indent, &kb) {
+            continue;
+        }
+        if !first {
+            if !buf_append_byte(out, 44) {
+                return false;
+            }
+        }
+        first = false;
+        if !jw_str_into(out, kb.ptr as &const byte, kb.len) {
+            return false;
+        }
+        if !buf_append_byte(out, 58) {
+            return false;
+        }
+        var sl: DshSlice = DshSlice{ off: 0, len: 0, has: false };
+        dv_inline(v, at, &sl);
+        if sl.has {
+            if !dv_scalar_json(v, &sl, out) {
+                return false;
+            }
+            continue;
+        }
+        const be: usize = dv_block_end(v, at, indent);
+        if !dv_block_json(v, at + 1, be, indent, out) {
+            return false;
+        }
+    }
+    return buf_append_byte(out, 125);
+}
+
+// 一个块（[from, to)，父缩进 parent）→ JSON。由**第一个子行**决定是映射还是序列；
+// 没有子行时给 `{}`（空映射：本仓自己写出来的空节就是这种形态）。
+fn dv_block_json(v: &const DshView, from: usize, to: usize, parent: usize,
+    out: &Buf) bool {
+    var j: usize = from;
+    while j < to {
+        if dv_blank(v, j) || dv_comment(v, j) {
+            j = j + 1;
+            continue;
+        }
+        // ⚠ 序列项**先判**：块状序列的 `- ` 既可以与键同缩进（YAML 允许），也可以
+        // 更深（本仓与 DSH 自己写出来的都是**更深两格**）。先判「缩进更深」会把
+        // 一个 `- id: …` 序列当成映射，于是 `models` 读回来成了 `{"id": …}` 而不是
+        // `[{...}]` —— 页面上那是「模型清单只剩第一行、还丢了所有字段」。
+        if dv_dash(v, j) {
+            return dv_seq_json(v, from, to, dl_at(v, j).indent, out);
+        }
+        if dl_at(v, j).indent > parent {
+            return dv_map_json(v, from, to, dl_at(v, j).indent, -1, out);
+        }
+        break;      // 子行缩进不合法（回到父层）：当空块
+    }
+    return buf_append_cstr(out, "{}");
+}
+
+// 一个序列 → JSON 数组。只认 `- ` 项；每项是标量、映射（`- key: …`）或嵌套块。
+fn dv_seq_json(v: &const DshView, from: usize, to: usize, indent: usize,
+    out: &Buf) bool {
+    if !buf_append_byte(out, 91) {
+        return false;
+    }
+    var first: bool = true;
+    var j: usize = from;
+    while j < to {
+        if dv_blank(v, j) || dv_comment(v, j) || dl_at(v, j).indent != indent
+            || !dv_dash(v, j) {
+            j = j + 1;
+            continue;
+        }
+        if !first {
+            if !buf_append_byte(out, 44) {
+                return false;
+            }
+        }
+        first = false;
+        const be: usize = dv_block_end(v, j, indent);
+        var sl: DshSlice = DshSlice{ off: 0, len: 0, has: false };
+        dv_inline(v, j, &sl);
+        if sl.has {
+            // `- key: …`：元素是个映射（head = 这一行）
+            if !dv_map_json(v, j + 1, be, indent + 2, j as i64, out) {
+                return false;
+            }
+        } else if !dv_block_json(v, j + 1, be, indent, out) {
+            return false;
+        }
+        j = be;
+    }
+    return buf_append_byte(out, 93);
+}
+
+// ns 的 config 节 → JSON 对象（`settings.describe` 的 `value`/`user` 用它）。
+export fn dshd_config_json(d: &const DshDoc, ns: &const byte, nl: usize,
+    out: &Buf) bool {
+    buf_reset(out);
+    var v: DshView = dv_empty_view();
+    if !dv_of(&d.text, &v) {
+        return false;
+    }
+    defer { dv_free(&v); }
+    var cfg: DshRange = DshRange{ first: 0, after: 0, indent: 0, ok: false };
+    if !dv_config_of(&v, ns, nl, &cfg) {
+        return false;
+    }
+    return dv_block_json(&v, cfg.first + 1, cfg.after, cfg.indent, out);
+}
+
+// ns 的 config 节 → 一段**独立的 YAML 文本**（缩进摊平到 0；给模型目录/路线复用
+// 现成的读码用，见文件头）。空节给空 Buf。
+export fn dshd_cfg_text(d: &const DshDoc, ns: &const byte, nl: usize,
+    out: &Buf) bool {
+    buf_reset(out);
+    var v: DshView = dv_empty_view();
+    if !dv_of(&d.text, &v) {
+        return false;
+    }
+    defer { dv_free(&v); }
+    var cfg: DshRange = DshRange{ first: 0, after: 0, indent: 0, ok: false };
+    if !dv_config_of(&v, ns, nl, &cfg) {
+        return false;
+    }
+    // 先量出块内**最小的内容缩进**，再按它整体左移（flow 写法内部的对齐也跟着走）。
+    var min_ind: usize = 0;
+    var seen: bool = false;
+    var j: usize = cfg.first + 1;
+    while j < cfg.after {
+        if !dv_blank(&v, j) {
+            if !seen || dl_at(v, j).indent < min_ind {
+                min_ind = dl_at(v, j).indent;
+                seen = true;
+            }
+        }
+        j = j + 1;
+    }
+    if !seen {
+        return true;
+    }
+    j = cfg.first + 1;
+    while j < cfg.after {
+        if dv_blank(&v, j) {
+            if !buf_append_byte(out, 10) {
+                return false;
+            }
+            j = j + 1;
+            continue;
+        }
+        const l: &const DshLine = dl_at(v, j);
+        const s: usize = l.off + min_ind;
+        if !buf_append(out, &v.text.ptr[s], l.end - s) {
+            return false;
+        }
+        if !buf_append_byte(out, 10) {
+            return false;
+        }
+        j = j + 1;
+    }
+    return true;
+}
+
+// ============================================================
+// 写：JSON 值 → 块状 YAML
+// ============================================================
+
+// 双引号字符串（YAML 的双引号转义与 JSON 那套一致，控制字节走 \xNN）。
+fn dy_quoted(out: &Buf, p: &const byte, n: usize) bool {
+    if !buf_append_byte(out, 34) {
+        return false;
+    }
+    var i: usize = 0;
+    while i < n {
+        const c: byte = p[i];
+        if c == 34 as byte || c == 92 as byte {
+            if !buf_append_byte(out, 92) || !buf_append_byte(out, c) {
+                return false;
+            }
+        } else if c == 10 as byte {
+            if !buf_append_cstr(out, "\\n") {
+                return false;
+            }
+        } else if c == 9 as byte {
+            if !buf_append_cstr(out, "\\t") {
+                return false;
+            }
+        } else if c == 13 as byte {
+            if !buf_append_cstr(out, "\\r") {
+                return false;
+            }
+        } else if c < 32 as byte {
+            const hex: &const byte = "0123456789abcdef" as &const byte;
+            if !buf_append_cstr(out, "\\x") {
+                return false;
+            }
+            if !buf_append_byte(out, hex[(c >> 4) as usize]) {
+                return false;
+            }
+            if !buf_append_byte(out, hex[(c & 15) as usize]) {
+                return false;
+            }
+        } else {
+            if !buf_append_byte(out, c) {
+                return false;
+            }
+        }
+        i = i + 1;
+    }
+    return buf_append_byte(out, 34);
+}
+
+// 一个键：**能裸写就裸写**（`providers:` / `OPENCODE_API_KEY:`），只有含特殊字符的
+// 才加引号。为什么不是一律加引号：DSH 自己的文档与 `yamlcfg` 那一层的键都是**裸键**
+// （`yt_key` 去引号只做了一半），一律加引号时「本仓写出来的键、本仓的另一层读不到」
+// ——实测症状：设置页里加了提供方、模型目录还是空的。
+fn dy_key(out: &Buf, p: &const byte, n: usize) bool {
+    if n == 0 {
+        return dy_quoted(out, p, n);
+    }
+    var i: usize = 0;
+    while i < n {
+        const c: byte = p[i];
+        const is_alpha: bool = (c >= 65 as byte && c <= 90 as byte)
+            || (c >= 97 as byte && c <= 122 as byte);
+        const okc: bool = is_alpha || c == 95 as byte
+            || (i > 0 && (is_digit(c) || c == 45 as byte));
+        if !okc {
+            return dy_quoted(out, p, n);
+        }
+        i = i + 1;
+    }
+    return buf_append(out, p, n);
+}
+
+// 缩进 n 个空格（导出的那份给 `dshfile.uya` 的翻译用）。
+export fn dshd_spaces(out: &Buf, n: usize) bool {
+    return dy_spaces(out, n);
+}
+
+// 缩进 n 个空格。
+fn dy_spaces(out: &Buf, n: usize) bool {
+    var i: usize = 0;
+    while i < n {
+        if !buf_append_byte(out, 32) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+// 值是**空的**映射/序列吗（写侧要把它写成内联的 `{}` / `[]`）。
+fn jv_is_empty(jv: &const JsonValue) bool {
+    const val: JsonValue = jv[0];
+    match val {
+        .obj(o) => {
+            return o.len == 0;
+        },
+        .arr(a) => {
+            return a.len == 0;
+        },
+        else => {
+            return false;
+        },
+    }
+}
+
+// 值形状：0 = 标量、1 = 映射、2 = 序列（写侧的分派只认这三种）。
+fn jv_kind(jv: &const JsonValue) u8 {
+    const val: JsonValue = jv[0];
+    match val {
+        .obj(_o) => {
+            return 1;
+        },
+        .arr(_a) => {
+            return 2;
+        },
+        else => {
+            return 0;
+        },
+    }
+}
+
+// 一个标量（浮点之类在配置里没有位置的形状**直接拒绝**，不猜格式）。
+fn dy_scalar(jv: &const JsonValue, out: &Buf) bool {
+    const val: JsonValue = jv[0];
+    match val {
+        .bool_val(b) => {
+            if b {
+                return buf_append_cstr(out, "true");
+            }
+            return buf_append_cstr(out, "false");
+        },
+        .int_val(n) => {
+            return buf_append_i64(out, n);
+        },
+        .num_text(t) => {
+            return buf_append(out, t.ptr as &const byte, t.len);
+        },
+        .str(s) => {
+            return dy_quoted(out, s.ptr as &const byte, s.len);
+        },
+        .float_val(_f) => {
+            return false;       // 浮点在配置里没有位置：拒绝，不猜格式
+        },
+        else => {
+            // 剩下的只有 null（`json_null` 是**无载荷**的变体：不能绑定名字，
+            // 绑了 C 后端会生成 `void _v = …` 这种非法初始化）。
+            return buf_append_cstr(out, "null");
+        },
+    }
+}
+
+// 一个映射 → 块状 YAML。`indent` 是每一行的缩进；`dash` = 第一行前面是 `- `。
+fn dy_map(jv: &const JsonValue, indent: usize, dash: bool, out: &Buf) bool {
+    const val: JsonValue = jv[0];
+    match val {
+        .obj(o) => {
+            if o.len == 0 {
+                if !dy_spaces(out, indent) {
+                    return false;
+                }
+                if dash {
+                    if !buf_append_cstr(out, "- ") {
+                        return false;
+                    }
+                }
+                return buf_append_cstr(out, "{}\n");
+            }
+            var i: usize = 0;
+            while i < o.len {
+                const kl: usize = o.pairs[i].key.len;
+                if dash && i == 0 {
+                    if indent < 2 || !dy_spaces(out, indent - 2)
+                        || !buf_append_cstr(out, "- ")
+                        || !dy_key(out, o.pairs[i].key.ptr as &const byte, kl) {
+                        return false;
+                    }
+                } else if !dy_spaces(out, indent)
+                    || !dy_key(out, o.pairs[i].key.ptr as &const byte, kl) {
+                    return false;
+                }
+                if !buf_append_byte(out, 58) {
+                    return false;
+                }
+                const vv: JsonValue = o.pairs[i].value;
+                const k: u8 = jv_kind(&vv);
+                if k == 1 {
+                    if jv_is_empty(&vv) {
+                        if !buf_append_cstr(out, " {}\n") {
+                            return false;
+                        }
+                    } else if !buf_append_byte(out, 10)
+                        || !dy_map(&vv, indent + 2, false, out) {
+                        return false;
+                    }
+                } else if k == 2 {
+                    if jv_is_empty(&vv) {
+                        if !buf_append_cstr(out, " []\n") {
+                            return false;
+                        }
+                    } else if !buf_append_byte(out, 10)
+                        || !dy_seq(&vv, indent + 2, out) {
+                        return false;
+                    }
+                } else {
+                    if !buf_append_byte(out, 32) || !dy_scalar(&vv, out)
+                        || !buf_append_byte(out, 10) {
+                        return false;
+                    }
+                }
+                i = i + 1;
+            }
+            return true;
+        },
+        else => {
+            return false;
+        },
+    }
+}
+
+// 一个序列 → 块状 YAML（每项 `- ` 起头；`indent` 是 `- ` 的缩进）。
+fn dy_seq(jv: &const JsonValue, indent: usize, out: &Buf) bool {
+    const val: JsonValue = jv[0];
+    match val {
+        .arr(a) => {
+            if a.len == 0 {
+                if !dy_spaces(out, indent) {
+                    return false;
+                }
+                return buf_append_cstr(out, "[]\n");
+            }
+            var i: usize = 0;
+            while i < a.len {
+                const it: JsonValue = a.items[i];
+                const k: u8 = jv_kind(&it);
+                if k == 1 {
+                    if !dy_map(&it, indent + 2, true, out) {
+                        return false;
+                    }
+                } else if k == 2 {
+                    if !dy_spaces(out, indent) || !buf_append_cstr(out, "-\n")
+                        || !dy_seq(&it, indent + 2, out) {
+                        return false;
+                    }
+                } else {
+                    if !dy_spaces(out, indent) || !buf_append_cstr(out, "- ")
+                        || !dy_scalar(&it, out) || !buf_append_byte(out, 10) {
+                        return false;
+                    }
+                }
+                i = i + 1;
+            }
+            return true;
+        },
+        else => {
+            return false;
+        },
+    }
+}
+
+// 一个 JSON 值 → `key:` 那一行（值块状写在下面，标量写在同一行）。
+fn dy_field(key: &const Buf, jv: &const JsonValue, indent: usize,
+    out: &Buf) bool {
+    if !dy_spaces(out, indent) || !dy_key(out, key.ptr as &const byte, key.len)
+        || !buf_append_byte(out, 58) {
+        return false;
+    }
+    const vv: JsonValue = jv[0];
+    const k: u8 = jv_kind(&vv);
+    if k == 1 {
+        // 空映射写内联（`key: {}`）：块状的空映射（下一行一个 `{}`）也是合法 YAML，
+        // 但它在**扫描器**眼里是一行没有键的内容行，给后面的收尾/自检添乱。
+        if jv_is_empty(&vv) {
+            return buf_append_cstr(out, " {}\n");
+        }
+        if !buf_append_byte(out, 10) {
+            return false;
+        }
+        return dy_map(&vv, indent + 2, false, out);
+    }
+    if k == 2 {
+        if jv_is_empty(&vv) {
+            return buf_append_cstr(out, " []\n");
+        }
+        if !buf_append_byte(out, 10) {
+            return false;
+        }
+        return dy_seq(&vv, indent + 2, out);
+    }
+    if !buf_append_byte(out, 32) || !dy_scalar(&vv, out) {
+        return false;
+    }
+    return buf_append_byte(out, 10);
+}
+
+// ============================================================
+// 改：拼接与 ops
+// ============================================================
+
+// 用 ins 替换 [from, to) 这一段字节。
+fn dd_splice(v: &const DshView, from: usize, to: usize, ins: &const Buf,
+    out: &Buf) bool {
+    buf_reset(out);
+    if !buf_append(out, v.text.ptr as &const byte, from) {
+        return false;
+    }
+    if !buf_append(out, ins.ptr as &const byte, ins.len) {
+        return false;
+    }
+    return buf_append(&out[0], &v.text.ptr[to], v.text.len - to);
+}
+
+// 一个块的**插入点**（字节偏移）：插在最后一条内容行之后（尾部空行之前）。
+// 块里一条内容行都没有时，插在父键那一行的下一行 —— 而父键必须没有 inline 值
+// （`config: {}` 这类内联写法本版不猜，返回 false）。
+fn dd_insert_at(v: &const DshView, kline: usize, from: usize, to: usize,
+    out: &usize) bool {
+    var last: isize = -1;
+    var j: usize = from;
+    while j < to {
+        if !dv_blank(v, j) {
+            last = j as isize;
+        }
+        j = j + 1;
+    }
+    if last < 0 {
+        var sl: DshSlice = DshSlice{ off: 0, len: 0, has: false };
+        dv_inline(v, kline, &sl);
+        if sl.has {
+            return false;
+        }
+        if dl_at(v, kline).end >= v.text.len {
+            out[0] = v.text.len;
+        } else {
+            out[0] = dl_at(v, kline).end + 1;
+        }
+        return true;
+    }
+    const li: usize = last as usize;
+    if li + 1 < v.n {
+        out[0] = dl_at(v, li + 1).off;
+    } else if dl_at(v, li).end < v.text.len {
+        out[0] = dl_at(v, li).end + 1;
+    } else {
+        out[0] = v.text.len;
+    }
+    return true;
+}
+
+// 在 `at` 处插入一段（`at` 不在行首时先补一个换行；末尾没有换行时也补）。
+fn dd_insert_at_off(v: &const DshView, at: usize, ins: &Buf, out: &Buf) bool {
+    var buf: Buf = buf_new(ins.len + 4);
+    defer { buf_free(&buf); }
+    if at > 0 && v.text.ptr[at - 1] != 10 as byte {
+        if !buf_append_byte(&buf, 10) {
+            return false;
+        }
+    }
+    if !buf_append(&buf, ins.ptr as &const byte, ins.len) {
+        return false;
+    }
+    return dd_splice(v, at, at, &buf, out);
+}
+
+// 一个键不存在时的插入：`key: <值>` 插到所在层（[from, to) + 父键 kline）的末尾。
+fn dd_insert_key(v: &const DshView, kline: usize, from: usize, to: usize,
+    key: &const Buf, jv: &const JsonValue, indent: usize, out: &Buf) i32 {
+    var at: usize = 0;
+    if !dd_insert_at(v, kline, from, to, &at) {
+        return DSHD_SHAPE;
+    }
+    var ins: Buf = buf_new(4096);
+    defer { buf_free(&ins); }
+    if !dy_field(key, jv, indent, &ins) {
+        return DSHD_IO;
+    }
+    if !dd_insert_at_off(v, at, &ins, out) {
+        return DSHD_IO;
+    }
+    return DSHD_OK;
+}
+
+// 在父块的末尾插一个**空映射键**（`"providers":` 这种，值块空着）——给
+// 「材料化中间层」用（见 `dd_ensure_one`）。
+fn dd_insert_empty_key(v: &const DshView, parent: &const DshRange,
+    key: &const Buf, out: &Buf) i32 {
+    var at: usize = 0;
+    if !dd_insert_at(v, parent.first, parent.first + 1, parent.after, &at) {
+        return DSHD_SHAPE;
+    }
+    var ins: Buf = buf_new(256);
+    defer { buf_free(&ins); }
+    if !dy_spaces(&ins, parent.indent + 2)
+        || !dy_key(&ins, key.ptr as &const byte, key.len)
+        || !buf_append_cstr(&ins, ":\n") {
+        return DSHD_IO;
+    }
+    return if dd_insert_at_off(v, at, &ins, out) { DSHD_OK } else { DSHD_IO };
+}
+
+// 保证 op 路径上**第 i 段**存在（i 是中间段，不是最后一段）：在就原样拷贝，不在就
+// 造一个空映射键。逐段调用它，就能把整条中间路径材料化。
+//
+// 为什么要材料化：DSH 自己的写语义就是这样的（客户端的 `setPath` 注释写着
+// 「materializing missing containers」）——页面的「添加提供方」发的是
+// `set ["providers", route]`，而一份**新建的** `llm-pi-ai` 条目里连 `providers`
+// 都还没有。不造中间层时那条路恒失败，而回给用户的是一句「这一节的写法改不了」，
+// 离根因（缺一个中间键）很远。
+fn dd_ensure_one(w: &const Buf, ns: &const byte, nl: usize, op: &const DshdOp,
+    i: usize, out: &Buf) i32 {
+    var v: DshView = dv_empty_view();
+    if !dv_of(w, &v) {
+        dv_free(&v);
+        return DSHD_SHAPE;
+    }
+    defer { dv_free(&v); }
+    var cfg: DshRange = DshRange{ first: 0, after: 0, indent: 0, ok: false };
+    if !dv_config_of(&v, ns, nl, &cfg) {
+        return DSHD_NOENTRY;
+    }
+    // ⚠ 用「三个平字段」当游标而不是整条 `DshRange` 赋值：uya 里**循环中的整条
+    // 结构体不能移动**（与 modelx 那条「填表一律拿槽位指针」同一约束）。
+    var cfirst: usize = cfg.first;
+    var cafter: usize = cfg.after;
+    var cindent: usize = cfg.indent;
+    var k: usize = 0;
+    while k < i {
+        var pr: DshRange = DshRange{ first: 0, after: 0, indent: 0, ok: false };
+        // ⚠ 键是 `&const byte`（C 串口径），必须走 `.ptr` —— 直接把 `&const Buf`
+        // 传过去时 uya 的类型检查会**放行**（两个都是指针），而 `bufx_cstr_len`
+        // 量的是**整个 Buf 结构体的字节**，于是「明明存在的键」恒判不存在。
+        const segk: &const Buf = dd_seg(op, k);
+        if !dv_find_child(&v, cfirst + 1, cafter, cindent,
+            segk.ptr as &const byte, segk.len, &pr) || !pr.ok {
+            return DSHD_SHAPE;
+        }
+        cfirst = pr.first;
+        cafter = pr.after;
+        cindent = pr.indent;
+        k = k + 1;
+    }
+    var cur: DshRange = DshRange{ first: cfirst, after: cafter, indent: cindent,
+        ok: true };
+    var r: DshRange = DshRange{ first: 0, after: 0, indent: 0, ok: false };
+    const segi: &const Buf = dd_seg(op, i);
+    if dv_find_child(&v, cur.first + 1, cur.after, cur.indent,
+        segi.ptr as &const byte, segi.len, &r) && r.ok {
+        buf_reset(out);
+        return if buf_append(out, v.text.ptr as &const byte, v.text.len)
+            { DSHD_OK } else { DSHD_IO };
+    }
+    return dd_insert_empty_key(&v, &cur, dd_seg(op, i), out);
+}
+
+// 把一条 set op 的**中间层**都材料化（最后一段留给 `dd_apply1`）。
+fn dd_ensure_path(w: &Buf, ns: &const byte, nl: usize, op: &const DshdOp,
+    out: &Buf) i32 {
+    var i: usize = 0;
+    var cur: Buf = buf_new(w.len + 256);
+    if !buf_append(&cur, w.ptr as &const byte, w.len) {
+        buf_free(&cur);
+        return DSHD_IO;
+    }
+    while i + 1 < op.nseg {
+        var next: Buf = buf_new(cur.len + 256);
+        const rc: i32 = dd_ensure_one(&cur, ns, nl, op, i, &next);
+        if rc != DSHD_OK {
+            buf_free(&next);
+            buf_free(&cur);
+            return rc;
+        }
+        buf_reset(&cur);
+        if !buf_append(&cur, next.ptr as &const byte, next.len) {
+            buf_free(&next);
+            buf_free(&cur);
+            return DSHD_IO;
+        }
+        buf_free(&next);
+        i = i + 1;
+    }
+    buf_reset(out);
+    const ok: bool = buf_append(out, cur.ptr as &const byte, cur.len);
+    buf_free(&cur);
+    return if ok { DSHD_OK } else { DSHD_IO };
+}
+
+// 一个 op 作用在当前文本上：成功了把新文本写进 out。
+fn dd_apply1(v: &const DshView, ns: &const byte, nl: usize,
+    op: &const DshdOp, out: &Buf) i32 {
+    if op.nseg == 0 || op.nseg > DSHD_PATH_MAX {
+        return DSHD_OPS;
+    }
+    var i: usize = 0;
+    while i < op.nseg {
+        const s: &const Buf = dd_seg(op, i);
+        if s.len == 0 || s.len > 128 {
+            return DSHD_OPS;
+        }
+        var c: usize = 0;
+        while c < s.len {
+            const b: byte = s.ptr[c];
+            if b == 58 as byte || b == 10 as byte || b == 34 as byte {
+                return DSHD_OPS;
+            }
+            c = c + 1;
+        }
+        i = i + 1;
+    }
+    var cfg: DshRange = DshRange{ first: 0, after: 0, indent: 0, ok: false };
+    if !dv_config_of(v, ns, nl, &cfg) {
+        return DSHD_NOENTRY;
+    }
+    var r: DshRange = DshRange{ first: 0, after: 0, indent: 0, ok: false };
+    var ci: usize = 0;
+    if !dv_walk(v, &cfg, op, op.nseg, &r, &ci) {
+
+        return DSHD_SHAPE;
+    }
+    if !r.ok {
+        if op.kind == DSHD_KIND_UNSET {
+            // 删一个本来就没有的键：无操作（幂等 —— 页面的「删除」会重试）
+            const nb: Buf = buf_empty();
+            return if dd_splice(v, 0, 0, &nb, out) { DSHD_OK } else { DSHD_IO };
+        }
+        // 键不存在 ⇒ 插到**所在层**的末尾；所在层 = 路径前 nseg-1 段那个键
+        var pr: DshRange = DshRange{ first: 0, after: 0, indent: 0, ok: false };
+        var pci: usize = 0;
+        if op.nseg == 1 {
+            return dd_insert_key(v, cfg.first, cfg.first + 1, cfg.after,
+                dd_seg(op, 0), &op.val, ci, out);
+        }
+        if !dv_walk(v, &cfg, op, op.nseg - 1, &pr, &pci) || !pr.ok {
+            return DSHD_SHAPE;      // 中间层缺失：本版不替用户造中间层
+        }
+        return dd_insert_key(v, pr.first, pr.first + 1, pr.after,
+            dd_seg(op, op.nseg - 1), &op.val, pr.indent + 2, out);
+    }
+    // 键存在：set 换块、unset 删块（尾部空行/注释留在原地）
+    const stop: usize = dv_block_trim(v, r.first, r.after);
+    var span: DshSlice = DshSlice{ off: 0, len: 0, has: false };
+    dv_bytes(v, r.first, stop, &span);
+    if op.kind == DSHD_KIND_UNSET {
+        const nb: Buf = buf_empty();
+        if !dd_splice(v, span.off, span.off + span.len, &nb, out) {
+            return DSHD_IO;
+        }
+        return DSHD_OK;
+    }
+    var ins: Buf = buf_new(4096);
+    defer { buf_free(&ins); }
+    if !dy_field(dd_seg(op, op.nseg - 1), &op.val, r.indent, &ins) {
+        return DSHD_IO;
+    }
+    if !dd_splice(v, span.off, span.off + span.len, &ins, out) {
+        return DSHD_IO;
+    }
+    return DSHD_OK;
+}
+
+
+// 把「没有子行的键」补成 `key: {}`（删光了 `providers` 的最后一个提供方之后，
+// 留一个裸 `providers:` 是 null，DSH 的 `z.dict(...)` 接不住）。
+fn dd_fix_empty(v: &const DshView, out: &Buf, changed: &bool) i32 {
+    changed[0] = false;
+    var j: usize = 0;
+    while j < v.n {
+        if dv_blank(v, j) || dv_comment(v, j) || dv_dash(v, j) {
+            j = j + 1;
+            continue;
+        }
+        // ⚠ 只认**真正的 `key:` 行**：光看「没有 inline 值 + 没有子行」会把一行
+        // `{}` / `[]`（空映射/空序列的块状写法）也算进来，于是每轮都往它后面接一个
+        // ` {}` —— 循环到轮数上限，最后报「这一节的写法改不了」，而真因在这里。
+        var kb: Buf = buf_new(128);
+        defer { buf_free(&kb); }
+        if !dv_key(v, j, dl_at(v, j).indent, &kb) || kb.len == 0 {
+            j = j + 1;
+            continue;
+        }
+        var sl: DshSlice = DshSlice{ off: 0, len: 0, has: false };
+        dv_inline(v, j, &sl);
+        if sl.has {
+            j = j + 1;
+            continue;
+        }
+        if dv_block_end(v, j, dl_at(v, j).indent) != j + 1 {
+            j = j + 1;
+            continue;
+        }
+        // 这一行是 `key:` 且下一个非空行不在它下面 ⇒ 空块，补 {}
+        var ins: Buf = buf_new(8);
+        defer { buf_free(&ins); }
+        if !buf_append_cstr(&ins, " {}") {
+            return DSHD_IO;
+        }
+        const at: usize = dl_at(v, j).end;
+        if !dd_splice(v, at, at, &ins, out) {
+            return DSHD_IO;
+        }
+        changed[0] = true;
+        return DSHD_OK;
+    }
+    return DSHD_OK;
+}
+
+// 反复补空块（每次一处，直到没有）。
+fn dd_fix_all(work: &Buf, out: &Buf) i32 {
+    var cur: Buf = buf_new(work.len + 64);
+    if !buf_append(&cur, work.ptr as &const byte, work.len) {
+        buf_free(&cur);
+        return DSHD_IO;
+    }
+    var round: usize = 0;
+    while round < 64 {
+        var v: DshView = dv_empty_view();
+        if !dv_of(&cur, &v) {
+            dv_free(&v);
+            buf_free(&cur);
+            return DSHD_SHAPE;
+        }
+        var next: Buf = buf_new(cur.len + 16);
+        var changed: bool = false;
+        const rc: i32 = dd_fix_empty(&v, &next, &changed);
+        dv_free(&v);
+        if rc != DSHD_OK || !changed {
+            // ⚠ 没有要修的**也必须把文本交出去**：`out` 是新建的空 Buf，一声不响
+            // 地返回一个「成功但空」的结果，会让下游（自检）拿到一段空文本 ——
+            // 实测症状：写盘自检恒失败、而失败原因说的是「这一节的写法改不了」，
+            // 与真因（这里少了一次拷贝）差着十万八千里。
+            buf_free(&next);
+            buf_reset(out);
+            const okc: bool = buf_append(out, cur.ptr as &const byte, cur.len);
+            buf_free(&cur);
+            if !okc {
+                return DSHD_IO;
+            }
+            return rc;
+        }
+        buf_reset(&cur);
+        if !buf_append(&cur, next.ptr as &const byte, next.len) {
+            buf_free(&next);
+            buf_free(&cur);
+            return DSHD_IO;
+        }
+        buf_free(&next);
+        round = round + 1;
+    }
+    buf_free(&cur);
+    return DSHD_SHAPE;
+}
+
+// ns → 它所属插件包的名字（新条目那一行要写对，否则 Loader 会把同一份配置当成
+// 另一个插件行 —— 表里这两条与 DSH 自己的 bundle 逐字一致：
+// `dsh-base/cordis.patch.yml` 的 `- id: llm-pi-ai` /
+// `name: '@deepseek-ai/dsh-llm-pi-ai'`）。
+fn dd_pkg_name(ns: &const Buf, out: &Buf) bool {
+    buf_reset(out);
+    if bufx_eq_cstr(ns.ptr as &const byte, ns.len, "llm-pi-ai" as &const byte) {
+        return buf_append_cstr(out, "@deepseek-ai/dsh-llm-pi-ai");
+    }
+    if bufx_eq_cstr(ns.ptr as &const byte, ns.len,
+        "llm-deepseek" as &const byte) {
+        return buf_append_cstr(out, "@deepseek-ai/dsh-llm-deepseek-api-key");
+    }
+    return false;
+}
+
+// 文档里没有这个 ns 的条目时**新加一条**（真 DSH 的 config editor 也这么做：
+// `document.add({id, name, config})`）。写在文档末尾，形状与别人手写的一模一样：
+//   - id: "llm-pi-ai"
+//     name: "@deepseek-ai/dsh-llm-pi-ai"
+//     config:
+// 之后 ops 就把键插进那个（还空着的）`config:` 块 —— `dd_insert_at` 认这种形态。
+fn dd_append_entry(d: &const DshDoc, ns: &const byte, nl: usize,
+    out: &Buf) i32 {
+    var nsb: Buf = buf_new(nl + 8);
+    defer { buf_free(&nsb); }
+    _ = buf_append(&nsb, ns, nl);
+    var pkg: Buf = buf_new(64);
+    defer { buf_free(&pkg); }
+    if !dd_pkg_name(&nsb, &pkg) {
+        return DSHD_NOENTRY;    // 不在表里的 ns：不猜包名（猜错等于写坏文档）
+    }
+    var ins: Buf = buf_new(256);
+    if d.text.len > 0 && d.text.ptr[d.text.len - 1] != 10 as byte {
+        if !buf_append_byte(&ins, 10) {
+            return DSHD_IO;
+        }
+    }
+    if !buf_append_cstr(&ins, "- id: ") || !dy_key(&ins, ns, nl)
+        || !buf_append_cstr(&ins, "\n  name: ")
+        || !dy_key(&ins, pkg.ptr as &const byte, pkg.len)
+        || !buf_append_cstr(&ins, "\n  config:\n") {
+        return DSHD_IO;
+    }
+    var v: DshView = dv_empty_view();
+    if !dv_of(&d.text, &v) {
+        dv_free(&v);
+        return DSHD_SHAPE;
+    }
+    defer { dv_free(&v); }
+    const ok: bool = dd_splice(&v, d.text.len, d.text.len, &ins, out);
+    return if ok { DSHD_OK } else { DSHD_IO };
+}
+
+// 文本里有没有这个 ns 的 config 节（建视图看一眼就够）。
+fn dv_has_config(text: &const Buf, ns: &const byte, nl: usize) bool {
+    var v: DshView = dv_empty_view();
+    if !dv_of(text, &v) {
+        dv_free(&v);
+        return false;
+    }
+    var cfg: DshRange = DshRange{ first: 0, after: 0, indent: 0, ok: false };
+    const ok: bool = dv_config_of(&v, ns, nl, &cfg);
+    dv_free(&v);
+    return ok;
+}
+
+// 应用一整套 ops：逐个 op（每个 op 重建一次视图）→ 空块收尾 → 写前自检。
+// 结果文本写进 out（调用方决定要不要 `dshd_save` 落盘）。
+export fn dshd_mutate(d: &const DshDoc, ns: &const byte, nl: usize,
+    ops: &const DshdOps, out: &Buf) i32 {
+    buf_reset(out);
+    if !d.loaded {
+        return DSHD_NOFILE;
+    }
+    if ops.n == 0 {
+        return if buf_append(out, d.text.ptr as &const byte, d.text.len)
+            { DSHD_OK } else { DSHD_IO };
+    }
+    var work: Buf = buf_new(d.text.len + 1024);
+    if !buf_append(&work, d.text.ptr as &const byte, d.text.len) {
+        buf_free(&work);
+        return DSHD_IO;
+    }
+    // 文档里还没有这一节 ⇒ 先加一条（页面的「添加提供方」走的就是这条路：
+    // 那条 patch 行本来是 bundle 里的、patch 文档里没有）。
+    var have: bool = dv_has_config(&work, ns, nl);
+    var hn: usize = 0;
+    if have {
+        hn = 1;
+    }
+    if !have {
+        var added: Buf = buf_new(work.len + 256);
+        const arc: i32 = dd_append_entry(d, ns, nl, &added);
+        buf_free(&work);
+        if arc != DSHD_OK {
+            buf_free(&added);
+            return arc;
+        }
+        work = added;
+    }
+    var i: usize = 0;
+    while i < ops.n {
+        // set 先把**中间层**材料化（DSH 的 `setPath` 语义）；unset 缺中间层 = 无操作
+        if ops.items[i].kind == DSHD_KIND_SET && ops.items[i].nseg > 1 {
+            var mid: Buf = buf_new(work.len + 256);
+            const mrc: i32 = dd_ensure_path(&work, ns, nl, &ops.items[i], &mid);
+            if mrc != DSHD_OK {
+                buf_free(&mid);
+                buf_free(&work);
+                return mrc;
+            }
+            buf_reset(&work);
+            if !buf_append(&work, mid.ptr as &const byte, mid.len) {
+                buf_free(&mid);
+                buf_free(&work);
+                return DSHD_IO;
+            }
+            buf_free(&mid);
+        }
+        var v: DshView = dv_empty_view();
+        if !dv_of(&work, &v) {
+            dv_free(&v);
+            buf_free(&work);
+            return DSHD_SHAPE;
+        }
+        var next: Buf = buf_new(work.len + 4096);
+        const rc: i32 = dd_apply1(&v, ns, nl, &ops.items[i], &next);
+        dv_free(&v);
+        if rc != DSHD_OK {
+            buf_free(&next);
+            buf_free(&work);
+            return rc;
+        }
+        buf_reset(&work);
+        if !buf_append(&work, next.ptr as &const byte, next.len) {
+            buf_free(&next);
+            buf_free(&work);
+            return DSHD_IO;
+        }
+        buf_free(&next);
+        i = i + 1;
+    }
+    var fixed: Buf = buf_new(work.len + 64);
+    const frc: i32 = dd_fix_all(&work, &fixed);
+    buf_free(&work);
+    if frc != DSHD_OK {
+        buf_free(&fixed);
+        return frc;
+    }
+    return dd_verify(ns, nl, &fixed, out);
+}
+
+// 写前自检：改完的文本必须自己解析得回来、且那个 ns 的条目还在（自检钉**结构**，
+// 不只钉值 —— P71 的教训），通过后把文本交给 out。
+fn dd_verify(ns: &const byte, nl: usize, text: &Buf, out: &Buf) i32 {
+    var v: DshView = dv_empty_view();
+    if !dv_of(text, &v) {
+        dv_free(&v);
+        return DSHD_SHAPE;
+    }
+    var cfg: DshRange = DshRange{ first: 0, after: 0, indent: 0, ok: false };
+    const found: bool = dv_config_of(&v, ns, nl, &cfg);
+    dv_free(&v);
+    if !found {
+
+        return DSHD_SHAPE;
+    }
+    var t: YTree = YTree{ nodes: [], n: 0, lines: [], nlines: 0,
+        raw: buf_empty(), cur: 0, err_line: 0 };
+    yt_init(&t);
+    const ok_parse: bool = yt_parse_text(text, &t);
+    yt_free(&t);
+    if !ok_parse {
+
+        return DSHD_SHAPE;
+    }
+    buf_reset(out);
+    return if buf_append(out, text.ptr as &const byte, text.len)
+        { DSHD_OK } else { DSHD_IO };
+}
+
+// ============================================================
+// 通用的一层键值改写（凭证文件那种形状：顶层一个 map，map 里一堆 `KEY: value`）
+// ============================================================
+//
+// 凭证文件（`$DSH_HOME/.credentials.yaml`）与 patch 文档是两种形状，但都需要同一件事：
+// 「找到顶层某个 map，读出/改写它下面的一个键」。把这件事收在这里（一处行表逻辑），
+// 外面那一层（`session/dshcred.uya`）就只剩「拼路径 + 按 0600 建文件」这些文件事。
+
+// 打开一份**按完整路径**给的文档（凭证文件不是 `profiles/<name>/…` 那种布局）。
+fn dd_open_path(d: &DshDoc, path_z: &const byte, home: &const Buf) i32 {
+    dshd_free(d);
+    var t: Buf = buf_new(8192);
+    const rc: i32 = dshd_read_file(path_z, &t);
+    var p: Buf = buf_new(bufx_cstr_len(path_z) + 8);
+    _ = buf_append_cstr(&p, path_z);
+    _ = buf_append_byte(&p, 0);
+    d.home = buf_new(home.len + 8);
+    _ = buf_append(&d.home, home.ptr as &const byte, home.len);
+    d.profile = buf_empty();
+    d.path = p;
+    if rc != DSHD_OK {
+        buf_free(&t);
+        return rc;
+    }
+    d.text = t;
+    d.rev = dshd_rev(&d.text);
+    d.loaded = true;
+    return DSHD_OK;
+}
+
+// 取 `top.<key>` 的值（去引号）。0 = 有、1 = 没有这个键、2 = 没有顶层那个 map、
+// 3 = 形状不认。
+export fn dshd_kv_get(home: &const Buf, path_z: &const byte, top: &const Buf,
+    key: &const Buf, out: &Buf) i32 {
+    buf_reset(out);
+    var d: DshDoc = dshd_zero();
+    defer { dshd_free(&d); }
+    const rc: i32 = dd_open_path(&d, path_z, home);
+    if rc == DSHD_NOFILE {
+        return 2;
+    }
+    if rc != DSHD_OK {
+        return 3;
+    }
+    var v: DshView = dv_empty_view();
+    if !dv_of(&d.text, &v) {
+        dv_free(&v);
+        return 3;
+    }
+    defer { dv_free(&v); }
+    var par: DshRange = DshRange{ first: 0, after: 0, indent: 0, ok: false };
+    if !dv_find_root(&v, 0, v.n, top.ptr as &const byte, top.len, &par) {
+        return 2;
+    }
+    var r: DshRange = DshRange{ first: 0, after: 0, indent: 0, ok: false };
+    if !dv_find_child(&v, par.first + 1, par.after, par.indent,
+        key.ptr as &const byte, key.len, &r) {
+        return 1;
+    }
+    var sl: DshSlice = DshSlice{ off: 0, len: 0, has: false };
+    dv_inline(&v, r.first, &sl);
+    if !sl.has {
+        return 1;
+    }
+    return if dv_unquote(&v, &sl, out) { 0 } else { 3 };
+}
+
+// 设/删 `top.<key>`：`val` 为空 = 删（幂等）。0 = 成功（**已落盘**）。
+export fn dshd_kv_set(home: &const Buf, path_z: &const byte, top: &const Buf,
+    key: &const Buf, val: &const Buf) i32 {
+    var d: DshDoc = dshd_zero();
+    defer { dshd_free(&d); }
+    const rc: i32 = dd_open_path(&d, path_z, home);
+    if rc != DSHD_OK {
+        return rc;
+    }
+    var v: DshView = dv_empty_view();
+    if !dv_of(&d.text, &v) {
+        dv_free(&v);
+        return DSHD_SHAPE;
+    }
+    defer { dv_free(&v); }
+    var par: DshRange = DshRange{ first: 0, after: 0, indent: 0, ok: false };
+    if !dv_find_root(&v, 0, v.n, top.ptr as &const byte, top.len, &par) {
+        return DSHD_SHAPE;      // 没有那个顶层 map：本版不猜（让人去看那个文件）
+    }
+    var next: Buf = buf_new(d.text.len + 1024);
+    const kind: u8 = if val.len == 0 { DSHD_KIND_UNSET } else { DSHD_KIND_SET };
+    const arc: i32 = dd_set_key_str(&v, &par, key, val, kind, &next);
+    if arc != DSHD_OK {
+        buf_free(&next);
+        return arc;
+    }
+    const src: i32 = dshd_save(&d, &next);
+    buf_free(&next);
+    return src;
+}
+
+// `"key": "value"` 那一行（标量写侧；凭证这种「值一定是字符串」的场景用它，
+// 少走一次 JSON → JsonValue 的往返）。
+fn dy_field_str(key: &const Buf, val: &const Buf, indent: usize,
+    out: &Buf) bool {
+    if !dy_spaces(out, indent) || !dy_key(out, key.ptr as &const byte, key.len)
+        || !buf_append_cstr(out, ": ")
+        || !dy_quoted(out, val.ptr as &const byte, val.len)
+        || !buf_append_byte(out, 10) {
+        return false;
+    }
+    return true;
+}
+
+// 一个块里的一个字符串键：找到就换（`set`）或删（`del`），没找到就插到块尾（只对 set）。
+fn dd_set_key_str(v: &const DshView, parent: &const DshRange, key: &const Buf,
+    val: &const Buf, kind: u8, out: &Buf) i32 {
+    var r: DshRange = DshRange{ first: 0, after: 0, indent: 0, ok: false };
+    const found: bool = dv_find_child(v, parent.first + 1, parent.after,
+        parent.indent, key.ptr as &const byte, key.len, &r);
+    if !found {
+        if kind == DSHD_KIND_UNSET {
+            const nb: Buf = buf_empty();
+            return if dd_splice(v, 0, 0, &nb, out) { DSHD_OK } else { DSHD_IO };
+        }
+        var at: usize = 0;
+        if !dd_insert_at(v, parent.first, parent.first + 1, parent.after, &at) {
+            return DSHD_SHAPE;
+        }
+        var ins: Buf = buf_new(1024);
+        defer { buf_free(&ins); }
+        if !dy_field_str(key, val, parent.indent + 2, &ins) {
+            return DSHD_IO;
+        }
+        if !dd_insert_at_off(v, at, &ins, out) {
+            return DSHD_IO;
+        }
+        return DSHD_OK;
+    }
+    const stop: usize = dv_block_trim(v, r.first, r.after);
+    var span: DshSlice = DshSlice{ off: 0, len: 0, has: false };
+    dv_bytes(v, r.first, stop, &span);
+    var ins: Buf = buf_new(1024);
+    defer { buf_free(&ins); }
+    if kind == DSHD_KIND_SET && !dy_field_str(key, val, r.indent, &ins) {
+        return DSHD_IO;
+    }
+    return if dd_splice(v, span.off, span.off + span.len, &ins, out)
+        { DSHD_OK } else { DSHD_IO };
+}
