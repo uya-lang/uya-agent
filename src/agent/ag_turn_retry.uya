@@ -1,0 +1,170 @@
+// src/agent/ag_turn_retry.uya — 回合异常结束之后的自动继续（P94）
+//
+// 本文件：`agent_turn_loop` 外面那一层「失败 → 说清 → 退避 → 替人打一句继续 → 再跑一个
+//   回合」。三件事都在这里：判据（`tr_should`）、退避与中断（`turn_retry_after`）、
+//   账（`tr_note` 的转录行 + `tr_log` 的 `turn/retry` 事件）。
+// 不变量：① **只对一种失败开闸** —— 模型空响应（正文与 tool_calls 都没有）且本步的同一步
+//   重发额度已经用尽；配置/鉴权/协议结构错、上下文超窗、步数熔断、OOM 一律**不**自动继续
+//   （重发一百次还是同一个错，还会把账单刷起来）。② 退避与传输层重试用**同一套数值**
+//   （0.5–3 s 随机，`net/retryx`）与同一条可中断等待（≤50 ms 切片 + 泵点），所以
+//   esc / ctrl+c 当场收口 —— 「自动重试」不许变成「按了没反应」。③ 预算是**次数**
+//   （出厂 2 次，0 = 关），不是时间；用尽就回到原来的样子：「本回合异常结束」那句话仍由
+//   调用方照旧打出来。
+// 依赖：net/retryx（退避区间与随机取值）、agent/ag_request_stream（`agent_rtx_wait` 的
+//   可中断等待与 `RTX_GO_*` 三态）、会话日志（`sess_begin`/`sess_end`）、历史写入
+//   （`agent_push_user_with_imgs` / `agent_log_user_att`）。
+// 命名：对外 `turn_retry_*` + 常量 `TURN_RETRY_MAX`；私有 `tr_*`。
+//
+// 为什么要有这个文件（用户报的现场）：异常收尾时屏幕上只说一句「本回合异常结束（可直接
+// 输入继续）」，而**人接着敲一句「继续」通常就好了** —— 那件事机器自己会做，不该每次都
+// 等人。用户的原话是「自动像连接重试一样的策略重试」，所以退避、中断、预算三样都照
+// `net/retryx` 与 `agent_rtx_after_failure` 的口径来，不另立一套。
+
+// 出厂预算：两次。为什么不跟传输层重试一样「无限」：一次传输重发只多一发请求，而回合级的
+// 自动继续会**再跑一整段 step 循环**（模型可能连着调几十个工具）。空响应确实多半是瞬时的，
+// 但「连着两次都空」本身就说明上游这会儿不对劲 —— 两次之后交回人手最稳（人只要按键就行，
+// 机器却不能替人决定花多少钱）。
+export const TURN_RETRY_MAX: i32 = 2;
+
+// 提示位：本回合为什么值得再跑一次。0 = 没定性（配置/协议/结构错），**不许**重试 ——
+// 不替上游猜，与 `net/retryx` 的分类表同一条纪律。
+const TR_HINT_NONE: i32 = 0;
+// 模型空响应：正文与 tool_calls 都没有，本步的同一步重发额度也用尽了。
+const TR_HINT_DEGENERATE: i32 = 1;
+
+// 自动继续塞进历史的那句话：与 `/continue` **逐字相同** —— 人打的是什么，机器打的就是
+// 什么（历史形状、模型看到的东西、会话日志三样因此都一样）。
+const TR_CONTINUE: &const byte = "继续" as &const byte;
+
+// 预算（进程级：`turn_retry_set_max` 写、`turn_retry_max` 读）。
+var g_turn_retry_max: i32 = TURN_RETRY_MAX;
+// 本回合的提示位（回合入口清、失败那一刻置）。
+var g_turn_retry_hint: i32 = TR_HINT_NONE;
+
+// 设预算：0 = 关、N > 0 = 最多自动继续 N 次。
+// 负数一律按「关」处理：回合级**不做无限**（理由见 TURN_RETRY_MAX 那段）。自测/CI 靠
+// `0` 这一档 fail fast，与 `rtx_set_max(0)` 同一个用法。
+export fn turn_retry_set_max(n: i32) void {
+    if n <= 0 {
+        g_turn_retry_max = 0;
+        return;
+    }
+    g_turn_retry_max = n;
+}
+
+// 当前预算（每一次自动继续之前读一次，所以运行中改也当场生效）。
+export fn turn_retry_max() i32 {
+    return g_turn_retry_max;
+}
+
+// 回合入口复位提示位。**每一回合都必须清**：上一回合留下的「空响应」不能给这一回合的
+// 401 当通行证 —— 那会让一个确定性的错被自动重跑（预算花在一个必然失败的请求上）。
+export fn turn_retry_clear() void {
+    g_turn_retry_hint = TR_HINT_NONE;
+}
+
+// 记一笔「这一回合是模型空响应收的场」（`agent_note_degenerate` 在额度用尽时调它）。
+export fn turn_retry_note_degenerate() void {
+    g_turn_retry_hint = TR_HINT_DEGENERATE;
+}
+
+// 要不要自动继续：退出码必须是协议错、提示位必须定过性、预算还没用尽。
+// 三条写在一个函数里（而不是散在 step 循环里），是为了「哪些失败会自动继续」只有一份答案。
+fn tr_should(rc: i32, attempt: i32) bool {
+    if rc != AGENT_PROTO {
+        return false;
+    }
+    if g_turn_retry_hint == TR_HINT_NONE {
+        return false;
+    }
+    const cap: i32 = g_turn_retry_max;
+    if cap <= 0 {
+        return false;
+    }
+    return attempt < cap;
+}
+
+// 转录里那一行：说清「为什么又跑一次、第几次、等多久、怎么停」。
+// --quiet 也照打 —— 它是「屏幕为什么又动起来了」的唯一解释（与 `[retry]` 那条同口径）。
+fn tr_note(cfg: &const Config, attempt: i32, wait_ms: i32) void {
+    out_err("[turn-retry] 模型空响应（无正文、无工具调用）");
+    out_err("——自动替你打一句「继续」再跑一回合（第 ");
+    out_err_dec(attempt as usize);
+    out_err("/");
+    out_err_dec(g_turn_retry_max as usize);
+    out_err(" 次，backoff=");
+    out_err_dec((wait_ms / 1000) as usize);
+    out_err(".");
+    out_err_dec(((wait_ms % 1000) / 100) as usize);
+    out_err("s；esc/ctrl+c 可停）\n");
+    if cfg.tui && tui_active() {
+        var note: Buf = buf_new(128);
+        if buf_valid(&note) {
+            _ = buf_append_cstr(&note, "自动继续（空响应，第 ");
+            _ = buf_append_u64(&note, attempt as u64);
+            _ = buf_append_cstr(&note, " 次）");
+            tui_add_notice(note.ptr as &const byte, note.len);
+            buf_free(&note);
+        }
+    }
+}
+
+// 同一条账进会话日志（`turn/retry`）：resume / 事后排障看的就是它。
+// 形状与 `llm/retry` 一致（attempt / maxRetries / reason / backoffMs），
+// 只是它记的是**回合级**那一次「替人打了继续」，不是同一请求的重发。
+fn tr_log(attempt: i32, wait_ms: i32) void {
+    if !g_sess.save {
+        return;
+    }
+    var ev: Buf = buf_new(512);
+    defer { buf_free(&ev); }
+    if !sess_begin(&g_sess, "turn/retry", &ev) {
+        return;
+    }
+    _ = buf_append_cstr(&ev, "{\"turn\":");
+    _ = buf_append_i64(&ev, g_turn as i64);
+    _ = buf_append_cstr(&ev, ",\"attempt\":");
+    _ = buf_append_i64(&ev, attempt as i64);
+    _ = buf_append_cstr(&ev, ",\"maxRetries\":");
+    _ = buf_append_i64(&ev, g_turn_retry_max as i64);
+    _ = buf_append_cstr(&ev, ",\"reason\":\"degenerate-response\"");
+    _ = buf_append_cstr(&ev, ",\"backoffMs\":");
+    _ = buf_append_i64(&ev, wait_ms as i64);
+    _ = buf_append_cstr(&ev, "}");
+    _ = sess_end(&g_sess, &ev);
+}
+
+// 一次自动继续：先说清 + 记账 + 退避（可中断）+ 把「继续」压进历史。
+//
+// 返回 `RTX_GO_RETRY`（可以再跑一回合）/ `RTX_GO_INTERRUPTED`（人在退避里叫停，
+// 调用方按 AGENT_INTERRUPTED 收口，**不许**再打错误行）/ `RTX_GO_GIVEUP`（连「继续」
+// 都压不进历史：内存或条数上限，认账，把原来的退出码交回去）。
+//
+// 顺序是刻意的：**先说话再睡**（沉默 3 s 与卡死没有区别），**先退避再注入**
+// （人若在退避里叫停，历史里不该多出一条没人要的 user 消息）。
+export fn turn_retry_after(cfg: &const Config, h: &History, attempt: i32) i32 {
+    const wait_ms: i32 = rtx_backoff_ms();
+    tr_note(cfg, attempt, wait_ms);
+    tr_log(attempt, wait_ms);
+    if agent_rtx_wait(wait_ms) {
+        return RTX_GO_INTERRUPTED;
+    }
+    var cont: Buf = buf_new(16);
+    defer { buf_free(&cont); }
+    var att: Buf = buf_new(1024);
+    defer { buf_free(&att); }
+    var have_att: bool = false;
+    if !buf_append_cstr(&cont, TR_CONTINUE) {
+        out_err("[turn-retry] 内存不足，续不上（本回合到此为止）\n");
+        return RTX_GO_GIVEUP;
+    }
+    // 与交互入口走**同一条**入史路径（`/continue` 也是这个函数）：图片附件的处理、
+    // 历史条数上限的腾挪都由它负责，这里不另写一份。
+    if !agent_push_user_with_imgs(h, &cont, &att, &have_att) {
+        out_err("[turn-retry] 「继续」写不进历史（内存或条数上限）\n");
+        return RTX_GO_GIVEUP;
+    }
+    agent_log_user_att(cont.ptr as &const byte, cont.len, false, &att,
+        &have_att);
+    return RTX_GO_RETRY;
+}

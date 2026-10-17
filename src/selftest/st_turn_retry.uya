@@ -1,0 +1,177 @@
+// src/selftest/st_turn_retry.uya — P94「回合异常结束自动继续」轮的判据
+//
+// 本文件：mode 50（`turn-retry`）那一轮的两侧验收 —— 转录（fd 2）里「说清了什么」与会话
+//   日志里「记了什么账」。轮次的驱动在 `st_round_driver.uya`，假网关在
+//   `st_mock_server.uya`（它另外在**请求体**上断言「继续」真的进了历史）。
+// 不变量：① 判据只落在**可观测的字节**上（转录的行、日志事件的字段、mock 收到的请求体）；
+//   ② 退避是随机数，所以只判**区间**（[0.5s, 3.0s]，与 `net/retryx` 同一组端点），
+//   不判相等；③ 这一轮只发生**一次**自动继续，次数、序号与两回合的顺序都钉死 ——
+//   「重试了」与「重试得当」是两件事。
+// 依赖：`st_round_driver.uya` 的 `ty_fail` / `contains` / `find_from` /
+//   `rtx_backoff_in_line`，会话日志的 `sess_*`（唯一真值在 `session/session.uya`），
+//   以及 `net/retryx` 的 `RTX_MIN_MS` / `RTX_MAX_MS`。
+// 命名：对外只有 `turnretry_check`；私有 `trc_*`。
+
+// 从捕获缓冲里找 `[turn-retry]` 那一行，再按「秒.十分之一秒」读回它声明的退避毫秒。
+// 返回 -1 = 那一行不存在或没有 backoff= 那一段（判据会报红）。
+// 复用 `rtx_backoff_in_line`（同一个格式、同一份解析）—— 两处各写一份的话，
+// 「回合级退避」与「传输层退避」的格式迟早分叉，而这里正是要钉它们同源。
+fn trc_backoff_ms(p: &const byte, n: usize) i32 {
+    const at: isize = find_from(p, n, "[turn-retry]" as &const byte, 12, 0);
+    if at < 0 {
+        return -1;
+    }
+    return rtx_backoff_in_line(p, n, at as usize);
+}
+
+// 转录那一半，六条判据（每一条都能单独变红）：
+//   ① 同一步的重发发生过（`[retry] empty response …`）—— 否则这一轮根本没走到
+//      「额度用尽」那个现场，后面的判据就成了空转；
+//   ② 第一回合确实按错误收场（`error: model returned neither content…`）；
+//   ③ 自动继续那一行在（`[turn-retry]`）；
+//   ④ 那一行给了退避值，且落在 [0.5s, 3.0s]；
+//   ⑤ 序号/预算说对了（第 1/2 次 —— 预算被谁改成别的，这里当场红）；
+//   ⑥ 那一行告诉了人怎么停（自动重试必须留一个能打断的口）。
+fn trc_capture_check(tag: &const byte, cap: &const Buf, ok: &bool) bool {
+    var pass: bool = true;
+    if !contains(cap, "[retry] empty response from upstream") {
+        ty_fail(tag, "转录里没有同一步重发的 [retry] 行（退化那条路没被走到？）",
+            &pass);
+    }
+    if !contains(cap, "error: model returned neither content nor tool_calls") {
+        ty_fail(tag, "第一回合没有按错误收场（这一轮就没测到「异常结束」）",
+            &pass);
+    }
+    if !contains(cap, "[turn-retry]") {
+        ty_fail(tag, "转录里没有 [turn-retry] 那一行（自动继续没发生或没说清）",
+            &pass);
+    }
+    const ms: i32 = trc_backoff_ms(cap.ptr as &const byte, cap.len);
+    if ms < 0 {
+        ty_fail(tag, "[turn-retry] 行里没有 backoff= 那一段", &pass);
+    } else if ms < RTX_MIN_MS || ms > RTX_MAX_MS {
+        ty_fail(tag, "退避值不在 [0.5s, 3.0s] 区间里（回合级与传输层没同源？）",
+            &pass);
+    }
+    if !contains(cap, "第 1/2 次") {
+        ty_fail(tag, "自动继续的序号/预算不对（应当是第 1/2 次）", &pass);
+    }
+    if !contains(cap, "esc/ctrl+c 可停") {
+        ty_fail(tag, "那一行没告诉人怎么停（自动重试必须留一个能打断的口）",
+            &pass);
+    }
+    if !pass {
+        ok[0] = false;
+    }
+    return pass;
+}
+
+// 会话日志那一半：读最后一轮会话，按行折出五条账。
+//   ① `turn/start` 恰好两条（第一回合 + 自动继续那一回合）；
+//   ② `turn/end` 的 reason 先 `error` 后 `completed`（顺序也管：先失败才谈得上继续）；
+//   ③ `turn/retry` 恰好一条，attempt=1、maxRetries=出厂预算、backoffMs 落在区间里；
+//   ④ 注入的那条 `user/message` 正文是「继续」（历史与会话日志必须同一条话）；
+//   ⑤ 日志里不许出现第二条 `turn/retry`（这一轮预算内只该继续一次）。
+fn trc_log_check(tag: &const byte, home: &const byte, ws: &const byte,
+                 ok: &bool) bool {
+    var path: Buf = buf_new(1200);
+    defer { buf_free(&path); }
+    if !sess_find_last(home, ws, &path) {
+        ty_fail(tag, "找不到刚跑完的会话（会话日志没落盘？）", ok);
+        return false;
+    }
+    // `sess_reader_load` 把路径当 C 串（Buf 不带 NUL）：自己补一个再退回
+    if !buf_append_byte(&path, 0) {
+        ty_fail(tag, "路径缓冲不够补 NUL", ok);
+        return false;
+    }
+    path.len = path.len - 1;
+    var r: SessReader = sess_reader_empty();
+    defer { sess_reader_free(&r); }
+    if !sess_reader_load(path.ptr as &const byte, &r) {
+        ty_fail(tag, "会话日志读不出来", ok);
+        return false;
+    }
+    var line: Buf = buf_new(65536);
+    defer { buf_free(&line); }
+    var typ: Buf = buf_new(64);
+    defer { buf_free(&typ); }
+    var starts: i32 = 0;
+    var ends: i32 = 0;
+    var retries: i32 = 0;
+    var retry_ok: bool = false;
+    var cont_user: bool = false;
+    while sess_next(&r, &line) {
+        buf_reset(&typ);
+        if !sess_line_type(&line, &typ) {
+            continue;
+        }
+        const view: &[byte] = line.ptr[0: line.len];
+        if sv_eq_cstr(&typ, "turn/start") {
+            starts = starts + 1;
+            continue;
+        }
+        if sv_eq_cstr(&typ, "turn/end") {
+            ends = ends + 1;
+            continue;
+        }
+        if sv_eq_cstr(&typ, "turn/retry") {
+            retries = retries + 1;
+            const a: i64 = sess_json_i64(view, "attempt" as &const byte);
+            const mx: i64 = sess_json_i64(view, "maxRetries" as &const byte);
+            const b: i64 = sess_json_i64(view, "backoffMs" as &const byte);
+            if a == 1 as i64 && mx == (TURN_RETRY_MAX as i64)
+                && b >= (RTX_MIN_MS as i64) && b <= (RTX_MAX_MS as i64) {
+                retry_ok = true;
+            }
+            continue;
+        }
+        if sv_eq_cstr(&typ, "user/message") {
+            if contains(&line, "继续") {
+                cont_user = true;
+            }
+            continue;
+        }
+    }
+    var pass: bool = true;
+    if starts != 2 {
+        ty_fail(tag, "turn/start 不是 2 条（自动继续没有开新回合？）", &pass);
+    }
+    if ends != 2 {
+        ty_fail(tag, "turn/end 不是 2 条（两个回合各自都该收尾）", &pass);
+    }
+    if retries != 1 {
+        ty_fail(tag, "turn/retry 不是 1 条（记账丢了，或继续了不止一次）",
+            &pass);
+    }
+    if !retry_ok {
+        ty_fail(tag, "turn/retry 的字段不对（attempt/maxRetries/backoffMs）",
+            &pass);
+    }
+    if !cont_user {
+        ty_fail(tag, "日志里没有那条「继续」的 user/message（历史与账本不一致）",
+            &pass);
+    }
+    if !pass {
+        ok[0] = false;
+    }
+    return pass;
+}
+
+// 这一轮的总判据：两侧都要过（只查一侧的话，「屏幕上什么都没说」与「账没记」各能骗过
+// 其中一条 —— 与 `netretry_check` 同一条纪律）。
+export fn turnretry_check(tag: &const byte, cap: &const Buf,
+                          home: &const byte, ws: &const byte,
+                          ok: &bool) bool {
+    var pass: bool = true;
+    if !trc_capture_check(tag, cap, &pass) {
+        pass = false;
+    }
+    if !trc_log_check(tag, home, ws, &pass) {
+        pass = false;
+    }
+    if !pass {
+        ok[0] = false;
+    }
+    return pass;
+}
