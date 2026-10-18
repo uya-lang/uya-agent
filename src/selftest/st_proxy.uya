@@ -64,9 +64,16 @@ const PXR_REPLY_BYPASS: &const byte =
 const PXR_ECHO: &const byte = "PING-THROUGH-TUNNEL" as &const byte;
 
 // 假代理要服务的连接条数（父进程的脚本步数与它一一对应）。
-const PXR_CONNS: i32 = 5;
+const PXR_CONNS: i32 = 6;
 // 子进程等连接的总预算（毫秒）：父进程某一步早退时，别让它吊在 accept 上。
 const PXR_ACCEPT_BUDGET_MS: u64 = 12000;
+// 「隧道被掐断」那一步的目标（与前面几步同一个 .invalid 域名，便于断言 hpx 记的账）。
+const PXR_DROP_HOST: &const byte = "proxy-selftest.invalid" as &const byte;
+const PXR_DROP_PORT: u16 = 8443;
+// 种进「上一次观测到的 leaf」的假指纹（64 个 hex 字符 —— 长度错一位就不算观测到了）。
+const PXR_SEED_HEX: &const byte =
+    "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+    as &const byte;
 
 // 断言失败：打一行带轮名的诊断并置 ok = false（与 dnr_fail 同形）。
 fn pxr_fail(what: &const byte, ok: &bool) void {
@@ -423,7 +430,31 @@ fn pxr_step_reject(cfd: i32, rx: &Buf, reply: &const byte) i32 {
     return 0;
 }
 
-// 回环绕过步（step 5）：请求直接打到**本假代理**（父进程把代理指向死端口，
+// 隧道被掐断步（step 5）：CONNECT 照收、200 照回，然后把隧道**掐断**（读完客户端
+// 发来的第一个 TLS 记录就走人，一个字都不回）。P95 用户报的现场就是这个形状：
+// 代理答应了 CONNECT、上游却没通，客户端这边只看到「握手失败」。
+//
+// 为什么读一次再关：**不读就关**时客户端的 ClientHello 有可能撞上 RST，那条路会以
+// `HcIoFailed` 收场（写失败），而不是本轮要钉的「握手失败」—— 判据就成了看运气。
+fn pxr_step_drop(cfd: i32, rx: &Buf) i32 {
+    var head_n: usize = 0;
+    if !pxr_take_request(cfd, rx, &head_n) {
+        return 15;
+    }
+    if !pxr_expect_head(rx, head_n, PXR_WIRE_CONNECT) {
+        return 16;
+    }
+    if !pxr_send(cfd, PXR_REPLY_200) {
+        return 17;
+    }
+    var tmp: [byte: 512] = [0: 512];
+    _ = https_read_some(cfd, &tmp[0], 512) catch {
+        return 0;   // 客户端没发也算正常（本轮只关心它随后会失败）
+    };
+    return 0;
+}
+
+// 回环绕过步（step 6）：请求直接打到**本假代理**（父进程把代理指向死端口，
 // 若绕过没生效就根本连不上），且请求行必须是**相对形式**。
 fn pxr_step_bypass(cfd: i32, rx: &Buf) i32 {
     var head_n: usize = 0;
@@ -477,6 +508,8 @@ fn pxr_fake_proxy(lfd: i32) i32 {
             rc = pxr_step_reject(cfd, &rx, PXR_REPLY_407);
         } else if served == 3 {
             rc = pxr_step_reject(cfd, &rx, PXR_REPLY_502);
+        } else if served == 4 {
+            rc = pxr_step_drop(cfd, &rx);
         } else {
             rc = pxr_step_bypass(cfd, &rx);
         }
@@ -643,7 +676,69 @@ fn pxr_parent_reject(ok: &bool, want_failed: bool, want_status: i32) void {
     pxr_fail("被代理拒绝的腿却连上了", ok);
 }
 
-// 父进程的 step 5：目标是回环 ⇒ 无论如何都直连（代理指向一个没人听的端口）。
+// 父进程的 step 5：隧道被掐断 ⇒ 握手失败，而且**两条账各归各位**。
+//
+// 这条腿钉的是 P95 用户报的那个现场：屏幕上「目标 = 本机代理:端口」＋「服务端 leaf
+// SHA-256 = 上一个回合那台站点的证书」。两件事分别有判据：
+//   ① 种一份「上一次观测到的指纹」，跑一次注定失败的握手，它必须被清零 —— 否则报告
+//      就会拿上一次的证书冒充这一次的（这一条删掉 `hc_connect` 里那行清账就红）；
+//   ② `hc_target_*` 记的是**代理**、`hpx_target_*` 记的是**真目标**。两者确实不同，
+//      所以报告不能只看 `hc_target_*`（`agent_target_line` 那条判据靠这份账）。
+// 种指纹为什么要专门的钩子：判据要么先在自测里造一次**成功**的 TLS 握手（本仓没有
+// TLS 服务端），要么把「上一次的观测」直接种进来 —— 后者测的正是产品代码那一行
+// （不种而直接断言 0 是假绿：那个 0 从初始化就是 0，删掉清账也照样绿）。
+fn pxr_parent_broken(ok: &bool, proxy_port: u16) void {
+    hc_note_leaf_for_test(PXR_SEED_HEX, 64);
+    if hc_last_leaf_len() != 64 {
+        pxr_fail("夹具：假指纹没种进去（长度不是 64）", ok);
+        return;
+    }
+    var u: Buf = buf_new(128);
+    defer { buf_free(&u); }
+    pxr_url(&u, "https://" as &const byte, PXR_DROP_HOST, PXR_DROP_PORT,
+        "/v1/chat" as &const byte);
+    var eb: Buf = buf_new(1);
+    defer { buf_free(&eb); }
+    var body: Buf = buf_new(4);
+    defer { buf_free(&body); }
+    _ = buf_append_cstr(&body, "{}");
+    var r: Resp = resp_empty();
+    defer { resp_free(&r); }
+    var tc: TlsConn = tls_conn_empty();
+    const call: !void = http_request(u.ptr[0: u.len], &"POST"[0: 4],
+        eb.ptr[0: 0], body.ptr as &const byte, body.len, 8000, 65536,
+        HC_VERIFY_NONE, eb.ptr[0: 0], &r, &tc);
+    var failed: bool = false;
+    _ = call catch |err| {
+        failed = true;
+        const eid: i32 = (@error_id(err) as! i32).value;
+        if eid != @error_id(error.HcHandshakeFailed) {
+            pxr_fail("隧道被掐断却没用「握手失败」那一档报出来", ok);
+            return;
+        }
+    };
+    if !failed {
+        pxr_fail("隧道被掐断的腿却成功了（夹具或实现有问题）", ok);
+        return;
+    }
+    if hc_last_leaf_len() != 0 {
+        pxr_fail("失败那一次还留着上一次的 leaf 指纹（报告会说谎）", ok);
+    }
+    if hc_last_route_now() != HC_ROUTE_TUNNEL {
+        pxr_fail("这一次走的路由不是隧道（报告取不到真目标）", ok);
+    }
+    const hn: usize = bufx_cstr_len(PXR_DROP_HOST);
+    if !pxr_eq_ptr(hpx_target_ptr(), hpx_target_len(), PXR_DROP_HOST)
+        || hpx_target_len() != hn || hpx_target_port() != PXR_DROP_PORT {
+        pxr_fail("代理账里的目标不是这次要去的那台（报告会印错目标）", ok);
+    }
+    if !pxr_eq_ptr(hc_target_host_ptr(), hc_target_host_len(),
+        "127.0.0.1" as &const byte) || hc_target_port_now() != proxy_port {
+        pxr_fail("连接账里记的不是代理（这条腿的前提不成立）", ok);
+    }
+}
+
+// 父进程的 step 6：目标是回环 ⇒ 无论如何都直连（代理指向一个没人听的端口）。
 fn pxr_parent_bypass(ok: &bool, target_port: u16) void {
     _ = hpx_set("127.0.0.1:1" as &const byte);
     var u: Buf = buf_new(128);
@@ -709,17 +804,18 @@ fn pxr_live_round(tag: &const byte) bool {
         _ = wait_child(pid);
         return ok;
     }
-    // 五个步骤的顺序与子进程脚本一一对应（少走一步会让子进程超时退出并报 91）
+    // 六个步骤的顺序与子进程脚本一一对应（少走一步会让子进程超时退出并报 91）
     pxr_parent_tunnel(&ok);
     pxr_parent_abs(&ok, proxy_port);
     pxr_parent_reject(&ok, true, 407);
     pxr_parent_reject(&ok, false, 502);
+    pxr_parent_broken(&ok, proxy_port);
     pxr_parent_bypass(&ok, proxy_port);
     const rc: i32 = wait_child(pid);
     if rc != 0 {
         out_err("selftest[proxy] note: 假代理判定码 = ");
         out_err_dec(rc as usize);
-        out_err("（1..14 = 第几步的哪条断言；90 = 内存；91 = 等连接超时）\n");
+        out_err("（1..17 = 第几步的哪条断言；90 = 内存；91 = 等连接超时）\n");
         pxr_fail("假代理侧的断言没过（线上的字节与期望不符）", &ok);
     }
     _ = hpx_set(null as &const byte);   // 别把代理留给后面的轮次
@@ -727,7 +823,7 @@ fn pxr_live_round(tag: &const byte) bool {
         out_err("selftest[");
         out_err(tag);
         out_err("] ok（CONNECT 原文 / 隧道回显透明 / 绝对形式请求行 / ");
-        out_err("407 与 502 各自归位 / 回环绕过）\n");
+        out_err("407 与 502 各自归位 / 隧道掐断时不留旧指纹 / 回环绕过）\n");
     }
     return ok;
 }

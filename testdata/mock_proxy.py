@@ -17,6 +17,8 @@
     python3 testdata/mock_proxy.py <port> <log-path> [--reject STATUS] [--upstream H:P]
         --reject STATUS   每条请求都直接回这个状态码（反腿用），不连上游
         --upstream H:P    **目标改写**：不管请求行里写的是谁，一律连这一台上游。
+        --tunnel-drop     CONNECT 照收、200 照回，然后把隧道**掐断**（模拟「代理答应了、
+                          上游却没通」——客户端那边只看到握手失败）。
 
 为什么需要 `--upstream`：验收腿故意用 `.invalid` 域名当目标（RFC 2606 保留域）—— 那是
 「请求真的到了代理由它转发」这条判据的依据，但代理自己**不能**去解析它（真解析器必然
@@ -34,14 +36,22 @@ PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 0
 LOG = sys.argv[2] if len(sys.argv) > 2 else "/tmp/proxy.log"
 REJECT = 0
 UPSTREAM = None            # (host, port)：目标改写（见文件头）
+DROP_TUNNEL = False        # 隧道掐断（见文件头）
 args = sys.argv[3:]
-while len(args) >= 2:
-    if args[0] == "--reject":
-        REJECT = int(args[1])
-    elif args[0] == "--upstream":
-        uhost, _, uport = args[1].partition(":")
+i = 0
+while i < len(args):
+    if args[i] == "--tunnel-drop":
+        DROP_TUNNEL = True
+        i += 1
+    elif args[i] == "--reject" and i + 1 < len(args):
+        REJECT = int(args[i + 1])
+        i += 2
+    elif args[i] == "--upstream" and i + 1 < len(args):
+        uhost, _, uport = args[i + 1].partition(":")
         UPSTREAM = (uhost, int(uport))
-    args = args[2:]
+        i += 2
+    else:
+        i += 1
 
 
 def upstream_of(host, port):
@@ -134,6 +144,14 @@ def serve_connect(conn, head, rest, target):
         log("AUTH %s" % auth)
     if REJECT:
         conn.sendall(("HTTP/1.1 %d Nope\r\n\r\n" % REJECT).encode())
+        return
+    if DROP_TUNNEL:
+        log("DROP %s" % target)
+        conn.sendall(b"HTTP/1.1 200 Connection established\r\n\r\n")
+        try:
+            conn.recv(4096)   # 收下客户端的第一段 TLS 记录再掐断（不读就关会撞 RST）
+        except OSError:
+            pass
         return
     dhost, dport = upstream_of(host, int(port))
     try:

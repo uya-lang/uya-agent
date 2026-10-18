@@ -1655,7 +1655,7 @@ e2e-proxy: build
 	ws=$$(pwd)/build/selftest_proxy_e2e; req=$$ws/req.bin; \
 	rm -rf $$ws; mkdir -p $$ws; \
 	plog=$$ws/proxy.log; gwlog=$$ws/gw.log; \
-	cleanup() { for p in $$pp $$gwp $$rp $$gws $$ps2; do \
+	cleanup() { for p in $$pp $$gwp $$rp $$gws $$ps2 $$dp; do \
 		kill $$p 2>/dev/null || true; done; rm -rf $$ws; }; \
 	trap cleanup EXIT; \
 	: "--- 起夹具：网关先起（代理要把它当 --upstream 的目标改写）---"; \
@@ -1676,15 +1676,21 @@ e2e-proxy: build
 		cat $$ws/gwsse.log; exit 1; }; \
 	python3 testdata/mock_proxy.py 0 $$ws/proxysse.log \
 		--upstream 127.0.0.1:$$sport > $$ws/proxysse.port 2>&1 & ps2=$$!; \
+	: "--- 掐断腿的假代理：CONNECT 照收、200 照回，然后把隧道掐断 ---"; \
+	python3 testdata/mock_proxy.py 0 $$ws/drop.log --tunnel-drop \
+		> $$ws/drop.port 2>&1 & dp=$$!; \
 	sleep 0.6; \
 	pport=$$(awk '/^PORT/{print $$2}' $$ws/proxy.port); \
 	rport=$$(awk '/^PORT/{print $$2}' $$ws/reject.port); \
 	sport2=$$(awk '/^PORT/{print $$2}' $$ws/proxysse.port); \
+	dport=$$(awk '/^PORT/{print $$2}' $$ws/drop.port); \
 	[ -n "$$pport" ] || { echo "FAIL: 假代理没起来"; cat $$ws/proxy.port; exit 1; }; \
 	[ -n "$$rport" ] || { echo "FAIL: 拒绝腿的假代理没起来"; \
 		cat $$ws/reject.port; exit 1; }; \
 	[ -n "$$sport2" ] || { echo "FAIL: 流式那条腿的假代理没起来"; \
 		cat $$ws/proxysse.port; exit 1; }; \
+	[ -n "$$dport" ] || { echo "FAIL: 掐断腿的假代理没起来"; \
+		cat $$ws/drop.port; exit 1; }; \
 	: "---- ① 正腿：env 档，请求穿过代理到达上游（明文目标 = 绝对形式）----"; \
 	rc=0; \
 	env -u UYA_AGENT_BASE_URL UYA_AGENT_PROXY=127.0.0.1:$$pport UYA_AGENT_API_KEY=k \
@@ -1769,6 +1775,34 @@ e2e-proxy: build
 	if grep -q "TLS\|域名解析" $$ws/bad.txt; then \
 		echo "FAIL: 代理失败却说成了 TLS/DNS（这条线要修的就是这个谎）"; \
 		cat $$ws/bad.txt; exit 1; fi; \
+	: "---- ⑥b 反腿：代理接了 CONNECT 却把隧道掐断 ⇒ 报握手失败，"; \
+	: "  但目标要写**真目标**（不是代理）、且不许印上一次的证书指纹 ----"; \
+	: "  P95 用户报的现场：报告里「目标 = 本机代理:端口」与「leaf = 上一个回合那台"; \
+	: "  站点的证书」互相矛盾，看的人被指向完全错的方向。"; \
+	rc=0; \
+	env -u UYA_AGENT_BASE_URL UYA_AGENT_PROXY=127.0.0.1:$$dport \
+		UYA_AGENT_API_KEY=k \
+		$(OUT) --no-dsh-config --no-tui --no-stream --api=chat --model px-drop \
+		--api-retry-max 0 \
+		--base-url "https://mock-proxy-e2e.invalid:443/v1" --workspace $$ws \
+		--agent-home $$ws/drophome --timeout-ms 5000 "hi" \
+		> $$ws/drop.txt 2>&1 || rc=$$?; \
+	[ "$$rc" = "2" ] || { echo "FAIL: 隧道被掐断时退出码应当是 2，实际 $$rc"; \
+		cat $$ws/drop.txt; exit 1; }; \
+	grep -q "TLS 握手失败" $$ws/drop.txt \
+		|| { echo "FAIL: 隧道被掐断没按握手失败报出来"; \
+		cat $$ws/drop.txt; exit 1; }; \
+	grep -q "目标 = mock-proxy-e2e.invalid:443" $$ws/drop.txt \
+		|| { echo "FAIL: 目标写错了（应当是隧道里的真目标，不是代理）"; \
+		cat $$ws/drop.txt; exit 1; }; \
+	grep -q "（经代理 127.0.0.1:$$dport）" $$ws/drop.txt \
+		|| { echo "FAIL: 没把「代理是谁」印出来"; cat $$ws/drop.txt; exit 1; }; \
+	grep -q "隧道多半被对端掐断" $$ws/drop.txt \
+		|| { echo "FAIL: 经代理那条路的下一步提示没给出来"; \
+		cat $$ws/drop.txt; exit 1; }; \
+	if grep -q "leaf SHA-256" $$ws/drop.txt; then \
+		echo "FAIL: 这一次没拿到证书却印了指纹（那是上一次的，报告在说谎）"; \
+		cat $$ws/drop.txt; exit 1; fi; \
 	: "---- ⑦ 反腿：CONNECT 被回 407 ⇒ rc=2、文案点名凭据 ----"; \
 	: "  目标写成 https://（走 CONNECT 隧道）：隧道被拒时根本不会开始 TLS 握手，"; \
 	: "  所以这条腿不需要证书，也不联网 —— 它判的正是「代理拒绝」那一档。"; \
@@ -1828,7 +1862,7 @@ e2e-proxy: build
 		cat $$ws/out6.txt; exit 1; }; \
 	grep -q "PORTABLE-OK" $$ws/out6.txt \
 		|| { echo "FAIL: 绕过代理那一轮没拿到答复"; cat $$ws/out6.txt; exit 1; }; \
-	echo "e2e-proxy: 通过（请求真穿过代理到上游；流式/凭据/CLI 档各一条；代理失败说人话；非法值 rc=1；回环绕过）"
+	echo "e2e-proxy: 通过（请求真穿过代理到上游；流式/凭据/CLI 档各一条；代理失败说人话；非法值 rc=1；回环绕过；隧道掐断时目标/代理分开印且不印旧指纹）"
 
 
 # 步数默认值回归（离线，--print-config 不联网）：默认不限步数（0）；CLI 与环境变量同口径。
