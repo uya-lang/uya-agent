@@ -1,0 +1,173 @@
+// src/agent/ag_stream_async.uya — 把「一步的流式请求」搬进事件循环（P100）
+//
+// 本文件：`agent_stream_call`。它在**交互模式**下把流式请求交给事件循环
+//   （`allm_stream_style` → `rt_run`），帧回调里做原来泵点该做的事（读键 / 派发运行中
+//   的命令 / 刷帧 / watch 心跳），并把「该不该停」翻译成 rt 的取消意图。
+//   非交互模式（管道 / CI / 子代理）**仍然走原来的同步路径**：那里没有人要服务，
+//   多绕一层事件循环只会让「请求体逐字节相同」这条不变量多一个变量。
+//
+// 不变量：
+//   ① **错误分类只有一处**：本文件只回 `(status, eid)` 两个数，`agent_step_stream` 拿
+//      着 eid 去调它原来那三个判据函数（`rtx_retryable_err` /
+//      `agent_net_fail_kind` / 错误种类）。**不在这一层复刻分类**，也不用把 error 值
+//      跨 `rt_run` 搬来搬去（`rt_run` 只回退出码，Uya 也没有 error 值的反射）。
+//   ② **泵点纪律不搬**：帧回调直接调 `agent_pump_block()` —— 后台请求（自动起标题）
+//      在那里本来就退化成「只刷帧、不读键」（P46），拖选复制 / ctrl+t 的请求也在那里
+//      消费（踩坑 114 / P85）。换的是「谁来调它」，不是「它做什么」。
+//   ③ 结束前**把取消意图消费掉**（`rt_abort_take`）：不清的话下一回合会在第一个等待
+//      边界被上一轮的 esc 当场打断（P96 的 goal 续跑就踩过这条）。
+//   ④ 帧回调**登记/复位必须成对**，且只在交互路径上做 —— 非交互路径一个字节都不碰
+//      rt 的全局状态。
+//
+// 依赖：src/net/allm.uya（`allm_stream_style`）、src/net/llm.uya（`ChatOut` /
+//   `llm_stream_style` 同步兜底）、src/rt/rtloop.uya（`rt_run` / `rt_abort*` /
+//   `rt_set_frame`）、src/agent/ag_plan_pump.uya（`agent_pump_block`）。
+// 命名：`agent_stream_*`、`AgRtFrame`。
+
+// 帧回调：每 ≤16 ms 一次（`rt` 的包装 future 负责节流），做一遍泵点该做的事。
+//
+// 为什么是 `agent_pump_block` 而不是 `llm_pump_input`：前者是**这一轮改造里唯一**
+// 该被周期调用的入口（读键 + 派发命令 + 刷帧 + watch + ctrl+t + 复制请求），
+// 后者是「流式循环自己的读键」，只在同步版里用。两个都调会让同一次按键被两边抢。
+struct AgRtFrame : RtFrame {
+    fn rt_frame(self: &Self, now_ms: u64) void {
+        _ = self;
+        _ = now_ms;
+        // 只做「显示 + 命令派发」：**不在这里读键**。键的读取留在流式循环里
+        // （`agent_stream_pump` → `llm_pump_input`，与同步版同一位置）——
+        // 帧比第一个字节到得早，在这里读键会让「请求已经发出去之后按的 ctrl+c」
+        // 变成「请求还没发就取消」，`interrupt` 那条腿的 mock 断言（必须服务满 1 轮）
+        // 会当场红（实测 verdict 62 = 一轮都没服务）。
+        // TUI 档不受影响：`agent_pump_block` → `tui_abort_check` → `tui_tick` 本来
+        // 就既读键又重绘，那是 TUI 唯一的读键入口（与同步版一致）。
+        const ab: i32 = agent_pump_block();
+        if ab == TUI_ABORT_TURN {
+            rt_abort(RT_ABORT_TURN);
+            return;
+        }
+        if ab == TUI_ABORT_QUIT {
+            rt_abort(RT_ABORT_QUIT);
+            return;
+        }
+    }
+}
+
+var g_ag_rt_frame: AgRtFrame = AgRtFrame{};
+// 接口值只装箱一次（具体 struct 的值形态装箱在检查器里算一次移动，见 rtloop 的注释）。
+var g_ag_rt_frame_i: RtFrame = g_ag_rt_frame;
+
+// 流式循环**每迭代一次**调它 —— 位置与同步版 `llm_stream_style` 里那次
+// `llm_pump_input()` 完全一致（读到一段字节之后、还没等到完整事件的时候）。
+//
+// 返回：0 = 继续；1 = 本回合中断（ctrl+c / esc）；2 = 用户要退出（ctrl+d / /exit）。
+// 两者在 `allm` 里都折成 `error.LlmInterrupted`（与同步版把事件翻译成同一个错误同义），
+// 「退出」那一半的意图留在 `tui_abort_*` / `rt_abort_*` 里，回合收口后主循环自己退。
+export fn agent_stream_pump(interactive: bool) i32 {
+    if !interactive {
+        return 0;
+    }
+    const ev: i32 = llm_pump_input();
+    if ev == TTY_EV_CTRL_C || ev == TTY_EV_ESC {
+        return 1;
+    }
+    if ev == TTY_EV_EOF {
+        return 2;
+    }
+    return 0;
+}
+
+// 事件循环里跑的那一段：把 `allm_stream_style` 的 (status, eid) 都带出来。
+@async_fn fn agent_stream_body(
+    style: u8,
+    url: &[byte],
+    headers: &[byte],
+    body: &const byte,
+    body_len: usize,
+    timeout_ms: u32,
+    max_body: usize,
+    verify: i32,
+    pin: &[byte],
+    o: &ChatOut,
+    print_content: bool,
+    print_reasoning: bool,
+    status_out: &i32,
+    eid_out: &i32
+) Future<!i32> {
+    eid_out[0] = 0;
+    const r: !i32 = @await allm_stream_style(style, url, headers, body,
+        body_len, timeout_ms, max_body, verify, pin, o, print_content,
+        print_reasoning, true, status_out);
+    const got: i32 = r catch |err| {
+        eid_out[0] = (@error_id(err) as! i32).value;
+        0 - 1;
+    };
+    return got;
+}
+
+// 帧回调的生命周期：**成对**使用。任何「要在事件循环上等一会儿」的执行核
+// （流式请求 / 前台子进程 / 将来的剪贴板与插件等待）都调这一对，
+// 于是「跑着的时候界面还在动、键还读得到、esc 还生效」只有一份实现。
+//
+// 为什么不是「各自注册自己的回调」：`rt_set_frame` 是单槽的（进程唯一事件循环），
+// 两处各自登记会互相覆盖 —— 谁先结束谁就把另一处的界面心跳清掉。
+export fn agent_rt_begin() void {
+    rt_abort_reset();
+    rt_set_frame(g_ag_rt_frame_i);
+}
+
+// 收工：清帧回调 + 把本轮的中止意图消费掉（不留给下一个回合）。
+export fn agent_rt_end() void {
+    rt_frame_clear();
+    _ = rt_abort_take();
+}
+
+// 一步的流式请求。返回状态码（-1 表示出错，具体是哪一档看 `eid_out`）。
+//
+// `interactive == false` 时**完全**走原来的同步路径（逐字节不变）。
+export fn agent_stream_call(
+    style: u8,
+    url: &[byte],
+    headers: &[byte],
+    body: &const byte,
+    body_len: usize,
+    timeout_ms: u32,
+    max_body: usize,
+    verify: i32,
+    pin: &[byte],
+    o: &ChatOut,
+    print_content: bool,
+    print_reasoning: bool,
+    interactive: bool,
+    eid_out: &i32
+) i32 {
+    eid_out[0] = 0;
+    if !interactive {
+        const r: !i32 = llm_stream_style(style, url, headers, body, body_len,
+            timeout_ms, max_body, verify, pin, o, print_content,
+            print_reasoning, false);
+        const got: i32 = r catch |err| {
+            eid_out[0] = (@error_id(err) as! i32).value;
+            0 - 1;
+        };
+        return got;
+    }
+    // 交互路径：事件循环 + 帧回调（= 泵点的替代品）
+    agent_rt_begin();
+    var status: i32 = 0;
+    var eid: i32 = 0;
+    const rc: i32 = rt_run(agent_stream_body(style, url, headers, body,
+        body_len, timeout_ms, max_body, verify, pin, o, print_content,
+        print_reasoning, &status, &eid));
+    // 清帧回调 + 消费掉本轮的中止意图（`agent_rt_end` 一次做完两件事）
+    agent_rt_end();
+    if eid != 0 {
+        eid_out[0] = eid;
+        return 0 - 1;
+    }
+    if rc != 0 {
+        // 事件循环本身没收口（重入 / epoll 建不起来）：按传输错报，别当成 200。
+        eid_out[0] = (@error_id(error.HcIoFailed) as! i32).value;
+        return 0 - 1;
+    }
+    return status;
+}

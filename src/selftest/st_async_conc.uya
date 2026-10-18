@@ -1,0 +1,370 @@
+// src/selftest/st_async_conc.uya — P102：并发能力与静音嵌套（`async-conc` 轮）
+//
+// 本文件：`async-conc` 轮，两部分判据 ——
+//   A **两条 LLM 流在同一个事件循环上真并发**：mock 记下两条连接各自的「开始/结束」
+//     时刻，要求时间**重叠**（串行实现只会前后相接）。这是「侧路请求与主回合同时发」
+//     那条收益的机器判据 —— 没有它，「并发」只是嘴上说的。
+//   B **`tls_noise_mute` 嵌套不再永久静音 fd 2**（P102 修的实测缺陷）：外层 unmute 之后
+//     fd 2 必须还能写。判据用「往 fd 2 写一段再读回来」做不到（fd 2 是终端），所以改用
+//     一个**临时文件**：`dup2(tmp, 2)` → 两层 mute/unmute → 再往 fd 2 写 → 读文件确认
+//     最后一段真的落进去了。
+//
+// 不变量：① 并发腿的两条连接指向**同一个** mock 服务端（它 accept 两条、按连接分别记
+//   时刻），这样「重叠」是同一个时钟下的比较；② 静音腿结束必须把 fd 2 复位到原样
+//   （还原 saved），否则整个自测套件的输出都会进那个临时文件；③ 两条腿都自带清理。
+//
+// 依赖：src/net/allm.uya（`allm_stream_chat`）、src/rt/rtloop.uya（`rt_run` /
+//   `rt_join2`）、src/agent/ag_config.uya（`tls_noise_mute` / `err_fd`）、
+//   libc.syscall（socket / fork / dup / dup2 / open / lseek / read）。
+// 命名：`conc_*`、`g_conc_*`、`async_conc_round`。
+
+// 一条连接的时刻（毫秒，进程启动后的相对值）—— 由 mock 子进程写进管道回传给父进程。
+const CONC_SLOTS: usize = 4;
+
+// 一条完整的 SSE 响应（头 + 61 字节体，共 152 字节）—— mock 与判据共用这一份。
+// 行宽豁免：HTTP/SSE 是协议报文，拆开就等于改协议。
+const CONC_SSE_RESP: &const byte = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 61\r\nConnection: close\r\n\r\ndata: {\"choices\":[{\"delta\":{\"content\":\"x\"}}]}\n\ndata: [DONE]\n\n";
+
+// 并发腿：一个服务端、两条连接、每条都先歇 120 ms 再回一段最小 SSE 流。
+// 串行实现：第二条连接的开始时间 ≥ 第一条的结束时间；并发实现：两条的开始都早于
+// 对方的结束。
+fn conc_serve(lfd: i32, times: &u64, n_slots: usize) i32 {
+    // **先把两条连接都接进来**（客户端并发连，两次 accept 都会很快返回），记下各自的
+    // 开始时刻；然后再歇 120 ms、再同时回 —— 这样「客户端并发」才会体现成时刻重叠。
+    // 反例（单线程串行客户端）：第二条连接在第一条请求**结束之后**才建立，
+    // t2 会明显晚于 t0（这正是这条腿要分辨的东西）。
+    var conns: [i32: 4] = [-1, -1, -1, -1];
+    var accepted: usize = 0;
+    while accepted < n_slots {
+        var peer: [byte: 16] = [0: 16];
+        var plen: u32 = 16;
+        const c: i32 = sys_accept(lfd, &peer[0] as &void, &plen) catch {
+            return 70;
+        };
+        conns[accepted] = c;
+        times[accepted * 2] = ua_now_ms();
+        accepted = accepted + 1;
+    }
+    // 读掉两条请求的头（每一条都要读，否则客户端的写会卡在缓冲区里）
+    var i: usize = 0;
+    while i < n_slots {
+        var tmp: [byte: 2048] = [0: 2048];
+        var seen: usize = 0;
+        while seen < 65536 {
+            const n: isize = sys_read(conns[i], &tmp[0], 2048) catch {
+                0 as isize;
+            };
+            if n <= 0 {
+                break;
+            }
+            var k: usize = 0;
+            var found: bool = false;
+            while k + 3 < (n as usize) {
+                if tmp[k] == 13 && tmp[k + 1] == 10 &&
+                    tmp[k + 2] == 13 && tmp[k + 3] == 10 {
+                    found = true;
+                    break;
+                }
+                k = k + 1;
+            }
+            if found {
+                break;
+            }
+            seen = seen + (n as usize);
+        }
+        i = i + 1;
+    }
+    // 歇 120 ms（两条一起歇 ⇒ 生命周期重叠）
+    var req: TimeSpec = TimeSpec{ tv_sec: 0, tv_nsec: 120000000 };
+    var rem: TimeSpec = TimeSpec{ tv_sec: 0, tv_nsec: 0 };
+    _ = sys_nanosleep(&req, &rem) catch {};
+    // 同时回两条
+    var j: usize = 0;
+    while j < n_slots {
+        // 行宽豁免：SSE 响应是协议报文（Content-Length 与正文必须逐字节对齐）。
+        const body: &const byte = CONC_SSE_RESP;
+        const w: !void = https_write_all(conns[j], body, 152 as usize);
+        _ = w catch {};
+        times[j * 2 + 1] = ua_now_ms();
+        _ = sys_close(conns[j]) catch {};
+        j = j + 1;
+    }
+    _ = sys_close(lfd) catch {};
+    return 0;
+}
+
+// 起并发腿的服务端：**时刻表通过管道回传**（`fork` 出来的子进程与父进程不共享内存）。
+// 返回端口（0 = 失败）；`rfd_out` 是读时刻表的 fd。
+fn conc_spawn(rfd_out: &i32) u16 {
+    var tp: [i32: 2] = [0: 2];
+    const pr: !i32 = sys_pipe2(&tp[0], 0);
+    _ = pr catch {
+        return 0 as u16;
+    };
+    const lfd: i32 = sys_socket(AF_INET, SOCK_STREAM, IPPROTO_TCP) catch {
+        return 0 as u16;
+    };
+    var one: i32 = 1;
+    _ = sys_setsockopt(lfd, SOL_SOCKET, SO_REUSEADDR,
+        &one as &void, 4 as u32) catch {};
+    var addr: [byte: 16] = [0: 16];
+    fill_sockaddr_ipv4(127, 0, 0, 1, 0, &addr[0]);
+    const br: !i32 = sys_bind(lfd, &addr[0] as &void, 16 as u32);
+    _ = br catch {
+        _ = sys_close(lfd) catch {};
+        return 0 as u16;
+    };
+    _ = sys_listen(lfd, 8) catch {
+        _ = sys_close(lfd) catch {};
+        return 0 as u16;
+    };
+    var got: [byte: 16] = [0: 16];
+    var glen: u32 = 16;
+    _ = sys_getsockname(lfd, &got[0] as &void, &glen) catch {
+        _ = sys_close(lfd) catch {};
+        return 0 as u16;
+    };
+    const port: u16 = (((got[2] as u16) as u16) << (8 as i32)) |
+        (got[3] as u16);
+    const pid64: i64 = sys_fork() catch {
+        _ = sys_close(lfd) catch {};
+        return 0 as u16;
+    };
+    if pid64 == 0 {
+        _ = sys_close(tp[0]) catch {};
+        var times: [u64: CONC_SLOTS] = [0: CONC_SLOTS];
+        const rc: i32 = conc_serve(lfd, &times[0], 2);
+        // 4 个 u64 → 32 字节，一次写进管道
+        var out: [byte: 32] = [0: 32];
+        var j: usize = 0;
+        while j < 4 {
+            var b: usize = 0;
+            while b < 8 {
+                const sh: i32 = (b as i32) * 8;
+                out[j * 8 + b] = (((times[j] >> sh) & (255 as u64)) as byte);
+                b = b + 1;
+            }
+            j = j + 1;
+        }
+        const w: !isize = sys_write(tp[1], &out[0], 32);
+        _ = w catch { 0 as isize; };
+        _ = sys_close(tp[1]) catch {};
+        sys_exit(rc);
+    }
+    _ = sys_close(lfd) catch {};
+    _ = sys_close(tp[1]) catch {};
+    rfd_out[0] = tp[0];
+    return port;
+}
+
+// 并发腿的一条支路：跑一次流式请求，只关心「有没有正常收口」。
+@async_fn fn conc_one(url: &[byte], hdrs: &[byte], body: &const Buf,
+    o: &ChatOut, status_out: &i32) Future<!i32> {
+    const r: !i32 = @await allm_stream_chat(url, hdrs,
+        body.ptr as &const byte, body.len, 15000 as u32, 262144 as usize,
+        HC_VERIFY_NONE, &""[0: 0], o, false, false, false,
+        status_out);
+    const got: i32 = r catch |err| {
+        _ = err;
+        0 - 1;
+    };
+    return got;
+}
+
+// 并发腿：两条流一起跑（`rt_join2`），成功后比较时刻表。
+fn conc_case(tag: &const byte, ok: &bool) void {
+    var rfd: i32 = -1;
+    const port: u16 = conc_spawn(&rfd);
+    if port == 0 {
+        ty_fail(tag, "起并发服务端失败", ok);
+        return;
+    }
+    var url: Buf = buf_new(128);
+    defer { buf_free(&url); }
+    _ = buf_append_cstr(&url, "http://127.0.0.1:");
+    _ = buf_append_u64(&url, port as u64);
+    _ = buf_append_cstr(&url, "/v1/chat/completions");
+    var hdrs: Buf = buf_new(128);
+    defer { buf_free(&hdrs); }
+    _ = buf_append_cstr(&hdrs,
+        "Content-Type: application/json\r\nAccept: text/event-stream\r\n" as &const byte);
+    var body: Buf = buf_new(128);
+    defer { buf_free(&body); }
+    _ = buf_append_cstr(&body,
+        "{\"model\":\"m\",\"stream\":true,\"messages\":[]}" as &const byte);
+    var o1: ChatOut = chat_out_new();
+    defer { chat_out_free(&o1); }
+    var o2: ChatOut = chat_out_new();
+    defer { chat_out_free(&o2); }
+    var s1: i32 = 0;
+    var s2: i32 = 0;
+    // 两条流一起进事件循环（`rt_join2` = 并发跑两个 future）
+    var j1: usize = 0;
+    var j2: usize = 0;
+    const rc: i32 = rt_run(conc_pair(url.ptr[0: url.len],
+        hdrs.ptr[0: hdrs.len], &body, &o1, &o2, &s1, &s2, &j1, &j2));
+    _ = rc;
+    if j1 == 0 || j2 == 0 {
+        ty_fail(tag, "并发跑两条流时有一条没收口", ok);
+    }
+    if s1 != 200 || s2 != 200 {
+        ty_fail(tag, "并发两条流的状态码不都是 200", ok);
+    }
+    // 时刻表：4 个 u64（每条连接的 start/end）
+    var raw: [byte: 32] = [0: 32];
+    var got: usize = 0;
+    while got < 32 {
+        const n: isize = sys_read(rfd, &raw[got], 32 - got) catch { 0 as isize; };
+        if n <= 0 {
+            break;
+        }
+        got = got + (n as usize);
+    }
+    _ = sys_close(rfd) catch {};
+    if got < 32 {
+        ty_fail(tag, "服务端没把时刻表回传够（32 字节）", ok);
+        return;
+    }
+    var t: [u64: CONC_SLOTS] = [0: CONC_SLOTS];
+    var i: usize = 0;
+    while i < 4 {
+        var v: u64 = 0;
+        var b: usize = 0;
+        while b < 8 {
+            const sh: i32 = (b as i32) * 8;
+            v = v | ((raw[i * 8 + b] as u64) << sh);
+            b = b + 1;
+        }
+        t[i] = v;
+        i = i + 1;
+    }
+    // 重叠判据：max(start1, start2) < min(end1, end2)
+    var max_start: u64 = t[0];
+    if t[2] > max_start {
+        max_start = t[2];
+    }
+    var min_end: u64 = t[1];
+    if t[3] < min_end {
+        min_end = t[3];
+    }
+    if max_start >= min_end {
+        ty_fail(tag, "两条流没有时间重叠（串行执行？）", ok);
+        out_err("  debug t0=");
+        out_err_dec(t[0] as usize);
+        out_err(" t1=");
+        out_err_dec(t[1] as usize);
+        out_err(" t2=");
+        out_err_dec(t[2] as usize);
+        out_err(" t3=");
+        out_err_dec(t[3] as usize);
+        out_err("\n");
+    }
+}
+
+// 并发腿的主体：两条流一起 await。
+@async_fn fn conc_pair(
+    url: &[byte],
+    hdrs: &[byte],
+    body: &const Buf,
+    o1: &ChatOut,
+    o2: &ChatOut,
+    s1: &i32,
+    s2: &i32,
+    j1: &usize,
+    j2: &usize
+) Future<!i32> {
+    const f1: Future<!usize> = conc_flag(url, hdrs, body, o1, s1, j1);
+    const f2: Future<!usize> = conc_flag(url, hdrs, body, o2, s2, j2);
+    const r: !usize = @await rt_join2(f1, f2, j1, j2);
+    _ = r catch {
+        0 as usize;
+    };
+    return 0 as i32;
+}
+
+// 一条支路折成 `Future<!usize>`（`rt_join2` 的入参形状）。
+@async_fn fn conc_flag(
+    url: &[byte],
+    hdrs: &[byte],
+    body: &const Buf,
+    o: &ChatOut,
+    s_out: &i32,
+    flag_out: &usize
+) Future<!usize> {
+    const st: !i32 = @await conc_one(url, hdrs, body, o, s_out);
+    const v: i32 = st catch {
+        return 0 as usize;
+    };
+    _ = v;
+    flag_out[0] = 1;
+    return 1 as usize;
+}
+
+// 静音腿：两层 mute/unmute 之后 fd 2 必须还能写。
+fn conc_mute_case(tag: &const byte, ok: &bool) void {
+    var tmp: [byte: 32] = "/tmp/ua_conc_mute.log";
+    const fd: i32 = sys_open(&tmp[0] as *const byte,
+        (O_WRONLY | O_CREAT | O_TRUNC) as i32, 420 as u32) catch {
+        ty_fail(tag, "开临时文件失败", ok);
+        return;
+    };
+    const saved: i32 = sys_dup(2) catch { -1; };
+    if saved < 0 {
+        _ = sys_close(fd) catch {};
+        ty_fail(tag, "dup(2) 失败", ok);
+        return;
+    }
+    // fd 2 → 临时文件（之后的断言靠读它）
+    _ = sys_dup2(fd, 2) catch {};
+    // 外层 + 内层静音，先解外层（这正是旧实现永久静音的那一步）
+    var g_out: FdGuard = FdGuard{ saved: -1, nullfd: -1, active: false };
+    var g_in: FdGuard = FdGuard{ saved: -1, nullfd: -1, active: false };
+    tls_noise_mute(&g_out, true);
+    tls_noise_mute(&g_in, true);
+    tls_noise_unmute(&g_out);
+    tls_noise_unmute(&g_in);
+    // 现在往 fd 2 写一段：修好之后这段会落进临时文件
+    const marker: &const byte = "MUTE-AFTER-UNMUTE";
+    const w: !isize = sys_write(2, marker, 16);
+    _ = w catch { 0 as isize; };
+    // 还原 fd 2，再检查文件内容
+    _ = sys_dup2(saved, 2) catch {};
+    _ = sys_close(saved) catch {};
+    _ = sys_close(fd) catch {};
+    const rfd: i32 = sys_open(&tmp[0] as *const byte, O_RDONLY as i32, 0) catch {
+        ty_fail(tag, "读回临时文件失败", ok);
+        return;
+    };
+    var buf: [byte: 64] = [0: 64];
+    var have: usize = 0;
+    while have < 64 {
+        const n: isize = sys_read(rfd, &buf[have], 64 - have) catch { 0 as isize; };
+        if n <= 0 {
+            break;
+        }
+        have = have + (n as usize);
+    }
+    _ = sys_close(rfd) catch {};
+    if have < 16 || !bufx_mem_eq(&buf[0] as &const byte, marker, 16) {
+        ty_fail(tag, "两层静音之后 fd 2 还是哑的（嵌套静音缺陷回归）", ok);
+    }
+    // 清掉临时文件
+    var path2: [byte: 32] = "/tmp/ua_conc_mute.log";
+    _ = sys_unlink(&path2[0] as *const byte) catch {};
+}
+
+// 轮入口：async-conc。
+fn async_conc_round(tag: &const byte) bool {
+    var ok: bool = true;
+    rt_frame_clear();
+    rt_abort_reset();
+    conc_mute_case(tag, &ok);
+    conc_case(tag, &ok);
+    if !ok {
+        return false;
+    }
+    out_err("selftest[");
+    out_err(tag);
+    out_err("] ok: 两条流真并发（时间重叠）+ 嵌套静音后 fd 2 仍可写\n");
+    return true;
+}

@@ -1,0 +1,188 @@
+// src/tools/shxwait.uya — 前台子进程的**事件循环版**等待（P101）
+//
+// 本文件：`shx_wait_run`（`shellx` 前台执行里那段「poll 两路管道 + waitpid + 超时」
+//   的替代品）。它把等待搬到事件循环上：两路管道用 `rt_wait_any2` 等就绪（epoll，
+//   不是每 50 ms 一次的 poll），帧回调照常跑（界面、键、取消都在那儿）。
+//
+// 不变量：
+//   ① **收尾读必须非阻塞**（原文件踩坑 38 的纪律，逐字保留）：命令自己退出了，但它的
+//      子孙可能还开着这两个管道（`sleep 300 &` / daemon），阻塞读会一直等 EOF ⇒
+//      「bash 已经退出、工具却还在运行中」；
+//   ② **停止信号优先于「被我们杀掉」**：`stopped_by` 与 `killed_by` 两条都要填，
+//      返回码由调用方按这个优先级拼（原判据一个字不改）；
+//   ③ 取消/超时都走 `sh_kill_tree`（按进程组收，连子孙一起），并且当轮**不再看**停止态
+//      —— 那种情况的口径是「被我们杀的」；
+//   ④ 输出上限 `cap` 按**字节**截断（`out_len` / `err_len` 各自计），不因为换了等法
+//      就多收或少收一个字节。
+//
+// 依赖：src/rt/rtloop.uya（`rt_run`）、src/rt/rtio.uya（`rt_wait_any2` /
+//   `rt_set_nonblock`）、src/tools/shellx.uya（`sh_kill_tree` / 常量）、
+//   src/agent/ag_stream_async.uya（`agent_rt_begin` / `agent_rt_end`：帧回调与取消）。
+// 命名：`shx_wait_*`、`ShWaitOut`。
+
+// 等待的**输出**（输入是 pid / 两个 fd / 超时 / 两个 Buf，见 `shx_wait_run`）。
+export struct ShWaitOut {
+    out_len: usize,
+    err_len: usize,
+    timed_out: bool,
+    killed_by: i32,
+    aborted: bool,
+    stopped_by: i32,
+    done: bool,
+}
+
+// 两路管道各读一次（非阻塞；返回读到的总字节数）。
+// 导出是给 `shellx` 的**收尾再读一次**用的（P38：命令退出了但子孙还开着管道）。
+export fn shx_drain_public(
+    fd: i32,
+    buf: &Buf,
+    len: &usize,
+    cap: usize,
+    chunk: &byte
+) usize {
+    return shx_drain(fd, buf, len, cap, chunk);
+}
+
+// 内部版（同函数，保持单一定义）。
+fn shx_drain(fd: i32, buf: &Buf, len: &usize, cap: usize, chunk: &byte) usize {
+    var total: usize = 0;
+    var guard: usize = 0;
+    while guard < 8 {
+        guard = guard + 1;
+        const n: isize = sys_read(fd, chunk, 8192) catch { 0 as isize; };
+        if n <= 0 {
+            break;
+        }
+        const un: usize = n as usize;
+        if len[0] < cap {
+            _ = buf_append(buf, chunk, un);
+            len[0] = len[0] + un;
+        }
+        total = total + un;
+    }
+    return total;
+}
+
+// 等一轮：先看取消、再看超时、再看子进程状态；最后等两路管道哪一路先就绪。
+//
+// 返回码（内部信号）：0 = 继续；1 = 收工（调用方按 flags 拼返回码）。
+@async_fn fn shx_wait_step(
+    cfg: &const Config,
+    pid: i32,
+    op: i32,
+    ep: i32,
+    timeout_ms: u32,
+    started: u64,
+    outs: &Buf,
+    errs: &Buf,
+    cap: usize,
+    res: &ShWaitOut
+) Future<!i32> {
+    // 取消（esc / ctrl+c / ctrl+d）—— 帧回调把它翻译成 rt 的取消意图
+    if rt_should_stop() {
+        sh_kill_tree(pid);
+        res.killed_by = SIGKILL;
+        res.aborted = true;
+        res.done = true;
+        return 1 as i32;
+    }
+    // 墙钟超时
+    if timeout_ms > 0 && (ua_now_ms() - started) >= (timeout_ms as u64) {
+        sh_kill_tree(pid);
+        res.killed_by = SIGKILL;
+        res.timed_out = true;
+        res.done = true;
+        return 1 as i32;
+    }
+    // 子进程状态（WNOHANG|WUNTRACED = 3）
+    var st: i32 = 0;
+    const r: i32 = sys_waitpid(pid, &st, 3) catch { 0; };
+    if r > 0 {
+        if (st & 127) == 127 {
+            // 被 job control 停住：收整棵子树，按 128+停止信号 收口（原判据）
+            res.stopped_by = (st >> 8) & 255;
+            sh_kill_tree(pid);
+            res.done = true;
+            return 1 as i32;
+        }
+        res.done = true;
+        return 1 as i32;
+    }
+    // 两路管道谁先就绪（片长 = 一个取消片，片间重新看取消/超时）
+    var chunk: [byte: 8192] = [0: 8192];
+    const slice_end: u64 = ua_now_ms() + RT_CANCEL_SLICE_MS;
+    const w: !usize = @await rt_wait_any2(op, ep, slice_end);
+    const which: usize = w catch |err| {
+        const eid: i32 = (@error_id(err) as! i32).value;
+        if eid == (@error_id(error.Cancelled) as! i32).value {
+            return error.Cancelled;
+        }
+        // 片到期（AsyncDeadlineExceeded）：回到循环顶重新判取消/超时/子进程
+        0 as usize;
+    };
+    if which == 1 {
+        _ = shx_drain(op, outs, &res.out_len, cap, &chunk[0]);
+    } else if which == 2 {
+        _ = shx_drain(ep, errs, &res.err_len, cap, &chunk[0]);
+    }
+    _ = cfg;
+    return 0 as i32;
+}
+
+// 主体：一直等到收工。
+@async_fn fn shx_wait_loop(
+    cfg: &const Config,
+    pid: i32,
+    op: i32,
+    ep: i32,
+    timeout_ms: u32,
+    started: u64,
+    outs: &Buf,
+    errs: &Buf,
+    cap: usize,
+    res: &ShWaitOut
+) Future<!i32> {
+    while !res.done {
+        const r: !i32 = @await shx_wait_step(cfg, pid, op, ep, timeout_ms,
+            started, outs, errs, cap, res);
+        const flag: i32 = r catch |err| {
+            const eid: i32 = (@error_id(err) as! i32).value;
+            if eid == (@error_id(error.Cancelled) as! i32).value {
+                sh_kill_tree(pid);
+                res.killed_by = SIGKILL;
+                res.aborted = true;
+                res.done = true;
+                return 0 as i32;
+            }
+            0 as i32;
+        };
+        _ = flag;
+    }
+    return 0 as i32;
+}
+
+// 对外入口：跑一次事件循环把子进程等到收工。
+//
+// 帧回调登记与取消意图在**进入/离开**时成对处理（`agent_rt_begin` / `agent_rt_end`）：
+// 这样工具跑着的时候界面照常刷、键照常读、esc 照常生效 —— 原来靠每 50 ms 一次的
+// `agent_pump_block()`，现在靠事件循环的帧回调（同一份实现，见 `ag_stream_async`）。
+export fn shx_wait_run(
+    cfg: &const Config,
+    pid: i32,
+    op: i32,
+    ep: i32,
+    timeout_ms: u32,
+    outs: &Buf,
+    errs: &Buf,
+    cap: usize,
+    res: &ShWaitOut
+) void {
+    rt_set_nonblock(op);
+    rt_set_nonblock(ep);
+    const started: u64 = ua_now_ms();
+    agent_rt_begin();
+    const rc: i32 = rt_run(shx_wait_loop(cfg, pid, op, ep, timeout_ms, started,
+        outs, errs, cap, res));
+    agent_rt_end();
+    _ = rc;
+}

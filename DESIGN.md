@@ -2091,7 +2091,13 @@ READY ──wt_finish──▶ FINISHED
 因为 `tls_noise_mute` 可能把 fd 2 重定向到 `/dev/null`（§4.2）。
 > P16 修的坑就是这条：显示层必须写到那个**还看得见的** stderr，否则 `--show-reasoning` 等于没开。
 
-### 11.2 单线程 + 泵点
+### 11.2 单线程 + 事件循环（原「单线程 + 泵点」）
+
+> **P97–P102 起口径更新**：等待已经分层 —— `src/rt/` 提供**进程唯一的事件循环**
+> （`rt_run`）、协作取消、定时与异步 I/O；流式请求、前台子进程、键盘输入都已搬上去，
+> 原来「每 ≤50 ms 插一个泵点」的那套在这些路径上**退役**。还没搬的（子代理 / 后台任务 /
+> 插件 / 文件 / 剪贴板 / web 会话 / 会话落盘）仍然靠泵点，行为不变。现状总表与两条纪律
+> 见 §19.26；为什么必须单线程、为什么不能上渲染线程，见下面的踩坑 47（结论没变）。
 
 **为什么不做渲染线程**（踩坑 47，这也是全仓最重要的架构决定之一）：
 
@@ -9042,3 +9048,84 @@ SSE/body」搬到事件循环上（`ahc_open` / `ahc_fill` / `ahc_connect` / `ah
 引用计数**）。**已知遗留**：① DNS 与 TLS 握手仍未 async（上表已写明原因与前置条件）；
 ② `@async_fn` 的 `!void` 不受支持（用 `Future<!usize>` 返回 0 代替）；
 ③ `const r: !T = <T 表达式>;` 不装箱（同步函数也红，与本轮无关的既有缺口）。
+
+### 19.23 P100：流式请求搬进事件循环（泵点的第一段退役）
+
+**这一段做了什么**：新增 `src/agent/ag_stream_async.uya`，`agent_step_stream` 里那次
+`llm_stream_style` 换成 `agent_stream_call(...)`：
+
+| 情形 | 走哪条路 | 为什么 |
+|---|---|---|
+| 交互模式（TUI / 滚动 REPL） | `rt_run` + `allm_stream_style`，帧回调 = `agent_pump_block()` | 网关 prefill 与逐 token 流式期间界面不冻、esc 当场生效 |
+| 非交互（管道 / CI / 子代理） | 原来的同步 `llm_stream_style`，**逐字节不变** | 那里没有人要服务；多绕一层只会给「请求体逐字节相同」这条不变量加变量 |
+
+**脚踩过的两个坑（都很值钱，改之前先读）**：
+
+1. **帧回调不能读键**。第一版把 `llm_pump_input()` 放进帧回调，于是「预先塞进队列的
+   ctrl+c」在**第一个字节到之前**就被吃掉了 —— `interrupt` 那条腿的 mock 断言
+   （必须服务满 1 轮）当场红（verdict 62 = 一轮都没服务）。**键的读取必须留在流式循环
+   里**（`agent_stream_pump`，位置与同步版那次 `llm_pump_input()` 一模一样：读到一段
+   之后、还没凑出完整事件的时候）。帧回调只做显示 + 命令派发。
+2. **帧回调与取消的生命周期要成对**：`agent_rt_begin()` / `agent_rt_end()`
+   （`ag_stream_async`）。`rt_set_frame` 是**单槽**的（进程唯一事件循环），两处各自
+   登记会互相覆盖 —— 谁先结束谁就把另一处的界面心跳清掉。前台子进程（P101）也走这一对。
+
+**这一段的判据**：`interrupt`（老腿，未改名、未放宽）+ `async-sse`（同步/异步同一个
+`ChatOut` + 401 正文 + 慢流可取消）+ 全套既有 e2e（`make selftest`）。
+
+### 19.24 P101：前台子进程的等待也搬进事件循环
+
+`src/tools/shxwait.uya` 取代 `shellx` 里那段「`agent_pump_block()` + `sys_poll(50ms)`」：
+
+| 原判据（一条都不许丢） | 现在的落点 |
+|---|---|
+| 收尾读**必须非阻塞**（踩坑 38：子孙还开着管道时阻塞读会等 EOF） | `shx_drain` + `shx_drain_public`（收尾再读一次），`rt_set_nonblock` 在进循环前设 |
+| **停止信号优先于「被我们杀的」** | `ShWaitOut.stopped_by` / `killed_by` 两条都填，调用方按原优先级拼返回码 |
+| 取消 / 超时**按进程组**收（连子孙） | `sh_kill_tree(pid)`（原函数，未改） |
+| 输出按 `cap` 字节截断 | `shx_drain` 里逐字节判 `len < cap` |
+| 被 job control 停住当场收口 | `waitpid(WNOHANG|WUNTRACED)` 里 `st & 127 == 127` 那支，逐字保留 |
+
+**收益**：等子进程不再每 50 ms 醒一次（epoll 等到就来），并且与流式请求共用同一份帧
+回调 —— 界面、键、esc 的实现只有一份。
+
+**还没搬的（如实记账，下一轮的工单）**：`deleg`（子代理等待）、`jobs`（后台任务）、
+`workflow`、`mcprun`（插件）、`gitx`、`clip*`（X11/helper）、`fsx`（文件读写）、
+`session/*`（会话落盘）、`web/*`。它们仍在用 `tui_poll_tick()` / `agent_pump_block()`
+那一套泵点 —— **行为是对的**（界面会动、esc 会生效），只是等待仍以 `poll` 轮询。
+**文件 I/O 的 async 只能是「分块 + 每块之间让点」**（§19.21 第 3 条：普通文件 fd 不能进
+epoll），所以那一批要按「读一块 → `rt_sleep(0)` 让一帧 → 再读」写，不许吹成 readiness。
+
+### 19.25 P102：嵌套静音（修实测缺陷）与并发能力的机器判据
+
+**① 修 `tls_noise_mute` 的嵌套缺陷**（§19.21 第 4 条记下的那个）：改成**进程级引用
+计数**。0→1 那次真的 `dup(2)` + `dup2(/dev/null)`，1→0 那次才还原；中间的嵌套只加减
+计数。修之前的实测症状：外层先 `unmute` 之后 fd 2 永久哑掉（整块屏幕静音）。判据在
+`async-conc` 轮的第二段：两层 `mute`/`unmute`（外先内后）之后往 fd 2 写一段标记，
+必须能从临时文件里读回来。
+
+**② 并发能力的机器判据**：`async-conc` 第一段跑两条 LLM 流（`rt_join2` 同时驱动两个
+future），mock 先 accept 两条、记下各自开始时刻，再一起歇 120 ms、一起回，然后比对
+`max(start1, start2) < min(end1, end2)`（时间**重叠**）。防假绿：把两条流改成顺序
+`@await` ⇒ 当场红（实测：第二条连接要等第一条结束后才建立，客户端超时不是 200）。
+
+**这一段**能**证明**并发、但**还没有**把侧路请求真的挂到主回合旁边（标题 / 压缩仍在 step
+边界与收工后触发，见 §9）。挂上去要动 `agent_turn_loop_inner` 的调度形状（把「主请求」与
+「标题请求」当成两个 future 一起 `rt_join2`），那是下一轮的第一件事 —— 现在缺的已经不是
+能力，而是接线。
+
+### 19.26 async 改造的现状总表（截至 P102）
+
+| 域 | 现状 | 判据 |
+|---|---|---|
+| 运行时（`src/rt/`） | ✅ `rt_run` / 帧回调 / 协作取消 / `rt_sleep` / `rt_read`·`write`·`accept`·`connect`·`wait_any2`·`join2`·`select2` | `async-rt`、`async-io` |
+| 键盘（fd 0） | ✅ 唯一读者 `term/tui/inp.uya`；TUI 管道 / 只交字节 / 同步桥；滚动 REPL 的读行已接入 | `async-keys` |
+| 网络数据面 | ✅ `ahc_open` / `ahc_fill`（连接异步、数据面异步）；DNS 与 TLS 握手仍同步（原因见 §19.22） | `async-net` |
+| LLM 流式 | ✅ `allm_stream_style`；交互模式下经事件循环 | `async-sse` |
+| 回合链（流式这一段） | ✅ `agent_stream_call`；工具执行仍同步（泵点仍活着） | `interrupt` + 全套 e2e |
+| 前台子进程 | ✅ `shx_wait_run`（epoll 等管道）；其余子进程等待仍轮询 | `shellx_selftest_all` |
+| 并发 | ✅ 能力与判据齐（`rt_join2`）；侧路请求尚未接线 | `async-conc` |
+| 文件 / 剪贴板 / 插件 / 会话落盘 / web | ⬜ 仍泵点轮询（文件按「分块 + 让点」做） | 下一轮 |
+
+**两条纪律留给后来者**：① **不要**在帧回调里读键（会抢在请求发出之前吃掉按键，
+`interrupt` 腿会红）；② 任何「要在事件循环上等一会儿」的新路径都调
+`agent_rt_begin()` / `agent_rt_end()`，不要自己 `rt_set_frame`（单槽会互相覆盖）。

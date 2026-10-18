@@ -600,7 +600,8 @@ leaf 指纹怎么算、指纹库放哪儿 —— 见 [DESIGN.md §18](DESIGN.md)
 | 会话日志格式、崩溃裁剪、索引、恢复数据流 | [DESIGN.md §8](DESIGN.md) |
 | 子代理 / goal / todo / plan / workflow / 任务面板 | [DESIGN.md §9](DESIGN.md) |
 | Git worktree 与残留回收 | [DESIGN.md §10](DESIGN.md) |
-| TUI 架构（单线程 + 泵点）、帧、键位、浮层、markdown | [DESIGN.md §11](DESIGN.md) |
+| TUI 架构（单线程 + 事件循环，泵点正在退役）、帧、键位、浮层、markdown | [DESIGN.md §11](DESIGN.md) |
+| async 改造（`src/rt/`：事件循环 / 协作取消 / 异步 I/O；现状总表） | [DESIGN.md §19.21–§19.26](DESIGN.md) |
 | `/diff` 浮窗与写工具 diff 正文 | [DESIGN.md §12](DESIGN.md) |
 | 图片附件（内联 base64）与剪贴板（X11 客户端） | [DESIGN.md §13](DESIGN.md) |
 | 全部上限常量与不变量清单 | [DESIGN.md §14](DESIGN.md) |
