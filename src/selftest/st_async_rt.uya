@@ -1,0 +1,259 @@
+// src/selftest/st_async_rt.uya — P97：单线程事件循环运行时（`src/rt/rtloop.uya`）
+//
+// 本文件：`async-rt` 轮。它是**运行时地基唯一的机器判据** —— P98–P102 所有
+//   「改成 async」的轮都站在它上面，所以这里必须能分辨「真的在跑事件循环」与
+//   「看起来跑完了」。
+//
+// 判据（每条都配了「拆掉什么会当场红」）：
+//   A 内层 future 在事件循环上跑到收口，**返回值原样透传**（拆掉驱动 ⇒ 拿不到 7）；
+//   B 帧回调每轮迭代跑一次且被节流（拆掉 `RtRunFut.poll` 里的 tick ⇒ 帧数 0；
+//     把节流拿掉 ⇒ 最小间隔掉到 0–1ms，B2 当场红）；
+//   C `rt_sleep` 的时长落在预算内（拆掉 deadline 传递 ⇒ 立刻返回，时长 < 一半预算）；
+//   D 取消意图**一处判**：置位之后 ≤ 一轮就收口成 130（去掉 `RtRunFut` 那道闸门
+//     ⇒ 2s 的睡眠会睡到底，rc 不是 130、时长也超过预算）；
+//   E `rt_abort_take` 读并清空、`QUIT` 不被 `TURN` 降级、`NONE` 是「不置」；
+//   F `rt_run` **不重入**：在 future 内部再调一次必须被拒（返回 RT_RC_FAILED）；
+//   G 连续两次 `rt_run` 都能跑（事件循环每次新建/关闭，不残留）；
+//   H `rt_sleep(0)` 立即返回（`deadline_after_ms(0)` 是「0 时刻」，而
+//     `async_wait_readable(deadline 0)` 是「不设超时」—— 挡住这条才不会在零睡眠上挂死）。
+//
+// 不变量：① 探针**必须是全局变量**（接口值里存的是「具体 struct 的地址」，登记局部
+//   变量的地址在登记那一刻就作废）；② 每个用例开头都复位探针与取消意图，别让上一条
+//   腿的计数漏进来；③ 收口时把 `rt_frame_clear` + `rt_abort_reset` 都做掉 —— 后面的
+//   轮不该看见这一轮留下的回调或意图。
+// 命名：`rt_case_*`（用例）、`rt_test_*`（被驱动的 future）、`RtTest*`（探针 struct）、
+//   `g_rt_t_*`（探针全局与它们的接口值）。
+//
+// 探针**必须是全局变量**：接口值里存的是「具体 struct 的地址」，局部变量登记进去
+// 之后，回调改的是那块栈上存储，登记的瞬间就作废了（与 `ui_reg` 里那些全局后端实例
+// 同一条纪律）。
+//
+// 依赖：src/rt/rtloop.uya（`rt_*`）、foundation/bufx（`ua_now_ms`）。
+
+// 帧回调探针：数次数 + 记最小间隔。
+struct RtTestFrame : RtFrame {
+    hits: i64,
+    last: u64,
+    gap_min: u64,
+    gap_seen: i64,
+
+    fn rt_frame(self: &Self, now_ms: u64) void {
+        if self.gap_seen > 0 {
+            const gap: u64 = now_ms - self.last;
+            if gap < self.gap_min {
+                self.gap_min = gap;
+            }
+        }
+        self.last = now_ms;
+        self.gap_seen = self.gap_seen + 1;
+        self.hits = self.hits + 1;
+    }
+}
+
+// 到第 N 帧时置一个取消意图的探针（模拟「用户按了 esc」）。
+struct RtTestAbortFrame : RtFrame {
+    hits: i64,
+    at: i64,
+    kind: i32,
+
+    fn rt_frame(self: &Self, now_ms: u64) void {
+        _ = now_ms;
+        self.hits = self.hits + 1;
+        if self.hits >= self.at {
+            rt_abort(self.kind);
+        }
+    }
+}
+
+var g_rt_t_frame: RtTestFrame = RtTestFrame{
+    hits: 0, last: 0, gap_min: 1000000 as u64, gap_seen: 0,
+};
+var g_rt_t_abort: RtTestAbortFrame = RtTestAbortFrame{
+    hits: 0, at: 2, kind: 1,
+};
+
+// 两个探针的**接口值**（装箱只做一次，见 `src/rt/rtloop.uya` 里 `g_rt_no_frame` 的
+// 注释：值形态装箱算一次移动，装第二次检查器会报「已被移动」）。
+var g_rt_t_frame_i: RtFrame = g_rt_t_frame;
+var g_rt_t_abort_i: RtFrame = g_rt_t_abort;
+
+// A/B/C 的主体：睡三段再返回 7。
+@async_fn fn rt_test_work() Future<!i32> {
+    _ = try @await rt_sleep_export(40);
+    _ = try @await rt_sleep_export(40);
+    _ = try @await rt_sleep_export(40);
+    return 7;
+}
+
+// D 的主体：睡很久（取消必须有办法把它叫停，否则这条腿要等 2s）。
+@async_fn fn rt_test_long_sleep() Future<!i32> {
+    _ = try @await rt_sleep_export(2000);
+    return 9;
+}
+
+// H 的主体：零睡眠必须立刻回来。
+@async_fn fn rt_test_zero_sleep() Future<!i32> {
+    _ = try @await rt_sleep_export(0);
+    return 5;
+}
+
+// G 的第二次 run。
+@async_fn fn rt_test_again() Future<!i32> {
+    _ = try @await rt_sleep_export(20);
+    return 8;
+}
+
+// F：在事件循环内部再调一次 rt_run（重入）—— 必须被拒。
+@async_fn fn rt_test_reenter() Future<!i32> {
+    const inner: i32 = rt_run(rt_test_again());
+    if inner == RT_RC_FAILED {
+        return 1;
+    }
+    return 0;
+}
+
+// 探针复位（每个用例开头都做，避免上一条腿的计数漏进来）。
+fn rt_t_reset_frame() void {
+    g_rt_t_frame.hits = 0;
+    g_rt_t_frame.last = 0;
+    g_rt_t_frame.gap_min = 1000000 as u64;
+    g_rt_t_frame.gap_seen = 0;
+    rt_frame_reset();
+    rt_abort_reset();
+}
+
+// A + B + C：跑完 + 返回值透传 + 帧回调真的跑了且被节流 + 睡眠时长在预算内。
+fn rt_case_run(tag: &const byte, ok: &bool) void {
+    rt_t_reset_frame();
+    rt_set_frame(g_rt_t_frame_i);
+    const t0: u64 = ua_now_ms();
+    const rc: i32 = rt_run(rt_test_work());
+    const dt: u64 = ua_now_ms() - t0;
+    if rc != 7 {
+        ty_fail(tag, "内层 future 的返回值没有透传（期望 7）", ok);
+    }
+    if dt < 100 || dt > 1200 {
+        ty_fail(tag, "rt_sleep 时长不在预算内（100–1200ms）", ok);
+    }
+    if rt_frame_count() <= 0 {
+        ty_fail(tag, "帧回调一次都没跑（事件循环没有驱动 tick）", ok);
+    }
+    if g_rt_t_frame.hits <= 0 {
+        ty_fail(tag, "登记的帧回调没被调用（接口值没接上）", ok);
+    }
+    if g_rt_t_frame.gap_seen > 0 && g_rt_t_frame.gap_min < (8 as u64) {
+        ty_fail(tag, "帧回调没有被节流（最小间隔 < 8ms）", ok);
+    }
+    if g_rt_t_frame.hits > (32 as i64) {
+        ty_fail(tag, "帧回调跑得太勤（节流失效）", ok);
+    }
+    if rt_running() {
+        ty_fail(tag, "rt_run 返回后仍在「运行中」（重入闸门没复位）", ok);
+    }
+    rt_frame_clear();
+}
+
+// D：置取消意图之后，长睡眠必须在很短时间内收口成 RT_RC_CANCELLED。
+fn rt_case_abort(tag: &const byte, ok: &bool) void {
+    rt_t_reset_frame();
+    g_rt_t_abort.hits = 0;
+    g_rt_t_abort.at = 2;
+    g_rt_t_abort.kind = RT_ABORT_TURN;
+    rt_set_frame(g_rt_t_abort_i);
+    const t0: u64 = ua_now_ms();
+    const rc: i32 = rt_run(rt_test_long_sleep());
+    const dt: u64 = ua_now_ms() - t0;
+    if rc != RT_RC_CANCELLED {
+        ty_fail(tag, "取消之后没有以 RT_RC_CANCELLED 收口", ok);
+    }
+    if dt > (400 as u64) {
+        ty_fail(tag, "取消没有及时收口（2000ms 的睡眠等了太久）", ok);
+    }
+    if rt_abort_state() != RT_ABORT_TURN {
+        ty_fail(tag, "取消意图没有留住（应当由主循环 take 走）", ok);
+    }
+    rt_abort_reset();
+    rt_frame_clear();
+}
+
+// E：`rt_abort_take` 读并清空；QUIT 不被 TURN 降级；NONE 不产生意图。
+fn rt_case_abort_api(tag: &const byte, ok: &bool) void {
+    rt_abort_reset();
+    if rt_should_stop() {
+        ty_fail(tag, "复位之后仍然说「该停了」", ok);
+    }
+    rt_abort(RT_ABORT_NONE);
+    if rt_abort_state() != RT_ABORT_NONE {
+        ty_fail(tag, "rt_abort(NONE) 不该产生任何意图", ok);
+    }
+    rt_abort(RT_ABORT_QUIT);
+    rt_abort(RT_ABORT_TURN);
+    if rt_abort_state() != RT_ABORT_QUIT {
+        ty_fail(tag, "QUIT 被 TURN 覆盖了（退出意图被降级）", ok);
+    }
+    const got: i32 = rt_abort_take();
+    if got != RT_ABORT_QUIT {
+        ty_fail(tag, "rt_abort_take 没把意图交回来", ok);
+    }
+    if rt_abort_state() != RT_ABORT_NONE {
+        ty_fail(tag, "rt_abort_take 之后意图没被清空", ok);
+    }
+    rt_abort_reset();
+}
+
+// F + G：不重入；连续两次 run 都正常。
+fn rt_case_reenter(tag: &const byte, ok: &bool) void {
+    rt_t_reset_frame();
+    rt_frame_clear();
+    if rt_running() {
+        ty_fail(tag, "空闲时 rt_running 应当为 false", ok);
+    }
+    const r1: i32 = rt_run(rt_test_reenter());
+    if r1 != 1 {
+        ty_fail(tag, "在 future 内部重入 rt_run 没有被拒", ok);
+    }
+    if rt_running() {
+        ty_fail(tag, "重入被拒之后闸门没有复位", ok);
+    }
+    const r2: i32 = rt_run(rt_test_again());
+    if r2 != 8 {
+        ty_fail(tag, "第二次 rt_run 没能正常跑到收口", ok);
+    }
+    if rt_running() {
+        ty_fail(tag, "第二次 rt_run 之后闸门没复位", ok);
+    }
+}
+
+// H：零睡眠立即返回。
+fn rt_case_zero_sleep(tag: &const byte, ok: &bool) void {
+    rt_t_reset_frame();
+    rt_frame_clear();
+    const t0: u64 = ua_now_ms();
+    const rc: i32 = rt_run(rt_test_zero_sleep());
+    const dt: u64 = ua_now_ms() - t0;
+    if rc != 5 {
+        ty_fail(tag, "rt_sleep(0) 的那条 future 没有正常收口", ok);
+    }
+    if dt > (200 as u64) {
+        ty_fail(tag, "rt_sleep(0) 没有立即返回（被当成「无限等」了）", ok);
+    }
+}
+
+// 轮入口：async-rt。
+fn async_rt_round(tag: &const byte) bool {
+    var ok: bool = true;
+    rt_case_abort_api(tag, &ok);
+    rt_case_run(tag, &ok);
+    rt_case_abort(tag, &ok);
+    rt_case_reenter(tag, &ok);
+    rt_case_zero_sleep(tag, &ok);
+    rt_frame_clear();
+    rt_abort_reset();
+    if !ok {
+        return false;
+    }
+    out_err("selftest[");
+    out_err(tag);
+    out_err("] ok: 驱动 + 帧节流 + 定时预算 + 取消三态 + 重入闸门\n");
+    return true;
+}

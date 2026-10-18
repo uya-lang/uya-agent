@@ -1,0 +1,163 @@
+// src/term/tui/inp.uya — 键盘输入的 async 入口（P98）
+//
+// 本文件：把「读 fd 0」从「谁顺手 poll 一下」改成**在事件循环上等**。三种入口：
+//     * `tui_input_wait`（`@async_fn`）—— TUI 用：等到就喂进 TUI 的键状态机；
+//     * `tui_input_wait_raw`（`@async_fn`）—— 滚动模式用：只交字节，喂进哪个编辑器
+//       由调用方决定（滚动模式的是 `tty_feed`，与 TUI 的键状态机是两套）；
+//     * `tui_input_read_sync`（同步桥）—— 还没搬进事件循环的老循环用：内部起一次
+//       `rt_run`，语义对齐老的 `poll(fd, timeout) + read`（含「超时就回去干活」）。
+//
+// 不变量：
+//   ① **fd 0 只有这一个读者**：`oscin` 的「借出」期间（`oscin_borrowed()`，剪贴板等待方
+//      正在等终端应答）一个字节都不许读 —— 终端应答与用户按键走同一条 fd，两边都读
+//      就会把应答当按键喂进编辑器（踩坑 137）。判据收在这里一处；
+//   ② 走 TUI 那条路时，字节**必须**先过 `oscin_feed` 再进键状态机（透传部分才进）；
+//      滚动模式那条路由 `tty_feed` 内部做同一件事（踩坑 135），这里不重复摘；
+//   ③ 本文件**不认识** agent 层：帧回调、watch/title 心跳都由上层登记
+//      （`rt_set_frame`）。「等输入」与「等的时候干什么」是两件事；
+//   ④ 同步桥返回码对齐 `poll` 时代：>0 字节，0 = EOF，-2 = 超时。
+//
+// 依赖：src/rt/rtloop.uya（`rt_run`）、src/rt/rtio.uya（`rt_read` /
+//   `rt_set_nonblock`）、src/term/oscin.uya、src/term/tty.uya、
+//   src/term/tui/keys.uya（`tui_key_feed` / `tui_key_flush_esc` /
+//   `tui_handle_keys`）。
+// 命名：`tui_input_*`、`TUI_INPUT_*`。
+
+// 一次最多读多少字节（与 `tui_poll_keys` 的临时缓冲同值：终端一次粘贴就是一整个
+// 转义序列块，512 够用且不会把栈撑大）。
+export const TUI_INPUT_CHUNK: usize = 512;
+
+// 同步桥的「超时」返回码（对齐老代码里 `poll` 返回 0 的分支）。
+export const TUI_INPUT_TIMEOUT: isize = -2;
+
+// 把一批**已读到**的字节喂进 TUI 键盘管道；返回透传（非终端应答）的字节数。
+// 同步函数 —— 纯字节状态机，与「谁来读 fd」无关（自测可以直接喂）。
+export fn tui_input_absorb(buf: &const byte, n: usize) usize {
+    if n == 0 {
+        return 0;
+    }
+    var pass: Buf = buf_new(640);
+    defer { buf_free(&pass); }
+    oscin_feed(buf, n, &pass);
+    if pass.len > 0 {
+        tui_key_feed(pass.ptr as &const byte, pass.len);
+    }
+    tui_key_flush_esc();
+    tui_handle_keys();
+    return pass.len;
+}
+
+// 事件循环里等一次输入，**只交字节**（TUI 之外的两套编辑器都需要这个）。
+// 返回 1 且 `n_out` 写字节数；0 = EOF；取消/超时按 error 交给调用方。
+@async_fn fn tui_input_wait_raw(
+    fd: i32,
+    buf: &byte,
+    cap: usize,
+    deadline_ms: u64,
+    n_out: &usize
+) Future<!usize> {
+    n_out[0] = 0;
+    if oscin_borrowed() {
+        return 0 as usize;
+    }
+    var got: usize = 0;
+    const r: !usize = @await rt_read(fd, buf, cap, deadline_ms, &got);
+    const flag: usize = r catch |err| {
+        return err;
+    };
+    if flag == 0 {
+        return 0 as usize;
+    }
+    n_out[0] = got;
+    return 1 as usize;
+}
+
+// 对外入口（自测与上层用）：只交字节。
+export fn tui_input_bytes(
+    fd: i32,
+    buf: &byte,
+    cap: usize,
+    deadline_ms: u64,
+    n_out: &usize
+) Future<!usize> {
+    return tui_input_wait_raw(fd, buf, cap, deadline_ms, n_out);
+}
+
+// TUI 那条路：等到之后喂进 TUI 键状态机。返回读到的字节数（0 = EOF）。
+@async_fn fn tui_input_wait(
+    fd: i32,
+    buf: &byte,
+    cap: usize,
+    deadline_ms: u64
+) Future<!usize> {
+    var got: usize = 0;
+    const r: !usize = @await tui_input_wait_raw(
+        fd, buf, cap, deadline_ms, &got);
+    const flag: usize = r catch |err| {
+        return err;
+    };
+    if flag == 0 {
+        return 0 as usize;
+    }
+    _ = tui_input_absorb(buf as &const byte, got);
+    return got;
+}
+
+// 对外入口（TUI 用）。
+export fn tui_input_feed_keys(
+    fd: i32,
+    buf: &byte,
+    cap: usize,
+    deadline_ms: u64
+) Future<!usize> {
+    return tui_input_wait(fd, buf, cap, deadline_ms);
+}
+
+// `tui_input_read_sync` 用它把「读到没有」带出来（`rt_run` 只回退出码）。
+@async_fn fn tui_input_sync_body(
+    fd: i32,
+    buf: &byte,
+    cap: usize,
+    deadline_ms: u64,
+    n_out: &usize,
+    timed_out: &i32
+) Future<!i32> {
+    n_out[0] = 0;
+    timed_out[0] = 0;
+    const r: !usize = @await tui_input_wait_raw(
+        fd, buf, cap, deadline_ms, n_out);
+    _ = r catch |err| {
+        const eid: i32 = (@error_id(err) as! i32).value;
+        if eid == (@error_id(error.AsyncDeadlineExceeded) as! i32).value {
+            timed_out[0] = 1;
+        }
+        return 0;
+    };
+    return 0;
+}
+
+// 同步桥：跑一次事件循环等输入。`timeout_ms == 0` 表示不设超时。
+//
+// 返回：>0 = 读到的字节数；0 = EOF；`TUI_INPUT_TIMEOUT` = 超时（调用方据此回去干
+// 它的事，与老的 `poll` 分支一字不差）。
+export fn tui_input_read_sync(
+    fd: i32,
+    buf: &byte,
+    cap: usize,
+    timeout_ms: u32
+) isize {
+    rt_set_nonblock(fd);
+    var n: usize = 0;
+    var timed_out: i32 = 0;
+    var dl: u64 = 0;
+    if timeout_ms > 0 {
+        dl = deadline_after_ms(timeout_ms) catch { 0 as u64; };
+    }
+    const rc: i32 = rt_run(
+        tui_input_sync_body(fd, buf, cap, dl, &n, &timed_out));
+    _ = rc;
+    if timed_out != 0 {
+        return TUI_INPUT_TIMEOUT;
+    }
+    return n as isize;
+}

@@ -1,0 +1,341 @@
+// src/selftest/st_async_io.uya — P98：异步 I/O 原语（`src/rt/rtio.uya`）
+//
+// 本文件：`async-io` 轮。rtio 是「所有同步 I/O 改 async」的那一层地基，所以这里
+//   必须证明四件事：**真的在等**（不是忙等、不是阻塞）、**等得回来**（deadline）、
+//   **叫得停**（取消）、**能并发**（select / join）。
+//
+// 判据（每条都配「拆掉什么会当场红」）：
+//   A 管道往返：`rt_write` 写进去、`rt_read` 原样读回来（拆掉非阻塞 + EAGAIN
+//     循环 ⇒ 要么阻塞住、要么读到 0 字节）；
+//   B 空管道 + 60ms deadline：必须等够 ~60ms 再报 `AsyncDeadlineExceeded`
+//     （拆掉 deadline 传递 ⇒ 立刻返回，时长会掉到 <30ms）；
+//   C 取消：置意图之后读必须 ≤ 半秒收口成 `error.Cancelled`（去掉 rtio 里的
+//     `rt_should_stop` 闸门 ⇒ 会一直等到本轮的 deadline）；
+//   D `rt_select2`：只写 B 就报 2、只写 A 就报 1（把它退化成「只等 a」⇒ 报错）；
+//   E `rt_join2`：两条都写完，两路都拿到数据（退化成串行或漏一路 ⇒ 有一路为 0）；
+//   F TCP 自连：非阻塞 `rt_connect` + `rt_accept` 在一条线程里走通（accept 走的是
+//     「等可读再重试」那条路，不是阻塞 accept）。
+//
+// 不变量：① 一条腿只起**一次** `rt_run`（进程唯一事件循环，rtloop 不变量①），多段
+//   判据靠 `g_rtio_*` 结果位汇总；② 取消那一段验完必须 `rt_abort_reset`，否则后面
+//   几段会被上一段的意图当场打断；③ 所有 fd 都先 `rt_set_nonblock`（这是 rtio 的前提，
+//   见 rtio 不变量①）。
+// 命名：`rtio_test_*` / `rtio_*`（被驱动的 future）、`g_rtio_*`（结果位）、
+//   `RtioAbortFrame`（取消探针）、`async_io_round`（轮入口）。
+//
+// 依赖：src/rt/rtloop.uya（`rt_run` / `rt_abort` / 定时）、src/rt/rtio.uya、
+//   libc.syscall（pipe / socket / bind / listen / close）、bufx（`ua_now_ms`）。
+// 命名：`rtio_test_*`（被驱动的 future）、`g_rtio_*`（结果位）、`async_io_round`（轮入口）。
+
+const RTIO_E_PORT: u16 = 0;
+
+var g_rtio_roundtrip: i32 = 0;
+var g_rtio_eagain_ms: u64 = 0;
+var g_rtio_eagain_eid: i32 = 0;
+var g_rtio_cancel_eid: i32 = 0;
+var g_rtio_cancel_ms: u64 = 0;
+var g_rtio_select_first: i32 = 0;
+var g_rtio_select_second: i32 = 0;
+var g_rtio_join_a: usize = 0;
+var g_rtio_join_b: usize = 0;
+var g_rtio_tcp_ok: i32 = 0;
+
+// 把 error id 折成可断言的类别：1 = 取消，2 = 超时，3 = 其它（含「成功」）。
+fn rtio_fail_kind(e: i32) i32 {
+    if e == (@error_id(error.Cancelled) as! i32).value {
+        return 1;
+    }
+    if e == (@error_id(error.AsyncDeadlineExceeded) as! i32).value {
+        return 2;
+    }
+    return 3;
+}
+
+// 一次 pipe 往返：写 "ping" 再读回来。
+@async_fn fn rtio_write_then_read(pfd: &i32) Future<!usize> {
+    const msg: [byte: 8] = [112, 105, 110, 103, 0, 0, 0, 0];
+    const w: !usize = @await rt_write(pfd[1], &msg[0], 4, 0 as u64);
+    _ = w catch |err| {
+        g_rtio_roundtrip = 0 - rtio_fail_kind((@error_id(err) as! i32).value);
+        return 0 as usize;
+    };
+    var buf: [byte: 8] = [0: 8];
+    var got: usize = 0;
+    const r: !usize = @await rt_read(pfd[0], &buf[0], 8, 0 as u64, &got);
+    _ = r catch |err| {
+        g_rtio_roundtrip = 0 - rtio_fail_kind((@error_id(err) as! i32).value);
+        return 0 as usize;
+    };
+    const ok_len: bool = got == 4;
+    const ok_bytes: bool =
+        buf[0] == 112 && buf[1] == 105 && buf[2] == 110 && buf[3] == 103;
+    if ok_len && ok_bytes {
+        g_rtio_roundtrip = 1;
+    }
+    return 0 as usize;
+}
+
+// 空管道 + deadline：必须等够时间再报超时。
+@async_fn fn rtio_wait_deadline(pfd: &i32, ms: u32) Future<!usize> {
+    var buf: [byte: 8] = [0: 8];
+    var got: usize = 0;
+    const dl: u64 = try deadline_after_ms(ms);
+    const r: !usize = @await rt_read(pfd[0], &buf[0], 8, dl, &got);
+    var eid: i32 = 0;
+    const got_flag: usize = r catch |err| {
+        eid = (@error_id(err) as! i32).value;
+        0 as usize;
+    };
+    _ = got_flag;
+    g_rtio_eagain_eid = rtio_fail_kind(eid);
+    return 0 as usize;
+}
+
+// 取消：读一个永远不来的管道，中途置取消意图。
+@async_fn fn rtio_wait_cancel(pfd: &i32) Future<!usize> {
+    var buf: [byte: 8] = [0: 8];
+    var got: usize = 0;
+    const t0: u64 = ua_now_ms();
+    const r: !usize = @await rt_read(pfd[0], &buf[0], 8, 0 as u64, &got);
+    var eid: i32 = 0;
+    const got_flag: usize = r catch |err| {
+        eid = (@error_id(err) as! i32).value;
+        0 as usize;
+    };
+    _ = got_flag;
+    g_rtio_cancel_eid = rtio_fail_kind(eid);
+    g_rtio_cancel_ms = ua_now_ms() - t0;
+    return 0 as usize;
+}
+
+// select2：先只写 b，再只写 a；两次都要报对是哪一路。
+@async_fn fn rtio_select(pfd_a: &i32, pfd_b: &i32) Future<!usize> {
+    const msg: [byte: 4] = [120, 0, 0, 0];
+    const wb: !usize = @await rt_write(pfd_b[1], &msg[0], 1, 0 as u64);
+    _ = wb catch { return 0 as usize; };
+    var buf: [byte: 4] = [0: 4];
+    var ga: usize = 0;
+    var gb: usize = 0;
+    var which: i32 = 0;
+    const r1: !usize = @await rt_select2(
+        rt_read(pfd_a[0], &buf[0], 4, 0 as u64, &ga),
+        rt_read(pfd_b[0], &buf[0], 4, 0 as u64, &gb),
+        &which);
+    _ = r1 catch { return 0 as usize; };
+    g_rtio_select_first = which;
+    const wa: !usize = @await rt_write(pfd_a[1], &msg[0], 1, 0 as u64);
+    _ = wa catch { return 0 as usize; };
+    var which2: i32 = 0;
+    const r2: !usize = @await rt_select2(
+        rt_read(pfd_a[0], &buf[0], 4, 0 as u64, &ga),
+        rt_read(pfd_b[0], &buf[0], 4, 0 as u64, &gb),
+        &which2);
+    _ = r2 catch { return 0 as usize; };
+    g_rtio_select_second = which2;
+    return 0 as usize;
+}
+
+// join2：两路都写，收集两路结果。
+@async_fn fn rtio_join(pfd_a: &i32, pfd_b: &i32) Future<!usize> {
+    const msg: [byte: 4] = [121, 0, 0, 0];
+    const wa: !usize = @await rt_write(pfd_a[1], &msg[0], 2, 0 as u64);
+    _ = wa catch { return 0 as usize; };
+    const wb: !usize = @await rt_write(pfd_b[1], &msg[0], 3, 0 as u64);
+    _ = wb catch { return 0 as usize; };
+    var buf_a: [byte: 8] = [0: 8];
+    var buf_b: [byte: 8] = [0: 8];
+    var na: usize = 0;
+    var nb: usize = 0;
+    var ra: usize = 0;
+    var rb: usize = 0;
+    const r: !usize = @await rt_join2(
+        rt_read(pfd_a[0], &buf_a[0], 8, 0 as u64, &na),
+        rt_read(pfd_b[0], &buf_b[0], 8, 0 as u64, &nb),
+        &ra, &rb);
+    _ = r catch { return 0 as usize; };
+    g_rtio_join_a = na;
+    g_rtio_join_b = nb;
+    return 0 as usize;
+}
+
+// TCP 自连：非阻塞 connect + accept（不 fork、不起线程）。
+@async_fn fn rtio_tcp(port: u16) Future<!usize> {
+    const lfd: i32 = sys_socket(AF_INET, SOCK_STREAM, IPPROTO_TCP) catch {
+        return 0 as usize;
+    };
+    defer { _ = sys_close(lfd) catch {}; }
+    var one: i32 = 1;
+    _ = sys_setsockopt(lfd, SOL_SOCKET, SO_REUSEADDR,
+        &one as &void, 4 as u32) catch {};
+    var addr: [byte: 16] = [0: 16];
+    rtio_sockaddr(port, &addr[0]);
+    const br: !i32 = sys_bind(lfd, &addr[0] as &void, 16 as u32);
+    _ = br catch { return 0 as usize; };
+    _ = sys_listen(lfd, 4) catch { return 0 as usize; };
+    var bound: [byte: 16] = [0: 16];
+    var blen: u32 = 16;
+    _ = sys_getsockname(lfd, &bound[0] as &void, &blen) catch {
+        return 0 as usize;
+    };
+    const rport: u16 = (((bound[2] as u16) as u16) << (8 as i32)) |
+        (bound[3] as u16);
+    var raddr: [byte: 16] = [0: 16];
+    rtio_sockaddr(rport, &raddr[0]);
+    rt_set_nonblock(lfd);
+    const cfd: i32 = sys_socket(AF_INET, SOCK_STREAM, IPPROTO_TCP) catch {
+        return 0 as usize;
+    };
+    defer { _ = sys_close(cfd) catch {}; }
+    rt_set_nonblock(cfd);
+    const cr: !usize = @await rt_connect(
+        cfd, &raddr[0] as &void, 16 as u32, 0 as u64);
+    _ = cr catch { return 0 as usize; };
+    var newfd: i32 = -1;
+    const ar: !usize = @await rt_accept(lfd, &newfd, 0 as u64);
+    _ = ar catch { return 0 as usize; };
+    if newfd >= 0 {
+        g_rtio_tcp_ok = 1;
+        _ = sys_close(newfd) catch {};
+    }
+    return 0 as usize;
+}
+
+// 填一个 IPv4 sockaddr（16 字节，与 httpc 的 fill_sockaddr_ipv4 同布局）。
+fn rtio_sockaddr(port: u16, out: &byte) void {
+    var i: usize = 0;
+    while i < 16 {
+        out[i] = 0;
+        i = i + 1;
+    }
+    out[0] = 2;
+    out[1] = 0;
+    const lo: u16 = port & (0xFF as u16);
+    const pnet: u16 = (lo << (8 as i32)) | (port >> (8 as i32));
+    out[2] = ((pnet & (255 as u16)) as byte);
+    out[3] = (((pnet >> 8) & (255 as u16)) as byte);
+    out[4] = 127;
+    out[5] = 0;
+    out[6] = 0;
+    out[7] = 1;
+}
+
+// 整轮的主体：一个 future 里顺序跑完六段判据。
+@async_fn fn rtio_main() Future<!i32> {
+    var pa: [i32: 2] = [0: 2];
+    const ra: !i32 = sys_pipe2(&pa[0], 0);
+    _ = ra catch { return 1; };
+    defer {
+        _ = sys_close(pa[0]) catch {};
+        _ = sys_close(pa[1]) catch {};
+    }
+    var pb: [i32: 2] = [0: 2];
+    const rb: !i32 = sys_pipe2(&pb[0], 0);
+    _ = rb catch { return 1; };
+    defer {
+        _ = sys_close(pb[0]) catch {};
+        _ = sys_close(pb[1]) catch {};
+    }
+    rt_set_nonblock(pa[0]);
+    rt_set_nonblock(pa[1]);
+    rt_set_nonblock(pb[0]);
+    rt_set_nonblock(pb[1]);
+
+    _ = try @await rtio_write_then_read(&pa[0]);
+
+    const t0: u64 = ua_now_ms();
+    _ = try @await rtio_wait_deadline(&pa[0], 60);
+    g_rtio_eagain_ms = ua_now_ms() - t0;
+
+    rt_set_frame(g_rtio_abort_frame_i);
+    const cr: !usize = @await rtio_wait_cancel(&pa[0]);
+    _ = cr catch {};
+    rt_frame_clear();
+    // 取消只是这一段要验的行为；清掉意图，后面几段照常跑（主循环在真实回合里
+    // 也是「收口之后 take 走意图」）。
+    rt_abort_reset();
+
+    _ = try @await rtio_select(&pb[0], &pa[0]);
+    _ = try @await rtio_join(&pa[0], &pb[0]);
+    _ = try @await rtio_tcp(RTIO_E_PORT);
+    return 0;
+}
+
+// 取消探针的接口值（装箱只做一次，见 rtloop 的 `g_rt_no_frame` 注释）。
+var g_rtio_abort_frame_i: RtFrame = g_rtio_abort_frame;
+
+// 等一帧就置取消意图：`rtio_wait_cancel` 必须在下一次 poll 就收口。
+struct RtioAbortFrame : RtFrame {
+    hits: i64,
+    fn rt_frame(self: &Self, now_ms: u64) void {
+        _ = now_ms;
+        self.hits = self.hits + 1;
+        rt_abort(RT_ABORT_TURN);
+    }
+}
+
+var g_rtio_abort_frame: RtioAbortFrame = RtioAbortFrame{ hits: 0 };
+
+// 轮入口：async-io。
+fn async_io_round(tag: &const byte) bool {
+    var ok: bool = true;
+    g_rtio_roundtrip = 0;
+    g_rtio_eagain_ms = 0;
+    g_rtio_eagain_eid = 0;
+    g_rtio_cancel_eid = 0;
+    g_rtio_cancel_ms = 0;
+    g_rtio_select_first = 0;
+    g_rtio_select_second = 0;
+    g_rtio_join_a = 0;
+    g_rtio_join_b = 0;
+    g_rtio_tcp_ok = 0;
+    g_rtio_abort_frame.hits = 0;
+    rt_abort_reset();
+    rt_frame_clear();
+    // 取消那一段由探针置意图，所以整轮跑完必须把意图清掉，别传给后面的轮。
+    const rc: i32 = rt_run(rtio_main());
+    rt_abort_reset();
+    rt_frame_clear();
+    if rc != 0 {
+        ty_fail(tag, "rtio_main 没有正常收口（基础设施错误）", &ok);
+    }
+    // A：管道往返
+    if g_rtio_roundtrip != 1 {
+        ty_fail(tag, "管道往返失败（写进去的四个字节没原样读回来）", &ok);
+    }
+    // B：deadline 必须真的等（60ms 预算，30–2000ms 都算等到）
+    if g_rtio_eagain_eid != 2 {
+        ty_fail(tag, "空管道读没有报 AsyncDeadlineExceeded", &ok);
+    }
+    if g_rtio_eagain_ms < (30 as u64) || g_rtio_eagain_ms > (2000 as u64) {
+        ty_fail(tag, "deadline 等待时长不对（应当 ≈60ms）", &ok);
+    }
+    // C：取消必须收口成 Cancelled 且很快
+    if g_rtio_cancel_eid != 1 {
+        ty_fail(tag, "取消之后没有报 error.Cancelled", &ok);
+    }
+    if g_rtio_cancel_ms > (500 as u64) {
+        ty_fail(tag, "取消收口太慢（>500ms）", &ok);
+    }
+    // D：select2 报对是哪一路
+    if g_rtio_select_first != 2 {
+        ty_fail(tag, "select2 没把「先就绪的是第二路」报出来", &ok);
+    }
+    if g_rtio_select_second != 1 {
+        ty_fail(tag, "select2 第二次没报第一路", &ok);
+    }
+    // E：join2 两路都要拿到数据
+    if g_rtio_join_a == 0 || g_rtio_join_b == 0 {
+        ty_fail(tag, "join2 有一路没拿到数据", &ok);
+    }
+    // F：TCP 自连
+    if g_rtio_tcp_ok != 1 {
+        ty_fail(tag, "非阻塞 connect + accept 没有走通", &ok);
+    }
+    if !ok {
+        return false;
+    }
+    out_err("selftest[");
+    out_err(tag);
+    out_err("] ok: 读写往返 + deadline + 取消 + select2 + join2 + TCP 自连\n");
+    return true;
+}

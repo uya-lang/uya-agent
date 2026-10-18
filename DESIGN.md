@@ -8933,3 +8933,63 @@ esc/ctrl+c 可停）`，会话日志的 `turn/retry` 里还带 `rc` 与机器名
 （那在 CI 里就是挂死）；不改 `AGENT_INTERRUPTED` 的退出码语义（130 仍是「人叫停」）；
 除 `/goal resume` 之外不新增第二条重新授权自动续跑的路（人在键盘前按一次键，比让机器
 猜「他是不是还想让它跑」便宜得多）。
+
+### 19.21 P97/P98：单线程事件循环取代泵点加密（async 改造第一段）
+
+**方向（用户拍板）**：所有同步 I/O 都改 async，**包括键盘输入**；尽量让编译器生成状态机
+（`@async_fn` + `@await`，手写 `poll` 只在「需要一个 Future 而不是一条协程」时用）；
+**坚持单线程**。撞到工具链缺口就回 `../uya` 改，改完再回来。
+
+**这一段落地了三块地基**（都在 `src/rt/`，零业务行为变更）：
+
+| 模块 | 装什么 | 关键决定 |
+|---|---|---|
+| `src/rt/rtloop.uya` | `rt_run`（唯一事件循环）、帧回调端口 `RtFrame`、协作取消 `rt_abort_*`、`rt_sleep` | 驱动复用 std 的 `scheduler_run_i32_with_event_loop`，只包一层 `RtRunFut` 注入帧回调 —— **不重写调度器** |
+| `src/rt/rtio.uya` | `rt_read` / `rt_write` / `rt_accept` / `rt_connect` / `rt_wait_any2` / `rt_join2` / `rt_select2` | 业务侧线性写 `@await`；**全文件唯一手写 poll** 是 `RtWaitAny2`（两路 fd 谁先就绪，waker 槽表用法与 std 同源） |
+| `src/term/tui/inp.uya` | `tui_input_*`：TUI 管道 / 只交字节 / 同步桥 | **fd 0 只有这一个读者**；`oscin_borrowed()` 判据收在一处（踩坑 135/137 不放松） |
+
+**TUI 帧、键盘、网络、定时现在共用一条等待原语**：帧回调在 `RtRunFut.poll` 里节流跑；
+滚动模式 REPL 的「读一行」（`tty_read_line_blocking`）已经从 `poll(fd0,200)+read` 换成
+`tui_input_read_sync`（内部 `rt_run` + 分片等待），watch / 标题待办那两拍仍靠**超时**
+回去推（语义一字不改）。
+
+**四条实测事实（改之前先读，都是本轮真跑出来的）**：
+
+1. **定时精度 = 循环 poll 超时**：`deadline` 只在 poll 返回之后才被检查。实测 poll=1000ms
+   时 120ms 的 deadline 跑成 1.003s；poll=16ms（`RT_POLL_MS`）时 0.123s。⇒ `RT_POLL_MS`
+   不能随便放大。
+2. **没有 sleep / timerfd**：定时一律 `async_wait_readable(永不就绪的管道, deadline)`；
+   管道**写端必须常开**（关了 = 读端 EOF = 永远可读 = 忙等）。
+3. **普通文件 fd 不能进 epoll**（`register` 实测失败），`async_wait_readable` 对文件因内核
+   `poll(0)` 恒可读而立即返回 ⇒ 文件 I/O 的「async」只能是**分块 + 每块之间让点**，
+   不许把它吹成 readiness（P101 的判据要照这条写）。
+4. **`tls_noise_mute` 嵌套会把 fd 2 永久静音**（实测：外层 unmute 之后 `AFTER-FD2` 不再
+   出现）⇒ **侧路请求并发之前必须先把它改成引用计数**（P102 的前置条件）。
+
+**取消只判一处，但等待要分片**：`RtRunFut` **不**做「看到取消就丢弃内层 future」——那样
+丢弃时内层的 `defer` 不会跑（fd/子进程泄漏）。取消由 `rt_sleep` 与 `rtio` 的每个等待边界
+负责：所有等待按 `RT_CANCEL_SLICE_MS = 32` 分片，片间看 `rt_abort_state()`，命中就
+`error.Cancelled` 正常退栈。实测 esc 之后 ≤1 片就收口。
+
+**工具链缺口（本轮已回 `../uya` 修，提交 `5d3e335d`）**：`具体 struct → 接口` 的**赋值**
+以前不装箱（只有文件作用域初始化器与函数实参两条路会发射 `{vtable, data}`），赋值语句直接
+发 `x = concrete;`，宿主 C 报 incompatible types。修法：`gen_assign_non_array` 里加
+`gen_assign_iface_box`；回归 `../uya/tests/test_interface_value_assign.uya`；`make b`
+自举对比字节一致。**口径**：具体 struct 只装箱一次（写进接口全局），之后一律传接口值 ——
+值形态装箱在检查器里算一次移动，`&x` 形态才是借用。
+
+**判据（三条新腿，全部带「拆掉就红」的对照）**：
+
+| 轮 | 判据 | 防假绿（真做过） |
+|---|---|---|
+| `async-rt` | future 跑完且值透传 / 帧回调被驱动且节流（最小间隔 ≥8ms）/ `rt_sleep` 时长预算 / 取消三态 + QUIT 不被 TURN 降级 / 重入被拒 / `rt_sleep(0)` 立即返回 | 删掉 `g_rt_frame.rt_frame(now)` ⇒ 帧回调与取消两条判据当场红 |
+| `async-io` | 管道往返 / 空管道 60ms deadline 等够时间 / 取消 ≤500ms 收口 / `select2` 报对哪一路 / `join2` 两路都拿到 / 非阻塞 connect+accept 自连 | 把 `linux_epoll_create(256)`（把槽位数当 flags）⇒ 整轮全红（这条踩过） |
+| `async-keys` | 异步读键 + TUI 管道收货 + 同步桥返回字节数 + 终端回帧不漏进输入行 | 删掉 `tui_input_absorb` 里的 `oscin_feed` ⇒ D 段红 |
+
+**还没做（下一段的入口，按顺序）**：P99 网络栈（`aic_*`/`ahc_*`/`llm_stream_*_async`，
+四条错误码与四档信任策略逐字保留）→ P100 回合链 + TUI 主循环搬进事件循环（泵点退役）→
+P101 子进程/文件/剪贴板/信号（文件按上面第 3 条做「分块让点」）→ P102 侧路并发（**先修
+`tls_noise_mute` 引用计数**）+ 文档收口。**已知遗留**：`tui_input_wait_raw` 在
+deadline≠0 的那条路上有一次读到 `0`（被当成 EOF）的现场没定死因（判据暂时由 `async-io`
+的 rtio 层覆盖）；`@async_fn` 里「两层嵌套 + 出参跨 await」的取值可疑，P99 动网络栈前
+先用最小复现钉一下。

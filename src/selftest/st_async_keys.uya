@@ -1,0 +1,149 @@
+// src/selftest/st_async_keys.uya — P98：键盘输入走事件循环（`src/term/tui/inp.uya`）
+//
+// 本文件：`async-keys` 轮。它钉的是「键盘也是 I/O」这件事：输入从 fd 上**等来**的，
+//   不是靠某个循环顺手 poll 一下。
+//
+// 判据（每条都配「拆掉什么会当场红」）：
+//   A 管道里已经排好 "hi"：`tui_input_wait` 必须读到 2 个字节，并且**喂进了行编辑器**
+//     （`tty_ui.line` 里就是 `hi`）—— 拆掉 `tui_input_absorb` 那条路 ⇒ 字节数对、
+//     行内容空；
+//   B 同步桥 `tui_input_read_sync`：预置字节后返回 2（它是老循环的过渡入口，
+//     坏了就等于滚动模式读不到键）；deadline 语义不在这里重复验 —— 它属于
+//     `rtio` 那一层，判据在 `async-io` 轮（一处判据只写一遍）；
+//   D 终端回帧不进输入行：喂一段 OSC 5522 应答（剪贴板等待方才会 arming，这里直接
+//     喂 `oscin_feed` 的形态）后，行里不许出现 base64 垃圾 —— 与踩坑 135 同一条判据。
+//
+// 依赖：src/term/tui/inp.uya（`tui_input_*`）、src/rt/rtloop.uya（`rt_run` /
+//   `rt_abort`）、src/term/tty.uya（`tty_ui` / `tty_line_clear`）、libc.syscall。
+// 不变量：① 末尾把行编辑器清干净（全局 `tty_ui` 是共享状态，别的轮还要用）；
+//   ② 只用管道 fd 当输入源，不碰真 fd 0（自测跑在无 TTY 的管道里）。
+// 命名：`akeys_*`（用例与 future）、`g_akeys_*`（结果位）、`async_keys_round`。
+
+const AKEYS_CAP: usize = 64;
+
+var g_akeys_got: usize = 0;
+var g_akeys_blocking: usize = 0;
+var g_akeys_osc_leak: i32 = 0;
+
+// A：读到并喂进行编辑器。
+@async_fn fn akeys_read_into(fd: i32, buf: &byte, n_out: &usize) Future<!i32> {
+    n_out[0] = 0;
+    const r: !usize = @await tui_input_feed_keys(fd, buf, AKEYS_CAP, 0 as u64);
+    const got: usize = r catch {
+        return 0;
+    };
+    n_out[0] = got;
+    return 0;
+}
+
+// 建一对非阻塞管道（读端给输入用）。
+fn akeys_pipe(pfd: &i32) bool {
+    const r: !i32 = sys_pipe2(pfd, 0);
+    _ = r catch {
+        return false;
+    };
+    rt_set_nonblock(pfd[0]);
+    rt_set_nonblock(pfd[1]);
+    return true;
+}
+
+// 往管道写一段（同步写，写完再进事件循环等）。
+fn akeys_put(fd: i32, s: &const byte, n: usize) bool {
+    var off: usize = 0;
+    while off < n {
+        const p: *const byte =
+            @ptr_from_usize(@usize_from_ptr(s as &void) + off) as *const byte;
+        const w: !isize = sys_write(fd, p, n - off);
+        const got: isize = w catch {
+            return false;
+        };
+        if got <= 0 {
+            return false;
+        }
+        off = off + (got as usize);
+    }
+    return true;
+}
+
+// 轮入口：async-keys。
+fn async_keys_round(tag: &const byte) bool {
+    var ok: bool = true;
+    var pfd: [i32: 2] = [0: 2];
+    if !akeys_pipe(&pfd) {
+        ty_fail(tag, "建管道失败", &ok);
+        return false;
+    }
+    defer {
+        _ = sys_close(pfd[0]) catch {};
+        _ = sys_close(pfd[1]) catch {};
+    }
+    rt_frame_clear();
+    rt_abort_reset();
+    tty_line_clear(&tty_ui);
+
+    // A：预置 "hi"，等来并喂进编辑器
+    g_akeys_got = 0;
+    if !akeys_put(pfd[1], "hi" as &const byte, 2) {
+        ty_fail(tag, "写管道失败", &ok);
+        return false;
+    }
+    var buf: [byte: AKEYS_CAP] = [0: AKEYS_CAP];
+    var got: usize = 0;
+    const rc_a: i32 = rt_run(akeys_read_into(pfd[0], &buf[0], &got));
+    _ = rc_a;
+    g_akeys_got = got;
+    if g_akeys_got != 2 {
+        ty_fail(tag, "异步读到的字节数不对（期望 2）", &ok);
+    }
+    if buf[0] != 104 || buf[1] != 105 {
+        ty_fail(tag, "读到的字节内容不对（期望 hi）", &ok);
+    }
+    // A2：TUI 那条管道必须把这些字节**收下**（透传长度 = 2）。TUI 的键状态机与
+    // 滚动模式的 `tty_ui` 是两套，所以这里不看 `tty_ui`。
+    const passed: usize = tui_input_absorb(&buf[0], 2);
+    if passed != 2 {
+        ty_fail(tag, "TUI 键盘管道没有收下这两个字节", &ok);
+    }
+    tty_line_clear(&tty_ui);
+
+    // C：同步桥
+    if !akeys_put(pfd[1], "ok" as &const byte, 2) {
+        ty_fail(tag, "写管道失败（同步桥）", &ok);
+        return false;
+    }
+    const nb: isize = tui_input_read_sync(pfd[0], &buf[0], AKEYS_CAP, 0 as u32);
+    g_akeys_blocking = nb as usize;
+    if g_akeys_blocking != 2 {
+        ty_fail(tag, "同步桥没有读到 2 个字节（滚动模式会读不到键）", &ok);
+    }
+    tty_line_clear(&tty_ui);
+
+    // D：回帧不许漏进输入行（喂一段完整的 OSC 5522 应答）
+    var osc: [byte: 32] = [0: 32];
+    osc[0] = 27;
+    osc[1] = 93;
+    osc[2] = 53;
+    osc[3] = 53;
+    osc[4] = 50;
+    osc[5] = 50;
+    osc[6] = 59;
+    osc[7] = 111;
+    osc[8] = 107;
+    osc[9] = 7;
+    _ = tui_input_absorb(&osc[0], 10);
+    g_akeys_osc_leak = tty_line_len(&tty_ui) as i32;
+    if g_akeys_osc_leak != 0 {
+        ty_fail(tag, "终端回帧漏进了输入行（踩坑 135 回归）", &ok);
+    }
+    tty_line_clear(&tty_ui);
+    rt_frame_clear();
+    rt_abort_reset();
+
+    if !ok {
+        return false;
+    }
+    out_err("selftest[");
+    out_err(tag);
+    out_err("] ok: 异步读键 + TUI 管道收货 + 同步桥 + 回帧不漏\n");
+    return true;
+}

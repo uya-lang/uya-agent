@@ -107,10 +107,11 @@ AGENT_CFLAGS      := $(AGENT_CFLAGS_BASE) -include $(AGENT_C_PROTOS)
 #      数文件：`make -s print-src | wc -w`。
 # 留在 src/ 根的 tools.uya 是 P50 起就不在构建里的已知死代码，故意不列。
 SRC := src/foundation/bufx.uya src/foundation/jsonx.uya src/foundation/yamlcfg.uya \
+       src/rt/rtloop.uya src/rt/rtio.uya \
        src/net/tlspin.uya src/net/proxyx.uya src/net/rsav.uya src/net/x509min.uya src/net/cachain.uya \
        src/net/httpc.uya src/net/httpsrv.uya src/net/httpstream.uya src/net/llm.uya src/net/retryx.uya src/net/sse.uya src/net/webx.uya \
        src/term/oscin.uya src/term/mdview.uya src/term/tasks.uya src/term/tty.uya \
-       src/term/tui/style.uya src/term/tui/keys.uya src/term/tui/frame.uya src/term/tui/entry.uya src/term/tui/screen.uya src/term/tui/sel.uya src/term/tui/overlay.uya src/term/tui/status.uya src/term/tui/ask.uya src/term/tui/watch.uya src/term/tui/diff.uya src/term/tui/hook.uya \
+       src/term/tui/style.uya src/term/tui/keys.uya src/term/tui/frame.uya src/term/tui/entry.uya src/term/tui/screen.uya src/term/tui/sel.uya src/term/tui/overlay.uya src/term/tui/status.uya src/term/tui/ask.uya src/term/tui/watch.uya src/term/tui/diff.uya src/term/tui/hook.uya src/term/tui/inp.uya \
        src/term/view.uya src/term/watch.uya \
        src/ui/ui_port.uya src/ui/be_null.uya src/ui/be_tui.uya src/ui/be_events.uya src/ui/ui_reg.uya src/ui/ui_fwd.uya \
        src/tools/askuser.uya src/tools/fsx.uya src/tools/jobs.uya src/tools/perm.uya src/tools/sandboxx.uya src/tools/search.uya src/tools/shellx.uya \
@@ -122,7 +123,7 @@ SRC := src/foundation/bufx.uya src/foundation/jsonx.uya src/foundation/yamlcfg.u
        src/web/ttyemu.uya src/web/dshauth.uya src/web/dshget.uya src/web/webui.uya src/web/wsess.uya src/web/dwhchild.uya src/web/dwhmodel.uya src/web/dwhschema.uya src/web/dwhset.uya src/web/whost.uya src/web/websrv.uya src/web/webhttp.uya src/web/webpump.uya \
        src/media/clipx.uya src/media/clipw.uya src/media/clipt.uya src/media/cliphelp.uya src/media/clip.uya src/media/imgx.uya src/media/imgz.uya \
        src/selftest/selftest.uya src/selftest/shellselftest.uya src/selftest/sigselftest.uya src/selftest/tuiselftest.uya \
-       src/selftest/st_core.uya src/selftest/st_mock_server.uya src/selftest/st_round_driver.uya src/selftest/st_turn_retry.uya src/selftest/st_tty_sse.uya src/selftest/st_sessions.uya src/selftest/st_read_window.uya src/selftest/st_view_watch.uya src/selftest/st_responses.uya src/selftest/st_stats_ctx.uya src/selftest/st_ctxfit.uya src/selftest/st_title.uya src/selftest/st_tasks_ws.uya src/selftest/st_vision.uya src/selftest/st_goal_worktree.uya src/selftest/st_goal_sess.uya src/selftest/st_todo_resume.uya src/selftest/st_pm.uya src/selftest/st_pm2.uya src/selftest/st_mcp.uya \
+       src/selftest/st_async_rt.uya src/selftest/st_async_io.uya src/selftest/st_async_keys.uya src/selftest/st_core.uya src/selftest/st_mock_server.uya src/selftest/st_round_driver.uya src/selftest/st_turn_retry.uya src/selftest/st_tty_sse.uya src/selftest/st_sessions.uya src/selftest/st_read_window.uya src/selftest/st_view_watch.uya src/selftest/st_responses.uya src/selftest/st_stats_ctx.uya src/selftest/st_ctxfit.uya src/selftest/st_title.uya src/selftest/st_tasks_ws.uya src/selftest/st_vision.uya src/selftest/st_goal_worktree.uya src/selftest/st_goal_sess.uya src/selftest/st_todo_resume.uya src/selftest/st_pm.uya src/selftest/st_pm2.uya src/selftest/st_mcp.uya \
        src/selftest/tuis_core.uya src/selftest/tuis_title_pty.uya src/selftest/tuis_exit_cmd.uya src/selftest/tuis_diff_scroll.uya src/selftest/tuis_title_ask.uya src/selftest/tuis_sessions_big.uya src/selftest/tuis_tail.uya src/selftest/tuis_marquee_row.uya src/selftest/tuis_sel.uya src/selftest/tuis_mem.uya \
        src/selftest/st_web.uya src/selftest/st_web_childcfg.uya src/selftest/st_web_live.uya src/selftest/st_tls_pin.uya src/selftest/st_tls_ca.uya \
        src/selftest/st_dns.uya src/selftest/st_proxy.uya \
