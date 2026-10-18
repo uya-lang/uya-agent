@@ -6765,7 +6765,8 @@ DEEPSEEK_API_KEY=sk-xxx ./build/uya-agent \
 | `empty-retry` | P54（mock mode 41）：第一轮回「finish_reason=stop + 只有思考、没有正文」→ 转录里那一行证据（`finish=stop have_finish=1 bad_finish=(none) content=0B reasoning=45B calls=0 usage={in=60 cache_read=40 cache_write=0 out=7 reasoning=3} prompt=…B/100tok retries=0/1`）+ 日志一条 `llm/degenerate`（字段逐项核对）→ **同一步重发**：第二轮请求与第一轮**逐字节相同**、`step/start` 仍只有一条、唯一那条 `assistant/message` 的正文是 `SELFTEST-RETRY-OK`、回合退出 0 |
 | `empty-retry-giveup` | P54（mock mode 42）：重发也只给空响应 → 只重发**一次**（两条 `llm/degenerate`：`retrying=true/retries=0` → `retrying=false/retries=1`）、退化那一步**一条 `assistant/message` 都没有**、转录里留下带同一条证据的错误行、回合按协议错误退出 3 |
 | `max-tokens-cut` | P59（mock mode 44，**一个进程跑两个回合**）：① `finish_reason=length` + 正文 + 一个 `write trunc.txt` 调用 → 一个工具调用都不派发（`trunc.txt` 不存在、日志零 `tool/call`）、正文剪掉断口空白后进历史、`assistant/message` **不带 tool_calls**、转录是 `warning:` + `[max-tokens] …发「继续」…`（**没有** `error: model output was truncated`）、`turn/end` reason = `max-tokens`、那一回合返回 `5`；② 人打「继续」→ 第二个请求里**带着那段正文**、没有 `"role":"tool"`、没有 `"tool_calls"` → 回合以 0 收尾、`turn/end` reason = `completed` |
-| `turn-retry` | P94（mock mode 50）：退化两发（第二发与第一发**逐字节相同**）⇒ 同一步的重发额度用尽、回合按错误收场 ⇒ **自动替人打一句「继续」**开新回合 ⇒ 第三发请求体里带着 `"role":"user","content":"继续"` ⇒ 退出 0。判据三侧：转录 `[turn-retry]` 行（第 1/2 次、`backoff=` 落在 [0.5s,3.0s]、`esc/ctrl+c 可停`）、日志（`turn/start` 2 条、`turn/end` 先 `error` 后 `completed`、`turn/retry` 1 条且 attempt=1/maxRetries=2、一条「继续」的 `user/message`）、mock 侧请求体 |
+| `turn-retry` | P94（mock mode 50）：退化两发（第二发与第一发**逐字节相同**）⇒ 同一步的重发额度用尽、回合按错误收场 ⇒ **自动替人打一句「继续」**开新回合 ⇒ 第三发请求体里带着 `"role":"user","content":"继续"` ⇒ 退出 0。判据三侧：转录 `[turn-retry]` 行（第 1 次、**不限次数**（P96）、`backoff=` 落在 [0.5s,3.0s]、`esc/ctrl+c 可停`）、日志（`turn/start` 2 条、`turn/end` 2 条、`turn/retry` 1 条且 attempt=1/maxRetries=-1/rc=3/reason=degenerate-response、一条「继续」的 `user/message`）、mock 侧请求体 |
+| `turn-retry-all` | P96（mock mode 51）：第一发 **401**（传输层不重试的那一档）⇒ 回合级自动继续 ⇒ 第二发请求体里带着整条 `"role":"user","content":"继续"` ⇒ 退出 0；第一发的请求体里不许已经出现那条消息。这一腿证明「所有没收完的回合都续」，P94 的实现下必红 |
 | `tui-diag` | 4 KiB JSON 只留 ≤512 B、半截汉字变 U+FFFD、`tty_sink_on` 收尾关回 |
 | `read-window` | `(Showing lines 1-1000 of 4000. …)`、`offset=3500` 真读到、`limit=2000` |
 | `title-format` | OSC/CSI 清洗、模型侧 45 B（15 字）/ 上屏 80 B 上限切码点边界、`ESC[22t`/`ESC[23t` |
@@ -8782,7 +8783,7 @@ TLS 校验）」，而真相是「这台站点换了一张同样合法的证书�
 |---|---|---|
 | 退避 | `rtx_backoff_ms()`：0.5–3 s 随机 | 与传输层重试**同一套数值**（用户的原话就是「像连接重试一样」）；抖动让同一故障下的多个客户端不同时回来 |
 | 中断 | `agent_rtx_wait`：≤50 ms 切片 + 泵点 | esc / ctrl+c / ctrl+d 当场收口 —— 自动重试不许变成「按了没反应」（踩坑 44 同族） |
-| 预算 | `TURN_RETRY_MAX = 2`，`0` = 关 | 回合级**不做无限**：一次传输重发只多一发请求，一次自动继续会再跑一整段 step 循环（模型可能连着调几十个工具）。连两次都空，交回人手最稳 |
+| 预算 | `TURN_RETRY_MAX = 2`，`0` = 关（**P96 已改成出厂不限**，见 §19.20） | 回合级**不做无限**：一次传输重发只多一发请求，一次自动继续会再跑一整段 step 循环（模型可能连着调几十个工具）。连两次都空，交回人手最稳 |
 | 账 | 转录一行 `[turn-retry] … backoff=1.7s（esc/ctrl+c 可停）` + 会话日志 `turn/retry` | 屏幕要能解释「为什么又动起来了」，日志要能复盘「继续了几次、等了多久」。`--quiet` 也照打 |
 | 注入 | 与 `/continue` **逐字相同**的「继续」，走 `agent_push_user_with_imgs` + `agent_log_user_att` | 历史、模型看到的东西、会话日志三样因此一致（图片附件与条数上限的腾挪也复用同一条路） |
 | 收尾 | 预算用尽 / 不可重试 → 原退出码交回去 | 「本回合异常结束」那句话仍由调用方照旧打出来；`--api-retry-max 0` 那类负控腿的退出码判据不受影响 |
@@ -8872,3 +8873,63 @@ error: 请求失败（TLS 握手失败）。
 的配置/证书问题）；经代理隧道被掐断在分类上仍是这一档 —— 要把它判成瞬时错得先能证明
 「一个字节都没回来」，而 `lib/tls` 的握手失败不区分「没读到」与「读到垃圾」，
 猜出来的瞬时错会让确定性的坏配置被无限重发。报告把两条路分开说清，交给人判断。
+
+### 19.20 P96：**所有**没收完的回合都自动继续 + goal 续跑能被 esc 叫停
+
+**用户报的两件事**（原话）：①「改出所有自动继续，直到成功或者用户主动中断」—— P94
+（§19.18）只对「模型空响应」开闸、出厂只续 2 次，用户要的是「所有失败都续，一直续到成功
+或者我按停」；②「顺手修复 goal 激活后 esc 中断不了」。
+
+**第一件：闸门放开到所有失败，预算改成不限。**
+
+| 要素 | P94 | P96 |
+|---|---|---|
+| 哪些失败续 | 只有「模型空响应」且同一步重发额度用尽 | **所有没收完的回合**：协议错（401/4xx、坏 payload、步数熔断、上下文压不动）、传输错（DNS / 握手 / 证书这类本身不重试的）、工具错、**有正文的** token 上限截断、空响应 |
+| 哪些不续 | 其余全部 | `AGENT_OK`（跑完了）、`AGENT_INTERRUPTED`（人按了 esc / ctrl+c）、`AGENT_USAGE`、**没产出正文的**截断（再发只是重复花同一笔钱 —— 那一档该调的是 `--max-tokens`） |
+| 预算 | 出厂 2 次 | 出厂**不限次数**（`TURN_RETRY_MAX = RTX_UNLIMITED`）；`--turn-retry-max N` / `UYA_AGENT_TURN_RETRY_MAX` 给脚本一个出口，`0` = 一次都不续（逐字节回到 P94 之前） |
+| 谁不享受 | — | **非交互进程**（管道 / CI / 子代理）：没人能叫停的地方不续（与 `agent_goal_drive` 的「只在有人在键盘前的前台会话里跑」同一条纪律）。显式给过 `--turn-retry-max` 就听人的 |
+
+判据仍然只有一份（`ag_turn_retry.uya::tr_should`），扩的是**入口集合**而不是散点补丁。
+两条边界是硬的：人已经要停（`tui_abort_state() != NONE`，含 ctrl+d / `/exit`）与
+`AGENT_INTERRUPTED` —— 一个字节都不再发；退避期间照旧 `agent_rtx_wait` 每 ≤50 ms 服务
+键盘，esc 当场收口。
+
+**为什么「一直续到成功」不等于「无限空转」**：① 每续一次都在屏幕上说清原因 ——
+`[turn-retry] <为什么>——自动替你打一句「继续」再跑一回合（第 N 次，不限次数，backoff=…s；
+esc/ctrl+c 可停）`，会话日志的 `turn/retry` 里还带 `rc` 与机器名 `reason`，人一眼能看出
+它在同一个错上转；② 默认只在「有键盘可停」的会话里续，CI 里默认不动；③ 停止永远只有
+一键（esc / ctrl+c），不靠等预算用尽。
+
+**第二件：goal 续跑按 esc 停不下来**（两处，都在 `agent_goal_drive`）：
+
+1. **中断意图被自己擦掉**。驱动器最前面那道闸门只认 `TUI_ABORT_QUIT`，`TUI_ABORT_TURN`
+   直接掉进后半段的 `tui_interrupt_clear()` —— 人刚按的 esc 被当成「上一轮遗留」清掉，
+   下一圈照常开轮。修法：`TURN` 单独成一条闸门 —— `goal_disarm` 收授权、说一句「已停下
+   自动续跑（esc 叫停；/goal resume 接着跑）」、**把意图消费掉**再返回。消费是对的：
+   不清的话下一个用户回合会在第一个 step 边界被它当场打断。
+2. **「中断不算异常」这条老规矩本身就错**。P58 收口时把 `AGENT_INTERRUPTED` 当「人只是
+   停下当前这一轮，目标该留着」⇒ 授权不动 ⇒ 主循环下一圈立刻又开一轮。屏幕上「已中断
+   本回合」与「自动续跑一轮」交替出现，esc 形同虚设。修法：中断**就是**人叫停续跑 ——
+   `goal_disarm` 收掉授权，盘上的 `armed` 一起翻成 false（否则面板与 `get_goal` 一直写着
+   armed），**phase 保持 active**（目标没被放弃，`/goal resume` 一条命令接着跑）。
+
+**判据（都在离线自测里）**：
+
+| 轮次 | 判据 |
+|---|---|
+| `turn-retry`（mode 50，P94 的老腿） | 退化两发 ⇒ 回合按错误收场 ⇒ 自动继续 ⇒ 第三发带「继续」⇒ 0 收口；`[turn-retry]` 行写「第 1 次」「**不限次数**」「esc/ctrl+c 可停」，日志 `turn/retry` 一条（attempt=1、maxRetries=-1、rc=3、reason=degenerate-response） |
+| `turn-retry-all`（mode 51，本轮新增） | 第一发 **401**（传输层分类表里不可重试的那一档）⇒ 回合级自动继续 ⇒ 第二发请求体里带着整条 `"role":"user","content":"继续"` ⇒ 0 收口。第一发的请求体里**不许**已经出现那条消息（证明注入发生在失败之后）；日志 `reason=protocol-error` |
+| `goal-cmd` 的 K10 段（本轮新增） | 直接调驱动器本体：`/goal …` 建目标（授权打开）→ `tui_abort_note_scroll(TURN)` 模拟 esc ⇒ `agent_goal_drive` 必须返回 false（没开轮）、进程本地授权收掉、**盘上 armed=false 且 revision+1**、phase 仍是 active、**中断意图被消费**（`tui_abort_state()==NONE`） |
+
+**防假绿对照（两次都真做过）**：
+
+① 把 `tr_should` 退回「必须有提示位」（= P94 的「只认空响应」）⇒ `turn-retry-all` 整片红：
+转录侧的 `[turn-retry]` 五条判据、日志侧四条、退出码 `agent_run returned 3`；
+② 把 K10 那条闸门里的 `goal_disarm(cfg)` 删掉（只留回执）⇒ `goal-cmd` 红在「进程本地的
+授权没被收掉」「盘上的 armed 还开着」「收了授权却没 +1 revision」。
+
+**边界（明确不做）**：不把「没产出正文的截断」算进自动继续；不在退避里抢 steer 的顺序
+（退避期间敲进来的正文照旧进 steer 收件箱，下一个 step 边界生效）；不做「无限次 + 非交互」
+（那在 CI 里就是挂死）；不改 `AGENT_INTERRUPTED` 的退出码语义（130 仍是「人叫停」）；
+除 `/goal resume` 之外不新增第二条重新授权自动续跑的路（人在键盘前按一次键，比让机器
+猜「他是不是还想让它跑」便宜得多）。
