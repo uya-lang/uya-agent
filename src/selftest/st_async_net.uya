@@ -1,0 +1,452 @@
+// src/selftest/st_async_net.uya — P99：异步 HTTP 客户端（`src/net/ahttp.uya`）
+//
+// 本文件：`async-net` 轮。它钉的是**两条路逐字节等价**：同一份响应经同步
+//   `hc_open`/`hc_fill` 与异步 `ahc_open`/`ahc_fill` 走下来，响应头、状态码、
+//   Content-Length / chunked 判定、解出来的体字节必须**一个字节都不差**。
+//
+// 判据（每条都配「拆掉什么会当场红」）：
+//   A 定长体（Content-Length）：头与体全部一致（把 async 路的 `hc_head_finish` 换成
+//     自己写一份解析 ⇒ 只要有一处口径不同就红）；
+//   B chunked 体：同上，且**分片到达**（服务端两次写、中间 sleep）—— 这测的是
+//     `ahc_fill` 的「暂时没数据」循环，短读/边界错都会红；
+//   C 404 状态码：两条路都拿到 404、头相同（状态码解析不出错）；
+//   D 取消：`ahc_fill` 在一个迟迟不发的服务端上等，置取消意图后 ≤500ms 收口成
+//     `error.Cancelled`（去掉 rtio 那道闸门 ⇒ 会一直等到 deadline）。
+//
+// 不变量：① 服务端在**子进程**里跑（`sys_fork`），父进程只做客户端 —— 一轮里同时
+//   有同步与异步两条连接，不会互相阻塞；② 每个用例都用**新端口**（`SO_REUSEADDR`
+//   + 先 bind 再 fork，端口由内核分配）；③ 比较的是 `st.head` 与 `st.dec` 的原字节，
+//   不比状态码之外任何「语义近似」。
+//
+// 依赖：src/net/httpc.uya（同步路）、src/net/httpstream.uya、src/net/ahttp.uya、
+//   src/rt/rtloop.uya、src/rt/rtio.uya、libc.syscall（socket / bind / listen /
+//   fork）。
+// 命名：`anet_*`（用例）、`g_anet_*`（结果位）、`async_net_round`。
+
+const ANET_RESP_CL: &const byte =
+    "HTTP/1.1 200 OK\r\nContent-Length: 11\r\nX-Test: anet\r\n\r\nhello world";
+
+// 行宽豁免：协议报文常量，拆开就等于改协议（chunk 边界与 \r\n 都是判据的一部分）。
+const ANET_RESP_CHUNKED_A: &const byte =
+    "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nX-Test: anet\r\n\r\n5\r\nabcde\r\n";
+
+const ANET_RESP_CHUNKED_B: &const byte = "6\r\nfghijk\r\n0\r\n\r\n";
+
+const ANET_RESP_404: &const byte =
+    "HTTP/1.1 404 Not Found\r\nContent-Length: 3\r\n\r\nno!";
+
+var g_anet_head_eq: i32 = 0;
+var g_anet_body_eq: i32 = 0;
+var g_anet_status_eq: i32 = 0;
+var g_anet_chunked_same: i32 = 0;
+var g_anet_404_ok: i32 = 0;
+var g_anet_cancel_eid: i32 = 0;
+var g_anet_cancel_ms: u64 = 0;
+
+// 服务端的单一回合：读掉请求头，回一段固定响应，然后关连接。
+// `second` 的第一段写完歇 120ms 再写第二段 —— 专门造「分片到达」。
+fn anet_serve_one(cfd: i32, which: i32) void {
+    var tmp: [byte: 2048] = [0: 2048];
+    var seen: usize = 0;
+    while seen < 2048 {
+        const n: isize = sys_read(cfd, &tmp[0], 2048) catch { 0 as isize; };
+        if n <= 0 {
+            break;
+        }
+        var i: usize = 0;
+        var found: bool = false;
+        while i + 3 < (n as usize) {
+            if tmp[i] == 13 && tmp[i + 1] == 10 &&
+                tmp[i + 2] == 13 && tmp[i + 3] == 10 {
+                found = true;
+                break;
+            }
+            i = i + 1;
+        }
+        if found {
+            break;
+        }
+        seen = seen + (n as usize);
+    }
+    if which == 0 {
+        _ = write_all_fd(cfd, ANET_RESP_CL, bufx_cstr_len(ANET_RESP_CL));
+    } else if which == 1 {
+        _ = write_all_fd(cfd, ANET_RESP_CHUNKED_A,
+            bufx_cstr_len(ANET_RESP_CHUNKED_A));
+        // 分片：歇一下再发后半段（客户端必须循环回来接着读）
+        _ = anet_msleep(120);
+        _ = write_all_fd(cfd, ANET_RESP_CHUNKED_B,
+            bufx_cstr_len(ANET_RESP_CHUNKED_B));
+    } else if which == 2 {
+        _ = write_all_fd(cfd, ANET_RESP_404, bufx_cstr_len(ANET_RESP_404));
+    } else {
+        // which == 3：只发头，体一个字节都不发（给取消用例用）
+        _ = write_all_fd(cfd,
+            "HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n" as &const byte,
+            40);
+        _ = anet_msleep(3000);
+    }
+}
+
+// 毫秒睡眠（同步；给子进程用，父进程不进事件循环）。
+fn anet_msleep(ms: u32) bool {
+    var ts: [byte: 16] = [0: 16];
+    const sec: u64 = (ms as u64) / (1000 as u64);
+    const nsec: u64 = ((ms as u64) % (1000 as u64)) * (1000000 as u64);
+    var i: usize = 0;
+    while i < 8 {
+        const sh: i32 = (i as i32) * 8;
+        ts[i] = (((sec >> sh) & (255 as u64)) as byte);
+        i = i + 1;
+    }
+    i = 0;
+    while i < 8 {
+        const sh2: i32 = (i as i32) * 8;
+        ts[8 + i] = (((nsec >> sh2) & (255 as u64)) as byte);
+        i = i + 1;
+    }
+    const r: !i32 = sys_nanosleep(&ts[0] as &void, null as &void);
+    _ = r catch {
+        return false;
+    };
+    return true;
+}
+
+// 起一个只服务一回合的服务端，返回端口（0 = 失败）。子进程收尾自己退。
+fn anet_spawn_server(which: i32) u16 {
+    const lfd: i32 = sys_socket(AF_INET, SOCK_STREAM, IPPROTO_TCP) catch {
+        return 0 as u16;
+    };
+    var one: i32 = 1;
+    _ = sys_setsockopt(lfd, SOL_SOCKET, SO_REUSEADDR,
+        &one as &void, 4 as u32) catch {};
+    var addr: [byte: 16] = [0: 16];
+    anet_sockaddr(0, &addr[0]);
+    const br: !i32 = sys_bind(lfd, &addr[0] as &void, 16 as u32);
+    _ = br catch {
+        _ = sys_close(lfd) catch {};
+        return 0 as u16;
+    };
+    _ = sys_listen(lfd, 8) catch {
+        _ = sys_close(lfd) catch {};
+        return 0 as u16;
+    };
+    var got: [byte: 16] = [0: 16];
+    var glen: u32 = 16;
+    _ = sys_getsockname(lfd, &got[0] as &void, &glen) catch {
+        _ = sys_close(lfd) catch {};
+        return 0 as u16;
+    };
+    const port: u16 = (((got[2] as u16) as u16) << (8 as i32)) |
+        (got[3] as u16);
+    const pid64: i64 = sys_fork() catch {
+        _ = sys_close(lfd) catch {};
+        return 0 as u16;
+    };
+    if pid64 == 0 {
+        // 每个用例要几条连接：定长/chunked/404 各两条（同步 + 异步），
+        // 取消那条只连一次就取消 —— 少服务一条，子进程才能及时退出（不留僵尸）。
+        var limit: i32 = 2;
+        if which == 3 {
+            limit = 1;
+        }
+        var keep: i32 = 0;
+        while keep < limit {
+            var peer: [byte: 16] = [0: 16];
+            var plen: u32 = 16;
+            const c: i32 = sys_accept(lfd, &peer[0] as &void, &plen) catch {
+                0 - 1;
+            };
+            if c < 0 {
+                break;
+            }
+            anet_serve_one(c, which);
+            _ = sys_close(c) catch {};
+            keep = keep + 1;
+        }
+        _ = sys_close(lfd) catch {};
+        sys_exit(0);
+    }
+    _ = sys_close(lfd) catch {};
+    return port;
+}
+
+// 填 IPv4 sockaddr（127.0.0.1:port）。
+fn anet_sockaddr(port: u16, out: &byte) void {
+    var i: usize = 0;
+    while i < 16 {
+        out[i] = 0;
+        i = i + 1;
+    }
+    out[0] = 2;
+    out[1] = 0;
+    const lo: u16 = port & (0xFF as u16);
+    const pnet: u16 = (lo << (8 as i32)) | (port >> (8 as i32));
+    out[2] = ((pnet & (255 as u16)) as byte);
+    out[3] = (((pnet >> 8) & (255 as u16)) as byte);
+    out[4] = 127;
+    out[5] = 0;
+    out[6] = 0;
+    out[7] = 1;
+}
+
+// 拼 URL 到 out（http://127.0.0.1:<port>/t）。
+fn anet_url(port: u16, out: &Buf) void {
+    buf_reset(out);
+    _ = buf_append_cstr(out, "http://127.0.0.1:");
+    _ = buf_append_u64(out, port as u64);
+    _ = buf_append_cstr(out, "/t");
+}
+
+// 同步路：整段读完，把 head / dec / status 交出来。
+fn anet_sync_get(url: &[byte], st: &HcStream, tc: &TlsConn) bool {
+    st[0] = hc_stream_empty();
+    const r: !void = hc_open(url, &"GET"[0: 3], &"X-A: 1"[0: 6],
+        "" as &const byte, 0 as usize, 5000 as u32, 65536 as usize,
+        HC_VERIFY_NONE, &""[0: 0], st, tc);
+    r catch {
+        return false;
+    };
+    while true {
+        const f: !i32 = hc_fill(st);
+        const v: i32 = f catch {
+            return false;
+        };
+        if v == 0 {
+            break;
+        }
+    }
+    return true;
+}
+
+// 异步路：同一份参数走 `ahc_open` / `ahc_fill`。
+@async_fn fn anet_async_get_run(
+    url: &[byte],
+    st: &HcStream,
+    tc: &TlsConn,
+    flag_out: &i32
+) Future<!i32> {
+    flag_out[0] = 0;
+    const r: !usize = @await ahc_open(url, &"GET"[0: 3],
+        &"X-A: 1"[0: 6], "" as &const byte, 0 as usize,
+        5000 as u32, 65536 as usize, HC_VERIFY_NONE,
+        &""[0: 0], st, tc);
+    _ = r catch {
+        return 0;
+    };
+    while true {
+        const f: !i32 = @await ahc_fill(st, 0 as u64);
+        const v: i32 = f catch {
+            return 0;
+        };
+        if v == 0 {
+            break;
+        }
+    }
+    flag_out[0] = 1;
+    return 0;
+}
+
+// 取消用例：等一个「只发头不发体」的服务端，中途置取消意图。
+@async_fn fn anet_cancel_run(
+    url: &[byte],
+    st: &HcStream,
+    tc: &TlsConn
+) Future<!i32> {
+    const r: !usize = @await ahc_open(url, &"GET"[0: 3],
+        &""[0: 0], "" as &const byte, 0 as usize,
+        30000 as u32, 65536 as usize, HC_VERIFY_NONE,
+        &""[0: 0], st, tc);
+    _ = r catch {
+        return 0;
+    };
+    const t0: u64 = ua_now_ms();
+    const f: !i32 = @await ahc_fill(st, 0 as u64);
+    var eid: i32 = 0;
+    const flag: i32 = f catch |err| {
+        eid = (@error_id(err) as! i32).value;
+        0 - 1;
+    };
+    _ = flag;
+    g_anet_cancel_eid = eid;
+    g_anet_cancel_ms = ua_now_ms() - t0;
+    return 0;
+}
+
+// 取消探针：第二帧就置取消意图（模拟用户按 esc）。
+struct AnetAbortFrame : RtFrame {
+    hits: i64,
+    fn rt_frame(self: &Self, now_ms: u64) void {
+        _ = now_ms;
+        self.hits = self.hits + 1;
+        if self.hits >= 2 {
+            rt_abort(RT_ABORT_TURN);
+        }
+    }
+}
+
+var g_anet_abort_frame: AnetAbortFrame = AnetAbortFrame{ hits: 0 };
+var g_anet_abort_frame_i: RtFrame = g_anet_abort_frame;
+
+// 两条路的响应是否逐字节相同（head 与 dec 各比一次）。
+fn anet_same(
+    sync_st: &const HcStream,
+    async_st: &const HcStream,
+    head_out: &i32,
+    body_out: &i32
+) void {
+    head_out[0] = 0;
+    body_out[0] = 0;
+    if sync_st.head.len == async_st.head.len &&
+        bufx_mem_eq(sync_st.head.ptr as &const byte,
+            async_st.head.ptr as &const byte, sync_st.head.len) {
+        head_out[0] = 1;
+    }
+    if sync_st.dec.len == async_st.dec.len &&
+        bufx_mem_eq(sync_st.dec.ptr as &const byte,
+            async_st.dec.ptr as &const byte, sync_st.dec.len) {
+        body_out[0] = 1;
+    }
+}
+
+// 跑一个用例：起服务端（两条连接）→ 同步一次 → 异步一次 → 比字节。
+fn anet_case(
+    tag: &const byte,
+    which: i32,
+    ok: &bool,
+    want_status: i32,
+    want_chunked: bool
+) void {
+    const port: u16 = anet_spawn_server(which);
+    if port == 0 {
+        ty_fail(tag, "起服务端失败", ok);
+        return;
+    }
+    var url: Buf = buf_new(128);
+    defer { buf_free(&url); }
+    anet_url(port, &url);
+    var s_st: HcStream = hc_stream_empty();
+    defer { hc_stream_free(&s_st); }
+    var s_tc: TlsConn = tls_conn_empty();
+    defer { tls_conn_free(&s_tc); }
+    if !anet_sync_get(url.ptr[0: url.len], &s_st, &s_tc) {
+        ty_fail(tag, "同步 hc_open/hc_fill 失败", ok);
+        return;
+    }
+    var a_st: HcStream = hc_stream_empty();
+    defer { hc_stream_free(&a_st); }
+    var a_tc: TlsConn = tls_conn_empty();
+    defer { tls_conn_free(&a_tc); }
+    var flag: i32 = 0;
+    rt_frame_clear();
+    rt_abort_reset();
+    const rc: i32 = rt_run(
+        anet_async_get_run(url.ptr[0: url.len], &a_st, &a_tc, &flag));
+    _ = rc;
+    if flag != 1 {
+        ty_fail(tag, "异步 ahc_open/ahc_fill 失败", ok);
+        return;
+    }
+    var h_eq: i32 = 0;
+    var b_eq: i32 = 0;
+    anet_same(&s_st, &a_st, &h_eq, &b_eq);
+    if h_eq != 1 {
+        ty_fail(tag, "两条路的响应头不是逐字节相同", ok);
+    }
+    if b_eq != 1 {
+        ty_fail(tag, "两条路解出来的体不是逐字节相同", ok);
+    }
+    if s_st.status != want_status || a_st.status != want_status {
+        ty_fail(tag, "状态码不对", ok);
+    }
+    if s_st.status == a_st.status {
+        g_anet_status_eq = g_anet_status_eq + 1;
+    } else {
+        ty_fail(tag, "两条路的状态码不一致", ok);
+    }
+    if s_st.chunked != want_chunked || a_st.chunked != want_chunked {
+        ty_fail(tag, "chunked 判定不对", ok);
+    }
+    if s_st.chunked == a_st.chunked {
+        g_anet_chunked_same = g_anet_chunked_same + 1;
+    } else {
+        ty_fail(tag, "两条路的 chunked 判定不一致", ok);
+    }
+    if h_eq == 1 {
+        g_anet_head_eq = g_anet_head_eq + 1;
+    }
+    if b_eq == 1 {
+        g_anet_body_eq = g_anet_body_eq + 1;
+    }
+    if want_status == 404 && h_eq == 1 {
+        g_anet_404_ok = 1;
+    }
+}
+
+// 轮入口：async-net。
+fn async_net_round(tag: &const byte) bool {
+    var ok: bool = true;
+    g_anet_head_eq = 0;
+    g_anet_body_eq = 0;
+    g_anet_status_eq = 0;
+    g_anet_chunked_same = 0;
+    g_anet_404_ok = 0;
+    g_anet_cancel_eid = 0;
+    g_anet_cancel_ms = 0;
+    rt_frame_clear();
+    rt_abort_reset();
+    // A：定长体
+    anet_case(tag, 0, &ok, 200, false);
+    // B：chunked 体（分片到达）
+    anet_case(tag, 1, &ok, 200, true);
+    // C：404
+    anet_case(tag, 2, &ok, 404, false);
+    // D：取消（只发头不发体，置取消意图之后必须很快收口）
+    const port: u16 = anet_spawn_server(3);
+    if port == 0 {
+        ty_fail(tag, "起服务端失败（取消用例）", &ok);
+    } else {
+        var url: Buf = buf_new(128);
+        defer { buf_free(&url); }
+        anet_url(port, &url);
+        var c_st: HcStream = hc_stream_empty();
+        defer { hc_stream_free(&c_st); }
+        var c_tc: TlsConn = tls_conn_empty();
+        defer { tls_conn_free(&c_tc); }
+        g_anet_abort_frame.hits = 0;
+        rt_set_frame(g_anet_abort_frame_i);
+        rt_abort_reset();
+        const rc: i32 = rt_run(
+            anet_cancel_run(url.ptr[0: url.len], &c_st, &c_tc));
+        _ = rc;
+        rt_frame_clear();
+        rt_abort_reset();
+        const cancel_id: i32 = (@error_id(error.Cancelled) as! i32).value;
+        if g_anet_cancel_eid != cancel_id {
+            ty_fail(tag, "流式等待中没有按取消收口（应当 error.Cancelled）", &ok);
+        }
+        if g_anet_cancel_ms > (600 as u64) {
+            ty_fail(tag, "取消收口太慢（>600ms）", &ok);
+        }
+    }
+    // 汇总：三条用例都要「头/体/状态码/chunked」四项一致
+    if g_anet_head_eq != 3 {
+        ty_fail(tag, "响应头逐字节相等的用例数不是 3", &ok);
+    }
+    if g_anet_body_eq != 3 {
+        ty_fail(tag, "解出来的体逐字节相等的用例数不是 3", &ok);
+    }
+    if g_anet_status_eq != 3 || g_anet_chunked_same != 3 {
+        ty_fail(tag, "状态码 / chunked 判定没有三例全一致", &ok);
+    }
+    if g_anet_404_ok != 1 {
+        ty_fail(tag, "404 那一例没有对齐", &ok);
+    }
+    if !ok {
+        return false;
+    }
+    out_err("selftest[");
+    out_err(tag);
+    out_err("] ok: 同步/异步逐字节一致（定长 · chunked 分片 · 404）+ 流式等待可取消\n");
+    return true;
+}

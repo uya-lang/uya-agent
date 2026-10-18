@@ -8993,3 +8993,52 @@ P101 子进程/文件/剪贴板/信号（文件按上面第 3 条做「分块让
 deadline≠0 的那条路上有一次读到 `0`（被当成 EOF）的现场没定死因（判据暂时由 `async-io`
 的 rtio 层覆盖）；`@async_fn` 里「两层嵌套 + 出参跨 await」的取值可疑，P99 动网络栈前
 先用最小复现钉一下。
+
+### 19.22 P99：网络数据面 async（`ahc_*`）与两条路的逐字节等价
+
+**这一段做了什么**：新增 `src/net/ahttp.uya`，把「发请求 → 读响应头 → 一条一条喂
+SSE/body」搬到事件循环上（`ahc_open` / `ahc_fill` / `ahc_connect` / `ahc_write_all`），
+并把 `httpstream` 的两处**判据**抽出来共用：`hc_head_finish`（头解析全部）与
+`hc_decode_step`（chunked / Content-Length / EOF 状态机）。`httpc` 抽出
+`hc_addr_into`（名字 → sockaddr，localhost / 点分四段 / 解析器三档一处判）与
+`hc_note_route`（诊断记账两行一处判）。
+
+**分工与边界（如实记录，这是本轮最需要看清楚的一格）**：
+
+| 阶段 | 谁在等 | 能不能被 esc 打断 | 为什么 |
+|---|---|---|---|
+| 名字解析 | 同步（`hc_addr_into` 内部的解析器） | 不能（≤5 s） | 这是 `lib/tls`/解析器调用内部，插不进泵点；DESIGN §15.1 早就记着 |
+| TCP 连接 | **async**（非阻塞 connect + 等可写 + `SO_ERROR`） | **能** | `rt_connect` 的 EINPROGRESS 循环，片间判取消 |
+| TLS 握手 | 同步（阻塞 fd + `SO_RCVTIMEO`，握完切回非阻塞） | 不能（≤`timeout_ms`） | **`https_client_handshake` 不可续**：它每次调用都从 ClientHello 重来，非阻塞 fd 上遇到 EAGAIN 之后重试会**重发 ClientHello**（std 的 `https_handshake_async` 就是这条路，所以本仓不用它）。要真正异步，得先把那个函数改成可续 —— 单独一轮 |
+| 写请求 / 读头 / 读体（SSE） | **async** | **能** | 这才是用户感知的那一段：网关 prefill 与逐 token 流式 |
+
+**为什么不手写一份 async 握手**（有人会想这么干）：握手有 4 步、3 处「读到 ServerHelloDone
+为止」的边界判定，还要叠会话复用与四档信任策略。复制一份 = 复制一套很容易漂移的协议
+判据；而收益只是「DNS 与握手这 ≤5 s / ≤`timeout_ms` 也能被打断」。先记在台账上，
+等 `https_client_handshake` 改可续时两边一起收。
+
+**判据（`async-net` 轮）**：
+
+| 判据 | 怎么测 | 防假绿（真做过） |
+|---|---|---|
+| 定长体 | 同一个假服务端，同步 `hc_open`+`hc_fill` 与 async `ahc_open`+`ahc_fill` 各走一遍，比 `st.head` / `st.dec` **原字节** | 把 async 路的 `hc_head_finish` 换成「只挑状态码」⇒ 头与体两条判据当场红（实测） |
+| chunked 分片 | 服务端先发一段 chunk、**歇 120 ms** 再发第二段 —— 测 `ahc_fill` 的「暂时没数据」循环 | 同上（chunked 判定不一致） |
+| 404 | 两条路都拿到 404 且头相同 | 同上 |
+| 流式等待可取消 | 服务端只发头不发体（3 s），第二帧置取消意图 ⇒ `error.Cancelled` 且 ≤600 ms 收口 | 去掉 rtio 的取消闸门 ⇒ 会等满 30 s（deadline 预算内） |
+
+**顺带修掉的编译器缺口（第二个，本轮）**：`@async_fn` 里 `catch |err| { return err; }`
+**丢掉 error_id** —— 返回表达式是标识符且它是错误值时，async 的 return 只认
+`AST_ERROR_VALUE`（`return error.X;` 字面量），于是掉进「包装成 Ready(ok(expr))」那一支，
+发成 `{ .error_id = 0, .value = err }`：错误变成**成功值**，`@error_id` 拿到 0。
+实测症状是「深 5 层 async 调用链，最内层的 `AsyncDeadlineExceeded` 到顶层变成成功」。
+修法在 `../uya` 的 `c99_async_emit_poll_error_ident_return`，回归
+`../uya/tests/test_async_catch_reraise.uya`，`make b` 自举字节一致。
+**这条缺口不修，后面所有「async 层层套」的代码都是在静默吞错。**
+
+**还没做（P99 的剩余部分 + 后面几段）**：`llm_stream_*_async`（把 `llm_stream_style`
+的读流循环换成 `ahc_fill`，解析仍走 `llm_handle_payload`）→ 回合链 `agent_step_*_async`
+（一次性 / REPL / TUI 都走 `rt_run`）→ 泵点退役（P100）→ 子进程/文件/剪贴板/信号
+（P101，文件按 §19.21 第 3 条做「分块让点」）→ 侧路并发（P102，**前置：`tls_noise_mute`
+引用计数**）。**已知遗留**：① DNS 与 TLS 握手仍未 async（上表已写明原因与前置条件）；
+② `@async_fn` 的 `!void` 不受支持（用 `Future<!usize>` 返回 0 代替）；
+③ `const r: !T = <T 表达式>;` 不装箱（同步函数也红，与本轮无关的既有缺口）。

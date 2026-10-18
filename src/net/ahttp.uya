@@ -1,0 +1,323 @@
+// src/net/ahttp.uya — 异步 HTTP/1.1 客户端（P99）：与 `hc_open`/`hc_fill` 同语义
+//
+// 本文件：把 `httpstream` 的「发请求 → 读响应头 → 一条一条喂 SSE/body」那套循环
+//     搬到事件循环上：`ahc_open` / `ahc_fill`。**解析全部复用现有件**
+//     （`url_parse` / `hc_route_for` / `hc_build_request` / `hc_head_finish` /
+//     `hc_decode_step`），本文件只负责「谁去等 I/O」。
+//
+// 不变量：
+//   ① **判据只有一份**：请求行形态（相对 / 绝对形式）、响应头解析（状态码 /
+//      Content-Length / Transfer-Encoding）、chunked 与 Content-Length 的优先级、
+//      EOF 语义 —— 全部调 `httpc`/`httpstream` 里那几支，本文件一条都不复刻。
+//      谁要改语义，改那边，两边一起生效。
+//   ② 连接阶段（名字解析 + TCP + TLS 握手）**仍是同步的**：DNS ≤5 s、握手 ≤
+//      `timeout_ms`，与改造前逐字节相同（DESIGN §15.1 记的那条边界）。数据阶段
+//      （写请求、读头、读体/SSE）全部 async —— 那才是「流式期间能按 esc」的部分。
+//      握手要真正异步，得先把 `https_client_handshake` 改成可续（它现在每次调用
+//      都从 ClientHello 重来，非阻塞 fd 上会重发），那是另一轮。
+//   ③ 连上之后 fd **立刻切非阻塞**（`rt_set_nonblock`）：此后所有读写都走 `rtio`
+//      的 EAGAIN→等就绪→重试循环；漏了这一步，`rt_read` 会在阻塞 fd 上把事件循环
+//      停住（那正是本轮要消灭的东西）。
+//
+// 依赖：src/rt/rtloop.uya（取消 / 定时）、src/rt/rtio.uya（`rt_read` / `rt_write` /
+//   `rt_connect` / `rt_set_nonblock`）、src/net/httpc.uya（`url_parse` /
+//   `hc_route_for` / `hc_connect` / `tcp_connect` / `hc_addr_into` /
+//   `tls_open` / `build_request`）、
+//   src/net/httpstream.uya（`hc_head_finish` / `hc_decode_step`）。
+// 命名：`ahc_*`、`AHC_*`。
+
+use std.async;
+use libc.syscall;
+
+// 一次最多读多少 wire 字节（与 httpstream 的 `HC_READ_CHUNK` 同值）。
+const AHC_READ_CHUNK: usize = 16384;
+// 响应头上限（与 httpstream 的 `HC_HEAD_MAX` 同值：超了就是坏响应）。
+// **两处同值改一处要改两处** —— 判据在 httpstream，这里只是提前挡住无界增长。
+const AHC_HEAD_MAX: usize = 65536;
+
+// async 建连：**只有 TCP 连接那一步是异步的**（非阻塞 connect + 等可写 + SO_ERROR）。
+//
+// 名字解析仍同步（`hc_addr_into` 内部走解析器，≤5 s，见文件头不变量②）；代理隧道
+// （`HC_ROUTE_TUNNEL`）整段回落到同步的 `hc_connect`：它要发 CONNECT 再读应答，
+// 与握手同一档，留到把「可续的读应答」做出来之后一起搬。
+@async_fn fn ahc_connect_run(
+    u: &const Url,
+    timeout_ms: u32,
+    route_inout: &u8
+) Future<!i32> {
+    route_inout[0] = hc_route_for(u);
+    hc_note_route(route_inout[0]);
+    if route_inout[0] == HC_ROUTE_TUNNEL {
+        const fd_sync: i32 = try hc_connect(u, timeout_ms, route_inout);
+        rt_set_nonblock(fd_sync);
+        return fd_sync;
+    }
+    var host: &const byte = url_host(u);
+    var host_len: usize = u.host_len;
+    var port: u16 = u.port;
+    if route_inout[0] == HC_ROUTE_PROXY_ABS {
+        hpx_note_target(host, host_len, port);
+        host = hpx_host_ptr();
+        host_len = hpx_host_len();
+        port = hpx_port();
+    }
+    var addr: [byte: 16] = [0: 16];
+    var alen: u32 = 16;
+    const ar: !void = hc_addr_into(
+        host, host_len, port, timeout_ms, &addr[0], &alen);
+    ar catch |err| {
+        return err;
+    };
+    const fd: i32 = sys_socket(AF_INET, SOCK_STREAM, IPPROTO_TCP) catch {
+        return error.HcConnectFailed;
+    };
+    rt_set_nonblock(fd);
+    var dl: u64 = 0;
+    if timeout_ms > 0 {
+        dl = deadline_after_ms(timeout_ms) catch { 0 as u64; };
+    }
+    const cr: !usize = @await rt_connect(fd, &addr[0] as &const void, alen, dl);
+    cr catch |err| {
+        _ = sys_close(fd) catch {};
+        const eid: i32 = (@error_id(err) as! i32).value;
+        if eid == (@error_id(error.Cancelled) as! i32).value {
+            return error.Cancelled;
+        }
+        if route_inout[0] == HC_ROUTE_PROXY_ABS {
+            hpx_note_fail(HPX_E_DIAL, 0);
+            return error.HcProxyUnavailable;
+        }
+        return error.HcConnectFailed;
+    };
+    if route_inout[0] == HC_ROUTE_PROXY_ABS {
+        hpx_note_ok();
+    }
+    return fd;
+}
+
+// 对外入口：返回可用的 fd（连上之后已是非阻塞）。
+export fn ahc_connect(
+    u: &const Url,
+    timeout_ms: u32,
+    route_inout: &u8
+) Future<!i32> {
+    return ahc_connect_run(u, timeout_ms, route_inout);
+}
+
+// 写满整段（请求体可能上百 KB：分片写，片间由 rtio 等可写）。
+@async_fn fn ahc_write_all_run(
+    fd: i32,
+    src: &const byte,
+    len: usize,
+    deadline_ms: u64
+) Future<!usize> {
+    const r: !usize = @await rt_write(fd, src, len, deadline_ms);
+    const n: usize = try r;
+    return n;
+}
+
+// 对外入口。
+export fn ahc_write_all(
+    fd: i32,
+    src: &const byte,
+    len: usize,
+    deadline_ms: u64
+) Future<!usize> {
+    return ahc_write_all_run(fd, src, len, deadline_ms);
+}
+
+// async 版的 `hc_open`：建连（TCP 异步 / 握手同步一次）→ 拼请求 → 异步写 →
+// 异步读到响应头结束 → 交给 `hc_head_finish` 解析 → 预解一次体。
+//
+// 参数与错误码与 `hc_open` **逐一对应**（调用方换名字即可）。返回值固定 0 ——
+// `@async_fn` 的返回类型必须是 `Future<!T>`，而 `!void` 在 async 里不被接受
+// （`Future<!void>` + `return;` 检查器直接拒），所以用 `usize` 0 表示「已就绪」，
+// 成败只看 error 分支（与 `hg_open` 的 `!void` 语义等价）。
+@async_fn fn ahc_open_run(
+    url: &[byte],
+    method: &[byte],
+    extra_headers: &[byte],
+    body: &const byte,
+    body_len: usize,
+    timeout_ms: u32,
+    max_body: usize,
+    verify: i32,
+    pin: &[byte],
+    st: &HcStream,
+    tls_out: &TlsConn
+) Future<!usize> {
+    var u: Url = url_empty();
+    try url_parse(url, &u);
+    defer { url_free(&u); }
+
+    var route: u8 = HC_ROUTE_DIRECT;
+    const cfd: !i32 = @await ahc_connect_run(&u, timeout_ms, &route);
+    const fd: i32 = try cfd;
+    st.fd = fd;
+    st.is_tls = u.tls;
+    st.tc = tls_out;
+    st.max_body = max_body;
+
+    tls_out.fd = fd;
+    var conn: HcConn = HcConn{ fd: fd, is_tls: u.tls, tc: tls_out };
+    if u.tls {
+        // 握手这一段要的是「阻塞 fd + SO_RCVTIMEO」（见文件头不变量②）：
+        // 先切回阻塞，握完再切非阻塞。
+        rt_set_blocking(fd);
+        var rc_guard: i32 = 0;
+        const tr: !void = tls_open(
+            tls_out, url_host(&u), u.host_len, verify, pin);
+        tr catch |err| {
+            rc_guard = 1;
+            _ = sys_close(fd) catch {};
+            return err;
+        };
+        _ = rc_guard;
+        rt_set_nonblock(fd);
+    }
+
+    var req: Buf = buf_new(4096);
+    defer { buf_free(&req); }
+    if !buf_valid(&req) {
+        _ = sys_close(fd) catch {};
+        return error.HcOutOfMemory;
+    }
+    if !build_request(&u, method, extra_headers, body_len, route, &req) {
+        _ = sys_close(fd) catch {};
+        return error.HcOutOfMemory;
+    }
+    if !buf_append(&req, body, body_len) {
+        _ = sys_close(fd) catch {};
+        return error.HcOutOfMemory;
+    }
+    var dl: u64 = 0;
+    if timeout_ms > 0 {
+        dl = deadline_after_ms(timeout_ms) catch { 0 as u64; };
+    }
+    const wr: !usize = @await rt_write(fd, &req.ptr[0], req.len, dl);
+    _ = wr catch |err| {
+        _ = sys_close(fd) catch {};
+        return err;
+    };
+
+    st.head = buf_new(512);
+    st.rx = buf_new(AHC_READ_CHUNK * 2);
+    st.dec = buf_new(AHC_READ_CHUNK);
+    if !buf_valid(&st.head) || !buf_valid(&st.rx) || !buf_valid(&st.dec) {
+        _ = sys_close(fd) catch {};
+        return error.HcOutOfMemory;
+    }
+
+    // 读到响应头结束（"\r\n\r\n"）。等待期间**帧回调照常跑**（rt 的 wrapper 负责），
+    // 所以网关 prefill 那几秒里界面不冻、esc 也能当场收口（rtio 的取消闸门）。
+    var tmp: [byte: AHC_READ_CHUNK] = [0: AHC_READ_CHUNK];
+    var head_end: usize = 0;
+    while true {
+        const view: &[byte] = st.rx.ptr[0: st.rx.len];
+        const he: isize = find_sub(view, &"\r\n\r\n"[0: 4], 0);
+        if he >= 0 {
+            head_end = (he as usize) + 4;
+            break;
+        }
+        if st.rx.len > AHC_HEAD_MAX {
+            _ = sys_close(fd) catch {};
+            return error.HcBadResponse;
+        }
+        var got: usize = 0;
+        const rr: !usize = @await rt_read(
+            fd, &tmp[0], AHC_READ_CHUNK, dl, &got);
+        const flag: usize = rr catch |err| {
+            _ = sys_close(fd) catch {};
+            return err;
+        };
+        if flag == 0 || got == 0 {
+            // 头都没读完就断了（与同步路 `n == 0 ⇒ HcBadResponse` 同判据）
+            _ = sys_close(fd) catch {};
+            return error.HcBadResponse;
+        }
+        if !buf_append(&st.rx, &tmp[0], got) {
+            _ = sys_close(fd) catch {};
+            return error.HcOutOfMemory;
+        }
+    }
+    try hc_head_finish(st, head_end);
+    // 头后面可能已经跟着体字节：立刻解一次（与同步路同一步）
+    const d0: !i32 = hc_decode_step(st);
+    _ = d0 catch {
+        0 as i32;
+    };
+    return 0 as usize;
+}
+
+// 对外入口。
+export fn ahc_open(
+    url: &[byte],
+    method: &[byte],
+    extra_headers: &[byte],
+    body: &const byte,
+    body_len: usize,
+    timeout_ms: u32,
+    max_body: usize,
+    verify: i32,
+    pin: &[byte],
+    st: &HcStream,
+    tls_out: &TlsConn
+) Future<!usize> {
+    return ahc_open_run(url, method, extra_headers, body, body_len, timeout_ms,
+        max_body, verify, pin, st, tls_out);
+}
+
+// async 版的 `hc_fill`：读一次网络并推进解码。返回码与 `hc_fill` 逐一对应
+// （1 = 有进展，0 = 体已结束，2 = 暂时没数据 —— 这里没有「暂时」：await 一直等到
+// 有数据或 deadline，所以只回 1 / 0）。
+@async_fn fn ahc_fill_run(st: &HcStream, deadline_ms: u64) Future<!i32> {
+    const d0: i32 = try hc_decode_step(st);
+    if d0 == 1 {
+        return 1 as i32;
+    }
+    if hc_body_done(st) {
+        st.eof = true;
+        return 0 as i32;
+    }
+    var tmp: [byte: AHC_READ_CHUNK] = [0: AHC_READ_CHUNK];
+    var got: usize = 0;
+    const rr: !usize = @await rt_read(
+        st.fd, &tmp[0], AHC_READ_CHUNK, deadline_ms, &got);
+    const flag: usize = rr catch |err| {
+        return err;
+    };
+    if flag == 0 || got == 0 {
+        // 对端关连接：先尽量把手里剩下的 rx 解完，再报结束（与 `hc_fill` 同判据）
+        st.net_eof = true;
+        const d1: i32 = try hc_decode_step(st);
+        if hc_body_done(st) || d1 == 0 {
+            st.eof = true;
+            return 0 as i32;
+        }
+        return 1 as i32;
+    }
+    if !buf_append(&st.rx, &tmp[0], got) {
+        return error.HcOutOfMemory;
+    }
+    if st.rx.len > st.max_body + AHC_HEAD_MAX + AHC_READ_CHUNK {
+        return error.HcTooLarge;
+    }
+    if st.rx_off > 0 && st.rx_off >= st.rx.len / 2 {
+        buf_drop_prefix(&st.rx, st.rx_off);
+        st.rx_off = 0;
+    }
+    const d2: i32 = try hc_decode_step(st);
+    if d2 == 1 {
+        return 1 as i32;
+    }
+    if hc_body_done(st) {
+        st.eof = true;
+        return 0 as i32;
+    }
+    return 2 as i32;
+}
+
+// 对外入口。
+export fn ahc_fill(st: &HcStream, deadline_ms: u64) Future<!i32> {
+    return ahc_fill_run(st, deadline_ms);
+}
