@@ -1,0 +1,404 @@
+// src/term/tui/queue.uya — 全屏 TUI：待发队列（还没送出去的提示词）
+//
+// 本文件：待发队列的**两份来源**与它们合成的那一块显示 ——
+//   ① **提交槽**（FIFO，最多 `TUI_SUBMIT_MAX` 条）：用户回车之后、被 `tui_take_submit`
+//      取走之前的那几行（TUI 自己知道；消费者只有 llm_pump_input / 主循环 / 问答三处）；
+//   ② **执行中的输入快照**（`tui_queue_set`）：agent 侧把 steer 收件箱里还没被领取的
+//      那几条推过来（「上层推、下层画」，与 `tasks_latest` 同一套分工）。
+//   两者合成**一块**，画在常驻状态区之上、常驻任务块之下。
+// 不变量：① 空队列 = **0 行**（版面与 P105 之前逐字节相同，`--tui-demo` 是判据）；
+//   ② 提交槽是 FIFO，且**不静默顶掉**已有条目（满 8 条丢新的，文本留在输入行里）；
+//   ③ 块里只画**一行一条**、过 `tui_clean_line_into`（ESC / TAB / NUL 一个都不进帧）；
+//   ④ 快照内容没变**不置脏**（这个函数挂在每个泵点上，流式每 ≤50ms 一次，白刷帧
+//   就等于把帧 diff 全废掉）。
+// 依赖：style（tui_row_new / tui_put* / tui_mark_dirty）、entry（TUI_PREFIX_COL /
+//   tui_clean_line_into）、foundation/bufx（Buf 与拼接）。
+// 命名：本目录统一 `tui_` / `TUI_` 前缀；内部 `tq_*` + `g_tq*`（模块级名字全局合并）。
+
+use libc.syscall;
+use libc.unistd;
+use libc.heap;
+
+// ============================================================
+// 上限（口径见 DESIGN §19.29 的上限表）
+// ============================================================
+
+// 提交槽的条数上限。与 `session/inbox.uya` 的 `INBOX_MAX` 同值：提交槽的下一站就是
+// 那个收件箱，两边容量对齐就不用担心「这里收下了、那里装不下」。
+export const TUI_SUBMIT_MAX: usize = 8;
+
+// 单条上限（与 inbox 的 `INBOX_ITEM_MAX` 同值，也就是输入行上限）。
+// 超了当场拒：文本留在输入行里，用户自己决定删一截还是拆两条。
+export const TUI_QUEUE_ITEM_MAX: usize = 200000;
+
+// 块最多几行：头行 + 至多 2 条 + 末行「… 还有 N 条」。
+// 为什么这么小：块画在转录与输入框之间，它每多一行转录就少一行 —— 待发队列是
+// 「让你知道有东西在排队」，不是「让你读完全文」（全文在输入行与转录里都有）。
+export const TUI_QUEUE_MAX_ROWS: usize = 4;
+
+// 一条在块里最多取多少**字节**（不是列 —— 列由 tui_put_clipped 按可用宽度裁）。
+// 512 与 NOTICE 单条上限同量级：够看清是哪一条，又不至于让拼接开销失真。
+const TUI_QUEUE_LINE_MAX: usize = 512;
+
+// ============================================================
+// 状态
+// ============================================================
+
+// 提交槽：定长数组 + len（uya 没有动态数组）。空槽是零值 Buf，push 时才 buf_new。
+export struct TuiSubmit {
+    items: [Buf: TUI_SUBMIT_MAX],
+    len: usize,
+}
+
+var g_tq: TuiSubmit = TuiSubmit{ items: [], len: 0 };
+
+// 执行中输入的**显示快照**（一行一条，由 agent 侧推来；见 tui_queue_set）。
+var g_tq_snap: Buf = Buf{ ptr: null, len: 0, cap: 0 };
+var g_tq_snap_n: usize = 0;      // 快照里有几行（0 = 没有）
+
+// 这一帧的块高：排版侧（screen.uya 的 home/chat）写，浮层重画与自测读 ——
+// 两处必须是**同一个值**，否则开一次浮层就会把块与状态行错开一行。
+var g_tq_h: usize = 0;
+
+// 惰性分配快照缓冲（幂等）。提交槽不用预分配：槽位是零值 Buf。
+fn tq_ensure() void {
+    if !buf_valid(&g_tq_snap) {
+        g_tq_snap = buf_new(16384);
+    }
+}
+
+// 重数快照的行数（写入之后调一次）。口径与 tui_tasks_refresh 一致：
+// `'\n'` 的个数 + 末尾没有 `'\n'` 时补一行；空快照 = 0 行。
+fn tq_count_snap() void {
+    g_tq_snap_n = 0;
+    if !buf_valid(&g_tq_snap) || g_tq_snap.len == 0 {
+        return;
+    }
+    var c: usize = 0;
+    var i: usize = 0;
+    while i < g_tq_snap.len {
+        if g_tq_snap.ptr[i] == 10 as byte {
+            c = c + 1;
+        }
+        i = i + 1;
+    }
+    if g_tq_snap.ptr[g_tq_snap.len - 1] != 10 as byte {
+        c = c + 1;
+    }
+    g_tq_snap_n = c;
+}
+
+// ============================================================
+// 提交槽（FIFO）
+// ============================================================
+
+// 压一条进提交槽（**尾部追加**）。n == 0 / n > TUI_QUEUE_ITEM_MAX / 满 8 条 ⇒ 返回
+// false 且什么都不改 —— 调用方（tui_do_submit）据此把文本留在输入行里，别静默丢掉。
+//
+// 为什么满了丢新的、不顶掉最旧的：这几条都是用户亲手敲的，而且**顺序有意义**
+// （下一条任务常常依赖上一条的结果）。旧实现是单格 `buf_reset` —— 长工具跑着时
+// 敲第二条，第一条就无声无息地没了（用户报的「执行中敲的提示词没地方显示」的另一半）。
+export fn tui_submit_push(p: &const byte, n: usize) bool {
+    if n == 0 || n > TUI_QUEUE_ITEM_MAX {
+        return false;
+    }
+    const idx: usize = g_tq.len;
+    if idx >= TUI_SUBMIT_MAX {
+        return false;
+    }
+    const slot: &Buf = &g_tq.items[idx];
+    slot[0] = buf_new(n + 8);
+    if !buf_valid(&slot[0]) {
+        return false;
+    }
+    if !buf_append(&slot[0], p, n) {
+        buf_free(&slot[0]);
+        return false;
+    }
+    g_tq.len = idx + 1;
+    tui_mark_dirty();
+    return true;
+}
+
+// 取走**队首**那一条（消费：内容拷到 out，槽位释放、后面的整体前移）。
+// 没有就返回 false、out 不动。口径与 inbox_pop 一字不差（FIFO，领取即拥有）。
+export fn tui_take_submit(out: &Buf) bool {
+    if g_tq.len == 0 {
+        return false;
+    }
+    buf_reset(out);
+    if !buf_append(out, g_tq.items[0].ptr as &const byte, g_tq.items[0].len) {
+        return false;
+    }
+    buf_free(&g_tq.items[0]);
+    var i: usize = 0;
+    while i + 1 < g_tq.len {
+        g_tq.items[i] = g_tq.items[i + 1];
+        i = i + 1;
+    }
+    g_tq.len = g_tq.len - 1;
+    // 队尾的槽位已经被搬走（复制语义），清成零值 —— 不清的话 len 降下来之后那个
+    // 槽位仍持着堆内存，看起来像「还有一条」，reset 时才被释放（内存不丢，但记账乱）。
+    g_tq.items[g_tq.len] = buf_empty();
+    tui_mark_dirty();
+    return true;
+}
+
+// 只看**队首**那一条、**不消费**（P46 沿用：泵点上要先判断「这行是不是只读命令」，
+// 是就当场派发，不是就一个字节都不动，原样留给 llm_pump_input / 主循环）。
+export fn tui_peek_submit(out: &Buf) bool {
+    if g_tq.len == 0 {
+        return false;
+    }
+    buf_reset(out);
+    _ = buf_append(out, g_tq.items[0].ptr as &const byte, g_tq.items[0].len);
+    return true;
+}
+
+// 有没有还没被取走的提交行。
+export fn tui_has_submit() bool {
+    return g_tq.len > 0;
+}
+
+// 提交槽里现存的条数（自测断言用；显示层的总数走 tui_queue_total）。
+export fn tui_submit_count() usize {
+    return g_tq.len;
+}
+
+// 取**最新**一条（队尾）—— `ask_user_question` 那条路专用。
+//
+// 为什么不是队首：提问期间用户敲的那一行排在**所有已排队提示词之后**，拿队首
+// 等于把一条本该发给模型的提示词当成答案吃掉（单格时代没这个问题，因为一敲就把
+// 上一条顶掉了 —— 那更糟；多格之后必须在取用口上把两支分开）。
+export fn tui_take_submit_last(out: &Buf) bool {
+    if g_tq.len == 0 {
+        return false;
+    }
+    const idx: usize = g_tq.len - 1;
+    // 证明器只认「正的 if 里做索引」：`g_tq.len <= TUI_SUBMIT_MAX` 这条不变量它推不出来，
+    // 所以这里显式再夹一次（永远不成立，正是防御的那一半）。
+    if idx >= TUI_SUBMIT_MAX {
+        return false;
+    }
+    buf_reset(out);
+    const slot: &Buf = &g_tq.items[idx];
+    if !buf_append(out, slot[0].ptr as &const byte, slot[0].len) {
+        return false;
+    }
+    buf_free(&g_tq.items[idx]);
+    g_tq.len = idx;
+    tui_mark_dirty();
+    return true;
+}
+
+// ============================================================
+// 执行中输入的显示快照（agent 侧推）
+// ============================================================
+
+// 整体替换快照（一行一条、`'\n'` 分隔；空串 = 清空）。
+// 内容**没变就不动、不置脏** —— 调用方是泵点（流式每 ≤50ms 一次）。
+export fn tui_queue_set(p: &const byte, n: usize) void {
+    tq_ensure();
+    if g_tq_snap.len == n && n == 0 {
+        return;
+    }
+    if g_tq_snap.len == n
+        && bufx_mem_eq(g_tq_snap.ptr as &const byte, p, n) {
+        return;
+    }
+    buf_reset(&g_tq_snap);
+    _ = buf_append(&g_tq_snap, p, n);
+    tq_count_snap();
+    tui_mark_dirty();
+}
+
+// 两份来源一共几**条**（提交槽在前、执行中快照在后 —— 显示顺序就是这个顺序）。
+export fn tui_queue_total() usize {
+    return g_tq.len + g_tq_snap_n;
+}
+
+// ============================================================
+// 那一块：行预算 + 绘制
+// ============================================================
+
+// 这一帧想画几行（0 = 不画 → 版面与 P105 之前逐字节相同）。
+export fn tui_queue_rows() usize {
+    const total: usize = tui_queue_total();
+    if total == 0 {
+        return 0;
+    }
+    const avail: usize = TUI_QUEUE_MAX_ROWS - 1;    // 扣掉头行
+    if total <= avail {
+        return 1 + total;
+    }
+    return TUI_QUEUE_MAX_ROWS;
+}
+
+// 按「最多能给几行」夹一次，并把结果记进 g_tq_h（浮层重画那段要读同一个值）。
+// room == 0 ⇒ 整块让位：窄终端里优先丢它 —— 转录、状态行、面板都比它关键。
+export fn tui_queue_prepare(room: usize) usize {
+    var h: usize = tui_queue_rows();
+    if h > room {
+        h = room;
+    }
+    g_tq_h = h;
+    return h;
+}
+
+// 上一帧定下的块高（浮层重画与自测断言读它）。
+export fn tui_queue_height() usize {
+    return g_tq_h;
+}
+
+// 把第 i 条（0 基，按显示顺序）**在块里要显示的那一行**清洗后写进 out（先 reset）。
+//
+// 只取第一条物理行：多行提示词在块里占一行（整块最多 4 行，摊开就把转录挤没了），
+// 全文在输入行与转录里都看得到。清洗走 tui_clean_line_into —— 与输入行同一口径
+// （粘进来的彩色文本 / TAB 不许改写终端状态，行内 '\n' 不许把一行拆成两行）。
+fn tq_item_line(i: usize, out: &Buf) void {
+    buf_reset(out);
+    // `i < TUI_SUBMIT_MAX &&` 是给**检查器**看的：它推不出 `g_tq.len <= TUI_SUBMIT_MAX`，
+    // 只看后者时「数组索引安全证明」会失败（前者永远真，不改变语义）。
+    if i < TUI_SUBMIT_MAX && i < g_tq.len {
+        const slot: &Buf = &g_tq.items[i];
+        var n: usize = slot[0].len;
+        var k: usize = 0;
+        while k < n {
+            if slot[0].ptr[k] == 10 as byte {
+                n = k;
+                break;
+            }
+            k = k + 1;
+        }
+        if n > TUI_QUEUE_LINE_MAX {
+            n = TUI_QUEUE_LINE_MAX;
+        }
+        tui_clean_line_into(out, slot[0].ptr as &const byte, n);
+        return;
+    }
+    // 快照那一段：按 '\n' 切到第 (i - len) 行
+    if !buf_valid(&g_tq_snap) {
+        return;
+    }
+    const at: usize = i - g_tq.len;
+    var line: usize = 0;
+    var start: usize = 0;
+    var p: usize = 0;
+    while p <= g_tq_snap.len {
+        if p == g_tq_snap.len || g_tq_snap.ptr[p] == 10 as byte {
+            if line == at {
+                var n: usize = p - start;
+                if n > TUI_QUEUE_LINE_MAX {
+                    n = TUI_QUEUE_LINE_MAX;
+                }
+                const src: &byte = g_tq_snap.ptr + start;
+                const base: &const byte = src as &const byte;
+                tui_clean_line_into(out, base, n);
+                return;
+            }
+            line = line + 1;
+            start = p + 1;
+        }
+        p = p + 1;
+    }
+}
+
+// 待发队列块：最多 h 行（h 由 tui_queue_prepare 定），返回画完后的行号。
+//
+// 版式（h 够的时候）：
+//   · 待发 2 条（还没送出）
+//     1. 把 hello.uya 的问候语改成 Hello, uya!
+//     2. 再补一条测试
+// 条数超过预算就把最后一条换成「… 还有 N 条」（与常驻任务块同一套收尾）。
+// h == 0（没有待发条目，或窄到放不下）时**一个字节都不写** —— 与 tui_draw_tasks_block
+// 同一条纪律：块为空时版面逐字节不变。
+fn tui_draw_queue_block(h: usize, r_in: usize) usize {
+    var r: usize = r_in;
+    const total: usize = tui_queue_total();
+    if h == 0 || total == 0 {
+        return r;
+    }
+    const indent: usize = TUI_PREFIX_COL + 2;
+    var avail_c: usize = 1;
+    if g_tui_cols > indent + 2 {
+        avail_c = g_tui_cols - indent - 2;
+    }
+    // 1) 头行：条数（不写「排队中」那种含糊话 —— 「还没送出」是这一块的全部信息）
+    var head: Buf = buf_new(96);
+    defer { buf_free(&head); }
+    _ = buf_append_cstr(&head, "· 待发 ");
+    _ = buf_append_u64(&head, total as u64);
+    _ = buf_append_cstr(&head, " 条（还没送出）");
+    tui_row_new();
+    tui_pad_to(TUI_PREFIX_COL);
+    tui_put_clipped(head.ptr as &const byte, head.len, avail_c, TUI_ST_ACCENT);
+    tui_fill_row(g_tui_cols);
+    r = r + 1;
+    if h <= 1 {
+        return r;
+    }
+    // 2) 条目行：超预算时留一行给收尾
+    const room: usize = h - 1;
+    var want: usize = total;
+    var clipped: bool = false;
+    if want > room {
+        want = room - 1;
+        clipped = true;
+    }
+    var one: Buf = buf_new(TUI_QUEUE_LINE_MAX * 4 + 64);
+    defer { buf_free(&one); }
+    var num: Buf = buf_new(32);
+    defer { buf_free(&num); }
+    var i: usize = 0;
+    while i < want {
+        tq_item_line(i, &one);
+        buf_reset(&num);
+        _ = buf_append_u64(&num, (i + 1) as u64);
+        _ = buf_append_cstr(&num, ". ");
+        var iw: usize = 1;
+        if avail_c > num.len + 1 {
+            iw = avail_c - num.len;
+        }
+        tui_row_new();
+        tui_pad_to(indent);
+        tui_put(num.ptr as &const byte, num.len, TUI_ST_DIM);
+        tui_put_clipped(one.ptr as &const byte, one.len, iw, TUI_ST_DEFAULT);
+        tui_fill_row(g_tui_cols);
+        r = r + 1;
+        i = i + 1;
+    }
+    // 3) 收尾行：还有几条没画（如实说数，别让人以为就这些）
+    if clipped {
+        var tail: Buf = buf_new(64);
+        defer { buf_free(&tail); }
+        _ = buf_append_cstr(&tail, "… 还有 ");
+        _ = buf_append_u64(&tail, (total - want) as u64);
+        _ = buf_append_cstr(&tail, " 条");
+        tui_row_new();
+        tui_pad_to(indent);
+        tui_put_clipped(tail.ptr as &const byte, tail.len, avail_c, TUI_ST_DIM);
+        tui_fill_row(g_tui_cols);
+        r = r + 1;
+    }
+    return r;
+}
+
+// 把待发队列清回初值（自测复位 + 新 UI 会话）。释放槽位与快照缓冲，行数归 0。
+// ⚠ 生产路径里的**正常取用**不走它（那走 tui_take_submit 的 FIFO）—— 它只在
+// 「换会话 / 自测轮次之间」用它，等价于 tui_transcript_clear 对转录做的事。
+export fn tui_queue_reset() void {
+    var i: usize = 0;
+    while i < TUI_SUBMIT_MAX {
+        if buf_valid(&g_tq.items[i]) {
+            buf_free(&g_tq.items[i]);
+        }
+        i = i + 1;
+    }
+    g_tq.len = 0;
+    if buf_valid(&g_tq_snap) {
+        buf_reset(&g_tq_snap);
+    }
+    g_tq_snap_n = 0;
+    g_tq_h = 0;
+    tui_mark_dirty();
+}
