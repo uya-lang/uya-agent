@@ -1003,3 +1003,20 @@ leaf 指纹怎么算、指纹库放哪儿 —— 见 [DESIGN.md §18](DESIGN.md)
 * **文件数上限 64 与函数表容量**（uya 0.10.1 的两条硬约束）：**都已在 0.10.3 解除**
   （输入文件表改为可增长、checker 的五张定长表改动态哈希表）；本仓现在是 113 个构建文件、
   函数可以净增。换/降编译器前先读 [CODING.md §1.2.1 / §6](CODING.md) —— 症状与最小复现都记在那里。
+
+## 8. 许可证
+
+本仓以 **MIT 许可证**发布，全文见 [LICENSE](LICENSE)：可自由使用、修改、分发、商用，
+**条件只有一个** —— 分发时把 LICENSE 里的版权声明与许可声明一起带上（MIT 的
+「in all copies or substantial portions of the Software」条款）。
+
+* **许可证是仓库级的，不进每个 `.uya` 文件头**：文件头只留本仓自己的索引（本文件 /
+  不变量 / 依赖 / 命名，见 [CODING.md §2](CODING.md)），不贴版权抬头 —— 一是省读者的
+  token，二是与「头部不写版本号/日期/作者」同源。分发整个仓库即满足随附声明。
+* **本仓没有 vendor 任何第三方代码**：构建只用 uya 编译器与随它分发的标准库
+  （同为 MIT，[uya-lang/uya](https://github.com/uya-lang/uya)），运行时只接 Linux
+  系统调用与 libc。`testdata/openbench_adapters/` 只是**调用**第三方基准 OpenBench
+  （按需自行 clone，不复制其代码）；`--dsh-web` 与 DSH 会话兼容读的是 DSH 自己的
+  配置 / 会话**文件格式**，同样不含它的代码。
+* **署名**：本仓版权归 `winger`（见 LICENSE）。再分发时想加自己的名字，按 MIT 条款
+  在保留原声明的前提下追加即可。
