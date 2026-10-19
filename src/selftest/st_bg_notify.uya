@@ -1,0 +1,402 @@
+// src/selftest/st_bg_notify.uya — 后台任务完成通知（P104）的三条腿
+//
+// 本文件：`bg_notify_rounds()` 是这一族的入口，三条腿各自钉一件事：
+//   腿 A（`bgn_e2e_round`，mock mode 52）—— **真的走一遍**：后台起一个任务、前台短睡
+//     让它在这一步里跑完 → 下一个请求体里必须出现「[后台任务完成] job-1 … BG-NOTIFIED」。
+//     这是「step 边界投递」这条路的端到端判据（`agent_claim_steer` 旁边那一行）。
+//   腿 B（`bgn_queue_round`）—— 队列语义（纯函数）：FIFO、满 8 条丢最旧并计数、
+//     单条超长只截尾、**`read_off` 一个字节都不动**（job_output 的增量语义不许被通知吃掉）。
+//   腿 C（`bgn_gate_round`）—— 投递与让路：`bg_notes_deliver` 真能把队列变成一条 user
+//     消息；关掉通知 / 子代理 / steer 有货 / 队列空这四种情形下 `bg_notes_drive` 一律
+//     返回 false 且历史不变（**不许**起回合）。
+// 不变量：① 判据只落在可观测的字节上（请求体、历史里的消息、队列长度）；
+//   ② 每条腿自己把全局状态摆好再断言（通知开关、队列、历史都是进程级的），
+//   ③ 跑完把开关**恢复成「显式关」** —— 整轮自测里其它轮次不该被通知影响
+//   （与 `selftest_main` 里 `rtx_set_max(0)` / `turn_retry_set_max(0)` 同一条纪律）。
+// 依赖：`st_mock_server.uya`（mode 52 的断言在那边，`mock_bgnotify_body`
+//   在本文件）、`st_round_driver.uya`（`ws_prepare` / `find_from`）、
+//   `st_tty_sse.uya`（`ty_fail`）、`agent/ag_bg_notes.uya`（被测对象）、
+//   `agent/ag_config.uya`（`hist_*` / `msg_at`）。
+// 命名：对外 `bg_notify_rounds`；私有 `bgn_*`。
+
+// ============================================================
+// 腿 A：端到端（mock mode 52）
+// ============================================================
+
+// 第一步的两个调用：先起后台任务（0.05 s 就结束，输出一个标记），再用一条**前台**
+// 短睡把时间推过去 —— 这样第二步开头那个 step 边界一定能看到它已经结算。
+// 为什么不用 `job_output(wait=true)` 来等：那条路会**销掉**通知（模型自己看到了），
+// 而这一腿要验的正是「模型没在看的完成」。
+fn mock_bgnotify_body(out: &Buf) bool {
+    var w: JsonWriter = JsonWriter{ buf: null, cap: 0, overflow: false,
+        used: 0 };
+    jw_init(&w, out.ptr, out.cap);
+    jw_byte(&w, 123);
+    jw_key(&w, "id");
+    jw_str_cstr(&w, "chatcmpl-bgnotify");
+    jw_byte(&w, 44);
+    jw_key(&w, "choices");
+    jw_byte(&w, 91);
+    jw_byte(&w, 123);
+    jw_key(&w, "index");
+    jw_i64(&w, 0);
+    jw_byte(&w, 44);
+    jw_key(&w, "message");
+    jw_byte(&w, 123);
+    jw_key(&w, "role");
+    jw_str_cstr(&w, "assistant");
+    jw_byte(&w, 44);
+    jw_key(&w, "content");
+    jw_null(&w);
+    jw_byte(&w, 44);
+    jw_key(&w, "tool_calls");
+    jw_byte(&w, 91);
+    // 行宽豁免：两条 mock 工具的 arguments 都是**不可断的 JSON 字面量**
+    // （Uya 没有相邻字面量拼接，断行会把 JSON 拆坏）。
+    mock_call(&w, "bg_1", "bash",
+        "{\"command\":\"sleep 0.05; echo BG-NOTIFIED\",\"description\":\"short background echo\",\"run_in_background\":true}");
+    jw_byte(&w, 44);
+    mock_call(&w, "bg_2", "bash",
+        "{\"command\":\"sleep 0.4\",\"description\":\"foreground pause so the job finishes\",\"timeoutMs\":20000}");
+    jw_byte(&w, 93);
+    jw_byte(&w, 125);
+    jw_byte(&w, 44);
+    jw_key(&w, "finish_reason");
+    jw_str_cstr(&w, "tool_calls");
+    jw_byte(&w, 125);
+    jw_byte(&w, 93);
+    jw_byte(&w, 125);
+    if jw_overflow(&w) {
+        return false;
+    }
+    out.len = jw_used(&w);
+    return true;
+}
+
+// 一个只会分配端口 + fork mock 子进程的小夹具（与 `jobs_round` 同一套形状）。
+// 返回监听端口（0 = 失败），pid 出参给回收用。
+fn bgn_spawn_mock(pid_out: &i32) u16 {
+    const lfd: i32 = sys_socket(AF_INET, SOCK_STREAM, IPPROTO_TCP) catch {
+        return 0 as u16;
+    };
+    var one: i32 = 1;
+    _ = sys_setsockopt(lfd, SOL_SOCKET, SO_REUSEADDR, &one as &void,
+        4 as u32) catch {};
+    var addr: [byte: 16] = [0: 16];
+    fill_sockaddr_ipv4(127, 0, 0, 1, 0, &addr[0]);
+    _ = sys_bind(lfd, &addr[0] as &void, 16 as u32) catch {
+        _ = sys_close(lfd) catch {};
+        return 0 as u16;
+    };
+    _ = sys_listen(lfd, 4) catch {
+        _ = sys_close(lfd) catch {};
+        return 0 as u16;
+    };
+    var got: [byte: 16] = [0: 16];
+    var glen: u32 = 16;
+    _ = sys_getsockname(lfd, &got[0] as &void, &glen) catch {
+        _ = sys_close(lfd) catch {};
+        return 0 as u16;
+    };
+    const port: u16 = ((got[2] as u16) << (8 as i32)) | (got[3] as u16);
+    const pid64: i64 = sys_fork() catch {
+        _ = sys_close(lfd) catch {};
+        return 0 as u16;
+    };
+    if pid64 == 0 {
+        const rc0: i32 = mock_server(lfd);
+        sys_exit(rc0);
+    }
+    pid_out[0] = i64_to_i32(pid64);
+    _ = sys_close(lfd) catch {};
+    return port;
+}
+
+// 腿 A 的本体：真跑一轮 agent（非交互），mock 在请求体上断言那条通知。
+fn bgn_e2e_round(base: &const Config, tag: &const byte, ws: &const byte) bool {
+    mock_mode = 52;
+    mock_expect_shell = true;
+    mock_expect_fold = false;
+    mock_expect_steer = false;
+    if !ws_prepare(ws) {
+        out_err("selftest: cannot prepare bg-notify workspace\n");
+        return false;
+    }
+    var pid: i32 = -1;
+    const port: u16 = bgn_spawn_mock(&pid);
+    if port == 0 {
+        return false;
+    }
+    var c: Config = cfg_default();
+    cfg_pin_api(&c, LLM_STYLE_CHAT);   // 自测钉住协议：默认是 responses + 一次性协商
+    c.base_url = buf_new(64);
+    _ = buf_append_cstr(&c.base_url, "http://127.0.0.1:");
+    _ = buf_append_u64(&c.base_url, port as u64);
+    _ = buf_append_cstr(&c.base_url, "/v1");
+    c.model = buf_new(32);
+    _ = buf_append_cstr(&c.model, "selftest-model");
+    c.api_key = buf_new(32);
+    _ = buf_append_cstr(&c.api_key, "selftest-key");
+    c.workspace = buf_new(strlen(ws) + 8);
+    _ = buf_append_cstr(&c.workspace, ws);
+    c.task = buf_new(64);
+    _ = buf_append_cstr(&c.task, "起一个后台任务再看看通知");
+    c.verify = HC_VERIFY_NONE;
+    c.allow_shell = true;
+    c.stream = true;
+    c.max_steps = 4;
+    c.timeout_ms = 30000;
+    c.quiet = true;
+    c.agent_home = buf_new(64);
+    _ = buf_append_cstr(&c.agent_home, "build/selftest_agent_home");
+    // 这一腿要验的正是「非交互进程里也能投递」—— 必须把人设的开关打开，
+    // 否则 `bgn_enabled` 会因为 g_interactive 为假而一条都不投（那是出厂的正确行为）。
+    bg_notify_set(true);
+    const rc: i32 = agent_run(&c);
+    bg_notify_set(false);          // 恢复成「显式关」：后面的轮次不受通知影响
+    cfg_free(&c);
+    const mock_rc: i32 = wait_child(pid);
+
+    var ok: bool = true;
+    out_err("selftest[");
+    out_err(tag);
+    out_err("] ");
+    if rc != AGENT_OK {
+        out_err("FAIL: agent_run returned ");
+        out_err_dec(rc as usize);
+        ok = false;
+    } else if mock_rc != 0 {
+        out_err("FAIL: mock server verdict ");
+        out_err_dec(mock_rc as usize);
+        ok = false;
+    } else {
+        out_err("ok");
+    }
+    out_err("\n");
+    _ = base;
+    return ok;
+}
+
+// ============================================================
+// 腿 B：队列语义（纯函数）
+// ============================================================
+
+// 第 i 条里含不含 lit（越界 / 不含都给 false）。先按**数组大小**收一次边界
+// （编译器的下标证明只认常量上界，`i >= BGN_MAX` 这一句就是给它看的）。
+fn bgn_item_has(i: usize, lit: &const byte) bool {
+    if i >= BGN_MAX {
+        return false;
+    }
+    if i >= bg_notes_len() {
+        return false;
+    }
+    const it: &const Buf = &g_bg_notes.items[i];
+    const ln: usize = bufx_cstr_len(lit);
+    const at: isize = find_from(it.ptr as &const byte, it.len, lit, ln, 0);
+    return at >= 0;
+}
+
+// 一条「已经结束的 job」的通知（腿 B/C 共用）
+fn bgn_push_dummy_job(tag_id: i32, marker: &const byte) void {
+    var body: Buf = buf_new(256);
+    defer { buf_free(&body); }
+    _ = buf_append_cstr(&body, marker);
+    _ = bg_notes_push_job(tag_id, JOB_DONE, 0, 1000, 4000,
+        "标签" as &const byte, bufx_cstr_len("标签" as &const byte),
+        body.ptr as &const byte, body.len, false);
+}
+
+// 腿 B 的本体：全在纯函数层断言（不 fork、不连网，几毫秒），所以能进整轮自测。
+fn bgn_queue_round(tag: &const byte) bool {
+    var ok: bool = true;
+    bg_notes_init();
+    if bg_notes_len() != 0 {
+        ty_fail(tag, "刚 init 完队列非空", &ok);
+    }
+    // FIFO：先推 3 条，顺序必须是 1、2、3
+    var i: i32 = 1;
+    while i <= 3 {
+        bgn_push_dummy_job(i, "M" as &const byte);
+        i = i + 1;
+    }
+    if bg_notes_len() != 3 {
+        ty_fail(tag, "推了 3 条但队列长度不对", &ok);
+    }
+    if !bgn_item_has(0, "M" as &const byte) {
+        ty_fail(tag, "队首内容不对", &ok);
+    }
+    // 满 8 条：第 9 条进来时丢**最旧**的一条并计数
+    bg_notes_init();
+    i = 1;
+    while i <= 9 {
+        bgn_push_dummy_job(i, "M" as &const byte);
+        i = i + 1;
+    }
+    if bg_notes_len() != BGN_MAX {
+        ty_fail(tag, "队列满之后长度不是 BGN_MAX", &ok);
+    }
+    if bg_notes_dropped() != 1 {
+        ty_fail(tag, "队列满时没有记一条被丢弃", &ok);
+    }
+    // 单条超长：只截尾（头部那句「谁跑完了」必须留）
+    bg_notes_init();
+    var big: Buf = buf_new(BGN_ITEM_MAX + 64);
+    defer { buf_free(&big); }
+    _ = buf_append_cstr(&big, "HEAD-" as &const byte);
+    while big.len < BGN_ITEM_MAX + 32 {
+        _ = buf_append_byte(&big, 65);        // 'A'
+    }
+    _ = bg_notes_push_job(7, JOB_DONE, 0, 0, 1000,
+        "" as &const byte, 0, big.ptr as &const byte, big.len, true);
+    if bg_notes_len() != 1 {
+        ty_fail(tag, "超长通知没有入队", &ok);
+    } else {
+        const it: &const Buf = &g_bg_notes.items[0];
+        if it.len > BGN_ITEM_MAX {
+            ty_fail(tag, "超长通知没有被截到 BGN_ITEM_MAX", &ok);
+        }
+        // 头部必须还在（这才是模型要读的那一句）
+        const head: &const byte = "[后台任务完成]" as &const byte;
+        const at: isize = find_from(it.ptr as &const byte, it.len, head,
+            bufx_cstr_len(head), 0);
+        if at != 0 {
+            ty_fail(tag, "超长通知把头部截掉了", &ok);
+        }
+    }
+    // read_off 一个字节都不许动：通知里带的是**拷贝**，job_output 的增量语义不变
+    bg_notes_init();
+    var jt: JobTable = JobTable{ items: [], next_id: 1 };
+    jobs_init(&jt);
+    var lbl: Buf = buf_new(16);
+    defer { buf_free(&lbl); }
+    _ = buf_append_cstr(&lbl, "回读" as &const byte);
+    const jid: i32 = job_register(&jt, -1, -1, lbl.ptr as &const byte, lbl.len);
+    if jid < 0 {
+        ty_fail(tag, "job_register 失败", &ok);
+    } else {
+        const j: &Job = &jt.items[0];
+        _ = buf_append_cstr(&j.buf, "已产出" as &const byte);
+        j.read_off = 2;                      // 假装模型已经读过前 2 字节
+        _ = bg_notes_push_job(j.id, JOB_DONE, 0, 0, 1000,
+            j.label.ptr as &const byte, j.label.len,
+            j.buf.ptr as &const byte, j.buf.len, false);
+        if j.read_off != 2 {
+            ty_fail(tag, "通知把 read_off 动了（增量语义会被吃掉）", &ok);
+        }
+    }
+    jobs_free(&jt);
+    bg_notes_init();
+    if ok {
+        out_err("selftest[");
+        out_err(tag);
+        out_err("] ok（FIFO / 满 8 丢最旧并计数 / 超长只截尾 / read_off 不动）\n");
+    }
+    return ok;
+}
+
+// ============================================================
+// 腿 C：投递与让路
+// ============================================================
+
+fn bgn_gate_round(tag: &const byte) bool {
+    var ok: bool = true;
+    var c: Config = cfg_default();
+    var h: History = hist_init();
+    // ① 关着通知：队列被清掉、历史不变
+    bg_notify_set(false);
+    bg_notes_init();
+    bgn_push_dummy_job(1, "M" as &const byte);
+    if bg_notes_deliver(&c, &h) {
+        ty_fail(tag, "通知关着却投递了", &ok);
+    }
+    if bg_notes_len() != 0 {
+        ty_fail(tag, "通知关着却没有清空队列", &ok);
+    }
+    if h.len != 0 {
+        ty_fail(tag, "通知关着却往历史里写了东西", &ok);
+    }
+    // ② 开着通知：队列变成**一条** user 消息，内容是抬头 + 那一单
+    bg_notify_set(true);
+    bg_notes_init();
+    bgn_push_dummy_job(3, "TAIL-MARKER" as &const byte);
+    const before: usize = h.len;
+    if !bg_notes_deliver(&c, &h) {
+        ty_fail(tag, "通知开着却没有投递", &ok);
+    }
+    if h.len != before + 1 {
+        ty_fail(tag, "一次投递没有恰好加一条 user 消息", &ok);
+    } else {
+        const m: &const Msg = msg_at(&h, before);
+        if m.role != ROLE_USER {
+            ty_fail(tag, "通知不是 user 消息", &ok);
+        }
+        if find_from(m.text as &const byte, m.text_len,
+            "[后台任务通知]" as &const byte,
+            bufx_cstr_len("[后台任务通知]" as &const byte), 0) != 0 {
+            ty_fail(tag, "通知正文没有抬头", &ok);
+        }
+        const at: isize = find_from(m.text as &const byte, m.text_len,
+            "TAIL-MARKER" as &const byte, 11, 0);
+        if at < 0 {
+            ty_fail(tag, "通知正文里没有那一单的输出尾部", &ok);
+        }
+    }
+    if bg_notes_len() != 0 {
+        ty_fail(tag, "投递之后队列没有清空", &ok);
+    }
+    // ③ 队列空：`bg_notes_drive` 必须返回 false（绝不能凭空空起一回合）
+    bg_notes_init();
+    if bg_notes_drive(&c, &h) {
+        ty_fail(tag, "队列空却起了一回合", &ok);
+    }
+    // ④ 子代理里不通知（它自己的目标是父进程管的）
+    bg_notes_init();
+    bgn_push_dummy_job(4, "M" as &const byte);
+    c.is_subagent = true;
+    if bg_notes_drive(&c, &h) {
+        ty_fail(tag, "子代理进程里却起了自动回合", &ok);
+    }
+    c.is_subagent = false;
+    // ⑤ steer 收件箱有货 ⇒ 让路（人先说，机器后说）
+    bg_notes_init();
+    bgn_push_dummy_job(5, "M" as &const byte);
+    _ = inbox_push(&g_steer, "人的输入" as &const byte,
+        bufx_cstr_len("人的输入" as &const byte));
+    if bg_notes_drive(&c, &h) {
+        ty_fail(tag, "steer 有货却起了自动回合（抢在人的输入前面）", &ok);
+    }
+    inbox_globals_free();
+    // ⑥ 关着通知时 drive 也不许动
+    bg_notify_set(false);
+    bg_notes_init();
+    bgn_push_dummy_job(6, "M" as &const byte);
+    if bg_notes_drive(&c, &h) {
+        ty_fail(tag, "通知关着却起了自动回合", &ok);
+    }
+    bg_notes_init();
+    hist_free(&h);
+    cfg_free(&c);
+    if ok {
+        out_err("selftest[");
+        out_err(tag);
+        out_err("] ok（关/开两档投递、一次一条、队列空与四种让路都不起回合）\n");
+    }
+    return ok;
+}
+
+// ============================================================
+// 入口
+// ============================================================
+
+// 三条腿一起跑（`--selftest` 与 `UYA_SELFTEST_NOTIFY_ONLY=1` 都走这里）。
+export fn bg_notify_rounds(base: &const Config) bool {
+    inbox_globals_init();
+    const a: bool = bgn_e2e_round(base, "bg-notify" as &const byte,
+        "build/selftest_ws_bgnotify" as &const byte);
+    const b: bool = bgn_queue_round("bg-notify-queue" as &const byte);
+    const c: bool = bgn_gate_round("bg-notify-gate" as &const byte);
+    bg_notify_set(false);      // 整轮跑完恢复「显式关」，别影响其它轮次
+    bg_notes_free();
+    inbox_globals_free();
+    return a && b && c;
+}

@@ -4008,6 +4008,7 @@ QTermWidget）对 `ESC[?5522$p`（DECRQM）**零应答**，OSC 52 写 `c`/`p` �
 | shellx | `cfg.max_tool_out` | 65536 | out/err 各自的截断线（标记 `[output truncated]`） |
 | shellx | 默认 timeout | 120000 ms | `--timeout-ms` |
 | jobs | `JOB_MAX` / `JOB_BUF_MAX` | 8 / `1 MiB` | 槽位 / 输出只留内存尾部 |
+| jobs | 完成通知 `BGN_MAX` / `BGN_ITEM_MAX` / `BGN_TAIL_MAX` / `BGN_BATCH_MAX` | 8 / 6144 / 2048 / 16384 字节 | 队列条数 / 单条上限 / 带的输出尾部 / 一次投递的正文预算（P104） |
 | sandboxx | `SAN_MAX_ARGS` | 24 | bwrap argv 上限 |
 | session | 会话 id | 16 字节 urandom | version 4 / variant 10 |
 | session | 索引排序 | O(n log n) 归并 | 与老插入排序**逐字节等价**（比较键是严格全序） |
@@ -6420,6 +6421,24 @@ QTermWidget）对 `ESC[?5522$p`（DECRQM）**零应答**，OSC 52 写 `c`/`p` �
     —— RFC 8259 允许 `\uXXXX` 逃逸，但**不允许**把非法字节直接塞进字符串字面量，
     而这两件事在本地看起来一模一样。
 
+157. **任务早就跑完了，模型还在 `pgrep` 循环里等 —— 因为没人告诉它**（P104，用户报的）：
+    用户原话是「现在经常任务已经完成，但 agent 还在等」。第一反应都会去查等待原语
+    （`job_wait` 是不是漏了 `WNOHANG`、`deleg` 的 100 ms 切片是不是卡住），**但那些
+    都是对的**：`job_wait` 50 ms 一轮、任务一结束就返回。真正的形状在会话日志里：
+    ① 同一个 job 连等 `600 s × 5 + 590 s × 2`，每次都回 `[status: running]`；
+    ② 模型干脆抛开工具，用 bash 写
+    `for i in $(seq 1 40); do pgrep -f "make release" || break; sleep 20; done`
+    —— 302 s / 602 s 两轮，第三轮 718 s 被人按停。
+    **根因是「缺一条投递路径」而不是「等待写得不好」**：完成状态只在 `/tasks` 面板上
+    变，模型看不见，于是它只能把「等」写成自己要执行的代码。这与踩坑 60（工具子进程
+    被 job control 停住却显示「运行中」）是同一族的两种长相 —— 都表现为「上下文里
+    还挂着运行中」，而**状态其实早就结束了**。
+    **修法**：结算即通知（`agent/ag_bg_notes.uya` + `job_note_terminal` /
+    `deleg_settled`），三个投递点（step 边界 / 空闲检查点 / 等键盘的超时），
+    外加把「不要写 sleep/pgrep 等待循环」写进 `SEC_JOBS` 与两个工具描述。
+    **教训**：凡是「模型要反复问同一个东西才知道进展」的设计，都该有一条**推**的路
+    —— 轮询是模型的退路，不应该是它唯一的路。
+
 ---
 
 ## 17. 工具实现要点
@@ -6683,6 +6702,9 @@ DEEPSEEK_API_KEY=sk-xxx ./build/uya-agent \
 | `pair-recover` | **P89 端到端**：合成「悬空 tool_calls + user」的日志 → `--resume` → 假网关断言**请求体里没有那个悬空的 id**（判据落在线上字节上；删掉接线这一轮就红，见 §19.11） |
 | `prompt-todo-plan` | system prompt/`{{cwd}}`/AGENTS.md 注入、请求无 NUL、todo 与 plan |
 | `bash-jobs` | 一轮 6 调用：后台短/长任务、`job_list`、`job_output(wait=true)`、`job_kill` |
+| `bg-notify` | **P104**：后台起一个 0.05 s 就结束的任务 → 前台短睡让它跑完 → **下一个请求体里**必须带 `[后台任务通知]` + `[后台任务完成] job-1` + 输出尾部 + `completed`（step 边界投递的端到端判据；见 §19.28） |
+| `bg-notify-queue` | **P104**：队列语义纯函数 —— FIFO、满 8 条丢最旧并计数、单条超长只截尾、**`read_off` 一个字节都不动** |
+| `bg-notify-gate` | **P104**：投递与让路 —— 关着不投且清队、开着恰好一条 user 消息、队列空 / 子代理 / steer 有货 / 关着 四种情形都不起回合 |
 | `fs-tools` | 一轮 10 调用：write 未读拒、edit 多匹配拒、glob/grep；落盘逐字节 |
 | `dsh-config` | 假 `$DSH_HOME`：YAML 预处理与四层凭据来源 |
 | `resp-text` | `output_text.delta`；`input_tokens(100)-cached(40)=60`；`event:` 行忽略 |
@@ -6787,7 +6809,7 @@ DEEPSEEK_API_KEY=sk-xxx ./build/uya-agent \
 **验证用的 make 目标与快捷入口**
 
 - 总闸门：`make selftest`（离线，含 `p30-check` 与全部轮次，SELFTEST PASS / 退出 0）、`make e2e`（真网关）。
-- 离线配套：`make check`（A1 类型检查）/ `build`（A2 产出 `build/uya-agent`）/ `codegen-audit` / `tui-selftest` / `shell-selftest` / `e2e-config-flags` / `e2e-api` / `e2e-steps` / `e2e-permission` / `e2e-sandbox` / `e2e-tasks` / `e2e-goal` / `e2e-sessions` / `e2e-resume-big` / `e2e-title` / `e2e-model` / `e2e-model-save` / `e2e-model-route` / `e2e-worktree` / `e2e-diff` / `e2e-watch` / `e2e-watch-pick` / `diff-selftest` / `panel-selftest` / `e2e-ws`。
+- 离线配套：`make check`（A1 类型检查）/ `build`（A2 产出 `build/uya-agent`）/ `codegen-audit` / `tui-selftest` / `shell-selftest` / `e2e-config-flags` / `e2e-api` / `e2e-steps` / `e2e-permission` / `e2e-sandbox` / `e2e-tasks` / `e2e-goal` / `e2e-sessions` / `e2e-resume-big` / `e2e-title` / `e2e-model` / `e2e-model-save` / `e2e-model-route` / `e2e-worktree` / `e2e-diff` / `e2e-watch` / `e2e-watch-pick` / `diff-selftest` / `panel-selftest` / `notify-selftest` / `e2e-ws`。
 - PTY 场景：`make p30-check`（`testdata/pty_drive.py --suite`，11 个场景；P91 那场 `goal-menu` 是**真按键**那条腿
   —— 输入框的同步采纳路在 headless 里收不到注入的键，只能在真终端里测；P41 那场 `worktree-menu` 走
   两条入口 —— 命令面板里选中 `/worktree` 与裸 `/worktree` —— 到选择框 → ↓ 到 `finish` → 确认框 →
@@ -6804,7 +6826,7 @@ DEEPSEEK_API_KEY=sk-xxx ./build/uya-agent \
   的真实路径（74 列），新窗口把它夹到 30 列并补 `…`；统计行因此整条放得下了（修前被长
   路径挤到只剩四组）。这是**有意的**，也正是用户报的那件事；短路径（`~/proj` 这类）装得下
   时仍然逐字节不变 —— `tui-marquee` 的 A 段钉的就是这条。
-- 只跑子集的开关：`UYA_SELFTEST_TUI_ONLY`、`UYA_SELFTEST_PERM_ONLY=1`（P21+P26）、`UYA_SELFTEST_GOAL_ONLY=1`（P29）、`UYA_SELFTEST_SHELL_ONLY=1`（P38）、`UYA_SELFTEST_PANEL_ONLY=1`（P15+P40，`make panel-selftest`）、`UYA_SELFTEST_EMPTY_ONLY=1`（P54，退化响应两轮 —— 跑对照实验时用它，一次约 0.2 s）。
+- 只跑子集的开关：`UYA_SELFTEST_TUI_ONLY`、`UYA_SELFTEST_PERM_ONLY=1`（P21+P26）、`UYA_SELFTEST_GOAL_ONLY=1`（P29）、`UYA_SELFTEST_SHELL_ONLY=1`（P38）、`UYA_SELFTEST_PANEL_ONLY=1`（P15+P40，`make panel-selftest`）、`UYA_SELFTEST_EMPTY_ONLY=1`（P54，退化响应两轮 —— 跑对照实验时用它，一次约 0.2 s）、`UYA_SELFTEST_NOTIFY_ONLY=1`（P104，后台完成通知三条腿，`make notify-selftest`）。
 - 探针：`make probe BASE=https://api.deepseek.com/v1` 期望 HTTP 401 + leaf 指纹。
 
 **load-bearing 硬指标**
@@ -9171,3 +9193,74 @@ future），mock 先 accept 两条、记下各自开始时刻，再一起歇 120
 **判据**：① 阻断性真机判据 —— TUI 对真实端点发一句，必须一次成功、无 `[retry]`
 （修前：无限 transport 重试）；② 既有 `async-net` / `async-sse` 全绿（明文路不许
 回退）；③ `make selftest` 全量绿（同步路行为一个字不动）。
+
+### 19.28 P104：后台任务 / 子代理的异步完成通知
+
+**现场（用户原话）**：「等待后台任务 的优化，现在经常任务已经完成，但 agent 还在等」。
+查会话日志得到的形状是两种，都不是「`job_wait` 堵住」：
+
+| 形状 | 实测数据 |
+|---|---|
+| 反复 `job_output(wait=true)` 空等 | `session-8ed5afdd`：同一个 job-1 连等 **600 s × 5 次 + 590 s × 2 次**，每次都回 `[status: running]` |
+| 模型自己写 bash 等待循环 | `session-fd12e186`：`for i in $(seq …); do pgrep -f "make release" …; sleep 20; done`，**302 s / 602 s**，另一轮 718 s 被人按停 |
+| 子代理同理 | 全部会话 207 次 `subagent_output`，140 次 `running`，**中位 30 s**（= 打满上限） |
+
+**根因**：完成状态**只在面板上变**，没有任何东西告诉模型。于是它只能自己盯 ——
+而「自己盯」在单线程 agent 里就是「阻塞一段墙钟时间」。这不是等待原语的缺陷
+（`job_wait` 是 50 ms 粒度轮询、任务一结束就返回），是**缺一条投递路径**。
+
+**修法**：结算即通知。一条进程级队列 + 三个投递点，不新建线程、不装信号、不用
+pidfd、不在流式中间插请求。
+
+```
+job_check / deleg_settled ──(终态，只一次)──▶ g_bg_notes（8 条）
+                                                │
+  ① step 边界（回合运行中，零额外请求）  ②③ 空闲检查点（回合之间，起一回合）
+```
+
+| 投递点 | 位置 | 形态 |
+|---|---|---|
+| ① step 边界 | `ag_request_stream` 里 `agent_claim_steer` 之后 | 批量拼成**一条** user 消息进历史，下一个请求模型就看见 |
+| ② TUI 空闲 | `agent_run_tui_body` 的 `agent_goal_drive` 之后 | `bg_notes_drive`：投递 + **再开一回合** |
+| ③ 滚动模式空闲 | `agent_run_interactive` 的 `agent_goal_drive` 之后 | 同上（两个调用点共用一份实现） |
+| ③' 等键盘的那段 | `tty_read_line_blocking` 的 200 ms 超时 | 新事件码 `TTY_EV_NOTIFY`：把控制权交回主循环，**不清输入行** |
+
+**为什么放在 step 边界而不是「立刻发一个请求」**：单线程下「立刻」等于把正在跑的
+那一步砍断。step 边界是进程里唯一「已经在发请求之前」的收口点，投递在那儿不额外
+花一个来回 —— 这也是模型最需要知道的那一刻（它正要决定下一步做什么）。
+
+**闸门**（`bg_notes_drive`，顺序照 `agent_goal_drive`，理由在那份注释里写全了）：
+开关 / 子代理 → 要退出 → 人按了 esc → 键盘上还有字节 → 输入行有字或浮层开着 →
+steer 收件箱有货 → 队列空。任何一条命中都**一次都不投**。
+
+**终止论证**：通知只在**一次真结算**时产生（`Job.noted` / `Deleg.notify_bg` 各只
+放行一次），投递后即出队；一个检查点最多投递一批；`AGENT_INTERRUPTED` 与「异常收场」
+两条路都清空队列 —— 不会自转。
+
+**两条防重复的销号**（这是最容易做错的地方）：凡「这次调用的结果里已经写出
+`[status: …]`」的路 —— `job_output`、`job_kill`、`subagent_output`、
+`interrupt_agent`、前台 `subagent`（自己阻塞等着）、人按 esc 杀掉的 —— 都先把
+对应槽位的通知**销掉**。否则同一次完成模型会收到两条（一条工具结果 + 一条通知）。
+
+**明确不做**：
+
+* 不动 `job_output(wait=true)` 的阻塞语义与上限（仍是 30 s 默认 / 600 s 上限）——
+  通知到位之后模型不该再用它长等，但接口一个字不改（老的 e2e 腿逐字断言它）。
+* 不做 epoll / pidfd 化：完成检测本来就有两条现成路径（TUI 1 Hz 心跳的
+  `tasks_tick` → `tasks_poll`，以及每个工具结果之后的 `agent_tasks_sync`）。
+* 不发终端响铃 / 桌面通知。
+* 一次性任务（`agent_run`）与子代理进程里默认不投（`bgn_enabled`）—— 那儿没有人能
+  叫停「自动再起一回合」，与 `--turn-retry-max`、`agent_goal_drive` 同一条纪律；
+  显式 `--bg-notify` / `UYA_AGENT_BG_NOTIFY=1` 可以压过去（自测就走这条）。
+
+**判据**：`make notify-selftest`（新目标，三条腿）——
+
+| 腿 | 验什么 | 防假绿（对照） |
+|---|---|---|
+| A（端到端，mock mode 52） | 真起后台任务 → 前台短睡让它跑完 → **下一个请求体里**必须出现 `[后台任务通知]` + `[后台任务完成] job-1` + 输出尾部 `BG-NOTIFIED` + `completed` | 注释掉 step 边界那两行 ⇒ 红 4 条 |
+| B（队列纯函数） | FIFO、满 8 条丢最旧并计数、单条超长只截尾（头部必须留）、**`read_off` 一个字节都不动** | 把 `bgn_enqueue` 的截断去掉 / 改成改 `read_off` ⇒ 各红一条 |
+| C（让路判据） | 关着不投且清队；开着恰好加**一条** user 消息且内容完整；队列空 / 子代理 / steer 有货 / 关着 四种情形 `bg_notes_drive` 一律 false | 去掉任一条闸门 ⇒ 对应那条红 |
+
+另外整轮 `make selftest` 里这一族默认**先关**（与 `rtx_set_max(0)` /
+`turn_retry_set_max(0)` 同一条纪律：会改变全局行为的东西，自测必须自己钉住初值），
+由这一轮自己打开、跑完再关回去。

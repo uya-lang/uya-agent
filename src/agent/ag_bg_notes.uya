@@ -1,0 +1,499 @@
+// src/agent/ag_bg_notes.uya — 后台任务 / 子代理的**异步完成通知**（P104）
+//
+// 本文件：进程级通知队列 `BgNotes`（`BGN_MAX`=8 条）+ 三个投递口
+//   `bg_notes_collect`（先把 job/deleg 的终态收出来）、`bg_notes_deliver`
+//   （把队列批量压成**一条** user 消息进历史）、`bg_notes_drive`
+//   （投递之后**再开一回合**，给空闲检查点用），以及通知开关
+//   （`bg_notify_set` / `bgn_enabled`）。
+//   产生端在 `tools/jobs.uya`（`job_note_terminal`）与 `agent/deleg.uya`
+//   （`deleg_settled`），两边只调 `bg_notes_push_job` / `bg_notes_push_agent`。
+// 不变量：① **只通知模型没看过的那一次完成**（`Job.noted` / `Deleg.notify_bg`）——
+//   已经通过 `job_output` / `subagent_output` / `job_kill` 交给模型的终态不再通知，
+//   否则同一次完成模型会收到两条消息（一条工具结果 + 一条通知）；
+//   ② 队列满（8 条）丢**最旧**的一条并计数，投递时补一句「另有 N 条被丢弃」；
+//   ③ 通知里带的输出尾部是**拷贝**：绝不动 `Job.read_off` / `Deleg.read_off`，
+//   `job_output` 的增量语义逐字节不变；
+//   ④ 投递只走**已有**的两条路 —— step 边界（回合运行中，零额外请求）与空闲检查点
+//   （回合之间，起一回合）。不新建线程、不装信号、不在流式中间插请求；
+//   ⑤ 空闲检查点的让路判据与 `agent_goal_drive` 同源（要退出 / 人按了 esc /
+//   键盘上还有字节 / 输入行里有字或浮层开着 / steer 收件箱有货 ⇒ 一次都不投递）。
+// 依赖：foundation/bufx（Buf 一族）、session/session（`sess_begin`/`sess_end`/
+//   `jw_str_into`）、tools/jobs（`jobs_poll_all`/`job_status_name`）、agent/deleg
+//   （`deleg_poll_all`/`deleg_status_name`）、term/tui（`tui_abort_state` 一族）、
+//   agent/ag_config（`g_jobs`/`g_deleg`/`g_steer`/`g_interactive`、`hist_push`）。
+// 命名：对外 `bg_notes_*` + `bg_notify_*`，私有 `bgn_*`，全局 `g_bg_*`。
+//
+// 为什么要有这个文件（用户报的现场）：「任务已经完成，但 agent 还在等」。查会话日志
+// 得到的形状是两种：① 模型反复 `job_output(wait=true)`，同一个 job 连等 600 s × 5 次
+// 都回 `[status: running]`；② 模型干脆用 bash 写等待循环
+// （`for i in $(seq 1 30); do pgrep -f "make release" …; sleep 20; done`，实测一轮
+// 602 s、另一轮 718 s 被人按停）。根因不是 `job_wait` 堵住（它是 50 ms 粒度轮询、
+// 任务一结束就返回），而是**没有任何东西告诉模型「它跑完了」**：完成状态只在面板上
+// 变，模型只能自己盯。于是 P104 补上「结算即通知」。
+
+// 队列条数与单条上限。8 条与 `JOB_MAX` 同量级：同一拍里最多也就这么多次结算。
+const BGN_MAX: usize = 8;
+const BGN_ITEM_MAX: usize = 6144;
+// 一条通知里带多少输出尾部（字节）。只够「看一眼结果对不对」，全文仍走 job_output。
+const BGN_TAIL_MAX: usize = 2048;
+// 一次投递的正文预算（把多条通知拼成一条 user 消息，别把上下文吃光）。
+// 超出就只投前几条，剩下的留到下一个 step 边界 —— 不会丢。
+const BGN_BATCH_MAX: usize = 16384;
+
+export struct BgNotes {
+    items: [Buf: BGN_MAX],
+    len: usize,
+    dropped: usize,       // 因队列满被丢弃的条数（投递时告诉模型一句）
+}
+
+// 进程级队列（单进程单前台界面才成立；子代理是 fork 出来的独立进程，各有一份）
+var g_bg_notes: BgNotes = BgNotes{ items: [], len: 0, dropped: 0 };
+// 通知开关。出厂 = 开，但只在**前台交互会话**里真的生效（见 `bgn_enabled`）。
+var g_bg_notify_on: bool = true;
+// 人（CLI / env / 自测）显式设过开关吗。没设过且这一进程不在交互态 ⇒ 一个通知都不投
+// （管道 / CI 里「自动再起一回合」就是挂死，与 `--turn-retry-max` 同一条纪律）。
+var g_bg_notify_set: bool = false;
+// 值是从哪来的（0 = 内置默认 / 2 = env / 3 = cli，与 `cfg_src_name` 同一套码）。
+// `--print-config` 印它 —— 「这台机器上通知到底开没开、谁定的」是排障的第一个问题。
+var g_bg_notify_src: u8 = 0;
+
+// ============================================================
+// 开关
+// ============================================================
+
+// 设通知开关（自测与「只改值」的调用点用：不动来源码）。
+export fn bg_notify_set(on: bool) void {
+    g_bg_notify_set = true;
+    g_bg_notify_on = on;
+}
+
+// 带来源码的开关设置（CLI = 3、env = 2，与其它旋钮同一套码）。
+export fn bg_notify_set_src(on: bool, src: u8) void {
+    g_bg_notify_set = true;
+    g_bg_notify_on = on;
+    g_bg_notify_src = src;
+}
+
+// 人设的那个值（`--print-config` 读它）。
+export fn bg_notify_on() bool {
+    return g_bg_notify_on;
+}
+
+// 那个值的来源码（0 / 2 / 3）
+export fn bg_notify_src() u8 {
+    return g_bg_notify_src;
+}
+
+// 这一刻要不要真的用通知：显式设过就听人的；否则只在前台交互会话里开。
+fn bgn_enabled(cfg: &const Config) bool {
+    if g_bg_notify_set {
+        return g_bg_notify_on;
+    }
+    if cfg.is_subagent {
+        return false;
+    }
+    return g_interactive;
+}
+
+// ============================================================
+// 队列
+// ============================================================
+
+// 清空队列（启动 / 退出 / 换会话 / 人叫停）。可重复调用。
+export fn bg_notes_init() void {
+    bg_notes_clear();
+    g_bg_notes.dropped = 0;
+}
+
+// 释放队列里所有 Buf（退出时调一次）
+export fn bg_notes_free() void {
+    bg_notes_clear();
+    g_bg_notes.dropped = 0;
+}
+
+// 丢掉队列里所有通知（不动 `dropped` 计数）
+export fn bg_notes_clear() void {
+    var i: usize = 0;
+    while i < g_bg_notes.len {
+        buf_free(&g_bg_notes.items[i]);
+        i = i + 1;
+    }
+    g_bg_notes.len = 0;
+}
+
+// 队列里现有几条（自测与滚动模式的「要不要带超时」判据用）
+export fn bg_notes_len() usize {
+    return g_bg_notes.len;
+}
+
+// 因队列满被丢弃的条数
+export fn bg_notes_dropped() usize {
+    return g_bg_notes.dropped;
+}
+
+// 丢掉队首 k 条（已经投递出去的那些）
+fn bgn_drop_front(k: usize) void {
+    var n: usize = k;
+    if n > g_bg_notes.len {
+        n = g_bg_notes.len;
+    }
+    const keep: usize = g_bg_notes.len - n;
+    var i: usize = 0;
+    while i < n {
+        buf_free(&g_bg_notes.items[i]);
+        i = i + 1;
+    }
+    i = 0;
+    while i < keep {
+        g_bg_notes.items[i] = g_bg_notes.items[i + n];
+        i = i + 1;
+    }
+    // 尾部的槽位清成空 Buf：留着的是**指向同一块堆内存**的副本，将来谁 free
+    // 谁就是双重释放（这里宁可贵一点，也要让「槽位与 len 一一对应」成立）
+    i = keep;
+    while i < g_bg_notes.len {
+        g_bg_notes.items[i] = buf_empty();
+        i = i + 1;
+    }
+    g_bg_notes.len = keep;
+}
+
+// 入队一条（内容**拷贝**进队列）。满 8 条时丢**最旧**的一条并 +1 计数。
+fn bgn_enqueue(p: &const byte, n: usize) bool {
+    if n == 0 {
+        return false;
+    }
+    var take: usize = n;
+    if take > BGN_ITEM_MAX {
+        take = BGN_ITEM_MAX;       // 只截尾（头部那句「谁跑完了」必须留）
+    }
+    if g_bg_notes.len >= BGN_MAX {
+        buf_free(&g_bg_notes.items[0]);
+        var k: usize = 1;
+        while k < g_bg_notes.len {
+            g_bg_notes.items[k - 1] = g_bg_notes.items[k];
+            k = k + 1;
+        }
+        g_bg_notes.len = g_bg_notes.len - 1;
+        g_bg_notes.dropped = g_bg_notes.dropped + 1;
+    }
+    const slot: usize = g_bg_notes.len;
+    g_bg_notes.items[slot] = buf_new(take + 8);
+    if !buf_valid(&g_bg_notes.items[slot]) {
+        return false;
+    }
+    if !buf_append(&g_bg_notes.items[slot], p, take) {
+        return false;
+    }
+    g_bg_notes.len = g_bg_notes.len + 1;
+    return true;
+}
+
+// ============================================================
+// 正文拼装（两个产生端共用同一套口吻）
+// ============================================================
+
+// 用时：`3s` / `2m07s` / `59m+`（与面板同一套读法，但**不**依赖 term 层）
+fn bgn_secs_into(out: &Buf, ms: u64) void {
+    var secs: u64 = ms / (1000 as u64);
+    if ms > 0 && secs == 0 {
+        secs = 1;                  // 不到一秒也别说 0s（那读着像没跑）
+    }
+    if secs >= (3600 as u64) {
+        _ = buf_append_cstr(out, "59m+");
+        return;
+    }
+    if secs >= (60 as u64) {
+        _ = buf_append_u64(out, secs / (60 as u64));
+        _ = buf_append_cstr(out, "m");
+        const r: u64 = secs % (60 as u64);
+        if r < 10 {
+            _ = buf_append_byte(out, 48);
+        }
+        _ = buf_append_u64(out, r);
+        _ = buf_append_cstr(out, "s");
+        return;
+    }
+    _ = buf_append_u64(out, secs);
+    _ = buf_append_cstr(out, "s");
+}
+
+// 已跑毫秒（now <= start 时给 0 —— 时钟回拨不许算出负数）
+fn bgn_elapsed_ms(start_ms: u64, now_ms: u64) u64 {
+    if start_ms == 0 || now_ms <= start_ms {
+        return 0;
+    }
+    return now_ms - start_ms;
+}
+
+// 输出尾部：最多 BGN_TAIL_MAX 字节，起点前移到 UTF-8 字符边界
+// （从序列中间起步会写出非法 UTF-8，踩坑 156 就是这一类）。
+fn bgn_tail_into(out: &Buf, p: &const byte, n: usize) void {
+    if n == 0 {
+        return;
+    }
+    var at: usize = 0;
+    if n > BGN_TAIL_MAX {
+        at = n - BGN_TAIL_MAX;
+        var guard: usize = 0;
+        while at < n && guard < 4 && ((p[at] as i32) & 192) == 128 {
+            at = at + 1;
+            guard = guard + 1;
+        }
+    }
+    _ = buf_append_span(out, p, at, n - at);
+}
+
+// 队列里那条「为什么会有这段话」的抬头（模型看到的第一句）
+fn bgn_head_into(out: &Buf) void {
+    _ = buf_append_cstr(out, "[后台任务通知] 下面这些任务在你做别的事的时候结束了：");
+    _ = buf_append_cstr(out, "不必再用 job_output(wait=true) 轮询，");
+    _ = buf_append_cstr(out, "也不必用 bash 写 sleep/pgrep 等待循环。\n");
+}
+
+// 后台任务结算的通知正文（`job_check` 落终态时调，只发一次）
+export fn bg_notes_push_job(id: i32, status: u8, exit_code: i32,
+                            start_ms: u64, now_ms: u64,
+                            label: &const byte, label_len: usize,
+                            body: &const byte, body_len: usize,
+                            truncated: bool) bool {
+    var m: Buf = buf_new(1024);
+    defer { buf_free(&m); }
+    if !buf_valid(&m) {
+        return false;
+    }
+    _ = buf_append_cstr(&m, "[后台任务完成] job-");
+    _ = buf_append_u64(&m, id as u64);
+    _ = buf_append_cstr(&m, " [bash] ");
+    _ = buf_append_cstr(&m, job_status_name(status));
+    _ = buf_append_cstr(&m, " (exit ");
+    _ = buf_append_i64(&m, exit_code as i64);
+    _ = buf_append_byte(&m, 41);          // ')'
+    if label_len > 0 {
+        _ = buf_append_cstr(&m, " — ");
+        _ = buf_append(&m, label, label_len);
+    }
+    _ = buf_append_cstr(&m, "\n用时 ");
+    bgn_secs_into(&m, bgn_elapsed_ms(start_ms, now_ms));
+    if body_len > 0 {
+        _ = buf_append_cstr(&m, "；输出尾部：\n");
+        bgn_tail_into(&m, body, body_len);
+        if truncated {
+            _ = buf_append_cstr(&m, "\n[output truncated]");
+        }
+    } else {
+        _ = buf_append_cstr(&m, "；没有输出");
+    }
+    _ = buf_append_byte(&m, 10);
+    return bgn_enqueue(m.ptr as &const byte, m.len);
+}
+
+// 子代理结算的通知正文（`deleg_settled` 调，只发一次）。
+// 「结果用 subagent_output 取」这句是必须的：通知里只有尾部，全文还在它的管道里。
+export fn bg_notes_push_agent(id: i32, kind: u8, status: u8, code: i32,
+                              start_ms: u64, now_ms: u64,
+                              label: &const byte, label_len: usize,
+                              body: &const byte, body_len: usize) bool {
+    var m: Buf = buf_new(1024);
+    defer { buf_free(&m); }
+    if !buf_valid(&m) {
+        return false;
+    }
+    _ = buf_append_cstr(&m, "[子代理完成] sub-");
+    _ = buf_append_u64(&m, id as u64);
+    _ = buf_append_cstr(&m, " [");
+    if kind == DELEG_KIND_RALPH {
+        _ = buf_append_cstr(&m, "ralph");
+    } else {
+        _ = buf_append_cstr(&m, "subagent");
+    }
+    _ = buf_append_cstr(&m, "] ");
+    _ = buf_append_cstr(&m, deleg_status_name(status));
+    if code != 0 {
+        _ = buf_append_cstr(&m, " (exit ");
+        _ = buf_append_i64(&m, code as i64);
+        _ = buf_append_byte(&m, 41);
+    }
+    if label_len > 0 {
+        _ = buf_append_cstr(&m, " — ");
+        _ = buf_append(&m, label, label_len);
+    }
+    _ = buf_append_cstr(&m, "\n用时 ");
+    bgn_secs_into(&m, bgn_elapsed_ms(start_ms, now_ms));
+    if body_len > 0 {
+        _ = buf_append_cstr(&m, "；输出尾部（全文用 subagent_output 取）：\n");
+        bgn_tail_into(&m, body, body_len);
+    } else {
+        _ = buf_append_cstr(&m, "；没有输出");
+    }
+    _ = buf_append_byte(&m, 10);
+    return bgn_enqueue(m.ptr as &const byte, m.len);
+}
+
+// ============================================================
+// 投递
+// ============================================================
+
+// 把 job / deleg 的终态与增量收出来（与 `tasks_poll` 同一套：只 drain + WNOHANG）。
+// 产生端在 `job_check` / `deleg_settled` 里，所以投递之前先扫一遍。
+export fn bg_notes_collect() void {
+    jobs_poll_all(&g_jobs);
+    deleg_poll_all(&g_deleg);
+}
+
+// 现在还有没有任何「还会再变的东西」：队列里有货，或还有任务/子代理在跑。
+// 滚动模式的阻塞读用它决定要不要带 200 ms 超时 —— 不带就是无限等，
+// 完成通知永远送不到用户发呆的那一刻。
+export fn bg_notes_watch() bool {
+    if g_bg_notes.len > 0 {
+        return true;
+    }
+    var i: usize = 0;
+    while i < JOB_MAX {
+        if g_jobs.items[i].used && g_jobs.items[i].status == JOB_RUNNING {
+            return true;
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while i < DELEG_MAX {
+        if g_deleg.items[i].used && g_deleg.items[i].status == DELEG_RUNNING {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+// 通知进会话日志（`bg/notify`）。**不走 `agent_log_user`**：那条会把它算成
+// 「人类消息」并推高自动起标题的 revision，而这段话是机器自己写的。
+fn bgn_log(body: &const Buf) void {
+    if !g_sess.save {
+        return;
+    }
+    var ev: Buf = buf_new(body.len + 256);
+    defer { buf_free(&ev); }
+    if !sess_begin(&g_sess, "bg/notify", &ev) {
+        return;
+    }
+    _ = buf_append_cstr(&ev, "{\"role\":\"user\",\"text\":");
+    _ = jw_str_into(&ev, body.ptr as &const byte, body.len);
+    _ = buf_append_cstr(&ev, "}");
+    _ = sess_end(&g_sess, &ev);
+}
+
+// 把队列里的通知拼成**一条** user 消息压进历史，返回是否真投递。
+// step 边界与空闲检查点共用这一份（口径因此在两处一字不差）。
+export fn bg_notes_deliver(cfg: &const Config, h: &History) bool {
+    if g_bg_notes.len == 0 {
+        return false;
+    }
+    if !bgn_enabled(cfg) {
+        bg_notes_clear();
+        g_bg_notes.dropped = 0;
+        return false;
+    }
+    var body: Buf = buf_new(BGN_ITEM_MAX);
+    defer { buf_free(&body); }
+    if !buf_valid(&body) {
+        bg_notes_clear();
+        g_bg_notes.dropped = 0;
+        return false;
+    }
+    bgn_head_into(&body);
+    var took: usize = 0;
+    while took < g_bg_notes.len {
+        const it: &const Buf = &g_bg_notes.items[took];
+        var need: usize = it.len + 1;
+        if took > 0 && body.len + need > BGN_BATCH_MAX {
+            break;                     // 放不下：剩下的留给下一个 step 边界
+        }
+        _ = buf_append(&body, it.ptr, it.len);
+        _ = buf_append_byte(&body, 10);
+        took = took + 1;
+    }
+    if g_bg_notes.dropped > 0 {
+        _ = buf_append_cstr(&body, "（另有 ");
+        _ = buf_append_u64(&body, g_bg_notes.dropped as u64);
+        _ = buf_append_cstr(&body, " 条更早的通知因队列满被丢弃。）\n");
+    }
+    if took < g_bg_notes.len {
+        _ = buf_append_cstr(&body, "（还有 ");
+        _ = buf_append_u64(&body, (g_bg_notes.len - took) as u64);
+        _ = buf_append_cstr(&body, " 条通知，下一个步骤再说。）\n");
+    }
+    var pushed: bool = hist_push(h, ROLE_USER, body.ptr as &const byte,
+        body.len);
+    while !pushed {
+        if !hist_drop_oldest(h) {
+            break;
+        }
+        pushed = hist_push(h, ROLE_USER, body.ptr as &const byte, body.len);
+    }
+    if !pushed {
+        out_err("[bg] 通知写不进历史（内存或条数上限），这一批丢掉\n");
+        bg_notes_clear();
+        g_bg_notes.dropped = 0;
+        return false;
+    }
+    bgn_log(&body);
+    bgn_drop_front(took);
+    g_bg_notes.dropped = 0;
+    return true;
+}
+
+// 界面正忙（有浮层 / 输入行里有字）：自动回合必须让路，否则用户敲的东西会被
+// 一轮机器消息盖过去（与 `agent_title_auto_ui_ok` 同一条纪律）。
+fn bgn_ui_busy() bool {
+    if tui_active() {
+        return tui_has_submit() || tui_overlay_open();
+    }
+    return tty_line_len(&tty_ui) > 0;
+}
+
+// 空闲检查点：投递 + **再开一回合**。返回是否真的跑了一回合。
+//
+// 闸门顺序照 `agent_goal_drive`（那里逐条写着理由）：
+//   开关 / 子代理 → 要退出 → 人按了 esc → 键盘上还有字节 → 输入行有字
+//   → steer 有货 → 队列空。
+// 终止论证：通知**只在一次真结算**时产生，投递后即出队；一个检查点最多投递一次，
+// 中断与异常收场都会清空队列 —— 不会自转。
+export fn bg_notes_drive(cfg: &Config, h: &History) bool {
+    if !bgn_enabled(cfg) || cfg.is_subagent {
+        return false;
+    }
+    const ab: i32 = tui_abort_state();
+    if ab == TUI_ABORT_QUIT {
+        return false;
+    }
+    if ab == TUI_ABORT_TURN {
+        tui_interrupt_clear();         // 消费掉中断意图，下一回合不被它当场打断
+        return false;
+    }
+    if agent_bg_input_pending() || bgn_ui_busy() {
+        return false;
+    }
+    if inbox_len(&g_steer) > 0 {
+        return false;
+    }
+    bg_notes_collect();
+    if !bg_notes_deliver(cfg, h) {
+        return false;                  // 队列空：什么都不发生
+    }
+    if cfg.tui && tui_active() {
+        tui_set_run(TUI_RUN_THINK, "" as &const byte, 0);
+    }
+    tui_interrupt_clear();
+    const rc: i32 = agent_turn_loop(cfg, h);
+    if cfg.tui && tui_active() {
+        agent_tui_turn_done();
+    }
+    if rc == AGENT_INTERRUPTED {
+        bg_notes_clear();              // 人叫停：剩下的一个都不投
+        return true;
+    }
+    if rc != AGENT_OK && rc != AGENT_MAX_TOKENS {
+        bg_notes_clear();              // 异常收场：别再自己续（同 goal drive）
+    }
+    return true;
+}

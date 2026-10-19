@@ -117,13 +117,13 @@ SRC := src/foundation/bufx.uya src/foundation/jsonx.uya src/foundation/yamlcfg.u
        src/tools/askuser.uya src/tools/fsx.uya src/tools/jobs.uya src/tools/perm.uya src/tools/sandboxx.uya src/tools/search.uya src/tools/shxwait.uya src/tools/shellx.uya \
        src/plugin/mcpcfg.uya src/plugin/mcprun.uya src/plugin/mcp.uya src/plugin/mcptool.uya \
        src/session/dshcfg.uya src/session/dshcred.uya src/session/dshdoc.uya src/session/dshfile.uya src/session/dshsave.uya src/session/dshsess.uya src/session/inbox.uya src/session/modelx.uya src/session/procx.uya src/session/session.uya src/session/sigx.uya src/session/stats.uya \
-       src/agent/agent.uya src/agent/ag_config.uya src/agent/ag_title_prompt.uya src/agent/ag_tools_schema.uya src/agent/ag_stream_async.uya src/agent/ag_request_stream.uya src/agent/ag_turn_retry.uya src/agent/ag_workspace_model.uya src/agent/ag_worktree.uya src/agent/ag_interactive_tasks.uya src/agent/ag_tui_sessions.uya src/agent/ag_plan_pump.uya src/agent/ag_pm.uya src/agent/compact.uya src/agent/deleg.uya src/agent/goal.uya src/agent/instr.uya src/agent/plan.uya src/agent/prompt.uya src/agent/skill.uya src/agent/todo.uya src/agent/workflow.uya \
+       src/agent/agent.uya src/agent/ag_config.uya src/agent/ag_title_prompt.uya src/agent/ag_tools_schema.uya src/agent/ag_stream_async.uya src/agent/ag_request_stream.uya src/agent/ag_turn_retry.uya src/agent/ag_workspace_model.uya src/agent/ag_worktree.uya src/agent/ag_bg_notes.uya src/agent/ag_interactive_tasks.uya src/agent/ag_tui_sessions.uya src/agent/ag_plan_pump.uya src/agent/ag_pm.uya src/agent/compact.uya src/agent/deleg.uya src/agent/goal.uya src/agent/instr.uya src/agent/plan.uya src/agent/prompt.uya src/agent/skill.uya src/agent/todo.uya src/agent/workflow.uya \
        src/pm/pm_repo.uya src/pm/pm_store.uya src/pm/pm_ingest.uya src/pm/pm_digest.uya \
        src/vcs/gitx.uya src/vcs/worktreex.uya \
        src/web/ttyemu.uya src/web/dshauth.uya src/web/dshget.uya src/web/webui.uya src/web/wsess.uya src/web/dwhchild.uya src/web/dwhmodel.uya src/web/dwhschema.uya src/web/dwhset.uya src/web/whost.uya src/web/websrv.uya src/web/webhttp.uya src/web/webpump.uya \
        src/media/clipx.uya src/media/clipw.uya src/media/clipt.uya src/media/cliphelp.uya src/media/clip.uya src/media/imgx.uya src/media/imgz.uya \
        src/selftest/selftest.uya src/selftest/shellselftest.uya src/selftest/sigselftest.uya src/selftest/tuiselftest.uya \
-       src/selftest/st_async_rt.uya src/selftest/st_async_io.uya src/selftest/st_async_keys.uya src/selftest/st_async_net.uya src/selftest/st_async_turn.uya src/selftest/st_async_conc.uya src/selftest/st_core.uya src/selftest/st_mock_server.uya src/selftest/st_round_driver.uya src/selftest/st_turn_retry.uya src/selftest/st_tty_sse.uya src/selftest/st_sessions.uya src/selftest/st_read_window.uya src/selftest/st_view_watch.uya src/selftest/st_responses.uya src/selftest/st_stats_ctx.uya src/selftest/st_ctxfit.uya src/selftest/st_title.uya src/selftest/st_tasks_ws.uya src/selftest/st_vision.uya src/selftest/st_goal_worktree.uya src/selftest/st_goal_sess.uya src/selftest/st_todo_resume.uya src/selftest/st_pm.uya src/selftest/st_pm2.uya src/selftest/st_mcp.uya \
+       src/selftest/st_async_rt.uya src/selftest/st_async_io.uya src/selftest/st_async_keys.uya src/selftest/st_async_net.uya src/selftest/st_async_turn.uya src/selftest/st_async_conc.uya src/selftest/st_core.uya src/selftest/st_mock_server.uya src/selftest/st_round_driver.uya src/selftest/st_turn_retry.uya src/selftest/st_bg_notify.uya src/selftest/st_tty_sse.uya src/selftest/st_sessions.uya src/selftest/st_read_window.uya src/selftest/st_view_watch.uya src/selftest/st_responses.uya src/selftest/st_stats_ctx.uya src/selftest/st_ctxfit.uya src/selftest/st_title.uya src/selftest/st_tasks_ws.uya src/selftest/st_vision.uya src/selftest/st_goal_worktree.uya src/selftest/st_goal_sess.uya src/selftest/st_todo_resume.uya src/selftest/st_pm.uya src/selftest/st_pm2.uya src/selftest/st_mcp.uya \
        src/selftest/tuis_core.uya src/selftest/tuis_title_pty.uya src/selftest/tuis_exit_cmd.uya src/selftest/tuis_diff_scroll.uya src/selftest/tuis_title_ask.uya src/selftest/tuis_sessions_big.uya src/selftest/tuis_tail.uya src/selftest/tuis_marquee_row.uya src/selftest/tuis_sel.uya src/selftest/tuis_mem.uya \
        src/selftest/st_web.uya src/selftest/st_web_childcfg.uya src/selftest/st_web_live.uya src/selftest/st_tls_pin.uya src/selftest/st_tls_ca.uya \
        src/selftest/st_dns.uya src/selftest/st_proxy.uya \
@@ -140,7 +140,7 @@ export UYA_ROOT
 export UYA_SPLIT_C_DIR := $(CURDIR)/build/uyacache
 
 # 行宽豁免：一条 .PHONY 就是一张全仓目标清单，拆行反而看不清哪条丢了
-.PHONY: all check wire-schema wire-probe wire-probe-real dsh-web-check dsh-settings-check print-src print-cflags build link-audit selftest codegen-audit doc-audit lint-size lint-size-all doc-cover ui-audit probe e2e e2e-config e2e-exec e2e-accept-nudge e2e-retry e2e-config-flags e2e-title e2e-title-cmd e2e-title-auto e2e-mouse e2e-api e2e-steps e2e-permission e2e-sandbox e2e-tasks e2e-tasks-resume e2e-goal e2e-memory e2e-memory-live e2e-sessions e2e-resume-big e2e-diff e2e-ws e2e-model e2e-model-save e2e-model-route e2e-provider e2e-ctxwindow e2e-inputimage e2e-worktree e2e-watch e2e-watch-pick e2e-dsh e2e-portable e2e-proxy p30-check tui-demo tui-selftest web-selftest sess-selftest diff-selftest model-selftest panel-selftest clean shell-selftest pm-selftest mcp-selftest proxy-selftest
+.PHONY: all check wire-schema wire-probe wire-probe-real dsh-web-check dsh-settings-check print-src print-cflags build link-audit selftest codegen-audit doc-audit lint-size lint-size-all doc-cover ui-audit probe e2e e2e-config e2e-exec e2e-accept-nudge e2e-retry e2e-config-flags e2e-title e2e-title-cmd e2e-title-auto e2e-mouse e2e-api e2e-steps e2e-permission e2e-sandbox e2e-tasks e2e-tasks-resume e2e-goal e2e-memory e2e-memory-live e2e-sessions e2e-resume-big e2e-diff e2e-ws e2e-model e2e-model-save e2e-model-route e2e-provider e2e-ctxwindow e2e-inputimage e2e-worktree e2e-watch e2e-watch-pick e2e-dsh e2e-portable e2e-proxy p30-check tui-demo tui-selftest web-selftest sess-selftest diff-selftest model-selftest panel-selftest clean shell-selftest pm-selftest mcp-selftest proxy-selftest notify-selftest
 
 all: build
 
@@ -2070,6 +2070,11 @@ diff-selftest: build
 # P38：bash 工具的进程侧自测轮（终端收口 / 停住即收口 / 整组收子孙），改 shellx 时比整轮快
 shell-selftest: build
 	UYA_SELFTEST_SHELL_ONLY=1 $(OUT) --selftest
+
+# P104：后台任务/子代理的**异步完成通知**（端到端投递 / 队列语义 / 让路判据），
+# 改 agent/ag_bg_notes.uya 或 jobs/deleg 的结算时比整轮快
+notify-selftest: build
+	UYA_SELFTEST_NOTIFY_ONLY=1 $(OUT) --selftest
 
 # P15/P40：子代理窗口面板的自测轮（几何 / 每行等宽 / 消息预览贴尾），改面板排版时比整轮快
 panel-selftest: build

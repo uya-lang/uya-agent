@@ -149,6 +149,7 @@ readelf -lW build/uya-agent | grep -c INTERP    # 0 = 真静态
 | `--grace-steps N` | **收工预算**：验收类命令在改动之后首次跑绿起，还允许再走 N 步；`0` = 只提醒不截断（**默认**） |
 | `--api-retry-max N` | **传输层重试上限**：连接失败 / IO / 超时 / SSE 早断 / HTTP 408·425·429·5xx 会退避 **0.5–3 s 随机**后重发同一请求。**不给 = 不限次数**（直到成功或你 esc/ctrl+c）；`0` = 一次都不重试（逐字节回到旧行为，CI/排障用）；`N>0` = 最多发 N 次。`UYA_AGENT_API_RETRY_MAX` 同口径 |
 | `--turn-retry-max N` | **回合级自动继续的预算**：一回合没跑完（协议错 / 传输错 / 有正文的截断 / 空响应）就自动替人打一句「继续」重开。`0` = 一次都不续（逐字节回到 P94 之前）；`N>0` = 最多 N 次；**不给 = 交互式会话里不限次数**（直到成功或你 esc/ctrl+c）。管道 / CI / 子代理默认不续。`UYA_AGENT_TURN_RETRY_MAX` 同口径 |
+| `--bg-notify` / `--no-bg-notify` | **后台任务/子代理跑完就通知模型**（默认交互式前台开）。通知在下一个 step 边界投递成一条 user 消息；回合结束之后才完成的，就在空闲时自动再开一回合。关掉它，模型只能自己 `job_output(wait=true)` / `sleep` 轮询。`UYA_AGENT_BG_NOTIFY=0` 同效 |
 | `--plan` | 以 plan 模式启动（先出计划、批准后再执行）；plan 模式**真的拦写**，非交互会话（管道/CI）里没有审阅渠道 ⇒ 只产出计划、写工具始终被拒 |
 | `--permission MODE` | **访问模式**：`read-only` / `workspace-write` / `danger-full-access`（默认）。也收 `--permission=<MODE>`；非法值**报错退出**。来源优先级 CLI > `UYA_AGENT_PERMISSION` > DSH `permission.defaultPreset` |
 | `--no-sandbox` | 关掉 bash 的内核沙箱（bwrap）：confined 模式不再套壳、也不再 fail closed（启动打一行警告） |
@@ -328,6 +329,8 @@ uya-agent --dsh-assets ~/dsh-assets --dsh-web        # 之后都指这份
 `UYA_AGENT_PERMISSION`（三档访问模式，非法值告警后忽略）、
 `UYA_AGENT_SANDBOX`（`0`/`off` = 等价于 `--no-sandbox`）、`UYA_AGENT_BWRAP`（bwrap 路径）、
 `UYA_AGENT_TITLE` / `UYA_AGENT_TITLE_AUTO`（`0` = 关，其它非空值 = 开；CLI 优先）、
+`UYA_AGENT_BG_NOTIFY`（`0`/`off`/`false` = 关掉后台任务的完成通知，其它非空值 = 开；
+同 `--no-bg-notify` / `--bg-notify`，CLI 优先）、
 `UYA_AGENT_MOUSE`（`0` = 关鼠标上报、可直接拖选复制；CLI 优先）、
 `UYA_AGENT_MCP`（`0` = 不读不连 MCP 插件，等价 `--no-mcp`）、
 `UYA_AGENT_WEB_TLS_VERIFY` / `UYA_AGENT_WEB_TLS_PIN`（搜索主机的信任策略，默认继承 cfg）、
@@ -515,10 +518,11 @@ make e2e-memory-live       # 项目记忆的**真机接线**：跑真二进制�
                            # （带真 stat 锚点）+ 跨会话注入 + 改→STALE + 删→GONE
                            # （纯函数自测覆盖不到接线层，见 DESIGN §16 踩坑 129）
 make mcp-selftest          # 只跑 src/plugin/（MCP 插件：公开名 / 握手 / 派发 / 降级）
+make notify-selftest       # 只跑后台完成通知（端到端投递 / 队列语义 / 让路判据）
 make UYA_SELFTEST_ONLY=x,y # 只跑指定的几轮
 ```
 
-**逐轮覆盖点**（§19 的轮次表共 **171 行 / 170 个不重名**的轮次 —— `tui-model` 记了两条）
+**逐轮覆盖点**（§19 的轮次表共 **174 行 / 173 个不重名**的轮次 —— `tui-model` 记了两条）
 见 [DESIGN.md §19](DESIGN.md) —— 那里也是**逐阶段的验收记录**
 （P1–P76 的 before/after 命令、真机对照实验、被自测当场抓住的自身缺陷）。
 
@@ -743,6 +747,16 @@ leaf 指纹怎么算、指纹库放哪儿 —— 见 [DESIGN.md §18](DESIGN.md)
   块不做鼠标交互、点击折叠。折叠行的目标段带**单位与正文**：`目标 3/20轮 · <目标正文>` ——
   `轮` 后面那个数是**轮次上限**（不是任务数），正文与 `round` 的解释见下一条；放不下时
   **只裁正文**，`目标 3/20轮` 始终在（窄终端上也看得见进度）。
+* **后台任务/子代理的完成会主动通知模型**（P104）：跑完那一刻就往一条进程级队列投一条
+  （含用时与输出尾部），并在三个地方交给模型 —— ① **step 边界**（回合运行中，拼成一条
+  user 消息，下一个请求就看见，**不额外花一个来回**）；② **空闲检查点**（回合之间，与
+  `/goal` 自动续跑同一个位置：投递之后**再开一回合**）；③ **等键盘的那段**（滚动模式带
+  200 ms 超时，`TTY_EV_NOTIFY` 交还控制权）。所以模型**不需要**用 `job_output(wait=true)`
+  长等、也不需要写 `sleep`/`pgrep` 等待循环（修前实测：同一个 job 连等 600 s × 5 次，
+  以及 302 s / 602 s / 718 s 的手写等待循环）。三条让路闸门保证它不抢人的输入：要退出 /
+  按了 esc / 键盘上有字节 / 输入行有字或浮层开着 / steer 收件箱有货 —— 任一条命中就一次
+  都不投。**关法**：`--no-bg-notify` 或 `UYA_AGENT_BG_NOTIFY=0`（默认只在交互式前台会话里
+  开；管道、CI、子代理默认关）。详见 [DESIGN.md §19.28](DESIGN.md) 与踩坑 157。
   （**跨会话记忆**是另一套东西，见上面的「项目记忆」与 DESIGN §20。）
 * **会话目标**：`goal.json` 是**会话级记录**，同时由**同会话续跑驱动器**消费（P58，对齐 DSH 的
   `goal-round-driver`）：主循环空闲时，`phase=active` 且有授权的目标会自动开下一轮 —— 往**同一个
