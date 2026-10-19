@@ -9119,7 +9119,7 @@ future），mock 先 accept 两条、记下各自开始时刻，再一起歇 120
 |---|---|---|
 | 运行时（`src/rt/`） | ✅ `rt_run` / 帧回调 / 协作取消 / `rt_sleep` / `rt_read`·`write`·`accept`·`connect`·`wait_any2`·`join2`·`select2` | `async-rt`、`async-io` |
 | 键盘（fd 0） | ✅ 唯一读者 `term/tui/inp.uya`；TUI 管道 / 只交字节 / 同步桥；滚动 REPL 的读行已接入 | `async-keys` |
-| 网络数据面 | ✅ `ahc_open` / `ahc_fill`（连接异步、数据面异步）；DNS 与 TLS 握手仍同步（原因见 §19.22） | `async-net` |
+| 网络数据面 | ✅ `ahc_open` / `ahc_fill`（连接异步、数据面异步；明文与 TLS **两条都覆盖**，见 §19.27）；DNS 与 TLS 握手仍同步（原因见 §19.22） | `async-net` + 真机 TUI |
 | LLM 流式 | ✅ `allm_stream_style`；交互模式下经事件循环 | `async-sse` |
 | 回合链（流式这一段） | ✅ `agent_stream_call`；工具执行仍同步（泵点仍活着） | `interrupt` + 全套 e2e |
 | 前台子进程 | ✅ `shx_wait_run`（epoll 等管道）；其余子进程等待仍轮询 | `shellx_selftest_all` |
@@ -9129,3 +9129,45 @@ future），mock 先 accept 两条、记下各自开始时刻，再一起歇 120
 **两条纪律留给后来者**：① **不要**在帧回调里读键（会抢在请求发出之前吃掉按键，
 `interrupt` 腿会红）；② 任何「要在事件循环上等一会儿」的新路径都调
 `agent_rt_begin()` / `agent_rt_end()`，不要自己 `rt_set_frame`（单槽会互相覆盖）。
+
+### 19.27 P103：修「交互模式连不上 https 端点」（async 数据面漏了 TLS）
+
+**现场**：`main`（P100–P102）上交互模式（TUI / 滚动 REPL）发任何 https 请求都进
+`[retry] transport`，无限重发直到人按 esc；同一个 key 走一次性/管道模式（同步路）
+一切正常。回退到 `pre-async-p97`（P96）构建则当场好 —— 分界线就是 async 改造。
+
+**根因**：`net/ahttp` 的 P99 只搬了「谁去等 I/O」，**没有搬 TLS 那一层**。
+`ahc_open` / `ahc_fill` 直接 `rt_write` / `rt_read` 原 fd，可 TLS 的加解密在用户态
+（标准库 `ssl_write` / `ssl_read`）：于是明文 `POST ...` 被写进一条 TLS 连接
+（`strace` 实见 `write(9, "POST /responses HTTP/1.1...")`），服务端看到畸形 record
+后掐连接，客户端读回 EOF ⇒ `HcBadResponse` ⇒ 传输层重试。同步路一直是走
+`conn_read` / `conn_write_all`（按记录解密/加密），所以同一个 key 在那条路上是好的。
+「数据面异步」在 TLS 上根本不成立 —— 只是 `async-net` 那条腿用的是明文 mock，
+没照见。
+
+**修法**（判据仍然只有一份，语义照抄同步路）：
+1. `net/ahttp` 增加记录级读写：`ahc_read_exact` 读满 5 字节记录头与负载，
+   `ahc_tls_read_some` 只解密 `APPLICATION_DATA`、alert 当 EOF、空记录跳过，
+   `ahc_tls_write_all` 按 ≤16 KiB 切明文、`ssl_write` 后 `rt_write` 写满密文；
+   明文与 TLS 由 `ahc_read_stream` / `ahc_write_stream` 一处分发。
+2. TLS 握手仍是阻塞的（§19.22 的边界不变），但 async 路自己 `sys_socket` 出来的 fd
+   以前**没有收发超时**，一个不回包的服务器能把进程挂死：`httpc` 导出
+   `hc_set_rw_timeout`，同步与 async 两条路共用（`tcp_connect` 改成调它）。
+3. `net/allm` 的错误映射补全传输层的每一档：以前除 BadResponse/TooLarge/OOM/Timeout
+   之外一律折成 `HcIoFailed`，交互模式下的失败报告因此永远只剩「网络或 TLS 校验」
+   一句；现在 DNS / TCP / 握手 / 代理 / 指纹族逐一保留，与同步路 `try` 透传一致。
+
+**这一轮踩到的两个坑**（都是「编译/类型不报错，但运行期行为完全错」那一类）：
+* 把 `st`（类型已经是 `&HcStream`）写成 `&st` 传给 `@async_fn`：检查器接受了，
+  生成的状态机里是 `s->st = (&s->st)`，被调方拿到的其实是**指针变量本身的地址**，
+  `st->fd` 读出来是一个堆地址（实测 `write(150970688, ...)` ⇒ EBADF）。
+  教训：async 调用点先核一遍实参类型，`&` 不是「保险」。
+* Uya 的 async 状态机在「`@await` 位于**循环体内的 if 里**」时，await 恢复后直接
+  跳回循环头，**跳过 if 之后的语句**：`ahc_tls_read_some` 因此只读记录头、永远不
+  解密，最后在 EOF 处报 `HcBadResponse`（表面看像服务端不认请求）。把负载读取挪到
+  循环体顶层（`rec_len == 0` 时 `ahc_read_exact` 立刻返回）即正常；ahttp 里那行注释
+  写明了原因，后来者别「优化」回 if 里。
+
+**判据**：① 阻断性真机判据 —— TUI 对真实端点发一句，必须一次成功、无 `[retry]`
+（修前：无限 transport 重试）；② 既有 `async-net` / `async-sse` 全绿（明文路不许
+回退）；③ `make selftest` 全量绿（同步路行为一个字不动）。

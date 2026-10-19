@@ -28,9 +28,15 @@
 
 use std.async;
 use libc.syscall;
+use tls.common;
+use tls.https;
 
 // 一次最多读多少 wire 字节（与 httpstream 的 `HC_READ_CHUNK` 同值）。
 const AHC_READ_CHUNK: usize = 16384;
+// 单条 TLS 记录的明文上限 / 密文缓冲（与 httpc 的 `HC_TLS_CHUNK` / `HC_TLS_BUF` 同值）。
+// **两处同值改一处要改两处**：记录格式由 tls 标准库定，这里只是按它切与收。
+const AHC_TLS_CHUNK: usize = 16384;
+const AHC_TLS_BUF: usize = 16896;
 // 响应头上限（与 httpstream 的 `HC_HEAD_MAX` 同值：超了就是坏响应）。
 // **两处同值改一处要改两处** —— 判据在 httpstream，这里只是提前挡住无界增长。
 const AHC_HEAD_MAX: usize = 65536;
@@ -71,6 +77,10 @@ const AHC_HEAD_MAX: usize = 65536;
     const fd: i32 = sys_socket(AF_INET, SOCK_STREAM, IPPROTO_TCP) catch {
         return error.HcConnectFailed;
     };
+    // P103：TLS 握手仍是**阻塞**的（不变量②），所以握手前必须让 fd 带上收发超时。
+    // 同步路的 `tcp_connect` 一直这么做；async 路自己 sys_socket 出来的 fd 没有，
+    // 漏掉它一个不回包的服务器就能把整个进程挂住（超时参数等于没写）。
+    hc_set_rw_timeout(fd, timeout_ms);
     rt_set_nonblock(fd);
     var dl: u64 = 0;
     if timeout_ms > 0 {
@@ -124,6 +134,160 @@ export fn ahc_write_all(
     deadline_ms: u64
 ) Future<!usize> {
     return ahc_write_all_run(fd, src, len, deadline_ms);
+}
+
+// ============================================================
+// TLS 数据面（P103）：fd 上是**密文**，读写都得按记录切
+//
+// 为什么不能直接 `rt_read` / `rt_write`：TLS 的加密在用户态（标准库的
+// `ssl_read` / `ssl_write`，见 httpc 的 `tls_read_some` / `tls_write_all`）。
+// 直接往 TLS 的 fd 写明文，对端只会看到一条畸形 record 后掐连接 —— 症状是
+// 「请求发出去了，收不到一个字节」，与网络故障长得一模一样。
+// 同步路一直是对的（`conn_read` / `conn_write_all` 按记录走 TLS），async 路
+// P99 只搬了「谁去等 I/O」，漏了这一层，于是**交互模式下所有 https 端点都连不上**
+// （一次性/管道模式走同步路，所以同一个 key 在那里是好的）。
+//
+// 判据与同步路一致：记录头 5 字节（类型 + 版本 + 长度），只解密
+// APPLICATION_DATA，alert 当 EOF（close_notify），握手/CCS 记录跳过。
+// ============================================================
+
+// 读满 need 字节（记录头与负载都必须读满才谈得上解密）。
+// 返回 1 = 读满；0 = 对端关闭；取消 / 超时 / IO 错误照 `rt_read` 的收口。
+@async_fn fn ahc_read_exact(
+    fd: i32,
+    out: &byte,
+    need: usize,
+    deadline_ms: u64
+) Future<!usize> {
+    var off: usize = 0;
+    while off < need {
+        const p: &byte =
+            @ptr_from_usize(@usize_from_ptr(out as &void) + off) as &byte;
+        var got: usize = 0;
+        const rr: !usize = @await rt_read(
+            fd, p, need - off, deadline_ms, &got);
+        const flag: usize = try rr;
+        if flag == 0 || got == 0 {
+            return 0 as usize;
+        }
+        off = off + got;
+    }
+    return 1 as usize;
+}
+
+// 读一条 TLS 记录并解密。返回码与 `rt_read` 同形（1 = 有明文，0 = 对端关闭）。
+@async_fn fn ahc_tls_read_some(
+    st: &HcStream,
+    out: &byte,
+    cap: usize,
+    deadline_ms: u64,
+    n_out: &usize
+) Future<!usize> {
+    var rec: [byte: AHC_TLS_BUF] = [0: AHC_TLS_BUF];
+    while true {
+        const h: usize = try @await ahc_read_exact(
+            st.fd, &rec[0], 5, deadline_ms);
+        if h == 0 {
+            return 0 as usize;
+        }
+        const rec_len: usize = ((rec[3] as usize) << (8 as i32))
+            | (rec[4] as usize);
+        if 5 + rec_len > AHC_TLS_BUF {
+            return error.HcBadResponse;
+        }
+        // 负载必须**无条件**读（rec_len == 0 时 `ahc_read_exact` 立刻返回 1）。
+        // 不要把这行塞进 `if rec_len > 0 { }` 里：Uya 的 async 状态机在
+        // 「await 位于循环体内的 if 里」时会从 await 之后直接跳回循环头，
+        // 把 if 之后的语句（解密那一段）整段跳过（P103 实测：只读到记录头，
+        // 永远不解密，最后在 EOF 处报 HcBadResponse）。放在循环体顶层就正常。
+        const b: usize = try @await ahc_read_exact(
+            st.fd, &rec[5], rec_len, deadline_ms);
+        if b == 0 {
+            return 0 as usize;
+        }
+        const rt: byte = rec[0];
+        if rt == (TLS_RECORD_ALERT as byte) {
+            // close_notify（或致命告警）等价于 EOF：手里已解出的明文由上层先消费。
+            return 0 as usize;
+        }
+        if rt != (TLS_RECORD_APPLICATION_DATA as byte) || rec_len == 0 {
+            continue;
+        }
+        var plen: usize = 0;
+        var consumed: usize = 0;
+        ssl_read(st.tc.ctx, &rec[0], 5 + rec_len, out, cap,
+            &plen, &consumed) catch {
+            return error.HcIoFailed;
+        };
+        if plen == 0 {
+            continue;
+        }
+        n_out[0] = plen;
+        return 1 as usize;
+    }
+    return 0 as usize;
+}
+
+// 写满整段明文：按 ≤16 KiB 切记录，加密后交给 `rt_write` 写满密文。
+// 返回值是**明文**字节数（与 `rt_write` 同口径）；同步路 `tls_write_all` 同一个形状
+// （那边每片还插一次泵点，这里由 rt 的帧回调负责读键 / 刷帧）。
+@async_fn fn ahc_tls_write_all(
+    st: &HcStream,
+    src: &const byte,
+    len: usize,
+    deadline_ms: u64
+) Future<!usize> {
+    var off: usize = 0;
+    var rec: [byte: AHC_TLS_BUF] = [0: AHC_TLS_BUF];
+    while off < len {
+        var take: usize = len - off;
+        if take > AHC_TLS_CHUNK {
+            take = AHC_TLS_CHUNK;
+        }
+        const p: &const byte = @ptr_from_usize(
+            @usize_from_ptr(src as &void) + off) as &const byte;
+        var clen: usize = 0;
+        ssl_write(st.tc.ctx, p, take, &rec[0], AHC_TLS_BUF, &clen) catch {
+            return error.HcIoFailed;
+        };
+        _ = try @await rt_write(st.fd, &rec[0], clen, deadline_ms);
+        off = off + take;
+    }
+    return off;
+}
+
+// 读一段（明文直读 / TLS 解出一条记录的明文）。返回码与 `rt_read` 同形。
+@async_fn fn ahc_read_stream(
+    st: &HcStream,
+    out: &byte,
+    cap: usize,
+    deadline_ms: u64,
+    n_out: &usize
+) Future<!usize> {
+    if st.is_tls {
+        const r: !usize = @await ahc_tls_read_some(
+            st, out, cap, deadline_ms, n_out);
+        return try r;
+    }
+    const r2: !usize = @await rt_read(
+        st.fd, out, cap, deadline_ms, n_out);
+    return try r2;
+}
+
+// 写满整段（明文直写 / TLS 分记录加密后写）。返回已写的**明文**字节数。
+@async_fn fn ahc_write_stream(
+    st: &HcStream,
+    src: &const byte,
+    len: usize,
+    deadline_ms: u64
+) Future<!usize> {
+    if st.is_tls {
+        const w: !usize = @await ahc_tls_write_all(
+            st, src, len, deadline_ms);
+        return try w;
+    }
+    const w2: !usize = @await rt_write(st.fd, src, len, deadline_ms);
+    return try w2;
 }
 
 // async 版的 `hc_open`：建连（TCP 异步 / 握手同步一次）→ 拼请求 → 异步写 →
@@ -194,7 +358,7 @@ export fn ahc_write_all(
     if timeout_ms > 0 {
         dl = deadline_after_ms(timeout_ms) catch { 0 as u64; };
     }
-    const wr: !usize = @await rt_write(fd, &req.ptr[0], req.len, dl);
+    const wr: !usize = @await ahc_write_stream(st, &req.ptr[0], req.len, dl);
     _ = wr catch |err| {
         _ = sys_close(fd) catch {};
         return err;
@@ -224,8 +388,8 @@ export fn ahc_write_all(
             return error.HcBadResponse;
         }
         var got: usize = 0;
-        const rr: !usize = @await rt_read(
-            fd, &tmp[0], AHC_READ_CHUNK, dl, &got);
+        const rr: !usize = @await ahc_read_stream(
+            st, &tmp[0], AHC_READ_CHUNK, dl, &got);
         const flag: usize = rr catch |err| {
             _ = sys_close(fd) catch {};
             return err;
@@ -281,8 +445,8 @@ export fn ahc_open(
     }
     var tmp: [byte: AHC_READ_CHUNK] = [0: AHC_READ_CHUNK];
     var got: usize = 0;
-    const rr: !usize = @await rt_read(
-        st.fd, &tmp[0], AHC_READ_CHUNK, deadline_ms, &got);
+    const rr: !usize = @await ahc_read_stream(
+        st, &tmp[0], AHC_READ_CHUNK, deadline_ms, &got);
     const flag: usize = rr catch |err| {
         return err;
     };
