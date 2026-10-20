@@ -14,6 +14,8 @@
 //   ④ `pending` 有界（`STATS_PENDING_MAX`=8），满了丢**最老**一条；`turn/end` 丢弃所有
 //   未结算的 `tool/call`（不凭空造时间）；⑤ token 四桶互不重叠，`billed = 未缓存 + 缓存读 +
 //   缓存写 = last_pressure`；`out_tokens <= 0` 视为提供方没上报 ⇒ 不记 decode；
+//   ⑤b 窗口 < `ST_DECODE_MIN_MS` 也 ⇒ 不记 decode（另计一步 `decode_short_steps`，见 §4.6：
+//   假流式网关下那个窗口只有 0–1 ms，记下去只会得到一个天文数字的 tok/s）；
 //   ⑥ 时间/比率一律经 `st_clamp0` 钳 0（时钟回退、负增量不许污染累计值）。
 // 依赖：foundation/bufx（Buf、`bufx_mem_eq`、`bufx_eq_cstr`）；本仓 session/session
 //   （`st_fold_line` 用 `sess_line_type`/`sess_json_i64`/`sess_json_str` 解析日志行）。
@@ -47,6 +49,20 @@
 
 const STATS_PENDING_MAX: usize = 8;   // 未结算的 tool/call 上限（同步派发时只会用到 1 个）
 
+// 解码窗口的**测量下限**（毫秒）。见 §4.6：有些网关（实测 opencode 的
+// `/v1/responses`）把整段生成攒在一个网络块里回下来 —— 客户端一次 `hc_fill` 就把
+// 全部 delta 都收到，于是「首 token → 消息组装」只剩一次调度的时间（实测 0–1 ms），
+// 而分子是提供方上报的**全部**输出 token ⇒ tok/s 是个天文数字（实测 4.4 万，真值约
+// 170，相差 260 倍）。这种窗口不产生读数，只产生噪声。
+//
+// 100 ms 这个值由两侧实测夹住：真正流式的同一网关走 chat 协议时窗口是 1.3 s，
+// 真机长回答是 4.2 s（DESIGN §4.6），而假流式只有 0–1 ms —— 相差三个数量级，
+// 阈值取中间任意值都行，100 ms 顺带也是「≥ 1 token 才可能量出 ≥10 tok/s」的量级。
+//
+// 跳过的步**必须计数并显示**（`st_decode_short_steps`）：跳过是为了不报假数，
+// 不是为了把「没有读数」藏起来 —— 与命中率的「未拆分 N 步」同一条纪律（踩坑 123）。
+const ST_DECODE_MIN_MS: i64 = 100;
+
 struct StatPending {
     id: Buf,
     at: i64,
@@ -62,6 +78,10 @@ export struct Stats {
     ttft_steps: i64,
     decode_ms: i64,
     decode_tokens: i64,
+    // 「窗口太短、测不出速率」的步数（见 ST_DECODE_MIN_MS 与 §4.6）。
+    // 必须如实计数并显示：跳过是为了不报假数，不是为了把「没有读数」藏起来
+    // —— 与命中率的「未拆分 N 步」同一条纪律（踩坑 123）。
+    decode_short_steps: i64,
     // token 账目（DSH 的 tokenUsage 投影：互不重叠的输入桶 + 输出）
     in_uncached: i64,
     cache_read: i64,
@@ -99,6 +119,7 @@ var g_stats: Stats = Stats{
     ttft_steps: 0,
     decode_ms: 0,
     decode_tokens: 0,
+    decode_short_steps: 0,
     in_uncached: 0,
     cache_read: 0,
     cache_write: 0,
@@ -164,6 +185,7 @@ export fn st_reset() void {
     g_stats.ttft_steps = 0;
     g_stats.decode_ms = 0;
     g_stats.decode_tokens = 0;
+    g_stats.decode_short_steps = 0;
     g_stats.in_uncached = 0;
     g_stats.cache_read = 0;
     g_stats.cache_write = 0;
@@ -211,6 +233,7 @@ export fn st_first_token(turn: i64, step: i64, ms: u64) void {
 
 // 一步收尾：llm/ttft/decode 时间 + token 账目
 // out_tokens <= 0 视为「提供方没上报输出 token」→ 不记 decode（见 §15.4 的偏差说明）
+// 窗口 < ST_DECODE_MIN_MS 同样不记 decode，只计一步「窗口太短」（见 §4.6）
 //
 // split_known = 提供方这一步**给了缓存明细**。token 账目（含 last_pressure）无论真假都照记
 // —— 压力口径要的是真实 prompt 大小，与「读数拆没拆开」无关；只有**命中率**的分母受它影响，
@@ -249,8 +272,16 @@ export fn st_assistant_message(turn: i64, step: i64, ms: u64, in_uncached: i64,
         g_stats.ttft_ms = g_stats.ttft_ms + st_clamp0(g_stats.first_token_ms - g_stats.open_ms);
         g_stats.ttft_steps = g_stats.ttft_steps + 1;
         if ot > 0 {
-            g_stats.decode_ms = g_stats.decode_ms + st_clamp0(t - g_stats.first_token_ms);
-            g_stats.decode_tokens = g_stats.decode_tokens + ot;
+            const win: i64 = st_clamp0(t - g_stats.first_token_ms);
+            // 窗口短到测不出速率就**不记这一笔**（见 ST_DECODE_MIN_MS）：
+            // 记下去只会得到一个「好得不像真的」的数字，而用户会照它做判断。
+            // 这一步照常计数，界面据此显示「短窗口 N 步」。
+            if win < ST_DECODE_MIN_MS {
+                g_stats.decode_short_steps = g_stats.decode_short_steps + 1;
+            } else {
+                g_stats.decode_ms = g_stats.decode_ms + win;
+                g_stats.decode_tokens = g_stats.decode_tokens + ot;
+            }
         }
     }
     g_stats.have_open = false;
@@ -463,6 +494,13 @@ export fn st_ttft_steps() i64 { return g_stats.ttft_steps; }
 export fn st_decode_ms() i64 { return g_stats.decode_ms; }
 // 解码输出 token 累计（decode_ms 的分子）
 export fn st_decode_tokens() i64 { return g_stats.decode_tokens; }
+// 窗口太短（< ST_DECODE_MIN_MS）被排除在解码账之外的步数；0 = 本会话没有这种情况。
+// 界面据此显示「短窗口 N 步」—— 读数必须能被正确解读，否则「一个 tok/s 都没有」
+// 会被读成「网关慢」，而真相是「这一路的流攒成一坨、速率根本量不出来」。
+export fn st_decode_short_steps() i64 { return g_stats.decode_short_steps; }
+// 解码窗口的测量下限（毫秒）。导出是为了让自测的边界判据绑在**这个值**上，
+// 而不是抄一个会漂移的魔数（改常量就该同时改掉那两处断言）。
+export fn st_decode_min_ms() i64 { return ST_DECODE_MIN_MS; }
 // 计费输入 = 未缓存 + 缓存读 + 缓存写（三个互不重叠的桶；DSH 的 billedInput）
 export fn st_billed_input() i64 { return g_stats.in_uncached + g_stats.cache_read + g_stats.cache_write; }
 // 命中率的分母（P72 踩坑 123）：只算「提供方给了缓存明细」的步。
@@ -687,6 +725,16 @@ export fn st_line(out: &Buf) bool {
             st_fmt_tps(&spd, g_stats.decode_tokens, g_stats.decode_ms);
             _ = buf_append_cstr(&spd, " tok/s");
         }
+        // 被排除在解码账之外的步（窗口太短）：如实标出来，否则「没有 tok/s」会被读成
+        // 「网关慢」或「压根没跑」，而真相是「这一路的流攒成一坨、速率量不出来」（§4.6）。
+        if g_stats.decode_short_steps > 0 {
+            if spd.len > 0 {
+                _ = buf_append_cstr(&spd, " · ");
+            }
+            _ = buf_append_cstr(&spd, "短窗口 ");
+            _ = buf_append_i64(&spd, g_stats.decode_short_steps);
+            _ = buf_append_cstr(&spd, " 步");
+        }
         if spd.len > 0 {
             st_line_sep(out);
             _ = buf_append(out, spd.ptr, spd.len);
@@ -879,8 +927,20 @@ export fn st_stats_detail(out: &Buf) void {
         st_fmt_tokens(out, g_stats.decode_tokens);
         _ = buf_append_cstr(out, " tok / ");
         st_fmt_duration(out, g_stats.decode_ms);
+    } else if g_stats.decode_short_steps > 0 {
+        // 不写死具体毫秒数：下限是 ST_DECODE_MIN_MS，改它不该让这句话变成谎话
+        _ = buf_append_cstr(out, "-（窗口太短，速率量不出来）");
     } else {
         _ = buf_append_cstr(out, "-");
+    }
+    if g_stats.decode_short_steps > 0 && g_stats.decode_ms > 0 {
+        _ = buf_append_cstr(out, " · 短窗口 ");
+        _ = buf_append_i64(out, g_stats.decode_short_steps);
+        _ = buf_append_cstr(out, " 步未计入");
+    } else if g_stats.decode_short_steps > 0 {
+        _ = buf_append_cstr(out, " · ");
+        _ = buf_append_i64(out, g_stats.decode_short_steps);
+        _ = buf_append_cstr(out, " 步被排除");
     }
     _ = buf_append_cstr(out, "\n缓存命中      ");
     var ch: Buf = buf_new(32);
