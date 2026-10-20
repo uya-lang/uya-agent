@@ -1,0 +1,391 @@
+// lib/std/http/websocket_types.uya - WebSocket 公共类型与接口
+//
+// 模块路径：use std.http.websocket_types
+
+use std.async;
+use tls.https;
+use tls.ssl.context;
+use tls.ssl.handshake;
+use tls.ssl.record;
+use libc.sys_close;
+
+// WebSocket over TLS 只需要覆盖单条 TLS record 的暂存预算；
+// 更大的 WebSocket frame/message 仍由上层 max_frame_size / max_message_size 控制。
+const WS_TLS_RECORD_PLAIN_SCRATCH: usize = RECORD_MAX_PLAIN;
+const WS_TLS_RECORD_CIPHER_SCRATCH: usize = RECORD_HEADER_LEN + 8 + RECORD_MAX_PLAIN + 16;
+
+export error WebSocketBadHandshake;
+export error WebSocketUnsupportedVersion;
+export error WebSocketMissingKey;
+export error WebSocketInvalidKey;
+export error WebSocketProtocolError;
+export error WebSocketFrameTooLarge;
+export error WebSocketMessageTooLarge;
+export error WebSocketNeedMoreData;
+export error WebSocketConnectionClosed;
+export error WebSocketMaskedServerFrame;
+export error WebSocketUnmaskedClientFrame;
+export error WebSocketUnsupportedOpcode;
+export error WebSocketUtf8Required;
+export error WebSocketControlFrameTooLarge;
+export error WebSocketFragmentedControlFrame;
+export error WebSocketContinuationMissing;
+export error WebSocketQueueFull;
+export error WebSocketHeartbeatTimeout;
+export error WebSocketReconnectExhausted;
+export error WebSocketExtensionsNotSupported;
+
+export const WS_GUID: &const byte = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+export const WS_MAX_HEADER_BYTES: usize = 14;
+export const WS_CONTROL_MAX_PAYLOAD: usize = 125;
+
+/// WebSocket opcode。
+/// 参数说明：无。
+/// 返回值说明：枚举值供 frame/message 层使用。
+export enum WebSocketOpcode {
+    Continuation = 0,
+    Text = 1,
+    Binary = 2,
+    Close = 8,
+    Ping = 9,
+    Pong = 10,
+}
+
+/// WebSocket 连接角色。
+/// 参数说明：无。
+/// 返回值说明：`Server` 表示服务端，`Client` 表示客户端。
+export enum WebSocketRole {
+    Server,
+    Client,
+}
+
+/// 单帧视图。
+/// 参数说明：字段均为协议层视图；`payload` 生命周期绑定到外部缓冲区。
+/// 返回值说明：无。
+export struct WebSocketFrameView {
+    fin: bool,
+    opcode: WebSocketOpcode,
+    masked: bool,
+    payload_ptr: &byte,
+    payload_len: usize,
+    mask_key: [byte: 4],
+}
+
+/// 聚合后的消息视图。
+/// 参数说明：`payload` 生命周期绑定到调用方提供的消息缓冲区。
+/// 返回值说明：无。
+export struct WebSocketMessageView {
+    opcode: WebSocketOpcode,
+    payload_ptr: &byte,
+    payload_len: usize,
+}
+
+/// 心跳策略。
+/// 参数说明：所有时间均为毫秒；`0` 表示关闭对应策略。
+/// 返回值说明：无。
+export struct WebSocketHeartbeatConfig {
+    ping_interval_ms: u32 = 0,
+    pong_timeout_ms: u32 = 0,
+    idle_timeout_ms: u32 = 0,
+}
+
+/// Upgrade / 连接接入选项。
+/// 参数说明：`subprotocols` 为服务端支持的协议名数组首元素地址，`subprotocol_count` 为数量。
+/// 返回值说明：无。
+export struct WebSocketAcceptOptions {
+    subprotocols: &const byte = null,
+    subprotocol_count: i32 = 0,
+    allow_extensions: bool = false,
+    max_frame_size: usize = 65536,
+    max_message_size: usize = 1048576,
+    auto_pong: bool = true,
+    send_queue_capacity: i32 = 16,
+    heartbeat: WebSocketHeartbeatConfig = WebSocketHeartbeatConfig{},
+}
+
+/// 自动重连策略。
+/// 参数说明：`initial_delay_ms` / `max_delay_ms` 为重连等待；`backoff_multiplier_x1000` 以千分比表达倍率。
+/// 返回值说明：无。
+export struct ReconnectPolicy {
+    enabled: bool = false,
+    max_retries: i32 = 0,
+    initial_delay_ms: u32 = 1000,
+    max_delay_ms: u32 = 30000,
+    backoff_multiplier_x1000: u32 = 2000,
+}
+
+/// WebSocket 底层 transport 抽象。
+/// 参数说明：复用 `AsyncReader` / `AsyncWriter` 风格，并补充 fd 借用与生命周期操作。
+/// 返回值说明：供 `WebSocketConn` 统一读写、关闭与所有权转移。
+export interface WebSocketTransport {
+    fn read(self: &Self, buf: &byte, count: usize) Future<!usize>;
+    fn read_exact(self: &Self, buf: &byte, count: usize) Future<!usize>;
+    fn write(self: &Self, data: &const byte, count: usize) Future<!usize>;
+    fn write_all(self: &Self, data: &const byte, count: usize) Future<!usize>;
+    fn flush(self: &Self) Future<!usize>;
+    fn borrow_fd(self: &Self) i32;
+    fn take_fd(self: &Self) i32;
+    fn close(self: &Self) void;
+    fn is_closed(self: &Self) bool;
+}
+
+/// WebSocket over TLS transport。
+/// 参数说明：内部持有 TLS 会话状态、底层 fd 与明文缓冲区；具体读写方法在 `websocket_tls.uya` 中实现。
+/// 返回值说明：无。
+export struct WebSocketTlsTransport : AsyncReader, AsyncWriter, WebSocketTransport {
+    fd: i32 = -1,
+    owned: i32 = 0,
+    closed: i32 = 1,
+    hs: HandshakeCtx = HandshakeCtx{},
+    rec: RecordCtx = RecordCtx{},
+    ctx: SslContext = SslContext{},
+    plain: [byte: WS_TLS_RECORD_PLAIN_SCRATCH] = [0: WS_TLS_RECORD_PLAIN_SCRATCH],
+    plain_off: usize = 0,
+    plain_len: usize = 0,
+}
+
+fn websocket_tls_copy_bytes(dst: &byte, src: &const byte, len: usize) void {
+    var i: usize = 0;
+    while i < len {
+        dst[i] = src[i];
+        i = i + 1;
+    }
+}
+
+fn websocket_tls_ready_result(result: !usize) Future<!usize> {
+    if result.error_id != 0u32 {
+        return Future<!usize>{ state: Poll<!usize>.Ready(result) };
+    }
+    return future_ready_ok<usize>(result.value);
+}
+
+fn websocket_tls_transport_reset_plain(self: &WebSocketTlsTransport) void {
+    self.plain_off = 0;
+    self.plain_len = 0;
+}
+
+export fn websocket_tls_transport_rebind(self: &WebSocketTlsTransport) void {
+    if self == null {
+        return;
+    }
+    self.ctx.hs = &self.hs;
+    self.ctx.rec = &self.rec;
+}
+
+fn websocket_tls_transport_fill_plain(self: &WebSocketTlsTransport) !void {
+    var cipher: [byte: WS_TLS_RECORD_CIPHER_SCRATCH] = [0: WS_TLS_RECORD_CIPHER_SCRATCH];
+    while true {
+        var cipher_len: usize = 0;
+        https_read_tls_record_exact(self.fd, &cipher[0], WS_TLS_RECORD_CIPHER_SCRATCH, &cipher_len) catch {
+            self.close();
+            return error.WebSocketConnectionClosed;
+        };
+        var plain_len: usize = 0;
+        var consumed: usize = 0;
+        ssl_read(&self.ctx, &cipher[0], cipher_len, &self.plain[0], WS_TLS_RECORD_PLAIN_SCRATCH, &plain_len, &consumed) catch {
+            self.close();
+            return error.WebSocketConnectionClosed;
+        };
+        if plain_len == 0 {
+            continue;
+        }
+        self.plain_off = 0;
+        self.plain_len = plain_len;
+        return;
+    }
+}
+
+fn websocket_tls_transport_read_some_sync(self: &WebSocketTlsTransport, out: &byte, out_max: usize) !usize {
+    if self.closed != 0 || self.fd < 0 {
+        return error.WebSocketConnectionClosed;
+    }
+    if out == null || out_max == 0 {
+        return 0 as usize;
+    }
+    if self.plain_off >= self.plain_len {
+        try websocket_tls_transport_fill_plain(self);
+    }
+    if self.plain_off > self.plain_len || self.plain_len > WS_TLS_RECORD_PLAIN_SCRATCH || self.plain_off >= WS_TLS_RECORD_PLAIN_SCRATCH {
+        self.close();
+        return error.WebSocketConnectionClosed;
+    }
+    var avail: usize = self.plain_len - self.plain_off;
+    if avail > out_max {
+        avail = out_max;
+    }
+    const src: &const byte = @ptr_from_usize(@usize_from_ptr(&self.plain[0] as &void) + self.plain_off) as &const byte;
+    websocket_tls_copy_bytes(out, src, avail);
+    self.plain_off = self.plain_off + avail;
+    if self.plain_off >= self.plain_len {
+        websocket_tls_transport_reset_plain(self);
+    }
+    return avail;
+}
+
+fn websocket_tls_transport_read_exact_sync(self: &WebSocketTlsTransport, out: &byte, total: usize) !usize {
+    var copied: usize = 0;
+    while copied < total {
+        const n: usize = try websocket_tls_transport_read_some_sync(self, &out[copied], total - copied);
+        if n == 0 {
+            self.close();
+            return error.WebSocketConnectionClosed;
+        }
+        copied = copied + n;
+    }
+    return copied;
+}
+
+export fn websocket_tls_transport_write_all_sync(self: &WebSocketTlsTransport, data: &const byte, total: usize) !usize {
+    if self.closed != 0 || self.fd < 0 {
+        return error.WebSocketConnectionClosed;
+    }
+    var sent: usize = 0;
+    while sent < total {
+        var chunk: usize = total - sent;
+        if chunk > WS_TLS_RECORD_PLAIN_SCRATCH {
+            chunk = WS_TLS_RECORD_PLAIN_SCRATCH;
+        }
+        var cipher: [byte: WS_TLS_RECORD_CIPHER_SCRATCH] = [0: WS_TLS_RECORD_CIPHER_SCRATCH];
+        var cipher_len: usize = 0;
+        ssl_write(&self.ctx, data + sent, chunk, &cipher[0], WS_TLS_RECORD_CIPHER_SCRATCH, &cipher_len) catch {
+            self.close();
+            return error.WebSocketConnectionClosed;
+        };
+        https_write_all(self.fd, &cipher[0], cipher_len) catch {
+            self.close();
+            return error.WebSocketConnectionClosed;
+        };
+        sent = sent + chunk;
+    }
+    return sent;
+}
+
+export fn websocket_tls_transport_take(self: &WebSocketTlsTransport) WebSocketTlsTransport {
+    var out: WebSocketTlsTransport = WebSocketTlsTransport{
+        fd: self.fd,
+        owned: self.owned,
+        closed: self.closed,
+        hs: self.hs,
+        rec: self.rec,
+        ctx: self.ctx,
+        plain_off: self.plain_off,
+        plain_len: self.plain_len,
+    };
+    out.ctx.hs = &out.hs;
+    out.ctx.rec = &out.rec;
+    var i: usize = 0;
+    while i < WS_TLS_RECORD_PLAIN_SCRATCH {
+        out.plain[i] = self.plain[i];
+        i = i + 1;
+    }
+    self.fd = -1;
+    self.owned = 0;
+    self.closed = 1;
+    websocket_tls_transport_reset_plain(self);
+    return out;
+}
+
+WebSocketTlsTransport {
+    fn read(self: &Self, buf: &byte, count: usize) Future<!usize> {
+        return websocket_tls_ready_result(websocket_tls_transport_read_some_sync(self, buf, count));
+    }
+
+    fn read_exact(self: &Self, buf: &byte, count: usize) Future<!usize> {
+        return websocket_tls_ready_result(websocket_tls_transport_read_exact_sync(self, buf, count));
+    }
+
+    fn write(self: &Self, data: &const byte, count: usize) Future<!usize> {
+        return websocket_tls_ready_result(websocket_tls_transport_write_all_sync(self, data, count));
+    }
+
+    fn write_all(self: &Self, data: &const byte, count: usize) Future<!usize> {
+        return websocket_tls_ready_result(websocket_tls_transport_write_all_sync(self, data, count));
+    }
+
+    fn flush(self: &Self) Future<!usize> {
+        _ = self;
+        return future_ready_ok<usize>(0);
+    }
+
+    fn borrow_fd(self: &Self) i32 {
+        return self.fd;
+    }
+
+    fn take_fd(self: &Self) i32 {
+        const fd: i32 = self.fd;
+        self.fd = -1;
+        self.owned = 0;
+        self.closed = 1;
+        websocket_tls_transport_reset_plain(self);
+        return fd;
+    }
+
+    fn close(self: &Self) void {
+        if self.closed != 0 {
+            return;
+        }
+        self.closed = 1;
+        websocket_tls_transport_reset_plain(self);
+        if self.owned != 0 && self.fd >= 0 {
+            _ = sys_close(self.fd) catch {};
+        }
+        self.fd = -1;
+    }
+
+    fn is_closed(self: &Self) bool {
+        return self.closed != 0 || self.fd < 0;
+    }
+
+    fn drop(self: WebSocketTlsTransport) void {
+        if self.owned != 0 && self.closed == 0 && self.fd >= 0 {
+            _ = sys_close(self.fd) catch {};
+        }
+    }
+}
+
+/// WebSocket 异步连接契约。
+/// 参数说明：读写 API 由调用方提供缓冲区；排队 API 由连接对象持有消息副本。
+/// 返回值说明：返回 frame/message 视图或已写入字节数。
+export interface AsyncWebSocketConn {
+    @async_fn
+    fn read_frame(self: &Self, rx: &byte, rx_cap: usize, opcode_out: &WebSocketOpcode, fin_out: &bool, payload_len_out: &usize) Future<!usize>;
+    @async_fn
+    fn read_message(self: &Self, rx: &byte, rx_cap: usize, msg: &byte, msg_cap: usize, opcode_out: &WebSocketOpcode) Future<!usize>;
+    @async_fn
+    fn write_frame(self: &Self, opcode: WebSocketOpcode, payload: &const byte, payload_len: usize, tx: &byte, tx_cap: usize) Future<!usize>;
+    @async_fn
+    fn write_message(self: &Self, opcode: WebSocketOpcode, payload: &const byte, payload_len: usize, tx: &byte, tx_cap: usize) Future<!usize>;
+    @async_fn
+    fn ping(self: &Self, payload: &const byte, payload_len: usize, tx: &byte, tx_cap: usize) Future<!usize>;
+    @async_fn
+    fn heartbeat_tick(self: &Self, now_ms: u64, tx: &byte, tx_cap: usize) Future<!usize>;
+    @async_fn
+    fn close_with_code(self: &Self, code: u16, reason: &const byte, reason_len: usize, tx: &byte, tx_cap: usize) Future<!usize>;
+    @async_fn
+    fn enqueue_message(self: &Self, opcode: WebSocketOpcode, payload: &const byte, payload_len: usize) Future<!usize>;
+    @async_fn
+    fn flush_pending(self: &Self) Future<!usize>;
+}
+
+/// 默认 WebSocket 接入选项。
+/// 参数说明：无。
+/// 返回值说明：返回建议的 HTTP/1.1 WebSocket 默认配置。
+export fn websocket_accept_options_default() WebSocketAcceptOptions {
+    return WebSocketAcceptOptions{};
+}
+
+/// 默认自动重连策略。
+/// 参数说明：无。
+/// 返回值说明：返回“默认关闭重连”的策略对象。
+export fn websocket_reconnect_policy_default() ReconnectPolicy {
+    return ReconnectPolicy{};
+}
+
+/// 判断 opcode 是否属于控制帧。
+/// 参数说明：`opcode` 为待检查的操作码。
+/// 返回值说明：控制帧返回 `true`，否则返回 `false`。
+export fn websocket_opcode_is_control(opcode: WebSocketOpcode) bool {
+    return opcode == WebSocketOpcode.Close ||
+        opcode == WebSocketOpcode.Ping ||
+        opcode == WebSocketOpcode.Pong;
+}

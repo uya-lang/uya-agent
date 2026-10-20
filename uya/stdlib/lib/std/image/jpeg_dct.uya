@@ -1,0 +1,286 @@
+// lib/std/image/jpeg_dct.uya - JPEG 的 8x8 整数 DCT / IDCT / 量化（零 libm）
+//
+// 模块路径：use std.image.jpeg_dct
+//
+// 本文件：**只有算术，没有 JPEG 结构** —— 分离式 8x8 DCT（编码用）与逆变换
+//   （解码用），以及量化/反量化两个逐元素操作。
+// 形式：**矩阵乘两趟**（行一趟、列一趟），不是 AAN 那种手工展开的蝶形。选它是因为
+//   ① 只有一张 8x8 常数矩阵，改动/校对都在一处 —— 展开式有几十个常量与中间量，
+//   抄错一个就是「图能出但颜色偏」这种最难查的错；② 精度可控：矩阵 13 位定标，
+//   两趟各带 2 位小数（见下），实测往返误差 <= 1 个灰阶（Python 模型验过）。
+//   代价是每块 2*8*8*8 = 1024 次乘加（展开式约 500 次）—— 对「偶尔压一张图」够用。
+// 定标（**这条最容易搞错，写清楚**）：
+//   * 矩阵 M[x][u] = ck(u)*cos((2x+1)u*pi/16)/2 * 2^13，即两趟合起来正好是定义式的 /4；
+//   * 域内量 = **真值**，不带 libjpeg 那个「*8」的口径 —— 系数就是真 DCT 系数、
+//     IDCT 输出就是像素差分（-128..127）。量化表因此可以**直接**用 Annex K 的表
+//     （它是按真值标定的：q=50 时 DC 系数 16 意味着「DC 步长 16」）；
+//   * PASS_BITS = 2：两趟之间保留 2 位小数（第一趟 descale 掉 11 位、第二趟 15 位），
+//     这是精度与溢出之间的折中；i64 中间量保证 (2^13 * 2^15 * 8) 量级不溢出。
+// 不变量：① **全整数**：不接受 f32/f64、不用 libm —— 标准库要能在 freestanding
+//   （microapp/nostdlib）环境里编；② 就地变换：输入输出同一块 `[i32: 64]`，自然
+//   顺序（索引 = v*8+u，即 v 是行/垂直频率、u 是列/水平频率）；③ 量化/反量化只做
+//   逐元素乘除，**不碰 zigzag**（顺序转换是 jpeg_marker / 热路径那一层的事）。
+// 依赖：无（零 use、零 libc）。
+// 命名：`jpeg_dct_*`、`jpeg_idct_8x8`、`jpeg_fdct_8x8`、`jpeg_quantize`。
+
+// 矩阵定标位数（M 的元素在 ±2^13 内）。
+export const JPEG_DCT_BITS: i32 = 13;
+// 两趟之间保留的小数位。
+const JPEG_DCT_PASS_BITS: i32 = 2;
+
+// DCT 矩阵，定标 2^13：M[x][u] = ck(u)*cos((2x+1)u*pi/16)/2 * 2^13。
+// 行是空间位置 x，列是频率 u。IDCT 用 M、FDCT 用它的转置（同一张表）。
+//
+// 生成式（Python，一次性）：
+//   round((1/sqrt(2) if u==0 else 1)*cos((2x+1)*u*pi/16)/2 * 8192)
+const JPEG_DCT_M: [i32: 64] = [
+    2896, 4017, 3784, 3406, 2896, 2276, 1567, 799,
+    2896, 3406, 1567, -799, -2896, -4017, -3784, -2276,
+    2896, 2276, -1567, -4017, -2896, 799, 3784, 3406,
+    2896, 799, -3784, -2276, 2896, 3406, -1567, -4017,
+    2896, -799, -3784, 2276, 2896, -3406, -1567, 4017,
+    2896, -2276, -1567, 4017, -2896, -799, 3784, -3406,
+    2896, -3406, 1567, 799, -2896, 4017, -3784, 2276,
+    2896, -4017, 3784, -3406, 2896, -2276, 1567, -799,
+];
+
+// (x + (1 << (n-1))) >> n：四舍五入的算术右移。
+// 单独拎出来是为了让所有取整都长得一样（正负都向最近取，不是 floor）。
+fn jpeg_dct_descale(x: i64, n: i32) i64 {
+    return (x + ((1 as i64) << (n - 1))) >> n;
+}
+
+// 矩阵 M 元素（i32 → i64），供乘加使用。
+fn jpeg_dct_m(i: usize) i64 {
+    return JPEG_DCT_M[i] as i64;
+}
+
+// ============================================================
+// 逆变换（解码头路）
+// ============================================================
+
+// 一趟变换先把源行/列拷进这个临时数组再算，写完再放回。
+// **为什么必须这样**：变换是「就地」的，但「一行的 8 个输出」都要读**同一行的 8 个
+// 输入**；直接写回 t[base+x] 会把后面还要用的输入覆盖掉（x=0 的输出一写进去，
+// x=1 的求和就读到它了）。实测这个 aliasing 让往返误差从 1 跳到 3 万 —— 图上表现为
+// 整片噪声。临时数组只有 8 项，栈上分配，无堆开销。
+// IDCT 第一趟：对每一行做「频率 → 空间」，结果左移 PASS_BITS 保留小数。
+// 参数：
+// - t: 64 项系数组（自然顺序；行内被原地替换成中间量）。
+// - src: 8 项临时数组（调用方给，避免每趟重新分配）。
+// - dst: 8 项临时数组（同上）。
+// 返回：
+// - 无。
+fn jpeg_idct_rows(t: &i32, src: &i32, dst: &i32) void {
+    var y: usize = 0;
+    while y < 8 {
+        const base: usize = y * 8;
+        var u: usize = 0;
+        while u < 8 {
+            src[u] = t[base + u];
+            u = u + 1;
+        }
+        var x: usize = 0;
+        while x < 8 {
+            var s: i64 = 0;
+            u = 0;
+            while u < 8 {
+                s = s + jpeg_dct_m(x * 8 + u) * (src[u] as i64);
+                u = u + 1;
+            }
+            const sh: i32 = JPEG_DCT_BITS - JPEG_DCT_PASS_BITS;
+            dst[x] = jpeg_dct_descale(s, sh) as i32;
+            x = x + 1;
+        }
+        x = 0;
+        while x < 8 {
+            t[base + x] = dst[x];
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+}
+
+// IDCT 第二趟：对每一列做「频率 → 空间」，结果就是像素差分（已除 4）。
+// 参数：
+// - t: 64 项中间量（就地）。
+// - src: 8 项临时数组（列拷贝）。
+// - dst: 8 项临时数组（列结果）。
+// 返回：
+// - 无。
+fn jpeg_idct_cols(t: &i32, src: &i32, dst: &i32) void {
+    var x: usize = 0;
+    while x < 8 {
+        var v: usize = 0;
+        while v < 8 {
+            src[v] = t[v * 8 + x];
+            v = v + 1;
+        }
+        var y: usize = 0;
+        while y < 8 {
+            var s: i64 = 0;
+            v = 0;
+            while v < 8 {
+                s = s + jpeg_dct_m(y * 8 + v) * (src[v] as i64);
+                v = v + 1;
+            }
+            const sh2: i32 = JPEG_DCT_BITS + JPEG_DCT_PASS_BITS;
+            dst[y] = jpeg_dct_descale(s, sh2) as i32;
+            y = y + 1;
+        }
+        y = 0;
+        while y < 8 {
+            t[y * 8 + x] = dst[y];
+            y = y + 1;
+        }
+        x = x + 1;
+    }
+}
+
+// 反 DCT：coef（自然顺序、**反量化之后**的系数）就地变成 8x8 像素差分
+// （值域约 -128..127）。调用方再加 128 并夹到 0..255。
+// 参数：
+// - coef: 64 项系数组（就地变换）。
+// 返回：
+// - 无。
+export fn jpeg_idct_8x8(coef: &i32) void {
+    var src: [i32: 8] = [0: 8];
+    var dst: [i32: 8] = [0: 8];
+    jpeg_idct_rows(coef, &src[0], &dst[0]);
+    jpeg_idct_cols(coef, &src[0], &dst[0]);
+}
+
+// ============================================================
+// 正变换（编码头路）
+// ============================================================
+
+// FDCT 第一趟：对每一行做「空间 → 频率」（用 M 的转置：M[x][u] 对 x 求和）。
+// 参数：
+// - t: 64 项像素差分（就地进行，逐行替换）。
+// - src: 8 项临时数组（源行，见 jpeg_idct_rows 上的 aliasing 说明）。
+// - dst: 8 项临时数组（结果行）。
+// 返回：
+// - 无。
+fn jpeg_fdct_rows(t: &i32, src: &i32, dst: &i32) void {
+    var y: usize = 0;
+    while y < 8 {
+        const base: usize = y * 8;
+        var x: usize = 0;
+        while x < 8 {
+            src[x] = t[base + x];
+            x = x + 1;
+        }
+        var u: usize = 0;
+        while u < 8 {
+            var s: i64 = 0;
+            x = 0;
+            while x < 8 {
+                s = s + jpeg_dct_m(x * 8 + u) * (src[x] as i64);
+                x = x + 1;
+            }
+            const sh3: i32 = JPEG_DCT_BITS - JPEG_DCT_PASS_BITS;
+            dst[u] = jpeg_dct_descale(s, sh3) as i32;
+            u = u + 1;
+        }
+        u = 0;
+        while u < 8 {
+            t[base + u] = dst[u];
+            u = u + 1;
+        }
+        y = y + 1;
+    }
+}
+
+// FDCT 第二趟：对每一列做「空间 → 频率」，结果就是 DCT 系数（真值口径）。
+// 参数：
+// - t: 64 项中间量（就地进行）。
+// - src: 8 项临时数组（源列）。
+// - dst: 8 项临时数组（结果列）。
+// 返回：
+// - 无。
+fn jpeg_fdct_cols(t: &i32, src: &i32, dst: &i32) void {
+    var u: usize = 0;
+    while u < 8 {
+        var y: usize = 0;
+        while y < 8 {
+            src[y] = t[y * 8 + u];
+            y = y + 1;
+        }
+        var v: usize = 0;
+        while v < 8 {
+            var s: i64 = 0;
+            y = 0;
+            while y < 8 {
+                s = s + jpeg_dct_m(y * 8 + v) * (src[y] as i64);
+                y = y + 1;
+            }
+            const sh4: i32 = JPEG_DCT_BITS + JPEG_DCT_PASS_BITS;
+            dst[v] = jpeg_dct_descale(s, sh4) as i32;
+            v = v + 1;
+        }
+        v = 0;
+        while v < 8 {
+            t[v * 8 + u] = dst[v];
+            v = v + 1;
+        }
+        u = u + 1;
+    }
+}
+
+// 正 DCT：8x8 像素差分（值域 -128..127，自然顺序，就地）变成 64 个 DCT 系数
+// （真值口径 —— 直接拿量化表除即可，不用额外的 8 倍配平）。
+// 参数：
+// - d: 64 项像素差（就地变换）。
+// 返回：
+// - 无。
+export fn jpeg_fdct_8x8(d: &i32) void {
+    var src: [i32: 8] = [0: 8];
+    var dst: [i32: 8] = [0: 8];
+    jpeg_fdct_rows(d, &src[0], &dst[0]);
+    jpeg_fdct_cols(d, &src[0], &dst[0]);
+}
+
+// ============================================================
+// 量化 / 反量化
+// ============================================================
+
+// 反量化：coef[i] = coef[i] * q[i]（q 走自然顺序；调用方先把 zigzag 摆回自然顺序）。
+// 参数：
+// - coef: 64 项系数组（就地）。
+// - q: 64 项量化表（自然顺序，值 >= 1）。
+// 返回：
+// - 无。
+export fn jpeg_dequantize(coef: &i32, q: &const u8) void {
+    var i: usize = 0;
+    while i < 64 {
+        coef[i] = coef[i] * (q[i] as i32);
+        i = i + 1;
+    }
+}
+
+// 量化：系数按量化表除，**对称**取整（正负都向远离 0 的方向凑半个步长）。
+// 对称取整让「q 表全 1」时往返误差为 0，自测靠这条钉死定标（见
+// tests/test_std_jpeg_encode.uya 的 q=100 断言）。
+// 参数：
+// - coef: 64 项 DCT 系数（就地变成量化系数）。
+// - q: 64 项量化表（自然顺序，值 >= 1）。
+// 返回：
+// - 无。
+export fn jpeg_quantize(coef: &i32, q: &const u8) void {
+    var i: usize = 0;
+    while i < 64 {
+        const divisor: i32 = q[i] as i32;
+        const v: i32 = coef[i];
+        var out: i32 = v;
+        if divisor > 1 {
+            const half: i32 = divisor / 2;
+            if v >= 0 {
+                out = (v + half) / divisor;
+            } else {
+                out = 0 - ((0 - v + half) / divisor);
+            }
+        }
+        coef[i] = out;
+        i = i + 1;
+    }
+}

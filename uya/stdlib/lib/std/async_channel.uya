@@ -1,0 +1,155 @@
+// lib/std/async_channel.uya - 单槽通道（设计见 docs/std_async_design.md）
+// 模块路径：use std.async_channel
+// 依赖 std.async（Poll, Future）
+
+use std.async;
+use std.collections.ring_queue.RingQueue;
+use std.mem.allocator.IAllocator;
+use std.mem.allocator.g_allocator;
+
+// GCC 原子 CAS 内建；这里本地声明，避免引入整个 pthread 模块造成额外依赖。
+extern "libc" fn __atomic_compare_exchange_n(ptr: &i32, expected: &i32, desired: i32, weak: i32, success_mem: i32, failure_mem: i32) i32;
+const ASYNC_CH_ATOMIC_SEQ_CST: i32 = 5;
+
+// 与 ring_queue.uya 中逻辑一致；不调用 `ring_queue_new`，避免合并 C 输出时函数定义顺序导致隐式声明。
+fn mpsc_ring_alloc_bytes(allocator: IAllocator, nbytes: usize) !&byte {
+    var p: &byte = try allocator.alloc(nbytes);
+    return p;
+}
+
+fn mpsc_channel_next_index(idx: i32, capacity: i32) i32 {
+    const next: i32 = idx + 1;
+    if next >= capacity {
+        return 0;
+    }
+    return next;
+}
+
+/// 泛型单槽通道。send 返回 Ready(0) 当槽位空；recv 返回 Ready(v) 当槽位满。
+/// 当前仍是单消费者模型，适合在 async 任务之间传递单个值。
+export struct Channel<T> {
+    _state: atomic i32,   // 0=empty, 1=full
+    _slot: [T: 1],
+
+    fn send(self: &Self, v: T) Future<usize> {
+        const s: i32 = self._state;
+        if s == 0 {
+            self._slot[0] = v;
+            self._state = 1;
+            return Future<usize>{ state: Poll<usize>.Ready(0 as usize) };
+        }
+        return Future<usize>{ state: Poll<usize>.Pending({}) };
+    }
+
+    fn recv(self: &Self) Future<T> {
+        const s: i32 = self._state;
+        if s == 1 {
+            const v: T = self._slot[0];
+            self._state = 0;
+            return Future<T>{ state: Poll<T>.Ready(v) };
+        }
+        return Future<T>{ state: Poll<T>.Pending({}) };
+    }
+}
+
+/// 创建泛型 Channel<T>。
+export fn channel_new<T>() Channel<T> {
+    return Channel<T>{ _state: 0 };
+}
+
+/// 泛型多生产者、单消费者通道。
+/// 当前基于 `std.collections.ring_queue` 的环形队列实现，并由一个原子锁保护并发 push/pop。
+export struct MpscChannel<T> {
+    _lock: atomic i32,
+    _queue: RingQueue<T>,
+
+    fn _try_lock(self: &Self) bool {
+        var expected: i32 = 0;
+        return __atomic_compare_exchange_n((&self._lock) as &i32, &expected, 1, 0, ASYNC_CH_ATOMIC_SEQ_CST, ASYNC_CH_ATOMIC_SEQ_CST) != 0;
+    }
+
+    fn _unlock(self: &Self) void {
+        self._lock = 0;
+    }
+
+    fn send(self: &Self, v: T) Future<usize> {
+        if !self._try_lock() {
+            return Future<usize>{ state: Poll<usize>.Pending({}) };
+        }
+
+        if self._queue._capacity <= 0 || self._queue._slot == null {
+            self._unlock();
+            return Future<usize>{ state: Poll<usize>.Pending({}) };
+        }
+        if self._queue._len >= self._queue._capacity {
+            self._unlock();
+            return Future<usize>{ state: Poll<usize>.Pending({}) };
+        }
+
+        const slot: &T = self._queue._slot as &T;
+        const idx: usize = self._queue._tail as usize;
+        slot[idx] = v;
+        self._queue._tail = mpsc_channel_next_index(self._queue._tail, self._queue._capacity);
+        self._queue._len = self._queue._len + 1;
+        self._unlock();
+        return Future<usize>{ state: Poll<usize>.Ready(0 as usize) };
+    }
+
+    fn recv(self: &Self) Future<T> {
+        if !self._try_lock() {
+            return Future<T>{ state: Poll<T>.Pending({}) };
+        }
+
+        if self._queue._capacity <= 0 || self._queue._slot == null {
+            self._unlock();
+            return Future<T>{ state: Poll<T>.Pending({}) };
+        }
+        if self._queue._len <= 0 {
+            self._unlock();
+            return Future<T>{ state: Poll<T>.Pending({}) };
+        }
+
+        const slot: &T = self._queue._slot as &T;
+        const idx: usize = self._queue._head as usize;
+        const value: T = slot[idx];
+        self._queue._head = mpsc_channel_next_index(self._queue._head, self._queue._capacity);
+        self._queue._len = self._queue._len - 1;
+        self._unlock();
+        return Future<T>{ state: Poll<T>.Ready(value) };
+    },
+}
+
+/// 创建泛型 MpscChannel<T>（使用传入的 `IAllocator` 分配环形缓冲区）。
+export fn mpsc_channel_new<T>(allocator: IAllocator, capacity: i32) MpscChannel<T> {
+    if capacity <= 0 {
+        return MpscChannel<T>{
+            _lock: 0,
+            _queue: RingQueue<T>{
+                allocator: allocator,
+                _head: 0,
+                _tail: 0,
+                _len: 0,
+                _capacity: capacity,
+                _slot: null,
+            },
+        };
+    }
+    var sample: [T: 1] = [];
+    const alloc_size: usize = (@size_of(sample[0]) as usize) * (capacity as usize);
+    const pb: !&byte = mpsc_ring_alloc_bytes(allocator, alloc_size);
+    const p: &byte = pb catch {
+        null as &byte;
+    };
+    // 勿使用中间 `RingQueue` 变量：C 后端会对复制后的临时值再 `drop`，会误释放已交给 `_queue` 的缓冲区。
+    return MpscChannel<T>{
+        _lock: 0,
+        _queue: RingQueue<T>{
+            allocator: allocator,
+            _head: 0,
+            _tail: 0,
+            _len: 0,
+            _capacity: capacity,
+            _slot: p,
+        },
+    };
+}

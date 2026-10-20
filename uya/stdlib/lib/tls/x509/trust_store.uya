@@ -1,0 +1,355 @@
+// lib/tls/x509/trust_store.uya - 系统根证书存储加载
+// 支持从 /etc/ssl/certs 目录加载 CA 证书
+
+use tls.x509.cert;
+use tls.x509.cert.Cert;
+use tls.x509.asn1;
+use std.encoding.base64.decode_base64_mime;
+use libc.unistd;
+use libc.syscall;
+use libc.fcntl;
+use libc.stdio;
+use libc.string;
+use libc.stdlib;
+
+const TRUST_STORE_MAX_CERTS: usize = 128;
+const TRUST_STORE_MAX_PATH: usize = 256;
+const TRUST_STORE_READ_BUF_SIZE: usize = 65536;
+const TRUST_STORE_DER_MAX: usize = 4096;
+
+// 根证书存储
+export struct TrustStore {
+    certs: [Cert: TRUST_STORE_MAX_CERTS],
+    der_storage: [byte: TRUST_STORE_MAX_CERTS * TRUST_STORE_DER_MAX],
+    count: usize,
+}
+
+// 初始化空信任存储
+export fn trust_store_init(ts: &TrustStore) void {
+    ts.count = 0;
+    var i: usize = 0;
+    while i < TRUST_STORE_MAX_CERTS {
+        cert_reset(&ts.certs[i]);
+        i = i + 1;
+    }
+}
+
+// 重置证书结构
+fn cert_reset(cert: &Cert) void {
+    cert.der = null as &const byte;
+    cert.der_len = 0;
+    cert.tbs_offset = 0;
+    cert.tbs_len = 0;
+    cert.tbs_tlv_len = 0;
+    cert.serial_len = 0;
+    cert.sig_oid_len = 0;
+    cert.sig_len = 0;
+    cert.rsa_n_len = 0;
+    cert.rsa_e_len = 0;
+    cert.has_basic_constraints = false;
+    cert.is_ca = false;
+    cert.has_path_len = false;
+    cert.max_path_len = 0;
+    cert.has_key_usage = false;
+    cert.key_usage_bits = 0;
+}
+
+// 从文件加载 PEM 编码的证书
+// 返回 true 如果成功加载至少一个证书
+fn load_pem_file(ts: &TrustStore, path: &const byte, path_len: usize) bool {
+    if ts.count >= TRUST_STORE_MAX_CERTS {
+        return false;
+    }
+    
+    var path_c: [byte: TRUST_STORE_MAX_PATH] = [0:TRUST_STORE_MAX_PATH];
+    if path_len >= TRUST_STORE_MAX_PATH {
+        return false;
+    }
+    
+    // 复制路径并添加 null 终止
+    var i: usize = 0;
+    while i < path_len {
+        path_c[i] = path[i];
+        i = i + 1;
+    }
+    path_c[path_len] = 0;
+    
+    const fd: i32 = sys_open(&path_c[0], O_RDONLY as i32, 0) catch {
+        return false;
+    };
+    
+    var buf: [byte: TRUST_STORE_READ_BUF_SIZE] = [0:TRUST_STORE_READ_BUF_SIZE];
+    var total: usize = 0;
+    
+    while total < TRUST_STORE_READ_BUF_SIZE {
+        const n: isize = sys_read(fd, &buf[total], TRUST_STORE_READ_BUF_SIZE - total) catch {
+            _ = sys_close(fd) catch {};
+            return false;
+        };
+        if n <= 0 {
+            break;
+        }
+        total = total + (n as usize);
+    }
+    
+    _ = sys_close(fd) catch {};
+    
+    if total == 0 {
+        return false;
+    }
+    
+    // 解析 PEM 中的证书
+    return parse_pem_certs(ts, &buf[0], total);
+}
+
+// PEM 头部和尾部标记（硬编码长度）
+const PEM_BEGIN_LEN: usize = 27;
+const PEM_END_LEN: usize = 25;
+
+// PEM 标记字符串（定义为数组以便取地址）
+fn get_pem_begin_marker() &[byte] {
+    const s: &[byte] = &"-----BEGIN CERTIFICATE-----"[0:27];
+    return s;
+}
+
+fn get_pem_end_marker() &[byte] {
+    const s: &[byte] = &"-----END CERTIFICATE-----"[0:25];
+    return s;
+}
+
+// 检查内存是否匹配
+fn mem_eq(a: &const byte, a_len: usize, b: &const byte, b_len: usize) bool {
+    if a_len != b_len {
+        return false;
+    }
+    var i: usize = 0;
+    while i < a_len {
+        if a[i] != b[i] {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+// 查找子串
+fn find_substr(hay: &const byte, hay_len: usize, needle: &const byte, needle_len: usize) isize {
+    if needle_len == 0 || hay_len < needle_len {
+        return -1;
+    }
+    var i: usize = 0;
+    while i + needle_len <= hay_len {
+        var j: usize = 0;
+        var is_match: bool = true;
+        while j < needle_len {
+            if hay[i + j] != needle[j] {
+                is_match = false;
+                break;
+            }
+            j = j + 1;
+        }
+        if is_match {
+            return i as isize;
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+// 检查前缀是否匹配
+fn mem_starts_with(data: &const byte, data_len: usize, prefix: &const byte, prefix_len: usize) bool {
+    if data_len < prefix_len {
+        return false;
+    }
+    var i: usize = 0;
+    while i < prefix_len {
+        if data[i] != prefix[i] {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+// 在数据中查找子串，返回起始位置或 -1
+fn find_substr_pos(haystack: &const byte, haystack_len: usize, 
+                   needle: &const byte, needle_len: usize) isize {
+    if needle_len == 0 || haystack_len < needle_len {
+        return -1;
+    }
+    var i: usize = 0;
+    while i + needle_len <= haystack_len {
+        var j: usize = 0;
+        var is_match: bool = true;
+        while j < needle_len {
+            if haystack[i + j] != needle[j] {
+                is_match = false;
+                break;
+            }
+            j = j + 1;
+        }
+        if is_match {
+            return i as isize;
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+// 查找换行符位置，返回下一个行的起始位置
+fn skip_to_next_line(data: &const byte, data_len: usize, start: usize) usize {
+    var pos: usize = start;
+    while pos < data_len {
+        if data[pos] == '\n' as byte {
+            return pos + 1;
+        }
+        if data[pos] == '\r' as byte && pos + 1 < data_len && data[pos + 1] == '\n' as byte {
+            return pos + 2;
+        }
+        pos = pos + 1;
+    }
+    return data_len;
+}
+
+// 解析单个 PEM 证书块
+// 返回解析后的 DER 数据长度，0 表示失败
+fn parse_one_pem_cert(pem_data: &const byte, pem_len: usize, 
+                      der_out: &byte, der_max: usize) usize {
+    // 查找 BEGIN 标记
+    const begin_marker: &[byte] = get_pem_begin_marker();
+    const begin_pos: isize = find_substr_pos(pem_data, pem_len, 
+                                              begin_marker.ptr, begin_marker.len);
+    if begin_pos < 0 {
+        return 0;
+    }
+    var pos: usize = (begin_pos as! usize).value + PEM_BEGIN_LEN;
+    
+    // 跳过头部后的换行
+    pos = skip_to_next_line(pem_data, pem_len, pos);
+    
+    // 查找 END 标记
+    const end_marker: &[byte] = get_pem_end_marker();
+    const end_pos: isize = find_substr_pos(&pem_data[pos], pem_len - pos,
+                                           end_marker.ptr, end_marker.len);
+    if end_pos < 0 {
+        return 0;
+    }
+    
+    // Base64 数据区域
+    const b64_start: usize = pos;
+    const b64_len: usize = (end_pos as! usize).value;
+    
+    if b64_len == 0 {
+        return 0;
+    }
+    
+    // Base64 解码
+    const decoded_len: !usize = decode_base64_mime(pem_data[b64_start: b64_len], der_out[0: der_max]);
+    return decoded_len catch {
+        0 as usize;
+    };
+}
+
+// 解析 PEM 数据中的所有证书
+fn parse_pem_certs(ts: &TrustStore, pem_data: &const byte, pem_len: usize) bool {
+    var pos: usize = 0;
+    var found_any: bool = false;
+    
+    // 为 DER 数据分配临时缓冲区（在栈上）
+    var der_buf: [byte: TRUST_STORE_DER_MAX] = [0:TRUST_STORE_DER_MAX];
+    
+    while pos < pem_len && ts.count < TRUST_STORE_MAX_CERTS {
+        // 查找下一个 BEGIN 标记
+        const begin_marker2: &[byte] = get_pem_begin_marker();
+        const begin_pos: isize = find_substr_pos(&pem_data[pos], pem_len - pos,
+                                                  begin_marker2.ptr, begin_marker2.len);
+        if begin_pos < 0 {
+            break;
+        }
+        
+        pos = pos + (begin_pos as usize);
+        
+        // 解析这个证书块
+        const der_len: usize = parse_one_pem_cert(&pem_data[pos], pem_len - pos,
+                                                   &der_buf[0], TRUST_STORE_DER_MAX);
+        if der_len > 0 && der_len <= TRUST_STORE_DER_MAX {
+            // 使用 DER 数据加载证书
+            const idx: usize = ts.count;
+            const der_off: usize = idx * TRUST_STORE_DER_MAX;
+            if idx < @len(ts.certs) &&
+               der_off < @len(ts.der_storage) &&
+               der_len <= @len(ts.der_storage) - der_off {
+                var i: usize = 0;
+                while i < der_len && i < @len(der_buf) && der_off + i < @len(ts.der_storage) {
+                    ts.der_storage[der_off + i] = der_buf[i];
+                    i = i + 1;
+                }
+                if load_cert_from_der(&ts.certs[idx], &ts.der_storage[der_off], der_len) {
+                    ts.count = ts.count + 1;
+                    found_any = true;
+                }
+            }
+        }
+        
+        // 跳过这个证书块（移动到 END 之后）
+        const end_marker2: &[byte] = get_pem_end_marker();
+        const end_pos: isize = find_substr_pos(&pem_data[pos], pem_len - pos,
+                                               end_marker2.ptr, end_marker2.len);
+        if end_pos < 0 {
+            break;
+        }
+        pos = pos + (end_pos as! usize).value + PEM_END_LEN;
+    }
+    
+    return found_any;
+}
+
+// 从 DER 数据加载证书（简化版，使用现有 cert.uya 的解析逻辑）
+fn load_cert_from_der(cert: &Cert, der: &const byte, der_len: usize) bool {
+    cert_reset(cert);
+    cert_parse(der, der_len, cert) catch {
+        return false;
+    };
+    return true;
+}
+
+// 从目录加载所有证书文件
+fn load_certs_from_dir(ts: &TrustStore, dir_path: &const byte, dir_len: usize) void {
+    // 尝试常见的根证书路径
+    const path1: &[byte] = &"/etc/ssl/certs/ca-certificates.crt"[0:34];  // Debian/Ubuntu
+    const path2: &[byte] = &"/etc/pki/tls/certs/ca-bundle.crt"[0:33];    // RHEL/CentOS/Fedora
+    const path3: &[byte] = &"/etc/ssl/cert.pem"[0:17];                   // macOS/BSD
+    
+    if load_pem_file(ts, path1.ptr, path1.len) {
+        return;
+    }
+    if load_pem_file(ts, path2.ptr, path2.len) {
+        return;
+    }
+    if load_pem_file(ts, path3.ptr, path3.len) {
+        return;
+    }
+}
+
+// 加载系统默认根证书
+export fn trust_store_load_system(ts: &TrustStore) bool {
+    trust_store_init(ts);
+    load_certs_from_dir(ts, null as &const byte, 0);
+    return ts.count > 0;
+}
+
+// 获取存储的证书数组和数量
+export fn trust_store_get_certs(ts: &TrustStore) &const Cert {
+    return &ts.certs[0] as &const Cert;
+}
+
+export fn trust_store_get_count(ts: &TrustStore) usize {
+    return ts.count;
+}
+
+// 调试：打印加载的证书信息
+export fn trust_store_print_info(ts: &TrustStore) void {
+    const msg: &[byte] = &"TrustStore: loaded certificates\n"[0:33];
+    _ = sys_write(2, msg.ptr, msg.len) catch {};
+    _ = ts.count;
+}

@@ -1,0 +1,707 @@
+// lib/std/image/jpeg_encode.uya - 基线 JPEG 编码（Huffman + 8x8 DCT）
+//
+// 模块路径：use std.image.jpeg_encode
+//
+// 本文件：**编码主线** —— RGB（或灰度）→ YCbCr → 可选色度下采样（4:4:4 /
+//   4:2:2 / 4:2:0）→ 分块 FDCT（jpeg_dct）→ 量化 → Huffman（jpeg_tables）→
+//   写段（SOI/APP0/DQT/SOF0/DHT/SOS/熵/EOI），全程零 libm、零分配（除调用方
+//   给的 IAllocator 用于色度平面与 MCU 缓冲）。
+// 输出口径：**JFIF**（APP0 里写 "JFIF\0"、版本 1.1、密度 1x1）、基线顺序 DCT
+//   （SOF0）、8-bit、标准 Annex K 量化表 + Huffman 表（不做码表优化）。
+// 支持：灰度（1 通道）与 RGB（3 通道）；`JpegEncodeOptions.subsample` 选
+//   1（4:4:4）/ 2（4:2:2）/ 4（4:2:0）；quality 1..100 按 T.81 K.4 缩表。
+// 不变量：① 缓冲不满时返回 JpegBufferTooSmall 并**不写坏内存**（写器自己带
+//   ok 标志）；② 每个 MCU 严格按 T.81 的块顺序写（Y 的 h*v 块，再各色度块）；
+//   ③ 熵段收尾必须补 **1**（jpeg_bits_flush 负责，补 0 会被某些解码器当成额外
+//   系数位）；④ 尺寸/通道非法或不支持采样时先报错再动手（不产半张图）。
+// 依赖：std.image.image、std.image.jpeg_tables、std.image.jpeg_dct、
+//   std.image.jpeg_bits、std.mem.allocator（只用到 IAllocator 类型，
+//   编码不分配堆）。
+// 命名：`jpeg_encode*`、`JpegEncodeOptions`、`JPEG_SUB_*`。
+
+use std.mem.allocator.IAllocator;
+use std.image.image.Image;
+use std.image.image.IMAGE_GRAY;
+use std.image.image.IMAGE_RGB;
+
+use std.image.jpeg_tables.JpegHuffEncoder;
+use std.image.jpeg_tables.jpeg_std_encoder;
+use std.image.jpeg_tables.jpeg_quality_scale;
+use std.image.jpeg_tables.jpeg_std_huffval;
+use std.image.jpeg_tables.JPEG_QUANT_LUMA_NATURAL;
+use std.image.jpeg_tables.JPEG_QUANT_CHROMA_NATURAL;
+use std.image.jpeg_tables.JPEG_ZIGZAG;
+
+use std.image.jpeg_dct.jpeg_fdct_8x8;
+use std.image.jpeg_dct.jpeg_quantize;
+
+use std.image.jpeg_bits.JpegBitWriter;
+use std.image.jpeg_bits.jpeg_bits_winit;
+use std.image.jpeg_bits.jpeg_bits_put;
+use std.image.jpeg_bits.jpeg_bits_flush;
+use std.image.jpeg_bits.jpeg_bits_wlen;
+use std.image.jpeg_bits.jpeg_bits_wok;
+use std.image.jpeg_bits.jpeg_bits_put_raw;
+use std.image.jpeg_bits.jpeg_bits_put_raw_n;
+
+// 色度采样模式（值 = 水平/垂直各方向的色度样本间隔，也是 SOF 里的采样因子）。
+export const JPEG_SUB_444: i32 = 1;
+export const JPEG_SUB_422: i32 = 2;
+export const JPEG_SUB_420: i32 = 4;
+
+// 编码选项。
+export struct JpegEncodeOptions {
+    quality: i32,        // 1..100（越界先夹）
+    subsample: i32,      // JPEG_SUB_444 / _422 / _420（灰度忽略）
+}
+
+// 缺省选项：质量 85、4:2:0（与 cjpeg 的常用默认同量级）。
+export fn jpeg_options_default() JpegEncodeOptions {
+    var o: JpegEncodeOptions = JpegEncodeOptions{
+        quality: 85, subsample: JPEG_SUB_420 };
+    return o;
+}
+
+// 一张图编码后的最大字节数上界（给调用方准备缓冲用）。
+// 公式：像素数 * 3 + 1024（最坏情况是 4:4:4、全高频、Huffman 每系数 16 bit；
+// 实际上 3 字节/像素已经远超真实需求，纯保守）。
+// 参数：
+// - width: 宽（像素）。
+// - height: 高（像素）。
+// 返回：
+// - 字节上界（尺寸非法时返回 0）。
+export fn jpeg_max_bytes(width: i32, height: i32) usize {
+    if width <= 0 || height <= 0 {
+        return 0 as usize;
+    }
+    const w: usize = width as usize;
+    const h: usize = height as usize;
+    return w * h * 3 as usize + 1024 as usize;
+}
+
+// 一张空的 Huffman 编码表。
+fn jpeg_enc_table_blank() JpegHuffEncoder {
+    var e: JpegHuffEncoder = JpegHuffEncoder{
+        bits: [0: 16], code: [0: 256], size: [0: 256] };
+    return e;
+}
+
+// 校验源图能不能编（空图 / 尺寸 / 通道）。
+// 参数：
+// - img: 源图。
+// 返回：
+// - true = 可以编；error = JpegCorrupt（空图或尺寸非正）/
+//   JpegUnsupported（尺寸超 65535 或通道不是 1/3）。
+fn jpeg_check_image(img: &const Image) !bool {
+    if img.pixels == null {
+        return error.JpegCorrupt;
+    }
+    if img.width <= 0 || img.height <= 0 {
+        return error.JpegCorrupt;
+    }
+    if img.width > 65535 || img.height > 65535 {
+        return error.JpegUnsupported;
+    }
+    if img.channels != IMAGE_GRAY && img.channels != IMAGE_RGB {
+        return error.JpegUnsupported;
+    }
+    return true;
+}
+
+// 归一化采样模式（非法值回退 4:2:0）。
+fn jpeg_norm_subsample(opts: &const JpegEncodeOptions) i32 {
+    const subs: i32 = opts.subsample;
+    if subs != JPEG_SUB_444 && subs != JPEG_SUB_422 && subs != JPEG_SUB_420 {
+        return JPEG_SUB_420;
+    }
+    return subs;
+}
+
+// 亮度分量的水平采样因子（灰度与 4:4:4 都是 1）。
+fn jpeg_encode_hsub(img: &const Image, opts: &const JpegEncodeOptions) i32 {
+    if img.channels != IMAGE_RGB {
+        return 1;
+    }
+    const subs: i32 = jpeg_norm_subsample(opts);
+    if subs == JPEG_SUB_444 {
+        return 1;
+    }
+    return 2;
+}
+
+// 亮度分量的垂直采样因子（只有 4:2:0 是 2）。
+fn jpeg_encode_vsub(img: &const Image, opts: &const JpegEncodeOptions) i32 {
+    if img.channels != IMAGE_RGB {
+        return 1;
+    }
+    if jpeg_norm_subsample(opts) != JPEG_SUB_420 {
+        return 1;
+    }
+    return 2;
+}
+
+// 装一份编码状态：四张标准 Huffman 表 + 量化表 + 归零的 DC 预测器。
+// 参数：
+// - qluma/qchroma: 已按质量缩放好的量化表（自然顺序）。
+// 返回：
+// - 可直接用于 jpeg_encode_mcus 的状态。
+fn jpeg_enc_state_new(qluma: &const u8, qchroma: &const u8) JpegEncState {
+    var dcl: JpegHuffEncoder = jpeg_enc_table_blank();
+    var acl: JpegHuffEncoder = jpeg_enc_table_blank();
+    var dcc: JpegHuffEncoder = jpeg_enc_table_blank();
+    var acc: JpegHuffEncoder = jpeg_enc_table_blank();
+    jpeg_std_encoder(0, &dcl);
+    jpeg_std_encoder(1, &acl);
+    jpeg_std_encoder(2, &dcc);
+    jpeg_std_encoder(3, &acc);
+    var st: JpegEncState = JpegEncState{
+        dcl: dcl, acl: acl, dcc: dcc, acc: acc,
+        qluma: [0: 64], qchroma: [0: 64],
+        predy: 0, predcb: 0, predcr: 0,
+    };
+    var i: usize = 0;
+    while i < 64 {
+        st.qluma[i] = qluma[i];
+        st.qchroma[i] = qchroma[i];
+        i = i + 1;
+    }
+    return st;
+}
+
+// 编码过程中的可变状态（DC 预测器 + 复用表）。
+struct JpegEncState {
+    dcl: JpegHuffEncoder,      // 亮度 DC
+    acl: JpegHuffEncoder,      // 亮度 AC
+    dcc: JpegHuffEncoder,      // 色度 DC
+    acc: JpegHuffEncoder,      // 色度 AC
+    qluma: [u8: 64],
+    qchroma: [u8: 64],
+    predy: i32,
+    predcb: i32,
+    predcr: i32,
+}
+
+// 扫完所有 MCU：每个 MCU 先写 h*v 个 Y 块，再写 Cb / Cr 各一块。
+// 参数：
+// - w: 写器。
+// - img: 源图。
+// - st: 状态（DC 预测器就地累加）。
+// - mw/mh: MCU 的像素宽高（hs*8 / vs*8）。
+// - hs/vs: 亮度采样因子。
+// - ncomp: 分量数。
+// - mcus_x/mcus_y: MCU 网格。
+// 返回：
+// - 无（缓冲不足由写器的 ok 标志记录）。
+fn jpeg_encode_mcus(w: &JpegBitWriter, img: &const Image,
+                    st: &JpegEncState, mw: i32, mh: i32, hs: i32, vs: i32,
+                    ncomp: i32, mcus_x: i32, mcus_y: i32) void {
+    var blk: [i32: 64] = [0: 64];
+    var my: i32 = 0;
+    while my < mcus_y {
+        var mx: i32 = 0;
+        while mx < mcus_x {
+            _ = jpeg_encode_mcu_luma(w, img, st, &blk[0], mx, my, mw, mh,
+                hs, vs);
+            if ncomp == 3 {
+                _ = jpeg_encode_mcu_chroma(w, img, st, &blk[0], mx, my,
+                    hs, vs);
+            }
+            mx = mx + 1;
+        }
+        my = my + 1;
+    }
+}
+
+// 写一个 MCU 的亮度块（h*v 个）。
+fn jpeg_encode_mcu_luma(w: &JpegBitWriter, img: &const Image,
+                        st: &JpegEncState, blk: &i32, mx: i32, my: i32,
+                        mw: i32, mh: i32, hs: i32, vs: i32) bool {
+    var by: i32 = 0;
+    while by < vs {
+        var bx: i32 = 0;
+        while bx < hs {
+            const x0: i32 = mx * mw + bx * 8;
+            const y0: i32 = my * mh + by * 8;
+            jpeg_load_block(blk, x0, y0, img, 0, 1, 1);
+            jpeg_fdct_quantize(blk, &st.qluma[0]);
+            jpeg_encode_block(w, &st.dcl, &st.acl, &st.predy, blk);
+            bx = bx + 1;
+        }
+        by = by + 1;
+    }
+    return true;
+}
+
+// 写一个 MCU 的两个色度块（Cb / Cr 各一块，尺寸按采样因子下采样）。
+fn jpeg_encode_mcu_chroma(w: &JpegBitWriter, img: &const Image,
+                          st: &JpegEncState, blk: &i32, mx: i32, my: i32,
+                          hs: i32, vs: i32) bool {
+    jpeg_load_block(blk, mx * hs * 8, my * vs * 8, img, 1, hs, vs);
+    jpeg_fdct_quantize(blk, &st.qchroma[0]);
+    jpeg_encode_block(w, &st.dcc, &st.acc, &st.predcb, blk);
+    jpeg_load_block(blk, mx * hs * 8, my * vs * 8, img, 2, hs, vs);
+    jpeg_fdct_quantize(blk, &st.qchroma[0]);
+    jpeg_encode_block(w, &st.dcc, &st.acc, &st.predcr, blk);
+    return true;
+}
+
+// 把 u8 写进原始字节（写段体用）。
+// 参数：
+// - w: 写器。
+// - v: 值。
+// 返回：
+// - 无。
+fn jpeg_wr_u8(w: &JpegBitWriter, v: i32) void {
+    jpeg_bits_put_raw(w, (v & 255) as u8);
+}
+
+// 写 16 位大端（段长度、宽高）。
+fn jpeg_wr_u16(w: &JpegBitWriter, v: i32) void {
+    jpeg_bits_put_raw(w, ((v >> 8) & 255) as u8);
+    jpeg_bits_put_raw(w, (v & 255) as u8);
+}
+
+// 写一个标记（0xFF + 码）。段体的长度由调用方紧接着写。
+fn jpeg_wr_marker(w: &JpegBitWriter, m: i32) void {
+    jpeg_bits_put_raw(w, 0xFF as u8);
+    jpeg_bits_put_raw(w, (m & 255) as u8);
+}
+
+// 写 SOI。
+fn jpeg_wr_soi(w: &JpegBitWriter) void {
+    jpeg_wr_marker(w, 0xD8);
+}
+
+// 写 JFIF APP0（16 字节段体）。
+fn jpeg_wr_app0(w: &JpegBitWriter) void {
+    jpeg_wr_marker(w, 0xE0);
+    jpeg_wr_u16(w, 16);
+    const sig: [u8: 5] = [0x4Au8, 0x46u8, 0x49u8, 0x46u8, 0x00u8];
+    jpeg_bits_put_raw_n(w, &sig[0], 5 as usize);
+    jpeg_wr_u8(w, 1);          // 主版本
+    jpeg_wr_u8(w, 1);          // 次版本
+    jpeg_wr_u8(w, 0);          // 密度单位 = 无
+    jpeg_wr_u16(w, 1);         // X 密度
+    jpeg_wr_u16(w, 1);         // Y 密度
+    jpeg_wr_u8(w, 0);          // 缩略图宽
+    jpeg_wr_u8(w, 0);          // 缩略图高
+}
+
+// 写 DQT（一张或两张表；n 张 = 段体长度 2 + n*65）。
+// 参数：
+// - w: 写器。
+// - luma: 亮度量化表（自然顺序，64 项）。
+// - chroma: 色度量化表（自然顺序，64 项；灰度时可为 null / 不写）。
+// - n: 表张数（1 或 2）。
+// 返回：
+// - 无。
+fn jpeg_wr_dqt(w: &JpegBitWriter, luma: &const u8, chroma: &const u8,
+                n: i32) void {
+    jpeg_wr_marker(w, 0xDB);
+    jpeg_wr_u16(w, 2 + n * 65);
+    var t: i32 = 0;
+    while t < n {
+        jpeg_wr_u8(w, t);      // 精度 0（8-bit）+ 表号 t
+        var k: usize = 0;
+        while k < 64 {
+            const nat: usize = JPEG_ZIGZAG[k] as usize;
+            const tbl: &const u8 = if t == 0 { luma } else { chroma };
+            jpeg_wr_u8(w, tbl[nat] as i32);
+            k = k + 1;
+        }
+        t = t + 1;
+    }
+}
+
+// 写 DHT（四张标准表：亮度/色度 × DC/AC）。
+fn jpeg_wr_dht(w: &JpegBitWriter) void {
+    jpeg_wr_marker(w, 0xC4);
+    // 段体长度 = 2 + 4 张 * (1 + 16 + 符号数)
+    jpeg_wr_u16(w, 2 + (1 + 16 + 12) * 2 + (1 + 16 + 162) * 2);
+    var t: i32 = 0;
+    while t < 4 {
+        // 0 = 亮度 DC，1 = 亮度 AC，2 = 色度 DC，3 = 色度 AC
+        const tc: i32 = if t == 0 || t == 2 { 0 } else { 1 };
+        const th: i32 = if t <= 1 { 0 } else { 1 };
+        var bits: [u8: 16] = [0: 16];
+        var vals: [u8: 162] = [0: 162];
+        var n: usize = 0;
+        jpeg_std_huffval(t, &bits[0], &vals[0], &n);
+        jpeg_wr_u8(w, (tc << 4) | th);
+        jpeg_bits_put_raw_n(w, &bits[0], 16 as usize);
+        jpeg_bits_put_raw_n(w, &vals[0], n);
+        t = t + 1;
+    }
+}
+
+// 写 SOF0。
+// 参数：
+// - w: 写器。
+// - width/height: 图像尺寸（1..65535）。
+// - ncomp: 分量数（1 或 3）。
+// - gray: true 表示灰度（1 分量）。
+// - hs/vs: 色度采样因子（灰度时忽略，写 1x1）。
+// 返回：
+// - 无。
+fn jpeg_wr_sof0(w: &JpegBitWriter, width: i32, height: i32, ncomp: i32,
+                hs: i32, vs: i32) void {
+    jpeg_wr_marker(w, 0xC0);
+    jpeg_wr_u16(w, 8 + ncomp * 3);
+    jpeg_wr_u8(w, 8);              // 精度
+    jpeg_wr_u16(w, height);
+    jpeg_wr_u16(w, width);
+    jpeg_wr_u8(w, ncomp);
+    if ncomp == 1 {
+        jpeg_wr_u8(w, 1);          // 分量 id
+        jpeg_wr_u8(w, 0x11);       // 1x1
+        jpeg_wr_u8(w, 0);          // 量化表 0
+        return;
+    }
+    // Y：采样因子 hs x vs，量化表 0
+    jpeg_wr_u8(w, 1);
+    jpeg_wr_u8(w, ((hs << 4) | vs));
+    jpeg_wr_u8(w, 0);
+    // Cb / Cr：1x1，量化表 1
+    jpeg_wr_u8(w, 2);
+    jpeg_wr_u8(w, 0x11);
+    jpeg_wr_u8(w, 1);
+    jpeg_wr_u8(w, 3);
+    jpeg_wr_u8(w, 0x11);
+    jpeg_wr_u8(w, 1);
+}
+
+// 写 SOS。
+fn jpeg_wr_sos(w: &JpegBitWriter, ncomp: i32) void {
+    jpeg_wr_marker(w, 0xDA);
+    jpeg_wr_u16(w, 6 + ncomp * 2);
+    jpeg_wr_u8(w, ncomp);
+    if ncomp == 1 {
+        jpeg_wr_u8(w, 1);
+        jpeg_wr_u8(w, 0x00);       // DC 表 0 / AC 表 0
+    } else {
+        jpeg_wr_u8(w, 1);
+        jpeg_wr_u8(w, 0x00);
+        jpeg_wr_u8(w, 2);
+        jpeg_wr_u8(w, 0x11);       // DC 表 1 / AC 表 1
+        jpeg_wr_u8(w, 3);
+        jpeg_wr_u8(w, 0x11);
+    }
+    jpeg_wr_u8(w, 0);              // Ss
+    jpeg_wr_u8(w, 63);             // Se
+    jpeg_wr_u8(w, 0);              // Ah/Al
+}
+
+// 写一个系数的幅值位（T.81 F.1.2.1.2：正数原样、负数取反码）。
+// 参数：
+// - w: 写器。
+// - v: 系数（非 0）。
+// - size: 该值的位宽（1..15）。
+// 返回：
+// - 无。
+fn jpeg_wr_magnitude(w: &JpegBitWriter, v: i32, size: i32) void {
+    var x: i32 = v;
+    if x < 0 {
+        x = v + (1 << size) - 1;
+    }
+    jpeg_bits_put(w, x, size);
+}
+
+// 把一个系数的位数（T.81 F.1.2.1.1）。
+fn jpeg_coef_size(v: i32) i32 {
+    var x: i32 = v;
+    if x < 0 {
+        x = 0 - x;
+    }
+    var s: i32 = 0;
+    while x > 0 {
+        s = s + 1;
+        x = x >> 1;
+    }
+    return s;
+}
+
+// 编码一个 8x8 块（输入自然顺序的量化系数，按 zigzag 写 DC + AC）。
+// 参数：
+// - w: 写器。
+// - dce: DC 编码表。
+// - ace: AC 编码表。
+// - pred: DC 预测器（就地累加，调用方按分量维持）。
+// - coef: 64 项量化系数（自然顺序）。
+// 返回：
+// - 无。缓冲不足由写器的 ok 标志记录。
+fn jpeg_encode_block(w: &JpegBitWriter, dce: &const JpegHuffEncoder,
+                     ace: &const JpegHuffEncoder, pred: &i32,
+                     coef: &const i32) void {
+    const diff: i32 = coef[0] - pred[0];
+    pred[0] = coef[0];
+    const ds: i32 = jpeg_coef_size(diff);
+    if ds > 15 {
+        // 量化后 DC 差不可能超过 11 位；超了说明调用方送来的块不合法。
+        // 硬塞 0 会让码流自洽但图像错，所以写一个「非法但可解」的 15 位占位。
+        jpeg_bits_put(w, dce.code[15] as i32, dce.size[15] as i32);
+        return;
+    }
+    const dsi: usize = (ds as! usize).value;
+    jpeg_bits_put(w, dce.code[dsi] as i32, dce.size[dsi] as i32);
+    if ds > 0 {
+        jpeg_wr_magnitude(w, diff, ds);
+    }
+    var run: i32 = 0;
+    var k: i32 = 1;
+    while k < 64 {
+        const zz: usize = JPEG_ZIGZAG[k as usize] as usize;
+        const v: i32 = coef[zz];
+        if v == 0 {
+            run = run + 1;
+            k = k + 1;
+            continue;
+        }
+        while run > 15 {
+            // ZRL：16 个零
+            jpeg_bits_put(w, ace.code[0xF0] as i32, ace.size[0xF0] as i32);
+            run = run - 16;
+        }
+        const s: i32 = jpeg_coef_size(v);
+        const sym: usize = ((run << 4) | s) as usize;
+        jpeg_bits_put(w, ace.code[sym] as i32, ace.size[sym] as i32);
+        jpeg_wr_magnitude(w, v, s);
+        run = 0;
+        k = k + 1;
+    }
+    if run > 0 {
+        // EOB
+        jpeg_bits_put(w, ace.code[0x00] as i32, ace.size[0x00] as i32);
+    }
+}
+
+// 从像素缓冲取一个分量（RGB → Y / Cb / Cr，或灰度直取）。
+// 参数：
+// - img: 源图。
+// - x/y: 像素坐标（已在界内）。
+// - which: 0 = Y（灰度也是 0），1 = Cb，2 = Cr。
+// 返回：
+// - 分量值（0..255）。
+fn jpeg_luma_chroma(img: &const Image, x: i32, y: i32, which: i32) i32 {
+    const off: usize = (((y as usize) * (img.width as usize) + (x as usize))
+        * (img.channels as usize));
+    if img.channels == IMAGE_GRAY {
+        return img.pixels[off] as i32;
+    }
+    const r: i32 = img.pixels[off] as i32;
+    const g: i32 = img.pixels[off + 1] as i32;
+    const b: i32 = img.pixels[off + 2] as i32;
+    if which == 0 {
+        // Y = 0.299R + 0.587G + 0.114B（定标 65536）
+        return (19595 * r + 38470 * g + 7471 * b) >> 16;
+    }
+    if which == 1 {
+        // Cb = 128 - 0.168736R - 0.331264G + 0.5B
+        return 128 + (((0 - 11059) * r + (0 - 21709) * g + 32768 * b) >> 16);
+    }
+    // Cr = 128 + 0.5R - 0.418688G - 0.081312B
+    return 128 + ((32768 * r + (0 - 27439) * g + (0 - 5329) * b) >> 16);
+}
+
+// 把 0..255 夹好（YCbCr 转换的理论值域可能轻微越界）。
+fn jpeg_clip8(v: i32) i32 {
+    if v < 0 {
+        return 0;
+    }
+    if v > 255 {
+        return 255;
+    }
+    return v;
+}
+
+// 取一个色度平面样本：4:2:2 / 4:2:0 时按 hsub x vsub 做**盒式平均**（下采样）。
+// 参数：
+// - img: 源图。
+// - cx/cy: 色度平面坐标。
+// - which: 1 = Cb，2 = Cr。
+// - hsub/vsub: 水平/垂直下采样因子（1 或 2）。
+// 返回：
+// - 0..255 的色度样本。
+fn jpeg_chroma_sample(img: &const Image, cx: i32, cy: i32, which: i32,
+                      hsub: i32, vsub: i32) i32 {
+    if hsub == 1 && vsub == 1 {
+        const x: i32 = cx;
+        const y: i32 = cy;
+        if x >= img.width || y >= img.height {
+            return 128;
+        }
+        return jpeg_clip8(jpeg_luma_chroma(img, x, y, which));
+    }
+    var sum: i32 = 0;
+    var n: i32 = 0;
+    var dy: i32 = 0;
+    while dy < vsub {
+        var dx: i32 = 0;
+        while dx < hsub {
+            const x: i32 = cx * hsub + dx;
+            const y: i32 = cy * vsub + dy;
+            if x < img.width && y < img.height {
+                sum = sum + jpeg_luma_chroma(img, x, y, which);
+                n = n + 1;
+            }
+            dx = dx + 1;
+        }
+        dy = dy + 1;
+    }
+    if n == 0 {
+        return 128;
+    }
+    return jpeg_clip8(sum / n);
+}
+
+// 装一个 8x8 的像素差分块（值 -128..127），从「取样本」回调的结果填。
+// 参数：
+// - blk: 64 项输出。
+// - y0/x0: 块左上角（源图坐标）。
+// - img: 源图。
+// - which: 分量（0 = Y，1 = Cb，2 = Cr；灰度恒 0）。
+// - hsub/vsub: 该分量的下采样因子（Y 恒 1）。
+// 返回：
+// - 无。越界像素按**边缘复制**（右/下边不足一块时）。
+fn jpeg_load_block(blk: &i32, x0: i32, y0: i32, img: &const Image,
+                   which: i32, hsub: i32, vsub: i32) void {
+    var y: i32 = 0;
+    while y < 8 {
+        var x: i32 = 0;
+        while x < 8 {
+            var v: i32 = 0;
+            if which == 0 {
+                var sx: i32 = x0 + x;
+                var sy: i32 = y0 + y;
+                if sx >= img.width {
+                    sx = img.width - 1;
+                }
+                if sy >= img.height {
+                    sy = img.height - 1;
+                }
+                v = jpeg_luma_chroma(img, sx, sy, 0);
+            } else {
+                var cx: i32 = (x0 / hsub) + x;
+                var cy: i32 = (y0 / vsub) + y;
+                const cw: i32 = (img.width + hsub - 1) / hsub;
+                const chh: i32 = (img.height + vsub - 1) / vsub;
+                if cx >= cw {
+                    cx = cw - 1;
+                }
+                if cy >= chh {
+                    cy = chh - 1;
+                }
+                v = jpeg_chroma_sample(img, cx, cy, which, hsub, vsub);
+            }
+            blk[(y * 8 + x) as usize] = jpeg_clip8(v) - 128;
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+}
+
+// 量化一个块：FDCT → 量化（就地）。
+// 参数：
+// - blk: 64 项像素差分（就地进行）。
+// - q: 64 项量化表（自然顺序）。
+// 返回：
+// - 无。
+fn jpeg_fdct_quantize(blk: &i32, q: &const u8) void {
+    jpeg_fdct_8x8(blk);
+    jpeg_quantize(blk, q);
+}
+
+// 解一张图并编码成 JPEG 字节流。
+// 参数：
+// - img: 源位图（灰度或 RGB，尺寸 1..65535）。
+// - opts: 编码选项（质量与采样）。
+// - out: 输出缓冲（&u8 视图）。
+// - cap: 缓冲字节数（建议 >= jpeg_max_bytes(width, height)）。
+// - alloc: 保留参数（当前编码路径只用调用方的 out 与栈上的块缓冲，
+//   不分配堆；留着是为了与解码侧同形，将来做「大图分块写盘」时用）。
+// - out_len: 接收实际写出的字节数（失败时不确定）。
+// 返回：
+// - true = 编码成功（out_len 有效）。
+// - error: JpegCorrupt（图/选项非法）/ JpegUnsupported（尺寸过大、通道不是 1/3）/
+//   JpegBufferTooSmall（out 装不下）。
+export fn jpeg_encode(img: &const Image, opts: &const JpegEncodeOptions,
+                      out: &u8, cap: usize, alloc: IAllocator,
+                      out_len: &usize) !bool {
+    _ = try jpeg_check_image(img);
+    const hs: i32 = jpeg_encode_hsub(img, opts);
+    const vs: i32 = jpeg_encode_vsub(img, opts);
+    // 量化表（质量缩放）+ 四张标准 Huffman 编码表
+    var qluma: [u8: 64] = [0: 64];
+    var qchroma: [u8: 64] = [0: 64];
+    jpeg_quality_scale(&JPEG_QUANT_LUMA_NATURAL[0], opts.quality, &qluma[0]);
+    jpeg_quality_scale(&JPEG_QUANT_CHROMA_NATURAL[0], opts.quality,
+        &qchroma[0]);
+    var st: JpegEncState = jpeg_enc_state_new(&qluma[0], &qchroma[0]);
+    const ncomp: i32 = if img.channels == IMAGE_RGB { 3 } else { 1 };
+    // 写头部
+    var w: JpegBitWriter = JpegBitWriter{ out: null, cap: 0, len: 0, acc: 0,
+        nbits: 0, ok: false };
+    jpeg_bits_winit(&w, out, cap);
+    jpeg_write_header(&w, img, ncomp, hs, vs, &qluma[0], &qchroma[0]);
+    // MCU 网格
+    const mw: i32 = hs * 8;
+    const mh: i32 = vs * 8;
+    var mcus_x: i32 = (img.width + mw - 1) / mw;
+    var mcus_y: i32 = (img.height + mh - 1) / mh;
+    if mcus_x < 1 {
+        mcus_x = 1;
+    }
+    if mcus_y < 1 {
+        mcus_y = 1;
+    }
+    // 熵编码（按 MCU 扫描）
+    _ = alloc;
+    jpeg_encode_mcus(&w, img, &st, mw, mh, hs, vs, ncomp, mcus_x, mcus_y);
+    jpeg_bits_flush(&w);
+    jpeg_wr_marker(&w, 0xD9);      // EOI
+    if !jpeg_bits_wok(&w) {
+        return error.JpegBufferTooSmall;
+    }
+    out_len[0] = jpeg_bits_wlen(&w);
+    return true;
+}
+
+// 写完整段头（SOI / APP0 / DQT / SOF0 / DHT / SOS）。
+// 参数：
+// - w: 写器。
+// - img: 源图（要宽高）。
+// - ncomp: 分量数。
+// - hs/vs: 亮度采样因子。
+// - qluma/qchroma: 量化表（自然顺序）。
+// 返回：
+// - 无。
+fn jpeg_write_header(w: &JpegBitWriter, img: &const Image, ncomp: i32,
+                     hs: i32, vs: i32, qluma: &const u8,
+                     qchroma: &const u8) void {
+    jpeg_wr_soi(w);
+    jpeg_wr_app0(w);
+    var nq: i32 = 1;
+    if ncomp == 3 {
+        nq = 2;
+    }
+    jpeg_wr_dqt(w, qluma, qchroma, nq);
+    jpeg_wr_sof0(w, img.width, img.height, ncomp, hs, vs);
+    jpeg_wr_dht(w);
+    jpeg_wr_sos(w, ncomp);
+}
+
+// 便捷入口：用缺省选项（质量 85、4:2:0）编码。
+// 参数：
+// - img: 源位图。
+// - quality: 质量 1..100。
+// - out: 输出缓冲。
+// - cap: 缓冲字节数。
+// - alloc: 分配器。
+// - out_len: 接收实际字节数。
+// 返回：
+// - true = 成功；error 同 jpeg_encode。
+export fn jpeg_encode_q(img: &const Image, quality: i32, out: &u8, cap: usize,
+                        alloc: IAllocator, out_len: &usize) !bool {
+    var o: JpegEncodeOptions = jpeg_options_default();
+    o.quality = quality;
+    return jpeg_encode(img, &o, out, cap, alloc, out_len);
+}

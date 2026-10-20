@@ -315,8 +315,21 @@ make doc-audit        # 文本文件里不许留 Git 冲突标记
 
 ## 6. 已知的编译器事实（不是本仓的规范，但会影响你写代码）
 
-**当前编译器 = `uya 0.10.3`**（`/home/winger/uya/uya/bin/uya`，`git describe` = `v0.10.3-7-gbb410f82`；
-Makefile 的 `UYA` / `UYA_ROOT` 默认就指向它）。下面第 1、2 条是 **0.10.1 时代的历史**，
+**当前编译器 = `uya 0.10.4`，随仓自带**（`./uya/bin/uya`，真二进制是同目录的 `uya-real`；
+Makefile 的 `UYA` / `UYA_ROOT` 默认就指向它，`UYA_ROOT=./uya/stdlib/`）。
+工具链的目录约定（2026-10 起，**换机不用再装编译器**）：
+
+* `uya/bin/uya` —— 启动器脚本：把 `UYA_ROOT` 钉到 `../stdlib`、再 exec `uya-real`。
+  它**覆盖**外部传入的 `UYA_ROOT`，所以入口固定走它，别直接调 `uya-real`。
+* `uya/bin/uya-real` —— 0.10.4 的 ELF 静态二进制（2.4 MB）。
+* `uya/stdlib/lib/` —— 标准库**源码**（`.uya`，215 个），编译器的 C 目标从它生成到
+  `build/uyacache/`（见 Makefile 的 `UYA_SPLIT_C_DIR`）。
+* **`uya/lib/` 已删除**（10 月 17 日那版工具链留下的 `.c` + `.o`，70+70 个、3.3 MB，
+  没有源）。它是**生成物**，不是库：里面全是 `#include "uya_split_protos.h"` 这类引用
+  `build/uyacache/` 里头的生成头的 C，删掉后 `rm -rf build && make build` 照样过。
+  以后别再让哪儿往仓里落 `.c`/`.o` —— 生成的 C 只许进 `build/`（`.gitignore` 已盖）。
+
+下面第 1、2 条是 **0.10.1 时代的历史**，
 **两条都已修**，但症状一起留着 —— 换/降编译器时会原样复发，而症状本身完全指不到根因：
 
 1. **函数表是定长表**（`uya 0.10.1`）：本仓余量只有 **+6 个函数**，第 8 个就报

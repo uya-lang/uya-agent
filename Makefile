@@ -36,19 +36,27 @@
 # 0.10 文档里的 `LINK_MODE=static` 对本路径**无效**（实测产物仍是 PIE 动态，那个变量
 # 是编译器自身构建脚本 compile.sh 用的）。
 
-# 编译器：用 /home/winger/uya/uya（0.10.3 + 三处「固定表」修复）。
-# 为什么不再用 /home/winger/uya-0.10（0.10.1）：
+# 编译器：用本仓的 ./uya/bin/uya（0.10.4，含下面三处「固定表」修复）。
+# 历史：0.10.3 时它指向 /home/winger/uya/uya；现在工具链随仓走，换机不用再装。
+# 为什么不用 /home/winger/uya-0.10（0.10.1）：
 #   ① 0.10.1 的**显式输入文件数硬上限是 64**（第 65 个报「收集模块依赖失败: <编译器路径>」，
 #      报错指不到根因）。本仓拆完 17937/12957/11583 三个大文件后有 **90 个构建文件**，
 #      0.10.1 直接编不动；
 #   ② 0.10.1 的 checker 函数表与 codegen `reachable_function_decls`（4096 槽）都是**定长表**，
 #      满了就**静默丢函数**（定义与原型都不发射、调用点还在 ⇒ 宿主 C 报 implicit declaration
 #      + invalid initializer / 链接期 undefined reference）。本仓 3600+ 个函数正好踩在边界上。
-# 这三处都已在 /home/winger/uya/uya 修掉（提交：`fc577783` checker 五张定长表改动态哈希表、
+# 这三处都已在 0.10.4 修掉（提交：`fc577783` checker 五张定长表改动态哈希表、
 # `7c49de57` 输入文件表可增长、`1267dbc6` reachable 函数表按实际条数分配）。
 # 换别的编译器时请先确认这三条都已修，否则 build 会以看不懂的方式失败。
-UYA_ROOT ?= ../uya/lib/
-UYA      ?= ../uya/bin/uya
+# 工具链现在就在本仓（`uya/`），**自包含**：`uya/bin/uya` 是启动器脚本（找库、钉版本），
+# `uya/bin/uya-real` 是 0.10.4 真二进制，标准库源码在 `uya/stdlib/lib/`。
+# UYA_ROOT 指 `uya/stdlib` —— 0.10.4 的编译器按这个布局找库（`$UYA_ROOT/lib/...`），
+# 指 `uya/lib` 那种老布局会报「链接失败」（实测）。
+# 为什么不要 `uya/lib`：那是上一版工具链留下的**生成物**（.c + .o，3.3 MB，无源），
+# 编译器自己会把它从 `uya/stdlib/lib/*.uya` 重新生成到 `build/uyacache`。见 CODING.md §6。
+# 用 `?=` 是为了 `make UYA=… UYA_ROOT=…` 换编译器（README §3）。
+UYA_ROOT ?= ./uya/stdlib/
+UYA      ?= ./uya/bin/uya
 
 STATIC ?= 1
 ifeq ($(STATIC),1)

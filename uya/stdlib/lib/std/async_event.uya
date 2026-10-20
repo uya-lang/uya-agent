@@ -1,0 +1,1092 @@
+// lib/std/async_event.uya - 异步事件循环抽象与 Linux epoll 实现
+//
+// 模块路径：use std.async_event
+// 设计见 docs/std_async_design.md 阶段 3（std.async.event）。
+//
+// 版本：2.0 - 显式状态机 + generation 防止 fd 复用混淆
+
+use std;
+use std.async;
+use libc.errno;
+use libc.syscall;
+use libc.stdlib;
+
+error EventLoopSlotsFull;
+error EventLoopInvalidCapacity;
+error EventLoopAllocFailed;
+
+const LINUX_EPOLL_DEFAULT_CAPACITY: i32 = 1024;
+const LINUX_EPOLL_FD_EMPTY: i32 = 0 - 1;
+const LINUX_EPOLL_FD_TOMBSTONE: i32 = 0 - 2;
+
+// kqueue（macOS）常量：EVFILT_* 为过滤器标识，EV_* 为提交标志。
+// 采用水平触发语义（不加 EV_CLEAR），与 epoll 默认行为对齐。
+const KQUEUE_EVFILT_READ: i16 = -1;
+const KQUEUE_EVFILT_WRITE: i16 = -2;
+const KQUEUE_EV_ADD: u16 = 0x0001;
+const KQUEUE_EV_DELETE: u16 = 0x0002;
+const KQUEUE_EV_ENABLE: u16 = 0x0004;
+
+/// kqueue 事件结构（BSD `struct kevent`，macOS x86_64 / arm64 均为 32 字节）。
+/// 字段：`ident` 为 fd（或标识符），`filter` 为 `EVFILT_*`，`flags` 为 `EV_*` 标志，
+/// `fflags` 为过滤器专用标志，`data` 为过滤器返回数据，`udata` 为用户附加指针。
+export struct Kevent {
+    ident: usize,
+    filter: i16,
+    flags: u16,
+    fflags: u32,
+    data: isize,
+    udata: usize,
+}
+
+/// kevent 超时结构（与 libc `struct timespec` 布局一致，共 16 字节）。
+/// 字段：`tv_sec` 为秒，`tv_nsec` 为纳秒。
+export struct TimeSpec {
+    tv_sec: i64,
+    tv_nsec: i64,
+}
+
+/// 事件关注类型：可读、可写、可读可写
+export union EventKind {
+    Readable: void,
+    Writable: void,
+    ReadWrite: void,
+}
+
+/// Slot 状态常量
+const SLOT_STATE_EMPTY: i32 = 0;        // 空闲槽位
+const SLOT_STATE_REGISTERED: i32 = 1;   // 已注册到 epoll，可接收事件
+
+/// 将 EventKind 转为 epoll 事件掩码（仅 Linux 实现使用）
+fn event_kind_to_epoll(k: EventKind) i32 {
+    std.cfg(std.target_os == .tos_macos, {
+        return 0;
+    }, {
+    match k {
+        .Readable(_) => { return EPOLLIN as i32; },
+        .Writable(_) => { return EPOLLOUT as i32; },
+        .ReadWrite(_) => { return (EPOLLIN | EPOLLOUT) as i32; },
+    };
+    return 0 as i32;
+    })
+}
+
+fn event_kind_to_poll(k: EventKind) i16 {
+    match k {
+        .Readable(_) => { return POLLIN; },
+        .Writable(_) => { return POLLOUT; },
+        .ReadWrite(_) => { return POLLIN | POLLOUT; },
+    };
+    return 0 as i16;
+}
+
+fn epoll_interest_or_default(fd: i32, interest: EventKind) EpollEvent {
+    return epoll_event_with_fd(event_kind_to_epoll(interest) as u32, fd);
+}
+
+// ============================================================================
+// kqueue（macOS）辅助函数
+// ============================================================================
+
+/// 把一个 `Kevent` 变更项填充为「对 fd 的 filter 应用 flags」。
+///
+/// 参数：`out` 为输出变更项；`fd` 为文件描述符；`filter` 为 `EVFILT_*`；
+/// `flags` 为 `EV_*` 提交标志。
+/// 返回值：无（就地写入 `out`）。
+fn kqueue_fill_change(out: &Kevent, fd: i32, filter: i16, flags: u16) void {
+    out.ident = (fd as! usize).value;
+    out.filter = filter;
+    out.flags = flags;
+    out.fflags = 0 as u32;
+    out.data = 0 as isize;
+    out.udata = 0 as usize;
+}
+
+/// 计算从 `old_mask` 迁移到新 `interest` 所需的 kevent 变更集合。
+///
+/// 参数：`out` 为输出变更数组（容量至少 4 项）；`fd` 为文件描述符；
+/// `old_mask` 为该 fd 先前的 poll 掩码（0 表示尚未注册）；`interest` 为新关注类型。
+/// 返回值：写入 `out` 的变更条目数（0 表示无需变更）。
+fn kqueue_build_transition(out: &Kevent, fd: i32, old_mask: i16, interest: EventKind) i32 {
+    const desired: i16 = event_kind_to_poll(interest);
+    const add_flags: u16 = KQUEUE_EV_ADD | KQUEUE_EV_ENABLE;
+    var count: i32 = 0;
+    if (old_mask & POLLIN) != 0 as i16 && (desired & POLLIN) == 0 as i16 {
+        kqueue_fill_change(&out[count], fd, KQUEUE_EVFILT_READ, KQUEUE_EV_DELETE);
+        count = count + 1;
+    }
+    if (old_mask & POLLOUT) != 0 as i16 && (desired & POLLOUT) == 0 as i16 {
+        kqueue_fill_change(&out[count], fd, KQUEUE_EVFILT_WRITE, KQUEUE_EV_DELETE);
+        count = count + 1;
+    }
+    if (desired & POLLIN) != 0 as i16 {
+        kqueue_fill_change(&out[count], fd, KQUEUE_EVFILT_READ, add_flags);
+        count = count + 1;
+    }
+    if (desired & POLLOUT) != 0 as i16 {
+        kqueue_fill_change(&out[count], fd, KQUEUE_EVFILT_WRITE, add_flags);
+        count = count + 1;
+    }
+    return count;
+}
+
+/// 提交一个 fd 的关注迁移（先删旧 filter，再加新 filter）。
+///
+/// 参数：`self` 为事件循环；`fd` 为文件描述符；`old_mask` 为先前的 poll 掩码；
+/// `interest` 为新关注类型。
+/// 返回值：成功返回 0；kqueue 提交失败时返回底层错误。
+fn kqueue_submit_transition(self: &LinuxEpoll, fd: i32, old_mask: i16, interest: EventKind) !i32 {
+    var changes: [Kevent: 4] = [];
+    const count: i32 = kqueue_build_transition(&changes[0], fd, old_mask, interest);
+    if count <= 0 {
+        return 0;
+    }
+    return sys_kevent(self.kqfd, &changes[0] as &void, count, null as &void, 0, null as &const void);
+}
+
+/// 从 kqueue 删除 fd 上仍在关注的过滤器（用于注销）。
+///
+/// 参数：`self` 为事件循环；`fd` 为文件描述符；`mask` 为该 fd 的 poll 掩码。
+/// 返回值：无（删除失败按已注销处理，不报错）。
+fn kqueue_deactivate(self: &LinuxEpoll, fd: i32, mask: i16) void {
+    var change: Kevent = Kevent{
+        ident: 0 as usize,
+        filter: 0 as i16,
+        flags: 0 as u16,
+        fflags: 0 as u32,
+        data: 0 as isize,
+        udata: 0 as usize,
+    };
+    if (mask & POLLIN) != 0 as i16 {
+        kqueue_fill_change(&change, fd, KQUEUE_EVFILT_READ, KQUEUE_EV_DELETE);
+        _ = sys_kevent(self.kqfd, &change as &void, 1, null as &void, 0, null as &const void) catch {};
+    }
+    if (mask & POLLOUT) != 0 as i16 {
+        kqueue_fill_change(&change, fd, KQUEUE_EVFILT_WRITE, KQUEUE_EV_DELETE);
+        _ = sys_kevent(self.kqfd, &change as &void, 1, null as &void, 0, null as &const void) catch {};
+    }
+}
+
+/// 把毫秒超时转换为 kevent 所需的 `timespec` 指针；负数表示无限阻塞（null）。
+///
+/// 参数：`ts` 为可供写入的 `TimeSpec` 缓冲；`timeout_ms` 为等待超时毫秒。
+/// 返回值：`ts` 的只读指针，或 `timeout_ms < 0` 时的 null（内核语义为无限阻塞）。
+fn kqueue_timeout_ptr(ts: &TimeSpec, timeout_ms: i32) &const void {
+    if timeout_ms < 0 {
+        return null as &const void;
+    }
+    ts.tv_sec = (timeout_ms as i64) / 1000 as i64;
+    ts.tv_nsec = ((timeout_ms as i64) % 1000 as i64) * 1000000 as i64;
+    return ts as &const void;
+}
+
+/// 事件循环统一接口：注册 fd、注销、轮询
+export interface EventLoop {
+    fn register(self: &Self, fd: i32, interest: EventKind, waker: &Waker) !i32;
+    fn deregister(self: &Self, fd: i32) !i32;
+    fn poll(self: &Self, timeout_ms: i32) !i32;
+}
+
+/// Linux epoll 事件循环实现（默认1024容量，可在构造时配置实例容量）
+/// 
+/// 线程安全：此实现非线程安全，所有操作应在单线程执行。
+/// fd 生命周期：register -> (mod) -> deregister，deregister 后 fd 保留在 epoll 中但事件掩码为 0。
+/// fd 复用：通过 generation 字段防止 fd 复用混淆。
+/// 容量策略：slot 相关存储在满载时自动扩容；`slot_capacity` / `event_capacity` 表示初始容量。
+export struct LinuxEpoll : EventLoop {
+    epfd: i32,                          // epoll 实例文件描述符
+    kqfd: i32,                          // macOS kqueue 实例描述符（Linux 恒为 -1；macOS 上 kqueue 失败也为 -1）
+    slot_capacity: i32,                 // 当前实例可使用的 slot 数量
+    event_capacity: i32,                // 单次 poll 可接收的事件数量
+    slot_states: &i32,                  // SLOT_STATE_EMPTY / SLOT_STATE_REGISTERED
+    slot_fds: &i32,                     // 关联的文件描述符
+    slot_wakers: &usize,                // Waker 指针（0 表示无）
+    slot_interests: &i16,               // poll(2) 事件关注掩码（macOS fallback 使用）
+    slot_generations: &u32,             // 代际计数，防止 fd 复用混淆
+    slot_next_free: &i32,               // 空闲 slot 链表
+    fd_keys: &i32,                      // fd -> slot 哈希表 key
+    fd_slot_indices: &i32,              // fd -> slot 哈希表 value
+    fd_map_capacity: i32,               // fd 哈希表容量
+    free_slot_head: i32,                // 空闲 slot 链表头
+    events: &EpollEvent,                // 单次 poll 复用的 event buffer
+    kevents: &Kevent,                   // macOS kqueue 单次 poll 复用的 event buffer
+    poll_fds: &PollFd,                  // macOS poll(2) fallback 复用的 fd buffer
+    next_generation: u32,               // 全局代际计数器
+    registered_count: i32,              // 当前已注册 fd 数
+    peak_registered_count: i32,         // 历史峰值已注册 fd 数
+    resize_count: i32,                  // slot 相关存储扩容次数
+
+    /// 查找指定 fd 的 slot（通过 fd 哈希索引查找）
+    fn find_slot(self: &Self, fd: i32) i32 {
+        if self.fd_map_capacity <= 0 {
+            return 0 - 1;
+        }
+        var idx: i32 = linux_epoll_fd_hash(fd, self.fd_map_capacity);
+        var probes: i32 = 0;
+        while probes < self.fd_map_capacity {
+            const key: i32 = self.fd_keys[idx];
+            if key == LINUX_EPOLL_FD_EMPTY {
+                return 0 - 1;
+            }
+            if key == fd {
+                const slot_idx: i32 = self.fd_slot_indices[idx];
+                if slot_idx >= 0 && slot_idx < self.slot_capacity && self.slot_states[slot_idx] == SLOT_STATE_REGISTERED {
+                    return slot_idx;
+                }
+                return 0 - 1;
+            }
+            idx = idx + 1;
+            if idx >= self.fd_map_capacity {
+                idx = 0;
+            }
+            probes = probes + 1;
+        }
+        return 0 - 1;
+    }
+
+    /// 分配空闲 slot（通过空闲链表 O(1) 弹出）
+    fn alloc_slot(self: &Self) i32 {
+        const slot_idx: i32 = self.free_slot_head;
+        if slot_idx < 0 || slot_idx >= self.slot_capacity {
+            return 0 - 1;
+        }
+        self.free_slot_head = self.slot_next_free[slot_idx];
+        self.slot_next_free[slot_idx] = 0 - 1;
+        return slot_idx;
+    }
+
+    /// 归还一个尚未使用或已清空的 slot 到空闲链表
+    fn recycle_slot(self: &Self, slot_idx: i32) void {
+        if slot_idx < 0 || slot_idx >= self.slot_capacity {
+            return;
+        }
+        const idx: usize = (slot_idx as! usize).value;
+        if self.slot_states[idx] == SLOT_STATE_REGISTERED && self.registered_count > 0 {
+            self.registered_count = self.registered_count - 1;
+        }
+        self.slot_states[idx] = SLOT_STATE_EMPTY;
+        self.slot_fds[idx] = 0;
+        self.slot_wakers[idx] = 0 as usize;
+        self.slot_interests[idx] = 0 as i16;
+        self.slot_generations[idx] = 0;
+        self.slot_next_free[idx] = self.free_slot_head;
+        self.free_slot_head = slot_idx;
+    }
+
+    /// 初始化 slot 为注册状态
+    fn init_slot(self: &Self, slot_idx: i32, fd: i32, interest: EventKind, waker: &Waker) void {
+        const idx: usize = (slot_idx as! usize).value;
+        const gen: u32 = self.next_generation;
+        self.next_generation = self.next_generation + 1;
+        self.slot_states[idx] = SLOT_STATE_REGISTERED;
+        self.slot_fds[idx] = fd;
+        self.slot_wakers[idx] = (waker as &void) as usize;
+        self.slot_interests[idx] = event_kind_to_poll(interest);
+        self.slot_generations[idx] = gen;
+        linux_epoll_fd_map_put(self, fd, slot_idx);
+        self.registered_count = self.registered_count + 1;
+        if self.registered_count > self.peak_registered_count {
+            self.peak_registered_count = self.registered_count;
+        }
+    }
+
+    /// 清空 slot
+    fn clear_slot(self: &Self, slot_idx: i32) void {
+        if slot_idx < 0 || slot_idx >= self.slot_capacity {
+            return;
+        }
+        const idx: usize = (slot_idx as! usize).value;
+        const fd: i32 = self.slot_fds[idx];
+        linux_epoll_fd_map_remove(self, fd);
+        self.recycle_slot(slot_idx);
+    }
+
+    /// 满载时扩容 slot 相关存储，并重建 fd -> slot 哈希表。
+    fn grow_slots(self: &Self, required_slots: i32) !i32 {
+        if required_slots <= self.slot_capacity {
+            return 0;
+        }
+        var old_capacity: i32 = self.slot_capacity;
+        if old_capacity <= 0 {
+            return error.EventLoopInvalidCapacity;
+        }
+        var new_capacity: i32 = old_capacity;
+        while new_capacity < required_slots {
+            const doubled: i32 = new_capacity * 2;
+            if doubled <= new_capacity {
+                new_capacity = required_slots;
+                break;
+            }
+            new_capacity = doubled;
+        }
+        if new_capacity <= old_capacity {
+            return error.EventLoopAllocFailed;
+        }
+        const old_free_head: i32 = self.free_slot_head;
+        const new_fd_map_capacity: i32 = linux_epoll_lookup_capacity_for_slots(new_capacity);
+        const new_slot_states: &i32 = linux_epoll_alloc_i32(new_capacity) catch {
+            return error.EventLoopAllocFailed;
+        };
+        const new_slot_fds: &i32 = linux_epoll_alloc_i32(new_capacity) catch {
+            free(new_slot_states as &void);
+            return error.EventLoopAllocFailed;
+        };
+        const new_slot_wakers: &usize = linux_epoll_alloc_usize(new_capacity) catch {
+            free(new_slot_states as &void);
+            free(new_slot_fds as &void);
+            return error.EventLoopAllocFailed;
+        };
+        const new_slot_interests: &i16 = linux_epoll_alloc_i16(new_capacity) catch {
+            free(new_slot_states as &void);
+            free(new_slot_fds as &void);
+            free(new_slot_wakers as &void);
+            return error.EventLoopAllocFailed;
+        };
+        const new_slot_generations: &u32 = linux_epoll_alloc_u32(new_capacity) catch {
+            free(new_slot_states as &void);
+            free(new_slot_fds as &void);
+            free(new_slot_wakers as &void);
+            free(new_slot_interests as &void);
+            return error.EventLoopAllocFailed;
+        };
+        const new_slot_next_free: &i32 = linux_epoll_alloc_i32(new_capacity) catch {
+            free(new_slot_states as &void);
+            free(new_slot_fds as &void);
+            free(new_slot_wakers as &void);
+            free(new_slot_interests as &void);
+            free(new_slot_generations as &void);
+            return error.EventLoopAllocFailed;
+        };
+        const new_fd_keys: &i32 = linux_epoll_alloc_i32(new_fd_map_capacity) catch {
+            free(new_slot_states as &void);
+            free(new_slot_fds as &void);
+            free(new_slot_wakers as &void);
+            free(new_slot_interests as &void);
+            free(new_slot_generations as &void);
+            free(new_slot_next_free as &void);
+            return error.EventLoopAllocFailed;
+        };
+        const new_fd_slot_indices: &i32 = linux_epoll_alloc_i32(new_fd_map_capacity) catch {
+            free(new_slot_states as &void);
+            free(new_slot_fds as &void);
+            free(new_slot_wakers as &void);
+            free(new_slot_interests as &void);
+            free(new_slot_generations as &void);
+            free(new_slot_next_free as &void);
+            free(new_fd_keys as &void);
+            return error.EventLoopAllocFailed;
+        };
+        const new_poll_fds: &PollFd = linux_epoll_alloc_pollfds(new_capacity) catch {
+            free(new_slot_states as &void);
+            free(new_slot_fds as &void);
+            free(new_slot_wakers as &void);
+            free(new_slot_interests as &void);
+            free(new_slot_generations as &void);
+            free(new_slot_next_free as &void);
+            free(new_fd_keys as &void);
+            free(new_fd_slot_indices as &void);
+            return error.EventLoopAllocFailed;
+        };
+        linux_epoll_init_fd_map(new_fd_keys, new_fd_slot_indices, new_fd_map_capacity);
+        var i: i32 = 0;
+        while i < old_capacity {
+            new_slot_states[i] = self.slot_states[i];
+            new_slot_fds[i] = self.slot_fds[i];
+            new_slot_wakers[i] = self.slot_wakers[i];
+            new_slot_interests[i] = self.slot_interests[i];
+            new_slot_generations[i] = self.slot_generations[i];
+            new_slot_next_free[i] = self.slot_next_free[i];
+            if new_slot_states[i] == SLOT_STATE_REGISTERED {
+                linux_epoll_fd_map_put_raw(new_fd_keys, new_fd_slot_indices, new_fd_map_capacity, new_slot_fds[i], i);
+            }
+            i = i + 1;
+        }
+        while i < new_capacity {
+            new_slot_states[i] = SLOT_STATE_EMPTY;
+            new_slot_fds[i] = 0;
+            new_slot_wakers[i] = 0 as usize;
+            new_slot_interests[i] = 0 as i16;
+            new_slot_generations[i] = 0;
+            if i + 1 < new_capacity {
+                new_slot_next_free[i] = i + 1;
+            } else {
+                new_slot_next_free[i] = old_free_head;
+            }
+            i = i + 1;
+        }
+
+        const kevent_capacity: i32 = linux_epoll_kevent_capacity(self.event_capacity, new_capacity);
+        const new_kevents: &Kevent = linux_epoll_alloc_kevents(kevent_capacity) catch {
+            free(new_slot_states as &void);
+            free(new_slot_fds as &void);
+            free(new_slot_wakers as &void);
+            free(new_slot_interests as &void);
+            free(new_slot_generations as &void);
+            free(new_slot_next_free as &void);
+            free(new_fd_keys as &void);
+            free(new_fd_slot_indices as &void);
+            free(new_poll_fds as &void);
+            return error.EventLoopAllocFailed;
+        };
+
+        free(self.slot_states as &void);
+        free(self.slot_fds as &void);
+        free(self.slot_wakers as &void);
+        free(self.slot_interests as &void);
+        free(self.slot_generations as &void);
+        free(self.slot_next_free as &void);
+        free(self.fd_keys as &void);
+        free(self.fd_slot_indices as &void);
+        free(self.poll_fds as &void);
+
+        self.slot_states = new_slot_states;
+        self.slot_fds = new_slot_fds;
+        self.slot_wakers = new_slot_wakers;
+        self.slot_interests = new_slot_interests;
+        self.slot_generations = new_slot_generations;
+        self.slot_next_free = new_slot_next_free;
+        self.fd_keys = new_fd_keys;
+        self.fd_slot_indices = new_fd_slot_indices;
+        self.fd_map_capacity = new_fd_map_capacity;
+        self.poll_fds = new_poll_fds;
+        self.kevents = new_kevents;
+        self.slot_capacity = new_capacity;
+        self.free_slot_head = old_capacity;
+        self.resize_count = self.resize_count + 1;
+        return 0;
+    }
+
+    fn ensure_slot_capacity(self: &Self, required_slots: i32) !i32 {
+        if required_slots <= self.slot_capacity {
+            return 0;
+        }
+        return self.grow_slots(required_slots);
+    }
+
+    /// macOS poll(2) fallback：注册 fd 并登记 waker（仅维护 slot 状态）。
+    ///
+    /// 参数：`fd` 为文件描述符；`interest` 为关注类型；`waker` 为唤醒器。
+    /// 返回值：成功返回 0；slot 耗尽返回 `error.EventLoopSlotsFull`。
+    fn register_with_poll(self: &Self, fd: i32, interest: EventKind, waker: &Waker) !i32 {
+        const slot: i32 = self.find_slot(fd);
+        if slot >= 0 {
+            self.slot_wakers[slot] = (waker as &void) as usize;
+            self.slot_interests[slot] = event_kind_to_poll(interest);
+            return 0;
+        }
+        var new_slot: i32 = self.alloc_slot();
+        if new_slot < 0 {
+            _ = try self.ensure_slot_capacity(self.slot_capacity + 1);
+            new_slot = self.alloc_slot();
+        }
+        if new_slot < 0 {
+            return error.EventLoopSlotsFull;
+        }
+        self.init_slot(new_slot, fd, interest, waker);
+        return 0;
+    }
+
+    /// macOS kqueue 注册：把 fd 的 interest 差异提交给内核，并登记 waker。
+    ///
+    /// 参数：`fd` 为文件描述符；`interest` 为关注类型；`waker` 为唤醒器。
+    /// 返回值：成功返回 0；slot 耗尽或 kevent 提交失败时返回对应错误。
+    fn register_with_kqueue(self: &Self, fd: i32, interest: EventKind, waker: &Waker) !i32 {
+        const slot: i32 = self.find_slot(fd);
+        if slot >= 0 {
+            const old_mask: i16 = self.slot_interests[slot];
+            const new_mask: i16 = event_kind_to_poll(interest);
+            if old_mask != new_mask {
+                _ = try kqueue_submit_transition(self, fd, old_mask, interest);
+            }
+            self.slot_wakers[slot] = (waker as &void) as usize;
+            self.slot_interests[slot] = new_mask;
+            return 0;
+        }
+        var new_slot: i32 = self.alloc_slot();
+        if new_slot < 0 {
+            _ = try self.ensure_slot_capacity(self.slot_capacity + 1);
+            new_slot = self.alloc_slot();
+        }
+        if new_slot < 0 {
+            return error.EventLoopSlotsFull;
+        }
+        _ = try kqueue_submit_transition(self, fd, 0 as i16, interest);
+        self.init_slot(new_slot, fd, interest, waker);
+        return 0;
+    }
+
+    /// macOS kqueue 注销：删除 fd 上的过滤器并清理 slot。
+    ///
+    /// 参数：`fd` 为文件描述符。
+    /// 返回值：恒返回 0（未注册的 fd 视为已注销）。
+    fn deregister_with_kqueue(self: &Self, fd: i32) !i32 {
+        const slot: i32 = self.find_slot(fd);
+        if slot >= 0 {
+            const mask: i16 = self.slot_interests[slot];
+            kqueue_deactivate(self, fd, mask);
+            self.clear_slot(slot);
+        }
+        return 0;
+    }
+
+    /// macOS poll(2) fallback 注销：清理 slot 状态。
+    ///
+    /// 参数：`fd` 为文件描述符。
+    /// 返回值：恒返回 0（未注册的 fd 视为已注销）。
+    fn deregister_with_poll(self: &Self, fd: i32) !i32 {
+        const slot: i32 = self.find_slot(fd);
+        if slot >= 0 {
+            self.clear_slot(slot);
+        }
+        return 0;
+    }
+
+    /// macOS poll(2) fallback：扫描 slot 组装 pollfd 并唤醒就绪 fd 的 waker。
+    ///
+    /// 参数：`timeout_ms` 为等待超时毫秒。
+    /// 返回值：成功时返回被唤醒的 waker 数；poll 失败时返回系统错误。
+    fn poll_with_poll(self: &Self, timeout_ms: i32) !i32 {
+        var i: i32 = 0;
+        var poll_count: i32 = 0;
+        while i < self.slot_capacity {
+            if self.slot_states[i] == SLOT_STATE_REGISTERED && self.slot_wakers[i] != 0 as usize {
+                self.poll_fds[poll_count].fd = self.slot_fds[i];
+                self.poll_fds[poll_count].events = self.slot_interests[i];
+                self.poll_fds[poll_count].revents = 0 as i16;
+                poll_count = poll_count + 1;
+            }
+            i = i + 1;
+        }
+        if poll_count <= 0 {
+            return 0;
+        }
+        const ready_count: i32 = try sys_poll(self.poll_fds, poll_count as usize, timeout_ms);
+        if ready_count <= 0 {
+            return ready_count;
+        }
+        var woke_count: i32 = 0;
+        i = 0;
+        while i < poll_count {
+            if self.poll_fds[i].revents != 0 as i16 {
+                const fd: i32 = self.poll_fds[i].fd;
+                const slot_idx: i32 = self.find_slot(fd);
+                if slot_idx >= 0 && self.slot_wakers[slot_idx] != 0 as usize {
+                    const waker: &Waker = (self.slot_wakers[slot_idx] as &void) as &Waker;
+                    waker.wake_from_event_loop();
+                    woke_count = woke_count + 1;
+                }
+            }
+            i = i + 1;
+        }
+        return woke_count;
+    }
+
+    /// macOS kqueue 等待：取就绪事件并唤醒对应 fd 的 waker。
+    ///
+    /// 参数：`timeout_ms` 为等待超时毫秒（负数表示无限阻塞）。
+    /// 返回值：成功时返回被唤醒的 waker 数；kevent 失败时返回系统错误。
+    fn poll_with_kqueue(self: &Self, timeout_ms: i32) !i32 {
+        var ts: TimeSpec = TimeSpec{ tv_sec: 0, tv_nsec: 0 };
+        const timeout_ptr: &const void = kqueue_timeout_ptr(&ts, timeout_ms);
+        const ready: i32 = try sys_kevent(self.kqfd, null as &void, 0, &self.kevents[0] as &void, self.event_capacity, timeout_ptr);
+        if ready <= 0 {
+            return ready;
+        }
+        var woke_count: i32 = 0;
+        var i: i32 = 0;
+        while i >= 0 && i < ready && i < self.event_capacity {
+            const ident: usize = self.kevents[i].ident;
+            const fd: i32 = (ident as! i32) catch { 0 - 1 as i32; };
+            const slot_idx: i32 = self.find_slot(fd);
+            if slot_idx >= 0 && self.slot_wakers[slot_idx] != 0 as usize {
+                const waker: &Waker = (self.slot_wakers[slot_idx] as &void) as &Waker;
+                waker.wake_from_event_loop();
+                woke_count = woke_count + 1;
+            }
+            i = i + 1;
+        }
+        return woke_count;
+    }
+
+    /// 注册 fd 到 epoll
+    /// 
+    /// 行为：
+    /// - 若 fd 已注册：修改关注事件（EPOLL_CTL_MOD）
+    /// - 若 fd 未注册：新增到 epoll（EPOLL_CTL_ADD）
+    /// - 容错：处理 EEXIST（已存在）、ENOENT（不存在）等边界情况
+    fn register(self: &Self, fd: i32, interest: EventKind, waker: &Waker) !i32 {
+        std.cfg(std.target_os == .tos_macos, {
+            if self.kqfd < 0 {
+                return self.register_with_poll(fd, interest, waker);
+            }
+            return self.register_with_kqueue(fd, interest, waker);
+        }, {
+        var ev: EpollEvent = epoll_interest_or_default(fd, interest);
+        var slot: i32 = self.find_slot(fd);
+        if slot >= 0 {
+            const mod_result: !i32 = sys_epoll_ctl(self.epfd, EPOLL_CTL_MOD, fd, &ev);
+            if mod_result.error_id != 0 {
+                const eid: i32 = mod_result.error_id as i32;
+                if eid == ENOENT || eid == EBADF {
+                    self.clear_slot(slot);
+                    slot = 0 - 1;
+                } else {
+                    return mod_result as! i32;
+                }
+            } else {
+                self.slot_wakers[slot] = (waker as &void) as usize;
+                self.slot_interests[slot] = event_kind_to_poll(interest);
+                return 0;
+            }
+        }
+
+        slot = self.alloc_slot();
+        if slot < 0 {
+            _ = try self.ensure_slot_capacity(self.slot_capacity + 1);
+            slot = self.alloc_slot();
+        }
+        if slot < 0 {
+            return error.EventLoopSlotsFull;
+        }
+        const add_result: !i32 = sys_epoll_ctl(self.epfd, EPOLL_CTL_ADD, fd, &ev);
+        if add_result.error_id != 0 {
+            const eid: i32 = add_result.error_id as i32;
+            if eid == EEXIST {
+                const mod_result: !i32 = sys_epoll_ctl(self.epfd, EPOLL_CTL_MOD, fd, &ev);
+                if mod_result.error_id != 0 {
+                    const mod_eid: i32 = mod_result.error_id as i32;
+                    if mod_eid == ENOENT || mod_eid == EBADF {
+                        const add_retry: !i32 = sys_epoll_ctl(self.epfd, EPOLL_CTL_ADD, fd, &ev);
+                        if add_retry.error_id != 0 {
+                            self.recycle_slot(slot);
+                            return add_retry as! i32;
+                        }
+                    } else {
+                        self.recycle_slot(slot);
+                        return mod_result as! i32;
+                    }
+                }
+                self.init_slot(slot, fd, interest, waker);
+                return 0;
+            }
+            self.recycle_slot(slot);
+            return add_result as! i32;
+        }
+        self.init_slot(slot, fd, interest, waker);
+        return 0;
+        })
+    }
+
+    /// 从 epoll 注销 fd
+    ///
+    /// 行为：
+    /// - 使用 EPOLL_CTL_MOD 将事件掩码设为 0（fd 保留在 epoll 中）
+    /// - 清理内部 slot 状态
+    /// - 容错：ENOENT/EBADF 视为已注销，不报错
+    fn deregister(self: &Self, fd: i32) !i32 {
+        std.cfg(std.target_os == .tos_macos, {
+            if self.kqfd < 0 {
+                return self.deregister_with_poll(fd);
+            }
+            return self.deregister_with_kqueue(fd);
+        }, {
+        const del_result: !i32 = sys_epoll_ctl_del(self.epfd, fd);
+        if del_result.error_id != 0 {
+            const eid: i32 = del_result.error_id as i32;
+            if eid != ENOENT && eid != EBADF {
+                return del_result as! i32;
+            }
+        }
+        // 清理 slot
+        const slot: i32 = self.find_slot(fd);
+        if slot >= 0 {
+            self.clear_slot(slot);
+        }
+        return 0;
+        })
+    }
+
+    /// 轮询 epoll / kqueue 事件并唤醒对应的 waker
+    fn poll(self: &Self, timeout_ms: i32) !i32 {
+        std.cfg(std.target_os == .tos_macos, {
+            if self.kqfd < 0 {
+                return self.poll_with_poll(timeout_ms);
+            }
+            return self.poll_with_kqueue(timeout_ms);
+        }, {
+        const wait_result: !i32 = sys_epoll_wait(self.epfd, self.events, self.event_capacity, timeout_ms);
+        const n: i32 = wait_result catch |err| {
+            return wait_result as! i32;
+        };
+        var i: i32 = 0;
+        while i >= 0 && i < n && i < self.event_capacity {
+            const fd: i32 = epoll_event_fd(&self.events[i]);
+            const slot_idx: i32 = self.find_slot(fd);
+            if slot_idx >= 0 && self.slot_wakers[slot_idx] != 0 as usize {
+                const waker: &Waker = (self.slot_wakers[slot_idx] as &void) as &Waker;
+                waker.wake_from_event_loop();
+            }
+            i = i + 1;
+        }
+        return n;
+        })
+    }
+}
+
+fn linux_epoll_capacity_is_valid(capacity: i32) bool {
+    return capacity > 0;
+}
+
+fn linux_epoll_lookup_capacity_for_slots(slot_capacity: i32) i32 {
+    var cap: i32 = 16;
+    const target: i32 = slot_capacity * 2;
+    while cap < target {
+        cap = cap * 2;
+    }
+    return cap;
+}
+
+/// 计算 kqueue 事件缓冲容量：取原 `event_capacity` 与 slot 数的较大者。
+///
+/// 参数：`event_capacity` 为实例配置的单次 poll event 容量；`slot_capacity` 为 slot 数。
+/// 返回值：扩容后 `kevents` 缓冲应具备的条目数（保证能一次取完所有就绪 fd）。
+fn linux_epoll_kevent_capacity(event_capacity: i32, slot_capacity: i32) i32 {
+    if event_capacity > slot_capacity {
+        return event_capacity;
+    }
+    return slot_capacity;
+}
+
+fn linux_epoll_fd_hash(fd: i32, capacity: i32) i32 {
+    var h: i32 = fd;
+    if h < 0 {
+        h = 0 - h;
+    }
+    return h % capacity;
+}
+
+fn linux_epoll_init_free_slots(next_free: &i32, slot_capacity: i32) void {
+    var i: i32 = 0;
+    while i < slot_capacity {
+        if i + 1 < slot_capacity {
+            next_free[i] = i + 1;
+        } else {
+            next_free[i] = 0 - 1;
+        }
+        i = i + 1;
+    }
+}
+
+fn linux_epoll_init_fd_map(fd_keys: &i32, fd_slot_indices: &i32, fd_map_capacity: i32) void {
+    var i: i32 = 0;
+    while i < fd_map_capacity {
+        fd_keys[i] = LINUX_EPOLL_FD_EMPTY;
+        fd_slot_indices[i] = 0 - 1;
+        i = i + 1;
+    }
+}
+
+fn linux_epoll_fd_map_put_raw(fd_keys: &i32, fd_slot_indices: &i32, fd_map_capacity: i32, fd: i32, slot_idx: i32) void {
+    if fd_map_capacity <= 0 {
+        return;
+    }
+    var idx: i32 = linux_epoll_fd_hash(fd, fd_map_capacity);
+    var probes: i32 = 0;
+    var first_tombstone: i32 = 0 - 1;
+    while probes < fd_map_capacity {
+        const key: i32 = fd_keys[idx];
+        if key == fd {
+            fd_slot_indices[idx] = slot_idx;
+            return;
+        }
+        if key == LINUX_EPOLL_FD_TOMBSTONE && first_tombstone < 0 {
+            first_tombstone = idx;
+        }
+        if key == LINUX_EPOLL_FD_EMPTY {
+            var target: i32 = idx;
+            if first_tombstone >= 0 {
+                target = first_tombstone;
+            }
+            fd_keys[target] = fd;
+            fd_slot_indices[target] = slot_idx;
+            return;
+        }
+        idx = idx + 1;
+        if idx >= fd_map_capacity {
+            idx = 0;
+        }
+        probes = probes + 1;
+    }
+    if first_tombstone >= 0 {
+        fd_keys[first_tombstone] = fd;
+        fd_slot_indices[first_tombstone] = slot_idx;
+    }
+}
+
+fn linux_epoll_fd_map_put(ep: &LinuxEpoll, fd: i32, slot_idx: i32) void {
+    linux_epoll_fd_map_put_raw(ep.fd_keys, ep.fd_slot_indices, ep.fd_map_capacity, fd, slot_idx);
+}
+
+fn linux_epoll_fd_map_remove(ep: &LinuxEpoll, fd: i32) void {
+    if ep.fd_map_capacity <= 0 {
+        return;
+    }
+    var idx: i32 = linux_epoll_fd_hash(fd, ep.fd_map_capacity);
+    var probes: i32 = 0;
+    while probes < ep.fd_map_capacity {
+        const key: i32 = ep.fd_keys[idx];
+        if key == LINUX_EPOLL_FD_EMPTY {
+            return;
+        }
+        if key == fd {
+            ep.fd_keys[idx] = LINUX_EPOLL_FD_TOMBSTONE;
+            ep.fd_slot_indices[idx] = 0 - 1;
+            return;
+        }
+        idx = idx + 1;
+        if idx >= ep.fd_map_capacity {
+            idx = 0;
+        }
+        probes = probes + 1;
+    }
+}
+
+fn linux_epoll_alloc_i32(count: i32) !&i32 {
+    const bytes: usize = @size_of(i32) * (count as usize);
+    const ptr: &void = calloc(1 as usize, bytes);
+    if ptr == null {
+        return error.EventLoopAllocFailed;
+    }
+    return ptr as &i32;
+}
+
+fn linux_epoll_alloc_i16(count: i32) !&i16 {
+    const bytes: usize = @size_of(i16) * (count as usize);
+    const ptr: &void = calloc(1 as usize, bytes);
+    if ptr == null {
+        return error.EventLoopAllocFailed;
+    }
+    return ptr as &i16;
+}
+
+fn linux_epoll_alloc_u32(count: i32) !&u32 {
+    const bytes: usize = @size_of(u32) * (count as usize);
+    const ptr: &void = calloc(1 as usize, bytes);
+    if ptr == null {
+        return error.EventLoopAllocFailed;
+    }
+    return ptr as &u32;
+}
+
+fn linux_epoll_alloc_usize(count: i32) !&usize {
+    const bytes: usize = @size_of(usize) * (count as usize);
+    const ptr: &void = calloc(1 as usize, bytes);
+    if ptr == null {
+        return error.EventLoopAllocFailed;
+    }
+    return ptr as &usize;
+}
+
+fn linux_epoll_alloc_events(count: i32) !&EpollEvent {
+    const bytes: usize = @size_of(EpollEvent) * (count as usize);
+    const ptr: &void = calloc(1 as usize, bytes);
+    if ptr == null {
+        return error.EventLoopAllocFailed;
+    }
+    return ptr as &EpollEvent;
+}
+
+fn linux_epoll_alloc_pollfds(count: i32) !&PollFd {
+    const bytes: usize = @size_of(PollFd) * (count as usize);
+    const ptr: &void = calloc(1 as usize, bytes);
+    if ptr == null {
+        return error.EventLoopAllocFailed;
+    }
+    return ptr as &PollFd;
+}
+
+fn linux_epoll_alloc_kevents(count: i32) !&Kevent {
+    const bytes: usize = @size_of(Kevent) * (count as usize);
+    const ptr: &void = calloc(1 as usize, bytes);
+    if ptr == null {
+        return error.EventLoopAllocFailed;
+    }
+    return ptr as &Kevent;
+}
+
+/// 创建 Linux epoll 实例（flags 传 0 或 EPOLL_CLOEXEC，默认容量 1024）
+export fn linux_epoll_create(flags: i32) !LinuxEpoll {
+    return linux_epoll_create_config(flags, LINUX_EPOLL_DEFAULT_CAPACITY, LINUX_EPOLL_DEFAULT_CAPACITY);
+}
+
+/// 创建 Linux epoll 实例，并配置可使用的 slot 容量和单次 poll event 容量。
+///
+/// 参数：
+/// - `flags`：传给 `epoll_create1` 的 flags，通常为 0 或 EPOLL_CLOEXEC。
+/// - `slot_capacity`：可注册 fd slot 数，必须大于 0。
+/// - `event_capacity`：单次 `poll` 可接收事件数，必须大于 0。
+/// 返回值：成功时返回配置后的 `LinuxEpoll`，容量非法或系统调用失败时返回错误。
+export fn linux_epoll_create_config(flags: i32, slot_capacity: i32, event_capacity: i32) !LinuxEpoll {
+    if !linux_epoll_capacity_is_valid(slot_capacity) || !linux_epoll_capacity_is_valid(event_capacity) {
+        return error.EventLoopInvalidCapacity;
+    }
+    const fd_map_capacity: i32 = linux_epoll_lookup_capacity_for_slots(slot_capacity);
+    const slot_states: &i32 = try linux_epoll_alloc_i32(slot_capacity);
+    const slot_fds: &i32 = try linux_epoll_alloc_i32(slot_capacity);
+    const slot_wakers: &usize = try linux_epoll_alloc_usize(slot_capacity);
+    const slot_interests: &i16 = try linux_epoll_alloc_i16(slot_capacity);
+    const slot_generations: &u32 = try linux_epoll_alloc_u32(slot_capacity);
+    const slot_next_free: &i32 = try linux_epoll_alloc_i32(slot_capacity);
+    const fd_keys: &i32 = try linux_epoll_alloc_i32(fd_map_capacity);
+    const fd_slot_indices: &i32 = try linux_epoll_alloc_i32(fd_map_capacity);
+    const events: &EpollEvent = try linux_epoll_alloc_events(event_capacity);
+    const poll_fds: &PollFd = try linux_epoll_alloc_pollfds(slot_capacity);
+    const kevents: &Kevent = try linux_epoll_alloc_kevents(event_capacity);
+    linux_epoll_init_free_slots(slot_next_free, slot_capacity);
+    linux_epoll_init_fd_map(fd_keys, fd_slot_indices, fd_map_capacity);
+    std.cfg(std.target_os == .tos_macos, {
+        _ = flags;
+        // kqueue 失败（返回 <0）时保留 kqfd = -1，register/deregister/poll 自动退回 poll(2) 实现。
+        const kqfd: i32 = sys_kqueue() catch { 0 - 1 as i32; };
+        return LinuxEpoll{
+            epfd: -1,
+            kqfd: kqfd,
+            slot_capacity: slot_capacity,
+            event_capacity: event_capacity,
+            slot_states: slot_states,
+            slot_fds: slot_fds,
+            slot_wakers: slot_wakers,
+            slot_interests: slot_interests,
+            slot_generations: slot_generations,
+            slot_next_free: slot_next_free,
+            fd_keys: fd_keys,
+            fd_slot_indices: fd_slot_indices,
+            fd_map_capacity: fd_map_capacity,
+            free_slot_head: 0,
+            events: events,
+            kevents: kevents,
+            poll_fds: poll_fds,
+            next_generation: 1,
+            registered_count: 0,
+            peak_registered_count: 0,
+            resize_count: 0,
+        };
+    }, {
+    const fd: i32 = try sys_epoll_create1(flags);
+    return LinuxEpoll{
+        epfd: fd,
+        kqfd: 0 - 1 as i32,
+        slot_capacity: slot_capacity,
+        event_capacity: event_capacity,
+        slot_states: slot_states,
+        slot_fds: slot_fds,
+        slot_wakers: slot_wakers,
+        slot_interests: slot_interests,
+        slot_generations: slot_generations,
+        slot_next_free: slot_next_free,
+        fd_keys: fd_keys,
+        fd_slot_indices: fd_slot_indices,
+        fd_map_capacity: fd_map_capacity,
+        free_slot_head: 0,
+        events: events,
+        poll_fds: poll_fds,
+        next_generation: 1,
+        registered_count: 0,
+        peak_registered_count: 0,
+        resize_count: 0,
+    };
+    })
+}
+
+// ============================================================================
+// 测试与调试辅助函数
+// ============================================================================
+
+/// 获取当前已注册的 fd 数量（用于调试/测试）
+export fn linux_epoll_registered_count(ep: &LinuxEpoll) i32 {
+    return ep.registered_count;
+}
+
+/// 检查指定 fd 是否已注册（用于调试/测试）
+export fn linux_epoll_is_registered(ep: &LinuxEpoll, fd: i32) bool {
+    const slot: i32 = ep.find_slot(fd);
+    return slot >= 0;
+}
+
+/// 获取 LinuxEpoll 当前实例可使用的 slot 容量。
+///
+/// 参数：`ep` 为 LinuxEpoll 实例指针。
+/// 返回值：当前实例可注册 fd slot 数。
+export fn linux_epoll_slot_capacity(ep: &LinuxEpoll) i32 {
+    return ep.slot_capacity;
+}
+
+/// 获取 LinuxEpoll 当前实例单次 poll 可接收的 event 容量。
+///
+/// 参数：`ep` 为 LinuxEpoll 实例指针。
+/// 返回值：当前实例单次 poll 的最大事件数。
+export fn linux_epoll_event_capacity(ep: &LinuxEpoll) i32 {
+    return ep.event_capacity;
+}
+
+/// 获取 LinuxEpoll 当前实例 fd lookup 哈希表容量。
+///
+/// 参数：`ep` 为 LinuxEpoll 实例指针。
+/// 返回值：当前实例 fd 到 slot 索引表容量，用于验证查找路径不依赖 slot 线性扫描。
+export fn linux_epoll_lookup_capacity(ep: &LinuxEpoll) i32 {
+    return ep.fd_map_capacity;
+}
+
+/// 获取 LinuxEpoll 历史峰值注册 fd 数。
+///
+/// 参数：`ep` 为 LinuxEpoll 实例指针。
+/// 返回值：自实例创建以来同时处于已注册状态的最大 fd 数。
+export fn linux_epoll_peak_registered_count(ep: &LinuxEpoll) i32 {
+    return ep.peak_registered_count;
+}
+
+/// 获取 LinuxEpoll 运行期触发的 slot 存储扩容次数。
+///
+/// 参数：`ep` 为 LinuxEpoll 实例指针。
+/// 返回值：满载后自动扩容成功的次数。
+export fn linux_epoll_resize_count(ep: &LinuxEpoll) i32 {
+    return ep.resize_count;
+}
+
+/// 关闭事件循环持有的内核对象（epoll / kqueue 描述符）。
+///
+/// 参数：`ep` 为 LinuxEpoll 实例指针。
+/// 返回值：无；描述符 <= 0 表示未创建，直接跳过；关闭失败不报错。
+export fn linux_epoll_close(ep: &LinuxEpoll) void {
+    if ep.epfd >= 0 {
+        _ = sys_close(ep.epfd) catch {};
+    }
+    if ep.kqfd >= 0 {
+        _ = sys_close(ep.kqfd) catch {};
+    }
+}
+
+/// 测试/调试入口：把「fd 的关注从 `old_mask` 迁移到 `interest`」翻译成 kevent 变更集。
+///
+/// macOS 的 kqueue 路径无法在 Linux 上运行，但这条**翻译规则**是纯函数、与平台无关
+/// （只依赖 poll 掩码约定与 EVFILT_* 常量）。导出它，让 Linux 回归能覆盖
+/// 「新增 / 注销 / RD→WR / RD→RDWR」等转移，避免这块只在 macOS 才跑到的逻辑无人验证。
+/// 参数：`out` 输出变更数组（容量至少 4 项）；`fd` 文件描述符；`old_mask` 旧 poll 掩码
+/// （0 表示尚未注册）；`interest` 新关注类型。
+/// 返回值：写入 `out` 的变更条目数。
+export fn async_event_kqueue_transition_for_test(out: &Kevent, fd: i32, old_mask: i16, interest: EventKind) i32 {
+    return kqueue_build_transition(out, fd, old_mask, interest);
+}
+
+/// 测试/调试入口：读取第 `index` 个变更项的 ident/filter/flags。
+/// 参数：`changes` 变更数组；`index` 下标；`ident_out`/`filter_out`/`flags_out` 输出槽。
+/// 返回值：下标合法返回 true（并填满输出），否则返回 false。
+export fn async_event_kqueue_change_at_for_test(changes: &const Kevent, index: i32, ident_out: &usize, filter_out: &i16, flags_out: &u16) bool {
+    if index < 0 || index >= 4 {
+        return false;
+    }
+    ident_out[0] = changes[index].ident;
+    filter_out[0] = changes[index].filter;
+    flags_out[0] = changes[index].flags;
+    return true;
+}

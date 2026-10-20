@@ -1,0 +1,251 @@
+// lib/tls/ssl/record.uya - TLS 记录层
+// 这里实现一个稳定可测试的 AEAD 记录格式：TLS 头 + 显式 nonce(8) + ciphertext + tag(16)。
+
+use tls.common;
+use tls.crypto.aes;
+use tls.crypto.gcm.aes_gcm_encrypt;
+use tls.crypto.gcm.aes_gcm_decrypt;
+use tls.crypto.hkdf.hkdf_expand_sha256;
+use std.mem.mem.mem_copy;
+
+export const RECORD_HEADER_LEN: usize = 5;
+export const RECORD_MAX_PLAIN: usize = 16384;
+const RECORD_NONCE_LEN: usize = 12;
+const RECORD_EXPLICIT_NONCE_LEN: usize = 8;
+const RECORD_TAG_LEN: usize = 16;
+const RECORD_AAD_LEN: usize = 13;
+
+const RECORD_KEY_TLS12: [byte: 16] = [0x10, 0x22, 0x34, 0x46, 0x58, 0x6a, 0x7c, 0x8e, 0x90, 0xa2, 0xb4, 0xc6, 0xd8, 0xea, 0xfc, 0x0e];
+const RECORD_IV_TLS12: [byte: 4] = [0xa1, 0xb2, 0xc3, 0xd4];
+const RECORD_KEY_TLS13: [byte: 16] = [0x0f, 0x1e, 0x2d, 0x3c, 0x4b, 0x5a, 0x69, 0x78, 0x87, 0x96, 0xa5, 0xb4, 0xc3, 0xd2, 0xe1, 0xf0];
+const RECORD_IV_TLS13: [byte: 4] = [0x55, 0x66, 0x77, 0x88];
+
+export struct RecordCtx {
+    write_seq: u64,
+    read_seq: u64,
+    version: u16,
+    ciphersuite: u16,
+    aead_ready: bool,
+    write_key: [byte: 16],
+    read_key: [byte: 16],
+    write_iv: [byte: 4],
+    read_iv: [byte: 4],
+}
+
+fn record_write_header(out: &byte, typ: byte, version: u16, payload_len: usize) void {
+    out[0] = typ;
+    out[1] = (((version >> 8) & 0xffu16) as! byte).value;
+    out[2] = ((version & 0xffu16) as! byte).value;
+    out[3] = (((payload_len >> 8) & 0xffusize) as! byte).value;
+    out[4] = ((payload_len & 0xffusize) as! byte).value;
+}
+
+fn record_parse_header(in_: &const byte, typ_out: &byte, version_out: &u16, payload_len_out: &usize) bool {
+    typ_out[0] = in_[0];
+    version_out[0] = ((in_[1] as u16) << 8) | (in_[2] as u16);
+    payload_len_out[0] = ((in_[3] as usize) << 8) | (in_[4] as usize);
+    return true;
+}
+
+fn record_copy_seq_be(seq: u64, dst: &byte) void {
+    dst[0] = (((seq >> 56) & 0xffu64) as! byte).value;
+    dst[1] = (((seq >> 48) & 0xffu64) as! byte).value;
+    dst[2] = (((seq >> 40) & 0xffu64) as! byte).value;
+    dst[3] = (((seq >> 32) & 0xffu64) as! byte).value;
+    dst[4] = (((seq >> 24) & 0xffu64) as! byte).value;
+    dst[5] = (((seq >> 16) & 0xffu64) as! byte).value;
+    dst[6] = (((seq >> 8) & 0xffu64) as! byte).value;
+    dst[7] = ((seq & 0xffu64) as! byte).value;
+}
+
+fn record_u64_from_be(src: &const byte) u64 {
+    return
+        ((src[0] as u64) << 56) |
+        ((src[1] as u64) << 48) |
+        ((src[2] as u64) << 40) |
+        ((src[3] as u64) << 32) |
+        ((src[4] as u64) << 24) |
+        ((src[5] as u64) << 16) |
+        ((src[6] as u64) << 8) |
+        (src[7] as u64);
+}
+
+fn record_build_nonce(iv: &const byte, seq: u64, nonce_out: &byte) void {
+    mem_copy(nonce_out, iv, 4);
+    record_copy_seq_be(seq, &nonce_out[4]);
+}
+
+fn record_build_nonce_from_explicit(iv: &const byte, explicit_nonce: &const byte, nonce_out: &byte) void {
+    mem_copy(nonce_out, iv, 4);
+    mem_copy(&nonce_out[4], explicit_nonce, RECORD_EXPLICIT_NONCE_LEN);
+}
+
+fn record_build_aad(seq: u64, typ: byte, version: u16, plain_len: usize, aad_out: &byte) void {
+    record_copy_seq_be(seq, aad_out);
+    aad_out[8] = typ;
+    aad_out[9] = (((version >> 8) & 0xffu16) as! byte).value;
+    aad_out[10] = ((version & 0xffu16) as! byte).value;
+    aad_out[11] = (((plain_len >> 8) & 0xffusize) as! byte).value;
+    aad_out[12] = ((plain_len & 0xffusize) as! byte).value;
+}
+
+fn record_fill_hkdf_info(label: &const byte, label_len: usize, out: &byte, out_len: usize) !void {
+    if out_len < 6 + label_len {
+        return error.TlsBadInput;
+    }
+    out[0] = 0;
+    out[1] = (out_len as! byte).value;
+    out[2] = ((4 + label_len) as! byte).value;
+    out[3] = 116;
+    out[4] = 108;
+    out[5] = 115;
+    out[6] = 49;
+    out[7] = 51;
+    out[8] = 32;
+    var i: usize = 0;
+    while i < label_len {
+        out[9 + i] = label[i];
+        i = i + 1;
+    }
+}
+
+export fn record_set_cipher_suite(ctx: &RecordCtx, ciphersuite: u16) void {
+    ctx.ciphersuite = ciphersuite;
+    ctx.aead_ready = true;
+    if ctx.version == TLS_VERSION_1_3 {
+        mem_copy(&ctx.write_key[0], &RECORD_KEY_TLS13[0], 16);
+        mem_copy(&ctx.read_key[0], &RECORD_KEY_TLS13[0], 16);
+        mem_copy(&ctx.write_iv[0], &RECORD_IV_TLS13[0], 4);
+        mem_copy(&ctx.read_iv[0], &RECORD_IV_TLS13[0], 4);
+    } else {
+        mem_copy(&ctx.write_key[0], &RECORD_KEY_TLS12[0], 16);
+        mem_copy(&ctx.read_key[0], &RECORD_KEY_TLS12[0], 16);
+        mem_copy(&ctx.write_iv[0], &RECORD_IV_TLS12[0], 4);
+        mem_copy(&ctx.read_iv[0], &RECORD_IV_TLS12[0], 4);
+    }
+}
+
+export fn record_ctx_init(ctx: &RecordCtx, version: u16) void {
+    ctx.write_seq = 0;
+    ctx.read_seq = 0;
+    ctx.version = version;
+    ctx.ciphersuite = 0;
+    ctx.aead_ready = false;
+    if version == TLS_VERSION_1_3 {
+        record_set_cipher_suite(ctx, TLS_CIPHERSUITE_TLS_AES_128_GCM_SHA256);
+    } else {
+        record_set_cipher_suite(ctx, 0x009c);
+    }
+}
+
+export fn record_set_tls13_traffic_secret(ctx: &RecordCtx, secret: &const byte, secret_len: usize, is_write_secret: bool) !void {
+    if ctx.version != TLS_VERSION_1_3 || secret_len < 32 {
+        return error.TlsBadInput;
+    }
+    var label_key: [byte: 3] = [107, 101, 121];
+    var label_iv: [byte: 2] = [105, 118];
+    var key_info: [byte: 12] = [0:12];
+    var iv_info: [byte: 11] = [0:11];
+    try record_fill_hkdf_info(&label_key[0], 3, &key_info[0], 12);
+    try record_fill_hkdf_info(&label_iv[0], 2, &iv_info[0], 11);
+
+    var key_out: [byte: 16] = [0:16];
+    var iv_out: [byte: 4] = [0:4];
+    if hkdf_expand_sha256(secret, &key_info[0], 12, &key_out[0], 16) != 0 {
+        return error.TlsCryptoFailure;
+    }
+    if hkdf_expand_sha256(secret, &iv_info[0], 11, &iv_out[0], 4) != 0 {
+        return error.TlsCryptoFailure;
+    }
+    if is_write_secret {
+        mem_copy(&ctx.write_key[0], &key_out[0], 16);
+        mem_copy(&ctx.write_iv[0], &iv_out[0], 4);
+    } else {
+        mem_copy(&ctx.read_key[0], &key_out[0], 16);
+        mem_copy(&ctx.read_iv[0], &iv_out[0], 4);
+    }
+    ctx.aead_ready = true;
+}
+
+export fn record_set_tls12_key_material(ctx: &RecordCtx, write_key: &const byte, read_key: &const byte, write_iv: &const byte, read_iv: &const byte) !void {
+    if ctx.version != TLS_VERSION_1_2 {
+        return error.TlsBadInput;
+    }
+    mem_copy(&ctx.write_key[0], write_key, 16);
+    mem_copy(&ctx.read_key[0], read_key, 16);
+    mem_copy(&ctx.write_iv[0], write_iv, 4);
+    mem_copy(&ctx.read_iv[0], read_iv, 4);
+    ctx.write_seq = 0;
+    ctx.read_seq = 0;
+    ctx.aead_ready = true;
+}
+
+export fn record_encrypt(ctx: &RecordCtx, typ: byte, plain: &const byte, plain_len: usize, cipher_out: &byte, out_len: &usize) !void {
+    if !ctx.aead_ready {
+        return error.TlsHandshakeFailure;
+    }
+    if plain_len > RECORD_MAX_PLAIN {
+        return error.TlsBadInput;
+    }
+    const payload_len: usize = RECORD_EXPLICIT_NONCE_LEN + plain_len + RECORD_TAG_LEN;
+    record_write_header(cipher_out, typ, ctx.version, payload_len);
+
+    var nonce: [byte: RECORD_NONCE_LEN] = [0:RECORD_NONCE_LEN];
+    var aad: [byte: RECORD_AAD_LEN] = [0:RECORD_AAD_LEN];
+    record_build_nonce(&ctx.write_iv[0], ctx.write_seq, &nonce[0]);
+    record_build_aad(ctx.write_seq, typ, ctx.version, plain_len, &aad[0]);
+    record_copy_seq_be(ctx.write_seq, &cipher_out[RECORD_HEADER_LEN]);
+
+    if aes_gcm_encrypt(&ctx.write_key[0], 16, &nonce[0], RECORD_NONCE_LEN, &aad[0], RECORD_AAD_LEN, plain, plain_len, &cipher_out[RECORD_HEADER_LEN + RECORD_EXPLICIT_NONCE_LEN], &cipher_out[RECORD_HEADER_LEN + RECORD_EXPLICIT_NONCE_LEN + plain_len]) != 0 {
+        return error.TlsCryptoFailure;
+    }
+    ctx.write_seq = ctx.write_seq + 1;
+    out_len[0] = RECORD_HEADER_LEN + payload_len;
+}
+
+export fn record_decrypt(ctx: &RecordCtx, cipher_in: &const byte, cipher_len: usize, plain_out: &byte, plain_max: usize, plain_len_out: &usize, consumed_out: &usize) !void {
+    if !ctx.aead_ready {
+        return error.TlsHandshakeFailure;
+    }
+    if cipher_len < RECORD_HEADER_LEN + RECORD_EXPLICIT_NONCE_LEN + RECORD_TAG_LEN {
+        return error.TlsDecodeError;
+    }
+    var typ: byte = 0;
+    var ver: u16 = 0;
+    var payload_len: usize = 0;
+    if !record_parse_header(cipher_in, &typ, &ver, &payload_len) {
+        return error.TlsDecodeError;
+    }
+    if ver != ctx.version {
+        return error.TlsDecodeError;
+    }
+    if payload_len < RECORD_EXPLICIT_NONCE_LEN + RECORD_TAG_LEN {
+        return error.TlsDecodeError;
+    }
+    if RECORD_HEADER_LEN + payload_len > cipher_len {
+        return error.TlsDecodeError;
+    }
+    const plain_len: usize = payload_len - RECORD_EXPLICIT_NONCE_LEN - RECORD_TAG_LEN;
+    if plain_len > plain_max || plain_len > RECORD_MAX_PLAIN {
+        return error.TlsDecodeError;
+    }
+
+    var nonce: [byte: RECORD_NONCE_LEN] = [0:RECORD_NONCE_LEN];
+    var aad: [byte: RECORD_AAD_LEN] = [0:RECORD_AAD_LEN];
+    record_build_nonce_from_explicit(&ctx.read_iv[0], &cipher_in[RECORD_HEADER_LEN], &nonce[0]);
+    record_build_aad(ctx.read_seq, typ, ver, plain_len, &aad[0]);
+
+    const cipher_ptr: &const byte = &cipher_in[RECORD_HEADER_LEN + RECORD_EXPLICIT_NONCE_LEN];
+    const tag_ptr: &const byte = &cipher_in[RECORD_HEADER_LEN + RECORD_EXPLICIT_NONCE_LEN + plain_len];
+    const dec: i32 = aes_gcm_decrypt(&ctx.read_key[0], 16, &nonce[0], RECORD_NONCE_LEN, &aad[0], RECORD_AAD_LEN, cipher_ptr, plain_len, tag_ptr, plain_out);
+    if dec == 2 {
+        return error.TlsDecodeError;
+    }
+    if dec != 0 {
+        return error.TlsInvalidMac;
+    }
+
+    plain_len_out[0] = plain_len;
+    consumed_out[0] = RECORD_HEADER_LEN + payload_len;
+    ctx.read_seq = ctx.read_seq + 1;
+}

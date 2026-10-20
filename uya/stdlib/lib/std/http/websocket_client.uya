@@ -1,0 +1,245 @@
+// lib/std/http/websocket_client.uya - WebSocket client / reconnect 包装
+//
+// 模块路径：use std.http.websocket_client
+
+use std.async;
+use std.http.websocket_types;
+use std.http.websocket_async;
+
+fn websocket_client_ready_result_usize(result: !usize) Future<!usize> {
+    if result.error_id != 0u32 {
+        return Future<!usize>{ state: Poll<!usize>.Ready(result) };
+    }
+    return future_ready_ok<usize>(result.value);
+}
+
+fn websocket_client_conn_is_closed(conn: &WebSocketConn) bool {
+    if conn == null || conn.closed {
+        return true;
+    }
+    if conn.use_tls {
+        return conn.tls_io.is_closed();
+    }
+    return conn.io.is_closed();
+}
+
+fn websocket_client_take_conn(conn: &WebSocketConn) WebSocketConn {
+    const out: WebSocketConn = conn[0];
+    conn[0] = websocket_conn_empty();
+    return out;
+}
+
+fn websocket_client_session(self: &WebSocketClient) &WebSocketConn {
+    if self == null || self.session_ptr == 0 as usize {
+        return null as &WebSocketConn;
+    }
+    return @ptr_from_usize(self.session_ptr) as &WebSocketConn;
+}
+
+fn websocket_client_note_connect_failure(self: &WebSocketClient, now_ms: u64) !void {
+    self.reconnect_failures = self.reconnect_failures + 1;
+    if self.reconnect.max_retries > 0 && self.reconnect_failures >= self.reconnect.max_retries {
+        self.reconnect_pending = false;
+        self.next_retry_at_ms = 0u64;
+        return error.WebSocketReconnectExhausted;
+    }
+    self.last_delay_ms = websocket_reconnect_next_delay_ms(&self.reconnect, self.last_delay_ms);
+    self.next_retry_at_ms = now_ms + (self.last_delay_ms as u64);
+}
+
+fn websocket_client_attach_connected(self: &WebSocketClient, conn: &WebSocketConn) !void {
+    _ = websocket_client_attach(self, conn) catch |err| {
+        _ = err;
+        conn.close();
+        return error.WebSocketProtocolError;
+    };
+}
+
+fn websocket_client_connector_connect(connector: WebSocketClientConnector, options: &WebSocketAcceptOptions) Future<!WebSocketConn> {
+    return connector.connect(options);
+}
+
+/// Client 侧连接工厂。
+/// 参数说明：实现方负责持有 endpoint、header、auth 等 client 专属握手上下文，并在每次 `connect(...)` 时复用。
+/// 返回值说明：返回已完成 dial + handshake 的 client role `WebSocketConn`。
+export interface WebSocketClientConnector {
+    @async_fn
+    fn connect(self: &Self, options: &WebSocketAcceptOptions) Future<!WebSocketConn>;
+}
+
+/// WebSocket 客户端包装结构体。
+/// 参数说明：只服务 client role；自动重连通过外部调度 `reconnect_tick(...)` 驱动。
+/// 返回值说明：无。
+export struct WebSocketClient {
+    role: WebSocketRole = WebSocketRole.Client,
+    options: WebSocketAcceptOptions = WebSocketAcceptOptions{},
+    reconnect: ReconnectPolicy = ReconnectPolicy{},
+    session_ptr: usize = 0,
+    connected: bool = false,
+    reconnect_pending: bool = false,
+    reconnect_failures: i32 = 0,
+    next_retry_at_ms: u64 = 0u64,
+    last_delay_ms: u32 = 0u32,
+}
+
+/// 创建默认的 WebSocketClient。
+/// 参数说明：`session` 为 caller-owned 会话存储槽位。
+/// 返回值说明：返回 role 固定为 `Client`、未连接、默认关闭自动重连的包装对象。
+export fn websocket_client_default(session: &WebSocketConn) WebSocketClient {
+    const opts: WebSocketAcceptOptions = websocket_accept_options_default();
+    const reconnect: ReconnectPolicy = websocket_reconnect_policy_default();
+    var out: WebSocketClient = WebSocketClient{};
+    websocket_client_init(&out, &opts, &reconnect, session);
+    return out;
+}
+
+/// 创建带配置的 WebSocketClient。
+/// 参数说明：`options` 为会话级配置；`reconnect` 为重连策略；`session` 为 caller-owned 会话存储槽位。
+/// 返回值说明：返回未连接的 client 包装对象。
+export fn websocket_client_new(options: &WebSocketAcceptOptions, reconnect: &ReconnectPolicy, session: &WebSocketConn) WebSocketClient {
+    var out: WebSocketClient = WebSocketClient{};
+    websocket_client_init(&out, options, reconnect, session);
+    return out;
+}
+
+/// 初始化带配置的 WebSocketClient。
+/// 参数说明：`self` 为待初始化对象；`options` 为会话级配置；`reconnect` 为重连策略；`session` 为 caller-owned 会话存储槽位。
+/// 返回值说明：无。
+export fn websocket_client_init(self: &WebSocketClient, options: &WebSocketAcceptOptions, reconnect: &ReconnectPolicy, session: &WebSocketConn) void {
+    if self == null {
+        return;
+    }
+    self.role = WebSocketRole.Client;
+    self.options = options[0];
+    self.reconnect = reconnect[0];
+    self.session_ptr = @usize_from_ptr(session as &void);
+    self.connected = false;
+    self.reconnect_pending = false;
+    self.reconnect_failures = 0;
+    self.next_retry_at_ms = 0u64;
+    self.last_delay_ms = 0u32;
+    if session != null {
+        session[0] = websocket_conn_empty();
+    }
+}
+
+/// 初始化默认 WebSocketClient。
+/// 参数说明：`self` 为待初始化对象；`session` 为 caller-owned 会话存储槽位。
+/// 返回值说明：无。
+export fn websocket_client_init_default(self: &WebSocketClient, session: &WebSocketConn) void {
+    const opts: WebSocketAcceptOptions = websocket_accept_options_default();
+    const reconnect: ReconnectPolicy = websocket_reconnect_policy_default();
+    websocket_client_init(self, &opts, &reconnect, session);
+}
+
+/// 计算下一次重连延迟。
+/// 参数说明：`prev_delay_ms == 0` 表示首次重连；`backoff_multiplier_x1000 == 1000` 表示固定间隔。
+/// 返回值说明：返回本次应使用的延迟，结果会被 `max_delay_ms` 截断。
+export fn websocket_reconnect_next_delay_ms(policy: &ReconnectPolicy, prev_delay_ms: u32) u32 {
+    var next: u64 = policy.initial_delay_ms as u64;
+    if prev_delay_ms != 0u32 {
+        next = prev_delay_ms as u64;
+        if policy.backoff_multiplier_x1000 > 1000u32 {
+            next = (next * (policy.backoff_multiplier_x1000 as u64)) / 1000u64;
+        }
+    }
+    if policy.max_delay_ms != 0u32 && next > (policy.max_delay_ms as u64) {
+        next = policy.max_delay_ms as u64;
+    }
+    return next as u32;
+}
+
+/// 挂接一个已完成握手的 client 侧会话。
+/// 参数说明：`conn` 必须是 `Client` role 连接；成功后会接管 `conn` 的所有权并清空重连状态。
+/// 返回值说明：成功返回 void；若传入 server role 会话则返回 `error.WebSocketProtocolError`。
+export fn websocket_client_attach(self: &WebSocketClient, conn: &WebSocketConn) !void {
+    if self.role != WebSocketRole.Client || conn.role != WebSocketRole.Client {
+        return error.WebSocketProtocolError;
+    }
+    const session: &WebSocketConn = websocket_client_session(self);
+    if session == null {
+        return error.WebSocketProtocolError;
+    }
+    if self.connected && !websocket_client_conn_is_closed(session) {
+        session.close();
+    }
+    session[0] = websocket_client_take_conn(conn);
+    self.connected = true;
+    self.reconnect_pending = false;
+    self.reconnect_failures = 0;
+    self.next_retry_at_ms = 0u64;
+    self.last_delay_ms = 0u32;
+}
+
+/// 将 client 切换到等待重连状态。
+/// 参数说明：`now_ms` 为当前调度时间；若策略启用则按 `initial_delay_ms` 预约下一次重连。
+/// 返回值说明：无。
+export fn websocket_client_schedule_reconnect(self: &WebSocketClient, now_ms: u64) void {
+    const session: &WebSocketConn = websocket_client_session(self);
+    if session != null && self.connected && !websocket_client_conn_is_closed(session) {
+        session.close();
+    }
+    self.connected = false;
+    if !self.reconnect.enabled {
+        self.reconnect_pending = false;
+        self.reconnect_failures = 0;
+        self.next_retry_at_ms = 0u64;
+        self.last_delay_ms = 0u32;
+        return;
+    }
+    self.reconnect_pending = true;
+    self.reconnect_failures = 0;
+    self.last_delay_ms = websocket_reconnect_next_delay_ms(&self.reconnect, 0u32);
+    self.next_retry_at_ms = now_ms + (self.last_delay_ms as u64);
+}
+
+/// 驱动一次自动重连检查。
+/// 参数说明：`connector` 为连接工厂；它负责复用 subprotocol/header/auth 等 client 握手上下文并返回新会话。
+/// 返回值说明：返回 `true` 表示本轮已重连成功；`false` 表示暂未执行或本轮失败后已重新排期；超过最大重试次数返回 `error.WebSocketReconnectExhausted`。
+export @async_fn fn websocket_client_reconnect_tick(self: &WebSocketClient, connector: WebSocketClientConnector, now_ms: u64) Future<!bool> {
+    if self.role != WebSocketRole.Client {
+        return error.WebSocketProtocolError;
+    }
+    if self.connected {
+        const session: &WebSocketConn = websocket_client_session(self);
+        if session == null {
+            return error.WebSocketProtocolError;
+        }
+        if !websocket_client_conn_is_closed(session) {
+            return false;
+        }
+        websocket_client_schedule_reconnect(self, now_ms);
+    }
+    if !self.reconnect.enabled || !self.reconnect_pending {
+        return false;
+    }
+    if self.next_retry_at_ms != 0u64 && now_ms < self.next_retry_at_ms {
+        return false;
+    }
+
+    const connect_result: !WebSocketConn = @await websocket_client_connector_connect(connector, &self.options);
+    var conn: WebSocketConn = connect_result catch |err| {
+        _ = err;
+        _ = websocket_client_note_connect_failure(self, now_ms) catch |note_err| {
+            _ = note_err;
+            return error.WebSocketReconnectExhausted;
+        };
+        websocket_conn_empty();
+    };
+    if connect_result.error_id != 0u32 {
+        return false;
+    }
+    try websocket_client_attach_connected(self, &conn);
+    return true;
+}
+
+/// 通过当前活跃会话发送业务消息。
+/// 参数说明：当 client 正在重连或当前无活跃会话时，本函数直接拒绝写入。
+/// 返回值说明：返回底层 `write_message(...)` 的总线长；重连期间返回 `error.WebSocketConnectionClosed`。
+export fn websocket_client_write_message(self: &WebSocketClient, opcode: WebSocketOpcode, payload: &const byte, payload_len: usize, tx: &byte, tx_cap: usize) Future<!usize> {
+    const session: &WebSocketConn = websocket_client_session(self);
+    if session == null || !self.connected || self.reconnect_pending || websocket_client_conn_is_closed(session) {
+        return websocket_client_ready_result_usize(error.WebSocketConnectionClosed);
+    }
+    return websocket_conn_write_message(session, opcode, payload, payload_len, tx, tx_cap);
+}

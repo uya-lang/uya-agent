@@ -1,0 +1,3556 @@
+// std.process - 进程与类型化管道抽象
+// 模块路径：lib/std/process.uya → use std.process;
+
+use std;
+use std.env.EnvBlockBuilder;
+use std.env.env_block_builder_new;
+use std.env.env_key_valid;
+use std.mem.allocator.IAllocator;
+use std.mem.allocator.MallocAllocator;
+use std.mem.allocator.get_allocator;
+use std.path.is_abs;
+use std.path.join;
+use std.path.ExecutableLookupKind;
+use std.path.find_executable;
+use std.runtime.saved_envp;
+use std.runtime.get_argc;
+use std.runtime.get_argv;
+use libc.getcwd;
+use libc.fork;
+use libc.execve;
+use libc.waitpid;
+use libc.chdir;
+use libc._exit;
+use libc.close;
+use libc.dup2;
+use libc.sys_pipe2;
+use libc.sys_open;
+use libc.O_RDONLY;
+use libc.O_WRONLY;
+use libc.O_CREAT;
+use libc.O_TRUNC;
+use libc.O_CLOEXEC;
+use libc.EINTR;
+use libc.sys_read;
+use libc.sys_poll;
+use libc.PollFd;
+use libc.POLLIN;
+use libc.POLLHUP;
+use libc.POLLERR;
+use libc.kill;
+use libc.SIGKILL;
+use libc.Stat;
+use libc.sys_stat;
+use libc.access;
+use libc.X_OK;
+use libc.read;
+use libc.write;
+use libc.sys_fcntl;
+use libc.F_DUPFD_CLOEXEC;
+use libc.F_GETFD;
+use libc.F_SETFD;
+use libc.sigset_t;
+use libc.sigemptyset;
+use libc.sigaddset;
+use libc.sigismember;
+use libc.sigpending;
+use libc.SIG_BLOCK;
+use libc.SIG_SETMASK;
+use libc.SIGPIPE;
+use libc.EPIPE;
+use libc.sys_write;
+use libc.sys_fstat;
+use libc.SIGTTOU;
+use libc.SIGINT;
+use libc.SIGQUIT;
+use libc.SIGTERM;
+use libc.SIGHUP;
+use libc.SIGTSTP;
+use libc.SIG_IGN;
+use libc.SIG_ERR;
+use libc.O_NONBLOCK;
+use libc.O_RDWR;
+use libc.WNOHANG;
+
+extern fn setpgid(pid: i32, pgid: i32) i32;
+extern fn sigwait(set: &const sigset_t, signal: &i32) i32;
+extern fn pthread_sigmask(how: i32, set: &const sigset_t, old_set: &sigset_t) i32;
+extern fn isatty(fd: i32) i32;
+extern fn tcgetpgrp(fd: i32) i32;
+extern fn tcsetpgrp(fd: i32, pgid: i32) i32;
+extern fn getpgrp() i32;
+extern fn sched_yield() i32;
+extern fn getpgid(pid: i32) i32;
+extern fn setsid() i32;
+extern fn posix_openpt(flags: i32) i32;
+extern fn grantpt(fd: i32) i32;
+extern fn unlockpt(fd: i32) i32;
+extern fn ptsname(fd: i32) &byte;
+extern fn __errno_location() &i32;
+extern fn sigaction(signum: i32, action: &const PipelineSigaction, old_action: &PipelineSigaction) i32;
+
+export error InvalidPipeline;
+export error ProcessFailed;
+export error PipelineSpawnFailed;
+export error PipelineIoError;
+export error CaptureLimitExceeded;
+export error Interrupted;
+export error PipelineStageFailed;
+
+/// Pipeline stage 的稳定执行状态类别。
+export enum PipelineStageStatusKind {
+    not_started,
+    spawn_failed,
+    cancelled,
+    exited,
+    signaled,
+    completed,
+    stage_failed,
+}
+
+/// Process stage 启动失败的稳定跨平台分类。
+export enum PipelineSpawnFailureKind {
+    none,
+    path_not_found,
+    cwd_unavailable,
+    permission_denied,
+    process_create_failed,
+    execution_domain_failed,
+    stdio_setup_failed,
+    exec_failed,
+    platform_error,
+}
+
+/// 单个完整 pipeline stage 的执行状态。
+export struct PipelineStageStatus {
+    stage_index: usize,
+    kind: PipelineStageStatusKind,
+    exit_code: u32,
+    signal: i32,
+    spawn_failure: PipelineSpawnFailureKind,
+    platform_code: u32,
+    error_name: &const byte,
+}
+
+/// Pipeline 执行结果摘要；不保存 caller statuses 缓冲区借用。
+export struct PipelineResult {
+    stage_count: usize,
+}
+
+/// 单路 capture 的长度与完整性摘要。
+export struct CaptureStreamResult {
+    captured: bool,
+    byte_count: usize,
+    complete: bool,
+}
+
+/// Pipeline capture 摘要；不保存 stdout/stderr caller buffer 借用。
+export struct PipelineCaptureResult {
+    result: PipelineResult,
+    stdout: CaptureStreamResult,
+    stderr: CaptureStreamResult,
+}
+
+/// Pipeline stage 的阻塞字节输入流；实例由 executor 提供，不拥有底层 fd。
+export struct StreamReader {
+    _fd: i32,
+
+    /// 阻塞读取至多 output.len 字节。
+    /// 参数：output 为调用方可写缓冲区。
+    /// 返回：读取字节数；仅在已观察到 EOF 且未读取字节时返回 0。
+    fn read(self: &Self, output: &[byte]) !usize {
+        if self == null || output.ptr == null && output.len != 0usize { return error.InvalidPipeline; }
+        while true {
+            const received: !isize = sys_read(self._fd, output.ptr, output.len);
+            const count: isize = received catch |err| {
+                if @error_id(err) as i32 == EINTR { continue; }
+                return error.PipelineIoError;
+            };
+            if count < 0isize { return error.PipelineIoError; }
+            return count as usize;
+        }
+    }
+
+    /// 阻塞读取一行，换行符包含在返回数据中。
+    /// 参数：output 为调用方可写缓冲区；缓冲区满时返回当前片段。
+    /// 返回：本次写入字节数；EOF 前已有字节时先返回该尾段，下一次调用返回 0。
+    fn read_line(self: &Self, output: &[byte]) !usize {
+        if self == null || output.ptr == null && output.len != 0usize { return error.InvalidPipeline; }
+        var count: usize = 0usize;
+        var one: [byte: 1] = [];
+        while count < output.len {
+            const read_count: usize = try self.read(&one[0:1]);
+            if read_count == 0usize { return count; }
+            output[count] = one[0];
+            count = count + 1usize;
+            if output[count - 1usize] == 10 as byte { return count; }
+        }
+        return count;
+    }
+}
+
+/// Pipeline stage 的阻塞字节输出流；实例由 executor 提供，不拥有底层 fd。
+export struct StreamWriter {
+    _fd: i32,
+
+    /// 阻塞写入一次，允许底层返回短写。
+    /// 参数：input 为待写入字节。
+    /// 返回：本次成功写入的字节数。
+    fn write(self: &Self, input: &[const byte]) !usize {
+        if self == null || input.ptr == null && input.len != 0usize { return error.InvalidPipeline; }
+        while true {
+            const sent: !isize = sys_write(self._fd, input.ptr, input.len);
+            const count: isize = sent catch |err| {
+                if @error_id(err) as i32 == EINTR { continue; }
+                return error.PipelineIoError;
+            };
+            if count < 0isize { return error.PipelineIoError; }
+            return count as usize;
+        }
+    }
+
+    /// 阻塞写完全部输入，自动处理短写与 EINTR。
+    /// 参数：input 为完整待写入字节。
+    /// 返回：成功时无返回值；写入停滞或失败时返回 PipelineIoError。
+    fn write_all(self: &Self, input: &[const byte]) !void {
+        if self == null || input.ptr == null && input.len != 0usize { return error.InvalidPipeline; }
+        var offset: usize = 0usize;
+        while offset < input.len {
+            const sent: !isize = sys_write(self._fd, &input.ptr[offset], input.len - offset);
+            const count: isize = sent catch |err| {
+                if @error_id(err) as i32 == EINTR { continue; }
+                return error.PipelineIoError;
+            };
+            if count <= 0isize { return error.PipelineIoError; }
+            offset = offset + count as usize;
+        }
+    }
+}
+
+/// 自定义 Uya pipeline stage 的同步流处理接口。
+export interface PipelineStage {
+    /// 阻塞运行 stage，直到输入 EOF、成功完成或返回 Uya error。
+    fn run(self: &Self, input: &StreamReader, output: &StreamWriter) !void;
+}
+
+interface PipelineErasedStageOps {
+    fn run_erased(self: &Self, input: &StreamReader, output: &StreamWriter) !void;
+    fn clone_erased(self: &Self) !PipelineErasedStageOps;
+    fn drop_erased(self: &Self) void;
+}
+
+struct PipelineErasedStageBox : PipelineErasedStageOps {
+    value: PipelineStage,
+    owned_value: &void,
+
+    fn run_erased(self: &Self, input: &StreamReader, output: &StreamWriter) !void {
+        try self.value.run(input, output);
+    }
+
+    fn clone_erased(self: &Self) !PipelineErasedStageOps {
+        _ = self;
+        return error.InvalidPipeline;
+    }
+
+    fn drop_erased(self: &Self) void {
+        if self.owned_value != null { free(self.owned_value); }
+        free(self as &void);
+    }
+}
+
+extern "libc" fn __atomic_compare_exchange_n(ptr: &i32, expected: &i32, desired: i32, weak: i32, success_mem: i32, failure_mem: i32) i32;
+extern "libc" fn __atomic_exchange_n(ptr: &i32, value: i32, memory_order: i32) i32;
+extern "libc" fn __atomic_add_fetch(ptr: &i32, value: i32, memory_order: i32) i32;
+extern "libc" fn __atomic_load_n(ptr: &i32, memory_order: i32) i32;
+extern fn malloc(size: usize) &void;
+extern fn free(ptr: &void) void;
+extern fn memcpy(dest: &void, src: &const void, count: usize) &void;
+extern fn uya_interface_get_vtable(interface_value: &void) usize;
+extern fn uya_interface_set_vtable(interface_value: &void, vtable: usize) void;
+extern fn uya_interface_set_data(interface_value: &void, data: &void) void;
+extern fn uya_pipeline_image_anchor() usize;
+
+const PIPELINE_REGISTRY_CAPACITY: usize = 1024usize;
+const PIPELINE_MAX_STAGES: usize = 32usize;
+const PIPELINE_STAGE_STORAGE_CAPACITY: usize = 32768usize;
+const PIPELINE_ATOMIC_SEQ_CST: i32 = 5;
+const PIPELINE_WAIT_UNTRACED: i32 = 2;
+const PIPELINE_WAIT_CONTINUED: i32 = 8;
+
+
+struct PipelineSlot {
+    generation: usize,
+    live: i32,
+    stage_count: usize,
+}
+
+struct PipelineProcessStage {
+    active: i32,
+    command_kind: i32,
+    argv: &&byte,
+    argv_count: usize,
+    cwd: &byte,
+    env_ops: &PipelineEnvOp,
+    env_op_count: usize,
+}
+
+struct PipelineErasedStage {
+    active: i32,
+    ops: PipelineErasedStageOps,
+    worker_vtable_offset: isize,
+    value_byte: byte,
+}
+
+struct PipelineWorkerDescriptor {
+    worker_vtable_offset: isize,
+    value_byte: byte,
+}
+
+struct PipelineEnvOp {
+    key: &byte,
+    value: &byte,
+    remove: i32,
+}
+
+struct PipelineExecutionStage {
+    exec_path: &byte,
+    cwd: &byte,
+}
+
+struct PipelinePreparedProcessStage {
+    argv: &&byte,
+    envp: &&byte,
+    cwd: &byte,
+    exec_path: &byte,
+}
+
+struct PipelineCwdSnapshot {
+    base: &byte,
+}
+
+struct PipelineCaptureExecution {
+    stdout_ptr: &byte,
+    stdout_limit: usize,
+    stdout_count: usize,
+    stdout_complete: bool,
+    stderr_ptr: &byte,
+    stderr_limit: usize,
+    stderr_count: usize,
+    stderr_complete: bool,
+    capture_stdout: bool,
+    capture_stderr: bool,
+}
+
+enum PipelineStdinPolicyKind {
+    unset,
+    file,
+    inherit,
+}
+
+enum PipelineStdoutPolicyKind {
+    unset,
+    inherit,
+    file,
+    capture,
+}
+
+enum PipelineStderrPolicyKind {
+    unset,
+    inherit,
+    file,
+    capture,
+    merge_stdout,
+}
+
+struct PipelineStreamPolicy {
+    stdin_kind: PipelineStdinPolicyKind,
+    stdin_path: &byte,
+    stdout_kind: PipelineStdoutPolicyKind,
+    stdout_path: &byte,
+    stderr_kind: PipelineStderrPolicyKind,
+    stderr_path: &byte,
+}
+
+struct PipelineTerminalLease {
+    active: i32,
+    device: i64,
+    inode: i64,
+}
+
+struct PipelineSigaction {
+    handler: &void,
+    mask_words: [u64: 16],
+    flags: i32,
+    padding: i32,
+    restorer: &void,
+}
+
+struct PipelineStartupRecord {
+    kind: i32,
+    phase: i32,
+    platform_code: i32,
+    error_name_offset: isize,
+}
+
+const PIPELINE_STARTUP_READY: i32 = 1;
+const PIPELINE_STARTUP_FAILED: i32 = 2;
+const PIPELINE_STAGE_COMPLETED: i32 = 3;
+const PIPELINE_STAGE_FAILED: i32 = 4;
+const PIPELINE_WORKER_DESCRIPTOR_FD: i32 = 198;
+const PIPELINE_WORKER_REPORT_FD: i32 = 199;
+const PIPELINE_PHASE_SIGNAL_SETUP: i32 = 1;
+const PIPELINE_PHASE_SETPGID: i32 = 2;
+const PIPELINE_PHASE_BARRIER: i32 = 3;
+const PIPELINE_PHASE_CHDIR: i32 = 4;
+const PIPELINE_PHASE_STDIN: i32 = 5;
+const PIPELINE_PHASE_STDOUT: i32 = 6;
+const PIPELINE_PHASE_STDERR: i32 = 7;
+const PIPELINE_PHASE_EXEC: i32 = 8;
+
+struct PipelineEnvAllocator : IAllocator {
+    inner: &MallocAllocator,
+
+    fn alloc(self: &Self, size: usize) !&byte {
+        return self.inner.alloc(size);
+    },
+
+    fn dealloc(self: &Self, ptr: &byte) void {
+        self.inner.dealloc(ptr);
+    },
+
+    fn realloc(self: &Self, ptr: &byte, new_size: usize) !&byte {
+        return self.inner.realloc(ptr, new_size);
+    },
+}
+
+var _pipeline_registry_lock: atomic i32 = 0;
+var _pipeline_registry: [PipelineSlot: 1024] = [];
+var _pipeline_process_stages: [PipelineProcessStage: 32768] = [];
+var _pipeline_erased_stages: [PipelineErasedStage: 32768] = [];
+var _pipeline_stream_policies: [PipelineStreamPolicy: 1024] = [];
+var _pipeline_broker_lock: atomic i32 = 0;
+var _pipeline_broker_subscribers: usize = 0usize;
+var _pipeline_terminal_leases: [PipelineTerminalLease: 16] = [];
+var _pipeline_broker_pipe: [i32: 2] = [0 - 1, 0 - 1];
+var _pipeline_broker_pending_signal: atomic i32 = 0;
+var _pipeline_broker_signal_epoch: atomic i32 = 0;
+var _pipeline_broker_installed: i32 = 0;
+var _pipeline_broker_previous_actions: [PipelineSigaction: 4] = [];
+var _pipeline_broker_owned_actions: [i32: 4] = [];
+var _pipeline_test_fail_next_fork: atomic i32 = 0;
+var _pipeline_test_allow_next_fork_stage: atomic i32 = 0;
+var _pipeline_test_interrupt_direct_sends: atomic i32 = 0;
+
+extern fn pipeline_broker_signal_handler(signum: i32) void {
+    _pipeline_broker_pending_signal = signum;
+    _ = __atomic_add_fetch((&_pipeline_broker_signal_epoch) as &i32, 1, PIPELINE_ATOMIC_SEQ_CST);
+}
+
+fn pipeline_broker_signal_at(index: usize) i32 {
+    if index == 0usize { return SIGINT; }
+    if index == 1usize { return SIGQUIT; }
+    if index == 2usize { return SIGTERM; }
+    return SIGHUP;
+}
+
+fn pipeline_broker_install_handler(signum: i32, index: usize) !void {
+    if index >= 4usize { return error.PipelineIoError; }
+    var action: PipelineSigaction = PipelineSigaction {};
+    var previous: PipelineSigaction = PipelineSigaction {};
+    action.handler = &pipeline_broker_signal_handler as &void;
+    if sigaction(signum, &action, &previous) != 0 { return error.PipelineIoError; }
+    const was_ignored: bool = previous.handler == SIG_IGN as &void;
+    _pipeline_broker_previous_actions[index] = previous;
+    if was_ignored {
+        action.handler = SIG_IGN as &void;
+        if sigaction(signum, &action, null as &PipelineSigaction) != 0 { return error.PipelineIoError; }
+        _pipeline_broker_owned_actions[index] = 0;
+    } else {
+        _pipeline_broker_owned_actions[index] = 1;
+    }
+}
+
+fn pipeline_broker_uninstall() void {
+    if _pipeline_broker_installed == 0 { return; }
+    var i: usize = 0usize;
+    while i < 4usize {
+        if _pipeline_broker_owned_actions[i] != 0 {
+            var current: PipelineSigaction = PipelineSigaction {};
+            if sigaction(pipeline_broker_signal_at(i), null as &const PipelineSigaction, &current) == 0 &&
+                current.handler == (&pipeline_broker_signal_handler as &void) {
+                _ = sigaction(pipeline_broker_signal_at(i), &_pipeline_broker_previous_actions[i],
+                    null as &PipelineSigaction);
+            }
+        }
+        _pipeline_broker_owned_actions[i] = 0;
+        i = i + 1usize;
+    }
+    if _pipeline_broker_pipe[0] >= 0 { _ = close(_pipeline_broker_pipe[0]); }
+    if _pipeline_broker_pipe[1] >= 0 { _ = close(_pipeline_broker_pipe[1]); }
+    _pipeline_broker_pipe[0] = 0 - 1;
+    _pipeline_broker_pipe[1] = 0 - 1;
+    _pipeline_broker_installed = 0;
+}
+
+fn pipeline_broker_install() !void {
+    if _pipeline_broker_installed != 0 { return; }
+    const created: !i32 = sys_pipe2(&_pipeline_broker_pipe[0], O_CLOEXEC | O_NONBLOCK);
+    _ = created catch { return error.PipelineIoError; };
+    try pipeline_pipe_above_stdio(&_pipeline_broker_pipe[0]);
+    try pipeline_broker_install_handler(SIGINT, 0usize);
+    try pipeline_broker_install_handler(SIGQUIT, 1usize);
+    try pipeline_broker_install_handler(SIGTERM, 2usize);
+    try pipeline_broker_install_handler(SIGHUP, 3usize);
+    _pipeline_broker_installed = 1;
+}
+
+fn pipeline_broker_take_signal(observed_epoch: &i32) i32 {
+    if observed_epoch == null { return 0; }
+    const epoch: i32 = __atomic_load_n((&_pipeline_broker_signal_epoch) as &i32, PIPELINE_ATOMIC_SEQ_CST);
+    if epoch == observed_epoch[0] { return 0; }
+    observed_epoch[0] = epoch;
+    const pending: i32 = __atomic_load_n((&_pipeline_broker_pending_signal) as &i32, PIPELINE_ATOMIC_SEQ_CST);
+    if _pipeline_broker_pipe[0] >= 0 {
+        var scratch: [byte: 32] = [];
+        while true {
+            const drained: !isize = sys_read(_pipeline_broker_pipe[0], &scratch[0], 32usize);
+            const count: isize = drained catch { break; };
+            if count <= 0isize || count < 32isize { break; }
+        }
+    }
+    return pending;
+}
+
+fn pipeline_child_signal_setup(saved_mask: &const sigset_t) i32 {
+    if _pipeline_broker_pipe[0] >= 0 { _ = close(_pipeline_broker_pipe[0]); }
+    if _pipeline_broker_pipe[1] >= 0 { _ = close(_pipeline_broker_pipe[1]); }
+    if saved_mask == null || pthread_sigmask(SIG_SETMASK, saved_mask, null as &sigset_t) != 0 {
+        return 0 - 1;
+    }
+    var i: usize = 0usize;
+    while i < 4usize {
+        var action: PipelineSigaction = PipelineSigaction {};
+        if _pipeline_broker_previous_actions[i].handler == SIG_IGN as &void {
+            action.handler = SIG_IGN as &void;
+        } else {
+            action.handler = null as &void;
+        }
+        if sigaction(pipeline_broker_signal_at(i), &action, null as &PipelineSigaction) != 0 {
+            return 0 - 1;
+        }
+        i = i + 1usize;
+    }
+    return 0;
+}
+
+fn pipeline_broker_lock() void {
+    while true {
+        var expected: i32 = 0;
+        if __atomic_compare_exchange_n((&_pipeline_broker_lock) as &i32, &expected, 1, 0,
+            PIPELINE_ATOMIC_SEQ_CST, PIPELINE_ATOMIC_SEQ_CST) != 0 { return; }
+        _ = sched_yield();
+    }
+}
+
+fn pipeline_broker_unlock() void { _pipeline_broker_lock = 0; }
+
+fn pipeline_broker_subscribe() !void {
+    pipeline_broker_lock();
+    if _pipeline_broker_subscribers == 0usize {
+        const installed: !void = pipeline_broker_install();
+        _ = installed catch { pipeline_broker_unlock(); return error.PipelineIoError; };
+    }
+    _pipeline_broker_subscribers = _pipeline_broker_subscribers + 1usize;
+    pipeline_broker_unlock();
+}
+
+fn pipeline_broker_unsubscribe() void {
+    pipeline_broker_lock();
+    if _pipeline_broker_subscribers > 0usize {
+        _pipeline_broker_subscribers = _pipeline_broker_subscribers - 1usize;
+    }
+    if _pipeline_broker_subscribers == 0usize { pipeline_broker_uninstall(); }
+    pipeline_broker_unlock();
+}
+
+fn pipeline_terminal_identity(fd: i32, device: &i64, inode: &i64) !void {
+    if device == null || inode == null { return error.PipelineIoError; }
+    var info: Stat = Stat {};
+    const stated: !i32 = sys_fstat(fd, &info);
+    const code: i32 = stated catch { return error.PipelineIoError; };
+    if code != 0 { return error.PipelineIoError; }
+    device[0] = info.st_dev;
+    inode[0] = info.st_ino;
+}
+
+fn pipeline_terminal_lease_acquire(fd: i32) !usize {
+    var device: i64 = 0;
+    var inode: i64 = 0;
+    try pipeline_terminal_identity(fd, &device, &inode);
+    while true {
+        pipeline_broker_lock();
+        var occupied: bool = false;
+        var free_idx: usize = 16usize;
+        var i: usize = 0usize;
+        while i < 16usize {
+            if _pipeline_terminal_leases[i].active != 0 &&
+                _pipeline_terminal_leases[i].device == device &&
+                _pipeline_terminal_leases[i].inode == inode {
+                occupied = true;
+            } else if _pipeline_terminal_leases[i].active == 0 && free_idx == 16usize {
+                free_idx = i;
+            }
+            i = i + 1usize;
+        }
+        if !occupied && free_idx < 16usize {
+            _pipeline_terminal_leases[free_idx] = PipelineTerminalLease {
+                active: 1, device: device, inode: inode,
+            };
+            pipeline_broker_unlock();
+            return free_idx;
+        }
+        pipeline_broker_unlock();
+        if !occupied { return error.PipelineIoError; }
+        _ = sched_yield();
+    }
+}
+
+fn pipeline_terminal_lease_release(index: usize) void {
+    if index >= 16usize { return; }
+    pipeline_broker_lock();
+    _pipeline_terminal_leases[index] = PipelineTerminalLease {};
+    pipeline_broker_unlock();
+}
+
+fn pipeline_registry_lock() void {
+    while true {
+        var expected: i32 = 0;
+        if __atomic_compare_exchange_n((&_pipeline_registry_lock) as &i32, &expected, 1, 0,
+            PIPELINE_ATOMIC_SEQ_CST, PIPELINE_ATOMIC_SEQ_CST) != 0 {
+            return;
+        }
+    }
+}
+
+fn pipeline_registry_unlock() void {
+    _pipeline_registry_lock = 0;
+}
+
+fn pipeline_next_generation(current: usize) usize {
+    var next: usize = current +% 1usize;
+    if next == 0usize {
+        next = 1usize;
+    }
+    return next;
+}
+
+fn pipeline_registry_allocate() Pipeline {
+    pipeline_registry_lock();
+    var i: usize = 0usize;
+    while i < PIPELINE_REGISTRY_CAPACITY {
+        if _pipeline_registry[i].live == 0 {
+            const generation: usize = pipeline_next_generation(_pipeline_registry[i].generation);
+            _pipeline_registry[i].generation = generation;
+            _pipeline_registry[i].live = 1;
+            _pipeline_registry[i].stage_count = 0usize;
+            _pipeline_stream_policies[i].stdin_kind = PipelineStdinPolicyKind.unset;
+            _pipeline_stream_policies[i].stdin_path = null as &byte;
+            _pipeline_stream_policies[i].stdout_kind = PipelineStdoutPolicyKind.unset;
+            _pipeline_stream_policies[i].stdout_path = null as &byte;
+            _pipeline_stream_policies[i].stderr_kind = PipelineStderrPolicyKind.unset;
+            _pipeline_stream_policies[i].stderr_path = null as &byte;
+            pipeline_registry_unlock();
+            return Pipeline { handle: i + 1usize, generation: generation };
+        }
+        i = i + 1usize;
+    }
+    pipeline_registry_unlock();
+    return Pipeline { handle: 0usize, generation: 0usize };
+}
+
+fn pipeline_registry_slot_index(input: &Pipeline) !usize {
+    if input == null || input.handle == 0usize || input.handle > PIPELINE_REGISTRY_CAPACITY {
+        return error.InvalidPipeline;
+    }
+    return input.handle - 1usize;
+}
+
+fn pipeline_registry_stage_count(input: &Pipeline) !usize {
+    const idx: usize = try pipeline_registry_slot_index(input);
+    if idx >= PIPELINE_REGISTRY_CAPACITY {
+        return error.InvalidPipeline;
+    }
+    pipeline_registry_lock();
+    if _pipeline_registry[idx].live == 0 ||
+        _pipeline_registry[idx].generation != input.generation {
+        pipeline_registry_unlock();
+        return error.InvalidPipeline;
+    }
+    const count: usize = _pipeline_registry[idx].stage_count;
+    pipeline_registry_unlock();
+    return count;
+}
+
+fn pipeline_stage_storage_index(slot_idx: usize, stage_idx: usize) !usize {
+    if slot_idx >= PIPELINE_REGISTRY_CAPACITY || stage_idx >= PIPELINE_MAX_STAGES {
+        return error.InvalidPipeline;
+    }
+    const index: usize = slot_idx * PIPELINE_MAX_STAGES + stage_idx;
+    if index >= PIPELINE_STAGE_STORAGE_CAPACITY {
+        return error.InvalidPipeline;
+    }
+    return index;
+}
+
+fn pipeline_registry_append_process_stage(input: &Pipeline, command_kind: i32) !void {
+    const slot_idx: usize = try pipeline_registry_slot_index(input);
+    if slot_idx >= PIPELINE_REGISTRY_CAPACITY {
+        return error.InvalidPipeline;
+    }
+    pipeline_registry_lock();
+    if _pipeline_registry[slot_idx].live == 0 ||
+        _pipeline_registry[slot_idx].generation != input.generation ||
+        _pipeline_registry[slot_idx].stage_count >= PIPELINE_MAX_STAGES {
+        pipeline_registry_unlock();
+        return error.InvalidPipeline;
+    }
+    const stage_idx: usize = _pipeline_registry[slot_idx].stage_count;
+    const storage_result: !usize = pipeline_stage_storage_index(slot_idx, stage_idx);
+    const storage_idx: usize = storage_result catch {
+        pipeline_registry_unlock();
+        return error.InvalidPipeline;
+    };
+    if storage_idx >= PIPELINE_STAGE_STORAGE_CAPACITY {
+        pipeline_registry_unlock();
+        return error.InvalidPipeline;
+    }
+    _pipeline_process_stages[storage_idx].active = 1;
+    _pipeline_process_stages[storage_idx].command_kind = command_kind;
+    _pipeline_process_stages[storage_idx].argv = null as &&byte;
+    _pipeline_process_stages[storage_idx].argv_count = 0usize;
+    _pipeline_process_stages[storage_idx].cwd = null as &byte;
+    _pipeline_process_stages[storage_idx].env_ops = null as &PipelineEnvOp;
+    _pipeline_process_stages[storage_idx].env_op_count = 0usize;
+    _pipeline_registry[slot_idx].stage_count = stage_idx + 1usize;
+    pipeline_registry_unlock();
+    return;
+}
+
+fn pipeline_registry_append_erased_stage(input: &Pipeline, ops: PipelineErasedStageOps,
+    worker_vtable_offset: isize, value_byte: byte) !void {
+    try pipeline_registry_append_process_stage(input, 3);
+    const slot_idx: usize = try pipeline_registry_slot_index(input);
+    const count: usize = try pipeline_registry_stage_count(input);
+    if count == 0usize { return error.InvalidPipeline; }
+    const storage_idx: usize = try pipeline_stage_storage_index(slot_idx, count - 1usize);
+    if storage_idx >= PIPELINE_STAGE_STORAGE_CAPACITY { return error.InvalidPipeline; }
+    _pipeline_erased_stages[storage_idx].active = 1;
+    _pipeline_erased_stages[storage_idx].ops = ops;
+    _pipeline_erased_stages[storage_idx].worker_vtable_offset = worker_vtable_offset;
+    _pipeline_erased_stages[storage_idx].value_byte = value_byte;
+}
+
+fn pipeline_owned_c_string(value: &const byte) !&byte {
+    if value == null {
+        return error.InvalidPipeline;
+    }
+    var len: usize = 0usize;
+    while value[len] != 0 as byte {
+        len = len + 1usize;
+    }
+    const raw: &void = malloc(len + 1usize);
+    if raw == null {
+        return error.InvalidPipeline;
+    }
+    const out: &byte = raw as &byte;
+    _ = memcpy(out as &void, value as &const void, len + 1usize);
+    return out;
+}
+
+fn pipeline_c_string_len(value: &const byte) usize {
+    if value == null { return 0usize; }
+    var len: usize = 0usize;
+    while value[len] != 0 as byte { len = len + 1usize; }
+    return len;
+}
+
+fn pipeline_cwd_snapshot_from(base: &const byte) !PipelineCwdSnapshot {
+    return PipelineCwdSnapshot { base: try pipeline_owned_c_string(base) };
+}
+
+fn pipeline_cwd_snapshot_capture() !PipelineCwdSnapshot {
+    const raw: &void = malloc(4096usize);
+    if raw == null { return error.InvalidPipeline; }
+    const buffer: &byte = raw as &byte;
+    if getcwd(buffer, 4096usize) == null {
+        free(raw);
+        return error.InvalidPipeline;
+    }
+    return PipelineCwdSnapshot { base: buffer };
+}
+
+fn pipeline_cwd_snapshot_deinit(snapshot: &PipelineCwdSnapshot) void {
+    if snapshot != null && snapshot.base != null {
+        free(snapshot.base as &void);
+        snapshot.base = null as &byte;
+    }
+}
+
+fn pipeline_join_owned(base: &const byte, child: &const byte) !&byte {
+    const cap: usize = pipeline_c_string_len(base) + pipeline_c_string_len(child) + 2usize;
+    const raw: &void = malloc(cap);
+    if raw == null { return error.InvalidPipeline; }
+    const out: &byte = raw as &byte;
+    if join(base, child, out, cap) != 0 {
+        free(raw);
+        return error.InvalidPipeline;
+    }
+    return out;
+}
+
+fn pipeline_resolve_sink_path(snapshot: &PipelineCwdSnapshot, stage_cwd: &const byte, path: &const byte) !&byte {
+    if snapshot == null || snapshot.base == null || path == null {
+        return error.InvalidPipeline;
+    }
+    var final_cwd: &byte = null as &byte;
+    if stage_cwd == null {
+        final_cwd = try pipeline_owned_c_string(snapshot.base);
+    } else if is_abs(stage_cwd) {
+        final_cwd = try pipeline_owned_c_string(stage_cwd);
+    } else {
+        final_cwd = try pipeline_join_owned(snapshot.base, stage_cwd);
+    }
+    if is_abs(path) {
+        free(final_cwd as &void);
+        return pipeline_owned_c_string(path);
+    }
+    const result: !&byte = pipeline_join_owned(final_cwd, path);
+    free(final_cwd as &void);
+    return result;
+}
+
+fn pipeline_c_string_equals(left: &const byte, right: &const byte) i32 {
+    if left == null || right == null {
+        return 0;
+    }
+    var i: usize = 0usize;
+    while left[i] != 0 as byte && right[i] != 0 as byte {
+        if left[i] != right[i] {
+            return 0;
+        }
+        i = i + 1usize;
+    }
+    if left[i] != right[i] {
+        return 0;
+    }
+    return 1;
+}
+
+fn pipeline_command_name_valid(program: &const byte) bool {
+    if program == null || program[0] == 0 as byte {
+        return false;
+    }
+    var i: usize = 0usize;
+    while program[i] != 0 as byte {
+        if program[i] == 47 as byte {
+            return false;
+        }
+        std.cfg(std.target_os == .tos_windows, {
+            if program[i] == 92 as byte || program[i] == 58 as byte {
+                return false;
+            }
+        })
+        i = i + 1usize;
+    }
+    return true;
+}
+
+fn pipeline_path_is_windows_drive_relative(path: &const byte) bool {
+    if path == null { return false; }
+    const first: byte = path[0];
+    const drive: bool = (first >= 65 as byte && first <= 90 as byte) ||
+        (first >= 97 as byte && first <= 122 as byte);
+    if !drive || path[1] != 58 as byte { return false; }
+    return path[2] != 47 as byte && path[2] != 92 as byte;
+}
+
+fn pipeline_path_preflight_valid(path: &const byte) bool {
+    if path == null || path[0] == 0 as byte { return false; }
+    std.cfg(std.target_os == .tos_windows, {
+        if pipeline_path_is_windows_drive_relative(path) { return false; }
+    })
+    return true;
+}
+
+fn pipeline_execution_stage_init(exec_path: &const byte) !PipelineExecutionStage {
+    return PipelineExecutionStage { exec_path: try pipeline_owned_c_string(exec_path), cwd: null as &byte };
+}
+
+fn pipeline_execution_stage_from_process(stage: &PipelineProcessStage) !PipelineExecutionStage {
+    if stage == null || stage.active == 0 || stage.argv == null || stage.argv_count == 0usize {
+        return error.InvalidPipeline;
+    }
+    var execution: PipelineExecutionStage = try pipeline_execution_stage_init(stage.argv[0]);
+    if stage.cwd != null {
+        const cwd_result: !&byte = pipeline_owned_c_string(stage.cwd);
+        execution.cwd = cwd_result catch {
+            pipeline_execution_stage_deinit(&execution);
+            return error.InvalidPipeline;
+        };
+    }
+    return execution;
+}
+
+fn pipeline_execution_stage_deinit(stage: &PipelineExecutionStage) void {
+    if stage == null {
+        return;
+    }
+    if stage.exec_path != null {
+        free(stage.exec_path as &void);
+        stage.exec_path = null as &byte;
+    }
+    if stage.cwd != null {
+        free(stage.cwd as &void);
+        stage.cwd = null as &byte;
+    }
+}
+
+fn pipeline_free_c_string_vector(values: &&byte) void {
+    if values == null { return; }
+    var i: usize = 0usize;
+    while values[i] != null {
+        free(values[i] as &void);
+        i = i + 1usize;
+    }
+    free(values as &void);
+}
+
+fn pipeline_copy_c_string_vector(values: &&const byte, count: usize) !&&byte {
+    if values == null && count != 0usize { return error.InvalidPipeline; }
+    const raw: &void = malloc((count + 1usize) * @size_of(&byte));
+    if raw == null { return error.InvalidPipeline; }
+    const output: &&byte = raw as &&byte;
+    var i: usize = 0usize;
+    while i < count {
+        const copied: !&byte = pipeline_owned_c_string(values[i]);
+        output[i] = copied catch {
+            output[i] = null as &byte;
+            pipeline_free_c_string_vector(output);
+            return error.InvalidPipeline;
+        };
+        i = i + 1usize;
+    }
+    output[count] = null as &byte;
+    return output;
+}
+
+fn pipeline_prepared_stage_deinit(stage: &PipelinePreparedProcessStage) void {
+    if stage == null { return; }
+    pipeline_free_c_string_vector(stage.argv);
+    pipeline_free_c_string_vector(stage.envp);
+    if stage.cwd != null { free(stage.cwd as &void); }
+    if stage.exec_path != null { free(stage.exec_path as &void); }
+    stage.argv = null as &&byte;
+    stage.envp = null as &&byte;
+    stage.cwd = null as &byte;
+    stage.exec_path = null as &byte;
+}
+
+fn pipeline_prepared_stages_deinit(stages: &PipelinePreparedProcessStage, count: usize) void {
+    var i: usize = 0usize;
+    while i < count {
+        pipeline_prepared_stage_deinit(&stages[i]);
+        i = i + 1usize;
+    }
+}
+
+fn pipeline_free_stage_argv(stage: &PipelineProcessStage) void {
+    if stage == null || stage.argv == null {
+        return;
+    }
+    var i: usize = 0usize;
+    while i < stage.argv_count {
+        if stage.argv[i] != null {
+            free(stage.argv[i] as &void);
+            stage.argv[i] = null as &byte;
+        }
+        i = i + 1usize;
+    }
+    free(stage.argv as &void);
+    stage.argv = null as &&byte;
+    stage.argv_count = 0usize;
+}
+
+fn pipeline_registry_set_last_stage_argv(input: &Pipeline, program: &const byte, args: &&const byte, args_len: usize) !void {
+    const slot_idx: usize = try pipeline_registry_slot_index(input);
+    if slot_idx >= PIPELINE_REGISTRY_CAPACITY {
+        return error.InvalidPipeline;
+    }
+    pipeline_registry_lock();
+    const count: usize = _pipeline_registry[slot_idx].stage_count;
+    if _pipeline_registry[slot_idx].live == 0 ||
+        _pipeline_registry[slot_idx].generation != input.generation || count == 0usize {
+        pipeline_registry_unlock();
+        return error.InvalidPipeline;
+    }
+    const storage_result: !usize = pipeline_stage_storage_index(slot_idx, count - 1usize);
+    const storage_idx: usize = storage_result catch {
+        pipeline_registry_unlock();
+        return error.InvalidPipeline;
+    };
+    if storage_idx >= PIPELINE_STAGE_STORAGE_CAPACITY {
+        pipeline_registry_unlock();
+        return error.InvalidPipeline;
+    }
+    if _pipeline_process_stages[storage_idx].active == 0 {
+        pipeline_registry_unlock();
+        return error.InvalidPipeline;
+    }
+    const argv_count: usize = args_len + 1usize;
+    const argv_raw: &void = malloc((argv_count + 1usize) * @size_of(&byte));
+    if argv_raw == null {
+        pipeline_registry_unlock();
+        return error.InvalidPipeline;
+    }
+    const owned_argv: &&byte = argv_raw as &&byte;
+    var initialized: usize = 0usize;
+    const owned_program_result: !&byte = pipeline_owned_c_string(program);
+    const owned_program: &byte = owned_program_result catch {
+        free(argv_raw);
+        pipeline_registry_unlock();
+        return error.InvalidPipeline;
+    };
+    owned_argv[0] = owned_program;
+    initialized = 1usize;
+    var i: usize = 0usize;
+    while i < args_len {
+        const argument: &const byte = args[i];
+        const owned_arg_result: !&byte = pipeline_owned_c_string(argument);
+        const owned_arg: &byte = owned_arg_result catch {
+            var j: usize = 0usize;
+            while j < initialized {
+                free(owned_argv[j] as &void);
+                j = j + 1usize;
+            }
+            free(argv_raw);
+            pipeline_registry_unlock();
+            return error.InvalidPipeline;
+        };
+        owned_argv[i + 1usize] = owned_arg;
+        initialized = initialized + 1usize;
+        i = i + 1usize;
+    }
+    owned_argv[argv_count] = null as &byte;
+    pipeline_free_stage_argv(&_pipeline_process_stages[storage_idx]);
+    _pipeline_process_stages[storage_idx].argv = owned_argv;
+    _pipeline_process_stages[storage_idx].argv_count = argv_count;
+    pipeline_registry_unlock();
+    return;
+}
+
+fn pipeline_registry_set_last_stage_cwd(input: &Pipeline, cwd: &const byte) !void {
+    const slot_idx: usize = try pipeline_registry_slot_index(input);
+    if slot_idx >= PIPELINE_REGISTRY_CAPACITY {
+        return error.InvalidPipeline;
+    }
+    const owned_cwd: &byte = try pipeline_owned_c_string(cwd);
+    pipeline_registry_lock();
+    const count: usize = _pipeline_registry[slot_idx].stage_count;
+    if _pipeline_registry[slot_idx].live == 0 ||
+        _pipeline_registry[slot_idx].generation != input.generation || count == 0usize {
+        pipeline_registry_unlock();
+        free(owned_cwd as &void);
+        return error.InvalidPipeline;
+    }
+    const storage_result: !usize = pipeline_stage_storage_index(slot_idx, count - 1usize);
+    const storage_idx: usize = storage_result catch {
+        pipeline_registry_unlock();
+        free(owned_cwd as &void);
+        return error.InvalidPipeline;
+    };
+    if storage_idx >= PIPELINE_STAGE_STORAGE_CAPACITY {
+        pipeline_registry_unlock();
+        free(owned_cwd as &void);
+        return error.InvalidPipeline;
+    }
+    if _pipeline_process_stages[storage_idx].active == 0 {
+        pipeline_registry_unlock();
+        free(owned_cwd as &void);
+        return error.InvalidPipeline;
+    }
+    if _pipeline_process_stages[storage_idx].cwd != null {
+        free(_pipeline_process_stages[storage_idx].cwd as &void);
+    }
+    _pipeline_process_stages[storage_idx].cwd = owned_cwd;
+    pipeline_registry_unlock();
+    return;
+}
+
+fn pipeline_free_env_ops(stage: &PipelineProcessStage) void {
+    if stage == null || stage.env_ops == null {
+        return;
+    }
+    var i: usize = 0usize;
+    while i < stage.env_op_count {
+        if stage.env_ops[i].key != null {
+            free(stage.env_ops[i].key as &void);
+        }
+        if stage.env_ops[i].value != null {
+            free(stage.env_ops[i].value as &void);
+        }
+        i = i + 1usize;
+    }
+    free(stage.env_ops as &void);
+    stage.env_ops = null as &PipelineEnvOp;
+    stage.env_op_count = 0usize;
+}
+
+fn pipeline_registry_append_last_stage_env(input: &Pipeline, key: &const byte, value: &const byte, remove: i32) !void {
+    const slot_idx: usize = try pipeline_registry_slot_index(input);
+    if slot_idx >= PIPELINE_REGISTRY_CAPACITY {
+        return error.InvalidPipeline;
+    }
+    if !env_key_valid(key) {
+        return error.EnvInvalidName;
+    }
+    if remove == 0 && value == null {
+        return error.EnvInvalidValue;
+    }
+    const owned_key: &byte = try pipeline_owned_c_string(key);
+    var owned_value: &byte = null as &byte;
+    if remove == 0 {
+        const value_result: !&byte = pipeline_owned_c_string(value);
+        owned_value = value_result catch {
+            free(owned_key as &void);
+            return error.InvalidPipeline;
+        };
+    }
+    pipeline_registry_lock();
+    const count: usize = _pipeline_registry[slot_idx].stage_count;
+    if _pipeline_registry[slot_idx].live == 0 ||
+        _pipeline_registry[slot_idx].generation != input.generation || count == 0usize {
+        pipeline_registry_unlock();
+        free(owned_key as &void);
+        if owned_value != null { free(owned_value as &void); }
+        return error.InvalidPipeline;
+    }
+    const storage_result: !usize = pipeline_stage_storage_index(slot_idx, count - 1usize);
+    const storage_idx: usize = storage_result catch {
+        pipeline_registry_unlock();
+        free(owned_key as &void);
+        if owned_value != null { free(owned_value as &void); }
+        return error.InvalidPipeline;
+    };
+    if storage_idx >= PIPELINE_STAGE_STORAGE_CAPACITY {
+        pipeline_registry_unlock();
+        free(owned_key as &void);
+        if owned_value != null { free(owned_value as &void); }
+        return error.InvalidPipeline;
+    }
+    if _pipeline_process_stages[storage_idx].active == 0 {
+        pipeline_registry_unlock();
+        free(owned_key as &void);
+        if owned_value != null { free(owned_value as &void); }
+        return error.InvalidPipeline;
+    }
+    const old_count: usize = _pipeline_process_stages[storage_idx].env_op_count;
+    const raw: &void = malloc((old_count + 1usize) * @size_of(PipelineEnvOp));
+    if raw == null {
+        pipeline_registry_unlock();
+        free(owned_key as &void);
+        if owned_value != null { free(owned_value as &void); }
+        return error.InvalidPipeline;
+    }
+    const ops: &PipelineEnvOp = raw as &PipelineEnvOp;
+    if old_count > 0usize {
+        _ = memcpy(raw, _pipeline_process_stages[storage_idx].env_ops as &const void,
+            old_count * @size_of(PipelineEnvOp));
+        free(_pipeline_process_stages[storage_idx].env_ops as &void);
+    }
+    ops[old_count] = PipelineEnvOp { key: owned_key, value: owned_value, remove: remove };
+    _pipeline_process_stages[storage_idx].env_ops = ops;
+    _pipeline_process_stages[storage_idx].env_op_count = old_count + 1usize;
+    pipeline_registry_unlock();
+    return;
+}
+
+fn pipeline_apply_stage_env(stage: &PipelineProcessStage, builder: &EnvBlockBuilder) !void {
+    if stage == null || builder == null {
+        return error.InvalidPipeline;
+    }
+    var i: usize = 0usize;
+    while i < stage.env_op_count {
+        if stage.env_ops[i].remove != 0 {
+            try builder.without(stage.env_ops[i].key);
+        } else {
+            try builder.with(stage.env_ops[i].key, stage.env_ops[i].value);
+        }
+        i = i + 1usize;
+    }
+}
+
+fn pipeline_path_env(builder: &EnvBlockBuilder) &(&const byte) {
+    return builder.envp();
+}
+
+fn pipeline_spawn_env(builder: &EnvBlockBuilder) &(&const byte) {
+    return builder.envp();
+}
+
+fn pipeline_env_value(envp: &(&const byte), key: &const byte) &const byte {
+    if envp == null || key == null { return null; }
+    var i: usize = 0usize;
+    while envp[i] != null {
+        const entry: &const byte = envp[i];
+        var j: usize = 0usize;
+        while key[j] != 0 as byte && entry[j] == key[j] { j = j + 1usize; }
+        if key[j] == 0 as byte && entry[j] == 61 as byte { return &entry[j + 1usize]; }
+        i = i + 1usize;
+    }
+    return null;
+}
+
+fn pipeline_resolve_command_path(builder: &EnvBlockBuilder, cwd: &const byte,
+    program: &const byte, out: &byte, out_cap: usize) ExecutableLookupKind {
+    if builder == null { return ExecutableLookupKind.platform_error; }
+    const envp: &(&const byte) = pipeline_path_env(builder);
+    const path_value: &const byte = pipeline_env_value(envp, "PATH");
+    return find_executable(path_value, cwd, program, out, out_cap);
+}
+
+fn pipeline_lookup_spawn_failure(kind: ExecutableLookupKind) PipelineSpawnFailureKind {
+    if kind == ExecutableLookupKind.path_not_found { return PipelineSpawnFailureKind.path_not_found; }
+    if kind == ExecutableLookupKind.permission_denied { return PipelineSpawnFailureKind.permission_denied; }
+    if kind == ExecutableLookupKind.platform_error { return PipelineSpawnFailureKind.platform_error; }
+    return PipelineSpawnFailureKind.none;
+}
+
+fn pipeline_registry_clear_stages(slot_idx: usize, count: usize) void {
+    var i: usize = 0usize;
+    while i < count && i < PIPELINE_MAX_STAGES {
+        const storage_result: !usize = pipeline_stage_storage_index(slot_idx, i);
+        const storage_idx: usize = storage_result catch { return; };
+        if storage_idx >= PIPELINE_STAGE_STORAGE_CAPACITY {
+            return;
+        }
+        if _pipeline_erased_stages[storage_idx].active != 0 {
+            _pipeline_erased_stages[storage_idx].ops.drop_erased();
+            _pipeline_erased_stages[storage_idx].active = 0;
+        }
+        pipeline_free_stage_argv(&_pipeline_process_stages[storage_idx]);
+        if _pipeline_process_stages[storage_idx].cwd != null {
+            free(_pipeline_process_stages[storage_idx].cwd as &void);
+            _pipeline_process_stages[storage_idx].cwd = null as &byte;
+        }
+        pipeline_free_env_ops(&_pipeline_process_stages[storage_idx]);
+        _pipeline_process_stages[storage_idx].active = 0;
+        _pipeline_process_stages[storage_idx].command_kind = 0;
+        i = i + 1usize;
+    }
+}
+
+fn pipeline_set_stdin_policy(input: &Pipeline, kind: PipelineStdinPolicyKind, path: &const byte) !void {
+    const idx: usize = try pipeline_registry_slot_index(input);
+    if idx >= PIPELINE_REGISTRY_CAPACITY ||
+        (kind == PipelineStdinPolicyKind.file && !pipeline_path_preflight_valid(path)) {
+        return error.InvalidPipeline;
+    }
+    var owned_path: &byte = null as &byte;
+    if kind == PipelineStdinPolicyKind.file {
+        owned_path = try pipeline_owned_c_string(path);
+    }
+    pipeline_registry_lock();
+    if _pipeline_registry[idx].live == 0 || _pipeline_registry[idx].generation != input.generation {
+        pipeline_registry_unlock();
+        if owned_path != null { free(owned_path as &void); }
+        return error.InvalidPipeline;
+    }
+    if _pipeline_stream_policies[idx].stdin_kind != PipelineStdinPolicyKind.unset {
+        pipeline_registry_unlock();
+        if owned_path != null { free(owned_path as &void); }
+        return error.InvalidPipeline;
+    }
+    if _pipeline_stream_policies[idx].stdin_path != null {
+        free(_pipeline_stream_policies[idx].stdin_path as &void);
+    }
+    _pipeline_stream_policies[idx].stdin_kind = kind;
+    _pipeline_stream_policies[idx].stdin_path = owned_path;
+    pipeline_registry_unlock();
+}
+
+fn pipeline_set_stdout_policy(input: &Pipeline, kind: PipelineStdoutPolicyKind, path: &const byte) !void {
+    const idx: usize = try pipeline_registry_slot_index(input);
+    if idx >= PIPELINE_REGISTRY_CAPACITY ||
+        (kind == PipelineStdoutPolicyKind.file && !pipeline_path_preflight_valid(path)) {
+        return error.InvalidPipeline;
+    }
+    var owned_path: &byte = null as &byte;
+    if kind == PipelineStdoutPolicyKind.file {
+        owned_path = try pipeline_owned_c_string(path);
+    }
+    pipeline_registry_lock();
+    if _pipeline_registry[idx].live == 0 || _pipeline_registry[idx].generation != input.generation {
+        pipeline_registry_unlock();
+        if owned_path != null { free(owned_path as &void); }
+        return error.InvalidPipeline;
+    }
+    if _pipeline_stream_policies[idx].stdout_kind != PipelineStdoutPolicyKind.unset {
+        pipeline_registry_unlock();
+        if owned_path != null { free(owned_path as &void); }
+        return error.InvalidPipeline;
+    }
+    if _pipeline_stream_policies[idx].stdout_path != null {
+        free(_pipeline_stream_policies[idx].stdout_path as &void);
+    }
+    _pipeline_stream_policies[idx].stdout_kind = kind;
+    _pipeline_stream_policies[idx].stdout_path = owned_path;
+    pipeline_registry_unlock();
+}
+
+fn pipeline_set_stderr_policy(input: &Pipeline, kind: PipelineStderrPolicyKind, path: &const byte) !void {
+    const idx: usize = try pipeline_registry_slot_index(input);
+    if idx >= PIPELINE_REGISTRY_CAPACITY ||
+        (kind == PipelineStderrPolicyKind.file && !pipeline_path_preflight_valid(path)) {
+        return error.InvalidPipeline;
+    }
+    var owned_path: &byte = null as &byte;
+    if kind == PipelineStderrPolicyKind.file {
+        owned_path = try pipeline_owned_c_string(path);
+    }
+    pipeline_registry_lock();
+    if _pipeline_registry[idx].live == 0 || _pipeline_registry[idx].generation != input.generation {
+        pipeline_registry_unlock();
+        if owned_path != null { free(owned_path as &void); }
+        return error.InvalidPipeline;
+    }
+    if _pipeline_stream_policies[idx].stderr_kind != PipelineStderrPolicyKind.unset {
+        pipeline_registry_unlock();
+        if owned_path != null { free(owned_path as &void); }
+        return error.InvalidPipeline;
+    }
+    if _pipeline_stream_policies[idx].stderr_path != null {
+        free(_pipeline_stream_policies[idx].stderr_path as &void);
+    }
+    _pipeline_stream_policies[idx].stderr_kind = kind;
+    _pipeline_stream_policies[idx].stderr_path = owned_path;
+    pipeline_registry_unlock();
+}
+
+fn pipeline_set_inherit_stdio(input: &Pipeline) !void {
+    const idx: usize = try pipeline_registry_slot_index(input);
+    if idx >= PIPELINE_REGISTRY_CAPACITY { return error.InvalidPipeline; }
+    pipeline_registry_lock();
+    if _pipeline_registry[idx].live == 0 || _pipeline_registry[idx].generation != input.generation ||
+        _pipeline_stream_policies[idx].stdin_kind != PipelineStdinPolicyKind.unset ||
+        _pipeline_stream_policies[idx].stdout_kind != PipelineStdoutPolicyKind.unset ||
+        _pipeline_stream_policies[idx].stderr_kind != PipelineStderrPolicyKind.unset {
+        pipeline_registry_unlock();
+        return error.InvalidPipeline;
+    }
+    _pipeline_stream_policies[idx].stdin_kind = PipelineStdinPolicyKind.inherit;
+    _pipeline_stream_policies[idx].stdout_kind = PipelineStdoutPolicyKind.inherit;
+    _pipeline_stream_policies[idx].stderr_kind = PipelineStderrPolicyKind.inherit;
+    pipeline_registry_unlock();
+}
+
+fn pipeline_registry_release(input: &Pipeline) i32 {
+    const idx_result: !usize = pipeline_registry_slot_index(input);
+    const idx: usize = idx_result catch { return 0; };
+    if idx >= PIPELINE_REGISTRY_CAPACITY {
+        return 0;
+    }
+    pipeline_registry_lock();
+    if _pipeline_registry[idx].live == 0 ||
+        _pipeline_registry[idx].generation != input.generation {
+        pipeline_registry_unlock();
+        return 0;
+    }
+    const old_stage_count: usize = _pipeline_registry[idx].stage_count;
+    pipeline_registry_clear_stages(idx, old_stage_count);
+    if _pipeline_stream_policies[idx].stdin_path != null {
+        free(_pipeline_stream_policies[idx].stdin_path as &void);
+        _pipeline_stream_policies[idx].stdin_path = null as &byte;
+    }
+    _pipeline_stream_policies[idx].stdin_kind = PipelineStdinPolicyKind.unset;
+    if _pipeline_stream_policies[idx].stdout_path != null {
+        free(_pipeline_stream_policies[idx].stdout_path as &void);
+        _pipeline_stream_policies[idx].stdout_path = null as &byte;
+    }
+    _pipeline_stream_policies[idx].stdout_kind = PipelineStdoutPolicyKind.unset;
+    if _pipeline_stream_policies[idx].stderr_path != null {
+        free(_pipeline_stream_policies[idx].stderr_path as &void);
+        _pipeline_stream_policies[idx].stderr_path = null as &byte;
+    }
+    _pipeline_stream_policies[idx].stderr_kind = PipelineStderrPolicyKind.unset;
+    _pipeline_registry[idx].live = 0;
+    _pipeline_registry[idx].stage_count = 0usize;
+    pipeline_registry_unlock();
+    return 1;
+}
+
+fn pipeline_empty_stage_status(index: usize) PipelineStageStatus {
+    return PipelineStageStatus {
+        stage_index: index,
+        kind: PipelineStageStatusKind.not_started,
+        exit_code: 0u32,
+        signal: 0,
+        spawn_failure: PipelineSpawnFailureKind.none,
+        platform_code: 0u32,
+        error_name: "",
+    };
+}
+
+fn pipeline_reset_result(result: &PipelineResult) void {
+    if result != null {
+        result.stage_count = 0usize;
+    }
+}
+
+fn pipeline_reset_capture_result(result: &PipelineCaptureResult) void {
+    if result == null {
+        return;
+    }
+    result.result.stage_count = 0usize;
+    result.stdout.captured = false;
+    result.stdout.byte_count = 0usize;
+    result.stdout.complete = false;
+    result.stderr.captured = false;
+    result.stderr.byte_count = 0usize;
+    result.stderr.complete = false;
+}
+
+fn pipeline_prepare_status_buffer(input: &Pipeline, statuses: &[PipelineStageStatus], result: &PipelineResult) !usize {
+    pipeline_reset_result(result);
+    const count: usize = try pipeline_registry_stage_count(input);
+    if statuses.len < count {
+        return error.InvalidPipeline;
+    }
+    var i: usize = 0usize;
+    while i < count {
+        statuses[i] = pipeline_empty_stage_status(i);
+        i = i + 1usize;
+    }
+    result.stage_count = count;
+    return count;
+}
+
+fn pipeline_copy_capture_bytes(output: &[byte], input: &[const byte], count: usize) !usize {
+    if count > output.len || count > input.len {
+        return error.InvalidPipeline;
+    }
+    var i: usize = 0usize;
+    while i < count {
+        output[i] = input[i];
+        i = i + 1usize;
+    }
+    return count;
+}
+
+fn pipeline_regions_overlap(left: &const void, left_size: usize, right: &const void, right_size: usize) bool {
+    if left_size == 0usize || right_size == 0usize { return false; }
+    if left == null || right == null { return true; }
+    const left_start: usize = @usize_from_ptr(left);
+    const right_start: usize = @usize_from_ptr(right);
+    const left_end: usize = left_start + left_size;
+    const right_end: usize = right_start + right_size;
+    if left_end < left_start || right_end < right_start { return true; }
+    return left_start < right_end && right_start < left_end;
+}
+
+fn pipeline_preflight_status_regions(statuses: &[PipelineStageStatus], result: &PipelineResult) !void {
+    if result == null || (statuses.len > 0usize && statuses.ptr == null) {
+        return error.InvalidPipeline;
+    }
+    const statuses_size: usize = statuses.len * @size_of(PipelineStageStatus);
+    if statuses.len > 0usize && statuses_size / statuses.len != @size_of(PipelineStageStatus) {
+        return error.InvalidPipeline;
+    }
+    if pipeline_regions_overlap(statuses.ptr as &const void,
+        statuses_size, result as &const void, @size_of(PipelineResult)) {
+        return error.InvalidPipeline;
+    }
+}
+
+fn pipeline_preflight_capture_regions(statuses: &[PipelineStageStatus], stdout_buf: &[byte],
+    stderr_buf: &[byte], capture_stdout: bool, capture_stderr: bool, result: &PipelineCaptureResult) !void {
+    if result == null || (statuses.len > 0usize && statuses.ptr == null) ||
+        (capture_stdout && stdout_buf.len > 0usize && stdout_buf.ptr == null) ||
+        (capture_stderr && stderr_buf.len > 0usize && stderr_buf.ptr == null) {
+        return error.InvalidPipeline;
+    }
+    const statuses_size: usize = statuses.len * @size_of(PipelineStageStatus);
+    if statuses.len > 0usize && statuses_size / statuses.len != @size_of(PipelineStageStatus) {
+        return error.InvalidPipeline;
+    }
+    var stdout_size: usize = 0usize;
+    var stderr_size: usize = 0usize;
+    if capture_stdout { stdout_size = stdout_buf.len; }
+    if capture_stderr { stderr_size = stderr_buf.len; }
+    if pipeline_regions_overlap(statuses.ptr as &const void, statuses_size,
+            stdout_buf.ptr as &const void, stdout_size) ||
+        pipeline_regions_overlap(statuses.ptr as &const void, statuses_size,
+            stderr_buf.ptr as &const void, stderr_size) ||
+        pipeline_regions_overlap(statuses.ptr as &const void, statuses_size,
+            result as &const void, @size_of(PipelineCaptureResult)) ||
+        pipeline_regions_overlap(stdout_buf.ptr as &const void, stdout_size,
+            stderr_buf.ptr as &const void, stderr_size) ||
+        pipeline_regions_overlap(stdout_buf.ptr as &const void, stdout_size,
+            result as &const void, @size_of(PipelineCaptureResult)) ||
+        pipeline_regions_overlap(stderr_buf.ptr as &const void, stderr_size,
+            result as &const void, @size_of(PipelineCaptureResult)) {
+        return error.InvalidPipeline;
+    }
+}
+
+fn pipeline_final_stage_cwd(snapshot: &PipelineCwdSnapshot, stage: &PipelineProcessStage) !&byte {
+    if snapshot == null || stage == null { return error.InvalidPipeline; }
+    if stage.cwd == null { return pipeline_owned_c_string(snapshot.base); }
+    return pipeline_resolve_sink_path(snapshot, null, stage.cwd);
+}
+
+fn pipeline_wait_status(raw: i32, index: usize) PipelineStageStatus {
+    var status: PipelineStageStatus = pipeline_empty_stage_status(index);
+    if (raw & 127) == 0 {
+        status.kind = PipelineStageStatusKind.exited;
+        status.exit_code = ((raw >> 8) & 255) as u32;
+    } else {
+        status.kind = PipelineStageStatusKind.signaled;
+        status.signal = raw & 127;
+    }
+    return status;
+}
+
+fn pipeline_wait_status_is_stopped(raw: i32) bool { return (raw & 255) == 127; }
+fn pipeline_wait_status_is_continued(raw: i32) bool { return raw == 65535; }
+
+fn pipeline_capture_read(fd: i32, output: &byte, limit: usize, count: &usize) !i32 {
+    if count == null { return error.InvalidPipeline; }
+    if count[0] < limit {
+        const remaining: usize = limit - count[0];
+        const read_result: !isize = sys_read(fd, &output[count[0]], remaining);
+        const read_count: isize = read_result catch { return 1; };
+        if read_count == 0isize { return 0; }
+        if read_count > 0isize {
+            count[0] = count[0] + read_count as usize;
+            return 1;
+        }
+        return 1;
+    }
+    var scratch: byte = 0 as byte;
+    const probe_result: !isize = sys_read(fd, &scratch, 1usize);
+    const probe: isize = probe_result catch { return 1; };
+    if probe == 0isize { return 0; }
+    if probe > 0isize { return 2; }
+    return 1;
+}
+
+fn pipeline_cancel_pids(pids: &i32, count: usize) void {
+    var i: usize = 0usize;
+    while i < count {
+        if pids[i] > 0 { _ = kill(pids[i], SIGKILL); }
+        i = i + 1usize;
+    }
+    i = 0usize;
+    while i < count {
+        if pids[i] > 0 {
+            var raw: i32 = 0;
+            _ = waitpid(pids[i], &raw, 0);
+        }
+        i = i + 1usize;
+    }
+}
+
+fn pipeline_cancel_started_group(pgid: i32, pids: &i32, count: usize) void {
+    if pgid > 0 { _ = kill(0 - pgid, SIGKILL); }
+    pipeline_cancel_pids(pids, count);
+}
+
+fn pipeline_interrupt_started_group(pgid: i32, pids: &i32, count: usize, signum: i32) void {
+    if pgid > 0 { _ = kill(0 - pgid, signum); }
+    var i: usize = 0usize;
+    while i < count {
+        if pids[i] > 0 {
+            const current_group: i32 = getpgid(pids[i]);
+            if current_group != pgid {
+                _ = __atomic_add_fetch((&_pipeline_test_interrupt_direct_sends) as &i32,
+                    1, PIPELINE_ATOMIC_SEQ_CST);
+                _ = kill(pids[i], signum);
+            }
+        }
+        i = i + 1usize;
+    }
+    if _pipeline_broker_pipe[0] >= 0 {
+        var wait_fd: PollFd = PollFd { fd: _pipeline_broker_pipe[0], events: POLLIN, revents: 0 };
+        const waited: !i32 = sys_poll(&wait_fd, 1usize, 100);
+        _ = waited catch {};
+    }
+    pipeline_cancel_started_group(pgid, pids, count);
+}
+
+fn pipeline_take_and_handle_interrupt(pgid: i32, pids: &i32, count: usize, observed_epoch: &i32) bool {
+    const signum: i32 = pipeline_broker_take_signal(observed_epoch);
+    if signum == 0 { return false; }
+    pipeline_interrupt_started_group(pgid, pids, count, signum);
+    return true;
+}
+
+fn pipeline_capture_priority_interrupt(pgid: i32, pids: &i32, count: usize,
+    reaped: &bool, raw_statuses: &i32, reaped_count: &usize, observed_epoch: &i32) bool {
+    if pipeline_take_and_handle_interrupt(pgid, pids, count, observed_epoch) { return true; }
+    if reaped == null || raw_statuses == null || reaped_count == null { return false; }
+    var i: usize = 0usize;
+    while i < count {
+        if !reaped[i] {
+            const waited: i32 = waitpid(pids[i], &raw_statuses[i],
+                WNOHANG | PIPELINE_WAIT_UNTRACED | PIPELINE_WAIT_CONTINUED);
+            if waited == pids[i] && pipeline_wait_status_is_stopped(raw_statuses[i]) {
+                pipeline_cancel_started_group(pgid, pids, count);
+                return true;
+            }
+            if waited == pids[i] && !pipeline_wait_status_is_continued(raw_statuses[i]) {
+                reaped[i] = true;
+                reaped_count[0] = reaped_count[0] + 1usize;
+            }
+        }
+        i = i + 1usize;
+    }
+    return false;
+}
+
+fn pipeline_abort_launches(launch_fds: &i32, report_fds: &i32, count: usize) void {
+    var i: usize = 0usize;
+    while i < count {
+        const launch_read: i32 = launch_fds[i * 2usize];
+        const launch_write: i32 = launch_fds[i * 2usize + 1usize];
+        const report_read: i32 = report_fds[i * 2usize];
+        const report_write: i32 = report_fds[i * 2usize + 1usize];
+        if launch_read >= 0 { _ = close(launch_read); launch_fds[i * 2usize] = 0 - 1; }
+        if launch_write >= 0 {
+            const aborted: !void = pipeline_write_control_token(launch_write, 65 as byte);
+            _ = aborted catch {};
+            _ = close(launch_write);
+            launch_fds[i * 2usize + 1usize] = 0 - 1;
+        }
+        if report_read >= 0 { _ = close(report_read); report_fds[i * 2usize] = 0 - 1; }
+        if report_write >= 0 { _ = close(report_write); report_fds[i * 2usize + 1usize] = 0 - 1; }
+        i = i + 1usize;
+    }
+}
+
+fn pipeline_open_retry(path: &const byte, flags: i32, mode: i32) !i32 {
+    while true {
+        const opened: !i32 = sys_open(path, flags, mode);
+        const fd: i32 = opened catch |err| {
+            if @error_id(err) as i32 == EINTR { continue; }
+            return error.PipelineIoError;
+        };
+        return fd;
+    }
+}
+
+fn pipeline_fd_above_stdio(fd: &i32) !void {
+    if fd == null || fd[0] < 0 { return error.PipelineIoError; }
+    if fd[0] > 2 { return; }
+    const duplicated: !i32 = sys_fcntl(fd[0], F_DUPFD_CLOEXEC, 3);
+    const moved: i32 = duplicated catch { return error.PipelineIoError; };
+    _ = close(fd[0]);
+    fd[0] = moved;
+}
+
+fn pipeline_pipe_above_stdio(fds: &i32) !void {
+    if fds == null { return error.PipelineIoError; }
+    try pipeline_fd_above_stdio(&fds[0]);
+    try pipeline_fd_above_stdio(&fds[1]);
+}
+
+fn pipeline_write_control_token(fd: i32, token: byte) !void {
+    var pipe_set: sigset_t = sigset_t {};
+    var old_set: sigset_t = sigset_t {};
+    var pending_before: sigset_t = sigset_t {};
+    if sigemptyset(&pipe_set) != 0 || sigaddset(&pipe_set, SIGPIPE) != 0 ||
+        pthread_sigmask(SIG_BLOCK, &pipe_set, &old_set) != 0 || sigpending(&pending_before) != 0 {
+        return error.PipelineIoError;
+    }
+    var write_error: i32 = 0;
+    while true {
+        const written: !isize = sys_write(fd, &token, 1usize);
+        const count: isize = written catch |err| {
+            const error_id: i32 = @error_id(err) as i32;
+            if error_id == EINTR { continue; }
+            write_error = error_id;
+            break;
+        };
+        if count == 1isize { break; }
+        write_error = EPIPE;
+        break;
+    }
+    var pending_after: sigset_t = sigset_t {};
+    if sigpending(&pending_after) == 0 && sigismember(&pending_before, SIGPIPE) == 0 &&
+        sigismember(&pending_after, SIGPIPE) == 1 {
+        var consumed: i32 = 0;
+        _ = sigwait(&pipe_set, &consumed);
+    }
+    if pthread_sigmask(SIG_SETMASK, &old_set, null as &sigset_t) != 0 {
+        return error.PipelineIoError;
+    }
+    if write_error != 0 { return error.PipelineIoError; }
+}
+
+fn pipeline_write_all_bytes(fd: i32, input: &const byte, count: usize) !void {
+    var offset: usize = 0usize;
+    while offset < count {
+        const written: i64 = write(fd, &input[offset], count - offset);
+        if written < 0i64 {
+            if pipeline_errno_value() == EINTR { continue; }
+            return error.PipelineIoError;
+        }
+        if written == 0i64 { return error.PipelineIoError; }
+        offset = offset + written as usize;
+    }
+}
+
+fn pipeline_errno_value() i32 {
+    const location: &i32 = __errno_location();
+    if location == null { return 0; }
+    return location[0];
+}
+
+fn pipeline_child_clear_cloexec(fd: i32) i32 {
+    const changed: !i32 = sys_fcntl(fd, F_SETFD, 0);
+    return changed catch { return 0 - 1; };
+}
+
+fn pipeline_child_write_startup(fd: i32, kind: i32, phase: i32, platform_code: i32) i32 {
+    const record: PipelineStartupRecord = PipelineStartupRecord {
+        kind: kind, phase: phase, platform_code: platform_code, error_name_offset: 0isize,
+    };
+    if write(fd, &record as &const byte, @size_of(PipelineStartupRecord)) !=
+        @size_of(PipelineStartupRecord) as i64 { return 0 - 1; }
+    return 0;
+}
+
+fn pipeline_child_write_stage_result(fd: i32, kind: i32, error_name: &const byte) i32 {
+    var error_name_offset: isize = 0isize;
+    if error_name != null {
+        error_name_offset = @usize_from_ptr(error_name as &const void) as isize -
+            uya_pipeline_image_anchor() as isize;
+    }
+    const record: PipelineStartupRecord = PipelineStartupRecord {
+        kind: kind, phase: 0, platform_code: 0, error_name_offset: error_name_offset,
+    };
+    if write(fd, &record as &const byte, @size_of(PipelineStartupRecord)) !=
+        @size_of(PipelineStartupRecord) as i64 { return 0 - 1; }
+    return 0;
+}
+
+fn pipeline_worker_arg_matches(value: &const byte) bool {
+    const expected: &const byte = "--uya-pipeline-worker";
+    if value == null { return false; }
+    var i: usize = 0usize;
+    while expected[i] != 0 as byte && value[i] == expected[i] { i = i + 1usize; }
+    return expected[i] == 0 as byte && value[i] == 0 as byte;
+}
+
+/// 隔离 Uya-stage worker 的进程入口；由生成的弱 main bridge 在普通用户代码前调用。
+/// 参数：无；descriptor/report 使用 executor 保留的固定 fd。
+/// 返回：非 worker 进程返回 -1；worker 返回稳定进程退出码。
+export extern "libc" fn uya_pipeline_worker_main_if_requested() i32 {
+    if get_argc() != 2 || !pipeline_worker_arg_matches(get_argv(1)) { return 0 - 1; }
+    var descriptor_storage: [byte: 32] = [];
+    if @size_of(PipelineWorkerDescriptor) > 32usize { return 122; }
+    const descriptor: &PipelineWorkerDescriptor =
+        &descriptor_storage[0] as &PipelineWorkerDescriptor;
+    var received: usize = 0usize;
+    while received < @size_of(PipelineWorkerDescriptor) {
+        const target: &byte = @ptr_from_usize(
+            @usize_from_ptr(descriptor as &void) + received) as &byte;
+        const count: i64 = read(PIPELINE_WORKER_DESCRIPTOR_FD, target,
+            @size_of(PipelineWorkerDescriptor) - received);
+        if count <= 0i64 { return 122; }
+        received = received + count as usize;
+    }
+    var worker_interface_storage: [byte: 16] = [];
+    const worker_value: &PipelineStage =
+        &worker_interface_storage[0] as &PipelineStage;
+    const worker_vtable: usize = (uya_pipeline_image_anchor() as isize +
+        descriptor.worker_vtable_offset) as usize;
+    uya_interface_set_vtable(worker_value as &void, worker_vtable);
+    uya_interface_set_data(worker_value as &void, &descriptor.value_byte as &void);
+    var input: StreamReader = StreamReader { _fd: 0 };
+    var output: StreamWriter = StreamWriter { _fd: 1 };
+    const ran: !void = worker_value[0].run(&input, &output);
+    _ = ran catch |err| {
+        if pipeline_child_write_stage_result(PIPELINE_WORKER_REPORT_FD,
+            PIPELINE_STAGE_FAILED, @error_name(err)) != 0 { return 122; }
+        return 100;
+    };
+    {
+        if pipeline_child_write_stage_result(PIPELINE_WORKER_REPORT_FD,
+            PIPELINE_STAGE_COMPLETED, null) != 0 { return 122; }
+        return 0;
+    }
+}
+
+fn pipeline_child_fail_startup(fd: i32, phase: i32, platform_code: i32) void {
+    _ = pipeline_child_write_startup(fd, PIPELINE_STARTUP_FAILED, phase, platform_code);
+    _exit(123);
+}
+
+fn pipeline_read_startup_record(fd: i32, record: &PipelineStartupRecord) !i32 {
+    if record == null { return error.PipelineIoError; }
+    var received: usize = 0usize;
+    while received < @size_of(PipelineStartupRecord) {
+        const target: &byte = @ptr_from_usize(@usize_from_ptr(record as &void) + received) as &byte;
+        const read_count: i64 = read(fd, target, @size_of(PipelineStartupRecord) - received);
+        if read_count == 0i64 {
+            if received == 0usize { return 0; }
+            return error.PipelineIoError;
+        }
+        if read_count < 0i64 {
+            if pipeline_errno_value() == EINTR { continue; }
+            return error.PipelineIoError;
+        }
+        received = received + read_count as usize;
+    }
+    return 1;
+}
+
+fn pipeline_spawn_failure_for_phase(phase: i32) PipelineSpawnFailureKind {
+    if phase == PIPELINE_PHASE_SIGNAL_SETUP || phase == PIPELINE_PHASE_SETPGID ||
+        phase == PIPELINE_PHASE_BARRIER { return PipelineSpawnFailureKind.execution_domain_failed; }
+    if phase == PIPELINE_PHASE_CHDIR { return PipelineSpawnFailureKind.cwd_unavailable; }
+    if phase == PIPELINE_PHASE_STDIN || phase == PIPELINE_PHASE_STDOUT ||
+        phase == PIPELINE_PHASE_STDERR { return PipelineSpawnFailureKind.stdio_setup_failed; }
+    if phase == PIPELINE_PHASE_EXEC { return PipelineSpawnFailureKind.exec_failed; }
+    return PipelineSpawnFailureKind.platform_error;
+}
+
+fn pipeline_parent_child_only_fds_closed(pipe_fds: &i32, pipe_fd_count: usize,
+    launch_fds: &i32, report_fds: &i32, stage_count: usize,
+    stdin_fd: i32, stdout_fd: i32, stderr_fd: i32,
+    stdout_capture_writer: i32, stderr_capture_writer: i32) bool {
+    var i: usize = 0usize;
+    while i < pipe_fd_count {
+        if pipe_fds[i] >= 0 { return false; }
+        i = i + 1usize;
+    }
+    i = 0usize;
+    while i < stage_count {
+        if launch_fds[i * 2usize] >= 0 || report_fds[i * 2usize + 1usize] >= 0 { return false; }
+        i = i + 1usize;
+    }
+    return stdin_fd < 0 && stdout_fd < 0 && stderr_fd < 0 &&
+        stdout_capture_writer < 0 && stderr_capture_writer < 0;
+}
+
+fn pipeline_tcsetpgrp(fd: i32, pgid: i32) !void {
+    var signal_set: sigset_t = sigset_t {};
+    var old_set: sigset_t = sigset_t {};
+    if sigemptyset(&signal_set) != 0 || sigaddset(&signal_set, SIGTTOU) != 0 ||
+        pthread_sigmask(SIG_BLOCK, &signal_set, &old_set) != 0 {
+        return error.PipelineIoError;
+    }
+    const changed: i32 = tcsetpgrp(fd, pgid);
+    const restored: i32 = pthread_sigmask(SIG_SETMASK, &old_set, null as &sigset_t);
+    if changed != 0 || restored != 0 { return error.PipelineIoError; }
+}
+
+fn pipeline_terminal_handoff_allowed(terminal_pgid: i32, executor_pgid: i32) bool {
+    return terminal_pgid > 0 && terminal_pgid == executor_pgid;
+}
+
+fn pipeline_prepare_process_stage(snapshot: &PipelineCwdSnapshot, stage: &PipelineProcessStage,
+    status: &PipelineStageStatus) !PipelinePreparedProcessStage {
+    var prepared: PipelinePreparedProcessStage = PipelinePreparedProcessStage {
+        argv: null as &&byte,
+        envp: null as &&byte,
+        cwd: null as &byte,
+        exec_path: null as &byte,
+    };
+    if snapshot == null || stage == null || status == null || stage.active == 0 ||
+        stage.argv == null || stage.argv_count == 0usize {
+        return error.InvalidPipeline;
+    }
+    const argv_result: !&&byte = pipeline_copy_c_string_vector(stage.argv as &&const byte, stage.argv_count);
+    prepared.argv = argv_result catch { return error.InvalidPipeline; };
+    const cwd_result: !&byte = pipeline_final_stage_cwd(snapshot, stage);
+    prepared.cwd = cwd_result catch {
+        pipeline_prepared_stage_deinit(&prepared);
+        status.kind = PipelineStageStatusKind.spawn_failed;
+        status.spawn_failure = PipelineSpawnFailureKind.cwd_unavailable;
+        return error.PipelineSpawnFailed;
+    };
+    var cwd_stat: Stat = Stat {};
+    const cwd_stat_result: !i32 = sys_stat(prepared.cwd, &cwd_stat);
+    const cwd_stat_code: i32 = cwd_stat_result catch {
+        pipeline_prepared_stage_deinit(&prepared);
+        status.kind = PipelineStageStatusKind.spawn_failed;
+        status.spawn_failure = PipelineSpawnFailureKind.cwd_unavailable;
+        return error.PipelineSpawnFailed;
+    };
+    if cwd_stat_code != 0 || (cwd_stat.st_mode as u32 & 61440u32) != 16384u32 ||
+        access(prepared.cwd, X_OK) != 0 {
+        pipeline_prepared_stage_deinit(&prepared);
+        status.kind = PipelineStageStatusKind.spawn_failed;
+        status.spawn_failure = PipelineSpawnFailureKind.cwd_unavailable;
+        return error.PipelineSpawnFailed;
+    }
+    var env_allocator: PipelineEnvAllocator = PipelineEnvAllocator { inner: get_allocator() };
+    var env_builder: EnvBlockBuilder = env_block_builder_new(env_allocator);
+    env_builder.inherit_current();
+    const applied: !void = pipeline_apply_stage_env(stage, &env_builder);
+    _ = applied catch { pipeline_prepared_stage_deinit(&prepared); return error.InvalidPipeline; };
+    const built: !void = env_builder.build();
+    _ = built catch { pipeline_prepared_stage_deinit(&prepared); return error.InvalidPipeline; };
+    const source_envp: &(&const byte) = env_builder.envp();
+    var env_count: usize = 0usize;
+    while source_envp[env_count] != null { env_count = env_count + 1usize; }
+    const env_result: !&&byte = pipeline_copy_c_string_vector(source_envp as &&const byte, env_count);
+    prepared.envp = env_result catch { pipeline_prepared_stage_deinit(&prepared); return error.InvalidPipeline; };
+    if stage.command_kind == 1 {
+        var resolved: [byte: 4096] = [];
+        const lookup: ExecutableLookupKind = pipeline_resolve_command_path(&env_builder,
+            prepared.cwd, prepared.argv[0], &resolved[0], 4096usize);
+        if lookup != ExecutableLookupKind.found {
+            status.kind = PipelineStageStatusKind.spawn_failed;
+            status.spawn_failure = pipeline_lookup_spawn_failure(lookup);
+            pipeline_prepared_stage_deinit(&prepared);
+            return error.PipelineSpawnFailed;
+        }
+        const path_result: !&byte = pipeline_owned_c_string(&resolved[0]);
+        prepared.exec_path = path_result catch { pipeline_prepared_stage_deinit(&prepared); return error.InvalidPipeline; };
+    } else if stage.command_kind == 2 {
+        const path_result: !&byte = pipeline_owned_c_string(prepared.argv[0]);
+        prepared.exec_path = path_result catch { pipeline_prepared_stage_deinit(&prepared); return error.InvalidPipeline; };
+    } else {
+        pipeline_prepared_stage_deinit(&prepared);
+        return error.InvalidPipeline;
+    }
+    return prepared;
+}
+
+fn pipeline_execute_basic(input: &Pipeline, statuses: &[PipelineStageStatus], result: &PipelineResult,
+    checked: bool, capture: &PipelineCaptureExecution) !void {
+    const count: usize = try pipeline_prepare_status_buffer(input, statuses, result);
+    if count == 0usize || count > PIPELINE_MAX_STAGES { return error.InvalidPipeline; }
+    const slot_idx: usize = try pipeline_registry_slot_index(input);
+    if slot_idx >= PIPELINE_REGISTRY_CAPACITY { return error.InvalidPipeline; }
+    var foreground_fd: i32 = 0 - 1;
+    var saved_foreground_pgid: i32 = 0 - 1;
+    var foreground_handed_off: bool = false;
+    var broker_registered: bool = false;
+    var terminal_lease: usize = 16usize;
+    var broker_signal_epoch: i32 = 0;
+    var sink_thread_mask: sigset_t = sigset_t {};
+    if pthread_sigmask(SIG_SETMASK, null as &const sigset_t, &sink_thread_mask) != 0 {
+        return error.PipelineIoError;
+    }
+    defer {
+        if foreground_handed_off && foreground_fd >= 0 && saved_foreground_pgid > 0 {
+            const restored: !void = pipeline_tcsetpgrp(foreground_fd, saved_foreground_pgid);
+            _ = restored catch {};
+        }
+        if terminal_lease < 16usize { pipeline_terminal_lease_release(terminal_lease); }
+        if broker_registered { pipeline_broker_unsubscribe(); }
+    }
+    var cwd_snapshot: PipelineCwdSnapshot = try pipeline_cwd_snapshot_capture();
+    defer { pipeline_cwd_snapshot_deinit(&cwd_snapshot); }
+    var prepared_stages: [PipelinePreparedProcessStage: 32] = [];
+    var prepared_count: usize = 0usize;
+    var has_uya_stage: bool = false;
+    var use_experimental_fork_stage: bool = false;
+    defer { pipeline_prepared_stages_deinit(&prepared_stages[0], prepared_count); }
+    var i: usize = 0usize;
+    while i < count {
+        const storage_idx: usize = try pipeline_stage_storage_index(slot_idx, i);
+        if storage_idx >= PIPELINE_STAGE_STORAGE_CAPACITY { return error.InvalidPipeline; }
+        const stage: &PipelineProcessStage = &_pipeline_process_stages[storage_idx];
+        if stage.command_kind == 3 {
+            if stage.active == 0 || _pipeline_erased_stages[storage_idx].active == 0 {
+                return error.InvalidPipeline;
+            }
+            has_uya_stage = true;
+        } else {
+            prepared_stages[i] = try pipeline_prepare_process_stage(&cwd_snapshot, stage, &statuses[i]);
+        }
+        prepared_count = prepared_count + 1usize;
+        i = i + 1usize;
+    }
+    if has_uya_stage {
+        use_experimental_fork_stage = __atomic_exchange_n(
+            (&_pipeline_test_allow_next_fork_stage) as &i32, 0,
+            PIPELINE_ATOMIC_SEQ_CST) != 0;
+    }
+    try pipeline_broker_subscribe();
+    broker_registered = true;
+    broker_signal_epoch = __atomic_load_n((&_pipeline_broker_signal_epoch) as &i32,
+        PIPELINE_ATOMIC_SEQ_CST);
+    const policy: &PipelineStreamPolicy = &_pipeline_stream_policies[slot_idx];
+    if policy.stdin_kind == PipelineStdinPolicyKind.inherit &&
+        policy.stdout_kind == PipelineStdoutPolicyKind.inherit &&
+        policy.stderr_kind == PipelineStderrPolicyKind.inherit {
+        if isatty(0) != 0 { foreground_fd = 0; }
+        else if isatty(1) != 0 { foreground_fd = 1; }
+        else if isatty(2) != 0 { foreground_fd = 2; }
+        if foreground_fd >= 0 {
+            terminal_lease = try pipeline_terminal_lease_acquire(foreground_fd);
+            const terminal_pgid: i32 = tcgetpgrp(foreground_fd);
+            if terminal_pgid <= 0 { return error.PipelineIoError; }
+            if pipeline_terminal_handoff_allowed(terminal_pgid, getpgrp()) {
+                saved_foreground_pgid = terminal_pgid;
+            }
+        }
+    }
+    var stdout_capture_fds: [i32: 2] = [0 - 1, 0 - 1];
+    var stderr_capture_fds: [i32: 2] = [0 - 1, 0 - 1];
+    if capture != null && capture.capture_stdout {
+        const capture_pipe: !i32 = sys_pipe2(&stdout_capture_fds[0], O_CLOEXEC);
+        _ = capture_pipe catch {
+            return error.PipelineIoError;
+        };
+        try pipeline_pipe_above_stdio(&stdout_capture_fds[0]);
+    }
+    if capture != null && capture.capture_stderr {
+        const capture_pipe: !i32 = sys_pipe2(&stderr_capture_fds[0], O_CLOEXEC);
+        _ = capture_pipe catch {
+            if stdout_capture_fds[0] >= 0 { _ = close(stdout_capture_fds[0]); _ = close(stdout_capture_fds[1]); }
+            return error.PipelineIoError;
+        };
+        try pipeline_pipe_above_stdio(&stderr_capture_fds[0]);
+    }
+    var pipe_fds: [i32: 62] = [];
+    var pipe_count: usize = 0usize;
+    while pipe_count + 1usize < count {
+        const pipe_result: !i32 = sys_pipe2(&pipe_fds[pipe_count * 2usize], O_CLOEXEC);
+        _ = pipe_result catch {
+            var pc: usize = 0usize;
+            while pc < pipe_count * 2usize { _ = close(pipe_fds[pc]); pc = pc + 1usize; }
+            if stdout_capture_fds[0] >= 0 { _ = close(stdout_capture_fds[0]); _ = close(stdout_capture_fds[1]); }
+            if stderr_capture_fds[0] >= 0 { _ = close(stderr_capture_fds[0]); _ = close(stderr_capture_fds[1]); }
+            return error.PipelineIoError;
+        };
+        try pipeline_pipe_above_stdio(&pipe_fds[pipe_count * 2usize]);
+        pipe_count = pipe_count + 1usize;
+    }
+    var launch_fds: [i32: 64] = [];
+    var report_fds: [i32: 64] = [];
+    var control_count: usize = 0usize;
+    while control_count < count {
+        const launch_result: !i32 = sys_pipe2(&launch_fds[control_count * 2usize], O_CLOEXEC);
+        _ = launch_result catch {
+            var ci: usize = 0usize;
+            while ci < control_count {
+                _ = close(launch_fds[ci * 2usize]); _ = close(launch_fds[ci * 2usize + 1usize]);
+                _ = close(report_fds[ci * 2usize]); _ = close(report_fds[ci * 2usize + 1usize]);
+                ci = ci + 1usize;
+            }
+            var pc: usize = 0usize;
+            while pc < pipe_count * 2usize { _ = close(pipe_fds[pc]); pc = pc + 1usize; }
+            if stdout_capture_fds[0] >= 0 { _ = close(stdout_capture_fds[0]); _ = close(stdout_capture_fds[1]); }
+            if stderr_capture_fds[0] >= 0 { _ = close(stderr_capture_fds[0]); _ = close(stderr_capture_fds[1]); }
+            return error.PipelineIoError;
+        };
+        try pipeline_pipe_above_stdio(&launch_fds[control_count * 2usize]);
+        const report_result: !i32 = sys_pipe2(&report_fds[control_count * 2usize], O_CLOEXEC);
+        _ = report_result catch {
+            _ = close(launch_fds[control_count * 2usize]);
+            _ = close(launch_fds[control_count * 2usize + 1usize]);
+            var ci: usize = 0usize;
+            while ci < control_count {
+                _ = close(launch_fds[ci * 2usize]); _ = close(launch_fds[ci * 2usize + 1usize]);
+                _ = close(report_fds[ci * 2usize]); _ = close(report_fds[ci * 2usize + 1usize]);
+                ci = ci + 1usize;
+            }
+            var pc: usize = 0usize;
+            while pc < pipe_count * 2usize { _ = close(pipe_fds[pc]); pc = pc + 1usize; }
+            if stdout_capture_fds[0] >= 0 { _ = close(stdout_capture_fds[0]); _ = close(stdout_capture_fds[1]); }
+            if stderr_capture_fds[0] >= 0 { _ = close(stderr_capture_fds[0]); _ = close(stderr_capture_fds[1]); }
+            return error.PipelineIoError;
+        };
+        try pipeline_pipe_above_stdio(&report_fds[control_count * 2usize]);
+        control_count = control_count + 1usize;
+    }
+    var stdin_fd: i32 = 0 - 1;
+    var stdout_fd: i32 = 0 - 1;
+    var stderr_fd: i32 = 0 - 1;
+    if _pipeline_stream_policies[slot_idx].stdin_kind == PipelineStdinPolicyKind.file {
+        const path: &byte = try pipeline_resolve_sink_path(&cwd_snapshot, null,
+            _pipeline_stream_policies[slot_idx].stdin_path);
+        const opened: !i32 = pipeline_open_retry(path, (O_RDONLY | O_CLOEXEC) as i32, 0);
+        stdin_fd = opened catch {
+            free(path as &void);
+            var pc: usize = 0usize;
+            while pc < pipe_count * 2usize { _ = close(pipe_fds[pc]); pc = pc + 1usize; }
+            if stdout_capture_fds[0] >= 0 { _ = close(stdout_capture_fds[0]); _ = close(stdout_capture_fds[1]); }
+            if stderr_capture_fds[0] >= 0 { _ = close(stderr_capture_fds[0]); _ = close(stderr_capture_fds[1]); }
+            return error.PipelineIoError;
+        };
+        try pipeline_fd_above_stdio(&stdin_fd);
+        free(path as &void);
+    }
+    if _pipeline_stream_policies[slot_idx].stdout_kind == PipelineStdoutPolicyKind.file {
+        const path: &byte = try pipeline_resolve_sink_path(&cwd_snapshot, null,
+            _pipeline_stream_policies[slot_idx].stdout_path);
+        const opened: !i32 = pipeline_open_retry(path,
+            (O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC) as i32, 438);
+        stdout_fd = opened catch {
+            free(path as &void);
+            var pc: usize = 0usize;
+            while pc < pipe_count * 2usize { _ = close(pipe_fds[pc]); pc = pc + 1usize; }
+            if stdin_fd >= 0 { _ = close(stdin_fd); }
+            if stdout_capture_fds[0] >= 0 { _ = close(stdout_capture_fds[0]); _ = close(stdout_capture_fds[1]); }
+            if stderr_capture_fds[0] >= 0 { _ = close(stderr_capture_fds[0]); _ = close(stderr_capture_fds[1]); }
+            return error.PipelineIoError;
+        };
+        try pipeline_fd_above_stdio(&stdout_fd);
+        free(path as &void);
+    }
+    if _pipeline_stream_policies[slot_idx].stderr_kind == PipelineStderrPolicyKind.file {
+        const path: &byte = try pipeline_resolve_sink_path(&cwd_snapshot, null,
+            _pipeline_stream_policies[slot_idx].stderr_path);
+        const opened: !i32 = pipeline_open_retry(path,
+            (O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC) as i32, 438);
+        stderr_fd = opened catch {
+            free(path as &void);
+            var pc: usize = 0usize;
+            while pc < pipe_count * 2usize { _ = close(pipe_fds[pc]); pc = pc + 1usize; }
+            if stdin_fd >= 0 { _ = close(stdin_fd); }
+            if stdout_fd >= 0 { _ = close(stdout_fd); }
+            if stdout_capture_fds[0] >= 0 { _ = close(stdout_capture_fds[0]); _ = close(stdout_capture_fds[1]); }
+            if stderr_capture_fds[0] >= 0 { _ = close(stderr_capture_fds[0]); _ = close(stderr_capture_fds[1]); }
+            return error.PipelineIoError;
+        };
+        try pipeline_fd_above_stdio(&stderr_fd);
+        free(path as &void);
+    }
+    var pids: [i32: 32] = [];
+    var pipeline_pgid: i32 = 0;
+    i = 0usize;
+    while i < count {
+        const storage_idx: usize = try pipeline_stage_storage_index(slot_idx, i);
+        if storage_idx >= PIPELINE_STAGE_STORAGE_CAPACITY { return error.InvalidPipeline; }
+        const plan_stage: &PipelineProcessStage = &_pipeline_process_stages[storage_idx];
+        const is_uya_stage: bool = plan_stage.command_kind == 3;
+        const stage: &PipelinePreparedProcessStage = &prepared_stages[i];
+        var pid: i32 = 0 - 1;
+        if __atomic_exchange_n((&_pipeline_test_fail_next_fork) as &i32, 0,
+            PIPELINE_ATOMIC_SEQ_CST) == 0 { pid = fork(); }
+        if pid < 0 {
+            statuses[i].kind = PipelineStageStatusKind.spawn_failed;
+            statuses[i].spawn_failure = PipelineSpawnFailureKind.process_create_failed;
+            var pc: usize = 0usize;
+            while pc < pipe_count * 2usize { _ = close(pipe_fds[pc]); pc = pc + 1usize; }
+            if stdin_fd >= 0 { _ = close(stdin_fd); }
+            if stdout_fd >= 0 { _ = close(stdout_fd); }
+            if stderr_fd >= 0 { _ = close(stderr_fd); }
+            if stdout_capture_fds[0] >= 0 { _ = close(stdout_capture_fds[0]); _ = close(stdout_capture_fds[1]); }
+            if stderr_capture_fds[0] >= 0 { _ = close(stderr_capture_fds[0]); _ = close(stderr_capture_fds[1]); }
+            pipeline_abort_launches(&launch_fds[0], &report_fds[0], count);
+            pipeline_cancel_started_group(pipeline_pgid, &pids[0], i);
+            return error.PipelineSpawnFailed;
+        }
+        if pid == 0 {
+            if pipeline_child_signal_setup(&sink_thread_mask) != 0 {
+                pipeline_child_fail_startup(report_fds[i * 2usize + 1usize],
+                    PIPELINE_PHASE_SIGNAL_SETUP, pipeline_errno_value());
+            }
+            const child_pgid: i32 = pipeline_pgid;
+            if setpgid(0, child_pgid) != 0 {
+                pipeline_child_fail_startup(report_fds[i * 2usize + 1usize],
+                    PIPELINE_PHASE_SETPGID, pipeline_errno_value());
+            }
+            var ci: usize = 0usize;
+            while ci < count {
+                _ = close(launch_fds[ci * 2usize + 1usize]);
+                _ = close(report_fds[ci * 2usize]);
+                if ci != i {
+                    _ = close(launch_fds[ci * 2usize]);
+                    _ = close(report_fds[ci * 2usize + 1usize]);
+                }
+                ci = ci + 1usize;
+            }
+            if i > 0usize && dup2(pipe_fds[(i - 1usize) * 2usize], 0) < 0 {
+                pipeline_child_fail_startup(report_fds[i * 2usize + 1usize], PIPELINE_PHASE_STDIN, pipeline_errno_value());
+            }
+            if i + 1usize < count && dup2(pipe_fds[i * 2usize + 1usize], 1) < 0 {
+                pipeline_child_fail_startup(report_fds[i * 2usize + 1usize], PIPELINE_PHASE_STDOUT, pipeline_errno_value());
+            }
+            if i == 0usize && stdin_fd >= 0 && dup2(stdin_fd, 0) < 0 {
+                pipeline_child_fail_startup(report_fds[i * 2usize + 1usize], PIPELINE_PHASE_STDIN, pipeline_errno_value());
+            }
+            if i + 1usize == count && stdout_fd >= 0 && dup2(stdout_fd, 1) < 0 {
+                pipeline_child_fail_startup(report_fds[i * 2usize + 1usize], PIPELINE_PHASE_STDOUT, pipeline_errno_value());
+            }
+            if i + 1usize == count && stdout_capture_fds[1] >= 0 && dup2(stdout_capture_fds[1], 1) < 0 {
+                pipeline_child_fail_startup(report_fds[i * 2usize + 1usize], PIPELINE_PHASE_STDOUT, pipeline_errno_value());
+            }
+            if stderr_fd >= 0 && dup2(stderr_fd, 2) < 0 {
+                pipeline_child_fail_startup(report_fds[i * 2usize + 1usize], PIPELINE_PHASE_STDERR, pipeline_errno_value());
+            }
+            if stderr_capture_fds[1] >= 0 && dup2(stderr_capture_fds[1], 2) < 0 {
+                pipeline_child_fail_startup(report_fds[i * 2usize + 1usize], PIPELINE_PHASE_STDERR, pipeline_errno_value());
+            }
+            if _pipeline_stream_policies[slot_idx].stderr_kind == PipelineStderrPolicyKind.merge_stdout &&
+                dup2(1, 2) < 0 {
+                pipeline_child_fail_startup(report_fds[i * 2usize + 1usize], PIPELINE_PHASE_STDERR, pipeline_errno_value());
+            }
+            var pc: usize = 0usize;
+            while pc < pipe_count * 2usize { _ = close(pipe_fds[pc]); pc = pc + 1usize; }
+            if stdin_fd >= 0 { _ = close(stdin_fd); }
+            if stdout_fd >= 0 { _ = close(stdout_fd); }
+            if stderr_fd >= 0 { _ = close(stderr_fd); }
+            if stdout_capture_fds[0] >= 0 { _ = close(stdout_capture_fds[0]); _ = close(stdout_capture_fds[1]); }
+            if stderr_capture_fds[0] >= 0 { _ = close(stderr_capture_fds[0]); _ = close(stderr_capture_fds[1]); }
+            if pipeline_child_write_startup(report_fds[i * 2usize + 1usize],
+                PIPELINE_STARTUP_READY, 0, 0) != 0 { _exit(123); }
+            var launch: byte = 0 as byte;
+            if read(launch_fds[i * 2usize], &launch, 1usize) != 1i64 || launch != 71 as byte {
+                pipeline_child_fail_startup(report_fds[i * 2usize + 1usize],
+                    PIPELINE_PHASE_BARRIER, pipeline_errno_value());
+            }
+            if is_uya_stage {
+                if !use_experimental_fork_stage {
+                    if dup2(launch_fds[i * 2usize], PIPELINE_WORKER_DESCRIPTOR_FD) < 0 ||
+                        dup2(report_fds[i * 2usize + 1usize], PIPELINE_WORKER_REPORT_FD) < 0 ||
+                        pipeline_child_clear_cloexec(PIPELINE_WORKER_DESCRIPTOR_FD) < 0 ||
+                        pipeline_child_clear_cloexec(PIPELINE_WORKER_REPORT_FD) < 0 {
+                        pipeline_child_fail_startup(report_fds[i * 2usize + 1usize],
+                            PIPELINE_PHASE_EXEC, pipeline_errno_value());
+                    }
+                    _ = close(launch_fds[i * 2usize]);
+                    var worker_argv: [&byte: 3] = ["/proc/self/exe", "--uya-pipeline-worker", null];
+                    _ = execve("/proc/self/exe", &worker_argv[0], saved_envp);
+                    pipeline_child_fail_startup(report_fds[i * 2usize + 1usize],
+                        PIPELINE_PHASE_EXEC, pipeline_errno_value());
+                }
+                _ = close(launch_fds[i * 2usize]);
+                var input_stream: StreamReader = StreamReader { _fd: 0 };
+                var output_stream: StreamWriter = StreamWriter { _fd: 1 };
+                const ran: !void = _pipeline_erased_stages[storage_idx].ops.run_erased(
+                    &input_stream, &output_stream);
+                _ = ran catch |err| {
+                    _ = pipeline_child_write_stage_result(report_fds[i * 2usize + 1usize],
+                        PIPELINE_STAGE_FAILED, @error_name(err));
+                    _exit(100);
+                };
+                _ = pipeline_child_write_stage_result(report_fds[i * 2usize + 1usize],
+                    PIPELINE_STAGE_COMPLETED, null);
+                _exit(0);
+            }
+            _ = close(launch_fds[i * 2usize]);
+            if chdir(stage.cwd) != 0 {
+                pipeline_child_fail_startup(report_fds[i * 2usize + 1usize],
+                    PIPELINE_PHASE_CHDIR, pipeline_errno_value());
+            }
+            _ = execve(stage.exec_path, stage.argv, stage.envp);
+            pipeline_child_fail_startup(report_fds[i * 2usize + 1usize],
+                PIPELINE_PHASE_EXEC, pipeline_errno_value());
+        }
+        if pipeline_pgid == 0 { pipeline_pgid = pid; }
+        if setpgid(pid, pipeline_pgid) != 0 {
+            pids[i] = pid;
+            var failed_pc: usize = 0usize;
+            while failed_pc < pipe_count * 2usize { _ = close(pipe_fds[failed_pc]); failed_pc = failed_pc + 1usize; }
+            if stdin_fd >= 0 { _ = close(stdin_fd); }
+            if stdout_fd >= 0 { _ = close(stdout_fd); }
+            if stderr_fd >= 0 { _ = close(stderr_fd); }
+            if stdout_capture_fds[0] >= 0 { _ = close(stdout_capture_fds[0]); _ = close(stdout_capture_fds[1]); }
+            if stderr_capture_fds[0] >= 0 { _ = close(stderr_capture_fds[0]); _ = close(stderr_capture_fds[1]); }
+            pipeline_abort_launches(&launch_fds[0], &report_fds[0], count);
+            pipeline_cancel_started_group(pipeline_pgid, &pids[0], i + 1usize);
+            return error.PipelineSpawnFailed;
+        }
+        pids[i] = pid;
+        _ = close(launch_fds[i * 2usize]);
+        launch_fds[i * 2usize] = 0 - 1;
+        _ = close(report_fds[i * 2usize + 1usize]);
+        report_fds[i * 2usize + 1usize] = 0 - 1;
+        i = i + 1usize;
+    }
+    var pc: usize = 0usize;
+    while pc < pipe_count * 2usize {
+        _ = close(pipe_fds[pc]);
+        pipe_fds[pc] = 0 - 1;
+        pc = pc + 1usize;
+    }
+    if stdin_fd >= 0 { _ = close(stdin_fd); stdin_fd = 0 - 1; }
+    if stdout_fd >= 0 { _ = close(stdout_fd); stdout_fd = 0 - 1; }
+    if stderr_fd >= 0 { _ = close(stderr_fd); stderr_fd = 0 - 1; }
+    if stdout_capture_fds[1] >= 0 { _ = close(stdout_capture_fds[1]); stdout_capture_fds[1] = 0 - 1; }
+    if stderr_capture_fds[1] >= 0 { _ = close(stderr_capture_fds[1]); stderr_capture_fds[1] = 0 - 1; }
+    i = 0usize;
+    while i < count {
+        var report: PipelineStartupRecord = PipelineStartupRecord {};
+        const received: !i32 = pipeline_read_startup_record(report_fds[i * 2usize], &report);
+        const record_state: i32 = received catch {
+            pipeline_abort_launches(&launch_fds[0], &report_fds[0], count);
+            pipeline_cancel_started_group(pipeline_pgid, &pids[0], count);
+            if stdout_capture_fds[0] >= 0 { _ = close(stdout_capture_fds[0]); stdout_capture_fds[0] = 0 - 1; }
+            if stderr_capture_fds[0] >= 0 { _ = close(stderr_capture_fds[0]); stderr_capture_fds[0] = 0 - 1; }
+            return error.PipelineIoError;
+        };
+        if record_state != 1 || report.kind != PIPELINE_STARTUP_READY {
+            if record_state == 1 && report.kind == PIPELINE_STARTUP_FAILED {
+                statuses[i].kind = PipelineStageStatusKind.spawn_failed;
+                statuses[i].spawn_failure = pipeline_spawn_failure_for_phase(report.phase);
+                statuses[i].platform_code = report.platform_code as u32;
+            }
+            pipeline_abort_launches(&launch_fds[0], &report_fds[0], count);
+            pipeline_cancel_started_group(pipeline_pgid, &pids[0], count);
+            if stdout_capture_fds[0] >= 0 { _ = close(stdout_capture_fds[0]); stdout_capture_fds[0] = 0 - 1; }
+            if stderr_capture_fds[0] >= 0 { _ = close(stderr_capture_fds[0]); stderr_capture_fds[0] = 0 - 1; }
+            return error.PipelineSpawnFailed;
+        }
+        i = i + 1usize;
+    }
+    if !pipeline_parent_child_only_fds_closed(&pipe_fds[0], pipe_count * 2usize,
+        &launch_fds[0], &report_fds[0], count, stdin_fd, stdout_fd, stderr_fd,
+        stdout_capture_fds[1], stderr_capture_fds[1]) {
+        pipeline_abort_launches(&launch_fds[0], &report_fds[0], count);
+        pipeline_cancel_started_group(pipeline_pgid, &pids[0], count);
+        return error.PipelineIoError;
+    }
+    if foreground_fd >= 0 && saved_foreground_pgid > 0 {
+        const handed: !void = pipeline_tcsetpgrp(foreground_fd, pipeline_pgid);
+        _ = handed catch {
+            if stdout_capture_fds[0] >= 0 { _ = close(stdout_capture_fds[0]); stdout_capture_fds[0] = 0 - 1; }
+            if stderr_capture_fds[0] >= 0 { _ = close(stderr_capture_fds[0]); stderr_capture_fds[0] = 0 - 1; }
+            pipeline_abort_launches(&launch_fds[0], &report_fds[0], count);
+            pipeline_cancel_started_group(pipeline_pgid, &pids[0], count);
+            return error.PipelineIoError;
+        };
+        foreground_handed_off = true;
+    }
+    i = 0usize;
+    while i < count {
+        const sent: !void = pipeline_write_control_token(launch_fds[i * 2usize + 1usize], 71 as byte);
+        _ = sent catch {
+            if stdout_capture_fds[0] >= 0 { _ = close(stdout_capture_fds[0]); stdout_capture_fds[0] = 0 - 1; }
+            if stderr_capture_fds[0] >= 0 { _ = close(stderr_capture_fds[0]); stderr_capture_fds[0] = 0 - 1; }
+            pipeline_abort_launches(&launch_fds[0], &report_fds[0], count);
+            pipeline_cancel_started_group(pipeline_pgid, &pids[0], count);
+            return error.PipelineSpawnFailed;
+        };
+        const storage_idx: usize = try pipeline_stage_storage_index(slot_idx, i);
+        if storage_idx >= PIPELINE_STAGE_STORAGE_CAPACITY { return error.InvalidPipeline; }
+        if _pipeline_process_stages[storage_idx].command_kind == 3 &&
+            !use_experimental_fork_stage {
+            const worker: &PipelineErasedStage = &_pipeline_erased_stages[storage_idx];
+            const descriptor: PipelineWorkerDescriptor = PipelineWorkerDescriptor {
+                worker_vtable_offset: worker.worker_vtable_offset,
+                value_byte: worker.value_byte,
+            };
+            const descriptor_sent: !void = pipeline_write_all_bytes(
+                launch_fds[i * 2usize + 1usize], &descriptor as &const byte,
+                @size_of(PipelineWorkerDescriptor));
+            _ = descriptor_sent catch {
+                pipeline_abort_launches(&launch_fds[0], &report_fds[0], count);
+                pipeline_cancel_started_group(pipeline_pgid, &pids[0], count);
+                return error.PipelineSpawnFailed;
+            };
+        }
+        _ = close(launch_fds[i * 2usize + 1usize]);
+        launch_fds[i * 2usize + 1usize] = 0 - 1;
+        i = i + 1usize;
+    }
+    i = 0usize;
+    while i < count {
+        const storage_idx: usize = try pipeline_stage_storage_index(slot_idx, i);
+        if storage_idx >= PIPELINE_STAGE_STORAGE_CAPACITY { return error.InvalidPipeline; }
+        if _pipeline_process_stages[storage_idx].command_kind == 3 {
+            i = i + 1usize;
+            continue;
+        }
+        var diagnostic: PipelineStartupRecord = PipelineStartupRecord {};
+        const received: !i32 = pipeline_read_startup_record(report_fds[i * 2usize], &diagnostic);
+        const state: i32 = received catch {
+            pipeline_abort_launches(&launch_fds[0], &report_fds[0], count);
+            pipeline_cancel_started_group(pipeline_pgid, &pids[0], count);
+            if stdout_capture_fds[0] >= 0 { _ = close(stdout_capture_fds[0]); stdout_capture_fds[0] = 0 - 1; }
+            if stderr_capture_fds[0] >= 0 { _ = close(stderr_capture_fds[0]); stderr_capture_fds[0] = 0 - 1; }
+            return error.PipelineIoError;
+        };
+        _ = close(report_fds[i * 2usize]);
+        report_fds[i * 2usize] = 0 - 1;
+        if state != 0 {
+            if state == 1 && diagnostic.kind == PIPELINE_STARTUP_FAILED {
+                statuses[i].kind = PipelineStageStatusKind.spawn_failed;
+                statuses[i].spawn_failure = pipeline_spawn_failure_for_phase(diagnostic.phase);
+                statuses[i].platform_code = diagnostic.platform_code as u32;
+            }
+            pipeline_abort_launches(&launch_fds[0], &report_fds[0], count);
+            pipeline_cancel_started_group(pipeline_pgid, &pids[0], count);
+            if stdout_capture_fds[0] >= 0 { _ = close(stdout_capture_fds[0]); stdout_capture_fds[0] = 0 - 1; }
+            if stderr_capture_fds[0] >= 0 { _ = close(stderr_capture_fds[0]); stderr_capture_fds[0] = 0 - 1; }
+            return error.PipelineSpawnFailed;
+        }
+        i = i + 1usize;
+    }
+    var reaped: [bool: 32] = [];
+    var raw_statuses: [i32: 32] = [];
+    var reaped_count: usize = 0usize;
+    if capture != null {
+        var stdout_open: bool = stdout_capture_fds[0] >= 0;
+        var stderr_open: bool = stderr_capture_fds[0] >= 0;
+        while (stdout_open || stderr_open) && reaped_count < count {
+            if pipeline_capture_priority_interrupt(pipeline_pgid, &pids[0], count,
+                &reaped[0], &raw_statuses[0], &reaped_count, &broker_signal_epoch) {
+                if stdout_open { _ = close(stdout_capture_fds[0]); }
+                if stderr_open { _ = close(stderr_capture_fds[0]); }
+                return error.Interrupted;
+            }
+            var poll_fds: [PollFd: 2] = [];
+            var poll_count: usize = 0usize;
+            if stdout_open {
+                poll_fds[poll_count] = PollFd { fd: stdout_capture_fds[0], events: POLLIN | POLLHUP | POLLERR, revents: 0 };
+                poll_count = poll_count + 1usize;
+            }
+            if stderr_open {
+                poll_fds[poll_count] = PollFd { fd: stderr_capture_fds[0], events: POLLIN | POLLHUP | POLLERR, revents: 0 };
+                poll_count = poll_count + 1usize;
+            }
+            const polled: !i32 = sys_poll(&poll_fds[0], poll_count, 50);
+            _ = polled catch {
+                if pipeline_capture_priority_interrupt(pipeline_pgid, &pids[0], count,
+                    &reaped[0], &raw_statuses[0], &reaped_count, &broker_signal_epoch) {
+                    if stdout_open { _ = close(stdout_capture_fds[0]); }
+                    if stderr_open { _ = close(stderr_capture_fds[0]); }
+                    return error.Interrupted;
+                }
+                pipeline_cancel_started_group(pipeline_pgid, &pids[0], count);
+                if stdout_open { _ = close(stdout_capture_fds[0]); }
+                if stderr_open { _ = close(stderr_capture_fds[0]); }
+                return error.PipelineIoError;
+            };
+            if pipeline_capture_priority_interrupt(pipeline_pgid, &pids[0], count,
+                &reaped[0], &raw_statuses[0], &reaped_count, &broker_signal_epoch) {
+                if stdout_open { _ = close(stdout_capture_fds[0]); }
+                if stderr_open { _ = close(stderr_capture_fds[0]); }
+                return error.Interrupted;
+            }
+            var poll_idx: usize = 0usize;
+            if stdout_open {
+                if poll_fds[poll_idx].revents != 0 {
+                    const state: i32 = try pipeline_capture_read(stdout_capture_fds[0], capture.stdout_ptr,
+                        capture.stdout_limit, &capture.stdout_count);
+                    if state == 0 {
+                        capture.stdout_complete = true;
+                        _ = close(stdout_capture_fds[0]);
+                        stdout_open = false;
+                    } else if state == 2 {
+                        _ = close(stdout_capture_fds[0]);
+                        if stderr_open { _ = close(stderr_capture_fds[0]); }
+                        pipeline_cancel_started_group(pipeline_pgid, &pids[0], count);
+                        return error.CaptureLimitExceeded;
+                    }
+                }
+                poll_idx = poll_idx + 1usize;
+            }
+            if stderr_open && poll_fds[poll_idx].revents != 0 {
+                const state: i32 = try pipeline_capture_read(stderr_capture_fds[0], capture.stderr_ptr,
+                    capture.stderr_limit, &capture.stderr_count);
+                if state == 0 {
+                    capture.stderr_complete = true;
+                    _ = close(stderr_capture_fds[0]);
+                    stderr_open = false;
+                } else if state == 2 {
+                    if stdout_open { _ = close(stdout_capture_fds[0]); }
+                    _ = close(stderr_capture_fds[0]);
+                    pipeline_cancel_started_group(pipeline_pgid, &pids[0], count);
+                    return error.CaptureLimitExceeded;
+                }
+            }
+            var child_idx: usize = 0usize;
+            while child_idx < count {
+                if !reaped[child_idx] {
+                    const waited: i32 = waitpid(pids[child_idx], &raw_statuses[child_idx],
+                        WNOHANG | PIPELINE_WAIT_UNTRACED | PIPELINE_WAIT_CONTINUED);
+                    if waited == pids[child_idx] && pipeline_wait_status_is_stopped(raw_statuses[child_idx]) {
+                        pipeline_cancel_started_group(pipeline_pgid, &pids[0], count);
+                        if stdout_open { _ = close(stdout_capture_fds[0]); }
+                        if stderr_open { _ = close(stderr_capture_fds[0]); }
+                        return error.Interrupted;
+                    }
+                    if waited == pids[child_idx] && !pipeline_wait_status_is_continued(raw_statuses[child_idx]) {
+                        reaped[child_idx] = true;
+                        reaped_count = reaped_count + 1usize;
+                    }
+                }
+                child_idx = child_idx + 1usize;
+            }
+        }
+        var drain_budget: usize = 64usize;
+        while (stdout_open || stderr_open) && drain_budget > 0usize {
+            if pipeline_capture_priority_interrupt(pipeline_pgid, &pids[0], count,
+                &reaped[0], &raw_statuses[0], &reaped_count, &broker_signal_epoch) {
+                if stdout_open { _ = close(stdout_capture_fds[0]); }
+                if stderr_open { _ = close(stderr_capture_fds[0]); }
+                return error.Interrupted;
+            }
+            var final_fds: [PollFd: 2] = [];
+            var final_count: usize = 0usize;
+            if stdout_open {
+                final_fds[final_count] = PollFd { fd: stdout_capture_fds[0], events: POLLIN | POLLHUP | POLLERR, revents: 0 };
+                final_count = final_count + 1usize;
+            }
+            if stderr_open {
+                final_fds[final_count] = PollFd { fd: stderr_capture_fds[0], events: POLLIN | POLLHUP | POLLERR, revents: 0 };
+                final_count = final_count + 1usize;
+            }
+            const final_polled: !i32 = sys_poll(&final_fds[0], final_count, 0);
+            const ready_count: i32 = final_polled catch { break; };
+            if ready_count <= 0 { break; }
+            var final_idx: usize = 0usize;
+            if stdout_open {
+                if final_fds[final_idx].revents != 0 {
+                    const state: i32 = try pipeline_capture_read(stdout_capture_fds[0], capture.stdout_ptr,
+                        capture.stdout_limit, &capture.stdout_count);
+                    if state == 0 { capture.stdout_complete = true; _ = close(stdout_capture_fds[0]); stdout_open = false; }
+                    else if state == 2 {
+                        _ = close(stdout_capture_fds[0]);
+                        if stderr_open { _ = close(stderr_capture_fds[0]); }
+                        pipeline_cancel_started_group(pipeline_pgid, &pids[0], count);
+                        return error.CaptureLimitExceeded;
+                    }
+                }
+                final_idx = final_idx + 1usize;
+            }
+            if stderr_open && final_fds[final_idx].revents != 0 {
+                const state: i32 = try pipeline_capture_read(stderr_capture_fds[0], capture.stderr_ptr,
+                    capture.stderr_limit, &capture.stderr_count);
+                if state == 0 { capture.stderr_complete = true; _ = close(stderr_capture_fds[0]); stderr_open = false; }
+                else if state == 2 {
+                    if stdout_open { _ = close(stdout_capture_fds[0]); }
+                    _ = close(stderr_capture_fds[0]);
+                    pipeline_cancel_started_group(pipeline_pgid, &pids[0], count);
+                    return error.CaptureLimitExceeded;
+                }
+            }
+            drain_budget = drain_budget - 1usize;
+        }
+        if stdout_open { _ = close(stdout_capture_fds[0]); }
+        if stderr_open { _ = close(stderr_capture_fds[0]); }
+    }
+    var saw_failure: bool = false;
+    var saw_stage_failure: bool = false;
+    i = 0usize;
+    while i < count {
+        var raw_status: i32 = raw_statuses[i];
+        var waited_pid: i32 = 0;
+        if reaped[i] { waited_pid = pids[i]; }
+        while waited_pid == 0 {
+            waited_pid = waitpid(pids[i], &raw_status,
+                WNOHANG | PIPELINE_WAIT_UNTRACED | PIPELINE_WAIT_CONTINUED);
+            if waited_pid == pids[i] && pipeline_wait_status_is_stopped(raw_status) {
+                pipeline_cancel_started_group(pipeline_pgid, &pids[0], count);
+                return error.Interrupted;
+            }
+            if waited_pid == pids[i] && pipeline_wait_status_is_continued(raw_status) {
+                waited_pid = 0;
+            }
+            if waited_pid == 0 {
+                if pipeline_take_and_handle_interrupt(pipeline_pgid, &pids[0], count, &broker_signal_epoch) {
+                    return error.Interrupted;
+                }
+                if _pipeline_broker_pipe[0] >= 0 {
+                    var wait_fd: PollFd = PollFd { fd: _pipeline_broker_pipe[0], events: POLLIN, revents: 0 };
+                    const paused: !i32 = sys_poll(&wait_fd, 1usize, 20);
+                    _ = paused catch {};
+                }
+            }
+        }
+        if waited_pid != pids[i] {
+            statuses[i].kind = PipelineStageStatusKind.cancelled;
+            saw_failure = true;
+        } else {
+            const storage_idx: usize = try pipeline_stage_storage_index(slot_idx, i);
+            if storage_idx >= PIPELINE_STAGE_STORAGE_CAPACITY { return error.InvalidPipeline; }
+            const plan_stage: &PipelineProcessStage = &_pipeline_process_stages[storage_idx];
+            statuses[i] = pipeline_wait_status(raw_status, i);
+            if plan_stage.command_kind == 3 {
+                var stage_report: PipelineStartupRecord = PipelineStartupRecord {};
+                const reported: !i32 = pipeline_read_startup_record(report_fds[i * 2usize], &stage_report);
+                const report_state: i32 = reported catch { return error.PipelineIoError; };
+                _ = close(report_fds[i * 2usize]);
+                report_fds[i * 2usize] = 0 - 1;
+                if statuses[i].kind == PipelineStageStatusKind.exited &&
+                    statuses[i].exit_code == 0u32 && report_state == 1 &&
+                    stage_report.kind == PIPELINE_STAGE_COMPLETED {
+                    statuses[i].kind = PipelineStageStatusKind.completed;
+                    statuses[i].exit_code = 0u32;
+                } else if statuses[i].kind == PipelineStageStatusKind.exited &&
+                    report_state == 1 && stage_report.kind == PIPELINE_STAGE_FAILED &&
+                    stage_report.error_name_offset != 0isize {
+                    statuses[i].kind = PipelineStageStatusKind.stage_failed;
+                    statuses[i].exit_code = 0u32;
+                    statuses[i].error_name = @ptr_from_usize(
+                        (uya_pipeline_image_anchor() as isize +
+                            stage_report.error_name_offset) as usize) as &const byte;
+                    saw_stage_failure = true;
+                    saw_failure = true;
+                } else {
+                    statuses[i].kind = PipelineStageStatusKind.cancelled;
+                    statuses[i].exit_code = 0u32;
+                    statuses[i].signal = 0;
+                    saw_failure = true;
+                }
+            } else if statuses[i].kind != PipelineStageStatusKind.exited || statuses[i].exit_code != 0u32 {
+                saw_failure = true;
+            }
+        }
+        i = i + 1usize;
+    }
+    if checked && saw_stage_failure { return error.PipelineStageFailed; }
+    if checked && saw_failure { return error.ProcessFailed; }
+}
+
+/// 进程管道的不透明、不可复制执行计划。
+/// 字段仅 std.process 声明模块可见；调用方只能通过公开 transformer/sink 移动它。
+export opaque struct Pipeline {
+    handle: usize,
+    generation: usize,
+
+    fn drop(self: Pipeline) void {
+        if pipeline_registry_release(&self) != 0 {
+            _pipeline_drop_count = _pipeline_drop_count + 1;
+        }
+    }
+}
+
+// bring-up 计数器用于验证 lowering 与自动 drop；Pipeline executor 落地后由实际
+// plan 资源释放取代计数器主体。
+var _pipeline_drop_count: u64 = 0;
+
+/// 返回 pipeline_drop 被调用的次数（interim 测试钩子）。
+export fn pipeline_drop_count() u64 {
+    return _pipeline_drop_count;
+}
+
+/// 重置 pipeline_drop 计数器（interim 测试钩子）。
+export fn reset_pipeline_drop_count() void {
+    _pipeline_drop_count = 0;
+}
+
+/// 释放 lowering 错误路径已经消费的 pipeline 计划。
+export fn pipeline_drop(input: Pipeline) void {
+    if pipeline_registry_release(&input) != 0 {
+        _pipeline_drop_count = _pipeline_drop_count + 1;
+    }
+}
+
+/// 创建一个空的 pipeline 计划。
+export fn pipeline() Pipeline {
+    return pipeline_registry_allocate();
+}
+
+fn pipeline_clone_plan(input: &Pipeline, output: &Pipeline) !void {
+    const source_slot: usize = try pipeline_registry_slot_index(input);
+    const count: usize = try pipeline_registry_stage_count(input);
+    var i: usize = 0usize;
+    while i < count {
+        const source_idx: usize = try pipeline_stage_storage_index(source_slot, i);
+        if source_idx >= PIPELINE_STAGE_STORAGE_CAPACITY { return error.InvalidPipeline; }
+        const source: &PipelineProcessStage = &_pipeline_process_stages[source_idx];
+        if source.command_kind == 3 {
+            if _pipeline_erased_stages[source_idx].active == 0 { return error.InvalidPipeline; }
+            const cloned: PipelineErasedStageOps = try _pipeline_erased_stages[source_idx].ops.clone_erased();
+            try pipeline_registry_append_erased_stage(output, cloned,
+                _pipeline_erased_stages[source_idx].worker_vtable_offset,
+                _pipeline_erased_stages[source_idx].value_byte);
+            i = i + 1usize;
+            continue;
+        }
+        if source.active == 0 || source.argv == null || source.argv_count == 0usize {
+            return error.InvalidPipeline;
+        }
+        try pipeline_registry_append_process_stage(output, source.command_kind);
+        var args: &&const byte = null as &&const byte;
+        if source.argv_count > 1usize { args = &source.argv[1] as &&const byte; }
+        try pipeline_registry_set_last_stage_argv(output, source.argv[0], args, source.argv_count - 1usize);
+        if source.cwd != null { try pipeline_registry_set_last_stage_cwd(output, source.cwd); }
+        var env_idx: usize = 0usize;
+        while env_idx < source.env_op_count {
+            const op: &PipelineEnvOp = &source.env_ops[env_idx];
+            try pipeline_registry_append_last_stage_env(output, op.key, op.value, op.remove);
+            env_idx = env_idx + 1usize;
+        }
+        i = i + 1usize;
+    }
+    if source_slot >= PIPELINE_REGISTRY_CAPACITY { return error.InvalidPipeline; }
+    const policy: &PipelineStreamPolicy = &_pipeline_stream_policies[source_slot];
+    if policy.stdin_kind != PipelineStdinPolicyKind.unset {
+        try pipeline_set_stdin_policy(output, policy.stdin_kind, policy.stdin_path);
+    }
+    if policy.stdout_kind != PipelineStdoutPolicyKind.unset {
+        try pipeline_set_stdout_policy(output, policy.stdout_kind, policy.stdout_path);
+    }
+    if policy.stderr_kind != PipelineStderrPolicyKind.unset {
+        try pipeline_set_stderr_policy(output, policy.stderr_kind, policy.stderr_path);
+    }
+}
+
+/// 深拷贝 pipeline 执行计划，返回独立拥有 argv、cwd、env 与 stream policy 的新 capability。
+/// 参数：input 为有效且仍存活的只读 pipeline capability。
+/// 返回：成功时返回可独立移动、执行和释放的副本；计划不可克隆或无效时返回 InvalidPipeline。
+export fn clone(input: &Pipeline) !Pipeline {
+    if input == null { return error.InvalidPipeline; }
+    var output: Pipeline = pipeline_registry_allocate();
+    if output.handle == 0usize { return error.InvalidPipeline; }
+    const copied: !void = pipeline_clone_plan(input, &output);
+    _ = copied catch {
+        _ = pipeline_registry_release(&output);
+        return error.InvalidPipeline;
+    };
+    return output;
+}
+
+/// 验证 clone 会拒绝没有已知深拷贝实现的 erased stage；仅供回归测试。
+export fn pipeline_uncloneable_stage_self_test() !void {
+    const source: Pipeline = pipeline_registry_allocate();
+    try pipeline_registry_append_process_stage(&source, 1);
+    try pipeline_registry_set_last_stage_argv(&source, "placeholder", null as &&const byte, 0usize);
+    const slot: usize = try pipeline_registry_slot_index(&source);
+    const storage: usize = try pipeline_stage_storage_index(slot, 0usize);
+    if storage >= PIPELINE_STAGE_STORAGE_CAPACITY {
+        _ = pipeline_registry_release(&source);
+        return error.InvalidPipeline;
+    }
+    _pipeline_process_stages[storage].active = 0;
+    const copied: !Pipeline = clone(&source);
+    _pipeline_process_stages[storage].active = 1;
+    _ = pipeline_registry_release(&source);
+    if copied.error_id != @error_id(error.InvalidPipeline) { return error.InvalidPipeline; }
+}
+
+/// 验证 launch/control 写端遇到 EPIPE 时不会让宿主进程收到默认 SIGPIPE 终止；仅供回归测试。
+export fn pipeline_control_epipe_self_test() !void {
+    var fds: [i32: 2] = [];
+    const created: !i32 = sys_pipe2(&fds[0], O_CLOEXEC);
+    _ = created catch { return error.PipelineIoError; };
+    _ = close(fds[0]);
+    const sent: !void = pipeline_write_control_token(fds[1], 71 as byte);
+    _ = close(fds[1]);
+    _ = sent catch {};
+    if sent.error_id != @error_id(error.PipelineIoError) { return error.InvalidPipeline; }
+}
+
+/// 验证 runtime broker 订阅与按 terminal identity 租约的配对清理；仅供回归测试。
+export fn pipeline_broker_lifecycle_self_test() !void {
+    if !pipeline_terminal_handoff_allowed(42, 42) ||
+        pipeline_terminal_handoff_allowed(41, 42) ||
+        pipeline_terminal_handoff_allowed(0, 42) {
+        return error.InvalidPipeline;
+    }
+    var fds: [i32: 2] = [];
+    const created: !i32 = sys_pipe2(&fds[0], O_CLOEXEC);
+    _ = created catch { return error.PipelineIoError; };
+    try pipeline_broker_subscribe();
+    const lease_result: !usize = pipeline_terminal_lease_acquire(fds[0]);
+    const lease: usize = lease_result catch {
+        pipeline_broker_unsubscribe();
+        _ = close(fds[0]); _ = close(fds[1]);
+        return error.PipelineIoError;
+    };
+    pipeline_terminal_lease_release(lease);
+    pipeline_broker_unsubscribe();
+    _ = close(fds[0]); _ = close(fds[1]);
+    if lease >= 16usize { return error.InvalidPipeline; }
+    pipeline_broker_lock();
+    const subscribers: usize = _pipeline_broker_subscribers;
+    const active: i32 = _pipeline_terminal_leases[lease].active;
+    pipeline_broker_unlock();
+    if subscribers != 0usize || active != 0 { return error.InvalidPipeline; }
+    var ignore_action: PipelineSigaction = PipelineSigaction {};
+    var saved_action: PipelineSigaction = PipelineSigaction {};
+    var after_action: PipelineSigaction = PipelineSigaction {};
+    ignore_action.handler = SIG_IGN as &void;
+    if sigaction(SIGTERM, &ignore_action, &saved_action) != 0 { return error.PipelineIoError; }
+    try pipeline_broker_subscribe();
+    pipeline_broker_unsubscribe();
+    if sigaction(SIGTERM, null as &const PipelineSigaction, &after_action) != 0 {
+        _ = sigaction(SIGTERM, &saved_action, null as &PipelineSigaction);
+        return error.PipelineIoError;
+    }
+    _ = sigaction(SIGTERM, &saved_action, null as &PipelineSigaction);
+    if after_action.handler != SIG_IGN as &void { return error.InvalidPipeline; }
+}
+
+/// 验证 fork child 在 READY 前移除 broker 继承状态并恢复 sink 原始 signal mask；仅供回归测试。
+export fn pipeline_child_signal_setup_self_test() !void {
+    var saved_mask: sigset_t = sigset_t {};
+    if pthread_sigmask(SIG_SETMASK, null as &const sigset_t, &saved_mask) != 0 {
+        return error.PipelineIoError;
+    }
+    try pipeline_broker_subscribe();
+    const broker_read: i32 = _pipeline_broker_pipe[0];
+    const broker_write: i32 = _pipeline_broker_pipe[1];
+    var blocked: sigset_t = sigset_t {};
+    if sigemptyset(&blocked) != 0 || sigaddset(&blocked, SIGTERM) != 0 ||
+        pthread_sigmask(SIG_BLOCK, &blocked, null as &sigset_t) != 0 {
+        pipeline_broker_unsubscribe();
+        return error.PipelineIoError;
+    }
+    const pid: i32 = fork();
+    if pid == 0 {
+        if pipeline_child_signal_setup(&saved_mask) != 0 { _exit(1); }
+        const read_flags: !i32 = sys_fcntl(broker_read, F_GETFD, 0);
+        if read_flags.error_id == 0 { _exit(2); }
+        const write_flags: !i32 = sys_fcntl(broker_write, F_GETFD, 0);
+        if write_flags.error_id == 0 { _exit(3); }
+        var current_mask: sigset_t = sigset_t {};
+        if pthread_sigmask(SIG_SETMASK, null as &const sigset_t, &current_mask) != 0 ||
+            sigismember(&current_mask, SIGTERM) != sigismember(&saved_mask, SIGTERM) {
+            _exit(4);
+        }
+        var action: PipelineSigaction = PipelineSigaction {};
+        if sigaction(SIGTERM, null as &const PipelineSigaction, &action) != 0 ||
+            action.handler == (&pipeline_broker_signal_handler as &void) { _exit(5); }
+        _exit(0);
+    }
+    _ = pthread_sigmask(SIG_SETMASK, &saved_mask, null as &sigset_t);
+    pipeline_broker_unsubscribe();
+    if pid < 0 { return error.PipelineIoError; }
+    var raw: i32 = 0;
+    if waitpid(pid, &raw, 0) != pid || ((raw >> 8) & 255) != 0 {
+        return error.InvalidPipeline;
+    }
+}
+
+fn pipeline_terminal_inherit_child_run(slave_name: &const byte, master_fd: i32) !void {
+    _ = close(master_fd);
+    if setsid() < 0 { return error.PipelineIoError; }
+    const slave_fd: i32 = try sys_open(slave_name, O_RDWR as i32, 0);
+    if tcsetpgrp(slave_fd, getpgrp()) != 0 || dup2(slave_fd, 0) < 0 ||
+        dup2(slave_fd, 1) < 0 || dup2(slave_fd, 2) < 0 { return error.PipelineIoError; }
+    if slave_fd > 2 { _ = close(slave_fd); }
+    const args: [&const byte: 2] = ["-c", "read value; test \"$value\" = token"];
+    const command: Pipeline = try cmd_path_argv(pipeline(), "/bin/sh", &args[0:2]);
+    try check(try inherit_stdio(command));
+    if tcgetpgrp(0) != getpgrp() { return error.InvalidPipeline; }
+}
+
+fn pipeline_terminal_inherit_child(slave_name: &const byte, master_fd: i32) void {
+    const completed: !void = pipeline_terminal_inherit_child_run(slave_name, master_fd);
+    _ = completed catch { _exit(1); };
+    _exit(0);
+}
+
+/// 验证继承终端 stdin 的 child 可读且 sink 完成后恢复 executor 前台 PGID；仅供回归测试。
+export fn pipeline_terminal_inherit_self_test() !void {
+    const master_fd: i32 = posix_openpt(O_RDWR as i32);
+    if master_fd < 0 || grantpt(master_fd) != 0 || unlockpt(master_fd) != 0 {
+        if master_fd >= 0 { _ = close(master_fd); }
+        return error.PipelineIoError;
+    }
+    const slave_name: &byte = ptsname(master_fd);
+    if slave_name == null { _ = close(master_fd); return error.PipelineIoError; }
+    const pid: i32 = fork();
+    if pid == 0 { pipeline_terminal_inherit_child(slave_name, master_fd); }
+    if pid < 0 { _ = close(master_fd); return error.PipelineIoError; }
+    const token: &const byte = "token\n";
+    const written: !isize = sys_write(master_fd, token, 6usize);
+    _ = written catch { _ = close(master_fd); return error.PipelineIoError; };
+    var raw: i32 = 0;
+    const waited: i32 = waitpid(pid, &raw, 0);
+    _ = close(master_fd);
+    if waited != pid || ((raw >> 8) & 255) != 0 { return error.InvalidPipeline; }
+}
+
+fn pipeline_terminal_background_child_run(slave_name: &const byte, master_fd: i32) !void {
+    _ = close(master_fd);
+    if setsid() < 0 { return error.PipelineIoError; }
+    const slave_fd: i32 = try sys_open(slave_name, O_RDWR as i32, 0);
+    if tcsetpgrp(slave_fd, getpgrp()) != 0 || dup2(slave_fd, 0) < 0 ||
+        dup2(slave_fd, 1) < 0 || dup2(slave_fd, 2) < 0 { return error.PipelineIoError; }
+    if slave_fd > 2 { _ = close(slave_fd); }
+    const foreground_pid: i32 = fork();
+    if foreground_pid == 0 {
+        if setpgid(0, 0) != 0 { _exit(1); }
+        while true { _ = sched_yield(); }
+    }
+    if foreground_pid < 0 || setpgid(foreground_pid, foreground_pid) != 0 ||
+        tcsetpgrp(0, foreground_pid) != 0 { return error.PipelineIoError; }
+    const no_args: [&const byte: 1] = [""];
+    const command: Pipeline = try cmd_path_argv(pipeline(), "/bin/true", &no_args[0:0]);
+    const executed: !void = check(try inherit_stdio(command));
+    _ = kill(foreground_pid, SIGKILL);
+    var raw: i32 = 0;
+    _ = waitpid(foreground_pid, &raw, 0);
+    try executed;
+    if tcgetpgrp(0) != foreground_pid { return error.InvalidPipeline; }
+}
+
+fn pipeline_terminal_background_child(slave_name: &const byte, master_fd: i32) void {
+    const completed: !void = pipeline_terminal_background_child_run(slave_name, master_fd);
+    _ = completed catch { _exit(1); };
+    _exit(0);
+}
+
+/// 验证后台 executor 不会调用 tcsetpgrp 抢占现有前台 process group；仅供回归测试。
+export fn pipeline_terminal_background_self_test() !void {
+    const master_fd: i32 = posix_openpt(O_RDWR as i32);
+    if master_fd < 0 || grantpt(master_fd) != 0 || unlockpt(master_fd) != 0 {
+        if master_fd >= 0 { _ = close(master_fd); }
+        return error.PipelineIoError;
+    }
+    const slave_name: &byte = ptsname(master_fd);
+    if slave_name == null { _ = close(master_fd); return error.PipelineIoError; }
+    const pid: i32 = fork();
+    if pid == 0 { pipeline_terminal_background_child(slave_name, master_fd); }
+    if pid < 0 { _ = close(master_fd); return error.PipelineIoError; }
+    var raw: i32 = 0;
+    const waited: i32 = waitpid(pid, &raw, 0);
+    _ = close(master_fd);
+    if waited != pid || ((raw >> 8) & 255) != 0 { return error.InvalidPipeline; }
+}
+
+fn pipeline_terminal_stopped_child_run(slave_name: &const byte, master_fd: i32,
+    background_read: bool) !void {
+    _ = close(master_fd);
+    if setsid() < 0 { return error.PipelineIoError; }
+    const slave_fd: i32 = try sys_open(slave_name, O_RDWR as i32, 0);
+    if tcsetpgrp(slave_fd, getpgrp()) != 0 || dup2(slave_fd, 0) < 0 ||
+        dup2(slave_fd, 1) < 0 || dup2(slave_fd, 2) < 0 { return error.PipelineIoError; }
+    if slave_fd > 2 { _ = close(slave_fd); }
+    var foreground_pid: i32 = 0 - 1;
+    if background_read {
+        foreground_pid = fork();
+        if foreground_pid == 0 {
+            if setpgid(0, 0) != 0 { _exit(1); }
+            while true { _ = sched_yield(); }
+        }
+        if foreground_pid < 0 || setpgid(foreground_pid, foreground_pid) != 0 ||
+            tcsetpgrp(0, foreground_pid) != 0 { return error.PipelineIoError; }
+    }
+    var script: &const byte = "kill -TSTP $$";
+    if background_read { script = "read value"; }
+    const args: [&const byte: 2] = ["-c", script];
+    const command: Pipeline = try cmd_path_argv(pipeline(), "/bin/sh", &args[0:2]);
+    const executed: !void = check(try inherit_stdio(command));
+    const foreground_after: i32 = tcgetpgrp(0);
+    if foreground_pid > 0 {
+        _ = kill(foreground_pid, SIGKILL);
+        var raw: i32 = 0;
+        _ = waitpid(foreground_pid, &raw, 0);
+    }
+    if executed.error_id != @error_id(error.Interrupted) { return error.InvalidPipeline; }
+    if background_read && foreground_after != foreground_pid { return error.InvalidPipeline; }
+    if !background_read && foreground_after != getpgrp() { return error.InvalidPipeline; }
+}
+
+fn pipeline_terminal_stopped_child(slave_name: &const byte, master_fd: i32,
+    background_read: bool) void {
+    const completed: !void = pipeline_terminal_stopped_child_run(slave_name, master_fd,
+        background_read);
+    _ = completed catch { _exit(1); };
+    _exit(0);
+}
+
+fn pipeline_terminal_stopped_case(background_read: bool) !void {
+    const master_fd: i32 = posix_openpt(O_RDWR as i32);
+    if master_fd < 0 || grantpt(master_fd) != 0 || unlockpt(master_fd) != 0 {
+        if master_fd >= 0 { _ = close(master_fd); }
+        return error.PipelineIoError;
+    }
+    const slave_name: &byte = ptsname(master_fd);
+    if slave_name == null { _ = close(master_fd); return error.PipelineIoError; }
+    const pid: i32 = fork();
+    if pid == 0 { pipeline_terminal_stopped_child(slave_name, master_fd, background_read); }
+    if pid < 0 { _ = close(master_fd); return error.PipelineIoError; }
+    var raw: i32 = 0;
+    const waited: i32 = waitpid(pid, &raw, 0);
+    _ = close(master_fd);
+    if waited != pid || ((raw >> 8) & 255) != 0 { return error.InvalidPipeline; }
+}
+
+/// 验证 SIGTSTP/SIGTTIN stopped child 均有限取消、返回 Interrupted 并恢复终端；仅供回归测试。
+export fn pipeline_terminal_stopped_self_test() !void {
+    try pipeline_terminal_stopped_case(false);
+    try pipeline_terminal_stopped_case(true);
+}
+
+/// 验证 StreamReader/StreamWriter 的阻塞、短行尾段与 EOF 语义；仅供回归测试。
+export fn pipeline_stream_self_test() !void {
+    var fds: [i32: 2] = [];
+    _ = try sys_pipe2(&fds[0], O_CLOEXEC);
+    var reader: StreamReader = StreamReader { _fd: fds[0] };
+    var writer: StreamWriter = StreamWriter { _fd: fds[1] };
+    var payload: [byte: 8] = [111 as byte, 110 as byte, 101 as byte, 10 as byte,
+        116 as byte, 97 as byte, 105 as byte, 108 as byte];
+    try writer.write_all(&payload[0:8]);
+    _ = close(fds[1]);
+    var line: [byte: 8] = [];
+    const first: usize = try reader.read_line(&line[0:8]);
+    if first != 4usize || line[0] != 111 as byte || line[3] != 10 as byte {
+        _ = close(fds[0]);
+        return error.InvalidPipeline;
+    }
+    const tail: usize = try reader.read_line(&line[0:8]);
+    if tail != 4usize || line[0] != 116 as byte || line[3] != 108 as byte {
+        _ = close(fds[0]);
+        return error.InvalidPipeline;
+    }
+    const eof: usize = try reader.read(&line[0:8]);
+    _ = close(fds[0]);
+    if eof != 0usize { return error.InvalidPipeline; }
+}
+
+fn pipeline_closed_stdio_child(closed_fd: i32) void {
+    _ = close(closed_fd);
+    const child_plan: Pipeline = pipeline_registry_allocate();
+    const first_added: !void = pipeline_registry_append_process_stage(&child_plan, 2);
+    _ = first_added catch { _exit(1); };
+    const first_args: [&const byte: 2] = ["-c",
+        "test -e /proc/self/fd/0 -a -e /proc/self/fd/1 -a -e /proc/self/fd/2 || exit 91; printf token"];
+    const first_set: !void = pipeline_registry_set_last_stage_argv(&child_plan,
+        "/bin/sh", &first_args[0], 2usize);
+    _ = first_set catch { _exit(2); };
+    const second_added: !void = pipeline_registry_append_process_stage(&child_plan, 2);
+    _ = second_added catch { _exit(3); };
+    const second_args: [&const byte: 2] = ["-c",
+        "read value; test \"$value\" = token || exit 92; test -e /proc/self/fd/0 -a -e /proc/self/fd/1 -a -e /proc/self/fd/2 || exit 93; printf out; printf err >&2"];
+    const second_set: !void = pipeline_registry_set_last_stage_argv(&child_plan,
+        "/bin/sh", &second_args[0], 2usize);
+    _ = second_set catch { _exit(4); };
+    const stdin_set: !void = pipeline_set_stdin_policy(&child_plan,
+        PipelineStdinPolicyKind.file, "/dev/null");
+    _ = stdin_set catch { _exit(5); };
+    const stdout_set: !void = pipeline_set_stdout_policy(&child_plan,
+        PipelineStdoutPolicyKind.file, "/tmp/uya-pipeline-closed-stdio.out");
+    _ = stdout_set catch { _exit(6); };
+    const stderr_set: !void = pipeline_set_stderr_policy(&child_plan,
+        PipelineStderrPolicyKind.file, "/tmp/uya-pipeline-closed-stdio.err");
+    _ = stderr_set catch { _exit(7); };
+    var statuses: [PipelineStageStatus: 2] = [];
+    var result: PipelineResult = PipelineResult {};
+    const executed: !void = pipeline_execute_basic(&child_plan, &statuses[0:2], &result, true, null);
+    _ = executed catch { _exit(8); };
+    _exit(0);
+}
+
+/// 验证宿主分别预先关闭 0/1/2 时，pipe/file remap 与 exec 后 stdio 均正确；仅供回归测试。
+export fn pipeline_closed_stdio_self_test() !void {
+    _ = unlink("/tmp/uya-pipeline-closed-stdio.out");
+    _ = unlink("/tmp/uya-pipeline-closed-stdio.err");
+    var closed_fd: i32 = 0;
+    while closed_fd < 3 {
+        const pid: i32 = fork();
+        if pid < 0 { return error.PipelineIoError; }
+        if pid == 0 { pipeline_closed_stdio_child(closed_fd); }
+        var raw: i32 = 0;
+        if waitpid(pid, &raw, 0) != pid || ((raw >> 8) & 255) != 0 {
+            return error.InvalidPipeline;
+        }
+        closed_fd = closed_fd + 1;
+    }
+    _ = unlink("/tmp/uya-pipeline-closed-stdio.out");
+    _ = unlink("/tmp/uya-pipeline-closed-stdio.err");
+}
+
+/// 向 pipeline 追加一个通过 PATH 查找的 process stage。
+/// 参数：input 为按值消费的 pipeline；program 为命令名；args 不包含 argv[0]。
+/// 返回：成功时返回追加 stage 后的 pipeline；参数或 capability 无效时返回错误。
+export fn cmd_argv(input: Pipeline, program: &const byte, args: &[&const byte]) !Pipeline {
+    if !pipeline_command_name_valid(program) || args.ptr == null && args.len != 0usize {
+        return error.InvalidPipeline;
+    }
+    try pipeline_registry_append_process_stage(&input, 1);
+    try pipeline_registry_set_last_stage_argv(&input, program, args.ptr, args.len);
+    return input;
+}
+
+/// 向 pipeline 追加一个按 exact path 执行的 process stage。
+/// 参数：input 为按值消费的 pipeline；path 可为绝对或相对路径；args 不包含 argv[0]。
+/// 返回：成功时原样保存 path 并返回新 pipeline；参数或 capability 无效时返回错误。
+export fn cmd_path_argv(input: Pipeline, path: &const byte, args: &[&const byte]) !Pipeline {
+    if !pipeline_path_preflight_valid(path) || args.ptr == null && args.len != 0usize {
+        return error.InvalidPipeline;
+    }
+    try pipeline_registry_append_process_stage(&input, 2);
+    try pipeline_registry_set_last_stage_argv(&input, path, args.ptr, args.len);
+    return input;
+}
+
+/// 向 pipeline 追加一个按值拥有的自定义 Uya 流 stage。
+/// 参数：input 为按值消费的 pipeline；stage_value 被移动到稳定 heap holder。
+/// 返回：成功时返回追加后的 pipeline；分配或计划容量失败时返回 InvalidPipeline。
+export fn stage<T: PipelineStage>(input: Pipeline, stage_value: T) !Pipeline {
+    if @size_of(T) != 1 { return error.InvalidPipeline; }
+    const value_raw: &void = malloc(@size_of(T));
+    if value_raw == null { return error.InvalidPipeline; }
+    const typed_value: &T = value_raw as &T;
+    typed_value[0] = stage_value;
+    const holder_raw: &void = malloc(@size_of(PipelineErasedStageBox));
+    if holder_raw == null { free(value_raw); return error.InvalidPipeline; }
+    const holder: &PipelineErasedStageBox = holder_raw as &PipelineErasedStageBox;
+    const boxed_value: PipelineStage = *typed_value;
+    holder.value = boxed_value;
+    holder.owned_value = value_raw;
+    const ops: PipelineErasedStageOps = *holder;
+    const value_bytes: &byte = typed_value as &byte;
+    const worker_vtable_offset: isize = uya_interface_get_vtable(
+        &boxed_value as &void) as isize - uya_pipeline_image_anchor() as isize;
+    const appended: !void = pipeline_registry_append_erased_stage(&input, ops,
+        worker_vtable_offset, value_bytes[0]);
+    _ = appended catch { holder.drop_erased(); return error.InvalidPipeline; };
+    return input;
+}
+
+/// 为最近追加的 process stage 设置最终工作目录。
+/// 参数：input 为按值消费的 pipeline；path 在 sink 开始时相对 canonical cwd 解释。
+/// 返回：成功时返回修改后的 pipeline；没有最近 process stage 时返回 InvalidPipeline。
+export fn cwd(input: Pipeline, path: &const byte) !Pipeline {
+    if !pipeline_path_preflight_valid(path) {
+        return error.InvalidPipeline;
+    }
+    try pipeline_registry_set_last_stage_cwd(&input, path);
+    return input;
+}
+
+/// 为最近追加的 process stage 设置 child-only 环境变量覆盖。
+/// 参数：input 为按值消费的 pipeline；key/value 会复制到计划中。
+/// 返回：成功时返回修改后的 pipeline；名称或值无效时返回 std.env 校验错误。
+export fn env(input: Pipeline, key: &const byte, value: &const byte) !Pipeline {
+    try pipeline_registry_append_last_stage_env(&input, key, value, 0);
+    return input;
+}
+
+/// 从最近追加的 process stage 最终 child 环境中移除变量。
+/// 参数：input 为按值消费的 pipeline；key 会复制到计划中。
+/// 返回：成功时返回修改后的 pipeline；名称无效时返回 std.env 校验错误。
+export fn unset_env(input: Pipeline, key: &const byte) !Pipeline {
+    try pipeline_registry_append_last_stage_env(&input, key, null, 1);
+    return input;
+}
+
+/// 让下一次 pipeline fork 路径返回 process-create failure；仅供回归测试。
+export fn pipeline_fail_next_fork_for_test() void {
+    _pipeline_test_fail_next_fork = 1;
+}
+
+/// 仅允许下一次含 Uya stage 的执行使用 POSIX fork 实验 worker。
+/// 参数：无；该一次性门闩不会改变 process-only pipeline。
+/// 返回：无；生产默认路径仍拒绝 fork-backed Uya stage。
+export fn pipeline_allow_next_fork_stage_for_test() void {
+    _pipeline_test_allow_next_fork_stage = 1;
+}
+
+/// 重置 interruption 的 direct-PID signal 计数；仅供回归测试。
+export fn pipeline_reset_interrupt_direct_sends_for_test() void {
+    _pipeline_test_interrupt_direct_sends = 0;
+}
+
+/// 返回 interruption 的 direct-PID signal 计数；仅供回归测试。
+export fn pipeline_interrupt_direct_sends_for_test() i32 {
+    return __atomic_load_n((&_pipeline_test_interrupt_direct_sends) as &i32,
+        PIPELINE_ATOMIC_SEQ_CST);
+}
+
+/// 将 pipeline 第一段 stdin 配置为文件输入。
+/// 参数：input 为按值消费的 pipeline；path 在 sink-time cwd 规则下解析。
+/// 返回：成功时返回新 pipeline；路径无效或 stdin 已配置时返回 InvalidPipeline。
+export fn stdin_file(input: Pipeline, path: &const byte) !Pipeline {
+    try pipeline_set_stdin_policy(&input, PipelineStdinPolicyKind.file, path);
+    return input;
+}
+
+/// 将 pipeline 最后一段 stdout 配置为文件输出。
+/// 参数：input 为按值消费的 pipeline；path 在 sink-time cwd 规则下解析。
+/// 返回：成功时返回新 pipeline；路径无效或 stdout 已配置时返回 InvalidPipeline。
+export fn stdout_file(input: Pipeline, path: &const byte) !Pipeline {
+    try pipeline_set_stdout_policy(&input, PipelineStdoutPolicyKind.file, path);
+    return input;
+}
+
+/// 将 pipeline 全部 process stage 的 stderr 配置为同一文件输出。
+/// 参数：input 为按值消费的 pipeline；path 在 sink-time cwd 规则下解析。
+/// 返回：成功时返回新 pipeline；路径无效或 stderr 已配置时返回 InvalidPipeline。
+export fn stderr_file(input: Pipeline, path: &const byte) !Pipeline {
+    try pipeline_set_stderr_policy(&input, PipelineStderrPolicyKind.file, path);
+    return input;
+}
+
+/// 捕获 pipeline 最后一段 stdout。
+/// 参数：input 为按值消费的 pipeline。
+/// 返回：成功时返回新 pipeline；stdout 已配置时返回 InvalidPipeline。
+export fn stdout_capture(input: Pipeline) !Pipeline {
+    try pipeline_set_stdout_policy(&input, PipelineStdoutPolicyKind.capture, null);
+    return input;
+}
+
+/// 捕获 pipeline 的 stderr。
+/// 参数：input 为按值消费的 pipeline。
+/// 返回：成功时返回新 pipeline；stderr 已配置时返回 InvalidPipeline。
+export fn stderr_capture(input: Pipeline) !Pipeline {
+    try pipeline_set_stderr_policy(&input, PipelineStderrPolicyKind.capture, null);
+    return input;
+}
+
+/// 将 pipeline 的 stderr 合并到 stdout policy。
+/// 参数：input 为按值消费的 pipeline。
+/// 返回：成功时返回新 pipeline；stderr 已配置时返回 InvalidPipeline。
+export fn stderr_to_stdout(input: Pipeline) !Pipeline {
+    try pipeline_set_stderr_policy(&input, PipelineStderrPolicyKind.merge_stdout, null);
+    return input;
+}
+
+/// 原子地让 pipeline 的 stdin/stdout/stderr 继承宿主标准流。
+/// 参数：input 为按值消费的 pipeline。
+/// 返回：成功时返回新 pipeline；任一路已配置时返回 InvalidPipeline 且不改变其余 policy。
+export fn inherit_stdio(input: Pipeline) !Pipeline {
+    try pipeline_set_inherit_stdio(&input);
+    return input;
+}
+
+fn pipeline_preflight_non_capture_sink(input: &Pipeline) !void {
+    const slot_idx: usize = try pipeline_registry_slot_index(input);
+    if slot_idx >= PIPELINE_REGISTRY_CAPACITY ||
+        _pipeline_stream_policies[slot_idx].stdout_kind == PipelineStdoutPolicyKind.capture ||
+        _pipeline_stream_policies[slot_idx].stderr_kind == PipelineStderrPolicyKind.capture {
+        return error.InvalidPipeline;
+    }
+}
+
+/// 执行 pipeline，并按 pipefail 语义要求所有 process stage 成功。
+/// 参数：input 为按值消费的 pipeline。
+/// 返回：成功无返回值；启动失败或非零退出返回对应错误。
+export fn check(input: Pipeline) !void {
+    var statuses_storage: [PipelineStageStatus: 32] = [];
+    const statuses: &[PipelineStageStatus] = &statuses_storage[0:32];
+    var result: PipelineResult = PipelineResult { stage_count: 0usize };
+    try pipeline_preflight_non_capture_sink(&input);
+    try pipeline_execute_basic(&input, statuses, &result, true, null);
+}
+
+/// 执行 checked pipeline，并将完整 stage 状态写入调用方缓冲区。
+/// 参数：input 为按值消费的 pipeline；statuses/result 为调用方可写区域。
+/// 返回：成功无返回值；错误返回前仍保留已获得的结果。
+export fn check_into(input: Pipeline, statuses: &[PipelineStageStatus], result: &PipelineResult) !void {
+    pipeline_reset_result(result);
+    try pipeline_preflight_status_regions(statuses, result);
+    try pipeline_preflight_non_capture_sink(&input);
+    try pipeline_execute_basic(&input, statuses, result, true, null);
+}
+
+/// 观察执行 pipeline，非零退出和 signal 通过 statuses 报告而不转为 ProcessFailed。
+/// 参数：input 为按值消费的 pipeline；statuses/result 为调用方可写区域。
+/// 返回：执行基础设施成功时无错误，启动失败返回 PipelineSpawnFailed。
+export fn status_into(input: Pipeline, statuses: &[PipelineStageStatus], result: &PipelineResult) !void {
+    pipeline_reset_result(result);
+    try pipeline_preflight_status_regions(statuses, result);
+    try pipeline_preflight_non_capture_sink(&input);
+    const executed: !void = pipeline_execute_basic(&input, statuses, result, false, null);
+    _ = executed catch {
+        if executed.error_id == @error_id(error.PipelineSpawnFailed) { return; }
+        if executed.error_id == @error_id(error.Interrupted) { return error.Interrupted; }
+        if executed.error_id == @error_id(error.InvalidPipeline) { return error.InvalidPipeline; }
+        return error.PipelineIoError;
+    };
+}
+
+fn pipeline_capture_into_impl(input: Pipeline, max_bytes: usize, statuses: &[PipelineStageStatus],
+    stdout_buf: &[byte], stderr_buf: &[byte], result: &PipelineCaptureResult) !void {
+    pipeline_reset_capture_result(result);
+    const slot_idx: usize = try pipeline_registry_slot_index(&input);
+    if slot_idx >= PIPELINE_REGISTRY_CAPACITY || result == null { return error.InvalidPipeline; }
+    const stdout_kind: PipelineStdoutPolicyKind = _pipeline_stream_policies[slot_idx].stdout_kind;
+    const stderr_kind: PipelineStderrPolicyKind = _pipeline_stream_policies[slot_idx].stderr_kind;
+    if stdout_kind == PipelineStdoutPolicyKind.file || stdout_kind == PipelineStdoutPolicyKind.inherit {
+        return error.InvalidPipeline;
+    }
+    const capture_stderr: bool = stderr_kind == PipelineStderrPolicyKind.capture;
+    try pipeline_preflight_capture_regions(statuses, stdout_buf, stderr_buf, true, capture_stderr, result);
+    var stdout_limit: usize = stdout_buf.len;
+    var stderr_limit: usize = stderr_buf.len;
+    if max_bytes < stdout_limit { stdout_limit = max_bytes; }
+    if max_bytes < stderr_limit { stderr_limit = max_bytes; }
+    var capture: PipelineCaptureExecution = PipelineCaptureExecution {
+        stdout_ptr: stdout_buf.ptr,
+        stdout_limit: stdout_limit,
+        stdout_count: 0usize,
+        stdout_complete: false,
+        stderr_ptr: stderr_buf.ptr,
+        stderr_limit: stderr_limit,
+        stderr_count: 0usize,
+        stderr_complete: false,
+        capture_stdout: true,
+        capture_stderr: capture_stderr,
+    };
+    const executed: !void = pipeline_execute_basic(&input, statuses, &result.result, false, &capture);
+    _ = executed catch {
+        if executed.error_id == @error_id(error.PipelineSpawnFailed) {
+            result.stdout.captured = true;
+            result.stdout.byte_count = capture.stdout_count;
+            result.stdout.complete = false;
+            result.stderr.captured = capture.capture_stderr;
+            result.stderr.byte_count = capture.stderr_count;
+            result.stderr.complete = false;
+            return;
+        }
+        pipeline_reset_capture_result(result);
+        if executed.error_id == @error_id(error.CaptureLimitExceeded) {
+            return error.CaptureLimitExceeded;
+        }
+        if executed.error_id == @error_id(error.Interrupted) { return error.Interrupted; }
+        if executed.error_id == @error_id(error.InvalidPipeline) { return error.InvalidPipeline; }
+        return error.PipelineIoError;
+    };
+    result.stdout.captured = true;
+    result.stdout.byte_count = capture.stdout_count;
+    result.stdout.complete = capture.stdout_complete;
+    result.stderr.captured = capture.capture_stderr;
+    result.stderr.byte_count = capture.stderr_count;
+    result.stderr.complete = capture.stderr_complete;
+}
+
+/// 观察执行 pipeline，并把捕获流写入调用方缓冲区。
+/// 参数：statuses/stdout_buf/stderr_buf/result 均由调用方持有；stdout 默认隐式 capture。
+/// 返回：正常 stage 失败仍成功；基础设施或容量超限返回错误。
+export fn capture_into(input: Pipeline, statuses: &[PipelineStageStatus], stdout_buf: &[byte],
+    stderr_buf: &[byte], result: &PipelineCaptureResult) !void {
+    var max_bytes: usize = stdout_buf.len;
+    if stderr_buf.len > max_bytes { max_bytes = stderr_buf.len; }
+    try pipeline_capture_into_impl(input, max_bytes, statuses, stdout_buf, stderr_buf, result);
+}
+
+/// 观察执行 pipeline，并对每个捕获流应用显式最大字节数。
+/// 参数：有效上限为 min(max_bytes, 对应 buffer.len)。
+/// 返回：超过任一路有效上限时取消 pipeline 并返回 CaptureLimitExceeded。
+export fn capture_limit_into(input: Pipeline, max_bytes: usize, statuses: &[PipelineStageStatus],
+    stdout_buf: &[byte], stderr_buf: &[byte], result: &PipelineCaptureResult) !void {
+    try pipeline_capture_into_impl(input, max_bytes, statuses, stdout_buf, stderr_buf, result);
+}
+
+/// 返回计划中的完整可执行 stage 数量，不消费或执行计划。
+export fn stage_count(input: &Pipeline) !usize {
+    return pipeline_registry_stage_count(input);
+}
+
+/// 运行 capability registry 的内部 bring-up 自检；仅供编译器回归测试。
+export fn pipeline_capability_self_test() !void {
+    if !pipeline_path_is_windows_drive_relative("C:tool.exe") ||
+        pipeline_path_is_windows_drive_relative("C:\\tool.exe") ||
+        pipeline_path_is_windows_drive_relative("/usr/bin/tool") {
+        return error.InvalidPipeline;
+    }
+    if pipeline_lookup_spawn_failure(ExecutableLookupKind.path_not_found) != PipelineSpawnFailureKind.path_not_found ||
+        pipeline_lookup_spawn_failure(ExecutableLookupKind.permission_denied) != PipelineSpawnFailureKind.permission_denied ||
+        pipeline_lookup_spawn_failure(ExecutableLookupKind.platform_error) != PipelineSpawnFailureKind.platform_error ||
+        pipeline_lookup_spawn_failure(ExecutableLookupKind.found) != PipelineSpawnFailureKind.none {
+        return error.InvalidPipeline;
+    }
+    const first: Pipeline = pipeline_registry_allocate();
+    const stale: Pipeline = Pipeline { handle: first.handle, generation: first.generation };
+    if try pipeline_registry_stage_count(&first) != 0usize {
+        return error.InvalidPipeline;
+    }
+    const empty_cwd: !void = pipeline_registry_set_last_stage_cwd(&first, "no-stage");
+    _ = empty_cwd catch {};
+    const empty_env: !void = pipeline_registry_append_last_stage_env(&first, "A", "1", 0);
+    _ = empty_env catch {};
+    if empty_cwd.error_id != @error_id(error.InvalidPipeline) ||
+        empty_env.error_id != @error_id(error.InvalidPipeline) {
+        return error.InvalidPipeline;
+    }
+    try pipeline_registry_append_process_stage(&first, 1);
+    try pipeline_registry_append_process_stage(&first, 2);
+    if try pipeline_registry_stage_count(&first) != 2usize {
+        return error.InvalidPipeline;
+    }
+    const argv_input: [&const byte: 2] = ["alpha", "beta"];
+    try pipeline_registry_set_last_stage_argv(&first, "tool", &argv_input[0], 2usize);
+    const first_slot: usize = try pipeline_registry_slot_index(&first);
+    if first_slot >= PIPELINE_REGISTRY_CAPACITY {
+        return error.InvalidPipeline;
+    }
+    const owned_stage_idx: usize = try pipeline_stage_storage_index(first_slot, 1usize);
+    if owned_stage_idx >= PIPELINE_STAGE_STORAGE_CAPACITY ||
+        _pipeline_process_stages[owned_stage_idx].argv_count != 3usize ||
+        _pipeline_process_stages[owned_stage_idx].argv == null ||
+        _pipeline_process_stages[owned_stage_idx].argv[0] == ("tool" as &byte) ||
+        pipeline_c_string_equals(_pipeline_process_stages[owned_stage_idx].argv[0], "tool") == 0 ||
+        pipeline_c_string_equals(_pipeline_process_stages[owned_stage_idx].argv[1], "alpha") == 0 ||
+        pipeline_c_string_equals(_pipeline_process_stages[owned_stage_idx].argv[2], "beta") == 0 {
+        return error.InvalidPipeline;
+    }
+    var execution_stage: PipelineExecutionStage = try pipeline_execution_stage_init("/bin/tool");
+    if execution_stage.exec_path == null ||
+        execution_stage.exec_path == ("/bin/tool" as &byte) ||
+        pipeline_c_string_equals(execution_stage.exec_path, "/bin/tool") == 0 ||
+        _pipeline_process_stages[owned_stage_idx].argv[0] == execution_stage.exec_path {
+        pipeline_execution_stage_deinit(&execution_stage);
+        return error.InvalidPipeline;
+    }
+    pipeline_execution_stage_deinit(&execution_stage);
+    if execution_stage.exec_path != null {
+        return error.InvalidPipeline;
+    }
+    try pipeline_registry_set_last_stage_cwd(&first, "build/work");
+    if _pipeline_process_stages[owned_stage_idx].cwd == null ||
+        _pipeline_process_stages[owned_stage_idx].cwd == ("build/work" as &byte) ||
+        pipeline_c_string_equals(_pipeline_process_stages[owned_stage_idx].cwd, "build/work") == 0 {
+        return error.InvalidPipeline;
+    }
+    var planned_execution: PipelineExecutionStage = try pipeline_execution_stage_from_process(
+        &_pipeline_process_stages[owned_stage_idx]);
+    if pipeline_c_string_equals(planned_execution.exec_path, "tool") == 0 ||
+        pipeline_c_string_equals(planned_execution.cwd, "build/work") == 0 {
+        pipeline_execution_stage_deinit(&planned_execution);
+        return error.InvalidPipeline;
+    }
+    pipeline_execution_stage_deinit(&planned_execution);
+    var cwd_snapshot: PipelineCwdSnapshot = try pipeline_cwd_snapshot_from("/sink/base");
+    const resolved_command: &byte = try pipeline_resolve_sink_path(&cwd_snapshot,
+        _pipeline_process_stages[owned_stage_idx].cwd, "tool");
+    const resolved_stream: &byte = try pipeline_resolve_sink_path(&cwd_snapshot,
+        _pipeline_process_stages[owned_stage_idx].cwd, "output.txt");
+    if pipeline_c_string_equals(resolved_command, "/sink/base/build/work/tool") == 0 ||
+        pipeline_c_string_equals(resolved_stream, "/sink/base/build/work/output.txt") == 0 {
+        free(resolved_command as &void);
+        free(resolved_stream as &void);
+        pipeline_cwd_snapshot_deinit(&cwd_snapshot);
+        return error.InvalidPipeline;
+    }
+    free(resolved_command as &void);
+    free(resolved_stream as &void);
+    pipeline_cwd_snapshot_deinit(&cwd_snapshot);
+    var captured_cwd: PipelineCwdSnapshot = try pipeline_cwd_snapshot_capture();
+    if captured_cwd.base == null { return error.InvalidPipeline; }
+    pipeline_cwd_snapshot_deinit(&captured_cwd);
+    try pipeline_registry_append_last_stage_env(&first, "MODE", "debug", 0);
+    try pipeline_registry_append_last_stage_env(&first, "OLD_MODE", null, 1);
+    if _pipeline_process_stages[owned_stage_idx].env_op_count != 2usize ||
+        _pipeline_process_stages[owned_stage_idx].env_ops == null ||
+        _pipeline_process_stages[owned_stage_idx].env_ops[0].remove != 0 ||
+        pipeline_c_string_equals(_pipeline_process_stages[owned_stage_idx].env_ops[0].key, "MODE") == 0 ||
+        pipeline_c_string_equals(_pipeline_process_stages[owned_stage_idx].env_ops[0].value, "debug") == 0 ||
+        _pipeline_process_stages[owned_stage_idx].env_ops[1].remove == 0 ||
+        pipeline_c_string_equals(_pipeline_process_stages[owned_stage_idx].env_ops[1].key, "OLD_MODE") == 0 ||
+        _pipeline_process_stages[owned_stage_idx].env_ops[1].value != null {
+        return error.InvalidPipeline;
+    }
+    var env_allocator: PipelineEnvAllocator = PipelineEnvAllocator { inner: get_allocator() };
+    var env_builder: EnvBlockBuilder = env_block_builder_new(env_allocator);
+    env_builder.inherit_current();
+    try pipeline_apply_stage_env(&_pipeline_process_stages[owned_stage_idx], &env_builder);
+    try env_builder.with("PATH", "/bin:/usr/bin");
+    try env_builder.build();
+    const path_env: &(&const byte) = pipeline_path_env(&env_builder);
+    const spawn_env: &(&const byte) = pipeline_spawn_env(&env_builder);
+    if path_env == null || spawn_env != path_env {
+        return error.InvalidPipeline;
+    }
+    var found_exec: [byte: 4096] = [];
+    if pipeline_resolve_command_path(&env_builder, "/", "sh", &found_exec[0], 4096usize) !=
+        ExecutableLookupKind.found || found_exec[0] == 0 as byte {
+        return error.InvalidPipeline;
+    }
+    const invalid_name: !void = pipeline_registry_append_last_stage_env(&first, "BAD=NAME", "x", 0);
+    _ = invalid_name catch {};
+    if invalid_name.error_id != @error_id(error.EnvInvalidName) {
+        return error.InvalidPipeline;
+    }
+    const invalid_value: !void = pipeline_registry_append_last_stage_env(&first, "VALID_NAME", null, 0);
+    _ = invalid_value catch {};
+    if invalid_value.error_id != @error_id(error.EnvInvalidValue) {
+        return error.InvalidPipeline;
+    }
+    try pipeline_set_stdin_policy(&first, PipelineStdinPolicyKind.file, "input.txt");
+    if _pipeline_stream_policies[first_slot].stdin_kind != PipelineStdinPolicyKind.file ||
+        _pipeline_stream_policies[first_slot].stdin_path == null ||
+        pipeline_c_string_equals(_pipeline_stream_policies[first_slot].stdin_path, "input.txt") == 0 {
+        return error.InvalidPipeline;
+    }
+    const stdin_conflict: !void = pipeline_set_stdin_policy(&first, PipelineStdinPolicyKind.inherit, null);
+    _ = stdin_conflict catch {};
+    if stdin_conflict.error_id != @error_id(error.InvalidPipeline) ||
+        _pipeline_stream_policies[first_slot].stdin_kind != PipelineStdinPolicyKind.file ||
+        pipeline_c_string_equals(_pipeline_stream_policies[first_slot].stdin_path, "input.txt") == 0 {
+        return error.InvalidPipeline;
+    }
+    try pipeline_set_stdout_policy(&first, PipelineStdoutPolicyKind.file, "output.txt");
+    if _pipeline_stream_policies[first_slot].stdout_kind != PipelineStdoutPolicyKind.file ||
+        pipeline_c_string_equals(_pipeline_stream_policies[first_slot].stdout_path, "output.txt") == 0 {
+        return error.InvalidPipeline;
+    }
+    const stdout_conflict: !void = pipeline_set_stdout_policy(&first, PipelineStdoutPolicyKind.capture, null);
+    _ = stdout_conflict catch {};
+    if stdout_conflict.error_id != @error_id(error.InvalidPipeline) ||
+        _pipeline_stream_policies[first_slot].stdout_kind != PipelineStdoutPolicyKind.file ||
+        pipeline_c_string_equals(_pipeline_stream_policies[first_slot].stdout_path, "output.txt") == 0 {
+        return error.InvalidPipeline;
+    }
+    try pipeline_set_stderr_policy(&first, PipelineStderrPolicyKind.file, "error.txt");
+    if _pipeline_stream_policies[first_slot].stderr_kind != PipelineStderrPolicyKind.file ||
+        pipeline_c_string_equals(_pipeline_stream_policies[first_slot].stderr_path, "error.txt") == 0 {
+        return error.InvalidPipeline;
+    }
+    const stderr_conflict: !void = pipeline_set_stderr_policy(&first, PipelineStderrPolicyKind.merge_stdout, null);
+    _ = stderr_conflict catch {};
+    if stderr_conflict.error_id != @error_id(error.InvalidPipeline) ||
+        _pipeline_stream_policies[first_slot].stderr_kind != PipelineStderrPolicyKind.file ||
+        pipeline_c_string_equals(_pipeline_stream_policies[first_slot].stderr_path, "error.txt") == 0 {
+        return error.InvalidPipeline;
+    }
+    if pipeline_registry_release(&first) == 0 {
+        return error.InvalidPipeline;
+    }
+    const stale_result: !usize = pipeline_registry_stage_count(&stale);
+    _ = stale_result catch { 0usize; };
+    if stale_result.error_id == 0 {
+        return error.InvalidPipeline;
+    }
+
+    const second: Pipeline = pipeline_registry_allocate();
+    if second.handle == stale.handle && second.generation == stale.generation {
+        return error.InvalidPipeline;
+    }
+    if pipeline_registry_release(&second) == 0 {
+        return error.InvalidPipeline;
+    }
+    if pipeline_registry_release(&second) != 0 {
+        return error.InvalidPipeline;
+    }
+
+    const forged: Pipeline = Pipeline { handle: PIPELINE_REGISTRY_CAPACITY + 1usize, generation: 1usize };
+    const forged_result: !usize = pipeline_registry_stage_count(&forged);
+    _ = forged_result catch { 0usize; };
+    if forged_result.error_id == 0 {
+        return error.InvalidPipeline;
+    }
+    return;
+}
+
+/// 验证 caller-provided statuses/capture buffer 协议；仅供编译器回归测试。
+export fn pipeline_buffer_self_test(statuses: &[PipelineStageStatus], stdout_buf: &[byte], result: &PipelineCaptureResult) !void {
+    pipeline_reset_capture_result(result);
+    const p: Pipeline = pipeline_registry_allocate();
+    try pipeline_registry_append_process_stage(&p, 1);
+    try pipeline_registry_append_process_stage(&p, 1);
+    const count: usize = try pipeline_prepare_status_buffer(&p, statuses, &result.result);
+    if count != 2usize {
+        return error.InvalidPipeline;
+    }
+    const sample: &[const byte] = &"ok"[0:2];
+    const copied: usize = try pipeline_copy_capture_bytes(stdout_buf, sample, 2usize);
+    result.stdout.captured = true;
+    result.stdout.byte_count = copied;
+    result.stdout.complete = true;
+    if pipeline_registry_release(&p) == 0 {
+        return error.InvalidPipeline;
+    }
+    return;
+}
+
+/// 验证 caller writable-region 的字节级重叠判定；仅供回归测试。
+export fn pipeline_region_self_test() !void {
+    var storage: [byte: 128] = [];
+    if pipeline_regions_overlap(&storage[0] as &const void, 32usize,
+            &storage[16] as &const void, 32usize) == false ||
+        pipeline_regions_overlap(&storage[0] as &const void, 16usize,
+            &storage[16] as &const void, 16usize) == true ||
+        pipeline_regions_overlap(&storage[0] as &const void, 0usize,
+            &storage[0] as &const void, 128usize) == true {
+        return error.InvalidPipeline;
+    }
+}

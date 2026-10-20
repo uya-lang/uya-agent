@@ -1,0 +1,978 @@
+// lib/std/mqtt/async.uya - 纯 UYA MQTT 异步协议层
+//
+// 模块路径：use std.mqtt.async
+//
+// 设计目标：
+// 1) MQTT 3.1 / 3.1.1 的最小可复用协议编解码；
+// 2) `@async_fn` + `AsyncReader` / `AsyncWriter` 驱动，调用方自带收发缓冲区；
+// 3) 提供 `AsyncMqttClient` 与 `MqttFdClient.@async_fn` 方法，便于把 MQTT 语义方法挂到自定义会话对象上；
+// 4) 默认走栈上固定数组和 caller-owned buffer，不在协议层做堆分配。
+// 使用文档：见 `uya/docs/std_mqtt_async.md`。
+
+use std.async;
+use libc.sys_socket;
+use libc.sys_connect;
+use libc.sys_close;
+use libc.sys_setsockopt;
+use libc.AF_INET;
+use libc.SOCK_STREAM;
+use libc.IPPROTO_TCP;
+use libc.TCP_NODELAY;
+
+export error MqttBuildOverflow;
+export error MqttBuildInvalid;
+export error MqttInvalidPacket;
+export error MqttNeedMoreData;
+export error MqttUnexpectedPacket;
+export error MqttConnectionClosed;
+export error MqttBufferTooSmall;
+
+export const MQTT_PROTOCOL_V31: byte = 3 as byte;
+export const MQTT_PROTOCOL_V311: byte = 4 as byte;
+
+export const MQTT_PACKET_TYPE_CONNECT: byte = 1 as byte;
+export const MQTT_PACKET_TYPE_CONNACK: byte = 2 as byte;
+export const MQTT_PACKET_TYPE_PUBLISH: byte = 3 as byte;
+export const MQTT_PACKET_TYPE_SUBSCRIBE: byte = 8 as byte;
+export const MQTT_PACKET_TYPE_SUBACK: byte = 9 as byte;
+
+fn mqtt_u16_host_to_be(v: u16) u16 {
+    return ((v & (0xFF as u16)) << 8) | ((v >> 8) & (0xFF as u16));
+}
+
+fn mqtt_write_u16_be_at(out: &byte, cap: usize, idx: &usize, v: u16) !void {
+    if *idx + 2 > cap {
+        return error.MqttBuildOverflow;
+    }
+    const be: u16 = mqtt_u16_host_to_be(v);
+    out[*idx] = ((be & (0xFF as u16)) as! byte).value;
+    out[*idx + 1] = (((be >> 8) & (0xFF as u16)) as! byte).value;
+    *idx = *idx + 2;
+}
+
+fn mqtt_write_bytes_at(out: &byte, cap: usize, idx: &usize, src: &const byte, n: usize) !void {
+    if *idx + n > cap {
+        return error.MqttBuildOverflow;
+    }
+    var i: usize = 0;
+    while i < n {
+        out[*idx + i] = src[i];
+        i = i + 1;
+    }
+    *idx = *idx + n;
+}
+
+fn mqtt_write_utf8_field_at(out: &byte, cap: usize, idx: &usize, s: &const byte, n: usize) !void {
+    if n > 65535 {
+        return error.MqttBuildInvalid;
+    }
+    try mqtt_write_u16_be_at(out, cap, idx, n as u16);
+    try mqtt_write_bytes_at(out, cap, idx, s, n);
+}
+
+fn mqtt_encode_remaining_len(v0: usize, out: &byte, out_cap: usize) !usize {
+    var v: usize = v0;
+    if v > 268435455 {
+        return error.MqttBuildInvalid;
+    }
+    var i: usize = 0;
+    while true {
+        if i >= out_cap {
+            return error.MqttBuildOverflow;
+        }
+        var d: byte = (v % (128 as usize)) as byte;
+        v = v / (128 as usize);
+        if v > 0 {
+            d = d | (0x80 as byte);
+        }
+        out[i] = d;
+        i = i + 1;
+        if v == 0 {
+            break;
+        }
+    }
+    return i;
+}
+
+fn mqtt_bytes_equal(a: &const byte, b: &const byte, n: usize) bool {
+    var i: usize = 0;
+    while i < n {
+        if a[i] != b[i] {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn mqtt_bytes_contains(hay: &const byte, hlen: usize, needle: &const byte, nlen: usize) bool {
+    if nlen == 0 {
+        return true;
+    }
+    if hlen < nlen {
+        return false;
+    }
+    var i: usize = 0;
+    while i + nlen <= hlen {
+        if mqtt_bytes_equal(hay + i, needle, nlen) {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn mqtt_slice_from_raw(base: &byte, len: usize) &[byte] {
+    return base[0: len];
+}
+
+fn mqtt_decode_remaining_len(raw: &const byte, raw_len: usize, header_len: &usize, remaining_len: &usize) !void {
+    if raw == null || raw_len == 0 {
+        return error.MqttNeedMoreData;
+    }
+    if raw_len < 2 {
+        return error.MqttNeedMoreData;
+    }
+    var rem: usize = 0;
+    var mul: usize = 1;
+    var rl_len: usize = 0;
+    while rl_len < 4 {
+        const ri: usize = 1 + rl_len;
+        if ri >= raw_len {
+            return error.MqttNeedMoreData;
+        }
+        const d: usize = raw[ri] as usize;
+        rem = rem + ((d & (127 as usize)) * mul);
+        rl_len = rl_len + 1;
+        if (d & (128 as usize)) == 0 {
+            header_len[0] = 1 + rl_len;
+            remaining_len[0] = rem;
+            return;
+        }
+        mul = mul * (128 as usize);
+    }
+    return error.MqttInvalidPacket;
+}
+
+export struct MqttConnectOptions {
+    client_id: &const byte,
+    client_id_len: usize,
+    username: &const byte = null,
+    username_len: usize = 0,
+    password: &const byte = null,
+    password_len: usize = 0,
+    keepalive: u16 = 60,
+    protocol_level: byte = MQTT_PROTOCOL_V311,
+
+    fn validate(self: &Self) !void {
+        if self.client_id == null || self.client_id_len == 0 || self.client_id_len > 23 {
+            return error.MqttBuildInvalid;
+        }
+        if self.protocol_level != MQTT_PROTOCOL_V31 && self.protocol_level != MQTT_PROTOCOL_V311 {
+            return error.MqttBuildInvalid;
+        }
+        if self.username_len > 65535 || self.password_len > 65535 {
+            return error.MqttBuildInvalid;
+        }
+        if self.password_len > 0 && self.username_len == 0 {
+            return error.MqttBuildInvalid;
+        }
+    }
+
+    fn build_packet(self: &Self, out: &byte, out_cap: usize) !usize {
+        try self.validate();
+
+        var proto_len: usize = 0;
+        if self.protocol_level == MQTT_PROTOCOL_V311 {
+            proto_len = 4;
+        } else {
+            proto_len = 6;
+        }
+
+        var rem: usize = 2 + proto_len + 1 + 1 + 2 + 2 + self.client_id_len;
+        if self.username_len > 0 {
+            rem = rem + 2 + self.username_len;
+        }
+        if self.password_len > 0 {
+            rem = rem + 2 + self.password_len;
+        }
+        if out_cap < 2 {
+            return error.MqttBuildOverflow;
+        }
+
+        out[0] = 0x10 as byte;
+        var idx: usize = 1;
+        var rem_enc: [byte: 4] = [0: 4];
+        const rem_len: usize = try mqtt_encode_remaining_len(rem, &rem_enc[0], 4);
+        try mqtt_write_bytes_at(out, out_cap, &idx, &rem_enc[0], rem_len);
+
+        if self.protocol_level == MQTT_PROTOCOL_V311 {
+            try mqtt_write_u16_be_at(out, out_cap, &idx, 4);
+            var pname311: [byte: 5] = "MQTT";
+            try mqtt_write_bytes_at(out, out_cap, &idx, &pname311[0], 4);
+        } else {
+            try mqtt_write_u16_be_at(out, out_cap, &idx, 6);
+            var pname31: [byte: 7] = "MQIsdp";
+            try mqtt_write_bytes_at(out, out_cap, &idx, &pname31[0], 6);
+        }
+        if idx + 4 > out_cap {
+            return error.MqttBuildOverflow;
+        }
+        out[idx] = self.protocol_level;
+        idx = idx + 1;
+
+        var flags: byte = (0x02 as byte);
+        if self.username_len > 0 {
+            flags = flags | (0x80 as byte);
+        }
+        if self.password_len > 0 {
+            flags = flags | (0x40 as byte);
+        }
+        out[idx] = flags;
+        idx = idx + 1;
+
+        try mqtt_write_u16_be_at(out, out_cap, &idx, self.keepalive);
+        try mqtt_write_utf8_field_at(out, out_cap, &idx, self.client_id, self.client_id_len);
+        if self.username_len > 0 {
+            try mqtt_write_utf8_field_at(out, out_cap, &idx, self.username, self.username_len);
+        }
+        if self.password_len > 0 {
+            try mqtt_write_utf8_field_at(out, out_cap, &idx, self.password, self.password_len);
+        }
+        return idx;
+    }
+}
+
+export fn mqtt_connect_options_build_packet(opts: &MqttConnectOptions, out: &byte, out_cap: usize) !usize {
+    return opts.build_packet(out, out_cap);
+}
+
+export struct MqttSubscribeRequest {
+    packet_id: u16,
+    topic: &const byte,
+    topic_len: usize,
+    qos: byte = 0,
+
+    fn validate(self: &Self) !void {
+        if self.packet_id == 0 || self.topic == null || self.topic_len == 0 || self.topic_len > 65535 {
+            return error.MqttBuildInvalid;
+        }
+        if self.qos > 0x02 as byte {
+            return error.MqttBuildInvalid;
+        }
+    }
+
+    fn build_packet(self: &Self, out: &byte, out_cap: usize) !usize {
+        try self.validate();
+        const rem: usize = 2 + 2 + self.topic_len + 1;
+        if out_cap < 2 {
+            return error.MqttBuildOverflow;
+        }
+
+        out[0] = 0x82 as byte;
+        var idx: usize = 1;
+        var rem_enc: [byte: 4] = [0: 4];
+        const rem_len: usize = try mqtt_encode_remaining_len(rem, &rem_enc[0], 4);
+        try mqtt_write_bytes_at(out, out_cap, &idx, &rem_enc[0], rem_len);
+        try mqtt_write_u16_be_at(out, out_cap, &idx, self.packet_id);
+        try mqtt_write_utf8_field_at(out, out_cap, &idx, self.topic, self.topic_len);
+        if idx + 1 > out_cap {
+            return error.MqttBuildOverflow;
+        }
+        out[idx] = self.qos;
+        idx = idx + 1;
+        return idx;
+    }
+}
+
+export fn mqtt_subscribe_request_build_packet(req: &MqttSubscribeRequest, out: &byte, out_cap: usize) !usize {
+    return req.build_packet(out, out_cap);
+}
+
+export struct MqttPublishRequest {
+    topic: &const byte,
+    topic_len: usize,
+    payload: &const byte,
+    payload_len: usize,
+    qos: byte = 0,
+    retain: bool = false,
+
+    fn validate(self: &Self) !void {
+        if self.topic == null || self.topic_len == 0 || self.topic_len > 65535 {
+            return error.MqttBuildInvalid;
+        }
+        if self.qos != 0 as byte {
+            return error.MqttBuildInvalid;
+        }
+    }
+
+    fn build_packet(self: &Self, out: &byte, out_cap: usize) !usize {
+        try self.validate();
+        const rem: usize = 2 + self.topic_len + self.payload_len;
+        if out_cap < 2 {
+            return error.MqttBuildOverflow;
+        }
+
+        var first: byte = 0x30 as byte;
+        if self.retain {
+            first = first | (0x01 as byte);
+        }
+        out[0] = first;
+        var idx: usize = 1;
+        var rem_enc: [byte: 4] = [0: 4];
+        const rem_len: usize = try mqtt_encode_remaining_len(rem, &rem_enc[0], 4);
+        try mqtt_write_bytes_at(out, out_cap, &idx, &rem_enc[0], rem_len);
+        try mqtt_write_utf8_field_at(out, out_cap, &idx, self.topic, self.topic_len);
+        try mqtt_write_bytes_at(out, out_cap, &idx, self.payload, self.payload_len);
+        return idx;
+    }
+}
+
+export fn mqtt_publish_request_build_packet(req: &MqttPublishRequest, out: &byte, out_cap: usize) !usize {
+    return req.build_packet(out, out_cap);
+}
+
+export struct MqttConnAck {
+    session_present: bool,
+    return_code: byte,
+
+    fn accepted(self: &Self) bool {
+        return self.return_code == 0 as byte;
+    }
+}
+
+export struct MqttSubAck {
+    packet_id: u16,
+    granted_qos: byte,
+
+    fn accepted(self: &Self) bool {
+        return self.granted_qos != 0x80 as byte;
+    }
+}
+
+export struct MqttPublishView {
+    topic_ptr: &const byte,
+    topic_len: usize,
+    payload_ptr: &const byte,
+    payload_len: usize,
+    qos: byte,
+    retain: bool,
+    dup: bool,
+
+    fn topic_eq(self: &Self, rhs: &const byte, rhs_len: usize) bool {
+        if self.topic_len != rhs_len {
+            return false;
+        }
+        return mqtt_bytes_equal(self.topic_ptr, rhs, rhs_len);
+    }
+
+    fn payload_contains(self: &Self, needle: &const byte, needle_len: usize) bool {
+        return mqtt_bytes_contains(self.payload_ptr, self.payload_len, needle, needle_len);
+    }
+}
+
+export struct MqttPacketView {
+    packet_type: byte,
+    flags: byte,
+    header_len: usize,
+    remaining_len: usize,
+    payload: &[byte],
+
+    fn packet_len(self: &Self) usize {
+        return self.header_len + self.remaining_len;
+    }
+
+    fn parse_connack(self: &Self) !MqttConnAck {
+        if self.packet_type != MQTT_PACKET_TYPE_CONNACK {
+            return error.MqttUnexpectedPacket;
+        }
+        if self.remaining_len != 2 || self.payload.len != 2 {
+            return error.MqttInvalidPacket;
+        }
+        if (self.payload[0] & (0xFE as byte)) != 0 {
+            return error.MqttInvalidPacket;
+        }
+        return MqttConnAck{
+            session_present: (self.payload[0] & (0x01 as byte)) != 0,
+            return_code: self.payload[1],
+        };
+    }
+
+    fn parse_suback(self: &Self) !MqttSubAck {
+        if self.packet_type != MQTT_PACKET_TYPE_SUBACK {
+            return error.MqttUnexpectedPacket;
+        }
+        if self.remaining_len < 3 || self.payload.len < 3 {
+            return error.MqttInvalidPacket;
+        }
+        return MqttSubAck{
+            packet_id: (((self.payload[0] as u16) << 8) | (self.payload[1] as u16)),
+            granted_qos: self.payload[2],
+        };
+    }
+
+    fn parse_publish(self: &Self) !MqttPublishView {
+        if self.packet_type != MQTT_PACKET_TYPE_PUBLISH {
+            return error.MqttUnexpectedPacket;
+        }
+        if self.remaining_len < 2 || self.payload.len < 2 {
+            return error.MqttInvalidPacket;
+        }
+        const topic_len: usize = (((self.payload[0] as usize) << 8) | (self.payload[1] as usize));
+        if self.remaining_len < 2 + topic_len {
+            return error.MqttInvalidPacket;
+        }
+        const qos: byte = ((self.flags >> 1) & (0x03 as byte));
+        var off: usize = 2 + topic_len;
+        if qos != 0 as byte {
+            if self.remaining_len < off + 2 {
+                return error.MqttInvalidPacket;
+            }
+            off = off + 2;
+        }
+        const payload_len: usize = self.remaining_len - off;
+        const topic_ptr: &const byte = @ptr_from_usize(@usize_from_ptr(self.payload.ptr as &void) + 2) as &const byte;
+        const payload_ptr: &const byte = @ptr_from_usize(@usize_from_ptr(self.payload.ptr as &void) + off) as &const byte;
+        return MqttPublishView{
+            topic_ptr: topic_ptr,
+            topic_len: topic_len,
+            payload_ptr: payload_ptr,
+            payload_len: payload_len,
+            qos: qos,
+            retain: (self.flags & (0x01 as byte)) != 0,
+            dup: (self.flags & (0x08 as byte)) != 0,
+        };
+    }
+}
+
+export fn mqtt_packet_parse_connack(packet: &MqttPacketView) !MqttConnAck {
+    return packet.parse_connack();
+}
+
+export fn mqtt_packet_parse_suback(packet: &MqttPacketView) !MqttSubAck {
+    return packet.parse_suback();
+}
+
+export fn mqtt_packet_parse_publish(packet: &MqttPacketView) !MqttPublishView {
+    return packet.parse_publish();
+}
+
+export fn mqtt_packet_wire_len(raw: &const byte, raw_len: usize) !usize {
+    var header_len: usize = 0;
+    var remaining_len: usize = 0;
+    try mqtt_decode_remaining_len(raw, raw_len, &header_len, &remaining_len);
+    const total: usize = header_len + remaining_len;
+    if total > raw_len {
+        return error.MqttNeedMoreData;
+    }
+    return total;
+}
+
+fn mqtt_parse_packet_raw(raw: &const byte, raw_len: usize) !MqttPacketView {
+    const total: usize = try mqtt_packet_wire_len(raw, raw_len);
+    var header_len: usize = 0;
+    var remaining_len: usize = 0;
+    try mqtt_decode_remaining_len(raw, raw_len, &header_len, &remaining_len);
+    if total != header_len + remaining_len {
+        return error.MqttInvalidPacket;
+    }
+    return MqttPacketView{
+        packet_type: (raw[0] >> 4),
+        flags: (raw[0] & (0x0F as byte)),
+        header_len: header_len,
+        remaining_len: remaining_len,
+        payload: raw[header_len: remaining_len],
+    };
+}
+
+export fn mqtt_parse_packet(raw: &[byte]) !MqttPacketView {
+    return mqtt_parse_packet_raw(raw.ptr as &const byte, raw.len);
+}
+
+export struct MqttFdTransport : AsyncReader, AsyncWriter {
+    fd: i32,
+    owned: i32,
+    closed: i32 = 0,
+
+    fn read(self: &Self, buf: &byte, count: usize) Future<!usize> {
+        return async_fd_read_future(self.fd, buf, count);
+    }
+
+    fn read_exact(self: &Self, buf: &byte, count: usize) Future<!usize> {
+        return async_fd_read_exact(self.fd, buf, count);
+    }
+
+    fn write(self: &Self, data: &const byte, count: usize) Future<!usize> {
+        return async_fd_write_future(self.fd, data, count);
+    }
+
+    fn write_all(self: &Self, data: &const byte, count: usize) Future<!usize> {
+        return async_fd_write_all(self.fd, data, count);
+    }
+
+    fn flush(self: &Self) Future<!usize> {
+        _ = self;
+        return future_ready_ok<usize>(0);
+    }
+
+    fn borrow_fd(self: &Self) i32 {
+        return self.fd;
+    }
+
+    fn take_fd(self: &Self) i32 {
+        const fd: i32 = self.fd;
+        self.fd = -1;
+        self.owned = 0;
+        self.closed = 1;
+        return fd;
+    }
+
+    fn close(self: &Self) void {
+        if self.closed != 0 {
+            return;
+        }
+        self.closed = 1;
+        if self.owned != 0 && self.fd >= 0 {
+            _ = sys_close(self.fd) catch {};
+        }
+        self.fd = -1;
+    }
+
+    fn drop(self: MqttFdTransport) void {
+        if self.owned != 0 && self.closed == 0 && self.fd >= 0 {
+            _ = sys_close(self.fd) catch {};
+        }
+    }
+}
+
+export fn mqtt_fd_transport_owned(fd: i32) MqttFdTransport {
+    return MqttFdTransport{ fd: fd, owned: 1, closed: 0 };
+}
+
+export fn mqtt_fd_transport_borrowed(fd: i32) MqttFdTransport {
+    return MqttFdTransport{ fd: fd, owned: 0, closed: 0 };
+}
+
+export struct MqttIpv4Endpoint {
+    a: byte,
+    b: byte,
+    c: byte,
+    d: byte,
+    port: u16,
+
+    fn fill_sockaddr(self: &Self, out: &byte) void {
+        var i: usize = 0;
+        while i < 16 {
+            out[i] = 0 as byte;
+            i = i + 1;
+        }
+        out[0] = AF_INET as byte;
+        out[1] = 0 as byte;
+        const pnet: u16 = mqtt_u16_host_to_be(self.port);
+        out[2] = (pnet & 0xFF) as byte;
+        out[3] = ((pnet >> 8) & 0xFF) as byte;
+        out[4] = self.a;
+        out[5] = self.b;
+        out[6] = self.c;
+        out[7] = self.d;
+    }
+
+    fn connect(self: &Self) !MqttFdTransport {
+        const fd: i32 = try sys_socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        errdefer { _ = sys_close(fd) catch {}; }
+        var addr: [byte: 16] = [0: 16];
+        self.fill_sockaddr(&addr[0]);
+        _ = try sys_connect(fd, &addr[0] as &void, 16 as u32);
+        var nd: i32 = 1;
+        _ = sys_setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &nd as &void, 4 as u32) catch {};
+        return mqtt_fd_transport_owned(fd);
+    }
+}
+
+export struct MqttClient {
+    connect: MqttConnectOptions,
+    next_packet_id: u16 = 1,
+
+    fn alloc_packet_id(self: &Self) u16 {
+        var mid: u16 = self.next_packet_id;
+        if mid == 0 {
+            mid = 1;
+        }
+        self.next_packet_id = mid + (1 as u16);
+        if self.next_packet_id == 0 {
+            self.next_packet_id = 1 as u16;
+        }
+        return mid;
+    }
+
+    fn subscribe_request(self: &Self, topic: &const byte, topic_len: usize) MqttSubscribeRequest {
+        return MqttSubscribeRequest{
+            packet_id: self.alloc_packet_id(),
+            topic: topic,
+            topic_len: topic_len,
+            qos: 0 as byte,
+        };
+    }
+
+    fn publish_request(self: &Self, topic: &const byte, topic_len: usize, payload: &const byte, payload_len: usize) MqttPublishRequest {
+        return MqttPublishRequest{
+            topic: topic,
+            topic_len: topic_len,
+            payload: payload,
+            payload_len: payload_len,
+            qos: 0 as byte,
+            retain: false,
+        };
+    }
+}
+
+export fn mqtt_client_new(connect: &MqttConnectOptions) MqttClient {
+    return MqttClient{
+        connect: *connect,
+        next_packet_id: 1 as u16,
+    };
+}
+
+export interface AsyncMqttClient {
+    @async_fn
+    fn connect(self: &Self, tx: &byte, tx_cap: usize, rx: &byte, rx_cap: usize) Future<!MqttConnAck>;
+    @async_fn
+    fn subscribe(self: &Self, topic: &const byte, topic_len: usize, tx: &byte, tx_cap: usize, rx: &byte, rx_cap: usize) Future<!MqttSubAck>;
+    @async_fn
+    fn publish_qos0(self: &Self, topic: &const byte, topic_len: usize, payload: &const byte, payload_len: usize, tx: &byte, tx_cap: usize) Future<!usize>;
+    @async_fn
+    fn read_packet(self: &Self, rx: &byte, rx_cap: usize) Future<!MqttPacketView>;
+}
+
+export @async_fn fn mqtt_write_all<W: AsyncWriter>(writer: &W, src: &const byte, total: usize) Future<!usize> {
+    var sent_total: usize = 0;
+    while sent_total < total {
+        const n: usize = try @await writer.write(src + sent_total, total - sent_total);
+        if n == 0 {
+            return sent_total;
+        }
+        sent_total = sent_total + n;
+    }
+    return sent_total;
+}
+
+export @async_fn fn mqtt_read_exact<R: AsyncReader>(reader: &R, dst: &byte, total: usize) Future<!usize> {
+    var got_total: usize = 0;
+    while got_total < total {
+        const n: usize = try @await reader.read(dst + got_total, total - got_total);
+        if n == 0 {
+            return got_total;
+        }
+        got_total = got_total + n;
+    }
+    return got_total;
+}
+
+export @async_fn fn mqtt_read_packet<R: AsyncReader>(reader: &R, dst: &byte, cap: usize) Future<!MqttPacketView> {
+    if cap < 2 {
+        return error.MqttBufferTooSmall;
+    }
+
+    const first_n: usize = try @await reader.read(dst, 1);
+    if first_n != 1 {
+        return error.MqttConnectionClosed;
+    }
+
+    var rem: usize = 0;
+    var mul: usize = 1;
+    var rl_len: usize = 0;
+    while rl_len < 4 {
+        if 1 + rl_len >= cap {
+            return error.MqttBufferTooSmall;
+        }
+        const rn: usize = try @await reader.read(dst + 1 + rl_len, 1);
+        if rn != 1 {
+            return error.MqttConnectionClosed;
+        }
+        const d: usize = dst[1 + rl_len] as usize;
+        rem = rem + ((d & (127 as usize)) * mul);
+        rl_len = rl_len + 1;
+        if (d & (128 as usize)) == 0 {
+            break;
+        }
+        mul = mul * (128 as usize);
+    }
+    if rl_len == 0 || rl_len > 4 {
+        return error.MqttInvalidPacket;
+    }
+
+    const header_len: usize = 1 + rl_len;
+    if header_len + rem > cap {
+        return error.MqttBufferTooSmall;
+    }
+
+    var got_total: usize = 0;
+    while got_total < rem {
+        const rn2: usize = try @await reader.read(dst + header_len + got_total, rem - got_total);
+        if rn2 == 0 {
+            return error.MqttConnectionClosed;
+        }
+        got_total = got_total + rn2;
+    }
+    if got_total != rem {
+        return error.MqttConnectionClosed;
+    }
+    return try mqtt_parse_packet_raw(dst as &const byte, header_len + rem);
+}
+
+export @async_fn fn mqtt_read_packet_fd(io: &MqttFdTransport, dst: &byte, cap: usize) Future<!MqttPacketView> {
+    if cap < 2 {
+        return error.MqttBufferTooSmall;
+    }
+
+    const first_n: usize = try @await io.read(dst, 1);
+    if first_n != 1 {
+        return error.MqttConnectionClosed;
+    }
+
+    var rem: usize = 0;
+    var mul: usize = 1;
+    var rl_len: usize = 0;
+    while rl_len < 4 {
+        if 1 + rl_len >= cap {
+            return error.MqttBufferTooSmall;
+        }
+        const rn: usize = try @await io.read(dst + 1 + rl_len, 1);
+        if rn != 1 {
+            return error.MqttConnectionClosed;
+        }
+        const d: usize = dst[1 + rl_len] as usize;
+        rem = rem + ((d & (127 as usize)) * mul);
+        rl_len = rl_len + 1;
+        if (d & (128 as usize)) == 0 {
+            break;
+        }
+        mul = mul * (128 as usize);
+    }
+    if rl_len == 0 || rl_len > 4 {
+        return error.MqttInvalidPacket;
+    }
+
+    const header_len: usize = 1 + rl_len;
+    if header_len + rem > cap {
+        return error.MqttBufferTooSmall;
+    }
+
+    var got_total: usize = 0;
+    while got_total < rem {
+        const rn2: usize = try @await io.read(dst + header_len + got_total, rem - got_total);
+        if rn2 == 0 {
+            return error.MqttConnectionClosed;
+        }
+        got_total = got_total + rn2;
+    }
+    if got_total != rem {
+        return error.MqttConnectionClosed;
+    }
+    return try mqtt_parse_packet_raw(dst as &const byte, header_len + rem);
+}
+
+export @async_fn fn mqtt_client_connect_fd(
+    client: &MqttClient,
+    io: &MqttFdTransport,
+    tx: &byte,
+    tx_cap: usize,
+    rx: &byte,
+    rx_cap: usize
+) Future<!MqttConnAck> {
+    const tx_len: usize = try mqtt_connect_options_build_packet(&client.connect, tx, tx_cap);
+    var sent_total: usize = 0;
+    while sent_total < tx_len {
+        const wn: usize = try @await io.write((tx as &const byte) + sent_total, tx_len - sent_total);
+        if wn == 0 {
+            return error.MqttConnectionClosed;
+        }
+        sent_total = sent_total + wn;
+    }
+
+    if rx_cap < 2 {
+        return error.MqttBufferTooSmall;
+    }
+    const first_n: usize = try @await io.read(rx, 1);
+    if first_n != 1 {
+        return error.MqttConnectionClosed;
+    }
+    var rem: usize = 0;
+    var mul: usize = 1;
+    var rl_len: usize = 0;
+    while rl_len < 4 {
+        if 1 + rl_len >= rx_cap {
+            return error.MqttBufferTooSmall;
+        }
+        const n: usize = try @await io.read(rx + 1 + rl_len, 1);
+        if n != 1 {
+            return error.MqttConnectionClosed;
+        }
+        const d: usize = rx[1 + rl_len] as usize;
+        rem = rem + ((d & (127 as usize)) * mul);
+        rl_len = rl_len + 1;
+        if (d & (128 as usize)) == 0 {
+            break;
+        }
+        mul = mul * (128 as usize);
+    }
+    const header_len: usize = 1 + rl_len;
+    if header_len + rem > rx_cap {
+        return error.MqttBufferTooSmall;
+    }
+    var got_total: usize = 0;
+    while got_total < rem {
+        const rn: usize = try @await io.read(rx + header_len + got_total, rem - got_total);
+        if rn == 0 {
+            return error.MqttConnectionClosed;
+        }
+        got_total = got_total + rn;
+    }
+    const packet: MqttPacketView = try mqtt_parse_packet_raw(rx as &const byte, header_len + rem);
+    return try mqtt_packet_parse_connack(&packet);
+}
+
+export @async_fn fn mqtt_client_subscribe_fd(
+    client: &MqttClient,
+    io: &MqttFdTransport,
+    topic: &const byte,
+    topic_len: usize,
+    tx: &byte,
+    tx_cap: usize,
+    rx: &byte,
+    rx_cap: usize
+) Future<!MqttSubAck> {
+    const req: MqttSubscribeRequest = client.subscribe_request(topic, topic_len);
+    const tx_len: usize = try mqtt_subscribe_request_build_packet(&req, tx, tx_cap);
+    var sent_total: usize = 0;
+    while sent_total < tx_len {
+        const wn: usize = try @await io.write((tx as &const byte) + sent_total, tx_len - sent_total);
+        if wn == 0 {
+            return error.MqttConnectionClosed;
+        }
+        sent_total = sent_total + wn;
+    }
+
+    if rx_cap < 2 {
+        return error.MqttBufferTooSmall;
+    }
+    const first_n: usize = try @await io.read(rx, 1);
+    if first_n != 1 {
+        return error.MqttConnectionClosed;
+    }
+    var rem: usize = 0;
+    var mul: usize = 1;
+    var rl_len: usize = 0;
+    while rl_len < 4 {
+        if 1 + rl_len >= rx_cap {
+            return error.MqttBufferTooSmall;
+        }
+        const n: usize = try @await io.read(rx + 1 + rl_len, 1);
+        if n != 1 {
+            return error.MqttConnectionClosed;
+        }
+        const d: usize = rx[1 + rl_len] as usize;
+        rem = rem + ((d & (127 as usize)) * mul);
+        rl_len = rl_len + 1;
+        if (d & (128 as usize)) == 0 {
+            break;
+        }
+        mul = mul * (128 as usize);
+    }
+    const header_len: usize = 1 + rl_len;
+    if header_len + rem > rx_cap {
+        return error.MqttBufferTooSmall;
+    }
+    var got_total: usize = 0;
+    while got_total < rem {
+        const rn: usize = try @await io.read(rx + header_len + got_total, rem - got_total);
+        if rn == 0 {
+            return error.MqttConnectionClosed;
+        }
+        got_total = got_total + rn;
+    }
+    const packet: MqttPacketView = try mqtt_parse_packet_raw(rx as &const byte, header_len + rem);
+    return try mqtt_packet_parse_suback(&packet);
+}
+
+export @async_fn fn mqtt_client_publish_qos0_fd(
+    client: &MqttClient,
+    io: &MqttFdTransport,
+    topic: &const byte,
+    topic_len: usize,
+    payload: &const byte,
+    payload_len: usize,
+    tx: &byte,
+    tx_cap: usize
+) Future<!usize> {
+    const req: MqttPublishRequest = client.publish_request(topic, topic_len, payload, payload_len);
+    const tx_len: usize = try mqtt_publish_request_build_packet(&req, tx, tx_cap);
+    var sent_total: usize = 0;
+    while sent_total < tx_len {
+        const wn: usize = try @await io.write((tx as &const byte) + sent_total, tx_len - sent_total);
+        if wn == 0 {
+            return error.MqttConnectionClosed;
+        }
+        sent_total = sent_total + wn;
+    }
+    return sent_total;
+}
+
+export struct MqttFdClient : AsyncMqttClient {
+    state: MqttClient,
+    io: MqttFdTransport,
+
+    @async_fn
+    fn connect(self: &Self, tx: &byte, tx_cap: usize, rx: &byte, rx_cap: usize) Future<!MqttConnAck> {
+        return try @await mqtt_client_connect_fd(&self.state, &self.io, tx, tx_cap, rx, rx_cap);
+    }
+
+    @async_fn
+    fn subscribe(self: &Self, topic: &const byte, topic_len: usize, tx: &byte, tx_cap: usize, rx: &byte, rx_cap: usize) Future<!MqttSubAck> {
+        return try @await mqtt_client_subscribe_fd(&self.state, &self.io, topic, topic_len, tx, tx_cap, rx, rx_cap);
+    }
+
+    @async_fn
+    fn publish_qos0(self: &Self, topic: &const byte, topic_len: usize, payload: &const byte, payload_len: usize, tx: &byte, tx_cap: usize) Future<!usize> {
+        return try @await mqtt_client_publish_qos0_fd(&self.state, &self.io, topic, topic_len, payload, payload_len, tx, tx_cap);
+    }
+
+    @async_fn
+    fn read_packet(self: &Self, rx: &byte, rx_cap: usize) Future<!MqttPacketView> {
+        return try @await mqtt_read_packet_fd(&self.io, rx, rx_cap);
+    }
+
+    fn borrow_fd(self: &Self) i32 {
+        return self.io.borrow_fd();
+    }
+
+    fn take_fd(self: &Self) i32 {
+        return self.io.take_fd();
+    }
+
+    fn close(self: &Self) void {
+        self.io.close();
+    }
+}
+
+export fn mqtt_fd_client_new(connect: &MqttConnectOptions, io: &MqttFdTransport) MqttFdClient {
+    const owned: i32 = io.owned;
+    const fd: i32 = io.take_fd();
+    var closed: i32 = 0;
+    if fd < 0 {
+        closed = 1;
+    }
+    return MqttFdClient{
+        state: mqtt_client_new(connect),
+        io: MqttFdTransport{
+            fd: fd,
+            owned: owned,
+            closed: closed,
+        },
+    };
+}
+
+export fn mqtt_fd_client_dial(endpoint: &MqttIpv4Endpoint, connect: &MqttConnectOptions) !MqttFdClient {
+    var io: MqttFdTransport = try endpoint.connect();
+    return mqtt_fd_client_new(connect, &io);
+}

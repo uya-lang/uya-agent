@@ -108,15 +108,14 @@ readelf -dW build/uya-agent | grep -c NEEDED      # 0
 为什么开关必须写在 Makefile 的**行内赋值**里、为什么命令行的 `LDFLAGS=-static` 不算数、
 为什么文档里的 `LINK_MODE=static` 无效 —— 见 [DESIGN.md §16 踩坑 90](DESIGN.md)。
 
-不带 make 的等价命令（关键点：**显式导出 `UYA_ROOT`**、**显式给 `LDFLAGS=-static`**，
-并尽量用编译器的绝对路径）：
+不带 make 的等价命令（关键点：**用仓自带的启动器**——`uya/bin/uya` 自己把 `UYA_ROOT`
+钉到 `uya/stdlib`，不用装编译器也不用 export；**显式给 `LDFLAGS=-static`**）：
 
 ```bash
-export UYA_ROOT=/home/winger/uya-0.10/lib/
 export UYA_SPLIT_C_DIR=$PWD/build/uyacache      # 多文件 C 缓存别丢在仓库根目录
 # 文件清单以 Makefile 的 SRC 为准（按域分目录；手抄的清单一定会过期）
 LDFLAGS=-static \
-  /home/winger/uya-0.10/bin/uya build $(make -s print-src) -o build/uya-agent
+  ./uya/bin/uya build $(make -s print-src) -o build/uya-agent
 readelf -lW build/uya-agent | grep -c INTERP    # 0 = 真静态
 ```
 
@@ -542,8 +541,15 @@ make check                      # 类型检查（看「AST 合并完成，共 N 
 make selftest                   # 离线端到端
 ```
 
-**换编译器**：`make UYA=/home/winger/uya-0.11/bin/uya UYA_ROOT=/home/winger/uya-0.11/lib/ ...`
-（0.11 与本仓的差异见 [DESIGN.md §15.1](DESIGN.md)）。
+**换编译器**：默认用仓自带的 `./uya/bin/uya`（启动器 + `uya/stdlib`）。
+要换成装在外面的别版，两个变量一起给（启动器会覆盖 `UYA_ROOT`，所以换版要指 `uya-real`）：
+
+```bash
+make UYA=/home/winger/uya-0.11/bin/uya-real \
+     UYA_ROOT=/home/winger/uya-0.11/lib/ ...
+```
+
+（0.11 与本仓的差异见 [DESIGN.md §15.1](DESIGN.md)。）
 
 ---
 

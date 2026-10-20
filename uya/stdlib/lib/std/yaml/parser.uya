@@ -1,0 +1,1280 @@
+// std.yaml.parser - YAML Flow 解析器（扩展 JSON Flow：无引号 key、yes/no/on/off）
+// 模块路径：lib/std/yaml/parser.uya → use std.yaml.parser;
+// Phase 1：结构与 JSON 一致，复用与 std.json.parser 相同的数值/字符串/数组逻辑。
+
+use std.yaml.value.YamlValue;
+use std.yaml.value.YamlArray;
+use std.yaml.value.YamlObject;
+use std.yaml.value.YamlKeyValue;
+use std.yaml.value.YamlStrView;
+use std.yaml.errors;
+use std.mem.arena.Arena;
+use std.mem.arena.arena_alloc;
+
+const MAX_NESTING: usize = 256;
+const YAML_VALUE_ALLOC_SIZE: usize = 64;
+const YAML_KEY_VALUE_ALLOC_SIZE: usize = 48;
+const MAX_ANCHORS: usize = 64;
+const MAX_ALIAS_RESOLUTIONS: usize = 1024;
+const MAX_ANCHOR_DEFINE_DEPTH: usize = 64;
+
+type YamlWsVec16 = @vector(u8, 16);
+type YamlWsMask16 = @mask(16);
+
+struct YamlAnchorCtx {
+    n: usize,
+    alias_res: usize,
+    def_depth: usize,
+    names: [YamlStrView: MAX_ANCHORS],
+    vals: [&YamlValue: MAX_ANCHORS],
+}
+
+struct ParseState {
+    ptr: &byte,
+    len: usize,
+    pos: usize,
+    arena: &Arena,
+    depth: usize,
+    anchors: &YamlAnchorCtx,
+}
+
+fn yaml_str_view_eq_ptr(ap: &byte, al: usize, bp: &byte, bl: usize) bool {
+    if al != bl { return false; }
+    if al == 0 { return true; }
+    if ap == null || bp == null { return false; }
+    var i: usize = 0;
+    while i < al {
+        if ap[i] != bp[i] { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn yaml_value_copy_to_arena(ar: &Arena, v: YamlValue) !&YamlValue {
+    const p: &YamlValue = arena_alloc(ar, YAML_VALUE_ALLOC_SIZE) as &YamlValue;
+    if p == null { return error.UnexpectedToken; }
+    p[0] = v;
+    return p;
+}
+
+fn parse_anchor_token_name(s: &ParseState) !YamlStrView {
+    if s.pos >= s.len { return error.UnexpectedEof; }
+    const start: usize = s.pos;
+    const b0: byte = s.ptr[s.pos];
+    if !is_yaml_ident_cont(b0) { return error.UnexpectedToken; }
+    while s.pos < s.len && is_yaml_ident_cont(s.ptr[s.pos]) {
+        s.pos = s.pos + 1;
+    }
+    if s.pos == start { return error.UnexpectedToken; }
+    return YamlStrView{ ptr: &s.ptr[start], len: s.pos - start };
+}
+
+fn yaml_anchor_find(ctx: &YamlAnchorCtx, name: YamlStrView) !usize {
+    const anchor_cap: usize = @len(ctx.names);
+    var i: usize = 0;
+    while i < ctx.n && i < anchor_cap {
+        const sn: YamlStrView = ctx.names[i];
+        if yaml_str_view_eq_ptr(sn.ptr, sn.len, name.ptr, name.len) {
+            return i;
+        }
+        i = i + 1;
+    }
+    return error.UnknownAlias;
+}
+
+fn yaml_anchor_register(ctx: &YamlAnchorCtx, name: YamlStrView, val_ptr: &YamlValue) !void {
+    const anchor_cap: usize = @len(ctx.names);
+    if ctx.n >= anchor_cap {
+        return error.AnchorOverflow;
+    }
+    var j: usize = 0;
+    while j < ctx.n && j < anchor_cap {
+        const sj: YamlStrView = ctx.names[j];
+        if yaml_str_view_eq_ptr(sj.ptr, sj.len, name.ptr, name.len) {
+            return error.UnexpectedToken;
+        }
+        j = j + 1;
+    }
+    if ctx.n < anchor_cap {
+        ctx.names[ctx.n] = name;
+        ctx.vals[ctx.n] = val_ptr;
+        ctx.n = ctx.n + 1;
+    } else {
+        return error.AnchorOverflow;
+    }
+}
+
+fn peek(s: &ParseState) byte {
+    if s.pos >= s.len { return 0; }
+    return s.ptr[s.pos];
+}
+
+fn is_yaml_ident_cont(b: byte) bool {
+    if b >= 48 && b <= 57 { return true; }
+    if b >= 97 && b <= 122 { return true; }
+    if b >= 65 && b <= 90 { return true; }
+    if b == 95 || b == 45 { return true; }
+    return false;
+}
+
+fn keyword_boundary_ok(s: &ParseState, kw_len: usize) bool {
+    if s.pos + kw_len > s.len { return false; }
+    if s.pos + kw_len >= s.len { return true; }
+    return !is_yaml_ident_cont(s.ptr[s.pos + kw_len]);
+}
+
+fn skip_ws(s: &ParseState) void {
+    while s.pos + 16 <= s.len {
+        const c: YamlWsVec16 = @vector.load(&s.ptr[s.pos]);
+        const w: YamlWsMask16 = (c == @vector.splat(32u8)) | (c == @vector.splat(9u8)) | (c == @vector.splat(10u8)) | (c == @vector.splat(13u8));
+        if @vector.all(w) {
+            s.pos = s.pos + 16;
+        } else {
+            break;
+        }
+    }
+    while s.pos < s.len {
+        const b: byte = s.ptr[s.pos];
+        if b == 32 || b == 9 || b == 10 || b == 13 {
+            s.pos = s.pos + 1;
+        } else {
+            return;
+        }
+    }
+}
+
+fn is_digit(b: byte) bool {
+    return b >= 48 && b <= 57;
+}
+
+fn skip_ascii_digits_vec16(s: &ParseState) void {
+    while s.pos + 16 <= s.len {
+        const c: YamlWsVec16 = @vector.load(&s.ptr[s.pos]);
+        const ge: YamlWsMask16 = c >= @vector.splat(48u8);
+        const le: YamlWsMask16 = c <= @vector.splat(57u8);
+        if @vector.all(ge & le) {
+            s.pos = s.pos + 16;
+        } else {
+            return;
+        }
+    }
+}
+
+fn skip_string_unescaped_run_vec16(s: &ParseState) void {
+    while s.pos + 16 <= s.len {
+        const c: YamlWsVec16 = @vector.load(&s.ptr[s.pos]);
+        const m: YamlWsMask16 = (c != @vector.splat(34u8)) & (c != @vector.splat(92u8));
+        if @vector.all(m) {
+            s.pos = s.pos + 16;
+        } else {
+            return;
+        }
+    }
+}
+
+fn parse_null(s: &ParseState) !YamlValue {
+    if s.pos + 4 <= s.len && s.ptr[s.pos] == 110 && s.ptr[s.pos + 1] == 117 && s.ptr[s.pos + 2] == 108 && s.ptr[s.pos + 3] == 108 {
+        if !keyword_boundary_ok(s, 4) { return error.UnexpectedToken; }
+        s.pos = s.pos + 4;
+        return YamlValue.yaml_null();
+    }
+    return error.UnexpectedToken;
+}
+
+fn parse_no(s: &ParseState) !YamlValue {
+    if s.pos + 2 <= s.len && s.ptr[s.pos] == 110 && s.ptr[s.pos + 1] == 111 {
+        if !keyword_boundary_ok(s, 2) { return error.UnexpectedToken; }
+        s.pos = s.pos + 2;
+        return YamlValue.bool_val(false);
+    }
+    return error.UnexpectedToken;
+}
+
+fn parse_true(s: &ParseState) !YamlValue {
+    if s.pos + 4 <= s.len && s.ptr[s.pos] == 116 && s.ptr[s.pos + 1] == 114 && s.ptr[s.pos + 2] == 117 && s.ptr[s.pos + 3] == 101 {
+        if !keyword_boundary_ok(s, 4) { return error.UnexpectedToken; }
+        s.pos = s.pos + 4;
+        return YamlValue.bool_val(true);
+    }
+    return error.UnexpectedToken;
+}
+
+fn parse_false(s: &ParseState) !YamlValue {
+    if s.pos + 5 <= s.len && s.ptr[s.pos] == 102 && s.ptr[s.pos + 1] == 97 && s.ptr[s.pos + 2] == 108 && s.ptr[s.pos + 3] == 115 && s.ptr[s.pos + 4] == 101 {
+        if !keyword_boundary_ok(s, 5) { return error.UnexpectedToken; }
+        s.pos = s.pos + 5;
+        return YamlValue.bool_val(false);
+    }
+    return error.UnexpectedToken;
+}
+
+fn parse_yes(s: &ParseState) !YamlValue {
+    if s.pos + 3 <= s.len && s.ptr[s.pos] == 121 && s.ptr[s.pos + 1] == 101 && s.ptr[s.pos + 2] == 115 {
+        if !keyword_boundary_ok(s, 3) { return error.UnexpectedToken; }
+        s.pos = s.pos + 3;
+        return YamlValue.bool_val(true);
+    }
+    return error.UnexpectedToken;
+}
+
+fn parse_on(s: &ParseState) !YamlValue {
+    if s.pos + 2 <= s.len && s.ptr[s.pos] == 111 && s.ptr[s.pos + 1] == 110 {
+        if !keyword_boundary_ok(s, 2) { return error.UnexpectedToken; }
+        s.pos = s.pos + 2;
+        return YamlValue.bool_val(true);
+    }
+    return error.UnexpectedToken;
+}
+
+fn parse_off(s: &ParseState) !YamlValue {
+    if s.pos + 3 <= s.len && s.ptr[s.pos] == 111 && s.ptr[s.pos + 1] == 102 && s.ptr[s.pos + 2] == 102 {
+        if !keyword_boundary_ok(s, 3) { return error.UnexpectedToken; }
+        s.pos = s.pos + 3;
+        return YamlValue.bool_val(false);
+    }
+    return error.UnexpectedToken;
+}
+
+fn parse_scalar_o(s: &ParseState) !YamlValue {
+    if s.pos + 3 <= s.len && s.ptr[s.pos] == 111 && s.ptr[s.pos + 1] == 102 && s.ptr[s.pos + 2] == 102 {
+        return parse_off(s);
+    }
+    return parse_on(s);
+}
+
+fn parse_scalar_n(s: &ParseState) !YamlValue {
+    const v_null: YamlValue = parse_null(s) catch {
+        return parse_no(s) catch {
+            return error.UnexpectedToken;
+        };
+    };
+    return v_null;
+}
+
+fn parse_number(s: &ParseState) !YamlValue {
+    const start: usize = s.pos;
+    if s.pos >= s.len { return error.UnexpectedEof; }
+    var is_float: bool = false;
+    if s.ptr[s.pos] == 45 { s.pos = s.pos + 1; }
+    if s.pos < s.len && s.ptr[s.pos] == 48 {
+        s.pos = s.pos + 1;
+        if s.pos < s.len && (s.ptr[s.pos] == 46 || s.ptr[s.pos] == 101 || s.ptr[s.pos] == 69) {
+            is_float = true;
+        }
+    } else {
+        if s.pos >= s.len || !is_digit(s.ptr[s.pos]) { return error.UnexpectedToken; }
+        skip_ascii_digits_vec16(s);
+        while s.pos < s.len && is_digit(s.ptr[s.pos]) { s.pos = s.pos + 1; }
+    }
+    if s.pos < s.len && s.ptr[s.pos] == 46 {
+        is_float = true;
+        s.pos = s.pos + 1;
+        if s.pos >= s.len || !is_digit(s.ptr[s.pos]) { return error.InvalidNumber; }
+        skip_ascii_digits_vec16(s);
+        while s.pos < s.len && is_digit(s.ptr[s.pos]) { s.pos = s.pos + 1; }
+    }
+    if s.pos < s.len && (s.ptr[s.pos] == 101 || s.ptr[s.pos] == 69) {
+        is_float = true;
+        s.pos = s.pos + 1;
+        if s.pos < s.len && (s.ptr[s.pos] == 43 || s.ptr[s.pos] == 45) { s.pos = s.pos + 1; }
+        if s.pos >= s.len || !is_digit(s.ptr[s.pos]) { return error.InvalidNumber; }
+        skip_ascii_digits_vec16(s);
+        while s.pos < s.len && is_digit(s.ptr[s.pos]) { s.pos = s.pos + 1; }
+    }
+    if is_float {
+        var i: usize = start;
+        var neg: i32 = 1;
+        if i < s.len && s.ptr[i] == 45 { neg = 0 - 1; i = i + 1; }
+        var v: f64 = 0.0;
+        while i < s.len && is_digit(s.ptr[i]) {
+            v = v * 10.0 + (s.ptr[i] as i32 - 48) as f64;
+            i = i + 1;
+        }
+        if i < s.len && s.ptr[i] == 46 {
+            i = i + 1;
+            var frac: f64 = 0.1;
+            while i < s.len && is_digit(s.ptr[i]) {
+                v = v + (s.ptr[i] as i32 - 48) as f64 * frac;
+                frac = frac / 10.0;
+                i = i + 1;
+            }
+        }
+        if i < s.len && (s.ptr[i] == 101 || s.ptr[i] == 69) {
+            i = i + 1;
+            var exp_neg: i32 = 1;
+            if i < s.len && s.ptr[i] == 45 { exp_neg = 0 - 1; i = i + 1; } else if i < s.len && s.ptr[i] == 43 { i = i + 1; }
+            var e: i32 = 0;
+            while i < s.len && is_digit(s.ptr[i]) {
+                e = e * 10 + (s.ptr[i] as i32 - 48);
+                i = i + 1;
+            }
+            while e > 0 {
+                if exp_neg < 0 { v = v * 0.1; } else { v = v * 10.0; }
+                e = e - 1;
+            }
+        }
+        return YamlValue.float_val(v * (neg as f64));
+    }
+    var i: usize = start;
+    var neg: bool = false;
+    if i < s.len && s.ptr[i] == 45 { neg = true; i = i + 1; }
+    var v: i64 = 0;
+    while i < s.pos {
+        const d: i32 = s.ptr[i] as i32 - 48;
+        if d < 0 || d > 9 { i = i + 1; continue; }
+        if v > 922337203685477580 { return error.NumberOverflow; }
+        if v == 922337203685477580 && (d > 7 || (!neg && d > 7)) { return error.NumberOverflow; }
+        v = v * 10 + d as i64;
+        i = i + 1;
+    }
+    if neg { v = 0 - v; }
+    return YamlValue.int_val(v);
+}
+
+fn parse_quoted_string_view(s: &ParseState) !YamlStrView {
+    if s.pos >= s.len || s.ptr[s.pos] != 34 { return error.UnexpectedToken; }
+    s.pos = s.pos + 1;
+    const start: usize = s.pos;
+    while s.pos < s.len {
+        skip_string_unescaped_run_vec16(s);
+        if s.pos >= s.len { break; }
+        const b: byte = s.ptr[s.pos];
+        if b == 34 {
+            const view: YamlStrView = YamlStrView{ ptr: &s.ptr[start], len: s.pos - start };
+            s.pos = s.pos + 1;
+            return view;
+        }
+        if b == 92 {
+            s.pos = s.pos + 1;
+            if s.pos >= s.len { return error.UnexpectedEof; }
+            const c: byte = s.ptr[s.pos];
+            if c == 110 || c == 116 || c == 114 || c == 34 || c == 92 {
+                s.pos = s.pos + 1;
+            } else if c == 117 {
+                s.pos = s.pos + 1;
+                if s.pos + 4 > s.len { return error.UnexpectedEof; }
+                var k: usize = 0;
+                while k < 4 {
+                    const h: byte = s.ptr[s.pos + k];
+                    if (h >= 48 && h <= 57) || (h >= 97 && h <= 102) || (h >= 65 && h <= 70) { k = k + 1; } else { return error.InvalidEscape; }
+                }
+                s.pos = s.pos + 4;
+            } else {
+                return error.InvalidEscape;
+            }
+        } else {
+            s.pos = s.pos + 1;
+        }
+    }
+    return error.UnexpectedEof;
+}
+
+fn parse_string(s: &ParseState) !YamlValue {
+    const view: YamlStrView = try parse_quoted_string_view(s);
+    return YamlValue.y_str(view);
+}
+
+fn parse_bare_key(s: &ParseState) !YamlStrView {
+    if s.pos >= s.len { return error.UnexpectedEof; }
+    const start: usize = s.pos;
+    const b0: byte = s.ptr[s.pos];
+    if b0 == 58 || b0 == 44 || b0 == 125 || b0 == 93 || b0 == 123 || b0 == 91 {
+        return error.UnexpectedToken;
+    }
+    if b0 == 32 || b0 == 9 || b0 == 10 || b0 == 13 {
+        return error.UnexpectedToken;
+    }
+    while s.pos < s.len {
+        const b: byte = s.ptr[s.pos];
+        if b == 32 || b == 9 || b == 10 || b == 13 || b == 58 {
+            break;
+        }
+        if b == 44 || b == 125 || b == 93 || b == 123 || b == 91 {
+            break;
+        }
+        s.pos = s.pos + 1;
+    }
+    if s.pos == start { return error.UnexpectedToken; }
+    return YamlStrView{ ptr: &s.ptr[start], len: s.pos - start };
+}
+
+fn parse_object_key(s: &ParseState) !YamlStrView {
+    skip_ws(s);
+    if s.pos >= s.len { return error.UnexpectedEof; }
+    if s.ptr[s.pos] == 34 {
+        return parse_quoted_string_view(s);
+    }
+    return parse_bare_key(s);
+}
+
+fn parse_array(s: &ParseState) !YamlValue {
+    if s.pos >= s.len || s.ptr[s.pos] != 91 { return error.UnexpectedToken; }
+    s.pos = s.pos + 1;
+    s.depth = s.depth + 1;
+    if s.depth > MAX_NESTING { return error.NestingTooDeep; }
+    skip_ws(s);
+    if s.pos < s.len && s.ptr[s.pos] == 93 {
+        s.pos = s.pos + 1;
+        s.depth = s.depth - 1;
+        const arr: YamlArray = YamlArray{ items: null, len: 0 };
+        return YamlValue.y_arr(arr);
+    }
+    var cap: usize = 4;
+    var items: &YamlValue = arena_alloc(s.arena, YAML_VALUE_ALLOC_SIZE * cap) as &YamlValue;
+    if items == null { return error.UnexpectedToken; }
+    var n: usize = 0;
+    while true {
+        const v: YamlValue = try parse_flow_value(s);
+        if n >= cap {
+            cap = cap * 2;
+            const new_items: &YamlValue = arena_alloc(s.arena, YAML_VALUE_ALLOC_SIZE * cap) as &YamlValue;
+            if new_items == null { return error.UnexpectedToken; }
+            var j: usize = 0;
+            while j < n {
+                new_items[j] = items[j];
+                j = j + 1;
+            }
+            items = new_items;
+        }
+        items[n] = v;
+        n = n + 1;
+        skip_ws(s);
+        if s.pos >= s.len { s.depth = s.depth - 1; return error.UnexpectedEof; }
+        if s.ptr[s.pos] == 93 {
+            s.pos = s.pos + 1;
+            s.depth = s.depth - 1;
+            const arr: YamlArray = YamlArray{ items: items, len: n };
+            return YamlValue.y_arr(arr);
+        }
+        if s.ptr[s.pos] != 44 { s.depth = s.depth - 1; return error.UnexpectedToken; }
+        s.pos = s.pos + 1;
+        skip_ws(s);
+    }
+}
+
+fn parse_object(s: &ParseState) !YamlValue {
+    if s.pos >= s.len || s.ptr[s.pos] != 123 { return error.UnexpectedToken; }
+    s.pos = s.pos + 1;
+    s.depth = s.depth + 1;
+    if s.depth > MAX_NESTING { return error.NestingTooDeep; }
+    skip_ws(s);
+    if s.pos < s.len && s.ptr[s.pos] == 125 {
+        s.pos = s.pos + 1;
+        s.depth = s.depth - 1;
+        const obj: YamlObject = YamlObject{ pairs: null, len: 0 };
+        return YamlValue.y_obj(obj);
+    }
+    var cap: usize = 4;
+    var pairs: &YamlKeyValue = arena_alloc(s.arena, YAML_KEY_VALUE_ALLOC_SIZE * cap) as &YamlKeyValue;
+    if pairs == null { return error.UnexpectedToken; }
+    var n: usize = 0;
+    while true {
+        const key_view: YamlStrView = try parse_object_key(s);
+        skip_ws(s);
+        if s.pos >= s.len || s.ptr[s.pos] != 58 { s.depth = s.depth - 1; return error.UnexpectedToken; }
+        s.pos = s.pos + 1;
+        skip_ws(s);
+        if n >= cap {
+            cap = cap * 2;
+            const new_pairs: &YamlKeyValue = arena_alloc(s.arena, YAML_KEY_VALUE_ALLOC_SIZE * cap) as &YamlKeyValue;
+            if new_pairs == null { return error.UnexpectedToken; }
+            var j: usize = 0;
+            while j < n {
+                new_pairs[j] = pairs[j];
+                j = j + 1;
+            }
+            pairs = new_pairs;
+        }
+        pairs[n] = try parse_flow_object_pair(s, key_view.ptr, key_view.len);
+        n = n + 1;
+        skip_ws(s);
+        if s.pos >= s.len { s.depth = s.depth - 1; return error.UnexpectedEof; }
+        if s.ptr[s.pos] == 125 {
+            s.pos = s.pos + 1;
+            s.depth = s.depth - 1;
+            const obj: YamlObject = YamlObject{ pairs: pairs, len: n };
+            return YamlValue.y_obj(obj);
+        }
+        if s.ptr[s.pos] != 44 { s.depth = s.depth - 1; return error.UnexpectedToken; }
+        s.pos = s.pos + 1;
+        skip_ws(s);
+    }
+}
+
+fn parse_flow_object_pair(s: &ParseState, key_ptr: &byte, key_len: usize) !YamlKeyValue {
+    const val: YamlValue = try parse_flow_value(s);
+    return YamlKeyValue{ key: YamlStrView{ ptr: key_ptr, len: key_len }, value: val };
+}
+
+fn parse_flow_value_prim(s: &ParseState) !YamlValue {
+    skip_ws(s);
+    if s.pos >= s.len { return error.UnexpectedEof; }
+    const b: byte = s.ptr[s.pos];
+    if b == 110 { return parse_scalar_n(s); }
+    if b == 116 { return parse_true(s); }
+    if b == 102 { return parse_false(s); }
+    if b == 121 { return parse_yes(s); }
+    if b == 111 { return parse_scalar_o(s); }
+    if b == 45 || is_digit(b) { return parse_number(s); }
+    if b == 34 { return parse_string(s); }
+    if b == 91 { return parse_array(s); }
+    if b == 123 { return parse_object(s); }
+    return error.UnexpectedToken;
+}
+
+fn parse_flow_value(s: &ParseState) !YamlValue {
+    skip_ws(s);
+    if s.pos >= s.len { return error.UnexpectedEof; }
+    if s.ptr[s.pos] == 38 {
+        s.pos = s.pos + 1;
+        skip_ws(s);
+        const nm: YamlStrView = try parse_anchor_token_name(s);
+        skip_ws(s);
+        const ctx: &YamlAnchorCtx = s.anchors;
+        ctx.def_depth = ctx.def_depth + 1;
+        if ctx.def_depth > MAX_ANCHOR_DEFINE_DEPTH {
+            ctx.def_depth = ctx.def_depth - 1;
+            return error.AnchorTooDeep;
+        }
+        const inner: YamlValue = try parse_flow_value(s);
+        ctx.def_depth = ctx.def_depth - 1;
+        const p: &YamlValue = try yaml_value_copy_to_arena(s.arena, inner);
+        try yaml_anchor_register(ctx, nm, p);
+        return inner;
+    }
+    if s.ptr[s.pos] == 42 {
+        s.pos = s.pos + 1;
+        skip_ws(s);
+        const nm2: YamlStrView = try parse_anchor_token_name(s);
+        const ctx2: &YamlAnchorCtx = s.anchors;
+        ctx2.alias_res = ctx2.alias_res + 1;
+        if ctx2.alias_res > MAX_ALIAS_RESOLUTIONS {
+            return error.AnchorOverflow;
+        }
+        const idx: usize = try yaml_anchor_find(ctx2, nm2);
+        const anchor_cap: usize = @len(ctx2.vals);
+        if idx >= anchor_cap {
+            return error.UnknownAlias;
+        }
+        if idx >= 0 && idx < anchor_cap {
+            const vp: &YamlValue = ctx2.vals[idx];
+            return vp[0];
+        }
+        return error.UnknownAlias;
+    }
+    return parse_flow_value_prim(s);
+}
+
+// --- Phase 3：Block 文档、块标量、多文档 ---
+
+fn block_at_line_start(s: &ParseState) bool {
+    if s.pos == 0 { return true; }
+    const p: usize = s.pos - 1;
+    return s.ptr[p] == 10 || s.ptr[p] == 13;
+}
+
+fn block_skip_newline(s: &ParseState) void {
+    if s.pos >= s.len { return; }
+    if s.ptr[s.pos] == 13 {
+        s.pos = s.pos + 1;
+        if s.pos < s.len && s.ptr[s.pos] == 10 { s.pos = s.pos + 1; }
+        return;
+    }
+    if s.ptr[s.pos] == 10 { s.pos = s.pos + 1; }
+}
+
+fn block_line_end(s: &ParseState, from: usize) usize {
+    var i: usize = from;
+    while i < s.len {
+        if s.ptr[i] == 10 || s.ptr[i] == 13 { return i; }
+        i = i + 1;
+    }
+    return s.len;
+}
+
+fn block_skip_leading_blank_lines(s: &ParseState) !void {
+    while s.pos < s.len {
+        if !block_at_line_start(s) { return; }
+        const ls: usize = s.pos;
+        var i: usize = ls;
+        while i < s.len && s.ptr[i] == 32 { i = i + 1; }
+        if i < s.len && s.ptr[i] == 9 { return error.InvalidIndent; }
+        const content: usize = i;
+        const le: usize = block_line_end(s, content);
+        if content == le {
+            s.pos = le;
+            block_skip_newline(s);
+            continue;
+        }
+        if ls == 0 {
+            var iq: usize = 0;
+            while iq < s.len && s.ptr[iq] == 32 { iq = iq + 1; }
+            if iq < s.len && s.ptr[iq] != 10 && s.ptr[iq] != 13 && iq > 0 { return error.InvalidIndent; }
+        }
+        s.pos = content;
+        return;
+    }
+}
+
+fn block_consume_indent(s: &ParseState) !usize {
+    if !block_at_line_start(s) { return error.InvalidIndent; }
+    var n: usize = 0;
+    while s.pos < s.len && s.ptr[s.pos] == 32 {
+        n = n + 1;
+        s.pos = s.pos + 1;
+    }
+    if s.pos < s.len && s.ptr[s.pos] == 9 { return error.InvalidIndent; }
+    return n;
+}
+
+fn block_trim_end_spaces(s: &ParseState, start: usize, end: usize) usize {
+    var e: usize = end;
+    while e > start {
+        const b: byte = s.ptr[e - 1];
+        if b == 32 || b == 9 { e = e - 1; } else { break; }
+    }
+    return e;
+}
+
+fn block_is_seq_dash(s: &ParseState) bool {
+    if s.pos >= s.len || s.ptr[s.pos] != 45 { return false; }
+    if s.pos + 1 >= s.len { return true; }
+    const nb: byte = s.ptr[s.pos + 1];
+    if nb == 32 || nb == 10 || nb == 13 { return true; }
+    return false;
+}
+
+fn parse_block_bounded_value(s: &ParseState) !YamlValue {
+    var st: ParseState = ParseState{ ptr: s.ptr, len: s.len, pos: s.pos, arena: s.arena, depth: s.depth, anchors: s.anchors };
+    const v: YamlValue = parse_flow_value(&st) catch {
+        st.pos = s.pos;
+        const st0: usize = st.pos;
+        while st.pos < st.len {
+            const bx: byte = st.ptr[st.pos];
+            if bx == 10 || bx == 13 { break; }
+            st.pos = st.pos + 1;
+        }
+        if st.pos == st0 { return error.UnexpectedToken; }
+        return YamlValue.y_str(YamlStrView{ ptr: &st.ptr[st0], len: st.pos - st0 });
+    };
+    skip_ws(&st);
+    if st.pos != s.len { return error.UnexpectedToken; }
+    return v;
+}
+
+fn block_copy_run(dst: &byte, src: &byte, n: usize) void {
+    var i: usize = 0;
+    while i < n {
+        dst[i] = src[i];
+        i = i + 1;
+    }
+}
+
+fn fold_line_is_spaced(s: &ParseState, line_start: usize, line_end_trim: usize) bool {
+    if line_start >= line_end_trim { return false; }
+    const b: byte = s.ptr[line_start];
+    return b == 32 || b == 9;
+}
+
+// 块标量内「零宽」物理行：行首即为换行（\n\n 之间的空行），仍属内容，不能按 ind=0 结束块。
+fn block_line_empty_no_indent(s: &ParseState) bool {
+    if s.pos >= s.len { return false; }
+    const b: byte = s.ptr[s.pos];
+    return b == 10 || b == 13;
+}
+
+// YAML 1.2.2 块折叠：相邻非空非「行首空白」行之间的换行 → 空格；空行 → 内容中的 \n；
+// 行首为空白的内容行（more-indented / spaced）与相邻行之间不换行折叠为空格。
+fn parse_block_chomped_lines_fold_size(s: &ParseState, min_indent: usize) !usize {
+    const begin: usize = s.pos;
+    var total: usize = 0;
+    var last_normal_content: bool = false;
+    var last_was_spaced: bool = false;
+    while s.pos < s.len {
+        if !block_at_line_start(s) { break; }
+        const mark: usize = s.pos;
+        if block_line_empty_no_indent(s) {
+            const le0: usize = block_line_end(s, s.pos);
+            if total > 0 {
+                total = total + 1;
+            }
+            last_normal_content = false;
+            last_was_spaced = false;
+            s.pos = le0;
+            block_skip_newline(s);
+            continue;
+        }
+        const ind: usize = try block_consume_indent(s);
+        if ind < min_indent {
+            s.pos = mark;
+            break;
+        }
+        if ind > min_indent {
+            s.pos = mark + min_indent;
+        }
+        const le: usize = block_line_end(s, s.pos);
+        const te: usize = block_trim_end_spaces(s, s.pos, le);
+        const ln: usize = te - s.pos;
+        if ln == 0 {
+            if total > 0 {
+                total = total + 1;
+            }
+            last_normal_content = false;
+            last_was_spaced = false;
+        } else {
+            const spaced: bool = fold_line_is_spaced(s, s.pos, te);
+            if spaced {
+                if total > 0 && (last_normal_content || last_was_spaced) {
+                    total = total + 1;
+                }
+                total = total + ln;
+                last_normal_content = false;
+                last_was_spaced = true;
+            } else {
+                if last_was_spaced && total > 0 {
+                    total = total + 1;
+                } else if last_normal_content {
+                    total = total + 1;
+                }
+                total = total + ln;
+                last_normal_content = true;
+                last_was_spaced = false;
+            }
+        }
+        s.pos = le;
+        block_skip_newline(s);
+    }
+    s.pos = begin;
+    return total;
+}
+
+fn parse_block_chomped_lines_fold_write(s: &ParseState, min_indent: usize, out: &byte) !usize {
+    var off: usize = 0;
+    var last_normal_content: bool = false;
+    var last_was_spaced: bool = false;
+    while s.pos < s.len {
+        if !block_at_line_start(s) { break; }
+        const mark: usize = s.pos;
+        if block_line_empty_no_indent(s) {
+            const le0: usize = block_line_end(s, s.pos);
+            if off > 0 {
+                out[off] = 10;
+                off = off + 1;
+            }
+            last_normal_content = false;
+            last_was_spaced = false;
+            s.pos = le0;
+            block_skip_newline(s);
+            continue;
+        }
+        const ind: usize = try block_consume_indent(s);
+        if ind < min_indent {
+            s.pos = mark;
+            break;
+        }
+        if ind > min_indent {
+            s.pos = mark + min_indent;
+        }
+        const le: usize = block_line_end(s, s.pos);
+        const te: usize = block_trim_end_spaces(s, s.pos, le);
+        const ln: usize = te - s.pos;
+        if ln == 0 {
+            if off > 0 {
+                out[off] = 10;
+                off = off + 1;
+            }
+            last_normal_content = false;
+            last_was_spaced = false;
+        } else {
+            const spaced: bool = fold_line_is_spaced(s, s.pos, te);
+            if spaced {
+                if off > 0 && (last_normal_content || last_was_spaced) {
+                    out[off] = 10;
+                    off = off + 1;
+                }
+                block_copy_run(&out[off], &s.ptr[s.pos], ln);
+                off = off + ln;
+                last_normal_content = false;
+                last_was_spaced = true;
+            } else {
+                if last_was_spaced && off > 0 {
+                    out[off] = 10;
+                    off = off + 1;
+                } else if last_normal_content {
+                    out[off] = 32;
+                    off = off + 1;
+                }
+                block_copy_run(&out[off], &s.ptr[s.pos], ln);
+                off = off + ln;
+                last_normal_content = true;
+                last_was_spaced = false;
+            }
+        }
+        s.pos = le;
+        block_skip_newline(s);
+    }
+    return off;
+}
+
+fn parse_block_chomped_lines(s: &ParseState, min_indent: usize, fold: bool) !YamlValue {
+    if fold {
+        const total: usize = try parse_block_chomped_lines_fold_size(s, min_indent);
+        if total == 0 { return YamlValue.y_str(YamlStrView{ ptr: s.ptr, len: 0 }); }
+        const out: &byte = arena_alloc(s.arena, total);
+        if out == null { return error.UnexpectedToken; }
+        const off: usize = try parse_block_chomped_lines_fold_write(s, min_indent, out);
+        return YamlValue.y_str(YamlStrView{ ptr: out, len: off });
+    }
+    var total2: usize = 0;
+    const begin2: usize = s.pos;
+    while s.pos < s.len {
+        if !block_at_line_start(s) { break; }
+        const mark2: usize = s.pos;
+        if block_line_empty_no_indent(s) {
+            const le0b: usize = block_line_end(s, s.pos);
+            if total2 > 0 {
+                total2 = total2 + 1;
+            }
+            s.pos = le0b;
+            block_skip_newline(s);
+            continue;
+        }
+        const ind2: usize = try block_consume_indent(s);
+        if ind2 < min_indent {
+            s.pos = mark2;
+            break;
+        }
+        if ind2 > min_indent {
+            s.pos = mark2 + min_indent;
+        }
+        const le2: usize = block_line_end(s, s.pos);
+        const te2: usize = block_trim_end_spaces(s, s.pos, le2);
+        const ln2: usize = te2 - s.pos;
+        if total2 > 0 {
+            total2 = total2 + 1;
+        }
+        total2 = total2 + ln2;
+        s.pos = le2;
+        block_skip_newline(s);
+    }
+    if total2 == 0 { return YamlValue.y_str(YamlStrView{ ptr: s.ptr, len: 0 }); }
+    const out2: &byte = arena_alloc(s.arena, total2);
+    if out2 == null { return error.UnexpectedToken; }
+    s.pos = begin2;
+    var off2: usize = 0;
+    while s.pos < s.len {
+        if !block_at_line_start(s) { break; }
+        const mark3: usize = s.pos;
+        if block_line_empty_no_indent(s) {
+            const le0c: usize = block_line_end(s, s.pos);
+            if off2 > 0 {
+                out2[off2] = 10;
+                off2 = off2 + 1;
+            }
+            s.pos = le0c;
+            block_skip_newline(s);
+            continue;
+        }
+        const ind3: usize = try block_consume_indent(s);
+        if ind3 < min_indent {
+            s.pos = mark3;
+            break;
+        }
+        if ind3 > min_indent {
+            s.pos = mark3 + min_indent;
+        }
+        const le3: usize = block_line_end(s, s.pos);
+        const te3: usize = block_trim_end_spaces(s, s.pos, le3);
+        const ln3: usize = te3 - s.pos;
+        if off2 > 0 {
+            out2[off2] = 10;
+            off2 = off2 + 1;
+        }
+        if ln3 > 0 {
+            block_copy_run(&out2[off2], &s.ptr[s.pos], ln3);
+            off2 = off2 + ln3;
+        }
+        s.pos = le3;
+        block_skip_newline(s);
+    }
+    return YamlValue.y_str(YamlStrView{ ptr: out2, len: off2 });
+}
+
+fn block_strip_pipe_gt(s: &ParseState) void {
+    while s.pos < s.len && s.ptr[s.pos] == 32 { s.pos = s.pos + 1; }
+}
+
+fn parse_block_value_after_colon(s: &ParseState, key_indent: usize) !YamlValue {
+    while s.pos < s.len && s.ptr[s.pos] == 32 { s.pos = s.pos + 1; }
+    const le: usize = block_line_end(s, s.pos);
+    if s.pos < le && s.ptr[s.pos] == 124 {
+        s.pos = s.pos + 1;
+        block_strip_pipe_gt(s);
+        if s.pos != le { return error.UnexpectedToken; }
+        block_skip_newline(s);
+        const child_ind: usize = key_indent + 2;
+        return parse_block_chomped_lines(s, child_ind, false);
+    }
+    if s.pos < le && s.ptr[s.pos] == 62 {
+        s.pos = s.pos + 1;
+        block_strip_pipe_gt(s);
+        if s.pos != le { return error.UnexpectedToken; }
+        block_skip_newline(s);
+        const child_ind2: usize = key_indent + 2;
+        return parse_block_chomped_lines(s, child_ind2, true);
+    }
+    if s.pos >= le {
+        block_skip_newline(s);
+        if s.pos >= s.len { return YamlValue.yaml_null(); }
+        const mark: usize = s.pos;
+        const ind: usize = try block_consume_indent(s);
+        if ind <= key_indent {
+            s.pos = mark;
+            return YamlValue.yaml_null();
+        }
+        if block_is_seq_dash(s) {
+            s.pos = mark;
+            return parse_block_sequence(s, ind);
+        }
+        s.pos = mark;
+        return parse_block_mapping(s, ind);
+    }
+    var st: ParseState = ParseState{ ptr: s.ptr, len: le, pos: s.pos, arena: s.arena, depth: s.depth, anchors: s.anchors };
+    const v: YamlValue = try parse_block_bounded_value(&st);
+    s.pos = le;
+    block_skip_newline(s);
+    return v;
+}
+
+fn parse_block_mapping(s: &ParseState, min_indent: usize) !YamlValue {
+    var cap: usize = 4;
+    var pairs: &YamlKeyValue = arena_alloc(s.arena, YAML_KEY_VALUE_ALLOC_SIZE * cap) as &YamlKeyValue;
+    if pairs == null { return error.UnexpectedToken; }
+    var n: usize = 0;
+    while s.pos < s.len {
+        if !block_at_line_start(s) { return error.UnexpectedToken; }
+        const mark: usize = s.pos;
+        const ind: usize = try block_consume_indent(s);
+        if ind < min_indent {
+            s.pos = mark;
+            break;
+        }
+        if ind != min_indent {
+            s.pos = mark;
+            break;
+        }
+        if block_is_seq_dash(s) {
+            s.pos = mark;
+            break;
+        }
+        const key_start: usize = s.pos;
+        if s.pos >= s.len { return error.UnexpectedEof; }
+        if s.ptr[s.pos] == 34 {
+            const kv: YamlStrView = try parse_quoted_string_view(s);
+            skip_ws(s);
+            if s.pos >= s.len || s.ptr[s.pos] != 58 { return error.UnexpectedToken; }
+            s.pos = s.pos + 1;
+            if n >= cap {
+                cap = cap * 2;
+                const np: &YamlKeyValue = arena_alloc(s.arena, YAML_KEY_VALUE_ALLOC_SIZE * cap) as &YamlKeyValue;
+                if np == null { return error.UnexpectedToken; }
+                var j: usize = 0;
+                while j < n {
+                    np[j] = pairs[j];
+                    j = j + 1;
+                }
+                pairs = np;
+            }
+            pairs[n] = try parse_block_mapping_pair(s, kv.ptr, kv.len, ind);
+            n = n + 1;
+            continue;
+        }
+        while s.pos < s.len {
+            const b: byte = s.ptr[s.pos];
+            if b == 58 { break; }
+            if b == 10 || b == 13 { return error.UnexpectedToken; }
+            s.pos = s.pos + 1;
+        }
+        if s.pos >= s.len || s.ptr[s.pos] != 58 { return error.UnexpectedToken; }
+        const key_view: YamlStrView = YamlStrView{ ptr: &s.ptr[key_start], len: s.pos - key_start };
+        s.pos = s.pos + 1;
+        if n >= cap {
+            cap = cap * 2;
+            const np2: &YamlKeyValue = arena_alloc(s.arena, YAML_KEY_VALUE_ALLOC_SIZE * cap) as &YamlKeyValue;
+            if np2 == null { return error.UnexpectedToken; }
+            var k: usize = 0;
+            while k < n {
+                np2[k] = pairs[k];
+                k = k + 1;
+            }
+            pairs = np2;
+        }
+        pairs[n] = try parse_block_mapping_pair(s, key_view.ptr, key_view.len, ind);
+        n = n + 1;
+    }
+    if n == 0 { return error.UnexpectedToken; }
+    return YamlValue.y_obj(YamlObject{ pairs: pairs, len: n });
+}
+
+fn parse_block_mapping_pair(s: &ParseState, key_ptr: &byte, key_len: usize, ind: usize) !YamlKeyValue {
+    const val: YamlValue = try parse_block_value_after_colon(s, ind);
+    return YamlKeyValue{ key: YamlStrView{ ptr: key_ptr, len: key_len }, value: val };
+}
+
+fn parse_block_sequence(s: &ParseState, min_indent: usize) !YamlValue {
+    var cap: usize = 4;
+    var items: &YamlValue = arena_alloc(s.arena, YAML_VALUE_ALLOC_SIZE * cap) as &YamlValue;
+    if items == null { return error.UnexpectedToken; }
+    var n: usize = 0;
+    while s.pos < s.len {
+        if !block_at_line_start(s) { return error.UnexpectedToken; }
+        const mark: usize = s.pos;
+        const ind: usize = try block_consume_indent(s);
+        if ind < min_indent {
+            s.pos = mark;
+            break;
+        }
+        if ind != min_indent {
+            s.pos = mark;
+            break;
+        }
+        if !block_is_seq_dash(s) {
+            s.pos = mark;
+            break;
+        }
+        s.pos = s.pos + 1;
+        while s.pos < s.len && s.ptr[s.pos] == 32 { s.pos = s.pos + 1; }
+        const le: usize = block_line_end(s, s.pos);
+        if s.pos >= le {
+            block_skip_newline(s);
+            if s.pos >= s.len { return error.UnexpectedEof; }
+            const ind2: usize = try block_consume_indent(s);
+            if ind2 <= min_indent { return error.InvalidIndent; }
+            if block_is_seq_dash(s) {
+                const vseq: YamlValue = try parse_block_sequence(s, ind2);
+                if n >= cap {
+                    cap = cap * 2;
+                    const ni: &YamlValue = arena_alloc(s.arena, YAML_VALUE_ALLOC_SIZE * cap) as &YamlValue;
+                    if ni == null { return error.UnexpectedToken; }
+                    var j: usize = 0;
+                    while j < n {
+                        ni[j] = items[j];
+                        j = j + 1;
+                    }
+                    items = ni;
+                }
+                items[n] = vseq;
+                n = n + 1;
+                continue;
+            }
+            const vmap: YamlValue = try parse_block_mapping(s, ind2);
+            if n >= cap {
+                cap = cap * 2;
+                const ni2: &YamlValue = arena_alloc(s.arena, YAML_VALUE_ALLOC_SIZE * cap) as &YamlValue;
+                if ni2 == null { return error.UnexpectedToken; }
+                var k: usize = 0;
+                while k < n {
+                    ni2[k] = items[k];
+                    k = k + 1;
+                }
+                items = ni2;
+            }
+            items[n] = vmap;
+            n = n + 1;
+            continue;
+        }
+        var st: ParseState = ParseState{ ptr: s.ptr, len: le, pos: s.pos, arena: s.arena, depth: s.depth, anchors: s.anchors };
+        const ve: YamlValue = try parse_block_bounded_value(&st);
+        s.pos = le;
+        block_skip_newline(s);
+        if n >= cap {
+            cap = cap * 2;
+            const ni3: &YamlValue = arena_alloc(s.arena, YAML_VALUE_ALLOC_SIZE * cap) as &YamlValue;
+            if ni3 == null { return error.UnexpectedToken; }
+            var t: usize = 0;
+            while t < n {
+                ni3[t] = items[t];
+                t = t + 1;
+            }
+            items = ni3;
+        }
+        items[n] = ve;
+        n = n + 1;
+    }
+    if n == 0 { return error.UnexpectedToken; }
+    return YamlValue.y_arr(YamlArray{ items: items, len: n });
+}
+
+fn parse_block_root(s: &ParseState) !YamlValue {
+    try block_skip_leading_blank_lines(s);
+    if s.pos >= s.len { return error.UnexpectedEof; }
+    if block_is_seq_dash(s) {
+        return parse_block_sequence(s, 0);
+    }
+    return parse_block_mapping(s, 0);
+}
+
+fn starts_flow_document(s: &ParseState) bool {
+    if s.pos >= s.len { return false; }
+    const b: byte = s.ptr[s.pos];
+    if b == 123 || b == 91 || b == 34 { return true; }
+    if b == 38 || b == 42 { return true; }
+    if b == 45 {
+        if s.pos + 1 < s.len && is_digit(s.ptr[s.pos + 1]) { return true; }
+        return false;
+    }
+    if is_digit(b) { return true; }
+    if b == 110 {
+        if s.pos + 4 <= s.len && s.ptr[s.pos] == 110 && s.ptr[s.pos + 1] == 117 && s.ptr[s.pos + 2] == 108 && s.ptr[s.pos + 3] == 108 {
+            return keyword_boundary_ok(s, 4);
+        }
+        if s.pos + 2 <= s.len && s.ptr[s.pos] == 110 && s.ptr[s.pos + 1] == 111 {
+            return keyword_boundary_ok(s, 2);
+        }
+        return false;
+    }
+    if b == 116 {
+        if s.pos + 4 <= s.len && s.ptr[s.pos] == 116 && s.ptr[s.pos + 1] == 114 && s.ptr[s.pos + 2] == 117 && s.ptr[s.pos + 3] == 101 {
+            return keyword_boundary_ok(s, 4);
+        }
+        return false;
+    }
+    if b == 102 {
+        if s.pos + 5 <= s.len && s.ptr[s.pos] == 102 && s.ptr[s.pos + 1] == 97 && s.ptr[s.pos + 2] == 108 && s.ptr[s.pos + 3] == 115 && s.ptr[s.pos + 4] == 101 {
+            return keyword_boundary_ok(s, 5);
+        }
+        return false;
+    }
+    if b == 121 {
+        if s.pos + 3 <= s.len && s.ptr[s.pos] == 121 && s.ptr[s.pos + 1] == 101 && s.ptr[s.pos + 2] == 115 {
+            return keyword_boundary_ok(s, 3);
+        }
+        return false;
+    }
+    if b == 111 {
+        if s.pos + 3 <= s.len && s.ptr[s.pos] == 111 && s.ptr[s.pos + 1] == 102 && s.ptr[s.pos + 2] == 102 {
+            return keyword_boundary_ok(s, 3);
+        }
+        if s.pos + 2 <= s.len && s.ptr[s.pos] == 111 && s.ptr[s.pos + 1] == 110 {
+            return keyword_boundary_ok(s, 2);
+        }
+        return false;
+    }
+    return false;
+}
+
+export fn parse(arena: &Arena, ptr: &byte, len: usize) !YamlValue {
+    var anchor_ctx: YamlAnchorCtx = YamlAnchorCtx{ n: 0, alias_res: 0, def_depth: 0, names: [], vals: [] };
+    var state: ParseState = ParseState{ ptr: ptr, len: len, pos: 0, arena: arena, depth: 0, anchors: &anchor_ctx };
+    try block_skip_leading_blank_lines(&state);
+    if state.pos >= len { return error.UnexpectedEof; }
+    if starts_flow_document(&state) {
+        const v: YamlValue = try parse_flow_value(&state);
+        skip_ws(&state);
+        if state.pos < len { return error.UnexpectedToken; }
+        return v;
+    }
+    const vb: YamlValue = try parse_block_root(&state);
+    try block_skip_trailing_blank_lines(&state);
+    if state.pos < len { return error.UnexpectedToken; }
+    return vb;
+}
+
+fn block_skip_trailing_blank_lines(s: &ParseState) !void {
+    while s.pos < s.len {
+        if !block_at_line_start(s) { return error.UnexpectedToken; }
+        const ls: usize = s.pos;
+        var i: usize = ls;
+        while i < s.len && s.ptr[i] == 32 { i = i + 1; }
+        if i < s.len && s.ptr[i] == 9 { return error.InvalidIndent; }
+        const le: usize = block_line_end(s, i);
+        if i == le {
+            s.pos = le;
+            block_skip_newline(s);
+            continue;
+        }
+        return error.UnexpectedToken;
+    }
+}
+
+fn multi_ptr_line_start(ptr: &byte, len: usize, i: usize) bool {
+    if i == 0 { return true; }
+    const p: usize = i - 1;
+    return ptr[p] == 10 || ptr[p] == 13;
+}
+
+fn multi_is_separator_line(ptr: &byte, len: usize, line_start: usize) bool {
+    if line_start + 3 > len { return false; }
+    if ptr[line_start] != 45 || ptr[line_start + 1] != 45 || ptr[line_start + 2] != 45 {
+        return false;
+    }
+    var j: usize = line_start + 3;
+    while j < len && ptr[j] == 32 { j = j + 1; }
+    if j >= len { return true; }
+    return ptr[j] == 10 || ptr[j] == 13;
+}
+
+fn multi_skip_line_end(ptr: &byte, len: usize, from: usize) usize {
+    var j: usize = from;
+    while j < len && ptr[j] != 10 && ptr[j] != 13 { j = j + 1; }
+    return j;
+}
+
+fn multi_skip_newline(ptr: &byte, len: usize, j: usize) usize {
+    if j >= len { return j; }
+    if ptr[j] == 13 {
+        var k: usize = j + 1;
+        if k < len && ptr[k] == 10 { k = k + 1; }
+        return k;
+    }
+    if ptr[j] == 10 { return j + 1; }
+    return j;
+}
+
+const MAX_MULTI_DOCS: usize = 32;
+
+export fn parse_multi(arena: &Arena, ptr: &byte, len: usize) !&[YamlValue] {
+    var doc_starts: [usize: 33] = [];
+    var doc_ends: [usize: 33] = [];
+    var base: usize = 0;
+    if len >= 3 && multi_ptr_line_start(ptr, len, 0) && multi_is_separator_line(ptr, len, 0) {
+        const e0: usize = multi_skip_line_end(ptr, len, 0);
+        base = multi_skip_newline(ptr, len, e0);
+    }
+    doc_starts[0] = base;
+    var doc_count: usize = 1;
+    var p: usize = base;
+    while p < len {
+        if multi_ptr_line_start(ptr, len, p) && multi_is_separator_line(ptr, len, p) {
+            if doc_count >= MAX_MULTI_DOCS { return error.NestingTooDeep; }
+            doc_ends[doc_count - 1] = p;
+            const eol: usize = multi_skip_line_end(ptr, len, p);
+            p = multi_skip_newline(ptr, len, eol);
+            doc_starts[doc_count] = p;
+            doc_count = doc_count + 1;
+            continue;
+        }
+        p = p + 1;
+    }
+    if doc_count > MAX_MULTI_DOCS { return error.NestingTooDeep; }
+    doc_ends[doc_count - 1] = len;
+    const out: &YamlValue = arena_alloc(arena, YAML_VALUE_ALLOC_SIZE * doc_count) as &YamlValue;
+    if out == null { return error.BufferTooSmall; }
+    var d: usize = 0;
+    while d < doc_count && d < MAX_MULTI_DOCS {
+        const a: usize = doc_starts[d];
+        const b: usize = doc_ends[d];
+        if a <= b {
+            const sl: usize = b - a;
+            if sl > 0 {
+                out[d] = try parse(arena, &ptr[a], sl);
+            } else {
+                out[d] = YamlValue.yaml_null();
+            }
+        } else {
+            out[d] = YamlValue.yaml_null();
+        }
+        d = d + 1;
+    }
+    return &out[0: doc_count];
+}

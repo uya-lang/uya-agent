@@ -1,0 +1,1414 @@
+// lib/std/async_scheduler.uya - 异步调度器
+//
+// 模块路径：use std.async_scheduler
+// 设计见 docs/std_async_design.md 阶段 5（std.async.scheduler）。
+// 当前支持：
+// - block_on + EventLoop 驱动
+// - 单任务 / 双任务共享 EventLoop
+// - 泛型 TaskQueue<T> 的共享 EventLoop 轮询
+// - eventfd 驱动的跨线程/跨执行上下文 wake
+// - cooperative cancel 状态传播（Future 在 poll 中显式检查 waker.is_cancelled()）
+
+use std;
+use std.async;
+use std.async_event;
+use std.async_frame;
+use std.thread;
+use std.mem.allocator.IAllocator;
+use libc.stdlib;
+use libc.syscall;
+
+extern fn malloc(size: usize) &void;
+extern fn realloc(ptr: &void, size: usize) &void;
+
+error TaskQueueFull;
+error TimedOut;
+
+export const TASK_QUEUE_CAPACITY: i32 = 64;
+export const TASK_QUEUE_I32_CAPACITY: i32 = TASK_QUEUE_CAPACITY;
+const SCHEDULER_COMPAT_INLINE_REPOLL_LIMIT: i32 = 1024;
+const SCHEDULER_DEFAULT_FRAME_BUFFER_BYTES: usize = 8192;
+
+// 本地时间辅助函数（避免跨模块 time.xxx 调用在泛型函数中的编译器 bug）
+fn sched_now_ms() !u64 {
+    var tv: TimeVal = TimeVal{ tv_sec: 0, tv_usec: 0 };
+    const result: !i32 = sys_gettimeofday(&tv, null as &void);
+    _ = result catch {
+        return error.TimedOut;
+    };
+    return (tv.tv_sec as u64) * (1000 as u64) + ((tv.tv_usec as u64) / (1000 as u64));
+}
+
+fn sched_deadline_expired(deadline_ms: u64) !bool {
+    if deadline_ms == 0 {
+        return false;
+    }
+    const current_ms: u64 = try sched_now_ms();
+    return current_ms >= deadline_ms;
+}
+
+fn sched_deadline_remaining_ms(deadline_ms: u64) !i32 {
+    if deadline_ms == 0 {
+        return -1;
+    }
+    const current_ms: u64 = try sched_now_ms();
+    if current_ms >= deadline_ms {
+        return 0;
+    }
+    const remaining: u64 = deadline_ms - current_ms;
+    if remaining > (0x7FFFFFFF as u64) {
+        return 0x7FFFFFFF;
+    }
+    var ms: i32 = remaining as i32;
+    if ms <= 0 {
+        ms = 1;
+    }
+    return ms;
+}
+
+fn scheduler_event_kind_from_waker(w: &Waker) EventKind {
+    const interest: i32 = w.io_interest_code();
+    if interest == 1 {
+        return EventKind.Readable({});
+    }
+    if interest == 2 {
+        return EventKind.Writable({});
+    }
+    return EventKind.ReadWrite({});
+}
+
+/// 把 Waker 的 interest 编码（1=RD / 2=WR / 3=RDWR）转成 EventLoop 的 EventKind。
+/// 参数说明：`code` 为 interest 编码。返回值说明：返回对应 EventKind；未知编码按 ReadWrite 处理。
+fn scheduler_event_kind_from_code(code: i32) EventKind {
+    if code == 1 {
+        return EventKind.Readable({});
+    }
+    if code == 2 {
+        return EventKind.Writable({});
+    }
+    return EventKind.ReadWrite({});
+}
+
+fn scheduler_deregister_fd(loop: EventLoop, registered_fd: &i32) !i32 {
+    if *registered_fd < 0 {
+        return 0;
+    }
+    const dereg_result: !i32 = loop.deregister(*registered_fd);
+    _ = dereg_result catch {
+        return dereg_result as! i32;
+    };
+    *registered_fd = 0 - 1;
+    return 0;
+}
+
+/// 一个等待中 future 在 EventLoop 上的 fd 注册表（有界，槽数与 `WAKER_IO_SLOT_MAX` 对齐）。
+///
+/// 为什么需要整张表而不是两个 i32：单 interest 时代每个 waker 最多只可能注册一个 io fd，
+/// 所以「已注册 fd」用一个 i32 就够。支持多 fd 之后必须记住**每一个**已注册的 fd，
+/// 才能在本轮注销掉已经不再需要关注的那些——否则 epoll 里会留下陈旧注册，fd 关闭后
+/// 数字被复用时会收到不属于本 future 的唤醒。
+///
+/// `io_fds[0]` 同时是历史读取口 `io_epoll_fd` 的镜像（测试与旧调用点只认主 fd）。
+export struct SchedulerFdRegs {
+    io_fds: [i32: WAKER_IO_SLOT_MAX],
+    io_count: i32,
+    event_fd: i32,
+
+    /// 主 io fd（历史 `io_epoll_fd` 语义）。
+    /// 参数说明：无。返回值说明：返回第 0 个已注册 io fd，没有则 -1。
+    fn primary_io_fd(self: &Self) i32 {
+        if self.io_count <= 0 {
+            return 0 - 1;
+        }
+        return self.io_fds[0];
+    }
+
+    /// 清空全部注册记录（不碰 EventLoop，注销由调用方负责）。
+    /// 参数说明：无。返回值说明：无。
+    fn clear(self: &Self) void {
+        var i: i32 = 0;
+        while i < WAKER_IO_SLOT_MAX {
+            self.io_fds[i] = 0 - 1;
+            i = i + 1;
+        }
+        self.io_count = 0;
+        self.event_fd = 0 - 1;
+    }
+
+    /// 清空 io fd 注册记录，保留 event fd（同步过程中 eventfd 与 io fd 分开管理）。
+    /// 参数说明：无。返回值说明：无。
+    fn clear_io_only(self: &Self) void {
+        var i: i32 = 0;
+        while i < WAKER_IO_SLOT_MAX {
+            self.io_fds[i] = 0 - 1;
+            i = i + 1;
+        }
+        self.io_count = 0;
+    }
+
+    /// 追加一个已注册 io fd（同 fd 不重复记录）。
+    /// 参数说明：`fd` 为本次成功注册的 fd。返回值说明：无。
+    fn remember_io_fd(self: &Self, fd: i32) void {
+        if fd < 0 || self.io_count >= WAKER_IO_SLOT_MAX {
+            return;
+        }
+        var i: i32 = 0;
+        while i < self.io_count {
+            if self.io_fds[i] == fd {
+                return;
+            }
+            i = i + 1;
+        }
+        self.io_fds[self.io_count] = fd;
+        self.io_count = self.io_count + 1;
+    }
+}
+
+fn scheduler_sync_registered_fd(loop: EventLoop, fd: i32, interest: EventKind, waker: &Waker, registered_fd: &i32) !i32 {
+    if fd < 0 {
+        _ = try scheduler_deregister_fd(loop, registered_fd);
+        return 0;
+    }
+    // 即使数字 fd 相同，也要重新走 register：
+    // - interest 可能从 readable 切到 writable
+    // - 旧 fd 关闭后，新 socket 可能复用同一个数字 fd
+    //   此时需要让 EventLoop 通过 MOD/ADD 修正内核注册状态
+    if *registered_fd >= 0 && *registered_fd != fd {
+        _ = try scheduler_deregister_fd(loop, registered_fd);
+    }
+    const reg_result: !i32 = loop.register(fd, interest, waker);
+    _ = reg_result catch {
+        return reg_result as! i32;
+    };
+    *registered_fd = fd;
+    return 1;
+}
+
+/// 把 waker 当前登记的全部 io 关注同步到 EventLoop，并注销不再需要的旧注册。
+///
+/// 单 interest 时代只要看 `io_fd()` 就够；多 fd 之后必须遍历 waker 的所有槽：
+/// - 每个槽按自己的 interest 注册（同 fd 的 RD|WR 已由 Waker 合并成 READWRITE）；
+/// - 上一轮注册过、这一轮 waker 不再关注的 fd 必须注销，否则 epoll 里留陈旧注册，
+///   数字 fd 被复用时会收到别的 future 的唤醒（表现为「莫名 Readable」）。
+/// 参数说明：`loop` 为事件循环；`waker` 为本次 poll 用过的 waker；`regs` 为该 future 的注册表。
+/// 返回值说明：返回本轮注册成功的 fd 数（含 eventfd）。
+fn scheduler_sync_waker_registrations_multi(loop: EventLoop, waker: &Waker, regs: &SchedulerFdRegs) !i32 {
+    var registered: i32 = 0;
+
+    if waker.has_event_fd() {
+        _ = try scheduler_sync_registered_fd(loop, waker.event_fd(), EventKind.Readable({}), waker, &regs.event_fd);
+        registered = 1;
+    } else {
+        _ = try scheduler_deregister_fd(loop, &regs.event_fd);
+    }
+
+    // 先把「本轮仍需要」的 fd 收进一个临时掩码，再拿它对照旧注册表做差集注销。
+    var keep: [i32: WAKER_IO_SLOT_MAX] = [];
+    var keep_count: i32 = 0;
+
+    const slot_total: i32 = waker.io_slot_count();
+    var i: i32 = 0;
+    while i < slot_total {
+        const fd: i32 = waker.io_slot_fd(i);
+        if fd >= 0 {
+            const interest: EventKind = scheduler_event_kind_from_code(waker.io_slot_interest(i));
+            var scratch: i32 = fd;
+            _ = try scheduler_sync_registered_fd(loop, fd, interest, waker, &scratch);
+            registered = registered + 1;
+            if keep_count < WAKER_IO_SLOT_MAX {
+                keep[keep_count] = fd;
+                keep_count = keep_count + 1;
+            }
+        }
+        i = i + 1;
+    }
+
+    // 旧注册里不再被关注的 fd：注销。
+    var old_i: i32 = 0;
+    while old_i < regs.io_count {
+        const old_fd: i32 = regs.io_fds[old_i];
+        var still_needed: bool = false;
+        var k: i32 = 0;
+        while k < keep_count {
+            if keep[k] == old_fd {
+                still_needed = true;
+                break;
+            }
+            k = k + 1;
+        }
+        if !still_needed {
+            var scratch2: i32 = old_fd;
+            _ = try scheduler_deregister_fd(loop, &scratch2);
+        }
+        old_i = old_i + 1;
+    }
+
+    // 记录本轮注册：主 fd 放第 0 位，保持 `primary_io_fd()` 与历史 `io_epoll_fd` 一致。
+    regs.clear_io_only();
+    var w: i32 = 0;
+    while w < keep_count {
+        regs.remember_io_fd(keep[w]);
+        w = w + 1;
+    }
+
+    return registered;
+}
+
+/// 创建一个空的 fd 注册表（所有 io 槽位记为「未注册」，event fd 为 -1）。
+/// 参数说明：无。返回值说明：返回可直接交给 `scheduler_sync_waker_registrations_multi` 的注册表。
+fn scheduler_fd_regs_new() SchedulerFdRegs {
+    var regs: SchedulerFdRegs = SchedulerFdRegs{ io_count: 0, event_fd: 0 - 1 };
+    var i: i32 = 0;
+    while i < WAKER_IO_SLOT_MAX {
+        regs.io_fds[i] = 0 - 1;
+        i = i + 1;
+    }
+    return regs;
+}
+
+/// 兼容入口：单 fd 调用方（只认一个 `io_registered_fd`）转走多 fd 实现。
+/// 参数说明：`loop` 事件循环；`waker` 本次 waker；`io_registered_fd`/`event_registered_fd` 为主 fd 镜像。
+/// 返回值说明：返回本轮注册成功的 fd 数。
+fn scheduler_sync_waker_registrations(loop: EventLoop, waker: &Waker, io_registered_fd: &i32, event_registered_fd: &i32) !i32 {
+    var regs: SchedulerFdRegs = scheduler_fd_regs_new();
+    regs.event_fd = *event_registered_fd;
+    if *io_registered_fd >= 0 {
+        regs.io_fds[0] = *io_registered_fd;
+        regs.io_count = 1;
+    }
+    const registered: i32 = try scheduler_sync_waker_registrations_multi(loop, waker, &regs);
+    *io_registered_fd = regs.primary_io_fd();
+    *event_registered_fd = regs.event_fd;
+    return registered;
+}
+
+fn scheduler_prepare_waker(waker: &Waker) !i32 {
+    if waker.has_event_fd() {
+        return 0;
+    }
+    std.cfg(std.target_os == .tos_macos, {
+        var pipe_fds: [i32: 2] = [];
+        _ = try sys_pipe2(&pipe_fds[0], O_NONBLOCK | O_CLOEXEC);
+        waker.bind_event_fd_pair(pipe_fds[0], pipe_fds[1]);
+        return 0;
+    }, {
+    const event_fd: i32 = try sys_eventfd(0 as u32, EFD_NONBLOCK | EFD_CLOEXEC);
+    waker.bind_event_fd(event_fd);
+    return 0;
+    })
+}
+
+fn scheduler_normalize_inline_repoll_limit(limit: i32) i32 {
+    if limit < 0 {
+        return 0;
+    }
+    return limit;
+}
+
+fn scheduler_env_looks_like_int(env: &byte) bool {
+    if env == null || env[0] == 0 as byte {
+        return false;
+    }
+    const first: byte = env[0];
+    if first == 43 as byte || first == 45 as byte {
+        return env[1] >= 48 as byte && env[1] <= 57 as byte;
+    }
+    return first >= 48 as byte && first <= 57 as byte;
+}
+
+fn scheduler_runtime_default_frame_buffer_bytes() usize {
+    var buffer_size: usize = SCHEDULER_DEFAULT_FRAME_BUFFER_BYTES;
+    const env: &byte = getenv("UYA_SCHEDULER_FRAME_BUFFER_BYTES" as &const byte);
+    if env != null && env[0] != 0 as byte {
+        const parsed: i32 = atoi(env as &const byte);
+        if parsed > 0 {
+            buffer_size = parsed as usize;
+        }
+    }
+    return buffer_size;
+}
+
+fn scheduler_runtime_default_inline_repoll_limit() i32 {
+    var limit: i32 = SCHEDULER_COMPAT_INLINE_REPOLL_LIMIT;
+    const env: &byte = getenv("UYA_SCHEDULER_INLINE_REPOLL_LIMIT" as &const byte);
+    if scheduler_env_looks_like_int(env) {
+        limit = atoi(env as &const byte);
+    }
+    return scheduler_normalize_inline_repoll_limit(limit);
+}
+
+fn scheduler_cleanup_waker(loop: EventLoop, waker: &Waker, io_registered_fd: &i32, event_registered_fd: &i32) void {
+    _ = scheduler_deregister_fd(loop, io_registered_fd) catch {};
+    _ = scheduler_deregister_fd(loop, event_registered_fd) catch {};
+    waker.close_event_fd();
+    waker.clear_io_interest();
+}
+
+fn scheduler_cleanup_slot_resources(loop: EventLoop, waker: &Waker, io_registered_fd: &i32, event_registered_fd: &i32) void {
+    _ = scheduler_deregister_fd(loop, io_registered_fd) catch {};
+    _ = scheduler_deregister_fd(loop, event_registered_fd) catch {};
+    waker.close_event_fd();
+    waker.clear_io_interest();
+}
+
+export struct TaskQueueSlot<T> {
+    future: Future<!T>,
+    waker: Waker,
+    active: i32,
+    done: i32,
+    cancelled: i32,
+    result: T,
+    error_id: u32,
+    io_epoll_fd: i32,
+    event_epoll_fd: i32,
+}
+
+export struct TaskQueue<T> {
+    len: i32,
+    capacity: i32,
+    fixed_capacity: i32,
+    slots: &TaskQueueSlot<T> = null,
+
+    fn push(self: &Self, f: Future<!T>) !i32 {
+        _ = try self.ensure_capacity_for_push();
+        const limit: i32 = self.capacity_limit();
+
+        const idx: i32 = self.len;
+        if idx < 0 || idx >= limit {
+            return error.TaskQueueFull;
+        }
+        var zero_sample: [T: 1] = [];
+        const zero_value: T = zero_sample[0];
+
+        self.slots[idx as usize] = TaskQueueSlot<T>{
+            future: f,
+            waker: Waker{ _io_fd: 0 - 1, _event_fd: 0 - 1 },
+            active: 1,
+            done: 0,
+            cancelled: 0,
+            result: zero_value,
+            error_id: 0 as u32,
+            io_epoll_fd: 0 - 1,
+            event_epoll_fd: 0 - 1,
+        };
+        self.len = idx + 1;
+        return idx;
+    }
+
+    fn capacity_limit(self: &Self) i32 {
+        if self.capacity <= 0 {
+            return TASK_QUEUE_CAPACITY;
+        }
+        return self.capacity;
+    }
+
+    fn ensure_capacity_for_push(self: &Self) !i32 {
+        if self.slots == null {
+            _ = try self.ensure_slots();
+        }
+        if self.len < self.capacity_limit() {
+            return 0;
+        }
+        if self.fixed_capacity != 0 {
+            return error.TaskQueueFull;
+        }
+        return self.grow_slots();
+    }
+
+    fn ensure_slots(self: &Self) !i32 {
+        if self.slots != null {
+            return 0;
+        }
+        const limit: i32 = self.capacity_limit();
+        if limit <= 0 {
+            return error.TaskQueueFull;
+        }
+        const ptr: &void = calloc(limit as usize, @size_of(TaskQueueSlot<T>));
+        if ptr == null {
+            return error.TaskQueueFull;
+        }
+        self.slots = ptr as &TaskQueueSlot<T>;
+        return 0;
+    }
+
+    fn grow_slots(self: &Self) !i32 {
+        var next_capacity: i32 = self.capacity_limit() * 2;
+        if next_capacity <= self.len {
+            next_capacity = self.len + 1;
+        }
+        if next_capacity <= 0 {
+            return error.TaskQueueFull;
+        }
+        const bytes: usize = (next_capacity as usize) * @size_of(TaskQueueSlot<T>);
+        const ptr: &void = realloc(self.slots as &void, bytes);
+        if ptr == null {
+            return error.TaskQueueFull;
+        }
+        self.slots = ptr as &TaskQueueSlot<T>;
+        self.capacity = next_capacity;
+        return 0;
+    }
+
+    fn result(self: &Self, idx: i32) T {
+        if idx < 0 || idx >= self.len || idx >= self.capacity_limit() {
+            var sample: [T: 1] = [];
+            return sample[0];
+        }
+        return self.slots[idx as usize].result;
+    }
+
+    fn error_id(self: &Self, idx: i32) u32 {
+        if idx < 0 || idx >= self.len || idx >= self.capacity_limit() {
+            return 0 as u32;
+        }
+        return self.slots[idx as usize].error_id;
+    }
+
+    fn is_done(self: &Self, idx: i32) bool {
+        if idx < 0 || idx >= self.len || idx >= self.capacity_limit() {
+            return false;
+        }
+        return self.slots[idx as usize].done != 0;
+    }
+
+    fn is_cancelled(self: &Self, idx: i32) bool {
+        if idx < 0 || idx >= self.len || idx >= self.capacity_limit() {
+            return false;
+        }
+        return self.slots[idx as usize].cancelled != 0;
+    }
+
+    fn cancel(self: &Self, idx: i32) bool {
+        if idx < 0 || idx >= self.len || idx >= self.capacity_limit() {
+            return false;
+        }
+        const slot: &TaskQueueSlot<T> = &self.slots[idx as usize];
+        if slot.active == 0 || slot.done != 0 {
+            return false;
+        }
+        slot.waker.cancel();
+        return true;
+    }
+}
+
+export type TaskQueueSlot_i32 = TaskQueueSlot<i32>;
+export type TaskQueue_i32 = TaskQueue<i32>;
+export type TaskQueueSlot_u32 = TaskQueueSlot<u32>;
+export type TaskQueue_u32 = TaskQueue<u32>;
+export type TaskQueueSlot_usize = TaskQueueSlot<usize>;
+export type TaskQueue_usize = TaskQueue<usize>;
+
+fn task_queue_normalize_capacity(capacity: i32) i32 {
+    if capacity <= 0 {
+        return TASK_QUEUE_CAPACITY;
+    }
+    return capacity;
+}
+
+/// 创建默认容量的任务队列。
+/// 参数：无。
+/// 返回：容量兼容既有默认值的 TaskQueue<T>。
+export fn task_queue_new<T>() TaskQueue<T> {
+    return TaskQueue<T>{ len: 0, capacity: TASK_QUEUE_CAPACITY, fixed_capacity: 0, slots: null };
+}
+
+/// 创建指定运行时容量上限的任务队列。
+/// 参数：capacity 为队列可入队任务上限；小于等于 0 时使用默认值。
+/// 返回：带可配置容量上限的 TaskQueue<T>。
+export fn task_queue_new_with_capacity<T>(capacity: i32) TaskQueue<T> {
+    return TaskQueue<T>{ len: 0, capacity: task_queue_normalize_capacity(capacity), fixed_capacity: 1, slots: null };
+}
+
+fn task_queue_capacity_internal<T>(queue: &TaskQueue<T>) i32 {
+    if queue == null {
+        return TASK_QUEUE_CAPACITY;
+    }
+    return queue.capacity_limit();
+}
+
+/// 创建默认容量的 i32 任务队列。
+/// 参数：无。
+/// 返回：TaskQueue_i32。
+export fn task_queue_i32_new() TaskQueue_i32 {
+    return task_queue_new<i32>();
+}
+
+/// 创建指定运行时容量上限的 i32 任务队列。
+/// 参数：capacity 为队列可入队任务上限。
+/// 返回：TaskQueue_i32。
+export fn task_queue_i32_new_with_capacity(capacity: i32) TaskQueue_i32 {
+    return task_queue_new_with_capacity<i32>(capacity);
+}
+
+/// 获取 i32 任务队列当前配置容量。
+/// 参数：queue 为 i32 任务队列指针。
+/// 返回：队列容量；空指针时返回兼容默认容量。
+export fn task_queue_i32_capacity(queue: &TaskQueue_i32) i32 {
+    return task_queue_capacity_internal<i32>(queue);
+}
+
+/// 创建默认容量的 u32 任务队列。
+/// 参数：无。
+/// 返回：TaskQueue_u32。
+export fn task_queue_u32_new() TaskQueue_u32 {
+    return task_queue_new<u32>();
+}
+
+/// 创建指定运行时容量上限的 u32 任务队列。
+/// 参数：capacity 为队列可入队任务上限。
+/// 返回：TaskQueue_u32。
+export fn task_queue_u32_new_with_capacity(capacity: i32) TaskQueue_u32 {
+    return task_queue_new_with_capacity<u32>(capacity);
+}
+
+/// 获取 u32 任务队列当前配置容量。
+/// 参数：queue 为 u32 任务队列指针。
+/// 返回：队列容量；空指针时返回兼容默认容量。
+export fn task_queue_u32_capacity(queue: &TaskQueue_u32) i32 {
+    return task_queue_capacity_internal<u32>(queue);
+}
+
+/// 创建默认容量的 usize 任务队列。
+/// 参数：无。
+/// 返回：TaskQueue_usize。
+export fn task_queue_usize_new() TaskQueue_usize {
+    return task_queue_new<usize>();
+}
+
+/// 创建指定运行时容量上限的 usize 任务队列。
+/// 参数：capacity 为队列可入队任务上限。
+/// 返回：TaskQueue_usize。
+export fn task_queue_usize_new_with_capacity(capacity: i32) TaskQueue_usize {
+    return task_queue_new_with_capacity<usize>(capacity);
+}
+
+/// 获取 usize 任务队列当前配置容量。
+/// 参数：queue 为 usize 任务队列指针。
+/// 返回：队列容量；空指针时返回兼容默认容量。
+export fn task_queue_usize_capacity(queue: &TaskQueue_usize) i32 {
+    return task_queue_capacity_internal<usize>(queue);
+}
+
+/// `Scheduler` 运行时指标快照。
+/// 参数：无；通过 `scheduler_metrics` 读取指定实例的当前值。
+/// 返回值：包含 async frame pool 的累计 alloc/free/full/debug heap fallback 计数，以及调度中的当前/历史峰值队列深度。
+export struct SchedulerMetrics {
+    frame_alloc_count: u64,
+    frame_free_count: u64,
+    frame_full_count: u64,
+    frame_heap_fallback_count: u64,
+    queue_depth: i32,
+    peak_queue_depth: i32,
+    timeout_wait_count: u64,
+    timeout_result_count: u64,
+    cancel_result_count: u64,
+    wake_inline_count: u64,
+    wake_event_loop_count: u64,
+    wake_cancel_count: u64,
+}
+
+/// async runtime 统一指标快照。
+/// 参数：无；通过 `async_runtime_metrics_linux_epoll` 读取指定 scheduler + LinuxEpoll 的聚合值。
+/// 返回值：包含 scheduler 的 frame/queue 指标、Linux epoll 的当前/峰值注册 fd 数和扩容次数，以及可选 thread pool 的队列/运行/饱和指标。
+export struct AsyncRuntimeMetrics {
+    frame_alloc_count: u64,
+    frame_free_count: u64,
+    frame_full_count: u64,
+    frame_heap_fallback_count: u64,
+    queue_depth: i32,
+    peak_queue_depth: i32,
+    timeout_wait_count: u64,
+    timeout_result_count: u64,
+    cancel_result_count: u64,
+    wake_inline_count: u64,
+    wake_event_loop_count: u64,
+    wake_cancel_count: u64,
+    epoll_registered_fd_count: i32,
+    epoll_peak_registered_fd_count: i32,
+    epoll_resize_count: i32,
+    thread_pool_queue_depth: i32,
+    thread_pool_running_workers: i32,
+    thread_pool_saturation_count: u64,
+}
+
+/// 调度器。持有 async frame pool，同 scheduler 内的任务共享 pool 分配器。
+export struct Scheduler {
+    _frame_pool: &AsyncFramePool,
+    _frame_buffer: &byte,
+    _frame_buffer_size: usize,
+    _metrics_frame_alloc_seen: u64,
+    _metrics_frame_free_seen: u64,
+    _metrics_heap_fallback_seen: u64,
+    _metrics_queue_depth: i32,
+    _metrics_peak_queue_depth: i32,
+    _metrics_timeout_wait_count: u64,
+    _metrics_timeout_result_count: u64,
+    _metrics_cancel_result_count: u64,
+    _metrics_wake_inline_count: u64,
+    _metrics_wake_event_loop_count: u64,
+    _metrics_wake_cancel_count: u64,
+    _inline_repoll_limit: i32,
+}
+
+fn scheduler_normalize_queue_depth(depth: i32) i32 {
+    if depth < 0 {
+        return 0;
+    }
+    return depth;
+}
+
+fn scheduler_set_queue_depth(self: &Scheduler, depth: i32) void {
+    if self == null {
+        return;
+    }
+    const next_depth: i32 = scheduler_normalize_queue_depth(depth);
+    self._metrics_queue_depth = next_depth;
+    if next_depth > self._metrics_peak_queue_depth {
+        self._metrics_peak_queue_depth = next_depth;
+    }
+}
+
+fn scheduler_record_wait_timeout(self: &Scheduler) void {
+    if self == null {
+        return;
+    }
+    self._metrics_timeout_wait_count = self._metrics_timeout_wait_count + 1u64;
+}
+
+fn scheduler_record_ready_error_id(self: &Scheduler, error_id: u32) void {
+    if self == null || error_id == 0 as u32 {
+        return;
+    }
+    if error_id == @error_id(error.Cancelled) as u32 {
+        self._metrics_cancel_result_count = self._metrics_cancel_result_count + 1u64;
+        return;
+    }
+    if error_id == @error_id(error.TimedOut) as u32 ||
+       error_id == @error_id(error.AsyncDeadlineExceeded) as u32 {
+        self._metrics_timeout_result_count = self._metrics_timeout_result_count + 1u64;
+    }
+}
+
+fn scheduler_record_wake_source(self: &Scheduler, waker: &Waker) void {
+    if self == null || waker == null || !waker.is_woken() {
+        return;
+    }
+    if waker.wake_source_is_cancel() {
+        self._metrics_wake_cancel_count = self._metrics_wake_cancel_count + 1u64;
+        return;
+    }
+    if waker.wake_source_is_event_loop() {
+        self._metrics_wake_event_loop_count = self._metrics_wake_event_loop_count + 1u64;
+        return;
+    }
+    self._metrics_wake_inline_count = self._metrics_wake_inline_count + 1u64;
+}
+
+/// 辅助：将 AsyncFramePool 值装箱为 IAllocator（利用 return 隐式转换）。
+fn scheduler_pool_to_allocator(pool: &AsyncFramePool) IAllocator {
+    return *pool;
+}
+
+/// 创建调度器并初始化其 async frame pool。
+/// 默认 inline repoll 策略读取 runtime 默认值。
+export fn scheduler_init(self: &Scheduler) void {
+    scheduler_init_with_config(self, 0usize, scheduler_runtime_default_inline_repoll_limit());
+}
+
+/// 使用显式资源配置创建调度器。
+/// 参数：self 为待初始化调度器；frame_buffer_bytes 为 frame pool backing buffer 字节数，0 使用默认值；inline_repoll_limit 为无 I/O Pending 连续 repoll 上限。
+/// 返回值：无。
+export fn scheduler_init_with_config(self: &Scheduler, frame_buffer_bytes: usize, inline_repoll_limit: i32) void {
+    if self == null {
+        return;
+    }
+    self._frame_pool = malloc(@size_of(AsyncFramePool)) as &AsyncFramePool;
+    if self._frame_pool == null {
+        return;
+    }
+    var buffer_size: usize = frame_buffer_bytes;
+    if buffer_size == 0 {
+        buffer_size = scheduler_runtime_default_frame_buffer_bytes();
+    }
+    self._frame_buffer = malloc(buffer_size) as &byte;
+    self._frame_buffer_size = buffer_size;
+    if self._frame_buffer == null {
+        self._frame_buffer_size = 0;
+    }
+    const stack_limit: usize = async_frame_runtime_default_stack_limit();
+    async_frame_pool_init_with_buffer(
+        self._frame_pool,
+        self._frame_buffer,
+        self._frame_buffer_size,
+        1,
+        stack_limit,
+    );
+    self._metrics_frame_alloc_seen = 0u64;
+    self._metrics_frame_free_seen = 0u64;
+    self._metrics_heap_fallback_seen = 0u64;
+    self._metrics_queue_depth = 0;
+    self._metrics_peak_queue_depth = 0;
+    self._metrics_timeout_wait_count = 0u64;
+    self._metrics_timeout_result_count = 0u64;
+    self._metrics_cancel_result_count = 0u64;
+    self._metrics_wake_inline_count = 0u64;
+    self._metrics_wake_event_loop_count = 0u64;
+    self._metrics_wake_cancel_count = 0u64;
+    self._inline_repoll_limit = scheduler_normalize_inline_repoll_limit(inline_repoll_limit);
+}
+
+/// 创建调度器并初始化其 async frame pool。
+export fn scheduler_new() Scheduler {
+    var s: Scheduler = Scheduler{};
+    scheduler_init(&s);
+    return s;
+}
+
+/// 创建调度器并设置 frame buffer 与 inline repoll 资源策略。
+/// 参数：frame_buffer_bytes 为 frame pool backing buffer 字节数，0 使用默认值；inline_repoll_limit 为无 I/O Pending 连续 repoll 上限。
+/// 返回：已初始化的 Scheduler。
+export fn scheduler_new_with_config(frame_buffer_bytes: usize, inline_repoll_limit: i32) Scheduler {
+    var s: Scheduler = Scheduler{};
+    scheduler_init_with_config(&s, frame_buffer_bytes, inline_repoll_limit);
+    return s;
+}
+
+/// 设置调度器在无 I/O interest 的 Pending 状态下可连续 inline repoll 的上限。
+/// 参数：limit 为上限；小于 0 时按 0 处理。
+/// 返回值：无。
+export fn scheduler_set_inline_repoll_limit(self: &Scheduler, limit: i32) void {
+    if self == null {
+        return;
+    }
+    self._inline_repoll_limit = scheduler_normalize_inline_repoll_limit(limit);
+}
+
+/// 创建调度器并设置 inline repoll 上限。
+/// 参数：limit 为无 I/O interest Pending 的连续 inline repoll 上限。
+/// 返回：已初始化的 Scheduler。
+export fn scheduler_new_with_inline_repoll_limit(limit: i32) Scheduler {
+    var s: Scheduler = scheduler_new();
+    scheduler_set_inline_repoll_limit(&s, limit);
+    return s;
+}
+
+/// 获取调度器 inline repoll 上限。
+/// 参数：self 为调度器指针。
+/// 返回：当前 inline repoll 上限；空指针时返回 runtime 默认策略（`UYA_SCHEDULER_INLINE_REPOLL_LIMIT` 或兼容默认值）。
+export fn scheduler_inline_repoll_limit(self: &Scheduler) i32 {
+    if self == null {
+        return scheduler_runtime_default_inline_repoll_limit();
+    }
+    return scheduler_normalize_inline_repoll_limit(self._inline_repoll_limit);
+}
+
+/// 获取调度器 frame pool backing buffer 字节数。
+/// 参数：self 为调度器指针。
+/// 返回：当前配置的 frame buffer 字节数；空指针时返回 0。
+export fn scheduler_frame_buffer_size(self: &Scheduler) usize {
+    if self == null {
+        return 0usize;
+    }
+    return self._frame_buffer_size;
+}
+
+/// 获取调度器绑定的 async frame pool。
+export fn scheduler_frame_pool(self: &Scheduler) &AsyncFramePool {
+    return self._frame_pool;
+}
+
+/// 获取调度器当前运行时指标快照。
+/// 参数：self 为调度器实例；空指针或未初始化 frame pool 时返回全零快照。
+/// 返回值：包含当前已知的 async frame alloc/free/full/debug heap fallback 计数，以及当前/历史峰值队列深度。
+export fn scheduler_metrics(self: &Scheduler) SchedulerMetrics {
+    if self == null || self._frame_pool == null {
+        return SchedulerMetrics{};
+    }
+    const pool: &AsyncFramePool = self._frame_pool;
+    return SchedulerMetrics{
+        frame_alloc_count: pool.total_alloc_count as u64,
+        frame_free_count: pool.total_free_count as u64,
+        frame_full_count: pool.pool_full_count as u64,
+        frame_heap_fallback_count: pool.debug_heap_fallback_count as u64,
+        queue_depth: self._metrics_queue_depth,
+        peak_queue_depth: self._metrics_peak_queue_depth,
+        timeout_wait_count: self._metrics_timeout_wait_count,
+        timeout_result_count: self._metrics_timeout_result_count,
+        cancel_result_count: self._metrics_cancel_result_count,
+        wake_inline_count: self._metrics_wake_inline_count,
+        wake_event_loop_count: self._metrics_wake_event_loop_count,
+        wake_cancel_count: self._metrics_wake_cancel_count,
+    };
+}
+
+/// 获取 async runtime 当前统一指标快照（scheduler + Linux epoll）。
+/// 参数：`self` 为 scheduler 指针，可为空；`loop` 为 LinuxEpoll 指针，可为空。
+/// 返回值：聚合后的统一指标；scheduler 或 epoll 为空时，对应字段返回 0。
+export fn async_runtime_metrics_linux_epoll(self: &Scheduler, loop: &LinuxEpoll) AsyncRuntimeMetrics {
+    return async_runtime_metrics_linux_epoll_with_thread_pool(self, loop, null as &ThreadPool);
+}
+
+fn async_runtime_metrics_apply_thread_pool(metrics: &AsyncRuntimeMetrics, pool: &ThreadPool) void {
+    if metrics == null || pool == null {
+        return;
+    }
+    const pool_metrics: ThreadPoolMetrics = thread_pool_metrics(pool);
+    metrics.thread_pool_queue_depth = pool_metrics.queue_depth;
+    metrics.thread_pool_running_workers = pool_metrics.running_workers;
+    metrics.thread_pool_saturation_count = pool_metrics.saturation_count;
+}
+
+/// 获取 async runtime 当前统一指标快照（scheduler + Linux epoll + 可选 thread pool）。
+/// 参数：`self` 为 scheduler 指针，可为空；`loop` 为 LinuxEpoll 指针，可为空；`pool` 为 thread pool 指针，可为空。
+/// 返回值：聚合后的统一指标；对应组件为空时，其字段返回 0。
+export fn async_runtime_metrics_linux_epoll_with_thread_pool(self: &Scheduler, loop: &LinuxEpoll, pool: &ThreadPool) AsyncRuntimeMetrics {
+    const scheduler_snapshot: SchedulerMetrics = scheduler_metrics(self);
+    var metrics: AsyncRuntimeMetrics = AsyncRuntimeMetrics{
+        frame_alloc_count: scheduler_snapshot.frame_alloc_count,
+        frame_free_count: scheduler_snapshot.frame_free_count,
+        frame_full_count: scheduler_snapshot.frame_full_count,
+        frame_heap_fallback_count: scheduler_snapshot.frame_heap_fallback_count,
+        queue_depth: scheduler_snapshot.queue_depth,
+        peak_queue_depth: scheduler_snapshot.peak_queue_depth,
+        timeout_wait_count: scheduler_snapshot.timeout_wait_count,
+        timeout_result_count: scheduler_snapshot.timeout_result_count,
+        cancel_result_count: scheduler_snapshot.cancel_result_count,
+        wake_inline_count: scheduler_snapshot.wake_inline_count,
+        wake_event_loop_count: scheduler_snapshot.wake_event_loop_count,
+        wake_cancel_count: scheduler_snapshot.wake_cancel_count,
+        epoll_registered_fd_count: 0,
+        epoll_peak_registered_fd_count: 0,
+        epoll_resize_count: 0,
+        thread_pool_queue_depth: 0,
+        thread_pool_running_workers: 0,
+        thread_pool_saturation_count: 0u64,
+    };
+    if loop != null {
+        metrics.epoll_registered_fd_count = linux_epoll_registered_count(loop);
+        metrics.epoll_peak_registered_fd_count = linux_epoll_peak_registered_count(loop);
+        metrics.epoll_resize_count = linux_epoll_resize_count(loop);
+    }
+    async_runtime_metrics_apply_thread_pool(&metrics, pool);
+    return metrics;
+}
+
+/// 同步运行 Future<!T> 直到 Ready，返回 !T。
+/// 忙等待轮询（与 std.async.block_on<T> 同逻辑）；此处内联实现，避免单态 `scheduler_run_*` 依赖未单独发射的 `std_block_on_*` 符号。
+/// 运行期间将 scheduler 的 frame pool 注入线程本地 allocator，返回前恢复。
+export fn scheduler_run<T>(self: &Scheduler, f: Future<!T>) !T {
+    const alloc: IAllocator = scheduler_pool_to_allocator(self._frame_pool);
+    const old_alloc: &IAllocator = get_async_frame_allocator();
+    set_async_frame_allocator(&alloc);
+    defer { set_async_frame_allocator(old_alloc); }
+    scheduler_set_queue_depth(self, 1);
+    defer { scheduler_set_queue_depth(self, 0); }
+    var w: Waker = Waker{};
+    while true {
+        scheduler_record_wake_source(self, &w);
+        w.reset();
+        w.clear_io_interest();
+        const p: Poll<!T> = f.poll(&w);
+        match p {
+            .Ready(ok_val) => {
+                scheduler_record_ready_error_id(self, ok_val.error_id);
+                return ok_val;
+            },
+            .Pending(_) => { },
+        };
+    }
+}
+
+export fn scheduler_run_i32(self: &Scheduler, f: Future<!i32>) !i32 {
+    const result: !i32 = scheduler_run<i32>(self, f);
+    return result;
+}
+
+export fn scheduler_run_u32(self: &Scheduler, f: Future<!u32>) !u32 {
+    const result: !u32 = scheduler_run<u32>(self, f);
+    return result;
+}
+
+export fn scheduler_run_usize(self: &Scheduler, f: Future<!usize>) !usize {
+    const result: !usize = scheduler_run<usize>(self, f);
+    return result;
+}
+
+/// 运行 Future<!T>，当 poll 返回 Pending 时主动驱动 EventLoop 一次后再重试。
+/// 运行期间将 scheduler 的 frame pool 注入线程本地 allocator，返回前恢复。
+export fn scheduler_run_with_event_loop<T>(self: &Scheduler, loop: EventLoop, f: Future<!T>, timeout_ms: i32) !T {
+    const alloc: IAllocator = scheduler_pool_to_allocator(self._frame_pool);
+    const old_alloc: &IAllocator = get_async_frame_allocator();
+    set_async_frame_allocator(&alloc);
+    defer { set_async_frame_allocator(old_alloc); }
+    scheduler_set_queue_depth(self, 1);
+    defer { scheduler_set_queue_depth(self, 0); }
+
+    var w: Waker = Waker{ _io_fd: 0 - 1, _event_fd: 0 - 1 };
+    var io_registered_fd: i32 = 0 - 1;
+    var event_registered_fd: i32 = 0 - 1;
+    var inline_repoll_count: i32 = 0;
+    defer { scheduler_cleanup_waker(loop, &w, &io_registered_fd, &event_registered_fd); }
+
+    while true {
+        scheduler_record_wake_source(self, &w);
+        w.reset();
+        w.clear_io_interest();
+        const p: Poll<!T> = f.poll(&w);
+        match p {
+            .Ready(ok_val) => {
+                scheduler_record_ready_error_id(self, ok_val.error_id);
+                return ok_val;
+            },
+            .Pending(_) => {
+                if w.is_woken() {
+                    inline_repoll_count = 0;
+                    continue;
+                }
+                if !w.has_io_interest() && inline_repoll_count < scheduler_inline_repoll_limit(self) {
+                    inline_repoll_count = inline_repoll_count + 1;
+                    continue;
+                }
+                inline_repoll_count = 0;
+                if !w.has_io_interest() && !w.has_event_fd() {
+                    const prepare_result: !i32 = scheduler_prepare_waker(&w);
+                    _ = prepare_result catch {
+                        return prepare_result as! T;
+                    };
+                }
+                const sync_result: !i32 = scheduler_sync_waker_registrations(loop, &w, &io_registered_fd, &event_registered_fd);
+                const registered: i32 = sync_result catch {
+                    return sync_result as! T;
+                };
+                if registered != 0 {
+                    const poll_result: !i32 = loop.poll(timeout_ms);
+                    const poll_count: i32 = poll_result catch {
+                        return poll_result as! T;
+                    };
+                    if poll_count == 0 {
+                        scheduler_record_wait_timeout(self);
+                    }
+                    continue;
+                }
+                const poll_result: !i32 = loop.poll(1);
+                const poll_count: i32 = poll_result catch {
+                    return poll_result as! T;
+                };
+                if poll_count == 0 {
+                    scheduler_record_wait_timeout(self);
+                }
+            },
+        };
+    }
+}
+
+export fn scheduler_run_i32_with_event_loop(self: &Scheduler, loop: EventLoop, f: Future<!i32>, timeout_ms: i32) !i32 {
+    const result: !i32 = scheduler_run_with_event_loop<i32>(self, loop, f, timeout_ms);
+    return result;
+}
+
+export fn scheduler_run_u32_with_event_loop(self: &Scheduler, loop: EventLoop, f: Future<!u32>, timeout_ms: i32) !u32 {
+    const result: !u32 = scheduler_run_with_event_loop<u32>(self, loop, f, timeout_ms);
+    return result;
+}
+
+export fn scheduler_run_usize_with_event_loop(self: &Scheduler, loop: EventLoop, f: Future<!usize>, timeout_ms: i32) !usize {
+    const result: !usize = scheduler_run_with_event_loop<usize>(self, loop, f, timeout_ms);
+    return result;
+}
+
+/// 使用共享 EventLoop 运行两个 i32 任务，直到二者都完成。
+/// 运行期间将 scheduler 的 frame pool 注入线程本地 allocator，返回前恢复。
+export fn scheduler_run_pair_i32_with_event_loop(self: &Scheduler, loop: EventLoop, first: Future<!i32>, second: Future<!i32>, first_result: &i32, second_result: &i32, timeout_ms: i32) !i32 {
+    const alloc: IAllocator = scheduler_pool_to_allocator(self._frame_pool);
+    const old_alloc: &IAllocator = get_async_frame_allocator();
+    set_async_frame_allocator(&alloc);
+    defer { set_async_frame_allocator(old_alloc); }
+    var remaining: i32 = 2;
+    scheduler_set_queue_depth(self, remaining);
+    defer { scheduler_set_queue_depth(self, 0); }
+
+    var first_done: i32 = 0;
+    var second_done: i32 = 0;
+    var first_waker: Waker = Waker{ _io_fd: 0 - 1, _event_fd: 0 - 1 };
+    var second_waker: Waker = Waker{ _io_fd: 0 - 1, _event_fd: 0 - 1 };
+    var first_io_registered_fd: i32 = 0 - 1;
+    var first_event_registered_fd: i32 = 0 - 1;
+    var second_io_registered_fd: i32 = 0 - 1;
+    var second_event_registered_fd: i32 = 0 - 1;
+
+    const first_prepare: !i32 = scheduler_prepare_waker(&first_waker);
+    _ = first_prepare catch {
+        return first_prepare as! i32;
+    };
+    const second_prepare: !i32 = scheduler_prepare_waker(&second_waker);
+    _ = second_prepare catch {
+        return second_prepare as! i32;
+    };
+    defer {
+        scheduler_cleanup_waker(loop, &first_waker, &first_io_registered_fd, &first_event_registered_fd);
+        scheduler_cleanup_waker(loop, &second_waker, &second_io_registered_fd, &second_event_registered_fd);
+    }
+
+    while first_done == 0 || second_done == 0 {
+        var made_progress: i32 = 0;
+        var registered: i32 = 0;
+
+        if first_done == 0 {
+            scheduler_record_wake_source(self, &first_waker);
+            first_waker.reset();
+            first_waker.clear_io_interest();
+            const first_poll: Poll<!i32> = first.poll(&first_waker);
+            match first_poll {
+                .Ready(ok_val) => {
+                    scheduler_record_ready_error_id(self, ok_val.error_id);
+                    *first_result = ok_val catch {
+                        return ok_val as! i32;
+                    };
+                    first_done = 1;
+                    remaining = remaining - 1;
+                    scheduler_set_queue_depth(self, remaining);
+                    made_progress = 1;
+                },
+                .Pending(_) => {
+                    if first_waker.is_woken() {
+                        made_progress = 1;
+                    } else {
+                        const first_sync: !i32 = scheduler_sync_waker_registrations(loop, &first_waker, &first_io_registered_fd, &first_event_registered_fd);
+                        registered = registered + (first_sync catch {
+                            return first_sync as! i32;
+                        });
+                    }
+                },
+            };
+        }
+
+        if second_done == 0 {
+            scheduler_record_wake_source(self, &second_waker);
+            second_waker.reset();
+            second_waker.clear_io_interest();
+            const second_poll: Poll<!i32> = second.poll(&second_waker);
+            match second_poll {
+                .Ready(ok_val) => {
+                    scheduler_record_ready_error_id(self, ok_val.error_id);
+                    *second_result = ok_val catch {
+                        return ok_val as! i32;
+                    };
+                    second_done = 1;
+                    remaining = remaining - 1;
+                    scheduler_set_queue_depth(self, remaining);
+                    made_progress = 1;
+                },
+                .Pending(_) => {
+                    if second_waker.is_woken() {
+                        made_progress = 1;
+                    } else {
+                        const second_sync: !i32 = scheduler_sync_waker_registrations(loop, &second_waker, &second_io_registered_fd, &second_event_registered_fd);
+                        registered = registered + (second_sync catch {
+                            return second_sync as! i32;
+                        });
+                    }
+                },
+            };
+        }
+
+        if first_done != 0 && second_done != 0 {
+            return 2;
+        }
+        if made_progress != 0 {
+            continue;
+        }
+        if registered != 0 {
+            const poll_result: !i32 = loop.poll(timeout_ms);
+            const poll_count: i32 = poll_result catch {
+                return poll_result as! i32;
+            };
+            if poll_count == 0 {
+                scheduler_record_wait_timeout(self);
+            }
+            continue;
+        }
+        const poll_result: !i32 = loop.poll(1);
+        const poll_count: i32 = poll_result catch {
+            return poll_result as! i32;
+        };
+        if poll_count == 0 {
+            scheduler_record_wait_timeout(self);
+        }
+    }
+
+    return 2;
+}
+
+/// 使用共享 EventLoop 运行固定容量的泛型任务队列，直到全部完成。
+/// 调度器只对事件循环错误报错；任务本身的错误写回各 slot.error_id。
+/// 运行期间将 scheduler 的 frame pool 注入线程本地 allocator，返回前恢复。
+export fn scheduler_run_task_queue_with_event_loop<T>(self: &Scheduler, loop: EventLoop, queue: &TaskQueue<T>, timeout_ms: i32) !i32 {
+    const alloc: IAllocator = scheduler_pool_to_allocator(self._frame_pool);
+    const old_alloc: &IAllocator = get_async_frame_allocator();
+    set_async_frame_allocator(&alloc);
+    defer { set_async_frame_allocator(old_alloc); }
+    var remaining: i32 = queue.len;
+    scheduler_set_queue_depth(self, remaining);
+    defer { scheduler_set_queue_depth(self, 0); }
+
+    var completed: i32 = 0;
+    defer {
+        var cleanup_idx: i32 = 0;
+        while cleanup_idx < queue.len && cleanup_idx < queue.capacity_limit() {
+            const slot: &TaskQueueSlot<T> = &queue.slots[cleanup_idx as usize];
+            if slot.active != 0 {
+                scheduler_cleanup_slot_resources(loop, &slot.waker, &slot.io_epoll_fd, &slot.event_epoll_fd);
+            }
+            cleanup_idx = cleanup_idx + 1;
+        }
+    }
+
+    var inline_repoll_count: i32 = 0;
+    while completed < queue.len {
+        var made_progress: i32 = 0;
+        var registered: i32 = 0;
+        var i: i32 = 0;
+
+        while i < queue.len && i < queue.capacity_limit() {
+            const slot: &TaskQueueSlot<T> = &queue.slots[i as usize];
+            if slot.active == 0 || slot.done != 0 {
+                i = i + 1;
+                continue;
+            }
+
+            const prepare_result: !i32 = scheduler_prepare_waker(&slot.waker);
+            _ = prepare_result catch {
+                return prepare_result as! i32;
+            };
+
+            scheduler_record_wake_source(self, &slot.waker);
+            slot.waker.reset();
+            slot.waker.clear_io_interest();
+            const p: Poll<!T> = slot.future.poll(&slot.waker);
+            match p {
+                .Ready(ok_val) => {
+                    const ready_result: !T = ok_val;
+                    scheduler_record_ready_error_id(self, ready_result.error_id);
+                    if ready_result.error_id != 0 {
+                        slot.error_id = ready_result.error_id;
+                        if ready_result.error_id == @error_id(error.Cancelled) {
+                            slot.cancelled = 1;
+                        } else {
+                            slot.cancelled = 0;
+                        }
+                    } else {
+                        var sample: [T: 1] = [];
+                        const zero_value: T = sample[0];
+                        const value: T = ready_result catch { zero_value; };
+                        slot.result = value;
+                        slot.error_id = 0 as u32;
+                        slot.cancelled = 0;
+                    }
+                    slot.done = 1;
+                    scheduler_cleanup_slot_resources(loop, &slot.waker, &slot.io_epoll_fd, &slot.event_epoll_fd);
+                    completed = completed + 1;
+                    remaining = remaining - 1;
+                    scheduler_set_queue_depth(self, remaining);
+                    made_progress = 1;
+                },
+                .Pending(_) => {
+                    if slot.waker.is_woken() {
+                        made_progress = 1;
+                        inline_repoll_count = 0;
+                    } else if !slot.waker.has_io_interest() && inline_repoll_count < scheduler_inline_repoll_limit(self) {
+                        inline_repoll_count = inline_repoll_count + 1;
+                        made_progress = 1;
+                    } else {
+                        inline_repoll_count = 0;
+                        const sync_result: !i32 = scheduler_sync_waker_registrations(loop, &slot.waker, &slot.io_epoll_fd, &slot.event_epoll_fd);
+                        registered = registered + (sync_result catch {
+                            return sync_result as! i32;
+                        });
+                    }
+                },
+            };
+            i = i + 1;
+        }
+
+        if completed >= queue.len {
+            return completed;
+        }
+        if made_progress != 0 {
+            continue;
+        }
+        if registered != 0 {
+            const poll_result: !i32 = loop.poll(timeout_ms);
+            const poll_count: i32 = poll_result catch {
+                return poll_result as! i32;
+            };
+            if poll_count == 0 {
+                scheduler_record_wait_timeout(self);
+            }
+            continue;
+        }
+        const poll_result: !i32 = loop.poll(1);
+        const poll_count: i32 = poll_result catch {
+            return poll_result as! i32;
+        };
+        if poll_count == 0 {
+            scheduler_record_wait_timeout(self);
+        }
+    }
+
+    return completed;
+}
+
+export fn scheduler_run_task_queue_i32_with_event_loop(self: &Scheduler, loop: EventLoop, queue: &TaskQueue_i32, timeout_ms: i32) !i32 {
+    return scheduler_run_task_queue_with_event_loop<i32>(self, loop, queue, timeout_ms);
+}
+
+export fn scheduler_run_task_queue_u32_with_event_loop(self: &Scheduler, loop: EventLoop, queue: &TaskQueue_u32, timeout_ms: i32) !i32 {
+    return scheduler_run_task_queue_with_event_loop<u32>(self, loop, queue, timeout_ms);
+}
+
+export fn scheduler_run_task_queue_usize_with_event_loop(self: &Scheduler, loop: EventLoop, queue: &TaskQueue_usize, timeout_ms: i32) !i32 {
+    return scheduler_run_task_queue_with_event_loop<usize>(self, loop, queue, timeout_ms);
+}
+
+// ============================================================
+// block_on 集成 EventLoop - 避免忙等待
+// ============================================================
+
+/// 使用 EventLoop 的 block_on：poll 返回 Pending 时注册 epoll / eventfd，阻塞等待。
+/// timeout_ms：-1 无限等待，>0 单次 epoll_wait 最大等待毫秒数（注意：累计无上限）
+/// 默认 inline repoll 策略读取 runtime 默认值；如需总超时保护，请使用 block_on_with_event_loop_deadline
+export fn block_on_with_event_loop<T>(loop: EventLoop, f: Future<!T>, timeout_ms: i32) !T {
+    return block_on_with_event_loop_inline_repoll_limit<T>(loop, f, timeout_ms, scheduler_runtime_default_inline_repoll_limit());
+}
+
+/// 使用 EventLoop 的 block_on，并显式设置 inline repoll 上限。
+/// 参数：loop 为事件循环；f 为待运行 Future；timeout_ms 为单次 poll 超时；inline_repoll_limit 为无 I/O Pending 连续 repoll 上限。
+/// 返回：Future 的 Ready 结果，或传播运行时错误。
+export fn block_on_with_event_loop_inline_repoll_limit<T>(loop: EventLoop, f: Future<!T>, timeout_ms: i32, inline_repoll_limit: i32) !T {
+    var w: Waker = Waker{ _io_fd: 0 - 1, _event_fd: 0 - 1 };
+    var io_registered_fd: i32 = 0 - 1;
+    var event_registered_fd: i32 = 0 - 1;
+    var inline_repoll_count: i32 = 0;
+    const repoll_limit: i32 = scheduler_normalize_inline_repoll_limit(inline_repoll_limit);
+    defer { scheduler_cleanup_waker(loop, &w, &io_registered_fd, &event_registered_fd); }
+
+    while true {
+        w.reset();
+        w.clear_io_interest();
+        const p: Poll<!T> = f.poll(&w);
+        match p {
+            .Ready(ok_val) => { return ok_val; },
+            .Pending(_) => {
+                if w.is_woken() {
+                    inline_repoll_count = 0;
+                    continue;
+                }
+                if !w.has_io_interest() && inline_repoll_count < repoll_limit {
+                    inline_repoll_count = inline_repoll_count + 1;
+                    continue;
+                }
+                inline_repoll_count = 0;
+                if !w.has_io_interest() && !w.has_event_fd() {
+                    const prepare_result: !i32 = scheduler_prepare_waker(&w);
+                    _ = prepare_result catch {
+                        return prepare_result as! T;
+                    };
+                }
+                const sync_result: !i32 = scheduler_sync_waker_registrations(loop, &w, &io_registered_fd, &event_registered_fd);
+                const registered: i32 = sync_result catch {
+                    return sync_result as! T;
+                };
+                if registered != 0 {
+                    const poll_result: !i32 = loop.poll(timeout_ms);
+                    _ = poll_result catch {
+                        return poll_result as! T;
+                    };
+                    continue;
+                }
+                const poll_result: !i32 = loop.poll(1);
+                _ = poll_result catch {
+                    return poll_result as! T;
+                };
+            },
+        };
+    }
+}
+
+/// 使用 EventLoop 的 block_on（带 deadline 总超时保护）。
+/// deadline_ms：0 表示不检查截止时间（无限等待），>0 表示绝对截止时间（Unix 毫秒）。
+/// 每轮循环检查 deadline 是否过期，过期则返回 error.TimedOut。
+/// epoll_wait 的超时取 timeout_ms 和 deadline_remaining 的较小值。
+export fn block_on_with_event_loop_deadline<T>(loop: EventLoop, f: Future<!T>, timeout_ms: i32, deadline_ms: u64) !T {
+    return block_on_with_event_loop_deadline_inline_repoll_limit<T>(loop, f, timeout_ms, deadline_ms, scheduler_runtime_default_inline_repoll_limit());
+}
+
+/// 使用 EventLoop 的 block_on（带 deadline 总超时保护）并显式设置 inline repoll 上限。
+/// 参数：loop 为事件循环；f 为待运行 Future；timeout_ms 为单次 poll 超时；deadline_ms 为绝对截止时间；inline_repoll_limit 为无 I/O Pending 连续 repoll 上限。
+/// 返回：Future 的 Ready 结果，或传播运行时错误。
+export fn block_on_with_event_loop_deadline_inline_repoll_limit<T>(loop: EventLoop, f: Future<!T>, timeout_ms: i32, deadline_ms: u64, inline_repoll_limit: i32) !T {
+    var w: Waker = Waker{ _io_fd: 0 - 1, _event_fd: 0 - 1 };
+    var io_registered_fd: i32 = 0 - 1;
+    var event_registered_fd: i32 = 0 - 1;
+    var inline_repoll_count: i32 = 0;
+    const repoll_limit: i32 = scheduler_normalize_inline_repoll_limit(inline_repoll_limit);
+    defer { scheduler_cleanup_waker(loop, &w, &io_registered_fd, &event_registered_fd); }
+
+    while true {
+        if deadline_ms != 0 {
+            const expired: bool = try sched_deadline_expired(deadline_ms);
+            if expired {
+                return error.TimedOut;
+            }
+        }
+
+        w.reset();
+        w.clear_io_interest();
+        const p: Poll<!T> = f.poll(&w);
+        match p {
+            .Ready(ok_val) => { return ok_val; },
+            .Pending(_) => {
+                var poll_timeout: i32 = timeout_ms;
+                if deadline_ms != 0 {
+                    const remaining: i32 = try sched_deadline_remaining_ms(deadline_ms);
+                    if remaining == 0 {
+                        return error.TimedOut;
+                    }
+                    if poll_timeout < 0 || remaining < poll_timeout {
+                        poll_timeout = remaining;
+                    }
+                }
+
+                if w.is_woken() {
+                    inline_repoll_count = 0;
+                    continue;
+                }
+                if !w.has_io_interest() && inline_repoll_count < repoll_limit {
+                    inline_repoll_count = inline_repoll_count + 1;
+                    continue;
+                }
+                inline_repoll_count = 0;
+                if !w.has_io_interest() && !w.has_event_fd() {
+                    const prepare_result: !i32 = scheduler_prepare_waker(&w);
+                    _ = prepare_result catch {
+                        return prepare_result as! T;
+                    };
+                }
+                const sync_result: !i32 = scheduler_sync_waker_registrations(loop, &w, &io_registered_fd, &event_registered_fd);
+                const registered: i32 = sync_result catch {
+                    return sync_result as! T;
+                };
+                if registered != 0 {
+                    const poll_result: !i32 = loop.poll(poll_timeout);
+                    _ = poll_result catch {
+                        return poll_result as! T;
+                    };
+                    continue;
+                }
+                const poll_result: !i32 = loop.poll(1);
+                _ = poll_result catch {
+                    return poll_result as! T;
+                };
+            },
+        };
+    }
+}

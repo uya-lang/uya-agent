@@ -1,0 +1,384 @@
+// lib/std/io/file.uya - 同步文件 I/O（模块 std.io）
+// 编译器内部继续走 std.io.*，这里提供最小 FILE 流缓冲实现，
+// 避免代码生成阶段退化为海量 tiny-write。
+
+use libc.sys_open;
+use libc.sys_close;
+use libc.sys_read;
+use libc.sys_write;
+use libc.O_RDONLY;
+use libc.O_WRONLY;
+use libc.O_RDWR;
+use libc.O_CREAT;
+use libc.O_TRUNC;
+use libc.O_APPEND;
+use libc.S_IRWXU;
+use std.string.strlen;
+
+export struct File {
+    fd: i32,
+    owns_fd: bool,
+}
+
+// 与 libc.FILE 保持同布局，供编译器与测试统一使用。
+export struct FILE {
+    fd: i64,
+    buffer: [byte: 65536],
+    buf_pos: usize,
+    buf_len: usize,
+    buf_mode: i32,  // 0=无缓冲, 1=行缓冲, 2=全缓冲
+}
+
+// fopen 的 FILE 池：槽位指针表 + 每个 FILE 独立 malloc（地址稳定）。
+// 原先写死 [FILE: 128]（128 × 64KiB = 8MiB BSS，且第 129 个 fopen 直接失败）。
+// 与 lib/libc/stdio.uya 同一套做法与同一套理由：调用方会长期持有 &FILE，不能搬迁本体。
+var std_io_fopen_fd_table: &(&FILE) = null;
+var std_io_fopen_fd_cap: usize = 0;
+const STD_IO_FILE_POOL_INIT: usize = 128;
+const STD_IO_FILE_POOL_MAX: usize = 1 << 20;
+
+// 扩一次槽位表（2 倍）。成功 0；失败/超上限 -1。
+fn std_io_file_pool_grow() i32 {
+    var ncap: usize = std_io_fopen_fd_cap;
+    if ncap == 0 {
+        ncap = STD_IO_FILE_POOL_INIT;
+    } else {
+        ncap = ncap * 2;
+    }
+    if ncap > STD_IO_FILE_POOL_MAX {
+        return -1;
+    }
+    const raw: &(&FILE) = malloc(ncap * @size_of(&FILE)) as &(&FILE);
+    if raw == null {
+        return -1;
+    }
+    var i: usize = 0;
+    while i < ncap {
+        raw[i] = null;
+        i = i + 1;
+    }
+    if std_io_fopen_fd_table != null {
+        var c: usize = 0;
+        while c < std_io_fopen_fd_cap {
+            raw[c] = std_io_fopen_fd_table[c];
+            c = c + 1;
+        }
+        free(std_io_fopen_fd_table as &void);
+    }
+    std_io_fopen_fd_table = raw;
+    std_io_fopen_fd_cap = ncap;
+    return 0;
+}
+
+// 取一个空闲槽的 &FILE（空槽 null 或 fd <= 0 都算空闲），必要时扩表。
+fn std_io_file_pool_acquire() &FILE {
+    var guard: i32 = 0;
+    while guard < 32 {
+        guard = guard + 1;
+        if std_io_fopen_fd_table == null || std_io_fopen_fd_cap == 0 {
+            if std_io_file_pool_grow() != 0 {
+                return null;
+            }
+        }
+        // 表在证明器眼里可能是空的（malloc 结果），先取一份带非空检查的引用
+        const tbl: &(&FILE) = std_io_fopen_fd_table;
+        if tbl == null {
+            return null;
+        }
+        var j: usize = 0;
+        while j < std_io_fopen_fd_cap {
+            const slot: &FILE = tbl[j];
+            if slot == null {
+                const fresh: &FILE = malloc(@size_of(FILE)) as &FILE;
+                if fresh == null {
+                    return null;
+                }
+                fresh.fd = 0;
+                fresh.buf_pos = 0;
+                fresh.buf_len = 0;
+                fresh.buf_mode = 0;
+                tbl[j] = fresh;
+                return fresh;
+            }
+            if slot.fd <= 0 {
+                return slot;
+            }
+            j = j + 1;
+        }
+        if std_io_file_pool_grow() != 0 {
+            return null;
+        }
+    }
+    return null;
+}
+
+export fn file_open(path: &const byte, flags: i32, mode: u32) !File {
+    const raw_fd: i32 = try sys_open(path as *const byte, flags, mode as i32);
+    var file: File = File {
+        fd: raw_fd,
+        owns_fd: true,
+    };
+    return file;
+}
+
+export fn file_close(f: &File) !void {
+    if !f.owns_fd || f.fd < 0 {
+        return;
+    }
+    try sys_close(f.fd);
+    f.fd = 0 - 1;
+    f.owns_fd = false;
+}
+
+export fn file_read(f: &File, buf: &byte, count: usize) isize {
+    const r: !isize = sys_read(f.fd, buf as *byte, count);
+    return r catch {
+        return 0 - 1;
+    };
+}
+
+export fn file_write(f: &File, buf: &const byte, count: usize) !usize {
+    const r: !isize = sys_write(f.fd, buf as *const byte, count);
+    const n: isize = r catch {
+        return r as! usize;
+    };
+    return n as usize;
+}
+
+fn std_io_flush_buffer(stream: &FILE) i32 {
+    if stream == null {
+        return 0 - 1;
+    }
+    if stream.buf_len == 0 {
+        return 0;
+    }
+
+    const result: !isize = sys_write(stream.fd as i32, &stream.buffer[0], stream.buf_len);
+    const written: isize = result catch {
+        return 0 - 1;
+    };
+    if written < 0 {
+        return 0 - 1;
+    }
+
+    stream.buf_pos = 0;
+    stream.buf_len = 0;
+    return 0;
+}
+
+fn std_io_write_to_buffer(stream: &FILE, buf: &const byte, n: usize) isize {
+    if stream == null {
+        return 0 - 1;
+    }
+    if n == 0 {
+        return 0;
+    }
+
+    const buf_size: usize = @len(stream.buffer);
+    if stream.buf_mode == 0 || n >= buf_size {
+        const result: !isize = sys_write(stream.fd as i32, buf as *const byte, n);
+        return result catch {
+            return 0 - 1;
+        };
+    }
+
+    var bytes_written: usize = 0;
+    var remaining: usize = n;
+    var src_offset: usize = 0;
+
+    while remaining > 0 {
+        var space_left: usize = buf_size - stream.buf_len;
+        if space_left == 0 {
+            if std_io_flush_buffer(stream) != 0 {
+                return 0 - 1;
+            }
+            space_left = buf_size;
+        }
+
+        var to_copy: usize = remaining;
+        if to_copy > space_left {
+            to_copy = space_left;
+        }
+
+        var i: usize = 0;
+        while i < to_copy {
+            stream.buffer[stream.buf_len + i] = buf[src_offset + i];
+            i = i + 1;
+        }
+
+        stream.buf_len = stream.buf_len + to_copy;
+        stream.buf_pos = stream.buf_len;
+        src_offset = src_offset + to_copy;
+        remaining = remaining - to_copy;
+        bytes_written = bytes_written + to_copy;
+
+        if stream.buf_mode == 1 {
+            var j: usize = stream.buf_len - to_copy;
+            var need_flush: bool = false;
+            while j < stream.buf_len {
+                if stream.buffer[j] == 10 as byte {
+                    need_flush = true;
+                    break;
+                }
+                j = j + 1;
+            }
+            if need_flush && std_io_flush_buffer(stream) != 0 {
+                return 0 - 1;
+            }
+        }
+    }
+
+    return bytes_written as isize;
+}
+
+export fn fopen(path: &const byte, mode: &const byte) &FILE {
+    if path == null || mode == null {
+        return null;
+    }
+
+    var flags: i64 = 0;
+    var create_mode: i64 = 0;
+    const w_flags: i64 = O_WRONLY | O_CREAT | O_TRUNC;
+    const a_flags: i64 = O_WRONLY | O_CREAT | O_APPEND;
+    const w_plus_flags: i64 = O_RDWR | O_CREAT | O_TRUNC;
+    const a_plus_flags: i64 = O_RDWR | O_CREAT | O_APPEND;
+    var i: usize = 0;
+    const mode_len: usize = strlen(mode);
+
+    while i < mode_len {
+        const c: byte = mode[i];
+        if c == 114 as byte {  // 'r'
+            flags = O_RDONLY;
+        } else if c == 119 as byte {  // 'w'
+            flags = w_flags;
+            create_mode = S_IRWXU;
+        } else if c == 97 as byte {  // 'a'
+            flags = a_flags;
+            create_mode = S_IRWXU;
+        } else if c == 43 as byte {  // '+'
+            if flags == O_RDONLY {
+                flags = O_RDWR;
+            } else if flags == w_flags {
+                flags = w_plus_flags;
+            } else if flags == a_flags {
+                flags = a_plus_flags;
+            } else {
+                flags = O_RDWR;
+            }
+        }
+        i = i + 1;
+    }
+
+    const result: !i32 = sys_open(path as *const byte, flags as i32, create_mode as i32);
+    const fd: i32 = result catch {
+        return null;
+    };
+
+    const slot: &FILE = std_io_file_pool_acquire();
+    if slot == null {
+        _ = sys_close(fd);
+        return null;
+    }
+    slot.fd = fd as i64;
+    slot.buf_pos = 0;
+    slot.buf_len = 0;
+    slot.buf_mode = 2;
+    return slot;
+}
+
+export fn fclose(stream: &FILE) i32 {
+    if stream == null {
+        return 0 - 1;
+    }
+    const fd: i64 = stream.fd;
+    if fd < 0 {
+        return 0 - 1;
+    }
+
+    _ = std_io_flush_buffer(stream);
+    const result: !i32 = sys_close(fd as i32);
+    _ = result catch {
+        return 0 - 1;
+    };
+    stream.fd = 0 - 1;
+    stream.buf_pos = 0;
+    stream.buf_len = 0;
+    return 0;
+}
+
+export fn fread(ptr: &byte, size: usize, nmemb: usize, stream: &FILE) usize {
+    if ptr == null || stream == null || size == 0 || nmemb == 0 {
+        return 0;
+    }
+    const fd: i64 = stream.fd;
+    if fd < 0 {
+        return 0;
+    }
+
+    const total_size: usize = size * nmemb;
+    const result: !isize = sys_read(fd as i32, ptr as *byte, total_size);
+    const bytes_read: isize = result catch {
+        return 0;
+    };
+    if bytes_read < 0 {
+        return 0;
+    }
+    return (bytes_read as usize) / size;
+}
+
+export fn fwrite(ptr: &const byte, size: usize, nmemb: usize, stream: &FILE) usize {
+    if stream == null || ptr == null || size == 0 || nmemb == 0 {
+        return 0;
+    }
+    const total_size: usize = size * nmemb;
+    const result: isize = std_io_write_to_buffer(stream, ptr, total_size);
+    if result < 0 {
+        return 0;
+    }
+    return (result as usize) / size;
+}
+
+export fn fgetc(stream: &FILE) i32 {
+    if stream == null {
+        return 0 - 1;
+    }
+
+    var buf: [byte: 1] = [];
+    const read_count: usize = fread(&buf[0], 1, 1, stream);
+    if read_count == 0 {
+        return 0 - 1;
+    }
+    return buf[0] as i32;
+}
+
+export fn fputc(c: i32, stream: &FILE) i32 {
+    if stream == null || c < 0 || c > 255 {
+        return 0 - 1;
+    }
+
+    var ch: byte = c as byte;
+    const result: isize = std_io_write_to_buffer(stream, &ch, 1);
+    if result != 1 {
+        return 0 - 1;
+    }
+    return c;
+}
+
+export fn fputs(s: &const byte, stream: &FILE) i32 {
+    if s == null || stream == null {
+        return 0 - 1;
+    }
+    const len: usize = strlen(s);
+    if len == 0 {
+        return 0;
+    }
+    const written: usize = fwrite(s, 1, len, stream);
+    if written != len {
+        return 0 - 1;
+    }
+    return written as i32;
+}
+
+export fn fflush(stream: &FILE) i32 {
+    return std_io_flush_buffer(stream);
+}

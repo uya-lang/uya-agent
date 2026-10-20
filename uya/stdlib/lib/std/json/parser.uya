@@ -1,0 +1,373 @@
+// std.json.parser - JSON 解析器（零拷贝字符串）
+// 模块路径：lib/std/json/parser.uya → use std.json.parser;
+
+use std.json.value.JsonValue;
+use std.json.value.JsonArray;
+use std.json.value.JsonObject;
+use std.json.value.JsonKeyValue;
+use std.json.value.JsonStrView;
+use std.json.errors;
+use std.mem.arena.Arena;
+use std.mem.arena.arena_alloc;
+
+const MAX_NESTING: usize = 256;
+const JSON_VALUE_ALLOC_SIZE: usize = 64;
+const JSON_KEY_VALUE_ALLOC_SIZE: usize = 48;
+
+type JsonWsVec16 = @vector(u8, 16);
+type JsonWsMask16 = @mask(16);
+
+struct ParseState {
+    ptr: &byte,
+    len: usize,
+    pos: usize,
+    arena: &Arena,
+    depth: usize,
+    preserve_numbers: bool,
+}
+
+fn peek(s: &ParseState) byte {
+    if s.pos >= s.len { return 0; }
+    return s.ptr[s.pos];
+}
+
+fn next(s: &ParseState) byte {
+    if s.pos >= s.len { return 0; }
+    const b: byte = s.ptr[s.pos];
+    s.pos = s.pos + 1;
+    return b;
+}
+
+fn skip_ws(s: &ParseState) void {
+    while s.pos < s.len {
+        const b: byte = s.ptr[s.pos];
+        if b == 32 || b == 9 || b == 10 || b == 13 {
+            s.pos = s.pos + 1;
+        } else {
+            return;
+        }
+    }
+}
+
+fn parse_null(s: &ParseState) !JsonValue {
+    if s.pos + 4 <= s.len && s.ptr[s.pos] == 110 && s.ptr[s.pos + 1] == 117 && s.ptr[s.pos + 2] == 108 && s.ptr[s.pos + 3] == 108 {
+        s.pos = s.pos + 4;
+        return JsonValue.json_null();
+    }
+    return error.UnexpectedToken;
+}
+
+fn parse_true(s: &ParseState) !JsonValue {
+    if s.pos + 4 <= s.len && s.ptr[s.pos] == 116 && s.ptr[s.pos + 1] == 114 && s.ptr[s.pos + 2] == 117 && s.ptr[s.pos + 3] == 101 {
+        s.pos = s.pos + 4;
+        return JsonValue.bool_val(true);
+    }
+    return error.UnexpectedToken;
+}
+
+fn parse_false(s: &ParseState) !JsonValue {
+    if s.pos + 5 <= s.len && s.ptr[s.pos] == 102 && s.ptr[s.pos + 1] == 97 && s.ptr[s.pos + 2] == 108 && s.ptr[s.pos + 3] == 115 && s.ptr[s.pos + 4] == 101 {
+        s.pos = s.pos + 5;
+        return JsonValue.bool_val(false);
+    }
+    return error.UnexpectedToken;
+}
+
+fn is_digit(b: byte) bool {
+    return b >= 48 && b <= 57;
+}
+
+// 连续 ASCII 数字 `0`–`9`：先 16 字节块（@vector），再标量收尾（与 skip_ws 同策略）
+fn skip_ascii_digits_vec16(s: &ParseState) void {
+    while s.pos < s.len && s.ptr[s.pos] >= 48 && s.ptr[s.pos] <= 57 {
+        s.pos = s.pos + 1;
+    }
+}
+
+// 字符串体中无 `"`、无 `\` 的连续段：debug C 后端下标量扫描比 SIMD helper 更少开销。
+fn skip_string_unescaped_run_vec16(s: &ParseState) void {
+    while s.pos < s.len && s.ptr[s.pos] != 34 && s.ptr[s.pos] != 92 {
+        s.pos = s.pos + 1;
+    }
+}
+
+fn parse_number(s: &ParseState) !JsonValue {
+    const start: usize = s.pos;
+    if s.pos >= s.len { return error.UnexpectedEof; }
+    var is_float: bool = false;
+    if s.ptr[s.pos] == 45 { s.pos = s.pos + 1; }
+    if s.pos < s.len && s.ptr[s.pos] == 48 {
+        s.pos = s.pos + 1;
+        if s.pos < s.len && (s.ptr[s.pos] == 46 || s.ptr[s.pos] == 101 || s.ptr[s.pos] == 69) {
+            is_float = true;
+        }
+    } else {
+        if s.pos >= s.len || !is_digit(s.ptr[s.pos]) { return error.UnexpectedToken; }
+        skip_ascii_digits_vec16(s);
+        while s.pos < s.len && is_digit(s.ptr[s.pos]) { s.pos = s.pos + 1; }
+    }
+    if s.pos < s.len && s.ptr[s.pos] == 46 {
+        is_float = true;
+        s.pos = s.pos + 1;
+        if s.pos >= s.len || !is_digit(s.ptr[s.pos]) { return error.InvalidNumber; }
+        skip_ascii_digits_vec16(s);
+        while s.pos < s.len && is_digit(s.ptr[s.pos]) { s.pos = s.pos + 1; }
+    }
+    if s.pos < s.len && (s.ptr[s.pos] == 101 || s.ptr[s.pos] == 69) {
+        is_float = true;
+        s.pos = s.pos + 1;
+        if s.pos < s.len && (s.ptr[s.pos] == 43 || s.ptr[s.pos] == 45) { s.pos = s.pos + 1; }
+        if s.pos >= s.len || !is_digit(s.ptr[s.pos]) { return error.InvalidNumber; }
+        skip_ascii_digits_vec16(s);
+        while s.pos < s.len && is_digit(s.ptr[s.pos]) { s.pos = s.pos + 1; }
+    }
+    if is_float {
+        if s.preserve_numbers {
+            return JsonValue.num_text(JsonStrView{
+                ptr: &s.ptr[start],
+                len: s.pos - start,
+            });
+        }
+        var i: usize = start;
+        var neg: i32 = 1;
+        if i < s.len && s.ptr[i] == 45 { neg = 0 - 1; i = i + 1; }
+        var v: f64 = 0.0;
+        while i < s.len && is_digit(s.ptr[i]) {
+            v = v * 10.0 + (s.ptr[i] as i32 - 48) as f64;
+            i = i + 1;
+        }
+        if i < s.len && s.ptr[i] == 46 {
+            i = i + 1;
+            var frac: f64 = 0.1;
+            while i < s.len && is_digit(s.ptr[i]) {
+                v = v + (s.ptr[i] as i32 - 48) as f64 * frac;
+                frac = frac / 10.0;
+                i = i + 1;
+            }
+        }
+        if i < s.len && (s.ptr[i] == 101 || s.ptr[i] == 69) {
+            i = i + 1;
+            var exp_neg: i32 = 1;
+            if i < s.len && s.ptr[i] == 45 { exp_neg = 0 - 1; i = i + 1; } else if i < s.len && s.ptr[i] == 43 { i = i + 1; }
+            var e: i32 = 0;
+            while i < s.len && is_digit(s.ptr[i]) {
+                e = e * 10 + (s.ptr[i] as i32 - 48);
+                i = i + 1;
+            }
+            while e > 0 {
+                if exp_neg < 0 { v = v * 0.1; } else { v = v * 10.0; }
+                e = e - 1;
+            }
+        }
+        return JsonValue.float_val(v * (neg as f64));
+    }
+    var i: usize = start;
+    var neg: bool = false;
+    if i < s.len && s.ptr[i] == 45 { neg = true; i = i + 1; }
+    var v: i64 = 0;
+    while i < s.pos {
+        const d: i32 = s.ptr[i] as i32 - 48;
+        if d < 0 || d > 9 { i = i + 1; continue; }
+        if v > 922337203685477580 {
+            if s.preserve_numbers {
+                return JsonValue.num_text(JsonStrView{
+                    ptr: &s.ptr[start],
+                    len: s.pos - start,
+                });
+            }
+            return error.NumberOverflow;
+        }
+        if v == 922337203685477580 && (d > 7 || (!neg && d > 7)) {
+            if s.preserve_numbers {
+                return JsonValue.num_text(JsonStrView{
+                    ptr: &s.ptr[start],
+                    len: s.pos - start,
+                });
+            }
+            return error.NumberOverflow;
+        }
+        v = v * 10 + d as i64;
+        i = i + 1;
+    }
+    if neg { v = 0 - v; }
+    return JsonValue.int_val(v);
+}
+
+fn parse_string(s: &ParseState) !JsonValue {
+    if s.pos >= s.len || s.ptr[s.pos] != 34 { return error.UnexpectedToken; }
+    s.pos = s.pos + 1;
+    const start: usize = s.pos;
+    while s.pos < s.len {
+        skip_string_unescaped_run_vec16(s);
+        if s.pos >= s.len { break; }
+        const b: byte = s.ptr[s.pos];
+        if b == 34 {
+            const view: JsonStrView = JsonStrView{ ptr: &s.ptr[start], len: s.pos - start };
+            s.pos = s.pos + 1;
+            return JsonValue.str(view);
+        }
+        if b == 92 {
+            s.pos = s.pos + 1;
+            if s.pos >= s.len { return error.UnexpectedEof; }
+            const c: byte = s.ptr[s.pos];
+            if c == 110 || c == 116 || c == 114 || c == 34 || c == 92 {
+                s.pos = s.pos + 1;
+            } else if c == 117 {
+                s.pos = s.pos + 1;
+                if s.pos + 4 > s.len { return error.UnexpectedEof; }
+                var k: usize = 0;
+                while k < 4 {
+                    const h: byte = s.ptr[s.pos + k];
+                    if (h >= 48 && h <= 57) || (h >= 97 && h <= 102) || (h >= 65 && h <= 70) { k = k + 1; } else { return error.InvalidUnicode; }
+                }
+                s.pos = s.pos + 4;
+            } else {
+                return error.InvalidEscape;
+            }
+        } else {
+            s.pos = s.pos + 1;
+        }
+    }
+    return error.UnexpectedEof;
+}
+
+fn parse_array(s: &ParseState) !JsonValue {
+    if s.pos >= s.len || s.ptr[s.pos] != 91 { return error.UnexpectedToken; }
+    s.pos = s.pos + 1;
+    s.depth = s.depth + 1;
+    if s.depth > MAX_NESTING { return error.NestingTooDeep; }
+    skip_ws(s);
+    if s.pos < s.len && s.ptr[s.pos] == 93 {
+        s.pos = s.pos + 1;
+        s.depth = s.depth - 1;
+        const arr: JsonArray = JsonArray{ items: null, len: 0 };
+        return JsonValue.arr(arr);
+    }
+    var cap: usize = 4;
+    var items: &JsonValue = arena_alloc(s.arena, JSON_VALUE_ALLOC_SIZE * cap) as &JsonValue;
+    if items == null { return error.UnexpectedToken; }
+    var n: usize = 0;
+    while true {
+        const v: JsonValue = try parse_value(s);
+        if n >= cap {
+            cap = cap * 2;
+            const new_items: &JsonValue = arena_alloc(s.arena, JSON_VALUE_ALLOC_SIZE * cap) as &JsonValue;
+            if new_items == null { return error.UnexpectedToken; }
+            var j: usize = 0;
+            while j < n {
+                new_items[j] = items[j];
+                j = j + 1;
+            }
+            items = new_items;
+        }
+        items[n] = v;
+        n = n + 1;
+        skip_ws(s);
+        if s.pos >= s.len { s.depth = s.depth - 1; return error.UnexpectedEof; }
+        if s.ptr[s.pos] == 93 {
+            s.pos = s.pos + 1;
+            s.depth = s.depth - 1;
+            const arr: JsonArray = JsonArray{ items: items, len: n };
+            return JsonValue.arr(arr);
+        }
+        if s.ptr[s.pos] != 44 { s.depth = s.depth - 1; return error.UnexpectedToken; }
+        s.pos = s.pos + 1;
+        skip_ws(s);
+    }
+}
+
+fn parse_object_pair(s: &ParseState, key_ptr: &byte, key_len: usize) !JsonKeyValue {
+    const val: JsonValue = try parse_value(s);
+    return JsonKeyValue{ key: JsonStrView{ ptr: key_ptr, len: key_len }, value: val };
+}
+
+fn parse_object(s: &ParseState) !JsonValue {
+    if s.pos >= s.len || s.ptr[s.pos] != 123 { return error.UnexpectedToken; }
+    s.pos = s.pos + 1;
+    s.depth = s.depth + 1;
+    if s.depth > MAX_NESTING { return error.NestingTooDeep; }
+    skip_ws(s);
+    if s.pos < s.len && s.ptr[s.pos] == 125 {
+        s.pos = s.pos + 1;
+        s.depth = s.depth - 1;
+        const obj: JsonObject = JsonObject{ pairs: null, len: 0 };
+        return JsonValue.obj(obj);
+    }
+    var cap: usize = 4;
+    var pairs: &JsonKeyValue = arena_alloc(s.arena, JSON_KEY_VALUE_ALLOC_SIZE * cap) as &JsonKeyValue;
+    if pairs == null { return error.UnexpectedToken; }
+    var n: usize = 0;
+    while true {
+        if s.pos >= s.len || s.ptr[s.pos] != 34 { s.depth = s.depth - 1; return error.UnexpectedToken; }
+        s.pos = s.pos + 1;
+        const key_start: usize = s.pos;
+        while s.pos < s.len && s.ptr[s.pos] != 34 {
+            skip_string_unescaped_run_vec16(s);
+            if s.pos >= s.len { break; }
+            if s.ptr[s.pos] == 34 { break; }
+            if s.ptr[s.pos] == 92 { s.pos = s.pos + 1; if s.pos < s.len { s.pos = s.pos + 1; } }
+            else { s.pos = s.pos + 1; }
+        }
+        if s.pos >= s.len { s.depth = s.depth - 1; return error.UnexpectedEof; }
+        const key_view: JsonStrView = JsonStrView{ ptr: &s.ptr[key_start], len: s.pos - key_start };
+        s.pos = s.pos + 1;
+        skip_ws(s);
+        if s.pos >= s.len || s.ptr[s.pos] != 58 { s.depth = s.depth - 1; return error.UnexpectedToken; }
+        s.pos = s.pos + 1;
+        skip_ws(s);
+        if n >= cap {
+            cap = cap * 2;
+            const new_pairs: &JsonKeyValue = arena_alloc(s.arena, JSON_KEY_VALUE_ALLOC_SIZE * cap) as &JsonKeyValue;
+            if new_pairs == null { return error.UnexpectedToken; }
+            var j: usize = 0;
+            while j < n {
+                new_pairs[j] = pairs[j];
+                j = j + 1;
+            }
+            pairs = new_pairs;
+        }
+        pairs[n] = try parse_object_pair(s, key_view.ptr, key_view.len);
+        n = n + 1;
+        skip_ws(s);
+        if s.pos >= s.len { s.depth = s.depth - 1; return error.UnexpectedEof; }
+        if s.ptr[s.pos] == 125 {
+            s.pos = s.pos + 1;
+            s.depth = s.depth - 1;
+            const obj: JsonObject = JsonObject{ pairs: pairs, len: n };
+            return JsonValue.obj(obj);
+        }
+        if s.ptr[s.pos] != 44 { s.depth = s.depth - 1; return error.UnexpectedToken; }
+        s.pos = s.pos + 1;
+        skip_ws(s);
+    }
+}
+
+fn parse_value(s: &ParseState) !JsonValue {
+    skip_ws(s);
+    if s.pos >= s.len { return error.UnexpectedEof; }
+    const b: byte = s.ptr[s.pos];
+    if b == 110 { return parse_null(s); }
+    if b == 116 { return parse_true(s); }
+    if b == 102 { return parse_false(s); }
+    if b == 45 || is_digit(b) { return parse_number(s); }
+    if b == 34 { return parse_string(s); }
+    if b == 91 { return parse_array(s); }
+    if b == 123 { return parse_object(s); }
+    return error.UnexpectedToken;
+}
+
+fn parse_with_number_policy(arena: &Arena, ptr: &byte, len: usize, preserve_numbers: bool) !JsonValue {
+    var state: ParseState = ParseState{ ptr: ptr, len: len, pos: 0, arena: arena, depth: 0, preserve_numbers: preserve_numbers };
+    const v: JsonValue = try parse_value(&state);
+    skip_ws(&state);
+    if state.pos < len { return error.UnexpectedToken; }
+    return v;
+}
+
+export fn parse(arena: &Arena, ptr: &byte, len: usize) !JsonValue {
+    return parse_with_number_policy(arena, ptr, len, false);
+}
+
+export fn parse_lossless_numbers(arena: &Arena, ptr: &byte, len: usize) !JsonValue {
+    return parse_with_number_policy(arena, ptr, len, true);
+}

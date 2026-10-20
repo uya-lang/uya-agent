@@ -1,0 +1,1912 @@
+// lib/std/async.uya - 异步运行时类型与接口
+//
+// 模块路径：use std.async
+// 提供：Waker、interface Future<T>、struct Future<T> 占位、Task<T>、Poll<T>。
+
+use libc.heap;
+use libc.errno;
+use libc.pthread;
+use libc.syscall;
+use std;
+use std.async_frame;
+use std.async_frame.AsyncFramePool;
+use std.async_frame.async_frame_pool_default;
+use std.http.types;
+use std.http.parse.http_parse_request;
+use std.http.parse.http_parse_request_into;
+use std.http.parse.http_decode_chunked_body_inplace;
+use std.mem.allocator.IAllocator;
+use std.mem.allocator.MallocAllocator;
+use std.string.strlen;
+use std.time.deadline_after_ms;
+use std.time.deadline_expired;
+
+/// 线程本地 async frame 分配器（通过 pthread TSD 绑定）
+var _uya_async_frame_allocator_once: pthread_once_t = pthread_once_t{ state: 0 };
+var _uya_async_frame_allocator_key: pthread_key_t = pthread_key_t{ seq: 0, destructor: null };
+// 仅供 tos_unknown 的 pthread TSD stub 使用；真实多线程目标不能通过全局变量传播线程本地 allocator。
+var _uya_async_frame_allocator_fallback: &IAllocator = null;
+var _uya_async_frame_default_allocator: IAllocator = MallocAllocator{};
+var _uya_async_frame_default_allocator_initialized: i32 = 0;
+
+/// 初始化当前进程的 async frame allocator 线程本地 key。
+/// 参数：_unused - pthread_once 兼容占位参数，当前实现忽略。
+/// 返回值：始终返回 null，仅用于兼容 pthread 启动例程签名。
+fn _uya_init_async_frame_allocator_key(_unused: &void) &void {
+    _ = _unused;
+    _ = pthread_key_create(&_uya_async_frame_allocator_key, null as &void);
+    return null as &void;
+}
+
+fn _uya_get_default_async_frame_allocator() &IAllocator {
+    if _uya_async_frame_default_allocator_initialized == 0 {
+        const pool: &AsyncFramePool = async_frame_pool_default();
+        if pool == null {
+            return null;
+        }
+        const alloc: IAllocator = *pool;
+        _uya_async_frame_default_allocator = alloc;
+        _uya_async_frame_default_allocator_initialized = 1;
+    }
+    return &_uya_async_frame_default_allocator;
+}
+
+/// 设置当前线程的 async frame 分配器。
+/// 参数说明：alloc 为当前线程要使用的 frame allocator；传 null 表示恢复默认 allocator。
+/// 返回值说明：无。
+export fn set_async_frame_allocator(alloc: &IAllocator) void {
+    std.cfg(std.target_os == .tos_unknown, {
+        _uya_async_frame_allocator_fallback = alloc;
+    }, { })
+    pthread_once(&_uya_async_frame_allocator_once, &_uya_init_async_frame_allocator_key as &void);
+    if _uya_async_frame_allocator_key.seq <= 0 {
+        return;
+    }
+    _ = pthread_setspecific(_uya_async_frame_allocator_key, alloc as &void);
+}
+
+/// 获取当前线程的 async frame 分配器。
+/// 参数说明：无。
+/// 返回值说明：若当前线程显式设置过 allocator 则返回它；否则返回默认 AsyncFramePool allocator。
+export fn get_async_frame_allocator() &IAllocator {
+    pthread_once(&_uya_async_frame_allocator_once, &_uya_init_async_frame_allocator_key as &void);
+    if _uya_async_frame_allocator_key.seq <= 0 {
+        std.cfg(std.target_os == .tos_unknown, {
+            if _uya_async_frame_allocator_fallback != null {
+                return _uya_async_frame_allocator_fallback;
+            }
+        }, { })
+        return _uya_get_default_async_frame_allocator();
+    }
+    const tsd_alloc: &IAllocator = pthread_getspecific(_uya_async_frame_allocator_key) as &IAllocator;
+    if tsd_alloc != null {
+        return tsd_alloc;
+    }
+    std.cfg(std.target_os == .tos_unknown, {
+        if _uya_async_frame_allocator_fallback != null {
+            return _uya_async_frame_allocator_fallback;
+        }
+    }, { })
+    return _uya_get_default_async_frame_allocator();
+}
+
+/// 供接口 box / async helper 复用的分配入口：优先当前线程的 async frame allocator。
+export fn async_box_alloc_current(size: usize) &byte {
+    const header_size: usize = @size_of(usize) * 2;
+    const total_size: usize = header_size + size;
+    const alloc_ptr: &IAllocator = get_async_frame_allocator();
+    var raw_ptr: &byte = null;
+    if alloc_ptr != null {
+        const alloc: IAllocator = *alloc_ptr;
+        const boxed: !&byte = alloc.alloc(total_size);
+        raw_ptr = boxed catch {
+            return null;
+        };
+    } else {
+        raw_ptr = malloc(total_size) as &byte;
+        if raw_ptr == null {
+            return null;
+        }
+    }
+    const header: &usize = raw_ptr as &usize;
+    *header = @usize_from_ptr(alloc_ptr as &void);
+    header[1] = size;
+    return (raw_ptr as usize + header_size) as &byte;
+}
+
+/// 与 `async_box_alloc_current` 配对的释放入口。
+export fn async_box_free_current(ptr: &byte) void {
+    if ptr == null {
+        return;
+    }
+    const header_size: usize = @size_of(usize) * 2;
+    const raw_ptr: &byte = (ptr as usize - header_size) as &byte;
+    const header: &usize = raw_ptr as &usize;
+    const alloc_ptr: usize = *header;
+    if alloc_ptr != 0 {
+        const alloc_ref: &IAllocator = @ptr_from_usize(alloc_ptr) as &IAllocator;
+        const alloc: IAllocator = *alloc_ref;
+        alloc.dealloc(raw_ptr);
+        return;
+    }
+    free(raw_ptr as &void);
+}
+
+/// 异步运行时统一错误类型
+export error EventLoopSlotsFull;
+export error TaskQueueFull;
+export error SchedulerStopped;
+export error FutureNotReady;
+export error AsyncFramePoolFull;
+export error Cancelled;
+export error AsyncDeadlineExceeded;
+export error WriteZero;
+
+fn waker_eventfd_notify(fd: i32) void {
+    if fd < 0 {
+        return;
+    }
+    var one: u64 = 1 as u64;
+    const write_result: !isize = sys_write(fd, (&one) as *const byte, @size_of(one));
+    _ = write_result catch |err| {
+        const err_id: i32 = @error_id(err) as i32;
+        if err_id == EAGAIN || err_id == EWOULDBLOCK {
+            return;
+        }
+        return;
+    };
+}
+
+fn waker_eventfd_drain(fd: i32) void {
+    if fd < 0 {
+        return;
+    }
+    while true {
+        var value: u64 = 0 as u64;
+        const read_result: !isize = sys_read(fd, (&value) as *byte, @size_of(value));
+        const n: isize = read_result catch |err| {
+            const err_id: i32 = @error_id(err) as i32;
+            if err_id == EAGAIN || err_id == EWOULDBLOCK {
+                return;
+            }
+            return;
+        };
+        if n != @size_of(value) as isize {
+            return;
+        }
+    }
+}
+
+const WAKER_WAKE_SOURCE_NONE: i32 = 0;
+const WAKER_WAKE_SOURCE_EXPLICIT: i32 = 1;
+const WAKER_WAKE_SOURCE_EVENT_LOOP: i32 = 2;
+const WAKER_WAKE_SOURCE_CANCEL: i32 = 3;
+
+/// interest 编码（与历史 _io_interest 取值保持一致）。
+const WAKER_INTEREST_NONE: i32 = 0;
+const WAKER_INTEREST_READABLE: i32 = 1;
+const WAKER_INTEREST_WRITABLE: i32 = 2;
+const WAKER_INTEREST_READWRITE: i32 = 3;
+
+/// 单个 Waker 可同时登记的最大 fd/interest 数。
+///
+/// 为什么需要多槽：单 fd/单 interest 的 Waker 在一个 poll 里登记第二个 fd 时会**覆盖**
+/// 前一个，于是「同时等两个 fd」（TLS 全双工、socketpair 双向、组合取消）只能退化成
+/// 「最后一个生效」。4 槽覆盖现有主链路（HTTP/1 请求 fd + eventfd + 组合 future 的两个
+/// 子 future），且不改变单 fd 路径的行为：单 fd future 仍只占第 0 槽，
+/// `io_fd()` / `io_interest_code()` 读到的仍是「最后一次声明」。
+export const WAKER_IO_SLOT_MAX: i32 = 4;
+
+/// 最小唤醒器。
+/// 当前仅维护“是否被唤醒”的可观察状态，供 Future 在 poll 内请求立即重试。
+/// 后续可在此基础上扩展到事件循环注册、任务队列与跨线程唤醒。
+export struct Waker {
+    _wake_count: atomic i32,
+    _wake_source: atomic i32,
+    _io_fd: i32,
+    _io_interest: i32,
+    // 多 interest 扩展槽：第 0 槽与 _io_fd/_io_interest 保持镜像（单 fd 路径行为不变），
+    // 第 1..WAKER_IO_SLOT_MAX-1 槽供「同一 poll 内登记多个 fd」使用。
+    _io_slot_fds: [i32: WAKER_IO_SLOT_MAX],
+    _io_slot_interests: [i32: WAKER_IO_SLOT_MAX],
+    _io_slot_count: i32,
+    _event_fd: i32,
+    _event_write_fd: i32,
+    _event_fd_bound: atomic i32,
+    _cancelled: atomic i32,
+
+    fn wake_with_source(self: &Self, source: i32) void {
+        if self._wake_count == 0 || self._wake_source != WAKER_WAKE_SOURCE_CANCEL || source == WAKER_WAKE_SOURCE_CANCEL {
+            self._wake_source = source;
+        }
+        self._wake_count = self._wake_count + 1;
+        if self._event_fd_bound != 0 {
+            var notify_fd: i32 = self._event_write_fd;
+            if notify_fd < 0 {
+                notify_fd = self._event_fd;
+            }
+            if notify_fd >= 0 {
+                waker_eventfd_notify(notify_fd);
+            }
+        }
+    }
+
+    fn wake(self: &Self) void {
+        self.wake_with_source(WAKER_WAKE_SOURCE_EXPLICIT);
+    }
+
+    fn wake_from_event_loop(self: &Self) void {
+        self.wake_with_source(WAKER_WAKE_SOURCE_EVENT_LOOP);
+    }
+
+    fn reset(self: &Self) void {
+        self._wake_count = 0;
+        self._wake_source = WAKER_WAKE_SOURCE_NONE;
+        if self._event_fd_bound != 0 && self._event_fd >= 0 {
+            waker_eventfd_drain(self._event_fd);
+        }
+    }
+
+    fn is_woken(self: &Self) bool {
+        return self._wake_count != 0;
+    }
+
+    fn wake_source_is_event_loop(self: &Self) bool {
+        return self._wake_source == WAKER_WAKE_SOURCE_EVENT_LOOP;
+    }
+
+    fn wake_source_is_cancel(self: &Self) bool {
+        return self._wake_source == WAKER_WAKE_SOURCE_CANCEL;
+    }
+
+    /// 把 fd 的 interest 合并进槽表，并把该槽标为「主槽」。
+    ///
+    /// 语义要点（两条，都来自既有调用契约）：
+    /// 1) **同 fd 合并**：`wait_readable(fd)` 后再 `wait_writable(fd)` 表示「同一个 fd
+    ///    既要读又要写」（TLS 全双工），合并成 READWRITE；旧实现是后写覆盖前写，
+    ///    于是只注册了一半的 interest，socket 反过来就绪时 future 永远醒不过来。
+    /// 2) **主槽 = 最后一次声明**：`io_fd()` / `io_interest_code()` 仍旧返回「最近一次
+    ///    声明」的 fd/interest，与单 fd 时代逐字节一致（调用方在一轮 poll 里先声明 A
+    ///    再声明 B 时，读到的仍是 B）；不同 fd 各自占一个槽，互不覆盖。
+    fn register_io_interest(self: &Self, fd: i32, interest: i32) void {
+        if fd < 0 || interest == WAKER_INTEREST_NONE {
+            return;
+        }
+        var i: i32 = 0;
+        while i < self._io_slot_count {
+            if self._io_slot_fds[i] == fd {
+                self._io_slot_interests[i] = self._io_slot_interests[i] | interest;
+                self._set_primary_io_slot(i);
+                return;
+            }
+            i = i + 1;
+        }
+        if self._io_slot_count < WAKER_IO_SLOT_MAX {
+            self._io_slot_fds[self._io_slot_count] = fd;
+            self._io_slot_interests[self._io_slot_count] = interest;
+            self._set_primary_io_slot(self._io_slot_count);
+            self._io_slot_count = self._io_slot_count + 1;
+        }
+    }
+
+    /// 把第 `index` 槽设为「主槽」：`_io_fd` / `_io_interest` 是历史读取口，
+    /// 始终镜像最后一次声明的那一槽，保证单 fd 调用方看到的值与旧实现相同。
+    fn _set_primary_io_slot(self: &Self, index: i32) void {
+        if index < 0 || index >= WAKER_IO_SLOT_MAX {
+            return;
+        }
+        self._io_fd = self._io_slot_fds[index];
+        self._io_interest = self._io_slot_interests[index];
+    }
+
+    /// 登记「关心 fd 可读」。
+    /// 与 `wait_writable` 对同一 fd 连续调用时，两次关注会**合并**成 READWRITE
+    /// （旧实现是「后一次覆盖前一次」，于是同一个 poll 里先读后写的 future
+    /// 只会被注册一半的 interest）。
+    fn wait_readable(self: &Self, fd: i32) void {
+        self.register_io_interest(fd, WAKER_INTEREST_READABLE);
+    }
+
+    /// 登记「关心 fd 可写」。语义与 `wait_readable` 对称（同 fd 合并为 READWRITE）。
+    fn wait_writable(self: &Self, fd: i32) void {
+        self.register_io_interest(fd, WAKER_INTEREST_WRITABLE);
+    }
+
+    fn clear_io_interest(self: &Self) void {
+        self._io_fd = 0 - 1;
+        self._io_interest = WAKER_INTEREST_NONE;
+        self._io_slot_count = 0;
+    }
+
+    fn has_io_interest(self: &Self) bool {
+        return self._io_interest != 0;
+    }
+
+    /// 当前登记在槽表里的 fd/interest 个数。
+    /// 参数说明：无。
+    /// 返回值说明：返回槽位数（0 表示本 waker 没有任何 I/O 关注）。
+    fn io_slot_count(self: &Self) i32 {
+        return self._io_slot_count;
+    }
+
+    /// 读取第 `index` 槽的 fd（不做 in-range 检查，调用方用 `io_slot_count` 界定）。
+    /// 参数说明：`index` 为槽下标。
+    /// 返回值说明：返回该槽的 fd；越界返回 -1。
+    fn io_slot_fd(self: &Self, index: i32) i32 {
+        if index < 0 || index >= self._io_slot_count {
+            return 0 - 1;
+        }
+        return self._io_slot_fds[index];
+    }
+
+    /// 读取第 `index` 槽的 interest 编码（1=RD / 2=WR / 3=RDWR）。
+    /// 参数说明：`index` 为槽下标。
+    /// 返回值说明：返回该槽的 interest 编码；越界返回 `WAKER_INTEREST_NONE`。
+    fn io_slot_interest(self: &Self, index: i32) i32 {
+        if index < 0 || index >= self._io_slot_count {
+            return WAKER_INTEREST_NONE;
+        }
+        return self._io_slot_interests[index];
+    }
+
+    fn io_fd(self: &Self) i32 {
+        return self._io_fd;
+    }
+
+    fn io_interest_code(self: &Self) i32 {
+        return self._io_interest;
+    }
+
+    fn event_fd(self: &Self) i32 {
+        if self._event_fd_bound == 0 || self._event_fd < 0 {
+            return 0 - 1;
+        }
+        return self._event_fd;
+    }
+
+    fn has_event_fd(self: &Self) bool {
+        return self._event_fd_bound != 0 && self._event_fd >= 0;
+    }
+
+    fn bind_event_fd(self: &Self, fd: i32) void {
+        self._event_fd = fd;
+        self._event_write_fd = fd;
+        if fd >= 0 {
+            self._event_fd_bound = 1;
+            return;
+        }
+        self._event_fd_bound = 0;
+    }
+
+    fn bind_event_fd_pair(self: &Self, read_fd: i32, write_fd: i32) void {
+        self._event_fd = read_fd;
+        self._event_write_fd = write_fd;
+        if read_fd >= 0 && write_fd >= 0 {
+            self._event_fd_bound = 1;
+            return;
+        }
+        self._event_fd_bound = 0;
+    }
+
+    fn clear_event_fd(self: &Self) void {
+        self._event_fd = 0 - 1;
+        self._event_write_fd = 0 - 1;
+        self._event_fd_bound = 0;
+    }
+
+    fn close_event_fd(self: &Self) void {
+        if self._event_fd_bound != 0 && self._event_fd >= 0 {
+            _ = sys_close(self._event_fd) catch {};
+        }
+        if self._event_fd_bound != 0 && self._event_write_fd >= 0 && self._event_write_fd != self._event_fd {
+            _ = sys_close(self._event_write_fd) catch {};
+        }
+        self.clear_event_fd();
+    }
+
+    fn cancel(self: &Self) void {
+        self._cancelled = 1;
+        self.wake_with_source(WAKER_WAKE_SOURCE_CANCEL);
+    }
+
+    fn clear_cancelled(self: &Self) void {
+        self._cancelled = 0;
+    }
+
+    fn is_cancelled(self: &Self) bool {
+        return self._cancelled != 0;
+    }
+}
+
+/// 显式取消检查辅助函数，供 Future 实现在 poll 中复用。
+export fn is_cancelled(waker: &Waker) bool {
+    if waker == null as &Waker {
+        return false;
+    }
+    return waker.is_cancelled();
+}
+
+/// 异步轮询结果。语言核心类型 union Poll<T>（Pending/Ready）。
+export union Poll<T> {
+    Pending: void,
+    Ready: T,
+}
+
+/// 异步计算抽象。实现此接口的类型可被 poll。
+export interface Future<T> {
+    fn poll(self: &Self, waker: &Waker) Poll<T>;
+    fn release(self: &Self) void;
+}
+
+/// Future 占位。@async_fn 函数当前返回此类型；实现 interface Future<T> 以便类型兼容。
+export struct Future<T> : Future<T> {
+    state: Poll<T>,
+
+    fn poll(self: &Self, waker: &Waker) Poll<T> {
+        return self.state;
+    }
+
+    fn release(self: &Self) void {
+        async_box_free_current(self as &byte);
+    }
+}
+
+/// 异步任务包装。实现 Future<T>，可持有 Poll 状态并供 poll。
+export struct Task<T> : Future<T> {
+    state: Poll<T>,
+
+    fn poll(self: &Self, waker: &Waker) Poll<T> {
+        return self.state;
+    }
+
+    fn release(self: &Self) void {
+        async_box_free_current(self as &byte);
+    }
+}
+
+/// 将值包装为错误联合 !T 的成功分支。
+/// 用于构造 Future<!T> 的 Ready(payload) 场景。
+export fn ok<T>(value: T) !T {
+    return value;
+}
+
+/// 构造 Poll<!T>.Ready(ok(value))，供自定义 `Future<!T>` 的 Ready 路径复用。
+export fn poll_ready_ok<T>(value: T) Poll<!T> {
+    return Poll<!T>.Ready(ok<T>(value));
+}
+
+/// 构造 Poll<T>.Pending({})，供各模块统一复用 pending 分支。
+/// 参数说明：无。
+/// 返回值说明：返回泛型 `Poll<T>.Pending({})`。
+export fn poll_pending<T>() Poll<T> {
+    return Poll<T>.Pending({});
+}
+
+/// 构造 Poll<!T>.Ready(err)，供各模块统一复用错误 ready 分支。
+/// 参数说明：`err` 为错误联合值。
+/// 返回值说明：返回 `Poll<!T>.Ready(err)`。
+export fn poll_ready_error<T>(err: !T) Poll<!T> {
+    return Poll<!T>.Ready(err);
+}
+
+/// 构造已就绪的 `Future<!T>`。
+export fn future_ready_ok<T>(value: T) Future<!T> {
+    return Future<!T>{ state: poll_ready_ok<T>(value) };
+}
+
+/// 创建已就绪任务。poll 时立即返回 Ready(value)。
+export fn task_ready<T>(value: T) Task<T> {
+    return Task<T>{ state: Poll<T>.Ready(value) };
+}
+
+/// 创建已就绪任务：Ready(ok(value))，便于构造 Future<!T>。
+export fn task_ready_ok<T>(value: T) Task<!T> {
+    return Task<!T>{ state: poll_ready_ok<T>(value) };
+}
+
+/// 同步运行 Future<!T> 直到 Ready，返回 !T。Pending 时轮询直到就绪（忙等待，测试用）。
+export fn block_on<T>(f: Future<!T>) !T {
+    var w: Waker = Waker{};
+    while true {
+        w.reset();
+        w.clear_io_interest();
+        const p: Poll<!T> = f.poll(&w);
+        match p {
+            .Ready(ok_val) => { return ok_val; },
+            .Pending(_) => { },
+        };
+    }
+}
+
+/// 同步运行 Future<T>（无 `!`）直到 Ready，直接返回 T。
+export fn block_on_plain<T>(f: Future<T>) T {
+    var w: Waker = Waker{};
+    while true {
+        w.reset();
+        w.clear_io_interest();
+        const p: Poll<T> = f.poll(&w);
+        match p {
+            .Ready(n) => { return n; },
+            .Pending(_) => { },
+        };
+    }
+}
+
+// 结构体内联方法当前不在类型检查阶段遍历函数体，泛型调用不会注册单态；经顶层转发以生成 C 单态符号。
+fn async_future_ready_ok_usize(value: usize) Future<!usize> {
+    const r: Future<!usize> = future_ready_ok<usize>(value);
+    return r;
+}
+
+fn async_future_unexpected_eof_usize() Future<!usize> {
+    const err_value: !usize = error.UnexpectedEof;
+    return Future<!usize>{ state: async_poll_ready_error_usize(err_value) };
+}
+
+fn async_poll_ready_ok_i32(value: i32) Poll<!i32> {
+    const r: Poll<!i32> = poll_ready_ok<i32>(value);
+    return r;
+}
+fn async_poll_ready_ok_u32(value: u32) Poll<!u32> {
+    const r: Poll<!u32> = poll_ready_ok<u32>(value);
+    return r;
+}
+fn async_poll_ready_ok_i64(value: i64) Poll<!i64> {
+    const r: Poll<!i64> = poll_ready_ok<i64>(value);
+    return r;
+}
+fn async_poll_ready_ok_u64(value: u64) Poll<!u64> {
+    const r: Poll<!u64> = poll_ready_ok<u64>(value);
+    return r;
+}
+fn async_poll_ready_ok_i16(value: i16) Poll<!i16> {
+    const r: Poll<!i16> = poll_ready_ok<i16>(value);
+    return r;
+}
+fn async_poll_ready_ok_u16(value: u16) Poll<!u16> {
+    const r: Poll<!u16> = poll_ready_ok<u16>(value);
+    return r;
+}
+fn async_poll_ready_ok_i8(value: i8) Poll<!i8> {
+    const r: Poll<!i8> = poll_ready_ok<i8>(value);
+    return r;
+}
+fn async_poll_ready_ok_u8(value: u8) Poll<!u8> {
+    const r: Poll<!u8> = poll_ready_ok<u8>(value);
+    return r;
+}
+fn async_poll_ready_ok_bool(value: bool) Poll<!bool> {
+    const r: Poll<!bool> = poll_ready_ok<bool>(value);
+    return r;
+}
+fn async_poll_ready_ok_f32(value: f32) Poll<!f32> {
+    const r: Poll<!f32> = poll_ready_ok<f32>(value);
+    return r;
+}
+fn async_poll_ready_ok_f64(value: f64) Poll<!f64> {
+    const r: Poll<!f64> = poll_ready_ok<f64>(value);
+    return r;
+}
+
+fn async_poll_ready_ok_usize(value: usize) Poll<!usize> {
+    const r: Poll<!usize> = poll_ready_ok<usize>(value);
+    return r;
+}
+
+/// 统一构造 `Poll<!usize>.Ready(err)`。
+/// 参数说明：`err` 为 `!usize` 错误联合值。
+/// 返回值说明：返回 `Poll<!usize>.Ready(err)`。
+export fn async_poll_ready_error_usize(err: !usize) Poll<!usize> {
+    const p: Poll<!usize> = poll_ready_error<usize>(err);
+    return p;
+}
+
+/// 统一构造 `Poll<!usize>.Pending({})`。
+/// 参数说明：无。
+/// 返回值说明：返回 `Poll<!usize>.Pending({})`。
+export fn async_poll_pending_usize() Poll<!usize> {
+    const p: Poll<!usize> = poll_pending<!usize>();
+    return p;
+}
+
+fn async_poll_pending_i32() Poll<!i32> {
+    const p: Poll<!i32> = poll_pending<!i32>();
+    return p;
+}
+
+fn async_poll_pending_parse_result() Poll<!ParseResult> {
+    const p: Poll<!ParseResult> = poll_pending<!ParseResult>();
+    return p;
+}
+
+fn async_poll_cancelled_i32() Poll<!i32> {
+    return Poll<!i32>.Ready(error.Cancelled);
+}
+
+fn async_poll_cancelled_usize() Poll<!usize> {
+    return Poll<!usize>.Ready(error.Cancelled);
+}
+
+fn async_poll_cancelled_parse_result() Poll<!ParseResult> {
+    return Poll<!ParseResult>.Ready(error.Cancelled);
+}
+
+fn async_waker_wait_readable(waker: &Waker, fd: i32) void {
+    if waker == null as &Waker {
+        return;
+    }
+    waker.wait_readable(fd);
+}
+
+fn async_waker_wait_writable(waker: &Waker, fd: i32) void {
+    if waker == null as &Waker {
+        return;
+    }
+    waker.wait_writable(fd);
+}
+
+/// 统一为 `Future<!usize>` 注册可读 interest 并返回 Pending。
+/// 参数说明：`waker` 为当前 poll 的唤醒器；`fd` 为等待可读事件的文件描述符。
+/// 返回值说明：始终返回 `Poll<!usize>.Pending({})`，并更新 `waker` 的 I/O interest。
+export fn async_poll_pending_readable_usize(waker: &Waker, fd: i32) Poll<!usize> {
+    async_waker_wait_readable(waker, fd);
+    return async_poll_pending_usize();
+}
+
+/// 统一为 `Future<!usize>` 注册可写 interest 并返回 Pending。
+/// 参数说明：`waker` 为当前 poll 的唤醒器；`fd` 为等待可写事件的文件描述符。
+/// 返回值说明：始终返回 `Poll<!usize>.Pending({})`，并更新 `waker` 的 I/O interest。
+export fn async_poll_pending_writable_usize(waker: &Waker, fd: i32) Poll<!usize> {
+    async_waker_wait_writable(waker, fd);
+    return async_poll_pending_usize();
+}
+
+/// 统一为 `Future<!i32>` 注册可读 interest 并返回 Pending。
+/// 参数说明：`waker` 为当前 poll 的唤醒器；`fd` 为等待可读事件的文件描述符。
+/// 返回值说明：始终返回 `Poll<!i32>.Pending({})`，并更新 `waker` 的 I/O interest。
+export fn async_poll_pending_readable_i32(waker: &Waker, fd: i32) Poll<!i32> {
+    async_waker_wait_readable(waker, fd);
+    return async_poll_pending_i32();
+}
+
+/// 统一为 `Future<!i32>` 注册可写 interest 并返回 Pending。
+/// 参数说明：`waker` 为当前 poll 的唤醒器；`fd` 为等待可写事件的文件描述符。
+/// 返回值说明：始终返回 `Poll<!i32>.Pending({})`，并更新 `waker` 的 I/O interest。
+export fn async_poll_pending_writable_i32(waker: &Waker, fd: i32) Poll<!i32> {
+    async_waker_wait_writable(waker, fd);
+    return async_poll_pending_i32();
+}
+
+/// 统一为 `Future<!ParseResult>` 注册可读 interest 并返回 Pending。
+/// 参数说明：`waker` 为当前 poll 的唤醒器；`fd` 为等待可读事件的文件描述符。
+/// 返回值说明：始终返回 `Poll<!ParseResult>.Pending({})`，并更新 `waker` 的 I/O interest。
+export fn async_poll_pending_readable_parse_result(waker: &Waker, fd: i32) Poll<!ParseResult> {
+    async_waker_wait_readable(waker, fd);
+    return async_poll_pending_parse_result();
+}
+
+fn async_join2_store_usize_result(result: !usize, out: &usize, error_out: &u32) void {
+    error_out[0] = result.error_id;
+    if result.error_id == 0u32 {
+        out[0] = result.value;
+        return;
+    }
+    out[0] = 0;
+}
+
+fn async_join2_has_io_interest(waker: &Waker) bool {
+    return waker.has_io_interest() && waker.io_fd() >= 0;
+}
+
+fn async_join2_interest_to_epoll_events(interest: i32) u32 {
+    if interest == 2 {
+        return EPOLLOUT as u32;
+    }
+    if interest == 1 {
+        return EPOLLIN as u32;
+    }
+    return 0 as u32;
+}
+
+fn async_join2_register_epoll_interest(epfd: i32, fd: i32, events: u32) !i32 {
+    if fd < 0 || events == 0u32 {
+        return 0;
+    }
+    var ev: EpollEvent = epoll_event_with_fd(events, fd);
+    _ = try sys_epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &ev);
+    return 1;
+}
+
+fn async_join2_register_epoll_pair(epfd: i32, first_waker: &Waker, second_waker: &Waker) !i32 {
+    var first_fd: i32 = 0 - 1;
+    var first_events: u32 = 0;
+    if async_join2_has_io_interest(first_waker) {
+        first_fd = first_waker.io_fd();
+        first_events = async_join2_interest_to_epoll_events(first_waker.io_interest_code());
+    }
+
+    var second_fd: i32 = 0 - 1;
+    var second_events: u32 = 0;
+    if async_join2_has_io_interest(second_waker) {
+        second_fd = second_waker.io_fd();
+        second_events = async_join2_interest_to_epoll_events(second_waker.io_interest_code());
+    }
+
+    if first_fd >= 0 && first_fd == second_fd {
+        first_events = first_events | second_events;
+        second_fd = 0 - 1;
+        second_events = 0;
+    }
+
+    var registered: i32 = 0;
+    registered = registered + (try async_join2_register_epoll_interest(epfd, first_fd, first_events));
+    registered = registered + (try async_join2_register_epoll_interest(epfd, second_fd, second_events));
+    return registered;
+}
+
+fn async_join2_wait_deadline_ms() !u64 {
+    return deadline_after_ms(16 as u32);
+}
+
+@async_fn fn async_join2_wait_single_fd(fd: i32, interest: i32) Future<!usize> {
+    const deadline_ms: u64 = try async_join2_wait_deadline_ms();
+    if interest == 2 {
+        const wait_result: !usize = @await async_wait_writable(fd, deadline_ms);
+        _ = wait_result catch |err| {
+            if @error_id(err) == @error_id(error.AsyncDeadlineExceeded) {
+                return 0 as usize;
+            }
+            return err;
+        };
+        return 1 as usize;
+    }
+    if interest == 1 {
+        const wait_result: !usize = @await async_wait_readable(fd, deadline_ms);
+        _ = wait_result catch |err| {
+            if @error_id(err) == @error_id(error.AsyncDeadlineExceeded) {
+                return 0 as usize;
+            }
+            return err;
+        };
+        return 1 as usize;
+    }
+    return error.FutureNotReady;
+}
+
+@async_fn fn async_join2_wait_pending_linux(first_waker: &Waker, second_waker: &Waker) Future<!usize> {
+    const epfd: i32 = try sys_epoll_create1(EPOLL_CLOEXEC);
+    const deadline_ms: u64 = try async_join2_wait_deadline_ms();
+    defer {
+        _ = sys_close(epfd) catch {};
+    }
+    const registered: i32 = try async_join2_register_epoll_pair(epfd, first_waker, second_waker);
+    if registered == 0 {
+        return 0 as usize;
+    }
+    const wait_result: !usize = @await async_wait_readable(epfd, deadline_ms);
+    _ = wait_result catch |err| {
+        if @error_id(err) == @error_id(error.AsyncDeadlineExceeded) {
+            return 0 as usize;
+        }
+        return err;
+    };
+    return registered as usize;
+}
+
+@async_fn fn async_join2_wait_pending_fallback(first_waker: &Waker, second_waker: &Waker) Future<!usize> {
+    if async_join2_has_io_interest(first_waker) {
+        return try @await async_join2_wait_single_fd(first_waker.io_fd(), first_waker.io_interest_code());
+    }
+    if async_join2_has_io_interest(second_waker) {
+        return try @await async_join2_wait_single_fd(second_waker.io_fd(), second_waker.io_interest_code());
+    }
+    return 0 as usize;
+}
+
+@async_fn fn async_join2_wait_pending(first_waker: &Waker, second_waker: &Waker) Future<!usize> {
+    std.cfg(std.target_os == .tos_linux, {
+        return try @await async_join2_wait_pending_linux(first_waker, second_waker);
+    }, {
+        return try @await async_join2_wait_pending_fallback(first_waker, second_waker);
+    })
+}
+
+/// 并发驱动两个 `Future<!usize>` 直到都完成。
+/// 参数说明：`first`/`second` 为待并发轮询的 future；`*_out` 写入成功值；`*_error_out` 写入各自 `error_id`。
+/// 返回值说明：两者都完成后返回 `2`；无论子 future 成功还是失败，本 future 都返回成功并把结果写入输出参数。
+export @async_fn fn async_join2_usize_results(first: Future<!usize>, first_out: &usize, first_error_out: &u32, second: Future<!usize>, second_out: &usize, second_error_out: &u32) Future<!usize> {
+    var first_done: i32 = 0;
+    var second_done: i32 = 0;
+    var first_waker: Waker = Waker{ _io_fd: 0 - 1, _event_fd: 0 - 1 };
+    var second_waker: Waker = Waker{ _io_fd: 0 - 1, _event_fd: 0 - 1 };
+
+    while first_done == 0 || second_done == 0 {
+        var made_progress: i32 = 0;
+
+        if first_done == 0 {
+            first_waker.reset();
+            first_waker.clear_io_interest();
+            const first_poll: Poll<!usize> = first.poll(&first_waker);
+            match first_poll {
+                .Pending(_) => {
+                    if first_waker.is_woken() {
+                        made_progress = 1;
+                    }
+                },
+                .Ready(first_result) => {
+                    first_done = 1;
+                    made_progress = 1;
+                    async_join2_store_usize_result(first_result, first_out, first_error_out);
+                },
+            };
+        }
+
+        if second_done == 0 {
+            second_waker.reset();
+            second_waker.clear_io_interest();
+            const second_poll: Poll<!usize> = second.poll(&second_waker);
+            match second_poll {
+                .Pending(_) => {
+                    if second_waker.is_woken() {
+                        made_progress = 1;
+                    }
+                },
+                .Ready(second_result) => {
+                    second_done = 1;
+                    made_progress = 1;
+                    async_join2_store_usize_result(second_result, second_out, second_error_out);
+                },
+            };
+        }
+
+        if first_done != 0 && second_done != 0 {
+            return 2 as usize;
+        }
+        if made_progress != 0 {
+            continue;
+        }
+        _ = try @await async_join2_wait_pending(&first_waker, &second_waker);
+    }
+
+    return 2 as usize;
+}
+
+// 注册常用 `ok<T>` 单态，供 poll_ready / 线程异步计算等生成的 C 链接（勿调用对应 `std_ok_*` 以免递归）。
+fn async_registry_ok_monos() void {
+    const k_i32: !i32 = ok<i32>(0);
+    const k_u32: !u32 = ok<u32>(0);
+    const k_i64: !i64 = ok<i64>(0);
+    const k_u64: !u64 = ok<u64>(0);
+    const k_i16: !i16 = ok<i16>(0);
+    const k_u16: !u16 = ok<u16>(0);
+    const k_i8: !i8 = ok<i8>(0);
+    const k_u8: !u8 = ok<u8>(0);
+    const k_bool: !bool = ok<bool>(0);
+    const k_f32: !f32 = ok<f32>(0.0);
+    const k_f64: !f64 = ok<f64>(0.0);
+    const k_usize: !usize = ok<usize>(0);
+    if k_i32.error_id != 0 && k_u32.error_id != 0 && k_i64.error_id != 0 && k_u64.error_id != 0 &&
+        k_i16.error_id != 0 && k_u16.error_id != 0 && k_i8.error_id != 0 && k_u8.error_id != 0 &&
+        k_bool.error_id != 0 && k_f32.error_id != 0 && k_f64.error_id != 0 && k_usize.error_id != 0 {
+    }
+    // 强制发出 std_poll_ready_ok_*（future_ready_ok/task_ready_ok 等会调用；结构体 poll 内直接 poll_ready_ok 不注册单态）
+    _ = async_poll_ready_ok_i32(0);
+    _ = async_poll_ready_ok_u32(0);
+    _ = async_poll_ready_ok_i64(0);
+    _ = async_poll_ready_ok_u64(0);
+    _ = async_poll_ready_ok_i16(0);
+    _ = async_poll_ready_ok_u16(0);
+    _ = async_poll_ready_ok_i8(0);
+    _ = async_poll_ready_ok_u8(0);
+    _ = async_poll_ready_ok_bool(false);
+    _ = async_poll_ready_ok_f32(0.0);
+    _ = async_poll_ready_ok_f64(0.0);
+    _ = async_poll_ready_ok_usize(0);
+}
+
+// ============================================================
+// std.async.io - 异步 I/O 抽象（设计见 docs/std_async_design.md）
+// ============================================================
+
+/// 异步输出抽象。当前统一收敛到 Future<!usize>：
+/// Pending 表示尚未就绪，Ready(ok(n)) 表示成功，Ready(err) 表示 I/O 失败。
+export interface AsyncWriter {
+    fn write(self: &Self, data: &const byte, count: usize) Future<!usize>;
+    fn write_all(self: &Self, data: &const byte, count: usize) Future<!usize>;
+    fn flush(self: &Self) Future<!usize>;
+}
+
+/// 异步输入抽象。read 返回 Future<!usize>，可在 @async_fn 中 try @await。
+export interface AsyncReader {
+    fn read(self: &Self, buf: &byte, count: usize) Future<!usize>;
+    fn read_exact(self: &Self, buf: &byte, count: usize) Future<!usize>;
+}
+
+/// 内存-backed 异步写入器（用于测试）。每次 write 立即返回 Ready(count)。
+export struct MemAsyncWriter : AsyncWriter {
+    _pos: usize,
+
+    fn write(self: &Self, data: &const byte, count: usize) Future<!usize> {
+        _ = self;
+        _ = data;
+        return async_future_ready_ok_usize(count);
+    }
+
+    fn write_all(self: &Self, data: &const byte, count: usize) Future<!usize> {
+        _ = self;
+        _ = data;
+        return async_future_ready_ok_usize(count);
+    }
+
+    fn flush(self: &Self) Future<!usize> {
+        _ = self;
+        return async_future_ready_ok_usize(0);
+    }
+}
+
+/// 创建 MemAsyncWriter。
+export fn mem_async_writer_new() MemAsyncWriter {
+    return MemAsyncWriter{ _pos: 0 };
+}
+
+/// 内存-backed 异步读取器（用于测试）。从预加载缓冲区读取，每次 read 立即返回 Ready(n)。
+export struct MemAsyncReader : AsyncReader {
+    _buf: &const byte,
+    _len: usize,
+    _pos: usize,
+
+    fn read(self: &Self, buf: &byte, count: usize) Future<!usize> {
+        var avail: usize = self._len - self._pos;
+        if avail > count {
+            avail = count;
+        }
+        var i: usize = 0;
+        while i < avail {
+            buf[i] = self._buf[self._pos + i];
+            i = i + 1;
+        }
+        self._pos = self._pos + avail;
+        return async_future_ready_ok_usize(avail);
+    }
+
+    fn read_exact(self: &Self, buf: &byte, count: usize) Future<!usize> {
+        const remaining: usize = self._len - self._pos;
+        if remaining < count {
+            var copied: usize = 0;
+            while copied < remaining {
+                buf[copied] = self._buf[self._pos + copied];
+                copied = copied + 1;
+            }
+            self._pos = self._pos + remaining;
+            return async_future_unexpected_eof_usize();
+        }
+
+        var copied: usize = 0;
+        while copied < count {
+            buf[copied] = self._buf[self._pos + copied];
+            copied = copied + 1;
+        }
+        self._pos = self._pos + count;
+        return async_future_ready_ok_usize(count);
+    }
+}
+
+/// 从给定缓冲区创建 MemAsyncReader。
+export fn mem_async_reader_new(data: &const byte, len: usize) MemAsyncReader {
+    return MemAsyncReader{ _buf: data, _len: len, _pos: 0 };
+}
+
+/// 从 MemAsyncReader 复制到 MemAsyncWriter，直到读取 0 字节。返回总复制字节数。
+export @async_fn fn async_copy(reader: &MemAsyncReader, writer: &MemAsyncWriter, buf: &byte, buf_len: usize) Future<!usize> {
+    var total: usize = 0;
+    while true {
+        const n: usize = try @await reader.read(buf, buf_len);
+        if n == 0 {
+            return total;
+        }
+        const written: usize = try @await writer.write(buf as &const byte, n);
+        total = total + written;
+        if written < n {
+            return total;
+        }
+    }
+}
+
+/// 将字节切片完整写入 AsyncWriter。
+export fn async_write_bytes(writer: AsyncWriter, data: &[byte]) Future<!usize> {
+    return writer.write_all(data.ptr as &const byte, data.len);
+}
+
+/// 将以 `\0` 结尾的 C 风格字符串完整写入 AsyncWriter。
+export fn async_write_cstr(writer: AsyncWriter, text: &const byte) Future<!usize> {
+    return writer.write_all(text, strlen(text));
+}
+
+/// 便捷输出：写入 C 风格字符串，不追加换行。
+export fn async_print_to(writer: AsyncWriter, text: &const byte) Future<!usize> {
+    return async_write_cstr(writer, text);
+}
+
+/// 便捷输出：写入字节切片，不追加换行。
+export fn async_print_bytes_to(writer: AsyncWriter, data: &[byte]) Future<!usize> {
+    return async_write_bytes(writer, data);
+}
+
+/// 便捷输出：写入 C 风格字符串并追加 `\n`。
+export @async_fn fn async_println_to(writer: AsyncWriter, text: &const byte) Future<!usize> {
+    var total: usize = try @await async_write_cstr(writer, text);
+    total = total + (try @await async_write_cstr(writer, "\n\0" as &const byte));
+    return total;
+}
+
+/// 便捷输出：写入字节切片并追加 `\n`。
+export @async_fn fn async_println_bytes_to(writer: AsyncWriter, data: &[byte]) Future<!usize> {
+    var total: usize = try @await async_write_bytes(writer, data);
+    total = total + (try @await async_write_cstr(writer, "\n\0" as &const byte));
+    return total;
+}
+
+/// 从 AsyncFd 精确读取 `count` 字节；若提前遇到 EOF，则返回 `error.UnexpectedEof`。
+export @async_fn fn async_fd_read_exact(fd: i32, buf: &byte, count: usize) Future<!usize> {
+    var total: usize = 0;
+    while total < count {
+        const n: usize = try @await async_fd_read_future(fd, &buf[total], count - total);
+        if n == 0 {
+            return error.UnexpectedEof;
+        }
+        total = total + n;
+    }
+    return total;
+}
+
+/// 向 AsyncFd 持续写入直到写满 `count` 字节；若写侧返回 0，则返回 `error.WriteZero`。
+export @async_fn fn async_fd_write_all(fd: i32, data: &const byte, count: usize) Future<!usize> {
+    var total: usize = 0;
+    while total < count {
+        const n: usize = try @await async_fd_write_future(fd, &data[total] as &const byte, count - total);
+        if n == 0 {
+            return error.WriteZero;
+        }
+        total = total + n;
+    }
+    return total;
+}
+
+fn async_deadline_expired(deadline_ms: u64) !bool {
+    if deadline_ms == 0 {
+        return false;
+    }
+    const expired_result: !bool = deadline_expired(deadline_ms);
+    return expired_result catch {
+        return error.AsyncDeadlineExceeded;
+    };
+}
+
+fn async_check_deadline(deadline_ms: u64) !void {
+    const expired: bool = try async_deadline_expired(deadline_ms);
+    if expired {
+        return error.AsyncDeadlineExceeded;
+    }
+}
+
+fn async_fd_set_nonblocking(fd: i32) !i32 {
+    const flags: i32 = try sys_fcntl(fd, F_GETFL, 0);
+    if (flags & O_NONBLOCK) == 0 {
+        _ = try sys_fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+    }
+    return fd;
+}
+
+const ASYNC_FD_IO_STEP_DONE: i32 = 0;
+const ASYNC_FD_IO_STEP_WAIT: i32 = 1;
+
+fn async_fd_read_try_step(fd: i32, buf: &byte, count: usize, out_n: &isize) !i32 {
+    const result: !isize = sys_read(fd, buf as *byte, count);
+    const n: isize = result catch |err| {
+        const err_id: u32 = @error_id(err);
+        if err_id == libc_EAGAIN as u32 || err_id == libc_EWOULDBLOCK as u32 {
+            return ASYNC_FD_IO_STEP_WAIT;
+        }
+        return err;
+    };
+    *out_n = n;
+    return ASYNC_FD_IO_STEP_DONE;
+}
+
+fn async_fd_write_try_step(fd: i32, data: &const byte, count: usize, out_n: &isize) !i32 {
+    const result: !isize = sys_write(fd, data as *const byte, count);
+    const n: isize = result catch |err| {
+        const err_id: u32 = @error_id(err);
+        if err_id == libc_EAGAIN as u32 || err_id == libc_EWOULDBLOCK as u32 {
+            return ASYNC_FD_IO_STEP_WAIT;
+        }
+        return err;
+    };
+    *out_n = n;
+    return ASYNC_FD_IO_STEP_DONE;
+}
+
+const ASYNC_WRITEV_STEP_WRITTEN: i32 = 0;
+const ASYNC_WRITEV_STEP_RETRY: i32 = 1;
+const ASYNC_WRITEV_STEP_WAIT_WRITABLE: i32 = 2;
+
+fn async_writev_try_step(fd: i32, iov: &const IOVec, iovcnt: i32, out_n: &isize) !i32 {
+    const write_result: !isize = sys_writev(fd, iov, iovcnt);
+    const n: isize = write_result catch |err| {
+        const err_id: u32 = @error_id(err);
+        if err_id == libc_EINTR as u32 {
+            return ASYNC_WRITEV_STEP_RETRY;
+        }
+        if err_id == libc_EAGAIN as u32 || err_id == libc_EWOULDBLOCK as u32 {
+            return ASYNC_WRITEV_STEP_WAIT_WRITABLE;
+        }
+        return err;
+    };
+    *out_n = n;
+    return ASYNC_WRITEV_STEP_WRITTEN;
+}
+
+/// 异步以 `writev(2)` 发送两段 buffer，直到全部写完。
+/// 参数说明：`fd` 为目标 fd；`head`/`head_len` 为第一段；`body`/`body_len` 为第二段，长度可为 0。
+/// 返回值说明：成功返回 `head_len + body_len`；`EAGAIN`/`EWOULDBLOCK` 时返回 Pending，其他错误原样透传，写入 0 字节返回 `error.WriteZero`。
+export @async_fn fn async_writev(fd: i32, head: &const byte, head_len: usize, body: &const byte, body_len: usize) Future<!usize> {
+    if fd < 0 {
+        return error.InvalidRequest;
+    }
+
+    var head_sent: usize = 0;
+    var body_sent: usize = 0;
+    var nonblocking_ready: i32 = 0;
+    while head_sent < head_len || body_sent < body_len {
+        const wait_writable_result: !usize = @await async_wait_writable(fd, 0 as u64);
+        _ = try wait_writable_result;
+        if nonblocking_ready == 0 {
+            _ = try async_fd_set_nonblocking(fd);
+            nonblocking_ready = 1;
+        }
+
+        var iov: [IOVec: 2] = [];
+        var iovcnt: i32 = 0;
+        if head_sent < head_len {
+            const head_ptr: *const byte = @ptr_from_usize(@usize_from_ptr(head as &void) + head_sent) as *const byte;
+            iov[iovcnt as usize] = IOVec{ iov_base: head_ptr, iov_len: head_len - head_sent };
+            iovcnt = iovcnt + 1;
+        }
+        if body_sent < body_len {
+            const body_ptr: *const byte = @ptr_from_usize(@usize_from_ptr(body as &void) + body_sent) as *const byte;
+            iov[iovcnt as usize] = IOVec{ iov_base: body_ptr, iov_len: body_len - body_sent };
+            iovcnt = iovcnt + 1;
+        }
+
+        var n: isize = 0;
+        const step_result: !i32 = async_writev_try_step(fd, &iov[0], iovcnt, &n);
+        const step: i32 = step_result catch |err| {
+            return err;
+        };
+        if step == ASYNC_WRITEV_STEP_RETRY {
+            continue;
+        }
+        if step == ASYNC_WRITEV_STEP_WAIT_WRITABLE {
+            continue;
+        }
+        if n <= 0 {
+            return error.WriteZero;
+        }
+
+        var advanced: usize = n as usize;
+        if head_sent < head_len {
+            const head_rem: usize = head_len - head_sent;
+            if advanced >= head_rem {
+                head_sent = head_len;
+                advanced = advanced - head_rem;
+            } else {
+                head_sent = head_sent + advanced;
+                advanced = 0;
+            }
+        }
+        if advanced > 0 && body_sent < body_len {
+            body_sent = body_sent + advanced;
+            if body_sent > body_len {
+                body_sent = body_len;
+            }
+        }
+    }
+    return head_len + body_len;
+}
+
+const ASYNC_SENDFILE_LINUX_STEP_SENT: i32 = 0;
+const ASYNC_SENDFILE_LINUX_STEP_RETRY: i32 = 1;
+const ASYNC_SENDFILE_LINUX_STEP_WAIT_WRITABLE: i32 = 2;
+const ASYNC_SENDFILE_LINUX_STEP_FALLBACK: i32 = 3;
+
+const ASYNC_SENDFILE_WRITE_STEP_WRITTEN: i32 = 0;
+const ASYNC_SENDFILE_WRITE_STEP_RETRY: i32 = 1;
+const ASYNC_SENDFILE_WRITE_STEP_WAIT_WRITABLE: i32 = 2;
+
+const ASYNC_SENDFILE_READ_STEP_FILLED: i32 = 0;
+const ASYNC_SENDFILE_READ_STEP_RETRY: i32 = 1;
+const ASYNC_SENDFILE_READ_STEP_EOF: i32 = 2;
+
+fn async_sendfile_enable_fallback(file_fd: i32, sent: usize, use_fallback: &i32) void {
+    if *use_fallback != 0 {
+        return;
+    }
+    *use_fallback = 1;
+    _ = sys_lseek(file_fd, sent as i64, SEEK_SET) catch {};
+}
+
+fn async_sendfile_try_linux_step(fd: i32, file_fd: i32, offset: &i64, remaining: usize, out_n: &isize) i32 {
+    var want_sf: usize = remaining;
+    if want_sf > 65536 {
+        want_sf = 65536;
+    }
+    const send_result: !isize = @syscall(40, fd as i64, file_fd as i64, offset as i64, want_sf as i64) as! isize;
+    const n_sf: isize = send_result catch |err| {
+        const err_id: u32 = @error_id(err);
+        if err_id == libc_EINTR as u32 {
+            return ASYNC_SENDFILE_LINUX_STEP_RETRY;
+        }
+        if err_id == libc_EAGAIN as u32 || err_id == libc_EWOULDBLOCK as u32 {
+            return ASYNC_SENDFILE_LINUX_STEP_WAIT_WRITABLE;
+        }
+        return ASYNC_SENDFILE_LINUX_STEP_FALLBACK;
+    };
+    if n_sf <= 0 {
+        return ASYNC_SENDFILE_LINUX_STEP_FALLBACK;
+    }
+    *out_n = n_sf;
+    return ASYNC_SENDFILE_LINUX_STEP_SENT;
+}
+
+fn async_sendfile_try_linux(fd: i32, file_fd: i32, total_len: usize, sent: &usize, offset: &i64) i32 {
+    std.cfg(std.target_os == .tos_linux, {
+    std.cfg(std.target_arch == .ta_x86_64, {
+    while *sent < total_len {
+        var n_sf: isize = 0;
+        const linux_step: i32 = async_sendfile_try_linux_step(fd, file_fd, offset, total_len - *sent, &n_sf);
+        if linux_step == ASYNC_SENDFILE_LINUX_STEP_RETRY {
+            continue;
+        }
+        if linux_step == ASYNC_SENDFILE_LINUX_STEP_WAIT_WRITABLE {
+            return ASYNC_SENDFILE_LINUX_STEP_WAIT_WRITABLE;
+        }
+        if linux_step == ASYNC_SENDFILE_LINUX_STEP_FALLBACK {
+            return ASYNC_SENDFILE_LINUX_STEP_FALLBACK;
+        }
+        *sent = *sent + (n_sf as usize);
+    }
+    return ASYNC_SENDFILE_LINUX_STEP_SENT;
+    }, {
+        return ASYNC_SENDFILE_LINUX_STEP_FALLBACK;
+    })
+    }, {
+        return ASYNC_SENDFILE_LINUX_STEP_FALLBACK;
+    })
+}
+
+fn async_sendfile_try_write_step(fd: i32, buf: &const byte, count: usize, out_n: &isize) !i32 {
+    const write_result: !isize = sys_write(fd, buf as *const byte, count);
+    const n: isize = write_result catch |err| {
+        const err_id: u32 = @error_id(err);
+        if err_id == libc_EINTR as u32 {
+            return ASYNC_SENDFILE_WRITE_STEP_RETRY;
+        }
+        if err_id == libc_EAGAIN as u32 || err_id == libc_EWOULDBLOCK as u32 {
+            return ASYNC_SENDFILE_WRITE_STEP_WAIT_WRITABLE;
+        }
+        return err;
+    };
+    if n <= 0 {
+        return error.WriteZero;
+    }
+    *out_n = n;
+    return ASYNC_SENDFILE_WRITE_STEP_WRITTEN;
+}
+
+fn async_sendfile_try_read_step(file_fd: i32, buf: &byte, count: usize, out_n: &isize) !i32 {
+    const read_result: !isize = sys_read(file_fd, buf as *byte, count);
+    const rn: isize = read_result catch |err| {
+        const err_id: u32 = @error_id(err);
+        if err_id == libc_EINTR as u32 {
+            return ASYNC_SENDFILE_READ_STEP_RETRY;
+        }
+        return err;
+    };
+    if rn <= 0 {
+        return ASYNC_SENDFILE_READ_STEP_EOF;
+    }
+    *out_n = rn;
+    return ASYNC_SENDFILE_READ_STEP_FILLED;
+}
+
+/// 异步把文件内容发送到 `fd`，优先走 Linux `sendfile(2)`，失败时退回 `read + write`。
+/// 参数说明：`fd` 为目标 fd；`file_fd` 为已打开文件；`total_len` 为期望发送字节数。
+/// 返回值说明：成功返回实际发送字节数；`EAGAIN`/`EWOULDBLOCK` 时返回 Pending，其他错误原样透传，提前 EOF 返回 `error.ConnectionClosed`。
+export @async_fn fn async_sendfile(fd: i32, file_fd: i32, total_len: usize) Future<!usize> {
+    if fd < 0 || file_fd < 0 {
+        return error.InvalidRequest;
+    }
+    var sent: usize = 0;
+    var offset: i64 = 0i64;
+    var nonblocking_ready: i32 = 0;
+    var use_fallback: i32 = 0;
+    var chunk: [byte: 4096] = [];
+    var chunk_len: usize = 0;
+    var chunk_off: usize = 0;
+    while sent < total_len {
+        const wait_writable_result: !usize = @await async_wait_writable(fd, 0 as u64);
+        _ = try wait_writable_result;
+        if nonblocking_ready == 0 {
+            _ = try async_fd_set_nonblocking(fd);
+            nonblocking_ready = 1;
+        }
+        if use_fallback == 0 && chunk_len == 0 {
+            const linux_step: i32 = async_sendfile_try_linux(fd, file_fd, total_len, &sent, &offset);
+            if linux_step == ASYNC_SENDFILE_LINUX_STEP_SENT {
+                if sent >= total_len {
+                    return sent;
+                }
+            } else if linux_step == ASYNC_SENDFILE_LINUX_STEP_WAIT_WRITABLE {
+                continue;
+            } else {
+                async_sendfile_enable_fallback(file_fd, sent, &use_fallback);
+            }
+        }
+        while sent < total_len {
+            if chunk_off < chunk_len {
+                const chunk_ptr: &const byte = @ptr_from_usize(@usize_from_ptr(&chunk[0] as &void) + chunk_off) as &const byte;
+                var n: isize = 0;
+                const write_step_result: !i32 = async_sendfile_try_write_step(fd, chunk_ptr, chunk_len - chunk_off, &n);
+                const write_step: i32 = write_step_result catch |err| {
+                    return err;
+                };
+                if write_step == ASYNC_SENDFILE_WRITE_STEP_RETRY {
+                    continue;
+                }
+                if write_step == ASYNC_SENDFILE_WRITE_STEP_WAIT_WRITABLE {
+                    break;
+                }
+                chunk_off = chunk_off + (n as usize);
+                sent = sent + (n as usize);
+                if chunk_off >= chunk_len {
+                    chunk_off = 0;
+                    chunk_len = 0;
+                }
+                continue;
+            }
+
+            var want: usize = total_len - sent;
+            if want > 4096 {
+                want = 4096;
+            }
+            var rn: isize = 0;
+            const read_step_result: !i32 = async_sendfile_try_read_step(file_fd, &chunk[0], want, &rn);
+            const read_step: i32 = read_step_result catch |err| {
+                return err;
+            };
+            if read_step == ASYNC_SENDFILE_READ_STEP_RETRY {
+                continue;
+            }
+            if read_step == ASYNC_SENDFILE_READ_STEP_EOF {
+                return error.ConnectionClosed;
+            }
+            chunk_len = rn as usize;
+            chunk_off = 0;
+        }
+    }
+    return sent;
+}
+
+const ASYNC_CONNECT_STEP_CONNECTED: i32 = 0;
+const ASYNC_CONNECT_STEP_RETRY: i32 = 1;
+const ASYNC_CONNECT_STEP_WAIT_WRITABLE: i32 = 2;
+
+fn async_connect_try_step(fd: i32, addr: &void, addr_len: u32) !i32 {
+    const connect_result: !i32 = sys_connect(fd, addr, addr_len);
+    _ = connect_result catch |err| {
+        const err_id: u32 = @error_id(err);
+        if err_id == libc_EINTR as u32 {
+            return ASYNC_CONNECT_STEP_RETRY;
+        }
+        if err_id == libc_EAGAIN as u32 || err_id == libc_EWOULDBLOCK as u32 || err_id == libc_EINPROGRESS as u32 || err_id == libc_EALREADY as u32 {
+            return ASYNC_CONNECT_STEP_WAIT_WRITABLE;
+        }
+        if err_id == libc_EISCONN as u32 {
+            return ASYNC_CONNECT_STEP_CONNECTED;
+        }
+        return err;
+    };
+    return ASYNC_CONNECT_STEP_CONNECTED;
+}
+
+// ============================================================
+// AsyncFd - 基于文件描述符的异步 I/O（高层 helper 走 @async_fn；唯一手写 poll 例外收敛到 wait substrate）
+// ============================================================
+
+use libc.syscall;
+
+const ASYNC_WAIT_INTEREST_NONE: i32 = 0;
+const ASYNC_WAIT_INTEREST_READABLE: i32 = 1;
+const ASYNC_WAIT_INTEREST_WRITABLE: i32 = 2;
+
+fn async_wait_interest_to_poll_events(interest: i32) i16 {
+    if interest == ASYNC_WAIT_INTEREST_READABLE {
+        return POLLIN;
+    }
+    if interest == ASYNC_WAIT_INTEREST_WRITABLE {
+        return POLLOUT;
+    }
+    return 0 as i16;
+}
+
+fn async_wait_revents_ready(events: i16, revents: i16) bool {
+    const ready_mask: i16 = events | POLLERR | POLLHUP | POLLNVAL;
+    return (revents & ready_mask) != 0;
+}
+
+fn async_wait_pending_usize(waker: &Waker, fd: i32, interest: i32) Poll<!usize> {
+    if interest == ASYNC_WAIT_INTEREST_READABLE {
+        return async_poll_pending_readable_usize(waker, fd);
+    }
+    if interest == ASYNC_WAIT_INTEREST_WRITABLE {
+        return async_poll_pending_writable_usize(waker, fd);
+    }
+    return Poll<!usize>.Ready(error.FutureNotReady);
+}
+
+// runtime substrate 的唯一手写 poll 例外：只承接 cancel/deadline/readiness wait。
+// 具体 sys_read/sys_write 与 buffer 处理一律留在 @async_fn helper 中。
+struct AsyncWaitFdFuture : Future<!usize> {
+    fd: i32,
+    interest: i32,
+    deadline_ms: u64 = 0,
+    boxed: i32 = 0,
+    skip_ready_probe: i32 = 0,
+    armed: i32 = 0,
+
+    fn poll(self: &Self, waker: &Waker) Poll<!usize> {
+        if waker.is_cancelled() {
+            return async_poll_cancelled_usize();
+        }
+        _ = async_check_deadline(self.deadline_ms) catch {
+            return Poll<!usize>.Ready(error.AsyncDeadlineExceeded);
+        };
+        if self.interest == ASYNC_WAIT_INTEREST_NONE {
+            return async_poll_ready_ok_usize(0);
+        }
+        const events: i16 = async_wait_interest_to_poll_events(self.interest);
+        if events == 0 {
+            return Poll<!usize>.Ready(error.FutureNotReady);
+        }
+        if self.skip_ready_probe != 0 {
+            if self.armed != 0 {
+                return async_poll_ready_ok_usize(0);
+            }
+            self.armed = 1;
+            return async_wait_pending_usize(waker, self.fd, self.interest);
+        }
+        var pollfd: PollFd = PollFd{
+            fd: self.fd,
+            events: events,
+            revents: 0 as i16,
+        };
+        const poll_result: !i32 = sys_poll(&pollfd, 1, 0);
+        const ready_count: i32 = poll_result catch {
+            const err_value: !usize = poll_result as! usize;
+            return Poll<!usize>.Ready(err_value);
+        };
+        if ready_count > 0 && async_wait_revents_ready(events, pollfd.revents) {
+            return async_poll_ready_ok_usize(0);
+        }
+        return async_wait_pending_usize(waker, self.fd, self.interest);
+    }
+
+    fn release(self: &Self) void {
+        if self.boxed != 0 {
+            async_box_free_current(self as &byte);
+        }
+    }
+}
+
+/// readiness-wait substrate：当前 runtime 中唯一允许保留的手写 `poll()` 例外。
+/// 参数说明：`fd` 为目标文件描述符；`deadline_ms` 为绝对毫秒 deadline，传 `0` 表示不设超时。
+/// 返回值说明：当 fd 已可读或出现需要让上层重试 syscall 的 readiness/error 事件时返回 `0`；取消返回 `error.Cancelled`；超时返回 `error.AsyncDeadlineExceeded`。
+export fn async_wait_readable(fd: i32, deadline_ms: u64) Future<!usize> {
+    return AsyncWaitFdFuture{
+        fd: fd,
+        interest: ASYNC_WAIT_INTEREST_READABLE,
+        deadline_ms: deadline_ms,
+        boxed: 1,
+    };
+}
+
+/// readiness-wait substrate：当前 runtime 中唯一允许保留的手写 `poll()` 例外。
+/// 参数说明：`fd` 为目标文件描述符；`deadline_ms` 为绝对毫秒 deadline，传 `0` 表示不设超时。
+/// 返回值说明：当 fd 已可写或出现需要让上层重试 syscall 的 readiness/error 事件时返回 `0`；取消返回 `error.Cancelled`；超时返回 `error.AsyncDeadlineExceeded`。
+export fn async_wait_writable(fd: i32, deadline_ms: u64) Future<!usize> {
+    return AsyncWaitFdFuture{
+        fd: fd,
+        interest: ASYNC_WAIT_INTEREST_WRITABLE,
+        deadline_ms: deadline_ms,
+        boxed: 1,
+    };
+}
+
+/// 基于 fd 的异步 I/O 包装。
+/// 当前对外 helper 走 `@async_fn` 组合；手写 `poll()` 仅保留在 `async_wait_*` substrate。
+export struct AsyncFd : AsyncWriter, AsyncReader {
+    fd: i32,
+
+    fn write(self: &Self, data: &const byte, count: usize) Future<!usize> {
+        return async_fd_write_future(self.fd, data, count);
+    }
+
+    fn write_all(self: &Self, data: &const byte, count: usize) Future<!usize> {
+        return async_fd_write_all(self.fd, data, count);
+    }
+
+    fn flush(self: &Self) Future<!usize> {
+        _ = self;
+        return async_future_ready_ok_usize(0);
+    }
+
+    fn read(self: &Self, buf: &byte, count: usize) Future<!usize> {
+        return async_fd_read_future(self.fd, buf, count);
+    }
+
+    fn read_exact(self: &Self, buf: &byte, count: usize) Future<!usize> {
+        return async_fd_read_exact(self.fd, buf, count);
+    }
+}
+
+/// 从 fd 创建 AsyncFd。
+export fn async_fd_new(fd: i32) AsyncFd {
+    return AsyncFd{ fd: fd };
+}
+
+/// 返回带绝对 deadline 的异步 fd 读 helper；先尝试 syscall，只有 would-block 时才等待 readiness。
+/// 参数说明：`fd` 为目标文件描述符；`buf`/`count` 为读取目标；`deadline_ms` 为绝对毫秒 deadline，传 `0` 表示不设超时。
+/// 返回值说明：成功返回本次实际读取字节数；would-block 时等待下一次可读事件；超时返回 `error.AsyncDeadlineExceeded`。
+export @async_fn fn async_fd_read_deadline_future(fd: i32, buf: &byte, count: usize, deadline_ms: u64) Future<!usize> {
+    var nonblocking_ready: i32 = 0;
+    const preflight_leaf: AsyncWaitFdFuture = AsyncWaitFdFuture{
+        fd: 0 - 1,
+        interest: ASYNC_WAIT_INTEREST_NONE,
+        deadline_ms: deadline_ms,
+    };
+    const preflight_fut: Future<!usize> = preflight_leaf;
+    _ = try @await preflight_fut;
+    while true {
+        if nonblocking_ready == 0 {
+            _ = try async_fd_set_nonblocking(fd);
+            nonblocking_ready = 1;
+        }
+        var n: isize = 0;
+        const step: i32 = try async_fd_read_try_step(fd, buf, count, &n);
+        if step == ASYNC_FD_IO_STEP_WAIT {
+            const wait_readable_leaf: AsyncWaitFdFuture = AsyncWaitFdFuture{
+                fd: fd,
+                interest: ASYNC_WAIT_INTEREST_READABLE,
+                deadline_ms: deadline_ms,
+            };
+            const wait_readable_fut: Future<!usize> = wait_readable_leaf;
+            _ = try @await wait_readable_fut;
+            continue;
+        }
+        return n as usize;
+    }
+}
+
+/// 返回已处于非阻塞模式 fd 的异步读 helper；调用方必须先保证 `fd` 设置了 `O_NONBLOCK`。
+/// 参数说明：`fd` 为目标文件描述符；`buf`/`count` 为读取目标。
+/// 返回值说明：成功返回本次实际读取字节数；`EAGAIN`/`EWOULDBLOCK` 时等待下一次可读事件。
+export @async_fn fn async_fd_read_nonblocking_future(fd: i32, buf: &byte, count: usize) Future<!usize> {
+    while true {
+        var n: isize = 0;
+        const step: i32 = try async_fd_read_try_step(fd, buf, count, &n);
+        if step == ASYNC_FD_IO_STEP_WAIT {
+            const wait_readable_leaf: AsyncWaitFdFuture = AsyncWaitFdFuture{
+                fd: fd,
+                interest: ASYNC_WAIT_INTEREST_READABLE,
+                deadline_ms: 0 as u64,
+                skip_ready_probe: 1,
+            };
+            const wait_readable_fut: Future<!usize> = wait_readable_leaf;
+            _ = try @await wait_readable_fut;
+            continue;
+        }
+        return n as usize;
+    }
+}
+
+/// 返回具体 fd 读 helper，供 `@await` 路径使用（接口返回，由 compiler box）。
+export @async_fn fn async_fd_read_future(fd: i32, buf: &byte, count: usize) Future<!usize> {
+    return try @await async_fd_read_deadline_future(fd, buf, count, 0 as u64);
+}
+
+/// 返回带绝对 deadline 的异步 fd 写 helper；先尝试 syscall，只有 would-block 时才等待 readiness。
+/// 参数说明：`fd` 为目标文件描述符；`data`/`count` 为待写 buffer；`deadline_ms` 为绝对毫秒 deadline，传 `0` 表示不设超时。
+/// 返回值说明：成功返回本次实际写入字节数；would-block 时等待下一次可写事件；超时返回 `error.AsyncDeadlineExceeded`。
+export @async_fn fn async_fd_write_deadline_future(fd: i32, data: &const byte, count: usize, deadline_ms: u64) Future<!usize> {
+    var nonblocking_ready: i32 = 0;
+    const preflight_leaf: AsyncWaitFdFuture = AsyncWaitFdFuture{
+        fd: 0 - 1,
+        interest: ASYNC_WAIT_INTEREST_NONE,
+        deadline_ms: deadline_ms,
+    };
+    const preflight_fut: Future<!usize> = preflight_leaf;
+    _ = try @await preflight_fut;
+    while true {
+        if nonblocking_ready == 0 {
+            _ = try async_fd_set_nonblocking(fd);
+            nonblocking_ready = 1;
+        }
+        var n: isize = 0;
+        const step: i32 = try async_fd_write_try_step(fd, data, count, &n);
+        if step == ASYNC_FD_IO_STEP_WAIT {
+            const wait_writable_leaf: AsyncWaitFdFuture = AsyncWaitFdFuture{
+                fd: fd,
+                interest: ASYNC_WAIT_INTEREST_WRITABLE,
+                deadline_ms: deadline_ms,
+            };
+            const wait_writable_fut: Future<!usize> = wait_writable_leaf;
+            _ = try @await wait_writable_fut;
+            continue;
+        }
+        return n as usize;
+    }
+}
+
+/// 返回已处于非阻塞模式 fd 的异步写 helper；调用方必须先保证 `fd` 设置了 `O_NONBLOCK`。
+/// 参数说明：`fd` 为目标文件描述符；`data`/`count` 为待写 buffer。
+/// 返回值说明：成功返回本次实际写入字节数；`EAGAIN`/`EWOULDBLOCK` 时等待下一次可写事件。
+export @async_fn fn async_fd_write_nonblocking_future(fd: i32, data: &const byte, count: usize) Future<!usize> {
+    while true {
+        var n: isize = 0;
+        const step: i32 = try async_fd_write_try_step(fd, data, count, &n);
+        if step == ASYNC_FD_IO_STEP_WAIT {
+            const wait_writable_leaf: AsyncWaitFdFuture = AsyncWaitFdFuture{
+                fd: fd,
+                interest: ASYNC_WAIT_INTEREST_WRITABLE,
+                deadline_ms: 0 as u64,
+                skip_ready_probe: 1,
+            };
+            const wait_writable_fut: Future<!usize> = wait_writable_leaf;
+            _ = try @await wait_writable_fut;
+            continue;
+        }
+        return n as usize;
+    }
+}
+
+/// 同上，写侧；配合 `async_fd_read_future` 用于 `@async_fn` 内 `try @await`。
+export @async_fn fn async_fd_write_future(fd: i32, data: &const byte, count: usize) Future<!usize> {
+    return try @await async_fd_write_deadline_future(fd, data, count, 0 as u64);
+}
+
+/// 异步执行一次 `send(2)`，供 socket transport 在 nonblocking 路径复用。
+/// 参数说明：`fd` 为已创建 socket；`data`/`count` 为本次要发送的 buffer；`deadline_ms` 为绝对毫秒 deadline，传 `0` 表示不设超时。
+/// 返回值说明：成功返回本次实际发送字节数；`EAGAIN`/`EWOULDBLOCK` 时返回 Pending，超时返回 `error.AsyncDeadlineExceeded`，其他错误原样透传。
+export @async_fn fn async_socket_send(fd: i32, data: &const byte, count: usize, deadline_ms: u64) Future<!usize> {
+    if fd < 0 {
+        return error.InvalidRequest;
+    }
+    var nonblocking_ready: i32 = 0;
+    while true {
+        const wait_writable_result: !usize = @await async_wait_writable(fd, deadline_ms);
+        _ = try wait_writable_result;
+        if nonblocking_ready == 0 {
+            _ = try async_fd_set_nonblocking(fd);
+            nonblocking_ready = 1;
+        }
+        while true {
+            const send_result: !isize = sys_send(fd, data, count, 0);
+            const n: isize = send_result catch |err| {
+                const err_id: u32 = @error_id(err);
+                if err_id == libc_EINTR as u32 {
+                    continue;
+                }
+                if err_id == libc_EAGAIN as u32 || err_id == libc_EWOULDBLOCK as u32 {
+                    break;
+                }
+                return err;
+            };
+            return n as usize;
+        }
+    }
+}
+
+/// 异步执行一次 `recv(2)`，供 socket transport 在 nonblocking 路径复用。
+/// 参数说明：`fd` 为已创建 socket；`buf`/`count` 为本次读取目标 buffer；`deadline_ms` 为绝对毫秒 deadline，传 `0` 表示不设超时。
+/// 返回值说明：成功返回本次实际接收字节数；`EAGAIN`/`EWOULDBLOCK` 时返回 Pending，超时返回 `error.AsyncDeadlineExceeded`，其他错误原样透传。
+export @async_fn fn async_socket_recv(fd: i32, buf: &byte, count: usize, deadline_ms: u64) Future<!usize> {
+    if fd < 0 {
+        return error.InvalidRequest;
+    }
+    var nonblocking_ready: i32 = 0;
+    while true {
+        const wait_readable_result: !usize = @await async_wait_readable(fd, deadline_ms);
+        _ = try wait_readable_result;
+        if nonblocking_ready == 0 {
+            _ = try async_fd_set_nonblocking(fd);
+            nonblocking_ready = 1;
+        }
+        while true {
+            const recv_result: !isize = sys_recv(fd, buf, count, 0);
+            const n: isize = recv_result catch |err| {
+                const err_id: u32 = @error_id(err);
+                if err_id == libc_EINTR as u32 {
+                    continue;
+                }
+                if err_id == libc_EAGAIN as u32 || err_id == libc_EWOULDBLOCK as u32 {
+                    break;
+                }
+                return err;
+            };
+            return n as usize;
+        }
+    }
+}
+
+/// 异步发起 nonblocking `connect(2)`，在 `EINPROGRESS` / `EAGAIN` 时注册可写兴趣并等待继续。
+/// 参数说明：`fd` 为待连接 socket；`addr` 为目标 `sockaddr` 指针；`addr_len` 为其长度；`deadline_ms` 为绝对毫秒 deadline，传 `0` 表示不设超时。
+/// 返回值说明：成功返回已连接的 `fd`；失败返回 connect 错误或 `error.AsyncDeadlineExceeded`，调用方负责按需关闭 `fd`。
+export @async_fn fn async_connect(fd: i32, addr: &void, addr_len: u32, deadline_ms: u64) Future<!i32> {
+    if fd < 0 || addr_len == 0 {
+        return error.InvalidRequest;
+    }
+    var nonblocking_ready: i32 = 0;
+    while true {
+        const wait_writable_result: !usize = @await async_wait_writable(fd, deadline_ms);
+        _ = try wait_writable_result;
+        if nonblocking_ready == 0 {
+            _ = try async_fd_set_nonblocking(fd);
+            nonblocking_ready = 1;
+        }
+        while true {
+            const connect_step: i32 = try async_connect_try_step(fd, addr, addr_len);
+            if connect_step == ASYNC_CONNECT_STEP_RETRY {
+                continue;
+            }
+            if connect_step == ASYNC_CONNECT_STEP_WAIT_WRITABLE {
+                break;
+            }
+            return fd;
+        }
+    }
+}
+
+/// 异步 accept 一个连接，并把监听 fd 与返回的连接 fd 都切到 nonblocking。
+/// 参数说明：`listen_fd` 为已进入 listen 状态的 socket fd，必须大于等于 0。
+/// 返回值说明：成功返回已接受且已设为 nonblocking 的连接 fd；`EAGAIN`/`EWOULDBLOCK` 时返回 Pending，其他错误原样透传。
+export @async_fn fn async_accept(listen_fd: i32) Future<!i32> {
+    if listen_fd < 0 {
+        return error.InvalidRequest;
+    }
+    var listen_nonblocking_ready: i32 = 0;
+    while true {
+        const wait_readable_result: !usize = @await async_wait_readable(listen_fd, 0 as u64);
+        _ = try wait_readable_result;
+        if listen_nonblocking_ready == 0 {
+            _ = try async_fd_set_nonblocking(listen_fd);
+            listen_nonblocking_ready = 1;
+        }
+        while true {
+            const accepted: !i32 = sys_accept(listen_fd, null, 0);
+            const fd: i32 = accepted catch |err| {
+                const err_id: u32 = @error_id(err);
+                if err_id == libc_EINTR as u32 {
+                    continue;
+                }
+                if err_id == libc_EAGAIN as u32 || err_id == libc_EWOULDBLOCK as u32 {
+                    break;
+                }
+                return err;
+            };
+
+            const accepted_nonblock: !i32 = async_fd_set_nonblocking(fd);
+            _ = accepted_nonblock catch |err| {
+                _ = sys_close(fd) catch {};
+                return err;
+            };
+            return fd;
+        }
+    }
+}
+
+/// 异步读到一个完整 HTTP 请求并返回解析结果。
+/// 参数说明：`fd` 为可读 fd；`base`/`cap`/`filled` 描述调用方持有的接收缓冲区与当前已填充字节数。
+/// 返回值说明：成功返回 `ParseResult`；遇 `EAGAIN`/`EWOULDBLOCK` 时挂起，连接关闭、解析失败和容量不足等错误原样透传。
+export @async_fn fn async_read_parse(fd: i32, base: &byte, cap: usize, filled: &usize) Future<!ParseResult> {
+    if fd < 0 || base == null || filled == null {
+        return error.InvalidRequest;
+    }
+
+    while true {
+        const cur: usize = *filled;
+        if cur > cap {
+            return error.PayloadTooLarge;
+        }
+        const sl: &[byte] = base[0: cur];
+        const parsed: !ParseResult = http_parse_request(sl);
+        if parsed.error_id == @error_id(error.IncompleteRequest) {
+            if cur >= cap {
+                return error.PayloadTooLarge;
+            }
+            var read_len: usize = cap - cur;
+            if read_len > 8192 {
+                read_len = 8192;
+            }
+            const read_dst: &byte = @ptr_from_usize(@usize_from_ptr(base as &void) + cur) as &byte;
+            const n: usize = try @await async_fd_read_future(fd, read_dst, read_len);
+            if n == 0 {
+                return error.ConnectionClosed;
+            }
+            *filled = cur + n;
+            continue;
+        }
+
+        var pr: ParseResult = try parsed;
+        if request_has_chunked_transfer_encoding(&pr.request) {
+            _ = try http_decode_chunked_body_inplace(&pr);
+        }
+        return pr;
+    }
+}
+
+/// 异步读到一个完整 HTTP 请求并把解析结果写入调用方提供的 `out`。
+/// 参数说明：`fd`/`base`/`cap`/`filled` 描述接收缓冲；`out` 用于承接解析结果；`err_out` 返回兼容旧调用点的错误码。
+/// 返回值说明：成功返回 `consumed`；若解析或连接错误需要兼容旧语义，则返回 `0` 并写入 `*err_out`；容量打满的 `PayloadTooLarge` 仍作为 Future 错误返回。
+export @async_fn fn async_read_parse_into(fd: i32, base: &byte, cap: usize, filled: &usize, out: &ParseResult, err_out: &u32) Future<!usize> {
+    if fd < 0 || base == null || filled == null || out == null || err_out == null {
+        return error.InvalidRequest;
+    }
+    while true {
+        const cur: usize = *filled;
+        if cur > cap {
+            *err_out = @error_id(error.PayloadTooLarge);
+            return 0 as usize;
+        }
+        const sl: &[byte] = base[0: cur];
+        const parsed: !void = http_parse_request_into(sl, out);
+        if parsed.error_id == @error_id(error.IncompleteRequest) {
+            if cur >= cap {
+                return error.PayloadTooLarge;
+            }
+            var read_len: usize = cap - cur;
+            if read_len > 8192 {
+                read_len = 8192;
+            }
+            const read_dst: &byte = @ptr_from_usize(@usize_from_ptr(base as &void) + cur) as &byte;
+            const read_result: !usize = @await async_fd_read_future(fd, read_dst, read_len);
+            if read_result.error_id != 0u32 {
+                if read_result.error_id == @error_id(error.Cancelled) {
+                    return error.Cancelled;
+                }
+                *err_out = @error_id(error.ConnectionClosed);
+                return 0 as usize;
+            }
+            const n: usize = read_result.value;
+            if n == 0 {
+                *err_out = @error_id(error.ConnectionClosed);
+                return 0 as usize;
+            }
+            *filled = cur + n;
+            continue;
+        }
+
+        _ = parsed catch |err| {
+            *err_out = @error_id(err);
+            return 0 as usize;
+        };
+        if request_has_chunked_transfer_encoding(&out.request) {
+            const decode_result: !usize = http_decode_chunked_body_inplace(out);
+            _ = decode_result catch {
+                *err_out = decode_result.error_id;
+                return 0 as usize;
+            };
+        }
+        *err_out = 0u32;
+        return out.consumed;
+    }
+}

@@ -1,0 +1,802 @@
+// lib/std/crypto/ed25519.uya — Ed25519 签名与验签（RFC 8032）
+//
+// 模块路径：use std.crypto.ed25519
+//
+// 依赖：std.crypto.curve25519（复用同一套 16×16 位域运算）与 std.crypto.sha512。
+// 结构参考 ref10 的「扩展坐标 + 统一加法」，标量乘用固定窗口双倍点（dbl-scalar-mult
+// 的简化版：k·B 用 4 位窗口预计算表，验签时用双标量乘的逐位版）。
+//
+// 曲线参数：−x² + y² = 1 + d·x²·y²，d = −121665/121666 mod p，p = 2^255 − 19。
+// 基点 B 与 8 的阶数关系、以及 SHA-512 的 clamp 规则均见 RFC 8032 §5.1。
+
+use std.crypto.curve25519;
+use std.crypto.curve25519.Gf;
+use std.crypto.ct_eq;
+use std.crypto.sha512;
+use std.crypto.Sha512Ctx;
+
+/// 点（扩展坐标）：X, Y, Z, T，满足 x = X/Z、y = Y/Z、T = XY/Z。
+export struct Ge {
+    x: Gf,
+    y: Gf,
+    z: Gf,
+    t: Gf,
+}
+
+/// d = −121665/121666 mod p，limb 形式（小端 16×16 位）。
+/// 值来自 ref10 的常量表，可用 Python 独立复算。
+const D_LIMBS: [i64: 16] = [
+    30883, 4953, 19914, 30187,
+    55467, 16705, 2637, 112,
+    59544, 30585, 16505, 36039,
+    65139, 11119, 27886, 20995,
+];
+
+/// 2d 的 limb 形式。
+const D2_LIMBS: [i64: 16] = [
+    61785, 9906, 39828, 60374,
+    45398, 33411, 5274, 224,
+    53552, 61171, 33010, 6542,
+    64743, 22239, 55772, 9222,
+];
+
+/// 基点 B 的 limb 形式（ref10 常量表）。
+const BX_LIMBS: [i64: 16] = [
+    54554, 36645, 11616, 51542,
+    42930, 38181, 51040, 26924,
+    56412, 64982, 57905, 49316,
+    21502, 52590, 14035, 8553,
+];
+
+const BY_LIMBS: [i64: 16] = [
+    26200, 26214, 26214, 26214,
+    26214, 26214, 26214, 26214,
+    26214, 26214, 26214, 26214,
+    26214, 26214, 26214, 26214,
+];
+
+/// √−1 mod p 的 limb 形式（开方时用）。
+const SQRTM1_LIMBS: [i64: 16] = [
+    41136, 18958, 6951, 50414,
+    58488, 44335, 6150, 12099,
+    55207, 15867, 153, 11085,
+    57099, 20417, 9344, 11139,
+];
+
+/// 点置为单位元 (0, 1, 1, 0)。
+/// 参数：p 为输出点。
+/// 返回值：无。
+export fn ge_zero(p: &Ge) void {
+    gf_zero(&p.x);
+    gf_one(&p.y);
+    gf_one(&p.z);
+    gf_zero(&p.t);
+}
+
+/// 落在曲线上的点（来自 radix-16 表或基点）：
+/// 给定 (x, y) 与 x·y 预计算值，构造 (X,Y,Z,T) = (x, y, 1, x·y)。
+/// 参数：p 为输出点，x/y 为仿射坐标。
+/// 返回值：无。
+fn ge_set(p: &Ge, x: &const Gf, y: &const Gf) void {
+    gf_copy(&p.x, x);
+    gf_copy(&p.y, y);
+    gf_one(&p.z);
+    gf_mul(&p.t, x, y);
+}
+
+/// 从常量 limb 表装载域元素。
+/// 参数：o 为输出域元素，src 为 limb 表。
+/// 返回值：无。
+fn gf_from_limbs(o: &Gf, src: &const i64) void {
+    var i: usize = 0;
+    while i < 16 {
+        o.v[i] = src[i];
+        i = i + 1;
+    }
+    gf_carry(o);
+    gf_carry(o);
+}
+
+/// 点加法 r = p + q（扩展坐标统一加法公式，RFC 8032 §5.1.4）。
+/// 参数：r 为输出，p/q 为输入。
+/// 返回值：无。
+export fn ge_add(r: &Ge, p: &const Ge, q: &const Ge) void {
+    var a: Gf = Gf{};
+    var b: Gf = Gf{};
+    var c: Gf = Gf{};
+    var d: Gf = Gf{};
+    var e: Gf = Gf{};
+    var f: Gf = Gf{};
+    var g: Gf = Gf{};
+    var h: Gf = Gf{};
+    var t1: Gf = Gf{};
+    var t2: Gf = Gf{};
+    var d2c: Gf = Gf{};
+    // EFD add-2008-hwcd-3（a = −1，扩展坐标 T = XY/Z）：
+    //   A = (Y1−X1)(Y2−X2), B = (Y1+X1)(Y2+X2), C = T1·2d·T2, D = 2·Z1·Z2
+    //   E = B−A, F = D−C, G = D+C, H = B+A
+    //   X3 = E·F, Y3 = G·H, T3 = E·H, Z3 = F·G
+    // 注意 T3 = E·H（不是 F·G）：把 T3 当 Z3、Z3 当 T3 会让投影坐标不自洽，
+    // 点的仿射坐标仍「看着像」，但后续加法/倍点立刻发散。
+    gf_add(&t1, &p.y, &p.x);
+    gf_add(&t2, &q.y, &q.x);
+    gf_mul(&b, &t1, &t2);            // B = (Y1+X1)(Y2+X2)
+    gf_sub(&t1, &p.y, &p.x);
+    gf_sub(&t2, &q.y, &q.x);
+    gf_mul(&a, &t1, &t2);            // A = (Y1−X1)(Y2−X2)
+    gf_from_limbs(&d2c, &D2_LIMBS[0]);
+    gf_mul(&c, &p.t, &q.t);
+    gf_mul(&c, &c, &d2c);            // C = T1·2d·T2
+    gf_mul(&d, &p.z, &q.z);
+    gf_add(&d, &d, &d);              // D = 2·Z1·Z2
+    gf_sub(&e, &b, &a);              // E = B−A
+    gf_sub(&f, &d, &c);              // F = D−C
+    gf_add(&g, &d, &c);              // G = D+C
+    gf_add(&h, &b, &a);              // H = B+A
+    gf_mul(&r.x, &e, &f);
+    gf_mul(&r.y, &g, &h);
+    gf_mul(&r.t, &e, &h);
+    gf_mul(&r.z, &f, &g);
+}
+
+/// 点倍加 r = 2p（dbl-2008-hwcd）。
+/// 参数：r 为输出，p 为输入。
+/// 返回值：无。
+export fn ge_double(r: &Ge, p: &const Ge) void {
+    var a: Gf = Gf{};
+    var b: Gf = Gf{};
+    var c: Gf = Gf{};
+    var d: Gf = Gf{};
+    var e: Gf = Gf{};
+    var f: Gf = Gf{};
+    var g: Gf = Gf{};
+    var h: Gf = Gf{};
+    var t: Gf = Gf{};
+    // EFD dbl-2008-hwcd（a = −1）：
+    //   A = X², B = Y², C = 2Z², D = −A, E = (X+Y)²−A−B, G = D+B, F = G−C, H = D−B
+    //   X3 = E·F, Y3 = G·H, T3 = E·H, Z3 = F·G
+    gf_sq(&a, &p.x);
+    gf_sq(&b, &p.y);
+    gf_sq(&c, &p.z);
+    gf_add(&c, &c, &c);              // C = 2Z²
+    gf_zero(&d);
+    gf_sub(&d, &d, &a);              // D = −A
+    gf_add(&t, &p.x, &p.y);
+    gf_sq(&t, &t);
+    gf_sub(&e, &t, &a);
+    gf_sub(&e, &e, &b);              // E = (X+Y)²−A−B
+    gf_add(&g, &d, &b);              // G = D+B
+    gf_sub(&f, &g, &c);              // F = G−C
+    gf_sub(&h, &d, &b);              // H = D−B
+    gf_mul(&r.x, &e, &f);
+    gf_mul(&r.y, &g, &h);
+    gf_mul(&r.t, &e, &h);
+    gf_mul(&r.z, &f, &g);
+}
+
+/// 点取反 r = −p（X ← −X，T ← −T）。
+/// 参数：r 为输出，p 为输入。
+/// 返回值：无。
+export fn ge_neg(r: &Ge, p: &const Ge) void {
+    var zero: Gf = Gf{};
+    gf_zero(&zero);
+    gf_sub(&r.x, &zero, &p.x);
+    gf_copy(&r.y, &p.y);
+    gf_copy(&r.z, &p.z);
+    gf_sub(&r.t, &zero, &p.t);
+}
+
+/// 标量乘 r = s·p（4 位固定窗口，左右各预计算 16 个倍数）。
+/// 参数：r 为输出，p 为基点，s 为 32 字节小端标量。
+/// 返回值：无。
+export fn ge_scalarmult(r: &Ge, p: &const Ge, s: &const byte) void {
+    // 预计算 [0]P … [15]P（下标 0 是单位元，见下：不进 table 而是靠 r 从零起步）
+    var table: [Ge: 16] = [Ge{}: 16];
+    var i: usize = 0;
+    while i < 16 {
+        ge_zero(&table[i]);
+        i = i + 1;
+    }
+    ge_zero(&table[0]);              // 0·P = 单位元（不是 1·P！）
+    ge_copy(&table[1], p);           // 1·P
+    i = 2;
+    while i < 16 {
+        ge_add(&table[i], &table[i - 1], p);
+        i = i + 1;
+    }
+    ge_zero(r);
+    // 从最高 nibble 到最低：r = 16r + table[nibble]
+    // r 初值为单位元（0），因此首轮 4 次倍点仍为单位元，等价于直接吃最高 nibble，
+    // 不会引入一个多余的 16 倍——这正是「高 nibble 先处理」的正确起点。
+    var nib_idx: i32 = 63;
+    while nib_idx >= 0 {
+        var dbl: usize = 0;
+        while dbl < 4 {
+            ge_double(r, r);
+            dbl = dbl + 1;
+        }
+        const nib: usize = ge_nibble(s, nib_idx as usize);
+        if nib != 0 && nib < 16 {
+            ge_add(r, r, &table[nib]);
+        }
+        nib_idx = nib_idx - 1;
+    }
+    // table 是 16 个点，逐个清零以免残留（Uya 无析构）
+    i = 0;
+    while i < 16 {
+        ge_zero(&table[i]);
+        i = i + 1;
+    }
+}
+
+/// 取标量的第 idx 个 4 位 nibble（小端）。
+/// 参数：s 为 32 字节小端标量，idx 为 nibble 下标（0..63）。
+/// 返回值：nibble 值。
+fn ge_nibble(s: &const byte, idx: usize) usize {
+    var tmp: [byte: 32] = [0: 32];
+    var k: usize = 0;
+    while k < 32 {
+        tmp[k] = s[k];
+        k = k + 1;
+    }
+    const byte_idx: usize = idx / 2;
+    if byte_idx >= 32 {
+        return 0;
+    }
+    const hi: usize = (tmp[byte_idx] as usize) >> (4 as i32);
+    const lo: usize = (tmp[byte_idx] as usize) & (15 as usize);
+    if (idx % (2 as usize)) == 0 {
+        return lo;
+    }
+    return hi;
+}
+
+/// 点拷贝。
+/// 参数：r 为输出，p 为输入。
+/// 返回值：无。
+export fn ge_copy(r: &Ge, p: &const Ge) void {
+    gf_copy(&r.x, &p.x);
+    gf_copy(&r.y, &p.y);
+    gf_copy(&r.z, &p.z);
+    gf_copy(&r.t, &p.t);
+}
+
+/// 点编码为 32 字节（y 的 255 位 + x 的最低位）。
+/// 参数：out 为 32 字节输出，p 为输入点。
+/// 返回值：无。
+export fn ge_pack(out: &byte, p: &Ge) void {
+    var zi: Gf = Gf{};
+    var x: Gf = Gf{};
+    var y: Gf = Gf{};
+    gf_inv(&zi, &p.z);
+    gf_mul(&x, &p.x, &zi);
+    gf_mul(&y, &p.y, &zi);
+    var buf: [byte: 32] = [0: 32];
+    gf_pack(&buf[0], &y);
+    var xb: [byte: 32] = [0: 32];
+    gf_pack(&xb[0], &x);
+    var i: usize = 0;
+    while i < 32 {
+        out[i] = buf[i];
+        i = i + 1;
+    }
+    out[31] = out[31] | ((xb[0] & 1 as byte) << 7);
+}
+
+/// 点解码（校验在曲线上），失败返回 false。
+/// 参数：p 为输出点，in 为 32 字节编码。
+/// 返回值：解码并校验成功返回 true。
+export fn ge_unpack(p: &Ge, in: &const byte) bool {
+    var buf: [byte: 32] = [0: 32];
+    var i: usize = 0;
+    while i < 32 {
+        buf[i] = in[i];
+        i = i + 1;
+    }
+    const sign: byte = (buf[31] >> 7) & 1 as byte;
+    buf[31] = buf[31] & (127 as byte);
+    var y: Gf = Gf{};
+    gf_unpack(&y, &buf[0]);
+    // x² = (y²−1)/(d·y²+1)
+    var y2: Gf = Gf{};
+    gf_sq(&y2, &y);
+    var num: Gf = Gf{};
+    var one: Gf = Gf{};
+    gf_one(&one);
+    gf_sub(&num, &y2, &one);
+    var d: Gf = Gf{};
+    gf_from_limbs(&d, &D_LIMBS[0]);
+    var den: Gf = Gf{};
+    gf_mul(&den, &d, &y2);
+    gf_add(&den, &den, &one);
+    var deni: Gf = Gf{};
+    gf_inv(&deni, &den);
+    var x2: Gf = Gf{};
+    gf_mul(&x2, &num, &deni);
+    // x = x2^((p+3)/8)：Ed25519 用 (p+3)/8，不是 ref10 的 (p−5)/8
+    var x: Gf = Gf{};
+    gf_pow_sqrt_exp(&x, &x2);
+    // 校验 x² == x2，否则乘 √−1 再试
+    var chk: Gf = Gf{};
+    gf_sq(&chk, &x);
+    var diff: Gf = Gf{};
+    gf_sub(&diff, &chk, &x2);
+    var dbuf: [byte: 32] = [0: 32];
+    gf_pack(&dbuf[0], &diff);
+    var zero: bool = true;
+    i = 0;
+    while i < 32 {
+        if dbuf[i] != 0 {
+            zero = false;
+        }
+        i = i + 1;
+    }
+    if !zero {
+        var sqrtm1: Gf = Gf{};
+        gf_from_limbs(&sqrtm1, &SQRTM1_LIMBS[0]);
+        gf_mul(&x, &x, &sqrtm1);
+        gf_sq(&chk, &x);
+        gf_sub(&diff, &chk, &x2);
+        gf_pack(&dbuf[0], &diff);
+        zero = true;
+        i = 0;
+        while i < 32 {
+            if dbuf[i] != 0 {
+                zero = false;
+            }
+            i = i + 1;
+        }
+        if !zero {
+            return false;
+        }
+    }
+    // x 的符号与编码的最高位一致
+    var xb: [byte: 32] = [0: 32];
+    gf_pack(&xb[0], &x);
+    if (xb[0] & 1 as byte) != sign {
+        var nzero: Gf = Gf{};
+        gf_zero(&nzero);
+        gf_sub(&x, &nzero, &x);
+    }
+    // x == 0 且 sign == 1 是非法编码
+    var zbuf: [byte: 32] = [0: 32];
+    gf_pack(&zbuf[0], &x);
+    var xzero: bool = true;
+    i = 0;
+    while i < 32 {
+        if zbuf[i] != 0 {
+            xzero = false;
+        }
+        i = i + 1;
+    }
+    if xzero && sign == (1 as byte) {
+        return false;
+    }
+    ge_set(p, &x, &y);
+    return true;
+}
+
+/// 基点。
+/// 参数：p 为输出点。
+/// 返回值：无。
+export fn ge_base(p: &Ge) void {
+    var bx: Gf = Gf{};
+    var by: Gf = Gf{};
+    gf_from_limbs(&bx, &BX_LIMBS[0]);
+    gf_from_limbs(&by, &BY_LIMBS[0]);
+    ge_set(p, &bx, &by);
+}
+
+/// 从 SHA-512 摘要按 RFC 8032 取标量：低 32 字节 clamp。
+/// 参数：s 为 32 字节输出标量，h 为 64 字节摘要。
+/// 返回值：无。
+fn ed25519_scalar_from_hash(s: &byte, h: &const byte) void {
+    var i: usize = 0;
+    while i < 32 {
+        s[i] = h[i];
+        i = i + 1;
+    }
+    s[0] = s[0] & (248 as byte);
+    s[31] = s[31] & (63 as byte);
+    s[31] = s[31] | (64 as byte);
+}
+
+/// 计算公钥：pk = clamp(SHA-512(sk)[0..32]) · B。
+/// 参数：pk 为 32 字节输出，sk 为 32 字节私钥种子。
+/// 返回值：无。
+export fn ed25519_public_key(pk: &byte, sk: &const byte) void {
+    var h: [byte: 64] = [0: 64];
+    var skv: [byte: 32] = [0: 32];
+    var i: usize = 0;
+    while i < 32 {
+        skv[i] = sk[i];
+        i = i + 1;
+    }
+    sha512_digest(skv[0: 32], h[0: 64]);
+    var a: [byte: 32] = [0: 32];
+    ed25519_scalar_from_hash(&a[0], &h[0]);
+    var b: Ge = Ge{};
+    ge_base(&b);
+    var p: Ge = Ge{};
+    ge_scalarmult(&p, &b, &a[0]);
+    ge_pack(pk, &p);
+}
+
+/// 标量归约：r mod L（L = 2^252 + 27742317777372353535851937790883648493）。
+/// 用「逐位相加」的朴素实现：把 512 位输入按位累加进 256 位结果，
+/// 每当结果 ≥ L 就减去 L。位循环 512 次，足够快且不依赖宽整数库。
+/// 参数：out 为 32 字节输出标量，in 为 64 字节输入。
+/// 返回值：无。
+fn ed25519_scalar_reduce(out: &byte, in: &const byte) void {
+    // L 的 limb 形式（16×16 位，小端）
+    const L_LIMBS: [i64: 16] = [
+    54253, 23797, 25370, 22546,
+    40150, 41719, 63966, 5342,
+    0, 0, 0, 0,
+    0, 0, 0, 4096,
+    ];
+    var res: [i64: 16] = [0: 16];
+    var bit: i32 = 511;
+    while bit >= 0 {
+        // res = res * 2
+        var carry: i64 = 0;
+        var i: usize = 0;
+        while i < 16 {
+            const v: i64 = res[i] * 2 + carry;
+            res[i] = v & (65535 as i64);
+            carry = v >> (16 as i32);
+            i = i + 1;
+        }
+        // 加上输入的第 bit 位
+        const byte_idx: usize = (bit / (8 as i32)) as usize;
+        const bit_idx: i32 = bit % (8 as i32);
+        const b: i64 = ((in[byte_idx] as i64) >> ((bit_idx as i32))) & (1 as i64);
+        if b != 0 {
+            res[0] = res[0] + 1;
+        }
+        // 归一 + 若 ≥ L 则减 L（做两轮，确保收敛）
+        var round: usize = 0;
+        while round < 2 {
+            var c: i64 = 0;
+            i = 0;
+            while i < 16 {
+                res[i] = res[i] + c;
+                c = res[i] >> (16 as i32);
+                res[i] = res[i] & (65535 as i64);
+                i = i + 1;
+            }
+            // 试减 L 并看借位
+            var m: [i64: 16] = [0: 16];
+            var borrow: i64 = 0;
+            i = 0;
+            while i < 16 {
+                const v: i64 = res[i] - L_LIMBS[i] - borrow;
+                if v < 0 {
+                    m[i] = v + 65536;
+                    borrow = 1;
+                } else {
+                    m[i] = v;
+                    borrow = 0;
+                }
+                i = i + 1;
+            }
+            if borrow == 0 {
+                i = 0;
+                while i < 16 {
+                    res[i] = m[i];
+                    i = i + 1;
+                }
+            }
+            round = round + 1;
+        }
+        bit = bit - 1;
+    }
+    var i2: usize = 0;
+    while i2 < 16 {
+        out[i2 * 2] = ((res[i2] & (255 as i64)) as! byte).value;
+        out[i2 * 2 + 1] = (((res[i2] >> (8 as i32)) & (255 as i64)) as! byte).value;
+        i2 = i2 + 1;
+    }
+}
+
+/// 生成签名（RFC 8032 §5.1.6）。
+/// 参数：sig 为 64 字节输出，msg/msg_len 为消息，sk 为 32 字节私钥种子，pk 为 32 字节公钥。
+/// 返回值：无。
+export fn ed25519_sign(sig: &byte, msg: &const byte, msg_len: usize, sk: &const byte, pk: &const byte) void {
+    var h: [byte: 64] = [0: 64];
+    var skv: [byte: 32] = [0: 32];
+    var i: usize = 0;
+    while i < 32 {
+        skv[i] = sk[i];
+        i = i + 1;
+    }
+    sha512_digest(skv[0: 32], h[0: 64]);
+    var a: [byte: 32] = [0: 32];
+    ed25519_scalar_from_hash(&a[0], &h[0]);
+
+    // r = SHA-512(h[32..64] || msg) mod L
+    var rctx: Sha512Ctx = Sha512Ctx{};
+    rctx.init();
+    rctx.update(h[32: 32]);
+    rctx.update(msg[0: msg_len]);
+    var rh: [byte: 64] = [0: 64];
+    rctx.final(rh[0: 64]);
+    var r: [byte: 32] = [0: 32];
+    ed25519_scalar_reduce(&r[0], &rh[0]);
+
+    // R = r·B
+    var b: Ge = Ge{};
+    ge_base(&b);
+    var R: Ge = Ge{};
+    ge_scalarmult(&R, &b, &r[0]);
+    ge_pack(&sig[0], &R);
+
+    // S = (r + SHA-512(R || pk || msg) mod L · a) mod L
+    var kctx: Sha512Ctx = Sha512Ctx{};
+    kctx.init();
+    kctx.update(sig[0: 32]);
+    kctx.update(pk[0: 32]);
+    kctx.update(msg[0: msg_len]);
+    var kh: [byte: 64] = [0: 64];
+    kctx.final(kh[0: 64]);
+    var k: [byte: 32] = [0: 32];
+    ed25519_scalar_reduce(&k[0], &kh[0]);
+    var ka: [byte: 64] = [0: 64];
+    ed25519_scalar_mul(&ka[0], &k[0], &a[0]);
+    var s: [byte: 32] = [0: 32];
+    ed25519_scalar_add(&s[0], &ka[0], &r[0]);
+    i = 0;
+    while i < 32 {
+        sig[32 + i] = s[i];
+        i = i + 1;
+    }
+}
+
+/// 两个 32 字节标量相乘（mod L），输出 64 字节中间积（未归约）。
+/// 参数：out 为 64 字节输出，a/b 为 32 字节标量。
+/// 返回值：无。
+fn ed25519_scalar_mul(out: &byte, a: &const byte, b: &const byte) void {
+    // 朴素多字节乘法：逐 limb（16 位）卷积，结果 ≤ 32 limb = 512 位
+    var t: [i64: 32] = [0: 32];
+    var i: usize = 0;
+    while i < 16 {
+        var j: usize = 0;
+        while j < 16 {
+            const ai: i64 = (a[i * 2] as i64) + (((a[i * 2 + 1] as i64)) << 8);
+            const bj: i64 = (b[j * 2] as i64) + (((b[j * 2 + 1] as i64)) << 8);
+            t[i + j] = t[i + j] + (ai * bj);
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    // 进位
+    var c: i64 = 0;
+    i = 0;
+    while i < 32 {
+        t[i] = t[i] + c;
+        c = t[i] >> (16 as i32);
+        t[i] = t[i] & (65535 as i64);
+        i = i + 1;
+    }
+    i = 0;
+    while i < 32 {
+        out[i * 2] = ((t[i] & (255 as i64)) as! byte).value;
+        out[i * 2 + 1] = (((t[i] >> (8 as i32)) & (255 as i64)) as! byte).value;
+        i = i + 1;
+    }
+}
+
+/// 标量加法 s = (a + b) mod L，a 为 64 字节中间积、b 为 32 字节标量。
+/// 参数：out 为 32 字节输出，a 为 64 字节加数，b 为 32 字节加数。
+/// 返回值：无。
+fn ed25519_scalar_add(out: &byte, a: &const byte, b: &const byte) void {
+    // 64 字节 a 先按 16 位 limb 化成 32 项，与 b 相加（b 扩成 64 字节），再整体归约
+    var sum: [byte: 65] = [0: 65];
+    var carry: i64 = 0;
+    var i: usize = 0;
+    while i < 32 {
+        const av: i64 = (a[i * 2] as i64) + (((a[i * 2 + 1] as i64)) << 8);
+        var bv: i64 = 0;
+        if i < 16 {
+            bv = (b[i * 2] as i64) + (((b[i * 2 + 1] as i64)) << 8);
+        }
+        const s: i64 = av + bv + carry;
+        sum[i * 2] = ((s & (255 as i64)) as! byte).value;
+        sum[i * 2 + 1] = (((s >> (8 as i32)) & (255 as i64)) as! byte).value;
+        carry = s >> 16;
+        i = i + 1;
+    }
+    sum[64] = carry as byte;
+    // 归约 mod L（用 65 字节按位归约）
+    ed25519_scalar_reduce_wide(out, &sum[0], 65);
+}
+
+/// 把任意长度（≤ 65 字节）的大端无关小端数按位归约 mod L。
+/// 参数：out 为 32 字节输出，in 为输入字节（小端），n 为字节数。
+/// 返回值：无。
+fn ed25519_scalar_reduce_wide(out: &byte, in: &const byte, n: usize) void {
+    const L_LIMBS: [i64: 16] = [
+    54253, 23797, 25370, 22546,
+    40150, 41719, 63966, 5342,
+    0, 0, 0, 0,
+    0, 0, 0, 4096,
+    ];
+    var res: [i64: 16] = [0: 16];
+    var bit: i32 = ((n * 8) as i32) - 1;
+    while bit >= 0 {
+        var carry: i64 = 0;
+        var i: usize = 0;
+        while i < 16 {
+            const v: i64 = res[i] * 2 + carry;
+            res[i] = v & (65535 as i64);
+            carry = v >> (16 as i32);
+            i = i + 1;
+        }
+        const byte_idx: usize = (bit / (8 as i32)) as usize;
+        const bit_idx: i32 = bit % (8 as i32);
+        const b: i64 = ((in[byte_idx] as i64) >> ((bit_idx as i32))) & (1 as i64);
+        if b != 0 {
+            res[0] = res[0] + 1;
+        }
+        var round: usize = 0;
+        while round < 2 {
+            var c: i64 = 0;
+            i = 0;
+            while i < 16 {
+                res[i] = res[i] + c;
+                c = res[i] >> (16 as i32);
+                res[i] = res[i] & (65535 as i64);
+                i = i + 1;
+            }
+            var m: [i64: 16] = [0: 16];
+            var borrow: i64 = 0;
+            i = 0;
+            while i < 16 {
+                const v: i64 = res[i] - L_LIMBS[i] - borrow;
+                if v < 0 {
+                    m[i] = v + 65536;
+                    borrow = 1;
+                } else {
+                    m[i] = v;
+                    borrow = 0;
+                }
+                i = i + 1;
+            }
+            if borrow == 0 {
+                i = 0;
+                while i < 16 {
+                    res[i] = m[i];
+                    i = i + 1;
+                }
+            }
+            round = round + 1;
+        }
+        bit = bit - 1;
+    }
+    var i2: usize = 0;
+    while i2 < 16 {
+        out[i2 * 2] = ((res[i2] & (255 as i64)) as! byte).value;
+        out[i2 * 2 + 1] = (((res[i2] >> (8 as i32)) & (255 as i64)) as! byte).value;
+        i2 = i2 + 1;
+    }
+}
+
+/// 判定点是否为小阶点（阶整除 8）：8·P == 单位元。
+/// 参数：p 为待判定点（须已成功解码）。
+/// 返回值：是小阶点返回 true。
+export fn ge_is_small_order(p: &const Ge) bool {
+    // 8·P == 单位元 ⇔ P 的阶整除 8。
+    var q: Ge = Ge{};
+    ge_copy(&q, p);
+    var i: usize = 0;
+    while i < 3 {
+        ge_double(&q, &q);
+        i = i + 1;
+    }
+    // 单位元的仿射坐标是 (0, 1)，射影坐标下即 X == 0 且 Y == Z。
+    //
+    // **不能逐 limb 直接比较 y 与 z**：域元素允许冗余表示（gf_carry 只把 limb 收进
+    // [0, 2^16)，并不做模 p 的唯一化），同一个值可以有多种 limb 组合，逐 limb 比会漏判。
+    // 正确做法是拿**完全归约后的规范形式**比：gf_pack 会把值约到 [0, p)。
+    var xb: [byte: 32] = [0: 32];
+    gf_pack(&xb[0], &q.x);
+    var xzero: bool = true;
+    i = 0;
+    while i < 32 {
+        if xb[i] != 0 {
+            xzero = false;
+        }
+        i = i + 1;
+    }
+    if !xzero {
+        return false;
+    }
+    var yb: [byte: 32] = [0: 32];
+    var zb: [byte: 32] = [0: 32];
+    // gf_pack 会就地修改入参，因此先各拷一份
+    var ycopy: Gf = Gf{};
+    var zcopy: Gf = Gf{};
+    gf_copy(&ycopy, &q.y);
+    gf_copy(&zcopy, &q.z);
+    gf_pack(&yb[0], &ycopy);
+    gf_pack(&zb[0], &zcopy);
+    var same: bool = true;
+    i = 0;
+    while i < 32 {
+        if yb[i] != zb[i] {
+            same = false;
+        }
+        i = i + 1;
+    }
+    return same;
+}
+
+/// 验签（RFC 8032 §5.1.7）。
+/// 参数：sig 为 64 字节签名，msg/msg_len 为消息，pk 为 32 字节公钥。
+/// 返回值：签名有效返回 true。
+export fn ed25519_verify(sig: &const byte, msg: &const byte, msg_len: usize, pk: &const byte) bool {
+    // S 必须 < L
+    const L_BYTES: [byte: 32] = [
+        0xed, 0xd3, 0xf5, 0x5c, 0x1a, 0x63, 0x12, 0x58,
+        0xd6, 0x9c, 0xf7, 0xa2, 0xde, 0xf9, 0xde, 0x14,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10,
+    ];
+    var i: i32 = 31;
+    while i >= 0 {
+        const sv: byte = sig[32 + i as usize];
+        const lv: byte = L_BYTES[i as usize];
+        if sv < lv {
+            break;
+        }
+        if sv > lv {
+            return false;
+        }
+        i = i - 1;
+    }
+    var R: Ge = Ge{};
+    if !ge_unpack(&R, &sig[0]) {
+        return false;
+    }
+    var A: Ge = Ge{};
+    if !ge_unpack(&A, pk) {
+        return false;
+    }
+    // RFC 8032 §5.1.7 要求：若 A 或 R 是**小阶点**（阶整除 8），验签必须失败。
+    // 少了这一步，「全零编码」这种 4 阶点就能当公钥/签名前半段用（它确实是一条合法
+    // 曲线点，编码也合法），于是可以被构造出对任意消息都通过的伪造签名。
+    // 判定法：8·P == 单位元 当且仅当 P 的阶整除 8。
+    if ge_is_small_order(&A) || ge_is_small_order(&R) {
+        return false;
+    }
+    // k = SHA-512(R || pk || msg) mod L
+    var kctx: Sha512Ctx = Sha512Ctx{};
+    kctx.init();
+    kctx.update(sig[0: 32]);
+    kctx.update(pk[0: 32]);
+    kctx.update(msg[0: msg_len]);
+    var kh: [byte: 64] = [0: 64];
+    kctx.final(kh[0: 64]);
+    var k: [byte: 32] = [0: 32];
+    ed25519_scalar_reduce(&k[0], &kh[0]);
+    // 校验 S·B == R + k·A
+    var b: Ge = Ge{};
+    ge_base(&b);
+    var s: [byte: 32] = [0: 32];
+    i = 0;
+    while i < 32 {
+        s[i as usize] = sig[32 + i as usize];
+        i = i + 1;
+    }
+    var lhs: Ge = Ge{};
+    ge_scalarmult(&lhs, &b, &s[0]);
+    var ka: Ge = Ge{};
+    ge_scalarmult(&ka, &A, &k[0]);
+    var rhs: Ge = Ge{};
+    ge_add(&rhs, &R, &ka);
+    var lb: [byte: 32] = [0: 32];
+    var rb: [byte: 32] = [0: 32];
+    ge_pack(&lb[0], &lhs);
+    ge_pack(&rb[0], &rhs);
+    return ct_eq(&lb[0], &rb[0], 32);
+}

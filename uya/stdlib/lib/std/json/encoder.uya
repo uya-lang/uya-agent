@@ -1,0 +1,352 @@
+// std.json.encoder - JSON 编码器
+// 模块路径：lib/std/json/encoder.uya → use std.json.encoder;
+// 对外只保留 to_json(arena, obj) !&[byte]、from_json(arena, buffer) !T；内部用宏/内联实现。
+
+use libc.strtod;
+use std.json.value.JsonValue;
+use std.json.value.JsonStrView;
+use std.json.value.JsonObject;
+use std.json.errors;
+use std.json.parser.parse;
+use std.json.macros;
+use std.mem.arena.Arena;
+use std.mem.arena.arena_alloc;
+
+// JSON 语法字符（ASCII），便于阅读与维护
+const _J_QUOT: byte = 34;
+const _J_COLON: byte = 58;
+const _J_COMMA: byte = 44;
+const _J_LBRACK: byte = 91;
+const _J_RBRACK: byte = 93;
+export const _J_LBRACE: byte = 123;
+export const _J_RBRACE: byte = 125;
+const _J_BACKSLASH: byte = 92;
+const _J_N: byte = 110;
+const _J_R: byte = 114;
+const _J_T: byte = 116;
+const _J_U: byte = 117;
+const _J_L: byte = 108;
+const _J_E: byte = 101;
+const _J_F: byte = 102;
+const _J_A: byte = 97;
+const _J_S: byte = 115;
+
+// 字符串编码：连续无需转义的 ASCII 段用 16 字节块扫描（与 parser 中 skip_string_unescaped 对称；遇 `"` `\` `\n` `\r` `\t` 回退标量）
+type JsonEscVec16 = @vector(u8, 16);
+type JsonEscMask16 = @mask(16);
+
+export struct JsonWriter {
+    buf: &byte,
+    cap: usize,
+    used: usize,
+    overflow: bool,
+}
+
+fn write_byte(w: &JsonWriter, b: byte) void {
+    if w.overflow { return; }
+    if w.used >= w.cap { w.overflow = true; return; }
+    w.buf[w.used] = b;
+    w.used = w.used + 1;
+}
+
+// 连续写入：一次容量判定后拷贝（json_write_str_view 向量段每 16 字节调用，避免逐字节 write_byte）
+fn json_buf_write_bytes(w: &JsonWriter, ptr: &byte, len: usize) void {
+    if w.overflow { return; }
+    if len == 0 { return; }
+    if w.used + len > w.cap { w.overflow = true; return; }
+    var i: usize = 0;
+    while i < len {
+        w.buf[w.used + i] = ptr[i];
+        i = i + 1;
+    }
+    w.used = w.used + len;
+}
+
+/// 写单个字节（用于手写 to_json 时写 `{` `}` `"` `:` `,` 等）
+export fn json_write_byte(w: &JsonWriter, b: byte) void {
+    write_byte(w, b);
+}
+
+export fn json_writer_init(w: &JsonWriter, buf: &byte, cap: usize) void {
+    if w == null { return; }
+    w.buf = buf;
+    w.cap = cap;
+    w.used = 0;
+    w.overflow = false;
+}
+
+export fn json_write_null(w: &JsonWriter) void {
+    write_byte(w, _J_N);
+    write_byte(w, _J_U);
+    write_byte(w, _J_L);
+    write_byte(w, _J_L);
+}
+
+export fn json_write_bool(w: &JsonWriter, v: bool) void {
+    if v {
+        write_byte(w, _J_T);
+        write_byte(w, _J_R);
+        write_byte(w, _J_U);
+        write_byte(w, _J_E);
+    } else {
+        write_byte(w, _J_F);
+        write_byte(w, _J_A);
+        write_byte(w, _J_L);
+        write_byte(w, _J_S);
+        write_byte(w, _J_E);
+    }
+}
+
+fn write_digit(w: &JsonWriter, d: i32) void {
+    write_byte(w, (d + 48) as byte);
+}
+
+fn json_write_i64_impl(w: &JsonWriter, v: i64) void {
+    if v == 0 {
+        write_byte(w, 48);
+        return;
+    }
+    var n: i64 = v;
+    if n < 0 {
+        write_byte(w, 45);
+        n = 0 - n;
+    }
+    var stack: [byte: 24] = [];
+    var i: i32 = 0;
+    while n != 0 && i < 24 {
+        stack[i] = ((n % (10 as i64)) as! byte).value;
+        n = n / (10 as i64);
+        i = i + 1;
+    }
+    while i > 0 {
+        i = i - 1;
+        if i >= 0 && i < 24 {
+            write_byte(w, stack[i] + 48);
+        }
+    }
+}
+
+export fn json_write_i64(w: &JsonWriter, v: i64) void {
+    json_write_i64_impl(w, v);
+}
+
+fn json_write_number_text(w: &JsonWriter, s: JsonStrView) void {
+    if s.ptr == null || s.len == 0 {
+        json_write_null(w);
+        return;
+    }
+    json_buf_write_bytes(w, s.ptr, s.len);
+}
+
+fn json_write_f64_impl(w: &JsonWriter, v: f64) void {
+    if v != v {
+        json_write_null(w);
+        return;
+    }
+    if v >= 1.0e15 || v <= -1.0e15 || (v > -0.0001 && v < 0.0001 && v != 0.0) {
+        json_write_null(w);
+        return;
+    }
+    var x: i64 = v as i64;
+    json_write_i64_impl(w, x);
+    var frac: f64 = v - (x as f64);
+    if frac < 0.0 { frac = 0.0 - frac; }
+    if frac >= 0.0000001 {
+        write_byte(w, 46);
+        var k: i32 = 0;
+        while k < 15 && frac >= 0.0000001 {
+            frac = frac * 10.0;
+            const d: i32 = frac as i32;
+            write_digit(w, d);
+            frac = frac - (d as f64);
+            k = k + 1;
+        }
+    }
+}
+
+export fn json_write_f64(w: &JsonWriter, v: f64) void {
+    json_write_f64_impl(w, v);
+}
+
+export fn json_write_str_view(w: &JsonWriter, s: JsonStrView) void {
+    write_byte(w, _J_QUOT);
+    var i: usize = 0;
+    while i < s.len {
+        while i + 16 <= s.len {
+            const c: JsonEscVec16 = @vector.load(&s.ptr[i]);
+            const m: JsonEscMask16 = (c != @vector.splat(34u8)) & (c != @vector.splat(92u8)) & (c != @vector.splat(10u8)) & (c != @vector.splat(13u8)) & (c != @vector.splat(9u8));
+            if @vector.all(m) {
+                json_buf_write_bytes(w, &s.ptr[i], 16);
+                i = i + 16;
+            } else {
+                break;
+            }
+        }
+        if i >= s.len { break; }
+        const b: byte = s.ptr[i];
+        if b == _J_QUOT { write_byte(w, _J_BACKSLASH); write_byte(w, _J_QUOT); }
+        else if b == _J_BACKSLASH { write_byte(w, _J_BACKSLASH); write_byte(w, _J_BACKSLASH); }
+        else if b == 10 { write_byte(w, _J_BACKSLASH); write_byte(w, _J_N); }
+        else if b == 13 { write_byte(w, _J_BACKSLASH); write_byte(w, _J_R); }
+        else if b == 9 { write_byte(w, _J_BACKSLASH); write_byte(w, _J_T); }
+        else { write_byte(w, b); }
+        i = i + 1;
+    }
+    write_byte(w, _J_QUOT);
+}
+
+/// 写 JSON 键（双引号 + 转义键字节 + 双引号 + 冒号），供 to_json_reflect 等宏生成代码使用
+export fn json_write_key(w: &JsonWriter, ptr: &byte, len: usize) void {
+    json_write_str_view(w, JsonStrView{ ptr: ptr, len: len });
+    write_byte(w, _J_COLON);
+}
+
+fn json_encode_value_inner(w: &JsonWriter, v: &JsonValue) void {
+    const val: JsonValue = v[0];
+    match val {
+        .json_null(_) => { json_write_null(w); },
+        .bool_val(x) => { json_write_bool(w, x); },
+        .int_val(x) => { json_write_i64(w, x); },
+        .float_val(x) => { json_write_f64(w, x); },
+        .num_text(s) => { json_write_number_text(w, s); },
+        .str(s) => { json_write_str_view(w, s); },
+        .arr(a) => {
+            write_byte(w, _J_LBRACK);
+            var i: usize = 0;
+            while i < a.len {
+                if i > 0 { write_byte(w, _J_COMMA); }
+                json_encode_value_inner(w, &a.items[i]);
+                i = i + 1;
+            }
+            write_byte(w, _J_RBRACK);
+        },
+        .obj(o) => {
+            write_byte(w, _J_LBRACE);
+            var i: usize = 0;
+            while i < o.len {
+                if i > 0 { write_byte(w, _J_COMMA); }
+                json_write_str_view(w, o.pairs[i].key);
+                write_byte(w, _J_COLON);
+                json_encode_value_inner(w, &o.pairs[i].value);
+                i = i + 1;
+            }
+            write_byte(w, _J_RBRACE);
+        },
+    }
+}
+
+fn json_write_value(w: &JsonWriter, v: &JsonValue) void {
+    json_encode_value_inner(w, v);
+}
+
+/// JsonValue 树编码到缓冲区（供测试与兼容用；结构体请用 to_json）
+export fn encode_to(v: &JsonValue, buf: &byte, cap: usize) !usize {
+    var w: JsonWriter = JsonWriter{ buf: buf, cap: cap, used: 0, overflow: false };
+    json_writer_init(&w, buf, cap);
+    json_write_value(&w, v);
+    if w.overflow { return error.BufferTooSmall; }
+    return w.used;
+}
+
+// 单次编码最大字节数；to_json / encode 内部分配用
+const ENCODE_ARENA_MAX: usize = 65536;
+
+/// 在 arena 中编码 JsonValue 并返回视图（供测试与兼容用；结构体请用 to_json）
+export fn encode_into_arena(ar: &Arena, v: &JsonValue) !JsonStrView {
+    const buf: &byte = arena_alloc(ar, ENCODE_ARENA_MAX);
+    if buf == null { return error.BufferTooSmall; }
+    const n: usize = try encode_to(v, buf, ENCODE_ARENA_MAX);
+    return JsonStrView{ ptr: buf, len: n };
+}
+
+/// 在 arena 中编码 JsonValue 并返回 &[byte]（供测试与兼容用；结构体请用 to_json）
+export fn encode(ar: &Arena, v: &JsonValue) !&[byte] {
+    const view: JsonStrView = try encode_into_arena(ar, v);
+    return &view.ptr[0: view.len];
+}
+
+/// 将对象 obj 序列化为 JSON 字节切片，生命周期与 arena 一致。内部由 encode_to_to_json 宏按类型 T 展开编码。
+export fn to_json<T>(ar: &Arena, obj: T) !&[byte] {
+    const buf: &byte = arena_alloc(ar, ENCODE_ARENA_MAX);
+    if buf == null { return error.BufferTooSmall; }
+    const n: usize = try encode_to_to_json(T, &obj, buf, ENCODE_ARENA_MAX);
+    return &buf[0: n];
+}
+
+// 结构体解码：在调用处由 codegen 内联展开，from_json 内部使用
+fn __decode_json<T>(ar: &Arena, v: &JsonValue) !T {
+    _ = ar;
+    _ = v;
+    return error.Unsupported;
+}
+
+/// 将 JSON 字节切片反序列化为类型 T 的值。内部用宏/内联展开解码。
+export fn from_json<T>(ar: &Arena, buffer: &[byte]) !T {
+    const v: JsonValue = try parse(ar, buffer.ptr, buffer.len);
+    return __decode_json<T>(ar, &v);
+}
+
+// --- from_json 内联解码用（codegen 生成代码会调用，需 export 以便链接）---
+
+export fn json_str_view_eq(s: JsonStrView, ptr: &byte, len: usize) bool {
+    if s.len != len { return false; }
+    var i: usize = 0;
+    while i < len {
+        if s.ptr[i] != ptr[i] { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+export fn json_object_find_index(o: &JsonObject, key_ptr: &byte, key_len: usize) !usize {
+    var i: usize = 0;
+    while i < o.len {
+        if json_str_view_eq(o.pairs[i].key, key_ptr, key_len) {
+            return i;
+        }
+        i = i + 1;
+    }
+    return error.MissingField;
+}
+
+export fn json_expect_i64(v: &JsonValue) !i64 {
+    match v[0] {
+        .int_val(x) => { return x; },
+        else => { return error.WrongType; },
+    }
+}
+
+export fn json_expect_str(v: &JsonValue) !JsonStrView {
+    match v[0] {
+        .str(s) => { return s; },
+        else => { return error.WrongType; },
+    }
+}
+
+export fn json_expect_bool(v: &JsonValue) !bool {
+    match v[0] {
+        .bool_val(x) => { return x; },
+        else => { return error.WrongType; },
+    }
+}
+
+export fn json_expect_f64(v: &JsonValue) !f64 {
+    match v[0] {
+        .float_val(x) => { return x; },
+        .int_val(x) => { return x as f64; },
+        .num_text(s) => {
+            if s.len == 0 || s.len >= 255usize {
+                return error.WrongType;
+            }
+            var buf: [byte: 256] = [];
+            var i: usize = 0usize;
+            while i < s.len {
+                buf[i] = s.ptr[i];
+                i = i + 1usize;
+            }
+            buf[s.len] = 0 as byte;
+            return strtod(&buf[0], null);
+        },
+        else => { return error.WrongType; },
+    }
+}

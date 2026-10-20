@@ -123,8 +123,10 @@ uya-agent 是一个**纯 Uya 源码**实现的命令行编程 agent：给它一�
 | **函数表是定长表**（`FUNCTION_TABLE_SIZE`，无开关） | 报「函数表容量不足，请增大 FUNCTION_TABLE_SIZE」，**报错点落在标准库里** | **已修**（`fc577783`：checker 的五张定长表改成通用动态哈希表）：本仓实测「净增 50 个函数 + 清缓存重编」通过 ⇒ 「净增 0」那条纪律**不再需要**（当时的写法：合并语义同族函数、就地展开只调一两处的转发、删零调用死函数） |
 | **codegen 的 reachable 函数表**（`C99_MAX_REACHABLE_FUNCTIONS`，0.10.x 是 4096） | 超过 4096 个可达函数时**静默丢函数**：定义与原型都不发射、调用点还在 ⇒ 宿主 C 报 `implicit declaration` + `invalid initializer`，报错点指向调用处 | **已修**（`1267dbc6`：按 checker 的实际条数分配 + 满时 2 倍扩容）；踩这条边界时本仓有 3600+ 个函数（现 2789，口径见 `make lint-size-all`） |
 
-> 编译器在 `/home/winger/uya/uya`（`bin/uya`，`git describe` = `v0.10.3-7-gbb410f82`），本仓
-> `Makefile` 的 `UYA` / `UYA_ROOT` 默认就指向它。换/降编译器前请确认上表三条「已修」都还在 ——
+> 编译器**随仓自带**：`./uya/bin/uya`（启动器，`git describe` = `v0.10.4`；真二进制是同目录的
+> `uya-real`，标准库源码在 `uya/stdlib/lib/`），本仓 `Makefile` 的 `UYA` / `UYA_ROOT`
+> 默认就指向它（`UYA_ROOT=./uya/stdlib/`）。老版的 `uya/lib/`（生成的 .c/.o）已删，
+> 见 CODING.md §6。换/降编译器前请确认上表三条「已修」都还在 ——
 > 否则 build 会以看不懂的方式失败：一个是「收集模块依赖失败: **<编译器路径>**」，
 > 一个是宿主 C 的 `invalid initializer`（报错点在调用处，根因在可达函数表满）。
 
@@ -7556,8 +7558,9 @@ dsh 有压缩/剪枝），这既解释了本仓更高的单请求成本，也解
 还带着 **64 个显式输入文件的上限**（CODING.md §1.2.1 记的就是这条）——本仓现在 **113 个**
 构建文件，用它 `check`/`build` 只会报 `收集模块依赖失败: <编译器路径>`，
 **报错指不到根因、看起来像编译器坏了**。实测 60 个文件过、70 个就炸，正是那条上限。
-可用的编译器是 **v0.10.3**（`/home/winger/uya/uya/bin/uya`，`UYA_ROOT=/home/winger/uya/uya/lib/`）。
-⇒ 换机/重装后第一步先 `uya --version` 认版本，别把这条当代码 bug 查。
+可用的编译器是 **v0.10.4，随仓自带**：`./uya/bin/uya`
+（启动器，自己把 `UYA_ROOT` 钉到 `uya/stdlib`；真二进制是 `uya-real`）。
+⇒ 换机/重装后第一步先 `./uya/bin/uya --version` 认版本，别把这条当代码 bug 查。
 
 ### 19.3 P82：给主链加传输层重试（修 §19.1 坑二）
 ### 19.4 P81：模型的上下文窗口（`uya-agent.contextWindows` + env + CLI）

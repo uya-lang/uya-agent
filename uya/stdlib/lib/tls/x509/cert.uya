@@ -1,0 +1,599 @@
+// lib/tls/x509/cert.uya - X.509 证书解析（最小子集：RSA 公钥、序列号、签名用于验签）
+
+use tls.common;
+use tls.x509.asn1;
+use libc.TimeVal;
+use libc.sys_gettimeofday;
+
+// 证书解析结果：持有 TBSCertificate 区间、签名、RSA 公钥及部分扩展，用于链验证
+export struct Cert {
+    der: &const byte,
+    der_len: usize,
+    tbs_offset: usize,
+    tbs_len: usize,
+    tbs_tlv_len: usize,
+    serial: [byte: 32],
+    serial_len: usize,
+    sig_oid: [byte: 24],
+    sig_oid_len: usize,
+    sig: [byte: 512],
+    sig_len: usize,
+    rsa_n: [byte: 512],
+    rsa_n_len: usize,
+    rsa_e: [byte: 8],
+    rsa_e_len: usize,
+
+    // basicConstraints (CA/pathLen) 与 keyUsage 扩展信息（若存在）
+    has_basic_constraints: bool,
+    is_ca: bool,
+    has_path_len: bool,
+    max_path_len: usize,
+    has_key_usage: bool,
+    key_usage_bits: u16,
+    
+    // 有效期（Unix 时间戳，秒）
+    has_validity: bool,
+    not_before: i64,
+    not_after: i64,
+}
+
+fn cert_reset_ext_fields(cert: &Cert) void {
+    cert.has_basic_constraints = false;
+    cert.is_ca = false;
+    cert.has_path_len = false;
+    cert.max_path_len = 0;
+    cert.has_key_usage = false;
+    cert.key_usage_bits = 0;
+    cert.has_validity = false;
+    cert.not_before = 0;
+    cert.not_after = 0;
+}
+
+fn cert_copy_positive_integer(dst: &byte, dst_max: usize, dst_len: &usize, src: &byte, src_len: usize) !void {
+    var start: usize = 0;
+    var n: usize = src_len;
+    if src_len > 1 && src[0] == 0 {
+        start = 1;
+        n = src_len - 1;
+    }
+    if n == 0 || n > dst_max {
+        return error.TlsDecodeError;
+    }
+    var i: usize = 0;
+    while i < n {
+        dst[i] = src[start + i];
+        i = i + 1;
+    }
+    dst_len[0] = n;
+}
+
+fn cert_parse_basic_constraints_from_ext_value(cert: &Cert, data: &const byte, data_len: usize) !void {
+    if data_len == 0 {
+        return error.TlsDecodeError;
+    }
+    var r2: Asn1Reader = Asn1Reader{ data: data, len: data_len, pos: 0 };
+    const seq_len: usize = asn1_enter_sequence(&r2) catch { return error.TlsDecodeError; };
+    if r2.pos + seq_len > r2.len {
+        return error.TlsDecodeError;
+    }
+    cert.has_basic_constraints = true;
+    cert.is_ca = false;
+    cert.has_path_len = false;
+    cert.max_path_len = 0;
+    if asn1_remaining(&r2) == 0 {
+        return;
+    }
+    const tag: byte = asn1_peek_tag(&r2) catch { return error.TlsDecodeError; };
+    if tag == (0x01 as byte) {
+        var bool_len: usize = 0;
+        if !asn1_get_tlv_to(&r2, 0x01 as byte, &bool_len) {
+            return error.TlsDecodeError;
+        }
+        if bool_len != 1 || r2.pos + bool_len > r2.len {
+            return error.TlsDecodeError;
+        }
+        const b: byte = r2.data[r2.pos];
+        r2.pos = r2.pos + 1;
+        cert.is_ca = (b != 0);
+    }
+    if asn1_remaining(&r2) == 0 {
+        return;
+    }
+    var int_buf: [byte: 4] = [0:4];
+    var int_len: usize = 0;
+    asn1_get_integer_to(&r2, &int_buf[0], 4, &int_len) catch { return error.TlsDecodeError; };
+    if int_len == 0 || int_len > 4 {
+        return error.TlsDecodeError;
+    }
+    var v: usize = 0;
+    var i: usize = 0;
+    while i < int_len {
+        v = (v << 8) | (int_buf[i] as usize);
+        i = i + 1;
+    }
+    cert.has_path_len = true;
+    cert.max_path_len = v;
+}
+
+fn cert_parse_key_usage_from_ext_value(cert: &Cert, data: &const byte, data_len: usize) !void {
+    if data_len == 0 {
+        return error.TlsDecodeError;
+    }
+    var r2: Asn1Reader = Asn1Reader{ data: data, len: data_len, pos: 0 };
+    var bits_buf: [byte: 2] = [0:2];
+    var bits_len: usize = 0;
+    asn1_get_bit_string_to(&r2, &bits_buf[0], 2, &bits_len) catch { return error.TlsDecodeError; };
+    if bits_len == 0 || bits_len > 2 {
+        return error.TlsDecodeError;
+    }
+    var v: u16 = 0;
+    v = (bits_buf[0] as u16);
+    if bits_len > 1 {
+        v = v | ((bits_buf[1] as u16) << 8);
+    }
+    cert.has_key_usage = true;
+    cert.key_usage_bits = v;
+}
+
+fn cert_parse_extensions_from_explicit_3(r: &Asn1Reader, cert: &Cert) !void {
+    var exts_len: usize = 0;
+    if !asn1_get_tlv_to(r, ASN1_TAG_EXPLICIT_3, &exts_len) {
+        return error.TlsDecodeError;
+    }
+    if r.pos + exts_len > r.len {
+        return error.TlsDecodeError;
+    }
+    const exts_end: usize = r.pos + exts_len;
+    var seq_len: usize = 0;
+    if !asn1_get_tlv_to(r, ASN1_TAG_SEQUENCE, &seq_len) {
+        return error.TlsDecodeError;
+    }
+    if r.pos + seq_len > exts_end {
+        return error.TlsDecodeError;
+    }
+    while r.pos < exts_end {
+        var ext_len: usize = 0;
+        if !asn1_get_tlv_to(r, ASN1_TAG_SEQUENCE, &ext_len) {
+            return error.TlsDecodeError;
+        }
+        if r.pos + ext_len > exts_end {
+            return error.TlsDecodeError;
+        }
+        const ext_end: usize = r.pos + ext_len;
+        var oid_buf: [byte: 16] = [0:16];
+        const oid_len: usize = asn1_get_oid(r, &oid_buf[0], 16) catch { return error.TlsDecodeError; };
+        var is_basic: bool = false;
+        var is_key_usage: bool = false;
+        if oid_len == 3 && oid_buf[0] == 0x55 && oid_buf[1] == 0x1D && oid_buf[2] == 0x13 {
+            is_basic = true;
+        }
+        if oid_len == 3 && oid_buf[0] == 0x55 && oid_buf[1] == 0x1D && oid_buf[2] == 0x0F {
+            is_key_usage = true;
+        }
+        if r.pos < ext_end {
+            const next_tag: byte = asn1_peek_tag(r) catch { return error.TlsDecodeError; };
+            if next_tag == (0x01 as byte) {
+                var bool_len: usize = 0;
+                if !asn1_get_tlv_to(r, 0x01 as byte, &bool_len) {
+                    return error.TlsDecodeError;
+                }
+                if bool_len != 1 || r.pos + bool_len > r.len {
+                    return error.TlsDecodeError;
+                }
+                const _b: byte = r.data[r.pos];
+                r.pos = r.pos + 1;
+            }
+        }
+        if r.pos >= ext_end {
+            return error.TlsDecodeError;
+        }
+        var val_len: usize = 0;
+        if !asn1_get_tlv_to(r, ASN1_TAG_OCTET_STRING, &val_len) {
+            return error.TlsDecodeError;
+        }
+        if val_len == 0 || r.pos + val_len > ext_end {
+            return error.TlsDecodeError;
+        }
+        if is_basic {
+            cert_parse_basic_constraints_from_ext_value(cert, &r.data[r.pos], val_len) catch {
+                return error.TlsDecodeError;
+            };
+        } else {
+            if is_key_usage {
+                cert_parse_key_usage_from_ext_value(cert, &r.data[r.pos], val_len) catch {
+                    return error.TlsDecodeError;
+                };
+            }
+        }
+        r.pos = r.pos + val_len;
+        if r.pos < ext_end {
+            if ext_end > r.pos {
+                const remain: usize = ext_end - r.pos;
+                if r.pos + remain > r.len {
+                    return error.TlsDecodeError;
+                }
+                r.pos = r.pos + remain;
+            }
+        } else {
+            if r.pos > ext_end {
+                return error.TlsDecodeError;
+            }
+        }
+    }
+    if r.pos < exts_end {
+        const remain2: usize = exts_end - r.pos;
+        if r.pos + remain2 > r.len {
+            return error.TlsDecodeError;
+        }
+        r.pos = r.pos + remain2;
+    } else {
+        if r.pos > exts_end {
+            return error.TlsDecodeError;
+        }
+    }
+}
+
+fn cert_parse_tbs(r: &Asn1Reader, cert: &Cert, tbs_content_len: usize) !void {
+    cert_reset_ext_fields(cert);
+    if asn1_remaining(r) < 1 {
+        return error.TlsDecodeError;
+    }
+    if asn1_peek_tag(r) catch { return error.TlsDecodeError; } == (0xA0 as byte) {
+        var len: usize = 0;
+        if !asn1_get_tlv_to(r, 0xA0 as byte, &len) {
+            return error.TlsDecodeError;
+        }
+        if r.pos + len > r.len {
+            return error.TlsDecodeError;
+        }
+        asn1_skip(r, len) catch { return error.TlsDecodeError; };
+    }
+
+    if asn1_remaining(r) < 2 {
+        return error.TlsDecodeError;
+    }
+    asn1_get_integer_to(r, &cert.serial[0], 32, &cert.serial_len) catch { return error.TlsDecodeError; };
+
+    asn1_skip_next_tlv(r) catch { return error.TlsDecodeError; };
+    asn1_skip_next_tlv(r) catch { return error.TlsDecodeError; };
+    asn1_skip_next_tlv(r) catch { return error.TlsDecodeError; };
+    asn1_skip_next_tlv(r) catch { return error.TlsDecodeError; };
+    if asn1_remaining(r) == 0 {
+        return error.TlsDecodeError;
+    }
+
+    var spki_len: usize = 0;
+    if !asn1_get_tlv_to(r, ASN1_TAG_SEQUENCE, &spki_len) {
+        return error.TlsDecodeError;
+    }
+    if r.pos + spki_len > r.len {
+        return error.TlsDecodeError;
+    }
+    asn1_skip_next_tlv(r) catch { return error.TlsDecodeError; };
+    var pk_buf: [byte: 528] = [0:528];
+    var pk_len: usize = 0;
+    asn1_get_bit_string_to(r, &pk_buf[0], 528, &pk_len) catch { return error.TlsDecodeError; };
+    if pk_len < 2 {
+        return error.TlsDecodeError;
+    }
+    var sub: Asn1Reader = Asn1Reader{ data: &pk_buf[0], len: pk_len, pos: 0 };
+    var seq_len2: usize = 0;
+    if !asn1_get_tlv_to(&sub, ASN1_TAG_SEQUENCE, &seq_len2) {
+        return error.TlsDecodeError;
+    }
+    if sub.pos + seq_len2 > sub.len {
+        return error.TlsDecodeError;
+    }
+    var tmp_n: [byte: 513] = [0:513];
+    var tmp_e: [byte: 9] = [0:9];
+    var tmp_n_len: usize = 0;
+    var tmp_e_len: usize = 0;
+    asn1_get_integer_to(&sub, &tmp_n[0], 513, &tmp_n_len) catch { return error.TlsDecodeError; };
+    cert_copy_positive_integer(&cert.rsa_n[0], 512, &cert.rsa_n_len, &tmp_n[0], tmp_n_len) catch { return error.TlsDecodeError; };
+    asn1_get_integer_to(&sub, &tmp_e[0], 9, &tmp_e_len) catch { return error.TlsDecodeError; };
+    cert_copy_positive_integer(&cert.rsa_e[0], 8, &cert.rsa_e_len, &tmp_e[0], tmp_e_len) catch { return error.TlsDecodeError; };
+
+    while asn1_remaining(r) > 0 {
+        const tag2: byte = asn1_peek_tag(r) catch { return error.TlsDecodeError; };
+        if tag2 == ASN1_TAG_EXPLICIT_1 || tag2 == ASN1_TAG_EXPLICIT_2 {
+            var len2: usize = 0;
+            if !asn1_get_tlv_to(r, tag2, &len2) {
+                return error.TlsDecodeError;
+            }
+            if r.pos + len2 > r.len {
+                return error.TlsDecodeError;
+            }
+            r.pos = r.pos + len2;
+            continue;
+        }
+        if tag2 == ASN1_TAG_EXPLICIT_3 {
+            const saved_pos: usize = r.pos;
+            cert_parse_extensions_from_explicit_3(r, cert) catch {
+                r.pos = saved_pos;
+                var ext3_len: usize = 0;
+                if !asn1_get_tlv_to(r, ASN1_TAG_EXPLICIT_3, &ext3_len) {
+                    return error.TlsDecodeError;
+                }
+                if r.pos + ext3_len > r.len {
+                    return error.TlsDecodeError;
+                }
+                r.pos = r.pos + ext3_len;
+            };
+            continue;
+        }
+        break;
+    }
+}
+
+export fn cert_parse(der: &const byte, der_len: usize, cert_out: &Cert) !void {
+    var r: Asn1Reader = Asn1Reader{ data: der, len: der_len, pos: 0 };
+    var cert_len: usize = 0;
+    if !asn1_get_tlv_to(&r, ASN1_TAG_SEQUENCE, &cert_len) {
+        return error.TlsDecodeError;
+    }
+    if r.pos + cert_len > der_len {
+        return error.TlsDecodeError;
+    }
+    cert_out.tbs_offset = r.pos;
+    var tbs_len: usize = 0;
+    if !asn1_get_tlv_to(&r, ASN1_TAG_SEQUENCE, &tbs_len) {
+        return error.TlsDecodeError;
+    }
+    cert_out.tbs_len = tbs_len;
+    var tlv_len: usize = 1;
+    if tbs_len < 128 {
+        tlv_len = 2 + tbs_len;
+    } else {
+        if tbs_len < 256 {
+            tlv_len = 3 + tbs_len;
+        } else {
+            if tbs_len < 65536 {
+                tlv_len = 4 + tbs_len;
+            } else {
+                tlv_len = 5 + tbs_len;
+            }
+        }
+    }
+    cert_out.tbs_tlv_len = tlv_len;
+    cert_out.der = der;
+    cert_out.der_len = der_len;
+    cert_parse_tbs(&r, cert_out, tbs_len) catch { return error.TlsDecodeError; };
+
+    asn1_skip_next_tlv(&r) catch { return error.TlsDecodeError; };
+    asn1_get_bit_string_to(&r, &cert_out.sig[0], 512, &cert_out.sig_len) catch { return error.TlsDecodeError; };
+}
+
+// ==================== 证书有效期验证 ====================
+
+use libc.time;
+
+// ASN.1 UTCTime/GeneralizedTime 解析
+// 格式: YYMMDDHHMMSSZ (UTCTime) 或 YYYYMMDDHHMMSSZ (GeneralizedTime)
+fn parse_asn1_time(data: &const byte, len: usize) !i64 {
+    if len < 10 {
+        return error.TlsDecodeError;
+    }
+    
+    var year: i64 = 0;
+    var month: i64 = 0;
+    var day: i64 = 0;
+    var hour: i64 = 0;
+    var minute: i64 = 0;
+    var second: i64 = 0;
+    
+    var pos: usize = 0;
+    
+    // 判断是 UTCTime (2位年份) 还是 GeneralizedTime (4位年份)
+    if len == 13 || (len > 13 && data[12] == 'Z' as byte) {
+        // UTCTime: YYMMDDHHMMSSZ
+        year = ((data[0] - '0' as byte) * 10 + (data[1] - '0' as byte)) as i64;
+        // RFC 5280: 50-99 表示 1950-1999, 00-49 表示 2000-2049
+        if year < 50 {
+            year = year + 2000;
+        } else {
+            year = year + 1900;
+        }
+        pos = 2;
+    } else if len == 15 || (len > 15 && data[14] == 'Z' as byte) {
+        // GeneralizedTime: YYYYMMDDHHMMSSZ
+        year = ((data[0] - '0' as byte) * 1000 + (data[1] - '0' as byte) * 100 + 
+                (data[2] - '0' as byte) * 10 + (data[3] - '0' as byte)) as i64;
+        pos = 4;
+    } else {
+        return error.TlsDecodeError;
+    }
+    
+    if pos + 10 > len {
+        return error.TlsDecodeError;
+    }
+    
+    month = ((data[pos] - '0' as byte) * 10 + (data[pos + 1] - '0' as byte)) as i64;
+    day = ((data[pos + 2] - '0' as byte) * 10 + (data[pos + 3] - '0' as byte)) as i64;
+    hour = ((data[pos + 4] - '0' as byte) * 10 + (data[pos + 5] - '0' as byte)) as i64;
+    minute = ((data[pos + 6] - '0' as byte) * 10 + (data[pos + 7] - '0' as byte)) as i64;
+    second = ((data[pos + 8] - '0' as byte) * 10 + (data[pos + 9] - '0' as byte)) as i64;
+    
+    // 验证范围
+    if month < 1 || month > 12 || day < 1 || day > 31 ||
+        hour < 0 || hour > 23 || minute < 0 || minute > 59 || second < 0 || second > 59 {
+        return error.TlsDecodeError;
+    }
+    
+    // 计算 Unix 时间戳（简化计算，不考虑闰秒和时区）
+    // 使用已知基准：1970-01-01 00:00:00 UTC = 0
+    return time_components_to_unix(year, month, day, hour, minute, second);
+}
+
+// 将时间组件转换为 Unix 时间戳（近似值，用于验证比较）
+fn time_components_to_unix(year: i64, month: i64, day: i64, hour: i64, minute: i64, second: i64) i64 {
+    // 计算从 1970 到目标年份的天数
+    var days: i64 = 0;
+    var y: i64 = 1970;
+    while y < year {
+        if is_leap_year(y) {
+            days = days + 366;
+        } else {
+            days = days + 365;
+        }
+        y = y + 1;
+    }
+    
+    // 计算目标年份中到目标月份的天数
+    const month_days: [i64: 12] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    var m: i64 = 1;
+    while m < month {
+        if m == 2 && cert_is_leap_year(year) {
+            days = days + 29;
+        } else {
+            const idx: i64 = m - 1;
+            if idx >= 0 && idx < 12 {
+                days = days + month_days[idx as usize];
+            }
+        }
+        m = m + 1;
+    }
+    
+    // 加上当月的天数
+    days = days + day - 1;
+    
+    // 转换为秒（使用 i64 避免溢出）
+    return days * 86400 as i64 + hour * 3600 as i64 + minute * 60 as i64 + second;
+}
+
+fn cert_is_leap_year(year: i64) bool {
+    return (year % 4 as i64 == 0 && year % 100 as i64 != 0) || (year % 400 as i64 == 0);
+}
+
+// 获取当前 Unix 时间戳
+fn get_current_unix_time() i64 {
+    var tv: TimeVal = TimeVal{};
+    const res: !i32 = sys_gettimeofday(&tv, null as &void);
+    res catch { return 0; };
+    return tv.tv_sec;
+}
+
+// 解析证书有效期（从 TBSCertificate 中）
+export fn cert_parse_validity(cert: &Cert) !void {
+    if cert.der == null as &const byte || cert.der_len == 0 {
+        return error.TlsDecodeError;
+    }
+    
+    var r: Asn1Reader = Asn1Reader{ 
+        data: cert.der, 
+        len: cert.der_len, 
+        pos: cert.tbs_offset 
+    };
+    
+    // 跳过版本（可选）和序列号
+    asn1_enter_sequence(&r) catch { return error.TlsDecodeError; };
+    
+    // 跳过版本（如果存在）
+    const peek_tag_res: !byte = asn1_peek_tag(&r);
+    const peek_tag: byte = peek_tag_res catch { 0 as byte; };
+    if peek_tag == (0xa0 as byte | 0 as byte) {
+        var ver_len: usize = 0;
+        if asn1_get_tlv_to(&r, 0xa0 as byte | 0 as byte, &ver_len) {
+            r.pos = r.pos + ver_len;
+        }
+    }
+    
+    // 跳过序列号
+    var serial_len: usize = 0;
+    _ = asn1_get_tlv_to(&r, ASN1_TAG_INTEGER, &serial_len);
+    r.pos = r.pos + serial_len;
+    
+    // 跳过签名算法
+    asn1_skip_next_tlv(&r) catch {};
+    
+    // 跳过颁发者
+    asn1_skip_next_tlv(&r) catch {};
+    
+    // 读取有效期序列
+    var validity_len: usize = 0;
+    if !asn1_get_tlv_to(&r, ASN1_TAG_SEQUENCE, &validity_len) {
+        return error.TlsDecodeError;
+    }
+    
+    const validity_end: usize = r.pos + validity_len;
+    
+    // 解析 notBefore
+    var time_len: usize = 0;
+    var tag: byte = 0;
+    const tag1_res: !byte = asn1_peek_tag(&r);
+    tag1_res catch { return error.TlsDecodeError; };
+    tag = r.data[r.pos];
+    
+    if tag == ASN1_TAG_UTCTIME || tag == ASN1_TAG_GENERALIZED_TIME {
+        if !asn1_get_tlv_to(&r, tag, &time_len) {
+            return error.TlsDecodeError;
+        }
+        if r.pos + time_len > r.len {
+            return error.TlsDecodeError;
+        }
+        const nb_res: !i64 = parse_asn1_time(&r.data[r.pos], time_len);
+        cert.not_before = nb_res catch {
+            0 as i64;
+        };
+        r.pos = r.pos + time_len;
+    } else {
+        return error.TlsDecodeError;
+    }
+    
+    // 解析 notAfter
+    if r.pos >= validity_end {
+        return error.TlsDecodeError;
+    }
+    
+    const tag2_res: !byte = asn1_peek_tag(&r);
+    tag2_res catch { return error.TlsDecodeError; };
+    tag = r.data[r.pos];
+    
+    if tag == ASN1_TAG_UTCTIME || tag == ASN1_TAG_GENERALIZED_TIME {
+        if !asn1_get_tlv_to(&r, tag, &time_len) {
+            return error.TlsDecodeError;
+        }
+        if r.pos + time_len > r.len {
+            return error.TlsDecodeError;
+        }
+        const na_res: !i64 = parse_asn1_time(&r.data[r.pos], time_len);
+        cert.not_after = na_res catch {
+            0 as i64;
+        };
+        r.pos = r.pos + time_len;
+    } else {
+        return error.TlsDecodeError;
+    }
+    
+    cert.has_validity = true;
+}
+
+// 使用 tls.x509.asn1 导出的 ASN1_TAG_UTCTIME 和 ASN1_TAG_GENERALIZED_TIME
+
+// 验证证书是否在有效期内
+export fn cert_check_validity(cert: &Cert) !void {
+    if !cert.has_validity {
+        // 如果没有有效期信息，尝试解析
+        cert_parse_validity(cert) catch {
+            return error.TlsCertificateExpired;
+        };
+    }
+    
+    if !cert.has_validity {
+        return error.TlsCertificateExpired;
+    }
+    
+    const now: i64 = get_current_unix_time();
+    if now == 0 {
+        // 无法获取当前时间，保守起见允许通过
+        // 或者可以返回错误，取决于安全策略
+        return;
+    }
+    
+    if now < cert.not_before {
+        return error.TlsCertificateNotYetValid;
+    }
+    
+    if now > cert.not_after {
+        return error.TlsCertificateExpired;
+    }
+}

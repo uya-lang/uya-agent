@@ -1,0 +1,488 @@
+// lib/std/http/server.uya — 阻塞式 HTTP 服务最小原语（Phase 5）
+//
+// 模块路径：use std.http.server
+
+use std;
+use std.http.types;
+use std.http.parse.http_parse_request;
+use std.http.parse.http_parse_request_into;
+use std.http.parse.http_decode_chunked_body_inplace;
+use libc.syscall;
+use libc.errno;
+
+const HTTP_RECV_BUF: usize = 8192;
+/// 单次连接读缓冲上限：须覆盖 `MAX_BODY_SIZE` 量级请求体 + 头（与 `parse` 一致）
+export const HTTP_CONN_READ_CAP: usize = (65536 + 4096) as usize;
+
+export struct HttpServer {
+    listen_fd: i32,
+    port: u16,
+}
+
+/// 循环 `write` 直至写满 `total` 字节。流式套接字上单次 `write` 可能短写；只写一部分会导致对端按 `Content-Length` 永远阻塞。
+fn sys_write_all_conn(fd: i32, base: &byte, total: usize) !void {
+    var off: usize = 0;
+    while off < total {
+        const p: *const byte = @ptr_from_usize(@usize_from_ptr(base as &void) + off) as *const byte;
+        const n: isize = try sys_write(fd, p, total - off);
+        if n <= 0 {
+            return error.ConnectionClosed;
+        }
+        off = off + (n as usize);
+    }
+}
+
+fn sys_writev_all_conn(fd: i32, head: &byte, head_len: usize, body: &byte, body_len: usize) !void {
+    var head_sent: usize = 0;
+    var body_sent: usize = 0;
+    while head_sent < head_len || body_sent < body_len {
+        var iov: [IOVec: 2] = [];
+        var iovcnt: i32 = 0;
+        if head_sent < head_len {
+            iov[iovcnt as usize] = IOVec{
+                iov_base: @ptr_from_usize(@usize_from_ptr(head as &void) + head_sent) as *const byte,
+                iov_len: head_len - head_sent,
+            };
+            iovcnt = iovcnt + 1;
+        }
+        if body_sent < body_len {
+            iov[iovcnt as usize] = IOVec{
+                iov_base: @ptr_from_usize(@usize_from_ptr(body as &void) + body_sent) as *const byte,
+                iov_len: body_len - body_sent,
+            };
+            iovcnt = iovcnt + 1;
+        }
+        const wr: isize = try sys_writev(fd, &iov[0], iovcnt);
+        if wr <= 0 {
+            return error.ConnectionClosed;
+        }
+        var advanced: usize = wr as usize;
+        if head_sent < head_len {
+            const head_rem: usize = head_len - head_sent;
+            if advanced >= head_rem {
+                head_sent = head_len;
+                advanced = advanced - head_rem;
+            } else {
+                head_sent = head_sent + advanced;
+                advanced = 0;
+            }
+        }
+        if advanced > 0 && body_sent < body_len {
+            body_sent = body_sent + advanced;
+        }
+    }
+}
+
+/// 非阻塞写：将 `base[0:total]` 尽量写入 `conn_fd`；`written` 入参为已发送字节数（首次传 `0`），返回时若成功则已达 `total`。遇 `EAGAIN`/`EWOULDBLOCK` 时返回 `error.ReadWouldBlock`（与读侧共用）；遇 `EINTR` 时重试写。`*written` 为已成功发送的字节数，可 `epoll_wait` 可写后再调用续传。
+export fn http_write_all_nonblocking(conn_fd: i32, base: &byte, total: usize, written: &usize) !void {
+    while *written < total {
+        const rem: usize = total - *written;
+        const p: *const byte = @ptr_from_usize(@usize_from_ptr(base as &void) + *written) as *const byte;
+        while true {
+            const wr: !isize = sys_write(conn_fd, p, rem);
+            const n: isize = wr catch |err| {
+                const eid: i32 = @error_id(err) as i32;
+                if eid == EAGAIN {
+                    return error.ReadWouldBlock;
+                }
+                if eid == EINTR {
+                    continue;
+                }
+                return error.ConnectionClosed;
+            };
+            if n <= 0 {
+                return error.ConnectionClosed;
+            }
+            *written = *written + (n as usize);
+            break;
+        }
+    }
+}
+
+/// 在 **非阻塞** 套接字上丢弃内核接收队列中的数据（`read` 直至 `EAGAIN` 或 `0`/错误）。
+/// 用于 `close` 前降低 Linux 上因接收队列仍有字节被丢弃而使对端看到 RST 的概率。
+export fn http_discard_socket_recv_nb(conn_fd: i32) void {
+    var junk: [byte: 4096] = [];
+    const chunk: usize = 4096;
+    while true {
+        const rr: !isize = sys_read(conn_fd, &junk[0] as *byte, chunk);
+        const n: isize = rr catch |err| {
+            const eid: i32 = @error_id(err) as i32;
+            if eid == EAGAIN {
+                return;
+            }
+            if eid == EINTR {
+                continue;
+            }
+            return;
+        };
+        if n <= 0 {
+            return;
+        }
+    }
+}
+
+fn htons_host_to_be(p: u16) u16 {
+    return ((p & (0xFF as u16)) << 8) | ((p >> 8) & (0xFF as u16));
+}
+
+export fn fill_sockaddr_loopback_16(port_host: u16, out: &byte) void {
+    var i: usize = 0;
+    while i < 16 {
+        out[i] = 0;
+        i = i + 1;
+    }
+    std.cfg(std.target_os == .tos_macos, {
+        out[0] = 16;
+        out[1] = AF_INET as byte;
+    }, {
+        out[0] = AF_INET as byte;
+        out[1] = 0;
+    })
+    const pnet: u16 = htons_host_to_be(port_host);
+    out[2] = (pnet & (0xFF as u16)) as byte;
+    out[3] = ((pnet >> 8) & (0xFF as u16)) as byte;
+    out[4] = 127;
+    out[5] = 0;
+    out[6] = 0;
+    out[7] = 1;
+}
+
+export fn read_port_from_sockaddr_16(addr: &byte) u16 {
+    const pnet: u16 = addr[2] as u16 | ((addr[3] as u16) << 8);
+    return ((pnet & (0xFF as u16)) << 8) | ((pnet >> 8) & (0xFF as u16));
+}
+
+/// `listen(2)` 的 backlog：`cfg.max_connections` 为提示值，夹在 \[128, 8192\]（内核仍可能按 `somaxconn` 再截断）。
+export fn http_listen_backlog(cfg_max: i32) i32 {
+    var b: i32 = cfg_max;
+    if b < 128 {
+        b = 128;
+    }
+    if b > 8192 {
+        b = 8192;
+    }
+    return b;
+}
+
+/// 绑定 `127.0.0.1`；`cfg.port == 0` 时由内核分配端口，可从返回的 `HttpServer.port` 读取。
+export fn http_server_listen(cfg: &ServerConfig) !HttpServer {
+    if cfg.mode != ServerMode.Blocking {
+        return error.InvalidRequest;
+    }
+    const fd: i32 = try sys_socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    var one: i32 = 1;
+    _ = sys_setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one as &void, 4 as u32) catch |err| {
+        _ = sys_close(fd) catch {};
+        return err;
+    };
+    var addr: [byte: 16] = [];
+    fill_sockaddr_loopback_16(cfg.port, &addr[0] as &byte);
+    _ = sys_bind(fd, &addr[0] as &void, 16 as u32) catch |err| {
+        _ = sys_close(fd) catch {};
+        return err;
+    };
+    _ = sys_listen(fd, http_listen_backlog(cfg.max_connections)) catch |err| {
+        _ = sys_close(fd) catch {};
+        return err;
+    };
+    var port_out: u16 = cfg.port;
+    if cfg.port == 0 {
+        var alen: u32 = 16;
+        var out: [byte: 16] = [];
+        _ = sys_getsockname(fd, &out[0] as &void, &alen) catch |err| {
+            _ = sys_close(fd) catch {};
+            return err;
+        };
+        port_out = read_port_from_sockaddr_16(&out[0] as &byte);
+    }
+    return HttpServer{ listen_fd: fd, port: port_out };
+}
+
+export fn http_server_close(srv: &HttpServer) void {
+    if srv.listen_fd >= 0 {
+        _ = sys_close(srv.listen_fd) catch {};
+    }
+}
+
+export fn http_server_accept(srv: &HttpServer) !Conn {
+    var alen: u32 = 16;
+    var peer: [byte: 16] = [];
+    const cfd: i32 = try sys_accept(srv.listen_fd, &peer[0] as &void, &alen);
+    var nd: i32 = 1;
+    _ = sys_setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, &nd as &void, 4 as u32) catch {};
+    return Conn{ fd: cfd };
+}
+
+/// 客户端连接本机 `127.0.0.1:port`（测试或工具用）
+export fn http_tcp_connect_loopback(port: u16) !i32 {
+    const fd: i32 = try sys_socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    var addr: [byte: 16] = [];
+    fill_sockaddr_loopback_16(port, &addr[0] as &byte);
+    _ = try sys_connect(fd, &addr[0] as &void, 16 as u32);
+    var nd: i32 = 1;
+    _ = sys_setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &nd as &void, 4 as u32) catch {};
+    return fd;
+}
+
+/// 去掉已解析的 `consumed` 字节，将剩余数据前移，供 Keep-alive 同缓冲区内解析下一请求。
+export fn http_connbuf_shift(base: &byte, filled: &usize, consumed: usize) void {
+    if consumed >= *filled {
+        *filled = 0;
+        return;
+    }
+    const rem: usize = *filled - consumed;
+    var i: usize = 0;
+    while i < rem {
+        base[i] = base[consumed + i];
+        i = i + 1;
+    }
+    *filled = rem;
+}
+
+/// 在调用方持有的缓冲上读满至少一个完整请求；`filled` 为已有字节数（入参/出参）。
+export fn http_conn_read_parse(conn_fd: i32, base: &byte, cap: usize, filled: &usize) !ParseResult {
+    while true {
+        const cur: usize = *filled;
+        if cur > cap {
+            return error.PayloadTooLarge;
+        }
+        const sl: &[byte] = base[0: cur];
+        const p: !ParseResult = http_parse_request(sl);
+        // 须含 `else`：`match` 若只列 `IncompleteRequest` 与 `pr`（成功）两类，C 后端会对其它错误（如 InvalidRequest）生成空分支并在 while 中空转。
+        match p {
+            error.IncompleteRequest => {
+                if cur >= cap {
+                    return error.PayloadTooLarge;
+                }
+                var room: usize = cap - cur;
+                var chunk: usize = HTTP_RECV_BUF;
+                if chunk > room {
+                    chunk = room;
+                }
+                const dst: *byte = @ptr_from_usize(@usize_from_ptr(base as &void) + cur) as *byte;
+                const n: isize = try sys_read(conn_fd, dst, chunk);
+                if n <= 0 {
+                    return error.ConnectionClosed;
+                }
+                *filled = cur + (n as usize);
+            }
+            else => {
+                var pr: ParseResult = try p;
+                if request_has_chunked_transfer_encoding(&pr.request) {
+                    _ = try http_decode_chunked_body_inplace(&pr);
+                }
+                return pr;
+            }
+        }
+    }
+}
+
+/// 与 `http_conn_read_parse` 相同，但套接字须为 **非阻塞**：`read(2)` 遇 `EAGAIN`/`EWOULDBLOCK` 时返回 `error.ReadWouldBlock`；遇 `EINTR` 时自动重试同一读。
+export fn http_conn_read_parse_nonblocking(conn_fd: i32, base: &byte, cap: usize, filled: &usize) !ParseResult {
+    while true {
+        const cur: usize = *filled;
+        if cur > cap {
+            return error.PayloadTooLarge;
+        }
+        const sl: &[byte] = base[0: cur];
+        const p: !ParseResult = http_parse_request(sl);
+        match p {
+            error.IncompleteRequest => {
+                if cur >= cap {
+                    return error.PayloadTooLarge;
+                }
+                var room: usize = cap - cur;
+                var chunk: usize = HTTP_RECV_BUF;
+                if chunk > room {
+                    chunk = room;
+                }
+                const dst: *byte = @ptr_from_usize(@usize_from_ptr(base as &void) + cur) as *byte;
+                while true {
+                    const rr: !isize = sys_read(conn_fd, dst, chunk);
+                    const n: isize = rr catch |err| {
+                        const eid: i32 = @error_id(err) as i32;
+                        if eid == EAGAIN {
+                            return error.ReadWouldBlock;
+                        }
+                        if eid == EINTR {
+                            continue;
+                        }
+                        return error.ConnectionClosed;
+                    };
+                    if n <= 0 {
+                        return error.ConnectionClosed;
+                    }
+                    *filled = cur + (n as usize);
+                    break;
+                }
+            }
+            else => {
+                var pr: ParseResult = try p;
+                if request_has_chunked_transfer_encoding(&pr.request) {
+                    _ = try http_decode_chunked_body_inplace(&pr);
+                }
+                return pr;
+            }
+        }
+    }
+}
+
+/// 与 `http_conn_read_parse_nonblocking` 相同，但解析结果**就地写入** `out: &ParseResult`，
+/// 不构造/返回巨型 `ParseResult` 值（其内含 `[ReqHeader: MAX_HEADER_SIZE]`，按值复制开销巨大）。
+/// 调用方持有一个可复用的 `ParseResult`（如静态/每连接缓冲）即可避免每请求多次拷贝。
+export fn http_conn_read_parse_nonblocking_into(conn_fd: i32, base: &byte, cap: usize, filled: &usize, out: &ParseResult) !void {
+    while true {
+        const cur: usize = *filled;
+        if cur > cap {
+            return error.PayloadTooLarge;
+        }
+        const sl: &[byte] = base[0: cur];
+        const p: !void = http_parse_request_into(sl, out);
+        match p {
+            error.IncompleteRequest => {
+                if cur >= cap {
+                    return error.PayloadTooLarge;
+                }
+                var room: usize = cap - cur;
+                var chunk: usize = HTTP_RECV_BUF;
+                if chunk > room {
+                    chunk = room;
+                }
+                const dst: *byte = @ptr_from_usize(@usize_from_ptr(base as &void) + cur) as *byte;
+                while true {
+                    const rr: !isize = sys_read(conn_fd, dst, chunk);
+                    const n: isize = rr catch |err| {
+                        const eid: i32 = @error_id(err) as i32;
+                        if eid == EAGAIN {
+                            return error.ReadWouldBlock;
+                        }
+                        if eid == EINTR {
+                            continue;
+                        }
+                        return error.ConnectionClosed;
+                    };
+                    if n <= 0 {
+                        return error.ConnectionClosed;
+                    }
+                    *filled = cur + (n as usize);
+                    break;
+                }
+            }
+            else => {
+                try p;
+                if request_has_chunked_transfer_encoding(&out.request) {
+                    _ = try http_decode_chunked_body_inplace(out);
+                }
+                return;
+            }
+        }
+    }
+}
+
+/// 从连接读取并解析至多一个完整请求（内部缓冲，可多次 `recv` 直至 `parse` 成功）。
+export fn http_recv_parse_request(conn_fd: i32) !ParseResult {
+    var buf: [byte: HTTP_CONN_READ_CAP] = [];
+    var filled: usize = 0;
+    return http_conn_read_parse(conn_fd, &buf[0] as &byte, HTTP_CONN_READ_CAP, &filled);
+}
+
+fn copy_slice_into_hdr(hdr: &byte, start: usize, s: &[byte]) usize {
+    var pos: usize = start;
+    var i: usize = 0;
+    while i < s.len {
+        hdr[pos] = s.ptr[i];
+        pos = pos + 1;
+        i = i + 1;
+    }
+    return pos;
+}
+
+fn append_usize_dec_hdr(hdr: &byte, start: usize, n: usize) usize {
+    var pos: usize = start;
+    if n == 0 {
+        hdr[pos] = '0' as byte;
+        return pos + 1;
+    }
+    var tmp: [byte: 24] = [];
+    var t: usize = 0;
+    var x: usize = n;
+    while x > 0 && t < 24 {
+        tmp[t] = ((x % 10) as u32 + 48) as byte;
+        t = t + 1;
+        x = x / 10;
+    }
+    while t > 0 {
+        t = t - 1;
+        if t >= 0 && t < 24 {
+            hdr[pos] = tmp[t];
+        }
+        pos = pos + 1;
+    }
+    return pos;
+}
+
+/// `emit_keep_alive`：在 **不关连接** 且客户端为 **HTTP/1.0** 并协商 Keep-Alive 时须为真，以便回显 `Connection: keep-alive`（`ab -k` 等依赖此，否则会卡在等待下一请求）。
+fn http_send_response_impl(conn_fd: i32, status: Status, body: &[byte], close_after: bool, emit_keep_alive: bool) !void {
+    var hdr: [byte: 512] = [];
+    var pos: usize = 0;
+    if status == Status.SwitchingProtocols {
+        pos = copy_slice_into_hdr(&hdr[0] as &byte, pos, &"HTTP/1.1 101 Switching Protocols\r\n"[0: 34]);
+    } else if status == Status.OK {
+        pos = copy_slice_into_hdr(&hdr[0] as &byte, pos, &"HTTP/1.1 200 OK\r\n"[0: 17]);
+    } else if status == Status.Created {
+        pos = copy_slice_into_hdr(&hdr[0] as &byte, pos, &"HTTP/1.1 201 Created\r\n"[0: 22]);
+    } else if status == Status.NoContent {
+        pos = copy_slice_into_hdr(&hdr[0] as &byte, pos, &"HTTP/1.1 204 No Content\r\n"[0: 25]);
+    } else if status == Status.BadRequest {
+        pos = copy_slice_into_hdr(&hdr[0] as &byte, pos, &"HTTP/1.1 400 Bad Request\r\n"[0: 26]);
+    } else if status == Status.NotFound {
+        pos = copy_slice_into_hdr(&hdr[0] as &byte, pos, &"HTTP/1.1 404 Not Found\r\n"[0: 24]);
+    } else if status == Status.MethodNotAllowed {
+        pos = copy_slice_into_hdr(&hdr[0] as &byte, pos, &"HTTP/1.1 405 Method Not Allowed\r\n"[0: 33]);
+    } else {
+        pos = copy_slice_into_hdr(&hdr[0] as &byte, pos, &"HTTP/1.1 500 Internal Server Error\r\n"[0: 36]);
+    }
+    pos = copy_slice_into_hdr(&hdr[0] as &byte, pos, &"Content-Length: "[0: 16]);
+    pos = append_usize_dec_hdr(&hdr[0] as &byte, pos, body.len);
+    if close_after {
+        pos = copy_slice_into_hdr(&hdr[0] as &byte, pos, &"\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n"[0: 49]);
+    } else if emit_keep_alive {
+        pos = copy_slice_into_hdr(&hdr[0] as &byte, pos, &"\r\nContent-Type: text/plain\r\nConnection: keep-alive\r\n\r\n"[0: 54]);
+    } else {
+        pos = copy_slice_into_hdr(&hdr[0] as &byte, pos, &"\r\nContent-Type: text/plain\r\n\r\n"[0: 30]);
+    }
+    // 头+小体一次 write，避免 Keep-alive 下双 write 与 Nagle/delayed ACK 叠加的停顿（ab -k 等）。
+    const room: usize = 512 - pos;
+    if body.len <= room {
+        var bi: usize = 0;
+        while bi < body.len {
+            hdr[pos + bi] = body.ptr[bi];
+            bi = bi + 1;
+        }
+        try sys_write_all_conn(conn_fd, &hdr[0] as &byte, pos + body.len);
+        return;
+    }
+    try sys_writev_all_conn(conn_fd, &hdr[0] as &byte, pos, body.ptr as &byte, body.len);
+}
+
+/// 发送 `HTTP/1.1` 响应（`Content-Type: text/plain`）；未声明 `Connection` 时客户端可按 HTTP/1.1 默认保持连接（便于 Keep-alive 测试）。
+export fn http_send_response(conn_fd: i32, status: Status, body: &[byte]) !void {
+    try http_send_response_impl(conn_fd, status, body, false, false);
+}
+
+/// 同上，但带 `Connection: close`（无 `Request` 上下文时用于错误响应等）。
+export fn http_send_response_close(conn_fd: i32, status: Status, body: &[byte]) !void {
+    try http_send_response_impl(conn_fd, status, body, true, false);
+}
+
+/// 使用调用方算好的 `persist`（可与 `request_wants_persistent_with_session` 配合，兼容 ab -k 等省略后续 Connection 的行为）。
+export fn http_send_response_for_request_persist(conn_fd: i32, status: Status, body: &[byte], req: &Request, persist: bool) !void {
+    const emit_ka: bool = persist && !req.http11;
+    try http_send_response_impl(conn_fd, status, body, !persist, emit_ka);
+}
+
+/// 按请求的 HTTP 版本与 `Connection` 头决定是否附加 `Connection: close`；HTTP/1.0 且保持连接时回显 `Connection: keep-alive`。
+export fn http_send_response_for_request(conn_fd: i32, status: Status, body: &[byte], req: &Request) !void {
+    try http_send_response_for_request_persist(conn_fd, status, body, req, request_wants_persistent_connection(req));
+}

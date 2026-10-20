@@ -1,0 +1,207 @@
+// Microcontainer single-level page table
+// Spec: docs/microcontainer/requirements_v1.3.md — Paging System
+//
+// Virtual space per container: 8 MB (128 pages × 64 KB)
+// PTE format (32-bit):
+//   bit 31: V (Valid)
+//   bit 30: R (Readable)
+//   bit 29: W (Writable)
+//   bit 28: X (Executable)
+//   bit 27: U (User/Container)
+//   bit 26: S (Shared)
+//   bit 25: D (Dirty)
+//   bit 24: A (Accessed)
+//   bit 23-7: PPN (Physical Page Number, 17 bits)
+//   bit 6-0: Reserved
+
+use kernel.errors;
+use kernel.mem;
+use libc.getenv;
+use libc.fprintf;
+use libc.stderr;
+
+// 与 mem.PAGE_SHIFT / PAGE_MASK / PAGE_SIZE 数值一致。
+// 分包 C 编译时跨文件 const 符号名不一致，翻译路径使用本模块字面量避免链接错误。
+const MMU_PAGE_SHIFT: i32 = 16;
+const MMU_PAGE_MASK: u32 = 65535;
+const MMU_PAGE_SIZE: u32 = 65536;
+
+fn mmu_debug_enabled() i32 {
+    const flag: *byte = getenv("MICROAPP_DEBUG_MMU" as *byte);
+    if flag == null || flag[0] == 0 {
+        return 0;
+    }
+    if flag[0] == 48 as byte {
+        return 0;
+    }
+    return 1;
+}
+
+// ── PTE 标志位 ──
+
+export const PTE_V: u32 = 2147483648;   // 1 << 31
+export const PTE_R: u32 = 1073741824;   // 1 << 30
+export const PTE_W: u32 = 536870912;    // 1 << 29
+export const PTE_X: u32 = 268435456;    // 1 << 28
+export const PTE_U: u32 = 134217728;    // 1 << 27
+export const PTE_S: u32 = 67108864;     // 1 << 26
+export const PTE_D: u32 = 33554432;     // 1 << 25
+export const PTE_A: u32 = 16777216;     // 1 << 24
+
+export const PTE_PPN_SHIFT: i32 = 7;
+export const PTE_PPN_MASK: u32 = 8388480;  // 0x7FFF80 = 17 bits << 7
+
+export const PAGE_TABLE_ENTRIES: u32 = 128;
+
+// 访问类型（传给 mmu_translate）
+export const ACCESS_R: u32 = 1;
+export const ACCESS_W: u32 = 2;
+export const ACCESS_X: u32 = 4;
+
+// ── 页表结构 ──
+
+export struct PageTable {
+    entries: [u32: 128],      // PTE 数组，每项 32 位
+}
+
+// ── 页表操作 ──
+
+export fn pt_init(pt: &PageTable) void {
+    var i: u32 = 0;
+    while i < @len(pt.entries) {
+        pt.entries[i] = 0;
+        i = i + 1;
+    }
+}
+
+// 构造 PTE 值
+export fn pte_make(ppn: u32, flags: u32) u32 {
+    return flags | ((ppn << PTE_PPN_SHIFT) & PTE_PPN_MASK);
+}
+
+// 从 PTE 提取 PPN
+export fn pte_ppn(pte: u32) u32 {
+    return (pte & PTE_PPN_MASK) >> PTE_PPN_SHIFT;
+}
+
+// 映射：将虚拟页 vpn 映射到物理页 ppn，带权限标志
+export fn pt_map(pt: &PageTable, vpn: u32, ppn: u32, flags: u32) !void {
+    if vpn >= @len(pt.entries) {
+        return error.PageBoundary;
+    }
+    pt.entries[vpn] = pte_make(ppn, flags | PTE_V);
+}
+
+export fn pt_map_code(pt: &PageTable, vpn: u32, ppn: u32) !void {
+    try pt_map(pt, vpn, ppn, PTE_R | PTE_X | PTE_U);
+}
+
+// 取消映射
+export fn pt_unmap(pt: &PageTable, vpn: u32) void {
+    if vpn >= @len(pt.entries) { return; }
+    pt.entries[vpn] = 0;
+}
+
+/// 功能说明：查找第一个无效 PTE 的虚拟页号，供 `SYS_ALLOC` 等映射新页。
+/// 参数：`pt` — 页表。
+/// 返回：空闲 `vpn`；若表满返回 `NoMemory`。
+export fn pt_find_free_vpn(pt: &PageTable) !u32 {
+    var v: u32 = 0;
+    while v < 128u32 {
+        const ent: u32 = pt.entries[v];
+        if (ent & PTE_V) == 0 {
+            return v;
+        }
+        v = v + 1;
+    }
+    return error.NoMemory;
+}
+
+// ── 核心：地址翻译 ──
+//
+// 输入：虚拟地址 vaddr, 访问大小 size, 访问类型 access (ACCESS_R/W/X)
+// 输出：物理页号 ppn + 页内偏移 offset（调用方通过 physmem_ptr 获取宿主指针）
+// 错误：PageFault (未映射), PagePermission (权限不符), PageBoundary (跨页)
+
+export struct TranslateResult {
+    ppn: u32,
+    offset: u32,
+}
+
+export fn mmu_translate(pt: &PageTable, vaddr: u32, size: u32, access: u32) !TranslateResult {
+    const vpn: u32 = (vaddr >> MMU_PAGE_SHIFT) & 127u32;
+    const offset: u32 = vaddr & MMU_PAGE_MASK;
+
+    if vpn < @len(pt.entries) {
+        const pte: u32 = pt.entries[vpn];
+
+        if mmu_debug_enabled() != 0 {
+            fprintf(stderr, "[mmu] translate vaddr=0x%x size=%u access=0x%x vpn=%u offset=%u pte=0x%x\n" as *byte,
+                vaddr, size, access, vpn, offset, pte);
+        }
+
+        if (pte & PTE_V) == 0 {
+            if mmu_debug_enabled() != 0 {
+                fprintf(stderr, "[mmu] fault: unmapped vpn=%u\n" as *byte, vpn);
+            }
+            return error.PageFault;
+        }
+
+        // 权限检查
+        if (access & ACCESS_R) != 0 && (pte & PTE_R) == 0 {
+            if mmu_debug_enabled() != 0 {
+                fprintf(stderr, "[mmu] permission denied: read vpn=%u\n" as *byte, vpn);
+            }
+            return error.PagePermission;
+        }
+        if (access & ACCESS_W) != 0 && (pte & PTE_W) == 0 {
+            if mmu_debug_enabled() != 0 {
+                fprintf(stderr, "[mmu] permission denied: write vpn=%u\n" as *byte, vpn);
+            }
+            return error.PagePermission;
+        }
+        if (access & ACCESS_X) != 0 && (pte & PTE_X) == 0 {
+            if mmu_debug_enabled() != 0 {
+                fprintf(stderr, "[mmu] permission denied: exec vpn=%u\n" as *byte, vpn);
+            }
+            return error.PagePermission;
+        }
+
+        // 跨页检查
+        if size > 0 && (offset + size) > MMU_PAGE_SIZE {
+            if mmu_debug_enabled() != 0 {
+                fprintf(stderr, "[mmu] boundary denied: vaddr=0x%x size=%u\n" as *byte, vaddr, size);
+            }
+            return error.PageBoundary;
+        }
+
+        // 设置 Accessed / Dirty 位
+        var updated: u32 = pte | PTE_A;
+        if (access & ACCESS_W) != 0 {
+            updated = updated | PTE_D;
+        }
+        pt.entries[vpn] = updated;
+
+        if mmu_debug_enabled() != 0 {
+            fprintf(stderr, "[mmu] ok: vpn=%u -> ppn=%u offset=%u updated=0x%x\n" as *byte,
+                vpn, pte_ppn(pte), offset, updated);
+        }
+
+        return TranslateResult{ ppn: pte_ppn(pte), offset: offset };
+    }
+    if mmu_debug_enabled() != 0 {
+        fprintf(stderr, "[mmu] fault: vpn out of range=%u\n" as *byte, vpn);
+    }
+    return error.PageFault;
+}
+
+// ── 便利函数：翻译并返回宿主指针 ──
+
+export fn mmu_translate_ptr(pt: &PageTable, pm: &PhysMem, vaddr: u32, size: u32, access: u32) !&byte {
+    const result: TranslateResult = try mmu_translate(pt, vaddr, size, access);
+    if mmu_debug_enabled() != 0 {
+        fprintf(stderr, "[mmu] ptr: vaddr=0x%x -> ppn=%u offset=%u size=%u\n" as *byte,
+            vaddr, result.ppn, result.offset, size);
+    }
+    return try physmem_ptr(pm, result.ppn, result.offset);
+}

@@ -1,0 +1,511 @@
+// std.runtime.microapp.loader - hosted microapp loader helpers
+// 模块路径：use std.runtime.microapp.loader;
+
+use kernel.mem;
+use kernel.scheduler;
+use kernel.sim;
+use kernel.image;
+use kernel.paging;
+use std;
+use libc.FILE;
+use libc.fopen;
+use libc.fread;
+use libc.fclose;
+use libc.fork;
+use libc.snprintf;
+use libc.system;
+use libc.waitpid;
+use libc._exit;
+use libc.read;
+use libc.write;
+use libc.close;
+use libc.sys_mmap;
+use libc.sys_pipe2;
+use libc.sys_mprotect;
+use libc.MAP_PRIVATE;
+use libc.MAP_ANONYMOUS;
+use libc.PROT_READ;
+use libc.PROT_WRITE;
+use libc.PROT_EXEC;
+
+export const MICROAPP_HOSTED_MAX_IMAGE_SIZE: usize = 2097152;  // 2 MiB
+export const MICROAPP_HOSTED_BACKING_SIZE: usize = 524288;     // 8 pages
+export const MICROAPP_HOSTED_DEFAULT_PRIORITY: u32 = 16u32;
+
+struct MicroappHostedChildResult {
+    kind: u32,
+    exit_code: i32,
+    fault_class: u32,
+    fault_code: u32,
+    fault_signal: u32,
+}
+
+fn microapp_hosted_target_arch_name(target_arch: ImageTargetArch) &byte {
+    if target_arch == ImageTargetArch.ita_rv32 {
+        return "rv32" as &byte;
+    }
+    if target_arch == ImageTargetArch.ita_x86_64 {
+        return "x86_64" as &byte;
+    }
+    if target_arch == ImageTargetArch.ita_aarch64 {
+        return "aarch64" as &byte;
+    }
+    if target_arch == ImageTargetArch.ita_xtensa {
+        return "xtensa" as &byte;
+    }
+    return "unknown" as &byte;
+}
+
+fn microapp_hosted_bridge_name(bridge_kind: ImageBridgeKind) &byte {
+    if bridge_kind == ImageBridgeKind.ibk_trap {
+        return "trap" as &byte;
+    }
+    if bridge_kind == ImageBridgeKind.ibk_call_gate {
+        return "call_gate" as &byte;
+    }
+    return "unknown" as &byte;
+}
+
+fn microapp_hosted_can_execute_mapped_payload(hdr: &ImageHeader) i32 {
+    if hdr == null || hdr.bridge_kind != ImageBridgeKind.ibk_call_gate {
+        return 0;
+    }
+    if hdr.target_arch == ImageTargetArch.ita_x86_64 {
+        std.cfg(std.target_arch == .ta_x86_64, {
+            return 1;
+        }, {
+            return 0;
+        })
+    }
+    if hdr.target_arch == ImageTargetArch.ita_aarch64 {
+        std.cfg(std.target_arch == .ta_arm64, {
+            return 1;
+        }, {
+            return 0;
+        })
+    }
+    return 0;
+}
+
+fn microapp_hosted_prot_from_pte(pte: u32) i32 {
+    var prot: i32 = 0;
+    if (pte & PTE_R) != 0u32 {
+        prot = prot | PROT_READ;
+    }
+    if (pte & PTE_W) != 0u32 {
+        prot = prot | PROT_WRITE;
+    }
+    if (pte & PTE_X) != 0u32 {
+        prot = prot | PROT_EXEC;
+    }
+    return prot;
+}
+
+fn microapp_hosted_apply_loaded_page_protections(k: &SimKernel, cid: u32) !void {
+    if cid >= 8u32 {
+        return error.InvalidState;
+    }
+    if k.loaded_image_valid[cid] == 0u32 {
+        return error.InvalidState;
+    }
+    const base_vpn: u32 = k.loaded_image_base_vpn[cid];
+    const page_count: u32 = k.loaded_image_page_count[cid];
+    if page_count == 0u32 {
+        return error.InvalidState;
+    }
+    var page_idx: u32 = 0u32;
+    while page_idx < page_count {
+        const vpn: u32 = base_vpn + page_idx;
+        if vpn >= PAGE_TABLE_ENTRIES {
+            return error.PageBoundary;
+        }
+        const pte: u32 = k.host_ctx.pts[cid].entries[vpn];
+        if (pte & PTE_V) != 0u32 {
+            const host_page: &byte = try physmem_ptr(&k.host_ctx.pm, pte_ppn(pte), 0u32);
+            _ = try sys_mprotect(host_page as *void, PAGE_SIZE as usize, microapp_hosted_prot_from_pte(pte));
+        }
+        page_idx = page_idx + 1u32;
+    }
+}
+
+fn microapp_hosted_exit_code_from_system_status(wstatus: i32) i32 {
+    if wstatus < 0 {
+        return 1;
+    }
+    const low: i32 = wstatus & 0x7f;
+    const code: i32 = (wstatus >> 8) & 0xff;
+    if low == 0 {
+        return code;
+    }
+    const sig: i32 = low & 0x7f;
+    if sig == 0 {
+        return 1;
+    }
+    return 128 + sig;
+}
+
+fn microapp_hosted_system_status_signal(wstatus: i32) i32 {
+    if wstatus < 0 {
+        return 0;
+    }
+    const low: i32 = wstatus & 0x7f;
+    if low == 0 {
+        return 0;
+    }
+    const sig: i32 = low & 0x7f;
+    if sig == 0 {
+        return 0;
+    }
+    return sig;
+}
+
+fn microapp_hosted_store_wait_status(kernel: &SimKernel, cid: u32, wstatus: i32) !void {
+    const signal_code: i32 = microapp_hosted_system_status_signal(wstatus);
+    if signal_code != 0 {
+        const fault_class: u32 = sim_fault_class_from_signal(signal_code);
+        try sim_store_loaded_fault_result(kernel, cid, fault_class, fault_class, signal_code as u32);
+        return;
+    }
+    const exit_code: i32 = microapp_hosted_exit_code_from_system_status(wstatus);
+    try sim_store_loaded_exit_result(kernel, cid, exit_code);
+}
+
+fn microapp_hosted_report_payload_result(kernel: &SimKernel, cid: u32) void {
+    if cid >= 8u32 {
+        @println("[microapp loader] invalid cid for payload result");
+        return;
+    }
+    if kernel.loaded_result_kind[cid] == SIM_LOADED_RESULT_VALIDATED {
+        var target_arch_name: &byte = "unknown" as &byte;
+        var bridge_name: &byte = "unknown" as &byte;
+        if kernel.loaded_image_valid[cid] != 0u32 {
+            const hdr: ImageHeader = kernel.loaded_image_headers[cid];
+            target_arch_name = microapp_hosted_target_arch_name(hdr.target_arch);
+            bridge_name = microapp_hosted_bridge_name(hdr.bridge_kind);
+        }
+        @println("[microapp loader] payload result=validated bridge=${bridge_name} target=${target_arch_name}");
+        return;
+    }
+    if kernel.loaded_result_kind[cid] == SIM_LOADED_RESULT_UNWIRED {
+        var target_arch_name: &byte = "unknown" as &byte;
+        var bridge_name: &byte = "unknown" as &byte;
+        if kernel.loaded_image_valid[cid] != 0u32 {
+            const hdr: ImageHeader = kernel.loaded_image_headers[cid];
+            target_arch_name = microapp_hosted_target_arch_name(hdr.target_arch);
+            bridge_name = microapp_hosted_bridge_name(hdr.bridge_kind);
+        }
+        @println("[microapp loader] payload result=unwired bridge=${bridge_name} target=${target_arch_name}");
+        return;
+    }
+    if kernel.loaded_result_kind[cid] == SIM_LOADED_RESULT_FAULT {
+        const fault_class: u32 = kernel.loaded_fault_class[cid];
+        const fault_code: u32 = kernel.loaded_fault_code[cid];
+        const fault_signal: u32 = kernel.loaded_fault_signal[cid];
+        const fault_class_name: &byte = sim_fault_class_name(fault_class);
+        @println("[microapp loader] payload result=fault class=${fault_class_name} code=${fault_code} signal=${fault_signal}");
+        return;
+    }
+    const exit_code: i32 = kernel.loaded_exit_code[cid];
+    if exit_code != 0 {
+        @println("[microapp loader] payload result=exit code=${exit_code}");
+        return;
+    }
+    @println("[microapp loader] payload result=ok");
+}
+
+fn microapp_hosted_log_store_child_result_failure() void {
+    @println("[microapp loader] failed to store child result");
+}
+
+fn microapp_hosted_resolve_uapp_path(argc: i32, argv: & &byte, default_uapp_path: &byte) &byte {
+    if argc > 1 && argv != null {
+        const arg_path: *byte = argv[1];
+        if arg_path != null && arg_path[0] != 0 as byte {
+            return arg_path as &byte;
+        }
+    }
+    return default_uapp_path;
+}
+
+fn microapp_hosted_resolve_native_payload_exe_path(argc: i32, argv: & &byte) &byte {
+    if argc > 2 && argv != null {
+        const arg_path: *byte = argv[2];
+        if arg_path != null && arg_path[0] != 0 as byte {
+            return arg_path as &byte;
+        }
+    }
+    return null;
+}
+
+fn microapp_hosted_run_payload_exe(payload_exe_path: &byte) i32 {
+    if payload_exe_path == null || payload_exe_path[0] == 0 as byte {
+        return 1;
+    }
+    var cmd: [byte: 4096] = [];
+    const cmd_len: i32 = snprintf(&cmd[0] as *byte, 4096, "\"%s\"" as *byte, payload_exe_path as *byte);
+    if cmd_len <= 0 || cmd_len >= 4096 {
+        @println("[microapp loader] failed to build payload command");
+        return 1;
+    }
+    return system(&cmd[0] as *byte);
+}
+
+fn microapp_hosted_store_child_result(kernel: &SimKernel, cid: u32, result: &MicroappHostedChildResult) !void {
+    if kernel == null || result == null {
+        return error.InvalidState;
+    }
+    if cid >= 8u32 {
+        return error.InvalidState;
+    }
+    if result.kind == SIM_LOADED_RESULT_EXIT {
+        try sim_store_loaded_exit_result(kernel, cid, result.exit_code);
+        return;
+    }
+    if result.kind == SIM_LOADED_RESULT_FAULT {
+        try sim_store_loaded_fault_result(kernel, cid, result.fault_class, result.fault_code, result.fault_signal);
+        return;
+    }
+    if result.kind == SIM_LOADED_RESULT_VALIDATED {
+        try sim_store_loaded_validated_result(kernel, cid);
+        return;
+    }
+    if result.kind == SIM_LOADED_RESULT_UNWIRED {
+        try sim_store_loaded_unwired_result(kernel, cid);
+        return;
+    }
+    try sim_reset_loaded_result(kernel, cid);
+}
+
+fn microapp_hosted_run_mapped_payload(kernel: &SimKernel) i32 {
+    if kernel == null {
+        return -1;
+    }
+    var pipe_fds: [i32: 2] = [];
+    _ = sys_pipe2(&pipe_fds[0], 0) catch {
+        @println("[microapp loader] pipe2 failed");
+        return -1;
+    };
+    const pid: i32 = fork();
+    if pid < 0 {
+        _ = close(pipe_fds[0]);
+        _ = close(pipe_fds[1]);
+        @println("[microapp loader] fork failed");
+        return -1;
+    }
+    if pid == 0 {
+        _ = close(pipe_fds[0]);
+        var child_status: i32 = 0;
+        const cid: u32 = sim_tick_loaded(kernel) catch |err| {
+            @println("microapp loader sim_tick_loaded error_id=${@error_id(err)}");
+            @println("[microapp loader] sim_tick_loaded failed");
+            child_status = 4;
+            0u32;
+        };
+        if child_status != 0 {
+            _ = close(pipe_fds[1]);
+            _exit(child_status);
+        }
+        if cid != 0u32 {
+            @println("[microapp loader] unexpected cid");
+            _ = close(pipe_fds[1]);
+            _exit(5);
+        }
+        var child_result: MicroappHostedChildResult = MicroappHostedChildResult{
+            kind: kernel.loaded_result_kind[0],
+            exit_code: kernel.loaded_exit_code[0],
+            fault_class: kernel.loaded_fault_class[0],
+            fault_code: kernel.loaded_fault_code[0],
+            fault_signal: kernel.loaded_fault_signal[0],
+        };
+        _ = write(pipe_fds[1], &child_result as &const byte, @size_of(MicroappHostedChildResult));
+        _ = close(pipe_fds[1]);
+        if kernel.loaded_result_kind[0] == SIM_LOADED_RESULT_EXIT {
+            _exit(kernel.loaded_exit_code[0]);
+        }
+        if kernel.loaded_result_kind[0] == SIM_LOADED_RESULT_FAULT {
+            _exit(128 + kernel.loaded_fault_code[0] as i32);
+        }
+        if kernel.loaded_result_kind[0] == SIM_LOADED_RESULT_UNWIRED {
+            _exit(6);
+        }
+        _exit(0);
+    }
+    _ = close(pipe_fds[1]);
+    var status: i32 = 0;
+    const waited: i32 = waitpid(pid, &status, 0);
+    var child_result: MicroappHostedChildResult = MicroappHostedChildResult{
+        kind: SIM_LOADED_RESULT_NONE,
+        exit_code: 0,
+        fault_class: SIM_FAULT_CLASS_NONE,
+        fault_code: 0u32,
+        fault_signal: 0u32,
+    };
+    const child_read: i64 = read(pipe_fds[0], &child_result as &byte, @size_of(MicroappHostedChildResult));
+    _ = close(pipe_fds[0]);
+    if waited != pid {
+        @println("[microapp loader] waitpid failed");
+        return -1;
+    }
+    if child_read == @size_of(MicroappHostedChildResult) as i64 {
+        microapp_hosted_store_child_result(kernel, 0u32, &child_result) catch {
+            microapp_hosted_log_store_child_result_failure();
+        };
+    }
+    return status;
+}
+
+export fn microapp_hosted_loader_run(argc: i32, argv: & &byte, default_uapp_path: &byte) i32 {
+    const argv_bytes: & &byte = argv as & &byte;
+    const uapp_path: &byte = microapp_hosted_resolve_uapp_path(argc, argv_bytes, default_uapp_path);
+    if uapp_path == null || uapp_path[0] == 0 as byte {
+        @println("[microapp loader] missing .uapp path");
+        return 1;
+    }
+
+    var kernel: SimKernel = sim_kernel_make();
+    sim_kernel_init(&kernel);
+
+    const exec_mem: *void = sys_mmap(null as *void, MICROAPP_HOSTED_BACKING_SIZE,
+        PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, 0 - 1, 0) catch {
+        @println("[microapp loader] exec mmap failed");
+        return 1;
+    };
+    const backing_ptr: &byte = exec_mem as &byte;
+    sim_kernel_attach_physmem(&kernel, backing_ptr[0: MICROAPP_HOSTED_BACKING_SIZE]) catch {
+        @println("[microapp loader] invalid exec backing memory");
+        return 1;
+    };
+
+    @println("[microapp loader] loading");
+    var img: [byte: MICROAPP_HOSTED_MAX_IMAGE_SIZE] = [];
+    const fp: &FILE = fopen(uapp_path as *byte, "rb\0" as &byte);
+    if fp == null {
+        @println("[microapp loader] fopen failed");
+        return 1;
+    }
+    const n: usize = fread(&img[0], 1 as usize, MICROAPP_HOSTED_MAX_IMAGE_SIZE as usize, fp);
+    _ = fclose(fp);
+    if n < IMAGE_HEADER_SIZE as usize {
+        @println("[microapp loader] image too small");
+        return 2;
+    }
+
+    sim_load_image(&kernel, 0u32, MICROAPP_HOSTED_DEFAULT_PRIORITY, img[0: n]) catch {
+        @println("[microapp loader] sim_load_image failed");
+        return 3;
+    };
+    microapp_hosted_apply_loaded_page_protections(&kernel, 0u32) catch {
+        @println("[microapp loader] mprotect failed");
+        return 3;
+    };
+    @println("[microapp loader] image loaded, ticking");
+    const native_payload_exe_path: &byte = microapp_hosted_resolve_native_payload_exe_path(argc, argv_bytes);
+    const loaded_hdr: ImageHeader = kernel.loaded_image_headers[0];
+    if microapp_hosted_can_execute_mapped_payload(&loaded_hdr) != 0 {
+        const payload_status: i32 = microapp_hosted_run_mapped_payload(&kernel);
+        const payload_exit: i32 = microapp_hosted_exit_code_from_system_status(payload_status);
+        const payload_signal: i32 = microapp_hosted_system_status_signal(payload_status);
+        if kernel.loaded_result_kind[0] == SIM_LOADED_RESULT_NONE {
+            microapp_hosted_store_wait_status(&kernel, 0u32, payload_status) catch {
+                @println("[microapp loader] failed to store mapped payload result");
+                return 4;
+            };
+        }
+        @println("[microapp loader] tick completed");
+        @println("[microapp loader] executed mapped payload");
+        microapp_hosted_report_payload_result(&kernel, 0u32);
+        if kernel.loaded_result_kind[0] == SIM_LOADED_RESULT_FAULT {
+            const fault_code: u32 = kernel.loaded_fault_code[0];
+            const fault_signal: u32 = kernel.loaded_fault_signal[0];
+            if fault_signal != 0u32 {
+                return payload_exit;
+            }
+            return 128 + fault_code as i32;
+        }
+        if kernel.loaded_result_kind[0] == SIM_LOADED_RESULT_EXIT && kernel.loaded_exit_code[0] != 0 {
+            @println("[microapp loader] payload exited non-zero");
+            return kernel.loaded_exit_code[0];
+        }
+    } else if native_payload_exe_path != null {
+        const cid: u32 = sim_tick_loaded(&kernel) catch |err| {
+            @println("microapp loader sim_tick_loaded error_id=${@error_id(err)}");
+            @println("[microapp loader] sim_tick_loaded failed");
+            return 4;
+        };
+        @println("[microapp loader] tick completed");
+        if cid != 0u32 {
+            @println("[microapp loader] unexpected cid");
+            return 5;
+        }
+        @println("[microapp loader] launching native payload");
+        const payload_status: i32 = microapp_hosted_run_payload_exe(native_payload_exe_path);
+        const payload_exit: i32 = microapp_hosted_exit_code_from_system_status(payload_status);
+        const payload_signal: i32 = microapp_hosted_system_status_signal(payload_status);
+        microapp_hosted_store_wait_status(&kernel, 0u32, payload_status) catch {
+            @println("[microapp loader] failed to store native payload result");
+            return 4;
+        };
+        microapp_hosted_report_payload_result(&kernel, 0u32);
+        if payload_exit != 0 {
+            if payload_signal == 0 {
+                @println("[microapp loader] payload exited non-zero");
+            }
+            return payload_exit;
+        }
+    } else {
+        var trap_ticks: u32 = 0u32;
+        while true {
+            const cid: u32 = sim_tick_loaded(&kernel) catch |err| {
+                @println("microapp loader sim_tick_loaded error_id=${@error_id(err)}");
+                @println("[microapp loader] sim_tick_loaded failed");
+                return 4;
+            };
+            @println("[microapp loader] tick completed");
+            if cid != 0u32 {
+                @println("[microapp loader] unexpected cid");
+                return 5;
+            }
+            if loaded_hdr.bridge_kind == ImageBridgeKind.ibk_trap {
+                if kernel.loaded_result_kind[0] == SIM_LOADED_RESULT_NONE {
+                    trap_ticks = trap_ticks + 1u32;
+                    if trap_ticks >= 1024u32 {
+                        @println("[microapp loader] trap bridge tick limit exceeded");
+                        return 6;
+                    }
+                    continue;
+                }
+                if kernel.loaded_result_kind[0] == SIM_LOADED_RESULT_EXIT || kernel.loaded_result_kind[0] == SIM_LOADED_RESULT_FAULT {
+                    @println("[microapp loader] executed trap payload");
+                    microapp_hosted_report_payload_result(&kernel, 0u32);
+                    if kernel.loaded_result_kind[0] == SIM_LOADED_RESULT_FAULT {
+                        const fault_code: u32 = kernel.loaded_fault_code[0];
+                        return 128 + fault_code as i32;
+                    }
+                    if kernel.loaded_exit_code[0] != 0 {
+                        @println("[microapp loader] payload exited non-zero");
+                        return kernel.loaded_exit_code[0];
+                    }
+                    @println("[microapp loader] done");
+                    return 0;
+                }
+            }
+            if kernel.loaded_result_kind[0] == SIM_LOADED_RESULT_VALIDATED {
+                microapp_hosted_report_payload_result(&kernel, 0u32);
+                @println("[microapp loader] trap bridge validated without native execution");
+                @println("[microapp loader] done");
+                return 0;
+            }
+            const target_arch_name: &byte = microapp_hosted_target_arch_name(loaded_hdr.target_arch);
+            const bridge_name: &byte = microapp_hosted_bridge_name(loaded_hdr.bridge_kind);
+            if kernel.loaded_result_kind[0] == SIM_LOADED_RESULT_UNWIRED {
+                microapp_hosted_report_payload_result(&kernel, 0u32);
+            }
+            @println("[microapp loader] no execution path for target_arch=${target_arch_name} bridge=${bridge_name}");
+            @println("[microapp loader] pass native payload path as argv[2] or add mapped execution support for this profile");
+            return 6;
+        }
+    }
+
+    @println("[microapp loader] done");
+    return 0;
+}

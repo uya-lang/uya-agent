@@ -1,0 +1,481 @@
+// lib/std/image/jpeg_bits.uya - JPEG 熵段的位读写（0xFF00 反转义 / RSTn / 填充）
+//
+// 模块路径：use std.image.jpeg_bits
+//
+// 本文件：**只做位与字节之间的搬运**，不懂 DCT、不懂 Huffman —— 熵段编码的数据流是
+//   「MSB 在前的位串」，但字节层有两条额外规矩（T.81 B.1.1.5 / B.1.1.2）：
+//   ① 数据里出现 `0xFF` 必须在后面塞一个 `0x00`（否则会被当成标记）；
+//   ② 位串收尾时用 **1** 补齐到字节边界（不是 0）。
+//   本文件把这两条封在读写器里，让 Huffman/DCT 两层只看见「取 n 位 / 写 n 位」。
+// 不变量：① 读侧**遇到真标记就停**（RSTn / EOI / 其它段头），并把 marker 记在
+//   `mark` 里 —— 停机后 get 恒返回 0，由调用方看 `overrun` 判「流被截断」，
+//   绝不用 0 冒充真实数据；② 写侧**容量检查只在 put_byte 一处**，越界一次就
+//   `ok = false` 并从此不再写（幂等，不半途崩）；③ 读侧是**逐位、不预读**的
+//   （见 jpeg_bits_next_byte 为什么不用 libjpeg 的预读形状），写侧的 acc 最多
+//   累计 32 位，所以单次 get/put 的 n 必须 <= 24（熵段的 n 最大 16，够用）。
+// 依赖：无（零 use、零 libc —— 只用整数运算与调用方给的内存）。
+// 命名：`JpegBitReader`/`JpegBitWriter`、`jpeg_bits_*`。
+
+// 触发「流停住」的标记值（0xFF 后面的那个字节）；0 = 还没遇到标记。
+export const JPEG_MARK_NONE: u8 = 0;
+// RSTn 区间：0xD0..0xD7（n = mark - 0xD0）。
+export const JPEG_RST0: u8 = 0xD0;
+export const JPEG_RST7: u8 = 0xD7;
+
+// 熵段位读器：data 是**整段 JPEG 字节**（从 SOI 起，或至少从 SOS 段体之后起，
+// 由调用方先把 pos 摆好），pos 是下一个待读字节。
+export struct JpegBitReader {
+    data: &const u8,
+    n: usize,
+    pos: usize,        // 下一个待读**流字节**的下标（撞到标记时指向标记的 0xFF）
+    cur: u8,           // 当前数据字节
+    nbits: i32,        // cur 里还没取走的位数（0 = 需要读下一个字节）
+    stopped: bool,     // 已停在标记上（或流结束）
+    eof: bool,         // 停下来的原因是数据耗尽
+    overrun: bool,     // 上一次取位不够（= 熵段被截断）
+    mark: u8,          // 停住的标记（JPEG_MARK_NONE = 没停在标记上）
+}
+
+// 初始化位读器。
+// 参数：
+// - r: 读器（调用方分配，本函数整体重写）。
+// - data: 字节缓冲（&u8 视图）。
+// - n: 缓冲长度。
+// - start: 熵数据起始偏移（落在这个偏移上开始读）。
+// 返回：
+// - 无。start 越界时读器直接处于 eof 状态。
+export fn jpeg_bits_init(r: &JpegBitReader, data: &const u8, n: usize,
+                         start: usize) void {
+    r.data = data;
+    r.n = n;
+    r.cur = 0 as u8;
+    r.nbits = 0;
+    r.stopped = false;
+    r.eof = false;
+    r.overrun = false;
+    r.mark = JPEG_MARK_NONE;
+    if start >= n {
+        r.pos = n;
+        r.stopped = true;
+        r.eof = true;
+        return;
+    }
+    r.pos = start;
+}
+
+// 取下一个**数据字节**放进 cur（0xFF00 算一个数据字节；撞到真标记就停，
+// 且 pos 留在标记的 0xFF 上**不消费**）。
+//
+// 这是「逐位、不预读」读器：一次只搬一个字节，要位时才搬下一个。为什么不用
+// libjpeg 那种「预读 4 字节进 acc」的形状：预读会把 pos 推过当前 interval 末尾
+// 的 RSTn，align 于是必须精确回退 —— 而数据里的 0xFF00 是**两个流字节一个数据
+// 字节**，按字节数回退会落进转义中间（实测在带 -restart 的真图上，第 70 个 MCU
+// 处报 JpegCorrupt）。逐个字节读就不存在「回退」：pos 永远指向下一个未读的流
+// 字节，撞到标记时正停在它上面。
+// 参数：
+// - r: 读器。
+// 返回：
+// - true = cur 里有 8 位可用；false = 流已停（标记或 EOF）。
+fn jpeg_bits_next_byte(r: &JpegBitReader) bool {
+    if r.stopped {
+        return false;
+    }
+    if r.pos >= r.n {
+        r.stopped = true;
+        r.eof = true;
+        return false;
+    }
+    const b: u8 = r.data[r.pos];
+    if b == 0xFF as u8 {
+        if r.pos + 1 >= r.n {
+            r.stopped = true;
+            r.eof = true;
+            return false;
+        }
+        const m: u8 = r.data[r.pos + 1];
+        if m == 0x00 as u8 {
+            r.pos = r.pos + 2;
+        } else {
+            r.mark = m;
+            r.stopped = true;
+            return false;
+        }
+    } else {
+        r.pos = r.pos + 1;
+    }
+    r.cur = b;
+    r.nbits = 8;
+    return true;
+}
+
+// 取 n 位（1..24，MSB 在前），返回无符号值。
+// 参数：
+// - r: 读器。
+// - n: 位数。
+// 返回：
+// - 取到的值；位不够时返回 0 并置 `overrun`（同时流进入 stopped）。
+export fn jpeg_bits_get(r: &JpegBitReader, n: i32) i32 {
+    if n <= 0 {
+        return 0;
+    }
+    if n > 24 {
+        r.overrun = true;
+        return 0;
+    }
+    var v: i32 = 0;
+    var i: i32 = 0;
+    while i < n {
+        if r.nbits <= 0 {
+            if !jpeg_bits_next_byte(r) {
+                r.overrun = true;
+                return 0;
+            }
+        }
+        r.nbits = r.nbits - 1;
+        const shift: i32 = r.nbits;
+        const bit: i32 = (((r.cur as i32) >> shift) & 1);
+        v = (v << 1) | bit;
+        i = i + 1;
+    }
+    return v;
+}
+
+// 只查看接下来 n 位（1..8，**不消费**），供 Huffman 快表先看一眼。
+// 参数：
+// - r: 读器。
+// - n: 位数（<= 8）。
+// 返回：
+// - 这 n 位的值；位不够（撞标记 / EOF）时返回 -1，调用方据此走逐位慢路径。
+export fn jpeg_bits_peek(r: &JpegBitReader, n: i32) i32 {
+    if n <= 0 {
+        return 0;
+    }
+    if n > 8 {
+        return 0 - 1;
+    }
+    if r.nbits >= n {
+        const shift: i32 = r.nbits - n;
+        const mask: i32 = (1 << n) - 1;
+        return (((r.cur as i32) >> shift) & mask);
+    }
+    // 跨字节：当前 cur 里剩下的 got 位 + pos 指向的**下一个**数据字节高位。
+    // 注意 pos 在「cur 已部分消费」时仍指着下一个字节（取字节时一次搬 8 位，
+    // 游标不会因为消费了几位而前移），所以这里读 r.data[r.pos] 正是要拼的那个字节。
+    var v: i32 = 0;
+    var got: i32 = 0;
+    if r.nbits > 0 {
+        const mask: i32 = (1 << r.nbits) - 1;
+        v = (r.cur as i32) & mask;
+        got = r.nbits;
+    }
+    const need0: i32 = n - got;
+    if need0 <= 0 {
+        const mask: i32 = (1 << n) - 1;
+        return (((r.cur as i32) >> r.nbits) & mask);
+    }
+    if r.stopped || r.pos >= r.n {
+        return 0 - 1;
+    }
+    const nb: u8 = r.data[r.pos];
+    if nb == 0xFF as u8 {
+        if r.pos + 1 >= r.n {
+            return 0 - 1;
+        }
+        const m: u8 = r.data[r.pos + 1];
+        if m != 0x00 as u8 {
+            return 0 - 1;          // 下一个就是标记：没有更多数据位
+        }
+    }
+    const need: i32 = n - got;
+    const high: i32 = (((nb as i32) >> (8 - need)) & ((1 << need) - 1));
+    return (v << need) | high;
+}
+
+// 消费 n 位（值已经由 peek 看过；这里只推进游标）。
+//
+// **必须逐位推进，不能「凑够 n 位再一次性减」**：peek 允许跨字节看（当前 cur 的
+// 余位 + 下一个字节的高位），此时若 consume 走「while nbits < n: next_byte()」，
+// 那一次 next_byte 会把 **cur 连同它剩下的位一起覆盖掉** —— 那几位是已经 peek 过、
+// 也属于这次码字的一部分，于是被静默丢弃，后续所有位整体左移（症状：小图尚可、
+// 一到某个 MCU 就 Huffman 取码失败）。逐位消费与 get 的推进方式完全一致，
+// 也与 peek 的「只看不动」互补。
+// 参数：
+// - r: 读器。
+// - n: 位数。
+// 返回：
+// - 无。位不够时置 overrun（不该发生：调用方必须先 peek 成功）。
+export fn jpeg_bits_consume(r: &JpegBitReader, n: i32) void {
+    if n <= 0 {
+        return;
+    }
+    var i: i32 = 0;
+    while i < n {
+        if r.nbits <= 0 {
+            if !jpeg_bits_next_byte(r) {
+                r.overrun = true;
+                return;
+            }
+        }
+        r.nbits = r.nbits - 1;
+        i = i + 1;
+    }
+}
+
+// 取 1 位（Huffman 慢路径用）。
+// 参数：
+// - r: 读器。
+// 返回：
+// - 0 或 1；位不够时返回 0 并置 `overrun`。
+export fn jpeg_bits_get1(r: &JpegBitReader) i32 {
+    return jpeg_bits_get(r, 1);
+}
+
+// 位读器里是否还有可用的位（cur 里剩位，或后面还有数据字节）。
+// 参数：
+// - r: 读器。
+// 返回：
+// - true = 还能取到位。
+export fn jpeg_bits_can_get(r: &const JpegBitReader) bool {
+    if r.nbits > 0 {
+        return true;
+    }
+    if r.stopped {
+        return false;
+    }
+    return r.pos < r.n;
+}
+
+// 当前是否已停在标记上（RSTn / EOI / 段头）。
+// 参数：
+// - r: 读器。
+// 返回：
+// - true = 停住了。
+export fn jpeg_bits_stopped(r: &const JpegBitReader) bool {
+    return r.stopped;
+}
+
+// 停住时是否因为数据耗尽（而不是遇到标记）。
+// 参数：
+// - r: 读器。
+// 返回：
+// - true = 数据读完了。
+export fn jpeg_bits_eof(r: &const JpegBitReader) bool {
+    return r.eof;
+}
+
+// 上一次取位是否位数不够（= 熵段被截断）。
+// 参数：
+// - r: 读器。
+// 返回：
+// - true = 发生过越界取位。
+export fn jpeg_bits_overrun(r: &const JpegBitReader) bool {
+    return r.overrun;
+}
+
+// 停住时的标记字节（JPEG_MARK_NONE = 没停在标记上）。
+// 参数：
+// - r: 读器。
+// 返回：
+// - 0xFF 后面的那个字节。
+export fn jpeg_bits_mark(r: &const JpegBitReader) u8 {
+    return r.mark;
+}
+
+// 对齐到字节边界：丢掉 cur 里还没取走的位（当前字节的尾巴）。
+// **不动 pos** —— 逐位读器没有预读，pos 一直指着下一个未读的流字节
+// （见 jpeg_bits_next_byte 的说明）。
+// 参数：
+// - r: 读器。
+// 返回：
+// - 无。
+export fn jpeg_bits_align(r: &JpegBitReader) void {
+    r.nbits = 0;
+}
+
+// 在 restart interval 边界上同步 RSTn：先对齐字节，再**向前**找到
+// `0xFF` + RSTn 这一对，校验编号，然后把读器摆到标记之后。
+//
+// 向前扫是安全的：数据里的 0xFF 一定跟着 0x00（T.81 B.1.1.5），
+// 所以扫到的 `0xFF` + 非 0x00 只可能是真标记。
+// 参数：
+// - r: 读器。
+// - idx: 本 interval 的序号（调用方自己数，从 0 起；按 idx % 8 比对编号）。
+// 返回：
+// - true = 标记正确（读器已移到下一个 interval 的数据上）。
+// - false = 找不到标记 / 编号不对 / 流已尽（调用方报 JpegCorrupt）。
+export fn jpeg_bits_sync_restart(r: &JpegBitReader, idx: i32) bool {
+    jpeg_bits_align(r);
+    var guard: i32 = 0;
+    while r.pos + 1 < r.n && guard < 32 {
+        const b: u8 = r.data[r.pos];
+        if b == 0xFF as u8 {
+            const m: u8 = r.data[r.pos + 1];
+            if m >= JPEG_RST0 && m <= JPEG_RST7 {
+                var want: i32 = idx % 8;
+                if want < 0 {
+                    want = 0;
+                }
+                const got: i32 = (m - JPEG_RST0) as i32;
+                r.pos = r.pos + 2;
+                r.stopped = false;
+                r.eof = false;
+                r.overrun = false;
+                r.mark = JPEG_MARK_NONE;
+                r.nbits = 0;
+                return got == want;
+            }
+            if m != 0x00 as u8 {
+                return false;
+            }
+            r.pos = r.pos + 2;
+            guard = guard + 1;
+            continue;
+        }
+        r.pos = r.pos + 1;
+        guard = guard + 1;
+    }
+    return false;
+}
+
+export struct JpegBitWriter {
+    out: &u8,
+    cap: usize,
+    len: usize,        // 已写出的字节数
+    acc: u32,          // 待写出的位（左对齐在低 nbits 位里）
+    nbits: i32,
+    ok: bool,
+}
+
+// 初始化位写器。
+// 参数：
+// - w: 写器（调用方分配，本函数整体重写）。
+// - out: 输出缓冲（&u8 视图）。
+// - cap: 缓冲字节数。
+// 返回：
+// - 无。out 为 null 或 cap = 0 时 ok = false。
+export fn jpeg_bits_winit(w: &JpegBitWriter, out: &u8, cap: usize) void {
+    w.out = out;
+    w.cap = cap;
+    w.len = 0;
+    w.acc = 0 as u32;
+    w.nbits = 0;
+    w.ok = out != null && cap > 0 as usize;
+}
+
+// 写一个字节，并按 0xFF00 规则做反转义。
+// 这是**唯一**做容量与转义检查的地方：位层只管把字节交给它。
+fn jpeg_bits_put_byte(w: &JpegBitWriter, b: u8) void {
+    if !w.ok {
+        return;
+    }
+    if w.len >= w.cap {
+        w.ok = false;
+        return;
+    }
+    w.out[w.len] = b;
+    w.len = w.len + 1;
+    if b == 0xFF as u8 {
+        if w.len >= w.cap {
+            w.ok = false;
+            return;
+        }
+        w.out[w.len] = 0x00 as u8;
+        w.len = w.len + 1;
+    }
+}
+
+// 写 n 位（1..24，MSB 在前）：value 的低 n 位被写出。
+// 参数：
+// - w: 写器。
+// - value: 待写值（只用低 n 位）。
+// - n: 位数。
+// 返回：
+// - 无。缓冲不足时置 ok = false。
+export fn jpeg_bits_put(w: &JpegBitWriter, value: i32, n: i32) void {
+    if n <= 0 || !w.ok {
+        return;
+    }
+    const mask: u32 = ((1 as u32) << n) - (1 as u32);
+    const v: u32 = (value as u32) & mask;
+    w.acc = (w.acc << n) | v;
+    w.nbits = w.nbits + n;
+    while w.nbits >= 8 {
+        const shift: i32 = w.nbits - 8;
+        const b: u32 = (w.acc >> shift) & (255 as u32);
+        jpeg_bits_put_byte(w, b as u8);
+        w.nbits = w.nbits - 8;
+    }
+}
+
+// 收尾：用 **1** 补齐到字节边界（T.81 B.1.1.5；补 0 会被某些解码器当成
+// 额外的系数位）。
+// 参数：
+// - w: 写器。
+// 返回：
+// - 无。收尾后还可以继续 put（用于多 scan 的流），但通常紧接着就取字节数。
+export fn jpeg_bits_flush(w: &JpegBitWriter) void {
+    if !w.ok {
+        return;
+    }
+    if w.nbits > 0 {
+        const pad: i32 = 8 - w.nbits;
+        const ones: i32 = (1 << pad) - 1;
+        jpeg_bits_put(w, ones, pad);
+    }
+    w.nbits = 0;
+    w.acc = 0 as u32;
+}
+
+// 已写出的字节数（含反转义塞进去的 0x00）。
+// 参数：
+// - w: 写器。
+// 返回：
+// - 字节数（ok = false 时是「已经写成功的那部分」）。
+export fn jpeg_bits_wlen(w: &const JpegBitWriter) usize {
+    return w.len;
+}
+
+// 写过程是否一直正常（没越界）。
+// 参数：
+// - w: 写器。
+// 返回：
+// - true = 全部写出去了。
+export fn jpeg_bits_wok(w: &const JpegBitWriter) bool {
+    return w.ok;
+}
+
+// 直接写一个原始字节（写段标记/段体用，**不做**反转义）。
+// 调用方保证字节是段结构的一部分（如 0xFF 后面跟标记码）。
+// 参数：
+// - w: 写器。
+// - b: 字节。
+// 返回：
+// - 无。缓冲不足时置 ok = false。
+export fn jpeg_bits_put_raw(w: &JpegBitWriter, b: u8) void {
+    if !w.ok {
+        return;
+    }
+    if w.len >= w.cap {
+        w.ok = false;
+        return;
+    }
+    w.out[w.len] = b;
+    w.len = w.len + 1;
+}
+
+// 直接写一段原始字节（写段体用，不做反转义）。
+// 参数：
+// - w: 写器。
+// - src: 源字节（&u8 视图）。
+// - n: 字节数。
+// 返回：
+// - 无。缓冲不足时置 ok = false（已写部分保留）。
+export fn jpeg_bits_put_raw_n(w: &JpegBitWriter, src: &const u8,
+                              n: usize) void {
+    var i: usize = 0;
+    while i < n {
+        jpeg_bits_put_raw(w, src[i]);
+        i = i + 1;
+    }
+}
+

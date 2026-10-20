@@ -1,0 +1,611 @@
+// lib/std/image/jpeg_marker.uya - JPEG 段解析（SOI/APPn/DQT/DHT/DRI/SOF/SOS/EOI）
+//
+// 模块路径：use std.image.jpeg_marker
+//
+// 本文件：**只认段、不碰熵数据** —— 从 SOI 起逐段走到 SOS，把解码要用到的
+//   全部信息装进 `JpegHeader`：量化表（最多 4 张）、Huffman 表（最多 4 张）、
+//   帧类型（基线 SOF0/SOF1）、宽高、分量描述（id / 采样因子 / 量化表号）、
+//   重启间隔、以及 SOS 的扫描分量（含 DC/AC 表号）与**熵数据起始偏移**。
+// 不变量：① **不认识的 SOF 一律拒绝**（渐进式 SOF2、算术 SOF9/10、无损 SOF3、
+//   12-bit SOF1 之外的差分帧）：宁可报 JpegUnsupported 也不按基线去解 —— 按基线
+//   解渐进式会得到一张「上半张对、下半张糊」的图，比报错糟得多；
+//   ② 段长度一律校验（长度域必须 >= 2 且不越界），越界报 JpegTruncated；
+//   ③ 表号 > 3 直接拒绝（T.81 只定义 0..3）；④ 本文件不分配内存，全部写进
+//   调用方给的 `JpegHeader`（无堆、无 libc）。
+// 依赖：无（零 use、零 libc）。
+// 命名：`JpegHeader` / `JpegComponent` / `JpegScanComp`、`jpeg_marker_*`、
+//   `JPEG_SOF_*`。
+
+// 错误族（**必须显式声明**：不声明时 `return error.JpegCorrupt` 也能过检查，
+// 那是「未知错误」，@error_id 会给出一个没意义的编号 —— 诊断时完全指不到地方）。
+// 四个码的语义：
+//   * JpegBadMarker   —— 根本不是 JPEG（没有 SOI），或段结构不成形；
+//   * JpegTruncated   —— 字节不够（段长度越界 / 熵段读尽）；
+//   * JpegUnsupported —— **我们不做**的合法 JPEG（渐进式、算术、12-bit、4 分量）；
+//   * JpegCorrupt     —— 结构合法但内容自相矛盾（表号越界、Huffman 码不合法）。
+error JpegBadMarker;
+error JpegTruncated;
+error JpegUnsupported;
+error JpegCorrupt;
+// 编码侧：输出缓冲装不下（调用方按 jpeg_max_bytes 准备就不会遇到）
+error JpegBufferTooSmall;
+
+// 段标记（0xFF 后面那个字节）。
+export const JPEG_M_SOF0: u8 = 0xC0;
+export const JPEG_M_SOF1: u8 = 0xC1;
+export const JPEG_M_SOF2: u8 = 0xC2;      // 渐进式：拒绝
+export const JPEG_M_SOF3: u8 = 0xC3;      // 无损：拒绝
+export const JPEG_M_DHT: u8 = 0xC4;
+export const JPEG_M_SOF9: u8 = 0xC9;      // 算术：拒绝
+export const JPEG_M_SOF10: u8 = 0xCA;     // 渐进 + 算术：拒绝
+export const JPEG_M_DAC: u8 = 0xCC;       // 算术编码条件：拒绝
+export const JPEG_M_RST0: u8 = 0xD0;
+export const JPEG_M_RST7: u8 = 0xD7;
+export const JPEG_M_SOI: u8 = 0xD8;
+export const JPEG_M_EOI: u8 = 0xD9;
+export const JPEG_M_SOS: u8 = 0xDA;
+export const JPEG_M_DQT: u8 = 0xDB;
+export const JPEG_M_DRI: u8 = 0xDD;
+export const JPEG_M_APP0: u8 = 0xE0;
+export const JPEG_M_COM: u8 = 0xFE;
+
+// 一次扫描里最多几个分量（基线是 1..4；我们只用到 1 与 3）。
+export const JPEG_MAX_COMPS: usize = 4;
+// 量化表 / Huffman 表的表号上限（T.81 定义 0..3）。
+export const JPEG_MAX_TABLES: usize = 4;
+// 色度分量最多几个块（4:2:0 = 4 个 Y 对应 1 个 Cb + 1 个 Cr；
+// 每分量每 MCU 最多 4 个块）。
+export const JPEG_MAX_BLOCKS: usize = 4;
+
+// 扁平表数组的步长（见 JpegHeader 里那段说明）。
+export const JPEG_QUANT_STRIDE: usize = 64;
+export const JPEG_HUFF_BITS_STRIDE: usize = 16;
+export const JPEG_HUFF_VALS_STRIDE: usize = 162;
+
+// Huffman 表的扁平下标：(类 0=DC/1=AC, 表号 0..3) → 0..7。
+export fn jpeg_huff_slot(tc: i32, th: i32) usize {
+    return ((tc * (JPEG_MAX_TABLES as i32) + th) as usize);
+}
+
+// 第 t 张量化表里第 k 个值（zigzag 顺序）。表号或下标越界返回 0。
+export fn jpeg_quant_at(h: &const JpegHeader, t: i32, k: usize) u16 {
+    if t < 0 || t >= (JPEG_MAX_TABLES as i32) {
+        return 0 as u16;
+    }
+    if k >= JPEG_QUANT_STRIDE {
+        return 0 as u16;
+    }
+    return h.quant[((t as usize) * JPEG_QUANT_STRIDE) + k];
+}
+
+// 第 t 张量化表是否出现过。表号越界算「没出现」。
+export fn jpeg_quant_used(h: &const JpegHeader, t: i32) bool {
+    if t < 0 || t >= (JPEG_MAX_TABLES as i32) {
+        return false;
+    }
+    const idx: usize = t as usize;
+    return h.quant_used[idx];
+}
+
+// 某张 Huffman 表的 BITS[i]（i = 0..15，对应码长 i+1）。越界返回 0。
+export fn jpeg_huff_bits_at(h: &const JpegHeader, tc: i32,
+                            th: i32, i: usize) u8 {
+    if tc < 0 || tc > 1 || th < 0 || th >= (JPEG_MAX_TABLES as i32) {
+        return 0 as u8;
+    }
+    if i >= JPEG_HUFF_BITS_STRIDE {
+        return 0 as u8;
+    }
+    const slot: usize = ((tc * (JPEG_MAX_TABLES as i32) + th) as usize);
+    return h.huff_bits[slot * JPEG_HUFF_BITS_STRIDE + i];
+}
+
+// 某张 Huffman 表的 HUFFVAL[k]。越界返回 0。
+export fn jpeg_huff_val_at(h: &const JpegHeader, tc: i32,
+                           th: i32, k: usize) u8 {
+    if tc < 0 || tc > 1 || th < 0 || th >= (JPEG_MAX_TABLES as i32) {
+        return 0 as u8;
+    }
+    if k >= JPEG_HUFF_VALS_STRIDE {
+        return 0 as u8;
+    }
+    const slot: usize = ((tc * (JPEG_MAX_TABLES as i32) + th) as usize);
+    return h.huff_vals[slot * JPEG_HUFF_VALS_STRIDE + k];
+}
+
+// 某张 Huffman 表的符号个数（= sum(BITS)）。越界返回 0。
+export fn jpeg_huff_count_at(h: &const JpegHeader, tc: i32, th: i32) i32 {
+    if tc < 0 || tc > 1 || th < 0 || th >= (JPEG_MAX_TABLES as i32) {
+        return 0;
+    }
+    const slot: usize = ((tc * (JPEG_MAX_TABLES as i32) + th) as usize);
+    return h.huff_count[slot];
+}
+
+// 某张 Huffman 表是否出现过。越界返回 false。
+export fn jpeg_huff_used_at(h: &const JpegHeader, tc: i32, th: i32) bool {
+    if tc < 0 || tc > 1 || th < 0 || th >= (JPEG_MAX_TABLES as i32) {
+        return false;
+    }
+    const slot: usize = ((tc * (JPEG_MAX_TABLES as i32) + th) as usize);
+    return h.huff_used[slot];
+}
+
+// 一个帧分量的描述（SOF 段里那一项）。
+export struct JpegComponent {
+    id: u8,            // 分量标识（1 = Y，2 = Cb，3 = Cr；但**只按位置解释**，见解码器）
+    h_samp: i32,       // 水平采样因子（1..4）
+    v_samp: i32,       // 垂直采样因子（1..4）
+    tq: i32,           // 量化表号
+}
+
+// SOS 里的一个扫描分量。
+export struct JpegScanComp {
+    id: u8,
+    td: i32,           // DC Huffman 表号
+    ta: i32,           // AC Huffman 表号
+}
+
+// 解一张图需要的全部头信息（由 jpeg_marker_parse 填）。
+export struct JpegHeader {
+    precision: i32,              // 采样精度（只接受 8）
+    width: i32,
+    height: i32,
+    ncomp: i32,                  // 帧分量数（1 或 3）
+    max_h: i32,                  // 分量里最大的水平采样因子
+    max_v: i32,
+    restart_interval: i32,       // DRI 给的 MCU 数（0 = 没有重启）
+    has_dri: bool,
+    progressive: bool,           // 帧是 SOF2 —— 拒绝时用来给准确的话术
+    arithmetic: bool,            // SOF9/SOF10/DAC —— 同上
+    comp: [JpegComponent: 4],    // 帧分量（前 ncomp 个有效）
+    // 表一律用**一维扁平数组**：编译器（v0.10.3）对结构体里的多维数组字段
+    // 直接发不出合法 C（`uint16_t[64] quant[4];` —— 见踩坑：结构体多维数组字段
+    // 的 codegen 缺陷），一维则完全正常。下标由下面的 jpeg_quant_at 等小函数算：
+    //   quant[t*64 + k]                      —— 第 t 张量化表的第 k 个值（zigzag 顺序）
+    //   huff_bits[(cls*4+th)*16 + i]         —— BITS
+    //   huff_vals[(cls*4+th)*162 + k]        —— HUFFVAL
+    //   huff_count[cls*4+th] / huff_used[cls*4+th]
+    quant: [u16: 256],
+    quant_used: [bool: 4],
+    huff_bits: [u8: 128],
+    huff_vals: [u8: 1296],
+    huff_count: [i32: 8],
+    huff_used: [bool: 8],
+    // SOS
+    ns: i32,                     // 扫描分量数
+    scan: [JpegScanComp: 4],
+    entropy_start: usize,        // 熵数据起始偏移（SOS 段体之后）
+}
+
+// 空头（全零；解析失败时调用方不必清）。
+export fn jpeg_header_blank() JpegHeader {
+    var h: JpegHeader = JpegHeader{
+        precision: 0, width: 0, height: 0, ncomp: 0, max_h: 1, max_v: 1,
+        restart_interval: 0, has_dri: false, progressive: false,
+        arithmetic: false,
+        comp: [JpegComponent{ id: 0, h_samp: 0, v_samp: 0, tq: 0 }: 4],
+        quant: [0: 256],
+        quant_used: [false: 4],
+        huff_bits: [0: 128],
+        huff_vals: [0: 1296],
+        huff_count: [0: 8],
+        huff_used: [false: 8],
+        ns: 0,
+        scan: [JpegScanComp{ id: 0, td: 0, ta: 0 }: 4],
+        entropy_start: 0 as usize,
+    };
+    return h;
+}
+
+// 解析 DQT 段体：可含多张表，每张 = 精度/表号 + 64 个值（8-bit 或 16-bit 大端）。
+// 参数：
+// - p: 段体。
+// - pn: 长度（不含长度域本身）。
+// - h: 头（就地写 quant / quant_used）。
+// 返回：
+// - true = 解析成功。
+// - error: 长度不足或表号越界（JpegTruncated / JpegCorrupt / JpegUnsupported）。
+fn jpeg_parse_dqt(p: &const u8, pn: usize, h: &JpegHeader) !bool {
+    var i: usize = 0;
+    while i < pn {
+        const pq: i32 = ((p[i] >> 4) as i32);
+        const tq: i32 = ((p[i] & (15 as u8)) as i32);
+        i = i + 1;
+        if tq < 0 || tq >= (JPEG_MAX_TABLES as i32) {
+            return error.JpegCorrupt;
+        }
+        if pq == 0 {
+            if i + 64 > pn {
+                return error.JpegTruncated;
+            }
+            const qbase: usize = (tq as usize) * JPEG_QUANT_STRIDE;
+            var k: usize = 0;
+            while k < 64 {
+                h.quant[qbase + k] = p[i + k] as u16;
+                k = k + 1;
+            }
+            i = i + 64;
+        } else if pq == 1 {
+            // 12-bit 精度的量化表：本实现不收（像素是 8-bit 的基线）
+            return error.JpegUnsupported;
+        } else {
+            return error.JpegCorrupt;
+        }
+        h.quant_used[tq as usize] = true;
+    }
+    return true;
+}
+
+// 解析 DHT 段体：可含多张表，每张 = 类/表号 + 16 个码长计数 + 符号表。
+// 参数：
+// - p: 段体。
+// - pn: 长度。
+// - h: 头（就地写 huff_*）。
+// 返回：
+// - true = 成功。
+// - error: 长度不足/类号表号越界/符号数超上限（JpegTruncated / JpegCorrupt）。
+fn jpeg_parse_dht(p: &const u8, pn: usize, h: &JpegHeader) !bool {
+    var i: usize = 0;
+    while i < pn {
+        if i + 17 > pn {
+            return error.JpegTruncated;
+        }
+        const tc: i32 = ((p[i] >> 4) as i32);
+        const th: i32 = ((p[i] & (15 as u8)) as i32);
+        i = i + 1;
+        if tc < 0 || tc > 1 {
+            return error.JpegCorrupt;
+        }
+        if th < 0 || th >= (JPEG_MAX_TABLES as i32) {
+            return error.JpegCorrupt;
+        }
+        const slot: usize = jpeg_huff_slot(tc, th);
+        const bbase: usize = slot * JPEG_HUFF_BITS_STRIDE;
+        const vbase: usize = slot * JPEG_HUFF_VALS_STRIDE;
+        var n: i32 = 0;
+        var k: usize = 0;
+        while k < 16 {
+            h.huff_bits[bbase + k] = p[i + k];
+            n = n + (p[i + k] as i32);
+            k = k + 1;
+        }
+        i = i + 16;
+        if n < 0 || n > 162 {
+            return error.JpegCorrupt;
+        }
+        if i + (n as usize) > pn {
+            return error.JpegTruncated;
+        }
+        k = 0;
+        while k < (n as usize) {
+            h.huff_vals[vbase + k] = p[i + k];
+            k = k + 1;
+        }
+        i = i + (n as usize);
+        h.huff_count[slot] = n;
+        h.huff_used[slot] = true;
+    }
+    return true;
+}
+
+// 解析 SOF 段体（帧头）：精度、宽高、分量描述。
+// 参数：
+// - m: 段标记（用来区分基线/渐进/算术）。
+// - p: 段体。
+// - pn: 长度。
+// - h: 头（就地写 precision/width/height/ncomp/comp/max_h/max_v，以及拒绝标志）。
+// 返回：
+// - true = 成功（可能带着 progressive/arithmetic 标志 —— 由调用方决定拒不拒）。
+// - error: 长度不足或分量数越界（JpegTruncated / JpegCorrupt）。
+fn jpeg_parse_sof(m: u8, p: &const u8, pn: usize, h: &JpegHeader) !bool {
+    // 先记下「这个帧是哪种编码」（调用方据此拒绝），再照常读宽高 ——
+    // **渐进式的宽高也要读出来**：`jpeg_decode_info` 的用途是「先问尺寸再决定
+    // 收不收」，只回一句「不支持」而不给尺寸，调用方就没法说清「4032x3024 的
+    // 渐进式 JPEG 我解不了」。
+    if m == JPEG_M_SOF2 {
+        h.progressive = true;
+    }
+    if m == JPEG_M_SOF9 || m == JPEG_M_SOF10 {
+        h.arithmetic = true;
+    }
+    if m == JPEG_M_SOF3 {
+        // 无损（差分）帧：本实现不收（它的 SOF 体里没有 DCT 的量化表号语义）
+        return error.JpegUnsupported;
+    }
+    if pn < 6 {
+        return error.JpegTruncated;
+    }
+    h.precision = p[0] as i32;
+    h.height = ((p[1] as i32) << 8) | (p[2] as i32);
+    h.width = ((p[3] as i32) << 8) | (p[4] as i32);
+    const nc: i32 = p[5] as i32;
+    if nc != 1 && nc != 3 {
+        return error.JpegUnsupported;
+    }
+    if nc > (JPEG_MAX_COMPS as i32) {
+        return error.JpegCorrupt;
+    }
+    if pn < (6 + (nc as usize) * 3) {
+        return error.JpegTruncated;
+    }
+    h.ncomp = nc;
+    h.max_h = 1;
+    h.max_v = 1;
+    var i: i32 = 0;
+    while i < nc {
+        _ = try jpeg_parse_frame_comp(p, 6 + (i as usize) * 3, i, h);
+        i = i + 1;
+    }
+    if h.width <= 0 || h.height <= 0 {
+        return error.JpegCorrupt;
+    }
+    return true;
+}
+
+// 读 SOF 段体里的一个分量描述（id / 采样因子 / 量化表号）并更新 max_h/max_v。
+// 参数：
+// - p: SOF 段体。
+// - o: 该分量的起始偏移（id 那一字节）。
+// - ci: 分量下标（写进 h.comp[ci]）。
+// - h: 头（就地更新）。
+// 返回：
+// - true = 成功；error = JpegCorrupt（采样因子越界）。
+fn jpeg_parse_frame_comp(p: &const u8, o: usize, ci: i32,
+                         h: &JpegHeader) !bool {
+    if ci < 0 || ci >= 4 {
+        return error.JpegCorrupt;
+    }
+    h.comp[ci as usize].id = p[o];
+    h.comp[ci as usize].h_samp = ((p[o + 1] >> 4) as i32);
+    h.comp[ci as usize].v_samp = ((p[o + 1] & (15 as u8)) as i32);
+    h.comp[ci as usize].tq = (p[o + 2] as i32);
+    if h.comp[ci as usize].h_samp < 1 || h.comp[ci as usize].h_samp > 4 {
+        return error.JpegCorrupt;
+    }
+    if h.comp[ci as usize].v_samp < 1 || h.comp[ci as usize].v_samp > 4 {
+        return error.JpegCorrupt;
+    }
+    if h.comp[ci as usize].h_samp > h.max_h {
+        h.max_h = h.comp[ci as usize].h_samp;
+    }
+    if h.comp[ci as usize].v_samp > h.max_v {
+        h.max_v = h.comp[ci as usize].v_samp;
+    }
+    return true;
+}
+
+// 解析 SOS 段体：扫描分量（各自用哪张 DC/AC 表）+ 谱选择（基线必须 0/63/0）。
+// 参数：
+// - p: 段体。
+// - pn: 长度。
+// - h: 头（就地写 ns/scan）。
+// 返回：
+// - true = 成功。
+// - error: 长度不足、分量数越界、或谱选择不是基线（JpegUnsupported/JpegTruncated）。
+fn jpeg_parse_sos(p: &const u8, pn: usize, h: &JpegHeader) !bool {
+    if pn < 4 {
+        return error.JpegTruncated;
+    }
+    const ns: i32 = p[0] as i32;
+    if ns < 1 || ns > (JPEG_MAX_COMPS as i32) {
+        return error.JpegCorrupt;
+    }
+    if pn < (1 + (ns as usize) * 2 + 3) {
+        return error.JpegTruncated;
+    }
+    h.ns = ns;
+    var i: i32 = 0;
+    while i < ns {
+        const o: usize = 1 + (i as usize) * 2;
+        h.scan[i as usize].id = p[o];
+        const td: i32 = ((p[o + 1] >> 4) as i32);
+        const ta: i32 = ((p[o + 1] & (15 as u8)) as i32);
+        if td < 0 || td >= (JPEG_MAX_TABLES as i32) {
+            return error.JpegCorrupt;
+        }
+        if ta < 0 || ta >= (JPEG_MAX_TABLES as i32) {
+            return error.JpegCorrupt;
+        }
+        h.scan[i as usize].td = td;
+        h.scan[i as usize].ta = ta;
+        i = i + 1;
+    }
+    const so: usize = 1 + (ns as usize) * 2;
+    const ss: i32 = p[so] as i32;
+    const se: i32 = p[so + 1] as i32;
+    const ah: i32 = ((p[so + 2] >> 4) as i32);
+    const al: i32 = ((p[so + 2] & (15 as u8)) as i32);
+    if h.progressive {
+        // 渐进式的每个 scan 都有自己的谱选择（Ss/Se/Ah/Al），**不在解析层判**：
+        // 「先问尺寸」要能过（它只关心宽高），拒不拒由解码侧看 progressive 标志。
+        return true;
+    }
+    if ss != 0 || se != 63 || ah != 0 || al != 0 {
+        // 基线顺序 DCT 只允许这一组（多 scan 顺序文件也走这里被拒）
+        return error.JpegUnsupported;
+    }
+    return true;
+}
+
+// 从头解析到 SOS：填 h，并记下熵数据起始偏移。
+// 参数：
+// - data: 整段 JPEG 字节（&u8 视图，含 SOI）。
+// - n: 字节数。
+// - h: 输出头（调用方分配，本函数整体重写）。
+// 返回：
+// - true = 成功，h.entropy_start 指向熵数据第一字节。
+// - error: JpegTruncated（读不全）/ JpegBadMarker（不是 JPEG 或段结构坏）/
+//   JpegUnsupported（渐进式、算术、12-bit、无损、4 分量等）/ JpegCorrupt。
+// 读一个段头：返回标记与段体（不含长度域），并把 pos 推到段体之后。
+// 参数：
+// - data/n: 整段 JPEG。
+// - pos: 进出参（进 = 0xFF 的位置，出 = 段体之后）。
+// - m_out: 接收标记码。
+// - body_out: 接收段体首地址。
+// - len_out: 接收段体长度（不填时用不到）。
+// 返回：
+// - true = 读到一个带长度域的段；false = 结构坏（调用方报错）。
+fn jpeg_next_segment(data: &const u8, n: usize, pos: &usize, m_out: &u8,
+                     body_out: &&const u8, len_out: &usize) !bool {
+    if pos[0] + 1 >= n {
+        return error.JpegTruncated;
+    }
+    if data[pos[0]] != 0xFF as u8 {
+        return error.JpegBadMarker;
+    }
+    // 允许填充的 0xFF（T.81 B.1.1.2）
+    while pos[0] < n && data[pos[0]] == 0xFF as u8 {
+        pos[0] = pos[0] + 1;
+    }
+    if pos[0] >= n {
+        return error.JpegTruncated;
+    }
+    const m: u8 = data[pos[0]];
+    pos[0] = pos[0] + 1;
+    m_out[0] = m;
+    // 无长度域的标记（TEM / RSTn）没有段体
+    if m == 0x01 as u8 || (m >= JPEG_M_RST0 && m <= JPEG_M_RST7) {
+        return false;
+    }
+    if pos[0] + 2 > n {
+        return error.JpegTruncated;
+    }
+    const ln: usize = ((data[pos[0]] as usize) << 8)
+        | (data[pos[0] + 1] as usize);
+    if ln < 2 || pos[0] + ln > n {
+        return error.JpegTruncated;
+    }
+    body_out[0] = jpeg_sub(data, pos[0] + 2);
+    len_out[0] = ln - 2;
+    pos[0] = pos[0] + ln;
+    return true;
+}
+
+// 按标记分派段体（DQT/DHT/DRI/SOF/DAC）。
+// 返回：
+// - true = 分派完成；error = 段体坏。
+fn jpeg_dispatch_segment(m: u8, body: &const u8, body_len: usize,
+                         h: &JpegHeader, saw_sof: &bool) !bool {
+    if m == JPEG_M_DQT {
+        _ = try jpeg_parse_dqt(body, body_len, h);
+    } else if m == JPEG_M_DHT {
+        _ = try jpeg_parse_dht(body, body_len, h);
+    } else if m == JPEG_M_DRI {
+        if body_len < 2 {
+            return error.JpegTruncated;
+        }
+        h.restart_interval = ((body[0] as i32) << 8) | (body[1] as i32);
+        h.has_dri = true;
+    } else if (m >= JPEG_M_SOF0 && m <= JPEG_M_SOF3)
+        || (m >= JPEG_M_SOF9 && m <= JPEG_M_SOF10) {
+        _ = try jpeg_parse_sof(m, body, body_len, h);
+        saw_sof[0] = true;
+    } else if m == JPEG_M_DAC {
+        h.arithmetic = true;
+    }
+    // 其它段（APPn / COM / DNL…）整段跳过
+    return true;
+}
+
+// 从头解析到 SOS：填 h，并记下熵数据起始偏移。
+// 参数：
+// - data: 整段 JPEG 字节（&u8 视图，含 SOI）。
+// - n: 字节数。
+// - h: 输出头（调用方分配，本函数整体重写）。
+// 返回：
+// - true = 成功，h.entropy_start 指向熵数据第一字节。
+// - error: JpegTruncated（读不全）/ JpegBadMarker（不是 JPEG 或段结构坏）/
+//   JpegUnsupported（渐进式、算术、12-bit、无损、4 分量等 —— 见 jpeg_decode）/
+//   JpegCorrupt。
+export fn jpeg_marker_parse(data: &const u8, n: usize, h: &JpegHeader) !bool {
+    if n < 4 {
+        return error.JpegTruncated;
+    }
+    if data[0] != 0xFF as u8 || data[1] != JPEG_M_SOI {
+        return error.JpegBadMarker;
+    }
+    h[0] = jpeg_header_blank();
+    var pos: usize = 2;
+    var saw_sof: bool = false;
+    var saw_sos: bool = false;
+    while pos + 1 < n {
+        var m: u8 = 0;
+        var body: &const u8 = null;
+        var body_len: usize = 0;
+        if !try jpeg_next_segment(data, n, &pos, &m, &body, &body_len) {
+            continue;                 // TEM / RSTn：没有段体，继续找
+        }
+        if m == JPEG_M_EOI {
+            break;
+        }
+        if m == JPEG_M_SOI {
+            continue;
+        }
+        if m == JPEG_M_SOS {
+            if !saw_sof {
+                return error.JpegCorrupt;
+            }
+            _ = try jpeg_parse_sos(body, body_len, h);
+            // pos 已指向段体之后 = 熵数据起点
+            h.entropy_start = pos;
+            saw_sos = true;
+            break;
+        }
+        _ = try jpeg_dispatch_segment(m, body, body_len, h, &saw_sof);
+    }
+    if !saw_sos {
+        return error.JpegTruncated;
+    }
+    // **这里不拒渐进式/算术编码**：解析层只负责「把 SOF 里的事实读出来」，
+    // 拒不拒是调用方的事 —— `jpeg_decode_info` 要能在渐进式上照样给出宽高
+    // （「先问尺寸」的用途），`jpeg_decode` 才拒绝。12-bit 精度同理放在
+    // 解码侧判（解析层已经把 precision 填好了）。
+    return true;
+}
+
+// 子视图：data + off（不校验长度，调用方已确认）。
+// 单独一个函数是因为「切片」语法对 const 全局数组有 codegen 缺陷（见 jpeg_dct
+// 的文件头），而这里用的是运行期指针，必须走指针算术。
+fn jpeg_sub(data: &const u8, off: usize) &const u8 {
+    const base: usize = @usize_from_ptr(data as &const void);
+    return @ptr_from_usize(base + off) as &const u8;
+}
+
+// MCU 里的块数（= max_h * max_v * ncomp 的另一种算法：每个 MCU 的 Y 块数 = max_h*max_v）。
+// 参数：
+// - h: 已解析的头。
+// 返回：
+// - 一个 MCU 的块总数（基线 4:2:0 三通道为 6）。
+export fn jpeg_mcu_blocks(h: &const JpegHeader) i32 {
+    var total: i32 = 0;
+    var i: i32 = 0;
+    while i < h.ncomp {
+        const c: JpegComponent = h.comp[i as usize];
+        total = total + c.h_samp * c.v_samp;
+        i = i + 1;
+    }
+    return total;
+}
+
+// 图像按 MCU 网格算出的列数/行数（右/下边不足一个 MCU 的部分也要补齐编码）。
+// 参数：
+// - h: 已解析的头。
+// - mcus_x: 接收 MCU 列数。
+// - mcus_y: 接收 MCU 行数。
+// 返回：
+// - 无。
+export fn jpeg_mcu_grid(h: &const JpegHeader, mcus_x: &i32, mcus_y: &i32) void {
+    const mw: i32 = h.max_h * 8;
+    const mh: i32 = h.max_v * 8;
+    var cx: i32 = (h.width + mw - 1) / mw;
+    var cy: i32 = (h.height + mh - 1) / mh;
+    if cx < 1 {
+        cx = 1;
+    }
+    if cy < 1 {
+        cy = 1;
+    }
+    mcus_x[0] = cx;
+    mcus_y[0] = cy;
+}

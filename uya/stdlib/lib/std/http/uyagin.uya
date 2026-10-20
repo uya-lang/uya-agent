@@ -1,0 +1,3358 @@
+// lib/std/http/uyagin.uya — Gin 风格纯 @async_fn HTTP 框架核心
+//
+// 模块路径：use std.http.uyagin
+
+use std;
+use std.async;
+use std.async_event;
+use std.async_scheduler;
+use std.async_frame.AsyncFramePool;
+use std.http.types;
+use std.http.uyagin_router;
+use std.http.parse.extract_multipart_boundary;
+use std.http.parse.parse_multipart;
+use std.http.server;
+use std.mem.allocator.IAllocator;
+use std.mem.arena.Arena;
+use std.mem.arena.arena_init;
+use std.mem.arena.arena_reset;
+use std.mem.arena.arena_alloc;
+use libc.heap;
+use libc.pthread;
+use libc.syscall;
+use libc.errno;
+
+export error HandlerMissing;
+export error RouteIndexInvalid;
+export error HeaderBufferTooSmall;
+
+export const UYAGIN_MAX_ROUTES: i32 = 1024;
+export const UYAGIN_IO_CAP: usize = (65536 + 4096) as usize;
+export const UYAGIN_HEADER_CAP: usize = 768;
+export const UYAGIN_MAX_MIDDLEWARES: i32 = 8;
+export const UYAGIN_MAX_RESPONSE_HEADERS: i32 = 16;
+export const UYAGIN_RUN_CONN_SLOT_CAP: i32 = 64;
+export const UYAGIN_REQUEST_ARENA_CAP: usize = 16384;
+const UYAGIN_TYPED_HANDLER_WORDS: usize = 32;
+const UYAGIN_TYPED_HANDLER_BYTES: usize = UYAGIN_TYPED_HANDLER_WORDS * @size_of(usize);
+const UYAGIN_OBSERVE_LOG_CAP: usize = 640;
+const UYAGIN_SHARD_THREAD_STACK_BYTES: usize = 32 * 1024 * 1024;
+// Hot-path connection frame is caller-owned by the engine slot. Keep a
+// conservative fixed backing store so slot orchestration stays independent of
+// compile-time @size_of(@frame(...)) folding.
+const UYAGIN_CONN_FRAME_BYTES: usize = 8192;
+const UYAGIN_CONN_FRAME_WORDS: usize =
+    (UYAGIN_CONN_FRAME_BYTES + @size_of(usize) - 1) / @size_of(usize);
+
+var uyagin_empty_body_raw: [byte: 1] = [0 as byte];
+
+export enum UyaginMode {
+    Debug,
+    Release,
+}
+
+export struct EngineRunOptions {
+    max_connections: i32,
+    accept_batch: i32,
+    poll_timeout_ms: i32,
+    shard_count: i32,
+    reuse_port: bool,
+    read_timeout_ms: u32,
+    write_timeout_ms: u32,
+    idle_timeout_ms: u32,
+    shutdown_grace_ms: u32,
+    listen_backlog: i32,
+    buffer_cap: usize,
+    request_arena_cap: usize,
+    mode: UyaginMode,
+    latency_sample_every: u32,
+    metrics_detail_sample_every: u32,
+}
+
+export struct EngineRunController {
+    stop_requested: atomic i32,
+}
+
+export struct UyaginLimits {
+    max_header_count: i32,
+    max_body_bytes: usize,
+    max_form_fields: i32,
+}
+
+export struct UyaginAccessLogOptions {
+    enabled: bool,
+    sample_every: u32,
+    fd: i32,
+}
+
+export struct UyaginConfig {
+    allocator: &IAllocator,
+    limits: UyaginLimits,
+    run_options: EngineRunOptions,
+    access_log: UyaginAccessLogOptions,
+}
+
+export struct UyaginMetrics {
+    request_count: atomic u64,
+    status_200_count: atomic u64,
+    status_201_count: atomic u64,
+    status_204_count: atomic u64,
+    status_400_count: atomic u64,
+    status_401_count: atomic u64,
+    status_403_count: atomic u64,
+    status_404_count: atomic u64,
+    status_405_count: atomic u64,
+    status_409_count: atomic u64,
+    status_413_count: atomic u64,
+    status_414_count: atomic u64,
+    status_500_count: atomic u64,
+    status_501_count: atomic u64,
+    status_other_count: atomic u64,
+    latency_le_100us_count: atomic u64,
+    latency_le_500us_count: atomic u64,
+    latency_le_1ms_count: atomic u64,
+    latency_le_5ms_count: atomic u64,
+    latency_le_10ms_count: atomic u64,
+    latency_gt_10ms_count: atomic u64,
+    accepted_connection_count: atomic u64,
+    closed_connection_count: atomic u64,
+    active_connection_count: atomic i32,
+    arena_used_bytes: atomic u64,
+    arena_reset_count: atomic u64,
+    frame_alloc_count: atomic u64,
+    frame_free_count: atomic u64,
+    heap_fallback_count: atomic u64,
+}
+
+export struct UyaginResponseBody {
+    kind: i32,
+    content_type: &[const byte],
+    bytes: &[const byte],
+    file_fd: i32,
+    file_len: usize,
+}
+
+export struct RequestArena {
+    arena: Arena,
+    used_snapshot: usize,
+
+    fn bind(self: &Self, storage: &byte, size: usize) void {
+        arena_init(&self.arena, storage, size);
+        self.used_snapshot = 0;
+    }
+
+    fn begin(self: &Self) void {
+        self.used_snapshot = 0;
+        if &self.arena != null {
+            self.used_snapshot = self.arena.used;
+        }
+    }
+
+    fn allocator(self: &Self) &IAllocator {
+        return &self.arena as &IAllocator;
+    }
+
+    fn used(self: &Self) usize {
+        if &self.arena == null {
+            return 0;
+        }
+        return self.arena.used;
+    }
+
+    fn reset(self: &Self) void {
+        arena_reset(&self.arena);
+        self.used_snapshot = 0;
+    }
+}
+
+struct UyaginShardThreadCtx {
+    engine: &Engine,
+    server: HttpServer,
+    controller: &EngineRunController,
+    options: EngineRunOptions,
+    served: i32,
+    failed: atomic i32,
+}
+
+/// 异步 Handler 契约。
+/// 返回值约定：0 表示已处理；正数保留给业务/中间件快速路径；错误走 Uya `!T` 异常机制。
+export interface AsyncHandler {
+    @async_fn
+    fn handle(self: &Self, ctx: &GinContext) Future<!i32>;
+}
+
+/// 异步 Middleware 契约（v0 先定义接口，路由链调度见 TODO 文档）。
+export interface AsyncMiddleware {
+    @async_fn
+    fn handle(self: &Self, ctx: &GinContext, next: AsyncHandler) Future<!i32>;
+}
+
+fn uyagin_route_store_typed_handler<H: AsyncHandler>(route: &GinRoute, handler: &H) !AsyncHandler {
+    if route == null || handler == null {
+        return error.InvalidRequest;
+    }
+    const size: usize = @size_of(H);
+    if size > UYAGIN_TYPED_HANDLER_BYTES {
+        return error.ValueTooLong;
+    }
+    const dst: &byte = &route.typed_handler_words[0] as &byte;
+    const src: &byte = handler as &byte;
+    var i: usize = 0;
+    while i < size {
+        dst[i] = src[i];
+        i = i + 1;
+    }
+    route.typed_handler_size = size as i32;
+    const stored: &H = &route.typed_handler_words[0] as &H;
+    const iface: AsyncHandler = *stored;
+    return iface;
+}
+
+/// 单条路由调度槽。路径匹配元数据放在 `Engine.route_meta`，这里只保留运行时 handler / middleware。
+export struct GinRoute {
+    handler: AsyncHandler,
+    typed_handler_words: [usize: UYAGIN_TYPED_HANDLER_WORDS],
+    typed_handler_size: i32,
+    middlewares: [AsyncHandler: UYAGIN_MAX_MIDDLEWARES],
+    middleware_count: i32,
+}
+
+/// 请求上下文：生命周期绑定到单次 HTTP 请求。
+/// Request 内 path/body/query/header 均为连接读缓冲的零拷贝视图，Handler 不应跨 await 后长期保存这些切片。
+export struct GinContext {
+    fd: i32,
+    request: &Request,
+    wrote: bool,
+    aborted: bool,
+    hijacked: bool,
+    persist: bool,
+    allocator: &IAllocator,
+    request_arena: &RequestArena,
+    response_status: Status,
+    out_headers: [Header: UYAGIN_MAX_RESPONSE_HEADERS],
+    out_header_count: i32,
+    suppress_body: bool,
+    response_body: UyaginResponseBody,
+    response_head_buf: &byte,
+    response_head_cap: usize,
+
+    fn req(self: &Self) &Request {
+        return self.request;
+    }
+
+    fn param(self: &Self, name: &[const byte]) !&[const byte] {
+        if self.request == null {
+            return error.InvalidRequest;
+        }
+        return uyagin_find_kv(self.request.path_params[0: self.request.path_param_count as usize], name);
+    }
+
+    fn query(self: &Self, name: &[const byte]) !&[const byte] {
+        if self.request == null {
+            return error.InvalidRequest;
+        }
+        return uyagin_find_kv(self.request.query[0: self.request.query_count as usize], name);
+    }
+
+    fn header(self: &Self, name: &[const byte]) !&[const byte] {
+        if self.request == null {
+            return error.InvalidRequest;
+        }
+        return request_get_header(self.request, name);
+    }
+
+    fn DefaultQuery(self: &Self, name: &[const byte], default_value: &[const byte]) &[const byte] {
+        const val: &[const byte] = self.query(name) catch {
+            return default_value;
+        };
+        return val;
+    }
+
+    fn PostForm(self: &Self, name: &[const byte]) !&[const byte] {
+        if self.request == null {
+            return error.InvalidRequest;
+        }
+        return uyagin_find_form_kv(self.request.body, name);
+    }
+
+    fn PostFormDefault(self: &Self, name: &[const byte], default_value: &[const byte]) &[const byte] {
+        const val: &[const byte] = self.PostForm(name) catch {
+            return default_value;
+        };
+        return val;
+    }
+
+    fn Multipart(self: &Self) !MultipartView {
+        if self.request == null {
+            return error.InvalidRequest;
+        }
+        const ct: &[const byte] = try self.header("Content-Type");
+        const boundary: &[const byte] = try extract_multipart_boundary(ct);
+        return parse_multipart(self.request.body, boundary);
+    }
+
+    fn status(self: &Self, status: Status) void {
+        self.response_status = status;
+    }
+
+    fn header_set(self: &Self, name: &[const byte], value: &[const byte]) !void {
+        try uyagin_context_header_set(self, name, value);
+    }
+
+    fn abort(self: &Self) void {
+        self.aborted = true;
+    }
+
+    fn data(self: &Self, status: Status, content_type: &[const byte], body: &[const byte]) Future<!i32> {
+        return uyagin_write_context_response_async(self, status, content_type, body);
+    }
+
+    fn string(self: &Self, status: Status, body: &[const byte]) Future<!i32> {
+        return self.data(status, "text/plain", body);
+    }
+
+    fn json_raw(self: &Self, status: Status, body: &[const byte]) Future<!i32> {
+        return self.data(status, "application/json", body);
+    }
+
+    fn bytes(self: &Self, status: Status, content_type: &[const byte], body: &[const byte]) Future<!i32> {
+        return self.data(status, content_type, body);
+    }
+
+    @async_fn
+    fn chunked(self: &Self, status: Status, content_type: &[const byte], body: &[const byte]) Future<!i32> {
+        _ = try @await uyagin_send_context_chunked_response_future(self, status, content_type, body.ptr, body.len);
+        self.wrote = true;
+        return 0;
+    }
+
+    @async_fn
+    fn body(self: &Self, status: Status, body: &UyaginResponseBody) Future<!i32> {
+        _ = try @await uyagin_send_context_response_body_trait_future(self, status, body);
+        self.wrote = true;
+        return 0;
+    }
+
+    fn arena_alloc(self: &Self, size: usize) !&byte {
+        if self.request_arena == null {
+            return error.AllocOutOfMemory;
+        }
+        const p: &byte = arena_alloc(&self.request_arena.arena, size);
+        if p == null {
+            return error.AllocOutOfMemory;
+        }
+        return p;
+    }
+
+    @async_fn
+    fn arena_bytes(self: &Self, status: Status, content_type: &[const byte], body: &[const byte]) Future<!i32> {
+        const p: &byte = try self.arena_alloc(body.len);
+        var i: usize = 0;
+        while i < body.len {
+            p[i] = body.ptr[i];
+            i = i + 1;
+        }
+        _ = try @await uyagin_send_context_response_raw_bytes_future(self, status, content_type, p, body.len);
+        self.wrote = true;
+        return 0;
+    }
+
+    @async_fn
+    fn file(self: &Self, status: Status, content_type: &[const byte], file_fd: i32, file_len: usize) Future<!i32> {
+        if self.suppress_body {
+            _ = try @await uyagin_send_context_response_head_only_async(self, status, content_type, file_len);
+        } else {
+            _ = try @await uyagin_send_context_response_head_only_async(self, status, content_type, file_len);
+            const send_fd: i32 = try sys_dup(file_fd);
+            _ = sys_lseek(send_fd, 0i64, SEEK_SET) catch {};
+            _ = try @await uyagin_send_file_body_async(self.fd, send_fd, file_len);
+            _ = sys_close(send_fd) catch {};
+        }
+        self.wrote = true;
+        return 0;
+    }
+
+    fn redirect(self: &Self, status: Status, location: &[const byte]) Future<!i32> {
+        _ = self.header_set("Location", location) catch |err| {
+            return uyagin_ready_i32(uyagin_error_from_error_id_i32(err));
+        };
+        return uyagin_write_context_response_async(self, status, uyagin_text_plain(), uyagin_empty_body());
+    }
+
+    fn no_content(self: &Self, status: Status) Future<!i32> {
+        return self.data(status, "text/plain", uyagin_empty_body());
+    }
+}
+
+struct UyaginConnState {
+    io_buf: [byte: UYAGIN_IO_CAP] = [],
+    parse_result: ParseResult,
+    parse_error_id: u32 = 0u32,
+    ctx: GinContext,
+    request_arena_storage: [byte: UYAGIN_REQUEST_ARENA_CAP] = [],
+    request_arena: RequestArena = RequestArena{},
+    response_head: [byte: UYAGIN_HEADER_CAP] = [],
+    filled: usize = 0,
+    served: i32 = 0,
+    http10_session_keep_alive: bool = false,
+
+    fn io_buf_base(self: &Self) &byte {
+        return &self.io_buf[0] as &byte;
+    }
+
+    fn response_head_base(self: &Self) &byte {
+        return &self.response_head[0] as &byte;
+    }
+
+    fn prepare(self: &Self, request_arena_cap: usize) void {
+        self.request_arena.bind(&self.request_arena_storage[0] as &byte, request_arena_cap);
+        self.parse_error_id = 0u32;
+        self.filled = 0;
+        self.served = 0;
+        self.http10_session_keep_alive = false;
+    }
+}
+
+struct UyaginConnTaskSlot {
+    active: i32,
+    fd: i32,
+    future_live: i32,
+    frame_storage: [usize: UYAGIN_CONN_FRAME_WORDS] = [],
+    state: UyaginConnState,
+    waker: Waker,
+    io_registered_fd: i32,
+    accepted_ms: u64,
+    last_progress_ms: u64,
+    wait_interest: i32,
+}
+
+fn uyagin_status_for_error_id(err_id: u32) Status {
+    if err_id == @error_id(error.PayloadTooLarge) {
+        return Status.PayloadTooLarge;
+    }
+    if err_id == @error_id(error.URITooLong) {
+        return Status.URITooLong;
+    }
+    if err_id == @error_id(error.MethodNotAllowed) {
+        return Status.MethodNotAllowed;
+    }
+    if err_id == @error_id(error.InvalidRequest) || err_id == @error_id(error.InvalidBoundary) || err_id == @error_id(error.HeaderTooLarge) || err_id == @error_id(error.ValueTooLong) || err_id == @error_id(error.TooManyParams) {
+        return Status.BadRequest;
+    }
+    if err_id == @error_id(error.TooManyParts) {
+        return Status.PayloadTooLarge;
+    }
+    return Status.InternalServerError;
+}
+
+fn uyagin_body_for_status(status: Status) &[const byte] {
+    if status == Status.BadRequest {
+        const s: &[const byte] = "bad request";
+        return s;
+    }
+    if status == Status.PayloadTooLarge {
+        const s: &[const byte] = "payload too large";
+        return s;
+    }
+    if status == Status.URITooLong {
+        const s: &[const byte] = "uri too long";
+        return s;
+    }
+    if status == Status.MethodNotAllowed {
+        const s: &[const byte] = "method not allowed";
+        return s;
+    }
+    const s: &[const byte] = "internal server error";
+    return s;
+}
+
+fn uyagin_log_recovery(engine: &Engine, ctx: &GinContext, err_id: u32, status: Status) void {
+    if !uyagin_should_trace_error(engine, status) {
+        return;
+    }
+    var buf: [byte: UYAGIN_OBSERVE_LOG_CAP] = [];
+    var pos: usize = 0;
+    pos = uyagin_append_slice_fast(&buf[0] as &byte, UYAGIN_OBSERVE_LOG_CAP, pos, "uyagin: trace error=");
+    pos = uyagin_append_slice_fast(&buf[0] as &byte, UYAGIN_OBSERVE_LOG_CAP, pos, uyagin_error_name(err_id));
+    pos = uyagin_append_slice_fast(&buf[0] as &byte, UYAGIN_OBSERVE_LOG_CAP, pos, " status=");
+    pos = uyagin_append_usize_dec_fast(&buf[0] as &byte, UYAGIN_OBSERVE_LOG_CAP, pos, (status as i32) as usize);
+    if ctx != null && ctx.request != null {
+        pos = uyagin_append_slice_fast(&buf[0] as &byte, UYAGIN_OBSERVE_LOG_CAP, pos, " method=");
+        pos = uyagin_append_slice_fast(&buf[0] as &byte, UYAGIN_OBSERVE_LOG_CAP, pos, uyagin_method_text(ctx.request.method));
+        pos = uyagin_append_slice_fast(&buf[0] as &byte, UYAGIN_OBSERVE_LOG_CAP, pos, " path=");
+        const path_base: &byte = &ctx.request.path[0] as &byte;
+        pos = uyagin_append_slice_fast(&buf[0] as &byte, UYAGIN_OBSERVE_LOG_CAP, pos, path_base[0: ctx.request.path_len as usize]);
+    }
+    pos = uyagin_append_slice_fast(&buf[0] as &byte, UYAGIN_OBSERVE_LOG_CAP, pos, " src=");
+    pos = uyagin_append_cstr_fast(&buf[0] as &byte, UYAGIN_OBSERVE_LOG_CAP, pos, @src_path as &byte);
+    pos = uyagin_append_slice_fast(&buf[0] as &byte, UYAGIN_OBSERVE_LOG_CAP, pos, ":");
+    pos = uyagin_append_usize_dec_fast(&buf[0] as &byte, UYAGIN_OBSERVE_LOG_CAP, pos, @src_line as usize);
+    pos = uyagin_append_slice_fast(&buf[0] as &byte, UYAGIN_OBSERVE_LOG_CAP, pos, "\n");
+    uyagin_log_buffer_write(uyagin_log_fd(engine), &buf[0] as &byte, pos, UYAGIN_OBSERVE_LOG_CAP);
+}
+
+export fn uyagin_error_response(engine: &Engine, ctx: &GinContext, err_id: u32) Future<!i32> {
+    if ctx == null {
+        return uyagin_ready_i32(error.InvalidRequest);
+    }
+    if ctx.wrote {
+        return uyagin_ready_i32(ok<i32>(0));
+    }
+    const status: Status = uyagin_status_for_error_id(err_id);
+    uyagin_log_recovery(engine, ctx, err_id, status);
+    return uyagin_write_context_response_async(ctx, status, uyagin_text_plain(), uyagin_body_for_status(status));
+}
+
+@async_fn fn uyagin_observe_request_future(engine: &Engine, ctx: &GinContext, inner: Future<!i32>) Future<!i32> {
+    var started_us: u64 = 0u64;
+    const latency_recorded: bool = uyagin_should_sample_latency(engine);
+    const needs_time: bool = latency_recorded || uyagin_will_emit_access_log(engine);
+    if needs_time {
+        const started_us_result: !u64 = uyagin_now_us();
+        started_us = started_us_result catch { 1u64; };
+    }
+    const result: !i32 = @await inner;
+    var ended_us: u64 = started_us;
+    if needs_time {
+        const ended_us_result: !u64 = uyagin_now_us();
+        ended_us = ended_us_result catch { started_us; };
+    }
+    var latency_us: u64 = 0u64;
+    if ended_us >= started_us {
+        latency_us = ended_us - started_us;
+    }
+    uyagin_record_request_observation(engine, ctx, result.error_id, latency_us, latency_recorded);
+    if result.error_id != 0u32 {
+        const restored: i32 = try uyagin_error_from_error_id_i32(result.error_id);
+        return restored;
+    }
+    return result.value;
+}
+
+@async_fn fn uyagin_observe_leaf_route_future(engine: &Engine, ctx: &GinContext, route: &GinRoute) Future<!i32> {
+    var started_us: u64 = 0u64;
+    const latency_recorded: bool = uyagin_should_sample_latency(engine);
+    const needs_time: bool = latency_recorded || uyagin_will_emit_access_log(engine);
+    if needs_time {
+        const started_us_result: !u64 = uyagin_now_us();
+        started_us = started_us_result catch { 1u64; };
+    }
+
+    var final_result: i32 = 0;
+    var err_id: u32 = 0u32;
+    const handler_future: Future<!i32> = route.handler.handle(ctx);
+    const handler_result: !i32 = @await handler_future;
+    if handler_result.error_id != 0u32 {
+        err_id = handler_result.error_id;
+    } else {
+        const encoded_err: u32 = uyagin_encoded_handler_error_id(handler_result.value);
+        if encoded_err != 0u32 {
+            err_id = encoded_err;
+        } else {
+            final_result = handler_result.value;
+        }
+    }
+
+    if err_id != 0u32 && engine != null && engine.recovery_enabled {
+        const error_future: Future<!i32> = uyagin_error_response(engine, ctx, err_id);
+        const error_result: !i32 = @await error_future;
+        if error_result.error_id != 0u32 {
+            err_id = error_result.error_id;
+        } else {
+            err_id = 0u32;
+            final_result = error_result.value;
+        }
+    }
+
+    if err_id == 0u32 && ctx != null && !ctx.wrote {
+        const empty_future: Future<!i32> = uyagin_write_context_response_async(ctx, ctx.response_status, uyagin_text_plain(), uyagin_empty_body());
+        const empty_result: !i32 = @await empty_future;
+        if empty_result.error_id != 0u32 {
+            err_id = empty_result.error_id;
+        } else {
+            final_result = empty_result.value;
+        }
+    }
+
+    var ended_us: u64 = started_us;
+    if needs_time {
+        const ended_us_result: !u64 = uyagin_now_us();
+        ended_us = ended_us_result catch { started_us; };
+    }
+    var latency_us: u64 = 0u64;
+    if ended_us >= started_us {
+        latency_us = ended_us - started_us;
+    }
+    uyagin_record_request_observation(engine, ctx, err_id, latency_us, latency_recorded);
+    if err_id != 0u32 {
+        const restored: i32 = try uyagin_error_from_error_id_i32(err_id);
+        return restored;
+    }
+    return final_result;
+}
+
+/// 路由分组：共享前缀，并可挂接组内 middleware。
+export struct RouterGroup {
+    engine: &Engine,
+    prefix: [byte: MAX_URI_LENGTH],
+    prefix_len: i32,
+    middlewares: [AsyncHandler: UYAGIN_MAX_MIDDLEWARES],
+    middleware_count: i32,
+}
+
+/// Engine 是 Gin 风格入口：注册路由并调度请求。
+export struct Engine {
+    router: UyaginRouter,
+    route_meta: [UyaginRouteMeta: UYAGIN_MAX_ROUTES],
+    routes: [GinRoute: UYAGIN_MAX_ROUTES],
+    route_count: i32,
+    middlewares: [AsyncHandler: UYAGIN_MAX_MIDDLEWARES],
+    middleware_count: i32,
+    recovery_enabled: bool,
+    allocator: &IAllocator,
+    limits: UyaginLimits,
+    run_options: EngineRunOptions,
+    access_log: UyaginAccessLogOptions,
+    metrics: UyaginMetrics,
+
+    fn add(self: &Self, method: Method, pattern: &[const byte], handler: AsyncHandler) !void {
+        if self.route_count < 0 || self.route_count >= UYAGIN_MAX_ROUTES {
+            return error.RouterFull;
+        }
+        const idx: i32 = self.route_count;
+        if idx < 0 || idx >= UYAGIN_MAX_ROUTES {
+            return error.RouterFull;
+        }
+        try uyagin_route_meta_init(&self.route_meta[idx], method, pattern);
+        try uyagin_router_add(&self.router, &self.route_meta[0] as &UyaginRouteMeta, idx, &self.route_meta[idx]);
+        self.routes[idx].handler = handler;
+        self.routes[idx].typed_handler_size = 0;
+        self.routes[idx].middleware_count = 0;
+        self.route_count = idx + 1;
+    }
+
+    fn add_typed<H: AsyncHandler>(self: &Self, method: Method, pattern: &[const byte], handler: &H) !void {
+        if self.route_count < 0 || self.route_count >= UYAGIN_MAX_ROUTES {
+            return error.RouterFull;
+        }
+        if handler == null {
+            return error.InvalidRequest;
+        }
+        const idx: i32 = self.route_count;
+        if idx < 0 || idx >= UYAGIN_MAX_ROUTES {
+            return error.RouterFull;
+        }
+        try uyagin_route_meta_init(&self.route_meta[idx], method, pattern);
+        try uyagin_router_add(&self.router, &self.route_meta[0] as &UyaginRouteMeta, idx, &self.route_meta[idx]);
+        self.routes[idx].handler = try uyagin_route_store_typed_handler<H>(&self.routes[idx], handler);
+        self.routes[idx].middleware_count = 0;
+        self.route_count = idx + 1;
+    }
+
+    fn Use(self: &Self, handler: AsyncHandler) !void {
+        if self.middleware_count < 0 || self.middleware_count >= UYAGIN_MAX_MIDDLEWARES {
+            return error.RouterFull;
+        }
+        self.middlewares[self.middleware_count] = handler;
+        self.middleware_count = self.middleware_count + 1;
+    }
+
+    fn UseRecovery(self: &Self) void {
+        self.recovery_enabled = true;
+    }
+
+    fn Group(self: &Self, prefix: &[const byte]) !RouterGroup {
+        return uyagin_group(self, prefix);
+    }
+
+    fn GET(self: &Self, pattern: &[const byte], handler: AsyncHandler) !void {
+        try self.add(Method.GET, pattern, handler);
+    }
+
+    fn GET_T<H: AsyncHandler>(self: &Self, pattern: &[const byte], handler: &H) !void {
+        try self.add_typed<H>(Method.GET, pattern, handler);
+    }
+
+    fn POST(self: &Self, pattern: &[const byte], handler: AsyncHandler) !void {
+        try self.add(Method.POST, pattern, handler);
+    }
+
+    fn POST_T<H: AsyncHandler>(self: &Self, pattern: &[const byte], handler: &H) !void {
+        try self.add_typed<H>(Method.POST, pattern, handler);
+    }
+
+    fn PUT(self: &Self, pattern: &[const byte], handler: AsyncHandler) !void {
+        try self.add(Method.PUT, pattern, handler);
+    }
+
+    fn PUT_T<H: AsyncHandler>(self: &Self, pattern: &[const byte], handler: &H) !void {
+        try self.add_typed<H>(Method.PUT, pattern, handler);
+    }
+
+    fn PATCH(self: &Self, pattern: &[const byte], handler: AsyncHandler) !void {
+        try self.add(Method.PATCH, pattern, handler);
+    }
+
+    fn PATCH_T<H: AsyncHandler>(self: &Self, pattern: &[const byte], handler: &H) !void {
+        try self.add_typed<H>(Method.PATCH, pattern, handler);
+    }
+
+    fn DELETE(self: &Self, pattern: &[const byte], handler: AsyncHandler) !void {
+        try self.add(Method.DELETE, pattern, handler);
+    }
+
+    fn DELETE_T<H: AsyncHandler>(self: &Self, pattern: &[const byte], handler: &H) !void {
+        try self.add_typed<H>(Method.DELETE, pattern, handler);
+    }
+
+    fn OPTIONS(self: &Self, pattern: &[const byte], handler: AsyncHandler) !void {
+        try self.add(Method.OPTIONS, pattern, handler);
+    }
+
+    fn OPTIONS_T<H: AsyncHandler>(self: &Self, pattern: &[const byte], handler: &H) !void {
+        try self.add_typed<H>(Method.OPTIONS, pattern, handler);
+    }
+
+    fn HEAD(self: &Self, pattern: &[const byte], handler: AsyncHandler) !void {
+        try self.add(Method.HEAD, pattern, handler);
+    }
+
+    fn HEAD_T<H: AsyncHandler>(self: &Self, pattern: &[const byte], handler: &H) !void {
+        try self.add_typed<H>(Method.HEAD, pattern, handler);
+    }
+
+    fn handle(self: &Self, ctx: &GinContext) Future<!i32> {
+        if ctx == null || ctx.request == null {
+            return uyagin_ready_i32(error.InvalidRequest);
+        }
+        const limit_err_id: u32 = uyagin_request_limit_error_id(self, ctx.request);
+        if limit_err_id != 0u32 {
+            ctx.abort();
+            const inner: Future<!i32> = uyagin_error_response(self, ctx, limit_err_id);
+            return uyagin_observe_request_future(self, ctx, inner);
+        }
+        var idx: i32 = uyagin_router_find_route_request(&self.router, &self.route_meta[0] as &UyaginRouteMeta, ctx.request.method, ctx.request);
+        if idx < 0 && ctx.request.method == Method.HEAD {
+            ctx.request.method = Method.GET;
+            idx = uyagin_router_match_method_request(&self.router, &self.route_meta[0] as &UyaginRouteMeta, Method.GET, ctx.request);
+            ctx.request.method = Method.HEAD;
+            if idx >= 0 {
+                ctx.suppress_body = true;
+            }
+        }
+        if idx >= 0 {
+            if !(idx >= 0 && idx < self.route_count && idx < UYAGIN_MAX_ROUTES) {
+                const inner: Future<!i32> = uyagin_ready_i32(error.RouteIndexInvalid);
+                return uyagin_observe_request_future(self, ctx, inner);
+            }
+            const route: &GinRoute = uyagin_route_ptr(self, idx);
+            const meta: &UyaginRouteMeta = uyagin_route_meta_ptr(self, idx);
+            if route == null || meta == null {
+                const inner: Future<!i32> = uyagin_ready_i32(error.RouteIndexInvalid);
+                return uyagin_observe_request_future(self, ctx, inner);
+            }
+            if meta.param_count == 0 {
+                ctx.request.path_param_count = 0;
+            } else {
+                uyagin_route_meta_bind_params_request(meta, ctx.request) catch {
+                    const inner: Future<!i32> = uyagin_ready_i32(error.InvalidRequest);
+                    return uyagin_observe_request_future(self, ctx, inner);
+                };
+            }
+            if self.middleware_count == 0 && route.middleware_count == 0 {
+                return uyagin_observe_leaf_route_future(self, ctx, route);
+            }
+            if self.recovery_enabled {
+                const inner: Future<!i32> = uyagin_run_chain_recover(self, ctx, route);
+                return uyagin_observe_request_future(self, ctx, inner);
+            } else {
+                const inner: Future<!i32> = uyagin_run_chain(self, ctx, route);
+                return uyagin_observe_request_future(self, ctx, inner);
+            }
+        }
+        if ctx.request.method == Method.OPTIONS {
+            const inner: Future<!i32> = uyagin_auto_options(self, ctx);
+            return uyagin_observe_request_future(self, ctx, inner);
+        }
+        if idx == -2 {
+            const inner: Future<!i32> = uyagin_method_not_allowed(self, ctx);
+            return uyagin_observe_request_future(self, ctx, inner);
+        }
+        const inner: Future<!i32> = ctx.string(Status.NotFound, "not found");
+        return uyagin_observe_request_future(self, ctx, inner);
+    }
+
+    @async_fn
+    fn serve_conn(self: &Self, fd: i32, scheduler: &Scheduler) Future<!i32> {
+        return try @await uyagin_serve_conn(self, fd, scheduler);
+    }
+
+    @async_fn
+    fn serve_once(self: &Self, srv: &HttpServer) Future<!i32> {
+        const fd: i32 = try @await uyagin_accept_async(srv);
+        var scheduler: Scheduler = scheduler_new();
+        return try @await uyagin_serve_conn(self, fd, &scheduler);
+    }
+
+    fn run(self: &Self, listener: &GinListener, loop: EventLoop, scheduler: &Scheduler) !i32 {
+        return uyagin_engine_run(self, &listener.server, loop, scheduler, &self.run_options, null as &EngineRunController);
+    }
+
+    fn run_with_options(self: &Self, listener: &GinListener, loop: EventLoop, scheduler: &Scheduler, opts: &EngineRunOptions, controller: &EngineRunController) !i32 {
+        return uyagin_engine_run(self, &listener.server, loop, scheduler, opts, controller);
+    }
+
+    fn run_shards(self: &Self, listener: &GinListener) !i32 {
+        return uyagin_engine_run_shards(self, listener, &self.run_options, null as &EngineRunController);
+    }
+
+    fn run_shards_with_options(self: &Self, listener: &GinListener, opts: &EngineRunOptions, controller: &EngineRunController) !i32 {
+        return uyagin_engine_run_shards(self, listener, opts, controller);
+    }
+}
+
+RouterGroup {
+    fn Use(self: &Self, handler: AsyncHandler) !void {
+        if self.middleware_count < 0 || self.middleware_count >= UYAGIN_MAX_MIDDLEWARES {
+            return error.RouterFull;
+        }
+        self.middlewares[self.middleware_count] = handler;
+        self.middleware_count = self.middleware_count + 1;
+    }
+
+    fn add(self: &Self, method: Method, pattern: &[const byte], handler: AsyncHandler) !void {
+        if self.engine == null {
+            return error.InvalidRequest;
+        }
+        var full: [byte: MAX_URI_LENGTH] = [];
+        const full_len: usize = try uyagin_join_group_path(self, pattern, &full[0] as &byte, MAX_URI_LENGTH as usize);
+        const full_base: &byte = &full[0] as &byte;
+        const full_path: &[byte] = full_base[0: full_len];
+        const before: i32 = self.engine.route_count;
+        try self.engine.add(method, full_path, handler);
+        const route: &GinRoute = uyagin_route_ptr(self.engine, before);
+        if route == null {
+            return error.RouteIndexInvalid;
+        }
+        var i: i32 = 0;
+        while i < self.middleware_count && i < UYAGIN_MAX_MIDDLEWARES {
+            route.middlewares[i] = self.middlewares[i];
+            i = i + 1;
+        }
+        route.middleware_count = i;
+    }
+
+    fn add_typed<H: AsyncHandler>(self: &Self, method: Method, pattern: &[const byte], handler: &H) !void {
+        if self.engine == null {
+            return error.InvalidRequest;
+        }
+        var full: [byte: MAX_URI_LENGTH] = [];
+        const full_len: usize = try uyagin_join_group_path(self, pattern, &full[0] as &byte, MAX_URI_LENGTH as usize);
+        const full_base: &byte = &full[0] as &byte;
+        const full_path: &[byte] = full_base[0: full_len];
+        const before: i32 = self.engine.route_count;
+        try self.engine.add_typed<H>(method, full_path, handler);
+        const route: &GinRoute = uyagin_route_ptr(self.engine, before);
+        if route == null {
+            return error.RouteIndexInvalid;
+        }
+        var i: i32 = 0;
+        while i < self.middleware_count && i < UYAGIN_MAX_MIDDLEWARES {
+            route.middlewares[i] = self.middlewares[i];
+            i = i + 1;
+        }
+        route.middleware_count = i;
+    }
+
+    fn GET(self: &Self, pattern: &[const byte], handler: AsyncHandler) !void { try self.add(Method.GET, pattern, handler); }
+    fn GET_T<H: AsyncHandler>(self: &Self, pattern: &[const byte], handler: &H) !void { try self.add_typed<H>(Method.GET, pattern, handler); }
+    fn POST(self: &Self, pattern: &[const byte], handler: AsyncHandler) !void { try self.add(Method.POST, pattern, handler); }
+    fn POST_T<H: AsyncHandler>(self: &Self, pattern: &[const byte], handler: &H) !void { try self.add_typed<H>(Method.POST, pattern, handler); }
+    fn PUT(self: &Self, pattern: &[const byte], handler: AsyncHandler) !void { try self.add(Method.PUT, pattern, handler); }
+    fn PUT_T<H: AsyncHandler>(self: &Self, pattern: &[const byte], handler: &H) !void { try self.add_typed<H>(Method.PUT, pattern, handler); }
+    fn PATCH(self: &Self, pattern: &[const byte], handler: AsyncHandler) !void { try self.add(Method.PATCH, pattern, handler); }
+    fn PATCH_T<H: AsyncHandler>(self: &Self, pattern: &[const byte], handler: &H) !void { try self.add_typed<H>(Method.PATCH, pattern, handler); }
+    fn DELETE(self: &Self, pattern: &[const byte], handler: AsyncHandler) !void { try self.add(Method.DELETE, pattern, handler); }
+    fn DELETE_T<H: AsyncHandler>(self: &Self, pattern: &[const byte], handler: &H) !void { try self.add_typed<H>(Method.DELETE, pattern, handler); }
+    fn OPTIONS(self: &Self, pattern: &[const byte], handler: AsyncHandler) !void { try self.add(Method.OPTIONS, pattern, handler); }
+    fn OPTIONS_T<H: AsyncHandler>(self: &Self, pattern: &[const byte], handler: &H) !void { try self.add_typed<H>(Method.OPTIONS, pattern, handler); }
+    fn HEAD(self: &Self, pattern: &[const byte], handler: AsyncHandler) !void { try self.add(Method.HEAD, pattern, handler); }
+    fn HEAD_T<H: AsyncHandler>(self: &Self, pattern: &[const byte], handler: &H) !void { try self.add_typed<H>(Method.HEAD, pattern, handler); }
+}
+
+export fn GET_T(engine: &Engine, pattern: &[const byte], handler: AsyncHandler) !void {
+    if engine == null {
+        return error.InvalidRequest;
+    }
+    try engine.add(Method.GET, pattern, handler);
+}
+
+fn uyagin_context_aborted(ctx: &GinContext) bool {
+    if ctx == null {
+        return true;
+    }
+    return ctx.aborted;
+}
+
+fn uyagin_context_is_hijacked(ctx: &GinContext) bool {
+    if ctx == null {
+        return false;
+    }
+    return ctx.hijacked;
+}
+
+/// 将当前 HTTP 请求上下文标记为“连接已接管”。
+/// 参数说明：`ctx` 为当前请求上下文；调用方需保证底层连接所有权已经转移到新对象。
+/// 返回值说明：成功时将阻止后续普通 HTTP 响应路径继续写回。
+export fn uyagin_context_mark_hijacked(ctx: &GinContext) !void {
+    if ctx == null || ctx.request == null || ctx.fd < 0 {
+        return error.InvalidRequest;
+    }
+    if ctx.hijacked {
+        return error.InvalidRequest;
+    }
+    ctx.hijacked = true;
+    ctx.wrote = true;
+    ctx.aborted = true;
+    ctx.persist = false;
+    ctx.response_status = Status.SwitchingProtocols;
+    ctx.fd = -1;
+}
+
+fn uyagin_find_form_kv(body: &[byte], name: &[const byte]) !&[const byte] {
+    var pos: usize = 0;
+    while pos <= body.len {
+        const start: usize = pos;
+        var end: usize = pos;
+        while end < body.len && body.ptr[end] != '&' as byte {
+            end = end + 1;
+        }
+        var eq: usize = end;
+        var i: usize = start;
+        while i < end {
+            if body.ptr[i] == '=' as byte {
+                eq = i;
+                break;
+            }
+            i = i + 1;
+        }
+        const key: &[const byte] = body[start: eq - start];
+        if uyagin_slice_eq(key, name) {
+            if eq < end {
+                return body[eq + 1: end - eq - 1];
+            }
+            return body[end: 0];
+        }
+        if end >= body.len {
+            break;
+        }
+        pos = end + 1;
+    }
+    return error.InvalidRequest;
+}
+
+fn uyagin_count_form_fields(body: &[byte]) i32 {
+    if body.len == 0 {
+        return 0;
+    }
+    var count: i32 = 1;
+    var i: usize = 0;
+    while i < body.len {
+        if body.ptr[i] == '&' as byte {
+            count = count + 1;
+        }
+        i = i + 1;
+    }
+    return count;
+}
+
+fn uyagin_byte_to_lower(c: byte) byte {
+    if c >= 'A' as byte && c <= 'Z' as byte {
+        return (c as i32 + 32) as byte;
+    }
+    return c;
+}
+
+fn uyagin_slice_prefix_ci(value: &[const byte], prefix: &[const byte]) bool {
+    if value.len < prefix.len {
+        return false;
+    }
+    var i: usize = 0;
+    while i < prefix.len {
+        if uyagin_byte_to_lower(value.ptr[i]) != uyagin_byte_to_lower(prefix.ptr[i]) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn uyagin_request_content_type(req: &Request) &[const byte] {
+    const ct: &[const byte] = request_get_header(req, &"Content-Type"[0: 12]) catch {
+        return uyagin_empty_body();
+    };
+    return ct;
+}
+
+fn uyagin_request_is_urlencoded_form(req: &Request) bool {
+    const ct: &[const byte] = uyagin_request_content_type(req);
+    return uyagin_slice_prefix_ci(ct, "application/x-www-form-urlencoded");
+}
+
+fn uyagin_request_is_multipart_form(req: &Request) bool {
+    const ct: &[const byte] = uyagin_request_content_type(req);
+    return uyagin_slice_prefix_ci(ct, "multipart/form-data");
+}
+
+fn uyagin_multipart_field_count(req: &Request) !i32 {
+    const ct: &[const byte] = uyagin_request_content_type(req);
+    const boundary: &[const byte] = try extract_multipart_boundary(ct);
+    const mv_result: !MultipartView = parse_multipart(req.body, boundary);
+    const mv: MultipartView = mv_result catch |err| {
+        if @error_id(err) == @error_id(error.TooManyParts) {
+            return error.PayloadTooLarge;
+        }
+        return err;
+    };
+    return mv.part_count;
+}
+
+export fn uyagin_validate_request_limits(engine: &Engine, req: &Request) !void {
+    if engine == null || req == null {
+        return error.InvalidRequest;
+    }
+    if req.header_count > engine.limits.max_header_count {
+        return error.HeaderTooLarge;
+    }
+    if req.body.len > engine.limits.max_body_bytes {
+        return error.PayloadTooLarge;
+    }
+    if req.body.len == 0 {
+        return;
+    }
+    if uyagin_request_is_urlencoded_form(req) {
+        if uyagin_count_form_fields(req.body) > engine.limits.max_form_fields {
+            return error.PayloadTooLarge;
+        }
+    } else if uyagin_request_is_multipart_form(req) {
+        const part_count: i32 = try uyagin_multipart_field_count(req);
+        if part_count > engine.limits.max_form_fields {
+            return error.PayloadTooLarge;
+        }
+    }
+}
+
+fn uyagin_request_limit_error_id(engine: &Engine, req: &Request) u32 {
+    const limit_result: !void = uyagin_validate_request_limits(engine, req);
+    _ = limit_result catch |err| {
+        return @error_id(err);
+    };
+    return 0u32;
+}
+
+export fn uyagin_collect_metrics(engine: &Engine, scheduler: &Scheduler, request_arena: &RequestArena) void {
+    if engine == null || scheduler == null || request_arena == null {
+        return;
+    }
+    const detail_recorded: bool = uyagin_should_sample_metrics_detail_current(engine);
+    if detail_recorded {
+        engine.metrics.arena_used_bytes += request_arena.used() as u64;
+        engine.metrics.arena_reset_count += 1u64;
+    }
+    const pool: &AsyncFramePool = scheduler._frame_pool;
+    if pool == null {
+        return;
+    }
+    const heap_fallback_count: u64 = pool.debug_heap_fallback_count as u64;
+    if heap_fallback_count >= scheduler._metrics_heap_fallback_seen {
+        engine.metrics.heap_fallback_count += heap_fallback_count - scheduler._metrics_heap_fallback_seen;
+    }
+    scheduler._metrics_heap_fallback_seen = heap_fallback_count;
+    if !detail_recorded {
+        return;
+    }
+    const frame_alloc_count: u64 = pool.total_alloc_count as u64;
+    const frame_free_count: u64 = pool.total_free_count as u64;
+    if frame_alloc_count >= scheduler._metrics_frame_alloc_seen {
+        engine.metrics.frame_alloc_count += frame_alloc_count - scheduler._metrics_frame_alloc_seen;
+    }
+    if frame_free_count >= scheduler._metrics_frame_free_seen {
+        engine.metrics.frame_free_count += frame_free_count - scheduler._metrics_frame_free_seen;
+    }
+    scheduler._metrics_frame_alloc_seen = frame_alloc_count;
+    scheduler._metrics_frame_free_seen = frame_free_count;
+}
+
+fn uyagin_log_fd(engine: &Engine) i32 {
+    if engine == null {
+        return 2;
+    }
+    if engine.access_log.fd >= 0 {
+        return engine.access_log.fd;
+    }
+    return 2;
+}
+
+fn uyagin_mode_is_debug(mode: UyaginMode) bool {
+    return mode == UyaginMode.Debug;
+}
+
+fn uyagin_should_trace_error(engine: &Engine, status: Status) bool {
+    if status == Status.InternalServerError || status == Status.NotImplemented {
+        return true;
+    }
+    if engine == null {
+        return false;
+    }
+    return uyagin_mode_is_debug(engine.run_options.mode);
+}
+
+fn uyagin_error_name(err_id: u32) &[const byte] {
+    if err_id == @error_id(error.InvalidRequest) {
+        const s: &[const byte] = "InvalidRequest";
+        return s;
+    }
+    if err_id == @error_id(error.MethodNotAllowed) {
+        const s: &[const byte] = "MethodNotAllowed";
+        return s;
+    }
+    if err_id == @error_id(error.URITooLong) {
+        const s: &[const byte] = "URITooLong";
+        return s;
+    }
+    if err_id == @error_id(error.HeaderTooLarge) {
+        const s: &[const byte] = "HeaderTooLarge";
+        return s;
+    }
+    if err_id == @error_id(error.PayloadTooLarge) {
+        const s: &[const byte] = "PayloadTooLarge";
+        return s;
+    }
+    if err_id == @error_id(error.TooManyParams) {
+        const s: &[const byte] = "TooManyParams";
+        return s;
+    }
+    if err_id == @error_id(error.ValueTooLong) {
+        const s: &[const byte] = "ValueTooLong";
+        return s;
+    }
+    if err_id == @error_id(error.InvalidBoundary) {
+        const s: &[const byte] = "InvalidBoundary";
+        return s;
+    }
+    if err_id == @error_id(error.TooManyParts) {
+        const s: &[const byte] = "TooManyParts";
+        return s;
+    }
+    if err_id == @error_id(error.HandlerMissing) {
+        const s: &[const byte] = "HandlerMissing";
+        return s;
+    }
+    const s: &[const byte] = "UnknownError";
+    return s;
+}
+
+fn uyagin_record_status_metric(metrics: &UyaginMetrics, status: Status) void {
+    if metrics == null {
+        return;
+    }
+    if status == Status.OK {
+        metrics.status_200_count += 1u64;
+        return;
+    }
+    if status == Status.Created {
+        metrics.status_201_count += 1u64;
+        return;
+    }
+    if status == Status.NoContent {
+        metrics.status_204_count += 1u64;
+        return;
+    }
+    if status == Status.BadRequest {
+        metrics.status_400_count += 1u64;
+        return;
+    }
+    if status == Status.Unauthorized {
+        metrics.status_401_count += 1u64;
+        return;
+    }
+    if status == Status.Forbidden {
+        metrics.status_403_count += 1u64;
+        return;
+    }
+    if status == Status.NotFound {
+        metrics.status_404_count += 1u64;
+        return;
+    }
+    if status == Status.MethodNotAllowed {
+        metrics.status_405_count += 1u64;
+        return;
+    }
+    if status == Status.Conflict {
+        metrics.status_409_count += 1u64;
+        return;
+    }
+    if status == Status.PayloadTooLarge {
+        metrics.status_413_count += 1u64;
+        return;
+    }
+    if status == Status.URITooLong {
+        metrics.status_414_count += 1u64;
+        return;
+    }
+    if status == Status.InternalServerError {
+        metrics.status_500_count += 1u64;
+        return;
+    }
+    if status == Status.NotImplemented {
+        metrics.status_501_count += 1u64;
+        return;
+    }
+    metrics.status_other_count += 1u64;
+}
+
+fn uyagin_record_latency_metric(metrics: &UyaginMetrics, latency_us: u64) void {
+    if metrics == null {
+        return;
+    }
+    if latency_us <= 100u64 {
+        metrics.latency_le_100us_count += 1u64;
+        return;
+    }
+    if latency_us <= 500u64 {
+        metrics.latency_le_500us_count += 1u64;
+        return;
+    }
+    if latency_us <= 1000u64 {
+        metrics.latency_le_1ms_count += 1u64;
+        return;
+    }
+    if latency_us <= 5000u64 {
+        metrics.latency_le_5ms_count += 1u64;
+        return;
+    }
+    if latency_us <= 10000u64 {
+        metrics.latency_le_10ms_count += 1u64;
+        return;
+    }
+    metrics.latency_gt_10ms_count += 1u64;
+}
+
+fn uyagin_should_emit_access_log(engine: &Engine) bool {
+    if engine == null || !engine.access_log.enabled {
+        return false;
+    }
+    if engine.access_log.sample_every <= 1u32 {
+        return true;
+    }
+    const seq: u64 = engine.metrics.request_count;
+    return (seq % (engine.access_log.sample_every as u64)) == 0u64;
+}
+
+fn uyagin_will_emit_access_log(engine: &Engine) bool {
+    if engine == null || !engine.access_log.enabled {
+        return false;
+    }
+    if engine.access_log.sample_every <= 1u32 {
+        return true;
+    }
+    const seq: u64 = engine.metrics.request_count + 1u64;
+    return (seq % (engine.access_log.sample_every as u64)) == 0u64;
+}
+
+fn uyagin_should_sample_latency(engine: &Engine) bool {
+    if engine == null || engine.run_options.metrics_detail_sample_every == 0u32 || engine.run_options.latency_sample_every == 0u32 {
+        return false;
+    }
+    if engine.run_options.latency_sample_every <= 1u32 {
+        return true;
+    }
+    const seq: u64 = engine.metrics.request_count + 1u64;
+    return (seq % (engine.run_options.latency_sample_every as u64)) == 0u64;
+}
+
+fn uyagin_should_sample_metrics_detail_for_seq(engine: &Engine, seq: u64) bool {
+    if engine == null || engine.run_options.metrics_detail_sample_every == 0u32 {
+        return false;
+    }
+    if engine.run_options.metrics_detail_sample_every <= 1u32 {
+        return true;
+    }
+    return (seq % (engine.run_options.metrics_detail_sample_every as u64)) == 0u64;
+}
+
+fn uyagin_should_sample_metrics_detail(engine: &Engine) bool {
+    if engine == null {
+        return false;
+    }
+    return uyagin_should_sample_metrics_detail_for_seq(engine, engine.metrics.request_count + 1u64);
+}
+
+fn uyagin_should_sample_metrics_detail_current(engine: &Engine) bool {
+    if engine == null {
+        return false;
+    }
+    return uyagin_should_sample_metrics_detail_for_seq(engine, engine.metrics.request_count);
+}
+
+fn uyagin_record_request_observation(engine: &Engine, ctx: &GinContext, err_id: u32, latency_us: u64, latency_recorded: bool) void {
+    if engine == null {
+        return;
+    }
+    var status: Status = Status.InternalServerError;
+    if ctx != null {
+        status = ctx.response_status;
+    }
+    if err_id != 0u32 && (ctx == null || (!ctx.wrote && status == Status.OK)) {
+        status = uyagin_status_for_error_id(err_id);
+    }
+    const detail_recorded: bool = uyagin_should_sample_metrics_detail(engine);
+    engine.metrics.request_count += 1u64;
+    if detail_recorded {
+        uyagin_record_status_metric(&engine.metrics, status);
+    }
+    if latency_recorded {
+        uyagin_record_latency_metric(&engine.metrics, latency_us);
+    }
+    if uyagin_should_emit_access_log(engine) {
+        uyagin_emit_access_log(engine, ctx, status, latency_us);
+    }
+}
+
+fn uyagin_note_connection_open(engine: &Engine) void {
+    if engine == null {
+        return;
+    }
+    engine.metrics.accepted_connection_count += 1u64;
+    engine.metrics.active_connection_count += 1;
+}
+
+fn uyagin_note_connection_close(engine: &Engine) void {
+    if engine == null {
+        return;
+    }
+    engine.metrics.closed_connection_count += 1u64;
+    if engine.metrics.active_connection_count > 0 {
+        engine.metrics.active_connection_count -= 1;
+    }
+}
+
+export fn uyagin_group(engine: &Engine, prefix: &[const byte]) !RouterGroup {
+    if engine == null || prefix.len > MAX_URI_LENGTH as usize {
+        return error.InvalidRequest;
+    }
+    var g: RouterGroup = RouterGroup{
+        engine: engine,
+        prefix: [],
+        prefix_len: prefix.len as i32,
+        middlewares: [],
+        middleware_count: 0,
+    };
+    var i: usize = 0;
+    while i < prefix.len && i < MAX_URI_LENGTH as usize {
+        g.prefix[i] = prefix.ptr[i];
+        i = i + 1;
+    }
+    return g;
+}
+
+fn uyagin_join_group_path(group: &RouterGroup, pattern: &[const byte], out: &byte, cap: usize) !usize {
+    if group == null || out == null {
+        return error.InvalidRequest;
+    }
+    var pos: usize = 0;
+    var i: usize = 0;
+    while i < group.prefix_len as usize {
+        if pos >= cap {
+            return error.URITooLong;
+        }
+        out[pos] = group.prefix[i];
+        pos = pos + 1;
+        i = i + 1;
+    }
+    var skip_slash: bool = false;
+    if pos > 0 && pattern.len > 0 && out[pos - 1] == '/' as byte && pattern.ptr[0] == '/' as byte {
+        skip_slash = true;
+    }
+    i = 0;
+    while i < pattern.len {
+        if skip_slash && i == 0 {
+            i = i + 1;
+            continue;
+        }
+        if pos >= cap {
+            return error.URITooLong;
+        }
+        out[pos] = pattern.ptr[i];
+        pos = pos + 1;
+        i = i + 1;
+    }
+    return pos;
+}
+
+fn uyagin_method_text(method: Method) &[const byte] {
+    if method == Method.GET { const s: &[const byte] = "GET"; return s; }
+    if method == Method.POST { const s: &[const byte] = "POST"; return s; }
+    if method == Method.PUT { const s: &[const byte] = "PUT"; return s; }
+    if method == Method.PATCH { const s: &[const byte] = "PATCH"; return s; }
+    if method == Method.DELETE { const s: &[const byte] = "DELETE"; return s; }
+    if method == Method.OPTIONS { const s: &[const byte] = "OPTIONS"; return s; }
+    const s: &[const byte] = "HEAD";
+    return s;
+}
+
+fn uyagin_append_allow_method(out: &byte, cap: usize, pos: usize, method: Method, first: bool) usize {
+    var p: usize = pos;
+    if !first {
+        p = uyagin_append_slice_fast(out, cap, p, ", ");
+    }
+    return uyagin_append_slice_fast(out, cap, p, uyagin_method_text(method));
+}
+
+fn uyagin_method_index(method: Method) i32 {
+    if method == Method.GET { return 0; }
+    if method == Method.POST { return 1; }
+    if method == Method.PUT { return 2; }
+    if method == Method.PATCH { return 3; }
+    if method == Method.DELETE { return 4; }
+    if method == Method.OPTIONS { return 5; }
+    return 6;
+}
+
+fn uyagin_allow_mask_has_method(mask: u32, method: Method) bool {
+    const idx: i32 = uyagin_method_index(method);
+    return (mask & (1u32 << idx)) != 0u32;
+}
+
+fn uyagin_build_allow_header(engine: &Engine, req: &Request, out: &byte, cap: usize) usize {
+    const explicit_mask: u32 = uyagin_router_allow_mask(&engine.router, &engine.route_meta[0] as &UyaginRouteMeta, req);
+    if explicit_mask == 0u32 {
+        return 0usize;
+    }
+    var pos: usize = 0;
+    var first: bool = true;
+    if uyagin_allow_mask_has_method(explicit_mask, Method.GET) {
+        pos = uyagin_append_allow_method(out, cap, pos, Method.GET, first);
+        first = false;
+    }
+    if uyagin_allow_mask_has_method(explicit_mask, Method.POST) {
+        pos = uyagin_append_allow_method(out, cap, pos, Method.POST, first);
+        first = false;
+    }
+    if uyagin_allow_mask_has_method(explicit_mask, Method.PUT) {
+        pos = uyagin_append_allow_method(out, cap, pos, Method.PUT, first);
+        first = false;
+    }
+    if uyagin_allow_mask_has_method(explicit_mask, Method.PATCH) {
+        pos = uyagin_append_allow_method(out, cap, pos, Method.PATCH, first);
+        first = false;
+    }
+    if uyagin_allow_mask_has_method(explicit_mask, Method.DELETE) {
+        pos = uyagin_append_allow_method(out, cap, pos, Method.DELETE, first);
+        first = false;
+    }
+    if uyagin_allow_mask_has_method(explicit_mask, Method.OPTIONS) {
+        pos = uyagin_append_allow_method(out, cap, pos, Method.OPTIONS, first);
+        first = false;
+    }
+    if uyagin_allow_mask_has_method(explicit_mask, Method.HEAD) {
+        pos = uyagin_append_allow_method(out, cap, pos, Method.HEAD, first);
+        first = false;
+    } else if uyagin_allow_mask_has_method(explicit_mask, Method.GET) {
+        pos = uyagin_append_allow_method(out, cap, pos, Method.HEAD, first);
+        first = false;
+    }
+    if !uyagin_allow_mask_has_method(explicit_mask, Method.OPTIONS) {
+        pos = uyagin_append_allow_method(out, cap, pos, Method.OPTIONS, first);
+    }
+    return pos;
+}
+
+fn uyagin_path_has_any_route(engine: &Engine, req: &Request) bool {
+    return uyagin_router_allow_mask(&engine.router, &engine.route_meta[0] as &UyaginRouteMeta, req) != 0u32;
+}
+
+export fn uyagin_method_not_allowed(engine: &Engine, ctx: &GinContext) Future<!i32> {
+    var allow: [byte: 128] = [];
+    const n: usize = uyagin_build_allow_header(engine, ctx.request, &allow[0] as &byte, 128);
+    const allow_base: &byte = &allow[0] as &byte;
+    const allow_slice: &[byte] = allow_base[0: n];
+    _ = ctx.header_set("Allow", allow_slice) catch |err| {
+        return uyagin_ready_i32(uyagin_error_from_error_id_i32(err));
+    };
+    return uyagin_write_context_response_async(ctx, Status.MethodNotAllowed, uyagin_text_plain(), uyagin_body_for_status(Status.MethodNotAllowed));
+}
+
+export fn uyagin_auto_options(engine: &Engine, ctx: &GinContext) Future<!i32> {
+    if !uyagin_path_has_any_route(engine, ctx.request) {
+        return ctx.string(Status.NotFound, "not found");
+    }
+    var allow: [byte: 128] = [];
+    const n: usize = uyagin_build_allow_header(engine, ctx.request, &allow[0] as &byte, 128);
+    const allow_base: &byte = &allow[0] as &byte;
+    const allow_slice: &[byte] = allow_base[0: n];
+    _ = ctx.header_set("Allow", allow_slice) catch |err| {
+        return uyagin_ready_i32(uyagin_error_from_error_id_i32(err));
+    };
+    return uyagin_write_context_response_async(ctx, Status.OK, uyagin_text_plain(), uyagin_empty_body());
+}
+
+fn uyagin_chain_should_stop(ctx: &GinContext) bool {
+    if ctx == null {
+        return true;
+    }
+    return ctx.aborted || ctx.wrote || ctx.hijacked;
+}
+
+export @async_fn fn uyagin_run_chain(engine: &Engine, ctx: &GinContext, route: &GinRoute) Future<!i32> {
+    var i: i32 = 0;
+    while i < engine.middleware_count && i < UYAGIN_MAX_MIDDLEWARES {
+        const current: Future<!i32> = engine.middlewares[i].handle(ctx);
+        const engine_current_result: i32 = try @await current;
+        try uyagin_raise_encoded_handler_result(engine_current_result);
+        _ = engine_current_result;
+        if uyagin_chain_should_stop(ctx) {
+            break;
+        }
+        i = i + 1;
+    }
+
+    if !uyagin_chain_should_stop(ctx) {
+        i = 0;
+        while i < route.middleware_count && i < UYAGIN_MAX_MIDDLEWARES {
+            const current: Future<!i32> = route.middlewares[i].handle(ctx);
+            const route_current_result: i32 = try @await current;
+            try uyagin_raise_encoded_handler_result(route_current_result);
+            _ = route_current_result;
+            if uyagin_chain_should_stop(ctx) {
+                break;
+            }
+            i = i + 1;
+        }
+    }
+
+    if !uyagin_chain_should_stop(ctx) {
+        const current: Future<!i32> = route.handler.handle(ctx);
+        const handler_result: i32 = try @await current;
+        try uyagin_raise_encoded_handler_result(handler_result);
+        _ = handler_result;
+    }
+
+    if ctx.wrote {
+        return 0;
+    }
+    return try @await uyagin_write_context_response_async(ctx, ctx.response_status, uyagin_text_plain(), uyagin_empty_body());
+}
+
+export @async_fn fn uyagin_run_chain_recover(engine: &Engine, ctx: &GinContext, route: &GinRoute) Future<!i32> {
+    const chain_result: !i32 = @await uyagin_run_chain(engine, ctx, route);
+    if chain_result.error_id != 0u32 {
+        const error_future: Future<!i32> = uyagin_error_response(engine, ctx, chain_result.error_id);
+        const error_result: !i32 = @await error_future;
+        if error_result.error_id != 0u32 {
+            const restored: i32 = try uyagin_error_from_error_id_i32(error_result.error_id);
+            return restored;
+        }
+        return error_result.value;
+    }
+    return chain_result.value;
+}
+
+/// RAII listener：离开作用域自动 close listen fd。
+export struct GinListener {
+    server: HttpServer,
+
+    fn drop(self: GinListener) void {
+        var srv: HttpServer = self.server;
+        http_server_close(&srv);
+    }
+}
+
+export fn uyagin_new() Engine {
+    const run_options: EngineRunOptions = uyagin_run_options_default();
+    return Engine{
+        router: uyagin_router_new(),
+        route_meta: [],
+        routes: [],
+        route_count: 0,
+        middlewares: [],
+        middleware_count: 0,
+        recovery_enabled: true,
+        allocator: null,
+        limits: uyagin_limits_default(),
+        run_options: run_options,
+        access_log: uyagin_access_log_options_default(),
+        metrics: UyaginMetrics{},
+    };
+}
+
+export fn uyagin_new_with_allocator(allocator: &IAllocator) Engine {
+    const run_options: EngineRunOptions = uyagin_run_options_default();
+    return Engine{
+        router: uyagin_router_new(),
+        route_meta: [],
+        routes: [],
+        route_count: 0,
+        middlewares: [],
+        middleware_count: 0,
+        recovery_enabled: true,
+        allocator: allocator,
+        limits: uyagin_limits_default(),
+        run_options: run_options,
+        access_log: uyagin_access_log_options_default(),
+        metrics: UyaginMetrics{},
+    };
+}
+
+export fn uyagin_new_with_config(config: UyaginConfig) Engine {
+    const normalized: UyaginConfig = uyagin_config_normalize(config);
+    return Engine{
+        router: uyagin_router_new(),
+        route_meta: [],
+        routes: [],
+        route_count: 0,
+        middlewares: [],
+        middleware_count: 0,
+        recovery_enabled: true,
+        allocator: normalized.allocator,
+        limits: normalized.limits,
+        run_options: normalized.run_options,
+        access_log: normalized.access_log,
+        metrics: UyaginMetrics{},
+    };
+}
+
+export fn uyagin_limits_default() UyaginLimits {
+    return UyaginLimits{
+        max_header_count: 64,
+        max_body_bytes: MAX_BODY_SIZE as usize,
+        max_form_fields: 16,
+    };
+}
+
+export fn uyagin_response_body_static(content_type: &[const byte], body: &[const byte]) UyaginResponseBody {
+    return UyaginResponseBody{
+        kind: 1,
+        content_type: content_type,
+        bytes: body,
+        file_fd: -1,
+        file_len: 0,
+    };
+}
+
+export fn uyagin_response_body_arena(content_type: &[const byte], body: &[const byte]) UyaginResponseBody {
+    return UyaginResponseBody{
+        kind: 2,
+        content_type: content_type,
+        bytes: body,
+        file_fd: -1,
+        file_len: 0,
+    };
+}
+
+export fn uyagin_response_body_file(content_type: &[const byte], file_fd: i32, file_len: usize) UyaginResponseBody {
+    return UyaginResponseBody{
+        kind: 3,
+        content_type: content_type,
+        bytes: uyagin_empty_body(),
+        file_fd: file_fd,
+        file_len: file_len,
+    };
+}
+
+export fn uyagin_set_limits(engine: &Engine, limits: UyaginLimits) void {
+    if engine == null {
+        return;
+    }
+    engine.limits = limits;
+}
+
+export fn uyagin_metrics(engine: &Engine) &UyaginMetrics {
+    return &engine.metrics;
+}
+
+export fn uyagin_access_log_options_default() UyaginAccessLogOptions {
+    return UyaginAccessLogOptions{
+        enabled: false,
+        sample_every: 1u32,
+        fd: 2,
+    };
+}
+
+export fn uyagin_run_options_default() EngineRunOptions {
+    return EngineRunOptions{
+        max_connections: UYAGIN_RUN_CONN_SLOT_CAP,
+        accept_batch: 16,
+        poll_timeout_ms: 50,
+        shard_count: 1,
+        reuse_port: false,
+        read_timeout_ms: 0u32,
+        write_timeout_ms: 0u32,
+        idle_timeout_ms: 0u32,
+        shutdown_grace_ms: 3000u32,
+        listen_backlog: http_listen_backlog(UYAGIN_RUN_CONN_SLOT_CAP),
+        buffer_cap: UYAGIN_IO_CAP,
+        request_arena_cap: UYAGIN_REQUEST_ARENA_CAP,
+        mode: UyaginMode.Release,
+        latency_sample_every: 1u32,
+        metrics_detail_sample_every: 1u32,
+    };
+}
+
+export fn uyagin_config_default() UyaginConfig {
+    return UyaginConfig{
+        allocator: null,
+        limits: uyagin_limits_default(),
+        run_options: uyagin_run_options_default(),
+        access_log: uyagin_access_log_options_default(),
+    };
+}
+
+fn uyagin_run_options_normalize(opts: EngineRunOptions) EngineRunOptions {
+    var normalized: EngineRunOptions = opts;
+    if normalized.max_connections <= 0 || normalized.max_connections > UYAGIN_RUN_CONN_SLOT_CAP {
+        normalized.max_connections = UYAGIN_RUN_CONN_SLOT_CAP;
+    }
+    if normalized.accept_batch <= 0 {
+        normalized.accept_batch = 16;
+    }
+    if normalized.poll_timeout_ms <= 0 {
+        normalized.poll_timeout_ms = 50;
+    }
+    if normalized.shard_count <= 0 {
+        normalized.shard_count = 1;
+    }
+    if normalized.listen_backlog <= 0 {
+        normalized.listen_backlog = http_listen_backlog(normalized.max_connections);
+    }
+    if normalized.buffer_cap == 0 || normalized.buffer_cap > UYAGIN_IO_CAP {
+        normalized.buffer_cap = UYAGIN_IO_CAP;
+    }
+    if normalized.request_arena_cap == 0 || normalized.request_arena_cap > UYAGIN_REQUEST_ARENA_CAP {
+        normalized.request_arena_cap = UYAGIN_REQUEST_ARENA_CAP;
+    }
+    return normalized;
+}
+
+fn uyagin_access_log_options_normalize(opts: UyaginAccessLogOptions) UyaginAccessLogOptions {
+    var normalized: UyaginAccessLogOptions = opts;
+    if normalized.sample_every == 0u32 {
+        normalized.sample_every = 1u32;
+    }
+    if normalized.fd < 0 {
+        normalized.fd = 2;
+    }
+    return normalized;
+}
+
+fn uyagin_config_normalize(config: UyaginConfig) UyaginConfig {
+    const run_options: EngineRunOptions = uyagin_run_options_normalize(config.run_options);
+    const access_log: UyaginAccessLogOptions = uyagin_access_log_options_normalize(config.access_log);
+    return UyaginConfig{
+        allocator: config.allocator,
+        limits: config.limits,
+        run_options: run_options,
+        access_log: access_log,
+    };
+}
+
+export fn uyagin_set_config(engine: &Engine, config: UyaginConfig) void {
+    if engine == null {
+        return;
+    }
+    const normalized: UyaginConfig = uyagin_config_normalize(config);
+    engine.allocator = normalized.allocator;
+    engine.limits = normalized.limits;
+    engine.run_options = normalized.run_options;
+    engine.access_log = normalized.access_log;
+}
+
+export fn uyagin_set_run_options(engine: &Engine, opts: EngineRunOptions) void {
+    if engine == null {
+        return;
+    }
+    engine.run_options = uyagin_run_options_normalize(opts);
+}
+
+export fn uyagin_set_access_log_options(engine: &Engine, opts: UyaginAccessLogOptions) void {
+    if engine == null {
+        return;
+    }
+    engine.access_log = uyagin_access_log_options_normalize(opts);
+}
+
+export fn uyagin_config(engine: &Engine) UyaginConfig {
+    if engine == null {
+        return uyagin_config_default();
+    }
+    return UyaginConfig{
+        allocator: engine.allocator,
+        limits: engine.limits,
+        run_options: engine.run_options,
+        access_log: engine.access_log,
+    };
+}
+
+export fn uyagin_run_controller_new() EngineRunController {
+    return EngineRunController{ stop_requested: 0 };
+}
+
+export fn uyagin_run_controller_request_stop(controller: &EngineRunController) void {
+    if controller == null {
+        return;
+    }
+    controller.stop_requested = 1;
+}
+
+fn uyagin_now_ms() !u64 {
+    var tv: TimeVal = TimeVal{ tv_sec: 0, tv_usec: 0 };
+    _ = try sys_gettimeofday(&tv, null as &void);
+    return (tv.tv_sec as u64) * (1000 as u64) + ((tv.tv_usec as u64) / (1000 as u64));
+}
+
+fn uyagin_now_us() !u64 {
+    var tv: TimeVal = TimeVal{ tv_sec: 0, tv_usec: 0 };
+    _ = try sys_gettimeofday(&tv, null as &void);
+    return (tv.tv_sec as u64) * (1000000 as u64) + (tv.tv_usec as u64);
+}
+
+fn uyagin_deadline_expired(now_ms: u64, started_ms: u64, timeout_ms: u32) bool {
+    if timeout_ms == 0u32 || started_ms == 0u64 {
+        return false;
+    }
+    return now_ms >= started_ms + (timeout_ms as u64);
+}
+
+fn uyagin_run_options_needs_clock(options: &EngineRunOptions, controller: &EngineRunController) bool {
+    if controller != null {
+        return true;
+    }
+    if options == null {
+        return false;
+    }
+    return options.read_timeout_ms != 0u32 || options.write_timeout_ms != 0u32 || options.idle_timeout_ms != 0u32;
+}
+
+fn uyagin_conn_slot_ptr(base: &UyaginConnTaskSlot, idx: i32, cap: i32) &UyaginConnTaskSlot {
+    if base == null || idx < 0 || idx >= cap {
+        return null;
+    }
+    return @ptr_from_usize(@usize_from_ptr(base as &void) + (idx as usize) * @size_of(UyaginConnTaskSlot)) as &UyaginConnTaskSlot;
+}
+
+fn uyagin_sync_slot_io_registration(loop: EventLoop, slot: &UyaginConnTaskSlot) !void {
+    if slot.io_registered_fd >= 0 && slot.io_registered_fd != slot.waker.io_fd() {
+        _ = loop.deregister(slot.io_registered_fd) catch {};
+        slot.io_registered_fd = -1;
+    }
+    if !slot.waker.has_io_interest() || slot.waker.io_fd() < 0 {
+        if slot.io_registered_fd >= 0 {
+            _ = loop.deregister(slot.io_registered_fd) catch {};
+            slot.io_registered_fd = -1;
+        }
+        return;
+    }
+    if slot.waker.io_interest_code() == 2 {
+        const reg_w: !i32 = loop.register(slot.waker.io_fd(), EventKind.Writable({}), &slot.waker);
+        _ = try reg_w;
+        slot.io_registered_fd = slot.waker.io_fd();
+        return;
+    }
+    const reg_r: !i32 = loop.register(slot.waker.io_fd(), EventKind.Readable({}), &slot.waker);
+    _ = try reg_r;
+    slot.io_registered_fd = slot.waker.io_fd();
+}
+
+fn uyagin_cleanup_slot(loop: EventLoop, slot: &UyaginConnTaskSlot) void {
+    if slot.io_registered_fd >= 0 {
+        _ = loop.deregister(slot.io_registered_fd) catch {};
+    }
+    uyagin_conn_slot_release(slot);
+    slot.active = 0;
+    slot.fd = -1;
+    slot.io_registered_fd = -1;
+    slot.accepted_ms = 0u64;
+    slot.last_progress_ms = 0u64;
+    slot.wait_interest = 0;
+    slot.waker.clear_io_interest();
+    slot.future_live = 0;
+    slot.state.parse_error_id = 0u32;
+    slot.state.filled = 0;
+    slot.state.served = 0;
+    slot.state.http10_session_keep_alive = false;
+}
+
+fn uyagin_init_slot(slot: &UyaginConnTaskSlot) void {
+    slot.active = 0;
+    slot.fd = -1;
+    slot.future_live = 0;
+    var i: usize = 0;
+    while i < UYAGIN_CONN_FRAME_WORDS {
+        slot.frame_storage[i] = 0usize;
+        i = i + 1;
+    }
+    slot.waker = Waker{ _io_fd: -1, _event_fd: -1 };
+    slot.io_registered_fd = -1;
+    slot.accepted_ms = 0u64;
+    slot.last_progress_ms = 0u64;
+    slot.wait_interest = 0;
+    slot.state.parse_error_id = 0u32;
+    slot.state.filled = 0;
+    slot.state.served = 0;
+    slot.state.http10_session_keep_alive = false;
+}
+
+fn uyagin_server_set_reuseport(fd: i32) void {
+    var one: i32 = 1;
+    _ = sys_setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &one as &void, 4 as u32) catch {};
+}
+
+fn uyagin_listen_loopback_server(port: u16, listen_backlog: i32, reuse_port: bool) !HttpServer {
+    const fd: i32 = try sys_socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    var one: i32 = 1;
+    _ = sys_setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one as &void, 4 as u32) catch |err| {
+        _ = sys_close(fd) catch {};
+        return err;
+    };
+    if reuse_port {
+        _ = sys_setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &one as &void, 4 as u32) catch {};
+    }
+    var addr: [byte: 16] = [];
+    fill_sockaddr_loopback_16(port, &addr[0] as &byte);
+    _ = sys_bind(fd, &addr[0] as &void, 16 as u32) catch |err| {
+        _ = sys_close(fd) catch {};
+        return err;
+    };
+    _ = sys_listen(fd, listen_backlog) catch |err| {
+        _ = sys_close(fd) catch {};
+        return err;
+    };
+    var port_out: u16 = port;
+    if port == 0 {
+        var alen: u32 = 16;
+        var out_addr: [byte: 16] = [];
+        _ = sys_getsockname(fd, &out_addr[0] as &void, &alen) catch |err| {
+            _ = sys_close(fd) catch {};
+            return err;
+        };
+        port_out = read_port_from_sockaddr_16(&out_addr[0] as &byte);
+    }
+    return HttpServer{ listen_fd: fd, port: port_out };
+}
+
+fn uyagin_shard_thread_main(arg: &void) &void {
+    const ctx: &UyaginShardThreadCtx = arg as &UyaginShardThreadCtx;
+    var scheduler: Scheduler = Scheduler{};
+    scheduler_init(&scheduler);
+    const loop_impl: !LinuxEpoll = linux_epoll_create(0);
+    const loop_ok: LinuxEpoll = loop_impl catch {
+        ctx.failed = 1;
+        return null;
+    };
+    const loop: EventLoop = loop_ok;
+    const served: !i32 = uyagin_engine_run(ctx.engine, &ctx.server, loop, &scheduler, &ctx.options, ctx.controller);
+    ctx.served = served catch {
+        ctx.failed = 1;
+        return null;
+    };
+    return null;
+}
+
+fn uyagin_engine_run_shards(engine: &Engine, listener: &GinListener, opts: &EngineRunOptions, controller: &EngineRunController) !i32 {
+    if engine == null || listener == null || opts == null {
+        return error.InvalidRequest;
+    }
+    const options: EngineRunOptions = uyagin_run_options_normalize(*opts);
+    var shard_count: i32 = options.shard_count;
+    if shard_count <= 0 {
+        shard_count = 1;
+    }
+    if shard_count == 1 {
+        var scheduler: Scheduler = Scheduler{};
+        scheduler_init(&scheduler);
+        var loop_impl: LinuxEpoll = try linux_epoll_create(0);
+        const loop: EventLoop = loop_impl;
+        return uyagin_engine_run(engine, &listener.server, loop, &scheduler, &options, controller);
+    }
+
+    var worker_count: i32 = shard_count - 1;
+    std.cfg(std.target_os == .tos_macos, {
+        worker_count = 0;
+    }, {})
+    if worker_count > 31 {
+        worker_count = 31;
+        shard_count = 32;
+    }
+
+    var threads: [pthread_t: 31] = [];
+    var ctxs: [UyaginShardThreadCtx: 31] = [];
+    var thread_attr: pthread_attr_t = pthread_attr_t{ stack_size: 0, detached: 0 };
+    _ = pthread_attr_init(&thread_attr);
+    _ = pthread_attr_setstacksize(&thread_attr, UYAGIN_SHARD_THREAD_STACK_BYTES);
+    defer {
+        _ = pthread_attr_destroy(&thread_attr);
+    }
+    var i: i32 = 0;
+    while i < worker_count {
+        var shard_server: HttpServer = listener.server;
+        if options.reuse_port {
+            shard_server = try uyagin_listen_loopback_server(listener.server.port, options.listen_backlog, true);
+        }
+        ctxs[i as usize].engine = engine;
+        ctxs[i as usize].server.listen_fd = shard_server.listen_fd;
+        ctxs[i as usize].server.port = shard_server.port;
+        ctxs[i as usize].controller = controller;
+        ctxs[i as usize].options.max_connections = options.max_connections;
+        ctxs[i as usize].options.accept_batch = options.accept_batch;
+        ctxs[i as usize].options.poll_timeout_ms = options.poll_timeout_ms;
+        ctxs[i as usize].options.shard_count = options.shard_count;
+        ctxs[i as usize].options.reuse_port = options.reuse_port;
+        ctxs[i as usize].options.read_timeout_ms = options.read_timeout_ms;
+        ctxs[i as usize].options.write_timeout_ms = options.write_timeout_ms;
+        ctxs[i as usize].options.idle_timeout_ms = options.idle_timeout_ms;
+        ctxs[i as usize].options.shutdown_grace_ms = options.shutdown_grace_ms;
+        ctxs[i as usize].options.listen_backlog = options.listen_backlog;
+        ctxs[i as usize].options.buffer_cap = options.buffer_cap;
+        ctxs[i as usize].options.request_arena_cap = options.request_arena_cap;
+        ctxs[i as usize].options.mode = options.mode;
+        ctxs[i as usize].options.latency_sample_every = options.latency_sample_every;
+        ctxs[i as usize].options.metrics_detail_sample_every = options.metrics_detail_sample_every;
+        ctxs[i as usize].served = 0;
+        ctxs[i as usize].failed = 0;
+        const cret: i32 = pthread_create(&threads[i as usize], &thread_attr as &const pthread_attr_t, &uyagin_shard_thread_main as &void, (&ctxs[i as usize]) as &void);
+        if cret != 0 {
+            if options.reuse_port {
+                http_server_close(&ctxs[i as usize].server);
+            }
+            return error.InvalidRequest;
+        }
+        i = i + 1;
+    }
+
+    var local_scheduler: Scheduler = Scheduler{};
+    scheduler_init(&local_scheduler);
+    var local_loop_impl: LinuxEpoll = try linux_epoll_create(0);
+    const local_loop: EventLoop = local_loop_impl;
+    const total_main: i32 = try uyagin_engine_run(engine, &listener.server, local_loop, &local_scheduler, &options, controller);
+
+    var total: i32 = total_main;
+    i = 0;
+    while i < worker_count {
+        _ = pthread_join(&threads[i as usize], null as & &void);
+        if ctxs[i as usize].failed != 0 {
+            return error.InvalidRequest;
+        }
+        total = total + ctxs[i as usize].served;
+        if options.reuse_port {
+            http_server_close(&ctxs[i as usize].server);
+        }
+        i = i + 1;
+    }
+    return total;
+}
+
+std.cfg(std.target_os == .tos_macos, {
+fn uyagin_engine_run(engine: &Engine, srv: &HttpServer, loop: EventLoop, scheduler: &Scheduler, opts: &EngineRunOptions, controller: &EngineRunController) !i32 {
+    _ = loop;
+    _ = scheduler;
+    if engine == null || srv == null || srv.listen_fd < 0 || opts == null {
+        return error.InvalidRequest;
+    }
+    return uyagin_run_simple_blocking(engine, srv, opts, controller);
+}
+}, {
+// 协议/连接处理本体已迁到 @async_fn，但生产 server loop 仍需保留 slot 级手写 poll：
+// 它同时负责 accept、新连接占槽、deadline/优雅停机判断，以及为活跃连接 frame 同步 fd interest。
+// 当前 Scheduler 入口仍是“给定一组 future 跑到完成”，还不能在运行中动态接纳/回收连接任务。
+fn uyagin_engine_run(engine: &Engine, srv: &HttpServer, loop: EventLoop, scheduler: &Scheduler, opts: &EngineRunOptions, controller: &EngineRunController) !i32 {
+    if engine == null || srv == null || srv.listen_fd < 0 || opts == null || scheduler == null {
+        return error.InvalidRequest;
+    }
+    const options: EngineRunOptions = uyagin_run_options_normalize(*opts);
+    const slot_cap: i32 = options.max_connections;
+    const alloc: IAllocator = *scheduler_frame_pool(scheduler);
+    const old_alloc: &IAllocator = get_async_frame_allocator();
+    set_async_frame_allocator(&alloc);
+    defer { set_async_frame_allocator(old_alloc); }
+
+    if options.reuse_port {
+        uyagin_server_set_reuseport(srv.listen_fd);
+    }
+
+    const slots_bytes: usize = (slot_cap as usize) * @size_of(UyaginConnTaskSlot);
+    const slots: &UyaginConnTaskSlot = malloc(slots_bytes) as &UyaginConnTaskSlot;
+    if slots == null {
+        return error.AllocOutOfMemory;
+    }
+    defer {
+        var cleanup_idx: i32 = 0;
+        while cleanup_idx < slot_cap {
+            const slot: &UyaginConnTaskSlot = uyagin_conn_slot_ptr(slots, cleanup_idx, slot_cap);
+            if slot != null && slot.active != 0 {
+                if slot.fd >= 0 {
+                    _ = sys_shutdown(slot.fd, SHUT_WR) catch {};
+                    _ = sys_close(slot.fd) catch {};
+                }
+                uyagin_cleanup_slot(loop, slot);
+            }
+            cleanup_idx = cleanup_idx + 1;
+        }
+        free(slots as &void);
+    }
+
+    var i: i32 = 0;
+    while i < slot_cap {
+        const slot: &UyaginConnTaskSlot = uyagin_conn_slot_ptr(slots, i, slot_cap);
+        if slot != null {
+            uyagin_init_slot(slot);
+        }
+        i = i + 1;
+    }
+
+    var accept_future: Future<!i32> = uyagin_accept_future(srv.listen_fd);
+    defer { accept_future.release(); }
+    var accept_waker: Waker = Waker{ _io_fd: -1, _event_fd: -1 };
+    var accept_registered_fd: i32 = -1;
+    var served_total: i32 = 0;
+    var active_count: i32 = 0;
+    var accepting: bool = true;
+    var shutdown_deadline_ms: u64 = 0u64;
+    const needs_clock: bool = uyagin_run_options_needs_clock(&options, controller);
+
+    while true {
+        var now_ms: u64 = 0u64;
+        if needs_clock {
+            now_ms = try uyagin_now_ms();
+        }
+        var made_progress: i32 = 0;
+        var registered: i32 = 0;
+        var need_retry: i32 = 0;
+
+        if controller != null && controller.stop_requested != 0 {
+            accepting = false;
+            if shutdown_deadline_ms == 0u64 {
+                shutdown_deadline_ms = now_ms + (options.shutdown_grace_ms as u64);
+            }
+        }
+
+        if accepting && active_count < options.max_connections {
+            accept_waker.reset();
+            accept_waker.clear_io_interest();
+            var accepted_in_round: i32 = 0;
+            while accepting && active_count < options.max_connections && accepted_in_round < options.accept_batch {
+                const ap: Poll<!i32> = accept_future.poll(&accept_waker);
+                match ap {
+                    .Ready(result) => {
+                        if result.error_id != 0 {
+                            accepting = false;
+                            break;
+                        }
+                        const fd: i32 = result.value;
+                        var assigned: bool = false;
+                        var sidx: i32 = 0;
+                        while sidx < slot_cap {
+                            const slot: &UyaginConnTaskSlot = uyagin_conn_slot_ptr(slots, sidx, slot_cap);
+                            if slot != null && slot.active == 0 {
+                                slot.active = 1;
+                                slot.fd = fd;
+                                uyagin_conn_slot_start(slot, engine, fd, scheduler, &options);
+                                slot.waker = Waker{ _io_fd: -1, _event_fd: -1 };
+                                slot.io_registered_fd = -1;
+                                slot.accepted_ms = now_ms;
+                                slot.last_progress_ms = now_ms;
+                                slot.wait_interest = 0;
+                                active_count = active_count + 1;
+                                uyagin_note_connection_open(engine);
+                                assigned = true;
+                                break;
+                            }
+                            sidx = sidx + 1;
+                        }
+                        if !assigned {
+                            _ = sys_close(fd) catch {};
+                            accept_future.release();
+                            accept_future = uyagin_accept_future(srv.listen_fd);
+                            break;
+                        }
+                        accept_future.release();
+                        accept_future = uyagin_accept_future(srv.listen_fd);
+                        accepted_in_round = accepted_in_round + 1;
+                        made_progress = 1;
+                    },
+                    .Pending(_) => {
+                        break;
+                    },
+                };
+            }
+            if !accepting && accept_registered_fd >= 0 {
+                _ = loop.deregister(accept_registered_fd) catch {};
+                accept_registered_fd = -1;
+            } else if accept_waker.has_io_interest() && accepting && active_count < options.max_connections {
+                const acc_reg: !i32 = loop.register(accept_waker.io_fd(), EventKind.Readable({}), &accept_waker);
+                _ = acc_reg catch {};
+                accept_registered_fd = accept_waker.io_fd();
+                registered = registered + 1;
+            } else if accept_registered_fd >= 0 {
+                _ = loop.deregister(accept_registered_fd) catch {};
+                accept_registered_fd = -1;
+            }
+        } else if accept_registered_fd >= 0 {
+            _ = loop.deregister(accept_registered_fd) catch {};
+            accept_registered_fd = -1;
+        }
+
+        i = 0;
+        while i < slot_cap {
+            const slot: &UyaginConnTaskSlot = uyagin_conn_slot_ptr(slots, i, slot_cap);
+            if slot == null || slot.active == 0 {
+                i = i + 1;
+                continue;
+            }
+
+            if needs_clock &&
+               (uyagin_deadline_expired(now_ms, slot.last_progress_ms, options.idle_timeout_ms) ||
+                (slot.wait_interest == 1 && uyagin_deadline_expired(now_ms, slot.last_progress_ms, options.read_timeout_ms)) ||
+                (slot.wait_interest == 2 && uyagin_deadline_expired(now_ms, slot.last_progress_ms, options.write_timeout_ms)) ||
+                (shutdown_deadline_ms != 0u64 && now_ms >= shutdown_deadline_ms)) {
+                _ = sys_shutdown(slot.fd, SHUT_WR) catch {};
+                _ = sys_close(slot.fd) catch {};
+                uyagin_cleanup_slot(loop, slot);
+                active_count = active_count - 1;
+                uyagin_note_connection_close(engine);
+                made_progress = 1;
+                i = i + 1;
+                continue;
+            }
+
+            slot.waker.reset();
+            slot.waker.clear_io_interest();
+            const p: Poll<!i32> = uyagin_conn_slot_poll(slot, &slot.waker);
+            match p {
+                .Ready(result) => {
+                    var served: i32 = 0;
+                    if result.error_id == 0 {
+                        served = result.value;
+                    }
+                    served_total = served_total + served;
+                    uyagin_cleanup_slot(loop, slot);
+                    active_count = active_count - 1;
+                    uyagin_note_connection_close(engine);
+                    made_progress = 1;
+                },
+                .Pending(_) => {
+                    if slot.waker.is_woken() {
+                        if needs_clock {
+                            slot.last_progress_ms = now_ms;
+                        }
+                        made_progress = 1;
+                    } else {
+                        slot.wait_interest = slot.waker.io_interest_code();
+                        try uyagin_sync_slot_io_registration(loop, slot);
+                        if slot.io_registered_fd >= 0 {
+                            registered = registered + 1;
+                        } else {
+                            need_retry = 1;
+                        }
+                    }
+                },
+            };
+            i = i + 1;
+        }
+
+        if !accepting && active_count == 0 {
+            break;
+        }
+        if made_progress != 0 {
+            continue;
+        }
+        if need_retry != 0 {
+            continue;
+        }
+        if registered != 0 {
+            _ = try loop.poll(options.poll_timeout_ms);
+            continue;
+        }
+        _ = try loop.poll(1);
+    }
+
+    if accept_registered_fd >= 0 {
+        _ = loop.deregister(accept_registered_fd) catch {};
+    }
+    return served_total;
+}
+})
+
+fn uyagin_run_simple_blocking(engine: &Engine, srv: &HttpServer, opts: &EngineRunOptions, controller: &EngineRunController) !i32 {
+    if engine == null || srv == null || srv.listen_fd < 0 || opts == null {
+        return error.InvalidRequest;
+    }
+    const options: EngineRunOptions = uyagin_run_options_normalize(*opts);
+    var scheduler: Scheduler = Scheduler{};
+    scheduler_init(&scheduler);
+    var served_total: i32 = 0;
+    while true {
+        if controller != null && controller.stop_requested != 0 {
+            break;
+        }
+        const fd: i32 = try sys_accept(srv.listen_fd, null, null);
+        uyagin_note_connection_open(engine);
+        var served: i32 = 0;
+        const served_result: !i32 = scheduler_run<!i32>(&scheduler, uyagin_serve_conn(engine, fd, &scheduler));
+        served = served_result catch {
+            uyagin_note_connection_close(engine);
+            continue;
+            0;
+        };
+        uyagin_note_connection_close(engine);
+        served_total = served_total + served;
+        if options.mode == UyaginMode.Debug {
+            break;
+        }
+    }
+    return served_total;
+}
+
+export fn uyagin_context_new_with_request_arena(fd: i32, req: &Request, persist: bool, allocator: &IAllocator, request_arena: &RequestArena) GinContext {
+    return GinContext{
+        fd: fd,
+        request: req,
+        wrote: false,
+        aborted: false,
+        hijacked: false,
+        persist: persist,
+        allocator: allocator,
+        request_arena: request_arena,
+        response_status: Status.OK,
+        out_headers: [],
+        out_header_count: 0,
+        suppress_body: false,
+        response_body: uyagin_response_body_static(uyagin_text_plain(), uyagin_empty_body()),
+        response_head_buf: null,
+        response_head_cap: 0usize,
+    };
+}
+
+export fn uyagin_context_new(fd: i32, req: &Request, persist: bool, allocator: &IAllocator) GinContext {
+    return uyagin_context_new_with_request_arena(fd, req, persist, allocator, null as &RequestArena);
+}
+
+fn uyagin_empty_body() &[const byte] {
+    const base: &byte = &uyagin_empty_body_raw[0] as &byte;
+    return base[0: 0];
+}
+
+fn uyagin_response_body_len(body: UyaginResponseBody) usize {
+    if body.kind == 3 {
+        return body.file_len;
+    }
+    return body.bytes.len;
+}
+
+@async_fn fn uyagin_writev_all_future(fd: i32, head: &const byte, head_len: usize, body: &const byte, body_len: usize) Future<!usize> {
+    return try @await async_writev(fd, head, head_len, body, body_len);
+}
+
+@async_fn fn uyagin_write_all_nonblocking_future(fd: i32, data: &const byte, count: usize) Future<!usize> {
+    var total: usize = 0;
+    while total < count {
+        const ptr: *const byte = @ptr_from_usize(@usize_from_ptr(data as &void) + total) as *const byte;
+        const result: !isize = sys_write(fd, ptr, count - total);
+        var step: i32 = 0;
+        const n: isize = result catch |err| {
+            const err_id: u32 = @error_id(err);
+            if err_id == EINTR as u32 {
+                step = 1;
+                0 as isize;
+            } else if err_id == EAGAIN as u32 || err_id == EWOULDBLOCK as u32 {
+                step = 2;
+                0 as isize;
+            } else {
+                return err;
+            }
+        };
+        if step == 1 {
+            continue;
+        }
+        if step == 2 {
+            _ = try @await async_wait_writable(fd, 0 as u64);
+            continue;
+        }
+        if n <= 0 {
+            return error.WriteZero;
+        }
+        total = total + (n as usize);
+    }
+    return total;
+}
+
+@async_fn fn uyagin_sendfile_future(fd: i32, file_fd: i32, total_len: usize) Future<!usize> {
+    return try @await async_sendfile(fd, file_fd, total_len);
+}
+
+export @async_fn fn uyagin_send_file_body_async(fd: i32, file_fd: i32, total_len: usize) Future<!usize> {
+    if fd < 0 || file_fd < 0 {
+        return error.InvalidRequest;
+    }
+    return try @await uyagin_sendfile_future(fd, file_fd, total_len);
+}
+
+fn uyagin_text_plain() &[const byte] {
+    const s: &[const byte] = "text/plain";
+    return s;
+}
+
+fn uyagin_encoded_handler_error_id(value: i32) u32 {
+    if value >= 0 {
+        return 0u32;
+    }
+    if value == (@error_id(error.HandlerMissing) as! i32).value {
+        return @error_id(error.HandlerMissing);
+    }
+    if value == (@error_id(error.InvalidRequest) as! i32).value {
+        return @error_id(error.InvalidRequest);
+    }
+    if value == (@error_id(error.HeaderTooLarge) as! i32).value {
+        return @error_id(error.HeaderTooLarge);
+    }
+    if value == (@error_id(error.ValueTooLong) as! i32).value {
+        return @error_id(error.ValueTooLong);
+    }
+    if value == (@error_id(error.TooManyParams) as! i32).value {
+        return @error_id(error.TooManyParams);
+    }
+    if value == (@error_id(error.PayloadTooLarge) as! i32).value {
+        return @error_id(error.PayloadTooLarge);
+    }
+    if value == (@error_id(error.URITooLong) as! i32).value {
+        return @error_id(error.URITooLong);
+    }
+    if value == (@error_id(error.MethodNotAllowed) as! i32).value {
+        return @error_id(error.MethodNotAllowed);
+    }
+    return @error_id(error.HandlerMissing);
+}
+
+fn uyagin_raise_encoded_handler_result(value: i32) !void {
+    const err_id: u32 = uyagin_encoded_handler_error_id(value);
+    if err_id == 0u32 {
+        return;
+    }
+    if err_id == @error_id(error.HandlerMissing) {
+        return error.HandlerMissing;
+    }
+    if err_id == @error_id(error.InvalidRequest) {
+        return error.InvalidRequest;
+    }
+    if err_id == @error_id(error.HeaderTooLarge) {
+        return error.HeaderTooLarge;
+    }
+    if err_id == @error_id(error.ValueTooLong) {
+        return error.ValueTooLong;
+    }
+    if err_id == @error_id(error.TooManyParams) {
+        return error.TooManyParams;
+    }
+    if err_id == @error_id(error.PayloadTooLarge) {
+        return error.PayloadTooLarge;
+    }
+    if err_id == @error_id(error.URITooLong) {
+        return error.URITooLong;
+    }
+    if err_id == @error_id(error.MethodNotAllowed) {
+        return error.MethodNotAllowed;
+    }
+    return error.HandlerMissing;
+}
+
+export fn uyagin_write_context_response_async(ctx: &GinContext, status: Status, content_type: &[const byte], body: &[const byte]) Future<!i32> {
+    if ctx != null && ctx.response_head_buf != null && ctx.response_head_cap > 0 {
+        return uyagin_write_context_response_with_head_async(ctx, status, content_type, body, ctx.response_head_buf, ctx.response_head_cap);
+    }
+    return uyagin_write_context_response_local_head_async(ctx, status, content_type, body);
+}
+
+@async_fn fn uyagin_write_context_response_local_head_async(ctx: &GinContext, status: Status, content_type: &[const byte], body: &[const byte]) Future<!i32> {
+    var hdr: [byte: UYAGIN_HEADER_CAP] = [];
+    return try @await uyagin_write_context_response_with_head_async(ctx, status, content_type, body, &hdr[0] as &byte, UYAGIN_HEADER_CAP);
+}
+
+@async_fn fn uyagin_write_context_response_with_head_async(ctx: &GinContext, status: Status, content_type: &[const byte], body: &[const byte], hdr: &byte, hdr_cap: usize) Future<!i32> {
+    if ctx == null || ctx.fd < 0 || ctx.request == null {
+        return error.InvalidRequest;
+    }
+    if hdr == null || hdr_cap == 0 {
+        return error.HeaderBufferTooSmall;
+    }
+    ctx.response_status = status;
+    if ctx.suppress_body {
+        _ = try @await uyagin_send_context_response_head_only_async(ctx, status, content_type, body.len);
+        ctx.wrote = true;
+        return 0;
+    }
+    var pos: usize = 0;
+    if ctx.out_header_count == 0 && ctx.persist && ctx.request.http11 {
+        pos = uyagin_build_response_head_http11_persist_no_headers(hdr, hdr_cap, status, content_type, body.len);
+    } else {
+        pos = uyagin_build_response_head(hdr, hdr_cap, status, content_type, body.len, ctx.request, ctx.persist, &ctx.out_headers[0] as &Header, ctx.out_header_count);
+    }
+    if pos > hdr_cap {
+        return error.HeaderBufferTooSmall;
+    }
+    var total: usize = pos + body.len;
+    const room: usize = hdr_cap - pos;
+    if body.len <= room {
+        var i: usize = 0;
+        while i < body.len {
+            hdr[pos + i] = body.ptr[i];
+            i = i + 1;
+        }
+        _ = try @await uyagin_write_all_nonblocking_future(ctx.fd, hdr as &const byte, total);
+    } else {
+        if body.len > 0 {
+            _ = try @await uyagin_writev_all_future(ctx.fd, hdr as &const byte, pos, body.ptr as &const byte, body.len);
+        } else {
+            _ = try @await uyagin_write_all_nonblocking_future(ctx.fd, hdr as &const byte, pos);
+        }
+    }
+    ctx.wrote = true;
+    return 0;
+}
+
+fn uyagin_error_from_error_id_i32(err_id: u32) !i32 {
+    if err_id == @error_id(error.ConnectionClosed) {
+        return error.ConnectionClosed;
+    }
+    if err_id == @error_id(error.InvalidRequest) {
+        return error.InvalidRequest;
+    }
+    if err_id == @error_id(error.HeaderTooLarge) {
+        return error.HeaderTooLarge;
+    }
+    if err_id == @error_id(error.ValueTooLong) {
+        return error.ValueTooLong;
+    }
+    if err_id == @error_id(error.TooManyParams) {
+        return error.TooManyParams;
+    }
+    if err_id == @error_id(error.PayloadTooLarge) {
+        return error.PayloadTooLarge;
+    }
+    if err_id == @error_id(error.URITooLong) {
+        return error.URITooLong;
+    }
+    if err_id == @error_id(error.MethodNotAllowed) {
+        return error.MethodNotAllowed;
+    }
+    if err_id == @error_id(error.HandlerMissing) {
+        return error.HandlerMissing;
+    }
+    return error.HandlerMissing;
+}
+
+fn uyagin_ready_i32(result: !i32) Future<!i32> {
+    return Future<!i32>{ state: Poll<!i32>.Ready(result) };
+}
+
+fn uyagin_ready_usize(result: !usize) Future<!usize> {
+    return Future<!usize>{ state: Poll<!usize>.Ready(result) };
+}
+
+export fn uyagin_listen_loopback_with_reuseport(port: u16, max_connections: i32, reuse_port: bool) !GinListener {
+    const backlog: i32 = http_listen_backlog(max_connections);
+    const srv: HttpServer = try uyagin_listen_loopback_server(port, backlog, reuse_port);
+    return GinListener{ server: srv };
+}
+
+export fn uyagin_listen_loopback(port: u16, max_connections: i32) !GinListener {
+    return uyagin_listen_loopback_with_reuseport(port, max_connections, false);
+}
+
+export fn uyagin_listen_loopback_with_options(port: u16, opts: &EngineRunOptions) !GinListener {
+    if opts == null {
+        return error.InvalidRequest;
+    }
+    const normalized: EngineRunOptions = uyagin_run_options_normalize(*opts);
+    const srv: HttpServer = try uyagin_listen_loopback_server(port, normalized.listen_backlog, normalized.reuse_port);
+    return GinListener{ server: srv };
+}
+
+export fn uyagin_listen_loopback_with_config(port: u16, config: &UyaginConfig) !GinListener {
+    if config == null {
+        return error.InvalidRequest;
+    }
+    const normalized: UyaginConfig = uyagin_config_normalize(*config);
+    return uyagin_listen_loopback_with_options(port, &normalized.run_options);
+}
+
+fn uyagin_route_ptr(engine: &Engine, idx: i32) &GinRoute {
+    if engine == null || idx < 0 || idx >= UYAGIN_MAX_ROUTES {
+        return null;
+    }
+    const base: &GinRoute = &engine.routes[0];
+    const off: usize = (idx as usize) * @size_of(GinRoute);
+    return @ptr_from_usize(@usize_from_ptr(base as &void) + off) as &GinRoute;
+}
+
+fn uyagin_route_meta_ptr(engine: &Engine, idx: i32) &UyaginRouteMeta {
+    if engine == null || idx < 0 || idx >= UYAGIN_MAX_ROUTES {
+        return null;
+    }
+    const base: &UyaginRouteMeta = &engine.route_meta[0];
+    const off: usize = (idx as usize) * @size_of(UyaginRouteMeta);
+    return @ptr_from_usize(@usize_from_ptr(base as &void) + off) as &UyaginRouteMeta;
+}
+
+fn uyagin_find_kv(kvs: &[HttpKvSlice], name: &[const byte]) !&[const byte] {
+    var i: usize = 0;
+    while i < kvs.len {
+        if uyagin_slice_eq(kvs.ptr[i].key, name) {
+            return kvs.ptr[i].value;
+        }
+        i = i + 1;
+    }
+    return error.InvalidRequest;
+}
+
+fn uyagin_slice_eq(a: &[const byte], b: &[const byte]) bool {
+    if a.len != b.len {
+        return false;
+    }
+    var i: usize = 0;
+    while i < a.len {
+        if a.ptr[i] != b.ptr[i] {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+
+fn uyagin_context_header_ptr(ctx: &GinContext, idx: i32) &Header {
+    if ctx == null || idx < 0 || idx >= UYAGIN_MAX_RESPONSE_HEADERS {
+        return null;
+    }
+    const base: &Header = &ctx.out_headers[0];
+    const off: usize = (idx as usize) * @size_of(Header);
+    return @ptr_from_usize(@usize_from_ptr(base as &void) + off) as &Header;
+}
+
+fn uyagin_copy_to_header_name(h: &Header, name: &[const byte]) !void {
+    if name.len > MAX_HEADER_SIZE as usize {
+        return error.HeaderTooLarge;
+    }
+    h.name_len = name.len;
+    var i: usize = 0;
+    while i < name.len {
+        h.name[i] = name.ptr[i];
+        i = i + 1;
+    }
+}
+
+fn uyagin_copy_to_header_value(h: &Header, value: &[const byte]) !void {
+    if value.len > MAX_HEADER_VALUE_SIZE as usize {
+        return error.HeaderTooLarge;
+    }
+    h.value_len = value.len;
+    var i: usize = 0;
+    while i < value.len {
+        h.value[i] = value.ptr[i];
+        i = i + 1;
+    }
+}
+
+fn uyagin_header_name_eq(h: &Header, name: &[const byte]) bool {
+    const hb: &byte = &h.name[0] as &byte;
+    return uyagin_slice_eq(hb[0: h.name_len], name);
+}
+
+fn uyagin_context_header_set(ctx: &GinContext, name: &[const byte], value: &[const byte]) !void {
+    if ctx == null {
+        return error.InvalidRequest;
+    }
+    var i: i32 = 0;
+    while i < ctx.out_header_count && i < UYAGIN_MAX_RESPONSE_HEADERS {
+        const h: &Header = uyagin_context_header_ptr(ctx, i);
+        if h != null && uyagin_header_name_eq(h, name) {
+            try uyagin_copy_to_header_value(h, value);
+            return;
+        }
+        i = i + 1;
+    }
+    if ctx.out_header_count < 0 || ctx.out_header_count >= UYAGIN_MAX_RESPONSE_HEADERS {
+        return error.HeaderTooLarge;
+    }
+    const dst: &Header = uyagin_context_header_ptr(ctx, ctx.out_header_count);
+    if dst == null {
+        return error.HeaderTooLarge;
+    }
+    try uyagin_copy_to_header_name(dst, name);
+    try uyagin_copy_to_header_value(dst, value);
+    ctx.out_header_count = ctx.out_header_count + 1;
+}
+
+fn uyagin_append_header_fast(out: &byte, cap: usize, pos: usize, h: &Header) usize {
+    var p: usize = pos;
+    p = uyagin_append_slice_fast(out, cap, p, "\r\n");
+    const nb: &byte = &h.name[0] as &byte;
+    p = uyagin_append_slice_fast(out, cap, p, nb[0: h.name_len]);
+    p = uyagin_append_slice_fast(out, cap, p, ": ");
+    const vb: &byte = &h.value[0] as &byte;
+    p = uyagin_append_slice_fast(out, cap, p, vb[0: h.value_len]);
+    return p;
+}
+
+fn uyagin_append_response_headers_fast(out: &byte, cap: usize, pos: usize, headers: &Header, header_count: i32) usize {
+    var p: usize = pos;
+    var i: i32 = 0;
+    while i < header_count && i < UYAGIN_MAX_RESPONSE_HEADERS {
+        const h: &Header = @ptr_from_usize(@usize_from_ptr(headers as &void) + (i as usize) * @size_of(Header)) as &Header;
+        p = uyagin_append_header_fast(out, cap, p, h);
+        i = i + 1;
+    }
+    return p;
+}
+
+fn uyagin_append_slice_fast(out: &byte, cap: usize, pos: usize, s: &[const byte]) usize {
+    if pos + s.len > cap {
+        return cap + 1;
+    }
+    var p: usize = pos;
+    var i: usize = 0;
+    while i < s.len {
+        out[p] = s.ptr[i];
+        p = p + 1;
+        i = i + 1;
+    }
+    return p;
+}
+
+fn uyagin_cstr_len(s: &byte) usize {
+    if s == null {
+        return 0;
+    }
+    var len: usize = 0;
+    while s[len] != 0 {
+        len = len + 1;
+    }
+    return len;
+}
+
+fn uyagin_append_cstr_fast(out: &byte, cap: usize, pos: usize, s: &byte) usize {
+    if s == null {
+        return uyagin_append_slice_fast(out, cap, pos, "?");
+    }
+    const n: usize = uyagin_cstr_len(s);
+    return uyagin_append_slice_fast(out, cap, pos, s[0: n]);
+}
+
+fn uyagin_append_usize_dec_fast(out: &byte, cap: usize, pos: usize, n: usize) usize {
+    var p: usize = pos;
+    if n == 0 {
+        if p + 1 > cap {
+            return cap + 1;
+        }
+        out[p] = '0' as byte;
+        return p + 1;
+    }
+    var tmp: [byte: 24] = [];
+    var t: usize = 0;
+    var x: usize = n;
+    while x > 0 && t < 24 {
+        tmp[t] = ((x % 10) as u32 + 48) as byte;
+        x = x / 10;
+        t = t + 1;
+    }
+    while t > 0 {
+        t = t - 1;
+        if p + 1 > cap {
+            return cap + 1;
+        }
+        out[p] = tmp[t];
+        p = p + 1;
+    }
+    return p;
+}
+
+fn uyagin_log_buffer_write(fd: i32, buf: &byte, pos: usize, cap: usize) void {
+    if buf == null || cap == 0 {
+        return;
+    }
+    var n: usize = pos;
+    if n >= cap {
+        n = cap;
+        buf[cap - 1] = '\n' as byte;
+    }
+    _ = sys_write(fd, buf as *const byte, n) catch {};
+}
+
+fn uyagin_emit_access_log(engine: &Engine, ctx: &GinContext, status: Status, latency_us: u64) void {
+    if engine == null || ctx == null || ctx.request == null {
+        return;
+    }
+    var buf: [byte: UYAGIN_OBSERVE_LOG_CAP] = [];
+    var pos: usize = 0;
+    pos = uyagin_append_slice_fast(&buf[0] as &byte, UYAGIN_OBSERVE_LOG_CAP, pos, "uyagin: access ");
+    pos = uyagin_append_slice_fast(&buf[0] as &byte, UYAGIN_OBSERVE_LOG_CAP, pos, uyagin_method_text(ctx.request.method));
+    pos = uyagin_append_slice_fast(&buf[0] as &byte, UYAGIN_OBSERVE_LOG_CAP, pos, " ");
+    const path_base: &byte = &ctx.request.path[0] as &byte;
+    pos = uyagin_append_slice_fast(&buf[0] as &byte, UYAGIN_OBSERVE_LOG_CAP, pos, path_base[0: ctx.request.path_len as usize]);
+    pos = uyagin_append_slice_fast(&buf[0] as &byte, UYAGIN_OBSERVE_LOG_CAP, pos, " status=");
+    pos = uyagin_append_usize_dec_fast(&buf[0] as &byte, UYAGIN_OBSERVE_LOG_CAP, pos, (status as i32) as usize);
+    pos = uyagin_append_slice_fast(&buf[0] as &byte, UYAGIN_OBSERVE_LOG_CAP, pos, " latency_us=");
+    pos = uyagin_append_usize_dec_fast(&buf[0] as &byte, UYAGIN_OBSERVE_LOG_CAP, pos, latency_us as usize);
+    if uyagin_mode_is_debug(engine.run_options.mode) {
+        pos = uyagin_append_slice_fast(&buf[0] as &byte, UYAGIN_OBSERVE_LOG_CAP, pos, " wrote=");
+        if ctx.wrote {
+            pos = uyagin_append_slice_fast(&buf[0] as &byte, UYAGIN_OBSERVE_LOG_CAP, pos, "1");
+        } else {
+            pos = uyagin_append_slice_fast(&buf[0] as &byte, UYAGIN_OBSERVE_LOG_CAP, pos, "0");
+        }
+        pos = uyagin_append_slice_fast(&buf[0] as &byte, UYAGIN_OBSERVE_LOG_CAP, pos, " persist=");
+        if ctx.persist {
+            pos = uyagin_append_slice_fast(&buf[0] as &byte, UYAGIN_OBSERVE_LOG_CAP, pos, "1");
+        } else {
+            pos = uyagin_append_slice_fast(&buf[0] as &byte, UYAGIN_OBSERVE_LOG_CAP, pos, "0");
+        }
+    }
+    pos = uyagin_append_slice_fast(&buf[0] as &byte, UYAGIN_OBSERVE_LOG_CAP, pos, "\n");
+    uyagin_log_buffer_write(uyagin_log_fd(engine), &buf[0] as &byte, pos, UYAGIN_OBSERVE_LOG_CAP);
+}
+
+fn uyagin_append_status_fast(out: &byte, cap: usize, pos: usize, status: Status) usize {
+    if status == Status.SwitchingProtocols {
+        return uyagin_append_slice_fast(out, cap, pos, "HTTP/1.1 101 Switching Protocols\r\n");
+    }
+    if status == Status.OK {
+        return uyagin_append_slice_fast(out, cap, pos, "HTTP/1.1 200 OK\r\n");
+    }
+    if status == Status.Created {
+        return uyagin_append_slice_fast(out, cap, pos, "HTTP/1.1 201 Created\r\n");
+    }
+    if status == Status.NoContent {
+        return uyagin_append_slice_fast(out, cap, pos, "HTTP/1.1 204 No Content\r\n");
+    }
+    if status == Status.BadRequest {
+        return uyagin_append_slice_fast(out, cap, pos, "HTTP/1.1 400 Bad Request\r\n");
+    }
+    if status == Status.Unauthorized {
+        return uyagin_append_slice_fast(out, cap, pos, "HTTP/1.1 401 Unauthorized\r\n");
+    }
+    if status == Status.Forbidden {
+        return uyagin_append_slice_fast(out, cap, pos, "HTTP/1.1 403 Forbidden\r\n");
+    }
+    if status == Status.NotFound {
+        return uyagin_append_slice_fast(out, cap, pos, "HTTP/1.1 404 Not Found\r\n");
+    }
+    if status == Status.MethodNotAllowed {
+        return uyagin_append_slice_fast(out, cap, pos, "HTTP/1.1 405 Method Not Allowed\r\n");
+    }
+    if status == Status.Conflict {
+        return uyagin_append_slice_fast(out, cap, pos, "HTTP/1.1 409 Conflict\r\n");
+    }
+    if status == Status.PayloadTooLarge {
+        return uyagin_append_slice_fast(out, cap, pos, "HTTP/1.1 413 Payload Too Large\r\n");
+    }
+    if status == Status.URITooLong {
+        return uyagin_append_slice_fast(out, cap, pos, "HTTP/1.1 414 URI Too Long\r\n");
+    }
+    if status == Status.NotImplemented {
+        return uyagin_append_slice_fast(out, cap, pos, "HTTP/1.1 501 Not Implemented\r\n");
+    }
+    return uyagin_append_slice_fast(out, cap, pos, "HTTP/1.1 500 Internal Server Error\r\n");
+}
+
+fn uyagin_build_response_head(out: &byte, cap: usize, status: Status, content_type: &[const byte], body_len: usize, req: &Request, persist: bool, headers: &Header, header_count: i32) usize {
+    var pos: usize = 0;
+    pos = uyagin_append_status_fast(out, cap, pos, status);
+    pos = uyagin_append_slice_fast(out, cap, pos, "Content-Length: ");
+    pos = uyagin_append_usize_dec_fast(out, cap, pos, body_len);
+    pos = uyagin_append_slice_fast(out, cap, pos, "\r\nContent-Type: ");
+    pos = uyagin_append_slice_fast(out, cap, pos, content_type);
+    if headers != null && header_count > 0 {
+        pos = uyagin_append_response_headers_fast(out, cap, pos, headers, header_count);
+    }
+    if !persist {
+        pos = uyagin_append_slice_fast(out, cap, pos, "\r\nConnection: close\r\n\r\n");
+    } else if req != null && !req.http11 {
+        pos = uyagin_append_slice_fast(out, cap, pos, "\r\nConnection: keep-alive\r\n\r\n");
+    } else {
+        pos = uyagin_append_slice_fast(out, cap, pos, "\r\n\r\n");
+    }
+    return pos;
+}
+
+fn uyagin_build_response_head_http11_persist_no_headers(out: &byte, cap: usize, status: Status, content_type: &[const byte], body_len: usize) usize {
+    var pos: usize = 0;
+    pos = uyagin_append_status_fast(out, cap, pos, status);
+    pos = uyagin_append_slice_fast(out, cap, pos, "Content-Length: ");
+    pos = uyagin_append_usize_dec_fast(out, cap, pos, body_len);
+    pos = uyagin_append_slice_fast(out, cap, pos, "\r\nContent-Type: ");
+    pos = uyagin_append_slice_fast(out, cap, pos, content_type);
+    pos = uyagin_append_slice_fast(out, cap, pos, "\r\n\r\n");
+    return pos;
+}
+
+fn uyagin_append_hex_usize_fast(out: &byte, cap: usize, pos: usize, n: usize) usize {
+    var p: usize = pos;
+    if n == 0 {
+        if p + 1 > cap {
+            return cap + 1;
+        }
+        out[p] = '0' as byte;
+        return p + 1;
+    }
+    var tmp: [byte: 24] = [];
+    var t: usize = 0;
+    var x: usize = n;
+    while x > 0 && t < 24 {
+        const d: usize = x & 15usize;
+        if d < 10usize {
+            tmp[t] = ((d as u32) + ('0' as u32)) as byte;
+        } else {
+            tmp[t] = (((d as u32) - 10u32) + ('a' as u32)) as byte;
+        }
+        x = x >> 4;
+        t = t + 1;
+    }
+    while t > 0 {
+        t = t - 1;
+        if p + 1 > cap {
+            return cap + 1;
+        }
+        out[p] = tmp[t];
+        p = p + 1;
+    }
+    return p;
+}
+
+fn uyagin_build_chunked_response_head(out: &byte, cap: usize, status: Status, content_type: &[const byte], req: &Request, persist: bool, headers: &Header, header_count: i32) usize {
+    var pos: usize = 0;
+    pos = uyagin_append_status_fast(out, cap, pos, status);
+    pos = uyagin_append_slice_fast(out, cap, pos, "Transfer-Encoding: chunked\r\nContent-Type: ");
+    pos = uyagin_append_slice_fast(out, cap, pos, content_type);
+    if headers != null && header_count > 0 {
+        pos = uyagin_append_response_headers_fast(out, cap, pos, headers, header_count);
+    }
+    if !persist {
+        pos = uyagin_append_slice_fast(out, cap, pos, "\r\nConnection: close\r\n\r\n");
+    } else if req != null && !req.http11 {
+        pos = uyagin_append_slice_fast(out, cap, pos, "\r\nConnection: keep-alive\r\n\r\n");
+    } else {
+        pos = uyagin_append_slice_fast(out, cap, pos, "\r\n\r\n");
+    }
+    return pos;
+}
+
+/// 异步写响应。小响应合并 header+body 一次写，减少 syscall 与 TCP delayed ACK 交互。
+export @async_fn fn uyagin_send_response_async(fd: i32, status: Status, content_type: &[const byte], body: &[const byte], req: &Request, persist: bool) Future<!usize> {
+    var hdr: [byte: UYAGIN_HEADER_CAP] = [];
+    var pos: usize = uyagin_build_response_head(&hdr[0] as &byte, UYAGIN_HEADER_CAP, status, content_type, body.len, req, persist, null as &Header, 0);
+    if pos > UYAGIN_HEADER_CAP {
+        return error.HeaderBufferTooSmall;
+    }
+
+    var total: usize = pos + body.len;
+    const room: usize = UYAGIN_HEADER_CAP - pos;
+    if body.len <= room {
+        var i: usize = 0;
+        while i < body.len {
+            hdr[pos + i] = body.ptr[i];
+            i = i + 1;
+        }
+        _ = try @await async_fd_write_all(fd, &hdr[0] as &const byte, total);
+    } else {
+        _ = try @await uyagin_writev_all_future(fd, &hdr[0] as &const byte, pos, body.ptr as &const byte, body.len);
+    }
+    return total;
+}
+
+export @async_fn fn uyagin_send_context_response_head_only_async(ctx: &GinContext, status: Status, content_type: &[const byte], body_len: usize) Future<!usize> {
+    if ctx == null || ctx.request == null {
+        return error.InvalidRequest;
+    }
+    var hdr: [byte: UYAGIN_HEADER_CAP] = [];
+    var pos: usize = 0;
+    if ctx.out_header_count == 0 && ctx.persist && ctx.request.http11 {
+        pos = uyagin_build_response_head_http11_persist_no_headers(&hdr[0] as &byte, UYAGIN_HEADER_CAP, status, content_type, body_len);
+    } else {
+        pos = uyagin_build_response_head(&hdr[0] as &byte, UYAGIN_HEADER_CAP, status, content_type, body_len, ctx.request, ctx.persist, &ctx.out_headers[0] as &Header, ctx.out_header_count);
+    }
+    if pos > UYAGIN_HEADER_CAP {
+        return error.HeaderBufferTooSmall;
+    }
+    _ = try @await async_fd_write_all(ctx.fd, &hdr[0] as &const byte, pos);
+    return pos;
+}
+
+export @async_fn fn uyagin_send_context_chunked_response_async(ctx: &GinContext, status: Status, content_type: &[const byte], body_ptr: &byte, body_len: usize) Future<!usize> {
+    if ctx == null || ctx.request == null {
+        return error.InvalidRequest;
+    }
+    var hdr: [byte: UYAGIN_HEADER_CAP] = [];
+    var pos: usize = uyagin_build_chunked_response_head(&hdr[0] as &byte, UYAGIN_HEADER_CAP, status, content_type, ctx.request, ctx.persist, &ctx.out_headers[0] as &Header, ctx.out_header_count);
+    if pos > UYAGIN_HEADER_CAP {
+        return error.HeaderBufferTooSmall;
+    }
+
+    _ = try @await async_fd_write_all(ctx.fd, &hdr[0] as &const byte, pos);
+    if body_len > 0 {
+        var prefix: [byte: 32] = [];
+        var prefix_len: usize = uyagin_append_hex_usize_fast(&prefix[0] as &byte, 32, 0, body_len);
+        prefix[prefix_len] = 13 as byte;
+        prefix[prefix_len + 1] = 10 as byte;
+        prefix_len = prefix_len + 2;
+        _ = try @await async_fd_write_all(ctx.fd, &prefix[0] as &const byte, prefix_len);
+        _ = try @await async_fd_write_all(ctx.fd, body_ptr as &const byte, body_len);
+        var tail: [byte: 7] = [];
+        tail[0] = 13 as byte;
+        tail[1] = 10 as byte;
+        tail[2] = '0' as byte;
+        tail[3] = 13 as byte;
+        tail[4] = 10 as byte;
+        tail[5] = 13 as byte;
+        tail[6] = 10 as byte;
+        _ = try @await async_fd_write_all(ctx.fd, &tail[0] as &const byte, 7);
+        return pos + prefix_len + body_len + 7;
+    }
+    var empty_tail: [byte: 5] = [];
+    empty_tail[0] = '0' as byte;
+    empty_tail[1] = 13 as byte;
+    empty_tail[2] = 10 as byte;
+    empty_tail[3] = 13 as byte;
+    empty_tail[4] = 10 as byte;
+    _ = try @await async_fd_write_all(ctx.fd, &empty_tail[0] as &const byte, 5);
+    return pos + 5;
+}
+
+export @async_fn fn uyagin_send_context_response_bytes_body_async(ctx: &GinContext, status: Status, content_type: &[const byte], body: &[const byte]) Future<!usize> {
+    return try @await uyagin_send_context_response_raw_bytes_body_async(ctx, status, content_type, body.ptr, body.len);
+}
+
+export @async_fn fn uyagin_send_context_response_raw_bytes_body_async(ctx: &GinContext, status: Status, content_type: &[const byte], body_ptr: &byte, body_len: usize) Future<!usize> {
+    if ctx == null || ctx.request == null {
+        return error.InvalidRequest;
+    }
+    var hdr: [byte: UYAGIN_HEADER_CAP] = [];
+    var pos: usize = 0;
+    if ctx.out_header_count == 0 && ctx.persist && ctx.request.http11 {
+        pos = uyagin_build_response_head_http11_persist_no_headers(&hdr[0] as &byte, UYAGIN_HEADER_CAP, status, content_type, body_len);
+    } else {
+        pos = uyagin_build_response_head(&hdr[0] as &byte, UYAGIN_HEADER_CAP, status, content_type, body_len, ctx.request, ctx.persist, &ctx.out_headers[0] as &Header, ctx.out_header_count);
+    }
+    if pos > UYAGIN_HEADER_CAP {
+        return error.HeaderBufferTooSmall;
+    }
+    var total: usize = pos + body_len;
+    const room: usize = UYAGIN_HEADER_CAP - pos;
+    if body_len <= room {
+        var i: usize = 0;
+        while i < body_len {
+            hdr[pos + i] = body_ptr[i];
+            i = i + 1;
+        }
+        _ = try @await async_fd_write_all(ctx.fd, &hdr[0] as &const byte, total);
+    } else {
+        if body_len > 0 {
+            _ = try @await uyagin_writev_all_future(ctx.fd, &hdr[0] as &const byte, pos, body_ptr as &const byte, body_len);
+        } else {
+            _ = try @await async_fd_write_all(ctx.fd, &hdr[0] as &const byte, pos);
+        }
+    }
+    return total;
+}
+
+export fn uyagin_send_context_response_bytes_future(ctx: &GinContext, status: Status, content_type: &[const byte], body: &[const byte]) Future<!usize> {
+    return uyagin_send_context_response_raw_bytes_future(ctx, status, content_type, body.ptr, body.len);
+}
+
+export fn uyagin_send_context_response_raw_bytes_future(ctx: &GinContext, status: Status, content_type: &[const byte], body_ptr: &byte, body_len: usize) Future<!usize> {
+    if ctx == null || ctx.request == null {
+        return uyagin_ready_usize(error.InvalidRequest);
+    }
+    if ctx.suppress_body {
+        return uyagin_send_context_response_head_only_async(ctx, status, content_type, body_len);
+    }
+    return uyagin_send_context_response_raw_bytes_body_async(ctx, status, content_type, body_ptr, body_len);
+}
+
+export fn uyagin_send_context_chunked_response_future(ctx: &GinContext, status: Status, content_type: &[const byte], body_ptr: &byte, body_len: usize) Future<!usize> {
+    if ctx == null || ctx.request == null {
+        return uyagin_ready_usize(error.InvalidRequest);
+    }
+    if ctx.suppress_body {
+        return uyagin_send_context_response_head_only_async(ctx, status, content_type, body_len);
+    }
+    return uyagin_send_context_chunked_response_async(ctx, status, content_type, body_ptr, body_len);
+}
+
+export @async_fn fn uyagin_send_context_response_body_trait_async(ctx: &GinContext, status: Status, body: &UyaginResponseBody) Future<!usize> {
+    if ctx == null || ctx.request == null {
+        return error.InvalidRequest;
+    }
+    if body.kind == 3 {
+        const head_wire: usize = try @await uyagin_send_context_response_head_only_async(ctx, status, body.content_type, body.file_len);
+        _ = head_wire;
+        const file_wire: usize = try @await uyagin_send_file_body_async(ctx.fd, body.file_fd, body.file_len);
+        return file_wire;
+    }
+    var hdr: [byte: UYAGIN_HEADER_CAP] = [];
+    var pos: usize = uyagin_build_response_head(&hdr[0] as &byte, UYAGIN_HEADER_CAP, status, body.content_type, body.bytes.len, ctx.request, ctx.persist, &ctx.out_headers[0] as &Header, ctx.out_header_count);
+    if pos > UYAGIN_HEADER_CAP {
+        return error.HeaderBufferTooSmall;
+    }
+    var total: usize = pos + body.bytes.len;
+    const room: usize = UYAGIN_HEADER_CAP - pos;
+    if body.bytes.len <= room {
+        var i: usize = 0;
+        while i < body.bytes.len {
+            hdr[pos + i] = body.bytes.ptr[i];
+            i = i + 1;
+        }
+        _ = try @await async_fd_write_all(ctx.fd, &hdr[0] as &const byte, total);
+    } else {
+        if body.bytes.len > 0 {
+            _ = try @await uyagin_writev_all_future(ctx.fd, &hdr[0] as &const byte, pos, body.bytes.ptr as &const byte, body.bytes.len);
+        } else {
+            _ = try @await async_fd_write_all(ctx.fd, &hdr[0] as &const byte, pos);
+        }
+    }
+    return total;
+}
+
+export fn uyagin_send_context_response_body_trait_future(ctx: &GinContext, status: Status, body: &UyaginResponseBody) Future<!usize> {
+    if ctx == null || ctx.request == null || body == null {
+        return uyagin_ready_usize(error.InvalidRequest);
+    }
+    if ctx.suppress_body {
+        return uyagin_send_context_response_head_only_async(ctx, status, body.content_type, uyagin_response_body_len(*body));
+    }
+    return uyagin_send_context_response_body_trait_async(ctx, status, body);
+}
+
+@async_fn fn uyagin_conn_read_more_future(fd: i32, base: &byte, cap: usize, filled: &usize) Future<!usize> {
+    if fd < 0 || base == null || filled == null {
+        return error.InvalidRequest;
+    }
+    const cur: usize = *filled;
+    if cur >= cap {
+        return error.PayloadTooLarge;
+    }
+    var read_len: usize = cap - cur;
+    if read_len > 8192 {
+        read_len = 8192;
+    }
+    const read_dst: &byte = @ptr_from_usize(@usize_from_ptr(base as &void) + cur) as &byte;
+    const n: usize = try @await async_fd_read_future(fd, read_dst, read_len);
+    if n == 0 {
+        return error.ConnectionClosed;
+    }
+    *filled = cur + n;
+    return n;
+}
+
+@async_fn fn uyagin_conn_read_parse_future(fd: i32, base: &byte, cap: usize, filled: &usize) Future<!ParseResult> {
+    if fd < 0 || base == null || filled == null {
+        return error.InvalidRequest;
+    }
+    var out: ParseResult = ParseResult{
+        request: Request{
+            method: Method.GET,
+            http11: true,
+            path: [],
+            path_len: 0,
+            path_params: [],
+            path_param_count: 0,
+            query: [],
+            query_count: 0,
+            headers: [],
+            header_count: 0,
+            body: base[0: 0],
+        },
+        consumed: 0,
+    };
+    var err_out: u32 = 0u32;
+    _ = try @await uyagin_conn_read_parse_into_future(fd, base, cap, filled, &out, &err_out);
+    if err_out != 0u32 {
+        const mapped: !i32 = uyagin_error_from_error_id_i32(err_out);
+        _ = mapped catch |err| {
+            return err;
+        };
+        return error.HandlerMissing;
+    }
+    return out;
+}
+
+/// 异步读到一个完整 HTTP 请求；返回 ParseResult，consumed 可用于 keep-alive 管线请求搬移。
+export fn uyagin_conn_read_parse_async(fd: i32, base: &byte, cap: usize, filled: &usize) Future<!ParseResult> {
+    return uyagin_conn_read_parse_future(fd, base, cap, filled);
+}
+
+@async_fn fn uyagin_conn_read_parse_into_future(fd: i32, base: &byte, cap: usize, filled: &usize, out: &ParseResult, err_out: &u32) Future<!usize> {
+    if fd < 0 || base == null || filled == null || out == null || err_out == null {
+        return error.InvalidRequest;
+    }
+    while true {
+        const cur: usize = *filled;
+        if cur > cap {
+            *err_out = @error_id(error.PayloadTooLarge);
+            return 0 as usize;
+        }
+        const sl: &[byte] = base[0: cur];
+        const parsed: !void = http_parse_request_into(sl, out);
+        if parsed.error_id == @error_id(error.IncompleteRequest) {
+            const read_more: !usize = @await uyagin_conn_read_more_future(fd, base, cap, filled);
+            _ = read_more catch |err| {
+                const err_id: u32 = @error_id(err);
+                if err_id == @error_id(error.PayloadTooLarge) {
+                    return error.PayloadTooLarge;
+                }
+                *err_out = err_id;
+                return 0 as usize;
+            };
+        } else {
+            _ = parsed catch |err| {
+                *err_out = @error_id(err);
+                return 0 as usize;
+            };
+            if request_has_chunked_transfer_encoding(&out.request) {
+                const decode_result: !usize = http_decode_chunked_body_inplace(out);
+                _ = decode_result catch {
+                    *err_out = decode_result.error_id;
+                    return 0 as usize;
+                };
+            }
+            *err_out = 0u32;
+            return out.consumed;
+        }
+    }
+}
+
+fn uyagin_accept_set_tcp_nodelay(fd: i32) void {
+    if fd < 0 {
+        return;
+    }
+    var nd: i32 = 1;
+    _ = sys_setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &nd as &void, 4 as u32) catch {};
+}
+
+@async_fn
+fn uyagin_accept_future(listen_fd: i32) Future<!i32> {
+    const fd: i32 = try @await async_accept(listen_fd);
+    uyagin_accept_set_tcp_nodelay(fd);
+    return fd;
+}
+
+export @async_fn fn uyagin_accept_async(srv: &HttpServer) Future<!i32> {
+    if srv == null || srv.listen_fd < 0 {
+        return error.InvalidRequest;
+    }
+    const fd: i32 = try @await uyagin_accept_future(srv.listen_fd);
+    return fd;
+}
+
+@align(8)
+@async_fn fn uyagin_serve_conn_slot_async(engine: &Engine, fd: i32, scheduler: &Scheduler, conn_state: &UyaginConnState) Future<!i32> {
+    if engine == null || fd < 0 || scheduler == null || conn_state == null {
+        return error.InvalidRequest;
+    }
+    var owned_fd: i32 = fd;
+    const run_options: EngineRunOptions = uyagin_run_options_normalize(engine.run_options);
+    defer {
+        if owned_fd >= 0 {
+            _ = sys_close(owned_fd) catch {};
+        }
+    }
+
+    while true {
+        conn_state.request_arena.begin();
+        var persist: bool = false;
+        var aborted: bool = false;
+        var session_keep_alive: bool = conn_state.http10_session_keep_alive;
+        {
+            defer {
+                uyagin_collect_metrics(engine, scheduler, &conn_state.request_arena);
+                conn_state.request_arena.reset();
+            }
+            conn_state.parse_error_id = 0u32;
+            const consumed: usize = try @await uyagin_conn_read_parse_into_future(
+                fd,
+                conn_state.io_buf_base(),
+                run_options.buffer_cap,
+                &conn_state.filled,
+                &conn_state.parse_result,
+                &conn_state.parse_error_id,
+            );
+            if conn_state.parse_error_id != 0u32 {
+                const parse_err_value: i32 = try uyagin_error_from_error_id_i32(conn_state.parse_error_id);
+                return parse_err_value;
+            }
+            persist = request_wants_persistent_with_session(&conn_state.parse_result.request, conn_state.http10_session_keep_alive);
+            var req_alloc: &IAllocator = conn_state.request_arena.allocator();
+            if engine.allocator != null {
+                req_alloc = engine.allocator;
+            }
+            conn_state.ctx = uyagin_context_new_with_request_arena(fd, &conn_state.parse_result.request, persist, req_alloc, &conn_state.request_arena);
+            conn_state.ctx.response_head_buf = conn_state.response_head_base();
+            conn_state.ctx.response_head_cap = UYAGIN_HEADER_CAP;
+            const handle_future: Future<!i32> = engine.handle(&conn_state.ctx);
+            const handled: i32 = try @await handle_future;
+            _ = handled;
+            conn_state.served = conn_state.served + 1;
+            if uyagin_context_is_hijacked(&conn_state.ctx) {
+                owned_fd = -1;
+                break;
+            }
+            aborted = uyagin_context_aborted(&conn_state.ctx);
+            if !conn_state.parse_result.request.http11 {
+                session_keep_alive = true;
+            }
+            if !persist || aborted {
+                break;
+            }
+            http_connbuf_shift(conn_state.io_buf_base(), &conn_state.filled, consumed);
+        }
+        conn_state.http10_session_keep_alive = session_keep_alive;
+    }
+
+    return conn_state.served;
+}
+
+/// 在单连接上运行 keep-alive 请求循环。调用者可用 scheduler + EventLoop 驱动该 Future。
+export @async_fn fn uyagin_serve_conn(engine: &Engine, fd: i32, scheduler: &Scheduler) Future<!i32> {
+    if engine == null || fd < 0 || scheduler == null {
+        return error.InvalidRequest;
+    }
+    const run_options: EngineRunOptions = uyagin_run_options_normalize(engine.run_options);
+    var state: UyaginConnState = UyaginConnState{};
+    state.prepare(run_options.request_arena_cap);
+    return try @await uyagin_serve_conn_slot_async(engine, fd, scheduler, &state);
+}
+
+fn uyagin_conn_slot_frame(slot: &UyaginConnTaskSlot) &@frame(uyagin_serve_conn_slot_async) {
+    return @ptr_from_usize(@usize_from_ptr(&slot.frame_storage[0] as &void)) as &@frame(uyagin_serve_conn_slot_async);
+}
+
+fn uyagin_conn_slot_release(slot: &UyaginConnTaskSlot) void {
+    if slot == null || slot.future_live == 0 {
+        return;
+    }
+    uyagin_conn_slot_frame(slot).stop();
+    slot.future_live = 0;
+}
+
+fn uyagin_conn_slot_start(slot: &UyaginConnTaskSlot, engine: &Engine, fd: i32, scheduler: &Scheduler, opts: &EngineRunOptions) void {
+    if slot == null || engine == null || scheduler == null || opts == null {
+        return;
+    }
+    slot.state.prepare(opts.request_arena_cap);
+    uyagin_conn_slot_frame(slot).start(engine, fd, scheduler, &slot.state);
+    slot.future_live = 1;
+}
+
+fn uyagin_conn_slot_poll(slot: &UyaginConnTaskSlot, waker: &Waker) Poll<!i32> {
+    if slot == null || slot.future_live == 0 {
+        return async_poll_ready_ok_i32(0);
+    }
+    return uyagin_conn_slot_frame(slot).poll(waker);
+}

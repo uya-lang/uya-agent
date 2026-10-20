@@ -1,0 +1,902 @@
+// lib/std/image/jpeg_decode.uya - 基线 JPEG 解码（Huffman + 8x8 DCT）
+//
+// 模块路径：use std.image.jpeg_decode
+//
+// 本文件：**基线顺序 DCT 解码的流程** —— 段解析（jpeg_marker）→ Huffman 译码
+//   （jpeg_tables）→ 反量化 + IDCT（jpeg_dct）→ 上采样 + YCbCr→RGB → 写进
+//   `Image`。公开三个入口：`jpeg_decode_info`（只读文件头，拿宽高与分量数）、
+//   `jpeg_decode`（解进 Image）、`jpeg_decode_rgb`（解进调用方给的 RGB 缓冲）。
+// 支持矩阵（**不支持的输入一律报 JpegUnsupported，绝不按基线硬解** —— 按基线解
+//   渐进式会得到「上半张对、下半张糊」的图，比报错糟得多）：
+//   * 基线顺序 DCT：SOF0 / SOF1；
+//   * 分量数 1（灰度）或 3（YCbCr）；
+//   * 采样：4:4:4 / 4:2:2 / 4:2:0，以及 h/v 各 1..4 的矩形采样；
+//   * DRI 重启间隔（每个 interval 边界跳 RSTn，并按 T.81 复位 DC 预测器）；
+//   * 8-bit 精度。
+// 上采样用**块重复**（每个色度样本复制到它覆盖的 h x v 个像素上）：与
+//   `djpeg -nosmooth` 一致，实现只有几行，且在「缩图 → 重编码」的用途下
+//   三角滤波的收益看不出来。
+// 不变量：① IDCT 结果 +128 后**立刻**夹到 0..255，不留中间态；② 每个 MCU 的
+//   每个块都必须解出来（Huffman 码非法 ⇒ JpegCorrupt，熵段读尽 ⇒ JpegTruncated），
+//   绝不用零块顶替 —— 那会产出「右边一条灰」这种像图但不对的结果；③ 灰度图
+//   ncomp = 1，输出单通道；彩色图 ncomp = 3，输出 RGB 三通道；④ 分配只用调用方
+//   给的 IAllocator（失败原样往上抛）；⑤ 失败时输出图已被清成空图（调用方
+//   不必再 free）。
+// 依赖：std.image.image、std.image.jpeg_marker、std.image.jpeg_tables、
+//   std.image.jpeg_dct、std.image.jpeg_bits。
+// 命名：`jpeg_*`（含内部流程）、`JpegInfo`。
+
+use std.mem.allocator.IAllocator;
+use std.image.image.Image;
+use std.image.image.image_new;
+use std.image.image.image_free;
+use std.image.image.IMAGE_GRAY;
+use std.image.image.IMAGE_RGB;
+
+use std.image.jpeg_marker.jpeg_marker_parse;
+use std.image.jpeg_marker.jpeg_header_blank;
+use std.image.jpeg_marker.jpeg_mcu_grid;
+use std.image.jpeg_marker.jpeg_quant_at;
+use std.image.jpeg_marker.jpeg_quant_used;
+use std.image.jpeg_marker.jpeg_huff_bits_at;
+use std.image.jpeg_marker.jpeg_huff_val_at;
+use std.image.jpeg_marker.jpeg_huff_count_at;
+use std.image.jpeg_marker.jpeg_huff_used_at;
+use std.image.jpeg_marker.JpegHeader;
+use std.image.jpeg_marker.JPEG_MAX_TABLES;
+use std.image.jpeg_marker.JPEG_QUANT_STRIDE;
+
+use std.image.jpeg_tables.jpeg_huff_build;
+use std.image.jpeg_tables.JpegHuffDecoder;
+use std.image.jpeg_tables.JPEG_ZIGZAG;
+use std.image.jpeg_tables.JPEG_HUFF_MAX_BITS;
+
+use std.image.jpeg_dct.jpeg_dequantize;
+use std.image.jpeg_dct.jpeg_idct_8x8;
+
+use std.image.jpeg_bits.JpegBitReader;
+use std.image.jpeg_bits.jpeg_bits_init;
+use std.image.jpeg_bits.jpeg_bits_get;
+use std.image.jpeg_bits.jpeg_bits_get1;
+use std.image.jpeg_bits.jpeg_bits_can_get;
+use std.image.jpeg_bits.jpeg_bits_peek;
+use std.image.jpeg_bits.jpeg_bits_consume;
+use std.image.jpeg_bits.jpeg_bits_align;
+use std.image.jpeg_bits.jpeg_bits_sync_restart;
+
+// 「先问尺寸」用的轻量信息（不解码像素、不分配堆）。
+export struct JpegInfo {
+    width: i32,
+    height: i32,
+    ncomp: i32,          // 1 = 灰度，3 = 彩色
+    progressive: bool,   // true = 是渐进式（要拒绝，但宽高已填好）
+}
+
+// 空信息（宽高 0 = 没解出来）。
+export fn jpeg_info_blank() JpegInfo {
+    var z: JpegInfo = JpegInfo{ width: 0, height: 0, ncomp: 0,
+        progressive: false };
+    return z;
+}
+
+/// 只读文件头：拿宽高与分量数（不解码、不分配堆）。
+/// 参数：
+/// - data: JPEG 字节（&u8 视图）。
+/// - n: 字节数。
+/// - info: 输出（调用方分配）。
+/// 返回：
+/// - true = 成功填好 info（渐进式也返回 true，progressive 字段为 true）。
+/// - error: JpegBadMarker（不是 JPEG）/ JpegTruncated（读不全）/
+///   JpegUnsupported（12-bit、4 分量、无损、算术）/ JpegCorrupt。
+export fn jpeg_decode_info(data: &const u8, n: usize, info: &JpegInfo) !bool {
+    var h: JpegHeader = jpeg_header_blank();
+    _ = try jpeg_marker_parse(data, n, &h);
+    if h.ncomp != 1 && h.ncomp != 3 {
+        return error.JpegUnsupported;
+    }
+    info[0] = JpegInfo{ width: h.width, height: h.height, ncomp: h.ncomp,
+        progressive: h.progressive };
+    return true;
+}
+
+// ============================================================
+// Huffman 表装配（按需，一张只装一次）
+// ============================================================
+
+// 4 张 DC + 4 张 AC 译码表。
+struct JpegDecTables {
+    dc: [JpegHuffDecoder: 4],
+    ac: [JpegHuffDecoder: 4],
+    dc_ready: [bool: 4],
+    ac_ready: [bool: 4],
+}
+
+// BITS 段首地址（扁平数组 + 步长）。
+fn jpeg_bits_ptr(h: &const JpegHeader, tc: i32, th: i32) &const u8 {
+    const slot: usize = ((tc * (JPEG_MAX_TABLES as i32) + th) as usize);
+    const base: usize = @usize_from_ptr(&h.huff_bits[0] as &const void);
+    return @ptr_from_usize(base + slot * 16 as usize) as &const u8;
+}
+
+// HUFFVAL 段首地址。
+fn jpeg_vals_ptr(h: &const JpegHeader, tc: i32, th: i32) &const u8 {
+    const slot: usize = ((tc * (JPEG_MAX_TABLES as i32) + th) as usize);
+    const base: usize = @usize_from_ptr(&h.huff_vals[0] as &const void);
+    return @ptr_from_usize(base + slot * 162 as usize) as &const u8;
+}
+
+// 取一张译码表（没有就装配）。
+// 参数：
+// - h: 已解析的头。
+// - t: 表集合（就地缓存）。
+// - tc: 0 = DC，1 = AC。
+// - th: 表号 0..3。
+// 返回：
+// - true = 表可用。
+// - error: 该表没在流里出现（JpegCorrupt）。
+fn jpeg_ensure_table(h: &const JpegHeader, t: &JpegDecTables, tc: i32,
+                     th: i32) !bool {
+    if th < 0 || th >= (JPEG_MAX_TABLES as i32) {
+        return error.JpegCorrupt;
+    }
+    if tc == 0 {
+        if !t.dc_ready[th as usize] {
+            if !jpeg_huff_used_at(h, 0, th) {
+                return error.JpegCorrupt;
+            }
+            jpeg_huff_build(jpeg_bits_ptr(h, 0, th), jpeg_vals_ptr(h, 0, th),
+                &t.dc[th as usize]);
+            if jpeg_huff_count_at(h, 0, th) <= 0 {
+                return error.JpegCorrupt;
+            }
+            t.dc_ready[th as usize] = true;
+        }
+        return true;
+    }
+    if !t.ac_ready[th as usize] {
+        if !jpeg_huff_used_at(h, 1, th) {
+            return error.JpegCorrupt;
+        }
+        jpeg_huff_build(jpeg_bits_ptr(h, 1, th), jpeg_vals_ptr(h, 1, th),
+            &t.ac[th as usize]);
+        if jpeg_huff_count_at(h, 1, th) <= 0 {
+            return error.JpegCorrupt;
+        }
+        t.ac_ready[th as usize] = true;
+    }
+    return true;
+}
+
+// ============================================================
+// Huffman 取码
+// ============================================================
+
+// 取一个 Huffman 符号：快表（<= 8 位）先查，未命中再逐位读 9..16 位。
+//
+// 这里**不用** libjpeg 那种「先吃 8 位再退」的写法：那个写法的正确性依赖
+// 「退位」把游标精确还原（acc/nbits/pos 三件套都要还原），实测在流末尾
+// （读器已经预读到 EOI）与重启边界上很难写对。改成 **peek 不消费 + 命中才
+// consume** 之后，「读多少位」与「消耗多少位」是同一个变量决定，不会错位。
+// 参数：
+// - r: 位读器。
+// - d: 译码表。
+// 返回：
+// - 符号（0..255）；码不合法或读尽时返回 -1。
+fn jpeg_huff_symbol(r: &JpegBitReader, d: &const JpegHuffDecoder) i32 {
+    // 快表：先看 8 位（不动游标）
+    const peek: i32 = jpeg_bits_peek(r, 8);
+    if peek >= 0 && peek <= 255 {
+        const slot: usize = peek as usize;
+        const packed: u32 = d.fast[slot] as u32;
+        const cb: i32 = ((packed >> 8) as i32);
+        if cb > 0 {
+            jpeg_bits_consume(r, cb);
+            return ((packed & (255 as u32)) as i32);
+        }
+    }
+    // 慢路径：逐个读位，用规范码区间判断「这个长度上有没有这个码」。
+    //
+    // **每个长度都要查，不能只查 9..16**：慢路径的触发条件不只是「码长 > 8」，
+    // 还有「剩余可用位不足 8」（快表 peek 不出来，典型是最后一个 MCU 的尾部、
+    // 或灰度图那种短流的收尾）。那时流里剩下的往往是 2..8 位的短码 —— 只查
+    // 9..16 会把它们全判成非法码（症状：灰度图整张 JpegCorrupt，彩图只要尾部
+    // 凑巧够 8 位就没事，于是「同样的代码彩色过、灰度不过」）。
+    // 注：mincode[l]/maxcode[l] 在 build 时对 1..16 全都填了，正是为了这里能用。
+    var code: i32 = 0;
+    var l: i32 = 1;
+    while l <= JPEG_HUFF_MAX_BITS {
+        const b: i32 = jpeg_bits_get1(r);
+        code = (code << 1) | b;
+        if d.maxcode[l] >= 0 {
+            if code >= d.mincode[l] && code <= d.maxcode[l] {
+                const idx: i32 = d.valptr[l] + (code - d.mincode[l]);
+                if idx >= 0 && idx < d.nvals {
+                    return d.vals[idx as usize] as i32;
+                }
+                return 0 - 1;
+            }
+        }
+        l = l + 1;
+    }
+    return 0 - 1;
+}
+
+// 在 SOS 的扫描分量里按「分量 id」找它的 DC/AC 表号（T.81 B.2.3：SOS 里的
+// 分量顺序**不必**与 SOF 一致，所以不能拿帧分量下标直接去索引 scan）。
+// 参数：
+// - h: 已解析的头。
+// - cid: 帧分量的 id。
+// - td_out: 接收 DC 表号。
+// - ta_out: 接收 AC 表号。
+// 返回：
+// - true = 找到；false = 这张扫描里没有这个分量（调用方报 JpegCorrupt）。
+fn jpeg_scan_tables(h: &const JpegHeader, cid: u8, td_out: &i32,
+                    ta_out: &i32) bool {
+    var i: i32 = 0;
+    while i < h.ns {
+        if i < 0 || i >= 4 {
+            return false;
+        }
+        if h.scan[i as usize].id == cid {
+            td_out[0] = h.scan[i as usize].td;
+            ta_out[0] = h.scan[i as usize].ta;
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+// 位读器是否已经停住（读尽或撞到标记，且没有可用的剩余位）。
+// 块解码
+// ============================================================
+
+// 读 size 位并做符号扩展（T.81 F.2.2.1 的 EXTEND）。
+// 参数：
+// - r: 位读器。
+// - size: 位数（1..15）。
+// 返回：
+// - 有符号系数值；位不够时返回 0（调用方随后从「读尽」看出截断）。
+fn jpeg_extend(r: &JpegBitReader, size: i32) i32 {
+    if size <= 0 {
+        return 0;
+    }
+    const v: i32 = jpeg_bits_get(r, size);
+    const vt: i32 = 1 << (size - 1);
+    if v < vt {
+        return v + 1 - (1 << size);
+    }
+    return v;
+}
+
+// 解一个 8x8 块（DC 差分 + AC run/size），输出 zigzag 顺序的 64 个系数。
+// 参数：
+// - r: 位读器。
+// - dcp: DC 译码表。
+// - acp: AC 译码表。
+// - pred: DC 预测器（就地累加；调用方按「每分量、每 restart interval」复位）。
+// - coef: 64 项输出（zigzag 顺序）。
+// 返回：
+// - true = 解出来。
+// - error: JpegCorrupt（码不合法）/ JpegTruncated（熵段读尽）。
+fn jpeg_decode_block(r: &JpegBitReader, dcp: &const JpegHuffDecoder,
+                     acp: &const JpegHuffDecoder, pred: &i32,
+                     coef: &i32) !bool {
+    var k: usize = 0;
+    while k < 64 {
+        coef[k] = 0;
+        k = k + 1;
+    }
+    const t: i32 = jpeg_huff_symbol(r, dcp);
+    if t < 0 || t > 15 {
+        return error.JpegCorrupt;
+    }
+    var diff: i32 = 0;
+    if t > 0 {
+        diff = jpeg_extend(r, t);
+    }
+    if jpeg_bits_overrun(r) {
+        return error.JpegTruncated;
+    }
+    pred[0] = pred[0] + diff;
+    coef[0] = pred[0];
+    k = 1;
+    while k < 64 {
+        const rs: i32 = jpeg_huff_symbol(r, acp);
+        if rs < 0 {
+            return error.JpegCorrupt;
+        }
+        const run: i32 = rs >> 4;
+        const size: i32 = rs & 15;
+        if size == 0 {
+            if run == 15 {
+                k = k + 16;
+                continue;
+            }
+            break;
+        }
+        k = k + (run as usize);
+        if k > 63 {
+            return error.JpegCorrupt;
+        }
+        const v: i32 = jpeg_extend(r, size);
+        if jpeg_bits_overrun(r) {
+            return error.JpegTruncated;
+        }
+        coef[k] = v;
+        k = k + 1;
+    }
+    return true;
+}
+
+// zigzag → 自然顺序（就地，走临时块）。
+fn jpeg_unzigzag(zz: &i32) void {
+    var nat: [i32: 64] = [0: 64];
+    var k: usize = 0;
+    while k < 64 {
+        const t: usize = JPEG_ZIGZAG[k] as usize;
+        nat[t] = zz[k];
+        k = k + 1;
+    }
+    k = 0;
+    while k < 64 {
+        zz[k] = nat[k];
+        k = k + 1;
+    }
+}
+
+// 反量化 + IDCT：coef（zigzag 顺序）就地变成 64 项像素差（-128..127 量级）。
+fn jpeg_block_to_pixels(coef: &i32, q: &const u8) void {
+    jpeg_unzigzag(coef);
+    jpeg_dequantize(coef, q);
+    jpeg_idct_8x8(coef);
+}
+
+// 量化表按自然顺序展开（解码内部统一走自然顺序）。
+// 参数：
+// - h: 头。
+// - t: 表号。
+// - out: 64 项输出（自然顺序）。
+// 返回：
+// - true = 表存在且是 8-bit 精度。
+// - error: JpegCorrupt（表没出现）/ JpegUnsupported（值 > 255）。
+fn jpeg_quant_natural(h: &const JpegHeader, t: i32, out: &u8) !bool {
+    if !jpeg_quant_used(h, t) {
+        return error.JpegCorrupt;
+    }
+    var k: usize = 0;
+    while k < 64 {
+        const src: u16 = jpeg_quant_at(h, t, k);
+        if src > 255 as u16 {
+            return error.JpegUnsupported;
+        }
+        const nat: usize = JPEG_ZIGZAG[k] as usize;
+        out[nat] = src as u8;
+        k = k + 1;
+    }
+    return true;
+}
+
+// YCbCr → RGB（整数近似：系数 * 65536 后取整，与 libjpeg 的 8-bit 公式同源）。
+// 参数：
+// - y: 亮度 0..255。
+// - cb: 蓝色差 0..255（居中 128）。
+// - cr: 红色差 0..255（居中 128）。
+// - out: 3 项输出 R,G,B（夹到 0..255）。
+// 返回：
+// - 无。
+export fn jpeg_ycbcr_to_rgb(y: i32, cb: i32, cr: i32, out: &u8) void {
+    const cc: i32 = cr - 128;
+    const cb2: i32 = cb - 128;
+    const r: i32 = y + ((91881 * cc) >> 16);
+    const g: i32 = y - ((22554 * cb2 + 46802 * cc) >> 16);
+    const b: i32 = y + ((116130 * cb2) >> 16);
+    out[0] = jpeg_clamp_u8(r);
+    out[1] = jpeg_clamp_u8(g);
+    out[2] = jpeg_clamp_u8(b);
+}
+
+// 夹到 0..255。
+export fn jpeg_clamp_u8(v: i32) u8 {
+    if v < 0 {
+        return 0 as u8;
+    }
+    if v > 255 {
+        return 255 as u8;
+    }
+    return v as u8;
+}
+
+// 灰度值 = 像素差 + 128（夹到 0..255）。
+export fn jpeg_bias_u8(v: i32) u8 {
+    return jpeg_clamp_u8(v + 128);
+}
+
+// ============================================================
+// 主流程
+// ============================================================
+
+// 校验「我们做不做这种编码」：渐进式 / 算术 / 非 8-bit / 分量数不是 1 或 3
+// 一律拒绝（**解析层不再代劳** —— 见 jpeg_marker_parse 末尾的说明：
+// jpeg_decode_info 要能在渐进式上照样给出宽高）。
+// 参数：
+// - h: 已解析的头。
+// 返回：
+// - true = 可以做；error = JpegUnsupported。
+fn jpeg_check_supported(h: &const JpegHeader) !bool {
+    if h.progressive {
+        return error.JpegUnsupported;
+    }
+    if h.arithmetic {
+        return error.JpegUnsupported;
+    }
+    if h.precision != 8 {
+        return error.JpegUnsupported;
+    }
+    if h.ncomp != 1 && h.ncomp != 3 {
+        return error.JpegUnsupported;
+    }
+    return true;
+}
+
+// 校验采样形状：只接受「Y + 两个色度」，且 Y 的采样因子是最大值、色度两者一致、
+// 最大值能被色度整除（否则配色会错 —— 这类图宁可拒绝也不出错色）。
+// 参数：
+// - h: 已解析的头。
+// 返回：
+// - true = 形状可用；error = JpegUnsupported。
+fn jpeg_check_sampling(h: &const JpegHeader) !bool {
+    if h.ncomp != 3 {
+        return true;
+    }
+    if h.comp[0].h_samp != h.max_h || h.comp[0].v_samp != h.max_v {
+        return error.JpegUnsupported;
+    }
+    const hs: i32 = h.comp[1].h_samp;
+    const vs: i32 = h.comp[1].v_samp;
+    if h.comp[2].h_samp != hs || h.comp[2].v_samp != vs {
+        return error.JpegUnsupported;
+    }
+    if hs <= 0 || vs <= 0 {
+        return error.JpegUnsupported;
+    }
+    if h.max_h % hs != 0 || h.max_v % vs != 0 {
+        return error.JpegUnsupported;
+    }
+    return true;
+}
+
+// 把各分量用到的量化表从 zigzag 摊成自然顺序，写进 qnat（扁平 4 x 64）。
+// 参数：
+// - h: 已解析的头。
+// - qnat: 256 项输出。
+// 返回：
+// - true = 成功；error = JpegCorrupt（表号非法或表没出现）/
+//   JpegUnsupported（量化值超 8-bit）。
+fn jpeg_load_quant_tables(h: &const JpegHeader, qnat: &u8) !bool {
+    var qi: i32 = 0;
+    while qi < h.ncomp {
+        const tq: i32 = h.comp[qi as usize].tq;
+        if tq < 0 || tq >= (JPEG_MAX_TABLES as i32) {
+            return error.JpegCorrupt;
+        }
+        var one: [u8: 64] = [0: 64];
+        _ = try jpeg_quant_natural(h, tq, &one[0]);
+        const base: usize = (tq as usize) * JPEG_QUANT_STRIDE;
+        var k: usize = 0;
+        while k < 64 {
+            qnat[base + k] = one[k];
+            k = k + 1;
+        }
+        qi = qi + 1;
+    }
+    return true;
+}
+
+// 把一块 8x8 像素差写进平面（带边界裁剪）。
+// 参数：
+// - plane: 平面缓冲。
+// - pw: 平面宽（每行字节数）。
+// - ph: 平面高。
+// - bx: 块列号。
+// - by: 块行号。
+// - px: 64 项像素差。
+// - bias: 是否 +128（灰度/平面存储都要 +128）。
+// 返回：
+// - 无。超出平面的像素**丢弃**（MCU 网格右/下边多出来的那一圈）。
+fn jpeg_store_block(plane: &u8, pw: i32, ph: i32, bx: i32, by: i32,
+                    px: &const i32, bias: bool) void {
+    var yy: i32 = 0;
+    while yy < 8 {
+        const gy: i32 = by * 8 + yy;
+        if gy < ph {
+            var xx: i32 = 0;
+            while xx < 8 {
+                const gx: i32 = bx * 8 + xx;
+                if gx < pw {
+                    var v: i32 = px[(yy * 8 + xx) as usize];
+                    if bias {
+                        v = v + 128;
+                    }
+                    const off: usize = (gy as usize) * (pw as usize)
+                        + (gx as usize);
+                    plane[off] = jpeg_clamp_u8(v);
+                }
+                xx = xx + 1;
+            }
+        }
+        yy = yy + 1;
+    }
+}
+
+// 取块在平面上的像素（带边界裁剪 + 块重复上采样）。
+// 参数：
+// - plane: 平面缓冲。
+// - pw: 平面宽。
+// - ph: 平面高。
+// - x: 目标像素 x（原图坐标）。
+// - y: 目标像素 y。
+// - hs: 水平采样因子（1..4；色度样本按它重复）。
+// - vs: 垂直采样因子。
+// 返回：
+// - 0..255 的样本值。
+fn jpeg_sample_plane(plane: &const u8, pw: i32, ph: i32, x: i32, y: i32,
+                     hs: i32, vs: i32) i32 {
+    var sx: i32 = x / hs;
+    var sy: i32 = y / vs;
+    if sx >= pw {
+        sx = pw - 1;
+    }
+    if sy >= ph {
+        sy = ph - 1;
+    }
+    if sx < 0 {
+        sx = 0;
+    }
+    if sy < 0 {
+        sy = 0;
+    }
+    const off: usize = ((sy as usize) * (pw as usize)) + (sx as usize);
+    return plane[off] as i32;
+}
+
+// 组一张 RGB 图：Y + 上采样后的 Cb/Cr → 像素。
+// 参数：
+// - img: 目标位图（RGB，宽高已设好）。
+// - yp/cbp/crp: 三张平面。
+// - yw/yh: Y 平面尺寸（= 原图按 MCU 网格补齐后的大小）。
+// - cw/ch: 色度平面尺寸。
+// - hs/vs: 色度采样因子。
+// 返回：
+// - 无。
+fn jpeg_compose_rgb(img: &Image, yp: &const u8, cbp: &const u8, crp: &const u8,
+                    yw: i32, yh: i32, cw: i32, ch: i32, hs: i32, vs: i32) void {
+    var y: i32 = 0;
+    while y < img.height {
+        var x: i32 = 0;
+        while x < img.width {
+            const off: usize = (((y as usize) * (yw as usize)) + (x as usize));
+            const yy: i32 = yp[off] as i32;
+            const cb: i32 = jpeg_sample_plane(cbp, cw, ch, x, y, hs, vs);
+            const cr: i32 = jpeg_sample_plane(crp, cw, ch, x, y, hs, vs);
+            var rgb: [u8: 3] = [0: 3];
+            jpeg_ycbcr_to_rgb(yy, cb, cr, &rgb[0]);
+            const rowoff: usize = (y as usize) * (img.width as usize);
+            const po: usize = (rowoff + (x as usize)) * 3 as usize;
+            img.pixels[po] = rgb[0];
+            img.pixels[po + 1] = rgb[1];
+            img.pixels[po + 2] = rgb[2];
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    _ = yh;
+}
+
+// 组一张灰度图（单通道，直接拷 Y 平面）。
+fn jpeg_compose_gray(img: &Image, yp: &const u8, yw: i32) void {
+    var y: i32 = 0;
+    while y < img.height {
+        var x: i32 = 0;
+        while x < img.width {
+            const src: usize = (((y as usize) * (yw as usize)) + (x as usize));
+            const dst: usize = (y as usize) * (img.width as usize)
+                + (x as usize);
+            img.pixels[dst] = yp[src];
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+}
+
+// 熵解码主循环：按 MCU 扫描，逐块解出系数 → 反量化 → IDCT → 写平面。
+// 参数：
+// - h: 头。
+// - r: 位读器（已 init 到 entropy_start）。
+// - t: 表集合。
+// - qnat: 4 张量化表（自然顺序，每张 64 项，扁平 256）。
+// - planes: 三张平面（灰度只用 planes.y）。
+// - mcus_x/mcus_y: MCU 网格。
+// 返回：
+// - true = 全部解出。
+// - error: JpegCorrupt / JpegTruncated / JpegUnsupported。
+// 解一个块并写到它所属的分量平面上（含取表、反量化、IDCT、越界裁剪）。
+// 参数：
+// - h/r/t/qnat: 头 / 位读器 / 表集合 / 量化表（自然顺序，扁平）。
+// - pred: 该分量的 DC 预测器（就地累加）。
+// - coef: 64 项块缓冲（就地）。
+// - ci: 分量下标。
+// - gx/gy: 块在**该分量平面**上的列/行号。
+// - yp/cbp/crp 与尺寸: 三张平面（灰度只用 yp）。
+// 返回：
+// - true = 写出；error = JpegCorrupt / JpegTruncated。
+fn jpeg_decode_one_block(h: &const JpegHeader, r: &JpegBitReader,
+                         t: &JpegDecTables, qnat: &const u8,
+                         pred: &i32, coef: &i32, ci: i32, gx: i32, gy: i32,
+                         yp: &u8, cbp: &u8, crp: &u8, yw: i32, yh: i32,
+                         cw: i32, ch: i32) !bool {
+    if ci < 0 || ci >= 4 {
+        return error.JpegCorrupt;
+    }
+    // 表：按分量 id 去 SOS 里查（顺序不一定对应）
+    var td: i32 = 0;
+    var ta: i32 = 0;
+    const cid: u8 = h.comp[ci as usize].id;
+    if !jpeg_scan_tables(h, cid, &td, &ta) {
+        return error.JpegCorrupt;
+    }
+    if td < 0 || td >= 4 {
+        return error.JpegCorrupt;
+    }
+    if ta < 0 || ta >= 4 {
+        return error.JpegCorrupt;
+    }
+    _ = try jpeg_ensure_table(h, t, 0, td);
+    _ = try jpeg_ensure_table(h, t, 1, ta);
+    _ = try jpeg_decode_block(r, &t.dc[td as usize], &t.ac[ta as usize],
+        pred, coef);
+    // 反量化 + IDCT
+    const qoff: usize = (h.comp[ci as usize].tq as usize) * JPEG_QUANT_STRIDE;
+    const qbase: usize = @usize_from_ptr(qnat as &const void) + qoff;
+    const qp: &const u8 = @ptr_from_usize(qbase) as &const u8;
+    jpeg_block_to_pixels(coef, qp);
+    // **平面尺寸必须按分量取**：色度平面比 Y 小（4:2:0 时是一半宽高）。
+    // 早先这里三处都传 Y 的尺寸，写 4:2:0 的色度块会越界 8 行 x 8 字节 ——
+    // 症状是「上半张对、下半张绿/噪点」（踩到过：越界把相邻堆块写坏）。
+    if ci == 0 {
+        jpeg_store_block(yp, yw, yh, gx, gy, coef, true);
+    } else if ci == 1 {
+        jpeg_store_block(cbp, cw, ch, gx, gy, coef, true);
+    } else {
+        jpeg_store_block(crp, cw, ch, gx, gy, coef, true);
+    }
+    return true;
+}
+
+// 扫一个 MCU：按分量顺序解 h*v 个块。
+// 参数：
+// - 同 jpeg_decode_one_block，另加 mx/my（MCU 坐标）与 coef 缓冲。
+// 返回：
+// - true = 写出；error 同上。
+fn jpeg_scan_mcu(h: &const JpegHeader, r: &JpegBitReader,
+                 t: &JpegDecTables, qnat: &const u8, pred: &[i32],
+                 coef: &i32, mx: i32, my: i32,
+                 yp: &u8, cbp: &u8, crp: &u8, yw: i32, yh: i32,
+                 cw: i32, ch: i32) !bool {
+    var ci: i32 = 0;
+    while ci < h.ncomp {
+        if ci < 0 || ci >= 4 {
+            return error.JpegCorrupt;
+        }
+        const hs: i32 = h.comp[ci as usize].h_samp;
+        const vs: i32 = h.comp[ci as usize].v_samp;
+        var by: i32 = 0;
+        while by < vs {
+            var bx: i32 = 0;
+            while bx < hs {
+                // 块坐标 = MCU 坐标 * 采样因子 + 组内偏移
+                const cix: usize = ci as usize;
+                _ = try jpeg_decode_one_block(h, r, t, qnat,
+                    &pred.ptr[cix], coef, ci, mx * hs + bx,
+                    my * vs + by, yp, cbp, crp, yw, yh, cw, ch);
+                bx = bx + 1;
+            }
+            by = by + 1;
+        }
+        ci = ci + 1;
+    }
+    return true;
+}
+
+// 熵解码主循环：按 MCU 扫描，逐块解出系数 → 反量化 → IDCT → 写平面。
+// 参数：
+// - h: 头。
+// - r: 位读器（已 init 到 entropy_start）。
+// - t: 表集合。
+// - qnat: 4 张量化表（自然顺序，每张 64 项，扁平 256）。
+// - yp/cbp/crp 与尺寸: 三张平面（灰度只用 yp，另两张传 yp 占位）。
+// - mcus_x/mcus_y: MCU 网格。
+// 返回：
+// - true = 全部解出。
+// - error: JpegCorrupt / JpegTruncated / JpegUnsupported。
+fn jpeg_scan_entropy(h: &const JpegHeader, r: &JpegBitReader,
+                     t: &JpegDecTables, qnat: &const u8,
+                     yp: &u8, cbp: &u8, crp: &u8, yw: i32, yh: i32,
+                     cw: i32, ch: i32, mcus_x: i32, mcus_y: i32) !bool {
+    // DC 预测器：按「扫描分量序号」各一个（T.81 F.2.1.3）
+    var pred: [i32: 4] = [0: 4];
+    var coef: [i32: 64] = [0: 64];
+    // RSTn 只在**每 restart_interval 个 MCU** 之后出现一次（T.81 B.2.1：DRI 的
+    // 单位是 MCU）。所以这里数的是「已经解过的 MCU 数」，到 ri 的整数倍就同步
+    // 下一个 RSTn 并复位预测器。早先按「每个 MCU 都同步一次」写，第 2 个 MCU
+    // 起就把数据字节当成标记去校验 —— 带 -restart 的图直接 JpegCorrupt。
+    var mcus_done: i32 = 0;
+    var rst_idx: i32 = 0;
+    var my: i32 = 0;
+    while my < mcus_y {
+        var mx: i32 = 0;
+        while mx < mcus_x {
+            if h.restart_interval > 0 && mcus_done > 0 {
+                if mcus_done % h.restart_interval == 0 {
+                    if !jpeg_bits_sync_restart(r, rst_idx) {
+                        return error.JpegCorrupt;
+                    }
+                    rst_idx = rst_idx + 1;
+                    var z: usize = 0;
+                    while z < 4 {
+                        pred[z] = 0;
+                        z = z + 1;
+                    }
+                }
+            }
+            _ = try jpeg_scan_mcu(h, r, t, qnat, &pred[0: 4],
+                &coef[0], mx, my,
+                yp, cbp, crp, yw, yh, cw, ch);
+            mcus_done = mcus_done + 1;
+            mx = mx + 1;
+        }
+        my = my + 1;
+    }
+    return true;
+}
+
+// 解一张 JPEG 到 Image（彩色图输出 RGB 三通道、灰度输出单通道）。
+// 参数：
+// - data: JPEG 字节（&u8 视图）。
+// - n: 字节数。
+// - alloc: 分配器（平面与像素缓冲都用它；img 释放时用同一个）。
+// - img: 输出位图（调用方分配；成功时是新缓冲，失败时已清空）。
+// 返回：
+// - true = 解出一张 width*height 的灰度或 RGB 图。
+// - error: JpegBadMarker / JpegTruncated / JpegUnsupported / JpegCorrupt /
+//   分配失败的原错误。
+export fn jpeg_decode(data: &const u8, n: usize, alloc: IAllocator,
+                      img: &Image) !bool {
+    var h: JpegHeader = jpeg_header_blank();
+    _ = try jpeg_marker_parse(data, n, &h);
+    _ = try jpeg_check_supported(&h);
+    // 量化表摊成自然顺序
+    var qnat: [u8: 256] = [0: 256];
+    _ = try jpeg_load_quant_tables(&h, &qnat[0]);
+    var mcus_x: i32 = 0;
+    var mcus_y: i32 = 0;
+    jpeg_mcu_grid(&h, &mcus_x, &mcus_y);
+    // 平面尺寸（Y 与色度各一套；MCU 网格补齐后的像素尺寸）
+    const pw: i32 = mcus_x * h.max_h * 8;
+    const ph: i32 = mcus_y * h.max_v * 8;
+    const cw: i32 = jpeg_chroma_plane_w(&h, mcus_x);
+    const chh: i32 = jpeg_chroma_plane_h(&h, mcus_y);
+    const yplane: &u8 = try alloc.alloc(((pw * ph) as usize));
+    defer { alloc.dealloc(yplane as &byte); }
+    var cplane: &u8 = null;
+    var crplane: &u8 = null;
+    if h.ncomp == 3 {
+        const csz: usize = ((cw * chh) as usize);
+        cplane = try alloc.alloc(csz);
+        crplane = try alloc.alloc(csz);
+    }
+    defer {
+        if cplane != null {
+            alloc.dealloc(cplane as &byte);
+        }
+        if crplane != null {
+            alloc.dealloc(crplane as &byte);
+        }
+    }
+    jpeg_zero(yplane, ((pw * ph) as usize));
+    if cplane != null {
+        jpeg_zero(cplane, ((cw * chh) as usize));
+        jpeg_zero(crplane, ((cw * chh) as usize));
+    }
+    _ = try jpeg_run_entropy(&h, data, n, &qnat[0], yplane, cplane, crplane,
+        pw, ph, cw, chh, mcus_x, mcus_y);
+    _ = try jpeg_compose_output(&h, img, alloc, yplane, cplane, crplane,
+        pw, ph, cw, chh);
+    return true;
+}
+
+// 初始化熵解码状态并跑完扫描（灰度时三张平面都指向 Y）。
+// 参数：
+// - h: 头。
+// - data/n: 整段 JPEG 与长度。
+// - qnat: 量化表（自然顺序，扁平）。
+// - 三张平面与尺寸: 灰度时 cbp/crp 传 yplane、色度尺寸传 Y 的尺寸。
+// - mcus_x/mcus_y: MCU 网格。
+// 返回：
+// - true = 扫完；error 同 jpeg_scan_entropy。
+fn jpeg_run_entropy(h: &const JpegHeader, data: &const u8, n: usize,
+                    qnat: &const u8, yplane: &u8, cplane: &u8,
+                    crplane: &u8, pw: i32, ph: i32, cw: i32, ch: i32,
+                    mcus_x: i32, mcus_y: i32) !bool {
+    var t: JpegDecTables = JpegDecTables{
+        dc: [JpegHuffDecoder{ fast: [0: 256], mincode: [0: 17],
+            maxcode: [0: 17], valptr: [0: 17], vals: [0: 256], nvals: 0 }: 4],
+        ac: [JpegHuffDecoder{ fast: [0: 256], mincode: [0: 17],
+            maxcode: [0: 17], valptr: [0: 17], vals: [0: 256], nvals: 0 }: 4],
+        dc_ready: [false: 4],
+        ac_ready: [false: 4],
+    };
+    var r: JpegBitReader = JpegBitReader{ data: null, n: 0, pos: 0, cur: 0,
+        nbits: 0, stopped: false, eof: false, overrun: false, mark: 0 };
+    jpeg_bits_init(&r, data, n, h.entropy_start);
+    if h.ncomp == 3 {
+        _ = try jpeg_scan_entropy(h, &r, &t, qnat, yplane, cplane, crplane,
+            pw, ph, cw, ch, mcus_x, mcus_y);
+    } else {
+        _ = try jpeg_scan_entropy(h, &r, &t, qnat, yplane, yplane, yplane,
+            pw, ph, pw, ph, mcus_x, mcus_y);
+    }
+    return true;
+}
+
+// 色度平面宽（灰度返回 0）。
+fn jpeg_chroma_plane_w(h: &const JpegHeader, mcus_x: i32) i32 {
+    if h.ncomp != 3 {
+        return 0;
+    }
+    return mcus_x * h.comp[1].h_samp * 8;
+}
+
+// 色度平面高（灰度返回 0）。
+fn jpeg_chroma_plane_h(h: &const JpegHeader, mcus_y: i32) i32 {
+    if h.ncomp != 3 {
+        return 0;
+    }
+    return mcus_y * h.comp[1].v_samp * 8;
+}
+
+// 组装输出位图：灰度直接拷 Y 平面，彩色把上采样后的 Cb/Cr 配成 RGB。
+// 参数：
+// - h: 头。
+// - img: 输出位图（就地写入）。
+// - alloc: 分配器。
+// - 三张平面与尺寸: 同上。
+// 返回：
+// - true = 成功；error = 分配失败的原错误。
+fn jpeg_compose_output(h: &const JpegHeader, img: &Image, alloc: IAllocator,
+                       yplane: &const u8, cplane: &const u8,
+                       crplane: &const u8, pw: i32, ph: i32, cw: i32,
+                       ch: i32) !bool {
+    var channels: i32 = IMAGE_GRAY;
+    if h.ncomp == 3 {
+        channels = IMAGE_RGB;
+    }
+    var out: Image = try image_new(h.width, h.height, channels, alloc);
+    if h.ncomp == 3 {
+        jpeg_compose_rgb(&out, yplane, cplane, crplane, pw, ph, cw, ch,
+            h.max_h / h.comp[1].h_samp, h.max_v / h.comp[1].v_samp);
+    } else {
+        jpeg_compose_gray(&out, yplane, pw);
+    }
+    img[0] = out;
+    return true;
+}
+
+// 把 n 字节清零。
+fn jpeg_zero(p: &u8, n: usize) void {
+    var i: usize = 0;
+    while i < n {
+        p[i] = 0 as u8;
+        i = i + 1;
+    }
+}

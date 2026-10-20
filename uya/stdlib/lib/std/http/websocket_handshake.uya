@@ -1,0 +1,329 @@
+// lib/std/http/websocket_handshake.uya - WebSocket HTTP/1.1 Upgrade 握手
+//
+// 模块路径：use std.http.websocket_handshake
+
+use std.http.types;
+use std.http.websocket_async;
+use std.crypto.sha1.sha1_digest;
+use std.encoding.base64.decode_base64;
+use std.encoding.base64.encode_base64;
+use std.http.websocket_types;
+use libc.sys_write;
+use libc.strlen;
+
+fn websocket_byte_to_lower(c: byte) byte {
+    if c >= 'A' as byte && c <= 'Z' as byte {
+        return ((c as i32) + 32) as byte;
+    }
+    return c;
+}
+
+fn websocket_slice_eq_ci(a: &[byte], b: &[byte]) bool {
+    if a.len != b.len {
+        return false;
+    }
+    var i: usize = 0;
+    while i < a.len {
+        if websocket_byte_to_lower(a.ptr[i]) != websocket_byte_to_lower(b.ptr[i]) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn websocket_header_has_token_ci(value: &[byte], tok: &[byte]) bool {
+    var i: usize = 0;
+    while i < value.len {
+        while i < value.len && (value.ptr[i] == ' ' as byte || value.ptr[i] == '\t' as byte) {
+            i = i + 1;
+        }
+        const start: usize = i;
+        while i < value.len && value.ptr[i] != ',' as byte {
+            i = i + 1;
+        }
+        var end: usize = i;
+        while end > start && (value.ptr[end - 1] == ' ' as byte || value.ptr[end - 1] == '\t' as byte) {
+            end = end - 1;
+        }
+        if end > start && (end - start) == tok.len {
+            if websocket_slice_eq_ci(value[start: end - start], tok) {
+                return true;
+            }
+        }
+        if i < value.len && value.ptr[i] == ',' as byte {
+            i = i + 1;
+        }
+    }
+    return false;
+}
+
+fn websocket_subprotocol_eq_cstr(token: &[byte], supported: &const byte) bool {
+    if supported == null {
+        return false;
+    }
+    const n: usize = strlen(supported);
+    if token.len != n {
+        return false;
+    }
+    var i: usize = 0;
+    while i < n {
+        if token.ptr[i] != supported[i] {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn websocket_key_is_valid(key: &[byte]) bool {
+    var decoded: [byte: 32] = [];
+    const n: !usize = decode_base64(key, decoded[0: 32]);
+    const got: usize = n catch {
+        return false;
+    };
+    return got == 16;
+}
+
+fn websocket_write_all_sync(fd: i32, data: &const byte, total: usize) !usize {
+    var sent: usize = 0;
+    while sent < total {
+        const wn: isize = sys_write(fd, data + sent, total - sent) catch {
+            return error.WebSocketConnectionClosed;
+        };
+        if wn <= 0 {
+            return error.WebSocketConnectionClosed;
+        }
+        sent = sent + (wn as usize);
+    }
+    return sent;
+}
+
+/// 判断请求是否满足最基本的 WebSocket Upgrade 形态。
+/// 参数说明：`req` 为已解析 HTTP 请求。
+/// 返回值说明：满足 HTTP/1.1 + `Connection: Upgrade` + `Upgrade: websocket` 时返回 `true`。
+export fn websocket_request_is_upgrade(req: &Request) bool {
+    if req == null || !req.http11 || req.method != Method.GET {
+        return false;
+    }
+    const connection: &[byte] = request_get_header(req, &"Connection"[0: 10]) catch {
+        return false;
+    };
+    if !websocket_header_has_token_ci(connection, &"Upgrade"[0: 7]) {
+        return false;
+    }
+    const upgrade: &[byte] = request_get_header(req, &"Upgrade"[0: 7]) catch {
+        return false;
+    };
+    return websocket_slice_eq_ci(upgrade, &"websocket"[0: 9]);
+}
+
+/// 读取并校验 `Sec-WebSocket-Key`。
+/// 参数说明：`req` 为 HTTP 请求。
+/// 返回值说明：成功时返回请求头内的 key 切片。
+export fn websocket_request_get_key(req: &Request) !&[byte] {
+    const key: &[byte] = request_get_header(req, &"Sec-WebSocket-Key"[0: 17]) catch {
+        return error.WebSocketMissingKey;
+    };
+    if !websocket_key_is_valid(key) {
+        return error.WebSocketInvalidKey;
+    }
+    return key;
+}
+
+/// 校验 HTTP/1.1 WebSocket Upgrade 请求。
+/// 参数说明：`req` 为已解析请求。
+/// 返回值说明：请求合法返回 `void`，否则返回对应 WebSocket 错误。
+export fn websocket_validate_upgrade_request(req: &Request) !void {
+    if !websocket_request_is_upgrade(req) {
+        return error.WebSocketBadHandshake;
+    }
+
+    const version: &[byte] = request_get_header(req, &"Sec-WebSocket-Version"[0: 21]) catch {
+        return error.WebSocketUnsupportedVersion;
+    };
+    if !websocket_slice_eq_ci(version, &"13"[0: 2]) {
+        return error.WebSocketUnsupportedVersion;
+    }
+
+    _ = try websocket_request_get_key(req);
+}
+
+fn websocket_extensions_requested(req: &Request) bool {
+    const exts: &[byte] = request_get_header(req, &"Sec-WebSocket-Extensions"[0: 24]) catch {
+        return false;
+    };
+    return exts.len > 0;
+}
+
+/// 计算 `Sec-WebSocket-Accept`。
+/// 参数说明：`key` 为客户端 `Sec-WebSocket-Key` 头值，`out` 为输出缓冲区。
+/// 返回值说明：返回写入的 Base64 文本长度。
+export fn websocket_compute_accept(key: &[byte], out: &byte, out_cap: usize) !usize {
+    if out == null || key.len == 0 {
+        return error.WebSocketInvalidKey;
+    }
+    if !websocket_key_is_valid(key) {
+        return error.WebSocketInvalidKey;
+    }
+    var joined: [byte: 128] = [];
+    if key.len + 36 > 128 {
+        return error.WebSocketInvalidKey;
+    }
+    var pos: usize = 0;
+    while pos < key.len {
+        joined[pos] = key.ptr[pos];
+        pos = pos + 1;
+    }
+    var i: usize = 0;
+    while i < 36 {
+        joined[pos + i] = WS_GUID[i];
+        i = i + 1;
+    }
+    pos = pos + 36;
+
+    var digest: [byte: 20] = [];
+    sha1_digest(joined[0: pos], digest[0: 20]);
+    if out_cap < 28 {
+        return error.WebSocketBadHandshake;
+    }
+    return try encode_base64(digest[0: 20], out[0: out_cap]);
+}
+
+/// 协商子协议。
+/// 参数说明：`supported` 为零结尾 C 字符串数组首元素地址，`supported_count` 为服务端支持数量。
+/// 返回值说明：命中时返回请求头中的子协议切片；未命中时返回空切片。
+export fn websocket_pick_subprotocol(req: &Request, supported: &&const byte, supported_count: i32) !&[const byte] {
+    const header: &[byte] = request_get_header(req, &"Sec-WebSocket-Protocol"[0: 22]) catch {
+        return &""[0: 0];
+    };
+    var i: usize = 0;
+    while i < header.len {
+        while i < header.len && (header.ptr[i] == ' ' as byte || header.ptr[i] == '\t' as byte) {
+            i = i + 1;
+        }
+        const start: usize = i;
+        while i < header.len && header.ptr[i] != ',' as byte {
+            i = i + 1;
+        }
+        var end: usize = i;
+        while end > start && (header.ptr[end - 1] == ' ' as byte || header.ptr[end - 1] == '\t' as byte) {
+            end = end - 1;
+        }
+        if end > start {
+            const token: &[byte] = header[start: end - start];
+            var si: i32 = 0;
+            while si < supported_count {
+                if websocket_subprotocol_eq_cstr(token, supported[si as usize]) {
+                    return token;
+                }
+                si = si + 1;
+            }
+        }
+        if i < header.len && header.ptr[i] == ',' as byte {
+            i = i + 1;
+        }
+    }
+    return &""[0: 0];
+}
+
+/// 构造 `101 Switching Protocols` 响应头。
+/// 参数说明：`accept` 为 `Sec-WebSocket-Accept`，`subprotocol` 为可选协商结果。
+/// 返回值说明：返回写入字节数。
+export fn websocket_build_upgrade_response(out: &byte, out_cap: usize, accept: &[byte], subprotocol: &[const byte]) !usize {
+    if out == null || accept.len == 0 {
+        return error.WebSocketBadHandshake;
+    }
+    const p1: &[byte] = &"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: "[0: 97];
+    const p2: &[byte] = &"\r\n"[0: 2];
+    const p3: &[byte] = &"Sec-WebSocket-Protocol: "[0: 24];
+    const end: &[byte] = &"\r\n\r\n"[0: 4];
+    var need: usize = p1.len + accept.len + p2.len + end.len;
+    if subprotocol.len > 0 {
+        need = need + p3.len + subprotocol.len + p2.len;
+    }
+    if need > out_cap {
+        return error.WebSocketBadHandshake;
+    }
+
+    var pos: usize = 0;
+    var i: usize = 0;
+    while i < p1.len {
+        out[pos + i] = p1.ptr[i];
+        i = i + 1;
+    }
+    pos = pos + p1.len;
+    i = 0;
+    while i < accept.len {
+        out[pos + i] = accept.ptr[i];
+        i = i + 1;
+    }
+    pos = pos + accept.len;
+    i = 0;
+    while i < p2.len {
+        out[pos + i] = p2.ptr[i];
+        i = i + 1;
+    }
+    pos = pos + p2.len;
+    if subprotocol.len > 0 {
+        i = 0;
+        while i < p3.len {
+            out[pos + i] = p3.ptr[i];
+            i = i + 1;
+        }
+        pos = pos + p3.len;
+        i = 0;
+        while i < subprotocol.len {
+            out[pos + i] = subprotocol.ptr[i];
+            i = i + 1;
+        }
+        pos = pos + subprotocol.len;
+        i = 0;
+        while i < p2.len {
+            out[pos + i] = p2.ptr[i];
+            i = i + 1;
+        }
+        pos = pos + p2.len;
+    }
+    i = 0;
+    while i < end.len {
+        out[pos + i] = end.ptr[i];
+        i = i + 1;
+    }
+    const total: usize = pos + end.len;
+    return total;
+}
+
+/// 在裸 HTTP 连接上完成 WebSocket Upgrade 并返回接管后的连接对象。
+/// 参数说明：`fd` 为已建立的 HTTP/1.1 连接；`req` 为已解析请求；`options` 为 Upgrade/会话配置。
+/// 返回值说明：成功时返回已发送 `101` 响应且接管 fd 所有权的 `WebSocketConn`。
+export fn websocket_accept_from_http(fd: i32, req: &Request, options: &WebSocketAcceptOptions) !WebSocketConn {
+    if fd < 0 || req == null || options == null {
+        return error.InvalidRequest;
+    }
+    try websocket_validate_upgrade_request(req);
+    if websocket_extensions_requested(req) && !options.allow_extensions {
+        return error.WebSocketExtensionsNotSupported;
+    }
+
+    const key: &[byte] = try websocket_request_get_key(req);
+    var accept_buf: [byte: 64] = [];
+    const accept_len: usize = try websocket_compute_accept(key, &accept_buf[0], 64);
+
+    var picked_subprotocol: &[const byte] = &""[0: 0];
+    if options.subprotocols != null && options.subprotocol_count > 0 {
+        picked_subprotocol = try websocket_pick_subprotocol(req, options.subprotocols as &&const byte, options.subprotocol_count);
+    }
+
+    var resp: [byte: 256] = [];
+    const resp_len: usize = try websocket_build_upgrade_response(
+        &resp[0],
+        256,
+        accept_buf[0: accept_len],
+        picked_subprotocol,
+    );
+    _ = try websocket_write_all_sync(fd, &resp[0] as &const byte, resp_len);
+
+    var io: WebSocketFdTransport = websocket_fd_transport_owned(fd);
+    return websocket_conn_new(&io, WebSocketRole.Server, options);
+}

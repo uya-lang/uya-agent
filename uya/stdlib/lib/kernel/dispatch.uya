@@ -1,0 +1,445 @@
+// 宿主机模拟：syscall 分发（调度 + 可选 MMU/页池）
+// Spec: docs/microcontainer/syscall_abi.md §4
+
+use kernel.container;
+use kernel.capability;
+use kernel.errors;
+use kernel.mem;
+use kernel.paging;
+use kernel.scheduler;
+use kernel.syscall;
+use libc.TimeVal;
+use libc.sys_gettimeofday;
+use libc.write;
+use libc.STDOUT_FILENO;
+
+/// 单次 SYS_PRINT 允许的最大长度（ABI 默认 256B）
+export const SYSCALL_PRINT_MAX: u32 = 256;
+
+/// 单槽在宿主机桩上允许通过 `SYS_ALLOC` 映射的页数上限
+export const KERNEL_HOST_MAX_PAGES_PER_SLOT: u32 = 2;
+
+/// 与 paging MMU 页大小一致的字面量（避免分包 C 跨单元 const）
+const DISPATCH_PAGE_BYTES: u32 = 65536;
+
+/// 宿主机内核上下文：`pm.base == null` 时 `PRINT`/`ALLOC` 走仅校验的桩路径。
+export struct KernelHostCtx {
+    sch: &Scheduler,
+    pts: [PageTable: 8],
+    pm: PhysMem,
+    pool: PagePool,
+    alloc_pages: [u32: 8],
+    heap_base_vpn: [u32: 8],
+    heap_next_vpn: [u32: 8],
+    stack_base_vpn: [u32: 8],
+    stack_page_count: [u32: 8],
+    io_allowed_devices: [u32: 8],
+    io_allowed_ops: [u32: 8],
+    io_available_devices: u32,
+}
+
+/// 功能说明：初始化 8 张页表、页池与每槽已分配页计数；不修改 `sch`/`pm`（由调用方先填）。
+/// 参数：`ctx` — 上下文（须已设置 `sch` 指向有效调度器）。
+/// 返回：无返回值。
+export fn kernel_host_ctx_init(ctx: &KernelHostCtx) void {
+    var j: u32 = 0;
+    while j < 8u32 {
+        pt_init(&ctx.pts[j]);
+        ctx.alloc_pages[j] = 0;
+        ctx.heap_base_vpn[j] = 0u32;
+        ctx.heap_next_vpn[j] = 0u32;
+        ctx.stack_base_vpn[j] = 0u32;
+        ctx.stack_page_count[j] = 0u32;
+        ctx.io_allowed_devices[j] = 0u32;
+        ctx.io_allowed_ops[j] = 0u32;
+        j = j + 1;
+    }
+    ctx.io_available_devices = 0u32;
+    page_pool_init(&ctx.pool, 8u32);
+}
+
+export fn kernel_host_allow_io_device(ctx: &KernelHostCtx, slot: u32, device_id: u32) !void {
+    if slot >= 8u32 {
+        return error.InvalidState;
+    }
+    if device_id >= 32u32 {
+        return error.DevDenied;
+    }
+    const allowed: &u32 = kernel_host_io_devices_ref(ctx, slot);
+    allowed[0] = allowed[0] | (1u32 << (device_id as i32));
+}
+
+export fn kernel_host_allow_io_op(ctx: &KernelHostCtx, slot: u32, operation: u32) !void {
+    if slot >= 8u32 {
+        return error.InvalidState;
+    }
+    if operation >= 32u32 {
+        return error.OpDenied;
+    }
+    const allowed: &u32 = kernel_host_io_ops_ref(ctx, slot);
+    allowed[0] = allowed[0] | (1u32 << (operation as i32));
+}
+
+export fn kernel_host_set_io_device_available(ctx: &KernelHostCtx, device_id: u32, available: u32) !void {
+    if device_id >= 32u32 {
+        return error.DevDenied;
+    }
+    const bit: u32 = 1u32 << (device_id as i32);
+    if available != 0u32 {
+        ctx.io_available_devices = ctx.io_available_devices | bit;
+    } else {
+        ctx.io_available_devices = ctx.io_available_devices & ~bit;
+    }
+}
+
+fn kernel_host_clear_io_policy(ctx: &KernelHostCtx, slot: u32) !void {
+    if slot >= 8u32 {
+        return error.InvalidState;
+    }
+    const allowed_devices: &u32 = kernel_host_io_devices_ref(ctx, slot);
+    const allowed_ops: &u32 = kernel_host_io_ops_ref(ctx, slot);
+    allowed_devices[0] = 0u32;
+    allowed_ops[0] = 0u32;
+}
+
+fn kernel_host_allow_io_basic_ops(ctx: &KernelHostCtx, slot: u32) !void {
+    try kernel_host_allow_io_op(ctx, slot, KERNEL_IO_OP_READ);
+    try kernel_host_allow_io_op(ctx, slot, KERNEL_IO_OP_WRITE);
+}
+
+fn kernel_host_apply_required_io_device(ctx: &KernelHostCtx, slot: u32, required_caps: u32, cap_bit: u32, device_id: u32) !void {
+    if (required_caps & cap_bit) == 0u32 {
+        return;
+    }
+    try kernel_host_allow_io_device(ctx, slot, device_id);
+    try kernel_host_set_io_device_available(ctx, device_id, 1u32);
+}
+
+/// 功能说明：将 `.uapp` 头部 `required_caps` 映射为当前槽位的 `SYS_IO` 设备与操作白名单。
+/// 参数：`ctx` — 宿主机上下文；`slot` — 容器槽位；`required_caps` — 镜像声明的能力位图。
+/// 返回：成功时无返回值；槽位非法或含未知能力位时返回错误。
+export fn kernel_host_apply_required_caps(ctx: &KernelHostCtx, slot: u32, required_caps: u32) !void {
+    if slot >= 8u32 {
+        return error.InvalidState;
+    }
+    try kernel_required_caps_validate(required_caps);
+    try kernel_host_clear_io_policy(ctx, slot);
+    if required_caps == 0u32 {
+        return;
+    }
+
+    try kernel_host_allow_io_basic_ops(ctx, slot);
+    try kernel_host_apply_required_io_device(ctx, slot, required_caps, KERNEL_CAP_IO_UART, KERNEL_IO_DEVICE_UART);
+    try kernel_host_apply_required_io_device(ctx, slot, required_caps, KERNEL_CAP_IO_GPIO, KERNEL_IO_DEVICE_GPIO);
+    try kernel_host_apply_required_io_device(ctx, slot, required_caps, KERNEL_CAP_IO_TIMER, KERNEL_IO_DEVICE_TIMER);
+}
+
+fn kernel_host_mm_enabled(ctx: &KernelHostCtx) i32 {
+    if ctx.pm.base == null {
+        return 0;
+    }
+    return 1;
+}
+
+fn kernel_host_pt_ref(ctx: &KernelHostCtx, slot: u32) &PageTable {
+    if slot == 0u32 {
+        return &ctx.pts[0];
+    }
+    if slot == 1u32 {
+        return &ctx.pts[1];
+    }
+    if slot == 2u32 {
+        return &ctx.pts[2];
+    }
+    if slot == 3u32 {
+        return &ctx.pts[3];
+    }
+    if slot == 4u32 {
+        return &ctx.pts[4];
+    }
+    if slot == 5u32 {
+        return &ctx.pts[5];
+    }
+    if slot == 6u32 {
+        return &ctx.pts[6];
+    }
+    return &ctx.pts[7];
+}
+
+fn kernel_host_io_devices_ref(ctx: &KernelHostCtx, slot: u32) &u32 {
+    if slot == 0u32 {
+        return &ctx.io_allowed_devices[0];
+    }
+    if slot == 1u32 {
+        return &ctx.io_allowed_devices[1];
+    }
+    if slot == 2u32 {
+        return &ctx.io_allowed_devices[2];
+    }
+    if slot == 3u32 {
+        return &ctx.io_allowed_devices[3];
+    }
+    if slot == 4u32 {
+        return &ctx.io_allowed_devices[4];
+    }
+    if slot == 5u32 {
+        return &ctx.io_allowed_devices[5];
+    }
+    if slot == 6u32 {
+        return &ctx.io_allowed_devices[6];
+    }
+    return &ctx.io_allowed_devices[7];
+}
+
+fn kernel_host_heap_base_vpn_ref(ctx: &KernelHostCtx, slot: u32) &u32 {
+    if slot == 0u32 {
+        return &ctx.heap_base_vpn[0];
+    }
+    if slot == 1u32 {
+        return &ctx.heap_base_vpn[1];
+    }
+    if slot == 2u32 {
+        return &ctx.heap_base_vpn[2];
+    }
+    if slot == 3u32 {
+        return &ctx.heap_base_vpn[3];
+    }
+    if slot == 4u32 {
+        return &ctx.heap_base_vpn[4];
+    }
+    if slot == 5u32 {
+        return &ctx.heap_base_vpn[5];
+    }
+    if slot == 6u32 {
+        return &ctx.heap_base_vpn[6];
+    }
+    return &ctx.heap_base_vpn[7];
+}
+
+fn kernel_host_heap_next_vpn_ref(ctx: &KernelHostCtx, slot: u32) &u32 {
+    if slot == 0u32 {
+        return &ctx.heap_next_vpn[0];
+    }
+    if slot == 1u32 {
+        return &ctx.heap_next_vpn[1];
+    }
+    if slot == 2u32 {
+        return &ctx.heap_next_vpn[2];
+    }
+    if slot == 3u32 {
+        return &ctx.heap_next_vpn[3];
+    }
+    if slot == 4u32 {
+        return &ctx.heap_next_vpn[4];
+    }
+    if slot == 5u32 {
+        return &ctx.heap_next_vpn[5];
+    }
+    if slot == 6u32 {
+        return &ctx.heap_next_vpn[6];
+    }
+    return &ctx.heap_next_vpn[7];
+}
+
+fn kernel_host_stack_base_vpn_ref(ctx: &KernelHostCtx, slot: u32) &u32 {
+    if slot == 0u32 {
+        return &ctx.stack_base_vpn[0];
+    }
+    if slot == 1u32 {
+        return &ctx.stack_base_vpn[1];
+    }
+    if slot == 2u32 {
+        return &ctx.stack_base_vpn[2];
+    }
+    if slot == 3u32 {
+        return &ctx.stack_base_vpn[3];
+    }
+    if slot == 4u32 {
+        return &ctx.stack_base_vpn[4];
+    }
+    if slot == 5u32 {
+        return &ctx.stack_base_vpn[5];
+    }
+    if slot == 6u32 {
+        return &ctx.stack_base_vpn[6];
+    }
+    return &ctx.stack_base_vpn[7];
+}
+
+fn kernel_host_io_ops_ref(ctx: &KernelHostCtx, slot: u32) &u32 {
+    if slot == 0u32 {
+        return &ctx.io_allowed_ops[0];
+    }
+    if slot == 1u32 {
+        return &ctx.io_allowed_ops[1];
+    }
+    if slot == 2u32 {
+        return &ctx.io_allowed_ops[2];
+    }
+    if slot == 3u32 {
+        return &ctx.io_allowed_ops[3];
+    }
+    if slot == 4u32 {
+        return &ctx.io_allowed_ops[4];
+    }
+    if slot == 5u32 {
+        return &ctx.io_allowed_ops[5];
+    }
+    if slot == 6u32 {
+        return &ctx.io_allowed_ops[6];
+    }
+    return &ctx.io_allowed_ops[7];
+}
+
+fn syscall_handle_yield(sch: &Scheduler, caller_slot: u32, arg1: u32, arg2: u32) !u32 {
+    if arg1 != 0u32 {
+        return error.InvalidFlags;
+    }
+    if arg2 != 0u32 {
+        return error.InvalidFlags;
+    }
+    const st: ContainerState = try scheduler_get_slot_state(sch, caller_slot);
+    if st == ContainerState.cs_running {
+        try scheduler_set_slot_state(sch, caller_slot, ContainerState.cs_ready);
+    }
+    return 0u32;
+}
+
+fn syscall_handle_time(arg1: u32, arg2: u32) !u32 {
+    if arg1 != 0u32 {
+        return error.InvalidFlags;
+    }
+    if arg2 != 0u32 {
+        return error.InvalidFlags;
+    }
+    var tv: TimeVal = TimeVal{ tv_sec: 0, tv_usec: 0 };
+    _ = try sys_gettimeofday(&tv, null as &void);
+    const sec_ms: i64 = tv.tv_sec * 1000;
+    const usec_ms: i64 = tv.tv_usec / 1000;
+    const total_ms: i64 = sec_ms + usec_ms;
+    const total_ms_u64: !u64 = total_ms as! u64;
+    return (total_ms_u64.value & 4294967295u64) as u32;
+}
+
+fn syscall_handle_print(ctx: &KernelHostCtx, caller_slot: u32, vaddr: u32, len: u32) !u32 {
+    if len > SYSCALL_PRINT_MAX {
+        return error.TooLarge;
+    }
+    if len == 0u32 {
+        return 0u32;
+    }
+    if kernel_host_mm_enabled(ctx) == 0 {
+        return 0u32;
+    }
+    const pt: &PageTable = kernel_host_pt_ref(ctx, caller_slot);
+    const ptr: &byte = try mmu_translate_ptr(pt, &ctx.pm, vaddr, len, ACCESS_R);
+    const written: i64 = write(STDOUT_FILENO, ptr, len as usize);
+    if written < 0 {
+        return error.DevUnavailable;
+    }
+    return len;
+}
+
+fn syscall_handle_alloc(ctx: &KernelHostCtx, caller_slot: u32, size: u32, flags: u32) !u32 {
+    if flags != 0u32 {
+        return error.InvalidFlags;
+    }
+    if size == 0u32 {
+        return error.InvalidSize;
+    }
+    if kernel_host_mm_enabled(ctx) == 0 {
+        return error.NoMemory;
+    }
+    if size > DISPATCH_PAGE_BYTES {
+        return error.TooLarge;
+    }
+    var t: u32 = caller_slot;
+    if t < 8u32 {
+        if ctx.alloc_pages[t] >= KERNEL_HOST_MAX_PAGES_PER_SLOT {
+            return error.QuotaExceeded;
+        }
+        const ppn: u32 = try page_alloc(&ctx.pool);
+        const pt: &PageTable = kernel_host_pt_ref(ctx, caller_slot);
+        const heap_next_ref: &u32 = kernel_host_heap_next_vpn_ref(ctx, caller_slot);
+        const heap_base_ref: &u32 = kernel_host_heap_base_vpn_ref(ctx, caller_slot);
+        const stack_base: u32 = kernel_host_stack_base_vpn_ref(ctx, caller_slot)[0];
+        var vpn: u32 = heap_next_ref[0];
+        if vpn == 0u32 && heap_base_ref[0] == 0u32 && ctx.alloc_pages[t] == 0u32 {
+            vpn = try pt_find_free_vpn(pt);
+            heap_base_ref[0] = vpn;
+        } else {
+            if heap_base_ref[0] == 0u32 {
+                heap_base_ref[0] = vpn;
+            }
+            if stack_base != 0u32 && vpn >= stack_base {
+                return error.NoMemory;
+            }
+            while vpn < PAGE_TABLE_ENTRIES && (pt.entries[vpn] & PTE_V) != 0u32 {
+                vpn = vpn + 1u32;
+                if stack_base != 0u32 && vpn >= stack_base {
+                    return error.NoMemory;
+                }
+            }
+            if vpn >= PAGE_TABLE_ENTRIES {
+                return error.NoMemory;
+            }
+        }
+        try pt_map(pt, vpn, ppn, PTE_R | PTE_W | PTE_U);
+        heap_next_ref[0] = vpn + 1u32;
+        ctx.alloc_pages[t] = ctx.alloc_pages[t] + 1u32;
+        return (vpn << 16);
+    }
+    return error.InvalidState;
+}
+
+fn syscall_handle_io(ctx: &KernelHostCtx, caller_slot: u32, device_id: u32, operation: u32) !u32 {
+    if caller_slot >= 8u32 {
+        return error.InvalidState;
+    }
+    if device_id >= 32u32 {
+        return error.DevDenied;
+    }
+    if operation >= 32u32 {
+        return error.OpDenied;
+    }
+    const device_bit: u32 = 1u32 << (device_id as i32);
+    const op_bit: u32 = 1u32 << (operation as i32);
+    const allowed_devices: u32 = kernel_host_io_devices_ref(ctx, caller_slot)[0];
+    const allowed_ops: u32 = kernel_host_io_ops_ref(ctx, caller_slot)[0];
+    if (allowed_devices & device_bit) == 0u32 {
+        return error.DevDenied;
+    }
+    if (allowed_ops & op_bit) == 0u32 {
+        return error.OpDenied;
+    }
+    if (ctx.io_available_devices & device_bit) == 0u32 {
+        return error.DevUnavailable;
+    }
+    return 0u32;
+}
+
+/// 功能说明：按调用号分发；`SYS_YIELD` 更新调度状态；`PRINT`/`ALLOC` 在启用 MMU 时做翻译与页池映射。
+/// 参数：`ctx` — 宿主机上下文；`caller_slot` — 0..7；`num` / `arg1` / `arg2` — ABI 参数。
+/// 返回：成功时的返回值；失败为 `!` 各错误联合成员（含 `PageFault`/`PagePermission` 等）。
+export fn syscall_dispatch(ctx: &KernelHostCtx, caller_slot: u32, num: u32, arg1: u32, arg2: u32) !u32 {
+    var c: u32 = caller_slot;
+    if c >= 8u32 {
+        return error.InvalidState;
+    }
+    if num == SYS_YIELD {
+        return try syscall_handle_yield(ctx.sch, c, arg1, arg2);
+    }
+    if num == SYS_PRINT {
+        return try syscall_handle_print(ctx, c, arg1, arg2);
+    }
+    if num == SYS_ALLOC {
+        return try syscall_handle_alloc(ctx, c, arg1, arg2);
+    }
+    if num == SYS_IO {
+        return try syscall_handle_io(ctx, c, arg1, arg2);
+    }
+    if num == SYS_TIME {
+        return try syscall_handle_time(arg1, arg2);
+    }
+    return error.OpDenied;
+}

@@ -1,0 +1,1319 @@
+// Microcontainer hosted simulator — ties all kernel modules together
+// Runs on x86-64 Linux, simulates the full container lifecycle:
+//   register → load → validate → schedule → syscall → crash/recover → hot update
+//
+// Container "execution" is modeled as callback functions that receive a context
+// and issue syscalls via kernel_syscall(). The scheduler calls these in round-robin.
+
+use kernel.container;
+use kernel.capability;
+use kernel.dispatch;
+use kernel.errors;
+use kernel.image;
+use kernel.mem;
+use kernel.paging;
+use kernel.recovery;
+use kernel.scheduler;
+use kernel.syscall;
+use kernel.update;
+use std;
+use libc.sys_mmap;
+use libc.sys_munmap;
+use libc.sys_mprotect;
+use libc.write;
+use libc.STDOUT_FILENO;
+use libc.PROT_READ;
+use libc.PROT_WRITE;
+use libc.PROT_EXEC;
+use libc.MAP_PRIVATE;
+use libc.MAP_ANONYMOUS;
+
+extern fn uya_call0_i32(fn_ptr: &void) i32;
+extern fn uya_call0_i32_stack(fn_ptr: &void, stack_top: &void) i32;
+
+export const SIM_LOADED_RESULT_NONE: u32 = 0u32;
+export const SIM_LOADED_RESULT_EXIT: u32 = 1u32;
+export const SIM_LOADED_RESULT_FAULT: u32 = 2u32;
+export const SIM_LOADED_RESULT_VALIDATED: u32 = 3u32;
+export const SIM_LOADED_RESULT_UNWIRED: u32 = 4u32;
+export const SIM_FAULT_CLASS_NONE: u32 = 0u32;
+export const SIM_FAULT_CLASS_SEGV: u32 = 1u32;
+export const SIM_FAULT_CLASS_ILL: u32 = 2u32;
+export const SIM_FAULT_CLASS_BUS: u32 = 3u32;
+export const SIM_FAULT_CLASS_ABORT: u32 = 4u32;
+export const SIM_FAULT_CLASS_UNKNOWN: u32 = 255u32;
+export const SIM_CALL_GATE_TRAMPOLINE_SIZE: usize = 4096usize;
+export const SIM_FAULT_CODE_PAGE_FAULT: u32 = 257u32;
+export const SIM_FAULT_CODE_PAGE_PERMISSION: u32 = 258u32;
+export const SIM_FAULT_CODE_IMAGE_RELOC: u32 = 259u32;
+export const SIM_FAULT_CODE_IMAGE_INSN: u32 = 260u32;
+export const SIM_MICROAPP_BRIDGE_ABI_MAGIC: u32 = 0x55414249u32;
+export const SIM_MICROAPP_BRIDGE_ABI_VERSION: u32 = 1u32;
+const SIM_MICROAPP_BRIDGE_DISPATCH2_OFFSET: usize = 8usize;
+const RV32_OPCODE_OP_IMM: u32 = 19u32;
+const RV32_FUNCT3_ADDI: u32 = 0u32;
+const RV32_REG_A0: u32 = 10u32;
+const RV32_REG_A1: u32 = 11u32;
+const RV32_REG_A7: u32 = 17u32;
+const RV32_INSN_ECALL: u32 = 115u32;
+const RV32_INSN_EBREAK: u32 = 1048691u32;
+
+// ── Container entry function type ──
+// fn(ctx: &SimContainerCtx) i32
+//   return 0 = yield (still alive)
+//   return 1 = exit normally
+//   return negative = crash with fault code
+
+export struct SimContainerCtx {
+    cid: u32,
+    tick: u32,              // how many times this container has been called
+    kernel: &SimKernel,     // back-reference for syscalls
+}
+
+// ── Kernel State ──
+
+export struct SimKernel {
+    sched: Scheduler,
+    host_ctx: KernelHostCtx,
+    recovery: RecoveryManager,
+    // Container entry functions (function pointers simulated as indices)
+    entry_fns: [i32: 8],      // 0 = no entry, >0 = registered function index
+    container_ctxs: [SimContainerCtx: 8],
+    total_ticks: u32,
+    loaded_image_headers: [ImageHeader: 8],
+    loaded_image_ppn: [u32: 8],
+    loaded_image_valid: [u32: 8],
+    loaded_image_base_vpn: [u32: 8],
+    loaded_image_page_count: [u32: 8],
+    loaded_result_kind: [u32: 8],
+    loaded_exit_code: [i32: 8],
+    loaded_fault_class: [u32: 8],
+    loaded_fault_code: [u32: 8],
+    loaded_fault_signal: [u32: 8],
+    loaded_trap_pc: [u32: 8],
+    loaded_trap_a0: [u32: 8],
+    loaded_trap_a1: [u32: 8],
+    loaded_trap_a7: [u32: 8],
+    loaded_bridge_dispatch_count: [u32: 8],
+    // Callback table: callers register fn pointers here
+    // For simplicity in Uya (no fn pointer arrays), we use a dispatch pattern
+}
+
+var g_sim_bridge_kernel: &SimKernel = null;
+var g_sim_bridge_cid: u32 = 0u32;
+var g_sim_bridge_active: u32 = 0u32;
+
+export fn sim_kernel_make() SimKernel {
+    return SimKernel{
+        sched: Scheduler{ slots: [], rr_cursor: 0 },
+        host_ctx: KernelHostCtx{ sch: null, pts: [], pm: PhysMem{ base: null, size: 0 }, pool: PagePool{ used: [], count: 0, used_count: 0 }, alloc_pages: [], heap_base_vpn: [], heap_next_vpn: [], stack_base_vpn: [], stack_page_count: [], io_allowed_devices: [], io_allowed_ops: [], io_available_devices: 0 },
+        recovery: RecoveryManager{ states: [], log: [], log_head: 0, log_count: 0 },
+        entry_fns: [],
+        container_ctxs: [],
+        total_ticks: 0,
+        loaded_image_headers: [],
+        loaded_image_ppn: [],
+        loaded_image_valid: [],
+        loaded_image_base_vpn: [],
+        loaded_image_page_count: [],
+        loaded_result_kind: [],
+        loaded_exit_code: [],
+        loaded_fault_class: [],
+        loaded_fault_code: [],
+        loaded_fault_signal: [],
+        loaded_trap_pc: [],
+        loaded_trap_a0: [],
+        loaded_trap_a1: [],
+        loaded_trap_a7: [],
+        loaded_bridge_dispatch_count: [],
+    };
+}
+
+export fn sim_kernel_attach_physmem(k: &SimKernel, backing: &[byte]) !void {
+    if k == null {
+        return error.InvalidState;
+    }
+    if backing.ptr == null || backing.len == 0 {
+        return error.InvalidSize;
+    }
+    k.host_ctx.pm.base = backing.ptr;
+    k.host_ctx.pm.size = backing.len as u32;
+}
+
+// ── Init ──
+
+export fn sim_kernel_init(k: &SimKernel) void {
+    scheduler_init(&k.sched);
+    k.host_ctx.sch = &k.sched;
+    k.host_ctx.pm.base = null;
+    k.host_ctx.pm.size = 0;
+    kernel_host_ctx_init(&k.host_ctx);
+    recovery_init(&k.recovery);
+    k.total_ticks = 0;
+
+    var i: u32 = 0;
+    while i >= 0 && i < 8 {
+        k.entry_fns[i] = 0;
+        k.container_ctxs[i].cid = i;
+        k.container_ctxs[i].tick = 0;
+        k.container_ctxs[i].kernel = k;
+        k.loaded_image_ppn[i] = 0u32;
+        k.loaded_image_valid[i] = 0u32;
+        k.loaded_image_base_vpn[i] = 0u32;
+        k.loaded_image_page_count[i] = 0u32;
+        k.loaded_result_kind[i] = SIM_LOADED_RESULT_NONE;
+        k.loaded_exit_code[i] = 0;
+        k.loaded_fault_class[i] = SIM_FAULT_CLASS_NONE;
+        k.loaded_fault_code[i] = 0u32;
+        k.loaded_fault_signal[i] = 0u32;
+        k.loaded_trap_pc[i] = 0u32;
+        k.loaded_trap_a0[i] = 0u32;
+        k.loaded_trap_a1[i] = 0u32;
+        k.loaded_trap_a7[i] = 0u32;
+        k.loaded_bridge_dispatch_count[i] = 0u32;
+        i = i + 1;
+    }
+}
+
+fn sim_pt_ref(k: &SimKernel, slot: u32) &PageTable {
+    if slot == 0u32 { return &k.host_ctx.pts[0]; }
+    if slot == 1u32 { return &k.host_ctx.pts[1]; }
+    if slot == 2u32 { return &k.host_ctx.pts[2]; }
+    if slot == 3u32 { return &k.host_ctx.pts[3]; }
+    if slot == 4u32 { return &k.host_ctx.pts[4]; }
+    if slot == 5u32 { return &k.host_ctx.pts[5]; }
+    if slot == 6u32 { return &k.host_ctx.pts[6]; }
+    return &k.host_ctx.pts[7];
+}
+
+fn sim_loaded_header_ref(k: &SimKernel, slot: u32) &ImageHeader {
+    if slot == 0u32 { return &k.loaded_image_headers[0]; }
+    if slot == 1u32 { return &k.loaded_image_headers[1]; }
+    if slot == 2u32 { return &k.loaded_image_headers[2]; }
+    if slot == 3u32 { return &k.loaded_image_headers[3]; }
+    if slot == 4u32 { return &k.loaded_image_headers[4]; }
+    if slot == 5u32 { return &k.loaded_image_headers[5]; }
+    if slot == 6u32 { return &k.loaded_image_headers[6]; }
+    return &k.loaded_image_headers[7];
+}
+
+fn sim_loaded_ppn_ref(k: &SimKernel, slot: u32) &u32 {
+    if slot == 0u32 { return &k.loaded_image_ppn[0]; }
+    if slot == 1u32 { return &k.loaded_image_ppn[1]; }
+    if slot == 2u32 { return &k.loaded_image_ppn[2]; }
+    if slot == 3u32 { return &k.loaded_image_ppn[3]; }
+    if slot == 4u32 { return &k.loaded_image_ppn[4]; }
+    if slot == 5u32 { return &k.loaded_image_ppn[5]; }
+    if slot == 6u32 { return &k.loaded_image_ppn[6]; }
+    return &k.loaded_image_ppn[7];
+}
+
+fn sim_loaded_valid_ref(k: &SimKernel, slot: u32) &u32 {
+    if slot == 0u32 { return &k.loaded_image_valid[0]; }
+    if slot == 1u32 { return &k.loaded_image_valid[1]; }
+    if slot == 2u32 { return &k.loaded_image_valid[2]; }
+    if slot == 3u32 { return &k.loaded_image_valid[3]; }
+    if slot == 4u32 { return &k.loaded_image_valid[4]; }
+    if slot == 5u32 { return &k.loaded_image_valid[5]; }
+    if slot == 6u32 { return &k.loaded_image_valid[6]; }
+    return &k.loaded_image_valid[7];
+}
+
+fn sim_loaded_base_vpn_ref(k: &SimKernel, slot: u32) &u32 {
+    if slot == 0u32 { return &k.loaded_image_base_vpn[0]; }
+    if slot == 1u32 { return &k.loaded_image_base_vpn[1]; }
+    if slot == 2u32 { return &k.loaded_image_base_vpn[2]; }
+    if slot == 3u32 { return &k.loaded_image_base_vpn[3]; }
+    if slot == 4u32 { return &k.loaded_image_base_vpn[4]; }
+    if slot == 5u32 { return &k.loaded_image_base_vpn[5]; }
+    if slot == 6u32 { return &k.loaded_image_base_vpn[6]; }
+    return &k.loaded_image_base_vpn[7];
+}
+
+fn sim_loaded_page_count_ref(k: &SimKernel, slot: u32) &u32 {
+    if slot == 0u32 { return &k.loaded_image_page_count[0]; }
+    if slot == 1u32 { return &k.loaded_image_page_count[1]; }
+    if slot == 2u32 { return &k.loaded_image_page_count[2]; }
+    if slot == 3u32 { return &k.loaded_image_page_count[3]; }
+    if slot == 4u32 { return &k.loaded_image_page_count[4]; }
+    if slot == 5u32 { return &k.loaded_image_page_count[5]; }
+    if slot == 6u32 { return &k.loaded_image_page_count[6]; }
+    return &k.loaded_image_page_count[7];
+}
+
+fn sim_loaded_result_kind_ref(k: &SimKernel, slot: u32) &u32 {
+    if slot == 0u32 { return &k.loaded_result_kind[0]; }
+    if slot == 1u32 { return &k.loaded_result_kind[1]; }
+    if slot == 2u32 { return &k.loaded_result_kind[2]; }
+    if slot == 3u32 { return &k.loaded_result_kind[3]; }
+    if slot == 4u32 { return &k.loaded_result_kind[4]; }
+    if slot == 5u32 { return &k.loaded_result_kind[5]; }
+    if slot == 6u32 { return &k.loaded_result_kind[6]; }
+    return &k.loaded_result_kind[7];
+}
+
+fn sim_loaded_exit_code_ref(k: &SimKernel, slot: u32) &i32 {
+    if slot == 0u32 { return &k.loaded_exit_code[0]; }
+    if slot == 1u32 { return &k.loaded_exit_code[1]; }
+    if slot == 2u32 { return &k.loaded_exit_code[2]; }
+    if slot == 3u32 { return &k.loaded_exit_code[3]; }
+    if slot == 4u32 { return &k.loaded_exit_code[4]; }
+    if slot == 5u32 { return &k.loaded_exit_code[5]; }
+    if slot == 6u32 { return &k.loaded_exit_code[6]; }
+    return &k.loaded_exit_code[7];
+}
+
+fn sim_loaded_fault_class_ref(k: &SimKernel, slot: u32) &u32 {
+    if slot == 0u32 { return &k.loaded_fault_class[0]; }
+    if slot == 1u32 { return &k.loaded_fault_class[1]; }
+    if slot == 2u32 { return &k.loaded_fault_class[2]; }
+    if slot == 3u32 { return &k.loaded_fault_class[3]; }
+    if slot == 4u32 { return &k.loaded_fault_class[4]; }
+    if slot == 5u32 { return &k.loaded_fault_class[5]; }
+    if slot == 6u32 { return &k.loaded_fault_class[6]; }
+    return &k.loaded_fault_class[7];
+}
+
+fn sim_loaded_fault_code_ref(k: &SimKernel, slot: u32) &u32 {
+    if slot == 0u32 { return &k.loaded_fault_code[0]; }
+    if slot == 1u32 { return &k.loaded_fault_code[1]; }
+    if slot == 2u32 { return &k.loaded_fault_code[2]; }
+    if slot == 3u32 { return &k.loaded_fault_code[3]; }
+    if slot == 4u32 { return &k.loaded_fault_code[4]; }
+    if slot == 5u32 { return &k.loaded_fault_code[5]; }
+    if slot == 6u32 { return &k.loaded_fault_code[6]; }
+    return &k.loaded_fault_code[7];
+}
+
+fn sim_loaded_fault_signal_ref(k: &SimKernel, slot: u32) &u32 {
+    if slot == 0u32 { return &k.loaded_fault_signal[0]; }
+    if slot == 1u32 { return &k.loaded_fault_signal[1]; }
+    if slot == 2u32 { return &k.loaded_fault_signal[2]; }
+    if slot == 3u32 { return &k.loaded_fault_signal[3]; }
+    if slot == 4u32 { return &k.loaded_fault_signal[4]; }
+    if slot == 5u32 { return &k.loaded_fault_signal[5]; }
+    if slot == 6u32 { return &k.loaded_fault_signal[6]; }
+    return &k.loaded_fault_signal[7];
+}
+
+fn sim_loaded_trap_pc_ref(k: &SimKernel, slot: u32) &u32 {
+    if slot == 0u32 { return &k.loaded_trap_pc[0]; }
+    if slot == 1u32 { return &k.loaded_trap_pc[1]; }
+    if slot == 2u32 { return &k.loaded_trap_pc[2]; }
+    if slot == 3u32 { return &k.loaded_trap_pc[3]; }
+    if slot == 4u32 { return &k.loaded_trap_pc[4]; }
+    if slot == 5u32 { return &k.loaded_trap_pc[5]; }
+    if slot == 6u32 { return &k.loaded_trap_pc[6]; }
+    return &k.loaded_trap_pc[7];
+}
+
+fn sim_loaded_trap_a0_ref(k: &SimKernel, slot: u32) &u32 {
+    if slot == 0u32 { return &k.loaded_trap_a0[0]; }
+    if slot == 1u32 { return &k.loaded_trap_a0[1]; }
+    if slot == 2u32 { return &k.loaded_trap_a0[2]; }
+    if slot == 3u32 { return &k.loaded_trap_a0[3]; }
+    if slot == 4u32 { return &k.loaded_trap_a0[4]; }
+    if slot == 5u32 { return &k.loaded_trap_a0[5]; }
+    if slot == 6u32 { return &k.loaded_trap_a0[6]; }
+    return &k.loaded_trap_a0[7];
+}
+
+fn sim_loaded_trap_a1_ref(k: &SimKernel, slot: u32) &u32 {
+    if slot == 0u32 { return &k.loaded_trap_a1[0]; }
+    if slot == 1u32 { return &k.loaded_trap_a1[1]; }
+    if slot == 2u32 { return &k.loaded_trap_a1[2]; }
+    if slot == 3u32 { return &k.loaded_trap_a1[3]; }
+    if slot == 4u32 { return &k.loaded_trap_a1[4]; }
+    if slot == 5u32 { return &k.loaded_trap_a1[5]; }
+    if slot == 6u32 { return &k.loaded_trap_a1[6]; }
+    return &k.loaded_trap_a1[7];
+}
+
+fn sim_loaded_trap_a7_ref(k: &SimKernel, slot: u32) &u32 {
+    if slot == 0u32 { return &k.loaded_trap_a7[0]; }
+    if slot == 1u32 { return &k.loaded_trap_a7[1]; }
+    if slot == 2u32 { return &k.loaded_trap_a7[2]; }
+    if slot == 3u32 { return &k.loaded_trap_a7[3]; }
+    if slot == 4u32 { return &k.loaded_trap_a7[4]; }
+    if slot == 5u32 { return &k.loaded_trap_a7[5]; }
+    if slot == 6u32 { return &k.loaded_trap_a7[6]; }
+    return &k.loaded_trap_a7[7];
+}
+
+fn sim_loaded_bridge_dispatch_count_ref(k: &SimKernel, slot: u32) &u32 {
+    if slot == 0u32 { return &k.loaded_bridge_dispatch_count[0]; }
+    if slot == 1u32 { return &k.loaded_bridge_dispatch_count[1]; }
+    if slot == 2u32 { return &k.loaded_bridge_dispatch_count[2]; }
+    if slot == 3u32 { return &k.loaded_bridge_dispatch_count[3]; }
+    if slot == 4u32 { return &k.loaded_bridge_dispatch_count[4]; }
+    if slot == 5u32 { return &k.loaded_bridge_dispatch_count[5]; }
+    if slot == 6u32 { return &k.loaded_bridge_dispatch_count[6]; }
+    return &k.loaded_bridge_dispatch_count[7];
+}
+
+fn sim_entry_fn_ref(k: &SimKernel, slot: u32) &i32 {
+    if slot == 0u32 { return &k.entry_fns[0]; }
+    if slot == 1u32 { return &k.entry_fns[1]; }
+    if slot == 2u32 { return &k.entry_fns[2]; }
+    if slot == 3u32 { return &k.entry_fns[3]; }
+    if slot == 4u32 { return &k.entry_fns[4]; }
+    if slot == 5u32 { return &k.entry_fns[5]; }
+    if slot == 6u32 { return &k.entry_fns[6]; }
+    return &k.entry_fns[7];
+}
+
+fn sim_ctx_ref(k: &SimKernel, slot: u32) &SimContainerCtx {
+    if slot == 0u32 { return &k.container_ctxs[0]; }
+    if slot == 1u32 { return &k.container_ctxs[1]; }
+    if slot == 2u32 { return &k.container_ctxs[2]; }
+    if slot == 3u32 { return &k.container_ctxs[3]; }
+    if slot == 4u32 { return &k.container_ctxs[4]; }
+    if slot == 5u32 { return &k.container_ctxs[5]; }
+    if slot == 6u32 { return &k.container_ctxs[6]; }
+    return &k.container_ctxs[7];
+}
+
+fn sim_range_overlaps(range_start: u32, range_len: u32, page_start: u32, page_end: u32) i32 {
+    if range_len == 0u32 {
+        return 0;
+    }
+    const range_end: u32 = range_start + range_len;
+    if range_end <= page_start {
+        return 0;
+    }
+    if range_start >= page_end {
+        return 0;
+    }
+    return 1;
+}
+
+export fn sim_fault_class_from_signal(signal_code: i32) u32 {
+    if signal_code == 11 {
+        return SIM_FAULT_CLASS_SEGV;
+    }
+    if signal_code == 4 {
+        return SIM_FAULT_CLASS_ILL;
+    }
+    if signal_code == 7 {
+        return SIM_FAULT_CLASS_BUS;
+    }
+    if signal_code == 6 {
+        return SIM_FAULT_CLASS_ABORT;
+    }
+    return SIM_FAULT_CLASS_UNKNOWN;
+}
+
+export fn sim_fault_class_name(fault_class: u32) &byte {
+    if fault_class == SIM_FAULT_CLASS_NONE {
+        return "none" as &byte;
+    }
+    if fault_class == SIM_FAULT_CLASS_SEGV {
+        return "segv" as &byte;
+    }
+    if fault_class == SIM_FAULT_CLASS_ILL {
+        return "ill" as &byte;
+    }
+    if fault_class == SIM_FAULT_CLASS_BUS {
+        return "bus" as &byte;
+    }
+    if fault_class == SIM_FAULT_CLASS_ABORT {
+        return "abort" as &byte;
+    }
+    return "unknown" as &byte;
+}
+
+export fn sim_bind_bridge_dispatch(k: &SimKernel, cid: u32) !void {
+    if k == null || cid >= 8u32 {
+        return error.InvalidState;
+    }
+    g_sim_bridge_kernel = k;
+    g_sim_bridge_cid = cid;
+    g_sim_bridge_active = 1u32;
+}
+
+export fn sim_unbind_bridge_dispatch() void {
+    g_sim_bridge_kernel = null;
+    g_sim_bridge_cid = 0u32;
+    g_sim_bridge_active = 0u32;
+}
+
+fn sim_bridge_error_id_to_i64(error_id: u32) i64 {
+    const err_tmp: !i64 = error_id as! i64;
+    if err_tmp.error_id != 0u32 {
+        return -1i64;
+    }
+    return 0i64 - err_tmp.value;
+}
+
+export fn sim_microapp_bridge_dispatch2(nr: i64, a1: i64, a2: i64) i64 {
+    if g_sim_bridge_active == 0u32 || g_sim_bridge_kernel == null {
+        return -1i64;
+    }
+    const bridge_kernel: &SimKernel = g_sim_bridge_kernel;
+    if g_sim_bridge_cid >= 8u32 {
+        return -1i64;
+    }
+    if nr < 0i64 {
+        return -1i64;
+    }
+    const nr_tmp: !u32 = nr as! u32;
+    if nr_tmp.error_id != 0u32 {
+        return -1i64;
+    }
+    sim_loaded_bridge_dispatch_count_ref(bridge_kernel, g_sim_bridge_cid)[0] =
+        sim_loaded_bridge_dispatch_count_ref(bridge_kernel, g_sim_bridge_cid)[0] + 1u32;
+
+    var bridge_kind: ImageBridgeKind = ImageBridgeKind.ibk_unknown;
+    if bridge_kernel.loaded_image_valid[g_sim_bridge_cid] != 0u32 {
+        bridge_kind = bridge_kernel.loaded_image_headers[g_sim_bridge_cid].bridge_kind;
+    }
+    if nr_tmp.value == SYS_PRINT {
+        if a1 < 0i64 || a2 < 0i64 {
+            return -1i64;
+        }
+        const len_tmp: !u32 = a2 as! u32;
+        if len_tmp.error_id != 0u32 {
+            return -1i64;
+        }
+        if bridge_kind == ImageBridgeKind.ibk_trap {
+            const vaddr_tmp: !u32 = a1 as! u32;
+            if vaddr_tmp.error_id != 0u32 {
+                return -1i64;
+            }
+            const ret: !u32 = sim_syscall(bridge_kernel, g_sim_bridge_cid, nr_tmp.value, vaddr_tmp.value, len_tmp.value);
+            if ret.error_id != 0u32 {
+                return sim_bridge_error_id_to_i64(ret.error_id);
+            }
+            const ret_i64: !i64 = ret.value as! i64;
+            if ret_i64.error_id != 0u32 {
+                return -1i64;
+            }
+            return ret_i64.value;
+        }
+        if len_tmp.value > SYSCALL_PRINT_MAX {
+            return -1i64;
+        }
+        if len_tmp.value == 0u32 {
+            return 0i64;
+        }
+        const ptr_addr_tmp: !usize = a1 as! usize;
+        if ptr_addr_tmp.error_id != 0u32 {
+            return -1i64;
+        }
+        const pm_base: usize = @usize_from_ptr(bridge_kernel.host_ctx.pm.base as &void);
+        const pm_end: usize = pm_base + bridge_kernel.host_ctx.pm.size as usize;
+        const ptr_end: usize = ptr_addr_tmp.value + len_tmp.value as usize;
+        if ptr_addr_tmp.value < pm_base || ptr_end > pm_end {
+            return -1i64;
+        }
+        const ptr: &byte = @ptr_from_usize(ptr_addr_tmp.value) as &byte;
+        const written: i64 = write(STDOUT_FILENO, ptr, len_tmp.value as usize);
+        if written < 0i64 {
+            return -1i64;
+        }
+        return written;
+    }
+    if nr_tmp.value == SYS_ALLOC {
+        if a1 < 0i64 || a2 < 0i64 {
+            return -1i64;
+        }
+        const size_tmp: !u32 = a1 as! u32;
+        const flags_tmp: !u32 = a2 as! u32;
+        if size_tmp.error_id != 0u32 || flags_tmp.error_id != 0u32 {
+            return -1i64;
+        }
+        const ret_va: !u32 = sim_syscall(g_sim_bridge_kernel, g_sim_bridge_cid, nr_tmp.value, size_tmp.value, flags_tmp.value);
+        if ret_va.error_id != 0u32 {
+            return sim_bridge_error_id_to_i64(ret_va.error_id);
+        }
+        if bridge_kind == ImageBridgeKind.ibk_trap {
+            const ret_va_i64: !i64 = ret_va.value as! i64;
+            if ret_va_i64.error_id != 0u32 {
+                return -1i64;
+            }
+            return ret_va_i64.value;
+        }
+        const host_ptr: &byte = mmu_translate_ptr(sim_pt_ref(bridge_kernel, g_sim_bridge_cid), &bridge_kernel.host_ctx.pm, ret_va.value, 1u32, ACCESS_W) catch {
+            return -1i64;
+        };
+        const host_addr_tmp: !i64 = @usize_from_ptr(host_ptr as &void) as! i64;
+        if host_addr_tmp.error_id != 0u32 {
+            return -1i64;
+        }
+        return host_addr_tmp.value;
+    }
+    if a1 < 0i64 || a2 < 0i64 {
+        return -1i64;
+    }
+    const a1_tmp: !u32 = a1 as! u32;
+    const a2_tmp: !u32 = a2 as! u32;
+    if a1_tmp.error_id != 0u32 || a2_tmp.error_id != 0u32 {
+        return -1i64;
+    }
+    const ret: !u32 = sim_syscall(bridge_kernel, g_sim_bridge_cid, nr_tmp.value, a1_tmp.value, a2_tmp.value);
+    if ret.error_id != 0u32 {
+        return sim_bridge_error_id_to_i64(ret.error_id);
+    }
+    const value_tmp: !i64 = ret.value as! i64;
+    if value_tmp.error_id != 0u32 {
+        return -1i64;
+    }
+    return value_tmp.value;
+}
+
+fn sim_fault_code_from_error_id(err_id: u32) u32 {
+    if err_id == @error_id(error.PageFault) {
+        return SIM_FAULT_CODE_PAGE_FAULT;
+    }
+    if err_id == @error_id(error.PagePermission) {
+        return SIM_FAULT_CODE_PAGE_PERMISSION;
+    }
+    if err_id == @error_id(error.ImgRelocInvalid) {
+        return SIM_FAULT_CODE_IMAGE_RELOC;
+    }
+    if err_id == @error_id(error.ImgInsnDenied) {
+        return SIM_FAULT_CODE_IMAGE_INSN;
+    }
+    return 0u32;
+}
+
+export fn sim_reset_loaded_result(k: &SimKernel, cid: u32) !void {
+    if cid >= 8u32 {
+        return error.InvalidState;
+    }
+    sim_loaded_result_kind_ref(k, cid)[0] = SIM_LOADED_RESULT_NONE;
+    sim_loaded_exit_code_ref(k, cid)[0] = 0;
+    sim_loaded_fault_class_ref(k, cid)[0] = SIM_FAULT_CLASS_NONE;
+    sim_loaded_fault_code_ref(k, cid)[0] = 0u32;
+    sim_loaded_fault_signal_ref(k, cid)[0] = 0u32;
+}
+
+fn sim_reset_loaded_trap_state(k: &SimKernel, cid: u32) !void {
+    if cid >= 8u32 {
+        return error.InvalidState;
+    }
+    sim_loaded_trap_pc_ref(k, cid)[0] = 0u32;
+    sim_loaded_trap_a0_ref(k, cid)[0] = 0u32;
+    sim_loaded_trap_a1_ref(k, cid)[0] = 0u32;
+    sim_loaded_trap_a7_ref(k, cid)[0] = 0u32;
+}
+
+export fn sim_store_loaded_exit_result(k: &SimKernel, cid: u32, exit_code: i32) !void {
+    if cid >= 8u32 {
+        return error.InvalidState;
+    }
+    sim_loaded_result_kind_ref(k, cid)[0] = SIM_LOADED_RESULT_EXIT;
+    sim_loaded_exit_code_ref(k, cid)[0] = exit_code;
+    sim_loaded_fault_class_ref(k, cid)[0] = SIM_FAULT_CLASS_NONE;
+    sim_loaded_fault_code_ref(k, cid)[0] = 0u32;
+    sim_loaded_fault_signal_ref(k, cid)[0] = 0u32;
+}
+
+export fn sim_store_loaded_validated_result(k: &SimKernel, cid: u32) !void {
+    if cid >= 8u32 {
+        return error.InvalidState;
+    }
+    sim_loaded_result_kind_ref(k, cid)[0] = SIM_LOADED_RESULT_VALIDATED;
+    sim_loaded_exit_code_ref(k, cid)[0] = 0;
+    sim_loaded_fault_class_ref(k, cid)[0] = SIM_FAULT_CLASS_NONE;
+    sim_loaded_fault_code_ref(k, cid)[0] = 0u32;
+    sim_loaded_fault_signal_ref(k, cid)[0] = 0u32;
+}
+
+export fn sim_store_loaded_unwired_result(k: &SimKernel, cid: u32) !void {
+    if cid >= 8u32 {
+        return error.InvalidState;
+    }
+    sim_loaded_result_kind_ref(k, cid)[0] = SIM_LOADED_RESULT_UNWIRED;
+    sim_loaded_exit_code_ref(k, cid)[0] = 0;
+    sim_loaded_fault_class_ref(k, cid)[0] = SIM_FAULT_CLASS_NONE;
+    sim_loaded_fault_code_ref(k, cid)[0] = 0u32;
+    sim_loaded_fault_signal_ref(k, cid)[0] = 0u32;
+}
+
+export fn sim_store_loaded_fault_result(k: &SimKernel, cid: u32, fault_class: u32, fault_code: u32, fault_signal: u32) !void {
+    if cid >= 8u32 {
+        return error.InvalidState;
+    }
+    sim_loaded_result_kind_ref(k, cid)[0] = SIM_LOADED_RESULT_FAULT;
+    sim_loaded_exit_code_ref(k, cid)[0] = 0;
+    sim_loaded_fault_class_ref(k, cid)[0] = fault_class;
+    sim_loaded_fault_code_ref(k, cid)[0] = fault_code;
+    sim_loaded_fault_signal_ref(k, cid)[0] = fault_signal;
+}
+
+fn sim_loaded_min_va(hdr: &ImageHeader) u32 {
+    var min_va: u32 = hdr.code_va;
+    if hdr.rodata_size > 0u32 && hdr.rodata_va < min_va {
+        min_va = hdr.rodata_va;
+    }
+    if (hdr.data_size > 0u32 || hdr.bss_size > 0u32) && hdr.data_va < min_va {
+        min_va = hdr.data_va;
+    }
+    if hdr.entry_va < min_va {
+        min_va = hdr.entry_va;
+    }
+    return min_va;
+}
+
+fn sim_loaded_max_end(hdr: &ImageHeader) u32 {
+    var max_end: u32 = hdr.code_va + hdr.code_size;
+    const ro_end: u32 = hdr.rodata_va + hdr.rodata_size;
+    const data_end: u32 = hdr.data_va + hdr.data_size + hdr.bss_size;
+    if ro_end > max_end {
+        max_end = ro_end;
+    }
+    if data_end > max_end {
+        max_end = data_end;
+    }
+    return max_end;
+}
+
+fn sim_page_flags_for_image_range(hdr: &ImageHeader, page_start: u32, page_end: u32) u32 {
+    var flags: u32 = 0u32;
+    if sim_range_overlaps(hdr.code_va, hdr.code_size, page_start, page_end) != 0 {
+        flags = flags | PTE_R | PTE_X | PTE_U;
+    }
+    if sim_range_overlaps(hdr.rodata_va, hdr.rodata_size, page_start, page_end) != 0 {
+        flags = flags | PTE_R | PTE_U;
+    }
+    if sim_range_overlaps(hdr.data_va, hdr.data_size + hdr.bss_size, page_start, page_end) != 0 {
+        flags = flags | PTE_R | PTE_W | PTE_U;
+    }
+    return flags;
+}
+
+fn sim_read_u32_le(buf: &[byte], off: usize) u32 {
+    const b0: u32 = buf.ptr[off] as u32;
+    const b1: u32 = buf.ptr[off + 1usize] as u32;
+    const b2: u32 = buf.ptr[off + 2usize] as u32;
+    const b3: u32 = buf.ptr[off + 3usize] as u32;
+    return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
+}
+
+fn sim_read_u32_le_ptr(ptr: &byte) u32 {
+    const b0: u32 = ptr[0] as u32;
+    const b1: u32 = ptr[1] as u32;
+    const b2: u32 = ptr[2] as u32;
+    const b3: u32 = ptr[3] as u32;
+    return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
+}
+
+fn sim_write_u64_le(ptr: &byte, value: u64) void {
+    const b0_tmp: !byte = (value & 255u64) as! byte;
+    const b1_tmp: !byte = ((value >> 8) & 255u64) as! byte;
+    const b2_tmp: !byte = ((value >> 16) & 255u64) as! byte;
+    const b3_tmp: !byte = ((value >> 24) & 255u64) as! byte;
+    const b4_tmp: !byte = ((value >> 32) & 255u64) as! byte;
+    const b5_tmp: !byte = ((value >> 40) & 255u64) as! byte;
+    const b6_tmp: !byte = ((value >> 48) & 255u64) as! byte;
+    const b7_tmp: !byte = ((value >> 56) & 255u64) as! byte;
+    ptr[0] = b0_tmp.value;
+    ptr[1] = b1_tmp.value;
+    ptr[2] = b2_tmp.value;
+    ptr[3] = b3_tmp.value;
+    ptr[4] = b4_tmp.value;
+    ptr[5] = b5_tmp.value;
+    ptr[6] = b6_tmp.value;
+    ptr[7] = b7_tmp.value;
+}
+
+fn sim_write_u64_le_at(ptr: &byte, off: usize, value: u64) void {
+    const b0_tmp: !byte = (value & 255u64) as! byte;
+    const b1_tmp: !byte = ((value >> 8) & 255u64) as! byte;
+    const b2_tmp: !byte = ((value >> 16) & 255u64) as! byte;
+    const b3_tmp: !byte = ((value >> 24) & 255u64) as! byte;
+    const b4_tmp: !byte = ((value >> 32) & 255u64) as! byte;
+    const b5_tmp: !byte = ((value >> 40) & 255u64) as! byte;
+    const b6_tmp: !byte = ((value >> 48) & 255u64) as! byte;
+    const b7_tmp: !byte = ((value >> 56) & 255u64) as! byte;
+    ptr[off] = b0_tmp.value;
+    ptr[off + 1usize] = b1_tmp.value;
+    ptr[off + 2usize] = b2_tmp.value;
+    ptr[off + 3usize] = b3_tmp.value;
+    ptr[off + 4usize] = b4_tmp.value;
+    ptr[off + 5usize] = b5_tmp.value;
+    ptr[off + 6usize] = b6_tmp.value;
+    ptr[off + 7usize] = b7_tmp.value;
+}
+
+fn sim_write_u32_le_at(ptr: &byte, off: usize, value: u32) void {
+    const b0_tmp: !byte = (value & 255u32) as! byte;
+    const b1_tmp: !byte = ((value >> 8) & 255u32) as! byte;
+    const b2_tmp: !byte = ((value >> 16) & 255u32) as! byte;
+    const b3_tmp: !byte = ((value >> 24) & 255u32) as! byte;
+    ptr[off] = b0_tmp.value;
+    ptr[off + 1usize] = b1_tmp.value;
+    ptr[off + 2usize] = b2_tmp.value;
+    ptr[off + 3usize] = b3_tmp.value;
+}
+
+export fn sim_make_x86_64_call_gate_trampoline(entry_ptr: &const void) !&byte {
+    if entry_ptr == null {
+        return error.InvalidState;
+    }
+    std.cfg(std.target_arch == .ta_x86_64, {
+        const raw: *void = sys_mmap(
+            null as *void,
+            SIM_CALL_GATE_TRAMPOLINE_SIZE,
+            PROT_READ | PROT_WRITE,
+            MAP_PRIVATE | MAP_ANONYMOUS,
+            -1,
+            0
+        ) catch {
+            return error.NoMemory;
+        };
+        const page: &byte = raw as &byte;
+        page[0] = 72 as byte;   // movabs rax, imm64
+        page[1] = 184 as byte;
+        const entry_addr: usize = @usize_from_ptr(entry_ptr);
+        const entry_u64_tmp: !u64 = entry_addr as! u64;
+        sim_write_u64_le_at(page, 2usize, entry_u64_tmp.value);
+        // jmp rax（FF E0）：**尾跳**，不压返回地址、不动 rsp。
+        //
+        // 这里不能写 `call rax; ret`（FF D0 C3）：stub 自身是被 `uya_call0_i32` /
+        // `uya_call0_i32_stack` 用 `call` 进来的（入口 rsp % 16 == 8），再多压一层返回
+        // 地址会让 payload 入口变成 rsp % 16 == 0，整条调用链相对 SysV ABI 偏移 8 字节；
+        // 下游一旦用到 16 字节对齐的 SSE 访存（movaps）就 SIGSEGV。实测症状即
+        // microapp time 用例崩在 `syscall_handle_time` 的 `movaps %xmm0,(%rsp)`。
+        // 尾跳后 payload 的 `ret` 直接回到调用方，语义与原来的 call/ret 一致。
+        page[10] = 255 as byte; // jmp rax
+        page[11] = 224 as byte;
+        _ = try sys_mprotect(page as *void, SIM_CALL_GATE_TRAMPOLINE_SIZE, PROT_READ | PROT_EXEC);
+        return page;
+    }, {
+        return error.InvalidState;
+    })
+}
+
+export fn sim_free_x86_64_call_gate_trampoline(trampoline_ptr: &byte) !void {
+    if trampoline_ptr == null {
+        return;
+    }
+    std.cfg(std.target_arch == .ta_x86_64, {
+        _ = try sys_munmap(trampoline_ptr as *void, SIM_CALL_GATE_TRAMPOLINE_SIZE);
+    }, {})
+}
+
+export fn sim_make_aarch64_call_gate_trampoline(entry_ptr: &const void) !&byte {
+    if entry_ptr == null {
+        return error.InvalidState;
+    }
+    const raw: *void = sys_mmap(
+        null as *void,
+        SIM_CALL_GATE_TRAMPOLINE_SIZE,
+        PROT_READ | PROT_WRITE,
+        MAP_PRIVATE | MAP_ANONYMOUS,
+        -1,
+        0
+    ) catch {
+        return error.NoMemory;
+    };
+    const page: &byte = raw as &byte;
+    const entry_addr: usize = @usize_from_ptr(entry_ptr);
+    const entry_u64_tmp: !u64 = entry_addr as! u64;
+    const entry_u64: u64 = entry_u64_tmp.value;
+    const imm0_tmp: !u32 = (entry_u64 & 65535u64) as! u32;
+    const imm1_tmp: !u32 = ((entry_u64 >> 16) & 65535u64) as! u32;
+    const imm2_tmp: !u32 = ((entry_u64 >> 32) & 65535u64) as! u32;
+    const imm3_tmp: !u32 = ((entry_u64 >> 48) & 65535u64) as! u32;
+    const imm0_bits: u32 = imm0_tmp.value * 32u32;
+    const imm1_bits: u32 = imm1_tmp.value * 32u32;
+    const imm2_bits: u32 = imm2_tmp.value * 32u32;
+    const imm3_bits: u32 = imm3_tmp.value * 32u32;
+    sim_write_u32_le_at(page, 0usize, 0xD2800010u32 | imm0_bits);
+    sim_write_u32_le_at(page, 4usize, 0xF2A00010u32 | imm1_bits);
+    sim_write_u32_le_at(page, 8usize, 0xF2C00010u32 | imm2_bits);
+    sim_write_u32_le_at(page, 12usize, 0xF2E00010u32 | imm3_bits);
+    sim_write_u32_le_at(page, 16usize, 0xD63F0200u32);  // blr x16
+    sim_write_u32_le_at(page, 20usize, 0xD65F03C0u32);  // ret
+    _ = try sys_mprotect(page as *void, SIM_CALL_GATE_TRAMPOLINE_SIZE, PROT_READ | PROT_EXEC);
+    return page;
+}
+
+export fn sim_free_aarch64_call_gate_trampoline(trampoline_ptr: &byte) !void {
+    if trampoline_ptr == null {
+        return;
+    }
+    _ = try sys_munmap(trampoline_ptr as *void, SIM_CALL_GATE_TRAMPOLINE_SIZE);
+}
+
+fn sim_apply_hosted_call_gate_relative_relocs(k: &SimKernel, cid: u32, hdr: &ImageHeader, image_bytes: &[byte]) !void {
+    if k == null || hdr == null {
+        return error.InvalidState;
+    }
+    if hdr.reloc_count == 0u32 {
+        return;
+    }
+    if hdr.reloc_offset > image_bytes.len as u32 {
+        return error.ImgRelocInvalid;
+    }
+    const reloc_bytes: &[byte] = image_bytes[hdr.reloc_offset as usize: image_bytes.len];
+    const expected_len: u32 = hdr.reloc_count * 8u32;
+    if reloc_bytes.len < expected_len as usize {
+        return error.ImgRelocInvalid;
+    }
+    const min_va: u32 = sim_loaded_min_va(hdr);
+    const max_va: u32 = sim_loaded_max_end(hdr);
+    const pt: &PageTable = sim_pt_ref(k, cid);
+    var i: u32 = 0u32;
+    while i < hdr.reloc_count {
+        const off: usize = i as usize * 8usize;
+        const target_va: u32 = sim_read_u32_le(reloc_bytes, off);
+        const value_va: u32 = sim_read_u32_le(reloc_bytes, off + 4usize);
+        if target_va < hdr.data_va || target_va + 8u32 > hdr.data_va + hdr.data_size + hdr.bss_size {
+            return error.ImgRelocInvalid;
+        }
+        if value_va < min_va || value_va >= max_va {
+            return error.ImgRelocInvalid;
+        }
+        const target_ptr: &byte = try mmu_translate_ptr(pt, &k.host_ctx.pm, target_va, 8u32, ACCESS_W);
+        const value_ptr: &byte = try mmu_translate_ptr(pt, &k.host_ctx.pm, value_va, 1u32, ACCESS_R);
+        const value_host_addr: usize = @usize_from_ptr(value_ptr as &void);
+        const value_host_addr_tmp: !u64 = value_host_addr as! u64;
+        sim_write_u64_le(target_ptr, value_host_addr_tmp.value);
+        i = i + 1u32;
+    }
+}
+
+fn sim_patch_hosted_call_gate_bridge_dispatch(k: &SimKernel, cid: u32, hdr: &ImageHeader) !void {
+    if k == null || hdr == null || hdr.bridge_kind != ImageBridgeKind.ibk_call_gate {
+        return;
+    }
+    if hdr.data_size < 16u32 {
+        return;
+    }
+    const pt: &PageTable = sim_pt_ref(k, cid);
+    const dispatch_addr: usize = @usize_from_ptr(&sim_microapp_bridge_dispatch2 as &void);
+    const dispatch_u64_tmp: !u64 = dispatch_addr as! u64;
+    var cur_va: u32 = hdr.data_va;
+    const end_va: u32 = hdr.data_va + hdr.data_size;
+    while cur_va + 16u32 <= end_va {
+        const slot_ptr: &byte = try mmu_translate_ptr(pt, &k.host_ctx.pm, cur_va, 16u32, ACCESS_W);
+        if sim_read_u32_le_ptr(slot_ptr) == SIM_MICROAPP_BRIDGE_ABI_MAGIC &&
+           sim_read_u32_le_ptr(&slot_ptr[4]) == SIM_MICROAPP_BRIDGE_ABI_VERSION {
+            sim_write_u64_le_at(slot_ptr, SIM_MICROAPP_BRIDGE_DISPATCH2_OFFSET, dispatch_u64_tmp.value);
+            return;
+        }
+        cur_va = cur_va + 4u32;
+    }
+    return;
+}
+
+fn sim_zero_mapped_pages(pm: &PhysMem, first_ppn: u32, page_count: u32) !void {
+    var page_idx: u32 = 0u32;
+    while page_idx < page_count {
+        const base: &byte = try physmem_ptr(pm, first_ppn + page_idx, 0u32);
+        var off: u32 = 0u32;
+        while off < PAGE_SIZE {
+            base[off] = 0 as byte;
+            off = off + 1u32;
+        }
+        page_idx = page_idx + 1u32;
+    }
+}
+
+fn sim_copy_segment(pm: &PhysMem, first_ppn: u32, base_vpn: u32, src: &[byte], dst_va: u32) !void {
+    var i: u32 = 0u32;
+    while i < src.len as u32 {
+        const cur_va: u32 = dst_va + i;
+        const vpn: u32 = cur_va / PAGE_SIZE;
+        const off: u32 = cur_va & (PAGE_SIZE - 1u32);
+        const ppn: u32 = first_ppn + (vpn - base_vpn);
+        const dst: &byte = try physmem_ptr(pm, ppn, off);
+        dst[0] = src.ptr[i as usize];
+        i = i + 1u32;
+    }
+}
+
+fn sim_handle_result(k: &SimKernel, cid: u32, result: i32) !void {
+    if result == 0 {
+        try sim_reset_loaded_result(k, cid);
+        try scheduler_set_slot_state(&k.sched, cid, ContainerState.cs_ready);
+    } else if result > 0 {
+        if sim_loaded_result_kind_ref(k, cid)[0] == SIM_LOADED_RESULT_NONE {
+            try sim_store_loaded_exit_result(k, cid, result - 1);
+        }
+        try scheduler_set_slot_state(&k.sched, cid, ContainerState.cs_empty);
+    } else {
+        if sim_loaded_result_kind_ref(k, cid)[0] != SIM_LOADED_RESULT_FAULT {
+            const fault_code: u32 = try ((0 - result) as! u32);
+            try sim_store_loaded_fault_result(k, cid, SIM_FAULT_CLASS_UNKNOWN, fault_code, 0u32);
+        }
+        try scheduler_set_slot_state(&k.sched, cid, ContainerState.cs_crashed);
+        recovery_record_fault(&k.recovery, cid, k.total_ticks as i64, sim_loaded_fault_class_ref(k, cid)[0], sim_loaded_fault_code_ref(k, cid)[0], sim_loaded_fault_signal_ref(k, cid)[0]);
+        if recovery_should_restart(&k.recovery, cid) != 0 {
+            recovery_mark_restarted(&k.recovery, cid);
+            try scheduler_set_slot_state(&k.sched, cid, ContainerState.cs_ready);
+        } else {
+            try scheduler_set_slot_state(&k.sched, cid, ContainerState.cs_zombie);
+        }
+    }
+}
+
+// ── Register a container ──
+// fn_id: a positive integer identifying which callback to use (caller's dispatch)
+
+export fn sim_register(k: &SimKernel, cid: u32, priority: u32, fn_id: i32) !void {
+    if cid >= 0 && cid < 8 {
+        k.entry_fns[cid] = fn_id;
+        try scheduler_set_slot_state(&k.sched, cid, ContainerState.cs_ready);
+        try scheduler_set_priority(&k.sched, cid, priority);
+        return;
+    }
+    return error.InvalidState;
+}
+
+// ── Issue syscall from container context ──
+
+export fn sim_syscall(k: &SimKernel, cid: u32, num: u32, arg1: u32, arg2: u32) !u32 {
+    return try syscall_dispatch(&k.host_ctx, cid, num, arg1, arg2);
+}
+
+export fn sim_load_image(k: &SimKernel, cid: u32, priority: u32, image_bytes: &[byte]) !void {
+    if cid >= 8u32 {
+        return error.InvalidState;
+    }
+    if k.host_ctx.pm.base == null {
+        return error.NoMemory;
+    }
+    const hdr: ImageHeader = try image_validate(image_bytes);
+    try kernel_required_caps_validate(hdr.required_caps);
+    const min_va: u32 = sim_loaded_min_va(&hdr);
+    const max_end: u32 = sim_loaded_max_end(&hdr);
+    const base_vpn: u32 = min_va / PAGE_SIZE;
+    const end_vpn: u32 = (max_end - 1u32) / PAGE_SIZE;
+    const pages_needed: u32 = end_vpn - base_vpn + 1u32;
+    var stack_pages: u32 = 0u32;
+    var stack_base_vpn: u32 = 0u32;
+    if hdr.stack_size_hint > 0u32 {
+        stack_pages = (hdr.stack_size_hint + PAGE_SIZE - 1u32) / PAGE_SIZE;
+        if stack_pages == 0u32 || stack_pages >= PAGE_TABLE_ENTRIES {
+            return error.NoMemory;
+        }
+        stack_base_vpn = PAGE_TABLE_ENTRIES - stack_pages;
+        if stack_base_vpn <= base_vpn + pages_needed {
+            return error.NoMemory;
+        }
+    }
+    var first_ppn: u32 = 0u32;
+    var page_idx: u32 = 0u32;
+    while page_idx < pages_needed {
+        const ppn: u32 = try page_alloc(&k.host_ctx.pool);
+        if page_idx == 0u32 {
+            first_ppn = ppn;
+        }
+        page_idx = page_idx + 1u32;
+    }
+    try sim_zero_mapped_pages(&k.host_ctx.pm, first_ppn, pages_needed);
+    const pt: &PageTable = sim_pt_ref(k, cid);
+    pt_init(pt);
+    page_idx = 0u32;
+    while page_idx < pages_needed {
+        const page_start: u32 = (base_vpn + page_idx) * PAGE_SIZE;
+        const page_end: u32 = page_start + PAGE_SIZE;
+        var flags: u32 = sim_page_flags_for_image_range(&hdr, page_start, page_end);
+        if flags == 0u32 {
+            flags = PTE_R | PTE_U;
+        }
+        try pt_map(pt, base_vpn + page_idx, first_ppn + page_idx, flags);
+        page_idx = page_idx + 1u32;
+    }
+    var stack_first_ppn: u32 = 0u32;
+    page_idx = 0u32;
+    while page_idx < stack_pages {
+        const ppn: u32 = try page_alloc(&k.host_ctx.pool);
+        if page_idx == 0u32 {
+            stack_first_ppn = ppn;
+        }
+        const base: &byte = try physmem_ptr(&k.host_ctx.pm, ppn, 0u32);
+        var off: u32 = 0u32;
+        while off < PAGE_SIZE {
+            base[off] = 0 as byte;
+            off = off + 1u32;
+        }
+        try pt_map(pt, stack_base_vpn + page_idx, ppn, PTE_R | PTE_W | PTE_U);
+        page_idx = page_idx + 1u32;
+    }
+    const code_slice: &[byte] = image_bytes[hdr.code_offset as usize: hdr.code_size as usize];
+    try sim_copy_segment(&k.host_ctx.pm, first_ppn, base_vpn, code_slice, hdr.code_va);
+    if hdr.rodata_size > 0u32 {
+        const ro_slice: &[byte] = image_bytes[hdr.rodata_offset as usize: hdr.rodata_size as usize];
+        try sim_copy_segment(&k.host_ctx.pm, first_ppn, base_vpn, ro_slice, hdr.rodata_va);
+    }
+    if hdr.data_size > 0u32 {
+        const data_slice: &[byte] = image_bytes[hdr.data_offset as usize: hdr.data_size as usize];
+        try sim_copy_segment(&k.host_ctx.pm, first_ppn, base_vpn, data_slice, hdr.data_va);
+    }
+    if hdr.bridge_kind == ImageBridgeKind.ibk_call_gate &&
+        (hdr.target_arch == ImageTargetArch.ita_x86_64 || hdr.target_arch == ImageTargetArch.ita_aarch64) {
+        try sim_apply_hosted_call_gate_relative_relocs(k, cid, &hdr, image_bytes);
+        try sim_patch_hosted_call_gate_bridge_dispatch(k, cid, &hdr);
+    }
+    try kernel_host_apply_required_caps(&k.host_ctx, cid, hdr.required_caps);
+    if mmu_debug_enabled() != 0 {
+        // 调试探针：显示入口地址在当前页表里的翻译结果，便于确认 MMU 路径是否接通。
+        _ = try mmu_translate_ptr(pt, &k.host_ctx.pm, hdr.entry_va, 4u32, ACCESS_X);
+    }
+    sim_loaded_header_ref(k, cid)[0] = hdr;
+    sim_loaded_ppn_ref(k, cid)[0] = first_ppn;
+    sim_loaded_valid_ref(k, cid)[0] = 1u32;
+    sim_loaded_base_vpn_ref(k, cid)[0] = base_vpn;
+    sim_loaded_page_count_ref(k, cid)[0] = pages_needed;
+    try sim_reset_loaded_result(k, cid);
+    try sim_reset_loaded_trap_state(k, cid);
+    sim_loaded_bridge_dispatch_count_ref(k, cid)[0] = 0u32;
+    k.host_ctx.heap_base_vpn[cid] = base_vpn + pages_needed;
+    k.host_ctx.heap_next_vpn[cid] = base_vpn + pages_needed;
+    k.host_ctx.stack_base_vpn[cid] = stack_base_vpn;
+    k.host_ctx.stack_page_count[cid] = stack_pages;
+    sim_entry_fn_ref(k, cid)[0] = -1;
+    try scheduler_set_slot_state(&k.sched, cid, ContainerState.cs_ready);
+    try scheduler_set_priority(&k.sched, cid, priority);
+}
+
+fn sim_rv32_sign_extend_12(imm12: u32) i32 {
+    if (imm12 & 2048u32) != 0u32 {
+        const neg_tmp: !i32 = (imm12 | 4294963200u32) as! i32;
+        return neg_tmp.value;
+    }
+    const pos_tmp: !i32 = imm12 as! i32;
+    return pos_tmp.value;
+}
+
+fn sim_exec_loaded_rv32_trap(k: &SimKernel, cid: u32, hdr: &ImageHeader) !i32 {
+    if k == null || hdr == null {
+        return error.InvalidState;
+    }
+    var pc: u32 = sim_loaded_trap_pc_ref(k, cid)[0];
+    if pc == 0u32 {
+        pc = hdr.entry_va;
+    }
+    var a0: u32 = sim_loaded_trap_a0_ref(k, cid)[0];
+    var a1: u32 = sim_loaded_trap_a1_ref(k, cid)[0];
+    var a7: u32 = sim_loaded_trap_a7_ref(k, cid)[0];
+    var steps: u32 = 0u32;
+    const code_end: u32 = hdr.code_va + hdr.code_size;
+    while steps < 256u32 {
+        if pc < hdr.code_va || pc + 4u32 > code_end {
+            return error.ImgInsnDenied;
+        }
+        const insn_ptr: &byte = try mmu_translate_ptr(sim_pt_ref(k, cid), &k.host_ctx.pm, pc, 4u32, ACCESS_X);
+        const insn: u32 = (insn_ptr[0] as u32) | ((insn_ptr[1] as u32) << 8) | ((insn_ptr[2] as u32) << 16) | ((insn_ptr[3] as u32) << 24);
+        const opcode: u32 = insn & 127u32;
+        if opcode == RV32_OPCODE_OP_IMM {
+            const funct3: u32 = (insn >> 12) & 7u32;
+            const rs1: u32 = (insn >> 15) & 31u32;
+            const rd: u32 = (insn >> 7) & 31u32;
+            if funct3 != RV32_FUNCT3_ADDI || rs1 != 0u32 {
+                return error.ImgInsnDenied;
+            }
+            const imm: i32 = sim_rv32_sign_extend_12((insn >> 20) & 4095u32);
+            const imm_tmp: !u32 = imm as! u32;
+            if rd == RV32_REG_A0 {
+                a0 = imm_tmp.value;
+            } else if rd == RV32_REG_A1 {
+                a1 = imm_tmp.value;
+            } else if rd == RV32_REG_A7 {
+                a7 = imm_tmp.value;
+            } else if rd != 0u32 {
+                return error.ImgInsnDenied;
+            }
+            pc = pc + 4u32;
+        } else if insn == RV32_INSN_ECALL {
+            try sim_bind_bridge_dispatch(k, cid);
+            const ret_raw: i64 = sim_microapp_bridge_dispatch2(a7 as i64, a0 as i64, a1 as i64);
+            sim_unbind_bridge_dispatch();
+            if ret_raw < 0i64 {
+                const err_tmp: !u32 = (0i64 - ret_raw) as! u32;
+                if err_tmp.error_id != 0u32 {
+                    return error.InvalidState;
+                }
+                a0 = 4294967295u32;
+                a1 = err_tmp.value;
+            } else {
+                const ret_tmp: !u32 = ret_raw as! u32;
+                if ret_tmp.error_id != 0u32 {
+                    return error.InvalidState;
+                }
+                a0 = ret_tmp.value;
+                a1 = 0u32;
+            }
+            pc = pc + 4u32;
+            if a7 == SYS_YIELD && a1 == 0u32 {
+                sim_loaded_trap_pc_ref(k, cid)[0] = pc;
+                sim_loaded_trap_a0_ref(k, cid)[0] = a0;
+                sim_loaded_trap_a1_ref(k, cid)[0] = a1;
+                sim_loaded_trap_a7_ref(k, cid)[0] = a7;
+                return 0;
+            }
+        } else if insn == RV32_INSN_EBREAK {
+            try sim_store_loaded_exit_result(k, cid, a0 as i32);
+            try sim_reset_loaded_trap_state(k, cid);
+            return 1;
+        } else {
+            return error.ImgInsnDenied;
+        }
+        steps = steps + 1u32;
+    }
+    return error.InvalidState;
+}
+
+export fn sim_exec_loaded(k: &SimKernel, cid: u32) !i32 {
+    if cid >= 8u32 {
+        return error.InvalidState;
+    }
+    if sim_loaded_valid_ref(k, cid)[0] == 0u32 {
+        return error.InvalidState;
+    }
+    const hdr: ImageHeader = sim_loaded_header_ref(k, cid)[0];
+    const code_off: u32 = hdr.entry_va;
+    const pt: &PageTable = sim_pt_ref(k, cid);
+    const insn_ptr: &byte = try mmu_translate_ptr(pt, &k.host_ctx.pm, code_off, 4u32, ACCESS_X);
+    const insn: u32 = (insn_ptr[0] as u32) | ((insn_ptr[1] as u32) << 8) | ((insn_ptr[2] as u32) << 16) | ((insn_ptr[3] as u32) << 24);
+    if hdr.bridge_kind == ImageBridgeKind.ibk_trap {
+        if hdr.target_arch == ImageTargetArch.ita_rv32 {
+            if hdr.code_size > 4u32 {
+                return try sim_exec_loaded_rv32_trap(k, cid, &hdr);
+            }
+            if insn != 115u32 {
+                return error.ImgInsnDenied;
+            }
+        }
+    } else if hdr.target_arch == ImageTargetArch.ita_x86_64 && hdr.bridge_kind == ImageBridgeKind.ibk_call_gate {
+        const entry_ptr: &byte = try mmu_translate_ptr(pt, &k.host_ctx.pm, hdr.entry_va, 1u32, ACCESS_X);
+        var call_ptr: &byte = entry_ptr;
+        var trampoline_ptr: &byte = sim_make_x86_64_call_gate_trampoline(entry_ptr as &const void) catch {
+            null as &byte;
+        };
+        if trampoline_ptr != null {
+            call_ptr = trampoline_ptr;
+        }
+        var exit_code: i32 = 0;
+        try sim_bind_bridge_dispatch(k, cid);
+        if k.host_ctx.stack_page_count[cid] > 0u32 {
+            const stack_top_va: u32 = (k.host_ctx.stack_base_vpn[cid] + k.host_ctx.stack_page_count[cid]) * PAGE_SIZE;
+            const stack_probe_ptr: &byte = try mmu_translate_ptr(pt, &k.host_ctx.pm, stack_top_va - 16u32, 16u32, ACCESS_W);
+            const stack_top_addr: usize = @usize_from_ptr(stack_probe_ptr as &void) + 16usize;
+            const stack_top_ptr: &byte = @ptr_from_usize(stack_top_addr) as &byte;
+            exit_code = uya_call0_i32_stack(call_ptr as &void, stack_top_ptr as &void);
+        } else {
+            exit_code = uya_call0_i32(call_ptr as &void);
+        }
+        sim_unbind_bridge_dispatch();
+        if trampoline_ptr != null {
+            sim_free_x86_64_call_gate_trampoline(trampoline_ptr) catch {};
+        }
+        try sim_store_loaded_exit_result(k, cid, exit_code);
+        return 1;
+    } else if hdr.target_arch == ImageTargetArch.ita_aarch64 && hdr.bridge_kind == ImageBridgeKind.ibk_call_gate {
+        std.cfg(std.target_arch == .ta_arm64, {
+            const entry_ptr: &byte = try mmu_translate_ptr(pt, &k.host_ctx.pm, hdr.entry_va, 1u32, ACCESS_X);
+            var call_ptr: &byte = entry_ptr;
+            var trampoline_ptr: &byte = sim_make_aarch64_call_gate_trampoline(entry_ptr as &const void) catch {
+                null as &byte;
+            };
+            if trampoline_ptr != null {
+                call_ptr = trampoline_ptr;
+            }
+            var exit_code: i32 = 0;
+            try sim_bind_bridge_dispatch(k, cid);
+            if k.host_ctx.stack_page_count[cid] > 0u32 {
+                const stack_top_va: u32 = (k.host_ctx.stack_base_vpn[cid] + k.host_ctx.stack_page_count[cid]) * PAGE_SIZE;
+                const stack_probe_ptr: &byte = try mmu_translate_ptr(pt, &k.host_ctx.pm, stack_top_va - 16u32, 16u32, ACCESS_W);
+                const stack_top_addr: usize = @usize_from_ptr(stack_probe_ptr as &void) + 16usize;
+                const stack_top_ptr: &byte = @ptr_from_usize(stack_top_addr) as &byte;
+                exit_code = uya_call0_i32_stack(call_ptr as &void, stack_top_ptr as &void);
+            } else {
+                exit_code = uya_call0_i32(call_ptr as &void);
+            }
+            sim_unbind_bridge_dispatch();
+            if trampoline_ptr != null {
+                sim_free_aarch64_call_gate_trampoline(trampoline_ptr) catch {};
+            }
+            try sim_store_loaded_exit_result(k, cid, exit_code);
+            return 1;
+        }, {})
+    }
+    if hdr.rodata_size > 0u32 {
+        const rodata_off: u32 = hdr.rodata_va;
+        // rodata 可能跨页；逐页验证映射存在，而不是一次性翻译整个范围。
+        var rodata_rem: u32 = hdr.rodata_size;
+        var rodata_cur: u32 = rodata_off;
+        while rodata_rem > 0u32 {
+            const page_rem: u32 = PAGE_SIZE - (rodata_cur & (PAGE_SIZE - 1u32));
+            var check_size: u32 = page_rem;
+            if rodata_rem < page_rem {
+                check_size = rodata_rem;
+            }
+            _ = try mmu_translate_ptr(sim_pt_ref(k, cid), &k.host_ctx.pm, rodata_cur, check_size, ACCESS_R);
+            rodata_cur = rodata_cur + check_size;
+            rodata_rem = rodata_rem - check_size;
+        }
+    }
+    if hdr.bridge_kind == ImageBridgeKind.ibk_trap {
+        try sim_store_loaded_validated_result(k, cid);
+    } else if sim_loaded_result_kind_ref(k, cid)[0] == SIM_LOADED_RESULT_NONE {
+        try sim_store_loaded_unwired_result(k, cid);
+    }
+    return 1;
+}
+
+export fn sim_tick_loaded(k: &SimKernel) !u32 {
+    const cid: u32 = try scheduler_pick_next_rr(&k.sched);
+    if cid >= 8u32 {
+        return error.InvalidState;
+    }
+    try scheduler_set_slot_state(&k.sched, cid, ContainerState.cs_running);
+    const ctx: &SimContainerCtx = sim_ctx_ref(k, cid);
+    ctx.tick = ctx.tick + 1u32;
+    k.total_ticks = k.total_ticks + 1u32;
+    const result: i32 = sim_exec_loaded(k, cid) catch |err| {
+        const err_id: u32 = @error_id(err);
+        const fault_code: u32 = sim_fault_code_from_error_id(err_id);
+        if fault_code == 0u32 {
+            return err;
+        }
+        try sim_store_loaded_fault_result(k, cid, SIM_FAULT_CLASS_UNKNOWN, fault_code, 0u32);
+        try sim_handle_result(k, cid, 0 - 1);
+        return cid;
+    };
+    try sim_handle_result(k, cid, result);
+    return cid;
+}
+
+// ── Run one tick: pick next container, call it, handle result ──
+// Returns: cid of container that ran, or error if none runnable
+
+export fn sim_tick(k: &SimKernel, call_result: &i32) !u32 {
+    // Pick next runnable container
+    const cid: u32 = try scheduler_pick_next_rr(&k.sched);
+
+    if cid >= 0 && cid < 8 {
+        // Mark as running
+        try scheduler_set_slot_state(&k.sched, cid, ContainerState.cs_running);
+        const ctx: &SimContainerCtx = sim_ctx_ref(k, cid);
+        ctx.tick = ctx.tick + 1;
+
+        // The actual "call" is done by the test harness reading entry_fns[cid]
+        // and calling the appropriate function. Here we just return cid;
+        // the caller provides the result via call_result.
+
+        k.total_ticks = k.total_ticks + 1;
+
+        const result: i32 = call_result[0];
+
+        try sim_handle_result(k, cid, result);
+
+        return cid;
+    }
+    return error.InvalidState;
+}
+
+// ── Run N ticks with a simple callback dispatch ──
+// run_fn: function that takes (cid, tick, fn_id) and returns result code
+
+export struct SimRunResult {
+    ticks_run: u32,
+    last_cid: u32,
+}
