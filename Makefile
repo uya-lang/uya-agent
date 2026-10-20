@@ -98,6 +98,27 @@ AGENT_C_PROTOS    := $(CURDIR)/src/cshim/uya_agent_libc_protos.h
 AGENT_CFLAGS_BASE ?= -std=c99 -O0 -fno-builtin
 AGENT_CFLAGS      := $(AGENT_CFLAGS_BASE) -include $(AGENT_C_PROTOS)
 
+# ---- Windows 交叉编译（`make windows`）----
+# ZIG：交叉编译用 zig cc（clang 内核 + 自带 MinGW 头与 libc，不用装 MinGW、不用 wine）。
+# 找不到 `zig` 时退到本机那个固定路径（与 uya-term 的 Makefile 同一处约定）。
+ZIG        ?= $(shell command -v zig 2>/dev/null || echo /home/winger/zig-x86_64-linux-0.16.0/zig)
+WIN_OUT    := build/uya-agent.exe
+WIN_CACHE  := $(CURDIR)/build/win/uyacache
+WIN_INC    := $(CURDIR)/src/cshim/win32_agent.h
+# ⚠ `-target` 必须挂在 **CC** 上而不是只放 CFLAGS：生成的 Makefile 里链接行是
+# `$(CC) $(OBJS) -o $(UYA_OUT) $(LDFLAGS) -lm`，**CFLAGS 不进链接行** —— 于是 zig cc
+# 会按宿主（Linux）去找 `-lws2_32`，报 "unable to find dynamic system library
+# 'ws2_32'"。这与编译器自己 `CC_TARGET_FLAGS` 的做法一致（它也把 `-target` 拼进 cc）。
+WIN_CC     := $(ZIG) cc -target x86_64-windows-gnu
+WIN_CFLAGS := -std=c99 -O0 -fno-builtin -I.
+WIN_LDFLAGS:= -lws2_32
+WIN_JOBS   ?= $(shell nproc 2>/dev/null || echo 4)
+# 用哪个编译器生成 C 目标。默认与 Linux 构建同一个 `$(UYA)`；**可覆盖**是因为
+# 那个二进制偶尔会处在「编译器自身正在改」的状态（实测有过一次连
+# `lib/std/async.uya` 都解析不过），而同一棵树的 `bin/uya-hosted` 能完整跑通 ——
+# 那时 `make windows WIN_UYA=…/uya-hosted` 不必等编译器修好。只影响**生成**这一步。
+WIN_UYA    ?= $(UYA)
+
 # 为什么用行内赋值而不是 export（同踩坑 90 那条 LDFLAGS 的教训）：export 会漏进**所有**
 # recipe 的环境，包括 `make selftest`（它内部 fork bash、由 agent 自己去 `uya build` 编
 # 东西）—— 那等于把本仓的原型头强加给**别人**的构建。所以只加在编译那一条命令上。
@@ -115,6 +136,7 @@ AGENT_CFLAGS      := $(AGENT_CFLAGS_BASE) -include $(AGENT_C_PROTOS)
 #      数文件：`make -s print-src | wc -w`。
 # 留在 src/ 根的 tools.uya 是 P50 起就不在构建里的已知死代码，故意不列。
 SRC := src/foundation/bufx.uya src/foundation/jsonx.uya src/foundation/yamlcfg.uya \
+       src/term/wincon.uya \
        src/rt/rtloop.uya src/rt/rtio.uya \
        src/net/tlspin.uya src/net/proxyx.uya src/net/rsav.uya src/net/x509min.uya src/net/cachain.uya \
        src/net/httpc.uya src/net/httpsrv.uya src/net/httpstream.uya src/net/ahttp.uya src/net/llm.uya src/net/allm.uya src/net/retryx.uya src/net/sse.uya src/net/webx.uya \
@@ -129,7 +151,7 @@ SRC := src/foundation/bufx.uya src/foundation/jsonx.uya src/foundation/yamlcfg.u
        src/pm/pm_repo.uya src/pm/pm_store.uya src/pm/pm_ingest.uya src/pm/pm_seed.uya src/pm/pm_digest.uya \
        src/vcs/gitx.uya src/vcs/worktreex.uya \
        src/web/ttyemu.uya src/web/dshauth.uya src/web/dshget.uya src/web/webui.uya src/web/wsess.uya src/web/dwhchild.uya src/web/dwhmodel.uya src/web/dwhschema.uya src/web/dwhset.uya src/web/whost.uya src/web/websrv.uya src/web/webhttp.uya src/web/webpump.uya \
-       src/media/clipx.uya src/media/clipw.uya src/media/clipt.uya src/media/cliphelp.uya src/media/clip.uya src/media/imgx.uya src/media/imgz.uya \
+       src/media/clipx.uya src/media/clipw.uya src/media/clipt.uya src/media/cliphelp.uya src/media/clipwin.uya src/media/clip.uya src/media/imgx.uya src/media/imgz.uya \
        src/selftest/selftest.uya src/selftest/shellselftest.uya src/selftest/sigselftest.uya src/selftest/tuiselftest.uya \
        src/selftest/st_async_rt.uya src/selftest/st_async_io.uya src/selftest/st_async_keys.uya src/selftest/st_async_net.uya src/selftest/st_async_turn.uya src/selftest/st_async_conc.uya src/selftest/st_core.uya src/selftest/st_mock_server.uya src/selftest/st_round_driver.uya src/selftest/st_turn_retry.uya src/selftest/st_bg_notify.uya src/selftest/st_tty_sse.uya src/selftest/st_sessions.uya src/selftest/st_read_window.uya src/selftest/st_view_watch.uya src/selftest/st_responses.uya src/selftest/st_stats_ctx.uya src/selftest/st_ctxfit.uya src/selftest/st_title.uya src/selftest/st_tasks_ws.uya src/selftest/st_vision.uya src/selftest/st_goal_worktree.uya src/selftest/st_goal_sess.uya src/selftest/st_todo_resume.uya src/selftest/st_pm.uya src/selftest/st_pm2.uya src/selftest/st_mcp.uya \
        src/selftest/tuis_core.uya src/selftest/tuis_title_pty.uya src/selftest/tuis_exit_cmd.uya src/selftest/tuis_diff_scroll.uya src/selftest/tuis_title_ask.uya src/selftest/tuis_sessions_big.uya src/selftest/tuis_tail.uya src/selftest/tuis_marquee_row.uya src/selftest/tuis_sel.uya src/selftest/tuis_mem.uya src/selftest/tuis_mem_menu.uya src/selftest/tuis_queue.uya \
@@ -148,7 +170,7 @@ export UYA_ROOT
 export UYA_SPLIT_C_DIR := $(CURDIR)/build/uyacache
 
 # 行宽豁免：一条 .PHONY 就是一张全仓目标清单，拆行反而看不清哪条丢了
-.PHONY: all check wire-schema wire-probe wire-probe-real dsh-web-check dsh-settings-check print-src print-cflags build link-audit selftest codegen-audit doc-audit lint-size lint-size-all doc-cover ui-audit probe e2e e2e-config e2e-exec e2e-accept-nudge e2e-retry e2e-config-flags e2e-title e2e-title-cmd e2e-title-auto e2e-mouse e2e-api e2e-steps e2e-permission e2e-sandbox e2e-tasks e2e-tasks-resume e2e-goal e2e-memory e2e-memory-live e2e-sessions e2e-resume-big e2e-diff e2e-ws e2e-model e2e-model-save e2e-model-route e2e-provider e2e-ctxwindow e2e-inputimage e2e-worktree e2e-watch e2e-watch-pick e2e-dsh e2e-portable e2e-proxy p30-check tui-demo tui-selftest web-selftest sess-selftest diff-selftest model-selftest panel-selftest clean shell-selftest pm-selftest mcp-selftest proxy-selftest notify-selftest
+.PHONY: all check wire-schema wire-probe wire-probe-real dsh-web-check dsh-settings-check print-src print-cflags build link-audit selftest codegen-audit doc-audit lint-size lint-size-all doc-cover ui-audit probe e2e e2e-config e2e-exec e2e-accept-nudge e2e-retry e2e-config-flags e2e-title e2e-title-cmd e2e-title-auto e2e-mouse e2e-api e2e-steps e2e-permission e2e-sandbox e2e-tasks e2e-tasks-resume e2e-goal e2e-memory e2e-memory-live e2e-sessions e2e-resume-big e2e-diff e2e-ws e2e-model e2e-model-save e2e-model-route e2e-provider e2e-ctxwindow e2e-inputimage e2e-worktree e2e-watch e2e-watch-pick e2e-dsh e2e-portable e2e-proxy p30-check tui-demo tui-selftest web-selftest sess-selftest diff-selftest model-selftest panel-selftest clean shell-selftest pm-selftest mcp-selftest proxy-selftest notify-selftest windows win-check
 
 all: build
 
@@ -173,6 +195,70 @@ build:
 ifeq ($(STATIC),1)
 	@$(MAKE) --no-print-directory link-audit
 endif
+
+# Windows 交叉编译（**不需要 Windows 机器**，也不需要装 MinGW）。
+#
+# 用 **单 TU**（`--no-split-c`）而不是 split-C，原因只有一个但很硬：
+# 生成物 `uya_part1_types.h` 在 Windows 目标下**带定义**（`uya_windows_syscall` 那一整套
+# Win32 桥、以及 `chdir` / `fork` / `stat` / `getpid` 这些 POSIX 垫片），而 split-C 的
+# **每一个 .c 都 include 它** ⇒ 200 多个 TU 各定义一份，链接期 lld-link 报一屏
+# `duplicate symbol: chdir`。zig 的 COFF 链接器又不认 `--allow-multiple-definition`，
+# 所以只能从生成方式上避开。代价是编一个大文件（35 MB），可接受。
+#
+# 生成后要修两处（**都不碰源码、不碰编译器**）：
+#   1) `_rotr64` 与 MinGW 的 <stdlib.h> 撞名：std 的 tls/crypto/sha384 自己定义了
+#      `_rotr64(u64,u32)`，MinGW 声明的是 `_rotr64(u64,int)` —— 同一个 TU 里两个原型，
+#      clang 报 conflicting types。把生成物里的这个符号改个名即可。
+#   2) 一处全局初始化顺序：`g_rtio_abort_frame_i`（接口值）排在它要装箱的
+#      `g_rtio_abort_frame` 之前，C 里那是「用还没初始化的对象取地址」，clang 报
+#      undeclared identifier。把两行交换即可（**只动生成物**）。
+#   3) 有符号左移溢出：codegen 把 `u64` 常量拆成高低两半时写成
+#      `((int64_t)(uint32_t)HI << 32)`，HI >= 0x80000000 就是**有符号左移溢出**
+#      （C 里的未定义行为）。宿主 GCC 不插桩所以一直没暴露，而 zig cc（clang）默认
+#      开 UBSan ⇒ 真机上**启动即 panic**
+#      （实测 `left shift of 3421674724 by 32 places cannot be represented in
+#      type 'int64_t'`）。把 `(int64_t)` 换成 `(uint64_t)` 即可：值相同、无 UB。
+#
+# 为什么需要 `-include src/cshim/win32_agent.h`：Uya 的 `extern "libc" fn` **不生成
+# C 原型**，而 zig cc（clang）在 C99 下把未声明调用当**错误**（宿主 GCC 只当警告）。
+#
+# ⚠ `-target` 必须挂在 **CC** 上而不是只放 CFLAGS：生成的链接行不含 CFLAGS，
+# 否则 zig cc 会按宿主 Linux 去找 `-lws2_32`。
+windows:
+	@mkdir -p build/win/single
+	@echo "== windows 1/3：生成单 TU C 目标（TARGET_OS=windows）"
+	@rm -f build/win/single/agent.c
+	@TARGET_OS=windows TARGET_ARCH=x86_64 TARGET_TRIPLE=x86_64-windows-gnu \
+		$(WIN_UYA) build --no-split-c --c99 $(SRC) \
+		-o build/win/single/agent.c > build/win/gen.log 2>&1 || { \
+			echo "windows: 生成失败（完整日志 build/win/gen.log）："; \
+			tail -20 build/win/gen.log; exit 1; }
+	@echo "== windows 2/3：修生成物（_rotr64 撞名 + 一处初始化顺序）"
+	@sed -i 's/\b_rotr64\b/uya_agent_rotr64/g' build/win/single/agent.c
+	@python3 testdata/win_fix_init_order.py build/win/single/agent.c
+	@python3 testdata/win_fix_shift_ub.py build/win/single/agent.c
+	@echo "== windows 3/3：zig cc 交叉编译（$(WIN_CC)）"
+	@$(WIN_CC) $(WIN_CFLAGS) -include $(WIN_INC) \
+		build/win/single/agent.c src/cshim/win32_agent.c \
+		-o $(WIN_OUT) $(WIN_LDFLAGS) > build/win/cc.log 2>&1 || { \
+			echo "windows: 编译失败（完整日志 build/win/cc.log）："; \
+			grep -E 'error:' build/win/cc.log | head -20; exit 1; }
+	@echo "windows: 产物 $(WIN_OUT)"
+	@ls -l $(WIN_OUT)
+	@file $(WIN_OUT)
+
+# Windows 产物的**形状**判据（不需要 Windows 机器）：PE32+、x86-64、控制台子系统。
+# 真机行为（编码 / 按键 / 剪贴板 / 退出码）在 dockur/windows 的 win10 客户机里验，
+# 见 testdata/win_guest_verify.sh。
+win-check:
+	@if [ ! -f $(WIN_OUT) ]; then echo "win-check: 先 make windows"; exit 1; fi; \
+	if ! file $(WIN_OUT) | grep -q 'PE32+'; then \
+		echo "win-check: 不是 PE32+"; file $(WIN_OUT); exit 1; fi; \
+	if ! file $(WIN_OUT) | grep -q 'x86-64'; then \
+		echo "win-check: 不是 x86-64"; file $(WIN_OUT); exit 1; fi; \
+	if ! file $(WIN_OUT) | grep -q 'console'; then \
+		echo "win-check: 不是控制台子系统"; file $(WIN_OUT); exit 1; fi; \
+	echo "win-check: 通过（PE32+ x86-64 控制台程序）"
 
 # 静态链接审计：产物必须**没有** PT_INTERP、没有 NEEDED 项。两条都走 readelf 的
 # 结构性 token（`INTERP` / `(NEEDED)`），不解析本机化后的散文（中文环境下 readelf

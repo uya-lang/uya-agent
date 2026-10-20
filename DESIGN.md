@@ -9489,3 +9489,130 @@ steer 收件箱有货 → 队列空。任何一条命中都**一次都不投**�
 把队列收干净（块回到 0 行），demo 出口不把状态留给下一个调用方。判据是
 `make tui-demo` 的输出末屏（需要精确对齐时用 `--tui-demo 160x40`，非 TTY 下画布
 不随终端变，见 §11.3）。
+
+### 19.30 P108：Windows 产物（`make windows`）+ 5522 在 Windows 上的落地
+
+**目标（用户原话）**：「实现编译 windows 版本，并实现 windows 版本直接支持 5522 协议」，
+随后收窄为「在 dockur/windows win10 里验证，并保证在 windows 的 cmd、powershell 能直接使用」。
+
+**先说结论**：`make windows` 交叉编译出 `build/uya-agent.exe`（PE32+ 控制台程序），
+在 Win10 客户机的 **cmd 与 PowerShell 里都直接可用** —— 中文不乱码、按键能进 TUI 与
+行编辑器、`Ctrl+V` / `/paste` 能读到系统剪贴板的文本与图片。
+
+#### 19.30.1 「直接支持 5522」的口径
+
+Windows 的**控制台宿主（conhost，cmd.exe / PowerShell 都在里面）不实现 OSC 5522**：
+`DECRQM ESC[?5522$p` 零应答，与 deepin-terminal / QTermWidget 那一档**完全同款**
+（见 §13.2 与踩坑 144）。所以「Windows 上按 Ctrl+V 要能贴」不能被翻译成
+「把 5522 客户端移植过去」——那条腿在这些宿主里永远返回 `UNSUPPORTED`。
+
+落地成两条腿，与既有仲裁层（`media/clip`）的优先级一致：
+
+| # | 腿 | 文件 | 什么时候赢 |
+|---|---|---|---|
+| 1 | 终端协议（OSC 5522） | `media/clipt` + `term/oscin` | 宿主真的应答探测（kitty / ghostty / Windows Terminal 一类）。**代码一个字没改**，只是 Windows 上第一次有人把它跑起来 |
+| 2 | **Win32 系统剪贴板** | `media/clipwin` + `cshim/win32_agent.c` | 上面那条答「不支持」之后（cmd / PowerShell 的常态） |
+
+不变量与取舍（都写在两个新文件的文件头里）：
+
+* **先图后文**，与另外三条来源同款：截图工具常同时写一份「路径文本」，先读文本会把图挤掉；
+* **超限明确拒绝、绝不截断**（`CLIPW_TOO_BIG`）：半个 JPEG 发给模型只会换回一个坏请求；
+* **只认 24/32 位的 `BI_RGB` / 32 位 `BI_BITFIELDS`**：1/4/8 位要展开调色板、16 位是
+  掩码压缩，它们在真机剪贴板里几乎不出现（截图工具都给 32 位）——不认识就落到文本腿，
+  而不是猜出一种错颜色；
+* **位图不新造格式**：本仓只认 PNG/JPEG/GIF/WebP（`imgx_sniff`），而标准库只有 JPEG
+  编码器 ⇒ 一律转 JPEG（`DIB → RGB 位图 → jpeg_encode_q`，全程 Uya 侧做、可被自测钉住）；
+* **不碰像素**：缩放/重压是 `media/imgz` 的职责，这里只做格式转换。
+
+#### 19.30.2 三处平台接缝（都收在一处，共享源码不写 `std.cfg`）
+
+| 接缝 | Uya 面 | C 面 | 为什么 |
+|---|---|---|---|
+| 控制台输入 | `term/wincon.uya` 的 `wincon_read` / `tty_read_stdin` | `win32_agent.c` 的 `uya_win_read` | 见下「代码页」那条 |
+| 窗口尺寸 | `wincon_size` | `GetConsoleScreenBufferInfo` 的 **`srWindow`** | `dwSize` 是屏幕缓冲区，可以远大于窗口 |
+| 环境块 | `wincon_startup` 里的 `saved_envp` 修正 | `GetEnvironmentStringsW` 重建 | Uya 运行时按 POSIX 的 `argv + argc + 1` 取 envp，Windows 的 CRT 不保证那个邻接布局 —— **实测取到空指针**，于是 `getenv` 对任何变量都返回 null（`HOME` / `PATH` / API key 全没了） |
+
+**为什么输入必须自己翻译**（这条是本轮最硬的一个坑）：conhost 的字节式读取按
+「控制台输入代码页」编码。把输入代码页切成 65001（TUI 需要）之后，**一个汉字只交出
+一个字节** —— 实测打「你好」读回来是 `60 60`，上层看到的就是「输入一个字符就换行」。
+而 `ReadConsoleW` 在 VT 输入模式下会把方向键 / F 键整条丢掉。所以一律自己读
+`INPUT_RECORD`：`uChar` 是 UTF-16（与代码页无关），自己转 UTF-8；特殊键自己翻成
+与 conhost 一致的 VT 序列（方向键 `1b 5b 41`、F1~F4 走 SS3、退格 `0x7f`、Alt+字符
+加 `ESC` 前缀）；**回车收敛成单个 `CR`**（粘贴进来的 CRLF 会被 conhost 拆成 CR + LF
+两条记录，不收敛的话 TUI 会把一次回车当成两次提交）。
+
+**为什么事件循环要换一条**：编译器的 Windows 后端把 `epoll_create/ctl/wait` 全映射成
+ENOSYS，而 `poll(2)` 对**非 socket** fd 的处理是「按超时睡一觉然后把它们全报成就绪」
+（见 `uya_windows_poll`）。于是原来那条「在一条永不写数据的管道上等到 deadline」的
+`rt_sleep` 会退化成**空转到 deadline**（CPU 100%、界面不动）。Windows 上改成 tick 驱动：
+
+* `rt_run` → `rt_win_drive`：每轮 poll 一次 future，Pending 就等一个 `RT_POLL_MS`；
+* `rt_sleep` → `RtWinSleepFut`：不占 fd，只看时钟，取消判据在 `poll` 里。
+
+**定时精度与 Linux 那条路完全相同**（`RT_POLL_MS` 本来就是定时精度，见 rtloop 文件头
+不变量③），差别只在它不做「谁就绪谁唤醒」的兴趣登记 —— 这正好匹配本仓「每次 poll
+重新探一次」的等待形状（`AsyncWaitFdFuture.poll` 自己先 `poll(fd, 0)` 探一次）。
+
+#### 19.30.3 两处**既有**缺陷，只在 Windows 上暴露
+
+两条都**不动源码、不动编译器**：`make windows` 在生成物上修，脚本带复跑判据
+（`testdata/win_fix_*.py`，修好之后打印「无需修补」并退出 0）。
+
+1. **有符号左移溢出**（`win_fix_shift_ub.py`）：codegen 把 `u64` 常量拆成高低两半时写
+   `((int64_t)(uint32_t)HI << 32)`，HI ≥ `0x80000000` 就是**未定义行为**。宿主 GCC 不插桩
+   所以在本机一直看不见；zig cc（clang）默认开 UBSan ⇒ 真机上**启动即 panic**：
+
+       thread N panic: left shift of 3421674724 by 32 places cannot be represented
+       in type 'int64_t' (aka 'long long')
+
+   生成物里共 203 处（sha384 的 K 表、P-256 的曲线常量等）。修法是把 `(int64_t)` 换成
+   `(uint64_t)`：移位在无符号域里完全定义良好，位模式与设计意图逐字节相同。
+2. **单 TU 的全局初始化顺序**（`win_fix_init_order.py`）：一个接口值排在它要装箱的
+   具体 struct 之前（`use of undeclared identifier`）。**只在单 TU 下出现** ——
+   而 Windows **必须**走单 TU：split-C 把 Win32 桥的**定义**（`uya_windows_stat` 一族、
+   `chdir` / `fork` / `stat` / `getpid` 这些 POSIX 垫片）写在 `uya_part1_types.h` 里，而
+   每个 `.c` 都 include 它 ⇒ 链接期一屏 `duplicate symbol`。zig 的 COFF 链接器又不认
+   `--allow-multiple-definition`，所以只能从生成方式上避开。
+
+#### 19.30.4 真机验收（dockur/windows 的 Win10 客户机）
+
+工具用 skill `uya-ssh-win10-verify` 里的 `cap.exe` / `kbd.exe`：前者把子进程接到**真实
+`CONOUT$` 控制台**上再读回屏幕字符（重定向测不出编码问题），后者往控制台注入真
+`KEY_EVENT`（往管道写字节测不出按键翻译）。宿主侧逐条断言报告。
+
+| 用例 | 命令 | 判据 |
+|---|---|---|
+| cmd 里的 `--help` | `cap.exe … C:\uya-verify\uya-agent.exe --help` | `had_console=1`、`console_output_cp_run=936`、屏幕段含「极简 CLI 编程 agent」**且不含** `鐢ㄦ硶` 一类乱码、`exit_code=0` |
+| **PowerShell 里跑** | `cap.exe … powershell -Command "…\uya-agent.exe --print-config"` | `exit_code=0`、41 行配置全渲染、中文提示正常 |
+| 全屏 TUI | `kbd.exe … TAB,ESC,C-d … uya-agent.exe --no-save` | `exit_code=0`（不崩、正常退出） |
+| TUI 排版 | `cap.exe … uya-agent.exe --tui-demo` | 200 行屏幕：ASCII 大字 + 中文示例任务「把 hello.uya 的问候语改成 Hello, uya!」+ 状态行全部正确 |
+| **剪贴板（文本）** | PowerShell `Set-Clipboard` 后 `kbd.exe … /paste` | 输入行出现 `CLIPWIN_PROBE_42 中文测试`（**逐字节**，含中文） |
+| **剪贴板（图片）** | PowerShell `Clipboard::SetImage` 后 `/paste` | 回执 `已从剪贴板挂上：图片 image/jpeg 40×30 · 907 B` |
+
+**真机抓到的两个自身缺陷**（都修了，都记在上面的「既有缺陷」里）：
+
+* 第一次跑全屏 TUI 就 **panic**（有符号左移）—— 宿主 Linux 上永远不会出现，因为 GCC
+  不插桩。这条正是「必须在真机验」的理由。
+* 第一次读剪贴板文本，中文成了 `涓枃娴嬭瘯`。**先怀疑错了对象**：那个字符串来自于
+  `Set-Clipboard`，而 PowerShell 5.1 读**无 BOM** 的 `.ps1` 时按 ANSI 解码 —— 是**测试
+  脚本**本身写进去的就是错字节。但排查过程暴露了真问题：`CF_TEXT` 里**没有编码声明**，
+  而 .NET / 浏览器多数实现写的是 UTF-8，中文 Windows 的 `CP_ACP` 却是 936，无条件按
+  936 转就会把 UTF-8 字节当双字节 GBK 解。修法是**先按 UTF-8 严格校验**
+  （`MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, …)`），失败才退 CP_ACP ——
+  这不是「猜编码」，是一个可证伪的合法性检查：真 ANSI 字节几乎必然含非法 UTF-8 序列。
+
+**没顺手做的**（都是有意留白，不是漏了）：
+
+* `--web` / `--dsh-web` 的子进程与伪终端（`fork` + `openpty` + `ioctl`）没有 Windows
+  实现；`run_shell` 与 `/diff` 的外部 `git` 同理 —— 这些路径在 Windows 上**如实报错**，
+  不假装成功；
+* 不做 `CF_HDROP`（把「复制了文件」当附件）、不做 `CF_DIBV5` 的 alpha 通道（模型只要颜色）、
+  不做 `RegisterClipboardFormat` 那一族私有格式；
+* 不做 Windows Terminal 之外的宿主探测 —— 5522 能不能用交给**探测本身**回答。
+
+**跑法**（纯命令行，不需要交互）：
+
+```bash
+make windows      # → build/uya-agent.exe（PE32+ console x86-64）
+make win-check    # 形状判据
+```

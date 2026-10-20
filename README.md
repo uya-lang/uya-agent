@@ -66,6 +66,8 @@ make diff-selftest # 只跑 src/diff/
 make shell-selftest # 只跑 bash 工具的进程侧
 make panel-selftest # 只跑子代理面板
 make e2e-portable  # 可搬运性：拷一个二进制到「新机器」（空 HOME/无 DSH/无仓库）跑完整功能
+make windows       # 交叉编译 Windows 产物 build/uya-agent.exe（PE32+ 控制台程序，见 §1.6）
+make win-check     # 核对 Windows 产物的形状（PE32+ / x86-64 / 控制台子系统）
 make codegen-audit # 扫构建产物：不许出现「切片描述符 → 字节指针」的强转（终端乱码源头）
 make doc-audit     # 扫文本文件：不许留 Git 冲突标记（合并残留）
 make probe         # 传输层探针：打真实 https 端点，期望 HTTP 401（不需要 key）
@@ -373,6 +375,43 @@ TCP 连不上会打出目标 `主机:端口`；TLS 握手失败再单独一档�
 > 立刻拿到旧行为）。**失败种类不因重试而混同**：传输错始终是 `2`、非 200/协议错始终是 `3`。
 
 ---
+
+### 1.6 Windows 产物（`make windows`）
+
+`make windows` 交叉编译出 `build/uya-agent.exe`（**不需要 Windows 机器，也不需要装
+MinGW**：用 `zig cc -target x86_64-windows-gnu`），产物是 PE32+ 控制台程序，在
+`cmd.exe` 与 PowerShell 里**直接可用**（不是只跑得起来：中文不乱码、按键能进 TUI、
+`Ctrl+V`/`/paste` 能读到系统剪贴板）。
+
+```bash
+make windows       # → build/uya-agent.exe
+make win-check     # 形状判据：PE32+ / x86-64 / console
+```
+
+为什么它不是「把 Linux 版重编一遍」，以及三处只在 Windows 上成立的接缝：
+
+| 接缝 | 文件 | 为什么必须有 |
+|---|---|---|
+| 控制台输入 | `src/cshim/win32_agent.c` | conhost 的字节式读取按**控制台代码页**编码：把输入代码页切成 65001 之后一个汉字只交出一个字节（实测打「你好」读回来是 `60 60`），上层看到的就是「输入一个字符就换行」。所以字符输入一律自己读 `INPUT_RECORD`（`uChar` 是 UTF-16，与代码页无关），特殊键自己翻成 VT 序列（方向键 = `1b 5b 41`，退格 = `0x7f`，回车收敛成单个 `CR`） |
+| 剪贴板 | `src/media/clipwin.uya` | **Windows 的控制台宿主不实现 OSC 5522**（DECRQM `ESC[?5522$p` 零应答，与 deepin-terminal 同款）。5522 客户端照旧保留（在 kitty / ghostty / Windows Terminal 一类宿主里会命中），命中不了就落到 Win32 系统剪贴板：文本走 `CF_UNICODETEXT`（回退 `CF_TEXT`，**先按 UTF-8 严格校验再退 CP_ACP**），位图走 `CF_DIB` → Uya 侧解析 `BITMAPINFOHEADER` → RGB → 标准库 JPEG |
+| 事件循环 | `src/rt/rtloop.uya` | 编译器的 Windows 后端把 `epoll_*` 全映射成 ENOSYS，且 `poll(2)` 对**非 socket** fd 一律「立刻就绪」。所以 Windows 上 `rt_run` 走 tick 驱动（每 `RT_POLL_MS` 重 poll 一次），`rt_sleep` 换成看时钟的 future（不占 fd）—— 定时精度与 Linux 那条路**相同** |
+
+另外两处是**既有**缺陷，只在 Windows 上暴露（宿主 GCC 不插桩 / 不在单 TU 下编译），
+`make windows` 在生成物上修掉、不动源码与编译器（脚本在 `testdata/` 里，带复跑判据）：
+
+* `testdata/win_fix_shift_ub.py` —— codegen 把 `u64` 常量拆成高低两半时生成
+  `((int64_t)(uint32_t)HI << 32)`，HI ≥ `0x80000000` 就是**有符号左移溢出**；zig cc
+  （clang）默认开 UBSan ⇒ 真机上**启动即 panic**（实测
+  `left shift of 3421674724 by 32 places cannot be represented in type 'int64_t'`）。
+* `testdata/win_fix_init_order.py` —— 单 TU 里有一个接口值排在它要装箱的具体 struct
+  之前（`use of undeclared identifier`）。Windows 必须走单 TU：split-C 会把 Win32 桥的
+  **定义**发进每一个 `.c`（它们写在 `uya_part1_types.h` 里），链接期一屏
+  `duplicate symbol: chdir / fork / stat …`。
+
+**已知限制**：`--web` / `--dsh-web` 的子进程与伪终端那套（`fork` + `openpty` + `ioctl`）
+在 Windows 上没有对应实现，`run_shell` 的工具与 `/diff` 的外部 `git` 也依赖 POSIX 进程
+模型 —— 这些路径在 Windows 上会**如实报错**，不会假装成功。真机验收记录（dockur/windows
+的 Win10 客户机、`cap.exe`/`kbd.exe` 真控制台）见 DESIGN.md §19.31。
 
 ## 2. 工具
 
