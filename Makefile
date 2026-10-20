@@ -403,8 +403,53 @@ lint-size-all:
 selftest: build codegen-audit doc-audit doc-cover ui-audit e2e-exec e2e-accept-nudge e2e-retry e2e-config-flags e2e-title e2e-title-cmd e2e-title-auto e2e-mouse e2e-api e2e-steps e2e-permission e2e-sandbox e2e-tasks e2e-tasks-resume e2e-goal e2e-memory e2e-memory-live e2e-sessions e2e-resume-big e2e-diff e2e-ws e2e-model e2e-model-save e2e-model-route e2e-provider e2e-ctxwindow e2e-inputimage e2e-worktree e2e-portable e2e-dns e2e-proxy p30-check
 	UYA_BIN=$(UYA) $(OUT) --selftest
 
+# **快速档**：给 CI 与「只想确认没把地基踩塌」的人用。它不是全量的一个子集那么简单 ——
+# 挑的是**每一条腿覆盖一个域、且都在 1 s 量级**的轮次（本机实测：TITLE 7ms / DIFF 62ms /
+# TASKS 21ms / SHELL 211ms / PERM 125ms / GOAL 27ms / EMPTY 53ms / PM 29ms / PANEL 8ms /
+# WS 41ms / PROXY 108ms / DNS 7ms / ASYNC 811ms / MCP 826ms / MODEL 1.0s / SESS 1.1s）。
+# 十七轮加起来的**测试时间约 10 s**；整体墙上时间 52 s，其中 42 s 是 `make build`
+# （无改动的重建也是这个数 —— 编译器每次都把 182 个文件重新烘一遍，不走增量）。
+#
+# 为什么必须有一条快档：`--selftest` 全量**两分钟还打不住**（CLIP 一轮 13.4 s —— 它要
+# 等真剪贴板的探测超时；RETRY 7.8 s —— 要等退避窗口）。路人 clone 下来敲 `make selftest`
+# 等两分钟没动静，体验上等同于「这仓没测过」；CI 更等不起。
+#
+# 为什么是「串一串 *_ONLY」而不是给 selftest.uya 加一个 FAST 开关：那一轮的分发是一个
+# 700 行的函数（`selftest_main` 的顺序执行体），往里插一个分支就要动全仓最长的那个函数，
+# 而这一步对**产品**没有任何价值 —— 它只是「跑哪些轮」的编排，本来就该在 Makefile 里。
+# 代价是这份清单可能与 selftest.uya 的轮次表脱节；失败模式是**安全的**：某个 env 名字
+# 写错时那一轮会落回全量（慢），而不是静默跳过（假绿）。
+#
+# 故意**不跑**的两轮（要全量请跑 `make selftest`）：
+#   * CLIP —— 要真 X11 / 剪贴板，无头机器上本来就是跳过态，还慢 13 s；
+#   * RETRY —— 要等退避窗口，改一行文档时它零信息量。
+# NET 传输层重试那几条腿（n0..n5）也不在这里：它们要等退避，由 `make e2e-retry` 单独覆盖。
+FAST_ROUNDS := TITLE DIFF TASKS SHELL SESS PANEL MODEL PM PERM GOAL EMPTY \
+               PROXY DNS MCP NOTIFY ASYNC WS
+
+selftest-fast: build codegen-audit doc-audit doc-cover ui-audit
+	@set -e; total=0; for r in $(FAST_ROUNDS); do \
+		echo "== selftest-fast: $$r"; \
+		if env UYA_SELFTEST_$${r}_ONLY=1 UYA_BIN=$(UYA) $(OUT) --selftest >/dev/null; then \
+			total=$$((total+1)); \
+		else \
+			echo "selftest-fast: FAIL（$$r 那一轮红了）"; exit 1; \
+		fi; \
+	done; \
+	echo "selftest-fast: PASS（$$total 个域各跑一轮；全量用 make selftest）"
+
 probe: build
 	$(OUT) --probe --tls-verify=none --base-url $(BASE)
+
+# 文档截图：起一个**脚本化**假网关（testdata/mock_gateway_demo.py，不联网、不要 key），
+# fork 一个真 TUI、喂一句话、把字节流喂给 testdata/shot.py 的终端解释器，写成
+# docs/tui-demo.svg（进仓，README 首屏引用）+ .png（有 rsvg-convert 才生成）。
+# 为什么要一条 make：README 里那句「界面改了就重出这张图」必须是一条命令，
+# 否则图会悄悄与真界面脱节 —— 而这一屏的全部价值就在「它真的长这样」。
+# 判据：同样的二进制跑两次，SVG 逐行相同 —— **只有脚注里的 `cpu N%` 例外**
+# （那是真采样；写死它就成了假图）。脚本化网关本身没有时钟与随机。
+shot: build
+	@python3 testdata/shot.py --bin $(OUT) --out docs/tui-demo
 
 # P21：访问模式的来源链（离线，--print-config 不联网）
 #   默认 = danger-full-access；--permission <v> 与 --permission=<v> 都是 cli；

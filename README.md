@@ -1,23 +1,65 @@
-# uya-agent — 纯 Uya 写的极简 CLI 编程 agent
+# uya-agent — 一个 9 MB 的静态二进制，就是整个编程 agent
 
-一个**只用 Uya 源码**实现的命令行编程 agent：给它一句话任务，它自己看文件、改文件、跑命令，
-多轮 loop 直到给出结论。**不引入任何 C 代码、`@c_import` 或其它语言**，只依赖 Uya 语言与
-随编译器分发的标准库。
+给它一句话，它自己读文件、改文件、跑命令，多轮 loop 到给出结论。
+**一个文件就是全部**：全屏 TUI、浏览器界面、内核沙箱（bwrap）、自带 TLS ——
+`scp` 到任何 x86-64 Linux 上直接跑，**不需要 node、不需要 python、不需要 glibc、
+不需要容器**（`readelf -lW` 里没有 `PT_INTERP`，`readelf -dW` 里没有 `NEEDED`）。
 
-**P0–P83 全部完成**，主线版本串 `p83-clip-any`（**版本串只在选定要动
-`AGENT_VERSION` 的那条线才改** —— 各线都沿用最近一次改动后的版本串，见
-`src/agent/ag_tui_sessions.uya` 的编号说明；各阶段做了什么见 [DESIGN.md §19](DESIGN.md)）。
+![uya-agent 跑完一个真实任务：读文件 → 改一行 → 跑命令 → 给结论](docs/tui-demo.png)
 
-| 文档 | 看什么 |
+```bash
+# 从 release 页拿单个二进制（或 git clone 后 make build）
+curl -fsSL https://raw.githubusercontent.com/uya-lang/uya-agent/main/install.sh | sh
+~/.local/bin/uya-agent --tui-demo     # 先看一眼界面（不联网、不要 key）
+~/.local/bin/uya-agent "把 hello.uya 的问候语改成 Hello, uya!"
+```
+
+`install.sh` 只做三件事：判断架构、下载那个二进制、`chmod`。不写配置、不改 `PATH`、
+不装任何运行时。想手工装也行：
+
+```bash
+curl -LO https://github.com/uya-lang/uya-agent/releases/latest/download/uya-agent-linux-x86_64
+chmod +x uya-agent-linux-x86_64 && mv uya-agent-linux-x86_64 uya-agent
+```
+
+> **`--selftest` 要在仓库根跑**：它是端到端套件，会用 `testdata/` 的夹具和 `build/`
+> 下的工作区（换到空目录会红几条，见 §3）。只想验证「这个二进制在这台机器上能跑」，
+> 用 `--tui-demo`（一屏纯文本渲染，几毫秒、零依赖）。
+
+**顺便，它是用一种没什么人听过的语言写的**：`src/` 下 182 个文件、15.2 万行全是
+[Uya](https://github.com/uya-lang/uya) 源码，**没有一个 `@c_import`**。
+唯一的 C 是 `src/cshim/` 那 840 行 —— 一段 Windows 控制台桥（`make windows` 才用到，
+见 §1.6）和一份给 GCC 15 补的 C 原型头；**Linux 产物不含任何本仓写的 C 逻辑**。
+为什么这不容易、以及这么做的代价，见上面「约束链」。
+
+| 想读什么 | 去哪 |
 |---|---|
-| **README.md**（本文） | 装、跑、选项与命令、退出码、能力一览、已知限制（§7） |
-| [DESIGN.md](DESIGN.md) | **详细设计**：分层与数据流、每处状态与不变量、设计决策的**理由**、踩坑现场（§16）、验收记录（§19） |
-| [CODING.md](CODING.md) | 目录/文件/命名约定、文件头模板、验收纪律、编译器的硬约束 |
+| 装、跑、全部选项与斜杠命令 | 本文 §1–§2 |
+| **为什么这么设计**（分层、不变量、设计取舍） | [DESIGN.md](DESIGN.md) |
+| 改代码的约定（目录/命名/验收纪律/编译器约束） | [CODING.md](CODING.md) |
 
-代码地图（`src/` 按域分目录，一个文件一个职责）见 [DESIGN.md §2](DESIGN.md)；
-**为什么这么设计**见 DESIGN.md 各章；**怎么改才不踩坑**见 DESIGN.md §14–§16。
+**English readers**: [README.en.md](README.en.md)（同一份内容的英文版）。
 
-**能力一览**：
+---
+
+## 0. 它凭什么是一个文件
+
+| | |
+|---|---|
+| **9 MB、静态链接** | 8.98 MB 单文件，无 `PT_INTERP`、无 `NEEDED`（`make link-audit` 每次构建都核）。拷到没有编译器的机器上就能跑 |
+| **自包含工具链** | `uya/` 里带编译器与标准库（2.4 MB），`make build` 不需要先装任何东西 |
+| **零外部运行时** | 不引 xterm.js、不走 CDN、不装 zlib —— 浏览器界面的终端解释器与 JPEG 编码器都是本仓自己写的 |
+| **离线可证** | 104 处断言、35 个 `make e2e-*`、内置 mock LLM：`make selftest` 全程不联网 |
+
+**约束链**（这不是炫技，是三个约束一路推下来的结果）：
+
+1. **没有 libc 的通用设施** → TLS、OpenAI 两种线协议、SSE、YAML、diff、markdown 全自己实现
+   （`src/net/` 9.8k 行、`src/diff/` 2.2k 行）。
+2. **不能引 xterm.js**（要么走 CDN、要么 vendor 几十万行压缩 JS，前者毁掉离线自测、
+   后者与「纯 Uya」冲突）→ **浏览器界面里的终端解释器写在服务端**（`src/web/ttyemu.uya`）。
+3. **没有 zlib** → 图片缩放只能自己写，PNG/GIF/WebP 只能说"不支持"而不是"静默坏掉"。
+
+### 0.1 能力一览
 
 * **协议**：流式 SSE、严格工具协议、两种线协议（`openai-responses` 默认 / `openai-completions`），
   `--no-stream` / `--compat-fold` 两条回退路径。
@@ -49,28 +91,51 @@
   `/memory search <词>` 检索、`/memory off` 关、`/memory forget` 清空；
   `--no-memory` / `--memory-budget N`。
 
+**开发阶段记法**：本仓的提交与 DESIGN 按 `P0`–`P108` 记（每一节末尾有验收记录，
+见 [DESIGN.md §19](DESIGN.md)）。主线版本串 `p83-clip-any`（**版本串只在选定要动
+`AGENT_VERSION` 的那条线才改** —— 各线都沿用最近一次改动后的版本串，见
+`src/agent/ag_tui_sessions.uya` 的编号说明）。
+
 ---
 
 ## 1. 构建与运行
 
-需要一个 Uya 编译器（默认用 `/home/winger/uya-0.10`，可在 Makefile 里改）：
+三种拿法，按省事程度排：
+
+1. **release 里的单个二进制**（推荐）：见上面的 `curl`。
+2. **Docker**：`docker build -t uya-agent . && docker run -it --rm uya-agent`
+   （镜像是 `FROM scratch` + 这一个二进制，见 `Dockerfile`）。
+3. **从源码**：仓库自带编译器，`make build` 即可 —— 不需要预装 Uya、不需要联网：
 
 ```bash
-make check         # 词法/语法/类型检查
-make build         # 产出 build/uya-agent（**静态链接**，见下）
-make link-audit    # 核对产物真是静态链接（无 PT_INTERP / 无 NEEDED）
-make selftest      # 离线端到端自测（内置 mock LLM，不需要网络也不需要 key）
-make tui-selftest  # 只跑 TUI 那几轮（改界面时最快）
-make sess-selftest # 只跑 /sessions 与大日志 meta 那几轮
-make diff-selftest # 只跑 src/diff/
+git clone https://github.com/uya-lang/uya-agent.git && cd uya-agent
+make build          # 产出 build/uya-agent（静态链接）
+make selftest       # 离线端到端自测（内置 mock LLM，不需要网络也不需要 key）
+```
+
+需要一个 Uya 编译器 —— **仓库里已经带了一个**（`uya/bin/uya`，0.10.4），
+`make` 默认就用它；想换别的编译器见 §3 的 `UYA=` / `UYA_ROOT=`。
+
+### 1.0 常用 make 目标
+
+```bash
+make check          # 词法/语法/类型检查
+make build          # 产出 build/uya-agent（**静态链接**，见下）
+make link-audit     # 核对产物真是静态链接（无 PT_INTERP / 无 NEEDED）
+make selftest       # 离线端到端自测（内置 mock LLM，不需要网络也不需要 key）
+make selftest-fast  # 快速档（CI 用）：17 个域各跑一轮，测试时间约 10 s；不跑 CLIP/RETRY
+make shot           # 重出文档首屏那张图（docs/tui-demo.svg/.png）
+make tui-selftest   # 只跑 TUI 那几轮（改界面时最快）
+make sess-selftest  # 只跑 /sessions 与大日志 meta 那几轮
+make diff-selftest  # 只跑 src/diff/
 make shell-selftest # 只跑 bash 工具的进程侧
 make panel-selftest # 只跑子代理面板
-make e2e-portable  # 可搬运性：拷一个二进制到「新机器」（空 HOME/无 DSH/无仓库）跑完整功能
-make windows       # 交叉编译 Windows 产物 build/uya-agent.exe（PE32+ 控制台程序，见 §1.6）
-make win-check     # 核对 Windows 产物的形状（PE32+ / x86-64 / 控制台子系统）
-make codegen-audit # 扫构建产物：不许出现「切片描述符 → 字节指针」的强转（终端乱码源头）
-make doc-audit     # 扫文本文件：不许留 Git 冲突标记（合并残留）
-make probe         # 传输层探针：打真实 https 端点，期望 HTTP 401（不需要 key）
+make e2e-portable   # 可搬运性：拷一个二进制到「新机器」（空 HOME/无 DSH/无仓库）跑完整功能
+make windows        # 交叉编译 Windows 产物 build/uya-agent.exe（PE32+ 控制台程序，见 §1.6）
+make win-check      # 核对 Windows 产物的形状（PE32+ / x86-64 / 控制台子系统）
+make codegen-audit  # 扫构建产物：不许出现「切片描述符 → 字节指针」的强转（终端乱码源头）
+make doc-audit      # 扫文本文件：不许留 Git 冲突标记（合并残留）
+make probe          # 传输层探针：打真实 https 端点，期望 HTTP 401（不需要 key）
 # 离线 e2e（不需要网络）：e2e-permission / e2e-sandbox / e2e-tasks / e2e-tasks-resume /
 #   e2e-goal / e2e-sessions /
 #   e2e-resume-big / e2e-diff / e2e-ws / e2e-model / e2e-ctxwindow / e2e-worktree / e2e-exec /
@@ -130,6 +195,7 @@ readelf -lW build/uya-agent | grep -c INTERP    # 0 = 真静态
 ./build/uya-agent --probe            # 传输层探针
 ./build/uya-agent --help
 ```
+
 
 ### 1.1 命令行选项
 
