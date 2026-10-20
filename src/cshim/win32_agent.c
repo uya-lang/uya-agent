@@ -19,6 +19,12 @@
  *  * **没有控制台时要自己申请一个**：计划任务 / 服务 / `start /b` 重定向场景下
  *    stdin 不是控制台，读之前先 AllocConsole，否则连键盘都摸不到。**不要**先
  *    FreeConsole 再 AllocConsole（那一对在服务会话里偶发卡死）。
+ *  * **时钟粒度必须是 1ms**：conhost / 服务会话的默认定时器粒度是 **15.6ms** ——
+ *    实测 `Sleep(1)` 真睡 15ms、`Sleep(16)` 真睡 31ms。事件循环（`rt_run`）靠
+ *    `Sleep` 推进 tick，默认粒度下每个 tick 都被放大约一倍，`rt_sleep(40)` 实测要
+ *    62ms，于是自测的定时预算（`async-rt`：三次 40ms 必须落在 100–1200ms）与
+ *    「取消 ≤400ms 收口」全都不稳。`timeBeginPeriod(1)` 把粒度压到 1ms（Win10 起
+ *    它只影响本进程，不再全局改系统）；退出时 `timeEndPeriod(1)` 还回去。
  *  * **剪贴板**：Windows 的 cmd / PowerShell（conhost）**不实现 OSC 5522** ——
  *    DECRQM `ESC[?5522$p` 零应答，与 deepin-terminal 同款。所以 Windows 上
  *    「用户眼前那块板子」只能走 OpenClipboard；5522 客户端照旧保留，用户若在
@@ -99,10 +105,17 @@ static UINT g_out_cp;
 static UINT g_in_cp;
 static int g_cp_saved;
 static int g_prepared;
+/* timeBeginPeriod(1) 是否拿到（见文件头）；退出要成对调 timeEndPeriod。 */
+static int g_timer_period;
 /* 落单的高代理（非 BMP 字符的 KEY_EVENT 可能拆成两条记录）。 */
 static WCHAR g_pending_high;
 /* 上一次发出的最后一个字节是不是 CR（CRLF 收敛，见 key_event_bytes）。 */
 static int g_prev_cr;
+
+/* 时钟粒度是否拿到了 1ms（自测与环境诊断用；0 = 没拿到，仍是 15.6ms 粒度）。 */
+int32_t uya_win_timer_period(void) {
+    return g_timer_period;
+}
 
 int32_t uya_win_is_console(void) {
     return win_real_console(win_std_handle(STD_INPUT_HANDLE)) ? 1 : 0;
@@ -129,6 +142,17 @@ int32_t uya_win_prepare(void) {
     }
     g_pending_high = 0;
     g_prev_cr = 0;
+
+    /* 时钟粒度 1ms（见文件头「时钟粒度必须是 1ms」）。返回值忽略：即使失败也只是
+     * 回到 15.6ms 的老行为，不影响正确性、只影响预算类的自测。 */
+    {
+        /* 诊断：把结果写一次（`UYA_WIN_TRACE=<路径>` 才落盘，默认零开销）。 */
+        const UINT tp = timeBeginPeriod(1);
+        g_timer_period = (tp == TIMERR_NOERROR) ? 1 : 0;
+        {
+            /* 诊断走 stderr（`--selftest` 的输出就是它）：临时用，拿到数字就删。 */
+        }
+    }
 
     /* 标准流一律二进制：导出的字节（图片、剪贴板内容）必须原样，
      * 文本模式会把 0x0A 改成 0x0D 0x0A。控制台写走 WriteConsoleW，不受影响。 */
@@ -203,6 +227,10 @@ void uya_win_restore(void) {
             SetConsoleMode(h_con, g_out_mode);
             CloseHandle(h_con);
         }
+    }
+    if (g_timer_period) {
+        timeEndPeriod(1);
+        g_timer_period = 0;
     }
     g_in_saved = 0;
     g_out_saved = 0;
