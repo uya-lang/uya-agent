@@ -36,10 +36,18 @@
   自动压缩）；技能发现 + `skill`；`web_search`；子代理一族（含 `ralph` 与 `/watch` 实时跟随）；
   会话目标；workflow（`.ush` 脚本编排）；三级访问模式 + bwrap 内核沙箱；Git worktree
   （执行 → 合并 → 删除，连带残留回收）；图片附件与剪贴板粘贴（纯 Uya 的 X11 客户端）。
-* **项目记忆**（P66–P68）：跨会话记住「这个项目怎么跑、关键文件在哪、上次什么还红着」——
-  按**归一化仓库根**归类（worktree 与其主仓同键），只追加分片存储（多写者不丢更新），
-  开工包在会话开始时注入**一条独立 user 消息**（不改 system、不打掉前缀缓存）。
-  `/memory` 看报告、`/memory off` 关、`/memory forget` 清空；`--no-memory` / `--memory-budget N`。
+* **项目记忆**（P66–P68，P107 加动作框与蒸馏）：跨会话记住「这个项目怎么跑、关键文件
+  在哪、上次什么还红着」——按**归一化仓库根**归类（worktree 与其主仓同键），只追加分片
+  存储（多写者不丢更新），开工包在会话开始时注入**一条独立 user 消息**（不改 system、
+  不打掉前缀缓存）。
+  **P107**：裸 `/memory` 开**动作选择框**（看 / 搜 / 蒸馏工作区 / 全部记忆桶 / 清空 /
+  关闭；`forget` 需二次确认且游标默认在「取消」）；每条事实带**状态与出处 token**
+  （`[confirmed]`/`[proposed]`/`[superseded]`、`[hand]`/`[ws:xxxxxxxx]`/`[sess:xxxx]`），
+  注入、报告、检索三处共用同一份渲染；`/memory learn` 是**确定性**的工作区蒸馏
+  （Makefile 目标 + 源文件职责，按 bundle 指纹短路，不调模型），跑的时候状态区会显示
+  `⠹ 蒸馏知识中 · …`。
+  `/memory search <词>` 检索、`/memory off` 关、`/memory forget` 清空；
+  `--no-memory` / `--memory-budget N`。
 
 ---
 

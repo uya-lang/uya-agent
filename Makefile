@@ -117,14 +117,14 @@ SRC := src/foundation/bufx.uya src/foundation/jsonx.uya src/foundation/yamlcfg.u
        src/tools/askuser.uya src/tools/fsx.uya src/tools/jobs.uya src/tools/perm.uya src/tools/sandboxx.uya src/tools/search.uya src/tools/shxwait.uya src/tools/shellx.uya \
        src/plugin/mcpcfg.uya src/plugin/mcprun.uya src/plugin/mcp.uya src/plugin/mcptool.uya \
        src/session/dshcfg.uya src/session/dshcred.uya src/session/dshdoc.uya src/session/dshfile.uya src/session/dshsave.uya src/session/dshsess.uya src/session/inbox.uya src/session/modelx.uya src/session/procx.uya src/session/session.uya src/session/sigx.uya src/session/stats.uya \
-       src/agent/agent.uya src/agent/ag_config.uya src/agent/ag_title_prompt.uya src/agent/ag_tools_schema.uya src/agent/ag_stream_async.uya src/agent/ag_request_stream.uya src/agent/ag_turn_retry.uya src/agent/ag_workspace_model.uya src/agent/ag_worktree.uya src/agent/ag_bg_notes.uya src/agent/ag_interactive_tasks.uya src/agent/ag_tui_sessions.uya src/agent/ag_plan_pump.uya src/agent/ag_pm.uya src/agent/compact.uya src/agent/deleg.uya src/agent/goal.uya src/agent/instr.uya src/agent/plan.uya src/agent/prompt.uya src/agent/skill.uya src/agent/todo.uya src/agent/workflow.uya \
-       src/pm/pm_repo.uya src/pm/pm_store.uya src/pm/pm_ingest.uya src/pm/pm_digest.uya \
+       src/agent/agent.uya src/agent/ag_config.uya src/agent/ag_title_prompt.uya src/agent/ag_tools_schema.uya src/agent/ag_stream_async.uya src/agent/ag_request_stream.uya src/agent/ag_turn_retry.uya src/agent/ag_workspace_model.uya src/agent/ag_worktree.uya src/agent/ag_bg_notes.uya src/agent/ag_interactive_tasks.uya src/agent/ag_tui_sessions.uya src/agent/ag_plan_pump.uya src/agent/ag_pm.uya src/agent/ag_memory_tui.uya src/agent/compact.uya src/agent/deleg.uya src/agent/goal.uya src/agent/instr.uya src/agent/plan.uya src/agent/prompt.uya src/agent/skill.uya src/agent/todo.uya src/agent/workflow.uya \
+       src/pm/pm_repo.uya src/pm/pm_store.uya src/pm/pm_ingest.uya src/pm/pm_seed.uya src/pm/pm_digest.uya \
        src/vcs/gitx.uya src/vcs/worktreex.uya \
        src/web/ttyemu.uya src/web/dshauth.uya src/web/dshget.uya src/web/webui.uya src/web/wsess.uya src/web/dwhchild.uya src/web/dwhmodel.uya src/web/dwhschema.uya src/web/dwhset.uya src/web/whost.uya src/web/websrv.uya src/web/webhttp.uya src/web/webpump.uya \
        src/media/clipx.uya src/media/clipw.uya src/media/clipt.uya src/media/cliphelp.uya src/media/clip.uya src/media/imgx.uya src/media/imgz.uya \
        src/selftest/selftest.uya src/selftest/shellselftest.uya src/selftest/sigselftest.uya src/selftest/tuiselftest.uya \
        src/selftest/st_async_rt.uya src/selftest/st_async_io.uya src/selftest/st_async_keys.uya src/selftest/st_async_net.uya src/selftest/st_async_turn.uya src/selftest/st_async_conc.uya src/selftest/st_core.uya src/selftest/st_mock_server.uya src/selftest/st_round_driver.uya src/selftest/st_turn_retry.uya src/selftest/st_bg_notify.uya src/selftest/st_tty_sse.uya src/selftest/st_sessions.uya src/selftest/st_read_window.uya src/selftest/st_view_watch.uya src/selftest/st_responses.uya src/selftest/st_stats_ctx.uya src/selftest/st_ctxfit.uya src/selftest/st_title.uya src/selftest/st_tasks_ws.uya src/selftest/st_vision.uya src/selftest/st_goal_worktree.uya src/selftest/st_goal_sess.uya src/selftest/st_todo_resume.uya src/selftest/st_pm.uya src/selftest/st_pm2.uya src/selftest/st_mcp.uya \
-       src/selftest/tuis_core.uya src/selftest/tuis_title_pty.uya src/selftest/tuis_exit_cmd.uya src/selftest/tuis_diff_scroll.uya src/selftest/tuis_title_ask.uya src/selftest/tuis_sessions_big.uya src/selftest/tuis_tail.uya src/selftest/tuis_marquee_row.uya src/selftest/tuis_sel.uya src/selftest/tuis_mem.uya src/selftest/tuis_queue.uya \
+       src/selftest/tuis_core.uya src/selftest/tuis_title_pty.uya src/selftest/tuis_exit_cmd.uya src/selftest/tuis_diff_scroll.uya src/selftest/tuis_title_ask.uya src/selftest/tuis_sessions_big.uya src/selftest/tuis_tail.uya src/selftest/tuis_marquee_row.uya src/selftest/tuis_sel.uya src/selftest/tuis_mem.uya src/selftest/tuis_mem_menu.uya src/selftest/tuis_queue.uya \
        src/selftest/st_web.uya src/selftest/st_web_childcfg.uya src/selftest/st_web_live.uya src/selftest/st_tls_pin.uya src/selftest/st_tls_ca.uya \
        src/selftest/st_dns.uya src/selftest/st_proxy.uya \
        src/selftest/st_clip.uya src/selftest/st_wire.uya src/selftest/tuis_ui_port.uya src/selftest/tuis_events.uya \
@@ -471,11 +471,11 @@ e2e-memory: build
 		|| { echo "FAIL: 裸 /memory 没有打出报告头"; echo "$$out"; exit 1; }; \
 	echo "$$out" | grep -qF "（这个项目还没有积累到任何事实" \
 		|| { echo "FAIL: 空态串不对"; exit 1; }; \
-	echo "$$out" | grep -qF "[memory] 用法：/memory 看报告" \
+	echo "$$out" | grep -qF "[memory] 用法：/memory" \
 		|| { echo "FAIL: 非法参数应当回用法"; exit 1; }; \
 	echo "$$out" | grep -qF "项目记忆：已关闭" \
 		|| { echo "FAIL: /memory off 之后报告应当说已关闭"; exit 1; }; \
-	echo "$$out" | grep -qF "/memory    项目记忆" \
+	echo "$$out" | grep -qF "/memory    记忆" \
 		|| { echo "FAIL: /help 里没有 /memory"; exit 1; }; \
 	echo "e2e-memory: 通过（print-config 两条 / 报告头 / 空态 / 非法参数 / off / /help）"
 

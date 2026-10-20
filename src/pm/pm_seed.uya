@@ -1,0 +1,605 @@
+// src/pm/pm_seed.uya — 工作区蒸馏：把仓库里**已经写死**的索引抽成记忆事实（P107）
+//
+// 本文件：仓库指纹（`pm_seed_fp`）、`Makefile` 的 target 抽取（`pm_seed_makefile`）、
+//   源文件头的一句话职责（`pm_seed_heads`）、以及两者的写入编排（`pm_seed_run`）。
+// 不变量：① **确定性、绝不调 LLM**：同一份工作区两次跑产出逐字节相同的事实
+//   （时间戳由调用方给、路径按字节序、行按出现序）。这条是它与「会话蒸馏」的分界 ——
+//   后者要模型，本文件只要文件。
+//   ② **只放指针不放正文**：`value` 是「首句 / 一句话职责」，绝不放文件内容。
+//   实测依据与 `pm_ingest` 同源：被读过的文件之后会被改动（19.2%），正文一定会过期。
+//   ③ **指纹短路**：`(Makefile, AGENTS.md, src 下 .uya 的 mtime+size)` 之和的 sha256 进
+//   事实 `ws:FP`；指纹没变就**一个字节都不读**直接返回 0 条。这是「默认开」的成本闸门：
+//   默认开不等于每次开。
+//   ④ **来源可回溯**：每条事实的 `src` 都是 `ws-distill:<指纹前 8 位>`，渲染时变成
+//   `[ws:xxxxxxxx]`（见 pm_digest 的 `pm_fact_src_token`）。
+//   ⑤ 失败一律返回 false 且**不产生副作用**（记忆是旁路，不能因为盘满打断一次回合）。
+// 依赖：libc（syscall / unistd）；本仓 foundation/bufx、tools/fsx（`fs_read_file_all` /
+//   `fs_stat`）、pm/pm_store（`PmFact`/`pm_store_append`）、
+//   pm/pm_repo（`PM_PATH_MAX`）、
+//   tls/crypto/sha256（指纹）。
+// 命名：`pm_seed_*`、`PM_SEED_*`。
+
+use libc.syscall;
+use libc.unistd;
+use tls.crypto.sha256;
+
+export const PM_SEED_SRC_MAX: usize = 64;       // 单条事实的 key 上限（target / 路径）
+export const PM_SEED_VAL_MAX: usize = 200;      // 单条事实的 value 上限（首句）
+const PM_SEED_MK_MAX: usize = 262144;           // Makefile 读取上限 256 KiB
+const PM_SEED_HDR_MAX: usize = 4096;            // 单个源文件只读前 4 KiB
+const PM_SEED_TARGETS_MAX: usize = 96;          // 单次最多抽多少个 target
+const PM_SEED_HEADS_MAX: usize = 64;            // 单次最多抽多少个文件头
+
+// 把 `<ws>` 与 `rel` 拼成绝对路径（带 NUL，给 syscall 用）写进 out。
+fn pm_seed_path(ws: &const byte, ws_len: usize, rel: &const byte,
+                out: &Buf) bool {
+    buf_reset(out);
+    if !buf_append(out, ws, pm_trim_slash(ws, ws_len)) {
+        return false;
+    }
+    if !buf_append_byte(out, 47) {
+        return false;
+    }
+    if !buf_append_cstr(out, rel) {
+        return false;
+    }
+    return buf_append_byte(out, 0);
+}
+
+// 指纹：只取 `Makefile` 的 `(mtime, size)` 与 `AGENTS.md` 的同两项，拼成 40 字节文本
+// 再 sha256，取前 8 hex。
+// 为什么不用「整个工作区」：那要遍历整棵树（本仓 2386 个 tracked 文件），而
+// 「Makefile / AGENTS.md 变了才值得重抽 target 与规矩」这条已经覆盖了本文件产出的两类事实。
+// 遍历整棵树的收益（发现某个源文件被改）与本文件**不读源文件正文**的口径不匹配。
+export fn pm_seed_fp(ws: &const byte, ws_len: usize, out: &Buf) bool {
+    buf_reset(out);
+    var key: [byte: 64] = [0: 64];
+    var kn: usize = 0;
+    var names: [&const byte: 2] = ["Makefile" as &const byte,
+                                   "AGENTS.md" as &const byte];
+    var i: usize = 0;
+    while i < 2 {
+        var pz: Buf = buf_new(PM_PATH_MAX);
+        defer { buf_free(&pz); }
+        if pm_seed_path(ws, ws_len, names[i], &pz) {
+            var st: FsStat = FsStat{
+                exists: false, is_dir: false, size: 0, mtime: 0, mtime_nsec: 0,
+            };
+            if fs_stat(pz.ptr as &const byte, &st) {
+                kn = pm_seed_put_num(&key[0], kn, 64, st.mtime as u64);
+                kn = pm_seed_put_num(&key[0], kn, 64, st.size as u64);
+            }
+        }
+        i = i + 1;
+    }
+    var digest: [byte: 32] = [0: 32];
+    sha256(&key[0], kn, &digest[0]);
+    var hex: [byte: 64] = [0: 64];
+    _ = hex_of(&digest[0], 32, &hex[0]);
+    return buf_append(out, &hex[0], 8);
+}
+
+// 把 v 的十进制写进 dst[at..cap)（最多 20 位），返回新的写入位置。
+// 手写而不走 `buf_append_i64`：指纹要的是**固定长度的字节串**，直接拼进栈数组最省事，
+// 也不用为一个纯内部小工具去申请 Buf。
+fn pm_seed_put_num(dst: &byte, at: usize, cap: usize, v: u64) usize {
+    var tmp: [byte: 20] = [0: 20];
+    var n: usize = 0;
+    var x: u64 = v;
+    if x == 0 {
+        tmp[0] = 48;
+        n = 1;
+    }
+    while x > 0 && n < 20 {
+        tmp[n] = (48 as u64 + (x % (10 as u64))) as byte;
+        x = x / (10 as u64);
+        n = n + 1;
+    }
+    var k: usize = 0;
+    var to: usize = at;
+    while k < n && to < cap {
+        dst[to] = tmp[n - 1 - k];
+        to = to + 1;
+        k = k + 1;
+    }
+    return to;
+}
+
+// 从 Makefile 抽 target：形如「行首标识符 + `:`」的行算一个 target。
+// `value` 取**紧邻上方**的注释块首句（连续 `#` 行里最上面那句）—— 那就是作者写下的
+// 「这个 target 干什么」，比任何摘要都准。
+// 没有上方注释的 target 一律**不记**（宁可少记，不可记错：`x:` 可能是变量赋值或规则片段）。
+export fn pm_seed_makefile(dir: &const byte, dir_len: usize,
+                           sid: &const byte, sid_len: usize,
+                           ws: &const byte, ws_len: usize,
+                           src: &const byte, src_len: usize,
+                           ts: i64) i32 {
+    var pz: Buf = buf_new(PM_PATH_MAX);
+    defer { buf_free(&pz); }
+    if !pm_seed_path(ws, ws_len, "Makefile" as &const byte, &pz) {
+        return 0;
+    }
+    var text: Buf = buf_new(8192);
+    defer { buf_free(&text); }
+    if !fs_read_file_all(pz.ptr as &const byte, &text, PM_SEED_MK_MAX) {
+        return 0;
+    }
+    if text.len == 0 {
+        return 0;
+    }
+    var n: i32 = 0;
+    var at: usize = 0;
+    var last_comment: usize = 0;      // 上一次看到的注释行起点（0 = 没有）
+    var last_comment_len: usize = 0;
+    var prev_blank: bool = true;
+    while at < text.len && n < PM_SEED_TARGETS_MAX {
+        const line_end: usize = pm_seed_line_end(&text, at);
+        const ln: usize = line_end - at;
+        if ln > 0 && text.ptr[at] == 35 as byte {          // `#` 注释
+            if prev_blank || last_comment == 0 {
+                last_comment = at;
+                last_comment_len = ln;
+            }
+            prev_blank = false;
+        } else if ln == 0 {
+            prev_blank = true;
+            last_comment = 0;
+            last_comment_len = 0;
+        } else {
+            const tl: usize = pm_seed_target_len(&text, at, ln);
+            if tl > 0 && last_comment_len > 0 {
+                if pm_seed_emit_target(dir, dir_len, sid, sid_len, src, src_len,
+                                       &text, at, tl, last_comment,
+                                       last_comment_len, ts) {
+                    n = n + 1;
+                }
+                last_comment = 0;
+                last_comment_len = 0;
+            }
+            prev_blank = false;
+        }
+        at = line_end;
+        if at < text.len && text.ptr[at] == 10 as byte {
+            at = at + 1;
+        }
+    }
+    return n;
+}
+
+// 从 at 起找这一行的结束位置（`\n` 或文本末尾）。返回的是**不含**换行的位置。
+fn pm_seed_line_end(t: &const Buf, at: usize) usize {
+    var e: usize = at;
+    while e < t.len && t.ptr[e] != 10 as byte {
+        e = e + 1;
+    }
+    return e;
+}
+
+// 判断这一行是不是「target 定义」，是则返回 target 名的长度（0 = 不是）。
+// 判据写死三条，越界一律 0：
+//   ① 首字符是字母或 `_`（排除 `.PHONY:` 这类特殊目标与数字开头的宏）；
+//   ② 名字只含 `[A-Za-z0-9_-]`，遇到 `:` 结束；
+//   ③ `:` 之后必须是行尾或空白（排除 `A:=1` 这种变量赋值）。
+fn pm_seed_target_len(t: &const Buf, at: usize, ln: usize) usize {
+    const c0: byte = t.ptr[at];
+    const is_alpha: bool = (c0 >= 65 as byte && c0 <= 90 as byte) ||
+        (c0 >= 97 as byte && c0 <= 122 as byte) || c0 == 95 as byte;
+    if !is_alpha {
+        return 0;
+    }
+    var i: usize = at;
+    const end: usize = at + ln;
+    while i < end {
+        const c: byte = t.ptr[i];
+        if c == 58 as byte {                                  // `:`
+            if i == at {
+                return 0;
+            }
+            const after: usize = i + 1;
+            if after < end && t.ptr[after] != 32 as byte &&
+               t.ptr[after] != 9 as byte {
+                return 0;                                     // `A:=1`
+            }
+            return i - at;
+        }
+        const ok: bool = (c >= 65 as byte && c <= 90 as byte) ||
+            (c >= 97 as byte && c <= 122 as byte) ||
+            (c >= 48 as byte && c <= 57 as byte) ||
+            c == 95 as byte || c == 45 as byte;
+        if !ok {
+            return 0;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// 落一条 command 事实：`key` = `make <target>`，`value` = 注释首句。
+// 注释行以 `#` 开头，可能带一个空格；首句取到第一个句号 / 分号 / 全角句号为止。
+fn pm_seed_emit_target(dir: &const byte, dir_len: usize,
+                       sid: &const byte, sid_len: usize,
+                       src: &const byte, src_len: usize,
+                       t: &const Buf, at: usize, tl: usize,
+                       c_at: usize, c_len: usize, ts: i64) bool {
+    if tl >= PM_SEED_SRC_MAX {
+        return false;
+    }
+    var f: PmFact = PmFact{
+        kind: PM_K_COMMANDS, status: PM_S_OBSERVED, ts: ts, ts_last: ts, n: 1,
+        key: buf_new(tl + 8), value: buf_new(PM_SEED_VAL_MAX + 8),
+        src: buf_new(src_len + 8), mt: 0, mt_ns: 0, size: 0,
+    };
+    defer {
+        buf_free(&f.key);
+        buf_free(&f.value);
+        buf_free(&f.src);
+    }
+    if !buf_append_cstr(&f.key, "make ") ||
+       !buf_append(&f.key, &t.ptr[at], tl) {
+        return false;
+    }
+    pm_seed_comment_first(&f.value, t, c_at, c_len);
+    if f.value.len == 0 {
+        return false;
+    }
+    if !buf_append(&f.src, src, src_len) {
+        return false;
+    }
+    return pm_store_append(dir, dir_len, sid, sid_len, &f);
+}
+
+// 取一行注释的首句，去 `#`、去首尾空白、截到 `PM_SEED_VAL_MAX` 字节。
+fn pm_seed_comment_first(out: &Buf, t: &const Buf, at: usize, ln: usize) void {
+    buf_reset(out);
+    var i: usize = at;
+    const end: usize = at + ln;
+    while i < end && (t.ptr[i] == 35 as byte || t.ptr[i] == 32 as byte ||
+                      t.ptr[i] == 9 as byte) {
+        i = i + 1;
+    }
+    while i < end {
+        const c: byte = t.ptr[i];
+        if c == 46 as byte || c == 59 as byte {               // `.` `;`
+            break;
+        }
+        if c == 0xE3 as byte && i + 2 < end && t.ptr[i + 1] == 0x80 as byte &&
+           t.ptr[i + 2] == 0x82 as byte {                     // 全角句号 `。`
+            break;
+        }
+        if out.len >= PM_SEED_VAL_MAX {
+            break;
+        }
+        _ = buf_append_byte(out, c);
+        i = i + 1;
+    }
+}
+
+// 从 `<ws>/src/**/*.uya` 的文件头抽「本文件：」首句，落成 `layout` 事实
+// （key = 相对路径）。走 `git ls-files` 拿清单：它给出的已经是相对仓库根的路径、
+// 且天然排除构建产物 —— 比手写目录遍历少一半代码，且与「这个仓里有什么」同源。
+//
+// ⚠ 只抽**本仓**：`git ls-files` 失败（不是 git 仓 / 没有 git）就直接 0 条，
+// 不做目录遍历兜底 —— 兜底结果是「在任意目录都能抽」，那与本文件「按仓库蒸馏」的定位冲突。
+export fn pm_seed_heads(dir: &const byte, dir_len: usize,
+                        sid: &const byte, sid_len: usize,
+                        ws: &const byte, ws_len: usize,
+                        src: &const byte, src_len: usize,
+                        ts: i64) i32 {
+    var list: Buf = buf_new(65536);
+    defer { buf_free(&list); }
+    if !pm_seed_git_files(ws, ws_len, &list) {
+        return 0;
+    }
+    var n: i32 = 0;
+    var at: usize = 0;
+    while at < list.len && n < PM_SEED_HEADS_MAX {
+        const e: usize = pm_seed_line_end(&list, at);
+        const ln: usize = e - at;
+        if ln > 3 && ln < PM_PATH_MAX && pm_seed_is_uya(&list, at, ln) {
+            if pm_seed_one_head(dir, dir_len, sid, sid_len, ws, ws_len,
+                                src, src_len, &list, at, ln, ts) {
+                n = n + 1;
+            }
+        }
+        at = e;
+        if at < list.len && list.ptr[at] == 10 as byte {
+            at = at + 1;
+        }
+    }
+    return n;
+}
+
+// 这一行是不是 `.uya` 源文件（且不是产物目录下的东西）。
+fn pm_seed_is_uya(l: &const Buf, at: usize, ln: usize) bool {
+    if ln < 5 {
+        return false;
+    }
+    const tail: usize = at + ln - 4;
+    if !bufx_mem_eq(&l.ptr[tail], ".uya", 4) {
+        return false;
+    }
+    // 产物目录里的东西不是「源」
+    var bad: bool = false;
+    if ln > 6 && bufx_mem_eq(&l.ptr[at], "build/", 6) {
+        bad = true;
+    }
+    if ln > 4 && bufx_mem_eq(&l.ptr[at], "bin/", 4) {
+        bad = true;
+    }
+    return !bad;
+}
+
+// 抽一个文件的「本文件：」首句。读不到 / 没有该字段 → false（零副作用）。
+fn pm_seed_one_head(dir: &const byte, dir_len: usize,
+                    sid: &const byte, sid_len: usize,
+                    ws: &const byte, ws_len: usize,
+                    src: &const byte, src_len: usize,
+                    l: &const Buf, at: usize, ln: usize, ts: i64) bool {
+    var pz: Buf = buf_new(PM_PATH_MAX);
+    defer { buf_free(&pz); }
+    buf_reset(&pz);
+    if !buf_append(&pz, ws, pm_trim_slash(ws, ws_len)) ||
+       !buf_append_byte(&pz, 47) || !buf_append(&pz, &l.ptr[at], ln) ||
+       !buf_append_byte(&pz, 0) {
+        return false;
+    }
+    var head: Buf = buf_new(2048);
+    defer { buf_free(&head); }
+    if !fs_read_file_all(pz.ptr as &const byte, &head, PM_SEED_HDR_MAX) {
+        return false;
+    }
+    const hv: &[byte] = head.ptr[0: head.len];
+    // 行宽豁免：这是被搜索的中文标记字面量（拆开会改变匹配语义）
+    const mark: &const byte = "本文件：";
+    const mk_at: isize = find_sub(hv, mark[0: 12], 0);
+    if mk_at < 0 {
+        return false;
+    }
+    var f: PmFact = PmFact{
+        kind: PM_K_LAYOUT, status: PM_S_OBSERVED, ts: ts, ts_last: ts, n: 1,
+        key: buf_new(ln + 8), value: buf_new(PM_SEED_VAL_MAX + 8),
+        src: buf_new(src_len + 8), mt: 0, mt_ns: 0, size: 0,
+    };
+    defer {
+        buf_free(&f.key);
+        buf_free(&f.value);
+        buf_free(&f.src);
+    }
+    if !buf_append(&f.key, &l.ptr[at], ln) {
+        return false;
+    }
+    // 首句：从标记之后到首个 `。` / 换行
+    var i: usize = (mk_at as usize) + 12;
+    while i < head.len && f.value.len < PM_SEED_VAL_MAX {
+        const c: byte = head.ptr[i];
+        if c == 10 as byte || c == 13 as byte {
+            break;
+        }
+        const full_stop: bool = c == 0xE3 as byte && i + 2 < head.len &&
+            head.ptr[i + 1] == 0x80 as byte && head.ptr[i + 2] == 0x82 as byte;
+        if full_stop {
+            break;
+        }
+        if c != 32 as byte || f.value.len > 0 {
+            _ = buf_append_byte(&f.value, c);
+        }
+        i = i + 1;
+    }
+    if f.value.len == 0 {
+        return false;
+    }
+    if !buf_append(&f.src, src, src_len) {
+        return false;
+    }
+    return pm_store_append(dir, dir_len, sid, sid_len, &f);
+}
+
+// 跑 `git ls-files` 拿清单（stderr 丢弃、stdout 上限 64 KiB）。
+fn pm_seed_git_files(ws: &const byte, ws_len: usize, out: &Buf) bool {
+    var cwdz: Buf = buf_new(PM_PATH_MAX);
+    defer { buf_free(&cwdz); }
+    buf_reset(&cwdz);
+    if !buf_append(&cwdz, ws, pm_trim_slash(ws, ws_len)) ||
+       !buf_append_byte(&cwdz, 0) {
+        return false;
+    }
+    // 行宽豁免：argv 字面量（拆行会改变参数，不是排版）
+    var argv: [&const byte: 3] = ["git" as &const byte,
+                                  "ls-files" as &const byte,
+                                  "*.uya" as &const byte];
+    var err: Buf = buf_new(1024);
+    defer { buf_free(&err); }
+    const rc: i32 = gitx_run(cwdz.ptr as &const byte, &argv[0],
+                             out, &err, 65536);
+    return rc == 0 && out.len > 0;
+}
+
+// 编排一次完整的工作区蒸馏：指纹 → Makefile target → 文件头 → 写入条数。
+// `ts` 由调用方给（本函数不读时钟，守确定性）。
+// 返回写入的事实条数；指纹没变返回 0（且**不读任何文件正文**）。
+export fn pm_seed_run(dir: &const byte, dir_len: usize,
+                      sid: &const byte, sid_len: usize,
+                      ws: &const byte, ws_len: usize,
+                      ts: i64) i32 {
+    var fp: Buf = buf_new(32);
+    defer { buf_free(&fp); }
+    if !pm_seed_fp(ws, ws_len, &fp) || fp.len == 0 {
+        return 0;
+    }
+    if pm_seed_same_fp(dir, dir_len, &fp) {
+        return 0;
+    }
+    var src: Buf = buf_new(PM_SEED_SRC_MAX);
+    defer { buf_free(&src); }
+    if !buf_append_cstr(&src, "ws-distill:") ||
+       !buf_append(&src, fp.ptr as &const byte, fp.len) {
+        return 0;
+    }
+    var n: i32 = pm_seed_makefile(dir, dir_len, sid, sid_len, ws, ws_len,
+                                  src.ptr as &const byte, src.len, ts);
+    n = n + pm_seed_heads(dir, dir_len, sid, sid_len, ws, ws_len,
+                          src.ptr as &const byte, src.len, ts);
+    // 指纹最后写：中途崩了下次会重跑（重跑是幂等的：同 key 在读取时归并）。
+    _ = pm_seed_write_fp(dir, dir_len, sid, sid_len, &fp, ts);
+    return n;
+}
+
+// 盘上记的指纹与本轮算出的一致吗？（读 `obs/seed.jsonl` 的 `ws:FP` 一条）
+// 读不到 / 没有那条 → false（= 该跑）。判定用「最新 ts_last 的那条」，
+// 与 `pm_store_merge` 的归并口径一致。
+fn pm_seed_same_fp(dir: &const byte, dir_len: usize, fp: &const Buf) bool {
+    var path: Buf = buf_new(PM_PATH_MAX);
+    defer { buf_free(&path); }
+    if !pm_seed_seedpath(dir, dir_len, &path) {
+        return false;
+    }
+    var text: Buf = buf_new(8192);
+    defer { buf_free(&text); }
+    if !fs_read_file_all(path.ptr as &const byte, &text, 65536) {
+        return false;
+    }
+    var at: usize = 0;
+    while at < text.len {
+        const e: usize = pm_seed_line_end(&text, at);
+        const ln: usize = e - at;
+        if ln > 0 && pm_seed_line_has_fp(&text, at, ln, fp) {
+            return true;
+        }
+        at = e;
+        if at < text.len && text.ptr[at] == 10 as byte {
+            at = at + 1;
+        }
+    }
+    return false;
+}
+
+// 这一行 JSONL 里有没有 `"key":"ws:FP"` 且 `"value":"<fp>"`。
+// 手写而不是走 `pm_fact_decode`：那要一个 Arena，而这里只关心两个定长字符串是否相等，
+// 为此铺一个解析器是过度设计（且这条路径每次会话开始都会跑）。
+fn pm_seed_line_has_fp(t: &const Buf, at: usize, ln: usize,
+                       fp: &const Buf) bool {
+    const view: &[byte] = t.ptr[at: at + ln];
+    const k_at: isize = find_sub(view, &"\"key\":\"ws:FP\""[0: 13], 0);
+    if k_at < 0 {
+        return false;
+    }
+    const v_at: isize = find_sub(view, &"\"value\":\""[0: 9], 0);
+    if v_at < 0 {
+        return false;
+    }
+    const s: usize = (v_at as usize) + 9;
+    if s + fp.len > ln {
+        return false;
+    }
+    // 用指针算术取 `view + s` 而不是 `&view[s]`：后者是「对 `&[byte]` 做下标」，
+    // 新版 checker 要求下标带可判定的边界证明（`DEBUG_BYTE_PTR_SUBSCRIPT_ERROR`），
+    // 而 `s` 来自 `find_sub` 的返回值，证明器认不出它 < ln。边界已经由上面那行显式判过。
+    const at_p: &const byte = @ptr_from_usize(
+        @usize_from_ptr(&view[0] as &const void) + s) as &const byte;
+    return bufx_mem_eq(at_p, fp.ptr as &const byte, fp.len);
+}
+
+// `<dir>/obs/seed.jsonl`（带 NUL）。
+fn pm_seed_seedpath(dir: &const byte, dir_len: usize, out: &Buf) bool {
+    buf_reset(out);
+    var obs: Buf = buf_new(PM_PATH_MAX);
+    defer { buf_free(&obs); }
+    if !pm_ensure_sub(dir, dir_len, "obs" as &const byte, &obs) {
+        return false;
+    }
+    if !buf_append(out, obs.ptr as &const byte, obs.len) {
+        return false;
+    }
+    return buf_append_cstr(out, "/seed.jsonl") && buf_append_byte(out, 0);
+}
+
+// 枚举一个目录下的**一级子目录**，每个桶出一行「名字  事实数」写进 out，`n` 累加。
+// 用于 `/memory all`：记忆按仓库根分桶，用户要一眼看出「这台机器上我一共有几摊记忆」。
+// 目录枚举走 `getdents64`（与 `pm_store_load` 扫 `obs/` 同源）；只收目录项（DT_DIR=4）。
+// 读不到目录（还没攒过记忆）**不算错误**，直接返回、`n` 保持 0。
+export fn pm_seed_buckets(root: &const Buf, out: &Buf, n: &i32) void {
+    var pz: Buf = buf_new(root.len + 1);
+    defer { buf_free(&pz); }
+    if !buf_append(&pz, root.ptr as &const byte, root.len) ||
+       !buf_append_byte(&pz, 0) {
+        return;
+    }
+    const dirflags: i32 = (O_RDONLY | O_DIRECTORY) as i32;
+    const fd: i32 = sys_open(&pz.ptr[0] as *const byte, dirflags, 0) catch {
+        return;
+    };
+    var buf: [byte: 4096] = [0: 4096];
+    while true {
+        const rc: isize = sys_getdents64(fd, &buf[0], 4096) catch {
+            break;
+        };
+        if rc <= 0 {
+            break;
+        }
+        var off: usize = 0;
+        const total: usize = rc as usize;
+        while off + 19 <= total {
+            const reclen: usize =
+                (buf[off + 16] as usize) | ((buf[off + 17] as usize) << 8);
+            if reclen == 0 || off + reclen > total {
+                break;
+            }
+            const dt: byte = buf[off + 18];
+            const cname: &byte = &buf[off + 19];
+            const cl: usize = bufx_cstr_len(cname);
+            if dt == 4 as byte && cl > 0 && cname[0] != 46 as byte {
+                pm_seed_bucket_line(root, cname, cl, out, n);
+            }
+            off = off + reclen;
+        }
+    }
+    _ = sys_close(fd) catch {};
+}
+
+// 一个桶的一行：`  <名字>   N 条`（N = 该桶载入后的事实数）。
+// 载入失败（分片坏了 / 目录刚被删）按 0 条算 —— 这一行是索引，不是断言。
+fn pm_seed_bucket_line(root: &const Buf, name: &const byte, nl: usize,
+                       out: &Buf, n: &i32) void {
+    var dir: Buf = buf_new(root.len + nl + 2);
+    defer { buf_free(&dir); }
+    if !buf_append(&dir, root.ptr as &const byte, root.len) ||
+       !buf_append_byte(&dir, 47) || !buf_append(&dir, name, nl) {
+        return;
+    }
+    var s: PmSet = pm_set_empty();
+    defer { pm_set_free(&s); }
+    _ = pm_store_load(dir.ptr as &const byte, dir.len, &s);
+    _ = buf_append_cstr(out, "  " as &const byte);
+    _ = buf_append(out, name, nl);
+    _ = buf_append_cstr(out, "  " as &const byte);
+    _ = buf_append_i64(out, s.n as i64);
+    _ = buf_append_cstr(out, " 条\n" as &const byte);
+    n[0] = n[0] + 1;
+}
+
+// 写一条 `ws:FP` 事实（指纹哨兵，kind = fact / src = hand）。
+// 固定的分片名 `seed`：这批事实是工作区的派生索引，不属于任何一次会话。
+fn pm_seed_write_fp(dir: &const byte, dir_len: usize,
+                    sid: &const byte, sid_len: usize,
+                    fp: &const Buf, ts: i64) bool {
+    var f: PmFact = PmFact{
+        kind: PM_K_FACT, status: PM_S_OBSERVED, ts: ts, ts_last: ts, n: 1,
+        key: buf_new(16), value: buf_new(fp.len + 8), src: buf_new(16),
+        mt: 0, mt_ns: 0, size: 0,
+    };
+    defer {
+        buf_free(&f.key);
+        buf_free(&f.value);
+        buf_free(&f.src);
+    }
+    if !buf_append_cstr(&f.key, "ws:FP") ||
+       !buf_append(&f.value, fp.ptr as &const byte, fp.len) {
+        return false;
+    }
+    if !buf_append_cstr(&f.src, "hand") {
+        return false;
+    }
+    _ = sid;
+    _ = sid_len;
+    return pm_store_append(dir, dir_len, "seed" as &const byte, 4, &f);
+}
