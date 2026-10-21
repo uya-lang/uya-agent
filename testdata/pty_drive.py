@@ -15,7 +15,9 @@
     interrupt-then-task  esc 中断一个回合，再跑一个任务（验证中断标志没有粘住）
     baseline             （对照）不做任何输入，只看回显的脚注
     worktree-menu        （P41）命令面板里选中 /worktree 与裸 /worktree 都要开动作选择框；
-                         ↓ 到 finish → 回车翻确认框；确认框上按回车（默认游标是「取消」）什么都不做
+                         P111 之后是**七个**动作（`on` 撤了、`off` 留作逃生口），默认开着
+                         所以没有一行带 ✓；↓ 到 finish → 回车翻确认框；确认框上按回车
+                         （默认游标是「取消」）什么都不做
     overlay-fullscreen   （P53）浮层全屏：非全屏的 /status 是居中框 → ctrl+f 顶到屏幕四边
                          （顶边第 0 行、左右边框 0 与 cols-1）且不吃面板/脚注 → F11 关回居中
                          → 再全屏一次、esc 关掉浮层
@@ -334,9 +336,13 @@ def suite():
     check(v8.get("palette_menu_seen"), "命令面板里选中 /worktree 没有开出动作选择框", failures)
     check(v8.get("palette_menu_items"), "命令面板那条路上开出来的框里没有动作行", failures)
     check(v8.get("menu_seen"), "裸 /worktree 没有开出动作选择框", failures)
-    check(v8.get("items_seen"), "/worktree 选择框里没有列全八个动作（P49 起含 reclaim）", failures)
+    check(v8.get("items_seen"),
+          "/worktree 选择框里没有列全七个动作（P111 撤了 on，P49 起含 reclaim）", failures)
     check(v8.get("gloss_seen"), "/worktree 选择框的动作行没有一行说明", failures)
-    check(v8.get("marked_off"), "/worktree 选择框的 ✓ 没有挂在 off 那一行", failures)
+    check(v8.get("marked_off"),
+          "/worktree 选择框的 ✓ 挂在了 off 那一行（默认已翻成开，off 是逃生口，不该带勾）", failures)
+    check(v8.get("on_gone"),
+          "/worktree 选择框里还留着 on 那一行（P111 之后打开不是动作）", failures)
     check(v8.get("confirm_seen"), "选 finish 没有翻出确认框", failures)
     check(v8.get("menu_closed"), "翻出确认框之后动作选择框还盖着", failures)
     check(v8.get("cancelled"), "确认框上按回车（默认游标是取消）之后框还在", failures)
@@ -405,7 +411,7 @@ def suite():
              v5.get("overlay_latency_ms"), v6.get("overlay_latency_ms"),
              v7.get("overlay_latency_ms")))
     print("P41 PASS（/worktree 动作选择框：面板选中 %s ms · 裸命令 %s ms · 确认框 %s ms；"
-          "八个动作与 ✓ 都在，确认框默认游标是取消）"
+          "七个动作都在、默认开着所以 off 不带 ✓，确认框默认游标是取消）"
           % (v8.get("palette_ms"), v8.get("menu_ms"), v8.get("confirm_ms")))
     print("P53 PASS（浮层全屏：非全屏居中（顶边 %s 行）→ ctrl+f 占满整行（边框列 %s、"
           "顶边 %s 行、底边压在面板 %s 之上、面板与脚注都在）→ F11 关回居中（顶边 %s 行）→"
@@ -592,11 +598,24 @@ def _drive(port, workspace, scenario, extra=None):
             verdict["menu_ms"] = wait_text(fd, screen, ("Git worktree（enter 执行 · esc 取消）",), t0, 1500)
             verdict["menu_seen"] = verdict["menu_ms"] is not None
             txt = screen.text()
-            # 每一项要么带 ✓（当前模式那两行之一），要么是两空格开头的普通行 —— 名字都得在
-            verdict["items_seen"] = all((("✓ " + w) in txt) or (("  " + w) in txt) for w in
-                                        ("on", "off", "start", "status", "finish", "discard", "list", "reclaim"))
+            # P111：`on` 那一行撤了（出厂就开着，想开是 `start`），`off` 还在（逃生口）
+            # ⇒ 七项。每一项要么带 ✓（当前模式），要么是两空格开头的普通行 —— 名字都得在。
+            verdict["items_seen"] = all(
+                (("✓ " + w) in txt) or (("  " + w) in txt) for w in
+                ("start", "status", "finish", "discard", "list",
+                 "reclaim", "off"))
             verdict["gloss_seen"] = "合并回基分支" in txt
-            verdict["marked_off"] = "✓ off" in txt
+            # ✓ 挂在哪一行 = 当前模式。P111 之前默认关 ⇒ `✓ off`；默认翻转成开之后
+            # `agent_tui_worktree_line` 只给 off 那一行留了打勾的可能、且条件是 `!wt_on()`
+            # ⇒ 默认开着时**一行都不带 ✓**（见 ag_worktree.uya 的 WT_ACT_OFF_ROW 那一段）。
+            # 所以这条不再是「✓ 在 off 上」，而是反过来验默认确实开着：off 没有被勾上，
+            # 且 `on` 这个动作名整个不在框里（撤了动作却不撤这一行，人还会以为能开）。
+            verdict["marked_off"] = "✓ off" not in txt
+            # 逐行看条目行首那个词（排版是「✓/两空格 + 名字补齐 8 列 + — 说明」）——
+            # 不拿裸子串搜 "on"：说明文字里本来就可能出现 on（reclaim、worktree…）。
+            verdict["on_gone"] = all(
+                not re.match(r"on\s+—", ln.strip().lstrip("✓").strip())
+                for ln in txt.splitlines())
             if os.environ.get("PTY_DUMP"):
                 print("---- /worktree 动作选择框 ----")
                 print(txt)
