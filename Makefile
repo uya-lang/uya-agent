@@ -733,6 +733,11 @@ e2e-memory-live: build
 
 # P26：/diff（离线）：在临时仓库里跑**真二进制**（滚动模式的单列文本回退）——
 # 必须列出改动文件（含未跟踪）、打出旧/新两侧内容；非仓库目录必须报错而不是静默无事发生。
+# 两处调用都要 --no-worktree：这一轮的被测主体是 `$$ws` 这个仓库里的**工作区改动**，而
+# worktree 会在开会话时把工作区搬进 `$$ws/.git/dsh-worktrees/<slug>` —— 那是个刚建出来的
+# 干净目录，`/diff` 看到 0 个文件，`3 个文件` / `M  a.uya` 那几条全红（P111 之后实测：
+# `当前: [diff] …/.git/dsh-worktrees/session-… · 0 个文件`）。非仓库那一腿同样要它：不加的话
+# 判据会退化成「worktree 里不是仓库」，不再是「非仓库目录 fail soft」。
 e2e-diff: build
 	@set -e; \
 	if ! command -v git >/dev/null 2>&1; then echo "e2e-diff: skip（本机没有 git）"; exit 0; fi; \
@@ -742,7 +747,7 @@ e2e-diff: build
 	  printf 'line1\nline2\nline3\n' > a.uya && printf 'gone\n' > c.uya && \
 	  git add -A && git commit -qm fixture && \
 	  printf 'line1\nCHANGED\nline3\n' > a.uya && printf 'new1\nnew2\n' > b.uya && rm c.uya ); \
-	out=$$(cd $$ws && printf '/diff\n/exit\n' | $(CURDIR)/$(OUT) --no-dsh-config --no-tui --quiet --api-key dummy-key 2>&1); \
+	out=$$(cd $$ws && printf '/diff\n/exit\n' | $(CURDIR)/$(OUT) --no-dsh-config --no-tui --quiet --api-key dummy-key --no-worktree 2>&1); \
 	echo "$$out" | grep -q "\[diff\] " || { echo "FAIL: /diff 没有输出 [diff] 头"; echo "$$out"; exit 1; }; \
 	echo "$$out" | grep -q "3 个文件" || { echo "FAIL: /diff 没报出改动文件数"; echo "$$out"; exit 1; }; \
 	echo "$$out" | grep -q "M  a.uya" || { echo "FAIL: 列表里没有改了一行的 a.uya"; exit 1; }; \
@@ -750,7 +755,7 @@ e2e-diff: build
 	echo "$$out" | grep -q -- "-line2" || { echo "FAIL: 没有打出旧内容（-line2）"; exit 1; }; \
 	echo "$$out" | grep -q -- "+CHANGED" || { echo "FAIL: 没有打出新内容（+CHANGED）"; exit 1; }; \
 	echo "$$out" | grep -q -- "+new1" || { echo "FAIL: 未跟踪文件的正文没打出来"; exit 1; }; \
-	out=$$(cd /tmp && printf '/diff\n/exit\n' | $(CURDIR)/$(OUT) --no-dsh-config --no-tui --quiet --api-key dummy-key 2>&1 || true); \
+	out=$$(cd /tmp && printf '/diff\n/exit\n' | $(CURDIR)/$(OUT) --no-dsh-config --no-tui --quiet --api-key dummy-key --no-worktree 2>&1 || true); \
 	echo "$$out" | grep -q "not a git repository" || { echo "FAIL: 非仓库目录没有报出「不是 git 仓库」"; echo "$$out"; exit 1; }; \
 	echo "e2e-diff: 通过（真 git 的列表 + 单列文本回退 + 非仓库报错）"
 
@@ -765,11 +770,17 @@ e2e-diff: build
 #   ④ 不公布档位的模型：--effort 原样透传（不 clamp），/effort 仍能报出当前值；
 #   ⑤ P62 **同名跨提供方**：beta 也发布 a-think ⇒ 用 `beta/a-think` 必须换到 beta（provider 与
 #      contextWindow 都跟着走），只给名字时用当前提供方并在回执里点出同名的那一家。
+# 为什么要 --no-worktree（P111 之后出厂就开）：`$$home` 是**相对**路径（build/ 下面），
+# 而 P111 的 worktree 会在开会话时真 chdir 进 `.git/dsh-worktrees/<slug>` —— 写回那一步拿的
+# 是启动时**解析出来的那份** dsh home（相对值，见 ag_model_save_default 的 g_dsh_home），
+# 一 chdir 就指到 worktree 里去了：`⑤d` 的 `/model beta/a-think` 于是报「这个 DSH 目录里
+# 没有 settings.yaml：没有写回」（实测；加 --no-worktree 就绿）。本轮验的是**模型选择**，
+# 不该顺便把工作区搬走。
 e2e-model: build
 	@set -e; \
 	home=build/selftest_p37_e2e; rm -rf $$home; mkdir -p $$home; \
 	printf 'llm-pi-ai:\n  providers:\n    {\n      alpha:\n        {\n          api: openai-responses,\n          baseURL: https://alpha.example/v1,\n          models:\n            [\n              { id: a-plain, contextWindow: 111000 },\n              { id: a-think, contextWindow: 222000, reasoningEfforts: { off: none, low: low, high: high } }\n            ]\n        },\n      beta:\n        {\n          api: openai-completions,\n          baseURL: https://beta.example/v1,\n          models:\n            [\n              { id: a-think, contextWindow: 444000, reasoningEfforts: { off: none } }\n            ]\n        }\n    }\nagent-default-model:\n  provider: alpha\n  model: a-think\n  reasoningEffort: high\n' > $$home/settings.yaml; \
-	run="$(CURDIR)/$(OUT) --dsh-home $$home --no-tui --quiet --api-key dummy-key"; \
+	run="$(CURDIR)/$(OUT) --dsh-home $$home --no-tui --quiet --api-key dummy-key --no-worktree"; \
 	out=$$($$run --print-config 2>&1); \
 	echo "$$out" | grep -q "model = a-think  (source: dsh-settings)" || { echo "FAIL: DSH 的默认模型没生效"; echo "$$out"; exit 1; }; \
 	echo "$$out" | grep -q "provider = alpha  (source: dsh-settings)" || { echo "FAIL: provider 没解析出来"; echo "$$out"; exit 1; }; \
@@ -1001,11 +1012,15 @@ e2e-inputimage: build
 #     ④ **反腿**：`--no-dsh-config` 不写；`--no-dsh-writeback` 不写（且 print-config 说清来源）；
 #     ⑤ **反腿**：目录里没有 settings.yaml ⇒ 不新建、只留一行回执；
 #     ⑥ **反腿**：flow 写法的节 ⇒ 拒写、文件逐字节不变（不猜、也不整份重写）。
+# 为什么要 --no-worktree（P111 之后出厂就开）：这一轮判的是**文件本身**（`grep` 那几行
+# 直接读 `$$home/settings.yaml`），而 `$$home` 是相对路径、worktree 会在开会话时 chdir 走
+# —— 写回目标跟着搬到 worktree 下面，主检出里那份一个字节都不动，① 立刻红（与 e2e-model
+# 同一个根因）。判据读的是**这个目录**里的文件，就不许工作目录先被搬走。
 e2e-model-save: build
 	@set -e; \
 	home=build/selftest_p71_save; rm -rf $$home; mkdir -p $$home; \
 	printf '# 顶层注释：写回必须保留它\nui-theme:\n  preference: dark\nagent-default-model:\n  provider: alpha\n  model: a-plain\n  reasoningEffort: high\nllm-pi-ai:\n  providers:\n    {\n      alpha:\n        {\n          api: openai-responses,\n          baseURL: https://alpha.example/v1,\n          models:\n            [\n              { id: a-plain, contextWindow: 111000 },\n              { id: a-think, contextWindow: 222000, reasoningEfforts: { off: none, low: low, high: high } }\n            ]\n        },\n      beta:\n        {\n          api: openai-completions,\n          baseURL: https://beta.example/v1,\n          models:\n            [\n              { id: a-think, contextWindow: 444000, reasoningEfforts: { off: none, low: low, high: high } }\n            ]\n        }\n    }\n' > $$home/settings.yaml; \
-	run="$(CURDIR)/$(OUT) --dsh-home $$home --no-tui --quiet --api-key dummy-key"; \
+	run="$(CURDIR)/$(OUT) --dsh-home $$home --no-tui --quiet --api-key dummy-key --no-worktree"; \
 	cp $$home/settings.yaml $$home/snap0; \
 	: "① 人敲 /model：三行跟着改，注释与兄弟节逐字节不变"; \
 	out=$$(printf '/model beta/a-think\n/effort low\n/exit\n' | $$run 2>&1); \
@@ -1038,14 +1053,14 @@ e2e-model-save: build
 	cmp -s $$home/snap1 $$home/settings.yaml || { echo "FAIL: --no-dsh-config 之后仍然写了设置"; exit 1; }; \
 	: "⑤ 反腿：目录里没有 settings.yaml ⇒ 不新建、只留一行说明"; \
 	none=build/selftest_p71_none; rm -rf $$none; mkdir -p $$none; \
-	out=$$(printf '/model a-think\n/exit\n' | $(CURDIR)/$(OUT) --dsh-home $$none --no-tui --quiet --api-key dummy-key 2>&1); \
+	out=$$(printf '/model a-think\n/exit\n' | $(CURDIR)/$(OUT) --dsh-home $$none --no-tui --quiet --api-key dummy-key --no-worktree 2>&1); \
 	echo "$$out" | grep -q "没有 settings.yaml" || { echo "FAIL: 缺设置文件时没有留下可见说明"; echo "$$out"; exit 1; }; \
 	[ -z "$$(ls -A $$none)" ] || { echo "FAIL: 缺设置文件时我们新建了东西：$$(ls -A $$none)"; exit 1; }; \
 	: "⑥ 反腿：flow 写法的节 ⇒ 拒写且文件逐字节不变"; \
 	flow=build/selftest_p71_flow; rm -rf $$flow; mkdir -p $$flow; \
 	printf 'agent-default-model: {provider: alpha, model: a-plain}\nllm-pi-ai:\n  providers: { alpha: { api: openai-completions, baseURL: "https://alpha.example/v1", models: [ { id: b-think } ] } }\n' > $$flow/settings.yaml; \
 	cp $$flow/settings.yaml $$flow/snap; \
-	out=$$(printf '/model b-think\n/exit\n' | $(CURDIR)/$(OUT) --dsh-home $$flow --no-tui --quiet --api-key dummy-key 2>&1); \
+	out=$$(printf '/model b-think\n/exit\n' | $(CURDIR)/$(OUT) --dsh-home $$flow --no-tui --quiet --api-key dummy-key --no-worktree 2>&1); \
 	echo "$$out" | grep -q "不是块状写法" || { echo "FAIL: flow 节没有被拒（应当留一行说明）"; echo "$$out"; exit 1; }; \
 	cmp -s $$flow/snap $$flow/settings.yaml || { echo "FAIL: 被拒之后文件被改了"; exit 1; }; \
 	echo "e2e-model-save: 通过（/model 与 /effort 写回那三行 + 注释与兄弟节逐字节保留 + 行数不变 / CLI 一次性不写 / --no-dsh-writeback 与 env 两档 / --no-dsh-config 不写 / 缺文件不新建 / flow 节拒写）"
@@ -1101,6 +1116,9 @@ e2e-model-route: build
 #   数「会话建出来的 worktree」时**不要**用 `git worktree list | grep dsh-worktrees`：从 worktree 会话里
 #   跑这轮时，主检出的路径本身就带 `.git/dsh-worktrees/`（CURDIR 在它下面），会把主检出也算进去、数出 2 个
 #   （实测）—— 按「非主 worktree 的条数」数（git 保证主检出排第一）才是这条断言的本意。
+# **这里不许加 --no-worktree**（与同一批修订里其它 e2e 目标相反）：这一轮的被测主体就是
+# worktree 本身 —— ① 断言它默认建出来、② 断言空跑退出回收、③ 断言 reclaim 的取舍。
+# 加了等于把整轮变成空跑。④b 那一腿本来就自带 --no-worktree（验「关得掉」）。
 e2e-worktree: build
 	@set -e; \
 	if ! command -v git >/dev/null 2>&1; then echo "e2e-worktree: skip（本机没有 git）"; exit 0; fi; \
@@ -1244,6 +1262,10 @@ e2e-portable: build
 		|| { echo "FAIL: 没有把「不传的开关」说出来（--no-dsh-config 应当被点名）"; exit 1; }; \
 	echo "e2e-portable: 通过（空 HOME/无 DSH/无仓库：内嵌 preset 兜底 + plan 段在 + 磁盘优先 + web 子进程继承父配置与权限）"
 
+# e2e-ws（本段）为什么要 --no-worktree：四条腿的判据全是**工作区路径**——
+# `/workspace` 报的那一行、`/diff` 头里那个目录、索引里的 `"cwd"`、以及「工作区被删之后
+# 留在当前工作区 $$b」。P111 之后出厂就开 worktree，会话一开始就会 chdir 进
+# `.git/dsh-worktrees/<slug>`，这些路径断言立刻对不上（实测 e2e-diff 就是这么红的）。
 e2e-ws: build
 	@set -e; \
 	root=$$(pwd); ws=$$root/build/selftest_p31_e2e; home=$$ws/home; a=$$ws/a; b=$$ws/b; c=$$ws/c; \
@@ -1264,7 +1286,7 @@ rows=[{'type':'session','version':0,'id':sid,'createdAt':1790993000000,'cwd':a,'
 {'type':'turn/end','seq':2,'time':1790993000003,'data':{'turn':1,'reason':'completed'}}];\
 open(p,'w').write(''.join(json.dumps(r,ensure_ascii=False,separators=(',',':'))+chr(10) for r in rows));\
 open(os.path.join(home,'index.jsonl'),'w').write(json.dumps({'id':sid,'cwd':a,'lastActiveAt':1790993000003,'title':'记住 5150','model':'deepseek-chat','delegationDepth':0,'turns':1,'events':3,'path':p},ensure_ascii=False,separators=(',',':'))+chr(10))" $$home $$a $$sid; \
-	run="$(CURDIR)/$(OUT) --no-dsh-config --no-tui --quiet --api-key dummy-key --agent-home $$home"; \
+	run="$(CURDIR)/$(OUT) --no-dsh-config --no-tui --quiet --api-key dummy-key --agent-home $$home --no-worktree"; \
 	: "① + ② 从 B 恢复 A 的会话"; \
 	out=$$(cd $$b && printf '/workspace\n/diff\n/exit\n' | $$run --resume $$sid 2>&1 || true); \
 	echo "$$out" | grep -q "工作区跟随会话：$$a" || { echo "FAIL: 恢复会话没有把工作区切到会话记录的那一个"; echo "$$out"; exit 1; }; \
@@ -1537,10 +1559,14 @@ e2e-title:
 #   ① 命令语义与措辞：/title 的用法串、改名回执、/status 里的 title 行与开关、/title clear、
 #      清洗后为空要报错且**标题不动**、/help 里查得到；
 #   ② 落盘：日志里一条 kind=user 的 session/title、index.jsonl 的 title 就是新值。
+# 为什么要 --no-worktree（P111 之后出厂就开）：② 落盘判据是 `grep` 这个 `$$home` 里的
+# index.jsonl / session.jsonl，而 `$$home` 是相对路径 —— worktree 一 chdir，会话就落进
+# `.git/dsh-worktrees/<slug>` 下面那份 home 了，主检出里这两个文件根本不生成（实测：①那一
+# 串措辞全对、②三处 grep 全空）。这一轮验的是标题，不是工作区。
 e2e-title-cmd: build
 	@set -e; \
 	home=build/selftest_title_cmd_e2e; rm -rf $$home; mkdir -p $$home; \
-	run="$(CURDIR)/$(OUT) --no-dsh-config --no-tui --quiet --api-key dummy-key --agent-home $$home"; \
+	run="$(CURDIR)/$(OUT) --no-dsh-config --no-tui --quiet --api-key dummy-key --agent-home $$home --no-worktree"; \
 	out=$$(printf '/title\n/title 把中文文件名修好\n/status\n/title clear\n/status\n/title \033[31m\007\n/status\n/help\n/exit\n' | $$run 2>&1); \
 	echo "$$out" | grep -qF "用法：/title <新标题> · /title clear（清回基标题）· 裸 /title 让模型起一个建议" \
 		|| { echo "FAIL: 裸 /title 没有给出用法"; echo "$$out"; exit 1; }; \
