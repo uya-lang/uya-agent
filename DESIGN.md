@@ -2002,7 +2002,22 @@ ctrl+v 一并吃掉）。
 **有意的偏离 DSH**：DSH 让模型**显式**调 `worktree start`；这里在**会话开始时自动建**
 （对齐 preset 的 `agent/session-start` 钩子）。`start` 仍保留（幂等）。
 
+**P111：模式开关出厂就是开**。这一条把上面「自动建」的前提落到了默认值上：
+`g_wt_on = true`（`vcs/worktreex.uya`），于是「这个会话在独立工作区里跑」不再需要
+`--worktree` / DSH preset `git-worktree` / `/worktree on` 任何一个来声明。**打开不再是
+一个动作** —— 想开就是 `start`（它无条件 `wt_set_on(true)` 再 provision，所以
+`--no-worktree` / `/worktree off` 之后再来一次也能开回来）。`on` 从动作表里撤掉，
+`off` 挪到浮层最后一行当**逃生口**（非 git 目录 / CI / 只想动主检出）。`wt_src`
+跟着只剩两档：`0` = 出厂默认（开着）、`3` = 这个会话里有人显式碰过它。
+
 **子代理共享父的 worktree**；非仓库/无 git ⇒ `phase = skipped` **照常干活**（fail soft）。
+
+> **踩坑（P111）**：默认值翻转之后，自测里的 `wt_set_on(false)` 从「挡真机 DSH preset」
+> 变成了「挡出厂默认本身」—— 它是**自测唯一的护栏**，删掉的话每个 fork 出去跑一轮的
+> 子进程都会建 worktree / 切工作区，mock 网关路径与工作目录全被搬走，`tui-pty` /
+> `tui-diff` 这类真 PTY 轮整片红（P37 实测过的坑）。同理，浮层里的 `↑` 到顶会**回绕**
+> 到最后一行（`off`），所以「按两下 ↑ 回到第一行」是错的（实测红过一次）：多按那一下
+> 会把 `off` 当成选中项执行。
 
 ### 10.2 状态机
 

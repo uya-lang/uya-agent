@@ -1091,12 +1091,13 @@ e2e-model-route: build
 	echo "e2e-model-route: 通过（回合运行中切换当场生效 + 请求改打新提供方 + 换用新提供方的密钥）"
 
 # P37：Git worktree（离线，真 git）：独立工作区执行 → 合并 → 删除
-#   ① --worktree 开会话：会话里真的有 worktree + dsh/<slug> 分支（状态报告里看得见，
+#   ① 默认就开（P111：不需要任何参数；以前这里传的是 --worktree）：会话里真的有
+#      worktree + dsh/<slug> 分支（状态报告里看得见，
 #      而且 `git status` 在它里面跑得通 —— 光有路径说明不了目录真的存在）；
 #   ② P49 残留回收：**没干活**就退出（/exit）⇒ 目录与分支当场回收，一个都不留；
 #   ③ P49 判据：`/worktree reclaim` 只清「确定的垃圾」—— 干净零提交的清了，
 #      带未提交改动的原样留着（那是别人的半成品，不许替他扔）；
-#   ④ --no-worktree / 非仓库：不建（fail soft）。
+#   ④ 非仓库 / --no-worktree：不建（fail soft；--no-worktree 是 P111 之后仅剩的那一档）。
 #   数「会话建出来的 worktree」时**不要**用 `git worktree list | grep dsh-worktrees`：从 worktree 会话里
 #   跑这轮时，主检出的路径本身就带 `.git/dsh-worktrees/`（CURDIR 在它下面），会把主检出也算进去、数出 2 个
 #   （实测）—— 按「非主 worktree 的条数」数（git 保证主检出排第一）才是这条断言的本意。
@@ -1106,8 +1107,8 @@ e2e-worktree: build
 	ws=build/selftest_p37_e2e_wt; rm -rf $$ws; mkdir -p $$ws; \
 	( cd $$ws && git init -q . && git config user.email t@t && git config user.name t && \
 	  printf 'base\n' > base.txt && git add -A && git commit -qm init ); \
-	run="$(CURDIR)/$(OUT) --no-dsh-config --no-tui --quiet --api-key dummy-key --worktree --no-save"; \
-	: "① 会话里真有 worktree（路径 + 分支 + git status 在它里面跑得通）"; \
+	run="$(CURDIR)/$(OUT) --no-dsh-config --no-tui --quiet --api-key dummy-key --no-save"; \
+	: "① 不带任何开关，会话里就有 worktree（默认开；路径 + 分支 + git status 在它里面跑得通）"; \
 	out=$$(cd $$ws && printf '/worktree status\n/exit\n' | $$run 2>&1); \
 	echo "$$out" | grep -q "worktree: .*\.git/dsh-worktrees/session-" || { echo "FAIL: /worktree status 没报出 worktree 路径"; echo "$$out"; exit 1; }; \
 	echo "$$out" | grep -q "branch:   dsh/session-" || { echo "FAIL: /worktree status 没报出会话分支"; echo "$$out"; exit 1; }; \
@@ -1142,7 +1143,7 @@ e2e-worktree: build
 	out=$$(cd $$ws2 && printf '/worktree status\n/exit\n' | $(CURDIR)/$(OUT) --no-dsh-config --no-tui --quiet --api-key dummy-key --no-worktree --no-save 2>&1); \
 	echo "$$out" | grep -q "worktree mode is off" || { echo "FAIL: --no-worktree 没有关掉"; echo "$$out"; exit 1; }; \
 	[ "$$(cd $$ws2 && git worktree list | tail -n +2 | wc -l)" = "0" ] || { echo "FAIL: --no-worktree 还是建了 worktree"; exit 1; }; \
-	echo "e2e-worktree: 通过（会话里真建 worktree / 退出回收残留 / reclaim 只清确定的垃圾 / 非仓库 fail soft / --no-worktree 关闭）"
+	echo "e2e-worktree: 通过（默认开：会话里真建 worktree / 退出回收残留 / reclaim 只清确定的垃圾 / 非仓库 fail soft / --no-worktree 关闭）"
 
 #   ④ 记录的工作区被删（worktree 合并后就删是常态）→ 留在当前工作区 + 留话 + 记一条 fallback。
 # 会话日志用 python3 手写（格式与 sess_open 逐字节一致）：这一轮**不联网、不用模型**。
