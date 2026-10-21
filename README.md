@@ -231,7 +231,7 @@ readelf -lW build/uya-agent | grep -c INTERP    # 0 = 真静态
 | `--bwrap PATH` | 指定 bwrap 可执行文件（默认探测 `/usr/bin/bwrap`、`/bin/bwrap`、`/usr/local/bin/bwrap`） |
 | `--proxy URL` | **出站请求走代理**：`host:port` / `http://host:port` / `http://user:pass@host:port`（端口省了按 8080）。只支持 **`http://` 明文代理**：HTTPS 目标打 `CONNECT` 隧道（TLS 仍与目标主机谈，指纹/pin/TOFU 判据一个字不变），HTTP 目标用绝对形式转发。**本机目标一律直连**（`localhost` / `127.0.0.0/8` / `::1`）。值非法**报错退出**（`1`），不静默直连。env 档是 `UYA_AGENT_PROXY`，CLI 压过它 |
 | `--no-proxy` | 不走代理（**压过** `UYA_AGENT_PROXY`）；`--web` / `--dsh-web` 的会话子进程也会拿到空值，挡住继承来的代理 |
-| `--worktree` / `--no-worktree` | **独立工作区执行**：会话开始建 git worktree + `dsh/<slug>` 分支，干完用 `worktree` 工具 `finish` 提交/合并/删除；DSH `agent-presets.default=git-worktree` 会自动开 |
+| `--no-worktree` | **关掉独立工作区执行**（逃生口）。它**默认就是开**：会话开始建 git worktree + `dsh/<slug>` 分支，干完用 `worktree` 工具 `finish` 提交/合并/删除。非 git 目录会自动 fail soft（不建、照常在原工作区干活）；CI / 只想动主检出时用这个开关或 `/worktree off` 关掉（P111 之后没有 `--worktree` —— 打开不再需要参数） |
 | `--skill-dir DIR` | 额外的技能根（冒号分隔，可多次） |
 | `--mcp-server SPEC` | 加一个 MCP 插件 server（可多次）。`SPEC = name=command [args…] [K=V…]`，例：`--mcp-server "fs=npx -y @mcp/server-filesystem ."`。见 [§2.1](#21-插件mcp) |
 | `--no-mcp` | 不读不连任何 MCP 插件（`UYA_AGENT_MCP=0` 同口径） |
@@ -276,8 +276,9 @@ readelf -lW build/uya-agent | grep -c INTERP    # 0 = 真静态
 `/help` `/status` `/tasks [open|close|toggle]` `/goal [<objective>|edit <objective>|pause|resume|clear]`
 （TUI 里裸命令开**动作选择框**，打开就回车 = 看状态；`create`/`edit` 再用输入框填正文）
 `/compact` `/plan` `/permission [预设]` `/model [名字|提供方/名字]` `/effort [档位]` `/workspace [目录]`
-`/worktree [on|off|start|status|finish|discard|list|reclaim]`（TUI 里裸命令开**动作选择框**，
-打开就回车 = `status`；`finish`/`discard` 选定后再过一道确认，`reclaim` 只清确定的垃圾、不确认）
+`/worktree [start|status|finish|discard|list|reclaim|off]`（**默认开着**；TUI 里裸命令开
+**动作选择框**，打开就回车 = `status`；`start` 当场建（模式关着也顺带开回来），`off` 是逃生口；
+`finish`/`discard` 选定后再过一道确认，`reclaim` 只清确定的垃圾、不确认）
 `/sessions` `/resume <id>` `/new` `/continue` `/diff` `/title [新标题]` `/image [路径]`
 `/paste` `/fullscreen [on|off]` `/mouse on|off` `/exit`（`/quit` 同义）。
 
@@ -1062,11 +1063,13 @@ leaf 指纹怎么算、指纹库放哪儿 —— 见 [DESIGN.md §18](DESIGN.md)
   worktree**（不支持并行/嵌套，`finish`/`discard` 只认本会话建的那个，`finish` 后要再来一轮得
   重新 `worktree start`）；**合并策略只有 `merge`（`--no-ff`）**，preset 的 `squash` 没做，
   冲突时中止合并并把主干恢复原状、不做自动冲突解决；**`--resume` 不重建 worktree**（按最后一条
-  `session/workspace` 落位，worktree 已被 `finish` 删掉就走 fallback）；DSH preset 自动开是一把
-  双刃剑 —— 真机 `agent-presets.default=git-worktree` 会让**每个**新会话都建 worktree，不想要就
-  `--no-worktree` 或 `/worktree off`。
-* **`/worktree` 的选择框与二次确认**：TUI 里裸 `/worktree` 是**底对齐选择框**，八个动作一行
-  一个、`✓` 标当前模式、游标**默认停在 `status`**；带参数的 `/worktree on|off|…` 仍是文本命令。
+  `session/workspace` 落位，worktree 已被 `finish` 删掉就走 fallback）。
+* **worktree 模式出厂就是开**（P111）：每个新会话一开就在自己的 worktree 里，**不需要**
+  `--worktree`、不需要 DSH preset `git-worktree`、也不需要 `/worktree on` —— 打开不再是一个
+  动作，想开就 `worktree start`（它无条件把模式开回来再建）。不想要就 `--no-worktree` 或
+  `/worktree off`（逃生口留着：非 git 目录 / CI / 只想动主检出）。
+* **`/worktree` 的选择框与二次确认**：TUI 里裸 `/worktree` 是**底对齐选择框**，七个动作一行
+  一个、`✓` 标当前模式、游标**默认停在 `status`**；带参数的 `/worktree start|off|…` 仍是文本命令。
   `finish` / `discard` 会**删掉目录与分支**，所以选定不生效、先翻第二道确认框且游标默认停在
   「取消」——彩排过：只按回车不会把 worktree 合掉/删掉。`reclaim` 也删目录，但**不翻确认框**：
   它只清「干净 + 零提交 + 没人在用」的确定垃圾。动作的执行结果走**滚动模式同一份**文本，
