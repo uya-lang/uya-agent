@@ -28,6 +28,14 @@ grep -n 'VER_SEMVER' src/foundation/verx.uya     # 印出 0.1.0
 `--dsh-web` 的 `host.describe.version`。**改了 `VER_SEMVER` 却忘了发版**的代价不是
 好看与否：用户按 UA 里的版本去找对应的 release，会找到一个不存在的号。
 
+**自测必须在「没有任何宿主配置」的机器上也是绿的** —— 这是 P113 的教训：本仓 CI 从 P37
+起红了很久，因为自测夹具依赖宿主的 `~/.gitconfig`（本机配过 git 身份，runner 没有）。
+发版前用**干净 HOME** 跑一次，这一条 CI 现在也会跑，但别指望它替你发现：
+
+```bash
+env -i PATH=/usr/bin:/bin HOME=$(mktemp -d) make selftest-fast
+```
+
 外加一条**文件级**的：`docs/tui-demo.svg` 必须与当前界面一致 ——
 改了 TUI 而没重出图，README 首屏就在撒谎。判据是 `make shot` 之后
 `git status --short docs/` 为空。

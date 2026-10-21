@@ -9732,3 +9732,64 @@ NUL 带进了 `/status` 浮层（自测的「正文层不许出现 NUL」不变�
 **没顺手做的**：不把版本编进 `--help` 首行（`--help` 是长文本，混一个版本进去会让
 「`--help` 的输出稳定」这条隐式契约变脆），也不给 `--version` 加平台/编译器行 ——
 这是「一行能 grep」的查询入口，不是 `uname`。
+
+### 19.33 P113：CI 从 P37 起一直是红的 —— 自测夹具依赖宿主的 git 身份
+
+**症状**：`ci` 的 `build-and-test` 作业在**最近三次推送**上全是 red，失败步骤都是
+`make selftest-fast`；本地同一个提交全绿。本机日志拿不到（GitHub 的 job log 端点要
+admin 权限），所以先本地复现。
+
+**复现**（把宿主的影响全摘掉 —— 这正是 runner 的样子）：
+
+```bash
+rm -rf /tmp/ci-home && mkdir /tmp/ci-home
+git clone <repo> /tmp/ci-sim && cd /tmp/ci-sim
+env -i PATH=/usr/bin:/bin HOME=/tmp/ci-home make selftest-fast
+# ⇒ selftest[worktree] FAIL: wt_finish 失败
+#    out=error: git commit failed in the worktree:
+#        Author identity unknown / *** Please tell me who you are.
+```
+
+**根因**：`finish` 会在 worktree 里**真的** `git commit`，而那是产品代码——没有地方给它
+塞 `-c user.email=…`。于是「worktree 那几轮能不能过」取决于**宿主有没有配全局 git 身份**：
+本机配过（`~/.gitconfig` 有 user.name/email），所以一直绿；runner 与容器没有，所以一直红。
+`st_goal_worktree.uya` 的文件头写着「幂等、不依赖环境」，而它的夹具恰好依赖 `~/.gitconfig`
+—— 那条纪律的反例，且**只有换机器才会暴露**（与踩坑 144「夹具目录没人建」同族）。
+
+**两处修法，各有各的理由**：
+
+1. **夹具自己钉身份**（`wt_fixture_make` 里 `git config user.name selftest` × 2）。
+   fixture 仓是**它自己造的**，让它的行为只由它自己决定 —— 这是自测的本分。
+2. **产品侧把失败说对**（`worktreex` 的 `wt_err_is_identity_missing` + `wt_identity_hint`）。
+   真机上「这台机器没配 git 身份」是用户**自己能修**的那一类失败，值得一句可执行的话；
+   更关键的是 `merge` 那条路：身份缺失时 git 退出码 128、**没有** `MERGE_HEAD`、工作区干净，
+   而旧代码把它和真冲突归成一类，回执里写「Resolve inside the worktree」—— 那句指导是
+   **假的**（没有冲突可解），模型会照着它空转。现在先判身份，说「没有冲突，去配身份」。
+   判据照抄 DSH 的 `identityHint`（同一个词表：`Please tell me who you are` /
+   `unable to auto-detect email` / `empty ident name`，另加中文 locale 那一条）。
+
+**新增判据 `selftest[worktree-identity]`**：真 git 造仓 → 建 worktree → 改文件 →
+`git config user.name ""`（**写空值**，删键会回落到宿主的全局身份，那就测不到了）→
+`finish` 必须失败、且回执里有 `has no Git identity`、且**不许**出现 `conflicted`。
+防假绿对照做了两次：
+
+| 对照 | 期望 | 实测 |
+|---|---|---|
+| 去掉 `wt_identity_hint` 调用 | 红 | 红（报「没给出那句可执行的提示」） |
+| 判据写成「回执含 `user.name`」 | —— | **恒绿**（git 自己的报错原文里就有 `user.email "you@example.com"`）⇒ 判据改成认我们自己的那句 |
+
+**顺带发现的第二个坑（夹具自己）**：新轮第一次写完是**假红**的 —— `wt_ws_pid` 给的路径
+缓冲**没有 NUL**，直接塞进 `git -C` 的 argv 之后，`git config` 读到堆里上一轮的文件名，
+静默失败（`fatal: cannot change to '/tmp/selftest_p37_wt_297217d/selftest_p37_mlog/…'`），
+身份根本没被清掉、`finish` 当然成功。⇒ argv 是 C 串，路径一律要带 NUL（`wszz`）。
+
+**验收**：
+
+```bash
+env -i PATH=/usr/bin:/bin HOME=<干净目录> make selftest-fast   # 18 域全绿（修前 MODEL 红）
+UYA_SELFTEST_MODEL_ONLY=1 ./build/uya-agent --selftest         # 本机（有全局身份）也绿
+```
+
+**没顺手做的**：不给 git 编造一个身份（`-c user.name=uya-agent` 那类）。伪造提交作者比
+失败更糟：它会把「这台机器没配」变成一条查不出处的历史记录。DSH 的 preset 也是失败的
+（只是失败得清楚），本仓跟它对齐。
