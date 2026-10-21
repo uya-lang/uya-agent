@@ -10,5 +10,8 @@
 | `leaf.pem` | 叶子，RSA-2048，SAN = `good.test` + `*.wild.test` |
 | `badhost.pem` | 叶子，SAN = `other.test`（验「主机名不符必须拒」） |
 | `ecinter.pem` / `ecleaf.pem` | P-256 那条：`ec.test` 的叶子由 P-256 中间签（验 ECDSA 路径） |
+| `sha1root.pem` | 自签根，**自签名算法是 SHA-1**（验「不支持的算法仍可作为父证书」） |
+| `sha1leaf.pem` | `sha1.test` 的叶子，由上面的根用 SHA-256 签（正腿：链本身可验） |
+| `sha1signedleaf.pem` | 同一张叶子但用 SHA-1 签（负腿：验签必须拒） |
 
 全部有效期 30000 天，不会自己过期（夹具过期会让自测某天莫名变红）。

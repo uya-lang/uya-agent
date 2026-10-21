@@ -9616,3 +9616,57 @@ ENOSYS，而 `poll(2)` 对**非 socket** fd 的处理是「按超时睡一觉然
 make windows      # → build/uya-agent.exe（PE32+ console x86-64）
 make win-check    # 形状判据
 ```
+
+### 19.31 P110：链条「找不到签发者」其实是**根证书被解析器拒了**（SHA-1 自签根）
+
+**用户报的**（TUI 截断后的原文）：
+
+    error: 请求失败（网络或 TLS 校验）。
+      leaf 指纹与信任记录不符（站点换了证书，或者有人在中间）。
+      服务端 leaf SHA-256 = 8d689a582ba3c4ff…
+      信任记录在 /home/winger/.uya-agent/tls_pins
+      已按发证机构校验这次的新证书：链上找不到这张证书的签发者
+      （服务端没发中间证书，系统库里也没有）
+
+**先复现，再改**。把 openrouter.ai 的一条假指纹放进临时库（模拟「站点换了证书」）：
+
+```bash
+printf 'openrouter.ai %064d\n' 0 > /tmp/pins_or
+UYA_AGENT_TLS_PINS=/tmp/pins_or ./build/uya-agent --no-dsh-config \
+  --no-proxy --tls-verify=tofu --base-url https://openrouter.ai/api/v1 hi
+```
+
+修前逐字节复现了同一句「链上找不到这张证书的签发者」。但**服务器发了中间证书，库里也有
+签发者**：
+
+    leaf(openrouter.ai) → WR1 → GTS Root R1（交叉签） → GlobalSign Root CA
+
+`openssl verify -CAfile /etc/ssl/certs/ca-certificates.crt` 对同一条链返回 OK。
+把 `cc_bundle_index` 的解析数打出来：**121 / 150** —— 系统库里有 29 张根没进索引，
+`GlobalSign Root CA` 正是其中一张。
+
+**根因**：`xm_parse` 在证书**自己的外层签名算法**不受支持时整张返回 false。GlobalSign
+Root CA 的自签名是 `sha1WithRSAEncryption`，于是它连「父证书」都当不了。可这一跳需要
+的只是它的**公钥**（用来验 GTS Root R1 交叉证书的 SHA-256 签名）；根自己的自签名本来
+就不该被验（信任锚的信任来自「它逐字节在系统库里」，不是来自它签了自己）。
+
+**修法**（`net/x509min.uya`）：不支持的算法只把 `sig_alg` 记为 `UNSUPPORTED`，**不再
+让解析失败**；AlgorithmIdentifier 的参数允许缺省或一个元素（SHA-1 带 NULL，PSS 带一个
+SEQUENCE）；已知的 RSA 仍要求 NULL。**验签闸门一个字没松**：`xm_tbs_hash` 对
+`UNSUPPORTED` 返回 false，所以 SHA-1 签名的叶子/中间证书依旧 `CC_FAIL`；
+自签根想当锚点仍必须「DER 在系统库里逐字节相等」。一句话：**能当父证书 ≠ 能过验签**。
+
+**验收**（两条腿都打在 `cc_verify` 产品代码上，夹具在 `testdata/tls_ca/`）：
+
+| 腿 | 夹具 | 期望 | 修前 |
+|---|---|---|---|
+| 正 | `sha1root.pem`（SHA-1 自签根）+ `sha1leaf.pem`（根用 SHA-256 签的叶子） | `CC_OK` | 红（找不到签发者） |
+| 负 | `sha1signedleaf.pem`（叶子自己也是 SHA-1 签名） | `CC_FAIL` | 红（解析就失败，原因不对） |
+
+修后真机复跑同一命令：新指纹 `ba98…` 被追加进临时库，请求走到 HTTP 401（只差 API key），
+不再是 `HcPinMismatch`。**注意** openrouter 这类站点会按 ClientHello 选证书：uya 只报
+RSA 签名算法，拿到 `WR1`（`ba98…`）；openssl 默认拿到 ECDSA 的 `WE1`（`22d1…`）。
+指纹不同不等于中间人 —— 这正是 P92「链验过才学」要处理的多证书现场。
+
+**没顺手做的**：不实现 AIA 抓中间证书，也不接受 SHA-1 **签名**。服务端真没发、库里
+真没有时仍然失败（那句兜底话到此才是真话）。
