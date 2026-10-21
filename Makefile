@@ -406,8 +406,9 @@ selftest: build codegen-audit doc-audit doc-cover ui-audit e2e-exec e2e-accept-n
 # **快速档**：给 CI 与「只想确认没把地基踩塌」的人用。它不是全量的一个子集那么简单 ——
 # 挑的是**每一条腿覆盖一个域、且都在 1 s 量级**的轮次（本机实测：TITLE 7ms / DIFF 62ms /
 # TASKS 21ms / SHELL 211ms / PERM 125ms / GOAL 27ms / EMPTY 53ms / PM 29ms / PANEL 8ms /
-# WS 41ms / PROXY 108ms / DNS 7ms / ASYNC 811ms / MCP 826ms / MODEL 1.0s / SESS 1.1s）。
-# 十七轮加起来的**测试时间约 10 s**；整体墙上时间 52 s，其中 42 s 是 `make build`
+# WS 41ms / PROXY 108ms / DNS 7ms / ASYNC 811ms / MCP 826ms / MODEL 1.0s / SESS 1.1s /
+# TLS 0.98s）。
+# 十八轮加起来的**测试时间约 11 s**；整体墙上时间 52 s，其中 42 s 是 `make build`
 # （无改动的重建也是这个数 —— 编译器每次都把 182 个文件重新烘一遍，不走增量）。
 #
 # 为什么必须有一条快档：`--selftest` 全量**两分钟还打不住**（CLIP 一轮 13.4 s —— 它要
@@ -425,7 +426,7 @@ selftest: build codegen-audit doc-audit doc-cover ui-audit e2e-exec e2e-accept-n
 #   * RETRY —— 要等退避窗口，改一行文档时它零信息量。
 # NET 传输层重试那几条腿（n0..n5）也不在这里：它们要等退避，由 `make e2e-retry` 单独覆盖。
 FAST_ROUNDS := TITLE DIFF TASKS SHELL SESS PANEL MODEL PM PERM GOAL EMPTY \
-               PROXY DNS MCP NOTIFY ASYNC WS
+               PROXY DNS MCP NOTIFY ASYNC WS TLS
 
 selftest-fast: build codegen-audit doc-audit doc-cover ui-audit
 	@set -e; total=0; for r in $(FAST_ROUNDS); do \

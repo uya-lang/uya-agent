@@ -46,5 +46,26 @@ printf "basicConstraints=critical,CA:FALSE\nsubjectAltName=DNS:ec.test\n" \
   > /tmp/uyatest_ecleaf.ext
 openssl x509 -req -in /tmp/uyatest_ecleaf.csr -CA ecinter.pem -CAkey /tmp/uyatest_ecint.key \
   -CAcreateserial -out ecleaf.pem -days 30000 -extfile /tmp/uyatest_ecleaf.ext -sha256
+# SHA-1 自签根：它自己的签名算法不受支持，但**只作为父证书**用时仍要能建路
+# （P110 的真实现场：GTS Root R1 交叉签 → GlobalSign Root CA，后者的自签名是 SHA-1）。
+openssl req -x509 -newkey rsa:2048 -nodes -sha1 \
+  -keyout /tmp/uyatest_sha1root.key -out sha1root.pem -days 30000 \
+  -subj "/O=Uya Test/CN=Uya Test SHA1 Root CA" \
+  -addext "basicConstraints=critical,CA:TRUE" \
+  -addext "keyUsage=critical,keyCertSign,cRLSign"
+openssl req -new -newkey rsa:2048 -nodes -keyout /tmp/uyatest_sha1leaf.key \
+  -out /tmp/uyatest_sha1leaf.csr -subj "/O=Uya Test/CN=sha1.test"
+printf "basicConstraints=critical,CA:FALSE\n\
+keyUsage=critical,digitalSignature,keyEncipherment\n\
+extendedKeyUsage=serverAuth\nsubjectAltName=DNS:sha1.test\n" \
+  > /tmp/uyatest_sha1leaf.ext
+# 正腿：根是 SHA-1 自签，但**叶子这一跳是 SHA-256**（要验的签名受支持）。
+openssl x509 -req -in /tmp/uyatest_sha1leaf.csr -CA sha1root.pem \
+  -CAkey /tmp/uyatest_sha1root.key -CAcreateserial -out sha1leaf.pem \
+  -days 30000 -extfile /tmp/uyatest_sha1leaf.ext -sha256
+# 负腿：叶子自己也是 SHA-1 签名 ⇒ 验签必须失败（不许因为根能解析就放行）。
+openssl x509 -req -in /tmp/uyatest_sha1leaf.csr -CA sha1root.pem \
+  -CAkey /tmp/uyatest_sha1root.key -CAcreateserial -out sha1signedleaf.pem \
+  -days 30000 -extfile /tmp/uyatest_sha1leaf.ext -sha1
 rm -f *.srl
-echo "gen.sh: 夹具已重新生成（root/inter/leaf/badhost/ecinter/ecleaf）"
+echo "gen.sh: 夹具已重新生成（root/inter/leaf/badhost/ecinter/ecleaf/sha1*）"
