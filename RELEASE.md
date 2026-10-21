@@ -17,11 +17,12 @@ git tag -l           # 打标之前：版本号对不对
 ```
 
 **版本号只有一处**：`src/foundation/verx.uya` 的 `VER_SEMVER`（另有一个开发阶段串
-`AGENT_VERSION` 并列，那个**不随发版动**）。打 `v0.1.0` 之前先确认两件事逐字节相符：
+`AGENT_VERSION` 并列，P114 起是空串，**不随发版动**）。打 `v0.1.0` 之前先确认两件事
+逐字节相符：
 
 ```bash
 grep -n 'VER_SEMVER' src/foundation/verx.uya     # 印出 0.1.0
-./build/uya-agent --version                      # 印出 uya-agent 0.1.0 (p83-clip-any)
+./build/uya-agent --version                      # 印出 uya-agent 0.1.0
 ```
 
 `--version` 里那个语义版本同时是 `User-Agent: uya-agent/0.1.0 (...)` 的身份段与
@@ -68,7 +69,7 @@ terminal-ui  sandbox  openai  anthropic-alternative  uya
 
 | 位置 | 改成 |
 |---|---|
-| Website | release 页；没有站点就**空着**（放一个 404 比空着差） |
+| Website | 仓根 `index.html`（GitHub Pages：`Settings → Pages` 选 `main` / `/` 即可，不用另建目录；仓根的 `.nojekyll` 关掉 Jekyll，否则整棵源码树都会被它预处理一遍） |
 | Discussions | 打开（`Settings → Features`）。仓最缺的是**提问的地方**，issue 门槛太高 |
 | Social preview | `docs/tui-demo.png`（Settings → Social preview）。**第一次被贴到群里时，预览卡就是它** |
 
