@@ -22,6 +22,7 @@ curl -fsSL https://raw.githubusercontent.com/uya-lang/uya-agent/main/install.sh 
 |---|---|
 | 有 release | 下载 → 校验 SHA256 → 装好 → 用 `--version` + `--tui-demo` 自检 |
 | **一次都没发过** | 直说「没有二进制可下」，并把 `git clone && make build` 三行贴出来 |
+| `--version` 钉的 tag 不存在 | 把**现有的** release 列出来，让你挑一个 |
 | API 连不上 | 让你查网络/代理（区别于「没发布」——这两件事的下一步完全不同） |
 
 `--version v0.1.0` 钉一个发布，`--dir ~/bin` 装到别处，`--local` 从 `build/uya-agent` 装。

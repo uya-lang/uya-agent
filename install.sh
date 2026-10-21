@@ -31,7 +31,7 @@ while [ $# -gt 0 ]; do
         --dir) DIR="$2"; shift 2 ;;
         --version) VERSION="$2"; shift 2 ;;
         --local) LOCAL=1; shift ;;
-        -h|--help) sed -n '2,20p' "$0"; exit 0 ;;
+        -h|--help) sed -n '2,10p' "$0"; exit 0 ;;
         *) echo "install.sh: 不认识的参数 $1" >&2; exit 1 ;;
     esac
 done
@@ -54,7 +54,11 @@ ASSET="uya-agent-${ARCH}"
 # 取一个 URL 到文件：有 curl 用 curl，否则 wget，都没有就报错。
 fetch_to() {
     if command -v curl >/dev/null 2>&1; then
-        curl -fsSL --retry 3 -o "$2" "$1"
+        # -s（不要进度条）但**不要** -S：404/断网时 curl 会自己打一行
+        # `curl: (22) The requested URL returned error: 404` —— 而每一个失败现场
+        # 我们都紧跟着给出人话（没有 release / 没有这个 tag / 网络不通），
+        # 多这一行只会让人以为出了别的问题。
+        curl -fsL --retry 3 -o "$2" "$1"
     elif command -v wget >/dev/null 2>&1; then
         wget -q -O "$2" "$1"
     else
@@ -71,7 +75,8 @@ json_urls() {
 }
 
 # 问一次仓库 API，把「这个版本该下的 URL」写进 $URL、校验和地址写进 $SUMS_URL。
-# 返回 0 = 找到；3 = 仓库确实没有任何正式 release；4 = 网络/解析失败（说不清）。
+# 返回 0 = 找到；3 = 仓库确实没有任何正式 release；5 = 钉的 tag 不存在（仓库里有的
+# release，但不是你要的那个）；4 = 网络/解析失败（说不清）。
 #
 # 为什么要区分 3 与 4：这两件事给用户的下一步**完全不同** ——
 #   * 没发过 release ⇒「去从源码构建」，再试一百次也一样；
@@ -85,10 +90,17 @@ resolve_release() {
     fi
     if ! fetch_to "$endpoint" "$meta"; then
         # `/releases/latest` 在「只有 draft / 只打了 tag」时也是 404，而 `/releases`
-        # 会给一个空数组。用它把「真没有」与「网络坏了」分开。
+        # 会给一个空数组。用它把三种 404 分开：真没发过 / 钉的 tag 不存在 / 网络坏了。
         if fetch_to "${API}/releases" "$meta.all" 2>/dev/null; then
             if ! grep -q '"tag_name"' "$meta.all"; then
                 return 3
+            fi
+            if [ "$VERSION" != "latest" ]; then
+                # 有 release，但没有你钉的那个 tag —— 把现有的列出来，别让人自己猜。
+                echo "install.sh: $REPO 没有 $VERSION 这个发布。现有的：" >&2
+                grep -o '"tag_name"[[:space:]]*:[[:space:]]*"[^"]*"' "$meta.all" \
+                    | sed 's/.*"\([^"]*\)"$/             \1/' >&2
+                return 5
             fi
             echo "install.sh: $REPO 还没有正式发布" >&2
             echo "           （有 draft / 预发布，但没有可下载的正式版）" >&2
@@ -127,6 +139,10 @@ else
     SUMS_URL=""
     rc=0
     resolve_release "$META" || rc=$?
+    if [ "$rc" = 5 ]; then
+        echo "install.sh: 换一个 --version，或者不带这个参数用最新的发布" >&2
+        exit 1
+    fi
     if [ "$rc" = 3 ]; then
         echo "install.sh: $REPO 还没有发过 release，没有二进制可下。" >&2
         echo "           从源码构建（仓库自带编译器，不需要预装 Uya）：" >&2
