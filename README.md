@@ -91,10 +91,15 @@ chmod +x uya-agent-linux-x86_64 && mv uya-agent-linux-x86_64 uya-agent
   `/memory search <词>` 检索、`/memory off` 关、`/memory forget` 清空；
   `--no-memory` / `--memory-budget N`。
 
-**开发阶段记法**：本仓的提交与 DESIGN 按 `P0`–`P108` 记（每一节末尾有验收记录，
-见 [DESIGN.md §19](DESIGN.md)）。主线版本串 `p83-clip-any`（**版本串只在选定要动
-`AGENT_VERSION` 的那条线才改** —— 各线都沿用最近一次改动后的版本串，见
-`src/agent/ag_tui_sessions.uya` 的编号说明）。
+**版本**：`uya-agent --version` 印一行 `uya-agent 0.1.0 (p83-clip-any)` ——
+前一个是**语义版本**（与 release 的 tag 同口径），括号里是**开发阶段串**。两个都在
+`src/foundation/verx.uya` 里各写一次，`/status`、TUI 脚注、`User-Agent`、
+`--dsh-web` 对前端报的版本**全从那里取**（以前是三个地方三个数，见 DESIGN §19 的 P112）。
+
+**开发阶段记法**：本仓的提交与 DESIGN 按 `P0`–`P112` 记（每一节末尾有验收记录，
+见 [DESIGN.md §19](DESIGN.md)）。主线阶段串 `p83-clip-any`（**阶段串只在选定要动
+`AGENT_VERSION` 的那条线才改** —— 各线都沿用最近一次改动后的串，见
+`src/foundation/verx.uya` 的编号说明）。
 
 ---
 
@@ -250,6 +255,7 @@ readelf -lW build/uya-agent | grep -c INTERP    # 0 = 真静态
 | `--no-dsh-writeback` | `/model`、`/effort` 切完**不写回** `settings.yaml`（`UYA_AGENT_DSH_WRITEBACK=0` 同口径）。注意这与 `--no-dsh-config` 不同：那个连模型路线与权限预设都不读 |
 | `--strict-dsh-config` | 读不到 DSH 设置就报错退出 |
 | `--dsh-root DIR` | packaged preset 根（读 persona / plan 段文案） |
+| `-V` / `--version` | 打印**一行**版本后退出（`uya-agent 0.1.0 (p83-clip-any)`：语义版本 + 开发阶段串）。**不读设置、不联网、不依赖 `$HOME`** —— 换机/装完之后认版本就用它（`/status` 的 `version` 字段与它逐字节相同，`User-Agent` 与 `--dsh-web` 对前端报的版本也从同一处取）。`--strict-dsh-config` 配一个不存在的 `--dsh-home` 也照样印得出来 |
 | `--print-config` | 打印生效配置、preset 旋钮与**来源**后退出（含 `tls_verify` / `tls_pin`） |
 | `--list-dsh-sessions` | 列出 DSH 自己的会话（`<DSH_HOME>/sessions`，含 zstd） |
 | `--resume-dsh ID` | 导入 DSH 会话并继续（id 前缀 ≥8 字符即可） |

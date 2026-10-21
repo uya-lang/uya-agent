@@ -7,13 +7,26 @@
 
 ---
 
-## 0. 发版前必须为真的三件事
+## 0. 发版前必须为真的四件事
 
 ```bash
 make link-audit      # 产物真的是静态链接（无 PT_INTERP / 无 NEEDED）
-make selftest-fast   # 17 个域各跑一轮，约 10 s
+make selftest-fast   # 17 个域各跑一轮，约 10 s（含 e2e-version）
 make lint-size       # 三条硬指标，只看本次 diff
+git tag -l           # 打标之前：版本号对不对
 ```
+
+**版本号只有一处**：`src/foundation/verx.uya` 的 `VER_SEMVER`（另有一个开发阶段串
+`AGENT_VERSION` 并列，那个**不随发版动**）。打 `v0.1.0` 之前先确认两件事逐字节相符：
+
+```bash
+grep -n 'VER_SEMVER' src/foundation/verx.uya     # 印出 0.1.0
+./build/uya-agent --version                      # 印出 uya-agent 0.1.0 (p83-clip-any)
+```
+
+`--version` 里那个语义版本同时是 `User-Agent: uya-agent/0.1.0 (...)` 的身份段与
+`--dsh-web` 的 `host.describe.version`。**改了 `VER_SEMVER` 却忘了发版**的代价不是
+好看与否：用户按 UA 里的版本去找对应的 release，会找到一个不存在的号。
 
 外加一条**文件级**的：`docs/tui-demo.svg` 必须与当前界面一致 ——
 改了 TUI 而没重出图，README 首屏就在撒谎。判据是 `make shot` 之后

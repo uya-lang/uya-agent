@@ -9685,3 +9685,50 @@ RSA 签名算法，拿到 `WR1`（`ba98…`）；openssl 默认拿到 ECDSA 的 
 
 **没顺手做的**：不实现 AIA 抓中间证书，也不接受 SHA-1 **签名**。服务端真没发、库里
 真没有时仍然失败（那句兜底话到此才是真话）。
+
+### 19.32 P112：版本号只有一个源（`--version` / UA / DSH 宿主字段）
+
+**症状**：用户问「我装的是哪个版本」，这个仓给不出一个答案 —— 同一份二进制有三个数：
+
+| 出口 | 修前 | 说法的来源 |
+|---|---|---|
+| 命令行 | **没有 `--version`**（`-h` 之外没有任何版本入口） | —— |
+| `/status` 与 TUI 脚注 | `p83-clip-any` | `ag_tui_sessions.uya` 的字节数组 + 手写长度常量 |
+| `User-Agent` | `uya-agent/0.1` | `net/httpc.uya` 的 `HC_USER_AGENT` 字面量 |
+| `--dsh-web` 的 `host.describe` | `0.0.1` | `web/whost.uya` 的 JSON 骨架里 |
+
+三个数各写一次、互不相干，`0.0.1` 更是从来没有过对应发行版。而 DESIGN §16 里那条
+「换机/重装后第一步先认版本」的告诫正好落空：**没有可以认的东西**。
+
+**为什么之前没人发现**：每一个数都只是某个文件里的一段字面量，谁都不比谁权威；
+`grep` 得到三处，读代码的人无从判断哪一处是「真的」。这不是笔误，是**定义缺失**。
+
+**修法**（`src/foundation/verx.uya`，新增，放 foundation 因为 net 与 web 都要读）：
+
+* `VER_NAME` / `VER_SEMVER`（发布身份，与 git tag 同口径）/ `AGENT_VERSION`（开发阶段串，
+  保留老名字，四个既有调用点与自测都在用）。**只在这里各写一次**。
+* `ver_line_into` → `uya-agent 0.1.0 (p83-clip-any)`；`ver_ident_into` → `uya-agent/0.1.0`。
+* `--version` / `-V` 在 main 的**预扫**里收口（早于读 DSH 设置与模型目录）：它是
+  「设置坏了的时候最需要的那个查询」，排在读设置之后就会在最需要它时失败。
+  写 **stdout**、一行、退出码 0（`v=$(uya-agent --version)` 要拿得到干净的值）。
+* `/status` 的 version 字段、UA 身份段、`host.describe.version` 三处改成调用上面两个函数。
+  UA 里 `" (deepseek-harness-compatible)"` 这半截**留在 httpc**：它是网关的客户端词表
+  契约（子串匹配），不是版本。
+
+**顺带消掉的两个坑**：`AGENT_VERSION` 从「字节数组 + 人读注释」变成 `&const byte`，
+手写的 `AGENT_VERSION_LEN` 一并删除 —— P30 与 P35 各因为那个长度没跟着串改，把结尾的
+NUL 带进了 `/status` 浮层（自测的「正文层不许出现 NUL」不变量当场抓的）。现在长度一律
+`bufx_cstr_len(AGENT_VERSION)`，没有第二个地方能数错。
+
+**验收**：
+
+| 判据 | 落点 |
+|---|---|
+| 拼装函数逐字节正确 / 两条路用的是同一个语义版本 / UA 后缀没过期 / 语义版本形状合法 | `selftest[version]`（`src/selftest/st_version.uya`，四段，纯字符串几毫秒） |
+| 真二进制：**一行**、语义版本形状、`-V` 与 `--version` 逐字节相同 | `make e2e-version` 前三腿 |
+| **不依赖设置**：`--strict-dsh-config --dsh-home /nonexistent --version` 仍印同一行 | `make e2e-version` 第四腿 |
+| 线上字节：UA 里 `uya-agent/0.1.0 (deepseek-harness-compatible)` | `selftest[mock UA]`（`MOCK_UA_LINE` 改成独立写死的新串） |
+
+**没顺手做的**：不把版本编进 `--help` 首行（`--help` 是长文本，混一个版本进去会让
+「`--help` 的输出稳定」这条隐式契约变脆），也不给 `--version` 加平台/编译器行 ——
+这是「一行能 grep」的查询入口，不是 `uname`。

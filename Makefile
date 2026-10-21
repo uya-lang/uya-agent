@@ -135,7 +135,7 @@ WIN_UYA    ?= $(UYA)
 #      本仓现在 90 个文件；加文件只要守 ①② 与 CODING.md §1.3 的粒度。
 #      数文件：`make -s print-src | wc -w`。
 # 留在 src/ 根的 tools.uya 是 P50 起就不在构建里的已知死代码，故意不列。
-SRC := src/foundation/bufx.uya src/foundation/jsonx.uya src/foundation/yamlcfg.uya \
+SRC := src/foundation/bufx.uya src/foundation/verx.uya src/foundation/jsonx.uya src/foundation/yamlcfg.uya \
        src/term/wincon.uya \
        src/rt/rtloop.uya src/rt/rtio.uya \
        src/net/tlspin.uya src/net/proxyx.uya src/net/rsav.uya src/net/x509min.uya src/net/cachain.uya \
@@ -158,6 +158,7 @@ SRC := src/foundation/bufx.uya src/foundation/jsonx.uya src/foundation/yamlcfg.u
        src/selftest/st_web.uya src/selftest/st_web_childcfg.uya src/selftest/st_web_live.uya src/selftest/st_tls_pin.uya src/selftest/st_tls_ca.uya \
        src/selftest/st_dns.uya src/selftest/st_proxy.uya \
        src/selftest/st_clip.uya src/selftest/st_wire.uya src/selftest/tuis_ui_port.uya src/selftest/tuis_events.uya \
+       src/selftest/st_version.uya \
        src/diff/model.uya src/diff/gitcmd.uya src/diff/rows.uya src/diff/view.uya src/diff/render.uya
 OUT := build/uya-agent
 
@@ -170,7 +171,7 @@ export UYA_ROOT
 export UYA_SPLIT_C_DIR := $(CURDIR)/build/uyacache
 
 # 行宽豁免：一条 .PHONY 就是一张全仓目标清单，拆行反而看不清哪条丢了
-.PHONY: all check wire-schema wire-probe wire-probe-real dsh-web-check dsh-settings-check print-src print-cflags build link-audit selftest codegen-audit doc-audit lint-size lint-size-all doc-cover ui-audit probe e2e e2e-config e2e-exec e2e-accept-nudge e2e-retry e2e-config-flags e2e-title e2e-title-cmd e2e-title-auto e2e-mouse e2e-api e2e-steps e2e-permission e2e-sandbox e2e-tasks e2e-tasks-resume e2e-goal e2e-memory e2e-memory-live e2e-sessions e2e-resume-big e2e-diff e2e-ws e2e-model e2e-model-save e2e-model-route e2e-provider e2e-ctxwindow e2e-inputimage e2e-worktree e2e-watch e2e-watch-pick e2e-dsh e2e-portable e2e-proxy p30-check tui-demo tui-selftest web-selftest sess-selftest diff-selftest model-selftest panel-selftest clean shell-selftest pm-selftest mcp-selftest proxy-selftest notify-selftest windows win-check
+.PHONY: all check wire-schema wire-probe wire-probe-real dsh-web-check dsh-settings-check print-src print-cflags build link-audit selftest codegen-audit doc-audit lint-size lint-size-all doc-cover ui-audit probe e2e e2e-config e2e-exec e2e-accept-nudge e2e-retry e2e-version e2e-config-flags e2e-title e2e-title-cmd e2e-title-auto e2e-mouse e2e-api e2e-steps e2e-permission e2e-sandbox e2e-tasks e2e-tasks-resume e2e-goal e2e-memory e2e-memory-live e2e-sessions e2e-resume-big e2e-diff e2e-ws e2e-model e2e-model-save e2e-model-route e2e-provider e2e-ctxwindow e2e-inputimage e2e-worktree e2e-watch e2e-watch-pick e2e-dsh e2e-portable e2e-proxy p30-check tui-demo tui-selftest web-selftest sess-selftest diff-selftest model-selftest panel-selftest clean shell-selftest pm-selftest mcp-selftest proxy-selftest notify-selftest windows win-check
 
 all: build
 
@@ -400,7 +401,7 @@ lint-size-all:
 #   本仓实测：90 文件树上净增 50 个函数 + `rm -rf build && make build` → 通过（静态链接审计通过）。
 #   因此「净增函数按 0 处理」那条纪律作废。这段留下的用处只有一个：**换/降编译器时认得出症状**
 #   （报错点落在标准库、`make check` 全绿、只有清缓存重编才炸）。
-selftest: build codegen-audit doc-audit doc-cover ui-audit e2e-exec e2e-accept-nudge e2e-retry e2e-config-flags e2e-title e2e-title-cmd e2e-title-auto e2e-mouse e2e-api e2e-steps e2e-permission e2e-sandbox e2e-tasks e2e-tasks-resume e2e-goal e2e-memory e2e-memory-live e2e-sessions e2e-resume-big e2e-diff e2e-ws e2e-model e2e-model-save e2e-model-route e2e-provider e2e-ctxwindow e2e-inputimage e2e-worktree e2e-portable e2e-dns e2e-proxy p30-check
+selftest: build codegen-audit doc-audit doc-cover ui-audit e2e-version e2e-exec e2e-accept-nudge e2e-retry e2e-config-flags e2e-title e2e-title-cmd e2e-title-auto e2e-mouse e2e-api e2e-steps e2e-permission e2e-sandbox e2e-tasks e2e-tasks-resume e2e-goal e2e-memory e2e-memory-live e2e-sessions e2e-resume-big e2e-diff e2e-ws e2e-model e2e-model-save e2e-model-route e2e-provider e2e-ctxwindow e2e-inputimage e2e-worktree e2e-portable e2e-dns e2e-proxy p30-check
 	UYA_BIN=$(UYA) $(OUT) --selftest
 
 # **快速档**：给 CI 与「只想确认没把地基踩塌」的人用。它不是全量的一个子集那么简单 ——
@@ -428,7 +429,7 @@ selftest: build codegen-audit doc-audit doc-cover ui-audit e2e-exec e2e-accept-n
 FAST_ROUNDS := TITLE DIFF TASKS SHELL SESS PANEL MODEL PM PERM GOAL EMPTY \
                PROXY DNS MCP NOTIFY ASYNC WS TLS
 
-selftest-fast: build codegen-audit doc-audit doc-cover ui-audit
+selftest-fast: build codegen-audit doc-audit doc-cover ui-audit e2e-version
 	@set -e; total=0; for r in $(FAST_ROUNDS); do \
 		echo "== selftest-fast: $$r"; \
 		if env UYA_SELFTEST_$${r}_ONLY=1 UYA_BIN=$(UYA) $(OUT) --selftest >/dev/null; then \
@@ -1474,6 +1475,29 @@ e2e-retry: build
 	if grep -q "TLS 校验" $(CURDIR)/build/e2e_retry_out_dead.txt; then \
 		echo "FAIL: 死端口却说成了 TLS 校验"; exit 1; fi; \
 	echo "e2e-retry: 通过（默认重发到成功 + 0/1/2 三个上限各自生效 + 重发逐字节相同 + 同一步 + 退出码分类不变）"
+
+# P112：版本输出（`--version` / `-V`）的**真二进制**判据。自测里那一轮（`selftest[version]`）
+# 断的是拼装函数与 UA/DSH 三处的一致性，够不到「命令行真的能印出来」这一段，所以补一条
+# 端到端。四条腿各自钉一件事：
+#   ① stdout 只有**一行**且退出码 0（脚本 `v=$(uya-agent --version)` 要拿得到干净的值）；
+#   ② 行里有程序名 + 语义版本，而且语义版本与 RELEASE 的 tag 同口径（无 `v` 前缀）；
+#   ③ `-V` 与 `--version` **逐字节相同**（两个旗标不许有两个输出）；
+#   ④ **不读设置也能印**：`--strict-dsh-config` + 一个不存在的 dsh-home，本来必报错退出，
+#      版本查询必须在它之前收口（这一条是「换机第一步先认版本」那个用场的唯一机器判据）。
+e2e-version: build
+	@set -e; \
+	v=$$($(OUT) --version); \
+	n=$$($(OUT) --version | wc -l); \
+	[ "$$n" = "1" ] || { echo "FAIL: --version 不是一行（$$n 行）"; exit 1; }; \
+	echo "$$v" | grep -q "^uya-agent [0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*" \
+		|| { echo "FAIL: --version 不是 `uya-agent <语义版本>[ (<阶段串>)]` 形状：$$v"; exit 1; }; \
+	vv=$$($(OUT) -V); \
+	[ "$$v" = "$$vv" ] || { echo "FAIL: -V 与 --version 输出不同：$$vv vs $$v"; exit 1; }; \
+	sv=$$($(OUT) --strict-dsh-config --dsh-home /nonexistent --version); \
+	[ "$$sv" = "$$v" ] \
+		|| { echo "FAIL: 设置读不到时印不出同一个版本（版本查询没有排到读设置之前）"; exit 1; }; \
+	echo "e2e-version: 通过（一行 · 语义版本形状 · -V 同输出 · 不依赖设置）"
+
 # CLI flag 回归：--dsh-home / --no-dsh-config / --strict-dsh-config 决定「去哪儿读设置」，
 # 必须在下一次加载之前生效（曾经因为完整 CLI 解析排在加载之后而三个 flag 全部静默失效，
 # 见 §16 踩坑 25）。离线可跑：--print-config 不联网。
