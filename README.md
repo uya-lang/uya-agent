@@ -15,7 +15,17 @@ curl -fsSL https://raw.githubusercontent.com/uya-lang/uya-agent/main/install.sh 
 ```
 
 `install.sh` 只做三件事：判断架构、下载那个二进制、`chmod`。不写配置、不改 `PATH`、
-不装任何运行时。想手工装也行：
+不装任何运行时。它会先查一次 GitHub API 拿到这个发布的**资产名与 SHA256SUMS**（所以
+产物改名不会静默 404，校验和对不上就不装），分得清三种结果：
+
+| 情形 | 它说什么 |
+|---|---|
+| 有 release | 下载 → 校验 SHA256 → 装好 → 用 `--version` + `--tui-demo` 自检 |
+| **一次都没发过** | 直说「没有二进制可下」，并把 `git clone && make build` 三行贴出来 |
+| API 连不上 | 让你查网络/代理（区别于「没发布」——这两件事的下一步完全不同） |
+
+`--version v0.1.0` 钉一个发布，`--dir ~/bin` 装到别处，`--local` 从 `build/uya-agent` 装。
+想手工装也行：
 
 ```bash
 curl -LO https://github.com/uya-lang/uya-agent/releases/latest/download/uya-agent-linux-x86_64
