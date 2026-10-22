@@ -190,25 +190,30 @@ adapter 原来只匹配 `session.jsonl*`，**新名字一个都匹配不到** �
 两者都指向「装置有问题」而不是「模型不行」，
 所以**看到基线分 + 空输出，先查装置**。
 
-## 已知未修：不回传 `reasoning_content`
+## 已修：不回传 `reasoning_content`（本轮修的）
 
 **症状**：在要求回传思考内容的路线（opencode thinking 模式）上，第一次工具调用之后
 必然 `HTTP 400 The reasoning_content in the thinking mode must be passed back`。
+真机现场：webcore 跑到第 2–8 步退出，`workspace_changed=false`、得分停在基线 ——
+**读起来像「模型做不出来」，其实是协议走不通**。
 
-**根因**（三条都已核实）：
+**根因**：`struct Msg` 只有 `text` / `extra` 两个数据槽（`extra` 已被 tool_calls
+原文或 tool_call_id 占用），思考内容只进会话日志供显示，从不进历史；
+两条构请求路径也都没有写这个字段。aigw 那条路线会替没回传的历史补空串，
+所以藏了很久；opencode 直连不补。
 
-1. `struct Msg`（`src/agent/ag_config.uya:1045`）只有 `text` / `extra` 两个数据槽；
-   `extra` 已被 `tool_calls` 数组原文或 `tool_call_id` 占用，**没有地方放 reasoning**。
-2. 构请求的两条路径（`ag_tools_schema.uya` 的 chat 版与 responses 版）都没有写
-   `reasoning_content` 的代码 —— `grep -c reasoning_content` 在 `src/agent/` 里
-   只命中显示与日志路径。
-3. 思考内容确实拿到了（`[usage] reasoning=N` 有数、`assistant/reasoning` 落盘了），
-   只是在构请求时被丢掉。
+**修法**：`Msg` 加 `reasoning` / `reasoning_len`；新增 `hist_push_msg_reasoning`
+（旧 `hist_push*` 全部转调，62 个调用点不用改）；chat 路径写 `reasoning_content`，
+responses 路径发独立的 `{"type":"reasoning",...}` item 且排在 `function_call` 之前。
 
-**为什么之前没暴露**：aigw 那条路线对没回传的历史**补空串**（DESIGN §19.x 有实测记录），
-上游接受；opencode 直连不补，直接 400。
+**判据**：`mock_reasoning_echo_ok(rx, expect)` —— 带 tool_calls 的 assistant
+必须带非空 `reasoning_content`；`expect` 由调用方给（不能靠「请求里有没有
+reasoning」自我判断，那是循环论证）。
+A 臂 147 ok / 0 个 verdict 250；B 臂（摘掉修复）红在
+`selftest[unlimited-steps] verdict 250`；真机 webcore **score=1.0、60 轮、1124 s**。
 
-**修法**（要动结构，不是一行）：给 `Msg` 加一个 reasoning 槽（或把它塞进 `extra`
-的 JSON 里），`hist_push*` 带上它，两条构请求路径各写一次字段，
-`--resume` 恢复路径与 `hist_fit_note` 的裁剪口径跟着改。
-影响面：`hist_push*` 62 个调用点、`Msg` 2 处字面构造。
+**教训（值得单独记）**：第一版判据写成「无条件要求每个 tool_calls 消息都有
+reasoning」，但 `mock_bigcall_body` 本来就不回思考，当场假红；第二版改成
+「靠请求里有没有 reasoning 自我判断」，负控下永远绿（自我放行）。
+两个方向都错，最后靠「由调用方显式告诉判据这一轮该不该有」才对。
+**判据的适用条件不能从被测对象本身推出来。**
