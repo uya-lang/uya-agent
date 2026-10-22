@@ -18,7 +18,8 @@
 |---|---|
 | `template_dsh/settings.yaml` | dsh 的隔离 home 模板（`maxTokens: 256000`，**配对口径**）。凭据由 runner 从 `~/.dsh/.credentials.yaml` 拷入，**不入库** |
 | `uyaagent.py` | OpenBench adapter：按 `obench/ADAPTER_SPEC.md` 暴露 `run()` |
-| `dsh.py` | 同上，跑 `dsh --profile headless` |
+| `dsh.py` | 同上，跑 `dsh --profile headless`（`OPENBENCH_DSH_PATCH` 可挂覆盖层） |
+| `opencode.patch.yml` | 走 opencode zen 时的 dsh 覆盖层（见上「换一条路线跑」） |
 
 ## 怎么复现
 
@@ -110,3 +111,59 @@ dsh can manage the installation fallback` 并直接退出。所以 `dsh.py` 的 
   不是推测；但两边的**上下文管理策略不同**：本仓平均 prompt **56 k token（峰值 213 k）**，
   dsh **18.6 k（峰值 53 k）** —— 3× 差距，既解释了本仓更高的单请求成本，
   也解释了它更容易撞上上游的长请求不稳定。
+
+## 复现这套装置踩到的坑（2026-10-22 重跑时补）
+
+这四条都是「装置在骗你」那一族：**结果行看起来完全正常，数字却是假的**。
+
+### 一、`_binary()` 先查 PATH 再查 `OPENBENCH_UYAAGENT_BIN` —— 测了别的二进制
+
+`shutil.which("uya-agent")` 会命中操作者装过的 `~/.local/bin/uya-agent`。
+实测那台机器上它是一份 **0.1.0 (p83-clip-any)** 的旧构建，不认新 flag，
+于是每个单元格都在**参数解析阶段**退出：
+
+| 现场 | 读起来像 |
+|---|---|
+| `error: exit 3` | 协议/配置错 |
+| `output_tail` **空字符串** | 「没输出」 |
+| `workspace_changed: false`、得分停在基线 | **「模型没做出来」** |
+
+判据：`results.jsonl` 每行的 `cmd[0]` 必须是你要测的那份产物。
+已修：显式路径优先（`uyaagent.py` 的 `_binary()`）。
+
+### 二、dsh 0.2.0-rc.2 换了会话日志文件名与结构 —— token/轮数全变 None
+
+| 项 | 旧构建 | 0.2.0-rc.2 |
+|---|---|---|
+| 文件名 | `session.jsonl.zstd` | `session.v4.jsonl.zstd` |
+| usage 记录 | `assistant/chunk` | `assistant/message` |
+| usage 位置 | `data.chunk.usage` | `data.usage` |
+| 镜像位置 | — | `data.stream[].chunk.usage` |
+
+adapter 原来只匹配 `session.jsonl*`，**新名字一个都匹配不到** ⇒
+`_parse_session_usage` 返回 None ⇒ 12 格全是 `turns=None / tokens=None`，
+而 `score` 照样是 1.0（判分不经过 adapter），所以**表面看不出来**。
+已修：`_record_usage` 同时读两种布局；v4 有 `data.usage` 就用它，
+避免把 `stream[]` 里那几份镜像**重复累加**（一次模型调用 = 一个 step = 一份 usage）。
+四条判据见 `dsh.py` 的 docstring 与自测夹具（旧布局 / 新布局 / 无 `data.usage` 回退 / 无关记录）。
+
+### 三、两个 runner 并发写同一份 `results.jsonl` —— 结果互相污染
+
+为了省时间并行跑了「主轮」和「dsh 单独臂」，两边写的是**不同的**文件，
+但同时在打同一个上游。实测差异肉眼可见：
+
+| | taskflow 三格 | webcore |
+|---|---|---|
+| 串行主轮 | 1.0 / 1.0 / 1.0（65/121/71 s） | 1.0 / 1.0 / 1.0 |
+| 并发那一轮 | 1.0 / **0.28** / 1.0（348/14/75 s） | 1.0 / 1.0 / 1.0 |
+
+并发那轮的两格失败是 **10–14 s 就 `exit 1`**、`output_tail` 为空 ——
+不是模型答错，是启动阶段被挤掉。**跨 harness 比效率时必须串行**，
+否则你量的是自己的调度。
+
+### 四、`output_tail: None` 与空字符串是两种不同的病
+
+`None` 是 adapter 根本没拿到输出（子进程没起来 / 被 kill）；
+`''` 是拿到了但一个字节都没有（旧二进制参数解析失败那一族）。
+两者都指向「装置有问题」而不是「模型不行」，
+所以**看到基线分 + 空输出，先查装置**。
