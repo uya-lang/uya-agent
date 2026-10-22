@@ -31,10 +31,16 @@ capability gap when it is really a budget mismatch. Use a template that sets
 Usage accounting
 ----------------
 `dsh` prints only the final assistant message, so tokens come from its own
-session log: `<home>/sessions/<workspace-key>/<session-id>/session.jsonl.zstd`,
-records of type `assistant/chunk` with `chunk.type == "usage"`. Because the home
-is fresh per cell it holds exactly one session, so the attribution is exact.
-Verified against the gateway ledger for one run:
+session log under `<home>/sessions/<workspace-key>/<session-id>/`. Because the
+home is fresh per cell it holds exactly one session, so the attribution is
+exact. Two log layouts exist and `_record_usage` reads both:
+
+    older builds : session.jsonl.zstd      assistant/chunk, chunk.type=usage
+    0.2.0-rc.2   : session.v4.jsonl.zstd   assistant/message, data.usage
+
+The v4 filename is why this adapter once reported `turns=None` on every cell:
+the glob matched `session.jsonl*` only, so the log was never opened. Verified
+against the gateway ledger for one run (older layout):
 
     session log : inputTokens 7776/239, cacheReadTokens 7680, outputTokens 90/2
     ledger      : input_cache_miss 7776/239, input_cache_hit 7680, output 90/2
@@ -44,9 +50,9 @@ so the three fields add up to the billed total -- the same convention the
 uya-agent arm uses. Decompression needs the `zstd` CLI; without it the adapter
 reports tokens=None rather than guessing.
 
-This build does NOT emit `reasoningTokens` in those usage records (the gateway
-ledger does count reasoning), so `tokens_reasoning` stays 0 and the two arms'
-reasoning columns are NOT comparable. Reported as-is rather than estimated.
+Neither layout emits `reasoningTokens` (the gateway ledger does count
+reasoning), so `tokens_reasoning` stays 0 and the two arms' reasoning columns
+are NOT comparable. Reported as-is rather than estimated.
 
 Scoring is NOT done here; the OpenBench checker decides success from the
 workspace.
@@ -60,8 +66,13 @@ import tempfile
 
 NAME = "dsh"
 
+# Canonical OpenBench name -> the model id dsh is configured with.
+# Route-specific, same as the uya-agent arm: the aigw-local template uses
+# `DeepSeek-V4.1-Flash`, the opencode patch uses `deepseek-v4.1-flash`.
 MODELS = {
-    "DeepSeek-V4.1-Flash": "DeepSeek-V4.1-Flash",
+    "DeepSeek-V4.1-Flash": os.environ.get(
+        "OPENBENCH_DSH_MODEL_ID", "DeepSeek-V4.1-Flash"
+    ),
 }
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -114,15 +125,53 @@ def _zstd_available():
     return shutil.which("zstd") is not None
 
 
+def _record_usage(record):
+    """Return the `usage` object for one session record, or None.
+
+    One model call = one step = at most one usage, so this returns a single
+    dict rather than a list. Two layouts exist and both must be read, or the
+    arm reports `turns=None` for a run that plainly used tokens:
+
+    * **v3 / older builds** (`session.jsonl.zstd`): one `assistant/chunk`
+      record per streamed piece, usage under `data.chunk.usage` with
+      `chunk.type == "usage"`.
+    * **v4 / 0.2.0-rc.2** (`session.v4.jsonl.zstd`): a single
+      `assistant/message` record per step, usage under `data.usage`, mirrored
+      once per chunk in `data.stream[].chunk.usage`. Counting every mirror
+      would multiply the totals, so `data.usage` wins when present; without
+      it, the first mirrored chunk is used.
+
+    Measured on 0.2.0-rc.2 (2026-10-22): the file is `session.v4.jsonl.zstd`
+    and `assistant/chunk` records do not exist at all.
+    """
+    data = record.get("data") or {}
+    kind = record.get("type")
+    if kind == "assistant/chunk":
+        chunk = data.get("chunk") or {}
+        if chunk.get("type") == "usage":
+            return chunk.get("usage")
+        return None
+    if kind != "assistant/message":
+        return None
+    if data.get("usage"):
+        return data["usage"]
+    for item in data.get("stream") or []:
+        chunk = (item or {}).get("chunk") or {}
+        if chunk.get("type") == "usage" and chunk.get("usage"):
+            return chunk["usage"]
+    return None
+
+
 def _parse_session_usage(home):
-    """Read the single session log under `home` and sum usage chunks."""
+    """Read the single session log under `home` and sum usage records."""
     root = os.path.join(home, "sessions")
     if not os.path.isdir(root) or not _zstd_available():
         return None
     logs = []
     for dirpath, _dirnames, filenames in os.walk(root):
         for filename in filenames:
-            if filename.startswith("session.jsonl"):
+            # `session.jsonl*` (older) and `session.v4.jsonl*` (0.2.0-rc.2).
+            if filename.startswith("session.") and ".jsonl" in filename:
                 logs.append(os.path.join(dirpath, filename))
     if not logs:
         return None
@@ -148,12 +197,9 @@ def _parse_session_usage(home):
                 record = json.loads(line)
             except ValueError:
                 continue
-            if record.get("type") != "assistant/chunk":
+            usage = _record_usage(record)
+            if usage is None:
                 continue
-            chunk = record.get("data", {}).get("chunk", {})
-            if chunk.get("type") != "usage":
-                continue
-            usage = chunk.get("usage") or {}
             found = True
             steps += 1
             in_uncached += int(usage.get("inputTokens") or 0)
@@ -209,7 +255,11 @@ def run(instruction, workdir, model, timeout_s):
         }
 
     try:
-        cmd = [exe, "--profile", PROFILE, instruction]
+        cmd = [exe, "--profile", PROFILE]
+        patch = os.environ.get("OPENBENCH_DSH_PATCH")
+        if patch:
+            cmd += ["--patch", patch]
+        cmd.append(instruction)
         env = _clean_env(home)
         try:
             proc = subprocess.run(

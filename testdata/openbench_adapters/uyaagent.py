@@ -43,7 +43,9 @@ NAME = "uyaagent"
 # the gateway model id directly; this map exists so `--model` stays canonical
 # on the results row like every other arm.
 MODELS = {
-    "DeepSeek-V4.1-Flash": "DeepSeek-V4.1-Flash",
+    "DeepSeek-V4.1-Flash": os.environ.get(
+        "OPENBENCH_UYAAGENT_MODEL_ID", "DeepSeek-V4.1-Flash"
+    ),
 }
 
 # Where the built binary lives. Overridable so a docker/local lane can point
@@ -69,6 +71,19 @@ _USAGE_RE = re.compile(
 
 
 def _binary():
+    """Pick the binary to measure.
+
+    `OPENBENCH_UYAAGENT_BIN` wins over PATH. The reverse order (which this
+    adapter used to have) silently measured whatever `uya-agent` happened to be
+    installed: a cell ran the operator's stale `~/.local/bin/uya-agent`
+    (0.1.0-p83) instead of the fresh build, and the only visible symptom was
+    `exit 3` with an EMPTY output tail -- old builds do not know the newer
+    flags, so they die in argument parsing before printing anything. The
+    results row still looked like a normal low score.
+    """
+    explicit = os.environ.get("OPENBENCH_UYAAGENT_BIN")
+    if explicit:
+        return explicit
     return shutil.which("uya-agent") or DEFAULT_BINARY
 
 
