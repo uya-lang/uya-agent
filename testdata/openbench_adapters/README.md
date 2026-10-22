@@ -60,6 +60,28 @@ token/成本/延迟的第二份证据从网关账本取（`request_logs` 给
 `client`/`call_kind`/`workspace`，`usage_records` 给 `dimensions_json`/`cost_micros`），
 两侧 adapter 上报的数与账本**逐数相等**才算数。
 
+### 五、opencode 不提供 Responses API，两臂都不能钉 `openai-responses`
+
+`POST .../v1/responses` 回 **503 `Endpoint is unavailable`**，
+`/chat/completions` 回 200。实测（2026-10-22）：
+
+| 配置 | 结果 |
+|---|---|
+| 钉 `--api=responses` | HTTP 400（`reasoning_content` 未回传），第 2–8 步退出 |
+| 不钉（让本仓自己协商） | 协商到 chat/completions，任务正常跑完 |
+
+**两个独立的坑叠在一起**，别只修一个：
+
+1. **钉死协议会关掉协商**：`api_may_negotiate` 只在「未显式声明协议」时才回退，
+   而 503 也不在回退集合（404/405/501）里 —— 声明即权威 + 503 不可回退 = 必挂。
+2. **本仓不回传 `reasoning_content`**：`Msg` 只有 `text` / `extra` 两个槽，
+   思考内容只进会话日志（`assistant/reasoning`，供显示），从不进历史，
+   两条协议路径都没有这个字段。opencode 的 thinking 模式**强制要求**回传上一轮的
+   `reasoning_content`，所以真跑起来仍然会在第 N 步撞同一个 400。
+
+⇒ 装置侧已改成不钉协议（`OPENBENCH_UYAAGENT_API` 可按需覆盖）；
+**第 2 条是本仓的真缺陷，未修**，详见本文件末尾「已知未修」。
+
 ## 三个坑（都是实测踩出来的，不是推测）
 
 ### 一、两侧的**输出上限**必须配对，否则比的是配置不是 harness
@@ -167,3 +189,26 @@ adapter 原来只匹配 `session.jsonl*`，**新名字一个都匹配不到** �
 `''` 是拿到了但一个字节都没有（旧二进制参数解析失败那一族）。
 两者都指向「装置有问题」而不是「模型不行」，
 所以**看到基线分 + 空输出，先查装置**。
+
+## 已知未修：不回传 `reasoning_content`
+
+**症状**：在要求回传思考内容的路线（opencode thinking 模式）上，第一次工具调用之后
+必然 `HTTP 400 The reasoning_content in the thinking mode must be passed back`。
+
+**根因**（三条都已核实）：
+
+1. `struct Msg`（`src/agent/ag_config.uya:1045`）只有 `text` / `extra` 两个数据槽；
+   `extra` 已被 `tool_calls` 数组原文或 `tool_call_id` 占用，**没有地方放 reasoning**。
+2. 构请求的两条路径（`ag_tools_schema.uya` 的 chat 版与 responses 版）都没有写
+   `reasoning_content` 的代码 —— `grep -c reasoning_content` 在 `src/agent/` 里
+   只命中显示与日志路径。
+3. 思考内容确实拿到了（`[usage] reasoning=N` 有数、`assistant/reasoning` 落盘了），
+   只是在构请求时被丢掉。
+
+**为什么之前没暴露**：aigw 那条路线对没回传的历史**补空串**（DESIGN §19.x 有实测记录），
+上游接受；opencode 直连不补，直接 400。
+
+**修法**（要动结构，不是一行）：给 `Msg` 加一个 reasoning 槽（或把它塞进 `extra`
+的 JSON 里），`hist_push*` 带上它，两条构请求路径各写一次字段，
+`--resume` 恢复路径与 `hist_fit_note` 的裁剪口径跟着改。
+影响面：`hist_push*` 62 个调用点、`Msg` 2 处字面构造。

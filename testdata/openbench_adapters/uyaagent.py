@@ -6,7 +6,7 @@ Headless invocation (observed working against the aigw-local gateway):
     UYA_AGENT_API_KEY=<key> uya-agent \
         --no-tui --quiet --no-dsh-config \
         --base-url http://127.0.0.1:8088/v1 \
-        --model DeepSeek-V4.1-Flash --api=responses --effort max \
+        --model DeepSeek-V4.1-Flash --effort max \
         --tls-verify=none \
         --agent-home <isolated> --permission danger-full-access \
         --no-memory \
@@ -212,14 +212,25 @@ def run(instruction, workdir, model, timeout_s):
             "--no-tui", "--quiet", "--no-dsh-config",
             "--base-url", BASE_URL,
             "--model", MODELS[model],
-            "--api=responses", "--effort", "max",
+            "--effort", "max",
             "--tls-verify=none",
             "--agent-home", agent_home,
             "--permission", "danger-full-access",
             "--no-memory",
             "--show-usage",
-            instruction,
         ]
+        # Protocol: pin it only when the lane asks. Pinning `--api=responses`
+        # unconditionally is wrong for routes that do not serve the Responses
+        # API -- opencode zen answers `/responses` with **503 "Endpoint is
+        # unavailable"**, and a pinned protocol also disables this harness's own
+        # negotiation (which only fires on 404/405/501). Measured 2026-10-22:
+        # pinned -> HTTP 400 "reasoning_content ... must be passed back" on the
+        # step after the first tool call; unpinned -> negotiates to
+        # chat/completions and the task completes.
+        api = os.environ.get("OPENBENCH_UYAAGENT_API")
+        if api:
+            cmd.append("--api=" + api)
+        cmd.append(instruction)
         env = _clean_env(key, agent_home)
         try:
             proc = subprocess.run(
@@ -252,4 +263,10 @@ def run(instruction, workdir, model, timeout_s):
             **usage,
         }
     finally:
-        shutil.rmtree(agent_home, ignore_errors=True)
+        # Diagnostic escape hatch, same as the dsh arm: keep the home so a
+        # cell's own session log can be read instead of guessed at. Off by
+        # default so a normal run leaves nothing behind.
+        if os.environ.get("OPENBENCH_UYAAGENT_KEEP_HOME"):
+            print("uyaagent: kept home at {}".format(agent_home), flush=True)
+        else:
+            shutil.rmtree(agent_home, ignore_errors=True)
