@@ -9708,7 +9708,7 @@ RSA 签名算法，拿到 `WR1`（`ba98…`）；openssl 默认拿到 ECDSA 的 
 * `VER_NAME` / `VER_SEMVER`（发布身份，与 git tag 同口径）/ `AGENT_VERSION`（开发阶段串，
   保留老名字，四个既有调用点与自测都在用）。**只在这里各写一次**。
 * `ver_line_into` → `uya-agent 0.1.0 (p83-clip-any)`；`ver_ident_into` → `uya-agent/0.1.0`。
-  （阶段串在 P114 被置空，人读行现在是 `uya-agent 0.1.0`，见 §19.34。）
+  （阶段串在 P114 被置空，人读行现在是 `uya-agent 0.1.1`，见 §19.34。）
 * `--version` / `-V` 在 main 的**预扫**里收口（早于读 DSH 设置与模型目录）：它是
   「设置坏了的时候最需要的那个查询」，排在读设置之后就会在最需要它时失败。
   写 **stdout**、一行、退出码 0（`v=$(uya-agent --version)` 要拿得到干净的值）。
@@ -9795,7 +9795,7 @@ UYA_SELFTEST_MODEL_ONLY=1 ./build/uya-agent --selftest         # 本机（有全
 失败更糟：它会把「这台机器没配」变成一条查不出处的历史记录。DSH 的 preset 也是失败的
 （只是失败得清楚），本仓跟它对齐。
 
-### 19.34 P114：版本号里的开发阶段串去掉（`uya-agent 0.1.0`）
+### 19.34 P114：版本号里的开发阶段串去掉（`uya-agent 0.1.1`）
 
 **症状**：`uya-agent --version` 印的是 `uya-agent 0.1.0 (p83-clip-any)`。语义版本那半
 没问题，括号里那串**对拿到二进制的人没有意义**：`p83-clip-any` 是 P83「剪贴板三源」
@@ -9812,7 +9812,7 @@ UYA_SELFTEST_MODEL_ONLY=1 ./build/uya-agent --selftest         # 本机（有全
 
 * `src/foundation/verx.uya`：`AGENT_VERSION` 置成**空串**。`ver_line_into` 对空阶段串
   一直是**不画括号**的（那一段原本是给「fork 出去把阶段串清掉的构建」写的），所以人读行
-  自然变成 `uya-agent 0.1.0`，拼装函数**一个字节没改**。
+  自然变成 `uya-agent <语义版本>`（当时是 `0.1.0`），拼装函数**一个字节没改**。
 * TUI 脚注（`ag_plan_pump` 的两个 `tui_state_init` 调用点）：传 `VER_SEMVER` 而不是
   `AGENT_VERSION` —— 阶段串空了之后传它等于**不印**，而脚注右半区本来就该退回版本号。
 * `--help` 的 `-V` 那一行：去掉 `(<阶段串>)` 的形状说明（照着它找括号的人会找不到）。
@@ -9831,7 +9831,15 @@ UYA_SELFTEST_MODEL_ONLY=1 ./build/uya-agent --selftest         # 本机（有全
 
 | 判据 | 落点 |
 |---|---|
-| 人读行逐字节是 `uya-agent 0.1.0`（**没有括号**） | `selftest[version]` 判据①（`VER_WANT_LINE` 改死写） |
+| 人读行逐字节是 `uya-agent 0.1.1`（**没有括号**） | `selftest[version]` 判据①（`VER_WANT_LINE` 改死写） |
 | 语义版本仍从**唯一**的那一处喂给两条路 | `selftest[version]` 判据② |
 | `/status` 里印得出当前版本（且不再被空串糊弄） | `selftest[stats]`（改钉 `VER_SEMVER`） |
 | 真二进制：一行、`-V` 与 `--version` 逐字节相同、不依赖设置 | `make e2e-version` 四腿 |
+
+**发版为什么是 `0.1.1` 而不是重发 `0.1.0`**：`v0.1.0` 当时已经是一个**公开的** release
+（三个产物都在，`uya-agent-linux-x86_64` 的 `--version` 印的是
+`uya-agent 0.1.0 (p83-clip-any)`），而本轮改的正是那一行的对外形状。同一个 tag 不能对应
+两份不同字节的产物 —— 老用户手里的 `v0.1.0` 与重发后的 `v0.1.0` 会印不同的版本串、
+`SHA256SUMS` 也对不上，`install.sh --version v0.1.0` 会拿到一个「不知道是哪一个」的
+二进制。所以 `VER_SEMVER` 往前走一格到 `0.1.1`，新 tag 由 `release.yml` 自动出产物；
+`install.sh` 默认走 `releases/latest`，因此不需要改它就已经指向新版。

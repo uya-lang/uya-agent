@@ -3,7 +3,7 @@
 #
 #   curl -fsSL https://raw.githubusercontent.com/uya-lang/uya-agent/main/install.sh | sh
 #   ./install.sh --dir ~/bin            # 装到别处
-#   ./install.sh --version v0.1.0       # 钉一个发布（默认 latest）
+#   ./install.sh --version v0.1.1       # 钉一个发布（默认 latest）
 #   ./install.sh --local                # 从当前目录的 build/uya-agent 装（自己编译过时）
 #
 # 它做的事只有三件：判断架构 → 拿那个二进制 → 放好并 chmod。
@@ -153,7 +153,7 @@ else
     fi
     if [ "$rc" != 0 ]; then
         echo "install.sh: 连不上 GitHub API（${API}）。" >&2
-        echo "           查一下网络 / 代理；也可以直接钉一个版本：--version v0.1.0" >&2
+        echo "           查一下网络 / 代理；也可以直接钉一个版本：--version v0.1.1" >&2
         exit 1
     fi
     echo "install.sh: 下载 $URL"

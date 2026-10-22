@@ -25,7 +25,7 @@ curl -fsSL https://raw.githubusercontent.com/uya-lang/uya-agent/main/install.sh 
 | `--version` 钉的 tag 不存在 | 把**现有的** release 列出来，让你挑一个 |
 | API 连不上 | 让你查网络/代理（区别于「没发布」——这两件事的下一步完全不同） |
 
-`--version v0.1.0` 钉一个发布，`--dir ~/bin` 装到别处，`--local` 从 `build/uya-agent` 装。
+`--version v0.1.1` 钉一个发布，`--dir ~/bin` 装到别处，`--local` 从 `build/uya-agent` 装。
 想手工装也行：
 
 ```bash
@@ -102,7 +102,7 @@ chmod +x uya-agent-linux-x86_64 && mv uya-agent-linux-x86_64 uya-agent
   `/memory search <词>` 检索、`/memory off` 关、`/memory forget` 清空；
   `--no-memory` / `--memory-budget N`。
 
-**版本**：`uya-agent --version` 印一行 `uya-agent 0.1.0` —— 那就是**语义版本**
+**版本**：`uya-agent --version` 印一行 `uya-agent 0.1.1` —— 那就是**语义版本**
 （与 release 的 tag 同口径）。程序名与版本号都在 `src/foundation/verx.uya` 里各写一次，
 `/status`、TUI 脚注、`User-Agent`、`--dsh-web` 对前端报的版本**全从那里取**（以前是
 三个地方三个数，见 DESIGN §19.32 的 P112）。
@@ -110,7 +110,7 @@ chmod +x uya-agent-linux-x86_64 && mv uya-agent-linux-x86_64 uya-agent
 **开发阶段记法**：本仓的提交与 DESIGN 按 `P0`–`P114` 记（每一节末尾有验收记录，
 见 [DESIGN.md §19](DESIGN.md)）。`verx` 里另有一个开发阶段串 `AGENT_VERSION`，
 **P114 起是空串** —— 它只服务于本仓内部的开发线记法，对拿到二进制的人没有意义：
-问「这是哪个版本」，答案就是 `0.1.0`（理由见 DESIGN §19.34）。
+问「这是哪个版本」，答案就是 `0.1.1`（理由见 DESIGN §19.34）。
 
 ---
 
@@ -266,7 +266,7 @@ readelf -lW build/uya-agent | grep -c INTERP    # 0 = 真静态
 | `--no-dsh-writeback` | `/model`、`/effort` 切完**不写回** `settings.yaml`（`UYA_AGENT_DSH_WRITEBACK=0` 同口径）。注意这与 `--no-dsh-config` 不同：那个连模型路线与权限预设都不读 |
 | `--strict-dsh-config` | 读不到 DSH 设置就报错退出 |
 | `--dsh-root DIR` | packaged preset 根（读 persona / plan 段文案） |
-| `-V` / `--version` | 打印**一行**版本后退出（`uya-agent 0.1.0`：程序名 + 语义版本）。**不读设置、不联网、不依赖 `$HOME`** —— 换机/装完之后认版本就用它（`/status` 的 `version` 字段与它逐字节相同，`User-Agent` 与 `--dsh-web` 对前端报的版本也从同一处取）。`--strict-dsh-config` 配一个不存在的 `--dsh-home` 也照样印得出来 |
+| `-V` / `--version` | 打印**一行**版本后退出（`uya-agent 0.1.1`：程序名 + 语义版本）。**不读设置、不联网、不依赖 `$HOME`** —— 换机/装完之后认版本就用它（`/status` 的 `version` 字段与它逐字节相同，`User-Agent` 与 `--dsh-web` 对前端报的版本也从同一处取）。`--strict-dsh-config` 配一个不存在的 `--dsh-home` 也照样印得出来 |
 | `--print-config` | 打印生效配置、preset 旋钮与**来源**后退出（含 `tls_verify` / `tls_pin`） |
 | `--list-dsh-sessions` | 列出 DSH 自己的会话（`<DSH_HOME>/sessions`，含 zstd） |
 | `--resume-dsh ID` | 导入 DSH 会话并继续（id 前缀 ≥8 字符即可） |

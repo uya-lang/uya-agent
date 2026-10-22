@@ -17,15 +17,15 @@ git tag -l           # 打标之前：版本号对不对
 ```
 
 **版本号只有一处**：`src/foundation/verx.uya` 的 `VER_SEMVER`（另有一个开发阶段串
-`AGENT_VERSION` 并列，P114 起是空串，**不随发版动**）。打 `v0.1.0` 之前先确认两件事
+`AGENT_VERSION` 并列，P114 起是空串，**不随发版动**）。打 `v0.1.1` 之前先确认两件事
 逐字节相符：
 
 ```bash
-grep -n 'VER_SEMVER' src/foundation/verx.uya     # 印出 0.1.0
-./build/uya-agent --version                      # 印出 uya-agent 0.1.0
+grep -n 'VER_SEMVER' src/foundation/verx.uya     # 印出 0.1.1
+./build/uya-agent --version                      # 印出 uya-agent 0.1.1
 ```
 
-`--version` 里那个语义版本同时是 `User-Agent: uya-agent/0.1.0 (...)` 的身份段与
+`--version` 里那个语义版本同时是 `User-Agent: uya-agent/0.1.1 (...)` 的身份段与
 `--dsh-web` 的 `host.describe.version`。**改了 `VER_SEMVER` 却忘了发版**的代价不是
 好看与否：用户按 UA 里的版本去找对应的 release，会找到一个不存在的号。
 
@@ -82,8 +82,8 @@ terminal-ui  sandbox  openai  anthropic-alternative  uya
 工作流已经写好了（`.github/workflows/release.yml`）：推一个 `v*` 标签即可。
 
 ```bash
-git tag -a v0.1.0 -m "uya-agent v0.1.0：第一个可下载的二进制"
-git push origin v0.1.0
+git tag -a v0.1.1 -m "uya-agent v0.1.1：版本号只剩语义版本（0.1.0 的括号里那串去掉）"
+git push origin v0.1.1
 ```
 
 它做四件事：构建 Linux 静态二进制 → `make link-audit` → 跑 `selftest-fast`
@@ -101,8 +101,8 @@ cp build/uya-agent uya-agent-linux-x86_64
 chmod 755 uya-agent-linux-x86_64
 strip --strip-all uya-agent-linux-x86_64      # 8.98 MB → 8.27 MB（实测，能跑）
 sha256sum uya-agent-linux-x86_64 > SHA256SUMS
-gh release create v0.1.0 uya-agent-linux-x86_64 SHA256SUMS \
-   --title "uya-agent v0.1.0" --generate-notes
+gh release create v0.1.1 uya-agent-linux-x86_64 SHA256SUMS \
+   --title "uya-agent v0.1.1" --generate-notes
 ```
 
 产物名**必须是** `uya-agent-linux-x86_64`：`install.sh` 按 `uya-agent-${ARCH}` 拼 URL，
