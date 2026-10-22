@@ -347,6 +347,10 @@ fn mock_bigcall_body(out: &Buf) bool {
 
 // 不限步数轮用：一封只含**一个** bash 调用的响应（每轮都一样，靠 tool_call_id 计数）。
 // 不碰文件，从而避开 fs 的观察策略（write 需要先 read）：每一步都是干净、等价的。
+// **带 reasoning_content**：这是「思考 + 工具调用」同时出现的唯一夹具，用来钉住
+// 「下一轮请求必须把上一轮的思考原样回传」这条判据（`mock_reasoning_echo_ok`）。
+// 不带它那条判据就永远不触发 —— 现成的 `mock_bigcall_body` 有 tool_calls 没思考、
+// `mock_final_body` 有思考没 tool_calls，两种形状都不满足「同时有」。
 fn mock_steps_body(out: &Buf) bool {
     var w: JsonWriter = JsonWriter{ buf: null, cap: 0, used: 0, overflow: false };
     jw_init(&w, out.ptr, out.cap);
@@ -364,6 +368,9 @@ fn mock_steps_body(out: &Buf) bool {
     jw_byte(&w, 123);
     jw_key(&w, "role");
     jw_str_cstr(&w, "assistant");
+    jw_byte(&w, 44);
+    jw_key(&w, "reasoning_content");
+    jw_str_cstr(&w, MOCK_STEP_THINK);
     jw_byte(&w, 44);
     jw_key(&w, "content");
     jw_null(&w);
@@ -387,6 +394,11 @@ fn mock_steps_body(out: &Buf) bool {
 // 所以这段文本同时被 mock（产生）和 reasoning_log_round（在会话里读回来）用。
 // 刻意带换行与中文：既验证「取哪一行」的显示口径，也验证日志里的转义/反转义。
 const MOCK_REASONING: &const byte = "先看 note.txt 里有什么，再决定要不要覆盖\n第二行思考只该出现在日志里，不该出现在终端";
+
+// 不限步数轮（`mock_steps_body`）里那段跟随工具调用的思考。与 MOCK_REASONING 分开，
+// 因为两者用途不同：那个检验「思考落日志」，这个检验「思考回传进下一次请求」。
+const MOCK_STEP_THINK: &const byte = "SELFTEST-STEP-THINK 这一步先探一下环境";
+
 
 // P54：**退化响应轮**（mode 41/42）里那段「只有思考」的文本 —— 真机上最常见的退化形状就是
 // 思考流了一大段、正文一个字都没上来。父进程断言证据里的 reasoning 字节数时用的就是这个
@@ -638,6 +650,73 @@ fn mock_field_eq(a: &const Buf, b: &const Buf) bool {
         return false;
     }
     return bufx_mem_eq(a.ptr as &const byte, b.ptr as &const byte, a.len);
+}
+
+// 请求体里的 reasoning 回传校验：**带 tool_calls 的 assistant 消息必须带
+// 非空的 `reasoning_content`**，前提是这一轮 mock 确实回过思考。
+//
+// 为什么这条判据值得单独存在：thinking 模式的上游要求把上一轮思考原样带回，
+// 不回就 400（`The reasoning_content in the thinking mode must be passed back`）。
+// 这个缺陷**不会**在「本地能不能跑通」那类判据里露头 —— 请求照样发得出去、
+// 历史照样对得上，只有真上游才拒。实测（2026-10-22）：aigw 那条路线会替没回传的
+// 历史补空串，藏了很久；opencode zen 直连第一次工具调用之后必挂。
+//
+// ⚠ 口径说明（第一版写错过两次，记在这里别再犯）：
+//   ① 不能无条件要求每个 tool_calls 消息都有 reasoning —— 不是每轮模型都吐思考
+//      （`mock_bigcall_body` 就是一例，它只有 tool_calls）。
+//   ② 也**不能**靠「请求里有没有 reasoning」来自我判断要不要查 —— 那是循环论证：
+//      回传坏了 ⇒ saw_reasoning=false ⇒ 判据自我放行，永远绿。实测确实如此
+//      （负控下 5 次调用全是 `no reasoning in request`）。
+//   所以「这一轮该不该有 reasoning」必须由**调用方**告诉它，见 `expect` 参数。
+fn mock_reasoning_echo_ok(rx: &const Buf, expect: bool) bool {
+    if !expect {
+        return true;    // 这一轮 mock 没回思考：不适用
+    }
+    var arr: Buf = buf_new(1 << 16);
+    defer { buf_free(&arr); }
+    if !buf_valid(&arr) {
+        return false;
+    }
+    const view: &[byte] = rx.ptr[0: rx.len];
+    if !sess_extract_array(view, "messages", &arr) {
+        return false;
+    }
+    const raw: &void = malloc(1 << 20);
+    if ((raw as &byte) as usize) == 0 {
+        return false;
+    }
+    defer { free(raw); }
+    var arena: Arena = Arena{ buffer: null, size: 0, used: 0 };
+    arena_init(&arena, raw as &byte, 1 << 20);
+    var root: JsonValue = JsonValue.json_null();
+    if !js_parse(&arena, arr.ptr, arr.len, &root) {
+        return false;
+    }
+    const total: usize = js_arr_len(&root);
+    var i: usize = 0;
+    while i < total {
+        var m: JsonValue = JsonValue.json_null();
+        if !js_arr_get(&root, i, &m) {
+            return false;
+        }
+        var role: Buf = buf_empty();
+        defer { buf_free(&role); }
+        if !mock_field(&m, "role", 4, &role) {
+            return false;
+        }
+        var tc: JsonValue = JsonValue.json_null();
+        var rs: Buf = buf_empty();
+        if mock_field_is(&role, "assistant")
+            && js_obj_get(&m, "tool_calls", 10, &tc) {
+            if !mock_field(&m, "reasoning_content", 17, &rs) || rs.len == 0 {
+                buf_free(&rs);
+                return false;
+            }
+        }
+        buf_free(&rs);
+        i = i + 1;
+    }
+    return true;
 }
 
 // mock 端最贵的断言：请求里的 `messages` 数组必须满足「每个 assistant tool_calls 后面
