@@ -588,7 +588,7 @@ export fn cmp_cache_unknown(have_split: bool, prompt: i64) bool {
 // ============================================================
 // DSH：thresholdRatio 默认 0.8（这里用千分数避免浮点）
 const CMP_THRESHOLD_PERMILLE: i64 = 800;
-const CMP_RETAIN_PERMILLE: i64 = 160;
+export var cmp_retain_permille: i64 = 160;
 
 // 压缩触发线 = `floor(window × 0.8)`（DSH 的 thresholdRatio 0.8，这里用千分数避免浮点）。
 // `window <= 0`（未知）返回 0 = 不触发。
@@ -668,9 +668,88 @@ export fn cmp_should_compact(pressure: i64, context_window: i64) bool {
     return false;
 }
 
+// ── 上下文感知闸门（2026-10-23）────────────────────────────
+// 压力大不等于该压：压一次要付一次摘要请求，还会丢掉原文。
+// 只有阴影段够大、估算净收益够多、离上次压缩够久时才压。
+// 窗口线仍是硬安全线，先于这三道闸门。
+export var cmp_min_shadow_bytes: usize = 16384;
+export var cmp_min_gain_bytes: usize = 8192;
+export var cmp_compact_cooldown_steps: i32 = 2;
+export var cmp_min_gain_tokens: i64 = 8192;
+export var cmp_last_compact_step: i32 = -1;
+export var cmp_last_compact_pressure: i64 = -1;
+
+// [0, shadow) 的原始字节数（未剪口径，与 cmp_shadow_count 边界同源）
+export fn cmp_shadow_bytes(h: &const History, shadow: usize) usize {
+    var total: usize = 0;
+    var end: usize = shadow;
+    if end > h.len {
+        end = h.len;
+    }
+    var i: usize = 0;
+    while i < end {
+        const m: &const Msg = msg_at(h, i);
+        total = total + m.text_len + m.extra_len;
+        i = i + 1;
+    }
+    return total;
+}
+
+// 估算压缩后的净收益：摘要是被遮蔽段的 ~1/4（保守）。
+fn cmp_est_gain_bytes(shadow_bytes: usize) usize {
+    const quarter: usize = shadow_bytes / 4;
+    if shadow_bytes <= quarter {
+        return 0;
+    }
+    return shadow_bytes - quarter;
+}
+
+// 上下文感知版：先过原来的体量线，再过“值不值得压”的三道闸门。
+// 窗口线是安全线，仍然无条件生效；绝对线/增长线要过：
+//   ① 阴影段至少 cmp_min_shadow_bytes；
+//   ② 估算净收益至少 cmp_min_gain_bytes；
+//   ③ 距上次自动压缩至少 cmp_compact_cooldown_steps 步，
+//      且压力比上次压缩后至少涨了 cmp_min_gain_tokens。
+// 未压过（last_step < 0）时 ③ 不生效。
+export fn cmp_should_compact_ctx(pressure: i64, context_window: i64,
+    shadow_bytes: usize, step: i32) bool {
+    if pressure <= 0 {
+        return false;
+    }
+    const limit: i64 = cmp_pressure_limit(context_window);
+    if limit > 0 && pressure >= limit {
+        return true;
+    }
+    if !cmp_should_compact(pressure, context_window) {
+        return false;
+    }
+    if shadow_bytes < cmp_min_shadow_bytes {
+        return false;
+    }
+    if cmp_est_gain_bytes(shadow_bytes) < cmp_min_gain_bytes {
+        return false;
+    }
+    if cmp_last_compact_step >= 0 && step >= 0
+        && step - cmp_last_compact_step < cmp_compact_cooldown_steps {
+        return false;
+    }
+    if cmp_last_compact_step >= 0 && cmp_last_compact_pressure > 0
+        && pressure - cmp_last_compact_pressure < cmp_min_gain_tokens {
+        return false;
+    }
+    return true;
+}
+
 // 保留多少条最近的原文（按字节比例估算，至少 2 条）
 fn cmp_retain_bytes(total_bytes: usize) usize {
-    var keep: usize = (total_bytes * (CMP_RETAIN_PERMILLE as usize)) / (1000 as usize);
+    var permille: i64 = cmp_retain_permille;
+    if permille < 50 {
+        permille = 50;
+    }
+    if permille > 500 {
+        permille = 500;
+    }
+    var keep: usize = (total_bytes * (permille as usize)) / (1000 as usize);
     if keep < 64 {
         keep = 64;
     }
@@ -865,6 +944,97 @@ fn cmp_summary_prompt(out: &Buf) bool {
     }
     const rules: &const byte = "Rules:\n- Keep exact paths, commands, error strings, identifiers, numbers and syntax fragments.\n- Capture user feedback and corrections faithfully.\n- Do not mention this summarization request or that the context was compacted.\n- Output only the checkpoint text; call no tool.\n- If the conversation already contains a <compacted-summary> block, treat it as a PRIOR checkpoint to merge into your output rather than copying it verbatim.";
     return buf_append_cstr(out, rules);
+}
+
+// 摘要提示词 + 钉住的事实：把原始任务与最近一条用户指令原文附在末尾。
+// 摘要模型即使把中间段落压丢，也必须保留这两条。
+const CMP_PIN_MAX: usize = 1024;
+
+fn cmp_starts_with(t: &const byte, n: usize,
+    prefix: &const byte, pn: usize) bool {
+    if n < pn {
+        return false;
+    }
+    return bufx_mem_eq(t, prefix, pn);
+}
+
+// 用户消息里哪些是“任务/指令”，哪些是注入的上下文（运行时快照、
+// system-reminder、checkpoint）。只钉前者。
+fn cmp_is_task_text(m: &const Msg) bool {
+    if m.role != ROLE_USER || m.text_len == 0 {
+        return false;
+    }
+    const t: &const byte = m.text as &const byte;
+    if cmp_starts_with(t, m.text_len,
+        "<system-reminder>" as &const byte, 17) {
+        return false;
+    }
+    if cmp_starts_with(t, m.text_len,
+        "Current runtime context" as &const byte, 23) {
+        return false;
+    }
+    if cmp_starts_with(t, m.text_len,
+        "This is an automatically generated checkpoint" as &const byte, 45) {
+        return false;
+    }
+    return true;
+}
+
+// 把一条消息的正文钉进摘要提示词（按码点截断，不切 UTF-8）。
+fn cmp_pin_into(m: &const Msg, label: &const byte, out: &Buf) bool {
+    const t: &const byte = m.text as &const byte;
+    var cps: usize = CMP_PIN_MAX;
+    if cps > m.text_len {
+        cps = m.text_len;
+    }
+    const cut: usize = bufx_utf8_prefix_bytes(t, m.text_len, cps);
+    if !buf_append_cstr(out, label) {
+        return false;
+    }
+    return buf_append(out, t, cut);
+}
+
+// 在原来的摘要提示词后追加“钉住的事实”：原始任务 + 最近一条指令。
+export fn cmp_summary_prompt_ctx(h: &const History, shadow: usize,
+    out: &Buf) bool {
+    if !cmp_summary_prompt(out) {
+        return false;
+    }
+    var first: isize = -1;
+    var latest: isize = -1;
+    var i: usize = 1;
+    while i < h.len {
+        const m: &const Msg = msg_at(h, i);
+        if cmp_is_task_text(m) {
+            if first < 0 {
+                first = i as isize;
+            }
+            if i < shadow {
+                latest = i as isize;
+            }
+        }
+        i = i + 1;
+    }
+    if first < 0 {
+        return true;
+    }
+    if !buf_append_cstr(
+        out,
+        "\n\nPinned facts (verbatim; preserve them in the checkpoint):"
+    ) {
+        return false;
+    }
+    if !cmp_pin_into(msg_at(h, first as usize),
+        "\n- Original task: ", out) {
+        return false;
+    }
+    if latest >= 0 && latest != first {
+        if !cmp_pin_into(msg_at(h, latest as usize),
+            "\n- Latest instruction: ", out) {
+            return false;
+        }
+    }
+    return true;
 }
 
 // 构造 checkpoint 消息正文（PREAMBLE + <compacted-summary>…</compacted-summary>）
