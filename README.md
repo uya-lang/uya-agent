@@ -481,8 +481,9 @@ make win-check     # 形状判据：PE32+ / x86-64 / console
 | 剪贴板 | `src/media/clipwin.uya` | **Windows 的控制台宿主不实现 OSC 5522**（DECRQM `ESC[?5522$p` 零应答，与 deepin-terminal 同款）。5522 客户端照旧保留（在 kitty / ghostty / Windows Terminal 一类宿主里会命中），命中不了就落到 Win32 系统剪贴板：文本走 `CF_UNICODETEXT`（回退 `CF_TEXT`，**先按 UTF-8 严格校验再退 CP_ACP**），位图走 `CF_DIB` → Uya 侧解析 `BITMAPINFOHEADER` → RGB → 标准库 JPEG |
 | 事件循环 | `src/rt/rtloop.uya` | 编译器的 Windows 后端把 `epoll_*` 全映射成 ENOSYS，且 `poll(2)` 对**非 socket** fd 一律「立刻就绪」。所以 Windows 上 `rt_run` 走 tick 驱动（每 `RT_POLL_MS` 重 poll 一次），`rt_sleep` 换成看时钟的 future（不占 fd）—— 定时精度与 Linux 那条路**相同** |
 
-另外两处是**既有**缺陷，只在 Windows 上暴露（宿主 GCC 不插桩 / 不在单 TU 下编译），
-`make windows` 在生成物上修掉、不动源码与编译器（脚本在 `testdata/` 里，带复跑判据）：
+另外六处是**既有**缺陷，只在 Windows 上暴露（宿主 GCC 不插桩 / 不在单 TU 下编译 /
+Winsock 与 POSIX 的 ABI 差异），`make windows` 在生成物上修掉、不动源码与编译器
+（脚本在 `testdata/` 里，带复跑判据）：
 
 * `testdata/win_fix_shift_ub.py` —— codegen 把 `u64` 常量拆成高低两半时生成
   `((int64_t)(uint32_t)HI << 32)`，HI ≥ `0x80000000` 就是**有符号左移溢出**；zig cc
@@ -492,11 +493,27 @@ make win-check     # 形状判据：PE32+ / x86-64 / console
   之前（`use of undeclared identifier`）。Windows 必须走单 TU：split-C 会把 Win32 桥的
   **定义**发进每一个 `.c`（它们写在 `uya_part1_types.h` 里），链接期一屏
   `duplicate symbol: chdir / fork / stat …`。
+* `testdata/win_fix_socket_srv.py` —— 桥里缺 `bind` / `listen` / `accept` /
+  `getsockname` / `getpeername` / `shutdown` 的 case（全落到 ENOSYS）⇒ 任何**监听
+  端口**的路径都起不来：离线自测的 mock LLM、`--web`、`--dsh-web`。
+* `testdata/win_fix_nanosleep.py` —— 桥按 `(sec, nsec)` 两个整数收，而调用点传的
+  是**两个 `TimeSpec*` 指针** ⇒ `Sleep()` 拿到一个天文数字 ⇒ 进程**静默挂死**
+  （无 panic、无输出、CPU 不动）。
+* `testdata/win_fix_gettimeofday.py` —— 第二参是 **timezone** 却被当成 `usec`
+  输出位，而调用点传 null ⇒ 时钟精度退化成 1000ms（定时与取消预算双双红）。
+* `testdata/win_fix_nonblock.py` —— Windows 管道没有真正的 `O_NONBLOCK`：桥直接
+  `_read` 会永久阻塞，`poll` 对非 socket fd 又**无条件报就绪** ⇒ EAGAIN 重试循环
+  空转。改成 PeekNamedPipe / 控制台事件数探测。
+
+**Windows 上的自测**：`uya-agent.exe --selftest` 是 **PASS**（77 ok / 93 显式
+SKIP / 0 FAIL）。依赖 `fork` / `execve` / `/proc` / 伪终端的 93 轮逐条打印轮次名
+与 SKIP 原因 —— 它们不是「绿」，是**如实标成不适用**（见 DESIGN.md §19.35.4）。
 
 **已知限制**：`--web` / `--dsh-web` 的子进程与伪终端那套（`fork` + `openpty` + `ioctl`）
 在 Windows 上没有对应实现，`run_shell` 的工具与 `/diff` 的外部 `git` 也依赖 POSIX 进程
 模型 —— 这些路径在 Windows 上会**如实报错**，不会假装成功。真机验收记录（dockur/windows
-的 Win10 客户机、`cap.exe`/`kbd.exe` 真控制台）见 DESIGN.md §19.31。
+的 Win10 客户机、`cap.exe`/`kbd.exe` 真控制台）见 DESIGN.md §19.30；P109 的补桥与
+「Windows 自测 PASS」的判据见 §19.35。
 
 ## 2. 工具
 

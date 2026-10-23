@@ -9884,3 +9884,88 @@ UYA_SELFTEST_MODEL_ONLY=1 ./build/uya-agent --selftest         # 本机（有全
 `SHA256SUMS` 也对不上，`install.sh --version v0.1.0` 会拿到一个「不知道是哪一个」的
 二进制。所以 `VER_SEMVER` 往前走一格到 `0.1.1`，新 tag 由 `release.yml` 自动出产物；
 `install.sh` 默认走 `releases/latest`，因此不需要改它就已经指向新版。
+
+### 19.35 P109：Windows 自测从「几乎全红」到 PASS（7 处桥缺陷 + 显式 SKIP）
+
+**现场**：P108 出了 PE32+ 产物，但 `--selftest` 在 win10 客户机上是 21 轮 ok /
+21 条 FAIL / 8 个轮次红：29 次 `selftest: fork() failed`，首行就是
+`selftest: bind() failed`。
+
+**结论**：逐条分出「平台不适用」与「真缺陷」之后，客户机是 **77 ok / 93 显式
+SKIP / 0 FAIL = SELFTEST PASS**；Linux 侧仍 PASS。
+
+#### 19.35.1 桥的 7 处缺陷（都在生成物上修，不动编译器）
+
+1. **服务端 socket 缺 case**：桥里没有 `bind` / `listen` / `accept` /
+   `getsockname` / `getpeername` / `shutdown`，全落到 `return -38`（ENOSYS）
+   ⇒ 任何**监听端口**的东西都起不来（离线自测的 mock LLM、`--web`、
+   `--dsh-web`）。最小复现证过 Winsock 本身没问题（同一客户机上 socket /
+   bind / getsockname / listen 全 0）。修在 `win_fix_socket_srv.py`。
+2. **`nanosleep` 的 ABI**：桥当成 `(sec, nsec)` 两个整数，而调用点传的是
+   **两个 `TimeSpec*` 指针** ⇒ 一个堆地址被当秒数乘 1000 ⇒ `Sleep()` 给一个
+   天文数字 ⇒ 进程**静默挂死**（无 panic、无输出、CPU 不动；自测停在
+   `async-rt` 之前）。修在 `win_fix_nanosleep.py`。
+3. **`gettimeofday` 的 ABI**：第二参是 **timezone**，桥当成 `usec` 输出位，
+   而调用点传 null ⇒ `tv_usec` 永不写 ⇒ `ua_now_ms()` 精度退化成 **1000ms**。
+   症状是「三次 40ms 的 sleep 落在 100–1200ms」与「取消 ≤400ms 收口」双双红。
+   修在 `win_fix_gettimeofday.py`。
+4. **非阻塞语义**：`uya_windows_read` 直接 `_read`（Windows 管道没有真正的
+   `O_NONBLOCK`）⇒ 空管道读**永久阻塞**；`uya_windows_poll` 对非 socket fd
+   **无条件报就绪** ⇒ EAGAIN 重试循环空转。改成 PeekNamedPipe / 控制台事件数
+   探测，修在 `win_fix_nonblock.py`。
+5. **有符号左移溢出**（203 处）：codegen 写
+   `((int64_t)(uint32_t)HI << 32)`，zig cc 默认开 UBSan ⇒ 真机**启动即 panic**
+   （`left shift of 3421674724 by 32 places`）。`win_fix_shift_ub.py` 已在
+   P108 落地，这里只做回归。
+6. **时钟粒度**：`timeBeginPeriod(1)`（默认 15.6ms 会把每个 tick 放大一倍），
+   于是 `WIN_LDFLAGS` 多了 `-lwinmm`。
+7. **单 TU 的全局初始化顺序**：一个接口值排在它要装箱的具体 struct 之前
+   （`win_fix_init_order.py`，同样 P108 已落地）。
+
+#### 19.35.2 产品级缺陷（不是测试问题）
+
+* `sess_norm_cwd` 只把 `/` 换成 `-`：Windows 的 cwd 是 `C:/a/b`，而 `:` 在
+  文件名里非法 ⇒ 会话目录 `--C:/x--` **建不出来** ⇒ `agent_session_create`
+  失败 ⇒ `--continue` / `--resume` / 会话列表全废。顺带把
+  `\ * ? " < > |` 一起换（同一个判据，一遍扫完）。
+* `tty_pump` 丢掉传入的 fd：`tty_read_stdin` 一开始硬编码了 fd 0，而
+  `tty_pump(ui, fd)` 的自测用管道 fd 喂按键 ⇒ `tui-plan` 红。改成带 fd 参数
+  （Windows 侧只认标准输入，非 0 按「本轮没数据」返回 -1）。
+* `getcwd` 的反斜杠：本仓与标准库拼路径一律用 `/`，混着用会让会话索引与夹具
+  目录「同一路径两种写法」而对不上。Windows 上统一归一成正斜杠。
+* `CF_TEXT` 的编码：先按 UTF-8 严格校验，失败才退 `CP_ACP`（.NET / 浏览器
+  写 UTF-8，而中文 Windows 的 ACP 是 936 —— 无条件按 936 转会毁掉中文）。
+* `/dev/null` → `NUL`：`tls_noise_mute` 写死 `/dev/null`，Windows 上
+  `sys_open` 直接失败 ⇒ 静音窗口**静默不生效**（tls 的 `[HS] ...` 刷屏）。
+  改走 `wincon_null_device`。
+
+#### 19.35.3 自测夹具的两处「碰运气绿」
+
+* `st_stats_ctx` 传给 `tty_title_fallback_into` 的字面量长度写成 36、实际 32
+  —— 多读 4 字节越界内存，Linux 上后面碰巧是 NUL 所以一直是绿的（与「测试里
+  的长度也要是真的」同族）。
+* `ws_prepare` 只 `mkdir(ws)` 不建父目录 —— Linux 上 `make build` 早建好了
+  `build/`，换到别的工作目录（客户机上直接跑 `--selftest`）就全是「夹具建不
+  进去」的连锁红。
+
+#### 19.35.4 平台不适用的轮次改成显式 SKIP
+
+93 轮依赖 `fork` / `execve` / `/proc` / 伪终端 / `testdata` 夹具，而桥里
+`fork`(57) / `execve`(59) 返回 ENOSYS，Windows 也没有 `/proc` 与 openpty。
+做法是**打印轮次名与原因**（`win_skip` 与各驱动函数内部的闸门），绝不静默当绿
+—— 静默跳过等于把「Windows 上子代理 / `run_shell` / `--web` 全都用不了」这件事
+藏起来。
+
+**已知限制**：Windows 版**没有 fork/execve**，因此子代理、`run_shell`、
+`--web` / `--dsh-web`、workflow、MCP server 在 Windows 上都不可用。要支持它们
+需要把「fork + execve」那一整层改写成 CreateProcess 语义 —— 那是另一个工程，
+不是补桥能解决的。
+
+**验收**：
+
+* 客户机：`uya-agent.exe --selftest` → **SELFTEST PASS**（77 ok / 93 SKIP /
+  0 FAIL）
+* 宿主：`make build`（静态链接审计）+ `make selftest-fast` → PASS（无回归）
+* 真机六用例：`sh testdata/windows/run_guest_verify.sh` → 全绿（剪贴板文本 /
+  图片、cmd / PowerShell、TUI、`--tui-demo`）
+* lint-size / doc-audit / doc-cover / codegen-audit / ui-audit 全绿

@@ -111,7 +111,8 @@ WIN_INC    := $(CURDIR)/src/cshim/win32_agent.h
 # 'ws2_32'"。这与编译器自己 `CC_TARGET_FLAGS` 的做法一致（它也把 `-target` 拼进 cc）。
 WIN_CC     := $(ZIG) cc -target x86_64-windows-gnu
 WIN_CFLAGS := -std=c99 -O0 -fno-builtin -I.
-WIN_LDFLAGS:= -lws2_32
+# -lwinmm：`timeBeginPeriod(1)` 在 winmm 里（见 src/cshim/win32_agent.c 的「时钟粒度」）。
+WIN_LDFLAGS:= -lws2_32 -lwinmm
 WIN_JOBS   ?= $(shell nproc 2>/dev/null || echo 4)
 # 用哪个编译器生成 C 目标。默认与 Linux 构建同一个 `$(UYA)`；**可覆盖**是因为
 # 那个二进制偶尔会处在「编译器自身正在改」的状态（实测有过一次连
@@ -219,6 +220,20 @@ endif
 #      开 UBSan ⇒ 真机上**启动即 panic**
 #      （实测 `left shift of 3421674724 by 32 places cannot be represented in
 #      type 'int64_t'`）。把 `(int64_t)` 换成 `(uint64_t)` 即可：值相同、无 UB。
+#   4) 服务端 socket 缺 case：桥里没有 `bind`(49) / `listen`(50) / `accept`(43) /
+#      `getsockname`(51) / `getpeername`(52) / `shutdown`(48)，全落到 `return -38`
+#      （ENOSYS）⇒ 任何**监听端口**的东西都起不来（离线自测的 mock LLM、`--web`、
+#      `--dsh-web`）。真机上第一行就是 `selftest: bind() failed`。
+#   5) `nanosleep` 的 ABI：桥把它当成 `(sec, nsec)` 两个整数，而 Linux 侧传的是
+#      **两个 `TimeSpec*` 指针** ⇒ 一个堆地址被当成秒数乘 1000，`Sleep()` 一个天文
+#      数字 ⇒ 进程**静默挂死**（实测：自测停在 `async-rt` 之前，无 panic、无输出）。
+#   6) `gettimeofday` 的 ABI：桥把第二参（timezone）当成 usec 输出位，而调用点传 null
+#      ⇒ `tv_usec` 永远不写 ⇒ `ua_now_ms()` 精度退化成 **1000ms**。实测后果：自测里
+#      「三次 40ms 的 sleep 落在 100–1200ms」与「取消 ≤400ms 收口」双双红。
+#   7) 非阻塞语义：`uya_windows_read` 直接 `_read`（Windows 管道没有真正的
+#      O_NONBLOCK）⇒ 空管道读**永久阻塞**；`uya_windows_poll` 对非 socket fd
+#      **无条件报就绪** ⇒ EAGAIN 重试循环空转。实测：自测跑到 `async-io` 的
+#      「空管道读必须报 deadline」就永久挂住。
 #
 # 为什么需要 `-include src/cshim/win32_agent.h`：Uya 的 `extern "libc" fn` **不生成
 # C 原型**，而 zig cc（clang）在 C99 下把未声明调用当**错误**（宿主 GCC 只当警告）。
@@ -238,6 +253,10 @@ windows:
 	@sed -i 's/\b_rotr64\b/uya_agent_rotr64/g' build/win/single/agent.c
 	@python3 testdata/win_fix_init_order.py build/win/single/agent.c
 	@python3 testdata/win_fix_shift_ub.py build/win/single/agent.c
+	@python3 testdata/win_fix_socket_srv.py build/win/single/agent.c
+	@python3 testdata/win_fix_nanosleep.py build/win/single/agent.c
+	@python3 testdata/win_fix_gettimeofday.py build/win/single/agent.c
+	@python3 testdata/win_fix_nonblock.py build/win/single/agent.c
 	@echo "== windows 3/3：zig cc 交叉编译（$(WIN_CC)）"
 	@$(WIN_CC) $(WIN_CFLAGS) -include $(WIN_INC) \
 		build/win/single/agent.c src/cshim/win32_agent.c \
