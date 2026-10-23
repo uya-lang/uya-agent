@@ -236,12 +236,35 @@ struct RtWinSleepFut : Future<!usize> {
         if ua_now_ms() >= self.end_ms {
             return Poll<!usize>.Ready(ok<usize>(0 as usize));
         }
+        // 把「下一次该醒的时刻」记进全局：驱动据此**精确**睡到那一刻，而不是每轮固定
+        // 睡 RT_POLL_MS。为什么要精确 —— Windows 的 `Sleep` 粒度实测是 ~15.6ms
+        // （`Sleep(150)` 实测 156ms）：固定睡 16ms 的话，每个分片都向上取整到 ~15.6ms
+        // 的整数倍，三次 40ms 的 sleep 累计能超出自测预算（100–1200ms）并让取消晚到。
+        rt_win_note_deadline(self.end_ms);
         return Poll<!usize>.Pending({});
     }
 
     fn release(self: &Self) void {
         _ = self;
     }
+}
+
+// 驱动用的「下一次该醒的时刻」（毫秒；0 = 没有要求，按 RT_POLL_MS 兜底）。
+// 每次 `RtWinSleepFut.poll` 都会把它压到「更早」的那个值 —— 多个等待并存时取最近的一个。
+var g_rt_win_next_ms: u64 = 0;
+
+// 登记「下一次该醒的时刻」（只在 Windows 的 tick 驱动里用；取更早的那个）。
+fn rt_win_note_deadline(end_ms: u64) void {
+    if g_rt_win_next_ms == 0 || end_ms < g_rt_win_next_ms {
+        g_rt_win_next_ms = end_ms;
+    }
+}
+
+// 取走并清空已登记的 deadline（0 = 没有登记，调用方按 RT_POLL_MS 兜底）。
+fn rt_win_take_next_ms() u64 {
+    const v: u64 = g_rt_win_next_ms;
+    g_rt_win_next_ms = 0;
+    return v;
 }
 
 // 本二进制是不是 Windows 目标（编译期常量，非 Windows 目标下恒 false）。
@@ -290,7 +313,27 @@ fn rt_win_sleep_future(ms: u32) Future<!usize> {
     // （实测 zig cc 报 initializing 'size_t' with an expression of incompatible
     // type 'struct RtWinSleepFut'）。
     if rt_clock_sleep_target() {
-        return try @await rt_win_sleep_future(ms);
+        // **同样要分片**（每片 ≤ RT_CANCEL_SLICE_MS）：`rt_sleep(2000)` 一次睡到底的话，
+        // esc 之后要等满 2 s 才被看见 —— 与 POSIX 分支违反的是同一条不变量。
+        // 实测症状：`async-rt` 轮的「取消没有及时收口」红。
+        const w_end: u64 = ua_now_ms() + (ms as u64);
+        while true {
+            if g_rt_abort != RT_ABORT_NONE {
+                return error.Cancelled;
+            }
+            const w_now: u64 = ua_now_ms();
+            if w_now >= w_end {
+                return 0 as usize;
+            }
+            const w_left: u64 = w_end - w_now;
+            const w_slice: u32 = if w_left > RT_CANCEL_SLICE_MS {
+                RT_CANCEL_SLICE_MS as u32;
+            } else {
+                w_left as u32;
+            };
+            _ = try @await rt_win_sleep_future(w_slice);
+        }
+        return 0 as usize;
     }
     const fd: i32 = rt_sleep_fd();
     if fd < 0 {
@@ -351,6 +394,10 @@ struct RtRunFut : Future<!i32> {
     fn poll(self: &Self, waker: &Waker) Poll<!i32> {
         const now: u64 = ua_now_ms();
         if now >= self.last_ms + RT_FRAME_MS {
+            // `self` 在 Linux 那条路上指向 `scheduler_run_*` 持有的**可变**对象，写进去
+            // 有效；Windows 驱动（`rt_win_drive`）把它放在一个**局部 var** 里，poll 完
+            // 再把 `last_ms` 读回自己的 `last_frame`（见那里的注释）。两边的节流判据
+            // 因此是同一个表达式，不存在「一份实现两种语义」。
             self.last_ms = now;
             g_rt_frames = g_rt_frames + 1;
             g_rt_frame.rt_frame(now);
@@ -414,11 +461,17 @@ export fn rt_run(f: Future<!i32>) i32 {
 // 上层的读循环就成了空转。无条件 tick 把整个循环钉在 ≤62 圈/秒。
 fn rt_win_drive(f: Future<!i32>) i32 {
     var w: Waker = Waker{ _io_fd: 0 - 1, _event_fd: 0 - 1 };
-    const wrapped: RtRunFut = RtRunFut{ inner: f, last_ms: 0 };
+    // `last_ms` 由**驱动自己**持有：`RtRunFut` 在这里是个局部 `const`，它内部改
+    // `self.last_ms` 写的是副本（见 `RtRunFut.poll` 的注释）。每轮驱动先把
+    // `last_ms` 顶到「现在」，`RtRunFut.poll` 读到它就会按 RT_FRAME_MS 节流。
+    var last_frame: u64 = 0;
     while true {
         w.reset();
         w.clear_io_interest();
+        const now_ms: u64 = ua_now_ms();
+        var wrapped: RtRunFut = RtRunFut{ inner: f, last_ms: last_frame };
         const p: Poll<!i32> = wrapped.poll(&w);
+        last_frame = wrapped.last_ms;
         match p {
             .Ready(ok_val) => {
                 // 与 `rt_run` 的 Linux 路径同一口写法：catch 块产出 i32，
@@ -438,7 +491,26 @@ fn rt_win_drive(f: Future<!i32>) i32 {
         if w.is_woken() {
             continue;
         }
-        rt_nanosleep_ms(RT_POLL_MS);
+        // 睡多久：优先「最近的那个 deadline 还剩多少」，没有就按 RT_POLL_MS 兜底。
+        // 两端都夹住 —— 下界 1ms（`Sleep(0)` 是让出时间片，不是等），上界 RT_POLL_MS
+        // （取消判据要求 ≤ 这个粒度，见文件头不变量与 `RT_CANCEL_SLICE_MS`）。
+        const next: u64 = rt_win_take_next_ms();
+        var wait: i32 = RT_POLL_MS;
+        if next != 0 {
+            const now: u64 = ua_now_ms();
+            if next <= now {
+                wait = 1;
+            } else {
+                const left: u64 = next - now;
+                if left < (RT_POLL_MS as u64) {
+                    wait = left as i32;
+                }
+            }
+        }
+        if wait < 1 {
+            wait = 1;
+        }
+        rt_nanosleep_ms(wait);
     }
     return RT_RC_FAILED;
 }

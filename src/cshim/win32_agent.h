@@ -46,6 +46,9 @@ char **uya_win_envp(void);
 /* ---- 控制台 ---- */
 
 /* stdin 是不是真正的控制台（管道 / 文件 / 计划任务重定向都是假）。 */
+/* 时钟粒度是否拿到了 1ms（0 = 没拿到）。见实现文件头的「时钟粒度必须是 1ms」。 */
+int32_t uya_win_timer_period(void);
+
 int32_t uya_win_is_console(void);
 
 /* 读 stdin，**永不阻塞**。返回：>0 字节数；0 = EOF（仅重定向场景）；-1 = 本轮
