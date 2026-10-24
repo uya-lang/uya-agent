@@ -108,7 +108,7 @@ chmod +x uya-agent-linux-x86_64 && mv uya-agent-linux-x86_64 uya-agent
 `/status`、TUI 脚注、`User-Agent`、`--dsh-web` 对前端报的版本**全从那里取**（以前是
 三个地方三个数，见 DESIGN §19.32 的 P112）。
 
-**开发阶段记法**：本仓的提交与 DESIGN 按 `P0`–`P114` 记（每一节末尾有验收记录，
+**开发阶段记法**：本仓的提交与 DESIGN 按 `P0`–`P116` 记（每一节末尾有验收记录，
 见 [DESIGN.md §19](DESIGN.md)）。`verx` 里另有一个开发阶段串 `AGENT_VERSION`，
 **P114 起是空串** —— 它只服务于本仓内部的开发线记法，对拿到二进制的人没有意义：
 问「这是哪个版本」，答案就是 `0.1.1`（理由见 DESIGN §19.34）。
@@ -807,10 +807,12 @@ leaf 指纹怎么算、指纹库放哪儿 —— 见 [DESIGN.md §18](DESIGN.md)
   四条硬边界：① **只在有人看的前台会话里跑** —— 管道 / CI / 子代理不驱动（那儿没人叫停，而每一轮
   都是真的发请求）；② **用户一动键盘就让行**（TUI 里 fd 0 上还有待读字节就不驱动，滚动模式先驱动
   一轮再等输入），按了退出/中断也不会再开新轮；③ **授权不跨进程** —— `/new`、`--resume`、fork 之后
-  目标还在盘上但自动续跑停着，接着跑要人明确 `/goal resume`；④ **异常不自动重试**：某一轮以网络/
+  目标还在盘上但自动续跑停着，接着跑要人明确 `/goal resume`（P116：也可以说一句「继续」，模型侧的
+  goal 策略会先 `get_goal` 再 `update_goal action=resume`）；④ **异常不自动重试**：某一轮以网络/
   协议错收场就停下（DSH 同口径），修好后 `/goal resume`。`round >= maxRounds` 时把盘上的 phase
-  改成 `blocked` + `blocker=round-limit`（是终态，不是悄悄停下）。**每轮一轮就是一条 `<goal_round>`
-  user 消息**进同一个会话（不 fork、不开新 agent），所以历史会一直长 —— 长目标仍要靠 `/compact`。
+  改成 `blocked` + `blocker=round-limit`（是终态，不是悄悄停下；P116：`resume` 会补一段新预算）。
+  **每轮一轮就是一条 `<goal_round>` user 消息**进同一个会话（不 fork、不开新 agent），所以历史
+  会一直长 —— 长目标仍要靠 `/compact`。
   `send_message` 时的任务或催促，只取首行、空白折叠、超长贴尾）；子代理的 stdout **只在跑完时**
   才回传管道，所以「它刚刚说了什么」得等终态或 `subagent_output`（面板上那个 `· N` 是已收输出
   行数，运行中通常是 0）。贴尾只收窄**显示**，`Deleg.prompt` 本身一个字节不动。
@@ -925,10 +927,14 @@ leaf 指纹怎么算、指纹库放哪儿 —— 见 [DESIGN.md §18](DESIGN.md)
   会话**追加一条 `<goal_round>` user 消息（不开新 agent、不 fork 历史）。人类命令没有 `complete`
   动词（标完成由模型工具负责），人的手段是 `edit` / `pause` / `resume` / `clear`；
   `/goal clear` 是删文件、没有 tombstone（清掉后 id 从 1 重新开始）。
-  `/goal` 弹窗里的 `Rounds: 3/20` 与常驻块的 `目标 3/20轮` 是**同一对数**：左边 = 已自动续跑
-  的轮数（人在输入行打的回合不计入），右边 = 创建时给定的上限（`/goal` 建的一律 20，工具面
-  默认 20、最多 200）；跑满即标成 `blocked`（round-limit）停下。弹窗里 `Objective:` /
-  `Blocker:` **压成一行**显示（多行目标与阻塞原因折成空格，方框不会被拆坏）。
+  `/goal` 弹窗里的 `Rounds: 3/256` 与常驻块的 `目标 3/256轮` 是**同一对数**：左边 = 已自动续跑
+  的轮数（人在输入行打的回合不计入），右边 = 创建时给定的上限（`/goal` 建的一律 256，工具面
+  默认 256、最多 1000）；跑满即标成 `blocked`（round-limit）停下。`resume` 会清掉上一次的
+  `blocker`，并在轮次用尽时补一段预算（再给 256 轮）—— 人叫停、会话恢复、轮次用尽之后，
+  一句「继续」（模型侧的 `update_goal action=resume`）或 `/goal resume` 就能接着跑，不会卡在
+  「已恢复但开不动」。弹窗里 `Objective:` / `Blocker:` **压成一行**显示（多行目标与阻塞原因
+  折成空格，方框不会被拆坏）。**P116**：模型侧的 goal 生命周期规则（会话恢复/中断后 resume、
+  complete / blocked 的门槛）是 system prompt 的一节，见 DESIGN §9.5。
   **目标属于会话**（P87）：它落在**会话目录**里（`<agent_home>/sessions/--<cwd>--/<id>/goal.json`，
   与 `session.jsonl` 同目录），所以两条会话各有各的目标、互不可见 —— 换会话（`/new`、`/resume`、
   `--resume`）就是换目标，`/new` 之后新会话**没有**目标。**目标不跨会话继承**：旧的那份留在

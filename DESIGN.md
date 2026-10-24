@@ -1788,7 +1788,7 @@ ralph → `<watch_base>-rN`，N 由管道里已收到的 `[round N]` 行推出
 | 工具 | 语义 |
 |---|---|
 | `get_goal` | 读状态 |
-| `create_goal` | `max_goal_rounds` 默认 20、**上限 200**；id = 上一个 id + 1，revision 1，phase active，armed true |
+| `create_goal` | `max_goal_rounds` 默认 256、**上限 1000**（P116；与 DSH 的 `defaultMaxGoalRounds = 256` 对齐）；id = 上一个 id + 1，revision 1，phase active，armed true |
 | `update_goal` | **CAS**：`goal_id` 与 `revision` **都必须精确匹配**（`goal-3` / `3` 两种写法都收），过期即报错并要求重取；动作 `edit/pause/resume/complete/blocked`；`blocked` 需要非空 `blocked_reason` 且 **`round < 2` 时拒绝**（DSH 规则：同一阻塞条件至少连续 3 轮）；每次成功 revision + 1 |
 
 **CAS 是必须的**：goal 是**跨进程/跨回合**的持久状态，没有 revision 校验的话两个并发分支会
@@ -1797,6 +1797,21 @@ ralph → `<watch_base>-rN`，N 由管道里已收到的 `[round N]` 行推出
 **人类命令面 `goal_cmd_run`**：`/goal`（看状态/用法）、`/goal <objective>`（已有未完成 goal 时拒绝）、
 `/goal edit <objective>`（phase/armed/round 不动）、`/goal pause|resume`（armed 跟着翻）、
 `/goal clear`（**删文件**，不留 tombstone ⇒ clear 之后 id 从 1 重新开始）。
+
+**`resume` 的两件事（P116）**：`/goal resume` 与 `update_goal action=resume` 除了把 phase
+拉回 active 并重新授权，还要 ① **清掉上一次的 `blocker`**（它是上一次停下的原因，接着跑之后
+留在 `get_goal` / 面板上只会误导 —— 真机 `goal.json` 里出现过「phase=active + 旧 blocker」）；
+② **轮次预算用尽时补一段**（`max_rounds = round + 256`）—— 不补的话下一次
+`goal_round_admit` 立刻又把它标回 `blocked`，人看到的「已恢复」等于没恢复。这两条与 DSH 的
+resume 同口径（接受 blocked 的 goal 并清除先前的 blocker reason）；差别只在预算：DSH 在
+Round 上限耗尽时**拒绝** resume（要人先改 `maxGoalRounds`），本仓没有另一条改上限的路
+（`/goal edit` 只换正文），所以改成「人明确要求继续就再给一段」。
+
+**`armed` 的显示口径（P116）**：`get_goal` / `/goal` / goal 动作浮层报的是**生效值** ——
+盘上 `Goal.armed` **且** 进程本地 `g_goal_armed`。只看盘上那位的话，`--resume` 之后会写着
+`armed` 而驱动器一眼都不看它（`g_goal_armed` 已被会话复位清掉）：模型据此以为续跑开着、
+不会去 resume，人也以为它只是慢。盘上字段本身仍然保留（各动作与 `goal_disarm` 都翻它），
+它表示「上一次会话的意愿」。
 
 **控制词只有独占整行时才不区分大小写**，其余非空后缀都是**字面目标**
 （例：`/goal pause after verification` 创建的就是那个字面目标）。
@@ -1871,6 +1886,17 @@ reload；**换会话（`/new`、`/resume`）也 reload**（P87：目标跟着会
 TUI 那一条另加两道**人的优先权**：`tui_abort_state() != QUIT`（按了退出就不许再开轮；这里
 **刻意不用** `tui_quit_wanted()` —— 那个还含 headless 的「注入键用完」，是自测的收工信号）
 与 `tui_input_pending()`（fd 0 上还有待读的键就让行）。
+
+**模型侧的契约是 system prompt 的一节（P116）**：`SEC_GOAL`（`agent/prompt.uya`，order 108）。
+会话恢复 / fork / 人按 esc 之后 active 目标是 **disarmed**：人用任何说法要求继续时，模型要先
+`get_goal` 再 `update_goal action=resume`；`complete` 只在目标真的达成时标；`blocked` 只在
+**同一个具体阻塞条件连续 3 轮**之后才允许，且「难 / 不确定 / 还有活」不算阻塞。没有这一节时
+模型会自己判断「剩余轮次不够」提前 blocked、或在人说「继续」时根本不 resume —— 后者是因为
+它没有任何理由去查目标状态（真机 session-28118a0a 的两条失速）。这一节也是 `<goal_round>`
+末尾那句 "Follow the configured goal-tool policy" 的实指：P116 之前，那句话指向的 policy
+在本仓**根本不存在**（只有三条工具描述）。它常驻 system 而不是像 Uya 速查表那样按需给
+（P63）：模型决定 blocked / resume 的那一刻不会先去查文档，而这套规则只在 goal 生命周期里
+用得上 —— 0.6 KB 换「目标不再半路停下」是划算的。
 
 **`round` 只在真正开轮之后才 +1**（`goal_round_admit` 里与 revision 一起落盘）：记账与投递成对，
 只有记上账的轮次才会被投递。反过来（先投递后记账）一旦落盘失败就是个没有记录的轮次，下一轮
@@ -4070,7 +4096,7 @@ QTermWidget）对 `ESC[?5522$p`（DECRQM）**零应答**，OSC 52 写 `c`/`p` �
 | delegation | `DELEG_MAX` / `DELEG_BUF_MAX` | 4 / `262144` | 槽位 / 管道缓冲（超出丢前缀并同步 `read_off`） |
 | delegation | `subagent_output wait` 上限 | 600 次 × 100 ms、墙钟 30000 ms | 防无限等待 |
 | delegation | `ralph` rounds | 默认 4 / 上限 20 | 防无限轮 |
-| goal | `max_goal_rounds` | 默认 20 / 上限 200 | |
+| goal | `max_goal_rounds` | 默认 256 / 上限 1000 | P116 从 20/200 提上来（与 DSH 的默认 256 对齐） |
 | goal | `blocked` 最小轮数 | `round < 2` 拒绝 | DSH 规则：同一阻塞条件至少连续 3 轮 |
 | workflow | `WF_MAX_STEPS` | 256 | 钩子处理上限；循环上限 `× 40 = 10240` 圈 |
 | worktree | `WT_ROOT` / `WT_BRANCH_PREFIX` | `.git/dsh-worktrees` / `dsh/` | 放 `.git` 下让 glob/grep 剪掉它 |
@@ -9864,7 +9890,7 @@ UYA_SELFTEST_MODEL_ONLY=1 ./build/uya-agent --selftest         # 本机（有全
 （「`/status` 里印得出当前版本」）不变，但不再能被空串糊弄。
 
 **没顺手做的**：不删 `AGENT_VERSION` 这个常量与它的两个调用点。它仍是**开发阶段身份**
-的挂载点（README §0.1 的 `P0`–`P114` 记法与 `--tui-demo` 脚注排版基准都指着它），
+的挂载点（README §0.1 的 `P0`–`P116` 记法与 `--tui-demo` 脚注排版基准都指着它），
 删掉它等于把「以后要挂一条阶段串」变成一次结构改动。置空是**可逆**的：把串填回去，
 拼装函数、自测与文档都不必再改。
 
@@ -9969,3 +9995,57 @@ SKIP / 0 FAIL = SELFTEST PASS**；Linux 侧仍 PASS。
 * 真机六用例：`sh testdata/windows/run_guest_verify.sh` → 全绿（剪贴板文本 /
   图片、cmd / PowerShell、TUI、`--tui-demo`）
 * lint-size / doc-audit / doc-cover / codegen-audit / ui-audit 全绿
+
+### 19.36 P116：goal 不再中途停下等人打「继续」
+
+**症状**（用户报的）：「goal 不会一直执行到目标完成，中途会停顿，要输入继续」。
+
+**真机取证**（`~/.uya-agent/sessions/` 下的 14 份 `goal.json` + 会话日志）：
+
+* `session-28118a0a`（「直到所有 todo 任务完成」）：1–16 轮自动跑得好好的；第 16 轮里模型
+  先 `get_goal`、看到 `round = 16/20`，紧接着 `update_goal action=blocked`，`blocked_reason`
+  的原文就是「剩余工作量远超本会话可用上下文 …… 无法在剩余轮次内安全完成」。自动续跑到此
+  为止；人打了「继续，不要停」，模型才 `resume`。之后 17–18 轮又被 esc 停下（**P96 的正确
+  行为**），但接下来人又连打了几句「继续」，目标**再也没有自己开过轮**。
+* `session-429370d0`：同样是「`<goal_round>` 被中断 → 人打继续」；
+  `session-97cb4df6` 则是 `turn/end reason=error` 之后 `turn/retry` 自己补了「继续」——
+  回合级重试（P94/P96）已经覆盖异常收场，问题不在那一层。
+
+**三条根因**（都不是「驱动器循环」本身）：
+
+1. **轮次太少**：默认 20 轮，模型看到「只剩 4 轮」就自己收工 —— 它没有错，是预算没给够。
+   DSH `dsh-goal` 的默认是 **256**。
+2. **模型看不到 goal 生命周期的规则**：`<goal_round>` 末尾写着 "Follow the configured
+   goal-tool policy"，但本仓**从来没有配置过**这份 policy（只有三条工具描述）。于是模型按
+   自己的判断 blocked（难 / 剩余活多 / 上下文不够），会话恢复或 esc 之后也没有任何理由去
+   `update_goal action=resume`。
+3. **显示说 armed、驱动器却停着**：`armed` 的真相是「盘上字段 **且** 进程本地
+   `g_goal_armed`」，而 `get_goal` / `/goal` / 动作浮层只报盘上那位。`--resume` 之后盘上
+   可能还留着 true —— 模型读到 `armed = true` 于是不会 resume，人看到的也是 armed，以为
+   它只是慢。这一条会让第 2 条修好之后**仍然**失灵。
+
+**修法**：
+
+* `agent/prompt.uya`：新增 `SEC_GOAL`（order 108）—— DSH 的 goal policy：会话恢复 / fork /
+  中断后要 resume；`complete` 只在真的达成时；`blocked` 只在同一具体条件连续 3 轮后，
+  且「难 / 不确定 / 还有活」不算阻塞。理由见 §9.5。
+* `agent/goal.uya`：`GOAL_DEFAULT_MAX_ROUNDS = 256`（工具面 cap 1000），人类命令与
+  `create_goal` 共用它；`resume`（命令面 + 工具面）清 `blocker`、预算用尽时补
+  `round + 256`；`goal_render` / `goal_render_user` 报**生效** armed。
+* `agent/ag_worktree.uya`：goal 动作浮层的说明行与 `✓` 同一口径（生效 armed）。
+
+**验收**：
+
+| 判据 | 落点 |
+|---|---|
+| `/goal` 建的目标默认 256 轮，`<goal_round>` 里是 `Round: N/256` | `selftest[goal]` K2/K3 |
+| resume 清 blocker + 补预算（命令面，fixture = blocked + round-limit + 预算用尽） | `selftest[goal]` K6 |
+| resume 清 blocker + 补预算（工具面，真 JSON 参数 / CAS） | `selftest[goal]` K11 |
+| system prompt 里真有 `SEC_GOAL` 的四条关键约束 | `selftest[prompt-todo-plan]`（mock 模式 10，verdict 182–185） |
+| 目标浮层状态行按新默认显示 | `selftest[tui-title-input]`（`active · 0/256 · armed`） |
+| `/goal` 端到端 | `make e2e-goal`（`Rounds: 0/256`） |
+
+**没顺手做的**：① 没把「人打了继续」做成代码层自动 re-arm —— 按 DSH 语义，resume 是模型 /
+人的显式动作；自动收掉 esc 的停止权等于把 P96 改回去。② `update_goal edit` 仍不能改
+`max_goal_rounds`（DSH 的 edit 能）—— 本仓用 resume 补预算覆盖了同一条需求，真需要
+「人指定一个更大的数」时再加。③ 没动 `turn/retry`：异常收场它已经自动续（P96）。
