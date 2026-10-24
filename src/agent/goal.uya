@@ -15,8 +15,10 @@
 //   （清掉后 id 从 1 重新开始）；⑥ 控制词只有**独占整行**时才不区分大小写，其余非空后缀都是
 //   **字面目标**（`/goal pause after verification` 创建的就是那个字面目标）；
 //   ⑦ **`round` 只在一次续跑真正开始之后才 +1**（`goal_round_admit` 里落盘），被拒的预留
-//   **不消耗轮号** —— 与 DSH 的 `roundsStarted` 口径一致；⑧ 续跑授权分**盘上**（`Goal.armed`，
-//   `get_goal` 报它）与**进程本地**（`g_goal_armed`）两份，后者**不跨会话**；
+//   **不消耗轮号** —— 与 DSH 的 `roundsStarted` 口径一致；⑧ 续跑授权分**盘上**（`Goal.armed`）
+//   与**进程本地**（`g_goal_armed`）两份，后者**不跨会话**；`get_goal` / `/goal` 报的是两者
+//   同时成立的**生效值**（P116：`--resume` 之后盘上可能仍是 true，只报盘上就会写着 armed
+//   而驱动器根本不看那一位）；
 //   ⑨ 目标**属于会话**：落点是**会话目录**里的 `goal.json`（与 `session.jsonl` 同目录），
 //   所以两条会话各有各的目标、互不可见 —— 这是「会话目标」这个名字的实体化
 //   （修前落在 agent_home 根上，同一台机器的所有会话共用一份）。
@@ -32,6 +34,11 @@
 //   * `armed` **不跨进程**：换会话/恢复那条路（`agent_history_begin` 里的会话级复位）把它
 //     清成进程本地的未授权。于是 `--resume` 之后目标还在盘上、自动续跑却停着，要接着跑必须
 //     由人明确授权（`/goal resume` 或 `update_goal action=resume`）—— 与 DSH 的激活边界同一条。
+//     P116：resume 除了重新授权，还会清掉上一次的 `blocker`，并在轮次预算用尽时补一段
+//     （`round + 默认预算`）—— 不补的话下一次 admit 立刻又标回 blocked，「已恢复」等于没恢复。
+//     模型侧规则（恢复/中断后要 resume、blocked 门槛）在 system prompt 的
+//     `SEC_GOAL`（`agent/prompt.uya`）—— `<goal_round>` 末尾那句 "Follow the
+//     configured goal-tool policy"（order 108）指的就是它。
 //
 // 目标存在**会话目录**下的 goal.json 里（`<agent_home>/sessions/--<cwd>--/<id>/goal.json`），
 // 跨进程可读；字段：objective / phase / round / maxRounds / blocker / revision / id。
@@ -78,8 +85,18 @@ export var g_goal_armed: bool = false;
 //   * `goal_round_admit`：轮次用尽或写盘失败 → false。
 // 换会话的复位在 `agent_session_scoped_reset`（`agent/agent.uya`，直接写这一位）。
 
+// P116：默认轮次预算 —— 对齐 DSH `dsh-goal` 的 `defaultMaxGoalRounds`（256）。
+//
+// 原来给 20，实测太少：一条 25 项的迁移任务跑到 16/20 时，模型看到「只剩 4 轮」就自己
+// `update_goal action=blocked` 收工（真机 session-28118a0a，blocker 原文就是「剩余轮次
+// 不够」）。轮次预算只该兜住「无限空转」，不该在任务做完之前逼模型选停。
+export const GOAL_DEFAULT_MAX_ROUNDS: i32 = 256;
+// 工具面 `max_goal_rounds` 的显式上限。比默认大一截，给「一次多给点」留余地；
+// 再大就不是预算，只是面板上一个没人看的数字。
+const GOAL_MAX_ROUNDS_CAP: i32 = 1000;
+
 // 零值 Goal：无 goal（id 0）、phase/objective/blocker 是 `buf_empty`、
-// `max_rounds` 给 20（不是 0 —— 0 会被下游当成「不许跑」）、armed=false。
+// `max_rounds` 给默认预算（不是 0 —— 0 会被下游当成「不许跑」）、armed=false。
 export fn goal_empty() Goal {
     return Goal{
         active_state: false,
@@ -88,7 +105,7 @@ export fn goal_empty() Goal {
         phase: buf_empty(),
         objective: buf_empty(),
         round: 0,
-        max_rounds: 20,
+        max_rounds: GOAL_DEFAULT_MAX_ROUNDS,
         blocker: buf_empty(),
         armed: false,
     };
@@ -363,8 +380,11 @@ fn goal_render(g: &const Goal, out: &Buf) void {
     _ = buf_append_u64(out, g.round as u64);
     _ = buf_append_cstr(out, " / ");
     _ = buf_append_u64(out, g.max_rounds as u64);
+    // P116：报**生效值**（盘上意愿 && 进程本地授权），不是盘上那个字段 ——
+    // `--resume` 之后盘上可能还留着 true，只报它的话模型/人都会以为续跑开着，
+    // 而驱动器根本不看盘上这一位（g_goal_armed 已被会话复位清掉）。
     _ = buf_append_cstr(out, "\narmed = ");
-    if g.armed {
+    if g.armed && g_goal_armed {
         _ = buf_append_cstr(out, "true");
     } else {
         _ = buf_append_cstr(out, "false");
@@ -391,8 +411,9 @@ export fn goal_tool_get(cfg: &const Config, out: &Buf) void {
     goal_render(&g, out);
 }
 
-// `create_goal` 工具：`max_goal_rounds` 默认 20、**上限 200**；新 id = 上一个 id + 1，
-// revision 1、phase active、armed true。
+// `create_goal` 工具：`max_goal_rounds` 默认 `GOAL_DEFAULT_MAX_ROUNDS`（256）、
+// 上限 `GOAL_MAX_ROUNDS_CAP`（1000）—— P116 从 20/200 提上来的，理由见常量那里；
+// 新 id = 上一个 id + 1，revision 1、phase active、armed true。
 // 已经有**未完成**的目标时**拒绝顶掉**（要换目标必须先 update 或 clear）。
 export fn goal_tool_create(cfg: &const Config, args: &const JsonValue, out: &Buf) void {
     var objective: Buf = buf_empty();
@@ -401,12 +422,12 @@ export fn goal_tool_create(cfg: &const Config, args: &const JsonValue, out: &Buf
         _ = buf_append_cstr(out, "Error: invalid objective: expected a non-empty string");
         return;
     }
-    var maxr: i32 = 20;
+    var maxr: i32 = GOAL_DEFAULT_MAX_ROUNDS;
     var mv: JsonValue = JsonValue.json_null();
     var n: i64 = 0;
     if js_obj_get(args, "max_goal_rounds", 15, &mv) && js_i64_of(&mv, &n) && n > 0 {
-        if n > 200 {
-            n = 200;
+        if n > (GOAL_MAX_ROUNDS_CAP as i64) {
+            n = GOAL_MAX_ROUNDS_CAP as i64;
         }
         maxr = n as i32;
     }
@@ -499,8 +520,17 @@ export fn goal_tool_update(cfg: &const Config, args: &const JsonValue, out: &Buf
         goal_set_lit(&g.phase, "paused" as &const byte, 6);
         g.armed = false;
     } else if bufx_eq_cstr(action.ptr as &const byte, action.len, "resume") {
+        // P116：resume 是「人明确要求继续」，两件事一起做 ——
+        //   ① 清掉上一次的 blocker：它是上一次停下的原因，接着跑之后留在 get_goal /
+        //      面板上只会误导（真机上「phase=active + 旧 blocker」同时存在过）；
+        //   ② 轮次预算真的用尽（round-limit）时补一段：不补的话下一次 admit 立刻又把它
+        //      标回 blocked，人看到的「已恢复」等于没恢复。
         goal_set_lit(&g.phase, "active" as &const byte, 6);
         g.armed = true;
+        buf_reset(&g.blocker);
+        if g.max_rounds > 0 && g.round >= g.max_rounds {
+            g.max_rounds = g.round +% GOAL_DEFAULT_MAX_ROUNDS;
+        }
     } else if bufx_eq_cstr(action.ptr as &const byte, action.len, "complete") {
         goal_set_lit(&g.phase, "complete" as &const byte, 8);
         g.armed = false;
@@ -572,8 +602,8 @@ export fn goal_tool_update(cfg: &const Config, args: &const JsonValue, out: &Buf
 export const GOAL_USAGE: &const byte =
     "Usage: /goal [<objective>|clear|edit <objective>|pause|resume]" as &const byte;
 
-// 人类命令的默认轮次上限（与 goal_tool_create 同口径；工具面还能用 max_goal_rounds 覆写）
-const GOAL_CMD_MAX_ROUNDS: i32 = 20;
+// 人类命令的默认轮次上限与工具面**同一个常量**（`GOAL_DEFAULT_MAX_ROUNDS`；工具面还能用
+// max_goal_rounds 覆写）。P116 起是 256 —— 原来这里另写死 20，两处只能各改各的。
 
 // 是不是空白（空格 / tab / LF / CR）。用于 `/goal` 命令行的控制词判定。
 fn goal_is_space(c: byte) bool {
@@ -667,6 +697,9 @@ export fn goal_clear(cfg: &const Config) bool {
 // 键名 `Status:` / `Rounds:` / `Activation:` / `Commands:` 一个字节都不动：逐字对齐 DSH 的
 // commands/command-goal（`make e2e-goal` 也在 grep 它们）。
 fn goal_render_user(g: &const Goal, out: &Buf) void {
+    // P116：与 get_goal 同一个口径 —— 报**生效值**（盘上意愿 && 进程本地授权）。
+    // `--resume` 之后盘上可能仍是 true，只报盘上就会写着 armed 却根本不跑。
+    const on: bool = g.armed && g_goal_armed;
     _ = buf_append_cstr(out, "Status: ");
     _ = buf_append(out, g.phase.ptr, g.phase.len);
     if goal_phase_is(g, "blocked" as &const byte) && g.blocker.len > 0 {
@@ -686,14 +719,14 @@ fn goal_render_user(g: &const Goal, out: &Buf) void {
     _ = buf_append_cstr(out, "/");
     _ = buf_append_u64(out, g.max_rounds as u64);
     _ = buf_append_cstr(out, "\nActivation: ");
-    if g.armed {
+    if on {
         _ = buf_append_cstr(out, "armed");
     } else {
         _ = buf_append_cstr(out, "disarmed");
     }
     _ = buf_append_cstr(out, "\n\nCommands: ");
     if goal_phase_is(g, "active" as &const byte) {
-        if g.armed {
+        if on {
             _ = buf_append_cstr(out, "/goal edit <objective>, /goal pause, /goal clear");
         } else {
             _ = buf_append_cstr(out, "/goal edit <objective>, /goal resume, /goal clear");
@@ -767,7 +800,7 @@ fn goal_cmd_create(cfg: &const Config, p: &const byte, s: usize, e: usize, out: 
     g.objective = buf_new(e - s + 8);
     _ = goal_set_span(&g.objective, p, s, e);
     g.round = 0;
-    g.max_rounds = GOAL_CMD_MAX_ROUNDS;
+    g.max_rounds = GOAL_DEFAULT_MAX_ROUNDS;
     g.blocker = buf_empty();
     g.armed = true;
     if !goal_save(cfg, &g) {
@@ -809,8 +842,16 @@ fn goal_cmd_switch(cfg: &const Config, out: &Buf, armed: bool, verb: &const byte
     if !goal_load(cfg, &g) {
         return goal_cmd_missing(out, verb);
     }
+    // P116：resume（armed=true）与 update_goal 的 resume 同口径 —— 清掉上一次的 blocker，
+    // 并在轮次预算用尽时补一段（否则下一次 admit 立刻又标回 blocked）。
     goal_set_lit(&g.phase, phase, bufx_cstr_len(phase));
     g.armed = armed;
+    if armed {
+        buf_reset(&g.blocker);
+        if g.max_rounds > 0 && g.round >= g.max_rounds {
+            g.max_rounds = g.round +% GOAL_DEFAULT_MAX_ROUNDS;
+        }
+    }
     g.revision = g.revision +% 1;
     if !goal_save(cfg, &g) {
         _ = buf_append_cstr(out, "Error: cannot persist the goal\n");
@@ -885,8 +926,9 @@ export fn goal_cmd_run(cfg: &const Config, line: &const Buf, out: &Buf) i32 {
 
 // 把「继续自动跑」这一位收掉：**进程本地与盘上都收**，phase 一个字节不动。
 //
-// 为什么要连盘上一起翻（P96）：`g_goal_armed` 只活这一次会话，而面板与 `get_goal` 报的是
-// 盘上那位 —— 只清本地的话，界面会一直写着 armed，人还以为它在接着跑。
+// 为什么要连盘上一起翻（P96；P116 起显示改看「盘上 && 本地」的生效值，这一笔仍要写）：
+// 写盘让 goal.json 自己也不留着一个早就没了的授权 —— 别的进程/工具读到它时不该以为
+// 这条目标还在自动跑。只清本地的话，盘上会永久留着一次「早就作废的 armed=true」。
 // phase 保持 active 是刻意的：目标本身没被放弃，`/goal resume` 一条命令就接着跑；
 // 顺手改成 paused 反而要人多想一步「我是不是把它弄坏了」。
 // 写盘失败不做补救（授权照样收掉 ——「不再自己跑」比「盘上好看」重要）。

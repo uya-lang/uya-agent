@@ -592,7 +592,7 @@ e2e-goal: build
 		|| { echo "FAIL: 空态没有给出用法"; exit 1; }; \
 	echo "$$out" | grep -qF "Goal created" || { echo "FAIL: 没有建出目标"; exit 1; }; \
 	echo "$$out" | grep -qF "Status: active" || { echo "FAIL: 创建后不是 active"; exit 1; }; \
-	echo "$$out" | grep -qF "Rounds: 0/20" || { echo "FAIL: 轮数显示不对"; exit 1; }; \
+	echo "$$out" | grep -qF "Rounds: 0/256" || { echo "FAIL: 轮数显示不对"; exit 1; }; \
 	echo "$$out" | grep -qF "Objective: 把 make release 跑绿" || { echo "FAIL: 目标正文不对"; exit 1; }; \
 	echo "$$out" | grep -qF "A goal is already active." \
 		|| { echo "FAIL: 未完成的 goal 被第二个目标顶掉了"; exit 1; }; \
