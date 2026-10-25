@@ -853,6 +853,21 @@ bash 结果占请求窗口 **57.9%**，read 只占 **12.9%**；其中会走到�
 开关：`--no-compact` / `--context-window N` / `/compact`（运行中敲的排 step 边界）。
 `compaction/summary` 事件落日志。
 
+**P120：模型面的 `compact` 工具**（压缩的第四个触发点 —— 前三个是自动触发、人的
+`/compact`、超窗重试时的就地压缩，都没有「模型自己觉得该压了」这条）。它**不当场压** ——
+只把 `g_compact_requested` 置起来，由**同一个 step 边界**消费（与 `/compact` 同一个落点）。
+不当场压是硬要求：工具是在**一个 tool 组的中途**执行的，而压缩从 0 开始按字节比例遮一段、
+其余原样保留 ⇒ 当场压可能把本步的 `assistant(tool_calls)` 遮掉、却留下它的 tool 结果
+⇒ 孤儿组 ⇒ 下一次请求 400（§19.10 那条死锁是「压不动」，这条会是「压坏了」）。
+放到 step 边界之后语义仍等价：**下一个请求看到的就是压过的历史**。
+
+回执里必须带**真值**：`Context now: ~<压力> tokens used of <窗口> (<百分比>%)`；太短时回
+`Nothing to compact yet …` 并说明**什么都没改**；`--no-compact` 时回
+`Error: compaction is disabled …`，一次都不排。这条是被现场逼出来的（§19.38）：真机上模型
+连着十几轮自称「上下文只剩 3%」（真值 20%），最后拿这个猜数当理由把整段目标停下 ——
+它手上没有任何读这个数的口子。同一组真数也进了 `<goal_round>` 正文
+（`Context: ~N tokens used of M (P%)`），让模型**每一轮**都有读数，不必先调工具。
+
 **P88：三道自保闸门（缺任何一道，「历史已经太大」时压缩就失效）** —— 现场见 §19.10：
 
 | 闸门 | 实现点 | 挡的是 |
@@ -1144,7 +1159,7 @@ front-matter = `---` 包起来的 YAML，必填 `name`（kebab-case，`[a-z0-9-]
 
 ### 6.1 工具目录：固定顺序
 
-29 个工具按**固定顺序**拼进请求（`tools_json`，`src/agent/ag_tools_schema.uya`）。
+30 个工具按**固定顺序**拼进请求（`tools_json`，`src/agent/ag_tools_schema.uya`）。
 顺序**恒定**是关键设计：工具目录跨模式稳定 ⇒ 前缀缓存不会因为「模式变了」而失效。
 
 | 组 | 工具 | 条件 |
@@ -1153,14 +1168,15 @@ front-matter = `---` 包起来的 YAML，必填 `name`（kebab-case，`[a-z0-9-]
 | 执行 | `bash` `job_list` `job_output` `job_kill` | **`allow_shell` 时**（否则整组不出现） |
 | 会话与交互 | `workspace` `worktree` `set_title` `todo_write` `exit_plan_mode` `ask_user_question` | **总是**（含 plan 模式 —— 工具目录跨模式稳定） |
 | 技能与搜索 | `skill` `uya_notes` `web_search` | 总是 |
+| 上下文（P120） | `compact` | 总是（只排一次 step 边界的压缩，不改历史、不自己发请求） |
 | 子代理 | `subagent` `subagent_fork` `list_agents` `subagent_output` `send_message` `interrupt_agent` `ralph` | 总是 |
 | 目标 | `create_goal` `get_goal` `update_goal` | 总是 |
 | 编排 | `workflow` | 总是 |
 | 插件（P70） | `mcp`（元工具）；每个 MCP 插件自己报的工具 | **配了 MCP server 时才出现**（没配时工具表逐字节不变，见 §21） |
 
 schema 文本是 `TOOL_*` 常量（`src/agent/ag_tools_schema.uya`），逐字对齐 DSH v0.1.1-rc.2 的
-standard preset。**唯二例外**是本仓自有的两个：`uya_notes`（P63，速查表）与 `run_shell`
-（死常量，未被 `tools_json` 引用）。
+standard preset。**例外**是本仓自有的三个：`uya_notes`（P63，速查表）、`compact`
+（P120，模型主动压缩，见 §5.3.3）与 `run_shell`（死常量，未被 `tools_json` 引用）。
 
 **两种协议的 schema 差异只用文本变换实现**：`TOOL_FLAT_STRIP`（31 字节）去掉
 `{"type":"function","function":{` 前缀 + 去掉尾部大括号 → Responses 形状。这样**只有一份**
@@ -1188,6 +1204,7 @@ schema 真值，不会两边漂移。
 | `ask_user_question` | `questions[]`（每项 `id`+`question`） | `header` `options[{label,description}]` `multi_select` | JSON `{"answers":[{"id":…,"selected":[…],"custom":…}, …]}` |
 | `workspace` | — | `path` | 无参 = 报告；带 `path` = chdir + 规范化 + 重指 `FsCtx` + 清技能缓存 + `gd_reset` + 记 `session/workspace` |
 | `todo_write` | `todos[]` | — | 整表替换；去重与状态校验 |
+| `compact` | — | — | `Compaction queued: N earlier message(s) (B bytes) …` + `Context now: ~X tokens used of Y (P%)`；太短 `Nothing to compact yet …`（什么都没改）；`--no-compact` 时 `Error: compaction is disabled …`（不排队） |
 | `exit_plan_mode` | `plan` | — | plan 非空且**首字符 `#`**；非 plan 模式调用报错 |
 | `skill` | `name` | — | `<skill_content name="…"><skill_resources>…</skill_resources><skill_instructions>…</…>` |
 | `uya_notes` | — | — | Uya 语言速查表正文（`UYA_LANG_NOTES`，纯文本；只读、无参数 ——
@@ -9945,7 +9962,7 @@ UYA_SELFTEST_MODEL_ONLY=1 ./build/uya-agent --selftest         # 本机（有全
 （「`/status` 里印得出当前版本」）不变，但不再能被空串糊弄。
 
 **没顺手做的**：不删 `AGENT_VERSION` 这个常量与它的两个调用点。它仍是**开发阶段身份**
-的挂载点（README §0.1 的 `P0`–`P119` 记法与 `--tui-demo` 脚注排版基准都指着它），
+的挂载点（README §0.1 的 `P0`–`P120` 记法与 `--tui-demo` 脚注排版基准都指着它），
 删掉它等于把「以后要挂一条阶段串」变成一次结构改动。置空是**可逆**的：把串填回去，
 拼装函数、自测与文档都不必再改。
 
@@ -10162,3 +10179,63 @@ SKIP / 0 FAIL = SELFTEST PASS**；Linux 侧仍 PASS。
 就会改变发给端点的请求（P4 的严格工具协议与缓存前缀都不许动）。② 不给 DSH 导入的
 日志补工具名：`--resume-dsh` 的 `tool/result` 里没有 `tool/call`（对方的格式），那条路
 仍是历史骨架。③ 不把 `display` 写进 DSH 兼容层（§8.7 的 `surfaceOp` 适配还没做）。
+
+### 19.38 P120：模型自己以为「上下文耗尽了」—— 把读数和一个压缩入口递过去
+
+**症状**（用户报的）：「跑长目标时会出现上下文耗尽」，而且「后半段会话只能做只读检查或
+docs-only 提交」，goal 一直续跑却一直没有实质产出 —— 人看上下文「才不到 50%」。
+
+**真机取证**（`~/.uya-agent/sessions/---home-winger-uya-aigw--/session-f499b4f5-…/`，
+5.7 MB / 7190 行 `session.jsonl`，1043 个 `step/start`）：
+
+* `goal.json`：`round = 113/256`、`phase = blocked`、`revision = 126`，`blocked_reason` 的
+  原文就是「会话上下文已耗尽 …… 只能读少量文件或做 doc-only 提交」。
+* 模型 `deepseek-v4.1-flash`，窗口 **1,000,000**；每一步实测
+  `cacheReadTokens ≈ 252K–259K`、`inputTokens 33–1851` ⇒ prompt ≈ **253K–260K**，
+  即窗口的 **25%**（与用户说的「不到 50%」对得上）。
+* 压缩**发生过 3 次**（`compaction/summary kind=auto`，日志 841 / 2939 / 4946 行），
+  `cache/evicted` 显示 prompt 从 35K 一路涨到 220K —— 换言之**压缩没坏**。
+* 但 step 3–72 里模型自己在 reasoning 里写「Context is very limited (~5%)」「nearly
+  exhausted」「essentially gone」—— **没有任何度量支撑**（真值 25%），随后只做
+  `git status` / `git log` 与 docs-only 提交（`c20584c docs(perf)`、`41a3846 docs(todo)`），
+  一轮接一轮地被续跑驱动器开下去，间隔只有 10–20 s。
+
+**根因**（三条，都不是「压缩不够」）：
+
+1. **模型拿不到读数**：`st_pressure()` 只喂 TUI 的状态行与日志统计，**一行都没进请求**；
+   窗口 1,000,000 时三条线是窗口线 800K、soft 线 300K、增长地板 200K，而 253K 一条都没到
+   ⇒ 它没有任何「还早」的证据，只能按「轮次多、历史长」自己推。
+2. **模型没有压缩入口**：出口只有人的 `/compact`、step 边界的自动压缩、超窗重试的就地压缩
+   —— 模型想问一句「能不能压一下」只能写在正文里，没人执行。
+3. **空转能自证**：`<goal_round>` 只说 `Round: N/M`，没有「这一轮做了什么」的判据，于是
+   「这轮只读了几行」和「这轮改完了」在驱动器眼里一模一样，照样开下一轮。
+
+**修法**：
+
+* `agent/compact.uya` 新增 `cmp_tool_compact`（+ `ag_tools_schema.uya` 的 `TOOL_COMPACT`）：
+  工具表 29 → **30**，参数为空。它**只排队**（`g_compact_requested`），由 step 边界消费成
+  `agent_maybe_compact(cfg, h, step, true)` —— 与 `/compact` 同一个落点。不当场压是硬要求：
+  工具在一个 tool 组中途执行，当场重写历史会把 `assistant(tool_calls)` 与它**一部分**
+  tool 结果拆开 ⇒ 孤儿组 ⇒ 下一次请求 400（§19.10 是「压不动」，这条会是「压坏了」）。
+* 回执带**真值**：`Context now: ~253K tokens used of 1.0M (25%)`；太短回
+  `Nothing to compact yet …`（什么都没改）；`--no-compact` 回
+  `Error: compaction is disabled …` 且一次都不排 —— **先把「它自己猜 5%」这条假信号掐掉**，
+  工具才是加分项，不是替代品。
+* `agent/goal.uya`：`<goal_round>` 正文加一行 `Context: ~N tokens used of M (P%)`
+  （拿不到样本时一个字都不加）—— 每轮都有读数，不必先调工具。
+* `agent/ag_worktree.uya`：换会话复位把队列清掉（那是上一条会话的历史）。
+
+**验收**：
+
+| 判据 | 落点 |
+|---|---|
+| 两种协议形状的工具表里都有 `compact` | `selftest[compact-tool]` |
+| 短历史：不排队 + 回执「没得压」 | 同上 |
+| 长历史：只排队（`g_compact_requested`）+ 回执带真值（`Context now` / `of 200K`） | 同上 |
+| `--no-compact`：不排队 + 报错 | 同上 |
+| `<goal_round>` 带上下文真值 | 无样本时不变（`make e2e-goal` 的 `Rounds: 0/256`） |
+
+**没顺手做的**：① 没加「这一轮没实质产出就不续跑」的判据 —— 它需要一个可判定的
+「实质产出」定义（改文件 / 有副作用的工具 / 验收命令通过），牵到驱动器与 goal 记账，
+留给下一条。② 没给模型一个「压多少」的旋钮：保留量策略是全局的，给了只会被调成 0。
+③ 没动那三条触发线：这次的问题不是压得太晚，而是**不晚** —— 模型却以为晚了。

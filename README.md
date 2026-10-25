@@ -108,7 +108,7 @@ chmod +x uya-agent-linux-x86_64 && mv uya-agent-linux-x86_64 uya-agent
 `/status`、TUI 脚注、`User-Agent`、`--dsh-web` 对前端报的版本**全从那里取**（以前是
 三个地方三个数，见 DESIGN §19.32 的 P112）。
 
-**开发阶段记法**：本仓的提交与 DESIGN 按 `P0`–`P119` 记（每一节末尾有验收记录，
+**开发阶段记法**：本仓的提交与 DESIGN 按 `P0`–`P120` 记（每一节末尾有验收记录，
 见 [DESIGN.md §19](DESIGN.md)）。`verx` 里另有一个开发阶段串 `AGENT_VERSION`，
 **P114 起是空串** —— 它只服务于本仓内部的开发线记法，对拿到二进制的人没有意义：
 问「这是哪个版本」，答案就是 `0.1.1`（理由见 DESIGN §19.34）。
@@ -254,7 +254,7 @@ readelf -lW build/uya-agent | grep -c INTERP    # 0 = 真静态
 | `--no-mcp` | 不读不连任何 MCP 插件（`UYA_AGENT_MCP=0` 同口径） |
 | `--list-plugins` | 打印插件与工具的诊断后退出（排查「为什么工具数是 0」的第一个入口） |
 | `--uya-bin PATH` | 跑 workflow 脚本的解释器（默认 `$UYA_BIN` 或 `uya`） |
-| `--no-compact` / `--context-window N` | 关闭自动上下文压缩 / 指定压缩判定的**上下文窗口**（`--context-window` 只认纯十进制正整数，非法值报错退出；`UYA_AGENT_CONTEXT_WINDOW` 另认 K/M/G 十进制单位，见 §7）。只认这四档来源，从高到低：`--context-window` > `UYA_AGENT_CONTEXT_WINDOW` > `settings.yaml` 的 `uya-agent.contextWindows` 映射 > DSH 模型条目的 `contextWindow`；一条都没有就**沿用**（一次都没人给过时是 `-1` = 未知，此时自动压缩不触发）。前两档是**显式**的：本会话里切模型也不动它。见 §7「上下文窗口」 |
+| `--no-compact` / `--context-window N` | 关闭自动上下文压缩（也关掉模型的 `compact` 工具 —— 它回一句 `Error: compaction is disabled`）/ 指定压缩判定的**上下文窗口**（`--context-window` 只认纯十进制正整数，非法值报错退出；`UYA_AGENT_CONTEXT_WINDOW` 另认 K/M/G 十进制单位，见 §7）。只认这四档来源，从高到低：`--context-window` > `UYA_AGENT_CONTEXT_WINDOW` > `settings.yaml` 的 `uya-agent.contextWindows` 映射 > DSH 模型条目的 `contextWindow`；一条都没有就**沿用**（一次都没人给过时是 `-1` = 未知，此时自动压缩不触发）。前两档是**显式**的：本会话里切模型也不动它。见 §7「上下文窗口」 |
 | `--input-image` / `--no-input-image` | 这个模型**收不收图**（`/image`、`ctrl+v`、`/paste` 挂不挂得上）。**默认支持** —— 只有明确了「不支持」才关：目录条目写了 `input:` 但不含 `image`（如 `[text]`），或这两个 flag / `UYA_AGENT_INPUT_IMAGE=0`。两个 flag 是**显式**的：本会话里切模型也不动它。见 §7「图片能力位」 |
 | `--no-memory` / `--memory-budget N` | 关掉项目记忆（不读不写不注入）/ 开工包的字节预算（默认 3072） |
 | `--agent-home DIR` | 会话与索引的根目录（默认 `~/.uya-agent`） |
@@ -518,7 +518,7 @@ SKIP / 0 FAIL）。依赖 `fork` / `execve` / `/proc` / 伪终端的 93 轮逐�
 
 ## 2. 工具
 
-模型可调用的 29 个工具（顺序固定，跨模式恒定可见）：
+模型可调用的 30 个工具（顺序固定，跨模式恒定可见）：
 
 | 组 | 工具 |
 |---|---|
@@ -526,6 +526,7 @@ SKIP / 0 FAIL）。依赖 `fork` / `execve` / `/proc` / 伪终端的 93 轮逐�
 | 执行 | `bash` `job_list` `job_output` `job_kill`（`--no-shell` 时整组不出现） |
 | 会话与交互 | `workspace` `worktree` `set_title` `todo_write` `exit_plan_mode` `ask_user_question` |
 | 技能与搜索 | `skill` `uya_notes` `web_search` |
+| 上下文（P120） | `compact`（模型主动请求压缩；只排队，step 边界执行，回执带真实的上下文占用） |
 
 `uya_notes`（P63）返回 **Uya 语言速查表**：入口与打印、显式类型（没有 `let`/`mut`/`i++`）、
 只有 `while` 没有 `for`、`!T` 错误处理与 `defer`、定长数组与结构体字面量、build/check 命令。
@@ -819,7 +820,9 @@ leaf 指纹怎么算、指纹库放哪儿 —— 见 [DESIGN.md §18](DESIGN.md)
   协议错收场就停下（DSH 同口径），修好后 `/goal resume`。`round >= maxRounds` 时把盘上的 phase
   改成 `blocked` + `blocker=round-limit`（是终态，不是悄悄停下；P116：`resume` 会补一段新预算）。
   **每轮一轮就是一条 `<goal_round>` user 消息**进同一个会话（不 fork、不开新 agent），所以历史
-  会一直长 —— 长目标仍要靠 `/compact`。
+  会一直长 —— 长目标要靠压缩（人的 `/compact`，或模型自己调 `compact` 工具）。P120 起
+  `<goal_round>` 里还带一行真实的上下文占用（`Context: ~N tokens used of M (P%)`），
+  模型不必靠猜 —— 真机上它曾把 25% 用成「上下文只剩 3%」。
   `send_message` 时的任务或催促，只取首行、空白折叠、超长贴尾）；子代理的 stdout **只在跑完时**
   才回传管道，所以「它刚刚说了什么」得等终态或 `subagent_output`（面板上那个 `· N` 是已收输出
   行数，运行中通常是 0）。贴尾只收窄**显示**，`Deleg.prompt` 本身一个字节不动。
