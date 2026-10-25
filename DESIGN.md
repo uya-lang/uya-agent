@@ -877,7 +877,7 @@ bash 结果占请求窗口 **57.9%**，read 只占 **12.9%**；其中会走到�
 | 档 | 来源 | 实现点 | `--print-config` 的 source |
 |---|---|---|---|
 | ① | `--context-window N` | `agent.uya` 的 CLI 解析 | `cli` |
-| ② | `UYA_AGENT_CONTEXT_WINDOW=N` | `agent.uya` 的 env 段 | `env` |
+| ② | `UYA_AGENT_CONTEXT_WINDOW=N`（N 可带 K/M/G） | `agent.uya` 的 env 段 | `env` |
 | ③ | `settings.yaml` 的 `uya-agent.contextWindows` | `modelx.uya` 的 `mx_read_windows` | `uya-agent` |
 | ④ | DSH 模型条目的 `contextWindow` | `agent_apply_dsh` / 模型目录 | `dsh-settings` |
 
@@ -894,7 +894,15 @@ bash 结果占请求窗口 **57.9%**，read 只占 **12.9%**；其中会走到�
 | ①② 是**显式**的，本会话谁也不许覆盖（切模型也不动） | 人是按**这一条路线**给的窗口（autodl 那种纯 env 部署连 DSH 目录都没有）；跟着目录改等于把显式配置降级成猜测 |
 | ③ 压过 ④ | 映射就是为「目录里没写 `contextWindow`」的路线准备的；同名模型跨提供方时用 `提供方/名字` 精确指定，裸名字是粗口径（键**整串匹配**，不做前缀） |
 | 一条来源都没有 ⇒ **沿用**，来源码退回 `default` | 清成 `-1` 会让压缩**静默**失效（`cmp_pressure_limit(<=0)=0`），与「目录外的模型名只换名字、能力保持不动」同一条理由；退回 `default` 是因为值来自**上一个**模型，照抄上一个模型的来源就是假话（实测：从映射里有的 w-one 切到没有的 w-five 之后仍标 `uya-agent`） |
-| 值必须是**纯十进制正整数**（1..999999999） | `yt_get_i64` / `parse_i32_arg` 都「读到第一个非数字为止」：`256K` 静默变 256、`abc` 静默变 0（= 窗口未知）—— 两条都让压缩线跑到谁也不认识的位置。拒绝的粒度分三处：CLI **报错退出**（与 `--permission bogus` 同口径）、env **告警后忽略**、设置里那条**跳过并计数**（`--print-config` 印 `skipped N`，启动另有一行 warning） |
+| 值必须是**正整数**（1..9999999999）；**只有 env** 另认 K/M/G 十进制后缀 | `yt_get_i64` / `parse_i32_arg` 都「读到第一个非数字为止」：`256K` 静默变 256、`abc` 静默变 0（= 窗口未知）—— 两条都让压缩线跑到谁也不认识的位置。拒绝的粒度分三处：CLI **报错退出**（与 `--permission bogus` 同口径）、env **告警后忽略**、设置里那条**跳过并计数**（`--print-config` 印 `skipped N`，启动另有一行 warning） |
+
+**单位只开在 env 这一档**（`mx_env_positive`）：`256K` = 256000、`128M` = 128000000、
+`1G` = 1000000000 —— **十进制**进位，与 token 显示口径（`st_fmt_tokens` 的 K/M）一致
+（§19.4 里「页面写 1024K、本仓写 1024000」就是这条，不是存储容量的 1024 进位）。
+后缀只认大写、且必须是最后一个字符（`256KB` / `1.5K` / `256k` 都拒绝）；CLI 与
+`uya-agent.contextWindows` 仍是纯十进制 —— 那两个入口的「报错退出 / 跳过并计数」
+语义已经定了，单位是给人手写环境变量用的便利。上限因此从 9 位抬到 10 位
+（`MX_WIN_MAX_VALUE` = 9999999999）：`1G` 能落进同一个上限，`10G` 仍然拒绝。
 
 **可证出口两条**：机器侧是 `--print-config` 的 `context_window = N (source: …)` 与
 `context_window_map = N model(s)`；人侧是 `/model` 报告里的 `ctx` 行（裸 `/model` 与切完模型
@@ -4092,7 +4100,7 @@ QTermWidget）对 `ESC[?5522$p`（DECRQM）**零应答**，OSC 52 写 `c`/`p` �
 | agent | `request_bytes_needed` | `h.bytes*2 + 8192 + 8192 + model.len*2 + img_extra` | 请求缓冲预算 |
 | agent | `TOOL_FLAT_STRIP` | 31 字节 | Responses 形状的 schema 前缀，去掉即 flat |
 | modelx | `MX_MAX` / `MX_LEVELS` | 256 / 7 | 模型目录条目上限 / DSH 的七个推理档位 |
-| modelx | `MX_WIN_MAX` / `MX_WIN_MAX_VALUE` | 32 / `999999999` | `uya-agent.contextWindows` 的条目上限 / 窗口值上限（**9 位十进制**——定死位数，解析才不会溢出，同时挡住 `1000000000` 这类误写） |
+| modelx | `MX_WIN_MAX` / `MX_WIN_MAX_VALUE` | 32 / `9999999999` | `uya-agent.contextWindows` 的条目上限 / 窗口值上限（**10 位十进制**——定死位数，解析才不会溢出，同时挡住 11 位数字这类误写；env 的 `1G` = 10 亿也要落在这个上限内） |
 | compact | `cmp_prune_threshold` / `head` / `tail` | 8192 / 4096 / 1024 **码点** | 对齐 DSH `thresholdChars` / `headChars` / `tailChars` |
 | compact | `CMP_BASH_MIN_BUDGET` | 512 | 低于此不剪 bash 结果（剪了也没信息量） |
 | compact | `CMP_BASH_SIGNAL_PERMILLE` | 800 | 中段预算里信号行最多占 80% |
@@ -6862,7 +6870,7 @@ DEEPSEEK_API_KEY=sk-xxx ./build/uya-agent \
 | `model-apply` | 切换跟随能力、旧档位回落 `off`、幂等返回 1、目录外不动能力；**P62**：同名 a-two 用 `提供方/名字` **双向**指定（alpha↔delta：provider/contextWindow/端点都跟着换）、目录里查不到的左半段不被误拆（`Qwen/Qwen3-32B` 整串当模型名）；**P37 修复**：换提供方时 `base_url` 与 `api_style` **双向**跟随（beta→alpha→beta 都断言）、跟随来的来源码落 `dsh-settings`、**显式 `--base-url`/`--api-key` 不被覆盖**、提供方**没声明 `baseURL`** 时端点一个字节不动、**解析不出凭据**时清空 key（旧密钥绝不跨提供方）（踩坑 96） |
 | `effort-apply` | 公布的收、同值幂等返回 1、未公布拒 2、透传但 `effort_set=false` |
 | `model-log` | `session/model` 三字段取最后一条 |
-| `ctxwin` | P81 上下文窗口的来源链（离线、纯函数 + 假目录）：映射**压过**目录条目（目录 111000 / 映射 555000 ⇒ 555000）、`提供方/名字` 压过裸名字（裸 222000 / 精确 666000 ⇒ 666000，夹具里**裸那条写在前面** ⇒ 「先命中的赢」的错误实现会红）、同名模型跨提供方各自成条（beta/c-three ⇒ 777000）、只给裸名字那条腿、映射没写⇒目录条目兜底（123000 src 1）、**目录里根本没有**这个模型也照映射走（888000 src 5 —— autodl 那种纯 env 部署的形态）、一条来源都没有⇒**沿用**且来源码退回 0、**键是整串匹配**（`c-fi` 不许吃掉 `c-five` / 模型 `c-f` 不许被 `c-fi` 匹配）、显式（src 2/3）切模型也不被动、`--no-dsh-config` 不读映射、非法值**跳过并计数**（`c-four: 256K` 不许被截断成 256）。**防假绿对照 4 次**（每次先看到红再改回）：①去掉显式守卫 + 映射不参与 ⇒ 红 8 条；②键匹配改「键以查询开头」⇒ `c-f` 那条红；③键匹配改「查询以键开头」⇒ `c-five` 那条红（**②③ 是补出来的**：原计划的「目录外沿用原值」那条腿**抓不住**前缀匹配，见下面 §19.3）；④env 入口整段变死代码 ⇒ `e2e-ctxwindow` 的 env 腿红 |
+| `ctxwin` | P81 上下文窗口的来源链（离线、纯函数 + 假目录）：映射**压过**目录条目（目录 111000 / 映射 555000 ⇒ 555000）、`提供方/名字` 压过裸名字（裸 222000 / 精确 666000 ⇒ 666000，夹具里**裸那条写在前面** ⇒ 「先命中的赢」的错误实现会红）、同名模型跨提供方各自成条（beta/c-three ⇒ 777000）、只给裸名字那条腿、映射没写⇒目录条目兜底（123000 src 1）、**目录里根本没有**这个模型也照映射走（888000 src 5 —— autodl 那种纯 env 部署的形态）、一条来源都没有⇒**沿用**且来源码退回 0、**键是整串匹配**（`c-fi` 不许吃掉 `c-five` / 模型 `c-f` 不许被 `c-fi` 匹配）、显式（src 2/3）切模型也不被动、`--no-dsh-config` 不读映射、非法值**跳过并计数**（`c-four: 256K` 不许被截断成 256）、env 的 K/M/G 十进制单位（`256K`/`128M`/`1G` 与 10 位上限各一条；拒绝 `256k`/`256KB`/`1.5K`/`0K`/`-1K`/11 位/`10G`/`1000000000K`，且 `mx_plain_positive` 仍拒绝 `256K`）。**防假绿对照 4 次**（每次先看到红再改回）：①去掉显式守卫 + 映射不参与 ⇒ 红 8 条；②键匹配改「键以查询开头」⇒ `c-f` 那条红；③键匹配改「查询以键开头」⇒ `c-five` 那条红（**②③ 是补出来的**：原计划的「目录外沿用原值」那条腿**抓不住**前缀匹配，见下面 §19.3）；④env 入口整段变死代码 ⇒ `e2e-ctxwindow` 的 env 腿红 |
 | `vision` | P84 收图能力位的来源链（离线、纯函数 + 假目录）：`vision_flag_parse` 八个词逐值 + 非法值（`maybe`/`2`/空/`TRUE`）**判 -1 不许静默当开**、出厂默认是「开 + src 0」（**默认支持**）、`input: [text, image]` ⇒ on(src 1)、**`input: [text]` ⇒ off(src 1)**（本轮修掉的那个洞）、**整键没写 ⇒ 沿用 on(src 0)**（「没声明」不是「不支持」）、同名跨提供方时 beta 那份没写 ⇒ 沿用（不许拿 alpha 那条来填）、目录外名字 ⇒ 沿用 + src 退回 0、显式（src 2/3）钉住、`--no-dsh-config` 不动、**两条走真入口**（`agent_model_apply`：切到不支持要真关、切回要真开 —— 调用点漏了 settle 时只调函数的腿全绿，见踩坑 143）。**防假绿对照 5 次**（每次先看到红再改回）：①去掉切模型时那次 settle ⇒ 红 2 条（**最初全绿**，补了真入口腿才抓住）；②去掉显式守卫 ⇒ 红 2 条；③出厂值改回 false ⇒ 本轮回红 2 条 + `e2e-inputimage` 红；④去掉 print-config 的 source ⇒ e2e 红；⑤去掉 web 注入 ⇒ `web-childcfg` 红 |
 | `dsh-writeback` | P71 写回（`session/dshsave.uya`）：叶级替换（注释/兄弟节**逐字节**保留、行数不变）/ 幂等（`DSHW_SAME`，连 mtime 都不动）/ effort 清档 / 缺键追加节尾 / 整节缺失追加文末 / 空 provider 不写空值（那一行原样留）/ 需要引号的值（空格与 `#`）/ 控制字节拒写且文件不变 / flow 节拒（不猜、不整份重写）/ 锁被占让位（`DSHW_BUSY`）且**不删别人的锁** / 缺 `settings.yaml` 不新建 / 回执表（`SAME` 与 `SKIP` 一个字节不加）。**防假绿对照**：①把「从第 0 字节照抄」改回「只抄节头那一行」⇒ 红 7 条；②抢锁恒成功 ⇒ 红 3 条；③flow 判据停掉 ⇒ 红 2 条（这条首版是**假绿**：夹具值与被写值不同时，追加会被写前自检挡下，判据停掉照样绿 —— 夹具改成「已经就是那两个值」之后才真的钉住它） |
 | `worktree` | 真 git：建 worktree + `dsh/<slug>`、闸门、`wt_finish` 合并且目录消失 |

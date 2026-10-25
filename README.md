@@ -254,7 +254,7 @@ readelf -lW build/uya-agent | grep -c INTERP    # 0 = 真静态
 | `--no-mcp` | 不读不连任何 MCP 插件（`UYA_AGENT_MCP=0` 同口径） |
 | `--list-plugins` | 打印插件与工具的诊断后退出（排查「为什么工具数是 0」的第一个入口） |
 | `--uya-bin PATH` | 跑 workflow 脚本的解释器（默认 `$UYA_BIN` 或 `uya`） |
-| `--no-compact` / `--context-window N` | 关闭自动上下文压缩 / 指定压缩判定的**上下文窗口**（纯十进制正整数，非法值报错退出）。只认这四档来源，从高到低：`--context-window` > `UYA_AGENT_CONTEXT_WINDOW` > `settings.yaml` 的 `uya-agent.contextWindows` 映射 > DSH 模型条目的 `contextWindow`；一条都没有就**沿用**（一次都没人给过时是 `-1` = 未知，此时自动压缩不触发）。前两档是**显式**的：本会话里切模型也不动它。见 §7「上下文窗口」 |
+| `--no-compact` / `--context-window N` | 关闭自动上下文压缩 / 指定压缩判定的**上下文窗口**（`--context-window` 只认纯十进制正整数，非法值报错退出；`UYA_AGENT_CONTEXT_WINDOW` 另认 K/M/G 十进制单位，见 §7）。只认这四档来源，从高到低：`--context-window` > `UYA_AGENT_CONTEXT_WINDOW` > `settings.yaml` 的 `uya-agent.contextWindows` 映射 > DSH 模型条目的 `contextWindow`；一条都没有就**沿用**（一次都没人给过时是 `-1` = 未知，此时自动压缩不触发）。前两档是**显式**的：本会话里切模型也不动它。见 §7「上下文窗口」 |
 | `--input-image` / `--no-input-image` | 这个模型**收不收图**（`/image`、`ctrl+v`、`/paste` 挂不挂得上）。**默认支持** —— 只有明确了「不支持」才关：目录条目写了 `input:` 但不含 `image`（如 `[text]`），或这两个 flag / `UYA_AGENT_INPUT_IMAGE=0`。两个 flag 是**显式**的：本会话里切模型也不动它。见 §7「图片能力位」 |
 | `--no-memory` / `--memory-budget N` | 关掉项目记忆（不读不写不注入）/ 开工包的字节预算（默认 3072） |
 | `--agent-home DIR` | 会话与索引的根目录（默认 `~/.uya-agent`） |
@@ -415,7 +415,8 @@ uya-agent --dsh-assets ~/dsh-assets --dsh-web        # 之后都指这份
 `UYA_AGENT_MAX_STEPS`（步数熔断上限，`0` = 不限，也是默认值；非法值告警后按「不限」处理）、
 `UYA_AGENT_API`（非法值告警后按「未声明」处理，即仍会先试 responses）、
 `UYA_AGENT_REASONING_EFFORT`（`off`/`none` = 不发）、
-`UYA_AGENT_CONTEXT_WINDOW`（压缩判定的上下文窗口，纯十进制正整数；非法值告警后忽略）、
+`UYA_AGENT_CONTEXT_WINDOW`（压缩判定的上下文窗口，纯十进制正整数，也可带 `K`/`M`/`G`
+十进制单位，如 `256K` = 256000；非法值告警后忽略）、
 `UYA_AGENT_INPUT_IMAGE=1\|0`（模型收不收图；**默认支持**，只有 `=0` 才关 ——
 认不出的一律告警后忽略，绝不静默当开）、
 `UYA_AGENT_EXEC_EFFORT` / `UYA_AGENT_EXEC_AFTER` / `UYA_AGENT_GRACE_STEPS`、
@@ -963,7 +964,7 @@ leaf 指纹怎么算、指纹库放哪儿 —— 见 [DESIGN.md §18](DESIGN.md)
   | 档 | 来源 | 写法 | `--print-config` 的 source |
   |---|---|---|---|
   | ① | 命令行 | `--context-window N` | `cli` |
-  | ② | 环境变量 | `UYA_AGENT_CONTEXT_WINDOW=N` | `env` |
+  | ② | 环境变量 | `UYA_AGENT_CONTEXT_WINDOW=N`（N 可带 K/M/G） | `env` |
   | ③ | 本仓设置节 | `settings.yaml` 的 `uya-agent.contextWindows` 映射 | `uya-agent` |
   | ④ | DSH 模型条目 | `providers.<p>.models[].contextWindow` | `dsh-settings` |
 
@@ -973,10 +974,14 @@ leaf 指纹怎么算、指纹库放哪儿 —— 见 [DESIGN.md §18](DESIGN.md)
     的路线」准备的：autodl 那种纯 env 部署连目录都没有，映射照样管用）；
   * 键是 `提供方/名字` 或裸名字，**整串精确匹配**（不做前缀、不折大小写）：同名模型跨提供方时
     用 `提供方/名字` 指定，裸名字是「这一家都这样」的粗口径；
-  * 值必须是**纯十进制正整数**（1..999999999）。`256K` / `0x100000` / 负数**一律拒绝**——
-    `256K` 那种写法按「读到第一个非数字为止」会静默变成 256，比拒绝坏得多。拒绝的粒度分三处：
-    `--context-window abc` **报错退出**（usage）；`UYA_AGENT_CONTEXT_WINDOW=256K` 告警后**忽略**；
-    设置里那条**跳过并计数**（`--print-config` 印 `skipped N entry/entries`，启动时也有一行 warning）；
+  * 值必须是**正整数**（1..9999999999），拒绝 `0x100000` / 负数 / `1.5K` 这类写法——
+    那种写法按「读到第一个非数字为止」会静默变成 0 或 1，比拒绝坏得多。**只有
+    `UYA_AGENT_CONTEXT_WINDOW`** 额外认 `K`/`M`/`G` 后缀，按**十进制**进位
+    （`256K` = 256000、`128M` = 128000000、`1G` = 1000000000；大写敏感，后缀后
+    不许再有字符 —— `256KB` / `256k` 一律拒绝）。CLI 与映射仍是纯十进制：
+    `--context-window abc` **报错退出**（usage）；`UYA_AGENT_CONTEXT_WINDOW=256KB`
+    告警后**忽略**；设置里那条**跳过并计数**（`--print-config` 印
+    `skipped N entry/entries`，启动时也有一行 warning）；
   * **`--model` 与 `--context-window` 的先后顺序无关**（定稿在所有 CLI 解析之后做一次）。
     以前是「谁在后面谁赢」：`--context-window 99999 --model m` 会把刚给的值换成目录里的值；
   * `--no-dsh-config` 时 ③④ 都不读（与模型目录同一条口径）；`-1`（未知）时自动压缩不触发
