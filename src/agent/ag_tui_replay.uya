@@ -1,0 +1,389 @@
+// src/agent/ag_tui_replay.uya — P119：恢复会话时按**日志**重放转录
+//
+// 本文件：`agent_tui_replay_session`（启动 `--resume` / `--continue` 与运行中
+//   `/resume` 共用的那条路）。修前回放只认 `History`，那是**模型输入**：被压缩裁过、
+//   注入了运行时上下文、工具只剩结果正文 —— 于是同一条会话「退出前」与「恢复后」
+//   长得不一样（工具行只剩裸结果、assistant(tool_calls) 的正文整条不见、checkpoint
+//   被当成一条 `▎ 你` 打出来、压缩前的消息直接消失）。
+//   日志里才有显示要的东西：`tool/call` 的 name+arguments、`assistant/reasoning`，
+//   以及 P119 起每条 `tool/result` 的 `display`（live 渲染好的整块）。
+//
+// 不变量：
+//   ① 只重放**显示事件**。`session/*` / `step/*` / `turn/*` / stats / goal / todo
+//      不进转录：面板由各自的恢复路径重推（tasks_goal_reload / todo_from_json）。
+//   ② 工具块优先用 `display`（与 live 逐字节相同）；老日志没有它时，按
+//      name+arguments+result 走**同一条**渲染器（`view_replay_block`）重画 ——
+//      这里不许自己拼字符串。
+//   ③ 窗口最多 `TR_MAX_EVENTS` 条显示相关事件（与 TUI 的 512 条目池同量级）；
+//      更早的只给一行「已省略」提示。
+//   ④ 日志读不到 / 没有可显示事件（`--no-save`、`--resume-dsh` 导入、空会话）→
+//      退回 `agent_tui_seed_history`（老口径）。
+//
+// 依赖：session/session（SessReader 与手写 JSON 取值）、term/view
+//   （view_replay_block / view_enabled）、term/tui 的端口入口、ag_plan_pump
+//   （注入判据 `agent_tui_text_is_injected`）。
+// 命名：对外 `agent_tui_replay_*`；内部一律 `tr_` 前缀。
+
+// 回放窗口：只留最近这么多条「显示相关」事件。TUI 自己的条目池是 512 条，
+// 更早的本来也会被 evict（`g_tui_dropped`），所以按同一个量级截断。
+const TR_MAX_EVENTS: usize = 512;
+
+// 事件种类（`tr_kind_of` 的结果；0 = 不进转录）
+const TR_K_USER: u8 = 1;
+const TR_K_ASSIST: u8 = 2;
+const TR_K_REASON: u8 = 3;
+const TR_K_CALL: u8 = 4;
+const TR_K_RESULT: u8 = 5;
+
+// 环形窗口：日志里事件行的**区间**（r.data 的偏移 + 长度）与种类。
+// 不存文本：日志已经整份在 SessReader.data 里，复制一遍纯属浪费。
+var g_tr_start: [usize: TR_MAX_EVENTS] = [0: TR_MAX_EVENTS];
+var g_tr_len: [usize: TR_MAX_EVENTS] = [0: TR_MAX_EVENTS];
+var g_tr_kind: [u8: TR_MAX_EVENTS] = [0: TR_MAX_EVENTS];
+var g_tr_head: usize = 0;          // 下一个写入位置（满时就是最老的那条）
+var g_tr_count: usize = 0;         // 窗口里实际有几条
+var g_tr_overflow: bool = false;   // 曾经丢过更早的事件（要打「已省略」）
+
+// 最近一条 tool/call。tool/result 紧跟在它后面（派发是严格顺序的），
+// 而日志的 result 里没有工具名 —— 名字/参数只能从这里取。
+struct TrPend {
+    id: Buf,
+    name: Buf,
+    args: Buf,
+    has: bool,
+}
+
+// 建一个空的「最近一次 tool/call」（三块 Buf 在第一次用时才分配）
+fn tr_pend_new() TrPend {
+    return TrPend{
+        id: buf_empty(),
+        name: buf_empty(),
+        args: buf_empty(),
+        has: false,
+    };
+}
+
+// 释放三块缓冲
+fn tr_pend_free(p: &TrPend) void {
+    buf_free(&p.id);
+    buf_free(&p.name);
+    buf_free(&p.args);
+}
+
+// 清空（保留缓冲）：一条 result 处理完就清，免得它被配给下一条
+fn tr_pend_clear(p: &TrPend) void {
+    buf_reset(&p.id);
+    buf_reset(&p.name);
+    buf_reset(&p.args);
+    p.has = false;
+}
+
+// 一条 NOTICE（C 字符串字面量）：长度现场量，别手数。
+fn tr_notice(s: &const byte) void {
+    tui_add_notice(s, bufx_cstr_len(s));
+}
+
+// 对外入口：把「当前会话」（g_sess.path）的转录重放一遍。
+// 调用方负责先清屏（tui_transcript_clear）；日志不可用时退回历史回放。
+export fn agent_tui_replay_session(cfg: &const Config,
+                                   h: &const History) void {
+    if agent_tui_replay_log(cfg) {
+        return;
+    }
+    agent_tui_seed_history(h);
+}
+
+// 这条事件要不要进转录（要就返回种类，不要返回 0）。
+// 注意 `assistant/reasoning`：live 的思考条目只在 `--show-reasoning` 时出现
+// （`view_think_delta` 里 `print_reasoning` 那个门），回放跟着当前进程的开关走。
+fn tr_kind_of(typ: &const Buf, cfg: &const Config) u8 {
+    if sv_eq_cstr(typ, "user/message") {
+        return TR_K_USER;
+    }
+    if sv_eq_cstr(typ, "assistant/message") {
+        return TR_K_ASSIST;
+    }
+    if sv_eq_cstr(typ, "tool/call") {
+        return TR_K_CALL;
+    }
+    if sv_eq_cstr(typ, "tool/result") {
+        return TR_K_RESULT;
+    }
+    if cfg.show_reasoning && sv_eq_cstr(typ, "assistant/reasoning") {
+        return TR_K_REASON;
+    }
+    return 0;
+}
+
+// 记一条事件行（区间 + 种类）；满了就环形覆盖最老的那条，并置 overflow
+fn tr_ring_push(kind: u8, start: usize, len: usize) void {
+    if g_tr_head < TR_MAX_EVENTS {
+        g_tr_start[g_tr_head] = start;
+        g_tr_len[g_tr_head] = len;
+        g_tr_kind[g_tr_head] = kind;
+    }
+    g_tr_head = (g_tr_head + 1) % TR_MAX_EVENTS;
+    if g_tr_count < TR_MAX_EVENTS {
+        g_tr_count = g_tr_count + 1;
+    } else {
+        g_tr_overflow = true;
+    }
+}
+
+// 按**时间序**取窗口里的第 i 条（0 = 最老的那条）
+fn tr_ring_at(i: usize, kind: &u8, start: &usize, len: &usize) void {
+    if i >= g_tr_count || g_tr_count > TR_MAX_EVENTS {
+        return;
+    }
+    const idx: usize = (g_tr_head + TR_MAX_EVENTS - g_tr_count + i)
+        % TR_MAX_EVENTS;
+    if idx >= TR_MAX_EVENTS {
+        return;
+    }
+    kind[0] = g_tr_kind[idx];
+    start[0] = g_tr_start[idx];
+    len[0] = g_tr_len[idx];
+}
+
+// 读日志 → 扫一遍（只记区间与种类）→ 按序重放。
+// 返回 false = 没得放（调用方退回历史回放）。
+fn agent_tui_replay_log(cfg: &const Config) bool {
+    if g_sess.path.len == 0 {
+        return false;
+    }
+    var r: SessReader = sess_reader_empty();
+    defer { sess_reader_free(&r); }
+    var pz: Buf = buf_new(g_sess.path.len + 1);
+    defer { buf_free(&pz); }
+    _ = buf_append(&pz, g_sess.path.ptr, g_sess.path.len);
+    _ = buf_append_byte(&pz, 0);
+    if !sess_reader_load(pz.ptr as &const byte, &r) {
+        return false;
+    }
+    g_tr_head = 0;
+    g_tr_count = 0;
+    g_tr_overflow = false;
+    var line: Buf = buf_new(4096);
+    defer { buf_free(&line); }
+    var typ: Buf = buf_new(64);
+    defer { buf_free(&typ); }
+    while sess_next(&r, &line) {
+        const view: &[byte] = line.ptr[0: line.len];
+        if !sess_json_str(view, "type" as &const byte, &typ) {
+            continue;
+        }
+        const k: u8 = tr_kind_of(&typ, cfg);
+        if k == 0 {
+            continue;
+        }
+        // 该行 '\n' 的下标 = r.pos - 1；事件行的起点由它反推。
+        const end: usize = r.pos - 1;
+        tr_ring_push(k, end - line.len, line.len);
+    }
+    if g_tr_count == 0 {
+        return false;
+    }
+    tr_render_pass(&r, cfg);
+    return true;
+}
+
+// 按时间序把窗口里的显示事件逐条重放；最后收口流式条目、把半行刷出去。
+fn tr_render_pass(r: &const SessReader, cfg: &const Config) void {
+    if g_tr_overflow {
+        tr_notice("… 更早的会话记录已省略" as &const byte);
+    }
+    var pend: TrPend = tr_pend_new();
+    defer { tr_pend_free(&pend); }
+    var out: Buf = buf_new(32768);
+    defer { buf_free(&out); }
+    var i: usize = 0;
+    while i < g_tr_count {
+        var kind: u8 = 0;
+        var start: usize = 0;
+        var len: usize = 0;
+        tr_ring_at(i, &kind, &start, &len);
+        const view: &[byte] = r.data.ptr[start: start + len];
+        tr_render_one(view, kind, cfg, &pend, &out);
+        i = i + 1;
+    }
+    tui_close_stream_entries();
+    tui_sink_flush_partial();
+}
+
+// 一条事件 → 一种显示条目（种类是扫描那一遍判好的，这里不再解析 `type`）
+fn tr_render_one(view: &[byte], kind: u8, cfg: &const Config,
+                 pend: &TrPend, out: &Buf) void {
+    if kind == TR_K_USER {
+        tr_user(view, cfg);
+    } else if kind == TR_K_ASSIST {
+        tr_assistant(view);
+    } else if kind == TR_K_REASON {
+        tr_reasoning(view);
+    } else if kind == TR_K_CALL {
+        tr_tool_call(view, pend);
+    } else if kind == TR_K_RESULT {
+        tr_tool_result(view, cfg, pend, out);
+    }
+}
+
+// `user/message` 三种来源：真输入（user）、回合中插话（steer）、压缩 checkpoint。
+// 压缩那一条**不是人打的字**：live 屏幕上是一条 `[compact] …` 诊断，不是 `▎ 你`。
+fn tr_user(view: &[byte], cfg: &const Config) void {
+    var kd: Buf = buf_new(24);
+    defer { buf_free(&kd); }
+    const have_kind: bool = sess_json_str(view, "kind" as &const byte, &kd);
+    if have_kind && bufx_eq_cstr(kd.ptr as &const byte, kd.len,
+                                 "compaction" as &const byte) {
+        tr_compact_notice(view, cfg);
+        return;
+    }
+    var text: Buf = buf_new(4096);
+    defer { buf_free(&text); }
+    if !sess_json_str(view, "text" as &const byte, &text) || text.len == 0 {
+        return;
+    }
+    // 注入类（`<goal_round>` 等）不进转录 —— 与 live 的 seed 判据同一条
+    if agent_tui_text_is_injected(text.ptr as &const byte, text.len) {
+        return;
+    }
+    if have_kind && bufx_eq_cstr(kd.ptr as &const byte, kd.len,
+                                 "steer" as &const byte) {
+        tui_add_steer(text.ptr as &const byte, text.len);
+        return;
+    }
+    tui_add_user(text.ptr as &const byte, text.len);
+}
+
+// 压缩 checkpoint：正文（一整段英文摘要）不回放，只留一条与 live 同款的诊断。
+// live 那条本身包在 `!cfg.quiet` 里，所以 `--quiet` 时这里一个字节也不出。
+// `shadowed` / `pressure` 是那条事件里的两个数（老日志没有它们 → 文案退化）。
+fn tr_compact_notice(view: &[byte], cfg: &const Config) void {
+    if cfg.quiet {
+        return;
+    }
+    const shadowed: i64 = sess_json_i64(view, "shadowed" as &const byte);
+    const pressure: i64 = sess_json_i64(view, "pressure" as &const byte);
+    var b: Buf = buf_new(128);
+    defer { buf_free(&b); }
+    if shadowed > 0 {
+        _ = buf_append_cstr(&b, "[compact] 已压缩较早的 ");
+        _ = buf_append_i64(&b, shadowed);
+        _ = buf_append_cstr(&b, " 条消息");
+    } else {
+        _ = buf_append_cstr(&b, "[compact] 上下文已压缩（较早的消息已折叠成摘要）");
+    }
+    if pressure >= 0 {
+        _ = buf_append_cstr(&b, "（pressure=");
+        _ = buf_append_i64(&b, pressure);
+        _ = buf_append_cstr(&b, "）");
+    }
+    tui_add_notice(b.ptr as &const byte, b.len);
+}
+
+// 助手正文：live 是流式写进同一条 ASSIST 条目（markdown 渲染）。回放整段写，
+// 写完就收口 —— 下一步的正文要另起一条（与 live 的 step 边界同效）。
+fn tr_assistant(view: &[byte]) void {
+    var text: Buf = buf_new(4096);
+    defer { buf_free(&text); }
+    if sess_json_str(view, "content" as &const byte, &text) && text.len > 0 {
+        tui_sink_bytes(1, text.ptr as &const byte, text.len);
+    }
+    tui_close_stream_entries();
+}
+
+// 思考条目（只在 `--show-reasoning` 时收；种类判定已在 tr_kind_of 里做过）。
+fn tr_reasoning(view: &[byte]) void {
+    var text: Buf = buf_new(4096);
+    defer { buf_free(&text); }
+    if !sess_json_str(view, "reasoning_content" as &const byte, &text) {
+        return;
+    }
+    if text.len == 0 {
+        return;
+    }
+    tui_sink_bytes(3, text.ptr as &const byte, text.len);
+}
+
+// 记住这一条 tool/call：下面的 tool/result 靠它把名字与参数对回来。
+// 日志的 result 里没有工具名（与 DSH 同口径），所以配对必须严格按 callId。
+fn tr_tool_call(view: &[byte], pend: &TrPend) void {
+    tr_pend_clear(pend);
+    if !sess_json_str(view, "callId" as &const byte, &pend.id) {
+        return;
+    }
+    if !sess_json_str(view, "name" as &const byte, &pend.name) {
+        return;
+    }
+    _ = sess_json_str(view, "arguments" as &const byte, &pend.args);
+    pend.has = pend.name.len > 0;
+}
+
+// 两个 Buf 逐字节相等（callId 配对用；长度不同直接否）
+fn tr_buf_eq(a: &const Buf, b: &const Buf) bool {
+    if a.len != b.len {
+        return false;
+    }
+    if a.len == 0 {
+        return true;
+    }
+    return bufx_mem_eq(a.ptr as &const byte, b.ptr as &const byte, a.len);
+}
+
+// `tool/result`：
+//   * 有 `display`（P119 起的日志）→ 整块原样进转录（含 diff / 首尾行，逐字节同 live）；
+//   * 老日志 → 用 name+arguments+result 走同一条渲染器重画（没有 diff 可画，其余一致）；
+//   * 连工具名都没有（外来会话）→ 退回修前的「裸结果块」。
+// `--quiet` 时 live 一个字节都不显示（`view_end_tool` 直接 return），回放同样跳过。
+fn tr_tool_result(view: &[byte], cfg: &const Config, pend: &TrPend,
+                  out: &Buf) void {
+    if !view_enabled() {
+        tr_pend_clear(pend);
+        return;
+    }
+    var disp: Buf = buf_new(4096);
+    defer { buf_free(&disp); }
+    if sess_json_str(view, "display" as &const byte, &disp) && disp.len > 0 {
+        tui_add_tool_block(disp.ptr as &const byte, disp.len);
+        tr_pend_clear(pend);
+        return;
+    }
+    var text: Buf = buf_new(4096);
+    defer { buf_free(&text); }
+    var cid: Buf = buf_new(128);
+    defer { buf_free(&cid); }
+    if !sess_json_str(view, "content" as &const byte, &text) {
+        tr_pend_clear(pend);
+        return;
+    }
+    var paired: bool = false;
+    if pend.has && sess_json_str(view, "callId" as &const byte, &cid) {
+        paired = tr_buf_eq(&cid, &pend.id);
+    }
+    if paired {
+        view_replay_block(out, &pend.name, &pend.args, &text,
+                          tr_tool_lines(cfg));
+        if out.len > 0 {
+            tui_add_tool_block(out.ptr as &const byte, out.len);
+        }
+    } else {
+        tr_raw_tool_block(&text);
+    }
+    tr_pend_clear(pend);
+}
+
+// 外来会话（DSH 导入的老日志没有 display，也没有配对上的工具名）：修前的口径
+fn tr_raw_tool_block(text: &const Buf) void {
+    tui_add_tool_block(text.ptr as &const byte, text.len);
+    if text.len > 0 && text.ptr[text.len - 1] != 10 as byte {
+        var nl: [byte: 1] = [10];
+        tui_add_tool_block(&nl[0], 0);
+    }
+}
+
+// 与 `cfg_tool_lines` 同一口径（那头是 ag_tools_schema 的私有函数）
+fn tr_tool_lines(cfg: &const Config) usize {
+    if cfg.tool_lines <= 0 {
+        return 0;
+    }
+    return cfg.tool_lines as usize;
+}
