@@ -6681,6 +6681,36 @@ QTermWidget）对 `ESC[?5522$p`（DECRQM）**零应答**，OSC 52 写 `c`/`p` �
      ② 自测夹具的清理与产品判据是两件事，**前者绿不能代替后者绿**（同族：踩坑 129
      「纯函数自测只能证明函数对，证明不了接线对」）。
 
+161. **恢复会话必崩：回放窗口按「起点 + 起点」切，读到映射尾**（P119 交付后修复，
+    用户报的「恢复 session-c7f98113 崩溃」）。
+
+     现场：`--resume session-c7f98113-…`（5.9 MB / 8929 行 / 6 次压缩）在 TUI 里
+     一起来就 SIGSEGV（pty 下 exit 139）。gdb 的栈是
+     `foundation_bufx_find_sub → sess_json_str → tr_tool_result → tr_render_one →
+     tr_render_pass → agent_tui_replay_log`。同一条会话的 `--dry-run` 正常恢复
+     2634 条消息 —— 崩的只有**重放屏幕**那条路，与历史折叠无关。
+
+     根因：P119 扫描把事件行记成 (起点, 长度)，重放时却写成
+     `r.data.ptr[start: start + len]`。本仓切片第二个数是**长度**
+     （`p[a: b]` = 从 a 起 b 字节，见踩坑 51/54）—— 于是窗口是「从 start 起
+     start+len 字节」，把**后面的事件**一起圈进来。小日志上只表现为「没有
+     `display` 的 `tool/result` 借走后面事件的 `display`」（屏幕上同一块铺多份）；
+     5.9 MB 时 `data` 缓冲经 realloc 走 mmap，读两倍长度直接越过映射尾。
+
+     修法：`r.data.ptr[start: len]`（一处）。修前全仓 `grep 'ptr\[[^]]*: [^]]* +'`
+     只有这一处这种写法 —— 手写的「起点 + 长度」不能与「起点 + 终点」混着用。
+
+     判据：`selftest[tui-switch]` B 段的夹具加了 c3（无 `display`）→ c4（有
+     `display`）这一对，断言 `TUIS-REPLAY-DUP` 在屏幕上**恰好 1 份**。防假绿对照：
+     把那一行改回 `start + len` 重编 ⇒ B 段两条红（「借用后面事件的 display」+
+     「老日志没按 name+arguments 重画」），恢复后全绿（已实测）。真机判据：同一条
+     5.9 MB 会话在 pty 里 `--resume`，修前 exit 139、修后正常起屏并退出。
+
+     教训：① 「起点 + 长度」与「起点 + 终点」在 `[0: n]` 上同形，所以只在 1 KB
+     夹具上跑的话**两种写法都绿** —— 判据必须造「后面还有带 display 的事件」，
+     并且**拿真机会话**跑一次 resume；② 这类越界读的症状与日志大小强相关，pty 里
+     跑一条真会话比在小夹具上重试一百次有用（与踩坑 129 的「真入口」同一条纪律）。
+
 ---
 
 ## 17. 工具实现要点
@@ -10172,8 +10202,15 @@ SKIP / 0 FAIL = SELFTEST PASS**；Linux 侧仍 PASS。
 | `--show-reasoning` 时才回放思考 | 同上（B 段打开开关，正文 `TUIS-RESUMED-THINK`） |
 | 压缩 checkpoint 不回放摘要正文、只出 `[compact]` 诊断 | 同上（`已压缩较早的 7 条消息`） |
 | `--tool-lines=0` 时结果正文不上屏 | 同上（`TUIS-RESUMED-OLDCONTENT` 不出现） |
+| 回放窗口只切**本事件行**（`[start: len]`） | 同上（c3 无 `display` → c4 有，`TUIS-REPLAY-DUP` 恰好 1 份） |
 | 启动 `--resume` 与 `/resume` 走同一条路 | 两条路都调 `agent_tui_replay_session` |
 | 换会话 / 滚动模式的既有口径不回归 | `selftest[tui-switch]` A/C/D 段 |
+
+**交付后修复（§16 踩坑 161）**：第二遍重放切视图时写成了 `[start: start + len]`，
+而本仓切片第二个数是**长度** ⇒ 窗口被拉成「起点 + 起点」，读到 `data` 映射尾。
+5.9 MB 的真机会话一 `--resume` 就 SIGSEGV（exit 139）；小日志上只表现为「没有
+`display` 的 result 借走后面事件的 `display`」。修法是一行（`[start: len]`），
+判据见上面验收表倒数第三行。README §7 的 P119 口径不变。
 
 **没顺手做的**：① 不把 `assistant/reasoning` 折进 `History` —— 它是显示数据，进了历史
 就会改变发给端点的请求（P4 的严格工具协议与缓存前缀都不许动）。② 不给 DSH 导入的
