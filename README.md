@@ -1059,7 +1059,13 @@ leaf 指纹怎么算、指纹库放哪儿 —— 见 [DESIGN.md §18](DESIGN.md)
   顶上，DeepSeek-V4.1-Flash 写一个大文件时 8192 被思考吃光（网关日志实测
   `output=8192, reasoning=8192`）→ `incomplete/max_output_tokens` → 半截工具调用只能整块丢掉
   （P59），一轮白跑。上限是**上限不是配额**，给大了不会多花钱；实测超过上游能力也不会 400
-  （aigw 与 autodl 都照常 200，按真实上限截）。`--print-config` 印的是**线上真正会发的值**与来源。
+  （aigw 与 autodl 都照常 200，按真实上限截）。`--print-config` 印的是**配置出来的上限**
+  与来源（真正发出去时还会按窗口再钳一次，见下一条）。
+* **输出上限不会超过窗口**（P117）：按「输入估算 + 输出上限 ≤ `context_window`」钳制，
+  超出就报**窗口剩下的那一份**（下限 16），窗口未知（`-1`）不钳。否则
+  `UYA_AGENT_CONTEXT_WINDOW=256000` + 默认上限 256000 这种看起来天经地义的配置会**一发都
+  发不出去** —— 端点回 400 `requested about 263431 tokens`，而摘要请求同构造器、同上限，
+  压缩也跟着压不动。见 [DESIGN.md §5.4.3](DESIGN.md)。
 * **推理强度两条协议都发**：completions 走顶层 `reasoning_effort`（字段排在 `max_tokens`
   之后，保住前缀缓存），responses 走 `reasoning.effort`；`compat.supportsReasoningEffort=false`
   或 `off`/`none` 时不发。此前只有 responses 发，默认路由是 completions ⇒ 配置被静默丢弃
