@@ -923,10 +923,12 @@ e2e-provider: build
 # 四档来源：目录条目（dsh-settings）< `uya-agent.contextWindows`（uya-agent）<
 # `UYA_AGENT_CONTEXT_WINDOW`（env）< `--context-window`（cli）；都没有就沿用。
 # 判据：
-#   ① 目录条目；② 映射压过目录条目（含 `提供方/名字` 精确口径）；③ env 压过映射；
-#   ④ cli 压过 env；⑤ **两个 flag 的先后顺序无关**（以前是「谁在后面谁赢」，同一对参数
+#   ① 目录条目；② 映射压过目录条目（含 `提供方/名字` 精确口径）；③ env 压过映射
+#   （env 另认 K/M/G **十进制**单位：`256K`=256000、`1G`=1000000000）；④ cli 压过
+#   env；⑤ **两个 flag 的先后顺序无关**（以前是「谁在后面谁赢」，同一对参数
 #   结果不同 —— 这条是回归腿）；⑥ 非法值：CLI 报错退出（usage），env 只告警并忽略，
-#   设置里那条被跳过并计数；⑦ `--no-dsh-config` 不读映射，什么都没有时是 `-1 (unknown)`；
+#   设置里那条被跳过并计数（映射不认单位：`bad-one: 256K` 仍算非法）；
+#   ⑦ `--no-dsh-config` 不读映射，什么都没有时是 `-1 (unknown)`；
 #   ⑧ 人这一侧的出口：/model 报告的 ctx 行带来源，沿用要说出来。
 # ⚠ 一律 `env -i` 起：宿主环境里的 `UYA_AGENT_MODEL` / `UYA_AGENT_BASE_URL` 之类会把这些
 #   判据搅在一起（本仓的 e2e 目标里就属它最依赖「干净的机器」）。
@@ -947,6 +949,11 @@ e2e-ctxwindow: build
 	: "③ env 压过映射；④ cli 压过 env"; \
 	out=$$(env -i PATH=/usr/bin:/bin HOME=$$HOME UYA_AGENT_CONTEXT_WINDOW=123456 $(CURDIR)/$(OUT) --dsh-home $$home --agent-home $$home/agent --no-dsh-writeback --api-key dummy-key --print-config --model w-two 2>&1); \
 	echo "$$out" | grep -q "context_window = 123456  (source: env)" || { echo "FAIL: UYA_AGENT_CONTEXT_WINDOW 没压过映射"; echo "$$out"; exit 1; }; \
+	: "③b env 的 K/M/G 单位（十进制进位：K=1000 / M=1e6 / G=1e9）"; \
+	out=$$(env -i PATH=/usr/bin:/bin HOME=$$HOME UYA_AGENT_CONTEXT_WINDOW=256K $(CURDIR)/$(OUT) --dsh-home $$home --agent-home $$home/agent --no-dsh-writeback --api-key dummy-key --print-config --model w-two 2>&1); \
+	echo "$$out" | grep -q "context_window = 256000  (source: env)" || { echo "FAIL: UYA_AGENT_CONTEXT_WINDOW=256K 应当是 256000（十进制，不是 256）"; echo "$$out"; exit 1; }; \
+	out=$$(env -i PATH=/usr/bin:/bin HOME=$$HOME UYA_AGENT_CONTEXT_WINDOW=1G $(CURDIR)/$(OUT) --dsh-home $$home --agent-home $$home/agent --no-dsh-writeback --api-key dummy-key --print-config --model w-two 2>&1); \
+	echo "$$out" | grep -q "context_window = 1000000000  (source: env)" || { echo "FAIL: UYA_AGENT_CONTEXT_WINDOW=1G 应当是 1000000000"; echo "$$out"; exit 1; }; \
 	out=$$(env -i PATH=/usr/bin:/bin HOME=$$HOME UYA_AGENT_CONTEXT_WINDOW=123456 $(CURDIR)/$(OUT) --dsh-home $$home --agent-home $$home/agent --no-dsh-writeback --api-key dummy-key --print-config --model w-two --context-window 99999 2>&1); \
 	echo "$$out" | grep -q "context_window = 99999  (source: cli)" || { echo "FAIL: --context-window 没压过 env"; echo "$$out"; exit 1; }; \
 	: "⑤ 顺序无关：同一对参数、两种顺序，整份 --print-config 逐字节相同"; \
@@ -954,11 +961,11 @@ e2e-ctxwindow: build
 	run --context-window 99999 --model w-two > $$home/order-b.txt 2>&1; \
 	cmp -s $$home/order-a.txt $$home/order-b.txt || { echo "FAIL: --model 与 --context-window 的先后顺序会改变结果"; diff $$home/order-a.txt $$home/order-b.txt | head -20; exit 1; }; \
 	grep -q "context_window = 99999  (source: cli)" $$home/order-a.txt || { echo "FAIL: 顺序 A 里 cli 的窗口没生效"; exit 1; }; \
-	: "⑥ 非法值：CLI 报错退出（usage），env 只告警并忽略"; \
+	: "⑥ 非法值：CLI 报错退出（usage），env 只告警并忽略（256KB 不是单位写法）"; \
 	if run --context-window abc >/dev/null 2>&1; then \
 		echo "FAIL: --context-window abc 应当报错退出"; exit 1; \
 	fi; \
-	out=$$(env -i PATH=/usr/bin:/bin HOME=$$HOME UYA_AGENT_CONTEXT_WINDOW=256K $(CURDIR)/$(OUT) --dsh-home $$home --agent-home $$home/agent --no-dsh-writeback --api-key dummy-key --print-config 2>&1); \
+	out=$$(env -i PATH=/usr/bin:/bin HOME=$$HOME UYA_AGENT_CONTEXT_WINDOW=256KB $(CURDIR)/$(OUT) --dsh-home $$home --agent-home $$home/agent --no-dsh-writeback --api-key dummy-key --print-config 2>&1); \
 	echo "$$out" | grep -q "warning: UYA_AGENT_CONTEXT_WINDOW 不是正整数" || { echo "FAIL: 非法 env 值没有告警"; echo "$$out"; exit 1; }; \
 	echo "$$out" | grep -q "context_window = 555000  (source: uya-agent)" || { echo "FAIL: 非法 env 值被忽略之后应当回落到映射"; echo "$$out"; exit 1; }; \
 	: "⑦ --no-dsh-config：映射不读；一次都没人给过就是 -1 (unknown)"; \
@@ -970,7 +977,7 @@ e2e-ctxwindow: build
 	echo "$$out" | grep -q "ctx        555000  (source: uya-agent)" || { echo "FAIL: /model 报告没有印出窗口与来源"; echo "$$out"; exit 1; }; \
 	out=$$(printf '/model w-six\n/model\n/exit\n' | env -i PATH=/usr/bin:/bin HOME=$$HOME $(CURDIR)/$(OUT) --dsh-home $$home --agent-home $$home/agent --no-dsh-writeback --api-key dummy-key --no-tui --quiet 2>&1); \
 	echo "$$out" | grep -q "ctx        555000  (source: default，沿用上一个模型的值)" || { echo "FAIL: 切到没有窗口的模型之后应当说清是「沿用」，不许照抄上一个模型的来源"; echo "$$out"; exit 1; }; \
-	echo "e2e-ctxwindow: 通过（目录条目 < 映射 < env < cli；顺序无关；非法值 CLI 拒·env 忽略·设置跳过并计数；--no-dsh-config 不读映射；-1 (unknown) 口径；/model 报告的 ctx 行）"
+	echo "e2e-ctxwindow: 通过（目录条目 < 映射 < env < cli；env 认 K/M/G 十进制单位；顺序无关；非法值 CLI 拒·env 忽略·设置跳过并计数；--no-dsh-config 不读映射；-1 (unknown) 口径；/model 报告的 ctx 行）"
 
 # P84：**收图能力位**（离线，真二进制 + 真 settings.yaml + 真 PNG）。
 #   口径是「默认支持」：出厂就是开，只有**明确说不支持**才关 ——
