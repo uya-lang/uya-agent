@@ -1485,7 +1485,7 @@ plan 审阅的四条裁决：`PLAN_KEEP=0` / `PLAN_APPROVE=1` / `PLAN_NO_CHANNEL
 | `assistant/message` | — | 助手正文（**退化那一步不写**，§5.4） |
 | `assistant/reasoning` | — | 思考（**步末**才落盘 —— 这是 `/watch` 粒度的根源，§11.6） |
 | `assistant/first-token` | `{turn, step}` | 首 token；**时间用 `sess_begin_at` 钉在首 token 那一刻**（不是落盘时刻） |
-| `tool/call` / `tool/result` | — | 工具调用/结果（`tool/call` 在工具**执行前**写） |
+| `tool/call` / `tool/result` | `tool/result.display`（P119） | 工具调用/结果（`tool/call` 在工具**执行前**写；`display` 是 live 渲染好的整块，恢复会话时逐字节回放，§8.6） |
 | `session/title` | — | 标题变更 |
 | `session/workspace` | `{workspace, previous, source}` | 工作区切换 |
 | `session/model` | `{provider, model, reasoningEffort, source}` | 模型/档位变更（`source` 见 §5.5.1） |
@@ -1582,6 +1582,33 @@ sess_open_resume            用会话自己的路径 + next_seq 续写
 
 `l.cwd` 传**当前**工作区（索引的工作区列按它写，**header 不动**）。
 折叠统计与日志在 resume 时对齐：`st_reset()` + 逐行 `st_fold_line`。
+
+**恢复之后屏幕上是什么**（P119）：`--resume` / `--continue` / `/resume` 的转录由
+`agent_tui_replay_session`（`agent/ag_tui_replay.uya`）从**会话日志**重放，不再从
+`History` 重放。`History` 是模型输入：它被压缩裁过、注入了运行时上下文、工具只剩结果
+正文 —— 照它铺屏幕，同一条会话「退出前」与「恢复后」必然是两种长相。
+
+| 日志事件 | 屏幕上的条目 |
+|---|---|
+| `user/message`（`source.kind = user` / `steer`） | `▎ 你` / 插话条目；注入类按 §15.2 的同一条判据跳过 |
+| `user/message`（`source.kind = compaction`） | 一条 `[compact] 已压缩较早的 N 条消息（pressure=X）`（`shadowed` / `pressure` 取自事件；老日志没有这两个键就退化）；摘要正文不回放 |
+| `assistant/message` | 正文条目（与 live 同一条流式入口，markdown 渲染） |
+| `assistant/reasoning` | 思考条目，**仅当**当前进程 `--show-reasoning` |
+| `tool/result` | 该事件的 `display` 整块原样（与 live 逐字节相同）；老日志没有 `display` 时用上一对 `tool/call` 的 name+arguments 走 `view_replay_block` 重画 |
+
+窗口 = 最近 `TR_MAX_EVENTS`（512，与 TUI 条目池同量级）条显示事件，更早的给一行
+「… 更早的会话记录已省略」。日志读不到 / 没有可显示事件（`--no-save`、`--resume-dsh`
+导入、空会话）→ 退回 `agent_tui_seed_history`（历史骨架；工具结果没有工具名）。
+
+`tool/result.display` 是 `view_render_block` 的成品：写入端在 `view_end_tool` 之后立刻
+取 `view_display_block()`（`--quiet` 时是空块，日志里一个字节都不多写）。回放**不重新
+渲染** live 的块，所以恢复之后即使 `--tool-lines` 换了，屏幕上仍是当时那一屏 —— 这正是
+「保持上一次运行时的最后显示」。
+
+代价与成本：`display` 在默认 `--tool-lines=0` 时只有一行（相对结果正文可忽略）；打开
+正文块时它与**截断后**的正文同量级。恢复时多出来的开销是**一次额外的顺序读 + 逐行判
+类型**（`"type":"` 在行首，几步命中）与重放 ≤512 条条目的排版 —— 后者与 live 当时做过
+的工作同量，不随日志长度线性放大。
 
 **折出 0 条有两种含义，必须分开**（踩坑 154）：`agent_hist_from_log` 的返回值数的是
 **历史消息**，而清单与 `session/title` 不进历史 —— 所以「一条消息都没有」既可能是
@@ -4267,7 +4294,7 @@ QTermWidget）对 `ESC[?5522$p`（DECRQM）**零应答**，OSC 52 写 `c`/`p` �
 
 | 边界 | 说明 |
 |---|---|
-| **换会话只换「当前会话的」那段屏幕**（P39） | TUI 里 `/new`、`/resume <id>` 把转录清成「只剩新会话」（`/resume` 再回放历史）；但**滚动模式（`--no-tui`）不重画** —— 那边的正文是终端自己滚出去的。回放复用启动时那一份口径（最近 200 条 + 一条「更早的会话记录已省略」提示，注入类消息不回放） |
+| **换会话只换「当前会话的」那段屏幕**（P39；P119 改口径） | TUI 里 `/new`、`/resume <id>` 把转录清成「只剩新会话」（`/resume` 再按**日志**重放到退出前那一屏，见 §8.6）；但**滚动模式（`--no-tui`）不重画** —— 那边的正文是终端自己滚出去的 |
 | **子代理面板里那条「最新消息」是父进程发给它的那句话**（P40） | 预览取 `Deleg.prompt`（首行、空白折叠、超长贴尾）；子代理 stdout 按 P11 口径**只在跑完时**才回传管道，所以「它刚说了什么」得等终态或 `subagent_output`（面板那个 `· N` 是已收输出行数，运行中通常是 0）。贴尾只收窄**显示**，`Deleg.prompt` 本身一个字节不动 |
 | **`/watch` 的实时粒度是「事件」不是 token 级**（P42） | 见 §9.1；且 `/watch` 是**进程状态**（`--resume` 不回填）；被跟随的子代理跑完或槽位回收时跟随自动结束 |
 | **浮层高上限 16 行**（非全屏） | `↑/↓`、`pgup/pgdn`、`home/end` 滚，标题栏 `↑`/`↓` 是溢出指示 |
@@ -4276,7 +4303,7 @@ QTermWidget）对 `ESC[?5522$p`（DECRQM）**零应答**，OSC 52 写 `c`/`p` �
 | **web 页面里的拖选与复制自己实现** | 浏览器默认给的那套在终端网格上有两个坑（抢焦点毁选区、默认复制带 `text/html`），所以：焦点只在「没在拖、也没选中」时才抢；`copy` 接管后只写 `text/plain`；`ctrl+c` 按选区分流（有选区 = 复制，没选区 = 中断）。见 §11.8.6.2/§11.8.6.3 与踩坑 125 |
 | **终端里不渲染图片** | 屏幕上只有一行占位（这就是「挂上了」的全部证据）；**超预算的 JPEG 会自动缩小**（`imgz`，P72），PNG/GIF/WebP 仍只能拒 |
 | **「选中文字复制」TUI 自己做**（P85） | 拖鼠标 = 选中并复制到 `CLIPBOARD`（不按 shift）；高亮逐格反显，esc 清选区。`F2` / `/mouse off` 仍可把鼠标交回终端（那时用终端自己的选区），`--no-mouse` 同效。没有 X11 会话时复制会**明确报错**（不静默）；SSH 下写进去的是**远端**剪贴板，回执会标出来 |
-| **`--resume` 只回填最近 200 条历史** | 注入类消息不回填；`--resume-dsh` 走同一条回填路径 |
+| **`--resume` 只回填最近 200 条历史** | 那是**模型输入**的口径（注入类消息不回填；`--resume-dsh` 走同一条回填路径）。屏幕由 P119 的日志重放铺开（最近 512 条显示事件），两条口径分开了 |
 | **滚动模式是纯文本字形、不做 markdown 渲染** | TUI 有颜色 + markdown |
 | 终端 < 32×8 自动退回滚动模式；`cols < 66` 时块字 logo 退化成一行标题 | |
 | **终端标题是 best-effort 的礼貌** | 不写空标题；导入 DSH 会话时按 `source.kind = "user"` 记一条 `session/title`，**不是新增事件类型** |
@@ -6931,7 +6958,7 @@ DEEPSEEK_API_KEY=sk-xxx ./build/uya-agent \
 | `todo-resume` | **§19.13**：清单的落盘与折回 —— 提交落 `todo/write`（线上字节逐字段）/ 清空内存折回来一致 / 面板出「任务 1/3」/ 折到 `turn/start` 出空 / 回合开始清空内存清单 |
 | `sess-list` | 去重取最后一条、按 `lastActiveAt` 降序、8 档列宽退化、完整 id |
 | `sess-list-big` | 踩坑 68：6000 行大索引 —— 归并排序与「金标准（未修的插入排序）」逐行等价、两把键各自有序、排两次结果相同、去重 2000 条、行尾 id 完整（抽查首/中/末） |
-| `tui-switch` | P39 换会话：清转录 → 回放 → 回执、脚注保留、滚动模式不动；P25 会话级状态：`/new`、`/resume` 清空 todo 清单（屏幕与 `g_todos.n` 两处），目标不跟着清 |
+| `tui-switch` | P39 换会话：清转录 → 回放 → 回执、脚注保留、滚动模式不动；P25 会话级状态：`/new`、`/resume` 清空 todo 清单（屏幕与 `g_todos.n` 两处），目标不跟着清；**P119 恢复显示**（§19.37）：工具块按 `display` 逐字节回放、老日志（无 `display`）按 name+arguments 重画、`--show-reasoning` 时才回放思考、压缩 checkpoint 只出 `[compact]` 诊断（摘要正文不许装成 `▎ 你`）、`--tool-lines=0` 时结果正文不上屏 |
 | `tui-sessions` | `/sessions` 浮层：箱体铺开、默认游标在最后一项、完整 id |
 | `tui-sessions-big` | 踩坑 68：2000 项 —— 取行查表 vs 线性扫描**差分逐字节相同** + 取末项 20000 次的自校准比值（查表 ≪ 扫描）+ 第 0/中/末项文本正确 + home/end/↑/↓ 与 sel_set 自洽 + 列表与 reader 成帧各 < 1 s + 正文层无 ESC/NUL |
 | `tui-model` | P37 `/model`/`/effort` 浮层：按提供方分组、只列公布的档位、反解、非推理模型不开浮层；**P37 修复**：回合运行中选完模型 ⇒ **泵点当场收口**（`cfg.model` 立刻变、结果不再挂着、浮层已关）；**P62**：同名跨提供方（见踩坑 99）—— 行里带提供方、`✓` 按二元组、选中另一家的同名行真换过去 |
@@ -7025,7 +7052,7 @@ DEEPSEEK_API_KEY=sk-xxx ./build/uya-agent \
   的真实路径（74 列），新窗口把它夹到 30 列并补 `…`；统计行因此整条放得下了（修前被长
   路径挤到只剩四组）。这是**有意的**，也正是用户报的那件事；短路径（`~/proj` 这类）装得下
   时仍然逐字节不变 —— `tui-marquee` 的 A 段钉的就是这条。
-- 只跑子集的开关：`UYA_SELFTEST_TUI_ONLY`、`UYA_SELFTEST_PERM_ONLY=1`（P21+P26）、`UYA_SELFTEST_GOAL_ONLY=1`（P29）、`UYA_SELFTEST_SHELL_ONLY=1`（P38）、`UYA_SELFTEST_PANEL_ONLY=1`（P15+P40，`make panel-selftest`）、`UYA_SELFTEST_EMPTY_ONLY=1`（P54，退化响应两轮 —— 跑对照实验时用它，一次约 0.2 s）、`UYA_SELFTEST_NOTIFY_ONLY=1`（P104，后台完成通知三条腿，`make notify-selftest`）。
+- 只跑子集的开关：`UYA_SELFTEST_TUI_ONLY`、`UYA_SELFTEST_PERM_ONLY=1`（P21+P26）、`UYA_SELFTEST_GOAL_ONLY=1`（P29）、`UYA_SELFTEST_SHELL_ONLY=1`（P38）、`UYA_SELFTEST_PANEL_ONLY=1`（P15+P40，`make panel-selftest`）、`UYA_SELFTEST_EMPTY_ONLY=1`（P54，退化响应两轮 —— 跑对照实验时用它，一次约 0.2 s）、`UYA_SELFTEST_NOTIFY_ONLY=1`（P104，后台完成通知三条腿，`make notify-selftest`）、`UYA_SELFTEST_TUISWITCH_ONLY=1`（P119，只跑 `tui-switch` 这一轮 —— 改「恢复显示」那条线时用它，配合 `UYA_SELFTEST_TUI_ONLY=1` 一次约 2 s）。
 - 探针：`make probe BASE=https://api.deepseek.com/v1` 期望 HTTP 401 + leaf 指纹。
 
 **load-bearing 硬指标**
@@ -9918,7 +9945,7 @@ UYA_SELFTEST_MODEL_ONLY=1 ./build/uya-agent --selftest         # 本机（有全
 （「`/status` 里印得出当前版本」）不变，但不再能被空串糊弄。
 
 **没顺手做的**：不删 `AGENT_VERSION` 这个常量与它的两个调用点。它仍是**开发阶段身份**
-的挂载点（README §0.1 的 `P0`–`P116` 记法与 `--tui-demo` 脚注排版基准都指着它），
+的挂载点（README §0.1 的 `P0`–`P119` 记法与 `--tui-demo` 脚注排版基准都指着它），
 删掉它等于把「以后要挂一条阶段串」变成一次结构改动。置空是**可逆**的：把串填回去，
 拼装函数、自测与文档都不必再改。
 
@@ -10077,3 +10104,61 @@ SKIP / 0 FAIL = SELFTEST PASS**；Linux 侧仍 PASS。
 人的显式动作；自动收掉 esc 的停止权等于把 P96 改回去。② `update_goal edit` 仍不能改
 `max_goal_rounds`（DSH 的 edit 能）—— 本仓用 resume 补预算覆盖了同一条需求，真需要
 「人指定一个更大的数」时再加。③ 没动 `turn/retry`：异常收场它已经自动续（P96）。
+
+### 19.37 P119：恢复会话之后，屏幕回到「上一次运行时的最后那一屏」
+
+**症状**（用户报的第 27 条）：「恢复会话后，显示要保持和恢复之前运行时的最后显示样式」。
+
+**为什么以前不是**：P39 的回放只认 `History`（`agent_tui_seed_history`），而历史是
+**模型输入**，不是屏幕：
+
+* 工具结果在历史里只剩**结果正文**（`ROLE_TOOL`）—— 屏幕上于是是一块裸文本，没有
+  `✓ Name(args) · 摘要`，没有 diff / 首尾行。日志里其实有 `tool/call` 的 name 与
+  arguments，只是回放没用。
+* `assistant(tool_calls)` 那条消息（正文 + 调用组）在历史里是
+  `ROLE_ASSISTANT_CALLS`，回放直接跳过 ⇒ 正文整条不见。
+* `assistant/reasoning` 根本不进历史 ⇒ 思考条目一条都没有。
+* 压缩 checkpoint 在历史里是**一条 `ROLE_USER`** ⇒ 恢复后屏幕上多一条 `▎ 你` + 一整段
+  英文摘要（用户从没打过这些字）。
+* 被压缩掉的那一段在历史里已经不存在 ⇒ 屏幕直接少一大段。
+
+一句话：日志是**显示**的真相，历史是**请求**的真相，两者不能互相顶替。
+
+**修法**（`agent/ag_tui_replay.uya`，两个入口共用）：
+
+* `--resume` / `--continue` 启动：`agent_run_tui_body` 里把
+  `agent_tui_seed_history(&h)` 换成 `agent_tui_replay_session(cfg, &h)`。
+* 运行中 `/resume`：`agent_tui_session_switched` 清屏之后走同一条函数。
+* 扫两遍日志：第一遍只把「会进转录」的事件行区间记进 512 条的环形窗口；第二遍按显示
+  入口逐条重放（user/steer/compaction、assistant、reasoning、tool/result）。窗口外的
+  事件给一行「… 更早的会话记录已省略」（与 P39 的老提示同一句）。
+* 压缩 checkpoint 只回放成 live 那句诊断：`shadowed` 与 `pressure` 一并落进 checkpoint
+  事件（P119 加 `pressure`），所以恢复出来的是逐字节相同的
+  `[compact] 已压缩较早的 N 条消息（pressure=X）`；`--quiet` 时 live 不出这句，回放也不出。
+* `tool/result` 新增 `display` 字段（`view_render_block` 的成品；写入端在
+  `view_end_tool` 之后立刻取 `view_display_block()`）⇒ 回放逐字节同 live，**含 diff**。
+  老日志没有它 → 用 name+arguments+result 走 `view_replay_block`（同一条渲染器；diff
+  画不出来，只剩后缀）。
+* 注入类消息（`<goal_round>` / `<pm-memory>` / 运行时上下文…）沿用
+  `agent_tui_is_injected` 的判据 —— 判据抽成
+  `agent_tui_text_is_injected(p, n)`，`Msg` 版与日志版共用一份（两份会分叉）。
+* 兜底：日志读不到 / 没有可显示事件（`--no-save`、`--resume-dsh` 导入、空会话）→
+  原来的 `agent_tui_seed_history`。`--quiet` 时工具块照旧不显示（`view_enabled()` 门）；
+  `--tool-lines` 不参与回放（回放的是当时渲染好的那一块）。
+
+**验收**：
+
+| 判据 | 落点 |
+|---|---|
+| `/resume` 之后工具块按 `display` 回放（含 ✓ 行） | `selftest[tui-switch]` B 段 |
+| 老日志（无 `display`）按 name+arguments 重画 | 同上（c2 那条） |
+| `--show-reasoning` 时才回放思考 | 同上（B 段打开开关，正文 `TUIS-RESUMED-THINK`） |
+| 压缩 checkpoint 不回放摘要正文、只出 `[compact]` 诊断 | 同上（`已压缩较早的 7 条消息`） |
+| `--tool-lines=0` 时结果正文不上屏 | 同上（`TUIS-RESUMED-OLDCONTENT` 不出现） |
+| 启动 `--resume` 与 `/resume` 走同一条路 | 两条路都调 `agent_tui_replay_session` |
+| 换会话 / 滚动模式的既有口径不回归 | `selftest[tui-switch]` A/C/D 段 |
+
+**没顺手做的**：① 不把 `assistant/reasoning` 折进 `History` —— 它是显示数据，进了历史
+就会改变发给端点的请求（P4 的严格工具协议与缓存前缀都不许动）。② 不给 DSH 导入的
+日志补工具名：`--resume-dsh` 的 `tool/result` 里没有 `tool/call`（对方的格式），那条路
+仍是历史骨架。③ 不把 `display` 写进 DSH 兼容层（§8.7 的 `surfaceOp` 适配还没做）。
