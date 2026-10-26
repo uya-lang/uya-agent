@@ -850,6 +850,15 @@ bash 结果占请求窗口 **57.9%**，read 只占 **12.9%**；其中会走到�
 保留最近 `retainRatio = 0.16` 的原文。**硬规则**：摘要**不比被遮蔽内容短就拒绝**（DSH 的规则）
 —— 否则「压缩」会反而把上下文撑大。
 
+**`h.bytes` 的口径（2026-10-26 修，踩坑 162）**：它数的是**要发给上游的全部字节**
+（`text + extra + reasoning`），不是正文。入史时三样都加，所以**每一次删除都必须三样
+一起减**（裁剪 / 回滚 / 丢最老 / 丢前缀 / 压缩）。修前只有入史算了 reasoning、删除只减
+`text + extra`，`cmp_apply` 更是**一分都不减** ⇒ 账单调偏大，而 `cmp_shadow_count` 的
+保留量（`cmp_retain_bytes(h.bytes)`，16%）正是按它算 ⇒ 保留段越来越大，最后每次只遮掉
+上一个 checkpoint、压力几乎不降（真机 78 步连压 9 次）。压后的压力基线也不再退回
+「字节 / 4」估算，而是按 `压前实测压力 × 压后字节 / 压前字节` 折算 —— 只做比例换算，
+与实测 `prompt_tokens` 同量纲（字节/4 不含 system/tools，约 30k 的差会让滞回闸门失真）。
+
 开关：`--no-compact` / `--context-window N` / `/compact`（运行中敲的排 step 边界）。
 `compaction/summary` 事件落日志。
 
@@ -6710,6 +6719,46 @@ QTermWidget）对 `ESC[?5522$p`（DECRQM）**零应答**，OSC 52 写 `c`/`p` �
      夹具上跑的话**两种写法都绿** —— 判据必须造「后面还有带 display 的事件」，
      并且**拿真机会话**跑一次 resume；② 这类越界读的症状与日志大小强相关，pty 里
      跑一条真会话比在小夹具上重试一百次有用（与踩坑 129 的「真入口」同一条纪律）。
+
+162. **自动压缩越压越频繁：`h.bytes` 只加不减，保留段最后约等于整份历史**
+     （2026-10-26，用户报的「session-c7f98113 频繁压缩」）。
+
+     现场：1M 窗口的会话 11998 行 / 19 次 `compaction/summary`；turn 15 的 78 步里
+     压了 9 次，后 8 次压力几乎不降（333k → 331k），每次都只遮掉「上一个
+     checkpoint」。压力读数本身没问题（≈200k = 1M 窗口的增长线 floor），坏的是
+     **每次压掉的量太少**。
+
+     根因：`History.bytes` 的记账口径不一致 —— `hist_push_msg_full` 把
+     `text + extra + reasoning` 三样都加进去，而四条删除路径（`hist_truncate_to`、
+     `hist_drop_oldest_below` ×2、`hist_remove_range`、`hist_drop_prefix`）只减
+     `text + extra`，`cmp_apply`（压缩本身）**一分都不减**。reasoning 在 thinking
+     模式里与正文同量级（该会话 assistant 正文 2.31 MB、reasoning 2.31 MB）⇒ 账上
+     多出来的部分随会话单调增长。而 `cmp_shadow_count` 用
+     `cmp_retain_bytes(h.bytes)`（16%）决定尾部保留多少字节 ⇒ 保留预算越来越大，
+     最后约等于整份历史 ⇒ 阴影段里只剩「上一次压缩插进来的 checkpoint」，摘要内容
+     几乎全是它 ⇒ 压完十几步就涨回来，再压。
+
+     修法（一条口径，五处同步）：`h.bytes` 正式定义为**要发给上游的全部字节**
+     （text + extra + reasoning），入史 / 五种删除 / `cmp_apply` 全部三样同加减；
+     `cmp_shadow_bytes` 与 `cmp_shadow_count` 的尾扫同口径（否则「阴影段多大」与
+     实际被遮掉的字节对不上）。另外把压后的压力基线从「`agent_pressure_tokens` 的
+     `bytes / 4` 兜底」改成「压前实测压力 × 压后字节 / 压前字节」—— 字节/4 不含
+     system/tools（约 30k），与实测 `prompt_tokens` 不同量纲，会让「涨够才许再压」
+     的滞回闸门失真。
+
+     判据：`selftest[compact-account]`（st_ctxfit）造两轮「20 组
+     assistant(1000 正文 + 3000 reasoning) + user(1000)」：① `hist_bytes_ok` 在
+     入史后 / 压缩后 / 插回 system+checkpoint 后都必须成立；② 压完 `h.bytes` 必须
+     降到压前的 1/4 以下；③ 第二轮再灌 10 万字节后阴影段必须仍 ≥ 60 KB（旧实现
+     只剩约 8 KB）。单条删除路径另由 `selftest[hist-repair]` 的第 7 段钉住（带
+     reasoning 的消息被裁剪后 `h.bytes` 必须跟着减）。防假绿对照：把 `cmp_apply`
+     里那三行减账删掉重编 ⇒ `compact-account` 当场 7 条红（含第二轮「入史后」那条
+     —— 前一轮的账没减），恢复后全绿（已实测）。
+
+     教训：① 一个「总量」字段有几种成分，就**必须**在「加」的那一处和「减」的每一处
+     写成同一份表达式 —— 只在入史里加、在删除里漏，是静默的单调漂移，任何单函数
+     自测都绿；② 账偏大不会报错，只会让**依赖它的阈值**悄悄失效（这里是保留比例），
+     所以判据要落在**行为**上（第二轮阴影段还剩多少），不能只断言函数返回值。
 
 ---
 
