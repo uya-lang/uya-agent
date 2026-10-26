@@ -1968,9 +1968,20 @@ TUI 那一条另加两道**人的优先权**：`tui_abort_state() != QUIT`（按
 **刻意不用** `tui_quit_wanted()` —— 那个还含 headless 的「注入键用完」，是自测的收工信号）
 与 `tui_input_pending()`（fd 0 上还有待读的键就让行）。
 
+**授权由人的输入重新打开（P121）**：`goal_disarm` 收掉的那一位（esc 叫停 / 异常收场 /
+`--resume` 之后），**人在会话里说下一句话**时由 `goal_rearm_on_human` 翻回来：盘上
+`armed=true` + `revision+1`（面板与别的进程看的是「盘上 && 本地」，必须成对），本地授权
+同时打开 —— 于是那句话答完、主循环回到 idle，驱动器照常开下一轮。闸门与驱动器同一对
+（`g_interactive` / 非子代理），paused / blocked / complete 一个字节都不动（那是明确的
+「不要跑了」）。动机是真机 `session-c7f98113`：esc 之后人问了一句「为什么这么耗内存」，
+答完就停在提示符上，active 目标再也不会自己开轮（人只好反复敲「继续」，而模型不一定
+记得去 `update_goal action=resume`）。P96 的「esc 停得下来」仍然成立 —— 停的含义是
+「停到人再开口」，不是「停到人想起来打 `/goal resume`」。
+
 **模型侧的契约是 system prompt 的一节（P116）**：`SEC_GOAL`（`agent/prompt.uya`，order 108）。
 会话恢复 / fork / 人按 esc 之后 active 目标是 **disarmed**：人用任何说法要求继续时，模型要先
-`get_goal` 再 `update_goal action=resume`；`complete` 只在目标真的达成时标；`blocked` 只在
+`get_goal` 再 `update_goal action=resume`（P121 起运行时已在人的下一条输入时自动 re-arm，
+模型这一步留给 paused / blocked 与「状态确实还是 disarmed」的兜底）；`complete` 只在目标真的达成时标；`blocked` 只在
 **同一个具体阻塞条件连续 3 轮**之后才允许，且「难 / 不确定 / 还有活」不算阻塞。没有这一节时
 模型会自己判断「剩余轮次不够」提前 blocked、或在人说「继续」时根本不 resume —— 后者是因为
 它没有任何理由去查目标状态（真机 session-28118a0a 的两条失速）。这一节也是 `<goal_round>`
@@ -1989,8 +2000,8 @@ TUI 那一条另加两道**人的优先权**：`tui_abort_state() != QUIT`（按
 
 **授权不跨进程**：`agent_session_scoped_reset`（启动 / fork / `--resume` / `/new` / `/resume`
 都走的那个收口）把 `g_goal_armed` 清掉，**盘上的 phase / revision 一个字节不动**。要接着自动跑
-必须由人明确授权（`update_goal action=resume` 或 `/goal resume`）—— 与 DSH 的
-「会话 resume / fork 之后 active 目标是 disarmed」同一条。
+必须由人明确授权（`update_goal action=resume` 或 `/goal resume`；P121 起人的下一条输入也算）——
+与 DSH 的「会话 resume / fork 之后 active 目标是 disarmed」同一条。
 **授权不跨会话**与**目标不跨会话**是两件事（P87）：前者是「这一轮的继续跑由谁授权」，后者是
 「目标是哪条会话的」—— 换会话之后目标换成了新会话自己那份（多半是「一个都没有」），
 而授权一律收回，两件事各管各的。
@@ -10325,3 +10336,53 @@ docs-only 提交」，goal 一直续跑却一直没有实质产出 —— 人看
 「实质产出」定义（改文件 / 有副作用的工具 / 验收命令通过），牵到驱动器与 goal 记账，
 留给下一条。② 没给模型一个「压多少」的旋钮：保留量策略是全局的，给了只会被调成 0。
 ③ 没动那三条触发线：这次的问题不是压得太晚，而是**不晚** —— 模型却以为晚了。
+
+### 19.39 P121：目标激活时人插一句话，答完就停下（不再自己开轮）
+
+**症状**（用户报的，原话）：「在目标激活的情况下，我中间输入了内容，它回答完就停下来了」。
+
+**真机取证**（`~/.uya-agent/sessions/---media-winger-_dde_data-winger-uya-uya--/`
+`session-c7f98113-…`，两万多行 `session.jsonl`）：
+
+* 最后一条 `<goal_round>` 是 `seq=22580`、`Round: 264/512`；此后再没有一条。
+* 紧接着 `turn/end` `seq=23090` 是 **reason=aborted**（那一轮正在跑 `bash`，工具回执是
+  `[aborted by user]` —— 人按了 esc），**1 秒后**就是人的 `user/message` `seq=23091`
+  「census为什么这么耗内存？」。
+* 那一轮 `turn/end seq=23285 reason=completed`（回答完了），然后**静止** —— 主循环回到
+  提示符，不再开轮。之后 `seq=23286`「修复」、`seq=23622`「是不是卡死了」（又是
+  `seq=23621 aborted`）、`seq=23650`「继续」，全是普通回合。
+* 盘上 `goal.json`：`phase=active`、`round=264`、`maxRounds=512`、`revision=283`，但
+  **`armed=false`** —— 目标本体还在，续跑授权收着。人于是只能一遍遍敲话催。
+
+**根因**（不是驱动器判据错，是「人说话」这条信号没人接）：P96 把 esc 做成「收授权 +
+停」，P116 把「接着跑」做成**模型侧的显式动作**（`update_goal action=resume`）。两处都
+漏了最常见的一步 —— 人按 esc 的动机往往就是**想插一句话**（现场：esc 之后 1 秒就说
+了）。运行时只认 `g_goal_armed`，而它已经被 `goal_disarm` 收掉；`goal_round_admit`
+的第一道闸门直接挡住，主循环回到提示符就再也不开轮。模型那一轮拿到的是「一句普通的
+提问」，没有任何理由去查 goal（与 §19.36 记的失速同族），于是「答完就停」。
+
+**修法**：
+
+* `agent/goal.uya` 新增 `goal_rearm_on_human`：人说话时若盘上是 `active` 而授权收着，
+  就翻回 `armed=true` + `revision+1` + 本地 `g_goal_armed`（面板/别的进程看的是
+  「盘上 && 本地」，必须成对），并打一条回执；paused / blocked / complete 一个字节
+  不动；非交互 / 子代理不动（与驱动器同一对闸门）。
+* 接在三个「人说话」的落点：TUI 主循环提交前、滚动模式提交前、`agent_claim_steer`
+  领取运行中插话时（三个落点覆盖「新回合」与「插话」两种形态）。
+* `agent_goal_drive` 的 esc / 异常回执改口径（`GOAL_STOPPED_MSG` 一处定义两处共用）：
+  说清「再输入任意内容会接着跑，/goal resume 立即接着跑」。
+* `SEC_GOAL` 补一句：运行时会在人的下一条输入时自动 re-arm，**别因为人插了一句话就
+  pause / 收工**。
+
+**验收**：
+
+| 判据 | 落点 |
+|---|---|
+| 没有目标 / paused / blocked / 非交互 → 不翻；active+disarmed → 翻（本地+盘上+revision）；已经开着 → 不重复翻；翻开后驱动器开得动 | `selftest[goal-cmd]` 的 K12 |
+| 端到端：盘上 active+disarmed 的目标 + 人一句输入 → 回执 + 答完真的开续跑轮 + 跑满即 blocked | `selftest[tui-turn]` 的 P121 腿（mock mode 53） |
+
+**没顺手做的**：① 没让人的输入把 `paused` / `blocked` 也拉起来 —— 那是明确的停止，
+要 `/goal resume`（或模型 resume）。② 没改 `--resume` 启动时 disarmed 那条不变量
+（P58 还在；人一说话它就自动接上）。③ 没判「这句话跟目标有关吗」：判断不了，而人主动
+说话本身已经是明确授权。④ 没把 `/continue` 也算成人的输入：它是「带着现有历史再跑
+一轮」而不是一句话，目标要接着跑仍走 `/goal resume`（或让模型 resume）。
