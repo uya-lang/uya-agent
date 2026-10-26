@@ -815,9 +815,9 @@ leaf 指纹怎么算、指纹库放哪儿 —— 见 [DESIGN.md §18](DESIGN.md)
   四条硬边界：① **只在有人看的前台会话里跑** —— 管道 / CI / 子代理不驱动（那儿没人叫停，而每一轮
   都是真的发请求）；② **用户一动键盘就让行**（TUI 里 fd 0 上还有待读字节就不驱动，滚动模式先驱动
   一轮再等输入），按了退出/中断也不会再开新轮；③ **授权不跨进程** —— `/new`、`--resume`、fork 之后
-  目标还在盘上但自动续跑停着，接着跑要人明确 `/goal resume`（P116：也可以说一句「继续」，模型侧的
-  goal 策略会先 `get_goal` 再 `update_goal action=resume`）；④ **异常不自动重试**：某一轮以网络/
-  协议错收场就停下（DSH 同口径），修好后 `/goal resume`。`round >= maxRounds` 时把盘上的 phase
+  目标还在盘上但自动续跑停着；P121 起**人的下一条输入**（说任何内容都算）会把它自动翻回来 ——
+  要立刻接着跑也可以 `/goal resume`，要真的停下目标本身用 `/goal pause`；④ **异常不自动重试**：某一轮以网络/
+  协议错收场就停下（DSH 同口径），修好后 `/goal resume`（P121：人再说一句话也会接着跑）。`round >= maxRounds` 时把盘上的 phase
   改成 `blocked` + `blocker=round-limit`（是终态，不是悄悄停下；P116：`resume` 会补一段新预算）。
   **每轮一轮就是一条 `<goal_round>` user 消息**进同一个会话（不 fork、不开新 agent），所以历史
   会一直长 —— 长目标要靠压缩（人的 `/compact`，或模型自己调 `compact` 工具）。P120 起
@@ -942,7 +942,9 @@ leaf 指纹怎么算、指纹库放哪儿 —— 见 [DESIGN.md §18](DESIGN.md)
   默认 256、最多 1000）；跑满即标成 `blocked`（round-limit）停下。`resume` 会清掉上一次的
   `blocker`，并在轮次用尽时补一段预算（再给 256 轮）—— 人叫停、会话恢复、轮次用尽之后，
   一句「继续」（模型侧的 `update_goal action=resume`）或 `/goal resume` 就能接着跑，不会卡在
-  「已恢复但开不动」。弹窗里 `Objective:` / `Blocker:` **压成一行**显示（多行目标与阻塞原因
+  「已恢复但开不动」。**P121**：人叫停 / 会话恢复之后的 active 目标，人的**下一条输入**（插话或
+  新回合，说任何内容）就会自动把续跑授权翻回来，答完那句话立刻接上下一轮，不必反复敲「继续」；
+  轮次用尽那种 `blocked` 是终态，仍要显式 resume。弹窗里 `Objective:` / `Blocker:` **压成一行**显示（多行目标与阻塞原因
   折成空格，方框不会被拆坏）。**P116**：模型侧的 goal 生命周期规则（会话恢复/中断后 resume、
   complete / blocked 的门槛）是 system prompt 的一节，见 DESIGN §9.5。
   **目标属于会话**（P87）：它落在**会话目录**里（`<agent_home>/sessions/--<cwd>--/<id>/goal.json`，
@@ -1170,7 +1172,9 @@ leaf 指纹怎么算、指纹库放哪儿 —— 见 [DESIGN.md §18](DESIGN.md)
   见 [DESIGN.md §19.20](DESIGN.md)。
 * **goal 的自动续跑能被 esc 叫停**（P96）：以前按 esc 只断当前那一轮，主循环下一圈立刻又
   开一轮（看起来就是「goal 激活之后中断不了」）；现在 esc / ctrl+c **收掉续跑授权**（盘上的
-  `armed` 一起翻成 false），目标本体留在盘上，`/goal resume` 一条命令接着跑。
+  `armed` 一起翻成 false），目标本体留在盘上，`/goal resume` 一条命令接着跑。**P121**：这一停
+  只到人再开口为止 —— 人下一条输入（插一句话也算）会把授权自动翻回来，答完就接着跑；要真的
+  让目标别跑用 `/goal pause`（或 `update_goal action=pause`）。
 
 **平台与编译器**
 
