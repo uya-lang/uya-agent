@@ -10466,3 +10466,54 @@ docs-only 提交」，goal 一直续跑却一直没有实质产出 —— 人看
 （P58 还在；人一说话它就自动接上）。③ 没判「这句话跟目标有关吗」：判断不了，而人主动
 说话本身已经是明确授权。④ 没把 `/continue` 也算成人的输入：它是「带着现有历史再跑
 一轮」而不是一句话，目标要接着跑仍走 `/goal resume`（或让模型 resume）。
+
+### 19.40 P122：连续「零产出」轮次 → 停下自动续跑（空转的刹车）
+
+**症状**（用户报的，同一现场 `session-c7f98113-…`，`session.jsonl` 33088 行）：
+目标的 `round` 从 264 一路涨到 297，三十来轮里**每一轮**都是同一个形状 ——
+`user/message`（`<goal_round>`）→ `step/start` → `assistant/message`（content 为空，
+`usage.outputTokens=16`，全是 reasoning）→ `turn/end reason=max-tokens`。没有一条工具
+调用、没有一个正文字节，每次都是同一份 `cacheReadTokens≈716K` 的提示词。只有人按 esc
+才停；而 P121 之后人一说话又自动重新授权，于是回到同一个圈。之后接 `/compact`（502）、
+`/new`。
+
+**根因**（不是「截断」本身，是**截断 + 一字未写**被当成了往前走）：`agent_goal_drive`
+的收口判据只有「退出码异常才算坏」，`AGENT_MAX_TOKENS` 是**刻意**放行的（P59：截断
+那一轮的正文已经进历史，下一轮的新预算正好接着写）。那条推理的前提是「这一轮写了点
+什么」。而输出预算全花在思考上时，历史一个字节没长，下一轮看到的东西**一模一样**，
+于是每一轮都以同样的方式再截断一次。轮次预算（默认 256）兜得住，但要烧掉几百份 716K
+的提示词才停 —— 那不是预算，是罚款。
+
+**修法**：
+
+* `agent/goal.uya` 新增判据 `goal_round_progressed(h, from)`：只看**本轮**追加的消息
+  （`from` = 投递 `<goal_round>` 之前拍的 `h.len`），助手正文（`text_len > 0`）/ 工具调用 /
+  工具结果任一存在即为有产出。为什么按正文长度而不是「历史变长」：截断那一轮也会留下
+  一条 content 为空的 assistant 消息，按条数算，空转与干活一模一样。
+* 新增计数 `g_goal_idle_rounds` + `goal_idle_note(progressed)`：连续 `GOAL_IDLE_STOP`（2）
+  轮零产出即返回「该停了」。一轮零产出不算（P59 口径不变）；有任何产出就清零。
+* `agent_goal_drive` 的收口多一支：盘上仍 active+armed、退出码也正常，但 `goal_idle_note`
+  说该停 → `goal_disarm` + `GOAL_IDLE_MSG`。处置与 esc 同一条口径（目标本体留在盘上，
+  人的下一句话或 `/goal resume` 立刻接着跑 —— `goal_rearm_on_human` 不看这一位）。
+* 三条清零路径：有产出 / `goal_disarm`（人叫停、换会话、异常收场都走它）/
+  `agent_session_scoped_reset`（换会话复位，`export` 理由与 `g_goal_armed` 相同）。
+* 顺带收掉同一形状的**输入侧空转**（`/new` 之后「卡死 + 100% CPU」那一类现场的一种成因）：
+  `tty_read_stdin` 新增哨兵 `-2`（真 EOF，或 `POLLHUP` 下的读失败），`tui_poll_keys` 见到它
+  就把 `g_tui_quit` 打开，滚动模式的 `read_line`、审批浮层（`askuser` 的两处等待）都按 EOF
+  收口。原来这几处把 `-2` 当成「本轮没有数据」⇒ poll 水平触发地立刻再报一次 HUP ⇒ 主循环
+  一个字节读不到、也无处阻塞 ⇒ 100% CPU 冻在最后一帧，而且会话日志里一个事件都不会多
+  （没有回合、没有回执）。
+
+**验收**：
+
+| 判据 | 落点 |
+|---|---|
+| 判据看的是本轮窗口（空 assistant 不算 / 正文一个字节算 / 工具调用与结果算 / 起点越界不崩）、阈值是 2 轮、有产出即清零、`goal_disarm` 清账 | `selftest[goal-idle]`（`UYA_SELFTEST_GOAL_ONLY=1` 也跑） |
+
+**没顺手做的**：① 没把「零产出」并进 `AGENT_MAX_TOKENS` 的退出码语义 —— 截断本身仍然
+不是异常，刹车是**连续**判据。② 没让刹车写 `phase`（不弄成终态：目标是「暂停自动续跑」，
+不是「目标作废」）。③ 没在 `bg_notes_drive` 上加同款刹车（它的收口不看退出码，且一次
+后台笔记回合不注入 716K 提示词）。④ 用户现场 `/new` 之后那次 100% CPU **没能复现**：
+本地按同一份 home + `--resume session-c7f98113-…` + `/new` 只看到 1.3 s 的收尾尖峰
+（拆会话 / 重建系统提示词 / reclaim），随后回落 ~0%；上面那条 `-2` 收口是同一症状里
+唯一能构造出来的机制，其余成因待现场取证（下次请给 `top -H` 或 `gdb -p <pid> bt`）。
