@@ -3956,7 +3956,16 @@ JPEG 先缩，其余只能「**接受原图**」或「**明确拒绝**」—— 
 
 **目录 = `<agent_home>/attachments`** —— **不能用 `g_home`**：那个全局只在会话打开时才填，
 而 `/image` 可以在会话没开时敲 ⇒ 实测那时路径退化成 `/attachments`、mkdir 建不出、
-**必然落盘失败**。`cfg.agent_home` 在启动时就定下来。
+**必然落盘失败**。
+
+**home 走 `agent_default_home`（`--agent-home` > `$UYA_AGENT_HOME` > `$HOME/.uya-agent`），
+而且落点必须是绝对路径**（`agent_attach_dir`）。修前这里只认 `cfg.agent_home`，而它
+**只有** `--agent-home` 才填得上 ⇒ 平常跑出来是相对的 `.uya-agent/attachments`
+（当前目录下），当场不报错、之后才现形：路径进会话日志，切工作区是真 chdir、恢复会话
+也常换目录，那时相对路径指向别处 ⇒ `imgx_load` 读空 ⇒ 构请求把这张图**静默跳过**
+（症状：模型说看不见刚贴的图）；web 那侧 `web_ep_image` 按 `<agent_home>/attachments`
+直传，写读两个目录对不上就一律 404（见 §16 踩坑 164）。相对 home（`--agent-home rel`
+/ 相对的环境变量）按**落盘这一刻**的当前目录钉死 —— 那正是文件真实所在。
 
 **两处必须自己补 NUL**（都是实测踩过的）：
 
@@ -6799,6 +6808,49 @@ QTermWidget）对 `ESC[?5522$p`（DECRQM）**零应答**，OSC 52 写 `c`/`p` �
      新元素必须来自新分配，复用旧槽位就是别名；② 这类错误的第一条（最新那条）永远
      是对的，所以只测「↑ 能取到历史」会一直绿，必须**连着翻两条以上**并逐字节比对。
 
+164. **「贴进去的图模型看不见」：附件落到当前目录下的 `.uya-agent`，而读它的人全在
+     agent home 里找**（2026-10-27，用户报的）。
+
+     现场：终端里 `ctrl+v` 贴一张截图，占位行照常上屏（`⎿ 图片 image/png WxH · …`），
+     但发出的回合里模型说看不见图；web 界面更直接 —— 同一张图的 `<img>` 一律 404。
+     同时用户的工程目录里凭空多出一个 `.uya-agent/attachments/`。
+
+     根因：`agent_attach_dir` 只认 `cfg.agent_home`，而 `cfg.agent_home` **只有**
+     `--agent-home` 这个入口才填得上（它出厂是空 Buf；`$UYA_AGENT_HOME` 与
+     `$HOME/.uya-agent` 是 `agent_default_home` 在那之后才现算的）。于是平常跑出来的
+     落点是相对的 `.uya-agent/attachments` —— 相对**当前工作区**，而读者（`web_ep_image`
+     直传、`imgx_load` 构请求）一律按 agent home（`--print-config` 里 `agent_home`
+     那一行报的就是它）找。写读两个根不一致，所以「存得下、找不到」。
+
+     为什么「当场不报错」：`imgx_store` 按相对路径写是成功的（OS 按 cwd 解析），
+     占位行也只报类型/尺寸/名字，不带路径 —— 屏幕上没有任何一处提示它存到了别处。
+     要到**下一次读**才现形，而那次读把失败**降级成一行 diag 后跳过**（`附件读不到
+     （已跳过）`，§13.1「宁可少一张图也不能让整轮失败」），TUI 里那行 diag 还常被
+     回合输出淹掉。另外两条同源的现形路径：切工作区（真 `chdir`）之后、以及换个目录
+     `--resume` 之后 —— 历史里记的仍是那条相对路径，读回来必然是空。
+
+     修法：`agent_attach_dir` 改走 `agent_default_home`（与全仓同源），并把结果**钉成
+     绝对路径**（相对 home 按落盘这一刻的当前目录解析 —— 那正是文件真实的位置）。
+     顺带修 `agent_default_home`：空的 `$UYA_AGENT_HOME`（`UYA_AGENT_HOME=`）以前会被
+     当成「设了」，home 解析成空串 ⇒ 附件又退回到相对目录（会话路径也一起坏）；现在
+     空值当没设，与本仓其它 env 入口（`agent_setup_tofu_pins` / `dwh_assets_home`）同口径。
+
+     判据：`img-sniff` 轮新增 `img_attach_dir_cases` —— ① `cfg.agent_home` 空时目录必须
+     **首字节是 `/`**，且（没设 `$UYA_AGENT_HOME` 时）逐字节等于 `$HOME/.uya-agent/attachments`；
+     ② 相对 home ⇒ 逐字节等于 `<cwd>/build/selftest_attach_home/attachments`；③ 真落盘
+     一张 PNG → `chdir build` → 按记下的那条路径**还能读回 124 字节**。单跑入口是
+     `UYA_SELFTEST_IMG_ONLY=1`（同 P83 的 `_CLIP_ONLY`，几毫秒）。防假绿对照：把
+     `agent_attach_dir` 还原成「只认 `cfg.agent_home` + `.uya-agent` 兜底」重编 ⇒
+     **四条全红** —— 不是绝对路径 / 不是 `$HOME` 那条 / 相对 home 没钉绝对 / chdir 之后
+     读不回（最后一条正是用户看到的「模型说看不见图」，已实测）。
+
+     教训：① 「写方与读方的路径各算各的」这类缺陷**不会**在写入时报错，只会让后续的读
+     静默降级 —— 所以凡是要进日志、跨 chdir / 跨进程重读的路径，**必须在写下那一刻就是
+     绝对路径**；② 一个配置字段「看起来启动时就定好了」不等于它真的被填过：`cfg.agent_home`
+     出厂是空 Buf，`--agent-home` 之外没人写它 —— 凡是要拿它当路径用的地方都得走
+     `agent_default_home` 现算（web 的 `dwh_assets_home` 就是因为自带 env 回落才没坏）；
+     ③ 判据别只测「目录拼得出来」，要测**写完之后换了目录还读得回**。
+
 ---
 
 ## 17. 工具实现要点
@@ -7102,7 +7154,7 @@ DEEPSEEK_API_KEY=sk-xxx ./build/uya-agent \
 | `tui-mouse` | 踩坑 72 鼠标上报开关（`F2` / `/mouse` / `--no-mouse`）：标志位默认开 + `tui_set_mouse` 幂等；`F2` 两种编码（`ESC O Q` / `ESC[12~`）与 `/mouse on·off·非法`；**字节级**进/关/再开/关着进都与开关一致；帮助浮层里有 `F2` 那一条；**真 PTY** 两个方向（默认开必有 `1000h`、`mouse=false` 必无 `1000h`/`1006h`） |
 | `title-cmd` | P48 `/title` 与 `set_title`：清洗（80 B / 码点边界 / 控制序列全丢后为空 ⇒ 报错且标题**不动**）、钉住语义（`user` 置位后自动起标题不跑、`clear` 解锁）、revision 门控、落盘事件逐字节（kind 三档 + clear 的**空标题**事件）、索引同步、`set_title` 工具三支（合法/空串/缺键）、工具目录里有它；**P74**：派生的备用标题**不写** `g_sess.title`、**不落** `session/title`（口径：标题由模型总结）；`g_title_auto_done` 首次闩（起过一次之后连待办都不挂，硬挂上也不发） |
 | `tui-paste` | P50 括起粘贴九段：进/出粘贴态的字节级判据、CR **不许**提交（踩坑 83 的原始症状）、CRLF 折成一个换行、TAB 是字面内容且**帧里**不出现 TAB、粘贴里的 ANSI 序列逐字节保留、收尾标记被切开也认、断流时悬着的 ESC 不吞、上限对齐 200000 且超限有提示、光标列按显示口径（TAB 四个空格）+ **真 PTY** 粘 3 行只提交一次（按会话日志断言；P80 起轮次开头**清空**夹具 home，并加一条「启动屏上不许有用户条目」的绊线 —— 见踩坑 134） |
-| `img-sniff` | P51 图片纯函数层：**真 PNG 字节**（zlib 压出来的 64×48）读尺寸、GIF87a/89a 小端、JPEG 段链（长度段在前，尺寸不在固定偏移）、WebP 三变体（VP8X/VP8L/VP8 ）、纯文本与截断 PNG 一律拒绝、字节/像素两道预算、内容寻址 id 稳定、base64（长度与 PNG 签名）、附件 JSON 往返（**数字字段** + 坏记录只跳那一项）、占位文案与 B/KiB/MiB 三档 |
+| `img-sniff` | P51 图片纯函数层：**真 PNG 字节**（zlib 压出来的 64×48）读尺寸、GIF87a/89a 小端、JPEG 段链（长度段在前，尺寸不在固定偏移）、WebP 三变体（VP8X/VP8L/VP8 ）、纯文本与截断 PNG 一律拒绝、字节/像素两道预算、内容寻址 id 稳定、base64（长度与 PNG 签名）、附件 JSON 往返（**数字字段** + 坏记录只跳那一项）、占位文案与 B/KiB/MiB 三档；**附件落点**（踩坑 164）：`cfg.agent_home` 空时目录必须绝对且等于 `$HOME/.uya-agent/attachments`、相对 home 被钉成绝对、真落盘后 `chdir` 到别处按记下的路径**还能读回** |
 | `clip-copy` | P85 写方向（见 §13.2.1）：`SetSelectionOwner` / `ChangeProperty` / `SelectionNotify` 的**请求体逐字节**（`items` 是元素个数不是字节数、20 字节头、notify 的四个字段偏移）+ 结果码（空文本 / 超限 / 无 X11 各回各的码，绝不静默清掉用户剪贴板）+ `DISPLAY` 为空时**明确回 NO_X11** |
 | `clip-term` / `clip-pty` / `clip-helper` | P83 剪贴板三源（见 §13.2）：`clip-term` = 纯函数（读请求/探测字节**逐字节**比对规范、分片喂入逐字节还原、**逐块** base64 解码走生产路径、非 5522 字节原样透传、一次 read 多帧的一帧一帧交付、DECRPM 的 Ps 判定与缓存、失败文案两两不同、`--clip` 五个取值 + 非法值不落回 auto）；`clip-helper` = 假 helper 脚本（PATH 前置探测、类型表**按行**比对不许子串命中、取数优先级、卡住的 helper **按进程组收且不许挂住**、无工具时的文案）；`clip-pty` = **真 PTY + 假终端**（父进程扮演支持 5522 的终端）：DISPLAY 为空也能贴上图片、应答字节**一个都没进屏幕**、收应答在读预算内当场完成 |
 | `clip-parse` | P52 X11 客户端可测部分：`DISPLAY` 五种形态（`:0`/`unix:7`/`host:1.0`/空/畸形）与三种畸形拒绝、**真 Xauthority 字节流**的两条目配对（family 256 + display 号 + MIT-MAGIC-COOKIE-1；不存在的 display 号**不许**回退到别的条目）、失败码文案非空 |
@@ -7187,7 +7239,7 @@ DEEPSEEK_API_KEY=sk-xxx ./build/uya-agent \
   的真实路径（74 列），新窗口把它夹到 30 列并补 `…`；统计行因此整条放得下了（修前被长
   路径挤到只剩四组）。这是**有意的**，也正是用户报的那件事；短路径（`~/proj` 这类）装得下
   时仍然逐字节不变 —— `tui-marquee` 的 A 段钉的就是这条。
-- 只跑子集的开关：`UYA_SELFTEST_TUI_ONLY`、`UYA_SELFTEST_PERM_ONLY=1`（P21+P26）、`UYA_SELFTEST_GOAL_ONLY=1`（P29）、`UYA_SELFTEST_SHELL_ONLY=1`（P38）、`UYA_SELFTEST_PANEL_ONLY=1`（P15+P40，`make panel-selftest`）、`UYA_SELFTEST_EMPTY_ONLY=1`（P54，退化响应两轮 —— 跑对照实验时用它，一次约 0.2 s）、`UYA_SELFTEST_NOTIFY_ONLY=1`（P104，后台完成通知三条腿，`make notify-selftest`）、`UYA_SELFTEST_TUISWITCH_ONLY=1`（P119，只跑 `tui-switch` 这一轮 —— 改「恢复显示」那条线时用它，配合 `UYA_SELFTEST_TUI_ONLY=1` 一次约 2 s）。
+- 只跑子集的开关：`UYA_SELFTEST_TUI_ONLY`、`UYA_SELFTEST_PERM_ONLY=1`（P21+P26）、`UYA_SELFTEST_GOAL_ONLY=1`（P29）、`UYA_SELFTEST_SHELL_ONLY=1`（P38）、`UYA_SELFTEST_PANEL_ONLY=1`（P15+P40，`make panel-selftest`）、`UYA_SELFTEST_EMPTY_ONLY=1`（P54，退化响应两轮 —— 跑对照实验时用它，一次约 0.2 s）、`UYA_SELFTEST_NOTIFY_ONLY=1`（P104，后台完成通知三条腿，`make notify-selftest`）、`UYA_SELFTEST_TUISWITCH_ONLY=1`（P119，只跑 `tui-switch` 这一轮 —— 改「恢复显示」那条线时用它，配合 `UYA_SELFTEST_TUI_ONLY=1` 一次约 2 s）、`UYA_SELFTEST_IMG_ONLY=1`（P51 的 `img-sniff` 一轮 —— 改附件落点 / 嗅探 / 预算 / 压缩时用它，几毫秒）。
 - 探针：`make probe BASE=https://api.deepseek.com/v1` 期望 HTTP 401 + leaf 指纹。
 
 **load-bearing 硬指标**
