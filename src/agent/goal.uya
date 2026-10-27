@@ -934,6 +934,9 @@ export fn goal_cmd_run(cfg: &const Config, line: &const Buf, out: &Buf) i32 {
 // 写盘失败不做补救（授权照样收掉 ——「不再自己跑」比「盘上好看」重要）。
 export fn goal_disarm(cfg: &const Config) void {
     g_goal_armed = false;
+    // P122：授权一收，空转刹车那一笔账就作废（下一次授权是**新的一轮开始**计数 ——
+    // 不然「上回数到 1 的零产出」会跟着下一次 resume 过继过来，一轮就刹停）。
+    g_goal_idle_rounds = 0;
     var g: Goal = goal_empty();
     defer { goal_free(&g); }
     if !goal_load(cfg, &g) || !g.armed {
@@ -986,6 +989,9 @@ export fn goal_rearm_on_human(cfg: &const Config) bool {
         }
     }
     g_goal_armed = true;
+    // P122：人的这句话 = 重新开始数空转（刹车只在**同一个授权周期**里累计；
+    // 人亲口说「接着跑」，上一轮零产出的旧账不该压在它头上）。
+    g_goal_idle_rounds = 0;
     if !cfg.quiet {
         out_err("[goal] 人的新输入已恢复自动续跑（/goal pause 可停）\n");
     }
@@ -1079,4 +1085,78 @@ export fn goal_round_admit(cfg: &const Config, out: &Buf) bool {
     _ = buf_append_cstr(out,
         "\n\nContinue working toward the objective in this same session. Treat the current workspace, tool results, and durable session state as authoritative; inspect them instead of assuming earlier narration is still current. Make concrete progress and verify the result. Before claiming completion, gather evidence that the whole objective is achieved, read the current goal, and mark it complete. If work remains, leave the goal active for the next round. Follow the configured goal-tool policy before reporting a blocker.\n</goal_round>");
     return out.len > 0;
+}
+
+// ============================================================
+// P122：连续「零产出」轮次 → 停下自动续跑（空转的刹车）
+// ============================================================
+//
+// 症状（用户报的，现场 `~/.uya-agent/sessions/--…--/session-c7f98113-…/session.jsonl`）：
+// 目标的 round 从 264 一路涨到 297，三十来轮里**每一轮**都是同一个形状 ——
+//   `user/message`（`<goal_round>`）→ `step/start`
+//   → `assistant/message`（content 为空，usage.outputTokens=16，全是 reasoning）
+//   → `turn/end reason=max-tokens`；
+// 没有一条工具调用、没有一个正文字节、上下文一个字都没长（每一轮都是同一个
+// cacheReadTokens≈716K）。也就是说：驱动器每隔几秒开一轮、每轮付出一份完整的 716K
+// 提示词，产出为零；只有人按 esc 才停下来 —— 而 P121 之后人一说话又自动重新授权，
+// 于是回到同一个圈。
+//
+// 根因：`agent_goal_drive` 的收口判据只有「退出码异常才算坏」。`AGENT_MAX_TOKENS`
+// 被**刻意**放行（P59：截断那一轮的正文已经进历史，下一轮的新预算正好接着写）——
+// 那条推理成立的前提是「这一轮**写了点什么**」。而「截断 + 一字未写」是另一件事：
+// 输出预算全花在思考上，历史一个字节没长，下一轮看到的东西**一模一样**，于是每一轮
+// 都以同样的方式再截断一次。轮次预算（默认 256）能兜住它，但那要烧掉几百份 716K 的
+// 提示词才停 —— 那不是预算，是罚款。DESIGN §19.38 的「没顺手做的①」正是这一条。
+//
+// 修法：把「这一轮有没有实质产出」变成一个**可判定**的量（`goal_round_progressed`
+// 只看本轮追加的消息），连续 `GOAL_IDLE_STOP` 轮零产出就收掉授权并说一句人话。
+// 三条边界：
+//   * **一轮**零产出不算（截断一次是常态，P59 的口径不变）；
+//   * 有任何产出就清零（正文、工具调用、工具结果 —— 都算往前走）；
+//   * 收授权与 esc / 异常收场同口径：目标本体留在盘上（phase 不动），`/goal resume`
+//     或人的下一句话立刻接着跑（`goal_rearm_on_human` 只看盘上的 phase/armed，
+//     不理会这一位 —— 刹车不该把目标弄成终态）。
+const GOAL_IDLE_STOP: i32 = 2;
+
+// 连续零产出轮次的进程本地计数。三条清零路径：`goal_idle_note` 看到有产出、
+// `goal_disarm`（人叫停 / 换会话 / 异常收场都走它）、`agent_session_scoped_reset`。
+// `export` 的理由与 `g_goal_armed` 相同：换会话的复位在 `agent/ag_worktree.uya` 里。
+export var g_goal_idle_rounds: i32 = 0;
+
+// 这一轮有没有**实质产出**。`from` = 开轮**之前**的 `h.len`（驱动器在投递
+// `<goal_round>` 之前拍下来的），只看这之后追加的消息。
+//
+// 三类都算：助手正文（哪怕一个字节）/ 助手发出的工具调用 / 工具结果。
+// 为什么要算工具结果：模型一步只调了个只读工具、正文为空，那仍然是在干活；
+// 真正要刹的是「一个字没写、一个工具没调、历史没长」的那种轮次。
+// 为什么算正文而不算「历史变长」：截断的那一轮也会留下一条 content 为空的
+// assistant 消息 —— 按条数算，空转看起来与干活一模一样（这正是 bug 藏身的地方）。
+export fn goal_round_progressed(h: &const History, from: usize) bool {
+    var i: usize = from;
+    while i < h.len {
+        const m: &const Msg = msg_at(h, i);
+        if m.role == ROLE_ASSISTANT {
+            if m.text_len > 0 {
+                return true;
+            }
+        } else if m.role == ROLE_ASSISTANT_CALLS || m.role == ROLE_TOOL {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+// 把这一轮的结果记在账上，返回 true = **该停下了**（连续 GOAL_IDLE_STOP 轮零产出）。
+// 判定与处置分开：这里只回答「停不停」，收授权与回执由驱动器做（它才有 cfg 与
+// 输出通道，也才与 esc / 异常那两条收口排在同一处）。
+export fn goal_idle_note(progressed: bool) bool {
+    if progressed {
+        g_goal_idle_rounds = 0;
+        return false;
+    }
+    if g_goal_idle_rounds < GOAL_IDLE_STOP {
+        g_goal_idle_rounds = g_goal_idle_rounds + 1;
+    }
+    return g_goal_idle_rounds >= GOAL_IDLE_STOP;
 }
