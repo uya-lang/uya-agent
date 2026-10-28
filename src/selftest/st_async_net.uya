@@ -32,6 +32,21 @@ const ANET_RESP_CHUNKED_A: &const byte =
 
 const ANET_RESP_CHUNKED_B: &const byte = "6\r\nfghijk\r\n0\r\n\r\n";
 
+// 半开用例的响应，**分两段发**（顺序是判据的一部分）：
+//   ① 只发响应头 —— `ahc_open` 到这里就返回，rx 里没有体字节；
+//   ② 隔 100ms 发一条完整 SSE 事件（chunked），之后半开。
+// 不分两步的话，头和事件会在同一次 read 里到达、一起进 rx，那时 `ahc_fill`
+// 第一下就解出来了 —— 测到的不是「半开」，而是「缓冲里有货」。
+// 行宽豁免：协议报文常量，拆开就改了帧边界。
+const ANET_RESP_SSE_HEAD: &const byte =
+    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n";
+
+// 事件里必须带**真的** content：半开用例走 `allm_stream_chat`（产品路径），
+// 只认 `choices[].delta.content`；空 delta 解不出 content，用例就会把
+// 「读到了但没内容」误判成「没读到」。
+const ANET_RESP_SSE_ONE: &const byte =
+    "30\r\ndata: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n\r\n";
+
 const ANET_RESP_404: &const byte =
     "HTTP/1.1 404 Not Found\r\nContent-Length: 3\r\n\r\nno!";
 
@@ -42,6 +57,10 @@ var g_anet_chunked_same: i32 = 0;
 var g_anet_404_ok: i32 = 0;
 var g_anet_cancel_eid: i32 = 0;
 var g_anet_cancel_ms: u64 = 0;
+var g_anet_half_eid: i32 = 0;
+var g_anet_half_n: i32 = 0;
+var g_anet_half_ms: u64 = 0;
+var g_anet_sync_half_ms: u64 = 0;
 
 // 服务端的单一回合：读掉请求头，回一段固定响应，然后关连接。
 // `second` 的第一段写完歇 120ms 再写第二段 —— 专门造「分片到达」。
@@ -79,11 +98,18 @@ fn anet_serve_one(cfd: i32, which: i32) void {
             bufx_cstr_len(ANET_RESP_CHUNKED_B));
     } else if which == 2 {
         _ = write_all_fd(cfd, ANET_RESP_404, bufx_cstr_len(ANET_RESP_404));
-    } else {
+    } else if which == 3 {
         // which == 3：只发头，体一个字节都不发（给取消用例用）
         _ = write_all_fd(cfd,
             "HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n" as &const byte,
             40);
+        _ = anet_msleep(3000);
+    } else {
+        // which == 4：发**一条** SSE 事件就半开（不发 [DONE]、不关连接）。
+        // 这正是「偶尔卡住」的现场：上游还活着、连接还在，但永远不再吐字节。
+        _ = write_all_fd(cfd, ANET_RESP_SSE_HEAD, bufx_cstr_len(ANET_RESP_SSE_HEAD));
+        _ = anet_msleep(100);
+        _ = write_all_fd(cfd, ANET_RESP_SSE_ONE, bufx_cstr_len(ANET_RESP_SSE_ONE));
         _ = anet_msleep(3000);
     }
 }
@@ -147,7 +173,7 @@ fn anet_spawn_server(which: i32) u16 {
         // 每个用例要几条连接：定长/chunked/404 各两条（同步 + 异步），
         // 取消那条只连一次就取消 —— 少服务一条，子进程才能及时退出（不留僵尸）。
         var limit: i32 = 2;
-        if which == 3 {
+        if which == 3 || which == 4 {
             limit = 1;
         }
         var keep: i32 = 0;
@@ -270,6 +296,68 @@ fn anet_sync_get(url: &[byte], st: &HcStream, tc: &TlsConn) bool {
     _ = flag;
     g_anet_cancel_eid = eid;
     g_anet_cancel_ms = ua_now_ms() - t0;
+    return 0;
+}
+
+// 半开用例：上游发一条事件后就不再发，**没有任何取消意图**。
+//
+// 走的是**产品路径** `allm_stream_chat`（不是直接调 `ahc_fill`）：要钉的正是
+// 「`allm` 里那次读有没有带空闲预算」这一行 —— 直接调 `ahc_fill` 就绕过了它，
+// 把 deadline 换回 0 也照样绿（负控证明过这一点，别退回去）。
+//
+// 判据取 `error.HcTimeout` 而不是任何一种「取消」：没有 esc，就没有取消。
+// `idle_ms` 故意取 600（远小于生产默认 120000）：用例要在 10s 内跑完。
+@async_fn fn anet_halfopen_run(
+    url: &[byte],
+    o: &ChatOut,
+    idle_ms: u32
+) Future<!i32> {
+    g_anet_half_n = 0;
+    var status: i32 = 0;
+    const t0: u64 = ua_now_ms();
+    const r: !i32 = @await allm_stream_chat(url, &"Accept: text/event-stream\r\n"[0: 25],
+        &"{\"stream\":true}"[0: 15], 15 as usize, idle_ms, 65536 as usize,
+        HC_VERIFY_NONE, &""[0: 0], o, false, false, false, &status);
+    var eid: i32 = 0;
+    var v: i32 = 0;
+    v = r catch |err| {
+        eid = (@error_id(err) as! i32).value;
+        0 - 1;
+    };
+    // 第一条事件已经解进 ChatOut（说明确实先通了一条，之后才是半开）。
+    if v == 0 - 1 && o.content.len > 0 {
+        g_anet_half_n = 1;
+    }
+    g_anet_half_eid = eid;
+    g_anet_half_ms = ua_now_ms() - t0;
+    return 0;
+}
+
+// 同步腿：**直接调产品路径** `llm_stream_chat(interactive = true)`。
+//
+// 为什么必须调真的那个函数：那条交互循环以前没有空闲上限（`hc_fill_wait` 返回 2
+// 之后 `continue`），上游半开时它一圈一圈空转到天荒地老。自己在本文件里复刻一份
+// 循环是假绿 —— 被测代码根本没跑到（负控证明过：把 llm 的判断拿掉，复刻版照样过）。
+//
+// 返回 1 = 按空闲预算收口成 HcTimeout；0 = 其它（含无限等，跑不到这里）。
+fn anet_sync_halfopen(url: &[byte], idle_ms: u32) i32 {
+    var o: ChatOut = chat_out_new();
+    defer { chat_out_free(&o); }
+    const t0: u64 = ua_now_ms();
+    const r: !i32 = llm_stream_chat(url, &"Accept: text/event-stream\r\n"[0: 25],
+        &"{\"stream\":true}"[0: 15], 15 as usize, idle_ms, 65536 as usize,
+        HC_VERIFY_NONE, &""[0: 0], &o, false, false, true);
+    var eid: i32 = 0;
+    var v: i32 = 0;
+    v = r catch |err| {
+        eid = (@error_id(err) as! i32).value;
+        0 - 1;
+    };
+    g_anet_sync_half_ms = ua_now_ms() - t0;
+    const to_id: i32 = (@error_id(error.HcTimeout) as! i32).value;
+    if v == 0 - 1 && eid == to_id && o.content.len > 0 {
+        return 1;
+    }
     return 0;
 }
 
@@ -429,6 +517,60 @@ fn async_net_round(tag: &const byte) bool {
             ty_fail(tag, "取消收口太慢（>600ms）", &ok);
         }
     }
+    // E：半开上游（发一条就停），没有取消意图 —— 必须按空闲预算自己收口。
+    //
+    // 这条是 P125 的负控：把 `allm` 里的空闲 deadline 换回 0，它会**永远**停在
+    // 那次 `ahc_fill` 上（整轮 selftest 挂死不返回），而不是悄悄变绿。
+    const hport: u16 = anet_spawn_server(4);
+    if hport == 0 {
+        ty_fail(tag, "起服务端失败（半开用例）", &ok);
+    } else {
+        var hurl: Buf = buf_new(128);
+        defer { buf_free(&hurl); }
+        anet_url(hport, &hurl);
+        var h_st: HcStream = hc_stream_empty();
+        defer { hc_stream_free(&h_st); }
+        var h_tc: TlsConn = tls_conn_empty();
+        defer { tls_conn_free(&h_tc); }
+        g_anet_half_eid = 0;
+        g_anet_half_n = 0;
+        g_anet_half_ms = 0;
+        rt_abort_reset();
+        var ho: ChatOut = chat_out_new();
+        defer { chat_out_free(&ho); }
+        const hrc: i32 = rt_run(anet_halfopen_run(hurl.ptr[0: hurl.len],
+            &ho, 600 as u32));
+        _ = hrc;
+        const to_id: i32 = (@error_id(error.HcTimeout) as! i32).value;
+        if g_anet_half_n != 1 {
+            ty_fail(tag, "半开用例没读到第一条事件（测的就不是半开）", &ok);
+        }
+        if g_anet_half_eid != to_id {
+            ty_fail(tag, "半开上游没有按空闲预算收口（应当 error.HcTimeout）",
+                &ok);
+        }
+        if g_anet_half_ms > (5000 as u64) {
+            ty_fail(tag, "半开上游收口太慢（>5s）", &ok);
+        }
+        // 同步腿：另起一个半开服务端（子进程只服务一条连接）。
+        const sport: u16 = anet_spawn_server(4);
+        if sport == 0 {
+            ty_fail(tag, "起服务端失败（同步半开用例）", &ok);
+        } else {
+            var surl: Buf = buf_new(128);
+            defer { buf_free(&surl); }
+            anet_url(sport, &surl);
+            g_anet_sync_half_ms = 0;
+            const sok: i32 = anet_sync_halfopen(surl.ptr[0: surl.len],
+                600 as u32);
+            if sok != 1 {
+                ty_fail(tag, "同步腿：半开上游没有按空闲预算收口", &ok);
+            }
+            if g_anet_sync_half_ms > (5000 as u64) {
+                ty_fail(tag, "同步腿：半开上游收口太慢（>5s）", &ok);
+            }
+        }
+    }
     // 汇总：三条用例都要「头/体/状态码/chunked」四项一致
     if g_anet_head_eq != 3 {
         ty_fail(tag, "响应头逐字节相等的用例数不是 3", &ok);
@@ -447,6 +589,7 @@ fn async_net_round(tag: &const byte) bool {
     }
     out_err("selftest[");
     out_err(tag);
-    out_err("] ok: 同步/异步逐字节一致（定长 · chunked 分片 · 404）+ 流式等待可取消\n");
+    out_err("] ok: 同步/异步逐字节一致（定长 · chunked 分片 · 404）");
+    out_err("+ 流式等待可取消 + 半开上游按空闲预算收口\n");
     return true;
 }

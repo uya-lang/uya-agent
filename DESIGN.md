@@ -9527,6 +9527,23 @@ SSE/body」搬到事件循环上（`ahc_open` / `ahc_fill` / `ahc_connect` / `ah
 | chunked 分片 | 服务端先发一段 chunk、**歇 120 ms** 再发第二段 —— 测 `ahc_fill` 的「暂时没数据」循环 | 同上（chunked 判定不一致） |
 | 404 | 两条路都拿到 404 且头相同 | 同上 |
 | 流式等待可取消 | 服务端只发头不发体（3 s），第二帧置取消意图 ⇒ `error.Cancelled` 且 ≤600 ms 收口 | 去掉 rtio 的取消闸门 ⇒ 会等满 30 s（deadline 预算内） |
+| 半开上游按空闲预算收口 | 服务端只发**一条** SSE 事件就半开（不 `[DONE]`、不关连接、**不置取消意图**），同步 `llm_stream_chat(interactive)` 与异步 `allm_stream_chat` 各跑一遍 ⇒ 都得 `error.HcTimeout` 且 >0 ms、<5 s | 把 `allm_idle_deadline` 换回 `0`、或拿掉 `llm` 里的空闲判断 ⇒ 对应那条腿当场红（两条都实测过） |
+
+**P125：空闲预算（超时语义在这条线上的唯一一份判据）**
+
+`timeout_ms` 在这条线上是**每一次读**的等待上限，不是整段体的总预算 —— 与同步路
+`hc_set_rw_timeout(fd, timeout_ms)`（`SO_RCVTIMEO`）同口径。两腿必须一致，否则
+「同一份配置」在同步/异步下表现不同（异步腿以前会**永远**等下去，只有 esc 能救）。
+
+| 层 | 参数语义 | 0 的含义 | 到点报什么 |
+|---|---|---|---|
+| `rt_read` / `rt_write` / `rt_connect`（`rtio`） | **绝对**毫秒 | 不设超时 | `error.AsyncDeadlineExceeded` |
+| `ahc_open` / `ahc_fill`（`ahttp`） | **绝对**毫秒 | 不设超时 | `error.HcTimeout`（`ahc_map_io_err` 折码，与同步路同档） |
+| `allm_idle_deadline(idle_ms)`（`allm`） | 收**相对**、产出**绝对** | 不设超时 | 由上一层报 |
+| `llm_stream_style` 交互循环 | 墙上时间（`ua_now_ms()`），只在**真读到字节**时重置 | 不设上限 | `error.HcTimeout` |
+
+折码这件事不是洁癖：`rtx_retryable_err` 与 `agent_net_fail_kind` 都按错误值分档，
+多出一个人不认识的码，失败报告就会退化成那句笼统的「网络或 TLS 校验」。
 
 **顺带修掉的编译器缺口（第二个，本轮）**：`@async_fn` 里 `catch |err| { return err; }`
 **丢掉 error_id** —— 返回表达式是标识符且它是错误值时，async 的 return 只认
