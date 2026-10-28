@@ -382,6 +382,12 @@ Apple Silicon（arm64）真机，`macos-13` 是 Intel（x86_64）。
 * **计费**：macOS runner 的分钟数是 Linux 的 **×10**。公开仓免费；私有仓要算进
   配额 —— 所以这个 workflow 用 `paths:` 收窄到 `src/`、`uya/`、`Makefile`、
   `testdata/macos/`，改文档不触发。
+* **构建会自己重试**（`scripts/uya_build_retry.sh`）：随仓的预编译编译器偶尔把
+  split-C 的某个 `.c` 写坏，CI 上稳定复现（run #3 的注解就是它：
+  `src/diff/model.c:819:10: error: expected ')'`，而同一份源码在开发机上生成的
+  同名文件只有 799 行）。`make build` / `make macos` 都改成经这条脚本调用：认出
+  `<文件>.c:<行>:<列>: error:` 这种形状就清掉缓存重来（最多 3 次），并把第 1 次
+  的失败日志留成 `<日志>.first`。**不是**吞错误 —— 别的形状照旧原样退出。
 
 怎么触发：推到 `main`、开 PR（改了上面那几个路径），或在 Actions 页面手动
 `Run workflow`（`workflow_dispatch`）。

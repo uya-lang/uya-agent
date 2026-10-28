@@ -57,6 +57,9 @@
 # 用 `?=` 是为了 `make UYA=… UYA_ROOT=…` 换编译器（README §3）。
 UYA_ROOT ?= ./uya/stdlib/
 UYA      ?= ./uya/bin/uya
+# 构建重试器：随仓的编译器偶尔把 split-C 的某个 .c 写坏（见脚本头注释），
+# 撞上那种形状就删掉坏文件重跑，最多 3 次。CI 上是必现的，本地偶发。
+UYA_RETRY ?= $(CURDIR)/scripts/uya_build_retry.sh
 
 STATIC ?= 1
 ifeq ($(STATIC),1)
@@ -194,7 +197,9 @@ check:
 
 build:
 	@mkdir -p build
-	CFLAGS="$(AGENT_CFLAGS)" LDFLAGS="$(AGENT_LDFLAGS)" $(UYA) build $(SRC) -o $(OUT)
+	CFLAGS="$(AGENT_CFLAGS)" LDFLAGS="$(AGENT_LDFLAGS)" \
+		$(UYA_RETRY) "$(CURDIR)/build/uyacache" build/build.log 3 -- \
+		$(UYA) build $(SRC) -o $(OUT)
 ifeq ($(STATIC),1)
 	@$(MAKE) --no-print-directory link-audit
 endif
@@ -335,7 +340,8 @@ macos:
 		HOST_OS=macos TARGET_OS=macos HOST_ARCH=$(MACOS_ARCH) TARGET_ARCH=$(MACOS_ARCH) \
 		TARGET_TRIPLE="$(MACOS_TRIPLE)" ZIG="$(ZIG)" \
 		CC_DRIVER="$(MACOS_CC)" \
-		$(UYA) build $(SRC) -o $(MACOS_OUT) > build/macos/build.log 2>&1 \
+		$(UYA_RETRY) "$(MACOS_CACHE)" build/macos/build.log 3 -- \
+		$(UYA) build $(SRC) -o $(MACOS_OUT) \
 		|| { echo "macos: 构建失败（日志 build/macos/build.log）："; \
 			grep -E 'error:' build/macos/build.log | head -20; exit 1; }
 	@echo "macos: 产物 $(MACOS_OUT)（$(MACOS_ARCH)）"
