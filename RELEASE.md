@@ -117,8 +117,19 @@ gh release create v0.1.1 uya-agent-linux-x86_64 SHA256SUMS \
 curl -fsSL \
   https://raw.githubusercontent.com/uya-lang/uya-agent/main/install.sh | sh
 
-# ② 语言条不是 Makefile 了（.gitattributes 的 linguist 规则生效）
+# ② 语言条：先把口径对上，别只「看一眼」。
+#    linguist 按 **blob 字节数**算，不按行数；本仓 Makefile 就是 18.3 万字节
+#    （recipe 里全是大段 YAML/JSON），所以判据是**字节占比**，不是行数。
+#    本地用发布用的那份 linguist 复算一遍，与 GitHub 的数字逐项对得上：
+gem install github-linguist --user-install --no-document
+OID=$(git rev-parse HEAD)
+"$HOME/.local/share/gem/ruby/3.3.0/bin/git-linguist" stats -c $OID
 #    GitHub 的语言统计是**异步重算**的，刚推上去那几分钟可能还是旧值。
+#
+#    ⚠ 已知未生效：`Uya` 还没进 linguist 的 languages.yml（PR #8296 开着），
+#    所以 `.uya` 目前**一个字节都不进统计**，上面那条命令的输出里不会有 Uya，
+#    首页仍显示 `Makefile`。这是上游的事，本仓改不动 —— 别以为是自己没修好，
+#    也别为此去删 .gitattributes 里的 `*.uya` 那一行（它是预埋，见该文件注释）。
 
 # ③ README 首屏那张图能显示（相对路径 docs/tui-demo.png）
 ```
