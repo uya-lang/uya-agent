@@ -71,8 +71,20 @@ while [ "$n" -le "$tries" ]; do
         | sed -e 's/:[0-9][0-9]*:.*//' \
         | sort -u)
     if [ -z "$bad" ]; then
+        # 退一步：截断/半截写除了「语法错」还会留下一个更硬的指纹 —— 文件末尾没有
+        # 换行。生成的 .c 一定以 `}\n` 收尾，所以这条几乎不会误报。
+        bad=$(find "$cache" -name '*.c' -type f -print 2>/dev/null \
+            | while IFS= read -r f; do
+                last=$(tail -c 1 "$f" | od -An -c | tr -d ' \n')
+                [ "$last" = '\n' ] || echo "${f#"$cache"/}"
+            done)
+        if [ -n "$bad" ]; then
+            echo "uya_build_retry: 日志里没有语法错，但有 .c 文件末尾缺换行：" >&2
+        fi
+    fi
+    if [ -z "$bad" ]; then
         echo "uya_build_retry: 失败形状不是「生成的 .c 坏了」" \
-            "（日志里没有 <文件>.c:<行>:<列>: error:），不重试" >&2
+            "（既没有 <文件>.c:<行>:<列>: error:，也没有末尾缺换行的 .c），不重试" >&2
         exit "$rc"
     fi
     echo "uya_build_retry: 第 $n 次尝试失败，坏文件（顺手把证据留在日志里）：" >&2

@@ -198,7 +198,7 @@ check:
 build:
 	@mkdir -p build
 	CFLAGS="$(AGENT_CFLAGS)" LDFLAGS="$(AGENT_LDFLAGS)" \
-		$(UYA_RETRY) "$(CURDIR)/build/uyacache" build/build.log 3 -- \
+		$(UYA_RETRY) "$(CURDIR)/build/uyacache" build/build.log 4 -- \
 		$(UYA) build $(SRC) -o $(OUT)
 ifeq ($(STATIC),1)
 	@$(MAKE) --no-print-directory link-audit
@@ -340,10 +340,10 @@ macos:
 		HOST_OS=macos TARGET_OS=macos HOST_ARCH=$(MACOS_ARCH) TARGET_ARCH=$(MACOS_ARCH) \
 		TARGET_TRIPLE="$(MACOS_TRIPLE)" ZIG="$(ZIG)" \
 		CC_DRIVER="$(MACOS_CC)" \
-		$(UYA_RETRY) "$(MACOS_CACHE)" build/macos/build.log 3 -- \
+		$(UYA_RETRY) "$(MACOS_CACHE)" build/macos/build-$(MACOS_ARCH).log 4 -- \
 		$(UYA) build $(SRC) -o $(MACOS_OUT) \
-		|| { echo "macos: 构建失败（日志 build/macos/build.log）："; \
-			grep -E 'error:' build/macos/build.log | head -20; exit 1; }
+		|| { echo "macos: 构建失败（日志 build/macos/build-$(MACOS_ARCH).log）："; \
+			grep -E 'error:' build/macos/build-$(MACOS_ARCH).log | head -20; exit 1; }
 	@echo "macos: 产物 $(MACOS_OUT)（$(MACOS_ARCH)）"
 	@ls -l $(MACOS_OUT)
 	@file $(MACOS_OUT)
