@@ -358,6 +358,13 @@ Apple Silicon（arm64）真机，`macos-13` 是 Intel（x86_64）。
 
 * **编译留在 ubuntu**：本仓自带的编译器 `uya/bin/uya` 是 Linux ELF，macOS runner
   上跑不了。所以形状与 windows job 一致 —— 交叉编译在一台、真机跑在另一台。
+* **zig 自己下，不用 `mlugg/setup-zig`**：这个 workflow 第一次跑（run #1）就是红在
+  那一跳，而 GitHub 的 job 日志要登录才给看（未认证 `GET .../logs` 是 403），没法
+  当场查因。改成 `curl` 拉 `ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz`
+  后，失败点写在 URL 上，任何人能本地重跑同一条命令。
+* **版本必须钉 0.16.0**：本机 PATH 上的 `zig` 是 0.17.0-dev，`make macos` 直接
+  构建失败 —— 这不是 CI 特有毛病，是「换 zig 版本 = 换一套 C 前端」，见 Makefile
+  注释 ④。
 * **`macos-13` 随时会退役**：它只是把 §4 那份 x86_64 证据变成「别人也能重跑」。
   镜像没了就删掉那一行矩阵项，别为它改判据。
 * **arm64 需要代码签名**：Apple Silicon 上 arm64 进程必须有签名，未签名的会被
