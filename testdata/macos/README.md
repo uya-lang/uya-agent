@@ -4,16 +4,18 @@
 
 * **造**：在 Linux 宿主上 `make macos` → `build/macos/uya-agent`（Mach-O 64 位
   x86_64 可执行文件）。不需要 macOS 机器，只要一个 zig（`zig cc` 自带 Darwin
-  libc 的 tbd 与 linker）。
+  libc 的 tbd 与 linker）。同一套 recipe 加 `MACOS_ARCH=arm64` 出 arm64 产物，
+  见 §6。
 * **跑**：把二进制丢进一台真 macOS，跑 `--help` / `--selftest`。本文的实测环境是
   [dockur/macos](https://github.com/dockur/macos) 的 **macOS 15 客户机**（x86_64
-  QEMU，KVM 加速），记录见下文「实测记录」。
+  QEMU，KVM 加速），记录见下文「实测记录」。arm64 档目前只有编译与形状证据。
 
 ## 1. 造：`make macos`
 
 ```bash
 make macos          # → build/macos/uya-agent（日志 build/macos/build.log）
 make macos-check    # 形状判据：Mach-O 64-bit x86_64 executable + 链接 libSystem
+make macos-arm64    # = make macos macos-check MACOS_ARCH=arm64（→ uya-agent-arm64）
 ```
 
 `file` 应报：
@@ -27,11 +29,12 @@ build/macos/uya-agent: Mach-O 64-bit x86_64 executable, flags:<NOUNDEFS|DYLDLINK
 | 差别 | 取值 | 为什么 |
 |---|---|---|
 | 不许 `-static` | recipe 里 `LDFLAGS=""` | Darwin 没有静态 libc（无 `libc.a` 可静链），`-static` 根本不被接受；产物动态链接 `/usr/lib/libSystem.B.dylib` |
-| `-target` 是 `x86_64-macos` | `MACOS_TRIPLE`，可用 `make macos MACOS_TRIPLE=…` 换 | zig 0.16 的 target query **不认** `x86_64-apple-darwin`，报 `UnknownOperatingSystem` |
+| `-target` 是 `x86_64-macos` / `aarch64-macos` | `MACOS_TRIPLE`（由 `MACOS_ARCH` 推） | zig 0.16 的 target query **不认** `x86_64-apple-darwin`，报 `UnknownOperatingSystem` |
 | 生成物后处理随每次 cc 生效 | `testdata/macos/zig-darwin-cc.sh` | 不像 windows 那样「生成 → 修 → 单 TU 编」，macOS 走 split-C，修补放在 `CC_DRIVER` 包装里 |
 
-缓存目录单独一个：`build/macos/uyacache`（`UYA_SPLIT_C_DIR`）。与 Linux 的
-`build/uyacache` 混用，增量 make 会拿错平台的 `.o` 去链接。
+缓存目录按 arch 各一个：`build/macos/uyacache-<arch>`（`UYA_SPLIT_C_DIR`）。与
+Linux 的 `build/uyacache`、另一个 arch 的缓存混用，增量 make 会拿错平台的 `.o` 去
+链接 —— 两个 arch 的 struct 布局大多一致，链接期一声不响，跑到运行期才炸。
 
 ### 1.1 `zig-darwin-cc.sh` 干的两件事
 
@@ -244,3 +247,97 @@ thread 4253 panic: left shift of 3421674724 by 32 places cannot be represented
   （Linux 用 `waitpid` 的 147 = 128+19），要分叉常量而不是直接复用。
 * 产物**未签名、未公证**：拷到别的机器（带 quarantine 属性）会被 Gatekeeper 拦，
   本机自编译自跑不受影响。
+
+## 6. arm64（Apple Silicon）
+
+### 6.1 能验到哪一步
+
+宿主是 Linux x86_64 时，arm64 只到「造得出来 + 形状对」：
+
+```bash
+make macos-arm64     # = make macos macos-check MACOS_ARCH=arm64
+```
+
+实测输出（zig 0.16.0，Linux x86_64 宿主）：
+
+```
+macos: 产物 build/macos/uya-agent-arm64（arm64）
+-rwxrwxr-x 1 winger winger 31690624 build/macos/uya-agent-arm64
+build/macos/uya-agent-arm64: Mach-O 64-bit arm64 executable,
+                             flags:<NOUNDEFS|DYLDLINK|TWOLEVEL|NO_REEXPORTED_DYLIBS|PIE>
+macho_stack: 通过（LC_MAIN.stacksize = 0x4000000（64.0 MB），门槛 0x4000000）
+macos-check: 通过（Mach-O 64 位 arm64，libSystem，栈 0x4000000）
+```
+
+默认档同时回归过：`make macos && make macos-check` 仍绿（33,725,194 B，
+x86_64）。两档共用一份 recipe，arch 只由 `MACOS_ARCH` 决定。
+
+一次 arm64 构建里踩到过**生成的 `.c` 写盘被截断**（本机 `/home` 只剩 13 GB，
+codegen 写 split-C 时偶尔短一截）：报错是 `src/tools/search.c:525:66: error:
+expected '}'` 这种「列号离谱」的语法错，源文件尾巴停在 `/* defer */`。删掉那两个
+`.c` 与 `.o` 重跑即可恢复，与 arch 无关（x86_64 档也出现过）：
+
+```bash
+rm -f build/macos/uyacache-arm64/src/tools/search.c \
+      build/macos/uyacache-arm64/src/tools/search.o \
+      build/macos/uyacache-arm64/src/session/session.c \
+      build/macos/uyacache-arm64/src/session/session.o
+```
+
+**三种拼法只在一处归一**（踩过这个坑的人会同时看到三种写法）：
+
+| 在哪 | 写什么 |
+|---|---|
+| `make` 命令行 / `file` 输出 | `arm64` |
+| zig 的 `-target` | `aarch64-macos` |
+| uya 的 `TARGET_ARCH` | `arm64`（实测写 `aarch64` 也认，两者都进 `.ta_arm64`） |
+
+`MACOS_ARCH` 传别的值直接 `$(error)` 拦下，免得拼错一个字母就静默出一份
+x86_64 产物。
+
+### 6.2 为什么这台机器跑不了 arm64 真机
+
+* dockur/macos 在 **x86_64 Linux 宿主**上走 QEMU + KVM，客户机只能是 x86_64 的
+  macOS；本篇 §3/§4 那台就是。
+* macOS **arm64 客户机**只在 Apple Silicon 上、由 Apple 的
+  Virtualization.framework 提供（dockur/macos 在 macOS 宿主上也是切到那条路）。
+  QEMU 侧没有能起 XNU arm64 的路子。
+* 所以 arm64 这一档**一条 `--selftest` 都没跑过**。§4 的 `0 FAIL` 是 x86_64 的
+  成绩，**不能挪用到 arm64**。
+
+### 6.3 要拿到 arm64 真机证据，三条路
+
+1. **Apple Silicon + Rosetta 跑 x86_64 产物**（最快，验的还是 §4 那套已绿的
+   二进制）：
+   ```bash
+   softwareupdate --install-rosetta --agree-to-license
+   make macos && ./build/macos/uya-agent --selftest; echo "exit=$?"
+   ```
+2. **Apple Silicon 上原生 arm64**：`make macos-arm64` 后照 §2 的判据跑。
+3. **dockur/macos 架在 Apple Silicon 宿主上**（它自动用 vz），客户机就是 arm64
+   macOS：把 `uya-agent-arm64` 传进去，按 §3/§4 的流程跑一遍。
+
+### 6.4 静态审计：arm64 上「应该」成立的部分
+
+| 检查 | 结论 | 依据 |
+|---|---|---|
+| 源码是否按 arch 分叉 | **没有** | `grep -rn target_arch src/` 为空：平台差异全在 `std.target_os` 这一层，Darwin 的行为已按 OS 分叉，arm64 复用同一份 |
+| stdlib 的两处 `.ta_x86_64` 分叉 | arm64 走 libc，不是裸 syscall | `std/async.uya` 的 sendfile、`std/runtime/runtime.uya` 的 `_uya_exit`，非 x86_64 一律回落 libc —— 正是 macOS 该走的 |
+| Darwin 常量是否与 CPU 相关 | 无关 | zig 的 Darwin 头只有一份 `any-darwin-any`（两档共用），`TIOCPTYGNAME = _IOC(IOC_OUT,'t',83,128)` 这类是拼出来的，两档同值 ⇒ §4.1 的 readdir 旧 ABI、§4.2 的 pty/termios 结论对 arm64 同样成立 |
+| 主线程栈 | 已实测 | arm64 产物的 `LC_MAIN.stacksize = 0x4000000` |
+| `long double` 差异（x86_64 16 B / arm64 8 B） | 踩不到 | 生成物里 `grep -c "long double"` 全 0 |
+| Homebrew 前缀（`/opt/homebrew`） | 已覆盖 | `src/vcs/gitx.uya` 把 `/opt/homebrew/bin/git` 列进候选 |
+
+### 6.5 arm64 上最可能先炸的地方（都未验）
+
+1. **信号**：`SigxAction` 是 glibc x86-64 布局（见 §5），Darwin arm64 的
+   `struct sigaction` / `ucontext` 与 glibc、与 Darwin x86_64 三者都不同 ⇒ 装着
+   信号的那几轮（`sigselftest`、pty 腿里的信号分支）在 arm64 上是空白。**这是
+   arm64 这档最大的洞**，也解释了为什么 §2 的判据在 arm64 上要重跑而不是沿用。
+2. **16 KB 页**（M 系列）：本仓没有按 4096 写死的对齐假设（`grep 4096` 命中的
+   全是缓冲区大小），但 `mmap` / 栈红区相关路径没验过。
+3. **arm64e / PAC**：产物是 `arm64`（不是 arm64e）、未签名，本机自跑不受指针认证
+   影响；一旦有人 re-sign 成 arm64e 或去做公证，签名与 entitlement 另算。
+4. **UBSan 仍要显式关**：zig cc 在 `-O0` 默认开 `-fsanitize=undefined`，与 arch
+   无关；codegen 里那个「常量拆半的有符号左移」在 arm64 上照样会 abort。
+5. **无 Darwin ASan runtime**：zig cc 出不了可用的 ASan，两档同样。
