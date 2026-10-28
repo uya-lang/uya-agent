@@ -173,7 +173,7 @@ export UYA_ROOT
 export UYA_SPLIT_C_DIR := $(CURDIR)/build/uyacache
 
 # 行宽豁免：一条 .PHONY 就是一张全仓目标清单，拆行反而看不清哪条丢了
-.PHONY: all check wire-schema wire-probe wire-probe-real dsh-web-check dsh-settings-check print-src print-cflags build link-audit selftest codegen-audit doc-audit lint-size lint-size-all doc-cover macos macos-check ui-audit probe e2e e2e-config e2e-exec e2e-accept-nudge e2e-retry e2e-version e2e-config-flags e2e-title e2e-title-cmd e2e-title-auto e2e-mouse e2e-api e2e-steps e2e-permission e2e-sandbox e2e-tasks e2e-tasks-resume e2e-goal e2e-memory e2e-memory-live e2e-sessions e2e-resume-big e2e-diff e2e-ws e2e-model e2e-model-save e2e-model-route e2e-provider e2e-ctxwindow e2e-inputimage e2e-worktree e2e-watch e2e-watch-pick e2e-dsh e2e-portable e2e-proxy p30-check tui-demo tui-selftest web-selftest sess-selftest diff-selftest model-selftest panel-selftest clean shell-selftest pm-selftest mcp-selftest proxy-selftest notify-selftest windows win-check
+.PHONY: all check wire-schema wire-probe wire-probe-real dsh-web-check dsh-settings-check print-src print-cflags build link-audit selftest codegen-audit doc-audit lint-size lint-size-all doc-cover macos macos-arm64 macos-check ui-audit probe e2e e2e-config e2e-exec e2e-accept-nudge e2e-retry e2e-version e2e-config-flags e2e-title e2e-title-cmd e2e-title-auto e2e-mouse e2e-api e2e-steps e2e-permission e2e-sandbox e2e-tasks e2e-tasks-resume e2e-goal e2e-memory e2e-memory-live e2e-sessions e2e-resume-big e2e-diff e2e-ws e2e-model e2e-model-save e2e-model-route e2e-provider e2e-ctxwindow e2e-inputimage e2e-worktree e2e-watch e2e-watch-pick e2e-dsh e2e-portable e2e-proxy p30-check tui-demo tui-selftest web-selftest sess-selftest diff-selftest model-selftest panel-selftest clean shell-selftest pm-selftest mcp-selftest proxy-selftest notify-selftest windows win-check
 
 all: build
 
@@ -303,11 +303,28 @@ win-check:
 #    `rc=139`，开发机一直是 `ulimit -s 65536`。macOS 主线程栈被 dyld 固定在 8 MB
 #    且 `ulimit -s` 改不动它，所以只能链接时声明：LC_MAIN.stacksize = 0x4000000。
 #    （`struct WebTable` 那 22 MB 已改为堆上分配，见 src/web/websrv.uya。）
-# 单独一个缓存目录：与 Linux 的 build/uyacache 混用会让增量 make 拿错平台的 .o。
-MACOS_OUT     := build/macos/uya-agent
-MACOS_CC      := $(CURDIR)/testdata/macos/zig-darwin-cc.sh
-MACOS_CACHE   := $(CURDIR)/build/macos/uyacache
+# ⑥ 两档 arch：`MACOS_ARCH=x86_64`（默认）或 `arm64`。三种拼法只在这一处归一 ——
+#    zig 的 triple 里 arm64 叫 `aarch64-macos`，`file` 把产物认作 `arm64`，uya 的
+#    TARGET_ARCH 收 `arm64`（实测写 `aarch64` 也认）。命令行里就写 `arm64`。
+#    缓存目录**必须按 arch 分**：两个 arch 的 struct 布局与函数签名大多一致，混进来
+#    的 .o 在链接期一声不响，跑到运行期才炸。产物名也分开（默认档沿用
+#    `build/macos/uya-agent`，别的档加后缀）。
+#    arm64 档目前只有「编译 + 形状」证据：本机是 x86_64 宿主，dockur/macos 那种
+#    QEMU 客户机起不了 arm64 macOS（要 Apple Silicon 上的 Virtualization.framework），
+#    真机跑法与没验到的部分见 testdata/macos/README.md §6。
+MACOS_ARCH    ?= x86_64
+ifeq ($(filter $(MACOS_ARCH),x86_64 arm64),)
+$(error MACOS_ARCH 只认 x86_64 或 arm64（zig triple 里的 aarch64 在这里写 arm64）)
+endif
+ifeq ($(MACOS_ARCH),x86_64)
 MACOS_TRIPLE  ?= x86_64-macos
+MACOS_OUT     := build/macos/uya-agent
+else
+MACOS_TRIPLE  ?= aarch64-macos
+MACOS_OUT     := build/macos/uya-agent-arm64
+endif
+MACOS_CC      := $(CURDIR)/testdata/macos/zig-darwin-cc.sh
+MACOS_CACHE   := $(CURDIR)/build/macos/uyacache-$(MACOS_ARCH)
 MACOS_CFLAGS  := $(AGENT_CFLAGS) -fno-sanitize=undefined
 MACOS_STACK   := 0x4000000
 MACOS_LDFLAGS := -Wl,-stack_size,$(MACOS_STACK)
@@ -315,28 +332,32 @@ MACOS_LDFLAGS := -Wl,-stack_size,$(MACOS_STACK)
 macos:
 	@mkdir -p build/macos
 	@CFLAGS="$(MACOS_CFLAGS)" LDFLAGS="$(MACOS_LDFLAGS)" UYA_SPLIT_C_DIR="$(MACOS_CACHE)" \
-		HOST_OS=macos TARGET_OS=macos HOST_ARCH=x86_64 TARGET_ARCH=x86_64 \
+		HOST_OS=macos TARGET_OS=macos HOST_ARCH=$(MACOS_ARCH) TARGET_ARCH=$(MACOS_ARCH) \
 		TARGET_TRIPLE="$(MACOS_TRIPLE)" ZIG="$(ZIG)" \
 		CC_DRIVER="$(MACOS_CC)" \
 		$(UYA) build $(SRC) -o $(MACOS_OUT) > build/macos/build.log 2>&1 \
 		|| { echo "macos: 构建失败（日志 build/macos/build.log）："; \
 			grep -E 'error:' build/macos/build.log | head -20; exit 1; }
-	@echo "macos: 产物 $(MACOS_OUT)"
+	@echo "macos: 产物 $(MACOS_OUT)（$(MACOS_ARCH)）"
 	@ls -l $(MACOS_OUT)
 	@file $(MACOS_OUT)
 
-# macOS 产物的**形状**判据（不需要 macOS 机器）：Mach-O 64 位 x86_64 可执行文件、
-# 且只依赖 libSystem —— Darwin 的动态链接是规矩，不是缺陷（那边没有 libc.a 可静链）；
-# 再加上 LC_MAIN.stacksize ≥ 64 MB：这条挡的是「-Wl,-stack_size 没传下去」——
-# 少了它产物照样能起，只是自测跑到 web/tui 组就 SIGSEGV，和在 Linux 上忘了
-# `ulimit -s 65536` 一模一样，而那种崩法在 macOS 上不留 crash report（见
-# testdata/macos/README.md §5）。
-# 真机行为（TUI 渲染 / 按键 / 自检）在 dockur/macos 的 macOS 15 客户机里验，
-# 见 testdata/macos/README.md。
+# arm64 一步到位：编译 + 形状检查。**不含**真机跑（要 Apple Silicon 的 macOS）。
+macos-arm64:
+	@$(MAKE) --no-print-directory macos macos-check MACOS_ARCH=arm64
+
+# macOS 产物的**形状**判据（不需要 macOS 机器）：Mach-O 64 位可执行文件、arch 与
+# `MACOS_ARCH` 一致、且只依赖 libSystem —— Darwin 的动态链接是规矩，不是缺陷（那边
+# 没有 libc.a 可静链）；再加上 LC_MAIN.stacksize ≥ 64 MB：这条挡的是
+# 「-Wl,-stack_size 没传下去」—— 少了它产物照样能起，只是自测跑到 web/tui 组就
+# SIGSEGV，和在 Linux 上忘了 `ulimit -s 65536` 一模一样，而那种崩法在 macOS 上不留
+# crash report（见 testdata/macos/README.md §5）。
+# 真机行为（TUI 渲染 / 按键 / 自检）在 dockur/macos 的 macOS 15 客户机里验（那台是
+# x86_64，所以只有默认档有真机证据），见 testdata/macos/README.md。
 macos-check:
 	@if [ ! -f $(MACOS_OUT) ]; then echo "macos-check: 先 make macos"; exit 1; fi; \
-	if ! file $(MACOS_OUT) | grep -q 'Mach-O 64-bit x86_64'; then \
-		echo "macos-check: 不是 Mach-O 64 位 x86_64"; \
+	if ! file $(MACOS_OUT) | grep -q 'Mach-O 64-bit $(MACOS_ARCH)'; then \
+		echo "macos-check: 不是 Mach-O 64 位 $(MACOS_ARCH)"; \
 		file $(MACOS_OUT); exit 1; fi; \
 	if ! file $(MACOS_OUT) | grep -q 'executable'; then \
 		echo "macos-check: 不是可执行文件"; file $(MACOS_OUT); exit 1; fi; \
@@ -344,7 +365,7 @@ macos-check:
 		echo "macos-check: 没有链接 libSystem"; exit 1; fi; \
 	if ! python3 testdata/macos/macho_stack.py $(MACOS_OUT) $(MACOS_STACK); then \
 		echo "macos-check: 主线程栈没到 $(MACOS_STACK)"; exit 1; fi; \
-	echo "macos-check: 通过（Mach-O 64 位 x86_64，链接 libSystem，栈 $(MACOS_STACK)）"
+	echo "macos-check: 通过（Mach-O 64 位 $(MACOS_ARCH)，libSystem，栈 $(MACOS_STACK)）"
 
 # 静态链接审计：产物必须**没有** PT_INTERP、没有 NEEDED 项。两条都走 readelf 的
 # 结构性 token（`INTERP` / `(NEEDED)`），不解析本机化后的散文（中文环境下 readelf
