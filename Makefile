@@ -1527,6 +1527,10 @@ e2e-version: build
 # CLI flag 回归：--dsh-home / --no-dsh-config / --strict-dsh-config 决定「去哪儿读设置」，
 # 必须在下一次加载之前生效（曾经因为完整 CLI 解析排在加载之后而三个 flag 全部静默失效，
 # 见 §16 踩坑 25）。离线可跑：--print-config 不联网。
+# 尾巴四腿钉「一个都没配时说什么」：没有凭据时除了那一行 error（脚本在 grep，字面不许变），
+# 还得印出可粘贴的下一步 —— 先说 DSH 设置查到哪儿（没读到 / --no-dsh-config 没读 / 已读到
+# 但里面没凭据），再给环境变量与 --api-key 两条配方；--strict-dsh-config 则要指名找的是哪个
+# settings.yaml。
 e2e-config-flags: build
 	@set -e; \
 	out=$$($(OUT) --no-dsh-config --print-config 2>&1); \
@@ -1544,6 +1548,25 @@ e2e-config-flags: build
 	if $(OUT) --strict-dsh-config --dsh-home /nonexistent --print-config >/dev/null 2>&1; then \
 		echo "FAIL: --strict-dsh-config 读不到设置却没有报错退出"; exit 1; \
 	fi; \
+	nh=$(CURDIR)/build/e2e_nokey_home; \
+	rm -rf $$nh; mkdir -p $$nh; \
+	if env -i PATH=/usr/bin:/bin HOME=$$nh $(CURDIR)/$(OUT) "hi" >$$nh/out.txt 2>&1; then \
+		echo "FAIL: 一个凭据都没配却退出 0"; exit 1; \
+	fi; \
+	grep -q "^error: no API key. set UYA_AGENT_API_KEY / DEEPSEEK_API_KEY / OPENAI_API_KEY$$" $$nh/out.txt \
+		|| { echo "FAIL: 没有凭据时那一行 error 被改动了（脚本在 grep 它）"; exit 1; }; \
+	grep -q "DSH 设置：没读到（找的是 $$nh/.dsh" $$nh/out.txt \
+		|| { echo "FAIL: 提示没说 DSH 设置找的是哪个目录（无从判断该配哪儿）"; exit 1; }; \
+	grep -q "export UYA_AGENT_BASE_URL=https://api.deepseek.com/v1" $$nh/out.txt \
+		|| { echo "FAIL: 提示没给出可粘贴的 UYA_AGENT_* 配方"; exit 1; }; \
+	grep -q "uya-agent --print-config" $$nh/out.txt \
+		|| { echo "FAIL: 提示没指向 --print-config（没见过生效值就没法自查）"; exit 1; }; \
+	env -i PATH=/usr/bin:/bin HOME=$$nh $(CURDIR)/$(OUT) --no-dsh-config "hi" >$$nh/out2.txt 2>&1 || true; \
+	grep -q "DSH 设置：按 --no-dsh-config 没读" $$nh/out2.txt \
+		|| { echo "FAIL: --no-dsh-config 时提示还在教人配 DSH 设置"; exit 1; }; \
+	env -i PATH=/usr/bin:/bin HOME=$$nh $(CURDIR)/$(OUT) --strict-dsh-config --dsh-home /nonexistent --print-config >$$nh/out3.txt 2>&1 || true; \
+	grep -q "hint: 找的是 /nonexistent/settings.yaml" $$nh/out3.txt \
+		|| { echo "FAIL: --strict-dsh-config 的提示没指名找的是哪个 settings.yaml"; exit 1; }; \
 	out=$$($(OUT) --dsh-root testdata/preset-root --print-config 2>&1); \
 	echo "$$out" | grep -q "knobs (source: preset)" \
 		|| { echo "FAIL: --dsh-root 没有生效（旋钮仍来自内置默认）"; exit 1; }; \
@@ -1552,7 +1575,7 @@ e2e-config-flags: build
 	out=$$($(OUT) --print-config 2>&1); \
 	echo "$$out" | grep -q "readLimit=1777" \
 		&& { echo "FAIL: 没给 --dsh-root 却读到了夹具的值"; exit 1; }; \
-	echo "e2e-config-flags: 通过（--dsh-home / --no-dsh-config / --strict-dsh-config / --dsh-root 都在加载前生效）"
+	echo "e2e-config-flags: 通过（--dsh-home / --no-dsh-config / --strict-dsh-config / --dsh-root 都在加载前生效；没凭据时印出下一步）"
 
 # P55 收工提醒（--grace-steps 的锚点也靠它）：验收类命令在**改动之后**跑绿时，工具结果尾部要出现
 # 一行 `[acceptance] …`；三种反例都不该出现 —— 非验收类命令（`ls -la`）、以及**文本里出现过
