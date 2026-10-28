@@ -305,16 +305,17 @@ x86_64 产物。
 * 所以 arm64 这一档**一条 `--selftest` 都没跑过**。§4 的 `0 FAIL` 是 x86_64 的
   成绩，**不能挪用到 arm64**。
 
-### 6.3 要拿到 arm64 真机证据，三条路
+### 6.3 要拿到 arm64 真机证据，四条路
 
-1. **Apple Silicon + Rosetta 跑 x86_64 产物**（最快，验的还是 §4 那套已绿的
-   二进制）：
+1. **GitHub Actions 的 `macos-14` runner**（就是 Apple Silicon 真机，见 §7）——
+   不需要自己的机器、别人也能一键重跑，是这一档的首选。
+2. **Apple Silicon + Rosetta 跑 x86_64 产物**（验的还是 §4 那套已绿的二进制）：
    ```bash
    softwareupdate --install-rosetta --agree-to-license
    make macos && ./build/macos/uya-agent --selftest; echo "exit=$?"
    ```
-2. **Apple Silicon 上原生 arm64**：`make macos-arm64` 后照 §2 的判据跑。
-3. **dockur/macos 架在 Apple Silicon 宿主上**（它自动用 vz），客户机就是 arm64
+3. **Apple Silicon 上原生 arm64**：`make macos-arm64` 后照 §2 的判据跑。
+4. **dockur/macos 架在 Apple Silicon 宿主上**（它自动用 vz），客户机就是 arm64
    macOS：把 `uya-agent-arm64` 传进去，按 §3/§4 的流程跑一遍。
 
 ### 6.4 静态审计：arm64 上「应该」成立的部分
@@ -341,3 +342,39 @@ x86_64 产物。
 4. **UBSan 仍要显式关**：zig cc 在 `-O0` 默认开 `-fsanitize=undefined`，与 arch
    无关；codegen 里那个「常量拆半的有符号左移」在 arm64 上照样会 abort。
 5. **无 Darwin ASan runtime**：zig cc 出不了可用的 ASan，两档同样。
+
+## 7. GitHub Actions 的 macOS runner（`.github/workflows/macos.yml`）
+
+本机没有 Apple Silicon 也能跑 arm64：GitHub 的 `macos-14` / `macos-15` 就是
+Apple Silicon（arm64）真机，`macos-13` 是 Intel（x86_64）。
+
+| job | 跑在 | 干什么 | 挡不挡合并 |
+|---|---|---|---|
+| `build` | `ubuntu-latest` | `make macos` + `make macos MACOS_ARCH=arm64` + 两档 `macos-check`，产物传 artifact | 挡 |
+| `test`（x86_64） | `macos-13` | `--help`、GOAL 组、TUI 组各跑一遍；全量只收集 | 观察项 |
+| `test`（arm64） | `macos-14` | 同上，二进制换 `uya-agent-arm64` | 观察项 |
+
+几个非显然的决定：
+
+* **编译留在 ubuntu**：本仓自带的编译器 `uya/bin/uya` 是 Linux ELF，macOS runner
+  上跑不了。所以形状与 windows job 一致 —— 交叉编译在一台、真机跑在另一台。
+* **`macos-13` 随时会退役**：它只是把 §4 那份 x86_64 证据变成「别人也能重跑」。
+  镜像没了就删掉那一行矩阵项，别为它改判据。
+* **arm64 需要代码签名**：Apple Silicon 上 arm64 进程必须有签名，未签名的会被
+  `Killed: 9`。实测 zig 的链接器已经打了 **ad-hoc 签名**
+  （`LC_CODE_SIGNATURE` 在、`codesign -dv` 报 `Signature=adhoc`），再加上 artifact
+  下载不带 `quarantine` 属性，所以直接 `chmod +x` 就能跑。workflow 里那步
+  `codesign -dv` 只是把这件事印出来，不参与判据。
+* **夹具要一起 checkout**：全量里有几轮往 `testdata/` 写假 runner / 假 Xauthority
+  （§4.3 最后一条），所以 test job 也 checkout 仓库，而不是只下 artifact。
+* **先当观察项**（`continue-on-error`）：arm64 一条自测都没跑过，§6.5 那 5 条
+  （信号布局排第一）随时会红。等红过几轮、把数字记进 §6，再把矩阵里的
+  `observe` 改成 `false` 转成硬判据 —— 顺序反了第一天就会挡所有人的 PR。
+* **`timeout-minutes: 30`**：pty 类回合在 macOS 上曾**永久阻塞**（§4.2 那条
+  「slave 未 open 时写 master 会阻塞」），有超时兜底才不会吃掉 runner 的 6 h。
+* **计费**：macOS runner 的分钟数是 Linux 的 **×10**。公开仓免费；私有仓要算进
+  配额 —— 所以这个 workflow 用 `paths:` 收窄到 `src/`、`uya/`、`Makefile`、
+  `testdata/macos/`，改文档不触发。
+
+怎么触发：推到 `main`、开 PR（改了上面那几个路径），或在 Actions 页面手动
+`Run workflow`（`workflow_dispatch`）。
