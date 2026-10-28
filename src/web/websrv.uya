@@ -17,7 +17,8 @@
 //   `kill(-pid)` 连子孙一起收），否则退出后会留下野进程；⑦ **画布尺寸只有一个
 //   入口**（`web_size_clamp`）：`s.cols` 与网格 `emu.cols` 必须同源，各说一套的话
 //   服务端按一个宽度发帧、前端按另一个排版，右边框永远对不齐。
-// 依赖：无 `use` 行（合并命名空间）；本仓 foundation/bufx、net/httpsrv（`srv_*`）、
+// 依赖：`use std;`（只为 `std.cfg` 按目标 OS 分叉 PTY 常量），其余靠合并命名空间；
+//   本仓 foundation/bufx、net/httpsrv（`srv_*`）、
 //   web/ttyemu（`emu_*`）、session/session（`sess_new_id` / `sess_find_last` /
 //   `sess_index_rows_sorted`）、tools/shellx（`sh_env_prepare_kv` / `env_add_kv` /
 //   `sh_env_array`）、session/sigx（`sigx_reset_for_child`）、agent（`Config`、
@@ -34,6 +35,8 @@
 // WebSocket 要多一套握手 + 帧编解码 + 掩码，收益只是「省一次往返」—— 在一个
 // 本地单用户页面上不值。NDJSON 还有个好处：`curl` 就能看（诊断友好）。
 
+use std;
+
 // ============================================================
 // 常量
 // ============================================================
@@ -49,12 +52,25 @@ const WEB_POLL_MS: i32 = 50;
 // 增量的），留帧只要原样再发一次。
 const WEB_REPLAY_FRAMES: usize = 4;
 
-// PTY 相关 ioctl（Linux 取值，与自测的 tuis_open_pty 同一套）
-const WEB_TIOCSPTLCK: i64 = 0x40045431;
-const WEB_TIOCGPTN: i64 = 0x80045430;
-const WEB_TIOCSWINSZ: i64 = 0x5414;
-const WEB_TIOCGWINSZ: i64 = 0x5413;
-const WEB_O_RDWR_NOCTTY: i32 = 0x102;      // O_RDWR | O_NOCTTY
+// PTY 相关 ioctl 与 open 标志。**取值随目标 OS 走**（与自测的 tuis_open_pty
+// 同一套语义）。抄错不是编译错，是运行期 `error: 打不开 /dev/ptmx（pty 用完了？）`
+// —— macOS 真机上就是这么红的（`testdata/macos/README.md` §4 有记录）。
+//
+// 两套 pty 语义不同，不只是数字不同：
+//   * Linux：`TIOCSPTLCK` 解链 + `TIOCGPTN` 取编号 ⇒ 从设备 `/dev/pts/N`；
+//   * Darwin：`TIOCPTYGRANT` 授权 + `TIOCPTYGNAME` 让内核把路径回填进 128 字节
+//     缓冲 ⇒ 从设备 `/dev/ttysNNN`（没有「取编号」这个 ioctl）。
+// `TIOCSWINSZ`/`TIOCGWINSZ` 连编码都不同（Linux `0x5414`/`0x5413`，Darwin 是
+// `_IOW('t',103,winsize)`/`_IOR('t',104,winsize)`），所以共用常量也得分叉。
+std.cfg(std.target_os == .tos_macos, {
+    const WEB_TIOCSWINSZ: i64 = 0x80087467;
+    const WEB_TIOCGWINSZ: i64 = 0x40087468;
+    const WEB_O_RDWR_NOCTTY: i32 = 0x00020002;  // O_RDWR | O_NOCTTY
+}, {
+    const WEB_TIOCSWINSZ: i64 = 0x5414;
+    const WEB_TIOCGWINSZ: i64 = 0x5413;
+    const WEB_O_RDWR_NOCTTY: i32 = 0x102;       // O_RDWR | O_NOCTTY
+})
 
 // HTTP 端点
 const WEB_P_SESSIONS: &const byte = "/api/sessions" as &const byte;
@@ -190,27 +206,77 @@ fn web_pty_open(slave_path: &Buf, cols: usize, rows: usize) i32 {
     if m < 0 {
         return -1;
     }
-    var zero: i32 = 0;
-    if (sys_ioctl(m, WEB_TIOCSPTLCK, web_addr(&zero as &const void)) catch {
-        -1;
-    }) != 0 {
+    if !web_pty_slave_name(m, slave_path) {
         srv_close(m);
         return -1;
     }
-    var num: i32 = 0;
-    if (sys_ioctl(m, WEB_TIOCGPTN, web_addr(&num as &const void)) catch {
-        -1;
-    }) != 0 {
-        srv_close(m);
-        return -1;
-    }
-    buf_reset(slave_path);
-    _ = buf_append_cstr(slave_path, "/dev/pts/");
-    _ = buf_append_i64(slave_path, num as i64);
-    _ = buf_append_byte(slave_path, 0);        // 尾 NUL：见上面的注释
     web_set_winsize(m, cols, rows);
+    // master **必须非阻塞**（`webpump` 的 `pending` + POLLOUT 那套本来就是按非阻塞
+    // fd 写的）。除了「一圈 poll 不许被一条会话卡住」，Darwin 上还有个更硬的理由：
+    // **从设备还没被 open 时，往 master 写会一直阻塞**（Linux 上是 EIO 立刻返回）。
+    // 客户机实测：GRANT/GNAME 都成功之后 `write(master)` 直接挂住 ≥4 秒
+    // （`testdata/macos/README.md` §5 有记录）。
+    rt_set_nonblock(m);
     return m;
 }
+
+// 把从设备的路径写进 slave_path（**含尾 NUL**，理由见 web_pty_open 的注释）。
+// 调用点只认「成没成」：两个平台的取名步骤完全不同，没有共同点可以抽象。
+std.cfg(std.target_os == .tos_macos, {
+    // Darwin（等价于 `openpty(3)` 里那三步 ioctl）。`TIOCPTYGRANT`/`TIOCPTYUNLK`
+    // 是 `_IO` 型（不传数据），那个地址参数被内核忽略，传个 0 的地址只为对齐
+    // 参数形状。
+    // 第三步 `TIOCPTYUNLK` **不能省**：授权之后不解除锁定，从设备仍然打不开
+    // （`open` 给 EBUSY），子进程静默起不来；Linux 那边对应的就是 `TIOCSPTLCK 0`。
+    fn web_pty_slave_name(m: i32, slave_path: &Buf) bool {
+        const TIOCPTYGRANT: i64 = 0x20007454;
+        const TIOCPTYGNAME: i64 = 0x40807453;
+        const TIOCPTYUNLK: i64 = 0x20007452;
+        var zero: i32 = 0;
+        if (sys_ioctl(m, TIOCPTYGRANT, web_addr(&zero as &const void))
+            catch { -1; }) != 0 {
+            return false;
+        }
+        var name: [byte: 128] = [0: 128];
+        if (sys_ioctl(m, TIOCPTYGNAME, web_addr(&name[0] as &const void))
+            catch { -1; }) != 0 {
+            return false;
+        }
+        if (sys_ioctl(m, TIOCPTYUNLK, web_addr(&zero as &const void))
+            catch { -1; }) != 0 {
+            return false;
+        }
+        buf_reset(slave_path);
+        if !buf_append_cstr(slave_path, &name[0] as &const byte) {
+            return false;
+        }
+        _ = buf_append_byte(slave_path, 0);    // 尾 NUL：见上面的注释
+        return true;
+    }
+}, {
+    // Linux：解链 + 取编号 + 自己拼 `/dev/pts/N`。
+    fn web_pty_slave_name(m: i32, slave_path: &Buf) bool {
+        const TIOCSPTLCK: i64 = 0x40045431;
+        const TIOCGPTN: i64 = 0x80045430;
+        var zero: i32 = 0;
+        if (sys_ioctl(m, TIOCSPTLCK, web_addr(&zero as &const void)) catch {
+            -1;
+        }) != 0 {
+            return false;
+        }
+        var num: i32 = 0;
+        if (sys_ioctl(m, TIOCGPTN, web_addr(&num as &const void)) catch {
+            -1;
+        }) != 0 {
+            return false;
+        }
+        buf_reset(slave_path);
+        _ = buf_append_cstr(slave_path, "/dev/pts/");
+        _ = buf_append_i64(slave_path, num as i64);
+        _ = buf_append_byte(slave_path, 0);    // 尾 NUL：见上面的注释
+        return true;
+    }
+})
 
 // 对 master fd 设窗口尺寸（TIOCSWINSZ；8 字节 winsize = rows, cols, x, y）。
 export fn web_set_winsize(m: i32, cols: usize, rows: usize) void {
@@ -404,7 +470,7 @@ fn web_spawn_into(cfg: &const Config, t: &WebTable, idx: usize,
     var self_bin: Buf = buf_new(4096);
     defer { buf_free(&self_bin); }
     if !web_self_exe(&self_bin) {
-        out_err("[web] 读不到 /proc/self/exe\n");
+        out_err("[web] 取不到自己的可执行文件路径\n");
         srv_close(m);
         return -1;
     }
@@ -977,6 +1043,29 @@ fn web_table_zero() WebTable {
     };
 }
 
+// 一张表有多大：`WEB_MAX_SESSIONS`（8）× 一个会话，而每个会话内嵌 `EmuGrid`
+// 的 `cells[100000]`（28 字节/格 ≈ 2.8 MB）⇒ **整张表 ≈ 22.6 MB**。
+//
+// 所以它**不能放栈上**：Linux 默认 `ulimit -s 8192` 与 macOS 主线程栈（8 MB）
+// 都会当场 SIGSEGV。实测 macOS 上 `--selftest` 崩在 `web-dispatch` 轮正是这个
+// 原因（`rc=139`）；同一份二进制在 `ulimit -s 65536` 下全绿
+// （见 testdata/macos/README §5）。堆是唯一不随平台/ulimit 变的地方，所以入口
+// 只留这一对：`web_table_heap_new()` 失败**返回空指针**（调用方必须判），
+// `web_table_heap_free()` 先释放表里的 Buf 再还表本身。
+export fn web_table_heap_new() &WebTable {
+    const p: &WebTable = malloc(@size_of(WebTable)) as &WebTable;
+    if (p as usize) == 0 {
+        return p;
+    }
+    p[0] = web_table_zero();
+    return p;
+}
+
+export fn web_table_heap_free(t: &WebTable) void {
+    web_table_free(t);
+    free(t as &void);
+}
+
 // 一个空会话槽。
 fn web_session_value_empty() WebSession {
     return WebSession{
@@ -1120,26 +1209,50 @@ export fn web_id_len_of(t: &const WebTable, i: usize) usize {
     return t.items[i].id.len;
 }
 
-// 取本进程自己的可执行文件路径（`readlink /proc/self/exe`），**带尾 NUL**
-// （要直接喂 `sys_execve`）。
+// 取本进程自己的可执行文件路径，**带尾 NUL**（要直接喂 `sys_execve`）。
 // 为什么不用 `get_argv(0)`：那可能是相对路径或软链，而子进程 execve 时的 cwd
-// 已经变了（且 execve 不查 PATH）。`/proc/self/exe` 是内核给的绝对真身。
-fn web_self_exe(out: &Buf) bool {
-    buf_reset(out);
-    var p: [byte: 16] = "/proc/self/exe";
-    var tmp: [byte: 4096] = [0: 4096];
-    const n: isize = sys_readlink(&p[0] as *const byte, &tmp[0], 4096) catch {
-        -1 as isize;
-    };
-    if n <= 0 {
-        return false;
+// 已经变了（且 execve 不查 PATH），必须是绝对真身。
+//
+// 两平台拿法不同，**没有共同点**：
+//   * Linux：`readlink /proc/self/exe`（内核给的绝对真身）；
+//   * Darwin：**没有 /proc**，得问 dyld 要 `_NSGetExecutablePath`（原型在
+//     `src/cshim/uya_agent_libc_protos.h`；它在 Mach-O 里的符号是
+//     `__NSGetExecutablePath`，多那个下划线是 clang 按 C 名加的）。
+std.cfg(std.target_os == .tos_macos, {
+    extern "libc" fn _NSGetExecutablePath(buf: *byte, size: *u32) i32;
+
+    fn web_self_exe(out: &Buf) bool {
+        buf_reset(out);
+        var tmp: [byte: 4096] = [0: 4096];
+        var sz: u32 = 4096;
+        // 返回值：0 = 成功；-1 = 缓冲不够（同时把真实长度写回 sz）。
+        if _NSGetExecutablePath(&tmp[0], &sz) != 0 {
+            return false;
+        }
+        if !buf_append_cstr(out, &tmp[0] as &const byte) {
+            return false;
+        }
+        return buf_append_byte(out, 0);
     }
-    const cn: usize = n as usize;
-    if cn >= 4096 {
-        return false;
+}, {
+    fn web_self_exe(out: &Buf) bool {
+        buf_reset(out);
+        var p: [byte: 16] = "/proc/self/exe";
+        var tmp: [byte: 4096] = [0: 4096];
+        const r: !isize = sys_readlink(&p[0] as *const byte, &tmp[0], 4096);
+        const n: isize = r catch {
+            -1 as isize;
+        };
+        if n <= 0 {
+            return false;
+        }
+        const cn: usize = n as usize;
+        if cn >= 4096 {
+            return false;
+        }
+        if !buf_append(out, &tmp[0], cn) {
+            return false;
+        }
+        return buf_append_byte(out, 0);
     }
-    if !buf_append(out, &tmp[0], cn) {
-        return false;
-    }
-    return buf_append_byte(out, 0);
-}
+})

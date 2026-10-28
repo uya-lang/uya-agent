@@ -2,7 +2,8 @@
 //
 // 本文件：isatty 探测与 raw 模式进出、终端尺寸读取、UTF-8 编解码与显示列宽、行编辑器与事件队列、面板块的擦除/重画协议、诊断字节的安全预览、终端标题（OSC 2）通道。
 // 不变量：编辑按 **UTF-8 字符**、定位按**显示列**（按字节退格会砍出半个汉字，按字节挪光标会越走越偏）；写转义序列必须用数组字面量取址，**不能**用 `&"字面量"[a:b]`（生成的是切片描述符地址，屏幕上就是乱码）；面板块的擦除只能清它自己占的格子（多行块走 tty_build_block_erase 的逐行 `ESC[2K`，不能拿 `ESC[J` 清到屏幕末尾，那会连带擦掉下面仍可见的正文）；raw 属性必须在正常/错误/信号三条路径上都还原。
-// 依赖：libc.syscall / libc.unistd / libc.stdlib、foundation/bufx；信号层在 sigx（本模块**不装处理器**）。
+// 依赖：libc.syscall / libc.unistd / libc.stdlib、foundation/bufx、`std.cfg`（按目标 OS
+//   分叉 termios ABI 与 ioctl 号）；信号层在 sigx（本模块**不装处理器**）。
 // 命名：本文件对外符号统一 `tty_` / `TTY_` 前缀。
 //
 // 提供：
@@ -22,25 +23,54 @@
 // 设计约束：Uya **没有捕获闭包**，所以状态放在模块级全局 tty_ui 上，函数直接操作它；
 // 单进程里只可能有一个前台界面，这与 DSH 的「一个 session 一个 driver」一致。
 
+use std;
 use libc.syscall;
 use libc.unistd;
 use libc.stdlib;
 
-// ---- ioctl / termios 常量（Linux x86-64）----
-const TTY_TCGETS: i64 = 0x5401;
-const TTY_TCSETS: i64 = 0x5402;
-const TTY_TIOCGWINSZ: i64 = 0x5413;
+// ---- ioctl / termios 常量：**两套取值，随目标 OS 走** ----
+//
+// 这里抄错既不是编译错、也不是启动错，而是**静默什么都不做**：`ioctl(0, 0x5401, …)`
+// 在 Darwin 上是 `ENOTTY` ⇒ `tty_probe` 探成 false ⇒ `raw` 整段跳过 ⇒ 界面看着
+// 没问题、键盘却要按回车（`testdata/macos/README.md` §4 有这条的真机记录）。
+//
+//   * 读写属性：Linux `TCGETS`/`TCSETS`(0x5401/0x5402)；Darwin `TIOCGETA`/
+//     `TIOCSETA`(0x40487413/0x80487414)；
+//   * 窗口尺寸：Linux 0x5413；Darwin `_IOR('t',104,winsize)` = 0x40087468；
+//   * flag 位：只有 `ICRNL`/`ECHO` 两边同值，`IXON`/`ISIG`/`ICANON`/`IEXTEN`
+//     全不同（Darwin 是老 BSD 位序，Linux 是各自定值）；
+//   * `c_cc` 下标：Linux `VMIN=6`/`VTIME=5`；Darwin `VMIN=16`/`VTIME=17`。
+std.cfg(std.target_os == .tos_macos, {
+    const TTY_TCGETS: i64 = 0x40487413;         // TIOCGETA
+    const TTY_TCSETS: i64 = 0x80487414;         // TIOCSETA
+    const TTY_TIOCGWINSZ: i64 = 0x40087468;
 
-const TTY_IFLAG_ICRNL: u32 = 0x0100;
-const TTY_IFLAG_IXON: u32 = 0x0400;
-const TTY_LFLAG_ISIG: u32 = 0x0001;
-const TTY_LFLAG_ICANON: u32 = 0x0002;
-const TTY_LFLAG_ECHO: u32 = 0x0008;
-const TTY_LFLAG_IEXTEN: u32 = 0x8000;
+    const TTY_IFLAG_ICRNL: u32 = 0x0100;
+    const TTY_IFLAG_IXON: u32 = 0x0200;
+    const TTY_LFLAG_ISIG: u32 = 0x0080;
+    const TTY_LFLAG_ICANON: u32 = 0x0100;
+    const TTY_LFLAG_ECHO: u32 = 0x0008;
+    const TTY_LFLAG_IEXTEN: u32 = 0x0400;
+
+    const TTY_CC_VTIME: usize = 17;
+    const TTY_CC_VMIN: usize = 16;
+}, {
+    const TTY_TCGETS: i64 = 0x5401;
+    const TTY_TCSETS: i64 = 0x5402;
+    const TTY_TIOCGWINSZ: i64 = 0x5413;
+
+    const TTY_IFLAG_ICRNL: u32 = 0x0100;
+    const TTY_IFLAG_IXON: u32 = 0x0400;
+    const TTY_LFLAG_ISIG: u32 = 0x0001;
+    const TTY_LFLAG_ICANON: u32 = 0x0002;
+    const TTY_LFLAG_ECHO: u32 = 0x0008;
+    const TTY_LFLAG_IEXTEN: u32 = 0x8000;
+
+    const TTY_CC_VTIME: usize = 5;
+    const TTY_CC_VMIN: usize = 6;
+})
+
 const TTY_U32_MAX: u32 = 0xFFFFFFFF;
-
-const TTY_CC_VTIME: usize = 5;
-const TTY_CC_VMIN: usize = 6;
 
 const TTY_LINE_MAX: usize = 8192;
 const TTY_HIST_MAX: usize = 32;
@@ -81,28 +111,64 @@ export const TTY_EV_REDRAW: i32 = 6;      // Ctrl-L
 // 由它把控制权交回主循环（那边投递完成通知，必要时再开一回合）。
 export const TTY_EV_NOTIFY: i32 = 7;
 
-export struct TtyTermios {
-    c_iflag: u32,
-    c_oflag: u32,
-    c_cflag: u32,
-    c_lflag: u32,
-    c_line: u8,
-    c_cc: [byte: 32],
-    pad: [byte: 3],
-    c_ispeed: u32,
-    c_ospeed: u32,
-}
+// termios 结构。**布局跟着平台 ABI 走**，不是「u32 换 u64」这种小事：
+//   * Linux x86-64：4×u32 + c_line + c_cc[32] + 2×u32 = 60 字节；
+//   * Darwin：4×**u64** + c_cc[20] + 2×u64 = 72 字节。
+//
+// 本模块只用到 `c_iflag`/`c_lflag` 的**低 32 位**（所有要清的位都在下半）和
+// `c_cc` 的两个下标，所以 Darwin 那份把每个 u64 拆成「低半 u32（真字段）+ 高半
+// u32（照抄回去的填充）」：两边字段名与类型一致，`t.c_lflag & …` 这类调用点一行
+// 都不用改。高半不会丢 —— `tty_raw_on` 是「读出来 → 改位 → 整份写回去」。
+std.cfg(std.target_os == .tos_macos, {
+    export struct TtyTermios {
+        c_iflag: u32,
+        hi_iflag: u32,
+        c_oflag: u32,
+        hi_oflag: u32,
+        c_cflag: u32,
+        hi_cflag: u32,
+        c_lflag: u32,
+        hi_lflag: u32,
+        c_cc: [byte: 20],
+        cc_pad: [byte: 4],
+        c_ispeed: u32,
+        hi_ispeed: u32,
+        c_ospeed: u32,
+        hi_ospeed: u32,
+    }
 
-export struct TtyWinsize {
-    ws_row: u16,
-    ws_col: u16,
-    ws_x: u16,
-    ws_y: u16,
-}
+    // 全零的 termios（72 字节）。
+    const TTY_TERMIOS_ZERO: TtyTermios = TtyTermios{
+        c_iflag: 0,
+        hi_iflag: 0,
+        c_oflag: 0,
+        hi_oflag: 0,
+        c_cflag: 0,
+        hi_cflag: 0,
+        c_lflag: 0,
+        hi_lflag: 0,
+        c_cc: [0: 20],
+        cc_pad: [0: 4],
+        c_ispeed: 0,
+        hi_ispeed: 0,
+        c_ospeed: 0,
+        hi_ospeed: 0,
+    };
+}, {
+    export struct TtyTermios {
+        c_iflag: u32,
+        c_oflag: u32,
+        c_cflag: u32,
+        c_lflag: u32,
+        c_line: u8,
+        c_cc: [byte: 32],
+        pad: [byte: 3],
+        c_ispeed: u32,
+        c_ospeed: u32,
+    }
 
-// 全零的 termios（c_cc 32 字节、pad 3 字节都清零），给「先 memset 再填」的调用方当起点。
-export fn tty_termios_zero() TtyTermios {
-    return TtyTermios{
+    // 全零的 termios（c_cc 32 字节、pad 3 字节都清零）。
+    const TTY_TERMIOS_ZERO: TtyTermios = TtyTermios{
         c_iflag: 0,
         c_oflag: 0,
         c_cflag: 0,
@@ -113,6 +179,18 @@ export fn tty_termios_zero() TtyTermios {
         c_ispeed: 0,
         c_ospeed: 0,
     };
+})
+
+export struct TtyWinsize {
+    ws_row: u16,
+    ws_col: u16,
+    ws_x: u16,
+    ws_y: u16,
+}
+
+// 全零的 termios，给「先 memset 再填」的调用方当起点（布局见 TtyTermios 的定义）。
+export fn tty_termios_zero() TtyTermios {
+    return TTY_TERMIOS_ZERO;
 }
 
 export struct TtyUi {
@@ -1714,17 +1792,7 @@ export var tty_ui: TtyUi = TtyUi{
     raw: false,
     cols: 80,
     rows: 24,
-    saved: TtyTermios{
-        c_iflag: 0,
-        c_oflag: 0,
-        c_cflag: 0,
-        c_lflag: 0,
-        c_line: 0,
-        c_cc: [0: 32],
-        pad: [0: 3],
-        c_ispeed: 0,
-        c_ospeed: 0,
-    },
+    saved: TTY_TERMIOS_ZERO,
     line: Buf{ ptr: null, len: 0, cap: 0 },
     cursor: 0,
     prompt: Buf{ ptr: null, len: 0, cap: 0 },

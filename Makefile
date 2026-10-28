@@ -137,6 +137,7 @@ WIN_UYA    ?= $(UYA)
 #      数文件：`make -s print-src | wc -w`。
 # 留在 src/ 根的 tools.uya 是 P50 起就不在构建里的已知死代码，故意不列。
 SRC := src/foundation/bufx.uya src/foundation/verx.uya src/foundation/jsonx.uya src/foundation/yamlcfg.uya \
+       src/foundation/dirent.uya \
        src/term/wincon.uya \
        src/rt/rtloop.uya src/rt/rtio.uya \
        src/net/tlspin.uya src/net/proxyx.uya src/net/rsav.uya src/net/x509min.uya src/net/cachain.uya \
@@ -172,7 +173,7 @@ export UYA_ROOT
 export UYA_SPLIT_C_DIR := $(CURDIR)/build/uyacache
 
 # 行宽豁免：一条 .PHONY 就是一张全仓目标清单，拆行反而看不清哪条丢了
-.PHONY: all check wire-schema wire-probe wire-probe-real dsh-web-check dsh-settings-check print-src print-cflags build link-audit selftest codegen-audit doc-audit lint-size lint-size-all doc-cover ui-audit probe e2e e2e-config e2e-exec e2e-accept-nudge e2e-retry e2e-version e2e-config-flags e2e-title e2e-title-cmd e2e-title-auto e2e-mouse e2e-api e2e-steps e2e-permission e2e-sandbox e2e-tasks e2e-tasks-resume e2e-goal e2e-memory e2e-memory-live e2e-sessions e2e-resume-big e2e-diff e2e-ws e2e-model e2e-model-save e2e-model-route e2e-provider e2e-ctxwindow e2e-inputimage e2e-worktree e2e-watch e2e-watch-pick e2e-dsh e2e-portable e2e-proxy p30-check tui-demo tui-selftest web-selftest sess-selftest diff-selftest model-selftest panel-selftest clean shell-selftest pm-selftest mcp-selftest proxy-selftest notify-selftest windows win-check
+.PHONY: all check wire-schema wire-probe wire-probe-real dsh-web-check dsh-settings-check print-src print-cflags build link-audit selftest codegen-audit doc-audit lint-size lint-size-all doc-cover macos macos-check ui-audit probe e2e e2e-config e2e-exec e2e-accept-nudge e2e-retry e2e-version e2e-config-flags e2e-title e2e-title-cmd e2e-title-auto e2e-mouse e2e-api e2e-steps e2e-permission e2e-sandbox e2e-tasks e2e-tasks-resume e2e-goal e2e-memory e2e-memory-live e2e-sessions e2e-resume-big e2e-diff e2e-ws e2e-model e2e-model-save e2e-model-route e2e-provider e2e-ctxwindow e2e-inputimage e2e-worktree e2e-watch e2e-watch-pick e2e-dsh e2e-portable e2e-proxy p30-check tui-demo tui-selftest web-selftest sess-selftest diff-selftest model-selftest panel-selftest clean shell-selftest pm-selftest mcp-selftest proxy-selftest notify-selftest windows win-check
 
 all: build
 
@@ -279,6 +280,71 @@ win-check:
 	if ! file $(WIN_OUT) | grep -q 'console'; then \
 		echo "win-check: 不是控制台子系统"; file $(WIN_OUT); exit 1; fi; \
 	echo "win-check: 通过（PE32+ x86-64 控制台程序）"
+
+# ---- macOS 交叉编译（`make macos`）----
+# 在 Linux 宿主上用 zig cc 造出能在 **x86_64 macOS** 上跑的 Mach-O。与 windows 那路
+# 的差别：
+# ① Darwin 没有静态 libc，`-static` 不可用 → 这条 recipe 直接给 LDFLAGS=""（不跟
+#    STATIC 变量走），产物动态链接 /usr/lib/libSystem.B.dylib；
+# ② 生成物有三处要后处理 —— Mach-O 符号下划线前缀、u64 常量拆半的有符号左移 UB、
+#    Darwin SDK 与生成物同名 tag（timeval / sigaction …）撞车 + ELF 弱引用钩子在
+#    Mach-O 上变成 undefined symbol。三者都收在 testdata/macos/zig-darwin-cc.sh 里、
+#    随每次 cc 调用生效，所以这里不必像 windows 那样另开「生成 → 修 → 单 TU 编译」三段
+#    流水线；
+# ③ 关掉 UBSan：zig cc（clang）在 -O0 给 C 代码插 `-fsanitize=undefined`，Linux 这边
+#    的 GCC -O0 不插。于是同一份有 UB 的 codegen 产物在 macOS 上会**运行期 abort**
+#    （实测 readdir 返回的 dirent 指针在 Darwin 上只有 4 字节对齐，成员访问直接 panic）。
+#    宿主档位是 -O0 调试构建，这里对齐 Linux：显式 -fno-sanitize=undefined。
+# ④ `-target` 必须是 `x86_64-macos`：zig 0.16 的 target query 不认
+#    `x86_64-apple-darwin`（报 UnknownOperatingSystem）。
+# ⑤ 主线程栈要 64 MB（`-Wl,-stack_size`）：自测里还有几处 MB 级的按值对象
+#    （`struct EmuGrid` 的 100000 格 emu 屏 ≈ 2.8 MB/个，一轮里同时活着的叠起来
+#    就过 8 MB）。Linux 侧同款门槛 —— 默认 `ulimit -s 8192` 跑 web/tui 组是
+#    `rc=139`，开发机一直是 `ulimit -s 65536`。macOS 主线程栈被 dyld 固定在 8 MB
+#    且 `ulimit -s` 改不动它，所以只能链接时声明：LC_MAIN.stacksize = 0x4000000。
+#    （`struct WebTable` 那 22 MB 已改为堆上分配，见 src/web/websrv.uya。）
+# 单独一个缓存目录：与 Linux 的 build/uyacache 混用会让增量 make 拿错平台的 .o。
+MACOS_OUT     := build/macos/uya-agent
+MACOS_CC      := $(CURDIR)/testdata/macos/zig-darwin-cc.sh
+MACOS_CACHE   := $(CURDIR)/build/macos/uyacache
+MACOS_TRIPLE  ?= x86_64-macos
+MACOS_CFLAGS  := $(AGENT_CFLAGS) -fno-sanitize=undefined
+MACOS_STACK   := 0x4000000
+MACOS_LDFLAGS := -Wl,-stack_size,$(MACOS_STACK)
+
+macos:
+	@mkdir -p build/macos
+	@CFLAGS="$(MACOS_CFLAGS)" LDFLAGS="$(MACOS_LDFLAGS)" UYA_SPLIT_C_DIR="$(MACOS_CACHE)" \
+		HOST_OS=macos TARGET_OS=macos HOST_ARCH=x86_64 TARGET_ARCH=x86_64 \
+		TARGET_TRIPLE="$(MACOS_TRIPLE)" ZIG="$(ZIG)" \
+		CC_DRIVER="$(MACOS_CC)" \
+		$(UYA) build $(SRC) -o $(MACOS_OUT) > build/macos/build.log 2>&1 \
+		|| { echo "macos: 构建失败（日志 build/macos/build.log）："; \
+			grep -E 'error:' build/macos/build.log | head -20; exit 1; }
+	@echo "macos: 产物 $(MACOS_OUT)"
+	@ls -l $(MACOS_OUT)
+	@file $(MACOS_OUT)
+
+# macOS 产物的**形状**判据（不需要 macOS 机器）：Mach-O 64 位 x86_64 可执行文件、
+# 且只依赖 libSystem —— Darwin 的动态链接是规矩，不是缺陷（那边没有 libc.a 可静链）；
+# 再加上 LC_MAIN.stacksize ≥ 64 MB：这条挡的是「-Wl,-stack_size 没传下去」——
+# 少了它产物照样能起，只是自测跑到 web/tui 组就 SIGSEGV，和在 Linux 上忘了
+# `ulimit -s 65536` 一模一样，而那种崩法在 macOS 上不留 crash report（见
+# testdata/macos/README.md §5）。
+# 真机行为（TUI 渲染 / 按键 / 自检）在 dockur/macos 的 macOS 15 客户机里验，
+# 见 testdata/macos/README.md。
+macos-check:
+	@if [ ! -f $(MACOS_OUT) ]; then echo "macos-check: 先 make macos"; exit 1; fi; \
+	if ! file $(MACOS_OUT) | grep -q 'Mach-O 64-bit x86_64'; then \
+		echo "macos-check: 不是 Mach-O 64 位 x86_64"; \
+		file $(MACOS_OUT); exit 1; fi; \
+	if ! file $(MACOS_OUT) | grep -q 'executable'; then \
+		echo "macos-check: 不是可执行文件"; file $(MACOS_OUT); exit 1; fi; \
+	if ! strings $(MACOS_OUT) | grep -q '/usr/lib/libSystem\.B\.dylib'; then \
+		echo "macos-check: 没有链接 libSystem"; exit 1; fi; \
+	if ! python3 testdata/macos/macho_stack.py $(MACOS_OUT) $(MACOS_STACK); then \
+		echo "macos-check: 主线程栈没到 $(MACOS_STACK)"; exit 1; fi; \
+	echo "macos-check: 通过（Mach-O 64 位 x86_64，链接 libSystem，栈 $(MACOS_STACK)）"
 
 # 静态链接审计：产物必须**没有** PT_INTERP、没有 NEEDED 项。两条都走 readelf 的
 # 结构性 token（`INTERP` / `(NEEDED)`），不解析本机化后的散文（中文环境下 readelf
