@@ -382,7 +382,8 @@ UYA_AGENT_DSH_WEB_EVENTS=/tmp/ev.ndjson uya-agent --no-dsh-config --dsh-web
   —— 想用某个目录里的模型就必须**不给** `--no-dsh-config`。
 
 **没有 API 凭据时**页面照常能开、消息也进会话，只是请求发不出去（启动时 stderr 会
-警告一句，子进程的诊断在 `child.log` 里）。
+警告一句，点名 `UYA_AGENT_API_KEY` / `DEEPSEEK_API_KEY` / `OPENAI_API_KEY` 与 `--api-key`
+并指向 `uya-agent -h`，子进程的诊断在 `child.log` 里）。
 
 页面本身仍然正常 —— 这是 P80 第二十二批修掉的那条：从前零事件源时会因为快照
 `records[]` 多一个逗号而整帧被客户端拒掉，页面红字「加载会话历史失败」+ 每 3 秒重连；
@@ -746,6 +747,16 @@ leaf 指纹怎么算、指纹库放哪儿 —— 见 [DESIGN.md §18](DESIGN.md)
 `uya-agent` / `default` 标签）—— 这是「配置到底生效了没有」唯一可证的出口。
 `--dsh-home` / `--dsh-root` / `--no-dsh-config` / `--strict-dsh-config` 在**读设置之前**预扫，
 所以它们不会被设置覆盖；`--no-dsh-config` 时 `uya-agent:` 那一节（连同模型目录）**都不读**。
+
+**一个都没配**（DSH 设置没读到、环境变量也没给）时不会只说一句「没有凭据」就退：stderr 上
+先照旧印 `error: no API key. set UYA_AGENT_API_KEY / DEEPSEEK_API_KEY / OPENAI_API_KEY`
+（这一行字面固定，脚本在 grep 它），紧跟一段提示 —— 先交代 DSH 设置**查到哪儿了**
+（`没读到（找的是 <home>/.dsh）` / `按 --no-dsh-config 没读` / `已读到 … 但里面没解析出凭据`），
+再给三条可粘贴的配方：环境变量一条（`UYA_AGENT_API_KEY` + `UYA_AGENT_BASE_URL` +
+`UYA_AGENT_MODEL`，也认 `<cwd>/.env`）、复用 DSH 一条（`DSH_HOME` / `--dsh-home` 指到放
+`.credentials.yaml` / `.env` 的目录）、临时一条（`--api-key sk-...`），末尾指向 `-h` 与
+`--print-config`。同一份文案三个入口共用（一次性任务 / `--no-tui` 滚动模式 / 全屏 TUI）；
+`--strict-dsh-config` 读不到设置时另有一段，明说它找的是哪个 `<dsh-home>/settings.yaml`。
 
 ---
 

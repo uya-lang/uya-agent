@@ -178,6 +178,20 @@ Uya 是「目录即模块」，但本仓实测：**跨目录是合并命名空�
 dsh-settings / default）。`--permission` 非法取值必须**报错退出**，理由同源：静默按默认跑会让
 人以为模式生效了（而默认是**全权**）。
 
+**一个都没配时说什么**（`agent_no_key_hint()`，`src/agent/agent.uya`）：三个要发请求的入口
+（一次性 `agent_run` / 滚动 `agent_run_interactive` / 全屏 `agent_run_tui`）在「没有凭据」这一支
+共用**同一段**提示，然后一律 `AGENT_USAGE` 退出 —— 一处改了三处一起变，不会出现「TUI 讲了怎么
+配、一次性任务不讲」。第一行固定是
+`error: no API key. set UYA_AGENT_API_KEY / DEEPSEEK_API_KEY / OPENAI_API_KEY`（脚本在 grep 它，
+**字面不许改**），后面才是 `hint:` 段：先按 `cfg` 回报 DSH 设置**查到哪儿了** ——
+`没读到（找的是 <home>/.dsh）` / 按 `--no-dsh-config` `没读` / `已读到 … 但里面没解析出凭据`
+（这条区分很要紧：前两条该去配新来源，第三条该去补 `apiKeyEnv` 指的变量或 `.credentials.yaml`），
+再给三条可粘贴的配方（环境变量 / 复用 DSH 设置 / `--api-key` 临时），末尾指向 `-h` 与
+`--print-config`。`--strict-dsh-config` 读不到设置时另有 `agent_strict_dsh_hint()`，明说找的是
+**哪个** `<dsh-home>/settings.yaml`（只说「读不到设置」的话，人多半不知道自己被 `$DSH_HOME` 或
+`$HOME` 带到了哪儿）。回归：`make e2e-config-flags` 尾巴四腿（错行字面 / 目录点名 / 可粘贴配方
+/ `--strict-dsh-config` 指名）。
+
 ### 3.2 启动阶段序列
 
 ```
@@ -188,6 +202,7 @@ main()                                    src/agent/agent.uya:9884
  │            --dry-run / --selftest / --probe / --tui-demo / --help
  ├─ agent_models_ensure() → agent_effort_recheck()   模型目录（P37）
  ├─ 形态选择
+ │   ├─ 没有 API 凭据 → agent_no_key_hint() → AGENT_USAGE（三条入口共用）
  │   ├─ 有任务词 → run_once() → agent_run(cfg)          一次性
  │   ├─ 无任务词 → agent_run_tui(cfg)                    全屏 TUI
  │   │             └─ 终端 < 32×8 或启动失败 → agent_run_interactive(cfg)  滚动模式
