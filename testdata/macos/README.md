@@ -310,8 +310,27 @@ x86_64 产物。
 
 也就是说：**arm64 上 TUI 的 40 轮（含 12 条真 PTY 腿）与整个 GOAL 组都绿**，
 唯一红的那条正是 x86_64 上也踩过的 `tui-paste`（§4.1 那个 readdir ABI 的邻居：
-一条测试把目录遍历、pty、粘贴、会话日志四件事串在一起，任一环不对都红。`tui-paste` 的证据链现在会打 fd 2（`paste-log: nmsg/…`、
-`paste-child: status=…`），下一轮就能看出是「粘贴没进 TUI」还是「子进程崩了」。
+一条测试把目录遍历、pty、粘贴、会话日志四件事串在一起，任一环不对都红）。
+
+同一个 run 里 `macos-15-intel`（x86_64 真机）那台**全绿**：`--help`、GOAL 4 轮、
+TUI 41 轮、全量收集，一步步都是 success —— 这是除 dockur/macos 之外第二份 x86_64
+真机证据，而且别人也能一键重跑。
+
+`tui-paste` 在 arm64 上的诊断（证据改成走 fd 2 之后才拿到的）：
+
+```
+paste-log: nmsg=0 body=0 len=0 path=(none)   三级目录一个都没找着
+paste-child: status=9                        子进程还活着（9 = 被我们 SIGKILL）
+selftest[tui-paste] FAIL: 真 PTY：会话日志里没有那条三行合一的 user 消息
+```
+
+屏幕上的断言都过了（粘贴没被当回车提交、回车之后有用户条目），只有「按
+`<home>/sessions/<cwd>/<session>/session.jsonl` 三级目录找日志」这条断在这里 ——
+连第一级 `sessions/` 都没取到条目 ⇒ 嫌疑落在 `opendir`/`readdir` 那条路上
+（`tui_paste_first_dir` 读的是 `Dirent.d_name`）。下一轮该查的就是这件事：macOS 的
+`readdir` 在 arm64 上很可能**没有** pre-10.5 那套旧 ABI（arm64 是后来的平台，
+Apple 的 stub 里也许只留 `readdir$INODE64`）；若如此，`Dirent` 要按 **arch** 再
+分一次叉（x86_64 旧 ABI / arm64 INODE64）。
 
 ### 6.2 为什么**本机**跑不了 arm64 真机（真机验证走 §7 的 CI）
 
