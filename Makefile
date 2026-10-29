@@ -60,18 +60,14 @@ UYA      ?= ./uya/bin/uya
 # 构建重试器：随仓的编译器偶尔把 split-C 的某个 .c 写坏（见脚本头注释），
 # 撞上那种形状就删掉坏文件重跑，最多 3 次。CI 上是必现的，本地偶发。
 UYA_RETRY ?= $(CURDIR)/scripts/uya_build_retry.sh
-# 前端并行度（`uya build --jobs N`）：**默认 1（串行）**。
+# 前端并行度（`uya build --jobs N`）：**默认不传**，按编译器的默认值走（CPU 数）。
 #
-# 为什么默认串行：编译器的默认值是「CPU 数（上限 32）」，而**并行前端**在 CI 那种
-# 4 vCPU 的 runner 上会间歇性产出坏掉的 split-C —— 同一个 `.c` 尾巴上留着上一版
-# 的内容（症状：报错行号超出文件实际行数、`extraneous closing brace`、
-# `redefinition … with a different type`）。开发机（32 worker）从来没撞上，CI 上
-# run #6/#9/#10/#11 反复撞上，两个环境的差别就在 worker 数。串行的代价很小：
-# 本机 `-O0` 实测 45 s → 52 s（+15%）。
-#
-# 想要快就把并行打开：`make build UYA_JOBS=32` / `make macos UYA_JOBS=8`。
-# 那属于「已知会偶发产出坏文件」的档位，撞上了靠 UYA_RETRY 兜。
-UYA_JOBS ?= 1
+# 曾经把它默认成 1 试过「串行能不能绕开坏文件」——**结论是不能**（run #12 用
+# `--jobs 1` 照样坏在 `src/session/dshfile.c`）。所以这里不硬改编译器行为，原因
+# 见 testdata/macos/README.md §7「坏文件」那一段。
+# 需要临时串行/限速时：`make build UYA_JOBS=1`。
+UYA_JOBS ?=
+UYA_JOBS_ARG := $(if $(UYA_JOBS),--jobs $(UYA_JOBS))
 
 STATIC ?= 1
 ifeq ($(STATIC),1)
@@ -211,7 +207,7 @@ build:
 	@mkdir -p build
 	CFLAGS="$(AGENT_CFLAGS)" LDFLAGS="$(AGENT_LDFLAGS)" \
 		$(UYA_RETRY) "$(CURDIR)/build/uyacache" build/build.log 4 -- \
-		$(UYA) build --jobs $(UYA_JOBS) $(SRC) -o $(OUT)
+		$(UYA) build $(UYA_JOBS_ARG) $(SRC) -o $(OUT)
 ifeq ($(STATIC),1)
 	@$(MAKE) --no-print-directory link-audit
 endif
@@ -353,7 +349,7 @@ macos:
 		TARGET_TRIPLE="$(MACOS_TRIPLE)" ZIG="$(ZIG)" \
 		CC_DRIVER="$(MACOS_CC)" \
 		$(UYA_RETRY) "$(MACOS_CACHE)" build/macos/build-$(MACOS_ARCH).log 6 -- \
-		$(UYA) build --jobs $(UYA_JOBS) $(SRC) -o $(MACOS_OUT) \
+		$(UYA) build $(UYA_JOBS_ARG) $(SRC) -o $(MACOS_OUT) \
 		|| { echo "macos: 构建失败（日志 build/macos/build-$(MACOS_ARCH).log）："; \
 			grep -E 'error:' build/macos/build-$(MACOS_ARCH).log | head -20; exit 1; }
 	@echo "macos: 产物 $(MACOS_OUT)（$(MACOS_ARCH)）"

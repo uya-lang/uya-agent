@@ -102,6 +102,16 @@ while [ "$n" -le "$tries" ]; do
             bytes=$(wc -c < "$p")
             echo "  - $p（$lines 行 / $bytes 字节，末尾 2 行：）" >&2
             tail -2 "$p" | sed -e 's/^/      /' >&2
+            # 编译器报的第一条错在哪一行？把那行前后 3 行也贴出来 —— 「坏在中间」
+            # （少了半句、多了半句）和「坏在尾巴」看这几行就能分开。
+            eln=$(grep -oE "^$f:[0-9]+" "$log" 2>/dev/null | head -1 | sed 's/.*://')
+            if [ -n "${eln:-}" ]; then
+                from=$((eln - 3))
+                [ "$from" -lt 1 ] && from=1
+                echo "      报错在 $eln 行附近（前后 3 行）：" >&2
+                sed -n "${from},$((eln + 3))p" "$p" | cut -c1-110 \
+                    | sed -e 's/^/        | /' >&2
+            fi
         else
             echo "  - $p（文件不在：编译时它可能已经被删了）" >&2
         fi
