@@ -429,7 +429,8 @@ Apple Silicon（arm64）真机，`macos-13` 是 Intel（x86_64）。
   `<文件>.c:<行>:<列>: error:`、或「生成的 `.c` 末尾没有换行」，就清掉缓存重来
   （最多 4 次），并把第 1 次的失败日志留成 `<日志>.first`。**不是**吞错误 ——
   别的形状照旧原样退出。
-  **它不是根治**。证据攒够之后，坏文件的形状指向一个具体嫌疑：
+  **根治的做法：前端改串行**（`UYA_JOBS ?= 1`，见下）。证据先把范围收窄到了
+  「并行前端」：
   * 报错的行号总是**超出**文件的实际行数（`ag_workspace_model.c:1938` vs 本地 1937
     行、`tasks.c:1236` 而本地更短），且内容是 `extraneous closing brace`、
     `redefinition of 'g_tasks_ms' with a different type`、`unknown type name 'line'`
@@ -437,12 +438,25 @@ Apple Silicon（arm64）真机，`macos-13` 是 Intel（x86_64）。
   * 同一份源码在开发机上生成的同名文件完全正常，重试时**换一个全新的缓存目录**也
     可能好、也可能照旧坏（run #9 连 4 次都坏在同一个文件）。
 
-  三项合起来最像「同一个 `.c` 在一次构建里被写了不止一遍，后一遍更短却没有截断，
-  旧尾巴留在文件里」。那段代码在编译器（`uya/bin/uya-real`，v0.10.4 预编译）里，
-  本仓改不动 ⇒ 只能清缓存重试（macOS 档给到 6 次）。**根治**要么给编译器侧的写盘
-  加 `O_TRUNC`/`ftruncate`，要么换一版编译器。
+  开发机（`--jobs` 默认 = CPU 数 = 32）从来没撞上，CI 的 4 vCPU runner（默认 4）
+  反复撞上 —— 两个环境**唯一的差别就是前端 worker 数**。而 `uya build --help` 里
+  写着「`--jobs <N>` 前端进程级并行度（默认 CPU 数，上限 32；1=全串行）」，
+  并行前端正是「分片 → 合并/违规回退」那条路（`c99_parallel_body_*`）。
+
+  所以 `Makefile` 把 **`UYA_JOBS` 默认改成 1（串行）**：那条路一步都不走，坏文件从
+  源头不再产生。代价很小 —— 本机 `-O0` 实测 `make build` 45 s → 52 s（+15%），
+  `make macos` 47 s。想要快可以显式打开：`make build UYA_JOBS=32`（那就回到「已知
+  会偶发写坏文件」的档位，靠 `UYA_RETRY` 兜）。
+
+  还没做完的那一半：并行前端的这个 bug 本身还在编译器里（`uya/bin/uya-real`，
+  v0.10.4 预编译，源码不在本仓；工作区里只有 v0.11-dev 的树，它用的新语法收不了，
+  现成的 v0.11 编译器又配不上随仓的 v0.10.4 标准库）。要彻底修得拿 v0.10.4 的源码：
+  在 `c99_parallel_body_finish` 的「违规回退 + 串行重做」那条路上查重复发射
+  （`redefinition` 这种症状很像 body 被追加了两次），或者给分片合并加退出状态检查。
+  有了源码这条路就能自证：CI 现在有注解 + commit comment 两条公开日志通道。
+
   顺带一句：同样的形状也在 `ci.yml` 的 `构建` 上出现过 —— 那条红在我这轮改动之前
-  就有，`make build` 现在也走同一个重试器。
+  就有，`make build` 现在也走同一条串行路径。
 
 怎么触发：推到 `main`、开 PR（改了上面那几个路径），或在 Actions 页面手动
 `Run workflow`（`workflow_dispatch`）。
