@@ -88,6 +88,10 @@ while [ "$n" -le "$tries" ]; do
         exit "$rc"
     fi
     echo "uya_build_retry: 第 $n 次尝试失败，坏文件（顺手把证据留在日志里）：" >&2
+    # 现场快照：磁盘/内存/文件大小能一眼分开「写了一半」（字节数偏小、末尾缺换行）
+    # 与「尾巴是旧内容」（字节数正常偏大、行号超出）。CI 上只靠注解也能看到。
+    echo "  现场：$(df -h . 2>/dev/null | tail -1 | tr -s ' ')" >&2
+    echo "  内存：$(free -m 2>/dev/null | sed -n 2p | tr -s ' ')" >&2
     for f in $bad; do
         case "$f" in
         /*) p=$f ;;
@@ -95,7 +99,8 @@ while [ "$n" -le "$tries" ]; do
         esac
         if [ -f "$p" ]; then
             lines=$(wc -l < "$p")
-            echo "  - $p（$lines 行，末尾 2 行：）" >&2
+            bytes=$(wc -c < "$p")
+            echo "  - $p（$lines 行 / $bytes 字节，末尾 2 行：）" >&2
             tail -2 "$p" | sed -e 's/^/      /' >&2
         else
             echo "  - $p（文件不在：编译时它可能已经被删了）" >&2
