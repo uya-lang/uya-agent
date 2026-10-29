@@ -340,7 +340,7 @@ macos:
 		HOST_OS=macos TARGET_OS=macos HOST_ARCH=$(MACOS_ARCH) TARGET_ARCH=$(MACOS_ARCH) \
 		TARGET_TRIPLE="$(MACOS_TRIPLE)" ZIG="$(ZIG)" \
 		CC_DRIVER="$(MACOS_CC)" \
-		$(UYA_RETRY) "$(MACOS_CACHE)" build/macos/build-$(MACOS_ARCH).log 4 -- \
+		$(UYA_RETRY) "$(MACOS_CACHE)" build/macos/build-$(MACOS_ARCH).log 6 -- \
 		$(UYA) build $(SRC) -o $(MACOS_OUT) \
 		|| { echo "macos: 构建失败（日志 build/macos/build-$(MACOS_ARCH).log）："; \
 			grep -E 'error:' build/macos/build-$(MACOS_ARCH).log | head -20; exit 1; }
