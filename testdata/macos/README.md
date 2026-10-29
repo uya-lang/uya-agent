@@ -252,7 +252,7 @@ thread 4253 panic: left shift of 3421674724 by 32 places cannot be represented
 
 ### 6.1 能验到哪一步
 
-宿主是 Linux x86_64 时，arm64 只到「造得出来 + 形状对」：
+**本机（Linux x86_64 宿主）**只到「造得出来 + 形状对」：
 
 ```bash
 make macos-arm64     # = make macos macos-check MACOS_ARCH=arm64
@@ -268,6 +268,8 @@ build/macos/uya-agent-arm64: Mach-O 64-bit arm64 executable,
 macho_stack: 通过（LC_MAIN.stacksize = 0x4000000（64.0 MB），门槛 0x4000000）
 macos-check: 通过（Mach-O 64 位 arm64，libSystem，栈 0x4000000）
 ```
+
+真机自测已经由 §7 的 GitHub `macos-14` runner 补上了（见 §6.1.1）。
 
 默认档同时回归过：`make macos && make macos-check` 仍绿（33,725,194 B，
 x86_64）。两档共用一份 recipe，arch 只由 `MACOS_ARCH` 决定。
@@ -295,7 +297,23 @@ rm -f build/macos/uyacache-arm64/src/tools/search.c \
 `MACOS_ARCH` 传别的值直接 `$(error)` 拦下，免得拼错一个字母就静默出一份
 x86_64 产物。
 
-### 6.2 为什么这台机器跑不了 arm64 真机
+### 6.1.1 arm64 真机第一次跑出来的数（GitHub `macos-14`，M1）
+
+§7 的 workflow 跑通之后，arm64 这一档第一次有了真机自测证据（run #7 / #8）：
+
+| 项 | 结果 |
+|---|---|
+| `--help`（中文帮助） | 退出码 0 |
+| GOAL 组（4 轮） | `SELFTEST GOAL PASS`、退出码 0 |
+| TUI 组（41 轮） | 40 绿、**1 红**：`tui-paste`「真 PTY：会话日志里没有那条三行合一的 user 消息」 |
+| 全量（150 轮） | 没跑到（TUI 组红在前面，Jobs 顺序是 GOAL → TUI → 全量） |
+
+也就是说：**arm64 上 TUI 的 40 轮（含 12 条真 PTY 腿）与整个 GOAL 组都绿**，
+唯一红的那条正是 x86_64 上也踩过的 `tui-paste`（§4.1 那个 readdir ABI 的邻居：
+一条测试把目录遍历、pty、粘贴、会话日志四件事串在一起，任一环不对都红。`tui-paste` 的证据链现在会打 fd 2（`paste-log: nmsg/…`、
+`paste-child: status=…`），下一轮就能看出是「粘贴没进 TUI」还是「子进程崩了」。
+
+### 6.2 为什么**本机**跑不了 arm64 真机（真机验证走 §7 的 CI）
 
 * dockur/macos 在 **x86_64 Linux 宿主**上走 QEMU + KVM，客户机只能是 x86_64 的
   macOS；本篇 §3/§4 那台就是。
@@ -351,7 +369,7 @@ Apple Silicon（arm64）真机，`macos-13` 是 Intel（x86_64）。
 | job | 跑在 | 干什么 | 挡不挡合并 |
 |---|---|---|---|
 | `build` | `ubuntu-latest` | `make macos` + `make macos MACOS_ARCH=arm64` + 两档 `macos-check`，产物传 artifact | 挡 |
-| `test`（x86_64） | `macos-13` | `--help`、GOAL 组、TUI 组各跑一遍；全量只收集 | 观察项 |
+| `test`（x86_64） | `macos-15-intel` | `--help`、GOAL 组、TUI 组各跑一遍；全量只收集 | 观察项 |
 | `test`（arm64） | `macos-14` | 同上，二进制换 `uya-agent-arm64` | 观察项 |
 
 几个非显然的决定：
@@ -365,8 +383,10 @@ Apple Silicon（arm64）真机，`macos-13` 是 Intel（x86_64）。
 * **版本必须钉 0.16.0**：本机 PATH 上的 `zig` 是 0.17.0-dev，`make macos` 直接
   构建失败 —— 这不是 CI 特有毛病，是「换 zig 版本 = 换一套 C 前端」，见 Makefile
   注释 ④。
-* **`macos-13` 随时会退役**：它只是把 §4 那份 x86_64 证据变成「别人也能重跑」。
-  镜像没了就删掉那一行矩阵项，别为它改判据。
+* **Intel 档换过镜像**：原来写 `macos-13`，但 run #5–#8 里它**排了半小时没分到
+  runner**（同一时刻 `macos-14` 8 秒就分到了）—— macOS 13 那批确实在退役，
+  改成 Intel 的接班镜像 `macos-15-intel`。它同样只是把 §4 那份 x86_64 证据变成
+  「别人也能重跑」；要是也排不上，就删掉那一行矩阵项，别为它改判据。
 * **arm64 需要代码签名**：Apple Silicon 上 arm64 进程必须有签名，未签名的会被
   `Killed: 9`。实测 zig 的链接器已经打了 **ad-hoc 签名**
   （`LC_CODE_SIGNATURE` 在、`codesign -dv` 报 `Signature=adhoc`），再加上 artifact
@@ -383,11 +403,17 @@ Apple Silicon（arm64）真机，`macos-13` 是 Intel（x86_64）。
   配额 —— 所以这个 workflow 用 `paths:` 收窄到 `src/`、`uya/`、`Makefile`、
   `testdata/macos/`，改文档不触发。
 * **构建会自己重试**（`scripts/uya_build_retry.sh`）：随仓的预编译编译器偶尔把
-  split-C 的某个 `.c` 写坏，CI 上稳定复现（run #3 的注解就是它：
-  `src/diff/model.c:819:10: error: expected ')'`，而同一份源码在开发机上生成的
-  同名文件只有 799 行）。`make build` / `make macos` 都改成经这条脚本调用：认出
-  `<文件>.c:<行>:<列>: error:` 这种形状就清掉缓存重来（最多 3 次），并把第 1 次
-  的失败日志留成 `<日志>.first`。**不是**吞错误 —— 别的形状照旧原样退出。
+  split-C 的某个 `.c` 写坏 —— 症状是编译期报一屏「行号/列号离谱」的语法错，例如
+  `src/diff/model.c:819:10: error: expected ')'`（同一份源码在开发机上生成的同名
+  文件只有 799 行）、`src/agent/ag_workspace_model.c:1938:13: error: unknown type
+  name 'line'`。`make build` / `make macos` 都经这条脚本调用：认出
+  `<文件>.c:<行>:<列>: error:`、或「生成的 `.c` 末尾没有换行」，就清掉缓存重来
+  （最多 4 次），并把第 1 次的失败日志留成 `<日志>.first`。**不是**吞错误 ——
+  别的形状照旧原样退出。
+  **它不是根治**：run #9 那回 4 次尝试都坏在同一个文件上（`ag_workspace_model.c`），
+  说明那个 runner 上是确定性复现的。真正的修复在编译器（`uya/bin/uya-real` 的
+  split-C 写盘），本仓只能绕着走。顺带一句：同样的形状也在 `ci.yml` 的 `构建`
+  上出现过 —— 那条红在我这轮改动之前就有。
 
 怎么触发：推到 `main`、开 PR（改了上面那几个路径），或在 Actions 页面手动
 `Run workflow`（`workflow_dispatch`）。
