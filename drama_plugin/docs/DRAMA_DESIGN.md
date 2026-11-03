@@ -1960,10 +1960,15 @@ L3 用 Mock provider（不真跑 GPU）：它验的是状态与调度，不是�
    `initialize` / `notifications/initialized` / `tools/list` / `tools/call`、
    未知方法回 `-32601`、stdout 不被日志污染、EOF/断管退出。
    （可参照 Uya 已写过的 MCP server 先例来搭骨架。）
-2. **HTTP 客户端**：stdlib **没有** HTTP 客户端（`std/http` 全是 server 侧；
-   `lib/tls/https.uya` 只有 `https_client_handshake`）。请求构造、响应解析、
-   重定向、超时、连接复用、分块/SSE 都要自己写——量级可参照宿主里那份
-   2000 行级的客户端。**这是 P5 的前置条件，不是边角料。**
+2. **HTTPS 客户端：有，但证书校验没做完（1.3 按实测修正）。**
+   `lib/tls/https.uya` 导出 `https_get` / `https_get_insecure` /
+   `https_get_with_config`，返回 `HttpsResponse{status, response_len,
+   response[]}`；`std/net/dns.uya` 能做 A 记录解析。实测：
+   `https_get_insecure("example.com", 443, "/")` **握手完成、status 200**；
+   默认配置（`verify_server_cert=true`）在 "Handshake not done
+   (peer not verified)" 处失败。
+   ⇒ 结论从"从零写 HTTP+TLS"改为"**补证书校验 + 上层封装**"；在补齐之前，
+   带 API Key 的远程调用不能用 insecure 模式，只能走本机网关或明文 HTTP。
 3. **非 ASCII 的 JSON 往返**：中文是否原样输出/是否 `\u` 转义、超长中文串的
    编码缓冲边界。
 4. **本地队列 Provider 的实际契约**：本机生成服务的提交/查历史/取文件接口、

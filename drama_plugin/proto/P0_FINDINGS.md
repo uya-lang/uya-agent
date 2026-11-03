@@ -194,6 +194,39 @@ grep -rn 'fsync\|fdatasync' uya/stdlib/lib --include=*.uya   # 无输出
 提交**。这条写进 DESIGN §8.2 与部署文档；selftest 用「杀进程」验证恢复，
 不假装能验证掉电。若将来不能接受，再单独做 syscall 包装原型（不改架构）。
 
+### 1.10 HTTPS 客户端：有，但证书校验没做完（1.3 修正一条定论）
+
+**怎么验的**：写一个 `.uya`（不是 `.ush`）直接调 stdlib 的 HTTPS 客户端，
+目标是 `example.com:443`，用 stderr 打状态码。
+
+**验出什么**：
+
+- `lib/tls/https.uya` **确实导出客户端**：`https_get`、`https_get_insecure`、
+  `https_get_with_config`，返回 `HttpsResponse{status, response_len,
+  response[]}`；`std/net/dns.uya` 负责域名解析（走 `/etc/resolv.conf`）。
+- `https_get_insecure(...)`：DNS → TCP → ClientHello → 服务器 flight →
+  ClientFinished → **握手完成，status 200**（真拿到了 example.com）。
+- `https_get(...)`（默认 `verify_server_cert=true`）：握手走到最后一步报
+  `[TLS] Handshake not done (peer not verified)`，**失败**。
+
+**结论修正**：评审与 v1.2/v1.3 前稿写的「stdlib 没有 HTTP 客户端」**过强**。
+准确说法是「有 HTTPS 客户端，**证书校验未实现**」。工作量随之从
+"从零写 HTTP+TLS（参照宿主 2318 行）"降为"补证书校验 + 上层封装"。
+
+**风险不变**：不能拿 insecure 模式去调带 API Key 的远程服务（等于裸奔）。
+可选路线：① 补 x509 校验（`lib/tls/x509/verify.uya` 已有骨架）；
+② 走本机网关（明文 HTTP，仅本机回环）；③ 只在受控网络里显式降级并记账。
+
+### 1.11 工具链的两个坑（实测）
+
+1. **`uya check` 不报未定义函数**：`const x: i32 = totally_missing_fn(1);`
+   —— `check` 通过，`build` 到 C 链接阶段才炸（`ld returned 1 exit status`）。
+   所以 CI 里只跑 `make check` 会漏；本仓 `make build` 才是真闸门。
+   （P0 最早就是这么被坑的：`dns_client_init_default` 根本不存在，`check` 却绿。）
+2. **`--strict-overflow` 连"取十进制位"都不放过**：`(x - (x/10)*10) + 48`
+   必须写成饱和运算，否则编译失败（本仓 `examples/mcp-plugins/wordcount.ush`
+   现在就因此编不过）。
+
 ### 2.2 宿主的 env 与权限事实（源码级复核，1.3 修正了一条错判）
 
 **env 白名单**（`src/plugin/mcprun.uya:159-180`）：子进程只继承
@@ -254,7 +287,8 @@ read-only 与 workspace-write 都为真，两者取或 ⇒ 这两种模式都是
 
 | 项 | 卡住谁 | 备注 |
 |---|---|---|
-| HTTP 后半：TLS / DNS / 重定向 / 分块 / SSE / 复用 | P5 | 明文 GET 已通（§1.6） |
+| 证书校验（HTTPS 默认配置） | P5 | 客户端在、校验缺（§1.10）；DNS 已可用 |
+| 重定向 / 分块 / SSE / 连接复用 | P5 | 明文 GET 已通（§1.6） |
 | JSON 嵌套 256 上限 | P3/P5 | 大 Bible/大纲是否触顶未知 |
 | 目录扫描与摘要读回 | P3/P13 | 已验收（§1.7）；正式实现用 sha256 |
 | Worker 中断/重启 | P4 | 已验收（§1.9）；真实 Worker 还要接任务锁与 Provider 轮询 |
@@ -272,6 +306,7 @@ read-only 与 workspace-write 都为真，两者取或 ⇒ 这两种模式都是
 | `proto/http_client.ush` | 明文 HTTP GET + 超时 | `proto/http_selftest.sh` |
 | `proto/scan.ush` | 目录枚举 + 摘要 | `proto/scan_selftest.sh` |
 | `proto/worker.ush` | Worker 检查点续跑（journal 追加写） | `proto/worker_selftest.sh` |
+| `proto/https_probe.uya` | HTTPS 双模式探针 | `proto/https_probe_selftest.sh` |
 | `proto/LOCAL_QUEUE_CONTRACT.md` | 本地队列实测契约（读侧） | 现场采集，样本在文档里 |
 
 两个脚本都是**可重跑**的：`sh drama_plugin/proto/selftest.sh`、

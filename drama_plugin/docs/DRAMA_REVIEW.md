@@ -536,3 +536,25 @@ v1.3 据此新增，不在 §A–§E 的 24 条之内：
 v1.3 不推翻 v1.2 的架构判断：提交记录 / 幂等任务 / Worker 分离 /
 只读产线适配全部保留，新增内容是"把连续性变成机器判定"和"把规模变成
 可测算"。
+
+---
+
+## I. 勘误（P0 原型阶段实测推翻的评审结论）
+
+评审里这几条当时是"读码 + grep"得出的，P0 上手后实测推翻了，如实记下：
+
+1. **「stdlib 没有 HTTP 客户端」→ 有，但证书校验没做完。**
+   `lib/tls/https.uya` 导出 `https_get` / `https_get_insecure` /
+   `https_get_with_config`，`std/net/dns.uya` 能解析域名；默认配置握手报
+   `peer not verified`，insecure 模式实测 `example.com` 返回 200。
+   证据：`proto/https_probe.uya`、`proto/https_probe_selftest.sh`。
+2. **「read-only 下 MCP 工具一律拒绝」→ 是逐次批准。**
+   `perm_requires_approval() || perm_confine()`：read-only 与
+   workspace-write 都要用户逐次点头，无回答渠道时 fail closed。
+   证据：`src/plugin/mcp.uya`、`src/tools/perm.uya`。
+3. **「帧格式/超时」等当时标"未实测"的项 → 已实测闭环。**
+   单行紧凑、超 1 MiB 整行丢弃、3 s 超时预算生效。
+   证据：`proto/selftest.sh`、`proto/http_selftest.sh`。
+
+结论不变的部分：`fsync` 确实没有；`uya check` 不能当唯一闸门（不报未定义
+函数，链接才炸）；单卡串行的产能基线成立。

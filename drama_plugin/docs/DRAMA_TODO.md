@@ -57,7 +57,7 @@
    非 ASCII JSON 往返。
 4. P2 的 `request_id` 改为可选，幂等键 = `(operation, input_hash)`。
 5. P3 增加 `format_version` 与迁移任务；存储布局补 `locks/`、`idempotency/`。
-6. P5 增加「LLM 传输层」任务组（stdlib 没有 HTTP 客户端）。
+6. P5 增加「LLM 传输层」任务组（stdlib 有 HTTPS 客户端但证书校验未完成）。
 7. P7 补接戏字段（`anchor_prev`/`cut_type`/`transition_line`/时间轴/片尾卡）
    与 provider 能力表校验。
 8. P10 删「配音替换」，补编码/响度口径。
@@ -69,9 +69,12 @@
 - `[!]` **没有 `fsync`**：stdlib 全树没有 `fsync`/`fdatasync` 包装。提交只能
   保证「不出现半个文件 + 崩溃后可重建」，**掉电可能丢最后一次提交**。
   替代方案写在 DESIGN §8.2；若不能接受，先做「自写 syscall 包装」的原型。
-- `[!]` **stdlib 没有 HTTP 客户端**（`std/http` 只有 server 侧，
-  `lib/tls/https.uya` 只有握手）。P5 的 LLM 调用依赖它，必须先有传输层任务，
-  否则 P5 会卡住。
+- `[!]` **HTTPS 客户端有，但证书校验没做完**（1.3 实测修正）：`lib/tls/https.uya`
+  导出 `https_get`/`https_get_insecure`，`std/net/dns.uya` 能解析域名；
+  insecure 模式实测 `example.com` 返回 200，默认配置（要校验证书）在
+  "Handshake not done (peer not verified)" 处失败。
+  ⇒ P5 的远程 LLM 调用要么补证书校验，要么走本机网关；**不许**默认用
+  insecure 调带 API Key 的服务。
 - `[!]` **没有随仓 sqlite 驱动**（`std/sql` 只有 Driver/Conn 接口）。
   存储只能走「不可变提交记录 + 原子 rename」的文件方案（DESIGN §8）。
 
@@ -157,9 +160,11 @@ JSON 上限/非 ASCII → env/密钥注入 → 资产可见性。
 - [x] **Uya 写 stdio MCP Server 的最小闭环**：单行紧凑 JSON 读写、四个基础
       方法、未知方法回 `-32601`、EOF/断管退出、stdout 零污染。
       （`proto/mcp_stdio.ush`，`sh proto/selftest.sh` 全绿）
-- [-] **HTTP 传输层**（阻塞 P5）：明文 HTTP 已跑通（建连/请求构造/
-      响应解析/状态行/404/连接拒绝/3 s 超时预算，见 `proto/http_client.ush`）；
-      仍缺 TLS、域名解析、重定向、分块、SSE、连接复用。
+- [-] **HTTP 传输层**（阻塞 P5）：
+      明文 HTTP 已跑通（建连/请求/响应/状态行/404/拒绝/3 s 预算，
+      `proto/http_client.ush`）；HTTPS 侧实测 `https_get_insecure` 可用
+      （200）、默认配置因证书校验未完成而握手失败；DNS 可用
+      （`std/net/dns.uya`）。仍缺：证书校验、重定向、分块、SSE、连接复用。
 - [x] **非 ASCII JSON 往返**：实测中文**原样透传**（UTF-8 字节，不转义）；
       缓冲边界仍按码点算长度。
 - [-] **本地队列 Provider 契约**：读侧已实测（`/prompt` 队列深度、
@@ -1023,7 +1028,7 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 | 风险 | 影响 | 缓解方式 | 阶段 |
 |---|---|---|---|
 | 无 fsync（已核验） | 掉电可能丢最后一次提交 | 明确写入已知限制；只保证"不留半个文件" | P0/P4 |
-| stdlib 无 HTTP 客户端（已核验） | P5 的 LLM 调用无法落地 | P0 先做传输层原型，再排 P5 | P0/P5 |
+| HTTPS 客户端证书校验未完成（实测） | 只能 insecure 调外部服务 = 泄 Key | 补校验或走本机网关 | P0/P5 |
 | MCP Host 与规范能力不一致 | 插件无法连接 | 只依赖已核验的四方法 + `-32601` 约定 | P0/P1 |
 | 协议帧写错（多行/超 1 MiB） | 宿主整条丢弃，工具全部失效 | 单行紧凑输出的自测判据 | P1 |
 | `call` 超过 60 s | 宿主超时，任务状态不明 | 一律先落盘再返回 `queued` | P1/P8 |
