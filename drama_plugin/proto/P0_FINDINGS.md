@@ -3,7 +3,7 @@
 - 文档编号：DRAMA-P0-001
 - 对应设计：DRAMA-DESIGN-001 v1.3
 - 对应任务：DRAMA-TODO-001 v1.3 §2.2（仍需实测）
-- 状态：进行中（B1/B2/B3/B5-前半 已过验收；B4 已定案；B6 部分；B7 部分）
+- 状态：进行中（B1/B2/B3/B5-前半/目录枚举 已过验收；B4 已定案；B6/B7 部分）
 
 每条结论只写三样东西：**怎么验的、验出什么、对设计的影响**。
 没有跑过的项标「待实测」，不用推测填。
@@ -112,6 +112,31 @@ sh drama_plugin/proto/http_selftest.sh
 证书校验/SNI 要自己接）、域名解析（现在只接受 IP）、重定向、
 分块传输、SSE/流式、连接复用。这些是 P5 之前必须补的，别被"能 GET 了"骗过去。
 
+### 1.7 目录枚举与文件摘要 —— 已验收
+
+**怎么验的**：`drama_plugin/proto/scan.ush` + `proto/scan_selftest.sh`
+（自己造目录、造 1000 个空文件、造空文件与一字之差的文件）。
+
+```bash
+sh drama_plugin/proto/scan_selftest.sh
+# PASS: 目录枚举 + 摘要（百集索引前置能力）
+```
+
+**验出什么**：
+
+- `sys_getdents64` 在 Uya 里可用；Linux 记录布局是
+  `d_ino(8) d_off(8) d_reclen(2) d_type(1) name…`，按 `d_reclen` 逐条走，
+  跳过 `.`/`..`，空目录返回 `COUNT 0` 不报错；
+- 文件摘要可复现：同内容同摘要、一字之差不同摘要、空文件等于
+  FNV-1a 64 的偏移基值 `cbf29ce484222325`（实现正确的硬证据）；
+- **1000 个文件一轮枚举，整轮墙钟 3 s（含 uya 编译）**
+  ⇒ DESIGN §8.7 担心的"扫全树会慢"在 1000 量级上不成立，
+  索引的价值主要在"避免每次提交都全量扫"，而不是"扫不动"。
+
+**对设计的影响**：§8.7 的索引仍是必要的（4500–6000 文件 × 每次提交），
+但判据可以更硬：单次 `list`/`continuity.inspect` < 200 ms 靠索引，
+而不是靠"文件少"。
+
 ---
 
 ## 2. 已出结论、不必再试
@@ -164,7 +189,7 @@ grep -rn 'fsync\|fdatasync' uya/stdlib/lib --include=*.uya   # 无输出
 |---|---|---|
 | HTTP 后半：TLS / DNS / 重定向 / 分块 / SSE / 复用 | P5 | 明文 GET 已通（§1.6） |
 | JSON 嵌套 256 上限 | P3/P5 | 大 Bible/大纲是否触顶未知 |
-| 目录扫描与摘要读回 | P3/P13 | 百集索引方案要用 |
+| 目录扫描与摘要读回 | P3/P13 | 已验收（§1.7）；正式实现用 sha256 |
 | Worker 中断/重启 | P4 | 注意上面第 5 条 |
 | env/密钥注入、权限模式 | P11 | 需一次真实 `uya-agent` 会话 |
 | 资产共享目录可见性 | P3/P10 | 数据根目录必须显式配置 |
@@ -178,6 +203,7 @@ grep -rn 'fsync\|fdatasync' uya/stdlib/lib --include=*.uya   # 无输出
 | `proto/mcp_stdio.ush` | 三工具 stdio MCP server（list/describe/call） | `proto/selftest.sh` |
 | `proto/txn.ush` | 原子写 + 锁 + 陈旧锁 + 崩溃注入 | `proto/txn_selftest.sh` |
 | `proto/http_client.ush` | 明文 HTTP GET（建连/请求/响应/超时） | `proto/http_selftest.sh` |
+| `proto/scan.ush` | 目录枚举 + 文件摘要（getdents64 / FNV-1a） | `proto/scan_selftest.sh` |
 
 两个脚本都是**可重跑**的：`sh drama_plugin/proto/selftest.sh`、
 `sh drama_plugin/proto/txn_selftest.sh`，失败即 exit 1。

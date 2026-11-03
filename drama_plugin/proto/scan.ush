@@ -1,0 +1,284 @@
+// drama_plugin/proto/scan.ush
+//
+// P0 原型：目录枚举 + 文件摘要读回（百集索引方案的前置能力）。
+//
+// 为什么需要它：DESIGN §8.7 决定百集走"派生索引"，但索引要能从盘上重建，
+// 所以必须证明「枚举一个目录」和「读一个文件并算摘要」在 Uya 里能做完，
+// 且成本可测（百集约 4500–6000 个文件）。
+//
+// stdin 命令：
+//   ls <dir>      枚举目录，逐条打印 NAME <entry>，最后 COUNT <n>
+//   sum <path>    读文件算 FNV-1a 64 摘要，打印 SIZE <n> / SUM <hex>
+//   q             退出
+//
+// 说明：这里用 FNV-1a 只是为了"能比较、可复现"，不是安全哈希；
+// 正式实现要走 std 里的 sha256（不依赖网络也跑得动）。
+
+use libc.syscall;
+use libc.unistd;
+use libc.heap;
+
+const LINE_MAX: usize = 1024;
+const DIRBUF: usize = 32768;
+const READBUF: usize = 65536;
+
+const O_RDONLY: i32 = 0;
+const O_DIRECTORY: i32 = 65536;
+
+fn slen(p: &const byte) usize {
+    var i: usize = 0;
+    while p[i] != 0 as byte {
+        i = i + 1;
+    }
+    return i;
+}
+
+fn say(p: &const byte) void {
+    _ = sys_write(1, p, slen(p)) catch { 0 as isize; };
+}
+
+fn write_all(fd: i32, p: &const byte, n: usize) bool {
+    var off: usize = 0;
+    while off < n {
+        const w: isize = sys_write(fd, &p[off], n - off) catch { -1 as isize; };
+        if w <= 0 {
+            return false;
+        }
+        off = off + (w as usize);
+    }
+    return true;
+}
+
+fn put_byte_fd(fd: i32, c: byte) void {
+    var one: [byte: 1] = [c];
+    _ = write_all(fd, &one[0], 1);
+}
+
+fn say_num(prefix: &const byte, v: i64) void {
+    say(prefix);
+    var tmp: [byte: 24] = [0: 24];
+    var n: usize = 0;
+    var x: i64 = v;
+    if x < 0 {
+        say("-" as &const byte);
+        x = 0 -| x;
+    }
+    while x > 0 {
+        const t10: i64 = (x / 10) *| 10;
+        const rem: i64 = x -| t10;
+        tmp[n] = (rem +| 48) as! byte catch { 48 as byte; };
+        n = n + 1;
+        x = x / 10;
+    }
+    if n == 0 {
+        say("0" as &const byte);
+    }
+    while n > 0 {
+        n = n - 1;
+        put_byte_fd(1, tmp[n]);
+    }
+    say("\n" as &const byte);
+}
+
+fn say_hex64(v: u64) void {
+    const hexd: &const byte = "0123456789abcdef" as &const byte;
+    var i: i32 = 15;
+    while i >= 0 {
+        const sh: i32 = i * 4;
+        const nib: u64 = (v >> sh) & (15 as u64);
+        put_byte_fd(1, hexd[nib as! usize catch { 0 as usize; }]);
+        i = i - 1;
+    }
+    say("\n" as &const byte);
+}
+
+fn read_line(buf: &byte, cap: usize) usize {
+    var i: usize = 0;
+    while true {
+        var c: [byte: 1] = [0: 1];
+        const n: isize = sys_read(0, &c[0], 1) catch { 0 as isize; };
+        if n <= 0 {
+            return i;
+        }
+        if c[0] == 10 as byte {
+            return i;
+        }
+        if i < cap {
+            buf[i] = c[0];
+            i = i + 1;
+        }
+    }
+}
+
+fn starts_with(line: &const byte, n: usize, want: &const byte) bool {
+    const wl: usize = slen(want);
+    if n < wl {
+        return false;
+    }
+    var i: usize = 0;
+    while i < wl {
+        if line[i] != want[i] {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn copy_span(line: &const byte, n: usize, at: usize, ln: usize, out: &[byte]) bool {
+    if at + ln > n || ln + 1 > out.len {
+        return false;
+    }
+    var i: usize = 0;
+    while i < ln {
+        out[i] = line[at + i];
+        i = i + 1;
+    }
+    out[ln] = 0 as byte;
+    return true;
+}
+
+fn arg_rest(line: &const byte, n: usize, cmdlen: usize, at: &usize, ln: &usize) bool {
+    var i: usize = cmdlen;
+    while i < n && line[i] == 32 as byte {
+        i = i + 1;
+    }
+    if i >= n {
+        return false;
+    }
+    at[0] = i;
+    ln[0] = n - i;
+    return true;
+}
+
+// getdents64 的 Linux 记录布局：d_ino(8) d_off(8) d_reclen(2) d_type(1) name…
+fn entry_reclen(buf: &byte, i: usize) usize {
+    const lo: usize = buf[i + 16] as usize;
+    const hi: usize = buf[i + 17] as usize;
+    // 用乘法代替位移：`<<` 的右操作数必须是 i32，`|` 又要求两边同型，
+    // 在两个 usize 上拼字节反而更啰嗦（且易错），这里直接算。
+    return lo + hi * 256;
+}
+
+fn ls(dir: &const byte) i32 {
+    const fd: i32 = sys_open(dir, O_RDONLY | O_DIRECTORY, 0) catch { -1 as i32; };
+    if fd < 0 {
+        say("ERR opendir\n" as &const byte);
+        return 1;
+    }
+    defer { _ = sys_close(fd) catch { 0 as i32; }; }
+    var buf: &byte = malloc(DIRBUF) as &byte;
+    defer { free(buf as &void); }
+    if (buf as usize) == 0 {
+        return 1;
+    }
+    var count: i64 = 0;
+    while true {
+        const got: isize = sys_getdents64(fd, buf as *void, DIRBUF) catch { -1 as isize; };
+        if got <= 0 {
+            break;
+        }
+        var i: usize = 0;
+        const total: usize = got as! usize catch { 0 as usize; };
+        while i + 19 <= total {
+            const reclen: usize = entry_reclen(buf, i);
+            if reclen < 19 || i + reclen > total {
+                break;
+            }
+            var nl: usize = 0;
+            while i + 19 + nl < i + reclen && buf[i + 19 + nl] != 0 as byte {
+                nl = nl + 1;
+            }
+            const name_start: usize = i + 19;
+            const is_dot: bool = nl == 1 && buf[name_start] == 46 as byte;
+            const is_dotdot: bool = nl == 2 && buf[name_start] == 46 as byte
+                && buf[name_start + 1] == 46 as byte;
+            if !is_dot && !is_dotdot {
+                say("NAME " as &const byte);
+                _ = write_all(1, &buf[name_start], nl);
+                say("\n" as &const byte);
+                count = count + 1;
+            }
+            i = i + reclen;
+        }
+    }
+    say_num("COUNT " as &const byte, count);
+    return 0;
+}
+
+fn sum_file(path: &const byte) i32 {
+    const fd: i32 = sys_open(path, O_RDONLY, 0) catch { -1 as i32; };
+    if fd < 0 {
+        say("ERR open\n" as &const byte);
+        return 1;
+    }
+    defer { _ = sys_close(fd) catch { 0 as i32; }; }
+    var buf: &byte = malloc(READBUF) as &byte;
+    defer { free(buf as &void); }
+    if (buf as usize) == 0 {
+        return 1;
+    }
+    var h: u64 = 14695981039346656037;
+    var size: i64 = 0;
+    while true {
+        const got: isize = sys_read(fd, buf, READBUF) catch { -1 as isize; };
+        if got <= 0 {
+            break;
+        }
+        const total: usize = got as! usize catch { 0 as usize; };
+        var i: usize = 0;
+        while i < total {
+            const b: u64 = buf[i] as u64;
+            const x: u64 = h ^ b;
+            const m: u64 = 1099511628211;
+            h = x *% m;
+            i = i + 1;
+        }
+        size = size +| (total as i64);
+    }
+    say_num("SIZE " as &const byte, size);
+    say("SUM " as &const byte);
+    say_hex64(h);
+    return 0;
+}
+
+export fn main() i32 {
+    var raw: &byte = malloc(LINE_MAX) as &byte;
+    defer { free(raw as &void); }
+    if (raw as usize) == 0 {
+        return 1;
+    }
+    var at: [usize: 1] = [0];
+    var ln: [usize: 1] = [0];
+    while true {
+        const n: usize = read_line(raw, LINE_MAX);
+        if n == 0 {
+            break;
+        }
+        const line: &const byte = raw as &const byte;
+        if starts_with(line, n, "q" as &const byte) {
+            break;
+        }
+        var pb: [byte: 512] = [0: 512];
+        if starts_with(line, n, "ls " as &const byte) {
+            if !arg_rest(line, n, 3, &at[0], &ln[0])
+                || !copy_span(line, n, at[0], ln[0], &pb[0: 512]) {
+                say("ERR usage: ls <dir>\n" as &const byte);
+                continue;
+            }
+            _ = ls(&pb[0]);
+            continue;
+        }
+        if starts_with(line, n, "sum " as &const byte) {
+            if !arg_rest(line, n, 4, &at[0], &ln[0])
+                || !copy_span(line, n, at[0], ln[0], &pb[0: 512]) {
+                say("ERR usage: sum <path>\n" as &const byte);
+                continue;
+            }
+            _ = sum_file(&pb[0]);
+            continue;
+        }
+        say("ERR unknown\n" as &const byte);
+    }
+    return 0;
+}

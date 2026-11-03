@@ -169,7 +169,9 @@ JSON 上限/非 ASCII → env/密钥注入 → 资产可见性。
 - [x] **陈旧锁处置**：`pid + kill(pid,0)` 探活实测可用，`kill -9` 后
       `STALE-RECOVERED`；锁文件损坏路径回 `LOCK_UNREADABLE`
       （`proto/txn_selftest.sh` 覆盖前两条）。
-- [ ] **目录扫描与文件校验**：`getdents64` 枚举 + 校验摘要读回。
+- [x] **目录扫描与文件校验**：`getdents64` 枚举 + 摘要读回实测通过；
+      1000 文件枚举整轮 3 s（含编译）。正式实现用 sha256。
+      （`proto/scan.ush`，`sh proto/scan_selftest.sh`）
 - [ ] **Worker 中断/重启行为**：杀进程后恢复，孤儿临时文件清理的宽限期。
       注意：`uya run` 会再起子进程，测试要按**进程组**杀，否则测的是假崩溃
       （P0_FINDINGS §3 第 5 条）。
