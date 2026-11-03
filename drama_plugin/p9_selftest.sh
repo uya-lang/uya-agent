@@ -196,6 +196,42 @@ d=json.load(sys.stdin)
 assert d.get('code') == 'CANNOT_CANCEL', d
 print('PASS: 已完成的任务拒绝取消（CANNOT_CANCEL）')" || bad "已完成任务还能被取消"
 
+# ---------- 6. 预算熔断 ----------
+out=$(ask "$(cat <<JSON
+{"jsonrpc":"2.0","id":15,"method":"tools/call","params":{"name":"call","arguments":{"operation":"budget.limit","input":{"project_id":"$PID","max_renders":1,"max_gpu_minutes":0}}}}
+JSON
+)")
+printf '%s' "$out" | field | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+assert d['max_renders'] == 1, d
+print('PASS: 预算上限设置成功（最多 1 次渲染）')" || bad "budget.limit 没生效"
+
+# 这轮项目已经渲染过（p8 里跑过？这里至少 0 次），再产一集应当被熔断
+out=$(ask "$(cat <<JSON
+{"jsonrpc":"2.0","id":16,"method":"tools/call","params":{"name":"call","arguments":{"operation":"episode.approve","input":{"project_id":"$PID","script_version":1}}}}
+JSON
+)")
+out=$(ask "$(cat <<JSON
+{"jsonrpc":"2.0","id":17,"method":"tools/call","params":{"name":"call","arguments":{"operation":"episode.produce","input":{"project_id":"$PID","episode_id":"e10","stage":"video"}}}}
+JSON
+)")
+TID4=$(printf '%s' "$out" | field | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+print(d.get('task_id','ERR'))")
+timeout 120 "$TMP/drama" worker run --data-dir "$DATA" > /dev/null 2>&1 || true
+out=$(ask "$(cat <<JSON
+{"jsonrpc":"2.0","id":18,"method":"tools/call","params":{"name":"call","arguments":{"operation":"production.status","input":{"project_id":"$PID","task_id":"$TID4"}}}}
+JSON
+)")
+printf '%s' "$out" | field | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+assert d['state'] == 'failed' and d['reason'] == 'budget_exceeded', d
+print('PASS: 超预算的任务被熔断（budget_exceeded），没有硬跑')" \
+    || bad "预算熔断没生效"
+
 echo "----"
 if [ "$fails" -eq 0 ]; then
     echo "PASS: P9 第一段（确定性 QA / 生产状态 / 重试）"

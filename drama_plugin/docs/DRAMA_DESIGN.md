@@ -712,7 +712,7 @@ operation.dispatch
 ### 5.0 上表的实现对照（1.17）
 
 首版实现把上表**拆细**了：粒度更小、每个操作只做一件事，方便校验与重放。
-完整清单（40 个）在 `DRAMA_TODO.md` §16，唯一来源是 `src/registry.uya`。
+完整清单（42 个）在 `DRAMA_TODO.md` §16，唯一来源是 `src/registry.uya`。
 
 | 设计里的操作 | 实现成 |
 |---|---|
@@ -723,7 +723,7 @@ operation.dispatch
 | `episode.produce` | 同名（`stage=script\|video`），落盘建任务后立刻回 `queued` |
 | `episode.get` | 同名（汇总剧本/分镜/成片版本 + Canon + 任务数），
   细粒度读取另有 `task.get` / `task.list` / `storyboard.get` |
-| `episode.review` | `qa.run`（确定性体检）+ `canon.audit`（闭环审计） |
+| `episode.review` | 同名（QA + 九条不变量的合并审核，落 reviews/v<N>.json） |
 | `episode.approve` | 同名（剧本结构复核 → 候选事件提交 Canon） |
 | `episode.retry` | 同名（把失败任务重置成 queued） |
 | `production.status` | 同名 |

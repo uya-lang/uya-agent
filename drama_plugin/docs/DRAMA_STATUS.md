@@ -19,7 +19,7 @@
 | `p6_selftest.sh` | 连续三集 + 重放复现（M1 最小版） | 9 |
 | `p7_selftest.sh` | 分镜生成 / 版本 / 时长口径 | 19 |
 | `p8_selftest.sh` | Provider 能力表 / 视频任务 / Worker | 14 |
-| `p9_selftest.sh` | 确定性 QA / 生产状态 / 重试 / 取消 | 12 |
+| `p9_selftest.sh` | 确定性 QA / 生产状态 / 重试 / 取消 / 熔断 | 14 |
 | `p12_selftest.sh` | 闭环审计 + 九条不变量逐条判定 | 14 |
 | `p12b_selftest.sh` | 反例库六条 + 规则/回收率（DESIGN §13.5） | 12 |
 | `p10_selftest.sh` | 成片合成（mock 拼接 + manifest） | 11 |
@@ -85,7 +85,7 @@ for f in drama_plugin/p*_selftest.sh; do sh "$f" || echo "FAILED $f"; done
 | P10 | 第一段 | mock 拼接 + manifest；缺 FFmpeg 探测/转码/响度/字幕 |
 | P11 | 第一段 | 端到端一条龙已跑通；发布/打包未做 |
 | P12 | 大部分 | 四本账 + 重放 + 九条不变量（六条反例 + 规则/钩子/时序）；缺错误定位与增量检查 |
-| P13 | 第二段 | 10 集测算 + 成本账本 + 派生索引；配额熔断、百集压力未做 |
+| P13 | 第三段 | 成本账本 + 派生索引 + 项目级配额熔断；百集压力未做 |
 
 ## 4. 已知限制（别当成承诺）
 

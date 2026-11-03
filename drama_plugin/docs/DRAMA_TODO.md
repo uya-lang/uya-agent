@@ -1123,7 +1123,7 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 - [x] 任务级 cost：`renders` 与 `gpu_ms` 写进视频任务记录。
 - [x] 项目级累计账本（`budget.report`：集数/任务/渲染/GPU 时长/每集渲染数）；
       三类配额与熔断还没做。
-- [ ] 超限熔断：停止派发，不硬杀在跑任务。
+- [x] 超限熔断：超预算的任务直接判 failed(budget_exceeded)，不开工。
 - [x] 重做率指标（`renders_per_episode`，百分之一为单位；告警阈值未接）。
 - [x] `budget.report` 项目级汇总（按集会/阶段/provider 的细分留到接真实产线）。
 
@@ -1153,7 +1153,7 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 
 # 16. 操作目录与测试覆盖矩阵
 
-**已实现的 40 个操作**（`registry.uya` 是唯一来源；`describe` 就是从这张表
+**已实现的 42 个操作**（`registry.uya` 是唯一来源；`describe` 就是从这张表
 生成的）。"覆盖脚本"列是能跑到它的自测，空着表示只有间接覆盖。
 
 | 操作 | 阶段 | 权限 | 覆盖脚本 |
@@ -1161,6 +1161,8 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 | project.create | P3 | write | p3 / p5b / p11 |
 | project.get | P3 | read | p2 / p3 |
 | project.configure | P3 | write | p3 |
+| episode.review | P5 | write | p9 |
+| budget.limit | P13 | write | p9 |
 | project.list | P3 | read | p3 |
 | bible.put | P3 | write | p3b / p12b |
 | bible.get | P3 | read | p3b |
@@ -1204,7 +1206,7 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 | 操作 | 出处 | 缺口 |
 |---|---|---|
 
-| episode.review | P5 | 审核版本读取（现在用 qa.run 顶） |
+
 
 | series.plan / outline.approve | P5 | 百集大纲与批准 |
 
