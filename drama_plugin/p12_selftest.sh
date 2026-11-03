@@ -143,6 +143,25 @@ AFTER=$(md5sum "$DATA/projects/$PID/canon.json" | cut -d' ' -f1)
 [ "$BEFORE" = "$AFTER" ] && ok "审计是只读的（canon.json 未变）" \
     || bad "审计改了 canon.json"
 
+# ---------- 3.5 九条不变量逐条判定 ----------
+out=$(ask "$(cat <<JSON
+{"jsonrpc":"2.0","id":24,"method":"tools/call","params":{"name":"call","arguments":{"operation":"invariant.check","input":{"project_id":"$PID"}}}}
+JSON
+)")
+printf '%s' "$out" | field | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+preds=d['predicates']
+codes=[p['code'] for p in preds]
+expect=['PROMISE_OVERDUE','HOOK_UNANSWERED','CHARACTER_DRIFT','KNOWLEDGE_LEAK',
+        'PROP_TELEPORT','SCENE_DRIFT','ORPHAN_CHANGE','TIMELINE_CONFLICT',
+        'RULE_VIOLATION']
+assert codes == expect, codes
+bad=[p for p in preds if not p['ok']]
+assert all(p['code'] == 'PROMISE_OVERDUE' for p in bad), bad
+print('PASS: 九条不变量逐条判定（只有 PROMISE_OVERDUE 红）')" \
+    || bad "invariant.check 输出不对"
+
 # ---------- 4. 篡改提交记录 ⇒ 重放告警 ----------
 python3 - "$DATA/projects/$PID/commits/2.json" <<'PY'
 import json

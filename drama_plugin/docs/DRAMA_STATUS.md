@@ -19,8 +19,8 @@
 | `p6_selftest.sh` | 连续三集 + 重放复现（M1 最小版） | 9 |
 | `p7_selftest.sh` | 分镜生成 / 版本 / 时长口径 | 19 |
 | `p8_selftest.sh` | Provider 能力表 / 视频任务 / Worker | 14 |
-| `p9_selftest.sh` | 确定性 QA / 生产状态 / 重试 | 9 |
-| `p12_selftest.sh` | 闭环审计（四本账 / 不变量 / 重放） | 13 |
+| `p9_selftest.sh` | 确定性 QA / 生产状态 / 重试 / 取消 | 12 |
+| `p12_selftest.sh` | 闭环审计 + 九条不变量逐条判定 | 14 |
 | `p12b_selftest.sh` | 反例库六条 + 规则/回收率（DESIGN §13.5） | 12 |
 | `p10_selftest.sh` | 成片合成（mock 拼接 + manifest） | 11 |
 | `p11_selftest.sh` | 端到端一条龙（三集 → 成片 → 审计 → 成本账本） | 21 |

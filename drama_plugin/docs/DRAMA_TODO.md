@@ -849,7 +849,7 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 - [ ] 实现步骤检查点。
 - [ ] 实现 Provider 轮询。
 - [x] 实现中断恢复（步骤状态在记录里；失败任务可重跑）。
-- [ ] 实现取消处理。
+- [x] 实现取消处理（`production.cancel`：未完成可取消，worker 不再捡起）。
 - [ ] 实现有限重试。
 - [x] 实现任务状态查询。
 - [ ] 实现 Worker 不在线时的明确反馈。
@@ -1153,7 +1153,7 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 
 # 16. 操作目录与测试覆盖矩阵
 
-**已实现的 37 个操作**（`registry.uya` 是唯一来源；`describe` 就是从这张表
+**已实现的 39 个操作**（`registry.uya` 是唯一来源；`describe` 就是从这张表
 生成的）。"覆盖脚本"列是能跑到它的自测，空着表示只有间接覆盖。
 
 | 操作 | 阶段 | 权限 | 覆盖脚本 |
@@ -1195,6 +1195,8 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 | outline.approve | P5 | write | p5e |
 | series.get | P5 | read | p5e |
 | promise.report | P12 | read | p12b |
+| invariant.check | P12 | read | p12 |
+| production.cancel | P8 | write | p9 |
 
 **还没实现、但文档里承诺过的操作**（照实记着，别当已完成）：
 
@@ -1202,9 +1204,9 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 |---|---|---|
 | project.configure | P3 | 项目配置变更 |
 | episode.review | P5 | 审核版本读取（现在用 qa.run 顶） |
-| production.cancel | P8 | 取消在跑任务 |
+
 | series.plan / outline.approve | P5 | 百集大纲与批准 |
-| invariant.check | P12 | 九条谓词的单点检查（现在只有 `canon.audit`） |
+
 
 
 

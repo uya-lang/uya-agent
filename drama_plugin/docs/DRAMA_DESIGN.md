@@ -712,7 +712,7 @@ operation.dispatch
 ### 5.0 上表的实现对照（1.17）
 
 首版实现把上表**拆细**了：粒度更小、每个操作只做一件事，方便校验与重放。
-完整清单（37 个）在 `DRAMA_TODO.md` §16，唯一来源是 `src/registry.uya`。
+完整清单（39 个）在 `DRAMA_TODO.md` §16，唯一来源是 `src/registry.uya`。
 
 | 设计里的操作 | 实现成 |
 |---|---|
@@ -726,7 +726,7 @@ operation.dispatch
 | `episode.approve` | 同名（剧本结构复核 → 候选事件提交 Canon） |
 | `episode.retry` | 同名（把失败任务重置成 queued） |
 | `production.status` | 同名 |
-| `production.cancel` | 未实现（P8 未做） |
+| `production.cancel` | 同名（未完成可取消，已完成的拒绝） |
 | `continuity.inspect` | `canon.inspect`（当前状态）+ `canon.audit`（四本账/不变量/重放） |
 | `asset.get` | `asset.list`（元数据）；按名单查留到接真实产线 |
 

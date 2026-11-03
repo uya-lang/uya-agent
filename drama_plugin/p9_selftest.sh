@@ -157,6 +157,45 @@ CANON_AFTER=$(md5sum "$DATA/projects/$PID/canon.json" 2>/dev/null | cut -d' ' -f
 [ "$CANON_BEFORE" = "$CANON_AFTER" ] && ok "重试没有改动 Canon" \
     || bad "重试改了 Canon"
 
+# ---------- 5. 取消：没跑完可以取消，跑完的不能 ----------
+out=$(ask "$(cat <<JSON
+{"jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"call","arguments":{"operation":"episode.produce","input":{"project_id":"$PID","episode_id":"e9","stage":"script"}}}}
+JSON
+)")
+TID3=$(printf '%s' "$out" | field | python3 -c "
+import json,sys
+print(json.load(sys.stdin)['task_id'])")
+out=$(ask "$(cat <<JSON
+{"jsonrpc":"2.0","id":12,"method":"tools/call","params":{"name":"call","arguments":{"operation":"production.cancel","input":{"project_id":"$PID","task_id":"$TID3"}}}}
+JSON
+)")
+printf '%s' "$out" | field | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+assert d['state'] == 'cancelled', d
+print('PASS: 未完成的任务可以取消')" || bad "取消失败"
+
+timeout 120 "$TMP/drama" worker run --data-dir "$DATA" > /dev/null 2>&1 || true
+out=$(ask "$(cat <<JSON
+{"jsonrpc":"2.0","id":14,"method":"tools/call","params":{"name":"call","arguments":{"operation":"production.status","input":{"project_id":"$PID","task_id":"$TID3"}}}}
+JSON
+)")
+printf '%s' "$out" | field | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+assert d['state'] == 'cancelled', d
+print('PASS: worker 不会把已取消的任务再捡起来')" || bad "worker 重跑了已取消的任务"
+
+out=$(ask "$(cat <<JSON
+{"jsonrpc":"2.0","id":13,"method":"tools/call","params":{"name":"call","arguments":{"operation":"production.cancel","input":{"project_id":"$PID","task_id":"$TID"}}}}
+JSON
+)")
+printf '%s' "$out" | field | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+assert d.get('code') == 'CANNOT_CANCEL', d
+print('PASS: 已完成的任务拒绝取消（CANNOT_CANCEL）')" || bad "已完成任务还能被取消"
+
 echo "----"
 if [ "$fails" -eq 0 ]; then
     echo "PASS: P9 第一段（确定性 QA / 生产状态 / 重试）"
