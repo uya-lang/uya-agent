@@ -162,6 +162,33 @@ for m in fails:
     print('FAIL: ' + m)
 sys.exit(1 if fails else 0)
 PY
+# ---------- 3.5 project.configure ----------
+CID=$(ls "$DATA/projects" | grep '^p_' | head -1)
+printf '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"call","arguments":{"operation":"project.configure","input":{"project_id":"%s","name":"改名后的项目","episode_count":66}}}}\n' \
+    "$CID" > "$TMP/inC.jsonl"
+timeout 120 "$TMP/drama" mcp serve --data-dir "$DATA" \
+    < "$TMP/inC.jsonl" > "$TMP/outC.jsonl" 2>/dev/null || true
+if python3 - "$TMP/outC.jsonl" <<'PYEOF'
+import json
+import sys
+
+for line in open(sys.argv[1], 'rb').read().split(b'\n'):
+    if not line:
+        continue
+    o = json.loads(line)
+    d = json.loads(o['result']['content'][0]['text'])['data']['result']
+    assert d['name'] == '改名后的项目', d
+    assert d['episode_count'] == 66, d
+    assert d['config_version'] == 1, d
+    sys.exit(0)
+sys.exit(1)
+PYEOF
+then
+    ok "project.configure 改名/改集数，config_version 递增"
+else
+    bad "project.configure 没生效"
+fi
+
 # ---------- 4. 不认识的 format_version ⇒ 只读故障态 ----------
 BADID=$(ls "$DATA/projects" | grep '^p_' | head -1)
 printf '%s' '{"format_version":99,"id":"x","name":"future","episode_count":0}' \

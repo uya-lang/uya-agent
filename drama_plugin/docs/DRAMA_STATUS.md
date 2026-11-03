@@ -9,7 +9,7 @@
 |---|---|---|
 | `p1_selftest.sh` | CLI 三模式 + stdio MCP 协议 + 宿主连接 | 9 |
 | `p2_selftest.sh` | Registry / Schema / Dispatch / 幂等 | 36 |
-| `p3_selftest.sh` | Project + 基础存储（原子写、重启、路径穿越） | 24 |
+| `p3_selftest.sh` | Project + 基础存储（原子写、重启、路径穿越、configure） | 25 |
 | `p3b_selftest.sh` | Bible 版本 + 冻结文本 hash + Asset | 22 |
 | `p4_selftest.sh` | Canon 提交 / 四轴不变量 / 锁 / 崩溃恢复 | 18 |
 | `p5_selftest.sh` | LLM 传输层 + Adapter（本机上游） | 11 |

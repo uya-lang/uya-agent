@@ -712,11 +712,12 @@ operation.dispatch
 ### 5.0 上表的实现对照（1.17）
 
 首版实现把上表**拆细**了：粒度更小、每个操作只做一件事，方便校验与重放。
-完整清单（39 个）在 `DRAMA_TODO.md` §16，唯一来源是 `src/registry.uya`。
+完整清单（40 个）在 `DRAMA_TODO.md` §16，唯一来源是 `src/registry.uya`。
 
 | 设计里的操作 | 实现成 |
 |---|---|
-| `project.create` / `project.get` | 同名，另有 `project.list` |
+| `project.create` / `project.get` | 同名，另有 `project.list` 与
+  `project.configure`（改名/改集数，config_version 递增） |
 | `project.configure` | `bible.put` / `bible.get` / `bible.history`（Bible 版本化）
   加 `asset.register` / `asset.list` |
 | `episode.produce` | 同名（`stage=script\|video`），落盘建任务后立刻回 `queued` |

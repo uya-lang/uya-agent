@@ -1153,13 +1153,14 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 
 # 16. 操作目录与测试覆盖矩阵
 
-**已实现的 39 个操作**（`registry.uya` 是唯一来源；`describe` 就是从这张表
+**已实现的 40 个操作**（`registry.uya` 是唯一来源；`describe` 就是从这张表
 生成的）。"覆盖脚本"列是能跑到它的自测，空着表示只有间接覆盖。
 
 | 操作 | 阶段 | 权限 | 覆盖脚本 |
 |---|---|---|---|
 | project.create | P3 | write | p3 / p5b / p11 |
 | project.get | P3 | read | p2 / p3 |
+| project.configure | P3 | write | p3 |
 | project.list | P3 | read | p3 |
 | bible.put | P3 | write | p3b / p12b |
 | bible.get | P3 | read | p3b |
@@ -1202,7 +1203,7 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 
 | 操作 | 出处 | 缺口 |
 |---|---|---|
-| project.configure | P3 | 项目配置变更 |
+
 | episode.review | P5 | 审核版本读取（现在用 qa.run 顶） |
 
 | series.plan / outline.approve | P5 | 百集大纲与批准 |
