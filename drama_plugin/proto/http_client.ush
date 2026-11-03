@@ -1,0 +1,339 @@
+// drama_plugin/proto/http_client.ush
+//
+// P0 原型 B5（前半）：Uya 侧 HTTP 客户端 —— 建连、发请求、收响应、
+// 解析状态行、按总预算超时。
+//
+// 为什么只做前半：stdlib 里 **没有 HTTP 客户端**（std/http 全是 server 侧，
+// lib/tls/https.uya 只有握手原语），所以客户端每一层都要自己写。
+// 本原型证明"普通 HTTP 这条链能打通"，TLS 与分块/SSE 仍未做（见 P0_FINDINGS）。
+//
+// stdin 命令：
+//   get <port> <path>     向 127.0.0.1:<port> 发 GET，打印 STATUS/BODY
+//   timeout <port>        连一个不回包的端口，验证预算到点会放弃
+//   q                     退出
+//
+// 输出（每条一行，便于脚本断言）：
+//   STATUS <code>         状态行里的数字
+//   HEADERS <bytes>       header 段字节数
+//   BODY <bytes>          正文字节数
+//   ERR <原因>            连接/读失败
+//   TIMEOUT               超过总预算
+
+use libc.syscall;
+use libc.unistd;
+use libc.heap;
+
+const LINE_MAX: usize = 1024;
+const BUF_MAX: usize = 65536;
+const BUDGET_MS: i64 = 3000;
+
+fn slen(p: &const byte) usize {
+    var i: usize = 0;
+    while p[i] != 0 as byte {
+        i = i + 1;
+    }
+    return i;
+}
+
+fn say(p: &const byte) void {
+    _ = sys_write(1, p, slen(p)) catch { 0 as isize; };
+}
+
+fn write_all(fd: i32, p: &const byte, n: usize) bool {
+    var off: usize = 0;
+    while off < n {
+        const w: isize = sys_write(fd, &p[off], n - off) catch { -1 as isize; };
+        if w <= 0 {
+            return false;
+        }
+        off = off + (w as usize);
+    }
+    return true;
+}
+
+fn say_num(prefix: &const byte, v: i64) void {
+    say(prefix);
+    var tmp: [byte: 24] = [0: 24];
+    var n: usize = 0;
+    var x: i64 = v;
+    if x < 0 {
+        say("-" as &const byte);
+        x = 0 -| x;
+    }
+    while x > 0 {
+        const t10: i64 = (x / 10) *| 10;
+        const rem: i64 = x -| t10;
+        tmp[n] = (rem +| 48) as! byte catch { 48 as byte; };
+        n = n + 1;
+        x = x / 10;
+    }
+    if n == 0 {
+        say("0" as &const byte);
+    }
+    while n > 0 {
+        n = n - 1;
+        var one: [byte: 1] = [tmp[n]];
+        _ = write_all(1, &one[0], 1);
+    }
+    say("\n" as &const byte);
+}
+
+fn now_ms() i64 {
+    var t: TimeSpec = TimeSpec{ tv_sec: 0, tv_nsec: 0 };
+    const rc: i32 = sys_clock_gettime(1, &t) catch { -1 as i32; };
+    if rc < 0 {
+        return 0;
+    }
+    return (t.tv_sec *| 1000) +| (t.tv_nsec / 1000000);
+}
+
+fn sleep_ms(ms: i64) void {
+    var req: TimeSpec = TimeSpec{ tv_sec: 0, tv_nsec: 0 };
+    req.tv_sec = ms / 1000;
+    req.tv_nsec = (ms -| (req.tv_sec *| 1000)) *| 1000000;
+    var rem: TimeSpec = TimeSpec{ tv_sec: 0, tv_nsec: 0 };
+    _ = sys_nanosleep(&req, &rem) catch { 0 as i32; };
+}
+
+fn read_line(buf: &byte, cap: usize) usize {
+    var i: usize = 0;
+    while true {
+        var c: [byte: 1] = [0: 1];
+        const n: isize = sys_read(0, &c[0], 1) catch { 0 as isize; };
+        if n <= 0 {
+            return i;
+        }
+        if c[0] == 10 as byte {
+            return i;
+        }
+        if i < cap {
+            buf[i] = c[0];
+            i = i + 1;
+        }
+    }
+}
+
+fn parse_num(p: &const byte, n: usize) i64 {
+    var v: i64 = 0;
+    var digits: usize = 0;
+    var i: usize = 0;
+    while i < n {
+        const c: byte = p[i];
+        if c < 48 as byte || c > 57 as byte {
+            return -1;
+        }
+        const d: i64 = (c as i64) - 48;
+        v = (v *| 10) +| d;
+        digits = digits + 1;
+        i = i + 1;
+    }
+    if digits == 0 {
+        return -1;
+    }
+    return v;
+}
+
+fn starts_with(line: &const byte, n: usize, want: &const byte) bool {
+    const wl: usize = slen(want);
+    if n < wl {
+        return false;
+    }
+    var i: usize = 0;
+    while i < wl {
+        if line[i] != want[i] {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn arg_at(line: &const byte, n: usize, from: usize, at: &usize, ln: &usize) bool {
+    var i: usize = from;
+    while i < n && line[i] == 32 as byte {
+        i = i + 1;
+    }
+    const s: usize = i;
+    while i < n && line[i] != 32 as byte {
+        i = i + 1;
+    }
+    if i == s {
+        return false;
+    }
+    at[0] = s;
+    ln[0] = i - s;
+    return true;
+}
+
+// 带边界检查的片段拷贝（`&const byte` 直接动态下标会被 DEBUG 检查拒绝）。
+fn copy_span(line: &const byte, n: usize, at: usize, ln: usize, out: &[byte]) bool {
+    if at + ln > n || ln + 1 > out.len {
+        return false;
+    }
+    var i: usize = 0;
+    while i < ln {
+        out[i] = line[at + i];
+        i = i + 1;
+    }
+    out[ln] = 0 as byte;
+    return true;
+}
+
+// GET 一个本地端口；返回 0 成功、1 连接失败、2 超时、3 空响应
+fn http_get(port: i32, path: &const byte, pathlen: usize) i32 {
+    var addr: [byte: 16] = [0: 16];
+    addr[0] = 2 as byte;                             // AF_INET
+    addr[1] = 0 as byte;
+    addr[2] = ((port >> 8) & 255) as! byte catch { 0 as byte; };
+    addr[3] = (port & 255) as! byte catch { 0 as byte; };
+    addr[4] = 127 as byte;
+    addr[5] = 0 as byte;
+    addr[6] = 0 as byte;
+    addr[7] = 1 as byte;                             // 127.0.0.1
+
+    const fd: i32 = sys_socket(2, 1, 0) catch { -1 as i32; };
+    if fd < 0 {
+        say("ERR socket\n" as &const byte);
+        return 1;
+    }
+    defer { _ = sys_close(fd) catch { 0 as i32; }; }
+    const rc: i32 = sys_connect(fd, &addr[0] as *void, 16) catch { -1 as i32; };
+    if rc < 0 {
+        say("ERR connect\n" as &const byte);
+        return 1;
+    }
+
+    // 请求：HTTP/1.1 + Connection: close，省掉 chunked 与长连接处理
+    var req: [byte: 512] = [0: 512];
+    var rl: usize = 0;
+    const head: &const byte = "GET ";
+    var i: usize = 0;
+    while i < 4 {
+        req[rl] = head[i];
+        rl = rl + 1;
+        i = i + 1;
+    }
+    i = 0;
+    while i < pathlen && rl < 500 {
+        req[rl] = path[i];
+        rl = rl + 1;
+        i = i + 1;
+    }
+    const tail: &const byte = " HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n";
+    i = 0;
+    while i < 52 && rl < 512 {
+        req[rl] = tail[i];
+        rl = rl + 1;
+        i = i + 1;
+    }
+    if !write_all(fd, &req[0] as &const byte, rl) {
+        say("ERR send\n" as &const byte);
+        return 1;
+    }
+
+    // 收：非阻塞 + 总预算，避免 server 不回包时挂死
+    var buf: &byte = malloc(BUF_MAX) as &byte;
+    defer { free(buf as &void); }
+    if (buf as usize) == 0 {
+        return 1;
+    }
+    var total: usize = 0;
+    const t0: i64 = now_ms();
+    var open: bool = true;
+    while open && total < BUF_MAX {
+        const n: isize = sys_recv(fd, &buf[total], BUF_MAX - total, 64) catch { -2 as isize; };
+        if n > 0 {
+            total = total + (n as usize);
+            continue;
+        }
+        if n == 0 {
+            open = false;
+            break;
+        }
+        if (now_ms() -| t0) > BUDGET_MS {
+            say_num("ELAPSED " as &const byte, now_ms() -| t0);
+            if total == 0 {
+                say("TIMEOUT\n" as &const byte);
+                return 2;
+            }
+            open = false;
+            break;
+        }
+        sleep_ms(5);
+    }
+    if total == 0 {
+        say("ERR empty\n" as &const byte);
+        return 3;
+    }
+
+    // 解析状态行：HTTP/1.x <code> ...
+    var code: i64 = -1;
+    if total > 12 {
+        code = parse_num(&buf[9], 3);
+    }
+    say_num("ELAPSED " as &const byte, now_ms() -| t0);
+    say_num("STATUS " as &const byte, code);
+    // header 段长度 = 第一个 "\r\n\r\n" 结束位置
+    var hend: usize = 0;
+    var k: usize = 0;
+    while k + 4 <= total {
+        if buf[k] == 13 as byte && buf[k + 1] == 10 as byte
+            && buf[k + 2] == 13 as byte && buf[k + 3] == 10 as byte {
+            hend = k + 4;
+            break;
+        }
+        k = k + 1;
+    }
+    say_num("HEADERS " as &const byte, hend as i64);
+    say_num("BODY " as &const byte, (total -| hend) as i64);
+    return 0;
+}
+
+export fn main() i32 {
+    var raw: &byte = malloc(LINE_MAX) as &byte;
+    defer { free(raw as &void); }
+    if (raw as usize) == 0 {
+        return 1;
+    }
+    while true {
+        const n: usize = read_line(raw, LINE_MAX);
+        if n == 0 {
+            break;
+        }
+        const line: &const byte = raw as &const byte;
+        if starts_with(line, n, "q" as &const byte) {
+            break;
+        }
+        var at: [usize: 1] = [0];
+        var ln: [usize: 1] = [0];
+        if starts_with(line, n, "get " as &const byte) {
+            if !arg_at(line, n, 4, &at[0], &ln[0]) {
+                say("ERR usage: get <port> <path>\n" as &const byte);
+                continue;
+            }
+            var pb: [byte: 64] = [0: 64];
+            if !copy_span(line, n, at[0], ln[0], &pb[0: 64]) {
+                say("ERR port too long\n" as &const byte);
+                continue;
+            }
+            const port64: i64 = parse_num(&pb[0], ln[0]);
+            if port64 <= 0 {
+                say("ERR port\n" as &const byte);
+                continue;
+            }
+            if !arg_at(line, n, at[0] + ln[0], &at[0], &ln[0]) {
+                say("ERR usage: get <port> <path>\n" as &const byte);
+                continue;
+            }
+            var pa: [byte: 256] = [0: 256];
+            if !copy_span(line, n, at[0], ln[0], &pa[0: 256]) {
+                say("ERR path too long\n" as &const byte);
+                continue;
+            }
+            _ = http_get(port64 as! i32 catch { 0 as i32; }, &pa[0], ln[0]);
+            continue;
+        }
+        say("ERR unknown\n" as &const byte);
+    }
+    return 0;
+}

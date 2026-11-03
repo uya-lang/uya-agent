@@ -157,8 +157,9 @@ JSON 上限/非 ASCII → env/密钥注入 → 资产可见性。
 - [x] **Uya 写 stdio MCP Server 的最小闭环**：单行紧凑 JSON 读写、四个基础
       方法、未知方法回 `-32601`、EOF/断管退出、stdout 零污染。
       （`proto/mcp_stdio.ush`，`sh proto/selftest.sh` 全绿）
-- [ ] **HTTP 传输层**（阻塞 P5）：连接、请求构造、响应解析、重定向、超时、
-      证书校验、连接复用；先跑通一次 HTTPS 的 JSON 请求-响应，再做 SSE/分块。
+- [-] **HTTP 传输层**（阻塞 P5）：明文 HTTP 已跑通（建连/请求构造/
+      响应解析/状态行/404/连接拒绝/3 s 超时预算，见 `proto/http_client.ush`）；
+      仍缺 TLS、域名解析、重定向、分块、SSE、连接复用。
 - [x] **非 ASCII JSON 往返**：实测中文**原样透传**（UTF-8 字节，不转义）；
       缓冲边界仍按码点算长度。
 - [ ] **本地队列 Provider 契约**：提交、查历史、取文件；队列满与重启清空

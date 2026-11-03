@@ -3,7 +3,7 @@
 - 文档编号：DRAMA-P0-001
 - 对应设计：DRAMA-DESIGN-001 v1.3
 - 对应任务：DRAMA-TODO-001 v1.3 §2.2（仍需实测）
-- 状态：进行中（B1/B2/B3 已过验收，B4 已出结论，B5/B6/B8 待做）
+- 状态：进行中（B1/B2/B3/B5-前半 已过验收；B4 已定案；B6 部分；B7 部分）
 
 每条结论只写三样东西：**怎么验的、验出什么、对设计的影响**。
 没有跑过的项标「待实测」，不用推测填。
@@ -87,6 +87,31 @@ sh drama_plugin/proto/txn_selftest.sh
 没有被转义成 `\uXXXX`。对设计的影响：不必担心「中文被转义后长度翻 6 倍」，
 但仍要按**码点**而不是字节算文本长度（DESIGN §16.3 的口径不变）。
 
+### 1.6 B5（前半）：HTTP 客户端 —— 已验收
+
+**怎么验的**：`drama_plugin/proto/http_client.ush` + `proto/http_selftest.sh`，
+自己起一个 `python3 -m http.server` 和一个「只 accept 不回包」的黑洞端口。
+
+```bash
+sh drama_plugin/proto/http_selftest.sh
+# PASS: B5（HTTP GET / 状态行 / header 边界 / 404 / 拒绝 / 超时）
+```
+
+**验出什么**：
+
+- `sys_socket` / `sys_connect` / `sys_send` / `sys_recv` 在 Uya 里可用，
+  IPv4 字面量地址直接构 `sockaddr_in` 即可；
+- 请求头自己拼（`HTTP/1.1` + `Connection: close`），响应按
+  `\r\n\r\n` 切 header/body，状态行取第 9–11 字节；
+- 404 如实返回状态码，不抛异常；
+- 连接被拒 → `ERR connect`，不挂死；
+- **超时预算真的生效**：客户端自报 `ELAPSED 3002`（预算 3000 ms），
+  而不是靠外层 `timeout` 收尸。
+
+**仍未做（同一项的后半）**：TLS（`lib/tls/https.uya` 只有握手原语，
+证书校验/SNI 要自己接）、域名解析（现在只接受 IP）、重定向、
+分块传输、SSE/流式、连接复用。这些是 P5 之前必须补的，别被"能 GET 了"骗过去。
+
 ---
 
 ## 2. 已出结论、不必再试
@@ -137,7 +162,7 @@ grep -rn 'fsync\|fdatasync' uya/stdlib/lib --include=*.uya   # 无输出
 
 | 项 | 卡住谁 | 备注 |
 |---|---|---|
-| HTTP/HTTPS 传输层 | P5 | stdlib 无客户端；先跑通一次 JSON 请求-响应 |
+| HTTP 后半：TLS / DNS / 重定向 / 分块 / SSE / 复用 | P5 | 明文 GET 已通（§1.6） |
 | JSON 嵌套 256 上限 | P3/P5 | 大 Bible/大纲是否触顶未知 |
 | 目录扫描与摘要读回 | P3/P13 | 百集索引方案要用 |
 | Worker 中断/重启 | P4 | 注意上面第 5 条 |
@@ -152,6 +177,7 @@ grep -rn 'fsync\|fdatasync' uya/stdlib/lib --include=*.uya   # 无输出
 |---|---|---|
 | `proto/mcp_stdio.ush` | 三工具 stdio MCP server（list/describe/call） | `proto/selftest.sh` |
 | `proto/txn.ush` | 原子写 + 锁 + 陈旧锁 + 崩溃注入 | `proto/txn_selftest.sh` |
+| `proto/http_client.ush` | 明文 HTTP GET（建连/请求/响应/超时） | `proto/http_selftest.sh` |
 
 两个脚本都是**可重跑**的：`sh drama_plugin/proto/selftest.sh`、
 `sh drama_plugin/proto/txn_selftest.sh`，失败即 exit 1。
