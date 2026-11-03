@@ -562,6 +562,10 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 > 幂等重放不再重复执行操作（拿操作真实产出的 task_id 登记幂等槽）。
 > 验收：`sh drama_plugin/p5d_selftest.sh`（9 项）：produce 只建任务、
 > 跨进程可查、run 才干活、重复 run 回放、记录回退后能续跑。
+> 第五段（1.19）：`src/series.uya` + `series.plan` / `outline.approve` /
+> `series.get`——一次生成 100 集大纲（每集钩子/兑现上集/笑点节拍/主角倾斜），
+> 未批准时逐集生成被拒（OUTLINE_NOT_APPROVED），重新规划作废旧批准。
+> 验收：`sh drama_plugin/p5e_selftest.sh`（12 项）。
 > 仍未做：重定向、分块/SSE、代理配置、Prompt 版本、格式修复重试、日志脱敏、
 > 人物一致性审核、长期梗检索（只做了 promise 账）、独立 worker 进程。
 
@@ -572,13 +576,15 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 ## 系列层规划（1.3 新增，百集前提）
 
 - [ ] 定义 `Series`：系列承诺、题材模板 ID、`format`、系列级冻结口径。
+      （大纲已落地；题材模板与系列级冻结口径还没做）
 - [ ] 定义 `Season`/`Arc`：起止集、弧内冲突、兑现点、角色成长弧。
-- [ ] 定义 `EpisodeOutline`：本集钩子、兑现上一集哪个 `promise_id`、
+- [x] 定义 `EpisodeOutline`：本集钩子、兑现上一集哪个 `promise_id`、
       笑点配额、场次、涉及角色/场景/道具。
-- [ ] `series.plan(total_episodes=100)` 一次生成完整大纲。
-- [ ] `outline.approve` 批准大纲；未批准则 `episode.produce` 拒绝执行。
+- [x] `series.plan(total_episodes=100)` 一次生成完整大纲（100 集 5 ms）。
+- [x] `outline.approve` 批准大纲；未批准则 `episode.generate` 拒绝执行。
 - [ ] 剧本必须能追到 `EpisodeOutline`；大纲外新增承诺 ⇒ 审批时写回大纲升版本。
-- [ ] 大纲变更把受影响集标记 `needs_revalidation`。
+- [x] 大纲变更直接作废旧批准（要重新批才算数）；
+      逐集 `needs_revalidation` 标记还没做。
 
 ## LLM 传输层（1.2 新增，P0 的 HTTP 原型的生产化）
 
@@ -1146,7 +1152,7 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 
 # 16. 操作目录与测试覆盖矩阵
 
-**已实现的 33 个操作**（`registry.uya` 是唯一来源；`describe` 就是从这张表
+**已实现的 36 个操作**（`registry.uya` 是唯一来源；`describe` 就是从这张表
 生成的）。"覆盖脚本"列是能跑到它的自测，空着表示只有间接覆盖。
 
 | 操作 | 阶段 | 权限 | 覆盖脚本 |
@@ -1184,6 +1190,9 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 | budget.report | P13 | read | p11 |
 | index.rebuild | P13 | write | p13b |
 | index.list | P13 | read | p13b |
+| series.plan | P5 | write | p5e |
+| outline.approve | P5 | write | p5e |
+| series.get | P5 | read | p5e |
 
 **还没实现、但文档里承诺过的操作**（照实记着，别当已完成）：
 

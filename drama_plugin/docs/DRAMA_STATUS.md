@@ -3,7 +3,7 @@
 这份文件只回答三个问题：**哪些阶段已经有代码**、**代码在哪**、**怎么复核**。
 设计与取舍看 `DRAMA_DESIGN.md`，任务清单看 `DRAMA_TODO.md`。
 
-## 1. 复核入口（19 个脚本，全部可重跑）
+## 1. 复核入口（20 个脚本，全部可重跑）
 
 | 脚本 | 覆盖 | 断言数 |
 |---|---|---|
@@ -26,6 +26,7 @@
 | `p11_selftest.sh` | 端到端一条龙（三集 → 成片 → 审计 → 成本账本） | 21 |
 | `p13_selftest.sh` | 10 集规模测算（控制面耗时/审计/状态体积） | 11 |
 | `p13b_selftest.sh` | 派生索引与全量重建 | 12 |
+| `p5e_selftest.sh` | 百集大纲与批准（系列层） | 12 |
 
 跑全部：
 
@@ -35,7 +36,7 @@ for f in drama_plugin/p*_selftest.sh; do sh "$f" || echo "FAILED $f"; done
 
 外加仓库门槛：`make lint-size`（文件 ≤2000 行 / 函数 ≤100 行 / 行宽 ≤80 码点）。
 
-## 2. 代码地图（`drama_plugin/src/`，26 个文件，约 9500 行）
+## 2. 代码地图（`drama_plugin/src/`，27 个文件，约 9800 行）
 
 | 模块 | 职责 | 行数 |
 |---|---|---|
@@ -65,6 +66,7 @@ for f in drama_plugin/p*_selftest.sh; do sh "$f" || echo "FAILED $f"; done
 | `audit.uya` | 闭环审计：账本 / 不变量 / 重放完整性 | 375 |
 | `assemble.uya` | 成片合成（mock 拼接）+ manifest | 246 |
 | `index.uya` | 派生索引（episodes）+ 全量重建 | 255 |
+| `series.uya` | 百集大纲生成、批准与拦截 | 312 |
 
 ## 3. 阶段落地情况
 
@@ -75,7 +77,7 @@ for f in drama_plugin/p*_selftest.sh; do sh "$f" || echo "FAILED $f"; done
 | P2 | 完成 | Registry / Schema / Dispatch 闭环 |
 | P3 | 大部分 | Project / 存储 / Bible 版本 / Asset；缺子模型字段约束、迁移器、审计轮转 |
 | P4 | 第一段 | Canon 提交 + 四轴不变量 + 锁 + 恢复；缺事件显式 ID、候选状态差异比较 |
-| P5 | 大部分 | 传输层 / Adapter / 剧本 / 上下文 / 任务；缺 SSE、代理、Prompt 版本、日志脱敏 |
+| P5 | 大部分 | 传输层 / Adapter / 剧本 / 上下文 / 任务 / 百集大纲；缺 SSE、代理、日志脱敏 |
 | P6 | M1 最小版 | 三集闭环 + 重放复现；真实模型与视频 Mock 未接 |
 | P7 | 第一段 | 确定性分镜；缺参考图顺序、状态迁移、固定资产引用 |
 | P8 | 第一段 | 能力表 + mock VideoProvider + Worker；缺真实本机队列 Adapter、单 Worker 锁 |
