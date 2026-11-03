@@ -229,45 +229,50 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 
 创建可独立构建、启动，并能被 `uya-agent` 连接的 Drama MCP Server。
 
+> **状态（1.3）**：骨架已落地并通过 `sh drama_plugin/p1_selftest.sh`；
+> 代码在 `drama_plugin/src/`（暂放本仓，独立仓落点见 §19 未定）。
+> 未勾的项是"还没有"的：配置文件、正式 logger、标准错误分类。
+
 ## 工程结构
 
-- [ ] 创建独立 Drama 工程。
-- [ ] 建立统一配置加载。
-- [ ] 建立 CLI 入口。
-- [ ] 建立 `mcp serve` 运行模式。
-- [ ] 建立 `worker run` 空运行模式（先不执行任务）。
-- [ ] 建立日志模块（stderr）。
-- [ ] 建立标准错误处理。
-- [ ] 建立版本输出和健康检查。
+- [-] 创建独立 Drama 工程（现在在 `drama_plugin/src/`，6 个源文件能单独构建）。
+- [ ] 建立统一配置加载（现在只有 `--data-dir`；`config.json` 走 P3）。
+- [x] 建立 CLI 入口（`version`/`health`/`mcp serve`/`worker run`）。
+- [x] 建立 `mcp serve` 运行模式。
+- [x] 建立 `worker run` 空运行模式（先不执行任务）。
+- [-] 建立日志模块（stderr）：`say_err` 已有；分级 logger 与脱敏待做。
+- [-] 建立标准错误处理：退出码 0/2 已定；错误分类与错误码表待 P2。
+- [x] 建立版本输出和健康检查。
 
 ## MCP 协议
 
-- [ ] 实现 JSON-RPC 请求解析。
-- [ ] 实现 `initialize`。
-- [ ] 实现 `notifications/initialized`。
-- [ ] 实现 `tools/list`。
-- [ ] 实现 `tools/call`。
-- [ ] 注册 `list`（公开名 `mcp__drama__list`）。
-- [ ] 注册 `describe`（公开名 `mcp__drama__describe`）。
-- [ ] 注册 `call`（公开名 `mcp__drama__call`）。
-- [ ] 三个工具以外不注册其他 Tool。
-- [ ] 返回 JSON 文本内容，**单行紧凑**（无 pretty-print、无内嵌换行）。
-- [ ] 标准输出仅写协议消息；一切日志/诊断走 stderr。
-- [ ] 处理未知方法（回 `-32601`）、非法 JSON 和协议错误。
-- [ ] 单条消息 >1 MiB 时不发送（改为返回资产引用或错误）。
-- [ ] 正确处理 shutdown/EOF（断管不崩、不留半条消息）。
+- [x] 实现 JSON-RPC 请求解析（`json_min.uya` 的最小读取器）。
+- [x] 实现 `initialize`（回 `2024-11-05`）。
+- [x] 实现 `notifications/initialized`（不回响应）。
+- [x] 实现 `tools/list`。
+- [x] 实现 `tools/call`。
+- [x] 注册 `list`（公开名 `mcp__drama__list`）。
+- [x] 注册 `describe`（公开名 `mcp__drama__describe`）。
+- [x] 注册 `call`（公开名 `mcp__drama__call`）。
+- [x] 三个工具以外不注册其他 Tool。
+- [x] 返回 JSON 文本内容，**单行紧凑**（无 pretty-print、无内嵌换行）。
+- [x] 标准输出仅写协议消息；一切日志/诊断走 stderr。
+- [x] 处理未知方法（回 `-32601`）、非法 JSON 和协议错误。
+- [-] 单条消息 >1 MiB：**入站**整行丢弃已实测；**出站**超限改资产引用待做
+      （现在最大文本 64 KiB 缓冲，超了就截断，P5 起换成资产引用）。
+- [x] 正确处理 shutdown/EOF（断管不崩、不留半条消息）。
 
-## 测试
+## 测试（都在 `p1_selftest.sh` 里，可重跑）
 
-- [ ] MCP initialize 测试。
-- [ ] tools/list 恰好三个工具测试（raw 名 = list/describe/call）。
-- [ ] 三个工具空实现调用测试。
-- [ ] 非法参数测试。
-- [ ] stderr/stdout 分离测试。
-- [ ] **单行紧凑判据**：任一响应原文除结尾 `\n` 外不含 `\n`（自测断言字节）。
-- [ ] **未知方法回 `-32601`**、server 不退出。
-- [ ] **`isError` 语义**：业务失败无 `isError`、基础设施失败有。
-- [ ] 与当前 `uya-agent` 的连接测试。
+- [x] MCP initialize 测试。
+- [x] tools/list 恰好三个工具测试（raw 名 = list/describe/call）。
+- [x] 三个工具空实现调用测试。
+- [x] 非法参数测试（缺 `operation` ⇒ `SCHEMA_INVALID`，`isError:false`）。
+- [x] stderr/stdout 分离测试（正常一轮会话 stderr 为 0 字节）。
+- [x] **单行紧凑判据**：逐行 `json.loads` 成功即证明没有内嵌换行。
+- [x] **未知方法回 `-32601`**、server 不退出。
+- [x] **`isError` 语义**：业务失败 `isError:false`，协议错误走 JSON-RPC error。
+- [x] 与当前 `uya-agent` 的连接测试（`--list-plugins` 认出 3 个工具）。
 
 ## 验收
 
