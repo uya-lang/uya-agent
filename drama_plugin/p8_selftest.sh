@@ -164,6 +164,24 @@ d=json.loads(sys.stdin.read().strip().split(chr(10))[-1])
 assert d['tasks_seen'] == 0, d
 print('PASS: 已完成的任务不会被重复执行')" || bad "worker 重复执行了已完成的活"
 
+# ---------- 6. 单 Worker 锁 ----------
+mkdir -p "$DATA/locks"
+printf '{"pid":%d}' "$$" > "$DATA/locks/worker.lock"
+out=$(timeout 120 "$TMP/drama" worker run --data-dir "$DATA" 2>/dev/null)
+printf '%s' "$out" | python3 -c "
+import json,sys
+d=json.loads(sys.stdin.read().strip())
+assert d.get('busy') is True, d
+print('PASS: 另一个 worker 在跑时拒绝开工（busy）')" || bad "worker 锁没生效"
+
+printf '{"pid":999999}' > "$DATA/locks/worker.lock"
+out=$(timeout 120 "$TMP/drama" worker run --data-dir "$DATA" 2>/dev/null)
+printf '%s' "$out" | python3 -c "
+import json,sys
+d=json.loads(sys.stdin.read().strip())
+assert 'tasks_seen' in d, d
+print('PASS: 持有者已死 ⇒ 陈旧 worker 锁自动清掉')" || bad "陈旧 worker 锁没恢复"
+
 echo "----"
 if [ "$fails" -eq 0 ]; then
     echo "PASS: P8 第一段（Provider 能力表 / 视频任务 / Worker）"

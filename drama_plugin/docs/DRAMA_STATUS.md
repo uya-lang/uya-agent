@@ -18,7 +18,7 @@
 | `p5d_selftest.sh` | 持久任务 / 断点续跑 | 10 |
 | `p6_selftest.sh` | 连续三集 + 重放复现（M1 最小版） | 9 |
 | `p7_selftest.sh` | 分镜生成 / 版本 / 时长口径 | 19 |
-| `p8_selftest.sh` | Provider 能力表 / 视频任务 / Worker | 14 |
+| `p8_selftest.sh` | Provider 能力表 / 视频任务 / Worker / 单 Worker 锁 | 16 |
 | `p9_selftest.sh` | 确定性 QA / 生产状态 / 重试 / 取消 / 熔断 | 14 |
 | `p12_selftest.sh` | 闭环审计 + 九条不变量逐条判定 | 14 |
 | `p12b_selftest.sh` | 反例库 + 规则/回收率/错误定位 | 14 |
