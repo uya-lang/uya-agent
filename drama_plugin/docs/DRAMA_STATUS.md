@@ -3,7 +3,7 @@
 这份文件只回答三个问题：**哪些阶段已经有代码**、**代码在哪**、**怎么复核**。
 设计与取舍看 `DRAMA_DESIGN.md`，任务清单看 `DRAMA_TODO.md`。
 
-## 1. 复核入口（18 个脚本，全部可重跑）
+## 1. 复核入口（19 个脚本，全部可重跑）
 
 | 脚本 | 覆盖 | 断言数 |
 |---|---|---|
@@ -25,6 +25,7 @@
 | `p10_selftest.sh` | 成片合成（mock 拼接 + manifest） | 11 |
 | `p11_selftest.sh` | 端到端一条龙（三集 → 成片 → 审计 → 成本账本） | 21 |
 | `p13_selftest.sh` | 10 集规模测算（控制面耗时/审计/状态体积） | 11 |
+| `p13b_selftest.sh` | 派生索引与全量重建 | 12 |
 
 跑全部：
 
@@ -34,7 +35,7 @@ for f in drama_plugin/p*_selftest.sh; do sh "$f" || echo "FAILED $f"; done
 
 外加仓库门槛：`make lint-size`（文件 ≤2000 行 / 函数 ≤100 行 / 行宽 ≤80 码点）。
 
-## 2. 代码地图（`drama_plugin/src/`，25 个文件，约 8900 行）
+## 2. 代码地图（`drama_plugin/src/`，26 个文件，约 9500 行）
 
 | 模块 | 职责 | 行数 |
 |---|---|---|
@@ -63,6 +64,7 @@ for f in drama_plugin/p*_selftest.sh; do sh "$f" || echo "FAILED $f"; done
 | `qa.uya` | 剧本/分镜确定性体检 + 不可变报告 | 362 |
 | `audit.uya` | 闭环审计：账本 / 不变量 / 重放完整性 | 375 |
 | `assemble.uya` | 成片合成（mock 拼接）+ manifest | 246 |
+| `index.uya` | 派生索引（episodes）+ 全量重建 | 255 |
 
 ## 3. 阶段落地情况
 
@@ -81,7 +83,7 @@ for f in drama_plugin/p*_selftest.sh; do sh "$f" || echo "FAILED $f"; done
 | P10 | 第一段 | mock 拼接 + manifest；缺 FFmpeg 探测/转码/响度/字幕 |
 | P11 | 第一段 | 端到端一条龙已跑通；发布/打包未做 |
 | P12 | 大部分 | 四本账 + 重放 + 六条反例全绿；缺九条完整谓词、增量检查、错误定位 |
-| P13 | 第一段 | 10 集测算 + 项目级成本账本；索引分片、配额熔断、百集压力未做 |
+| P13 | 第二段 | 10 集测算 + 成本账本 + 派生索引；配额熔断、百集压力未做 |
 
 ## 4. 已知限制（别当成承诺）
 
