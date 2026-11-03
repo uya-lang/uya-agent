@@ -535,7 +535,7 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 
 ---
 
-# 7. P5：LLM Provider 和 Story Engine（**传输层 + Adapter 骨架已落地**）
+# 7. P5：LLM Provider 和 Story Engine（**传输/Adapter/剧本/上下文/任务五段已落地**）
 
 > 1.7 落地：`src/httpc.uya`（HTTP/HTTPS POST + 超时 + 状态码/错误分类）、
 > `src/llm.uya`（配置来自 `<root>/llm.json`、mock 与 openai 兼容两种 Provider、
@@ -554,8 +554,13 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 > 一集摘要（episodes 以 canon revision 编号）。
 > 验收：`sh drama_plugin/p5c_selftest.sh`（11 项）：来源 ID、Bible 版本号、
 > 只给 open 承诺、批准后摘要进上下文、预算不足先丢摘要并标 truncated。
+> 第四段（1.10）：`src/task.uya`（持久任务 + 断点续跑）、`episode.produce`
+> 改成落盘建任务立刻回 queued、`task.run` / `task.get` / `task.list`；
+> 幂等重放不再重复执行操作（拿操作真实产出的 task_id 登记幂等槽）。
+> 验收：`sh drama_plugin/p5d_selftest.sh`（9 项）：produce 只建任务、
+> 跨进程可查、run 才干活、重复 run 回放、记录回退后能续跑。
 > 仍未做：重定向、分块/SSE、代理配置、Prompt 版本、格式修复重试、日志脱敏、
-> 人物一致性审核、长期梗检索（只做了 promise 账）。
+> 人物一致性审核、长期梗检索（只做了 promise 账）、独立 worker 进程。
 
 ## 目标
 
@@ -643,10 +648,11 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 
 ## Task 接入
 
-- [ ] 让 `episode.produce(target=script)` 创建持久任务。
-- [ ] Worker 能执行 LLM 剧本步骤。
-- [ ] 保存输入 hash、模型版本和输出资产。
-- [ ] 中断后可从已完成步骤恢复。
+- [x] 让 `episode.produce(target=script)` 创建持久任务。
+- [x] Worker 能执行 LLM 剧本步骤（`task.run` 走同一套 llm/story 代码；
+      独立 worker 进程留到 P8）。
+- [x] 保存输入 hash 与输出剧本版本（模型名称/参数落盘留到 P8 的日志）。
+- [x] 中断后可从已完成步骤恢复。
 
 ## 验收
 

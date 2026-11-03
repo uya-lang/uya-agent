@@ -18,8 +18,8 @@ $HERE/src/json_out.uya $HERE/src/registry.uya $HERE/src/schema.uya \
 $HERE/src/dispatch.uya $HERE/src/store.uya $HERE/src/project.uya \
 $HERE/src/digest.uya $HERE/src/asset.uya $HERE/src/bible.uya \
 $HERE/src/canon.uya $HERE/src/httpc.uya $HERE/src/llm.uya \
-$HERE/src/story.uya $HERE/src/context.uya $HERE/src/ops.uya \
-$HERE/src/server.uya"
+$HERE/src/story.uya $HERE/src/context.uya $HERE/src/task.uya \
+$HERE/src/ops.uya $HERE/src/server.uya"
 
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
@@ -84,7 +84,7 @@ cat > "$TMP/in.jsonl" <<'EOF'
 {"jsonrpc":"2.0","method":"notifications/initialized"}
 {"jsonrpc":"2.0","id":2,"method":"tools/list"}
 {"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"list","arguments":{}}}
-{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"call","arguments":{"operation":"episode.produce","input":{"episode_id":"ep-1"},"request_id":"req-1"}}}
+{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"call","arguments":{"operation":"llm.ping","input":{},"request_id":"req-1"}}}
 {"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"describe","arguments":{"operation":"nope.op"}}}
 {"jsonrpc":"2.0","id":6,"method":"resources/list"}
 {"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"call","arguments":{"operation":"project.create","input":{"name":"中文项目"},"request_id":"中文 id"}}}
@@ -157,8 +157,8 @@ for rid in (3, 4, 5, 7):
 
 t, _ = text(4)
 d = json.loads(t)['data'] if t else {}
-if d.get('status') != 'queued':
-    fails.append('call 没返回 queued')
+if 'provider' not in json.dumps(d):
+    fails.append('call 没返回 provider')
 if t and 'input_hash' not in json.loads(t):
     fails.append('call 没返回 input_hash')
 t, _ = text(5)

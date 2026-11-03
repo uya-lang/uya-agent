@@ -25,8 +25,8 @@ $HERE/src/json_out.uya $HERE/src/registry.uya $HERE/src/schema.uya \
 $HERE/src/dispatch.uya $HERE/src/store.uya $HERE/src/project.uya \
 $HERE/src/digest.uya $HERE/src/asset.uya $HERE/src/bible.uya \
 $HERE/src/canon.uya $HERE/src/httpc.uya $HERE/src/llm.uya \
-$HERE/src/story.uya $HERE/src/context.uya $HERE/src/ops.uya \
-$HERE/src/server.uya"
+$HERE/src/story.uya $HERE/src/context.uya $HERE/src/task.uya \
+$HERE/src/ops.uya $HERE/src/server.uya"
 
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
@@ -48,13 +48,13 @@ cat > "$TMP/in.jsonl" <<'JSONL'
 {"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}
 {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"list","arguments":{}}}
 {"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"describe","arguments":{"operation":"episode.produce"}}}
-{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"call","arguments":{"operation":"episode.produce","input":{"episode_id":"ep-1","stage":"shots"},"request_id":"r-1"}}}
-{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"call","arguments":{"operation":"episode.produce","input":{"episode_id":"ep-1","stage":"shots"},"request_id":"r-1"}}}
-{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"call","arguments":{"operation":"episode.produce","input":{"episode_id":"ep-2"},"request_id":"r-1"}}}
-{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"call","arguments":{"operation":"episode.produce","input":{"stage":"shots"}}}}
-{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"call","arguments":{"operation":"episode.produce","input":{"episode_id":7}}}}
-{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"call","arguments":{"operation":"episode.produce","input":{"episode_id":"e","nope":1}}}}
-{"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"call","arguments":{"operation":"episode.produce","input":{"episode_id":"e","stage":"x"}}}}
+{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"call","arguments":{"operation":"episode.produce","input":{"project_id":"p_00000000","episode_id":"ep-1","stage":"shots"},"request_id":"r-1"}}}
+{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"call","arguments":{"operation":"episode.produce","input":{"project_id":"p_00000000","episode_id":"ep-1","stage":"shots"},"request_id":"r-1"}}}
+{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"call","arguments":{"operation":"episode.produce","input":{"project_id":"p_00000000","episode_id":"ep-2"},"request_id":"r-1"}}}
+{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"call","arguments":{"operation":"project.get","input":{}}}}
+{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"call","arguments":{"operation":"project.get","input":{"project_id":7}}}}
+{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"call","arguments":{"operation":"project.get","input":{"project_id":"p_00000000","nope":1}}}}
+{"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"call","arguments":{"operation":"episode.produce","input":{"project_id":"p_00000000","episode_id":"e","stage":"x"}}}}
 {"jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"call","arguments":{"operation":"nope.op","input":{}}}}
 {"jsonrpc":"2.0","id":12,"method":"tools/call","params":{"name":"call","arguments":{"operation":"continuity.inspect","input":{"episode_id":"ep-1"}}}}
 JSONL
@@ -114,11 +114,12 @@ check(d.get('idempotency_key') == 'operation+input_hash',
       'describe 报幂等键口径')
 check(sch.get('additionalProperties') is False,
       'describe 声明 additionalProperties=false')
-check(sch.get('required') == ['episode_id'], 'describe 报 required')
+check(sch.get('required') == ['project_id', 'episode_id'],
+      'describe 报 required')
 check(props.get('episode_id', {}).get('type') == 'string',
       'describe 报字段类型')
-check(props.get('stage', {}).get('enum') == ['storyboard', 'shots',
-                                            'render'],
+check(props.get('stage', {}).get('enum') == ['script', 'storyboard',
+                                            'shots', 'render'],
       'describe 报 enum')
 check(len(d.get('errors') or []) >= 3, 'describe 报错误码清单')
 check('example' in d, 'describe 带最小示例')
@@ -126,19 +127,21 @@ stage_enum = props.get('stage', {}).get('enum') or []
 
 # 3) call 执行
 t, e = body(4)
-dd = (t or {}).get('data', {})
+dall = (t or {}).get('data') or {}
+dd = dall.get('result') or {}
 check(e is False, 'call 的 isError=false')
 check(dd.get('status') == 'queued', '异步写操作回 queued')
 check(bool(dd.get('task_id')), '写操作回 task_id')
-check(dd.get('idempotent_replay') is False, '首次调用不是重放')
+check(dall.get('idempotent_replay') is False, '首次调用不是重放')
 check(bool((t or {}).get('request_id')), '回显 request_id')
 check(bool((t or {}).get('input_hash')), '回 input_hash')
 
 # 6) 幂等
 t, e = body(5)
-dd2 = (t or {}).get('data', {})
+dall2 = (t or {}).get('data') or {}
+dd2 = dall2.get('result') or dall2
 check(dd2.get('task_id') == dd.get('task_id'), '同键复用 task_id')
-check(dd2.get('idempotent_replay') is True, '同键标记 idempotent_replay')
+check(dall2.get('idempotent_replay') is True, '同键标记 idempotent_replay')
 
 t, e = body(6)
 code = ((t or {}).get('error') or {}).get('code')
@@ -149,12 +152,12 @@ check(code == 'REQUEST_REUSED', '同 rid 换 payload 报 REQUEST_REUSED')
 t, e = body(7)
 er = (t or {}).get('error') or {}
 check(e is False, '缺字段仍是业务失败')
-check(er.get('code') == 'SCHEMA_INVALID' and er.get('field') == 'episode_id',
+check(er.get('code') == 'SCHEMA_INVALID' and er.get('field') == 'project_id',
       '缺 required 字段被拒并指出字段')
 
 t, e = body(8)
 er = (t or {}).get('error') or {}
-check(er.get('code') == 'TYPE_MISMATCH' and er.get('field') == 'episode_id',
+check(er.get('code') == 'TYPE_MISMATCH' and er.get('field') == 'project_id',
       '类型错误单独报 TYPE_MISMATCH')
 
 t, e = body(9)
