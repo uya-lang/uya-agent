@@ -287,7 +287,7 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 
 ---
 
-# 4. P2：Operation Registry
+# 4. P2：Operation Registry（**已完成**，验收见 `p2_selftest.sh`）
 
 ## 目标
 
@@ -295,56 +295,56 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 
 ## 注册机制
 
-- [ ] 定义 OperationInfo。
-- [ ] 定义操作名与操作版本。
-- [ ] 定义 Input Schema。
-- [ ] 定义 Output Schema。
-- [ ] 定义 mutates/async/permission/cost/idempotency 属性。
-- [ ] 实现 register/find/list/describe。
-- [ ] 实现操作版本兼容检查。
-- [ ] 禁止重复注册和名称冲突。
+- [x] 定义 OperationInfo。
+- [x] 定义操作名与操作版本。
+- [x] 定义 Input Schema。
+- [x] 定义 Output Schema。
+- [x] 定义 mutates/async/permission/cost/idempotency 属性。
+- [x] 实现 register/find/list/describe。
+- [x] 实现操作版本兼容检查。
+- [x] 禁止重复注册和名称冲突。
 
 ## Schema 验证
 
-- [ ] 实现 object/string/integer/number/boolean/array 基础类型验证。
-- [ ] 实现 required。
-- [ ] 实现 enum。
-- [ ] 实现 minimum/maximum。
-- [ ] 实现 minLength/maxLength。
-- [ ] 实现 additionalProperties 策略。
-- [ ] 实现默认值填充（仅对声明可填充参数）。
-- [ ] 实现嵌套 object 和 array 验证。
-- [ ] 保证 describe 返回 Schema 与 call 实际校验使用同一个定义。
+- [x] 实现 object/string/integer/number/boolean/array 基础类型验证。
+- [x] 实现 required。
+- [x] 实现 enum。
+- [x] 实现 minimum/maximum。
+- [x] 实现 minLength/maxLength。
+- [x] 实现 additionalProperties 策略。
+- [x] 实现默认值填充（仅对声明可填充参数）。
+- [x] 实现嵌套 object 和 array 验证。
+- [x] 保证 describe 返回 Schema 与 call 实际校验使用同一个定义。
 
 ## 分发机制
 
-- [ ] 实现统一 Dispatcher。
-- [ ] `request_id` 改为**可选**：缺省生成并回显，只作 tracing。
-- [ ] 实现写操作幂等记录接口（键 = `operation` + `input_hash`）。
-- [ ] 同 `request_id` 但 `input_hash` 不同 ⇒ 报 `REQUEST_REUSED`。
-- [ ] 实现统一成功返回格式。
-- [ ] 实现统一错误格式。
-- [ ] 实现未知 operation 拒绝。
-- [ ] 实现权限和预算策略接口。
-- [ ] 实现操作审计记录。
+- [x] 实现统一 Dispatcher。
+- [x] `request_id` 改为**可选**：缺省生成并回显，只作 tracing。
+- [x] 实现写操作幂等记录接口（键 = `operation` + `input_hash`）。
+- [x] 同 `request_id` 但 `input_hash` 不同 ⇒ 报 `REQUEST_REUSED`。
+- [x] 实现统一成功返回格式。
+- [x] 实现统一错误格式。
+- [x] 实现未知 operation 拒绝。
+- [x] 实现权限和预算策略接口。
+- [x] 实现操作审计记录。
 
 ## MCP 对接
 
-- [ ] `list` 从 Registry 读取目录。
-- [ ] `describe` 返回完整契约（含错误码与最小示例）。
-- [ ] `call` 使用 Registry 分发，并在 60 s 内返回。
-- [ ] 验证 list/describe 缓存所需的插件/操作版本信息。
+- [x] `list` 从 Registry 读取目录。
+- [x] `describe` 返回完整契约（含错误码与最小示例）。
+- [x] `call` 使用 Registry 分发，并在 60 s 内返回。
+- [x] 验证 list/describe 缓存所需的插件/操作版本信息。
 
-## 验收
+## 验收（1.5 落地：`sh drama_plugin/p2_selftest.sh`，35 项全绿）
 
-- [ ] 注册一个 Mock Operation。
-- [ ] list 可发现该操作。
-- [ ] describe 可读取完整 Schema。
-- [ ] call 可执行。
-- [ ] 非法字段、缺失参数、类型错误均被拒绝。
-- [ ] 未注册操作不可执行。
-- [ ] 相同 `(operation, input_hash)` 不重复产生写入副作用。
-- [ ] 同 `request_id` + 不同 `input_hash` 被拒绝（`REQUEST_REUSED`）。
+- [x] 注册一个 Mock Operation。
+- [x] list 可发现该操作。
+- [x] describe 可读取完整 Schema。
+- [x] call 可执行。
+- [x] 非法字段、缺失参数、类型错误均被拒绝。
+- [x] 未注册操作不可执行。
+- [x] 相同 `(operation, input_hash)` 不重复产生写入副作用。
+- [x] 同 `request_id` + 不同 `input_hash` 被拒绝（`REQUEST_REUSED`）。
 
 ---
 

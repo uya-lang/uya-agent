@@ -3,48 +3,57 @@
 // 幂等键 = (operation, input_hash)（DESIGN §4.5）：
 //   * 同键再来 ⇒ 复用同一个 task_id，并回 `idempotent_replay: true`；
 //   * 同 `request_id` 但 `input_hash` 变了 ⇒ 报 `REQUEST_REUSED`；
-//   * 首版把这两张表放内存（进程重启即丢），P3 落到 `idempotency/` 与提交记录。
+//   * 首版把这两张表放内存（进程重启即丢），P3 落到提交记录里。
 //
 // 审计：P2 只记计数与最后一条操作，`health` 会报出来；P3 落 jsonl。
+//
+// 约定：所有出参都是「调用方给缓冲 + 长度出参」，不做堆分配。
 
 const SLOT_MAX: usize = 16;
 const RID_MAX: usize = 16;
 const RID_LEN: usize = 64;
+const TASK_LEN: usize = 24;
 
 struct IdemSlot {
     used: bool,
-    op: &const byte,
     key: u64,
-    task: [byte: 24],
+    op_i: usize,
+    task: [byte: TASK_LEN],
+    task_len: usize,
 }
 
 struct RidSlot {
     used: bool,
     rid: [byte: RID_LEN],
+    rid_len: usize,
     key: u64,
 }
 
-var g_idem: [IdemSlot: SLOT_MAX] = [IdemSlot{ used: false, op: "" as &const byte, key: 0, task: [0: 24] }: SLOT_MAX];
-var g_rid: [RidSlot: RID_MAX] = [RidSlot{ used: false, rid: [0: RID_LEN], key: 0 }: RID_MAX];
-var g_audit_count: i64 = 0;
+var g_idem: [IdemSlot: SLOT_MAX] = [IdemSlot{ used: false, key: 0, op_i: 0,
+    task: [0: TASK_LEN], task_len: 0 }: SLOT_MAX];
+var g_rid: [RidSlot: RID_MAX] = [RidSlot{ used: false,
+    rid: [0: RID_LEN], rid_len: 0, key: 0 }: RID_MAX];
+var g_audit: i64 = 0;
 var g_task_seq: i64 = 0;
+var g_req_seq: i64 = 0;
 
 export fn audit_count() i64 {
-    return g_audit_count;
+    return g_audit;
 }
 
 export fn audit_note() void {
-    g_audit_count = g_audit_count +| 1;
+    g_audit = g_audit +| 1;
 }
 
-// 记一条 request_id ↔ input_hash 的绑定；返回 false 表示"同 rid 不同 payload"
+// 记一条 request_id ↔ input_hash 的绑定；false = 同 rid 不同 payload
 export fn rid_bind(rid: &const byte, rl: usize, key: u64) bool {
-    if rl == 0 {
-        return true;
+    if rl == 0 || rl >= RID_LEN {
+        return true;   // 没给 / 太长：不做这项检查，不误拒业务
     }
     var i: usize = 0;
     while i < RID_MAX {
-        if g_rid[i].used && b_eq(&g_rid[i].rid[0], b_len(&g_rid[i].rid[0]), rid) {
+        if g_rid[i].used && g_rid[i].rid_len == rl
+            && b_eq(&g_rid[i].rid[0], rl, rid) {
             return g_rid[i].key == key;
         }
         i = i + 1;
@@ -52,24 +61,32 @@ export fn rid_bind(rid: &const byte, rl: usize, key: u64) bool {
     i = 0;
     while i < RID_MAX {
         if !g_rid[i].used {
+            var l: usize = 0;
+            if !copy_to(rid, rl, &g_rid[i].rid[0: RID_LEN], &l) {
+                return true;
+            }
             g_rid[i].used = true;
+            g_rid[i].rid_len = l;
             g_rid[i].key = key;
-            _ = copy_to(rid, rl, &g_rid[i].rid[0: RID_LEN], &g_rid[i].rid_l());
-            return true;
+            break;
         }
         i = i + 1;
     }
-    return true;   // 表满：退化成"不做这项检查"，不误拒业务
+    return true;
 }
 
 // 幂等查找：命中则把 task_id 写进 out，返回 true
-export fn idem_find(op: &const byte, key: u64, out: &[byte]) bool {
+export fn idem_find(op_i: usize, key: u64, out: &[byte],
+    out_len: &usize) bool {
+    out_len[0] = 0;
     var i: usize = 0;
     while i < SLOT_MAX {
-        if g_idem[i].used && g_idem[i].key == key
-            && b_eq(g_idem[i].op, b_len(g_idem[i].op), op) {
-            _ = copy_to(&g_idem[i].task[0], b_len(&g_idem[i].task[0]),
-                out, b_len(&g_idem[i].task[0]) + 1, &g_tmp_len());
+        if g_idem[i].used && g_idem[i].key == key && g_idem[i].op_i == op_i {
+            var l: usize = 0;
+            if !copy_to(&g_idem[i].task[0], g_idem[i].task_len, out, &l) {
+                return false;
+            }
+            out_len[0] = l;
             return true;
         }
         i = i + 1;
@@ -77,25 +94,50 @@ export fn idem_find(op: &const byte, key: u64, out: &[byte]) bool {
     return false;
 }
 
-// 新任务：生成 task_id 并登记
-export fn idem_insert(op: &const byte, oplen: usize, key: u64, out: &[byte]) void {
+// 新任务：生成 task_id 并登记（同一 op + hkey 只登记一条）
+export fn idem_insert(op_i: usize, key: u64, out: &[byte],
+    out_len: &usize) void {
     g_task_seq = g_task_seq +| 1;
-    var buf: [byte: 24] = [0: 24];
+    var buf: [byte: TASK_LEN] = [0: TASK_LEN];
     var w: usize = 0;
-    w = w + j_put(&buf[0: 24], w, "task_p2_" as &const byte);
-    w = w + j_put_i64(&buf[0: 24], w, g_task_seq);
-    buf[w] = 0 as byte;
-    _ = copy_to(&buf[0], w, out, w + 1, &g_tmp_len());
+    w = w + j_put(&buf[0: TASK_LEN], w, "task_p2_" as &const byte);
+    w = w + j_put_i64(&buf[0: TASK_LEN], w, g_task_seq);
+    var l: usize = 0;
+    _ = copy_to(&buf[0], w, out, &l);
+    out_len[0] = l;
     var i: usize = 0;
     while i < SLOT_MAX {
         if !g_idem[i].used {
             g_idem[i].used = true;
-            g_idem[i].op = op;
+            g_idem[i].op_i = op_i;
             g_idem[i].key = key;
-            _ = copy_to(&buf[0], w, &g_idem[i].task[0: 24], &g_tmp_len());
+            var tl: usize = 0;
+            _ = copy_to(&buf[0], w, &g_idem[i].task[0: TASK_LEN], &tl);
+            g_idem[i].task_len = tl;
             break;
         }
         i = i + 1;
     }
-    _ = oplen;
+}
+
+// 缺省 request_id：生成一个并回显（DESIGN §4.5：request_id 可选，只作 tracing）
+export fn req_next(out: &[byte], out_len: &usize) void {
+    g_req_seq = g_req_seq +| 1;
+    var buf: [byte: 24] = [0: 24];
+    var w: usize = 0;
+    w = w + j_put(&buf[0: 24], w, "req_p2_" as &const byte);
+    w = w + j_put_i64(&buf[0: 24], w, g_req_seq);
+    var l: usize = 0;
+    _ = copy_to(&buf[0], w, out, &l);
+    out_len[0] = l;
+}
+
+// 幂等键：input 对象的原始字节（缺 input 时退化成整行）
+export fn input_hash(line: &const byte, n: usize) u64 {
+    var st: [usize: 1] = [0];
+    var ln: [usize: 1] = [0];
+    if !schema_input_span(line, n, &st[0], &ln[0]) {
+        return fnv64(line, n);
+    }
+    return fnv64(&line[st[0]], ln[0]);
 }

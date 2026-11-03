@@ -14,7 +14,8 @@ UYA=${UYA:-$ROOT/uya/bin/uya}
 export UYA_ROOT=${UYA_ROOT:-$ROOT/uya/stdlib}
 
 SRC="$HERE/src/main.uya $HERE/src/bytes.uya $HERE/src/json_min.uya \
-$HERE/src/json_out.uya $HERE/src/registry.uya $HERE/src/server.uya"
+$HERE/src/json_out.uya $HERE/src/registry.uya $HERE/src/schema.uya \
+$HERE/src/dispatch.uya $HERE/src/server.uya"
 
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
@@ -79,10 +80,10 @@ cat > "$TMP/in.jsonl" <<'EOF'
 {"jsonrpc":"2.0","method":"notifications/initialized"}
 {"jsonrpc":"2.0","id":2,"method":"tools/list"}
 {"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"list","arguments":{}}}
-{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"call","arguments":{"operation":"episode.produce","input":{},"request_id":"req-1"}}}
+{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"call","arguments":{"operation":"episode.produce","input":{"episode_id":"ep-1"},"request_id":"req-1"}}}
 {"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"describe","arguments":{"operation":"nope.op"}}}
 {"jsonrpc":"2.0","id":6,"method":"resources/list"}
-{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"call","arguments":{"operation":"project.create","input":{},"request_id":"中文 id"}}}
+{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"call","arguments":{"operation":"project.create","input":{"name":"中文项目"},"request_id":"中文 id"}}}
 EOF
 python3 - "$TMP/in.jsonl" <<'PY'
 import json, sys
