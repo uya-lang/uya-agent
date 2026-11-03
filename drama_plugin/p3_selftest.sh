@@ -158,6 +158,34 @@ for m in fails:
     print('FAIL: ' + m)
 sys.exit(1 if fails else 0)
 PY
+# ---------- 4. 不认识的 format_version ⇒ 只读故障态 ----------
+BADID=$(ls "$DATA/projects" | grep '^p_' | head -1)
+printf '%s' '{"format_version":99,"id":"x","name":"future","episode_count":0}' \
+    > "$DATA/projects/$BADID/project.json"
+printf '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"call","arguments":{"operation":"project.get","input":{"project_id":"%s"}}}}\n' \
+    "$BADID" > "$TMP/in3.jsonl"
+timeout 120 "$TMP/drama" mcp serve --data-dir "$DATA" \
+    < "$TMP/in3.jsonl" > "$TMP/out3.jsonl" 2> "$TMP/err3.txt" || true
+if python3 - "$TMP/out3.jsonl" <<'PY'
+import json
+import sys
+
+for line in open(sys.argv[1], 'rb').read().split(b'\n'):
+    if not line:
+        continue
+    o = json.loads(line)
+    t = json.loads(o['result']['content'][0]['text'])
+    if (t.get('error') or {}).get('code') == 'FORMAT_UNSUPPORTED':
+        sys.exit(0)
+    sys.exit(1)
+sys.exit(1)
+PY
+then
+    ok "不认识的 format_version 进只读故障态"
+else
+    bad "format_version 守卫没生效"
+fi
+
 rc=$?
 
 echo "----"
