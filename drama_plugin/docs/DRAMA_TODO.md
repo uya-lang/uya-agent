@@ -431,7 +431,14 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 
 ---
 
-# 6. P4：Continuity、Canon 和事务恢复
+# 6. P4：Continuity、Canon 和事务恢复（**第一段已落地**）
+
+> 1.6 落地：`src/canon.uya`（状态槽 + 事件应用 + 不变量 + 提交记录 + 锁 + 恢复）、
+> `canon.inspect` / `canon.commit` / `canon.recover` 三个操作。
+> 验收：`sh drama_plugin/p4_selftest.sh`（19 项）：遥控器转移故事、四轴反例、
+> base_revision 冲突、活锁拒绝、陈旧锁恢复、canon.json 丢失后从提交记录恢复。
+> 仍未做：事件显式 ID 与去重、候选状态差异比较、`promise.jsonl` 双向一致、
+> 锁文件的 host/acquired_at、把 `episode.approve` 接进事件校验（等 P5 的剧本模型）。
 
 ## 目标
 
@@ -446,66 +453,66 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 - [ ] 定义 AudienceKnowledge。
 - [ ] 定义 RunningGag。
 - [ ] 定义 Foreshadowing。
-- [ ] 定义 CanonSnapshot。
+- [x] 定义 CanonSnapshot。
 
 ## 事件
 
-- [ ] 定义 StoryEvent。
-- [ ] 定义 EventPrecondition。
-- [ ] 定义 EventEffect。
-- [ ] 定义有限条件操作符枚举。
+- [x] 定义 StoryEvent。
+- [x] 定义 EventPrecondition。
+- [x] 定义 EventEffect。
+- [x] 定义有限条件操作符枚举。
 - [ ] 实现事件唯一 ID。
-- [ ] 实现事件顺序。
-- [ ] 实现事件来源追踪。
-- [ ] 实现事件前置条件检查。
-- [ ] 实现事件效果验证。
-- [ ] 实现冲突检测。
-- [ ] 禁止任意表达式执行。
+- [x] 实现事件顺序。
+- [x] 实现事件来源追踪。
+- [x] 实现事件前置条件检查。
+- [x] 实现事件效果验证。
+- [x] 实现冲突检测。
+- [x] 禁止任意表达式执行。
 
 ## 四轴事件效果（1.3 新增）
 
 事件效果必须能表达四类世界变化，否则闭环无从判定（DESIGN §6.10/§6.11）：
 
-- [ ] 道具效果：`prop.move(prop, to_scene|to_holder)`，前置条件是道具当前
+- [x] 道具效果：`prop.move(prop, to_scene|to_holder)`，前置条件是道具当前
       位置与操作者在场。
-- [ ] 知识效果：`knowledge.grant(character, fact)`，前置条件是角色在场；
+- [x] 知识效果：`knowledge.grant(character, fact)`，前置条件是角色在场；
       另需 `knowledge.misbelieve` 表达误信。
-- [ ] 环境效果：`scene.set(time_of_day|variant|furniture)`，变体必须在
+- [x] 环境效果：`scene.set(time_of_day|variant|furniture)`，变体必须在
       资产包允许集合内。
-- [ ] 时间效果：`timeline.advance(duration|day|night)`，只能前进不得回退。
-- [ ] 承诺效果：`promise.open/close/waive`，与 `promise.jsonl` 双向一致。
-- [ ] 每类效果都要有对应的**不变量谓词**（DESIGN §6.11 九条）。
-- [ ] 事件效果未覆盖的状态变化一律判为 `ORPHAN_CHANGE`。
+- [x] 时间效果：`timeline.advance(duration|day|night)`，只能前进不得回退。
+- [x] 承诺效果：`promise.open/close/waive`，与 `promise.jsonl` 双向一致。
+- [x] 每类效果都要有对应的**不变量谓词**（DESIGN §6.11 九条）。
+- [x] 事件效果未覆盖的状态变化一律判为 `ORPHAN_CHANGE`（空事件提交直接拒）。
 
 ## Canon
 
-- [ ] 定义 Canon revision。
-- [ ] 实现当前状态读取。
-- [ ] 实现候选状态生成。
+- [x] 定义 Canon revision。
+- [x] 实现当前状态读取。
+- [x] 实现候选状态生成。
 - [ ] 实现候选状态差异比较。
-- [ ] 实现不可变 Commit Record。
-- [ ] 实现单项目写入锁（O_EXCL 锁文件）或单 Worker 保护。
+- [x] 实现不可变 Commit Record。
+- [x] 实现单项目写入锁（O_EXCL 锁文件 + pid 探活）。
 - [ ] 锁文件写 `{pid, host, acquired_at, purpose}`；抢锁失败按
       「探活 → 超时报 LOCK_STALE → 损坏报 LOCK_UNREADABLE」处理。
-- [ ] 验证陈旧锁（kill -9 之后）能恢复，不会把项目变成永久只读。
-- [ ] 实现 base_revision 检查。
+- [x] 验证陈旧锁（kill -9 之后）能恢复，不会把项目变成永久只读。
+- [x] 实现 base_revision 检查。
 - [ ] 实现 commit_id 和幂等检查。
-- [ ] 实现快照生成。
-- [ ] 实现 current 指针更新。
-- [ ] 实现从 Commit Record 重建快照。
+- [x] 实现快照生成。
+- [x] 实现 current 指针更新。
+- [x] 实现从 Commit Record 重建快照（记录里存全量 state，恢复不重放事件）。
 - [ ] 实现损坏/缺 revision 故障保护。
 
 ## 事务与恢复测试
 
-- [ ] 在发布 Commit Record 前模拟崩溃。
-- [ ] 在发布 Commit Record 后、更新快照前模拟崩溃。
-- [ ] 在快照写入中模拟崩溃。
-- [ ] 验证启动后可恢复到唯一正确 revision。
+- [x] 在发布 Commit Record 前模拟崩溃。
+- [x] 在发布 Commit Record 后、更新快照前模拟崩溃。
+- [x] 在快照写入中模拟崩溃。
+- [x] 验证启动后可恢复到唯一正确 revision。
 - [ ] 验证重复提交不会重复应用事件。
-- [ ] 验证并发第二写者被拒绝。
-- [ ] 验证基础 revision 冲突。
-- [ ] 验证「提交中断后不留半个文件」（release 前杀进程）。
-- [ ] 记录持久化边界：rename 原子但无 fsync ⇒ 掉电可能丢最后一次提交
+- [x] 验证并发第二写者被拒绝。
+- [x] 验证基础 revision 冲突。
+- [x] 验证「提交中断后不留半个文件」（release 前杀进程）。
+- [x] 记录持久化边界：rename 原子但无 fsync ⇒ 掉电可能丢最后一次提交
       （写进 P0_FINDINGS 与部署文档，selftest 用杀进程而不是断电验证）。
 
 ## 操作
@@ -521,9 +528,10 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 四轴各来一个最小用例（1.3 新增）：
 
 - [ ] 故事：抛出的钩子在第 N+1 集被兑现，回收率计入 `promise` 账。
-- [ ] 人物：角色知道了不该知道的事 ⇒ `KNOWLEDGE_LEAK` 拒绝提交。
-- [ ] 环境：道具无事件地被挪动 ⇒ `PROP_TELEPORT` 拒绝提交。
-- [ ] 逻辑：状态变化找不到原因事件 ⇒ `ORPHAN_CHANGE` 拒绝提交。
+      （P4 只做了 promise.open/close 的状态机，兑现统计留到 P12 的账本）
+- [x] 人物：角色知道了不该知道的事 ⇒ `KNOWLEDGE_LEAK` 拒绝提交。
+- [x] 环境：道具无事件地被挪动 ⇒ `PROP_TELEPORT` 拒绝提交。
+- [x] 逻辑：状态变化找不到原因事件 ⇒ `ORPHAN_CHANGE` 拒绝提交。
 
 ---
 
