@@ -1078,6 +1078,8 @@ leaf 指纹怎么算、指纹库放哪儿 —— 见 [DESIGN.md §18](DESIGN.md)
   **本次启动的默认路线**（与设置里的 `agent-default-model.provider` 同一个槽位，只是 env
   压过设置）；`--resume` 仍跟随会话记录的那一条 —— 不把这一次恢复钉死在环境上
   （`--dsh-web` 的标签页重开之后回到用户刚切的模型，而不是宿主的默认路线）。
+  显式的 `UYA_AGENT_MODEL` / `--model` 优先于会话模型；否则跟随会话记录。
+  显式指定的 effort 优先于会话记录。
 * **输出上限总是发**（P61）：`max_tokens`（completions）/ `max_output_tokens`（responses）
   **每个请求都带**，口径是 `--max-tokens` > 模型目录的 `maxTokens` > 默认 **256000**
   （照抄 DSH 自己的 `dsh-llm-deepseek`：`config.maxTokens ?? 256e3`，且它经 `defaultMaxTokens`
