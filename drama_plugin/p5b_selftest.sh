@@ -23,8 +23,9 @@ $HERE/src/dispatch.uya $HERE/src/store.uya $HERE/src/project.uya \
 $HERE/src/digest.uya $HERE/src/asset.uya $HERE/src/bible.uya \
 $HERE/src/canon.uya $HERE/src/httpc.uya $HERE/src/llm.uya \
 $HERE/src/story.uya $HERE/src/context.uya $HERE/src/task.uya \
-$HERE/src/board.uya $HERE/src/provider.uya $HERE/src/qa.uya $HERE/src/audit.uya \
-$HERE/src/ops.uya $HERE/src/server.uya"
+$HERE/src/board.uya $HERE/src/provider.uya $HERE/src/qa.uya \
+$HERE/src/audit.uya $HERE/src/assemble.uya $HERE/src/ops.uya \
+$HERE/src/server.uya"
 
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
