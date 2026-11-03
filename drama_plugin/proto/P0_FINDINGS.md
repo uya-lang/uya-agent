@@ -3,7 +3,7 @@
 - 文档编号：DRAMA-P0-001
 - 对应设计：DRAMA-DESIGN-001 v1.3
 - 对应任务：DRAMA-TODO-001 v1.3 §2.2（仍需实测）
-- 状态：进行中（B1/B2/B3/B5-前半/目录枚举/队列契约 已过验收；B4 已定案；B6/B7 部分）
+- 状态：进行中（B1/B2/B3/B5-前半/目录枚举/队列契约/Worker 恢复 已过验收；B4 已定案；B6/B7 部分）
 
 每条结论只写三样东西：**怎么验的、验出什么、对设计的影响**。
 没有跑过的项标「待实测」，不用推测填。
@@ -156,6 +156,30 @@ sh drama_plugin/proto/scan_selftest.sh
 **对设计的影响**：DESIGN §10.3 的 `submit/poll/fetch/cancel/depth`
 可以直接按这张表实现；`GET /prompt` 的 `queue_remaining` 用来派发前限流。
 
+### 1.9 Worker 中断/重启 —— 已验收
+
+**怎么验的**：`drama_plugin/proto/worker.ush` + `proto/worker_selftest.sh`。
+每步完成后向 journal **追加**一行 `done <n>` 并 close；启动时读 journal
+取最大已完成步，从下一步继续。测试在第 4 步执行中硬杀，再重启。
+
+```bash
+sh drama_plugin/proto/worker_selftest.sh
+# 被杀时已完成: 3 步
+# 重启 -> RESUME 4 / FINAL 10
+# PASS: Worker 中断/重启（检查点续跑、不重复执行）
+```
+
+**验出什么**：
+
+- 首次运行 `RESUME 1`（无历史）；中途硬杀后重启 `RESUME 4`，
+  **没有从 1 重跑**，也没有跳步；
+- 跑完后 journal 恰好 10 条 `done`、10 个不同步骤 ⇒ **每步恰好执行一次**；
+- 这条断言正是 DESIGN §9.3「只恢复未完成步骤，不重复执行已完成步骤」
+  的可判定版本。
+
+**配套注意**：杀进程必须按进程组杀（见 §3 第 5 条），否则测出来的是
+"假崩溃"——脚本里 `kill -9 -$pid` + `pgrep` 轮询到进程真的消失才算数。
+
 ---
 
 ## 2. 已出结论、不必再试
@@ -209,7 +233,7 @@ grep -rn 'fsync\|fdatasync' uya/stdlib/lib --include=*.uya   # 无输出
 | HTTP 后半：TLS / DNS / 重定向 / 分块 / SSE / 复用 | P5 | 明文 GET 已通（§1.6） |
 | JSON 嵌套 256 上限 | P3/P5 | 大 Bible/大纲是否触顶未知 |
 | 目录扫描与摘要读回 | P3/P13 | 已验收（§1.7）；正式实现用 sha256 |
-| Worker 中断/重启 | P4 | 注意上面第 5 条 |
+| Worker 中断/重启 | P4 | 已验收（§1.9）；真实 Worker 还要接任务锁与 Provider 轮询 |
 | env/密钥注入、权限模式 | P11 | 需一次真实 `uya-agent` 会话 |
 | 资产共享目录可见性 | P3/P10 | 数据根目录必须显式配置 |
 
@@ -223,6 +247,7 @@ grep -rn 'fsync\|fdatasync' uya/stdlib/lib --include=*.uya   # 无输出
 | `proto/txn.ush` | 原子写 + 锁 + 陈旧锁 + 崩溃注入 | `proto/txn_selftest.sh` |
 | `proto/http_client.ush` | 明文 HTTP GET（建连/请求/响应/超时） | `proto/http_selftest.sh` |
 | `proto/scan.ush` | 目录枚举 + 文件摘要（getdents64 / FNV-1a） | `proto/scan_selftest.sh` |
+| `proto/worker.ush` | Worker 检查点续跑（journal 追加写） | `proto/worker_selftest.sh` |
 | `proto/LOCAL_QUEUE_CONTRACT.md` | 本地队列实测契约（读侧） | 现场采集，样本在文档里 |
 
 两个脚本都是**可重跑**的：`sh drama_plugin/proto/selftest.sh`、
