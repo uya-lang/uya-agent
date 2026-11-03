@@ -188,6 +188,22 @@ print('PASS: episode.get 汇总（剧本 v%d / 分镜 v%d / 成片 v%d / Canon r
       % (d['script_version'], d['board_version'], d['assembly_version'],
          d['canon_revision']))" || bad "episode.get 汇总不对"
 
+# ---------- 4.6 成本账本 ----------
+out=$(ask "$(cat <<JSON
+{"jsonrpc":"2.0","id":71,"method":"tools/call","params":{"name":"call","arguments":{"operation":"budget.report","input":{"project_id":"$PID"}}}}
+JSON
+)")
+printf '%s' "$out" | field | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+assert d['episodes'] == 3, d
+assert d['renders'] >= 3, d
+assert d['gpu_ms'] > 0, d
+assert d['renders_per_episode'] > 0, d
+print('PASS: budget.report（%d 集 / %d 次渲染 / %d ms GPU / 每集 %.2f 次）'
+      % (d['episodes'], d['renders'], d['gpu_ms'],
+         d['renders_per_episode'] / 100.0))" || bad "成本账本不对"
+
 # ---------- 5. 落盘检查 ----------
 n=$(ls "$DATA/projects/$PID/assemblies"/v*.json 2>/dev/null | wc -l)
 [ "$n" -eq 3 ] && ok "三份合成 manifest 都在" || bad "manifest 数量是 $n"

@@ -1107,11 +1107,12 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 
 ## 预算与熔断
 
-- [ ] 任务级 cost：`llm_tokens`、`gpu_minutes`、`renders`。
-- [ ] 项目级累计账本与三类配额（单集/项目/单日）。
+- [x] 任务级 cost：`renders` 与 `gpu_ms` 写进视频任务记录。
+- [x] 项目级累计账本（`budget.report`：集数/任务/渲染/GPU 时长/每集渲染数）；
+      三类配额与熔断还没做。
 - [ ] 超限熔断：停止派发，不硬杀在跑任务。
-- [ ] 重做率指标与告警（基线 1.56×，2.0× 告警）。
-- [ ] `budget.report` 按集/阶段/provider 汇总。
+- [x] 重做率指标（`renders_per_episode`，百分之一为单位；告警阈值未接）。
+- [x] `budget.report` 项目级汇总（按集会/阶段/provider 的细分留到接真实产线）。
 
 ## 批量调度与审批
 
@@ -1139,7 +1140,7 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 
 # 16. 操作目录与测试覆盖矩阵
 
-**已实现的 30 个操作**（`registry.uya` 是唯一来源；`describe` 就是从这张表
+**已实现的 31 个操作**（`registry.uya` 是唯一来源；`describe` 就是从这张表
 生成的）。"覆盖脚本"列是能跑到它的自测，空着表示只有间接覆盖。
 
 | 操作 | 阶段 | 权限 | 覆盖脚本 |
@@ -1174,6 +1175,7 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 | provider.capabilities | P8 | read | p8 |
 | qa.run | P9 | write | p9 / p11 |
 | media.assemble | P10 | write | p10 / p11 |
+| budget.report | P13 | read | p11 |
 
 **还没实现、但文档里承诺过的操作**（照实记着，别当已完成）：
 
@@ -1185,7 +1187,7 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 | series.plan / outline.approve | P5 | 百集大纲与批准 |
 | invariant.check | P12 | 九条谓词的单点检查（现在只有 `canon.audit`） |
 | promise.report | P12 | 回收率/waive 原因报表 |
-| budget.report | P13 | 成本账本与熔断 |
+
 
 ---
 
