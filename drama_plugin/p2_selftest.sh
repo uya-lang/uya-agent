@@ -59,8 +59,8 @@ cat > "$TMP/in.jsonl" <<'JSONL'
 {"jsonrpc":"2.0","id":12,"method":"tools/call","params":{"name":"call","arguments":{"operation":"continuity.inspect","input":{"episode_id":"ep-1"}}}}
 JSONL
 
-timeout 120 "$TMP/drama" mcp serve < "$TMP/in.jsonl" \
-    > "$TMP/out.jsonl" 2> "$TMP/err.txt" || true
+timeout 120 "$TMP/drama" mcp serve --data-dir "$TMP/data" \
+    < "$TMP/in.jsonl" > "$TMP/out.jsonl" 2> "$TMP/err.txt" || true
 
 # ---------- 2. 断言 ----------
 python3 - "$TMP/out.jsonl" "$TMP/err.txt" <<'PY'
