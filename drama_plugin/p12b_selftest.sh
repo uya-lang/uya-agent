@@ -168,6 +168,32 @@ JSON
     && ok "反例 6：冻结文本被改 ⇒ CHARACTER_DRIFT" \
     || bad "反例 6 没报 CHARACTER_DRIFT（$(code_of "$out")）"
 
+# ---------- 6.5 错误定位（对象 ID） ----------
+out=$(ask "$(cat <<JSON
+{"jsonrpc":"2.0","id":70,"method":"tools/call","params":{"name":"call","arguments":{"operation":"canon.commit","input":{"project_id":"$P1","base_revision":1,"events":[{"type":"prop.move","prop":"ghost_prop","to_scene":"living_room"}]}}}}
+JSON
+)")
+printf '%s' "$out" | field | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+assert d['code'] == 'PROP_UNKNOWN', d
+assert d.get('object') == 'ghost_prop', d
+print('PASS: 事件错误带对象定位（object=ghost_prop）')" \
+    || bad "事件错误没带对象定位"
+
+out=$(ask "$(cat <<JSON
+{"jsonrpc":"2.0","id":71,"method":"tools/call","params":{"name":"call","arguments":{"operation":"canon.audit","input":{"project_id":"$P1"}}}}
+JSON
+)")
+printf '%s' "$out" | field | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+assert 'violations' in d, d
+for v in d['violations']:
+    assert 'object' in v or v['code'] != 'PROP_IN_UNKNOWN_SCENE', v
+print('PASS: 审计违规结构里带 object 字段（%d 条违规）' % len(d['violations']))" \
+    || bad "审计违规没带对象字段"
+
 # 显式允许后可以改（豁免通道）
 out=$(ask "$(cat <<JSON
 {"jsonrpc":"2.0","id":52,"method":"tools/call","params":{"name":"call","arguments":{"operation":"bible.put","input":{"project_id":"$P6","bible":{"characters":[{"id":"dad"}]},"locks":{"dad":"长发，深灰夹克","_allow_drift":true}}}}}
