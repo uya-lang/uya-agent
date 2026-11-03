@@ -3,7 +3,7 @@
 这份文件只回答三个问题：**哪些阶段已经有代码**、**代码在哪**、**怎么复核**。
 设计与取舍看 `DRAMA_DESIGN.md`，任务清单看 `DRAMA_TODO.md`。
 
-## 1. 复核入口（13 个脚本，全部可重跑）
+## 1. 复核入口（14 个脚本，全部可重跑）
 
 | 脚本 | 覆盖 | 断言数 |
 |---|---|---|
@@ -20,6 +20,7 @@
 | `p7_selftest.sh` | 分镜生成 / 版本 / 时长口径 | 19 |
 | `p8_selftest.sh` | Provider 能力表 / 视频任务 / Worker | 14 |
 | `p9_selftest.sh` | 确定性 QA / 生产状态 / 重试 | 9 |
+| `p12_selftest.sh` | 闭环审计（四本账 / 不变量 / 重放） | 13 |
 
 跑全部：
 
@@ -29,7 +30,7 @@ for f in drama_plugin/p*_selftest.sh; do sh "$f" || echo "FAILED $f"; done
 
 外加仓库门槛：`make lint-size`（文件 ≤2000 行 / 函数 ≤100 行 / 行宽 ≤80 码点）。
 
-## 2. 代码地图（`drama_plugin/src/`，23 个文件，约 8100 行）
+## 2. 代码地图（`drama_plugin/src/`，24 个文件，约 8600 行）
 
 | 模块 | 职责 | 行数 |
 |---|---|---|
@@ -56,6 +57,7 @@ for f in drama_plugin/p*_selftest.sh; do sh "$f" || echo "FAILED $f"; done
 | `board.uya` | 剧本 → 确定性分镜 + 版本存储 | 499 |
 | `provider.uya` | 版本化能力表 + mock VideoProvider | 136 |
 | `qa.uya` | 剧本/分镜确定性体检 + 不可变报告 | 362 |
+| `audit.uya` | 闭环审计：账本 / 不变量 / 重放完整性 | 375 |
 
 ## 3. 阶段落地情况
 
@@ -71,7 +73,9 @@ for f in drama_plugin/p*_selftest.sh; do sh "$f" || echo "FAILED $f"; done
 | P7 | 第一段 | 确定性分镜；缺参考图顺序、状态迁移、固定资产引用 |
 | P8 | 第一段 | 能力表 + mock VideoProvider + Worker；缺真实本机队列 Adapter、单 Worker 锁 |
 | P9 | 第一段 | 确定性 QA + 生产状态 + 重试；缺 ASR/锚帧/成片终检/跨集审计 |
-| P10–P13 | 未开始 | 合成/发布/闭环引擎/规模 |
+| P10–P11 | 未开始 | 合成/发布 |
+| P12 | 第一段 | 四本账 + 重放 + 三类不变量；缺九条完整谓词、增量检查、反例库 |
+| P13 | 未开始 | 规模与产能 |
 
 ## 4. 已知限制（别当成承诺）
 
