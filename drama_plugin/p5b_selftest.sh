@@ -22,7 +22,7 @@ $HERE/src/json_out.uya $HERE/src/registry.uya $HERE/src/schema.uya \
 $HERE/src/dispatch.uya $HERE/src/store.uya $HERE/src/project.uya \
 $HERE/src/digest.uya $HERE/src/asset.uya $HERE/src/bible.uya \
 $HERE/src/canon.uya $HERE/src/httpc.uya $HERE/src/llm.uya \
-$HERE/src/story.uya $HERE/src/context.uya $HERE/src/task.uya \
+$HERE/src/story.uya $HERE/src/context.uya $HERE/src/task.uya $HERE/src/board.uya \
 $HERE/src/ops.uya $HERE/src/server.uya"
 
 TMP=$(mktemp -d)

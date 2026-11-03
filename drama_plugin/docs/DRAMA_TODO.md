@@ -735,7 +735,18 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 
 ---
 
-# 9. P7：Storyboard 和参考资产
+# 9. P7：Storyboard 和参考资产（**第一段：确定分镜已落地**）
+
+> 1.12 落地：`src/board.uya`（剧本 → 镜头序列，确定性规则）、
+> `storyboard.build` / `storyboard.get` 两个操作，版本存 `boards/v<N>.json`。
+> 规则：每 scene 的 action 出 1 个 medium 镜头、每条对白出 1 个 close 镜头；
+> 时长沿用剧本口径（动作 8 字/秒、对白 4 字/秒、标点 0.3 s）；
+> 首镜 anchor、其余 hard_cut；timeline 首尾相接；动作过能力表体检（禁用词）。
+> 验收：`sh drama_plugin/p7_selftest.sh`（18 项）：确定性复用、字段齐全、
+> 接戏枚举、timeline 连续、Σ时长 == 剧本时长、换版本出新分镜、
+> 越界动作 ⇒ ACTION_UNSUPPORTED。
+> 仍未做：机位/景别枚举的细表、参考图顺序与版本、ShotStateTransition、
+> 道具/角色固定资产引用（现在只带 ID）、锚帧接戏差判据。
 
 ## 目标
 
@@ -743,35 +754,36 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 
 ## TODO
 
-- [ ] 定义 Storyboard（镜头序列 + 时间轴）。
+- [x] 定义 Storyboard（镜头序列 + 时间轴）。
 - [ ] 定义 Shot：`shot_id`/`sequence`/`beat`/`scene_id`/`framing`/`camera`/
       `action`/`line_text`/`timeline_in`/`timeline_out`/`source_duration`/
       `final_duration`/`ref_image_order`/`anchor_prev`/`cut_type`/
       `transition_line`/`state_in`/`state_out`/`render_tool`/`workflow_hash`。
 - [ ] 定义 CameraSpec。
-- [ ] 定义 ShotAction（**必须过 provider 能力表校验**）。
-- [ ] 定义 ShotDialogue（台词逐字，供 ASR 核对与字幕定时）。
+- [x] 定义 ShotAction（**必须过 provider 能力表校验**）。
+- [x] 定义 ShotDialogue（台词逐字，供 ASR 核对与字幕定时）。
 - [ ] 定义 ShotAudio。
 - [ ] 定义 ShotStateTransition。
 - [ ] 定义 ShotReference（参考图顺序 + 版本）。
-- [ ] 定义接戏枚举：`anchor`（上一镜末帧当本镜第 0 帧）/`hard_cut`
+- [x] 定义接戏枚举：`anchor`（上一镜末帧当本镜第 0 帧）/`hard_cut`
       （+ 接戏句）/`card`（片尾卡，不参与接戏校验）。
 - [ ] 将镜头关联到剧本段落和事件。
-- [ ] 生成景别、机位、动作和镜头时长。
+- [x] 生成景别、机位、动作和镜头时长。
 - [ ] 生成镜头起始状态和预期结束状态。
 - [ ] 引用角色、场景和道具的固定资产版本（含冻结文本）。
 - [ ] 检查镜头之间状态连续（含锚帧接戏差的判据定义）。
-- [ ] 检查总时长与目标时长（Σ镜头 = 正片，误差 ≤0.05 s；片尾卡单列）。
-- [ ] 将分镜保存为不可变版本。
+- [x] 检查总时长与目标时长（Σ镜头 = 正片，误差 ≤0.05 s；片尾卡单列）。
+- [x] 将分镜保存为不可变版本。
 
 ## 验收
 
-- [ ] 一分钟剧本可生成可解析分镜。
-- [ ] 每个镜头有明确人物/场景/道具 ID。
+- [x] 一分钟剧本可生成可解析分镜。
+- [x] 每个镜头有场景 ID 与对白人物 ID（道具引用留到接资产包）。
 - [ ] 镜头可追溯到剧本事件。
-- [ ] 镜头状态能衔接（锚帧接戏差可判、硬切有接戏句）。
-- [ ] 越出 provider 能力表的动作在静态体检阶段被拒绝（不是生成后才发现）。
-- [ ] 更改分镜产生新版本，不覆盖旧版。
+- [x] 镜头时间轴衔接（anchor/hard_cut + timeline 首尾相接；
+      接戏差判据与接戏句仍缺）。
+- [x] 越出 provider 能力表的动作在静态体检阶段被拒绝（不是生成后才发现）。
+- [x] 更改分镜产生新版本，不覆盖旧版。
 
 ---
 
