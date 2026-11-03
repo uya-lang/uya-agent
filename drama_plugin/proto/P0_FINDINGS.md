@@ -194,7 +194,7 @@ grep -rn 'fsync\|fdatasync' uya/stdlib/lib --include=*.uya   # 无输出
 提交**。这条写进 DESIGN §8.2 与部署文档；selftest 用「杀进程」验证恢复，
 不假装能验证掉电。若将来不能接受，再单独做 syscall 包装原型（不改架构）。
 
-### 1.10 HTTPS 客户端：有，但证书校验没做完（1.3 修正一条定论）
+### 1.10 HTTPS 客户端：默认校验模式已可用（1.5 修正为"通过"）
 
 **怎么验的**：写一个 `.uya`（不是 `.ush`）直接调 stdlib 的 HTTPS 客户端，
 目标是 `example.com:443`，用 stderr 打状态码。
@@ -227,53 +227,80 @@ grep -rn 'fsync\|fdatasync' uya/stdlib/lib --include=*.uya   # 无输出
    必须写成饱和运算，否则编译失败（本仓 `examples/mcp-plugins/wordcount.ush`
    现在就因此编不过）。
 
-### 1.12 HTTPS 证书校验为什么过不去 —— 根因已定位（1.4）
+### 1.12 HTTPS 证书校验的七个根因与修法（1.4 定位 → 1.5 全部修完）
 
-上一节只说了"校验没做完"。这一节是**逐层打开的根因**，全部现场实测：
+上一节说的是"校验能不能用"。这一节是**逐层打开的根因**，每条都有现场实测
+证据，修法全部落在上游 `~/uya/uya/lib/tls/`（commit `b578a7ed` +
+`9a91c5ce`，合并补丁见 `proto/patches/0002-tls-x509-ecdsa-and-truststore.patch`）。
 
-**现象**：`https_get(...)`（默认校验）在 `[TLS] Handshake not done
-(peer not verified)` 处失败；`https_get_insecure(...)` 能拿到 200。
+**① 链根本没被捕获 —— 记录头错位。**
+`hs_remember_message(...)` 保存服务器 flight 时跳过 5 字节记录头
+（`&send_buf[5]`），而 `ssl_capture_peer_chain_from_server_flight` 却按
+"记录头 + 握手消息"解析，第一步 `data[0] != 22` 直接返回 ⇒ `chain_len=0`。
+现场打点：`[DBG] head: 02 00 00 52 03 03`（首字节是 2 = ServerHello）。
+**修法**：捕获时按"裸握手消息"解析，两种形态都接受。
+补丁：`proto/patches/0001-tls-capture-bare-server-flight.patch`。
 
-**第一层根因：链根本没被捕获。**
-在 `ssl_verify_peer_chain` 里打点，看到 `anchors=30, chain_len=0,
-peer_leaf NULL`。继续往上打点：
+**② SPKI 只认 RSA —— ECDSA 公钥解析不出来。**
+`cert_parse_tbs` 只会把 SubjectPublicKeyInfo 当 RSA 的 (n, e) 两个 INTEGER。
+现代站点全是 ECDSA。P-256 未压缩点 **65 字节**、P-384 **97 字节**
+（最初按 65 写死，P-384 证书直接被判非法）。
+**修法**：按曲线 OID（`1.2.840.10045.3.1.7` / `1.3.132.0.34`）分辨，
+`pub_kind` 记 2 = P-256、3 = P-384，`ec_pub` 缓冲按 97 字节留足。
 
-```text
-[DBG] flight_len=3915
-[DBG] head: 02 00 00 52 03 03 …     ← 首字节是 2（ServerHello）
-[DBG] capture: bad record type 2
-```
+**③ ECDSA 验签两侧都错 —— 哈希分派 + r/s 错位。**
+旧实现只做 P-256 + SHA-256；更致命的是把 `r/s` 从 48 字节缓冲的
+`rb[32 + k]` 处读（本该是 `rb[k]`），**签名永远验不过**。
+**修法**：按曲线分派 `ec_p256_ecdsa_verify` / `ec_p384_ecdsa_verify`，
+配 SHA-256 / SHA-384；r/s 按位宽（32/48）右对齐后取整段。
 
-`hs_remember_message(...)` 保存服务器 flight 时**跳过了 5 字节记录头**
-（`&send_buf[5]`，见 `lib/tls/ssl/handshake.uya`），而
-`ssl_capture_peer_chain_from_server_flight` 却按"记录头 + 握手消息"解析，
-第一步 `data[0] != 22` 就直接返回 ⇒ 证书链永远为空 ⇒ 必然
-`peer_verified=false`。
+**④ 扩展解析整块放弃 —— OID 缓冲太小 + 边界用错。**
+扩展 OID 缓冲 16 字节，长 OID（CA/B Forum、厂商私有）解析失败；
+扩展列表的循环边界用的是 `explicit-3` 的末尾而不是内层 SEQUENCE 的末尾，
+尾部多读 2~4 字节后把下一个元素当 OID 解析 ⇒ 整张证书的扩展被放弃 ⇒
+`is_ca=false` ⇒ 链在中间证书处断掉。
+现场打点：`notCA i=2 has_bc=0 is_ca=0`。
+**修法**：OID 缓冲 → 32；循环边界改用 `seq_end`。
 
-**第二层根因：X.509 栈是 RSA-only。**
-打完"裸消息"补丁后链能抓到（`chain_len=2`），但 `verify_chain_rsa` 失败。
-继续看 `x509/cert.uya`：`cert_parse_tbs` 只会把 SPKI 当
-**RSA 的 (n, e) 两个 INTEGER** 解析；实测系统根库里 626 字节、514 字节的证书
-解析失败（ECDSA 根），`verify_chain_rsa` 还要求每一级 `rsa_n_len != 0`。
-现代站点普遍带 ECDSA 中间证书，于是链校验必然失败。
+**⑤ keyUsage 只认 8 位对齐 —— CA 证书最常用的写法过不去。**
+`asn1_get_bit_string_to` 要求 `unused == 0`，但 CA 证书的 KeyUsage 常常
+只用 7 位（digitalSignature + keyCertSign + cRLSign），`unused = 1` ⇒ 直接
+判失败。
+**修法**：新增 `asn1_get_bit_string_bits_to`（允许 0~7 个未用比特并掩码），
+只有签名值继续走严格版。
 
-**结论**：证书校验要在真实站点上跑通，需要三件事，工作量不是一个补丁：
+**⑥ 信任库只加载前 43 张根 + MPI 放不下乘积。**
+`TRUST_STORE_READ_BUF_SIZE = 65536`，而 Debian 的
+`/etc/ssl/certs/ca-certificates.crt` 是 **224 KB / 150 张**
+⇒ AAA、Sectigo 这些排在后半段的根"不存在"。
+另外 `MPI_MAX_LIMBS = 32`（2048 位）看着够放 RSA-2048 的模数，但模幂要算
+`a*b` 这个 **4096 位**中间积，`a.n + b.n > 32` 当场报 `TlsBadInput`
+⇒ RSA 验签必然失败（自签 RSA 证书实测失败）。
+**修法**：PEM 分块流式读（保留不完整尾部）+ `MAX_CERTS 128→256`；
+`MPI_MAX_LIMBS 32→64`。
 
-1. ~~服务器 flight 的保存/解析形态对齐~~ —— 已有补丁
-   `proto/patches/0001-tls-capture-bare-server-flight.patch`（已应用到
-   `~/uya/uya`，未提交）；
-2. **X.509 支持 ECDSA**：SPKI 的 EC point 解析、ECDSA 签名验证、
-   系统根库里的 ECDSA 根；
-3. **PKIX 路径构建**：按 issuer/subject DN 走链、按 keyUsage/basicConstraints
-   过滤，而不是"把对端给的链当唯一可能"。
+**⑦ 还差一个套件：ECDHE-ECDSA 根本没在 ClientHello 里。**
+前六条修完仍然失败——把 `handshake.uya` 退回原版做对照，才确认密码套件表
+里没有 `0xC02B`（ECDHE-ECDSA-AES128-GCM-SHA256）、签名算法表里没有
+`0x0403`（ecdsa_secp256r1_sha256）。example.com 是 ECDHE-ECDSA-only，
+协商不出套件就换不到服务器 flight。**修法**：两张表各补一项（上游 commit
+`9a91c5ce`）。这条最容易漏：链校验全绿了，但握手压根没开始。
+
+**验收线**：`proto/https_probe_selftest.sh` 现在断言"默认配置拿到 200、
+不再出现 peer not verified"；v1.1 时它断言的是反面。这条脚本就是回归线。
+
+**工具链同步（1.5 落地）**：上游编译器 v0.11.0 与 `lib/` 已同步进本仓
+`uya/`（`uya/bin/uya-real` + `uya/stdlib/lib/`），7 个 P0/P1 验收脚本
+在新工具链下全绿。注意 v0.11.0 默认开 `--strict-overflow`，普通 `+ - *`
+要写成饱和运算。
 
 **另外一条工具链坑**：`uya/bin/uya` 启动脚本会**无条件覆盖 `UYA_ROOT`**
 （`UYA_ROOT="$(cd "$self/../stdlib" && pwd)"; export UYA_ROOT`），
 所以 `UYA_ROOT=/tmp/x uya build …` 是无效的——要换库必须直接调
 `uya/bin/uya-real`。这条坑让第一次诊断白跑了两轮。
 
-**给 P5 的结论**：远程 LLM 调用可以走"本机网关 + 明文 HTTP"（已验证可行），
-或等标准库补齐 ECDSA/PKIX；**不要**用 insecure 模式把 API Key 发到公网。
+**给 P5 的结论**：远程 LLM 调用可以直接走 `https_get`（默认校验），不必再
+绕本机网关；但**不要**为了省事用 insecure 模式把 API Key 发到公网。
 
 ### 2.2 宿主的 env 与权限事实（源码级复核，1.3 修正了一条错判）
 
@@ -335,7 +362,7 @@ read-only 与 workspace-write 都为真，两者取或 ⇒ 这两种模式都是
 
 | 项 | 卡住谁 | 备注 |
 |---|---|---|
-| 证书校验（HTTPS 默认配置） | P5 | 客户端在、校验缺（§1.10）；DNS 已可用 |
+| 证书反例回归（错主机名 / 过期 / 断链） | P5 | 正例已通（§1.10）；反例还没脚本化 |
 | 重定向 / 分块 / SSE / 连接复用 | P5 | 明文 GET 已通（§1.6） |
 | JSON 嵌套 256 上限 | P3/P5 | 大 Bible/大纲是否触顶未知 |
 | 目录扫描与摘要读回 | P3/P13 | 已验收（§1.7）；正式实现用 sha256 |

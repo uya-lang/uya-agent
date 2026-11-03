@@ -57,7 +57,7 @@
    非 ASCII JSON 往返。
 4. P2 的 `request_id` 改为可选，幂等键 = `(operation, input_hash)`。
 5. P3 增加 `format_version` 与迁移任务；存储布局补 `locks/`、`idempotency/`。
-6. P5 增加「LLM 传输层」任务组（stdlib 有 HTTPS 客户端但证书校验未完成）。
+6. P5 增加「LLM 传输层」任务组（stdlib 的 HTTPS 默认校验模式 1.5 起可用）。
 7. P7 补接戏字段（`anchor_prev`/`cut_type`/`transition_line`/时间轴/片尾卡）
    与 provider 能力表校验。
 8. P10 删「配音替换」，补编码/响度口径。
@@ -69,12 +69,13 @@
 - `[!]` **没有 `fsync`**：stdlib 全树没有 `fsync`/`fdatasync` 包装。提交只能
   保证「不出现半个文件 + 崩溃后可重建」，**掉电可能丢最后一次提交**。
   替代方案写在 DESIGN §8.2；若不能接受，先做「自写 syscall 包装」的原型。
-- `[!]` **HTTPS 客户端有，但证书校验没做完**（1.3 实测修正）：`lib/tls/https.uya`
-  导出 `https_get`/`https_get_insecure`，`std/net/dns.uya` 能解析域名；
-  insecure 模式实测 `example.com` 返回 200，默认配置（要校验证书）在
-  "Handshake not done (peer not verified)" 处失败。
-  ⇒ P5 的远程 LLM 调用要么补证书校验，要么走本机网关；**不许**默认用
-  insecure 调带 API Key 的服务。
+- `[x]` **HTTPS 默认校验模式已可用**（1.5 实测转绿）：`https_get("example.com",
+  443, "/")` 握手完成、`S: 200`。1.3/1.4 记的"证书校验没做完"已被 6 个上游
+  修复推翻（记录头错位、ECDSA SPKI、ECDSA 验签 r/s 错位、扩展 OID 缓冲与
+  边界、keyUsage 未用比特、信任库截断 + MPI limb 上限），全部落在上游
+  `~/uya/uya/lib/tls/`（commit `b578a7ed`）。
+  ⇒ P5 可以直接用 `https_get`，不必绕本机网关；**不许**默认用 insecure 调
+  带 API Key 的服务。边界：不做吊销/CT；反例（错主机名、过期）还没脚本化。
 - `[!]` **没有随仓 sqlite 驱动**（`std/sql` 只有 Driver/Conn 接口）。
   存储只能走「不可变提交记录 + 原子 rename」的文件方案（DESIGN §8）。
 
@@ -162,12 +163,12 @@ JSON 上限/非 ASCII → env/密钥注入 → 资产可见性。
       （`proto/mcp_stdio.ush`，`sh proto/selftest.sh` 全绿）
 - [-] **HTTP 传输层**（阻塞 P5）：
       明文 HTTP 已跑通（建连/请求/响应/状态行/404/拒绝/3 s 预算，
-      `proto/http_client.ush`）；HTTPS 侧实测 `https_get_insecure` 可用
-      （200）、默认配置因证书校验失败而握手失败；DNS 可用
-      （`std/net/dns.uya`）。根因已定位（P0_FINDINGS §1.12）：flight 保存
-      形态不一致（有补丁）+ X.509 只支持 RSA + 无 PKIX 路径构建。
-      修法：**改上游 `~/uya/uya` 标准库，再同步进本仓**；仍缺：ECDSA 证书、
-      路径构建、重定向、分块、SSE、连接复用。
+      `proto/http_client.ush`）；HTTPS 侧 1.5 起**默认校验模式**即可用
+      （`https_get` 拿 200，见 `proto/https_probe_selftest.sh`）；DNS 可用
+      （`std/net/dns.uya`）。1.4 定位的 6 个根因（P0_FINDINGS §1.12）已全部
+      在上游修完（commit `b578a7ed`）并同步进本仓 `uya/`（编译器 v0.11.0 +
+      标准库）。仍缺：吊销（CRL/OCSP）、CT、反例回归、重定向、分块、SSE、
+      连接复用。
 - [x] **非 ASCII JSON 往返**：实测中文**原样透传**（UTF-8 字节，不转义）；
       缓冲边界仍按码点算长度。
 - [-] **本地队列 Provider 契约**：读侧已实测（`/prompt` 队列深度、
@@ -535,7 +536,7 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 ## LLM 传输层（1.2 新增，P0 的 HTTP 原型的生产化）
 
 - [ ] 封装 HTTP 请求：方法/头/体/超时/重试/重定向。
-- [ ] TLS：证书校验、SNI、失败原因可诊断。
+- [x] TLS：默认校验模式已验证通过（1.5）；SNI 与失败原因可诊断。
 - [ ] 响应解析：JSON 体、错误体、非 200 的错误映射。
 - [ ] 若走流式（SSE/分块）：增量解析与中断恢复。
 - [ ] 代理与 `no_proxy`：既然子进程只拿到白名单 env，代理配置必须来自
@@ -1038,7 +1039,7 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 | 风险 | 影响 | 缓解方式 | 阶段 |
 |---|---|---|---|
 | 无 fsync（已核验） | 掉电可能丢最后一次提交 | 明确写入已知限制；只保证"不留半个文件" | P0/P4 |
-| HTTPS 校验跑不通（RSA-only） | 只能 insecure = 泄 Key | 上游补 ECDSA/PKIX | P0/P5 |
+| HTTPS 校验（1.5 已修） | 曾经只能 insecure = 泄 Key | 上游已补 ECDSA/RSA/信任库；反例未回归 | P0/P5 |
 | MCP Host 与规范能力不一致 | 插件无法连接 | 只依赖已核验的四方法 + `-32601` 约定 | P0/P1 |
 | 协议帧写错（多行/超 1 MiB） | 宿主整条丢弃，工具全部失效 | 单行紧凑输出的自测判据 | P1 |
 | `call` 超过 60 s | 宿主超时，任务状态不明 | 一律先落盘再返回 `queued` | P1/P8 |

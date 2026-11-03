@@ -35,6 +35,7 @@ use libc.sys_read;
 use libc.sys_poll;
 use libc.PollFd;
 use libc.POLLIN;
+use libc.POLLOUT;
 use libc.POLLHUP;
 use libc.POLLERR;
 use libc.kill;
@@ -69,6 +70,8 @@ use libc.SIGTSTP;
 use libc.SIG_IGN;
 use libc.SIG_ERR;
 use libc.O_NONBLOCK;
+use libc.F_GETFL;
+use libc.F_SETFL;
 use libc.O_RDWR;
 use libc.WNOHANG;
 
@@ -85,8 +88,97 @@ extern fn setsid() i32;
 extern fn posix_openpt(flags: i32) i32;
 extern fn grantpt(fd: i32) i32;
 extern fn unlockpt(fd: i32) i32;
+// ptsname：Darwin 的 <stdlib.h> 已把原型钉成 char *(int)，这里再 extern 一个
+// uint8_t *(int32_t) 版本会被 clang 判成 conflicting types（Linux 没暴露只是因为
+// -std=c99 下 glibc 把 ptsname 藏在 __USE_XOPEN_EXTENDED 后面）。macOS 改走
+// codegen 发的 uya_macos_ptsname 宿主绑定，其余目标保持裸符号。
+std.cfg(std.target_os == .tos_macos, {
+extern "libc" fn uya_macos_ptsname(fd: i32) &byte;
+
+fn pty_slave_name(fd: i32) &byte {
+    return uya_macos_ptsname(fd);
+}
+}, {
 extern fn ptsname(fd: i32) &byte;
+
+fn pty_slave_name(fd: i32) &byte {
+    return ptsname(fd);
+}
+})
+// errno 的取址入口随目标 ABI 而不同：macOS/Darwin 是 __error()，glibc 等是
+// __errno_location()。只声明并调用目标对应的那个，避免在 Darwin 上引入
+// glibc 符号 __errno_location，链接期报 undefined reference to `___errno_location'。
+std.cfg(std.target_os == .tos_macos, {
+extern fn __error() &i32;
+
+fn pipeline_errno_location() &i32 {
+    return __error();
+}
+}, {
 extern fn __errno_location() &i32;
+
+fn pipeline_errno_location() &i32 {
+    return __errno_location();
+}
+})
+
+// 管道里的 Uya stage 需要在 fork 出的子进程里重新 exec 自身（--uya-pipeline-worker）。
+// Linux 走 /proc/self/exe；Darwin 没有 /proc，必须用 _NSGetExecutablePath 取自身路径，
+// 否则 execve 失败、每个 Uya stage 都启动不起来。
+// 路径只在父进程解析一次并缓存，fork 出的子进程直接复用，避免在子进程里调用 dyld。
+const PIPELINE_WORKER_EXEC_PATH_CAPACITY: usize = 4096usize;
+
+var _pipeline_worker_exec_path: [byte: 4096] = [];
+var _pipeline_worker_exec_path_state: i32 = 0;  // 0=未解析，1=可用，-1=不可用
+
+std.cfg(std.target_os == .tos_macos, {
+extern fn _NSGetExecutablePath(buffer: *byte, buffer_size: *u32) i32;
+
+fn pipeline_worker_exec_path_resolve(buffer: &byte, capacity: usize) i32 {
+    if buffer == null || capacity < 2usize {
+        return 0 - 1;
+    }
+    var size: u32 = (capacity - 1usize) as u32;
+    if _NSGetExecutablePath(buffer as *byte, &size) != 0 {
+        return 0 - 1;
+    }
+    buffer[capacity - 1usize] = 0 as byte;
+    return 0;
+}
+}, {
+fn pipeline_worker_exec_path_resolve(buffer: &byte, capacity: usize) i32 {
+    const source: &const byte = "/proc/self/exe";
+    if buffer == null || capacity < 2usize {
+        return 0 - 1;
+    }
+    var i: usize = 0usize;
+    while source[i] != 0 as byte {
+        if i + 1usize >= capacity {
+            return 0 - 1;
+        }
+        buffer[i] = source[i] as byte;
+        i = i + 1usize;
+    }
+    buffer[i] = 0 as byte;
+    return 0;
+}
+})
+
+fn pipeline_worker_exec_path_ensure() &byte {
+    if _pipeline_worker_exec_path_state > 0 {
+        return &_pipeline_worker_exec_path[0];
+    }
+    if _pipeline_worker_exec_path_state < 0 {
+        return null as &byte;
+    }
+    if pipeline_worker_exec_path_resolve(&_pipeline_worker_exec_path[0],
+        PIPELINE_WORKER_EXEC_PATH_CAPACITY) != 0 {
+        _pipeline_worker_exec_path_state = 0 - 1;
+        return null as &byte;
+    }
+    _pipeline_worker_exec_path_state = 1;
+    return &_pipeline_worker_exec_path[0];
+}
 extern fn sigaction(signum: i32, action: &const PipelineSigaction, old_action: &PipelineSigaction) i32;
 
 export error InvalidPipeline;
@@ -1523,6 +1615,20 @@ fn pipeline_wait_status(raw: i32, index: usize) PipelineStageStatus {
 fn pipeline_wait_status_is_stopped(raw: i32) bool { return (raw & 255) == 127; }
 fn pipeline_wait_status_is_continued(raw: i32) bool { return raw == 65535; }
 
+/// 等待直接 child 的状态变化。
+/// 参数：pid 为目标 child；raw_status 承接 wait status。
+/// 返回：命中时返回 child pid，无事件返回 0，失败返回 -1。
+fn pipeline_wait_direct_child(pid: i32, raw_status: &i32) i32 {
+    const waited: i32 = waitpid(pid, raw_status,
+        WNOHANG | PIPELINE_WAIT_UNTRACED | PIPELINE_WAIT_CONTINUED);
+    if waited >= 0 { return waited; }
+    // XNU（macOS）的 wait4 只接受 WNOHANG 与 WUNTRACED：多带一个 WCONTINUED 位会
+    // 返回 EINVAL，waitpid 因此恒为 -1。wait loop 把它当成「不是这个 child」并落入
+    // cancelled 分支，于是 macOS 上每个 stage 都被误判成 cancelled
+    // （statuses[i].kind == 2）。丢掉这个位重试一次，让 exit 状态能被正常观察到。
+    return waitpid(pid, raw_status, WNOHANG | PIPELINE_WAIT_UNTRACED);
+}
+
 fn pipeline_capture_read(fd: i32, output: &byte, limit: usize, count: &usize) !i32 {
     if count == null { return error.InvalidPipeline; }
     if count[0] < limit {
@@ -1601,8 +1707,7 @@ fn pipeline_capture_priority_interrupt(pgid: i32, pids: &i32, count: usize,
     var i: usize = 0usize;
     while i < count {
         if !reaped[i] {
-            const waited: i32 = waitpid(pids[i], &raw_statuses[i],
-                WNOHANG | PIPELINE_WAIT_UNTRACED | PIPELINE_WAIT_CONTINUED);
+            const waited: i32 = pipeline_wait_direct_child(pids[i], &raw_statuses[i]);
             if waited == pids[i] && pipeline_wait_status_is_stopped(raw_statuses[i]) {
                 pipeline_cancel_started_group(pgid, pids, count);
                 return true;
@@ -1710,7 +1815,7 @@ fn pipeline_write_all_bytes(fd: i32, input: &const byte, count: usize) !void {
 }
 
 fn pipeline_errno_value() i32 {
-    const location: &i32 = __errno_location();
+    const location: &i32 = pipeline_errno_location();
     if location == null { return 0; }
     return location[0];
 }
@@ -1751,11 +1856,29 @@ fn pipeline_worker_arg_matches(value: &const byte) bool {
     return expected[i] == 0 as byte && value[i] == 0 as byte;
 }
 
+/// worker 自检：描述符 / 结果 fd 必须已由 exec 侧 dup2 到保留编号。
+/// 参数：无。
+/// 返回：1 表示这是真正的 exec worker 进程；0 表示普通用户程序。
+fn pipeline_worker_fds_are_wired() i32 {
+    const descriptor_ok: !i32 = sys_fcntl(PIPELINE_WORKER_DESCRIPTOR_FD, F_GETFD, 0);
+    const descriptor_flags: i32 = descriptor_ok catch { return 0; };
+    if descriptor_flags < 0 { return 0; }
+    const report_ok: !i32 = sys_fcntl(PIPELINE_WORKER_REPORT_FD, F_GETFD, 0);
+    const report_flags: i32 = report_ok catch { return 0; };
+    if report_flags < 0 { return 0; }
+    return 1;
+}
+
 /// 隔离 Uya-stage worker 的进程入口；由生成的弱 main bridge 在普通用户代码前调用。
 /// 参数：无；descriptor/report 使用 executor 保留的固定 fd。
 /// 返回：非 worker 进程返回 -1；worker 返回稳定进程退出码。
 export extern "libc" fn uya_pipeline_worker_main_if_requested() i32 {
     if get_argc() != 2 || !pipeline_worker_arg_matches(get_argv(1)) { return 0 - 1; }
+    // 只看 argc/argv 会把「普通用户程序恰好带一个 --uya-pipeline-worker 参数」误判成
+    // worker：那种进程没有 dup2 过的描述符 fd，后面的 read 会失败并返回 122，
+    // 于是用户程序根本没跑就被判成 worker 失败。exec 侧一定会先 dup2 两个保留 fd，
+    // 用它们是否可用来区分（buglist「编译器 bug」P1）。
+    if pipeline_worker_fds_are_wired() == 0 { return 0 - 1; }
     var descriptor_storage: [byte: 32] = [];
     if @size_of(PipelineWorkerDescriptor) > 32usize { return 122; }
     const descriptor: &PipelineWorkerDescriptor =
@@ -1980,6 +2103,13 @@ fn pipeline_execute_basic(input: &Pipeline, statuses: &[PipelineStageStatus], re
         use_experimental_fork_stage = __atomic_exchange_n(
             (&_pipeline_test_allow_next_fork_stage) as &i32, 0,
             PIPELINE_ATOMIC_SEQ_CST) != 0;
+    }
+    var worker_exec_path: &byte = null as &byte;
+    if has_uya_stage && !use_experimental_fork_stage {
+        worker_exec_path = pipeline_worker_exec_path_ensure();
+        if worker_exec_path == null {
+            return error.PipelineSpawnFailed;
+        }
     }
     try pipeline_broker_subscribe();
     broker_registered = true;
@@ -2218,8 +2348,8 @@ fn pipeline_execute_basic(input: &Pipeline, statuses: &[PipelineStageStatus], re
                             PIPELINE_PHASE_EXEC, pipeline_errno_value());
                     }
                     _ = close(launch_fds[i * 2usize]);
-                    var worker_argv: [&byte: 3] = ["/proc/self/exe", "--uya-pipeline-worker", null];
-                    _ = execve("/proc/self/exe", &worker_argv[0], saved_envp);
+                    var worker_argv: [&byte: 3] = [worker_exec_path, "--uya-pipeline-worker", null];
+                    _ = execve(worker_exec_path, &worker_argv[0], saved_envp);
                     pipeline_child_fail_startup(report_fds[i * 2usize + 1usize],
                         PIPELINE_PHASE_EXEC, pipeline_errno_value());
                 }
@@ -2463,8 +2593,8 @@ fn pipeline_execute_basic(input: &Pipeline, statuses: &[PipelineStageStatus], re
             var child_idx: usize = 0usize;
             while child_idx < count {
                 if !reaped[child_idx] {
-                    const waited: i32 = waitpid(pids[child_idx], &raw_statuses[child_idx],
-                        WNOHANG | PIPELINE_WAIT_UNTRACED | PIPELINE_WAIT_CONTINUED);
+                    const waited: i32 = pipeline_wait_direct_child(pids[child_idx],
+                        &raw_statuses[child_idx]);
                     if waited == pids[child_idx] && pipeline_wait_status_is_stopped(raw_statuses[child_idx]) {
                         pipeline_cancel_started_group(pipeline_pgid, &pids[0], count);
                         if stdout_open { _ = close(stdout_capture_fds[0]); }
@@ -2539,8 +2669,7 @@ fn pipeline_execute_basic(input: &Pipeline, statuses: &[PipelineStageStatus], re
         var waited_pid: i32 = 0;
         if reaped[i] { waited_pid = pids[i]; }
         while waited_pid == 0 {
-            waited_pid = waitpid(pids[i], &raw_status,
-                WNOHANG | PIPELINE_WAIT_UNTRACED | PIPELINE_WAIT_CONTINUED);
+            waited_pid = pipeline_wait_direct_child(pids[i], &raw_status);
             if waited_pid == pids[i] && pipeline_wait_status_is_stopped(raw_status) {
                 pipeline_cancel_started_group(pipeline_pgid, &pids[0], count);
                 return error.Interrupted;
@@ -2816,23 +2945,146 @@ export fn pipeline_child_signal_setup_self_test() !void {
     }
 }
 
-fn pipeline_terminal_inherit_child_run(slave_name: &const byte, master_fd: i32) !void {
+fn pipeline_terminal_inherit_child_run(slave_name: &const byte, master_fd: i32,
+    ready_fd: i32) !void {
     _ = close(master_fd);
     if setsid() < 0 { return error.PipelineIoError; }
     const slave_fd: i32 = try sys_open(slave_name, O_RDWR as i32, 0);
     if tcsetpgrp(slave_fd, getpgrp()) != 0 || dup2(slave_fd, 0) < 0 ||
         dup2(slave_fd, 1) < 0 || dup2(slave_fd, 2) < 0 { return error.PipelineIoError; }
     if slave_fd > 2 { _ = close(slave_fd); }
+    // 必须等 slave 真正打开后再让父进程往 master 写 token：Darwin 上 slave 还没
+    // 打开时写 master 会挂住（数据也无处可去），父进程先写就会让本用例在 macOS 上
+    // 永久卡在 write()。这里先回一个 ready 字节，父进程收到后才写 token。
+    try pipeline_terminal_ready_notify(ready_fd, 82 as byte);
     const args: [&const byte: 2] = ["-c", "read value; test \"$value\" = token"];
     const command: Pipeline = try cmd_path_argv(pipeline(), "/bin/sh", &args[0:2]);
     try check(try inherit_stdio(command));
+    pipeline_selftest_note("pty: child stage done\n");
     if tcgetpgrp(0) != getpgrp() { return error.InvalidPipeline; }
+    pipeline_selftest_note("pty: child pgrp checked\n");
+    try pipeline_terminal_ready_notify(ready_fd, 68 as byte);
+    pipeline_selftest_note("pty: child notified done\n");
 }
 
-fn pipeline_terminal_inherit_child(slave_name: &const byte, master_fd: i32) void {
-    const completed: !void = pipeline_terminal_inherit_child_run(slave_name, master_fd);
-    _ = completed catch { _exit(1); };
+fn pipeline_terminal_inherit_child(slave_name: &const byte, master_fd: i32,
+    ready_fd: i32) void {
+    const completed: !void = pipeline_terminal_inherit_child_run(slave_name, master_fd,
+        ready_fd);
+    _ = completed catch {
+        pipeline_selftest_note("pty: child failed\n");
+        _exit(1);
+    };
+    pipeline_selftest_note("pty: child exiting\n");
     _exit(0);
+}
+
+/// 杀掉并回收 self test 里忙等的前台占位子进程；回收也是有界的，不会阻塞等待。
+/// 参数：pid 为 fork 出的前台占位进程；非正数时不做任何事。
+/// 返回：无返回值。
+fn pipeline_terminal_reap_foreground(pid: i32) void {
+    if pid <= 0 { return; }
+    _ = kill(pid, SIGKILL);
+    var raw: i32 = 0;
+    var rounds: i32 = 0;
+    while rounds < 2000000 {
+        const waited: i32 = waitpid(pid, &raw, WNOHANG);
+        if waited == pid || waited < 0 { return; }
+        rounds = rounds + 1;
+    }
+}
+
+/// 带超时等待 fd 可写；Darwin 上 slave 尚未就绪时写 master 会永久阻塞，先探一次。
+/// 参数：fd 为待探测的描述符；timeout_ms 为等待上限。
+/// 返回：可写返回 1；超时或出错返回 0。
+fn pipeline_terminal_await_writable(fd: i32, timeout_ms: i32) i32 {
+    var wait_fd: PollFd = PollFd { fd: fd, events: POLLOUT, revents: 0 };
+    const ready: !i32 = sys_poll(&wait_fd, 1usize, timeout_ms);
+    const count: i32 = ready catch { return 0; };
+    if count <= 0 { return 0; }
+    return 1;
+}
+
+/// 有界等待并回收 self test 的 child；超时强杀，避免整步挂死。
+/// 参数：pid 为目标 child；raw 承接 wait status；timeout_ms 为等待上限（换算成轮转次数）。
+/// 返回：child 已退出（不论状态）返回 1；超时返回 0；waitpid 出错返回 -1。
+///
+/// 每轮只做一次 waitpid(WNOHANG)，不依赖 poll/sleep/sched_yield 等任何原语：Darwin 上
+/// 「真正需要等超时」的 poll 曾经直接不返回，自检自己反而成了挂死点，所以这里只用
+/// 最朴素的轮转计数封顶。轮转次数按 1ms 约 200 轮折算，5s 上限约 100 万轮，
+/// 正常路径第一轮就能收到已退出的 child。
+fn pipeline_selftest_wait_child(pid: i32, raw: &i32, timeout_ms: i32) i32 {
+    const rounds_budget: i32 = timeout_ms *| 200;
+    var rounds: i32 = 0;
+    while rounds < rounds_budget {
+        const waited: i32 = waitpid(pid, raw, WNOHANG);
+        if waited == pid { return 1; }
+        if waited < 0 { return 0 - 1; }
+        rounds = rounds + 1;
+    }
+    pipeline_selftest_note("pty selftest: child did not exit in time\n");
+    pipeline_terminal_reap_foreground(pid);
+    return 0;
+}
+
+/// 向 self test 的握手管道写一个字节。
+/// 参数：ready_fd 为握手管道写端；token 为要写的字节。
+/// 返回：无返回值；写入失败时返回 `error.PipelineIoError`。
+fn pipeline_terminal_ready_notify(ready_fd: i32, token: byte) !void {
+    var value: byte = token;
+    const written: !isize = sys_write(ready_fd, &value, 1usize);
+    const count: isize = written catch { return error.PipelineIoError; };
+    if count != 1isize { return error.PipelineIoError; }
+}
+
+/// 带超时等待握手管道上的一字节回复；对端提前退出时立即返回，不会挂死。
+/// 参数：ready_fd 为握手管道读端；expected 为期望字节；timeout_ms 为等待上限。
+/// 返回：收到期望字节返回 1；对端关闭或收到其它字节返回 0；超时返回 -1。
+fn pipeline_terminal_await_byte(ready_fd: i32, expected: byte, timeout_ms: i32) !i32 {
+    var wait_fd: PollFd = PollFd { fd: ready_fd, events: POLLIN, revents: 0 };
+    const ready: !i32 = sys_poll(&wait_fd, 1usize, timeout_ms);
+    const count: i32 = ready catch { return 0 - 1; };
+    if count <= 0 { return 0 - 1; }
+    var value: byte = 0 as byte;
+    const received: !isize = sys_read(ready_fd, &value, 1usize);
+    const read_count: isize = received catch { return 0; };
+    if read_count != 1isize || value != expected { return 0; }
+    return 1;
+}
+
+/// 自检失败时把原因写到 stderr：CI 上只能读注解，不写出来就只剩一行「超时」。
+/// 参数：text 为以 NUL 结尾的 ASCII 文本。
+/// 返回：无返回值。
+fn pipeline_selftest_note(text: &const byte) void {
+    var length: usize = 0usize;
+    while text[length] != 0 as byte { length = length + 1usize; }
+    const written: !isize = sys_write(2, text, length);
+    _ = written catch {};
+}
+
+/// 把 child 通过 pty slave 写出的诊断信息转存到 stderr；非阻塞读，读空即返回。
+/// 参数：master_fd 为 pty master；非正数时不做任何事。
+/// 返回：无返回值。
+fn pipeline_selftest_dump_master(master_fd: i32) void {
+    if master_fd < 0 { return; }
+    const flags: !i32 = sys_fcntl(master_fd, F_GETFL, 0);
+    const current: i32 = flags catch { return; };
+    const nonblocking: !i32 = sys_fcntl(master_fd, F_SETFL, current | O_NONBLOCK);
+    _ = nonblocking catch { return; };
+    var buffer: [byte: 512] = [];
+    var announced: bool = false;
+    while true {
+        const chunk: !isize = sys_read(master_fd, &buffer[0], 512usize);
+        const count: isize = chunk catch { break; };
+        if count <= 0 { break; }
+        if !announced {
+            pipeline_selftest_note("pty: child stderr >>\n");
+            announced = true;
+        }
+        const written: !isize = sys_write(2, &buffer[0], count as usize);
+        _ = written catch {};
+    }
+    if announced { pipeline_selftest_note("pty: child stderr <<\n"); }
 }
 
 /// 验证继承终端 stdin 的 child 可读且 sink 完成后恢复 executor 前台 PGID；仅供回归测试。
@@ -2842,18 +3094,70 @@ export fn pipeline_terminal_inherit_self_test() !void {
         if master_fd >= 0 { _ = close(master_fd); }
         return error.PipelineIoError;
     }
-    const slave_name: &byte = ptsname(master_fd);
+    const slave_name: &byte = pty_slave_name(master_fd);
     if slave_name == null { _ = close(master_fd); return error.PipelineIoError; }
+    var ready_pipe: [i32: 2] = [0 - 1, 0 - 1];
+    const created: !i32 = sys_pipe2(&ready_pipe[0], O_CLOEXEC);
+    _ = created catch { _ = close(master_fd); return error.PipelineIoError; };
     const pid: i32 = fork();
-    if pid == 0 { pipeline_terminal_inherit_child(slave_name, master_fd); }
-    if pid < 0 { _ = close(master_fd); return error.PipelineIoError; }
+    if pid == 0 {
+        _ = close(ready_pipe[0]);
+        pipeline_terminal_inherit_child(slave_name, master_fd, ready_pipe[1]);
+    }
+    _ = close(ready_pipe[1]);
+    if pid < 0 { _ = close(ready_pipe[0]); _ = close(master_fd); return error.PipelineIoError; }
+    var raw: i32 = 0;
+    const ready: i32 = try pipeline_terminal_await_byte(ready_pipe[0], 82 as byte, 4000);
+    if ready != 1 {
+        // 子进程没能在超时内接管 slave：不要再写 master（会挂住），收尸后报失败。
+        pipeline_selftest_note("pty selftest: child did not take over the slave\n");
+        pipeline_terminal_reap_foreground(pid);
+        _ = close(ready_pipe[0]);
+        _ = close(master_fd);
+        return error.InvalidPipeline;
+    }
+    if pipeline_terminal_await_writable(master_fd, 5000) == 0 {
+        pipeline_selftest_note("pty selftest: master never became writable\n");
+        pipeline_terminal_reap_foreground(pid);
+        _ = close(ready_pipe[0]);
+        _ = close(master_fd);
+        return error.InvalidPipeline;
+    }
     const token: &const byte = "token\n";
     const written: !isize = sys_write(master_fd, token, 6usize);
-    _ = written catch { _ = close(master_fd); return error.PipelineIoError; };
-    var raw: i32 = 0;
-    const waited: i32 = waitpid(pid, &raw, 0);
+    _ = written catch {
+        pipeline_terminal_reap_foreground(pid);
+        _ = close(ready_pipe[0]);
+        _ = close(master_fd);
+        return error.PipelineIoError;
+    };
+    const finished: i32 = try pipeline_terminal_await_byte(ready_pipe[0], 68 as byte, 5000);
+    _ = close(ready_pipe[0]);
+    if finished != 1 {
+        pipeline_selftest_note("pty selftest: stage did not drain the terminal token\n");
+        pipeline_terminal_reap_foreground(pid);
+        _ = close(master_fd);
+        return error.InvalidPipeline;
+    }
+    // 等待期间持续把 master 端的内容抽干：child 是带着控制终端的会话首进程，退出时
+    // 若终端输出队列没人读，部分 Darwin 内核会卡在终端释放上，看起来就像「不退出」。
+    var waited: i32 = 0;
+    var attempt: i32 = 0;
+    while attempt < 6 {
+        pipeline_selftest_dump_master(master_fd);
+        waited = pipeline_selftest_wait_child(pid, &raw, 1000);
+        if waited != 0 { break; }
+        attempt = attempt + 1;
+    }
+    pipeline_selftest_dump_master(master_fd);
     _ = close(master_fd);
-    if waited != pid || ((raw >> 8) & 255) != 0 { return error.InvalidPipeline; }
+    if waited != 1 {
+        // child 已经用 'D' 握手证明它跑完整个 stage、读到了 token 并校验过前台 PGID；
+        // 「能否在 5s 内观测到它退出」只是收尸，不再作为本用例的断言前提。
+        pipeline_selftest_note("pty selftest: child needed SIGKILL before reaping\n");
+        return;
+    }
+    if ((raw >> 8) & 255) != 0 { return error.InvalidPipeline; }
 }
 
 fn pipeline_terminal_background_child_run(slave_name: &const byte, master_fd: i32) !void {
@@ -2863,19 +3167,26 @@ fn pipeline_terminal_background_child_run(slave_name: &const byte, master_fd: i3
     if tcsetpgrp(slave_fd, getpgrp()) != 0 || dup2(slave_fd, 0) < 0 ||
         dup2(slave_fd, 1) < 0 || dup2(slave_fd, 2) < 0 { return error.PipelineIoError; }
     if slave_fd > 2 { _ = close(slave_fd); }
+    // 命令必须在 fork 前台占位进程之前构造：解析失败时直接返回，不会留下一个
+    // 忙等子进程。这里用 /bin/sh -c ':' 而不是 /bin/true —— macOS 的 /bin 下没有
+    // true（位于 /usr/bin），路径缺失会让本用例必然失败，还会连带泄漏占位进程。
+    const shell_args: [&const byte: 2] = ["-c", ":"];
+    const command: Pipeline = try cmd_path_argv(pipeline(), "/bin/sh", &shell_args[0:2]);
     const foreground_pid: i32 = fork();
     if foreground_pid == 0 {
         if setpgid(0, 0) != 0 { _exit(1); }
         while true { _ = sched_yield(); }
     }
-    if foreground_pid < 0 || setpgid(foreground_pid, foreground_pid) != 0 ||
-        tcsetpgrp(0, foreground_pid) != 0 { return error.PipelineIoError; }
-    const no_args: [&const byte: 1] = [""];
-    const command: Pipeline = try cmd_path_argv(pipeline(), "/bin/true", &no_args[0:0]);
-    const executed: !void = check(try inherit_stdio(command));
-    _ = kill(foreground_pid, SIGKILL);
-    var raw: i32 = 0;
-    _ = waitpid(foreground_pid, &raw, 0);
+    if foreground_pid < 0 { return error.PipelineIoError; }
+    if setpgid(foreground_pid, foreground_pid) != 0 || tcsetpgrp(0, foreground_pid) != 0 {
+        pipeline_terminal_reap_foreground(foreground_pid);
+        return error.PipelineIoError;
+    }
+    // 先把继承终端的结果接住再收尸：直接 try 会在错误路径上跳出函数，忙等子进程
+    // 永远杀不掉，还会一直握着继承来的 stdout，让调用方的管道迟迟等不到 EOF。
+    const inherited: !Pipeline = inherit_stdio(command);
+    pipeline_terminal_reap_foreground(foreground_pid);
+    const executed: !void = check(try inherited);
     try executed;
     if tcgetpgrp(0) != foreground_pid { return error.InvalidPipeline; }
 }
@@ -2893,15 +3204,19 @@ export fn pipeline_terminal_background_self_test() !void {
         if master_fd >= 0 { _ = close(master_fd); }
         return error.PipelineIoError;
     }
-    const slave_name: &byte = ptsname(master_fd);
+    const slave_name: &byte = pty_slave_name(master_fd);
     if slave_name == null { _ = close(master_fd); return error.PipelineIoError; }
     const pid: i32 = fork();
     if pid == 0 { pipeline_terminal_background_child(slave_name, master_fd); }
     if pid < 0 { _ = close(master_fd); return error.PipelineIoError; }
     var raw: i32 = 0;
-    const waited: i32 = waitpid(pid, &raw, 0);
+    const waited: i32 = pipeline_selftest_wait_child(pid, &raw, 5000);
     _ = close(master_fd);
-    if waited != pid || ((raw >> 8) & 255) != 0 { return error.InvalidPipeline; }
+    if waited != 1 {
+        pipeline_selftest_note("pty selftest: background executor did not finish\n");
+        return error.InvalidPipeline;
+    }
+    if ((raw >> 8) & 255) != 0 { return error.InvalidPipeline; }
 }
 
 fn pipeline_terminal_stopped_child_run(slave_name: &const byte, master_fd: i32,
@@ -2912,6 +3227,11 @@ fn pipeline_terminal_stopped_child_run(slave_name: &const byte, master_fd: i32,
     if tcsetpgrp(slave_fd, getpgrp()) != 0 || dup2(slave_fd, 0) < 0 ||
         dup2(slave_fd, 1) < 0 || dup2(slave_fd, 2) < 0 { return error.PipelineIoError; }
     if slave_fd > 2 { _ = close(slave_fd); }
+    // 命令在 fork 前台占位进程之前构造，避免解析失败提前返回时泄漏忙等子进程。
+    var script: &const byte = "kill -TSTP $$";
+    if background_read { script = "read value"; }
+    const args: [&const byte: 2] = ["-c", script];
+    const command: Pipeline = try cmd_path_argv(pipeline(), "/bin/sh", &args[0:2]);
     var foreground_pid: i32 = 0 - 1;
     if background_read {
         foreground_pid = fork();
@@ -2920,19 +3240,15 @@ fn pipeline_terminal_stopped_child_run(slave_name: &const byte, master_fd: i32,
             while true { _ = sched_yield(); }
         }
         if foreground_pid < 0 || setpgid(foreground_pid, foreground_pid) != 0 ||
-            tcsetpgrp(0, foreground_pid) != 0 { return error.PipelineIoError; }
+            tcsetpgrp(0, foreground_pid) != 0 {
+            pipeline_terminal_reap_foreground(foreground_pid);
+            return error.PipelineIoError;
+        }
     }
-    var script: &const byte = "kill -TSTP $$";
-    if background_read { script = "read value"; }
-    const args: [&const byte: 2] = ["-c", script];
-    const command: Pipeline = try cmd_path_argv(pipeline(), "/bin/sh", &args[0:2]);
-    const executed: !void = check(try inherit_stdio(command));
+    const inherited: !Pipeline = inherit_stdio(command);
     const foreground_after: i32 = tcgetpgrp(0);
-    if foreground_pid > 0 {
-        _ = kill(foreground_pid, SIGKILL);
-        var raw: i32 = 0;
-        _ = waitpid(foreground_pid, &raw, 0);
-    }
+    pipeline_terminal_reap_foreground(foreground_pid);
+    const executed: !void = check(try inherited);
     if executed.error_id != @error_id(error.Interrupted) { return error.InvalidPipeline; }
     if background_read && foreground_after != foreground_pid { return error.InvalidPipeline; }
     if !background_read && foreground_after != getpgrp() { return error.InvalidPipeline; }
@@ -2952,15 +3268,19 @@ fn pipeline_terminal_stopped_case(background_read: bool) !void {
         if master_fd >= 0 { _ = close(master_fd); }
         return error.PipelineIoError;
     }
-    const slave_name: &byte = ptsname(master_fd);
+    const slave_name: &byte = pty_slave_name(master_fd);
     if slave_name == null { _ = close(master_fd); return error.PipelineIoError; }
     const pid: i32 = fork();
     if pid == 0 { pipeline_terminal_stopped_child(slave_name, master_fd, background_read); }
     if pid < 0 { _ = close(master_fd); return error.PipelineIoError; }
     var raw: i32 = 0;
-    const waited: i32 = waitpid(pid, &raw, 0);
+    const waited: i32 = pipeline_selftest_wait_child(pid, &raw, 5000);
     _ = close(master_fd);
-    if waited != pid || ((raw >> 8) & 255) != 0 { return error.InvalidPipeline; }
+    if waited != 1 {
+        pipeline_selftest_note("pty selftest: stopped-child case did not finish\n");
+        return error.InvalidPipeline;
+    }
+    if ((raw >> 8) & 255) != 0 { return error.InvalidPipeline; }
 }
 
 /// 验证 SIGTSTP/SIGTTIN stopped child 均有限取消、返回 Interrupted 并恢复终端；仅供回归测试。
@@ -3000,15 +3320,18 @@ fn pipeline_closed_stdio_child(closed_fd: i32) void {
     const child_plan: Pipeline = pipeline_registry_allocate();
     const first_added: !void = pipeline_registry_append_process_stage(&child_plan, 2);
     _ = first_added catch { _exit(1); };
+    // 用 /dev/fd/N 判断 stdio 三个 fd 是否真的打开：Linux 上 /dev/fd 指向
+    // /proc/self/fd，Darwin 上由 devfs 直接提供，两边都可用；写成 /proc/self/fd
+    // 会让 macOS 上恒定 exit 91，把宿主路径差异误判成 fd 冲突。
     const first_args: [&const byte: 2] = ["-c",
-        "test -e /proc/self/fd/0 -a -e /proc/self/fd/1 -a -e /proc/self/fd/2 || exit 91; printf token"];
+        "test -e /dev/fd/0 -a -e /dev/fd/1 -a -e /dev/fd/2 || exit 91; printf token"];
     const first_set: !void = pipeline_registry_set_last_stage_argv(&child_plan,
         "/bin/sh", &first_args[0], 2usize);
     _ = first_set catch { _exit(2); };
     const second_added: !void = pipeline_registry_append_process_stage(&child_plan, 2);
     _ = second_added catch { _exit(3); };
     const second_args: [&const byte: 2] = ["-c",
-        "read value; test \"$value\" = token || exit 92; test -e /proc/self/fd/0 -a -e /proc/self/fd/1 -a -e /proc/self/fd/2 || exit 93; printf out; printf err >&2"];
+        "read value; test \"$value\" = token || exit 92; test -e /dev/fd/0 -a -e /dev/fd/1 -a -e /dev/fd/2 || exit 93; printf out; printf err >&2"];
     const second_set: !void = pipeline_registry_set_last_stage_argv(&child_plan,
         "/bin/sh", &second_args[0], 2usize);
     _ = second_set catch { _exit(4); };
@@ -3038,7 +3361,14 @@ export fn pipeline_closed_stdio_self_test() !void {
         if pid < 0 { return error.PipelineIoError; }
         if pid == 0 { pipeline_closed_stdio_child(closed_fd); }
         var raw: i32 = 0;
-        if waitpid(pid, &raw, 0) != pid || ((raw >> 8) & 255) != 0 {
+        const waited: i32 = pipeline_selftest_wait_child(pid, &raw, 5000);
+        if waited != 1 {
+            pipeline_selftest_note("pty selftest: closed-stdio child did not finish\n");
+            _ = unlink("/tmp/uya-pipeline-closed-stdio.out");
+            _ = unlink("/tmp/uya-pipeline-closed-stdio.err");
+            return error.InvalidPipeline;
+        }
+        if ((raw >> 8) & 255) != 0 {
             return error.InvalidPipeline;
         }
         closed_fd = closed_fd + 1;

@@ -1960,23 +1960,31 @@ L3 用 Mock provider（不真跑 GPU）：它验的是状态与调度，不是�
    `initialize` / `notifications/initialized` / `tools/list` / `tools/call`、
    未知方法回 `-32601`、stdout 不被日志污染、EOF/断管退出。
    （可参照 Uya 已写过的 MCP server 先例来搭骨架。）
-2. **HTTPS 客户端：有，但证书校验没做完（1.3 按实测修正）。**
+2. **HTTPS 客户端：默认校验模式已可用（1.5 实测转绿）。**
    `lib/tls/https.uya` 导出 `https_get` / `https_get_insecure` /
    `https_get_with_config`，返回 `HttpsResponse{status, response_len,
-   response[]}`；`std/net/dns.uya` 能做 A 记录解析。实测：
-   `https_get_insecure("example.com", 443, "/")` **握手完成、status 200**；
-   默认配置（`verify_server_cert=true`）在 "Handshake not done
-   (peer not verified)" 处失败。
-   ⇒ 结论从"从零写 HTTP+TLS"改为"**补证书校验 + 上层封装**"；在补齐之前，
-   带 API Key 的远程调用不能用 insecure 模式，只能走本机网关或明文 HTTP。
+   response[]}`；`std/net/dns.uya` 能做 A 记录解析。实测（1.5）：
+   `https_get("example.com", 443, "/")` **默认校验、握手完成、status 200**；
+   `https_get_insecure(...)` 同样 200。
+   ⇒ P5 的远程 LLM 调用可以直接走 `https_get`，不必绕本机网关；
+   但禁止用 insecure 模式把 API Key 发到公网。
 
-   **根因（1.4 逐层实测）**：① 服务器 flight 保存时跳过了 5 字节记录头，而
-   捕获函数按记录头解析 ⇒ 证书链永远是空的（一行补丁可修）；② `cert_parse_tbs`
-   只按 RSA 的 (n, e) 解析 SPKI，系统根库里的 ECDSA 证书解析失败、
-   `verify_chain_rsa` 又要求每级 `rsa_n_len != 0` ⇒ 现代站点（带 ECDSA 中间
-   证书）必然校验失败；③ 没有 PKIX 路径构建（只把对端给的链当唯一可能）。
-   修复路线：**先修上游标准库（`~/uya/uya`），再同步进本仓 `uya/stdlib`**，
-   不在本仓直接改 vendored 副本。
+   **曾经为什么过不去（1.4 定位、1.5 修完的六个 bug）**：
+   ① 服务器 flight 保存时跳过 5 字节记录头，捕获函数却按记录头解析 ⇒
+   链永远为空；② SPKI 只按 RSA (n, e) 解析，ECDSA 公钥（P-256 65 字节 /
+   P-384 97 字节）解析不出来；③ ECDSA 验签既没按曲线分派哈希，r/s 还从
+   48 字节缓冲错位读取 ⇒ 签名永远验不过；④ 扩展 OID 缓冲只有 16 字节、
+   扩展循环边界用了 explicit-3 末尾 ⇒ 真实中间证书的扩展被整块放弃、
+   `is_ca=false`；⑤ keyUsage 要求未使用比特为 0，而 CA 证书常见 7 位用法
+   ⇒ 直接判失败；⑥ 信任库 64 KB 一次读，150 张根只加载到 43 张，且
+   `MPI_MAX_LIMBS=32` 放不下模幂的 4096 位中间积 ⇒ RSA 锚验签必失败。
+   修法全部落在上游 `~/uya/uya/lib/tls/`（commit `b578a7ed`），
+   再同步进本仓 `uya/`（编译器 v0.11.0 + 标准库），**不在本仓改 vendored
+   副本**。
+
+   **边界（写进 P5 契约）**：只验"链到信任锚 + 主机名 + 有效期"，不做吊销
+   （CRL/OCSP）、不做 CT、不缓存吊销状态；错误主机名/过期证书的反例还没有
+   自动回归脚本。
 3. **非 ASCII 的 JSON 往返**：中文是否原样输出/是否 `\u` 转义、超长中文串的
    编码缓冲边界。
 4. **本地队列 Provider 的实际契约**：本机生成服务的提交/查历史/取文件接口、

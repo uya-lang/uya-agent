@@ -543,11 +543,15 @@ v1.3 不推翻 v1.2 的架构判断：提交记录 / 幂等任务 / Worker 分�
 
 评审里这几条当时是"读码 + grep"得出的，P0 上手后实测推翻了，如实记下：
 
-1. **「stdlib 没有 HTTP 客户端」→ 有，但证书校验没做完。**
+1. **「stdlib 没有 HTTP 客户端」→ 有，且默认校验模式已可用。**
    `lib/tls/https.uya` 导出 `https_get` / `https_get_insecure` /
-   `https_get_with_config`，`std/net/dns.uya` 能解析域名；默认配置握手报
-   `peer not verified`，insecure 模式实测 `example.com` 返回 200。
-   证据：`proto/https_probe.uya`、`proto/https_probe_selftest.sh`。
+   `https_get_with_config`，`std/net/dns.uya` 能解析域名。
+   1.1~1.4 期间默认配置握手报 `peer not verified`（当时的结论是"校验没做完"），
+   1.5 定位并修完 6 个上游 bug 后，`https_get("example.com",443,"/")` 直接
+   拿到 `S: 200`——**这条勘误本身又被勘误了一次**，教训是"跑不通"不等于
+   "没实现"，先分层打点再下结论。
+   证据：`proto/https_probe.uya`、`proto/https_probe_selftest.sh`、
+   P0_FINDINGS §1.12。
 2. **「read-only 下 MCP 工具一律拒绝」→ 是逐次批准。**
    `perm_requires_approval() || perm_confine()`：read-only 与
    workspace-write 都要用户逐次点头，无回答渠道时 fail closed。
