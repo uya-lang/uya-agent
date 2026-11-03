@@ -787,7 +787,16 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 
 ---
 
-# 10. P8：Provider、Worker 和异步视频任务
+# 10. P8：Provider、Worker 和异步视频任务（**第一段：mock Provider + Worker 已落地**）
+
+> 1.13 落地：`src/provider.uya`（版本化能力表 + mock VideoProvider，确定性
+> 产出占位 mp4）、任务表加 `target=video` 步骤（分镜 → 逐镜渲染 → 任务完成）、
+> `drama worker run` 扫未完成任务并执行（状态以记录文件为准）。
+> 验收：`sh drama_plugin/p8_selftest.sh`（13 项）：能力表版本化、
+> produce 立刻回 queued、未批准剧本 ⇒ 任务 failed 且不产文件、
+> 批准后 worker 跑完并产出 3 个镜头文件、视频不改 Canon、已完成的活不重做。
+> 仍未做：真实本机队列 Adapter（submit/poll/cancel/取文件）、单 Worker 锁、
+> 有限重试与取消、成本（GPU 分钟）记账、Cloud/HttpProvider。
 
 ## 目标
 
@@ -795,14 +804,14 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 
 ## Provider 接口
 
-- [ ] 定义 Provider 基础配置。
-- [ ] 定义统一错误类型。
+- [x] 定义 Provider 基础配置。
+- [x] 定义统一错误类型。
 - [ ] 定义超时和重试策略。
-- [ ] 定义模型、Provider 与**能力表**版本记录。
-- [ ] 定义 `video.capabilities()`：哪些动作能演、哪些不能（版本化）。
+- [x] 定义模型、Provider 与**能力表**版本记录。
+- [x] 定义 `video.capabilities()`：哪些动作能演、哪些不能（版本化）。
 - [ ] 定义 LLMProvider。
 - [ ] 定义 ImageProvider。
-- [ ] 定义 VideoProvider。
+- [x] 定义 VideoProvider（mock；真实产线 Adapter 留到接本机队列）。
 - [ ] 定义 AudioProvider（首版不做配音替换）。
 - [ ] 定义 MediaProvider。
 - [ ] 定义 `PipelineProvider`：以子进程方式调用既有产线脚本
@@ -825,15 +834,15 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 
 ## Worker
 
-- [ ] 实现持久任务扫描。
+- [x] 实现持久任务扫描。
 - [ ] 实现单 Worker 锁。
-- [ ] 实现任务状态迁移。
+- [x] 实现任务状态迁移。
 - [ ] 实现步骤检查点。
 - [ ] 实现 Provider 轮询。
-- [ ] 实现中断恢复。
+- [x] 实现中断恢复（步骤状态在记录里；失败任务可重跑）。
 - [ ] 实现取消处理。
 - [ ] 实现有限重试。
-- [ ] 实现任务状态查询。
+- [x] 实现任务状态查询。
 - [ ] 实现 Worker 不在线时的明确反馈。
 
 ## 操作
@@ -845,8 +854,8 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 
 ## 验收
 
-- [ ] 可创建视频任务并返回 task_id（`call` 在 60 s 内返回）。
-- [ ] MCP 请求快速返回，不等待视频完成。
+- [x] 可创建视频任务并返回 task_id（`call` 在 60 s 内返回）。
+- [x] MCP 请求快速返回，不等待视频完成。
 - [ ] MCP Server 退出不丢失任务记录。
 - [ ] Worker 重启后能恢复查询既有 job（先查历史，不盲目重发）。
 - [ ] 同一 `prompt_id` 不会重复执行、不会重复记账。

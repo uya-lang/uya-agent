@@ -25,8 +25,9 @@ $HERE/src/json_out.uya $HERE/src/registry.uya $HERE/src/schema.uya \
 $HERE/src/dispatch.uya $HERE/src/store.uya $HERE/src/project.uya \
 $HERE/src/digest.uya $HERE/src/asset.uya $HERE/src/bible.uya \
 $HERE/src/canon.uya $HERE/src/httpc.uya $HERE/src/llm.uya \
-$HERE/src/story.uya $HERE/src/context.uya $HERE/src/task.uya $HERE/src/board.uya \
-$HERE/src/ops.uya $HERE/src/server.uya"
+$HERE/src/story.uya $HERE/src/context.uya $HERE/src/task.uya \
+$HERE/src/board.uya $HERE/src/provider.uya $HERE/src/ops.uya \
+$HERE/src/server.uya"
 
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
@@ -48,8 +49,8 @@ cat > "$TMP/in.jsonl" <<'JSONL'
 {"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}
 {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"list","arguments":{}}}
 {"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"describe","arguments":{"operation":"episode.produce"}}}
-{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"call","arguments":{"operation":"episode.produce","input":{"project_id":"p_00000000","episode_id":"ep-1","stage":"shots"},"request_id":"r-1"}}}
-{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"call","arguments":{"operation":"episode.produce","input":{"project_id":"p_00000000","episode_id":"ep-1","stage":"shots"},"request_id":"r-1"}}}
+{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"call","arguments":{"operation":"episode.produce","input":{"project_id":"p_00000000","episode_id":"ep-1","stage":"video"},"request_id":"r-1"}}}
+{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"call","arguments":{"operation":"episode.produce","input":{"project_id":"p_00000000","episode_id":"ep-1","stage":"video"},"request_id":"r-1"}}}
 {"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"call","arguments":{"operation":"episode.produce","input":{"project_id":"p_00000000","episode_id":"ep-2"},"request_id":"r-1"}}}
 {"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"call","arguments":{"operation":"project.get","input":{}}}}
 {"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"call","arguments":{"operation":"project.get","input":{"project_id":7}}}}
@@ -118,8 +119,8 @@ check(sch.get('required') == ['project_id', 'episode_id'],
       'describe 报 required')
 check(props.get('episode_id', {}).get('type') == 'string',
       'describe 报字段类型')
-check(props.get('stage', {}).get('enum') == ['script', 'storyboard',
-                                            'shots', 'render'],
+check(props.get('stage', {}).get('enum') == ['script', 'video',
+                                            'storyboard', 'render'],
       'describe 报 enum')
 check(len(d.get('errors') or []) >= 3, 'describe 报错误码清单')
 check('example' in d, 'describe 带最小示例')

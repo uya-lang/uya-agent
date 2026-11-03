@@ -18,8 +18,9 @@ $HERE/src/json_out.uya $HERE/src/registry.uya $HERE/src/schema.uya \
 $HERE/src/dispatch.uya $HERE/src/store.uya $HERE/src/project.uya \
 $HERE/src/digest.uya $HERE/src/asset.uya $HERE/src/bible.uya \
 $HERE/src/canon.uya $HERE/src/httpc.uya $HERE/src/llm.uya \
-$HERE/src/story.uya $HERE/src/context.uya $HERE/src/task.uya $HERE/src/board.uya \
-$HERE/src/ops.uya $HERE/src/server.uya"
+$HERE/src/story.uya $HERE/src/context.uya $HERE/src/task.uya \
+$HERE/src/board.uya $HERE/src/provider.uya $HERE/src/ops.uya \
+$HERE/src/server.uya"
 
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
@@ -63,7 +64,7 @@ fi
 # ---------- 3. worker 骨架 ----------
 out=$("$APP" worker run --data-dir /tmp/drama-y)
 case "$out" in
-    *"/tmp/drama-y") ok "worker：骨架启动并读到 data_dir" ;;
+    *tasks_seen*) ok "worker：扫任务并回计数（没有任务时 0/0/0）" ;;
     *) bad "worker 输出不对：$out" ;;
 esac
 
