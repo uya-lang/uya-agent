@@ -3,7 +3,7 @@
 - 文档编号：DRAMA-P0-001
 - 对应设计：DRAMA-DESIGN-001 v1.3
 - 对应任务：DRAMA-TODO-001 v1.3 §2.2（仍需实测）
-- 状态：进行中（B1/B2/B3/B5-前半/目录枚举 已过验收；B4 已定案；B6/B7 部分）
+- 状态：进行中（B1/B2/B3/B5-前半/目录枚举/队列契约 已过验收；B4 已定案；B6/B7 部分）
 
 每条结论只写三样东西：**怎么验的、验出什么、对设计的影响**。
 没有跑过的项标「待实测」，不用推测填。
@@ -137,6 +137,25 @@ sh drama_plugin/proto/scan_selftest.sh
 但判据可以更硬：单次 `list`/`continuity.inspect` < 200 ms 靠索引，
 而不是靠"文件少"。
 
+### 1.8 本地生成队列契约 —— 已采集（读侧）
+
+**怎么采的**：本机队列正在跑真实任务时，直接读
+`/system_stats`、`/prompt`、`/queue`、`/history`、`/view`。
+写侧（`POST /prompt`）**故意没提交**——会占 GPU，留到 P8 的真实链路里测。
+
+**结论**：见 `proto/LOCAL_QUEUE_CONTRACT.md`，五个关键事实：
+
+1. 视频产物出现在 `outputs.<node>.images[]`，靠 `animated: [true]` 识别，
+   找 `videos` 键会颗粒无收；
+2. `client_id` 由调用方给，落在 `extra_data` 里 ⇒ **这是幂等键的落点**：
+   提交后崩溃时按 `client_id` 扫最近历史找回来，不盲目重发；
+3. 未知 `prompt_id` 返回 `{}` 而不是 404 ⇒ 轮询必须把空 dict 当"未完成"；
+4. 单卡单槽（`queue_running` 长度实测 1）⇒ 并发上限 1，产能基线成立；
+5. 取消分两种：排队中 `DELETE /queue`、执行中 `POST /interrupt`。
+
+**对设计的影响**：DESIGN §10.3 的 `submit/poll/fetch/cancel/depth`
+可以直接按这张表实现；`GET /prompt` 的 `queue_remaining` 用来派发前限流。
+
 ---
 
 ## 2. 已出结论、不必再试
@@ -204,6 +223,7 @@ grep -rn 'fsync\|fdatasync' uya/stdlib/lib --include=*.uya   # 无输出
 | `proto/txn.ush` | 原子写 + 锁 + 陈旧锁 + 崩溃注入 | `proto/txn_selftest.sh` |
 | `proto/http_client.ush` | 明文 HTTP GET（建连/请求/响应/超时） | `proto/http_selftest.sh` |
 | `proto/scan.ush` | 目录枚举 + 文件摘要（getdents64 / FNV-1a） | `proto/scan_selftest.sh` |
+| `proto/LOCAL_QUEUE_CONTRACT.md` | 本地队列实测契约（读侧） | 现场采集，样本在文档里 |
 
 两个脚本都是**可重跑**的：`sh drama_plugin/proto/selftest.sh`、
 `sh drama_plugin/proto/txn_selftest.sh`，失败即 exit 1。

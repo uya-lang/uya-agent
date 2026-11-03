@@ -162,8 +162,11 @@ JSON 上限/非 ASCII → env/密钥注入 → 资产可见性。
       仍缺 TLS、域名解析、重定向、分块、SSE、连接复用。
 - [x] **非 ASCII JSON 往返**：实测中文**原样透传**（UTF-8 字节，不转义）；
       缓冲边界仍按码点算长度。
-- [ ] **本地队列 Provider 契约**：提交、查历史、取文件；队列满与重启清空
-      队列时的行为；单卡串行的实测吞吐（每镜耗时）。
+- [-] **本地队列 Provider 契约**：读侧已实测（`/prompt` 队列深度、
+      `/queue`、`/history`、`/view` 取 mp4；`client_id` 即幂等键落点，
+      见 `proto/LOCAL_QUEUE_CONTRACT.md`）；单卡串行吞吐有真实日志
+      （12.5 min/镜、重做 1.56×）。仍缺：`POST /prompt` 返回形状、
+      队列满/重启清空行为、取消是否真停 GPU。
 - [x] **fsync 替代方案确认**：`grep -rn 'fsync\|fdatasync' uya/stdlib/lib`
       无输出 ⇒ 接受「掉电可能丢最后一次提交」，写进部署文档与 §15 已知限制。
 - [x] **陈旧锁处置**：`pid + kill(pid,0)` 探活实测可用，`kill -9` 后
