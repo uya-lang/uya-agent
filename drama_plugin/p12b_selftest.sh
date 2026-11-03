@@ -176,6 +176,43 @@ JSON
 [ "$(code_of "$out")" = "OK" ] && ok "外观漂移有显式豁免通道（allow_drift）" \
     || bad "豁免通道不通（$(code_of "$out")）"
 
+# ---------- 7. 世界规则被推翻 ----------
+P7=$(new_project "反例-规则被推翻")
+ask "$(cat <<JSON
+{"jsonrpc":"2.0","id":60,"method":"tools/call","params":{"name":"call","arguments":{"operation":"canon.commit","input":{"project_id":"$P7","base_revision":0,"events":[{"type":"rule.define","rule":"r1","text":"冰箱门关上以后没人能打开"}]}}}}
+JSON
+)" > /dev/null
+out=$(ask "$(cat <<JSON
+{"jsonrpc":"2.0","id":61,"method":"tools/call","params":{"name":"call","arguments":{"operation":"canon.commit","input":{"project_id":"$P7","base_revision":1,"events":[{"type":"rule.define","rule":"r1","text":"冰箱门随时能打开"}]}}}}
+JSON
+)")
+[ "$(code_of "$out")" = "RULE_VIOLATION" ] \
+    && ok "反例 7：世界规则被推翻 ⇒ RULE_VIOLATION" \
+    || bad "反例 7 没报 RULE_VIOLATION（$(code_of "$out")）"
+
+# 同一条规则重复定义（文本一样）是幂等的
+out=$(ask "$(cat <<JSON
+{"jsonrpc":"2.0","id":62,"method":"tools/call","params":{"name":"call","arguments":{"operation":"canon.commit","input":{"project_id":"$P7","base_revision":1,"events":[{"type":"rule.define","rule":"r1","text":"冰箱门关上以后没人能打开"}]}}}}
+JSON
+)")
+[ "$(code_of "$out")" = "OK" ] && ok "同一规则重复定义是幂等的" \
+    || bad "重复定义被误拒（$(code_of "$out")）"
+
+# ---------- 8. 承诺回收率 ----------
+out=$(ask "$(cat <<JSON
+{"jsonrpc":"2.0","id":63,"method":"tools/call","params":{"name":"call","arguments":{"operation":"promise.report","input":{"project_id":"$P4"}}}}
+JSON
+)")
+printf '%s' "$out" | field | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+assert d['open'] >= 1, d
+assert d['overdue'] >= 1, d
+assert 0 <= d['collected_permille'] <= 1000, d
+print('PASS: promise.report 给出回收率（open=%d closed=%d overdue=%d %.1f%%）'
+      % (d['open'], d['closed'], d['overdue'],
+         d['collected_permille'] / 10.0))" || bad "promise.report 不对"
+
 echo "----"
 if [ "$fails" -eq 0 ]; then
     echo "PASS: P12 第二段（反例库六条）"

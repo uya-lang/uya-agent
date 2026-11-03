@@ -21,7 +21,7 @@
 | `p8_selftest.sh` | Provider 能力表 / 视频任务 / Worker | 14 |
 | `p9_selftest.sh` | 确定性 QA / 生产状态 / 重试 | 9 |
 | `p12_selftest.sh` | 闭环审计（四本账 / 不变量 / 重放） | 13 |
-| `p12b_selftest.sh` | 反例库六条（DESIGN §13.5） | 9 |
+| `p12b_selftest.sh` | 反例库六条 + 规则/回收率（DESIGN §13.5） | 12 |
 | `p10_selftest.sh` | 成片合成（mock 拼接 + manifest） | 11 |
 | `p11_selftest.sh` | 端到端一条龙（三集 → 成片 → 审计 → 成本账本） | 21 |
 | `p13_selftest.sh` | 10 集规模测算（控制面耗时/审计/状态体积） | 11 |
@@ -63,7 +63,7 @@ for f in drama_plugin/p*_selftest.sh; do sh "$f" || echo "FAILED $f"; done
 | `board.uya` | 剧本 → 确定性分镜 + 版本存储 | 499 |
 | `provider.uya` | 版本化能力表 + mock VideoProvider | 136 |
 | `qa.uya` | 剧本/分镜确定性体检 + 不可变报告 | 362 |
-| `audit.uya` | 闭环审计：账本 / 不变量 / 重放完整性 | 375 |
+| `audit.uya` | 闭环审计：账本 / 不变量 / 重放 / 回收率 | 472 |
 | `assemble.uya` | 成片合成（mock 拼接）+ manifest | 246 |
 | `index.uya` | 派生索引（episodes）+ 全量重建 | 255 |
 | `series.uya` | 百集大纲生成、批准与拦截 | 312 |
@@ -84,7 +84,7 @@ for f in drama_plugin/p*_selftest.sh; do sh "$f" || echo "FAILED $f"; done
 | P9 | 第一段 | 确定性 QA + 生产状态 + 重试；缺 ASR/锚帧/成片终检/跨集审计 |
 | P10 | 第一段 | mock 拼接 + manifest；缺 FFmpeg 探测/转码/响度/字幕 |
 | P11 | 第一段 | 端到端一条龙已跑通；发布/打包未做 |
-| P12 | 大部分 | 四本账 + 重放 + 六条反例全绿；缺九条完整谓词、增量检查、错误定位 |
+| P12 | 大部分 | 四本账 + 重放 + 九条不变量（六条反例 + 规则/钩子/时序）；缺错误定位与增量检查 |
 | P13 | 第二段 | 10 集测算 + 成本账本 + 派生索引；配额熔断、百集压力未做 |
 
 ## 4. 已知限制（别当成承诺）
