@@ -348,12 +348,18 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 
 ---
 
-# 5. P3：Project、Bible、Asset 和基础存储（**进行中**：Project + 基础存储已落地，Bible/Asset 未开始）
+# 5. P3：Project、Bible、Asset 和基础存储
+
+（**进行中**：存储 / Project / Bible 版本 / Asset 已落地；子模型字段与迁移器未做）
 
 > 1.5 落地：`src/store.uya`（路径拼接/逐级 mkdir/原子写/读回）、
 > `src/project.uya`（ID 规则、create/get/list、index.jsonl）、
 > `src/ops.uya`（把 project.* 接到 Registry 上）。
-> 验收：`sh drama_plugin/p3_selftest.sh`（22 项，含重启持久化与路径穿越拒绝）。
+> 验收：`sh drama_plugin/p3_selftest.sh`（22 项，含重启持久化与路径穿越拒绝）；
+> `sh drama_plugin/p3b_selftest.sh`（21 项，Bible 版本/冻结文本 hash/资产元数据，
+> 其中锁与资产的 SHA-256 用 Python 侧独立算一遍对数）。
+> 仍未做：CharacterProfile / SceneDefinition / PropDefinition 的字段级约束、
+> 迁移器、审计轮转、符号链接逃逸。
 
 ## 目标
 
@@ -364,7 +370,7 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 - [x] 定义 Project。
 - [x] 定义 ProjectConfig。
 - [ ] 定义 ProjectBible。
-- [ ] 定义 BibleVersion。
+- [x] 定义 BibleVersion（`version` / `format_version` / `content_hash`）。
 - [x] 实现项目 ID 规则。
 - [x] 实现 project.create。
 - [x] 实现 project.get。
@@ -387,8 +393,8 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 - [ ] 定义项目风格与创作规则（含系列级"哪些跨集不许变"）。
 - [ ] 定义 `format` 规格块（画布/成片/帧率/正片+卡/编码/响度）。
 - [ ] 定义固定参考资产 ID。
-- [ ] 冻结文本的**逐字粘贴**校验：写入后核对 hash，与产线脚本里那份一致。
-- [ ] 修改已被剧集引用的设定时创建新版本。
+- [x] 冻结文本的**逐字粘贴**校验：写入后核对 hash，与产线脚本里那份一致。
+- [x] 修改已被剧集引用的设定时创建新版本。
 
 ## 基础存储
 
@@ -406,21 +412,21 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 
 ## Asset Store
 
-- [ ] 定义 AssetMetadata。
-- [ ] 实现 asset ID。
-- [ ] 实现文件登记。
-- [ ] 实现 MIME、大小和 SHA-256 元数据。
-- [ ] 实现 asset.get。
+- [x] 定义 AssetMetadata。
+- [x] 实现 asset ID（项目内文件名即 ID，字符集白名单校验）。
+- [x] 实现文件登记。
+- [x] 实现 MIME、大小和 SHA-256 元数据。
+- [x] 实现 asset.get（`asset.list` 回全部元数据；按名单查留到 P8）。
 - [ ] 实现 shared filesystem 访问模式。
-- [ ] 禁止任意绝对路径查询。
-- [ ] 防止路径穿越和符号链接逃逸。
+- [x] 禁止任意绝对路径查询。
+- [x] 防止路径穿越（名字白名单）；**符号链接逃逸待补**（要 lstat）。
 
 ## 验收
 
 - [x] 创建两个项目并互不干扰。
 - [x] 关闭重启后项目仍存在。
-- [ ] Bible 版本可追溯。
-- [ ] 资产元数据可查询。
+- [x] Bible 版本可追溯。
+- [x] 资产元数据可查询。
 - [x] 非授权路径无法读取。
 
 ---

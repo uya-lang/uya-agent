@@ -16,6 +16,7 @@ export UYA_ROOT=${UYA_ROOT:-$ROOT/uya/stdlib}
 SRC="$HERE/src/main.uya $HERE/src/bytes.uya $HERE/src/json_min.uya \
 $HERE/src/json_out.uya $HERE/src/registry.uya $HERE/src/schema.uya \
 $HERE/src/dispatch.uya $HERE/src/store.uya $HERE/src/project.uya \
+$HERE/src/digest.uya $HERE/src/asset.uya $HERE/src/bible.uya \
 $HERE/src/ops.uya $HERE/src/server.uya"
 
 TMP=$(mktemp -d)
@@ -95,7 +96,8 @@ with open(sys.argv[1], 'a') as f:
     f.write('{"jsonrpc":"2.0","id":9,"method":"tools/list"}' + "\n")
 PY
 
-timeout 120 "$APP" mcp serve < "$TMP/in.jsonl" > "$TMP/out.jsonl" 2> "$TMP/err.txt"
+timeout 120 "$APP" mcp serve --data-dir "$TMP/data" \
+    < "$TMP/in.jsonl" > "$TMP/out.jsonl" 2> "$TMP/err.txt"
 rc=$?
 if [ "$rc" -eq 0 ]; then ok "mcp serve：EOF 后退出码 0"; else bad "mcp serve：rc=$rc"; fi
 
