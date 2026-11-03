@@ -1139,26 +1139,52 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 
 # 16. 操作目录与测试覆盖矩阵
 
-| 业务操作 | 引入阶段 | 最低测试 |
+**已实现的 29 个操作**（`registry.uya` 是唯一来源；`describe` 就是从这张表
+生成的）。"覆盖脚本"列是能跑到它的自测，空着表示只有间接覆盖。
+
+| 操作 | 阶段 | 权限 | 覆盖脚本 |
+|---|---|---|---|
+| project.create | P3 | write | p3 / p5b / p11 |
+| project.get | P3 | read | p2 / p3 |
+| project.list | P3 | read | p3 |
+| bible.put | P3 | write | p3b / p12b |
+| bible.get | P3 | read | p3b |
+| bible.history | P3 | read | p3b |
+| asset.register | P3 | write | p3b |
+| asset.list | P3 | read | p3b |
+| canon.inspect | P4 | read | p4 / p6 |
+| canon.commit | P4 | write | p4 / p12 / p12b |
+| canon.recover | P4 | write | p4 |
+| canon.audit | P12 | read | p12 / p12b / p11 |
+| continuity.inspect | P4 | read | p2（仍是 mock 读操作） |
+| llm.ping | P5 | read | p1 / p5 |
+| llm.complete | P5 | read | p5 |
+| episode.generate | P5 | write | p5b / p6 / p11 |
+| episode.approve | P5 | write | p5b / p6 / p11 |
+| context.inspect | P5 | read | p5c |
+| episode.produce | P5/P8 | write | p2 / p5d / p8 |
+| episode.retry | P9 | write | p9 |
+| production.status | P8 | read | p9 |
+| task.run | P5 | write | p5d |
+| task.get | P5 | read | p5d |
+| task.list | P5 | read | p5d |
+| storyboard.build | P7 | write | p7 / p11 |
+| storyboard.get | P7 | read | p7 |
+| provider.capabilities | P8 | read | p8 |
+| qa.run | P9 | write | p9 / p11 |
+| media.assemble | P10 | write | p10 / p11 |
+
+**还没实现、但文档里承诺过的操作**（照实记着，别当已完成）：
+
+| 操作 | 出处 | 缺口 |
 |---|---|---|
-| project.create | P3 | 项目初始化、重复请求、非法路径 |
-| project.get | P3 | 不存在项目、版本读取 |
-| project.configure | P3 | 新版本、历史引用不被覆盖 |
-| episode.produce | P5/P8 | script/video 两种目标、幂等 |
-| episode.get | P5 | 候选/批准版本读取 |
-| episode.review | P5/P9 | 审核通过、失败、版本绑定 |
-| episode.approve | P4/P5/P10 | screenplay 与 final_cut 区分 |
-| episode.retry | P8/P9 | 单步骤重试、重试限制 |
-| production.status | P8 | 所有任务状态 |
-| production.cancel | P8 | 可取消/不可取消任务 |
-| continuity.inspect | P4 | 人物、道具、知识、事件和伏笔 |
-| asset.get | P3/P10 | 权限、路径、摘要和文件大小 |
-| series.plan | P5 | 100 集大纲生成、承诺登记 |
-| outline.approve | P5 | 大纲批准、受影响集标记 |
-| invariant.check | P12 | 九条谓词逐条、错误码定位 |
-| continuity.audit | P12/P9 | 六类反例、历史重放 |
-| promise.report | P12 | 回收率、overdue 计数、waive 原因 |
-| budget.report | P13 | 分集/阶段汇总、熔断触发 |
+| project.configure | P3 | 项目配置变更 |
+| episode.get / episode.review | P5 | 候选与审核版本读取 |
+| production.cancel | P8 | 取消在跑任务 |
+| series.plan / outline.approve | P5 | 百集大纲与批准 |
+| invariant.check | P12 | 九条谓词的单点检查（现在只有 `canon.audit`） |
+| promise.report | P12 | 回收率/waive 原因报表 |
+| budget.report | P13 | 成本账本与熔断 |
 
 ---
 

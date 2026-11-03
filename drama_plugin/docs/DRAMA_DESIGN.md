@@ -709,6 +709,34 @@ operation.dispatch
 
 内部可以有更多细粒度函数，但首版不应全部暴露给 Agent。
 
+### 5.0 上表的实现对照（1.17）
+
+首版实现把上表**拆细**了：粒度更小、每个操作只做一件事，方便校验与重放。
+完整清单（29 个）在 `DRAMA_TODO.md` §16，唯一来源是 `src/registry.uya`。
+
+| 设计里的操作 | 实现成 |
+|---|---|
+| `project.create` / `project.get` | 同名，另有 `project.list` |
+| `project.configure` | `bible.put` / `bible.get` / `bible.history`（Bible 版本化）
+  加 `asset.register` / `asset.list` |
+| `episode.produce` | 同名（`stage=script\|video`），落盘建任务后立刻回 `queued` |
+| `episode.get` | `task.get` / `task.list` / `storyboard.get` |
+| `episode.review` | `qa.run`（确定性体检）+ `canon.audit`（闭环审计） |
+| `episode.approve` | 同名（剧本结构复核 → 候选事件提交 Canon） |
+| `episode.retry` | 同名（把失败任务重置成 queued） |
+| `production.status` | 同名 |
+| `production.cancel` | 未实现（P8 未做） |
+| `continuity.inspect` | `canon.inspect`（当前状态）+ `canon.audit`（四本账/不变量/重放） |
+| `asset.get` | `asset.list`（元数据）；按名单查留到接真实产线 |
+
+另外多出四个设计里没写、实现需要的操作：`canon.commit` / `canon.recover`
+（提交与恢复）、`llm.ping` / `llm.complete`（传输层自检）、
+`context.inspect`（上下文组装自检）、`provider.capabilities`（能力表）、
+`storyboard.build` / `media.assemble`（分镜与合成）、`task.run`（worker 单步）。
+
+粒度拆细的代价是操作数变多；收益是每个操作都能单独校验、单独重放，
+`describe` 出来的契约也更精确（`DRAMA_STATUS.md` 有测试覆盖对照）。
+
 ### 5.1 `project.create`
 
 输入包括项目名称、简介、风格、目标时长及初始 Bible。创建时允许先创建空项目，再通过 `project.configure` 补充人物、场景和道具。
