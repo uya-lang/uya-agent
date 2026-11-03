@@ -348,7 +348,12 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 
 ---
 
-# 5. P3：Project、Bible、Asset 和基础存储
+# 5. P3：Project、Bible、Asset 和基础存储（**进行中**：Project + 基础存储已落地，Bible/Asset 未开始）
+
+> 1.5 落地：`src/store.uya`（路径拼接/逐级 mkdir/原子写/读回）、
+> `src/project.uya`（ID 规则、create/get/list、index.jsonl）、
+> `src/ops.uya`（把 project.* 接到 Registry 上）。
+> 验收：`sh drama_plugin/p3_selftest.sh`（22 项，含重启持久化与路径穿越拒绝）。
 
 ## 目标
 
@@ -356,15 +361,15 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 
 ## Project
 
-- [ ] 定义 Project。
-- [ ] 定义 ProjectConfig。
+- [x] 定义 Project。
+- [x] 定义 ProjectConfig。
 - [ ] 定义 ProjectBible。
 - [ ] 定义 BibleVersion。
-- [ ] 实现项目 ID 规则。
-- [ ] 实现 project.create。
-- [ ] 实现 project.get。
+- [x] 实现项目 ID 规则。
+- [x] 实现 project.create。
+- [x] 实现 project.get。
 - [ ] 实现 project.configure。
-- [ ] 实现项目列表/索引（如果首版确实需要）。
+- [x] 实现项目列表/索引（如果首版确实需要）。
 - [ ] 实现项目版本管理。
 
 ## Bible 子模型（字段直接对齐既有资产包，1.2）
@@ -387,15 +392,15 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 
 ## 基础存储
 
-- [ ] 实现数据根目录配置（必须显式配置，不靠工作区变量推断）。
-- [ ] 实现项目目录创建（含 `locks/`、`idempotency/`）。
-- [ ] 实现 JSON 读写封装。
-- [ ] 实现临时文件写入（O_EXCL、0600）。
-- [ ] 实现原子替换（tmp → rename），错误路径清理 tmp。
-- [ ] 每类 JSON 带 `format_version`；读到不认识的版本进只读故障态。
+- [x] 实现数据根目录配置（必须显式配置，不靠工作区变量推断）。
+- [x] 实现项目目录创建（`projects/<id>/`；`locks/`、`idempotency/` 待 P4）。
+- [x] 实现 JSON 读写封装。
+- [x] 实现临时文件写入（O_EXCL、0600）。
+- [x] 实现原子替换（tmp → rename），错误路径清理 tmp。
+- [x] 每类 JSON 带 `format_version`；读到不认识的版本进只读故障态。
 - [ ] 实现版本迁移器（只做加法；破坏性变更必须写迁移器 + 测试）。
-- [ ] 实现路径规范化。
-- [ ] 实现目录边界校验。
+- [x] 实现路径规范化。
+- [x] 实现目录边界校验。
 - [ ] 实现基础文件完整性校验。
 - [ ] 审计日志按大小轮转（8 MiB × 5），写失败只记 stderr 不影响业务。
 
@@ -412,11 +417,11 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 
 ## 验收
 
-- [ ] 创建两个项目并互不干扰。
-- [ ] 关闭重启后项目仍存在。
+- [x] 创建两个项目并互不干扰。
+- [x] 关闭重启后项目仍存在。
 - [ ] Bible 版本可追溯。
 - [ ] 资产元数据可查询。
-- [ ] 非授权路径无法读取。
+- [x] 非授权路径无法读取。
 
 ---
 
