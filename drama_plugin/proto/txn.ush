@@ -1,0 +1,457 @@
+// drama_plugin/proto/txn.ush
+//
+// P0 原型 B3：文件事务与锁的最小实现，用来实证 DESIGN §8.2/§8.4 的三条结论。
+//
+// 它证明的是"崩溃后不会出现半个文件"，不是"数据不丢"：
+//   * 写：O_CREAT|O_EXCL 建 `<path>.tmp`（0600）→ 写满 → rename 到目标；
+//     目标文件只会在 rename 那一瞬间出现，进程被 kill 只留下 tmp。
+//   * 锁：O_CREAT|O_EXCL 建锁文件，写 `pid`；抢不到就读 pid 并 kill(pid,0) 探活，
+//     死锁判定为陈旧锁（LOCK_STALE）后可回收。
+//   * 没有 fsync（stdlib 全树没有 fsync/fdatasync 包装）⇒ rename 保证了
+//     "文件名可见性"的原子性，但掉电可能丢最后一次提交。这条限制写进文档。
+//
+// stdin 是一行一条命令（避免依赖 argv；`uya run` 不吃脚本参数）：
+//   w <path> <bytes>  原子写 N 字节（内容为 'x'）
+//   l <path>          抢锁
+//   u <path>          释放锁
+//   s <bytes>         读回文件大小
+//   q                 退出
+// 所有结果打到 stdout（本原型不是协议 server，日志与结果同流可接受）。
+
+use libc.syscall;
+use libc.unistd;
+use libc.heap;
+
+const LINE_MAX: usize = 4096;
+const CHUNK: usize = 65536;
+
+const O_WRONLY: i32 = 1;
+const O_CREAT: i32 = 64;
+const O_EXCL: i32 = 128;
+const O_RDONLY: i32 = 0;
+const MODE_0600: i32 = 384;
+
+fn slen(p: &const byte) usize {
+    var i: usize = 0;
+    while p[i] != 0 as byte {
+        i = i + 1;
+    }
+    return i;
+}
+
+fn write_all(fd: i32, p: &const byte, n: usize) bool {
+    var off: usize = 0;
+    while off < n {
+        const w: isize = sys_write(fd, &p[off], n - off) catch { -1 as isize; };
+        if w <= 0 {
+            return false;
+        }
+        off = off + (w as usize);
+    }
+    return true;
+}
+
+fn say(p: &const byte) void {
+    _ = write_all(1, p, slen(p));
+}
+
+fn say_num(prefix: &const byte, v: i64) void {
+    say(prefix);
+    var tmp: [byte: 24] = [0: 24];
+    var n: usize = 0;
+    var x: i64 = v;
+    if x < 0 {
+        say("-" as &const byte);
+        x = 0 -| x;
+    }
+    while x > 0 {
+        const t10: i64 = (x / 10) *| 10;
+        const rem: i64 = x -| t10;
+        tmp[n] = (rem +| 48) as! byte catch { 48 as byte; };
+        n = n + 1;
+        x = x / 10;
+    }
+    if n == 0 {
+        say("0" as &const byte);
+    }
+    while n > 0 {
+        n = n - 1;
+        var one: [byte: 1] = [tmp[n]];
+        _ = write_all(1, &one[0], 1);
+    }
+    say("\n" as &const byte);
+}
+
+// 读一行；超长部分丢弃（这里不用，但保持与协议原型同一口径）。
+fn read_line(buf: &byte, cap: usize) usize {
+    var i: usize = 0;
+    var over: bool = false;
+    while true {
+        var c: [byte: 1] = [0: 1];
+        const n: isize = sys_read(0, &c[0], 1) catch { 0 as isize; };
+        if n <= 0 {
+            return i;
+        }
+        if c[0] == 10 as byte {
+            return i;
+        }
+        if i < cap {
+            buf[i] = c[0];
+            i = i + 1;
+        } else {
+            over = true;
+        }
+    }
+    if over {
+        return 0;
+    }
+    return i;
+}
+
+// 解析十进制（失败返回 -1）
+fn parse_num(p: &const byte, n: usize) i64 {
+    var v: i64 = 0;
+    var digits: usize = 0;
+    var i: usize = 0;
+    while i < n {
+        const c: byte = p[i];
+        if c < 48 as byte || c > 57 as byte {
+            return -1;
+        }
+        const d: i64 = (c as i64) - 48;
+        const v10: i64 = v *| 10;
+        v = v10 +| d;
+        digits = digits + 1;
+        i = i + 1;
+    }
+    if digits == 0 {
+        return -1;
+    }
+    return v;
+}
+
+fn starts_with(line: &const byte, n: usize, want: &const byte) bool {
+    const wl: usize = slen(want);
+    if n < wl {
+        return false;
+    }
+    var i: usize = 0;
+    while i < wl {
+        if line[i] != want[i] {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+// 取 `cmd <path> [num]` 里的 path 段下标区间（成功后 at/len）
+fn arg_path(line: &const byte, n: usize, cmdlen: usize, at: &usize, len: &usize) bool {
+    var i: usize = cmdlen;
+    while i < n && line[i] == 32 as byte {
+        i = i + 1;
+    }
+    const s: usize = i;
+    while i < n && line[i] != 32 as byte {
+        i = i + 1;
+    }
+    if i == s {
+        return false;
+    }
+    at[0] = s;
+    len[0] = i - s;
+    return true;
+}
+
+fn arg_num(line: &const byte, n: usize, from: usize) i64 {
+    var i: usize = from;
+    while i < n && line[i] == 32 as byte {
+        i = i + 1;
+    }
+    return parse_num(&line[i], n - i);
+}
+
+// 把命令里的 path 段拷进定长缓冲（带边界检查，留一个 NUL 位）。
+fn copy_arg(line: &const byte, n: usize, at: usize, ln: usize, out: &[byte]) bool {
+    if at + ln > n || ln + 1 > out.len {
+        return false;
+    }
+    var i: usize = 0;
+    while i < ln {
+        out[i] = line[at + i];
+        i = i + 1;
+    }
+    out[ln] = 0 as byte;
+    return true;
+}
+
+// 第一步：tmp(O_EXCL,0600) → 写满（此时目标文件还不存在）
+fn write_tmp(path: &const byte, plen: usize, bytes: i64) bool {
+    var tmp: [byte: 512] = [0: 512];
+    if plen + 12 >= 512 {
+        return false;
+    }
+    var i: usize = 0;
+    while i < plen {
+        tmp[i] = path[i];
+        i = i + 1;
+    }
+    const suffix: &const byte = ".tmp";
+    var k: usize = 0;
+    while k < 4 {
+        tmp[plen + k] = suffix[k];
+        k = k + 1;
+    }
+    const tp: &const byte = &tmp[0];
+    const fd: i32 = sys_open(tp, O_WRONLY | O_CREAT | O_EXCL, MODE_0600)
+        catch { -1 as i32; };
+    if fd < 0 {
+        say("ERR open-tmp\n" as &const byte);
+        return false;
+    }
+    var buf: &byte = malloc(CHUNK) as &byte;
+    defer { free(buf as &void); }
+    if (buf as usize) == 0 {
+        _ = sys_close(fd);
+        return false;
+    }
+    var j: usize = 0;
+    while j < CHUNK {
+        buf[j] = 120 as byte;
+        j = j + 1;
+    }
+    var left: i64 = bytes;
+    while left > 0 {
+        var take: usize = CHUNK;
+        if left < (CHUNK as i64) {
+            take = left as! usize catch { 0 as usize; };
+        }
+        if !write_all(fd, buf as &const byte, take) {
+            _ = sys_close(fd);
+            return false;
+        }
+        left = left -| (take as i64);
+    }
+    _ = sys_close(fd);
+    return true;
+}
+
+// 第二步（线性化点）：rename 之前目标不存在；rename 之后就是完整文件。
+fn commit_tmp(path: &const byte, plen: usize) bool {
+    var tmp: [byte: 512] = [0: 512];
+    if plen + 12 >= 512 {
+        return false;
+    }
+    var i: usize = 0;
+    while i < plen {
+        tmp[i] = path[i];
+        i = i + 1;
+    }
+    const suffix: &const byte = ".tmp";
+    var k: usize = 0;
+    while k < 4 {
+        tmp[plen + k] = suffix[k];
+        k = k + 1;
+    }
+    const rc: i32 = sys_rename(&tmp[0], path) catch { -1 as i32; };
+    if rc < 0 {
+        say("ERR rename\n" as &const byte);
+        return false;
+    }
+    return true;
+}
+
+fn atomic_write(path: &const byte, plen: usize, bytes: i64) bool {
+    if !write_tmp(path, plen, bytes) {
+        return false;
+    }
+    return commit_tmp(path, plen);
+}
+
+fn read_pid(path: &const byte) i64 {
+    const fd: i32 = sys_open(path, O_RDONLY, 0) catch { -1 as i32; };
+    if fd < 0 {
+        return -1;
+    }
+    var b: [byte: 32] = [0: 32];
+    const n: isize = sys_read(fd, &b[0], 32) catch { 0 as isize; };
+    _ = sys_close(fd);
+    if n <= 0 {
+        return -1;
+    }
+    return parse_num(&b[0], n as usize);
+}
+
+// 抢锁：成功 ACQUIRED；被活进程占着 BUSY；占位进程已死则回收后再抢。
+fn try_lock(path: &const byte, plen: usize) void {
+    const me: i64 = sys_getpid() catch { -1 as i64; };
+    var fres: [byte: 32] = [0: 32];
+    var fn_: usize = 0;
+    while fn_ < plen && fn_ < 32 {
+        fres[fn_] = path[fn_];
+        fn_ = fn_ + 1;
+    }
+    const fd: i32 = sys_open(path, O_WRONLY | O_CREAT | O_EXCL, MODE_0600)
+        catch { -1 as i32; };
+    if fd >= 0 {
+        // 锁文件里写 pid，供后来者探活
+        var pb: [byte: 24] = [0: 24];
+        var pn: usize = 0;
+        var x: i64 = me;
+        if x < 0 {
+            x = 0;
+        }
+        while x > 0 {
+            const t10: i64 = (x / 10) *| 10;
+            const rem: i64 = x -| t10;
+            pb[pn] = (rem +| 48) as! byte catch { 48 as byte; };
+            pn = pn + 1;
+            x = x / 10;
+        }
+        var q: usize = pn;
+        while q > 0 {
+            q = q - 1;
+            _ = sys_write(fd, &pb[q], 1) catch { 0 as isize; };
+        }
+        _ = sys_close(fd);
+        say_num("ACQUIRED " as &const byte, me);
+        return;
+    }
+    // 抢不到：读 pid 探活（kill(pid, 0)）
+    const holder: i64 = read_pid(path);
+    if holder <= 0 {
+        say("UNREADABLE\n" as &const byte);
+        return;
+    }
+    const alive: i32 = sys_kill(holder, 0) catch { -1 as i32; };
+    if alive >= 0 {
+        say_num("BUSY " as &const byte, holder);
+        return;
+    }
+    // 陈旧锁：回收后重试一次
+    _ = sys_unlink(path) catch { -1 as i32; };
+    const fd2: i32 = sys_open(path, O_WRONLY | O_CREAT | O_EXCL, MODE_0600)
+        catch { -1 as i32; };
+    if fd2 < 0 {
+        say("STALE-RETRY-FAILED\n" as &const byte);
+        return;
+    }
+    _ = sys_close(fd2);
+    say_num("STALE-RECOVERED " as &const byte, holder);
+}
+
+fn file_size(path: &const byte) void {
+    var st: [byte: 256] = [0: 256];
+    // 用 open+lseek 取大小，避免依赖 Stat 结构布局
+    const fd: i32 = sys_open(path, O_RDONLY, 0) catch { -1 as i32; };
+    if fd < 0 {
+        say("MISSING\n" as &const byte);
+        return;
+    }
+    const sz: i64 = sys_lseek(fd, 0 as i64, 2) catch { -1 as i64; };
+    _ = sys_close(fd);
+    say_num("SIZE " as &const byte, sz);
+    _ = st;
+}
+
+export fn main() i32 {
+    var raw: &byte = malloc(LINE_MAX) as &byte;
+    defer { free(raw as &void); }
+    if (raw as usize) == 0 {
+        return 1;
+    }
+    while true {
+        const n: usize = read_line(raw, LINE_MAX);
+        if n == 0 {
+            break;
+        }
+        const line: &const byte = raw as &const byte;
+        var at: [usize: 1] = [0];
+        var ln: [usize: 1] = [0];
+
+        if starts_with(line, n, "q" as &const byte) {
+            break;
+        }
+        if starts_with(line, n, "w " as &const byte) {
+            if !arg_path(line, n, 2, &at[0], &ln[0]) {
+                say("ERR usage: w <path> <bytes>\n" as &const byte);
+                continue;
+            }
+            const bytes: i64 = arg_num(line, n, at[0] + ln[0]);
+            if bytes < 0 {
+                say("ERR bytes\n" as &const byte);
+                continue;
+            }
+            // 必须拷进 NUL 结尾的缓冲：sys_* 收的是 C 串，
+            // 直接指到行缓冲里会把后面的残留字节当成路径后缀。
+            var pb: [byte: 512] = [0: 512];
+            if !copy_arg(line, n, at[0], ln[0], &pb[0: 512]) {
+                continue;
+            }
+            const path: &const byte = &pb[0];
+            if atomic_write(path, ln[0], bytes) {
+                say("WROTE\n" as &const byte);
+            }
+            continue;
+        }
+        if starts_with(line, n, "wp " as &const byte) {
+            if !arg_path(line, n, 3, &at[0], &ln[0]) {
+                say("ERR usage: wp <path> <bytes>\n" as &const byte);
+                continue;
+            }
+            const bytes2: i64 = arg_num(line, n, at[0] + ln[0]);
+            var pb2: [byte: 512] = [0: 512];
+            if bytes2 < 0 || !copy_arg(line, n, at[0], ln[0], &pb2[0: 512]) {
+                continue;
+            }
+            if !write_tmp(&pb2[0], ln[0], bytes2) {
+                continue;
+            }
+            say("READY\n" as &const byte);
+            // 等一个字节：测试脚本在这条之后 kill -9，就落在 rename 之前的窗口
+            var sig: [byte: 1] = [0: 1];
+            _ = sys_read(0, &sig[0], 1) catch { 0 as isize; };
+            if commit_tmp(&pb2[0], ln[0]) {
+                say("COMMITTED\n" as &const byte);
+            }
+            continue;
+        }
+        if starts_with(line, n, "l " as &const byte) {
+            if !arg_path(line, n, 2, &at[0], &ln[0]) {
+                say("ERR usage: l <path>\n" as &const byte);
+                continue;
+            }
+            var pb: [byte: 512] = [0: 512];
+            if !copy_arg(line, n, at[0], ln[0], &pb[0: 512]) {
+                continue;
+            }
+            try_lock(&pb[0], ln[0]);
+            continue;
+        }
+        if starts_with(line, n, "u " as &const byte) {
+            if !arg_path(line, n, 2, &at[0], &ln[0]) {
+                continue;
+            }
+            var p: [byte: 512] = [0: 512];
+            if !copy_arg(line, n, at[0], ln[0], &p[0: 512]) {
+                continue;
+            }
+            _ = sys_unlink(&p[0]) catch { -1 as i32; };
+            say("UNLOCKED\n" as &const byte);
+            continue;
+        }
+        if starts_with(line, n, "s " as &const byte) {
+            if !arg_path(line, n, 2, &at[0], &ln[0]) {
+                continue;
+            }
+            var p: [byte: 512] = [0: 512];
+            if !copy_arg(line, n, at[0], ln[0], &p[0: 512]) {
+                continue;
+            }
+            file_size(&p[0]);
+            continue;
+        }
+        say("ERR unknown\n" as &const byte);
+    }
+    return 0;
+}

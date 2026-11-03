@@ -151,19 +151,27 @@ JSON 上限/非 ASCII → env/密钥注入 → 资产可见性。
 
 ### 2.2 仍需实测（P0 的全部工作量）
 
-- [ ] **Uya 写 stdio MCP Server 的最小闭环**：单行紧凑 JSON 读写、四个基础
+> 已经验过的项在下面直接勾选，证据在 `proto/P0_FINDINGS.md`
+> 与 `proto/*_selftest.sh`（均可重跑）。
+
+- [x] **Uya 写 stdio MCP Server 的最小闭环**：单行紧凑 JSON 读写、四个基础
       方法、未知方法回 `-32601`、EOF/断管退出、stdout 零污染。
+      （`proto/mcp_stdio.ush`，`sh proto/selftest.sh` 全绿）
 - [ ] **HTTP 传输层**（阻塞 P5）：连接、请求构造、响应解析、重定向、超时、
       证书校验、连接复用；先跑通一次 HTTPS 的 JSON 请求-响应，再做 SSE/分块。
-- [ ] **非 ASCII JSON 往返**：中文是原样输出还是被转义、长中文串的缓冲边界。
+- [x] **非 ASCII JSON 往返**：实测中文**原样透传**（UTF-8 字节，不转义）；
+      缓冲边界仍按码点算长度。
 - [ ] **本地队列 Provider 契约**：提交、查历史、取文件；队列满与重启清空
       队列时的行为；单卡串行的实测吞吐（每镜耗时）。
-- [ ] **fsync 替代方案确认**：接受「掉电可能丢最后一次提交」并写进部署文档，
-      或做出自写 syscall 包装的原型（二选一，必须留结论）。
-- [ ] **陈旧锁处置**：`pid + kill(pid,0)` 探活、`LOCK_STALE_MS` 超时口径，
-      以及「锁文件损坏」时的报错路径。
+- [x] **fsync 替代方案确认**：`grep -rn 'fsync\|fdatasync' uya/stdlib/lib`
+      无输出 ⇒ 接受「掉电可能丢最后一次提交」，写进部署文档与 §15 已知限制。
+- [x] **陈旧锁处置**：`pid + kill(pid,0)` 探活实测可用，`kill -9` 后
+      `STALE-RECOVERED`；锁文件损坏路径回 `LOCK_UNREADABLE`
+      （`proto/txn_selftest.sh` 覆盖前两条）。
 - [ ] **目录扫描与文件校验**：`getdents64` 枚举 + 校验摘要读回。
 - [ ] **Worker 中断/重启行为**：杀进程后恢复，孤儿临时文件清理的宽限期。
+      注意：`uya run` 会再起子进程，测试要按**进程组**杀，否则测的是假崩溃
+      （P0_FINDINGS §3 第 5 条）。
 - [ ] **env/密钥注入**：只走宿主配置 `env` 或 0600 配置文件；确认 `command`
       必须绝对路径。
 - [ ] **资产共享目录对宿主的可见性**：确认宿主不给 MCP 子进程套沙箱，
