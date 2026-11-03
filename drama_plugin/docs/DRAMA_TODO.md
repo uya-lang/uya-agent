@@ -1139,7 +1139,7 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 
 # 16. 操作目录与测试覆盖矩阵
 
-**已实现的 29 个操作**（`registry.uya` 是唯一来源；`describe` 就是从这张表
+**已实现的 30 个操作**（`registry.uya` 是唯一来源；`describe` 就是从这张表
 生成的）。"覆盖脚本"列是能跑到它的自测，空着表示只有间接覆盖。
 
 | 操作 | 阶段 | 权限 | 覆盖脚本 |
@@ -1159,6 +1159,7 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 | continuity.inspect | P4 | read | p2（仍是 mock 读操作） |
 | llm.ping | P5 | read | p1 / p5 |
 | llm.complete | P5 | read | p5 |
+| episode.get | P5 | read | p11 |
 | episode.generate | P5 | write | p5b / p6 / p11 |
 | episode.approve | P5 | write | p5b / p6 / p11 |
 | context.inspect | P5 | read | p5c |
@@ -1179,7 +1180,7 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 | 操作 | 出处 | 缺口 |
 |---|---|---|
 | project.configure | P3 | 项目配置变更 |
-| episode.get / episode.review | P5 | 候选与审核版本读取 |
+| episode.review | P5 | 审核版本读取（现在用 qa.run 顶） |
 | production.cancel | P8 | 取消在跑任务 |
 | series.plan / outline.approve | P5 | 百集大纲与批准 |
 | invariant.check | P12 | 九条谓词的单点检查（现在只有 `canon.audit`） |

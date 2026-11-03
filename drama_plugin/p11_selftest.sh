@@ -171,6 +171,23 @@ codes={v['code'] for v in d['violations']}
 assert not codes, codes
 print('PASS: 审计干净（三条提交、重放一致、零违规）')" || bad "审计没通过"
 
+# ---------- 4.5 生产摘要（episode.get） ----------
+out=$(ask "$(cat <<JSON
+{"jsonrpc":"2.0","id":70,"method":"tools/call","params":{"name":"call","arguments":{"operation":"episode.get","input":{"project_id":"$PID"}}}}
+JSON
+)")
+printf '%s' "$out" | field | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+assert d['script_version'] == 3, d
+assert d['board_version'] >= 3, d
+assert d['assembly_version'] == 3, d
+assert d['canon_revision'] == 3, d
+assert d['tasks'] >= 3, d
+print('PASS: episode.get 汇总（剧本 v%d / 分镜 v%d / 成片 v%d / Canon r%d）'
+      % (d['script_version'], d['board_version'], d['assembly_version'],
+         d['canon_revision']))" || bad "episode.get 汇总不对"
+
 # ---------- 5. 落盘检查 ----------
 n=$(ls "$DATA/projects/$PID/assemblies"/v*.json 2>/dev/null | wc -l)
 [ "$n" -eq 3 ] && ok "三份合成 manifest 都在" || bad "manifest 数量是 $n"

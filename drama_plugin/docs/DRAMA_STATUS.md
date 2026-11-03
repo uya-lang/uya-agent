@@ -23,7 +23,7 @@
 | `p12_selftest.sh` | 闭环审计（四本账 / 不变量 / 重放） | 13 |
 | `p12b_selftest.sh` | 反例库六条（DESIGN §13.5） | 9 |
 | `p10_selftest.sh` | 成片合成（mock 拼接 + manifest） | 11 |
-| `p11_selftest.sh` | 端到端一条龙（三集 → 成片 → 审计） | 19 |
+| `p11_selftest.sh` | 端到端一条龙（三集 → 成片 → 审计） | 20 |
 | `p13_selftest.sh` | 10 集规模测算（控制面耗时/审计/状态体积） | 11 |
 
 跑全部：
