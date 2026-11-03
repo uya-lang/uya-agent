@@ -26,6 +26,7 @@
 | `p11_selftest.sh` | 端到端一条龙（三集 → 成片 → 审计 → 成本账本） | 21 |
 | `p13_selftest.sh` | 10 集规模测算（控制面耗时/审计/状态体积） | 11 |
 | `p13b_selftest.sh` | 派生索引与全量重建 | 12 |
+| `pack.sh`（不是自测） | 打交付包：bin/docs/src/selftest + tar.gz + sha256 | — |
 | `p5e_selftest.sh` | 百集大纲与批准（系列层） | 12 |
 
 跑全部：
@@ -83,7 +84,7 @@ for f in drama_plugin/p*_selftest.sh; do sh "$f" || echo "FAILED $f"; done
 | P8 | 第一段 | 能力表 + mock VideoProvider + Worker；缺真实本机队列 Adapter、单 Worker 锁 |
 | P9 | 第一段 | 确定性 QA + 生产状态 + 重试；缺 ASR/锚帧/成片终检/跨集审计 |
 | P10 | 第一段 | mock 拼接 + manifest；缺 FFmpeg 探测/转码/响度/字幕 |
-| P11 | 第一段 | 端到端一条龙已跑通；发布/打包未做 |
+| P11 | 第二段 | 端到端一条龙 + 交付包（pack.sh）；部署/升级流程未写 |
 | P12 | 大部分 | 四本账 + 重放 + 九条不变量 + 错误定位；缺增量检查 |
 | P13 | 第三段 | 成本账本 + 派生索引 + 项目级配额熔断；百集压力未做 |
 
