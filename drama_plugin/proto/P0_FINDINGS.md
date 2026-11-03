@@ -227,6 +227,54 @@ grep -rn 'fsync\|fdatasync' uya/stdlib/lib --include=*.uya   # 无输出
    必须写成饱和运算，否则编译失败（本仓 `examples/mcp-plugins/wordcount.ush`
    现在就因此编不过）。
 
+### 1.12 HTTPS 证书校验为什么过不去 —— 根因已定位（1.4）
+
+上一节只说了"校验没做完"。这一节是**逐层打开的根因**，全部现场实测：
+
+**现象**：`https_get(...)`（默认校验）在 `[TLS] Handshake not done
+(peer not verified)` 处失败；`https_get_insecure(...)` 能拿到 200。
+
+**第一层根因：链根本没被捕获。**
+在 `ssl_verify_peer_chain` 里打点，看到 `anchors=30, chain_len=0,
+peer_leaf NULL`。继续往上打点：
+
+```text
+[DBG] flight_len=3915
+[DBG] head: 02 00 00 52 03 03 …     ← 首字节是 2（ServerHello）
+[DBG] capture: bad record type 2
+```
+
+`hs_remember_message(...)` 保存服务器 flight 时**跳过了 5 字节记录头**
+（`&send_buf[5]`，见 `lib/tls/ssl/handshake.uya`），而
+`ssl_capture_peer_chain_from_server_flight` 却按"记录头 + 握手消息"解析，
+第一步 `data[0] != 22` 就直接返回 ⇒ 证书链永远为空 ⇒ 必然
+`peer_verified=false`。
+
+**第二层根因：X.509 栈是 RSA-only。**
+打完"裸消息"补丁后链能抓到（`chain_len=2`），但 `verify_chain_rsa` 失败。
+继续看 `x509/cert.uya`：`cert_parse_tbs` 只会把 SPKI 当
+**RSA 的 (n, e) 两个 INTEGER** 解析；实测系统根库里 626 字节、514 字节的证书
+解析失败（ECDSA 根），`verify_chain_rsa` 还要求每一级 `rsa_n_len != 0`。
+现代站点普遍带 ECDSA 中间证书，于是链校验必然失败。
+
+**结论**：证书校验要在真实站点上跑通，需要三件事，工作量不是一个补丁：
+
+1. ~~服务器 flight 的保存/解析形态对齐~~ —— 已有补丁
+   `proto/patches/0001-tls-capture-bare-server-flight.patch`（已应用到
+   `~/uya/uya`，未提交）；
+2. **X.509 支持 ECDSA**：SPKI 的 EC point 解析、ECDSA 签名验证、
+   系统根库里的 ECDSA 根；
+3. **PKIX 路径构建**：按 issuer/subject DN 走链、按 keyUsage/basicConstraints
+   过滤，而不是"把对端给的链当唯一可能"。
+
+**另外一条工具链坑**：`uya/bin/uya` 启动脚本会**无条件覆盖 `UYA_ROOT`**
+（`UYA_ROOT="$(cd "$self/../stdlib" && pwd)"; export UYA_ROOT`），
+所以 `UYA_ROOT=/tmp/x uya build …` 是无效的——要换库必须直接调
+`uya/bin/uya-real`。这条坑让第一次诊断白跑了两轮。
+
+**给 P5 的结论**：远程 LLM 调用可以走"本机网关 + 明文 HTTP"（已验证可行），
+或等标准库补齐 ECDSA/PKIX；**不要**用 insecure 模式把 API Key 发到公网。
+
 ### 2.2 宿主的 env 与权限事实（源码级复核，1.3 修正了一条错判）
 
 **env 白名单**（`src/plugin/mcprun.uya:159-180`）：子进程只继承
