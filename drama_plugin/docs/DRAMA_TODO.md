@@ -8,6 +8,9 @@
 
 ---
 
+> 实现到哪一步、代码在哪、怎么复核：见 `docs/DRAMA_STATUS.md`
+> （12 个可重跑验收脚本 + 22 个源文件的地图 + 已知限制）。
+
 ## 0. 开发约束
 
 1. Drama 是独立 Uya 项目，不修改 `uya-agent` Agent Core。
