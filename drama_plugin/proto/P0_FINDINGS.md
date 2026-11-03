@@ -194,7 +194,31 @@ grep -rn 'fsync\|fdatasync' uya/stdlib/lib --include=*.uya   # 无输出
 提交**。这条写进 DESIGN §8.2 与部署文档；selftest 用「杀进程」验证恢复，
 不假装能验证掉电。若将来不能接受，再单独做 syscall 包装原型（不改架构）。
 
-### 2.2 宿主协议事实 —— 与 DESIGN §4.2 一致
+### 2.2 宿主的 env 与权限事实（源码级复核，1.3 修正了一条错判）
+
+**env 白名单**（`src/plugin/mcprun.uya:159-180`）：子进程只继承
+`HOME LOGNAME PATH SHELL TERM USER` 六个变量，再叠加配置里的 `env`
+（同名后者胜）。⇒ 代理、API Key、`DSH_*` 一律看不见，必须写进配置。
+
+**MCP 工具批准**（`src/plugin/mcp.uya:1019-1049`，判定在
+`src/tools/perm.uya:124-136`）：
+
+| 模式 | 行为 |
+|---|---|
+| read-only | 每次都要用户批准 |
+| workspace-write | 每次都要用户批准 |
+| danger-full-access | 直接放行 |
+| 无回答渠道（非交互/子代理） | fail closed（等于拒绝） |
+
+⚠ **DESIGN 1.2 原来写"read-only 下 MCP 工具一律拒绝"是错的**：
+`perm_requires_approval()` 只在 read-only 为真，`perm_confine()` 在
+read-only 与 workspace-write 都为真，两者取或 ⇒ 这两种模式都是"逐次批准"。
+1.3 已按源码改正（DESIGN §14.2）。
+
+**推论**：百集无人值守不能靠 Agent 循环调 `call`（会 fail closed），
+必须由 Worker 自己推进——这正好与"Worker 独立进程"的架构决策一致。
+
+### 2.3 宿主协议事实 —— 与 DESIGN §4.2 一致
 
 `--list-plugins` 的输出直接印证：仅 stdio、工具名 `mcp__<server>__<tool>`、
 `serverName` 参与命名。没有发现与文档不一致之处。
@@ -243,10 +267,10 @@ grep -rn 'fsync\|fdatasync' uya/stdlib/lib --include=*.uya   # 无输出
 
 | 文件 | 作用 | 验收脚本 |
 |---|---|---|
-| `proto/mcp_stdio.ush` | 三工具 stdio MCP server（list/describe/call） | `proto/selftest.sh` |
+| `proto/mcp_stdio.ush` | 三工具 stdio MCP server | `proto/selftest.sh` |
 | `proto/txn.ush` | 原子写 + 锁 + 陈旧锁 + 崩溃注入 | `proto/txn_selftest.sh` |
-| `proto/http_client.ush` | 明文 HTTP GET（建连/请求/响应/超时） | `proto/http_selftest.sh` |
-| `proto/scan.ush` | 目录枚举 + 文件摘要（getdents64 / FNV-1a） | `proto/scan_selftest.sh` |
+| `proto/http_client.ush` | 明文 HTTP GET + 超时 | `proto/http_selftest.sh` |
+| `proto/scan.ush` | 目录枚举 + 摘要 | `proto/scan_selftest.sh` |
 | `proto/worker.ush` | Worker 检查点续跑（journal 追加写） | `proto/worker_selftest.sh` |
 | `proto/LOCAL_QUEUE_CONTRACT.md` | 本地队列实测契约（读侧） | 现场采集，样本在文档里 |
 

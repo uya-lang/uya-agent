@@ -886,8 +886,10 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 
 - [ ] 抽样审批策略：每 10 集抽 1 集全审，其余抽样 + 异常优先队列
       （把百集约 300 次点击压到约 30 次）。
-- [ ] 权限模式说明：read-only 下工具被拒；workspace-write 下**每次调用**
-      都要用户批准（建议把"跑完本集剩余步骤"合成一次 `episode.produce`）。
+- [ ] 权限模式说明（按源码）：read-only 与 workspace-write 下**每次 MCP
+      调用都要用户批准**，danger-full-access 放行，**无回答渠道时 fail closed**；
+      建议把"跑完本集剩余步骤"合成一次 `episode.produce`；无人值守只能靠
+      Worker 自己跑，不能靠 Agent 循环 `call`。
 - [ ] Worker 启动示例。
 - [ ] API Key 配置说明（只走宿主 `env` 或 0600 配置文件；不继承 shell 变量）。
 - [ ] 数据目录备份/恢复说明。
