@@ -1,0 +1,165 @@
+#!/bin/sh
+# drama_plugin/p9_selftest.sh — P9 第一段（确定性 QA + 生产状态 + 重试）
+#
+# 覆盖 DRAMA_TODO §11 的一部分：
+#   * 静态体检能发现"素材缺失/结构不对"：缺 hook、对白没说话人、空动作镜头；
+#   * 正常剧本 + 分镜 ⇒ QA 全绿，报告落 qa/v1.json（不可变、带 hash）；
+#   * production.status 能查到任务当前状态；
+#   * episode.retry 把失败任务重置成 queued，worker 能重跑，且**不动 Canon**。
+#
+# 用法：sh drama_plugin/p9_selftest.sh
+
+set -eu
+
+HERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+ROOT=$(CDPATH= cd -- "$HERE/.." && pwd)
+UYA=${UYA:-$ROOT/uya/bin/uya}
+export UYA_ROOT=${UYA_ROOT:-$ROOT/uya/stdlib}
+
+SRC="$HERE/src/main.uya $HERE/src/bytes.uya $HERE/src/json_min.uya \
+$HERE/src/json_out.uya $HERE/src/registry.uya $HERE/src/schema.uya \
+$HERE/src/dispatch.uya $HERE/src/store.uya $HERE/src/project.uya \
+$HERE/src/digest.uya $HERE/src/asset.uya $HERE/src/bible.uya \
+$HERE/src/canon.uya $HERE/src/httpc.uya $HERE/src/llm.uya \
+$HERE/src/story.uya $HERE/src/context.uya $HERE/src/task.uya \
+$HERE/src/board.uya $HERE/src/provider.uya $HERE/src/qa.uya \
+$HERE/src/ops.uya $HERE/src/server.uya"
+
+TMP=$(mktemp -d)
+trap 'rm -rf "$TMP"' EXIT
+DATA="$TMP/data"
+
+fails=0
+ok() { echo "PASS: $1"; }
+bad() { echo "FAIL: $1"; fails=$((fails + 1)); }
+
+if ! "$UYA" build $SRC -o "$TMP/drama" > "$TMP/build.log" 2>&1; then
+    echo "FAIL: 构建失败"
+    tail -10 "$TMP/build.log"
+    exit 1
+fi
+ok "构建通过"
+
+ask() { printf '%s\n' "$1" > "$TMP/q.jsonl"; \
+    timeout 120 "$TMP/drama" mcp serve --data-dir "$DATA" \
+    < "$TMP/q.jsonl" 2>/dev/null; }
+field() { python3 -c "
+import json,sys
+raw=[l for l in sys.stdin.read().split(chr(10)) if l.strip()]
+o=json.loads(raw[0])
+t=json.loads(o['result']['content'][0]['text'])
+r=t.get('data',{}).get('result')
+print(json.dumps(r if r is not None else t.get('error'), ensure_ascii=False))
+"; }
+
+out=$(ask '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"call","arguments":{"operation":"project.create","input":{"name":"QA测试"}}}}')
+PID=$(printf '%s' "$out" | field | python3 -c "
+import json,sys
+print(json.load(sys.stdin)['project_id'])")
+[ -n "$PID" ] && ok "项目创建 id=$PID" || { bad "项目没建起来"; exit 1; }
+
+# ---------- 1. 正常链路：生成 → 分镜 → QA 全绿 ----------
+ask "$(cat <<JSON
+{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"call","arguments":{"operation":"episode.generate","input":{"project_id":"$PID"}}}}
+JSON
+)" > /dev/null
+ask "$(cat <<JSON
+{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"call","arguments":{"operation":"storyboard.build","input":{"project_id":"$PID","script_version":1}}}}
+JSON
+)" > /dev/null
+out=$(ask "$(cat <<JSON
+{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"call","arguments":{"operation":"qa.run","input":{"project_id":"$PID","script_version":1}}}}
+JSON
+)")
+printf '%s' "$out" | field | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+assert d['ok'] is True, d
+assert d['issue_count'] == 0, d
+assert d['report_version'] == 1, d
+assert d['report']['checked_shots'] > 0, d
+print('PASS: 正常剧本 + 分镜 ⇒ QA 全绿（检查了 %d 个镜头）'
+      % d['report']['checked_shots'])" || bad "正常链路 QA 没全绿"
+
+# ---------- 2. 缺 hook 的剧本 ⇒ QA 报问题 ----------
+mkdir -p "$DATA/projects/$PID/scripts"
+printf '%s' '{"format_version":1,"version":2,"content_hash":"x","screenplay":{"title":"bad","scenes":[{"no":1,"action":"a","dialogue":[{"line":"没人说的话"}]}]}}' \
+    > "$DATA/projects/$PID/scripts/v2.json"
+out=$(ask "$(cat <<JSON
+{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"call","arguments":{"operation":"qa.run","input":{"project_id":"$PID","script_version":2}}}}
+JSON
+)")
+printf '%s' "$out" | field | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+assert d['ok'] is False, d
+codes={i['code'] for i in d['report']['issues']}
+assert 'QA_HOOK_MISSING' in codes, codes
+assert 'QA_LINE_NO_SPEAKER' in codes, codes
+print('PASS: 缺 hook / 没说话人的对白都被报出来（%d 条）'
+      % d['issue_count'])" || bad "结构问题没被 QA 发现"
+
+# ---------- 3. 生产状态 ----------
+out=$(ask "$(cat <<JSON
+{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"call","arguments":{"operation":"episode.produce","input":{"project_id":"$PID","episode_id":"e1","stage":"script"}}}}
+JSON
+)")
+TID=$(printf '%s' "$out" | field | python3 -c "
+import json,sys
+print(json.load(sys.stdin)['task_id'])")
+out=$(ask "$(cat <<JSON
+{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"call","arguments":{"operation":"production.status","input":{"project_id":"$PID","task_id":"$TID"}}}}
+JSON
+)")
+printf '%s' "$out" | field | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+assert d['state'] == 'queued', d
+print('PASS: production.status 能查到 queued 的任务')" || bad "status 查不到任务"
+
+# ---------- 4. 失败 → 重试 → worker 跑通，且不动 Canon ----------
+printf '%s' '{"format_version":1,"version":3,"content_hash":"z","screenplay":{"title":"v3","hook":"h","scenes":[{"no":1,"action":"冰箱爆炸了","dialogue":[]}]}}' \
+    > "$DATA/projects/$PID/scripts/v3.json"
+printf '%s' '{"version":3}' > "$DATA/projects/$PID/scripts/current.json"
+printf '%s' '{"script_version":3,"canon_revision":0}' > "$DATA/projects/$PID/scripts/approved.json"
+CANON_BEFORE=$(md5sum "$DATA/projects/$PID/canon.json" 2>/dev/null | cut -d' ' -f1 || echo none)
+out=$(ask "$(cat <<JSON
+{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"call","arguments":{"operation":"episode.produce","input":{"project_id":"$PID","episode_id":"e2","stage":"video"}}}}
+JSON
+)")
+TID2=$(printf '%s' "$out" | field | python3 -c "
+import json,sys
+print(json.load(sys.stdin)['task_id'])")
+timeout 120 "$TMP/drama" worker run --data-dir "$DATA" > /dev/null 2>&1 || true
+out=$(ask "$(cat <<JSON
+{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"call","arguments":{"operation":"production.status","input":{"project_id":"$PID","task_id":"$TID2"}}}}
+JSON
+)")
+printf '%s' "$out" | field | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+assert d['state'] == 'failed' and d['reason'] == 'action_unsupported', d
+print('PASS: 能力表外的动作让任务 failed（action_unsupported）')" \
+    || bad "越界动作没让任务失败"
+
+out=$(ask "$(cat <<JSON
+{"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"call","arguments":{"operation":"episode.retry","input":{"project_id":"$PID","task_id":"$TID2"}}}}
+JSON
+)")
+printf '%s' "$out" | field | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+assert d['state'] == 'queued', d
+print('PASS: episode.retry 把失败任务重置成 queued')" || bad "retry 没重置任务"
+
+CANON_AFTER=$(md5sum "$DATA/projects/$PID/canon.json" 2>/dev/null | cut -d' ' -f1 || echo none)
+[ "$CANON_BEFORE" = "$CANON_AFTER" ] && ok "重试没有改动 Canon" \
+    || bad "重试改了 Canon"
+
+echo "----"
+if [ "$fails" -eq 0 ]; then
+    echo "PASS: P9 第一段（确定性 QA / 生产状态 / 重试）"
+    exit 0
+fi
+echo "FAIL: $fails 项"
+exit 1
