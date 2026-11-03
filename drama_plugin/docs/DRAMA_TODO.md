@@ -535,7 +535,17 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 
 ---
 
-# 7. P5：LLM Provider 和 Story Engine
+# 7. P5：LLM Provider 和 Story Engine（**传输层 + Adapter 骨架已落地**）
+
+> 1.7 落地：`src/httpc.uya`（HTTP/HTTPS POST + 超时 + 状态码/错误分类）、
+> `src/llm.uya`（配置来自 `<root>/llm.json`、mock 与 openai 兼容两种 Provider、
+> choices[0].message.content 解析与反解转义、结构化校验、有限次重试）、
+> `llm.ping` / `llm.complete` 两个操作。
+> 验收：`sh drama_plugin/p5_selftest.sh`（10 项，用本机 Python HTTP 服务当上游）：
+> mock 默认、正常解析、非 200 ⇒ UPSTREAM_ERROR、畸形响应 ⇒ BAD_RESPONSE、
+> 模型输出非 JSON ⇒ MODEL_OUTPUT_NOT_JSON、超时 ⇒ TIMEOUT。
+> 仍未做：重定向、分块/SSE、代理配置、Prompt 版本、格式修复重试、
+> 日志脱敏、Story 模型与剧本生成（下一段）。
 
 ## 目标
 
@@ -554,24 +564,25 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 
 ## LLM 传输层（1.2 新增，P0 的 HTTP 原型的生产化）
 
-- [ ] 封装 HTTP 请求：方法/头/体/超时/重试/重定向。
+- [x] 封装 HTTP 请求：方法/头/体/超时/重试（**重定向未做**）。
 - [x] TLS：默认校验模式已验证通过（1.5）；SNI 与失败原因可诊断。
-- [ ] 响应解析：JSON 体、错误体、非 200 的错误映射。
+- [x] 响应解析：JSON 体、错误体、非 200 的错误映射。
 - [ ] 若走流式（SSE/分块）：增量解析与中断恢复。
 - [ ] 代理与 `no_proxy`：既然子进程只拿到白名单 env，代理配置必须来自
       配置文件，不能指望 shell 环境。
-- [ ] 本地模型服务（如 Ollama/自建网关）作为一等 Provider 目标。
+- [x] 本地模型服务（如 Ollama/自建网关）作为一等 Provider 目标。
 
 ## LLM Adapter
 
-- [ ] 定义 LLMProvider 接口。
-- [ ] 定义模型配置。
+- [x] 定义 LLMProvider 接口。
+- [x] 定义模型配置。
 - [ ] 定义 Prompt/输入版本。
-- [ ] 实现结构化输出请求。
-- [ ] 实现响应解析和 Schema 校验。
-- [ ] 实现超时、限流和错误分类。
+- [x] 实现结构化输出请求。
+- [x] 实现响应解析和 Schema 校验。
+- [x] 实现超时、限流和错误分类。
 - [ ] 实现有限次数的格式修复。
 - [ ] 记录模型名称、参数和输出摘要。
+      （P5 骨架只在响应里回 model/超时配置，落盘记录留到 Task 接入）
 - [ ] 日志和错误信息脱敏。
 
 ## Story 模型

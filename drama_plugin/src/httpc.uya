@@ -1,0 +1,307 @@
+// drama_plugin/src/httpc.uya — 最小 HTTP/HTTPS 客户端（P5 传输层）
+//
+// 只做一件事：发一个请求、把响应头和体分开、读到底。
+//   * 明文走 sys_connect + sys_send/sys_recv；
+//   * TLS 走 tls.https 的 handshake + write_all/read_some（默认校验证书）；
+//   * 超时用 SO_RCVTIMEO/SO_SNDTIMEO，不做异步；
+//   * 不支持重定向、分块、SSE —— 这些在 P5 后续小节里补。
+//
+// 返回码：0 成功 70 连接失败 71 写失败 72 读失败 73 响应格式不认识
+//         74 请求头太长 75 DNS 解析失败
+
+use libc.syscall;
+use std.net.dns;
+use tls.https;
+
+const REQ_MAX: usize = 8192;
+const HEAD_END: usize = 4;   // \r\n\r\n
+
+fn fill_sockaddr(a: byte, b: byte, c: byte, d: byte, port: u16,
+    out: &[byte]) void {
+    out[0] = 2 as byte;                     // AF_INET
+    out[1] = 0 as byte;
+    const p: i32 = port as! i32 catch { 80 as i32; };
+    out[2] = ((p >> 8) & 0xFF) as! byte catch { 0 as byte; };
+    out[3] = (p & 0xFF) as! byte catch { 0 as byte; };
+    out[4] = a;
+    out[5] = b;
+    out[6] = c;
+    out[7] = d;
+    var i: usize = 8;
+    while i < 16 {
+        out[i] = 0 as byte;
+        i = i + 1;
+    }
+}
+
+// 解析 "1.2.3.4"；成功返回 true
+fn parse_ipv4(host: &const byte, n: usize, out: &[byte]) bool {
+    var oct: usize = 0;
+    var val: i32 = 0;
+    var digits: usize = 0;
+    var i: usize = 0;
+    while i < n {
+        const ch: byte = host[i];
+        if ch == 46 as byte {
+            if digits == 0 || oct >= 4 {
+                return false;
+            }
+            out[oct] = val as! byte catch { 0 as byte; };
+            oct = oct + 1;
+            val = 0;
+            digits = 0;
+        } else if ch >= 48 as byte && ch <= 57 as byte {
+            val = val *| 10;
+            val = val +| ((ch as i32) -| 48);
+            if val > 255 {
+                return false;
+            }
+            digits = digits + 1;
+        } else {
+            return false;
+        }
+        i = i + 1;
+    }
+    if oct != 3 || digits == 0 {
+        return false;
+    }
+    out[3] = val as! byte catch { 0 as byte; };
+    return true;
+}
+
+fn set_timeout(fd: i32, ms: i32) void {
+    var tv: [byte: 16] = [0: 16];
+    const sec: i32 = ms / 1000;
+    const usec: i32 = (ms % 1000) * 1000;
+    var i: usize = 0;
+    while i < 4 {
+        const sh: i32 = (i as! i32 catch { 0 as i32; }) *| 8;
+        tv[i] = ((sec >> sh) & 0xFF) as! byte catch { 0 as byte; };
+        tv[8 + i] = ((usec >> sh) & 0xFF) as! byte catch { 0 as byte; };
+        i = i + 1;
+    }
+    _ = sys_setsockopt(fd, 1, 20, &tv[0] as &void, 16) catch { 0 as i32; };
+    _ = sys_setsockopt(fd, 1, 21, &tv[0] as &void, 16) catch { 0 as i32; };
+}
+
+fn close_fd(fd: i32) void {
+    _ = sys_close(fd) catch { 0 as i32; };
+}
+
+// 建立 TCP 连接；失败返回 -1
+export fn httpc_connect(host: &const byte, host_len: usize, port: u16,
+    addr_out: &[byte], timeout_ms: i32) i32 {
+    var ip: [byte: 4] = [0: 4];
+    var is_lit: bool = parse_ipv4(host, host_len, &ip[0: 4]);
+    if !is_lit {
+        var client: DnsClient = DnsClient{};
+        dns_client_init(&client, &""[0: 0]);
+        var ip_len: usize = 0;
+        dns_client_resolve_host(&client, host, host_len, &ip[0], 4,
+            &ip_len) catch {
+            return -1;
+        };
+        if ip_len != 4 {
+            return -1;
+        }
+    }
+    fill_sockaddr(ip[0], ip[1], ip[2], ip[3], port, addr_out);
+    const fd: i32 = sys_socket(2, 1, 6) catch {
+        return -1;
+    };
+    set_timeout(fd, timeout_ms);
+    var tries: usize = 0;
+    while tries < 3 {
+        const rc: i32 = sys_connect(fd, &addr_out[0] as &void, 16) catch {
+            -1 as i32;
+        };
+        if rc == 0 {
+            return fd;
+        }
+        tries = tries + 1;
+    }
+    close_fd(fd);
+    return -1;
+}
+
+// 组请求：POST 一个 JSON 体（额外头留空，够用）
+fn build_request(host: &const byte, host_len: usize, path: &const byte,
+    path_len: usize, body: &const byte, body_len: usize, out: &[byte],
+    out_len: &usize) bool {
+    out_len[0] = 0;
+    var w: usize = 0;
+    w = w + j_put(out, w, "POST " as &const byte);
+    w = w + j_put_raw(out, w, path, path_len);
+    w = w + j_put(out, w, " HTTP/1.1\r\nHost: " as &const byte);
+    w = w + j_put_raw(out, w, host, host_len);
+    w = w + j_put(out, w,
+        "\r\nContent-Type: application/json\r\n" as &const byte);
+    w = w + j_put(out, w,
+        "Connection: close\r\nContent-Length: " as &const byte);
+    w = w + j_put_i64(out, w, body_len as i64);
+    w = w + j_put(out, w, "\r\n\r\n" as &const byte);
+    w = w + j_put_raw(out, w, body, body_len);
+    out_len[0] = w;
+    return w > 0;
+}
+
+fn send_all_plain(fd: i32, p: &const byte, n: usize) bool {
+    var sent: usize = 0;
+    while sent < n {
+        const got: isize = sys_send(fd, &p[sent], n - sent, 0) catch {
+            return false;
+        };
+        if got <= 0 {
+            return false;
+        }
+        sent = sent + (got as usize);
+    }
+    return true;
+}
+
+fn send_all_tls(fd: i32, p: &const byte, n: usize) bool {
+    https_write_all(fd, p, n) catch {
+        return false;
+    };
+    return true;
+}
+
+fn recv_loop_plain(fd: i32, out: &[byte], out_len: &usize) bool {
+    var total: usize = 0;
+    while total < out.len {
+        const got: isize = sys_recv(fd, &out[total], out.len - total, 0) catch {
+            break;
+        };
+        if got <= 0 {
+            break;
+        }
+        total = total + (got as usize);
+    }
+    out_len[0] = total;
+    return total > 0;
+}
+
+fn recv_loop_tls(fd: i32, out: &[byte], out_len: &usize) bool {
+    var total: usize = 0;
+    while total < out.len {
+        var chunk: [byte: 8192] = [0: 8192];
+        const got: usize = https_read_some(fd, &chunk[0], 8192) catch {
+            break;
+        };
+        if got == 0 {
+            break;
+        }
+        var i: usize = 0;
+        while i < got && total < out.len {
+            out[total] = chunk[i];
+            total = total + 1;
+            i = i + 1;
+        }
+    }
+    out_len[0] = total;
+    return total > 0;
+}
+
+// 找 "\r\n\r\n"，返回体起点
+fn head_end(buf: &[byte], n: usize, hdr_len: &usize, body_off: &usize) bool {
+    hdr_len[0] = 0;
+    body_off[0] = 0;
+    var i: usize = 0;
+    while i + 3 < n {
+        if buf[i] == 13 as byte && buf[i + 1] == 10 as byte
+            && buf[i + 2] == 13 as byte && buf[i + 3] == 10 as byte {
+            body_off[0] = i + HEAD_END;
+            hdr_len[0] = body_off[0];
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+// 发一个 POST；响应正文（不含头）写进 out
+// status_out 收 HTTP 状态码；hdr_out 收响应头长度（体从 hdr_out 开始）
+export fn httpc_post(host: &const byte, host_len: usize, port: u16,
+    use_tls: bool, path: &const byte, path_len: usize, body: &const byte,
+    body_len: usize, timeout_ms: i32, out: &[byte], out_len: &usize,
+    status_out: &i32, hdr_out: &usize) i32 {
+    out_len[0] = 0;
+    status_out[0] = 0;
+    hdr_out[0] = 0;
+    var addr: [byte: 16] = [0: 16];
+    const fd: i32 = httpc_connect(host, host_len, port, &addr[0: 16],
+        timeout_ms);
+    if fd < 0 {
+        return 75;
+    }
+    if use_tls {
+        https_connect_fd(fd, &addr[0], 16) catch {
+            close_fd(fd);
+            return 70;
+        };
+    }
+    var req: [byte: REQ_MAX] = [0: REQ_MAX];
+    var rl: usize = 0;
+    if !build_request(host, host_len, path, path_len, body, body_len,
+        &req[0: REQ_MAX], &rl) {
+        close_fd(fd);
+        return 74;
+    }
+    var ok: bool = false;
+    if use_tls {
+        ok = send_all_tls(fd, &req[0], rl);
+    } else {
+        ok = send_all_plain(fd, &req[0], rl);
+    }
+    if !ok {
+        close_fd(fd);
+        return 71;
+    }
+    var got: bool = false;
+    if use_tls {
+        got = recv_loop_tls(fd, out, out_len);
+    } else {
+        got = recv_loop_plain(fd, out, out_len);
+    }
+    close_fd(fd);
+    if !got {
+        return 72;
+    }
+    var hl: [usize: 1] = [0];
+    var bo: [usize: 1] = [0];
+    if !head_end(out, out_len[0], &hl[0], &bo[0]) {
+        return 73;
+    }
+    hdr_out[0] = bo[0];
+    const code: i32 = parse_status(out, hl[0]);
+    if code <= 0 {
+        return 73;
+    }
+    status_out[0] = code;
+    return 0;
+}
+
+// "HTTP/1.1 200 OK" → 200
+fn parse_status(buf: &[byte], n: usize) i32 {
+    var i: usize = 0;
+    while i < n && buf[i] != 32 as byte {
+        i = i + 1;
+    }
+    i = i + 1;
+    var v: i32 = 0;
+    var digits: usize = 0;
+    while i < n && digits < 3 {
+        const c: byte = buf[i];
+        if c < 48 as byte || c > 57 as byte {
+            break;
+        }
+        v = v *| 10;
+        v = v +| ((c as i32) -| 48);
+        digits = digits + 1;
+        i = i + 1;
+    }
+    if digits == 0 {
+        return 0;
+    }
+    return v;
+}
