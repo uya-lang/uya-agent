@@ -70,7 +70,7 @@ printf 'fake-png-bytes' > "$DATA/projects/$PID/assets/cover.png"
 cat > "$TMP/in2.jsonl" <<JSONL
 {"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"call","arguments":{"operation":"bible.put","input":{"project_id":"$PID","bible":{"characters":[{"id":"c1","name":"林岚"}]},"locks":{"c1":"长发，深蓝风衣"}}}}}
 {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"call","arguments":{"operation":"bible.put","input":{"project_id":"$PID","bible":{"characters":[{"id":"c1","name":"林岚"}]},"locks":{"c1":"长发，深蓝风衣"}}}}}
-{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"call","arguments":{"operation":"bible.put","input":{"project_id":"$PID","bible":{"characters":[{"id":"c1","name":"林岚"}]},"locks":{"c1":"短发，深蓝风衣"}}}}}
+{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"call","arguments":{"operation":"bible.put","input":{"project_id":"$PID","bible":{"characters":[{"id":"c1","name":"林岚"}]},"locks":{"c1":"短发，深蓝风衣","_allow_drift":true}}}}}
 {"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"call","arguments":{"operation":"bible.history","input":{"project_id":"$PID"}}}}
 {"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"call","arguments":{"operation":"bible.get","input":{"project_id":"$PID","version":1}}}}
 {"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"call","arguments":{"operation":"asset.register","input":{"project_id":"$PID","name":"cover.png","mime":"image/png"}}}}
