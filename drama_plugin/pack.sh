@@ -92,8 +92,10 @@ for f in selftest/p*_selftest.sh; do bash "\$f" || echo "FAILED \$f"; done
 - 模型是 mock（确定性、不联网）；真实 Provider 是替换点，未接。
 - 视频是 mock 占位文件；真实产线 Adapter 与 FFmpeg 转码未接。
 - 没有 fsync：掉电可能丢最后一次提交。
-- CLI version: $VERSION. Data format version is recorded in project files;
-  no automated migration is provided yet.
+- CLI version: $VERSION; Uya build tool: 0.11.0. The CLI version and data
+  `format_version` are separate. Current project format is 1; no migration is
+  provided, and 0.x releases make no cross-version data compatibility promise.
+  Back up data and do not upgrade existing project data across releases yet.
 - Config files are not loaded by the current CLI; use --data-dir.
 README
 

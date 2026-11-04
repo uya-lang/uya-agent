@@ -11,6 +11,9 @@ if [ ! -f "$BUILD" ]; then
 fi
 UYA=${UYA:-$ROOT/uya/bin/uya}
 UYA_ROOT=${UYA_ROOT:-$ROOT/uya/stdlib}
+VERSION=$(sed -n 's/.*const VERSION:.*"\([0-9][0-9.]*\)".*/\1/p' \
+    "$HERE/src/main.uya")
+[ -n "$VERSION" ] || { echo "FAIL: source version not found"; exit 1; }
 export UYA UYA_ROOT
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
@@ -20,10 +23,10 @@ check_binary() {
     binary=$1
     [ -x "$binary" ]
     version=$("$binary" version)
-    case "$version" in
-        'drama '*) ;;
-        *) echo "FAIL: unexpected version output: $version"; exit 1 ;;
-    esac
+    [ "$version" = "drama $VERSION" ] || {
+        echo "FAIL: expected drama $VERSION, got: $version"
+        exit 1
+    }
     echo "PASS: executable runs: $version"
 }
 
