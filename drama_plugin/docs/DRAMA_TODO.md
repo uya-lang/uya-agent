@@ -1017,16 +1017,15 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 
 - [ ] 抽样审批策略：每 10 集抽 1 集全审，其余抽样 + 异常优先队列
       （把百集约 300 次点击压到约 30 次）。
-- [ ] 权限模式说明（按源码）：read-only 与 workspace-write 下**每次 MCP
-      调用都要用户批准**，danger-full-access 放行，**无回答渠道时 fail closed**；
-      建议把"跑完本集剩余步骤"合成一次 `episode.produce`；无人值守只能靠
-      Worker 自己跑，不能靠 Agent 循环 `call`。
+- [x] 权限模式说明（`DRAMA_OPERATIONS.md` 按源码记录）：read-only 与
+      workspace-write 每次 MCP 调用都需批准，danger-full-access 放行，无回答
+      渠道时 fail closed；无人值守走 Worker，不走 Agent 循环 `call`。
 - [x] Worker 启动示例（交付 README：与 MCP 分进程、共享数据目录，单次扫描后退出）。
 - [ ] API Key：源码尚未读取凭证或发送 Authorization Header；公网认证 Provider 暂不可用。
       只连自管无认证本机网关，待凭证支持落地后再写正式配置说明。
 - [x] 数据目录备份/恢复说明（交付 README：停写后归档全数据根，解压新目录并校验）。
-- [ ] **已知限制**：无 fsync（掉电可能丢最后一次提交）、单卡串行、
-      GPU 分钟预算、审计日志轮转。
+- [x] 已知限制说明（`DRAMA_OPERATIONS.md`）：无 fsync、单 Worker/模拟 GPU
+      预算边界、审计可全量重放但暂无大小轮转。真实 GPU 串行仍待产线接入。
 - [x] Provider 配置文档（`DRAMA_PROVIDER.md`：`llm.json` 字段、错误边界、
       `mock-video-cap-1` 能力表及 P5/P8 回归入口）。
 - [x] 支持平台说明（`DRAMA_PROVIDER.md`：当前仅 GNU/Linux x86-64；其他平台

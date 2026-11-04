@@ -70,7 +70,8 @@ UYA=/opt/uya/bin/uya UYA_ROOT=/opt/uya/stdlib \\
 
 MCP Server 与 Worker 是独立进程，必须在同一台机器共享同一个数据目录。
 两条命令分别由 MCP Host 和服务管理器启动；Worker 单次扫描所有未完成任务后退出，
-需再次启动才能处理后续任务。
+需再次启动才能处理后续任务。权限、预算、锁和已知限制见
+\`docs/DRAMA_OPERATIONS.md\`。
 
 ## 数据备份与恢复
 
