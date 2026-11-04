@@ -85,7 +85,7 @@ for f in drama_plugin/p*_selftest.sh; do sh "$f" || echo "FAILED $f"; done
 | P8 | 第二段 | 能力表 + mock VideoProvider + Worker + 单 Worker 锁；缺真实队列 Adapter、重试上限 |
 | P9 | 第一段 | 确定性 QA + 生产状态 + 重试 + 取消；缺 ASR/锚帧/成片终检/跨集审计 |
 | P10 | 第一段 | mock 拼接 + manifest；缺 FFmpeg 探测/转码/响度/字幕 |
-| P11 | 第二段 | 端到端一条龙 + 交付包/Worker/版本边界说明（`pack.sh`）；缺部署/升级流程 |
+| P11 | 第二段 | 端到端一条龙 + 交付包/Worker/备份与版本边界说明；缺部署/升级流程 |
 | P12 | 大部分 | 四账 / 全量审计 / 九不变量 / 定位 / 反例库；缺增量 |
 | P13 | 第三段 | 10 集测算 + 成本账本 + 派生索引 + 项目级配额熔断；缺百集压力 |
 

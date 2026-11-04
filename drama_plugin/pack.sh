@@ -47,7 +47,7 @@ cat > "$STAGE/README.md" <<README
 # drama $VERSION
 
 短剧生产插件的可交付包。**不含 Uya 工具链**。
-构建和源码自测需要 Uya 0.11.0；已构建的 `bin/drama` 可独立运行。
+构建和源码自测需要 Uya 0.11.0；已构建的 \`bin/drama\` 可独立运行。
 （本仓 \`uya/bin/uya\` + \`uya/stdlib\`）。
 
 ## 怎么构建
@@ -72,6 +72,44 @@ MCP Server 与 Worker 是独立进程，必须在同一台机器共享同一个�
 两条命令分别由 MCP Host 和服务管理器启动；Worker 单次扫描所有未完成任务后退出，
 需再次启动才能处理后续任务。
 
+## 数据备份与恢复
+
+备份前先停止 MCP Host 和 Worker，确认没有进程写入数据目录。以数据根
+`/var/lib/drama` 为例：
+
+\`\`\`sh
+DATA=/var/lib/drama
+BACKUP=/var/backups/drama-\$(date +%F-%H%M%S).tar.gz
+umask 077
+mkdir -p "\$(dirname "\$BACKUP")"
+tar -czf "\$BACKUP" -C "\$(dirname "\$DATA")" "\$(basename "\$DATA")"
+\`\`\`
+
+恢复时先解压到新目录，不覆盖原数据：
+
+\`\`\`sh
+RESTORE_PARENT=\$(mktemp -d)
+tar -xzf "\$BACKUP" -C "\$RESTORE_PARENT"
+RESTORE="\$RESTORE_PARENT/\$(basename "\$DATA")"
+./bin/drama health --data-dir "\$RESTORE"
+cat <<'JSON' | ./bin/drama mcp serve --data-dir "\$RESTORE"
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "method": "tools/call",
+  "params": {
+    "name": "call",
+    "arguments": {"operation": "project.list", "input": {}}
+  }
+}
+JSON
+\`\`\`
+
+确认 \`project.list\` 返回预期项目后，再由 MCP Host 和 Worker 切换到恢复目录。
+备份包含整个数据根（项目、Canon、任务和资产）；不要只复制 \`canon.json\`。
+本版本没有格式迁移，跨版本恢复前须先确认数据兼容性；无 fsync，异常断电
+仍可能丢失最后一次写入。
+
 ## 怎么验
 
 \`\`\`sh
@@ -93,7 +131,7 @@ for f in selftest/p*_selftest.sh; do bash "\$f" || echo "FAILED \$f"; done
 - 视频是 mock 占位文件；真实产线 Adapter 与 FFmpeg 转码未接。
 - 没有 fsync：掉电可能丢最后一次提交。
 - CLI version: $VERSION; Uya build tool: 0.11.0. The CLI version and data
-  `format_version` are separate. Current project format is 1; no migration is
+  \`format_version\` are separate. Current project format is 1; no migration is
   provided, and 0.x releases make no cross-version data compatibility promise.
   Back up data and do not upgrade existing project data across releases yet.
 - Config files are not loaded by the current CLI; use --data-dir.
