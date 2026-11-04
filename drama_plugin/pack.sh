@@ -11,7 +11,7 @@
 #
 # 用法：sh drama_plugin/pack.sh [输出目录]
 #
-# 注意：包里不含 uya 工具链（体积大且项目相关），README 里写清楚需要 uya 0.11.0。
+# 注意：包里不含 Uya 工具链；构建和源码自测需要 Uya 0.11.0 与匹配标准库。
 
 set -eu
 
@@ -25,29 +25,19 @@ VERSION=$(grep -o '"0\.[0-9]*\.[0-9]*"' "$HERE/src/main.uya" | head -1 | tr -d '
 [ -n "$VERSION" ] || VERSION=0.0.0
 PKG="drama-$VERSION"
 
-SRC="$HERE/src/main.uya $HERE/src/bytes.uya $HERE/src/json_min.uya \
-$HERE/src/json_out.uya $HERE/src/registry.uya $HERE/src/schema.uya \
-$HERE/src/dispatch.uya $HERE/src/store.uya $HERE/src/project.uya \
-$HERE/src/digest.uya $HERE/src/asset.uya $HERE/src/bible.uya \
-$HERE/src/canon.uya $HERE/src/httpc.uya $HERE/src/llm.uya \
-$HERE/src/story.uya $HERE/src/context.uya $HERE/src/task.uya \
-$HERE/src/board.uya $HERE/src/provider.uya $HERE/src/qa.uya \
-$HERE/src/audit.uya $HERE/src/assemble.uya $HERE/src/index.uya \
-$HERE/src/series.uya $HERE/src/ops.uya $HERE/src/server.uya"
-
 mkdir -p "$OUT"
 STAGE="$OUT/$PKG"
 rm -rf "$STAGE"
 mkdir -p "$STAGE/bin" "$STAGE/docs" "$STAGE/src" "$STAGE/selftest"
 
 echo "== 编译 =="
-"$UYA" build $SRC -o "$STAGE/bin/drama"
-echo "   bin/drama $(wc -c < "$STAGE/bin/drama") 字节"
+UYA="$UYA" UYA_ROOT="$UYA_ROOT" sh "$HERE/build.sh" "$STAGE/bin/drama"
 
 echo "== 收集文件 =="
 cp "$HERE"/docs/*.md "$STAGE/docs/"
 cp "$HERE"/src/*.uya "$STAGE/src/"
 cp "$HERE"/*_selftest.sh "$STAGE/selftest/"
+cp "$HERE/build.sh" "$STAGE/build.sh"
 cp -r "$HERE/proto" "$STAGE/selftest/proto"
 # 验收脚本按「脚本目录下的 src/」找源码，包里就照这个布局放一份
 cp -r "$HERE/src" "$STAGE/selftest/src"
@@ -56,8 +46,18 @@ rm -f "$STAGE"/selftest/proto/*.log 2>/dev/null || true
 cat > "$STAGE/README.md" <<README
 # drama $VERSION
 
-短剧生产插件的可交付包。**不含 Uya 工具链**：运行时需要 uya 0.11.0
+短剧生产插件的可交付包。**不含 Uya 工具链**。
+构建和源码自测需要 Uya 0.11.0；已构建的 `bin/drama` 可独立运行。
 （本仓 \`uya/bin/uya\` + \`uya/stdlib\`）。
+
+## 怎么构建
+
+如需从源码构建或运行源码自测，需要 Uya 0.11.0 与匹配的标准库：
+
+\`\`\`sh
+UYA=/opt/uya/bin/uya UYA_ROOT=/opt/uya/stdlib \\
+  sh build.sh build/drama
+\`\`\`
 
 ## 怎么跑
 
@@ -71,9 +71,10 @@ cat > "$STAGE/README.md" <<README
 ## 怎么验
 
 \`\`\`sh
-UYA=<uya 编译器路径> UYA_ROOT=<标准库路径> sh selftest/p1_selftest.sh
-# 或一次跑完：
-for f in selftest/p*_selftest.sh; do sh "\$f" || echo "FAILED \$f"; done
+UYA=<uya 编译器路径> UYA_ROOT=<标准库路径> \\
+  sh selftest/build_selftest.sh
+# 或跑完整 MCP 回归：
+for f in selftest/p*_selftest.sh; do bash "\$f" || echo "FAILED \$f"; done
 \`\`\`
 
 包里 \`selftest/src/\` 是源码副本（验收脚本按「脚本目录下的 src」找源码）。
@@ -87,6 +88,9 @@ for f in selftest/p*_selftest.sh; do sh "\$f" || echo "FAILED \$f"; done
 - 模型是 mock（确定性、不联网）；真实 Provider 是替换点，未接。
 - 视频是 mock 占位文件；真实产线 Adapter 与 FFmpeg 转码未接。
 - 没有 fsync：掉电可能丢最后一次提交。
+- CLI version: $VERSION. Data format version is recorded in project files;
+  no automated migration is provided yet.
+- Config files are not loaded by the current CLI; use --data-dir.
 README
 
 echo "== 打包 =="
