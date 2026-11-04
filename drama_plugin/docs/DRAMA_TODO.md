@@ -1001,17 +1001,17 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 - [x] 独立构建脚本（`build.sh`；自测验证默认/自定义路径及启动）。
 - [x] 定义当前版本号和兼容策略（0.1.0 / project format 1；不承诺 0.x
       跨版本数据兼容，迁移器未完成前要求先备份且不直接升级既有项目）。
-- [ ] 默认配置模板。
-- [ ] MCP Host 配置示例，必须包含：`command` **绝对路径**、
-      `args`（如 `mcp serve --config …`）、`env`（API Key 与代理）、
-      `cwd`、`toolCallTimeoutMs`（≥60000）。示例形态：
+- [x] 默认 Provider 配置模板（交付 `docs/DRAMA_PROVIDER.md`：无文件即 mock，
+      本机无认证 OpenAI 兼容网关使用 `llm.json`）。
+- [ ] MCP Host 配置示例：当前 CLI 不接受通用 `--config`，且源码尚未读取
+      API Key/代理；待凭据与代理支持落地后补正式 Host 示例。当前最小形态：
 
       ```json
       {"mcpServers":{"drama":{
         "command":"/opt/drama/bin/drama",
-        "args":["mcp","serve","--config","/etc/drama/config.json"],
+        "args":["mcp","serve","--data-dir","/var/lib/drama"],
         "cwd":"/home/<user>/drama",
-        "env":{"LLM_API_KEY":"${DRAMA_LLM_KEY}"},
+        "env":{},
         "toolCallTimeoutMs":60000}}}
       ```
 
@@ -1027,8 +1027,10 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 - [x] 数据目录备份/恢复说明（交付 README：停写后归档全数据根，解压新目录并校验）。
 - [ ] **已知限制**：无 fsync（掉电可能丢最后一次提交）、单卡串行、
       GPU 分钟预算、审计日志轮转。
-- [ ] Provider 配置文档（含能力表版本）。
-- [ ] 支持平台说明。
+- [x] Provider 配置文档（`DRAMA_PROVIDER.md`：`llm.json` 字段、错误边界、
+      `mock-video-cap-1` 能力表及 P5/P8 回归入口）。
+- [x] 支持平台说明（`DRAMA_PROVIDER.md`：当前仅 GNU/Linux x86-64；其他平台
+      未验收，不作支持承诺）。
 - [x] 完整 selftest 通过（发布包内 20 个阶段脚本及构建自测均通过）。
 
 ---
