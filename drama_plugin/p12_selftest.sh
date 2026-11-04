@@ -185,6 +185,23 @@ assert 'AUDIT_REPLAY_MISMATCH' in codes, codes
 print('PASS: 改过的提交记录被审计抓出来（AUDIT_REPLAY_MISMATCH）')" \
     || bad "篡改没被发现"
 
+# 重复审计仍须检查旧提交，不能复用可陈旧的成功结果。
+req='{"jsonrpc":"2.0","id":25,'\
+'"method":"tools/call","params":{"name":"call",'\
+'"arguments":{"operation":"canon.audit",'\
+'"input":{"project_id":"'"$PID"'"}}}}'
+out=$(ask "$req")
+printf '%s' "$out" | field | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+assert d['replay_ok'] is False, d
+assert any(v['code']=='AUDIT_REPLAY_MISMATCH' for v in d['violations']), d
+print('PASS: 重复全历史审计仍检查旧提交')" \
+    || bad "重复审计漏掉旧提交篡改"
+[ ! -e "$DATA/projects/$PID/audit/last.json" ] \
+    && ok "全历史审计不依赖可陈旧缓存" \
+    || bad "发现未验证的审计缓存"
+
 # ---------- 5. 道具指向未知场景 ----------
 python3 - "$DATA/projects/$PID/canon.json" <<'PY'
 import json

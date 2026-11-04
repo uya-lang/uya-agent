@@ -20,7 +20,7 @@
 | `p7_selftest.sh` | 分镜生成 / 版本 / 时长口径 | 19 |
 | `p8_selftest.sh` | Provider 能力表 / 视频任务 / Worker / 单 Worker 锁 | 16 |
 | `p9_selftest.sh` | 确定性 QA / 生产状态 / 重试 / 取消 / 熔断 | 14 |
-| `p12_selftest.sh` | 闭环审计 + 九条不变量逐条判定 | 14 |
+| `p12_selftest.sh` | 闭环审计 + 九条不变量 + 重复全历史篡改检测 | 16 |
 | `p12b_selftest.sh` | 反例库 + 规则/回收率/错误定位 | 14 |
 | `p10_selftest.sh` | 成片合成（mock 拼接 + manifest） | 11 |
 | `p11_selftest.sh` | 端到端一条龙（三集 → 成片 → 审计 → 成本账本） | 21 |
@@ -64,7 +64,7 @@ for f in drama_plugin/p*_selftest.sh; do sh "$f" || echo "FAILED $f"; done
 | `board.uya` | 剧本 → 确定性分镜 + 版本存储 | 499 |
 | `provider.uya` | 版本化能力表 + mock VideoProvider | 136 |
 | `qa.uya` | 剧本/分镜确定性体检 + 不可变报告 | 362 |
-| `audit.uya` | 闭环审计：账本 / 不变量 / 重放 / 回收率 | 472 |
+| `audit.uya` | 闭环审计：账本 / 不变量 / 全历史重放 / 回收率 | 614 |
 | `assemble.uya` | 成片合成（mock 拼接）+ manifest | 246 |
 | `index.uya` | 派生索引（episodes）+ 全量重建 | 255 |
 | `series.uya` | 百集大纲生成、批准与拦截 | 312 |
@@ -73,20 +73,20 @@ for f in drama_plugin/p*_selftest.sh; do sh "$f" || echo "FAILED $f"; done
 
 | 阶段 | 状态 | 说明 |
 |---|---|---|
-| P0 | 完成 | 技术核验、HTTPS 证书校验修好、工具链同步到 `uya/` |
-| P1 | 完成 | CLI + 三工具 stdio server |
-| P2 | 完成 | Registry / Schema / Dispatch 闭环 |
-| P3 | 大部分 | Project / 存储 / Bible 版本 / Asset；缺子模型字段约束、迁移器、审计轮转 |
-| P4 | 第一段 | Canon 提交 + 四轴不变量 + 锁 + 恢复；缺事件显式 ID、候选状态差异比较 |
-| P5 | 大部分 | 传输层 / Adapter / 剧本 / 上下文 / 任务 / 百集大纲；缺 SSE、代理、日志脱敏 |
+| P0 | 完成 | 技术核验、HTTPS 证书校验修好、工具链同步到 `uya/`（v0.11.0） |
+| P1 | 完成 | CLI 三模式 + 三工具 stdio server |
+| P2 | 完成 | Registry / Schema / Dispatch / 幂等闭环 |
+| P3 | 大部分 | Project / 存储 / Bible 版本 / Asset / configure；缺子模型字段约束、迁移器、审计轮转 |
+| P4 | 大部分 | Canon 提交 + 四轴不变量 + 锁 + 崩溃恢复；缺事件显式 ID、候选状态差异比较 |
+| P5 | 大部分 | 传输层 / Adapter / 剧本 / 上下文 / 任务 / 百集大纲 / 合一审核；缺 SSE、代理、日志脱敏 |
 | P6 | M1 最小版 | 三集闭环 + 重放复现；真实模型与视频 Mock 未接 |
 | P7 | 第一段 | 确定性分镜；缺参考图顺序、状态迁移、固定资产引用 |
-| P8 | 第一段 | 能力表 + mock VideoProvider + Worker；缺真实本机队列 Adapter、单 Worker 锁 |
-| P9 | 第一段 | 确定性 QA + 生产状态 + 重试；缺 ASR/锚帧/成片终检/跨集审计 |
+| P8 | 第二段 | 能力表 + mock VideoProvider + Worker + 单 Worker 锁；缺真实队列 Adapter、重试上限 |
+| P9 | 第一段 | 确定性 QA + 生产状态 + 重试 + 取消；缺 ASR/锚帧/成片终检/跨集审计 |
 | P10 | 第一段 | mock 拼接 + manifest；缺 FFmpeg 探测/转码/响度/字幕 |
-| P11 | 第二段 | 端到端一条龙 + 交付包（pack.sh）；部署/升级流程未写 |
-| P12 | 大部分 | 四本账 + 重放 + 九条不变量 + 错误定位；缺增量检查 |
-| P13 | 第三段 | 成本账本 + 派生索引 + 项目级配额熔断；百集压力未做 |
+| P11 | 第二段 | 端到端一条龙 + 交付包（`pack.sh`）；缺部署/升级流程 |
+| P12 | 大部分 | 四账 / 全量审计 / 九不变量 / 定位 / 反例库；缺增量 |
+| P13 | 第三段 | 10 集测算 + 成本账本 + 派生索引 + 项目级配额熔断；缺百集压力 |
 
 ## 4. 已知限制（别当成承诺）
 
@@ -97,3 +97,6 @@ for f in drama_plugin/p*_selftest.sh; do sh "$f" || echo "FAILED $f"; done
   日志里，多进程并发写同一项目未验证。
 - **上下文是全量 + 预算裁剪**，没有向量检索；长期梗只做了 promise 账。
 - **反例回归不全**：证书错误的负例、越权资产读取的符号链接逃逸都还没脚本化。
+- **没有真实外部依赖的验证**：模型、视频队列、FFmpeg 全是 mock/替身，
+  接真实产线前不能拿它跑真片。
+- **规模只到 10 集**：百集压力、索引分片、单日配额都没跑过。
