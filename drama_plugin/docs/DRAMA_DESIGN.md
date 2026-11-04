@@ -1505,10 +1505,12 @@ video.capabilities() -> 能力表                  # 见下
 （`HOME LOGNAME PATH SHELL TERM USER`）+ 配置里显式给的 `K=V`；
 `command` **不做 PATH 查找**。因此：
 
-- API Key 的合法来源只有两个：宿主配置里的 `env`（`mcp.json` 的
+- API Key 的目标来源只有两个：宿主配置里的 `env`（`mcp.json` 的
   `mcpServers.<name>.env`）或 Drama 自己的配置文件（0600，路径在配置里给）；
+- **当前未实现凭证读取或 Authorization Header**，公开 API Key Provider 不可用；
+  仅可连接用户自管、无需认证的 OpenAI 兼容本机网关；
 - **不要**假设继承 shell 里的 `OPENAI_API_KEY`/`HTTP_PROXY` 之类变量——
-  要用就得在宿主配置里显式声明；
+  要用就得在宿主配置里显式声明；Drama 当前也不会读取这些变量。
 - `command` 必须写**绝对路径**；
 - 不写入 Project Bible、Task 输出或 MCP 响应；
 - 日志脱敏（key 只出现前 4 位 + 长度）；

@@ -97,6 +97,9 @@ for f in selftest/p*_selftest.sh; do bash "\$f" || echo "FAILED \$f"; done
   provided, and 0.x releases make no cross-version data compatibility promise.
   Back up data and do not upgrade existing project data across releases yet.
 - Config files are not loaded by the current CLI; use --data-dir.
+- OpenAI-compatible requests currently send no Authorization/API Key header.
+  Use only an unauthenticated endpoint you control; public authenticated
+  providers are unsupported.
 README
 
 echo "== 打包 =="
