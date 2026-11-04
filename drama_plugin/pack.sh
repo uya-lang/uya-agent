@@ -64,9 +64,13 @@ UYA=/opt/uya/bin/uya UYA_ROOT=/opt/uya/stdlib \\
 \`\`\`sh
 ./bin/drama version
 ./bin/drama health --data-dir /tmp/drama-data
-./bin/drama mcp serve --data-dir /tmp/drama-data     # stdio MCP，三工具
-./bin/drama worker run --data-dir /tmp/drama-data    # 扫未完成任务
+./bin/drama mcp serve --data-dir /var/lib/drama
+./bin/drama worker run --data-dir /var/lib/drama
 \`\`\`
+
+MCP Server 与 Worker 是独立进程，必须在同一台机器共享同一个数据目录。
+两条命令分别由 MCP Host 和服务管理器启动；Worker 单次扫描所有未完成任务后退出，
+需再次启动才能处理后续任务。
 
 ## 怎么验
 
