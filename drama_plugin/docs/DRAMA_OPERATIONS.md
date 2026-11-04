@@ -67,7 +67,10 @@ sh drama_plugin/p4_selftest.sh
 sh drama_plugin/p8_selftest.sh
 sh drama_plugin/p9_selftest.sh
 sh drama_plugin/p12_selftest.sh
+sh drama_plugin/p13_selftest.sh
+EPISODES=100 sh drama_plugin/p13_selftest.sh
 ```
 
 这些脚本覆盖 Canon 恢复、Worker 锁与任务、预算熔断、全历史审计和篡改
-检测；它们不证明真实视频、外部 Provider 或跨平台运行已经完成。
+检测；`EPISODES=100` 只验证控制面提交与重放，不证明百集视频压力、真实
+外部 Provider 或跨平台运行已经完成。

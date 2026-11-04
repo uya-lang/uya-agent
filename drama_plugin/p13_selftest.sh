@@ -1,10 +1,11 @@
 #!/bin/sh
 # drama_plugin/p13_selftest.sh — P13 第一段（规模与产能的第一次测算）
 #
-# 用 mock Provider 连跑 10 集，量三件事：
+# 用 mock Provider 连跑 N 集，量三件事（默认 N=10）：
 #   1. 每集"生成 + 批准"的墙钟耗时（控制面开销，不含模型与 GPU）；
-#   2. 审计在 10 集规模下的耗时（闭环检查不能随集数爆炸）；
+#   2. 审计在 N 集规模下的耗时（闭环检查不能随集数爆炸）；
 #   3. 状态体积（canon.json 大小），看百集会不会撑爆缓冲。
+# 可用 EPISODES=100 做百集控制面压力；它不替代完整视频 M4 验收。
 #
 # 这不是产能承诺：真实产能取决于模型与 GPU（P0_FINDINGS §1.4 有实测基线）。
 # 这里量的是**本插件自身的开销**。
@@ -31,7 +32,11 @@ $HERE/src/server.uya"
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 DATA="$TMP/data"
-EPISODES=10
+EPISODES=${EPISODES:-10}
+case "$EPISODES" in
+    ''|*[!0-9]*) echo "FAIL: EPISODES must be an integer"; exit 1 ;;
+esac
+[ "$EPISODES" -gt 0 ] || { echo "FAIL: EPISODES must be positive"; exit 1; }
 
 fails=0
 ok() { echo "PASS: $1"; }
@@ -101,11 +106,12 @@ JSON
 A_END=$(date +%s%N)
 AUDIT_MS=$(( (A_END - A_START) / 1000000 ))
 printf '%s' "$out" | field > "$TMP/audit.json"
-python3 - "$TMP/audit.json" <<'PY'
+python3 - "$TMP/audit.json" "$EPISODES" <<'PY'
 import json
 import sys
 
 d = json.load(open(sys.argv[1]))
+n = int(sys.argv[2])
 ok, fails = [], []
 
 
@@ -113,9 +119,9 @@ def check(c, m):
     (ok if c else fails).append(m)
 
 
-check(d['revision'] == 10, '10 集后 canon revision = 10')
-check(d['commits'] == 10, '提交记录 10 条')
-check(d['replay_ok'] is True, '10 条提交重放全部一致')
+check(d['revision'] == n, '%d 集后 canon revision = %d' % (n, n))
+check(d['commits'] == n, '提交记录 %d 条' % n)
+check(d['replay_ok'] is True, '%d 条提交重放全部一致' % n)
 check(d['ledger']['promises_overdue'] == 0, '没有逾期承诺')
 for m in ok:
     print('PASS: ' + m)
@@ -125,13 +131,13 @@ sys.exit(1 if fails else 0)
 PY
 [ $? -eq 0 ] || fails=$((fails + 1))
 
-[ "$AUDIT_MS" -lt 3000 ] && ok "10 集审计耗时 ${AUDIT_MS} ms（< 3 s）" \
+[ "$AUDIT_MS" -lt 3000 ] && ok "$EPISODES 集审计耗时 ${AUDIT_MS} ms（< 3 s）" \
     || bad "审计太慢：${AUDIT_MS} ms"
 
 # ---------- 状态体积 ----------
 CANON_BYTES=$(wc -c < "$DATA/projects/$PID/canon.json")
 [ "$CANON_BYTES" -lt 65536 ] \
-    && ok "canon.json ${CANON_BYTES} B（远小于 64 KB 缓冲）" \
+    && ok "canon.json ${CANON_BYTES} B（小于 64 KB 缓冲）" \
     || bad "canon.json 涨到 ${CANON_BYTES} B，快撑爆缓冲"
 
 # 按当前斜率外推百集
@@ -148,7 +154,7 @@ PY
 
 echo "----"
 if [ "$fails" -eq 0 ]; then
-    echo "PASS: P13 第一段（10 集规模测算）"
+    echo "PASS: P13 第一段（${EPISODES} 集规模测算）"
     exit 0
 fi
 echo "FAIL: $fails 项"
