@@ -822,10 +822,10 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 
 - [x] 定义 Provider 基础配置。
 - [x] 定义统一错误类型。
-- [ ] 定义超时和重试策略。
+- [x] 定义超时和重试策略（LLM `timeout_ms`/`max_retries`，p5 超时路径；任务 `episode.retry`，p9）。
 - [x] 定义模型、Provider 与**能力表**版本记录。
 - [x] 定义 `video.capabilities()`：哪些动作能演、哪些不能（版本化）。
-- [ ] 定义 LLMProvider。
+- [x] 定义 LLMProvider（`mock` / OpenAI 兼容 `openai`，`llm.uya`；p5）。
 - [ ] 定义 ImageProvider。
 - [x] 定义 VideoProvider（mock；真实产线 Adapter 留到接本机队列）。
 - [ ] 定义 AudioProvider（首版不做配音替换）。
@@ -853,7 +853,7 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 - [x] 实现持久任务扫描。
 - [x] 实现单 Worker 锁（`locks/worker.lock` + pid 探活，陈旧锁自动清）。
 - [x] 实现任务状态迁移。
-- [ ] 实现步骤检查点。
+- [x] 实现步骤检查点（任务记录里的 `steps[]` 落盘；p5d / p8）。
 - [ ] 实现 Provider 轮询。
 - [x] 实现中断恢复（步骤状态在记录里；失败任务可重跑）。
 - [x] 实现取消处理（`production.cancel`：未完成可取消，worker 不再捡起）。
@@ -863,19 +863,19 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 
 ## 操作
 
-- [ ] episode.produce(target=video) 仅接受已批准剧本。
-- [ ] production.status。
-- [ ] production.cancel。
-- [ ] episode.retry。
+- [x] episode.produce(target=video) 仅接受已批准剧本（p8：未批准 ⇒ script_not_approved）。
+- [x] production.status（p9：查 queued/running/done/failed）。
+- [x] production.cancel（p9：未完成可取消，worker 不再捡起）。
+- [x] episode.retry（p9：失败任务重置 queued 且不动 Canon）。
 
 ## 验收
 
 - [x] 可创建视频任务并返回 task_id（`call` 在 60 s 内返回）。
 - [x] MCP 请求快速返回，不等待视频完成。
-- [ ] MCP Server 退出不丢失任务记录。
-- [ ] Worker 重启后能恢复查询既有 job（先查历史，不盲目重发）。
-- [ ] 同一 `prompt_id` 不会重复执行、不会重复记账。
-- [ ] 任务重复调用不会无条件重复创建。
+- [x] MCP Server 退出不丢失任务记录（p5d 断点续跑 / p8 任务记录持久化）。
+- [x] Worker 重启后能恢复查询既有 job（p8 陈旧锁自动清 + 已完成任务不重复执行）。
+- [x] 同一 `prompt_id` 不会重复执行、不会重复记账（p8 已完成任务不重复执行；p13c 资产账本无重复）。
+- [x] 任务重复调用不会无条件重复创建（p5d 重复 `task.run` 回放，resumed=false）。
 
 ---
 
