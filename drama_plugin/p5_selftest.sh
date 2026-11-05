@@ -211,6 +211,26 @@ case "$got" in
     *) bad "超时应回 TIMEOUT，实际 $got" ;;
 esac
 
+# ---------- 7.5 调用摘要：模型/参数/输出 hash ----------
+if [ -f "$DATA/llm_calls.jsonl" ]; then
+    python3 - "$DATA/llm_calls.jsonl" <<'PY'
+import json, sys
+rows = [json.loads(l) for l in open(sys.argv[1]) if l.strip()]
+hits = [d for d in rows if d['rc'] == 0 and d['output_chars'] > 0]
+assert hits, rows[-1:]
+d = hits[-1]
+assert d['model'] == 'test-model', d
+assert d['temperature'] == 0, d
+assert d['attempts'] >= 1, d
+assert len(d['output_sha256']) == 64, d
+assert 'sk-test-123' not in open(sys.argv[1]).read(), 'api_key leaked'
+print('PASS: llm_calls.jsonl 记录模型/参数/尝试次数/输出摘要')
+PY
+    [ $? -eq 0 ] || fails=$((fails + 1))
+else
+    bad "没有写 llm_calls.jsonl"
+fi
+
 # ---------- 8. 日志脱敏：密钥只留在 llm.json ----------
 if grep -Rq "sk-test-123" "$DATA/projects" "$DATA/operations.jsonl" \
     2>/dev/null; then
