@@ -223,6 +223,32 @@ PY
 cat > "$TMP/q.jsonl" <<JSON
 {
   "jsonrpc": "2.0",
+  "id": 4010,
+  "method": "tools/call",
+  "params": {"name": "call", "arguments": {
+    "operation": "production.report", "input": {"project_id": "$PID"}
+  }}
+}
+JSON
+out=$(ask)
+printf '%s' "$out" | field > "$TMP/report.json"
+python3 - "$TMP/report.json" "$EPISODES" <<'PY'
+import json
+import sys
+d = json.load(open(sys.argv[1]))
+n = int(sys.argv[2])
+assert d["episodes"] == n, d
+assert d["tasks_done"] == n, d
+assert d["tasks_failed"] == 0, d
+assert d["renders"] == n * 3, d
+assert d["invariants_ok"] is True, d
+assert d["failed_tasks"] == [], d
+print("PASS: production.report %d 集 / 零失败 / 不变量全绿" % n)
+PY
+
+cat > "$TMP/q.jsonl" <<JSON
+{
+  "jsonrpc": "2.0",
   "id": 4006,
   "method": "tools/call",
   "params": {"name": "call", "arguments": {

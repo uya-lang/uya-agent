@@ -1141,7 +1141,8 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 ## 批量调度与审批
 
 - [ ] 一次投 N 集、优先级、截止时间。
-- [ ] 日终报告（完成集数、GPU 小时、重做率、异常清单）。
+- [x] 日终报告（`production.report`：完成集数、任务完成/失败、GPU 分钟、
+      重做率、异常任务清单、不变量是否全绿；告警推送留到接真实产线）。
 - [ ] 抽样审批 + 异常优先队列。
 
 ## 规模门槛
@@ -1161,9 +1162,12 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
       任务。全部用 mock 占位文件，不含真实 GPU 与转码，见
       `docs/DRAMA_PROVIDER.md`。同一脚本还断言：300 条资产账本逐条重算
       SHA-256 与文件一致、`asset.list` 整份返回、`episode.get` /
-      `index.rebuild` / `index.list` 百集耗时分别为 34 / 36 / 34 ms。
+      `index.rebuild` / `index.list` 百集耗时分别为 34 / 36 / 34 ms；
+      `production.report` 汇总 100 集 / 零失败任务 / 不变量全绿。
 - [ ] M4 的真实部分：接真实 VideoProvider 重跑同一套百集压力。
 - [ ] 百集成本报告（GPU 小时、人工分钟、重做率、不变量红数）。
+      `production.report` 已能给出 mock 口径的集数/GPU 分钟/重做率/红数；
+      真实产线数字仍要等真实 Provider。
 - [x] 镜头文件按分镜版本归档：mock 写
       `assets/v<board_version>/shot_<seq>.mp4`，不同集的分镜版本不同，
       同号镜头不再互相覆盖；`assemble` 只在本次分镜自己的目录里拼接，
@@ -1184,7 +1188,7 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 
 # 16. 操作目录与测试覆盖矩阵
 
-**已实现的 42 个操作**（`registry.uya` 是唯一来源；`describe` 就是从这张表
+**已实现的 43 个操作**（`registry.uya` 是唯一来源；`describe` 就是从这张表
 生成的）。"覆盖脚本"列是能跑到它的自测，空着表示只有间接覆盖。
 
 | 操作 | 阶段 | 权限 | 覆盖脚本 |
@@ -1223,6 +1227,7 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 | qa.run | P9 | write | p9 / p11 |
 | media.assemble | P10 | write | p10 / p11 |
 | budget.report | P13 | read | p11 |
+| production.report | P13 | read | p13c |
 | index.rebuild | P13 | write | p13b |
 | index.list | P13 | read | p13b |
 | series.plan | P5 | write | p5e |
