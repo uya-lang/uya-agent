@@ -948,7 +948,8 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 > 1.17 补：`media.probe` 用 ffprobe 读首条视频流宽高与容器时长，只接受数据根下
 > 的相对路径，并记录 ffprobe/ffmpeg 版本首行与探测参数；合成出的成片同时登记进
 > `assets.jsonl`（mime `video/mp4`）；失败不占版本，补回镜头重跑即可恢复；
-> `media.probe` 还可带期望宽高/时长，不符回 `MEDIA_MISMATCH`。
+> `media.probe` 还可带期望宽高/时长，不符回 `MEDIA_MISMATCH`；`media.encode`
+> 按 format.encode 参数转码到 `encodes/<name>`。
 > 验收：`sh drama_plugin/p10_selftest.sh`：manifest 字段齐全、
 > 成片大小 == 各镜头字节数之和、合成不改 Canon、同样输入两次成片 hash 一致、
 > 镜头缺失 ⇒ ASSEMBLY_MISSING_SHOT、媒体探测返回宽高/时长且越界路径被拒。
@@ -962,7 +963,7 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 - [ ] 实现 loudnorm 两遍（目标 I=-16 LUFS、TP=-1.5 dBTP）。
 - [ ] 实现字幕文件生成（以 ASR 对齐结果为定时依据）。
 - [ ] 实现字幕合成。
-- [ ] 实现输出编码配置（libx264/crf20/yuv420p/aac 128k/32kHz/faststart）。
+- [x] 实现输出编码配置（`media.encode`：libx264/crf20/yuv420p/aac 128k/32kHz/faststart；成片拼接接入待真实产线）。
 - [ ] 实现输出时长/分辨率检查（`media.probe` 已支持 `expect_width`/`expect_height`/`expect_duration_ms`；成片与 `format` 绑定待真实产线）。
 - [x] 实现输出文件完整性检查（大小与各镜头之和比对 + SHA-256 入 manifest）。
 - [x] 记录 FFmpeg 版本和参数（`media.probe` 回 ffprobe/ffmpeg 版本首行与实际探测参数）。
@@ -1203,7 +1204,7 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 
 # 16. 操作目录与测试覆盖矩阵
 
-**已实现的 45 个操作**（`registry.uya` 是唯一来源；`describe` 就是从这张表
+**已实现的 46 个操作**（`registry.uya` 是唯一来源；`describe` 就是从这张表
 生成的）。"覆盖脚本"列是能跑到它的自测，空着表示只有间接覆盖。
 
 | 操作 | 阶段 | 权限 | 覆盖脚本 |
@@ -1243,6 +1244,7 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 | qa.run | P9 | write | p9 / p11 |
 | media.assemble | P10 | write | p10 / p11 |
 | media.probe | P10 | read | p10 |
+| media.encode | P10 | write | p10 |
 | budget.report | P13 | read | p11 |
 | production.report | P13 | read | p13c |
 | index.rebuild | P13 | write | p13b |

@@ -7,7 +7,8 @@
 #   * 镜头文件缺失 ⇒ ASSEMBLY_MISSING_SHOT，不产出半成品；补回镜头后重跑恢复；
 #   * 合成不改 Canon，成片登记进资产账本（video/mp4），asset.get 可按名查回；
 
-#   * `media.probe` 用 ffprobe 报宽高/时长，越界路径与缺失文件各有错误码。
+#   * `media.probe` 用 ffprobe 报宽高/时长，越界路径与缺失文件各有错误码；
+#   * `media.encode` 按 format.encode 参数转码，产物可被 probe 读回。
 #
 # 用法：sh drama_plugin/p10_selftest.sh
 
@@ -273,6 +274,25 @@ d=json.load(sys.stdin)
 assert d.get('code') == 'MEDIA_MISMATCH', d
 print('PASS: 分辨率不符 ⇒ MEDIA_MISMATCH')" \
         || bad "分辨率不符没被拦住"
+
+    out=$(ask '{"jsonrpc":"2.0","id":17,"method":"tools/call","params":{"name":"call","arguments":{"operation":"media.encode","input":{"path":"probe/clip.mp4","output":"enc1.mp4"}}}}')
+    printf '%s' "$out" | field | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+assert d.get('output') == 'encodes/enc1.mp4', d
+assert d.get('size', 0) > 0, d
+print('PASS: media.encode 产出 %s（%d B）' % (d['output'], d['size']))" \
+        || bad "media.encode 没产出"
+
+    out=$(ask '{"jsonrpc":"2.0","id":18,"method":"tools/call","params":{"name":"call","arguments":{"operation":"media.probe","input":{"path":"encodes/enc1.mp4"}}}}')
+    printf '%s' "$out" | field | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+assert d.get('width') == 320, d
+assert d.get('height') == 240, d
+assert 900 <= d.get('duration_ms', 0) <= 1100, d
+print('PASS: 转码产物可被 media.probe 读回')" \
+        || bad "转码产物不可读"
 
     out=$(ask '{"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"call","arguments":{"operation":"media.probe","input":{"path":"../etc/passwd"}}}}')
     printf '%s' "$out" | field | python3 -c "
