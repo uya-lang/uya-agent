@@ -5,7 +5,7 @@
 #   * 分镜 → 成片：按镜号顺序拼接镜头文件，产出 manifest（镜头数/时长/size/hash）；
 #   * 确定性：同一份分镜同一批镜头 ⇒ 成片字节一致；
 #   * 镜头文件缺失 ⇒ ASSEMBLY_MISSING_SHOT，不产出半成品；
-#   * 合成不改 Canon；
+#   * 合成不改 Canon，成片登记进资产账本（video/mp4）；
 #   * `media.probe` 用 ffprobe 报宽高/时长，越界路径与缺失文件各有错误码。
 #
 # 用法：sh drama_plugin/p10_selftest.sh
@@ -118,6 +118,19 @@ for m in fails:
 sys.exit(1 if fails else 0)
 PY
 [ $? -eq 0 ] || fails=$((fails + 1))
+
+out=$(ask "$(cat <<JSON
+{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"call","arguments":{"operation":"asset.list","input":{"project_id":"$PID"}}}}
+JSON
+)")
+printf '%s' "$out" | field | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+hit=[x for x in d['assets'] if x['name']=='episode_1.mp4']
+assert len(hit)==1, d
+assert hit[0]['mime']=='video/mp4', hit
+print('PASS: 成片已登记为 Asset（video/mp4）')" \
+    || bad "成片没有登记成 Asset"
 
 # ---------- 2. 合成不改 Canon ----------
 CANON_AFTER=$(md5sum "$DATA/projects/$PID/canon.json" | cut -d' ' -f1)
