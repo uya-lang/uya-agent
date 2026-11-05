@@ -173,7 +173,10 @@ assert d['script_version'] >= 1, d
 assert d['board_version'] >= 1, d
 assert d['shots_rendered'] > 0, d
 assert d['state'] == 'done', d
-print('PASS: 每集 manifest.json 记录了版本/镜头数/状态')
+assert d['format']['canvas']['width'] == 448, d
+assert d['format']['delivery']['fps'] == 24, d
+assert d['format']['encode']['vcodec'] == 'libx264', d
+print('PASS: 每集 manifest.json 记录了版本/镜头数/状态/format')
 PY
     [ $? -eq 0 ] || fails=$((fails + 1))
 else
