@@ -1124,9 +1124,10 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 - [x] 派生索引（`index/episodes.jsonl`，一行一集），可从真相全量重建；
       shot/asset 级索引还没做。
 - [ ] 每集一个 `manifest.json`。
-- [ ] `list`/`continuity.inspect` 百集下 < 200 ms。
-      （10 集重建实测 5 ms，百集要等索引分片）
-- [ ] 全量索引重建 < 60 s。
+- [x] `episode.get` / `index.list` 百集下 < 200 ms：`p13c_selftest.sh`
+      100 集实测各 34 ms（机器相关，不是产能承诺）。
+- [ ] `continuity.inspect` 百集下 < 200 ms（还没单独计时）。
+- [x] 全量索引重建 < 60 s：100 集实测 36 ms。
 
 ## 预算与熔断
 
@@ -1158,7 +1159,9 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
       校验 revision 与 state、断言 100 个分镜版本目录 / 300 个镜头文件、
       抽第 50 集按自己的目录合成、删 Canon 恢复、恢复后 Worker 重跑零重复
       任务。全部用 mock 占位文件，不含真实 GPU 与转码，见
-      `docs/DRAMA_PROVIDER.md`。
+      `docs/DRAMA_PROVIDER.md`。同一脚本还断言：300 条资产账本逐条重算
+      SHA-256 与文件一致、`asset.list` 整份返回、`episode.get` /
+      `index.rebuild` / `index.list` 百集耗时分别为 34 / 36 / 34 ms。
 - [ ] M4 的真实部分：接真实 VideoProvider 重跑同一套百集压力。
 - [ ] 百集成本报告（GPU 小时、人工分钟、重做率、不变量红数）。
 - [x] 镜头文件按分镜版本归档：mock 写

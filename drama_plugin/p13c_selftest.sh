@@ -242,6 +242,84 @@ assert all(x["size"] == 256 for x in d["assets"]), d["assets"][:2]
 print("PASS: asset.list 返回 %d 条（每条 256 B）" % len(d["assets"]))
 PY
 
+START=$(date +%s%N)
+cat > "$TMP/q.jsonl" <<JSON
+{
+  "jsonrpc": "2.0",
+  "id": 4007,
+  "method": "tools/call",
+  "params": {"name": "call", "arguments": {
+    "operation": "episode.get", "input": {"project_id": "$PID"}
+  }}
+}
+JSON
+out=$(ask)
+END=$(date +%s%N)
+printf '%s' "$out" | field > "$TMP/epget.json"
+python3 - "$TMP/epget.json" "$EPISODES" "$(( (END - START) / 1000000 ))" <<'PY'
+import json
+import sys
+d = json.load(open(sys.argv[1]))
+n = int(sys.argv[2])
+ms = int(sys.argv[3])
+assert d["canon_revision"] == n, d
+assert d["tasks"] == n, d
+assert ms < 200, ms
+print("PASS: episode.get %d 集 %d ms（< 200 ms）" % (n, ms))
+PY
+
+START=$(date +%s%N)
+cat > "$TMP/q.jsonl" <<JSON
+{
+  "jsonrpc": "2.0",
+  "id": 4008,
+  "method": "tools/call",
+  "params": {"name": "call", "arguments": {
+    "operation": "index.rebuild", "input": {"project_id": "$PID"}
+  }}
+}
+JSON
+out=$(ask)
+END=$(date +%s%N)
+printf '%s' "$out" | field > "$TMP/idx.json"
+python3 - "$TMP/idx.json" "$EPISODES" "$(( (END - START) / 1000000 ))" <<'PY'
+import json
+import sys
+d = json.load(open(sys.argv[1]))
+n = int(sys.argv[2])
+ms = int(sys.argv[3])
+assert d["episodes"] == n, d
+assert d["renders"] == n * 3, d
+assert ms < 60000, ms
+print("PASS: index.rebuild %d 集 %d ms（< 60 s）" % (n, ms))
+PY
+
+START=$(date +%s%N)
+cat > "$TMP/q.jsonl" <<JSON
+{
+  "jsonrpc": "2.0",
+  "id": 4009,
+  "method": "tools/call",
+  "params": {"name": "call", "arguments": {
+    "operation": "index.list", "input": {"project_id": "$PID"}
+  }}
+}
+JSON
+out=$(ask)
+END=$(date +%s%N)
+printf '%s' "$out" | field > "$TMP/idxlist.json"
+python3 - "$TMP/idxlist.json" "$EPISODES" "$(( (END - START) / 1000000 ))" <<'PY'
+import json
+import sys
+d = json.load(open(sys.argv[1]))
+n = int(sys.argv[2])
+ms = int(sys.argv[3])
+assert len(d["episodes"]) == n, len(d["episodes"])
+assert d["episodes"][-1]["revision"] == n, d["episodes"][-1]
+assert ms < 200, ms
+print("PASS: index.list %d 集 %d ms（< 200 ms）" % (n, ms))
+PY
+
 cat > "$TMP/q.jsonl" <<JSON
 {
   "jsonrpc": "2.0",
@@ -301,7 +379,13 @@ assert len(lines) == n * 3, len(lines)
 names = {json.loads(x)["name"] for x in lines}
 assert len(names) == n * 3, len(names)
 assert "v%d/shot_1.mp4" % (n // 2) in names, sorted(names)[:3]
-print("PASS: 资产账本 %d 条，路径带分镜版本" % len(lines))
+import hashlib
+for x in lines:
+    rec = json.loads(x)
+    data = (project / "assets" / rec["name"]).read_bytes()
+    assert len(data) == rec["size"], rec["name"]
+    assert hashlib.sha256(data).hexdigest() == rec["sha256"], rec["name"]
+print("PASS: 资产账本 %d 条，路径与 sha256 全部对上" % len(lines))
 PY
 
 rm "$DATA/projects/$PID/canon.json"
