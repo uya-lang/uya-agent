@@ -1031,7 +1031,7 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
       数据根下 `llm.json`（0600，`api_key` 字段）。Host 侧不要注入
       `OPENAI_API_KEY`/`HTTP_PROXY`：Drama 不读这些环境变量。
 
-- [ ] 抽样审批策略：每 10 集抽 1 集全审，其余抽样 + 异常优先队列
+- [x] 抽样审批策略：`production.report` 每 10 个完成任务抽 1 集进 `review_sample`，异常任务走 `failed_tasks` 优先队列（审批动作待接）
       （把百集约 300 次点击压到约 30 次）。
 - [x] 权限模式说明（`DRAMA_OPERATIONS.md` 按源码记录）：read-only 与
       workspace-write 每次 MCP 调用都需批准，danger-full-access 放行，无回答

@@ -243,6 +243,7 @@ assert d["tasks_failed"] == 0, d
 assert d["renders"] == n * 3, d
 assert d["invariants_ok"] is True, d
 assert d["failed_tasks"] == [], d
+assert len(d["review_sample"]) == max(1, n // 10), d
 print("PASS: production.report %d 集 / 零失败 / 不变量全绿" % n)
 PY
 
