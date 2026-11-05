@@ -2,7 +2,8 @@
 # drama_plugin/p8_selftest.sh — P8 第一段（Provider 能力表 / 视频任务 / Worker）
 #
 # 覆盖 DRAMA_TODO §10 的一部分：
-#   * `provider.capabilities` 是版本化的能力表（含禁用动作、接戏枚举）；
+#   * `provider.capabilities` 是版本化的能力表（含禁用动作、接戏枚举、
+#     FFmpeg/ffprobe 探测的 media 字段）；
 #   * `episode.produce(stage=video)` 立刻回 queued（MCP 不等待视频）；
 #   * `drama worker run` 扫未完成任务并执行：分镜 → 逐镜 mock 渲染 → 任务 done；
 #   * 未批准剧本的视频任务 ⇒ 任务 failed 且不产出文件（不会污染 Canon）；
@@ -63,7 +64,17 @@ d=json.load(sys.stdin)
 assert d['capability_version'] == 'mock-video-cap-1', d
 assert '跳切' in d['forbidden_actions'], d
 assert d['supports'] == ['anchor','hard_cut'], d
-print('PASS: provider.capabilities 是版本化能力表')" || bad "能力表不对"
+m = d.get('media')
+assert isinstance(m, dict), d
+for k in ('ffmpeg', 'ffprobe'):
+    assert isinstance(m[k], bool), m
+    path = m[k + '_path']
+    assert isinstance(path, str), m
+    if m[k]:
+        assert path.endswith('/' + k), m
+    else:
+        assert path == '', m
+print('PASS: provider.capabilities 是版本化能力表（含 media 探测）')" || bad "能力表不对"
 
 out=$(ask '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"call","arguments":{"operation":"project.create","input":{"name":"视频任务测试"}}}}')
 PID=$(printf '%s' "$out" | field | python3 -c "

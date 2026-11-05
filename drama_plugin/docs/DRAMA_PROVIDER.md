@@ -76,11 +76,20 @@ sh drama_plugin/p5_selftest.sh
   "max_shots": 64,
   "max_shot_ms": 30000,
   "forbidden_actions": ["跳切", "爆炸"],
-  "supports": ["anchor", "hard_cut"]
+  "supports": ["anchor", "hard_cut"],
+  "media": {
+    "ffmpeg": true,
+    "ffmpeg_path": "/usr/bin/ffmpeg",
+    "ffprobe": true,
+    "ffprobe_path": "/usr/bin/ffprobe"
+  }
 }
 ```
 
-`capability_version` 必须随实现或模型能力变化而更新。当前 mock 渲染
+`capability_version` 必须随实现或模型能力变化而更新。`media` 是宿主
+媒体工具探测结果：只检查 `/usr/bin`、`/usr/local/bin`、`/bin` 三个
+目录（不读宿主 `PATH`），找不到时布尔为 `false`、路径为空串；本阶段
+只报可用性，不执行 FFmpeg 也不记录版本。当前 mock 渲染
 只写确定性的 256 字节占位文件，不能作为可播放成片；动作禁用词在渲染
 前拦截。占位文件按分镜版本分目录：
 `projects/<id>/assets/v<board_version>/shot_<seq>.mp4`，所以不同集同号
