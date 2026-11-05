@@ -220,6 +220,24 @@ print('PASS: 恢复后的成片也登记进资产账本')" \
         || bad "恢复后的成片没登记"
 fi
 
+# ---------- 5.5 成片终检：文件截断 ⇒ ASSEMBLY_CORRUPT ----------
+FILM="$DATA/projects/$PID/assets/episode_3.mp4"
+if [ -f "$FILM" ]; then
+    cp "$FILM" "$TMP/film.bak"
+    : > "$FILM"
+    out=$(ask '{"jsonrpc":"2.0","id":16,"method":"tools/call","params":{"name":"call","arguments":{"operation":"qa.run","input":{"project_id":"'"$PID"'","script_version":1}}}}')
+    printf '%s' "$out" | field | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+codes={i['code'] for i in d.get('report',{}).get('issues',[])}
+assert 'ASSEMBLY_CORRUPT' in codes, d
+print('PASS: 成片被截断 ⇒ QA 报 ASSEMBLY_CORRUPT')" \
+        || bad "成片截断没被 QA 发现"
+    cp "$TMP/film.bak" "$FILM"
+else
+    bad "找不到 episode_3.mp4"
+fi
+
 # ---------- 媒体输入探测（ffprobe） ----------
 if command -v ffmpeg >/dev/null 2>&1 && command -v ffprobe >/dev/null 2>&1; then
     mkdir -p "$DATA/probe"
