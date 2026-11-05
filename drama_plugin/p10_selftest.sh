@@ -5,6 +5,7 @@
 #   * 分镜 → 成片：按镜号顺序拼接镜头文件，产出 manifest（镜头数/时长/size/hash）；
 #   * 确定性：同一份分镜同一批镜头 ⇒ 成片字节一致；
 #   * 镜头文件缺失 ⇒ ASSEMBLY_MISSING_SHOT，不产出半成品；补回镜头后重跑恢复；
+#   * `shot.retry` 只重渲一镜并恢复文件；
 #   * 合成不改 Canon，成片登记进资产账本（video/mp4），asset.get 可按名查回；
 
 #   * `media.probe` 用 ffprobe 报宽高/时长，越界路径与缺失文件各有错误码；
@@ -173,6 +174,21 @@ H2=$(printf '%s' "$out" | field | python3 -c "
 import json,sys;print(json.load(sys.stdin)['sha256'])")
 [ "$H1" = "$H2" ] && ok "同样输入再合成，成片 hash 一致（确定性）" \
     || bad "第二次合成的 hash 变了"
+
+# ---------- 3.5 单镜头重试 ----------
+SHOT2="$DATA/projects/$PID/assets/v1/shot_2.mp4"
+printf 'corrupt' > "$SHOT2"
+out=$(ask '{"jsonrpc":"2.0","id":24,"method":"tools/call","params":{"name":"call","arguments":{"operation":"shot.retry","input":{"project_id":"'"$PID"'","board_version":1,"sequence":2}}}}')
+printf '%s' "$out" | field | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+assert d.get('shot_no') == 2, d
+assert d.get('state') == 'done', d
+print('PASS: shot.retry 只重渲第 2 镜')" \
+    || bad "shot.retry 没成功"
+S2=$(wc -c < "$SHOT2" | tr -d ' ')
+[ "$S2" = "256" ] && ok "重试后镜头文件恢复为 256 B" \
+    || bad "重试后镜头大小是 $S2"
 
 # ---------- 4. 镜头文件缺失 ----------
 VICTIM=$(python3 -c "
