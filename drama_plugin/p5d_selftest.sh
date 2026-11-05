@@ -82,7 +82,7 @@ import json,sys
 d=json.load(sys.stdin)
 assert d['state'] == 'queued', d
 assert d['steps'][0]['state'] == 'pending', d
-assert 'script_version' not in d, d
+assert d.get('script_version') == 0, d
 print('PASS: 任务记录里步骤还是 pending，没有提前调模型')" \
     || bad "任务记录不对"
 

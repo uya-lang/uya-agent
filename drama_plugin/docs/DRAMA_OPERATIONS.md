@@ -74,6 +74,7 @@ EPISODES=100 sh drama_plugin/p13c_selftest.sh
 
 这些脚本覆盖 Canon 恢复、Worker 锁与任务、预算熔断、全历史审计和篡改
 检测；`p13_selftest.sh` 的 `EPISODES=100` 只验证控制面提交与重放，
-`p13c_selftest.sh` 另外跑 100 集 mock 视频任务（每集一个任务、逐集
-Worker、抽 10 条提交重放、删 Canon 恢复、幂等重跑）。两者都不证明真实
-GPU 产能、真实外部 Provider 或跨平台运行已经完成。
+`p13c_selftest.sh` 另外跑 100 集 mock 视频任务（先全部排队、再一次
+Worker 扫描消费，抽 10 条提交重放、抽一集按自己的镜头目录合成、删
+Canon 恢复、幂等重跑）。两者都不证明真实 GPU 产能、真实外部 Provider
+或跨平台运行已经完成。

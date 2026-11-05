@@ -149,22 +149,30 @@ import sys
 print(json.load(sys.stdin)["task_id"])
 ')
 
-    timeout 120 "$TMP/drama" worker run --data-dir "$DATA" \
-        > "$TMP/worker.out" 2>/dev/null
-    python3 - "$TMP/worker.out" "$tid" <<'PY'
+    [ -n "$tid" ] || {
+        echo "FAIL: 第 $i 集没有建出任务"
+        exit 1
+    }
+    i=$((i + 1))
+done
+
+echo "PASS: $EPISODES 集已排队（每集一个视频任务）"
+
+# 一次 Worker 扫描消费全部任务：任务里固定的剧本版本必须各自对上，
+# 不能都渲染"当前最新一集"。
+timeout 900 "$TMP/drama" worker run --data-dir "$DATA" \
+    > "$TMP/worker.out" 2>/dev/null
+python3 - "$TMP/worker.out" "$EPISODES" <<'PY'
 import json
 import sys
 raw = [x for x in open(sys.argv[1]).read().split(chr(10)) if x.strip()]
 d = json.loads(raw[-1])
-assert d["tasks_seen"] == 1, d
-assert d["tasks_done"] == 1, d
+n = int(sys.argv[2])
+assert d["tasks_seen"] == n, d
+assert d["tasks_done"] == n, d
 assert d["tasks_failed"] == 0, d
-print("PASS: video task completed " + sys.argv[2])
+print("PASS: 单次 Worker 跑完 %d 个视频任务" % n)
 PY
-    i=$((i + 1))
-done
-
-echo "PASS: $EPISODES 集 mock 视频任务全部完成"
 
 cat > "$TMP/q.jsonl" <<JSON
 {
@@ -259,6 +267,12 @@ assert len(boards) == n, len(boards)
 tasks = list((project / "tasks").glob("t_*.json"))
 assert len(tasks) == n, len(tasks)
 print("PASS: 分镜版本和任务文件各 %d 个" % n)
+dirs = sorted(p.name for p in (project / "assets").glob("v*") if p.is_dir())
+assert len(dirs) == n, len(dirs)
+shots = list((project / "assets").glob("v*/shot_*.mp4"))
+assert len(shots) == n * 3, len(shots)
+print("PASS: 镜头文件按分镜版本分 %d 个目录，共 %d 个文件" %
+      (len(dirs), len(shots)))
 PY
 
 rm "$DATA/projects/$PID/canon.json"
@@ -282,6 +296,38 @@ n = int(sys.argv[2])
 assert d["revision"] == n, d
 assert d["recovered"] is True, d
 print("PASS: 删除 Canon 后恢复到 revision %d" % n)
+PY
+
+MID=$((EPISODES / 2))
+cat > "$TMP/q.jsonl" <<JSON
+{
+  "jsonrpc": "2.0",
+  "id": 4005,
+  "method": "tools/call",
+  "params": {"name": "call", "arguments": {
+    "operation": "media.assemble",
+    "input": {"project_id": "$PID", "board_version": $MID}
+  }}
+}
+JSON
+out=$(ask)
+printf '%s' "$out" | field > "$TMP/asm.json"
+python3 - "$TMP/asm.json" "$DATA/projects/$PID" "$MID" <<'PY'
+import json
+import os
+import sys
+d = json.load(open(sys.argv[1]))
+base = sys.argv[2]
+bv = int(sys.argv[3])
+assert d["board_version"] == bv, d
+shot_dir = os.path.join(base, "assets", "v%d" % bv)
+files = sorted(f for f in os.listdir(shot_dir) if f.startswith("shot_"))
+assert len(files) == d["shots"], (len(files), d["shots"])
+total = sum(os.path.getsize(os.path.join(shot_dir, f)) for f in files)
+assert total == d["size"], (total, d["size"])
+assert os.path.isfile(os.path.join(base, "assets", d["output"]))
+print("PASS: 第 %d 集按自己的镜头目录合成（%d 镜 / %d B）" %
+      (bv, d["shots"], d["size"]))
 PY
 
 # 恢复后再次启动 Worker，不应重复执行已完成任务。

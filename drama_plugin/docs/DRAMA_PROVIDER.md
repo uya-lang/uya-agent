@@ -79,7 +79,9 @@ sh drama_plugin/p5_selftest.sh
 
 `capability_version` 必须随实现或模型能力变化而更新。当前 mock 渲染
 只写确定性的 256 字节占位文件，不能作为可播放成片；动作禁用词在渲染
-前拦截。P8 回归验证能力表版本、未批准剧本拦截、Worker、失败任务和
+前拦截。占位文件按分镜版本分目录：
+`projects/<id>/assets/v<board_version>/shot_<seq>.mp4`，所以不同集同号
+镜头不会互相覆盖；`media.assemble` 只在该集分镜自己的目录里拼接。P8 回归验证能力表版本、未批准剧本拦截、Worker、失败任务和
 单 Worker 锁：
 
 ```sh

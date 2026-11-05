@@ -149,7 +149,7 @@ print('PASS: 任务记录里 shots_rendered=%d' % rec['shots_rendered'])
 PY
 [ $? -eq 0 ] || fails=$((fails + 1))
 
-n=$(ls "$DATA/projects/$PID/assets"/*.mp4 2>/dev/null | wc -l)
+n=$(find "$DATA/projects/$PID/assets" -name "shot_*.mp4" | wc -l)
 [ "$n" -gt 0 ] && ok "产出了 $n 个镜头文件" || bad "没有产出镜头文件"
 
 CANON_AFTER=$(md5sum "$DATA/projects/$PID/canon.json" | cut -d' ' -f1)

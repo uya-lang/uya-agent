@@ -1176,7 +1176,7 @@ DRAMA_ROOT/
         characters/
         scenes/
         props/
-        shots/
+        v<board_version>/   # 镜头文件按分镜版本隔离：shot_<seq>.mp4
         audio/
         final/
       audit/

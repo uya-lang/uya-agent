@@ -104,10 +104,11 @@ check(os.path.isfile(out_path), '成片文件写出来了')
 if os.path.isfile(out_path):
     real = os.path.getsize(out_path)
     check(real == d['size'], '成片大小与 manifest 一致（%d B）' % real)
-    shots = [f for f in os.listdir(os.path.join(base, 'assets'))
-             if f.startswith('shot_')]
-    total = sum(os.path.getsize(os.path.join(base, 'assets', f))
-                for f in shots)
+    shots = []
+    for dpath, _, files in os.walk(os.path.join(base, 'assets')):
+        shots += [os.path.join(dpath, f) for f in files
+                  if f.startswith('shot_')]
+    total = sum(os.path.getsize(f) for f in shots)
     check(real == total, '成片字节数 == 各镜头字节数之和')
 for m in ok:
     print('PASS: ' + m)
@@ -135,7 +136,16 @@ import json,sys;print(json.load(sys.stdin)['sha256'])")
     || bad "第二次合成的 hash 变了"
 
 # ---------- 4. 镜头文件缺失 ----------
-rm -f "$DATA/projects/$PID/assets/shot_2.mp4"
+VICTIM=$(python3 -c "
+import os
+base = '$DATA/' + 'projects/$PID/assets'
+for dpath, _, files in os.walk(base):
+    for f in sorted(files):
+        if f == 'shot_2.mp4':
+            print(os.path.join(dpath, f))
+            raise SystemExit
+")
+rm -f "$VICTIM"
 out=$(ask "$(cat <<JSON
 {"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"call","arguments":{"operation":"media.assemble","input":{"project_id":"$PID"}}}}
 JSON

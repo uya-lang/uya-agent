@@ -123,18 +123,18 @@ PY
 i=1
 while [ "$i" -le 3 ]; do
     out=$(ask "$(cat <<JSON
-{"jsonrpc":"2.0","id":$((40 + i)),"method":"tools/call","params":{"name":"call","arguments":{"operation":"storyboard.build","input":{"project_id":"$PID","script_version":$i}}}}
+{"jsonrpc":"2.0","id":$((40 + i)),"method":"tools/call","params":{"name":"call","arguments":{"operation":"task.get","input":{"project_id":"$PID","task_id":"t_$i"}}}}
 JSON
 )")
-    shots=$(printf '%s' "$out" | field | python3 -c "
+    bv=$(printf '%s' "$out" | field | python3 -c "
 import json,sys
 d=json.load(sys.stdin)
-print(d.get('shot_count','ERR'))")
-    [ "$shots" != "ERR" ] && [ "$shots" -gt 0 ] \
-        && ok "第 $i 集分镜生成（$shots 个镜头）" \
-        || bad "第 $i 集分镜失败"
+print(d.get('board_version','ERR'))")
+    [ "$bv" != "ERR" ] && [ "$bv" -gt 0 ] \
+        && ok "第 $i 集视频任务绑定 board v$bv" \
+        || bad "第 $i 集任务记录没有 board_version：$bv"
     out=$(ask "$(cat <<JSON
-{"jsonrpc":"2.0","id":$((50 + i)),"method":"tools/call","params":{"name":"call","arguments":{"operation":"media.assemble","input":{"project_id":"$PID"}}}}
+{"jsonrpc":"2.0","id":$((50 + i)),"method":"tools/call","params":{"name":"call","arguments":{"operation":"media.assemble","input":{"project_id":"$PID","board_version":$bv}}}}
 JSON
 )")
     sz=$(printf '%s' "$out" | field | python3 -c "
@@ -142,7 +142,8 @@ import json,sys
 d=json.load(sys.stdin)
 print(d.get('size', d.get('code','ERR')))")
     [ "$sz" != "ERR" ] && [ "$sz" -gt 0 ] \
-        && ok "第 $i 集成片合成（$sz 字节）" || bad "第 $i 集合成失败：$sz"
+        && ok "第 $i 集成片合成（board v$bv，$sz 字节）" \
+        || bad "第 $i 集合成失败：$sz"
     i=$((i + 1))
 done
 

@@ -558,7 +558,8 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 > 验收：`sh drama_plugin/p5c_selftest.sh`（11 项）：来源 ID、Bible 版本号、
 > 只给 open 承诺、批准后摘要进上下文、预算不足先丢摘要并标 truncated。
 > 第四段（1.10）：`src/task.uya`（持久任务 + 断点续跑）、`episode.produce`
-> 改成落盘建任务立刻回 queued、`task.run` / `task.get` / `task.list`；
+> 改成落盘建任务立刻回 queued、并把当次剧本版本写进任务记录（重试保留），
+> `task.run` / `task.get` / `task.list`；
 > 幂等重放不再重复执行操作（拿操作真实产出的 task_id 登记幂等槽）。
 > 验收：`sh drama_plugin/p5d_selftest.sh`（9 项）：produce 只建任务、
 > 跨进程可查、run 才干活、重复 run 回放、记录回退后能续跑。
@@ -1151,15 +1152,22 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 - [ ] M3：30 集跨题材（题材模板参数化：Bible 模板 + 资产包模板 +
       能力表 + `format`，换模板不改代码）。
 - [x] M4 的 Mock 部分：100 集 Mock 视频压力 + 抽 10 条提交历史重放。
-      `EPISODES=100 sh drama_plugin/p13c_selftest.sh`：100 集逐集生成/批准/
-      建视频任务/Worker 渲染，抽 10 条 commit 校验 revision 与 state，删
-      Canon 后恢复，恢复后 Worker 重跑零重复任务。全部用 mock 占位文件，
-      不含真实 GPU 与转码，见 `docs/DRAMA_PROVIDER.md`。
+      `EPISODES=100 sh drama_plugin/p13c_selftest.sh`：100 集先全部生成/
+      批准/排队（每个任务固定建任务时的剧本版本），再一次 Worker 扫描消费
+      全部任务——批量排队不会都去渲染"当前最新一集"；随后抽 10 条 commit
+      校验 revision 与 state、断言 100 个分镜版本目录 / 300 个镜头文件、
+      抽第 50 集按自己的目录合成、删 Canon 恢复、恢复后 Worker 重跑零重复
+      任务。全部用 mock 占位文件，不含真实 GPU 与转码，见
+      `docs/DRAMA_PROVIDER.md`。
 - [ ] M4 的真实部分：接真实 VideoProvider 重跑同一套百集压力。
 - [ ] 百集成本报告（GPU 小时、人工分钟、重做率、不变量红数）。
-- [ ] 资产按集归档：mock 写 `assets/shot_<seq>.mp4`，跨集同号镜头会互相
-      覆盖（成片拼接也按这个名字找文件）；视频任务目前不登记 `asset.*`
-      账本。要改成按集（或按分镜版本）分目录，并同步 `assemble` 与 p10。
+- [x] 镜头文件按分镜版本归档：mock 写
+      `assets/v<board_version>/shot_<seq>.mp4`，不同集的分镜版本不同，
+      同号镜头不再互相覆盖；`assemble` 只在本次分镜自己的目录里拼接，
+      `p13c_selftest.sh` 断言 100 集有 100 个目录、300 个镜头文件，并抽
+      第 50 集合成（3 镜 / 768 B）。
+- [ ] 视频任务仍未登记 `asset.*` 账本（渲染结果只有文件名，没进资产表）；
+      接真实 Provider 时要落 `relative_path` + `sha256` + 集号。
 
 ## 验收
 
