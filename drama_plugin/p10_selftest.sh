@@ -10,7 +10,7 @@
 #   * `media.probe` 用 ffprobe 报宽高/时长，越界路径与缺失文件各有错误码；
 #   * `media.encode` 按 format.encode 参数转码，产物可被 probe 读回；
 #   * `media.subtitle` 按分镜时间轴生成 SRT，`media.mux` 混成 mov_text 字幕轨；
-#   * `media.mix` 把音频轨混入成片。
+#   * `media.mix` 把音频轨混入成片，`media.loudnorm` 两遍归一。
 #
 # 用法：sh drama_plugin/p10_selftest.sh
 
@@ -339,6 +339,19 @@ print('PASS: media.mix 产出 %s（%d B）' % (d['output'], d['size']))" \
     AUD_CODEC=$(ffprobe -v error -select_streams a -show_entries stream=codec_name \
         -of csv=p=0 "$DATA/encodes/mix1.mp4" 2>/dev/null | head -1)
     [ "$AUD_CODEC" = "aac" ] && ok "混入音轨是 aac" || bad "音轨是 $AUD_CODEC"
+
+    out=$(ask '{"jsonrpc":"2.0","id":23,"method":"tools/call","params":{"name":"call","arguments":{"operation":"media.loudnorm","input":{"path":"encodes/mix1.mp4","output":"loud1.mp4"}}}}')
+    printf '%s' "$out" | field | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+assert d.get('output') == 'encodes/loud1.mp4', d
+assert d.get('size', 0) > 0, d
+print('PASS: media.loudnorm 产出 %s（%d B）' % (d['output'], d['size']))" \
+        || bad "media.loudnorm 没产出"
+    LOUD_CODEC=$(ffprobe -v error -select_streams a -show_entries stream=codec_name \
+        -of csv=p=0 "$DATA/encodes/loud1.mp4" 2>/dev/null | head -1)
+    [ "$LOUD_CODEC" = "aac" ] && ok "响度归一产物保留 aac 音轨" \
+        || bad "归一产物音轨是 $LOUD_CODEC"
 
     out=$(ask '{"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"call","arguments":{"operation":"media.probe","input":{"path":"../etc/passwd"}}}}')
     printf '%s' "$out" | field | python3 -c "
