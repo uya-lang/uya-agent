@@ -76,6 +76,7 @@ raw=[l for l in sys.stdin.read().split(chr(10)) if l.strip()]
 o=json.loads(raw[0])
 print(json.loads(o['result']['content'][0]['text']).get('data',{}).get('result',{}).get('revision','ERR'))")
 [ "$code" = "1" ] && ok "世界初始化提交到 revision 1" || bad "初始化提交失败：$code"
+H1=$(md5sum "$DATA/projects/$PID/commits/1.json" | cut -d' ' -f1)
 
 MOVE=$(cat <<JSON
 {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"call","arguments":{"operation":"canon.commit","input":{"project_id":"$PID","base_revision":1,"events":[{"type":"prop.move","prop":"remote","to_scene":"kitchen","to_holder":"fridge"}]}}}}
@@ -213,6 +214,9 @@ fi
 commits=$(ls "$DATA/projects/$PID/commits" | grep -c '\.json$' || true)
 [ "$commits" = "3" ] && ok "三次提交各留一个不可变记录" \
     || bad "提交记录数量是 $commits（应为 3）"
+H2=$(md5sum "$DATA/projects/$PID/commits/1.json" | cut -d' ' -f1)
+[ -n "$H1" ] && [ "$H1" = "$H2" ] && ok "后续提交没有改写 1.json（只追加）" \
+    || bad "v1.json 被改写了"
 
 echo "----"
 if [ "$fails" -eq 0 ]; then
