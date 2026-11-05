@@ -3,7 +3,7 @@
 #
 # 覆盖 DRAMA_TODO §9 的一部分：
 #   * 剧本 → 分镜是确定性的：同一份剧本重复 build 复用同一版本；
-#   * 每个镜头有 shot_id / sequence / scene / framing / action / cut_type /
+#   * 每个镜头有 shot_id / sequence / scene / framing / camera / audio / action / cut_type /
 #     timeline_in / timeline_out / duration_ms；
 #   * 首镜 anchor、其余 hard_cut；timeline 首尾相接；
 #   * Σ镜头时长 == 剧本时长（同一套确定性口径）；
@@ -140,6 +140,11 @@ def check(c, m):
 need = ['shot_id', 'sequence', 'scene', 'framing', 'cut_type',
         'timeline_in', 'timeline_out', 'duration_ms']
 check(all(all(k in s for k in need) for s in shots), '每个镜头字段齐全')
+check(all(isinstance(s.get('camera'), dict) and
+           s['camera'].get('move') == 'static' for s in shots),
+      '每镜有 camera.move=static')
+check(all(s.get('audio', {}).get('has_dialogue') == bool(s.get('line'))
+          for s in shots), 'audio.has_dialogue 与台词一致')
 check(shots[0]['cut_type'] == 'anchor', '首镜是 anchor')
 check(all(s['cut_type'] == 'hard_cut' for s in shots[1:]),
       '其余镜头是 hard_cut')

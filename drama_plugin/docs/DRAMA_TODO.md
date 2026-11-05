@@ -775,10 +775,10 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
       `action`/`line_text`/`timeline_in`/`timeline_out`/`source_duration`/
       `final_duration`/`ref_image_order`/`anchor_prev`/`cut_type`/
       `transition_line`/`state_in`/`state_out`/`render_tool`/`workflow_hash`。
-- [ ] 定义 CameraSpec。
+- [x] 定义 CameraSpec（分镜输出 `camera.move=static`；真实运镜参数待产线）。
 - [x] 定义 ShotAction（**必须过 provider 能力表校验**）。
 - [x] 定义 ShotDialogue（台词逐字，供 ASR 核对与字幕定时）。
-- [ ] 定义 ShotAudio。
+- [x] 定义 ShotAudio（`audio.has_dialogue` 由台词有无判定）。
 - [ ] 定义 ShotStateTransition。
 - [ ] 定义 ShotReference（参考图顺序 + 版本）。
 - [x] 定义接戏枚举：`anchor`（上一镜末帧当本镜第 0 帧）/`hard_cut`
