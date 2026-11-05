@@ -190,6 +190,15 @@ S2=$(wc -c < "$SHOT2" | tr -d ' ')
 [ "$S2" = "256" ] && ok "重试后镜头文件恢复为 256 B" \
     || bad "重试后镜头大小是 $S2"
 
+out=$(ask '{"jsonrpc":"2.0","id":25,"method":"tools/call","params":{"name":"call","arguments":{"operation":"budget.limit","input":{"project_id":"'"$PID"'","max_renders":1}}}}')
+out=$(ask '{"jsonrpc":"2.0","id":26,"method":"tools/call","params":{"name":"call","arguments":{"operation":"shot.retry","input":{"project_id":"'"$PID"'","board_version":1,"sequence":2}}}}')
+printf '%s' "$out" | field | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+assert d.get('code') == 'BUDGET_EXCEEDED', d
+print('PASS: 重试计入预算，超限即熔断')" \
+    || bad "重试绕过了预算"
+
 # ---------- 4. 镜头文件缺失 ----------
 VICTIM=$(python3 -c "
 import os
