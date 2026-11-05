@@ -82,7 +82,7 @@ for f in drama_plugin/p*_selftest.sh; do sh "$f" || echo "FAILED $f"; done
 | P5 | 大部分 | 传输层 / Adapter / 剧本 / 上下文 / 任务 / 百集大纲 / 配置文件 API Key；缺 SSE、代理与日志脱敏 |
 | P6 | M1 最小版 | 三集闭环 + 重放复现；真实模型与视频 Mock 未接 |
 | P7 | 第一段 | 确定性分镜；缺参考图顺序、状态迁移、固定资产引用 |
-| P8 | 第二段 | 能力表 + mock VideoProvider + Worker + 单 Worker 锁；缺真实队列 Adapter、重试上限 |
+| P8 | 第二段 | 能力表 + mock VideoProvider + Worker + 单 Worker 锁 + 在线状态；缺真实队列 Adapter、重试上限 |
 | P9 | 第一段 | 确定性 QA + 生产状态 + 重试 + 取消；缺 ASR/锚帧/成片终检/跨集审计 |
 | P10 | 第一段 | mock 拼接 + manifest + 成片登记 Asset；能力表探测 FFmpeg/ffprobe + `media.probe` 宽高/时长/版本/参数/期望值校验，失败可恢复；缺转码/响度/字幕 |
 | P11 | 第二段 | 端到端一条龙 + 交付包/Worker/权限/限制/Provider/平台说明；缺升级迁移与服务管理流程 |

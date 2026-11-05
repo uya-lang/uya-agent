@@ -859,7 +859,7 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 - [x] 实现取消处理（`production.cancel`：未完成可取消，worker 不再捡起）。
 - [ ] 实现有限重试。
 - [x] 实现任务状态查询。
-- [ ] 实现 Worker 不在线时的明确反馈。
+- [x] 实现 Worker 不在线时的明确反馈（`production.status` 回 `worker=idle|busy`，按锁文件 pid 探活；p9）。
 
 ## 操作
 

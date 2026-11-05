@@ -4,7 +4,7 @@
 # 覆盖 DRAMA_TODO §11 的一部分：
 #   * 静态体检能发现"素材缺失/结构不对"：缺 hook、对白没说话人、空动作镜头；
 #   * 正常剧本 + 分镜 ⇒ QA 全绿，报告落 qa/v1.json（不可变、带 hash）；
-#   * production.status 能查到任务当前状态；
+#   * production.status 能查到任务当前状态和 worker=idle|busy；
 #   * episode.retry 把失败任务重置成 queued，worker 能重跑，且**不动 Canon**。
 #
 # 用法：sh drama_plugin/p9_selftest.sh
@@ -116,7 +116,8 @@ printf '%s' "$out" | field | python3 -c "
 import json,sys
 d=json.load(sys.stdin)
 assert d['state'] == 'queued', d
-print('PASS: production.status 能查到 queued 的任务')" || bad "status 查不到任务"
+assert d.get('worker') in ('idle', 'busy'), d
+print('PASS: production.status 能查到 queued 的任务与 worker 状态')" || bad "status 查不到任务"
 
 # ---------- 4. 失败 → 重试 → worker 跑通，且不动 Canon ----------
 printf '%s' '{"format_version":1,"version":3,"content_hash":"z","screenplay":{"title":"v3","hook":"h","scenes":[{"no":1,"action":"冰箱爆炸了","dialogue":[]}]}}' \
