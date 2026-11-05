@@ -3,7 +3,9 @@
 这份文件只回答三个问题：**哪些阶段已经有代码**、**代码在哪**、**怎么复核**。
 设计与取舍看 `DRAMA_DESIGN.md`，任务清单看 `DRAMA_TODO.md`。
 
-## 1. 复核入口（21 个脚本，全部可重跑）
+## 1. 复核入口（21 个自测脚本 + 打包脚本，全部可重跑）
+
+最近一次全套（`EPISODES=10`）：21 个自测脚本全绿。
 
 | 脚本 | 覆盖 | 断言数 |
 |---|---|---|
@@ -12,20 +14,21 @@
 | `p3_selftest.sh` | Project + 基础存储（原子写、重启、路径穿越、configure） | 25 |
 | `p3b_selftest.sh` | Bible 版本 + 冻结文本 hash + Asset | 22 |
 | `p4_selftest.sh` | Canon 提交 / 四轴不变量 / 锁 / 崩溃恢复 | 18 |
-| `p5_selftest.sh` | LLM 传输层 + Adapter（本机上游） | 11 |
+| `p5_selftest.sh` | LLM 传输层 / 调用摘要 / 格式修复（本机上游） | 16 |
 | `p5b_selftest.sh` | 剧本生成 / 审核 / 批准入 Canon | 12 |
 | `p5c_selftest.sh` | 上下文组装（来源 ID / 预算裁剪） | 12 |
 | `p5d_selftest.sh` | 持久任务 / 断点续跑 | 10 |
 | `p6_selftest.sh` | 连续三集 + 重放复现（M1 最小版） | 9 |
 | `p7_selftest.sh` | 分镜生成 / 版本 / 时长口径 | 19 |
-| `p8_selftest.sh` | Provider 能力表 / 视频任务 / Worker / 单 Worker 锁 | 16 |
+| `p8_selftest.sh` | Provider 能力表 / 视频任务 / Worker / 单 Worker 锁 / 每集 manifest | 17 |
 | `p9_selftest.sh` | 确定性 QA / 生产状态 / 重试 / 取消 / 熔断 | 14 |
 | `p12_selftest.sh` | 闭环审计 + 九条不变量 + 重复全历史篡改检测 | 16 |
 | `p12b_selftest.sh` | 反例库 + 规则/回收率/错误定位 | 14 |
-| `p10_selftest.sh` | 成片合成（mock 拼接 + manifest） | 11 |
-| `p11_selftest.sh` | 端到端一条龙（三集 → 成片 → 审计 → 成本账本） | 21 |
+| `p10_selftest.sh` | 成片合成 / media.probe / 资产登记 / 失败恢复 | 22 |
+| `p11_selftest.sh` | 端到端一条龙（三集 → 成片 → 审计 → 成本账本 → 资产共享） | 23 |
 | `p13_selftest.sh` | 10 集规模测算（控制面耗时/审计/状态体积） | 11 |
 | `p13b_selftest.sh` | 派生索引与全量重建 | 12 |
+| `p13c_selftest.sh` | 百集 mock 视频压力 / 资产账本 / 操作审计 / 索引计时 | 23 |
 | `build_selftest.sh` | 独立构建入口：任意 cwd / 输出路径 / 启动 | 4 |
 | `pack.sh`（不是自测） | 打交付包：bin/docs/src/selftest + tar.gz + sha256 | — |
 | `p5e_selftest.sh` | 百集大纲与批准（系列层） | 12 |
