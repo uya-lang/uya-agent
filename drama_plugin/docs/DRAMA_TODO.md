@@ -424,7 +424,7 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 - [x] 实现 asset ID（项目内文件名即 ID，字符集白名单校验）。
 - [x] 实现文件登记。
 - [x] 实现 MIME、大小和 SHA-256 元数据。
-- [x] 实现 asset.get（`asset.list` 回全部元数据；按名单查留到 P8）。
+- [x] 实现 asset.get（按 name 查单条 + 数据根相对路径；`asset.list` 仍回全部元数据）。
 - [ ] 实现 shared filesystem 访问模式。
 - [x] 禁止任意绝对路径查询。
 - [x] 防止路径穿越（名字白名单）；**符号链接逃逸待补**（要 lstat）。
@@ -973,8 +973,8 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 - [ ] 音频轨道完整，响度达标（两遍 loudnorm 后可测）。
 - [ ] 字幕同步且可见（与 ASR 时间轴一致）。
 - [ ] 输出文件可正常解码，编码参数与 `format` 一致。
-- [ ] 成片可以通过 asset.get 获取元数据和共享路径引用。
-      （manifest 已登记；asset 登记留到接真实产线后）
+- [x] 成片可以通过 asset.get 获取元数据和共享路径引用
+      （路径为 `projects/<id>/assets/<name>`；合成时已登记 Asset）。
 
 ---
 
@@ -1201,7 +1201,7 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 
 # 16. 操作目录与测试覆盖矩阵
 
-**已实现的 44 个操作**（`registry.uya` 是唯一来源；`describe` 就是从这张表
+**已实现的 45 个操作**（`registry.uya` 是唯一来源；`describe` 就是从这张表
 生成的）。"覆盖脚本"列是能跑到它的自测，空着表示只有间接覆盖。
 
 | 操作 | 阶段 | 权限 | 覆盖脚本 |
@@ -1217,6 +1217,7 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 | bible.history | P3 | read | p3b |
 | asset.register | P3 | write | p3b / p13c |
 | asset.list | P3 | read | p3b |
+| asset.get | P3 | read | p10 |
 | canon.inspect | P4 | read | p4 / p6 |
 | canon.commit | P4 | write | p4 / p12 / p12b |
 | canon.recover | P4 | write | p4 |

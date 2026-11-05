@@ -5,7 +5,8 @@
 #   * 分镜 → 成片：按镜号顺序拼接镜头文件，产出 manifest（镜头数/时长/size/hash）；
 #   * 确定性：同一份分镜同一批镜头 ⇒ 成片字节一致；
 #   * 镜头文件缺失 ⇒ ASSEMBLY_MISSING_SHOT，不产出半成品；
-#   * 合成不改 Canon，成片登记进资产账本（video/mp4）；
+#   * 合成不改 Canon，成片登记进资产账本（video/mp4），asset.get 可按名查回；
+
 #   * `media.probe` 用 ffprobe 报宽高/时长，越界路径与缺失文件各有错误码。
 #
 # 用法：sh drama_plugin/p10_selftest.sh
@@ -132,6 +133,27 @@ assert hit[0]['mime']=='video/mp4', hit
 print('PASS: 成片已登记为 Asset（video/mp4）')" \
     || bad "成片没有登记成 Asset"
 
+out=$(ask "$(cat <<JSON
+{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"call","arguments":{"operation":"asset.get","input":{"project_id":"$PID","name":"episode_1.mp4"}}}}
+JSON
+)")
+printf '%s' "$out" | field | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+assert d['asset']['mime'] == 'video/mp4', d
+assert d['asset']['size'] > 0, d
+assert d['path'] == 'projects/$PID/assets/episode_1.mp4', d
+print('PASS: asset.get 返回成片元数据与共享路径')" \
+    || bad "asset.get 查不到成片"
+
+out=$(ask '{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"call","arguments":{"operation":"asset.get","input":{"project_id":"'"$PID"'","name":"nope.mp4"}}}}')
+printf '%s' "$out" | field | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+assert d.get('code') == 'NOT_FOUND', d
+print('PASS: asset.get 查不到 ⇒ NOT_FOUND')" \
+    || bad "asset.get 缺失资产没被拦住"
+
 # ---------- 2. 合成不改 Canon ----------
 CANON_AFTER=$(md5sum "$DATA/projects/$PID/canon.json" | cut -d' ' -f1)
 [ "$CANON_BEFORE" = "$CANON_AFTER" ] && ok "合成没有改动 Canon" \
@@ -177,7 +199,7 @@ if command -v ffmpeg >/dev/null 2>&1 && command -v ffprobe >/dev/null 2>&1; then
     ffmpeg -v error -f lavfi -i testsrc=duration=1:size=320x240:rate=10 \
         -pix_fmt yuv420p -c:v mpeg4 "$DATA/probe/clip.mp4" -y \
         >/dev/null 2>&1
-    out=$(ask '{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"call","arguments":{"operation":"media.probe","input":{"path":"probe/clip.mp4"}}}}')
+    out=$(ask '{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"call","arguments":{"operation":"media.probe","input":{"path":"probe/clip.mp4"}}}}')
     printf '%s' "$out" | field | python3 -c "
 import json,sys
 d=json.load(sys.stdin)
@@ -187,7 +209,7 @@ assert 900 <= d.get('duration_ms', 0) <= 1100, d
 print('PASS: media.probe 报出宽高与时长（320x240，约 1s）')" \
         || bad "media.probe 结果不对"
 
-    out=$(ask '{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"call","arguments":{"operation":"media.probe","input":{"path":"../etc/passwd"}}}}')
+    out=$(ask '{"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"call","arguments":{"operation":"media.probe","input":{"path":"../etc/passwd"}}}}')
     printf '%s' "$out" | field | python3 -c "
 import json,sys
 d=json.load(sys.stdin)
@@ -195,7 +217,7 @@ assert d.get('code') == 'SCHEMA_INVALID', d
 print('PASS: 越出数据根 ⇒ SCHEMA_INVALID')" \
         || bad "越界路径没被拦住"
 
-    out=$(ask '{"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"call","arguments":{"operation":"media.probe","input":{"path":"probe/nope.mp4"}}}}')
+    out=$(ask '{"jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"call","arguments":{"operation":"media.probe","input":{"path":"probe/nope.mp4"}}}}')
     printf '%s' "$out" | field | python3 -c "
 import json,sys
 d=json.load(sys.stdin)
