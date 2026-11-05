@@ -94,8 +94,8 @@ ELAPSED_MS=$(( (END - START) / 1000000 ))
 PER_MS=$(( ELAPSED_MS / EPISODES ))
 ok "$EPISODES 集全部提交，控制面总耗时 ${ELAPSED_MS} ms（每集约 ${PER_MS} ms）"
 
-[ "$PER_MS" -lt 10000 ] && ok "单集控制面开销 < 10 s（实测 ${PER_MS} ms）" \
-    || bad "单集控制面开销过大：${PER_MS} ms"
+[ "$PER_MS" -lt 3000 ] && ok "单集提交检查 < 3 s（实测 ${PER_MS} ms）" \
+    || bad "单集提交检查超过 3 s：${PER_MS} ms"
 
 # ---------- 审计耗时 ----------
 A_START=$(date +%s%N)
