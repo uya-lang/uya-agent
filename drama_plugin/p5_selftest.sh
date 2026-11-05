@@ -107,6 +107,26 @@ class H(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
             return
+        if self.path.startswith('/repair'):
+            cp = sys.argv[3]
+            try:
+                k = int(open(cp).read())
+            except Exception:
+                k = 0
+            k += 1
+            open(cp, 'w').write(str(k))
+            if k == 1:
+                content = 'not json'
+            else:
+                content = json.dumps({'title': 'repair-episode',
+                                      'scenes': [{'no': 1, 'action': 'a'}]})
+            body = json.dumps({'choices': [{'message': {'content': content}}]})
+            raw = body.encode()
+            self.send_response(200)
+            self.send_header('Content-Length', str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+            return
         if self.path.startswith('/slow'):
             import time
             time.sleep(3)
@@ -124,7 +144,7 @@ srv = HTTPServer(('127.0.0.1', 0), H)
 open(sys.argv[1], 'w').write(str(srv.server_address[1]))
 srv.serve_forever()
 PY
-python3 "$TMP/srv.py" "$TMP/port" "$TMP/auth" &
+python3 "$TMP/srv.py" "$TMP/port" "$TMP/auth" "$TMP/repair.count" &
 SRV_PID=$!
 i=0
 while [ ! -s "$TMP/port" ] && [ "$i" -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
@@ -201,6 +221,23 @@ out=$(ask '{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"call"
 got=$(code_of "$out")
 [ "$got" = "MODEL_OUTPUT_NOT_JSON" ] && ok "模型输出不是 JSON ⇒ MODEL_OUTPUT_NOT_JSON" \
     || bad "非 JSON 输出应回 MODEL_OUTPUT_NOT_JSON，实际 $got"
+
+# ---------- 6.5 格式修复重试 ----------
+cfg "/repair" 2000
+out=$(ask '{"jsonrpc":"2.0","id":20,"method":"tools/call","params":{"name":"call","arguments":{"operation":"llm.complete","input":{"prompt":"写一集修复"}}}}')
+printf '%s' "$out" | field | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+assert d['content']['title'] == 'repair-episode', d
+print('PASS: 首次输出不是 JSON 时自动修复重试一次')" || bad "格式修复重试没生效"
+python3 - "$DATA/llm_calls.jsonl" <<'PY'
+import json, sys
+rows = [json.loads(l) for l in open(sys.argv[1]) if l.strip()]
+hits = [d for d in rows if d['rc'] == 0 and d['prompt_chars'] > 15]
+assert hits, rows[-2:]
+print('PASS: 修复重试确实追加了"只输出 JSON"提示')
+PY
+[ $? -eq 0 ] || fails=$((fails + 1))
 
 # ---------- 7. 超时 ----------
 cfg "/slow" 500

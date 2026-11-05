@@ -79,7 +79,7 @@ for f in drama_plugin/p*_selftest.sh; do sh "$f" || echo "FAILED $f"; done
 | P2 | 完成 | Registry / Schema / Dispatch / 幂等闭环 |
 | P3 | 大部分 | Project / 存储 / Bible 版本 / Asset（含 `asset.get` 单条查询）/ configure / 操作审计日志（8 MiB × 5 轮转）；缺子模型字段约束、迁移器 |
 | P4 | 大部分 | Canon 提交 + 四轴不变量 + 锁 + 崩溃恢复；缺事件显式 ID、候选状态差异比较 |
-| P5 | 大部分 | 传输层 / Adapter / 剧本 / 上下文 / 任务 / 百集大纲 / 配置文件 API Key；缺 SSE、代理与日志脱敏 |
+| P5 | 大部分 | 传输层 / Adapter / 调用摘要 / 格式修复 / 剧本 / 上下文 / 任务 / 百集大纲 / 配置文件 API Key；缺 SSE、代理 |
 | P6 | M1 最小版 | 三集闭环 + 重放复现；真实模型与视频 Mock 未接 |
 | P7 | 第一段 | 确定性分镜；缺参考图顺序、状态迁移、固定资产引用 |
 | P8 | 第二段 | 能力表 + mock VideoProvider + Worker + 单 Worker 锁 + 在线状态；缺真实队列 Adapter、重试上限 |
