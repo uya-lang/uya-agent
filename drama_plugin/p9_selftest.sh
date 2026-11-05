@@ -97,6 +97,7 @@ assert d['ok'] is False, d
 codes={i['code'] for i in d['report']['issues']}
 assert 'QA_HOOK_MISSING' in codes, codes
 assert 'QA_LINE_NO_SPEAKER' in codes, codes
+assert 'STALE_BOARD' in codes, codes
 print('PASS: 缺 hook / 没说话人的对白都被报出来（%d 条）'
       % d['issue_count'])" || bad "结构问题没被 QA 发现"
 
