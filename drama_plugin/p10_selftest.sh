@@ -353,6 +353,20 @@ print('PASS: media.loudnorm 产出 %s（%d B）' % (d['output'], d['size']))" \
     [ "$LOUD_CODEC" = "aac" ] && ok "响度归一产物保留 aac 音轨" \
         || bad "归一产物音轨是 $LOUD_CODEC"
 
+    ffmpeg -hide_banner -nostats -i "$DATA/encodes/loud1.mp4" \
+        -af loudnorm=I=-16:TP=-1.5:LRA=11:print_format=json -f null - \
+        2> "$TMP/loud.meas" >/dev/null
+    python3 - "$TMP/loud.meas" <<'PY'
+import re, sys
+s = open(sys.argv[1], errors='replace').read()
+m = re.search(r'"input_i"\s*:\s*"(-?[0-9.]+)"', s)
+assert m, s[-300:]
+i = float(m.group(1))
+assert -17.5 <= i <= -14.5, i
+print('PASS: 归一后整体响度 I=%.2f LUFS（目标 -16）' % i)
+PY
+    [ $? -eq 0 ] || fails=$((fails + 1))
+
     out=$(ask '{"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"call","arguments":{"operation":"media.probe","input":{"path":"../etc/passwd"}}}}')
     printf '%s' "$out" | field | python3 -c "
 import json,sys
