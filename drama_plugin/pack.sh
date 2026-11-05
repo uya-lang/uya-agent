@@ -66,7 +66,12 @@ UYA=/opt/uya/bin/uya UYA_ROOT=/opt/uya/stdlib \\
 ./bin/drama health --data-dir /tmp/drama-data
 ./bin/drama mcp serve --data-dir /var/lib/drama
 ./bin/drama worker run --data-dir /var/lib/drama
+# 或把数据根写进 config.json：{"data_dir":"/var/lib/drama"}
+./bin/drama mcp serve --config /etc/drama/config.json
+./bin/drama worker run --config /etc/drama/config.json
 \`\`\`
+
+\`--data-dir\` 覆盖 \`--config\` 里的数据根。
 
 MCP Server 与 Worker 是独立进程，必须在同一台机器共享同一个数据目录。
 两条命令分别由 MCP Host 和服务管理器启动；Worker 单次扫描所有未完成任务后退出，
@@ -135,11 +140,12 @@ for f in selftest/p*_selftest.sh; do bash "\$f" || echo "FAILED \$f"; done
   \`format_version\` are separate. Current project format is 1; no migration is
   provided, and 0.x releases make no cross-version data compatibility promise.
   Back up data and do not upgrade existing project data across releases yet.
-- LLM config is read from \`llm.json\` under --data-dir; there is no generic
-  --config CLI option. See docs/DRAMA_PROVIDER.md for the templates.
-- OpenAI-compatible requests currently send no Authorization/API Key header.
-  Use only an unauthenticated endpoint you control; public authenticated
-  providers are unsupported.
+- CLI accepts \`--config FILE\` and reads \`data_dir\` from it; an explicit
+  --data-dir wins. LLM config stays in \`llm.json\` under the data dir.
+  See docs/DRAMA_PROVIDER.md for the templates.
+- \`llm.json\` supports an optional \`api_key\`; it is sent as
+  \`Authorization: Bearer <key>\`. Environment variables and HTTP proxies are
+  not read. For public endpoints set \`tls\`: 1 so the key is not sent in clear.
 - Release target: GNU/Linux x86-64. macOS, Windows, ARM and other platforms
   are not verified; see docs/DRAMA_PROVIDER.md.
 README

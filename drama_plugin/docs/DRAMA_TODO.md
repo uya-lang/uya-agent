@@ -243,7 +243,8 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 ## 工程结构
 
 - [-] 创建独立 Drama 工程（现在在 `drama_plugin/src/`，6 个源文件能单独构建）。
-- [ ] 建立统一配置加载（现在只有 `--data-dir`；`config.json` 走 P3）。
+- [x] 建立配置加载：`--config FILE` 读取 `data_dir`（显式 `--data-dir` 覆盖）；
+      LLM 设置仍读数据根下 `llm.json`，其余配置暂未集中。
 - [x] 建立 CLI 入口（`version`/`health`/`mcp serve`/`worker run`）。
 - [x] 建立 `mcp serve` 运行模式。
 - [x] 建立 `worker run` 空运行模式（先不执行任务）。
@@ -1008,17 +1009,21 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
       跨版本数据兼容，迁移器未完成前要求先备份且不直接升级既有项目）。
 - [x] 默认 Provider 配置模板（交付 `docs/DRAMA_PROVIDER.md`：无文件即 mock，
       本机无认证 OpenAI 兼容网关使用 `llm.json`）。
-- [ ] MCP Host 配置示例：当前 CLI 不接受通用 `--config`，且源码尚未读取
-      API Key/代理；待凭据与代理支持落地后补正式 Host 示例。当前最小形态：
+- [x] MCP Host 配置示例：CLI 已接受 `--config FILE`（读 `data_dir`），
+      `llm.json` 支持 `api_key`；代理仍未实现，见下方限制。
 
       ```json
       {"mcpServers":{"drama":{
         "command":"/opt/drama/bin/drama",
-        "args":["mcp","serve","--data-dir","/var/lib/drama"],
-        "cwd":"/home/<user>/drama",
+        "args":["mcp","serve","--config","/etc/drama/config.json"],
+        "cwd":"/var/lib/drama",
         "env":{},
         "toolCallTimeoutMs":60000}}}
       ```
+
+      `/etc/drama/config.json` 只写 `{"data_dir":"/var/lib/drama"}`；密钥在
+      数据根下 `llm.json`（0600，`api_key` 字段）。Host 侧不要注入
+      `OPENAI_API_KEY`/`HTTP_PROXY`：Drama 不读这些环境变量。
 
 - [ ] 抽样审批策略：每 10 集抽 1 集全审，其余抽样 + 异常优先队列
       （把百集约 300 次点击压到约 30 次）。

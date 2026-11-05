@@ -10,7 +10,13 @@ Drama Server 和 Worker 是两个独立进程，必须在同一台机器上使�
 DATA=/var/lib/drama
 /opt/drama/bin/drama mcp serve --data-dir "$DATA"
 /opt/drama/bin/drama worker run --data-dir "$DATA"
+
+# 或者把数据根写进 /etc/drama/config.json：{"data_dir":"/var/lib/drama"}
+/opt/drama/bin/drama mcp serve --config /etc/drama/config.json
+/opt/drama/bin/drama worker run --config /etc/drama/config.json
 ```
+
+`--data-dir` 与 `--config` 同时给时以 `--data-dir` 为准。
 
 Server 与 Worker 不要使用不同的数据目录。备份、权限和清理策略必须覆盖
 整个数据根；详见发布包 README 的备份恢复章节。

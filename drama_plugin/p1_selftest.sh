@@ -62,6 +62,32 @@ else
     bad "health 输出不对：$out"
 fi
 
+# ---------- 2b. --config ----------
+cat > "$TMP/cfg.json" <<'JSON'
+{"data_dir":"/tmp/drama-cfg"}
+JSON
+out=$("$APP" health --config "$TMP/cfg.json")
+echo "$out" | python3 -c '
+import json, sys
+d = json.loads(sys.stdin.read())
+assert d["data_dir"] == "/tmp/drama-cfg", d["data_dir"]
+' && ok "health：--config 读出的 data_dir 生效" \
+    || bad "--config 没生效：$out"
+
+out=$("$APP" health --config "$TMP/cfg.json" --data-dir /tmp/drama-x)
+echo "$out" | python3 -c '
+import json, sys
+d = json.loads(sys.stdin.read())
+assert d["data_dir"] == "/tmp/drama-x", d["data_dir"]
+' && ok "health：--data-dir 覆盖 --config" \
+    || bad "--data-dir 没有覆盖 config：$out"
+
+if "$APP" health --config "$TMP/no-such.json" >/dev/null 2>&1; then
+    bad "读不到的 --config 应该报错"
+else
+    ok "health：--config 读不到时明确失败"
+fi
+
 # ---------- 3. worker 骨架 ----------
 out=$("$APP" worker run --data-dir /tmp/drama-y)
 case "$out" in
