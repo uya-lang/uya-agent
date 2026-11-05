@@ -9,7 +9,7 @@
 
 #   * `media.probe` 用 ffprobe 报宽高/时长，越界路径与缺失文件各有错误码；
 #   * `media.encode` 按 format.encode 参数转码，产物可被 probe 读回；
-#   * `media.subtitle` 按分镜时间轴生成 SRT。
+#   * `media.subtitle` 按分镜时间轴生成 SRT，`media.mux` 混成 mov_text 字幕轨。
 #
 # 用法：sh drama_plugin/p10_selftest.sh
 
@@ -311,6 +311,19 @@ assert d.get('height') == 240, d
 assert 900 <= d.get('duration_ms', 0) <= 1100, d
 print('PASS: 转码产物可被 media.probe 读回')" \
         || bad "转码产物不可读"
+
+    out=$(ask '{"jsonrpc":"2.0","id":21,"method":"tools/call","params":{"name":"call","arguments":{"operation":"media.mux","input":{"video":"encodes/enc1.mp4","subtitle":"projects/'"$PID"'/subtitles/v1.srt","output":"mux1.mp4"}}}}')
+    printf '%s' "$out" | field | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+assert d.get('output') == 'encodes/mux1.mp4', d
+assert d.get('size', 0) > 0, d
+print('PASS: media.mux 产出 %s（%d B）' % (d['output'], d['size']))" \
+        || bad "media.mux 没产出"
+    SUB_CODEC=$(ffprobe -v error -select_streams s -show_entries stream=codec_name \
+        -of csv=p=0 "$DATA/encodes/mux1.mp4" 2>/dev/null | head -1)
+    [ "$SUB_CODEC" = "mov_text" ] && ok "成片含 mov_text 字幕轨" \
+        || bad "字幕轨是 $SUB_CODEC"
 
     out=$(ask '{"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"call","arguments":{"operation":"media.probe","input":{"path":"../etc/passwd"}}}}')
     printf '%s' "$out" | field | python3 -c "
