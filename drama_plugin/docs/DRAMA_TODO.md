@@ -959,7 +959,7 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 - [x] 实现 FFmpeg 可执行文件探测（`/usr/bin`、`/usr/local/bin`、`/bin`；结果并入 `provider.capabilities.media` 的 `ffmpeg`/`ffprobe` 与路径）。
 - [x] 实现媒体输入探测（`media.probe`：ffprobe 报宽高/时长；越界路径 ⇒ SCHEMA_INVALID）。
 - [x] 实现视频拼接（按分镜时间轴顺序；mock 阶段是字节拼接，片尾卡待接）。
-- [ ] 实现现场声/音乐轨混音（**不做配音替换**：台词由视频模型直出）。
+- [x] 实现现场声/音乐轨混音（`media.mix` 把音轨混入成片；不做配音替换）。
 - [ ] 实现 loudnorm 两遍（目标 I=-16 LUFS、TP=-1.5 dBTP）。
 - [ ] 实现字幕文件生成（以 ASR 对齐结果为定时依据；`media.subtitle` 已按分镜时间轴生成 SRT，ASR 待接）。
 - [x] 实现字幕合成（`media.mux`：SRT 作为 mov_text 混进 MP4；ASR 定时待接）。
@@ -1204,7 +1204,7 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 
 # 16. 操作目录与测试覆盖矩阵
 
-**已实现的 48 个操作**（`registry.uya` 是唯一来源；`describe` 就是从这张表
+**已实现的 49 个操作**（`registry.uya` 是唯一来源；`describe` 就是从这张表
 生成的）。"覆盖脚本"列是能跑到它的自测，空着表示只有间接覆盖。
 
 | 操作 | 阶段 | 权限 | 覆盖脚本 |
@@ -1247,6 +1247,7 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 | media.encode | P10 | write | p10 |
 | media.subtitle | P10 | write | p10 |
 | media.mux | P10 | write | p10 |
+| media.mix | P10 | write | p10 |
 | budget.report | P13 | read | p11 |
 | production.report | P13 | read | p13c |
 | index.rebuild | P13 | write | p13b |

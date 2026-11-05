@@ -9,7 +9,8 @@
 
 #   * `media.probe` 用 ffprobe 报宽高/时长，越界路径与缺失文件各有错误码；
 #   * `media.encode` 按 format.encode 参数转码，产物可被 probe 读回；
-#   * `media.subtitle` 按分镜时间轴生成 SRT，`media.mux` 混成 mov_text 字幕轨。
+#   * `media.subtitle` 按分镜时间轴生成 SRT，`media.mux` 混成 mov_text 字幕轨；
+#   * `media.mix` 把音频轨混入成片。
 #
 # 用法：sh drama_plugin/p10_selftest.sh
 
@@ -324,6 +325,20 @@ print('PASS: media.mux 产出 %s（%d B）' % (d['output'], d['size']))" \
         -of csv=p=0 "$DATA/encodes/mux1.mp4" 2>/dev/null | head -1)
     [ "$SUB_CODEC" = "mov_text" ] && ok "成片含 mov_text 字幕轨" \
         || bad "字幕轨是 $SUB_CODEC"
+
+    ffmpeg -v error -f lavfi -i sine=frequency=440:duration=1 \
+        -c:a pcm_s16le "$DATA/probe/tone.wav" -y >/dev/null 2>&1
+    out=$(ask '{"jsonrpc":"2.0","id":22,"method":"tools/call","params":{"name":"call","arguments":{"operation":"media.mix","input":{"video":"encodes/enc1.mp4","audio":"probe/tone.wav","output":"mix1.mp4"}}}}')
+    printf '%s' "$out" | field | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+assert d.get('output') == 'encodes/mix1.mp4', d
+assert d.get('size', 0) > 0, d
+print('PASS: media.mix 产出 %s（%d B）' % (d['output'], d['size']))" \
+        || bad "media.mix 没产出"
+    AUD_CODEC=$(ffprobe -v error -select_streams a -show_entries stream=codec_name \
+        -of csv=p=0 "$DATA/encodes/mix1.mp4" 2>/dev/null | head -1)
+    [ "$AUD_CODEC" = "aac" ] && ok "混入音轨是 aac" || bad "音轨是 $AUD_CODEC"
 
     out=$(ask '{"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"call","arguments":{"operation":"media.probe","input":{"path":"../etc/passwd"}}}}')
     printf '%s' "$out" | field | python3 -c "
