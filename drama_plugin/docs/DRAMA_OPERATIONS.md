@@ -51,8 +51,12 @@ Drama 自身的状态、幂等、预算和审计逻辑。
 
 - 写入使用临时文件、权限 `0600` 和同文件系统 `rename`，不会留下半个目标
   文件；标准库没有 `fsync`，掉电仍可能丢失最后一次提交。
-- `canon.audit` 每次从 Canon 与 commits 全量重放并返回账本和违规项；审计
-  日志没有已实现的大小轮转，生产部署应自行监控数据根容量并保留备份。
+- `canon.audit` 每次从 Canon 与 commits 全量重放并返回账本和违规项。
+- 每个带 `project_id` 的 `call` 会在 `projects/<id>/audit/operations.jsonl`
+  追加一行（`ts` / `op` / `ok`）；写前判断大小，达到 8 MiB 就把当前文件
+  rename 成 `.1`，旧的 `.1`–`.4` 逐级后移，只保留 5 份（DESIGN §8.6）。
+  审计是可观测性数据：写失败只记 stderr，不影响业务结果；没有 `project_id`
+  的操作（如 `project.create`）不记项目日志。
 - 当前视频 Provider 是确定性的 mock，占位文件不是可播放成片；真实视频队列、
   FFmpeg、ASR、字幕、响度和外部 API 尚未接入。
 - 项目格式迁移器尚未实现。升级或更换版本前必须停止写入、备份整个数据根，

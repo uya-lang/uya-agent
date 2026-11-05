@@ -411,7 +411,11 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 - [x] 实现路径规范化。
 - [x] 实现目录边界校验。
 - [ ] 实现基础文件完整性校验。
-- [ ] 审计日志按大小轮转（8 MiB × 5），写失败只记 stderr 不影响业务。
+- [x] 审计日志按大小轮转（8 MiB × 5），写失败只记 stderr 不影响业务。
+      `dispatch.uya` 的 `oplog_note`：每次带 `project_id` 的 `call` 追加一行
+      `{"ts":…,"op":…,"ok":…}`；写前看大小，满了把
+      `audit/operations.jsonl` rename 成 `.1`（旧的逐级后移，只留 5 份），
+      不重写历史文件。p13c 实测：10 集 33 行、轮转后 `.1` 恰好 9 MiB。
 
 ## Asset Store
 
@@ -1026,7 +1030,7 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
       只连自管无认证本机网关，待凭证支持落地后再写正式配置说明。
 - [x] 数据目录备份/恢复说明（交付 README：停写后归档全数据根，解压新目录并校验）。
 - [x] 已知限制说明（`DRAMA_OPERATIONS.md`）：无 fsync、单 Worker/模拟 GPU
-      预算边界、审计可全量重放但暂无大小轮转。真实 GPU 串行仍待产线接入。
+      预算边界。真实 GPU 串行仍待产线接入。
 - [x] Provider 配置文档（`DRAMA_PROVIDER.md`：`llm.json` 字段、错误边界、
       `mock-video-cap-1` 能力表及 P5/P8 回归入口）。
 - [x] 支持平台说明（`DRAMA_PROVIDER.md`：当前仅 GNU/Linux x86-64；其他平台

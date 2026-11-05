@@ -246,6 +246,19 @@ assert d["failed_tasks"] == [], d
 print("PASS: production.report %d 集 / 零失败 / 不变量全绿" % n)
 PY
 
+python3 - "$DATA/projects/$PID/audit/operations.jsonl" "$EPISODES" <<'PY'
+import json
+import sys
+path = sys.argv[1]
+n = int(sys.argv[2])
+lines = [json.loads(x) for x in open(path) if x.strip()]
+assert len(lines) >= n * 3, len(lines)
+assert all(x["ok"] is True for x in lines), [x for x in lines if not x["ok"]][:3]
+assert lines[-1]["op"] == "production.report", lines[-1]
+assert all(x["ts"] > 0 for x in lines), lines[0]
+print("PASS: 操作审计 %d 行，全部 ok 且带时间戳" % len(lines))
+PY
+
 cat > "$TMP/q.jsonl" <<JSON
 {
   "jsonrpc": "2.0",
@@ -482,4 +495,36 @@ print("PASS: Worker 恢复后幂等重跑无重复任务")
 PY
 
 echo "----"
+# 审计轮转：先塞 9 MiB 旧日志，下一次操作应把它转成 .1
+LOG="$DATA/projects/$PID/audit/operations.jsonl"
+python3 - "$LOG" <<'PY'
+import sys
+with open(sys.argv[1], "wb") as f:
+    f.write(b"x" * (9 * 1024 * 1024))
+PY
+cat > "$TMP/q.jsonl" <<JSON
+{
+  "jsonrpc": "2.0",
+  "id": 4011,
+  "method": "tools/call",
+  "params": {"name": "call", "arguments": {
+    "operation": "canon.inspect", "input": {"project_id": "$PID"}
+  }}
+}
+JSON
+out=$(ask)
+python3 - "$LOG" <<'PY'
+import json
+import os
+import sys
+base = sys.argv[1]
+cur = [json.loads(x) for x in open(base) if x.strip()]
+assert len(cur) == 1, cur
+assert cur[0]["op"] == "canon.inspect", cur
+arch = base + ".1"
+assert os.path.getsize(arch) == 9 * 1024 * 1024, os.path.getsize(arch)
+assert not os.path.exists(base + ".2"), "多余归档"
+print("PASS: 审计日志满 8 MiB 自动轮转到 .1，新日志独立追加")
+PY
+
 echo "PASS: P13 M4 mock 视频压力与抽样恢复（${EPISODES} 集）"

@@ -77,7 +77,7 @@ for f in drama_plugin/p*_selftest.sh; do sh "$f" || echo "FAILED $f"; done
 | P0 | 完成 | 技术核验、HTTPS 证书校验修好、工具链同步到 `uya/`（v0.11.0） |
 | P1 | 完成 | CLI 三模式 + 三工具 stdio server |
 | P2 | 完成 | Registry / Schema / Dispatch / 幂等闭环 |
-| P3 | 大部分 | Project / 存储 / Bible 版本 / Asset / configure；缺子模型字段约束、迁移器、审计轮转 |
+| P3 | 大部分 | Project / 存储 / Bible 版本 / Asset / configure / 操作审计日志（8 MiB × 5 轮转）；缺子模型字段约束、迁移器 |
 | P4 | 大部分 | Canon 提交 + 四轴不变量 + 锁 + 崩溃恢复；缺事件显式 ID、候选状态差异比较 |
 | P5 | 大部分 | 传输层 / Adapter / 剧本 / 上下文 / 任务 / 百集大纲；缺 SSE、代理、凭据与日志脱敏 |
 | P6 | M1 最小版 | 三集闭环 + 重放复现；真实模型与视频 Mock 未接 |
