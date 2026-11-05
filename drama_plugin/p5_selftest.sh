@@ -257,6 +257,7 @@ hits = [d for d in rows if d['rc'] == 0 and d['output_chars'] > 0]
 assert hits, rows[-1:]
 d = hits[-1]
 assert d['model'] == 'test-model', d
+assert d['prompt_version'] == 1, d
 assert d['temperature'] == 0, d
 assert d['attempts'] >= 1, d
 assert len(d['output_sha256']) == 64, d

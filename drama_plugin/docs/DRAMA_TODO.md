@@ -607,7 +607,7 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 
 - [x] 定义 LLMProvider 接口。
 - [x] 定义模型配置。
-- [ ] 定义 Prompt/输入版本。
+- [x] 定义 Prompt/输入版本（`PROMPT_VERSION=1`，随 `llm_calls.jsonl` 落盘；p5）。
 - [x] 实现结构化输出请求。
 - [x] 实现响应解析和 Schema 校验。
 - [x] 实现超时、限流和错误分类。
