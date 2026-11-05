@@ -84,7 +84,7 @@ for f in drama_plugin/p*_selftest.sh; do sh "$f" || echo "FAILED $f"; done
 | P7 | 第一段 | 确定性分镜；缺参考图顺序、状态迁移、固定资产引用 |
 | P8 | 第二段 | 能力表 + mock VideoProvider + Worker + 单 Worker 锁；缺真实队列 Adapter、重试上限 |
 | P9 | 第一段 | 确定性 QA + 生产状态 + 重试 + 取消；缺 ASR/锚帧/成片终检/跨集审计 |
-| P10 | 第一段 | mock 拼接 + manifest + 成片登记 Asset；能力表探测 FFmpeg/ffprobe + `media.probe` 宽高/时长/版本/参数；缺转码/响度/字幕 |
+| P10 | 第一段 | mock 拼接 + manifest + 成片登记 Asset；能力表探测 FFmpeg/ffprobe + `media.probe` 宽高/时长/版本/参数，失败可恢复；缺转码/响度/字幕 |
 | P11 | 第二段 | 端到端一条龙 + 交付包/Worker/权限/限制/Provider/平台说明；缺升级迁移与服务管理流程 |
 | P12 | 大部分 | 四账 / 全量审计 / 九不变量 / 定位 / 反例库；缺增量 |
 | P13 | 第三段 | 10 集测算 + 百集控制面压力 + 百集 mock 视频压力 + 成本/资产/派生索引账本 + 日终报告 `production.report`；缺真实视频管线与真实产能报告 |

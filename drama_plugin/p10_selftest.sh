@@ -4,7 +4,7 @@
 # 覆盖 DRAMA_TODO §12 的一部分：
 #   * 分镜 → 成片：按镜号顺序拼接镜头文件，产出 manifest（镜头数/时长/size/hash）；
 #   * 确定性：同一份分镜同一批镜头 ⇒ 成片字节一致；
-#   * 镜头文件缺失 ⇒ ASSEMBLY_MISSING_SHOT，不产出半成品；
+#   * 镜头文件缺失 ⇒ ASSEMBLY_MISSING_SHOT，不产出半成品；补回镜头后重跑恢复；
 #   * 合成不改 Canon，成片登记进资产账本（video/mp4），asset.get 可按名查回；
 
 #   * `media.probe` 用 ffprobe 报宽高/时长，越界路径与缺失文件各有错误码。
@@ -181,6 +181,7 @@ for dpath, _, files in os.walk(base):
             print(os.path.join(dpath, f))
             raise SystemExit
 ")
+if [ -n "$VICTIM" ]; then cp "$VICTIM" "$TMP/victim.bak"; fi
 rm -f "$VICTIM"
 out=$(ask "$(cat <<JSON
 {"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"call","arguments":{"operation":"media.assemble","input":{"project_id":"$PID"}}}}
@@ -192,6 +193,32 @@ d=json.load(sys.stdin)
 assert d.get('code') == 'ASSEMBLY_MISSING_SHOT', d
 print('PASS: 镜头文件缺失 ⇒ ASSEMBLY_MISSING_SHOT')" \
     || bad "缺镜头没被拦住"
+
+# ---------- 5. 补回镜头后从合成步骤恢复 ----------
+if [ -n "$VICTIM" ] && [ -f "$TMP/victim.bak" ]; then
+    cp "$TMP/victim.bak" "$VICTIM"
+    out=$(ask "$(cat <<JSON
+{"jsonrpc":"2.0","id":12,"method":"tools/call","params":{"name":"call","arguments":{"operation":"media.assemble","input":{"project_id":"$PID"}}}}
+JSON
+)")
+    printf '%s' "$out" | field | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+assert d.get('assembly_version') == 3, d
+assert d.get('size', 0) > 0, d
+print('PASS: 补回镜头后从合成步骤恢复（v3，失败不占版本）')" \
+        || bad "合成失败后没能恢复"
+    out=$(ask "$(cat <<JSON
+{"jsonrpc":"2.0","id":13,"method":"tools/call","params":{"name":"call","arguments":{"operation":"asset.get","input":{"project_id":"$PID","name":"episode_3.mp4"}}}}
+JSON
+)")
+    printf '%s' "$out" | field | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+assert d['asset']['mime'] == 'video/mp4', d
+print('PASS: 恢复后的成片也登记进资产账本')" \
+        || bad "恢复后的成片没登记"
+fi
 
 # ---------- 媒体输入探测（ffprobe） ----------
 if command -v ffmpeg >/dev/null 2>&1 && command -v ffprobe >/dev/null 2>&1; then
