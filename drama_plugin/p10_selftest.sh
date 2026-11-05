@@ -8,7 +8,8 @@
 #   * 合成不改 Canon，成片登记进资产账本（video/mp4），asset.get 可按名查回；
 
 #   * `media.probe` 用 ffprobe 报宽高/时长，越界路径与缺失文件各有错误码；
-#   * `media.encode` 按 format.encode 参数转码，产物可被 probe 读回。
+#   * `media.encode` 按 format.encode 参数转码，产物可被 probe 读回；
+#   * `media.subtitle` 按分镜时间轴生成 SRT。
 #
 # 用法：sh drama_plugin/p10_selftest.sh
 
@@ -219,6 +220,23 @@ d=json.load(sys.stdin)
 assert d['asset']['mime'] == 'video/mp4', d
 print('PASS: 恢复后的成片也登记进资产账本')" \
         || bad "恢复后的成片没登记"
+fi
+
+# ---------- 5.4 字幕生成（按分镜时间轴） ----------
+out=$(ask '{"jsonrpc":"2.0","id":19,"method":"tools/call","params":{"name":"call","arguments":{"operation":"media.subtitle","input":{"project_id":"'"$PID"'","board_version":1}}}}')
+SUB=$(printf '%s' "$out" | field | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+assert d.get('lines', 0) > 0, d
+assert d.get('path', '').startswith('subtitles/v'), d
+print(d['path'])")
+if [ -n "$SUB" ] && [ -f "$DATA/projects/$PID/$SUB" ]; then
+    grep -q -- '-->' "$DATA/projects/$PID/$SUB" \
+        && ok "字幕文件含 SRT 时间轴（$SUB）" || bad "字幕没有时间轴"
+    grep -q '谁把冰箱门开着' "$DATA/projects/$PID/$SUB" \
+        && ok "字幕含台词文本" || bad "字幕缺台词"
+else
+    bad "字幕文件没生成"
 fi
 
 # ---------- 5.5 成片终检：文件截断 ⇒ ASSEMBLY_CORRUPT ----------
