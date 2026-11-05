@@ -213,6 +213,25 @@ n=$(ls "$DATA/projects/$PID/scripts"/v*.json 2>/dev/null | wc -l)
 n=$(ls "$DATA/projects/$PID/assets"/episode_*.mp4 2>/dev/null | wc -l)
 [ "$n" -eq 3 ] && ok "三个成片文件都在" || bad "成片数量是 $n"
 
+seen=0
+for f in "$DATA/projects/$PID/assets"/episode_*.mp4; do
+    [ -f "$f" ] || continue
+    nm=$(basename "$f")
+    out=$(ask "$(cat <<JSON
+{"jsonrpc":"2.0","id":90,"method":"tools/call","params":{"name":"call","arguments":{"operation":"asset.get","input":{"project_id":"$PID","name":"$nm"}}}}
+JSON
+)")
+    printf '%s' "$out" | field | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+assert d['asset']['mime'] == 'video/mp4', d
+assert d['path'] == 'projects/$PID/assets/$nm', d
+" || bad "asset.get 查不到 $nm"
+    seen=$((seen + 1))
+done
+[ "$seen" -eq 3 ] && ok "三集成片都能通过 asset.get 共享路径访问" \
+    || bad "只有 $seen 个成片可通过 asset.get 访问"
+
 echo "----"
 if [ "$fails" -eq 0 ]; then
     echo "PASS: P11 第一段（端到端一条龙）"

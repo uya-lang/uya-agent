@@ -1004,7 +1004,7 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 - [ ] 重做不合格镜头。
 - [ ] FFmpeg 合成成片。
 - [ ] 审批 final_cut。
-- [ ] 三集成片均可通过资产共享目录访问。
+- [x] 三集成片均可通过资产共享目录访问（`asset.get` 回 `projects/<id>/assets/<name>`；p11）。
 - [ ] Canon 只随 screenplay approval 变化，不随 final_cut approval 重复变化。
 
 ## 发布
