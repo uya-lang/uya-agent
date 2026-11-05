@@ -5,7 +5,8 @@
 #   * 分镜 → 成片：按镜号顺序拼接镜头文件，产出 manifest（镜头数/时长/size/hash）；
 #   * 确定性：同一份分镜同一批镜头 ⇒ 成片字节一致；
 #   * 镜头文件缺失 ⇒ ASSEMBLY_MISSING_SHOT，不产出半成品；
-#   * 合成不改 Canon。
+#   * 合成不改 Canon；
+#   * `media.probe` 用 ffprobe 报宽高/时长，越界路径与缺失文件各有错误码。
 #
 # 用法：sh drama_plugin/p10_selftest.sh
 
@@ -156,6 +157,41 @@ d=json.load(sys.stdin)
 assert d.get('code') == 'ASSEMBLY_MISSING_SHOT', d
 print('PASS: 镜头文件缺失 ⇒ ASSEMBLY_MISSING_SHOT')" \
     || bad "缺镜头没被拦住"
+
+# ---------- 媒体输入探测（ffprobe） ----------
+if command -v ffmpeg >/dev/null 2>&1 && command -v ffprobe >/dev/null 2>&1; then
+    mkdir -p "$DATA/probe"
+    ffmpeg -v error -f lavfi -i testsrc=duration=1:size=320x240:rate=10 \
+        -pix_fmt yuv420p -c:v mpeg4 "$DATA/probe/clip.mp4" -y \
+        >/dev/null 2>&1
+    out=$(ask '{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"call","arguments":{"operation":"media.probe","input":{"path":"probe/clip.mp4"}}}}')
+    printf '%s' "$out" | field | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+assert d.get('width') == 320, d
+assert d.get('height') == 240, d
+assert 900 <= d.get('duration_ms', 0) <= 1100, d
+print('PASS: media.probe 报出宽高与时长（320x240，约 1s）')" \
+        || bad "media.probe 结果不对"
+
+    out=$(ask '{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"call","arguments":{"operation":"media.probe","input":{"path":"../etc/passwd"}}}}')
+    printf '%s' "$out" | field | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+assert d.get('code') == 'SCHEMA_INVALID', d
+print('PASS: 越出数据根 ⇒ SCHEMA_INVALID')" \
+        || bad "越界路径没被拦住"
+
+    out=$(ask '{"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"call","arguments":{"operation":"media.probe","input":{"path":"probe/nope.mp4"}}}}')
+    printf '%s' "$out" | field | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+assert d.get('code') == 'IO_ERROR', d
+print('PASS: 文件不存在 ⇒ IO_ERROR')" \
+        || bad "缺失文件没被拦住"
+else
+    echo "SKIP: 没有 ffmpeg/ffprobe，跳过 media.probe"
+fi
 
 echo "----"
 if [ "$fails" -eq 0 ]; then
