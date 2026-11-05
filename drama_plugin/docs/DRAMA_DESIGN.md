@@ -728,7 +728,8 @@ operation.dispatch
 | `episode.retry` | 同名（把失败任务重置成 queued） |
 | `production.status` | 同名 |
 | `production.cancel` | 同名（未完成可取消，已完成的拒绝） |
-| `continuity.inspect` | `canon.inspect`（当前状态）+ `canon.audit`（四本账/不变量/重放） |
+| `continuity.inspect` | 同名（返回 `canon.audit` 的四本账/不变量/全历史重放；
+  本机百集实测 34 ms） |
 | `asset.get` | `asset.list`（元数据）；按名单查留到接真实产线 |
 
 另外多出四个设计里没写、实现需要的操作：`canon.commit` / `canon.recover`

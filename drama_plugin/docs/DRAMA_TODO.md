@@ -525,7 +525,8 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 
 ## 操作
 
-- [ ] 注册 continuity.inspect。
+- [x] 注册 continuity.inspect：`op_continuity_inspect` 复用 `audit_run`，
+      返回账本、不变量与全历史重放结果（旧版只登记了名字，调用会报缺字段）。
 - [ ] 在 episode.approve(screenplay) 内部执行事件验证和 Canon 提交。
 - [ ] 不提供绕过校验的外部状态写入入口。
 
@@ -1136,7 +1137,7 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 - [ ] 每集一个 `manifest.json`。
 - [x] `episode.get` / `index.list` 百集下 < 200 ms：`p13c_selftest.sh`
       100 集实测各 34 ms（机器相关，不是产能承诺）。
-- [ ] `continuity.inspect` 百集下 < 200 ms（还没单独计时）。
+- [x] `continuity.inspect` 百集下 < 200 ms：p13c 100 集实测 34 ms。
 - [x] 全量索引重建 < 60 s：100 集实测 36 ms。
 
 ## 预算与熔断
@@ -1218,7 +1219,7 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 | canon.commit | P4 | write | p4 / p12 / p12b |
 | canon.recover | P4 | write | p4 |
 | canon.audit | P12 | read | p12 / p12b / p11 |
-| continuity.inspect | P4 | read | p2（仍是 mock 读操作） |
+| continuity.inspect | P4 | read | p2 / p13c |
 | llm.ping | P5 | read | p1 / p5 |
 | llm.complete | P5 | read | p5 |
 | episode.get | P5 | read | p11 |

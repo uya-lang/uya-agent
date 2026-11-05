@@ -58,7 +58,7 @@ cat > "$TMP/in.jsonl" <<'JSONL'
 {"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"call","arguments":{"operation":"project.get","input":{"project_id":"p_00000000","nope":1}}}}
 {"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"call","arguments":{"operation":"episode.produce","input":{"project_id":"p_00000000","episode_id":"e","stage":"x"}}}}
 {"jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"call","arguments":{"operation":"nope.op","input":{}}}}
-{"jsonrpc":"2.0","id":12,"method":"tools/call","params":{"name":"call","arguments":{"operation":"continuity.inspect","input":{"episode_id":"ep-1"}}}}
+{"jsonrpc":"2.0","id":12,"method":"tools/call","params":{"name":"call","arguments":{"operation":"continuity.inspect","input":{"project_id":"p_00000000"}}}}
 JSONL
 
 timeout 120 "$TMP/drama" mcp serve --data-dir "$TMP/data" \
@@ -168,8 +168,9 @@ check(er.get('code') == 'SCHEMA_INVALID' and er.get('field') == 'nope',
       '未声明字段被拒（additionalProperties=false）')
 
 t, e = body(12)
-ddr = (t or {}).get('data', {})
-check(ddr.get('status') == 'done', '读操作直接回 done')
+ddr = (t or {}).get('data', {}).get('result') or {}
+check(ddr.get('ok') is True and ddr.get('revision') == 0,
+      '读操作回结果（空项目 = 零账本）')
 check('task_id' not in ddr, '读操作不发 task_id')
 
 # 7) describe 与 call 同源：describe 的 enum 外值必被拒

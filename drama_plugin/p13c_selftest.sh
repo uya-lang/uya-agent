@@ -359,6 +359,34 @@ assert ms < 200, ms
 print("PASS: index.list %d 集 %d ms（< 200 ms）" % (n, ms))
 PY
 
+START=$(date +%s%N)
+cat > "$TMP/q.jsonl" <<JSON
+{
+  "jsonrpc": "2.0",
+  "id": 4012,
+  "method": "tools/call",
+  "params": {"name": "call", "arguments": {
+    "operation": "continuity.inspect", "input": {"project_id": "$PID"}
+  }}
+}
+JSON
+out=$(ask)
+END=$(date +%s%N)
+printf '%s' "$out" | field > "$TMP/cont.json"
+python3 - "$TMP/cont.json" "$EPISODES" "$(( (END - START) / 1000000 ))" <<'PY'
+import json
+import sys
+d = json.load(open(sys.argv[1]))
+n = int(sys.argv[2])
+ms = int(sys.argv[3])
+assert d["ok"] is True, d
+assert d["revision"] == n, d
+assert d["commits"] == n, d
+assert d["violations"] == [], d["violations"]
+assert ms < 200, ms
+print("PASS: continuity.inspect %d 集 %d ms（< 200 ms，零违规）" % (n, ms))
+PY
+
 cat > "$TMP/q.jsonl" <<JSON
 {
   "jsonrpc": "2.0",
