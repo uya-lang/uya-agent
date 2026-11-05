@@ -1026,8 +1026,9 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
       workspace-write 每次 MCP 调用都需批准，danger-full-access 放行，无回答
       渠道时 fail closed；无人值守走 Worker，不走 Agent 循环 `call`。
 - [x] Worker 启动示例（交付 README：与 MCP 分进程、共享数据目录，单次扫描后退出）。
-- [ ] API Key：源码尚未读取凭证或发送 Authorization Header；公网认证 Provider 暂不可用。
-      只连自管无认证本机网关，待凭证支持落地后再写正式配置说明。
+- [x] API Key：`llm.json` 可选 `api_key`，非空时请求带
+      `Authorization: Bearer <key>`；p5 用本机 HTTP 服务抓头验证。环境变量
+      与代理仍未接（见上一条），公网 Provider 需 `tls: 1`。
 - [x] 数据目录备份/恢复说明（交付 README：停写后归档全数据根，解压新目录并校验）。
 - [x] 已知限制说明（`DRAMA_OPERATIONS.md`）：无 fsync、单 Worker/模拟 GPU
       预算边界。真实 GPU 串行仍待产线接入。

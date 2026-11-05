@@ -1507,8 +1507,9 @@ video.capabilities() -> 能力表                  # 见下
 
 - API Key 的目标来源只有两个：宿主配置里的 `env`（`mcp.json` 的
   `mcpServers.<name>.env`）或 Drama 自己的配置文件（0600，路径在配置里给）；
-- **当前未实现凭证读取或 Authorization Header**，公开 API Key Provider 不可用；
-  仅可连接用户自管、无需认证的 OpenAI 兼容本机网关；
+- 已实现配置文件凭证：`llm.json` 的 `api_key`（0600）会变成
+  `Authorization: Bearer <key>`；仍不读取环境变量。没有代理字段，公开
+  Provider 只在 `tls: 1` 时建议使用；
 - **不要**假设继承 shell 里的 `OPENAI_API_KEY`/`HTTP_PROXY` 之类变量——
   要用就得在宿主配置里显式声明；Drama 当前也不会读取这些变量。
 - `command` 必须写**绝对路径**；

@@ -47,16 +47,19 @@ OpenAI 兼容 LLM。视频侧只有确定性的 `mock.video`，不连接 ComfyUI
 - `model`：放入请求体的模型名；mock 不使用它。
 - `timeout_ms`：连接和读取超时，默认 `3000`。
 - `max_retries`：网络类失败的重试次数，默认 `1`。
+- `api_key`：可选；非空时每个请求带 `Authorization: Bearer <key>`。密钥只
+  在配置文件里（权限 0600），不要写进 Project Bible、任务记录或日志。
 
 请求是 `POST`，正文使用 `model`、零温度和一条 user message；响应要求
 `choices[0].message.content` 是可解析并通过剧本结构校验的 JSON。
 
-当前请求不读取环境变量，也不发送 `Authorization` 或 API Key Header。
-因此只能连接用户自管的无认证本机网关；公网认证 Provider 暂不可用。
-不要把密钥写进 `llm.json`、Project Bible、任务记录或日志。
+当前不读取 `OPENAI_API_KEY` / `HTTP_PROXY` 等环境变量，也没有代理字段；
+认证只来自 `llm.json` 的 `api_key`。连接公网 Provider 时务必用 `tls: 1`，
+否则 Bearer 头会明文过网。P5 回归会用一个本机 HTTP 服务抓
+`Authorization`，断言 `api_key` 确实变成了 `Bearer` 头。
 
-P5 回归覆盖默认 mock、本机 OpenAI 兼容请求、500、畸形响应、非 JSON
-模型输出和超时：
+P5 回归覆盖默认 mock、本机 OpenAI 兼容请求、`api_key` 头、500、畸形响
+应、非 JSON 模型输出和超时：
 
 ```sh
 sh drama_plugin/p5_selftest.sh

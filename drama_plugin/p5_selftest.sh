@@ -88,6 +88,7 @@ class H(BaseHTTPRequestHandler):
     def do_POST(self):
         n = int(self.headers.get('Content-Length', '0'))
         self.rfile.read(n)
+        open(sys.argv[2], 'w').write(self.headers.get('Authorization', ''))
         if self.path.startswith('/fail500'):
             self.send_response(500)
             self.end_headers()
@@ -123,7 +124,7 @@ srv = HTTPServer(('127.0.0.1', 0), H)
 open(sys.argv[1], 'w').write(str(srv.server_address[1]))
 srv.serve_forever()
 PY
-python3 "$TMP/srv.py" "$TMP/port" &
+python3 "$TMP/srv.py" "$TMP/port" "$TMP/auth" &
 SRV_PID=$!
 i=0
 while [ ! -s "$TMP/port" ] && [ "$i" -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
@@ -135,9 +136,14 @@ fi
 ok "本机上游服务起在 127.0.0.1:$PORT"
 
 cfg() {
+    if [ -n "${3:-}" ]; then
+        key=",\"api_key\":\"$3\""
+    else
+        key=""
+    fi
     cat > "$DATA/llm.json" <<JSON
 {"provider":"openai","base_url":"127.0.0.1","port":$PORT,"tls":0,
- "path":"$1","model":"test-model","timeout_ms":${2:-2000},"max_retries":0}
+ "path":"$1","model":"test-model","timeout_ms":${2:-2000},"max_retries":0$key}
 JSON
 }
 
@@ -162,6 +168,18 @@ c=d.get('content',{})
 assert c.get('title') == 'upstream-episode', d
 print('PASS: 解析出上游的 title（choices[0].message.content）')" \
     || bad "解析出来的内容不对"
+
+# ---------- 3b. api_key 走 Authorization ----------
+cfg "/v1/chat/completions" 2000 "sk-test-123"
+out=$(ask '{"jsonrpc":"2.0","id":31,"method":"tools/call","params":{"name":"call","arguments":{"operation":"llm.complete","input":{"prompt":"写一集"}}}}')
+got=$(code_of "$out")
+[ "$got" = "OK" ] || bad "带 api_key 的正常路径失败：$got"
+python3 - "$TMP/auth" <<'PY'
+import sys
+got = open(sys.argv[1]).read()
+assert got == "Bearer sk-test-123", got
+print("PASS: llm.json 的 api_key 变成 Authorization: Bearer 头")
+PY
 
 # ---------- 4. 非 200 ----------
 cfg "/fail500"
