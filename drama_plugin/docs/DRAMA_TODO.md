@@ -1138,7 +1138,7 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 
 - [x] 派生索引（`index/episodes.jsonl`，一行一集），可从真相全量重建；
       shot/asset 级索引还没做。
-- [ ] 每集一个 `manifest.json`。
+- [x] 每集一个 `manifest.json`（视频任务完成时写 `episodes/<id>/manifest.json`：剧本/分镜版本、镜头数、时长、任务与成本；p8）。
 - [x] `episode.get` / `index.list` 百集下 < 200 ms：`p13c_selftest.sh`
       100 集实测各 34 ms（机器相关，不是产能承诺）。
 - [x] `continuity.inspect` 百集下 < 200 ms：p13c 100 集实测 34 ms。

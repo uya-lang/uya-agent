@@ -8,7 +8,7 @@
 #   * `drama worker run` 扫未完成任务并执行：分镜 → 逐镜 mock 渲染 → 任务 done；
 #   * 未批准剧本的视频任务 ⇒ 任务 failed 且不产出文件（不会污染 Canon）；
 #   * 能力表外的动作 ⇒ 任务 failed（reason=action_unsupported）；
-#   * 视频任务成功不改变 Canon。
+#   * 视频任务成功不改变 Canon，并写每集 manifest.json（版本/镜头数/状态）。
 #
 # 用法：sh drama_plugin/p8_selftest.sh
 
@@ -162,6 +162,23 @@ PY
 
 n=$(find "$DATA/projects/$PID/assets" -name "shot_*.mp4" | wc -l)
 [ "$n" -gt 0 ] && ok "产出了 $n 个镜头文件" || bad "没有产出镜头文件"
+
+MAN=$(find "$DATA/projects/$PID/episodes" -name manifest.json 2>/dev/null | head -1)
+if [ -n "$MAN" ]; then
+    python3 - "$MAN" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+assert d['episode_id'] in ('e1', 'e2'), d
+assert d['script_version'] >= 1, d
+assert d['board_version'] >= 1, d
+assert d['shots_rendered'] > 0, d
+assert d['state'] == 'done', d
+print('PASS: 每集 manifest.json 记录了版本/镜头数/状态')
+PY
+    [ $? -eq 0 ] || fails=$((fails + 1))
+else
+    bad "没有写每集 manifest.json"
+fi
 
 CANON_AFTER=$(md5sum "$DATA/projects/$PID/canon.json" | cut -d' ' -f1)
 [ "$CANON_BEFORE" = "$CANON_AFTER" ] && ok "视频任务没有改动 Canon" \
