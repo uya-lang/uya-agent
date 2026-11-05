@@ -1166,8 +1166,10 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
       同号镜头不再互相覆盖；`assemble` 只在本次分镜自己的目录里拼接，
       `p13c_selftest.sh` 断言 100 集有 100 个目录、300 个镜头文件，并抽
       第 50 集合成（3 镜 / 768 B）。
-- [ ] 视频任务仍未登记 `asset.*` 账本（渲染结果只有文件名，没进资产表）；
-      接真实 Provider 时要落 `relative_path` + `sha256` + 集号。
+- [x] 视频任务登记资产账本：每渲染一镜就 `asset.register`
+      `v<board_version>/shot_<seq>.mp4`（现场算 SHA-256/大小），任务重置
+      重跑按名字查重不重复登记；`asset.list` 在百集 300 条下可整份返回。
+      接真实 Provider 时把 `v<board_version>` 换成集号目录即可。
 
 ## 验收
 
@@ -1193,7 +1195,7 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 | bible.put | P3 | write | p3b / p12b |
 | bible.get | P3 | read | p3b |
 | bible.history | P3 | read | p3b |
-| asset.register | P3 | write | p3b |
+| asset.register | P3 | write | p3b / p13c |
 | asset.list | P3 | read | p3b |
 | canon.inspect | P4 | read | p4 / p6 |
 | canon.commit | P4 | write | p4 / p12 / p12b |

@@ -223,6 +223,28 @@ PY
 cat > "$TMP/q.jsonl" <<JSON
 {
   "jsonrpc": "2.0",
+  "id": 4006,
+  "method": "tools/call",
+  "params": {"name": "call", "arguments": {
+    "operation": "asset.list", "input": {"project_id": "$PID"}
+  }}
+}
+JSON
+out=$(ask)
+printf '%s' "$out" | field > "$TMP/assets.json"
+python3 - "$TMP/assets.json" "$EPISODES" <<'PY'
+import json
+import sys
+d = json.load(open(sys.argv[1]))
+n = int(sys.argv[2])
+assert len(d["assets"]) == n * 3, len(d["assets"])
+assert all(x["size"] == 256 for x in d["assets"]), d["assets"][:2]
+print("PASS: asset.list 返回 %d 条（每条 256 B）" % len(d["assets"]))
+PY
+
+cat > "$TMP/q.jsonl" <<JSON
+{
+  "jsonrpc": "2.0",
   "id": 4003,
   "method": "tools/call",
   "params": {"name": "call", "arguments": {
@@ -273,6 +295,13 @@ shots = list((project / "assets").glob("v*/shot_*.mp4"))
 assert len(shots) == n * 3, len(shots)
 print("PASS: 镜头文件按分镜版本分 %d 个目录，共 %d 个文件" %
       (len(dirs), len(shots)))
+index = project / "assets.jsonl"
+lines = [x for x in index.read_text().splitlines() if x.strip()]
+assert len(lines) == n * 3, len(lines)
+names = {json.loads(x)["name"] for x in lines}
+assert len(names) == n * 3, len(names)
+assert "v%d/shot_1.mp4" % (n // 2) in names, sorted(names)[:3]
+print("PASS: 资产账本 %d 条，路径带分镜版本" % len(lines))
 PY
 
 rm "$DATA/projects/$PID/canon.json"
