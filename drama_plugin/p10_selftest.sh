@@ -206,7 +206,11 @@ d=json.load(sys.stdin)
 assert d.get('width') == 320, d
 assert d.get('height') == 240, d
 assert 900 <= d.get('duration_ms', 0) <= 1100, d
-print('PASS: media.probe 报出宽高与时长（320x240，约 1s）')" \
+assert d.get('tool') == 'ffprobe', d
+assert d.get('version', '').startswith('ffprobe version'), d
+assert d.get('ffmpeg_version', '').startswith('ffmpeg version'), d
+assert '-select_streams v:0' in d.get('args', ''), d
+print('PASS: media.probe 报出宽高/时长/版本/参数（320x240，约 1s）')" \
         || bad "media.probe 结果不对"
 
     out=$(ask '{"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"call","arguments":{"operation":"media.probe","input":{"path":"../etc/passwd"}}}}')

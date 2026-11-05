@@ -946,7 +946,8 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 > 拼成成片，写 manifest（`assemblies/v<N>.json`：镜头数、时长、大小、输出名、
 > SHA-256）。真实转码的替换点就是 `concat_shots`（换成 PipelineProvider 调产线脚本）。
 > 1.17 补：`media.probe` 用 ffprobe 读首条视频流宽高与容器时长，只接受数据根下
-> 的相对路径；合成出的成片同时登记进 `assets.jsonl`（mime `video/mp4`）。
+> 的相对路径，并记录 ffprobe/ffmpeg 版本首行与探测参数；合成出的成片同时登记进
+> `assets.jsonl`（mime `video/mp4`）。
 > 验收：`sh drama_plugin/p10_selftest.sh`：manifest 字段齐全、
 > 成片大小 == 各镜头字节数之和、合成不改 Canon、同样输入两次成片 hash 一致、
 > 镜头缺失 ⇒ ASSEMBLY_MISSING_SHOT、媒体探测返回宽高/时长且越界路径被拒。
@@ -963,7 +964,7 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 - [ ] 实现输出编码配置（libx264/crf20/yuv420p/aac 128k/32kHz/faststart）。
 - [ ] 实现输出时长/分辨率检查（成片 440×800 与 `format` 一致）。
 - [x] 实现输出文件完整性检查（大小与各镜头之和比对 + SHA-256 入 manifest）。
-- [ ] 记录 FFmpeg 版本和参数。
+- [x] 记录 FFmpeg 版本和参数（`media.probe` 回 ffprobe/ffmpeg 版本首行与实际探测参数）。
 - [x] 将最终成片登记为 Asset（合成后按 `episode_<N>.mp4` + `video/mp4` 入账）。
 - [ ] 支持失败后从合成步骤恢复。
 
