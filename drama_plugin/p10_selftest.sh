@@ -240,6 +240,22 @@ assert '-select_streams v:0' in d.get('args', ''), d
 print('PASS: media.probe 报出宽高/时长/版本/参数（320x240，约 1s）')" \
         || bad "media.probe 结果不对"
 
+    out=$(ask '{"jsonrpc":"2.0","id":14,"method":"tools/call","params":{"name":"call","arguments":{"operation":"media.probe","input":{"path":"probe/clip.mp4","expect_width":320,"expect_height":240,"expect_duration_ms":1000}}}}')
+    printf '%s' "$out" | field | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+assert d.get('width') == 320, d
+print('PASS: 期望宽高/时长一致时探测通过')" \
+        || bad "期望值一致却报错"
+
+    out=$(ask '{"jsonrpc":"2.0","id":15,"method":"tools/call","params":{"name":"call","arguments":{"operation":"media.probe","input":{"path":"probe/clip.mp4","expect_width":1920}}}}')
+    printf '%s' "$out" | field | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+assert d.get('code') == 'MEDIA_MISMATCH', d
+print('PASS: 分辨率不符 ⇒ MEDIA_MISMATCH')" \
+        || bad "分辨率不符没被拦住"
+
     out=$(ask '{"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"call","arguments":{"operation":"media.probe","input":{"path":"../etc/passwd"}}}}')
     printf '%s' "$out" | field | python3 -c "
 import json,sys
