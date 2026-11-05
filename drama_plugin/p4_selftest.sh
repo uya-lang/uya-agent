@@ -77,6 +77,14 @@ o=json.loads(raw[0])
 print(json.loads(o['result']['content'][0]['text']).get('data',{}).get('result',{}).get('revision','ERR'))")
 [ "$code" = "1" ] && ok "世界初始化提交到 revision 1" || bad "初始化提交失败：$code"
 H1=$(md5sum "$DATA/projects/$PID/commits/1.json" | cut -d' ' -f1)
+CID=$(printf '%s' "$out" | python3 -c "
+import json,sys
+raw=[l for l in sys.stdin.read().split(chr(10)) if l.strip()]
+o=json.loads(raw[0])
+print(json.loads(o['result']['content'][0]['text'])['data']['result'].get('commit_id',''))")
+REAL=$(sha256sum "$DATA/projects/$PID/commits/1.json" | cut -d' ' -f1)
+[ -n "$CID" ] && [ "$CID" = "$REAL" ] && ok "commit_id 可从提交记录复算（SHA-256）" \
+    || bad "commit_id 与记录 hash 不一致：$CID vs $REAL"
 
 MOVE=$(cat <<JSON
 {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"call","arguments":{"operation":"canon.commit","input":{"project_id":"$PID","base_revision":1,"events":[{"type":"prop.move","prop":"remote","to_scene":"kitchen","to_holder":"fridge"}]}}}}
