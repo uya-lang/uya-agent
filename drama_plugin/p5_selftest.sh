@@ -211,6 +211,14 @@ case "$got" in
     *) bad "超时应回 TIMEOUT，实际 $got" ;;
 esac
 
+# ---------- 8. 日志脱敏：密钥只留在 llm.json ----------
+if grep -Rq "sk-test-123" "$DATA/projects" "$DATA/operations.jsonl" \
+    2>/dev/null; then
+    bad "审计/项目文件泄露了 api_key"
+else
+    ok "审计与项目文件不含 api_key（密钥只在 llm.json）"
+fi
+
 echo "----"
 if [ "$fails" -eq 0 ]; then
     echo "PASS: P5（LLM 传输层 + Adapter 骨架）"
