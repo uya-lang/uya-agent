@@ -370,6 +370,10 @@ MCP Server 只注册以下三个 Tool：
   一行必须是一条**完整、紧凑**的 JSON-RPC 消息；单条上限 **1 MiB**，超限
   **整行丢弃**（不是截断后解析）。⇒ **禁止 pretty-print、禁止消息内换行、
   禁止在协议流里混日志。**
+
+**不做流式**（明确决策）：请求给完整 `arguments`，响应给完整 `result`；
+不实现 SSE / `notifications/message` 分块。中断恢复不靠增量解析，而靠
+操作幂等键（p2 重放）+ 任务游标与队列记录（p5d / p8）。
 - 工具结果投影：`content[]` 里 `type=="text"` 的 `text` 逐段拼接（`\n` 连接）；
   非 text 段落落成占位行；`isError:true` ⇒ 结果文本前缀 `Error: `。
 - `structuredContent` **宿主已支持**（有则优先读）。首版可选使用，
