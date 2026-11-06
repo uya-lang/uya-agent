@@ -161,6 +161,46 @@ sys.exit(1 if fails else 0)
 PY
 rc=$?
 
+# ---------- 共享文件系统：第二个进程读同一数据根 ----------
+cat > "$TMP/in2.jsonl" <<JSONL
+{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"call","arguments":{"operation":"bible.get","input":{"project_id":"$PID"}}}}
+{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"call","arguments":{"operation":"asset.list","input":{"project_id":"$PID"}}}}
+JSONL
+timeout 120 "$TMP/drama" mcp serve --data-dir "$DATA" \
+    < "$TMP/in2.jsonl" > "$TMP/out2.jsonl" 2> "$TMP/err2.txt" || true
+python3 - "$TMP/out2.jsonl" "$TMP/out1.jsonl" <<'PY'
+import json
+import sys
+
+
+def rows(path):
+    out = []
+    for line in open(path, 'rb').read().split(bytes([10])):
+        if not line:
+            continue
+        o = json.loads(line)
+        t = json.loads(o['result']['content'][0]['text'])
+        out.append(t.get('data', {}).get('result'))
+    return out
+
+
+second = rows(sys.argv[1])
+first = rows(sys.argv[2])
+ok, bad = [], []
+(ok if second[0] and second[0].get('version') == 2 else bad).append(
+    '另一个进程读到当前 Bible v2')
+(ok if second[1] and second[1].get('assets') else bad).append(
+    '另一个进程读到资产索引')
+(ok if bytes([0]) not in open(sys.argv[1], 'rb').read() else bad).append(
+    '共享读没有 NUL 污染')
+for m in bad:
+    print('FAIL: ' + m)
+for m in ok:
+    print('PASS: ' + m)
+sys.exit(1 if bad else 0)
+PY
+[ $? -eq 0 ] || fails=$((fails + 1))
+
 echo "----"
 if [ "$rc" -eq 0 ] && [ "$fails" -eq 0 ]; then
     echo "PASS: P3 第二段（Bible 版本 + Asset）"

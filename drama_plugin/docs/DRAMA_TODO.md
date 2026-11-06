@@ -425,7 +425,7 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 - [x] 实现文件登记。
 - [x] 实现 MIME、大小和 SHA-256 元数据。
 - [x] 实现 asset.get（按 name 查单条 + 数据根相对路径；`asset.list` 仍回全部元数据）。
-- [ ] 实现 shared filesystem 访问模式。
+- [x] 实现 shared filesystem 访问模式（多个 MCP 进程共享同一 `--data-dir`，p3b 第二进程读同一 Bible/资产索引）。
 - [x] 禁止任意绝对路径查询。
 - [x] 防止路径穿越（名字白名单）；**符号链接逃逸待补**（要 lstat）。
 
