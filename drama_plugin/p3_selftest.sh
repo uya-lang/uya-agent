@@ -190,6 +190,62 @@ else
     bad "project.configure 没生效"
 fi
 
+# ---------- 3.6 project.migrate：只补 format_version ----------
+python3 - "$DATA/projects/$CID/project.json" <<'PY'
+import json
+import sys
+
+p = sys.argv[1]
+d = json.load(open(p))
+d.pop('format_version', None)
+open(p, 'w').write(json.dumps(d))
+PY
+printf '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"call","arguments":{"operation":"project.migrate","input":{"project_id":"%s"}}}}\n' \
+    "$CID" > "$TMP/inM.jsonl"
+timeout 120 "$TMP/drama" mcp serve --data-dir "$DATA" \
+    < "$TMP/inM.jsonl" > "$TMP/outM.jsonl" 2>/dev/null || true
+if python3 - "$TMP/outM.jsonl" "$DATA/projects/$CID/project.json" <<'PYEOF'
+import json
+import sys
+
+raw = [l for l in open(sys.argv[1], 'rb').read().split(b'\n') if l]
+d = json.loads(json.loads(raw[0])['result']['content'][0]['text'])
+d = d['data']['result']
+assert d['migrated'] == ['project.json'], d
+assert d['already'] == 0, d
+assert json.load(open(sys.argv[2]))['format_version'] == 1
+sys.exit(0)
+PYEOF
+then
+    ok "project.migrate 补上缺的 format_version"
+else
+    bad "project.migrate 没生效"
+fi
+
+printf '%s' '{"format_version":2,"id":"x","name":"future","episode_count":0}' \
+    > "$DATA/projects/$CID/project.json"
+printf '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"call","arguments":{"operation":"project.migrate","input":{"project_id":"%s"}}}}\n' \
+    "$CID" > "$TMP/inM2.jsonl"
+timeout 120 "$TMP/drama" mcp serve --data-dir "$DATA" \
+    < "$TMP/inM2.jsonl" > "$TMP/outM2.jsonl" 2>/dev/null || true
+if python3 - "$TMP/outM2.jsonl" <<'PYEOF'
+import json
+import sys
+
+for line in open(sys.argv[1], 'rb').read().split(b'\n'):
+    if not line:
+        continue
+    t = json.loads(json.loads(line)['result']['content'][0]['text'])
+    code = (t.get('error') or {}).get('code')
+    sys.exit(0 if code == 'FORMAT_UNSUPPORTED' else 1)
+sys.exit(1)
+PYEOF
+then
+    ok "更高 format_version 的迁移被拒（FORMAT_UNSUPPORTED）"
+else
+    bad "更高版本被迁移器改写了"
+fi
+
 # ---------- 4. 不认识的 format_version ⇒ 只读故障态 ----------
 BADID=$(ls "$DATA/projects" | grep '^p_' | head -1)
 printf '%s' '{"format_version":99,"id":"x","name":"future","episode_count":0}' \

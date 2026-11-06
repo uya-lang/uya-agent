@@ -408,7 +408,7 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 - [x] 实现临时文件写入（O_EXCL、0600）。
 - [x] 实现原子替换（tmp → rename），错误路径清理 tmp。
 - [x] 每类 JSON 带 `format_version`；读到不认识的版本进只读故障态。
-- [ ] 实现版本迁移器（只做加法；破坏性变更必须写迁移器 + 测试）。
+- [x] 实现版本迁移器（只做加法：缺 `format_version` 补 1，更高版本回 FORMAT_UNSUPPORTED；`project.migrate`，p3）。
 - [x] 实现路径规范化。
 - [x] 实现目录边界校验。
 - [x] 实现基础文件完整性校验（审计核资产：缺失 / 大小不符 / ≤256 KiB 的 SHA-256；p12）。
@@ -1205,7 +1205,7 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 
 # 16. 操作目录与测试覆盖矩阵
 
-**已实现的 52 个操作**（`registry.uya` 是唯一来源；`describe` 就是从这张表
+**已实现的 53 个操作**（`registry.uya` 是唯一来源；`describe` 就是从这张表
 生成的）。"覆盖脚本"列是能跑到它的自测，空着表示只有间接覆盖。
 
 | 操作 | 阶段 | 权限 | 覆盖脚本 |
@@ -1251,6 +1251,7 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 | media.mix | P10 | write | p10 |
 | media.loudnorm | P10 | write | p10 |
 | shot.retry | P9 | write | p10 |
+| project.migrate | P3 | write | p3 |
 | episode.batch | P13 | write | p9 |
 | budget.report | P13 | read | p11 |
 | production.report | P13 | read | p13c |
