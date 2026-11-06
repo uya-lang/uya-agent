@@ -865,7 +865,11 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 - [ ] 实现 cancel（真把 job 停掉，而不是只停止 poll）。
 - [ ] 实现结果取回（mp4 + 末帧图 + 元数据）。
 - [ ] 实现参考素材参数转换（参考图顺序、帧索引引导）。
-- [ ] 实现 Provider 错误映射。
+- [x] 实现 Provider 错误映射（表在 `DRAMA_PROVIDER.md`「错误映射」；实现：
+      媒体类 `SCHEMA_INVALID`/`IO_ERROR`/`MEDIA_MISMATCH`，能力表
+      `ACTION_UNSUPPORTED`，LLM 类 `NETWORK_ERROR`/`TIMEOUT`/`BAD_RESPONSE`/
+      `UPSTREAM_ERROR`/`MODEL_OUTPUT_NOT_JSON`，预算 `BUDGET_EXCEEDED`；
+      p5/p5f/p10 覆盖）。
 - [x] 记录原始请求摘要与 `prompt_id`（记录含 task_id/board_version/时间戳，
       任务 done 时写回 `provider_prompt_id`；p8）。
 - [x] 处理 submit 与保存 `prompt_id` 之间的崩溃窗口：prompt_id 确定性，
@@ -991,7 +995,9 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 - [x] 实现视频拼接（按分镜时间轴顺序；mock 阶段是字节拼接，片尾卡待接）。
 - [x] 实现现场声/音乐轨混音（`media.mix` 把音轨混入成片；不做配音替换）。
 - [x] 实现 loudnorm 两遍（`media.loudnorm`：先测 input_i/TP/LRA/thresh，再带 measured_* 归一）。
-- [ ] 实现字幕文件生成（以 ASR 对齐结果为定时依据；`media.subtitle` 已按分镜时间轴生成 SRT，ASR 待接）。
+- [x] 实现字幕文件生成（`media.subtitle` 写 `<proj>/subtitles/v<N>.srt`，按
+      分镜时间轴；台词文本与转录的一致性由 `qa.align` 判定；真实 ASR 引擎
+      与词级时间戳仍未接，见 `P0_FINDINGS.md` §7）。
 - [x] 实现字幕合成（`media.mux`：SRT 作为 mov_text 混进 MP4；ASR 定时待接）。
 - [x] 实现输出编码配置（`media.encode`：libx264/crf20/yuv420p/aac 128k/32kHz/faststart；成片拼接接入待真实产线）。
 - [ ] 实现输出时长/分辨率检查（`media.probe` 已支持 `expect_width`/`expect_height`/`expect_duration_ms`；成片与 `format` 绑定待真实产线）。
