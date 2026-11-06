@@ -214,6 +214,20 @@ sys.exit(0 if ok else 1)
 PY
 [ $? -eq 0 ] || fails=$((fails + 1))
 
+# ---------- 6.1 同一批事件重放不会重复应用 ----------
+out=$(ask "$(cat <<JSON
+{"jsonrpc":"2.0","id":31,"method":"tools/call","params":{"name":"call","arguments":{"operation":"canon.commit","input":{"project_id":"$PID","base_revision":2,"events":[{"type":"prop.move","prop":"remote","to_scene":"kitchen","to_holder":"fridge"}]}}}}
+JSON
+)")
+printf '%s' "$out" | python3 -c "
+import json,sys
+raw=[l for l in sys.stdin.read().split(chr(10)) if l.strip()]
+t=json.loads(json.loads(raw[0])['result']['content'][0]['text'])
+assert t.get('success') is False, t
+assert t['error']['code'] == 'BASE_REVISION_CONFLICT', t
+print('PASS: 重放已应用的提交 ⇒ BASE_REVISION_CONFLICT（不重复应用）')" \
+    || bad "重放提交没有冲突保护"
+
 # ---------- 6.2 状态槽：人物/场景/道具/知识 ----------
 out=$(ask "$(cat <<JSON
 {"jsonrpc":"2.0","id":30,"method":"tools/call","params":{"name":"call","arguments":{"operation":"canon.inspect","input":{"project_id":"$PID"}}}}
