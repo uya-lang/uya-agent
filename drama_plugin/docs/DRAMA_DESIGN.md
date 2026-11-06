@@ -1105,6 +1105,11 @@ outline_version, episode}`：剧本必须能追到**已批准**的大纲版本�
 冻结口径（`frozen`）为真的字段一旦批准，改动必须重新规划并升版本；
 `outline.approve` 只批当前版本，重规划自动作废旧批准（p5e）。
 
+**钩子账**：每集批准时往候选事件里追加两条——`promise.close("hook_<N-1>")`
+与 `promise.open("hook_<N>")`（无上一集时只开不关）。审计的回收率
+`payoff_rate_pct = closed*100/(closed+overdue)` 就基于这本账；`hook_<N>`
+开满 3 集还没回收才算逾期（p6 / p12）。
+
 判据：观众已知而角色未知 ⇒ 允许（制造信息差）；角色已知而观众未知 ⇒
 必须在后续镜头补揭示，否则审核报 `KNOWLEDGE_LEAK`。
 

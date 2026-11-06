@@ -134,6 +134,11 @@ det = [json.loads(s) for s in sums]
 check(all(d.get('scenes', 0) >= 1 for d in det), '摘要记了镜头段数（scenes）')
 check(all(d.get('duration_ms', 0) > 0 for d in det), '摘要记了时长（duration_ms）')
 check(all(d.get('title') and d.get('hook') for d in det), '摘要带标题与钩子')
+prom = canon.get('promises', [])
+closed = sorted(p['id'] for p in prom if p.get('state') == 'closed')
+opens = sorted(p['id'] for p in prom if p.get('state') != 'closed')
+check(closed == ['hook_1', 'hook_2'], '第 2、3 集各兑现上一集钩子')
+check(opens == ['hook_3'], '结束时只剩本集新钩子未兑现（回收率 100%）')
 
 bible = json.load(open(os.path.join(base, 'bible', 'current.json')))
 check(bible.get('version') == 1, 'Bible 版本没被剧本写坏')

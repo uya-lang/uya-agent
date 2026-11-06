@@ -541,7 +541,10 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 
 四轴各来一个最小用例（1.3 新增）：
 
-- [ ] 故事：抛出的钩子在第 N+1 集被兑现，回收率计入 `promise` 账。
+- [x] 故事：抛出的钩子在第 N+1 集被兑现，回收率计入 `promise` 账
+      （批准时注入 `promise.close("hook_<N-1>")` + `promise.open("hook_<N>")`；
+      p6 断言 3 集后 hook_1/hook_2 已关、只剩 hook_3 开着；审计
+      `payoff_rate_pct` 用同一本账）。
       （P4 只做了 promise.open/close 的状态机，兑现统计留到 P12 的账本）
 - [x] 人物：角色知道了不该知道的事 ⇒ `KNOWLEDGE_LEAK` 拒绝提交。
 - [x] 环境：道具无事件地被挪动 ⇒ `PROP_TELEPORT` 拒绝提交。
