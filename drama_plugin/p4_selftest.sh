@@ -214,6 +214,23 @@ sys.exit(0 if ok else 1)
 PY
 [ $? -eq 0 ] || fails=$((fails + 1))
 
+# ---------- 6.08 一批事件里有一条不合法 ⇒ 整批不应用 ----------
+REV_BEFORE=$(python3 -c "
+import json
+print(json.load(open('$DATA/projects/$PID/canon.json'))['revision'])")
+out=$(ask "$(cat <<JSON
+{"jsonrpc":"2.0","id":35,"method":"tools/call","params":{"name":"call","arguments":{"operation":"canon.commit","input":{"project_id":"$PID","base_revision":$REV_BEFORE,"events":[{"type":"scene.define","scene":"hall"},{"type":"prop.move","prop":"不存在","to_scene":"hall"}]}}}}
+JSON
+)")
+REV_AFTER=$(python3 -c "
+import json
+print(json.load(open('$DATA/projects/$PID/canon.json'))['revision'])")
+[ "$REV_BEFORE" = "$REV_AFTER" ] \
+    && ok "一批事件有一条不合法 ⇒ 整体回滚到提交前 revision（$REV_AFTER）" \
+    || bad "半批事件被应用了：$REV_BEFORE → $REV_AFTER"
+grep -q '"hall"' "$DATA/projects/$PID/canon.json" \
+    && bad "非法批次里的第一条事件落盘了" || ok "非法批次没有留下任何状态"
+
 # ---------- 6.1 同一批事件重放不会重复应用 ----------
 out=$(ask "$(cat <<JSON
 {"jsonrpc":"2.0","id":31,"method":"tools/call","params":{"name":"call","arguments":{"operation":"canon.commit","input":{"project_id":"$PID","base_revision":2,"events":[{"type":"prop.move","prop":"remote","to_scene":"kitchen","to_holder":"fridge"}]}}}}

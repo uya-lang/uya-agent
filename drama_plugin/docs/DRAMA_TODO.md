@@ -1094,9 +1094,10 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 
 ## 提交门
 
-- [ ] `episode.approve` 内固定顺序：结构 → 前置 → 不变量 → 账本 → 提交 →
-      快照 → 索引。
-- [ ] 任一步失败整体回滚到提交前 revision。
+- [x] `episode.approve` 内固定顺序：结构 → 前置 → 不变量 → 账本 → 提交 →
+      快照 → 索引（`story_validate` → `canon_commit`（逐事件前置/不变量）→
+      `approved.json` → `summaries.jsonl`；p5b/p5c）。
+- [x] 任一步失败整体回滚到提交前 revision（p4：一批事件里有一条不合法 ⇒ revision 不变、状态无残留）。
 - [x] 唯一豁免：承诺延期（`promise.waive` 需 `reason` + 新 `due_ep`，缺一即拒；p12b 验证 overdue 归零）。
 - [x] 不提供任何绕过入口（不允许"直接写 Canon"）。
 
