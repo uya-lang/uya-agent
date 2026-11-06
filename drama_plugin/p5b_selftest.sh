@@ -114,6 +114,23 @@ nver=$(ls "$DATA/projects/$PID/scripts" | grep -c '^v[0-9]*\.json$' || true)
 [ "$V1_HASH" = "$(md5sum "$DATA/projects/$PID/scripts/v1.json" | cut -d' ' -f1)" ] \
     && ok "旧版本 v1 未被覆盖（字节不变）" || bad "旧版本被改写了"
 
+# ---------- 2b. 审查报告：问题清单 + 审核版本 ID ----------
+out=$(ask "$(cat <<JSON
+{"jsonrpc":"2.0","id":41,"method":"tools/call","params":{"name":"call","arguments":{"operation":"story.review","input":{"project_id":"$PID","script_version":1}}}}
+JSON
+)")
+printf '%s' "$out" | field > "$TMP/review.json"
+RID=$(python3 -c "
+import json
+d = json.load(open('$TMP/review.json'))
+assert d['ok'] is True, d
+assert len(d['review_id']) == 16, d
+assert d['scenes'] >= 1, d
+assert d['candidate_events'] >= 1, d
+assert d['issues'] == [], d
+print(d['review_id'])")
+[ -n "$RID" ] && ok "审查报告 ok + review_id=$RID" || bad "审查报告不对"
+
 # ---------- 3. 审核失败不能批准 ----------
 mkdir -p "$DATA/projects/$PID/scripts"
 printf '%s' '{"format_version":1,"version":3,"content_hash":"x","screenplay":{"title":"bad","scenes":[{"no":1,"action":"a"}]}}' \
@@ -152,6 +169,16 @@ print('PASS: 批准后候选事件进 Canon（revision 1，%d 个事件）' % d[
 else
     bad "批准失败：$got"
 fi
+
+python3 - "$DATA/projects/$PID/scripts/approved.json" "$RID" <<'PY'
+import json
+import sys
+
+d = json.load(open(sys.argv[1]))
+assert d['review_id'] == sys.argv[2], d
+print('PASS: 批准记录带上 review_id（%s）' % d['review_id'])
+PY
+[ $? -eq 0 ] || bad "批准记录没带 review_id"
 
 out=$(ask "$(cat <<JSON
 {"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"call","arguments":{"operation":"canon.inspect","input":{"project_id":"$PID"}}}}

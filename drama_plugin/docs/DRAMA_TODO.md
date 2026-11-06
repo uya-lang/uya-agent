@@ -532,7 +532,7 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 - [x] 注册 continuity.inspect：`op_continuity_inspect` 复用 `audit_run`，
       返回账本、不变量与全历史重放结果（旧版只登记了名字，调用会报缺字段）。
 - [x] 在 episode.approve(screenplay) 内部执行事件验证和 Canon 提交（`story_validate` → `canon_commit` → `approved.json`；p5b）。
-- [x] 不提供绕过校验的外部状态写入入口（57 个操作里没有通用写文件/写状态；
+- [x] 不提供绕过校验的外部状态写入入口（58 个操作里没有通用写文件/写状态；
       Canon 只能经 `canon.commit` 逐事件校验，剧本只能经 approve 提交）。
 
 ## 验收
@@ -667,7 +667,9 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 - [x] 道具和场景状态检查（PROP_TELEPORT / SCENE_DRIFT；p12b）。
 - [x] 事件前置条件检查（未定义的道具/角色、TIMELINE_CONFLICT 都被拒；p12b）。
 - [ ] 喜剧结构和可理解性审查。
-- [ ] 生成问题清单和审核版本 ID。
+- [x] 生成问题清单和审核版本 ID（`story.review`：确定性检查清单 +
+      `review_id` = 剧本内容 SHA-256 前 16 位；批准时写进
+      `scripts/approved.json` 的 `review_id`，可回查是哪一版被批的；p5b）。
 - [x] 支持创建新剧本版本，不覆盖旧版本（`scripts/v<N>.json` 只增不改；p5b 比对 v1 字节不变）。
 
 ## Task 接入
@@ -1223,7 +1225,7 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 
 # 16. 操作目录与测试覆盖矩阵
 
-**已实现的 57 个操作**（`registry.uya` 是唯一来源；`describe` 就是从这张表
+**已实现的 58 个操作**（`registry.uya` 是唯一来源；`describe` 就是从这张表
 生成的）。"覆盖脚本"列是能跑到它的自测，空着表示只有间接覆盖。
 
 | 操作 | 阶段 | 权限 | 覆盖脚本 |
@@ -1278,6 +1280,7 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 | index.rebuild | P13 | write | p13b |
 | qa.align | P7 | read | p7 |
 | canon.diff | P4 | read | p4 |
+| story.review | P5 | read | p5b |
 | index.list | P13 | read | p13b |
 | series.plan | P5 | write | p5e |
 | outline.approve | P5 | write | p5e |
