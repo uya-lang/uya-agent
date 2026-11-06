@@ -953,6 +953,33 @@ fn agent_log_turn_end(reason: &const byte) void {
     _ = sess_end(&g_sess, &ev);
 }
 
+// 折日志时把一条 `assistant/message` 压进历史（带 tool_calls / 只带正文两种形状）。
+//
+// `rsn` 是**同一步** `assistant/reasoning` 事件里暂存的思考（见 `agent_hist_from_log`
+// 里那一支）。必须一起带上：thinking 模式的上游要求把这一轮的思考原样回传，不回就
+// 400（`reasoning_content ... must be passed back`）。live 路径早就带上了（见
+// `hist_push_msg_reasoning` 的调用点），恢复路径以前只折正文 —— 于是「恢复会话之后
+// 的第一个请求」又会撞回同一个 400，而且它在 live 里怎么都复现不出来。
+//
+// 思考超过单条上限（`MSG_CONTENT_MAX`）时**丢思考、保消息**：`hist_push_msg_reasoning`
+// 遇到超长 reasoning 是整条拒绝，那会把 assistant(tool_calls) 连同它的 tool 结果
+// 变成悬空半组（端点 400 得更彻底）。思考可以省，消息一条都不能少。
+fn hist_push_logged_assistant(h: &History,
+                              text: &const byte, text_len: usize,
+                              extra: &const byte, extra_len: usize,
+                              rsn: &const byte, rsn_len: usize,
+                              calls: bool) bool {
+    var r: &const byte = rsn;
+    var rn: usize = rsn_len;
+    if rn > MSG_CONTENT_MAX {
+        r = null;
+        rn = 0;
+    }
+    const role: u8 = if calls { ROLE_ASSISTANT_CALLS } else { ROLE_ASSISTANT };
+    return hist_push_msg_reasoning(h, role, text, text_len,
+                                   extra, extra_len, r, rn);
+}
+
 // 从会话日志恢复消息历史（返回恢复的消息条数；0 表示没有可恢复内容）
 //
 // fold_stats=true 时顺带把**同一遍扫描**的每一行喂进统计折叠 —— 统计因此是全会话
@@ -994,7 +1021,15 @@ fn agent_hist_from_log(cfg: &const Config, h: &History, path: &const Buf, out_ne
     defer { buf_free(&extra); }
     var kd: Buf = buf_new(32);
     defer { buf_free(&kd); }
+    // 暂存的思考（`assistant/reasoning` 事件）与它所属的步号 —— 见下面那一支
+    var rsn: Buf = buf_new(65536);
+    defer { buf_free(&rsn); }
+    var rsn_turn: i64 = -1;
+    var rsn_step: i64 = -1;
     var added: i32 = 0;
+    // 计数用 `+%`（包装加）：这个函数的分支一多，`--strict-overflow` 就证不出
+    // `added + 1` 不溢出（实测在加了 assistant/reasoning 那一支之后当场报错）。
+    // 一条日志不可能折出 2^31 条消息，所以包装在这里没有语义代价。
     var expect: i64 = 0;
     // P88：checkpoint 折叠的**基线** = 此刻历史里已有的那几条（system + 运行时上下文 /
     // AGENTS.md / 技能目录 / 开工包）。它们不进日志，所以每次恢复都要重新注入一次；
@@ -1023,7 +1058,20 @@ fn agent_hist_from_log(cfg: &const Config, h: &History, path: &const Buf, out_ne
             continue;
         }
         const view: &[byte] = line.ptr[0: line.len];
-        if sv_eq_cstr(&typ, "user/message") {
+        if sv_eq_cstr(&typ, "assistant/reasoning") {
+            // 思考在日志里是**独立事件**（`agent_log_reasoning`），不属于某一条消息。
+            // 折历史时先暂存，等**同一步**那条 `assistant/message` 再挂上去 ——
+            // 只暂存、不单独入史：它是消息的一部分，不是一条消息。
+            // 记 turn/step 是因为中断的回合**只写了思考、没写 assistant/message**，
+            // 不比对步号的话这段思考会漂到后面某一步上去（错位的思考比没有更糟）。
+            buf_reset(&rsn);
+            rsn_turn = -1;
+            rsn_step = -1;
+            if sess_json_str(view, "reasoning_content", &rsn) && rsn.len > 0 {
+                rsn_turn = sess_json_i64(view, "turn");
+                rsn_step = sess_json_i64(view, "step");
+            }
+        } else if sv_eq_cstr(&typ, "user/message") {
             // P88：checkpoint 事件（`source.kind = "compaction"`）**改写折叠基线**：
             // 它记录了「此前的消息已被压成这一条」，所以先把折叠出来的消息丢掉，只留
             // system + 注入段，再把 checkpoint 压进去。不认它的话 `--resume` 会把被压掉的
@@ -1036,7 +1084,7 @@ fn agent_hist_from_log(cfg: &const Config, h: &History, path: &const Buf, out_ne
                 if have_ck && text.len > 0
                     && hist_push(h, ROLE_USER, text.ptr as &const byte,
                                  text.len) {
-                    added = added + 1;
+                    added = added +% 1;
                 }
                 continue;
             }
@@ -1049,38 +1097,52 @@ fn agent_hist_from_log(cfg: &const Config, h: &History, path: &const Buf, out_ne
                 if have_att {
                     if hist_push_msg(h, ROLE_USER, text.ptr as &const byte, text.len,
                         att.ptr as &const byte, att.len) {
-                        added = added + 1;
+                        added = added +% 1;
                     }
                 } else if hist_push(h, ROLE_USER, text.ptr as &const byte, text.len) {
-                    added = added + 1;
+                    added = added +% 1;
                 }
             }
         } else if sv_eq_cstr(&typ, "assistant/message") {
             const has_text: bool = sess_json_str(view, "content", &text);
             const has_calls: bool = sess_extract_array(view, "tool_calls", &extra);
+            // 这一步的思考：步号对得上才挂（理由见上面 `assistant/reasoning` 那一支）
+            var rp: &const byte = null;
+            var rn: usize = 0;
+            if rsn.len > 0 && rsn_turn == sess_json_i64(view, "turn")
+                && rsn_step == sess_json_i64(view, "step") {
+                rp = rsn.ptr as &const byte;
+                rn = rsn.len;
+            }
             if has_calls && extra.len > 0 {
-                if hist_push_msg(
+                if hist_push_logged_assistant(
                     h,
-                    ROLE_ASSISTANT_CALLS,
                     text.ptr as &const byte,
                     if has_text { text.len } else { 0 as usize },
                     extra.ptr as &const byte,
-                    extra.len
+                    extra.len, rp, rn, true
                 ) {
-                    added = added + 1;
+                    added = added +% 1;
                 }
             } else if has_text && text.len > 0 {
-                if hist_push(h, ROLE_ASSISTANT, text.ptr as &const byte, text.len) {
-                    added = added + 1;
+                if hist_push_logged_assistant(
+                    h, text.ptr as &const byte, text.len,
+                    null, 0, rp, rn, false
+                ) {
+                    added = added +% 1;
                 }
             }
+            // 用掉（或步号对不上）就清掉：思考只属于写它的那一步
+            buf_reset(&rsn);
+            rsn_turn = -1;
+            rsn_step = -1;
         } else if sv_eq_cstr(&typ, "tool/result") {
             var cid: Buf = buf_new(128);
             defer { buf_free(&cid); }
             if sess_json_str(view, "callId", &cid) && sess_json_str(view, "content", &text) {
                 // 会话日志不带工具名，回放出来的结果一律按通用规则剪（同 dshsess.uya 的说明）
                 if hist_push_msg(h, ROLE_TOOL, text.ptr as &const byte, text.len, cid.ptr as &const byte, cid.len) {
-                    added = added + 1;
+                    added = added +% 1;
                 }
             }
         } else if sv_eq_cstr(&typ, "session/title") {
