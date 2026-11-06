@@ -122,7 +122,7 @@ print('PASS: production.status 能查到 queued 的任务与 worker 状态')" ||
 
 # ---------- 3.5 批量投 N 集 ----------
 out=$(ask "$(cat <<JSON
-{"jsonrpc":"2.0","id":40,"method":"tools/call","params":{"name":"call","arguments":{"operation":"episode.batch","input":{"project_id":"$PID","episodes":"e10,e11,e12","priority":5}}}}
+{"jsonrpc":"2.0","id":40,"method":"tools/call","params":{"name":"call","arguments":{"operation":"episode.batch","input":{"project_id":"$PID","episodes":"e10,e11,e12","priority":5,"deadline_s":$(( $(date +%s) - 60 ))}}}}
 JSON
 )")
 printf '%s' "$out" | field | python3 -c "
@@ -148,6 +148,16 @@ assert d['priority'] == 5, d
 assert d['episode_id'] == 'e10', d
 print('PASS: 批量任务记录里带 priority 与 episode_id')" \
     || bad "批量任务记录不对"
+
+out=$(ask "$(cat <<JSON
+{"jsonrpc":"2.0","id":42,"method":"tools/call","params":{"name":"call","arguments":{"operation":"production.report","input":{"project_id":"$PID"}}}}
+JSON
+)")
+printf '%s' "$out" | field | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+assert d['tasks_overdue'] == 3, d
+print('PASS: 过了截止时间的 3 个任务被计为逾期')" || bad "逾期统计不对"
 
 # ---------- 4. 失败 → 重试 → worker 跑通，且不动 Canon ----------
 printf '%s' '{"format_version":1,"version":3,"content_hash":"z","screenplay":{"title":"v3","hook":"h","scenes":[{"no":1,"action":"冰箱爆炸了","dialogue":[]}]}}' \

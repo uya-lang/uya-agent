@@ -1156,7 +1156,7 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 
 ## 批量调度与审批
 
-- [x] 一次投 N 集、优先级（`episode.batch`：逗号分隔集号 + `priority`，每集一个任务；截止时间待做）。
+- [x] 一次投 N 集、优先级、截止时间（`episode.batch`：逗号分隔集号 + `priority` + `deadline_s`；`production.report.tasks_overdue` 统计逾期；p9）。
 - [x] 日终报告（`production.report`：完成集数、任务完成/失败、GPU 分钟、
       重做率、异常任务清单、不变量是否全绿；告警推送留到接真实产线）。
 - [ ] 抽样审批 + 异常优先队列。
