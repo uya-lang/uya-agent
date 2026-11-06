@@ -1,7 +1,7 @@
 # P0 调研结论
 
 > 口径：只写「跑过测试」或「读过源码」的结论。没验证的一律进 §7「不可用 /
-> 替代方案」。测试脚本都是 `drama_plugin/p*_selftest.sh`，共 21 个。
+> 替代方案」。测试脚本都是 `drama_plugin/p*_selftest.sh`，共 22 个。
 
 ## 1. 运行时与工程
 
@@ -9,7 +9,7 @@
 | --- | --- | --- |
 | Uya 模块 / 构建 | 已验证：28 个单模块 `.uya` 编成一个可执行 | `bash drama_plugin/build.sh` → `build/drama`（1.08 MB） |
 | 运行时依赖 | 已验证：只用 `libc.so.6`，不引第三方库 | `ldd build/drama` 两行 |
-| selftest 规范 | 已验证：p 脚本全走「起真进程 + JSON-RPC」黑盒 | 21 个 `p*_selftest.sh` |
+| selftest 规范 | 已验证：p 脚本全走「起真进程 + JSON-RPC」黑盒 | 22 个 `p*_selftest.sh` |
 | 首版目标平台 | 决定：Linux x86_64；系统调用只用 `libc.syscall` 子集（read/write/open/fsync/rename/mkdir/getrandom/clock_gettime） | `src/plat.uya` |
 | 仓库落点 | 决定：**暂留本仓 `drama_plugin/`**（独立仓库只影响打包，不影响代码）；迁移时整目录拖走即可 | §19 |
 | 宿主插件契约 | 已验证：宿主 fork+execve，只给白名单 env，不套沙箱；`cwd` 由配置给 | `src/plugin/mcprun.uya` |
@@ -53,4 +53,4 @@
 | 真实视频 Provider | 不可用（无凭据） | mock 镜头 + 本地拼接（`media.assemble`），`p13c` 压到 10 集 |
 | ASR 对齐 | 不可用 | 字幕按镜头时长均分（`media.subtitle`），口径写在 `DRAMA_OPERATIONS.md` |
 | 画布 32 倍数 / `17k+5` 帧 | 只做校验，不做编码 | `media.encode` 只透传参数并回 `MEDIA_MISMATCH` |
-| 代理与 `no_proxy` | 未做 | 子进程 env 白名单里没有 `HTTP_PROXY`，走直连 |
+| TLS 经代理（CONNECT） | 未做 | 走代理只支持明文 HTTP，TLS+代理直接回 `PROXY_TLS_UNSUPPORTED`（p5f） |

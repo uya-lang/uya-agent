@@ -201,7 +201,7 @@ JSON 上限/非 ASCII → env/密钥注入 → 资产可见性。
 ### 2.3 工程准备
 
 - [x] 确定 Drama 独立仓库位置和命名（决定：暂留本仓 `drama_plugin/`，见 `P0_FINDINGS.md` §1）。
-- [x] 阅读 Uya 模块、包、构建和 selftest 规范（28 模块 → 单可执行；21 个 p 脚本）。
+- [x] 阅读 Uya 模块、包、构建和 selftest 规范（28 模块 → 单可执行；22 个 p 脚本）。
 - [x] 阅读 `uya-agent` 的 `DESIGN.md`（尤其 §21 插件系统）、`CODING.md`（插件契约见 §1 表）。
 - [x] 确认 Uya 可执行程序的构建和发布方式（单文件，仅依赖 libc；`build/drama`）。
 - [x] 确认 Linux 首版目标平台（x86_64；系统调用只用 `libc.syscall` 子集）。
@@ -601,8 +601,8 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 - [x] TLS：默认校验模式已验证通过（1.5）；SNI 与失败原因可诊断。
 - [x] 响应解析：JSON 体、错误体、非 200 的错误映射。
 - [ ] 若走流式（SSE/分块）：增量解析与中断恢复。
-- [ ] 代理与 `no_proxy`：既然子进程只拿到白名单 env，代理配置必须来自
-      配置文件，不能指望 shell 环境。
+- [x] 代理与 `no_proxy`：配置只来自 `<data>/proxy.json`，请求行走
+      absolute-form，`no_proxy` 命中即直连（p5f）。
 - [x] 本地模型服务（如 Ollama/自建网关）作为一等 Provider 目标。
 
 ## LLM Adapter
