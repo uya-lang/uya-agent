@@ -154,6 +154,14 @@ gaps = [s for a, s in zip(shots, shots[1:])
         if s['timeline_in'] != a['timeline_out']]
 check(not gaps, 'timeline 首尾相接（没有空档/重叠）')
 check(all(s['scene'] for s in shots), '每个镜头都有场景 ID')
+src = [s.get('source', {}) for s in shots]
+check(all(x.get('script_version') == 1 for x in src),
+      '每个镜头都记了来源剧本版本（可回溯）')
+check(all(x.get('shot') == s['sequence'] for x, s in zip(src, shots)),
+      'source.shot 与该镜 sequence 一致')
+check([s['beat'] for s in shots] == sorted(s['beat'] for s in shots)
+      and shots[0]['beat'] == 1 and shots[-1]['beat'] >= 2,
+      '镜头按剧本段落（beat）单调递增，可追到第几段')
 dlg = [s for s in shots if 'line' in s]
 check(bool(dlg), '对白镜头保留了台词')
 check(all(s.get('who') for s in dlg), '对白镜头有人物 ID')

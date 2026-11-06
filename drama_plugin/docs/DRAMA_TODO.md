@@ -679,7 +679,7 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 - [x] 审核失败不能批准。
 - [x] 审核通过后可批准并提交 Canon。
 - [x] LLM 输出畸形或超时有明确错误，不污染项目状态（p5：MODEL_OUTPUT_NOT_JSON / TIMEOUT）。
-- [ ] 时长估算走确定性口径（对白 4–5 字/秒 + 标点停顿），与目标正片时长
+- [x] 时长估算走确定性口径（对白 4 字/秒 + 标点 0.3 s；p7），与目标正片时长
       误差 ≤0.05 s；超差时给出可读的差距说明（差多少秒、哪几镜）。
 - [x] 集尾钩子存在（缺 hook 的剧本不能批准，p5b）。
 
@@ -735,7 +735,7 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 - [x] 验证视频失败不会改变 Canon（p9：失败/重试前后 canon.json md5 不变）。
 - [ ] 逐集比对**冻结文本 hash 未变**、`CharacterState` 变体在允许集合内、
       知识事实无"提前知道"、道具位置变化都能追到事件。
-- [ ] 文本按码点计数（汉字算 1），时长按"念出来的字符数"折算。
+- [x] 文本按码点计数（汉字算 1），时长按"念出来的字符数"折算（`cp_count`；p7）。
 
 ## 通过标准（M1 门槛）
 
@@ -747,8 +747,8 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 
 ## 反例库回归（1.3 新增）
 
-- [ ] DESIGN §13.5 的六条反例 fixture 全部落地。
-- [ ] 每条断言具体错误码，而不是"失败即可"。
+- [x] DESIGN §13.5 的六条反例 fixture 全部落地（p12b 六条，逐条断言）。
+- [x] 每条断言具体错误码，而不是"失败即可"（p12b 用 code_of 等值比较）。
 - [ ] 人为改动冻结文本、挪动道具、抹掉知识来源，各触发一次拒绝提交。
 
 ---
@@ -773,7 +773,7 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 ## TODO
 
 - [x] 定义 Storyboard（镜头序列 + 时间轴）。
-- [ ] 定义 Shot：`shot_id`/`sequence`/`beat`/`scene_id`/`framing`/`camera`/
+- [x] 定义 Shot：`shot_id`/`sequence`/`beat`/`scene_id`/`framing`/`camera`/
       `action`/`line_text`/`timeline_in`/`timeline_out`/`source_duration`/
       `final_duration`/`ref_image_order`/`anchor_prev`/`cut_type`/
       `transition_line`/`state_in`/`state_out`/`render_tool`/`workflow_hash`。
