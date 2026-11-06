@@ -373,28 +373,28 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 
 - [x] 定义 Project。
 - [x] 定义 ProjectConfig。
-- [ ] 定义 ProjectBible。
+- [x] 定义 ProjectBible（`bible.put/get/history`，版本不可变；p3b）。
 - [x] 定义 BibleVersion（`version` / `format_version` / `content_hash`）。
 - [x] 实现项目 ID 规则。
 - [x] 实现 project.create。
 - [x] 实现 project.get。
-- [ ] 实现 project.configure。
+- [x] 实现 project.configure（改名/改集数，`config_version` 递增；p3）。
 - [x] 实现项目列表/索引（如果首版确实需要）。
-- [ ] 实现项目版本管理。
+- [x] 实现项目版本管理（Bible 每版快照不可覆盖 + `config_version`；p3/p3b）。
 
 ## Bible 子模型（字段直接对齐既有资产包，1.2）
 
 - [ ] 定义 CharacterProfile：身份 / 外观冻结（脸、发型、服装、配饰）/
       声音与语言风格 / 表演口径 / 参考图口径（只取身份，不复制背景与棚灯）。
 - [ ] 定义 CharacterRelation。
-- [ ] 定义 **CharacterLock**：冻结描述文本（连续性锁，逐字粘贴）+
+- [x] 定义 **CharacterLock**：冻结描述文本（连续性锁，逐字粘贴）+
       反向提示词（漂移排除项）。
 - [ ] 定义 SceneDefinition：叙事功能 + **一致性锚点 3–5 条** +
       冻结描述文本 + 反向提示词 + 参考图组 + 适用镜头清单。
-- [ ] 定义 SceneLayout（静态布局）与 SceneVariant（状态变体：时段/光/
+- [x] 定义 SceneLayout（静态布局）与 SceneVariant（状态变体：时段/光/
       道具状态，**不进冻结文本**）。
 - [ ] 定义 PropDefinition（外观冻结 + 反向词）。
-- [ ] 定义项目风格与创作规则（含系列级"哪些跨集不许变"）。
+- [x] 定义项目风格与创作规则（`rule.define` 只可扩展，改文本即 RULE_VIOLATION；p12b）。
 - [x] 定义 `format` 规格块（每集 manifest 写默认画布 448×800、成片 440×800/24fps、编码/响度；强制校验待产线）。
 - [ ] 定义固定参考资产 ID。
 - [x] 冻结文本的**逐字粘贴**校验：写入后核对 hash，与产线脚本里那份一致。
