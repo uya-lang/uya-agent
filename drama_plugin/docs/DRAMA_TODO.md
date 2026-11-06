@@ -502,8 +502,8 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 - [ ] 实现候选状态差异比较。
 - [x] 实现不可变 Commit Record。
 - [x] 实现单项目写入锁（O_EXCL 锁文件 + pid 探活）。
-- [ ] 锁文件写 `{pid, host, acquired_at, purpose}`；抢锁失败按
-      「探活 → 超时报 LOCK_STALE → 损坏报 LOCK_UNREADABLE」处理。
+- [x] 锁文件写 `{pid, host, acquired_at, purpose}`；抢锁失败按
+      「探活 → 超时报 LOCK_STALE → 损坏报 LOCK_UNREADABLE」处理（p4 三条用例）。
 - [x] 验证陈旧锁（kill -9 之后）能恢复，不会把项目变成永久只读。
 - [x] 实现 base_revision 检查。
 - [x] 实现 commit_id 和幂等检查（`commit_id` = 提交记录 SHA-256，p4 从磁盘复算比对；操作级幂等见 p2）。

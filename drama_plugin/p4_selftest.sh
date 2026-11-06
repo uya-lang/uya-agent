@@ -192,6 +192,21 @@ t=json.loads(o['result']['content'][0]['text'])
 print(t.get('data',{}).get('result',{}).get('revision','ERR'))")
 [ "$rev" = "3" ] && ok "陈旧锁（持有进程已死）可恢复" || bad "陈旧锁没恢复：$rev"
 
+# 锁太老：持有者还活着但 acquired_at 很旧 ⇒ LOCK_STALE（不硬等）
+printf '{"pid":%d,"host":"test","acquired_at":%d,"purpose":"canon.commit"}' \
+    "$$" "$(( $(date +%s) - 1000 ))" > "$LOCKDIR/commit.lock"
+check_reject "锁太老 ⇒ LOCK_STALE" LOCK_STALE <<JSON
+{"jsonrpc":"2.0","id":13,"method":"tools/call","params":{"name":"call","arguments":{"operation":"canon.commit","input":{"project_id":"$PID","base_revision":3,"events":[{"type":"timeline.advance","minutes":5}]}}}}
+JSON
+
+# 锁文件存在但读不出来（这里用目录占位）⇒ LOCK_UNREADABLE
+rm -f "$LOCKDIR/commit.lock"
+mkdir "$LOCKDIR/commit.lock"
+check_reject "锁文件损坏 ⇒ LOCK_UNREADABLE" LOCK_UNREADABLE <<JSON
+{"jsonrpc":"2.0","id":14,"method":"tools/call","params":{"name":"call","arguments":{"operation":"canon.commit","input":{"project_id":"$PID","base_revision":3,"events":[{"type":"timeline.advance","minutes":5}]}}}}
+JSON
+rmdir "$LOCKDIR/commit.lock"
+
 # ---------- 6. 崩溃恢复：canon.json 丢了 ----------
 rm -f "$DATA/projects/$PID/canon.json"
 out=$(ask "$(cat <<JSON
