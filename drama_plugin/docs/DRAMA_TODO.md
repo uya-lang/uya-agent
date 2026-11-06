@@ -1156,7 +1156,7 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 
 ## 批量调度与审批
 
-- [ ] 一次投 N 集、优先级、截止时间。
+- [x] 一次投 N 集、优先级（`episode.batch`：逗号分隔集号 + `priority`，每集一个任务；截止时间待做）。
 - [x] 日终报告（`production.report`：完成集数、任务完成/失败、GPU 分钟、
       重做率、异常任务清单、不变量是否全绿；告警推送留到接真实产线）。
 - [ ] 抽样审批 + 异常优先队列。
@@ -1204,7 +1204,7 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 
 # 16. 操作目录与测试覆盖矩阵
 
-**已实现的 51 个操作**（`registry.uya` 是唯一来源；`describe` 就是从这张表
+**已实现的 52 个操作**（`registry.uya` 是唯一来源；`describe` 就是从这张表
 生成的）。"覆盖脚本"列是能跑到它的自测，空着表示只有间接覆盖。
 
 | 操作 | 阶段 | 权限 | 覆盖脚本 |
@@ -1250,6 +1250,7 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 | media.mix | P10 | write | p10 |
 | media.loudnorm | P10 | write | p10 |
 | shot.retry | P9 | write | p10 |
+| episode.batch | P13 | write | p9 |
 | budget.report | P13 | read | p11 |
 | production.report | P13 | read | p13c |
 | index.rebuild | P13 | write | p13b |

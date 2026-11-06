@@ -120,6 +120,35 @@ assert d['state'] == 'queued', d
 assert d.get('worker') in ('idle', 'busy'), d
 print('PASS: production.status 能查到 queued 的任务与 worker 状态')" || bad "status 查不到任务"
 
+# ---------- 3.5 批量投 N 集 ----------
+out=$(ask "$(cat <<JSON
+{"jsonrpc":"2.0","id":40,"method":"tools/call","params":{"name":"call","arguments":{"operation":"episode.batch","input":{"project_id":"$PID","episodes":"e10,e11,e12","priority":5}}}}
+JSON
+)")
+printf '%s' "$out" | field | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+assert d['queued'] == 3, d
+assert len(d['episodes']) == 3, d
+assert len(set(d['episodes'])) == 3, d
+assert d['priority'] == 5, d
+print('PASS: episode.batch 一次投 %d 集（priority=5）' % d['queued'])" \
+    || bad "批量投递不对"
+
+out=$(ask "$(cat <<JSON
+{"jsonrpc":"2.0","id":41,"method":"tools/call","params":{"name":"call","arguments":{"operation":"production.status","input":{"project_id":"$PID","task_id":"$(printf '%s' "$out" | field | python3 -c "
+import json,sys;print(json.load(sys.stdin)['episodes'][0])")"}}}}
+JSON
+)")
+printf '%s' "$out" | field | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+assert d['state'] == 'queued', d
+assert d['priority'] == 5, d
+assert d['episode_id'] == 'e10', d
+print('PASS: 批量任务记录里带 priority 与 episode_id')" \
+    || bad "批量任务记录不对"
+
 # ---------- 4. 失败 → 重试 → worker 跑通，且不动 Canon ----------
 printf '%s' '{"format_version":1,"version":3,"content_hash":"z","screenplay":{"title":"v3","hook":"h","scenes":[{"no":1,"action":"冰箱爆炸了","dialogue":[]}]}}' \
     > "$DATA/projects/$PID/scripts/v3.json"
