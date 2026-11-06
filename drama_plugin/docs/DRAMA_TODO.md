@@ -469,7 +469,7 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 - [x] 定义 EventPrecondition。
 - [x] 定义 EventEffect。
 - [x] 定义有限条件操作符枚举。
-- [ ] 实现事件唯一 ID。
+- [x] 实现事件唯一 ID（`r<revision>#<序号>`，canon.commit 返回 `event_ids`；p4）。
 - [x] 实现事件顺序。
 - [x] 实现事件来源追踪。
 - [x] 实现事件前置条件检查。

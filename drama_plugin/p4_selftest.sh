@@ -305,6 +305,21 @@ H2=$(md5sum "$DATA/projects/$PID/commits/1.json" | cut -d' ' -f1)
 [ -n "$H1" ] && [ "$H1" = "$H2" ] && ok "后续提交没有改写 1.json（只追加）" \
     || bad "v1.json 被改写了"
 
+# ---------- 6.05 事件唯一 ID ----------
+out=$(ask "$(cat <<JSON
+{"jsonrpc":"2.0","id":32,"method":"tools/call","params":{"name":"call","arguments":{"operation":"canon.commit","input":{"project_id":"$PID","base_revision":3,"events":[{"type":"scene.define","scene":"balcony"},{"type":"character.place","character":"mom","scene":"balcony"}]}}}}
+JSON
+)")
+printf '%s' "$out" | python3 -c "
+import json,sys
+raw=[l for l in sys.stdin.read().split(chr(10)) if l.strip()]
+t=json.loads(json.loads(raw[0])['result']['content'][0]['text'])
+r=t['data']['result']
+assert r['revision'] == 4, r
+assert r['event_ids'] == ['r4#0', 'r4#1'], r
+print('PASS: 事件唯一 ID 形如 r<revision>#<序号>（%s）' % r['event_ids'])" \
+    || bad "事件 ID 不对"
+
 echo "----"
 if [ "$fails" -eq 0 ]; then
     echo "PASS: P4（Canon 提交 / 不变量 / 锁 / 恢复）"
