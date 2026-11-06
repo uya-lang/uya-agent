@@ -400,6 +400,47 @@ print('PASS: 预演不落盘（revision 仍是 4）')
 PY
 [ $? -eq 0 ] || bad "canon.diff 动了状态"
 
+# ---------- 9. space 账：场景连通 / 陈设 hash / 时段 ----------
+printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":30,\"method\":\"tools/call\",\"params\":{\"name\":\"call\",\"arguments\":{\"operation\":\"canon.commit\",\"input\":{\"project_id\":\"$PID\",\"base_revision\":4,\"events\":[{\"type\":\"character.place\",\"character\":\"dad\",\"scene\":\"kitchen\"}]}}}}" \
+    > "$TMP/s1.jsonl"
+run < "$TMP/s1.jsonl" > "$TMP/s1.out" 2>/dev/null || true
+python3 - "$TMP/s1.out" <<'PY'
+import json
+import sys
+
+o = json.loads(open(sys.argv[1]).read().strip().split('\n')[0])
+t = json.loads(o['result']['content'][0]['text'])
+r = t['data']['result']
+assert r['revision'] == 5, r
+print('PASS: dad 从客厅走到厨房（revision 5）')
+PY
+[ $? -eq 0 ] || bad "dad 没走到厨房"
+
+printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":31,\"method\":\"tools/call\",\"params\":{\"name\":\"call\",\"arguments\":{\"operation\":\"space.report\",\"input\":{\"project_id\":\"$PID\"}}}}" \
+    > "$TMP/s2.jsonl"
+run < "$TMP/s2.jsonl" > "$TMP/s2.out" 2>/dev/null || true
+python3 - "$TMP/s2.out" <<'PY'
+import json
+import sys
+
+o = json.loads(open(sys.argv[1]).read().strip().split('\n')[0])
+t = json.loads(o['result']['content'][0]['text'])
+r = t['data']['result']
+scenes = {s['name']: s for s in r['scenes']}
+assert 'living_room' in scenes and 'kitchen' in scenes, r
+assert scenes['living_room']['time_of_day'] == 'day', scenes
+assert any(s['name'] == 'kitchen'
+           for s in r['scenes'] if 'living_room' in s['links']), r
+assert any(e['from'] == 'living_room' and e['to'] == 'kitchen'
+           or e['from'] == 'kitchen' and e['to'] == 'living_room'
+           for e in r['edges']), r
+hid = scenes['living_room']['variant_hash']
+assert hid == '' or len(hid) == 16, scenes
+print('PASS: space.report（场景 %d 个 / 连通边 %d 条）'
+      % (len(r['scenes']), len(r['edges'])))
+PY
+[ $? -eq 0 ] || bad "space.report 不对"
+
 echo "----"
 if [ "$fails" -eq 0 ]; then
     echo "PASS: P4（Canon 提交 / 不变量 / 锁 / 恢复）"

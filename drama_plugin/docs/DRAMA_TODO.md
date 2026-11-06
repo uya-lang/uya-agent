@@ -532,7 +532,7 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 - [x] 注册 continuity.inspect：`op_continuity_inspect` 复用 `audit_run`，
       返回账本、不变量与全历史重放结果（旧版只登记了名字，调用会报缺字段）。
 - [x] 在 episode.approve(screenplay) 内部执行事件验证和 Canon 提交（`story_validate` → `canon_commit` → `approved.json`；p5b）。
-- [x] 不提供绕过校验的外部状态写入入口（60 个操作里没有通用写文件/写状态；
+- [x] 不提供绕过校验的外部状态写入入口（61 个操作里没有通用写文件/写状态；
       Canon 只能经 `canon.commit` 逐事件校验，剧本只能经 approve 提交）。
 
 ## 验收
@@ -1110,7 +1110,10 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
       `promise.report` 给回收率。
 - [x] `prop`（道具位置）唯一位置不变式。
 - [x] `knowledge`（谁知道什么）授予必须来自事件且角色在场。
-- [ ] `space`（场景连通/陈设 hash/时段/变体）。
+- [x] `space`（场景连通/陈设 hash/时段/变体）：`space.report` 输出每个
+      场景的时段/变体/陈设 hash（variant 的 SHA-256 前 16 位）/在场角色与
+      道具/连通场景；连通边从提交记录里的 `character.place`、`prop.move`
+      推（p4）。
 - [x] 账本重建：从 Commit Record 重算 state_hash 并逐条比对（审计里做）。
 - [x] 账本只追加、只升版本，不可改写（p4 校验 1.json 在后续提交后 hash 不变）。
 
@@ -1238,7 +1241,7 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 
 # 16. 操作目录与测试覆盖矩阵
 
-**已实现的 60 个操作**（`registry.uya` 是唯一来源；`describe` 就是从这张表
+**已实现的 61 个操作**（`registry.uya` 是唯一来源；`describe` 就是从这张表
 生成的）。"覆盖脚本"列是能跑到它的自测，空着表示只有间接覆盖。
 
 | 操作 | 阶段 | 权限 | 覆盖脚本 |
@@ -1296,6 +1299,7 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 | story.review | P5 | read | p5b |
 | review.queue | P9 | read | p9 |
 | review.decide | P9 | write | p9 |
+| space.report | P4 | read | p4 |
 | index.list | P13 | read | p13b |
 | series.plan | P5 | write | p5e |
 | outline.approve | P5 | write | p5e |

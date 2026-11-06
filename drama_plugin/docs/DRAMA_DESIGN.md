@@ -716,7 +716,7 @@ operation.dispatch
 ### 5.0 上表的实现对照（1.17）
 
 首版实现把上表**拆细**了：粒度更小、每个操作只做一件事，方便校验与重放。
-完整清单（60 个）在 `DRAMA_TODO.md` §16，唯一来源是 `src/registry.uya`。
+完整清单（61 个）在 `DRAMA_TODO.md` §16，唯一来源是 `src/registry.uya`。
 
 | 设计里的操作 | 实现成 |
 |---|---|
@@ -1044,6 +1044,10 @@ outline_version, episode}`：剧本必须能追到**已批准**的大纲版本�
 
 字段：`scene_id`、`connect_to`（有向连通）、`furniture_hash`、
 `time_of_day`、`variant`（状态变体，取自资产包允许集合）。
+
+`space.report` 是这套账的只读投影：每场景报时段、变体、陈设 hash
+（variant 的 SHA-256 前 16 位）、在场角色/道具、连通场景；连通边从提交
+记录里的 `character.place`、`prop.move` 重放推出来（p4）。
 
 账本与 Canon 的关系：账本是 Canon 的**投影**，可从事件重放重建
 （重建校验见 §13.4）；落盘只是为了检查变快，不能当成唯一事实来源。
