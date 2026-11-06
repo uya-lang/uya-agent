@@ -82,6 +82,7 @@ sh drama_plugin/p5_selftest.sh
     "ffmpeg_path": "/usr/bin/ffmpeg",
     "ffprobe": true,
     "ffprobe_path": "/usr/bin/ffprobe"
+    ,"http_provider": false
   }
 }
 ```
@@ -104,6 +105,51 @@ sh drama_plugin/p8_selftest.sh
 
 真实本机视频队列、云视频 API、重试上限和 FFmpeg 适配器仍未实现，不能
 依据这张 mock 能力表安排真实生产。
+
+## Provider 接口（图像 / 音频 / 媒体 / 产线）
+
+四类 Provider 共用一套生命周期：`submit` → `poll` → `fetch`，失败走同一张
+错误映射表；每类都要在能力表里自报 `capability_version`，版本一变就得
+重跑对应回归。`http_provider:false` 是显式占位：本版没有云 API 版，
+不要把它当成可用能力。
+
+### ImageProvider（尚未实现）
+
+- `submit(shot, ref_images[])` → `{prompt_id}`；
+- `ref_images` 的顺序就是 `<Picture n>` 的绑定顺序，**顺序不同即新任务**；
+- `poll(prompt_id)` → `queued|running|done|failed{reason}`；
+- `fetch(prompt_id)` → `{file, width, height, sha256}`；
+- 能力表：`max_refs`、`supported_sizes`、`seedable`。
+
+### AudioProvider（首版不做配音替换）
+
+只保留方法名与错误码，调用即回 `PROVIDER_UNSUPPORTED`；首版字幕按镜头
+时长均分（`media.subtitle`），不做 TTS，也不做音色绑定。
+
+### MediaProvider（本机 FFmpeg，已实现）
+
+由 `provider.encode` / `mux` / `mix` / `loudnorm` / `probe` 兑现，参数取自
+剧本的 `format` 块；只接受项目内相对路径，不做远程上传。
+
+### PipelineProvider（子进程方式接既有产线）
+
+- `submit(job_json)`：`execve` 产线脚本（绝对路径 + 白名单 env），`stdin`
+  给 job JSON，`stdout` 只允许单行 JSON；
+- 产物必须落到项目 `assets/` 下并回相对路径，不允许把宿主绝对路径透出去；
+- 超时（默认 900 s）→ `TIMEOUT`；非 0 退出码 → `UPSTREAM_ERROR`，
+  消息里带 `stderr` 末尾；
+- `cancel(prompt_id)` 必须真的给子进程发信号，不能只停掉 `poll`。
+
+### 错误映射（四类共用）
+
+| 情况 | 错误码 |
+|---|---|
+| 提交参数不合法 | `SCHEMA_INVALID` |
+| 队列/服务不可达 | `NETWORK_ERROR` |
+| 任务失败 | `UPSTREAM_ERROR` |
+| 响应不是约定 JSON | `BAD_RESPONSE` |
+| 超出预算 | `BUDGET_EXCEEDED` |
+| 能力表里没有的能力 | `PROVIDER_UNSUPPORTED` |
 
 ## 平台与依赖边界
 

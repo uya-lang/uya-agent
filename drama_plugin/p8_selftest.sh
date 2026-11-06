@@ -196,6 +196,64 @@ d=json.loads(sys.stdin.read().strip().split(chr(10))[-1])
 assert d['tasks_seen'] == 0, d
 print('PASS: 已完成的任务不会被重复执行')" || bad "worker 重复执行了已完成的活"
 
+# ---------- 5.5 本地队列：prompt_id / 复用 / 取消 ----------
+out=$(ask '{"jsonrpc":"2.0","id":20,"method":"tools/call","params":{"name":"call","arguments":{"operation":"queue.get","input":{"project_id":"'"$PID"'","task_id":"'"$TID2"'"}}}}')
+printf '%s' "$out" | field | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+assert d['state'] == 'done', d
+assert d['prompt_id'].startswith('q_'), d
+assert len(d['prompt_id']) == 10, d
+assert d['board_version'] >= 1, d
+assert d['shots'] > 0, d
+assert d['gpu_ms'] > 0, d
+print('PASS: 队列记录 done（prompt_id=%s, shots=%d）' % (d['prompt_id'], d['shots']))" \
+    || bad "队列记录不对"
+
+Q2="$DATA/projects/$PID/queue/$TID2.json"
+STAMP_BEFORE=$(md5sum "$Q2" | cut -d' ' -f1)
+# 模拟"提交完还没跑完就崩溃"：把任务记录改回 running，再跑一次 worker
+python3 - "$DATA/projects/$PID/tasks/$TID2.json" <<'PY'
+import json
+import sys
+
+p = sys.argv[1]
+rec = json.load(open(p))
+rec['state'] = 'running'
+json.dump(rec, open(p, 'w'), ensure_ascii=False)
+PY
+out=$(timeout 120 "$TMP/drama" worker run --data-dir "$DATA" 2>/dev/null)
+STAMP_AFTER=$(md5sum "$Q2" | cut -d' ' -f1)
+[ "$STAMP_BEFORE" = "$STAMP_AFTER" ] \
+    && ok "崩溃后重跑复用同一条队列记录（不重发 submit）" \
+    || bad "崩溃后重跑重发了 submit"
+python3 - "$DATA/projects/$PID/tasks/$TID2.json" <<'PY'
+import json
+import sys
+
+rec = json.load(open(sys.argv[1]))
+assert rec['state'] == 'done', rec
+assert rec.get('provider_prompt_id', '').startswith('q_'), rec
+assert rec.get('queue') == 'done', rec
+print('PASS: 任务记录带 provider_prompt_id 与 queue=done')
+PY
+[ $? -eq 0 ] || fails=$((fails + 1))
+
+# 取消：还没跑的任务取消后，队列跟着置 canceled，worker 不再执行
+out=$(ask '{"jsonrpc":"2.0","id":21,"method":"tools/call","params":{"name":"call","arguments":{"operation":"episode.produce","input":{"project_id":"'"$PID"'","episode_id":"e9","stage":"video"}}}}')
+TID9=$(printf '%s' "$out" | field | python3 -c "
+import json,sys
+print(json.load(sys.stdin)['task_id'])")
+out=$(ask '{"jsonrpc":"2.0","id":22,"method":"tools/call","params":{"name":"call","arguments":{"operation":"production.cancel","input":{"project_id":"'"$PID"'","task_id":"'"$TID9"'"}}}}')
+printf '%s' "$out" | field | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+assert d['state'] == 'cancelled', d
+print('PASS: task.cancel 把任务标成 cancelled')" || bad "取消没生效"
+[ ! -f "$DATA/projects/$PID/queue/$TID9.json" ] \
+    && ok "取消的任务没有进队列（没提交过就不生成记录）" \
+    || bad "取消的任务还是进了队列"
+
 # ---------- 6. 单 Worker 锁 ----------
 mkdir -p "$DATA/locks"
 printf '{"pid":%d}' "$$" > "$DATA/locks/worker.lock"

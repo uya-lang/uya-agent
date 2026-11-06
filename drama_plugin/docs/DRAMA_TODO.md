@@ -828,24 +828,27 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 - [x] 定义模型、Provider 与**能力表**版本记录。
 - [x] 定义 `video.capabilities()`：哪些动作能演、哪些不能（版本化）。
 - [x] 定义 LLMProvider（`mock` / OpenAI 兼容 `openai`，`llm.uya`；p5）。
-- [ ] 定义 ImageProvider。
+- [x] 定义 ImageProvider（`submit/poll/fetch` + 参考图顺序即绑定；`DRAMA_PROVIDER.md`）。
 - [x] 定义 VideoProvider（mock；真实产线 Adapter 留到接本机队列）。
-- [ ] 定义 AudioProvider（首版不做配音替换）。
-- [ ] 定义 MediaProvider。
-- [ ] 定义 `PipelineProvider`：以子进程方式调用既有产线脚本
+- [x] 定义 AudioProvider（只留方法名，调用回 PROVIDER_UNSUPPORTED；不做 TTS）。
+- [x] 定义 MediaProvider（本机 FFmpeg：encode/mux/mix/loudnorm/probe）。
+- [x] 定义 `PipelineProvider`：以子进程方式调用既有产线脚本
       （入参固化为 JSON、退出码与产物清单进检查点、只读 stdout 摘要）。
 
 ## 本地队列 Video Adapter（1.2 替换原「H3 Adapter」）
 
-- [ ] 按 P0 调研结果确认本机生成服务契约（提交 / 查历史 / 取文件）。
-- [ ] 实现 submit（返回 `prompt_id` 作为 provider task id）。
-- [ ] 实现 poll（查队列与历史，区分排队中/执行中/完成/失败）。
+- [x] 确认本机生成服务契约：`queue/<task_id>.json`（提交 / 查状态 / 取结果），
+      prompt_id 由 (task_id, board_version) 确定性算出（p8）。
+- [x] 实现 submit（返回 `q_<8hex>` 的 prompt_id 作为 provider task id；p8）。
+- [x] 实现 poll（`queue.get` 回 queued/running/done/failed/canceled；p8）。成/失败）。
 - [ ] 实现 cancel（真把 job 停掉，而不是只停止 poll）。
 - [ ] 实现结果取回（mp4 + 末帧图 + 元数据）。
 - [ ] 实现参考素材参数转换（参考图顺序、帧索引引导）。
 - [ ] 实现 Provider 错误映射。
-- [ ] 记录原始请求摘要与 `prompt_id`。
-- [ ] 处理 submit 与保存 `prompt_id` 之间的崩溃窗口：先查历史再决定重发。
+- [x] 记录原始请求摘要与 `prompt_id`（记录含 task_id/board_version/时间戳，
+      任务 done 时写回 `provider_prompt_id`；p8）。
+- [x] 处理 submit 与保存 `prompt_id` 之间的崩溃窗口：prompt_id 确定性，
+      重跑先查记录再决定重发（p8 断言记录未被改写）。查历史再决定重发。
 - [x] 并发上限固定 1（单卡串行），排队顺序 = Worker 调度顺序。
 - [x] 成本按 GPU 分钟记账（`production.report` 的 `gpu_ms`/`gpu_minutes`；p9）。
 - [x] 云 API 版（`HttpProvider`）只留占位：`provider.capabilities` 里显式
@@ -1209,7 +1212,7 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 
 # 16. 操作目录与测试覆盖矩阵
 
-**已实现的 54 个操作**（`registry.uya` 是唯一来源；`describe` 就是从这张表
+**已实现的 55 个操作**（`registry.uya` 是唯一来源；`describe` 就是从这张表
 生成的）。"覆盖脚本"列是能跑到它的自测，空着表示只有间接覆盖。
 
 | 操作 | 阶段 | 权限 | 覆盖脚本 |
@@ -1255,6 +1258,7 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 | media.mix | P10 | write | p10 |
 | media.loudnorm | P10 | write | p10 |
 | shot.retry | P9 | write | p10 |
+| queue.get | P8 | read | p8 |
 | final.approve | P11 | write | p11 |
 | project.migrate | P3 | write | p3 |
 | episode.batch | P13 | write | p9 |
