@@ -384,19 +384,21 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 
 ## Bible 子模型（字段直接对齐既有资产包，1.2）
 
-- [ ] 定义 CharacterProfile：身份 / 外观冻结（脸、发型、服装、配饰）/
-      声音与语言风格 / 表演口径 / 参考图口径（只取身份，不复制背景与棚灯）。
-- [ ] 定义 CharacterRelation。
+- [x] 定义 CharacterProfile：身份 / 外观冻结（脸、发型、服装、配饰）/
+      声音与语言风格 / 表演口径 / 参考图口径（只取身份，不复制背景与棚灯；
+      `DRAMA_DESIGN.md` §6.2）。
+- [x] 定义 CharacterRelation（关系写进 `CharacterProfile`，事实带来源；§6.2）。
 - [x] 定义 **CharacterLock**：冻结描述文本（连续性锁，逐字粘贴）+
       反向提示词（漂移排除项）。
-- [ ] 定义 SceneDefinition：叙事功能 + **一致性锚点 3–5 条** +
-      冻结描述文本 + 反向提示词 + 参考图组 + 适用镜头清单。
+- [x] 定义 SceneDefinition：叙事功能 + **一致性锚点 3–5 条** +
+      冻结描述文本 + 反向提示词 + 参考图组 + 适用镜头清单（§6.3；
+      layout/variant 已分家）。
 - [x] 定义 SceneLayout（静态布局）与 SceneVariant（状态变体：时段/光/
       道具状态，**不进冻结文本**）。
-- [ ] 定义 PropDefinition（外观冻结 + 反向词）。
+- [x] 定义 PropDefinition（外观冻结 + 反向词；`prop_id` 全项目唯一，§6.4）。
 - [x] 定义项目风格与创作规则（`rule.define` 只可扩展，改文本即 RULE_VIOLATION；p12b）。
 - [x] 定义 `format` 规格块（每集 manifest 写默认画布 448×800、成片 440×800/24fps、编码/响度；强制校验待产线）。
-- [ ] 定义固定参考资产 ID。
+- [x] 定义固定参考资产 ID（`asset.register` 的稳定 id + `sha256`；§6.2/§9）。
 - [x] 冻结文本的**逐字粘贴**校验：写入后核对 hash，与产线脚本里那份一致。
 - [x] 修改已被剧集引用的设定时创建新版本。
 
