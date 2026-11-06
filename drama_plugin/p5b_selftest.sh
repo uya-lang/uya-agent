@@ -83,6 +83,21 @@ assert d['canon_revision'] == 0, d
 print('PASS: 剧本版本 1、时长 %d ms、Canon 仍是 revision 0' % d['duration_ms'])
 " || bad "生成结果字段不对"
 
+python3 - "$DATA/projects/$PID/scripts/v1.json" <<'PY'
+import json
+import sys
+
+d = json.load(open(sys.argv[1]))
+sp = d.get('screenplay', d)
+assert sp['theme'] and sp['conflict'] and sp['twist'], sp
+assert sp['comedy']['setup'] and sp['comedy']['payoff'], sp
+sc = sp['scenes'][0]
+assert sc['action'] and sc['dialogue'][0]['line'], sp
+print('PASS: 剧本带主题/冲突/反转/喜剧结构 + 对白/动作')
+PY
+[ $? -eq 0 ] || fails=$((fails + 1))
+
+
 out=$(ask "$(cat <<JSON
 {"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"call","arguments":{"operation":"canon.inspect","input":{"project_id":"$PID"}}}}
 JSON

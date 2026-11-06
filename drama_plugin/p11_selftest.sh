@@ -239,6 +239,33 @@ print('PASS: budget.report（%d 集 / %d 次渲染 / %d ms GPU / 每集 %.2f 次
 # ---------- 5. 落盘检查 ----------
 n=$(ls "$DATA/projects/$PID/assemblies"/v*.json 2>/dev/null | wc -l)
 [ "$n" -eq 3 ] && ok "三份合成 manifest 都在" || bad "manifest 数量是 $n"
+python3 - "$DATA/projects/$PID/assemblies" <<'PY'
+import glob
+import json
+import sys
+
+files = sorted(glob.glob(sys.argv[1] + '/v*.json'))
+ok, fails = [], []
+
+
+def check(c, m):
+    (ok if c else fails).append(m)
+
+
+for f in files:
+    d = json.load(open(f))
+    frames = d['frames']
+    check(d['fps'] == 25, 'manifest 写 25 fps')
+    check((frames - 5) % 17 == 0, '帧数满足 17k+5（%d）' % frames)
+    check(frames * 40 >= d['duration_ms'], '帧覆盖住总时长')
+for m in ok:
+    print('PASS: ' + m)
+for m in fails:
+    print('FAIL: ' + m)
+sys.exit(1 if fails else 0)
+PY
+[ $? -eq 0 ] || fails=$((fails + 1))
+
 n=$(ls "$DATA/projects/$PID/scripts"/v*.json 2>/dev/null | wc -l)
 [ "$n" -eq 3 ] && ok "三个剧本版本都在" || bad "剧本版本数量是 $n"
 n=$(ls "$DATA/projects/$PID/assets"/episode_*.mp4 2>/dev/null | wc -l)

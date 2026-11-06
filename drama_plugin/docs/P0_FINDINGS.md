@@ -51,6 +51,6 @@
 | 能力 | 状态 | 替代 |
 | --- | --- | --- |
 | 真实视频 Provider | 不可用（无凭据） | mock 镜头 + 本地拼接（`media.assemble`），`p13c` 压到 10 集 |
-| ASR 对齐 | 不可用 | 字幕按镜头时长均分（`media.subtitle`），口径写在 `DRAMA_OPERATIONS.md` |
-| 画布 32 倍数 / `17k+5` 帧 | 只做校验，不做编码 | `media.encode` 只透传参数并回 `MEDIA_MISMATCH` |
+| ASR 对齐 | 引擎不可用；判定已实现（`qa.align`，转录文本由外部给） | 字幕按镜头时间轴生成（`media.subtitle`）；相似度阈值 85% |
+| 画布 32 倍数 / `17k+5` 帧 | manifest 记 25 fps 与 `17k+5` 帧（`assemble`）；不做真实编码 | `media.encode` 只透传参数并回 `MEDIA_MISMATCH` |
 | TLS 经代理（CONNECT） | 未做 | 走代理只支持明文 HTTP，TLS+代理直接回 `PROXY_TLS_UNSUPPORTED`（p5f） |

@@ -1110,6 +1110,11 @@ outline_version, episode}`：剧本必须能追到**已批准**的大纲版本�
 `payoff_rate_pct = closed*100/(closed+overdue)` 就基于这本账；`hook_<N>`
 开满 3 集还没回收才算逾期（p6 / p12）。
 
+**剧本字段**（生成模板与 `story.review` 共用一套口径）：`theme`（主题）、
+`conflict`（冲突）、`comedy.{setup,payoff}`（喜剧结构）、`twist`（结尾反转）、
+`title`、`hook`、`scenes[].action` / `scenes[].dialogue[]`、`candidate_events`。
+审查只报问题，不拦批准；批不批仍看 `story_validate` 的结构硬校验（p5b）。
+
 判据：观众已知而角色未知 ⇒ 允许（制造信息差）；角色已知而观众未知 ⇒
 必须在后续镜头补揭示，否则审核报 `KNOWLEDGE_LEAK`。
 
