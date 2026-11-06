@@ -212,6 +212,39 @@ print('PASS: 剧本记录追到 outline v2 / 第 1 集')
 PY
 [ $? -eq 0 ] || fails=$((fails + 1))
 
+# ---------- 7. 剧本加了大纲外的承诺 ⇒ 写回大纲并升版本 ----------
+mkdir -p "$DATA/projects/$PID/scripts"
+cat > "$DATA/projects/$PID/scripts/v3.json" <<JSON
+{"format_version":1,"version":3,"content_hash":"x","screenplay":{"title":"加戏","theme":"信任","conflict":"秘密被藏起来","comedy":{"setup":"藏信","payoff":"信被找到"},"twist":"秘密是爸爸的","hook":"这封信是谁写的？","scenes":[{"no":1,"action":"爸爸把信塞进抽屉","dialogue":[]}],"candidate_events":[{"type":"timeline.advance","minutes":1},{"type":"promise.open","promise":"secret_letter"}]}}
+JSON
+out=$(ask "$(cat <<JSON
+{"jsonrpc":"2.0","id":13,"method":"tools/call","params":{"name":"call","arguments":{"operation":"episode.approve","input":{"project_id":"$PID","script_version":3}}}}
+JSON
+)")
+[ "$(code_of "$out")" = "OK" ] && ok "带额外承诺的剧本批准成功" \
+    || bad "带额外承诺的剧本没批成（$(code_of "$out")）"
+
+out=$(ask "$(cat <<JSON
+{"jsonrpc":"2.0","id":14,"method":"tools/call","params":{"name":"call","arguments":{"operation":"series.get","input":{"project_id":"$PID"}}}}
+JSON
+)")
+printf '%s' "$out" | field | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+assert d['version'] == 3, d
+print('PASS: 大纲升到 v3（写回新承诺）')" || bad "大纲没升版本"
+
+grep -q "secret_letter" "$DATA/projects/$PID/series/amendments.jsonl" \
+    && ok "承诺记进 amendments.jsonl" || bad "amendments 没有新承诺"
+
+out=$(ask "$(cat <<JSON
+{"jsonrpc":"2.0","id":15,"method":"tools/call","params":{"name":"call","arguments":{"operation":"episode.generate","input":{"project_id":"$PID"}}}}
+JSON
+)")
+[ "$(code_of "$out")" = "OUTLINE_NOT_APPROVED" ] \
+    && ok "升版本后旧批准失效，必须重新批准大纲" \
+    || bad "升版本后没拦住（$(code_of "$out")）"
+
 echo "----"
 if [ "$fails" -eq 0 ]; then
     echo "PASS: P5 系列层（百集大纲与批准）"

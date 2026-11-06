@@ -599,7 +599,11 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
       笑点配额、场次、涉及角色/场景/道具。
 - [x] `series.plan(total_episodes=100)` 一次生成完整大纲（100 集 5 ms）。
 - [x] `outline.approve` 批准大纲；未批准则 `episode.generate` 拒绝执行。
-- [ ] 剧本必须能追到 `EpisodeOutline`；大纲外新增承诺 ⇒ 审批时写回大纲升版本。
+- [x] 剧本必须能追到 `EpisodeOutline`；大纲外新增承诺 ⇒ 审批时写回大纲升版本
+      （`scripts/approved.json` 记 `outline_version`/`episode`/`review_id`；
+      剧本里有非 `hook_<N>` 的 `promise.open` 时，审批写
+      `series/amendments.jsonl` 并把大纲版本 +1，旧批准因版本不匹配失效；
+      p5e 三条断言）。
 - [x] 大纲变更直接作废旧批准（要重新批才算数）；
       逐集 `needs_revalidation` 标记还没做。
 

@@ -1110,6 +1110,10 @@ outline_version, episode}`：剧本必须能追到**已批准**的大纲版本�
 `payoff_rate_pct = closed*100/(closed+overdue)` 就基于这本账；`hook_<N>`
 开满 3 集还没回收才算逾期（p6 / p12）。
 
+**大纲外承诺**：剧本自己加的 `promise.open`（不是 `hook_<N>`）会在批准时
+写进 `series/amendments.jsonl`，并把 `series/outline.json` 的 `version` +1；
+旧 `approved.json` 版本对不上，逐集生成立刻停（必须重新 `outline.approve`）。
+
 **剧本字段**（生成模板与 `story.review` 共用一套口径）：`theme`（主题）、
 `conflict`（冲突）、`comedy.{setup,payoff}`（喜剧结构）、`twist`（结尾反转）、
 `title`、`hook`、`scenes[].action` / `scenes[].dialogue[]`、`candidate_events`。
