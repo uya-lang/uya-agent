@@ -169,6 +169,24 @@ assert d['recent_summaries'] == [], d
 assert d['canon_revision'] == 2, d
 print('PASS: 预算不够时先丢摘要并标 truncated')" || bad "裁剪行为不对"
 
+# ---------- 6. 只带最近 5 集摘要 ----------
+for i in 2 3 4 5 6 7; do
+    printf '%s\n' "{\"episode\":$i,\"title\":\"第 $i 集\",\"hook\":\"h$i\"}" \
+        >> "$DATA/projects/$PID/summaries.jsonl"
+done
+out=$(ask "$(cat <<JSON
+{"jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"call","arguments":{"operation":"context.inspect","input":{"project_id":"$PID"}}}}
+JSON
+)")
+printf '%s' "$out" | field | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+s=d['recent_summaries']
+assert len(s) == 5, d
+assert [x['episode'] for x in s] == [3, 4, 5, 6, 7], d
+print('PASS: 摘要窗口只保留最近 5 集（%s）' % [x['episode'] for x in s])" \
+    || bad "摘要窗口不对"
+
 echo "----"
 if [ "$fails" -eq 0 ]; then
     echo "PASS: P5 第三段（上下文组装）"
