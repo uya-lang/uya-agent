@@ -454,10 +454,10 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 
 ## 动态状态
 
-- [ ] 定义 CharacterState。
-- [ ] 定义 SceneState。
-- [ ] 定义 PropState。
-- [ ] 定义 CharacterKnowledge。
+- [x] 定义 CharacterState（`CharSlot`：位置 + 在场校验；p4 状态槽断言）。
+- [x] 定义 SceneState（`SceneSlot`：时段 + 变体；p4 断言 living_room 时段）。
+- [x] 定义 PropState（`PropSlot`：所在场景 + 持有者；p4 断言 remote 在厨房冰箱手里）。
+- [x] 定义 CharacterKnowledge（`CharSlot.knows` + `knowledge.grant` 在场校验；越界回 KNOWLEDGE_LEAK，p12b）。
 - [ ] 定义 AudienceKnowledge。
 - [ ] 定义 RunningGag。
 - [ ] 定义 Foreshadowing。

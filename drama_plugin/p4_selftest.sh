@@ -213,6 +213,30 @@ sys.exit(0 if ok else 1)
 PY
 [ $? -eq 0 ] || fails=$((fails + 1))
 
+# ---------- 6.2 状态槽：人物/场景/道具/知识 ----------
+out=$(ask "$(cat <<JSON
+{"jsonrpc":"2.0","id":30,"method":"tools/call","params":{"name":"call","arguments":{"operation":"canon.inspect","input":{"project_id":"$PID"}}}}
+JSON
+)" 2>/dev/null)
+printf '%s' "$out" | python3 -c "
+import json,sys
+raw=[l for l in sys.stdin.read().split(chr(10)) if l.strip()]
+o=json.loads(raw[0])
+t=json.loads(o['result']['content'][0]['text'])['data']['result']
+st=t.get('state',t)
+loc={}
+for c in st.get('characters',[]):
+    loc[c['name']]=c
+assert loc['dad']['scene'] == 'living_room', loc['dad']
+assert 'knows' in loc['dad'], loc['dad']
+props={p['name']:p for p in st.get('props',[])}
+assert props['remote']['holder'] == 'fridge', props['remote']
+assert props['remote']['scene'] == 'kitchen', props['remote']
+scenes={s['name']:s for s in st.get('scenes',[])}
+assert scenes['living_room']['time_of_day'] == 'day', scenes['living_room']
+print('PASS: 人物位置 / 人物知识槽 / 道具位置 / 场景时段都落盘')" \
+    || bad "状态槽不对"
+
 # ---------- 6.5 损坏的 canon.json（缺 revision）也能恢复 ----------
 printf '%s' '{"format_version":1}' > "$DATA/projects/$PID/canon.json"
 out=$(ask "$(cat <<JSON
