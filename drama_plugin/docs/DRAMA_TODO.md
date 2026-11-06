@@ -499,7 +499,9 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 - [x] 定义 Canon revision。
 - [x] 实现当前状态读取。
 - [x] 实现候选状态生成。
-- [ ] 实现候选状态差异比较。
+- [x] 实现候选状态差异比较（`canon.diff`：在内存副本上预演事件，返回
+      from_revision/events/delta{characters,props,scenes,promises,rules,
+      timeline_min}；非法事件与提交同样被拒；不落盘；p4）。
 - [x] 实现不可变 Commit Record。
 - [x] 实现单项目写入锁（O_EXCL 锁文件 + pid 探活）。
 - [x] 锁文件写 `{pid, host, acquired_at, purpose}`；抢锁失败按
@@ -530,7 +532,7 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 - [x] 注册 continuity.inspect：`op_continuity_inspect` 复用 `audit_run`，
       返回账本、不变量与全历史重放结果（旧版只登记了名字，调用会报缺字段）。
 - [x] 在 episode.approve(screenplay) 内部执行事件验证和 Canon 提交（`story_validate` → `canon_commit` → `approved.json`；p5b）。
-- [x] 不提供绕过校验的外部状态写入入口（56 个操作里没有通用写文件/写状态；
+- [x] 不提供绕过校验的外部状态写入入口（57 个操作里没有通用写文件/写状态；
       Canon 只能经 `canon.commit` 逐事件校验，剧本只能经 approve 提交）。
 
 ## 验收
@@ -1217,7 +1219,7 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 
 # 16. 操作目录与测试覆盖矩阵
 
-**已实现的 56 个操作**（`registry.uya` 是唯一来源；`describe` 就是从这张表
+**已实现的 57 个操作**（`registry.uya` 是唯一来源；`describe` 就是从这张表
 生成的）。"覆盖脚本"列是能跑到它的自测，空着表示只有间接覆盖。
 
 | 操作 | 阶段 | 权限 | 覆盖脚本 |
@@ -1271,6 +1273,7 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 | production.report | P13 | read | p13c |
 | index.rebuild | P13 | write | p13b |
 | qa.align | P7 | read | p7 |
+| canon.diff | P4 | read | p4 |
 | index.list | P13 | read | p13b |
 | series.plan | P5 | write | p5e |
 | outline.approve | P5 | write | p5e |

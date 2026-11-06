@@ -352,6 +352,54 @@ assert r['event_ids'] == ['r4#0', 'r4#1'], r
 print('PASS: 事件唯一 ID 形如 r<revision>#<序号>（%s）' % r['event_ids'])" \
     || bad "事件 ID 不对"
 
+# ---------- 8. 候选状态差异（canon.diff：预演一遍，不落盘） ----------
+printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":20,\"method\":\"tools/call\",\"params\":{\"name\":\"call\",\"arguments\":{\"operation\":\"canon.diff\",\"input\":{\"project_id\":\"$PID\",\"events\":[{\"type\":\"timeline.advance\",\"minutes\":5}]}}}}" \
+    > "$TMP/d1.jsonl"
+run < "$TMP/d1.jsonl" > "$TMP/d1.out" 2>/dev/null || true
+python3 - "$TMP/d1.out" <<'PY'
+import json
+import sys
+
+o = json.loads(open(sys.argv[1]).read().strip().split('\n')[0])
+t = json.loads(o['result']['content'][0]['text'])
+r = t['data']['result']
+assert r['ok'] is True, r
+assert r['from_revision'] == 4, r
+assert r['events'] == 1, r
+assert r['delta']['timeline_min'] == 5, r
+print('PASS: canon.diff 预演 5 分钟 ⇒ timeline +5 min')
+PY
+[ $? -eq 0 ] || bad "canon.diff 差异不对"
+
+printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":21,\"method\":\"tools/call\",\"params\":{\"name\":\"call\",\"arguments\":{\"operation\":\"canon.diff\",\"input\":{\"project_id\":\"$PID\",\"events\":[{\"type\":\"no.such.event\"}]}}}}" \
+    > "$TMP/d2.jsonl"
+run < "$TMP/d2.jsonl" > "$TMP/d2.out" 2>/dev/null || true
+python3 - "$TMP/d2.out" <<'PY'
+import json
+import sys
+
+o = json.loads(open(sys.argv[1]).read().strip().split('\n')[0])
+t = json.loads(o['result']['content'][0]['text'])
+assert t['error']['code'] == 'UNKNOWN_OPERATOR', t
+print('PASS: canon.diff 里非法事件同样被拒（UNKNOWN_OPERATOR）')
+PY
+[ $? -eq 0 ] || bad "canon.diff 没拦非法事件"
+
+printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":22,\"method\":\"tools/call\",\"params\":{\"name\":\"call\",\"arguments\":{\"operation\":\"canon.diff\",\"input\":{\"project_id\":\"$PID\",\"events\":[]}}}}" \
+    > "$TMP/d3.jsonl"
+run < "$TMP/d3.jsonl" > "$TMP/d3.out" 2>/dev/null || true
+python3 - "$TMP/d3.out" <<'PY'
+import json
+import sys
+
+o = json.loads(open(sys.argv[1]).read().strip().split('\n')[0])
+t = json.loads(o['result']['content'][0]['text'])
+r = t['data']['result']
+assert r['from_revision'] == 4, r
+print('PASS: 预演不落盘（revision 仍是 4）')
+PY
+[ $? -eq 0 ] || bad "canon.diff 动了状态"
+
 echo "----"
 if [ "$fails" -eq 0 ]; then
     echo "PASS: P4（Canon 提交 / 不变量 / 锁 / 恢复）"
