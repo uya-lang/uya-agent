@@ -947,6 +947,10 @@ Bible 具有版本号。每集生成时固定引用一个 Bible 版本，不能�
 
 已批准对象不可原地修改。重写必须生成新版本，并重新审核。
 
+剧本批准时 `scripts/approved.json` 记 `{script_version, canon_revision,
+outline_version, episode}`：剧本必须能追到**已批准**的大纲版本（没有大纲时
+`outline_version=0`，单集仍可跑）。
+
 ## 6.8 分镜与接戏模型（1.2 新增）
 
 `Storyboard`：本集镜头序列 + 时间轴；`Shot` 至少包含：

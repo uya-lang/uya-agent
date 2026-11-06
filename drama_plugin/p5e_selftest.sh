@@ -165,6 +165,39 @@ JSON
 [ "$(code_of "$out")" = "OUTLINE_NOT_APPROVED" ] \
     && ok "改大纲后必须先重新批准" || bad "改大纲后没拦住"
 
+# ---------- 6. 剧本追到批准的大纲 ----------
+out=$(ask "$(cat <<JSON
+{"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"call","arguments":{"operation":"outline.approve","input":{"project_id":"$PID"}}}}
+JSON
+)")
+[ "$(code_of "$out")" = "OK" ] && ok "v2 大纲重新批准" || bad "v2 大纲批准失败"
+
+out=$(ask "$(cat <<JSON
+{"jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"call","arguments":{"operation":"episode.generate","input":{"project_id":"$PID"}}}}
+JSON
+)")
+SV=$(printf '%s' "$out" | field | python3 -c "
+import json,sys
+print(json.load(sys.stdin)['script_version'])")
+
+out=$(ask "$(cat <<JSON
+{"jsonrpc":"2.0","id":12,"method":"tools/call","params":{"name":"call","arguments":{"operation":"episode.approve","input":{"project_id":"$PID","script_version":$SV}}}}
+JSON
+)")
+[ "$(code_of "$out")" = "OK" ] && ok "剧本批准成功" || bad "剧本批准失败"
+
+python3 - "$DATA/projects/$PID/scripts/approved.json" <<'PY'
+import json
+import sys
+
+d = json.load(open(sys.argv[1]))
+assert d['outline_version'] == 2, d
+assert d['episode'] == 1, d
+assert d['canon_revision'] == 1, d
+print('PASS: 剧本记录追到 outline v2 / 第 1 集')
+PY
+[ $? -eq 0 ] || fails=$((fails + 1))
+
 echo "----"
 if [ "$fails" -eq 0 ]; then
     echo "PASS: P5 系列层（百集大纲与批准）"
