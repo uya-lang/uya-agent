@@ -933,10 +933,10 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 ## 验收
 
 - [x] 能发现明显素材缺失/损坏。
-- [ ] 能记录人物/道具连续性问题。
+- [x] 能记录人物/道具连续性问题（审计违规带 object；p12b）。
 - [x] 能仅重做一个不合格镜头（p10：改写 shot_2 后 `shot.retry` 恢复 256 B）。
 - [x] 达到重试上限会停止并说明原因（预算熔断回 BUDGET_EXCEEDED；p10）。
-- [ ] QA 失败的成片不能标记为 final approved。
+- [x] QA 失败的成片不能标记为 final approved（`final.approve`：无绿报告/无成片回 QA_FAILED；p11）。
 
 ---
 
@@ -1205,7 +1205,7 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 
 # 16. 操作目录与测试覆盖矩阵
 
-**已实现的 53 个操作**（`registry.uya` 是唯一来源；`describe` 就是从这张表
+**已实现的 54 个操作**（`registry.uya` 是唯一来源；`describe` 就是从这张表
 生成的）。"覆盖脚本"列是能跑到它的自测，空着表示只有间接覆盖。
 
 | 操作 | 阶段 | 权限 | 覆盖脚本 |
@@ -1251,6 +1251,7 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 | media.mix | P10 | write | p10 |
 | media.loudnorm | P10 | write | p10 |
 | shot.retry | P9 | write | p10 |
+| final.approve | P11 | write | p11 |
 | project.migrate | P3 | write | p3 |
 | episode.batch | P13 | write | p9 |
 | budget.report | P13 | read | p11 |

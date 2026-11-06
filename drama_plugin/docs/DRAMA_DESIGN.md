@@ -712,7 +712,7 @@ operation.dispatch
 ### 5.0 上表的实现对照（1.17）
 
 首版实现把上表**拆细**了：粒度更小、每个操作只做一件事，方便校验与重放。
-完整清单（53 个）在 `DRAMA_TODO.md` §16，唯一来源是 `src/registry.uya`。
+完整清单（54 个）在 `DRAMA_TODO.md` §16，唯一来源是 `src/registry.uya`。
 
 | 设计里的操作 | 实现成 |
 |---|---|

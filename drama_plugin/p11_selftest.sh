@@ -162,6 +162,33 @@ assert d['report']['script_version'] == 1, d
 print('PASS: 第 1 集 QA 全绿（自动选了映射到剧本 v1 的分镜 v1）')" \
     || bad "第 1 集 QA 没绿"
 
+# ---------- 4.5 final.approve：QA 绿才放行，且不动 Canon ----------
+out=$(ask "$(cat <<JSON
+{"jsonrpc":"2.0","id":62,"method":"tools/call","params":{"name":"call","arguments":{"operation":"final.approve","input":{"project_id":"$PID","script_version":1}}}}
+JSON
+)")
+printf '%s' "$out" | field | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+assert d['approved'] is True, d
+assert d['script_version'] == 1, d
+assert d['board_version'] == 1, d
+assert d['assembly_version'] == 3, d
+assert d['canon_revision'] == 3, d
+print('PASS: 第 1 集成片通过 final.approve（Canon 仍 r3）')" \
+    || bad "final.approve 没放行"
+
+out=$(ask "$(cat <<JSON
+{"jsonrpc":"2.0","id":63,"method":"tools/call","params":{"name":"call","arguments":{"operation":"final.approve","input":{"project_id":"$PID","script_version":2}}}}
+JSON
+)")
+printf '%s' "$out" | field | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+assert d['code'] == 'QA_FAILED', d
+print('PASS: 没有 QA 报告的剧本版本被 final.approve 拒（QA_FAILED）')" \
+    || bad "QA 未过的版本被标成 final approved"
+
 out=$(ask "$(cat <<JSON
 {"jsonrpc":"2.0","id":61,"method":"tools/call","params":{"name":"call","arguments":{"operation":"canon.audit","input":{"project_id":"$PID"}}}}
 JSON
