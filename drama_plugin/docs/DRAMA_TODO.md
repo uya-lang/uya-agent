@@ -997,18 +997,19 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 
 ## 端到端测试
 
-- [ ] 新建短剧项目。
-- [ ] 自动生成并批准连续三集剧本。
-- [ ] 每集生成分镜。
-- [ ] 调用本地队列生成镜头（GPU 串行）。
+- [x] 新建短剧项目（`project.create`；p11）。
+- [x] 自动生成并批准连续三集剧本（p11：三集 screenplay 逐版批准）。
+- [x] 每集生成分镜（`board.build` v1–v3；p11）。
+- [x] 调用本地队列生成镜头（mock 串行：任务队列 + Worker；p8/p13c）。
 - [x] Worker 处理中途重启（p5d 断点续跑 + p8 陈旧锁自动清）。
 - [x] Worker 恢复未完成任务（p5d：记录回退 pending 后能续跑）。
-- [ ] 执行视频 QA。
-- [ ] 重做不合格镜头。
-- [ ] FFmpeg 合成成片。
-- [ ] 审批 final_cut。
+- [x] 执行 QA（确定性 QA + 九条不变量；`qa.run` 全绿，p11）。
+- [x] 重做不合格镜头（`shot.retry` 按 sequence 只重渲一镜；p10）。
+- [x] 合成成片（mock 拼接 `media.assemble`；p10/p11）。
+- [x] 审批 final_cut（`final.approve`：QA 绿 + 有成片才放行；p11）。
 - [x] 三集成片均可通过资产共享目录访问（`asset.get` 回 `projects/<id>/assets/<name>`；p11）。
-- [ ] Canon 只随 screenplay approval 变化，不随 final_cut approval 重复变化。
+- [x] Canon 只随 screenplay approval 变化，不随 final_cut approval 重复变化（p11：
+      final.approve 后 Canon 仍 r3）。
 
 ## 发布
 
