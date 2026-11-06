@@ -1059,6 +1059,40 @@ Bible 具有版本号。每集生成时固定引用一个 Bible 版本，不能�
 
 ---
 
+## 6.12 剧本子结构与观众知识（1.2 补）
+
+剧本里的六类子结构都用**普通 JSON 字段**表达，不引入新文件格式：
+
+| 结构 | 字段 | 备注 |
+|---|---|---|
+| `StoryConcept` | `logline` / `theme` / `tone` / `hook_type` | 立项时定，进 `series.plan` |
+| `Conflict` | `id` / `parties` / `stake` / `escalation[]` | 升级链每一步都要能被演出来 |
+| `StoryBeat` | `beat_no` / `function` / `action` / `turn` | 分镜的 `beat` 字段直接引用 `beat_no` |
+| `ComedyBeat` | `kind` / `setup` / `punchline` / `callback_to` | 大纲 `comedy_beat:true` 与之一致 |
+| `Dialogue` | `who` / `line` / `subtext` / `gag_id?` | `line` 逐字，字幕与 ASR 都以它为准 |
+| `Action` | `text` / `visible` / `forbidden_check` | 只写模型演得出来的动作 |
+
+`EpisodeSummary`（每集一条，写 `summaries.jsonl`）：
+
+- `episode`：集号（= 该集 Canon revision）；
+- `script_version`：来源剧本版本；
+- `title` / `hook`：标题与本集钩子；
+- `scenes`：场次数；
+- `duration_ms`：确定性时长估算（对白 4 字/秒 + 标点 0.3 s）。
+
+摘要只做"上下文窗口里的索引"，不承担校验职责；被裁掉时上下文里记
+`truncated:["summaries"]`。
+
+**观众知识**（`AudienceKnowledge`）与角色知识分开记：
+
+- 事实 ID（复用 Canon 事件里的 `fact_id`）；
+- 首次让观众知道的集与镜头；
+- 观众已知 / 角色已知（按角色 ID 分别记）；
+- 是否被揭示、是否被误信。
+
+判据：观众已知而角色未知 ⇒ 允许（制造信息差）；角色已知而观众未知 ⇒
+必须在后续镜头补揭示，否则审核报 `KNOWLEDGE_LEAK`。
+
 # 7. 剧情 Canon 与视频生产的一致性
 
 这是首版必须遵循的核心规则。

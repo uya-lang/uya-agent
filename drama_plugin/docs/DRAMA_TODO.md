@@ -460,9 +460,9 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 - [x] 定义 SceneState（`SceneSlot`：时段 + 变体；p4 断言 living_room 时段）。
 - [x] 定义 PropState（`PropSlot`：所在场景 + 持有者；p4 断言 remote 在厨房冰箱手里）。
 - [x] 定义 CharacterKnowledge（`CharSlot.knows` + `knowledge.grant` 在场校验；越界回 KNOWLEDGE_LEAK，p12b）。
-- [ ] 定义 AudienceKnowledge。
-- [ ] 定义 RunningGag。
-- [ ] 定义 Foreshadowing。
+- [x] 定义 AudienceKnowledge（事实 ID + 首次揭示集/镜 + 观众/角色分别记；§6.12）。
+- [x] 定义 RunningGag（长期梗：ID/引入集/出现集数/回收；§6.6）。
+- [x] 定义 Foreshadowing（ID/引入事件/计划回收/实际回收/可延期；§6.6）。
 - [x] 定义 CanonSnapshot。
 
 ## 事件
@@ -621,15 +621,16 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 
 ## Story 模型
 
-- [ ] 定义 StoryConcept。
-- [ ] 定义 Conflict。
-- [ ] 定义 StoryBeat。
-- [ ] 定义 ComedyBeat。
-- [ ] 定义 Dialogue。
-- [ ] 定义 Action。
+- [x] 定义 StoryConcept（`logline/theme/tone/hook_type`；§6.12）。
+- [x] 定义 Conflict（`parties/stake/escalation[]`；§6.12）。
+- [x] 定义 StoryBeat（`beat_no/function/action/turn`，与分镜 `beat` 对齐；§6.12）。
+- [x] 定义 ComedyBeat（`kind/setup/punchline/callback_to`；§6.12）。
+- [x] 定义 Dialogue（`who/line/subtext/gag_id?`，`line` 逐字；§6.12）。
+- [x] 定义 Action（`text/visible/forbidden_check`；§6.12）。
 - [x] 定义 Screenplay。
 - [x] 定义 CandidateEventSet。
-- [ ] 定义 EpisodeSummary。
+- [x] 定义 EpisodeSummary 并落盘（`episode` / `script_version` / `title` / `hook` / `scenes` /
+      `duration_ms`；p6 断言）。
 
 ## 上下文组装
 

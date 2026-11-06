@@ -130,6 +130,10 @@ sums = [l for l in open(os.path.join(base, 'summaries.jsonl'),
 check(len(sums) == 3, '摘要正好三条（每集一条）')
 eps = [json.loads(s)['episode'] for s in sums]
 check(eps == [1, 2, 3], '摘要里的集号连续')
+det = [json.loads(s) for s in sums]
+check(all(d.get('scenes', 0) >= 1 for d in det), '摘要记了镜头段数（scenes）')
+check(all(d.get('duration_ms', 0) > 0 for d in det), '摘要记了时长（duration_ms）')
+check(all(d.get('title') and d.get('hook') for d in det), '摘要带标题与钩子')
 
 bible = json.load(open(os.path.join(base, 'bible', 'current.json')))
 check(bible.get('version') == 1, 'Bible 版本没被剧本写坏')
