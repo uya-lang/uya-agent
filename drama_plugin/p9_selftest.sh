@@ -123,7 +123,7 @@ print('PASS: production.status 能查到 queued 的任务与 worker 状态')" ||
 
 # ---------- 3.5 批量投 N 集 ----------
 out=$(ask "$(cat <<JSON
-{"jsonrpc":"2.0","id":40,"method":"tools/call","params":{"name":"call","arguments":{"operation":"episode.batch","input":{"project_id":"$PID","episodes":"e10,e11,e12","priority":5,"deadline_s":$(( $(date +%s) - 60 ))}}}}
+{"jsonrpc":"2.0","id":40,"method":"tools/call","params":{"name":"call","arguments":{"operation":"episode.batch","input":{"project_id":"$PID","episodes":"e10,e11,e12","priority":5,"deadline_s":$(( $(date +%s) + 3600 ))}}}}
 JSON
 )")
 printf '%s' "$out" | field | python3 -c "
@@ -150,6 +150,14 @@ assert d['episode_id'] == 'e10', d
 print('PASS: 批量任务记录里带 priority 与 episode_id')" \
     || bad "批量任务记录不对"
 
+# ---------- 3.6 过了截止时间的任务不再跑 ----------
+out=$(ask "$(cat <<JSON
+{"jsonrpc":"2.0","id":43,"method":"tools/call","params":{"name":"call","arguments":{"operation":"episode.batch","input":{"project_id":"$PID","episodes":"e13","deadline_s":$(( $(date +%s) - 60 ))}}}}
+JSON
+)")
+TID_LATE=$(printf '%s' "$out" | field | python3 -c "
+import json,sys
+print(json.load(sys.stdin)['episodes'][0])")
 out=$(ask "$(cat <<JSON
 {"jsonrpc":"2.0","id":42,"method":"tools/call","params":{"name":"call","arguments":{"operation":"production.report","input":{"project_id":"$PID"}}}}
 JSON
@@ -157,8 +165,21 @@ JSON
 printf '%s' "$out" | field | python3 -c "
 import json,sys
 d=json.load(sys.stdin)
-assert d['tasks_overdue'] == 3, d
-print('PASS: 过了截止时间的 3 个任务被计为逾期')" || bad "逾期统计不对"
+assert d['tasks_overdue'] == 1, d
+print('PASS: 过了截止时间的任务被计为逾期')" || bad "逾期统计不对"
+
+timeout 120 "$TMP/drama" worker run --data-dir "$DATA" > /dev/null 2>&1 || true
+out=$(ask "$(cat <<JSON
+{"jsonrpc":"2.0","id":44,"method":"tools/call","params":{"name":"call","arguments":{"operation":"production.status","input":{"project_id":"$PID","task_id":"$TID_LATE"}}}}
+JSON
+)")
+printf '%s' "$out" | field | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+assert d['state'] == 'failed', d
+assert d['reason'] == 'deadline_exceeded', d
+print('PASS: 逾期任务被 worker 记 failed/deadline_exceeded')" \
+    || bad "逾期任务没被拦下"
 
 # ---------- 4. 失败 → 重试 → worker 跑通，且不动 Canon ----------
 printf '%s' '{"format_version":1,"version":3,"content_hash":"z","screenplay":{"title":"v3","hook":"h","scenes":[{"no":1,"action":"冰箱爆炸了","dialogue":[]}]}}' \
