@@ -107,6 +107,7 @@ check(led['scenes'] == 3, '场景账本正确')
 check(led['promises_open'] == 0, '没有未回收的承诺')
 check(led['promises_closed'] == 1, '已回收承诺 1 条')
 check(led['promises_overdue'] == 0, '没有逾期承诺')
+check(led['payoff_rate_pct'] == 100, '承诺回收率 100%')
 check(led['timeline_ms'] == 30, '时间轴账本 = 30 分钟')
 for m in ok:
     print('PASS: ' + m)
@@ -132,6 +133,7 @@ codes={v['code'] for v in d['violations']}
 assert d['ok'] is False, d
 assert 'PROMISE_OVERDUE' in codes, codes
 assert d['ledger']['promises_overdue'] == 1, d
+assert d['ledger']['payoff_rate_pct'] == 50, d
 print('PASS: 逾期承诺被记成 PROMISE_OVERDUE 违规')" || bad "逾期没进违规列表"
 
 # ---------- 3. 审计只读 ----------
