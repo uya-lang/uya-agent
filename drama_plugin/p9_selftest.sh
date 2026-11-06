@@ -295,6 +295,53 @@ assert d['state'] == 'failed' and d['reason'] == 'budget_exceeded', d
 print('PASS: 超预算的任务被熔断（budget_exceeded），没有硬跑')" \
     || bad "预算熔断没生效"
 
+# ---------- 抽样审批队列 ----------
+out=$(ask "$(cat <<JSON
+{"jsonrpc":"2.0","id":51,"method":"tools/call","params":{"name":"call","arguments":{"operation":"review.queue","input":{"project_id":"$PID"}}}}
+JSON
+)")
+printf '%s' "$out" | field | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+assert isinstance(d['sample'], list), d
+assert isinstance(d['anomalies'], list), d
+assert d['decided'] == 0, d
+print('PASS: 审批队列（抽样 %d 条 / 异常 %d 条）'
+      % (len(d['sample']), len(d['anomalies'])))" \
+    || bad "审批队列不对"
+
+out=$(ask "$(cat <<JSON
+{"jsonrpc":"2.0","id":52,"method":"tools/call","params":{"name":"call","arguments":{"operation":"review.decide","input":{"project_id":"$PID","episode_id":"e13","decision":"reject","note":"重看第三镜"}}}}
+JSON
+)")
+printf '%s' "$out" | field | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+assert d['recorded'] is True and d['decision'] == 'reject', d
+print('PASS: 抽样裁决已记录（e13 reject）')" || bad "裁决没记下来"
+
+out=$(ask "$(cat <<JSON
+{"jsonrpc":"2.0","id":53,"method":"tools/call","params":{"name":"call","arguments":{"operation":"review.queue","input":{"project_id":"$PID"}}}}
+JSON
+)")
+printf '%s' "$out" | field | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+assert d['decided'] == 1, d
+print('PASS: 队列里能看到已裁决 1 条')" || bad "已裁决计数不对"
+
+out=$(ask "$(cat <<JSON
+{"jsonrpc":"2.0","id":54,"method":"tools/call","params":{"name":"call","arguments":{"operation":"review.decide","input":{"project_id":"$PID","episode_id":"e13","decision":"maybe"}}}}
+JSON
+)")
+got=$(printf '%s' "$out" | field | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+print(d.get('code','OK'))")
+[ "$got" = "SCHEMA_INVALID" ] \
+    && ok "非法裁决被拒（SCHEMA_INVALID）" \
+    || bad "非法裁决没拦住（$got）"
+
 echo "----"
 if [ "$fails" -eq 0 ]; then
     echo "PASS: P9 第一段（确定性 QA / 生产状态 / 重试）"

@@ -532,7 +532,7 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 - [x] 注册 continuity.inspect：`op_continuity_inspect` 复用 `audit_run`，
       返回账本、不变量与全历史重放结果（旧版只登记了名字，调用会报缺字段）。
 - [x] 在 episode.approve(screenplay) 内部执行事件验证和 Canon 提交（`story_validate` → `canon_commit` → `approved.json`；p5b）。
-- [x] 不提供绕过校验的外部状态写入入口（58 个操作里没有通用写文件/写状态；
+- [x] 不提供绕过校验的外部状态写入入口（60 个操作里没有通用写文件/写状态；
       Canon 只能经 `canon.commit` 逐事件校验，剧本只能经 approve 提交）。
 
 ## 验收
@@ -1185,7 +1185,9 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 - [x] 一次投 N 集、优先级、截止时间（`episode.batch`：逗号分隔集号 + `priority` + `deadline_s`；`production.report.tasks_overdue` 统计逾期，逾期的 src 任务由 worker 记 `failed/deadline_exceeded`；p9）。
 - [x] 日终报告（`production.report`：完成集数、任务完成/失败、GPU 分钟、
       重做率、异常任务清单、不变量是否全绿；告警推送留到接真实产线）。
-- [ ] 抽样审批 + 异常优先队列。
+- [x] 抽样审批 + 异常优先队列（`review.queue` 给抽样集与异常任务，
+      `review.decide` 记 approve/reject + 备注到 `reviews/decisions.jsonl`；
+      抽样规则仍是每 10 个完成任务抽 1 集；p9）。
 
 ## 规模门槛
 
@@ -1230,7 +1232,7 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 
 # 16. 操作目录与测试覆盖矩阵
 
-**已实现的 58 个操作**（`registry.uya` 是唯一来源；`describe` 就是从这张表
+**已实现的 60 个操作**（`registry.uya` 是唯一来源；`describe` 就是从这张表
 生成的）。"覆盖脚本"列是能跑到它的自测，空着表示只有间接覆盖。
 
 | 操作 | 阶段 | 权限 | 覆盖脚本 |
@@ -1286,6 +1288,8 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 | qa.align | P7 | read | p7 |
 | canon.diff | P4 | read | p4 |
 | story.review | P5 | read | p5b |
+| review.queue | P9 | read | p9 |
+| review.decide | P9 | write | p9 |
 | index.list | P13 | read | p13b |
 | series.plan | P5 | write | p5e |
 | outline.approve | P5 | write | p5e |
