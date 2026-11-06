@@ -213,6 +213,46 @@ sys.exit(0 if ok else 1)
 PY
 [ $? -eq 0 ] || fails=$((fails + 1))
 
+# ---------- 6.5 损坏的 canon.json（缺 revision）也能恢复 ----------
+printf '%s' '{"format_version":1}' > "$DATA/projects/$PID/canon.json"
+out=$(ask "$(cat <<JSON
+{"jsonrpc":"2.0","id":20,"method":"tools/call","params":{"name":"call","arguments":{"operation":"canon.recover","input":{"project_id":"$PID"}}}}
+JSON
+)" 2>/dev/null)
+printf '%s' "$out" | python3 -c "
+import json,sys
+raw=[l for l in sys.stdin.read().split(chr(10)) if l.strip()]
+o=json.loads(raw[0])
+r=json.loads(o['result']['content'][0]['text']).get('data',{}).get('result',{})
+assert r.get('revision') == 3, r
+print('PASS: 缺 revision 的 canon.json 被提交记录拉回 revision 3')" \
+    || bad "缺 revision 没有故障保护"
+
+printf '%s' 'not json at all' > "$DATA/projects/$PID/canon.json"
+out=$(ask "$(cat <<JSON
+{"jsonrpc":"2.0","id":21,"method":"tools/call","params":{"name":"call","arguments":{"operation":"canon.inspect","input":{"project_id":"$PID"}}}}
+JSON
+)" 2>/dev/null)
+printf '%s' "$out" | python3 -c "
+import json,sys
+raw=[l for l in sys.stdin.read().split(chr(10)) if l.strip()]
+o=json.loads(raw[0])
+t=json.loads(o['result']['content'][0]['text'])
+assert t.get('success') is False, t
+print('PASS: 损坏的 canon.json 不会被当成合法状态（%s）'
+      % t['error']['code'])" || bad "损坏文件被当成了合法状态"
+out=$(ask "$(cat <<JSON
+{"jsonrpc":"2.0","id":22,"method":"tools/call","params":{"name":"call","arguments":{"operation":"canon.recover","input":{"project_id":"$PID"}}}}
+JSON
+)" 2>/dev/null)
+printf '%s' "$out" | python3 -c "
+import json,sys
+raw=[l for l in sys.stdin.read().split(chr(10)) if l.strip()]
+o=json.loads(raw[0])
+r=json.loads(o['result']['content'][0]['text']).get('data',{}).get('result',{})
+assert r.get('revision') == 3, r
+print('PASS: 损坏文件可由 canon.recover 修复')" || bad "损坏文件没被修复"
+
 # ---------- 7. 提交目录里没有半个文件 ----------
 if ls "$DATA/projects/$PID/commits" | grep -q '\.tmp$'; then
     bad "提交目录里留了 .tmp"

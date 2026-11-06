@@ -508,7 +508,7 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 - [x] 实现快照生成。
 - [x] 实现 current 指针更新。
 - [x] 实现从 Commit Record 重建快照（记录里存全量 state，恢复不重放事件）。
-- [ ] 实现损坏/缺 revision 故障保护。
+- [x] 实现损坏/缺 revision 故障保护（缺 revision 被提交记录拉回；坏 JSON 报 IO_ERROR 且可 recover；p4）。
 
 ## 事务与恢复测试
 
