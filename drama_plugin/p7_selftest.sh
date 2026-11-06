@@ -106,6 +106,70 @@ sys.exit(1 if fails else 0)
 PY
 [ $? -eq 0 ] || fails=$((fails + 1))
 
+# ---------- 2b. ASR 对齐：转录文本按台词逐镜比对 ----------
+python3 - "$DATA/projects/$PID/boards/v1.json" \
+    "$DATA/projects/$PID/asr.txt" <<'PY'
+import json
+import sys
+
+board = json.load(open(sys.argv[1]))
+board = board.get('board', board)
+lines = [s['line'] for s in board['shots'] if s.get('line')]
+open(sys.argv[2], 'w').write('\n'.join(lines) + '\n')
+PY
+[ $? -eq 0 ] || fails=$((fails + 1))
+
+out=$(ask "$(cat <<JSON
+{"jsonrpc":"2.0","id":30,"method":"tools/call","params":{"name":"call","arguments":{"operation":"qa.align","input":{"project_id":"$PID","transcript":"asr.txt"}}}}
+JSON
+)")
+printf '%s' "$out" | field > "$TMP/align1.json"
+python3 - "$TMP/align1.json" "$DATA/projects/$PID/boards/v1.json" <<'PY'
+import json
+import sys
+
+d = json.load(open(sys.argv[1]))
+b = json.load(open(sys.argv[2]))
+b = b.get('board', b)
+lines = [s['line'] for s in b['shots'] if s.get('line')]
+ok, fails = [], []
+
+
+def check(c, m):
+    (ok if c else fails).append(m)
+
+
+check(d.get('ok') is True, '转录与台词一致 ⇒ ok')
+check(d.get('checked') == len(lines), '逐镜比对条数 == 对白镜头数')
+check(d.get('min_pct') == 100, '完全一致 ⇒ min_pct=100')
+for m in ok:
+    print('PASS: ' + m)
+for m in fails:
+    print('FAIL: ' + m)
+sys.exit(1 if fails else 0)
+PY
+[ $? -eq 0 ] || fails=$((fails + 1))
+
+python3 - "$DATA/projects/$PID/asr.txt" <<'PY'
+import sys
+
+lines = open(sys.argv[1]).read().split('\n')
+lines[0] = '这句和台词完全不一样'
+open(sys.argv[1], 'w').write('\n'.join(lines))
+PY
+out=$(ask "$(cat <<JSON
+{"jsonrpc":"2.0","id":31,"method":"tools/call","params":{"name":"call","arguments":{"operation":"qa.align","input":{"project_id":"$PID","transcript":"asr.txt"}}}}
+JSON
+)")
+printf '%s' "$out" | field | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+assert d['ok'] is False, d
+assert any(m['shot'] == 2 for m in d['mismatches']), d
+assert d['min_pct'] < 85, d
+print('PASS: 台词被改 ⇒ 第 2 镜不达标（%d%%）' % d['min_pct'])" \
+    || bad "改台词后没报不达标"
+
 # ---------- 3. 再 build：复现 ----------
 out=$(ask "$(cat <<JSON
 {"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"call","arguments":{"operation":"storyboard.build","input":{"project_id":"$PID","script_version":1}}}}

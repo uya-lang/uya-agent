@@ -530,7 +530,7 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 - [x] 注册 continuity.inspect：`op_continuity_inspect` 复用 `audit_run`，
       返回账本、不变量与全历史重放结果（旧版只登记了名字，调用会报缺字段）。
 - [x] 在 episode.approve(screenplay) 内部执行事件验证和 Canon 提交（`story_validate` → `canon_commit` → `approved.json`；p5b）。
-- [x] 不提供绕过校验的外部状态写入入口（55 个操作里没有通用写文件/写状态；
+- [x] 不提供绕过校验的外部状态写入入口（56 个操作里没有通用写文件/写状态；
       Canon 只能经 `canon.commit` 逐事件校验，剧本只能经 approve 提交）。
 
 ## 验收
@@ -905,7 +905,10 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 
 - [x] 检查生成视频对应的剧本版本（QA 比对分镜 `source_script_version`，不符报 `STALE_BOARD`；p9）。
 - [x] 静态体检：字段完整、镜号连续、时长核算、能力表校验、规格合规。
-- [ ] ASR 对齐：逐镜台词相似度 ≥ 阈值（默认 0.85），产出字幕时间轴。
+- [x] ASR 对齐：逐镜台词相似度 ≥ 阈值（默认 0.85），产出字幕时间轴
+      （`qa.align`：转录一行一条台词，编辑距离算每镜百分比，低于 85 列
+      `mismatches`；字幕时间轴用 `media.subtitle` 的分镜时间；p7）。真实
+      ASR 引擎仍未接，转录文本由调用方/外部工具给。
 - [ ] 锚帧接戏差：`cut_type="anchor"` 的镜头与上一镜末帧做像素差比对。
 - [ ] 成片终检：可解码、无空文件、无黑边、无长静音段、时长一致、片尾卡在（已做 manifest/文件存在/大小一致；其余待真实产线）。
 - [ ] 检查人物外观和服装（对照冻结文本与锚点，模型辅助）。
@@ -1214,7 +1217,7 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 
 # 16. 操作目录与测试覆盖矩阵
 
-**已实现的 55 个操作**（`registry.uya` 是唯一来源；`describe` 就是从这张表
+**已实现的 56 个操作**（`registry.uya` 是唯一来源；`describe` 就是从这张表
 生成的）。"覆盖脚本"列是能跑到它的自测，空着表示只有间接覆盖。
 
 | 操作 | 阶段 | 权限 | 覆盖脚本 |
@@ -1267,6 +1270,7 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 | budget.report | P13 | read | p11 |
 | production.report | P13 | read | p13c |
 | index.rebuild | P13 | write | p13b |
+| qa.align | P7 | read | p7 |
 | index.list | P13 | read | p13b |
 | series.plan | P5 | write | p5e |
 | outline.approve | P5 | write | p5e |
