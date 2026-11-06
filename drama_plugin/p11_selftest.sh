@@ -157,7 +157,10 @@ printf '%s' "$out" | field | python3 -c "
 import json,sys
 d=json.load(sys.stdin)
 assert d['ok'] is True, d
-print('PASS: 第 1 集 QA 全绿')" || bad "第 1 集 QA 没绿"
+assert d['report']['board_version'] == 1, d
+assert d['report']['script_version'] == 1, d
+print('PASS: 第 1 集 QA 全绿（自动选了映射到剧本 v1 的分镜 v1）')" \
+    || bad "第 1 集 QA 没绿"
 
 out=$(ask "$(cat <<JSON
 {"jsonrpc":"2.0","id":61,"method":"tools/call","params":{"name":"call","arguments":{"operation":"canon.audit","input":{"project_id":"$PID"}}}}
