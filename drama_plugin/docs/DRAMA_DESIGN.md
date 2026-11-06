@@ -1094,6 +1094,17 @@ outline_version, episode}`：剧本必须能追到**已批准**的大纲版本�
 - 观众已知 / 角色已知（按角色 ID 分别记）；
 - 是否被揭示、是否被误信。
 
+**系列层**（`series.plan` 写进 `series/outline.json`，只有批了才允许逐集生成）：
+
+| 对象 | 字段 | 说明 |
+|---|---|---|
+| `Series` | `genre_template` / `format` / `promises` / `frozen` | 题材模板 ID、画布与单集时长、系列承诺、"改了必须升版本"的冻结口径 |
+| `Season` | `no` / `from` / `to` / `arcs` | 10 集一季；弧的起止集必须落在这季里 |
+| `Arc` | `no` / `conflict` / `payoff_episode` / `character_arc` | 弧内冲突、兑现点、主角成长弧 |
+
+冻结口径（`frozen`）为真的字段一旦批准，改动必须重新规划并升版本；
+`outline.approve` 只批当前版本，重规划自动作废旧批准（p5e）。
+
 判据：观众已知而角色未知 ⇒ 允许（制造信息差）；角色已知而观众未知 ⇒
 必须在后续镜头补揭示，否则审核报 `KNOWLEDGE_LEAK`。
 

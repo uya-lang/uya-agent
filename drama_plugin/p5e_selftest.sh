@@ -112,6 +112,20 @@ check(eps[1]['pays_off'] == 1, '第 2 集兑现第 1 集的钩子')
 check(all(e['opens_hook'] == e['episode'] for e in eps), '每集开一个新钩子')
 check(sum(1 for e in eps if e['comedy_beat']) == 33, '笑点节拍 33 集')
 check(eps[0]['lead'] == '爸爸', '主角从 Bible 取（爸爸）')
+ser = d['series']
+check(ser['genre_template'] == 'family_comedy.v1', '题材模板 ID 有值')
+check(ser['format']['canvas'] == '440x800', '画布写进系列层')
+check(ser['format']['target_seconds'] == 90, '单集目标时长写进系列层')
+check(len(ser['promises']) == 3, '系列承诺 3 条')
+check(all(ser['frozen'].values()), '系列级冻结口径全开')
+seasons = d['seasons']
+check(len(seasons) == 10, '100 集分 10 季')
+check(seasons[0]['from'] == 1 and seasons[0]['to'] == 10, '第 1 季 1..10')
+check(seasons[-1]['from'] == 91 and seasons[-1]['to'] == 100,
+      '最后一季 91..100')
+arc = seasons[0]['arcs'][0]
+check(arc['payoff_episode'] == 10, '弧的兑现点落在季末')
+check('爸爸' in arc['character_arc'], '角色成长弧点了主角')
 for m in ok:
     print('PASS: ' + m)
 for m in fails:
