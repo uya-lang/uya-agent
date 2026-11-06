@@ -106,6 +106,14 @@ assert d['duration_ms'] > 0, d
 print('PASS: 同样输入再生成，时长仍是 %d ms（确定性口径）' % d['duration_ms'])
 " || bad "第二次生成的时长不对"
 
+# 版本只增不改：第二次生成另起一版，旧版字节不动
+V1_HASH=$(md5sum "$DATA/projects/$PID/scripts/v1.json" | cut -d' ' -f1)
+nver=$(ls "$DATA/projects/$PID/scripts" | grep -c '^v[0-9]*\.json$' || true)
+[ "$nver" -ge 2 ] && ok "第二次生成另起一版（现有 $nver 个版本）" \
+    || bad "第二次生成没有保留旧版本"
+[ "$V1_HASH" = "$(md5sum "$DATA/projects/$PID/scripts/v1.json" | cut -d' ' -f1)" ] \
+    && ok "旧版本 v1 未被覆盖（字节不变）" || bad "旧版本被改写了"
+
 # ---------- 3. 审核失败不能批准 ----------
 mkdir -p "$DATA/projects/$PID/scripts"
 printf '%s' '{"format_version":1,"version":3,"content_hash":"x","screenplay":{"title":"bad","scenes":[{"no":1,"action":"a"}]}}' \

@@ -527,7 +527,7 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 
 - [x] 注册 continuity.inspect：`op_continuity_inspect` 复用 `audit_run`，
       返回账本、不变量与全历史重放结果（旧版只登记了名字，调用会报缺字段）。
-- [ ] 在 episode.approve(screenplay) 内部执行事件验证和 Canon 提交。
+- [x] 在 episode.approve(screenplay) 内部执行事件验证和 Canon 提交（`story_validate` → `canon_commit` → `approved.json`；p5b）。
 - [ ] 不提供绕过校验的外部状态写入入口。
 
 ## 验收
@@ -660,7 +660,7 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 - [ ] 事件前置条件检查。
 - [ ] 喜剧结构和可理解性审查。
 - [ ] 生成问题清单和审核版本 ID。
-- [ ] 支持创建新剧本版本，不覆盖旧版本。
+- [x] 支持创建新剧本版本，不覆盖旧版本（`scripts/v<N>.json` 只增不改；p5b 比对 v1 字节不变）。
 
 ## Task 接入
 
