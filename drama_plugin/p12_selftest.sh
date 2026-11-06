@@ -224,6 +224,39 @@ codes={v['code'] for v in d['violations']}
 assert 'PROP_IN_UNKNOWN_SCENE' in codes, codes
 print('PASS: 道具指向未知场景被审计抓出来')" || bad "场景不变量没生效"
 
+# ---------- 6. 资产完整性 ----------
+mkdir -p "$DATA/projects/$PID/assets"
+printf '%s' '0123456789abcdef0123456789abcdef' \
+    > "$DATA/projects/$PID/assets/ref.bin"
+out=$(ask "$(cat <<JSON
+{"jsonrpc":"2.0","id":24,"method":"tools/call","params":{"name":"call","arguments":{"operation":"asset.register","input":{"project_id":"$PID","name":"ref.bin","mime":"application/octet-stream"}}}}
+JSON
+)")
+printf '%s' 'ffffffffffffffffffffffffffffffff' \
+    > "$DATA/projects/$PID/assets/ref.bin"
+out=$(ask "$(cat <<JSON
+{"jsonrpc":"2.0","id":25,"method":"tools/call","params":{"name":"call","arguments":{"operation":"canon.audit","input":{"project_id":"$PID"}}}}
+JSON
+)")
+printf '%s' "$out" | field | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+codes={v['code'] for v in d['violations']}
+assert 'ASSET_HASH_MISMATCH' in codes, codes
+print('PASS: 资产被替换（同大小不同内容）⇒ ASSET_HASH_MISMATCH')" \
+    || bad "资产哈希被改没被抓"
+rm -f "$DATA/projects/$PID/assets/ref.bin"
+out=$(ask "$(cat <<JSON
+{"jsonrpc":"2.0","id":26,"method":"tools/call","params":{"name":"call","arguments":{"operation":"canon.audit","input":{"project_id":"$PID"}}}}
+JSON
+)")
+printf '%s' "$out" | field | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+codes={v['code'] for v in d['violations']}
+assert 'ASSET_MISSING' in codes, codes
+print('PASS: 资产文件不见了 ⇒ ASSET_MISSING')" || bad "资产缺失没被抓"
+
 echo "----"
 if [ "$fails" -eq 0 ]; then
     echo "PASS: P12 第一段（闭环审计）"
