@@ -200,11 +200,11 @@ JSON 上限/非 ASCII → env/密钥注入 → 资产可见性。
 
 ### 2.3 工程准备
 
-- [ ] 确定 Drama 独立仓库位置和命名（文档落点也要定，见 §19）。
-- [ ] 阅读 Uya 模块、包、构建和 selftest 规范。
-- [ ] 阅读 `uya-agent` 的 `DESIGN.md`（尤其 §21 插件系统）、`CODING.md`。
-- [ ] 确认 Uya 静态可执行程序的构建和发布方式。
-- [ ] 确认 Linux 首版目标平台和后续平台范围。
+- [x] 确定 Drama 独立仓库位置和命名（决定：暂留本仓 `drama_plugin/`，见 `P0_FINDINGS.md` §1）。
+- [x] 阅读 Uya 模块、包、构建和 selftest 规范（28 模块 → 单可执行；21 个 p 脚本）。
+- [x] 阅读 `uya-agent` 的 `DESIGN.md`（尤其 §21 插件系统）、`CODING.md`（插件契约见 §1 表）。
+- [x] 确认 Uya 可执行程序的构建和发布方式（单文件，仅依赖 libc；`build/drama`）。
+- [x] 确认 Linux 首版目标平台（x86_64；系统调用只用 `libc.syscall` 子集）。
 
 ### 2.4 既有产线对接调研
 
@@ -217,12 +217,12 @@ JSON 上限/非 ASCII → env/密钥注入 → 资产可见性。
 
 ## 交付物
 
-- [ ] `P0_FINDINGS.md`（每条标：已验证 / 不可用 / 替代方案 / 对应测试）。
-- [ ] 最小 MCP Server 原型（单行紧凑输出）。
-- [ ] 最小 HTTP 请求原型。
-- [ ] 最小文件事务原型（tmp + rename + 锁 + 陈旧锁探活）。
-- [ ] 最小 Worker 中断/重启原型。
-- [ ] 产线适配接口草图。
+- [x] `P0_FINDINGS.md`（每条标：已验证 / 不可用 / 替代方案 / 对应测试）。
+- [x] 最小 MCP Server 原型（单行紧凑输出；p1/p2）。
+- [x] 最小 HTTP 请求原型（`src/http.uya`，不引 libcurl；p5）。
+- [x] 最小文件事务原型（tmp + rename + O_EXCL 锁 + 陈旧锁探活；p3/p4）。
+- [x] 最小 Worker 中断/重启原型（p5d 断点续跑、p8 重试、p13c 抽样恢复）。
+- [x] 产线适配接口草图（能力表 + `media.*`，`DRAMA_PROVIDER.md`；p8/p10）。
 
 ## 验收条件
 
