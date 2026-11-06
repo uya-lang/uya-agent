@@ -142,6 +142,10 @@ def check(c, m):
 check(d.get('ok') is True, '转录与台词一致 ⇒ ok')
 check(d.get('checked') == len(lines), '逐镜比对条数 == 对白镜头数')
 check(d.get('min_pct') == 100, '完全一致 ⇒ min_pct=100')
+check(all(s['source'].get('events') for s in b['shots']),
+      '镜头都追到剧本事件（source.events 非空）')
+check(all(e >= 0 for s in b['shots'] for e in s['source']['events']),
+      '事件下标合法')
 for m in ok:
     print('PASS: ' + m)
 for m in fails:
