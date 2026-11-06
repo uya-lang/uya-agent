@@ -240,6 +240,50 @@ print('PASS: promise.report 给出回收率（open=%d closed=%d overdue=%d %.1f%
       % (d['open'], d['closed'], d['overdue'],
          d['collected_permille'] / 10.0))" || bad "promise.report 不对"
 
+# 显式延期（原因 + 新 due_ep）后不再算逾期
+out=$(ask "$(cat <<JSON
+{"jsonrpc":"2.0","id":31,"method":"tools/call","params":{"name":"call","arguments":{"operation":"canon.commit","input":{"project_id":"$P4","base_revision":4,"events":[{"type":"promise.waive","promise":"p1","reason":"留到下一集揭","due_ep":5}]}}}}
+JSON
+)")
+printf '%s' "$out" | field | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+assert d['revision'] == 5, d
+print('PASS: promise.waive 记下原因与新 due_ep（revision 5）')" \
+    || bad "promise.waive 没提交"
+out=$(ask "$(cat <<JSON
+{"jsonrpc":"2.0","id":32,"method":"tools/call","params":{"name":"call","arguments":{"operation":"canon.audit","input":{"project_id":"$P4"}}}}
+JSON
+)")
+printf '%s' "$out" | field | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+codes={v['code'] for v in d['violations']}
+assert 'PROMISE_OVERDUE' not in codes, d
+print('PASS: 延期后的承诺不再算逾期')" || bad "延期没有生效"
+out=$(ask "$(cat <<JSON
+{"jsonrpc":"2.0","id":33,"method":"tools/call","params":{"name":"call","arguments":{"operation":"canon.inspect","input":{"project_id":"$P4"}}}}
+JSON
+)")
+printf '%s' "$out" | field | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+p1=[p for p in d['promises'] if p['id'] == 'p1'][0]
+assert p1['waived'] is True, p1
+assert p1['due_ep'] == 5, p1
+assert p1['reason'] == '留到下一集揭', p1
+print('PASS: 承诺状态里能看到 waived/due_ep/reason')" || bad "承诺状态没落盘"
+
+out=$(ask "$(cat <<JSON
+{"jsonrpc":"2.0","id":34,"method":"tools/call","params":{"name":"call","arguments":{"operation":"promise.report","input":{"project_id":"$P4"}}}}
+JSON
+)")
+printf '%s' "$out" | field | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+assert d['overdue'] == 0, d
+print('PASS: 延期后 promise.report 的 overdue 归零')" || bad "延期后回收账不对"
+
 echo "----"
 if [ "$fails" -eq 0 ]; then
     echo "PASS: P12 第二段（反例库六条）"
