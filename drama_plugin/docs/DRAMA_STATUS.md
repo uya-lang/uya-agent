@@ -41,13 +41,14 @@ for f in drama_plugin/p*_selftest.sh; do sh "$f" || echo "FAILED $f"; done
 
 外加仓库门槛：`make lint-size`（文件 ≤2000 行 / 函数 ≤100 行 / 行宽 ≤80 码点）。
 
-## 2. 代码地图（`drama_plugin/src/`，27 个文件，约 9800 行）
+## 2. 代码地图（`drama_plugin/src/`，28 个文件，约 9900 行）
 
 | 模块 | 职责 | 行数 |
 |---|---|---|
 | `main.uya` | CLI：version / health / mcp serve / worker run | 139 |
 | `server.uya` | MCP 三工具（list/describe/call）+ 协议错误 | 816 |
-| `ops.uya` | 24 个业务操作的分派与实现 | 858 |
+| `ops.uya` | 业务操作的分派与实现 | 1844 |
+| `media_ops.uya` | 媒资四件套 / 单镜头重试 / 资产 / 生产报告 | 320 |
 | `registry.uya` | 操作目录 + 字段规格（describe 与 call 同源） | 359 |
 | `schema.uya` | Input Schema 校验（required/type/enum/额外字段） | 198 |
 | `dispatch.uya` | 幂等槽 + request_id + task_id 生成 | 161 |
