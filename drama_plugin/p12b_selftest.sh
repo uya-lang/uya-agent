@@ -1,5 +1,6 @@
 #!/bin/sh
 # drama_plugin/p12b_selftest.sh — P12 第二段：反例库六条（DESIGN §13.5）
+# 另补两条同类：抹掉知识来源、改动冻结文本（各断言具体错误码）
 #
 # 每条 fixture = 一个小项目 + 一个期望错误码；检查器不报对应码就算失败。
 #   1 道具瞬移            PROP_TELEPORT
@@ -97,6 +98,15 @@ JSON
 )")
 [ "$(code_of "$out")" = "KNOWLEDGE_LEAK" ] && ok "反例 2：知识越界 ⇒ KNOWLEDGE_LEAK" \
     || bad "反例 2 没报 KNOWLEDGE_LEAK（$(code_of "$out")）"
+
+# 抹掉知识来源（少写 at_scene）：同样按 KNOWLEDGE_LEAK 拒
+out=$(ask "$(cat <<JSON
+{"jsonrpc":"2.0","id":41,"method":"tools/call","params":{"name":"call","arguments":{"operation":"canon.commit","input":{"project_id":"$P2","base_revision":1,"events":[{"type":"knowledge.grant","character":"dad","fact":"kitchen_secret"}]}}}}
+JSON
+)")
+[ "$(code_of "$out")" = "KNOWLEDGE_LEAK" ] \
+    && ok "反例 2b：抹掉知识来源 ⇒ KNOWLEDGE_LEAK" \
+    || bad "反例 2b 没报 KNOWLEDGE_LEAK（$(code_of "$out")）"
 
 # ---------- 3. 场景穿帮 ----------
 P3=$(new_project "反例-场景穿帮")
