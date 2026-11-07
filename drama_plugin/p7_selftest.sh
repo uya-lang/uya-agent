@@ -29,6 +29,7 @@ $HERE/src/board.uya $HERE/src/provider.uya $HERE/src/qa.uya \
 $HERE/src/audit.uya $HERE/src/assemble.uya $HERE/src/index.uya $HERE/src/series.uya $HERE/src/ops.uya \
 $HERE/src/media_ops.uya \
 $HERE/src/verify_ops.uya \
+$HERE/src/queue_ops.uya \
 $HERE/src/server.uya"
 
 TMP=$(mktemp -d)
@@ -332,6 +333,25 @@ s2 = d['shots'][1]['references']['characters'][0]
 assert s2['frozen_hash'] != ref['frozen_hash'], (ref, s2)
 print('PASS: 引用固定资产版本（Bible v%d + 冻结文本 hash 前 12 位，逐人不同）'
       % d['bible_version'])" || bad "固定资产引用不对"
+
+out=$(ask "$(cat <<JSON
+{"jsonrpc":"2.0","id":75,"method":"tools/call","params":{"name":"call","arguments":{"operation":"provider.refs","input":{"project_id":"$PSS","board_version":1,"shot":2}}}}
+JSON
+)")
+printf '%s' "$out" | field | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+assert d['shot'] == 2, d
+assert d['ref_count'] == 1, d
+r = d['refs'][0]
+assert r['order'] == 0, r
+assert r['role'] == 'character', r
+assert r['id'] == 'kid', r
+assert r['slot'] == 'first_frame', r
+assert r['frame_index'] == 0, r
+assert len(r['frozen_hash']) == 12, r
+print('PASS: 参考素材参数转换（顺序 + 首帧槽位 + 冻结 hash）')" \
+    || bad "参考素材参数转换不对"
 
 python3 - "$DATA/projects/$PSS/boards/v1.json" <<'PY'
 import json

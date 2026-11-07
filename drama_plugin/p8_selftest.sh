@@ -29,6 +29,7 @@ $HERE/src/board.uya $HERE/src/provider.uya $HERE/src/qa.uya \
 $HERE/src/audit.uya $HERE/src/assemble.uya $HERE/src/index.uya $HERE/src/series.uya $HERE/src/ops.uya \
 $HERE/src/media_ops.uya \
 $HERE/src/verify_ops.uya \
+$HERE/src/queue_ops.uya \
 $HERE/src/server.uya"
 
 TMP=$(mktemp -d)
@@ -254,6 +255,84 @@ print('PASS: task.cancel 把任务标成 cancelled')" || bad "取消没生效"
 [ ! -f "$DATA/projects/$PID/queue/$TID9.json" ] \
     && ok "取消的任务没有进队列（没提交过就不生成记录）" \
     || bad "取消的任务还是进了队列"
+
+# ---------- 5.7 结果取回 / 参考素材参数转换 ----------
+# 真产物才有可探测的时长：造两段 1 秒的 mp4 放到 v9
+mkdir -p "$DATA/projects/$PID/assets/v9"
+for i in 1 2; do
+    ffmpeg -v error -y -f lavfi -i color=c=blue:s=96x54:d=1 \
+        -pix_fmt yuv420p "$DATA/projects/$PID/assets/v9/shot_$i.mp4"
+done
+printf '%s' '{"format_version":1,"prompt_id":"q_real7777","task_id":"t_real","board_version":9,"state":"done","shots":2,"gpu_ms":1500,"submitted_at":1,"updated_at":2}' \
+    > "$DATA/projects/$PID/queue/t_real.json"
+out=$(ask '{"jsonrpc":"2.0","id":25,"method":"tools/call","params":{"name":"call","arguments":{"operation":"provider.result","input":{"project_id":"'"$PID"'","task_id":"t_real"}}}}')
+printf '%s' "$out" | field | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+assert d['task_id'] == 't_real', d
+assert len(d['videos']) == 2, d
+assert d['total_ms'] > 0, d
+for v in d['videos']:
+    assert v['bytes'] > 0, v
+    assert v['duration_ms'] > 0, v
+assert d['last_frame'].endswith('last.jpg'), d
+assert d['last_frame_bytes'] > 0, d
+print('PASS: provider.result 取回 mp4 清单 + 末帧图 + 元数据（%d 段 / %d ms）'
+      % (len(d['videos']), d['total_ms']))" || bad "结果取回不完整"
+
+# 还没跑完的任务取结果 ⇒ RESULT_NOT_READY
+printf '%s' '{"format_version":1,"prompt_id":"q_zzzz9999","task_id":"t_pending","board_version":1,"state":"running","shots":1,"gpu_ms":0,"submitted_at":1,"updated_at":2}' \
+    > "$DATA/projects/$PID/queue/t_pending.json"
+out=$(ask '{"jsonrpc":"2.0","id":26,"method":"tools/call","params":{"name":"call","arguments":{"operation":"provider.result","input":{"project_id":"'"$PID"'","task_id":"t_pending"}}}}')
+printf '%s' "$out" | field | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+assert d.get('code') == 'RESULT_NOT_READY', d
+print('PASS: 未完成的任务取结果 ⇒ RESULT_NOT_READY')" || bad "未完成任务没拒绝取结果"
+
+# 取消：真的把 job 停掉（标记文件 + 记录置 canceled），已终结的拒绝
+out=$(ask '{"jsonrpc":"2.0","id":27,"method":"tools/call","params":{"name":"call","arguments":{"operation":"provider.cancel","input":{"project_id":"'"$PID"'","task_id":"t_pending"}}}}')
+printf '%s' "$out" | field | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+assert d['state'] == 'canceled', d
+print('PASS: provider.cancel 把队列记录置 canceled')" || bad "取消没改状态"
+[ -f "$DATA/projects/$PID/queue/t_pending.cancel" ] \
+    && ok "取消留了 .cancel 标记文件（worker 会真把生成进程收掉）" \
+    || bad "取消没留标记文件"
+python3 - "$DATA/projects/$PID/queue/t_pending.json" <<'PY'
+import json
+import sys
+
+rec = json.load(open(sys.argv[1]))
+assert rec['state'] == 'canceled', rec
+assert rec['prompt_id'] == 'q_zzzz9999', rec
+print('PASS: 取消只改 state，prompt_id 等字段原样保留')
+PY
+[ $? -eq 0 ] || fails=$((fails + 1))
+out=$(ask '{"jsonrpc":"2.0","id":28,"method":"tools/call","params":{"name":"call","arguments":{"operation":"provider.cancel","input":{"project_id":"'"$PID"'","task_id":"t_real"}}}}')
+printf '%s' "$out" | field | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+assert d.get('code') == 'TASK_TERMINAL', d
+print('PASS: 已完成的任务取消不成立（TASK_TERMINAL）')" || bad "终态任务还能取消"
+
+# 参考素材参数转换：slot / 顺序 / 帧索引引导 / 冻结文本 hash
+out=$(ask '{"jsonrpc":"2.0","id":29,"method":"tools/call","params":{"name":"call","arguments":{"operation":"provider.refs","input":{"project_id":"'"$PID"'","board_version":1,"shot":1}}}}')
+printf '%s' "$out" | field | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+assert d['shot'] == 1, d
+if d['ref_count'] > 0:
+    r = d['refs'][0]
+    assert r['order'] == 0, r
+    assert r['slot'] == 'first_frame', r
+    assert r['frame_index'] == 0, r
+    assert r['role'] in ('character', 'prop'), r
+    assert len(r['frozen_hash']) == 12, r
+    print('PASS: provider.refs 给出参考图槽位/顺序/帧索引/冻结 hash')
+else:
+    print('PASS: provider.refs 在没有在场角色时返回空参考表')" || bad "参考素材参数转换不对"
 
 # ---------- 6. 单 Worker 锁 ----------
 mkdir -p "$DATA/locks"

@@ -532,7 +532,7 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 - [x] 注册 continuity.inspect：`op_continuity_inspect` 复用 `audit_run`，
       返回账本、不变量与全历史重放结果（旧版只登记了名字，调用会报缺字段）。
 - [x] 在 episode.approve(screenplay) 内部执行事件验证和 Canon 提交（`story_validate` → `canon_commit` → `approved.json`；p5b）。
-- [x] 不提供绕过校验的外部状态写入入口（66 个操作里没有通用写文件/写状态；
+- [x] 不提供绕过校验的外部状态写入入口（69 个操作里没有通用写文件/写状态；
       Canon 只能经 `canon.commit` 逐事件校验，剧本只能经 approve 提交）。
 
 ## 验收
@@ -886,9 +886,15 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
       prompt_id 由 (task_id, board_version) 确定性算出（p8）。
 - [x] 实现 submit（返回 `q_<8hex>` 的 prompt_id 作为 provider task id；p8）。
 - [x] 实现 poll（`queue.get` 回 queued/running/done/failed/canceled；p8）。成/失败）。
-- [ ] 实现 cancel（真把 job 停掉，而不是只停止 poll）。
-- [ ] 实现结果取回（mp4 + 末帧图 + 元数据）。
-- [ ] 实现参考素材参数转换（参考图顺序、帧索引引导）。
+- [x] 实现 cancel（真把 job 停掉，而不是只停止 poll）（`provider.cancel`：
+      队列记录置 `canceled` + 留 `<task_id>.cancel` 标记给 worker 收进程 +
+      记录里有 `pid` 就发 SIGTERM；终态任务回 `TASK_TERMINAL`；p8）。
+- [x] 实现结果取回（mp4 + 末帧图 + 元数据）（`provider.result`：逐镜回
+      `{path, bytes, duration_ms}` + `total_ms` + 末帧图 `assets/v<N>/last.jpg`
+      与字节数；没跑完回 `RESULT_NOT_READY`；p8）。
+- [x] 实现参考素材参数转换（参考图顺序、帧索引引导）（`provider.refs`：
+      按 `shot.state` 的在场顺序出 `{order, role, id, asset_version,
+      frozen_hash, frame_index, slot}`，第 0 张锁首帧 `first_frame`；p7/p8）。
 - [x] 实现 Provider 错误映射（表在 `DRAMA_PROVIDER.md`「错误映射」；实现：
       媒体类 `SCHEMA_INVALID`/`IO_ERROR`/`MEDIA_MISMATCH`，能力表
       `ACTION_UNSUPPORTED`，LLM 类 `NETWORK_ERROR`/`TIMEOUT`/`BAD_RESPONSE`/
@@ -1354,6 +1360,9 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 | shot.anchor | P10 | read | p10 |
 | character.voice | P13 | read | p9 |
 | shot.state | P7 | read | p7 |
+| provider.cancel | P8 | write | p8 |
+| provider.result | P8 | read | p8 |
+| provider.refs | P7 | read | p7 p8 |
 | canon.diff | P4 | read | p4 |
 | story.review | P5 | read | p5b |
 | review.queue | P9 | read | p9 |
