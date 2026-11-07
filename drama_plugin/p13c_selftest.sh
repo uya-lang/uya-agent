@@ -30,6 +30,7 @@ $HERE/src/qa.uya $HERE/src/audit.uya \
 $HERE/src/assemble.uya $HERE/src/index.uya \
 $HERE/src/series.uya $HERE/src/ops.uya \
 $HERE/src/media_ops.uya \
+$HERE/src/verify_ops.uya \
 $HERE/src/server.uya"
 
 TMP=$(mktemp -d)

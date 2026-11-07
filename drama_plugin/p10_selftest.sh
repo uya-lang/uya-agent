@@ -31,6 +31,7 @@ $HERE/src/story.uya $HERE/src/context.uya $HERE/src/task.uya \
 $HERE/src/board.uya $HERE/src/provider.uya $HERE/src/qa.uya \
 $HERE/src/audit.uya $HERE/src/assemble.uya $HERE/src/index.uya $HERE/src/series.uya $HERE/src/ops.uya \
 $HERE/src/media_ops.uya \
+$HERE/src/verify_ops.uya \
 $HERE/src/server.uya"
 
 TMP=$(mktemp -d)
@@ -282,6 +283,82 @@ print('PASS: 成片被截断 ⇒ QA 报 ASSEMBLY_CORRUPT')" \
     cp "$TMP/film.bak" "$FILM"
 else
     bad "找不到 episode_3.mp4"
+fi
+
+# ---------- 成片终检：解码 + format 绑定 + 字幕对轴 ----------
+code_of() { printf '%s' "$1" | field | python3 -c "
+import json,sys
+print(json.load(sys.stdin).get('code', 'OK'))"; }
+
+if command -v ffmpeg >/dev/null 2>&1 && command -v ffprobe >/dev/null 2>&1; then
+    PV=$(ask '{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"call","arguments":{"operation":"project.create","input":{"name":"终检"}}}}' | field | python3 -c "
+import json,sys
+print(json.load(sys.stdin)['project_id'])")
+    ask "$(cat <<JSON
+{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"call","arguments":{"operation":"bible.put","input":{"project_id":"$PV","bible":{"characters":[{"id":"dad"}],"format":{"canvas":"440x800","codec":"h264"}},"locks":{"dad":"短寸头"}}}}}
+JSON
+)" > /dev/null
+    mkdir -p "$DATA/projects/$PV/assemblies" "$DATA/projects/$PV/subtitles"
+    ffmpeg -v error -f lavfi -i testsrc=duration=2:size=440x800:rate=25 \
+        -pix_fmt yuv420p "$DATA/projects/$PV/assemblies/ep.mp4" -y \
+        >/dev/null 2>&1
+    REL="projects/$PV/assemblies/ep.mp4"
+    out=$(ask "$(cat <<JSON
+{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"call","arguments":{"operation":"final.verify","input":{"project_id":"$PV","path":"$REL","expect_duration_ms":2000}}}}
+JSON
+)")
+    printf '%s' "$out" | field | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+names={c['name']: c['ok'] for c in d['checks']}
+assert names.get('decode') is True, d
+assert names.get('resolution') is True, d
+assert names.get('codec') is True, d
+assert names.get('duration') is True, d
+assert d['ok'] is True, d
+print('PASS: 成片终检通过（解码/分辨率/编码/时长都对上 format）')" \
+        || bad "成片终检没通过"
+
+    out=$(ask "$(cat <<JSON
+{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"call","arguments":{"operation":"final.verify","input":{"project_id":"$PV","path":"$REL","expect_duration_ms":9000}}}}
+JSON
+)")
+    [ "$(code_of "$out")" = "FINAL_VERIFY_FAILED" ] \
+        && ok "时长对不上 ⇒ FINAL_VERIFY_FAILED" \
+        || bad "时长不符没被拒（$(code_of "$out")）"
+
+    head -c 3000 "$DATA/projects/$PV/assemblies/ep.mp4" \
+        > "$DATA/projects/$PV/assemblies/broken.mp4"
+    out=$(ask "$(cat <<JSON
+{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"call","arguments":{"operation":"final.verify","input":{"project_id":"$PV","path":"projects/$PV/assemblies/broken.mp4"}}}}
+JSON
+)")
+    [ "$(code_of "$out")" = "IO_ERROR" ] \
+        && ok "截断成片解不开 ⇒ IO_ERROR（不会当成好片放行）" \
+        || bad "坏片没被拒（$(code_of "$out")）"
+
+    printf '1\n00:00:00,000 --> 00:00:00,500\n你好\n' \
+        > "$DATA/projects/$PV/subtitles/v1.srt"
+    out=$(ask "$(cat <<JSON
+{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"call","arguments":{"operation":"final.verify","input":{"project_id":"$PV","path":"$REL","board_version":1}}}}
+JSON
+)")
+    [ "$(code_of "$out")" = "FINAL_VERIFY_FAILED" ] \
+        && ok "字幕末条没贴住成片时长 ⇒ FINAL_VERIFY_FAILED" \
+        || bad "字幕对轴不齐没被拒（$(code_of "$out")）"
+
+    printf '1\n00:00:00,000 --> 00:00:01,980\n你好\n' \
+        > "$DATA/projects/$PV/subtitles/v1.srt"
+    out=$(ask "$(cat <<JSON
+{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"call","arguments":{"operation":"final.verify","input":{"project_id":"$PV","path":"$REL","board_version":1}}}}
+JSON
+)")
+    printf '%s' "$out" | field | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+names={c['name']: c['ok'] for c in d['checks']}
+assert names.get('subtitle_sync') is True, d
+print('PASS: 字幕末条与成片时长对齐（±1s）')" || bad "字幕对轴没通过"
 fi
 
 # ---------- 媒体输入探测（ffprobe） ----------

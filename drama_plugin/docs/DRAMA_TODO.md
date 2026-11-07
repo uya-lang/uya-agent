@@ -532,7 +532,7 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 - [x] 注册 continuity.inspect：`op_continuity_inspect` 复用 `audit_run`，
       返回账本、不变量与全历史重放结果（旧版只登记了名字，调用会报缺字段）。
 - [x] 在 episode.approve(screenplay) 内部执行事件验证和 Canon 提交（`story_validate` → `canon_commit` → `approved.json`；p5b）。
-- [x] 不提供绕过校验的外部状态写入入口（62 个操作里没有通用写文件/写状态；
+- [x] 不提供绕过校验的外部状态写入入口（63 个操作里没有通用写文件/写状态；
       Canon 只能经 `canon.commit` 逐事件校验，剧本只能经 approve 提交）。
 
 ## 验收
@@ -944,7 +944,9 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
       `mismatches`；字幕时间轴用 `media.subtitle` 的分镜时间；p7）。真实
       ASR 引擎仍未接，转录文本由调用方/外部工具给。
 - [ ] 锚帧接戏差：`cut_type="anchor"` 的镜头与上一镜末帧做像素差比对。
-- [ ] 成片终检：可解码、无空文件、无黑边、无长静音段、时长一致、片尾卡在（已做 manifest/文件存在/大小一致；其余待真实产线）。
+- [ ] 成片终检：可解码、无空文件、无黑边、无长静音段、时长一致、片尾卡在
+      （已做 manifest/文件存在/大小一致 + `final.verify` 试解码与时长/分辨率；
+      黑边、静音段、片尾卡仍需真实产线的画面/音频分析，未做）。
 - [ ] 检查人物外观和服装（对照冻结文本与锚点，模型辅助）。
       （P9 第一段只做确定性项；这条要模型辅助，等 P12 的审计）
 - [x] 检查场景和道具引用（`qa_refs`：镜头的 `scene` 必须在 Canon 场景表里，
@@ -1021,7 +1023,7 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
       与词级时间戳仍未接，见 `P0_FINDINGS.md` §7）。
 - [x] 实现字幕合成（`media.mux`：SRT 作为 mov_text 混进 MP4；ASR 定时待接）。
 - [x] 实现输出编码配置（`media.encode`：libx264/crf20/yuv420p/aac 128k/32kHz/faststart；成片拼接接入待真实产线）。
-- [ ] 实现输出时长/分辨率检查（`media.probe` 已支持 `expect_width`/`expect_height`/`expect_duration_ms`；成片与 `format` 绑定待真实产线）。
+- [x] 实现输出时长/分辨率检查（`media.probe` 已支持 `expect_width`/`expect_height`/`expect_duration_ms`；`final.verify` 把成片实际宽高/时长直接对 Bible `format.canvas` 与期望时长判，偏差超 100ms 或分辨率不符 ⇒ `FINAL_VERIFY_FAILED`；p10）。
 - [x] 实现输出文件完整性检查（大小与各镜头之和比对 + SHA-256 入 manifest）。
 - [x] 记录 FFmpeg 版本和参数（`media.probe` 回 ffprobe/ffmpeg 版本首行与实际探测参数）。
 - [x] 将最终成片登记为 Asset（合成后按 `episode_<N>.mp4` + `video/mp4` 入账）。
@@ -1031,8 +1033,8 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 
 - [x] 镜头能按时间顺序拼接（片尾卡留到接真实产线）。
 - [x] 音频轨道完整，响度达标（p10：混音后 aac 轨 + 两遍 loudnorm 测得 I≈-16 LUFS）。
-- [ ] 字幕同步且可见（与 ASR 时间轴一致）。
-- [ ] 输出文件可正常解码，编码参数与 `format` 一致。
+- [x] 字幕同步且可见（与 ASR 时间轴一致）（`final.verify` 的 `subtitle_sync`：成片里 `subtitles/v<N>.srt` 末条结束时刻与 ffprobe 实测时长差必须在 ±1s 内；`media.mux` 把 SRT 混成 mov_text 字幕轨，p10 用 ffprobe 验轨存在）。
+- [x] 输出文件可正常解码，编码参数与 `format` 一致（`provider_verify_file` 跑 `ffmpeg -xerror -f null` 试解码并取 `codec_name`；`final.verify` 比对 Bible `format.codec`；截断片回 `IO_ERROR`，p10）。
 - [x] 成片可以通过 asset.get 获取元数据和共享路径引用
       （路径为 `projects/<id>/assets/<name>`；合成时已登记 Asset）。
 
@@ -1326,6 +1328,7 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 | index.rebuild | P13 | write | p13b |
 | qa.align | P7 | read | p7 |
 | audit.incremental | P13 | write | p12 |
+| final.verify | P10 | read | p10 |
 | canon.diff | P4 | read | p4 |
 | story.review | P5 | read | p5b |
 | review.queue | P9 | read | p9 |
