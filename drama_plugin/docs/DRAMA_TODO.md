@@ -532,7 +532,7 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 - [x] 注册 continuity.inspect：`op_continuity_inspect` 复用 `audit_run`，
       返回账本、不变量与全历史重放结果（旧版只登记了名字，调用会报缺字段）。
 - [x] 在 episode.approve(screenplay) 内部执行事件验证和 Canon 提交（`story_validate` → `canon_commit` → `approved.json`；p5b）。
-- [x] 不提供绕过校验的外部状态写入入口（70 个操作里没有通用写文件/写状态；
+- [x] 不提供绕过校验的外部状态写入入口（71 个操作里没有通用写文件/写状态；
       Canon 只能经 `canon.commit` 逐事件校验，剧本只能经 approve 提交）。
 
 ## 验收
@@ -1295,9 +1295,15 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
       `index.rebuild` / `index.list` 百集耗时分别为 34 / 36 / 34 ms；
       `production.report` 汇总 100 集 / 零失败任务 / 不变量全绿。
 - [ ] M4 的真实部分：接真实 VideoProvider 重跑同一套百集压力。
-- [ ] 百集成本报告（GPU 小时、人工分钟、重做率、不变量红数）。
-      `production.report` 已能给出 mock 口径的集数/GPU 分钟/重做率/红数；
-      真实产线数字仍要等真实 Provider。
+- [x] 百集成本报告（GPU 小时、人工分钟、重做率、不变量红数）
+      （`production.cost`：拿真实账目（集数 / GPU 毫秒 / 渲染数 / 失败任务）
+      按每集口径外推到 `target_episodes`（默认 100），给
+      `projection.{gpu_ms, gpu_minutes, gpu_hours_milli, human_minutes,
+      redo_tasks}` 与 `per_episode.{gpu_ms, renders_pct, redo_rate_pct}`，
+      `invariants_red` 取审计 violations 条数；人工分钟 = 审片基线
+      （`review_min_per_episode`，默认 3）+ 每次重做 2 分钟；p11 断言外推
+      严格按每集放大、红数为 0。这是 mock 口径的账，真实产线数字仍要等
+      真实 Provider）。
 - [x] 镜头文件按分镜版本归档：mock 写
       `assets/v<board_version>/shot_<seq>.mp4`，不同集的分镜版本不同，
       同号镜头不再互相覆盖；`assemble` 只在本次分镜自己的目录里拼接，
@@ -1381,6 +1387,7 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 | provider.result | P8 | read | p8 |
 | provider.refs | P7 | read | p7 p8 |
 | provider.poll | P8 | read | p8 |
+| production.cost | P11 | read | p11 |
 | canon.diff | P4 | read | p4 |
 | story.review | P5 | read | p5b |
 | review.queue | P9 | read | p9 |

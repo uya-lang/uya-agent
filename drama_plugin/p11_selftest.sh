@@ -306,6 +306,27 @@ PY
 [ $? -eq 0 ] || fails=$((fails + 1))
 
 
+# 百集成本报告：拿这票真实账目（集数/GPU 毫秒/重做率/不变量红数）外推
+out=$(ask "$(cat <<JSON
+{"jsonrpc":"2.0","id":90,"method":"tools/call","params":{"name":"call","arguments":{"operation":"production.cost","input":{"project_id":"$PID","target_episodes":100}}}}
+JSON
+)")
+printf '%s' "$out" | field | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+assert d['target_episodes'] == 100, d
+m, p = d['measured'], d['projection']
+assert d['episodes_measured'] > 0, d
+assert d['per_episode']['gpu_ms'] > 0, d
+assert p['gpu_minutes'] >= 0 and p['human_minutes'] > 0, d
+# 外推必须严格按每集口径放大：gpu_ms ≈ 每集 × 100
+assert abs(p['gpu_ms'] - d['per_episode']['gpu_ms'] * 100) <= 100, d
+assert 0 <= d['per_episode']['redo_rate_pct'] <= 100, d
+assert d['invariants_red'] == 0, d
+print('PASS: 百集成本报告（每集 %d ms GPU ⇒ 100 集 %.1f GPU 分钟 / %d 人工分钟 / 重做率 %d%%）'
+      % (d['per_episode']['gpu_ms'], p['gpu_minutes'], p['human_minutes'],
+         d['per_episode']['redo_rate_pct']))"     || bad "百集成本报告口径不对"
+
 echo "----"
 if [ "$fails" -eq 0 ]; then
     echo "PASS: P11 第一段（端到端一条龙）"
