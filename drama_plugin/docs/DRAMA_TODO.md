@@ -532,7 +532,7 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 - [x] 注册 continuity.inspect：`op_continuity_inspect` 复用 `audit_run`，
       返回账本、不变量与全历史重放结果（旧版只登记了名字，调用会报缺字段）。
 - [x] 在 episode.approve(screenplay) 内部执行事件验证和 Canon 提交（`story_validate` → `canon_commit` → `approved.json`；p5b）。
-- [x] 不提供绕过校验的外部状态写入入口（65 个操作里没有通用写文件/写状态；
+- [x] 不提供绕过校验的外部状态写入入口（66 个操作里没有通用写文件/写状态；
       Canon 只能经 `canon.commit` 逐事件校验，剧本只能经 approve 提交）。
 
 ## 验收
@@ -810,19 +810,30 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 - [x] 定义 ShotAction（**必须过 provider 能力表校验**）。
 - [x] 定义 ShotDialogue（台词逐字，供 ASR 核对与字幕定时）。
 - [x] 定义 ShotAudio（`audio.has_dialogue` 由台词有无判定）。
-- [ ] 定义 ShotStateTransition。
-- [ ] 定义 ShotReference（参考图顺序 + 版本）。
+- [x] 定义 ShotStateTransition（`shot.state` 每镜出 `transition`
+      `{added_characters, removed_characters, added_props}`：本镜所在场景的
+      在场集合减去上一镜的差值；首镜 state_in = state_out，表示开集时人已在
+      场；p7）。
+- [x] 定义 ShotReference（参考图顺序 + 版本）（`shot.state` 的
+      `references.{characters,props}[]`：每项 `{id, asset_version,
+      frozen_hash}`，顺序与在场集合一致——出图时按这个顺序喂参考图；
+      `frozen_hash` 是 Bible 冻结文本 hash 前 12 位；p7）。
 - [x] 定义接戏枚举：`anchor`（上一镜末帧当本镜第 0 帧）/`hard_cut`
       （+ 接戏句）/`card`（片尾卡，不参与接戏校验）。
 - [x] 将镜头关联到剧本段落和事件（分镜 `source` 记 `script_version`/
       `scene`/`shot`，并新增 `events`：剧本 `candidate_events` 里提到这一镜
       场景或角色的下标；p7 断言每镜都有且下标合法）。
 - [x] 生成景别、机位、动作和镜头时长。
-- [ ] 生成镜头起始状态和预期结束状态。
-- [ ] 引用角色、场景和道具的固定资产版本（含冻结文本）。
-- [ ] 检查镜头之间状态连续（含锚帧接戏差的判据定义）
-      （锚帧判据已定义并实现：`shot.anchor` 的 PSNR ≥ 阈值，见 P10 验收；
-      状态连续部分仍未做）。
+- [x] 生成镜头起始状态和预期结束状态（`shot.state` 每镜出
+      `state_in`/`state_out` = `{characters, props}` 两个在场集合，state_in
+      取上一镜 state_out；p7 断言 dad 出、kid 进）。
+- [x] 引用角色、场景和道具的固定资产版本（含冻结文本）（同上
+      `references`；角色另带 Bible `asset_version` 与冻结文本 hash 前缀，
+      p7 断言两人 hash 不同）。
+- [x] 检查镜头之间状态连续（含锚帧接戏差的判据定义）（状态连续：`shot.state`
+      逐镜比对"在场集合"，说话人（`who`）不在本镜场景里就算断点，回
+      `CONTINUITY_BREAK`；锚帧接戏差判据：`shot.anchor` 的 PSNR ≥ 阈值。
+      p7 / p10）。
 - [x] 检查总时长与目标时长（Σ镜头 = 正片，误差 ≤0.05 s；片尾卡单列）。
 - [x] 将分镜保存为不可变版本。
 
@@ -1342,6 +1353,7 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 | final.verify | P10 | read | p10 |
 | shot.anchor | P10 | read | p10 |
 | character.voice | P13 | read | p9 |
+| shot.state | P7 | read | p7 |
 | canon.diff | P4 | read | p4 |
 | story.review | P5 | read | p5b |
 | review.queue | P9 | read | p9 |

@@ -272,6 +272,87 @@ assert d.get('code') == 'ACTION_UNSUPPORTED', d
 print('PASS: 越出能力表的动作在体检阶段被拒（ACTION_UNSUPPORTED）')" \
     || bad "动作体检没拦住"
 
+# ---------- 镜头状态进出 / 迁移 / 引用固定资产版本 ----------
+PSS=$(ask "$(cat <<JSON
+{"jsonrpc":"2.0","id":70,"method":"tools/call","params":{"name":"call","arguments":{"operation":"project.create","input":{"name":"状态进出"}}}}
+JSON
+)" | field | python3 -c "
+import json,sys
+print(json.load(sys.stdin)['project_id'])")
+ask "$(cat <<JSON
+{"jsonrpc":"2.0","id":71,"method":"tools/call","params":{"name":"call","arguments":{"operation":"bible.put","input":{"project_id":"$PSS","bible":{"characters":[{"id":"dad"},{"id":"kid"}]},"locks":{"dad":"短寸头，深灰夹克","kid":"马尾，校服"}}}}}
+JSON
+)" > /dev/null
+ask "$(cat <<JSON
+{"jsonrpc":"2.0","id":72,"method":"tools/call","params":{"name":"call","arguments":{"operation":"canon.commit","input":{"project_id":"$PSS","base_revision":0,"events":[{"type":"scene.define","scene":"living_room"},{"type":"scene.define","scene":"kitchen"},{"type":"character.place","character":"dad","scene":"living_room"},{"type":"character.place","character":"kid","scene":"kitchen"}]}}}}
+JSON
+)" > /dev/null
+mkdir -p "$DATA/projects/$PSS/boards"
+python3 - "$DATA/projects/$PSS/boards/v1.json" <<'PY'
+import json
+import sys
+
+shots = [
+    {"shot_id": "s1", "sequence": 1, "scene": "living_room",
+     "cut_type": "anchor", "who": "dad"},
+    {"shot_id": "s2", "sequence": 2, "scene": "kitchen",
+     "cut_type": "hard_cut"},
+    {"shot_id": "s3", "sequence": 3, "scene": "kitchen",
+     "cut_type": "hard_cut", "who": "kid"},
+]
+board = {"format_version": 1, "version": 1, "source_script_version": 1,
+         "shot_count": 3, "shots": shots}
+open(sys.argv[1], "w").write(json.dumps(board, ensure_ascii=False))
+PY
+out=$(ask "$(cat <<JSON
+{"jsonrpc":"2.0","id":73,"method":"tools/call","params":{"name":"call","arguments":{"operation":"shot.state","input":{"project_id":"$PSS","board_version":1}}}}
+JSON
+)")
+printf '%s' "$out" | field | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+s1, s2 = d['shots'][0], d['shots'][1]
+assert s1['state_out']['characters'] == ['dad'], s1
+assert s2['state_out']['characters'] == ['kid'], s2
+assert s2['transition']['added_characters'] == ['kid'], s2
+assert s2['transition']['removed_characters'] == ['dad'], s2
+assert s2['state_in']['characters'] == ['dad'], s2
+assert d['continuity_breaks'] == 0, d
+print('PASS: 镜头状态进出与迁移（dad 出、kid 进）都对上了')" \
+    || bad "镜头状态进出不对"
+
+printf '%s' "$out" | field | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+ref = d['shots'][0]['references']['characters'][0]
+assert ref['id'] == 'dad', ref
+assert len(ref['frozen_hash']) == 12, ref
+assert ref['asset_version'] == d['bible_version'], ref
+s2 = d['shots'][1]['references']['characters'][0]
+assert s2['frozen_hash'] != ref['frozen_hash'], (ref, s2)
+print('PASS: 引用固定资产版本（Bible v%d + 冻结文本 hash 前 12 位，逐人不同）'
+      % d['bible_version'])" || bad "固定资产引用不对"
+
+python3 - "$DATA/projects/$PSS/boards/v1.json" <<'PY'
+import json
+import sys
+
+p = sys.argv[1]
+b = json.load(open(p))
+b['shots'][1]['who'] = 'mom'    # 厨房里没有 mom
+json.dump(b, open(p, 'w'), ensure_ascii=False)
+PY
+out=$(ask "$(cat <<JSON
+{"jsonrpc":"2.0","id":74,"method":"tools/call","params":{"name":"call","arguments":{"operation":"shot.state","input":{"project_id":"$PSS","board_version":1}}}}
+JSON
+)")
+printf '%s' "$out" | field | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+assert d.get('code') == 'CONTINUITY_BREAK', d
+print('PASS: 说话人不在这一镜的场景里 ⇒ CONTINUITY_BREAK')" \
+    || bad "说话人不在场没被拒"
+
 echo "----"
 if [ "$fails" -eq 0 ]; then
     echo "PASS: P7 第一段（分镜生成 / 版本 / 时长口径）"
