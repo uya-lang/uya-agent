@@ -33,7 +33,8 @@ if ! bash "$HERE/build.sh" > "$WORK/build.log" 2>&1; then
 fi
 ok "构建通过"
 
-call() {
+# 一次调用：输出 text（失败时输出空串）
+call_once() {
     op="$1"
     input="$2"
     printf '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"call","arguments":{"operation":"%s","input":%s}}}\n' \
@@ -43,8 +44,22 @@ call() {
 import json
 import sys
 
-d = json.loads(sys.stdin.read().strip())
-print(d["result"]["content"][0]["text"])'
+raw = sys.stdin.read().strip()
+try:
+    d = json.loads(raw)
+    print(d["result"]["content"][0]["text"])
+except Exception:
+    print("")'
+}
+
+# 带一次重试：百集连跑时偶发空回（serve 被中断/管道半截）不该算产线失败
+call() {
+    out=$(call_once "$1" "$2")
+    if [ -z "$out" ]; then
+        sleep 1
+        out=$(call_once "$1" "$2")
+    fi
+    printf '%s\n' "$out"
 }
 
 mkdir -p "$DATA/projects/p_stress/assets"
