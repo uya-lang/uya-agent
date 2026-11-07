@@ -264,6 +264,14 @@ Uya 的 `media.probe` 复探一致。`final` 入口失败在环境上（产线 `
 要 `/tmp/asrvenv/bin/python` 这个 ASR venv，本机没有），`pipeline.run` 如实
 把非 0 退出码与 `stderr` 尾部回给了调用方。
 
+### 规模压力（`real_stress.sh`，可选）
+
+`EPISODES=N bash drama_plugin/real_stress.sh`：把样板集复制成 N 集，逐集走
+`pipeline.run`（`lint` → 可选 `generate` → `cards` → `build`）再用
+`media.probe` 复探成片，最后汇总"集数 / 合计 MB / 片长区间 / 墙钟"。
+`REUSE=1`（默认）复用样板集已生成的真镜头，只跑不占 GPU 的那几段；`REUSE=0`
+才真生成（6–20 分钟/镜）。
+
 ### 错误映射（四类共用）
 
 | 情况 | 错误码 |

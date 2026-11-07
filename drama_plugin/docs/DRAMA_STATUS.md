@@ -36,6 +36,7 @@
 | `p17_selftest.sh` | 真产线产能：提交/完成/镜数/每镜均值/重做率/百集外推 | 8 |
 | `p18_selftest.sh` | 人物外观/服装：PSNR 锚帧门 / VLM OK+DRIFT / 阈值可调 | 12 |
 | `real_gpu_check.sh`（不是自测，需真 GPU） | 真产线入口：lint / dry / [REAL_SHOT] / capacity | 4–5 |
+| `real_stress.sh`（不是自测，需真产线） | N 集过真产线：lint → [生成] → cards → build → probe | 按集数 |
 | `build_selftest.sh` | 独立构建入口：任意 cwd / 输出路径 / 启动 | 4 |
 | `pack.sh`（不是自测） | 打交付包：bin/docs/src/selftest + tar.gz + sha256 | — |
 | `p5e_selftest.sh` | 百集大纲与批准（系列层） | 12 |
