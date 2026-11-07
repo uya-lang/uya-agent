@@ -221,6 +221,29 @@ JSON
 [ "$(code_of "$out")" = "OK" ] && ok "外观漂移有显式豁免通道（allow_drift）" \
     || bad "豁免通道不通（$(code_of "$out")）"
 
+# ---------- 6.7 冻结文本被改写（文件级篡改 ⇒ BIBLE_TAMPERED） ----------
+python3 - "$DATA/projects/$P6/bible/v1.json" <<'PY'
+import sys
+
+p = sys.argv[1]
+raw = open(p, 'rb').read()
+# 载荷里改一个角色 ID（等长替换），content_hash 不动 ⇒ 审计必须报出来
+raw = raw.replace('"id":"dad"'.encode(), '"id":"mum"'.encode(), 1)
+open(p, 'wb').write(raw)
+PY
+out=$(ask "$(cat <<JSON
+{"jsonrpc":"2.0","id":72,"method":"tools/call","params":{"name":"call","arguments":{"operation":"canon.audit","input":{"project_id":"$P6"}}}}
+JSON
+)")
+printf '%s' "$out" | field | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+codes={v['code'] for v in d['violations']}
+assert 'BIBLE_TAMPERED' in codes, d
+assert d['ok'] is False, d
+print('PASS: 冻结文本被改写 ⇒ BIBLE_TAMPERED（审计不绿）')" \
+    || bad "改冻结文本没被审计发现"
+
 # ---------- 7. 世界规则被推翻 ----------
 P7=$(new_project "反例-规则被推翻")
 ask "$(cat <<JSON

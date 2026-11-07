@@ -757,8 +757,11 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 - [x] 验证事件因果成立。
 - [x] 验证重复 `(operation, input_hash)` 不会创建重复任务（幂等重放）。
 - [x] 验证视频失败不会改变 Canon（p9：失败/重试前后 canon.json md5 不变）。
-- [ ] 逐集比对**冻结文本 hash 未变**、`CharacterState` 变体在允许集合内、
+- [x] 逐集比对**冻结文本 hash 未变**、`CharacterState` 变体在允许集合内、
       知识事实无"提前知道"、道具位置变化都能追到事件。
+      （冻结文本：`check_bible` 逐版复算 Bible 快照的 `content_hash`，
+      载荷被改就报 `BIBLE_TAMPERED`，p12b 改了角色 ID 被抓到；知识/道具
+      两条分别由 `KNOWLEDGE_LEAK` / `PROP_TELEPORT` 覆盖，p12b 反例 1、2。）
 - [x] 文本按码点计数（汉字算 1），时长按"念出来的字符数"折算（`cp_count`；p7）。
 
 ## 通过标准（M1 门槛）
@@ -962,7 +965,9 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 - [x] 承诺回收率：`overdue` 必须为 0，`waived` 必须有原因与新到期集。
 - [ ] 人物漂移：外观锚帧与首集基准比对；台词语料画像（人称、口头禅、
       句长、语速）比对。
-- [ ] 笑点重复：连续 20 集内结构重复率超阈值即报告。
+- [x] 笑点重复：连续 20 集内结构重复率超阈值即报告（`check_comedy`
+      在 20 集窗口内统计 `comedy.setup`，同一 setup 出现超过一半就报
+      `COMEDY_REPEAT`；窗口没装满不判，避免样板期误报）。
 - [ ] 逻辑矛盾：全历史 `ORPHAN_CHANGE`/`TIMELINE_CONFLICT`/`RULE_VIOLATION`
       清零。
 - [x] 审计报告进资产；不通过不允许批量推进（`canon.audit` 把报告写
