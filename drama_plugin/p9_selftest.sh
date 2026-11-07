@@ -334,6 +334,65 @@ assert 'QA_WHO_UNKNOWN' in codes, codes
 print('PASS: 台词说话人不在 Bible 角色表 ⇒ QA_WHO_UNKNOWN')" \
     || bad "没报 QA_WHO_UNKNOWN"
 
+# ---------- 台词语料画像：人称/句长跨集漂移 ----------
+PV2=$(ask "$(cat <<JSON
+{"jsonrpc":"2.0","id":47,"method":"tools/call","params":{"name":"call","arguments":{"operation":"project.create","input":{"name":"语料"}}}}
+JSON
+)" | field | python3 -c "
+import json,sys
+print(json.load(sys.stdin)['project_id'])")
+mkdir -p "$DATA/projects/$PV2/scripts"
+python3 - "$DATA/projects/$PV2/scripts" <<'PY'
+import json
+import os
+import sys
+
+d = sys.argv[1]
+
+
+def sp(spec):
+    return {"format_version": 1, "version": 1, "content_hash": "x",
+            "screenplay": {"title": "t", "theme": "a", "conflict": "b",
+                           "twist": "c", "hook": "d",
+                           "comedy": {"setup": "e", "payoff": "f"},
+                           "scenes": [{"no": 1, "action": "a",
+                                       "dialogue": spec}],
+                           "candidate_events": []}}
+
+
+steady = [{"who": "dad", "line": "我不去。"}] * 3
+# v1/v2 里 kid 也是短句，v3 突然变长：句长漂移
+short = [{"who": "kid", "line": "我去。"}] * 3
+long = [{"who": "kid", "line": "我今天真的不想去那个地方了。"}] * 3
+for i, spec in enumerate([steady + short, steady + short,
+                          steady + long], 1):
+    open(os.path.join(d, "v%d.json" % i), "w").write(
+        json.dumps(sp(spec), ensure_ascii=False))
+PY
+out=$(ask "$(cat <<JSON
+{"jsonrpc":"2.0","id":48,"method":"tools/call","params":{"name":"call","arguments":{"operation":"character.voice","input":{"project_id":"$PV2","from_version":1,"to_version":3}}}}
+JSON
+)")
+printf '%s' "$out" | field | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+by={c['id']: c for c in d['characters']}
+assert by['dad']['drift'] is False, by['dad']
+assert by['kid']['drift'] is True, by['kid']
+assert d['drifted'] == 1, d
+print('PASS: 台词画像（句长/人称）跨集比对：dad 稳定、kid 变长被抓到')" \
+    || bad "语料画像漂移判错"
+
+out=$(ask "$(cat <<JSON
+{"jsonrpc":"2.0","id":49,"method":"tools/call","params":{"name":"call","arguments":{"operation":"character.voice","input":{"project_id":"$PV2","from_version":1,"to_version":2}}}}
+JSON
+)")
+printf '%s' "$out" | field | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+assert d['drifted'] == 0, d
+print('PASS: 同一集台词画像不漂（阈值不误报）')" || bad "同一集误报漂移"
+
 # ---------- 抽样审批队列 ----------
 out=$(ask "$(cat <<JSON
 {"jsonrpc":"2.0","id":51,"method":"tools/call","params":{"name":"call","arguments":{"operation":"review.queue","input":{"project_id":"$PID"}}}}

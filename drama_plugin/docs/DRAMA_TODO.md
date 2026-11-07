@@ -532,7 +532,7 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 - [x] 注册 continuity.inspect：`op_continuity_inspect` 复用 `audit_run`，
       返回账本、不变量与全历史重放结果（旧版只登记了名字，调用会报缺字段）。
 - [x] 在 episode.approve(screenplay) 内部执行事件验证和 Canon 提交（`story_validate` → `canon_commit` → `approved.json`；p5b）。
-- [x] 不提供绕过校验的外部状态写入入口（64 个操作里没有通用写文件/写状态；
+- [x] 不提供绕过校验的外部状态写入入口（65 个操作里没有通用写文件/写状态；
       Canon 只能经 `canon.commit` 逐事件校验，剧本只能经 approve 提交）。
 
 ## 验收
@@ -970,8 +970,11 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 
 - [x] 历史重放：抽 10 条提交（含第 1 与当前）＋全历史重放 hash 比对（p13c）。
 - [x] 承诺回收率：`overdue` 必须为 0，`waived` 必须有原因与新到期集。
-- [ ] 人物漂移：外观锚帧与首集基准比对；台词语料画像（人称、口头禅、
-      句长、语速）比对。
+- [x] 人物漂移·台词语料画像：`character.voice` 逐版扫台词，出每人「句长
+      （码点×1000）＋人称占比（我/你/他/她）」两张画像，基线版与最新版比：
+      句长变化超 50% 或人称占比差超 30 个百分点判 `drift`；每边至少 3 句才
+      判，避免冷启动误报（p9）。口头禅/语速两项未做。
+- [ ] 人物漂移·外观锚帧：与首集基准比对（要真实出图，待产线）。
 - [x] 笑点重复：连续 20 集内结构重复率超阈值即报告（`check_comedy`
       在 20 集窗口内统计 `comedy.setup`，同一 setup 出现超过一半就报
       `COMEDY_REPEAT`；窗口没装满不判，避免样板期误报）。
@@ -1335,6 +1338,7 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 | audit.incremental | P13 | write | p12 |
 | final.verify | P10 | read | p10 |
 | shot.anchor | P10 | read | p10 |
+| character.voice | P13 | read | p9 |
 | canon.diff | P4 | read | p4 |
 | story.review | P5 | read | p5b |
 | review.queue | P9 | read | p9 |
