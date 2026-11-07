@@ -31,6 +31,7 @@
 | `p13_selftest.sh` | 10 集规模测算（控制面耗时/审计/状态体积） | 11 |
 | `p13b_selftest.sh` | 派生索引与全量重建 | 12 |
 | `p13c_selftest.sh` | 百集 mock 视频压力 / 资产账本 / 操作审计 / 索引计时 | 23 |
+| `p15_selftest.sh` | 30 集跨题材（3 个 Bible 模板 × 每题材 EPISODES/3 集，换模板不改代码） | 12 |
 | `build_selftest.sh` | 独立构建入口：任意 cwd / 输出路径 / 启动 | 4 |
 | `pack.sh`（不是自测） | 打交付包：bin/docs/src/selftest + tar.gz + sha256 | — |
 | `p5e_selftest.sh` | 百集大纲与批准（系列层） | 12 |

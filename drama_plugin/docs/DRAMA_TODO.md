@@ -1277,8 +1277,12 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
       无人值守与真实产线仍待接。
 - [x] 百集控制面压力：`EPISODES=100 sh drama_plugin/p13_selftest.sh` 已验证
       100 次提交、全量重放、审计和状态体积；不含视频 Worker/GPU。
-- [ ] M3：30 集跨题材（题材模板参数化：Bible 模板 + 资产包模板 +
-      能力表 + `format`，换模板不改代码）。
+- [x] M3：30 集跨题材（题材模板参数化：Bible 模板 + 资产包模板 +
+      能力表 + `format`，换模板不改代码）（`p15_selftest.sh`：家庭喜剧竖屏
+      440x800 / 悬疑竖屏 / 古装横屏 1280x720 各 10 集，共 30 集；每个题材
+      只给 Bible + locks + format 三样输入，代码零分支；断言每集批准 revision
+      连续、单次 Worker 全部做完 10 个视频任务、`canon.audit` 绿、Bible 版本
+      与 format 就是模板里那份）。
 - [x] M4 的 Mock 部分：100 集 Mock 视频压力 + 抽 10 条提交历史重放。
       `EPISODES=100 sh drama_plugin/p13c_selftest.sh`：100 集先全部生成/
       批准/排队（每个任务固定建任务时的剧本版本），再一次 Worker 扫描消费
