@@ -290,6 +290,20 @@ done
 [ "$seen" -eq 3 ] && ok "三集成片都能通过 asset.get 共享路径访问" \
     || bad "只有 $seen 个成片可通过 asset.get 访问"
 
+python3 - "$DATA/projects/$PID/assets" <<'PY'
+import glob
+import json
+import sys
+
+files = sorted(glob.glob(sys.argv[1] + '/audit_v*.json'))
+assert files, '审计报告没进资产目录'
+d = json.load(open(files[0]))
+assert 'ok' in d and 'violations' in d, d
+print('PASS: 审计报告进资产（%d 份，audit_v*.json）' % len(files))
+PY
+[ $? -eq 0 ] || fails=$((fails + 1))
+
+
 echo "----"
 if [ "$fails" -eq 0 ]; then
     echo "PASS: P11 第一段（端到端一条龙）"

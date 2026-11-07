@@ -444,8 +444,11 @@ print("PASS: 镜头文件按分镜版本分 %d 个目录，共 %d 个文件" %
       (len(dirs), len(shots)))
 index = project / "assets.jsonl"
 lines = [x for x in index.read_text().splitlines() if x.strip()]
-assert len(lines) == n * 3, len(lines)
-names = {json.loads(x)["name"] for x in lines}
+shot_idx = [x for x in lines if 'shot_' in x]
+audit_idx = [x for x in lines if 'audit_v' in x]
+assert len(shot_idx) == n * 3, len(shot_idx)
+assert audit_idx, lines
+names = {json.loads(x)["name"] for x in shot_idx}
 assert len(names) == n * 3, len(names)
 assert "v%d/shot_1.mp4" % (n // 2) in names, sorted(names)[:3]
 import hashlib

@@ -150,6 +150,14 @@ assert 'PROMISE_OVERDUE' in codes, d
 print('PASS: 反例 4：伏笔落空 ⇒ PROMISE_OVERDUE')" \
     || bad "反例 4 没报 PROMISE_OVERDUE"
 
+out=$(ask "$(cat <<JSON
+{"jsonrpc":"2.0","id":31,"method":"tools/call","params":{"name":"call","arguments":{"operation":"episode.batch","input":{"project_id":"$P4","episodes":"e1"}}}}
+JSON
+)")
+[ "$(code_of "$out")" = "AUDIT_FAILED" ] \
+    && ok "审计不绿时批量推进被拒（AUDIT_FAILED）" \
+    || bad "红审计还能批量推进（$(code_of "$out")）"
+
 # ---------- 5. 时间悖论 ----------
 P5=$(new_project "反例-时间悖论")
 init_world "$P5"
