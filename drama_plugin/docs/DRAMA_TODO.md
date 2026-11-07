@@ -532,7 +532,7 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 - [x] 注册 continuity.inspect：`op_continuity_inspect` 复用 `audit_run`，
       返回账本、不变量与全历史重放结果（旧版只登记了名字，调用会报缺字段）。
 - [x] 在 episode.approve(screenplay) 内部执行事件验证和 Canon 提交（`story_validate` → `canon_commit` → `approved.json`；p5b）。
-- [x] 不提供绕过校验的外部状态写入入口（61 个操作里没有通用写文件/写状态；
+- [x] 不提供绕过校验的外部状态写入入口（62 个操作里没有通用写文件/写状态；
       Canon 只能经 `canon.commit` 逐事件校验，剧本只能经 approve 提交）。
 
 ## 验收
@@ -1149,7 +1149,10 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 - [x] 实现 DESIGN §6.11 的九条谓词与错误码（六条反例 + 规则/钩子/时序三类已覆盖）。
 - [x] 每条错误带定位（对象 ID）：事件错误回 `object`，审计违规也带 `object`；
       集号/镜号的定位留到接真实产线（现在错误发生在对象层）。
-- [ ] 增量检查：只查受影响实体，复杂度 O(集数)；不能复用未经校验的旧审计结论。
+- [x] 增量检查：只查受影响实体，复杂度 O(集数)；不能复用未经校验的旧审计结论
+      （`audit.incremental` 读 `<proj>/audit/watermark.json` 的水位，只重放
+      水位之后的提交；水位那一条必做一次抽查，被改过照样
+      `AUDIT_REPLAY_MISMATCH`，不拿旧结论当新结论；p12）。
 - [x] 全历史检查模式（`canon.audit` 每次逐条校验提交记录与索引 hash；可手动触发）。
 - [x] 百集规模下单集提交检查 < 3 s（p13 实测每集数十 ms，断言阈值 3 s）。
 
@@ -1322,6 +1325,7 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 | production.report | P13 | read | p13c |
 | index.rebuild | P13 | write | p13b |
 | qa.align | P7 | read | p7 |
+| audit.incremental | P13 | write | p12 |
 | canon.diff | P4 | read | p4 |
 | story.review | P5 | read | p5b |
 | review.queue | P9 | read | p9 |

@@ -259,6 +259,31 @@ codes={v['code'] for v in d['violations']}
 assert 'ASSET_MISSING' in codes, codes
 print('PASS: 资产文件不见了 ⇒ ASSET_MISSING')" || bad "资产缺失没被抓"
 
+# ---------- 增量审计：只重放水位之后的提交 ----------
+out=$(ask "$(cat <<JSON
+{"jsonrpc":"2.0","id":81,"method":"tools/call","params":{"name":"call","arguments":{"operation":"audit.incremental","input":{"project_id":"$PID"}}}}
+JSON
+)")
+printf '%s' "$out" | field | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+assert d['since_revision'] == 0, d
+assert d['checked_commits'] == d['report']['commits'], d
+print('PASS: 首次增量审计从 0 开始，重放全部 %d 条提交'
+      % d['checked_commits'])" || bad "首次增量审计不对"
+
+out=$(ask "$(cat <<JSON
+{"jsonrpc":"2.0","id":82,"method":"tools/call","params":{"name":"call","arguments":{"operation":"audit.incremental","input":{"project_id":"$PID"}}}}
+JSON
+)")
+printf '%s' "$out" | field | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+assert d['since_revision'] == d['report']['revision'], d
+assert d['checked_commits'] == 1, d
+print('PASS: 水位之后没有新提交 ⇒ 只抽查 1 条（O(新集数)）')" \
+    || bad "第二次增量审计没有走增量"
+
 echo "----"
 if [ "$fails" -eq 0 ]; then
     echo "PASS: P12 第一段（闭环审计）"
