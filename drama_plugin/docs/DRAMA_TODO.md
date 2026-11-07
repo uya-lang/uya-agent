@@ -532,7 +532,7 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 - [x] 注册 continuity.inspect：`op_continuity_inspect` 复用 `audit_run`，
       返回账本、不变量与全历史重放结果（旧版只登记了名字，调用会报缺字段）。
 - [x] 在 episode.approve(screenplay) 内部执行事件验证和 Canon 提交（`story_validate` → `canon_commit` → `approved.json`；p5b）。
-- [x] 不提供绕过校验的外部状态写入入口（63 个操作里没有通用写文件/写状态；
+- [x] 不提供绕过校验的外部状态写入入口（64 个操作里没有通用写文件/写状态；
       Canon 只能经 `canon.commit` 逐事件校验，剧本只能经 approve 提交）。
 
 ## 验收
@@ -820,7 +820,9 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 - [x] 生成景别、机位、动作和镜头时长。
 - [ ] 生成镜头起始状态和预期结束状态。
 - [ ] 引用角色、场景和道具的固定资产版本（含冻结文本）。
-- [ ] 检查镜头之间状态连续（含锚帧接戏差的判据定义）。
+- [ ] 检查镜头之间状态连续（含锚帧接戏差的判据定义）
+      （锚帧判据已定义并实现：`shot.anchor` 的 PSNR ≥ 阈值，见 P10 验收；
+      状态连续部分仍未做）。
 - [x] 检查总时长与目标时长（Σ镜头 = 正片，误差 ≤0.05 s；片尾卡单列）。
 - [x] 将分镜保存为不可变版本。
 
@@ -943,7 +945,10 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
       （`qa.align`：转录一行一条台词，编辑距离算每镜百分比，低于 85 列
       `mismatches`；字幕时间轴用 `media.subtitle` 的分镜时间；p7）。真实
       ASR 引擎仍未接，转录文本由调用方/外部工具给。
-- [ ] 锚帧接戏差：`cut_type="anchor"` 的镜头与上一镜末帧做像素差比对。
+- [x] 锚帧接戏差：`cut_type="anchor"` 的镜头与上一镜末帧做像素差比对
+      （`shot.anchor`：ffmpeg 取上一镜末帧与这一镜首帧，缩到 64×64 灰度算
+      PSNR，`average_mdb` 低于 `threshold_db`（默认 30 dB）回
+      `ANCHOR_JUMP`；两帧完全一致按 `inf` 处理；p10 用静态色块验真）。
 - [ ] 成片终检：可解码、无空文件、无黑边、无长静音段、时长一致、片尾卡在
       （已做 manifest/文件存在/大小一致 + `final.verify` 试解码与时长/分辨率；
       黑边、静音段、片尾卡仍需真实产线的画面/音频分析，未做）。
@@ -1329,6 +1334,7 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 | qa.align | P7 | read | p7 |
 | audit.incremental | P13 | write | p12 |
 | final.verify | P10 | read | p10 |
+| shot.anchor | P10 | read | p10 |
 | canon.diff | P4 | read | p4 |
 | story.review | P5 | read | p5b |
 | review.queue | P9 | read | p9 |

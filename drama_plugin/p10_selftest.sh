@@ -358,7 +358,59 @@ import json,sys
 d=json.load(sys.stdin)
 names={c['name']: c['ok'] for c in d['checks']}
 assert names.get('subtitle_sync') is True, d
-print('PASS: 字幕末条与成片时长对齐（±1s）')" || bad "字幕对轴没通过"
+print('PASS: 字幕末条与成片时长对齐（±1s）')" || bad "字幕对轴没通过"    # 锚帧接戏差：上一镜末帧 vs 这一镜首帧
+    mkdir -p "$DATA/projects/$PV/boards" "$DATA/projects/$PV/assets/v1"
+    python3 - "$DATA/projects/$PV/boards/v1.json" <<'PY'
+import json
+import sys
+
+shots = [{"sequence": i, "scene": "living_room", "cut_type": "anchor"}
+         for i in (1, 2, 3)]
+board = {"format_version": 1, "version": 1, "source_script_version": 1,
+         "shot_count": 3, "shots": shots}
+open(sys.argv[1], "w").write(json.dumps(board, ensure_ascii=False))
+PY
+    for n in 1 2 3; do
+        ffmpeg -v error -f lavfi \
+            -i "color=c=blue:duration=1:size=160x160:rate=10" \
+            -pix_fmt yuv420p "$DATA/projects/$PV/assets/v1/shot_$n.mp4" -y \
+            >/dev/null 2>&1
+    done
+    out=$(ask "$(cat <<JSON
+{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"call","arguments":{"operation":"shot.anchor","input":{"project_id":"$PV","board_version":1}}}}
+JSON
+)")
+    printf '%s' "$out" | field | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+assert d['checked'] == 2 and d['passed'] == 2, d
+assert d['ok'] is True, d
+print('PASS: 相邻两镜首末帧一致 ⇒ 锚帧接戏检查通过（%d 处）' % d['checked'])" \
+        || bad "锚帧接戏检查没通过"
+
+    ffmpeg -v error -f lavfi -i "color=c=red:duration=1:size=160x160:rate=10" \
+        -pix_fmt yuv420p "$DATA/projects/$PV/assets/v1/shot_3.mp4" -y \
+        >/dev/null 2>&1
+    out=$(ask "$(cat <<JSON
+{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"call","arguments":{"operation":"shot.anchor","input":{"project_id":"$PV","board_version":1}}}}
+JSON
+)")
+    [ "$(code_of "$out")" = "ANCHOR_JUMP" ] \
+        && ok "上一镜末帧与这一镜首帧差太多 ⇒ ANCHOR_JUMP" \
+        || bad "接戏差没被拒（$(code_of "$out")）"
+
+    out=$(ask "$(cat <<JSON
+{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"call","arguments":{"operation":"shot.anchor","input":{"project_id":"$PV","board_version":1,"threshold_db":5}}}}
+JSON
+)")
+    printf '%s' "$out" | field | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+assert d['ok'] is True, d
+assert d['threshold_db'] == 5, d
+print('PASS: 阈值可调（5 dB 下设成通过，判据不写死）')" \
+        || bad "阈值参数没生效"
+
 fi
 
 # ---------- 媒体输入探测（ffprobe） ----------
