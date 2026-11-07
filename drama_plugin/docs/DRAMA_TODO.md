@@ -978,8 +978,11 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 - [x] 笑点重复：连续 20 集内结构重复率超阈值即报告（`check_comedy`
       在 20 集窗口内统计 `comedy.setup`，同一 setup 出现超过一半就报
       `COMEDY_REPEAT`；窗口没装满不判，避免样板期误报）。
-- [ ] 逻辑矛盾：全历史 `ORPHAN_CHANGE`/`TIMELINE_CONFLICT`/`RULE_VIOLATION`
-      清零。
+- [x] 逻辑矛盾：全历史 `ORPHAN_CHANGE`/`TIMELINE_CONFLICT`/`RULE_VIOLATION`
+      清零（`canon_replay_history`：从空状态起逐条提交重放，任何一条事件今天
+      再判仍不合规就报，重放出的状态与提交记录的 `state` 逐字节比对；
+      `canon.audit` 汇总成 `HISTORY_CONTRADICTION`。增量审计不跑这段
+      O(集数) 的重放；p12b 往历史里塞孤儿变更被抓到）。
 - [x] 审计报告进资产；不通过不允许批量推进（`canon.audit` 把报告写
       `assets/audit_v<revision>.json` 并登记进资产账本；`episode.batch` 先跑
       审计，不绿直接回 `AUDIT_FAILED`；p11 / p12b）。

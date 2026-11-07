@@ -326,6 +326,51 @@ d=json.load(sys.stdin)
 assert d['overdue'] == 0, d
 print('PASS: 延期后 promise.report 的 overdue 归零')" || bad "延期后回收账不对"
 
+# ---------- 8.5 历史被改写 ⇒ 全历史重放对不上（逻辑矛盾清零） ----------
+P8=$(new_project "反例-历史重放")
+ask "$(cat <<JSON
+{"jsonrpc":"2.0","id":80,"method":"tools/call","params":{"name":"call","arguments":{"operation":"canon.commit","input":{"project_id":"$P8","base_revision":0,"events":[{"type":"scene.define","scene":"living_room"},{"type":"character.place","character":"dad","scene":"living_room"}]}}}}
+JSON
+)" > /dev/null
+ask "$(cat <<JSON
+{"jsonrpc":"2.0","id":81,"method":"tools/call","params":{"name":"call","arguments":{"operation":"canon.commit","input":{"project_id":"$P8","base_revision":1,"events":[{"type":"scene.set","scene":"living_room","field":"time_of_day","value":"night"}]}}}}
+JSON
+)" > /dev/null
+out=$(ask "$(cat <<JSON
+{"jsonrpc":"2.0","id":82,"method":"tools/call","params":{"name":"call","arguments":{"operation":"canon.audit","input":{"project_id":"$P8"}}}}
+JSON
+)")
+printf '%s' "$out" | field | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+assert d['ok'] is True, d
+print('PASS: 历史干净时全历史重放一致（%d 条提交）' % d['commits'])" \
+    || bad "干净历史重放不一致"
+
+# 往第 2 条提交里塞一条引用不存在道具的事件：state 不动，但重放会炸
+python3 - "$DATA/projects/$P8/commits/2.json" <<'PY'
+import json
+import sys
+
+p = sys.argv[1]
+d = json.load(open(p))
+d['events'].append({"type": "prop.move", "prop": "ghost",
+                    "to_scene": "living_room"})
+open(p, 'w').write(json.dumps(d, ensure_ascii=False))
+PY
+out=$(ask "$(cat <<JSON
+{"jsonrpc":"2.0","id":83,"method":"tools/call","params":{"name":"call","arguments":{"operation":"canon.audit","input":{"project_id":"$P8"}}}}
+JSON
+)")
+printf '%s' "$out" | field | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+codes={v['code'] for v in d['violations']}
+assert 'HISTORY_CONTRADICTION' in codes, d
+assert d['ok'] is False, d
+print('PASS: 历史里塞进孤儿变更 ⇒ 重放报 HISTORY_CONTRADICTION')" \
+    || bad "历史矛盾没被重放抓住"
+
 echo "----"
 if [ "$fails" -eq 0 ]; then
     echo "PASS: P12 第二段（反例库六条）"
