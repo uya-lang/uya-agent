@@ -295,6 +295,25 @@ assert d['state'] == 'failed' and d['reason'] == 'budget_exceeded', d
 print('PASS: 超预算的任务被熔断（budget_exceeded），没有硬跑')" \
     || bad "预算熔断没生效"
 
+# ---------- 引用与事件核对（场景/道具/事件可追） ----------
+ask "$(cat <<JSON
+{"jsonrpc":"2.0","id":44,"method":"tools/call","params":{"name":"call","arguments":{"operation":"canon.commit","input":{"project_id":"$PID","events":[{"type":"scene.define","scene":"kitchen","time_of_day":"day"},{"type":"prop.define","prop":"remote","scene":"kitchen"}]}}}}
+JSON
+)" > /dev/null
+printf '%s' '{"format_version":1,"version":3,"content_hash":"x","screenplay":{"title":"引用","theme":"信任","conflict":"谁动了遥控器","comedy":{"setup":"藏","payoff":"找到"},"twist":"一直在口袋","hook":"遥控器去哪了？","scenes":[{"no":1,"action":"爸爸找遥控器","dialogue":[]}],"candidate_events":[{"type":"timeline.advance","minutes":1},{"type":"prop.move","prop":"tv","at_scene":"kitchen","to_scene":"kitchen"}]}}' \
+    > "$DATA/projects/$PID/scripts/v3.json"
+out=$(ask "$(cat <<JSON
+{"jsonrpc":"2.0","id":45,"method":"tools/call","params":{"name":"call","arguments":{"operation":"qa.run","input":{"project_id":"$PID","script_version":3}}}}
+JSON
+)")
+printf '%s' "$out" | field | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+codes={i['code'] for i in d['report']['issues']}
+assert 'QA_PROP_UNKNOWN' in codes, codes
+print('PASS: 事件引用了 Canon 里没有的道具 ⇒ QA_PROP_UNKNOWN')" \
+    || bad "没报 QA_PROP_UNKNOWN"
+
 # ---------- 抽样审批队列 ----------
 out=$(ask "$(cat <<JSON
 {"jsonrpc":"2.0","id":51,"method":"tools/call","params":{"name":"call","arguments":{"operation":"review.queue","input":{"project_id":"$PID"}}}}
