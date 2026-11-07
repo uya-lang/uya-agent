@@ -256,6 +256,29 @@ assert r['ok'] is False, r
 print('PASS: 超时被 timeout 掐断（退出码 124）')" \
     || bad "超时没生效"
 
+# 日志尾部截断不能切在 UTF-8 多字节字符中间（切了调用方 JSON 就解析不了）
+cat > "$ROOT/ep1/scripts/cards.py" <<'PY'
+import sys
+
+for i in range(200):
+    print("第%03d镜：字幕「你还想面试？」已插入" % i)
+sys.exit(0)
+PY
+printf '%s\n' "$(ask 24 pipeline.run \
+    "{\"pipeline_root\":\"$ROOT\",\"episode\":\"ep1\",\"entry\":\"cards\"}")" \
+    > "$TMP/b5.jsonl"
+"$BIN" mcp serve --data-dir "$DATA" < "$TMP/b5.jsonl" 2>/dev/null | tail -1 \
+    | field | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+r=d['data']['result']
+t=r['log_tail']
+assert r['exit_code'] == 0, r
+assert 0 < len(t.encode()) <= 600, len(t)
+assert '镜' in t, t[:40]
+print('PASS: 日志尾部按 UTF-8 边界截断（%d 字节，能解码）' % len(t.encode()))" \
+    || bad "日志尾部切在多字节字符中间"
+
 # 产线真的挂了（非 0 退出码）要如实回给调用方
 cat > "$ROOT/ep1/scripts/cards.py" <<'PY'
 import sys
