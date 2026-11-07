@@ -236,6 +236,21 @@ sh drama_plugin/p8_selftest.sh
 - 注意：`httpc` 的请求缓冲原来是 8 KB（栈上），装不下几百 KB 的图，已改成
   1 MB 堆缓冲；响应缓冲同样给到 1 MB。
 
+### 真机验收（`real_gpu_check.sh`，可选）
+
+`bash drama_plugin/real_gpu_check.sh` 对既有产线跑不占 GPU 的入口（`lint`、
+`generate --dry`）并复算产能；`REAL_SHOT=3 bash ...` 再真生成一镜（6–15 分钟，
+需要 ComfyUI 在 `H3_HOST`）。这脚本不进 CI（`p*_selftest.sh` 那个循环），
+因为它要真 GPU 与真产线目录。
+
+真机实测（2026-11-07，RTX 3060 12G + MiniMax H3 int8）：
+
+| 镜号 | 帧数 | 用时 | 产物 |
+|---|---|---|---|
+| 镜1 | 158 | 13.0 min | `shot01.mp4` 889 KB / `last.png` 407 KB |
+| 镜2 | 73 | 5.7 min | `shot02.mp4` 303 KB / `last.png` 419 KB |
+| 镜3 | 107 | 8.0 min | `shot03.mp4` 452 KB / `last.png` 见目录 |
+
 ### 错误映射（四类共用）
 
 | 情况 | 错误码 |
