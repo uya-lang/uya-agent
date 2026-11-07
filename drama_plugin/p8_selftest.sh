@@ -341,6 +341,36 @@ if d['ref_count'] > 0:
 else:
     print('PASS: provider.refs 在没有在场角色时返回空参考表')" || bad "参考素材参数转换不对"
 
+# 轮询口径：排队/跑着各给不同的等待时长，终态不再问
+printf '%s' '{"format_version":1,"prompt_id":"q_poll1","task_id":"t_q","board_version":1,"state":"queued","shots":1,"gpu_ms":0,"submitted_at":1,"updated_at":1}' \
+    > "$DATA/projects/$PID/queue/t_q.json"
+printf '%s' '{"format_version":1,"prompt_id":"q_poll2","task_id":"t_r","board_version":1,"state":"running","shots":1,"gpu_ms":0,"submitted_at":1,"updated_at":1}' \
+    > "$DATA/projects/$PID/queue/t_r.json"
+out=$(ask '{"jsonrpc":"2.0","id":30,"method":"tools/call","params":{"name":"call","arguments":{"operation":"provider.poll","input":{"project_id":"'"$PID"'","task_id":"t_q"}}}}')
+printf '%s' "$out" | field | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+assert d['state'] == 'queued', d
+assert d['terminal'] is False, d
+assert d['poll_after_ms'] == 500, d
+print('PASS: 排队的任务 poll 回 queued 并让 500 ms 后再问')" \
+    || bad "排队状态的轮询口径不对"
+out=$(ask '{"jsonrpc":"2.0","id":31,"method":"tools/call","params":{"name":"call","arguments":{"operation":"provider.poll","input":{"project_id":"'"$PID"'","task_id":"t_r"}}}}')
+printf '%s' "$out" | field | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+assert d['state'] == 'running', d
+assert d['poll_after_ms'] == 1500, d
+print('PASS: 跑着的任务 poll 回 running 并让 1.5 s 后再问')" \
+    || bad "运行状态的轮询口径不对"
+out=$(ask '{"jsonrpc":"2.0","id":32,"method":"tools/call","params":{"name":"call","arguments":{"operation":"provider.poll","input":{"project_id":"'"$PID"'","task_id":"t_q2none"}}}}')
+printf '%s' "$out" | field | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+assert d['state'] == 'unknown', d
+assert d['terminal'] is False, d
+print('PASS: 没有记录的任务 poll 回 unknown')" || bad "未知任务的轮询不对"
+
 # ---------- 6. 单 Worker 锁 ----------
 mkdir -p "$DATA/locks"
 printf '{"pid":%d}' "$$" > "$DATA/locks/worker.lock"

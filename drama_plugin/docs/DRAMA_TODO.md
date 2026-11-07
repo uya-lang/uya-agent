@@ -532,7 +532,7 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 - [x] 注册 continuity.inspect：`op_continuity_inspect` 复用 `audit_run`，
       返回账本、不变量与全历史重放结果（旧版只登记了名字，调用会报缺字段）。
 - [x] 在 episode.approve(screenplay) 内部执行事件验证和 Canon 提交（`story_validate` → `canon_commit` → `approved.json`；p5b）。
-- [x] 不提供绕过校验的外部状态写入入口（69 个操作里没有通用写文件/写状态；
+- [x] 不提供绕过校验的外部状态写入入口（70 个操作里没有通用写文件/写状态；
       Canon 只能经 `canon.commit` 逐事件校验，剧本只能经 approve 提交）。
 
 ## 验收
@@ -922,7 +922,9 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 - [x] 实现单 Worker 锁（`locks/worker.lock` + pid 探活，陈旧锁自动清）。
 - [x] 实现任务状态迁移。
 - [x] 实现步骤检查点（任务记录里的 `steps[]` 落盘；p5d / p8）。
-- [ ] 实现 Provider 轮询。
+- [x] 实现 Provider 轮询（`provider.poll`：状态映射 queued/running/done/
+      failed/canceled（没记录给 unknown）+ 退避口径排队 500 ms / 跑着
+      1500 ms / 终态 0）+ `age_s`；p8）。
 - [x] 实现中断恢复（步骤状态在记录里；失败任务可重跑）。
 - [x] 实现取消处理（`production.cancel`：未完成可取消，worker 不再捡起）。
 - [x] 实现有限重试（`max_retries` + 预算熔断；p5/p8/p10）。
@@ -1374,6 +1376,7 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 | provider.cancel | P8 | write | p8 |
 | provider.result | P8 | read | p8 |
 | provider.refs | P7 | read | p7 p8 |
+| provider.poll | P8 | read | p8 |
 | canon.diff | P4 | read | p4 |
 | story.review | P5 | read | p5b |
 | review.queue | P9 | read | p9 |
