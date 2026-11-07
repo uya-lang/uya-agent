@@ -555,7 +555,7 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 - [x] 注册 continuity.inspect：`op_continuity_inspect` 复用 `audit_run`，
       返回账本、不变量与全历史重放结果（旧版只登记了名字，调用会报缺字段）。
 - [x] 在 episode.approve(screenplay) 内部执行事件验证和 Canon 提交（`story_validate` → `canon_commit` → `approved.json`；p5b）。
-- [x] 不提供绕过校验的外部状态写入入口（73 个操作里没有通用写文件/写状态；
+- [x] 不提供绕过校验的外部状态写入入口（74 个操作里没有通用写文件/写状态；
       Canon 只能经 `canon.commit` 逐事件校验，剧本只能经 approve 提交）。
 
 ## 验收
@@ -1005,8 +1005,14 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
       `no_long_silence`（silencedetect 数 ≥2 s 的静音段，一条都不许）/
       `end_card`（分镜最后一镜 `cut_type="card"`，没有分镜版本时跳过）。
       黑边/静音/片尾卡各有一个反例 + 一个正例在 p10）。
-- [ ] 检查人物外观和服装（对照冻结文本与锚点，模型辅助）。
-      （P9 第一段只做确定性项；这条要模型辅助，等 P12 的审计）
+- [x] 检查人物外观和服装（对照冻结文本与锚点，模型辅助）
+      （`qa.appearance`：冻结文本取 Bible 的 `locks[character_id]` 或入参
+      `frozen`；`use_model` 时把真图 base64 后发给本机 VLM（`llm.json` 指向
+      vision 模型，OpenAI 形状 `/v1/chat/completions`），要它第一行只回
+      OK/DRIFT；真机跑过：448×800 真帧 + 冻结文本「苏晚：短寸头，深蓝卫衣」
+      ⇒ 模型回 `DRIFT`＋「图中人物是长马尾 + 黑色西装外套配白衬衫」，判不过；
+      p18 用假 VLM 把 OK/DRIFT/未配置三条分支都钉住。注意 `httpc` 的请求
+      缓冲从 8 KB 提到 1 MB（堆上），否则几百 KB 的图发不出去）。
 - [x] 检查场景和道具引用（`qa_refs`：镜头的 `scene` 必须在 Canon 场景表里，
       否则 `QA_SCENE_UNKNOWN`；候选事件里的 `prop` 必须已定义，否则
       `QA_PROP_UNKNOWN`；p9）。
@@ -1027,7 +1033,14 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
       （码点×1000）＋人称占比（我/你/他/她）」两张画像，基线版与最新版比：
       句长变化超 50% 或人称占比差超 30 个百分点判 `drift`；每边至少 3 句才
       判，避免冷启动误报（p9）。口头禅/语速两项未做。
-- [ ] 人物漂移·外观锚帧：与首集基准比对（要真实出图，待产线）。
+- [x] 人物漂移·外观锚帧：与首集基准比对（`qa.appearance` 的 PSNR 门：
+      给 `baseline` 与 `image` 就缩到 64×64 灰度算 PSNR，`psnr_mdb` 低于
+      `min_psnr_db`（默认 15 dB）判 `psnr_ok=false`，两张图完全一致按 `inf`
+      处理（999999）；两条判据取最严——PSNR 过门但模型说 DRIFT 仍然不过。
+      真机标定（真帧 + 真定妆图，448×800）：定妆图 vs 首镜末帧 7546 mdb、
+      镜1末帧 vs 镜2末帧 10344 mdb ⇒ 跨场景的绝对 PSNR 天然很低，所以
+      **像素门只用来抓"同一机位同一人"的明显漂移，语义判断交给模型**；
+      p18 用色块图把门限、阈值可调、inf 三件事钉住）。
 - [x] 笑点重复：连续 20 集内结构重复率超阈值即报告（`check_comedy`
       在 20 集窗口内统计 `comedy.setup`，同一 setup 出现超过一半就报
       `COMEDY_REPEAT`；窗口没装满不判，避免样板期误报）。
@@ -1425,6 +1438,7 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 | production.cost | P11 | read | p11 |
 | pipeline.run | P16 | write | p16 |
 | pipeline.capacity | P17 | read | p17 |
+| qa.appearance | P18 | read | p18 |
 | canon.diff | P4 | read | p4 |
 | story.review | P5 | read | p5b |
 | review.queue | P9 | read | p9 |

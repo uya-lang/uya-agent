@@ -12,7 +12,7 @@ $HERE/src/media_ops.uya $HERE/src/bible.uya $HERE/src/qa.uya \
 $HERE/src/audit.uya $HERE/src/task.uya $HERE/src/worker.uya \
 $HERE/src/llm.uya $HERE/src/provider.uya $HERE/src/server.uya \
 $HERE/src/index.uya $HERE/src/verify_ops.uya $HERE/src/queue_ops.uya \
-$HERE/src/pipeline_ops.uya"
+$HERE/src/pipeline_ops.uya $HERE/src/vision_ops.uya"
 UYA=${UYA:-$HERE/../uya/bin/uya}
 export UYA_ROOT=${UYA_ROOT:-$HERE/../uya/stdlib}
 TMP=$(mktemp -d /tmp/p16.XXXXXX)

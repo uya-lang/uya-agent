@@ -216,6 +216,26 @@ sh drama_plugin/p8_selftest.sh
 - 日志最多读尾部 256 KB（大日志用 `lseek`），空日志回 `measured=false`
   的全零报告，日志不存在回 `IO_ERROR`。
 
+### 视觉判据（`qa.appearance`，本机 VLM）
+
+外观/服装这条是"模型辅助"，两条判据分开算，取最严：
+
+- **像素门**（确定性）：`baseline` 与 `image` 缩到 64×64 灰度算 PSNR，
+  `psnr_mdb` 低于 `min_psnr_db`（默认 15 dB）就不过；两张图一致按 `inf`
+  记 999999。真机标定：定妆图 vs 首镜末帧 7546 mdb、镜1末帧 vs 镜2末帧
+  10344 mdb ⇒ 跨场景绝对值天然低，所以这道门只管"同一机位同一人"的漂移。
+- **模型判**：`use_model` 时把图 base64 发本机 VLM（`<data>/llm.json` 指向
+  vision 模型，走 OpenAI 形状 `/v1/chat/completions`，`content` 里放
+  `{"type":"image_url"}` data URL），提示词要求第一行只回 `OK`/`DRIFT`；
+  回话里出现 `DRIFT` 就判不过，原话进 `note`。
+- 返回 `{image, character_id, psnr_mdb, min_psnr_mdb, psnr_ok, model_used,
+  model_rc, model_verdict, note, ok}`；`model_rc` 83=没配模型（mock）、
+  82=模型侧非 200、72=连接/接收失败。
+- 真机实证：448×800 真帧 + 冻结文本「苏晚：短寸头，深蓝卫衣」⇒ 模型回
+  `DRIFT`＋「图中人物是长马尾 + 黑色西装外套配白衬衫」，`ok=false`。
+- 注意：`httpc` 的请求缓冲原来是 8 KB（栈上），装不下几百 KB 的图，已改成
+  1 MB 堆缓冲；响应缓冲同样给到 1 MB。
+
 ### 错误映射（四类共用）
 
 | 情况 | 错误码 |
