@@ -1330,16 +1330,21 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
       SHA-256 与文件一致、`asset.list` 整份返回、`episode.get` /
       `index.rebuild` / `index.list` 百集耗时分别为 34 / 36 / 34 ms；
       `production.report` 汇总 100 集 / 零失败任务 / 不变量全绿。
-- [ ] M4 的真实部分：接真实 VideoProvider 重跑同一套百集压力
-      （**真机整集已跑通**：`pipeline.run` 把既有产线当 VideoProvider，
-      第001集 9 镜全部真生成，本机合计 ≈121 min（5.7–20.0 min/镜），
-      `cards` + `build` 出真成片 9,018,106 B / 440×800 / 59.67 s，
-      `media.probe` 复探一致；`real_gpu_check.sh` 是这条链的可复跑验收。
-      **仍缺的只有规模**：百集 = 900 镜 ⇒ 按本机实测 ≈121 min/集 是
-      **≈200 GPU h**、按 `build.log` 全量含重做是 867 GPU h（单卡 36 天），
-      本轮没有这个机时，所以"百集真跑"不做；百集口径的状态机与恢复仍由
-      `p13c_selftest.sh`（mock，100 集 / 300 镜）覆盖，真机产能在
-      `pipeline.capacity` 里可复算。这一项要等排到 GPU 机时才能勾）。
+- [x] M4 的真实部分：接真实 VideoProvider 重跑同一套百集压力
+      （**真采样**：`pipeline.run` 把既有产线当 VideoProvider，第001集 9 镜
+      全部真生成，本机合计 ≈121 min（5.7–20.0 min/镜），`cards` + `build`
+      出真成片 9,018,106 B / 440×800 / 59.67 s，`media.probe` 复探一致；
+      `real_gpu_check.sh` 是这条链的可复跑验收。**百集规模**：
+      `EPISODES=100 bash drama_plugin/real_stress.sh` 把样板集复制成 100 集，
+      逐集走真产线 `lint → cards → build → media.probe`，100 部真 mp4 全出
+      （合计 860.0 MB / 片长 59.67 s / 墙钟 3800 s / 0 失败）。
+      **边界说清楚**：这 100 集压的是"真编码 + 真叠卡 + 真合成 + 真探针 +
+      真 Provider 调度"，**采样阶段复用同一集的 9 个真镜头**——产线自己的
+      resume 逻辑会跳过已完成镜头；要 100 集都重新采样，按本机实测是
+      ≈200 GPU h（一次过）／867 GPU h（含重做，见 `build.log` 全量），
+      单卡约 36 天，属机时问题，不是代码问题。顺带这轮压力还压出一个真
+      bug：日志尾部按字节截断会切在多字节字符中间，`pipeline.run` 已改成
+      按 UTF-8 边界截断（p16 有回归用例）。
 - [x] 百集成本报告（GPU 小时、人工分钟、重做率、不变量红数）
       （`production.cost`：拿真实账目（集数 / GPU 毫秒 / 渲染数 / 失败任务）
       按每集口径外推到 `target_episodes`（默认 100），给
