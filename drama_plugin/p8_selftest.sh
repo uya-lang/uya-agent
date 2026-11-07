@@ -213,7 +213,11 @@ print('PASS: 队列记录 done（prompt_id=%s, shots=%d）' % (d['prompt_id'], d
     || bad "队列记录不对"
 
 Q2="$DATA/projects/$PID/queue/$TID2.json"
-STAMP_BEFORE=$(md5sum "$Q2" | cut -d' ' -f1)
+# 判据是"不重发 submit"：prompt_id 与 submitted_at 不许变（updated_at 允许刷新）
+KEY_BEFORE=$(python3 -c "
+import json,sys
+r=json.load(open('$Q2'))
+print(r['prompt_id'], r['submitted_at'])")
 # 模拟"提交完还没跑完就崩溃"：把任务记录改回 running，再跑一次 worker
 python3 - "$DATA/projects/$PID/tasks/$TID2.json" <<'PY'
 import json
@@ -225,10 +229,13 @@ rec['state'] = 'running'
 json.dump(rec, open(p, 'w'), ensure_ascii=False)
 PY
 out=$(timeout 120 "$TMP/drama" worker run --data-dir "$DATA" 2>/dev/null)
-STAMP_AFTER=$(md5sum "$Q2" | cut -d' ' -f1)
-[ "$STAMP_BEFORE" = "$STAMP_AFTER" ] \
-    && ok "崩溃后重跑复用同一条队列记录（不重发 submit）" \
-    || bad "崩溃后重跑重发了 submit"
+KEY_AFTER=$(python3 -c "
+import json,sys
+r=json.load(open('$Q2'))
+print(r['prompt_id'], r['submitted_at'])")
+[ "$KEY_BEFORE" = "$KEY_AFTER" ] \
+    && ok "崩溃后重跑复用同一条队列记录（prompt_id 不变，不重发 submit）" \
+    || bad "崩溃后重跑重发了 submit（$KEY_BEFORE → $KEY_AFTER）"
 python3 - "$DATA/projects/$PID/tasks/$TID2.json" <<'PY'
 import json
 import sys

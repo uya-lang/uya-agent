@@ -966,9 +966,13 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
       （`shot.anchor`：ffmpeg 取上一镜末帧与这一镜首帧，缩到 64×64 灰度算
       PSNR，`average_mdb` 低于 `threshold_db`（默认 30 dB）回
       `ANCHOR_JUMP`；两帧完全一致按 `inf` 处理；p10 用静态色块验真）。
-- [ ] 成片终检：可解码、无空文件、无黑边、无长静音段、时长一致、片尾卡在
-      （已做 manifest/文件存在/大小一致 + `final.verify` 试解码与时长/分辨率；
-      黑边、静音段、片尾卡仍需真实产线的画面/音频分析，未做）。
+- [x] 成片终检：可解码、无空文件、无黑边、无长静音段、时长一致、片尾卡在
+      （`final.verify` 六条判据全做齐：`decode` 试解码 / `resolution` `codec`
+      `duration` 对 Bible format / `subtitle_sync` 字幕末条贴住时长 /
+      `no_letterbox`（cropdetect 出的画幅要贴满整幅，X/Y 不能留边）/
+      `no_long_silence`（silencedetect 数 ≥2 s 的静音段，一条都不许）/
+      `end_card`（分镜最后一镜 `cut_type="card"`，没有分镜版本时跳过）。
+      黑边/静音/片尾卡各有一个反例 + 一个正例在 p10）。
 - [ ] 检查人物外观和服装（对照冻结文本与锚点，模型辅助）。
       （P9 第一段只做确定性项；这条要模型辅助，等 P12 的审计）
 - [x] 检查场景和道具引用（`qa_refs`：镜头的 `scene` 必须在 Canon 场景表里，

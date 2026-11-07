@@ -359,7 +359,86 @@ import json,sys
 d=json.load(sys.stdin)
 names={c['name']: c['ok'] for c in d['checks']}
 assert names.get('subtitle_sync') is True, d
-print('PASS: 字幕末条与成片时长对齐（±1s）')" || bad "字幕对轴没通过"    # 锚帧接戏差：上一镜末帧 vs 这一镜首帧
+print('PASS: 字幕末条与成片时长对齐（±1s）')" || bad "字幕对轴没通过"    # 黑边 / 长静音段 / 片尾卡：三条新判据各来一个反例
+    ffmpeg -v error -f lavfi -i "testsrc=size=440x760:duration=2:rate=25" \
+        -vf pad=440:800:0:20 -pix_fmt yuv420p \
+        "$DATA/projects/$PV/assemblies/bars.mp4" -y >/dev/null 2>&1
+    out=$(ask "$(cat <<JSON
+{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"call","arguments":{"operation":"final.verify","input":{"project_id":"$PV","path":"projects/$PV/assemblies/bars.mp4","expect_duration_ms":2000}}}}
+JSON
+)")
+    [ "$(code_of "$out")" = "FINAL_VERIFY_FAILED" ] \
+        && ok "上下留黑边 ⇒ FINAL_VERIFY_FAILED" \
+        || bad "黑边没被拒（$(code_of "$out")）"
+
+    ffmpeg -v error -f lavfi -i "testsrc=size=440x800:duration=2:rate=25" \
+        -f lavfi -i "anullsrc=r=44100:cl=mono" -shortest \
+        -pix_fmt yuv420p "$DATA/projects/$PV/assemblies/mute.mp4" -y \
+        >/dev/null 2>&1
+    out=$(ask "$(cat <<JSON
+{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"call","arguments":{"operation":"final.verify","input":{"project_id":"$PV","path":"projects/$PV/assemblies/mute.mp4","expect_duration_ms":2000}}}}
+JSON
+)")
+    [ "$(code_of "$out")" = "FINAL_VERIFY_FAILED" ] \
+        && ok "整段静音 ⇒ FINAL_VERIFY_FAILED" \
+        || bad "长静音段没被拒（$(code_of "$out")）"
+
+    ffmpeg -v error -f lavfi -i "testsrc=size=440x800:duration=2:rate=25" \
+        -f lavfi -i "sine=frequency=440:duration=2" -shortest \
+        -pix_fmt yuv420p "$DATA/projects/$PV/assemblies/tone.mp4" -y \
+        >/dev/null 2>&1
+    out=$(ask "$(cat <<JSON
+{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"call","arguments":{"operation":"final.verify","input":{"project_id":"$PV","path":"projects/$PV/assemblies/tone.mp4","expect_duration_ms":2000}}}}
+JSON
+)")
+    printf '%s' "$out" | field | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+names={c['name']: c['ok'] for c in d['checks']}
+assert names.get('no_letterbox') is True, d
+assert names.get('no_long_silence') is True, d
+print('PASS: 画面贴满 + 有声音 ⇒ 黑边/静音两条判据都过')" \
+        || bad "正常片被误判成有黑边/静音"
+
+    mkdir -p "$DATA/projects/$PV/boards"
+    python3 - "$DATA/projects/$PV/boards/v2.json" \
+        "$DATA/projects/$PV/boards/v3.json" <<'PY'
+import json
+import sys
+
+base = {"format_version": 1, "source_script_version": 1, "shot_count": 2}
+tail_card = {"shot_id": "s2", "sequence": 2, "scene": "片尾",
+             "cut_type": "card"}
+tail_cut = {"shot_id": "s2", "sequence": 2, "scene": "片尾",
+            "cut_type": "hard_cut"}
+head = {"shot_id": "s1", "sequence": 1, "scene": "客厅"}
+for path, ver, tail in ((sys.argv[1], 2, tail_card),
+                        (sys.argv[2], 3, tail_cut)):
+    b = dict(base)
+    b["version"] = ver
+    b["shots"] = [head, tail]
+    open(path, "w").write(json.dumps(b, ensure_ascii=False))
+PY
+    out=$(ask "$(cat <<JSON
+{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"call","arguments":{"operation":"final.verify","input":{"project_id":"$PV","path":"$REL","board_version":3}}}}
+JSON
+)")
+    [ "$(code_of "$out")" = "FINAL_VERIFY_FAILED" ] \
+        && ok "最后一镜不是片尾卡 ⇒ FINAL_VERIFY_FAILED" \
+        || bad "片尾卡缺失没被拒（$(code_of "$out")）"
+    out=$(ask "$(cat <<JSON
+{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"call","arguments":{"operation":"final.verify","input":{"project_id":"$PV","path":"$REL","board_version":2}}}}
+JSON
+)")
+    printf '%s' "$out" | field | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+names={c['name']: c['ok'] for c in d['checks']}
+assert names.get('end_card') is True, d
+print('PASS: 最后一镜是 card ⇒ 片尾卡判据过')" \
+        || bad "片尾卡没通过"
+
+    # 锚帧接戏差：上一镜末帧 vs 这一镜首帧
     mkdir -p "$DATA/projects/$PV/boards" "$DATA/projects/$PV/assets/v1"
     python3 - "$DATA/projects/$PV/boards/v1.json" <<'PY'
 import json
