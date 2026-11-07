@@ -118,9 +118,30 @@ print("PASS: 产能口径可算：%d 提交 / %d 完成 / %d 镜 / 每镜 %.1f �
          d["projection"]["gpu_hours_milli"] / 1000.0))' \
     || bad "产能口径算不出来"
 
+# 5) 真成片：产线已经出片的话，拿 Uya 的 media.probe 验画幅与时长
+#    （黑边/静音/末帧是 final.verify 内部判据，fixture 覆盖在 p10）
+FILM=$(ls "$EP_DIR"/成片/*.mp4 2>/dev/null | head -1)
+if [ -n "${FILM:-}" ] && [ -s "$FILM" ]; then
+    mkdir -p "$DATA/projects/p_real/assets"
+    cp "$FILM" "$DATA/projects/p_real/assets/film.mp4"
+    call media.probe "{\"path\":\"projects/p_real/assets/film.mp4\",\"expect_width\":440,\"expect_height\":800}" \
+        | python3 -c '
+import json
+import sys
+
+d = json.load(sys.stdin)["data"]["result"]
+assert d["width"] == 440 and d["height"] == 800, d
+assert 55000 <= d["duration_ms"] <= 65000, d
+print("PASS: 真成片探针过（%dx%d / %d ms）"
+      % (d["width"], d["height"], d["duration_ms"]))' \
+        || bad "真成片探针不过"
+else
+    ok "没有真成片，跳过成片验证"
+fi
+
 echo "----"
 if [ "$FAILS" -eq 0 ]; then
-    echo "PASS: 真机验收（lint / dry / [REAL_SHOT] / capacity）"
+    echo "PASS: 真机验收（lint / dry / [REAL_SHOT] / capacity / 成片）"
     exit 0
 fi
 echo "FAIL: $FAILS 项"

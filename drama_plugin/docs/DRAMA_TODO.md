@@ -1331,12 +1331,15 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
       `index.rebuild` / `index.list` 百集耗时分别为 34 / 36 / 34 ms；
       `production.report` 汇总 100 集 / 零失败任务 / 不变量全绿。
 - [ ] M4 的真实部分：接真实 VideoProvider 重跑同一套百集压力
-      （**已接通**：`pipeline.run` 把既有产线的 `run_shots.py` 当 VideoProvider
-      用，真机跑出真镜头——镜1 用时 13.0 min / 158 帧 / 448×800 / 889 KB，
-      镜2 经 `pipeline.run generate shot=2` 提交并取回。**但没跑百集**：
-      按实测 8.67 GPU h/集，100 集 ≈ 867 GPU h ≈ 单卡 36 天，本轮不具备
-      这个机时；百集口径的状态机压力仍由 `p13c_selftest.sh` 的 mock 覆盖，
-      真机产能由下面的 `pipeline.capacity` 从真日志算）。
+      （**真机整集已跑通**：`pipeline.run` 把既有产线当 VideoProvider，
+      第001集 9 镜全部真生成，本机合计 ≈121 min（5.7–20.0 min/镜），
+      `cards` + `build` 出真成片 9,018,106 B / 440×800 / 59.67 s，
+      `media.probe` 复探一致；`real_gpu_check.sh` 是这条链的可复跑验收。
+      **仍缺的只有规模**：百集 = 900 镜 ⇒ 按本机实测 ≈121 min/集 是
+      **≈200 GPU h**、按 `build.log` 全量含重做是 867 GPU h（单卡 36 天），
+      本轮没有这个机时，所以"百集真跑"不做；百集口径的状态机与恢复仍由
+      `p13c_selftest.sh`（mock，100 集 / 300 镜）覆盖，真机产能在
+      `pipeline.capacity` 里可复算。这一项要等排到 GPU 机时才能勾）。
 - [x] 百集成本报告（GPU 小时、人工分钟、重做率、不变量红数）
       （`production.cost`：拿真实账目（集数 / GPU 毫秒 / 渲染数 / 失败任务）
       按每集口径外推到 `target_episodes`（默认 100），给

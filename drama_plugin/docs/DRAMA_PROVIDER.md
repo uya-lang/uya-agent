@@ -249,7 +249,20 @@ sh drama_plugin/p8_selftest.sh
 |---|---|---|---|
 | 镜1 | 158 | 13.0 min | `shot01.mp4` 889 KB / `last.png` 407 KB |
 | 镜2 | 73 | 5.7 min | `shot02.mp4` 303 KB / `last.png` 419 KB |
-| 镜3 | 107 | 8.0 min | `shot03.mp4` 452 KB / `last.png` 见目录 |
+| 镜3 | 107 | 8.0 min | `shot03.mp4` 452 KB / `last.png` 503 KB |
+| 镜4 | 192 | 17.7 min | `shot04.mp4` 见目录 |
+| 镜5 | — | 20.0 min | — |
+| 镜6 | — | 11.3 min | — |
+| 镜7 | — | 14.7 min | — |
+| 镜8 | — | 11.0 min | — |
+| 镜9 | — | 20.0 min | — |
+
+**整集真跑（2026-11-08，全程经 `pipeline.run` 调用既有产线）**：9 镜全部真生成，
+本机合计 **≈ 121 min（2.0 h）**（5.7–20.0 min/镜）；随后 `cards` + `build`
+出真成片 `第001集_明早八点别迟到.mp4`（**9,018,106 B / 440×800 / 59.67 s**），
+Uya 的 `media.probe` 复探一致。`final` 入口失败在环境上（产线 `qc.py final`
+要 `/tmp/asrvenv/bin/python` 这个 ASR venv，本机没有），`pipeline.run` 如实
+把非 0 退出码与 `stderr` 尾部回给了调用方。
 
 ### 错误映射（四类共用）
 
