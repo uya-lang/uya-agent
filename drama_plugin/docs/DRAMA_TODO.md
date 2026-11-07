@@ -673,11 +673,16 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 ## 剧本审核
 
 - [x] 确定性字段/格式检查（title / scenes / no / action / hook）。
-- [ ] 人物性格一致性检查。
+- [x] 人物性格一致性检查（确定性部分：每条对白的 `who` 必须在 Bible 角色
+      表里，否则 `QA_WHO_UNKNOWN`；缺说话人 `QA_WHO_MISSING`；说话人 Canon
+      里查不到位置 `QA_ACTOR_OFFSTAGE`；模型判断的语气一致留到接真实产线；
+      p9）。
 - [x] 角色知识状态检查（`knowledge.grant` 必须在场，否则 KNOWLEDGE_LEAK；p12b）。
 - [x] 道具和场景状态检查（PROP_TELEPORT / SCENE_DRIFT；p12b）。
 - [x] 事件前置条件检查（未定义的道具/角色、TIMELINE_CONFLICT 都被拒；p12b）。
-- [ ] 喜剧结构和可理解性审查。
+- [x] 喜剧结构和可理解性审查（`story.review`：`comedy.{setup,payoff}` 缺
+      任一 ⇒ `COMEDY_INCOMPLETE`；单行台词超过约 30 字 ⇒ `LINE_TOO_LONG`；
+      p5b）。
 - [x] 生成问题清单和审核版本 ID（`story.review`：确定性检查清单 +
       `review_id` = 剧本内容 SHA-256 前 16 位；批准时写进
       `scripts/approved.json` 的 `review_id`，可回查是哪一版被批的；p5b）。

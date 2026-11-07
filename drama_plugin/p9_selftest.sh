@@ -314,6 +314,25 @@ assert 'QA_PROP_UNKNOWN' in codes, codes
 print('PASS: 事件引用了 Canon 里没有的道具 ⇒ QA_PROP_UNKNOWN')" \
     || bad "没报 QA_PROP_UNKNOWN"
 
+# ---------- 人物一致性：说话的人必须在 Bible 角色表里 ----------
+ask "$(cat <<JSON
+{"jsonrpc":"2.0","id":45,"method":"tools/call","params":{"name":"call","arguments":{"operation":"bible.put","input":{"project_id":"$PID","bible":{"characters":[{"id":"dad"}],"format":{"canvas":"440x800"}},"locks":{"dad":"爸爸：短寸头"}}}}}
+JSON
+)" > /dev/null
+printf '%s' '{"format_version":1,"version":4,"content_hash":"x","screenplay":{"title":"乱说话","theme":"信任","conflict":"谁在说话","comedy":{"setup":"藏","payoff":"找到"},"twist":"一直在家","hook":"谁在说话？","scenes":[{"no":1,"action":"有人开口","dialogue":[{"who":"ghost","line":"我不在家"}]}],"candidate_events":[{"type":"timeline.advance","minutes":1}]}}' \
+    > "$DATA/projects/$PID/scripts/v4.json"
+out=$(ask "$(cat <<JSON
+{"jsonrpc":"2.0","id":46,"method":"tools/call","params":{"name":"call","arguments":{"operation":"qa.run","input":{"project_id":"$PID","script_version":4}}}}
+JSON
+)")
+printf '%s' "$out" | field | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+codes={i['code'] for i in d['report']['issues']}
+assert 'QA_WHO_UNKNOWN' in codes, codes
+print('PASS: 台词说话人不在 Bible 角色表 ⇒ QA_WHO_UNKNOWN')" \
+    || bad "没报 QA_WHO_UNKNOWN"
+
 # ---------- 抽样审批队列 ----------
 out=$(ask "$(cat <<JSON
 {"jsonrpc":"2.0","id":51,"method":"tools/call","params":{"name":"call","arguments":{"operation":"review.queue","input":{"project_id":"$PID"}}}}
