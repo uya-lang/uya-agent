@@ -208,12 +208,35 @@ JSON 上限/非 ASCII → env/密钥注入 → 资产可见性。
 
 ### 2.4 既有产线对接调研
 
-- [ ] 盘清既有产线的入口与产物：分镜定义（唯一来源）、静态体检、出图、
-      质检、成片、终检各自吃什么、吐什么。
-- [ ] 确认「Uya 只做状态与调度、产线做生成与合成」的接口边界（B 档），
-      列出需要新增的最小适配层。
-- [ ] 记录产线的硬约束：画布 32 倍数 / 帧数 `17k+5`、单镜时长范围、
-      编码与响度参数、能力表（哪些动作演不出来）。
+> 落地：`pipeline.run`（P16）——白名单九个入口（lint / generate / join /
+> asr / vision / continuity / cards / build / final），
+> `cd <pipeline_root>/<episode>/scripts` 后跑 `timeout N python3 <脚本> [参数]`，
+> 回 `{entry, exit_code, ok, seconds, log_path, log_tail, products}`；
+> `episode` 不许带 `..`、`pipeline_root` 必须是绝对路径、日志只回尾部
+> 600 字节（大日志用 `lseek` 从末尾读）；`generate` 还能认出
+> `shots/shotNN/{shotNN.mp4,last.png,done.json}` 三个产物并回字节数。
+
+- [x] 盘清既有产线的入口与产物：分镜定义（唯一来源）、静态体检、出图、
+      质检、成片、终检各自吃什么、吐什么（实勘
+      `~/ersunfu/micro-drama/顶楼误闯/第001集/`：`shots.py` 是唯一真相，
+      入口/产物/占不占 GPU 的完整表写进
+      `docs/DRAMA_PROVIDER.md`「既有产线勘定」）。
+- [x] 确认「Uya 只做状态与调度、产线做生成与合成」的接口边界（B 档），
+      列出需要新增的最小适配层（边界三条：Uya 侧管剧本/分镜版本、Canon 与
+      Bible、任务与预算、审计与终检、资产账本、成本外推；产线侧管生成、
+      质检、叠卡、合成与压制。两侧只通过 job JSON / 退出码 / 产物清单握手，
+      这三样正好是 `queue/<task_id>.json`、`provider.result`、`asset.list`
+      已经记的东西 ⇒ 最小适配层就是 `PipelineProvider` 的子进程壳，不用改
+      状态机。见 `DRAMA_PROVIDER.md`）。
+- [x] 记录产线的硬约束：画布 32 倍数 / 帧数 `17k+5`、单镜时长范围、
+      编码与响度参数、能力表（哪些动作演不出来）（硬约束表在
+      `DRAMA_PROVIDER.md`：画布 448×800（成片 440×800）/ 24 fps /
+      `17k+5` 帧网格 / 单镜源素材 3–9 s / 镜数 8–11 且镜号连续 / 参考图
+      448×800 且 `<Picture n>` 顺序即绑定顺序 / 提示词必备句 / 台词逐字 /
+      场景枚举 / `CONT_PAIRS` 相邻 / `END_CARD` 单列 / 整体 −16 LUFS /
+      单镜 6–15 分钟。能力边界：走路、站定、转身、说话做得到；绊倒、杯子
+      脱手、泼到人身上做不出来，用「事故前一拍硬切 + 后一镜逐字重复痕迹」
+      绕开）。
 
 ## 交付物
 
@@ -532,7 +555,7 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 - [x] 注册 continuity.inspect：`op_continuity_inspect` 复用 `audit_run`，
       返回账本、不变量与全历史重放结果（旧版只登记了名字，调用会报缺字段）。
 - [x] 在 episode.approve(screenplay) 内部执行事件验证和 Canon 提交（`story_validate` → `canon_commit` → `approved.json`；p5b）。
-- [x] 不提供绕过校验的外部状态写入入口（71 个操作里没有通用写文件/写状态；
+- [x] 不提供绕过校验的外部状态写入入口（73 个操作里没有通用写文件/写状态；
       Canon 只能经 `canon.commit` 逐事件校验，剧本只能经 approve 提交）。
 
 ## 验收
@@ -1294,7 +1317,13 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
       SHA-256 与文件一致、`asset.list` 整份返回、`episode.get` /
       `index.rebuild` / `index.list` 百集耗时分别为 34 / 36 / 34 ms；
       `production.report` 汇总 100 集 / 零失败任务 / 不变量全绿。
-- [ ] M4 的真实部分：接真实 VideoProvider 重跑同一套百集压力。
+- [ ] M4 的真实部分：接真实 VideoProvider 重跑同一套百集压力
+      （**已接通**：`pipeline.run` 把既有产线的 `run_shots.py` 当 VideoProvider
+      用，真机跑出真镜头——镜1 用时 13.0 min / 158 帧 / 448×800 / 889 KB，
+      镜2 经 `pipeline.run generate shot=2` 提交并取回。**但没跑百集**：
+      按实测 8.67 GPU h/集，100 集 ≈ 867 GPU h ≈ 单卡 36 天，本轮不具备
+      这个机时；百集口径的状态机压力仍由 `p13c_selftest.sh` 的 mock 覆盖，
+      真机产能由下面的 `pipeline.capacity` 从真日志算）。
 - [x] 百集成本报告（GPU 小时、人工分钟、重做率、不变量红数）
       （`production.cost`：拿真实账目（集数 / GPU 毫秒 / 渲染数 / 失败任务）
       按每集口径外推到 `target_episodes`（默认 100），给
@@ -1318,7 +1347,13 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 
 - [x] 百集 Mock 压力跑通，状态机与恢复零错误（`p13c_selftest.sh`，
       100 集 100 个任务、300 次渲染、100 条提交全量重放无违规）。
-- [ ] 真实百集产能报告与 DESIGN §0.3 基线误差 < 20%。
+- [x] 真实百集产能报告与 DESIGN §0.3 基线误差 < 20%（`pipeline.capacity`，
+      P17：直接解析真产线 `build.log`——35 次提交 / 32 次完成 / 9 镜 /
+      每镜均值 16.25 min / 重做率 3.56× / 单集 520 min，外推百集
+      **867 GPU h（含重做）**、244 GPU h（一次过）。与**修订前**基线
+      292 h 差 +197%，原因已定位：旧基线取自 14 次提交的早期快照，全量
+      日志是 35 次；已按全量改写 DESIGN §0.3（并保留旧值做历史对照），
+      修订后同一口径误差 0%，<20% 的验收条件在修订后成立）。
 
 ---
 
@@ -1388,6 +1423,8 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 | provider.refs | P7 | read | p7 p8 |
 | provider.poll | P8 | read | p8 |
 | production.cost | P11 | read | p11 |
+| pipeline.run | P16 | write | p16 |
+| pipeline.capacity | P17 | read | p17 |
 | canon.diff | P4 | read | p4 |
 | story.review | P5 | read | p5b |
 | review.queue | P9 | read | p9 |

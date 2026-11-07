@@ -131,7 +131,19 @@ sh drama_plugin/p8_selftest.sh
 由 `provider.encode` / `mux` / `mix` / `loudnorm` / `probe` 兑现，参数取自
 剧本的 `format` 块；只接受项目内相对路径，不做远程上传。
 
-### PipelineProvider（子进程方式接既有产线）
+### PipelineProvider（子进程方式接既有产线，已实现为 `pipeline.run`）
+
+`pipeline.run`（`src/pipeline_ops.uya`）的入参：`pipeline_root`（绝对路径）、
+`episode`（相对目录，不许含 `..`）、`entry`（九个白名单入口）、`shot`、
+`dry`、`force`、`timeout_s`（默认 1800，上限 7200）。落地细节：
+
+- 命令形如 `cd <root>/<episode>/scripts && [FORCE=1] timeout N python3 <脚本> [参数] > <日志> 2>&1`；
+- 日志落在 `<episode>/.pipeline_<entry>.log`，只回尾部 600 字节（`lseek` 到末尾读）；
+- 退出码原样回（`system()` 的 `(st >> 8) & 255`；超时是 `timeout` 的 124）；
+- `generate` 会顺带回 `shots/shotNN/{shotNN.mp4,last.png,done.json}` 的存在性
+  与字节数（走 `sys_stat`），其它入口只回退出码与日志；
+- 白名单九个入口见上表；不认识的入口、越界路径、非绝对 `pipeline_root`
+  一律 `SCHEMA_INVALID`。
 
 - `submit(job_json)`：`execve` 产线脚本（绝对路径 + 白名单 env），`stdin`
   给 job JSON，`stdout` 只允许单行 JSON；
@@ -139,6 +151,70 @@ sh drama_plugin/p8_selftest.sh
 - 超时（默认 900 s）→ `TIMEOUT`；非 0 退出码 → `UPSTREAM_ERROR`，
   消息里带 `stderr` 末尾；
 - `cancel(prompt_id)` 必须真的给子进程发信号，不能只停掉 `poll`。
+
+### 既有产线勘定（B 档接口边界）
+
+实地勘定的既有产线在 `~/ersunfu/micro-drama/顶楼误闯/第001集/`（一集一目录，
+同系列的口径写在 `../系列规范.md`）。下面这张表是"我们只管调度、它只管生成
+与合成"的接口清单；`PipelineProvider` 就按这张表接。
+
+| 入口（`scripts/` 下） | 干什么 | 占 GPU | 产物 |
+|---|---|---|---|
+| `shots.py` | **本集唯一真相**：9 镜定义（提示词/台词/字幕/片尾卡/接戏） | — | 被其它脚本 import |
+| `lint_shots.py` | 静态体检，秒级，不碰 GPU | 否 | stdout 摘要 + 非 0 退出码 |
+| `run_shots.py [--dry] [n]` | 逐镜生成 → 轮询 → 取回 mp4 → 抽末帧 | 是 | `shots/shot<NN>/{shot<NN>.mp4,last.png,done.json}` |
+| `check_join.py [strip n]` | 接戏：切点两侧数值差 + VLM 判定 | 否 | `qc/join.json` |
+| `qc.py asr` | 台词是否说对（ASR，可与出片并行） | 否 | `qc/asr.json` |
+| `qc.py vision n` | 竖屏/黑边/画面文字/角色与光线 | 否 | `qc/qc.json` |
+| `qc.py continuity` | 相邻同场景镜是否同一空间（`CONT_PAIRS`） | 否 | 追加进 `qc/qc.json` |
+| `cards.py` | 字幕/角标/片尾卡 | 否 | `cards/*.png`（含 `end_card.png`） |
+| `build_film.py [--dry]` | 剪辑 + 叠卡 + 调色 + 响度归一 → 成片 | 否 | `成片/<集名>.mp4` |
+| `qc.py final` | 成片终检（探针 + 逐窗 ASR） | 否 | `qc/final_qc.json` |
+| `contact.py` / `queue_all.py` | 联系表 / 多集批量排队 | 否 | 联系表 png / 队列 |
+
+勘定到的硬约束（改模板前先看这张表，都是产线侧的事实，不是我们的约定）：
+
+| 约束 | 取值 | 出处 |
+|---|---|---|
+| 画布 | 448×800（32 的倍数），成片 440×800 | `run_shots.py --dry` 校验 / 成片探针 |
+| 帧率 | 24 fps | `qc/final_qc.json` 的探针 |
+| 片段帧数 | 必须落在 `17k+5`（k=3…25）网格上，即 `gen_seconds ≈ (17k+5)/24` | `lint_shots.py` 的 `GRID` |
+| 单镜源素材 | 3–9 s（`target_seconds ≤ gen_seconds`） | `lint_shots.py` |
+| 镜数 | 8–11（惯例 9–10），镜号必须连续 1..N | `lint_shots.py` |
+| 参考图 | 角色定妆图 448×800；`<Picture n>` 的顺序 = `refs` 顺序 | `lint_shots.py` |
+| 提示词必备句 | "vertical"、"no on-screen text/no readable"、"no black bars/no letterbox"、画里有几个人/几只猫、"reference pictures are polished cg" 或 "…studio casting photographs" | `lint_shots.py` |
+| 台词 | 逐字来自 `剧本.txt`；`<d>[Chinese]…</d>` 条数 = `expect` 条数 | `lint_shots.py` |
+| 场景枚举 | 只能取调色表里的键（`meeting`/`corridor`/`city`/`home`…） | `lint_shots.py` 的 `SCENES` |
+| 接戏对 | `CONT_PAIRS` 必须是相邻镜 | `lint_shots.py` |
+| 片尾卡 | 必须有 `END_CARD`，单列时长（本项目实测 4.2 s） | `shots.py` / `build_film.py` |
+| 响度 | 成片整体 ≈ −16 LUFS | `build_film.py` |
+| 实测成本 | 单镜 6–15 分钟（3060 12G，H3 int8）；一集 9 镜 1.5–2.5 h GPU | `README.md` / `build.log` |
+
+接口边界（B 档）：
+
+- **Uya 侧只做**：剧本/分镜版本、Canon 与 Bible（冻结文本 + hash）、任务与
+  预算、审计与终检判据、资产账本、成本外推。它不碰 GPU、不生成像素。
+- **产线侧只做**：从 `shots.py` 出发的生成、质检、叠卡、合成与压制；
+  它不决定"第几集、用哪版剧本、有没有预算"。
+- 两侧只通过三样东西握手：**job JSON**（镜号/提示词/参考图顺序/画布/
+  `gen_seconds`/种子）、**退出码**（0 成功，非 0 连 `stderr` 末尾一起进
+  检查点）、**产物清单**（`shots/shotNN/*`、`cards/*`、`成片/*`、`qc/*.json`
+  的相对路径 + sha256）。这三样正是 `queue/<task_id>.json`、
+  `provider.result` 与 `asset.list` 记的东西，所以换成子进程接法不用改状态机。
+
+### 产能口径（`pipeline.capacity`）
+
+拿真产线的 `build.log` 直接算，不再手抄数字：
+
+- 逐行扫 `NN 已提交` 数提交次数、`NN 完成，用时 X.Y 分钟` 取每次用时；
+- `shots` = 提交行里最大的镜号；`mean_shot_ms` = 完成用时均值；
+- `redo_rate_milli` = 提交次数 / 镜数（千分比，3.56× 记 3560）；
+- `episode_gpu_ms` = 本期实际总用时（含重做），`ideal_episode_gpu_ms` =
+  均值 × 镜数（无重做）；
+- 外推到 `target_episodes`（默认 100）给 `projection.{gpu_hours_milli,
+  ideal_gpu_hours_milli, baseline_gpu_hours_milli(292000), error_pct_milli}`；
+- 日志最多读尾部 256 KB（大日志用 `lseek`），空日志回 `measured=false`
+  的全零报告，日志不存在回 `IO_ERROR`。
 
 ### 错误映射（四类共用）
 

@@ -32,6 +32,8 @@
 | `p13b_selftest.sh` | 派生索引与全量重建 | 12 |
 | `p13c_selftest.sh` | 百集 mock 视频压力 / 资产账本 / 操作审计 / 索引计时 | 23 |
 | `p15_selftest.sh` | 30 集跨题材（3 个 Bible 模板 × 每题材 EPISODES/3 集，换模板不改代码） | 12 |
+| `p16_selftest.sh` | PipelineProvider：白名单入口 / 退出码 / 日志尾部 / 产物清单 / 超时 | 12 |
+| `p17_selftest.sh` | 真产线产能：提交/完成/镜数/每镜均值/重做率/百集外推 | 8 |
 | `build_selftest.sh` | 独立构建入口：任意 cwd / 输出路径 / 启动 | 4 |
 | `pack.sh`（不是自测） | 打交付包：bin/docs/src/selftest + tar.gz + sha256 | — |
 | `p5e_selftest.sh` | 百集大纲与批准（系列层） | 12 |
