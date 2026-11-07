@@ -335,6 +335,62 @@ assert 'QA_WHO_UNKNOWN' in codes, codes
 print('PASS: 台词说话人不在 Bible 角色表 ⇒ QA_WHO_UNKNOWN')" \
     || bad "没报 QA_WHO_UNKNOWN"
 
+# ---------- 人物位置 / 服装 / 情绪 ----------
+PQ=$(ask "$(cat <<JSON
+{"jsonrpc":"2.0","id":48,"method":"tools/call","params":{"name":"call","arguments":{"operation":"project.create","input":{"name":"人物三查"}}}}
+JSON
+)" | field | python3 -c "
+import json,sys
+print(json.load(sys.stdin)['project_id'])")
+ask "$(cat <<JSON
+{"jsonrpc":"2.0","id":49,"method":"tools/call","params":{"name":"call","arguments":{"operation":"bible.put","input":{"project_id":"$PQ","bible":{"characters":[{"id":"dad"}],"format":{"canvas":"440x800"}},"locks":{"dad":"爸爸：短寸头，深灰夹克"}}}}}
+JSON
+)" > /dev/null
+ask "$(cat <<JSON
+{"jsonrpc":"2.0","id":50,"method":"tools/call","params":{"name":"call","arguments":{"operation":"canon.commit","input":{"project_id":"$PQ","base_revision":0,"events":[{"type":"scene.define","scene":"living_room"},{"type":"character.place","character":"dad","scene":"living_room"}]}}}}
+JSON
+)" > /dev/null
+mkdir -p "$DATA/projects/$PQ/scripts"
+mk_script() {
+    printf '%s' "$2" > "$DATA/projects/$PQ/scripts/v$1.json"
+}
+mk_script 1 '{"format_version":1,"version":1,"content_hash":"x","screenplay":{"title":"开局","theme":"信任","conflict":"谁先开口","comedy":{"setup":"藏","payoff":"找到"},"twist":"一直在家","hook":"他要说什么？","scenes":[{"no":1,"action":"爸爸坐下","dialogue":[{"who":"dad","line":"我回来了","emotion":"平静"}]}],"candidate_events":[{"type":"timeline.advance","minutes":1}]}}'
+ask "$(cat <<JSON
+{"jsonrpc":"2.0","id":51,"method":"tools/call","params":{"name":"call","arguments":{"operation":"storyboard.build","input":{"project_id":"$PQ","script_version":1}}}}
+JSON
+)" > /dev/null
+
+mk_script 2 '{"format_version":1,"version":2,"content_hash":"x","screenplay":{"title":"情绪越界","theme":"信任","conflict":"谁先开口","comedy":{"setup":"藏","payoff":"找到"},"twist":"一直在家","hook":"他要说什么？","scenes":[{"no":1,"action":"爸爸坐下","dialogue":[{"who":"dad","line":"我回来了","emotion":"狂喜"}]}],"candidate_events":[{"type":"timeline.advance","minutes":1}]}}'
+mk_script 3 '{"format_version":1,"version":3,"content_hash":"x","screenplay":{"title":"情绪断裂","theme":"信任","conflict":"谁先开口","comedy":{"setup":"藏","payoff":"找到"},"twist":"一直在家","hook":"他要说什么？","scenes":[{"no":1,"action":"爸爸坐下","dialogue":[{"who":"dad","line":"我回来了","emotion":"平静"},{"who":"dad","line":"你到底想干什么","emotion":"生气"}]}],"candidate_events":[{"type":"timeline.advance","minutes":1}]}}'
+mk_script 4 '{"format_version":1,"version":4,"content_hash":"x","screenplay":{"title":"有转折","theme":"信任","conflict":"谁先开口","comedy":{"setup":"藏","payoff":"找到"},"twist":"一直在家","hook":"他要说什么？","scenes":[{"no":1,"action":"爸爸坐下","cause":"reversal","dialogue":[{"who":"dad","line":"我回来了","emotion":"平静"},{"who":"dad","line":"你到底想干什么","emotion":"生气"}]}],"candidate_events":[{"type":"timeline.advance","minutes":1}]}}'
+mk_script 5 '{"format_version":1,"version":5,"content_hash":"x","screenplay":{"title":"换了件衣服","theme":"信任","conflict":"谁先开口","comedy":{"setup":"藏","payoff":"找到"},"twist":"一直在家","hook":"他要说什么？","scenes":[{"no":1,"action":"爸爸坐下","dialogue":[{"who":"dad","line":"我回来了","emotion":"平静","outfit":"红裙子"}]}],"candidate_events":[{"type":"timeline.advance","minutes":1}]}}'
+
+codes_for() {
+    ask "$(cat <<JSON
+{"jsonrpc":"2.0","id":52,"method":"tools/call","params":{"name":"call","arguments":{"operation":"qa.run","input":{"project_id":"$PQ","script_version":$1}}}}
+JSON
+)" | field | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+print(' '.join(sorted({i['code'] for i in d['report']['issues']})))"
+}
+out=$(codes_for 2)
+case "$out" in *QA_EMOTION_UNKNOWN*) ok "情绪不在允许集合 ⇒ QA_EMOTION_UNKNOWN" ;;
+    *) bad "越界情绪没报（$out）" ;; esac
+out=$(codes_for 3)
+case "$out" in *QA_EMOTION_JUMP*) ok "情绪两档以上直跳且没有 cause ⇒ QA_EMOTION_JUMP" ;;
+    *) bad "情绪断裂没报（$out）" ;; esac
+out=$(codes_for 4)
+case "$out" in *QA_EMOTION_JUMP*) bad "有 cause 的转折被误报（$out）" ;;
+    *) ok "场景给了 cause=reversal ⇒ 情绪断裂不报" ;; esac
+out=$(codes_for 5)
+case "$out" in *QA_COSTUME_UNFROZEN*) ok "台词里的 outfit 不在冻结外观文本里 ⇒ QA_COSTUME_UNFROZEN" ;;
+    *) bad "换装没对冻结文本（$out）" ;; esac
+out=$(codes_for 1)
+case "$out" in *QA_POSITION_UNKNOWN*|*QA_COSTUME_UNFROZEN*|*QA_EMOTION*)
+    bad "干净的剧本被误报（$out）" ;;
+    *) ok "位置/服装/情绪都合理的剧本不报错" ;; esac
+
 # ---------- 台词语料画像：人称/句长跨集漂移 ----------
 PV2=$(ask "$(cat <<JSON
 {"jsonrpc":"2.0","id":47,"method":"tools/call","params":{"name":"call","arguments":{"operation":"project.create","input":{"name":"语料"}}}}

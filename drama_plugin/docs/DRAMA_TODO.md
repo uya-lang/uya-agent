@@ -750,7 +750,14 @@ P0 每项能力必须标记“已验证 / 不可用 / 替代方案”。未经�
 - [x] 生成第三集，确认加载 revision 2。
 - [x] 审核并提交 revision 3。
 - [x] 验证人物 Profile 未漂移。
-- [ ] 验证人物位置、服装和情绪状态合理。
+- [x] 验证人物位置、服装和情绪状态合理（`qa.run` 里加 `qa_character` 三条
+      判据：位置 = 台词的人必须在 Canon 里有场景落点，否则
+      `QA_POSITION_UNKNOWN`；服装 = 必须有 Bible 冻结外观文本，台词写了
+      `outfit` 时该串必须出现在冻结文本里（换装先改 Bible），否则
+      `QA_COSTUME_UNFROZEN`；情绪 = 台词可带 `emotion`（平静/紧张/难过/害怕/
+      生气/开心，按 0..5 档），集合外 `QA_EMOTION_UNKNOWN`，同一角色相邻两句
+      跳 >2 档且场景没给 `cause`（reversal/reveal/loss）算 `QA_EMOTION_JUMP`；
+      p9 五条断言）。
 - [x] 验证人物知识状态没有提前泄露（KNOWLEDGE_LEAK；p12b 反例 2）。
 - [x] 验证道具位置连续。
 - [x] 验证伏笔/长期梗状态连续（PROMISE_OVERDUE；p12b 反例 4）。
