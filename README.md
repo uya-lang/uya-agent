@@ -86,7 +86,8 @@ chmod +x uya-agent-linux-x86_64 && mv uya-agent-linux-x86_64 uya-agent
   页面零外部依赖（不引 xterm.js、不走 CDN，终端解释器在服务端，见 §1.3）。
 * **能力**：会话落盘可恢复（`--continue` / `--resume` / `/sessions` —— 列表只列**有标题的**会话，
   无标题的仍可 `--resume <id>` 直达；恢复后屏幕按日志重放到退出前那一屏，P119）；上下文管理（剪枝 +
-  自动压缩）；技能发现 + `skill`；`web_search`；子代理一族（含 `ralph` 与 `/watch` 实时跟随）；
+  自动压缩）；技能发现 + `skill`；`web_search`；子代理一族（含 `ralph`、`/watch` 实时跟随、
+  `/stop` 人叫停）；
   会话目标；workflow（`.ush` 脚本编排）；三级访问模式 + bwrap 内核沙箱；Git worktree
   （执行 → 合并 → 删除，连带残留回收）；图片附件与剪贴板粘贴（纯 Uya 的 X11 客户端）。
 * **项目记忆**（P66–P68，P107 加动作框与蒸馏）：跨会话记住「这个项目怎么跑、关键文件
@@ -299,6 +300,8 @@ readelf -lW build/uya-agent | grep -c INTERP    # 0 = 真静态
 **动作选择框**，打开就回车 = `status`；`start` 当场建（模式关着也顺带开回来），`off` 是逃生口；
 `finish`/`discard` 选定后再过一道确认，`reclaim` 只清确定的垃圾、不确认）
 `/sessions` `/resume <id>` `/new` `/continue` `/diff` `/title [新标题]` `/image [路径]`
+`/watch [sub-N|off]` `/stop [sub-N|all]`（叫停子代理：裸命令开**现役清单**，回车停选中的那个；
+`all` 全停；与模型工具 `interrupt_agent` 共用**同一份状态机**，连它起的 bash 一起收）
 `/paste` `/fullscreen [on|off]` `/mouse on|off` `/exit`（`/quit` 同义）。
 
 ### 1.3 web 界面（`--web`）
@@ -838,6 +841,9 @@ leaf 指纹怎么算、指纹库放哪儿 —— 见 [DESIGN.md §18](DESIGN.md)
   `send_message` 时的任务或催促，只取首行、空白折叠、超长贴尾）；子代理的 stdout **只在跑完时**
   才回传管道，所以「它刚刚说了什么」得等终态或 `subagent_output`（面板上那个 `· N` 是已收输出
   行数，运行中通常是 0）。贴尾只收窄**显示**，`Deleg.prompt` 本身一个字节不动。
+  跑完时面板收掉，滚动区那行结算通知带上**它自己的回话**（贴尾取最后一条非空行，`↳` 后面那半句
+  —— 见 `view_agents_note_text`）；`subagent` / `subagent_fork` / `subagent_output` 三条工具调用的
+  正文也不再被 `--tool-lines 0` 吞掉（首尾各 6 行，剩下的一行「省略」）。要逐行看全仍走 `/watch sub-N`。
 * **`/watch` 的实时粒度是「事件」，不是 token 级**：它读的是子代理的会话日志，而
   `assistant/reasoning` 与 `assistant/message` 都在**步末**才落盘 —— 所以单个长 step 内部
   （模型正在流式吐字的那几秒到几十秒）日志不增长，屏幕上不会长出新行。那段时间能看到的实时
@@ -845,8 +851,20 @@ leaf 指纹怎么算、指纹库放哪儿 —— 见 [DESIGN.md §18](DESIGN.md)
   只有在前台跑（交互模式）才有。
   另外：`/watch` 是**进程状态**（`--resume` 不回填）；被跟随的子代理跑完或槽位被回收时跟随自动
   结束；`ralph` 跟随的是**当前轮**的日志，换轮时插一行 `[轮次切换]` 并从新日志头开始读。
+* **`/stop` 是「人叫停子代理」的那个动词（P127）**：以前叫停只有一个入口 —— 模型自己调
+  `interrupt_agent`；人这边（键层、命令表、面板）一个动词都没有，后台子代理跑飞了只能等它
+  自己结束或者把整个进程退掉。现在：裸 `/stop` 开**现役清单**（回车停选中的那个，游标默认落在
+  第一个代理行 —— 与 `/watch` 的清单同一个形状、同一个 `watch_line_id` 取编号），
+  `/stop sub-3` 点名停，`/stop all` 全停。三条入口（人 / 模型 / 清单浮层）共用
+  `deleg_kill` **一份状态机**：清 `notify_bg`（别再补一条「它跑完了」）→ `sh_kill_tree`
+  按进程组收**整棵树**（子代理的 bash 工具自成会话，单杀 pid 会把它留成野进程）→ 收尸 →
+  进 `KILLED` 终态 → 结算一次。回执分三种落点：真的停了 / 早就结束了 / 没有这个编号，
+  **都有话说**（静默是最难查的失败）。回合运行中也能当场派发：它不碰 History 也不返回「停」。
+  退出（含 `/new`、`/resume` 换会话）时 `agent_session_close` 会 `deleg_free` —— 以前只有
+  `--tui-demo` 的 fixture 会收，正常退出后 `sub-N` 还在跑、还在往旧会话日志里写。
 * **回合运行中的界面命令**：只读命令（`/status`、`/help`、`/tasks`、`/memory`、`/sessions`、
-  `/goal`、`/diff`、`/watch`（**含** `/watch sub-N`））在每个泵点当场派发并当场画一帧；`/model` 与
+  `/goal`、`/diff`、`/watch`（**含** `/watch sub-N`）、`/stop`（**含** `/stop sub-N`——它只动进程、
+  不动历史））在每个泵点当场派发并当场画一帧；`/model` 与
   `/effort`（裸命令开浮层、`/model <名字>` 这类带参形态都算）同样在泵点当场生效 ——
   它们在浮层里选完/敲完就改状态并落一条 `session/model`，**下一个 step 的请求**已经是新模型；
   `/title <新标题>` 早已同路。`/new`、`/resume`
