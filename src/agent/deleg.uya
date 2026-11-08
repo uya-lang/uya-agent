@@ -116,7 +116,8 @@ export fn deleg_init(t: &DelegTable) void {
 }
 
 // 释放**所有**槽位（不只是终态的）：六个 Buf、关管道 fd，并且对没回收过的活进程
-// **SIGKILL + waitpid** —— 否则退出时留下孤儿子代理（它们各自还在跑 agent 循环）。
+// **整棵树收掉 + waitpid** —— 否则退出时留下孤儿子代理（它们各自还在跑 agent 循环，
+// 而子代理起的那条 bash 又是另一个会话，见 `sh_kill_tree`）。
 export fn deleg_free(t: &DelegTable) void {
     var i: usize = 0;
     while i < DELEG_MAX {
@@ -132,7 +133,7 @@ export fn deleg_free(t: &DelegTable) void {
                 _ = sys_close(d.fd) catch {};
             }
             if !d.reaped && d.pid > 0 {
-                _ = sys_kill(d.pid as i64, SIGKILL) catch {};
+                sh_kill_tree(d.pid);
                 var st: i32 = 0;
                 _ = sys_waitpid(d.pid, &st, 0) catch {};
             }
@@ -480,6 +481,10 @@ fn deleg_child_main(src: &const Config, prompt: &const Buf, label: &const Buf, k
     // 还会从 fd 0 抢键 —— 用户按 esc/ctrl+c/ctrl+d 被子进程吃掉，父进程收不到，
     // 就是「退不出」（踩坑 44）。
     tui_child_detach();
+    // 槽位表也是 fork 继承来的：**子进程先把它清零**。不清的话这份拷贝里躺着父进程
+    // 那几个孩子（还有它们的 pid）—— 任何一条「收尾时清场」的路（`deleg_free`）在这个
+    // 进程里跑一遍就会把**自己的兄弟**杀掉。子代理自己起的孙代理从这张空表重新开始。
+    deleg_init(&g_deleg);
     var c: Config = cfg_default();
     deleg_clone_cfg(src, &c, prompt, label);
     c.deleg_depth = src.deleg_depth +% 1;
@@ -812,7 +817,11 @@ fn deleg_settled(t: &DelegTable, idx: usize) void {
             ms = now - d.started_ms;
         }
     }
-    view_agents_note(d.id, d.kind, d.status, ms, d.label.ptr as &const byte, d.label.len);
+    // 结算行把人看得见的那半句也带上：`[agents] … — <标签>` + `↳ <答复末行>`。
+    // 答复就在管道里（`d.buf`），以前只交给模型（`subagent_output` / 完成通知），
+    // 屏幕上**一个字的回话都没有** —— 用户问的正是「它到底说了什么」。
+    view_agents_note(d.id, d.kind, d.status, ms, d.label.ptr as &const byte,
+        d.label.len, d.buf.ptr as &const byte, d.buf.len);
     deleg_agents_refresh();
 }
 
@@ -886,13 +895,15 @@ fn deleg_id_from_buf(b: &const Buf, out: &i32) bool {
 // 用户叫停（esc / ctrl+c / ctrl+d）：把还在跑的子代理杀掉并让它进终态。
 // 不杀的话父进程会一直等它 —— 子代理是**独立进程**，父进程不主动收，界面就一直卡在
 // 「运行中 ● Subagent」上，这正是「退不出」的另一半（踩坑 44）。
+// 收的是**整棵树**（`sh_kill_tree`）：子代理正在跑的那条 bash 自成会话，单杀 pid
+// 会把它留成野进程。
 fn deleg_abort_slot(t: &DelegTable, si: usize) void {
     if si >= DELEG_MAX {
         return;
     }
     // P104：这是**人**叫停的，不是模型在等的结果 —— 别再补一条完成通知。
     t.items[si].notify_bg = false;
-    _ = sys_kill(t.items[si].pid as i64, SIGKILL) catch {};
+    sh_kill_tree(t.items[si].pid);
     deleg_check(t, si);
     if t.items[si].status == DELEG_RUNNING {
         t.items[si].status = DELEG_KILLED;
@@ -945,7 +956,8 @@ export fn deleg_tool_subagent(cfg: &const Config, t: &DelegTable, args: &const J
             break;
         }
         if (ua_now_ms() - started) >= (cfg.timeout_ms as u64) {
-            _ = sys_kill(t.items[si].pid as i64, SIGKILL) catch {};
+            // 超时与 `/stop` 收的是同一棵树（子代理 + 它起的命令）
+            sh_kill_tree(t.items[si].pid);
             deleg_check(t, si);
             if t.items[si].status == DELEG_RUNNING {
                 t.items[si].status = DELEG_KILLED;
@@ -1166,8 +1178,97 @@ export fn deleg_tool_send(cfg: &const Config, t: &DelegTable, args: &const JsonV
     t.items[nsi].notify_bg = true;
 }
 
-// `interrupt_agent` 工具：先 `deleg_poll_all` 收一遍僵尸，再**仅在 RUNNING 时**
-// SIGKILL + 结算。已经终态的槽位回一句「早就结束了」，不做无效动作。
+// ============================================================
+// 叫停：人（`/stop`）与模型（`interrupt_agent`）共用**一份**状态机
+// ============================================================
+// 三条落点。文案由调用方各自组装 —— 工具那条给模型读、`/stop` 那条给转录读，
+// 措辞不同，但「什么时候算停」只许有这一个答案。
+export const DELEG_KILL_OK: u8 = 0;        // 真的叫停了
+export const DELEG_KILL_GONE: u8 = 1;      // 没有这个编号（写错 / 槽位已回收）
+export const DELEG_KILL_ALREADY: u8 = 2;   // 早就结束了，不做无效动作
+
+// 先 `deleg_poll_all` 收一遍僵尸（status 才是终态），再**仅在 RUNNING 时**动手：
+//   * **按进程组收整棵树**（`sh_kill_tree`：SIGCONT → kill(-pid) → 补一发单 pid）。
+//     子代理的 bash 工具子进程各自 `setsid()` 自成会话，只杀子代理 pid 会把
+//     `make` / `sleep 300` 留成野进程 —— 用户看到的是「面板没了，CPU 还在烧」。
+//   * `notify_bg` 当场销掉：这次叫停的结果马上就要交给调用方，别再补一条完成通知。
+export fn deleg_kill(t: &DelegTable, id: i32) u8 {
+    deleg_poll_all(t);
+    const slot: isize = deleg_find(t, id);
+    if slot < 0 {
+        return DELEG_KILL_GONE;
+    }
+    const si: usize = slot as usize;
+    if si >= DELEG_MAX {
+        return DELEG_KILL_GONE;
+    }
+    if t.items[si].status != DELEG_RUNNING {
+        return DELEG_KILL_ALREADY;
+    }
+    t.items[si].notify_bg = false;
+    sh_kill_tree(t.items[si].pid);
+    deleg_check(t, si);
+    if t.items[si].status == DELEG_RUNNING {
+        t.items[si].status = DELEG_KILLED;
+    }
+    deleg_settled(t, si);
+    return DELEG_KILL_OK;
+}
+
+// 人那条回执（`/stop`）：一行说清「停没停、为什么没停」——与工具那条共用
+// `deleg_kill`，只有措辞不同。
+export fn deleg_kill_receipt(id: i32, rc: u8, out: &Buf) void {
+    if rc == DELEG_KILL_GONE {
+        _ = buf_append_cstr(out, "[stop] 没有 sub-");
+        _ = buf_append_u64(out, id as u64);
+        _ = buf_append_cstr(out, " 这个子代理（/tasks 看现役清单）\n");
+        return;
+    }
+    _ = buf_append_cstr(out, "[stop] sub-");
+    _ = buf_append_u64(out, id as u64);
+    if rc == DELEG_KILL_ALREADY {
+        _ = buf_append_cstr(out, " 早就结束了，没有要停的东西\n");
+        return;
+    }
+    _ = buf_append_cstr(out, " 已叫停（连同它起的命令一起收掉）\n");
+}
+
+// `/stop` 的现役清单（裸命令开选择框）：表头 + 一行一个子代理，**行首就是 `sub-N`** ——
+// 与 `/watch` 的清单同一个形状，所以选中行能用同一个 `watch_line_id` 取出编号。
+// 一个都没有时**一个字节都不写**、返回 false：调用方给一句空态文案就够了，
+// 绝不为「无目标」开一个空的选择框（用户回车之后只会得到一句「没认出编号」）。
+export fn deleg_stop_list(t: &DelegTable, out: &Buf) bool {
+    deleg_poll_all(t);
+    var n: usize = 0;
+    var i: usize = 0;
+    while i < DELEG_MAX {
+        if t.items[i].used {
+            n = n + 1;
+        }
+        i = i + 1;
+    }
+    if n == 0 {
+        return false;
+    }
+    _ = buf_append_cstr(out, "[stop] 现役子代理（回车叫停 · esc 取消）：\n");
+    i = 0;
+    while i < DELEG_MAX {
+        if t.items[i].used {
+            _ = buf_append_cstr(out, "  sub-");
+            _ = buf_append_u64(out, t.items[i].id as u64);
+            _ = buf_append_cstr(out, " [");
+            _ = buf_append_cstr(out, deleg_status_name(t.items[i].status));
+            _ = buf_append_cstr(out, "] ");
+            _ = buf_append(out, t.items[i].label.ptr, t.items[i].label.len);
+            _ = buf_append_byte(out, 10);
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+// `interrupt_agent` 工具：状态机在 `deleg_kill` 里，这里只负责把三种落点翻成
+// **模型**读的短句（这些是工具结果，文案与老口径逐字一致，别改）。
 export fn deleg_tool_interrupt(t: &DelegTable, args: &const JsonValue, out: &Buf) void {
     var idb: Buf = buf_empty();
     defer { buf_free(&idb); }
@@ -1180,33 +1281,25 @@ export fn deleg_tool_interrupt(t: &DelegTable, args: &const JsonValue, out: &Buf
         _ = buf_append_cstr(out, "Error: unknown subagent_id");
         return;
     }
-    const slot: isize = deleg_find(t, id);
-    if slot < 0 {
+    const rc: u8 = deleg_kill(t, id);
+    if rc == DELEG_KILL_GONE {
         _ = buf_append_cstr(out, "Error: unknown subagent_id");
         return;
     }
-    const si: usize = slot as usize;
-    deleg_poll_all(t);
-    if si >= DELEG_MAX {
-        return;
-    }
-    const d: &Deleg = &t.items[si];
-    if d.status != DELEG_RUNNING {
+    if rc == DELEG_KILL_ALREADY {
+        const slot: isize = deleg_find(t, id);
+        if slot < 0 {
+            _ = buf_append_cstr(out, "Error: unknown subagent_id");
+            return;
+        }
         _ = buf_append_cstr(out, "sub-");
         _ = buf_append_u64(out, id as u64);
         _ = buf_append_cstr(out, " had already finished [status: ");
-        _ = buf_append_cstr(out, deleg_status_name(d.status));
+        const si2: usize = slot as usize;
+        _ = buf_append_cstr(out, deleg_status_name(deleg_status_at(t, si2)));
         _ = buf_append_cstr(out, "]");
         return;
     }
-    // P104：模型自己叫停的，结果就在这条工具结果里，不再补完成通知。
-    t.items[si].notify_bg = false;
-    _ = sys_kill(d.pid as i64, SIGKILL) catch {};
-    deleg_check(t, si);
-    if t.items[si].status == DELEG_RUNNING {
-        t.items[si].status = DELEG_KILLED;
-    }
-    deleg_settled(t, si);
     _ = buf_append_cstr(out, "requested cancellation of sub-");
     _ = buf_append_u64(out, id as u64);
 }

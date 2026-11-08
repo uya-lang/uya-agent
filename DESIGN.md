@@ -1239,7 +1239,7 @@ schema 真值，不会两边漂移。
 | `subagent` | `prompt` `description` | `run_in_background`(默认 true) | `started background subagent sub-N` / 前台等到终态 |
 | `subagent_output` | `subagent_id` | `wait` `timeout_ms` | 增量正文 + `[status: …]` |
 | `send_message` | `subagent_id` `message` | — | `delivered message to sub-N; continuing as sub-M` |
-| `interrupt_agent` | `subagent_id` | — | 仅 RUNNING 时 SIGKILL + 结算 |
+| `interrupt_agent` | `subagent_id` | — | 仅 RUNNING 时按进程组 SIGKILL + 结算（与 `/stop` 共用 `deleg_kill`） |
 | `ralph` | `objective` | `maxRounds` | `[round N] <answer>` 逐轮 |
 | `create_goal` / `get_goal` / `update_goal` | 见 §9.3 | | |
 | `workflow` | `meta` `script` | `args` | 见 §9.4 |
@@ -1802,7 +1802,7 @@ deleg_child_main
 | `subagent` / `subagent_fork` | 必填 `prompt` + `description`；`run_in_background` 默认 **true**（立刻返回 `started background subagent sub-N`）；前台模式轮询到终态，超时上限 = `cfg.timeout_ms`，超时 SIGKILL 并报 `timed out and was interrupted`；每 50 ms 一次 `agent_pump_block()` 检查用户叫停 |
 | `subagent_output` | `wait=true` 时最多转 600 次 × 100 ms、墙钟 30 000 ms，或用户叫停即返回；**增量**读 `read_off`；无新内容给 `(no new output)`；尾部 `[status: …]` |
 | `send_message` | 要求槽位**不处于 RUNNING**；`d.sid` 空时报 `has no session to continue (ralph rounds are fresh-agent by design)`；实现是**新 spawn 一个槽位**并用同一个 `force_session_id` **续写同一份日志**，回 `delivered message to sub-N; continuing as sub-M` |
-| `interrupt_agent` | `deleg_poll_all` 后仅在 RUNNING 时 SIGKILL + 结算 |
+| `interrupt_agent` | 状态机在 `deleg_kill`（与人的 `/stop` **同一份**）：`deleg_poll_all` 后仅在 RUNNING 时**按进程组** SIGKILL + 结算；终态槽位回 `had already finished [status: …]` |
 | `list_agents` | 逐槽打印 `sub-N [subagent\|ralph] <status> — <label>`；无则 `(no background agents)` |
 
 **`ralph`**：默认 `rounds = 4`、上限 20；每轮构造**全新** prompt：
@@ -1844,6 +1844,24 @@ ralph → `<watch_base>-rN`，N 由管道里已收到的 `[round N]` 行推出
 其它：1 Hz 节流；空闲 TUI 主循环也继续（靠 `g_watch_cfg` 保存的 cfg 指针）；
 逐字节比、内容变了才重推；ralph 换轮 `watch_retarget` **保留已渲染内容** + 插一行
 `[轮次切换]`；槽位回收/换人（id 对不上）**自动结束**跟随。
+
+#### `/stop`：人叫停子代理（P127）
+
+**病根**：叫停只有**模型**一个入口（`interrupt_agent` 工具）。人这一侧（键层、命令表、
+面板）一个动词都没有 ⇒ 后台子代理跑飞了只能等它自己结束，或者把整个进程退掉；而退出
+那条路**也不收孩子**（`deleg_free` 只被 `--tui-demo` 的 fixture 调过），于是退出后
+`sub-N` 还在跑、还在烧 CPU、还在往旧会话日志里写。
+
+| 设计点 | 说明 |
+|---|---|
+| **一份状态机** | `deleg_kill(t, id) → DELEG_KILL_OK / _GONE / _ALREADY`，三个入口（`/stop`、清单浮层、`interrupt_agent`）全走它。各写一套必然漏掉「销通知 / 进终态 / 收整棵树 / 结算」里的某一步 |
+| **收整棵树** | `sh_kill_tree`（SIGCONT → `kill(-pid)` → 补一发单 pid）。子代理的 bash 工具各自 `setsid()` **自成会话**，只杀子代理 pid 会把 `make` / `sleep 300` 留成野进程 —— 屏幕上「面板没了、CPU 还在烧」正是这个 |
+| **销通知** | `notify_bg = false`：结果马上就交给调用方（人看回执 / 模型看工具结果），别再补一条「它跑完了」 |
+| **三种落点** | 真的停了 / 早就结束了 / 没有这个编号 —— **都有话说**。静默是最难查的失败（P46 的老账） |
+| **清单浮层** | 裸 `/stop` 开自己的 kind `TUI_OVK_STOP_LIST`（23，追加在末尾）。**不能借** `TASKS`（纯查看，回车不派发）或 `WATCH_LIST`（回车 = 跟随）—— 同一个坑已经踩过两次。游标默认落在第一个代理行（`agent_list_first_agent_row`，与 `/watch` 共用） |
+| **回合里也能派发** | 进 `agent_tui_cmd_safe`（含带参形态，与 `/watch` 同一条路）。判据是「碰不碰 History / cfg」，不是「有没有副作用」：`/stop` 会杀进程，但它不动历史也不返回「停」 |
+| **退出收尸** | `agent_session_close()` 里 `agent_watch_stop()` + `deleg_free(&g_deleg)` + `deleg_init(&g_deleg)`。这一个点覆盖进程退出、`/new`、`/resume`（换会话时旧的子代理属于旧会话，必须收） |
+| **子进程清表** | `deleg_child_main` 一进门就 `deleg_init(&g_deleg)`：槽位表是 fork **继承**来的，不清的话子代理这份拷贝里躺着父进程那几个孩子（含 pid）—— 它退出时一跑 `deleg_free` 就会**杀掉自己的兄弟** |
 
 ### 9.2 todo / plan
 
@@ -2337,7 +2355,7 @@ READY ──wt_finish──▶ FINISHED
 
 | 派发点 | 哪些命令 |
 |---|---|
-| **泵点**（当场派发 + 当场画一帧） | 只读命令：`/status` `/help` `/tasks` `/sessions` `/goal` `/diff` `/watch`（**含** `/watch sub-N`） |
+| **泵点**（当场派发 + 当场画一帧） | 只读命令：`/status` `/help` `/tasks` `/sessions` `/goal` `/diff` `/watch`（**含** `/watch sub-N`）`/stop`（**含** `/stop sub-N`；只动进程、不动历史） |
 | **step 边界** | `/compact` |
 | **主循环**（回合结束后） | `/continue` `/exit` 与其余；`/new` `/resume` **立刻回执** + 先中断当前回合 |
 
@@ -2587,7 +2605,7 @@ bash / node / python 峰值可达 GB 级，不算进来是刻意的）。
 
 | 形态 | kind 前缀 | 状态 | 用途 |
 |---|---|---|---|
-| 列表 | `TUI_OVK_*`（19 种） | 条目 + 游标 + 过滤词 | 命令面板 / `/sessions` / `/help` / `/model` / `/permission` / `/worktree` / `/goal`（P91 动作选择）/ `/watch` 清单 |
+| 列表 | `TUI_OVK_*`（20 种） | 条目 + 游标 + 过滤词 | 命令面板 / `/sessions` / `/help` / `/model` / `/permission` / `/worktree` / `/goal`（P91 动作选择）/ `/watch` 清单 / `/stop` 清单（P127，回车 = 叫停） |
 | reader | `TUI_OV_READER` | 可滚动正文 | plan 审阅 / `/status` / `/tasks` 长文本 |
 | diff | `TUI_OV_DIFF` | 左文件列表 + 右两栏 | `/diff` |
 | ask | `TUI_OVK_ASK` | 问题 + 选项 + 自定义行 | `ask_user_question` |
@@ -4380,6 +4398,7 @@ QTermWidget）对 `ESC[?5522$p`（DECRQM）**零应答**，OSC 52 写 `c`/`p` �
 |---|---|
 | **换会话只换「当前会话的」那段屏幕**（P39；P119 改口径） | TUI 里 `/new`、`/resume <id>` 把转录清成「只剩新会话」（`/resume` 再按**日志**重放到退出前那一屏，见 §8.6）；但**滚动模式（`--no-tui`）不重画** —— 那边的正文是终端自己滚出去的 |
 | **子代理面板里那条「最新消息」是父进程发给它的那句话**（P40） | 预览取 `Deleg.prompt`（首行、空白折叠、超长贴尾）；子代理 stdout 按 P11 口径**只在跑完时**才回传管道，所以「它刚说了什么」得等终态或 `subagent_output`（面板那个 `· N` 是已收输出行数，运行中通常是 0）。贴尾只收窄**显示**，`Deleg.prompt` 本身一个字节不动 |
+| **回话在屏幕上曾经一个字节都没有**（P127） | 管道里只有终态答复，而它以前只交给模型（`subagent_output` / 完成通知）：结算行只印 `[agents] … — <标签>`（标签是父进程自己写进去的词），`subagent_output` 的正文被 `--tool-lines 0`（默认）整段吞掉。现在：结算行第二行 `↳ <答复末行>`（`view_agents_note_text`，贴尾取最后一条非空行、超长按 `VIEW_AG_MSG_MAX` 截）；`subagent` / `subagent_fork` / `subagent_output` 三条工具调用的正文在 `tool_lines=0` 时也出（首尾各 6 行）。逐行看全仍走 `/watch sub-N` |
 | **`/watch` 的实时粒度是「事件」不是 token 级**（P42） | 见 §9.1；且 `/watch` 是**进程状态**（`--resume` 不回填）；被跟随的子代理跑完或槽位回收时跟随自动结束 |
 | **浮层高上限 16 行**（非全屏） | `↑/↓`、`pgup/pgdn`、`home/end` 滚，标题栏 `↑`/`↓` 是溢出指示 |
 | **浮层全屏只吃转录区** | 不做「盖住整屏」的真全屏，不做鼠标拖拽缩放/点击边框，不做「每个形态各自记住全屏偏好」 |
@@ -6889,6 +6908,41 @@ QTermWidget）对 `ESC[?5522$p`（DECRQM）**零应答**，OSC 52 写 `c`/`p` �
      `agent_default_home` 现算（web 的 `dwh_assets_home` 就是因为自带 env 回落才没坏）；
      ③ 判据别只测「目录拼得出来」，要测**写完之后换了目录还读得回**。
 
+165. **「子代理没法手工停、它说了什么屏幕上一个字都没有」：叫停只有模型一个入口，
+      退出也不收孩子**（用户报的「子代理没法手工停止 + 回话怎么显示」）。
+
+      现场：后台子代理（`run_in_background` **默认 true**）跑飞之后，人在终端上按什么都没用 ——
+      esc / ctrl+c 停的是**父代理这一回合**，与那个 `sub-N` 无关；`/help` 里没有停止类命令；
+      面板上那行「最新消息」永远是父进程发过去的那句话（P40 的贴尾预览取 `Deleg.prompt`），
+      跑完时滚动区只多一行 `[agents] sub-N [subagent] ✓ idle 27s — <标签>` —— **答复正文一个字都没有**。
+      更糟的是退出也不收：`deleg_free` 全仓只有 `--tui-demo` 的 fixture 调过，正常退出（含 `/new`、
+      `/resume`）一个孩子都不收，于是 `sub-N` 在父进程没了之后继续跑、继续往旧会话日志里写。
+
+      根因三条：① 叫停只有 `interrupt_agent` 这一个**给模型**的工具，人这一侧（键层 / 命令表 /
+      面板）根本没有动词 —— 能力只在「模型愿意调」的时候才存在；② 管道里只有**终态答复**
+      （fd 1/2 指向 `/dev/null`，这是 P9/P11 的纪律，不能改），而它只交给模型
+      （`subagent_output` / 完成通知），显示层从没读过 `Deleg.buf`；③ 显示层还有一道
+      `--tool-lines 0`（默认）的闸：每个工具只留一行，于是 `subagent_output` 的正文整段被吞。
+
+      修法：① `deleg_kill` 一份状态机（`OK/GONE/ALREADY`），三个入口共用（`/stop`、清单浮层、
+      `interrupt_agent`），收的是**整棵树**（`sh_kill_tree`，子代理的 bash 自成会话）；
+      ② 新命令 `/stop [sub-N|all]` + 自己的浮层 kind `TUI_OVK_STOP_LIST`（不能借 TASKS/WATCH_LIST，
+      理由见 §11）、进只读集合（回合里也能当场派发）；③ 结算行加 `↳ <答复末行>`
+      （`view_agents_note_text`，取最后一条非空行、贴尾截到 `VIEW_AG_MSG_MAX`），
+      `subagent`/`subagent_fork`/`subagent_output` 的工具正文在 `tool_lines=0` 时也出（首尾各 6 行）；
+      ④ `agent_session_close` 里 `deleg_free` + `deleg_init`，子进程一进门 `deleg_init` 清掉继承来的表
+      （不清的话它退出时会杀掉自己的兄弟）。
+
+      判据：`subagent-stop` 轮（清单 / 点名单停 / 全停 / 空态 / 非法参数 / 与 `interrupt_agent`
+      共用一份状态机 / 命令表里有 `/stop`）+ `tool-view` 轮的 L 组（`↳` 三态 + 超宽截断 +
+      `subagent_output` 正文在 `tool_lines=0` 时也出）。
+
+      教训：① 「能力只在模型手里」是设计债：凡是模型能做的、人又需要在中途做的动作，
+      **同一份状态机**必须也给人一个动词（照着 `interrupt_agent` 另抄一份 kill 是最容易犯的错）；
+      ② 进程/资源的所有权要写在**唯一的收尾点**上（这里是 `agent_session_close`），
+      散落在 demo 与自测里的 `free` 等于没有；
+      ③ fork 之后**子进程要先清掉继承来的「别人的资源表」**，否则它一收尾就会误伤兄弟。
+
 ---
 
 ## 17. 工具实现要点
@@ -7212,7 +7266,7 @@ DEEPSEEK_API_KEY=sk-xxx ./build/uya-agent \
 | `watch-poll` | P42 `/watch` 增量读：分批写文件只取新增、**半行不吐**（补齐后才出现）、没有新字节时一个字节都不重渲染 |
 | `watch-e2e` | `make e2e-watch`：真终端 + 假网关派一个「先思考、再跑 `sleep 8` bash」的子代理，`/watch sub-1` 后 `[step …]` 与 `▸ bash …` 必须**在子代理结束之前**上屏 |
 | `watch-pick-parse` | P46 现役清单行 → 编号（纯函数）：`  sub-12 [running] …` 整段取两位数、标签里的 `sub-3` 不抢先、表头的 `sub-N`（N 不是数字）与空态行都不认、认出的编号必须能过 `deleg_id_parse` |
-| `tui-watch-pick` | P46 清单浮层的 kind 是自己的 `TUI_OVK_WATCH_LIST`（借 `/tasks` 的 kind ⇒ 回车的结果被静默丢掉）+ 默认游标落在第一个代理行（喂一份带表头的清单给 `agent_watch_list_first_row`）+ 回车交出选中行原文 + 三条失败路都有回执（表头行、刚跑完的编号、`/watch sub-9`）+ 三种落点码 + 带参数的 `/watch` 在只读集合里 |
+| `tui-watch-pick` | P46 清单浮层的 kind 是自己的 `TUI_OVK_WATCH_LIST`（借 `/tasks` 的 kind ⇒ 回车的结果被静默丢掉）+ 默认游标落在第一个代理行（喂一份带表头的清单给 `agent_list_first_agent_row`）+ 回车交出选中行原文 + 三条失败路都有回执（表头行、刚跑完的编号、`/watch sub-9`）+ 三种落点码 + 带参数的 `/watch` 在只读集合里 |
 | `web-emu` | P60 服务端终端解释器：把**真实捕获的 TUI 帧字节**（`tui_start` 的输出 fd 指向管道）喂给 `emu_feed`，断言 ① 网格文本与 `tui_screen_text()` **逐字节相同**；② **逐字节分片**喂入结果相同（状态机跨 feed）；③ 白名单外的 CSI **不改动网格**；④ 捕获里出现的 CSI 终字节全在白名单内 |
 | `web-http` | P60 HTTP 侧纯函数：`srv_query_get` 能从**带路径前缀**的 URL 里取到参数（修过的「永远 missing id」回归）+ `web_addr_parse` 三形态（默认 8787 / 127.0.0.1:PORT / 0.0.0.0:0）三拒绝（别的 IP / 缺端口 / 非数字端口）+ `web_id_is_hex` 拒绝 `../` 与 `/`（路径穿越） |
 | `web-page` | P60 页面：顶栏 `tabs` / `+` 按钮 / 六个端点标识齐全；**整份 HTML 里没有任何外链**（`http://` / `https://` / `src="//"` —— 不引 xterm.js、不走 CDN 的机器判据）；JS 里有方向键映射；**高亮可见**（不许有 `filter:invert`、必须有反显规则，踩坑 113）+ **宽字符排版三件事在**（段上钉宽度 / 按段补字距 / 量过宽字符进宽，踩坑 112）+ **IME 通道在**（有 `id="ime"` 的代理输入框 / `compositionend` / `insertCompositionText` 守卫，且 `keyBytes` 里**没有**单字符兜底 —— 踩坑 116）+ `esid`（订阅身份，踩坑 117）+ **复制与选区五条**（踩坑 125：`dragging` 标志在 / `selInTerm` 判据在 / `copy` 只写 `text/plain` 且**不许**写 `text/html` / `ctrl+c` 按选区分流 / 非修饰键先清残留选区 / `::selection` 定了不透明色）。防假绿对照：把 `keyBytes` 的单字符兜底装回去 ⇒ 当场红 |
@@ -7235,6 +7289,8 @@ DEEPSEEK_API_KEY=sk-xxx ./build/uya-agent \
 | `tui-mem` | 转录的内存纪律（踩坑 153，**四段判据全是数值、屏幕上看不见**）：① 记账恒等式 —— `tui_text_bytes()`（现算 Σ text.len）必须**逐字节等于** `tui_text_accounted()`（记账），派生同理；夹具含思考超 `TUI_REASON_TAIL` 的截尾与**两种宽度下重折**（这两条正是修前「只加不减」的两个现场），并打印实测的正文/派生字节数；② 派生上限 —— 正常 markdown 灌到正文上限附近（512 条 / 3.6 MB）派生必须 **< 上限**（实测 10.9 MB，即「一条正常内容都不会因为它被丢」的可执行版本），病态夹具（缩进 900 列的长行）派生必须**有界**（实测 20.4 MB）且真丢过条目、且不许把最后一条也丢掉；③ 清空 —— `tui_transcript_clear()` ×10 之后 `tui_entry_live_allocs()` 必须 **= 0**（ASSIST/TOOL/USER/NOTICE 四种条目都建过；修前漏的是 TOOL/USER/NOTICE 的 `wrap_ix`），三个记账与丢弃计数一起归零；④ 单条上限对**整块输入**成立（`✓ ` 起头的 1 MiB 工具行 ⇒ 该条目 `text.len` 不许超 `TUI_ENTRY_MAX`）+ 丢过条目后上滚时第 0 行出现「更早的 N 条已省略」。防假绿对照四次（见踩坑 153） |
 | `overlay-fullscreen` | `make p30-check` 第 9 场（真终端 + 假网关）：屏幕几何判据 —— 非全屏顶边 > 0 行且左边框 > 0 列 → `ctrl+f` 后顶边第 0 行、左右边框正好 `0` 与 `cols-1`、标题带 ` · 全屏`、面板与脚注都还在、底边行 < 面板行 → `F11` 关回居中 → 再全屏、`esc` 关掉后方框消失 |
 | `tasks-ctrl-t` | `make p30-check` 第 10 场（踩坑 114，真终端 + 假网关 `todo_first=1`）：回合**运行中**按 `ctrl+t` → `┌─ tasks ` ≤1.5 s 上屏**且那一刻 `SELFTEST_OK` 还没到** → 再按一次收回折叠行（实测 101 ms） |
+| `tui-stop-pick` | P127 `/stop` 的 TUI 链路：裸命令开 `TUI_OVK_STOP_LIST`（kind 独占）+ 游标落在第一个代理行 + 回车**真把槽位打成 KILLED** 并落回执 + 另两种落点（早就结束 / 编号不存在）都有回执 + 空态**不开空浮层** + 带参 `/stop` 在只读集合里 |
+| `subagent-stop` | P127 人叫停子代理：`/stop` 的三种落点（清单 / 点名 / `all`）+ 空态与非法参数都有回执 + **与 `interrupt_agent` 共用 `deleg_kill`**（工具那条文案逐字不变）+ 命令表里有 `/stop`。全在纯函数层（不 fork），Windows 照跑 |
 | `watch-pick-e2e` | `make e2e-watch-pick`：真终端 + 假网关两条腿 —— ①裸 `/watch` → 清单 → **一次回车**开跟随浮层（`[step …]`/`▸ bash …` 仍在子代理结束之前上屏）；②假网关把父代理的收尾按住 12 s，期间敲 `/watch sub-1` 必须**当场**开浮层（屏幕上还没有 `PARENT-DONE-OK`） |
 | `model-route-e2e` | `make e2e-model-route`：真终端 + **两个**假网关（各自记账模型名与 `Authorization`），两条腿（`--mode text` 带参命令 / `--mode overlay` 浮层）—— 回合被一条慢 bash 撑住时切换模型，断言**回合结束前**信息行就变成新模型/新提供方（实测 102 ms）、之后那条请求打到**新提供方**的网关（旧网关不再收到）、且带的是**新提供方**的密钥（旧密钥不跨提供方），那一轮的答案是新提供方给的。尾判等的是**正面事实** `PROV-B-ANSWER`（以前等「有 `轮 ·` 且没有 `运行中`」，那两半都在回合半途就成立 ⇒ 约 5% 假红，见踩坑 109；基线 104 次红 5 次、修后 104 次全绿，防假绿对照照红）。对照改动前：`VERDICT: FAIL` + 网关记账里 prov-a 收到全部请求（踩坑 96） |
 | `session-log` | 控制字节按字节往返、半条记录 `dropped_tail`、重建历史 |
