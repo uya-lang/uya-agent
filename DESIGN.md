@@ -700,7 +700,8 @@ malloc(LLM_EVENT_ARENA) + arena_init
 | order | 节 | 来源 | 何时出现 |
 |---|---|---|---|
 | 0 | persona | preset 的 persona 行（见下面三级来源）；读不到用内置默认值（逐字） | 总是 |
-| 50 | plan 策略 | preset 的 `plan-mode.section`，否则内置 | **仅 plan 模式激活时** |
+| 50 | plan 策略 | preset 的 `plan-mode.section`，否则内置 | **仅 plan 模式** |
+| 51 | chat 策略（`SEC_CHAT`） | 本仓常量（上游没有这一节，见 P126） | **仅 chat 模式** |
 | 100–106 | 工具引导（`SEC_READ`/`SEC_WRITE`/`SEC_EDIT`/`SEC_GLOB`/`SEC_GREP`/`SEC_BASH`/`SEC_JOBS`） | 本仓常量；read/bash 两条与 DSH 原文一致，其余为等价精简表述 | `SEC_BASH`/`SEC_JOBS` **仅 `allow_shell` 时** |
 | 107 | 收工纪律（`SEC_FINISH`） | 本仓常量（DSH 没有） | 总是 |
 
@@ -766,6 +767,7 @@ Current runtime context. This snapshot supersedes earlier runtime-context snapsh
 | `file-policy` | 三级访问模式的说明句 + **按沙箱实际可用性收尾** | 模型得知道自己的写权限与沙箱是否真的生效（「沙箱不可用」与「不需要沙箱」是两件事） |
 | `workspace` | `Current workspace: <path> (…)` | 工作区是**当前会话**的状态、运行中会被切（`workspace` 工具 / `/workspace`）—— 模型每轮都要一眼看到自己在哪 |
 | `plan` | plan 模式激活时的「不许改文件，先出计划」 | 与 §7.4 的写闸门配对（提示 + 硬拒） |
+| `chat` | chat 模式激活时的「只回答问题，要改就请人切 build」 | 与 `plan` 那句**互斥**（三态里只有一个模式成立），同样与写闸门配对 |
 
 **「supersedes earlier snapshots」这句话是有功能的**：工作区 / 权限 / plan 都可能在会话中途变，
 历史里会堆积多份快照。模型需要知道**以最后一份为准**，否则会按已经失效的工作区去解析路径。
@@ -1445,8 +1447,8 @@ write/edit **成功后刷新**记录。
 
 | 闸门 | 拦什么 | 拦法 | 与谁独立 |
 |---|---|---|---|
-| **权限模式** | 写工具（read-only 全拒）+ bash 审批 | 硬拒 / 问人 | 独立于 plan |
-| **plan 写闸门** | `write` / `edit` | 硬拒（`plan_blocks_write`） | 独立于权限；**不拦 bash** |
+| **权限模式** | 写工具（read-only 全拒）+ bash 审批 | 硬拒 / 问人 | 独立于会话模式 |
+| **会话模式闸门** | `write` / `edit`（`plan` 与 `chat` 两种模式都拦） | 硬拒（`mode_blocks_write`） | 独立于权限；**不拦 bash** |
 | **worktree 共享 checkout** | 对共享 checkout 的 read/write 与含 git 变更子命令的 bash | 硬拒 | 独立于前两者（P37） |
 
 **plan 模式为什么拦 `write`/`edit` 而不拦 `bash`**：DSH 的 plan mode 是**纯引导**（它自己的
@@ -1454,9 +1456,18 @@ write/edit **成功后刷新**记录。
 上是因为：**不这么做，模型压根不调 `exit_plan_mode` 就直接开工**，审阅浮窗永远不会出现
 （现场证据：踩坑 36）。而 `bash` **不拦** —— 探索要用它，它归访问模式（§7.1）管。
 
-拒串（**测试逐字断言**）：plan 模式 `Error: write is refused in plan mode (no file changes
-before the user approves the plan). …`；read-only 模式 `Error: write is refused in read-only
-mode (the user granted no write access). Do not retry; …`。
+**`chat`（P126）共用同一道闸门**：问答模式同样不该动文件，所以 `mode_blocks_write()` 对
+`plan` 与 `chat` 都为真 —— 一个 `u8` 决定三态，闸门只有一处判断。三者的差别在**出口**：
+`plan` 有 `exit_plan_mode` 的审阅浮窗（这是它存在的理由），`chat` **没有**出口（那个工具在
+chat 下照旧报「只在 plan 模式可用」），想动手只能由人切模式。`bash` 在两种模式下都一样不拦，
+理由同上；真要物理只读请叠加 `--permission read-only`（两者叠加 = 全只读）。
+
+拒串（**测试逐字断言**，`plan` / `chat` 两种模式**分开写**：plan 指路 `exit_plan_mode`，
+chat 指路切 build）：plan 模式 `Error: write is refused in plan mode (no file changes
+before the user approves the plan). …`；chat 模式 `Error: write is refused in chat mode
+(this mode answers questions and does not change files). …`；read-only 模式
+`Error: write is refused in read-only mode (the user granted no write access). Do not
+retry; …`。
 
 ### 7.5 审批与提问：fail closed 与「换个地方问」的区别
 
@@ -1532,7 +1543,7 @@ plan 审阅的四条裁决：`PLAN_KEEP=0` / `PLAN_APPROVE=1` / `PLAN_NO_CHANNEL
 | `session/model` | `{provider, model, reasoningEffort, source}` | 模型/档位变更（`source` 见 §5.5.1） |
 | `session/worktree` | `{action, worktree, branch, base}` | worktree 动作（§10） |
 | `permission/mode` | `{mode}` | 权限模式切换（§7.1） |
-| `plan/mode` | — | plan 模式切换 |
+| `plan/mode` | `{active, mode}` | 会话模式切换：`mode` 是三态真值（`build`/`plan`/`chat`，P126），`active` 是 P26 起就有的 plan 布尔口径（保留给既有读者，两者永远同时写） |
 | `compaction/summary` | — | 自动压缩（§5.3.3） |
 | `subagent/start` | — | 子代理派生（§9.1） |
 | `cache/evicted` | — | 缓存淘汰 |
@@ -1849,10 +1860,22 @@ ralph → `<watch_base>-rN`，N 由管道里已收到的 `[round N]` 行推出
 | 换会话时也清 | `agent_session_scoped_reset`。**修过的 bug**：原来没人清 ⇒ `/new` 之后清单还挂着上一条会话的「第几步」 |
 | **列表不再注入回上下文** | 与 DSH 一致 —— 那是 UI/replay 状态，不是模型输入（**落盘 ≠ 注入**：恢复折的是屏幕/报告上的那份，模型那边一个字节都看不到） |
 
-**plan（`agent/plan.uya`）**：见 §7.4。
-状态 `PlanState{active, pending}`，`pending` 是 DSH `set()` 语义的简化（这里只在 step 边界检查，
-所以立即改 `active`）。进程级镜像 `g_on` + `tui_set_plan` 同步。
-`plan_tool_exit` 要求 plan 非空且**首字符 `#`**；非 plan 模式调用报错。
+**会话模式（`agent/plan.uya`）**：见 §7.4。三态 `MODE_BUILD` / `MODE_PLAN` / `MODE_CHAT`，
+状态 `PlanState{mode, pending}` —— **互斥由一个 `u8` 保证**（P126 之前是一对 `bool`，
+加第三态时才看出「两个开关」表达不了它）。`pending` 是 DSH `set()` 语义的简化（这里只在
+step 边界检查，所以立即改 `mode`）。
+
+| 出口 | 谁能切 | 走哪条路 |
+|---|---|---|
+| tab（TUI） | 人 | 键层 `tui_mode_cycle()` 翻 chip + 置 `TUI_REQ_MODE`，主循环 `agent_mode_apply` |
+| `/plan`、`/chat`（两种界面都有） | 人 | `agent_mode_apply(cfg, h, MODE_*)` |
+| `exit_plan_mode`（审阅浮窗「确认执行」） | 模型 | `mode_set(s, MODE_BUILD)`（只在 plan 模式可用） |
+| `--plan` / `--chat` | 人（启动时） | `agent_texts_ensure` 里一次 `mode_set`（两个都给时 plan 优先） |
+
+`mode_set` 是**唯一**的状态变更点：它同时写 `s.mode`、清 `pending`、同步进程级镜像 `g_mode`
+与输入面板的 chip（`tui_set_mode`）。表外的值一律**不动**（显示层与状态层的镜像不许被一个
+没人认识的数改掉）。`plan_tool_exit` 要求 plan 非空且**首字符 `#`**；非 plan 模式调用报错
+（`chat` 下也报 —— 它没有审阅出口）。
 
 ### 9.3 会话目标（`agent/goal.uya`）
 
@@ -2368,7 +2391,7 @@ READY ──wt_finish──▶ FINISHED
 
 | 键 | 行为 |
 |---|---|
-| `tab` | 输入为空 = **切 plan 模式**；否则插入两空格 |
+| `tab` | 输入为空 = **轮转会模式** build → plan → chat → build（P126）；否则插入两空格 |
 | `shift+tab` | 输入为空 = 访问模式选择器；否则插入两空格 |
 | `esc` | **运行中 = 中断本回合**；空闲 = 清行 |
 | `F2` | 切换鼠标上报（**关掉即可拖选复制**） |
@@ -4503,7 +4526,7 @@ QTermWidget）对 `ESC[?5522$p`（DECRQM）**零应答**，OSC 52 写 `c`/`p` �
 41. **首 token 只认正文 delta**：推理/工具回合几乎空着，偶尔打到时 tok/s 爆表（实测 6371，真值 ≈158.6）；判据改「任意非空增量」（`got_payload`：正文/`reasoning_content`/`tool_calls` 参数），元数据帧不算；回归 `stream-firsttok-*`。
 42. **「被裁要补 `…`」的预算必须先扣一列**：`tui_put_clipped` 的 `…` 不在预算里，长行比方框宽 1 列；新增 `tui_ov_put_clipped()` 用 `tty_clip_bytes` 量后减一；回归拿会撑满的 `/permission` 量边界。
 43. **uya 0.10 四坑**：①全局初始化式必须常量（`initializer element is not constant`）；②循环里 `const x = if …` 生成给只读变量赋值的 C（改 `var`+if）；③`match` 是保留字；④`buf_new` 缓冲无 NUL，画 Buf 用 `tui_putn`/`tui_put_clipped`。
-44. **plan 模式只是提示词软引导时模型直接开工**：无 `exit_plan_mode` 调用；`write`/`edit`/`bash` 无闸门（`perm_allows_write()` 只看访问模式），审阅走 CLI `ask_write`+y/N 与 TUI 键队列互不相干；加 `plan_blocks_write()`+`tui_reader_wait`。
+44. **plan 模式只是提示词软引导时模型直接开工**：无 `exit_plan_mode` 调用；`write`/`edit`/`bash` 无闸门（`perm_allows_write()` 只看访问模式），审阅走 CLI `ask_write`+y/N 与 TUI 键队列互不相干；加 `plan_blocks_write()`+`tui_reader_wait`（P126 起改名为 `mode_blocks_write()`，`chat` 共用）。
 46. **「把键收下来」不等于「看键」，有东西在跑就退出不了**：阻塞循环只 `tui_poll_tick()` 不读标志 → 统一 `tui_abort_check()`；`llm_stream_style` 忽略 `TTY_EV_EOF`；`g_tui_interrupt` 没人复位；子代理抢 fd 0 → `tui_child_detach()`；headless 与 quit 标志拆开。
 45. **`const x = if c { a } else { b };` 在 0.10 C 生成里变成给 const 赋值**：`make build` 报 `assignment of read-only variable '__uya_ifexpr_8'`；同类 `out` 已是 `&Buf` 时 `&out` 是 `Buf**`（C 阶段才报）；check 后必须再 `make build`。
 47. **「TUI 渲染与 agent loop 分两条线程」被分配器否掉**：机制成立（`libc.pthread`、`sys_tgkill`+无 `SA_RESTART` 处理器 EINTR 唤醒，errno=4）；但工具链堆并发分配 8/8 崩（`double free detected in tcache 2`）、pthread 互斥不干净；选「单线程+泵点加密」。
@@ -7058,7 +7081,7 @@ DEEPSEEK_API_KEY=sk-xxx ./build/uya-agent \
 | `tui-frame` | 八尺寸每行 ≤ cols、正文层无 ESC；脚注按列退化；浮层方框左右边界同列（踩坑 42） |
 | `tui-marquee` | P75 放不下的文本滚动显示六段：**A** 装得下时逐字节不变（短路径 11 列、无 `…`、tick 恒 false 不置脏）；**B** 200 列下 cwd 段仍只占 30 列、尾段不在屏上、带尾随 `…`（旧行为整条放出来 ⇒ 红 3 条）；**C** 时间闸门（同一毫秒连推 5 次不动）、一列一步、滚到尾后尾段与分支上屏、端点停满 4 步、第 5 步归零重来；**D** 复位 —— 夹具用**兄弟路径**（真 worktree 形态：同长、前 16 字节相同）⇒ 只有 `tui_set_cwd` 里那次显式复位能救，`tui_reset_all` 同理；**E** 不变量：滚动中整行 ≤ cols、右半区仍右对齐 `cols-3`、40 列仍整段让位；**F** 心跳置脏（推进了必须有帧待画）；**G** **真 PTY** 端到端：长工作区起真 TUI、**不按键**只收帧，路径后段必须自己滚上来 —— F/G 两段都是**假绿**逼出来的（headless 的 `tui_flush` 因 `out_fd < 0` 早退 ⇒ 脏位永远清不掉 ⇒ 任何脏位判据在 headless 里恒真，见 §19 P75） |
 | `tui-marquee-row` | P76 一格一条的簇里**只有选中项滚**四段：**A** 120 列真命令表面板（两条长命令同屏）—— 推进 8 拍后**方框之内除选中那一行外逐行逐字节不变**、选中行真在动、且它仍以 `/model [名字\|提供方/名字] ` 开头（钉住）；**B** 一路滚到尾段（`管推理强度）`）上屏且命令名仍在同一行 ⇒「只滑说明」；换选之后原行回到静态截断（尾串消失 + 尾随 `…`）、再选回来从头部开始；**C** 另两条簇同一条纪律（ask 选项 / reader 动作行；动作行一行多项但共用槽位是安全的，见下方对照实验④）+ **没有分列空格时长行整行滑**（钉不出名字就不该钉）；**D** **真 PTY** 端到端：真 TUI 喂 `/model` 开面板，**不按键**只收帧，用 `web/ttyemu` 解成网格逐行差分 —— 方框内只有选中那一行在变、命令名仍在。判据只认**方框之内**（脚注 cpu/ctx/时钟、状态区本来就每拍在变；算进来等于恒红，P75 的 F 段正是被这类噪声盖住才假绿） |
-| `tui-keys` | UTF-8 逐字符编辑、切开的 `ESC [ D`、Ctrl-J、↑历史、tab plan、面板、Ctrl-D/Ctrl-C、`tui_abort_state()` 三档；**ctrl+v 贴剪贴板（踩坑 110）：无浮层时给出 `TUI_REQ_PASTE`、浮层开着时不动全屏态、全部 `TUI_K_*` 事件码两两不同的哨兵、help 文案里有那一条** |
+| `tui-keys` | UTF-8 逐字符编辑、切开的 `ESC [ D`、Ctrl-J、↑历史、tab 轮转三种模式（build→plan→chat→build，含输入非空时只插空格）、面板、Ctrl-D/Ctrl-C、`tui_abort_state()` 三档；**ctrl+v 贴剪贴板（踩坑 110）：无浮层时给出 `TUI_REQ_PASTE`、浮层开着时不动全屏态、全部 `TUI_K_*` 事件码两两不同的哨兵、help 文案里有那一条** |
 | `tui-turn` | headless 端到端：用户条目、`✓ Write`/`✓ Bash(`、最终答案、状态区收掉无残影；脚注含 `1 轮 · `；**P58 续跑腿**（换一份 mock 重跑：`create_goal` 之后主循环空闲即自开第二轮 → 续跑轮用记账后的 revision 标 complete → 授权收掉、转录里不出现 `<goal_round>` 用户条目） |
 | `tui-status` | 常驻状态区 + 思考实时行：铺满后仍钉住、只显示 `latestLine`、空闲 0 行、窄终端退化 |
 | `tui-caret` | 踩坑 66：运行中（思考/输出/工具）输入行有光标（标志位 + 字节级 1×`?25h`/0×`?25l`）；空闲与「空闲+浮层」两格不变；运行中开浮层仍隐藏（1×`?25l`/0×`?25h`） |
@@ -7087,7 +7110,8 @@ DEEPSEEK_API_KEY=sk-xxx ./build/uya-agent \
 | `san-shell` | 直接 fork 沙箱实测：read-only 写 `/tmp` 被拒、区外写被拒；无 bwrap 打 skip |
 | `san-tool` | 端到端：workspace-write 区内落盘、区外不存在（内核拦的） |
 | `tui-access` | chip 三模式、`shift+tab` 只置请求、选 Full access 出确认层；`/status` 真派发、`/help` 开浮层；结果 kind 跨 close 存活（踩坑 44） |
-| `plan-gate` | P26 plan 写闸门真值表 + 全权模式下 write/edit 被拒且 `plan-gate.txt` 不落盘 |
+| `plan-gate` | P26/P126 三态真值表（互斥 / 表外值不动 / 两个名字 / 四个裁决）+ 全权模式下 plan 模式的 write/edit 被拒且 `plan-gate.txt` 不落盘、没有渠道时**不退出** plan 模式 |
+| `chat-gate` | P126 chat 模式：全权模式下 write/edit 按 **chat 的拒绝串**被拒、`exit_plan_mode` 报「只在 plan 模式可用」、system 里**不再有** plan 那一段，一轮跑完模式不变、文件不落盘 |
 | `tui-plan` | 审阅浮窗四段：动作/滚动/`Plan approved`/`esc` dismissed；40 列不超宽 |
 | `tui-ask` | P43/P45/踩坑 81 提问弹窗六段：① headless 排版与按键（标题/问题/编号选项/`▸`/`✎`/提示/方框闭合/每行 ≤ cols/无 ESC-NUL/**无行内换行**；`↓`、`1-9` 直选、打字进自定义、`backspace` 退、单选自定义排他、多选 `[x]` 交回两个下标、0 选项只画自定义行、40 列不越界、`esc` 取消）；② 框宽**自适应内容**（短内容缩到下限 34、长问题长到终端上限 −6、光标移动不抖列宽、提示与占位按 full→mid→min 退让且 `esc 取消` 不被截、40/30 列终端仍闭合不越界）；③ **长/多行内容不跑出框外**（超长问题折成多行且末行标记上屏、放不下时末行补 `…`、多行问题的 `\n` 折成空格、脏 `header`/ESC 被清洗、多行自定义回答仍在框内、**缩窗后按新宽度重折且每行仍在预算内**、宽终端上多选提示的 full 档真的会用）；④ 终端太矮 `tui_ask_wait` 返回 0（回落输入行，不 fail closed）；⑤ headless+agent 真调 `ask_user_question`：没人答 = dismissed + 空 `selected`，绝不假装有人答、浮层收干净；⑥ 真 PTY：弹窗把**长且多行**的问题首末行都画上屏（不是输入行那条提示）、`2`+回车后模型收到的工具结果里是第二个选项的 label |
 | `tui-ws` | P34 工作区切换：脚注 cwd、`/diff` 标题、运行时上下文注入不上屏、幂等 |
@@ -10549,3 +10573,57 @@ docs-only 提交」，goal 一直续跑却一直没有实质产出 —— 人看
 本地按同一份 home + `--resume session-c7f98113-…` + `/new` 只看到 1.3 s 的收尾尖峰
 （拆会话 / 重建系统提示词 / reclaim），随后回落 ~0%；上面那条 `-2` 收口是同一症状里
 唯一能构造出来的机制，其余成因待现场取证（下次请给 `top -H` 或 `gdb -p <pid> bt`）。
+
+### 19.41 P126：会话模式的第三态 `chat`（tab 轮转 build → plan → chat）
+
+**需求**（人提的）：plan 与 build 之间缺一个「只答问题、不动手」的位置。想先问清一个仓怎么跑、
+或者只想让人解释一段代码时，plan 模式是**错的工具** —— 它逼你交一份计划、还得走
+`exit_plan_mode` 的审阅浮窗；build 模式则随时可能动手改文件。所以加第三态 `chat`：**只回答、
+不写文件**，与 plan 平级、用 `tab` 轮转。
+
+**为什么不复用 plan 加一个布尔**：P26 的 `PlanState{active, pending}` 是一对 bool，
+`tab` 的语义是「开/关」。第三态一来，「两个开关」立刻表达不出互斥（`plan && chat` 是什么？），
+于是一个**状态**变成两个**可能自相矛盾的标志**。改成 `PlanState{mode: u8, pending: i32}`：
+互斥由类型的**一个数**保证，`mode_set()` 是唯一变更点（同时写 `s.mode`、清 `pending`、同步
+进程级镜像 `g_mode` 与 chip），加第四态只动这一处。
+
+**三态的分工**（差别只在提示词与出口，闸门是同一道）：
+
+| | 写工具 | 审阅出口 | 提示词里多出的一节 |
+|---|---|---|---|
+| build | 允许（受访问模式约束） | — | — |
+| plan | **硬拒** | `exit_plan_mode` 浮窗（批准 → 回 build） | preset 的 `plan-mode.section`（order 50） |
+| chat | **硬拒**（同一道 `mode_blocks_write`） | **没有**（`exit_plan_mode` 照旧报错） | 内置 `SEC_CHAT`（order 51） |
+
+`bash` 在 plan 与 chat 下都**不拦**（与 §7.4 同一条理由：探索要用它，它归访问模式管）；
+真要物理只读请叠加 `--permission read-only`。
+
+**键层与状态层的分工**：`tab` 在键层只做两件事 —— 把 chip **乐观地**翻到下一个模式
+（`tui_mode_cycle()`，按键即反馈）并置 `TUI_REQ_MODE`；真正的状态迁移由空闲主循环
+`agent_mode_apply(cfg, &h, tui_mode())` 做。轮转顺序**只在一处定义**（`tui_mode_next`），
+键层与主循环都不写 if。原来的 `TUI_REQ_PLAN_ON`/`PLAN_OFF` 换成单个 `TUI_REQ_MODE`
+（值 1；2 号**留空不复用** —— 外部若还留着 2，宁可它什么都不做，也不要突然被解释成别的动作）。
+
+**三个刻意的选择**：
+
+* **工具目录跨模式恒定**：`exit_plan_mode` 在 chat 下照旧注册，调用时报「只在 plan 模式可用」。
+  按模式增减工具会改请求前缀、打掉缓存（与 §9 的 plan 同一条理由）。
+* **`mode_label` 与 `mode_name` 分开**：chip 上是 `Build`/`Plan`/`Chat`（人读），会话日志
+  `plan/mode` 的载荷里是小写机器名（外部按值匹配）。日志同时保留 P26 的 `active` 布尔，
+  两个字段永远一起写。
+* **`--plan` 与 `--chat` 同给时 plan 优先**：plan 是那个**带出口**的模式，chat 只是它减去审阅。
+
+**验收**：
+
+| 判据 | 落点 |
+|---|---|
+| 三态互斥 / 表外值不动 / 两个名字三态各一份 / 四个审阅裁决 | `selftest[plan-gate]`（`mode_truth_round`，纯函数） |
+| plan 闸门端到端（全权模式仍被拒、无渠道不退出） | `selftest[plan-gate]`（mock 26） |
+| chat 闸门端到端（chat 拒绝串、`exit_plan_mode` 报错、system 里没有 plan 那段、不落盘） | `selftest[chat-gate]`（mock 29，`UYA_SELFTEST_PERM_ONLY=1` 也跑） |
+| tab 轮转三态 + 输入非空时只插空格 + chip 逐态显示 | `selftest[tui-keys]`、`selftest[tui-plan]`（含 headless 走真 tab 路径） |
+| 端口载荷 `"2"` = chat、表外值落回 build | `selftest[ui-port]` |
+| 代理标记在三种 chip 上都挂得上 | `selftest[tui-pty]`（`Chat · 代理`） |
+
+**没顺手做的**：① 没给 `chat` 加自己的审阅出口（那样它就只是 plan 的别名）；
+② 没让 `chat` 拦 `bash`（同上，靠 `--permission read-only` 叠加）；
+③ 没把模式落进会话日志的**恢复**路径（模式仍是进程级状态，恢复会话后回 build —— 与 P26 一致）。

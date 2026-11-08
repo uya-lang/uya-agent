@@ -94,6 +94,10 @@ milliseconds, zero dependencies.
 * **Browser UI** (`--web`): a tab per session showing **that session's real
   TTY**, with a `+` to create one. The page has zero external dependencies —
   no xterm.js, no CDN; the terminal emulator runs server-side.
+* **Three session modes, cycled with `tab`**: build → plan → chat → build. Plan
+  refuses `write`/`edit` until a plan is approved; chat refuses them too and
+  answers questions only (no review exit) — `--plan` / `--chat` start there and
+  `/plan` / `/chat` switch.
 * **Scrolling mode** (`--no-tui`) falls back to a plain-text transcript, for
   pipes and CI.
 
