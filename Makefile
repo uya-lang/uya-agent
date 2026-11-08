@@ -1090,12 +1090,15 @@ e2e-ctxwindow: build
 #     ④ 非法值只告警并忽略（绝不静默当开）；
 #     ⑤ `--print-config` 的 `input_image = … (source: …)` 四档逐条可证。
 #   图是 45 字节的**真 PNG**（IHDR 1×1）：`printf` 八进制写出，不往仓里加二进制夹具。
+#   ②b 另有一张 33 字节的 **2K 文件头**（IHDR 2560×1600，CRC 是 0）：踩坑 167 的端到端
+#      判据 —— 修前像素缺省是 640000，2K 屏截图必然被拒；判定层只读文件头，所以够用。
 #   ⚠ 一律 `env -i` 起（宿主导出的 `UYA_AGENT_*` 会把这几条判据搅在一起，同 e2e-ctxwindow）。
 e2e-inputimage: build
 	@set -e; \
 	home=build/selftest_p84_e2e; rm -rf $$home; mkdir -p $$home/att; \
 	printf 'llm-pi-ai:\n  providers:\n    {\n      alpha:\n        {\n          api: openai-responses,\n          baseURL: https://alpha.example/v1,\n          apiKeyEnv: ALPHA_KEY,\n          models:\n            [\n              { id: a-vision, input: [ text, image ] },\n              { id: a-plain, input: [ text ] },\n              { id: a-none }\n            ]\n        }\n    }\nagent-default-model:\n  provider: alpha\n  model: a-vision\n' > $$home/settings.yaml; \
 	printf '\211PNG\015\012\032\012\000\000\000\015IHDR\000\000\000\001\000\000\000\001\010\002\000\000\000\220wS\336\000\000\000\000IEND\256B\140\202' > $$home/att/one.png; \
+	printf '\211PNG\015\012\032\012\000\000\000\015IHDR\000\000\012\000\000\000\006\100\000\000\000\000\000\000\000\000\000' > $$home/att/twok.png; \
 	run() { env -i PATH=/usr/bin:/bin HOME=$$HOME $(CURDIR)/$(OUT) --dsh-home $$home --agent-home $$home/agent --no-dsh-writeback --api-key dummy-key "$$@"; }; \
 	: "① 目录条目：含 image ⇒ 开；存在但不含 ⇒ 关；整键没写 ⇒ 沿用（默认支持）"; \
 	out=$$(run --print-config 2>&1); \
@@ -1108,6 +1111,10 @@ e2e-inputimage: build
 	out=$$(printf '/image %s\n/exit\n' "$$home/att/one.png" | env -i PATH=/usr/bin:/bin HOME=$$HOME UYA_AGENT_MODEL=my-vlm $(CURDIR)/$(OUT) --no-dsh-config --agent-home $$home/agent2 --no-dsh-writeback --api-key k --base-url http://127.0.0.1:1/v1 --no-tui --quiet 2>&1); \
 	echo "$$out" | grep -q "已挂上：" || { echo "FAIL: 纯 env 路线（默认支持）应当能挂上图，实际被拒了"; echo "$$out"; exit 1; }; \
 	echo "$$out" | grep -q "图片 image/png" || { echo "FAIL: 挂上的图没有逐项元数据行"; echo "$$out"; exit 1; }; \
+	: "②b 2K 屏截图（2560×1600）必须收下（踩坑 167：修前被像素预算当场拒）"; \
+	out=$$(printf '/image %s\n/exit\n' "$$home/att/twok.png" | env -i PATH=/usr/bin:/bin HOME=$$HOME UYA_AGENT_MODEL=my-vlm $(CURDIR)/$(OUT) --no-dsh-config --agent-home $$home/agent4 --no-dsh-writeback --api-key k --base-url http://127.0.0.1:1/v1 --no-tui --quiet 2>&1); \
+	echo "$$out" | grep -q "已挂上：" || { echo "FAIL: 2K 截图被拒了（缺省像素上限还是 640000？）"; echo "$$out"; exit 1; }; \
+	echo "$$out" | grep -q "2560×1600" || { echo "FAIL: 2K 图挂上后占位行没有真尺寸"; echo "$$out"; exit 1; }; \
 	: "③ 钉子：env=0 压过目录的「支持」；cli 压过 env；--no-input-image 压过目录"; \
 	out=$$(env -i PATH=/usr/bin:/bin HOME=$$HOME UYA_AGENT_INPUT_IMAGE=0 $(CURDIR)/$(OUT) --dsh-home $$home --agent-home $$home/agent --no-dsh-writeback --api-key dummy-key --print-config 2>&1); \
 	echo "$$out" | grep -q "^input_image = false  (source: env)" || { echo "FAIL: UYA_AGENT_INPUT_IMAGE=0 没压过目录条目里的「支持」"; echo "$$out"; exit 1; }; \
@@ -1128,7 +1135,7 @@ e2e-inputimage: build
 	echo "$$out" | grep -q "要收图：--input-image 或 UYA_AGENT_INPUT_IMAGE=1" || { echo "FAIL: 关掉收图时没给出怎么打开的出口"; echo "$$out"; exit 1; }; \
 	out=$$(printf '/model\n/exit\n' | run --no-tui --quiet 2>&1); \
 	echo "$$out" | grep -q "^image      on  (source: dsh-settings)" || { echo "FAIL: 目录声明支持时 image 行应当印 on + dsh-settings"; echo "$$out"; exit 1; }; \
-	echo "e2e-inputimage: 通过（默认支持；目录三态；纯 env 零配置可挂图；env/cli 钉住且切模型不动；非法值告警忽略；--print-config 与 /model 两个出口）"
+	echo "e2e-inputimage: 通过（默认支持；目录三态；纯 env 零配置可挂图；2K 截图收得下；env/cli 钉住且切模型不动；非法值告警忽略；--print-config 与 /model 两个出口）"
 
 # P71：**人运行中切模型/强度 ⇒ 这份选择写回 DSH 设置**（离线，真二进制 + 真 settings.yaml）
 #   对齐 DSH 自己的行为：`selectModel` → `agentDefaultModel.saveSelection()` → 同一个
