@@ -2400,7 +2400,8 @@ model-selftest: build
 web-selftest: build
 	UYA_SELFTEST_WEB_ONLY=1 $(OUT) --selftest
 
-# P33：/sessions 列表的自测轮（纯函数排版 + TUI 浮层 + 大索引排序/大列表取行），改会话列表时比整轮 selftest 快
+# P33：/sessions 列表的自测轮（纯函数排版 + TUI 浮层 + 大索引排序/大列表取行 + 索引写入时机），
+# 改会话列表 / 索引那条线时比整轮 selftest 快（踩坑 166 的 sess-touch 也挂在这里）
 sess-selftest: build
 	UYA_SELFTEST_SESS_ONLY=1 $(OUT) --selftest
 

@@ -1375,3 +1375,209 @@ fn dshw_save_round(tag: &const byte) bool {
     }
     return ok;
 }
+
+// ============================================================
+// 索引的 lastActiveAt 跟着**活动**走（agent 被杀也不能停在会话开头）
+// ============================================================
+// 用户报的：「agent 被杀之后，session 的时间戳没有更新」。根因在**写入时机**：索引原先
+// 只有两条路会写 —— `sess_close`（正常退出）与「标题 / 工作区 / 模型变了」。agent 被杀
+// （SIGKILL / OOM / 关终端 / 被叫停）时前者根本轮不到，于是 lastActiveAt 停在上一次写
+// 索引的时刻（常常是会话开头那一条），`/sessions` 的排序与 `--continue` 挑哪条会话
+// 全跟着错。真机实测：一条 622 事件的会话被杀时，索引落后日志 mtime 六个小时。
+//
+// 修法：活动期间由**泵点**（回合里流式 / 工具 / 子代理等待都每 ≤50ms 过一次）按
+// `SESS_IDX_TOUCH_MS` 节流追一条索引（`agent_sess_touch_index`）—— 这一轮钉写入时机。
+//
+// 四条腿各钉一个失败模式：
+//   ① 活动过一次就该有记录（只在 close 才写的实现：一条都没有 ⇒ 红）；
+//   ② 紧跟的泵点**不多出行**（不节流的话泵点按 50ms 一条把索引灌爆）；
+//   ③ 窗口过去之后**再追一条**（不是「写完一条就永久闭锁」）；
+//   ④ `--no-save` 的会话一个字节都不写（不落盘的会话不该进列表）。
+//
+// 会话**故意不 close** 就断言（模拟被杀）—— close 放在每条腿的最后收尾。
+
+const SESST_HOME: &const byte = "build/selftest_sess_touch" as &const byte;
+
+// 把 <home>/index.jsonl 整份读进 out。返回 false = 文件不存在 / 读不出来。
+// 为什么不用 sess_reader_load：那是**会话日志**的读法（要求首行是 `"type":"session"`），
+// 而索引是裸 jsonl —— 每行一条会话记录、没有 header。
+fn sesst_idx_load(home: &const byte, out: &Buf) bool {
+    buf_reset(out);
+    var p: Buf = buf_new(bufx_cstr_len(home) + 32);
+    defer { buf_free(&p); }
+    _ = buf_append_cstr(&p, home);
+    _ = buf_append_cstr(&p, "/index.jsonl");
+    _ = buf_append_byte(&p, 0);
+    const fd: i32 = sys_open(p.ptr as *const byte, 0, 0) catch {
+        return false;
+    };
+    defer { _ = sys_close(fd) catch {}; }
+    var tmp: [byte: 8192] = [0: 8192];
+    while true {
+        const n: isize = sys_read(fd, &tmp[0], 8192) catch { 0 as isize; };
+        if n <= 0 {
+            break;
+        }
+        _ = buf_append(out, &tmp[0], n as usize);
+    }
+    return out.len > 0;
+}
+
+// 两段字节相等（Buf 没有 NUL 结尾，不许拿 bufx_eq_cstr 比 —— 那是 C 串口径）
+fn sesst_same(a: &const Buf, b: &const Buf) bool {
+    if a.len != b.len {
+        return false;
+    }
+    var i: usize = 0;
+    while i < a.len {
+        if a.ptr[i] != b.ptr[i] {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+// 数索引里这条 id 写了**几行**（= 追过几次索引），顺带给出最后一条的 lastActiveAt。
+// latest-wins：索引是追加写的，同一个 id 以最后一条为准（与读侧同口径）。
+fn sesst_idx_scan(data: &const Buf, id: &const Buf
+    , rows: &usize, at: &i64) void {
+    rows[0] = 0;
+    at[0] = -1;
+    var from: usize = 0;
+    while from < data.len {
+        var e: usize = from;
+        while e < data.len && data.ptr[e] != 10 as byte {
+            e = e + 1;
+        }
+        if e > from {
+            const view: &[byte] = data.ptr[from: e];
+            var got: Buf = buf_new(64);
+            defer { buf_free(&got); }
+            if sess_json_str(view, "id", &got) && sesst_same(&got, id) {
+                rows[0] = rows[0] + 1;
+                at[0] = sess_json_i64(view, "lastActiveAt");
+            }
+        }
+        from = e + 1;
+    }
+}
+
+// 开一条**真会话**（真落盘、真索引），返回会话 id 的副本（close 会清掉 g_sess 的 Buf）。
+// save = 这条会话落不落盘（false 就是 `--no-save`，④ 那条腿用）。
+fn sesst_open(c: &Config, tag: &const byte, save: bool, ok: &bool) Buf {
+    c.save_session = save;
+    if !agent_session_create(c) {
+        ty_fail(tag, "开不出会话（本轮其它断言都无从谈起）", ok);
+        return buf_empty();
+    }
+    var sid: Buf = buf_new(96);
+    _ = buf_append(&sid, g_sess.id.ptr as &const byte, g_sess.id.len);
+    return sid;
+}
+
+// ① + ② + ③：活动就写、紧跟的不重复写、窗口过去再写一条。会话全程**不 close**。
+fn sesst_round_activity(tag: &const byte, c: &Config, ok: &bool) void {
+    var sid: Buf = sesst_open(c, tag, true, ok);
+    defer { buf_free(&sid); }
+    if sid.len == 0 {
+        return;
+    }
+    const t0: u64 = ua_now_ms();
+    agent_log_turn_start();     // 真活动：写一条 turn/start 到会话日志
+    agent_pump_block();         // 泵点：回合里每 ≤50ms 一次
+    var data: Buf = buf_new(65536);
+    defer { buf_free(&data); }
+    if !sesst_idx_load(SESST_HOME, &data) {
+        ty_fail(tag, "活动过一次了索引文件却还不存在（被杀就永远没有时间戳）", ok);
+        agent_session_close();
+        return;
+    }
+    var rows: usize = 0;
+    var at: i64 = -1;
+    sesst_idx_scan(&data, &sid, &rows, &at);
+    if rows != 1 {
+        ty_fail(tag, "泵点没有追索引（只有 close 才写的实现：这条会话被杀就没有时间戳）", ok);
+    }
+    if at < t0 as i64 {
+        ty_fail(tag, "索引里的 lastActiveAt 不是刚才的（写的是旧时间戳）", ok);
+    }
+    if at != g_sess.idx_ms as i64 {
+        ty_fail(tag, "落盘的 lastActiveAt 与节流戳不是同一个数（读侧看到的时间会偏）", ok);
+    }
+    // ② 节流：紧跟的两次泵点一个字节都不许写（否则泵点自己就是索引的灌水机）
+    agent_pump_block();
+    agent_pump_block();
+    _ = sesst_idx_load(SESST_HOME, &data);
+    sesst_idx_scan(&data, &sid, &rows, &at);
+    if rows != 1 {
+        ty_fail(tag, "泵点没有节流：每 50ms 追一条会把索引灌爆（§8.5 的排序成本随行数涨）", ok);
+    }
+    // ③ 窗口过去 ⇒ 再追一条（把节流戳往回挪一个窗口，别真的 sleep 一分钟）
+    g_sess.idx_ms = ua_now_ms() - (SESS_IDX_TOUCH_MS + 1);
+    agent_pump_block();
+    _ = sesst_idx_load(SESST_HOME, &data);
+    sesst_idx_scan(&data, &sid, &rows, &at);
+    if rows != 2 {
+        ty_fail(tag, "节流窗口过去之后没有继续追索引（时间戳会一直冻在第二次上）", ok);
+    }
+    agent_session_close();      // 收尾（这条会话的 close 记录不参与上面任何断言）
+}
+
+// ④ `--no-save`：泵点过多少次都不许往索引里加一个字节。
+fn sesst_round_nosave(tag: &const byte, c: &Config, ok: &bool) void {
+    var data: Buf = buf_new(65536);
+    defer { buf_free(&data); }
+    _ = sesst_idx_load(SESST_HOME, &data);
+    const before: usize = data.len;
+    var sid: Buf = sesst_open(c, tag, false, ok);
+    defer { buf_free(&sid); }
+    if sid.len == 0 {
+        return;
+    }
+    agent_log_turn_start();
+    agent_pump_block();
+    agent_pump_block();
+    _ = sesst_idx_load(SESST_HOME, &data);
+    if data.len != before {
+        ty_fail(tag, "`--no-save` 的会话也写了索引（不落盘的会话不该进列表）", ok);
+    }
+    var rows: usize = 0;
+    var at: i64 = -1;
+    sesst_idx_scan(&data, &sid, &rows, &at);
+    if rows != 0 {
+        ty_fail(tag, "`--no-save` 的会话在索引里留下了记录", ok);
+    }
+    agent_session_close();
+}
+
+// sess-touch 轮：四条腿 + 收尾。返回 false = 本轮红。
+fn sess_touch_round(tag: &const byte) bool {
+    var ok: bool = true;
+    // 上一轮的残留必须先清掉：这一轮数的是「写了几行」
+    var ip: Buf = buf_new(bufx_cstr_len(SESST_HOME) + 32);
+    defer { buf_free(&ip); }
+    _ = buf_append_cstr(&ip, SESST_HOME);
+    _ = buf_append_cstr(&ip, "/index.jsonl");
+    _ = buf_append_byte(&ip, 0);
+    _ = sys_unlink(ip.ptr as &const byte) catch {};
+    if !sess_mkdir_p(SESST_HOME) {
+        ty_fail(tag, "造不出 agent home", &ok);
+        return false;
+    }
+    var c: Config = cfg_default();
+    defer { cfg_free(&c); }
+    c.agent_home = buf_new(96);
+    _ = buf_append_cstr(&c.agent_home, SESST_HOME);
+    c.model = buf_from_cstr("selftest-model" as &const byte);
+    c.workspace = buf_empty();
+    sesst_round_activity(tag, &c, &ok);
+    sesst_round_nosave(tag, &c, &ok);
+    if ok {
+        out_err("selftest[");
+        out_err(tag);
+        out_err("] ok（活动即写索引（被杀也有时间戳）/ 泵点节流不多写 / 窗口过去再写 / --no-save 一个字节不写）\n");
+    }
+    return ok;
+}
+
