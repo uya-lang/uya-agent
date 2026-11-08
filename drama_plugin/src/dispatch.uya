@@ -1,0 +1,317 @@
+// drama_plugin/src/dispatch.uya — `call` 的幂等与审计（P2）
+//
+// 幂等键 = (operation, input_hash)（DESIGN §4.5）：
+//   * 同键再来 ⇒ 复用同一个 task_id，并回 `idempotent_replay: true`；
+//   * 同 `request_id` 但 `input_hash` 变了 ⇒ 报 `REQUEST_REUSED`；
+//   * 首版把这两张表放内存（进程重启即丢），P3 落到提交记录里。
+//
+// 审计：P2 只记计数与最后一条操作，`health` 会报出来；P3 落 jsonl。
+//
+// 约定：所有出参都是「调用方给缓冲 + 长度出参」，不做堆分配。
+
+use libc.syscall;
+use libc.unistd;
+
+const SLOT_MAX: usize = 16;
+const RID_MAX: usize = 16;
+const RID_LEN: usize = 64;
+const TASK_LEN: usize = 24;
+
+struct IdemSlot {
+    used: bool,
+    key: u64,
+    op_i: usize,
+    task: [byte: TASK_LEN],
+    task_len: usize,
+}
+
+struct RidSlot {
+    used: bool,
+    rid: [byte: RID_LEN],
+    rid_len: usize,
+    key: u64,
+}
+
+var g_idem: [IdemSlot: SLOT_MAX] = [IdemSlot{ used: false, key: 0, op_i: 0,
+    task: [0: TASK_LEN], task_len: 0 }: SLOT_MAX];
+var g_rid: [RidSlot: RID_MAX] = [RidSlot{ used: false,
+    rid: [0: RID_LEN], rid_len: 0, key: 0 }: RID_MAX];
+var g_audit: i64 = 0;
+var g_task_seq: i64 = 0;
+var g_req_seq: i64 = 0;
+
+export fn audit_count() i64 {
+    return g_audit;
+}
+
+export fn audit_note() void {
+    g_audit = g_audit +| 1;
+}
+
+// 记一条 request_id ↔ input_hash 的绑定；false = 同 rid 不同 payload
+export fn rid_bind(rid: &const byte, rl: usize, key: u64) bool {
+    if rl == 0 || rl >= RID_LEN {
+        return true;   // 没给 / 太长：不做这项检查，不误拒业务
+    }
+    var i: usize = 0;
+    while i < RID_MAX {
+        if g_rid[i].used && g_rid[i].rid_len == rl
+            && b_eq(&g_rid[i].rid[0], rl, rid) {
+            return g_rid[i].key == key;
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while i < RID_MAX {
+        if !g_rid[i].used {
+            var l: usize = 0;
+            if !copy_to(rid, rl, &g_rid[i].rid[0: RID_LEN], &l) {
+                return true;
+            }
+            g_rid[i].used = true;
+            g_rid[i].rid_len = l;
+            g_rid[i].key = key;
+            break;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+// 幂等查找：命中则把 task_id 写进 out，返回 true
+export fn idem_find(op_i: usize, key: u64, out: &[byte],
+    out_len: &usize) bool {
+    out_len[0] = 0;
+    var i: usize = 0;
+    while i < SLOT_MAX {
+        if g_idem[i].used && g_idem[i].key == key && g_idem[i].op_i == op_i {
+            var l: usize = 0;
+            if !copy_to(&g_idem[i].task[0], g_idem[i].task_len, out, &l) {
+                return false;
+            }
+            out_len[0] = l;
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+// 新任务：生成 task_id 并登记（同一 op + hkey 只登记一条）
+export fn idem_insert(op_i: usize, key: u64, out: &[byte],
+    out_len: &usize) void {
+    g_task_seq = g_task_seq +| 1;
+    var buf: [byte: TASK_LEN] = [0: TASK_LEN];
+    var w: usize = 0;
+    w = w + j_put(&buf[0: TASK_LEN], w, "task_p2_" as &const byte);
+    w = w + j_put_i64(&buf[0: TASK_LEN], w, g_task_seq);
+    var l: usize = 0;
+    _ = copy_to(&buf[0], w, out, &l);
+    out_len[0] = l;
+    var i: usize = 0;
+    while i < SLOT_MAX {
+        if !g_idem[i].used {
+            g_idem[i].used = true;
+            g_idem[i].op_i = op_i;
+            g_idem[i].key = key;
+            var tl: usize = 0;
+            _ = copy_to(&buf[0], w, &g_idem[i].task[0: TASK_LEN], &tl);
+            g_idem[i].task_len = tl;
+            break;
+        }
+        i = i + 1;
+    }
+}
+
+// 用操作自己产出的 task_id 登记幂等槽（真实 op 的 id 与这里的序号无关）
+export fn idem_insert_with(op_i: usize, key: u64, task_id: &const byte,
+    tidn: usize) void {
+    var i: usize = 0;
+    while i < SLOT_MAX {
+        if !g_idem[i].used {
+            g_idem[i].used = true;
+            g_idem[i].op_i = op_i;
+            g_idem[i].key = key;
+            var tl: usize = 0;
+            _ = copy_to(task_id, tidn, &g_idem[i].task[0: TASK_LEN], &tl);
+            g_idem[i].task_len = tl;
+            break;
+        }
+        i = i + 1;
+    }
+}
+
+// 缺省 request_id：生成一个并回显（DESIGN §4.5：request_id 可选，只作 tracing）
+export fn req_next(out: &[byte], out_len: &usize) void {
+    g_req_seq = g_req_seq +| 1;
+    var buf: [byte: 24] = [0: 24];
+    var w: usize = 0;
+    w = w + j_put(&buf[0: 24], w, "req_p2_" as &const byte);
+    w = w + j_put_i64(&buf[0: 24], w, g_req_seq);
+    var l: usize = 0;
+    _ = copy_to(&buf[0], w, out, &l);
+    out_len[0] = l;
+}
+
+// 幂等键：input 对象的原始字节（缺 input 时退化成整行）
+export fn input_hash(line: &const byte, n: usize) u64 {
+    var st: [usize: 1] = [0];
+    var ln: [usize: 1] = [0];
+    if !schema_input_span(line, n, &st[0], &ln[0]) {
+        return fnv64(line, n);
+    }
+    return fnv64(&line[st[0]], ln[0]);
+}
+
+// ---- 操作审计日志（DESIGN §8.6）------------------------------------------
+// 只追加；写前判断大小，达到 8 MiB 就把 operations.jsonl 轮转到 .1。
+// 审计可以丢：写失败只记一条 stderr，不影响业务操作的返回值。
+
+const OLOG_NAME: &const byte = "operations.jsonl" as &const byte;
+const OLOG_MAX: i64 = 8388608;
+const OLOG_KEEP: usize = 5;
+
+fn olog_size(path: &const byte) i64 {
+    const fd: i32 = sys_open(path, 0, 0) catch { return -1 as i64; };
+    const sz: i64 = sys_lseek(fd, 0 as i64, 2) catch { -1 as i64; };
+    _ = sys_close(fd) catch { 0 as i32; };
+    return sz;
+}
+
+// 归档文件名：operations.jsonl.<i>（i = 1..KEEP-1）
+fn olog_arch(i: usize, out: &[byte]) usize {
+    var k: usize = 0;
+    while k < 16 {
+        out[k] = OLOG_NAME[k];
+        k = k + 1;
+    }
+    out[16] = 46 as byte;
+    out[17] = (48 as u8) +| (i as u8);
+    return 18;
+}
+
+// 轮转：.i → .i+1（从老到新），当前文件 → .1；不重写文件内容
+fn olog_rotate(dirp: &const byte, dl: usize) void {
+    var i: usize = OLOG_KEEP - 2;
+    while i >= 1 {
+        var nm: [byte: 32] = [0: 32];
+        var nm2: [byte: 32] = [0: 32];
+        const nl: usize = olog_arch(i, &nm[0: 32]);
+        const nl2: usize = olog_arch(i + 1, &nm2[0: 32]);
+        var p1: [byte: 512] = [0: 512];
+        var p2: [byte: 512] = [0: 512];
+        var l1: [usize: 1] = [0];
+        var l2: [usize: 1] = [0];
+        if path_join(dirp, dl, &nm[0], nl, &p1[0: 512], &l1[0])
+            && path_join(dirp, dl, &nm2[0], nl2, &p2[0: 512], &l2[0]) {
+            _ = sys_rename(&p1[0], &p2[0]) catch { 0 as i32; };
+        }
+        if i == 1 {
+            break;
+        }
+        i = i - 1;
+    }
+    var p1: [byte: 512] = [0: 512];
+    var l1: [usize: 1] = [0];
+    var nm: [byte: 32] = [0: 32];
+    const nl: usize = olog_arch(1, &nm[0: 32]);
+    if path_join(dirp, dl, &nm[0], nl, &p1[0: 512], &l1[0]) {
+        var cur: [byte: 512] = [0: 512];
+        var cl: [usize: 1] = [0];
+        if path_join(dirp, dl, OLOG_NAME, 16, &cur[0: 512], &cl[0]) {
+            _ = sys_rename(&cur[0], &p1[0]) catch { 0 as i32; };
+        }
+    }
+}
+
+fn olog_diag() void {
+    _ = sys_write(2, "drama: audit log write failed\n" as &const byte,
+        30) catch { 0 as isize; };
+}
+
+// 追加一行；任何失败都吞掉（只记 stderr）
+fn olog_write(dirp: &const byte, dl: usize, line: &const byte,
+    ln: usize) bool {
+    var dp: [byte: 512] = [0: 512];
+    var dpl: [usize: 1] = [0];
+    if !path_join(dirp, dl, "audit" as &const byte, 5, &dp[0: 512], &dpl[0]) {
+        return false;
+    }
+    if !mkdir_p(&dp[0], dpl[0]) {
+        return false;
+    }
+    var fp: [byte: 512] = [0: 512];
+    var fpl: [usize: 1] = [0];
+    if !path_join(&dp[0], dpl[0], OLOG_NAME, 16, &fp[0: 512], &fpl[0]) {
+        return false;
+    }
+    if olog_size(&fp[0]) >= OLOG_MAX {
+        olog_rotate(&dp[0], dpl[0]);
+    }
+    // O_WRONLY(1) | O_CREAT(64) | O_APPEND(1024)
+    const fd: i32 = sys_open(&fp[0], 1089, 384) catch {
+        return false;
+    };
+    var wrote: usize = 0;
+    while wrote < ln {
+        const got: isize = sys_write(fd, &line[wrote], ln - wrote) catch {
+            _ = sys_close(fd) catch { 0 as i32; };
+            return false;
+        };
+        if got <= 0 {
+            _ = sys_close(fd) catch { 0 as i32; };
+            return false;
+        }
+        wrote = wrote + (got as usize);
+    }
+    _ = sys_close(fd) catch { 0 as i32; };
+    return true;
+}
+
+// 每次业务 call 后记一行；没有 project_id 的操作不记
+export fn oplog_note(root: &const byte, rn: usize, line: &const byte,
+    n: usize, op: &const byte, opn: usize, ok: bool) void {
+    var st: [usize: 1] = [0];
+    var ln: [usize: 1] = [0];
+    if !schema_input_span(line, n, &st[0], &ln[0]) {
+        return;
+    }
+    var pid: [byte: 64] = [0: 64];
+    var pl: usize = 0;
+    if !j_str(&line[st[0]], ln[0], "project_id" as &const byte,
+        &pid[0: 64], &pl) {
+        return;
+    }
+    if !project_id_ok(&pid[0], pl) {
+        return;
+    }
+    var pdir: [byte: 512] = [0: 512];
+    var pdl: [usize: 1] = [0];
+    if !path_join(root, rn, "projects" as &const byte, 8, &pdir[0: 512],
+        &pdl[0]) {
+        return;
+    }
+    var idir: [byte: 512] = [0: 512];
+    var idl: [usize: 1] = [0];
+    if !path_join(&pdir[0], pdl[0], &pid[0], pl, &idir[0: 512], &idl[0]) {
+        return;
+    }
+    var ts: TimeSpec = TimeSpec{ tv_sec: 0, tv_nsec: 0 };
+    _ = sys_clock_gettime(0, &ts) catch { 0 as i32; };
+    var b: [byte: 512] = [0: 512];
+    var w: usize = 0;
+    w = w + j_put(&b[0: 512], w, "{\"ts\":" as &const byte);
+    w = w + j_put_i64(&b[0: 512], w, ts.tv_sec);
+    w = w + j_put(&b[0: 512], w, ",\"op\":" as &const byte);
+    w = w + j_put_str(&b[0: 512], w, op, opn);
+    w = w + j_put(&b[0: 512], w, ",\"ok\":" as &const byte);
+    if ok {
+        w = w + j_put(&b[0: 512], w, "true" as &const byte);
+    } else {
+        w = w + j_put(&b[0: 512], w, "false" as &const byte);
+    }
+    w = w + j_put(&b[0: 512], w, "}\n" as &const byte);
+    if !olog_write(&idir[0], idl[0], &b[0], w) {
+        olog_diag();
+    }
+}

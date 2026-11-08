@@ -1,0 +1,1689 @@
+// drama_plugin/src/task.uya — 持久任务（P5 Task 接入的最小版）
+//
+// 为什么要有任务表：LLM 一次可能几十秒，宿主 60 s 就超时（P0_FINDINGS §2.3），
+// 所以 `call` 只负责**落盘建任务**并立刻回 `queued`，真正干活的是 worker
+// （同一进程里由 `task.run` 触发，P8 起换成独立 worker 进程轮询）。
+//
+// 落盘：
+//   <root>/projects/<id>/tasks/<task_id>.json   单任务记录
+//   <root>/projects/<id>/tasks/index.jsonl      一行一个任务（列表用）
+//
+// 断点续跑：步骤状态写在记录里；`task.run` 只跑 pending 的步骤，
+// 已经 done 的直接跳过 ⇒ 中断后重跑不会重复调模型、也不会重复存剧本版本。
+//
+// 返回码：0 成功 50 ID 非法 55 写失败 56 任务不存在 57 步骤执行失败
+
+use libc.syscall;
+use libc.unistd;
+
+const TASK_BUF: usize = 65536;
+const TASK_DIR: &const byte = "tasks" as &const byte;
+
+fn tdir(root: &const byte, rn: usize, id: &const byte, idn: usize,
+    out: &[byte], out_len: &usize) bool {
+    var pdir: [byte: 512] = [0: 512];
+    var pdl: usize = 0;
+    if !path_join(root, rn, "projects" as &const byte, 8,
+        &pdir[0: 512], &pdl) {
+        return false;
+    }
+    var dir: [byte: 512] = [0: 512];
+    var dl: usize = 0;
+    if !path_join(&pdir[0], pdl, id, idn, &dir[0: 512], &dl) {
+        return false;
+    }
+    return path_join(&dir[0], dl, TASK_DIR, b_len(TASK_DIR), out, out_len);
+}
+
+fn next_seq(dir: &const byte, dl: usize) i64 {
+    var buf: [byte: TASK_BUF] = [0: TASK_BUF];
+    var bl: usize = 0;
+    if !read_file(dir, dl, "index.jsonl" as &const byte, 11, &buf[0],
+        TASK_BUF, &bl) {
+        return 0;
+    }
+    var lines: i64 = 0;
+    var i: usize = 0;
+    while i < bl {
+        if buf[i] == 10 as byte {
+            lines = lines +| 1;
+        }
+        i = i + 1;
+    }
+    return lines;
+}
+
+// 建任务：状态 queued，一个 pending 步骤
+export fn task_create(root: &const byte, rn: usize, id: &const byte,
+    idn: usize, target: &const byte, tn: usize, episode_id: &const byte,
+    en: usize, input_hash: u64, script_ver: i64, priority: i64,
+    deadline_s: i64, out_id: &[byte], out_len: &usize) i32 {
+    out_len[0] = 0;
+    if !project_id_ok(id, idn) {
+        return 50;
+    }
+    var dir: [byte: 512] = [0: 512];
+    var dl: usize = 0;
+    if !tdir(root, rn, id, idn, &dir[0: 512], &dl) {
+        return 55;
+    }
+    const seq: i64 = next_seq(&dir[0], dl) +| 1;
+    var tid: [byte: 32] = [0: 32];
+    var tl: usize = 0;
+    tl = tl + j_put(&tid[0: 32], tl, "t_" as &const byte);
+    tl = tl + j_put_i64(&tid[0: 32], tl, seq);
+    var rec: [byte: 1024] = [0: 1024];
+    var w: usize = 0;
+    w = w + j_put(&rec[0: 1024], w,
+        "{\"format_version\":1,\"id\":\"" as &const byte);
+    w = w + j_put_raw(&rec[0: 1024], w, &tid[0], tl);
+    w = w + j_put(&rec[0: 1024], w, "\",\"target\":" as &const byte);
+    w = w + j_put_str(&rec[0: 1024], w, target, tn);
+    if en > 0 {
+        w = w + j_put(&rec[0: 1024], w, ",\"episode_id\":" as &const byte);
+        w = w + j_put_str(&rec[0: 1024], w, episode_id, en);
+    }
+    w = w + j_put(&rec[0: 1024], w, ",\"priority\":" as &const byte);
+    w = w + j_put_i64(&rec[0: 1024], w, priority);
+    if deadline_s > 0 {
+        w = w + j_put(&rec[0: 1024], w,
+            ",\"deadline_s\":" as &const byte);
+        w = w + j_put_i64(&rec[0: 1024], w, deadline_s);
+    }
+    w = w + j_put(&rec[0: 1024], w,
+        ",\"state\":\"queued\",\"input_hash\":\"" as &const byte);
+    w = w + j_put_hex(&rec[0: 1024], w, input_hash);
+    w = w + j_put(&rec[0: 1024], w,
+        "\",\"script_version\":" as &const byte);
+    w = w + j_put_i64(&rec[0: 1024], w, script_ver);
+    w = w + j_put(&rec[0: 1024], w,
+        ",\"steps\":[{\"name\":\"script\"," as &const byte);
+    w = w + j_put(&rec[0: 1024], w, "\"state\":\"pending\"}]}" as &const byte);
+    var nm: [byte: 32] = [0: 32];
+    var nn: usize = 0;
+    nn = nn + j_put_raw(&nm[0: 32], nn, &tid[0], tl);
+    nn = nn + j_put_raw(&nm[0: 32], nn, ".json" as &const byte, 5);
+    if !write_atomic(&dir[0], dl, &nm[0], nn, &rec[0], w) {
+        return 55;
+    }
+    if !append_index(&dir[0], dl, &rec[0], w) {
+        return 55;
+    }
+    var i: usize = 0;
+    while i < tl {
+        out_id[i] = tid[i];
+        i = i + 1;
+    }
+    out_id[tl] = 0 as byte;
+    out_len[0] = tl;
+    return 0;
+}
+
+fn append_index(dir: &const byte, dl: usize, line: &const byte,
+    ln: usize) bool {
+    var old: [byte: TASK_BUF] = [0: TASK_BUF];
+    var ol: usize = 0;
+    _ = read_file(dir, dl, "index.jsonl" as &const byte, 11, &old[0],
+        TASK_BUF, &ol);
+    var merged: [byte: 66560] = [0: 66560];
+    if ol + ln + 1 > 66560 {
+        return false;
+    }
+    var i: usize = 0;
+    while i < ol {
+        merged[i] = old[i];
+        i = i + 1;
+    }
+    i = 0;
+    while i < ln {
+        merged[ol + i] = line[i];
+        i = i + 1;
+    }
+    merged[ol + ln] = 10 as byte;
+    return write_atomic(dir, dl, "index.jsonl" as &const byte, 11,
+        &merged[0], ol + ln + 1);
+}
+
+// 读一条任务
+export fn task_get(root: &const byte, rn: usize, id: &const byte,
+    idn: usize, task_id: &const byte, tidn: usize, out: &[byte],
+    out_len: &usize) i32 {
+    out_len[0] = 0;
+    if !project_id_ok(id, idn) {
+        return 50;
+    }
+    var dir: [byte: 512] = [0: 512];
+    var dl: usize = 0;
+    if !tdir(root, rn, id, idn, &dir[0: 512], &dl) {
+        return 55;
+    }
+    var nm: [byte: 32] = [0: 32];
+    var nn: usize = 0;
+    if tidn + 5 >= 32 {
+        return 56;
+    }
+    nn = nn + j_put_raw(&nm[0: 32], nn, task_id, tidn);
+    nn = nn + j_put_raw(&nm[0: 32], nn, ".json" as &const byte, 5);
+    if !read_file(&dir[0], dl, &nm[0], nn, &out[0], out.len, out_len) {
+        return 56;
+    }
+    return 0;
+}
+
+// 一行任务用**记录文件**，不用索引行：索引是创建日志，里面的 state 只是
+// 建任务时的快照；Worker 干完活只改记录文件，回放索引会让调用方永远看到
+// queued。记录缺失时退回索引行，至少还能列出 id。
+fn emit_live_line(root: &const byte, rn: usize, id: &const byte,
+    idn: usize, line: &const byte, ln: usize, out: &[byte], at: usize,
+    out_len: &usize) bool {
+    var tid: [byte: 32] = [0: 32];
+    var tidl: usize = 0;
+    _ = j_str(line, ln, "id" as &const byte, &tid[0: 32], &tidl);
+    var rec: [byte: TASK_BUF] = [0: TASK_BUF];
+    var rl: [usize: 1] = [0];
+    var src: &const byte = line;
+    var n: usize = ln;
+    if tidl > 0 && task_get(root, rn, id, idn, &tid[0], tidl,
+        &rec[0: TASK_BUF], &rl[0]) == 0 {
+        src = &rec[0];
+        n = rl[0];
+    }
+    if at + n + 1 > out.len {
+        return false;
+    }
+    var k: usize = 0;
+    while k < n {
+        out[at + k] = src[k];
+        k = k + 1;
+    }
+    out[at + n] = 10 as byte;
+    out_len[0] = n + 1;
+    return true;
+}
+
+// 任务列表：索引 + 记录文件里的实时状态（索引里的 state 是创建快照）
+export fn task_list(root: &const byte, rn: usize, id: &const byte,
+    idn: usize, out: &[byte], out_len: &usize) i32 {
+    out_len[0] = 0;
+    var dir: [byte: 512] = [0: 512];
+    var dl: usize = 0;
+    if !tdir(root, rn, id, idn, &dir[0: 512], &dl) {
+        return 55;
+    }
+    var idx: [byte: TASK_BUF] = [0: TASK_BUF];
+    var il: [usize: 1] = [0];
+    if !read_file(&dir[0], dl, "index.jsonl" as &const byte, 11, &idx[0],
+        TASK_BUF, &il[0]) {
+        return 0;
+    }
+    var w: usize = 0;
+    var i: usize = 0;
+    while i < il[0] {
+        var e: usize = i;
+        while e < il[0] && idx[e] != 10 as byte {
+            e = e + 1;
+        }
+        if e > i {
+            var one: usize = 0;
+            if !emit_live_line(root, rn, id, idn, &idx[i], e - i,
+                out, w, &one) {
+                out_len[0] = w;
+                return 56;
+            }
+            w = w + one;
+        }
+        i = e + 1;
+    }
+    out_len[0] = w;
+    return 0;
+}
+
+// 执行任务里 pending 的步骤；已经 done 的直接跳过（可重复调用）
+export fn task_run(root: &const byte, rn: usize, id: &const byte,
+    idn: usize, task_id: &const byte, tidn: usize, out: &[byte],
+    out_len: &usize) i32 {
+    out_len[0] = 0;
+    var rec: [byte: TASK_BUF] = [0: TASK_BUF];
+    var rl: [usize: 1] = [0];
+    const grc: i32 = task_get(root, rn, id, idn, task_id, tidn,
+        &rec[0: TASK_BUF], &rl[0]);
+    if grc != 0 {
+        return grc;
+    }
+    var stbuf: [byte: 16] = [0: 16];
+    var stl: usize = 0;
+    _ = j_str(&rec[0], rl[0], "state" as &const byte, &stbuf[0: 16], &stl);
+    if stl == 4 {
+        // "done"：直接回放
+        var w0: usize = 0;
+        w0 = w0 + j_put(out, w0,
+            "{\"state\":\"done\",\"resumed\":false," as &const byte);
+        w0 = w0 + j_put(out, w0, "\"script_version\":" as &const byte);
+        w0 = w0 + j_put_i64(out, w0, num_in(&rec[0], rl[0],
+            "script_version" as &const byte));
+        w0 = w0 + j_put(out, w0, "}" as &const byte);
+        out_len[0] = w0;
+        return 0;
+    }
+    var tgt: [byte: 32] = [0: 32];
+    var tgl: usize = 0;
+    _ = j_str(&rec[0], rl[0], "target" as &const byte, &tgt[0: 32], &tgl);
+    if eqb(&tgt[0], tgl, "video" as &const byte, 5) {
+        return task_run_video(root, rn, id, idn, task_id, tidn, out,
+            out_len);
+    }
+    // 跑 script 步骤：上下文 → 模型 → 校验 → 存版本
+    var ctxbuf: [byte: 8192] = [0: 8192];
+    var ctxl: [usize: 1] = [0];
+    const cx: i32 = ctx_build(root, rn, id, idn, 4096, &ctxbuf[0: 8192],
+        &ctxl[0]);
+    if cx != 0 {
+        return 57;
+    }
+    var prompt: [byte: 1024] = [0: 1024];
+    var pl: usize = 0;
+    pl = pl + j_put(&prompt[0: 1024], pl,
+        "写一集短剧剧本（JSON：title/hook/scenes/candidate_events）。" as &const byte);
+    pl = pl + j_put_raw(&prompt[0: 1024], pl, "上下文：" as &const byte, 13);
+    pl = pl + j_put_raw(&prompt[0: 1024], pl, &ctxbuf[0], ctxl[0]);
+    var content: &byte = malloc(16384) as &byte;
+    defer { free(content as &void); }
+    if (content as usize) == 0 {
+        return 57;
+    }
+    var cl: [usize: 1] = [0];
+    const lrc: i32 = llm_complete_repair(root, rn, &prompt[0], pl,
+        &content[0: 16384], &cl[0]);
+    if lrc != 0 {
+        return 57;
+    }
+    if story_validate(&content[0], cl[0]) != 0 {
+        return 57;
+    }
+    var dump: [byte: 64] = [0: 64];
+    var dl2: [usize: 1] = [0];
+    if story_save(root, rn, id, idn, &content[0], cl[0], &dump[0: 64],
+        &dl2[0]) != 0 {
+        return 57;
+    }
+    const ver: i64 = story_current_version(root, rn, id, idn);
+    if !mark_done(root, rn, id, idn, task_id, tidn, ver) {
+        return 55;
+    }
+    var w: usize = 0;
+    w = w + j_put(out, w,
+        "{\"state\":\"done\",\"resumed\":true," as &const byte);
+    w = w + j_put(out, w, "\"script_version\":" as &const byte);
+    w = w + j_put_i64(out, w, ver);
+    w = w + j_put(out, w, "}" as &const byte);
+    out_len[0] = w;
+    return 0;
+}
+
+fn eqb(a: &const byte, an: usize, b: &const byte, bn: usize) bool {
+    if an != bn {
+        return false;
+    }
+    var i: usize = 0;
+    while i < an {
+        if a[i] != b[i] {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn num_in(buf: &const byte, n: usize, key: &const byte) i64 {
+    var st: [usize: 1] = [0];
+    var ln: [usize: 1] = [0];
+    if j_span(buf, n, key, &st[0], &ln[0]) == 0 as byte {
+        return 0;
+    }
+    var i: usize = 0;
+    var v: i64 = 0;
+    while i < ln[0] {
+        const c: byte = buf[st[0] + i];
+        if c < 48 as byte || c > 57 as byte {
+            break;
+        }
+        v = v *| 10;
+        v = v +| ((c as i64) -| 48);
+        i = i + 1;
+    }
+    return v;
+}
+
+// 把记录改成 done（保留原 target / input_hash / id）
+fn mark_done(root: &const byte, rn: usize, id: &const byte, idn: usize,
+    task_id: &const byte, tidn: usize, ver: i64) bool {
+    var dir: [byte: 512] = [0: 512];
+    var dl: usize = 0;
+    if !tdir(root, rn, id, idn, &dir[0: 512], &dl) {
+        return false;
+    }
+    var rec: [byte: TASK_BUF] = [0: TASK_BUF];
+    var rl: [usize: 1] = [0];
+    if task_get(root, rn, id, idn, task_id, tidn, &rec[0: TASK_BUF],
+        &rl[0]) != 0 {
+        return false;
+    }
+    var tgt: [byte: 64] = [0: 64];
+    var tgl: usize = 0;
+    _ = j_str(&rec[0], rl[0], "target" as &const byte, &tgt[0: 64], &tgl);
+    var body: [byte: 1024] = [0: 1024];
+    var w: usize = 0;
+    w = w + j_put(&body[0: 1024], w,
+        "{\"format_version\":1,\"id\":\"" as &const byte);
+    w = w + j_put_raw(&body[0: 1024], w, task_id, tidn);
+    w = w + j_put(&body[0: 1024], w, "\",\"target\":" as &const byte);
+    w = w + j_put_str(&body[0: 1024], w, &tgt[0], tgl);
+    w = w + j_put(&body[0: 1024], w, ",\"state\":\"done\"," as &const byte);
+    w = w + j_put(&body[0: 1024], w, "\"script_version\":" as &const byte);
+    w = w + j_put_i64(&body[0: 1024], w, ver);
+    w = w + j_put(&body[0: 1024], w,
+        ",\"steps\":[{\"name\":\"script\"," as &const byte);
+    w = w + j_put(&body[0: 1024], w, "\"state\":\"done\"}]}" as &const byte);
+    var nm: [byte: 32] = [0: 32];
+    var nn: usize = 0;
+    nn = nn + j_put_raw(&nm[0: 32], nn, task_id, tidn);
+    nn = nn + j_put_raw(&nm[0: 32], nn, ".json" as &const byte, 5);
+    return write_atomic(&dir[0], dl, &nm[0], nn, &body[0], w);
+}
+
+// 视频任务的剧本版本：建任务时固定，批量排队才不会串集；老记录退回
+// "当前已批准"
+fn video_script_ver(root: &const byte, rn: usize, id: &const byte,
+    idn: usize, task_id: &const byte, tidn: usize) i64 {
+    var want: i64 = 0;
+    var own: [byte: 1024] = [0: 1024];
+    var ol: [usize: 1] = [0];
+    if task_get(root, rn, id, idn, task_id, tidn, &own[0: 1024],
+        &ol[0]) == 0 {
+        want = num_in(&own[0], ol[0], "script_version" as &const byte);
+    }
+    var aver: [i64: 1] = [0];
+    var arev: [i64: 1] = [0];
+    if !story_approved(root, rn, id, idn, &aver[0], &arev[0])
+        || aver[0] <= 0 {
+        return 0;
+    }
+    if want > 0 {
+        return want;
+    }
+    return aver[0];
+}
+
+// 渲染一镜并登记资产：登记失败不能算任务成功
+fn render_shot(root: &const byte, rn: usize, id: &const byte,
+    idn: usize, board_ver: i64, shot_no: i64, action: &const byte,
+    an: usize) i32 {
+    var ao: [byte: 512] = [0: 512];
+    var aol: [usize: 1] = [0];
+    const rc: i32 = provider_render(root, rn, id, idn, board_ver, shot_no,
+        action, an, &ao[0: 512], &aol[0]);
+    if rc != 0 {
+        return rc;
+    }
+    var nm: [byte: 96] = [0: 96];
+    var nn: usize = 0;
+    nn = nn + j_put_raw(&nm[0: 96], nn, "v" as &const byte, 1);
+    nn = nn + j_put_i64(&nm[0: 96], nn, board_ver);
+    nn = nn + j_put_raw(&nm[0: 96], nn, "/shot_" as &const byte, 6);
+    nn = nn + j_put_i64(&nm[0: 96], nn, shot_no);
+    nn = nn + j_put_raw(&nm[0: 96], nn, ".mp4" as &const byte, 4);
+    if asset_registered(root, rn, id, idn, &nm[0], nn) {
+        return 0;
+    }
+    return asset_register(root, rn, id, idn, &nm[0], nn,
+        "video/mp4" as &const byte, 9);
+}
+
+// 单镜头重试：只重渲指定 sequence，资产按名字去重
+export fn task_retry_shot(root: &const byte, rn: usize, id: &const byte,
+    idn: usize, board_ver: i64, seq: i64, out: &[byte],
+    out_len: &usize) i32 {
+    out_len[0] = 0;
+    if seq <= 0 {
+        return 57;
+    }
+    var rec: [byte: TASK_BUF] = [0: TASK_BUF];
+    var rl: [usize: 1] = [0];
+    if board_get(root, rn, id, idn, board_ver, &rec[0: TASK_BUF],
+        &rl[0]) != 0 {
+        return 57;
+    }
+    const ver: i64 = num_in(&rec[0], rl[0], "version" as &const byte);
+    if ver <= 0 {
+        return 57;
+    }
+    var bs: [usize: 1] = [0];
+    var bl: [usize: 1] = [0];
+    if j_span(&rec[0], rl[0], "board" as &const byte, &bs[0],
+        &bl[0]) != 123 as byte {
+        return 57;
+    }
+    const bd: &const byte = &rec[bs[0]];
+    var ss: [usize: 1] = [0];
+    var sl: [usize: 1] = [0];
+    if j_span(bd, bl[0], "shots" as &const byte, &ss[0],
+        &sl[0]) != 91 as byte {
+        return 57;
+    }
+    var idx: usize = 0;
+    while true {
+        var es: [usize: 1] = [0];
+        var el: [usize: 1] = [0];
+        if !j_arr_item(&bd[ss[0]], sl[0], idx, &es[0], &el[0]) {
+            break;
+        }
+        const sh: &const byte = &bd[ss[0] + es[0]];
+        const no: i64 = num_in(sh, el[0], "sequence" as &const byte);
+        if no == seq {
+            var act: [byte: 256] = [0: 256];
+            var al: usize = 0;
+            _ = j_str(sh, el[0], "action" as &const byte, &act[0: 256],
+                &al);
+            const dur: i64 = num_in(sh, el[0],
+                "duration_ms" as &const byte);
+            if budget_would_exceed(root, rn, id, idn, 1, dur) {
+                return 60;
+            }
+            const rc: i32 = render_shot(root, rn, id, idn, ver, seq,
+                &act[0], al);
+            if rc != 0 {
+                return rc;
+            }
+            var w: usize = 0;
+            w = w + j_put(out, w, "{\"shot_no\":" as &const byte);
+            w = w + j_put_i64(out, w, seq);
+            w = w + j_put(out, w, ",\"board_version\":" as &const byte);
+            w = w + j_put_i64(out, w, ver);
+            w = w + j_put(out, w, ",\"state\":\"done\"}" as &const byte);
+            out_len[0] = w;
+            return 0;
+        }
+        idx = idx + 1;
+    }
+    return 17;
+}
+
+// 视频步骤：只接已批准的剧本 → 分镜 → 逐镜渲染并登记资产 → 任务完成
+export fn task_run_video(root: &const byte, rn: usize, id: &const byte,
+    idn: usize, task_id: &const byte, tidn: usize, out: &[byte],
+    out_len: &usize) i32 {
+    out_len[0] = 0;
+    var aver: [i64: 1] = [0];
+    aver[0] = video_script_ver(root, rn, id, idn, task_id, tidn);
+    if aver[0] <= 0 {
+        _ = mark_failed(root, rn, id, idn, task_id, tidn,
+            "script_not_approved" as &const byte);
+        qfail(root, rn, id, idn, task_id, tidn);
+        return 57;
+    }
+    var bw: [byte: 512] = [0: 512];
+    var bl: [usize: 1] = [0];
+    const brc: i32 = board_build(root, rn, id, idn, aver[0], &bw[0: 512],
+        &bl[0]);
+    if brc == 98 {
+        _ = mark_failed(root, rn, id, idn, task_id, tidn,
+            "action_unsupported" as &const byte);
+        qfail(root, rn, id, idn, task_id, tidn);
+        return 58;
+    }
+    if brc != 0 {
+        _ = mark_failed(root, rn, id, idn, task_id, tidn,
+            "board_invalid" as &const byte);
+        qfail(root, rn, id, idn, task_id, tidn);
+        return 57;
+    }
+    const board_ver: i64 = num_in(&bw[0], bl[0],
+        "board_version" as &const byte);
+    if board_ver <= 0 {
+        return 57;
+    }
+    var rec: [byte: TASK_BUF] = [0: TASK_BUF];
+    var rl: [usize: 1] = [0];
+    const brc2: i32 = board_get(root, rn, id, idn, board_ver,
+        &rec[0: TASK_BUF], &rl[0]);
+    if brc2 != 0 {
+        return 57;
+    }
+    var bs2: [usize: 1] = [0];
+    var bl2: [usize: 1] = [0];
+    if j_span(&rec[0], rl[0], "board" as &const byte, &bs2[0],
+        &bl2[0]) != 123 as byte {
+        return 57;
+    }
+    const bd: &const byte = &rec[bs2[0]];
+    var ss: [usize: 1] = [0];
+    var sl: [usize: 1] = [0];
+    if j_span(bd, bl2[0], "shots" as &const byte, &ss[0], &sl[0])
+        != 91 as byte {
+        return 57;
+    }
+    // 熔断：先把这一集要花的量估出来（镜头数 + 时长），超上限就不开工
+    if over_budget(root, rn, id, idn, bd, bl2[0]) {
+        _ = mark_failed(root, rn, id, idn, task_id, tidn,
+            "budget_exceeded" as &const byte);
+        qfail(root, rn, id, idn, task_id, tidn);
+        return 60;
+    }
+    // 提交本地队列：prompt_id 确定性、已有记录就复用（崩溃窗口不会重发）
+    var prompt: [byte: 32] = [0: 32];
+    var pnl: [usize: 1] = [0];
+    if queue_submit(root, rn, id, idn, task_id, tidn, board_ver,
+        &prompt[0: 32], &pnl[0]) != 0 {
+        _ = mark_failed(root, rn, id, idn, task_id, tidn,
+            "queue_submit_failed" as &const byte);
+        return 55;
+    }
+    _ = queue_set(root, rn, id, idn, task_id, tidn,
+        "running" as &const byte, 0, 0);
+    var idx: usize = 0;
+    var rendered: i64 = 0;
+    var gpu_ms: i64 = 0;
+    while true {
+        var es: [usize: 1] = [0];
+        var el: [usize: 1] = [0];
+        if !j_arr_item(&bd[ss[0]], sl[0], idx, &es[0], &el[0]) {
+            break;
+        }
+        const sh: &const byte = &bd[ss[0] + es[0]];
+        const no: i64 = num_in(sh, el[0], "sequence" as &const byte);
+        var act: [byte: 256] = [0: 256];
+        var al: usize = 0;
+        _ = j_str(sh, el[0], "action" as &const byte, &act[0: 256], &al);
+        const rc: i32 = render_shot(root, rn, id, idn, board_ver, no,
+            &act[0], al);
+        if rc == 98 {
+            _ = mark_failed(root, rn, id, idn, task_id, tidn,
+                "action_unsupported" as &const byte);
+            qfail(root, rn, id, idn, task_id, tidn);
+            return 58;   // 能力表外的动作
+        }
+        if rc != 0 {
+            _ = mark_failed(root, rn, id, idn, task_id, tidn,
+                "asset_register_failed" as &const byte);
+            qfail(root, rn, id, idn, task_id, tidn);
+            return 55;
+        }
+        rendered = rendered +| 1;
+        gpu_ms = gpu_ms +| (anum_of(sh, el[0], "duration_ms" as &const byte));
+        idx = idx + 1;
+    }
+    if !queue_set(root, rn, id, idn, task_id, tidn,
+        "done" as &const byte, rendered, gpu_ms) {
+        _ = mark_failed(root, rn, id, idn, task_id, tidn,
+            "queue_done_failed" as &const byte);
+        return 55;
+    }
+    if !mark_done_video(root, rn, id, idn, task_id, tidn, board_ver,
+        rendered, gpu_ms, &prompt[0], pnl[0]) {
+        return 55;
+    }
+    var w: usize = 0;
+    w = w + j_put(out, w,
+        "{\"state\":\"done\",\"shots_rendered\":" as &const byte);
+    w = w + j_put_i64(out, w, rendered);
+    w = w + j_put(out, w, ",\"board_version\":" as &const byte);
+    w = w + j_put_i64(out, w, board_ver);
+    w = w + j_put(out, w, "}" as &const byte);
+    out_len[0] = w;
+    return 0;
+}
+
+export fn anum_of(buf: &const byte, n: usize, key: &const byte) i64 {
+    return num_in(buf, n, key);
+}
+
+// 任务记录里的 episode_id / script_version（写每集 manifest 用）
+fn task_episode_meta(dir: &const byte, dl: usize, task_id: &const byte,
+    tidn: usize, ep: &[byte], epn: &usize, sv: &i64) bool {
+    var nm: [byte: 32] = [0: 32];
+    var nn: usize = 0;
+    nn = nn + j_put_raw(&nm[0: 32], nn, task_id, tidn);
+    nn = nn + j_put_raw(&nm[0: 32], nn, ".json" as &const byte, 5);
+    var rec: [byte: 1024] = [0: 1024];
+    var rl: [usize: 1] = [0];
+    if !read_file(dir, dl, &nm[0], nn, &rec[0], 1024, &rl[0]) {
+        return false;
+    }
+    epn[0] = 0;
+    _ = j_str(&rec[0], rl[0], "episode_id" as &const byte, ep, epn);
+    sv[0] = num_in(&rec[0], rl[0], "script_version" as &const byte);
+    return epn[0] > 0;
+}
+
+fn episode_id_ok(ep: &const byte, n: usize) bool {
+    if n == 0 || n > 63 {
+        return false;
+    }
+    var i: usize = 0;
+    while i < n {
+        const c: byte = ep[i];
+        const digit: bool = c >= 48 as byte && c <= 57 as byte;
+        const upper: bool = c >= 65 as byte && c <= 90 as byte;
+        const lower: bool = c >= 97 as byte && c <= 122 as byte;
+        if !digit && !upper && !lower && c != 95 as byte && c != 45 as byte {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+// 默认 format 规格块（DESIGN §7.4）：画布/成片/时长/编码/响度
+fn put_format(out: &[byte], w0: usize) usize {
+    var w: usize = w0;
+    w = w + j_put(out, w,
+        ",\"format\":{\"canvas\":{\"width\":448," as &const byte);
+    w = w + j_put(out, w, "\"height\":800}," as &const byte);
+    w = w + j_put(out, w,
+        "\"delivery\":{\"width\":440," as &const byte);
+    w = w + j_put(out, w, "\"height\":800,\"fps\":24}," as &const byte);
+    w = w + j_put(out, w,
+        "\"duration\":{\"main_seconds\":56," as &const byte);
+    w = w + j_put(out, w, "\"end_card_seconds\":4," as &const byte);
+    w = w + j_put(out, w, "\"total_seconds\":60," as &const byte);
+    w = w + j_put(out, w, "\"tolerance_seconds\":0.05}," as &const byte);
+    w = w + j_put(out, w,
+        "\"encode\":{\"vcodec\":\"libx264\"," as &const byte);
+    w = w + j_put(out, w, "\"crf\":20," as &const byte);
+    w = w + j_put(out, w, "\"pix_fmt\":\"yuv420p\"," as &const byte);
+    w = w + j_put(out, w, "\"acodec\":\"aac\"," as &const byte);
+    w = w + j_put(out, w, "\"abitrate\":\"128k\"," as &const byte);
+    w = w + j_put(out, w, "\"asr\":32000,\"faststart\":true}," as &const byte);
+    w = w + j_put(out, w,
+        "\"loudness\":{\"target_i\":-16," as &const byte);
+    w = w + j_put(out, w,
+        "\"target_tp\":-1.5,\"passes\":2}}" as &const byte);
+    return w;
+}
+
+// 每集一个 manifest.json：剧本/分镜版本、镜头数、时长、任务与成本口径
+fn write_episode_manifest(root: &const byte, rn: usize, id: &const byte,
+    idn: usize, ep: &const byte, epn: usize, sv: i64, board_ver: i64,
+    shots: i64, gpu_ms: i64, task_id: &const byte, tidn: usize) bool {
+    if !episode_id_ok(ep, epn) {
+        return false;
+    }
+    var pdir: [byte: 512] = [0: 512];
+    var pl: usize = 0;
+    if !path_join(root, rn, "projects" as &const byte, 8, &pdir[0: 512],
+        &pl) {
+        return false;
+    }
+    var idir: [byte: 512] = [0: 512];
+    var il: usize = 0;
+    if !path_join(&pdir[0], pl, id, idn, &idir[0: 512], &il) {
+        return false;
+    }
+    var edir: [byte: 512] = [0: 512];
+    var el: usize = 0;
+    if !path_join(&idir[0], il, "episodes" as &const byte, 8,
+        &edir[0: 512], &el) {
+        return false;
+    }
+    var epdir: [byte: 512] = [0: 512];
+    var epl: usize = 0;
+    if !path_join(&edir[0], el, ep, epn, &epdir[0: 512], &epl) {
+        return false;
+    }
+    _ = mkdir_p(&epdir[0], epl);
+    var body: [byte: 1024] = [0: 1024];
+    var w: usize = 0;
+    w = w + j_put(&body[0: 1024], w,
+        "{\"format_version\":1,\"episode_id\":" as &const byte);
+    w = w + j_put_str(&body[0: 1024], w, ep, epn);
+    w = w + j_put(&body[0: 1024], w, ",\"task_id\":" as &const byte);
+    w = w + j_put_str(&body[0: 1024], w, task_id, tidn);
+    w = w + j_put(&body[0: 1024], w, ",\"script_version\":" as &const byte);
+    w = w + j_put_i64(&body[0: 1024], w, sv);
+    w = w + j_put(&body[0: 1024], w, ",\"board_version\":" as &const byte);
+    w = w + j_put_i64(&body[0: 1024], w, board_ver);
+    w = w + j_put(&body[0: 1024], w, ",\"shots_rendered\":" as &const byte);
+    w = w + j_put_i64(&body[0: 1024], w, shots);
+    w = w + j_put(&body[0: 1024], w, ",\"duration_ms\":" as &const byte);
+    w = w + j_put_i64(&body[0: 1024], w, gpu_ms);
+    w = w + j_put(&body[0: 1024], w, ",\"gpu_ms\":" as &const byte);
+    w = w + j_put_i64(&body[0: 1024], w, gpu_ms);
+    w = w + j_put(&body[0: 1024], w, ",\"state\":\"done\"" as &const byte);
+    w = put_format(&body[0: 1024], w);
+    w = w + j_put(&body[0: 1024], w, "}" as &const byte);
+    return write_atomic(&epdir[0], epl, "manifest.json" as &const byte, 13,
+        &body[0], w);
+}
+
+fn mark_done_video(root: &const byte, rn: usize, id: &const byte,
+    idn: usize, task_id: &const byte, tidn: usize, board_ver: i64,
+    shots: i64, gpu_ms: i64, prompt: &const byte, pn: usize) bool {
+    var dir: [byte: 512] = [0: 512];
+    var dl: usize = 0;
+    var ep: [byte: 64] = [0: 64];
+    var epn: [usize: 1] = [0];
+    var sv: [i64: 1] = [0];
+    if !tdir(root, rn, id, idn, &dir[0: 512], &dl) {
+        return false;
+    }
+    const have_meta: bool = task_episode_meta(&dir[0], dl, task_id, tidn,
+        &ep[0: 64], &epn[0], &sv[0]);
+    var body: [byte: 1024] = [0: 1024];
+    var w: usize = 0;
+    w = w + j_put(&body[0: 1024], w,
+        "{\"format_version\":1,\"id\":\"" as &const byte);
+    w = w + j_put_raw(&body[0: 1024], w, task_id, tidn);
+    w = w + j_put(&body[0: 1024], w, "\",\"target\":\"video\"" as &const byte);
+    if have_meta {
+        w = w + j_put(&body[0: 1024], w, ",\"episode_id\":" as &const byte);
+        w = w + j_put_str(&body[0: 1024], w, &ep[0], epn[0]);
+        w = w + j_put(&body[0: 1024], w,
+            ",\"script_version\":" as &const byte);
+        w = w + j_put_i64(&body[0: 1024], w, sv[0]);
+    }
+    w = w + j_put(&body[0: 1024], w, ",\"state\":\"done\"" as &const byte);
+    w = w + j_put(&body[0: 1024], w, ",\"board_version\":" as &const byte);
+    w = w + j_put_i64(&body[0: 1024], w, board_ver);
+    w = w + j_put(&body[0: 1024], w, ",\"shots_rendered\":" as &const byte);
+    w = w + j_put_i64(&body[0: 1024], w, shots);
+    w = w + j_put(&body[0: 1024], w, ",\"renders\":" as &const byte);
+    w = w + j_put_i64(&body[0: 1024], w, shots);
+    w = w + j_put(&body[0: 1024], w, ",\"gpu_ms\":" as &const byte);
+    w = w + j_put_i64(&body[0: 1024], w, gpu_ms);
+    w = w + j_put(&body[0: 1024], w,
+        ",\"provider_prompt_id\":" as &const byte);
+    w = w + j_put_str(&body[0: 1024], w, prompt, pn);
+    w = w + j_put(&body[0: 1024], w, ",\"queue\":\"done\"" as &const byte);
+    w = w + j_put(&body[0: 1024], w,
+        ",\"steps\":[{\"name\":\"video\",\"state\":\"done\"}]}" as
+        &const byte);
+    var nm: [byte: 32] = [0: 32];
+    var nn: usize = 0;
+    nn = nn + j_put_raw(&nm[0: 32], nn, task_id, tidn);
+    nn = nn + j_put_raw(&nm[0: 32], nn, ".json" as &const byte, 5);
+    const okw: bool = write_atomic(&dir[0], dl, &nm[0], nn, &body[0], w);
+    if okw && have_meta {
+        _ = write_episode_manifest(root, rn, id, idn, &ep[0], epn[0],
+            sv[0], board_ver, shots, gpu_ms, task_id, tidn);
+    }
+    return okw;
+}
+
+// Worker：扫一遍所有项目里未完成的任务并执行（P8 第一段的"worker run"）
+export fn task_worker_run(root: &const byte, rn: usize, out: &[byte],
+    out_len: &usize) i32 {
+    out_len[0] = 0;
+    var pidx: [byte: TASK_BUF] = [0: TASK_BUF];
+    var pl: usize = 0;
+    var pdir: [byte: 512] = [0: 512];
+    var pdl: usize = 0;
+    if !path_join(root, rn, "projects" as &const byte, 8, &pdir[0: 512],
+        &pdl) {
+        return 55;
+    }
+    _ = read_file(&pdir[0], pdl, "index.jsonl" as &const byte, 11,
+        &pidx[0], TASK_BUF, &pl);
+    var ran: i64 = 0;
+    var done: i64 = 0;
+    var failed: i64 = 0;
+    var pi: usize = 0;
+    while pi < pl {
+        var pe: usize = pi;
+        while pe < pl && pidx[pe] != 10 as byte {
+            pe = pe + 1;
+        }
+        if pe > pi {
+            var pid: [byte: 32] = [0: 32];
+            var pidl: usize = 0;
+            _ = j_str(&pidx[pi], pe - pi, "id" as &const byte,
+                &pid[0: 32], &pidl);
+            if pidl > 0 {
+                const r: i32 = run_project_tasks(root, rn, &pid[0], pidl,
+                    &ran, &done, &failed);
+                if r != 0 {
+                    return r;
+                }
+            }
+        }
+        pi = pe + 1;
+    }
+    var w: usize = 0;
+    w = w + j_put(out, w, "{\"tasks_seen\":" as &const byte);
+    w = w + j_put_i64(out, w, ran);
+    w = w + j_put(out, w, ",\"tasks_done\":" as &const byte);
+    w = w + j_put_i64(out, w, done);
+    w = w + j_put(out, w, ",\"tasks_failed\":" as &const byte);
+    w = w + j_put_i64(out, w, failed);
+    w = w + j_put(out, w, "}" as &const byte);
+    out_len[0] = w;
+    return 0;
+}
+
+fn run_project_tasks(root: &const byte, rn: usize, id: &const byte,
+    idn: usize, ran: &i64, done: &i64, failed: &i64) i32 {
+    var dir: [byte: 512] = [0: 512];
+    var dl: usize = 0;
+    if !tdir(root, rn, id, idn, &dir[0: 512], &dl) {
+        return 0;   // 这个项目还没有任务目录
+    }
+    var idx: [byte: TASK_BUF] = [0: TASK_BUF];
+    var il: usize = 0;
+    if !read_file(&dir[0], dl, "index.jsonl" as &const byte, 11, &idx[0],
+        TASK_BUF, &il) {
+        return 0;
+    }
+    var i: usize = 0;
+    while i < il {
+        var e: usize = i;
+        while e < il && idx[e] != 10 as byte {
+            e = e + 1;
+        }
+        if e > i {
+            var tid: [byte: 32] = [0: 32];
+            var tidl: usize = 0;
+            _ = j_str(&idx[i], e - i, "id" as &const byte, &tid[0: 32],
+                &tidl);
+            // 状态以**记录文件**为准：索引是创建日志，里面的 state 是旧的
+            var st: [byte: 16] = [0: 16];
+            var stl: usize = 0;
+            var expired: bool = false;
+            if tidl > 0 {
+                var rbuf: [byte: 2048] = [0: 2048];
+                var rbl: [usize: 1] = [0];
+                if task_get(root, rn, id, idn, &tid[0], tidl,
+                    &rbuf[0: 2048], &rbl[0]) == 0 {
+                    _ = j_str(&rbuf[0], rbl[0], "state" as &const byte,
+                        &st[0: 16], &stl);
+                    expired = deadline_passed(&rbuf[0], rbl[0]);
+                }
+            }
+            const is_done: bool = eqb(&st[0], stl, "done" as &const byte, 4);
+            const is_cancelled: bool = eqb(&st[0], stl,
+                "cancelled" as &const byte, 9);
+            if tidl > 0 && !is_done && !is_cancelled {
+                ran[0] = ran[0] +| 1;
+                if expired {
+                    _ = mark_failed(root, rn, id, idn, &tid[0], tidl,
+                        "deadline_exceeded" as &const byte);
+                    failed[0] = failed[0] +| 1;
+                } else {
+                    var ob: [byte: 2048] = [0: 2048];
+                    var obl: [usize: 1] = [0];
+                    const rc: i32 = task_run(root, rn, id, idn, &tid[0],
+                        tidl, &ob[0: 2048], &obl[0]);
+                    if rc == 0 {
+                        done[0] = done[0] +| 1;
+                    } else {
+                        failed[0] = failed[0] +| 1;
+                    }
+                }
+            }
+        }
+        i = e + 1;
+    }
+    return 0;
+}
+
+// ---- 本地队列（单卡串行）-----------------------------------------------
+// 落盘 <root>/projects/<id>/queue/<task_id>.json：
+//   {format_version, prompt_id, task_id, board_version, state, submitted_at,
+//    updated_at, shots?, gpu_ms?}
+// prompt_id 由 (task_id, board_version) 确定性算出 ⇒ 崩溃重跑时"先查历史再
+// 决定重发"不需要额外事务：同一个任务永远是同一个 prompt_id，已有记录就复用。
+
+fn qdir(root: &const byte, rn: usize, id: &const byte, idn: usize,
+    out: &[byte], out_len: &usize) bool {
+    var pdir: [byte: 512] = [0: 512];
+    var pdl: usize = 0;
+    if !path_join(root, rn, "projects" as &const byte, 8, &pdir[0: 512],
+        &pdl) {
+        return false;
+    }
+    var dir: [byte: 512] = [0: 512];
+    var dl: usize = 0;
+    if !path_join(&pdir[0], pdl, id, idn, &dir[0: 512], &dl) {
+        return false;
+    }
+    return path_join(&dir[0], dl, "queue" as &const byte, 5, out, out_len);
+}
+
+fn qnow() i64 {
+    var ts: TimeSpec = TimeSpec{ tv_sec: 0, tv_nsec: 0 };
+    _ = sys_clock_gettime(0, &ts) catch { 0 as i32; };
+    return ts.tv_sec;
+}
+
+// 队列文件名 = <task_id>.json
+fn qname(task_id: &const byte, tidn: usize, out: &[byte]) usize {
+    var i: usize = 0;
+    while i < tidn && i < 27 {
+        out[i] = task_id[i];
+        i = i + 1;
+    }
+    out[i] = 46 as byte;
+    out[i + 1] = 106 as byte;
+    out[i + 2] = 115 as byte;
+    out[i + 3] = 111 as byte;
+    out[i + 4] = 110 as byte;
+    return i + 5;
+}
+
+fn qload(dir: &const byte, dl: usize, task_id: &const byte, tidn: usize,
+    buf: &[byte], cap: usize, out_len: &usize) bool {
+    var nm: [byte: 32] = [0: 32];
+    const nn: usize = qname(task_id, tidn, &nm[0: 32]);
+    return read_file(dir, dl, &nm[0], nn, buf, cap, out_len);
+}
+
+fn qsave(dir: &const byte, dl: usize, task_id: &const byte, tidn: usize,
+    body: &const byte, n: usize) bool {
+    var nm: [byte: 32] = [0: 32];
+    const nn: usize = qname(task_id, tidn, &nm[0: 32]);
+    return write_atomic(dir, dl, &nm[0], nn, body, n);
+}
+
+// prompt_id = "q_" + sha256(task_id|board_ver) 的前 8 位十六进制
+fn qprompt(task_id: &const byte, tidn: usize, board_ver: i64,
+    out: &[byte], out_len: &usize) bool {
+    var src: [byte: 64] = [0: 64];
+    var sn: usize = 0;
+    _ = copy_to(task_id, tidn, &src[0: 64], &sn);
+    var tv: [byte: 16] = [0: 16];
+    var tvn: [usize: 1] = [0];
+    tvn[0] = tvn[0] + j_put_i64(&tv[0: 16], tvn[0], board_ver);
+    var k: usize = 0;
+    while k < tvn[0] && sn < 64 {
+        src[sn] = tv[k];
+        sn = sn + 1;
+        k = k + 1;
+    }
+    var hex: [byte: 72] = [0: 72];
+    var hl: [usize: 1] = [0];
+    if !sha256_hex(&src[0], sn, &hex[0: 72], &hl[0]) {
+        return false;
+    }
+    var w: usize = 0;
+    w = w + j_put(out, w, "q_" as &const byte);
+    w = w + j_put_raw(out, w, &hex[0], 8);
+    out_len[0] = w;
+    return true;
+}
+
+// 提交：已有记录就复用（不重发），没有才落 queued
+export fn queue_submit(root: &const byte, rn: usize, id: &const byte,
+    idn: usize, task_id: &const byte, tidn: usize, board_ver: i64,
+    out: &[byte], out_len: &usize) i32 {
+    out_len[0] = 0;
+    var dir: [byte: 512] = [0: 512];
+    var dl: usize = 0;
+    if !qdir(root, rn, id, idn, &dir[0: 512], &dl) {
+        return 55;
+    }
+    var prompt: [byte: 32] = [0: 32];
+    var pn: [usize: 1] = [0];
+    if !qprompt(task_id, tidn, board_ver, &prompt[0: 32], &pn[0]) {
+        return 55;
+    }
+    var old: [byte: 1024] = [0: 1024];
+    var ol: [usize: 1] = [0];
+    if qload(&dir[0], dl, task_id, tidn, &old[0: 1024], 1024, &ol[0]) {
+        var op: [byte: 32] = [0: 32];
+        var opn: [usize: 1] = [0];
+        _ = j_str(&old[0], ol[0], "prompt_id" as &const byte,
+            &op[0: 32], &opn[0]);
+        if opn[0] == pn[0] {
+            var i: usize = 0;
+            while i < pn[0] && i < 32 {
+                out[i] = prompt[i];
+                i = i + 1;
+            }
+            out_len[0] = i;
+            return 0;   // 复用它，绝不重发
+        }
+    }
+    const now: i64 = qnow();
+    var body: [byte: 1024] = [0: 1024];
+    var w: usize = 0;
+    w = w + j_put(&body[0: 1024], w,
+        "{\"format_version\":1,\"prompt_id\":" as &const byte);
+    w = w + j_put_str(&body[0: 1024], w, &prompt[0], pn[0]);
+    w = w + j_put(&body[0: 1024], w, ",\"task_id\":" as &const byte);
+    w = w + j_put_str(&body[0: 1024], w, task_id, tidn);
+    w = w + j_put(&body[0: 1024], w, ",\"board_version\":" as
+        &const byte);
+    w = w + j_put_i64(&body[0: 1024], w, board_ver);
+    w = w + j_put(&body[0: 1024], w, ",\"state\":\"queued\"" as
+        &const byte);
+    w = w + j_put(&body[0: 1024], w, ",\"submitted_at\":" as &const byte);
+    w = w + j_put_i64(&body[0: 1024], w, now);
+    w = w + j_put(&body[0: 1024], w, ",\"updated_at\":" as &const byte);
+    w = w + j_put_i64(&body[0: 1024], w, now);
+    w = w + j_put(&body[0: 1024], w, "}" as &const byte);
+    if !qsave(&dir[0], dl, task_id, tidn, &body[0], w) {
+        return 55;
+    }
+    var i: usize = 0;
+    while i < pn[0] && i < 32 {
+        out[i] = prompt[i];
+        i = i + 1;
+    }
+    out_len[0] = i;
+    return 0;
+}
+
+// 状态推进：queued → running → done（canceled 由取消走）
+export fn queue_set(root: &const byte, rn: usize, id: &const byte,
+    idn: usize, task_id: &const byte, tidn: usize, state: &const byte,
+    shots: i64, gpu_ms: i64) bool {
+    var dir: [byte: 512] = [0: 512];
+    var dl: usize = 0;
+    if !qdir(root, rn, id, idn, &dir[0: 512], &dl) {
+        return false;
+    }
+    var old: [byte: 1024] = [0: 1024];
+    var ol: [usize: 1] = [0];
+    var prompt: [byte: 32] = [0: 32];
+    var pn: [usize: 1] = [0];
+    var bver: i64 = 0;
+    if !qload(&dir[0], dl, task_id, tidn, &old[0: 1024], 1024, &ol[0]) {
+        return false;
+    }
+    _ = j_str(&old[0], ol[0], "prompt_id" as &const byte, &prompt[0: 32],
+        &pn[0]);
+    bver = num_in(&old[0], ol[0], "board_version" as &const byte);
+    if pn[0] == 0 {
+        return false;
+    }
+    if eqb(state, b_len(state), "canceled" as &const byte, 8) {
+        // 已经跑完的不允许撤回
+        var st: [byte: 16] = [0: 16];
+        var stl: [usize: 1] = [0];
+        _ = j_str(&old[0], ol[0], "state" as &const byte, &st[0: 16],
+            &stl[0]);
+        if eqb(&st[0], stl[0], "done" as &const byte, 4) {
+            return false;
+        }
+    }
+    var body: [byte: 1024] = [0: 1024];
+    var w: usize = 0;
+    w = w + j_put(&body[0: 1024], w,
+        "{\"format_version\":1,\"prompt_id\":" as &const byte);
+    w = w + j_put_str(&body[0: 1024], w, &prompt[0], pn[0]);
+    w = w + j_put(&body[0: 1024], w, ",\"task_id\":" as &const byte);
+    w = w + j_put_str(&body[0: 1024], w, task_id, tidn);
+    w = w + j_put(&body[0: 1024], w, ",\"board_version\":" as
+        &const byte);
+    w = w + j_put_i64(&body[0: 1024], w, bver);
+    w = w + j_put(&body[0: 1024], w, ",\"state\":" as &const byte);
+    w = w + j_put_str(&body[0: 1024], w, state, b_len(state));
+    if eqb(state, b_len(state), "done" as &const byte, 4) {
+        w = w + j_put(&body[0: 1024], w, ",\"shots\":" as &const byte);
+        w = w + j_put_i64(&body[0: 1024], w, shots);
+        w = w + j_put(&body[0: 1024], w, ",\"gpu_ms\":" as &const byte);
+        w = w + j_put_i64(&body[0: 1024], w, gpu_ms);
+    }
+    w = w + j_put(&body[0: 1024], w, ",\"submitted_at\":" as &const byte);
+    w = w + j_put_i64(&body[0: 1024], w, num_in(&old[0], ol[0],
+        "submitted_at" as &const byte));
+    w = w + j_put(&body[0: 1024], w, ",\"updated_at\":" as &const byte);
+    w = w + j_put_i64(&body[0: 1024], w, qnow());
+    w = w + j_put(&body[0: 1024], w, "}" as &const byte);
+    return qsave(&dir[0], dl, task_id, tidn, &body[0], w);
+}
+
+
+// ---- 取消 / 结果取回：队列记录改写 + 真停 job --------------------------
+// 终态（done/failed/canceled）不再改，取消一个已终结的任务回 58。
+
+fn qis_terminal(st: &const byte, sn: usize) bool {
+    return eqb(st, sn, "done" as &const byte, 4)
+        || eqb(st, sn, "failed" as &const byte, 6)
+        || eqb(st, sn, "canceled" as &const byte, 8);
+}
+
+// 取一个字段的字符串值（取不到就给空）
+fn qget_str(rec: &const byte, rl: usize, key: &const byte, out: &[byte],
+    cap: usize, out_len: &usize) void {
+    out_len[0] = 0;
+    _ = j_str(rec, rl, key, &out[0: cap], out_len);
+}
+
+// 把记录里除 state 之外的字段原样搬过来，只换 state
+fn qrewrite(rec: &const byte, rl: usize, state: &const byte, sn: usize,
+    body: &[byte], cap: usize) usize {
+    var w: usize = 0;
+    w = w + j_put(&body[0: cap], w,
+        "{\"format_version\":1,\"prompt_id\":\"" as &const byte);
+    var f: [byte: 64] = [0: 64];
+    var fl: [usize: 1] = [0];
+    qget_str(rec, rl, "prompt_id" as &const byte, &f[0: 64], 64, &fl[0]);
+    w = w + j_put_raw(&body[0: cap], w, &f[0], fl[0]);
+    w = w + j_put(&body[0: cap], w, "\",\"task_id\":\"" as &const byte);
+    qget_str(rec, rl, "task_id" as &const byte, &f[0: 64], 64, &fl[0]);
+    w = w + j_put_raw(&body[0: cap], w, &f[0], fl[0]);
+    w = w + j_put(&body[0: cap], w, "\",\"board_version\":" as &const byte);
+    w = w + j_put_i64(&body[0: cap], w,
+        num_in(rec, rl, "board_version" as &const byte));
+    w = w + j_put(&body[0: cap], w, ",\"state\":\"" as &const byte);
+    w = w + j_put_raw(&body[0: cap], w, state, sn);
+    w = w + j_put(&body[0: cap], w, "\",\"shots\":" as &const byte);
+    w = w + j_put_i64(&body[0: cap], w,
+        num_in(rec, rl, "shots" as &const byte));
+    w = w + j_put(&body[0: cap], w, ",\"gpu_ms\":" as &const byte);
+    w = w + j_put_i64(&body[0: cap], w,
+        num_in(rec, rl, "gpu_ms" as &const byte));
+    w = w + j_put(&body[0: cap], w, ",\"submitted_at\":" as &const byte);
+    w = w + j_put_i64(&body[0: cap], w,
+        num_in(rec, rl, "submitted_at" as &const byte));
+    w = w + j_put(&body[0: cap], w, ",\"updated_at\":" as &const byte);
+    w = w + j_put_i64(&body[0: cap], w, qnow());
+    w = w + j_put(&body[0: cap], w, "}" as &const byte);
+    return w;
+}
+
+// 读队列记录到 out（没有就空）；顺便把 state 抠出来
+fn qread_state(root: &const byte, rn: usize, id: &const byte, idn: usize,
+    task_id: &const byte, tidn: usize, rec: &[byte], cap: usize,
+    rl: &usize, state: &[byte], sl: &usize) bool {
+    rl[0] = 0;
+    sl[0] = 0;
+    var dir: [byte: 512] = [0: 512];
+    var dl: usize = 0;
+    if !qdir(root, rn, id, idn, &dir[0: 512], &dl) {
+        return false;
+    }
+    if !qload(&dir[0], dl, task_id, tidn, &rec[0: cap], cap, rl) {
+        return false;
+    }
+    qget_str(&rec[0], rl[0], "state" as &const byte, &state[0: 16], 16, sl);
+    return true;
+}
+
+// 取消：终态拒绝；否则改 state=canceled、留 .cancel 标记、按 pid 停进程
+export fn queue_cancel(root: &const byte, rn: usize, id: &const byte,
+    idn: usize, task_id: &const byte, tidn: usize, out: &[byte],
+    out_len: &usize) i32 {
+    out_len[0] = 0;
+    var rec: [byte: 1024] = [0: 1024];
+    var rl: [usize: 1] = [0];
+    var st: [byte: 16] = [0: 16];
+    var sl: [usize: 1] = [0];
+    if !qread_state(root, rn, id, idn, task_id, tidn, &rec[0: 1024],
+        1024, &rl[0], &st[0: 16], &sl[0]) {
+        return 56;
+    }
+    if qis_terminal(&st[0], sl[0]) {
+        return 74;   // 已是终态，取消不成立
+    }
+    var dir: [byte: 512] = [0: 512];
+    var dl: usize = 0;
+    if !qdir(root, rn, id, idn, &dir[0: 512], &dl) {
+        return 56;
+    }
+    // 停真的 job：记录里带 pid 就按 pid 发 TERM（本机队列由 worker 记录）
+    const pid: i64 = num_in(&rec[0], rl[0], "pid" as &const byte);
+    var killed: bool = false;
+    if pid > 0 {
+        var nm: [byte: 32] = [0: 32];
+        const nn: usize = qname(task_id, tidn, &nm[0: 5]);
+        _ = nn;
+        const rc: i32 = sys_kill(pid as i32, 15) catch { -1 as i32; };
+        killed = rc == 0;
+    }
+    // 标记文件：worker 每轮先看这个，真把生成进程收掉
+    var mk: [byte: 27] = [0: 27];
+    var ml: usize = 0;
+    var i: usize = 0;
+    while i < tidn && i < 22 {
+        mk[i] = task_id[i];
+        i = i + 1;
+    }
+    ml = i;
+    ml = ml + j_put_raw(&mk[0: 27], ml, ".cancel" as &const byte, 7);
+    var body: [byte: 128] = [0: 128];
+    var w: usize = 0;
+    w = w + j_put(&body[0: 128], w, "{\"task_id\":\"" as &const byte);
+    w = w + j_put_raw(&body[0: 128], w, task_id, tidn);
+    w = w + j_put(&body[0: 128], w, "\",\"requested_at\":" as &const byte);
+    w = w + j_put_i64(&body[0: 128], w, qnow());
+    w = w + j_put(&body[0: 128], w, "}" as &const byte);
+    _ = write_atomic(&dir[0], dl, &mk[0], ml, &body[0], w);
+    var nb: [byte: 1024] = [0: 1024];
+    const nw: usize = qrewrite(&rec[0], rl[0], "canceled" as &const byte,
+        8, &nb[0: 1024], 1024);
+    if !qsave(&dir[0], dl, task_id, tidn, &nb[0], nw) {
+        return 56;
+    }
+    var ow: usize = 0;
+    ow = ow + j_put(out, ow, "{\"task_id\":\"" as &const byte);
+    ow = ow + j_put_raw(out, ow, task_id, tidn);
+    ow = ow + j_put(out, ow, "\",\"state\":\"canceled\",\"killed\":" as
+        &const byte);
+    if killed {
+        ow = ow + j_put(out, ow, "true" as &const byte);
+    } else {
+        ow = ow + j_put(out, ow, "false" as &const byte);
+    }
+    ow = ow + j_put(out, ow, "}" as &const byte);
+    out_len[0] = ow;
+    return 0;
+}
+
+export fn queue_get(root: &const byte, rn: usize, id: &const byte,
+    idn: usize, task_id: &const byte, tidn: usize, out: &[byte],
+    out_len: &usize) i32 {
+    out_len[0] = 0;
+    var dir: [byte: 512] = [0: 512];
+    var dl: usize = 0;
+    if !qdir(root, rn, id, idn, &dir[0: 512], &dl) {
+        return 56;
+    }
+    var buf: [byte: 1024] = [0: 1024];
+    var bl: [usize: 1] = [0];
+    if !qload(&dir[0], dl, task_id, tidn, &buf[0: 1024], 1024, &bl[0]) {
+        return 56;
+    }
+    var w: usize = 0;
+    w = w + j_put(out, w, "{" as &const byte);
+    var i: usize = 1;
+    while i < bl[0] {
+        out[w] = buf[i];
+        w = w + 1;
+        i = i + 1;
+    }
+    out_len[0] = w;
+    return 0;
+}
+
+// 视频任务失败时把队列记录也标成 failed（没提交过就静默跳过）
+fn qfail(root: &const byte, rn: usize, id: &const byte, idn: usize,
+    task_id: &const byte, tidn: usize) void {
+    _ = queue_set(root, rn, id, idn, task_id, tidn,
+        "failed" as &const byte, 0, 0);
+}
+
+// 任务失败：记下原因，不留在 queued 里无限重试
+// 任务过了截止时间就不再跑（worker 直接记 failed/deadline_exceeded）
+fn deadline_passed(rec: &const byte, rl: usize) bool {
+    const dl: i64 = num_in(rec, rl, "deadline_s" as &const byte);
+    if dl <= 0 {
+        return false;
+    }
+    var ts: TimeSpec = TimeSpec{ tv_sec: 0, tv_nsec: 0 };
+    _ = sys_clock_gettime(0, &ts) catch { 0 as i32; };
+    return ts.tv_sec > dl;
+}
+
+fn mark_failed(root: &const byte, rn: usize, id: &const byte, idn: usize,
+    task_id: &const byte, tidn: usize, reason: &const byte) bool {
+    var dir: [byte: 512] = [0: 512];
+    var dl: usize = 0;
+    if !tdir(root, rn, id, idn, &dir[0: 512], &dl) {
+        return false;
+    }
+    var body: [byte: 512] = [0: 512];
+    var w: usize = 0;
+    w = w + j_put(&body[0: 512], w,
+        "{\"format_version\":1,\"id\":\"" as &const byte);
+    w = w + j_put_raw(&body[0: 512], w, task_id, tidn);
+    w = w + j_put(&body[0: 512], w, "\",\"state\":\"failed\"," as &const byte);
+    w = w + j_put(&body[0: 512], w, "\"reason\":\"" as &const byte);
+    w = w + j_put_raw(&body[0: 512], w, reason, b_len(reason));
+    w = w + j_put(&body[0: 512], w, "\"}" as &const byte);
+    var nm: [byte: 32] = [0: 32];
+    var nn: usize = 0;
+    nn = nn + j_put_raw(&nm[0: 32], nn, task_id, tidn);
+    nn = nn + j_put_raw(&nm[0: 32], nn, ".json" as &const byte, 5);
+    return write_atomic(&dir[0], dl, &nm[0], nn, &body[0], w);
+}
+
+// 重试：把任务重置成 queued（保留 id/target），供 episode.retry 用
+export fn task_reset(root: &const byte, rn: usize, id: &const byte,
+    idn: usize, task_id: &const byte, tidn: usize) i32 {
+    var dir: [byte: 512] = [0: 512];
+    var dl: usize = 0;
+    if !tdir(root, rn, id, idn, &dir[0: 512], &dl) {
+        return 55;
+    }
+    var rec: [byte: 1024] = [0: 1024];
+    var rl: [usize: 1] = [0];
+    if task_get(root, rn, id, idn, task_id, tidn, &rec[0: 1024],
+        &rl[0]) != 0 {
+        return 56;
+    }
+    var tgt: [byte: 32] = [0: 32];
+    var tgl: usize = 0;
+    _ = j_str(&rec[0], rl[0], "target" as &const byte, &tgt[0: 32], &tgl);
+    if tgl == 0 {
+        _ = copy_to("script" as &const byte, 6, &tgt[0: 32], &tgl);
+    }
+    var body: [byte: 512] = [0: 512];
+    var w: usize = 0;
+    w = w + j_put(&body[0: 512], w,
+        "{\"format_version\":1,\"id\":\"" as &const byte);
+    w = w + j_put_raw(&body[0: 512], w, task_id, tidn);
+    w = w + j_put(&body[0: 512], w, "\",\"target\":" as &const byte);
+    w = w + j_put_str(&body[0: 512], w, &tgt[0], tgl);
+    w = w + j_put(&body[0: 512], w, ",\"state\":\"queued\"," as &const byte);
+    w = w + j_put(&body[0: 512], w,
+        "\"script_version\":" as &const byte);
+    w = w + j_put_i64(&body[0: 512], w,
+        num_in(&rec[0], rl[0], "script_version" as &const byte));
+    w = w + j_put(&body[0: 512], w,
+        ",\"steps\":[{\"name\":\"retry\"," as &const byte);
+    w = w + j_put(&body[0: 512], w, "\"state\":\"pending\"}]}" as &const byte);
+    var nm: [byte: 32] = [0: 32];
+    var nn: usize = 0;
+    nn = nn + j_put_raw(&nm[0: 32], nn, task_id, tidn);
+    nn = nn + j_put_raw(&nm[0: 32], nn, ".json" as &const byte, 5);
+    if !write_atomic(&dir[0], dl, &nm[0], nn, &body[0], w) {
+        return 55;
+    }
+    return 0;
+}
+
+// 取消：只允许取消还没跑完的任务；已 done 的不能取消（返回 59）
+export fn task_cancel(root: &const byte, rn: usize, id: &const byte,
+    idn: usize, task_id: &const byte, tidn: usize) i32 {
+    var dir: [byte: 512] = [0: 512];
+    var dl: usize = 0;
+    if !tdir(root, rn, id, idn, &dir[0: 512], &dl) {
+        return 55;
+    }
+    var rec: [byte: 1024] = [0: 1024];
+    var rl: [usize: 1] = [0];
+    if task_get(root, rn, id, idn, task_id, tidn, &rec[0: 1024],
+        &rl[0]) != 0 {
+        return 56;
+    }
+    var st: [byte: 16] = [0: 16];
+    var stl: usize = 0;
+    _ = j_str(&rec[0], rl[0], "state" as &const byte, &st[0: 16], &stl);
+    if eqb(&st[0], stl, "done" as &const byte, 4) {
+        return 59;   // 已经跑完了，取消没有意义
+    }
+    var tgt: [byte: 32] = [0: 32];
+    var tgl: usize = 0;
+    _ = j_str(&rec[0], rl[0], "target" as &const byte, &tgt[0: 32], &tgl);
+    var body: [byte: 512] = [0: 512];
+    var w: usize = 0;
+    w = w + j_put(&body[0: 512], w,
+        "{\"format_version\":1,\"id\":\"" as &const byte);
+    w = w + j_put_raw(&body[0: 512], w, task_id, tidn);
+    w = w + j_put(&body[0: 512], w, "\",\"target\":" as &const byte);
+    w = w + j_put_str(&body[0: 512], w, &tgt[0], tgl);
+    w = w + j_put(&body[0: 512], w, ",\"state\":\"cancelled\"," as &const byte);
+    w = w + j_put(&body[0: 512], w,
+        "\"steps\":[{\"name\":\"cancel\",\"state\":\"done\"}]}" as &const byte);
+    var nm: [byte: 32] = [0: 32];
+    var nn: usize = 0;
+    nn = nn + j_put_raw(&nm[0: 32], nn, task_id, tidn);
+    nn = nn + j_put_raw(&nm[0: 32], nn, ".json" as &const byte, 5);
+    if !write_atomic(&dir[0], dl, &nm[0], nn, &body[0], w) {
+        return 55;
+    }
+    // 已经提交到本地队列的，一并撤回（没提交过就静默跳过）
+    _ = queue_set(root, rn, id, idn, task_id, tidn,
+        "canceled" as &const byte, 0, 0);
+    return 0;
+}
+
+// ---- 预算上限与熔断（P13）----
+
+// 读预算上限；0 表示不限制
+fn budget_limits(root: &const byte, rn: usize, id: &const byte,
+    idn: usize, max_renders: &i64, max_gpu_ms: &i64) void {
+    max_renders[0] = 0;
+    max_gpu_ms[0] = 0;
+    var dir: [byte: 512] = [0: 512];
+    var dl: usize = 0;
+    if !tdir(root, rn, id, idn, &dir[0: 512], &dl) {
+        return;
+    }
+    var buf: [byte: 512] = [0: 512];
+    var bl: usize = 0;
+    var pdir: [byte: 512] = [0: 512];
+    var pdl: usize = 0;
+    if !path_join(root, rn, "projects" as &const byte, 8, &pdir[0: 512],
+        &pdl) {
+        return;
+    }
+    var proj: [byte: 512] = [0: 512];
+    var prl: usize = 0;
+    if !path_join(&pdir[0], pdl, id, idn, &proj[0: 512], &prl) {
+        return;
+    }
+    if !read_file(&proj[0], prl, "budget.json" as &const byte, 11, &buf[0],
+        512, &bl) {
+        return;
+    }
+    max_renders[0] = num_in(&buf[0], bl, "max_renders" as &const byte);
+    max_gpu_ms[0] = num_in(&buf[0], bl, "max_gpu_ms" as &const byte);
+}
+
+// 设置上限（0 = 放开）
+export fn budget_set(root: &const byte, rn: usize, id: &const byte,
+    idn: usize, max_renders: i64, max_gpu_minutes: i64) i32 {
+    var pdir: [byte: 512] = [0: 512];
+    var pdl: usize = 0;
+    if !path_join(root, rn, "projects" as &const byte, 8, &pdir[0: 512],
+        &pdl) {
+        return 55;
+    }
+    var proj: [byte: 512] = [0: 512];
+    var prl: usize = 0;
+    if !path_join(&pdir[0], pdl, id, idn, &proj[0: 512], &prl) {
+        return 55;
+    }
+    var b: [byte: 256] = [0: 256];
+    var w: usize = 0;
+    w = w + j_put(&b[0: 256], w, "{\"max_renders\":" as &const byte);
+    w = w + j_put_i64(&b[0: 256], w, max_renders);
+    w = w + j_put(&b[0: 256], w, ",\"max_gpu_ms\":" as &const byte);
+    w = w + j_put_i64(&b[0: 256], w, max_gpu_minutes *| 60000);
+    w = w + j_put(&b[0: 256], w, "}" as &const byte);
+    if !write_atomic(&proj[0], prl, "budget.json" as &const byte, 11,
+        &b[0], w) {
+        return 55;
+    }
+    return 0;
+}
+
+// 再干这么多活会不会超预算
+fn budget_would_exceed(root: &const byte, rn: usize, id: &const byte,
+    idn: usize, add_renders: i64, add_gpu_ms: i64) bool {
+    var mr: [i64: 1] = [0];
+    var mg: [i64: 1] = [0];
+    budget_limits(root, rn, id, idn, &mr[0], &mg[0]);
+    if mr[0] == 0 && mg[0] == 0 {
+        return false;   // 没设上限
+    }
+    var renders: [i64: 1] = [0];
+    var gpu: [i64: 1] = [0];
+    if !sum_renders(root, rn, id, idn, &renders[0], &gpu[0]) {
+        return false;
+    }
+    if mr[0] > 0 && renders[0] +| add_renders > mr[0] {
+        return true;
+    }
+    if mg[0] > 0 && gpu[0] +| add_gpu_ms > mg[0] {
+        return true;
+    }
+    return false;
+}
+
+// 汇总已完成任务的渲染数/GPU 时长（budget.report 也用这份）
+export fn sum_renders(root: &const byte, rn: usize, id: &const byte,
+    idn: usize, renders: &i64, gpu_ms: &i64) bool {
+    var idx: [byte: TASK_BUF] = [0: TASK_BUF];
+    var il: [usize: 1] = [0];
+    if task_list(root, rn, id, idn, &idx[0: TASK_BUF], &il[0]) != 0 {
+        return false;
+    }
+    var i: usize = 0;
+    while i < il[0] {
+        var e: usize = i;
+        while e < il[0] && idx[e] != 10 as byte {
+            e = e + 1;
+        }
+        if e > i {
+            var tid: [byte: 32] = [0: 32];
+            var tidl: usize = 0;
+            _ = j_str(&idx[i], e - i, "id" as &const byte, &tid[0: 32],
+                &tidl);
+            if tidl > 0 {
+                var rec: [byte: 2048] = [0: 2048];
+                var rl: [usize: 1] = [0];
+                if task_get(root, rn, id, idn, &tid[0], tidl,
+                    &rec[0: 2048], &rl[0]) == 0 {
+                    renders[0] = renders[0] +| num_in(&rec[0], rl[0],
+                        "renders" as &const byte);
+                    gpu_ms[0] = gpu_ms[0] +| num_in(&rec[0], rl[0],
+                        "gpu_ms" as &const byte);
+                }
+            }
+        }
+        i = e + 1;
+    }
+    return true;
+}
+
+// 分镜里有多少镜头 / 总时长（熔断预估用）
+fn count_shots(bd: &const byte, bn: usize) i64 {
+    var ss: [usize: 1] = [0];
+    var sl: [usize: 1] = [0];
+    if j_span(bd, bn, "shots" as &const byte, &ss[0], &sl[0]) != 91 as byte {
+        return 0;
+    }
+    var idx: usize = 0;
+    while true {
+        var es: [usize: 1] = [0];
+        var el: [usize: 1] = [0];
+        if !j_arr_item(&bd[ss[0]], sl[0], idx, &es[0], &el[0]) {
+            break;
+        }
+        idx = idx + 1;
+    }
+    return idx as i64;
+}
+
+fn sum_shot_ms(bd: &const byte, bn: usize) i64 {
+    var ss: [usize: 1] = [0];
+    var sl: [usize: 1] = [0];
+    if j_span(bd, bn, "shots" as &const byte, &ss[0], &sl[0]) != 91 as byte {
+        return 0;
+    }
+    var idx: usize = 0;
+    var total: i64 = 0;
+    while true {
+        var es: [usize: 1] = [0];
+        var el: [usize: 1] = [0];
+        if !j_arr_item(&bd[ss[0]], sl[0], idx, &es[0], &el[0]) {
+            break;
+        }
+        const sh: &const byte = &bd[ss[0] + es[0]];
+        total = total +| num_in(sh, el[0], "duration_ms" as &const byte);
+        idx = idx + 1;
+    }
+    return total;
+}
+
+// 这一集要花的量会不会超预算
+fn over_budget(root: &const byte, rn: usize, id: &const byte,
+    idn: usize, bd: &const byte, bn: usize) bool {
+    return budget_would_exceed(root, rn, id, idn, count_shots(bd, bn),
+        sum_shot_ms(bd, bn));
+}
+
+// ---- 单 Worker 锁（P8）：同一数据根只允许一个 worker 在跑 ----
+
+fn worker_lock_path(root: &const byte, rn: usize, out: &[byte],
+    out_len: &usize) bool {
+    var ldir: [byte: 512] = [0: 512];
+    var ldl: usize = 0;
+    if !path_join(root, rn, "locks" as &const byte, 5, &ldir[0: 512],
+        &ldl) {
+        return false;
+    }
+    return path_join(&ldir[0], ldl, "worker.lock" as &const byte, 11, out,
+        out_len);
+}
+
+// 拿 worker 锁：活着就失败，死了就清掉重试
+export fn worker_lock(root: &const byte, rn: usize) bool {
+    var ldir: [byte: 512] = [0: 512];
+    var ldl: usize = 0;
+    if !path_join(root, rn, "locks" as &const byte, 5, &ldir[0: 512],
+        &ldl) {
+        return false;
+    }
+    _ = mkdir_p(&ldir[0], ldl);
+    var fpath: [byte: 512] = [0: 512];
+    var fl: usize = 0;
+    if !worker_lock_path(root, rn, &fpath[0: 512], &fl) {
+        return false;
+    }
+    var tries: usize = 0;
+    while tries < 2 {
+        const fd: i32 = sys_open(&fpath[0], (1 + 64 + 128) as i32, 384)
+            catch { -1 as i32; };
+        if fd >= 0 {
+            const pid: i64 = sys_getpid() catch { 0 as i64; };
+            var b: [byte: 64] = [0: 64];
+            var w: usize = 0;
+            w = w + j_put(&b[0: 64], w, "{\"pid\":" as &const byte);
+            w = w + j_put_i64(&b[0: 64], w, pid);
+            w = w + j_put(&b[0: 64], w, "}" as &const byte);
+            _ = sys_write(fd, &b[0], w) catch { 0 as isize; };
+            _ = sys_close(fd) catch { 0 as i32; };
+            return true;
+        }
+        var old: [byte: 128] = [0: 128];
+        var ol: usize = 0;
+        if !read_file(&ldir[0], ldl, "worker.lock" as &const byte, 11,
+            &old[0], 128, &ol) {
+            return false;
+        }
+        const holder: i64 = num_in(&old[0], ol, "pid" as &const byte);
+        const alive: bool = sys_kill(holder, 0) catch { -1 as i32; } == 0;
+        if holder > 0 && alive {
+            return false;   // 有人在跑
+        }
+        _ = sys_unlink(&fpath[0]) catch { 0 as i32; };
+        tries = tries + 1;
+    }
+    return false;
+}
+
+// 当前有没有活着的 worker 持锁（1 = busy，0 = idle）
+export fn worker_state(root: &const byte, rn: usize) i32 {
+    var ldir: [byte: 512] = [0: 512];
+    var ldl: usize = 0;
+    if !path_join(root, rn, "locks" as &const byte, 5, &ldir[0: 512],
+        &ldl) {
+        return 0;
+    }
+    var old: [byte: 128] = [0: 128];
+    var ol: usize = 0;
+    if !read_file(&ldir[0], ldl, "worker.lock" as &const byte, 11,
+        &old[0], 128, &ol) {
+        return 0;
+    }
+    const holder: i64 = num_in(&old[0], ol, "pid" as &const byte);
+    if holder <= 0 {
+        return 0;
+    }
+    const alive: bool = sys_kill(holder, 0) catch { -1 as i32; } == 0;
+    if alive {
+        return 1;
+    }
+    return 0;
+}
+
+export fn worker_unlock(root: &const byte, rn: usize) void {
+    var fpath: [byte: 512] = [0: 512];
+    var fl: usize = 0;
+    if worker_lock_path(root, rn, &fpath[0: 512], &fl) {
+        _ = sys_unlink(&fpath[0]) catch { 0 as i32; };
+    }
+}

@@ -1,0 +1,606 @@
+// drama_plugin/src/story.uya — 剧本模型、确定性校验、时长估算、版本存储
+//
+// 剧本 JSON（模型输出，也是落盘格式）：
+//   {"title":"…","hook":"下一集要兑现的问题",
+//    "scenes":[{"no":1,"action":"…","dialogue":[{"who":"dad","line":"…"}]}],
+//    "candidate_events":[{…canon 事件…}]}
+//
+// 三条硬规矩（DESIGN §7）：
+//   * 剧本只产出**候选事件**，绝不直接改 Canon（提交要另外走 approve）；
+//   * 结构校验是确定性的：缺 title / 缺 scenes / 场景缺 no 或 action /
+//     缺集尾 hook 一律拒；
+//   * 时长估算走确定性口径：对白 4.5 字/秒 + 标点每个 0.30 s，
+//     动作描述 8 字/秒；不算镜头、不算停顿以外的表演时间。
+//
+// 返回码：0 成功 90 缺 title 91 缺 scenes / 场景为空 92 场景字段不全
+//         93 缺 hook 94 读失败 95 写失败 96 版本不存在
+
+use libc.syscall;
+use libc.unistd;
+
+const SCRIPT_BUF: usize = 32768;
+const SCRIPT_DIR: &const byte = "scripts" as &const byte;
+
+// UTF-8 码点个数（按首字节算，忽略续字节）
+fn cp_count(p: &const byte, n: usize) i64 {
+    var i: usize = 0;
+    var c: i64 = 0;
+    while i < n {
+        const b: byte = p[i];
+        if (b as i32 & 0xC0) != 0x80 {
+            c = c +| 1;
+        }
+        i = i + 1;
+    }
+    return c;
+}
+
+fn is_punct(b: byte) bool {
+    if b == 44 as byte || b == 46 as byte || b == 63 as byte
+        || b == 33 as byte || b == 59 as byte || b == 58 as byte {
+        return true;
+    }
+    // 中文标点：，。？！；：
+    if b == 0xEF as byte {
+        return true;
+    }
+    return false;
+}
+
+fn punct_count(p: &const byte, n: usize) i64 {
+    var i: usize = 0;
+    var c: i64 = 0;
+    while i < n {
+        if is_punct(p[i]) {
+            c = c +| 1;
+            // 中文标点是 3 字节，跳过其余两字节
+            if p[i] == 0xEF as byte && i + 2 < n {
+                i = i + 2;
+            }
+        }
+        i = i + 1;
+    }
+    return c;
+}
+
+// 时长（毫秒）：对白 4.5 字/秒 + 标点 0.3 s；动作 8 字/秒
+fn ms_for(cps: i64, puncts: i64, ch_per_sec: i64) i64 {
+    var ms: i64 = 0;
+    if ch_per_sec > 0 {
+        ms = ms +| ((cps *| 1000) / ch_per_sec);
+    }
+    ms = ms +| (puncts *| 300);
+    return ms;
+}
+
+// 结构校验
+export fn story_validate(buf: &const byte, n: usize) i32 {
+    var ts: [usize: 1] = [0];
+    var tl: [usize: 1] = [0];
+    if j_span(buf, n, "title" as &const byte, &ts[0], &tl[0]) != 34 as byte {
+        return 90;
+    }
+    if tl[0] < 3 {
+        return 90;
+    }
+    var ss: [usize: 1] = [0];
+    var sl: [usize: 1] = [0];
+    if j_span(buf, n, "scenes" as &const byte, &ss[0], &sl[0]) != 91 as byte {
+        return 91;
+    }
+    var hs: [usize: 1] = [0];
+    var hl: [usize: 1] = [0];
+    if j_span(buf, n, "hook" as &const byte, &hs[0], &hl[0]) != 34 as byte {
+        return 93;
+    }
+    if hl[0] < 3 {
+        return 93;
+    }
+    var idx: usize = 0;
+    while true {
+        var es: [usize: 1] = [0];
+        var el: [usize: 1] = [0];
+        if !j_arr_item(&buf[ss[0]], sl[0], idx, &es[0], &el[0]) {
+            break;
+        }
+        const sc: &const byte = &buf[ss[0] + es[0]];
+        var ns: [usize: 1] = [0];
+        var nl: [usize: 1] = [0];
+        if j_span(sc, el[0], "no" as &const byte, &ns[0], &nl[0]) == 0 as byte {
+            return 92;
+        }
+        var as_: [usize: 1] = [0];
+        var al: [usize: 1] = [0];
+        if j_span(sc, el[0], "action" as &const byte, &as_[0],
+            &al[0]) != 34 as byte {
+            return 92;
+        }
+        idx = idx + 1;
+    }
+    if idx == 0 {
+        return 91;
+    }
+    return 0;
+}
+
+// 审查报告：确定性检查的完整清单 + 审核版本 ID（剧本内容 SHA-256 前 16 位）
+// 返回码：0 报告已出（ok 字段说明过没过）94 读失败
+export fn story_review(sp: &const byte, n: usize, out: &[byte],
+    out_len: &usize) i32 {
+    out_len[0] = 0;
+    var hex: [byte: 64] = [0: 64];
+    var hls: [usize: 1] = [0];
+    if !sha256_hex(sp, n, &hex[0: 64], &hls[0]) {
+        return 94;
+    }
+    var codes: [i32: 8] = [0: 8];
+    var bad: usize = 0;
+    const vr: i32 = story_validate(sp, n);
+    if vr != 0 && bad < 8 {
+        codes[bad] = vr;
+        bad = bad + 1;
+    }
+    // 创作四件套：主题 / 冲突 / 反转（缺了记进问题清单，但不拦批准）
+    var ks: [usize: 1] = [0];
+    var kl: [usize: 1] = [0];
+    if j_span(sp, n, "theme" as &const byte, &ks[0], &kl[0]) != 34 as byte
+        || kl[0] < 4 {
+        if bad < 8 {
+            codes[bad] = 81;
+            bad = bad + 1;
+        }
+    }
+    if j_span(sp, n, "conflict" as &const byte, &ks[0], &kl[0]) != 34 as byte
+        || kl[0] < 4 {
+        if bad < 8 {
+            codes[bad] = 82;
+            bad = bad + 1;
+        }
+    }
+    if j_span(sp, n, "twist" as &const byte, &ks[0], &kl[0]) != 34 as byte
+        || kl[0] < 4 {
+        if bad < 8 {
+            codes[bad] = 83;
+            bad = bad + 1;
+        }
+    }
+    // 喜剧结构：setup 与 payoff 都要有，缺一个就不算"结构"
+    var cs: [usize: 1] = [0];
+    var cl2: [usize: 1] = [0];
+    if j_span(sp, n, "comedy" as &const byte, &cs[0],
+        &cl2[0]) != 123 as byte {
+        if bad < 8 {
+            codes[bad] = 84;
+            bad = bad + 1;
+        }
+    } else {
+        const cb: &const byte = &sp[cs[0]];
+        if j_span(cb, cl2[0], "setup" as &const byte, &ks[0],
+            &kl[0]) != 34 as byte || kl[0] < 3 {
+            if bad < 8 {
+                codes[bad] = 84;
+                bad = bad + 1;
+            }
+        }
+        if j_span(cb, cl2[0], "payoff" as &const byte, &ks[0],
+            &kl[0]) != 34 as byte || kl[0] < 3 {
+            if bad < 8 {
+                codes[bad] = 84;
+                bad = bad + 1;
+            }
+        }
+    }
+    var sn: i64 = 0;
+    var ss: [usize: 1] = [0];
+    var sl: [usize: 1] = [0];
+    if j_span(sp, n, "scenes" as &const byte, &ss[0], &sl[0]) == 91 as byte {
+        var idx: usize = 0;
+        while true {
+            var es: [usize: 1] = [0];
+            var el: [usize: 1] = [0];
+            if !j_arr_item(&sp[ss[0]], sl[0], idx, &es[0], &el[0]) {
+                break;
+            }
+            const sc: &const byte = &sp[ss[0] + es[0]];
+            var ds: [usize: 1] = [0];
+            var dl2: [usize: 1] = [0];
+            if j_span(sc, el[0], "dialogue" as &const byte, &ds[0],
+                &dl2[0]) == 91 as byte {
+                var k: usize = 0;
+                while true {
+                    var ls: [usize: 1] = [0];
+                    var ll: [usize: 1] = [0];
+                    if !j_arr_item(&sc[ds[0]], dl2[0], k, &ls[0],
+                        &ll[0]) {
+                        break;
+                    }
+                    const ln: &const byte = &sc[ds[0] + ls[0]];
+                    var lns: [usize: 1] = [0];
+                    var lnl: [usize: 1] = [0];
+                    if j_span(ln, ll[0], "line" as &const byte, &lns[0],
+                        &lnl[0]) != 34 as byte || lnl[0] <= 2 {
+                        if bad < 8 {
+                            codes[bad] = 97;
+                            bad = bad + 1;
+                        }
+                    } else if lnl[0] > 90 {
+                        // 一行说不完的台词就是听不懂的台词（字节口径，
+                        // 中文 3 字节/字 ⇒ 约 30 字）
+                        if bad < 8 {
+                            codes[bad] = 85;
+                            bad = bad + 1;
+                        }
+                    }
+                    k = k + 1;
+                }
+            }
+            idx = idx + 1;
+            sn = sn + 1;
+        }
+    }
+    var evn: i64 = 0;
+    var es2: [usize: 1] = [0];
+    var el2: [usize: 1] = [0];
+    if j_span(sp, n, "candidate_events" as &const byte, &es2[0],
+        &el2[0]) == 91 as byte {
+        var k: usize = 0;
+        while true {
+            var xs: [usize: 1] = [0];
+            var xl: [usize: 1] = [0];
+            if !j_arr_item(&sp[es2[0]], el2[0], k, &xs[0], &xl[0]) {
+                break;
+            }
+            evn = evn +| 1;
+            k = k + 1;
+        }
+    }
+    if evn == 0 && bad < 8 {
+        codes[bad] = 98;
+        bad = bad + 1;
+    }
+    var w: usize = 0;
+    w = w + j_put(out, w, "{\"ok\":" as &const byte);
+    if bad == 0 {
+        w = w + j_put(out, w, "true" as &const byte);
+    } else {
+        w = w + j_put(out, w, "false" as &const byte);
+    }
+    w = w + j_put(out, w, ",\"review_id\":\"" as &const byte);
+    var hn: usize = hls[0];
+    if hn > 16 {
+        hn = 16;
+    }
+    w = w + j_put_raw(out, w, &hex[0], hn);
+    w = w + j_put(out, w, "\",\"scenes\":" as &const byte);
+    w = w + j_put_i64(out, w, sn);
+    w = w + j_put(out, w, ",\"candidate_events\":" as &const byte);
+    w = w + j_put_i64(out, w, evn);
+    w = w + j_put(out, w, ",\"issues\":[" as &const byte);
+    var i: usize = 0;
+    while i < bad {
+        if i > 0 {
+            w = w + j_put(out, w, "," as &const byte);
+        }
+        w = w + j_put(out, w, "{\"code\":\"" as &const byte);
+        w = w + j_put(out, w, rev_code(codes[i]));
+        w = w + j_put(out, w, "\"}" as &const byte);
+        i = i + 1;
+    }
+    w = w + j_put(out, w, "]}" as &const byte);
+    out_len[0] = w;
+    return 0;
+}
+
+fn rev_code(rc: i32) &const byte {
+    if rc == 90 {
+        return "MISSING_TITLE" as &const byte;
+    }
+    if rc == 91 {
+        return "MISSING_SCENES" as &const byte;
+    }
+    if rc == 92 {
+        return "SCENE_FIELD" as &const byte;
+    }
+    if rc == 93 {
+        return "MISSING_HOOK" as &const byte;
+    }
+    if rc == 97 {
+        return "EMPTY_LINE" as &const byte;
+    }
+    if rc == 98 {
+        return "NO_EVENTS" as &const byte;
+    }
+    if rc == 81 {
+        return "MISSING_THEME" as &const byte;
+    }
+    if rc == 82 {
+        return "MISSING_CONFLICT" as &const byte;
+    }
+    if rc == 83 {
+        return "MISSING_TWIST" as &const byte;
+    }
+    if rc == 84 {
+        return "COMEDY_INCOMPLETE" as &const byte;
+    }
+    if rc == 85 {
+        return "LINE_TOO_LONG" as &const byte;
+    }
+    return "INVALID" as &const byte;
+}
+
+// 时长估算（毫秒）
+export fn story_duration_ms(buf: &const byte, n: usize) i64 {
+    var ms: i64 = 0;
+    var ss: [usize: 1] = [0];
+    var sl: [usize: 1] = [0];
+    if j_span(buf, n, "scenes" as &const byte, &ss[0], &sl[0]) != 91 as byte {
+        return 0;
+    }
+    var idx: usize = 0;
+    while true {
+        var es: [usize: 1] = [0];
+        var el: [usize: 1] = [0];
+        if !j_arr_item(&buf[ss[0]], sl[0], idx, &es[0], &el[0]) {
+            break;
+        }
+        const sc: &const byte = &buf[ss[0] + es[0]];
+        var as_: [usize: 1] = [0];
+        var al: [usize: 1] = [0];
+        if j_span(sc, el[0], "action" as &const byte, &as_[0],
+            &al[0]) == 34 as byte && al[0] > 2 {
+            const txt: &const byte = &sc[as_[0] + 1];
+            const tn: usize = al[0] - 2;
+            ms = ms +| ms_for(cp_count(txt, tn), punct_count(txt, tn), 8);
+        }
+        var ds: [usize: 1] = [0];
+        var dl: [usize: 1] = [0];
+        if j_span(sc, el[0], "dialogue" as &const byte, &ds[0],
+            &dl[0]) == 91 as byte {
+            var j: usize = 0;
+            while true {
+                var ls: [usize: 1] = [0];
+                var ll: [usize: 1] = [0];
+                if !j_arr_item(&sc[ds[0]], dl[0], j, &ls[0], &ll[0]) {
+                    break;
+                }
+                const line: &const byte = &sc[ds[0] + ls[0]];
+                var xs: [usize: 1] = [0];
+                var xl: [usize: 1] = [0];
+                if j_span(line, ll[0], "line" as &const byte, &xs[0],
+                    &xl[0]) == 34 as byte && xl[0] > 2 {
+                    const txt: &const byte = &line[xs[0] + 1];
+                    const tn: usize = xl[0] - 2;
+                    ms = ms +| ms_for(cp_count(txt, tn),
+                        punct_count(txt, tn), 4);
+                }
+                j = j + 1;
+            }
+        }
+        idx = idx + 1;
+    }
+    return ms;
+}
+
+// ---- 版本存储 ----
+
+fn scripts_dir(root: &const byte, rn: usize, id: &const byte, idn: usize,
+    out: &[byte], out_len: &usize) bool {
+    var pdir: [byte: 512] = [0: 512];
+    var pdl: usize = 0;
+    if !path_join(root, rn, "projects" as &const byte, 8,
+        &pdir[0: 512], &pdl) {
+        return false;
+    }
+    var dir: [byte: 512] = [0: 512];
+    var dl: usize = 0;
+    if !path_join(&pdir[0], pdl, id, idn, &dir[0: 512], &dl) {
+        return false;
+    }
+    return path_join(&dir[0], dl, SCRIPT_DIR, b_len(SCRIPT_DIR), out,
+        out_len);
+}
+
+fn script_name(version: i64, out: &[byte]) usize {
+    var w: usize = 0;
+    w = w + j_put_raw(out, w, "v" as &const byte, 1);
+    w = w + j_put_i64(out, w, version);
+    w = w + j_put_raw(out, w, ".json" as &const byte, 5);
+    return w;
+}
+
+export fn story_current_version(root: &const byte, rn: usize,
+    id: &const byte, idn: usize) i64 {
+    var dpath: [byte: 512] = [0: 512];
+    var dl: usize = 0;
+    if !scripts_dir(root, rn, id, idn, &dpath[0: 512], &dl) {
+        return 0;
+    }
+    var buf: [byte: 128] = [0: 128];
+    var bl: usize = 0;
+    if !read_file(&dpath[0], dl, "current.json" as &const byte, 12,
+        &buf[0], 128, &bl) {
+        return 0;
+    }
+    var st: [usize: 1] = [0];
+    var ln: [usize: 1] = [0];
+    if j_span(&buf[0], bl, "version" as &const byte, &st[0],
+        &ln[0]) == 0 as byte {
+        return 0;
+    }
+    var i: usize = 0;
+    var v: i64 = 0;
+    while i < ln[0] {
+        const c: byte = buf[st[0] + i];
+        if c < 48 as byte || c > 57 as byte {
+            break;
+        }
+        v = v *| 10;
+        v = v +| ((c as i64) -| 48);
+        i = i + 1;
+    }
+    return v;
+}
+
+// 存一版剧本；返回新版本号
+export fn story_save(root: &const byte, rn: usize, id: &const byte,
+    idn: usize, content: &const byte, cn: usize, out: &[byte],
+    out_len: &usize) i32 {
+    out_len[0] = 0;
+    if !project_id_ok(id, idn) {
+        return 95;
+    }
+    var dpath: [byte: 512] = [0: 512];
+    var dl: usize = 0;
+    if !scripts_dir(root, rn, id, idn, &dpath[0: 512], &dl) {
+        return 95;
+    }
+    const ver: i64 = story_current_version(root, rn, id, idn) +| 1;
+    var hex: [byte: 64] = [0: 64];
+    var hl: [usize: 1] = [0];
+    if !sha256_hex(content, cn, &hex[0: 64], &hl[0]) {
+        return 95;
+    }
+    var body: [byte: SCRIPT_BUF] = [0: SCRIPT_BUF];
+    var w: usize = 0;
+    w = w + j_put(&body[0: SCRIPT_BUF], w,
+        "{\"format_version\":1,\"version\":" as &const byte);
+    w = w + j_put_i64(&body[0: SCRIPT_BUF], w, ver);
+    w = w + j_put(&body[0: SCRIPT_BUF], w,
+        ",\"content_hash\":\"" as &const byte);
+    w = w + j_put_raw(&body[0: SCRIPT_BUF], w, &hex[0], hl[0]);
+    w = w + j_put(&body[0: SCRIPT_BUF], w, "\",\"screenplay\":" as &const byte);
+    w = w + j_put_raw(&body[0: SCRIPT_BUF], w, content, cn);
+    w = w + j_put(&body[0: SCRIPT_BUF], w, "}" as &const byte);
+    var nm: [byte: 32] = [0: 32];
+    const nn: usize = script_name(ver, &nm[0: 32]);
+    if !write_atomic(&dpath[0], dl, &nm[0], nn, &body[0], w) {
+        return 95;
+    }
+    var cur: [byte: 128] = [0: 128];
+    var cw: usize = 0;
+    cw = cw + j_put(&cur[0: 128], cw, "{\"version\":" as &const byte);
+    cw = cw + j_put_i64(&cur[0: 128], cw, ver);
+    cw = cw + j_put(&cur[0: 128], cw, "}" as &const byte);
+    if !write_atomic(&dpath[0], dl, "current.json" as &const byte, 12,
+        &cur[0], cw) {
+        return 95;
+    }
+    out_len[0] = 0;
+    return 0;
+}
+
+// 读某一版（version<=0 表示当前版）；返回的是整条记录（含 screenplay）
+export fn story_load(root: &const byte, rn: usize, id: &const byte,
+    idn: usize, version: i64, out: &[byte], out_len: &usize) i32 {
+    out_len[0] = 0;
+    var dpath: [byte: 512] = [0: 512];
+    var dl: usize = 0;
+    if !scripts_dir(root, rn, id, idn, &dpath[0: 512], &dl) {
+        return 94;
+    }
+    var v: i64 = version;
+    if v <= 0 {
+        v = story_current_version(root, rn, id, idn);
+    }
+    if v <= 0 {
+        return 96;
+    }
+    var nm: [byte: 32] = [0: 32];
+    const nn: usize = script_name(v, &nm[0: 32]);
+    if !read_file(&dpath[0], dl, &nm[0], nn, &out[0], out.len, out_len) {
+        return 96;
+    }
+    return 0;
+}
+
+// 已批准记录：{"script_version":N,"canon_revision":R}
+// 作用：同一个剧本版本重复批准时直接回放上次结果，不重复应用事件。
+export fn story_approved(root: &const byte, rn: usize, id: &const byte,
+    idn: usize, ver_out: &i64, rev_out: &i64) bool {
+    ver_out[0] = 0;
+    rev_out[0] = 0;
+    var dpath: [byte: 512] = [0: 512];
+    var dl: usize = 0;
+    if !scripts_dir(root, rn, id, idn, &dpath[0: 512], &dl) {
+        return false;
+    }
+    var buf: [byte: 256] = [0: 256];
+    var bl: usize = 0;
+    if !read_file(&dpath[0], dl, "approved.json" as &const byte, 13,
+        &buf[0], 256, &bl) {
+        return false;
+    }
+    ver_out[0] = num_of(&buf[0], bl, "script_version" as &const byte);
+    rev_out[0] = num_of(&buf[0], bl, "canon_revision" as &const byte);
+    return true;
+}
+
+export fn story_mark_approved(root: &const byte, rn: usize, id: &const byte,
+    idn: usize, ver: i64, rev: i64, over_ver: i64, ep: i64,
+    rid: &const byte, ridn: usize) bool {
+    var dpath: [byte: 512] = [0: 512];
+    var dl: usize = 0;
+    if !scripts_dir(root, rn, id, idn, &dpath[0: 512], &dl) {
+        return false;
+    }
+    var b: [byte: 128] = [0: 128];
+    var w: usize = 0;
+    w = w + j_put(&b[0: 128], w, "{\"script_version\":" as &const byte);
+    w = w + j_put_i64(&b[0: 128], w, ver);
+    w = w + j_put(&b[0: 128], w, ",\"canon_revision\":" as &const byte);
+    w = w + j_put_i64(&b[0: 128], w, rev);
+    // 剧本追到批准过的大纲（没有大纲就记 0，仍可单集跑）
+    w = w + j_put(&b[0: 128], w, ",\"outline_version\":" as &const byte);
+    w = w + j_put_i64(&b[0: 128], w, over_ver);
+    w = w + j_put(&b[0: 128], w, ",\"episode\":" as &const byte);
+    w = w + j_put_i64(&b[0: 128], w, ep);
+    w = w + j_put(&b[0: 128], w, ",\"review_id\":\"" as &const byte);
+    w = w + j_put_raw(&b[0: 128], w, rid, ridn);
+    w = w + j_put(&b[0: 128], w, "\"}" as &const byte);
+    return write_atomic(&dpath[0], dl, "approved.json" as &const byte, 13,
+        &b[0], w);
+}
+
+fn num_of(buf: &const byte, n: usize, key: &const byte) i64 {
+    var st: [usize: 1] = [0];
+    var ln: [usize: 1] = [0];
+    if j_span(buf, n, key, &st[0], &ln[0]) == 0 as byte {
+        return 0;
+    }
+    var i: usize = 0;
+    var v: i64 = 0;
+    while i < ln[0] {
+        const c: byte = buf[st[0] + i];
+        if c < 48 as byte || c > 57 as byte {
+            break;
+        }
+        v = v *| 10;
+        v = v +| ((c as i64) -| 48);
+        i = i + 1;
+    }
+    return v;
+}
+
+export fn story_put_hook_events(out: &[byte], src: &const byte, sn: usize,
+    ep: i64, close_prev: bool) usize {
+    var w: usize = 0;
+    const keep: usize = if sn > 1 { sn - 1 } else { 0 as usize };
+    w = w + j_put_raw(out, w, src, keep);
+    if close_prev && ep > 1 {
+        w = w + j_put(out, w, "," as &const byte);
+        w = w + j_put(out, w,
+            "{\"type\":\"promise.close\",\"promise\":\"hook_" as
+            &const byte);
+        w = w + j_put_i64(out, w, ep -| 1);
+        w = w + j_put(out, w, "\"}" as &const byte);
+    }
+    w = w + j_put(out, w, "," as &const byte);
+    w = w + j_put(out, w,
+        "{\"type\":\"promise.open\",\"promise\":\"hook_" as
+        &const byte);
+    w = w + j_put_i64(out, w, ep);
+    w = w + j_put(out, w, "\",\"due_ep\":" as &const byte);
+    w = w + j_put_i64(out, w, ep +| 1);
+    w = w + j_put(out, w, "}]" as &const byte);
+    return w;
+}

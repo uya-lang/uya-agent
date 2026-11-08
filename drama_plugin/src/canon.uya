@@ -1,0 +1,1691 @@
+// drama_plugin/src/canon.uya — 权威状态 + 提交记录 + 锁（P4 第一段）
+//
+// 权威状态（DESIGN §6.7）：只有事件能改状态，没有旁路写入。
+//   <root>/projects/<id>/canon.json         当前状态（format_version + revision）
+//   <root>/projects/<id>/commits/<rev>.json 不可变提交记录（含当次全量状态）
+//   <root>/projects/<id>/current.json       {"revision":N} 当前指针
+//   <root>/projects/<id>/locks/commit.lock  {pid, purpose} 单写者锁
+//
+// 崩溃恢复的口径：提交记录先落，再更新 canon/current。任何时刻 canon 落后于
+// 最新提交记录都能从记录里重建（记录里存了全量 state），所以"崩溃后能恢复到
+// 唯一正确 revision"不需要重放事件。
+//
+// 没有 fsync ⇒ rename 之后仍可能丢最后一次提交，这点写死在文档里，测试用
+// 杀进程而不是断电来验证。
+//
+// 事件类型（有限集合，禁止任意表达式）：
+//   scene.define / character.place / prop.define / prop.move /
+//   knowledge.grant / scene.set / timeline.advance / promise.open /
+//   promise.close / promise.waive（显式延期：原因 + 新 due_ep）
+//
+// 返回码：0 成功 50 ID 非法 51 锁被占 52 读失败 53 base_revision 冲突
+//         54 事件非法 55 写失败 56 状态不存在
+
+use libc.syscall;
+use libc.unistd;
+
+const MAX_OBJ: usize = 32;
+const NM: usize = 32;
+const VL: usize = 64;
+const BUF_SMALL: usize = 4096;
+const BUF_STATE: usize = 16384;
+
+// ---- 状态槽 ----
+
+struct PropSlot {
+    used: bool,
+    name: [byte: NM],
+    name_len: usize,
+    holder: [byte: NM],
+    holder_len: usize,
+    scene: [byte: NM],
+    scene_len: usize,
+}
+
+struct CharSlot {
+    used: bool,
+    name: [byte: NM],
+    name_len: usize,
+    scene: [byte: NM],
+    scene_len: usize,
+    knows: [byte: VL],
+    knows_len: usize,
+}
+
+struct SceneSlot {
+    used: bool,
+    name: [byte: NM],
+    name_len: usize,
+    tod: [byte: NM],
+    tod_len: usize,
+    variant: [byte: NM],
+    variant_len: usize,
+}
+
+struct PromiseSlot {
+    used: bool,
+    id: [byte: NM],
+    id_len: usize,
+    state: u8,          // 0 = open, 1 = closed
+    waived: bool,       // 显式延期：仍 open，但不再算逾期
+    due_ep: i64,
+    reason: [byte: VL],
+    reason_len: usize,
+}
+
+// 世界规则：只可扩展、不可推翻（改同一条规则的文本就是 RULE_VIOLATION）
+struct RuleSlot {
+    used: bool,
+    id: [byte: NM],
+    id_len: usize,
+    hash: [byte: 64],
+    hash_len: usize,
+}
+
+struct State {
+    revision: i64,
+    timeline: i64,
+    props: [PropSlot: MAX_OBJ],
+    chars: [CharSlot: MAX_OBJ],
+    scenes: [SceneSlot: MAX_OBJ],
+    promises: [PromiseSlot: MAX_OBJ],
+    rules: [RuleSlot: MAX_OBJ],
+    prop_n: usize,
+    char_n: usize,
+    scene_n: usize,
+    promise_n: usize,
+    rule_n: usize,
+}
+
+// 出错对象的名字（道具/场景/角色/承诺/规则的 id），供错误信息定位
+var g_obj: [byte: 32] = [0: 32];
+var g_obj_len: usize = 0;
+
+fn set_obj(name: &const byte, n: usize) void {
+    // 全局数组的切片在这里会被推断成 int32 切片，干脆手写拷贝
+    var i: usize = 0;
+    while i < n {
+        if i >= 32 {
+            break;
+        }
+        g_obj[i] = name[i];
+        i = i + 1;
+    }
+    g_obj_len = i;
+}
+
+export fn canon_last_obj() &const byte {
+    return &g_obj[0];
+}
+
+export fn canon_last_obj_len() usize {
+    return g_obj_len;
+}
+
+fn clear_obj() void {
+    g_obj_len = 0;
+    g_obj[0] = 0 as byte;
+}
+
+fn blank_state() State {
+    return State{ revision: 0, timeline: 0,
+        props: [PropSlot{ used: false, name: [0: NM], name_len: 0,
+            holder: [0: NM], holder_len: 0, scene: [0: NM],
+            scene_len: 0 }: MAX_OBJ],
+        chars: [CharSlot{ used: false, name: [0: NM], name_len: 0,
+            scene: [0: NM], scene_len: 0, knows: [0: VL], knows_len: 0
+            }: MAX_OBJ],
+        scenes: [SceneSlot{ used: false, name: [0: NM], name_len: 0,
+            tod: [0: NM], tod_len: 0, variant: [0: NM],
+            variant_len: 0 }: MAX_OBJ],
+        promises: [PromiseSlot{ used: false, id: [0: NM], id_len: 0,
+            state: 0, waived: false, due_ep: 0, reason: [0: VL],
+            reason_len: 0 }: MAX_OBJ],
+        rules: [RuleSlot{ used: false, id: [0: NM], id_len: 0,
+            hash: [0: 64], hash_len: 0 }: MAX_OBJ],
+        prop_n: 0, char_n: 0, scene_n: 0, promise_n: 0, rule_n: 0 };
+}
+
+// ---- 小工具 ----
+
+fn eq(a: &const byte, an: usize, b: &const byte, bn: usize) bool {
+    if an != bn {
+        return false;
+    }
+    var i: usize = 0;
+    while i < an {
+        if a[i] != b[i] {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn setstr(dst: &[byte], dst_len: &usize, v: &const byte, vn: usize) void {
+    var l: usize = 0;
+    _ = copy_to(v, vn, dst, &l);
+    dst_len[0] = l;
+}
+
+fn get_str(obj: &const byte, n: usize, key: &const byte, out: &[byte],
+    out_len: &usize) bool {
+    return j_str(obj, n, key, out, out_len);
+}
+
+fn get_i64(obj: &const byte, n: usize, key: &const byte, dflt: i64) i64 {
+    var st: [usize: 1] = [0];
+    var ln: [usize: 1] = [0];
+    const k: byte = j_span(obj, n, key, &st[0], &ln[0]);
+    if k == 0 as byte || k == 34 as byte || k == 123 as byte {
+        return dflt;
+    }
+    var i: usize = 0;
+    var neg: bool = false;
+    var v: i64 = 0;
+    if ln[0] > 0 && obj[st[0]] == 45 as byte {
+        neg = true;
+        i = 1;
+    }
+    while i < ln[0] {
+        const c: byte = obj[st[0] + i];
+        if c < 48 as byte || c > 57 as byte {
+            break;
+        }
+        v = v *| 10;
+        v = v +| (c as i64) -| 48;
+        i = i + 1;
+    }
+    if neg {
+        return 0 -| v;
+    }
+    return v;
+}
+
+fn find_prop(s: &const State, name: &const byte, n: usize) isize {
+    var i: usize = 0;
+    while i < s.prop_n {
+        if eq(&s.props[i].name[0: NM], s.props[i].name_len, name, n) {
+            return i as isize;
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn find_char(s: &const State, name: &const byte, n: usize) isize {
+    var i: usize = 0;
+    while i < s.char_n {
+        if eq(&s.chars[i].name[0: NM], s.chars[i].name_len, name, n) {
+            return i as isize;
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn find_scene(s: &const State, name: &const byte, n: usize) isize {
+    var i: usize = 0;
+    while i < s.scene_n {
+        if eq(&s.scenes[i].name[0: NM], s.scenes[i].name_len, name, n) {
+            return i as isize;
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn find_promise(s: &const State, id: &const byte, n: usize) isize {
+    var i: usize = 0;
+    while i < s.promise_n {
+        if eq(&s.promises[i].id[0: NM], s.promises[i].id_len, id, n) {
+            return i as isize;
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+// ---- 状态 → JSON ----
+
+fn put_props(s: &const State, out: &[byte], w0: usize) usize {
+    var w: usize = w0;
+    var i: usize = 0;
+    while i < s.prop_n {
+        if i > 0 {
+            w = w + j_put(out, w, "," as &const byte);
+        }
+        w = w + j_put(out, w, "{\"name\":" as &const byte);
+        w = w + j_put_str(out, w, &s.props[i].name[0: NM], s.props[i].name_len);
+        w = w + j_put(out, w, ",\"holder\":" as &const byte);
+        w = w + j_put_str(out, w, &s.props[i].holder[0: NM],
+            s.props[i].holder_len);
+        w = w + j_put(out, w, ",\"scene\":" as &const byte);
+        w = w + j_put_str(out, w, &s.props[i].scene[0: NM],
+            s.props[i].scene_len);
+        w = w + j_put(out, w, "}" as &const byte);
+        i = i + 1;
+    }
+    return w;
+}
+
+fn put_chars(s: &const State, out: &[byte], w0: usize) usize {
+    var w: usize = w0;
+    var i: usize = 0;
+    while i < s.char_n {
+        if i > 0 {
+            w = w + j_put(out, w, "," as &const byte);
+        }
+        w = w + j_put(out, w, "{\"name\":" as &const byte);
+        w = w + j_put_str(out, w, &s.chars[i].name[0: NM], s.chars[i].name_len);
+        w = w + j_put(out, w, ",\"scene\":" as &const byte);
+        w = w + j_put_str(out, w, &s.chars[i].scene[0: NM],
+            s.chars[i].scene_len);
+        w = w + j_put(out, w, ",\"knows\":" as &const byte);
+        w = w + j_put_str(out, w, &s.chars[i].knows[0: NM],
+            s.chars[i].knows_len);
+        w = w + j_put(out, w, "}" as &const byte);
+        i = i + 1;
+    }
+    return w;
+}
+
+fn put_scenes(s: &const State, out: &[byte], w0: usize) usize {
+    var w: usize = w0;
+    var i: usize = 0;
+    while i < s.scene_n {
+        if i > 0 {
+            w = w + j_put(out, w, "," as &const byte);
+        }
+        w = w + j_put(out, w, "{\"name\":" as &const byte);
+        w = w + j_put_str(out, w, &s.scenes[i].name[0: NM],
+            s.scenes[i].name_len);
+        w = w + j_put(out, w, ",\"time_of_day\":" as &const byte);
+        w = w + j_put_str(out, w, &s.scenes[i].tod[0: NM],
+            s.scenes[i].tod_len);
+        w = w + j_put(out, w, ",\"variant\":" as &const byte);
+        w = w + j_put_str(out, w, &s.scenes[i].variant[0: NM],
+            s.scenes[i].variant_len);
+        w = w + j_put(out, w, "}" as &const byte);
+        i = i + 1;
+    }
+    return w;
+}
+
+fn put_promises(s: &const State, out: &[byte], w0: usize) usize {
+    var w: usize = w0;
+    var i: usize = 0;
+    while i < s.promise_n {
+        if i > 0 {
+            w = w + j_put(out, w, "," as &const byte);
+        }
+        w = w + j_put(out, w, "{\"id\":" as &const byte);
+        w = w + j_put_str(out, w, &s.promises[i].id[0: NM],
+            s.promises[i].id_len);
+        w = w + j_put(out, w, ",\"state\":\"" as &const byte);
+        if s.promises[i].state == 0 {
+            w = w + j_put(out, w, "open" as &const byte);
+        } else {
+            w = w + j_put(out, w, "closed" as &const byte);
+        }
+        w = w + j_put(out, w, "\"" as &const byte);
+        if s.promises[i].due_ep > 0 {
+            w = w + j_put(out, w, ",\"due_ep\":" as &const byte);
+            w = w + j_put_i64(out, w, s.promises[i].due_ep);
+        }
+        if s.promises[i].waived {
+            w = w + j_put(out, w, ",\"waived\":true," as &const byte);
+            w = w + j_put(out, w, "\"reason\":" as &const byte);
+            w = w + j_put_str(out, w, &s.promises[i].reason[0: VL],
+                s.promises[i].reason_len);
+        }
+        w = w + j_put(out, w, "}" as &const byte);
+        i = i + 1;
+    }
+    return w;
+}
+
+fn put_rules(s: &const State, out: &[byte], w0: usize) usize {
+    var w: usize = w0;
+    var i: usize = 0;
+    while i < s.rule_n {
+        if i > 0 {
+            w = w + j_put(out, w, "," as &const byte);
+        }
+        w = w + j_put(out, w, "{\"id\":" as &const byte);
+        w = w + j_put_str(out, w, &s.rules[i].id[0], s.rules[i].id_len);
+        w = w + j_put(out, w, ",\"hash\":\"" as &const byte);
+        w = w + j_put_raw(out, w, &s.rules[i].hash[0],
+            s.rules[i].hash_len);
+        w = w + j_put(out, w, "\"}" as &const byte);
+        i = i + 1;
+    }
+    return w;
+}
+
+export fn canon_serialize(s: &const State, out: &[byte]) usize {
+    var w: usize = 0;
+    w = w + j_put(out, w, "{\"format_version\":1,\"revision\":" as &const byte);
+    w = w + j_put_i64(out, w, s.revision);
+    w = w + j_put(out, w, ",\"timeline\":" as &const byte);
+    w = w + j_put_i64(out, w, s.timeline);
+    w = w + j_put(out, w, ",\"props\":[" as &const byte);
+    w = put_props(s, out, w);
+    w = w + j_put(out, w, "],\"characters\":[" as &const byte);
+    w = put_chars(s, out, w);
+    w = w + j_put(out, w, "],\"scenes\":[" as &const byte);
+    w = put_scenes(s, out, w);
+    w = w + j_put(out, w, "],\"promises\":[" as &const byte);
+    w = put_promises(s, out, w);
+    w = w + j_put(out, w, "],\"rules\":[" as &const byte);
+    w = put_rules(s, out, w);
+    w = w + j_put(out, w, "]}" as &const byte);
+    return w;
+}
+
+// ---- JSON → 状态 ----
+
+fn load_props(s: &State, buf: &const byte, n: usize) void {
+    var ist: [usize: 1] = [0];
+    var iln: [usize: 1] = [0];
+    if j_span(buf, n, "props" as &const byte, &ist[0], &iln[0]) != 91 as byte {
+        return;
+    }
+    var idx: usize = 0;
+    while s.prop_n < MAX_OBJ {
+        var es: [usize: 1] = [0];
+        var el: [usize: 1] = [0];
+        if !j_arr_item(&buf[ist[0]], iln[0], idx, &es[0], &el[0]) {
+            break;
+        }
+        const o: &const byte = &buf[ist[0] + es[0]];
+        s.props[s.prop_n].used = true;
+        get_str(o, el[0], "name" as &const byte, &s.props[s.prop_n].name[0: NM],
+            &s.props[s.prop_n].name_len);
+        get_str(o, el[0], "holder" as &const byte,
+            &s.props[s.prop_n].holder[0: NM], &s.props[s.prop_n].holder_len);
+        get_str(o, el[0], "scene" as &const byte,
+            &s.props[s.prop_n].scene[0: NM], &s.props[s.prop_n].scene_len);
+        s.prop_n = s.prop_n + 1;
+        idx = idx + 1;
+    }
+}
+
+fn load_chars(s: &State, buf: &const byte, n: usize) void {
+    var ist: [usize: 1] = [0];
+    var iln: [usize: 1] = [0];
+    const k: byte = j_span(buf, n, "characters" as &const byte,
+        &ist[0], &iln[0]);
+    if k != 91 as byte {
+        return;
+    }
+    var idx: usize = 0;
+    while s.char_n < MAX_OBJ {
+        var es: [usize: 1] = [0];
+        var el: [usize: 1] = [0];
+        if !j_arr_item(&buf[ist[0]], iln[0], idx, &es[0], &el[0]) {
+            break;
+        }
+        const o: &const byte = &buf[ist[0] + es[0]];
+        s.chars[s.char_n].used = true;
+        get_str(o, el[0], "name" as &const byte, &s.chars[s.char_n].name[0: NM],
+            &s.chars[s.char_n].name_len);
+        get_str(o, el[0], "scene" as &const byte,
+            &s.chars[s.char_n].scene[0: NM], &s.chars[s.char_n].scene_len);
+        get_str(o, el[0], "knows" as &const byte,
+            &s.chars[s.char_n].knows[0: NM], &s.chars[s.char_n].knows_len);
+        s.char_n = s.char_n + 1;
+        idx = idx + 1;
+    }
+}
+
+fn load_scenes(s: &State, buf: &const byte, n: usize) void {
+    var ist: [usize: 1] = [0];
+    var iln: [usize: 1] = [0];
+    const k: byte = j_span(buf, n, "scenes" as &const byte,
+        &ist[0], &iln[0]);
+    if k != 91 as byte {
+        return;
+    }
+    var idx: usize = 0;
+    while s.scene_n < MAX_OBJ {
+        var es: [usize: 1] = [0];
+        var el: [usize: 1] = [0];
+        if !j_arr_item(&buf[ist[0]], iln[0], idx, &es[0], &el[0]) {
+            break;
+        }
+        const o: &const byte = &buf[ist[0] + es[0]];
+        s.scenes[s.scene_n].used = true;
+        get_str(o, el[0], "name" as &const byte,
+            &s.scenes[s.scene_n].name[0: NM], &s.scenes[s.scene_n].name_len);
+        get_str(o, el[0], "time_of_day" as &const byte,
+            &s.scenes[s.scene_n].tod[0: NM], &s.scenes[s.scene_n].tod_len);
+        get_str(o, el[0], "variant" as &const byte,
+            &s.scenes[s.scene_n].variant[0: NM],
+            &s.scenes[s.scene_n].variant_len);
+        s.scene_n = s.scene_n + 1;
+        idx = idx + 1;
+    }
+}
+
+// JSON 布尔字面量 true 的判断（j_span 对标量返回 's'）
+fn flag_true(o: &const byte, n: usize, key: &const byte) bool {
+    var st: [usize: 1] = [0];
+    var ln: [usize: 1] = [0];
+    if j_span(o, n, key, &st[0], &ln[0]) != 115 as byte || ln[0] != 4 {
+        return false;
+    }
+    return eq(&o[st[0]], 4, "true" as &const byte, 4);
+}
+
+fn load_promises(s: &State, buf: &const byte, n: usize) void {
+    var ist: [usize: 1] = [0];
+    var iln: [usize: 1] = [0];
+    const k: byte = j_span(buf, n, "promises" as &const byte,
+        &ist[0], &iln[0]);
+    if k != 91 as byte {
+        return;
+    }
+    var idx: usize = 0;
+    while s.promise_n < MAX_OBJ {
+        var es: [usize: 1] = [0];
+        var el: [usize: 1] = [0];
+        if !j_arr_item(&buf[ist[0]], iln[0], idx, &es[0], &el[0]) {
+            break;
+        }
+        const o: &const byte = &buf[ist[0] + es[0]];
+        s.promises[s.promise_n].used = true;
+        get_str(o, el[0], "id" as &const byte,
+            &s.promises[s.promise_n].id[0: NM],
+            &s.promises[s.promise_n].id_len);
+        var st: [byte: 16] = [0: 16];
+        var sl: usize = 0;
+        if get_str(o, el[0], "state" as &const byte, &st[0: 16], &sl)
+            && sl == 6 {
+            s.promises[s.promise_n].state = 1;
+        }
+        s.promises[s.promise_n].due_ep = get_i64(o, el[0],
+            "due_ep" as &const byte, 0);
+        if flag_true(o, el[0], "waived" as &const byte) {
+            s.promises[s.promise_n].waived = true;
+        }
+        get_str(o, el[0], "reason" as &const byte,
+            &s.promises[s.promise_n].reason[0: VL],
+            &s.promises[s.promise_n].reason_len);
+        s.promise_n = s.promise_n + 1;
+        idx = idx + 1;
+    }
+}
+
+// 把一条规则的字段填进槽里（单独一个函数，避免在循环里搬移结构体）
+fn fill_rule(dst: &RuleSlot, o: &const byte, on: usize) void {
+    dst.used = true;
+    get_str(o, on, "id" as &const byte, &dst.id[0: NM], &dst.id_len);
+    var hs: [usize: 1] = [0];
+    var hl: [usize: 1] = [0];
+    if j_span(o, on, "hash" as &const byte, &hs[0], &hl[0]) != 34 as byte {
+        return;
+    }
+    if hl[0] < 2 || hl[0] - 2 > 64 {
+        return;
+    }
+    var k: usize = 0;
+    while k < hl[0] - 2 {
+        if k >= 64 {
+            break;
+        }
+        dst.hash[k] = o[hs[0] + 1 + k];
+        k = k + 1;
+    }
+    dst.hash_len = hl[0] - 2;
+}
+
+fn load_rules(s: &State, buf: &const byte, n: usize) void {
+    var ist: [usize: 1] = [0];
+    var iln: [usize: 1] = [0];
+    if j_span(buf, n, "rules" as &const byte, &ist[0], &iln[0])
+        != 91 as byte {
+        return;
+    }
+    var idx: usize = 0;
+    while true {
+        const at: usize = s.rule_n;
+        if at >= MAX_OBJ {
+            break;
+        }
+        var es: [usize: 1] = [0];
+        var el: [usize: 1] = [0];
+        if !j_arr_item(&buf[ist[0]], iln[0], idx, &es[0], &el[0]) {
+            break;
+        }
+        if at < @len(s.rules) {
+            fill_rule(&s.rules[at], &buf[ist[0] + es[0]], el[0]);
+        }
+        s.rule_n = at + 1;
+        idx = idx + 1;
+    }
+}
+
+export fn canon_load(s: &State, buf: &const byte, n: usize) bool {
+    s[0] = blank_state();
+    if !fmt_version_ok_p(buf, n, 1) {
+        return false;
+    }
+    s.revision = get_i64(buf, n, "revision" as &const byte, 0);
+    s.timeline = get_i64(buf, n, "timeline" as &const byte, 0);
+    load_props(s, buf, n);
+    load_chars(s, buf, n);
+    load_scenes(s, buf, n);
+    load_promises(s, buf, n);
+    load_rules(s, buf, n);
+    return true;
+}
+
+// ---- 事件应用（有限操作符；不认识的类型直接拒） ----
+
+// 错误码：1 未知类型 2 道具不存在 3 场景不存在 4 知识泄漏 5 时间回退
+//         6 道具瞬移 7 角色不存在 8 承诺不存在
+fn apply_event(s: &State, ev: &const byte, n: usize) i32 {
+    var ty: [byte: NM] = [0: NM];
+    var tl: usize = 0;
+    if !get_str(ev, n, "type" as &const byte, &ty[0: NM], &tl) {
+        return 1;
+    }
+    if eq(&ty[0], tl, "scene.define" as &const byte, 12) {
+        return ev_scene_define(s, ev, n);
+    }
+    if eq(&ty[0], tl, "character.place" as &const byte, 15) {
+        return ev_character_place(s, ev, n);
+    }
+    if eq(&ty[0], tl, "prop.define" as &const byte, 11) {
+        return ev_prop_define(s, ev, n);
+    }
+    if eq(&ty[0], tl, "prop.move" as &const byte, 9) {
+        return ev_prop_move(s, ev, n);
+    }
+    if eq(&ty[0], tl, "knowledge.grant" as &const byte, 15) {
+        return ev_knowledge(s, ev, n);
+    }
+    if eq(&ty[0], tl, "scene.set" as &const byte, 9) {
+        return ev_scene_set(s, ev, n);
+    }
+    if eq(&ty[0], tl, "timeline.advance" as &const byte, 16) {
+        return ev_timeline(s, ev, n);
+    }
+    if eq(&ty[0], tl, "promise.open" as &const byte, 12) {
+        return ev_promise(s, ev, n, 0);
+    }
+    if eq(&ty[0], tl, "promise.close" as &const byte, 13) {
+        return ev_promise(s, ev, n, 1);
+    }
+    if eq(&ty[0], tl, "promise.waive" as &const byte, 13) {
+        return ev_promise(s, ev, n, 2);
+    }
+    if eq(&ty[0], tl, "rule.define" as &const byte, 11) {
+        return ev_rule_define(s, ev, n);
+    }
+    return 1;
+}
+
+fn ev_scene_define(s: &State, ev: &const byte, n: usize) i32 {
+    var nm: [byte: NM] = [0: NM];
+    var nl: usize = 0;
+    if !get_str(ev, n, "scene" as &const byte, &nm[0: NM], &nl) {
+        return 3;
+    }
+    var idx: isize = find_scene(s, &nm[0], nl);
+    var i: usize = 0;
+    if idx >= 0 {
+        i = idx as! usize catch { return 3; };
+    } else {
+        if s.scene_n >= MAX_OBJ {
+            return 3;
+        }
+        i = s.scene_n;
+        s.scene_n = s.scene_n + 1;
+        setstr(&s.scenes[i].name[0: NM], &s.scenes[i].name_len, &nm[0], nl);
+        s.scenes[i].used = true;
+    }
+    if i >= MAX_OBJ {
+        return 3;
+    }
+    var tod: [byte: NM] = [0: NM];
+    var tl: usize = 0;
+    if get_str(ev, n, "time_of_day" as &const byte, &tod[0: NM], &tl) {
+        setstr(&s.scenes[i].tod[0: NM], &s.scenes[i].tod_len, &tod[0], tl);
+    }
+    var vr: [byte: NM] = [0: NM];
+    var vl: usize = 0;
+    if get_str(ev, n, "variant" as &const byte, &vr[0: NM], &vl) {
+        // 陈设（variant）已经在用的时候，换它必须走 scene.set（有审批），
+        // 直接在 scene.define 里改就是穿帮。
+        if s.scenes[i].variant_len > 0 && vl > 0
+            && !eq(&s.scenes[i].variant[0], s.scenes[i].variant_len,
+                &vr[0], vl) {
+            return 9;   // SCENE_DRIFT
+        }
+        setstr(&s.scenes[i].variant[0: NM], &s.scenes[i].variant_len,
+            &vr[0], vl);
+    }
+    return 0;
+}
+
+fn ev_character_place(s: &State, ev: &const byte, n: usize) i32 {
+    var nm: [byte: NM] = [0: NM];
+    var nl: usize = 0;
+    var sc: [byte: NM] = [0: NM];
+    var sl: usize = 0;
+    if !get_str(ev, n, "character" as &const byte, &nm[0: NM], &nl) {
+        return 7;
+    }
+    if !get_str(ev, n, "scene" as &const byte, &sc[0: NM], &sl) {
+        return 3;
+    }
+    if find_scene(s, &sc[0], sl) < 0 {
+        set_obj(&sc[0], sl);
+        return 3;
+    }
+    const idx: isize = find_char(s, &nm[0], nl);
+    var i: usize = 0;
+    if idx >= 0 {
+        i = idx as! usize catch { return 7; };
+    } else {
+        if s.char_n >= MAX_OBJ {
+            return 7;
+        }
+        i = s.char_n;
+        s.char_n = s.char_n + 1;
+        setstr(&s.chars[i].name[0: NM], &s.chars[i].name_len, &nm[0], nl);
+        s.chars[i].used = true;
+    }
+    if i >= MAX_OBJ {
+        return 7;
+    }
+    setstr(&s.chars[i].scene[0: NM], &s.chars[i].scene_len, &sc[0], sl);
+    return 0;
+}
+
+fn ev_prop_define(s: &State, ev: &const byte, n: usize) i32 {
+    var nm: [byte: NM] = [0: NM];
+    var nl: usize = 0;
+    var sc: [byte: NM] = [0: NM];
+    var sl: usize = 0;
+    var hd: [byte: NM] = [0: NM];
+    var hl: usize = 0;
+    if !get_str(ev, n, "prop" as &const byte, &nm[0: NM], &nl) {
+        return 2;
+    }
+    if !get_str(ev, n, "scene" as &const byte, &sc[0: NM], &sl) {
+        return 3;
+    }
+    if find_scene(s, &sc[0], sl) < 0 {
+        set_obj(&sc[0], sl);
+        return 3;
+    }
+    _ = get_str(ev, n, "holder" as &const byte, &hd[0: NM], &hl);
+    const idx: isize = find_prop(s, &nm[0], nl);
+    var i: usize = 0;
+    if idx >= 0 {
+        i = idx as! usize catch { return 2; };
+    } else {
+        if s.prop_n >= MAX_OBJ {
+            return 2;
+        }
+        i = s.prop_n;
+        s.prop_n = s.prop_n + 1;
+        setstr(&s.props[i].name[0: NM], &s.props[i].name_len, &nm[0], nl);
+        s.props[i].used = true;
+    }
+    if i >= MAX_OBJ {
+        return 2;
+    }
+    setstr(&s.props[i].scene[0: NM], &s.props[i].scene_len, &sc[0], sl);
+    setstr(&s.props[i].holder[0: NM], &s.props[i].holder_len, &hd[0], hl);
+    return 0;
+}
+
+fn ev_prop_move(s: &State, ev: &const byte, n: usize) i32 {
+    var nm: [byte: NM] = [0: NM];
+    var nl: usize = 0;
+    var hd: [byte: NM] = [0: NM];
+    var hl: usize = 0;
+    var sc: [byte: NM] = [0: NM];
+    var sl: usize = 0;
+    if !get_str(ev, n, "prop" as &const byte, &nm[0: NM], &nl) {
+        return 2;
+    }
+    const idx: isize = find_prop(s, &nm[0], nl);
+    if idx < 0 {
+        set_obj(&nm[0], nl);
+        return 2;
+    }
+    const i: usize = idx as! usize catch { return 2; };
+    if i >= MAX_OBJ {
+        return 2;
+    }
+    // 到了新场景就必须和道具原来的场景一致（否则是瞬移）
+    if get_str(ev, n, "at_scene" as &const byte, &sc[0: NM], &sl) {
+        if find_scene(s, &sc[0], sl) < 0 {
+            set_obj(&sc[0], sl);
+            return 3;
+        }
+        if !eq(&s.props[i].scene[0: NM], s.props[i].scene_len, &sc[0], sl) {
+            return 6;
+        }
+    }
+    if get_str(ev, n, "to_scene" as &const byte, &sc[0: NM], &sl) {
+        if find_scene(s, &sc[0], sl) < 0 {
+            set_obj(&sc[0], sl);
+            return 3;
+        }
+        setstr(&s.props[i].scene[0: NM], &s.props[i].scene_len, &sc[0], sl);
+    }
+    if get_str(ev, n, "to_holder" as &const byte, &hd[0: NM], &hl) {
+        setstr(&s.props[i].holder[0: NM], &s.props[i].holder_len, &hd[0], hl);
+    }
+    return 0;
+}
+
+fn ev_knowledge(s: &State, ev: &const byte, n: usize) i32 {
+    var nm: [byte: NM] = [0: NM];
+    var nl: usize = 0;
+    var fact: [byte: VL] = [0: VL];
+    var fl: usize = 0;
+    var sc: [byte: NM] = [0: NM];
+    var sl: usize = 0;
+    if !get_str(ev, n, "character" as &const byte, &nm[0: NM], &nl) {
+        return 7;
+    }
+    if !get_str(ev, n, "fact" as &const byte, &fact[0: VL], &fl) {
+        return 1;
+    }
+    const idx: isize = find_char(s, &nm[0], nl);
+    if idx < 0 {
+        set_obj(&nm[0], nl);
+        return 7;
+    }
+    const i: usize = idx as! usize catch { return 7; };
+    if i >= MAX_OBJ {
+        return 7;
+    }
+    // 角色必须在场：事件要说明发生在哪个场景
+    if get_str(ev, n, "at_scene" as &const byte, &sc[0: NM], &sl) {
+        if !eq(&s.chars[i].scene[0: NM], s.chars[i].scene_len, &sc[0], sl) {
+            return 4;   // KNOWLEDGE_LEAK
+        }
+    } else {
+        return 4;
+    }
+    setstr(&s.chars[i].knows[0: NM], &s.chars[i].knows_len, &fact[0], fl);
+    return 0;
+}
+
+fn ev_scene_set(s: &State, ev: &const byte, n: usize) i32 {
+    var nm: [byte: NM] = [0: NM];
+    var nl: usize = 0;
+    var fld: [byte: NM] = [0: NM];
+    var fl: usize = 0;
+    var val: [byte: NM] = [0: NM];
+    var vl: usize = 0;
+    if !get_str(ev, n, "scene" as &const byte, &nm[0: NM], &nl) {
+        return 3;
+    }
+    const idx: isize = find_scene(s, &nm[0], nl);
+    if idx < 0 {
+        set_obj(&nm[0], nl);
+        return 3;
+    }
+    const i: usize = idx as! usize catch { return 3; };
+    if i >= MAX_OBJ {
+        return 3;
+    }
+    if !get_str(ev, n, "field" as &const byte, &fld[0: NM], &fl) {
+        return 1;
+    }
+    if !get_str(ev, n, "value" as &const byte, &val[0: NM], &vl) {
+        return 1;
+    }
+    if eq(&fld[0], fl, "time_of_day" as &const byte, 11) {
+        // 同一场景连着两次"入夜"却没有时间推进 = 时间悖论
+        if s.scenes[i].tod_len > 0
+            && eq(&s.scenes[i].tod[0], s.scenes[i].tod_len, &val[0], vl) {
+            return 10;   // TIMELINE_CONFLICT
+        }
+        setstr(&s.scenes[i].tod[0: NM], &s.scenes[i].tod_len, &val[0], vl);
+        return 0;
+    }
+    if eq(&fld[0], fl, "variant" as &const byte, 7) {
+        setstr(&s.scenes[i].variant[0: NM], &s.scenes[i].variant_len,
+            &val[0], vl);
+        return 0;
+    }
+    return 1;
+}
+
+fn ev_timeline(s: &State, ev: &const byte, n: usize) i32 {
+    const mins: i64 = get_i64(ev, n, "minutes" as &const byte, 0);
+    if mins <= 0 {
+        return 5;   // 时间只能前进
+    }
+    s.timeline = s.timeline +| mins;
+    return 0;
+}
+
+// 世界规则：同 id 只允许定义一次；文本变了就是 RULE_VIOLATION（返回 11）
+fn ev_rule_define(s: &State, ev: &const byte, n: usize) i32 {
+    var id: [byte: NM] = [0: NM];
+    var il: usize = 0;
+    if !get_str(ev, n, "rule" as &const byte, &id[0: NM], &il) {
+        return 11;
+    }
+    var text: [byte: 256] = [0: 256];
+    var tl: usize = 0;
+    if !get_str(ev, n, "text" as &const byte, &text[0: 256], &tl) {
+        return 11;
+    }
+    var hex: [byte: 64] = [0: 64];
+    var hl: [usize: 1] = [0];
+    if !sha256_hex(&text[0], tl, &hex[0: 64], &hl[0]) {
+        return 11;
+    }
+    // 已经定义过：hash 相同 = 幂等；不同 = 推翻规则
+    var i: usize = 0;
+    while i < s.rule_n {
+        if eq(&s.rules[i].id[0], s.rules[i].id_len, &id[0], il) {
+            if s.rules[i].hash_len != hl[0] {
+                set_obj(&id[0], il);
+                return 11;
+            }
+            var k: usize = 0;
+            while k < hl[0] {
+                if s.rules[i].hash[k] != hex[k] {
+                    set_obj(&id[0], il);
+                    return 11;
+                }
+                k = k + 1;
+            }
+            return 0;
+        }
+        i = i + 1;
+    }
+    if s.rule_n >= MAX_OBJ {
+        return 11;
+    }
+    const at: usize = s.rule_n;
+    s.rules[at].used = true;
+    setstr(&s.rules[at].id[0: NM], &s.rules[at].id_len, &id[0], il);
+    var k2: usize = 0;
+    while k2 < hl[0] {
+        s.rules[at].hash[k2] = hex[k2];
+        k2 = k2 + 1;
+    }
+    s.rules[at].hash_len = hl[0];
+    s.rule_n = s.rule_n + 1;
+    return 0;
+}
+
+fn ev_promise(s: &State, ev: &const byte, n: usize, target: u8) i32 {
+    var id: [byte: NM] = [0: NM];
+    var il: usize = 0;
+    if !get_str(ev, n, "promise" as &const byte, &id[0: NM], &il) {
+        return 8;
+    }
+    var idx: isize = find_promise(s, &id[0], il);
+    var i: usize = 0;
+    if idx >= 0 {
+        i = idx as! usize catch { return 8; };
+    } else {
+        if target == 1 {
+            return 8;   // 不能关一个没开过的承诺
+        }
+        if s.promise_n >= MAX_OBJ {
+            return 8;
+        }
+        i = s.promise_n;
+        s.promise_n = s.promise_n + 1;
+        setstr(&s.promises[i].id[0: NM], &s.promises[i].id_len, &id[0], il);
+        s.promises[i].used = true;
+    }
+    if i >= MAX_OBJ {
+        return 8;
+    }
+    if target == 2 {
+        // 延期：必须给原因和新的兑现集号，否则不算豁免
+        var why: [byte: VL] = [0: VL];
+        var wl: usize = 0;
+        if !get_str(ev, n, "reason" as &const byte, &why[0: VL], &wl)
+            || wl == 0 {
+            return 8;
+        }
+        const due: i64 = get_i64(ev, n, "due_ep" as &const byte, 0);
+        if due <= 0 {
+            return 8;
+        }
+        s.promises[i].waived = true;
+        s.promises[i].due_ep = due;
+        setstr(&s.promises[i].reason[0: VL], &s.promises[i].reason_len,
+            &why[0], wl);
+        return 0;
+    }
+    s.promises[i].state = target;
+    return 0;
+}
+
+// ---- 文件布局与锁 ----
+
+fn proj_dir(root: &const byte, rn: usize, id: &const byte, idn: usize,
+    out: &[byte], out_len: &usize) bool {
+    var pdir: [byte: 512] = [0: 512];
+    var pdl: usize = 0;
+    if !path_join(root, rn, "projects" as &const byte, 8,
+        &pdir[0: 512], &pdl) {
+        return false;
+    }
+    return path_join(&pdir[0], pdl, id, idn, out, out_len);
+}
+
+fn lock_path(dir: &const byte, dl: usize, out: &[byte],
+    out_len: &usize) bool {
+    return path_join(dir, dl, "locks" as &const byte, 5, out, out_len);
+}
+
+// 拿锁：O_EXCL 建；已存在则看进程是否还活着（不活就清掉重试一次）
+// 锁文件里的宿主机名：/proc/sys/kernel/hostname 读不到就记 "unknown"
+var g_host: [byte: 64] = [0: 64];
+var g_host_len: usize = 0;
+var g_host_ready: bool = false;
+
+fn lock_now() i64 {
+    var ts: TimeSpec = TimeSpec{ tv_sec: 0, tv_nsec: 0 };
+    _ = sys_clock_gettime(0, &ts) catch { 0 as i32; };
+    return ts.tv_sec;
+}
+
+fn lock_host() void {
+    if g_host_ready {
+        return;
+    }
+    g_host_ready = true;
+    var bl: [usize: 1] = [0];
+    if !read_file("/proc/sys/kernel" as &const byte, 15,
+        "hostname" as &const byte, 8, &g_host[0], 64, &bl[0]) {
+        g_host_len = 0;
+        return;
+    }
+    var n: usize = 0;
+    while n < bl[0] && g_host[n] != 10 as byte {
+        n = n + 1;
+    }
+    g_host_len = n;
+}
+
+// 返回码：0 拿到 51 被占 48 锁文件读不出 49 锁太老
+export fn canon_lock(dir: &const byte, dl: usize) i32 {
+    var lockdir: [byte: 512] = [0: 512];
+    var ldl: usize = 0;
+    if !lock_path(dir, dl, &lockdir[0: 512], &ldl) {
+        return 48;
+    }
+    _ = mkdir_p(&lockdir[0], ldl);
+    var fpath: [byte: 512] = [0: 512];
+    var fl: usize = 0;
+    if !path_join(&lockdir[0], ldl, "commit.lock" as &const byte, 11,
+        &fpath[0: 512], &fl) {
+        return 48;
+    }
+    lock_host();
+    var try_n: usize = 0;
+    while try_n < 2 {
+        const fd: i32 = sys_open(&fpath[0], (1 + 64 + 128) as i32, 384)
+            catch { -1 as i32; };
+        if fd >= 0 {
+            const pid: i64 = sys_getpid() catch { 0 as i64; };
+            var body: [byte: 160] = [0: 160];
+            var bw: usize = 0;
+            bw = bw + j_put(&body[0: 160], bw, "{\"pid\":" as &const byte);
+            bw = bw + j_put_i64(&body[0: 160], bw, pid);
+            bw = bw + j_put(&body[0: 160], bw, ",\"host\":" as &const byte);
+            bw = bw + j_put_str(&body[0: 160], bw, &g_host[0], g_host_len);
+            bw = bw + j_put(&body[0: 160], bw, ",\"acquired_at\":" as
+                &const byte);
+            bw = bw + j_put_i64(&body[0: 160], bw, lock_now());
+            bw = bw + j_put(&body[0: 160], bw,
+                ",\"purpose\":\"canon.commit\"}" as &const byte);
+            _ = sys_write(fd, &body[0], bw) catch { 0 as isize; };
+            _ = sys_close(fd) catch { 0 as i32; };
+            return 0;
+        }
+        // 抢不到：读 pid 探活，死了就当陈旧锁清掉
+        var old: [byte: 128] = [0: 128];
+        var ol: usize = 0;
+        if !read_file(&lockdir[0], ldl, "commit.lock" as &const byte, 11,
+            &old[0], 128, &ol) {
+            return 48;   // 有文件却读不出来：损坏
+        }
+        const holder: i64 = canon_pid_of(&old[0], ol);
+        if holder > 0 && canon_alive(holder) {
+            // 活着但锁太老（默认 600 s）：多半是卡死的进程，报出来别硬等
+            const at: i64 = get_i64(&old[0], ol,
+                "acquired_at" as &const byte, 0);
+            if at > 0 && lock_now() -| at > 600 {
+                return 49;
+            }
+            return 51;
+        }
+        _ = sys_unlink(&fpath[0]) catch { 0 as i32; };
+        try_n = try_n + 1;
+    }
+    return 48;
+}
+
+fn canon_pid_of(buf: &const byte, n: usize) i64 {
+    return get_i64(buf, n, "pid" as &const byte, 0);
+}
+
+fn canon_alive(pid: i64) bool {
+    const rc: i32 = sys_kill(pid, 0) catch { -1 as i32; };
+    return rc == 0;
+}
+
+export fn canon_unlock(dir: &const byte, dl: usize) void {
+    var lockdir: [byte: 512] = [0: 512];
+    var ldl: usize = 0;
+    if !lock_path(dir, dl, &lockdir[0: 512], &ldl) {
+        return;
+    }
+    var fpath: [byte: 512] = [0: 512];
+    var fl: usize = 0;
+    if path_join(&lockdir[0], ldl, "commit.lock" as &const byte, 11,
+        &fpath[0: 512], &fl) {
+        _ = sys_unlink(&fpath[0]) catch { 0 as i32; };
+    }
+}
+
+// 读当前状态；没有 canon.json 就当 revision=0 的空状态
+fn load_current(dir: &const byte, dl: usize, s: &State) bool {
+    var buf: [byte: BUF_STATE] = [0: BUF_STATE];
+    var bl: usize = 0;
+    if !read_file(dir, dl, "canon.json" as &const byte, 10, &buf[0],
+        BUF_STATE, &bl) {
+        s[0] = blank_state();
+        return true;
+    }
+    return canon_load(s, &buf[0], bl);
+}
+
+fn current_rev(dir: &const byte, dl: usize) i64 {
+    var buf: [byte: 128] = [0: 128];
+    var bl: usize = 0;
+    if !read_file(dir, dl, "current.json" as &const byte, 12, &buf[0],
+        128, &bl) {
+        return 0;
+    }
+    return get_i64(&buf[0], bl, "revision" as &const byte, 0);
+}
+
+fn write_current(dir: &const byte, dl: usize, rev: i64) bool {
+    var b: [byte: 128] = [0: 128];
+    var w: usize = 0;
+    w = w + j_put(&b[0: 128], w, "{\"revision\":" as &const byte);
+    w = w + j_put_i64(&b[0: 128], w, rev);
+    w = w + j_put(&b[0: 128], w, "}" as &const byte);
+    return write_atomic(dir, dl, "current.json" as &const byte, 12, &b[0], w);
+}
+
+// ---- 对外：inspect / commit / recover ----
+
+// 读当前权威状态（原样回 canon.json；没有就回空状态）
+export fn canon_inspect(root: &const byte, rn: usize, id: &const byte,
+    idn: usize, out: &[byte], out_len: &usize) i32 {
+    out_len[0] = 0;
+    if !project_id_ok(id, idn) {
+        return 50;
+    }
+    var dir: [byte: 512] = [0: 512];
+    var dl: usize = 0;
+    if !proj_dir(root, rn, id, idn, &dir[0: 512], &dl) {
+        return 52;
+    }
+    var s: State = blank_state();
+    if !load_current(&dir[0], dl, &s) {
+        return 52;
+    }
+    out_len[0] = canon_serialize(&s, out);
+    return 0;
+}
+
+// 提交记录：不可变，含全量 state ⇒ 恢复时不用重放事件
+fn put_record(out: &[byte], rev: i64, base_rev: i64, events: &const byte,
+    elen: usize, state: &const byte, sn: usize) usize {
+    var w: usize = 0;
+    w = w + j_put(out, w, "{\"format_version\":1," as &const byte);
+    w = w + j_put(out, w, "\"revision\":" as &const byte);
+    w = w + j_put_i64(out, w, rev);
+    w = w + j_put(out, w, ",\"base_revision\":" as &const byte);
+    w = w + j_put_i64(out, w, base_rev);
+    w = w + j_put(out, w, ",\"events\":" as &const byte);
+    w = w + j_put_raw(out, w, events, elen);
+    w = w + j_put(out, w, ",\"state\":" as &const byte);
+    w = w + j_put_raw(out, w, state, sn);
+    w = w + j_put(out, w, "}" as &const byte);
+    return w;
+}
+
+fn record_id(rec: &const byte, n: usize, hex: &[byte],
+    hex_len: &usize) bool {
+    return sha256_hex(rec, n, hex, hex_len);
+}
+
+// 事件错误码统一翻译：1..8 → 61..68；9/10/11 用 45/46/47
+fn ev_rc(rc: i32) i32 {
+    if rc == 9 {
+        return 45;   // SCENE_DRIFT
+    }
+    if rc == 10 {
+        return 46;   // TIMELINE_CONFLICT
+    }
+    if rc == 11 {
+        return 47;   // RULE_VIOLATION
+    }
+    return 60 +| rc;
+}
+
+// 提交：事件全部通过才落提交记录；返回 revision 与 commit_id
+export fn canon_commit(root: &const byte, rn: usize, id: &const byte,
+    idn: usize, base_rev: i64, events: &const byte, elen: usize,
+    out: &[byte], out_len: &usize) i32 {
+    out_len[0] = 0;
+    if !project_id_ok(id, idn) {
+        return 50;
+    }
+    var dir: [byte: 512] = [0: 512];
+    var dl: usize = 0;
+    if !proj_dir(root, rn, id, idn, &dir[0: 512], &dl) {
+        return 52;
+    }
+    const lk: i32 = canon_lock(&dir[0], dl);
+    if lk != 0 {
+        return lk;
+    }
+    defer { canon_unlock(&dir[0], dl); }
+    var s: State = blank_state();
+    if !load_current(&dir[0], dl, &s) {
+        return 52;
+    }
+    if base_rev >= 0 && base_rev != s.revision {
+        return 53;
+    }
+    clear_obj();
+    // 逐个事件应用；有任何一条不合规整体回滚（状态只在这份副本上改）
+    var idx: usize = 0;
+    var n_ev: usize = 0;
+    while true {
+        var es: [usize: 1] = [0];
+        var el: [usize: 1] = [0];
+        if !j_arr_item(events, elen, idx, &es[0], &el[0]) {
+            break;
+        }
+        const rc: i32 = apply_event(&s, &events[es[0]], el[0]);
+        if rc != 0 {
+            return ev_rc(rc);
+        }
+        n_ev = n_ev + 1;
+        idx = idx + 1;
+    }
+    if n_ev == 0 {
+        return 69;   // 没有事件 = 没有状态变化来源（ORPHAN_CHANGE）
+    }
+    s.revision = s.revision +| 1;
+    var state_buf: [byte: BUF_STATE] = [0: BUF_STATE];
+    const sn: usize = canon_serialize(&s, &state_buf[0: BUF_STATE]);
+    var rev_name: [byte: 32] = [0: 32];
+    var rn2: usize = 0;
+    rn2 = rn2 + j_put(&rev_name[0: 32], rn2, "commits/" as &const byte);
+    rn2 = rn2 + j_put_i64(&rev_name[0: 32], rn2, s.revision);
+    rn2 = rn2 + j_put(&rev_name[0: 32], rn2, ".json" as &const byte);
+    var rec: [byte: BUF_STATE] = [0: BUF_STATE];
+    const w: usize = put_record(&rec[0: BUF_STATE], s.revision, base_rev,
+        events, elen, &state_buf[0], sn);
+    // commit_id = 提交记录字节的 SHA-256（可从 commits/<rev>.json 复算）
+    var cid: [byte: 64] = [0: 64];
+    var cidl: [usize: 1] = [0];
+    if !record_id(&rec[0], w, &cid[0: 64], &cidl[0]) {
+        return 55;
+    }
+    var cdir: [byte: 512] = [0: 512];
+    var cdl: usize = 0;
+    if !path_join(&dir[0], dl, "commits" as &const byte, 7,
+        &cdir[0: 512], &cdl) {
+        return 55;
+    }
+    if !persist_commit(&dir[0], dl, &cdir[0], cdl, &rev_name[8], rn2 - 8,
+        &rec[0], w, &state_buf[0], sn, s.revision) {
+        return 55;
+    }
+    var ow: usize = 0;
+    ow = ow + j_put(out, ow, "{\"revision\":" as &const byte);
+    ow = ow + j_put_i64(out, ow, s.revision);
+    ow = ow + j_put(out, ow, ",\"events_applied\":" as &const byte);
+    ow = ow + j_put_i64(out, ow, n_ev as i64);
+    ow = ow + j_put(out, ow, ",\"commit_id\":\"" as &const byte);
+    ow = ow + j_put_raw(out, ow, &cid[0], cidl[0]);
+    ow = ow + j_put(out, ow, "\"" as &const byte);
+    ow = put_event_ids(out, ow, s.revision, n_ev as usize);
+    ow = ow + j_put(out, ow, "}" as &const byte);
+    out_len[0] = ow;
+    return 0;
+}
+
+// 落盘一次提交：记录、canon.json、current.json、提交索引（顺序固定）
+fn persist_commit(dir: &const byte, dl: usize, cdir: &const byte,
+    cdl: usize, rev_name: &const byte, rnl: usize, rec: &const byte,
+    rn2: usize, state: &const byte, sn: usize, rev: i64) bool {
+    if !write_atomic(cdir, cdl, rev_name, rnl, rec, rn2) {
+        return false;
+    }
+    if !write_atomic(dir, dl, "canon.json" as &const byte, 10, state, sn) {
+        return false;
+    }
+    if !write_current(dir, dl, rev) {
+        return false;
+    }
+    return append_commit_index(cdir, cdl, rev, state, sn);
+}
+
+// 事件唯一 ID：r<revision>#<序号>（跨提交可溯源，重放同一批得到同一批 ID）
+fn put_event_ids(out: &[byte], w0: usize, rev: i64, cnt: usize) usize {
+    var w: usize = w0;
+    w = w + j_put(out, w, ",\"event_ids\":[" as &const byte);
+    var i: usize = 0;
+    while i < cnt {
+        if i > 0 {
+            w = w + j_put(out, w, "," as &const byte);
+        }
+        w = w + j_put(out, w, "\"r" as &const byte);
+        w = w + j_put_i64(out, w, rev);
+        w = w + j_put(out, w, "#" as &const byte);
+        w = w + j_put_i64(out, w, i as i64);
+        w = w + j_put(out, w, "\"" as &const byte);
+        i = i + 1;
+    }
+    return w + j_put(out, w, "]" as &const byte);
+}
+
+// 提交索引：一行一个 revision + state 的 SHA-256，用于恢复与去重
+fn append_commit_index(cdir: &const byte, cdl: usize, rev: i64,
+    state: &const byte, sn: usize) bool {
+    var hex: [byte: 64] = [0: 64];
+    var hl: [usize: 1] = [0];
+    if !sha256_hex(state, sn, &hex[0: 64], &hl[0]) {
+        return false;
+    }
+    var line: [byte: 256] = [0: 256];
+    var w: usize = 0;
+    w = w + j_put(&line[0: 256], w, "{\"revision\":" as &const byte);
+    w = w + j_put_i64(&line[0: 256], w, rev);
+    w = w + j_put(&line[0: 256], w, ",\"state_hash\":\"" as &const byte);
+    w = w + j_put_raw(&line[0: 256], w, &hex[0], hl[0]);
+    w = w + j_put(&line[0: 256], w, "\"}" as &const byte);
+    var old: [byte: 16384] = [0: 16384];
+    var ol: usize = 0;
+    _ = read_file(cdir, cdl, "index.jsonl" as &const byte, 11, &old[0],
+        16384, &ol);
+    var merged: [byte: 17408] = [0: 17408];
+    if ol + w + 1 > 17408 {
+        return false;
+    }
+    var i: usize = 0;
+    while i < ol {
+        merged[i] = old[i];
+        i = i + 1;
+    }
+    i = 0;
+    while i < w {
+        merged[ol + i] = line[i];
+        i = i + 1;
+    }
+    merged[ol + w] = 10 as byte;
+    return write_atomic(cdir, cdl, "index.jsonl" as &const byte, 11,
+        &merged[0], ol + w + 1);
+}
+
+// 恢复：以 commits/index.jsonl 的最后一条为准，把 canon/current 拉回该版本
+export fn canon_recover(root: &const byte, rn: usize, id: &const byte,
+    idn: usize, out: &[byte], out_len: &usize) i32 {
+    out_len[0] = 0;
+    if !project_id_ok(id, idn) {
+        return 50;
+    }
+    var dir: [byte: 512] = [0: 512];
+    var dl: usize = 0;
+    if !proj_dir(root, rn, id, idn, &dir[0: 512], &dl) {
+        return 52;
+    }
+    var cdir: [byte: 512] = [0: 512];
+    var cdl: usize = 0;
+    if !path_join(&dir[0], dl, "commits" as &const byte, 7,
+        &cdir[0: 512], &cdl) {
+        return 52;
+    }
+    var idxbuf: [byte: 16384] = [0: 16384];
+    var il: usize = 0;
+    if !read_file(&cdir[0], cdl, "index.jsonl" as &const byte, 11,
+        &idxbuf[0], 16384, &il) {
+        return 56;
+    }
+    const last_rev: i64 = last_index_rev(&idxbuf[0], il);
+    if last_rev <= 0 {
+        return 56;
+    }
+    const cur: i64 = current_rev(&dir[0], dl);
+    var s: State = blank_state();
+    _ = load_current(&dir[0], dl, &s);
+    if cur == last_rev && s.revision == last_rev {
+        var ow: usize = 0;
+        ow = ow + j_put(out, ow, "{\"revision\":" as &const byte);
+        ow = ow + j_put_i64(out, ow, last_rev);
+        ow = ow + j_put(out, ow, ",\"recovered\":false}" as &const byte);
+        out_len[0] = ow;
+        return 0;
+    }
+    var rev_name: [byte: 32] = [0: 32];
+    var rn2: usize = 0;
+    rn2 = rn2 + j_put_i64(&rev_name[0: 32], rn2, last_rev);
+    rn2 = rn2 + j_put(&rev_name[0: 32], rn2, ".json" as &const byte);
+    var rec: [byte: BUF_STATE] = [0: BUF_STATE];
+    var rl: usize = 0;
+    if !read_file(&cdir[0], cdl, &rev_name[0], rn2, &rec[0], BUF_STATE,
+        &rl) {
+        return 56;
+    }
+    var ss: [usize: 1] = [0];
+    var sl: [usize: 1] = [0];
+    if j_span(&rec[0], rl, "state" as &const byte, &ss[0], &sl[0])
+        != 123 as byte {
+        return 56;
+    }
+    var state: [byte: BUF_STATE] = [0: BUF_STATE];
+    var sn: usize = 0;
+    if !copy_to(&rec[ss[0]], sl[0], &state[0: BUF_STATE], &sn) {
+        return 56;
+    }
+    if !write_atomic(&dir[0], dl, "canon.json" as &const byte, 10,
+        &state[0], sn) {
+        return 55;
+    }
+    if !write_current(&dir[0], dl, last_rev) {
+        return 55;
+    }
+    var ow: usize = 0;
+    ow = ow + j_put(out, ow, "{\"revision\":" as &const byte);
+    ow = ow + j_put_i64(out, ow, last_rev);
+    ow = ow + j_put(out, ow, ",\"recovered\":true}" as &const byte);
+    out_len[0] = ow;
+    return 0;
+}
+
+// 索引最后一行里的 revision
+fn last_index_rev(buf: &const byte, n: usize) i64 {
+    var start: usize = 0;
+    var i: usize = 0;
+    var last_start: usize = 0;
+    var last_end: usize = 0;
+    while i < n {
+        if buf[i] == 10 as byte {
+            if i > start {
+                last_start = start;
+                last_end = i;
+            }
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    if start < n {
+        var j: usize = start;
+        while j < n && buf[j] != 10 as byte {
+            j = j + 1;
+        }
+        if j > start {
+            last_start = start;
+            last_end = j;
+        }
+    }
+    if last_end <= last_start {
+        return 0;
+    }
+    // 只看最后一行：整段扫会命中第一行的 revision
+    return get_i64(&buf[last_start], last_end - last_start,
+        "revision" as &const byte, 0);
+}
+
+// 当前 revision（没有 canon.json 就是 0）
+// 这个承诺开过没有（要不要发 promise.close 先问一句，免得凭空关）
+export fn canon_has_promise(root: &const byte, rn: usize, id: &const byte,
+    idn: usize, pid: &const byte, pn: usize) bool {
+    if !project_id_ok(id, idn) {
+        return false;
+    }
+    var dir: [byte: 512] = [0: 512];
+    var dl: usize = 0;
+    if !proj_dir(root, rn, id, idn, &dir[0: 512], &dl) {
+        return false;
+    }
+    var s: State = blank_state();
+    if !load_current(&dir[0], dl, &s) {
+        return false;
+    }
+    return find_promise(&s, pid, pn) >= 0;
+}
+
+// 候选状态差异：把 events 在内存里预演一遍再和当前状态比一遍。
+// 不落盘、不加锁，只回答「这批事件会改什么、合不合法」。
+export fn canon_diff(root: &const byte, rn: usize, id: &const byte,
+    idn: usize, events: &const byte, elen: usize, out: &[byte],
+    out_len: &usize) i32 {
+    out_len[0] = 0;
+    if !project_id_ok(id, idn) {
+        return 50;
+    }
+    var dir: [byte: 512] = [0: 512];
+    var dl: usize = 0;
+    if !proj_dir(root, rn, id, idn, &dir[0: 512], &dl) {
+        return 52;
+    }
+    var s: State = blank_state();
+    if !load_current(&dir[0], dl, &s) {
+        return 52;
+    }
+    var cand: State = s;
+    var idx: usize = 0;
+    while true {
+        var es: [usize: 1] = [0];
+        var el: [usize: 1] = [0];
+        if !j_arr_item(events, elen, idx, &es[0], &el[0]) {
+            break;
+        }
+        const rc: i32 = apply_event(&cand, &events[es[0]], el[0]);
+        if rc != 0 {
+            return ev_rc(rc);
+        }
+        idx = idx + 1;
+    }
+    var w: usize = 0;
+    w = w + j_put(out, w, "{\"from_revision\":" as &const byte);
+    w = w + j_put_i64(out, w, s.revision);
+    w = w + j_put(out, w, ",\"events\":" as &const byte);
+    w = w + j_put_i64(out, w, idx as i64);
+    w = w + j_put(out, w, ",\"ok\":true,\"delta\":{" as &const byte);
+    w = w + j_put(out, w, "\"characters\":" as &const byte);
+    w = w + j_put_i64(out, w,
+        (cand.char_n as i64) -| (s.char_n as i64));
+    w = w + j_put(out, w, ",\"props\":" as &const byte);
+    w = w + j_put_i64(out, w,
+        (cand.prop_n as i64) -| (s.prop_n as i64));
+    w = w + j_put(out, w, ",\"scenes\":" as &const byte);
+    w = w + j_put_i64(out, w,
+        (cand.scene_n as i64) -| (s.scene_n as i64));
+    w = w + j_put(out, w, ",\"promises\":" as &const byte);
+    w = w + j_put_i64(out, w,
+        (cand.promise_n as i64) -| (s.promise_n as i64));
+    w = w + j_put(out, w, ",\"rules\":" as &const byte);
+    w = w + j_put_i64(out, w,
+        (cand.rule_n as i64) -| (s.rule_n as i64));
+    w = w + j_put(out, w, ",\"timeline_min\":" as &const byte);
+    w = w + j_put_i64(out, w, cand.timeline -| s.timeline);
+    w = w + j_put(out, w, "}}" as &const byte);
+    out_len[0] = w;
+    return 0;
+}
+
+
+// 全历史重放：从空状态起逐条提交把 events 应用上去，序列化结果必须与
+// 记录里的 state 完全一致。历史里只要出现过不合规的事件（ORPHAN_CHANGE /
+// TIMELINE_CONFLICT / RULE_VIOLATION …），重放就会在这里现形。
+export fn canon_replay_history(root: &const byte, rn: usize,
+    id: &const byte, idn: usize, out: &[byte], out_len: &usize) i32 {
+    out_len[0] = 0;
+    if !project_id_ok(id, idn) {
+        return 50;
+    }
+    var dir: [byte: 512] = [0: 512];
+    var dl: usize = 0;
+    if !proj_dir(root, rn, id, idn, &dir[0: 512], &dl) {
+        return 52;
+    }
+    var cdir: [byte: 512] = [0: 512];
+    var cdl: usize = 0;
+    if !path_join(&dir[0], dl, "commits" as &const byte, 7, &cdir[0: 512],
+        &cdl) {
+        return 52;
+    }
+    var s: State = blank_state();
+    var rec: &byte = malloc(BUF_STATE) as &byte;
+    defer { free(rec as &void); }
+    if (rec as usize) == 0 {
+        return 55;
+    }
+    var ow: usize = 0;
+    var rev: i64 = 1;
+    var ok: bool = true;
+    var first_bad: i64 = 0;
+    var bad_code: i32 = 0;
+    ow = ow + j_put(out, ow, "{\"violations\":[" as &const byte);
+    var n_vi: usize = 0;
+    while rev <= 1000 {
+        var nm: [byte: 24] = [0: 24];
+        var nn: usize = 0;
+        nn = nn + j_put_i64(&nm[0: 24], nn, rev);
+        nn = nn + j_put_raw(&nm[0: 24], nn, ".json" as &const byte, 5);
+        var rl: [usize: 1] = [0];
+        if !read_file(&cdir[0], cdl, &nm[0], nn, rec, BUF_STATE,
+            &rl[0]) {
+            break;
+        }
+        var es: [usize: 1] = [0];
+        var el: [usize: 1] = [0];
+        if j_span(rec, rl[0], "events" as &const byte, &es[0],
+            &el[0]) != 91 as byte {
+            break;
+        }
+        clear_obj();
+        var idx: usize = 0;
+        var rc_e: i32 = 0;
+        while idx < 256 {
+            var xs: [usize: 1] = [0];
+            var xl: [usize: 1] = [0];
+            if !j_arr_item(&rec[es[0]], el[0], idx, &xs[0], &xl[0]) {
+                break;
+            }
+            const rc: i32 = apply_event(&s, &rec[es[0] + xs[0]], xl[0]);
+            if rc != 0 {
+                rc_e = rc;
+                break;
+            }
+            idx = idx + 1;
+        }
+        if rc_e != 0 {
+            ok = false;
+            if n_vi == 0 {
+                first_bad = rev;
+                bad_code = ev_rc(rc_e);
+            }
+            if n_vi < 8 {
+                if n_vi > 0 {
+                    ow = ow + j_put(out, ow, "," as &const byte);
+                }
+                ow = ow + j_put(out, ow, "{\"revision\":" as &const byte);
+                ow = ow + j_put_i64(out, ow, rev);
+                ow = ow + j_put(out, ow, ",\"code\":" as &const byte);
+                ow = ow + j_put_i64(out, ow, ev_rc(rc_e) as i64);
+                ow = ow + j_put(out, ow, "}" as &const byte);
+                n_vi = n_vi + 1;
+            }
+            rev = rev + 1;
+            continue;
+        }
+        // 重放出来的状态必须与提交记录里的 state 逐字节一致
+        s.revision = rev;
+        var sb: [byte: BUF_STATE] = [0: BUF_STATE];
+        const sn: usize = canon_serialize(&s, &sb[0: BUF_STATE]);
+        var ss: [usize: 1] = [0];
+        var sl: [usize: 1] = [0];
+        if j_span(rec, rl[0], "state" as &const byte, &ss[0],
+            &sl[0]) != 123 as byte {
+            ok = false;
+            break;
+        }
+        if sl[0] != sn {
+            ok = false;
+        } else {
+            var k: usize = 0;
+            while k < sn {
+                if rec[ss[0] + k] != sb[k] {
+                    ok = false;
+                    break;
+                }
+                k = k + 1;
+            }
+        }
+        if !ok {
+            if n_vi < 8 {
+                if n_vi > 0 {
+                    ow = ow + j_put(out, ow, "," as &const byte);
+                }
+                ow = ow + j_put(out, ow, "{\"revision\":" as &const byte);
+                ow = ow + j_put_i64(out, ow, rev);
+                ow = ow + j_put(out, ow, ",\"code\":98}" as &const byte);
+                n_vi = n_vi + 1;
+            }
+            break;
+        }
+        rev = rev + 1;
+    }
+    ow = ow + j_put(out, ow, "],\"commits\":" as &const byte);
+    ow = ow + j_put_i64(out, ow, rev -| 1);
+    ow = ow + j_put(out, ow, ",\"ok\":" as &const byte);
+    if ok {
+        ow = ow + j_put(out, ow, "true" as &const byte);
+    } else {
+        ow = ow + j_put(out, ow, "false" as &const byte);
+    }
+    ow = ow + j_put(out, ow, ",\"first_bad_revision\":" as &const byte);
+    ow = ow + j_put_i64(out, ow, first_bad);
+    ow = ow + j_put(out, ow, ",\"first_bad_code\":" as &const byte);
+    ow = ow + j_put_i64(out, ow, bad_code as i64);
+    ow = ow + j_put(out, ow, "}" as &const byte);
+    out_len[0] = ow;
+    return 0;
+}
+
+export fn canon_revision(root: &const byte, rn: usize, id: &const byte,
+    idn: usize) i64 {
+    if !project_id_ok(id, idn) {
+        return -1;
+    }
+    var dir: [byte: 512] = [0: 512];
+    var dl: usize = 0;
+    if !proj_dir(root, rn, id, idn, &dir[0: 512], &dl) {
+        return -1;
+    }
+    return current_rev(&dir[0], dl);
+}

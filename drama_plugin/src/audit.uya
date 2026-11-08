@@ -1,0 +1,1112 @@
+// drama_plugin/src/audit.uya — 闭环审计（P12 第一段：四本账 + 不变量 + 重放）
+//
+// 审计只读，不改任何状态。三件事：
+//   1. **重放完整性**：commits/index.jsonl 里每条记录的 state_hash 能否与
+//      commits/<rev>.json 里的全量 state 对上；对不上就是历史被改过；
+//   2. **账本**：promise（open/closed/overdue）、道具、角色、时间轴四项计数；
+//   3. **不变量**：道具/角色必须停在已知场景、承诺逾期必须为 0、
+//      当前 canon 不能落后于最新提交、时间轴只能前进。
+//
+// 返回码：0 成功（无论有没有违规，都靠 ok 字段判定）50 ID 非法 94 读失败
+
+use libc.syscall;
+use libc.unistd;
+
+const AUDIT_BUF: usize = 16384;
+const VIO_MAX: usize = 32;
+
+struct Vio {
+    code: [byte: 40],
+    code_len: usize,
+    detail: [byte: 128],
+    detail_len: usize,
+    obj: [byte: 32],
+    obj_len: usize,
+}
+
+struct Audit {
+    vios: [Vio: VIO_MAX],
+    n: usize,
+    props: i64,
+    chars: i64,
+    scenes: i64,
+    promises_open: i64,
+    promises_closed: i64,
+    promises_overdue: i64,
+    rules: i64,
+    timeline: i64,
+    revision: i64,
+    commits: i64,
+    replay_ok: bool,
+}
+
+fn blank_audit() Audit {
+    return Audit{ vios: [Vio{ code: [0: 40], code_len: 0,
+        detail: [0: 128], detail_len: 0, obj: [0: 32],
+        obj_len: 0 }: VIO_MAX], n: 0, props: 0,
+        chars: 0, scenes: 0, promises_open: 0, promises_closed: 0,
+        promises_overdue: 0, rules: 0, timeline: 0, revision: 0, commits: 0,
+        replay_ok: true };
+}
+
+fn vio(a: &Audit, code: &const byte, detail: &const byte) void {
+    vio_obj(a, code, detail, "" as &const byte, 0);
+}
+
+// 带对象定位的违规
+fn vio_obj(a: &Audit, code: &const byte, detail: &const byte,
+    obj: &const byte, on: usize) void {
+    if a.n >= VIO_MAX {
+        return;
+    }
+    var v: Vio = Vio{ code: [0: 40], code_len: 0,
+        detail: [0: 128], detail_len: 0, obj: [0: 32], obj_len: 0 };
+    var l: usize = 0;
+    _ = copy_to(code, b_len(code), &v.code[0: 40], &l);
+    v.code_len = l;
+    _ = copy_to(detail, b_len(detail), &v.detail[0: 128], &l);
+    v.detail_len = l;
+    _ = copy_to(obj, on, &v.obj[0: 32], &l);
+    v.obj_len = l;
+    a.vios[a.n] = v;
+    a.n = a.n + 1;
+}
+
+fn anum(buf: &const byte, n: usize, key: &const byte) i64 {
+    var st: [usize: 1] = [0];
+    var ln: [usize: 1] = [0];
+    if j_span(buf, n, key, &st[0], &ln[0]) == 0 as byte {
+        return 0;
+    }
+    var i: usize = 0;
+    var v: i64 = 0;
+    while i < ln[0] {
+        const c: byte = buf[st[0] + i];
+        if c < 48 as byte || c > 57 as byte {
+            break;
+        }
+        v = v *| 10;
+        v = v +| ((c as i64) -| 48);
+        i = i + 1;
+    }
+    return v;
+}
+
+fn adir(root: &const byte, rn: usize, id: &const byte, idn: usize,
+    out: &[byte], out_len: &usize) bool {
+    var pdir: [byte: 512] = [0: 512];
+    var pdl: usize = 0;
+    if !path_join(root, rn, "projects" as &const byte, 8,
+        &pdir[0: 512], &pdl) {
+        return false;
+    }
+    return path_join(&pdir[0], pdl, id, idn, out, out_len);
+}
+
+// 场景名集合里有没有它
+fn scene_exists(sn: &const byte, sl: usize, name: &const byte,
+    nn: usize) bool {
+    var idx: usize = 0;
+    while true {
+        var es: [usize: 1] = [0];
+        var el: [usize: 1] = [0];
+        if !j_arr_item(sn, sl, idx, &es[0], &el[0]) {
+            return false;
+        }
+        const it: &const byte = &sn[es[0]];
+        var nm: [byte: 32] = [0: 32];
+        var nl: usize = 0;
+        _ = j_str(it, el[0], "name" as &const byte, &nm[0: 32], &nl);
+        if nl == nn {
+            var k: usize = 0;
+            var same: bool = true;
+            while k < nn {
+                if nm[k] != name[k] {
+                    same = false;
+                    break;
+                }
+                k = k + 1;
+            }
+            if same {
+                return true;
+            }
+        }
+        idx = idx + 1;
+    }
+}
+
+// 检查数组里每个元素的 scene 字段都指向已知场景
+fn check_scenes(canon: &const byte, cn: usize, key: &const byte,
+    a: &Audit, code: &const byte) void {
+    var ss: [usize: 1] = [0];
+    var sl: [usize: 1] = [0];
+    if j_span(canon, cn, key, &ss[0], &sl[0]) != 91 as byte {
+        return;
+    }
+    var scs: [usize: 1] = [0];
+    var scl: [usize: 1] = [0];
+    const has_scenes: bool = j_span(canon, cn, "scenes" as &const byte,
+        &scs[0], &scl[0]) == 91 as byte;
+    var idx: usize = 0;
+    while true {
+        var es: [usize: 1] = [0];
+        var el: [usize: 1] = [0];
+        if !j_arr_item(&canon[ss[0]], sl[0], idx, &es[0], &el[0]) {
+            break;
+        }
+        const it: &const byte = &canon[ss[0] + es[0]];
+        var sc: [byte: 32] = [0: 32];
+        var sl2: usize = 0;
+        _ = j_str(it, el[0], "scene" as &const byte, &sc[0: 32], &sl2);
+        if has_scenes && sl2 > 0
+            && !scene_exists(&canon[scs[0]], scl[0], &sc[0], sl2) {
+            var nm: [byte: 32] = [0: 32];
+            var nl: usize = 0;
+            _ = j_str(it, el[0], "name" as &const byte, &nm[0: 32], &nl);
+            vio_obj(a, code, "entity points to unknown scene" as &const byte,
+                &nm[0], nl);
+        }
+        idx = idx + 1;
+    }
+}
+
+// 兑现账：open / closed / overdue（逾期 = 至今仍 open 且已经有 N 集没兑现）
+fn flag_true(o: &const byte, n: usize, key: &const byte) bool {
+    var st: [usize: 1] = [0];
+    var ln: [usize: 1] = [0];
+    if j_span(o, n, key, &st[0], &ln[0]) != 115 as byte || ln[0] != 4 {
+        return false;
+    }
+    const t: &const byte = "true" as &const byte;
+    var i: usize = 0;
+    while i < 4 {
+        if o[st[0] + i] != t[i] {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+// 资产完整性：索引里的每条都要在盘上，大小一致（小文件再核 SHA-256）
+fn check_assets(root: &const byte, rn: usize, id: &const byte, idn: usize,
+    a: &Audit) void {
+    var idx: [byte: 65536] = [0: 65536];
+    var il: [usize: 1] = [0];
+    if asset_index(root, rn, id, idn, &idx[0: 65536], &il[0]) != 0 {
+        return;
+    }
+    var pdir: [byte: 512] = [0: 512];
+    var pdl: [usize: 1] = [0];
+    if !adir(root, rn, id, idn, &pdir[0: 512], &pdl[0]) {
+        return;
+    }
+    var dir: [byte: 512] = [0: 512];
+    var dl: [usize: 1] = [0];
+    if !path_join(&pdir[0], pdl[0], "assets" as &const byte, 6,
+        &dir[0: 512], &dl[0]) {
+        return;
+    }
+    var st: usize = 0;
+    while st < il[0] {
+        var en: usize = st;
+        while en < il[0] && idx[en] != 10 as byte {
+            en = en + 1;
+        }
+        if en > st {
+            check_one_asset(&idx[st], en - st, &dir[0], dl[0], a);
+        }
+        st = en + 1;
+    }
+}
+
+fn check_one_asset(line: &const byte, ln: usize, dir: &const byte,
+    dl: usize, a: &Audit) void {
+    var nm: [byte: 128] = [0: 128];
+    var nl: usize = 0;
+    if !j_str(line, ln, "name" as &const byte, &nm[0: 128], &nl) || nl == 0 {
+        return;
+    }
+    const want: i64 = anum(line, ln, "size" as &const byte);
+    const path: [byte: 512] = [0: 512];
+    var pl: [usize: 1] = [0];
+    if !path_join(dir, dl, &nm[0], nl, &path[0: 512], &pl[0]) {
+        return;
+    }
+    const sz: i64 = asset_size(&path[0]);
+    if sz < 0 {
+        vio_obj(a, "ASSET_MISSING" as &const byte,
+            "asset file is gone" as &const byte, &nm[0], nl);
+        return;
+    }
+    if want > 0 && sz != want {
+        vio_obj(a, "ASSET_SIZE_MISMATCH" as &const byte,
+            "asset size differs from index" as &const byte, &nm[0], nl);
+        return;
+    }
+    if sz > 262144 {
+        return;   // 大文件只核大小，哈希留给真实产线
+    }
+    var buf: [byte: 262144] = [0: 262144];
+    var bl: [usize: 1] = [0];
+    if !read_file(dir, dl, &nm[0], nl, &buf[0], 262144,
+        &bl[0]) {
+        return;
+    }
+    var hex: [byte: 64] = [0: 64];
+    var hl: [usize: 1] = [0];
+    if !sha256_hex(&buf[0], bl[0], &hex[0: 64], &hl[0]) {
+        return;
+    }
+    var got: [byte: 72] = [0: 72];
+    var gl: usize = 0;
+    if !j_str(line, ln, "sha256" as &const byte, &got[0: 72], &gl) {
+        return;
+    }
+    var k: usize = 0;
+    var same: bool = true;
+    while k < gl && k < 64 {
+        if got[k] != hex[k] {
+            same = false;
+            break;
+        }
+        k = k + 1;
+    }
+    if !same {
+        vio_obj(a, "ASSET_HASH_MISMATCH" as &const byte,
+            "asset content hash differs from index" as &const byte,
+            &nm[0], nl);
+    }
+}
+
+fn asset_size(path: &const byte) i64 {
+    const fd: i32 = sys_open(path, 0, 0) catch { return -1 as i64; };
+    const sz: i64 = sys_lseek(fd, 0 as i64, 2) catch { -1 as i64; };
+    _ = sys_close(fd) catch { 0 as i32; };
+    return sz;
+}
+
+// 钩子承诺的 ID 形如 "hook_<集号>"：开了几集还没回收才算逾期
+fn hook_ep(id: &const byte, n: usize) i64 {
+    if n <= 5 {
+        return 0;
+    }
+    if id[0] != 104 as byte || id[1] != 111 as byte || id[2] != 111 as byte
+        || id[3] != 107 as byte || id[4] != 95 as byte {
+        return 0;
+    }
+    var v: i64 = 0;
+    var i: usize = 5;
+    while i < n {
+        const b: byte = id[i];
+        if b < 48 as byte || b > 57 as byte {
+            return 0;
+        }
+        v = (v *| 10) +| (b as i64 -| 48);
+        i = i + 1;
+    }
+    return v;
+}
+
+fn tally_promises(canon: &const byte, cn: usize, a: &Audit) void {
+    var ps: [usize: 1] = [0];
+    var pl: [usize: 1] = [0];
+    if j_span(canon, cn, "promises" as &const byte, &ps[0], &pl[0])
+        != 91 as byte {
+        return;
+    }
+    var idx: usize = 0;
+    while true {
+        var es: [usize: 1] = [0];
+        var el: [usize: 1] = [0];
+        if !j_arr_item(&canon[ps[0]], pl[0], idx, &es[0], &el[0]) {
+            break;
+        }
+        const it: &const byte = &canon[ps[0] + es[0]];
+        var st: [byte: 16] = [0: 16];
+        var stl: usize = 0;
+        _ = j_str(it, el[0], "state" as &const byte, &st[0: 16], &stl);
+        const waived: bool = flag_true(it, el[0], "waived" as &const byte);
+        if stl == 6 {
+            a.promises_closed = a.promises_closed +| 1;
+        } else if waived {
+            // 显式延期的承诺（有原因 + 新 due_ep）不再算逾期
+            a.promises_open = a.promises_open +| 1;
+        } else {
+            a.promises_open = a.promises_open +| 1;
+            // 逾期口径：hook_<N> 开了 3 集还没回收；其它承诺沿用
+            // "revision >= 3 仍 open" 的保守口径
+            var idb: [byte: 64] = [0: 64];
+            var idl: usize = 0;
+            _ = j_str(it, el[0], "id" as &const byte, &idb[0: 64], &idl);
+            const hep: i64 = hook_ep(&idb[0], idl);
+            var old_p: bool = a.revision >= 3;
+            if hep > 0 {
+                old_p = (a.revision -| hep) >= 3;
+            }
+            if old_p {
+                a.promises_overdue = a.promises_overdue +| 1;
+            }
+        }
+        idx = idx + 1;
+    }
+}
+
+// 增量审计：g_since > 0 时只重放这之后的提交；水位那一条做一次抽查，
+// 证明"没有复用未经校验的旧结论"，被改过照样报 AUDIT_REPLAY_MISMATCH。
+var g_since: i64 = 0;
+var g_checked: i64 = 0;
+
+// 增量水位：<proj>/audit/watermark.json {"last_revision":N}
+const WM_NAME: &const byte = "watermark.json" as &const byte;
+
+fn audit_wm_dir(dir: &const byte, dl: usize, out: &[byte],
+    out_len: &usize) bool {
+    var ad: [byte: 512] = [0: 512];
+    var al: usize = 0;
+    if !path_join(dir, dl, "audit" as &const byte, 5, &ad[0: 512], &al) {
+        return false;
+    }
+    if !mkdir_p(&ad[0], al) {
+        return false;
+    }
+    var i: usize = 0;
+    while i < al && i < out.len {
+        out[i] = ad[i];
+        i = i + 1;
+    }
+    out_len[0] = i;
+    return true;
+}
+
+export fn audit_watermark(root: &const byte, rn: usize, id: &const byte,
+    idn: usize) i64 {
+    var dir: [byte: 512] = [0: 512];
+    var dl: usize = 0;
+    if !adir(root, rn, id, idn, &dir[0: 512], &dl) {
+        return 0;
+    }
+    var wd: [byte: 512] = [0: 512];
+    var wdl: usize = 0;
+    if !audit_wm_dir(&dir[0], dl, &wd[0: 512], &wdl) {
+        return 0;
+    }
+    var raw: [byte: 256] = [0: 256];
+    var rl: [usize: 1] = [0];
+    if !read_file(&wd[0], wdl, WM_NAME, 14, &raw[0], 256, &rl[0]) {
+        return 0;
+    }
+    return anum(&raw[0], rl[0], "last_revision" as &const byte);
+}
+
+fn audit_wm_save(root: &const byte, rn: usize, id: &const byte,
+    idn: usize, rev: i64) void {
+    var dir: [byte: 512] = [0: 512];
+    var dl: usize = 0;
+    if !adir(root, rn, id, idn, &dir[0: 512], &dl) {
+        return;
+    }
+    var wd: [byte: 512] = [0: 512];
+    var wdl: usize = 0;
+    if !audit_wm_dir(&dir[0], dl, &wd[0: 512], &wdl) {
+        return;
+    }
+    var raw: [byte: 128] = [0: 128];
+    var w: usize = 0;
+    w = w + j_put(&raw[0: 128], w, "{\"last_revision\":" as &const byte);
+    w = w + j_put_i64(&raw[0: 128], w, rev);
+    w = w + j_put(&raw[0: 128], w, "}" as &const byte);
+    _ = write_atomic(&wd[0], wdl, WM_NAME, 14, &raw[0], w);
+}
+
+// 增量模式：只查 since 之后的提交；since 上那一条也抽查一次
+export fn audit_run_since(root: &const byte, rn: usize, id: &const byte,
+    idn: usize, since: i64, out: &[byte], out_len: &usize) i32 {
+    g_since = since;
+    g_checked = 0;
+    // g_checked 统计真正重放的提交条数（含水位抽查那一条）
+    const rc: i32 = audit_run(root, rn, id, idn, out, out_len);
+    g_since = 0;
+    if rc == 0 {
+        var dir: [byte: 512] = [0: 512];
+        var dl: usize = 0;
+        if adir(root, rn, id, idn, &dir[0: 512], &dl) {
+            var canon: [byte: 4096] = [0: 4096];
+            var cn: [usize: 1] = [0];
+            if read_file(&dir[0], dl, "canon.json" as &const byte, 10,
+                &canon[0], 4096, &cn[0]) {
+                audit_wm_save(root, rn, id, idn,
+                    anum(&canon[0], cn[0], "revision" as &const byte));
+            }
+        }
+    }
+    return rc;
+}
+
+export fn audit_checked() i64 {
+    return g_checked;
+}
+
+// 重放完整性：索引里每条 (revision, state_hash) 与提交记录里的 state 对得上
+fn check_replay(cdir: &const byte, cdl: usize, a: &Audit) void {
+    var idx: [byte: AUDIT_BUF] = [0: AUDIT_BUF];
+    var il: usize = 0;
+    if !read_file(cdir, cdl, "index.jsonl" as &const byte, 11, &idx[0],
+        AUDIT_BUF, &il) {
+        return;
+    }
+    var i: usize = 0;
+    while i < il {
+        var e: usize = i;
+        while e < il && idx[e] != 10 as byte {
+            e = e + 1;
+        }
+        if e > i {
+            const rev: i64 = anum(&idx[i], e - i, "revision" as &const byte);
+            // 缓冲要留 NUL 位：j_str 走 copy_to，64 字节的 hash 需要 65
+            var hex: [byte: 65] = [0: 65];
+            var hl: usize = 0;
+            _ = j_str(&idx[i], e - i, "state_hash" as &const byte,
+                &hex[0: 65], &hl);
+            a.commits = a.commits +| 1;
+            if rev > 0 && hl == 64 {
+                // 增量模式：老提交跳过，但水位那一条要抽查
+                if g_since > 0 && rev < g_since {
+                    i = e + 1;
+                    continue;
+                }
+                check_one_commit(cdir, cdl, rev, &hex[0], a);
+                g_checked = g_checked +| 1;
+            }
+        }
+        i = e + 1;
+    }
+}
+
+fn check_one_commit(cdir: &const byte, cdl: usize, rev: i64,
+    hex: &const byte, a: &Audit) void {
+    var nm: [byte: 32] = [0: 32];
+    var nn: usize = 0;
+    nn = nn + j_put_i64(&nm[0: 32], nn, rev);
+    nn = nn + j_put_raw(&nm[0: 32], nn, ".json" as &const byte, 5);
+    var rec: [byte: AUDIT_BUF] = [0: AUDIT_BUF];
+    var rl: usize = 0;
+    if !read_file(cdir, cdl, &nm[0], nn, &rec[0], AUDIT_BUF, &rl) {
+        a.replay_ok = false;
+        vio(a, "AUDIT_COMMIT_MISSING" as &const byte,
+            "commit record missing for index entry" as &const byte);
+        return;
+    }
+    var ss: [usize: 1] = [0];
+    var sl: [usize: 1] = [0];
+    if j_span(&rec[0], rl, "state" as &const byte, &ss[0], &sl[0])
+        != 123 as byte {
+        a.replay_ok = false;
+        vio(a, "AUDIT_COMMIT_BROKEN" as &const byte,
+            "commit record has no state" as &const byte);
+        return;
+    }
+    var now: [byte: 64] = [0: 64];
+    var nl: [usize: 1] = [0];
+    if !sha256_hex(&rec[ss[0]], sl[0], &now[0: 64], &nl[0]) {
+        a.replay_ok = false;
+        return;
+    }
+    var k: usize = 0;
+    while k < 64 {
+        if now[k] != hex[k] {
+            a.replay_ok = false;
+            vio(a, "AUDIT_REPLAY_MISMATCH" as &const byte,
+                "commit state does not match index hash" as &const byte);
+            return;
+        }
+        k = k + 1;
+    }
+}
+
+// 钩子链：大纲里每集兑现的必须是上一集开的钩子；已产出的集数不能超大纲
+fn check_hooks(root: &const byte, rn: usize, id: &const byte, idn: usize,
+    a: &Audit, canon: &const byte, cn: usize) void {
+    var obuf: [byte: AUDIT_BUF] = [0: AUDIT_BUF];
+    var ol: [usize: 1] = [0];
+    if series_get(root, rn, id, idn, &obuf[0: AUDIT_BUF], &ol[0]) != 0 {
+        _ = canon;
+        _ = cn;
+        return;   // 没有大纲就不查这条
+    }
+    var ps: [usize: 1] = [0];
+    var pl: [usize: 1] = [0];
+    if j_span(&obuf[0], ol[0], "plan" as &const byte, &ps[0],
+        &pl[0]) != 123 as byte {
+        return;
+    }
+    const plan: &const byte = &obuf[ps[0]];
+    const total: i64 = anum(plan, pl[0], "total_episodes" as &const byte);
+    if a.revision > total {
+        vio(a, "HOOK_UNANSWERED" as &const byte,
+            "more episodes produced than the approved outline" as &const byte);
+    }
+    var es: [usize: 1] = [0];
+    var el: [usize: 1] = [0];
+    if j_span(plan, pl[0], "episodes" as &const byte, &es[0],
+        &el[0]) != 91 as byte {
+        return;
+    }
+    var prev_hook: i64 = 0;
+    var idx: usize = 0;
+    while true {
+        var xs: [usize: 1] = [0];
+        var xl: [usize: 1] = [0];
+        if !j_arr_item(&plan[es[0]], el[0], idx, &xs[0], &xl[0]) {
+            break;
+        }
+        const ep: &const byte = &plan[es[0] + xs[0]];
+        const pays: i64 = anum(ep, xl[0], "pays_off" as &const byte);
+        if idx > 0 && pays != prev_hook {
+            vio(a, "HOOK_UNANSWERED" as &const byte,
+                "episode does not pay off the previous hook" as &const byte);
+            return;
+        }
+        prev_hook = anum(ep, xl[0], "opens_hook" as &const byte);
+        idx = idx + 1;
+    }
+}
+
+// ---- 冻结文本完整性 + 笑点重复（跨集审计两条） ---------------------------
+// Bible 快照格式：{"format_version":1,"version":N,"content_hash":"<64 hex>",
+//                 <payload>}；content_hash 覆盖 payload。任何改写都会对不上。
+
+fn aud_hex_ok(buf: &const byte, n: usize, off: usize) bool {
+    if off + 64 > n {
+        return false;
+    }
+    var i: usize = 0;
+    while i < 64 {
+        const c: byte = buf[off + i];
+        const hex: bool = (c >= 48 as byte && c <= 57 as byte)
+            || (c >= 97 as byte && c <= 102 as byte);
+        if !hex {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+// 返回该版本快照是否是"内容 hash 与载荷一致"
+fn bible_snapshot_ok(raw: &const byte, n: usize) bool {
+    var ks: [usize: 1] = [0];
+    var kl: [usize: 1] = [0];
+    if j_span(raw, n, "content_hash" as &const byte, &ks[0],
+        &kl[0]) != 34 as byte || kl[0] < 66 {
+        return false;
+    }
+    // j_span 对字符串回「开引号位置 + 含引号长度」⇒ 十六进制从 ks[0]+1 起
+    if !aud_hex_ok(raw, n, ks[0] + 1) {
+        return false;
+    }
+    // payload 起点 = 闭引号（ks[0]+65）之后越过 `,` 的位置
+    const after: usize = ks[0] + 65;
+    if after + 2 > n {
+        return false;
+    }
+    if raw[after] != 34 as byte || raw[after + 1] != 44 as byte {
+        return false;
+    }
+    const pstart: usize = after + 2;
+    if pstart + 2 > n {
+        return false;
+    }
+    var pend: usize = n;
+    while pend > pstart && raw[pend - 1] != 125 as byte {
+        pend = pend - 1;
+    }
+    if pend <= pstart + 1 {
+        return false;
+    }
+    pend = pend - 1;   // 去掉最外层 `}`
+    var hex: [byte: 64] = [0: 64];
+    var hl: [usize: 1] = [0];
+    if !sha256_hex(&raw[pstart], pend - pstart, &hex[0: 64], &hl[0]) {
+        return false;
+    }
+    var i: usize = 0;
+    while i < 64 && i < hl[0] {
+        if hex[i] != raw[ks[0] + 1 + i] {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+// 逐版核对 bible/v*.json（到 current 为止），坏了就报 BIBLE_TAMPERED
+export fn check_bible(root: &const byte, rn: usize, id: &const byte,
+    idn: usize, a: &Audit) void {
+    var dir: [byte: 512] = [0: 512];
+    var dl: usize = 0;
+    if !adir(root, rn, id, idn, &dir[0: 512], &dl) {
+        return;
+    }
+    var bdir: [byte: 512] = [0: 512];
+    var bdl: usize = 0;
+    if !path_join(&dir[0], dl, "bible" as &const byte, 5, &bdir[0: 512],
+        &bdl) {
+        return;
+    }
+    var cur: [byte: 128] = [0: 128];
+    var cl: [usize: 1] = [0];
+    if !read_file(&bdir[0], bdl, "current.json" as &const byte, 12,
+        &cur[0], 128, &cl[0]) {
+        return;
+    }
+    const top: i64 = anum(&cur[0], cl[0], "version" as &const byte);
+    var v: i64 = 1;
+    while v <= top {
+        var nm: [byte: 24] = [0: 24];
+        var nn: usize = 0;
+        nn = nn + j_put_raw(&nm[0: 24], nn, "v" as &const byte, 1);
+        nn = nn + j_put_i64(&nm[0: 24], nn, v);
+        nn = nn + j_put_raw(&nm[0: 24], nn, ".json" as &const byte, 5);
+        var raw: [byte: 16384] = [0: 16384];
+        var rl: [usize: 1] = [0];
+        if read_file(&bdir[0], bdl, &nm[0], nn, &raw[0], 16384, &rl[0]) {
+            if !bible_snapshot_ok(&raw[0], rl[0]) {
+                vio_obj(a, "BIBLE_TAMPERED" as &const byte,
+                    "bible snapshot hash does not match its payload"
+                    as &const byte, &nm[0], nn);
+            }
+        }
+        v = v + 1;
+    }
+}
+
+// 笑点重复：最近 20 集里同一段 comedy.setup 出现超过 2 次就算重复
+export fn check_comedy(root: &const byte, rn: usize, id: &const byte,
+    idn: usize, a: &Audit) void {
+    var dir: [byte: 512] = [0: 512];
+    var dl: usize = 0;
+    if !adir(root, rn, id, idn, &dir[0: 512], &dl) {
+        return;
+    }
+    var sdir: [byte: 512] = [0: 512];
+    var sdl: usize = 0;
+    if !path_join(&dir[0], dl, "scripts" as &const byte, 7,
+        &sdir[0: 512], &sdl) {
+        return;
+    }
+    var seen: [byte: 1280] = [0: 1280];
+    var slens: [usize: 20] = [0: 20];
+    var nseen: usize = 0;
+    var counts: [i64: 20] = [0: 20];
+    var lo: i64 = a.revision -| 19;
+    if lo < 1 {
+        lo = 1;
+    }
+    var v: i64 = lo;
+    while v <= a.revision {
+        var nm: [byte: 24] = [0: 24];
+        var nn: usize = 0;
+        nn = nn + j_put_raw(&nm[0: 24], nn, "v" as &const byte, 1);
+        nn = nn + j_put_i64(&nm[0: 24], nn, v);
+        nn = nn + j_put_raw(&nm[0: 24], nn, ".json" as &const byte, 5);
+        var raw: [byte: 32768] = [0: 32768];
+        var rl: [usize: 1] = [0];
+        if read_file(&sdir[0], sdl, &nm[0], nn, &raw[0], 32768, &rl[0]) {
+            var ss: [usize: 1] = [0];
+            var ssl: [usize: 1] = [0];
+            if j_span(&raw[0], rl[0], "screenplay" as &const byte,
+                &ss[0], &ssl[0]) == 123 as byte {
+                var cs: [usize: 1] = [0];
+                var csl: [usize: 1] = [0];
+                if j_span(&raw[ss[0]], ssl[0], "comedy" as &const byte,
+                    &cs[0], &csl[0]) == 123 as byte {
+                    var st: [byte: 64] = [0: 64];
+                    var stl: usize = 0;
+                    if j_str(&raw[ss[0] + cs[0]], csl[0],
+                        "setup" as &const byte, &st[0: 64], &stl)
+                        && stl > 0 {
+                        comedy_bump(&seen[0: 1280], &slens[0: 20],
+                            &counts[0: 20], &nseen, &st[0], stl);
+                    }
+                }
+            }
+        }
+        v = v + 1;
+    }
+    // 只在窗口装满（20 集）时才判重复率：同一 setup 出现超过一半
+    var i: usize = 0;
+    while a.revision >= 20 && i < nseen && i < 20 {
+        if counts[i] > 10 {
+            vio_obj(a, "COMEDY_REPEAT" as &const byte,
+                "same comedy setup repeated in 20 episodes"
+                as &const byte, &seen[i * 64], slens[i]);
+        }
+        i = i + 1;
+    }
+}
+
+fn comedy_bump(seen: &[byte], slens: &[usize], counts: &[i64],
+    nseen: &usize, s: &const byte, sn: usize) void {
+    var i: usize = 0;
+    while i < nseen[0] && i < 20 {
+        if slens[i] == sn && aud_is(&seen[i * 64], sn, s, sn) {
+            counts[i] = counts[i] +| 1;
+            return;
+        }
+        i = i + 1;
+    }
+    if nseen[0] >= 20 {
+        return;
+    }
+    var k: usize = 0;
+    while k < sn && k < 63 {
+        seen[nseen[0] * 64 + k] = s[k];
+        k = k + 1;
+    }
+    slens[nseen[0]] = k;
+    counts[nseen[0]] = 1;
+    nseen[0] = nseen[0] + 1;
+}
+
+fn aud_is(a: &const byte, an: usize, b: &const byte, bn: usize) bool {
+    if an != bn {
+        return false;
+    }
+    var i: usize = 0;
+    while i < an {
+        if a[i] != b[i] {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+// 全历史重放：任何历史提交里的不合规事件（孤儿变更/时间冲突/规则被推翻）
+// 都会在重放时现形；重放状态与记录 state 不一致同样要报。
+fn check_history(root: &const byte, rn: usize, id: &const byte,
+    idn: usize, a: &Audit) void {
+    var buf: &byte = malloc(4096) as &byte;
+    defer { free(buf as &void); }
+    if (buf as usize) == 0 {
+        return;
+    }
+    var bl: [usize: 1] = [0];
+    if canon_replay_history(root, rn, id, idn, &buf[0: 4096], &bl[0])
+        != 0 {
+        return;
+    }
+    if !flag_true(buf, bl[0], "ok" as &const byte) {
+        vio(a, "HISTORY_CONTRADICTION" as &const byte,
+            "history replays to a different state" as &const byte);
+    }
+}
+
+// 主审计：每次检查所有提交，避免缓存掩盖历史篡改。
+export fn audit_run(root: &const byte, rn: usize, id: &const byte,
+    idn: usize, out: &[byte], out_len: &usize) i32 {
+    out_len[0] = 0;
+    if !project_id_ok(id, idn) {
+        return 50;
+    }
+    var dir: [byte: 512] = [0: 512];
+    var dl: usize = 0;
+    if !adir(root, rn, id, idn, &dir[0: 512], &dl) {
+        return 94;
+    }
+    var canon: [byte: AUDIT_BUF] = [0: AUDIT_BUF];
+    var cn: usize = 0;
+    const has_canon: bool = read_file(&dir[0], dl, "canon.json" as
+        &const byte, 10, &canon[0], AUDIT_BUF, &cn);
+
+    var a: Audit = blank_audit();
+    if has_canon {
+        a.revision = anum(&canon[0], cn, "revision" as &const byte);
+        a.timeline = anum(&canon[0], cn, "timeline" as &const byte);
+    }
+    var cdir: [byte: 512] = [0: 512];
+    var cdl: usize = 0;
+    if path_join(&dir[0], dl, "commits" as &const byte, 7,
+        &cdir[0: 512], &cdl) {
+        check_replay(&cdir[0], cdl, &a);
+    }
+    if has_canon {
+        a.props = count_items(&canon[0], cn, "props" as &const byte);
+        a.chars = count_items(&canon[0], cn, "characters" as &const byte);
+        a.scenes = count_items(&canon[0], cn, "scenes" as &const byte);
+        a.rules = count_items(&canon[0], cn, "rules" as &const byte);
+        tally_promises(&canon[0], cn, &a);
+        check_scenes(&canon[0], cn, "props" as &const byte, &a,
+            "PROP_IN_UNKNOWN_SCENE" as &const byte);
+        check_scenes(&canon[0], cn, "characters" as &const byte, &a,
+            "CHARACTER_IN_UNKNOWN_SCENE" as &const byte);
+        if a.commits > 0 && a.revision < a.commits {
+            vio(&a, "CANON_BEHIND_COMMITS" as &const byte,
+                "canon revision is behind commits" as &const byte);
+        }
+        check_hooks(root, rn, id, idn, &a, &canon[0], cn);
+        check_assets(root, rn, id, idn, &a);
+        if a.promises_overdue > 0 {
+            vio(&a, "PROMISE_OVERDUE" as &const byte,
+                "open promise older than 3 revisions" as &const byte);
+        }
+    }
+    // 这两条不依赖 Canon：Bible 篡改在还没提交过剧情时也要能查出来
+    check_bible(root, rn, id, idn, &a);
+    check_comedy(root, rn, id, idn, &a);
+    // 全历史重放是 O(集数) 的活：增量审计只查水位之后，不重复整段重放
+    if g_since == 0 {
+        check_history(root, rn, id, idn, &a);
+    }
+    out_len[0] = audit_serialize(&a, out);
+    return 0;
+}
+
+fn count_items(canon: &const byte, cn: usize, key: &const byte) i64 {
+    var ss: [usize: 1] = [0];
+    var sl: [usize: 1] = [0];
+    if j_span(canon, cn, key, &ss[0], &sl[0]) != 91 as byte {
+        return 0;
+    }
+    var idx: usize = 0;
+    while true {
+        var es: [usize: 1] = [0];
+        var el: [usize: 1] = [0];
+        if !j_arr_item(&canon[ss[0]], sl[0], idx, &es[0], &el[0]) {
+            break;
+        }
+        idx = idx + 1;
+    }
+    return idx as i64;
+}
+
+fn audit_serialize(a: &const Audit, out: &[byte]) usize {
+    var w: usize = 0;
+    w = w + j_put(out, w, "{\"ok\":" as &const byte);
+    if a.n == 0 {
+        w = w + j_put(out, w, "true" as &const byte);
+    } else {
+        w = w + j_put(out, w, "false" as &const byte);
+    }
+    w = w + j_put(out, w, ",\"revision\":" as &const byte);
+    w = w + j_put_i64(out, w, a.revision);
+    w = w + j_put(out, w, ",\"commits\":" as &const byte);
+    w = w + j_put_i64(out, w, a.commits);
+    w = w + j_put(out, w, ",\"replay_ok\":" as &const byte);
+    if a.replay_ok {
+        w = w + j_put(out, w, "true" as &const byte);
+    } else {
+        w = w + j_put(out, w, "false" as &const byte);
+    }
+    w = w + j_put(out, w, ",\"ledger\":{\"props\":" as &const byte);
+    w = w + j_put_i64(out, w, a.props);
+    w = w + j_put(out, w, ",\"characters\":" as &const byte);
+    w = w + j_put_i64(out, w, a.chars);
+    w = w + j_put(out, w, ",\"scenes\":" as &const byte);
+    w = w + j_put_i64(out, w, a.scenes);
+    w = w + j_put(out, w, ",\"promises_open\":" as &const byte);
+    w = w + j_put_i64(out, w, a.promises_open);
+    w = w + j_put(out, w, ",\"promises_closed\":" as &const byte);
+    w = w + j_put_i64(out, w, a.promises_closed);
+    w = w + j_put(out, w, ",\"promises_overdue\":" as &const byte);
+    w = w + j_put_i64(out, w, a.promises_overdue);
+    // 回收率 = closed / (closed + overdue)；没有承诺就当 100
+    const ptotal: i64 = a.promises_closed +| a.promises_overdue;
+    var rate: i64 = 100;
+    if ptotal > 0 {
+        rate = (a.promises_closed *| 100) / ptotal;
+    }
+    w = w + j_put(out, w, ",\"payoff_rate_pct\":" as &const byte);
+    w = w + j_put_i64(out, w, rate);
+    w = w + j_put(out, w, ",\"rules\":" as &const byte);
+    w = w + j_put_i64(out, w, a.rules);
+    w = w + j_put(out, w, ",\"timeline_ms\":" as &const byte);
+    w = w + j_put_i64(out, w, a.timeline);
+    w = w + j_put(out, w, "},\"violations\":[" as &const byte);
+    var i: usize = 0;
+    while i < a.n {
+        if i > 0 {
+            w = w + j_put(out, w, "," as &const byte);
+        }
+        w = w + j_put(out, w, "{\"code\":" as &const byte);
+        w = w + j_put_str(out, w, &a.vios[i].code[0], a.vios[i].code_len);
+        w = w + j_put(out, w, ",\"detail\":" as &const byte);
+        w = w + j_put_str(out, w, &a.vios[i].detail[0],
+            a.vios[i].detail_len);
+        if a.vios[i].obj_len > 0 {
+            w = w + j_put(out, w, ",\"object\":" as &const byte);
+            w = w + j_put_str(out, w, &a.vios[i].obj[0],
+                a.vios[i].obj_len);
+        }
+        w = w + j_put(out, w, "}" as &const byte);
+        i = i + 1;
+    }
+    w = w + j_put(out, w, "]}" as &const byte);
+    return w;
+}
+
+// promise.report：承诺回收率（closed / (closed+open)，百分之一为单位）
+export fn promise_report(root: &const byte, rn: usize, id: &const byte,
+    idn: usize, out: &[byte], out_len: &usize) i32 {
+    out_len[0] = 0;
+    if !project_id_ok(id, idn) {
+        return 50;
+    }
+    var canon: [byte: AUDIT_BUF] = [0: AUDIT_BUF];
+    var cn: usize = 0;
+    var a: Audit = blank_audit();
+    if read_file_root(root, rn, id, idn, &canon[0], AUDIT_BUF, &cn) {
+        a.revision = anum(&canon[0], cn, "revision" as &const byte);
+        tally_promises(&canon[0], cn, &a);
+    }
+    const total: i64 = a.promises_open +| a.promises_closed;
+    var w: usize = 0;
+    w = w + j_put(out, w, "{\"open\":" as &const byte);
+    w = w + j_put_i64(out, w, a.promises_open);
+    w = w + j_put(out, w, ",\"closed\":" as &const byte);
+    w = w + j_put_i64(out, w, a.promises_closed);
+    w = w + j_put(out, w, ",\"overdue\":" as &const byte);
+    w = w + j_put_i64(out, w, a.promises_overdue);
+    w = w + j_put(out, w, ",\"collected_permille\":" as &const byte);
+    if total > 0 {
+        w = w + j_put_i64(out, w, ((a.promises_closed *| 1000) / total));
+    } else {
+        w = w + j_put_i64(out, w, 0);
+    }
+    w = w + j_put(out, w, "}" as &const byte);
+    out_len[0] = w;
+    return 0;
+}
+
+fn read_file_root(root: &const byte, rn: usize, id: &const byte,
+    idn: usize, out: &byte, cap: usize, out_len: &usize) bool {
+    var dir: [byte: 512] = [0: 512];
+    var dl: usize = 0;
+    if !adir(root, rn, id, idn, &dir[0: 512], &dl) {
+        return false;
+    }
+    return read_file(&dir[0], dl, "canon.json" as &const byte, 10, out,
+        cap, out_len);
+}
+
+// 九条不变量的逐条判定（设计 §6.11）：每条给 ok + 证据计数
+struct Pred {
+    code: [byte: 32],
+    code_len: usize,
+    ok: bool,
+    hits: i64,
+}
+
+fn blank_preds() [Pred: 9] {
+    return [Pred{ code: [0: 32], code_len: 0, ok: true, hits: 0 }: 9];
+}
+
+fn pred_code(i: usize) &const byte {
+    if i == 0 {
+        return "PROMISE_OVERDUE" as &const byte;
+    }
+    if i == 1 {
+        return "HOOK_UNANSWERED" as &const byte;
+    }
+    if i == 2 {
+        return "CHARACTER_DRIFT" as &const byte;
+    }
+    if i == 3 {
+        return "KNOWLEDGE_LEAK" as &const byte;
+    }
+    if i == 4 {
+        return "PROP_TELEPORT" as &const byte;
+    }
+    if i == 5 {
+        return "SCENE_DRIFT" as &const byte;
+    }
+    if i == 6 {
+        return "ORPHAN_CHANGE" as &const byte;
+    }
+    if i == 7 {
+        return "TIMELINE_CONFLICT" as &const byte;
+    }
+    return "RULE_VIOLATION" as &const byte;
+}
+
+// 逐条判定：把审计结果按错误码归到九条上
+export fn invariant_check(root: &const byte, rn: usize, id: &const byte,
+    idn: usize, out: &[byte], out_len: &usize) i32 {
+    out_len[0] = 0;
+    var buf: [byte: AUDIT_BUF] = [0: AUDIT_BUF];
+    var bl: [usize: 1] = [0];
+    const rc: i32 = audit_run(root, rn, id, idn, &buf[0: AUDIT_BUF],
+        &bl[0]);
+    if rc != 0 {
+        return rc;
+    }
+    var preds: [Pred: 9] = blank_preds();
+    var vs: [usize: 1] = [0];
+    var vl: [usize: 1] = [0];
+    if j_span(&buf[0], bl[0], "violations" as &const byte, &vs[0],
+        &vl[0]) == 91 as byte {
+        var idx: usize = 0;
+        while true {
+            var es: [usize: 1] = [0];
+            var el: [usize: 1] = [0];
+            if !j_arr_item(&buf[vs[0]], vl[0], idx, &es[0], &el[0]) {
+                break;
+            }
+            const it: &const byte = &buf[vs[0] + es[0]];
+            var code: [byte: 40] = [0: 40];
+            var cl: usize = 0;
+            _ = j_str(it, el[0], "code" as &const byte, &code[0: 40], &cl);
+            var k: usize = 0;
+            while k < 9 {
+                const want: &const byte = pred_code(k);
+                if eqb(&code[0], cl, want, b_len(want)) {
+                    if k < @len(preds) {
+                        preds[k].ok = false;
+                        preds[k].hits = preds[k].hits +| 1;
+                    }
+                }
+                k = k + 1;
+            }
+            idx = idx + 1;
+        }
+    }
+    var w: usize = 0;
+    w = w + j_put(out, w, "{\"predicates\":[" as &const byte);
+    var i: usize = 0;
+    while i < 9 {
+        if i > 0 {
+            w = w + j_put(out, w, "," as &const byte);
+        }
+        const code: &const byte = pred_code(i);
+        w = w + j_put(out, w, "{\"code\":" as &const byte);
+        w = w + j_put_str(out, w, code, b_len(code));
+        w = w + j_put(out, w, ",\"ok\":" as &const byte);
+        if preds[i].ok {
+            w = w + j_put(out, w, "true" as &const byte);
+        } else {
+            w = w + j_put(out, w, "false" as &const byte);
+        }
+        w = w + j_put(out, w, ",\"hits\":" as &const byte);
+        w = w + j_put_i64(out, w, preds[i].hits);
+        w = w + j_put(out, w, "}" as &const byte);
+        i = i + 1;
+    }
+    w = w + j_put(out, w, "]}" as &const byte);
+    out_len[0] = w;
+    return 0;
+}
+
+fn eqb(a: &const byte, an: usize, b: &const byte, bn: usize) bool {
+    if an != bn {
+        return false;
+    }
+    var i: usize = 0;
+    while i < an {
+        if a[i] != b[i] {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}

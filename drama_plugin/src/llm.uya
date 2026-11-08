@@ -1,0 +1,431 @@
+// drama_plugin/src/llm.uya — LLM Provider 适配层（P5 传输层 + Adapter 骨架）
+//
+// 配置来源是**文件**不是环境变量（MCP 子进程只拿到白名单 env，见
+// P0_FINDINGS §2.2）：<root>/llm.json
+//   {"provider":"mock|openai","base_url":"127.0.0.1","port":8080,
+//    "tls":false,"path":"/v1/chat/completions","model":"m",
+//    "timeout_ms":3000,"max_retries":1}
+//
+// 支持的 Provider：
+//   * mock   —— 确定性输出，不联网；单测与离线环境用
+//   * openai —— 任何 OpenAI 兼容的 /chat/completions（含本机网关/ollama）
+//
+// 返回码：0 成功 70 连接失败 71 写失败 72 超时/读失败 73 响应格式不认识
+//         75 DNS 失败 80 配置缺失/非法 81 Provider 不支持
+//         82 HTTP 非 200 83 模型输出不是 JSON 84 结构化校验失败
+
+use libc.syscall;
+use libc.unistd;
+
+const LLM_BUF: usize = 32768;
+// Prompt/输入版本：改模板时递增，随调用摘要落盘
+const PROMPT_VERSION: i64 = 1;
+const CFG_FILE: &const byte = "llm.json" as &const byte;
+
+struct LlmConfig {
+    is_mock: bool,
+    host: [byte: 128],
+    host_len: usize,
+    port: u16,
+    use_tls: bool,
+    path: [byte: 128],
+    path_len: usize,
+    model: [byte: 64],
+    model_len: usize,
+    timeout_ms: i32,
+    max_retries: i32,
+    api_key: [byte: 256],
+    api_key_len: usize,
+}
+
+// 默认 = mock、不联网：没配置也能跑（离线环境 / 单测）
+fn cfg_default() LlmConfig {
+    return LlmConfig{ is_mock: true, host: [0: 128], host_len: 0,
+        port: 8080, use_tls: false, path: [0: 128], path_len: 0,
+        model: [0: 64], model_len: 0, timeout_ms: 3000, max_retries: 1,
+        api_key: [0: 256], api_key_len: 0 };
+}
+
+fn get_str_or(buf: &const byte, n: usize, key: &const byte,
+    out: &[byte], out_len: &usize) bool {
+    return j_str(buf, n, key, out, out_len);
+}
+
+fn get_int_or(buf: &const byte, n: usize, key: &const byte, dflt: i64) i64 {
+    var st: [usize: 1] = [0];
+    var ln: [usize: 1] = [0];
+    const k: byte = j_span(buf, n, key, &st[0], &ln[0]);
+    if k == 0 as byte || k == 34 as byte || k == 123 as byte {
+        return dflt;
+    }
+    var i: usize = 0;
+    var v: i64 = 0;
+    while i < ln[0] {
+        const c: byte = buf[st[0] + i];
+        if c < 48 as byte || c > 57 as byte {
+            break;
+        }
+        v = v *| 10;
+        v = v +| ((c as i64) -| 48);
+        i = i + 1;
+    }
+    return v;
+}
+
+// 读 <root>/llm.json；没有就用 mock 默认
+export fn llm_config_load(root: &const byte, rn: usize,
+    c: &LlmConfig) i32 {
+    c[0] = cfg_default();
+    var buf: [byte: 4096] = [0: 4096];
+    var bl: usize = 0;
+    if !read_file(root, rn, CFG_FILE, b_len(CFG_FILE), &buf[0], 4096, &bl) {
+        return 0;   // 没有配置 = mock，可离线跑
+    }
+    var prov: [byte: 32] = [0: 32];
+    var pl: usize = 0;
+    if get_str_or(&buf[0], bl, "provider" as &const byte, &prov[0: 32], &pl) {
+        if b_eq(&prov[0], pl, "mock" as &const byte) {
+            c.is_mock = true;
+        } else if b_eq(&prov[0], pl, "openai" as &const byte) {
+            c.is_mock = false;
+        } else {
+            return 81;
+        }
+    }
+    _ = get_str_or(&buf[0], bl, "base_url" as &const byte, &c.host[0: 128],
+        &c.host_len);
+    _ = get_str_or(&buf[0], bl, "path" as &const byte, &c.path[0: 128],
+        &c.path_len);
+    _ = get_str_or(&buf[0], bl, "model" as &const byte, &c.model[0: 64],
+        &c.model_len);
+    const port: i64 = get_int_or(&buf[0], bl, "port" as &const byte, 8080);
+    c.port = port as! u16 catch { 8080 as u16; };
+    const tls: i64 = get_int_or(&buf[0], bl, "tls" as &const byte, 0);
+    c.use_tls = tls != 0;
+    const tmo: i64 = get_int_or(&buf[0], bl, "timeout_ms" as &const byte,
+        3000);
+    c.timeout_ms = tmo as! i32 catch { 3000 as i32; };
+    _ = get_str_or(&buf[0], bl, "api_key" as &const byte,
+        &c.api_key[0: 256], &c.api_key_len);
+    const retries: i64 = get_int_or(&buf[0], bl, "max_retries" as &const byte,
+        1);
+    c.max_retries = retries as! i32 catch { 1 as i32; };
+    if !c.is_mock && (c.host_len == 0 || c.path_len == 0) {
+        return 80;
+    }
+    load_proxy(root, rn);
+    return 0;
+}
+
+// 代理只能来自配置文件（子进程的 env 是白名单，指望不上）
+fn load_proxy(root: &const byte, rn: usize) void {
+    var buf: [byte: 1024] = [0: 1024];
+    var bl: usize = 0;
+    if !read_file(root, rn, "proxy.json" as &const byte, 10, &buf[0],
+        1024, &bl) {
+        httpc_set_proxy("" as &const byte, 0, "" as &const byte, 0);
+        return;
+    }
+    var px: [byte: 256] = [0: 256];
+    var pl: usize = 0;
+    var none: [byte: 256] = [0: 256];
+    var nl: usize = 0;
+    if !get_str_or(&buf[0], bl, "http_proxy" as &const byte,
+        &px[0: 256], &pl) {
+        httpc_set_proxy("" as &const byte, 0, "" as &const byte, 0);
+        return;
+    }
+    _ = get_str_or(&buf[0], bl, "no_proxy" as &const byte,
+        &none[0: 256], &nl);
+    httpc_set_proxy(&px[0], pl, &none[0], nl);
+}
+
+// ---- 请求体与响应解析 ----
+
+// 组 OpenAI 兼容的 chat/completions 请求体（messages 只有一条 user）
+fn build_body(c: &const LlmConfig, prompt: &const byte, pn: usize,
+    out: &[byte]) usize {
+    var w: usize = 0;
+    w = w + j_put(out, w, "{\"model\":" as &const byte);
+    w = w + j_put_str(out, w, &c.model[0], c.model_len);
+    w = w + j_put(out, w, ",\"temperature\":0," as &const byte);
+    w = w + j_put(out, w,
+        "\"messages\":[{\"role\":\"user\",\"content\":" as &const byte);
+    w = w + j_put_str(out, w, prompt, pn);
+    w = w + j_put(out, w, "}]}" as &const byte);
+    return w;
+}
+
+// JSON 字符串反转义（只处理 OpenAI 会用的那几种）
+fn copy_unescaped(src: &const byte, n: usize, out: &[byte],
+    out_len: &usize) bool {
+    var i: usize = 0;
+    var w: usize = 0;
+    while i < n && w < out.len {
+        const c: byte = src[i];
+        if c != 92 as byte {
+            out[w] = c;
+            w = w + 1;
+            i = i + 1;
+        } else if i + 1 < n {
+            const nx: byte = src[i + 1];
+            var rep: byte = nx;
+            if nx == 110 as byte {
+                rep = 10 as byte;
+            } else if nx == 116 as byte {
+                rep = 9 as byte;
+            } else if nx == 114 as byte {
+                rep = 13 as byte;
+            }
+            out[w] = rep;
+            w = w + 1;
+            i = i + 2;
+        } else {
+            break;
+        }
+    }
+    out_len[0] = w;
+    return w > 0;
+}
+
+// 从响应里取 choices[0].message.content（OpenAI 兼容形状）
+fn extract_content(buf: &[byte], n: usize, out: &[byte],
+    out_len: &usize) i32 {
+    out_len[0] = 0;
+    var cs: [usize: 1] = [0];
+    var cl: [usize: 1] = [0];
+    if j_span(buf, n, "choices" as &const byte, &cs[0], &cl[0])
+        != 91 as byte {
+        return 73;
+    }
+    var is0: [usize: 1] = [0];
+    var il0: [usize: 1] = [0];
+    if !j_arr_item(&buf[cs[0]], cl[0], 0, &is0[0], &il0[0]) {
+        return 73;
+    }
+    const item: &const byte = &buf[cs[0] + is0[0]];
+    var ms: [usize: 1] = [0];
+    var ml: [usize: 1] = [0];
+    if j_span(item, il0[0], "message" as &const byte, &ms[0], &ml[0])
+        != 123 as byte {
+        return 73;
+    }
+    const msg: &const byte = &item[ms[0]];
+    var st: [usize: 1] = [0];
+    var ln: [usize: 1] = [0];
+    const k: byte = j_span(msg, ml[0], "content" as &const byte,
+        &st[0], &ln[0]);
+    if k != 34 as byte || ln[0] < 3 {
+        return 73;
+    }
+    if !copy_unescaped(&msg[st[0] + 1], ln[0] - 2, out, out_len) {
+        return 73;
+    }
+    return 0;
+}
+
+// 结构化输出校验：剧本必须是对象且带 scenes 数组
+export fn llm_validate_screenplay(buf: &const byte, n: usize) i32 {
+    if n == 0 {
+        return 83;
+    }
+    // 第一层：模型返回的 content 本身得是 JSON 对象
+    var s0: usize = 0;
+    while s0 < n && (buf[s0] == 32 as byte || buf[s0] == 10 as byte) {
+        s0 = s0 + 1;
+    }
+    if s0 >= n || buf[s0] != 123 as byte {
+        return 83;
+    }
+    var st: [usize: 1] = [0];
+    var ln: [usize: 1] = [0];
+    if j_span(buf, n, "scenes" as &const byte, &st[0], &ln[0]) != 91 as byte {
+        return 84;
+    }
+    var ts: [usize: 1] = [0];
+    var tl: [usize: 1] = [0];
+    if j_span(buf, n, "title" as &const byte, &ts[0], &tl[0]) != 34 as byte {
+        return 84;
+    }
+    return 0;
+}
+
+// mock Provider：确定性输出，形状与真实模型一致
+fn mock_response(out: &[byte]) usize {
+    var w: usize = 0;
+    w = w + j_put(out, w,
+        "{\"theme\":\"亲情与误会\",\"conflict\":\"爸爸想管教孩子，孩子想" as &const byte);
+    w = w + j_put(out, w,
+        "留住遥控器\",\"comedy\":{\"setup\":\"孩子把遥控器塞进冰箱\",\"p" as &const byte);
+    w = w + j_put(out, w,
+        "ayoff\":\"爸爸从自己口袋摸出遥控器\"},\"twist\":\"遥控器一直有两只" as &const byte);
+    w = w + j_put(out, w,
+        "\",\"title\":\"mock-episode\"," as &const byte);
+    w = w + j_put(out, w,
+        "\"hook\":\"冰箱里的遥控器是谁放的？\"," as &const byte);
+    w = w + j_put(out, w, "\"scenes\":[" as &const byte);
+    w = w + j_put(out, w, "{\"no\":1," as &const byte);
+    w = w + j_put(out, w,
+        "\"action\":\"爸爸把遥控器放回茶几。\"," as &const byte);
+    w = w + j_put(out, w,
+        "\"dialogue\":[{\"who\":\"dad\"," as &const byte);
+    w = w + j_put(out, w,
+        "\"line\":\"谁把冰箱门开着？\"}]}," as &const byte);
+    w = w + j_put(out, w, "{\"no\":2," as &const byte);
+    w = w + j_put(out, w,
+        "\"action\":\"孩子把遥控器塞进冰箱\"," as &const byte);
+    w = w + j_put(out, w, "\"dialogue\":[]}" as &const byte);
+    w = w + j_put(out, w, "]," as &const byte);
+    w = w + j_put(out, w,
+        "\"candidate_events\":[{\"type\":\"scene.define\"," as &const byte);
+    w = w + j_put(out, w,
+        "\"scene\":\"kitchen\",\"time_of_day\":\"night\"}," as &const byte);
+    w = w + j_put(out, w,
+        "{\"type\":\"timeline.advance\",\"minutes\":5}]}" as &const byte);
+    return w;
+}
+
+// 调用摘要：模型/参数/尝试次数/输出 hash（不写 prompt 与密钥）
+fn llm_log(root: &const byte, rn: usize, c: &const LlmConfig,
+    prompt_n: usize, out: &[byte], outn: usize, rc: i32,
+    attempts: i32) void {
+    var path: [byte: 512] = [0: 512];
+    var pl: [usize: 1] = [0];
+    if !path_join(root, rn, "llm_calls.jsonl" as &const byte, 15,
+        &path[0: 512], &pl[0]) {
+        return;
+    }
+    var hex: [byte: 64] = [0: 64];
+    var hl: [usize: 1] = [0];
+    if !sha256_hex(out, outn, &hex[0: 64], &hl[0]) {
+        return;
+    }
+    var buf: [byte: 1024] = [0: 1024];
+    var w: usize = 0;
+    w = w + j_put(&buf[0: 1024], w,
+        "{\"format_version\":1,\"prompt_version\":" as &const byte);
+    w = w + j_put_i64(&buf[0: 1024], w, PROMPT_VERSION);
+    w = w + j_put(&buf[0: 1024], w, ",\"model\":" as &const byte);
+    w = w + j_put_str(&buf[0: 1024], w, &c.model[0], c.model_len);
+    w = w + j_put(&buf[0: 1024], w,
+        ",\"temperature\":0,\"timeout_ms\":" as &const byte);
+    w = w + j_put_i64(&buf[0: 1024], w, c.timeout_ms as i64);
+    w = w + j_put(&buf[0: 1024], w, ",\"max_retries\":" as &const byte);
+    w = w + j_put_i64(&buf[0: 1024], w, c.max_retries as i64);
+    w = w + j_put(&buf[0: 1024], w, ",\"attempts\":" as &const byte);
+    w = w + j_put_i64(&buf[0: 1024], w, attempts as i64);
+    w = w + j_put(&buf[0: 1024], w, ",\"rc\":" as &const byte);
+    w = w + j_put_i64(&buf[0: 1024], w, rc as i64);
+    w = w + j_put(&buf[0: 1024], w, ",\"prompt_chars\":" as &const byte);
+    w = w + j_put_i64(&buf[0: 1024], w, prompt_n as i64);
+    w = w + j_put(&buf[0: 1024], w, ",\"output_chars\":" as &const byte);
+    w = w + j_put_i64(&buf[0: 1024], w, outn as i64);
+    w = w + j_put(&buf[0: 1024], w, ",\"output_sha256\":\"" as &const byte);
+    w = w + j_put_raw(&buf[0: 1024], w, &hex[0], hl[0]);
+    w = w + j_put(&buf[0: 1024], w, "\"}" as &const byte);
+    buf[w] = 10 as byte;
+    w = w + 1;
+    const fd: i32 = sys_open(&path[0], 1089, 384) catch {
+        return;
+    };
+    _ = sys_write(fd, &buf[0], w) catch { 0 as isize; };
+    _ = sys_close(fd) catch { 0 as i32; };
+}
+
+
+// 一次调用（含重试）；out 是模型返回的 content（不是 HTTP 体）
+export fn llm_complete(root: &const byte, rn: usize, prompt: &const byte,
+    pn: usize, out: &[byte], out_len: &usize) i32 {
+    out_len[0] = 0;
+    var c: LlmConfig = cfg_default();
+    const crc: i32 = llm_config_load(root, rn, &c);
+    if crc != 0 {
+        return crc;
+    }
+    if c.is_mock {
+        out_len[0] = mock_response(out);
+        return 0;
+    }
+    var body: [byte: 8192] = [0: 8192];
+    const body_len: usize = build_body(&c, prompt, pn, &body[0: 8192]);
+    var attempt: i32 = 0;
+    var last: i32 = 72;
+    var calls: i32 = 0;
+    while attempt <= c.max_retries {
+        calls = calls + 1;
+        last = llm_once(&c, &body[0], body_len, out, out_len);
+        if last == 0 {
+            llm_log(root, rn, &c, pn, out, out_len[0], 0, calls);
+            return 0;
+        }
+        // 只有网络类错误才重试；4xx 重试没意义
+        if last != 70 && last != 71 && last != 72 && last != 75 {
+            llm_log(root, rn, &c, pn, out, out_len[0], last, calls);
+            return last;
+        }
+        attempt = attempt + 1;
+    }
+    llm_log(root, rn, &c, pn, out, out_len[0], last, calls);
+    return last;
+}
+
+// 剧本结构化输出：首次不是合法 JSON/结构时，补一句"只输出 JSON"再试一次
+export fn llm_complete_repair(root: &const byte, rn: usize,
+    prompt: &const byte, pn: usize, out: &[byte], out_len: &usize) i32 {
+    var rc: i32 = llm_complete(root, rn, prompt, pn, out, out_len);
+    if rc == 0 {
+        const vr: i32 = llm_validate_screenplay(out, out_len[0]);
+        if vr == 0 {
+            return 0;
+        }
+        rc = vr;
+    }
+    if rc != 83 && rc != 84 {
+        return rc;
+    }
+    var pb: [byte: 4096] = [0: 4096];
+    var w: usize = 0;
+    var i: usize = 0;
+    while i < pn && w < 3900 {
+        pb[w] = prompt[i];
+        w = w + 1;
+        i = i + 1;
+    }
+    const sfx: &const byte = "\n\n只输出严格 JSON，不要解释、不要代码块。"
+        as &const byte;
+    const sl: usize = b_len(sfx);
+    i = 0;
+    while i < sl && w < 4096 {
+        pb[w] = sfx[i];
+        w = w + 1;
+        i = i + 1;
+    }
+    return llm_complete(root, rn, &pb[0], w, out, out_len);
+}
+
+fn llm_once(c: &const LlmConfig, body: &const byte, bn: usize,
+    out: &[byte], out_len: &usize) i32 {
+    var resp: &byte = malloc(LLM_BUF) as &byte;
+    defer { free(resp as &void); }
+    if (resp as usize) == 0 {
+        return 72;
+    }
+    var rl: [usize: 1] = [0];
+    var status: [i32: 1] = [0];
+    var hdr: [usize: 1] = [0];
+    const rc: i32 = httpc_post(&c.host[0], c.host_len, c.port, c.use_tls,
+        &c.path[0], c.path_len, body, bn, &c.api_key[0], c.api_key_len,
+        c.timeout_ms,
+        &resp[0: LLM_BUF], &rl[0], &status[0], &hdr[0]);
+    if rc != 0 {
+        return rc;
+    }
+    if status[0] != 200 {
+        return 82;
+    }
+    if hdr[0] >= rl[0] {
+        return 73;
+    }
+    const body_n: usize = rl[0] - hdr[0];
+    return extract_content(&resp[hdr[0]: LLM_BUF], body_n, out, out_len);
+}

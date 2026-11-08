@@ -1,0 +1,569 @@
+// drama_plugin/proto/mcp_stdio.ush
+//
+// P0 原型 B1/B2：用 Uya 写一个能被 uya-agent 连上的 drama MCP server。
+//
+// 它只证明四件事（对应 DRAMA_TODO P0 §2.2 的前两条）：
+//   1. 四个基础方法（initialize / notifications/initialized / tools/list /
+//      tools/call）的闭环；
+//   2. stdout 上的帧是**单行紧凑 JSON**、不夹日志；日志只走 stderr；
+//   3. 未知方法回 -32601（宿主据此放行）；
+//   4. EOF 干净退出（返回 0）。
+//
+// 三个工具用 DESIGN §4.1 定的 raw 名：list / describe / call
+// （公开名由宿主拼成 mcp__drama__list 等）。
+//
+// 业务语义（DESIGN §4.6）：
+//   - 业务/校验失败 ⇒ JSON-RPC 成功，文本里 {"success":false,...}，
+//     `isError` 为 **false**，让模型自己纠正；
+//   - 协议/基础设施失败 ⇒ JSON-RPC error（-32601 等）。
+//
+// 运行：printf '…' | uya run drama_plugin/proto/mcp_stdio.ush
+// 限制：`.ush` 环境里只有 libc + std.json，没有宿主自己的 Buf/jw_* 符号。
+
+use libc.syscall;
+use libc.unistd;
+use libc.heap;
+
+// 宿主 MCP 客户端的单行上限是 1 MiB，超限整行丢弃（DESIGN §4.2）。
+const LINE_MAX: usize = 1048576;
+// 单条工具结果的文本上限（远小于 1 MiB，留出信封余量）。
+const TEXT_MAX: usize = 65536;
+
+const OP0: &const byte = "project.create";
+const OP1: &const byte = "episode.produce";
+const OP2: &const byte = "continuity.inspect";
+
+// -------------------- 基础：C 串长度 / 写 --------------------
+
+fn slen(p: &const byte) usize {
+    var i: usize = 0;
+    while p[i] != 0 as byte {
+        i = i + 1;
+    }
+    return i;
+}
+
+fn write_all(fd: i32, p: &const byte, n: usize) bool {
+    var off: usize = 0;
+    while off < n {
+        const w: isize = sys_write(fd, &p[off], n - off) catch { -1 as isize; };
+        if w <= 0 {
+            return false;
+        }
+        off = off + (w as usize);
+    }
+    return true;
+}
+
+fn put(out: &Buf, p: &[byte]) bool {
+    const b: &Buf = out;
+    var i: usize = 0;
+    while i < p.len && b.len < b.cap {
+        b.ptr[b.len] = p[i];
+        b.len = b.len + 1;
+        i = i + 1;
+    }
+    return i == p.len;
+}
+
+fn put_cstr(out: &Buf, p: &const byte) bool {
+    return put(out, p[0: slen(p)]);
+}
+
+fn put_byte(out: &Buf, c: byte) bool {
+    var one: [byte: 1] = [c];
+    return put(out, &one[0: 1]);
+}
+
+// -------------------- 输出缓冲 --------------------
+
+struct Buf {
+    ptr: &byte,
+    len: usize,
+    cap: usize,
+}
+
+fn buf_new(cap: usize) Buf {
+    return Buf{ ptr: malloc(cap) as &byte, len: 0, cap: cap };
+}
+
+fn buf_free(b: &Buf) void {
+    free(b.ptr as &void);
+}
+
+fn emit(b: &Buf) void {
+    _ = write_all(1, b.ptr as &const byte, b.len);
+}
+
+// -------------------- 读一行（帧边界 = '\n'） --------------------
+
+// 超限行不缓存、不响应、但必须读到行尾再丢（DESIGN §4.2 的宿主口径）。
+fn read_line(buf: &byte, cap: usize, over: &bool) usize {
+    var i: usize = 0;
+    while true {
+        var c: [byte: 1] = [0: 1];
+        const n: isize = sys_read(0, &c[0], 1) catch { 0 as isize; };
+        if n <= 0 {
+            return i;
+        }
+        if c[0] == 10 as byte {
+            return i;
+        }
+        if i < cap {
+            buf[i] = c[0];
+            i = i + 1;
+        } else {
+            over[0] = true;
+        }
+    }
+}
+
+// -------------------- 从一行 JSON 里取值 --------------------
+
+fn find_key(p: &const byte, n: usize, key: &const byte) isize {
+    const kl: usize = slen(key);
+    var i: usize = 0;
+    while i + kl + 2 <= n {
+        if p[i] != 34 as byte {
+            i = i + 1;
+            continue;
+        }
+        var same: bool = true;
+        var k: usize = 0;
+        while k < kl {
+            if p[i + 1 + k] != key[k] {
+                same = false;
+                break;
+            }
+            k = k + 1;
+        }
+        if !same || p[i + 1 + kl] != 34 as byte {
+            i = i + 1;
+            continue;
+        }
+        var j: usize = i + 2 + kl;
+        while j < n && (p[j] == 32 as byte || p[j] == 9 as byte) {
+            j = j + 1;
+        }
+        if j < n && p[j] == 58 as byte {
+            return (j + 1) as isize;
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn json_str(p: &const byte, n: usize, key: &const byte, out: &Buf) bool {
+    out.len = 0;
+    const at: isize = find_key(p, n, key);
+    if at < 0 {
+        return false;
+    }
+    var i: usize = at as! usize catch { return false; };
+    while i < n && (p[i] == 32 as byte || p[i] == 9 as byte) {
+        i = i + 1;
+    }
+    if i >= n || p[i] != 34 as byte {
+        return false;
+    }
+    i = i + 1;
+    var esc: bool = false;
+    while i < n {
+        const c: byte = p[i];
+        if esc {
+            esc = false;
+            _ = put_byte(out, c);
+        } else if c == 92 as byte {
+            esc = true;
+        } else if c == 34 as byte {
+            return true;
+        } else {
+            _ = put_byte(out, c);
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn json_id(p: &const byte, n: usize) i64 {
+    const at: isize = find_key(p, n, "id" as &const byte);
+    if at < 0 {
+        return -1;
+    }
+    var i: usize = at as! usize catch { return -1; };
+    while i < n && (p[i] == 32 as byte || p[i] == 9 as byte) {
+        i = i + 1;
+    }
+    var v: i64 = 0;
+    var digits: usize = 0;
+    while i < n {
+        const c: byte = p[i];
+        if c < 48 as byte || c > 57 as byte {
+            break;
+        }
+        // 饱和运算符避免 i64 溢出证明失败（P0 实测：普通 * + 过不了
+        // --strict-overflow，这正是"Uya 写法要先验证"的一条实证）。
+        const d: i64 = (c as i64) - 48;
+        const v10: i64 = v *| 10;
+        v = v10 +| d;
+        digits = digits + 1;
+        i = i + 1;
+    }
+    if digits == 0 {
+        return -1;
+    }
+    return v;
+}
+
+fn method_is(p: &const byte, n: usize, want: &const byte) bool {
+    var mv: Buf = buf_new(256);
+    defer { buf_free(&mv); }
+    if !json_str(p, n, "method" as &const byte, &mv) {
+        return false;
+    }
+    const wl: usize = slen(want);
+    if mv.len != wl {
+        return false;
+    }
+    var i: usize = 0;
+    while i < wl {
+        if mv.ptr[i] != want[i] {
+            buf_free(&mv);
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+// -------------------- 写 JSON 数字 / 字符串 --------------------
+
+fn put_i64(out: &Buf, v: i64) bool {
+    if v == 0 {
+        return put(out, &"0"[0: 1]);
+    }
+    var tmp: [byte: 24] = [0: 24];
+    var n: usize = 0;
+    var x: i64 = v;
+    if v < 0 {
+        // JSON-RPC 错误码是负数（-32601 等），不处理会输出 `{"code":,`
+        if !put_byte(out, 45 as byte) {
+            return false;
+        }
+        x = 0 -| v;
+    }
+    while x > 0 {
+        // 用饱和运算符：普通 `-`/`*`/`+` 过不了 --strict-overflow。
+        const t10: i64 = (x / 10) *| 10;
+        const rem: i64 = x -| t10;
+        const d: byte = (rem +| 48) as! byte catch { 48 as byte; };
+        tmp[n] = d;
+        n = n + 1;
+        x = x / 10;
+    }
+    var i: usize = n;
+    while i > 0 {
+        i = i - 1;
+        if !put_byte(out, tmp[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn put_json_str(out: &Buf, p: &const byte, n: usize) bool {
+    if !put(out, &"\""[0: 1]) {
+        return false;
+    }
+    var i: usize = 0;
+    while i < n {
+        const c: byte = p[i];
+        if c == 34 as byte {
+            if !put(out, &"\\\""[0: 2]) { return false; }
+        } else if c == 92 as byte {
+            if !put(out, &"\\\\"[0: 2]) { return false; }
+        } else if c == 10 as byte {
+            if !put(out, &"\\n"[0: 2]) { return false; }
+        } else if c == 13 as byte {
+            if !put(out, &"\\r"[0: 2]) { return false; }
+        } else if c == 9 as byte {
+            if !put(out, &"\\t"[0: 2]) { return false; }
+        } else if c < 32 as byte {
+            const hexd: &const byte = "0123456789abcdef" as &const byte;
+            const hi: byte = hexd[((c as i32) >> 4) as usize];
+            const lo: byte = hexd[((c as i32) & 15) as usize];
+            if !put(out, &"\\u00"[0: 4]) { return false; }
+            if !put_byte(out, hi) { return false; }
+            if !put_byte(out, lo) { return false; }
+        } else {
+            if !put_byte(out, c) { return false; }
+        }
+        i = i + 1;
+    }
+    return put(out, &"\""[0: 1]);
+}
+
+// -------------------- 响应信封 --------------------
+
+// 工具结果：把已构造好的 JSON 文本塞进 content[0].text。
+fn emit_tool_text(id: i64, text: &const byte, n: usize, is_err: bool) void {
+    var out: Buf = buf_new(TEXT_MAX + 512);
+    out.len = 0;
+    _ = put_cstr(&out, "{\"jsonrpc\":\"2.0\",\"id\":" as &const byte);
+    _ = put_i64(&out, id);
+    _ = put_cstr(&out, ",\"result\":{\"content\":[{\"type\":\"text\",\"text\":" as &const byte);
+    _ = put_json_str(&out, text, n);
+    if is_err {
+        _ = put_cstr(&out, "}],\"isError\":true}}\n" as &const byte);
+    } else {
+        _ = put_cstr(&out, "}],\"isError\":false}}\n" as &const byte);
+    }
+    emit(&out);
+    buf_free(&out);
+}
+
+fn emit_jsonrpc_error(id: i64, code: i64, msg: &const byte) void {
+    var out: Buf = buf_new(512);
+    out.len = 0;
+    _ = put_cstr(&out, "{\"jsonrpc\":\"2.0\",\"id\":" as &const byte);
+    if id < 0 {
+        _ = put_cstr(&out, "null" as &const byte);
+    } else {
+        _ = put_i64(&out, id);
+    }
+    _ = put_cstr(&out, ",\"error\":{\"code\":" as &const byte);
+    _ = put_i64(&out, code);
+    _ = put_cstr(&out, ",\"message\":" as &const byte);
+    _ = put_json_str(&out, msg, slen(msg));
+    _ = put_cstr(&out, "}}\n" as &const byte);
+    emit(&out);
+    buf_free(&out);
+}
+
+// -------------------- 业务：list / describe / call --------------------
+
+fn append_ops(t: &Buf) void {
+    _ = put_cstr(t, "{\"success\":true,\"operation\":\"list\",\"data\":{\"operations\":[" as &const byte);
+    _ = put_cstr(t, "{\"name\":\"" as &const byte);
+    _ = put_cstr(t, OP0);
+    _ = put_cstr(t, "\",\"mutates\":true}," as &const byte);
+    _ = put_cstr(t, "{\"name\":\"" as &const byte);
+    _ = put_cstr(t, OP1);
+    _ = put_cstr(t, "\",\"mutates\":true}," as &const byte);
+    _ = put_cstr(t, "{\"name\":\"" as &const byte);
+    _ = put_cstr(t, OP2);
+    _ = put_cstr(t, "\",\"mutates\":false}]}}" as &const byte);
+}
+
+fn op_known(op: &Buf) bool {
+    if op.len == slen(OP0) {
+        var i: usize = 0;
+        var same: bool = true;
+        while i < op.len {
+            if op.ptr[i] != OP0[i] {
+                same = false;
+                break;
+            }
+            i = i + 1;
+        }
+        if same {
+            return true;
+        }
+    }
+    if op.len == slen(OP1) {
+        var i: usize = 0;
+        var same: bool = true;
+        while i < op.len {
+            if op.ptr[i] != OP1[i] {
+                same = false;
+                break;
+            }
+            i = i + 1;
+        }
+        if same {
+            return true;
+        }
+    }
+    if op.len == slen(OP2) {
+        var i: usize = 0;
+        var same: bool = true;
+        while i < op.len {
+            if op.ptr[i] != OP2[i] {
+                same = false;
+                break;
+            }
+            i = i + 1;
+        }
+        if same {
+            return true;
+        }
+    }
+    return false;
+}
+
+fn business_error(t: &Buf, op: &Buf, code: &const byte) void {
+    t.len = 0;
+    _ = put_cstr(t, "{\"success\":false,\"operation\":" as &const byte);
+    _ = put_json_str(t, op.ptr as &const byte, op.len);
+    _ = put_cstr(t, ",\"error\":{\"code\":\"" as &const byte);
+    _ = put_cstr(t, code);
+    _ = put_cstr(t, "\",\"message\":\"operation not found\",\"retryable\":false}}" as &const byte);
+}
+
+// describe：返回该操作的契约（原型里是静态 schema）。
+fn handle_describe(id: i64, op: &Buf) void {
+    if !op_known(op) {
+        var t: Buf = buf_new(2048);
+        business_error(&t, op, "OPERATION_NOT_FOUND" as &const byte);
+        emit_tool_text(id, t.ptr as &const byte, t.len, false);
+        buf_free(&t);
+        return;
+    }
+    var t: Buf = buf_new(4096);
+    t.len = 0;
+    _ = put_cstr(&t, "{\"success\":true,\"operation\":" as &const byte);
+    _ = put_json_str(&t, op.ptr as &const byte, op.len);
+    _ = put_cstr(&t, ",\"data\":{\"input_schema\":{\"type\":\"object\",\"required\":[\"operation\",\"input\"]},\"output_schema\":{\"type\":\"object\"},\"mutates\":true,\"async\":true,\"permission\":\"write\"}}" as &const byte);
+    emit_tool_text(id, t.ptr as &const byte, t.len, false);
+    buf_free(&t);
+}
+
+// call：分发一个 mock 操作；`episode.produce` 走"已入队"的异步语义。
+fn handle_call(id: i64, op: &Buf, req: &Buf) void {
+    if !op_known(op) {
+        var t: Buf = buf_new(2048);
+        business_error(&t, op, "OPERATION_NOT_FOUND" as &const byte);
+        emit_tool_text(id, t.ptr as &const byte, t.len, false);
+        buf_free(&t);
+        return;
+    }
+    var t: Buf = buf_new(4096);
+    t.len = 0;
+    _ = put_cstr(&t, "{\"success\":true,\"operation\":" as &const byte);
+    _ = put_json_str(&t, op.ptr as &const byte, op.len);
+    if req.len > 0 {
+        _ = put_cstr(&t, ",\"request_id\":" as &const byte);
+        _ = put_json_str(&t, req.ptr as &const byte, req.len);
+    }
+    _ = put_cstr(&t, ",\"data\":{\"status\":\"queued\",\"task_id\":\"task_proto_0001\"}}" as &const byte);
+    emit_tool_text(id, t.ptr as &const byte, t.len, false);
+    buf_free(&t);
+}
+
+// -------------------- 主循环 --------------------
+
+export fn main() i32 {
+    var raw: &byte = malloc(LINE_MAX) as &byte;
+    defer { free(raw as &void); }
+    if (raw as usize) == 0 {
+        return 1;
+    }
+    var tool: Buf = buf_new(256);
+    defer { buf_free(&tool); }
+    var op: Buf = buf_new(256);
+    defer { buf_free(&op); }
+    var req: Buf = buf_new(256);
+    defer { buf_free(&req); }
+    var text: Buf = buf_new(TEXT_MAX);
+    defer { buf_free(&text); }
+
+    while true {
+        var over: [bool: 1] = [false];
+        const n: usize = read_line(raw, LINE_MAX, &over[0]);
+        if over[0] {
+            continue;
+        }
+        if n == 0 {
+            break;
+        }
+        const line: &const byte = raw as &const byte;
+        const id: i64 = json_id(line, n);
+
+        if method_is(line, n, "initialize" as &const byte) {
+            var out: Buf = buf_new(512);
+            out.len = 0;
+            _ = put_cstr(&out, "{\"jsonrpc\":\"2.0\",\"id\":" as &const byte);
+            _ = put_i64(&out, id);
+            _ = put_cstr(&out, ",\"result\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{\"tools\":{}},\"serverInfo\":{\"name\":\"drama\",\"version\":\"0.0.1\"}}}\n" as &const byte);
+            emit(&out);
+            buf_free(&out);
+            continue;
+        }
+        if method_is(line, n, "notifications/initialized" as &const byte) {
+            continue;
+        }
+        if method_is(line, n, "tools/list" as &const byte) {
+            var out: Buf = buf_new(4096);
+            out.len = 0;
+            _ = put_cstr(&out, "{\"jsonrpc\":\"2.0\",\"id\":" as &const byte);
+            _ = put_i64(&out, id);
+            _ = put_cstr(&out, ",\"result\":{\"tools\":[" as &const byte);
+            _ = put_cstr(&out, "{\"name\":\"list\",\"description\":\"List business operations.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{},\"additionalProperties\":false}}," as &const byte);
+            _ = put_cstr(&out, "{\"name\":\"describe\",\"description\":\"Describe one operation contract.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"operation\":{\"type\":\"string\"}},\"required\":[\"operation\"]}}," as &const byte);
+            _ = put_cstr(&out, "{\"name\":\"call\",\"description\":\"Invoke one operation.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"operation\":{\"type\":\"string\"},\"input\":{\"type\":\"object\"},\"request_id\":{\"type\":\"string\"}},\"required\":[\"operation\",\"input\"]}}]}}\n" as &const byte);
+            emit(&out);
+            buf_free(&out);
+            continue;
+        }
+        if method_is(line, n, "tools/call" as &const byte) {
+            if !json_str(line, n, "name" as &const byte, &tool) {
+                emit_jsonrpc_error(id, -32602, "missing tool name" as &const byte);
+                continue;
+            }
+            const has_op: bool = json_str(line, n, "operation" as &const byte, &op);
+            _ = json_str(line, n, "request_id" as &const byte, &req);
+            if tool.len == 4 {
+                // "list"
+                if tool.ptr[0] == 108 as byte && tool.ptr[1] == 105 as byte
+                    && tool.ptr[2] == 115 as byte && tool.ptr[3] == 116 as byte {
+                    text.len = 0;
+                    append_ops(&text);
+                    emit_tool_text(id, text.ptr as &const byte, text.len, false);
+                    continue;
+                }
+                // "call"
+                if tool.ptr[0] == 99 as byte && tool.ptr[1] == 97 as byte
+                    && tool.ptr[2] == 108 as byte && tool.ptr[3] == 108 as byte {
+                    if !has_op {
+                        text.len = 0;
+                        _ = put_cstr(&text, "{\"success\":false,\"error\":{\"code\":\"SCHEMA_INVALID\",\"message\":\"call requires arguments.operation\",\"retryable\":false}}" as &const byte);
+                        emit_tool_text(id, text.ptr as &const byte, text.len, false);
+                        continue;
+                    }
+                    handle_call(id, &op, &req);
+                    continue;
+                }
+            }
+            // "describe"（8 字节）
+            if tool.len == 8 {
+                var is_desc: bool = true;
+                const want: &const byte = "describe";
+                var i: usize = 0;
+                while i < 8 {
+                    if tool.ptr[i] != want[i] {
+                        is_desc = false;
+                        break;
+                    }
+                    i = i + 1;
+                }
+                if is_desc {
+                    if !has_op {
+                        text.len = 0;
+                        _ = put_cstr(&text, "{\"success\":false,\"error\":{\"code\":\"SCHEMA_INVALID\",\"message\":\"describe requires arguments.operation\",\"retryable\":false}}" as &const byte);
+                        emit_tool_text(id, text.ptr as &const byte, text.len, false);
+                        continue;
+                    }
+                    handle_describe(id, &op);
+                    continue;
+                }
+            }
+            emit_jsonrpc_error(id, -32602, "unknown tool" as &const byte);
+            continue;
+        }
+        // 不认的方法：宿主据此放行（它只关心 tools 与自己的钩子）。
+        if id >= 0 {
+            emit_jsonrpc_error(id, -32601, "Method not found" as &const byte);
+        }
+    }
+    return 0;
+}

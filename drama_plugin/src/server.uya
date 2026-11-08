@@ -1,0 +1,958 @@
+// drama_plugin/src/server.uya — `mcp serve` 的 stdio 主循环（P1 骨架）
+//
+// 硬约束（DESIGN §4.2/§4.6）：
+//   * stdin/stdout 一行一条**紧凑** JSON；日志只走 stderr；
+//   * 单条 ≤1 MiB，超限整行丢弃且不中断服务；
+//   * 未知方法回 -32601（宿主据此放行）；
+//   * 业务校验失败用 `{"success":false,…}` + `isError:false`；
+//     协议/基础设施失败用 JSON-RPC `error`。
+
+use libc.syscall;
+use libc.unistd;
+use libc.heap;
+
+const LINE_MAX: usize = 1048576;
+const OUT_MAX: usize = 65536;
+const RID_BUF: usize = 64;
+
+fn emit_tool_text(id: i64, text: &const byte, n: usize, is_err: bool) void {
+    var out: [byte: OUT_MAX] = [0: OUT_MAX];
+    const o: &[byte] = &out[0: OUT_MAX];
+    var w: usize = 0;
+    w = w + j_put(o, w, "{\"jsonrpc\":\"2.0\",\"id\":" as &const byte);
+    w = w + j_put_i64(o, w, id);
+    w = w + j_put(o, w,
+        ",\"result\":{\"content\":[{\"type\":\"text\"," as &const byte);
+    w = w + j_put(o, w, "\"text\":" as &const byte);
+    w = w + j_put_str(o, w, text, n);
+    if is_err {
+        w = w + j_put(o, w, "}],\"isError\":true}}\n" as &const byte);
+    } else {
+        w = w + j_put(o, w, "}],\"isError\":false}}\n" as &const byte);
+    }
+    _ = fd_write_all(1, &out[0], w);
+}
+
+fn emit_error(id: i64, code: i64, msg: &const byte) void {
+    var out: [byte: 512] = [0: 512];
+    const o: &[byte] = &out[0: 512];
+    var w: usize = 0;
+    w = w + j_put(o, w, "{\"jsonrpc\":\"2.0\",\"id\":" as &const byte);
+    if id < 0 {
+        w = w + j_put(o, w, "null" as &const byte);
+    } else {
+        w = w + j_put_i64(o, w, id);
+    }
+    w = w + j_put(o, w, ",\"error\":{\"code\":" as &const byte);
+    w = w + j_put_i64(o, w, code);
+    w = w + j_put(o, w, ",\"message\":" as &const byte);
+    w = w + j_put_str(o, w, msg, b_len(msg));
+    w = w + j_put(o, w, "}}\n" as &const byte);
+    _ = fd_write_all(1, &out[0], w);
+}
+
+// 读一行；超限则丢弃整行（继续读到 '\n'）。返回字节数，0 = EOF
+fn read_line(buf: &byte, cap: usize, over: &bool) usize {
+    var i: usize = 0;
+    while true {
+        var c: [byte: 1] = [0: 1];
+        const n: isize = sys_read(0, &c[0], 1) catch { 0 as isize; };
+        if n <= 0 {
+            return i;
+        }
+        if c[0] == 10 as byte {
+            return i;
+        }
+        if i < cap {
+            buf[i] = c[0];
+            i = i + 1;
+        } else {
+            over[0] = true;
+        }
+    }
+}
+
+// ---- 输出小工具 ----
+
+fn put_bool(t: &[byte], w: usize, v: bool) usize {
+    if v {
+        return w + j_put(t, w, "true" as &const byte);
+    }
+    return w + j_put(t, w, "false" as &const byte);
+}
+
+fn put_str_field(t: &[byte], w: usize, sep: bool, key: &const byte,
+    v: &const byte) usize {
+    var x: usize = w;
+    if sep {
+        x = x + j_put(t, x, "," as &const byte);
+    }
+    x = x + j_put_str(t, x, key, b_len(key));
+    x = x + j_put(t, x, ":" as &const byte);
+    x = x + j_put_str(t, x, v, b_len(v));
+    return x;
+}
+
+// `list` 的业务文本：目录就是契约的第一层（名字/版本/副作用/权限/成本）
+fn do_list(t: &[byte]) usize {
+    var w: usize = 0;
+    w = w + j_put(t, w,
+        "{\"success\":true,\"operation\":\"list\"," as &const byte);
+    w = w + j_put(t, w, "\"data\":{\"operations\":[" as &const byte);
+    var i: usize = 0;
+    while i < registry_count() {
+        if i > 0 {
+            w = w + j_put(t, w, "," as &const byte);
+        }
+        w = w + j_put(t, w, "{\"name\":" as &const byte);
+        const nm: &const byte = registry_name(i);
+        w = w + j_put_str(t, w, nm, b_len(nm));
+        w = put_str_field(t, w, true, "version" as &const byte,
+            registry_version(i));
+        w = w + j_put(t, w, ",\"mutates\":" as &const byte);
+        w = put_bool(t, w, registry_mutates(i));
+        w = w + j_put(t, w, ",\"async\":" as &const byte);
+        w = put_bool(t, w, registry_async(i));
+        w = put_str_field(t, w, true, "permission" as &const byte,
+            registry_permission(i));
+        w = put_str_field(t, w, true, "cost" as &const byte,
+            registry_cost(i));
+        w = w + j_put(t, w, "}" as &const byte);
+        i = i + 1;
+    }
+    w = w + j_put(t, w, "]}}" as &const byte);
+    return w;
+}
+
+// 业务错误文本：`{"success":false,"error":{…}}`（isError 仍为 false）
+fn do_business_error(t: &[byte], code: &const byte, msg: &const byte) usize {
+    var w: usize = 0;
+    w = w + j_put(t, w, "{\"success\":false," as &const byte);
+    w = w + j_put(t, w, "\"error\":{\"code\":" as &const byte);
+    w = w + j_put_str(t, w, code, b_len(code));
+    w = w + j_put(t, w, ",\"message\":" as &const byte);
+    w = w + j_put_str(t, w, msg, b_len(msg));
+    w = w + j_put(t, w, ",\"retryable\":false}}" as &const byte);
+    return w;
+}
+
+// 带字段名的业务错误（校验失败要让模型知道打哪个字段）
+fn do_field_error(t: &[byte], code: &const byte, msg: &const byte,
+    field: &const byte, flen: usize) usize {
+    var w: usize = 0;
+    w = w + j_put(t, w, "{\"success\":false," as &const byte);
+    w = w + j_put(t, w, "\"error\":{\"code\":" as &const byte);
+    w = w + j_put_str(t, w, code, b_len(code));
+    w = w + j_put(t, w, ",\"message\":" as &const byte);
+    w = w + j_put_str(t, w, msg, b_len(msg));
+    if flen > 0 {
+        w = w + j_put(t, w, ",\"field\":" as &const byte);
+        w = w + j_put_str(t, w, field, flen);
+    }
+    w = w + j_put(t, w, ",\"retryable\":false}}" as &const byte);
+    return w;
+}
+
+// 一个字段的 JSON Schema 片段
+fn put_field_schema(t: &[byte], w: usize, op_i: usize, k: usize) usize {
+    var x: usize = w;
+    const nm: &const byte = registry_field_name(op_i, k);
+    x = x + j_put_str(t, x, nm, b_len(nm));
+    x = x + j_put(t, x, ":{\"type\":" as &const byte);
+    const tn: &const byte = registry_type_name(registry_field_type(op_i, k));
+    x = x + j_put_str(t, x, tn, b_len(tn));
+    const en: &const byte = registry_field_enum(op_i, k);
+    if b_len(en) > 0 {
+        x = x + j_put(t, x, ",\"enum\":[" as &const byte);
+        var i: usize = 0;
+        var first: bool = true;
+        const an: usize = b_len(en);
+        while i <= an {
+            var j: usize = i;
+            while j < an && en[j] != 124 as byte {
+                j = j + 1;
+            }
+            if j > i {
+                if !first {
+                    x = x + j_put(t, x, "," as &const byte);
+                }
+                x = x + j_put_str(t, x, &en[i], j - i);
+                first = false;
+            }
+            i = j + 1;
+        }
+        x = x + j_put(t, x, "]" as &const byte);
+    }
+    x = x + j_put(t, x, "}" as &const byte);
+    return x;
+}
+
+// 示例值：string→"s"（有 enum 取第一个）、integer→1、boolean→true
+fn put_example_value(t: &[byte], w: usize, op_i: usize, k: usize) usize {
+    var x: usize = w;
+    const ty: u8 = registry_field_type(op_i, k);
+    const en: &const byte = registry_field_enum(op_i, k);
+    if ty == 1 {
+        if b_len(en) > 0 {
+            var j: usize = 0;
+            const an: usize = b_len(en);
+            while j < an && en[j] != 124 as byte {
+                j = j + 1;
+            }
+            return x + j_put_str(t, x, &en[0], j);
+        }
+        return x + j_put_str(t, x, "s" as &const byte, 1);
+    }
+    if ty == 2 {
+        return x + j_put(t, x, "1" as &const byte);
+    }
+    if ty == 3 {
+        return x + j_put(t, x, "true" as &const byte);
+    }
+    return x + j_put(t, x, "{}" as &const byte);
+}
+
+fn put_field_example(t: &[byte], w: usize, op_i: usize, k: usize) usize {
+    var x: usize = w;
+    const nm: &const byte = registry_field_name(op_i, k);
+    x = x + j_put_str(t, x, nm, b_len(nm));
+    x = x + j_put(t, x, ":" as &const byte);
+    return put_example_value(t, x, op_i, k);
+}
+
+// `describe` 的业务文本：与 `call` 用同一份 FieldSpec
+fn do_describe(t: &[byte], op_i: usize) usize {
+    var w: usize = 0;
+    w = w + j_put(t, w, "{\"success\":true,\"operation\":" as &const byte);
+    const nm: &const byte = registry_name(op_i);
+    w = w + j_put_str(t, w, nm, b_len(nm));
+    w = w + j_put(t, w, ",\"data\":{" as &const byte);
+    w = put_str_field(t, w, false, "version" as &const byte,
+        registry_version(op_i));
+    w = w + j_put(t, w, ",\"mutates\":" as &const byte);
+    w = put_bool(t, w, registry_mutates(op_i));
+    w = w + j_put(t, w, ",\"async\":" as &const byte);
+    w = put_bool(t, w, registry_async(op_i));
+    w = put_str_field(t, w, true, "permission" as &const byte,
+        registry_permission(op_i));
+    w = put_str_field(t, w, true, "cost" as &const byte,
+        registry_cost(op_i));
+    w = put_str_field(t, w, true, "idempotency_key" as &const byte,
+        registry_idem_key(op_i));
+    // input_schema
+    w = w + j_put(t, w,
+        ",\"input_schema\":{\"type\":\"object\"," as &const byte);
+    w = w + j_put(t, w,
+        "\"additionalProperties\":false,\"properties\":{" as &const byte);
+    var k: usize = 0;
+    while k < registry_field_count(op_i) {
+        if k > 0 {
+            w = w + j_put(t, w, "," as &const byte);
+        }
+        w = put_field_schema(t, w, op_i, k);
+        k = k + 1;
+    }
+    w = w + j_put(t, w, "},\"required\":[" as &const byte);
+    var first: bool = true;
+    k = 0;
+    while k < registry_field_count(op_i) {
+        if registry_field_required(op_i, k) {
+            if !first {
+                w = w + j_put(t, w, "," as &const byte);
+            }
+            const fn2: &const byte = registry_field_name(op_i, k);
+            w = w + j_put_str(t, w, fn2, b_len(fn2));
+            first = false;
+        }
+        k = k + 1;
+    }
+    w = w + j_put(t, w, "]}" as &const byte);
+    w = w + j_put(t, w,
+        ",\"output_schema\":{\"type\":\"object\"}" as &const byte);
+    w = w + j_put(t, w,
+        ",\"errors\":[\"SCHEMA_INVALID\"," as &const byte);
+    w = w + j_put(t, w,
+        "\"OPERATION_NOT_FOUND\",\"REQUEST_REUSED\"]" as &const byte);
+    // 最小示例
+    w = w + j_put(t, w, ",\"example\":{\"operation\":" as &const byte);
+    w = w + j_put_str(t, w, nm, b_len(nm));
+    w = w + j_put(t, w, ",\"input\":{" as &const byte);
+    k = 0;
+    first = true;
+    while k < registry_field_count(op_i) {
+        if registry_field_required(op_i, k) {
+            if !first {
+                w = w + j_put(t, w, "," as &const byte);
+            }
+            w = put_field_example(t, w, op_i, k);
+            first = false;
+        }
+        k = k + 1;
+    }
+    w = w + j_put(t, w, "}}}}" as &const byte);
+    return w;
+}
+
+// 带对象定位的业务错误：把 canon 记下的出错对象附在 error 里
+fn do_located_error(t: &[byte], code: &const byte, msg: &const byte) usize {
+    var w: usize = 0;
+    w = w + j_put(t, w,
+        "{\"success\":false,\"error\":{\"code\":" as &const byte);
+    w = w + j_put_str(t, w, code, b_len(code));
+    w = w + j_put(t, w, ",\"message\":" as &const byte);
+    w = w + j_put_str(t, w, msg, b_len(msg));
+    const ol: usize = canon_last_obj_len();
+    if ol > 0 {
+        w = w + j_put(t, w, ",\"object\":" as &const byte);
+        w = w + j_put_str(t, w, canon_last_obj(), ol);
+    }
+    w = w + j_put(t, w, ",\"retryable\":false}}" as &const byte);
+    return w;
+}
+
+// 事件校验错误码 → 业务错误（P4 的四轴不变量）
+fn do_canon_error(t: &[byte], rc: i32) usize {
+    if rc == 61 {
+        return do_located_error(t, "UNKNOWN_OPERATOR" as &const byte,
+            "unknown event type" as &const byte);
+    }
+    if rc == 62 {
+        return do_located_error(t, "PROP_UNKNOWN" as &const byte,
+            "prop not defined" as &const byte);
+    }
+    if rc == 63 {
+        return do_located_error(t, "SCENE_UNKNOWN" as &const byte,
+            "scene not defined" as &const byte);
+    }
+    if rc == 64 {
+        return do_located_error(t, "KNOWLEDGE_LEAK" as &const byte,
+            "character not present when gaining knowledge" as &const byte);
+    }
+    if rc == 65 {
+        return do_located_error(t, "TIMELINE_BACKWARD" as &const byte,
+            "timeline may only advance" as &const byte);
+    }
+    if rc == 66 {
+        return do_located_error(t, "PROP_TELEPORT" as &const byte,
+            "prop moved without a matching scene" as &const byte);
+    }
+    if rc == 45 {
+        return do_located_error(t, "SCENE_DRIFT" as &const byte,
+            "scene variant changed without scene.set" as &const byte);
+    }
+    if rc == 47 {
+        return do_located_error(t, "RULE_VIOLATION" as &const byte,
+            "world rule redefined (rules may only be added)" as &const byte);
+    }
+    if rc == 46 {
+        return do_located_error(t, "TIMELINE_CONFLICT" as &const byte,
+            "same night happened twice without time passing" as &const byte);
+    }
+    if rc == 67 {
+        return do_located_error(t, "CHARACTER_UNKNOWN" as &const byte,
+            "character not defined" as &const byte);
+    }
+    return do_located_error(t, "PROMISE_UNKNOWN" as &const byte,
+        "promise not open" as &const byte);
+}
+
+// 剧本相关错误码（P5 第二段）
+fn do_story_error(t: &[byte], rc: i32) usize {
+    if rc == 90 {
+        return do_business_error(t, "SCHEMA_INVALID" as &const byte,
+            "screenplay has no title" as &const byte);
+    }
+    if rc == 91 {
+        return do_business_error(t, "SCHEMA_INVALID" as &const byte,
+            "screenplay has no scenes" as &const byte);
+    }
+    if rc == 92 {
+        return do_business_error(t, "SCHEMA_INVALID" as &const byte,
+            "scene missing no/action" as &const byte);
+    }
+    if rc == 93 {
+        return do_business_error(t, "SCHEMA_INVALID" as &const byte,
+            "screenplay has no episode hook" as &const byte);
+    }
+    if rc == 96 {
+        return do_business_error(t, "NOT_FOUND" as &const byte,
+            "script version not found" as &const byte);
+    }
+    if rc == 98 {
+        return do_business_error(t, "ACTION_UNSUPPORTED" as &const byte,
+            "action rejected by provider capability table" as &const byte);
+    }
+    if rc == 99 {
+        return do_business_error(t, "CHARACTER_DRIFT" as &const byte,
+            "frozen lock text changed (pass allow_drift to accept)"
+            as &const byte);
+    }
+    if rc == 97 {
+        return do_business_error(t, "NO_CANDIDATE_EVENTS" as &const byte,
+            "screenplay carries no candidate_events" as &const byte);
+    }
+    return do_business_error(t, "IO_ERROR" as &const byte,
+        "script storage failed" as &const byte);
+}
+
+// 任务/取消类错误码
+fn do_task_error(t: &[byte], rc: i32) usize {
+    if rc == 17 {
+        return do_business_error(t, "TASK_NOT_FOUND" as &const byte,
+            "task not found" as &const byte);
+    }
+    if rc == 24 {
+        return do_business_error(t, "AUDIT_FAILED" as &const byte,
+            "continuity audit is red; fix violations before batch"
+            as &const byte);
+    }
+    if rc == 18 {
+        return do_business_error(t, "STEP_FAILED" as &const byte,
+            "task step failed (LLM or validation)" as &const byte);
+    }
+    if rc == 19 {
+        return do_business_error(t, "ASSEMBLY_MISSING_SHOT" as &const byte,
+            "some shot files are missing" as &const byte);
+    }
+    if rc == 23 {
+        return do_business_error(t, "BUDGET_EXCEEDED" as &const byte,
+            "project budget would be exceeded" as &const byte);
+    }
+    if rc == 22 {
+        return do_business_error(t, "CANNOT_CANCEL" as &const byte,
+            "task already finished" as &const byte);
+    }
+    return 0;
+}
+
+// 业务执行失败 → 统一的业务错误（isError 仍为 false）
+// 业务执行失败 → 统一的业务错误（isError 仍为 false）
+fn ops_error(t: &[byte], rc: i32) usize {
+    if (rc >= 61 && rc <= 68) || (rc >= 45 && rc <= 47) {
+        return do_canon_error(t, rc);
+    }
+    if rc >= 90 && rc <= 99 {
+        return do_story_error(t, rc);
+    }
+    if rc >= 69 && rc <= 84 {
+        const w: usize = do_llm_error(t, rc);
+        if w > 0 {
+            return w;
+        }
+    }
+    const tw: usize = do_task_error(t, rc);
+    if tw > 0 {
+        return tw;
+    }
+    return do_io_error(t, rc);
+}
+
+fn do_llm_error(t: &[byte], rc: i32) usize {
+    if rc == 70 || rc == 71 || rc == 75 {
+        return do_business_error(t, "NETWORK_ERROR" as &const byte,
+            "cannot reach the LLM endpoint" as &const byte);
+    }
+    if rc == 72 {
+        return do_business_error(t, "TIMEOUT" as &const byte,
+            "LLM call timed out" as &const byte);
+    }
+    if rc == 76 {
+        return do_business_error(t, "PROXY_TLS_UNSUPPORTED" as &const byte,
+            "proxy only supports plaintext HTTP" as &const byte);
+    }
+    if rc == 80 {
+        return do_business_error(t, "CONFIG_INVALID" as &const byte,
+            "llm.json missing or invalid" as &const byte);
+    }
+    if rc == 81 {
+        return do_business_error(t, "PROVIDER_UNSUPPORTED" as &const byte,
+            "unknown provider" as &const byte);
+    }
+    if rc == 82 {
+        return do_business_error(t, "UPSTREAM_ERROR" as &const byte,
+            "LLM endpoint returned non-200" as &const byte);
+    }
+    if rc == 83 {
+        return do_business_error(t, "MODEL_OUTPUT_NOT_JSON" as &const byte,
+            "model output is not JSON" as &const byte);
+    }
+    if rc == 84 {
+        return do_business_error(t, "SCHEMA_INVALID" as &const byte,
+            "model output failed schema validation" as &const byte);
+    }
+    if rc == 73 {
+        return do_business_error(t, "BAD_RESPONSE" as &const byte,
+            "malformed HTTP response" as &const byte);
+    }
+    return 0;
+}
+
+fn do_media_error(t: &[byte], rc: i32) usize {
+    if rc == 86 {
+        return do_business_error(t, "SCHEMA_INVALID" as &const byte,
+            "invalid media path" as &const byte);
+    }
+    if rc == 87 {
+        return do_business_error(t, "IO_ERROR" as &const byte,
+            "media file not probeable" as &const byte);
+    }
+    if rc == 88 {
+        return do_business_error(t, "MEDIA_MISMATCH" as &const byte,
+            "media metadata does not match expectation" as &const byte);
+    }
+    return 0;
+}
+
+fn do_qa_error(t: &[byte], rc: i32) usize {
+    if rc == 74 {
+        return do_business_error(t, "TASK_TERMINAL" as &const byte,
+            "task already finished; cancel is not applicable"
+            as &const byte);
+    }
+    if rc == 54 {
+        return do_business_error(t, "RESULT_NOT_READY" as &const byte,
+            "task has not finished yet; no result to fetch"
+            as &const byte);
+    }
+    if rc == 77 {
+        return do_business_error(t, "CONTINUITY_BREAK" as &const byte,
+            "a speaking character is not present in the shot's scene"
+            as &const byte);
+    }
+    if rc == 79 {
+        return do_business_error(t, "ANCHOR_JUMP" as &const byte,
+            "anchor shot does not match the previous shot's last frame"
+            as &const byte);
+    }
+    if rc == 78 {
+        return do_business_error(t, "FINAL_VERIFY_FAILED" as &const byte,
+            "final cut failed decode/format/subtitle verification"
+            as &const byte);
+    }
+    if rc == 89 {
+        return do_business_error(t, "QA_FAILED" as &const byte,
+            "final approval blocked: QA not green or no final cut"
+            as &const byte);
+    }
+    return 0;
+}
+
+fn do_io_error(t: &[byte], rc: i32) usize {
+    const qw: usize = do_qa_error(t, rc);
+    if qw > 0 {
+        return qw;
+    }
+    const mw: usize = do_media_error(t, rc);
+    if mw > 0 {
+        return mw;
+    }
+    if rc == 10 {
+        return do_business_error(t, "SCHEMA_INVALID" as &const byte,
+            "invalid project name" as &const byte);
+    }
+    if rc == 11 {
+        return do_business_error(t, "ALREADY_EXISTS" as &const byte,
+            "project with this name already exists" as &const byte);
+    }
+    if rc == 12 {
+        return do_business_error(t, "IO_ERROR" as &const byte,
+            "write failed" as &const byte);
+    }
+    if rc == 13 {
+        return do_business_error(t, "SCHEMA_INVALID" as &const byte,
+            "invalid project_id" as &const byte);
+    }
+    if rc == 14 {
+        return do_business_error(t, "NOT_FOUND" as &const byte,
+            "project not found" as &const byte);
+    }
+    if rc == 30 || rc == 40 {
+        return do_business_error(t, "SCHEMA_INVALID" as &const byte,
+            "invalid project_id" as &const byte);
+    }
+    if rc == 31 {
+        return do_business_error(t, "SCHEMA_INVALID" as &const byte,
+            "invalid asset name" as &const byte);
+    }
+    if rc == 32 {
+        return do_business_error(t, "IO_ERROR" as &const byte,
+            "asset file not readable" as &const byte);
+    }
+    if rc == 43 {
+        return do_business_error(t, "IO_ERROR" as &const byte,
+            "snapshot write failed" as &const byte);
+    }
+    if rc == 44 {
+        return do_business_error(t, "IO_ERROR" as &const byte,
+            "current.json write failed" as &const byte);
+    }
+    if rc == 48 {
+        return do_business_error(t, "LOCK_UNREADABLE" as &const byte,
+            "commit lock file is unreadable" as &const byte);
+    }
+    if rc == 49 {
+        return do_business_error(t, "LOCK_STALE" as &const byte,
+            "commit lock is too old; holder looks stuck" as &const byte);
+    }
+    if rc == 51 {
+        return do_business_error(t, "LOCKED" as &const byte,
+            "another writer holds the commit lock" as &const byte);
+    }
+    if rc == 53 {
+        return do_business_error(t, "BASE_REVISION_CONFLICT" as &const byte,
+            "base_revision does not match current revision" as &const byte);
+    }
+    if rc == 69 {
+        return do_business_error(t, "ORPHAN_CHANGE" as &const byte,
+            "commit carries no events" as &const byte);
+    }
+    if (rc >= 61 && rc <= 68) || (rc >= 45 && rc <= 47) {
+        return do_canon_error(t, rc);
+    }
+    if rc == 21 {
+        return do_business_error(t, "OUTLINE_NOT_APPROVED" as &const byte,
+            "series outline exists but is not approved" as &const byte);
+    }
+    if rc == 16 {
+        return do_business_error(t, "FORMAT_UNSUPPORTED" as &const byte,
+            "unknown format_version (read-only)" as &const byte);
+    }
+    if rc == 34 || rc == 42 {
+        return do_business_error(t, "NOT_FOUND" as &const byte,
+            "not found" as &const byte);
+    }
+    if rc == 35 {
+        return do_business_error(t, "NOT_FOUND" as &const byte,
+            "asset not found" as &const byte);
+    }
+    if rc == 41 {
+        return do_business_error(t, "IO_ERROR" as &const byte,
+            "bible dir/io failed" as &const byte);
+    }
+    if rc == 33 {
+        return do_business_error(t, "IO_ERROR" as &const byte,
+            "asset index write failed" as &const byte);
+    }
+    if rc == 12 {
+        return do_business_error(t, "IO_ERROR" as &const byte,
+            "project write failed" as &const byte);
+    }
+    if rc == 15 {
+        return do_business_error(t, "IO_ERROR" as &const byte,
+            "project read failed" as &const byte);
+    }
+    return do_business_error(t, "IO_ERROR" as &const byte,
+        "unknown failure" as &const byte);
+}
+
+// 校验失败 → 业务错误；把码翻译成模型能自己纠正的话
+fn emit_schema_error(id: i64, op_i: usize, rc: i32, field: &const byte,
+    flen: usize) void {
+    var t: [byte: 1024] = [0: 1024];
+    var w: usize = 0;
+    if rc == 1 {
+        w = do_business_error(&t[0: 1024], "SCHEMA_INVALID" as &const byte,
+            "call requires arguments.input" as &const byte);
+    } else if rc == 2 {
+        w = do_business_error(&t[0: 1024], "SCHEMA_INVALID" as &const byte,
+            "arguments.input must be an object" as &const byte);
+    } else if rc == 3 {
+        w = do_field_error(&t[0: 1024], "SCHEMA_INVALID" as &const byte,
+            "missing required field" as &const byte, field, flen);
+    } else if rc == 4 {
+        w = do_field_error(&t[0: 1024], "TYPE_MISMATCH" as &const byte,
+            "field type mismatch" as &const byte, field, flen);
+    } else if rc == 5 {
+        w = do_field_error(&t[0: 1024], "SCHEMA_INVALID" as &const byte,
+            "unknown field (additionalProperties=false)" as &const byte,
+            field, flen);
+    } else {
+        w = do_field_error(&t[0: 1024], "SCHEMA_INVALID" as &const byte,
+            "value not in enum (see describe input_schema)" as &const byte,
+            field, flen);
+    }
+    emit_tool_text(id, &t[0], w, false);
+}
+
+fn handle_describe(id: i64, op: &const byte, opn: usize) void {
+    var t: [byte: 4096] = [0: 4096];
+    var w: usize = 0;
+    const fi: isize = registry_find(op, opn);
+    if fi < 0 {
+        w = do_business_error(&t[0: 4096],
+            "OPERATION_NOT_FOUND" as &const byte,
+            "operation not registered" as &const byte);
+        emit_tool_text(id, &t[0], w, false);
+        return;
+    }
+    const op_i: usize = fi as! usize catch { return; };
+    w = do_describe(&t[0: 4096], op_i);
+    emit_tool_text(id, &t[0], w, false);
+}
+
+fn emit_call_ok(id: i64, op: &const byte, opn: usize, rid: &const byte,
+    rl: usize, h: u64, dbuf: &const byte, dn: usize, replay: bool,
+    op_i: usize, orc: i32, task: &const byte, tl: usize) void {
+    // 大对象（比如百集大纲）要能整份回给模型：缓冲给到 32 KB
+    var t: [byte: 65536] = [0: 65536];
+    const o: &[byte] = &t[0: 65536];
+    var w: usize = 0;
+    w = w + j_put(o, w, "{\"success\":true," as &const byte);
+    w = w + j_put(o, w, "\"operation\":" as &const byte);
+    w = w + j_put_str(o, w, op, opn);
+    w = w + j_put(o, w, ",\"request_id\":" as &const byte);
+    w = w + j_put_str(o, w, rid, rl);
+    w = w + j_put(o, w, ",\"input_hash\":\"" as &const byte);
+    w = w + j_put_hex(o, w, h);
+    w = w + j_put(o, w, "\",\"data\":{" as &const byte);
+    if orc == 0 {
+        w = w + j_put(o, w, "\"result\":" as &const byte);
+        w = w + j_put_raw(o, w, dbuf, dn);
+        w = w + j_put(o, w, ",\"idempotent_replay\":" as &const byte);
+        w = put_bool(o, w, replay);
+    } else if registry_mutates(op_i) {
+        w = w + j_put(o, w, "\"status\":\"" as &const byte);
+        if registry_async(op_i) {
+            w = w + j_put(o, w, "queued" as &const byte);
+        } else {
+            w = w + j_put(o, w, "done" as &const byte);
+        }
+        w = w + j_put(o, w, "\",\"task_id\":" as &const byte);
+        w = w + j_put_str(o, w, task, tl);
+        w = w + j_put(o, w, ",\"idempotent_replay\":" as &const byte);
+        w = put_bool(o, w, replay);
+    } else {
+        w = w + j_put(o, w,
+            "\"status\":\"done\",\"result\":{\"checked\":0}" as &const byte);
+    }
+    w = w + j_put(o, w, "}}" as &const byte);
+    emit_tool_text(id, &t[0], w, false);
+}
+
+// 做幂等判断 → 执行操作 → 组响应；幂等重放时不再执行
+fn handle_call(id: i64, line: &const byte, n: usize, op: &const byte,
+    opn: usize) void {
+    var t: [byte: 1024] = [0: 1024];
+    var w: usize = 0;
+    const fi: isize = registry_find(op, opn);
+    if fi < 0 {
+        w = do_business_error(&t[0: 1024],
+            "OPERATION_NOT_FOUND" as &const byte,
+            "operation not registered" as &const byte);
+        emit_tool_text(id, &t[0], w, false);
+        return;
+    }
+    const op_i: usize = fi as! usize catch { return; };
+    var fbuf: [byte: 128] = [0: 128];
+    var flen: [usize: 1] = [0];
+    const rc: i32 = schema_validate(op_i, line, n, &fbuf[0: 128], &flen[0]);
+    if rc != 0 {
+        emit_schema_error(id, op_i, rc, &fbuf[0], flen[0]);
+        return;
+    }
+    const h: u64 = input_hash(line, n);
+    var rid: [byte: RID_BUF] = [0: RID_BUF];
+    var rl: usize = 0;
+    _ = j_str(line, n, "request_id" as &const byte, &rid[0: RID_BUF], &rl);
+    if rl == 0 {
+        req_next(&rid[0: RID_BUF], &rl);
+    }
+    if !rid_bind(&rid[0], rl, h) {
+        w = do_field_error(&t[0: 1024], "REQUEST_REUSED" as &const byte,
+            "same request_id with different input" as &const byte,
+            &rid[0], rl);
+        emit_tool_text(id, &t[0], w, false);
+        return;
+    }
+    var task: [byte: 32] = [0: 32];
+    var tl: usize = 0;
+    var replay: bool = false;
+    if registry_mutates(op_i) && idem_find(op_i, h, &task[0: 32], &tl) {
+        replay = true;
+    }
+    var dbuf: [byte: 65536] = [0: 65536];
+    var dn: [usize: 1] = [0];
+    var orc: i32 = 20;
+    if !replay {
+        orc = ops_run(op_i, line, n, &dbuf[0: 65536], &dn[0]);
+        if orc != 0 && orc != 20 {
+            w = ops_error(&t[0: 1024], orc);
+            emit_tool_text(id, &t[0], w, false);
+            return;
+        }
+        if registry_mutates(op_i) && orc == 0 {
+            bind_idem(op_i, h, &dbuf[0], dn[0], &task[0: 32], &tl);
+        }
+    } else {
+        // 幂等重放：把上次的 task_id 回给调用方
+        dn[0] = 0;
+        dn[0] = dn[0] + j_put(&dbuf[0: 65536], dn[0],
+            "{\"status\":\"queued\",\"task_id\":" as &const byte);
+        dn[0] = dn[0] + j_put_str(&dbuf[0: 65536], dn[0], &task[0], tl);
+        dn[0] = dn[0] + j_put(&dbuf[0: 65536], dn[0], "}" as &const byte);
+    }
+    audit_note();
+    oplog_note(data_root_ptr(), data_root_len(), line, n, op, opn,
+        orc == 0 || replay);
+    emit_call_ok(id, op, opn, &rid[0], rl, h, &dbuf[0], dn[0], replay,
+        op_i, orc, &task[0], tl);
+}
+
+// 从操作结果里取真实 task_id 登记幂等槽
+fn bind_idem(op_i: usize, h: u64, dbuf: &const byte, dn: usize,
+    task: &[byte], tl: &usize) void {
+    var tk: [byte: 32] = [0: 32];
+    var tkl: usize = 0;
+    if !j_str(dbuf, dn, "task_id" as &const byte, &tk[0: 32], &tkl) {
+        return;
+    }
+    idem_insert_with(op_i, h, &tk[0], tkl);
+    var k: usize = 0;
+    while k < tkl && k < 32 {
+        task[k] = tk[k];
+        k = k + 1;
+    }
+    tl[0] = tkl;
+}
+
+// 三个工具的自描述（契约在 Registry 里，这里只描述工具面）
+fn do_tool_list(o: &[byte], w0: usize) usize {
+    var w: usize = w0;
+    w = w + j_put(o, w, "{\"name\":\"list\"," as &const byte);
+    w = w + j_put(o, w,
+        "\"description\":\"List business operations.\"," as &const byte);
+    w = w + j_put(o, w, "\"inputSchema\":{" as &const byte);
+    w = w + j_put(o, w,
+        "\"type\":\"object\",\"properties\":{}," as &const byte);
+    w = w + j_put(o, w, "\"additionalProperties\":false}}," as &const byte);
+    w = w + j_put(o, w, "{\"name\":\"describe\"," as &const byte);
+    w = w + j_put(o, w,
+        "\"description\":\"Describe one operation contract.\"," as &const byte);
+    w = w + j_put(o, w, "\"inputSchema\":{" as &const byte);
+    w = w + j_put(o, w, "\"type\":\"object\"," as &const byte);
+    w = w + j_put(o, w,
+        "\"properties\":{\"operation\":{\"type\":\"string\"}}," as &const byte);
+    w = w + j_put(o, w, "\"required\":[\"operation\"]}}," as &const byte);
+    w = w + j_put(o, w, "{\"name\":\"call\"," as &const byte);
+    w = w + j_put(o, w,
+        "\"description\":\"Invoke one operation.\"," as &const byte);
+    w = w + j_put(o, w, "\"inputSchema\":{" as &const byte);
+    w = w + j_put(o, w, "\"type\":\"object\"," as &const byte);
+    w = w + j_put(o, w, "\"properties\":{" as &const byte);
+    w = w + j_put(o, w,
+        "\"operation\":{\"type\":\"string\"}," as &const byte);
+    w = w + j_put(o, w, "\"input\":{\"type\":\"object\"}," as &const byte);
+    w = w + j_put(o, w,
+        "\"request_id\":{\"type\":\"string\"}}," as &const byte);
+    w = w + j_put(o, w,
+        "\"required\":[\"operation\",\"input\"]}}" as &const byte);
+    return w;
+}
+
+// 一条请求 → 一条响应（或零条响应：通知）
+fn handle_line(line: &const byte, n: usize) void {
+    const id: i64 = j_id(line, n);
+    if j_method_is(line, n, "initialize" as &const byte) {
+        var out: [byte: 512] = [0: 512];
+        const o: &[byte] = &out[0: 512];
+        var w: usize = 0;
+        w = w + j_put(&out[0: 512], w, "{\"jsonrpc\":\"2.0\"," as &const byte);
+        w = w + j_put(&out[0: 512], w, "\"id\":" as &const byte);
+        w = w + j_put_i64(o, w, id);
+        w = w + j_put(&out[0: 512], w,
+            ",\"result\":{\"protocolVersion\":\"2024-11-05\"," as &const byte);
+        w = w + j_put(&out[0: 512], w,
+            "\"capabilities\":{\"tools\":{}}," as &const byte);
+        w = w + j_put(&out[0: 512], w,
+            "\"serverInfo\":{\"name\":\"drama\",\"version\":\"" as &const byte);
+        w = w + j_put(&out[0: 512], w, version_string());
+        w = w + j_put(&out[0: 512], w, "\"}}}\n" as &const byte);
+        _ = fd_write_all(1, &out[0], w);
+        return;
+    }
+    if j_method_is(line, n, "notifications/initialized" as &const byte) {
+        return;
+    }
+    if j_method_is(line, n, "tools/list" as &const byte) {
+        var out: [byte: 4096] = [0: 4096];
+        const o: &[byte] = &out[0: 4096];
+        var w: usize = 0;
+        w = w + j_put(o, w, "{\"jsonrpc\":\"2.0\"," as &const byte);
+        w = w + j_put(o, w, "\"id\":" as &const byte);
+        w = w + j_put_i64(o, w, id);
+        w = w + j_put(o, w, ",\"result\":{\"tools\":[" as &const byte);
+        w = do_tool_list(o, w);
+        w = w + j_put(o, w, "]}}\n" as &const byte);
+        _ = fd_write_all(1, &out[0], w);
+        return;
+    }
+    if j_method_is(line, n, "tools/call" as &const byte) {
+        var tool: [byte: 64] = [0: 64];
+        if !j_field(line, n, "name" as &const byte, &tool[0: 64]) {
+            emit_error(id, -32602, "missing tool name" as &const byte);
+            return;
+        }
+        const tn: usize = b_len(&tool[0]);
+        var op: [byte: 128] = [0: 128];
+        const has_op: bool = j_field(line, n, "operation" as &const byte,
+            &op[0: 128]);
+        if b_eq(&tool[0], tn, "list" as &const byte) {
+            // 操作目录会随阶段增长：40 个操作的 list 已经超过 4 KB
+            var t: [byte: 16384] = [0: 16384];
+            const w: usize = do_list(&t[0: 16384]);
+            emit_tool_text(id, &t[0], w, false);
+            return;
+        }
+        if b_eq(&tool[0], tn, "describe" as &const byte) {
+            if !has_op {
+                var t2: [byte: 512] = [0: 512];
+                const w2: usize = do_business_error(&t2[0: 512],
+                    "SCHEMA_INVALID" as &const byte,
+                    "describe requires arguments.operation" as &const byte);
+                emit_tool_text(id, &t2[0], w2, false);
+                return;
+            }
+            handle_describe(id, &op[0], b_len(&op[0]));
+            return;
+        }
+        if b_eq(&tool[0], tn, "call" as &const byte) {
+            if !has_op {
+                var t3: [byte: 512] = [0: 512];
+                const w3: usize = do_business_error(&t3[0: 512],
+                    "SCHEMA_INVALID" as &const byte,
+                    "call requires arguments.operation" as &const byte);
+                emit_tool_text(id, &t3[0], w3, false);
+                return;
+            }
+            handle_call(id, line, n, &op[0], b_len(&op[0]));
+            return;
+        }
+        emit_error(id, -32602, "unknown tool" as &const byte);
+        return;
+    }
+    if id >= 0 {
+        emit_error(id, -32601, "Method not found" as &const byte);
+    }
+}
+
+// `drama mcp serve`：读到 EOF 退出
+export fn serve() i32 {
+    var raw: &byte = malloc(LINE_MAX) as &byte;
+    defer { free(raw as &void); }
+    if (raw as usize) == 0 {
+        say_err("drama: out of memory\n" as &const byte);
+        return 1;
+    }
+    while true {
+        var over: [bool: 1] = [false];
+        const n: usize = read_line(raw, LINE_MAX, &over[0]);
+        if over[0] {
+            continue;
+        }
+        if n == 0 {
+            break;
+        }
+        handle_line(raw as &const byte, n);
+    }
+    return 0;
+}
