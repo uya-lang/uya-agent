@@ -243,6 +243,7 @@ readelf -lW build/uya-agent | grep -c INTERP    # 0 = 真静态
 | `--turn-retry-max N` | **回合级自动继续的预算**：一回合没跑完（协议错 / 传输错 / 有正文的截断 / 空响应）就自动替人打一句「继续」重开。`0` = 一次都不续（逐字节回到 P94 之前）；`N>0` = 最多 N 次；**不给 = 交互式会话里不限次数**（直到成功或你 esc/ctrl+c）。管道 / CI / 子代理默认不续。`UYA_AGENT_TURN_RETRY_MAX` 同口径 |
 | `--bg-notify` / `--no-bg-notify` | **后台任务/子代理跑完就通知模型**（默认交互式前台开）。通知在下一个 step 边界投递成一条 user 消息；回合结束之后才完成的，就在空闲时自动再开一回合。关掉它，模型只能自己 `job_output(wait=true)` / `sleep` 轮询。`UYA_AGENT_BG_NOTIFY=0` 同效 |
 | `--plan` | 以 plan 模式启动（先出计划、批准后再执行）；plan 模式**真的拦写**，非交互会话（管道/CI）里没有审阅渠道 ⇒ 只产出计划、写工具始终被拒 |
+| `--chat` | 以 **chat（问答）模式**启动：只答问题、不动文件（写工具硬拒），没有审阅出口 —— 想动手就 `tab` 或 `/chat` 切回 build。与 `--plan` 同给时 plan 优先 |
 | `--permission MODE` | **访问模式**：`read-only` / `workspace-write` / `danger-full-access`（默认）。也收 `--permission=<MODE>`；非法值**报错退出**。来源优先级 CLI > `UYA_AGENT_PERMISSION` > DSH `permission.defaultPreset` |
 | `--no-sandbox` | 关掉 bash 的内核沙箱（bwrap）：confined 模式不再套壳、也不再 fail closed（启动打一行警告） |
 | `--bwrap PATH` | 指定 bwrap 可执行文件（默认探测 `/usr/bin/bwrap`、`/bin/bwrap`、`/usr/local/bin/bwrap`） |
@@ -293,7 +294,7 @@ readelf -lW build/uya-agent | grep -c INTERP    # 0 = 真静态
 
 `/help` `/status` `/tasks [open|close|toggle]` `/goal [<objective>|edit <objective>|pause|resume|clear]`
 （TUI 里裸命令开**动作选择框**，打开就回车 = 看状态；`create`/`edit` 再用输入框填正文）
-`/compact` `/plan` `/permission [预设]` `/model [名字|提供方/名字]` `/effort [档位]` `/workspace [目录]`
+`/compact` `/plan` `/chat` `/permission [预设]` `/model [名字|提供方/名字]` `/effort [档位]` `/workspace [目录]`
 `/worktree [start|status|finish|discard|list|reclaim|off]`（**默认开着**；TUI 里裸命令开
 **动作选择框**，打开就回车 = `status`；`start` 当场建（模式关着也顺带开回来），`off` 是逃生口；
 `finish`/`discard` 选定后再过一道确认，`reclaim` 只清确定的垃圾、不确认）
@@ -311,7 +312,7 @@ uya-agent --web 127.0.0.1:9000     # 指定端口（端口写 0 = 内核分配�
 
 * **顶栏**：一条会话一个标签，标签上是**会话标题**（模型 `set_title` / `/title` 起的 →
   兜底用首条人类消息的前 3 个词 → 再兜底「会话 N」）；标题栏**最右边是 `+`**，点它新建会话。
-* **标题下面是该会话的终端**：那就是**真 TTY** —— 键盘、`tab` 切计划、`/status` 浮层、
+* **标题下面是该会话的终端**：那就是**真 TTY** —— 键盘、`tab` 切模式、`/status` 浮层、
   `esc` 打断、`↑/↓` 历史都与在终端里跑一模一样（因为服务端跑的就是同一个全屏 TUI，
   只是外面套了一层 PTY）。**中文可以直接输入**：页面里有一个透明的代理输入框接输入法
   （候选期间不上屏、回车确认候选词不会被当成提交），粘贴走括起粘贴（粘多行只出现换行，

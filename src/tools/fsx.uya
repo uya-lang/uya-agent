@@ -13,12 +13,13 @@
 //   记 `OBS_PRESENT`，读到不存在记 `OBS_ABSENT`，write/edit 成功后刷新记录；
 //   ③ read 必须**流式扫完整个文件**数真实总行数（只读文件头 cap 字节会把 5756 行的
 //   agent.uya 报成 3149 行，模型据此以为读完了，踩坑 34）；④ 行长按**字符数**截断且不
-//   切断 UTF-8，footer 三种文案各有触发条件；⑤ plan 闸门**排在** read-only 之前（当前最
-//   直接的障碍是「计划还没批」，文案也最能指路），⑥ write 的 diff 采集必须在 `O_TRUNC`
+//   切断 UTF-8，footer 三种文案各有触发条件；⑤ 会话模式闸门（plan / chat）**排在**
+//   read-only 之前（最直接的障碍先说），⑥ write 的 diff 采集必须在 `O_TRUNC`
 //   **之前**读旧内容；⑦ 失败一律以 `Error: …` 文本返回，不抛错。
 // 依赖：libc.syscall/unistd（open/stat/write/mkdir）、foundation/bufx（Buf、`bufx_mem_eq`）、
-//   foundation/jsonx（工具参数解析）；本仓 tools/perm（`perm_allows_write`）、plan
-//   （`plan_blocks_write`）、vcs/worktreex（`wt_guard_path_crosses`）、diff/diffx
+//   foundation/jsonx（工具参数解析）；本仓 tools/perm（`perm_allows_write`）、
+//   plan（`mode_blocks_write` / `chat_on`）、vcs/worktreex
+//   （`wt_guard_path_crosses`）、diff/diffx
 //   （`diffx_enabled`/`diffx_note_*`，只用于显示层采集）。
 // 命名：对外 `fs_*`（解析 / 观察 / 三个工具入口）+ `FS_*` 常量（拒绝文案与上限），
 //   私有同样 `fs_*` 前缀（非 export），工具入口统一 `fs_tool_*`。
@@ -54,6 +55,12 @@ const FS_READONLY_EDIT: &const byte = "Error: edit is refused in read-only mode 
 // 检查排在 read-only 之前 —— 当前最直接的障碍是「计划还没批」，文案也最能指路）
 const FS_PLAN_WRITE: &const byte = "Error: write is refused in plan mode (no file changes before the user approves the plan). Do not retry; present the complete plan through exit_plan_mode first.";
 const FS_PLAN_EDIT: &const byte = "Error: edit is refused in plan mode (no file changes before the user approves the plan). Do not retry; present the complete plan through exit_plan_mode first.";
+// P126：chat（问答）模式下写工具的拒绝串。与 plan 共用同一道闸门、**文案分开**：
+// plan 指路 exit_plan_mode（计划还没批），chat 没有审阅出口，只能请人切到 build。
+// 行宽豁免：错误串不可断（自测逐字断言）
+const FS_CHAT_WRITE: &const byte = "Error: write is refused in chat mode (this mode answers questions and does not change files). Do not retry; tell the user to switch to build mode (tab) if they want the change made.";
+// 行宽豁免：错误串不可断（自测逐字断言）
+const FS_CHAT_EDIT: &const byte = "Error: edit is refused in chat mode (this mode answers questions and does not change files). Do not retry; tell the user to switch to build mode (tab).";
 
 export struct FsCtx {
     workspace: &const byte,
@@ -682,7 +689,7 @@ fn fs_mkdir_parent(abs_z: &const byte) bool {
     return true;
 }
 
-// write 工具入口。顺序：参数校验 → plan 闸门 → read-only 闸门 → worktree 写闸门 →
+// write 工具入口。顺序：参数校验 → 会话模式闸门 → read-only 闸门 → worktree 写闸门 →
 // 观察策略（已存在则要求「读过且版本未变」，否则 FS_STALE_VERSION / 先 read 提示）→
 // O_TRUNC 前采 diff → 落盘 → 刷新观察记录 → 回 `<path>…` 信封（正文 `Updated file` /
 // `Created file`）。**文件不存在时不要求先读**。所有失败也写进 out，不抛错。
@@ -693,9 +700,14 @@ export fn fs_tool_write(f: &const FsCtx, obs: &FsObsTable, args: &const JsonValu
         fs_err(out, "file_path must be a non-empty string");
         return;
     }
-    // P26：plan 模式下写工具硬拒（计划批了才有写权限；闸门在工具层，不是内核边界）
-    if plan_blocks_write() {
-        _ = buf_append_cstr(out, FS_PLAN_WRITE);
+    // P26/P126：会话模式闸门（plan = 计划批了才有写权限；chat = 问答模式不动文件）。
+    // 闸门在工具层，不是内核边界；两种模式的拒绝串分开（见 FS_CHAT_* 的注释）。
+    if mode_blocks_write() {
+        if chat_on() {
+            _ = buf_append_cstr(out, FS_CHAT_WRITE);
+        } else {
+            _ = buf_append_cstr(out, FS_PLAN_WRITE);
+        }
         return;
     }
     // P21：read-only 模式下写工具硬拒（模式是用户选的，不要试着绕过）
@@ -832,9 +844,10 @@ fn fs_count_occurrences(data: &[byte], needle: &[byte]) i32 {
     return n;
 }
 
-// edit 工具入口。顺序：参数校验（old_string 非空、new_string 存在、两者必须不同）→ plan 闸门 →
-// read-only 闸门 → worktree 写闸门 → 观察策略（不存在 + 没见过 → 先 read 提示；见过 →
-// file not found；存在但没见过 → 先 read 提示；版本变了 → FS_STALE_VERSION）→ 整文件读入
+// edit 工具入口。顺序：参数校验（old_string 非空、new_string 存在、两者必须不同）→
+// 会话模式闸门 → read-only 闸门 → worktree 写闸门 → 观察策略（不存在 + 没见过 →
+// 先 read 提示；见过 → file not found；存在但没见过 → 先 read 提示；版本变了 →
+// FS_STALE_VERSION）→ 整文件读入
 // （上限 4 MiB）做字面替换 → 刷新观察记录 → 回 `The file X has been updated successfully.`
 // / `…All occurrences were successfully replaced.`。`old_string` 不唯一且没给 `replace_all=true`
 // 时报「appears N times」，绝不猜要替哪一个。
@@ -845,9 +858,13 @@ export fn fs_tool_edit(f: &const FsCtx, obs: &FsObsTable, args: &const JsonValue
         fs_err(out, "file_path must be a non-empty string");
         return;
     }
-    // P26：plan 模式下编辑工具硬拒
-    if plan_blocks_write() {
-        _ = buf_append_cstr(out, FS_PLAN_EDIT);
+    // P26/P126：会话模式闸门（edit 与 write 同一条；拒绝串按模式分开）
+    if mode_blocks_write() {
+        if chat_on() {
+            _ = buf_append_cstr(out, FS_CHAT_EDIT);
+        } else {
+            _ = buf_append_cstr(out, FS_PLAN_EDIT);
+        }
         return;
     }
     // P21：read-only 模式下编辑工具硬拒
