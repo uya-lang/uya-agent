@@ -163,9 +163,12 @@ if cmp -s "$D1/projects/$PID1/canon.json" "$D2/projects/$PID2/canon.json"; then
     ok "重放后 canon.json 逐字节一致（复现率 100%）"
 else
     bad "重放后 canon.json 不一致"
-    diff <(python3 -m json.tool "$D1/projects/$PID1/canon.json" 2>/dev/null || true) \
-         <(python3 -m json.tool "$D2/projects/$PID2/canon.json" 2>/dev/null || true) \
-         | head -10 || true
+    # 用临时文件而不是 <( )：本脚本是 /bin/sh，进程替换只有 bash 认
+    python3 -m json.tool "$D1/projects/$PID1/canon.json" \
+        > "$TMP/canon_d1.json" 2>/dev/null || true
+    python3 -m json.tool "$D2/projects/$PID2/canon.json" \
+        > "$TMP/canon_d2.json" 2>/dev/null || true
+    diff "$TMP/canon_d1.json" "$TMP/canon_d2.json" | head -10 || true
 fi
 
 echo "----"

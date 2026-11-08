@@ -113,3 +113,17 @@ for f in drama_plugin/p*_selftest.sh; do sh "$f" || echo "FAILED $f"; done
 - **没有真实外部依赖的验证**：模型、视频队列、FFmpeg 全是 mock/替身，
   接真实产线前不能拿它跑真片。
 - **规模只到 10 集**：百集压力、索引分片、单日配额都没跑过。
+
+## 5. 合并回 main 后补的四个缺陷（2026-11-08 实测修复）
+
+原先在 session 分支上，`sh` 调用下有两个自测红；修完 27 个脚本（含
+`build_selftest.sh`）在 `sh` 下全绿，`p13c` 默认 `EPISODES=100` 也全绿。
+
+| 现象 | 根因 | 修法 |
+|---|---|---|
+| 第 11 集之后 `episode.approve` 报 `IO_ERROR/unknown failure` | `fmt_version_ok_p` 把 `take` 和 512 字节缓冲区取成同一个数，`copy_to` 要留 1 字节结尾 ⇒ **凡 ≥512 字节的状态文件都判成"格式不认识"**（canon.json 每集长 ~37 字节，第 11 集正好越过 512） | 缓冲区改 520，`take` 仍 512 |
+| 同一个错误只写 `unknown failure`，看不出是哪一步 | `canon_commit` 的 50/52/55/56 没进错误码表，全落兜底分支 | 新增 `do_commit_error`：`invalid project_id` / `canon state unreadable` / `commit record write failed` / `commit index unreadable` |
+| 默认 100 集跑到第 33 集红 | 承诺槽沿用 `MAX_OBJ=32`，百集每集一条钩子必然撑爆，且爆掉时报成 `PROMISE_UNKNOWN`（像是"承诺不存在"） | 承诺单独 `PROMISE_MAX=160`；槽满改报 `CAPACITY_EXCEEDED`（rc 57） |
+| 100 集过了数量关，仍因 `COMEDY_REPEAT` 判红 | mock 剧本写死同一个笑点 setup，20 集窗口里同一个 setup 出现 100 次 | mock 按 prompt 的 FNV-1a 在 12 条 setup 里挑，仍然是"同输入同输出" |
+| `p6_selftest.sh` 在 `sh`（dash）下 Syntax error | 脚本是 `#!/bin/sh`，却用了只有 bash 认的 `<( )` 进程替换 | 改成临时文件 + `diff` |
+| `p13c` 偶发 `JSONDecodeError`（空回） | `serve` 被打断 / 管道半截，`real_stress.sh` 早就加了重试，`p13c` 没加 | `ask_once` + 一次重试，口径与 `real_stress.sh` 一致 |

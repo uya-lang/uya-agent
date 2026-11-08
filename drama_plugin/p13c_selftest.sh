@@ -53,7 +53,7 @@ if ! "$UYA" build $SRC -o "$TMP/drama" > "$TMP/build.log" 2>&1; then
 fi
 echo "PASS: 构建通过"
 
-ask() {
+ask_once() {
     python3 - "$TMP/q.jsonl" > "$TMP/request.jsonl" <<'PY'
 import json
 import sys
@@ -62,6 +62,17 @@ print(json.dumps(obj, ensure_ascii=False, separators=(',', ':')))
 PY
     timeout 120 "$TMP/drama" mcp serve --data-dir "$DATA" \
         < "$TMP/request.jsonl" 2>/dev/null
+}
+
+# 百集连跑时偶发空回（serve 被打断 / 管道半截）：重试一次，别把 flake 当缺陷。
+# 口径与 real_stress.sh 一致。
+ask() {
+    _resp=$(ask_once)
+    if [ -z "$_resp" ] || ! printf '%s' "$_resp" | grep -q '"result"'; then
+        sleep 1
+        _resp=$(ask_once)
+    fi
+    printf '%s\n' "$_resp"
 }
 
 field() {
