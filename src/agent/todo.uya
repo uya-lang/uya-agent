@@ -2,7 +2,8 @@
 //
 // 本文件：清单项与状态的零值/生命周期（`td_item_empty`/`todo_init`/`todo_free`）、
 //   工具入口 `todo_tool_write`（校验 + 整表替换 + 回显）、**落盘**（`todo_log_write`）
-//   与**折回**（`todo_from_json`）、空白处理 `td_trim`、状态串映射 `td_status_of`。
+//   与**折回**（`todo_from_json`）、空白处理 `td_trim`、状态串映射 `td_status_of`、
+//   执行中的清单提醒 `todo_remind_step`（P131）。
 // 不变量：① **整表替换** —— 每次调用提交完整列表，不做增量合并；
 //   ② **先全量校验再落状态**（content 去空白后非空、列表内不重复、status 合法、条数 ≤ 32）——
 //   否则会出现「一半校验过一半没过」的半更新；③ 上限 `TODO_MAX = 32`；
@@ -10,7 +11,10 @@
 //   ⑤ 清空时机有两个：**回合开始时**（`todo_clear`，DSH 口径）与**换会话时**
 //   （agent 的 `agent_session_scoped_reset`）；
 //   ⑥ **提交成功的整表落一条 `todo/write` 事件**（后写覆盖先写），恢复会话时由
-//   `agent_hist_from_log` 折回最后一次 —— 修前清单只在内存里，`--resume` 之后恒为空。
+//   `agent_hist_from_log` 折回最后一次 —— 修前清单只在内存里，`--resume` 之后恒为空；
+//   ⑦ **执行中也要回头看一眼**：step 边界按间隔补一条几十字节的自问式提醒
+//   （`todo_remind_step`）—— 不变量 ④ 让模型看不到清单，事后防线又只有收工那一条，
+//   于是「做完了不标」成了常态（见该函数的注释）。
 // 依赖：无 `use` 行；依赖 libc.heap（malloc/free，同 goal.uya 的手法）、
 //   foundation/bufx（Buf / bufx_mem_eq）、foundation/jsonx
 //   （Arena / arena_init / JsonValue / JsonStrView / js_parse / js_obj_get /
@@ -29,6 +33,33 @@
 
 const TODO_MAX: usize = 32;
 const TODO_CONTENT_MAX: usize = 4096;
+
+// ---- P131：执行中的清单提醒（`todo_remind_step`）----
+//
+// 用户报的现场：**跑着就不更新**，做完的那一项一路挂在 `in_progress` 上，直到收工
+// （或被下一条任务挤掉）才有人回头补。根因不是措辞 —— 工具描述与 DSH 逐字相同，写的
+// 正是 "mark a todo completed the moment it is done"。真实缺口是两侧都空着：
+//   * 不变量 ④ 让清单**不进上下文**，模型手里没有当前值；
+//   * 事后防线只有 system prompt 的收工纪律（`SEC_FINISH` 第三条），它只管收工那一刻。
+// DSH 那边有 `dsh-repeat-tool-reminder` 与 session projection 兜着，本仓两样都没有。
+// 修法：step 边界补一条**几十字节**的自问式提醒，按间隔节流。为什么这样够：上一次
+// `todo_write` 的**参数**就在历史里（assistant 的 `tool_calls`），模型看得见 ——
+// 缺的从来不是数据，是「现在该回头看它一眼」这个动作。抄正文既白花 token，又多一份
+// 可能与真实状态不一致的副本（与 `agent_ctx_est` 不抄正文同一条纪律）。
+
+// 提醒间隔（step 边界个数）：一次提交之后至少隔两步才吭声（刚标过就不打扰），
+// 而「标完又干了两步」正好是「这一步大概做完了」的时间尺度。
+const TODO_REMIND_EVERY: i32 = 3;
+// 提醒消息的固定前缀。两个用途：① `hist_drop_user_prefix` 按它删掉上一条 ——
+// 历史里只留一条（与运行时快照 supersede 同一手法，见 `hist_drop_user_prefix`）；
+// ② 别处本来就按 `<system-reminder>` 过滤注入消息（`tm_is_task_msg` /
+// `agent_title_user_into`），用同一形状就不必再教它们认第三种。
+const TODO_REMIND_TAG: &const byte = "<system-reminder>\nTodo check: ";
+
+// 距上一条提醒 / 上一次提交过了几个 step 边界。四个写点：本行的初值、
+// `todo_clear`（回合开始）、`todo_tool_write`（提交成功）都清零，
+// `todo_remind_step` 自己每步 +1、注入成功时归零 —— 别处只读。
+var g_todo_remind_wait: i32 = 0;
 
 export const TD_PENDING: u8 = 0;
 export const TD_INPROGRESS: u8 = 1;
@@ -74,6 +105,9 @@ export fn todo_free(s: &TodoState) void {
 // DSH：回合开始时清空（投影在 turn/start 复位）
 export fn todo_clear(s: &TodoState) void {
     todo_free(s);
+    // P131：提醒的节奏跟着清单一起复位 —— 不然上一回合最后两步攒下的等待会
+    // 让新回合的第一个 step 边界立刻补一条（那时清单还是空的，白扫一遍历史）
+    g_todo_remind_wait = 0;
 }
 
 // 算出 `[0, n)` 去掉**首尾**空白（空格 / tab / LF / CR）之后的（偏移, 长度），
@@ -357,6 +391,8 @@ export fn todo_tool_write(s: &TodoState, args: &const JsonValue, out: &Buf) void
     // 落一条 `todo/write`：**只有走到这一行的提交**才会进日志（被上面任何一档拒掉的
     // 提交一个字节都不写）。恢复会话时折最后一次 —— 见 `todo_log_write` 的注释。
     todo_log_write(s);
+    // P131：刚提交过 ⇒ 提醒重新计时（否则下一步边界立刻补一条「你刚写过的清单」）
+    g_todo_remind_wait = 0;
     var np: usize = 0;
     var ni: usize = 0;
     var nc: usize = 0;
@@ -378,4 +414,62 @@ export fn todo_tool_write(s: &TodoState, args: &const JsonValue, out: &Buf) void
     _ = buf_append_cstr(out, " in progress, ");
     _ = buf_append_u64(out, nc as u64);
     _ = buf_append_cstr(out, " completed.");
+}
+
+// 每个 step 边界调一次（`agent_turn_loop_once` 组请求之前，P131）。清单里有
+// `in_progress` 且距上一条提醒够久，就往历史尾部补一条几十字节的提醒；
+// 返回是否真的注入了（自测按它钉节流，产品侧不看返回值）。
+//
+// 两条节流都要有：没有在做的条目就**一个字节都不说**（没开始的事没什么可标的）；
+// 间隔没到也不说（每步一句等于把上下文预算和前缀缓存一起烧掉）。另外，清单变成
+// 「没有 in_progress」时要把上一条提醒**撤掉** —— 它描述的状态已经不成立了，
+// 留着只会让模型看见一份和现实相反的计数。
+export fn todo_remind_step(h: &History) bool {
+    // 饱和加：撞到上限也只是「一直该提醒」，不会翻成负数把节流整条关掉
+    g_todo_remind_wait = g_todo_remind_wait +| 1;
+    var np: usize = 0;
+    var ni: usize = 0;
+    var nc: usize = 0;
+    var i: usize = 0;
+    while i < g_todos.n {
+        if g_todos.items[i].status == TD_INPROGRESS {
+            ni = ni + 1;
+        } else if g_todos.items[i].status == TD_COMPLETED {
+            nc = nc + 1;
+        } else {
+            np = np + 1;
+        }
+        i = i + 1;
+    }
+    const tag_n: usize = bufx_cstr_len(TODO_REMIND_TAG);
+    if ni == 0 {
+        _ = hist_drop_user_prefix(h, TODO_REMIND_TAG, tag_n);
+        return false;
+    }
+    if g_todo_remind_wait < TODO_REMIND_EVERY {
+        return false;
+    }
+    var m: Buf = buf_new(384);
+    if !buf_valid(&m) {
+        return false;
+    }
+    defer { buf_free(&m); }
+    var ok: bool = buf_append_cstr(&m, TODO_REMIND_TAG);
+    ok = ok && buf_append_u64(&m, ni as u64);
+    ok = ok && buf_append_cstr(&m, " in_progress, ");
+    ok = ok && buf_append_u64(&m, nc as u64);
+    ok = ok && buf_append_cstr(&m, " completed, ");
+    ok = ok && buf_append_u64(&m, np as u64);
+    ok = ok && buf_append_cstr(&m, " pending.\nIf you just finished one of");
+    ok = ok && buf_append_cstr(&m, " them, call todo_write now with the");
+    ok = ok && buf_append_cstr(&m, " COMPLETE list (all items, not a diff)");
+    ok = ok && buf_append_cstr(&m, " and mark it completed — do not batch");
+    ok = ok && buf_append_cstr(&m, " completions.\n</system-reminder>");
+    if !ok {
+        return false;   // 分配失败：不注入，也不动节奏（下一步再试）
+    }
+    // 旧的先撤再推：反过来会连刚插进去的那一条一起删掉（前缀相同）
+    _ = hist_drop_user_prefix(h, TODO_REMIND_TAG, tag_n);
+    g_todo_remind_wait = 0;
+    return hist_push(h, ROLE_USER, m.ptr as &const byte, m.len);
 }
