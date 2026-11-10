@@ -1900,7 +1900,7 @@ step 边界检查，所以立即改 `mode`）。
 
 | 出口 | 谁能切 | 走哪条路 |
 |---|---|---|
-| tab（TUI） | 人 | 键层 `tui_mode_cycle()` 翻 chip + 置 `TUI_REQ_MODE`，主循环 `agent_mode_apply` |
+| tab（TUI） | 人 | 键层 `tui_mode_cycle()` 翻 chip + 置 `TUI_REQ_MODE`；空闲主循环 `agent_mode_apply`（整份）；回合运行中泵点 `agent_mode_force(tui_mode())` 只落地状态那一半（P129） |
 | `/plan`、`/chat`（两种界面都有） | 人 | `agent_mode_apply(cfg, h, MODE_*)` |
 | `exit_plan_mode`（审阅浮窗「确认执行」） | 模型 | `mode_set(s, MODE_BUILD)`（只在 plan 模式可用） |
 | `--plan` / `--chat` | 人（启动时） | `agent_texts_ensure` 里一次 `mode_set`（两个都给时 plan 优先） |
@@ -2158,11 +2158,12 @@ log / result；没调 `wf_done` 时给 `(the script finished without calling wf_
 就是「按了没反应」（那是本条踩坑的主因）。两条路都调 `agent_tasks_toggle_apply`（翻显示位 +
 重建文本 + 空表时落 notice + 当场出帧），一处改两处生效。
 
-**这条待遇只给 ctrl+t**：它一个字节都不改历史（只翻显示位 + 重建只读文本，TUI 下零 IO）。
-tab（plan）/ shift+tab（access）**不能**照搬 —— 那两个会 `hist_push` 一份运行时快照进
+**这条待遇只给「不改历史」的那一半**：ctrl+t 一个字节都不改历史（只翻显示位 + 重建只读
+文本，TUI 下零 IO）。shift+tab（access）**不能**照搬 —— 它会 `hist_push` 一份运行时快照进
 **正在被这一回合使用的** History。所以泵点上的取用口是**只认 TASKS** 的
-`tui_take_tasks_request()`，不是 `tui_take_request()`（后者会把还挂着的 plan / access /
-ctrl+v 一并吃掉）。
+`tui_take_tasks_request()`，不是 `tui_take_request()`（后者会把还挂着的 access / ctrl+v
+一并吃掉）。**P129 补充**：tab 也进了泵点，但只落地状态那一半（改 `g_plan.mode` + 写闸门 +
+chip，零历史改动），快照仍由 step 边界补推 —— 见 §19.42。
 
 **空态屏也画这块**（`tui_draw_tasks_block` 由 home 与 chat 共用，行预算收口在
 `tui_tasks_prepare`）：刚启动 / `/new` 之后按 ctrl+t 必须与对话态一个行为。
@@ -5543,13 +5544,14 @@ QTermWidget）对 `ESC[?5522$p`（DECRQM）**零应答**，OSC 52 写 `c`/`p` �
     与踩坑 44 的「键收下来了但没人看」是同一个形状。修法也沿用本仓既定套路：**在泵点当场消费**
     （`agent_pump_block` 里取一次）。
 
-    **为什么只有 ctrl+t 能享受泵点待遇**（这条边界比修法本身更重要）：它**一个字节都不改历史** ——
-    只翻一个显示位 + 重建一张只读文本（`tasks_panel_sync` 在 TUI 下只 mark dirty，零 IO）。
-    tab（plan）/ shift+tab（access）**不行**：那两个会 `hist_push` 一份运行时快照进**正在被这一
-    回合使用的** History。所以泵点上的取用口必须是**只认 TASKS**的那一个（`tui_take_tasks_request`），
+    **为什么泵点待遇的门槛是「不改历史」**（这条边界比修法本身更重要）：ctrl+t **一个字节都
+    不改历史** —— 只翻一个显示位 + 重建一张只读文本（`tasks_panel_sync` 在 TUI 下只 mark dirty，
+    零 IO）。shift+tab（access）**不行**：它会 `hist_push` 一份运行时快照进**正在被这一回合
+    使用的** History。所以泵点上的取用口必须是**只认 TASKS**的那一个（`tui_take_tasks_request`），
     不能图省事写 `tui_take_request() == TUI_REQ_TASKS` —— 那个出口会把**任何**请求一并取走，
-    等于把还挂着的 plan / access / ctrl+v 悄悄吃掉（钉子直接钉住这条：泵点跑完，
-    `tui_take_request()` 还得能取到 `TUI_REQ_PLAN_ON`）。
+    等于把还挂着的 access / ctrl+v 悄悄吃掉。**P129 补充**（同一个门槛、另一种切法）：tab 也
+    进泵点，但只落**状态那一半**（`agent_mode_force`，零历史改动），快照留给 step 边界 ——
+    于是「chip 写着 Build、写闸门还是 chat」那段窗口关掉了，见 §19.42。
 
     ②的修法是把 chat 里画块那一段**原样抽成** `tui_draw_tasks_block`，home 与 chat 共用；
     行预算也收口成 `tui_tasks_prepare`（两个屏的块高算法只留一份，否则迟早漂移）。
@@ -7295,7 +7297,7 @@ DEEPSEEK_API_KEY=sk-xxx ./build/uya-agent \
 | `subagent-goal` | 9 调用：goal 三工具、`subagent`/`subagent_output(wait)`、`ralph(maxRounds=2)` |
 | `tasks-render` | 进度条/百分比/体量、空态零字节、箱体 11 行逐行等宽；**§19.12**：折叠行的目标段带 `轮` 单位与正文、正文带换行压成一行、放不下时**只裁正文不丢头**（26..78 逐档扫描 + 两条前缀等值） |
 | `tasks-scroll` | `--no-tui`：折叠行与 agents 箱体进面板；展开后每行 98 列 |
-| `tui-tasks` | 常驻任务块层序、`ctrl+t` 只置 `TUI_REQ_TASKS`、矮/窄退化；折叠行的 `目标 N/M轮` 与目标正文真在屏幕上（§19.12）；P29 `/goal` 浮层、**P91 动作选择框**（六动作 + ✓ 挪位 + 打开就回车 = 看状态且不建 status 目标 + pause/resume/clear 真翻盘 + 泵点只回执不执行）；**E 段（踩坑 114）**：泵点消费 ctrl+t（运行中当场翻转 + 请求被消费 + 泵点只认 TASKS，tab 的请求原样留给主循环）、空态屏照样画块并按得动、四表全空时落 notice |
+| `tui-tasks` | 常驻任务块层序、`ctrl+t` 只置 `TUI_REQ_TASKS`、矮/窄退化；折叠行的 `目标 N/M轮` 与目标正文真在屏幕上（§19.12）；P29 `/goal` 浮层、**P91 动作选择框**（六动作 + ✓ 挪位 + 打开就回车 = 看状态且不建 status 目标 + pause/resume/clear 真翻盘 + 泵点只回执不执行）；**E 段（踩坑 114）**：泵点消费 ctrl+t（运行中当场翻转 + 请求被消费 + 取用口只认自己那一个）、空态屏照样画块并按得动、四表全空时落 notice；**P129 腿**：回合运行中按 tab 当场落地状态那一半（写闸门真开、请求被消费、历史零改动）且 step 边界补推快照 |
 | `skills-web-search` | 目录型技能注入 + `skill` 工具；Anthropic 形状 `web_search` 鉴权与去重 |
 | `compact-prune` | 20000 字符输出 → 剪枝标记、完整中段消失 |
 | `compact-auto` | 窗口 200 触发：摘要请求 → `automatically generated checkpoint` |
@@ -10755,7 +10757,8 @@ docs-only 提交」，goal 一直续跑却一直没有实质产出 —— 人看
 
 **键层与状态层的分工**：`tab` 在键层只做两件事 —— 把 chip **乐观地**翻到下一个模式
 （`tui_mode_cycle()`，按键即反馈）并置 `TUI_REQ_MODE`；真正的状态迁移由空闲主循环
-`agent_mode_apply(cfg, &h, tui_mode())` 做。轮转顺序**只在一处定义**（`tui_mode_next`），
+`agent_mode_apply(cfg, &h, tui_mode())` 做（回合运行中由泵点只落地状态那一半，见 §19.42）。
+轮转顺序**只在一处定义**（`tui_mode_next`），
 键层与主循环都不写 if。原来的 `TUI_REQ_PLAN_ON`/`PLAN_OFF` 换成单个 `TUI_REQ_MODE`
 （值 1；2 号**留空不复用** —— 外部若还留着 2，宁可它什么都不做，也不要突然被解释成别的动作）。
 
@@ -10782,3 +10785,46 @@ docs-only 提交」，goal 一直续跑却一直没有实质产出 —— 人看
 **没顺手做的**：① 没给 `chat` 加自己的审阅出口（那样它就只是 plan 的别名）；
 ② 没让 `chat` 拦 `bash`（同上，靠 `--permission read-only` 叠加）；
 ③ 没把模式落进会话日志的**恢复**路径（模式仍是进程级状态，恢复会话后回 build —— 与 P26 一致）。
+
+### 19.42 P129：回合运行中按 tab 不生效 —— chip 写着 Build，写闸门还是 chat
+
+**需求**（人报的）：chat 模式里跑着一个回合，按 tab 切到 build —— 模型下一句还在说
+「请切到 build 模式」。
+
+**现场**：P126 把 tab 拆成了两半：键层 `tui_mode_cycle()` 把 chip **乐观**翻到下一个模式
+（按键即反馈），`TUI_REQ_MODE` 留给空闲主循环 `agent_mode_apply` 收。问题在**回合期间
+主循环整段不跑**（泵点那条线 P30 的同一个前提）：请求只能一直挂着，于是
+
+* chip（显示层）已经是 **Build**，权威状态 `g_plan.mode` / `g_mode` 还是 **chat**
+  ⇒ 写闸门 `mode_blocks_write()` 照旧硬拒，拒绝串还写着「tell the user to switch to
+  build mode (tab)」—— 用户**刚刚就按了**，屏幕上正写着 Build；
+* 用户再按一次 tab 更糟：chip 跳到 **Plan**，权威状态照样停在 chat，下一次拒绝又换成
+  plan 的串（那时连「该按什么键」都对不上）。
+
+**修法**：泵点（`agent_pump_block`，回合期间唯一稳定每圈都会过的收口）多消费一个请求，
+但**只做状态那一半**：
+
+| 那一半 | 谁做 | 为什么 |
+|---|---|---|
+| 状态（`g_plan.mode` + 写闸门 + chip） | 泵点 `agent_mode_force(tui_mode())`，**当场** | 它只写进程级全局，零 IO、不碰历史 —— 与 ctrl+t（P22）、拖选复制（P85）同一条分工 |
+| 模型可见面（运行时上下文快照 + `plan/mode` 日志） | step 边界的 `agent_plan_snapshot_sync`（已在，按 `g_plan_snap` 比对补推） | 泵点跑在工具/流式中间，那时历史里可能正有一条 `assistant(tool_calls)` 等着结果 —— 中间插一条 user 就是非法序列 |
+
+于是「按完 tab 立刻生效」这条口径回到 `mode_set` 的语义（**立即**改 mode，本仓只在
+step 边界检查状态），而消息序列仍然只在一个稳定点被改。**回合里一次都没到 step 边界
+也不丢**：下一回合的第一步同样是那个补推点（`step == 1` 也过），模型在发请求前一定
+看得到新模式。取用口是新的 `tui_take_mode_request()`（只认 `TUI_REQ_MODE`）—— 不能拿
+`tui_take_request()` 顶替，那会把还挂着的 shift+tab / ctrl+v 一并吃掉。
+
+**验收**：
+
+| 判据 | 落点 |
+|---|---|
+| 运行中按 tab：请求被消费、写闸门真打开、chip 与权威状态一致 | `selftest[tui-tasks]`（`tuis_tasks_pump_mode_case`，调用点是真入口 `agent_pump_block`） |
+| 泵点**不碰**回合正在用的历史（快照留到 step 边界） | 同上：`h.len` 在泵点前后必须相等 |
+| step 边界把新模式补推给模型（快照里没有 chat 那句） | 同上：直接调 `agent_plan_snapshot_sync` 后 `h.len + 1` 且正文判据 |
+| 后向兼容：ctrl+t 那次「泵点不吞 tab」的旧断言已按新口径改写 | `selftest[tui-tasks]` E 段 |
+
+**没顺手做的**：① 没让泵点也补推快照（那正是非法序列的来源，见上表的第二行）；
+② 没给 shift+tab（访问模式选择器）开同一条路 —— 它要往历史里压快照并开浮层，回合
+运行中开浮层还会和输入行抢键，留到有需求时另做。
+
