@@ -243,8 +243,9 @@ readelf -lW build/uya-agent | grep -c INTERP    # 0 = 真静态
 | `--api-retry-max N` | **传输层重试上限**：连接失败 / IO / 超时 / SSE 早断 / HTTP 408·425·429·5xx 会退避 **0.5–3 s 随机**后重发同一请求。**不给 = 不限次数**（直到成功或你 esc/ctrl+c）；`0` = 一次都不重试（逐字节回到旧行为，CI/排障用）；`N>0` = 最多发 N 次。`UYA_AGENT_API_RETRY_MAX` 同口径 |
 | `--turn-retry-max N` | **回合级自动继续的预算**：一回合没跑完（协议错 / 传输错 / 有正文的截断 / 空响应）就自动替人打一句「继续」重开。`0` = 一次都不续（逐字节回到 P94 之前）；`N>0` = 最多 N 次；**不给 = 交互式会话里不限次数**（直到成功或你 esc/ctrl+c）。管道 / CI / 子代理默认不续。`UYA_AGENT_TURN_RETRY_MAX` 同口径 |
 | `--bg-notify` / `--no-bg-notify` | **后台任务/子代理跑完就通知模型**（默认交互式前台开）。通知在下一个 step 边界投递成一条 user 消息；回合结束之后才完成的，就在空闲时自动再开一回合。关掉它，模型只能自己 `job_output(wait=true)` / `sleep` 轮询。`UYA_AGENT_BG_NOTIFY=0` 同效 |
-| `--plan` | 以 plan 模式启动（先出计划、批准后再执行）；plan 模式**真的拦写**，非交互会话（管道/CI）里没有审阅渠道 ⇒ 只产出计划、写工具始终被拒 |
+| `--plan` | 以 plan 模式启动（先出计划、批准后再执行）；**这是默认起点**；plan 模式**真的拦写**，非交互会话（管道/CI）里没有审阅渠道 ⇒ 只产出计划、写工具始终被拒 |
 | `--chat` | 以 **chat（问答）模式**启动：只答问题、不动文件（写工具硬拒），没有审阅出口 —— 想动手就 `tab` 或 `/chat` 切回 build。与 `--plan` 同给时 plan 优先 |
+| `--build` | 以 **build 模式**启动：**跳过默认的 plan**，直接能写文件（`--plan` / `--chat` 同给时让位） |
 | `--permission MODE` | **访问模式**：`read-only` / `workspace-write` / `danger-full-access`（默认）。也收 `--permission=<MODE>`；非法值**报错退出**。来源优先级 CLI > `UYA_AGENT_PERMISSION` > DSH `permission.defaultPreset` |
 | `--no-sandbox` | 关掉 bash 的内核沙箱（bwrap）：confined 模式不再套壳、也不再 fail closed（启动打一行警告） |
 | `--bwrap PATH` | 指定 bwrap 可执行文件（默认探测 `/usr/bin/bwrap`、`/bin/bwrap`、`/usr/local/bin/bwrap`） |
