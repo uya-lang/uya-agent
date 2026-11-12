@@ -184,7 +184,7 @@ export UYA_ROOT
 export UYA_SPLIT_C_DIR := $(CURDIR)/build/uyacache
 
 # 行宽豁免：一条 .PHONY 就是一张全仓目标清单，拆行反而看不清哪条丢了
-.PHONY: all check wire-schema wire-probe wire-probe-real dsh-web-check dsh-settings-check print-src print-cflags build link-audit selftest codegen-audit doc-audit lint-size lint-size-all doc-cover macos macos-arm64 macos-check ui-audit probe e2e e2e-config e2e-exec e2e-accept-nudge e2e-retry e2e-version e2e-config-flags e2e-title e2e-title-cmd e2e-title-auto e2e-mouse e2e-api e2e-steps e2e-permission e2e-sandbox e2e-tasks e2e-tasks-resume e2e-goal e2e-memory e2e-memory-live e2e-sessions e2e-resume-big e2e-diff e2e-ws e2e-model e2e-model-save e2e-model-route e2e-provider e2e-ctxwindow e2e-inputimage e2e-worktree e2e-watch e2e-watch-pick e2e-dsh e2e-portable e2e-proxy p30-check tui-demo tui-selftest web-selftest sess-selftest diff-selftest model-selftest panel-selftest clean shell-selftest pm-selftest mcp-selftest proxy-selftest notify-selftest windows win-check
+.PHONY: all check wire-schema wire-probe wire-probe-real dsh-web-check dsh-settings-check print-src print-cflags build link-audit selftest codegen-audit doc-audit lint-size lint-size-all doc-cover macos macos-arm64 macos-check ui-audit probe e2e e2e-config e2e-exec e2e-accept-nudge e2e-retry e2e-version e2e-config-flags e2e-title e2e-title-cmd e2e-title-auto e2e-mouse e2e-api e2e-steps e2e-maxtokens e2e-permission e2e-sandbox e2e-tasks e2e-tasks-resume e2e-goal e2e-memory e2e-memory-live e2e-sessions e2e-resume-big e2e-diff e2e-ws e2e-model e2e-model-save e2e-model-route e2e-provider e2e-ctxwindow e2e-inputimage e2e-worktree e2e-watch e2e-watch-pick e2e-dsh e2e-portable e2e-proxy p30-check tui-demo tui-selftest web-selftest sess-selftest diff-selftest model-selftest panel-selftest clean shell-selftest pm-selftest mcp-selftest proxy-selftest notify-selftest windows win-check
 
 all: build
 
@@ -521,7 +521,7 @@ lint-size-all:
 #   本仓实测：90 文件树上净增 50 个函数 + `rm -rf build && make build` → 通过（静态链接审计通过）。
 #   因此「净增函数按 0 处理」那条纪律作废。这段留下的用处只有一个：**换/降编译器时认得出症状**
 #   （报错点落在标准库、`make check` 全绿、只有清缓存重编才炸）。
-selftest: build codegen-audit doc-audit doc-cover ui-audit e2e-version e2e-exec e2e-accept-nudge e2e-retry e2e-config-flags e2e-title e2e-title-cmd e2e-title-auto e2e-mouse e2e-api e2e-steps e2e-permission e2e-sandbox e2e-tasks e2e-tasks-resume e2e-goal e2e-memory e2e-memory-live e2e-sessions e2e-resume-big e2e-diff e2e-ws e2e-model e2e-model-save e2e-model-route e2e-provider e2e-ctxwindow e2e-inputimage e2e-worktree e2e-portable e2e-dns e2e-proxy p30-check
+selftest: build codegen-audit doc-audit doc-cover ui-audit e2e-version e2e-exec e2e-accept-nudge e2e-retry e2e-config-flags e2e-title e2e-title-cmd e2e-title-auto e2e-mouse e2e-api e2e-steps e2e-maxtokens e2e-permission e2e-sandbox e2e-tasks e2e-tasks-resume e2e-goal e2e-memory e2e-memory-live e2e-sessions e2e-resume-big e2e-diff e2e-ws e2e-model e2e-model-save e2e-model-route e2e-provider e2e-ctxwindow e2e-inputimage e2e-worktree e2e-portable e2e-dns e2e-proxy p30-check
 	UYA_BIN=$(UYA) $(OUT) --selftest
 
 # **快速档**：给 CI 与「只想确认没把地基踩塌」的人用。它不是全量的一个子集那么简单 ——
@@ -2240,6 +2240,32 @@ e2e-steps: build
 	echo "$$out" | grep -q "max_steps = unlimited (0)" \
 		|| { echo "FAIL: 非法 --max-steps 应回落到默认（不限）"; exit 1; }; \
 	echo "e2e-steps: 通过（默认不限步数；--max-steps / UYA_AGENT_MAX_STEPS 同口径）"
+
+# 输出上限的 env 档（离线，--print-config 不联网）。P133 现场：端点对 max_tokens
+# 是**硬拒绝**而不是截断 —— freeshare 的 claude-fable-5-1 只给 128000，而本仓默认发
+# DEFAULT_MAX_OUTPUT_TOKENS（256000，P61）⇒ 每一回合第一发都是
+# `HTTP 400 max_tokens: 256000 > 128000`。conf 能写的只有 env（`. ~/xxx.conf`），
+# 所以这一档要常驻守着：默认值 / env 生效 / 带单位 / CLI 压过 env / 非法值告警。
+e2e-maxtokens: build
+	@set -e; \
+	out=$$($(OUT) --print-config 2>&1); \
+	echo "$$out" | grep -q "max_tokens = 256000  (source: default" \
+		|| { echo "FAIL: 默认输出上限不是 256000"; exit 1; }; \
+	out=$$(UYA_AGENT_MAX_TOKENS=128000 $(OUT) --print-config 2>&1); \
+	echo "$$out" | grep -q "max_tokens = 128000  (source: env" \
+		|| { echo "FAIL: UYA_AGENT_MAX_TOKENS 没有生效"; exit 1; }; \
+	out=$$(UYA_AGENT_MAX_TOKENS=128K $(OUT) --print-config 2>&1); \
+	echo "$$out" | grep -q "max_tokens = 128000  (source: env" \
+		|| { echo "FAIL: UYA_AGENT_MAX_TOKENS=128K 应当是 128000"; exit 1; }; \
+	out=$$(UYA_AGENT_MAX_TOKENS=128000 $(OUT) --max-tokens 64000 --print-config 2>&1); \
+	echo "$$out" | grep -q "max_tokens = 64000  (source: cli" \
+		|| { echo "FAIL: --max-tokens 应压过 env"; exit 1; }; \
+	out=$$(UYA_AGENT_MAX_TOKENS=128KB $(OUT) --print-config 2>&1); \
+	echo "$$out" | grep -q "warning: UYA_AGENT_MAX_TOKENS 不是正整数" \
+		|| { echo "FAIL: 非法 env 值没有告警"; exit 1; }; \
+	echo "$$out" | grep -q "max_tokens = 256000  (source: default" \
+		|| { echo "FAIL: 非法 env 值应回落到默认"; exit 1; }; \
+	echo "e2e-maxtokens: 通过（默认 256000；env / K 单位 / cli 优先级 / 非法值告警）"
 
 # DSH 自己的会话列表（读 ~/.dsh/sessions，含 zstd）
 e2e-dsh: build
