@@ -1114,6 +1114,44 @@ conf」只能靠人每次在命令行补参。判据在 `make e2e-maxtokens`（�
 它能让 conf 一个字节不改就跑起来，但要在 400 的收口路上多一条「改配置后重发」的分支，
 留作后续；眼下 env 这一档已经把那个现场解掉。
 
+#### 5.4.5 估算要按**实测**比例走（P134）
+
+§5.4.3 那条「偏保守」的 2.5 B/token，在高压力 + 大窗口时是**致命的**保守。真机现场
+（superc/c6c，窗口 1M，注入的 `<goal_round>` 里写着 `Context: ~786K tokens used of 1M
+(79%)`）：
+
+    user(<goal_round> Round: n) → assistant(正文 0 字节，reasoning 44 字节)
+    → turn/end reason=max-tokens
+
+连着 5 轮同一个形状（32…36），中间的 `[goal] 自动续跑一轮` 与「[max-tokens] 这一步没有
+正文可留（输出预算全花在思考上）」把人往「模型想太多」上引。**真因是这一发只给了 16
+token**：786K token 的请求体约 3.2 MB，`cmp_est_tokens` 按 2.5 B/token 估成 ~1.28M，
+已经超过 1M 的窗口 ⇒ `room` 为负 ⇒ 被压到 `RESP_MSG_MIN_TOKENS` 的下限。模型拿着 16
+token 的预算说话，半句话就截断；历史一个正文字节都没长，下一轮看到的东西**一模一样**，
+于是每一轮都这样（只有 P122 的零产出刹车能停）。
+
+而 2.5 B/token 的来历就在上面那句注释里：**同一份 30,222 字节的请求实测 4.07 B/token**
+—— 本仓自己承认它偏保守。保守的方向在这里正好反了：估得越多，留给输出的越少。
+
+**修法**（`clamp_est_input_tokens`）：端点自己数出来的 `prompt_tokens` 是唯一权威 ——
+`agent_finish_step` 拿到 usage 时把「这一发的请求体字节数 → prompt_tokens」记进校准器
+（`clamp_note_prompt`），下一发按这个实测比值估输入；拿不到 usage（提供方没回，推理模型
+截断时常见）就**沿用**上一对，从没测到过才退回 2.5 B/token。两对数成对更新，只记字节
+不记 token 会让比值退化成 0。
+
+两处配套，都是为了「别再把人指错方向」：
+
+* 被压到下限时喊一句 `[ctx] 输入估算 ~N tokens ≥ 窗口 W：这一发的输出上限只能给 16`
+  —— 一次一喊（回落到 `CLAMP_ROOM_COMFORT` 才复位），别逐 step 刷屏；
+* 截断收口那一行按**实际发出的上限**分岔：≤`CLAMP_TINY_OUTPUT`（256）时说「这一发的
+  输出上限只有 N tokens，先 /compact 再继续」，否则才说「输出预算全花在思考上」
+  （`g_clamp_sent_tokens` 由 `clamp_output_to_window` 每次记账）。
+
+判据在 `selftest[resp-build]` 的 3.9 段：同一份 3.2 MB 请求，喂进实测 786K 之前必须被
+判「窗口已满」（16），之后必须按真数钳到窗口剩的 214K（旧口径会给出 16）；`tokens=0`
+不许冲掉已有比例；`clamp_reset_measurement` 之后回到旧口径（两条口径都能各自钉死，
+改动才算可证）。
+
 ### 5.5 执行期两条纪律（P55）
 
 **来由是一次同任务 A/B 实测**：任务 = 「把 `src/` 下 50 个 `.uya` 按职责拆进子目录、全部改动

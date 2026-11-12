@@ -727,22 +727,115 @@ fn effective_max_tokens(cfg: &const Config) i64 {
 // 原样返回：那是「没人告诉我们窗口」，不许替用户猜。
 //
 // used_bytes = **已写出去的那部分请求体**（构请求时 `jw_used` 的现值），它已经
-// 含 model / 历史 / tools —— 输入侧的全貌。估算走 `cmp_est_tokens` 的 2.5 B/token
-// （偏保守：实测一份 30,222 字节的请求被端点数成 7,431 token，这里估成 12,089）。
+// 含 model / 历史 / tools —— 输入侧的全貌。估算见 `clamp_est_input_tokens`：
+// 有实测比例就按实测走，从没测到过才退回 `cmp_est_tokens` 的 2.5 B/token。
+
+// P134：**估算校准** —— 端点自己数出来的 `prompt_tokens` 才是权威。
+//
+// 现场（superc/c6c，窗口 1M，`Context: ~786K tokens used of 1M (79%)`）：
+// 连着 5 轮同一个形状 —— 正文 0 字节、reasoning 40 来字节、`turn/end max-tokens`，
+// 只有 P122 的零产出刹车能停下来。屏幕上那句「输出预算全花在思考上」把人往
+// 「模型想太多」上引，真因是**这一发只给了 16 token**：
+//   ① 786K token 的请求体约 3.2 MB；
+//   ② `cmp_est_tokens` 按 2.5 B/token 把它估成 ~1.28M > 窗口 1M；
+//   ③ `room` 为负 ⇒ 压到 16 的下限（`RESP_MSG_MIN_TOKENS`）；
+//   ④ 模型拿着 16 token 的预算说话，半句就截断 ⇒ 正文为空 ⇒ 下一轮同样的输入。
+// 而 2.5 B/token 是本仓自己承认的**偏保守**口径（同一份请求实测 4.07 B/token）：
+// 保守在这里恰好致命 —— 估得越保守，留给输出的越少。
+//
+// 口径：记住上一次「请求体字节数 → prompt_tokens」的比值，下一发按它估。
+// 拿不到 usage（提供方没回，推理模型截断时常见）就**沿用**上一对，别把好数据
+// 冲掉；从来没用过就退回 2.5 B/token（= 旧行为，自测里那条现场形状还钉着它）。
+// 两对数成对更新：只记字节不记 token 会让比值退化成「0 token/字节」。
+var g_clamp_body_bytes: usize = 0;
+var g_clamp_real_tokens: i64 = 0;
+
+// 最近一发真正发出去的输出上限（`max_tokens` / `max_output_tokens` 的值）。
+// 两个用途：① 截断收口时说实话（「这一发的上限只有 N」比「预算全花在思考上」
+// 准得多）；② 下限诊断的判据。
+export var g_clamp_sent_tokens: i64 = 0;
+
+// 下限诊断只喊一次：跨过「估算已占满窗口」这条线之后，每个 step 都会算出同一个
+// 结果，逐 step 喊会把转录刷满（真机上一屏就能被它填满）。
+var g_clamp_floor_noted: bool = false;
+
+// 「窗口还够用」的舒适区。回落到这里就把上面那面旗子复位，下次真被压扁再喊一声。
+const CLAMP_ROOM_COMFORT: i64 = 4096;
+
+// 「小到不可能是模型自己烧完的」输出上限。低于它且本回合正文为空时，真因是
+// 本函数把预算压扁了，不是模型思考太多（见上面那段现场）。
+export const CLAMP_TINY_OUTPUT: i64 = 256;
+
+// 记下**上一发**的真实用量（`agent_finish_step` 拿到 usage 时调）。
+// tokens <= 0 = 提供方没回 usage：保持上一对，不做任何事。
+export fn clamp_note_prompt(tokens: i64, body_bytes: usize) void {
+    if tokens <= 0 || body_bytes == 0 {
+        return;
+    }
+    g_clamp_body_bytes = body_bytes;
+    g_clamp_real_tokens = tokens;
+}
+
+// 忘掉实测比例（退回 2.5 B/token 的旧口径）。自测要能来回切两套口径，
+// 否则「改好了」与「本来就没坏」分不开。
+export fn clamp_reset_measurement() void {
+    g_clamp_body_bytes = 0;
+    g_clamp_real_tokens = 0;
+}
+
+// 输入侧的 token 估算：有实测比例就按它，没有就退回 `cmp_est_tokens`。
+fn clamp_est_input_tokens(used_bytes: usize) i64 {
+    if g_clamp_real_tokens > 0 && g_clamp_body_bytes > 0 && used_bytes > 0 {
+        // 左操作数先落进具名局部：`*%` 挂在强制转换/括号表达式上会退成 32 位
+        // （见 uya 的算术纪律），这里的乘积是 1e13 量级。
+        var ub: i64 = used_bytes as i64;
+        const prod: i64 = ub *% g_clamp_real_tokens;
+        var den: i64 = g_clamp_body_bytes as i64;
+        const est: i64 = prod / den;
+        if est > 0 {
+            return est;
+        }
+    }
+    return cmp_est_tokens(used_bytes);
+}
+
+// 「输入估算已经把窗口占满」这一档只能给 16 token —— 那一条请求注定一个正文字节
+// 都产不出来。以前这里一声不响，屏幕上只剩「预算全花在思考上」，人被引向模型；
+// 现在喊一次、说清楚下一步（compact 或换窗口）。
+fn clamp_note_floor(cfg: &const Config, est: i64) void {
+    if g_clamp_floor_noted || cfg.quiet {
+        return;
+    }
+    g_clamp_floor_noted = true;
+    out_err("[ctx] 输入估算 ~");
+    out_err_dec(est as usize);
+    out_err(" tokens ≥ 窗口 ");
+    out_err_dec(cfg.context_window as usize);
+    out_err("：这一发的输出上限只能给 ");
+    out_err_dec(RESP_MSG_MIN_TOKENS as usize);
+    out_err("\n[ctx] 它几乎必然只回一段思考、正文为空 —— 先 /compact，");
+    out_err("或换一个更大的窗口再继续\n");
+}
+
 fn clamp_output_to_window(cfg: &const Config, used_bytes: usize,
                           want: i64) i64 {
-    if cfg.context_window <= 0 {
-        return want;
+    var mt: i64 = want;
+    if cfg.context_window > 0 {
+        const est: i64 = clamp_est_input_tokens(used_bytes);
+        var room: i64 = cfg.context_window -% est;
+        if room < RESP_MSG_MIN_TOKENS {
+            // 再小只会被端点直接拒掉（OpenAI 那条 <16 的硬约束），不如给下限。
+            room = RESP_MSG_MIN_TOKENS;
+            clamp_note_floor(cfg, est);
+        } else if room >= CLAMP_ROOM_COMFORT {
+            g_clamp_floor_noted = false;
+        }
+        if room < mt {
+            mt = room;
+        }
     }
-    var room: i64 = cfg.context_window -% cmp_est_tokens(used_bytes);
-    if room < RESP_MSG_MIN_TOKENS {
-        // 再小只会被端点直接拒掉（OpenAI 那条 <16 的硬约束），不如给下限。
-        room = RESP_MSG_MIN_TOKENS;
-    }
-    if want < room {
-        return want;
-    }
-    return room;
+    g_clamp_sent_tokens = mt;
+    return mt;
 }
 
 // call_id 只回放 '|' 前那段（DSH 会话里可能是 "call_x|fc_y"；item id 不回放，
