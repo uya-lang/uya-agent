@@ -1086,6 +1086,34 @@ model / 历史 / tools，正好是输入侧的全貌；估算沿用压缩那条 
 判据在 `selftest[resp-build]` 的 3.8 段：窗口未知不钳 / 已知按输入扣 / 下限 16 / 显式小值
 原样 / 窗口 256000 时请求里不再出现 256000。
 
+#### 5.4.4 端点**硬拒绝**输出上限时，conf 得能钉住（P133）
+
+§5.4.2 里「实测超过上游能力也不 400」**不是普适事实** —— 有些端点直接拒绝。真机现场
+（2026-11-12，`api.freeshare.tech:8443` 的 `claude-fable-5-1`）：
+
+    HTTP 400 {"error":{"message":"max_tokens: 256000 > 128000, which is the
+    maximum allowed number of output tokens for claude-fable-5-1"}}
+
+那份 conf 写的是 `UYA_AGENT_CONTEXT_WINDOW=1M`，P117 的钳制认为「窗口装得下」⇒
+原样发 256000 ⇒ **每一回合的第一发**都是这条 400。而这条 400 既不在
+`rtx_retryable_status` 里（不重试），也不匹配 `rtx_context_overflow`（它不是超窗），
+于是回合当场以 `AGENT_PROTO` 收口 —— 屏幕上那句 `HTTP 400` 就是全部症状。
+
+**修法**：`UYA_AGENT_MAX_TOKENS`（`--max-tokens` 的 env 档，`src_max_tokens = 2`）。
+口径与 `UYA_AGENT_CONTEXT_WINDOW` 完全一致：`mx_env_positive`（纯十进制正整数，
+可带 `K`/`M`/`G`，`128K` = 128000），非法值留一行 warning 后忽略；优先级仍是
+`--max-tokens`（cli）> env > 目录 `maxTokens` > 默认 256000。可证出口是
+`--print-config` 的 `max_tokens = 128000  (source: env; sent as max_tokens)`。
+
+**为什么必须走 env**：用户配端点那一跳唯一的入口是 `. ~/xxx.conf`（一叠 `export`），
+而 P133 之前只有 `--max-tokens` 一个 CLI 旋钮 —— conf 里写不了，于是那份「没写错的
+conf」只能靠人每次在命令行补参。判据在 `make e2e-maxtokens`（默认值 / env 生效 /
+`128K` / cli 压过 env / 非法值告警）。
+
+**没做的那一半**：从这条 400 的 body 里**学到**真实上限 + 同一步重发（P88 的形状）。
+它能让 conf 一个字节不改就跑起来，但要在 400 的收口路上多一条「改配置后重发」的分支，
+留作后续；眼下 env 这一档已经把那个现场解掉。
+
 ### 5.5 执行期两条纪律（P55）
 
 **来由是一次同任务 A/B 实测**：任务 = 「把 `src/` 下 50 个 `.uya` 按职责拆进子目录、全部改动
