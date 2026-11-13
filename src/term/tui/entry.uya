@@ -400,10 +400,64 @@ fn tui_pend_ensure() void {
 //   * 其余控制字节（0x00-0x1f 除了 \n、0x7f）→ ·
 //   * TAB → 四个空格（正文层里没有 TAB，宽度算得准）
 //   * 非法 / 半截 UTF-8 → U+FFFD（EF BF BD，1 列；见下面 tui_clean_into）
+//   * 一串坏字节（或上游已经换好的 U+FFFD）**折成一个** U+FFFD + 一句计数 ——
+//     「一格一个 `�`」在一整块二进制上等于把屏幕铺满噪声（踩坑 169）
 // ============================================================
 
 // U+FFFD（替换字符）：数组字面量，避免「切片描述符 → char*」强转（踩坑 22）
 const g_tui_repl: [byte: 3] = [239, 191, 189];
+
+// 一次清洗最多画几个 U+FFFD（再多就只留一句计数，见 tui_clean_ex_into）。
+//
+// 取 8：偶发的一两个坏字节（半个汉字、串口读回的个别字节）照旧一个 `�`，看起来还是
+// 「这里有个字节坏了」；而一整块二进制 / 一整串上游替身会被压成「8 个 `�` + 一句话」，
+// 屏幕上永远不会出现**一行全是 `�`**（截图现场：512 B 的 NOTICE = 一整行 `�`，
+// 后面紧跟「诊断已截断」，人一个字节的信息都读不到 —— 踩坑 169）。
+export const TUI_BAD_MAX: usize = 8;
+
+// 游程超过这么多**字节**才值得报数字（否则半截汉字这种「2 字节」也要带一句计数，
+// 屏幕上全是噪声）。短的、偶发的坏字节只画一个 `�`，长游程 / 预算用完之后补一句
+// 「…（共 N 字节非 UTF-8）」。
+const TUI_BAD_RUN: usize = 8;
+
+// p[i] 起的**合法**多字节序列长度（2..4）；坏字节 / 半截 / 孤儿续字节 / 编码出来的
+// U+FFFD 一律返回 0（= 「这是坏单元，进折叠口径」）。
+//
+// 为什么把**合法的 U+FFFD 也算坏**：上游（session 的 jw_str、jsonx 的转义器、任何容错
+// 解码）把坏字节换成 U+FFFD 之后，屏幕上的那一串 `�` 与原样透传的坏字节长得一模一样。
+// 两种来源必须走同一条折叠口径，否则「换一层就又开始铺满屏」（这正是同一张截图上
+// 「修完还乱码」的原因之一）。
+fn tui_utf8_ok_len(p: &const byte, n: usize, i: usize) usize {
+    const c: byte = p[i];
+    if c < 0x80 as byte {
+        return 1;
+    }
+    const need: usize = tty_utf8_len(c);
+    if need < 2 || i + need > n {
+        return 0;
+    }
+    const step: usize = tty_utf8_next(p, i, n) - i;
+    if step != need || tty_utf8_decode(p, i, n) == 0xFFFD {
+        return 0;
+    }
+    return step;
+}
+
+// p[i] 这一个**坏单元**占几个字节：编码出来的 U+FFFD 是 3，坏字节是 1，合法字符 0
+// （游程到此为止）。与 tui_utf8_ok_len 互斥：同一个下标两边恰好一边为 0。
+fn tui_bad_unit_len(p: &const byte, n: usize, i: usize) usize {
+    if tui_utf8_ok_len(p, n, i) > 0 {
+        return 0;
+    }
+    const need: usize = tty_utf8_len(p[i]);
+    if need >= 2 && i + need <= n {
+        const step: usize = tty_utf8_next(p, i, n) - i;
+        if step == need {
+            return step;   // 合法编码、但解出来是 U+FFFD（EF BF BD / 代理项 / 过长编码）
+        }
+    }
+    return 1;
+}
 
 // 清洗入口（多行版）：控制字节 / ESC 序列 / TAB / 非法 UTF-8 全换成正文层安全的字节，
 // `'\n'` 原样保留。结果写进 dst（dst 先清零）。
@@ -423,6 +477,8 @@ fn tui_clean_line_into(dst: &Buf, p: &const byte, n: usize) void {
 // 行内的 '\n' 会把那一行拆成两行画出来、右边框再也对不齐）。
 fn tui_clean_ex_into(dst: &Buf, p: &const byte, n: usize, one_line: bool) void {
     var i: usize = 0;
+    var shown: usize = 0;   // 已经画出来的 U+FFFD 个数（到 TUI_BAD_MAX 就只计数）
+    var hid: usize = 0;     // 因为超出预算而**没画**的坏字节数（收尾时补一句）
     while i < n {
         const c: byte = p[i];
         if c == 27 as byte {
@@ -478,31 +534,45 @@ fn tui_clean_ex_into(dst: &Buf, p: &const byte, n: usize, one_line: bool) void {
             continue;
         }
         if c >= 0x80 as byte {
-            // 非法 / 半截 UTF-8 → U+FFFD（1 列）。不换的话终端自己渲染半个字符，
-            // 而且它的列宽和我们算的不一致（tty_char_cols 按 1 列算）→ 整行错位。
-            // 孤立续字节也要换掉：tty_utf8_decode 对它会返回字节本身而不是 U+FFFD，
-            // 所以先按 tty_utf8_len 判「合法引导字节 + 长度对不对」。
-            const need: usize = tty_utf8_len(c);
-            const step: usize = tty_utf8_next(p, i, n) - i;
-            var good: bool = need > 1 && step == need;
-            if good {
-                const cp: u32 = tty_utf8_decode(p, i, n);
-                if cp == 0xFFFD {
-                    good = step == 3 && c == 239 as byte
-                        && p[i + 1] == 191 as byte && p[i + 2] == 189 as byte;
-                }
-            }
-            if good {
+            // 合法序列（中文 / emoji / 其余合法多字节字符）原样透传。
+            const step: usize = tui_utf8_ok_len(p, n, i);
+            if step > 0 {
                 _ = buf_append(dst, p + i, step);
                 i = i + step;
-            } else {
+                continue;
+            }
+            // 坏字节 / 合法的 U+FFFD 替身：整段**游程**只画一个 U+FFFD。
+            // 不折叠的话：终端按字节各画一个 `�`，而 tty_char_cols 按 1 列算 ——
+            // 屏幕上是乱码、列的账也对不上（一整块二进制 = 一整屏 `�`，踩坑 169）。
+            var run: usize = 0;
+            while i < n {
+                const u: usize = tui_bad_unit_len(p, n, i);
+                if u == 0 {
+                    break;
+                }
+                run = run + u;
+                i = i + u;
+            }
+            if shown < TUI_BAD_MAX {
                 _ = buf_append(dst, &g_tui_repl[0], 3);
-                i = i + 1;
+                shown = shown + 1;
+                // 长游程还得报个数字：一个 `�` 说不清「丢了 512 字节还是 2 字节」
+                if run > TUI_BAD_RUN {
+                    hid = hid + run;
+                }
+            } else {
+                hid = hid + run;
             }
             continue;
         }
         _ = buf_append_byte(dst, c);
         i = i + 1;
+    }
+    // 被折掉 / 被预算挡掉的那一段：一句计数顶掉一整屏 `�`（数字是**字节**数）。
+    if hid > 0 {
+        _ = buf_append_cstr(dst, "…（共 " as &const byte);
+        _ = buf_append_u64(dst, hid as u64);
+        _ = buf_append_cstr(dst, " 字节非 UTF-8）" as &const byte);
     }
 }
 
@@ -1061,6 +1131,46 @@ fn tui_sink_line(p: &const byte, n: usize) void {
 
 // ---- 外部写入接口（agent / view / askuser 用）----
 
+// 条目接口这一侧的**清洗闸门**：外部交进来的是外来字节（工具输出、网关错误体、
+// 设备读回的二进制，以及「长度算大了」多读进来的堆尾巴），必须先在临时缓冲里过
+// tui_clean_into 再进条目表。
+//
+// 为什么以前没出事、现在必须补（踩坑 169）：条目 text 的不变量是「清洗之后的屏幕
+// 文本」，而这条不变量一直**只有 fd 2 的 sink**（tui_sink_bytes）在守 —— 走
+// `betui_add_*` 这四条路（用户 / steer / 工具块 / NOTICE）的字节是裸进去的：
+// 非法 UTF-8 直接进帧 ⇒ 终端按字节各画一个 `�`，而 tty_char_cols 按 1 列算 ⇒
+// 屏幕上是乱码、折行与列宽全对不上。清洗之后这条不变量在**所有**入口都成立。
+//
+// 分配失败时**一个字节都不画**（fail closed）：宁可这一条不出现，也不把裸字节送上屏。
+fn tui_entry_append_foreign(e: &TuiEntry, p: &const byte, n: usize) void {
+    if n == 0 {
+        return;
+    }
+    var clean: Buf = buf_new(n * 4 + 64);
+    if !buf_valid(&clean) {
+        return;
+    }
+    defer { buf_free(&clean); }
+    tui_clean_into(&clean, p, n);
+    tui_entry_append(e, clean.ptr as &const byte, clean.len);
+}
+
+// NOTICE 版本：清洗之后才走 tui_notice_append 的 512 B 上限口径。
+// 顺序很重要 —— 先清洗再限长，于是一整块二进制折成「8 个 `�` + 一句计数」之后
+// 根本顶不到上限，「诊断已截断」只留给真正长**文本**的诊断（踩坑 169）。
+fn tui_notice_append_foreign(e: &TuiEntry, p: &const byte, n: usize) void {
+    if n == 0 {
+        return;
+    }
+    var clean: Buf = buf_new(n * 4 + 64);
+    if !buf_valid(&clean) {
+        return;
+    }
+    defer { buf_free(&clean); }
+    tui_clean_into(&clean, p, n);
+    tui_notice_append(e, clean.ptr as &const byte, clean.len);
+}
+
 // 外部接口：新增一条**用户**条目（提交的输入行）。
 export fn betui_add_user(p: &const byte, n: usize) void {
     const idx: i32 = tui_entry_new(TUI_E_USER);
@@ -1068,7 +1178,7 @@ export fn betui_add_user(p: &const byte, n: usize) void {
         return;
     }
     const e: &TuiEntry = tui_entry_at(idx as usize);
-    tui_entry_append(e, p, n);
+    tui_entry_append_foreign(e, p, n);
 }
 
 // 外部接口：新增一条 **steer**（回合中插入的用户插话）条目。
@@ -1078,7 +1188,7 @@ export fn betui_add_steer(p: &const byte, n: usize) void {
         return;
     }
     const e: &TuiEntry = tui_entry_at(idx as usize);
-    tui_entry_append(e, p, n);
+    tui_entry_append_foreign(e, p, n);
 }
 
 // 外部接口：新增一条 NOTICE（诊断 / 提示）条目，走 tui_notice_append 的上限口径。
@@ -1088,7 +1198,7 @@ export fn betui_add_notice(p: &const byte, n: usize) void {
         return;
     }
     const e: &TuiEntry = tui_entry_at(idx as usize);
-    tui_notice_append(e, p, n);
+    tui_notice_append_foreign(e, p, n);
     tui_notice_newline(e);
 }
 
@@ -1101,7 +1211,7 @@ export fn betui_add_tool_block(p: &const byte, n: usize) void {
         return;
     }
     const e: &TuiEntry = tui_entry_at(idx as usize);
-    tui_entry_append(e, p, n);
+    tui_entry_append_foreign(e, p, n);
 }
 
 // sink 入口（tty.uya 的 tty_write / tty_stream_write / tty_reason_write 调它）
