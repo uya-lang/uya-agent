@@ -43,6 +43,8 @@ fn agent_pump_ctx_end(cfg: &const Config) void {
 //   4) 踩坑 114：ctrl+t 的 `TUI_REQ_TASKS` 也在这里消费（见 agent_tasks_toggle_apply）；
 //   5) P129：tab 的 `TUI_REQ_MODE` 也在这里消费 —— 但只落地**状态那一半**
 //      （模式 + 写闸门 + chip）；给模型看的那份快照仍由 step 边界补推。
+//   6) P137：ctrl+z 的 `TUI_REQ_QUEUE_UNDO` 也在这里消费（撤回最后一条待发，见
+//      agent_queue_undo）—— 待发块有意义的时候正是回合运行中。
 // 返回中止意图给调用方（bash/jobs/deleg/search/workflow 各自决定怎么收场）。
 fn agent_pump_block() i32 {
     // 索引里的 lastActiveAt 跟着**活动**走（见 agent_sess_touch_index）：泵点是回合里
@@ -91,6 +93,10 @@ fn agent_pump_block() i32 {
     // 整段不跑，而「跑着工具/流式时拖一段复制」正是最常见的用法。零历史改动、只写
     // 一次剪贴板（有硬超时），所以当场执行安全。
     agent_pump_copy_request();
+    // P137：撤回待发（ctrl+z）也在这里消费 —— 理由与上一条一字不差：回合运行中主循环
+    // 整段不跑，而「待发块里有东西」正是回合运行时的状态。它只动两份待发来源（提交槽 /
+    // steer 收件箱），历史与 cfg 一个字节都不碰，所以当场执行安全。
+    agent_pump_queue_undo_request();
     if g_pump_cfg != null as &const Config && g_pump_hist != null as &const History {
         agent_tui_poll_pending_cmd(g_pump_cfg, g_pump_hist);
         agent_pump_submitted_cmd(g_pump_cfg, g_pump_hist);
@@ -236,6 +242,65 @@ fn agent_main_copy_request() void {
         return;
     }
     _ = agent_clip_copy(&g_tui_copy_buf, tui_copy_truncated());
+}
+
+// ============================================================
+// P137：撤回最后一条待发（ctrl+z）
+// ============================================================
+
+// 泵点用的取用口：挂着「撤回最后一条待发」的请求就当场办掉（**只认 QUEUE_UNDO**，
+// 别的一律不动 —— 理由见 tui_take_queue_undo_request 的注释）。没有请求时 O(1) 早退。
+fn agent_pump_queue_undo_request() void {
+    if tui_take_queue_undo_request() {
+        agent_queue_undo();
+    }
+}
+
+// 撤回**最后一条**待发。两份来源按待发块的**显示顺序**取尾部 —— 块里先画提交槽、
+// 再画执行中快照，所以「最后画出来的那一条」= 收件箱箱尾（箱非空时），否则是提交槽
+// 的末格。用户看见的是**一块**（P105 把两份合成一块），键就只能有「撤这块里最后一条」
+// 这一个意思；让他先判断这条到底在哪个槽里，是把实现细节推给人。
+//
+// 为什么非要在 agent 侧做：收件箱是 agent 侧的全局（TUI 那一层不认识 Inbox），提交槽
+// 是 TUI 的 —— 两份都要能撤，就得在同时看得见两边的地方动手。
+// 回执只走 TUI（`tui_add_notice`）：待发队列本身就是 TUI 的东西（滚动模式没有队列），
+// 也**不**走 agent_attach_notice —— 那个是图片挂载专用的（带 "[image] " 前缀、
+// 无 TUI 时写 fd 2，一条撤回回执不该带那个前缀）。
+fn agent_queue_undo() void {
+    var out: Buf = buf_new(4096);
+    defer { buf_free(&out); }
+    var hit: bool = inbox_drop_last(&g_steer, &out);
+    if !hit {
+        hit = tui_take_submit_last(&out);
+    }
+    // 先刷快照：块上那一行要**当场**消失（泵点下一次 ≤50ms 之后才轮到 —— 那一刻之前
+    // 屏幕上会挂着一条已经不存在的待发条目，与 agent_claim_steer 同一个理由）。
+    agent_queue_sync();
+    if !hit {
+        return;
+    }
+    var m: Buf = buf_new(512);
+    defer { buf_free(&m); }
+    _ = buf_append_cstr(&m, "已撤回待发：");
+    var n: usize = out.len;
+    var k: usize = 0;
+    while k < n {
+        if out.ptr[k] == 10 as byte {
+            n = k;      // 多行提示词只报第一行
+            break;
+        }
+        k = k + 1;
+    }
+    // 一行、最多 40 个码点：回执是「让你认出撤了哪一条」，不是全文。
+    const keep: usize = bufx_utf8_prefix_bytes(out.ptr as &const byte, n, 40);
+    _ = buf_append(&m, out.ptr as &const byte, keep);
+    if keep < n {
+        _ = buf_append_cstr(&m, "…");
+    }
+    if tui_active() {
+        tui_add_notice(m.ptr as &const byte, m.len);
+        tui_mark_dirty();
+    }
 }
 
 
@@ -1114,6 +1179,10 @@ fn agent_run_tui_body(cfg: &Config, tui_fd: i32) i32 {
             // ⚠ 请求位已经被上面那句 `tui_take_request()` 取走了，所以走的是
             // **只取文本**的那一半（`tui_take_copy_request` 在这里只会拿到 false）。
             agent_main_copy_request();
+        } else if req == TUI_REQ_QUEUE_UNDO {
+            // P137：空闲时撤回最后一条待发（提交槽里那条还没被下面第 4 步取走）。
+            // 与泵点那条路共用同一份实现 —— 用户在哪个时刻按 ctrl+z 都该是同一个行为。
+            agent_queue_undo();
         }
         // 2) 浮层结果（会话选择 / 命令面板）
         if tui_overlay_take(&sel) {
