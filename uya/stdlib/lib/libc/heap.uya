@@ -62,6 +62,11 @@ struct HeapRegion {
     next: &HeapRegion,
     base: &ChunkHeader,
     size: usize,
+    // mmap 的原始基点与长度：trim（heap_trim）要**整块还给内核**时按这两个数 munmap。
+    // 以前只留 base/size（chunk 侧的数），根本没法 munmap —— 于是普通 region 一律
+    // 「mmap 一次就永久占着」，7×24 长跑下就是单调上涨的水位（见 heap_trim 那段）。
+    map_base: *void,
+    map_size: usize,
 }
 
 struct LargeRegion {
@@ -1094,6 +1099,9 @@ fn morecore(needed: usize) &ChunkHeader {
 
     region.base = hdr;
     region.size = alloc_size;
+    // 留着原始映射（trim 要按它 munmap；chunk 侧多出来的是 region 头那一段）
+    region.map_base = mapped;
+    region.map_size = map_size;
     region.next = heap_regions;
     heap_regions = region;
 
@@ -1421,4 +1429,182 @@ export extern "libc" fn realloc(ptr: &void, size: usize) &void {
     const result: &void = _realloc_impl(ptr, size);
     _heap_lock_release();
     return result;
+}
+
+// ============================================================
+// 归还内存给内核（trim）
+//
+// 为什么需要：**普通 region**（<4 KiB 的分配走 morecore）mmap 之后只挂进
+// `heap_regions` 链表，全文件没有一处把整块删掉 —— 分配过多少就永久占多少。
+// large 路径（≥4 KiB）相反，free 时按指针 munmap，会还。
+//
+// 7×24 长跑里的形状因此是：一帧里几个小 Buf（行文本、临时拼接）就能攒出上千块
+// 4 KiB region，`[heap]` 是 4 KiB、全部内存散成 1000+ 个匿名映射，RSS 只涨不落。
+// 这里用系统的 munmap 把「整块都空着」的 region 直接还给内核（与 large 路径
+// free 时的做法一致），并顺手把线程缓存回刷 —— tcache 里的 chunk 不参与合并，
+// 不回刷就永远凑不出「整块空着」这种形态。
+//
+// 调用节奏由上层定（`tui` 心跳每 5 s 一次、换会话/回合结束时各一次）：trim 要
+// 遍历 region 链表，别放进分配热路径。
+// ============================================================
+var _heap_debug_trim_calls: usize = 0;
+var _heap_debug_trim_regions: usize = 0;
+var _heap_debug_trim_bytes: usize = 0;
+
+// 清掉线程缓存里记的「上次命中 region」：它可能正好指向马上要 munmap 的地址，
+// 不清的话下一次 owns_ptr 会在**已经还掉的地址**上判 true（等于悬空判断）。
+fn heap_cache_clear(cache: &pthread_heap_cache_t) void {
+    if cache == null as &pthread_heap_cache_t {
+        return;
+    }
+    cache.last_region_start = 0usize;
+    cache.last_region_end = 0usize;
+}
+
+// region 是不是「整块空着」：只有一个 chunk、覆盖全 region、且是 free（非 tcache）。
+// 完全空的 region 在 merge_free_neighbors 之后就是这一种形态；tcache 里的 chunk
+// 字节仍算在用（size 挂着 CHUNK_FLAG_TCACHE），所以判据里排掉它。
+fn heap_region_is_empty(region: &HeapRegion) bool {
+    if is_null(region as &void) || is_null(region.base as &void) {
+        return false;
+    }
+    const hdr: &ChunkHeader = region.base;
+    if hdr.magic != CHUNK_MAGIC {
+        return false;
+    }
+    if !is_free(hdr) || is_tcache(hdr) {
+        return false;
+    }
+    return get_size(hdr) == region.size;
+}
+
+// 回收一块空 region：从 bin 摘掉它的 free chunk（否则链表里留悬空指针）、
+// munmap、再从 region 链表摘掉。成功返回释放的字节数（= region.size）。
+//
+// 顺序刻意这么排：**munmap 成功之后才动 region 链表**，而且 `next` 要提前取好 ——
+// 还掉的地址上一个字节都不许再读（`region.next` 就在那块里）。munmap 失败（正常
+// 映射上不会发生）时把 chunk 放回 bin、region 原样留着：宁可占着，也不许留下
+// 一条已经指向别处的链表。
+fn heap_region_release(prev: &HeapRegion, region: &HeapRegion) usize {
+    const size: usize = region.size;
+    const map_base: *void = region.map_base;
+    const map_size: usize = region.map_size;
+    const next: &HeapRegion = region.next;
+    const chunk: &FreeChunk = region.base as &FreeChunk;
+    remove_free(chunk);
+    const result: !i32 = sys_munmap(map_base, map_size);
+    result catch {
+        add_free(chunk);
+        return 0usize;
+    };
+    if is_null(prev as &void) {
+        heap_regions = next;
+    } else {
+        prev.next = next;
+    }
+    _heap_debug_trim_regions = _heap_debug_trim_regions + 1usize;
+    _heap_debug_trim_bytes = _heap_debug_trim_bytes + size;
+    return size;
+}
+
+/// 功能说明：把「整块都空着」的普通 region 还给内核（munmap），返回释放字节数。
+/// 参数说明：无。
+/// 返回值说明：本次释放的字节数（0 = 没有可回收的块）。
+export fn heap_trim() usize {
+    // 多线程时不回收：trim 只回刷**当前线程**的 tcache，别的线程缓存里可能还捏着这些
+    // region 里的 chunk —— munmap 之后它们就是悬空指针，下次复用等于往已归还的地址上写。
+    // 单线程（本仓的 TUI / agent 主循环）才是这条闸门的目标形态。
+    if pthread_live_thread_count_hint() > 1usize {
+        return 0usize;
+    }
+    const cache: &pthread_heap_cache_t = current_thread_heap_cache();
+    _heap_lock_acquire();
+    _heap_debug_trim_calls = _heap_debug_trim_calls + 1usize;
+    tcache_flush_all_locked(cache);
+    orphan_tcache_flush_all_locked();
+    var released: usize = 0usize;
+    var prev: &HeapRegion = null;
+    var region: &HeapRegion = heap_regions;
+    while !is_null(region as &void) {
+        const next: &HeapRegion = region.next;
+        if heap_region_is_empty(region) {
+            released = released + heap_region_release(prev, region);
+        } else {
+            prev = region;
+        }
+        region = next;
+    }
+    if released > 0usize {
+        heap_cache_clear(cache);
+    }
+    _heap_lock_release();
+    return released;
+}
+
+// ============================================================
+// 观测：普通 region / large 块分开数
+//
+// 与 RSS 一起看才分得清「泄漏」和「水位」：large 字节只涨不落 ⇒ 真有东西不还；
+// region 字节涨而 large 字节平 ⇒ 是小分配攒下的水位（trim 该出手）。
+// 都按需现算（walk 链表），不占分配热路径。
+// ============================================================
+
+/// 返回值：普通 region 的块数。
+export fn heap_region_count() usize {
+    var n: usize = 0usize;
+    var region: &HeapRegion = heap_regions;
+    while !is_null(region as &void) {
+        n = n + 1usize;
+        region = region.next;
+    }
+    return n;
+}
+
+/// 返回值：普通 region 的字节数（含 chunk 头与尾部）。
+export fn heap_region_bytes() usize {
+    var n: usize = 0usize;
+    var region: &HeapRegion = heap_regions;
+    while !is_null(region as &void) {
+        n = n + region.size;
+        region = region.next;
+    }
+    return n;
+}
+
+/// 返回值：活着的 large 块（≥4 KiB 的分配）的**用户字节**数与块数分开取，
+/// 块数用 `heap_large_count()`。
+export fn heap_large_bytes() usize {
+    var n: usize = 0usize;
+    var region: &LargeRegion = large_regions;
+    while !is_null(region as &void) {
+        n = n + region.user_size;
+        region = region.next;
+    }
+    return n;
+}
+
+/// 返回值：活着的 large 块数。
+export fn heap_large_count() usize {
+    var n: usize = 0usize;
+    var region: &LargeRegion = large_regions;
+    while !is_null(region as &void) {
+        n = n + 1usize;
+        region = region.next;
+    }
+    return n;
+}
+
+/// 返回值：累计 trim 调用次数。
+export fn heap_trim_calls() usize {
+    return _heap_debug_trim_calls;
+}
+
+/// 返回值：累计被 trim 回收的 region 块数。
+export fn heap_trim_regions() usize {
+    return _heap_debug_trim_regions;
+}
+
+/// 返回值：累计被 trim 还给内核的字节数。
+export fn heap_trim_bytes() usize {
+    return _heap_debug_trim_bytes;
 }

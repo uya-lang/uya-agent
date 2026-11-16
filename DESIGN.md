@@ -4405,6 +4405,7 @@ QTermWidget）对 `ESC[?5522$p`（DECRQM）**零应答**，OSC 52 写 `c`/`p` �
 | TUI | `TUI_LOGO_COLS` | 66 | 低于此不画块字 logo |
 | TUI | `TUI_MAX_ENTRIES` / `ENTRY_MAX` / `TEXT_MAX` | 512 / `256 KiB` / `4 MiB` | 条目环形表 / 单条 / **正文**总量 |
 | TUI | `TUI_DERIVED_MAX` | `16 MiB` | 派生缓冲（折行 + 样式 + 行表）总量，见 §11.5.1 |
+| TUI | `TUI_TRIM_MS` | 5000 | 把「整块空着」的 region 还给内核的节拍（7×24 稳态，见 §16 踩坑 170） |
 | TUI | `TUI_REASON_TAIL` | 4096 | 思考条目只留最新一段 |
 | TUI | `TUI_NOTICE_MAX` | 512 | 无它则一条 4 KiB 的网关错误体就能把整屏转录冲掉 |
 | TUI | `TUI_IN_MAX` / `TUI_IN_MAX_TEXT` | `200000` / 4096 | 输入行上限（与 `MSG_CONTENT_MAX` 同值）/ 单行输入（标题 ≤80 B，防手滑粘贴） |
@@ -7154,6 +7155,50 @@ QTermWidget）对 `ESC[?5522$p`（DECRQM）**零应答**，OSC 52 写 `c`/`p` �
       要拿真实世界过一遍：2K 屏截图是这个功能最常见的那张图，缺省值连它都收不下，说明
       这个缺省从来没被真实输入碰过（当时只有 64×48 的夹具）；③ 拒绝话术里的数字要能直接
       指导下一步（该缩到多大 / 该转成什么格式），只印一个上限像素数等于把换算推回给用户。
+
+168. **「7×24 跑着跑着内存几百 MB」：分配器把 ≥4 KiB 的分配一块一 mmap，而 <4 KiB 的
+      region 全文件没有一处卸载；`Buf` 的 cap 又只增不减**
+
+      现场（本机实测，只读看 `/proc`）：同一台机器上并存的 5 个 `uya-agent`（会话越长越
+      大）—— 39 步 13 MB、864 步 132 MB、1409 步 154 MB、1532 步 253 MB；2 分钟采样
+      没有一个回落（+100~640 KB/2 min）。253 MB 那个的形状是：`[heap]` 只有 **4 KiB**、
+      全部内存散成 **1446 个匿名 mmap**，其中有驻留的 1221 块合计 241 MB，而按驻留大小
+      分桶是「1045 块落在 64–512 KiB」—— 不是几块大缓冲，是**上千个中小缓冲同时活着**。
+
+      根因在 `libc/heap.uya`（uya 自己的分配器，不走 glibc）：① `_malloc_impl` 里
+      `aligned >= HEAP_PAGE_SIZE` 就走 `_malloc_large` = **一次分配一块 mmap**（所以
+      `[heap]` 永远是 4 KiB）；② 小于 4 KiB 的走 `morecore`，region 只挂进 `heap_regions`
+      链表 —— 全文件**没有一处**把整块摘掉，分配过多少就永久占多少；③ `bufx` 的
+      `buf_reset` / `buf_truncate` 只改 `len`，`cap` 一点都不缩。于是「一帧里几个小 Buf」
+      在长跑里累积成上千块 4 KiB region，RSS 单调上涨 —— 而 4 MiB/16 MiB 那两条转录
+      上限管的是**条目正文与派生**，跟这条线不是一回事（转录本身丢条目时四块缓冲一起
+      `buf_free`，量过：`tui_entry_live_allocs()` 清空后归 0）。
+
+      修法（用系统的内存管理接口，四件一起才叫「稳态」）：① `heap_trim()` —— 先回刷线程
+      tcache / 孤儿队列（不回刷就永远凑不出「整块空着」的形态），再把 `is_free` 且
+      `size == region.size` 的 region 从 bin 与 region 链表里摘掉、`munmap` 还给内核；
+      多线程时不回收（别的线程缓存里可能捏着这些 chunk，还了就是悬空指针）；②
+      `buf_shrink()` —— `cap > 1.25×len + 4 KiB` 时 realloc 缩到「刚好装得下」，接到
+      单条上限截断与思考截尾两处（那是「曾经很大、现在很小」的两个现场）；③ 节拍：
+      TUI 心跳 5 s 一次（`TUI_TRIM_MS`）、换会话清转录时一次、**回合结束**一次
+      （`agent_log_turn_end` 里，放在 `save` 判据之前 —— 不落盘的会话同样要还内存）；
+      ④ 可观测量：`heap_region_count()` / `heap_region_bytes()` / `heap_large_bytes()` /
+      `heap_trim_bytes()`，`UYA_AGENT_RT_STATS=1` 时随 `[rt]` 行打出来（`tiny=` 涨而
+      `large=` 平 ⇒ 是小分配的水位，trim 该出手；`large=` 只涨不落才是真有东西没还）。
+
+      判据（`selftest[tui-mem]` 新增两段，全在分配器读数上，屏幕上一个像素都看不见）：
+      ⑤a 2000 个 2 KiB 缓冲（全走 `morecore` 那条路）→ 全 free → `heap_trim()`：region
+      数必须回落到基线（修前是永久留着），且 `trim` 返回字节数 > 0；⑤b 反复「喂正文 →
+      成帧 → 换会话 → trim」40 轮，第 40 轮的 region 数不许比第 10 轮多 16 块以上 ——
+      这就是「7×24 回到同一个水位」的可执行形式。两条防假绿对照：把 `heap_trim()` 调用
+      注释掉、或删掉里面的 `tcache_flush_all_locked`，⑤a 都当场红。
+
+      教训：① **「有上限」不等于「会回落」**：转录的两条上限让人以为内存有界，但分配器
+      侧的水位（region 与 cap）不在任何上限里，长跑仍然只涨不落 —— 判据要落在「回落到
+      同一水位」上，而不是「不超过某个数」；② **分配器行为要看实现，别按 glibc 的直觉
+      推断**：这里一块一 mmap 的形状（`[heap]` 4 KiB + 1446 个匿名映射）就是「读一眼
+      `_malloc_impl`」比猜快得多的那种情况；③ 释放类改动必须**同时给判据**：`trim` 有没有
+      生效在界面上完全不可见，没有数值断言就只能靠「用户下次再报」。
 
 ---
 
