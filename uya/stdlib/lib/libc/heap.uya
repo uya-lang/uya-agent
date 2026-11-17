@@ -13,6 +13,9 @@ extern "libc" fn __atomic_compare_exchange_n(ptr: &i32, expected: &i32, desired:
 const HEAP_ATOMIC_SEQ_CST: i32 = 5;
 var _heap_lock: atomic i32 = 0;
 
+// 分配点（GCC/Clang 内建）。只给诊断用：`LargeRegion.site` 记的是它。
+extern "libc" fn __builtin_return_address(level: u32) *void;
+
 fn _heap_lock_acquire() void {
     var expected: i32 = 0;
     var contended: bool = false;
@@ -34,6 +37,8 @@ fn _heap_lock_release() void {
 const MALLOC_ALIGN: usize = 16;
 const MIN_CHUNK_SIZE: usize = 32;
 const HEAP_PAGE_SIZE: usize = 4096;
+// large 块尺寸直方图的桶数（每桶 4 KiB，见 heap_large_hist_bucket）。
+const HEAP_LARGE_HIST_BUCKETS: usize = 16;
 const CHUNK_MAGIC: u64 = 3735928559;  // 0xDEADBEEF
 const CHUNK_FLAG_FREE: usize = 1;
 const CHUNK_FLAG_TCACHE: usize = 2;
@@ -75,6 +80,21 @@ struct LargeRegion {
     map_size: usize,
     user_size: usize,
     hdr: &ChunkHeader,
+    // 分配点（`__builtin_return_address`）—— 只给诊断用：活块涨而不知道是哪一处
+    // `buf_new(N)` 时，按尺寸分桶只能指到「多少个字节」，这一列才指得到「哪一行」。
+    // 用 `addr2line -f -e build/uya-agent 0x<值>` 反查符号。
+    site: usize,
+}
+
+// 诊断开关：打开之后每次 large 分配记下「谁调的 `malloc`」（返回地址，level 2）。
+// 为什么要开关：`__builtin_return_address(N>1)` 靠栈上的帧指针链，进程**最早期**
+// 栈很浅，走两层会读到栈外的垃圾地址（实测 `--version` 那种启动路径会 SIGSEGV）。
+// 所以只在进程起来之后由 `rt_run` 打开；关着时一块都不多读。
+var _large_site_on: bool = false;
+
+/// 打开「记录大块分配点」。幂等；只在诊断（`UYA_AGENT_RT_STATS=1`）时调。
+export fn heap_large_site_enable() void {
+    _large_site_on = true;
 }
 
 var bins: [&FreeChunk: NUM_BINS] = [];
@@ -1131,6 +1151,13 @@ fn _malloc_large(requested: usize, aligned: usize) &void {
     region.map_size = total;
     region.user_size = requested;
     region.hdr = hdr;
+    region.site = 0usize;
+    if _large_site_on {
+        // level 1 = `malloc` 体内（实测校准过），level 2 才是「谁调的 malloc」。
+        // 不要再往上走：`__builtin_return_address(N>2)` 在多一层转发时会踩到没有
+        // 帧记录的栈位（实测 `calloc` 那条链上取 level 3 会 SIGSEGV）。
+        region.site = __builtin_return_address(2) as usize;
+    }
     region.next = large_regions;
     large_regions = region;
     _heap_debug_large_mmap_count = _heap_debug_large_mmap_count + 1;
@@ -1461,40 +1488,100 @@ fn heap_cache_clear(cache: &pthread_heap_cache_t) void {
     cache.last_region_end = 0usize;
 }
 
-// region 是不是「整块空着」：只有一个 chunk、覆盖全 region、且是 free（非 tcache）。
-// 完全空的 region 在 merge_free_neighbors 之后就是这一种形态；tcache 里的 chunk
-// 字节仍算在用（size 挂着 CHUNK_FLAG_TCACHE），所以判据里排掉它。
+// 一块 region 从 `base` 起按 chunk 头逐个往后走，**每个** chunk 都是 free 且不在
+// tcache 里，才算「整块空着」。
+//
+// 为什么不能要求「只有一个 chunk、覆盖全 region」（上一版就是那么写的，结果 trim
+// 一次都没释放到内存，RSS 照涨）：`morecore` 一次只按**本次需求**映射一块 region，
+// 之后 `find_chunk` 会不停地把这块 region 切给后面更小的分配用。切过的 region 除非
+// 所有邻居都 free 且一路合并回一个 chunk，否则 `get_size(base) != region.size` ——
+// 而 tcache 里的 chunk 不参与合并、中间只要夹一个在用的小分配就再也合不拢。真实长跑
+// 里的 region 全是这种「碎块」形态，于是旧判据恒假、trim 恒放 0 字节。
+// 判据改成「全空」之后，碎块 region 照样能被整个还掉（回收时按 chunk 逐个摘链即可）。
+//
+// tcache 里的 chunk 字节仍算在用（size 挂着 CHUNK_FLAG_TCACHE），所以判据里排掉它。
 fn heap_region_is_empty(region: &HeapRegion) bool {
     if is_null(region as &void) || is_null(region.base as &void) {
         return false;
     }
-    const hdr: &ChunkHeader = region.base;
-    if hdr.magic != CHUNK_MAGIC {
-        return false;
+    const end: usize = region_end_addr(region);
+    var hdr: &ChunkHeader = region.base;
+    var walked: usize = 0usize;
+    while (hdr as usize) < end {
+        if hdr.magic != CHUNK_MAGIC {
+            return false;
+        }
+        const size: usize = get_size(hdr);
+        // 尺寸不前进就是坏链：宁可整块留着，也不许在它上面 munmap（那会连活着的
+        // 分配一起还掉，属于最坏的一种错）。
+        if size < chunk_overhead() {
+            return false;
+        }
+        if !is_free(hdr) || is_tcache(hdr) {
+            return false;
+        }
+        const next_addr: usize = (hdr as usize) + size;
+        if next_addr > end {
+            return false;
+        }
+        walked = walked + size;
+        hdr = next_addr as &ChunkHeader;
     }
-    if !is_free(hdr) || is_tcache(hdr) {
-        return false;
-    }
-    return get_size(hdr) == region.size;
+    return walked == region.size;
 }
 
-// 回收一块空 region：从 bin 摘掉它的 free chunk（否则链表里留悬空指针）、
-// munmap、再从 region 链表摘掉。成功返回释放的字节数（= region.size）。
+// 把一块「整块空着」的 region 里**所有** free chunk 从各自 bin 摘掉，末了把整块
+// munmap 还给内核、再从 region 链表摘除。成功返回释放的字节数（= region.size）。
+//
+// 为什么是逐个摘、不是摘一个：region 会被 `find_chunk` 切成碎块（见
+// `heap_region_is_empty` 上面那段），碎块 region 的每个 free chunk 都还挂在某个
+// bin 里。漏摘任何一个，bin 里就留一条悬空指针，下一次分配复用它就是往已经还掉的
+// 地址上写 —— 崩溃的位置和原因会隔得很远。
 //
 // 顺序刻意这么排：**munmap 成功之后才动 region 链表**，而且 `next` 要提前取好 ——
 // 还掉的地址上一个字节都不许再读（`region.next` 就在那块里）。munmap 失败（正常
-// 映射上不会发生）时把 chunk 放回 bin、region 原样留着：宁可占着，也不许留下
-// 一条已经指向别处的链表。
+// 映射上不会发生）时把刚才摘掉的 chunk 全都放回 bin、region 原样留着：宁可占着，
+// 也不许留下一条已经指向别处的链表。逐块回灌用的是「整块重新压回 bin 头」而不是
+// 还原原来的链位置 —— 顺序变了不影响正确性，bin 本来就是无序的。
 fn heap_region_release(prev: &HeapRegion, region: &HeapRegion) usize {
     const size: usize = region.size;
     const map_base: *void = region.map_base;
     const map_size: usize = region.map_size;
     const next: &HeapRegion = region.next;
-    const chunk: &FreeChunk = region.base as &FreeChunk;
-    remove_free(chunk);
+    const end: usize = region_end_addr(region);
+
+    // 第一遍：摘链，同时数出摘了多少块（munmap 失败时要按同样的条数回灌）。
+    var pulled: usize = 0usize;
+    var hdr: &ChunkHeader = region.base;
+    while (hdr as usize) < end {
+        if hdr.magic == CHUNK_MAGIC && is_free(hdr) && !is_tcache(hdr) {
+            remove_free(hdr as &FreeChunk);
+            pulled = pulled + 1usize;
+        }
+        const chunk_size: usize = get_size(hdr);
+        if chunk_size < chunk_overhead() {
+            break;
+        }
+        hdr = (((hdr as usize) + chunk_size) as &ChunkHeader);
+    }
+
     const result: !i32 = sys_munmap(map_base, map_size);
     result catch {
-        add_free(chunk);
+        // 回灌：把这一块 region 里现存的 free chunk 重新挂回 bin（地址还没还掉，
+        // 现在读它们是安全的）。
+        var i: usize = 0usize;
+        var again: &ChunkHeader = region.base;
+        while i < pulled && (again as usize) < end {
+            if again.magic == CHUNK_MAGIC && is_free(again) && !is_tcache(again) {
+                add_free(again as &FreeChunk);
+                i = i + 1usize;
+            }
+            const again_size: usize = get_size(again);
+            if again_size < chunk_overhead() {
+                break;
+            }
+            again = (((again as usize) + again_size) as &ChunkHeader);
+        }
         return 0usize;
     };
     if is_null(prev as &void) {
@@ -1534,9 +1621,11 @@ export fn heap_trim() usize {
         }
         region = next;
     }
-    if released > 0usize {
-        heap_cache_clear(cache);
-    }
+    // 无条件清：`cache.last_region_start/end` 是「上次命中 region」的快路径缓存，
+    // 只要 munmap 过就可能指向已还的地址。挂在 `released > 0` 下面等于让第一刀
+    // 决定后面每一刀 —— 而上一版 trim 恒放 0 字节，这个缓存就从来没被清过。
+    // 清一次只是两个 usize 归零，比一次悬空判断便宜得多。
+    heap_cache_clear(cache);
     _heap_lock_release();
     return released;
 }
@@ -1592,6 +1681,62 @@ export fn heap_large_count() usize {
         region = region.next;
     }
     return n;
+}
+
+/// 返回值：活着的 large 块中，尺寸落在第 `i` 桶的块数（桶 = user_size / 4 KiB，
+/// 最后一桶是「≥ 60 KiB」）。
+///
+/// 为什么要按尺寸分桶：`heap_large_bytes()` 只给总字节，分不清「一块 700 KiB 的大缓冲」
+/// 与「几百块 4 KiB 的小缓冲」—— 而长跑泄漏恰恰常是后者（每帧/每回合固定几块不还）。
+/// 分桶之后「哪个尺寸只涨不落」是直接读出来的，不用猜是哪一处的 `buf_new`。
+export fn heap_large_hist_bucket(i: usize) usize {
+    if i >= HEAP_LARGE_HIST_BUCKETS {
+        return 0usize;
+    }
+    var n: usize = 0usize;
+    var region: &LargeRegion = large_regions;
+    while !is_null(region as &void) {
+        var b: usize = region.user_size / HEAP_PAGE_SIZE;
+        if b >= HEAP_LARGE_HIST_BUCKETS {
+            b = HEAP_LARGE_HIST_BUCKETS - 1usize;
+        }
+        if b == i {
+            n = n + 1usize;
+        }
+        region = region.next;
+    }
+    return n;
+}
+
+/// 返回值：第 `i` 个活着的 large 块的**用户字节数**（越界返回 0）。
+/// 只给诊断用：分桶看趋势，逐个尺寸看「到底是多少字节」，两样合起来才指得到
+/// 具体是哪一处 `buf_new(N)`。
+export fn heap_large_size_at(i: usize) usize {
+    var k: usize = 0usize;
+    var region: &LargeRegion = large_regions;
+    while !is_null(region as &void) {
+        if k == i {
+            return region.user_size;
+        }
+        k = k + 1usize;
+        region = region.next;
+    }
+    return 0usize;
+}
+
+/// 返回值：第 `i` 个活着的 large 块的**分配点**（返回地址；越界返回 0）。
+/// 与 `heap_large_size_at` 配套：尺寸只说「多大」，这个说「谁分配的」。
+export fn heap_large_site_at(i: usize) usize {
+    var k: usize = 0usize;
+    var region: &LargeRegion = large_regions;
+    while !is_null(region as &void) {
+        if k == i {
+            return region.site;
+        }
+        k = k + 1usize;
+        region = region.next;
+    }
+    return 0usize;
 }
 
 /// 返回值：累计 trim 调用次数。
