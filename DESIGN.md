@@ -2026,6 +2026,15 @@ resume 同口径（接受 blocked 的 goal 并清除先前的 blocker reason）�
 Round 上限耗尽时**拒绝** resume（要人先改 `maxGoalRounds`），本仓没有另一条改上限的路
 （`/goal edit` 只换正文），所以改成「人明确要求继续就再给一段」。
 
+**P138：续跑多少轮由模型评估，不由代码写死**：`update_goal action=resume` 另收可选的
+`max_goal_rounds` —— 新的**总**轮次上限，必须大于当前 round 且 ≤ 1000；模型先
+`get_goal`，按目标剩余工作评估还要几轮再用它定下续跑长度，没给才沿用默认的
+`round + 256`。驱动器在预算用尽时写下的 `blocked + blocker=round-limit` 是
+**预算终态**而不是人说的停：`goal_rearm_on_human` 在人的下一条输入会把它接回
+active（清 blocker、翻盘上/本地授权），但只补 **1 轮**给模型做评估；那一轮的
+`<goal_round>` 明确要求它设 `max_goal_rounds`，否则这轮之后目标又会停下。
+`paused` / 带真实 reason 的 `blocked` / `complete` 仍是明确的停止，一个字节不动。
+
 **`armed` 的显示口径（P116）**：`get_goal` / `/goal` / goal 动作浮层报的是**生效值** ——
 盘上 `Goal.armed` **且** 进程本地 `g_goal_armed`。只看盘上那位的话，`--resume` 之后会写着
 `armed` 而驱动器一眼都不看它（`g_goal_armed` 已被会话复位清掉）：模型据此以为续跑开着、
@@ -10860,8 +10869,9 @@ docs-only 提交」，goal 一直续跑却一直没有实质产出 —— 人看
 | 没有目标 / paused / blocked / 非交互 → 不翻；active+disarmed → 翻（本地+盘上+revision）；已经开着 → 不重复翻；翻开后驱动器开得动 | `selftest[goal-cmd]` 的 K12 |
 | 端到端：盘上 active+disarmed 的目标 + 人一句输入 → 回执 + 答完真的开续跑轮 + 跑满即 blocked | `selftest[tui-turn]` 的 P121 腿（mock mode 53） |
 
-**没顺手做的**：① 没让人的输入把 `paused` / `blocked` 也拉起来 —— 那是明确的停止，
-要 `/goal resume`（或模型 resume）。② 没改 `--resume` 启动时 disarmed 那条不变量
+**没顺手做的**：① 没让人的输入把 `paused` / 带真实 reason 的 `blocked` 也拉起来 ——
+那是明确的停止，要 `/goal resume`（或模型 resume）；P138 只接上**驱动器**自己写的
+round-limit 预算终态（见 §19.44）。② 没改 `--resume` 启动时 disarmed 那条不变量
 （P58 还在；人一说话它就自动接上）。③ 没判「这句话跟目标有关吗」：判断不了，而人主动
 说话本身已经是明确授权。④ 没把 `/continue` 也算成人的输入：它是「带着现有历史再跑
 一轮」而不是一句话，目标要接着跑仍走 `/goal resume`（或让模型 resume）。
@@ -11059,3 +11069,43 @@ step 边界检查状态），而消息序列仍然只在一个稳定点被改。
 **没顺手做的**：① 没把清单正文注进去（理由见上表）；② 没做 DSH 的
 `dsh-repeat-tool-reminder`（那是另一条腿：重复的工具调用，与清单状态无关）；
 ③ 没给 `/tasks` 面板加任何东西 —— 它本来就推的是同一份 `g_todos`。
+
+### 19.44 P138：round 用尽后人说继续，却停在提示符上
+
+**症状**（用户报的，现场 `session-91cae8cc-9952-47ac-92ee-18ed780830e3`）：
+`goal.json` 是 `phase=blocked`、`blocker=round-limit`、`round=40/40`、`armed=false`。
+人连着敲「继续」「为什么停了」「为什么agent不跑了？」—— 每一句都答了，目标却
+再没开过轮，而且这不是人按了 `pause`。
+
+**根因**：驱动器在 `round >= maxRounds` 时把目标标成 `blocked + round-limit`（P58
+的终态口径），而 P121 的 `goal_rearm_on_human` 只认 `active`，把 `blocked` 一律
+当成「明确的不要跑了」。可这个 blocked 是**驱动器自己写的**，原因只是「这一段
+预算用完了」，不是人/模型说的停。模型侧也没调用 `update_goal action=resume`
+（P116 §19.36 第 2 条根因：它没有理由去查目标状态）。
+
+**修法**：
+
+* `agent/goal.uya`：`goal_rearm_on_human` 认 `blocked + blocker=round-limit`，按
+  resume 同口径收口 —— 清 blocker、phase 回 active、盘上/本地授权都翻开；预算
+  **只补 1 轮**（`goal_resume_bookkeeping(&g, 1)`），留给模型评估剩余工作。
+  `paused` / 真实 reason 的 blocked / complete 仍一个字节不动；非交互与子代理
+  两道闸门不变。
+* `agent/goal.uya`：`update_goal action=resume` 收可选的 `max_goal_rounds`（新的
+  总上限，> 当前 round、≤ 1000），模型按剩余工作评估后设定；resume 的三件记账
+  抽成 `goal_resume_bookkeeping`，工具面/命令面/人的输入共用，不再分叉。
+* `goal_round_admit`：预算只剩这一轮时追加一句，要求模型评估剩余工作并用
+  `update_goal action=resume max_goal_rounds=<新总上限>` 定下续跑长度。
+* `agent/prompt.uya` 的 `SEC_GOAL` 与 `agent/ag_tools_schema.uya` 的
+  `TOOL_UPDATE_GOAL` 同步写明这条契约（模型决策时不会先翻文档，见 P63）。
+
+**验收**：
+
+| 判据 | 落点 |
+|---|---|
+| round-limit 随人的输入接上：phase 回 active / 清 blocker / 双翻授权 / 只补 1 轮 / 驱动器开得动 | `selftest[goal-cmd]` K12 |
+| 带真实 reason 的 blocked 仍不许被人的输入翻开 | `selftest[goal-cmd]` K12 |
+| `max_goal_rounds=300` 覆盖默认预算；`<= round` 与 `> 1000` 报错 | `selftest[goal-cmd]` K11b |
+
+**没顺手做的**：① 没让人的输入拉起 `paused` / 真实 blocked（明确停止，DSH 同
+口径）；② 没替模型估算剩余轮数（判断不了，「按目标评估」正是用户要的）；
+③ 没动 P122 的空转刹车（它只收授权、不改 phase，与这里同属「人再开口即续」）。
