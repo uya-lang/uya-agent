@@ -235,6 +235,27 @@ fn goal_set_lit(dst: &Buf, lit: &const byte, n: usize) void {
     goal_set_n(dst, lit, n);
 }
 
+// P138：resume 的三件记账 —— ① phase 回 active；② 清掉上一次的 blocker；
+// ③ 轮次预算真的用尽时补 `extra` 轮。工具面/命令面给默认 256；人的新输入
+// 接上 round-limit 时只给 1 轮评测预算 —— 后面还要多少轮由模型按目标剩余
+// 工作量评估，再用 `update_goal max_goal_rounds` 设定，不由代码写死。
+// 不碰 armed / revision / 落盘：各有各的授权口径与回执，由调用方做。
+fn goal_resume_bookkeeping(g: &Goal, extra: i32) void {
+    goal_set_lit(&g.phase, "active" as &const byte, 6);
+    buf_reset(&g.blocker);
+    if g.max_rounds > 0 && g.round >= g.max_rounds {
+        g.max_rounds = g.round +% extra;
+    }
+}
+
+// blocker 是不是**驱动器**在预算用尽时写下的那个合成值。只有它算
+// 「预算终态」，能随人的新输入自动续上；别的 reason 是人/模型明确写下的
+// 停止条件，一个字节都不许动。
+fn goal_blocker_is_round_limit(g: &const Goal) bool {
+    return bufx_eq_cstr(g.blocker.ptr as &const byte, g.blocker.len,
+        "round-limit" as &const byte);
+}
+
 // 从 JSON 字符串视图赋值：**先反转义**。
 //
 // 为什么必须反转义（这是一处修过的真缺陷）：`goal_save` 用 `jw_str_into` 写盘，
@@ -486,6 +507,14 @@ export fn goal_tool_update(cfg: &const Config, args: &const JsonValue, out: &Buf
         _ = buf_append_cstr(out, "Error: action must be one of edit|pause|resume|complete|blocked");
         return;
     }
+    // P138：`max_goal_rounds`（只在 resume 有意义）= 模型按剩余工作评估出来的
+    // **新的总轮次上限**。没给就沿用默认补一段；给了必须 > 当前 round 且
+    // 不超过 GOAL_MAX_ROUNDS_CAP，否则模型一个手滑就把目标永久卡死。
+    var new_max: i64 = -1;
+    var mv: JsonValue = JsonValue.json_null();
+    if js_obj_get(args, "max_goal_rounds", 15, &mv) {
+        _ = js_i64_of(&mv, &new_max);
+    }
     var g: Goal = goal_empty();
     defer { goal_free(&g); }
     if !goal_load(cfg, &g) {
@@ -520,17 +549,21 @@ export fn goal_tool_update(cfg: &const Config, args: &const JsonValue, out: &Buf
         goal_set_lit(&g.phase, "paused" as &const byte, 6);
         g.armed = false;
     } else if bufx_eq_cstr(action.ptr as &const byte, action.len, "resume") {
-        // P116：resume 是「人明确要求继续」，两件事一起做 ——
-        //   ① 清掉上一次的 blocker：它是上一次停下的原因，接着跑之后留在 get_goal /
-        //      面板上只会误导（真机上「phase=active + 旧 blocker」同时存在过）；
-        //   ② 轮次预算真的用尽（round-limit）时补一段：不补的话下一次 admit 立刻又把它
-        //      标回 blocked，人看到的「已恢复」等于没恢复。
-        goal_set_lit(&g.phase, "active" as &const byte, 6);
-        g.armed = true;
-        buf_reset(&g.blocker);
-        if g.max_rounds > 0 && g.round >= g.max_rounds {
-            g.max_rounds = g.round +% GOAL_DEFAULT_MAX_ROUNDS;
+        // P116/P138：清 blocker + phase 回 active + 默认补 256 轮，与命令面
+        // 同一口径；给了 max_goal_rounds 就以模型的评估为准覆盖总上限。
+        goal_resume_bookkeeping(&g, GOAL_DEFAULT_MAX_ROUNDS);
+        if new_max >= 0 {
+            if new_max <= (g.round as i64) {
+                _ = buf_append_cstr(out, "Error: max_goal_rounds <= round\n");
+                return;
+            }
+            if new_max > (GOAL_MAX_ROUNDS_CAP as i64) {
+                _ = buf_append_cstr(out, "Error: max_goal_rounds > 1000\n");
+                return;
+            }
+            g.max_rounds = new_max as i32;
         }
+        g.armed = true;
     } else if bufx_eq_cstr(action.ptr as &const byte, action.len, "complete") {
         goal_set_lit(&g.phase, "complete" as &const byte, 8);
         g.armed = false;
@@ -842,15 +875,12 @@ fn goal_cmd_switch(cfg: &const Config, out: &Buf, armed: bool, verb: &const byte
     if !goal_load(cfg, &g) {
         return goal_cmd_missing(out, verb);
     }
-    // P116：resume（armed=true）与 update_goal 的 resume 同口径 —— 清掉上一次的 blocker，
-    // 并在轮次预算用尽时补一段（否则下一次 admit 立刻又标回 blocked）。
+    // P116/P138：resume（armed=true）与 update_goal、人的新输入同口径。
+    // pause 只翻 phase 与 armed，不碰 blocker / 预算。
     goal_set_lit(&g.phase, phase, bufx_cstr_len(phase));
     g.armed = armed;
     if armed {
-        buf_reset(&g.blocker);
-        if g.max_rounds > 0 && g.round >= g.max_rounds {
-            g.max_rounds = g.round +% GOAL_DEFAULT_MAX_ROUNDS;
-        }
+        goal_resume_bookkeeping(&g, GOAL_DEFAULT_MAX_ROUNDS);
     }
     g.revision = g.revision +% 1;
     if !goal_save(cfg, &g) {
@@ -947,22 +977,31 @@ export fn goal_disarm(cfg: &const Config) void {
     _ = goal_save(cfg, &g);
 }
 
-// P121：**人的新输入 = 重新授权自动续跑**。
+// P121：**人的新输入 = 重新授权自动续跑**；P138：预算终态也一起接上。
 //
-// 症状（用户报的，现场 `session-c7f98113` 的 goal.json 正是 phase=active、
-// armed=false、round=264/512）：目标在跑，人按 esc 停下当前这一轮（P96 收掉
-// 授权），然后敲一句「为什么这么耗内存」/「修复」/「继续」。agent 答完那句
-// 话就停在提示符上 —— 目标盘上还是 active，可再也不会自己开下一轮；人得反复
-// 敲「继续」，而模型不一定记得去 `update_goal action=resume`（P116 §19.36 记
-// 的就是这种失速）。人**还在键盘前**指挥，那不是「不要跑了」。
+// 症状一（P121，现场 session-c7f98113）：目标 phase=active、armed=false、
+// round=264/512。人按 esc 停下当前一轮，再敲一句「为什么这么耗内存」，
+// agent 答完就停在提示符上，目标再也不自己开轮。人还在键盘前指挥，
+// 那不是「不要跑了」。
 //
-// 所以：目标还是 active、而授权收着（esc 叫停 / 异常收场 / `--resume` 之后）
-// 时，人的**任何**一条新输入（新回合，或回合运行中被采纳的插话）都把授权翻回
-// 来一次，驱动器下一圈照常开轮。三条明确的「不要跑了」不受影响：
-//   * `/goal pause` 或模型的 `update_goal action=pause` → phase=paused，这里
-//     一个字节都不动（complete / blocked 同理）；
-//   * esc 之后**不再输入** → 没人说话，授权就一直收着（P96 仍在）；
-//   * 非交互（管道 / CI / 子代理）→ 与驱动器同一对闸门，一次都不翻。
+// 症状二（P138，现场 session-91cae8cc）：目标 round=40/40，驱动器在预算
+// 用尽时写下 phase=blocked + blocker=round-limit + armed=false。人连着敲
+// 「继续」「为什么停了」「为什么agent不跑了？」—— 每一句都答了，目标却
+// 再没开过轮：这里把 blocked 一律当成明确停止，连**驱动器自己写的**
+// round-limit 都不许翻。可它只是「这一段预算用完了」，与 P116 给 resume
+// 补预算是同一件事；人还在说话，那就是接着跑。
+//
+// 所以：目标还是 active、或只是 round-limit 预算终态，而授权收着时，人的
+// **任何**一条新输入（新回合，或回合中被采纳的插话）都按 resume 同口径
+// 收口 —— 清 blocker、phase 回 active、盘上/本地授权都翻开，驱动器下一圈
+// 照常开轮。预算终态只补**一轮**：模型先按剩余工作评估还需要几轮，再用
+// `update_goal action=resume max_goal_rounds=<新总上限>` 定下续跑长度；
+// 不由代码写死 256（用户明确要求按目标评估）。三条真正的「不要跑了」不变：
+//   * `/goal pause` 或 `update_goal action=pause` → phase=paused；
+//   * 带真实 reason 的 blocked（人/模型明确写下的停止条件）；
+//   * complete。
+// 另两条 P121 闸门不变：esc 之后不再输入就一直收着（P96）；非交互
+// （管道 / CI / 子代理）与驱动器同一对闸门，一次都不翻。
 // 盘上也要翻回 `armed=true`：面板与别的进程看的是「盘上 && 本地」（P116），
 // 只翻本地会让它们继续写着 disarmed —— `goal_disarm` 的反向操作必须成对。
 //
@@ -976,11 +1015,23 @@ export fn goal_rearm_on_human(cfg: &const Config) bool {
     if !goal_load(cfg, &g) || !g.active_state {
         return false;
     }
-    if !goal_phase_is(&g, "active" as &const byte) {
-        return false;   // paused / blocked / complete：只能显式 resume
+    // P138：只有驱动器写的 round-limit 算预算终态；别的 blocker 是人/模型
+    // 的明确停止，和 paused / complete 一样留给显式 resume。
+    const round_limit: bool = goal_phase_is(&g, "blocked" as &const byte)
+        && goal_blocker_is_round_limit(&g);
+    if !round_limit && !goal_phase_is(&g, "active" as &const byte) {
+        return false;
+    }
+    var dirty: bool = false;
+    if round_limit {
+        goal_resume_bookkeeping(&g, 1);
+        dirty = true;
     }
     if !g.armed {
         g.armed = true;
+        dirty = true;
+    }
+    if dirty {
         g.revision = g.revision +% 1;
         if !goal_save(cfg, &g) {
             // 写不进去就别空转：授权不打开（与 admit 的记账失败同一条纪律）
@@ -993,7 +1044,11 @@ export fn goal_rearm_on_human(cfg: &const Config) bool {
     // 人亲口说「接着跑」，上一轮零产出的旧账不该压在它头上）。
     g_goal_idle_rounds = 0;
     if !cfg.quiet {
-        out_err("[goal] 人的新输入已恢复自动续跑（/goal pause 可停）\n");
+        if round_limit {
+            out_err("[goal] 预算用尽的目标已续上；请评估还需几轮并设 max_goal_rounds\n");
+        } else {
+            out_err("[goal] 人的新输入已恢复自动续跑（/goal pause 可停）\n");
+        }
     }
     return true;
 }
@@ -1081,6 +1136,13 @@ export fn goal_round_admit(cfg: &const Config, out: &Buf) bool {
         }
         // 行宽豁免：这句是给模型的单句英文指令，拆开只会让措辞更难维护。
         _ = buf_append_cstr(out, " — a long conversation is not an exhausted context; the compact tool frees it on demand.");
+    }
+    // P138：预算只剩这一轮（人的新输入刚从 round-limit 接上，只补了一轮）
+    // 时，让模型按剩余工作评估还要几轮并用 max_goal_rounds 设定 —— 续跑
+    // 长度由目标决定，不由代码写死。其余轮次一个字都不加。
+    // 行宽豁免：给模型的单句英文指令，拆开只会让措辞更难维护。
+    if g.max_rounds > 0 && g.round >= g.max_rounds {
+        _ = buf_append_cstr(out, "\nThe round budget is now exhausted. Assess the remaining work and set the rounds you still need with update_goal action=resume max_goal_rounds=<new total limit, greater than the current round>. Without it this goal stops after this round.\n");
     }
     _ = buf_append_cstr(out,
         "\n\nContinue working toward the objective in this same session. Treat the current workspace, tool results, and durable session state as authoritative; inspect them instead of assuming earlier narration is still current. Make concrete progress and verify the result. Before claiming completion, gather evidence that the whole objective is achieved, read the current goal, and mark it complete. If work remains, leave the goal active for the next round. Follow the configured goal-tool policy before reporting a blocker.\n</goal_round>");
