@@ -10425,7 +10425,7 @@ RSA 签名算法，拿到 `WR1`（`ba98…`）；openssl 默认拿到 ECDSA 的 
 * `VER_NAME` / `VER_SEMVER`（发布身份，与 git tag 同口径）/ `AGENT_VERSION`（开发阶段串，
   保留老名字，四个既有调用点与自测都在用）。**只在这里各写一次**。
 * `ver_line_into` → `uya-agent 0.1.0 (p83-clip-any)`；`ver_ident_into` → `uya-agent/0.1.0`。
-  （阶段串在 P114 被置空，人读行现在是 `uya-agent 0.1.3`，见 §19.34。）
+  （阶段串在 P114 被置空，人读行现在是 `uya-agent 0.1.4`，见 §19.34。）
 * `--version` / `-V` 在 main 的**预扫**里收口（早于读 DSH 设置与模型目录）：它是
   「设置坏了的时候最需要的那个查询」，排在读设置之后就会在最需要它时失败。
   写 **stdout**、一行、退出码 0（`v=$(uya-agent --version)` 要拿得到干净的值）。
