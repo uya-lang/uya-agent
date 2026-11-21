@@ -50,6 +50,11 @@ for arg in "$@"; do
 done
 
 if [ -n "$CACHE" ]; then
+    # make -j 会同时拉起几十个本脚本；整棵生成物的改写必须串行，否则两个
+    # fix_darwin_headers.py 同时写同一个文件就会留下半截内容（CI 上见到的坏
+    # catch 块 / 头文件丢 typedef 正是这个形状）。② 也进同一把锁，别互相写坏。
+    exec 9>"$CACHE/.uya_darwin_fix.lock"
+    flock 9
     # ① 符号前缀
     sed -i -E \
         '/uya_host_|uya_macos_real_/ s/__asm__\("([a-z][a-z_0-9]*)"\)/__asm__("_\1")/' \
@@ -75,6 +80,7 @@ if [ -n "$CACHE" ]; then
             esac
         done
     fi
+    exec 9>&-          # 别把锁带进 cc：编译可能很慢，后面还要并行
 fi
 
 exec "$ZIG" cc "$@"

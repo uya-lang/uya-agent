@@ -1,5 +1,5 @@
 #!/bin/sh
-# 用途：跑一次 `uya build`，撞上「生成的 `.c` 内容坏了」就把缓存清掉重来。
+# 用途：跑一次 `uya build`，撞上「生成物（.c / uya_*.h）坏了」就清缓存重来。
 #
 # 为什么需要：随仓发出去的编译器（`uya/bin/uya-real`，v0.10.4 预编译）写 split-C
 # 时**偶尔写出坏文件**，症状是编译期报一屏「行号/列号离谱」的语法错。GitHub
@@ -18,8 +18,11 @@
 # （实测撞出 `undefined symbol: _main` 那种更难看的失败）。整目录清最多多花一次
 # 全量编译，换来一个干净状态。
 #
-# 只认**那一种形状**才重试：日志里出现 `<路径>.c:<行>:<列>: error:`。别的失败
+# 只认**那一种形状**才重试：日志里出现生成物的
+# `<路径>.c:<行>:<列>: error:` 或 `uya_*.h:<行>:<列>: error:`。别的失败
 # （链接错、找不到编译器、真正的语法错误）一律原样退出，绝不吞掉。
+# 头文件也要认：macOS arm64 那次红就是 uya_split_protos.h 丢了类型定义，
+# 报 `unknown type name 'size_t'`，旧口径只盯 .c，直接放弃重试。
 #
 # 用法：uya_build_retry.sh <cache 目录> <日志文件> <最多尝试次数> -- <构建命令…>
 #   cache 目录：编译器写 split-C 的地方（Linux 是 build/uyacache，macOS 是
@@ -60,31 +63,34 @@ while [ "$n" -le "$tries" ]; do
     rm -f "$log.rc"
     if [ "$rc" -eq 0 ]; then
         if [ "$n" -gt 1 ]; then
-            echo "uya_build_retry: 第 $n 次尝试通过（前 $((n - 1)) 次生成的 .c 是坏的）"
+            echo "uya_build_retry: 第 $n 次尝试通过（前 $((n - 1)) 次生成物是坏的）"
         fi
         exit 0
     fi
     if [ "$n" = "1" ]; then
         cp -f "$log" "$log.first" 2>/dev/null || true
     fi
-    bad=$(grep -oE '^[^ :]+\.c:[0-9]+:[0-9]+: error:' "$log" 2>/dev/null \
+    bad=$(grep -oE -e '^[^ :]+\.c:[0-9]+:[0-9]+: error:' \
+                  -e '^[^ :]*uya_[^ :]*\.h:[0-9]+:[0-9]+: error:' \
+                  "$log" 2>/dev/null \
         | sed -e 's/:[0-9][0-9]*:.*//' \
         | sort -u)
     if [ -z "$bad" ]; then
         # 退一步：截断/半截写除了「语法错」还会留下一个更硬的指纹 —— 文件末尾没有
-        # 换行。生成的 .c 一定以 `}\n` 收尾，所以这条几乎不会误报。
-        bad=$(find "$cache" -name '*.c' -type f -print 2>/dev/null \
+        # 换行。生成的 .c / uya_*.h 一定以换行收尾，所以这条几乎不会误报。
+        bad=$(find "$cache" \( -name '*.c' -o -name 'uya_*.h' \) \
+            -type f -print 2>/dev/null \
             | while IFS= read -r f; do
                 last=$(tail -c 1 "$f" | od -An -c | tr -d ' \n')
                 [ "$last" = '\n' ] || echo "${f#"$cache"/}"
             done)
         if [ -n "$bad" ]; then
-            echo "uya_build_retry: 日志里没有语法错，但有 .c 文件末尾缺换行：" >&2
+            echo "uya_build_retry: 日志里没有语法错，但有生成物末尾缺换行：" >&2
         fi
     fi
     if [ -z "$bad" ]; then
-        echo "uya_build_retry: 失败形状不是「生成的 .c 坏了」" \
-            "（既没有 <文件>.c:<行>:<列>: error:，也没有末尾缺换行的 .c），不重试" >&2
+        echo "uya_build_retry: 失败形状不是「生成物坏了」" \
+            "（既没有 .c / uya_*.h 的行列错，也没有末尾缺换行的生成物），不重试" >&2
         exit "$rc"
     fi
     echo "uya_build_retry: 第 $n 次尝试失败，坏文件（顺手把证据留在日志里）：" >&2
