@@ -636,6 +636,9 @@ export struct Scheduler {
     _frame_pool: &AsyncFramePool,
     _frame_buffer: &byte,
     _frame_buffer_size: usize,
+    /// 装箱成 IAllocator 的池拷贝（`scheduler_run_allocator` 的持久化结果）。
+    /// 只在 init 时建一次，各 run 入口复用 —— 桶里的帧块跨回合积累复用。
+    _run_alloc: &IAllocator,
     _metrics_frame_alloc_seen: u64,
     _metrics_frame_free_seen: u64,
     _metrics_heap_fallback_seen: u64,
@@ -709,6 +712,31 @@ fn scheduler_pool_to_allocator(pool: &AsyncFramePool) IAllocator {
     return *pool;
 }
 
+/// 取（必要时建）本调度器持久化的 IAllocator 装箱。
+///
+/// 为什么不能每次 run 都在栈上装箱：`IAllocator` 是 {vtable, data} 值，
+/// `*pool` 会把池结构体复制一份，帧的借还都记在这份拷贝的桶上。run 返回
+/// 时栈上的拷贝消失，桶里刚归还的大帧（例如 ahc_open/ahc_fill 的 51 KiB /
+/// 34 KiB 帧）再也没人引用 —— 每跑一次 LLM 回合净漏两块。把这份拷贝堆分配
+/// 一次并挂在 Scheduler 上，桶表就能跨回合复用同一批帧块。
+/// 返回值：成功返回持久化装箱的指针；池未初始化返回 null。
+fn scheduler_run_allocator(self: &Scheduler) &IAllocator {
+    if self._run_alloc != null {
+        return self._run_alloc;
+    }
+    if self._frame_pool == null {
+        return null;
+    }
+    // 接口值 = {vtable, data} 两个机器字（沿用仓里既有的装箱尺寸写法）。
+    const boxed: &IAllocator = malloc(@size_of(usize) *| 2) as &IAllocator;
+    if boxed == null {
+        return null;
+    }
+    boxed[0] = scheduler_pool_to_allocator(self._frame_pool);
+    self._run_alloc = boxed;
+    return boxed;
+}
+
 /// 创建调度器并初始化其 async frame pool。
 /// 默认 inline repoll 策略读取 runtime 默认值。
 export fn scheduler_init(self: &Scheduler) void {
@@ -721,6 +749,11 @@ export fn scheduler_init(self: &Scheduler) void {
 export fn scheduler_init_with_config(self: &Scheduler, frame_buffer_bytes: usize, inline_repoll_limit: i32) void {
     if self == null {
         return;
+    }
+    // 重新 init 时旧的持久化装箱作废（新池会配新的桶表）。
+    if self._run_alloc != null {
+        free(self._run_alloc as &void);
+        self._run_alloc = null;
     }
     self._frame_pool = malloc(@size_of(AsyncFramePool)) as &AsyncFramePool;
     if self._frame_pool == null {
@@ -896,9 +929,13 @@ export fn async_runtime_metrics_linux_epoll_with_thread_pool(self: &Scheduler, l
 /// 忙等待轮询（与 std.async.block_on<T> 同逻辑）；此处内联实现，避免单态 `scheduler_run_*` 依赖未单独发射的 `std_block_on_*` 符号。
 /// 运行期间将 scheduler 的 frame pool 注入线程本地 allocator，返回前恢复。
 export fn scheduler_run<T>(self: &Scheduler, f: Future<!T>) !T {
-    const alloc: IAllocator = scheduler_pool_to_allocator(self._frame_pool);
+    const alloc_ptr: &IAllocator = scheduler_run_allocator(self);
+    if alloc_ptr == null {
+        const e: !T = error.AllocOutOfMemory;
+        return e;
+    }
     const old_alloc: &IAllocator = get_async_frame_allocator();
-    set_async_frame_allocator(&alloc);
+    set_async_frame_allocator(alloc_ptr);
     defer { set_async_frame_allocator(old_alloc); }
     scheduler_set_queue_depth(self, 1);
     defer { scheduler_set_queue_depth(self, 0); }
@@ -936,9 +973,13 @@ export fn scheduler_run_usize(self: &Scheduler, f: Future<!usize>) !usize {
 /// 运行 Future<!T>，当 poll 返回 Pending 时主动驱动 EventLoop 一次后再重试。
 /// 运行期间将 scheduler 的 frame pool 注入线程本地 allocator，返回前恢复。
 export fn scheduler_run_with_event_loop<T>(self: &Scheduler, loop: EventLoop, f: Future<!T>, timeout_ms: i32) !T {
-    const alloc: IAllocator = scheduler_pool_to_allocator(self._frame_pool);
+    const alloc_ptr: &IAllocator = scheduler_run_allocator(self);
+    if alloc_ptr == null {
+        const e: !T = error.AllocOutOfMemory;
+        return e;
+    }
     const old_alloc: &IAllocator = get_async_frame_allocator();
-    set_async_frame_allocator(&alloc);
+    set_async_frame_allocator(alloc_ptr);
     defer { set_async_frame_allocator(old_alloc); }
     scheduler_set_queue_depth(self, 1);
     defer { scheduler_set_queue_depth(self, 0); }
@@ -1019,9 +1060,12 @@ export fn scheduler_run_usize_with_event_loop(self: &Scheduler, loop: EventLoop,
 /// 使用共享 EventLoop 运行两个 i32 任务，直到二者都完成。
 /// 运行期间将 scheduler 的 frame pool 注入线程本地 allocator，返回前恢复。
 export fn scheduler_run_pair_i32_with_event_loop(self: &Scheduler, loop: EventLoop, first: Future<!i32>, second: Future<!i32>, first_result: &i32, second_result: &i32, timeout_ms: i32) !i32 {
-    const alloc: IAllocator = scheduler_pool_to_allocator(self._frame_pool);
+    const alloc_ptr: &IAllocator = scheduler_run_allocator(self);
+    if alloc_ptr == null {
+        return error.AllocOutOfMemory;
+    }
     const old_alloc: &IAllocator = get_async_frame_allocator();
-    set_async_frame_allocator(&alloc);
+    set_async_frame_allocator(alloc_ptr);
     defer { set_async_frame_allocator(old_alloc); }
     var remaining: i32 = 2;
     scheduler_set_queue_depth(self, remaining);
@@ -1143,9 +1187,12 @@ export fn scheduler_run_pair_i32_with_event_loop(self: &Scheduler, loop: EventLo
 /// 调度器只对事件循环错误报错；任务本身的错误写回各 slot.error_id。
 /// 运行期间将 scheduler 的 frame pool 注入线程本地 allocator，返回前恢复。
 export fn scheduler_run_task_queue_with_event_loop<T>(self: &Scheduler, loop: EventLoop, queue: &TaskQueue<T>, timeout_ms: i32) !i32 {
-    const alloc: IAllocator = scheduler_pool_to_allocator(self._frame_pool);
+    const alloc_ptr: &IAllocator = scheduler_run_allocator(self);
+    if alloc_ptr == null {
+        return error.AllocOutOfMemory;
+    }
     const old_alloc: &IAllocator = get_async_frame_allocator();
-    set_async_frame_allocator(&alloc);
+    set_async_frame_allocator(alloc_ptr);
     defer { set_async_frame_allocator(old_alloc); }
     var remaining: i32 = queue.len;
     scheduler_set_queue_depth(self, remaining);
