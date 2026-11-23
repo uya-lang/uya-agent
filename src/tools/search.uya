@@ -24,7 +24,7 @@
 //   grep：`rg --json` 逐行解析（不做冒号切分），按文件分组输出 `Line N: <preview>`，
 //         最多 250 条（grepMaxMatches），每行预览最多 2000 字节（grepMaxLineBytes）。
 //
-// 与 shell 工具一样：fork + pipe + poll 读子进程输出，墙钟超时 → SIGKILL。
+// 与 shell 工具一样：fork + pipe + 事件循环等可读，墙钟超时 → SIGKILL。
 
 use libc.syscall;
 use libc.unistd;
@@ -40,7 +40,87 @@ const SEARCH_OUT_MAX: usize = 8 * 1024 * 1024;
 
 // ============================================================
 // 跑一个 rg 子进程；返回退出码，stdout 收进 out
+//
+// P101 同款：等待搬进事件循环（rt_wait_any2 + 帧回调），不再用
+// sys_poll(100ms) + agent_pump_block() 的同步轮询。
 // ============================================================
+
+struct RgWaitOut {
+    done: bool,
+    aborted: bool,
+}
+
+// 等一轮：取消 / 超时 / 可读。片长 = 一个取消片，片间重判取消与超时。
+@async_fn fn rg_wait_step(
+    fd: i32,
+    pid: i32,
+    timeout_ms: u32,
+    started: u64,
+    out: &Buf,
+    res: &RgWaitOut
+) Future<!i32> {
+    if rt_should_stop() {
+        sh_kill_tree(pid);
+        res.aborted = true;
+        res.done = true;
+        return 1 as i32;
+    }
+    if timeout_ms > 0
+        && ua_now_ms() - started >= (timeout_ms as u64) {
+        sh_kill_tree(pid);
+        res.done = true;
+        return 1 as i32;
+    }
+    var chunk: [byte: 32768] = [0: 32768];
+    const dl: u64 = ua_now_ms() + RT_CANCEL_SLICE_MS;
+    const w: !usize = @await rt_wait_any2(fd, -1 as i32, dl);
+    const which: usize = w catch |err| {
+        const e: i32 = (@error_id(err) as! i32).value;
+        if e == (@error_id(error.Cancelled) as! i32).value {
+            return error.Cancelled;
+        }
+        0 as usize;
+    };
+    _ = which;
+    // fd 已设非阻塞：EAGAIN 不是 EOF，下一轮继续等
+    const n: isize = sys_read(fd, &chunk[0], 32768) catch {
+        -1 as isize;
+    };
+    if n > 0 {
+        if out.len < SEARCH_OUT_MAX {
+            _ = buf_append(out, &chunk[0], n as usize);
+        }
+    } else if n == 0 {
+        res.done = true;
+    }
+    return 0 as i32;
+}
+
+@async_fn fn rg_wait_loop(
+    fd: i32,
+    pid: i32,
+    timeout_ms: u32,
+    started: u64,
+    out: &Buf,
+    res: &RgWaitOut
+) Future<!i32> {
+    while !res.done {
+        const r: !i32 = @await rg_wait_step(fd, pid, timeout_ms,
+            started, out, res);
+        const flag: i32 = r catch |err| {
+            const e: i32 = (@error_id(err) as! i32).value;
+            if e == (@error_id(error.Cancelled) as! i32).value {
+                sh_kill_tree(pid);
+                res.aborted = true;
+                res.done = true;
+            }
+            0;
+        };
+        _ = flag;
+    }
+    return 0 as i32;
+}
+
 fn rg_run(argv: &(&const byte), cwd: &const byte, out: &Buf) i32 {
     var fds: [i32: 2] = [0: 2];
     sys_pipe2(&fds[0], 0) catch {
@@ -72,40 +152,23 @@ fn rg_run(argv: &(&const byte), cwd: &const byte, out: &Buf) i32 {
     }
     const pid: i32 = i64_to_i32(pid64);
     _ = sys_close(fds[1]) catch {};
-    var chunk: [byte: 32768] = [0: 32768];
-    var pfds: [PollFd: 1] = [PollFd{ fd: fds[0], events: POLLIN, revents: 0 }];
     const started: u64 = ua_now_ms();
-    var done: bool = false;
-    var aborted: bool = false;
-    while !done {
-        // P30 合流：泵点（中止检查 + 命令派发）；用户叫停就当场杀掉 rg
-        if agent_pump_block() != TUI_ABORT_NONE {
-            // P38：整棵子树（rg 自身没有子孙，但口径统一：中止＝按进程组收）
-            sh_kill_tree(pid);
-            aborted = true;
-            done = true;
-        }
-        const pr: i32 = sys_poll(&pfds[0], 1, 100) catch { 0; };
-        if pr > 0 && ((pfds[0].revents & POLLIN) != 0 || (pfds[0].revents & POLLHUP) != 0 || (pfds[0].revents & POLLERR) != 0) {
-            const n: isize = sys_read(fds[0], &chunk[0], 32768) catch { 0 as isize; };
-            if n <= 0 {
-                done = true;
-            } else if out.len < SEARCH_OUT_MAX {
-                _ = buf_append(out, &chunk[0], n as usize);
-            }
-        }
-        if !done && search_timeout_ms > 0 {
-            if (ua_now_ms() - started) >= (search_timeout_ms as u64) {
-                // P38：按进程组收（中止/超时同一条口径）
-                sh_kill_tree(pid);
-                done = true;
-            }
-        }
-    }
+    rt_set_nonblock(fds[0]);
+    var res: RgWaitOut = RgWaitOut{ done: false, aborted: false };
+    // 帧回调 = 原来的泵点（中止 / 命令派发 / 刷帧），注册与收工成对
+    agent_rt_begin();
+    const rc: i32 = rt_run(rg_wait_loop(fds[0], pid,
+        search_timeout_ms, started, out, &res));
+    agent_rt_end();
+    _ = rc;
     _ = sys_close(fds[0]) catch {};
     var st: i32 = 0;
-    _ = sys_waitpid(pid, &st, 0) catch {};
-    if aborted {
+    _ = sys_waitpid(pid, &st, 3) catch { 0; };
+    if (st & 127) == 127 {
+        // 被 job control 停住：按进程组收，别留孤儿
+        sh_kill_tree(pid);
+    }
+    if res.aborted {
         if out.len > 0 && out.ptr[out.len - 1] != 10 as byte {
             _ = buf_append_byte(out, 10);
         }
