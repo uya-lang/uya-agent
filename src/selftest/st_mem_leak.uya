@@ -3,6 +3,10 @@
 // 本文件：mode `mem-leak`（入口 `mem_leak_round`）：子进程 mock 回最短 SSE，跑 N 回合
 //   真 HTTP+SSE（生产 `rt_run(allm_stream_chat)` 同路径），前后读 `heap_large_*`，
 //   钉住「每回合不再漏 2 块 async 大帧」。
+//   W 段（session-91cae8cc 的 839 MB）：反复 `rt_run` 一个只 `@await rt_wait_any2`
+//   的协程 1440 次，前后读 `heap_region_count()`，钉住「**装箱 Future 的 `release`
+//   必须还**」—— 那 148 小时里 3,715,480 块 48 B 帧全从这里漏，钉住 103,718 个
+//   4 KiB region（409 MB 映射 / 839 MB RSS）。
 // 不变量：① mock 在子进程（sys_fork），每回合一条连接一个新端口，回合后由
 //   本轮收尸；② 计数用 `heap_large_*`（`libc.heap` 导出），不猜；
 //   ③ 每回合的请求体/响应体都走 `ChatOut` 正常释放路径（defer free）。
@@ -222,6 +226,75 @@ fn mleak_turn(port: u16, url: &Buf, hdrs: &const Buf, body: &const Buf) bool {
     return status == 200;
 }
 
+// ---------- W 段：装箱 Future 的 `release` 必须还（region 数判据） ----------
+//
+// 背景（session-91cae8cc 的 839 MB RSS）：`RtWaitAny2` 被 codegen 装箱成接口值，
+// 而它的 `release` 当年是 `_ = self;`（no-op）⇒ **每次等待漏一块** 48 B 帧。
+// `shx_wait_step` 每 32 ms 重来一次，148 小时里 3,715,480 次 → 103,718 个 4 KiB
+// morecore region 常驻（分配器对 <4 KiB 的请求一律单独 mmap，且只有「整块空着」
+// 才肯 trim munmap），RSS 839 MB。
+//
+// 判据：反复 `rt_run` 一个只 `@await rt_wait_any2` 的协程 N 次，
+// `heap_region_count()` 的增量不许线性上涨。
+//   修复前：一块 48 B 帧钉住一整个 region（现场 3,715,480 块 ↔ 103,718 个
+//   region ≈ 每 36 块一个）⇒ N=1440 时约 +40；
+//   修复后：帧回到池的空闲链表，region 数纹丝不动（±4 是分配器噪声）。
+// 为什么用 region 数而不是 RSS：region 是分配器的自有读数，不掺内核统计口径；
+// 而泄漏的形状正是「一块小帧钉住一整个 region」—— 也正是 trim 收不掉它的原因。
+//
+// ⚠ 防假绿：把 `RtWaitAny2.release` 改回 `_ = self;`，本段当场红。
+
+// 只做一件事：等两路里的第一路（第二路传 -1 表示不参与）。
+@async_fn fn mleak_w_wait(fd: i32, dl: u64) Future<!i32> {
+    const w: !usize = @await rt_wait_any2(fd, 0 - 1, dl);
+    _ = w catch {};
+    return 0;
+}
+
+const MLEAK_W_ITERS: i32 = 1440;
+const MLEAK_W_SLACK: usize = 4;
+
+fn mleak_w_round(tag: &const byte, ok: &bool) void {
+    var fds: [i32: 2] = [0 - 1, 0 - 1];
+    const pr: !i32 = sys_pipe2(&fds[0], 0);
+    if (pr catch { 0 - 1; }) != 0 {
+        ty_fail(tag, "W 段：建管道失败", ok);
+        return;
+    }
+    defer {
+        _ = sys_close(fds[0]) catch {};
+        _ = sys_close(fds[1]) catch {};
+    }
+    // 先放一个字节并且**永不读走**：每轮 poll 立刻就是「可读」⇒ 纯粹的
+    // 「分配-释放」循环，不掺任何等待时间（也不受 Windows 睡粒度影响）。
+    const one: [byte: 1] = [65 as byte];
+    const wr: isize = sys_write(fds[1], &one[0], 1) catch { 0 as isize; };
+    if wr != (1 as isize) {
+        ty_fail(tag, "W 段：管道写失败（前置条件没成立）", ok);
+        return;
+    }
+    // 给一个「绝不会真到」的超时：万一 poll 没看见那个字节，这段会以
+    // AsyncDeadlineExceeded 结束并照常走 release，而不是把自测挂死。
+    const dl: u64 = ua_now_ms() + (5000 as u64);
+    // 暖身 8 次：第一次会把 48 B 帧池的桶与 slots 数组建出来，那是一次的。
+    var i: i32 = 0;
+    while i < 8 {
+        _ = rt_run(mleak_w_wait(fds[0], dl));
+        i = i + 1;
+    }
+    const before: usize = heap_region_count();
+    i = 0;
+    while i < MLEAK_W_ITERS {
+        _ = rt_run(mleak_w_wait(fds[0], dl));
+        i = i + 1;
+    }
+    const after: usize = heap_region_count();
+    const grow: usize = if after > before { after - before } else { 0 as usize };
+    if grow > MLEAK_W_SLACK {
+        ty_fail(tag, "W 段：每次等待漏一块（region 数线性涨）", ok);
+    }
+}
+
 // 轮入口：mem-leak。
 fn mem_leak_round(tag: &const byte) bool {
     var ok: bool = true;
@@ -286,11 +359,13 @@ fn mem_leak_round(tag: &const byte) bool {
     if cnt_grow < 0 - 4 {
         ty_fail(tag, "块数异常回落（判据自身不可信）", &ok);
     }
+    // W 段：装箱 Future 的 `release`（与上面「每回合两个大帧」是两条独立的链）。
+    mleak_w_round(tag, &ok);
     if !ok {
         return false;
     }
     out_err("selftest[");
     out_err(tag);
-    out_err("] ok: 6 回合 live 大块稳定（无每回合 +2 大帧泄漏）\n");
+    out_err("] ok: 6 回合 live 大块稳定 + 1440 次等待 region 数不涨\n");
     return true;
 }
