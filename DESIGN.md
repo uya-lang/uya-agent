@@ -7209,6 +7209,51 @@ QTermWidget）对 `ESC[?5522$p`（DECRQM）**零应答**，OSC 52 写 `c`/`p` �
       `_malloc_impl`」比猜快得多的那种情况；③ 释放类改动必须**同时给判据**：`trim` 有没有
       生效在界面上完全不可见，没有数值断言就只能靠「用户下次再报」。
 
+169. **「跑两天内存 839 MB」：codegen 装箱的 Future，`release` 写成了 no-op ——
+     每次等待漏一块，一块 48 B 钉住一整个 4 KiB region**
+
+     现场（本机，2026-11-24）：session-91cae8cc 的 agent 跑了 148 小时，RSS 从
+     790 MB 涨到 839 MB 且每秒还在 +6.4 KB；`/proc/<pid>/maps` 里 11,014 个 VMA
+     （10,986 个匿名 rw）。分配器这边（踩坑 168 的 trim）是正常的 —— 根因在
+     **一处 `release`**：直读进程内存里的 `AsyncFramePool`，8 个桶里 `size=48`
+     那个 **alloc=3,715,480 / free=0**。一块 48 B 的帧把一整个 4 KiB morecore
+     region 钉死（region 必须「整块都空」才肯 trim munmap），于是 103,718 个
+     region 常驻 409 MB 映射，RSS 839 MB。
+
+     调用链（gdb 断在 `std_async_frame_pool_alloc_aligned` 的 `size==48` 上）：
+     `shx_wait_step` → `rt_wait_any2` → codegen 的 `async_box_alloc_current`
+     → 帧池 alloc。`shx_wait_step` 每 `RT_CANCEL_SLICE_MS`（32 ms）重来一次，
+     所以一条 `bash` 命令等 1 小时就是 11 万块；`jobs` / `search` 走同一个原语。
+
+     根因：codegen 把「具体 struct → `Future<T>` 接口值」的转换做成装箱
+     （`std_async_box_alloc_current`，堆上一块 {vtable, data}），并把**归还**
+     委托给这个 struct 的 `release`（`@await` 拿到 Ready 后调一次 vtable 第二槽）。
+     而 `RtWaitAny2.release` 当年写的是 `_ = self;` —— 语法上合法、语义上「什么
+     都不做」，装箱块于是再无人引用。同类还有 `RtWinSleepFut`（Windows 每个睡眠
+     分片漏一块）与 TLS 的 `HttpsRead/WriteAll/HandshakeFuture`（潜伏：目前没有
+     调用方，一旦有人 `@await` 就同一个坑）。
+
+     修法：这五个 `release` 一律 `async_box_free_current(self as &byte);`，与 std
+     里 `AsyncWaitFdFuture` / `thread.uya` 的五个 future 同一个形状。纪律：
+     **凡是会被装箱成 `Future<T>` 接口值的手写 struct，`release` 必须还装箱**；
+     写 `_ = self;` 等于把「每次调用漏一块」写进不变量里。
+
+     判据（`selftest[mem-leak]` 新增 W 段）：反复 `rt_run` 一个只 `@await
+     rt_wait_any2` 的协程 1440 次，`heap_region_count()` 的增量必须 ≤ 4
+     （现场 3,715,480 块 ↔ 103,718 个 region，≈ 每 36 块钉住一个，按此推算
+     N=1440 约 +40；负向对照实测：把 `release` 改回 no-op，本段当场红）。
+     为什么不用 RSS：region 是分配器
+     的自有读数，不掺内核统计口径，而泄漏的形状正是「一块小帧钉住整个 region」。
+     防假绿：把 `RtWaitAny2.release` 改回 `_ = self;`，W 段当场红。
+
+     教训：① **「release 被调到了」不等于「资源还了」**：no-op 的 `release` 让
+     「alloc/free 有配对调用」的静态检查全绿，泄漏照样发生 —— 判据要落在
+     **计数器**上（alloc−free、region 数），不是「有没有调用」；② **一块小内存
+     能钉住一整个 region**：48 B 在 148 小时里长成 839 MB，量级差 5 个数量级，
+     「小对象漏一点不要紧」的直觉在这里是错的；③ 长跑现场的定位顺序应当是
+     「RSS → `/proc/<pid>/maps` 的形状 → 分配器的自有计数器」，三步就能把 839 MB
+     收到一个 48 字节的桶上。
+
 ---
 
 ## 17. 工具实现要点
